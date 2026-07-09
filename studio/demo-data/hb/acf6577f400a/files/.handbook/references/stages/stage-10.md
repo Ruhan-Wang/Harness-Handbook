@@ -1,8 +1,10 @@
 # Main event loop and request dispatch  `stage-10`
 
-This stage is the system’s steady-state control center: once startup is complete, it sits in the main loop and turns incoming UI activity, JSON-RPC traffic, and internal thread messages into concrete work for the right subsystem. Interactive event dispatch governs the TUI side, consuming the unified event stream, deciding which screen, popup, composer, or thread should receive each keystroke or redraw signal, and forwarding background work or RPCs when user actions require them.
+This stage is the system’s normal working loop, after startup is finished. It is the traffic control center for everything that happens while the app is running. On the user side, interactive event dispatch turns keyboard input, paste events, terminal resizing, redraw requests, and background updates into clear app actions, then sends them to the right screen area or chat thread.
 
-RPC request routing performs the same role for protocol traffic. It decodes requests and notifications, checks connection and session state, selects the appropriate feature processor, and shapes replies, errors, and outbound notifications across the app server, core tool routing, MCP paths, and executor-facing endpoints. Directly assigned files support that dispatch spine: exec-server/src/server/processor.rs drives one exec-server connection end to end; core/src/session/handlers.rs maps session operations into mutations, tasks, persistence, and emitted events; app-server/src/request_serialization.rs preserves ordering for conflicting requests without blocking unrelated ones; and core/src/tools/parallel.rs executes tool calls with the right concurrency and cancellation semantics. Together, these parts keep the running system responsive, ordered, and correctly routed.
+On the server side, RPC request routing handles JSON-RPC messages, which are structured requests with names, data, and replies. It checks each request, chooses the right subsystem, and sends back results or errors. The exec server processor does this for each remote execution connection, reading requests, dispatching actions, writing replies, and cleaning up afterward.
+
+Inside a live Codex session, session handlers act like a command desk for user messages, approvals, setting changes, rollbacks, reviews, voice input, and shutdown. Request serialization keeps requests that touch the same resource in a safe order, while allowing unrelated work to continue. Parallel tool handling decides which tool calls can run together, formats their results, and makes cancellation reliable.
 
 ## Sub-stages
 
@@ -16,15 +18,15 @@ The exec server enters its steady-state JSON-RPC loop, decoding inbound traffic 
 
 ### `exec-server/src/server/processor.rs`
 
-`orchestration` · `per-connection main loop`
+`orchestration` · `request handling`
 
-This file contains the orchestration layer between raw JSON-RPC transport events and the server handler implementation. `ConnectionProcessor` owns two pieces of shared state: an `Arc<SessionRegistry>` so multiple connections can attach to or resume the same session, and `ExecServerRuntimePaths` needed by handlers. Its `run_connection` method clones both and hands them to the internal async `run_connection` function.
+The exec server talks to clients using JSON-RPC, a simple pattern where each message is a request, response, notification, or error written as JSON. This file is the part that sits in the middle of one live connection. It is like a receptionist: it reads each incoming message, checks which server feature it asks for, sends it to the right handler, and returns the answer.
 
-`run_connection` first builds a router with `build_router`, destructures the `JsonRpcConnection` into inbound/outbound channels plus transport task handles, and creates a dedicated mpsc channel for server outbound messages. That channel is wrapped in `RpcNotificationSender` and passed into a new `ExecServerHandler`. A spawned `outbound_task` drains `RpcServerOutboundMessage` values, serializes them with `encode_server_message`, logs and stops on serialization failure, and forwards JSON text to the transport's outgoing channel until the receiver closes.
+A ConnectionProcessor owns shared session state, so a client can reconnect and resume an existing exec session. When a connection starts, the processor builds a router, creates a handler for real server work, and starts a background task that turns internal server replies into JSON strings for the transport layer to send.
 
-Inbound processing is intentionally sequential to preserve the required `initialize` then `initialized` ordering. Before each event, the loop checks `handler.is_session_attached()` so an evicted connection exits promptly after session resume elsewhere. Malformed messages generate an explicit JSON-RPC error with request id `-1`. Valid requests are dispatched through the router; each handler future is raced against `disconnected_rx.changed()` so transport loss interrupts in-flight work. Unknown request methods return `method_not_found`, while unknown notifications, unexpected client responses, and unexpected client errors all cause the connection to close. On exit, the processor shuts down the handler, drops the outbound sender to end the serializer task, aborts any transport-owned tasks, and awaits cleanup.
+Incoming messages are processed one at a time. That matters because startup messages such as initialize and initialized must happen in order. Badly formed messages get a standard “invalid request” error. Unknown request methods get a “method not found” error. Unexpected client responses, client errors, or unknown notifications are treated as protocol mistakes and close the connection.
 
-The embedded tests use in-memory duplex streams to verify a subtle lifecycle guarantee: disconnecting a transport during a long-poll read must detach the session quickly enough that another connection can resume it without waiting for the old read to finish.
+The file also watches for disconnects while a request is still running. If the transport disappears, it stops waiting and shuts down cleanly. The included test checks an important reconnect case: an old connection with a long-running read must not block a new connection from resuming the same session.
 
 #### Function details
 
@@ -34,11 +36,11 @@ The embedded tests use in-memory duplex streams to verify a subtle lifecycle gua
 fn new(runtime_paths: ExecServerRuntimePaths) -> Self
 ```
 
-**Purpose**: Creates a connection processor with a fresh shared session registry and fixed runtime paths. This is the top-level object reused across accepted transports.
+**Purpose**: Creates a reusable processor for exec-server connections. It sets up shared session tracking and remembers the runtime paths needed later to run commands.
 
-**Data flow**: Consumes `ExecServerRuntimePaths`, allocates a new `SessionRegistry`, stores both in the struct, and returns `ConnectionProcessor`.
+**Data flow**: It receives the runtime path settings for the server. It creates a fresh shared SessionRegistry, stores the paths beside it, and returns a ConnectionProcessor ready to accept connections.
 
-**Call relations**: Constructed by transport startup code before serving stdio or websocket connections. Each accepted connection later uses the same processor so sessions can survive reconnects.
+**Call relations**: Higher-level server and relay code call this when they are setting up an exec-server environment. The processor it returns is later asked to run individual connections through ConnectionProcessor::run_connection.
 
 *Call graph*: calls 1 internal fn (new); called by 10 (processor_exit_reports_closed_virtual_stream, multiplexed_environment_sends_keepalive, duplicate_handshakes_exhaust_failure_budget, oversized_harness_authorization_is_rejected_before_validation, pending_harness_key_validation_does_not_block_new_handshakes, repeated_early_data_during_validation_closes_the_physical_relay, repeated_malformed_handshakes_close_the_physical_relay, run_remote_environment, run_stdio_connection_with_io, run_websocket_listener).
 
@@ -49,11 +51,11 @@ fn new(runtime_paths: ExecServerRuntimePaths) -> Self
 async fn run_connection(&self, connection: JsonRpcConnection)
 ```
 
-**Purpose**: Runs one `JsonRpcConnection` against the processor's shared registry and runtime configuration. It is the public per-connection entry point.
+**Purpose**: Starts processing one client connection using the processor’s shared session registry and runtime settings. This is the public wrapper around the file’s main connection loop.
 
-**Data flow**: Consumes a `JsonRpcConnection`, clones `self.session_registry` and `self.runtime_paths`, and awaits the internal `run_connection` function. It returns when that connection has fully shut down.
+**Data flow**: It receives a JsonRpcConnection, copies the shared session registry pointer and runtime paths, and passes them into the lower-level run_connection function. It waits until that connection loop has fully finished.
 
-**Call relations**: Called by transport code when a stdio session starts or a websocket upgrades. It delegates all detailed event-loop behavior to the free `run_connection` function.
+**Call relations**: Connection-handling code calls this when a new virtual stream or client link is ready. It delegates the real work to run_connection, so all connections share the same behavior and session registry.
 
 *Call graph*: calls 1 internal fn (run_connection); called by 1 (spawn_noise_virtual_stream); 2 external calls (clone, clone).
 
@@ -68,11 +70,11 @@ async fn run_connection(
 )
 ```
 
-**Purpose**: Implements the full JSON-RPC event loop for one connection, including routing, outbound serialization, disconnect handling, and final cleanup. It is the core driver that turns transport events into handler calls.
+**Purpose**: Runs the full life of one JSON-RPC connection: route incoming client messages, send replies, notice disconnects, and clean up tasks. Without this loop, the exec server would receive bytes but would not turn them into server actions or responses.
 
-**Data flow**: Takes a `JsonRpcConnection`, shared `SessionRegistry`, and `ExecServerRuntimePaths`. It builds a router, creates an outbound mpsc channel and `RpcNotificationSender`, constructs an `ExecServerHandler`, spawns an outbound serialization task, then repeatedly reads `JsonRpcConnectionEvent` values from `incoming_rx`. Depending on the event, it emits JSON-RPC errors for malformed input, dispatches requests and notifications through router closures, races each dispatch against `disconnected_rx.changed()`, forwards any resulting `RpcServerOutboundMessage` to the outbound channel, and breaks on protocol violations, disconnects, send failures, or session eviction. After the loop it awaits `handler.shutdown()`, drops channels, aborts connection-owned tasks, and awaits the outbound task.
+**Data flow**: It takes a JsonRpcConnection, a shared session registry, and runtime paths. It builds a router, creates an ExecServerHandler, and opens an internal outgoing message channel. As incoming events arrive, it turns valid requests and notifications into handler calls, turns handler results into outbound messages, and sends errors for malformed or unknown requests. When the connection ends or the protocol is broken, it shuts down the handler, closes channels, aborts transport tasks, and waits for the outbound writer task to finish.
 
-**Call relations**: This function is invoked by `ConnectionProcessor::run_connection` in production and by `tests::spawn_test_connection` in the local test harness. It depends on `build_router` for method dispatch and on `ExecServerHandler` for all protocol semantics, while also enforcing transport-level closure rules.
+**Call relations**: ConnectionProcessor::run_connection and the test helper tests::spawn_test_connection call this. Inside, it relies on build_router to find the right request or notification function, ExecServerHandler to do the actual exec-session work, encode_server_message to serialize replies, and invalid_request or method_not_found to make standard JSON-RPC errors.
 
 *Call graph*: calls 6 internal fn (new, encode_server_message, invalid_request, method_not_found, new, build_router); called by 2 (run_connection, spawn_test_connection); 7 external calls (new, Integer, debug!, format!, select!, spawn, warn!).
 
@@ -83,11 +85,11 @@ async fn run_connection(
 async fn transport_disconnect_detaches_session_during_in_flight_read()
 ```
 
-**Purpose**: Tests that dropping the first transport during a long-poll `exec/read` detaches the session quickly enough for a second connection to resume it immediately. It guards against resume being blocked by an in-flight read on the old connection.
+**Purpose**: Checks that a disconnected client does not keep ownership of a session while a long-running read request is still waiting. This protects reconnection: a new client should be able to resume quickly even if the old connection died mid-request.
 
-**Data flow**: Creates a shared `SessionRegistry`, spawns a first in-memory connection, sends initialize and initialized messages, starts a process, issues a long-poll read request, then drops the first writer to simulate disconnect. After a short sleep it spawns a second connection, sends initialize with `resume_session_id` from the first response, waits with a timeout for the resumed initialize response, asserts the session id matches, waits for the first processor task to exit, sends initialized on the second connection, terminates the process, and finally drops the second connection and waits for its task to finish.
+**Data flow**: The test creates a first fake connection, initializes a session, starts a process, and sends a read request that waits. It then drops the first writer to simulate a disconnect, starts a second fake connection, and tries to resume the same session. The expected result is that the second initialize call returns promptly with the same session id, the first processor exits, and the process can be terminated through the second connection.
 
-**Call relations**: This test drives the internal `run_connection` loop through the helper functions in the nested test module. It specifically validates the disconnect-vs-read race handled by the `tokio::select!` branches in request processing.
+**Call relations**: This test drives the same run_connection function used in production through tests::spawn_test_connection. It uses the small test helpers to send JSON-RPC requests and notifications, read typed responses, and build command parameters.
 
 *Call graph*: calls 2 internal fn (from, new); 11 external calls (clone, from_millis, from_secs, assert_eq!, exec_params, read_response, send_notification, send_request, spawn_test_connection, sleep (+1 more)).
 
@@ -101,11 +103,11 @@ fn spawn_test_connection(
     ) -> (DuplexStream, Lines<BufReader<DuplexStream>>, JoinHandle<()>)
 ```
 
-**Purpose**: Creates an in-memory client/server pair and launches `run_connection` against the server side. It is the reusable harness for processor tests.
+**Purpose**: Builds an in-memory client/server connection for tests and starts the real connection processor on the server side. This lets the test exercise production connection logic without opening a real socket or terminal.
 
-**Data flow**: Accepts a shared `Arc<SessionRegistry>` and a label string, creates two `duplex` stream pairs to simulate bidirectional stdio, wraps the server ends in `JsonRpcConnection::from_stdio`, spawns `run_connection(connection, registry, test_runtime_paths())`, and returns the client writer, a line-oriented reader over the client read side, and the join handle.
+**Data flow**: It receives a shared session registry and a label. It creates paired in-memory streams, wraps the server ends as a JsonRpcConnection, starts run_connection in a background task, and returns the client writer, client response reader, and task handle.
 
-**Call relations**: Used by the processor test to stand up first and second logical connections sharing one registry. It delegates actual protocol processing to the same `run_connection` function used in production.
+**Call relations**: The reconnect test calls this twice, once for the old connection and once for the resumed connection. It hands the fake connection to run_connection so the test uses the same routing, disconnect, and cleanup behavior as real code.
 
 *Call graph*: calls 2 internal fn (from_stdio, run_connection); 4 external calls (new, test_runtime_paths, duplex, spawn).
 
@@ -116,11 +118,11 @@ fn spawn_test_connection(
 fn test_runtime_paths() -> ExecServerRuntimePaths
 ```
 
-**Purpose**: Builds runtime paths for processor tests from the current executable. It mirrors the production constructor but omits any Linux sandbox binary.
+**Purpose**: Creates runtime path settings suitable for tests. It points the server at the current test executable and leaves the optional Linux sandbox executable unset.
 
-**Data flow**: Reads `current_exe`, passes it with `None` into `ExecServerRuntimePaths::new`, and returns the resulting runtime-path object.
+**Data flow**: It reads the path of the currently running executable, passes that into ExecServerRuntimePaths::new, and returns the resulting runtime paths object.
 
-**Call relations**: Called by `tests::spawn_test_connection` so each in-memory processor instance has valid runtime configuration.
+**Call relations**: tests::spawn_test_connection calls this while constructing a test connection. The returned paths are passed into run_connection so the handler can be created normally.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (current_exe).
 
@@ -136,11 +138,11 @@ async fn send_request(
     )
 ```
 
-**Purpose**: Serializes and writes a JSON-RPC request line to the test connection. It hides the boilerplate for request id, method, and params encoding.
+**Purpose**: Sends one JSON-RPC request over a test stream. It hides the repetitive work of wrapping a method name, id, and parameters into the protocol’s request shape.
 
-**Data flow**: Takes a mutable `DuplexStream`, numeric id, method string, and serializable params, wraps them in `JSONRPCMessage::Request(JSONRPCRequest { ... })` with `RequestId::Integer(id)` and `serde_json::to_value(params)`, then forwards the message to `write_message`.
+**Data flow**: It receives a writable in-memory stream, a numeric request id, a method name, and serializable parameters. It converts the parameters to JSON, builds a JSONRPCRequest message, and passes it to tests::write_message to put it on the stream.
 
-**Call relations**: Used throughout the processor test to drive initialize, exec, read, and terminate requests into the running connection loop. It depends on `write_message` for the actual framed write.
+**Call relations**: The reconnect test uses this helper for initialize, exec, read, and terminate requests. It hands the final message off to tests::write_message, which performs the actual serialization and write.
 
 *Call graph*: 4 external calls (Request, Integer, write_message, to_value).
 
@@ -151,11 +153,11 @@ async fn send_request(
 async fn send_notification(writer: &mut DuplexStream, method: &str, params: &P)
 ```
 
-**Purpose**: Serializes and writes a JSON-RPC notification line to the test connection. It is the notification counterpart to `send_request`.
+**Purpose**: Sends one JSON-RPC notification over a test stream. A notification is like a request that does not expect a response.
 
-**Data flow**: Takes a mutable `DuplexStream`, method string, and serializable params, wraps them in `JSONRPCMessage::Notification(JSONRPCNotification { ... })` using `serde_json::to_value`, and passes the message to `write_message`.
+**Data flow**: It receives a writable stream, a method name, and serializable parameters. It converts the parameters to JSON, builds a JSONRPCNotification message, and sends it through tests::write_message.
 
-**Call relations**: Used by the processor test to send the `initialized` notification after successful initialize responses. It feeds the same line-oriented transport format expected by `run_connection`.
+**Call relations**: The reconnect test uses this to send the initialized notification after each successful initialize response. It shares the low-level writing path with tests::send_request.
 
 *Call graph*: 3 external calls (Notification, write_message, to_value).
 
@@ -166,11 +168,11 @@ async fn send_notification(writer: &mut DuplexStream, method: &str, params: &P)
 async fn write_message(writer: &mut DuplexStream, message: &JSONRPCMessage)
 ```
 
-**Purpose**: Writes one JSON-RPC message followed by a newline to a duplex stream. It provides the framing expected by the stdio-style test transport.
+**Purpose**: Writes a JSON-RPC message to the test stream in the same line-based format the server expects. Each message is encoded as JSON followed by a newline.
 
-**Data flow**: Accepts a mutable `DuplexStream` and a `JSONRPCMessage`, serializes the message with `serde_json::to_vec`, writes the bytes, then writes `\n`. It returns after both writes complete successfully.
+**Data flow**: It receives a writable in-memory stream and a JSON-RPC message. It serializes the message into bytes, writes those bytes, then writes a newline so the reader can tell where the message ends.
 
-**Call relations**: This low-level helper is called by both `send_request` and `send_notification`. It is the final step that injects test traffic into the processor.
+**Call relations**: tests::send_request and tests::send_notification both use this helper. It is the final step before the test message reaches the production connection reader.
 
 *Call graph*: 2 external calls (write_all, to_vec).
 
@@ -184,11 +186,11 @@ async fn read_response(
     ) -> T
 ```
 
-**Purpose**: Reads the next line from the test connection and decodes it as a successful JSON-RPC response of a caller-specified result type. It fails loudly on errors or unexpected message kinds.
+**Purpose**: Reads one JSON-RPC response from a test stream and decodes its result into the type the test expects. It also verifies that the response id matches the request id.
 
-**Data flow**: Takes a mutable `Lines<BufReader<DuplexStream>>` and an expected integer request id, reads the next line, parses it as `JSONRPCMessage`, matches only `JSONRPCMessage::Response(JSONRPCResponse { id, result })`, asserts the id equals `RequestId::Integer(expected_id)`, and deserializes `result` into `T` with `serde_json::from_value`. Any JSON-RPC error or non-response message causes a panic.
+**Data flow**: It receives a line reader and the expected numeric id. It reads one line, parses it as a JSON-RPC message, checks that it is a response with the expected id, converts the response result into the requested Rust type, and returns that value. If it sees an error or a different message kind, the test fails.
 
-**Call relations**: Used by the processor test after each request to validate that `run_connection` emitted the expected response promptly. It is the read-side counterpart to `send_request`.
+**Call relations**: The reconnect test uses this after requests that should produce replies, such as initialize, exec, and terminate. It turns raw JSON lines coming back from run_connection into strongly checked test values.
 
 *Call graph*: 4 external calls (next_line, assert_eq!, panic!, from_value).
 
@@ -199,11 +201,11 @@ async fn read_response(
 fn exec_params(process_id: ProcessId) -> ExecParams
 ```
 
-**Purpose**: Builds `ExecParams` for the processor test's long-lived process. The command is chosen to emit output only after a delay so the read request remains in flight during disconnect.
+**Purpose**: Builds the parameters for a test command that starts a process and produces output later. The delayed output is useful for creating a read request that can stay in flight.
 
-**Data flow**: Accepts a `ProcessId`, creates a PATH-only environment map, resolves the current directory to `PathUri`, obtains argv from `sleep_then_print_argv`, and returns an `ExecParams` with `env_policy: None`, `tty: false`, `pipe_stdin: false`, and `arg0: None`.
+**Data flow**: It receives a process id. It copies the PATH environment variable if available, gets the current directory as a URI, chooses the platform-specific delayed command from tests::sleep_then_print_argv, and returns an ExecParams structure for starting that command.
 
-**Call relations**: Called by the processor test before sending the `exec` request. Its delayed-output command is essential to reproducing the in-flight long-poll scenario.
+**Call relations**: The reconnect test calls this before sending the exec request. It depends on tests::sleep_then_print_argv for the actual command line and supplies the request body used by tests::send_request.
 
 *Call graph*: calls 1 internal fn (from_path); 4 external calls (new, sleep_then_print_argv, current_dir, var_os).
 
@@ -214,11 +216,11 @@ fn exec_params(process_id: ProcessId) -> ExecParams
 fn sleep_then_print_argv() -> Vec<String>
 ```
 
-**Purpose**: Returns a platform-specific shell command that waits and then prints `late`. It ensures the process stays alive long enough for the disconnect/resume race to be exercised.
+**Purpose**: Returns a small command line that waits briefly and then prints text. It uses different commands on Windows and non-Windows systems so the test can run on both.
 
-**Data flow**: Checks `cfg!(windows)` and returns either a `cmd.exe /C` command using `ping` and `echo late`, or a `/bin/sh -c` command using `sleep 1; printf late`, packaged as `Vec<String>`.
+**Data flow**: It checks the operating system at compile time. On Windows it returns a command shell invocation using ping as a delay; elsewhere it returns a shell command using sleep and printf. The result is a list of command arguments.
 
-**Call relations**: Used only by `tests::exec_params` to define the process behavior for the transport-disconnect test.
+**Call relations**: tests::exec_params calls this when building the test process parameters. Its delayed output helps the main reconnect test create a long-poll read that is still pending when the first connection disconnects.
 
 *Call graph*: 2 external calls (cfg!, vec!).
 
@@ -228,9 +230,13 @@ Session-level dispatch turns incoming operations into concrete protocol handling
 
 ### `core/src/session/handlers.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `main loop, request handling, and teardown`
 
-This file is the main orchestration hub for session-level protocol handling. Small wrappers like `interrupt`, `clean_background_terminals`, `request_user_input_response`, `request_permissions_response`, `dynamic_tool_response`, `refresh_mcp_servers`, and `reload_user_config` simply forward to `Session` methods. More involved handlers translate protocol payloads into internal state transitions: `thread_settings_update` merges partial `ThreadSettingsOverrides` with the active collaboration mode when model/effort updates arrive without an explicit mode object, and `thread_settings_applied_event` snapshots the resulting configuration into a `ThreadSettingsAppliedEvent`. `user_input_or_turn_inner` is the most important path: it destructures `Op::UserInput`, optionally applies thread-setting updates, starts a new turn, emits settings-applied and unknown-model warnings, then tries `sess.steer_input(...)`. If steering reports `NoActiveTurn`, it merges additional context into session state, converts that context into `TurnInput::ResponseItem` values, appends user input if present, refreshes MCP servers if requested, and spawns a regular task. The file also handles inter-agent mailbox traffic, shell-command execution either inside an active turn or as a new task, elicitation resolution, approval decisions including execpolicy amendment persistence, compaction, thread rollback with persistence flush/load/replay and rollback-marker durability, thread memory mode persistence, review-thread spawning, and full shutdown. `submission_loop` ties everything together: it receives `Submission`s from an async channel, creates a tracing span with optional W3C parent context, matches on `Op`, invokes the appropriate handler, and ensures teardown still runs if the channel closes without an explicit shutdown.
+A Codex session is a live conversation with background tasks, tool calls, saved history, permissions, and sometimes realtime audio. This file turns incoming protocol requests into concrete session actions. Think of it like a hotel front desk: guests ask for many different things, and the desk either handles them directly or sends them to housekeeping, maintenance, security, or checkout.
+
+The central piece is `submission_loop`, which waits for `Submission` messages from a channel. Each submission contains an `Op`, meaning an operation requested by the client. The loop matches the operation and calls a smaller handler: start a new user turn, update settings, answer an approval prompt, run a shell command, refresh MCP servers, roll back history, compact the conversation, start a review, or shut the session down.
+
+Several helpers keep the behavior safe and predictable. Settings updates are converted into internal session updates and echoed back as a snapshot. User input either steers an active turn or starts a new model task. Rollback refuses to run during an active turn and carefully reloads persisted history before replaying it. Shutdown stops running tasks, closes services, flushes saved thread state, emits lifecycle hooks, and finally reports completion. The file also creates tracing spans, which are labeled timing/logging scopes that help operators see what each incoming operation did.
 
 #### Function details
 
@@ -240,11 +246,11 @@ This file is the main orchestration hub for session-level protocol handling. Sma
 async fn interrupt(sess: &Arc<Session>)
 ```
 
-**Purpose**: Interrupts the currently running session task.
+**Purpose**: Stops the currently running session task, such as an in-progress model turn or tool activity. A client uses this when the user wants Codex to stop what it is doing.
 
-**Data flow**: Takes `&Arc<Session>`, awaits `sess.interrupt_task()`, and produces no return value or additional state beyond the session-side interruption effects.
+**Data flow**: It receives a shared session reference → asks the session to interrupt its active task → nothing is returned, but the running work is signaled to stop.
 
-**Call relations**: Called from `submission_loop` when it receives `Op::Interrupt`. It is a minimal adapter that keeps the dispatch match concise.
+**Call relations**: `submission_loop` calls this when it receives an interrupt operation. The actual stopping work is handed to the session object, which owns the active task.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -255,11 +261,11 @@ async fn interrupt(sess: &Arc<Session>)
 async fn clean_background_terminals(sess: &Arc<Session>)
 ```
 
-**Purpose**: Closes any unified exec/background terminal processes associated with the session.
+**Purpose**: Closes background terminal processes that were left open by the session. This is useful when the client wants to clean up hidden or auxiliary command processes.
 
-**Data flow**: Accepts `&Arc<Session>`, awaits `sess.close_unified_exec_processes()`, and returns `()` after the session has attempted cleanup.
+**Data flow**: It receives the session → tells it to close unified execution processes → returns after the cleanup request has been made.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::CleanBackgroundTerminals`. It isolates this maintenance action behind a named handler.
+**Call relations**: `submission_loop` calls this for the clean-background-terminals operation. The session’s execution process layer does the real cleanup.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -270,11 +276,11 @@ async fn clean_background_terminals(sess: &Arc<Session>)
 async fn realtime_conversation_list_voices(sess: &Session, sub_id: String)
 ```
 
-**Purpose**: Responds to a realtime-conversation voice-list request with the built-in voice inventory.
+**Purpose**: Sends the client the built-in list of voices available for realtime conversation. It answers a simple “what voices can I use?” request.
 
-**Data flow**: Builds an `Event` using the provided subscription id and `EventMsg::RealtimeConversationListVoicesResponse`, filling `voices` with `RealtimeVoicesList::builtin()`, then sends it via `sess.send_event_raw`.
+**Data flow**: It receives the session and submission id → builds a response event containing the built-in voice list → sends that event back under the same id.
 
-**Call relations**: Used by `submission_loop` for `Op::RealtimeConversationListVoices` and by a dedicated test. It does not query dynamic state; it always emits the built-in list.
+**Call relations**: `submission_loop` calls this for realtime voice-list requests, and tests call it to check the emitted list. It does not ask an external service; it uses the built-in voice catalog.
 
 *Call graph*: calls 1 internal fn (builtin); called by 2 (submission_loop, realtime_conversation_list_voices_emits_builtin_list); 2 external calls (send_event_raw, RealtimeConversationListVoicesResponse).
 
@@ -290,11 +296,11 @@ async fn user_input_or_turn(
 )
 ```
 
-**Purpose**: Public wrapper that forwards user-input submissions into the full turn/steering handler.
+**Purpose**: Public wrapper for processing user input. It exists so callers can use a simple entry point while the detailed logic stays in `user_input_or_turn_inner`.
 
-**Data flow**: Receives the session, submission id, `Op`, and optional client message id; passes them unchanged to `user_input_or_turn_inner` and awaits completion.
+**Data flow**: It receives the session, submission id, operation, and optional client message id → forwards all of that unchanged → returns when the inner processing is done.
 
-**Call relations**: Called from `submission_loop` for `Op::UserInput` and from tests. It exists mainly as the externally visible entry while the inner function remains `pub(super)`.
+**Call relations**: `submission_loop` and tests call this. It immediately delegates to `user_input_or_turn_inner`, which decides whether to steer an active turn or start a new one.
 
 *Call graph*: calls 1 internal fn (user_input_or_turn_inner); called by 2 (submission_loop, user_turn_updates_approvals_reviewer).
 
@@ -309,11 +315,11 @@ async fn update_thread_settings(
 )
 ```
 
-**Purpose**: Applies thread-setting overrides and emits either a snapshot event or a bad-request error event.
+**Purpose**: Applies new conversation-level settings, such as model, permissions, sandboxing, workspace roots, or personality. It also reports either the applied settings snapshot or a clear error back to the client.
 
-**Data flow**: Transforms `ThreadSettingsOverrides` into `SessionSettingsUpdate` via `thread_settings_update`, calls `sess.update_settings(updates)`, maps success to `thread_settings_applied_event(sess).await` and failure to `EventMsg::Error` with a formatted validation message, then sends the resulting event with the provided submission id.
+**Data flow**: It receives setting overrides → converts them into the session’s internal update format → asks the session to apply them → sends either a settings-applied event or an invalid-settings error.
 
-**Call relations**: Invoked by `submission_loop` for `Op::ThreadSettings`. It orchestrates the update-and-respond flow while delegating update construction and snapshot formatting to helper functions.
+**Call relations**: `submission_loop` calls this for thread settings operations. It relies on `thread_settings_update` to prepare the update and `thread_settings_applied_event` to describe the result.
 
 *Call graph*: calls 2 internal fn (thread_settings_applied_event, thread_settings_update); called by 1 (submission_loop); 2 external calls (format!, Error).
 
@@ -327,11 +333,11 @@ async fn thread_settings_update(
 ) -> SessionSettingsUpdate
 ```
 
-**Purpose**: Converts protocol-level thread-setting overrides into the internal `SessionSettingsUpdate` structure, preserving current collaboration mode when only partial model settings are supplied.
+**Purpose**: Translates protocol-facing setting overrides into the internal update object the session understands. It also preserves the current collaboration mode when only model or reasoning effort changes are supplied.
 
-**Data flow**: Destructures `ThreadSettingsOverrides` into individual optional fields. If `collaboration_mode` is absent, it locks `sess.state`, reads the current `session_configuration.collaboration_mode`, and derives an updated mode with `with_updates(model, effort, None)`; then it returns a `SessionSettingsUpdate` populated with the provided environment, workspace, approval, sandbox, permission, Windows sandbox, collaboration, reasoning summary, service tier, and personality fields plus defaults for the rest.
+**Data flow**: It receives the session and the user’s partial settings override → reads current session configuration if needed → builds a `SessionSettingsUpdate` with explicit fields and defaults for the rest.
 
-**Call relations**: Used by both `update_thread_settings` and `user_input_or_turn_inner` whenever thread settings accompany a request. It centralizes the subtle rule that model and reasoning effort currently live inside collaboration-mode settings.
+**Call relations**: `update_thread_settings` uses this for standalone settings changes, and `user_input_or_turn_inner` uses it when a user message includes settings changes. It is the adapter between client settings and session settings.
 
 *Call graph*: called by 2 (update_thread_settings, user_input_or_turn_inner); 1 external calls (default).
 
@@ -342,11 +348,11 @@ async fn thread_settings_update(
 async fn thread_settings_applied_event(sess: &Session) -> EventMsg
 ```
 
-**Purpose**: Builds the protocol event that reports the session’s current thread settings snapshot back to the client.
+**Purpose**: Builds the confirmation message that tells the client what settings are now active. This prevents the client from guessing after a partial update.
 
-**Data flow**: Locks `sess.state`, obtains `state.session_configuration.thread_config_snapshot()`, clones the snapshot cwd, and constructs `EventMsg::ThreadSettingsApplied` containing a `ThreadSettingsSnapshot` with model, provider, service tier, approval settings, permission profile fields, cwd, reasoning settings, personality, and collaboration mode.
+**Data flow**: It reads the session’s current thread configuration snapshot → copies the relevant fields into a protocol event → returns that event message.
 
-**Call relations**: Called after successful settings updates from both `update_thread_settings` and `user_input_or_turn_inner`. It is the canonical formatter for the post-update snapshot sent to clients.
+**Call relations**: `update_thread_settings` sends this after a successful settings update. `user_input_or_turn_inner` also sends it when a user input request included settings overrides.
 
 *Call graph*: called by 2 (update_thread_settings, user_input_or_turn_inner); 1 external calls (ThreadSettingsApplied).
 
@@ -362,11 +368,11 @@ async fn user_input_or_turn_inner(
 )
 ```
 
-**Purpose**: Processes a `UserInput` operation by applying optional thread-setting updates, opening a turn, attempting to steer active work, and falling back to spawning a new regular task when no active turn can accept the input.
+**Purpose**: Processes a user message. It either adds the message to an already-running turn or starts a fresh model turn with the user input and any extra context.
 
-**Data flow**: Pattern-matches `op` as `Op::UserInput`, extracts items, schema, metadata, additional context, and thread settings, computes whether settings-applied should be emitted, builds `SessionSettingsUpdate` via `thread_settings_update` or default, stores `final_output_json_schema`, and calls `sess.new_turn_with_sub_id`. On success it may emit `ThreadSettingsApplied`, emits unknown-model warnings, and calls `sess.steer_input(...)`. If steering succeeds it records telemetry for the user prompt. If it returns `SteerInputError::NoActiveTurn(items)`, it optionally stores responses API metadata in turn metadata, refreshes MCP servers, merges additional context into session state, converts merged context into `ResponseItem` then `TurnInput::ResponseItem`, appends a `TurnInput::UserInput` when the original items are non-empty, and spawns a regular task. Any other steering error is converted to an `ErrorEvent` and sent.
+**Data flow**: It receives a user-input operation → optionally applies thread settings and output schema → opens a new turn record → tries to steer an active turn → if no active turn exists, merges extra context, builds task input, refreshes requested MCP servers, and spawns a regular task → if something fails, sends an error event.
 
-**Call relations**: Reached from `user_input_or_turn` and realtime text routing. It is the central bridge between protocol input and task execution, delegating turn creation, steering, MCP refresh, context merging, and task spawning to session methods.
+**Call relations**: `user_input_or_turn` and realtime text routing call this. It coordinates session state, telemetry, MCP refresh, context merging, and task spawning so the user’s message becomes model work.
 
 *Call graph*: calls 3 internal fn (thread_settings_applied_event, thread_settings_update, new); called by 2 (route_realtime_text_input, user_input_or_turn); 5 external calls (clone, default, Error, default, unreachable!).
 
@@ -381,11 +387,11 @@ async fn inter_agent_communication(
 )
 ```
 
-**Purpose**: Queues an inter-agent mailbox message and optionally triggers turn startup if the message requests it.
+**Purpose**: Queues a message from another agent and optionally starts work if the session is idle. This lets agents leave mailbox-style messages for the conversation.
 
-**Data flow**: Reads `communication.trigger_turn`, enqueues the full `InterAgentCommunication` into `sess.input_queue`, and if the flag is true calls `sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)`.
+**Data flow**: It receives inter-agent communication → stores it in the session input queue → if the message says to trigger a turn, asks the session to start pending work under the submission id.
 
-**Call relations**: Called by `submission_loop` for `Op::InterAgentCommunication`. It separates mailbox enqueueing from the scheduler decision about whether pending work should wake an idle session.
+**Call relations**: `submission_loop` calls this for inter-agent communication operations. The pending-work scheduler decides whether the queued message should become a new turn.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -396,11 +402,11 @@ async fn inter_agent_communication(
 async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String)
 ```
 
-**Purpose**: Executes a user shell command either as auxiliary work attached to the active turn or as a standalone task in a newly created default turn.
+**Purpose**: Runs a shell command requested directly by the user. If a turn is already active, it runs as side work for that turn; otherwise it starts a dedicated shell-command task.
 
-**Data flow**: Checks `sess.active_turn_context_and_cancellation_token()`. If an active turn exists, it clones the session and spawns a Tokio task that calls `execute_user_shell_command(session, turn_context, command, cancellation_token, UserShellCommandMode::ActiveTurnAuxiliary)`. Otherwise it creates a default turn with the submission id and spawns a `UserShellCommandTask::new(command)` with empty initial input.
+**Data flow**: It receives the command and session → checks for an active turn and cancellation token → either spawns an auxiliary command task tied to that turn, or creates a new default turn and spawns a `UserShellCommandTask` → returns immediately after scheduling.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::RunUserShellCommand` and covered by tests. It chooses between in-turn auxiliary execution and standalone task startup based on whether a turn is already active.
+**Call relations**: `submission_loop` calls this for run-shell-command operations, and tests check its context behavior. It hands actual command execution to `execute_user_shell_command` or to a task object.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (submission_loop, run_user_shell_command_does_not_set_reference_context_item); 4 external calls (clone, new, execute_user_shell_command, spawn).
 
@@ -416,11 +422,11 @@ async fn resolve_elicitation(
     content: Option<Value
 ```
 
-**Purpose**: Maps a protocol-level elicitation decision into the RMCP client representation and forwards it to the session.
+**Purpose**: Sends the user’s answer to an MCP elicitation request. An elicitation is a prompt from an external tool/server asking the user to provide or approve information.
 
-**Data flow**: Converts `codex_protocol::approvals::ElicitationAction` into `codex_rmcp_client::ElicitationAction`, normalizes accepted responses to include `{}` content when absent while dropping content for decline/cancel, wraps action/content/meta into `ElicitationResponse`, converts `ProtocolRequestId` into `rmcp::model::NumberOrString`, and calls `sess.resolve_elicitation(server_name, request_id, response)`, logging a warning if that fails.
+**Data flow**: It receives server name, request id, decision, optional content, and metadata → converts protocol types into the MCP client’s types → fills in an empty object for accepted legacy responses with no content → asks the session to resolve the request → logs a warning if resolution fails.
 
-**Call relations**: Used by `submission_loop` for `Op::ResolveElicitation`. It is the protocol adaptation layer between client-facing approval responses and the session’s MCP elicitation machinery.
+**Call relations**: `submission_loop` calls this when the client answers an elicitation. The session then forwards the answer to the MCP connection that originally asked.
 
 *Call graph*: called by 1 (submission_loop); 4 external calls (Number, String, from, warn!).
 
@@ -436,11 +442,11 @@ async fn exec_approval(
 )
 ```
 
-**Purpose**: Applies a user’s exec approval decision, including optional persistence of an execpolicy amendment before notifying the waiting approval flow.
+**Purpose**: Applies the user’s decision about an execution approval request. It can also persist an approved execution-policy amendment before notifying the waiting task.
 
-**Data flow**: Computes an event turn id from `turn_id` or `approval_id`. If the decision is `ApprovedExecpolicyAmendment`, it calls `sess.persist_execpolicy_amendment(...)`; on success it records an amendment message, on failure it formats a warning message and sends `EventMsg::Warning`. It then either interrupts the task for `ReviewDecision::Abort` or forwards the decision to `sess.notify_approval(&approval_id, other)`.
+**Data flow**: It receives an approval id, optional turn id, and decision → if the decision includes an exec-policy amendment, tries to save it and records or warns about the result → if the decision is abort, interrupts the task; otherwise notifies the session of the approval decision.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::ExecApproval`. It adds amendment persistence and warning emission around the generic approval-notification path.
+**Call relations**: `submission_loop` calls this for exec approval operations. It connects the client’s security decision to the paused command or tool request waiting inside the session.
 
 *Call graph*: called by 1 (submission_loop); 3 external calls (format!, Warning, warn!).
 
@@ -451,11 +457,11 @@ async fn exec_approval(
 async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision)
 ```
 
-**Purpose**: Propagates a non-exec approval patch decision or aborts the active task.
+**Purpose**: Applies the user’s decision about a patch approval request. A patch approval is permission to make or apply file changes.
 
-**Data flow**: Matches on `ReviewDecision`; `Abort` triggers `sess.interrupt_task().await`, while any other decision is passed to `sess.notify_approval(&id, other).await`.
+**Data flow**: It receives the approval id and decision → interrupts the running task if the decision is abort → otherwise sends the decision to the session’s approval waiters.
 
-**Call relations**: Called from `submission_loop` for `Op::PatchApproval`. It is a simpler sibling of `exec_approval` without execpolicy amendment handling.
+**Call relations**: `submission_loop` calls this for patch approval operations. It is the patch-specific counterpart to `exec_approval`, but without exec-policy amendment handling.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -470,11 +476,11 @@ async fn request_user_input_response(
 )
 ```
 
-**Purpose**: Forwards a response to a pending user-input request back into the session.
+**Purpose**: Delivers the client’s answer to a pending request for more user input. This unblocks session work that paused to ask the user a question.
 
-**Data flow**: Accepts the request id and `RequestUserInputResponse`, then awaits `sess.notify_user_input_response(&id, response)`.
+**Data flow**: It receives the request id and response → passes both to the session → returns after the session has been notified.
 
-**Call relations**: Used by `submission_loop` for `Op::UserInputAnswer`. It is a thin protocol-to-session adapter.
+**Call relations**: `submission_loop` calls this when a user-input-answer operation arrives. The session matches the id to the waiting task.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -489,11 +495,11 @@ async fn request_permissions_response(
 )
 ```
 
-**Purpose**: Forwards a response to a pending permissions request back into the session.
+**Purpose**: Delivers the client’s answer to a pending permissions request. This lets paused work continue or stop based on the user’s permission decision.
 
-**Data flow**: Accepts the request id and `RequestPermissionsResponse`, then awaits `sess.notify_request_permissions_response(&id, response)`.
+**Data flow**: It receives the request id and permission response → passes them to the session’s permission-response notifier → returns when notification is complete.
 
-**Call relations**: Used by `submission_loop` for `Op::RequestPermissionsResponse`. Like the user-input response handler, it simply bridges protocol input to session state.
+**Call relations**: `submission_loop` calls this for request-permissions-response operations. The session wakes the part of the system waiting for that permission decision.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -504,11 +510,11 @@ async fn request_permissions_response(
 async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: DynamicToolResponse)
 ```
 
-**Purpose**: Delivers a dynamic tool response to the session component waiting for it.
+**Purpose**: Delivers a response for a dynamic tool request. Dynamic tools are tools whose details can be supplied or changed at runtime rather than being fixed in the program.
 
-**Data flow**: Takes the response id and `DynamicToolResponse`, then calls `sess.notify_dynamic_tool_response(&id, response).await`.
+**Data flow**: It receives the tool request id and response → forwards them to the session → returns after the waiting tool flow has been notified.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::DynamicToolResponse`. It is another narrow forwarding adapter.
+**Call relations**: `submission_loop` calls this for dynamic-tool-response operations. The session connects the response to the tool request that was waiting.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -519,11 +525,11 @@ async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: Dynami
 async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig)
 ```
 
-**Purpose**: Stores a pending MCP server refresh configuration to be applied later during turn processing.
+**Purpose**: Records that MCP servers should be refreshed using the given configuration. MCP servers are external tool servers that Codex can connect to.
 
-**Data flow**: Locks `sess.pending_mcp_server_refresh_config` and replaces its contents with `Some(refresh_config)`.
+**Data flow**: It receives a refresh configuration → locks the session’s pending-refresh slot, which is a protected shared value → stores the configuration there for later use.
 
-**Call relations**: Called by `submission_loop` for `Op::RefreshMcpServers`. It does not refresh immediately; later turn logic consumes this pending config via session MCP helpers.
+**Call relations**: `submission_loop` calls this when the client asks to refresh MCP servers. Later turn setup reads the pending configuration and performs the refresh.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -534,11 +540,11 @@ async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefre
 async fn reload_user_config(sess: &Arc<Session>)
 ```
 
-**Purpose**: Triggers reloading of the user config layer for the session.
+**Purpose**: Reloads the user configuration layer for the running session. This lets changes to user config take effect without restarting the whole process.
 
-**Data flow**: Awaits `sess.reload_user_config_layer()` and returns `()`.
+**Data flow**: It receives the session → asks it to reload user config → returns when the reload operation completes.
 
-**Call relations**: Invoked from `submission_loop` for `Op::ReloadUserConfig`. It delegates all actual reload semantics to the session.
+**Call relations**: `submission_loop` calls this for reload-user-config operations. The session owns the actual configuration reload logic.
 
 *Call graph*: called by 1 (submission_loop).
 
@@ -549,11 +555,11 @@ async fn reload_user_config(sess: &Arc<Session>)
 async fn compact(sess: &Arc<Session>, sub_id: String)
 ```
 
-**Purpose**: Starts a compaction task in a fresh default turn.
+**Purpose**: Starts a compaction task, which reduces or summarizes conversation context so the session can keep working within model limits. It is like tidying a long notebook so the important parts remain usable.
 
-**Data flow**: Creates a default turn context with the submission id, then calls `sess.spawn_task(Arc::clone(&turn_context), Vec::new(), CompactTask).await`.
+**Data flow**: It receives the session and submission id → creates a new default turn context → spawns a `CompactTask` with no user input items → returns after scheduling the task.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::Compact`. It is the entry point for compaction work and always runs as a new task.
+**Call relations**: `submission_loop` calls this for compact operations. The session task system performs the actual compaction work.
 
 *Call graph*: called by 1 (submission_loop); 2 external calls (clone, new).
 
@@ -564,11 +570,11 @@ async fn compact(sess: &Arc<Session>, sub_id: String)
 async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32)
 ```
 
-**Purpose**: Rolls back persisted thread history by replaying stored rollout items minus the requested number of turns, then records and emits a rollback marker.
+**Purpose**: Rolls the conversation thread back by a requested number of user turns. It is used when the client wants to undo recent conversation history and continue from an earlier point.
 
-**Data flow**: Validates `num_turns >= 1`, rejects rollback if an active turn exists, creates a default turn context, obtains a persisted live thread or emits an error if unavailable, flushes persistence, loads non-archived history, constructs `ThreadRolledBackEvent` and `EventMsg::ThreadRolledBack`, appends that marker to the replay item stream, applies rollout reconstruction, recomputes token usage, persists the rollback marker, flushes rollout with warning-on-failure, and finally delivers the rollback event to the client.
+**Data flow**: It receives the session, submission id, and number of turns → rejects zero turns and rejects rollback during an active turn → opens a default turn context → loads and flushes persisted thread history → appends a rollback marker to the replay data → reconstructs in-memory state, recomputes token usage, persists the marker, and emits a rollback event or warning/error as needed.
 
-**Call relations**: Called from `submission_loop` for `Op::ThreadRollback` and heavily exercised by tests. It coordinates persistence, replay, state recomputation, and client notification to make rollback durable and visible.
+**Call relations**: `submission_loop` calls this for rollback operations, and many tests exercise its safety cases. It depends on persisted thread history because rollback must rebuild the session from durable records rather than guess from partial memory.
 
 *Call graph*: called by 9 (submission_loop, thread_rollback_clears_history_when_num_turns_exceeds_existing_turns, thread_rollback_drops_last_turn_from_history, thread_rollback_fails_when_num_turns_is_zero, thread_rollback_fails_when_turn_in_progress, thread_rollback_fails_without_persisted_thread_history, thread_rollback_persists_marker_and_replays_cumulatively, thread_rollback_recomputes_previous_turn_settings_and_reference_context_from_replay, thread_rollback_restores_cleared_reference_context_item_after_compaction); 6 external calls (format!, Error, ThreadRolledBack, Warning, EventMsg, once).
 
@@ -582,11 +588,11 @@ async fn persist_thread_memory_mode_update(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Persists a thread-level memory mode change into durable thread metadata.
+**Purpose**: Writes the thread’s memory mode setting into persisted thread metadata. This controls whether the thread is eligible for future memory generation.
 
-**Data flow**: Obtains a live thread via `sess.live_thread_for_persistence(...)`, persists and flushes current state, calls `update_memory_mode(mode, false)`, flushes again, and returns `Ok(())` or the first persistence error.
+**Data flow**: It receives the session and desired memory mode → obtains the live persisted thread → makes sure current state is persisted and flushed → updates the memory mode in stored metadata → flushes again → returns success or an error.
 
-**Call relations**: Used internally by `set_thread_memory_mode`. It isolates the persistence sequence required to safely update thread metadata.
+**Call relations**: `set_thread_memory_mode` calls this and turns any error into a client-facing event. The function isolates the durable-storage steps from the public handler.
 
 *Call graph*: called by 2 (set_thread_memory_mode, set_thread_memory_mode).
 
@@ -597,11 +603,11 @@ async fn persist_thread_memory_mode_update(
 async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: ThreadMemoryMode)
 ```
 
-**Purpose**: Applies a thread memory mode update and reports any persistence failure back to the client as an error event.
+**Purpose**: Applies a thread-level memory mode change and reports failures. It does not talk to the model; it only changes saved metadata about the thread.
 
-**Data flow**: Calls `persist_thread_memory_mode_update(sess, mode).await`; on error it logs a warning, constructs an `EventMsg::Error` with `CodexErrorInfo::Other`, and sends it using the provided submission id.
+**Data flow**: It receives the session, submission id, and mode → calls `persist_thread_memory_mode_update` → if that fails, logs the problem and sends an error event to the client.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::SetThreadMemoryMode`. It wraps the lower-level persistence helper with user-visible error reporting.
+**Call relations**: `submission_loop` calls this for set-thread-memory-mode operations. It relies on `persist_thread_memory_mode_update` for storage and handles user-visible error reporting.
 
 *Call graph*: calls 1 internal fn (persist_thread_memory_mode_update); called by 1 (submission_loop); 2 external calls (Error, warn!).
 
@@ -612,11 +618,11 @@ async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: Threa
 async fn shutdown_session_runtime(sess: &Arc<Session>)
 ```
 
-**Purpose**: Performs the internal teardown sequence for a session runtime without emitting the final shutdown-complete protocol event.
+**Purpose**: Stops the live runtime pieces of a session. This is the cleanup step that prevents background work, processes, connections, and review services from continuing after the session ends.
 
-**Data flow**: Takes and aborts any startup prewarm handle, aborts all tasks with `TurnAbortReason::Interrupted`, shuts down the conversation, terminates all unified exec processes, attempts code-mode shutdown with warning on failure, shuts down the MCP connection manager, and shuts down the guardian review session.
+**Data flow**: It receives the session → aborts startup prewarm if present → aborts all tasks → shuts down the conversation, execution processes, code mode service, MCP connections, and Guardian review session → logs if code mode shutdown fails.
 
-**Call relations**: Called by both `shutdown` and the fallback path at the end of `submission_loop` when the channel closes unexpectedly. It centralizes runtime cleanup so explicit and implicit teardown share the same sequence.
+**Call relations**: `shutdown` calls this during an explicit shutdown, and `submission_loop` calls it if the submission channel closes unexpectedly. It is runtime cleanup, separate from sending the final shutdown event.
 
 *Call graph*: called by 2 (shutdown, submission_loop); 1 external calls (warn!).
 
@@ -627,11 +633,11 @@ async fn shutdown_session_runtime(sess: &Arc<Session>)
 async fn emit_thread_stop_lifecycle(sess: &Session)
 ```
 
-**Purpose**: Invokes extension lifecycle contributors for thread-stop notifications.
+**Purpose**: Notifies extensions that the thread is stopping. Extensions are add-on components that may need to save data or run cleanup code.
 
-**Data flow**: Iterates over `sess.services.extensions.thread_lifecycle_contributors()`, and for each contributor awaits `on_thread_stop` with references to session and thread extension stores.
+**Data flow**: It receives the session → asks the extension service for thread-lifecycle contributors → calls each contributor’s stop hook with access to session and thread extension stores → returns after all hooks finish.
 
-**Call relations**: Used during both explicit `shutdown` and implicit teardown after `submission_loop` exits. It gives extensions a consistent stop hook after runtime cleanup.
+**Call relations**: `shutdown` and `submission_loop` call this during teardown. It gives extensions a formal chance to react before the session is fully gone.
 
 *Call graph*: called by 2 (shutdown, submission_loop).
 
@@ -642,11 +648,11 @@ async fn emit_thread_stop_lifecycle(sess: &Session)
 async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool
 ```
 
-**Purpose**: Runs full session shutdown, records telemetry and rollout trace completion, flushes thread persistence, emits `ShutdownComplete`, and signals the submission loop to exit.
+**Purpose**: Performs a full, explicit session shutdown and tells the client it is complete. It also records final telemetry and closes persisted thread state cleanly.
 
-**Data flow**: Calls `shutdown_session_runtime`, logs shutdown, clones conversation history and counts user-turn boundaries for telemetry, emits thread-stop lifecycle hooks, attempts `live_thread.shutdown()` and sends an error event if that fails, constructs and records a `ShutdownComplete` event in rollout tracing, delivers it, records rollout completion status, and returns `true`.
+**Data flow**: It receives the session and submission id → stops runtime services → counts user turns from history and records telemetry → emits thread-stop lifecycle hooks → shuts down live thread persistence if present → records and delivers a shutdown-complete event → marks the rollout trace completed → returns true to tell the loop to exit.
 
-**Call relations**: Triggered from `submission_loop` for `Op::Shutdown`. Its boolean return is used by the loop to break and avoid duplicate teardown.
+**Call relations**: `submission_loop` calls this when it receives a shutdown operation. It builds on `shutdown_session_runtime` and `emit_thread_stop_lifecycle`, then adds client notification and trace finalization.
 
 *Call graph*: calls 2 internal fn (emit_thread_stop_lifecycle, shutdown_session_runtime); called by 1 (submission_loop); 4 external calls (try_from, info!, Error, warn!).
 
@@ -662,11 +668,11 @@ async fn review(
 )
 ```
 
-**Purpose**: Starts a review workflow in a fresh turn after resolving the incoming review request against the turn cwd.
+**Purpose**: Starts a review flow for a requested target, such as code or changes needing inspection. It validates and resolves the request before launching the review thread.
 
-**Data flow**: Creates a default turn context, emits unknown-model warnings, refreshes MCP servers if requested, resolves the incoming `ReviewRequest` with `resolve_review_request(review_request, &turn_context.cwd)`, and on success calls `spawn_review_thread(...)`; on failure it sends an `ErrorEvent` through the turn context.
+**Data flow**: It receives the session, config, submission id, and review request → creates a default turn context → emits model warnings and refreshes MCP servers if needed → resolves the review request relative to the current working directory → either spawns a review thread or sends an error event.
 
-**Call relations**: Dispatched from `submission_loop` for `Op::Review`. It orchestrates the setup and validation needed before handing off to the dedicated review-thread spawner.
+**Call relations**: `submission_loop` calls this for review operations. It hands validated review work to `spawn_review_thread`; invalid requests are reported directly to the client.
 
 *Call graph*: called by 1 (submission_loop); 4 external calls (clone, resolve_review_request, spawn_review_thread, Error).
 
@@ -681,11 +687,11 @@ async fn submission_loop(
 )
 ```
 
-**Purpose**: Receives protocol submissions from the session channel, wraps each dispatch in tracing context, routes every supported `Op` to its handler, and guarantees teardown when the loop ends.
+**Purpose**: The main dispatcher for a session’s incoming client operations. It keeps reading submissions and calls the right handler for each operation until shutdown or channel closure.
 
-**Data flow**: Consumes `Submission` values from `rx_sub.recv().await` in a loop, logs each submission, creates a span via `submission_dispatch_span`, matches on `sub.op.clone()`, invokes the corresponding handler for realtime conversation, user input, settings, approvals, MCP refresh, rollback, shell commands, review, shutdown, and other operations, and tracks whether an explicit shutdown occurred. If the channel closes without shutdown, it still calls `shutdown_session_runtime` and `emit_thread_stop_lifecycle` before exiting.
+**Data flow**: It receives the session, config, and a channel of submissions → repeatedly reads one submission at a time → creates a tracing span for observability → matches the operation and awaits the matching handler → exits on explicit shutdown, or performs cleanup if the channel closes without shutdown.
 
-**Call relations**: Called by the session’s internal spawn path and acts as the central dispatcher for this file. Every other handler here is either directly invoked from this match or supports one of the invoked flows.
+**Call relations**: `spawn_internal` starts this loop. It is the hub that calls nearly every other handler in this file, plus realtime conversation handlers from another module.
 
 *Call graph*: calls 30 internal fn (handle_audio, handle_close, handle_speech, handle_start, handle_text, approve_guardian_denied_action, clean_background_terminals, compact, dynamic_tool_response, emit_thread_stop_lifecycle (+15 more)); called by 1 (spawn_internal); 2 external calls (debug!, Error).
 
@@ -696,11 +702,11 @@ async fn submission_loop(
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent)
 ```
 
-**Purpose**: Transforms approval of a previously denied Guardian assessment into a developer message injected into the conversation without starting a new turn.
+**Purpose**: Turns a user approval of a previously denied Guardian action into developer instructions injected into the session. Guardian is a safety review layer that can deny risky actions.
 
-**Data flow**: Checks that `event.status` is `Denied`, otherwise warns and returns. For denied events it builds a JSON object containing the original action and `outcome: "allowed"`, pretty-serializes it, formats a developer instruction block prefixed with `AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX`, wraps that text in a `ResponseInputItem::Message` and `ResponseItem`, and calls `sess.inject_no_new_turn(items, None).await`.
+**Data flow**: It receives the session and Guardian assessment event → ignores it unless the event was denied → builds a JSON description of the exact approved action → formats developer text saying only that exact action is approved → injects that message into the session without starting a new turn.
 
-**Call relations**: Invoked from `submission_loop` for `Op::ApproveGuardianDeniedAction`. It converts an approval action into conversation state that the model can consume on the next turn or active work stream.
+**Call relations**: `submission_loop` calls this for approve-Guardian-denied-action operations. It does not directly execute the action; it adds precise approval context so the ongoing flow can reconsider it.
 
 *Call graph*: called by 1 (submission_loop); 5 external calls (format!, json!, to_string_pretty, vec!, warn!).
 
@@ -711,11 +717,11 @@ async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAsse
 fn submission_dispatch_span(sub: &Submission) -> tracing::Span
 ```
 
-**Purpose**: Creates the tracing span used for dispatching a submission and optionally attaches a W3C parent trace context from the submission payload.
+**Purpose**: Creates a tracing span for one incoming submission. A tracing span is a labeled block of logs and timing data that helps developers understand what happened during that operation.
 
-**Data flow**: Reads the operation kind from `sub.op.kind()`, formats an OpenTelemetry span name, creates either a `debug_span!` for realtime audio or an `info_span!` for all other ops with submission id and op fields, then if `sub.trace` is present attempts `set_parent_from_w3c_trace_context`; invalid trace carriers trigger a warning. It returns the configured `tracing::Span`.
+**Data flow**: It receives a submission → reads the operation kind and id → creates a debug-level span for high-volume realtime audio or an info-level span for other operations → attaches a parent trace from the submission if valid → returns the span.
 
-**Call relations**: Called once per iteration by `submission_loop` before dispatching the operation. It provides consistent observability metadata across all handlers in this file.
+**Call relations**: `submission_loop` calls this before dispatching each operation and then runs the handler inside the span. This ties logs and telemetry for that operation together.
 
 *Call graph*: called by 1 (submission_loop); 5 external calls (set_parent_from_w3c_trace_context, debug_span!, format!, info_span!, warn!).
 
@@ -725,11 +731,17 @@ Supporting dispatch machinery then governs how work is serialized by resource ke
 
 ### `app-server/src/request_serialization.rs`
 
-`util` · `cross-cutting request dispatch serialization for initialized client requests`
+`domain_logic` · `request handling`
 
-This module implements the app server's per-scope request serialization mechanism. `RequestSerializationQueueKey` enumerates the resource scopes that can be serialized independently: global names, thread ids, thread paths, command-exec processes, generic processes, fuzzy-search sessions, filesystem watches, and MCP OAuth servers. `RequestSerializationQueueKey::from_scope` converts the wire-level `ClientRequestSerializationScope` plus `ConnectionId` into an internal key and an access mode (`Exclusive` or `SharedRead`).
+Some client requests must not run on top of each other. For example, two requests that change the same thread, process, file watch, or OAuth flow could interfere if they happen at once. This file provides the waiting-room system for those requests.
 
-Queued work is represented by `QueuedInitializedRequest`, which pairs a boxed future with a `ConnectionRpcGate`. Running the request goes through `gate.run(future)`, so requests for closed or shutting-down connections are skipped consistently. `RequestSerializationQueues` stores a `HashMap<RequestSerializationQueueKey, VecDeque<QueuedSerializedRequest>>` behind a Tokio mutex. `enqueue` pushes onto an existing queue or creates a new queue and spawns a dedicated drain task for that key. `drain` repeatedly pops the next request; if it is `SharedRead`, it also drains any immediately following shared reads for the same key into the same batch. It then runs the batch concurrently with `join_all`. This preserves FIFO ordering across writes and read/write boundaries while allowing adjacent reads to overlap. The tests cover FIFO behavior for same-key exclusives, concurrency across different keys, skipping requests whose gate is already closed or shuts down while queued, concurrent execution of adjacent shared reads, writer blocking behind running readers, and the invariant that later readers cannot jump ahead of an already queued writer.
+The main idea is a key: `RequestSerializationQueueKey` names the thing a request is about, such as a thread, a process, a path, or a global operation. Requests with the same key share one line. Requests with different keys get different lines and can move independently.
+
+Each queued request also says whether it needs `Exclusive` access, meaning it must run alone, or `SharedRead` access, meaning it can run beside other reads. This is like a library room: many people may read the same book at once, but only one person may rewrite it.
+
+`RequestSerializationQueues` stores one first-in, first-out queue per key. When the first request for a key arrives, it starts a background task that drains that key’s queue. The drainer runs one exclusive request at a time, or groups consecutive shared reads and waits for them all to finish before moving on. It does not let later reads skip ahead of an already queued exclusive request.
+
+Each queued request is wrapped with a `ConnectionRpcGate`, which acts like a safety gate for a client connection. If the connection is closed or shutting down, the gate can prevent already queued work from running.
 
 #### Function details
 
@@ -742,11 +754,11 @@ fn from_scope(
     ) -> (Self, RequestSerializationAccess)
 ```
 
-**Purpose**: Maps a client-declared serialization scope into the internal queue key and access mode used by the dispatcher. It also folds connection identity into scopes that are connection-local.
+**Purpose**: This converts the request’s public serialization scope into the internal queue key used by the server. It also decides whether that scope should run alone or may share time with other read-only requests.
 
-**Data flow**: Accepts a `ConnectionId` and `ClientRequestSerializationScope`, matches the scope variant, constructs the corresponding `RequestSerializationQueueKey`, and returns it paired with either `RequestSerializationAccess::Exclusive` or `SharedRead`.
+**Data flow**: It receives the connection id and a client-provided scope. It matches the scope to the correct internal key, adding the connection id where needed so two clients do not accidentally share a process or file-watch queue. It returns the key plus either exclusive or shared-read access.
 
-**Call relations**: Called by initialized-request dispatch before enqueuing work so requests that target the same logical resource share a queue.
+**Call relations**: When `dispatch_initialized_client_request` is preparing a client request, it calls this function to find the correct waiting line for that request. The result is then used to enqueue the request with the right ordering rules.
 
 *Call graph*: called by 1 (dispatch_initialized_client_request); 1 external calls (Global).
 
@@ -760,11 +772,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Wraps a request future together with the connection RPC gate that controls whether it may run. It boxes and pins the future for storage in the queue.
+**Purpose**: This packages an already prepared request so it can be stored in a queue and run later. It keeps the request together with the connection gate that decides whether it is still allowed to run.
 
-**Data flow**: Accepts `Arc<ConnectionRpcGate>` and any `Future<Output = ()> + Send + 'static`, boxes and pins the future into `BoxFutureUnit`, and returns `QueuedInitializedRequest { gate, future }`.
+**Data flow**: It receives a shared `ConnectionRpcGate` and an asynchronous future, which is work that will finish later. It pins and boxes the future so different kinds of request work can be stored in the same queue shape. It returns a `QueuedInitializedRequest` ready for queuing.
 
-**Call relations**: Used by request dispatch and by tests to create queueable work items.
+**Call relations**: `dispatch_initialized_client_request` uses this before putting real client work into the serialization queues. The tests also use it to build small fake requests that prove the queue runs, skips, and orders work correctly.
 
 *Call graph*: called by 8 (dispatch_initialized_client_request, closed_gate_request_is_skipped_and_following_requests_continue, different_keys_run_concurrently, exclusive_write_waits_for_running_shared_reads, later_shared_reads_do_not_jump_ahead_of_queued_write, same_key_requests_run_fifo, same_key_shared_reads_run_concurrently, shutdown_of_live_gate_skips_already_queued_requests); 1 external calls (pin).
 
@@ -775,11 +787,11 @@ fn new(
 async fn run(self)
 ```
 
-**Purpose**: Executes the queued request through its connection gate. This ensures closed or shutting-down connections suppress queued work consistently.
+**Purpose**: This runs one queued request through its connection gate. The gate is important because queued work may become invalid if the client disconnects or the connection is shutting down before the request reaches the front of the line.
 
-**Data flow**: Consumes `self`, destructures out `gate` and `future`, and awaits `gate.run(future)`.
+**Data flow**: It takes ownership of the queued request, separates the gate from the stored future, and asks the gate to run the future. The future may execute, or the gate may prevent it depending on connection state. The function returns nothing when the attempt is complete.
 
-**Call relations**: Called by `RequestSerializationQueues::drain` for each dequeued request or shared-read batch member.
+**Call relations**: This is the final execution step for a queued item. The queue-draining logic calls on it when a request or group of compatible requests is ready to leave the waiting line.
 
 
 ##### `RequestSerializationQueues::enqueue`  (lines 139–167)
@@ -793,11 +805,11 @@ async fn enqueue(
     )
 ```
 
-**Purpose**: Adds a request to the queue for a given key and starts a drain task if this is the first request for that key. It is the only mutation entrypoint for the queue map.
+**Purpose**: This adds a request to the correct per-resource queue. If this is the first request for that resource, it also starts a background task to drain that queue.
 
-**Data flow**: Accepts a queue key, access mode, and `QueuedInitializedRequest`, wraps them in `QueuedSerializedRequest`, locks `inner`, pushes onto an existing `VecDeque` or inserts a new one, records whether a drain task should be spawned, then if needed clones `self`, creates a tracing span, and spawns `queues.drain(key)`.
+**Data flow**: It receives a queue key, an access mode, and a prepared queued request. It locks the shared map of queues, appends the request if a queue already exists, or creates a new queue if not. If it created a new queue, it spawns an asynchronous drainer for that key and then returns.
 
-**Call relations**: Called by initialized-request dispatch after computing the serialization key. It delegates actual execution ordering to `drain`.
+**Call relations**: `dispatch_initialized_client_request` calls this after it has translated a client request into a queue key. This function hands off actual execution to `RequestSerializationQueues::drain` by spawning a background task for newly active keys.
 
 *Call graph*: called by 1 (dispatch_initialized_client_request); 4 external calls (new, clone, spawn, debug_span!).
 
@@ -808,11 +820,11 @@ async fn enqueue(
 async fn drain(self, key: RequestSerializationQueueKey)
 ```
 
-**Purpose**: Runs queued requests for one key in the correct order, batching adjacent shared reads so they execute concurrently. It removes the queue entry when the queue becomes empty.
+**Purpose**: This is the worker that empties one queue in the correct order. It enforces the rule that exclusive requests run alone, while consecutive shared reads may run together.
 
-**Data flow**: Consumes `self` and a queue key, loops forever, locks `inner`, fetches the queue for the key, pops the front request, and if that request is `SharedRead` also pops any immediately following shared-read requests into the same vector. If the queue is empty it removes the key and returns. Outside the lock it awaits `join_all` over `request.request.run()` for the batch, then repeats.
+**Data flow**: It receives the queue collection and the key it is responsible for. In a loop, it locks the queue map, removes the next request, and, if that request is a shared read, also removes any immediately following shared reads. It then runs that batch and waits until all of it finishes. When the queue is empty, it removes the queue from the map and exits.
 
-**Call relations**: Spawned by `enqueue` once per active key. It is the core scheduler that enforces FIFO ordering and shared-read batching semantics.
+**Call relations**: `RequestSerializationQueues::enqueue` starts this function when a key first becomes active. Inside the drain loop, it runs queued requests and uses `join_all` to wait for a batch of shared reads to complete before continuing.
 
 *Call graph*: 2 external calls (join_all, vec!).
 
@@ -823,11 +835,11 @@ async fn drain(self, key: RequestSerializationQueueKey)
 fn gate() -> Arc<ConnectionRpcGate>
 ```
 
-**Purpose**: Creates a fresh `ConnectionRpcGate` wrapped in `Arc` for queue tests. It keeps test setup concise.
+**Purpose**: This test helper creates a fresh connection gate. Tests use it so each fake request can behave like it belongs to a real client connection.
 
-**Data flow**: Constructs `ConnectionRpcGate::new()`, wraps it in `Arc`, and returns it.
+**Data flow**: It takes no input. It creates a new `ConnectionRpcGate`, wraps it in shared ownership, and returns it to the test.
 
-**Call relations**: Shared fixture helper for all request-serialization tests.
+**Call relations**: The queue behavior tests call this whenever they need a live gate for a queued fake request. It keeps the tests shorter and makes the gate setup consistent.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (new).
 
@@ -838,11 +850,11 @@ fn gate() -> Arc<ConnectionRpcGate>
 fn queue_drain_timeout() -> Duration
 ```
 
-**Purpose**: Provides a standard timeout used when waiting for queued requests to run in tests. It avoids repeating the same duration literal.
+**Purpose**: This test helper gives a standard maximum wait time for queue activity. It prevents tests from hanging forever if a queued request never runs.
 
-**Data flow**: Returns `Duration::from_secs(1)`.
+**Data flow**: It takes no input and returns a one-second duration. Tests pass that duration to timeout checks around expected queue progress.
 
-**Call relations**: Used throughout the tests when awaiting queue progress.
+**Call relations**: The async tests call this while waiting for messages that prove a request started or a queue drained. If the timeout expires, the test fails instead of stalling.
 
 *Call graph*: 1 external calls (from_secs).
 
@@ -853,11 +865,11 @@ fn queue_drain_timeout() -> Duration
 fn shutdown_wait_timeout() -> Duration
 ```
 
-**Purpose**: Provides a short timeout used when asserting something should still be blocked. It distinguishes expected waiting from deadlock.
+**Purpose**: This test helper gives a short wait time used when something is expected not to happen yet. It helps prove that shutdowns or writes are correctly blocked while earlier work is still running.
 
-**Data flow**: Returns `Duration::from_millis(50)`.
+**Data flow**: It takes no input and returns a fifty-millisecond duration. Tests use it with timeout checks where success would mean the queue moved too early.
 
-**Call relations**: Used by tests that verify shutdown or queued-write blocking behavior.
+**Call relations**: Tests for shutdown and shared-read ordering call this to confirm that a task remains waiting at the right moment.
 
 *Call graph*: 1 external calls (from_millis).
 
@@ -868,11 +880,11 @@ fn shutdown_wait_timeout() -> Duration
 async fn same_key_requests_run_fifo()
 ```
 
-**Purpose**: Verifies exclusive requests enqueued under the same key execute strictly in FIFO order. This is the baseline serialization guarantee.
+**Purpose**: This test proves that exclusive requests with the same key run in first-in, first-out order. In plain terms, the first request put in line is the first one served.
 
-**Data flow**: Creates a default queue set, one global key, a gate, and an unbounded channel; enqueues three exclusive requests that send distinct integers; drains the receiver with timeouts; and asserts the observed values are `[1, 2, 3]`.
+**Data flow**: The test creates one queue key and enqueues three fake exclusive requests that send the values 1, 2, and 3. It then reads those values from a channel. The expected output is the same order: 1, then 2, then 3.
 
-**Call relations**: Test-harness coverage for same-key exclusive ordering.
+**Call relations**: It builds requests with `QueuedInitializedRequest::new`, puts them into `RequestSerializationQueues::enqueue`, and uses `queue_drain_timeout` while waiting. It exercises the core same-key ordering path.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (clone, new, Global, default, gate, queue_drain_timeout, assert_eq!, unbounded_channel, timeout).
 
@@ -883,11 +895,11 @@ async fn same_key_requests_run_fifo()
 async fn different_keys_run_concurrently()
 ```
 
-**Purpose**: Checks that requests under different keys do not block each other. A blocked request on one key should not prevent another key from running immediately.
+**Purpose**: This test proves that a stuck request for one key does not block a request for another key. Separate resources should have separate waiting lines.
 
-**Data flow**: Creates two one-shot channels, enqueues one exclusive request under key `blocked` that waits on a receiver, enqueues another under key `other` that signals completion, waits for the second to run within the drain timeout, then releases the blocked request.
+**Data flow**: The test enqueues one request under a key that waits until it is released. Then it enqueues another request under a different key that immediately signals it ran. The expected result is that the second request runs even while the first is still blocked.
 
-**Call relations**: Covers cross-key concurrency in the queue scheduler.
+**Call relations**: It uses `QueuedInitializedRequest::new` and `RequestSerializationQueues::enqueue` to create two independent queues. The timeout confirms that the second queue’s drainer is not held up by the first queue.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (Global, default, gate, queue_drain_timeout, timeout).
 
@@ -898,11 +910,11 @@ async fn different_keys_run_concurrently()
 async fn closed_gate_request_is_skipped_and_following_requests_continue()
 ```
 
-**Purpose**: Verifies a queued request whose gate is already closed is skipped rather than blocking the queue, and later requests on the same key still run. This protects queue progress when a connection disappears.
+**Purpose**: This test proves that a request whose connection gate is already closed does not stop the rest of the queue. Bad or obsolete work is skipped, and later valid work still runs.
 
-**Data flow**: Creates one live gate and one gate that is closed before enqueue, enqueues a blocking first request under the live gate, a second request under the closed gate, and a third under the live gate; waits for the first value, releases the blocker, drains remaining values, and asserts only the third value appears after the first.
+**Data flow**: The test enqueues three same-key requests. The first runs and waits, the second belongs to a closed gate, and the third belongs to a live gate. After releasing the first request, the test expects the second request not to send anything and the third request to send its value.
 
-**Call relations**: Tests the interaction between queue draining and `ConnectionRpcGate::run` skipping behavior.
+**Call relations**: It uses `QueuedInitializedRequest::new` to attach different gates to queued requests. It checks the interaction between queue draining and the gate behavior that can skip closed-connection work.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (clone, new, Global, default, gate, queue_drain_timeout, assert_eq!, unbounded_channel, timeout).
 
@@ -913,11 +925,11 @@ async fn closed_gate_request_is_skipped_and_following_requests_continue()
 async fn shutdown_of_live_gate_skips_already_queued_requests()
 ```
 
-**Purpose**: Checks that shutting down a live gate waits for the currently running request but prevents already queued later requests from running. This models orderly connection shutdown.
+**Purpose**: This test proves that if a connection begins shutting down while one request is running, later queued requests for that same gate are skipped. Shutdown waits for the currently running request but does not start new ones afterward.
 
-**Data flow**: Enqueues a blocking first request and a second queued request under the same live gate, waits for the first to start, spawns `gate.shutdown()`, asserts shutdown is still waiting, releases the blocker, then confirms the queue drains without ever receiving the second request's value.
+**Data flow**: The test enqueues two same-key requests on one live gate. The first starts and blocks. While it is still running, the test starts gate shutdown and confirms shutdown has to wait. After the first request is released, the test expects no second value, showing the queued request was skipped.
 
-**Call relations**: Covers gate-shutdown semantics for queued work after a request has already started.
+**Call relations**: It combines `QueuedInitializedRequest::new`, `RequestSerializationQueues::enqueue`, and `shutdown_wait_timeout`. It verifies the queue cooperates with `ConnectionRpcGate` shutdown rules.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (clone, Global, default, gate, shutdown_wait_timeout, assert_eq!, unbounded_channel, spawn, timeout).
 
@@ -928,11 +940,11 @@ async fn shutdown_of_live_gate_skips_already_queued_requests()
 async fn same_key_shared_reads_run_concurrently()
 ```
 
-**Purpose**: Verifies adjacent shared-read requests for the same key are batched and run concurrently once earlier exclusive work finishes. Both readers should start before either is released.
+**Purpose**: This test proves that consecutive shared-read requests for the same key can run at the same time once earlier exclusive work is finished. This is the main performance benefit of the shared-read mode.
 
-**Data flow**: Enqueues an exclusive blocker under one key, waits for it to start, enqueues two shared-read requests that each signal start and then wait on a broadcast receiver, releases the blocker, collects both start signals, asserts both readers started, then broadcasts release.
+**Data flow**: The test first enqueues an exclusive blocker. Behind it, it enqueues two shared-read requests that each report when they start and then wait for release. After the blocker is released, both read requests should report that they started without waiting for each other to finish.
 
-**Call relations**: Tests the shared-read batching branch in `drain`.
+**Call relations**: It uses queue enqueueing and fake gated requests to exercise the shared-read batching done by `RequestSerializationQueues::drain`. The timeout and channel checks confirm both reads enter the same batch.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, Global, default, gate, queue_drain_timeout, assert_eq!, unbounded_channel, timeout).
 
@@ -943,11 +955,11 @@ async fn same_key_shared_reads_run_concurrently()
 async fn exclusive_write_waits_for_running_shared_reads()
 ```
 
-**Purpose**: Checks that an exclusive request queued after shared reads does not start until all currently running shared reads finish. This preserves write-after-read ordering.
+**Purpose**: This test proves that an exclusive request waits until currently running shared reads are finished. A write-like operation must not start while read-like operations are still using the same resource.
 
-**Data flow**: Enqueues an exclusive blocker, waits for it to start, enqueues two shared reads and then one exclusive write under the same key, releases the blocker, waits for both reads to start, asserts the write has not started within the short timeout, then releases the reads and confirms the write starts afterward.
+**Data flow**: The test queues an exclusive blocker, then two shared reads, then an exclusive request. After releasing the blocker, the shared reads start and stay running. The test checks that the exclusive request does not start until both reads are released.
 
-**Call relations**: Covers the read-batch then write ordering guarantee in the scheduler.
+**Call relations**: It builds the exact read-then-write queue shape that `RequestSerializationQueues::drain` must handle. The short shutdown-style timeout is used to prove the exclusive request is still waiting at the proper point.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (pin, Global, default, gate, queue_drain_timeout, shutdown_wait_timeout, unbounded_channel, timeout).
 
@@ -958,26 +970,26 @@ async fn exclusive_write_waits_for_running_shared_reads()
 async fn later_shared_reads_do_not_jump_ahead_of_queued_write()
 ```
 
-**Purpose**: Verifies that a shared read arriving after an exclusive write is queued cannot join an earlier shared-read batch and overtake the write. This preserves FIFO boundaries between batches.
+**Purpose**: This test proves the queue is fair to an already waiting exclusive request. A later shared read is not allowed to sneak ahead just because reads can sometimes run together.
 
-**Data flow**: Enqueues an exclusive blocker, then a first shared read, then an exclusive write, then a later shared read under the same key; releases the blocker; confirms the first read starts while the write and later read remain blocked; releases the first read and confirms the write starts before the later read; then releases the write and confirms the later read starts last.
+**Data flow**: The test queues an exclusive blocker, a shared read, an exclusive request, and then another shared read. After the blocker is released, the first read starts. The write waits for that read, and the later read waits behind the write. Only after the write finishes may the later read start.
 
-**Call relations**: Regression test for the subtle queue invariant that only immediately adjacent shared reads batch together.
+**Call relations**: It stresses the ordering rule inside `RequestSerializationQueues::drain`: only consecutive shared reads at the front are grouped. The test confirms that once an exclusive request is next in line, later shared reads stay behind it.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (pin, Global, default, gate, queue_drain_timeout, shutdown_wait_timeout, timeout).
 
 
 ### `core/src/tools/parallel.rs`
 
-`orchestration` · `tool call dispatch and cancellation handling`
+`orchestration` · `tool execution during a conversation turn`
 
-This module wraps `ToolRouter` dispatch in a runtime that understands parallelism, cancellation, and response shaping. `ToolCallRuntime` holds shared references to the router, session, turn context, a diff tracker, and an `RwLock<()>` used as a coarse execution gate: tools that support parallel execution take a read lock, while exclusive tools take a write lock. That design allows many parallel-safe tools to run together while serializing tools that require isolation.
+A tool call is work the system asks another component to do, such as running a shell command or calling a custom tool. This file provides `ToolCallRuntime`, the small runtime that sits between the conversation code and the tool router. Its job is like a traffic controller: let safe tool calls proceed in parallel, make exclusive tools wait their turn, and produce one clear answer for each call.
 
-`handle_tool_call` is the public convenience entry point for direct calls. It delegates to `handle_tool_call_with_source`, then converts `AnyToolResult` into a `ResponseInputItem`; fatal dispatch failures become `CodexErr::Fatal`, while nonfatal tool errors are turned into synthetic failure outputs by `failure_response`. The lower-level `handle_tool_call_with_source` spawns router dispatch in a task wrapped by `AbortOnDropHandle`, tracks whether a terminal outcome has already been claimed with an `AtomicBool`, and races task completion against the caller’s `CancellationToken`. If cancellation arrives after the task has effectively finished, it returns the real result. Otherwise it either waits for runtime-managed cleanup (`waits_for_runtime_cancellation`) or aborts the task immediately, then synthesizes an aborted tool result via `aborted_response` and emits `notify_tool_aborted`.
+The runtime keeps shared references to the tool router, the current session, the current turn, and a turn-diff tracker, which records changes made during the turn. It uses a read/write lock: tools that support parallel execution take a shared read lock, while tools that must run alone take an exclusive write lock. That prevents unsafe overlap without blocking tools that are declared safe to run together.
 
-Response shaping is payload-sensitive: tool-search failures return an empty completed search output, custom tools return `CustomToolCallOutput`, and ordinary tools return `FunctionCallOutput`, all with `success: Some(false)`. Aborted messages are also specialized: plain `shell_command` and `unified_exec` calls get a multi-line wall-time format, while other tools get a concise `aborted by user after ...s` string.
+Cancellation is the most delicate part. If the user cancels while a tool is running, the runtime checks whether the tool already reached a final outcome. If it did, the completed result is preserved. If not, the runtime either aborts the task immediately or waits for the tool to clean itself up, depending on what the tool says it needs. It then returns an “aborted by user” result and notifies lifecycle hooks so extensions see the right final state.
 
-The embedded tests build minimal fake tool executors and lifecycle contributors to verify two subtle races: cancellation after the handler has already finished but before lifecycle finish callbacks complete must preserve the completed lifecycle outcome, while cancellation of a runtime that performs cleanup after observing cancellation must emit only an aborted lifecycle outcome.
+The tests in this file guard two important promises: late cancellation must not turn a completed tool into an aborted one, and cleanup-aware cancellation must emit only the aborted lifecycle outcome.
 
 #### Function details
 
@@ -992,11 +1004,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a tool-call runtime with shared router, session, turn context, diff tracker, and a fresh parallel-execution lock. This is the setup step before handling any tool calls.
+**Purpose**: Builds a `ToolCallRuntime` from the shared pieces needed to run tools: the router, session, turn context, and change tracker. It also creates the internal lock used to coordinate parallel and exclusive tool execution.
 
-**Data flow**: Consumes `router`, `session`, `turn_context`, and `tracker` as `Arc` values → creates `parallel_execution: Arc<RwLock<()>>` initialized with a new lock → returns `ToolCallRuntime { ... }`.
+**Data flow**: It receives already-created shared objects for routing, session state, turn state, and turn changes. It stores them in a new runtime object and adds a fresh read/write lock, which starts unlocked. The result is a ready-to-use runtime that can dispatch tool calls.
 
-**Call relations**: Turn workers, sampling flows, and tests instantiate this runtime before dispatching tool calls. It prepares the shared state used by both direct and nested tool-call handling.
+**Call relations**: This is called when larger flows prepare to run tools, such as turn workers, sampling requests, and the tests in this file. After construction, callers use the runtime to create diff consumers or to execute tool calls.
 
 *Call graph*: called by 6 (test_tool_runtime, run_sampling_request, handle_output_item_done_returns_contributed_last_agent_message, start_turn_worker, cancellation_after_handler_finishes_preserves_completed_lifecycle, cancellation_waiting_for_runtime_cleanup_emits_only_aborted_lifecycle); 2 external calls (new, new).
 
@@ -1010,11 +1022,11 @@ fn create_diff_consumer(
     ) -> Option<Box<dyn ToolArgumentDiffConsumer>>
 ```
 
-**Purpose**: Asks the router for an argument-diff consumer for a specific tool name. This exposes router-specific diff tracking through the runtime wrapper.
+**Purpose**: Asks the tool router whether a tool has a helper that can consume partial argument changes. This is useful when tool arguments arrive gradually and the system wants to track or display the changing input.
 
-**Data flow**: Reads `tool_name: &codex_tools::ToolName` → calls `self.router.create_diff_consumer(tool_name)` → returns `Option<Box<dyn ToolArgumentDiffConsumer>>`.
+**Data flow**: It takes a tool name, passes that name to the router, and returns either a boxed consumer object or nothing if the tool does not provide one. It does not change the runtime itself.
 
-**Call relations**: Sampling-request code calls this when it wants to track argument diffs for a tool invocation. The runtime simply forwards the request to the router.
+**Call relations**: Sampling code calls this while trying to run a sampling request. The runtime does not create the consumer directly; it delegates that decision to the router because the router knows the registered tools.
 
 *Call graph*: called by 1 (try_run_sampling_request).
 
@@ -1029,11 +1041,11 @@ fn handle_tool_call(
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>>
 ```
 
-**Purpose**: Handles a direct tool call and converts the result into a `ResponseInputItem` suitable for protocol output. It wraps lower-level dispatch errors into either fatal codex errors or synthetic failure responses.
+**Purpose**: Runs a normal, direct tool call and converts the internal tool result into the response format expected by the protocol. It also turns recoverable tool errors into failure responses instead of crashing the whole request.
 
-**Data flow**: Consumes `self`, `call: ToolCall`, and `cancellation_token` → clones the call for fallback error formatting, invokes `handle_tool_call_with_source(call, ToolCallSource::Direct, cancellation_token)`, awaits it, and maps outcomes: successful `AnyToolResult` becomes `into_response()`, `FunctionCallError::Fatal(message)` becomes `Err(CodexErr::Fatal(message))`, and other errors become `Ok(Self::failure_response(error_call, other))`.
+**Data flow**: It receives a tool call and a cancellation token, then calls the lower-level source-aware runner with the source marked as direct. If the call succeeds, it converts the tool result into a protocol response. If the tool reports a fatal error, it returns a fatal protocol error. For other tool errors, it creates a normal response whose output says the call failed.
 
-**Call relations**: This is the main entry point for ordinary tool calls. It delegates all dispatch, locking, and cancellation logic to `handle_tool_call_with_source`, then performs only the final protocol-level result shaping.
+**Call relations**: This is the public path for ordinary tool execution. It hands the real dispatch work to `ToolCallRuntime::handle_tool_call_with_source`, and uses `ToolCallRuntime::failure_response` only when the lower-level runner reports a non-fatal failure.
 
 *Call graph*: calls 1 internal fn (handle_tool_call_with_source); 3 external calls (failure_response, clone, Fatal).
 
@@ -1049,13 +1061,11 @@ fn handle_tool_call_with_source(
     ) -> impl std::future::Future<Output = Result<
 ```
 
-**Purpose**: Dispatches a tool call with explicit source metadata, enforcing parallel/exclusive execution rules and resolving cancellation races. It returns either the real `AnyToolResult` or an aborted synthetic result/error.
+**Purpose**: Runs a tool call with full coordination: parallel-or-exclusive locking, dispatch through the router, tracing, cancellation, abort reporting, and cleanup behavior. This is the core of the file.
 
-**Data flow**: Consumes `self`, `call`, `source`, and `cancellation_token` → queries router capabilities (`tool_supports_parallel`, `tool_waits_for_runtime_cancellation`), clones shared state, records start time, creates an `AtomicBool` for terminal-outcome ownership, and spawns a task that acquires either a read or write lock on `parallel_execution` before calling `router.dispatch_tool_call_with_terminal_outcome(...)` under a tracing span → then `tokio::select!` races task completion against `cancellation_token.cancelled()`.
+**Data flow**: It receives a tool call, a source label, and a cancellation token. It asks the router whether the tool supports parallel execution and whether it needs time to react to runtime cancellation. It then spawns the actual tool dispatch in a task. While that task runs, it waits for either the task result or cancellation. On success, it returns the tool result. On cancellation, it either waits for cleanup or aborts the task, then returns a synthetic aborted result and sends an aborted lifecycle notification.
 
-If the task finishes first, it returns the joined result or maps join failure through `tool_task_join_error`. If cancellation wins but the terminal outcome is already reached or the task is finished, it still awaits and returns the real task result. Otherwise it records the span as aborted and either waits for runtime-managed cancellation cleanup or aborts the task immediately, handling cancelled join errors specially. After cleanup/abort, it builds `AnyToolResult` via `aborted_response`, calls `notify_tool_aborted(...)`, and returns the aborted result.
-
-**Call relations**: Direct-call handling and nested tool-call flows both use this method. It delegates actual tool execution to the router, lifecycle abort notification to `notify_tool_aborted`, and join-error formatting plus aborted-result construction to local helpers.
+**Call relations**: `ToolCallRuntime::handle_tool_call` uses this for direct calls, and nested tool execution uses it when one tool calls another. Inside, it hands actual tool execution to the router, uses `ToolCallRuntime::tool_task_join_error` if the spawned task fails unexpectedly, and uses `ToolCallRuntime::aborted_response` plus `notify_tool_aborted` when cancellation wins.
 
 *Call graph*: called by 2 (call_nested_tool, handle_tool_call); 13 external calls (new, clone, new, new, clone, Left, Right, now, clone, clone (+3 more)).
 
@@ -1066,11 +1076,11 @@ If the task finishes first, it returns the joined result or maps join failure th
 fn tool_task_join_error(err: JoinError) -> FunctionCallError
 ```
 
-**Purpose**: Converts a Tokio task join failure into a fatal function-call error. This treats dispatcher task crashes as unrecoverable tool-call failures.
+**Purpose**: Converts an unexpected failure of the spawned tool task into a fatal tool error. This gives callers one consistent error type when the background task itself cannot be joined.
 
-**Data flow**: Consumes `err: JoinError` → formats it into `"tool task failed to receive: {err:?}"` → returns `FunctionCallError::Fatal(...)`.
+**Data flow**: It receives Tokio's join error, which means the spawned async task failed to return normally. It formats that error into a readable message and wraps it as a fatal function-call error. The output is an error value for the surrounding tool runtime.
 
-**Call relations**: Cancellation and normal completion paths in `handle_tool_call_with_source` call this whenever awaiting the spawned dispatch task fails. It centralizes the fatal-error wording.
+**Call relations**: `ToolCallRuntime::handle_tool_call_with_source` calls this whenever awaiting the spawned tool task fails in a way that is not the expected cancellation path.
 
 *Call graph*: 2 external calls (format!, Fatal).
 
@@ -1081,11 +1091,11 @@ fn tool_task_join_error(err: JoinError) -> FunctionCallError
 fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem
 ```
 
-**Purpose**: Builds a protocol response item representing a nonfatal tool-call failure, with shape determined by the original tool payload type. This lets the system return structured failure outputs instead of surfacing every tool error as a transport failure.
+**Purpose**: Builds a protocol response for a tool call that failed without being fatal. This lets the model or caller see that the tool call completed with an error message rather than losing the call entirely.
 
-**Data flow**: Consumes `call: ToolCall` and `err: FunctionCallError` → converts the error to a message string → matches `call.payload`: `ToolSearch` yields `ResponseInputItem::ToolSearchOutput` with empty tools and completed/client status, `Custom` yields `CustomToolCallOutput` with text body and `success: Some(false)`, and all other payloads yield `FunctionCallOutput` with the same text body and failure flag.
+**Data flow**: It receives the original tool call and the error. It turns the error into text and chooses the right response shape based on the tool payload type: search tools get an empty search result, custom tools get custom output, and normal function tools get function output. The response marks ordinary output as unsuccessful where that format supports it.
 
-**Call relations**: The public `handle_tool_call` method uses this when lower-level dispatch returns a nonfatal `FunctionCallError`. It is the final fallback shaping step for recoverable tool failures.
+**Call relations**: `ToolCallRuntime::handle_tool_call` calls this after `ToolCallRuntime::handle_tool_call_with_source` returns a non-fatal error. It is the bridge from internal error values to the external response format.
 
 *Call graph*: 3 external calls (new, Text, to_string).
 
@@ -1096,11 +1106,11 @@ fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem
 fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult
 ```
 
-**Purpose**: Constructs an `AnyToolResult` representing a user-aborted tool call. The payload is preserved, but the result body is replaced with an `AbortedToolOutput` message.
+**Purpose**: Creates an internal tool result that says the user aborted the tool. This result can then flow through the same response machinery as other tool results.
 
-**Data flow**: Reads `call: &ToolCall` and `secs: f32` → clones `call_id` and `payload`, computes the message with `abort_message(call, secs)`, boxes `AbortedToolOutput { message }`, and returns `AnyToolResult { call_id, payload, result, post_tool_use_payload: None }`.
+**Data flow**: It receives the original tool call and the number of seconds the tool ran before aborting. It copies the call id and payload, creates an aborted output message, and returns an `AnyToolResult` with no extra post-tool payload.
 
-**Call relations**: Cancellation handling in `handle_tool_call_with_source` uses this after it has decided the call should be treated as aborted. It delegates message formatting to `abort_message`.
+**Call relations**: `ToolCallRuntime::handle_tool_call_with_source` calls this after cancellation wins and the tool task has either stopped or finished cleanup. It relies on `ToolCallRuntime::abort_message` to produce the human-readable message.
 
 *Call graph*: 2 external calls (new, abort_message).
 
@@ -1111,11 +1121,11 @@ fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult
 fn abort_message(call: &ToolCall, secs: f32) -> String
 ```
 
-**Purpose**: Formats the human-visible aborted message for a cancelled tool call, with special wording for shell-like tools. This preserves the legacy wall-time format expected for command execution tools.
+**Purpose**: Creates the text shown when a tool is aborted by the user. It gives shell-like tools a special wall-time format and uses a shorter general format for other tools.
 
-**Data flow**: Reads `call.tool_name.namespace`, `call.tool_name.name`, and `secs` → if the tool is unnamespaced and named `shell_command` or `unified_exec`, returns `"Wall time: {secs:.1} seconds\naborted by user"`; otherwise returns `"aborted by user after {secs:.1}s"`.
+**Data flow**: It reads the tool name and the elapsed seconds. If the tool is a built-in shell-style tool, it returns text like a command-line timeout report. Otherwise, it returns a plain message saying the user aborted after a certain number of seconds.
 
-**Call relations**: Only `aborted_response` calls this helper. It encapsulates the special-case formatting logic for shell-oriented tools.
+**Call relations**: `ToolCallRuntime::aborted_response` calls this when building the aborted tool result. The special formatting matters because command execution output is often read like terminal output.
 
 *Call graph*: 2 external calls (format!, matches!).
 
@@ -1126,11 +1136,11 @@ fn abort_message(call: &ToolCall, secs: f32) -> String
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the configured test tool name for the immediate-success handler. It satisfies the `ToolExecutor` trait in the test harness.
+**Purpose**: Returns the name of the simple test tool that finishes immediately. Test code uses this to register and identify the fake tool.
 
-**Data flow**: Reads `self.tool_name` → clones it → returns the cloned `ToolName`.
+**Data flow**: It reads the stored tool name from the test handler, clones it, and returns the clone. Nothing else changes.
 
-**Call relations**: The test router calls this when registering or dispatching the fake handler. It is a simple trait accessor used only in tests.
+**Call relations**: The tool registry calls this through the `ToolExecutor` trait while setting up or dispatching the test tool. It supports the test that checks cancellation after a tool has already completed.
 
 *Call graph*: 1 external calls (clone).
 
@@ -1141,11 +1151,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Provides a minimal function-tool spec for the immediate test handler. The spec advertises a non-strict function with default JSON schema and no output schema.
+**Purpose**: Describes the immediate test tool to the registry. The description says it is a function-style tool with default input schema and no special output schema.
 
-**Data flow**: Reads `self.tool_name.name` → constructs `codex_tools::ResponsesApiTool` with fixed description and defaults → wraps it in `codex_tools::ToolSpec::Function` and returns it.
+**Data flow**: It reads the stored tool name and builds a tool specification object around it. The result is metadata, not an executed tool call.
 
-**Call relations**: The test registry uses this trait method when building the router. It supplies enough metadata for dispatch without affecting the cancellation behavior under test.
+**Call relations**: The registry uses this through the tool executor interface when the fake tool is registered for tests. It allows the runtime to treat the fake tool like a real registered tool.
 
 *Call graph*: 2 external calls (default, Function).
 
@@ -1156,11 +1166,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Implements a test tool that completes immediately with a successful text output. It is used to exercise cancellation races after handler completion.
+**Purpose**: Implements the immediate test tool's actual work: it instantly returns successful text output saying `ok`. This gives tests a tool that finishes before cancellation is triggered.
 
-**Data flow**: Ignores the incoming `ToolInvocation` → returns a pinned async future that resolves to `Ok(Box<dyn ToolOutput>)` containing `FunctionToolOutput::from_text("ok", Some(true))`.
+**Data flow**: It ignores the invocation details, creates a successful function-tool output containing the text `ok`, boxes it as a generic tool output, and returns it from an async future.
 
-**Call relations**: The router dispatches this handler in the completed-lifecycle cancellation test. It does not delegate further beyond constructing the boxed output.
+**Call relations**: The router calls this through the tool execution trait during the completed-lifecycle test. That test then delays lifecycle finishing and cancels afterward to confirm the runtime preserves the completed result.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (new, pin).
 
@@ -1171,11 +1181,11 @@ fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the configured test tool name for the cancellation-cleanup handler. It fulfills the `ToolExecutor` trait in tests.
+**Purpose**: Returns the name of the cleanup-aware test tool. This lets the registry identify the fake tool used in cancellation cleanup tests.
 
-**Data flow**: Reads `self.tool_name` → clones and returns it.
+**Data flow**: It reads the stored tool name, clones it, and returns the clone. It does not touch the cancellation test state.
 
-**Call relations**: The test router uses this when registering the cleanup-aware fake tool. It is a simple trait accessor.
+**Call relations**: The tool registry calls this through the executor trait while preparing the cleanup-aware fake tool. That fake tool is used to test runtime cancellation behavior.
 
 *Call graph*: 1 external calls (clone).
 
@@ -1186,11 +1196,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Provides a minimal function-tool spec for the cleanup-aware test handler. Like the immediate handler, it advertises a simple non-strict function tool.
+**Purpose**: Describes the cleanup-aware test tool to the registry. It declares a simple function-style test tool with default schema information.
 
-**Data flow**: Reads `self.tool_name.name` → constructs a `ResponsesApiTool` with fixed description, default schema, and no output schema → wraps it in `ToolSpec::Function` and returns it.
+**Data flow**: It reads the stored name and builds a function tool specification. The output is registration metadata for the test tool.
 
-**Call relations**: The test registry consumes this metadata when building the router for cancellation-cleanup scenarios.
+**Call relations**: The registry uses this when the cleanup tool is added to the test router. It makes the fake cleanup tool look like a normal tool to the runtime.
 
 *Call graph*: 2 external calls (default, Function).
 
@@ -1201,11 +1211,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async `handle_call` helper into the boxed future shape required by `ToolExecutor`. It keeps the test logic itself in a separate method.
+**Purpose**: Starts the cleanup-aware test tool's asynchronous work. It wraps `handle_call`, which contains the actual wait-for-cancellation and cleanup behavior.
 
-**Data flow**: Consumes `invocation: ToolInvocation` → calls `self.handle_call(invocation)` → boxes and pins the resulting future for trait compatibility.
+**Data flow**: It receives a tool invocation, passes it to `tests::CancellationCleanupHandler::handle_call`, and returns the resulting pinned future. The work itself happens later when the future is awaited.
 
-**Call relations**: The router invokes this trait method during the cleanup test. It delegates all substantive behavior to `handle_call`.
+**Call relations**: The router calls this through the executor trait during the cancellation cleanup test. It immediately hands off to `tests::CancellationCleanupHandler::handle_call` so the test can coordinate startup, cancellation, and cleanup.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1219,11 +1229,11 @@ async fn handle_call(
         ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Simulates a tool that notices cancellation, performs asynchronous cleanup, and only then returns. It lets tests verify the runtime path that waits for tool-managed cancellation cleanup.
+**Purpose**: Simulates a tool that notices cancellation, performs cleanup, and only then returns. This is used to prove the runtime can wait for tools that need cleanup time.
 
-**Data flow**: Reads `invocation.cancellation_token` and internal synchronization fields → sends a `started` oneshot if present, awaits `invocation.cancellation_token.cancelled()`, sends a `cleanup_started` oneshot if present, waits on `self.allow_cleanup.notified()`, then returns `Ok(Box<dyn ToolOutput>)` containing `FunctionToolOutput::from_text("cleanup complete", Some(false))`.
+**Data flow**: It receives the tool invocation, signals the test that the handler has started, then waits until the invocation's cancellation token is cancelled. After cancellation, it signals that cleanup has started, waits until the test allows cleanup to finish, and returns a text output saying cleanup completed with an unsuccessful result.
 
-**Call relations**: The boxed `handle` method delegates here. The runtime cancellation test uses this behavior to ensure the runtime emits an aborted lifecycle outcome instead of the handler’s eventual output.
+**Call relations**: `tests::CancellationCleanupHandler::handle` calls this when the router executes the fake tool. The cancellation cleanup test uses its signals to cancel at the right moment and verify that the runtime reports an aborted outcome instead of a completed cleanup result.
 
 *Call graph*: calls 1 internal fn (from_text); called by 1 (handle); 1 external calls (new).
 
@@ -1234,11 +1244,11 @@ async fn handle_call(
 fn waits_for_runtime_cancellation(&self) -> bool
 ```
 
-**Purpose**: Marks the cleanup-aware test handler as one that expects the runtime to wait for cancellation cleanup rather than aborting its task immediately.
+**Purpose**: Tells the runtime that this test tool wants to receive cancellation and clean itself up instead of being force-aborted immediately. This models tools that own resources and need orderly shutdown.
 
-**Data flow**: Takes `&self` and returns `true` with no side effects.
+**Data flow**: It takes no outside data beyond the handler itself and returns `true`. That single value changes how the runtime treats cancellation for this tool.
 
-**Call relations**: The runtime queries this through router capability plumbing during cancellation handling. It drives the branch in `handle_tool_call_with_source` that waits for cleanup before synthesizing an aborted response.
+**Call relations**: `ToolCallRuntime::handle_tool_call_with_source` consults this behavior through the router before deciding whether to abort the task or wait for cleanup. The cleanup test depends on this returning true.
 
 
 ##### `tests::FinishRecorder::on_tool_finish`  (lines 357–369)
@@ -1250,11 +1260,11 @@ fn on_tool_finish(
         ) -> codex_extension_api::ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Records each tool-finish outcome into a shared vector for assertions. It is a lightweight lifecycle contributor used in tests.
+**Purpose**: Records each tool finish outcome during tests. It gives the tests a simple way to inspect whether the runtime reported `Completed` or `Aborted` to lifecycle listeners.
 
-**Data flow**: Reads `input.outcome`, clones the shared `records` mutex, and returns a pinned async future that locks the vector and pushes the outcome.
+**Data flow**: It receives lifecycle finish input, copies out the outcome, and returns an async future. When run, that future locks the shared record list and appends the outcome.
 
-**Call relations**: The cancellation-cleanup test installs this contributor in the extension registry to observe whether the runtime emits `Completed` or `Aborted` finish notifications.
+**Call relations**: The extension lifecycle system calls this after a tool finishes. The cancellation cleanup test later reads the shared records to confirm that only an aborted outcome was reported.
 
 *Call graph*: 2 external calls (clone, pin).
 
@@ -1268,11 +1278,11 @@ fn on_tool_finish(
         ) -> codex_extension_api::ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Simulates a lifecycle contributor whose finish callback blocks until explicitly released. This creates a race window where the handler has finished but lifecycle completion is still in progress.
+**Purpose**: Simulates a lifecycle listener that starts processing a completed tool result but pauses before recording it. This lets a test cancel during that small window and verify the completed outcome is still preserved.
 
-**Data flow**: Reads `input.outcome`, clones shared `records` and `allow_finish`, takes an optional `finish_started` oneshot sender, and returns a pinned async future that signals `finish_started`, waits on `allow_finish.notified()`, then pushes the outcome into the shared vector.
+**Data flow**: It receives the finish input, copies the outcome, signals the test that finish handling has started, waits until the test allows it to continue, and then appends the outcome to the shared record list.
 
-**Call relations**: The completed-lifecycle cancellation test installs this contributor to verify that cancellation arriving during finish-hook execution does not convert a completed tool call into an aborted one.
+**Call relations**: The completed-lifecycle test installs this contributor. The runtime finishes the immediate tool, this contributor blocks, the test cancels the token, and then the contributor is released so the test can verify the result remains completed.
 
 *Call graph*: 2 external calls (clone, pin).
 
@@ -1283,11 +1293,11 @@ fn on_tool_finish(
 async fn cancellation_after_handler_finishes_preserves_completed_lifecycle() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that if the tool handler has already completed and only lifecycle finish callbacks are still running, a later cancellation does not change the final response or lifecycle outcome. The call should still complete successfully.
+**Purpose**: Checks that cancelling after a tool has already produced its result does not rewrite history as an abort. This protects users and extensions from seeing a completed tool incorrectly reported as cancelled.
 
-**Data flow**: Builds a session and turn context, installs `BlockingFinishContributor`, constructs a router with `ImmediateHandler`, creates `ToolCallRuntime`, spawns `handle_tool_call`, waits until finish notification starts, cancels the token, releases the blocking contributor, awaits the response, and asserts the response is a successful `FunctionCallOutput` with body `"ok"` and the recorded lifecycle outcomes equal `[ToolCallOutcome::Completed { success: true }]`.
+**Data flow**: The test builds a session, installs a blocking lifecycle contributor, registers an immediate fake tool, and starts a tool call. Once lifecycle finish handling has begun, it cancels the token, releases the blocked lifecycle contributor, and waits for the response. It then checks that the response is the successful `ok` output and that the recorded lifecycle outcome is completed.
 
-**Call relations**: This integration-style test exercises the cancellation race logic in `handle_tool_call_with_source` together with lifecycle notification ordering. It proves the runtime respects an already-claimed terminal outcome.
+**Call relations**: This test constructs a `ToolCallRuntime` with `ToolCallRuntime::new` and runs `ToolCallRuntime::handle_tool_call`. It uses `tests::ImmediateHandler` for the tool behavior and `tests::BlockingFinishContributor` to create the race-like timing it wants to verify.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, new, from_tools, from_parts, new, plain); 16 external calls (clone, new, new, from_millis, from_secs, new, new, assert_eq!, new, channel (+6 more)).
 
@@ -1298,32 +1308,36 @@ async fn cancellation_after_handler_finishes_preserves_completed_lifecycle() -> 
 async fn cancellation_waiting_for_runtime_cleanup_emits_only_aborted_lifecycle() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that when a tool waits for runtime-managed cancellation cleanup, cancelling the call yields an aborted response and only an aborted lifecycle finish event. The handler’s eventual cleanup-complete output must not surface as the final result.
+**Purpose**: Checks that a cleanup-aware tool, when cancelled, is reported as aborted and not also as completed. This protects lifecycle consumers from receiving contradictory finish events.
 
-**Data flow**: Builds a session and turn context, installs `FinishRecorder`, constructs a router with `CancellationCleanupHandler`, creates `ToolCallRuntime`, spawns `handle_tool_call`, waits for handler start, cancels the token, waits for cleanup to begin, releases cleanup, awaits the response, extracts the text body from the returned `FunctionCallOutput`, asserts it contains `"aborted by user"`, and asserts the recorded lifecycle outcomes equal `[ToolCallOutcome::Aborted]`.
+**Data flow**: The test builds a session, installs a finish recorder, registers the cleanup-aware fake tool, and starts a tool call. It waits until the tool starts, cancels the token, waits until cleanup begins, then allows cleanup to finish. Finally, it checks that the response text says the tool was aborted and that the only recorded lifecycle outcome is aborted.
 
-**Call relations**: This test drives the `wait_for_runtime_cancellation` branch in `handle_tool_call_with_source`. It confirms that the runtime, not the handler’s eventual return value, owns the terminal outcome once cancellation is claimed.
+**Call relations**: This test creates the runtime with `ToolCallRuntime::new` and executes through `ToolCallRuntime::handle_tool_call`. It relies on `tests::CancellationCleanupHandler::waits_for_runtime_cancellation` and `tests::CancellationCleanupHandler::handle_call` to exercise the runtime path that waits for cleanup before returning an aborted response.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, new, from_tools, from_parts, new, plain); 17 external calls (clone, new, new, from_millis, from_secs, new, new, bail!, assert!, assert_eq! (+7 more)).
 
 ## 📊 State Registers Touched
 
-- `reg-feature-flags` — The resolved experimental-feature and startup feature-enablement state that gates runtime behavior and can be surfaced or updated through server APIs.
-- `reg-tool-catalog` — The runtime-visible catalog of executable tools and their normalized schemas, exposure rules, and metadata used for dispatch and prompt assembly.
-- `reg-mcp-server-catalog` — The materialized MCP declarations, runtime server metadata, and contribution overlays used for connection setup, routing, and prompt/tool exposure.
-- `reg-app-server-connections` — The live app-server transport/listener/connection registry and per-connection routing state that all RPC handling depends on.
-- `reg-remote-control-state` — The persisted and live remote-control desired state, pairing/enrollment records, and reconnecting remote-session state.
-- `reg-exec-server-runtime` — The exec-server listener, client, process-control, and environment-discovery runtime state shared across request processing and execution.
-- `reg-mcp-runtime-connections` — The live MCP runtime sessions and transport connections maintained for tool routing and integration access.
-- `reg-frontend-session-ui-state` — The user-facing frontend session state including startup decisions, terminal ownership, visible chat/transcript state, and loaded thread view.
-- `reg-live-thread-registry` — The in-memory registry of active threads and reconstructed thread runtimes that stabilizes ownership across resumes, forks, and UI switching.
-- `reg-live-session-object` — The long-lived session object and shared services that own turn submission, event delivery, approvals, persistence, and runtime configuration.
-- `reg-thread-projections` — The projected user-visible thread state derived from events and persisted records, including item views, statuses, summaries, and replayed token usage.
-- `reg-connection-shutdown-gates` — The per-connection shutdown acceptance flags, running-handler tracking, and cleanup-task registries used for graceful drain and teardown.
-- `reg-observability-context` — The global tracing/logging/metrics context and stable session-turn-auth-model-tool tags attached to emitted telemetry throughout runtime.
-- `reg-request-serialization-queues` — Per-resource/per-thread ordering queues that serialize conflicting RPC or session requests while allowing unrelated work to proceed concurrently.
-- `reg-realtime-session-state` — The live per-thread realtime conversation/session state, including active start/append/stop lifecycle and associated transport/session bookkeeping.
-- `reg-command-exec-pty-sessions` — The registry of long-lived interactive command/process sessions, including PTY handles, stdin/write channels, resize/terminate control, and streamed output subscribers.
-- `reg-connection-pending-initialization` — Per-connection initialization/handshake state that gates which RPC methods are allowed before a transport session is fully initialized.
-- `reg-listener-subscriptions` — The per-thread and per-connection listener/subscription registry that tracks who is watching which thread or process streams for ordered notifications.
-- `reg-tool-runtime-concurrency` — The live concurrency, cancellation, and in-flight execution coordination state for parallel tool calls and other dispatched runtime tasks.
+- `reg-effective-config` — The final set of settings Codex runs with after combining files, policies, profiles, cloud settings, thread overrides, and command-line flags.
+- `reg-feature-flags` — The shared list of enabled or disabled experimental and product features that changes what the app exposes.
+- `reg-auth-identity` — The signed-in user or service identity, including account facts such as email, plan, workspace, and login mode.
+- `reg-model-provider-catalog` — The combined menu of usable model providers and models from bundled data, cache, live services, local servers, and account access.
+- `reg-app-server-runtime` — The live app-server or daemon state, including open transports, connected clients, request routing, and server lifecycle status.
+- `reg-remote-control-relay` — The remote-control, relay, socket, WebSocket, and encrypted connection state used to connect clients and helper processes.
+- `reg-permission-sandbox-policy` — The shared rules for file access, command execution, network access, approvals, and sandbox modes.
+- `reg-exec-environment` — The active command-execution setup, including local or remote executor choice, sandbox helper paths, runtime paths, and process execution capabilities.
+- `reg-process-registry` — The shared record of running or tracked external processes, their identifiers, input/output streams, terminal sizes, and completion state.
+- `reg-mcp-server-sessions` — The configured and connected MCP tool servers, their tools, resources, login state, approval rules, and active sessions.
+- `reg-live-session-services` — The toolbox attached to one running session, such as model access, auth, telemetry, approvals, tools, extensions, networking, and MCP connections.
+- `reg-thread-session-state` — The live state of a conversation thread, including its identity, workspace, selected model, history, permissions, listeners, and lifecycle status.
+- `reg-turn-state` — The shared clipboard for one active assistant turn, tracking the current task, pending replies, granted permissions, cancellations, and bookkeeping.
+- `reg-hook-rules` — The configured hooks and hook schemas that let external commands inspect or affect session starts, turns, tool calls, and other lifecycle events.
+- `reg-background-work-queues` — The shared set of background tasks such as cloud refreshes, cleanup jobs, memory jobs, skill watchers, agent jobs, update checks, and session maintenance.
+- `reg-tui-visible-state` — The current terminal user-interface state, including visible transcript cells, inputs, popups, keymaps, headers, status lines, notifications, and restored history.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.
+- `reg-realtime-stream-state` — Active realtime conversation state, including audio/text stream sessions, WebSocket transport state, buffers, and stop/cancel lifecycle data.
+- `reg-request-serialization-gates` — The in-flight RPC/session request admission gates, per-resource serialization queues, and shutdown blockers that control when handlers may start or must drain.
+- `reg-filesystem-watch-subscriptions` — Active file and directory watch subscriptions, invalidation signals, and watcher-to-client mappings used for skills, plugin/config refreshes, and app-server file APIs.
+- `reg-terminal-runtime-state` — Live terminal control state such as raw mode, alternate screen ownership, resize/suspend handling, input streams, and restoration obligations.
+- `reg-workspace-change-set` — Live and saved workspace change information, including file diffs, patch outcomes, reviewable changes, and rollback/snapshot data used by tools, UI, and persistence.
+- `reg-outgoing-transport-buffers` — Queued outbound protocol messages, write buffers, and backpressure state for app-server, daemon, exec-server, and remote transports.

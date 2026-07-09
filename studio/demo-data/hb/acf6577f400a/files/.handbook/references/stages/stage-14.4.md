@@ -1,10 +1,8 @@
 # Sandbox policy generation and command-safety parsing helpers  `stage-14.4`
 
-This stage is cross-cutting infrastructure that sits between policy definition and actual tool execution. It turns loosely specified confinement rules and raw command strings into concrete sandbox settings and approval signals that higher layers can trust before launching a process.
+This stage is shared safety support used before running tools. It helps answer two questions: “What is this command really doing?” and “What should the sandbox allow it to touch?” The legacy policy files define the building blocks for allowed command arguments: argument shapes, option objects, argument types, and a narrow safe form of sed line-printing commands. The sandbox files then turn requested permissions into actual confinement rules. On macOS, seatbelt.rs writes Seatbelt rules for sandbox-exec. On Linux, build.rs makes sure sandbox build checks notice the expected bubblewrap hash.
 
-On the policy side, the legacy execpolicy files define how command arguments are described and validated: arg_matcher.rs models policy-language match patterns and cardinality, opt.rs represents command-line options in Starlark-parsed policy files, and arg_type.rs performs the concrete value checks for matched arguments. sed_command.rs adds a special-purpose validator for the tiny safe subset of sed expressions the system permits. For runtime confinement, policy_transforms.rs merges base profiles with extra requested permissions into effective sandbox policies, while seatbelt.rs renders those policies into macOS Seatbelt rules and launch arguments; linux-sandbox/build.rs ensures Linux sandbox rebuilds when the bundled bubblewrap digest changes.
-
-On the command-analysis side, bash.rs and powershell.rs unwrap and normalize shell invocations, parse_command.rs summarizes user-facing intent, command_canonicalization.rs produces stable approval-cache keys, and the command_safety modules classify commands as safely read-only or obviously dangerous, with powershell_parser.rs supplying structured PowerShell AST data for the Windows-specific safe and dangerous heuristics.
+The shell-command files inspect command text before execution. bash.rs parses only simple Bash or Zsh forms into plain argument lists. powershell.rs and the PowerShell parser helper understand Windows PowerShell scripts without repeatedly starting a new parser. parse_command.rs summarizes common actions, while command_canonicalization.rs normalizes commands so approval decisions can be reused. The command_safety files are the gatekeepers: they recognize safe read-only commands, flag dangerous ones like forceful deletion, and apply stricter Windows-specific safe and dangerous command rules.
 
 ## Files in this stage
 
@@ -13,11 +11,13 @@ These files define the legacy execution-policy language for command arguments, o
 
 ### `execpolicy-legacy/src/arg_matcher.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `policy/config loading and argument checking`
 
-This file is primarily a data-model layer for describing how command-line arguments should be interpreted by the legacy exec policy engine. The `ArgMatcher` enum distinguishes literal tokens, opaque non-file values, readable and writable file arguments, repeated readable-file forms, positive integers, safe sed commands, and an unconstrained varargs form. Two methods provide the operational meaning of each variant: `cardinality` collapses the matcher into `ArgMatcherCardinality::{One, AtLeastOne, ZeroOrMore}`, while `arg_type` converts it into the lower-level `ArgType` used for per-value validation and file-write risk analysis. Notably, both `ReadableFiles` and `ReadableFilesOrCwd` map to `ArgType::ReadableFile`; the difference between them is cardinality, not element type.
+This file is about checking command arguments safely. A command like `cat input.txt` or `head -n 10 file.txt` is just a list of strings, but the execution policy needs to understand what each string means: is it a file to read, a file to write, a number, a fixed keyword, or something unknown? `ArgMatcher` is the set of allowed patterns for one position, or sometimes several positions, in that argument list.
 
-The file also exposes `ArgMatcherCardinality::is_exact`, which returns `Some(1)` only for fixed-width matchers and `None` for vararg forms. The remaining implementations make `ArgMatcher` usable from Starlark: `AllocValue` stores it on a heap, `StarlarkValue` declares the runtime type name, and `UnpackValue` accepts either a native `ArgMatcher` object or a plain Starlark string, treating strings as `ArgMatcher::Literal`. That implicit string-to-literal conversion is an important convenience in policy definitions.
+The enum works like a set of labels on boxes. A `Literal` means “this exact string must appear.” `ReadableFile` and `WriteableFile` mark file paths with different permissions. `ReadableFiles` means one or more input files, while `ReadableFilesOrCwd` also allows no files, which implies the current working directory is the input. There are special cases for positive integers, safe `sed` commands, and unverified variable-length arguments.
+
+The file also defines `ArgMatcherCardinality`, which says how many command arguments a matcher consumes: exactly one, at least one, or zero or more. Finally, it connects these Rust values to Starlark, the configuration language used by the policy system, so policy scripts can pass either matcher objects or plain strings. Plain strings are treated as literal argument matches.
 
 #### Function details
 
@@ -27,11 +27,11 @@ The file also exposes `ArgMatcherCardinality::is_exact`, which returns `Some(1)`
 fn cardinality(&self) -> ArgMatcherCardinality
 ```
 
-**Purpose**: Classifies each matcher variant by how many positional arguments it consumes. Fixed tokens and typed single arguments consume exactly one, while file-list and varargs forms consume variable counts.
+**Purpose**: This function tells the checker how many command-line arguments a matcher is allowed to cover. For example, a single readable file takes one argument, while a list of readable files can take several.
 
-**Data flow**: Reads `self` and matches on the enum variant. It returns `ArgMatcherCardinality::One`, `AtLeastOne`, or `ZeroOrMore` without side effects.
+**Data flow**: It starts with one `ArgMatcher` value. It looks at which kind of matcher it is, then returns a simple count rule: exactly one, at least one, or zero or more. It does not change anything; it only translates the matcher into its size requirement.
 
-**Call relations**: This method is consumed by argument-resolution logic elsewhere to partition patterns into prefix, vararg, and suffix sections and to determine how many observed arguments each fixed matcher should bind.
+**Call relations**: This is used when the policy checker needs to walk through a command's arguments and decide how far each pattern reaches. It does not hand work off to other project functions; it simply returns the cardinality rule that later checking code can rely on.
 
 
 ##### `ArgMatcher::arg_type`  (lines 66–78)
@@ -40,11 +40,11 @@ fn cardinality(&self) -> ArgMatcherCardinality
 fn arg_type(&self) -> ArgType
 ```
 
-**Purpose**: Converts a matcher pattern into the concrete `ArgType` used to validate individual observed argument values. It preserves literal strings and collapses repeated-file matchers to the per-element readable-file type.
+**Purpose**: This function converts an argument matcher into the more general argument type that the rest of the policy system understands. It answers, “if this matcher succeeds, what kind of argument did we find?”
 
-**Data flow**: Matches on `self`; for `Literal(String)` it clones the stored string into `ArgType::Literal`, and for all other variants it returns the corresponding `ArgType` enum value. It performs no mutation.
+**Data flow**: It takes an `ArgMatcher`, checks its variant, and produces an `ArgType`. A literal matcher becomes a literal argument type with the same string copied into it. File-list matchers become the single readable-file type because each item in the list is still a readable file. Unverified variable arguments become `Unknown`, because the matcher itself does not say what those arguments mean.
 
-**Call relations**: Resolution code calls this after deciding which observed arguments belong to a pattern. The returned `ArgType` is then passed into `MatchedArg::new`, which validates the actual string value.
+**Call relations**: This function sits between pattern matching and later permission reasoning. After a matcher describes what is allowed at a position, this function provides the type label that other policy code can use to decide whether the command reads files, writes files, uses numbers, or contains unknown arguments. Its only notable handoff is constructing the literal argument type when the matcher is a literal string.
 
 *Call graph*: 1 external calls (Literal).
 
@@ -55,11 +55,11 @@ fn arg_type(&self) -> ArgType
 fn is_exact(&self) -> Option<usize>
 ```
 
-**Purpose**: Reports whether a cardinality corresponds to a fixed argument count. Only `One` is exact in this model.
+**Purpose**: This function answers the narrow question: “does this count rule require an exact number of arguments?” At present, only the `One` rule has an exact count.
 
-**Data flow**: Reads `self` and returns `Some(1)` for `One`; `AtLeastOne` and `ZeroOrMore` both return `None` to indicate variable width.
+**Data flow**: It receives an `ArgMatcherCardinality`. If the rule is exactly one argument, it returns `Some(1)`. If the rule allows a variable number of arguments, it returns `None`, meaning there is no single fixed count.
 
-**Call relations**: Argument partitioning and matching use this to distinguish fixed-width patterns from the single allowed vararg pattern. A `None` result is what triggers vararg handling.
+**Call relations**: This is a convenience helper for code that can take a shortcut when a matcher has a fixed width. It does not call other functions; it simply turns the cardinality enum into an optional number for callers that need one.
 
 
 ##### `ArgMatcher::alloc_value`  (lines 98–100)
@@ -68,11 +68,11 @@ fn is_exact(&self) -> Option<usize>
 fn alloc_value(self, heap: Heap<'v>) -> Value<'v>
 ```
 
-**Purpose**: Allocates an `ArgMatcher` as a Starlark heap value. This is the bridge from Rust-owned matcher data into the embedded Starlark runtime.
+**Purpose**: This function makes an `ArgMatcher` available inside Starlark, the scripting language used for policy definitions. In plain terms, it puts the Rust value into Starlark's memory space so scripts can use it.
 
-**Data flow**: Consumes `self` and a `Heap<'v>`, calls `heap.alloc_simple(self)`, and returns the resulting `Value<'v>`. No external state is modified beyond the heap allocation.
+**Data flow**: It takes ownership of an `ArgMatcher` and receives a Starlark heap, which is the place where Starlark values are stored. It asks the heap to allocate the matcher as a simple value, then returns the resulting Starlark `Value` handle.
 
-**Call relations**: This implementation is used implicitly by Starlark embedding code whenever an `ArgMatcher` needs to be exposed to scripts or policy evaluation.
+**Call relations**: This is called by the Starlark integration layer when an `ArgMatcher` needs to cross from Rust into policy script land. It hands the actual allocation to the heap's `alloc_simple` operation, because the heap owns the storage rules for Starlark values.
 
 *Call graph*: 1 external calls (alloc_simple).
 
@@ -83,22 +83,24 @@ fn alloc_value(self, heap: Heap<'v>) -> Value<'v>
 fn unpack_value_impl(value: Value<'v>) -> starlark::Result<Option<Self>>
 ```
 
-**Purpose**: Attempts to recover an `ArgMatcher` from a generic Starlark value, with a convenience rule that plain strings become literal matchers. This makes policy authoring less verbose.
+**Purpose**: This function reads a Starlark value and tries to turn it into an `ArgMatcher`. It is what lets policy authors write either a matcher object or a plain string, where the plain string means “match this exact argument.”
 
-**Data flow**: Accepts a `Value<'v>`. If it downcasts to `StarlarkStr`, it returns `Ok(Some(ArgMatcher::Literal(...)))`; otherwise it tries to downcast to an existing `ArgMatcher` and clones it, returning that optional result. Errors come from the Starlark API type.
+**Data flow**: It receives a Starlark `Value`. First it checks whether that value is a Starlark string; if so, it copies the string into an `ArgMatcher::Literal`. If it is not a string, it checks whether the value already contains an `ArgMatcher` and clones it if found. If neither form matches, it returns `None` inside a successful result, meaning “this value was not an argument matcher.”
 
-**Call relations**: This unpacker is invoked by the Starlark runtime when Rust code requests an `ArgMatcher` parameter from script values. Its string-special case is what allows script authors to write bare string literals instead of constructing matcher objects explicitly.
+**Call relations**: This function is used by Starlark's value-unpacking machinery when Rust code expects an `ArgMatcher` from a policy script. Its main special behavior is the string shortcut: it constructs a literal matcher for plain strings, so policy files can stay concise instead of wrapping every fixed argument in an explicit matcher object.
 
 *Call graph*: 1 external calls (Literal).
 
 
 ### `execpolicy-legacy/src/opt.rs`
 
-`data_model` · `config load`
+`data_model` · `policy definition and Starlark value exchange`
 
-This file is primarily a data-model bridge between Rust and Starlark. `Opt` represents one allowed command-line option for a program spec: the literal option spelling in `opt`, metadata in `meta`, and whether the option is mandatory in `required`. `OptMeta` distinguishes a pure flag (`Flag`) from an option that consumes a value of a specific `ArgType` (`Value(ArgType)`). Display derives render these in policy/debug-friendly forms.
+This file is a small data model for command-line options. In plain terms, it describes things like “--help is a flag” or “--output needs a string value.” Without this shared shape, policy code would not have a reliable way to talk about which command-line arguments are allowed, required, or expected to carry a value.
 
-Beyond the plain structs, the file implements the traits needed for Starlark policy evaluation. `StarlarkValue` marks both `Opt` and `OptMeta` as first-class Starlark values. `UnpackValue` for `Opt` downcasts a generic Starlark `Value` to `Opt` and clones it out, which is how builtin functions such as `define_program` receive typed option lists from policy code. `AllocValue` allocates an `Opt` into the Starlark heap with `heap.alloc_simple(self)`. The implementation is intentionally minimal: there is no parsing logic here, only construction, name access, and runtime interop so other modules can build `ProgramSpec.allowed_options` from policy declarations.
+The main type is `Opt`, which stores three facts: the option text as it appears on the command line, such as `-h` or `--help`; metadata saying whether it is just a flag or needs a value; and whether the option is required. The companion enum `OptMeta` explains the kind of option. A `Flag` takes no extra value. A `Value(ArgType)` takes one value of a particular argument type.
+
+The file also connects these Rust types to Starlark, a small configuration language used by projects like Buck and Bazel. That means policy scripts can create or receive `Opt` values, and Rust can safely pull them back out. You can think of this as giving the option object a passport so it can cross between Rust code and Starlark scripts without losing its identity.
 
 #### Function details
 
@@ -108,11 +110,11 @@ Beyond the plain structs, the file implements the traits needed for Starlark pol
 fn new(opt: String, meta: OptMeta, required: bool) -> Self
 ```
 
-**Purpose**: Constructs an `Opt` from its command-line spelling, metadata, and requiredness flag.
+**Purpose**: Creates a new command-line option description from its pieces. Someone uses this when they know the option spelling, what kind of value it accepts, and whether it must be present.
 
-**Data flow**: Takes ownership of `opt: String`, `meta: OptMeta`, and `required: bool`, then returns an `Opt` with those fields unchanged.
+**Data flow**: It takes an option string, option metadata, and a required/not-required flag. It places those three inputs into a new `Opt` object and returns that object unchanged in meaning.
 
-**Call relations**: Used by policy builtin functions when translating Starlark `opt(...)` and `flag(...)` declarations into Rust values stored in a `ProgramSpec`.
+**Call relations**: This is the simple constructor for the `Opt` data type. Other parts of the policy system can call it when building the list of allowed or expected command-line options.
 
 
 ##### `Opt::name`  (lines 48–50)
@@ -121,11 +123,11 @@ fn new(opt: String, meta: OptMeta, required: bool) -> Self
 fn name(&self) -> &str
 ```
 
-**Purpose**: Returns the option's canonical command-line spelling as a borrowed string slice.
+**Purpose**: Returns the option’s command-line spelling, such as `--help`. This gives callers a read-only view of the option name without copying it.
 
-**Data flow**: Reads `self.opt` and returns `&str` pointing into that field without allocation or mutation.
+**Data flow**: It reads the `opt` field from an existing `Opt` object and returns it as text borrowed from that object. Nothing is changed.
 
-**Call relations**: Called while building the allowed-options map so duplicate detection and key insertion use the exact option name.
+**Call relations**: This is used whenever surrounding code needs to compare, display, or inspect which command-line option an `Opt` represents.
 
 
 ##### `Opt::unpack_value_impl`  (lines 61–65)
@@ -134,11 +136,11 @@ fn name(&self) -> &str
 fn unpack_value_impl(value: Value<'v>) -> starlark::Result<Option<Self>>
 ```
 
-**Purpose**: Attempts to extract an `Opt` from a generic Starlark runtime value.
+**Purpose**: Tries to read an `Opt` object out of a Starlark value. This is needed when Starlark policy code passes a value back into Rust and Rust needs to confirm it really is an option description.
 
-**Data flow**: Receives a `Value<'v>`, downcasts it to `&Opt` if possible, clones the underlying `Opt`, and returns `Ok(Some(opt))`; non-`Opt` values become `Ok(None)`.
+**Data flow**: It receives a generic Starlark `Value`, checks whether that value contains an `Opt`, and if so clones and returns it. If the Starlark value is not an `Opt`, it returns `None`; if Starlark reports an error, that error can be returned.
 
-**Call relations**: Used by Starlark argument unpacking when builtin policy functions accept `UnpackList<Opt>` parameters.
+**Call relations**: This function is part of the bridge from Starlark into Rust. The Starlark runtime calls it when Rust code asks to unpack a script value as an `Opt`.
 
 
 ##### `Opt::alloc_value`  (lines 69–71)
@@ -147,22 +149,26 @@ fn unpack_value_impl(value: Value<'v>) -> starlark::Result<Option<Self>>
 fn alloc_value(self, heap: Heap<'v>) -> Value<'v>
 ```
 
-**Purpose**: Allocates an `Opt` into the Starlark heap so it can be passed around inside evaluated policy code.
+**Purpose**: Stores an `Opt` object on a Starlark heap so it can be used as a Starlark value. A heap here is the memory area where Starlark keeps values that scripts can refer to.
 
-**Data flow**: Consumes `self`, writes it into the provided `Heap<'v>` via `alloc_simple`, and returns the resulting Starlark `Value<'v>` handle.
+**Data flow**: It takes ownership of an `Opt` and receives a Starlark heap. It asks the heap to allocate the option as a simple stored value, then returns the resulting Starlark `Value` handle.
 
-**Call relations**: Participates in Rust-to-Starlark value conversion for policy builtins and module setup.
+**Call relations**: This function is part of the bridge from Rust into Starlark. When Rust needs to hand an `Opt` to Starlark code, this method calls `alloc_simple` to place it into Starlark-managed memory.
 
 *Call graph*: 1 external calls (alloc_simple).
 
 
 ### `execpolicy-legacy/src/arg_type.rs`
 
-`domain_logic` · `request handling`
+`data_model` · `policy construction and argument validation`
 
-This file introduces `ArgType`, the normalized classification attached to each matched argument after pattern resolution. Variants distinguish exact literals, opaque non-file values, readable and writable file paths, positive integers, safe sed commands, and an `Unknown` fallback. The key behavior is `validate`, which enforces the per-type constraints used when constructing matched arguments. Literal values must exactly equal the stored string; readable and writable file arguments must be non-empty strings; positive integers must parse as `u64` and be greater than zero; and sed commands are delegated to `parse_sed_command` for bespoke safety checks. `OpaqueNonFile` and `Unknown` intentionally accept any string.
+Execution policies need to understand command arguments well enough to decide whether a command is safe. For example, an argument might be a fixed word like `-n`, a file that will be read, a file that may be written, or a number. This file gives those categories a shared name: `ArgType`.
 
-The second method, `might_write_file`, is a conservative risk classifier used by policy logic to reason about side effects. It returns `true` for `WriteableFile` and also for `Unknown`, reflecting the design choice that unknown arguments may represent writable paths and therefore should be treated cautiously. All other variants are considered non-writing. The file also marks `ArgType` as a Starlark value type, but unlike `ArgMatcher` it contains no custom unpacking logic; its main role is to carry validated semantics through the rest of the legacy exec-policy pipeline.
+Think of `ArgType` like labels on boxes at a security checkpoint. A box labeled “readable file” must not be empty, because an empty filename is not meaningful. A box labeled “positive integer” must contain a number greater than zero. A box labeled “literal” must contain exactly the expected text. A `sed` command gets special checking, because `sed` scripts can do many things and only some are considered safe here.
+
+The important part is that this file does not run commands. It classifies and validates their arguments before other code trusts them. Without this, the policy system would have a much weaker idea of what each command argument means, which could let bad or ambiguous command lines slip through.
+
+It also provides a small helper to ask whether an argument type might write to a file. That matters because file-writing arguments are more dangerous than ordinary flags or read-only inputs.
 
 #### Function details
 
@@ -172,11 +178,11 @@ The second method, `might_write_file`, is a conservative risk classifier used by
 fn validate(&self, value: &str) -> Result<()>
 ```
 
-**Purpose**: Checks whether a concrete argument string satisfies the constraints implied by this `ArgType`. It turns semantic mismatches into structured policy errors.
+**Purpose**: Checks whether a concrete command-line value matches this argument type. It turns a type label like “literal”, “positive integer”, or “safe sed command” into an actual yes-or-no validation step, with a specific error when the value is not acceptable.
 
-**Data flow**: Reads `self` and an input `&str`. Depending on the variant, it compares against a stored literal, checks for non-empty file names, parses a positive integer, or delegates sed-command validation to `parse_sed_command`; `OpaqueNonFile` and `Unknown` accept any value. It returns `Result<()>`, producing specific `Error` variants on failure.
+**Data flow**: It receives an `ArgType` and a text value from a command line. It compares or parses that text according to the type: literals must match exactly, readable and writeable file names must not be empty, positive integers must parse as numbers greater than zero, and sed commands are passed to the sed-command parser for deeper checking. It returns success when the value fits, or an error explaining what was wrong.
 
-**Call relations**: This method is called during matched-argument construction elsewhere in the policy engine. It is the final per-value gate after argument-resolution has decided which observed string belongs to which semantic type.
+**Call relations**: Two construction routines named `new` call this function when new policy-related values are being created. In the special `SedCommand` case, it hands the text to `parse_sed_command`, because sed syntax needs its own focused safety check rather than a simple string comparison.
 
 *Call graph*: calls 1 internal fn (parse_sed_command); called by 2 (new, new).
 
@@ -187,20 +193,22 @@ fn validate(&self, value: &str) -> Result<()>
 fn might_write_file(&self) -> bool
 ```
 
-**Purpose**: Conservatively reports whether an argument of this type could represent a file write. It is used for side-effect analysis rather than strict validation.
+**Purpose**: Answers the safety question: could an argument of this type cause a file to be written? This helps later policy decisions treat potentially writeable arguments more carefully.
 
-**Data flow**: Matches on `self` and returns `true` for `WriteableFile` and `Unknown`, `false` for all other variants. It has no side effects.
+**Data flow**: It reads the current `ArgType`. It returns `true` for `WriteableFile`, and also for `Unknown` because an unknown argument might be a file output. It returns `false` for fixed literals, non-file opaque values, positive integers, readable files, and checked sed commands.
 
-**Call relations**: Other policy components can call this after arguments have been typed to decide whether a command may write to the filesystem. The inclusion of `Unknown` makes the method intentionally pessimistic.
+**Call relations**: The call graph provided for this file does not show a specific caller, but this function is designed as a quick question other policy code can ask when deciding whether an argument should be treated as possibly modifying the filesystem.
 
 
 ### `execpolicy-legacy/src/sed_command.rs`
 
-`util` · `request handling`
+`domain_logic` · `validation`
 
-This file contains a single conservative parser used when an argument has been classified as a sed command. Rather than attempting to understand general sed syntax, it recognizes only commands of the form `N,Mp`: a trailing literal `p`, exactly one comma separating two numeric fields, and both numeric fields parseable as `u64`. The implementation uses chained `if let`/`&&` guards to keep the accepted grammar explicit and small.
+This file exists as a small safety gate for `sed`, a common text-processing tool. Some `sed` commands can do much more than print text, so this code does not try to understand every possible command. Instead, it only approves one very narrow shape: two positive line numbers separated by a comma, ending with `p`, which means “print these lines.” An everyday analogy is a door guard with a very short guest list: if the command does not exactly match the approved pattern, it is turned away.
 
-Anything outside that exact shape is rejected with `Error::SedCommandNotProvablySafe`, carrying the original command string. That includes missing `p`, extra syntax, non-numeric ranges, single-address commands, substitutions, and any other sed features. The design choice here is intentional: the function is not a general parser but a proof-oriented whitelist for a tiny safe subset, so false negatives are acceptable while false positives are avoided.
+The check works by peeling the command apart. First it looks for a final `p`. Then it checks that what comes before can be split into two parts around a comma. Finally, it verifies that both parts are valid whole numbers. If all of that is true, the command is accepted. If anything is missing or malformed, the function returns an error saying the command is not provably safe.
+
+This matters because the surrounding validation code can rely on this file to be deliberately conservative. It may reject commands that a human knows are harmless, but it avoids accidentally approving a command whose behavior is unclear or dangerous.
 
 #### Function details
 
@@ -210,11 +218,11 @@ Anything outside that exact shape is rejected with `Error::SedCommandNotProvably
 fn parse_sed_command(sed_command: &str) -> Result<()>
 ```
 
-**Purpose**: Accepts only sed print-range commands in the exact `number,numberp` format and rejects all other sed syntax.
+**Purpose**: This function decides whether a `sed` command is in the one safe form this program currently recognizes: a numeric line range followed by `p`, like `122,202p`. It is used to reject anything more complex or unclear.
 
-**Data flow**: Reads `sed_command`, strips a trailing `p`, splits the remainder once on `,`, and attempts to parse both sides as `u64`. If all checks succeed it returns `Ok(())`; otherwise it returns `Err(Error::SedCommandNotProvablySafe { command: sed_command.to_string() })`.
+**Data flow**: It receives the command as text. It checks whether the text ends in `p`, whether the remaining text contains one comma, and whether both sides of that comma are valid whole numbers. If all checks pass, it returns success with no extra data; otherwise, it returns an error that includes the original command text.
 
-**Call relations**: Called from argument validation logic when a policy marks an argument as a sed command, serving as the concrete whitelist check for that argument type.
+**Call relations**: The broader `validate` flow calls this when it needs to confirm that a requested `sed` command is safe enough to allow. This function does the narrow pattern check and hands back either approval or a clear rejection, so validation can stop unsafe or unsupported commands before they are used.
 
 *Call graph*: called by 1 (validate).
 
@@ -226,9 +234,7 @@ These files turn higher-level sandbox permissions into concrete platform-specifi
 
 `config` · `build time`
 
-This build script exists solely to connect the compile-time `CODEX_BWRAP_SHA256` environment variable to Cargo's rebuild logic. The runtime sandbox code in `bundled_bwrap.rs` reads that value through `option_env!`, which means the compiled binary embeds whatever digest was present at build time. Without a build script, changing the environment variable would not necessarily trigger recompilation, and the embedded expected digest could become stale.
-
-The script therefore prints a single Cargo directive, `cargo:rerun-if-env-changed=CODEX_BWRAP_SHA256`. Cargo interprets that line specially and reruns the build script whenever the variable's value changes between builds. There is no filesystem probing, code generation, or conditional logic here; the file's entire role is to keep the compile-time digest dependency explicit and reproducible.
+Rust crates can include a build script, which is a tiny program Cargo runs before compiling the crate. This file uses that hook for one specific purpose: it tells Cargo that the build should be considered out of date if the environment variable CODEX_BWRAP_SHA256 changes. An environment variable is a value supplied from outside the program, often by the shell or build system. Here, the variable name suggests it contains a SHA-256 checksum for bubblewrap, a Linux sandboxing tool. The script does not read or verify the value itself. Instead, it prints a special instruction that Cargo understands: “rerun this build script if this environment variable changes.” Without this, Cargo might reuse an old build result even after the checksum setting changed, which could make the build behave as if it still had the old configuration. Think of it like putting a sticky note on a recipe: if this ingredient label changes, check the recipe again before cooking.
 
 #### Function details
 
@@ -238,22 +244,26 @@ The script therefore prints a single Cargo directive, `cargo:rerun-if-env-change
 fn main()
 ```
 
-**Purpose**: Emits the Cargo rebuild hint for the bundled bubblewrap SHA-256 environment variable.
+**Purpose**: This is the build script’s entry point. It tells Cargo to rerun the build script whenever the CODEX_BWRAP_SHA256 environment variable changes.
 
-**Data flow**: Reads no runtime inputs → prints `cargo:rerun-if-env-changed=CODEX_BWRAP_SHA256` to stdout for Cargo to consume.
+**Data flow**: It takes no direct input from the program. When Cargo runs it, it writes one specially formatted line to standard output; Cargo reads that line and records CODEX_BWRAP_SHA256 as a build dependency. The result is not a normal return value, but a change in Cargo’s rebuild tracking.
 
-**Call relations**: Executed by Cargo during crate build so changes to the digest environment variable invalidate the build as intended.
+**Call relations**: Cargo calls this function automatically before compiling the crate. The function hands its instruction to Cargo by printing it, using Rust’s println! macro, and Cargo uses that instruction later to decide whether the build script needs to run again.
 
 *Call graph*: 1 external calls (println!).
 
 
 ### `sandboxing/src/policy_transforms.rs`
 
-`domain_logic` · `permission evaluation and sandbox setup`
+`domain_logic` · `permission setup and sandbox policy calculation`
 
-This file concentrates the rules for reconciling `AdditionalPermissionProfile` values with existing `PermissionProfile`, `FileSystemSandboxPolicy`, and `NetworkSandboxPolicy` settings. Its first responsibility is normalization: `normalize_additional_permissions` removes empty sections, canonicalizes concrete filesystem paths while preserving symlink structure, rejects invalid glob grants unless they are deny entries, and deduplicates entries. From there, the file provides two distinct composition modes. `merge_permission_profiles` unions two additional-permission profiles, preserving any enabled network access and combining filesystem entries plus the effective glob scan depth needed by deny-glob rules. `intersect_permission_profiles` instead computes what granted permissions remain inside a requested envelope, using a restricted `FileSystemSandboxPolicy`, `ReadDenyMatcher`, path resolution against `cwd`, and explicit retention of deny entries that still constrain accepted grants.
+This file is the permission “adapter” for the sandbox. A sandbox is a safety boundary that limits what the program can read, write, or access on the network. Users or clients may ask for extra access, but those requests arrive in a flexible form: paths may be relative, duplicate rules may appear, and some rules depend on the current working directory. This file cleans that up and turns it into concrete policies the rest of the system can enforce.
 
-A large part of the logic exists to deal with cwd-dependent or symbolic permission paths: special paths such as project roots, root, tmpdir, and relative glob patterns are resolved or materialized only when needed. The file also encodes subtle invariants: deny glob entries are the only legal glob additional permissions; deny entries are retained only if they actually constrain surviving readable grants; and glob scan depth is only meaningful when deny-glob entries exist, with `None` representing either no glob scanning requirement or an unbounded scan depending on context. Finally, the module derives effective runtime filesystem/network policies and decides whether a platform sandbox is still required based on network enablement, managed-network requirements, filesystem sandbox kind, and whether restricted mode still blocks full-disk writes.
+The main flow is: normalize extra permissions, merge permissions from different sources, intersect requested permissions with granted permissions, and then produce the effective file-system and network sandbox policies. Think of it like checking several guest lists before opening a door: one list says what was requested, one says what was granted, and the final list says who actually gets in.
+
+The file is careful with deny rules. A deny rule means “even if a broader read is allowed, this part must stay blocked.” It keeps deny rules when they still restrict an accepted grant, including deny rules written as glob patterns, where a pattern like `*.secret` may match many files. It also resolves special paths such as the project root, the system root, or temporary directories when possible.
+
+Without this file, added permissions could be too loose, duplicated, inconsistent, or impossible for the sandbox to enforce correctly.
 
 #### Function details
 
@@ -265,11 +275,11 @@ fn normalize_additional_permissions(
 ) -> Result<AdditionalPermissionProfile, String>
 ```
 
-**Purpose**: Normalizes an `AdditionalPermissionProfile` into a canonical, deduplicated form suitable for later policy merging. It strips empty network/filesystem sections, canonicalizes concrete paths, and rejects glob filesystem entries unless they are deny rules.
+**Purpose**: Cleans up an extra permission profile before it is used. It removes empty sections, makes real file paths more stable, rejects unsupported glob permissions, and removes duplicate file-system entries.
 
-**Data flow**: It takes ownership of an `AdditionalPermissionProfile`. It reads `network` and drops it when `is_empty()` is true; for `file_system`, it iterates each `FileSystemSandboxEntry`, validates that `FileSystemPath::GlobPattern` entries only appear with `FileSystemAccessMode::Deny`, canonicalizes `FileSystemPath::Path` values via `canonicalize_preserving_symlinks` and `AbsolutePathBuf::from_absolute_path`, leaves glob and special paths unchanged, and pushes only unique normalized entries. It returns `Ok` with a rebuilt profile containing only non-empty sections, or `Err(String)` for invalid glob grants.
+**Data flow**: It receives an `AdditionalPermissionProfile`, which may contain network and file-system permissions. It drops empty network permissions, walks each file-system entry, canonicalizes normal paths when possible while preserving symbolic links, leaves special paths and glob patterns in their own forms, rejects glob entries unless they are deny rules, and removes duplicates. It returns either the cleaned profile or an error message explaining why the profile is invalid.
 
-**Call relations**: This is an early validation/cleanup step invoked before permissions are persisted or applied. Callers such as request/response handling and write-path setup use it to ensure downstream merge/intersection logic sees canonical paths and legal glob semantics.
+**Call relations**: This is called when permissions are written for paths, when extra permissions are normalized and validated, and when a call is handled. It prepares permission data before later code merges it or applies it to a sandbox.
 
 *Call graph*: called by 3 (write_permissions_for_paths, normalize_and_validate_additional_permissions, handle_call); 3 external calls (with_capacity, canonicalize_preserving_symlinks, matches!).
 
@@ -283,11 +293,11 @@ fn merge_permission_profiles(
 ) -> Option<AdditionalPermissionProfile>
 ```
 
-**Purpose**: Computes the union of a base and an overlay `AdditionalPermissionProfile`. The result preserves any enabled network access and combines filesystem entries without duplicates while carrying forward the strongest glob-scan requirement implied by deny-glob rules.
+**Purpose**: Combines two extra permission profiles into one. It is used when permissions come from more than one place and the system needs a single combined view.
 
-**Data flow**: It accepts optional references to a base profile and an overriding profile. If the overlay is absent it clones the base; otherwise it inspects both `network` sections and returns `enabled: Some(true)` if either side explicitly enables network. For filesystem permissions, it either clones one side, or when both exist, builds a new `FileSystemPermissions` whose `entries` come from `merge_permission_entries` and whose `glob_scan_max_depth` comes from `merge_glob_scan_max_depth` converted back into `NonZeroUsize`. Empty merged sections are filtered out, and the final `Option<AdditionalPermissionProfile>` is omitted if fully empty.
+**Data flow**: It receives an optional base profile and an optional additional profile. If the new profile is missing, it keeps the base. If both exist, it enables network access if either profile explicitly enables it, combines file-system entries without duplicates, and chooses a safe combined glob scan depth. It returns no profile if the result is empty.
 
-**Call relations**: This function sits in the additive composition path used when previously granted permissions are accumulated or patch permissions are layered. It delegates entry deduplication and glob-depth reconciliation to helper functions so callers get a single merged profile without reimplementing those rules.
+**Call relations**: This is used when granted permissions are recorded, when granted turn permissions are applied, when patch permissions are calculated, and in tests around preapproved deny glob behavior. It relies on `merge_permission_entries` for file entries and `merge_glob_scan_max_depth` for glob scanning limits.
 
 *Call graph*: calls 2 internal fn (merge_glob_scan_max_depth, merge_permission_entries); called by 5 (record_granted_permissions, record_granted_permissions, apply_granted_turn_permissions, effective_patch_permissions, relative_deny_glob_grants_remain_preapproved_after_materialization).
 
@@ -302,11 +312,11 @@ fn intersect_permission_profiles(
 ) -> AdditionalPermissionProfile
 ```
 
-**Purpose**: Builds the subset of granted permissions that are actually allowed by a requested permission profile. It intersects both filesystem and network permissions, preserving only readable grants covered by the request and retaining deny entries that still meaningfully constrain those surviving grants.
+**Purpose**: Finds the permissions that are both requested and granted. This prevents the system from accepting a grant that goes beyond what was actually asked for.
 
-**Data flow**: It consumes `requested` and `granted` `AdditionalPermissionProfile` values plus a `cwd`. For filesystem permissions, it converts the requested entries into a restricted `FileSystemSandboxPolicy`, constructs a `ReadDenyMatcher`, filters granted entries through `granted_file_system_entry_within_request`, materializes cwd-dependent entries, deduplicates them, then appends deny entries from both requested and granted sides only when `retain_constraining_deny_entries` determines they overlap accepted readable grants. It computes the resulting `glob_scan_max_depth` from the retained deny entries on both sides. For network, it returns enabled only when both requested and granted explicitly enable it. The function returns a new `AdditionalPermissionProfile`, omitting empty filesystem results.
+**Data flow**: It receives a requested profile, a granted profile, and the current working directory. For file-system permissions, it builds a temporary policy from the requested entries, accepts only granted read-capable entries that fit inside that request, materializes entries that depend on the working directory, and keeps deny entries that still restrict the accepted grants. For network permissions, it only enables network access if both requested and granted profiles enable it. It returns the final intersected profile.
 
-**Call relations**: This is the restrictive counterpart to profile merging and is used when a granted set must be checked against a requested envelope, such as client permission responses or preapproval checks. Internally it relies on path resolution, access coverage checks, and deny-retention helpers to avoid accidentally widening permissions during intersection.
+**Call relations**: This is used when a client responds to a permission request, when permission responses are normalized, and when checking whether permissions are already preapproved. Internally it coordinates the file-entry checks, deny-rule retention, path resolution, and glob scan depth merging.
 
 *Call graph*: called by 4 (request_permissions_response_from_client_result, normalize_request_permissions_response, permissions_are_preapproved, relative_deny_glob_grants_remain_preapproved_after_materialization).
 
@@ -322,11 +332,11 @@ fn merge_glob_scan_max_depth(
 ) -> Option<usiz
 ```
 
-**Purpose**: Combines two optional glob scan depth settings into the effective depth required by both permission sets. It only treats a depth as meaningful when the corresponding entries actually contain deny-glob rules.
+**Purpose**: Combines the scan-depth limits for glob deny rules. A scan depth is how far the system should look through directories when applying a glob pattern.
 
-**Data flow**: It receives left/right entry slices and optional numeric depths. It first converts each side into an `Option<GlobScanDepth>` using `effective_glob_scan_depth`; then it merges them so that any `Unbounded` side yields `None`, two bounded depths yield their maximum, and a single bounded side wins over a missing side. It returns `Option<usize>` representing the merged runtime depth requirement.
+**Data flow**: It receives two sets of file-system entries and their optional depth limits. It first asks whether each side actually has deny glob rules. If either side has an unbounded glob scan, the combined result is unbounded. If both have bounded depths, it keeps the larger depth. If only one side has a relevant depth, it uses that one. It returns the merged depth or no limit.
 
-**Call relations**: This helper is used whenever filesystem permissions or policies are combined. Its role is to centralize the subtle interpretation of `None` versus bounded values in the presence of deny-glob entries.
+**Call relations**: This is used when permission profiles are merged and when extra file-system permissions are folded into an existing sandbox policy. It depends on `effective_glob_scan_depth` to ignore depth settings that do not matter because there are no glob deny entries.
 
 *Call graph*: calls 1 internal fn (effective_glob_scan_depth); called by 2 (merge_file_system_policy_with_additional_permissions, merge_permission_profiles).
 
@@ -340,11 +350,11 @@ fn effective_glob_scan_depth(
 ) -> Option<GlobScanDepth>
 ```
 
-**Purpose**: Determines whether a filesystem entry list implies glob scanning at all, and if so whether that scan is bounded or unbounded. Only deny entries with `FileSystemPath::GlobPattern` activate this behavior.
+**Purpose**: Determines whether a set of entries really needs a glob scan depth. It treats the depth as meaningful only when there is at least one deny rule written as a glob pattern.
 
-**Data flow**: It reads a slice of `FileSystemSandboxEntry` plus an optional depth. It scans the entries for any deny-glob rule; if none exist it returns `None`. If one exists, it maps `Some(depth)` to `Some(GlobScanDepth::Bounded(depth))` and missing depth to `Some(GlobScanDepth::Unbounded)`.
+**Data flow**: It receives file-system entries and an optional numeric depth. It scans the entries for a deny glob. If none exists, it returns nothing. If one exists, it returns either a bounded depth using the given number or an unbounded marker when no number was provided.
 
-**Call relations**: This function is only called by `merge_glob_scan_max_depth`, where it supplies the normalized per-side interpretation needed before two depth settings can be reconciled.
+**Call relations**: This helper is called by `merge_glob_scan_max_depth`. It keeps unrelated depth values from affecting profiles that do not use glob deny rules.
 
 *Call graph*: called by 1 (merge_glob_scan_max_depth); 2 external calls (iter, Bounded).
 
@@ -359,11 +369,11 @@ fn granted_file_system_entry_within_request(
     grant
 ```
 
-**Purpose**: Checks whether a single granted filesystem entry is covered by the requested filesystem permissions. It rejects non-readable grants, honors requested deny-read matchers, and compares either resolved path access or exact unresolved entry equality.
+**Purpose**: Checks whether one granted file-system permission fits inside what was requested. It is a safety check that stops broader-than-requested access from slipping through.
 
-**Data flow**: It takes the requested `FileSystemPermissions`, a prebuilt restricted `FileSystemSandboxPolicy`, an optional `ReadDenyMatcher`, one granted `FileSystemSandboxEntry`, and `cwd`. It first rejects entries whose access mode cannot read. If the granted path can be resolved by `resolve_permission_path`, it asks the deny matcher whether reads are denied for that path and, if not, compares the requested policy's resolved access against the granted access via `access_covers`. If the path cannot be resolved, it falls back to scanning requested entries for an exact path match with sufficient access. It returns `bool`.
+**Data flow**: It receives the requested file-system permissions, the requested policy, an optional read-deny matcher, a granted entry, and the current working directory. It rejects granted entries that cannot read. If the granted path can be resolved to a concrete path, it checks that the path is not denied by the requested deny rules and that the requested access covers the granted access. If the path cannot be resolved, it only accepts an exact matching requested entry with enough access. It returns true or false.
 
-**Call relations**: This predicate is used during profile intersection to decide which granted entries survive. It delegates path interpretation to `resolve_permission_path` and access comparison to `access_covers`, because requested coverage depends on both cwd-sensitive resolution and access-mode semantics.
+**Call relations**: This helper is part of the intersection flow in `intersect_permission_profiles`. It uses `resolve_permission_path` to turn special paths into real paths and `access_covers` to compare requested access with granted access.
 
 *Call graph*: calls 3 internal fn (resolve_access_with_cwd, access_covers, resolve_permission_path).
 
@@ -378,11 +388,11 @@ fn retain_constraining_deny_entries(
     output_entries: &mut Vec<FileSystemSandboxEntry
 ```
 
-**Purpose**: Selectively carries deny entries into an intersected permission set only when they still constrain at least one accepted readable grant. This prevents irrelevant deny rules from cluttering the resulting profile.
+**Purpose**: Keeps deny rules that still matter after grants have been accepted. This matters because a broad allowed read may still need a smaller blocked area inside it.
 
-**Data flow**: It accepts source deny candidates, the already accepted entries, `cwd`, and a mutable output vector. It filters `source_entries` down to deny entries, checks each with `deny_entry_constrains_accepted_grant`, materializes cwd-dependent forms with `materialize_cwd_dependent_entry`, appends unique retained entries into `output_entries`, and also collects them into a returned `Vec<FileSystemSandboxEntry>` for later glob-depth computation.
+**Data flow**: It receives a source list of entries, the already accepted grant entries, the current working directory, and an output list to append to. It looks only at deny entries, keeps the ones that overlap accepted readable grants, materializes working-directory-dependent paths, avoids duplicates in the output list, and returns the deny entries it retained.
 
-**Call relations**: This helper is called twice by `intersect_permission_profiles`, once for requested deny entries and once for granted deny entries. Its job in that flow is to preserve only semantically active deny constraints so the intersection remains both safe and minimal.
+**Call relations**: This is used during profile intersection after accepted grants are known. It calls `deny_entry_constrains_accepted_grant` to decide whether a deny rule matters and `materialize_cwd_dependent_entry` before adding retained rules to the final output.
 
 *Call graph*: calls 2 internal fn (deny_entry_constrains_accepted_grant, materialize_cwd_dependent_entry); 2 external calls (new, iter).
 
@@ -397,11 +407,11 @@ fn deny_entry_constrains_accepted_grant(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a deny entry overlaps any accepted readable grant closely enough to matter. It treats glob denies by their static path prefix and concrete/special denies by their resolved path.
+**Purpose**: Decides whether a deny rule actually restricts any accepted readable grant. If it does not overlap any accepted grant, keeping it would not change the final permission outcome.
 
-**Data flow**: It takes one deny entry, the accepted entries, and `cwd`. It iterates accepted entries that can read, resolves each grant path, and then compares the deny side: for `GlobPattern`, it computes a static prefix with `glob_static_prefix_path` and checks overlap; for `Path` or `Special`, it resolves the deny path with `resolve_permission_path` and checks overlap. It returns `true` if any accepted readable grant overlaps.
+**Data flow**: It receives one deny entry, the accepted entries, and the current working directory. For each accepted readable grant, it resolves the grant to a concrete path. If the deny entry is a glob pattern, it estimates the pattern’s fixed path prefix and checks whether that prefix overlaps the grant. If the deny entry is a normal or special path, it resolves it and checks overlap directly. It returns true if any accepted grant is constrained.
 
-**Call relations**: This predicate is used exclusively by `retain_constraining_deny_entries`. In the intersection pipeline it is the gate that decides whether a deny rule survives because it still narrows one of the accepted grants.
+**Call relations**: This is called by `retain_constraining_deny_entries`. It is the filter that decides which deny rules should survive into an intersected permission profile.
 
 *Call graph*: called by 1 (retain_constraining_deny_entries); 1 external calls (iter).
 
@@ -412,11 +422,11 @@ fn deny_entry_constrains_accepted_grant(
 fn glob_static_prefix_path(pattern: &str, cwd: &Path) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Extracts the non-wildcard absolute directory prefix from a glob pattern, resolved against the current working directory. This gives the code a conservative concrete path for overlap checks without expanding the glob.
+**Purpose**: Finds the non-wildcard path prefix of a glob pattern. This gives the code a concrete area of the file tree to compare against grants.
 
-**Data flow**: It takes a glob pattern string and `cwd`, resolves the pattern against `cwd` with `AbsolutePathBuf::resolve_path_against_base`, converts it to a lossy string, finds the first wildcard metacharacter, and then chooses either the full path, the prefix directory, or `None` if the pattern begins with a wildcard. It returns `Option<AbsolutePathBuf>` after validating the prefix as absolute.
+**Data flow**: It receives a glob pattern string and the current working directory. It resolves the pattern against that directory, finds the first wildcard character such as `*` or `?`, and keeps the path portion before that wildcard. If the pattern starts with a wildcard or the prefix cannot be made absolute, it returns nothing. Otherwise it returns the absolute prefix path.
 
-**Call relations**: This helper is used by `deny_entry_constrains_accepted_grant` when a deny rule is a glob. It exists because overlap checks need a concrete path anchor even though glob patterns themselves cannot be fully resolved.
+**Call relations**: This supports deny-rule overlap checks for glob patterns. It gives `deny_entry_constrains_accepted_grant` a usable path prefix when the full pattern cannot be treated as one concrete path.
 
 *Call graph*: calls 2 internal fn (from_absolute_path, resolve_path_against_base); 1 external calls (new).
 
@@ -427,11 +437,11 @@ fn glob_static_prefix_path(pattern: &str, cwd: &Path) -> Option<AbsolutePathBuf>
 fn paths_overlap(left: &Path, right: &Path) -> bool
 ```
 
-**Purpose**: Tests whether two filesystem paths are in an ancestor/descendant relationship. It is a simple overlap notion used for permission containment checks.
+**Purpose**: Checks whether two paths cover some of the same file-tree area. One path overlaps another when either one is inside the other.
 
-**Data flow**: It takes two `&Path` values and returns `true` if either starts with the other using `starts_with`, otherwise `false`.
+**Data flow**: It receives two paths. It checks whether the left path starts with the right path or the right path starts with the left path. It returns true if either is true, otherwise false.
 
-**Call relations**: This small helper supports deny/grant overlap detection in the intersection logic. It is intentionally narrow: callers use it only after resolving or approximating permission paths.
+**Call relations**: This is used by the deny-rule overlap logic to decide whether a deny rule could affect an accepted grant.
 
 *Call graph*: 1 external calls (starts_with).
 
@@ -442,11 +452,11 @@ fn paths_overlap(left: &Path, right: &Path) -> bool
 fn access_covers(requested: FileSystemAccessMode, granted: FileSystemAccessMode) -> bool
 ```
 
-**Purpose**: Checks whether a requested access mode is sufficient to cover a granted access mode. Read grants require readable requested access, write grants require writable requested access, and deny grants are never considered covered.
+**Purpose**: Checks whether requested access is strong enough to include granted access. For example, a request that can read covers a granted read, but deny never counts as a grant.
 
-**Data flow**: It takes `requested` and `granted` `FileSystemAccessMode` values. It matches on the granted mode and calls `can_read` or `can_write` on the requested mode as appropriate, returning a boolean.
+**Data flow**: It receives a requested access mode and a granted access mode. For a granted read, it checks whether the requested mode can read. For a granted write, it checks whether the requested mode can write. For a granted deny, it returns false. The output is a yes-or-no answer.
 
-**Call relations**: This helper is used by `granted_file_system_entry_within_request` to compare requested coverage against each granted entry. It isolates the access-mode semantics from the surrounding path-resolution logic.
+**Call relations**: This is called by `granted_file_system_entry_within_request` when deciding whether an accepted grant stays within the original request.
 
 *Call graph*: calls 2 internal fn (can_read, can_write); called by 1 (granted_file_system_entry_within_request).
 
@@ -460,11 +470,11 @@ fn materialize_cwd_dependent_entry(
 ) -> FileSystemSandboxEntry
 ```
 
-**Purpose**: Converts cwd-dependent permission entries into concrete forms where possible so later comparisons and persisted results are stable. It resolves project-root special paths to concrete paths and rewrites relative glob patterns against `cwd`.
+**Purpose**: Turns permission entries that depend on the current working directory into concrete entries when possible. This makes later comparisons and stored permissions more stable.
 
-**Data flow**: It takes a `FileSystemSandboxEntry` reference and `cwd`. For `Special::ProjectRoots`, it tries `resolve_permission_path` and, if successful, returns a new `FileSystemSandboxEntry` with `FileSystemPath::Path`; for `GlobPattern`, it rewrites the pattern string to an absolute pattern using `resolve_path_against_base`; for ordinary `Path` and other `Special` variants it clones the original entry. It returns the transformed entry.
+**Data flow**: It receives a file-system entry and the current working directory. Project-root special paths are resolved into normal absolute paths when possible. Glob patterns are resolved against the working directory so relative patterns become absolute-looking patterns. Other normal or special paths are left unchanged. It returns the materialized entry.
 
-**Call relations**: This helper is used while intersecting permissions and retaining deny entries so the resulting profile contains concrete, cwd-stable entries whenever possible. It depends on `resolve_permission_path` for special-path resolution.
+**Call relations**: This is called when accepted grants and retained deny entries are built during intersection. It uses `resolve_permission_path` for special path resolution and absolute-path utilities for glob patterns.
 
 *Call graph*: calls 2 internal fn (resolve_permission_path, resolve_path_against_base); called by 1 (retain_constraining_deny_entries); 1 external calls (clone).
 
@@ -475,11 +485,11 @@ fn materialize_cwd_dependent_entry(
 fn resolve_permission_path(path: &FileSystemPath, cwd: &Path) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Resolves a `FileSystemPath` into an absolute concrete path when that path kind has a cwd- or environment-dependent meaning. It is the central interpreter for special filesystem permission path variants.
+**Purpose**: Converts a permission path into a concrete absolute path when that is possible. Some permission paths are symbolic, such as “project root” or “temporary directory,” and this function gives them real locations.
 
-**Data flow**: It takes a `FileSystemPath` and `cwd`. `Path` returns its contained `AbsolutePathBuf`; `GlobPattern` returns `None`; `Special::Root` resolves to the filesystem root by taking the last ancestor of `cwd`; `Special::ProjectRoots` resolves either to `cwd` or a subpath under it; `Special::Tmpdir` reads `TMPDIR` from the environment and validates it as absolute and non-empty; `Special::SlashTmp` returns `/tmp` only if it exists as a directory; `Minimal` and `Unknown` return `None`. The result is `Option<AbsolutePathBuf>`.
+**Data flow**: It receives a permission path and the current working directory. Normal path entries are returned as-is. Glob patterns cannot become one exact path, so they return nothing. Special paths are resolved based on their meaning: root becomes the filesystem root for the current directory, project roots become the current directory or a subpath under it, temporary-directory entries use environment or `/tmp` where valid, and unknown or minimal special paths return nothing. The output is an absolute path or nothing.
 
-**Call relations**: This function underpins several higher-level checks: request/grant containment, cwd-dependent entry materialization, and deny overlap detection. Callers use it whenever they need a concrete path rather than a symbolic permission path.
+**Call relations**: This is used by `granted_file_system_entry_within_request` and `materialize_cwd_dependent_entry`. It is the shared translator from human-friendly or special path forms to concrete paths.
 
 *Call graph*: calls 2 internal fn (from_absolute_path, resolve_path_against_base); called by 2 (granted_file_system_entry_within_request, materialize_cwd_dependent_entry); 5 external calls (ancestors, as_path, from, clone, var_os).
 
@@ -493,11 +503,11 @@ fn merge_permission_entries(
 ) -> Vec<FileSystemSandboxEntry>
 ```
 
-**Purpose**: Produces a deduplicated concatenation of two filesystem permission entry lists while preserving first-seen order. It is the low-level union operation for filesystem entries.
+**Purpose**: Combines two lists of file-system permission entries without keeping duplicates. It preserves the order in which entries are first seen.
 
-**Data flow**: It takes slices of base and overlay `FileSystemSandboxEntry` values, allocates a vector sized for both, iterates the concatenated sequence, clones each entry not already present, and returns the merged vector.
+**Data flow**: It receives a base list and an additional list. It walks through both lists in order, copies each entry into a new list only if it is not already there, and returns the new combined list.
 
-**Call relations**: This helper is called by `merge_permission_profiles` when both profiles contain filesystem permissions. It isolates the entry-level union behavior from the surrounding profile merge logic.
+**Call relations**: This is called by `merge_permission_profiles` when two profiles both contain file-system permissions.
 
 *Call graph*: called by 1 (merge_permission_profiles); 3 external calls (with_capacity, iter, len).
 
@@ -511,11 +521,11 @@ fn merge_file_system_policy_with_additional_permissions(
 ) -> FileSystemSandboxPolicy
 ```
 
-**Purpose**: Adds additional filesystem permissions into an existing runtime filesystem sandbox policy when that policy is restricted. Unrestricted and externally sandboxed policies are left unchanged.
+**Purpose**: Adds extra file-system permissions to an existing file-system sandbox policy, but only when the policy is the kind that can be extended safely.
 
-**Data flow**: It takes a `FileSystemSandboxPolicy` and `FileSystemPermissions`. If the policy kind is `Restricted`, it clones the policy, appends any missing additional entries, recomputes `glob_scan_max_depth` with `merge_glob_scan_max_depth`, and returns the merged policy. For `Unrestricted` and `ExternalSandbox`, it simply clones and returns the original policy.
+**Data flow**: It receives a current file-system sandbox policy and extra file-system permissions. If the policy is restricted, it clones the policy, appends any non-duplicate extra entries, merges the glob scan depth, and returns the expanded policy. If the policy is unrestricted or controlled by an external sandbox, it simply returns a clone of the original policy.
 
-**Call relations**: This helper is the implementation detail behind `effective_file_system_sandbox_policy`. It is only used when deriving the runtime filesystem policy from a base policy plus optional additional permissions.
+**Call relations**: This is called by `effective_file_system_sandbox_policy`. It is the point where cleaned extra file permissions are actually folded into the runtime sandbox policy.
 
 *Call graph*: calls 1 internal fn (merge_glob_scan_max_depth); called by 1 (effective_file_system_sandbox_policy); 1 external calls (clone).
 
@@ -529,11 +539,11 @@ fn effective_file_system_sandbox_policy(
 ) -> FileSystemSandboxPolicy
 ```
 
-**Purpose**: Computes the runtime filesystem sandbox policy after applying optional additional permissions. It short-circuits when no additional filesystem permissions are present or when they are empty.
+**Purpose**: Computes the file-system sandbox policy that should actually be used after considering optional extra permissions.
 
-**Data flow**: It takes a base `FileSystemSandboxPolicy` and an optional `AdditionalPermissionProfile`. If the profile is absent, lacks `file_system`, or contains an empty filesystem section, it clones and returns the original policy. Otherwise it passes the base policy and additional filesystem permissions to `merge_file_system_policy_with_additional_permissions` and returns that result.
+**Data flow**: It receives the base file-system policy and optional extra permissions. If there are no extra permissions, no file-system section, or an empty file-system section, it returns the base policy unchanged. Otherwise it merges the extra file-system permissions into the base policy and returns the result.
 
-**Call relations**: This function is called by sandbox-context builders and by `effective_permission_profile`. In the call flow it is the public filesystem-policy derivation step that hides the restricted-vs-unrestricted merge rules.
+**Call relations**: This is used when building sandbox contexts, calculating patch permissions, and producing an effective full permission profile. It hands off the actual merge work to `merge_file_system_policy_with_additional_permissions`.
 
 *Call graph*: calls 1 internal fn (merge_file_system_policy_with_additional_permissions); called by 5 (file_system_sandbox_context, effective_patch_permissions, file_system_sandbox_context_uses_active_attempt, file_system_sandboxed_write_allows_additional_write_root, effective_permission_profile); 1 external calls (clone).
 
@@ -547,11 +557,11 @@ fn merge_network_access(
 ) -> bool
 ```
 
-**Purpose**: Combines a base network-enabled flag with additional permissions to determine whether network access should be considered enabled. Additional permissions only widen access when they explicitly set `enabled` to `true`.
+**Purpose**: Answers whether network access should be considered enabled after adding extra permissions. Network access is enabled if it was already enabled or if the extra permissions explicitly enable it.
 
-**Data flow**: It takes a boolean `base_network_access` and an `AdditionalPermissionProfile`. It reads `additional_permissions.network.enabled`, defaults missing values to `false`, ORs that with the base flag, and returns the resulting boolean.
+**Data flow**: It receives the base network-access boolean and an extra permission profile. It checks whether the base is already true; if not, it looks for an explicit `enabled: true` in the extra network permissions. It returns the combined yes-or-no result.
 
-**Call relations**: This is a small helper used by `effective_network_sandbox_policy` to keep the network-enablement rule in one place.
+**Call relations**: This helper is used by `effective_network_sandbox_policy` to keep the network decision simple and consistent.
 
 
 ##### `effective_network_sandbox_policy`  (lines 478–491)
@@ -563,11 +573,11 @@ fn effective_network_sandbox_policy(
 ) -> NetworkSandboxPolicy
 ```
 
-**Purpose**: Derives the runtime network sandbox policy from a base policy plus optional additional permissions. Additional permissions can force `Enabled`; otherwise, if additional permissions are present but do not enable network, the result becomes `Restricted` rather than preserving the original policy.
+**Purpose**: Computes the network sandbox policy that should actually be used after considering optional extra permissions.
 
-**Data flow**: It takes a `NetworkSandboxPolicy` and an optional `AdditionalPermissionProfile`. If additional permissions exist and `merge_network_access(network_policy.is_enabled(), permissions)` is true, it returns `NetworkSandboxPolicy::Enabled`. If additional permissions exist but do not enable network, it returns `NetworkSandboxPolicy::Restricted`. If no additional permissions are supplied, it returns the original policy unchanged.
+**Data flow**: It receives the base network policy and optional extra permissions. If the combined result says network access is enabled, it returns an enabled network policy. If extra permissions were present but did not enable network access, it returns a restricted policy. If there were no extra permissions, it keeps the original policy.
 
-**Call relations**: This function is used alongside filesystem policy derivation in sandbox-context creation and `effective_permission_profile`. Its role is to convert the base-plus-additional network state into the concrete runtime enum used by the sandbox layer.
+**Call relations**: This is used when building sandbox contexts and when producing an effective full permission profile. It uses the same network-merge decision as `merge_network_access`.
 
 *Call graph*: called by 4 (file_system_sandbox_context, file_system_sandbox_context_uses_active_attempt, file_system_sandboxed_write_allows_additional_write_root, effective_permission_profile).
 
@@ -581,11 +591,11 @@ fn effective_permission_profile(
 ) -> PermissionProfile
 ```
 
-**Purpose**: Builds a full `PermissionProfile` reflecting the effective runtime filesystem and network policies after applying optional additional permissions. It preserves the original enforcement mode while replacing the runtime permission components.
+**Purpose**: Builds a complete effective permission profile from a named profile plus optional extra permissions. It keeps the profile’s enforcement style while changing the file-system and network rules as needed.
 
-**Data flow**: It takes a `PermissionProfile` and optional additional permissions. It extracts the current runtime filesystem and network policies with `to_runtime_permissions`, computes updated versions via `effective_file_system_sandbox_policy` and `effective_network_sandbox_policy`, reads the original enforcement mode with `enforcement`, and reconstructs a new `PermissionProfile` using `from_runtime_permissions_with_enforcement`.
+**Data flow**: It receives a `PermissionProfile` and optional extra permissions. It converts the profile into runtime file-system and network policies, applies extra file-system permissions, applies extra network permissions, and then converts the result back into a `PermissionProfile` while preserving the original enforcement setting. It returns the finished profile.
 
-**Call relations**: This is the top-level profile transformation used by callers that need a complete permission profile object rather than separate filesystem/network policies. It orchestrates the two effective-policy helpers and rewraps their results into the protocol-level profile type.
+**Call relations**: This is called when building a sandbox context for an attempt, when transforming profiles, and in permission-escalation tests. It coordinates `effective_file_system_sandbox_policy` and `effective_network_sandbox_policy` so callers get one updated profile instead of separate policies.
 
 *Call graph*: calls 5 internal fn (enforcement, from_runtime_permissions_with_enforcement, to_runtime_permissions, effective_file_system_sandbox_policy, effective_network_sandbox_policy); called by 3 (file_system_sandbox_context_for_attempt, preapproved_additional_permissions_escalate_intercepted_exec, transform).
 
@@ -600,24 +610,24 @@ fn should_require_platform_sandbox(
 ) -> bool
 ```
 
-**Purpose**: Decides whether an additional platform sandbox mechanism is still necessary given the effective filesystem and network policies. The decision is conservative when managed network requirements exist or when the current policy still leaves meaningful restrictions to enforce.
+**Purpose**: Decides whether the program should require the operating-system-level sandbox for a given file-system and network setup. This is the final safety gate for whether platform enforcement is needed.
 
-**Data flow**: It takes a `FileSystemSandboxPolicy`, a `NetworkSandboxPolicy`, and a `has_managed_network_requirements` flag. It immediately returns `true` if managed network requirements are present. Otherwise, if network is not enabled, it requires a platform sandbox unless the filesystem policy kind is `ExternalSandbox`. If network is enabled, it requires a platform sandbox only for `Restricted` filesystem policies that do not already have full disk write access; unrestricted and external-sandbox kinds return `false`.
+**Data flow**: It receives a file-system policy, a network policy, and a flag saying whether there are managed network requirements. If managed network requirements exist, it requires the platform sandbox. If network access is not enabled, it requires a sandbox unless the file-system policy is handled by an external sandbox. If network access is enabled, it requires a sandbox only for restricted file-system policies that do not already allow full disk writes. It returns true or false.
 
-**Call relations**: This function is consulted by higher-level sandbox selection and warning logic after effective policies have been computed. It does not transform permissions itself; instead it interprets the resulting policy combination to decide whether OS-level sandboxing must still be engaged.
+**Call relations**: This is used when tagging permission profiles, warning about system sandbox support, and selecting the initial sandbox setup. It turns the combined policy state into a simple decision about whether platform sandboxing must be active.
 
 *Call graph*: calls 2 internal fn (has_full_disk_write_access, is_enabled); called by 3 (permission_profile_sandbox_tag, should_warn_about_system_bwrap, select_initial); 1 external calls (matches!).
 
 
 ### `sandboxing/src/seatbelt.rs`
 
-`domain_logic` · `sandbox setup before spawning a macOS sandboxed child process`
+`domain_logic` · `command launch`
 
-This file is the macOS-specific policy compiler for sandboxed process execution. It starts from `FileSystemSandboxPolicy`, `NetworkSandboxPolicy`, optional `NetworkProxy` configuration, and a target command, then emits the full `sandbox-exec` argument vector: `-p <policy>`, zero or more `-DKEY=VALUE` parameter definitions, `--`, and the original command. The generated policy is assembled from embedded base/network/defaults SBPL fragments plus dynamically synthesized read, write, deny, and network clauses.
+macOS has a built-in sandbox system called Seatbelt. A Seatbelt policy is a small rule file that says things like “this process may read here,” “it may write there,” or “it may only connect to this local proxy.” This file is the translator between Codex's higher-level permissions and those low-level macOS rules.
 
-Filesystem policy generation is centered on `SeatbeltAccessRoot`, which models an allowed root together with excluded subpaths and protected metadata names. `build_seatbelt_access_policy` turns those into `(allow file-read*)` or `(allow file-write*)` forms using `subpath`, `literal`, `require-not`, and regex guards. A notable detail is that protected metadata names are denied by regex under writable roots when the higher-level policy would not permit writing those metadata paths. Unreadable glob patterns are separately converted into anchored Seatbelt regex deny rules for both reads and unlink-style writes, because Seatbelt cannot consume the original glob syntax directly.
+The main job is to build the argument list for `sandbox-exec`: first the generated policy text, then named path parameters, then the actual command to run. The file combines several pieces: fixed base policy snippets, file read/write allowances, explicit deny rules for unreadable glob patterns, and network rules. The network side is careful with proxies. If a managed proxy is configured, it tries to allow only loopback proxy ports, rather than opening the whole network. It can also allow selected Unix domain sockets, which are local socket files used for communication between programs on the same machine.
 
-Network policy generation is intentionally fail-closed around managed proxies. The code extracts loopback proxy ports from proxy environment variables, distinguishes between “proxy configured” and “proxy endpoints successfully inferred,” and only grants broad network access when the sandbox policy explicitly enables networking and no proxy enforcement is active. Unix domain socket access is modeled separately with either `AllowAll` or a normalized allowlist of absolute paths; restricted mode emits parameterized `subpath` rules so sockets created beneath approved directories remain usable. Path normalization consistently rejects relative paths and prefers canonicalized absolute paths when available, reducing accidental policy widening and duplicate entries.
+A key safety theme is “fail closed.” If proxy settings exist but cannot be turned into safe local endpoints, the generated policy does not silently grant wider network access. Paths are also normalized before being passed into Seatbelt, so the policy refers to stable absolute paths instead of ambiguous relative ones.
 
 #### Function details
 
@@ -627,11 +637,11 @@ Network policy generation is intentionally fail-closed around managed proxies. T
 fn is_loopback_host(host: &str) -> bool
 ```
 
-**Purpose**: Checks whether a hostname should be treated as loopback for proxy allowance purposes. It recognizes `localhost`, `127.0.0.1`, and `::1` only.
+**Purpose**: Checks whether a host name points back to the same machine. This matters because proxy access is only treated as safe and narrow when it goes through local addresses such as `localhost`, `127.0.0.1`, or `::1`.
 
-**Data flow**: Takes a `&str` host name, compares it against the accepted loopback spellings using ASCII-insensitive matching for `localhost`, and returns a `bool`. It reads no external state and writes nothing.
+**Data flow**: It receives a host string, compares it with the accepted loopback names and addresses, and returns true if it is local or false otherwise. It does not change any outside state.
 
-**Call relations**: This is a small predicate used during proxy environment parsing. `proxy_loopback_ports_from_env` invokes it after URL parsing to decide whether a proxy endpoint should contribute an allowed outbound localhost port.
+**Call relations**: When proxy settings are inspected, `proxy_loopback_ports_from_env` asks this helper whether each proxy URL points to the local machine. Only local proxy hosts are turned into Seatbelt network allowances.
 
 *Call graph*: called by 1 (proxy_loopback_ports_from_env).
 
@@ -642,11 +652,11 @@ fn is_loopback_host(host: &str) -> bool
 fn proxy_scheme_default_port(scheme: &str) -> u16
 ```
 
-**Purpose**: Supplies the implicit port number for proxy URLs that omit an explicit port. It maps HTTPS to 443, SOCKS variants to 1080, and everything else to 80.
+**Purpose**: Provides the usual port number for a proxy URL when the URL does not spell one out. For example, HTTPS commonly uses 443 and SOCKS commonly uses 1080.
 
-**Data flow**: Consumes a URL scheme string and returns a `u16` default port chosen by a `match`. It has no side effects or external dependencies.
+**Data flow**: It receives a URL scheme such as `https` or `socks5`, chooses the standard fallback port for that scheme, and returns the port number. Unknown schemes fall back to port 80.
 
-**Call relations**: This helper supports proxy URL interpretation inside `proxy_loopback_ports_from_env`, where parsed URLs without a port still need a concrete localhost port for Seatbelt rules.
+**Call relations**: It supports proxy URL parsing by filling in missing port numbers. That lets the surrounding proxy policy code still create a precise sandbox rule even when the environment variable uses a shortened proxy address.
 
 
 ##### `proxy_loopback_ports_from_env`  (lines 43–76)
@@ -655,11 +665,11 @@ fn proxy_scheme_default_port(scheme: &str) -> u16
 fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16>
 ```
 
-**Purpose**: Scans proxy-related environment variables and extracts the set of loopback proxy ports that should be reachable from inside the sandbox. It tolerates missing schemes, malformed URLs, empty values, and non-loopback hosts by skipping them.
+**Purpose**: Finds proxy ports in environment variables, but only for proxies that point to the local machine. This helps the sandbox allow traffic to a local proxy without allowing general internet access.
 
-**Data flow**: Reads a `HashMap<String, String>` environment, iterates over `PROXY_URL_ENV_KEYS`, fetches each value via `proxy_url_env_value`, trims it, prepends `http://` when no scheme is present, parses it as a `Url`, filters to loopback hosts via `is_loopback_host`, resolves an explicit or default port via `proxy_scheme_default_port`, deduplicates ports in a `BTreeSet`, and returns them as a sorted `Vec<u16>`. It does not mutate caller state.
+**Data flow**: It receives a map of environment variable names to values. It looks through the known proxy variables, cleans up each value, parses it as a URL, rejects anything invalid or non-local, chooses an explicit or default port, removes duplicates, and returns the sorted list of local proxy ports.
 
-**Call relations**: Called by `proxy_policy_inputs` when a `NetworkProxy` is present. Its output directly drives the per-port `(allow network-outbound (remote ip "localhost:PORT"))` rules emitted later by `dynamic_network_policy_for_network`.
+**Call relations**: `proxy_policy_inputs` uses this when it has a `NetworkProxy` configuration. The resulting ports become the specific loopback destinations allowed by `dynamic_network_policy_for_network`.
 
 *Call graph*: calls 1 internal fn (is_loopback_host); called by 1 (proxy_policy_inputs); 4 external calls (new, parse, proxy_url_env_value, format!).
 
@@ -670,11 +680,11 @@ fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16>
 fn default() -> Self
 ```
 
-**Purpose**: Defines the safe default unix-socket policy as restricted mode with an empty allowlist. This avoids silently granting unix socket access when no explicit configuration exists.
+**Purpose**: Creates the safest default Unix socket policy: no broad socket access and no allowed socket paths. A Unix domain socket is a local communication endpoint represented by a filesystem path.
 
-**Data flow**: Constructs and returns `UnixDomainSocketPolicy::Restricted { allowed: vec![] }`. It reads no state and performs no I/O.
+**Data flow**: It takes no input and returns a `Restricted` socket policy with an empty allowlist. Nothing outside the returned value is changed.
 
-**Call relations**: Used indirectly through `ProxyPolicyInputs` defaulting and in the no-network branch of `proxy_policy_inputs`, ensuring the rest of the policy builder can assume a concrete unix-socket mode.
+**Call relations**: This default is used when proxy policy inputs are built without special socket permissions. Later helpers expand this only if the network configuration or caller supplies socket paths.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -688,11 +698,11 @@ fn proxy_policy_inputs(
 ) -> ProxyPolicyInputs
 ```
 
-**Purpose**: Normalizes all proxy- and unix-socket-related inputs into a single `ProxyPolicyInputs` struct consumed by network policy generation. It merges explicit network proxy settings with extra unix socket allowances supplied by the caller.
+**Purpose**: Collects all network-proxy-related facts needed to write the Seatbelt network policy. It turns a higher-level proxy configuration into concrete details: local proxy ports, whether proxy variables exist, whether local binding is allowed, and which Unix sockets are allowed.
 
-**Data flow**: Accepts `Option<&NetworkProxy>` and a slice of `AbsolutePathBuf` extra socket paths. It first normalizes extra socket paths with `normalize_path_for_sandbox`. If a `NetworkProxy` exists, it materializes proxy env vars into a temporary `HashMap` via `apply_to_env`, computes loopback ports with `proxy_loopback_ports_from_env`, detects whether any proxy env vars are configured with `has_proxy_url_env_vars`, reads `allow_local_binding`, and builds either `UnixDomainSocketPolicy::AllowAll` or a restricted allowlist from `network.allow_unix_sockets()` plus extras, warning on entries that cannot be normalized. Without a proxy, it returns defaults except for a restricted unix-socket allowlist containing only the normalized extras.
+**Data flow**: It receives an optional `NetworkProxy` and extra Unix socket paths. It normalizes socket paths, asks the proxy to write its environment settings into a temporary map, extracts loopback proxy ports, checks whether proxy variables are present, and builds a socket policy. It returns a `ProxyPolicyInputs` bundle used by later policy builders.
 
-**Call relations**: This is the bridge between external network configuration and Seatbelt-specific policy synthesis. `create_seatbelt_command_args` calls it once, then passes the resulting struct to both `dynamic_network_policy_for_network` and `unix_socket_dir_params`.
+**Call relations**: `create_seatbelt_command_args` calls this before building network rules. The returned bundle is then passed into `dynamic_network_policy_for_network` for text policy generation and into `unix_socket_dir_params` for command-line path definitions.
 
 *Call graph*: calls 1 internal fn (proxy_loopback_ports_from_env); called by 1 (create_seatbelt_command_args); 4 external calls (default, new, has_proxy_url_env_vars, iter).
 
@@ -703,11 +713,11 @@ fn proxy_policy_inputs(
 fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Validates and normalizes a filesystem path before embedding it into Seatbelt parameters. It rejects relative paths outright and prefers canonicalized absolute paths when canonicalization succeeds.
+**Purpose**: Turns an absolute path into the cleanest absolute form available for use in a sandbox rule. It refuses relative paths because accepting them could make the policy depend on the process's current directory in surprising ways.
 
-**Data flow**: Takes a `&Path`, returns `None` if `is_absolute` is false, otherwise constructs an `AbsolutePathBuf` with `from_absolute_path`. It then attempts `canonicalize` and converts the canonical path back into `AbsolutePathBuf`; if canonicalization fails, it falls back to the original absolute path. The result is `Option<AbsolutePathBuf>` with no side effects.
+**Data flow**: It receives a filesystem path. If the path is not absolute, it returns nothing. If it is absolute, it wraps it as an absolute path and tries to canonicalize it, which means resolving links and `..` where the filesystem allows. It returns the canonical path when possible, otherwise the original absolute path.
 
-**Call relations**: Used wherever path-based policy inputs are accepted from higher layers: `proxy_policy_inputs` for unix sockets, `build_seatbelt_access_policy` for allowed and excluded roots, and `canonicalize_glob_static_prefix_for_sandbox` for unreadable glob normalization.
+**Call relations**: Path-building functions call this before inserting paths into Seatbelt parameters or glob-derived rules. It is an important safety step for `build_seatbelt_access_policy` and `canonicalize_glob_static_prefix_for_sandbox`.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 2 (build_seatbelt_access_policy, canonicalize_glob_static_prefix_for_sandbox); 1 external calls (is_absolute).
 
@@ -718,11 +728,11 @@ fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf>
 fn unix_socket_path_params(proxy: &ProxyPolicyInputs) -> Vec<UnixSocketPathParam>
 ```
 
-**Purpose**: Converts the restricted unix-socket allowlist into a stable, deduplicated sequence of indexed parameter records. Allow-all mode intentionally produces no path parameters because the policy does not need path qualifiers.
+**Purpose**: Prepares a clean, numbered list of Unix socket paths that the sandbox may use. Numbering is needed because Seatbelt policies refer to external path values through named parameters.
 
-**Data flow**: Reads `ProxyPolicyInputs`. If `unix_domain_socket_policy` is `AllowAll`, it returns an empty `Vec`. Otherwise it inserts each allowed `AbsolutePathBuf` into a `BTreeMap<String, AbsolutePathBuf>` keyed by lossy string form to deduplicate and sort deterministically, then enumerates the values into `UnixSocketPathParam { index, path }` records.
+**Data flow**: It receives the proxy policy input bundle. If socket access is unrestricted, it returns an empty list because no per-path parameters are needed. If access is restricted, it removes duplicate allowed paths, sorts them by their string form, assigns each one an index, and returns those indexed path records.
 
-**Call relations**: This helper feeds both parameter definition generation and SBPL rule generation. `unix_socket_dir_params` uses it to build `-D` arguments, while `unix_socket_policy` uses the same indexed paths to reference those parameters in `subpath` clauses.
+**Call relations**: `unix_socket_policy` uses this list to write socket allow rules, and `unix_socket_dir_params` uses the same list to create the matching `-D` command-line definitions. These two uses must agree on the generated parameter names.
 
 *Call graph*: called by 2 (unix_socket_dir_params, unix_socket_policy); 2 external calls (new, vec!).
 
@@ -733,11 +743,11 @@ fn unix_socket_path_params(proxy: &ProxyPolicyInputs) -> Vec<UnixSocketPathParam
 fn unix_socket_path_param_key(index: usize) -> String
 ```
 
-**Purpose**: Formats the Seatbelt parameter name used for a unix-socket allowlist entry. The names are `UNIX_SOCKET_PATH_<index>`.
+**Purpose**: Builds the parameter name for one allowed Unix socket path. This keeps the policy text and the command-line definitions using the same naming pattern.
 
-**Data flow**: Consumes a `usize` index and returns a `String` built with `format!`. It has no side effects.
+**Data flow**: It receives a numeric index and returns a string such as `UNIX_SOCKET_PATH_0`. It does not read or change anything else.
 
-**Call relations**: Called from both `unix_socket_policy` and the surrounding parameter-generation path so the SBPL references and `-D` definitions stay in sync.
+**Call relations**: `unix_socket_policy` calls this while writing Seatbelt rules for each socket path. `unix_socket_dir_params` uses the same naming scheme through the path parameter records so the policy can find the actual paths at runtime.
 
 *Call graph*: called by 1 (unix_socket_policy); 1 external calls (format!).
 
@@ -748,11 +758,11 @@ fn unix_socket_path_param_key(index: usize) -> String
 fn unix_socket_dir_params(proxy: &ProxyPolicyInputs) -> Vec<(String, PathBuf)>
 ```
 
-**Purpose**: Builds the concrete `-DKEY=VALUE` parameter bindings for restricted unix-socket paths. Each allowed path becomes one named parameter pointing at its directory path.
+**Purpose**: Creates the command-line parameter definitions for allowed Unix socket paths. These definitions are how the generated Seatbelt policy receives real filesystem paths without hard-coding them directly into the policy text.
 
-**Data flow**: Reads `ProxyPolicyInputs`, obtains indexed path records from `unix_socket_path_params`, maps each to `(String, PathBuf)` using `unix_socket_path_param_key` and `into_path_buf`, and returns the resulting vector. It does not mutate external state.
+**Data flow**: It receives proxy policy inputs, asks `unix_socket_path_params` for the numbered allowed paths, converts each path into a normal path buffer, and returns key/path pairs. The caller later formats those pairs as `-DKEY=value` arguments.
 
-**Call relations**: Invoked by `create_seatbelt_command_args` when assembling all Seatbelt parameter definitions. Its output must correspond exactly to the parameter names referenced by `unix_socket_policy`.
+**Call relations**: `create_seatbelt_command_args` calls this after building the main policy sections. Its output is appended beside file read/write path parameters so `sandbox-exec` can substitute the socket paths into the policy.
 
 *Call graph*: calls 1 internal fn (unix_socket_path_params); called by 1 (create_seatbelt_command_args).
 
@@ -763,11 +773,11 @@ fn unix_socket_dir_params(proxy: &ProxyPolicyInputs) -> Vec<(String, PathBuf)>
 fn unix_socket_policy(proxy: &ProxyPolicyInputs) -> String
 ```
 
-**Purpose**: Generates the SBPL lines that permit unix domain socket use for local IPC. It emits either broad AF_UNIX/network rules for allow-all mode or parameterized `subpath` rules for each approved socket directory.
+**Purpose**: Writes the Seatbelt rules that allow Unix domain socket communication. It either allows all Unix sockets when explicitly requested, or allows only sockets under approved paths.
 
-**Data flow**: Consumes `&ProxyPolicyInputs`, derives indexed socket params with `unix_socket_path_params`, checks whether any unix-socket access exists, and returns either an empty `String` or a newline-terminated policy block. In allow-all mode it emits generic `system-socket`, `network-bind`, and `network-outbound` unix-socket rules; in restricted mode it emits one bind and one outbound rule per parameter key from `unix_socket_path_param_key`.
+**Data flow**: It receives proxy policy inputs. If no Unix socket access is allowed, it returns an empty string. If all sockets are allowed, it returns broad socket rules. Otherwise, it builds one pair of bind and outbound rules for each allowed socket path parameter and returns the policy text, ending with newlines so it can be appended safely.
 
-**Call relations**: This function is called only from `dynamic_network_policy_for_network`, which splices its output into the broader network policy when unix-socket access should coexist with disabled or restricted IP networking.
+**Call relations**: `dynamic_network_policy_for_network` includes this text when network policy needs local socket access. It relies on `unix_socket_path_params` and `unix_socket_path_param_key` so the policy text lines up with the parameter definitions created elsewhere.
 
 *Call graph*: calls 2 internal fn (unix_socket_path_param_key, unix_socket_path_params); called by 1 (dynamic_network_policy_for_network); 3 external calls (new, format!, matches!).
 
@@ -782,11 +792,11 @@ fn dynamic_network_policy(
 ) -> String
 ```
 
-**Purpose**: Adapts a full `SandboxPolicy` into the narrower network-policy builder used by this file. It exists mainly as a compatibility wrapper around `dynamic_network_policy_for_network`.
+**Purpose**: Adapts the older, combined sandbox policy type into the newer network-policy-specific builder. It exists as a compatibility wrapper so callers with a full `SandboxPolicy` can still ask for network Seatbelt text.
 
-**Data flow**: Accepts `&SandboxPolicy`, `bool` enforcement flag, and `&ProxyPolicyInputs`; converts the sandbox policy into `NetworkSandboxPolicy` with `from`, forwards all inputs to `dynamic_network_policy_for_network`, and returns the resulting policy string.
+**Data flow**: It receives a full sandbox policy, a flag saying whether managed networking must be enforced, and proxy policy inputs. It extracts the network portion from the full policy and passes everything to `dynamic_network_policy_for_network`, then returns that generated policy string.
 
-**Call relations**: This wrapper is retained for dead-code-tolerant/test use. The main production path calls `dynamic_network_policy_for_network` directly from `create_seatbelt_command_args` after it already has a `NetworkSandboxPolicy`.
+**Call relations**: This function is a thin bridge into `dynamic_network_policy_for_network`. It is mainly useful for tests or legacy paths that still start from the broader `SandboxPolicy` type.
 
 *Call graph*: calls 2 internal fn (from, dynamic_network_policy_for_network).
 
@@ -801,11 +811,11 @@ fn dynamic_network_policy_for_network(
 ) -> String
 ```
 
-**Purpose**: Synthesizes the complete dynamic network section of the Seatbelt policy from network enablement, managed-network enforcement, proxy-derived localhost ports, local-binding permission, and unix-socket allowances. Its key design choice is to fail closed when proxy enforcement is expected but no usable proxy endpoints can be inferred.
+**Purpose**: Creates the Seatbelt network rules for the sandboxed command. It decides between full network access, proxy-only local access, Unix-socket access, or no network access.
 
-**Data flow**: Takes a `NetworkSandboxPolicy`, `bool` `enforce_managed_network`, and `&ProxyPolicyInputs`. It first determines whether any unix-socket access exists, then decides whether to use a restricted policy based on proxy ports, proxy config presence, managed-network enforcement, or the special case of disabled IP networking plus unix-socket access. In restricted mode it conditionally appends localhost bind/inbound/outbound rules, optional DNS egress on port 53 when local binding and proxy ports coexist, one localhost outbound rule per proxy port, and any unix-socket rules from `unix_socket_policy`, then appends the embedded network SBPL fragment. Outside restricted mode it returns an empty string for fail-closed proxy/enforcement cases, broad inbound/outbound rules plus unix-socket rules when networking is enabled, or an empty string when networking is disabled.
+**Data flow**: It receives the requested network policy, a managed-network enforcement flag, and proxy details. It checks whether proxy ports, proxy configuration, enforced managed networking, or Unix socket needs require a restricted policy. It then builds allow rules for local binding, DNS when needed, loopback proxy ports, and Unix sockets, or returns broader network rules when full networking is enabled and no proxy restriction applies. If safe proxy endpoints are missing while proxy enforcement is expected, it returns an empty policy rather than opening the network.
 
-**Call relations**: This is the central network-policy decision point. `create_seatbelt_command_args` calls it during final policy assembly, and `dynamic_network_policy` delegates to it for legacy/test callers.
+**Call relations**: `create_seatbelt_command_args` calls this while assembling the complete Seatbelt policy. The compatibility wrapper `dynamic_network_policy` also delegates to it. It calls `unix_socket_policy` when local socket communication must be included.
 
 *Call graph*: calls 2 internal fn (is_enabled, unix_socket_policy); called by 2 (create_seatbelt_command_args, dynamic_network_policy); 3 external calls (from, new, format!).
 
@@ -816,11 +826,11 @@ fn dynamic_network_policy_for_network(
 fn root_absolute_path() -> AbsolutePathBuf
 ```
 
-**Purpose**: Constructs the absolute path object representing `/`. It panics if that invariant somehow fails.
+**Purpose**: Creates an absolute path object for `/`, the filesystem root. This is used when the policy needs to describe access starting at the whole disk, usually with exclusions carved out.
 
-**Data flow**: Calls `AbsolutePathBuf::from_absolute_path` on `Path::new("/")`; on success returns the `AbsolutePathBuf`, on error panics with a descriptive message. It has no external side effects beyond the panic path.
+**Data flow**: It takes no input, converts `/` into the project's absolute path type, and returns it. If that ever failed, it panics because `/` must be absolute on macOS and Unix-like systems.
 
-**Call relations**: Used by `create_seatbelt_command_args` when full-disk read or write access must be represented as a single root with optional excluded unreadable subpaths.
+**Call relations**: `create_seatbelt_command_args` uses this when full-disk read or write access is requested but some unreadable roots still need to be excluded. The root path is then passed into `build_seatbelt_access_policy`.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 2 external calls (new, panic!).
 
@@ -835,11 +845,11 @@ fn build_seatbelt_access_policy(
 ) -> (String, Vec<(String, PathBuf)>)
 ```
 
-**Purpose**: Builds parameterized Seatbelt allow rules for filesystem reads or writes over one or more roots, with optional excluded subpaths and protected metadata-name exclusions. It is the core translator from structured filesystem access roots into SBPL expressions and matching `-D` parameter bindings.
+**Purpose**: Builds Seatbelt allow rules for file reads or writes over one or more approved roots. It can also carve out subpaths and protected metadata names so a broad root does not accidentally expose sensitive project control files.
 
-**Data flow**: Accepts an action string like `file-read*` or `file-write*`, a parameter-name prefix, and a `Vec<SeatbeltAccessRoot>`. For each root it normalizes the root path, allocates a root parameter name, and records `(param, PathBuf)` in the returned params vector. If there are no exclusions or protected metadata names, it emits a simple `(subpath (param ...))` component. Otherwise it builds a `(require-all ...)` expression containing the root subpath plus `require-not` clauses for each excluded path's exact literal and subtree, and regex-based `require-not` clauses for each protected metadata name using `seatbelt_protected_metadata_name_regex`. It returns either an empty policy with no params or a complete `(allow ACTION ... )` string plus all parameter bindings.
+**Data flow**: It receives an action name such as `file-read*` or `file-write*`, a parameter name prefix, and a list of access roots. For each root, it normalizes the path, creates a parameter for it, adds exclusions for protected subpaths, and adds regex-based exclusions for protected metadata names. It returns two things: the policy text and the path parameters that must be passed to `sandbox-exec`.
 
-**Call relations**: This function is called repeatedly by `create_seatbelt_command_args` to generate read and write policy sections for full-disk and allowlisted modes. It relies on `normalize_path_for_sandbox` and `seatbelt_protected_metadata_name_regex` to keep path handling and metadata exclusions precise.
+**Call relations**: `create_seatbelt_command_args` calls this separately for read and write permissions. It uses `normalize_path_for_sandbox` for stable paths and `seatbelt_protected_metadata_name_regex` when metadata names must be blocked under an otherwise writable root.
 
 *Call graph*: calls 2 internal fn (normalize_path_for_sandbox, seatbelt_protected_metadata_name_regex); called by 1 (create_seatbelt_command_args); 4 external calls (new, new, format!, vec!).
 
@@ -850,11 +860,11 @@ fn build_seatbelt_access_policy(
 fn seatbelt_protected_metadata_name_regex(root: &AbsolutePathBuf, name: &str) -> String
 ```
 
-**Purpose**: Creates an anchored regex that matches a protected metadata path name directly under a given root and anything beneath it. It handles the root directory `/` as a special case so the resulting pattern is syntactically correct.
+**Purpose**: Creates a regular expression that matches a protected metadata directory or file name directly under a given root, plus everything inside it. A regular expression is a text pattern used here by Seatbelt to recognize paths.
 
-**Data flow**: Consumes an `&AbsolutePathBuf` root and `&str` metadata name, trims trailing slashes from the root except when it is exactly `/`, escapes both pieces with `regex_lite::escape`, and returns a regex string of the form `^/name(/.*)?$` or `^<root>/name(/.*)?$`.
+**Data flow**: It receives an absolute root path and a metadata name. It removes trailing slashes from the root except for `/`, escapes both pieces so special characters are treated literally, and returns a pattern that matches exactly `root/name` and its descendants.
 
-**Call relations**: Used only by `build_seatbelt_access_policy` when writable roots need metadata-name exclusions expressed as regex-based `require-not` clauses.
+**Call relations**: `build_seatbelt_access_policy` calls this when it needs to prevent writes to protected metadata names while still allowing writes elsewhere under the same root.
 
 *Call graph*: calls 1 internal fn (to_string_lossy); called by 1 (build_seatbelt_access_policy); 5 external calls (format!, escape, ends_with, len, pop).
 
@@ -869,11 +879,11 @@ fn protected_metadata_names_for_writable_root(
 ) -> Vec<String>
 ```
 
-**Purpose**: Determines which metadata names under a writable root must still be protected from writes. It merges explicit per-root protected names with globally protected metadata names that the higher-level filesystem policy would not allow writing.
+**Purpose**: Decides which metadata names should remain protected inside a writable root. This prevents a write permission from unintentionally allowing changes to important hidden project or system metadata.
 
-**Data flow**: Takes a `&FileSystemSandboxPolicy`, `&WritableRoot`, and current working directory `&Path`. It clones `writable_root.protected_metadata_names`, then iterates `PROTECTED_METADATA_PATH_NAMES`; for each missing name it joins that name onto the writable root path and asks `can_write_path_with_cwd` whether the policy permits writing it. Names that remain unwritable are appended, and the final `Vec<String>` is returned.
+**Data flow**: It receives the filesystem sandbox policy, one writable root, and the policy's current working directory. It starts with the names already protected on that writable root, then checks the global protected metadata names. If the broader filesystem policy would not allow writing a particular metadata path, that name is added to the protected list. It returns the completed list of names.
 
-**Call relations**: This helper is used during writable-root translation inside `create_seatbelt_command_args`, ensuring write-allowed roots do not accidentally permit writes to metadata paths that the higher-level policy still intends to protect.
+**Call relations**: This helper is used while writable roots are being prepared for `build_seatbelt_access_policy`. Its output becomes regex exclusions inside the generated write policy.
 
 *Call graph*: calls 1 internal fn (can_write_path_with_cwd).
 
@@ -887,11 +897,11 @@ fn build_seatbelt_unreadable_glob_policy(
 ) -> String
 ```
 
-**Purpose**: Converts unreadable glob patterns from the filesystem sandbox policy into explicit Seatbelt deny rules. It denies both reads and unlink-style writes so forbidden paths cannot be probed or removed despite broader allow rules.
+**Purpose**: Turns unreadable glob patterns into Seatbelt deny rules. A glob is a wildcard path pattern, like `*.pem` or `secret/**`, but Seatbelt needs regular expressions instead.
 
-**Data flow**: Reads unreadable glob strings from `file_system_sandbox_policy.get_unreadable_globs_with_cwd(cwd)`. If none exist, it returns an empty string. Otherwise, for each pattern it computes one regex from the original pattern via `seatbelt_regex_for_unreadable_glob` and optionally a second regex from a canonicalized static-prefix variant via `canonicalize_glob_static_prefix_for_sandbox`; duplicates are removed with a `BTreeSet`. Each regex is escaped for embedded quotes and expanded into `(deny file-read* ...)` and `(deny file-write-unlink ...)` lines, which are joined with newlines and returned.
+**Data flow**: It receives the filesystem sandbox policy and current working directory. It asks the policy for unreadable glob patterns, converts each pattern into one or more regular expressions, also tries a normalized version when the non-wildcard prefix can be canonicalized, and writes deny rules for reading and unlink-style deletion. It returns the combined deny policy text, or an empty string if there are no unreadable globs.
 
-**Call relations**: Called by `create_seatbelt_command_args` after allow rules are built. It complements the allowlist-based read/write policy by re-imposing explicit denials for glob-based unreadable paths that Seatbelt cannot represent natively.
+**Call relations**: `create_seatbelt_command_args` includes this after the main read and write allow rules. It calls `seatbelt_regex_for_unreadable_glob` for translation and `canonicalize_glob_static_prefix_for_sandbox` to catch paths that resolve differently through symlinks or cleaned prefixes.
 
 *Call graph*: calls 3 internal fn (get_unreadable_globs_with_cwd, canonicalize_glob_static_prefix_for_sandbox, seatbelt_regex_for_unreadable_glob); called by 1 (create_seatbelt_command_args); 4 external calls (new, new, new, format!).
 
@@ -902,11 +912,11 @@ fn build_seatbelt_unreadable_glob_policy(
 fn canonicalize_glob_static_prefix_for_sandbox(pattern: &str) -> Option<String>
 ```
 
-**Purpose**: Attempts to normalize the non-glob prefix of a glob pattern so equivalent paths resolve consistently in Seatbelt regex generation. This improves matching when the original pattern contains symlinked or non-canonical absolute prefixes.
+**Purpose**: Normalizes the non-wildcard beginning of a glob pattern, when possible. This helps a deny rule still work when the written path and the filesystem's canonical path differ.
 
-**Data flow**: Accepts a glob pattern `&str`. It finds the first glob metacharacter among `*`, `?`, `[`, or `]`. If none exist, it normalizes the whole path with `normalize_path_for_sandbox` and returns its string form. Otherwise it isolates the static prefix up to the containing directory boundary, normalizes that prefix, appends the untouched suffix, and returns `Some(normalized_pattern)` only when the normalized result differs from the original; if no usable absolute prefix exists, it returns `None`.
+**Data flow**: It receives a glob pattern string. If there are no wildcard characters, it normalizes the whole path. If there are wildcards, it finds the path portion before the first wildcard, normalizes the directory part, and then reattaches the wildcard suffix. It returns the changed pattern when normalization succeeds and actually changes it, otherwise nothing.
 
-**Call relations**: Used only by `build_seatbelt_unreadable_glob_policy` as a second-chance normalization step before converting unreadable globs into regexes.
+**Call relations**: `build_seatbelt_unreadable_glob_policy` calls this for each unreadable glob. When it returns a normalized version, that version is also converted into a Seatbelt regex so the deny policy covers both forms.
 
 *Call graph*: calls 1 internal fn (normalize_path_for_sandbox); called by 1 (build_seatbelt_unreadable_glob_policy); 2 external calls (new, format!).
 
@@ -917,11 +927,11 @@ fn canonicalize_glob_static_prefix_for_sandbox(pattern: &str) -> Option<String>
 fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String>
 ```
 
-**Purpose**: Translates the supported unreadable-glob syntax into an anchored regex suitable for Seatbelt deny rules. It preserves path-component semantics for `*` and `?`, supports `**/` for recursive directory matching, and treats non-glob patterns as exact path plus subtree matches.
+**Purpose**: Translates a supported glob pattern into a regular expression that Seatbelt can use. This is the bridge between the project's user-friendly wildcard syntax and Seatbelt's pattern language.
 
-**Data flow**: Consumes a pattern string and returns `None` for empty input. Otherwise it walks the pattern character-by-character using a `VecDeque<char>`, building a regex string starting with `^`. `*` becomes `[^/]*` unless doubled, where `**/` becomes `(.*/)?` and bare `**` becomes `.*`; `?` becomes `[^/]`; closed character classes are copied with minimal escaping and `!` translated to `^`; unmatched `[` is treated literally by emitting `\[` and pushing consumed chars back; stray `]` becomes `\]`; all other characters are escaped with `regex_lite::escape`. If no glob metacharacters were seen, it appends `(/.*)?` so the exact path and descendants are denied. It then appends `$` and returns the regex.
+**Data flow**: It receives a pattern string. Empty patterns produce no result. For non-empty patterns, it walks character by character, converting `*`, `**/`, `?`, and character classes into regex equivalents while escaping ordinary characters. If the pattern has no wildcards, it treats it as an exact path plus everything below it. It returns the finished anchored regex.
 
-**Call relations**: This translator is called by `build_seatbelt_unreadable_glob_policy` for both original and canonicalized patterns. Its output directly becomes the regex payload in generated Seatbelt deny clauses.
+**Call relations**: `build_seatbelt_unreadable_glob_policy` calls this for original and normalized unreadable patterns. The returned regexes are inserted into Seatbelt deny rules for reads and destructive unlink-style writes.
 
 *Call graph*: called by 1 (build_seatbelt_unreadable_glob_policy); 3 external calls (from, new, escape).
 
@@ -937,11 +947,11 @@ fn create_seatbelt_command_args_for_legacy_policy(
     network: Option<&
 ```
 
-**Purpose**: Provides a compatibility entry point for callers that still hold the older unified `SandboxPolicy` representation. It derives the newer filesystem and network policy forms and forwards them to the main argument builder.
+**Purpose**: Provides a compatibility path for older callers that still pass a combined sandbox policy. It converts that legacy policy into the newer separate filesystem and network policies, then uses the main command-argument builder.
 
-**Data flow**: Accepts the command vector, `&SandboxPolicy`, cwd, managed-network flag, and optional `&NetworkProxy`. It constructs a `FileSystemSandboxPolicy` with `from_legacy_sandbox_policy_for_cwd`, derives `NetworkSandboxPolicy` with `from`, packages all values into `CreateSeatbeltCommandArgsParams` with no extra unix sockets, and returns the `Vec<String>` from `create_seatbelt_command_args`.
+**Data flow**: It receives the command to run, the older sandbox policy, the policy working directory, the managed-network flag, and an optional network proxy. It derives a filesystem policy for that directory, extracts the network policy, fills in an empty extra-socket list, calls `create_seatbelt_command_args`, and returns the final argument vector.
 
-**Call relations**: This wrapper is called by legacy code paths and delegates all real work to `create_seatbelt_command_args`, preserving one implementation of Seatbelt argument synthesis.
+**Call relations**: This wrapper hands all real work to `create_seatbelt_command_args`. It keeps older code paths working without duplicating the Seatbelt-building logic.
 
 *Call graph*: calls 3 internal fn (from_legacy_sandbox_policy_for_cwd, from, create_seatbelt_command_args).
 
@@ -952,11 +962,11 @@ fn create_seatbelt_command_args_for_legacy_policy(
 fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -> Vec<String>
 ```
 
-**Purpose**: Assembles the complete `sandbox-exec` invocation arguments for a command, including the full SBPL policy text and all parameter definitions. It is the file's main public entry point and combines filesystem, unreadable-glob, network, proxy, and unix-socket policy generation into one deterministic output vector.
+**Purpose**: Builds the full list of arguments used to run a command under macOS `sandbox-exec`. This is the central function that combines file, network, proxy, socket, and platform-default rules into one Seatbelt policy.
 
-**Data flow**: Consumes `CreateSeatbeltCommandArgsParams`, destructuring the command, filesystem policy, network policy, cwd, managed-network flag, optional proxy, and extra unix sockets. It queries unreadable roots, then builds write policy: either broad full-disk write, full-root-with-exclusions, or per-writable-root rules using `build_seatbelt_access_policy` and `protected_metadata_names_for_writable_root`. It similarly builds read policy from full-disk read or readable roots, carrying unreadable-root exclusions where needed. It computes `ProxyPolicyInputs` via `proxy_policy_inputs`, derives the network section with `dynamic_network_policy_for_network`, optionally adds platform-default restrictions, and generates unreadable-glob deny rules with `build_seatbelt_unreadable_glob_policy`. All policy sections are concatenated with embedded base/default SBPL fragments into one string. It then concatenates read, write, and unix-socket parameter bindings, formats them as `-DKEY=VALUE`, prefixes `-p <policy>`, appends `--`, then appends the original command, returning the final `Vec<String>`.
+**Data flow**: It receives the command, filesystem policy, network policy, policy working directory, managed-network flag, optional proxy, and extra allowed Unix sockets. It builds write rules, read rules, deny rules for unreadable globs, proxy inputs, dynamic network rules, and optional platform defaults. It joins those policy sections into one policy string, gathers all path parameters for files and sockets, formats them as `-D` definitions, appends `--`, then appends the original command. It returns the complete argument list for `sandbox-exec`.
 
-**Call relations**: This function is invoked by the sandbox runner and by `create_seatbelt_command_args_for_legacy_policy`. It orchestrates nearly every helper in the file: filesystem access builders, unreadable-glob translation, proxy normalization, network policy synthesis, and unix-socket parameter generation.
+**Call relations**: This function is called when the system is about to run a command under the sandbox, and the legacy wrapper delegates to it. It coordinates the helper functions in this file: access-policy builders for files, unreadable-glob deny generation, proxy input collection, network policy generation, and Unix socket parameter creation.
 
 *Call graph*: calls 5 internal fn (build_seatbelt_access_policy, build_seatbelt_unreadable_glob_policy, dynamic_network_policy_for_network, proxy_policy_inputs, unix_socket_dir_params); called by 2 (run_command_under_sandbox, create_seatbelt_command_args_for_legacy_policy); 4 external calls (new, new, format!, vec!).
 
@@ -966,13 +976,13 @@ These helpers provide shell-specific parsing and normalization primitives that h
 
 ### `shell-command/src/bash.rs`
 
-`domain_logic` · `command classification and approval checks`
+`domain_logic` · `request handling and command safety checks`
 
-This file is the shell-side parser used by command safety logic. It uses `tree_sitter_bash` to parse script text into a syntax tree, then walks that tree with explicit allow-lists rather than trying to interpret arbitrary shell. The central rule is conservative: only scripts composed of plain commands joined by `&&`, `||`, `;`, or `|` are accepted, and every named node and punctuation token encountered must be on an allow-list. Parentheses, redirections, substitutions, assignments, control flow, and other shell constructs are rejected by structure, not by string matching.
+Shell commands are tricky because a short string can hide a lot of behavior: redirects can write files, substitutions can run extra commands, variables can change meanings, and parentheses can create subshells. This file acts like a cautious translator. It uses tree-sitter, a parser library that turns source text into a tree of syntax pieces, to inspect Bash-like scripts before accepting them.
 
-Accepted command nodes are converted into argv-like `Vec<String>` values by `parse_plain_command_from_node`, which supports bare words, numbers, single-quoted strings, double-quoted strings containing only literal `string_content`, and concatenations such as `-g"*.py"`. A separate path, `parse_shell_lc_single_command_prefix`, handles heredoc-style scripts for exec-policy prefix matching: it requires a parse without errors, presence of a heredoc redirect, absence of ordinary file redirects, exactly one command node, and then extracts only literal command words while ignoring heredoc attachment nodes.
+The safe path is narrow on purpose. A script is accepted only when it is made of plain commands joined by simple operators such as `&&`, `||`, `;`, or `|`. Each command must be made from literal words, numbers, or simple quoted strings. Anything more powerful, such as `$HOME`, `$(...)`, redirection, assignment prefixes, control flow, or unsupported punctuation, is rejected by returning `None`.
 
-The file also contains wrapper detection in `extract_bash_command`, normalizing only shell invocations whose executable path resolves to Bash/Zsh/Sh via `detect_shell_type`. Extensive tests document accepted quoting, concatenation, pipelines, and many rejected edge cases such as substitutions, malformed operator placement, and heredoc misuse.
+The file also recognizes commands shaped like `bash -lc "..."`, `zsh -lc "..."`, or `sh -c "..."`, extracts the embedded script, and parses it. There is a special path for here-doc scripts, such as `python3 <<'PY' ... PY`, where the code only needs the executable prefix, not the document contents. The tests document the safety boundary: many normal-looking commands are accepted, but anything that could hide extra shell behavior is deliberately refused.
 
 #### Function details
 
@@ -982,11 +992,11 @@ The file also contains wrapper detection in `extract_bash_command`, normalizing 
 fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree>
 ```
 
-**Purpose**: Parses raw shell source text with the Bash tree-sitter grammar and returns the syntax tree if parsing succeeds. It does not itself enforce any safety constraints beyond parser success.
+**Purpose**: Parses Bash-like source text into a syntax tree using the Bash grammar. Other functions use this tree so they can inspect the structure of the command instead of guessing from raw text.
 
-**Data flow**: It takes a shell script `&str`, constructs a `Parser`, loads the Bash language, parses the source with no previous tree, and returns `Option<Tree>` from tree-sitter.
+**Data flow**: It receives a shell script string. It creates a tree-sitter parser, loads the Bash grammar, and asks the parser to read the script. It returns a parsed tree when parsing succeeds, or `None` when the parser cannot produce one.
 
-**Call relations**: It is the first stage for both `parse_shell_script_into_commands` and `parse_shell_lc_single_command_prefix`, and is also reused by other shell-parsing entry points elsewhere in the crate.
+**Call relations**: This is the first parsing step for `parse_shell_script_into_commands` and `parse_shell_lc_single_command_prefix`. A higher-level parser named `parse_shell_script` also calls it when it needs the raw syntax tree.
 
 *Call graph*: called by 3 (parse_shell_lc_single_command_prefix, parse_shell_script_into_commands, parse_shell_script); 1 external calls (new).
 
@@ -997,11 +1007,11 @@ fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree>
 fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Validates that a parsed shell tree contains only a restricted sequence of plain commands joined by safe operators, then extracts each command’s words in source order. Any disallowed syntax causes rejection.
+**Purpose**: Checks whether a parsed shell script is only a safe sequence of plain commands, then extracts each command as a list of words. It is the main safety filter for ordinary shell command strings.
 
-**Data flow**: It takes a parsed `Tree` and original source `&str`, rejects immediately if the root has parse errors, traverses the tree with a stack, checks every named node kind against `ALLOWED_KINDS`, checks punctuation/operator tokens against `ALLOWED_PUNCT_TOKENS`, collects `command` nodes, sorts them by `start_byte`, converts each with `parse_plain_command_from_node`, and returns `Some(Vec<Vec<String>>)` or `None`.
+**Data flow**: It receives a syntax tree and the original script text. It walks every node in the tree, rejecting parse errors and any syntax kind or punctuation that is not on a small allow-list. It then extracts each command node into words. The result is a list of command argument lists, or `None` if anything unsafe or unsupported appears.
 
-**Call relations**: It is the core validator/extractor called by `parse_shell_script_into_commands`. Its strict traversal is what prevents later safety logic from trusting scripts with hidden shell features.
+**Call relations**: After `try_parse_shell` builds a tree, `parse_shell_script_into_commands` and `parse_shell_script` call this function to decide whether the script is simple enough. For each accepted command node, it hands the detailed word extraction to `parse_plain_command_from_node`.
 
 *Call graph*: calls 1 internal fn (parse_plain_command_from_node); called by 2 (parse_shell_script_into_commands, parse_shell_script); 3 external calls (root_node, new, vec!).
 
@@ -1012,11 +1022,11 @@ fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<V
 fn parse_shell_script_into_commands(script: &str) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Convenience entry point that parses shell text and, if it matches the restricted grammar, returns the extracted command sequence. It combines syntax parsing and structural validation into one call.
+**Purpose**: Combines parsing and safety checking for a plain shell script. Callers use it when they have script text and want safe command argument lists.
 
-**Data flow**: It takes a script `&str`, calls `try_parse_shell`, then passes the resulting tree and original source into `try_parse_word_only_commands_sequence`, returning the extracted commands or `None`.
+**Data flow**: It receives script text. First it asks `try_parse_shell` to build a syntax tree. If that works, it passes the tree and source text to `try_parse_word_only_commands_sequence`. It returns the extracted commands or `None` if either step fails.
 
-**Call relations**: This function is the main shell-script parser consumed by command safety code and tests, including `parse_shell_lc_plain_commands`.
+**Call relations**: This is the public shortcut used by `parse_shell_lc_plain_commands`, by command-memory analysis, and by the test helper `tests::parse_seq`. It hides the two-stage flow of parse first, then validate.
 
 *Call graph*: calls 2 internal fn (try_parse_shell, try_parse_word_only_commands_sequence); called by 3 (memories_usage_kinds_from_command, parse_shell_lc_plain_commands, parse_seq).
 
@@ -1027,11 +1037,11 @@ fn parse_shell_script_into_commands(script: &str) -> Option<Vec<Vec<String>>>
 fn extract_bash_command(command: &[String]) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Recognizes argv vectors of the form `<shell> -c <script>` or `<shell> -lc <script>` where the executable resolves to Bash, Zsh, or Sh. It returns the shell executable and script text for further parsing.
+**Purpose**: Recognizes command arrays that mean “run this script through bash, zsh, or sh”. It prevents the shell parser from being used on unrelated commands.
 
-**Data flow**: It takes a `&[String]`, pattern-matches exactly three elements `[shell, flag, script]`, checks that `flag` is `-lc` or `-c`, runs `detect_shell_type(PathBuf::from(shell))`, and returns `Some((&str, &str))` only for Bash/Zsh/Sh executables.
+**Data flow**: It receives a command as a list of strings. It only accepts exactly three items: a shell path/name, a flag, and a script. The flag must be `-lc` or `-c`, and the shell path must be detected as Bash, Zsh, or Sh. It returns the shell and script as borrowed strings, or `None` if the shape does not match.
 
-**Call relations**: It is the gatekeeper used by both shell-wrapper parsing functions and by other approval/canonicalization code that wants to inspect shell invocations safely.
+**Call relations**: Several higher-level command policy and formatting paths call this before trying to interpret embedded shell text. `parse_shell_lc_plain_commands` and `parse_shell_lc_single_command_prefix` rely on it as their gatekeeper.
 
 *Call graph*: called by 6 (canonicalize_command_for_approval, parse_shell_lc_plain_commands, parse_shell_lc_single_command_prefix, extract_shell_command, parse_shell_lc_commands, format_unified_exec_interaction); 1 external calls (matches!).
 
@@ -1042,11 +1052,11 @@ fn extract_bash_command(command: &[String]) -> Option<(&str, &str)>
 fn parse_shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Extracts the plain command sequence from a shell wrapper invocation when the embedded script satisfies the restricted grammar. It is the shell-wrapper counterpart to `parse_shell_script_into_commands`.
+**Purpose**: Extracts plain commands from a `bash -lc`, `zsh -lc`, or `sh -c` invocation when the embedded script stays within the safe subset. It lets policy code see the real commands hidden inside a shell wrapper.
 
-**Data flow**: It takes a tokenized command slice, uses `extract_bash_command` to obtain the script, then parses that script with `parse_shell_script_into_commands`, returning the command vectors or `None`.
+**Data flow**: It receives a full command array, such as `['bash', '-lc', 'ls && pwd']`. It first uses `extract_bash_command` to find the embedded script. Then it passes that script to `parse_shell_script_into_commands`. It returns the parsed command lists or `None` if the wrapper or script is not acceptable.
 
-**Call relations**: This is the main bridge from outer argv classification into shell-script analysis, and is used by safety and danger heuristics for `bash -lc` and `zsh -lc` commands.
+**Call relations**: Command approval, execution policy, danger checks, and known-safe checks call this when they need to look through a shell invocation. It delegates shell recognition to `extract_bash_command` and script parsing to `parse_shell_script_into_commands`.
 
 *Call graph*: calls 2 internal fn (extract_bash_command, parse_shell_script_into_commands); called by 6 (canonicalize_command_for_approval, commands_for_exec_policy, commands_for_intercepted_exec_policy, parse_zsh_lc_plain_commands, command_might_be_dangerous, is_known_safe_command).
 
@@ -1057,11 +1067,11 @@ fn parse_shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>>
 fn parse_shell_lc_single_command_prefix(command: &[String]) -> Option<Vec<String>>
 ```
 
-**Purpose**: Extracts only the executable-prefix words from a heredoc-style shell wrapper script when the script contains exactly one command and no ordinary file redirects. It is intentionally narrower than full plain-command parsing.
+**Purpose**: Finds the executable and literal arguments for a single shell command that uses a here-doc. This is useful when a script passes a block of text to one program, such as `python3 <<'PY'`, and policy only needs the program prefix.
 
-**Data flow**: It takes a tokenized command slice, extracts the shell script with `extract_bash_command`, parses it with `try_parse_shell`, rejects parse errors, requires a named descendant `heredoc_redirect`, rejects any `file_redirect`, finds exactly one command node with `find_single_command_node`, then converts that node with `parse_heredoc_command_words`.
+**Data flow**: It receives a full shell command array. It extracts the embedded script, parses it, rejects parse errors, requires a here-doc-style redirect, rejects normal file redirects, and requires exactly one command node. It then extracts only safe literal command words. The result is that one command prefix, or `None` if the script contains extra commands or unsafe features.
 
-**Call relations**: It is used by exec-policy code paths that need to recognize a single command prefix even when stdin is supplied via heredoc. It delegates tree searches and word extraction to dedicated helpers.
+**Call relations**: Execution policy paths call this after shell extraction when here-doc scripts need special treatment. It coordinates `try_parse_shell`, `has_named_descendant_kind`, `find_single_command_node`, and `parse_heredoc_command_words`.
 
 *Call graph*: calls 5 internal fn (extract_bash_command, find_single_command_node, has_named_descendant_kind, parse_heredoc_command_words, try_parse_shell); called by 3 (commands_for_exec_policy, commands_for_intercepted_exec_policy, parse_shell_lc_single_command_prefix_supports_heredoc).
 
@@ -1072,11 +1082,11 @@ fn parse_shell_lc_single_command_prefix(command: &[String]) -> Option<Vec<String
 fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Vec<String>>
 ```
 
-**Purpose**: Converts one tree-sitter `command` node into a vector of literal argv words, supporting bare words, numbers, quoted strings, and concatenations. It rejects any child shape outside that narrow subset.
+**Purpose**: Turns one safe `command` node from the syntax tree into the familiar list of command-line arguments. It understands literal words, numbers, simple quotes, and safe quote concatenation.
 
-**Data flow**: It takes a `Node` and source `&str`, verifies the node kind is `command`, iterates named children, extracts command names from nested `word` nodes, copies `word` and `number` text directly, parses `string` via `parse_double_quoted_string`, parses `raw_string` via `parse_raw_string`, flattens `concatenation` parts into one `String`, and returns `Option<Vec<String>>`.
+**Data flow**: It receives one syntax-tree command node and the original script text. It reads each named child in order, extracts the command name and arguments, removes simple quote wrappers, and joins safe concatenated pieces such as `-g"*.py"`. It returns a vector of strings, or `None` if it sees an unsupported child.
 
-**Call relations**: It is called for each collected command node by `try_parse_word_only_commands_sequence`, and its rejection behavior enforces literal-only argv extraction.
+**Call relations**: `try_parse_word_only_commands_sequence` calls this after it has already checked the broader script shape. This function then performs the smaller job of converting each individual command node into plain words, using `parse_double_quoted_string` and `parse_raw_string` for quoted text.
 
 *Call graph*: calls 2 internal fn (parse_double_quoted_string, parse_raw_string); called by 1 (try_parse_word_only_commands_sequence); 5 external calls (kind, named_children, walk, new, new).
 
@@ -1087,11 +1097,11 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
 fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>>
 ```
 
-**Purpose**: Extracts the literal argv prefix from a single command node that may carry heredoc attachments. It allows heredoc-related nodes but rejects expansions and non-heredoc redirects.
+**Purpose**: Extracts the literal executable prefix from a single command that has a here-doc attachment. It deliberately ignores the here-doc body while still rejecting unsafe argument syntax.
 
-**Data flow**: It takes a `command` `Node` and source `&str`, iterates named children, accepts `command_name`, `word`, and `number` only when `is_literal_word_or_number` says they have no named descendants, ignores `comment`, ignores attachment kinds accepted by `is_allowed_heredoc_attachment_kind`, rejects everything else, and returns `Some(words)` only if at least one word was collected.
+**Data flow**: It receives a command node and source text. It accepts only a literal command name and literal word or number arguments, while allowing here-doc-related syntax nodes to be attached. It returns the collected words if at least one word is found, or `None` if the command contains expansion, assignment-like structure, or unrelated syntax.
 
-**Call relations**: It is the final extraction step in `parse_shell_lc_single_command_prefix`, specialized for heredoc-bearing scripts where full plain-command parsing would reject the redirect nodes.
+**Call relations**: `parse_shell_lc_single_command_prefix` calls this after proving there is exactly one command and that the script uses here-doc syntax. It relies on `is_literal_word_or_number` for word safety and `is_allowed_heredoc_attachment_kind` for the allowed attachment nodes.
 
 *Call graph*: calls 2 internal fn (is_allowed_heredoc_attachment_kind, is_literal_word_or_number); called by 1 (parse_shell_lc_single_command_prefix); 5 external calls (kind, named_children, walk, new, matches!).
 
@@ -1102,11 +1112,11 @@ fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>>
 fn is_literal_word_or_number(node: Node<'_>) -> bool
 ```
 
-**Purpose**: Checks whether a `word` or `number` node is syntactically literal rather than containing nested expansions or other named structure. This is a structural safety predicate.
+**Purpose**: Checks whether a syntax node is a plain word or number with no hidden child syntax inside it. This blocks things that look like a word but actually contain shell expansion.
 
-**Data flow**: It takes a `Node`, verifies its kind is `word` or `number`, walks its named children, and returns `true` only if there are none.
+**Data flow**: It receives one syntax-tree node. It first checks that the node kind is `word` or `number`, then verifies it has no named children. It returns `true` only for a simple literal token.
 
-**Call relations**: It is used by `parse_heredoc_command_words` to reject arithmetic expansions, substitutions, and similar constructs hidden inside otherwise word-like nodes.
+**Call relations**: `parse_heredoc_command_words` calls this before accepting command names and arguments in the here-doc special case. It acts as the small safety check for each possible word.
 
 *Call graph*: called by 1 (parse_heredoc_command_words); 3 external calls (named_children, walk, matches!).
 
@@ -1117,11 +1127,11 @@ fn is_literal_word_or_number(node: Node<'_>) -> bool
 fn is_allowed_heredoc_attachment_kind(kind: &str) -> bool
 ```
 
-**Purpose**: Defines which named node kinds may appear alongside a command when extracting a heredoc command prefix. The allow-list is limited to stdin-attachment constructs.
+**Purpose**: Names the syntax node kinds that are allowed as here-doc or here-string attachments. It keeps that allow-list in one clear place.
 
-**Data flow**: It takes a node kind `&str` and returns `true` only for `heredoc_body`, `simple_heredoc_body`, `heredoc_redirect`, `herestring_redirect`, or `redirected_statement`.
+**Data flow**: It receives a syntax node kind as text. It compares that kind against the few here-doc-related names that are acceptable. It returns `true` for those names and `false` for everything else.
 
-**Call relations**: It is consulted by `parse_heredoc_command_words` to distinguish acceptable heredoc plumbing from other redirect or syntax nodes.
+**Call relations**: `parse_heredoc_command_words` calls this when it sees non-word children attached to a command. This function decides whether those attachments are part of the permitted here-doc shape.
 
 *Call graph*: called by 1 (parse_heredoc_command_words); 1 external calls (matches!).
 
@@ -1132,11 +1142,11 @@ fn is_allowed_heredoc_attachment_kind(kind: &str) -> bool
 fn find_single_command_node(root: Node<'_>) -> Option<Node<'_>>
 ```
 
-**Purpose**: Traverses a syntax subtree and returns the only `command` node if exactly one exists. Multiple commands cause rejection.
+**Purpose**: Searches a syntax tree and succeeds only if there is exactly one command node. It prevents a here-doc shortcut from hiding a second command.
 
-**Data flow**: It takes a root `Node`, performs a stack-based traversal over named children, tracks whether a `command` has already been seen, returns `None` on the second one, and otherwise returns the single found node.
+**Data flow**: It receives the root node of a parsed tree. It walks through named descendants, remembers a command node if it finds one, and immediately fails if it finds another. It returns the single command node or `None`.
 
-**Call relations**: It is used by `parse_shell_lc_single_command_prefix` to enforce the invariant that heredoc prefix extraction only applies to one-command scripts.
+**Call relations**: `parse_shell_lc_single_command_prefix` uses this before extracting a here-doc command prefix. It provides the “only one command is present” guarantee needed by that special path.
 
 *Call graph*: called by 1 (parse_shell_lc_single_command_prefix); 1 external calls (vec!).
 
@@ -1147,11 +1157,11 @@ fn find_single_command_node(root: Node<'_>) -> Option<Node<'_>>
 fn has_named_descendant_kind(node: Node<'_>, kind: &str) -> bool
 ```
 
-**Purpose**: Searches a syntax subtree for any named descendant of a given kind. It is a generic tree predicate used for redirect checks.
+**Purpose**: Checks whether a parsed syntax tree contains a named node of a particular kind. It is a simple search tool used for safety decisions.
 
-**Data flow**: It takes a root `Node` and target kind `&str`, traverses named children with a stack, returns `true` on the first matching node kind, and `false` if none are found.
+**Data flow**: It receives a starting node and a target kind name. It walks through the node and all named descendants, returning `true` as soon as it finds the target. If no matching node appears, it returns `false`.
 
-**Call relations**: It is called by `parse_shell_lc_single_command_prefix` to require heredoc presence and forbid ordinary file redirects before attempting prefix extraction.
+**Call relations**: `parse_shell_lc_single_command_prefix` calls this to require here-doc syntax and to reject normal file redirects. It gives that function quick yes-or-no answers about important syntax features.
 
 *Call graph*: called by 1 (parse_shell_lc_single_command_prefix); 1 external calls (vec!).
 
@@ -1162,11 +1172,11 @@ fn has_named_descendant_kind(node: Node<'_>, kind: &str) -> bool
 fn parse_double_quoted_string(node: Node, src: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts the literal contents of a double-quoted string node only when it contains plain `string_content` parts and no expansions. This rejects interpolated shell strings.
+**Purpose**: Extracts the contents of a double-quoted string only when it contains plain text. It rejects double-quoted strings with variable or command expansion.
 
-**Data flow**: It takes a `string` `Node` and source `&str`, verifies the node kind, checks every named child is `string_content`, reads the raw source text, strips the surrounding double quotes, and returns the inner `String`.
+**Data flow**: It receives a syntax node and the original source. It verifies the node is a `string`, checks that every named child is only `string_content`, then strips the surrounding double quotes from the raw text. It returns the inside text or `None`.
 
-**Call relations**: It is used by `parse_plain_command_from_node` for both standalone quoted arguments and quoted parts inside concatenations.
+**Call relations**: `parse_plain_command_from_node` calls this when an argument is written with double quotes. This keeps ordinary quoted text usable while blocking hidden shell behavior inside quotes.
 
 *Call graph*: called by 1 (parse_plain_command_from_node); 4 external calls (kind, named_children, utf8_text, walk).
 
@@ -1177,11 +1187,11 @@ fn parse_double_quoted_string(node: Node, src: &str) -> Option<String>
 fn parse_raw_string(node: Node, src: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts the contents of a single-quoted shell string node. It assumes the parser has already identified the node as a raw string literal.
+**Purpose**: Extracts the contents of a single-quoted shell string. In shell syntax, single quotes are treated as literal text, so this is a safe quoting form.
 
-**Data flow**: It takes a `raw_string` `Node` and source `&str`, verifies the kind, reads the raw source text, strips leading and trailing single quotes, and returns the inner owned string.
+**Data flow**: It receives a syntax node and the source text. It verifies the node is a `raw_string`, reads its exact text, strips one leading and trailing single quote, and returns the contents. If the shape is wrong, it returns `None`.
 
-**Call relations**: It is the single-quoted counterpart to `parse_double_quoted_string`, used by `parse_plain_command_from_node`.
+**Call relations**: `parse_plain_command_from_node` calls this for single-quoted arguments and for single-quoted pieces inside concatenated arguments.
 
 *Call graph*: called by 1 (parse_plain_command_from_node); 2 external calls (kind, utf8_text).
 
@@ -1192,11 +1202,11 @@ fn parse_raw_string(node: Node, src: &str) -> Option<String>
 fn parse_seq(src: &str) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Small test helper that forwards shell source into the main parser. It keeps the test bodies concise.
+**Purpose**: Provides a short test helper for parsing shell snippets. It keeps the tests focused on expected behavior rather than repeated setup.
 
-**Data flow**: It takes a source `&str`, calls `parse_shell_script_into_commands`, and returns the resulting optional command sequence.
+**Data flow**: It receives a source string, passes it to `parse_shell_script_into_commands`, and returns whatever that parser returns.
 
-**Call relations**: Most parser tests call this helper instead of invoking the parser directly.
+**Call relations**: Many test cases call this helper when they want to check the ordinary safe-command parser.
 
 *Call graph*: calls 1 internal fn (parse_shell_script_into_commands).
 
@@ -1207,11 +1217,11 @@ fn parse_seq(src: &str) -> Option<Vec<Vec<String>>>
 fn accepts_single_simple_command()
 ```
 
-**Purpose**: Confirms that a basic command with one flag parses into one argv vector. It establishes the simplest accepted case.
+**Purpose**: Verifies that a basic command with one argument is accepted. This confirms the parser works for the simplest useful case.
 
-**Data flow**: The test parses `ls -1`, unwraps the result, and asserts it equals a single command vector containing `ls` and `-1`.
+**Data flow**: It feeds `ls -1` through the test helper and compares the result with one command containing `ls` and `-1`.
 
-**Call relations**: It exercises the happy path through `parse_shell_script_into_commands` and `parse_plain_command_from_node`.
+**Call relations**: The test runner calls this test. It exercises `tests::parse_seq`, which then reaches the public script parser.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1222,11 +1232,11 @@ fn accepts_single_simple_command()
 fn accepts_multiple_commands_with_allowed_operators()
 ```
 
-**Purpose**: Verifies that `&&`, `;`, and `|` are accepted as sequence operators and that commands are returned in source order. It also checks quoted string extraction inside a pipeline.
+**Purpose**: Verifies that simple commands joined by allowed operators are accepted and separated correctly. This checks the intended safe chaining behavior.
 
-**Data flow**: The test parses `ls && pwd; echo 'hi there' | wc -l`, unwraps the result, builds the expected nested vectors, and asserts equality.
+**Data flow**: It parses a script using `&&`, `;`, quotes, and `|`. It expects four separate command lists in source order.
 
-**Call relations**: It covers the traversal, operator allow-list, command sorting by byte position, and mixed command extraction logic.
+**Call relations**: The test runner calls this to cover the sequence parser and its allowed operator list through `tests::parse_seq`.
 
 *Call graph*: 3 external calls (assert_eq!, parse_seq, vec!).
 
@@ -1237,11 +1247,11 @@ fn accepts_multiple_commands_with_allowed_operators()
 fn extracts_double_and_single_quoted_strings()
 ```
 
-**Purpose**: Checks that both double-quoted and single-quoted literal strings are unwrapped correctly into argv words. It ensures quotes are removed but contents preserved.
+**Purpose**: Checks that both double-quoted and single-quoted plain strings become normal argument text. It proves quotes are removed without losing spaces.
 
-**Data flow**: The test parses `echo "hello world"` and `echo 'hi there'`, unwraps both results, and asserts the extracted words contain the unquoted string contents.
+**Data flow**: It parses `echo "hello world"` and `echo 'hi there'`, then compares each result with an `echo` command whose second argument contains the spaces.
 
-**Call relations**: It specifically exercises `parse_double_quoted_string` and `parse_raw_string` through the main parser.
+**Call relations**: This test reaches quote parsing through `tests::parse_seq`, indirectly covering `parse_double_quoted_string` and `parse_raw_string`.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1252,12 +1262,11 @@ fn extracts_double_and_single_quoted_strings()
 fn accepts_double_quoted_strings_with_newlines()
 ```
 
-**Purpose**: Verifies that literal newlines inside double-quoted strings are preserved rather than rejected. This documents that multiline literal strings are acceptable.
+**Purpose**: Confirms that plain double-quoted strings may contain newline characters. This matters for commands such as commit messages.
 
-**Data flow**: The test parses `git commit -m "line1
-line2"`, unwraps the result, and asserts the `-m` argument value contains the embedded newline.
+**Data flow**: It parses a `git commit -m` command whose quoted message spans two lines, then checks that the newline is preserved in the argument.
 
-**Call relations**: It covers the string-content-only rule in `parse_double_quoted_string` with multiline content.
+**Call relations**: The test runner uses this to cover multiline safe string content through the normal parsing path.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1268,11 +1277,11 @@ line2"`, unwraps the result, and asserts the `-m` argument value contains the em
 fn accepts_mixed_quote_concatenation()
 ```
 
-**Purpose**: Confirms that adjacent quoted and unquoted literal fragments are concatenated into one argv word. This matches shell concatenation semantics for purely literal pieces.
+**Purpose**: Checks that adjacent quoted and unquoted pieces can combine into one argument when every piece is literal. This matches common shell behavior for building paths.
 
-**Data flow**: The test parses two mixed-quote `echo` examples and asserts each yields a single concatenated path argument `/usr/local/bin`.
+**Data flow**: It parses examples that combine single quotes, double quotes, and bare text into `/usr/local/bin`, then compares the parsed output with that single combined argument.
 
-**Call relations**: It exercises the `concatenation` branch in `parse_plain_command_from_node`.
+**Call relations**: This test exercises concatenation behavior in `parse_plain_command_from_node` through the public parsing helper.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1283,11 +1292,11 @@ fn accepts_mixed_quote_concatenation()
 fn rejects_double_quoted_strings_with_expansions()
 ```
 
-**Purpose**: Ensures interpolated double-quoted strings are rejected. Variable and parameter expansions inside quotes are not considered literal-safe.
+**Purpose**: Verifies that double-quoted strings containing shell expansion are rejected. This prevents variables from being mistaken for fixed text.
 
-**Data flow**: The test calls `parse_seq` on examples containing `${USER}` and `$HOME` inside double quotes and asserts both return `None`.
+**Data flow**: It tries examples containing `${USER}` and `$HOME` inside double quotes. Each parse is expected to return `None`.
 
-**Call relations**: It validates the child-kind check in `parse_double_quoted_string` and the parser’s conservative rejection of expansions.
+**Call relations**: The test runner uses this to confirm `parse_double_quoted_string` rejects non-plain children inside quoted strings.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1298,11 +1307,11 @@ fn rejects_double_quoted_strings_with_expansions()
 fn accepts_numbers_as_words()
 ```
 
-**Purpose**: Checks that numeric tokens are accepted as command arguments. Tree-sitter emits numbers separately from words, so this test locks in support for them.
+**Purpose**: Confirms numeric-looking arguments are accepted as ordinary command words. Many real commands use numbers as options or values.
 
-**Data flow**: The test parses `echo 123 456`, unwraps the result, and asserts the argv contains the numeric strings unchanged.
+**Data flow**: It parses `echo 123 456` and expects the numbers to appear as string arguments after `echo`.
 
-**Call relations**: It exercises the `number` handling in `parse_plain_command_from_node`.
+**Call relations**: This test covers the `number` node path inside the normal command parser.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1313,11 +1322,11 @@ fn accepts_numbers_as_words()
 fn rejects_parentheses_and_subshells()
 ```
 
-**Purpose**: Verifies that subshell/grouping syntax is rejected outright. Parentheses are outside the allowed shell subset.
+**Purpose**: Checks that subshell-style syntax is rejected. Parentheses can change execution behavior, so they are outside this file’s safe subset.
 
-**Data flow**: The test parses `(ls)` and `ls || (pwd && echo hi)` and asserts both return `None`.
+**Data flow**: It attempts to parse `(ls)` and a chained command containing a parenthesized group. Both must return `None`.
 
-**Call relations**: It covers the named-node and punctuation rejection logic in `try_parse_word_only_commands_sequence`.
+**Call relations**: The test runner uses this to validate the broad syntax allow-list in `try_parse_word_only_commands_sequence`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1328,11 +1337,11 @@ fn rejects_parentheses_and_subshells()
 fn rejects_redirections_and_unsupported_operators()
 ```
 
-**Purpose**: Ensures output redirection and unsupported backgrounding operators are rejected. These constructs can introduce side effects or ambiguous semantics.
+**Purpose**: Confirms that output redirection and unsupported background-style operators are rejected. These features could write files or run extra work in ways the plain parser should not collapse.
 
-**Data flow**: The test parses `ls > out.txt` and `echo hi & echo bye` and asserts both are rejected.
+**Data flow**: It parses `ls > out.txt` and `echo hi & echo bye`. Each parse is expected to fail.
 
-**Call relations**: It validates the punctuation/operator allow-list and disallowed syntax filtering in the tree walk.
+**Call relations**: This test exercises the punctuation and syntax rejection rules in the sequence parser.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1343,11 +1352,11 @@ fn rejects_redirections_and_unsupported_operators()
 fn rejects_command_and_process_substitutions_and_expansions()
 ```
 
-**Purpose**: Checks that command substitution, backticks, variable expansion, and interpolated variables are all rejected. These forms are not literal-safe.
+**Purpose**: Verifies that command substitution, backticks, variables, and quoted variables are rejected. These features can hide values or extra commands.
 
-**Data flow**: The test parses several substitution/expansion examples and asserts each returns `None`.
+**Data flow**: It feeds examples such as `$(pwd)`, backtick command substitution, `$HOME`, and `"hi $USER"` to the parser. Every example must return `None`.
 
-**Call relations**: It exercises multiple rejection paths in the parser’s structural checks and string parsing helpers.
+**Call relations**: The test runner uses this to confirm that only literal words and simple strings are accepted by the parser stack.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1358,11 +1367,11 @@ fn rejects_command_and_process_substitutions_and_expansions()
 fn rejects_variable_assignment_prefix()
 ```
 
-**Purpose**: Verifies that assignment-prefixed commands like `FOO=bar ls` are not accepted as plain commands. Environment mutation before execution is outside the safe subset.
+**Purpose**: Checks that environment assignment prefixes before commands are rejected. Such prefixes can change how the command runs.
 
-**Data flow**: The test parses `FOO=bar ls` and asserts the parser returns `None`.
+**Data flow**: It tries to parse `FOO=bar ls` and expects parsing to fail.
 
-**Call relations**: It documents that assignment syntax is excluded by the allowed-node filter.
+**Call relations**: This test covers the syntax allow-list and command-node extraction rules through `tests::parse_seq`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1373,11 +1382,11 @@ fn rejects_variable_assignment_prefix()
 fn rejects_trailing_operator_parse_error()
 ```
 
-**Purpose**: Ensures syntactically incomplete command sequences are rejected. A trailing operator must not produce a partial accepted parse.
+**Purpose**: Confirms a script ending with an operator is rejected. This protects against accepting incomplete shell syntax.
 
-**Data flow**: The test parses `ls &&` and asserts the result is `None`.
+**Data flow**: It parses `ls &&` and expects `None` because the parse tree has an error.
 
-**Call relations**: It relies on parse errors being surfaced by `tree.root_node().has_error()` in `try_parse_word_only_commands_sequence`.
+**Call relations**: The test runner uses this to cover the parse-error check in `try_parse_word_only_commands_sequence`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1388,11 +1397,11 @@ fn rejects_trailing_operator_parse_error()
 fn rejects_empty_command_position_with_leading_operator()
 ```
 
-**Purpose**: Checks that a leading operator without a preceding command is rejected. Empty command slots are not tolerated.
+**Purpose**: Checks that a script cannot begin with a chaining operator. There must be a real command where the shell grammar expects one.
 
-**Data flow**: The test parses `&& ls` and asserts rejection.
+**Data flow**: It parses `&& ls` and expects failure.
 
-**Call relations**: It covers parse-error or invalid-structure rejection in the main sequence parser.
+**Call relations**: This test reaches the parser through `tests::parse_seq` and confirms malformed command sequences are not accepted.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1403,11 +1412,11 @@ fn rejects_empty_command_position_with_leading_operator()
 fn rejects_empty_command_position_with_double_separator()
 ```
 
-**Purpose**: Verifies that doubled separators creating an empty command position are rejected. This prevents malformed lists from being misinterpreted.
+**Purpose**: Verifies that doubled separators creating an empty command position are rejected. This avoids treating broken shell syntax as a valid command list.
 
-**Data flow**: The test parses `ls ;; pwd` and asserts the parser returns `None`.
+**Data flow**: It parses `ls ;; pwd` and expects `None`.
 
-**Call relations**: It exercises the same conservative malformed-script handling as other operator-placement tests.
+**Call relations**: The test runner uses this to confirm parse errors stop the safe-command sequence path.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1418,11 +1427,11 @@ fn rejects_empty_command_position_with_double_separator()
 fn rejects_empty_command_position_with_empty_pipeline_segment()
 ```
 
-**Purpose**: Ensures pipelines with an empty segment are rejected. A missing command between pipes must not be accepted.
+**Purpose**: Checks that a pipeline cannot contain an empty segment. A pipe must connect real commands on both sides.
 
-**Data flow**: The test parses `ls | | wc` and asserts rejection.
+**Data flow**: It parses `ls | | wc` and expects the parser to reject it.
 
-**Call relations**: It validates malformed pipeline handling in the parser.
+**Call relations**: This test exercises the parse-error rejection behavior through the public parsing helper.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1433,11 +1442,11 @@ fn rejects_empty_command_position_with_empty_pipeline_segment()
 fn parse_zsh_lc_plain_commands()
 ```
 
-**Purpose**: Confirms that `zsh -lc` wrappers are accepted alongside Bash wrappers and parsed into plain commands. The shell executable detection intentionally treats Zsh as supported.
+**Purpose**: Verifies that `zsh -lc` shell wrappers are recognized, not only Bash. This matters because the same simple embedded command policy applies to supported shells.
 
-**Data flow**: The test builds a three-element command vector for `zsh -lc ls`, calls `parse_shell_lc_plain_commands`, unwraps the result, and asserts it equals one `ls` command.
+**Data flow**: It builds a command array for `zsh -lc ls`, parses it with `parse_shell_lc_plain_commands`, and expects one command containing `ls`.
 
-**Call relations**: It exercises `extract_bash_command`’s shell-type detection and the wrapper parsing path.
+**Call relations**: The test runner calls this to cover `extract_bash_command` and the shell-wrapper parsing flow.
 
 *Call graph*: calls 1 internal fn (parse_shell_lc_plain_commands); 2 external calls (assert_eq!, vec!).
 
@@ -1448,11 +1457,11 @@ fn parse_zsh_lc_plain_commands()
 fn accepts_concatenated_flag_and_value()
 ```
 
-**Purpose**: Checks that concatenated literal fragments like `-g"*.py"` are flattened into one argv word. This is important for common CLI flag syntax.
+**Purpose**: Checks that a flag directly joined to a double-quoted value is accepted when the value is literal. This supports common patterns such as ripgrep globs.
 
-**Data flow**: The test parses `rg -n "foo" -g"*.py"`, unwraps the result, and asserts the final argument is `-g*.py`.
+**Data flow**: It parses `rg -n "foo" -g"*.py"` and expects the last argument to become `-g*.py`.
 
-**Call relations**: It specifically covers concatenation handling in `parse_plain_command_from_node`.
+**Call relations**: This test exercises concatenation support in `parse_plain_command_from_node` through `tests::parse_seq`.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1463,11 +1472,11 @@ fn accepts_concatenated_flag_and_value()
 fn accepts_concatenated_flag_with_single_quotes()
 ```
 
-**Purpose**: Verifies the same concatenation behavior for single-quoted fragments. Literal quoting style should not affect acceptance.
+**Purpose**: Checks the same safe concatenation behavior when the joined value is single-quoted. It confirms both quote styles work for literal pieces.
 
-**Data flow**: The test parses `grep -n 'pattern' -g'*.txt'`, unwraps the result, and asserts the final argument is `-g*.txt`.
+**Data flow**: It parses `grep -n 'pattern' -g'*.txt'` and expects `-g*.txt` as one argument.
 
-**Call relations**: It complements the previous concatenation test using `parse_raw_string` inside concatenations.
+**Call relations**: The test runner uses this to cover the raw-string part of concatenation parsing.
 
 *Call graph*: 2 external calls (assert_eq!, parse_seq).
 
@@ -1478,11 +1487,11 @@ fn accepts_concatenated_flag_with_single_quotes()
 fn rejects_concatenation_with_variable_substitution()
 ```
 
-**Purpose**: Ensures concatenations containing variable expansion are rejected rather than partially flattened. Literal-only concatenation is the invariant.
+**Purpose**: Verifies that concatenated arguments are rejected if the quoted part contains a variable. The final text would not be known safely ahead of time.
 
-**Data flow**: The test parses two `rg -g"$VAR"` forms and asserts both return `None`.
+**Data flow**: It tries examples like `-g"$VAR"` and `-g"${VAR}"`. Each is expected to fail.
 
-**Call relations**: It validates that concatenation parsing still depends on the quoted-string helpers rejecting expansions.
+**Call relations**: This test confirms concatenation still relies on the strict quote parser, rather than blindly joining text.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1493,11 +1502,11 @@ fn rejects_concatenation_with_variable_substitution()
 fn rejects_concatenation_with_command_substitution()
 ```
 
-**Purpose**: Checks that command substitution inside concatenated strings is rejected. This prevents hidden execution inside otherwise literal-looking arguments.
+**Purpose**: Checks that concatenated arguments cannot contain command substitution. This prevents hidden commands from being smuggled inside an argument.
 
-**Data flow**: The test parses two `$(...)` concatenation examples and asserts both are rejected.
+**Data flow**: It parses examples with `$(pwd)` and `$(echo '*.py')` inside a joined quoted value. Both must return `None`.
 
-**Call relations**: It covers the same concatenation path under substitution-heavy inputs.
+**Call relations**: The test runner uses this to validate the safety checks inside concatenated string parsing.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1508,11 +1517,11 @@ fn rejects_concatenation_with_command_substitution()
 fn parse_shell_lc_single_command_prefix_supports_heredoc()
 ```
 
-**Purpose**: Verifies that heredoc scripts can still yield a single executable prefix when they contain exactly one command and no unsafe redirects. Both quoted and unquoted heredoc delimiters are accepted.
+**Purpose**: Verifies that a single here-doc command can produce a safe executable prefix. It covers both quoted and unquoted here-doc delimiters.
 
-**Data flow**: The test builds two `zsh -lc` command vectors containing `python3 <<...` scripts, calls `parse_shell_lc_single_command_prefix`, and asserts each returns `Some(vec!["python3"])`.
+**Data flow**: It builds two `zsh -lc` command arrays that run `python3` with a here-doc body. Each call is expected to return only `python3` as the command prefix.
 
-**Call relations**: It exercises the heredoc-specific path through `extract_bash_command`, `try_parse_shell`, descendant checks, `find_single_command_node`, and `parse_heredoc_command_words`.
+**Call relations**: This test calls `parse_shell_lc_single_command_prefix`, exercising the special here-doc path used by execution policy.
 
 *Call graph*: calls 1 internal fn (parse_shell_lc_single_command_prefix); 2 external calls (assert_eq!, vec!).
 
@@ -1523,11 +1532,11 @@ fn parse_shell_lc_single_command_prefix_supports_heredoc()
 fn parse_shell_lc_single_command_prefix_rejects_multi_command_scripts()
 ```
 
-**Purpose**: Ensures heredoc prefix extraction does not apply when the script contains more than one command. The helper is intentionally single-command only.
+**Purpose**: Checks that the here-doc prefix shortcut fails when the script contains more than one command. The shortcut is only safe for one command.
 
-**Data flow**: The test builds a `bash -lc` heredoc script followed by `echo done` and asserts `parse_shell_lc_single_command_prefix` returns `None`.
+**Data flow**: It builds a Bash here-doc script followed by `echo done` and expects `parse_shell_lc_single_command_prefix` to return `None`.
 
-**Call relations**: It validates the uniqueness check enforced by `find_single_command_node`.
+**Call relations**: The test runner uses this to cover `find_single_command_node` through the here-doc parser.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1538,11 +1547,11 @@ fn parse_shell_lc_single_command_prefix_rejects_multi_command_scripts()
 fn parse_shell_lc_single_command_prefix_rejects_non_heredoc_redirects()
 ```
 
-**Purpose**: Checks that ordinary file redirects are rejected by the heredoc-prefix parser. Prefix extraction must not ignore output side effects.
+**Purpose**: Verifies that normal file redirection is not accepted by the here-doc prefix parser. Writing to a file has side effects that should not be hidden.
 
-**Data flow**: The test passes `echo hello > /tmp/out.txt` through `parse_shell_lc_single_command_prefix` and asserts `None`.
+**Data flow**: It builds `echo hello > /tmp/out.txt` under `bash -lc` and expects no prefix result.
 
-**Call relations**: It covers the `has_named_descendant_kind(root, "file_redirect")` rejection path.
+**Call relations**: This test covers the redirect rejection checks in `parse_shell_lc_single_command_prefix`.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1553,11 +1562,11 @@ fn parse_shell_lc_single_command_prefix_rejects_non_heredoc_redirects()
 fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_extra_file_redirect()
 ```
 
-**Purpose**: Ensures a heredoc combined with an additional file redirect is still rejected. Heredoc support is not a blanket redirect exemption.
+**Purpose**: Checks that a here-doc command is still rejected if it also has a normal file redirect. The allowed special case does not permit extra filesystem writes.
 
-**Data flow**: The test parses a `python3 <<'PY' > /tmp/out.txt` script and asserts the prefix parser returns `None`.
+**Data flow**: It builds a `python3` here-doc script that also redirects output to `/tmp/out.txt`. The expected result is `None`.
 
-**Call relations**: It validates that the file-redirect prohibition still applies even when a heredoc is present.
+**Call relations**: The test runner uses this to confirm that `has_named_descendant_kind` catches disallowed file redirects even when a here-doc is present.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1568,11 +1577,11 @@ fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_extra_file_redirect
 fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_variable_assignment()
 ```
 
-**Purpose**: Checks that assignment-prefixed heredoc commands are rejected. Literal command-prefix extraction must not ignore environment mutation.
+**Purpose**: Verifies that assignment prefixes are not accepted in the here-doc command prefix path. Changing environment variables could change what actually runs.
 
-**Data flow**: The test parses `PATH=/tmp/evil:$PATH cat <<'EOF'...` and asserts `None`.
+**Data flow**: It builds a here-doc command with `PATH=...` before `cat` and expects no parsed prefix.
 
-**Call relations**: It exercises `parse_heredoc_command_words` and the literal-word checks against expanded/structured nodes.
+**Call relations**: This test exercises `parse_heredoc_command_words`, which rejects command children outside the literal-word and allowed here-doc attachment set.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1583,11 +1592,11 @@ fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_variable_assignment
 fn parse_shell_lc_single_command_prefix_rejects_herestring_with_chaining()
 ```
 
-**Purpose**: Verifies that scripts with chaining and non-heredoc redirects are rejected by the single-command prefix parser. It must not collapse multi-step scripts into one executable prefix.
+**Purpose**: Checks that a script with normal redirection and command chaining does not pass through the here-doc prefix parser. It protects against collapsing a multi-step script into one harmless-looking prefix.
 
-**Data flow**: The test parses `echo hello > /tmp/out.txt && cat /tmp/out.txt` and asserts `None`.
+**Data flow**: It builds a shell script that writes a file and then reads it with `&&`. The expected prefix result is `None`.
 
-**Call relations**: It covers both the redirect and multi-command rejection conditions in the heredoc-prefix path.
+**Call relations**: The test runner calls the here-doc prefix parser and confirms the combined syntax is rejected before any prefix is returned.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1598,11 +1607,11 @@ fn parse_shell_lc_single_command_prefix_rejects_herestring_with_chaining()
 fn parse_shell_lc_single_command_prefix_rejects_herestring_with_substitution()
 ```
 
-**Purpose**: Ensures here-string input containing command substitution is rejected. Dynamic stdin expressions are not treated as safe literal prefixes.
+**Purpose**: Verifies that a here-string containing command substitution is rejected. Even though here-strings are related to input redirection, substitution can run hidden commands.
 
-**Data flow**: The test parses `python3 <<< "$(rm -rf /)"` and asserts `None`.
+**Data flow**: It builds `python3 <<< "$(rm -rf /)"` inside a shell command and expects `None`.
 
-**Call relations**: It validates the literal-word restrictions and unsupported syntax handling in the heredoc-prefix parser.
+**Call relations**: This test covers the strict word-safety checks used by `parse_heredoc_command_words` in the here-doc-style path.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1613,11 +1622,11 @@ fn parse_shell_lc_single_command_prefix_rejects_herestring_with_substitution()
 fn parse_shell_lc_single_command_prefix_rejects_arithmetic_shift_non_heredoc_script()
 ```
 
-**Purpose**: Checks that arithmetic expansion in a non-heredoc script is rejected by the prefix parser. The helper is not a general shell parser.
+**Purpose**: Checks that arithmetic syntax containing `<<` is not mistaken for a here-doc. The parser must distinguish input redirection from arithmetic shift notation.
 
-**Data flow**: The test parses `echo $((1<<2))` and asserts `None`.
+**Data flow**: It builds `echo $((1<<2))` under `bash -lc` and expects the here-doc prefix parser to return `None`.
 
-**Call relations**: It exercises the parse and descendant checks leading to rejection before any prefix extraction.
+**Call relations**: The test runner uses this to confirm `parse_shell_lc_single_command_prefix` requires real here-doc syntax, not just similar-looking characters.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1628,22 +1637,24 @@ fn parse_shell_lc_single_command_prefix_rejects_arithmetic_shift_non_heredoc_scr
 fn parse_shell_lc_single_command_prefix_rejects_heredoc_command_with_word_expansion()
 ```
 
-**Purpose**: Ensures arithmetic expansion inside the command words of a heredoc script is rejected. Even with heredoc stdin, argv words must remain literal.
+**Purpose**: Verifies that the command prefix of a here-doc may not contain arithmetic expansion. The executable arguments must be literal.
 
-**Data flow**: The test parses `python3 $((1<<2)) <<'PY'...` and asserts `None`.
+**Data flow**: It builds a `python3` here-doc command with `$((1<<2))` as an argument and expects no parsed prefix.
 
-**Call relations**: It specifically validates `is_literal_word_or_number` within `parse_heredoc_command_words`.
+**Call relations**: This test exercises `is_literal_word_or_number` through `parse_heredoc_command_words`, confirming expanded words are rejected.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `shell-command/src/powershell.rs`
 
-`domain_logic` · `command parsing and shell normalization; occasional executable discovery during setup/tests`
+`domain_logic` · `command preparation, safety checking, and shell discovery`
 
-This file concentrates all logic for recognizing argv-style PowerShell invocations, extracting the script payload behind `-Command`/`-c`, optionally rewriting that payload to force UTF-8 console output, and locating runnable `powershell.exe` or `pwsh.exe` binaries. The recognition path is intentionally strict: `extract_powershell_command` first verifies that argv[0] resolves to `ShellType::PowerShell` via `detect_shell_type`, then scans subsequent arguments in order, accepting only a small allowlist of wrapper flags (`-nologo`, `-noprofile`, `-command`, `-c`). Any unexpected flag aborts extraction rather than trying to be permissive. Once a command is recognized, `prefix_powershell_script_with_utf8` rewrites only the final script argument, preserving the original executable and flags and avoiding duplicate insertion if the script already begins with `UTF8_OUTPUT_PREFIX` after leading whitespace trimming.
+PowerShell commands often arrive wrapped like: “run powershell.exe with these flags, then execute this script text.” This file peels back that wrapper so the rest of the system can see the real script inside. Without it, the project might treat a PowerShell command as one opaque string, which would make safety checks less accurate and output encoding less reliable.
 
-For parsing, `parse_powershell_command_into_plain_commands` does not interpret arbitrary Windows shell syntax itself; it unwraps the PowerShell wrapper and delegates the script body to `try_parse_powershell_ast_commands`, keeping this module narrowly focused on wrapper detection. Executable discovery is similarly defensive: `try_find_pwsh_executable_blocking` first asks `cmd /C pwsh ... $PSHOME` for PowerShell Core’s installation home, constructs `pwsh.exe` relative to that directory, validates it by actually running `Write-Output ok`, and only then falls back to PATH lookup. Shared helpers ensure discovered paths are absolute and executable, not merely present in PATH. The tests cover accepted casing, full-path executables, alias handling, UTF-8 prefix idempotence, and AST-based plain-command parsing on Windows.
+The file does three main jobs. First, it can find the script part of a PowerShell launch, accepting common forms such as `-Command` and `-c`, while rejecting unexpected flags. This is like checking that an envelope is addressed correctly before opening it. Second, it can add a small PowerShell prefix that asks the console to print UTF-8 text, so non-English characters and symbols are less likely to come out garbled. It avoids adding the prefix twice. Third, it can look for usable `powershell.exe` or `pwsh.exe` programs on the machine and test that they really run.
+
+For safety-related code, it also passes the extracted script to a PowerShell parser that turns the script into command-like pieces. That lets higher-level policy code judge what the script is trying to do instead of only seeing “powershell.exe”.
 
 #### Function details
 
@@ -1653,11 +1664,11 @@ For parsing, `parse_powershell_command_into_plain_commands` does not interpret a
 fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String>
 ```
 
-**Purpose**: Prepends a best-effort PowerShell snippet that sets `[Console]::OutputEncoding` to UTF-8, but only when the input argv is a recognized PowerShell `-Command`/`-c` invocation. It preserves non-script arguments unchanged and avoids adding the prefix twice.
+**Purpose**: Adds a short PowerShell setup line that asks PowerShell to produce UTF-8 output. This helps avoid broken or unreadable text when commands print characters outside basic English.
 
-**Data flow**: It takes a borrowed `&[String]` command vector, reads it through `extract_powershell_command`, and if extraction fails returns a cloned copy of the original argv. When extraction succeeds, it trims leading whitespace from the script to test whether `UTF8_OUTPUT_PREFIX` is already present; if not, it builds a new script string with `format!`, clones all arguments except the last one, appends the rewritten script, and returns the new `Vec<String>`.
+**Data flow**: It receives a command as a list of strings, such as the executable, flags, and script. It first asks `extract_powershell_command` to find the script body; if the command is not a recognized PowerShell invocation, it returns an unchanged copy. If it is PowerShell, it checks whether the script already starts with the UTF-8 prefix, adds the prefix if needed, and returns a new command list with only the script string changed.
 
-**Call relations**: This function is used from higher-level run paths when PowerShell commands need output normalized before execution, and it is exercised directly by the UTF-8 prefix test. Its only internal dependency is `extract_powershell_command`, which gates rewriting so callers can safely pass arbitrary argv without separate shell checks.
+**Call relations**: During command execution setup, `run` calls this before launching PowerShell so output is more consistently readable. It depends on `extract_powershell_command` to avoid changing commands that are not clearly PowerShell, and its behavior is checked by `prefixes_powershell_command_with_best_effort_utf8`.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); called by 3 (run, run, prefixes_powershell_command_with_best_effort_utf8); 1 external calls (format!).
 
@@ -1668,11 +1679,11 @@ fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String>
 fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Recognizes a narrow PowerShell wrapper shape and returns the executable token plus the script body string that follows `-Command` or `-c`. It rejects short argv, non-PowerShell executables, and any wrapper containing flags outside the module’s allowlist.
+**Purpose**: Finds the actual script text inside a PowerShell command-line invocation. Other code uses this when it needs to inspect or modify the script rather than the wrapper around it.
 
-**Data flow**: It reads the input `&[String]`, first requiring at least three elements. It inspects `command[0]`, converts it to a `PathBuf`, and asks `detect_shell_type` whether it is `Some(ShellType::PowerShell)`; if not, it returns `None`. It then scans arguments from index 1 onward while a following element exists, lowercases each flag for membership testing against `POWERSHELL_FLAGS`, returns `None` on the first unknown flag, and returns `Some((&str, &str))` when it encounters `-Command` or `-c`, using the next element as the script.
+**Data flow**: It receives a list of command arguments. It first checks that there are enough parts, then verifies that the first part looks like a PowerShell executable. It then walks through the flags, accepting only known PowerShell flags used here, and returns the shell name plus the script text when it finds `-Command` or `-c` followed by a script. If anything does not match the expected shape, it returns nothing.
 
-**Call relations**: This is the central recognizer for the file: approval/canonicalization code, parser code, UTF-8 prefixing, and plain-command parsing all call it before doing PowerShell-specific work. It does not delegate further parsing of the script itself; instead it acts as the narrow front door that decides whether downstream PowerShell logic should run at all.
+**Call relations**: This is the shared doorway for PowerShell understanding in this file. Safety and parsing paths such as `canonicalize_command_for_approval`, `parse_command_impl`, and `parse_powershell_command_into_plain_commands` call it when they need the script body. `prefix_powershell_script_with_utf8` also calls it before editing a command. Several tests call it with different valid forms to prove that common spellings and paths are recognized.
 
 *Call graph*: called by 8 (canonicalize_command_for_approval, parse_command_impl, parse_powershell_command_into_plain_commands, prefix_powershell_script_with_utf8, extracts_basic_powershell_command, extracts_full_path_powershell_command, extracts_lowercase_flags, extracts_with_noprofile_and_alias); 1 external calls (matches!).
 
@@ -1685,11 +1696,11 @@ fn parse_powershell_command_into_plain_commands(
 ) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Unwraps a recognized PowerShell wrapper and asks the PowerShell AST parser to convert the script body into plain argv-like command segments. It exists specifically for top-level `powershell ... -Command <script>` forms, not arbitrary shell command lines.
+**Purpose**: Turns the script inside a PowerShell wrapper into simpler command-shaped pieces that policy code can reason about. This supports safety checks that need to know what the PowerShell script would run.
 
-**Data flow**: It accepts `&[String]`, calls `extract_powershell_command`, and early-returns `None` if the wrapper is not recognized. On success it receives `(executable, script)` and passes both into `try_parse_powershell_ast_commands`, returning that parser’s `Option<Vec<Vec<String>>>` result unchanged.
+**Data flow**: It receives a full command list. It uses `extract_powershell_command` to pull out the executable and script; if that fails, it returns nothing. If extraction succeeds, it passes the executable and script to the PowerShell abstract syntax tree parser, which reads the script structure and returns a list of plain command argument lists when possible.
 
-**Call relations**: This function is invoked by command-policy logic that needs to inspect the concrete commands embedded inside a PowerShell wrapper, and by Windows-only tests that verify simple and piped scripts are decomposed correctly. It sits between wrapper recognition and the AST parser, deliberately delegating all script semantics to `try_parse_powershell_ast_commands`.
+**Call relations**: `commands_for_exec_policy` calls this when it needs PowerShell commands in a form suitable for execution policy decisions. The parser itself is delegated to `try_parse_powershell_ast_commands`, while this function only unwraps the outer PowerShell launch. Windows-only tests check both a single command and a pipeline of multiple commands.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); called by 3 (commands_for_exec_policy, parses_multiple_plain_powershell_commands, parses_plain_powershell_commands); 1 external calls (try_parse_powershell_ast_commands).
 
@@ -1700,11 +1711,11 @@ fn parse_powershell_command_into_plain_commands(
 fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Looks for a usable Windows PowerShell executable by searching for `powershell.exe` and validating the result. It is the simplest discovery path in the file.
+**Purpose**: Looks for the older Windows PowerShell executable, `powershell.exe`, and returns its absolute path if it can be found and run. “Blocking” means it does the search immediately and waits for any checks to finish.
 
-**Data flow**: It takes no arguments and directly calls `try_find_powershellish_executable_in_path` with a single candidate slice containing `"powershell.exe"`. It returns the resulting `Option<AbsolutePathBuf>` unchanged.
+**Data flow**: It takes no input. It asks `try_find_powershellish_executable_in_path` to search the system PATH for `powershell.exe`, then returns the first usable absolute path or nothing if none is available.
 
-**Call relations**: Tests and parser-process scenarios call this helper when they need a concrete Windows PowerShell binary to exercise wrapper recognition or safety checks. All actual lookup and validation work is delegated to the shared PATH-search helper.
+**Call relations**: Tests and parser-process setup code call this when they need a real PowerShell executable for Windows-style command behavior. It keeps the public search function small by handing the actual PATH search and validation to `try_find_powershellish_executable_in_path`.
 
 *Call graph*: calls 1 internal fn (try_find_powershellish_executable_in_path); called by 3 (commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command, parser_process_handles_multiple_requests, parser_process_rejects_stop_parsing_forms).
 
@@ -1715,11 +1726,11 @@ fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf>
 fn try_find_pwsh_executable_blocking() -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Finds a usable PowerShell Core executable, preferring discovery via `$PSHOME` and falling back to PATH lookup. This extra logic exists because `pwsh.exe` may be installed outside PATH even when present on the machine.
+**Purpose**: Looks for PowerShell Core, named `pwsh.exe`, and returns its absolute path if it can find a working copy. PowerShell Core is newer and cross-platform, but it may be installed somewhere that is not directly visible in PATH.
 
-**Data flow**: It starts a blocking `cmd /C pwsh -NoProfile -Command $PSHOME` subprocess and reads its output. If the subprocess succeeds and stdout trims to a non-empty directory string, it resolves `pwsh.exe` against that base with `AbsolutePathBuf::resolve_path_against_base`, validates the candidate with `is_powershellish_executable_available`, and returns it on success. If any step fails, it falls back to `try_find_powershellish_executable_in_path(&["pwsh.exe"])` and returns that result.
+**Data flow**: It takes no input. First it tries to ask `pwsh` itself for `$PSHOME`, the folder where PowerShell lives, by running a small command through `cmd`. If that succeeds, it builds a possible `pwsh.exe` path from that folder and tests whether it runs. If that route fails, it falls back to searching PATH for `pwsh.exe`. The result is either a usable absolute path or nothing.
 
-**Call relations**: Safety and parsing tests that specifically care about `pwsh` variants call this function to obtain a real executable path. Internally it orchestrates two lower-level helpers—path construction/validation first, generic PATH search second—so callers get a single best-effort discovery API.
+**Call relations**: Safety and PowerShell-wrapper tests call this when they need to use the same PowerShell variant that would actually be invoked. It uses `is_powershellish_executable_available` to avoid returning a broken executable and falls back to `try_find_powershellish_executable_in_path` when the `$PSHOME` shortcut does not work.
 
 *Call graph*: calls 3 internal fn (is_powershellish_executable_available, try_find_powershellish_executable_in_path, resolve_path_against_base); called by 7 (commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command, windows_powershell_full_path_is_safe, accepts_full_path_powershell_invocations, allows_read_only_pipelines_and_git_usage, recognizes_safe_powershell_wrappers, rejects_git_global_override_options, uses_invoked_powershell_variant_for_parsing); 1 external calls (new).
 
@@ -1730,11 +1741,11 @@ fn try_find_pwsh_executable_blocking() -> Option<AbsolutePathBuf>
 fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Searches PATH for one or more candidate executable names and returns the first one that both resolves and successfully runs a trivial PowerShell command. It filters out stale PATH entries or nonfunctional binaries.
+**Purpose**: Searches the system PATH for one or more possible PowerShell executable names and returns the first one that is both found and runnable. This avoids trusting a file name just because it exists.
 
-**Data flow**: It takes a slice of candidate names, iterates in order, and for each one calls `which::which`. For each resolved path it invokes `is_powershellish_executable_available`; unavailable candidates are skipped. For available paths it attempts `AbsolutePathBuf::from_absolute_path`, skipping any path that cannot be represented as an absolute-path wrapper, and returns the first successful `AbsolutePathBuf`. If no candidate passes all checks, it returns `None`.
+**Data flow**: It receives a list of candidate executable names. For each name, it asks the operating system search helper to resolve it from PATH. If a path is found, it runs a small availability test. If the test succeeds, it converts the path into the project’s absolute-path type and returns it. If no candidate passes all checks, it returns nothing.
 
-**Call relations**: Both executable-discovery entry points delegate to this helper for their PATH fallback or sole lookup path. Its role is to centralize the repeated loop of locate → validate → normalize-to-absolute-path.
+**Call relations**: Both `try_find_powershell_executable_blocking` and `try_find_pwsh_executable_blocking` call this for the common PATH-search behavior. It hands each found path to `is_powershellish_executable_available` before reporting success.
 
 *Call graph*: calls 2 internal fn (is_powershellish_executable_available, from_absolute_path); called by 2 (try_find_powershell_executable_blocking, try_find_pwsh_executable_blocking); 1 external calls (which).
 
@@ -1745,11 +1756,11 @@ fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<Abso
 fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Path) -> bool
 ```
 
-**Purpose**: Verifies that a candidate PowerShell executable can actually be launched and execute a minimal command successfully. It is a runtime health check rather than a mere filesystem existence test.
+**Purpose**: Checks whether a supposed PowerShell executable can actually run a tiny command successfully. This protects callers from using a missing, broken, or unusable shell program.
 
-**Data flow**: It accepts a `&Path`, spawns that executable with `-NoLogo -NoProfile -Command Write-Output ok`, and reads the subprocess result. It maps a successful spawn to `output.status.success()` and returns `false` for spawn failures or unsuccessful exits via `unwrap_or(false)`.
+**Data flow**: It receives a filesystem path. It starts that program with flags that suppress startup extras and asks it to run `Write-Output ok`. If the process starts and exits successfully, it returns true; if starting fails or the command exits with an error, it returns false.
 
-**Call relations**: This helper is called from both discovery paths: directly when validating a `$PSHOME`-derived `pwsh.exe`, and indirectly from the PATH-search loop for every candidate found by `which`. It provides the invariant that any returned executable path has already survived a real invocation.
+**Call relations**: The search helpers call this before accepting a found `powershell.exe` or `pwsh.exe`. It is the final practical test that turns “there is a file at this path” into “this PowerShell-like program is usable.”
 
 *Call graph*: called by 2 (try_find_powershellish_executable_in_path, try_find_pwsh_executable_blocking); 1 external calls (new).
 
@@ -1760,11 +1771,11 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 fn extracts_basic_powershell_command()
 ```
 
-**Purpose**: Checks that a minimal `powershell -Command <script>` argv is recognized and that the script body is returned unchanged.
+**Purpose**: Checks that a simple PowerShell invocation using `-Command` is recognized and that the script text is extracted correctly.
 
-**Data flow**: The test constructs a three-element `Vec<String>`, passes it to `extract_powershell_command`, unwraps the `Option`, and asserts that the extracted script equals `"Write-Host hi"`. It writes no persistent state beyond the test assertion outcome.
+**Data flow**: It builds a small command list for `powershell -Command "Write-Host hi"`. It passes that list to `extract_powershell_command`, unwraps the result, and verifies that the returned script is exactly `Write-Host hi`.
 
-**Call relations**: This test directly exercises the happy-path branch of `extract_powershell_command`, serving as the baseline wrapper shape against which stricter flag handling is understood.
+**Call relations**: This test exercises the main successful path through `extract_powershell_command`. It gives confidence that the most basic wrapper form works before more unusual flag combinations are tested.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); 2 external calls (assert_eq!, vec!).
 
@@ -1775,11 +1786,11 @@ fn extracts_basic_powershell_command()
 fn extracts_lowercase_flags()
 ```
 
-**Purpose**: Verifies that lowercase PowerShell flags are accepted, confirming case-insensitive handling of wrapper options.
+**Purpose**: Checks that lowercase PowerShell flags are accepted. This matters because users and tools may write flags with different capitalization.
 
-**Data flow**: It builds argv using `-nologo` and `-command`, calls `extract_powershell_command`, unwraps the result, and asserts that the script payload is preserved. The only output is the pass/fail assertion.
+**Data flow**: It builds a command list using `-nologo` and `-command`. It sends that list to `extract_powershell_command` and checks that the script body still comes back as `Write-Host hi`.
 
-**Call relations**: This test targets the flag-normalization path inside `extract_powershell_command`, specifically the lowercase membership check and case-insensitive command-flag recognition.
+**Call relations**: This test calls `extract_powershell_command` to confirm that flag matching is case-insensitive for supported flags. It covers a common variation of the same command shape.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); 2 external calls (assert_eq!, vec!).
 
@@ -1790,11 +1801,11 @@ fn extracts_lowercase_flags()
 fn extracts_full_path_powershell_command()
 ```
 
-**Purpose**: Confirms that wrapper recognition works when argv[0] is a full filesystem path to `powershell.exe`, not just a bare executable name.
+**Purpose**: Checks that PowerShell is recognized even when the command uses a full filesystem path instead of just `powershell`. This is important because programs often launch shells by absolute path.
 
-**Data flow**: It chooses a Windows or Unix-style full path string based on `cfg!(windows)`, constructs argv with `-Command`, calls `extract_powershell_command`, and asserts that the extracted script matches the input script. No external state is modified.
+**Data flow**: It chooses a Windows-style full path on Windows and a Unix-style test path elsewhere. It builds a command list with that path, `-Command`, and a script, then asks `extract_powershell_command` to extract the script. The test passes only if the script is returned unchanged.
 
-**Call relations**: This test validates the interaction between `extract_powershell_command` and shell detection, proving that `detect_shell_type(PathBuf::from(shell))` accepts full-path PowerShell executables.
+**Call relations**: This test calls `extract_powershell_command` and depends on shell-type detection accepting full paths. It proves the extraction logic is not limited to bare executable names.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); 3 external calls (assert_eq!, cfg!, vec!).
 
@@ -1805,11 +1816,11 @@ fn extracts_full_path_powershell_command()
 fn extracts_with_noprofile_and_alias()
 ```
 
-**Purpose**: Checks that `pwsh` plus `-NoProfile` and the short `-c` alias are accepted as a valid PowerShell wrapper.
+**Purpose**: Checks that the parser accepts a common extra flag, `-NoProfile`, and the short `-c` alias for `-Command`. This matches how PowerShell is often invoked by automation tools.
 
-**Data flow**: It creates argv for `pwsh -NoProfile -c <script>`, invokes `extract_powershell_command`, unwraps the result, and asserts that the script body is exactly the pipeline string supplied. The test only emits assertion success/failure.
+**Data flow**: It builds a `pwsh` command with `-NoProfile`, `-c`, and a pipeline script. It sends the list to `extract_powershell_command` and verifies that the whole script after `-c` is returned.
 
-**Call relations**: This test covers the alternate executable and short command-flag branch of `extract_powershell_command`, complementing the basic `powershell -Command` case.
+**Call relations**: This test calls `extract_powershell_command` to cover a realistic PowerShell Core invocation. It complements the simpler tests by showing that accepted flags before the command body do not block extraction.
 
 *Call graph*: calls 1 internal fn (extract_powershell_command); 2 external calls (assert_eq!, vec!).
 
@@ -1820,11 +1831,11 @@ fn extracts_with_noprofile_and_alias()
 fn prefixes_powershell_command_with_best_effort_utf8()
 ```
 
-**Purpose**: Ensures that recognized PowerShell commands are rewritten so the script begins with the UTF-8 output prefix.
+**Purpose**: Checks that PowerShell scripts are prefixed with the UTF-8 output setup when they do not already have it. This protects command output from avoidable character-encoding problems.
 
-**Data flow**: It constructs a simple PowerShell argv, passes it to `prefix_powershell_script_with_utf8`, and asserts that the returned vector matches the original executable and flags with the final script replaced by `UTF8_OUTPUT_PREFIX` plus the original script. The test has no side effects beyond assertion.
+**Data flow**: It builds a normal PowerShell command whose script is `Write-Host hi`. It passes the command to `prefix_powershell_script_with_utf8` and checks that the returned command is the same except that the script now starts with the UTF-8 prefix.
 
-**Call relations**: This test exercises the successful rewrite path of `prefix_powershell_script_with_utf8`, demonstrating how that function transforms only the script argument after wrapper extraction succeeds.
+**Call relations**: This test calls `prefix_powershell_script_with_utf8`, which in turn relies on PowerShell extraction before changing the script. It verifies the behavior used by command-running code before launching PowerShell.
 
 *Call graph*: calls 1 internal fn (prefix_powershell_script_with_utf8); 2 external calls (assert_eq!, vec!).
 
@@ -1835,11 +1846,11 @@ fn prefixes_powershell_command_with_best_effort_utf8()
 fn does_not_duplicate_utf8_prefix()
 ```
 
-**Purpose**: Verifies idempotence of UTF-8 prefix insertion when the script already starts with the exact prefix string.
+**Purpose**: Checks that the UTF-8 setup text is not added twice. This keeps repeated preparation steps from growing the script or changing it unnecessarily.
 
-**Data flow**: It builds argv whose script is already `UTF8_OUTPUT_PREFIX` followed by a command, calls `prefix_powershell_script_with_utf8`, and asserts that the returned vector is byte-for-byte equal to the original input vector. No external state is touched.
+**Data flow**: It builds a PowerShell command whose script already begins with the UTF-8 prefix. It compares the result of the prefixing behavior with the original command and expects them to be identical.
 
-**Call relations**: This test targets the branch in `prefix_powershell_script_with_utf8` that checks `trim_start()` and skips rewriting when the prefix is already present.
+**Call relations**: This test protects the idempotent behavior of the UTF-8 prefixing path: applying the preparation more than once should have the same effect as applying it once. It sits alongside the test that confirms the prefix is added when missing.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1850,11 +1861,11 @@ fn does_not_duplicate_utf8_prefix()
 fn parses_plain_powershell_commands()
 ```
 
-**Purpose**: On Windows, confirms that a simple PowerShell script body like `echo hi` is parsed into a single plain argv command.
+**Purpose**: Checks that a simple PowerShell script can be unwrapped and converted into a plain command list. This test runs only on Windows, where the PowerShell parser behavior is expected.
 
-**Data flow**: It passes a `powershell.exe -NoProfile -Command "echo hi"` argv slice into `parse_powershell_command_into_plain_commands`, unwraps the returned nested vector, and asserts equality with `[["echo", "hi"]]`. The test only records assertion success/failure.
+**Data flow**: It passes a `powershell.exe -NoProfile -Command "echo hi"` command to `parse_powershell_command_into_plain_commands`. It expects to get one plain command back: `echo` with the argument `hi`.
 
-**Call relations**: This test exercises the full wrapper-unwrapping path into `try_parse_powershell_ast_commands`, proving that `parse_powershell_command_into_plain_commands` delegates correctly for a trivial script.
+**Call relations**: This test calls `parse_powershell_command_into_plain_commands`, which first extracts the script and then delegates to the PowerShell script parser. It verifies the simple case used by execution-policy code.
 
 *Call graph*: calls 1 internal fn (parse_powershell_command_into_plain_commands); 1 external calls (assert_eq!).
 
@@ -1865,22 +1876,26 @@ fn parses_plain_powershell_commands()
 fn parses_multiple_plain_powershell_commands()
 ```
 
-**Purpose**: On Windows, verifies that a piped PowerShell script is decomposed into multiple plain command vectors in pipeline order.
+**Purpose**: Checks that a PowerShell pipeline can be turned into multiple plain command entries. This matters because a script may run more than one command connected by a pipe.
 
-**Data flow**: It invokes `parse_powershell_command_into_plain_commands` with a wrapper around `Write-Output foo | Measure-Object`, unwraps the result, and asserts that the returned nested vector contains one argv for `Write-Output foo` and one for `Measure-Object`. No persistent state is changed.
+**Data flow**: It passes a command containing `Write-Output foo | Measure-Object` to `parse_powershell_command_into_plain_commands`. It expects two command lists back: one for `Write-Output foo` and one for `Measure-Object`.
 
-**Call relations**: This test covers the multi-command parsing behavior exposed through `parse_powershell_command_into_plain_commands`, showing that the delegated AST parser can split a pipeline into separate plain commands.
+**Call relations**: This Windows-only test calls `parse_powershell_command_into_plain_commands` to confirm that the parser can expose each stage of a pipeline. That supports policy checks that need to inspect all commands, not just the first one.
 
 *Call graph*: calls 1 internal fn (parse_powershell_command_into_plain_commands); 1 external calls (assert_eq!).
 
 
 ### `core/src/command_canonicalization.rs`
 
-`util` · `approval matching`
+`domain_logic` · `command approval checking`
 
-This file contains a single helper, `canonicalize_command_for_approval`, plus two string constants used as synthetic prefixes for script-shaped commands. The function exists specifically for approval-cache matching: two invocations that are semantically the same should hash to the same approval key even if one uses `/bin/bash -lc` and another uses `bash -lc`, or if PowerShell wrappers differ slightly.
+When the system asks whether a command has already been approved, it needs a fair way to compare commands. Raw command arguments can vary even when the human meaning is the same. For example, `bash -lc "echo hi"` and `/bin/bash -lc "echo hi"` may be the same request in practice, but their raw text differs. This file solves that by creating a “canonical” version, meaning a normalized version used for comparison.
 
-The control flow is intentionally ordered from most precise to most conservative. First, it asks `parse_shell_lc_plain_commands` whether the argv represents a shell `-lc` wrapper around plain tokenizable commands; if exactly one plain command is recovered, that inner token vector becomes the canonical form. This collapses whitespace and wrapper-path differences for simple shell invocations like `bash -lc "cargo   test"`. If that parse fails, it falls back to `extract_bash_command`; for arbitrary shell scripts such as heredocs, it returns a synthetic vector beginning with `__codex_shell_script__`, followed by the shell mode argument and the exact script text. PowerShell wrappers are handled similarly with `__codex_powershell_script__` and the extracted script body. If none of the shell-specific recognizers match, the original argv is returned unchanged. The design deliberately prefers preserving exact script text over risky normalization for complex scripts.
+The main function first looks for simple shell commands that can be safely broken back into their real command words. If there is exactly one plain command inside a shell wrapper, it returns that inner command directly. This makes approval match the actual thing being run, not the wrapper around it.
+
+If the shell script is more complex and cannot safely be reduced to simple command words, the file keeps the script text exactly as written. It adds a special marker such as `__codex_shell_script__` or `__codex_powershell_script__` so that Bash and PowerShell scripts do not accidentally look the same. Think of it like labeling two envelopes before filing them: the contents may both be text, but the label says how that text will be interpreted.
+
+If the command is not recognized as one of these shell forms, it is returned unchanged.
 
 #### Function details
 
@@ -1890,11 +1905,11 @@ The control flow is intentionally ordered from most precise to most conservative
 fn canonicalize_command_for_approval(command: &[String]) -> Vec<String>
 ```
 
-**Purpose**: Converts a command argv slice into a stable canonical vector suitable for approval-cache comparisons. It collapses simple shell wrappers to their inner command tokens and otherwise emits synthetic script keys for bash-like and PowerShell script wrappers.
+**Purpose**: This function converts a command’s argument list into the form used for approval-cache matching. It tries to ignore harmless wrapper differences while preserving the exact script text when simplifying it would be unsafe.
 
-**Data flow**: Takes `&[String]` command argv → first tries `parse_shell_lc_plain_commands`; if it yields exactly one plain command, returns that cloned token vector → else tries `extract_bash_command` and returns `["__codex_shell_script__", shell_mode, script]` → else tries `extract_powershell_command` and returns `["__codex_powershell_script__", script]` → otherwise clones and returns the original argv.
+**Data flow**: It receives a list of command words, such as the program name and its arguments. First it asks `parse_shell_lc_plain_commands` whether this is a simple shell wrapper around one plain command; if so, it returns that inner command. If not, it asks `extract_bash_command` whether the input is a Bash-style shell script; if it is, it returns a new list with a Bash marker, the shell mode, and the exact script text. If that also does not match, it asks `extract_powershell_command` whether it is a PowerShell script; if so, it returns a PowerShell marker plus the exact script text. If none of those checks apply, it returns a copy of the original command unchanged.
 
-**Call relations**: This helper is called by approval-related code that needs stable cache keys across wrapper-path and shell-launch variations, and it delegates parsing/extraction to the shell-command utility crate.
+**Call relations**: This function sits in the approval path as the normalizer before commands are compared with cached approval decisions. It delegates the shell-specific detective work to `parse_shell_lc_plain_commands`, `extract_bash_command`, and `extract_powershell_command`; after those helpers identify the command shape, this function decides what stable command list should be handed back for matching.
 
 *Call graph*: calls 3 internal fn (extract_bash_command, parse_shell_lc_plain_commands, extract_powershell_command); 1 external calls (vec!).
 
@@ -1903,11 +1918,11 @@ fn canonicalize_command_for_approval(command: &[String]) -> Vec<String>
 
 `domain_logic` · `request handling`
 
-This file is the core command summarizer for the shell-command crate. Its output type is `codex_protocol::parse_command::ParsedCommand`, and nearly all logic exists to infer one of a few semantic categories from a raw `&[String]` token vector or from a shell script embedded in `bash -c/-lc`, `zsh -c/-lc`, or PowerShell wrappers. The parser first peels off shell wrappers (`extract_bash_command`, `extract_powershell_command`), then either parses a shell AST via `try_parse_shell`/`try_parse_word_only_commands_sequence` or falls back to token-based heuristics.
+Commands produced by an AI or typed by a user can be messy: they may be wrapped in bash, chained with pipes, or include helper tools like `head`, `sed`, or `wc`. This file is the project’s translator. It looks at a command and tries to say, in plain terms, “this searches for TODO in src” or “this reads README.md.” Without it, the rest of the system would have to show raw shell text more often, which is harder for users to review and approve.
 
-The main heuristics classify commands like `rg`, `grep`, `git grep`, `fd`, `find`, `ls`/`tree`/`du`, `cat`/`bat`/`less`/`more`, `head`/`tail`, `awk`, `sed -n`, `nl`, and Python `-c` snippets that enumerate files. It tracks `cd` segments across command sequences so `Read` paths become relative to the effective working directory, using `join_paths` and `PathBuf`. It also strips or ignores formatting-only pipeline helpers (`head`, `tail`, `wc`, `cut`, `sort`, `uniq`, `printf`, non-mutating `xargs`, etc.), removes trivial commands like `true`, and repeatedly simplifies parsed sequences with `simplify_once`.
+The parser works like a cautious reader. First it unwraps shell launchers such as `bash -lc` or PowerShell `-Command`, so it can inspect the real script. Then it splits command chains and pipelines into pieces, tracks simple `cd` directory changes, and removes small formatting helpers that do not change the main intent. For example, `rg --files | head -n 40` is summarized as listing files, not as running `head`.
 
-Two important invariants shape the final result: consecutive duplicate summaries are deduplicated, and if any parsed segment remains `ParsedCommand::Unknown`, the whole command collapses to a single `Unknown` summary built from the shell script or joined tokens. The large inline test module documents many edge cases: quoted patterns, Windows paths, `--flag=value` handling, `sed -n` range detection, mutating `xargs perl -pi`, and preserving grep queries without shortening slash-containing patterns.
+It recognizes many familiar tools: `rg`, `grep`, `git grep`, `find`, `fd`, `ls`, `cat`, `sed -n`, `head`, `tail`, `bat`, and more. When any part looks unclear or potentially mutating, it prefers an `Unknown` summary rather than pretending to understand. The large test block documents many edge cases and protects this delicate behavior.
 
 #### Function details
 
@@ -1917,11 +1932,11 @@ Two important invariants shape the final result: consecutive duplicate summaries
 fn shlex_join(tokens: &[String]) -> String
 ```
 
-**Purpose**: Joins a token slice back into a shell-escaped command string suitable for display in summaries. It provides a stable fallback string when joining fails because a token contains a NUL byte.
+**Purpose**: Turns a list of command words back into one shell-looking command string. It quotes words when needed so the display is close to what a user would type.
 
-**Data flow**: Takes `&[String]`, maps each token to `&str`, and feeds them to `shlex::try_join`. On success it returns the escaped command string; on error it returns the literal placeholder `"<command included NUL byte>"`. It does not mutate external state.
+**Data flow**: It receives command tokens → asks the shell-quoting library to join them safely → returns the joined command text, or a clear placeholder if a token contains a NUL byte that cannot be represented normally.
 
-**Call relations**: This is the common rendering primitive used throughout parsing and by external event-building code whenever a tokenized command must be shown to users. Parsing helpers call it when constructing `ParsedCommand::{Unknown,Search,ListFiles,Read}` so summaries preserve quoting and spacing.
+**Call relations**: Many higher-level UI and execution paths call this when they need to show a command to a user. Inside this file, parsing helpers also use it to store the original command text in `ParsedCommand` summaries.
 
 *Call graph*: called by 16 (build_command_execution_approval_request_item, build_command_execution_begin_item, build_command_execution_end_item, build_item_from_guardian_event, apply_bespoke_event_handling, command_assessment_action, handle_call, prompt, execve_permission_request_hook_short_circuits_prompt, parse_grep_like (+6 more)); 1 external calls (try_join).
 
@@ -1932,11 +1947,11 @@ fn shlex_join(tokens: &[String]) -> String
 fn extract_shell_command(command: &[String]) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Detects whether a tokenized command is really a shell wrapper and, if so, extracts the wrapped script text. It supports both Bash-compatible wrappers and PowerShell wrappers.
+**Purpose**: Finds the actual script inside a shell wrapper, whether the wrapper is Bash-like or PowerShell-like. This lets the parser focus on the command being run instead of the program used to launch it.
 
-**Data flow**: Consumes `&[String]` and first queries Bash extraction; if that returns `None`, it tries PowerShell extraction. It returns `Option<(&str, &str)>`, where the tuple contains the shell executable and the embedded script string.
+**Data flow**: It receives the full command argument list → first asks the Bash extractor, then the PowerShell extractor → returns the shell name and inner script if either format matches.
 
-**Call relations**: It is used when building a single fallback `Unknown` summary so the displayed command is the inner script rather than the outer shell invocation. Other code that strips shell wrappers relies on this helper to unify Bash and PowerShell detection.
+**Call relations**: When the parser gives up, `single_unknown_for_command` uses this to show only the inner script instead of noisy wrapper arguments. Other code also uses it when it needs to strip shell wrappers for display.
 
 *Call graph*: calls 1 internal fn (extract_bash_command); called by 2 (single_unknown_for_command, strip_bash_lc_and_escape).
 
@@ -1947,11 +1962,11 @@ fn extract_shell_command(command: &[String]) -> Option<(&str, &str)>
 fn parse_command(command: &[String]) -> Vec<ParsedCommand>
 ```
 
-**Purpose**: Provides the public, user-facing parse entrypoint that normalizes the lower-level parse result into a concise summary list. It removes consecutive duplicates and collapses any partially understood command sequence into one `Unknown` summary.
+**Purpose**: This is the public entry point for turning raw command arguments into one or more readable command summaries. It also avoids misleading partial summaries by collapsing the result to one `Unknown` if anything important could not be understood.
 
-**Data flow**: Accepts a tokenized command slice, delegates to `parse_command_impl`, then iterates through the returned `Vec<ParsedCommand>` to drop adjacent duplicates. If any remaining element is `ParsedCommand::Unknown`, it discards the detailed list and returns a one-element vector from `single_unknown_for_command`; otherwise it returns the deduplicated vector.
+**Data flow**: It receives a tokenized command → delegates detailed parsing to `parse_command_impl` → removes consecutive duplicate summaries → if any summary is unknown, replaces everything with one unknown summary for the whole command; otherwise returns the cleaned summaries.
 
-**Call relations**: Higher-level execution, approval, and UI code calls this function when it needs a safe summary for arbitrary commands. It sits above `parse_command_impl` specifically to enforce the conservative rule that mixed known/unknown pipelines should be presented as wholly unknown.
+**Call relations**: Execution, approval, shell, and test code call this before showing command intent to users. It sits above all the detailed helpers and applies the final safety rule.
 
 *Call graph*: calls 1 internal fn (parse_command_impl); called by 10 (build_item_from_guardian_event, request_command_approval, execute_user_shell_command, shell, unified_exec, create_expected_elicitation_request_params, assert_parsed, supports_tail_n_last_lines, exec_end_without_begin_uses_event_command, begin_exec_with_source); 2 external calls (with_capacity, vec!).
 
@@ -1962,11 +1977,11 @@ fn parse_command(command: &[String]) -> Vec<ParsedCommand>
 fn single_unknown_for_command(command: &[String]) -> ParsedCommand
 ```
 
-**Purpose**: Builds the canonical fallback `ParsedCommand::Unknown` for a command that could not be summarized safely. It prefers the inner shell script text over the outer wrapper invocation.
+**Purpose**: Builds one safe fallback summary for a command the parser cannot confidently explain. It tries to display the most useful version of the command text.
 
-**Data flow**: Reads the original `&[String]` command. If `extract_shell_command` finds an embedded script, it returns `ParsedCommand::Unknown { cmd: script.to_string() }`; otherwise it joins the original tokens with `shlex_join` and stores that string in the `cmd` field.
+**Data flow**: It receives the original command tokens → if they contain a shell wrapper, extracts the inner script → otherwise joins the tokens with shell quoting → returns a `ParsedCommand::Unknown` containing that text.
 
-**Call relations**: This helper is only used by `parse_command` after the lower-level parser produced at least one unknown segment. Its role is to replace a potentially misleading partial parse with a single opaque summary.
+**Call relations**: Only `parse_command` calls this after it detects an unknown piece in the parsed output. It relies on `extract_shell_command` and `shlex_join` to choose readable fallback text.
 
 *Call graph*: calls 2 internal fn (extract_shell_command, shlex_join).
 
@@ -1977,11 +1992,11 @@ fn single_unknown_for_command(command: &[String]) -> ParsedCommand
 fn shlex_split_safe(s: &str) -> Vec<String>
 ```
 
-**Purpose**: Test-only helper that tokenizes a shell command string while tolerating malformed quoting. It keeps tests concise by always returning a `Vec<String>`.
+**Purpose**: Provides a forgiving way for tests to turn a command string into tokens. If shell-style splitting fails, it falls back to simple whitespace splitting so the test can still run.
 
-**Data flow**: Takes `&str`, tries `shlex::split`, and if parsing fails falls back to `split_whitespace()` with `ToString`. It returns the resulting token vector and touches no shared state.
+**Data flow**: It receives a command string → tries shell-aware splitting → returns tokens from that split, or tokens split on whitespace if the shell parser rejects the string.
 
-**Call relations**: Many tests use this helper to build token arrays from inline shell snippets without having to care whether the snippet is perfectly shell-quoted.
+**Call relations**: Many tests use this helper to build realistic token lists before calling `assert_parsed` or `parse_command`.
 
 *Call graph*: 1 external calls (split).
 
@@ -1992,11 +2007,11 @@ fn shlex_split_safe(s: &str) -> Vec<String>
 fn vec_str(args: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts a borrowed string slice into owned `String` tokens for tests. It avoids repetitive `to_string()` calls in assertions.
+**Purpose**: Makes test command arguments easier to write by converting string slices into owned strings. It keeps test cases short and readable.
 
-**Data flow**: Maps each `&str` in the input slice to `String` and collects into `Vec<String>`. It has no side effects.
+**Data flow**: It receives a list of string references → copies each one into a `String` → returns a vector of strings.
 
-**Call relations**: Used by tests that want exact token vectors, especially for shell-wrapper forms like `bash -lc <script>`.
+**Call relations**: Most tests that already know the exact argument boundaries use this helper before calling `assert_parsed`.
 
 
 ##### `tests::assert_parsed`  (lines 79–82)
@@ -2005,11 +2020,11 @@ fn vec_str(args: &[&str]) -> Vec<String>
 fn assert_parsed(args: &[String], expected: Vec<ParsedCommand>)
 ```
 
-**Purpose**: Central test assertion helper that compares parser output against an expected `Vec<ParsedCommand>`. It keeps individual tests focused on the scenario rather than boilerplate.
+**Purpose**: Checks that the parser returns exactly the expected command summary. It is the main assertion helper for the test suite.
 
-**Data flow**: Accepts tokenized arguments and an expected parsed vector, calls `parse_command`, and asserts equality with `pretty_assertions::assert_eq!`. It returns unit and writes only to the test assertion machinery.
+**Data flow**: It receives input tokens and expected parsed commands → runs `parse_command` → compares the actual output with the expected output.
 
-**Call relations**: Nearly every scenario test delegates through this helper so all parser expectations flow through the public `parse_command` API.
+**Call relations**: Nearly every parser behavior test goes through this helper, so failures point to a mismatch in user-visible summaries.
 
 *Call graph*: calls 1 internal fn (parse_command); 1 external calls (assert_eq!).
 
@@ -2020,11 +2035,11 @@ fn assert_parsed(args: &[String], expected: Vec<ParsedCommand>)
 fn git_status_is_unknown()
 ```
 
-**Purpose**: Verifies that unsupported Git subcommands such as `git status` remain opaque rather than being misclassified.
+**Purpose**: Verifies that a plain `git status` command is not over-interpreted. The parser should only summarize command types it understands well.
 
-**Data flow**: Builds `['git','status']`, passes it through `assert_parsed`, and expects a single `ParsedCommand::Unknown` with `cmd` equal to `git status`.
+**Data flow**: It builds tokens for `git status` → parses them → expects one unknown summary containing the original command.
 
-**Call relations**: This test exercises the `summarize_main_tokens` Git branch's fallback path through the public parser.
+**Call relations**: This test uses `vec_str` and `assert_parsed` to protect the parser’s conservative fallback behavior.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2035,11 +2050,11 @@ fn git_status_is_unknown()
 fn supports_git_grep_and_ls_files()
 ```
 
-**Purpose**: Checks that supported Git subcommands are recognized as search and file-list operations, including variants with flags and optional paths.
+**Purpose**: Checks that common Git discovery commands are recognized. `git grep` should become a search, and `git ls-files` should become a file listing.
 
-**Data flow**: Creates several tokenized `git grep` and `git ls-files` commands, runs them through `assert_parsed`, and compares against `ParsedCommand::Search` or `ParsedCommand::ListFiles` values with concrete `query` and `path` fields.
+**Data flow**: It turns several Git command strings into tokens → parses each → expects search or list summaries with query and path details where available.
 
-**Call relations**: It validates the specialized Git handling inside `summarize_main_tokens`, including delegation to `parse_grep_like` for `git grep`.
+**Call relations**: These cases exercise the `git` branch inside `summarize_main_tokens`, through the normal public `parse_command` route.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2050,11 +2065,11 @@ fn supports_git_grep_and_ls_files()
 fn handles_git_pipe_wc()
 ```
 
-**Purpose**: Ensures that a shell script containing an unsupported command piped into a formatting helper collapses to a single unknown summary.
+**Purpose**: Ensures a pipeline containing an unsupported Git command is not partly summarized as something safer than it is. `git status | wc -l` remains unknown.
 
-**Data flow**: Wraps `git status | wc -l` in `bash -lc`, parses it, and expects one `Unknown` containing the inner script text.
+**Data flow**: It wraps a pipeline in `bash -lc` → parses it → expects one unknown summary for the inner script.
 
-**Call relations**: This test covers shell-wrapper extraction, shell-script parsing, formatting-helper dropping, and the top-level unknown-collapse behavior.
+**Call relations**: This test protects the rule in `parse_command` that unknown pieces collapse the whole command to a single unknown summary.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2065,11 +2080,11 @@ fn handles_git_pipe_wc()
 fn bash_lc_redirect_not_quoted()
 ```
 
-**Purpose**: Confirms that shell redirection syntax inside `bash -lc` is not incorrectly summarized as a known operation.
+**Purpose**: Checks that a Bash command with output redirection is shown plainly when unknown. This avoids odd quoting in user-facing text.
 
-**Data flow**: Parses `bash -lc 'echo foo > bar'` and expects `ParsedCommand::Unknown { cmd: 'echo foo > bar' }`.
+**Data flow**: It passes `echo foo > bar` through a Bash wrapper → parses it → expects an unknown summary with the inner script as written.
 
-**Call relations**: It exercises the shell-script path where parsing succeeds enough to preserve the script text but no known command pattern matches.
+**Call relations**: This exercises shell extraction and fallback display through `assert_parsed`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2080,11 +2095,11 @@ fn bash_lc_redirect_not_quoted()
 fn handles_complex_bash_command_head()
 ```
 
-**Purpose**: Checks that a long compound shell script with multiple connectors and pipelines remains unknown when it cannot be safely reduced to one semantic action.
+**Purpose**: Confirms that a long mixed Bash script is not simplified into misleading pieces. Version checks and pipelines together are treated as unknown.
 
-**Data flow**: Builds a multi-command `bash -lc` script, parses it, and asserts a single `Unknown` containing the full script.
+**Data flow**: It builds a Bash-wrapped script with several commands → parses it → expects one unknown summary for the full script.
 
-**Call relations**: This validates the conservative behavior of `parse_shell_script` and `parse_command` when many heterogeneous commands appear.
+**Call relations**: This guards the cautious behavior of `parse_shell_script` and the final unknown-collapse rule.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2095,11 +2110,11 @@ fn handles_complex_bash_command_head()
 fn supports_searching_for_navigate_to_route() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that quoted ripgrep patterns inside a shell wrapper are normalized into a `Search` summary with the expected query.
+**Purpose**: Checks that a quoted ripgrep search term is captured correctly. The user should see the search query without extra quote noise.
 
-**Data flow**: Parses `bash -lc 'rg -n "navigate-to-route" -S'` and expects `ParsedCommand::Search` with `query: Some("navigate-to-route")` and no path.
+**Data flow**: It passes `rg -n "navigate-to-route" -S` through Bash → parses it → expects a search summary with that query and no path.
 
-**Call relations**: It exercises shell unwrapping plus the ripgrep branch in `summarize_main_tokens`.
+**Call relations**: This flows through Bash extraction, shell parsing, and the `rg` logic in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2110,11 +2125,11 @@ fn supports_searching_for_navigate_to_route() -> anyhow::Result<()>
 fn handles_complex_bash_command()
 ```
 
-**Purpose**: Ensures a pipeline whose primary stage is a recognizable search command still summarizes as that search even when followed by formatting helpers.
+**Purpose**: Ensures a search piped into `head` is summarized as the search, not as the formatting step. This matches the user’s real intent.
 
-**Data flow**: Parses `bash -lc 'rg -n "BUG|FIXME|TODO|XXX|HACK" -S | head -n 200'` and expects a single `Search` for the regex pattern.
+**Data flow**: It parses a Bash script with `rg` followed by `head` → removes the formatting helper → expects a search summary with the regex query.
 
-**Call relations**: This covers `drop_small_formatting_commands` and the rule that formatting-only pipeline stages should not obscure the main command.
+**Call relations**: This test depends on `parse_shell_script` and `drop_small_formatting_commands` working together.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2125,11 +2140,11 @@ fn handles_complex_bash_command()
 fn supports_rg_files_with_path_and_pipe()
 ```
 
-**Purpose**: Checks that `rg --files` with a path remains a file-list summary even when piped into another command.
+**Purpose**: Verifies that `rg --files` with a path is still recognized when piped to another helper. The parser should preserve the useful directory hint.
 
-**Data flow**: Parses `bash -lc 'rg --files webview/src | sed -n'` and expects `ListFiles` with path shortened to `webview`.
+**Data flow**: It parses `rg --files webview/src | sed -n` → focuses on the file-listing command → expects a list summary with a shortened path of `webview`.
 
-**Call relations**: It validates path shortening and formatting-helper removal in shell-script parsing.
+**Call relations**: This exercises pipeline filtering and `short_display_path` through the main parser.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2140,11 +2155,11 @@ fn supports_rg_files_with_path_and_pipe()
 fn supports_rg_files_then_head()
 ```
 
-**Purpose**: Verifies that `head` after `rg --files` is treated as a formatting helper and omitted from the summary.
+**Purpose**: Checks that limiting file-list output with `head` does not hide the main action. The command is still a file listing.
 
-**Data flow**: Parses `bash -lc 'rg --files | head -n 50'` and expects a single `ListFiles` for `rg --files`.
+**Data flow**: It parses a Bash pipeline `rg --files | head -n 50` → drops `head` as a formatting helper → expects a list-files summary.
 
-**Call relations**: This specifically exercises `is_small_formatting_command` for `head` and the shell-script filtering pipeline.
+**Call relations**: This protects `is_small_formatting_command` behavior as used by `parse_shell_script`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2155,11 +2170,11 @@ fn supports_rg_files_then_head()
 fn keeps_mutating_xargs_pipeline()
 ```
 
-**Purpose**: Ensures that a pipeline ending in mutating `xargs perl -pi` is not dropped as harmless formatting and therefore remains unknown.
+**Purpose**: Ensures a pipeline that edits files through `xargs perl -pi` is not summarized as a harmless search. Mutating commands must remain unknown.
 
-**Data flow**: Parses a `bash -lc` pipeline from `rg -l ... | xargs perl -pi -e ...` and expects one `Unknown` containing the full script.
+**Data flow**: It parses a Bash pipeline from `rg -l` into an in-place Perl replacement → detects the unsafe later stage → expects one unknown summary.
 
-**Call relations**: It validates `is_mutating_xargs_command` and the distinction between formatting helpers and state-changing commands.
+**Call relations**: This guards the `xargs` mutation detection used when deciding whether a pipeline helper can be dropped.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2170,11 +2185,11 @@ fn keeps_mutating_xargs_pipeline()
 fn collapses_plain_pipeline_when_any_stage_is_unknown()
 ```
 
-**Purpose**: Checks the public parser's rule that a mixed pipeline with any unknown stage collapses to one unknown summary.
+**Purpose**: Checks that an ordinary tokenized pipeline with an unknown or mutating stage collapses to unknown. This prevents partial, misleading summaries.
 
-**Data flow**: Tokenizes a plain pipeline with `rg -l ... | xargs perl -pi ...`, parses it through `parse_command`, and expects `Unknown` with `cmd` equal to `shlex_join(&command)`.
+**Data flow**: It tokenizes a search piped into in-place replacement → parses it → expects one unknown summary for the whole joined command.
 
-**Call relations**: This test targets the top-level `parse_command` post-processing rather than shell-script parsing.
+**Call relations**: This tests `parse_command_impl` plus the top-level unknown-collapse rule in `parse_command`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2185,11 +2200,11 @@ fn collapses_plain_pipeline_when_any_stage_is_unknown()
 fn collapses_pipeline_with_helper_when_later_stage_is_unknown()
 ```
 
-**Purpose**: Verifies that even if an early stage is known and an intermediate stage is a helper, a later unknown stage forces the whole pipeline to become unknown.
+**Purpose**: Verifies that a known command followed by helpers and then an unknown command is not summarized as only the known first command.
 
-**Data flow**: Parses `rg --files | nl -ba | foo` and expects a single `Unknown` for the whole joined command.
+**Data flow**: It parses `rg --files | nl -ba | foo` → sees an unknown final stage → expects one unknown summary for the whole pipeline.
 
-**Call relations**: It combines helper stripping with the conservative unknown-collapse rule in `parse_command`.
+**Call relations**: This protects the conservative behavior applied after `simplify_once` removes harmless helpers.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2200,11 +2215,11 @@ fn collapses_pipeline_with_helper_when_later_stage_is_unknown()
 fn rg_files_with_matches_flags_are_search()
 ```
 
-**Purpose**: Confirms that ripgrep variants selecting matching or non-matching files are still summarized as searches, not file listings.
+**Purpose**: Checks that ripgrep flags such as `-l` and `--files-with-matches` are treated as searches, not file listings. These flags list matching files, but the user’s action is still searching for text.
 
-**Data flow**: Runs several `rg`/`rga` commands with `-l`, `--files-with-matches`, `-L`, and `--files-without-match`, asserting `Search` outputs with extracted query and path.
+**Data flow**: It parses several `rg` and `rga` commands → extracts query and path operands → expects search summaries.
 
-**Call relations**: This validates the ripgrep branch's distinction between explicit `--files` listing mode and pattern-search modes.
+**Call relations**: These cases exercise the ripgrep branch of `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2215,11 +2230,11 @@ fn rg_files_with_matches_flags_are_search()
 fn supports_cat()
 ```
 
-**Purpose**: Checks that `cat <file>` inside `bash -lc` becomes a `Read` summary with the correct basename and `PathBuf`.
+**Purpose**: Verifies that `cat` of one file is recognized as reading that file. This is one of the most common inspection commands.
 
-**Data flow**: Parses `bash -lc 'cat webview/README.md'` and expects `Read { name: 'README.md', path: PathBuf::from('webview/README.md') }`.
+**Data flow**: It parses `cat webview/README.md` in Bash → extracts the file path and display name → expects a read summary.
 
-**Call relations**: It exercises shell unwrapping and the `cat` branch in `summarize_main_tokens`.
+**Call relations**: This flows through shell extraction and the `cat` branch of `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2230,11 +2245,11 @@ fn supports_cat()
 fn zsh_lc_supports_cat()
 ```
 
-**Purpose**: Verifies that Zsh wrappers are treated like Bash wrappers for simple file reads.
+**Purpose**: Checks that the same file-read recognition works through `zsh -lc`. Bash and zsh wrappers should behave similarly here.
 
-**Data flow**: Parses `zsh -lc 'cat README.md'` and expects a `Read` summary for `README.md`.
+**Data flow**: It parses a zsh-wrapped `cat README.md` → unwraps the script → expects a read summary for README.md.
 
-**Call relations**: This covers `extract_bash_command` support for multiple shell names and the shared shell-script parser.
+**Call relations**: This verifies shell wrapper handling before the normal read-command summarizer runs.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2245,11 +2260,11 @@ fn zsh_lc_supports_cat()
 fn supports_bat()
 ```
 
-**Purpose**: Checks that `bat` with option flags and a single file operand is recognized as a file read.
+**Purpose**: Checks that `bat`, a file viewer, is treated as reading a file even when display options are present.
 
-**Data flow**: Parses `bash -lc 'bat --theme TwoDark README.md'` and expects `Read` with `README.md`.
+**Data flow**: It parses `bat --theme TwoDark README.md` → skips the theme option and its value → expects a read summary for README.md.
 
-**Call relations**: It validates `single_non_flag_operand` with a command-specific list of flags that consume values.
+**Call relations**: This exercises the `bat` branch of `summarize_main_tokens` and its flag-skipping logic.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2260,11 +2275,11 @@ fn supports_bat()
 fn supports_batcat()
 ```
 
-**Purpose**: Verifies that `batcat` is treated the same as `bat` for file-reading summaries.
+**Purpose**: Verifies support for `batcat`, another name for the `bat` file viewer on some systems.
 
-**Data flow**: Parses `bash -lc 'batcat README.md'` and expects a `Read` summary for that file.
+**Data flow**: It parses `batcat README.md` → identifies the file operand → expects a read summary.
 
-**Call relations**: This exercises the shared `bat`/`batcat` branch in `summarize_main_tokens`.
+**Call relations**: This protects the shared `bat` and `batcat` handling in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2275,11 +2290,11 @@ fn supports_batcat()
 fn supports_less()
 ```
 
-**Purpose**: Checks that `less` with pattern-related flags still resolves to a single file read when exactly one file operand is present.
+**Purpose**: Checks that viewing a file with `less` is summarized as reading the file, while ignoring viewer options.
 
-**Data flow**: Parses `bash -lc 'less -p TODO README.md'` and expects `Read` for `README.md`.
+**Data flow**: It parses `less -p TODO README.md` → skips the search-pattern option and value → expects a read summary for README.md.
 
-**Call relations**: It validates the `less` branch's flag-skipping logic.
+**Call relations**: This tests the `less` branch and `single_non_flag_operand` support.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2290,11 +2305,11 @@ fn supports_less()
 fn supports_more()
 ```
 
-**Purpose**: Ensures `more <file>` is summarized as a file read.
+**Purpose**: Checks that viewing a file with `more` is summarized as reading the file.
 
-**Data flow**: Parses `bash -lc 'more README.md'` and expects `Read` with the file path and basename.
+**Data flow**: It parses `more README.md` → extracts the single file operand → expects a read summary.
 
-**Call relations**: This covers the straightforward `more` branch in `summarize_main_tokens`.
+**Call relations**: This uses the public parser to cover the `more` branch in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2305,11 +2320,11 @@ fn supports_more()
 fn cd_then_cat_is_single_read()
 ```
 
-**Purpose**: Verifies that a leading `cd` updates the effective working directory for a later read command.
+**Purpose**: Verifies that a preceding `cd` changes the reported file path for a later read. The summary should show the effective file location.
 
-**Data flow**: Parses `cd foo && cat foo.txt` and expects a single `Read` whose `path` is `foo/foo.txt` while the displayed `cmd` remains `cat foo.txt`.
+**Data flow**: It parses `cd foo && cat foo.txt` → records `foo` as the current directory → expects a read path of `foo/foo.txt`.
 
-**Call relations**: It exercises `cd_target`, `join_paths`, connector splitting, and the sequence simplification that drops standalone `cd` summaries.
+**Call relations**: This exercises `cd_target`, `join_paths`, and command-chain parsing in `parse_command_impl`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2320,11 +2335,11 @@ fn cd_then_cat_is_single_read()
 fn cd_with_double_dash_then_cat_is_read()
 ```
 
-**Purpose**: Checks that `cd -- <dir>` correctly treats the operand after `--` as the target directory.
+**Purpose**: Checks that `cd -- -weird` is understood as changing into a directory whose name starts with a dash. The double dash means later text is not a flag.
 
-**Data flow**: Parses `cd -- -weird && cat foo.txt` and expects a `Read` with path `-weird/foo.txt`.
+**Data flow**: It parses `cd -- -weird && cat foo.txt` → treats `-weird` as the directory → expects a read path inside that directory.
 
-**Call relations**: This validates `cd_target` handling of `--` and path joining.
+**Call relations**: This protects the special `--` handling in `cd_target`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2335,11 +2350,11 @@ fn cd_with_double_dash_then_cat_is_read()
 fn cd_with_multiple_operands_uses_last()
 ```
 
-**Purpose**: Ensures that when multiple non-flag operands appear in `cd`, the parser uses the last one as the effective target.
+**Purpose**: Documents how the parser handles an unusual `cd` with multiple operands. It uses the last non-flag operand as the target.
 
-**Data flow**: Parses `cd dir1 dir2 && cat foo.txt` and expects the resulting read path to be `dir2/foo.txt`.
+**Data flow**: It parses `cd dir1 dir2 && cat foo.txt` → records `dir2` as the directory → expects the read path under `dir2`.
 
-**Call relations**: It documents the parser's pragmatic `cd_target` heuristic rather than strict shell semantics.
+**Call relations**: This locks in `cd_target` behavior as used by `parse_command_impl`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2350,11 +2365,11 @@ fn cd_with_multiple_operands_uses_last()
 fn bash_cd_then_bar_is_same_as_bar()
 ```
 
-**Purpose**: Checks that a leading `cd` inside a shell wrapper is dropped when followed by an otherwise unknown command.
+**Purpose**: Checks that a leading `cd` inside Bash does not become a separate user-facing summary when followed by an unknown command.
 
-**Data flow**: Parses `bash -lc 'cd foo && bar'` and expects a single `Unknown` for `cd foo && bar`.
+**Data flow**: It parses `bash -lc 'cd foo && bar'` → cannot explain `bar` safely → expects one unknown summary for the script.
 
-**Call relations**: This covers shell-script parsing plus `simplify_once` removal of `cd` summaries when another command follows.
+**Call relations**: This exercises Bash script parsing, `cd` tracking, and unknown fallback together.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2365,11 +2380,11 @@ fn bash_cd_then_bar_is_same_as_bar()
 fn bash_cd_then_cat_is_read()
 ```
 
-**Purpose**: Verifies `cd` path propagation inside `bash -lc` scripts for file reads.
+**Purpose**: Verifies that `cd` inside a Bash script affects a later file read. The read summary should include the changed directory.
 
-**Data flow**: Parses `bash -lc 'cd foo && cat foo.txt'` and expects `Read` with path `foo/foo.txt`.
+**Data flow**: It parses `bash -lc 'cd foo && cat foo.txt'` → records the directory change → expects a read of `foo/foo.txt`.
 
-**Call relations**: It exercises the shell-script path's own `cwd` tracking logic.
+**Call relations**: This covers the `cd` path adjustment path in `parse_shell_script`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2380,11 +2395,11 @@ fn bash_cd_then_cat_is_read()
 fn supports_ls_with_pipe()
 ```
 
-**Purpose**: Ensures `ls` remains a file-list summary even when piped into a formatting command.
+**Purpose**: Checks that listing files with `ls` remains the main summary when its output is piped to `sed` for display.
 
-**Data flow**: Parses `bash -lc 'ls -la | sed -n '1,120p''` and expects `ListFiles { cmd: 'ls -la', path: None }`.
+**Data flow**: It parses `ls -la | sed -n ...` → drops the display-only `sed` stage → expects a list-files summary.
 
-**Call relations**: This validates helper stripping and the `ls` branch in `summarize_main_tokens`.
+**Call relations**: This tests pipeline parsing and small formatting command removal.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2395,11 +2410,11 @@ fn supports_ls_with_pipe()
 fn supports_eza_exa_tree_du()
 ```
 
-**Purpose**: Checks several directory-listing tools and confirms their path extraction and shortening behavior.
+**Purpose**: Verifies that several directory-inspection tools are summarized as file listings. This covers modern `ls` alternatives and size/tree views.
 
-**Data flow**: Parses `eza`, `exa`, `tree`, and `du` examples and asserts `ListFiles` outputs with command strings preserved and paths shortened where appropriate.
+**Data flow**: It parses `eza`, `exa`, `tree`, and `du` examples → extracts useful path operands while skipping options → expects list-file summaries.
 
-**Call relations**: It exercises multiple listing branches and command-specific flag-value skipping.
+**Call relations**: These cases exercise several listing branches in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2410,11 +2425,11 @@ fn supports_eza_exa_tree_du()
 fn supports_head_n()
 ```
 
-**Purpose**: Verifies that `head -n <count> <file>` is treated as reading a file rather than as a formatting helper.
+**Purpose**: Checks that `head -n` with a file is treated as reading that file. Limiting lines does not change the main action.
 
-**Data flow**: Parses `bash -lc 'head -n 50 Cargo.toml'` and expects `Read` for `Cargo.toml`.
+**Data flow**: It parses `head -n 50 Cargo.toml` → skips the line-count option → expects a read summary for Cargo.toml.
 
-**Call relations**: This covers the `head` branch's explicit file-detection logic.
+**Call relations**: This protects the `head` branch in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2425,11 +2440,11 @@ fn supports_head_n()
 fn supports_head_file_only()
 ```
 
-**Purpose**: Checks that `head <file>` without an explicit count still becomes a file read.
+**Purpose**: Verifies that `head` with only a file name is also recognized as a file read.
 
-**Data flow**: Parses `bash -lc 'head Cargo.toml'` and expects `Read` with the file path.
+**Data flow**: It parses `head Cargo.toml` → treats the single operand as the file → expects a read summary.
 
-**Call relations**: It validates the fallback single-operand case in the `head` parser.
+**Call relations**: This tests the simpler path through the `head` summarizer.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2440,11 +2455,11 @@ fn supports_head_file_only()
 fn supports_cat_sed_n()
 ```
 
-**Purpose**: Ensures a `cat` piped into `sed -n` still summarizes as reading the original file.
+**Purpose**: Checks that `cat file | sed -n range` is summarized as reading the file. The line-range filter is only display shaping.
 
-**Data flow**: Parses `bash -lc 'cat tui/Cargo.toml | sed -n '1,200p''` and expects a `Read` for `tui/Cargo.toml` with the full script as `cmd`.
+**Data flow**: It parses the Bash pipeline → identifies the `cat` file read as the meaningful action → expects a read summary for the file.
 
-**Call relations**: This covers the special shell-script rule that preserves the full script text for read pipelines involving `sed -n`.
+**Call relations**: This relies on shell pipeline parsing and formatting-helper removal.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2455,11 +2470,11 @@ fn supports_cat_sed_n()
 fn supports_tail_n_plus()
 ```
 
-**Purpose**: Checks that `tail -n +<offset> <file>` is recognized as a file read.
+**Purpose**: Verifies that `tail -n +N file`, which starts reading at a line offset, is recognized as reading a file.
 
-**Data flow**: Parses `bash -lc 'tail -n +522 README.md'` and expects `Read` for `README.md`.
+**Data flow**: It parses `tail -n +522 README.md` → validates the numeric offset → expects a read summary.
 
-**Call relations**: It validates plus-prefixed numeric parsing in the `tail` branch.
+**Call relations**: This tests the `tail` branch in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2470,11 +2485,11 @@ fn supports_tail_n_plus()
 fn supports_tail_n_last_lines()
 ```
 
-**Purpose**: Verifies the standard `tail -n <count> <file>` case through a direct `parse_command` call.
+**Purpose**: Checks that `tail -n N file`, which reads the last lines, is also summarized as a file read.
 
-**Data flow**: Parses `bash -lc 'tail -n 30 README.md'`, stores the output, and asserts it equals a one-element `Read` vector.
+**Data flow**: It builds a Bash-wrapped tail command → calls `parse_command` directly → compares the result with the expected read summary.
 
-**Call relations**: This test directly exercises the public parser rather than the shared assertion helper.
+**Call relations**: Unlike most tests, it calls `parse_command` and `assert_eq!` directly, but still exercises the public parser path.
 
 *Call graph*: calls 1 internal fn (parse_command); 2 external calls (assert_eq!, vec_str).
 
@@ -2485,11 +2500,11 @@ fn supports_tail_n_last_lines()
 fn supports_tail_file_only()
 ```
 
-**Purpose**: Checks that `tail <file>` without flags is treated as a file read.
+**Purpose**: Verifies that `tail` with only a file name is recognized as reading that file.
 
-**Data flow**: Parses `bash -lc 'tail README.md'` and expects `Read` for that file.
+**Data flow**: It parses `tail README.md` → treats the single operand as the file → expects a read summary.
 
-**Call relations**: It covers the single-operand fallback in the `tail` parser.
+**Call relations**: This covers the simple file-only branch of `summarize_main_tokens` for `tail`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2500,11 +2515,11 @@ fn supports_tail_file_only()
 fn supports_npm_run_build_is_unknown()
 ```
 
-**Purpose**: Ensures unrelated commands like `npm run build` are left as unknown rather than guessed.
+**Purpose**: Checks that build commands are not guessed as reads, searches, or listings. They remain unknown because they can do many things.
 
-**Data flow**: Parses `['npm','run','build']` and expects one `Unknown` with `cmd: 'npm run build'`.
+**Data flow**: It parses `npm run build` → finds no known safe summary shape → expects an unknown summary.
 
-**Call relations**: This validates the default branch in `summarize_main_tokens`.
+**Call relations**: This protects conservative fallback behavior in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2515,11 +2530,11 @@ fn supports_npm_run_build_is_unknown()
 fn supports_grep_recursive_current_dir()
 ```
 
-**Purpose**: Checks recursive grep parsing with a current-directory path operand.
+**Purpose**: Verifies that recursive `grep` over the current directory is summarized as a search with query and path.
 
-**Data flow**: Parses `grep -R CODEX_SANDBOX_ENV_VAR -n .` and expects `Search` with query `CODEX_SANDBOX_ENV_VAR` and path `.`.
+**Data flow**: It parses `grep -R CODEX_SANDBOX_ENV_VAR -n .` → skips flags → expects a search summary for the query in `.`.
 
-**Call relations**: It exercises `parse_grep_like` path and query extraction.
+**Call relations**: This exercises `parse_grep_like` through the `grep` branch.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2530,11 +2545,11 @@ fn supports_grep_recursive_current_dir()
 fn supports_grep_recursive_specific_file()
 ```
 
-**Purpose**: Verifies that grep against a specific file shortens the path to the basename in the summary.
+**Purpose**: Checks that a recursive grep targeting a specific file reports a useful shortened path. The query must stay separate from the file path.
 
-**Data flow**: Parses `grep -R CODEX_SANDBOX_ENV_VAR -n core/src/spawn.rs` and expects `Search` with path `spawn.rs`.
+**Data flow**: It parses a grep command with a file path → extracts the search term and short display path → expects a search summary.
 
-**Call relations**: This covers `short_display_path` as used by `parse_grep_like`.
+**Call relations**: This covers `parse_grep_like` and `short_display_path` together.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2545,11 +2560,11 @@ fn supports_grep_recursive_specific_file()
 fn supports_egrep_and_fgrep()
 ```
 
-**Purpose**: Checks that grep-family aliases are parsed with the same search heuristics.
+**Purpose**: Verifies that `egrep` and `fgrep` are treated like `grep` for search summaries.
 
-**Data flow**: Parses `egrep -R TODO src` and `fgrep -l TODO src`, expecting `Search` summaries with query `TODO` and path `src`.
+**Data flow**: It parses examples using both commands → extracts query and path → expects search summaries.
 
-**Call relations**: It validates the shared grep-like branch in `summarize_main_tokens`.
+**Call relations**: This protects the grep-like command match in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2560,11 +2575,11 @@ fn supports_egrep_and_fgrep()
 fn grep_files_with_matches_flags_are_search()
 ```
 
-**Purpose**: Ensures grep flags that select matching or non-matching files still count as searches.
+**Purpose**: Checks that grep commands which output matching file names are still summarized as searches. The important user intent is finding text.
 
-**Data flow**: Runs several grep variants with `-l`, `--files-with-matches`, `-L`, and `--files-without-match`, asserting `Search` outputs.
+**Data flow**: It parses grep variants with `-l`, `-L`, and long forms → extracts the query and path → expects search summaries.
 
-**Call relations**: This confirms that `parse_grep_like` ignores these flags when extracting the pattern and path.
+**Call relations**: These cases exercise `parse_grep_like` and ensure file-list-looking flags do not change the summary type.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2575,11 +2590,11 @@ fn grep_files_with_matches_flags_are_search()
 fn supports_grep_query_with_slashes_not_shortened()
 ```
 
-**Purpose**: Verifies that grep patterns containing slashes are preserved verbatim and not mistaken for paths.
+**Purpose**: Ensures grep patterns that contain slashes are not mistaken for paths and shortened. A pattern like `src/main.rs` may be literal text.
 
-**Data flow**: Parses `grep -R src/main.rs -n .` and expects `query: Some('src/main.rs')` with path `.`.
+**Data flow**: It parses `grep -R src/main.rs -n .` → preserves the full query string → expects path `.` separately.
 
-**Call relations**: It documents the deliberate design in `parse_grep_like` to shorten only paths, never grep queries.
+**Call relations**: This protects the query-handling rule inside `parse_grep_like`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2590,11 +2605,11 @@ fn supports_grep_query_with_slashes_not_shortened()
 fn supports_grep_weird_backtick_in_query()
 ```
 
-**Purpose**: Checks that unusual grep patterns containing backticks survive quoting and parsing intact.
+**Purpose**: Checks that unusual characters in a grep query are preserved and safely quoted in the displayed command.
 
-**Data flow**: Parses `grep -R COD\`EX_SANDBOX -n` and expects a `Search` whose `cmd` is shell-escaped and whose `query` preserves the backtick.
+**Data flow**: It tokenizes a grep command with a backtick in the query → parses it → expects the query unchanged and the command string safely quoted.
 
-**Call relations**: This exercises `shlex_join` rendering and grep pattern extraction.
+**Call relations**: This exercises `shlex_join` as used by `parse_grep_like`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2605,11 +2620,11 @@ fn supports_grep_weird_backtick_in_query()
 fn supports_cd_and_rg_files()
 ```
 
-**Purpose**: Ensures a leading `cd` does not incorrectly alter a pure `rg --files` summary when no explicit path operand exists.
+**Purpose**: Verifies that a `cd` before `rg --files` does not create a separate summary. The main action remains listing files.
 
-**Data flow**: Parses `cd codex-rs && rg --files` and expects `ListFiles { cmd: 'rg --files', path: None }`.
+**Data flow**: It parses `cd codex-rs && rg --files` → records but does not display the `cd` → expects a list-files summary.
 
-**Call relations**: It validates that `cwd` tracking only rewrites `Read` paths, not listing/search metadata.
+**Call relations**: This tests sequence parsing and `cd` simplification in `parse_command_impl`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2620,11 +2635,11 @@ fn supports_cd_and_rg_files()
 fn supports_single_string_script_with_cd_and_pipe()
 ```
 
-**Purpose**: Checks a realistic shell script combining `cd`, ripgrep search, and `head`, ensuring the search survives with the right path.
+**Purpose**: Checks that a realistic Bash script with `cd`, search, and `head` is summarized as the search. The command’s working directory setup should not obscure intent.
 
-**Data flow**: Parses a `bash -lc` script that changes directory then runs `rg -n "codex_api" codex-rs -S | head -n 50`, expecting a `Search` for query `codex_api` and path `codex-rs`.
+**Data flow**: It parses a Bash-wrapped script → ignores the directory setup and output limiter → expects a search summary with query and path.
 
-**Call relations**: This covers shell-script parsing, helper dropping, and search extraction in one scenario.
+**Call relations**: This exercises `parse_shell_script`, `cd_target`, and formatting-helper filtering.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2635,11 +2650,11 @@ fn supports_single_string_script_with_cd_and_pipe()
 fn supports_python_walks_files()
 ```
 
-**Purpose**: Verifies that Python one-liners using filesystem enumeration APIs are summarized as file listings.
+**Purpose**: Verifies that a Python one-liner which lists directory contents is summarized as listing files. The parser recognizes common filesystem-walking APIs.
 
-**Data flow**: Parses `bash -lc 'python -c "import os; print(os.listdir('.'))"'` and expects `ListFiles` with `cmd` equal to the joined Python command and no path.
+**Data flow**: It parses `python -c` containing `os.listdir` → detects file-walking code → expects a list-files summary.
 
-**Call relations**: It exercises `is_python_command` and `python_walks_files`.
+**Call relations**: This covers `python_walks_files` through the Python branch of `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2650,11 +2665,11 @@ fn supports_python_walks_files()
 fn supports_python3_walks_files()
 ```
 
-**Purpose**: Checks the same file-listing heuristic for `python3` and `glob.glob`.
+**Purpose**: Checks the same file-listing detection for `python3`. Python version names should not change the summary.
 
-**Data flow**: Parses `bash -lc 'python3 -c "import glob; print(glob.glob('*.rs'))"'` and expects `ListFiles`.
+**Data flow**: It parses a `python3 -c` script using `glob.glob` → detects file listing behavior → expects a list-files summary.
 
-**Call relations**: This validates the broader Python executable matching and script-content detection.
+**Call relations**: This tests `is_python_command` and `python_walks_files` together.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2665,11 +2680,11 @@ fn supports_python3_walks_files()
 fn python_without_file_walk_is_unknown()
 ```
 
-**Purpose**: Ensures arbitrary Python snippets are not over-classified as file listings.
+**Purpose**: Ensures arbitrary Python code is not guessed as file listing. Only recognized filesystem-walking snippets get that summary.
 
-**Data flow**: Parses `bash -lc 'python -c "print('hello')"'` and expects `Unknown` with the joined Python command.
+**Data flow**: It parses `python -c "print('hello')"` → finds no file-walking API → expects an unknown summary.
 
-**Call relations**: It covers the negative path of `python_walks_files`.
+**Call relations**: This protects the conservative fallback in the Python branch.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2680,11 +2695,11 @@ fn python_without_file_walk_is_unknown()
 fn small_formatting_always_true_commands()
 ```
 
-**Purpose**: Checks commands that should always be treated as formatting helpers in pipelines.
+**Purpose**: Checks that simple pipeline helpers like `wc`, `tr`, and `sort` are always considered formatting-only. These usually shape output rather than define the main action.
 
-**Data flow**: Builds token vectors for commands like `wc`, `tr`, `cut`, `sort`, `uniq`, `xargs`, `tee`, and `column`, then asserts `is_small_formatting_command` returns true both with and without a dummy flag.
+**Data flow**: It feeds each helper command, with and without a dummy flag, into `is_small_formatting_command` → expects true.
 
-**Call relations**: This directly tests the helper-filtering predicate used by `parse_shell_script`.
+**Call relations**: This directly tests the helper-classification logic used by `drop_small_formatting_commands`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2695,11 +2710,11 @@ fn small_formatting_always_true_commands()
 fn awk_behavior()
 ```
 
-**Purpose**: Verifies that `awk` is considered formatting-only unless it clearly reads a data file.
+**Purpose**: Verifies when `awk` is considered just formatting and when it reads a file. An `awk` script alone is formatting; an `awk` command with a data file is a read.
 
-**Data flow**: Asserts `is_small_formatting_command` is true for `awk '{print $1}'` and false when a file operand or `-f` script file plus data file is present.
+**Data flow**: It checks several `awk` token lists → expects true when no file operand exists and false when a file is present.
 
-**Call relations**: It exercises `awk_data_file_operand` and the `awk` branch of the formatting-helper predicate.
+**Call relations**: This directly covers `awk_data_file_operand` as used by `is_small_formatting_command`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2710,11 +2725,11 @@ fn awk_behavior()
 fn head_behavior()
 ```
 
-**Purpose**: Checks the distinction between `head` as a formatting helper and `head` as a file reader.
+**Purpose**: Checks when `head` is a pipeline helper versus a file read. `head -n 40` alone is formatting, but `head -n 40 file` reads a file.
 
-**Data flow**: Asserts helper status for `head`, `head -n 40`, and non-helper status for `head -n 40 file.txt` and `head file.txt`.
+**Data flow**: It passes several `head` forms into `is_small_formatting_command` → expects true only when there is no explicit file operand.
 
-**Call relations**: This validates the exact shape matching in `is_small_formatting_command` for `head`.
+**Call relations**: This protects the `head` logic used to drop helpers from pipelines.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2725,11 +2740,11 @@ fn head_behavior()
 fn tail_behavior()
 ```
 
-**Purpose**: Verifies the analogous helper-versus-reader distinction for `tail`, including `-n`, `-c`, and `+offset` forms.
+**Purpose**: Checks when `tail` is a formatting helper versus a file read. Counts without a file are helpers; counts with a file are reads.
 
-**Data flow**: Runs several assertions over tokenized `tail` commands, expecting true when no file operand is present and false when a file is explicitly named.
+**Data flow**: It tests several `tail` forms with line and byte counts → expects helper classification only when no file operand appears.
 
-**Call relations**: It tests the `tail` branch of `is_small_formatting_command`.
+**Call relations**: This directly tests the `tail` branch of `is_small_formatting_command`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2740,11 +2755,11 @@ fn tail_behavior()
 fn sed_behavior()
 ```
 
-**Purpose**: Checks that `sed` is treated as formatting-only except for valid `sed -n <range> <file>` read patterns.
+**Purpose**: Verifies that only clear `sed -n range file` forms are treated as file reads. Other `sed` uses stay formatting-only in pipelines.
 
-**Data flow**: Asserts helper status for plain `sed` and invalid range forms, and non-helper status for valid range-plus-file forms including `-e` and `--` variants.
+**Data flow**: It passes several `sed` token lists into `is_small_formatting_command` → expects false for valid range-plus-file forms and true for ambiguous forms.
 
-**Call relations**: This directly validates `sed_read_path` and `is_valid_sed_n_arg` through the formatting predicate.
+**Call relations**: This protects `sed_read_path`, which both classifies helpers and builds read summaries.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2755,11 +2770,11 @@ fn sed_behavior()
 fn empty_tokens_is_not_small()
 ```
 
-**Purpose**: Ensures the formatting-helper predicate rejects empty command vectors.
+**Purpose**: Checks that an empty token list is not classified as a formatting command. Empty input should not look like a real helper.
 
-**Data flow**: Creates an empty `Vec<String>` and asserts `is_small_formatting_command` returns false.
+**Data flow**: It creates an empty vector → passes it to `is_small_formatting_command` → expects false.
 
-**Call relations**: This covers the guard clause at the top of the helper predicate.
+**Call relations**: This guards a boundary case in the formatting-helper classifier.
 
 *Call graph*: 2 external calls (new, assert!).
 
@@ -2770,11 +2785,11 @@ fn empty_tokens_is_not_small()
 fn supports_nl_then_sed_reading()
 ```
 
-**Purpose**: Verifies that `nl <file> | sed -n ...` still summarizes as reading the original file.
+**Purpose**: Verifies that numbering a file with `nl` and then filtering lines with `sed` is summarized as reading the file.
 
-**Data flow**: Parses `bash -lc 'nl -ba core/src/parse_command.rs | sed -n '1200,1720p''` and expects `Read` for `core/src/parse_command.rs`.
+**Data flow**: It parses `nl -ba file | sed -n range` → keeps the `nl` file operand as the meaningful read → expects a read summary.
 
-**Call relations**: It exercises the `nl` read parser plus the shell-script rule that preserves full script text for `sed -n` pipelines.
+**Call relations**: This exercises the `nl` branch in `summarize_main_tokens` and pipeline helper filtering.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2785,11 +2800,11 @@ fn supports_nl_then_sed_reading()
 fn supports_sed_n()
 ```
 
-**Purpose**: Checks direct `sed -n <range> <file>` parsing into a file read summary.
+**Purpose**: Checks that `sed -n range file` is recognized as reading a file. This is a common way to inspect part of a file.
 
-**Data flow**: Parses `bash -lc 'sed -n '2000,2200p' tui/src/history_cell.rs'` and expects `Read` with basename `history_cell.rs` and the full path.
+**Data flow**: It parses a Bash-wrapped `sed -n` command → validates the range expression → expects a read summary.
 
-**Call relations**: This validates `sed_read_path` as used by `summarize_main_tokens`.
+**Call relations**: This covers `sed_read_path` through `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2800,11 +2815,11 @@ fn supports_sed_n()
 fn supports_awk_with_file()
 ```
 
-**Purpose**: Ensures `awk` with a data file operand is summarized as reading that file.
+**Purpose**: Verifies that `awk` with a data file is summarized as reading that file.
 
-**Data flow**: Parses `bash -lc 'awk '{print $1}' Cargo.toml'` and expects `Read` for `Cargo.toml`.
+**Data flow**: It parses `awk '{print $1}' Cargo.toml` → identifies the second non-flag operand as the file → expects a read summary.
 
-**Call relations**: It exercises `awk_data_file_operand` in the main summarizer.
+**Call relations**: This tests `awk_data_file_operand` through the main summarizer.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2815,11 +2830,11 @@ fn supports_awk_with_file()
 fn filters_out_printf()
 ```
 
-**Purpose**: Checks that decorative `printf` stages are dropped so the actual file read remains visible.
+**Purpose**: Checks that banner-printing with `printf` is ignored when followed by a real file read. Decorative output should not become the summary.
 
-**Data flow**: Parses a `bash -lc` script that prints a banner then runs `cat -- ansi-escape/Cargo.toml`, expecting only the `Read` summary for the `cat` command.
+**Data flow**: It parses a Bash script that prints a header then cats a file → drops `printf` → expects a read summary for the file.
 
-**Call relations**: This validates `printf` classification as a small formatting helper and `cat` handling of `--`.
+**Call relations**: This protects `is_small_formatting_command` and `drop_small_formatting_commands` behavior.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2830,11 +2845,11 @@ fn filters_out_printf()
 fn drops_yes_in_pipelines()
 ```
 
-**Purpose**: Verifies that a leading `yes |` inside a shell wrapper is ignored when summarizing the primary command.
+**Purpose**: Verifies that `yes |` before a command is ignored when it is only feeding input. The parser should focus on the primary command.
 
-**Data flow**: Parses `bash -lc 'yes | rg --files'` and expects a single `ListFiles` for `rg --files`.
+**Data flow**: It parses `yes | rg --files` → removes the `yes` stage → expects a list-files summary.
 
-**Call relations**: It covers both `normalize_tokens` and helper dropping for `yes`.
+**Call relations**: This exercises shell pipeline parsing and helper removal.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2845,11 +2860,11 @@ fn drops_yes_in_pipelines()
 fn supports_sed_n_then_nl_as_search()
 ```
 
-**Purpose**: Ensures a `sed -n <range> <file> | nl -ba` pipeline is still treated as reading the file, not as an unknown or formatting-only sequence.
+**Purpose**: Checks that reading a file slice with `sed -n` and piping to `nl` is summarized as a file read. The line numbering is not the main action.
 
-**Data flow**: Parses the tokenized pipeline and expects `Read` for `exec/src/event_processor_with_human_output.rs` with the `sed -n` command string.
+**Data flow**: It tokenizes `sed -n range file | nl -ba` → drops trailing numbering helper → expects a read summary for the file.
 
-**Call relations**: This validates that `nl` can be dropped while `sed -n` remains the primary read command.
+**Call relations**: This covers `sed_read_path`, `simplify_once`, and the final parser flow.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2860,11 +2875,11 @@ fn supports_sed_n_then_nl_as_search()
 fn preserves_rg_with_spaces()
 ```
 
-**Purpose**: Checks that quoted ripgrep queries containing spaces survive helper stripping and remain intact in the summary.
+**Purpose**: Ensures a ripgrep query containing spaces stays intact. The parser should not split the user’s search phrase incorrectly.
 
-**Data flow**: Parses `yes | rg -n 'foo bar' -S` and expects `Search` with `query: Some('foo bar')`.
+**Data flow**: It parses `yes | rg -n 'foo bar' -S` → removes the `yes` helper → expects a search query of `foo bar`.
 
-**Call relations**: It combines `yes` dropping with `shlex_join`-based command reconstruction.
+**Call relations**: This tests shell splitting and the ripgrep branch of `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2875,11 +2890,11 @@ fn preserves_rg_with_spaces()
 fn ls_with_glob()
 ```
 
-**Purpose**: Verifies that `ls` with an ignore glob but no explicit path is still a file-list summary with no path.
+**Purpose**: Checks that `ls` with an ignore glob is still summarized as listing files. The glob option should not be mistaken for a path.
 
-**Data flow**: Parses `ls -I '*.test.js'` and expects `ListFiles { path: None }`.
+**Data flow**: It parses `ls -I '*.test.js'` → skips the option value → expects a list-files summary with no path.
 
-**Call relations**: This exercises `first_non_flag_operand` with `ls` flags that consume values.
+**Call relations**: This exercises flag-value skipping for the `ls` branch.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2890,11 +2905,11 @@ fn ls_with_glob()
 fn strips_true_in_sequence()
 ```
 
-**Purpose**: Checks that no-op `true` commands are removed from command sequences on either side of a meaningful command.
+**Purpose**: Verifies that `true` is removed from command sequences. It is a no-op command, meaning it does nothing useful for the summary.
 
-**Data flow**: Parses `true && rg --files` and `rg --files && true`, expecting only the `ListFiles` summary in both cases.
+**Data flow**: It parses commands with `true` before and after `rg --files` → removes `true` → expects only the file-listing summary.
 
-**Call relations**: It validates `simplify_once` removal of `ParsedCommand::Unknown { cmd: 'true' }`.
+**Call relations**: This protects `simplify_once` as used after tokenized sequence parsing.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2905,11 +2920,11 @@ fn strips_true_in_sequence()
 fn strips_true_inside_bash_lc()
 ```
 
-**Purpose**: Ensures the same `true` stripping logic applies inside shell-wrapper scripts.
+**Purpose**: Checks the same no-op removal inside Bash-wrapped scripts. `true` should not distract from the real command.
 
-**Data flow**: Parses `bash -lc 'true && rg --files'` and `bash -lc 'rg --files || true'`, expecting only `ListFiles` summaries.
+**Data flow**: It parses Bash scripts containing `true` with `rg --files` → removes the no-op → expects list-files summaries.
 
-**Call relations**: This covers the shell-script path's reuse of `simplify_once`.
+**Call relations**: This covers the `true` simplification path inside `parse_shell_script`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2920,11 +2935,11 @@ fn strips_true_inside_bash_lc()
 fn shorten_path_on_windows()
 ```
 
-**Purpose**: Verifies that Windows-style backslash paths are preserved in `PathBuf` while the display name is shortened to the basename.
+**Purpose**: Verifies that Windows-style backslash paths are displayed with a useful file name while preserving the original path.
 
-**Data flow**: Parses `cat "pkg\src\main.rs"` and expects `Read` with `name: 'main.rs'` and `path: PathBuf::from(r'pkg\src\main.rs')`.
+**Data flow**: It parses `cat "pkg\src\main.rs"` → shortens the display name to `main.rs` → expects the stored path to keep the Windows-style separators.
 
-**Call relations**: It exercises `short_display_path` path normalization and `shlex_join` escaping.
+**Call relations**: This tests `short_display_path` and read-summary construction.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2935,11 +2950,11 @@ fn shorten_path_on_windows()
 fn head_with_no_space()
 ```
 
-**Purpose**: Checks support for compact `head -n50 <file>` syntax.
+**Purpose**: Checks that compact `head -n50 file` syntax is recognized. The parser should handle both spaced and unspaced count flags.
 
-**Data flow**: Parses `bash -lc 'head -n50 Cargo.toml'` and expects a `Read` summary.
+**Data flow**: It parses a Bash-wrapped `head -n50 Cargo.toml` → validates the count → expects a read summary.
 
-**Call relations**: This validates the `head` parser's no-space numeric flag handling.
+**Call relations**: This protects the compact flag logic in the `head` branch.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2950,11 +2965,11 @@ fn head_with_no_space()
 fn bash_dash_c_pipeline_parsing()
 ```
 
-**Purpose**: Ensures `bash -c` is handled the same way as `bash -lc` for pipeline summarization.
+**Purpose**: Verifies that `bash -c` is parsed like `bash -lc` for pipelines. Both forms carry an inner script.
 
-**Data flow**: Parses `['bash','-c','rg --files | head -n 1']` and expects `ListFiles` for `rg --files`.
+**Data flow**: It parses `bash -c 'rg --files | head -n 1'` → unwraps the script and drops `head` → expects a list-files summary.
 
-**Call relations**: It covers shell-wrapper extraction for both `-c` and `-lc` forms.
+**Call relations**: This tests Bash extraction before `parse_shell_script`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -2965,11 +2980,11 @@ fn bash_dash_c_pipeline_parsing()
 fn tail_with_no_space()
 ```
 
-**Purpose**: Checks support for compact `tail -n+10 <file>` syntax.
+**Purpose**: Checks compact `tail -n+10 file` syntax. The parser should recognize the offset even without a space.
 
-**Data flow**: Parses `bash -lc 'tail -n+10 README.md'` and expects `Read` for `README.md`.
+**Data flow**: It parses a Bash-wrapped compact tail command → validates the numeric offset → expects a read summary.
 
-**Call relations**: This validates the `tail` parser's no-space plus-offset handling.
+**Call relations**: This protects the compact flag logic in the `tail` branch.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2980,11 +2995,11 @@ fn tail_with_no_space()
 fn grep_with_query_and_path()
 ```
 
-**Purpose**: Verifies the basic grep case where both a query and a path are present.
+**Purpose**: Verifies a basic grep command with both query and path. This is the standard search case.
 
-**Data flow**: Parses `grep -R TODO src` and expects `Search` with query `TODO` and path `src`.
+**Data flow**: It parses `grep -R TODO src` → extracts `TODO` as the query and `src` as the path → expects a search summary.
 
-**Call relations**: It exercises the standard operand ordering in `parse_grep_like`.
+**Call relations**: This exercises `parse_grep_like` through the normal parser.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -2995,11 +3010,11 @@ fn grep_with_query_and_path()
 fn supports_ag_ack_pt_rga()
 ```
 
-**Purpose**: Checks additional search tools that should map to the same `Search` summary shape.
+**Purpose**: Checks that several grep-like search tools are recognized. Users may use `ag`, `ack`, `pt`, or `rga` instead of `grep` or `rg`.
 
-**Data flow**: Parses `ag`, `ack`, `pt`, and `rga` examples and expects `Search` outputs with extracted query and path.
+**Data flow**: It parses example commands for each tool → extracts query and path → expects search summaries.
 
-**Call relations**: This validates multiple branches in `summarize_main_tokens` that share grep-like semantics.
+**Call relations**: These tests cover both the `ag`/`ack`/`pt` branch and the `rga` handling in `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3010,11 +3025,11 @@ fn supports_ag_ack_pt_rga()
 fn ag_ack_pt_files_with_matches_flags_are_search()
 ```
 
-**Purpose**: Ensures `-l` variants of `ag`, `ack`, and `pt` are still treated as searches.
+**Purpose**: Verifies that `-l` with `ag`, `ack`, and `pt` still means a search summary. Listing matching file names is still driven by a text query.
 
-**Data flow**: Parses each command with `-l TODO src` and expects `Search` summaries.
+**Data flow**: It parses three commands with `-l` → extracts the search term and path → expects search summaries.
 
-**Call relations**: It confirms that these tools' parsers ignore file-selection flags when extracting operands.
+**Call relations**: This protects the search-tool branch from treating `-l` as a plain listing.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3025,11 +3040,11 @@ fn ag_ack_pt_files_with_matches_flags_are_search()
 fn rg_with_equals_style_flags()
 ```
 
-**Purpose**: Checks that `--flag=value` ripgrep options are skipped correctly when extracting query and path operands.
+**Purpose**: Checks that long options written as `--flag=value` do not become query or path operands. They should be ignored when extracting meaning.
 
-**Data flow**: Parses `rg --colors=never -n foo src` and expects `Search` with query `foo` and path `src`.
+**Data flow**: It parses `rg --colors=never -n foo src` → skips the equals-style option → expects query `foo` and path `src`.
 
-**Call relations**: This validates `skip_flag_values` behavior for `--flag=value` forms.
+**Call relations**: This tests `skip_flag_values` behavior inside ripgrep parsing.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3040,11 +3055,11 @@ fn rg_with_equals_style_flags()
 fn cat_with_double_dash_and_sed_ranges()
 ```
 
-**Purpose**: Verifies two read-specific edge cases: `cat -- <file>` and `sed -n <range> <file>`.
+**Purpose**: Verifies two common edge cases: file names that look like flags after `--`, and valid `sed -n` range reads.
 
-**Data flow**: Parses both commands and expects `Read` summaries with correct names and `PathBuf`s, including a filename beginning with `-`.
+**Data flow**: It parses `cat -- ./-strange-file-name` and `sed -n '12,20p' Cargo.toml` → treats both as file reads → checks names and paths.
 
-**Call relations**: It exercises operand parsing after `--` and valid `sed -n` range detection.
+**Call relations**: This covers `positional_operands` double-dash handling and `sed_read_path` range validation.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3055,11 +3070,11 @@ fn cat_with_double_dash_and_sed_ranges()
 fn drop_trailing_nl_in_pipeline()
 ```
 
-**Purpose**: Checks that a trailing `nl` stage with only flags is dropped from a pipeline summary.
+**Purpose**: Checks that a trailing `nl` line-numbering stage is removed from a file-listing pipeline. Line numbering is only presentation.
 
-**Data flow**: Parses `rg --files | nl -ba` and expects only `ListFiles { cmd: 'rg --files' }`.
+**Data flow**: It parses `rg --files | nl -ba` → drops the `nl` helper → expects a list-files summary.
 
-**Call relations**: This validates both helper filtering and `simplify_once` handling of `nl`-only stages.
+**Call relations**: This protects `simplify_once` and helper removal behavior.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3070,11 +3085,11 @@ fn drop_trailing_nl_in_pipeline()
 fn ls_with_time_style_and_path()
 ```
 
-**Purpose**: Verifies `ls` path extraction when an equals-style option consumes a value and the path itself shortens to `.`.
+**Purpose**: Verifies that `ls` options with values are skipped when finding the listed path. It also documents how display paths are shortened.
 
-**Data flow**: Parses `ls --time-style=long-iso ./dist` and expects `ListFiles` with path `.`.
+**Data flow**: It parses `ls --time-style=long-iso ./dist` → ignores the option → shortens the path display → expects a list-files summary.
 
-**Call relations**: It exercises `first_non_flag_operand` plus `short_display_path`'s exclusion of `dist`.
+**Call relations**: This tests `skip_flag_values` and `short_display_path` through the `ls` summarizer.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3085,11 +3100,11 @@ fn ls_with_time_style_and_path()
 fn fd_file_finder_variants()
 ```
 
-**Purpose**: Checks both listing and searching modes for `fd` depending on whether the first positional operand looks path-like.
+**Purpose**: Checks two uses of `fd`: listing files with type filters, and searching by name within a path.
 
-**Data flow**: Parses `fd -t f src/` expecting `ListFiles` with path `src`, then parses `fd main src` expecting `Search` with query `main` and path `src`.
+**Data flow**: It parses `fd -t f src/` and `fd main src` → skips type option values → expects list or search summaries as appropriate.
 
-**Call relations**: This validates `parse_fd_query_and_path` and `is_pathish`.
+**Call relations**: This directly exercises `parse_fd_query_and_path` through `summarize_main_tokens`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3100,11 +3115,11 @@ fn fd_file_finder_variants()
 fn find_basic_name_filter()
 ```
 
-**Purpose**: Verifies that `find` with a `-name` filter is summarized as a search with both root path and pattern.
+**Purpose**: Verifies that `find` with a name filter is summarized as a search. The name pattern becomes the query.
 
-**Data flow**: Parses `find . -name '*.rs'` and expects `Search` with query `*.rs` and path `.`.
+**Data flow**: It parses `find . -name '*.rs'` → extracts root path `.` and query `*.rs` → expects a search summary.
 
-**Call relations**: It exercises `parse_find_query_and_path`.
+**Call relations**: This covers `parse_find_query_and_path`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3115,11 +3130,11 @@ fn find_basic_name_filter()
 fn find_type_only_path()
 ```
 
-**Purpose**: Checks that `find` without a name/path/regex filter is treated as a file listing rooted at the given path.
+**Purpose**: Checks that `find` without a name-like filter is summarized as listing files. A type filter alone does not supply a search query.
 
-**Data flow**: Parses `find src -type f` and expects `ListFiles` with path `src`.
+**Data flow**: It parses `find src -type f` → extracts the root path and no query → expects a list-files summary.
 
-**Call relations**: This covers the list-only branch after `parse_find_query_and_path` returns no query.
+**Call relations**: This exercises the list-files path through `parse_find_query_and_path`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3130,11 +3145,11 @@ fn find_type_only_path()
 fn bin_bash_lc_sed()
 ```
 
-**Purpose**: Ensures shell-wrapper extraction works even when the shell executable is given as an absolute path.
+**Purpose**: Verifies that Bash wrappers are recognized even when invoked by a full path such as `/bin/bash`. The inner `sed` read should still be parsed.
 
-**Data flow**: Parses `/bin/bash -lc 'sed -n '1,10p' Cargo.toml'` and expects a `Read` summary for `Cargo.toml`.
+**Data flow**: It tokenizes a full-path Bash command with `sed -n` → unwraps the script → expects a read summary.
 
-**Call relations**: It validates `extract_bash_command` integration through `parse_shell_lc_commands`.
+**Call relations**: This tests shell extraction before `parse_shell_script`.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3145,11 +3160,11 @@ fn bin_bash_lc_sed()
 fn bin_zsh_lc_sed()
 ```
 
-**Purpose**: Checks the same absolute-path wrapper handling for Zsh.
+**Purpose**: Checks the same full-path shell handling for zsh. `/bin/zsh -lc` should not block command understanding.
 
-**Data flow**: Parses `/bin/zsh -lc 'sed -n '1,10p' Cargo.toml'` and expects `Read` for `Cargo.toml`.
+**Data flow**: It tokenizes a full-path zsh command with `sed -n` → unwraps the script → expects a read summary.
 
-**Call relations**: This covers shell-wrapper extraction for path-qualified Zsh executables.
+**Call relations**: This covers zsh extraction through the public parser.
 
 *Call graph*: 3 external calls (assert_parsed, shlex_split_safe, vec!).
 
@@ -3160,11 +3175,11 @@ fn bin_zsh_lc_sed()
 fn powershell_command_is_stripped()
 ```
 
-**Purpose**: Verifies that PowerShell wrappers are stripped and summarized as the inner script text.
+**Purpose**: Verifies that PowerShell wrappers are stripped for display. The parser does not deeply understand PowerShell, but it can show the inner command.
 
-**Data flow**: Parses `['powershell','-Command','Get-ChildItem']` and expects `Unknown { cmd: 'Get-ChildItem' }`.
+**Data flow**: It parses `powershell -Command Get-ChildItem` → extracts `Get-ChildItem` → expects an unknown summary for that script text.
 
-**Call relations**: It exercises the PowerShell extraction path in `parse_command_impl` and `single_unknown_for_command`.
+**Call relations**: This exercises `extract_powershell_command` through `parse_command_impl`.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -3175,11 +3190,11 @@ fn powershell_command_is_stripped()
 fn pwsh_with_noprofile_and_c_alias_is_stripped()
 ```
 
-**Purpose**: Checks PowerShell Core wrapper stripping with extra flags and the `-c` alias.
+**Purpose**: Checks PowerShell Core (`pwsh`) with common flags and `-c` alias. The meaningful inner command should be shown.
 
-**Data flow**: Parses `['pwsh','-NoProfile','-c','Write-Host hi']` and expects `Unknown` for the inner script.
+**Data flow**: It parses `pwsh -NoProfile -c Write-Host hi` → extracts the script → expects an unknown summary for `Write-Host hi`.
 
-**Call relations**: This validates the PowerShell extractor's tolerance for wrapper options.
+**Call relations**: This protects PowerShell extraction in the main parser flow.
 
 *Call graph*: 3 external calls (assert_parsed, vec_str, vec!).
 
@@ -3190,11 +3205,11 @@ fn pwsh_with_noprofile_and_c_alias_is_stripped()
 fn powershell_with_path_is_stripped()
 ```
 
-**Purpose**: Ensures PowerShell extraction also works when the executable is specified by full path on either Windows or non-Windows test hosts.
+**Purpose**: Verifies that PowerShell is recognized even when invoked by an absolute executable path. This matters across Windows and Unix-like systems.
 
-**Data flow**: Chooses a platform-specific PowerShell executable path, parses it with `-NoProfile -c 'Write-Host hi'`, and expects `Unknown { cmd: 'Write-Host hi' }`.
+**Data flow**: It chooses a platform-appropriate PowerShell path → parses a command with `-NoProfile -c` → expects the inner script as an unknown summary.
 
-**Call relations**: It covers path-qualified PowerShell wrapper detection.
+**Call relations**: This tests path-tolerant PowerShell extraction through `parse_command`.
 
 *Call graph*: 4 external calls (cfg!, assert_parsed, vec_str, vec!).
 
@@ -3205,11 +3220,11 @@ fn powershell_with_path_is_stripped()
 fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand>
 ```
 
-**Purpose**: Implements the main parsing pipeline that tokenizes, splits, summarizes, tracks `cd`, and simplifies command sequences before the public wrapper applies final deduplication and unknown collapsing.
+**Purpose**: Does the main parsing work before the public safety cleanup. It unwraps shells, splits command chains, tracks simple directory changes, summarizes each piece, and simplifies harmless noise.
 
-**Data flow**: Takes `&[String]`. It first tries `parse_shell_lc_commands`; if that succeeds, it returns those parsed commands directly. Otherwise it strips PowerShell wrappers to a single `Unknown`, normalizes tokens with `normalize_tokens`, optionally splits on connectors, then iterates left-to-right over each segment. `cd` segments update a local `cwd: Option<String>` via `cd_target` and `join_paths`; non-`cd` segments are summarized by `summarize_main_tokens`, and `Read` paths are rewritten relative to `cwd`. Finally it repeatedly applies `simplify_once` until no further reduction occurs and returns the resulting `Vec<ParsedCommand>`.
+**Data flow**: It receives tokenized command arguments → tries shell-script parsing or PowerShell extraction first → normalizes wrappers and connectors → summarizes each command segment while applying `cd` to read paths → repeatedly simplifies the result → returns parsed summaries.
 
-**Call relations**: This is the internal engine behind `parse_command` and another caller that detects skill-doc reads. It delegates shell-wrapper parsing to `parse_shell_lc_commands`, per-command classification to `summarize_main_tokens`, and sequence cleanup to `simplify_once`.
+**Call relations**: `parse_command` calls this for normal user-facing parsing, and another detector uses it for skill-document reads. It coordinates many lower-level helpers such as `normalize_tokens`, `summarize_main_tokens`, `cd_target`, `join_paths`, and `simplify_once`.
 
 *Call graph*: calls 9 internal fn (cd_target, contains_connectors, join_paths, normalize_tokens, parse_shell_lc_commands, simplify_once, split_on_connectors, summarize_main_tokens, extract_powershell_command); called by 2 (detect_skill_doc_read, parse_command); 3 external calls (from, new, vec!).
 
@@ -3220,11 +3235,11 @@ fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand>
 fn simplify_once(commands: &[ParsedCommand]) -> Option<Vec<ParsedCommand>>
 ```
 
-**Purpose**: Performs one pass of sequence-level cleanup over parsed commands, removing noise commands that should not appear in summaries.
+**Purpose**: Removes one harmless or distracting summary from a list of parsed commands. It is like tidying a sentence by deleting filler words such as `echo`, `cd`, `true`, or line numbering.
 
-**Data flow**: Consumes a `&[ParsedCommand]` and returns `Option<Vec<ParsedCommand>>`. It returns `None` when no simplification applies. Otherwise it clones all but one removed element according to four rules: drop a leading `echo ...`, remove any `cd ...` unknown when another command follows, remove any `Unknown { cmd: 'true' }`, or remove `nl` commands whose tokens are only `nl` plus flags.
+**Data flow**: It receives parsed command summaries → looks for one simplifiable pattern → returns a new shorter list if it found one, or `None` if nothing should be changed.
 
-**Call relations**: Both `parse_command_impl` and `parse_shell_script` call this in a loop until it stabilizes. Its role is to erase shell-control or formatting noise after command-level parsing has already happened.
+**Call relations**: `parse_command_impl` and `parse_shell_script` call this in a loop until no more cleanup is possible.
 
 *Call graph*: called by 2 (parse_command_impl, parse_shell_script); 4 external calls (with_capacity, iter, len, split).
 
@@ -3235,11 +3250,11 @@ fn simplify_once(commands: &[ParsedCommand]) -> Option<Vec<ParsedCommand>>
 fn is_valid_sed_n_arg(arg: Option<&str>) -> bool
 ```
 
-**Purpose**: Recognizes the restricted `sed -n` script forms that represent line-range reads rather than arbitrary editing logic.
+**Purpose**: Checks whether a `sed -n` script looks like a simple line-range print, such as `10p` or `1,200p`. This keeps the parser from treating arbitrary `sed` scripts as safe file reads.
 
-**Data flow**: Accepts `Option<&str>`, returns false for `None`, then checks whether the string ends with `p` and whether the preceding content is either a single ASCII digit sequence or two comma-separated ASCII digit sequences. It returns a boolean and mutates nothing.
+**Data flow**: It receives an optional argument string → verifies it ends in `p` and contains one or two numeric parts → returns true only for that simple range shape.
 
-**Call relations**: This helper is used only by `sed_read_path` to decide whether a `sed -n` invocation should be treated as reading a file.
+**Call relations**: `sed_read_path` calls this when deciding whether a `sed` command reads a file range.
 
 *Call graph*: called by 1 (sed_read_path).
 
@@ -3250,11 +3265,11 @@ fn is_valid_sed_n_arg(arg: Option<&str>) -> bool
 fn sed_read_path(args: &[String]) -> Option<String>
 ```
 
-**Purpose**: Extracts the file operand from `sed -n <range> <file>`-style commands when they look like read-only line-range requests.
+**Purpose**: Finds the file path in a safe-looking `sed -n range file` command. It only succeeds for simple line-printing forms.
 
-**Data flow**: Takes the `sed` argument tail, trims anything after a connector, and first requires that `-n` be present. It scans for valid range scripts supplied via `-e`/`--expression`, skips script-file flags `-f`/`--file`, and if needed also looks for a positional valid range argument. If no valid range script is found it returns `None`. Otherwise it uses `skip_flag_values` to remove expression/file flag values, filters to non-flag operands, and returns the inferred file path according to whether the first non-flag operand was the range script or the file.
+**Data flow**: It receives `sed` arguments → ignores anything after connectors → checks for `-n` and a valid range script → skips option values → returns the likely file path, or nothing if the command is ambiguous.
 
-**Call relations**: It is consulted both by `is_small_formatting_command` to keep real file reads from being dropped and by `summarize_main_tokens` to emit `ParsedCommand::Read` for `sed`.
+**Call relations**: `summarize_main_tokens` uses this to create read summaries for `sed`, and `is_small_formatting_command` uses it to decide whether `sed` is just a pipeline helper.
 
 *Call graph*: calls 3 internal fn (is_valid_sed_n_arg, skip_flag_values, trim_at_connector); called by 2 (is_small_formatting_command, summarize_main_tokens); 1 external calls (matches!).
 
@@ -3265,11 +3280,11 @@ fn sed_read_path(args: &[String]) -> Option<String>
 fn normalize_tokens(cmd: &[String]) -> Vec<String>
 ```
 
-**Purpose**: Applies lightweight token-level normalization before connector splitting and heuristic parsing.
+**Purpose**: Peels off a few simple wrappers and prefixes from an already-tokenized command. This makes later parsing look at the real command.
 
-**Data flow**: Given a token slice, it pattern-matches a few special prefixes. It drops leading `yes |` and `no |`/`n |` by returning the remainder unchanged, and for exact three-token `bash|zsh -c|-lc <script>` forms it re-tokenizes the script with `shlex_split`, falling back to the original wrapper tokens if splitting fails. All other inputs are cloned unchanged.
+**Data flow**: It receives command tokens → removes leading `yes |` or `no |`, or splits a simple `bash/zsh -c/-lc` script into tokens → otherwise returns the original tokens copied.
 
-**Call relations**: This is an early preprocessing step used only by `parse_command_impl` for non-AST parsing paths.
+**Call relations**: `parse_command_impl` calls this before splitting on connectors and summarizing command parts.
 
 *Call graph*: called by 1 (parse_command_impl); 1 external calls (split).
 
@@ -3280,11 +3295,11 @@ fn normalize_tokens(cmd: &[String]) -> Vec<String>
 fn contains_connectors(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Detects whether a token vector contains shell sequencing or pipeline connectors that should split parsing into multiple segments.
+**Purpose**: Checks whether a token list contains shell connectors such as pipes, `&&`, `||`, or semicolons. These marks mean the command should be split into stages.
 
-**Data flow**: Scans `&[String]` for any token equal to `&&`, `||`, `|`, or `;` and returns a boolean.
+**Data flow**: It receives tokens → scans for connector strings → returns true if any are present.
 
-**Call relations**: Used by `parse_command_impl` to decide whether to call `split_on_connectors` or treat the whole token vector as one command.
+**Call relations**: `parse_command_impl` uses this to decide whether to call `split_on_connectors`.
 
 *Call graph*: called by 1 (parse_command_impl).
 
@@ -3295,11 +3310,11 @@ fn contains_connectors(tokens: &[String]) -> bool
 fn split_on_connectors(tokens: &[String]) -> Vec<Vec<String>>
 ```
 
-**Purpose**: Splits a flat token stream into command segments separated by shell connectors while discarding the connector tokens themselves.
+**Purpose**: Breaks a token list into separate command chunks at shell connectors. Each chunk can then be summarized on its own.
 
-**Data flow**: Iterates over `&[String]`, accumulating cloned tokens into a current segment. On `&&`, `||`, `|`, or `;`, it pushes the current segment if non-empty and starts a new one. After the loop it pushes any trailing segment and returns `Vec<Vec<String>>`.
+**Data flow**: It receives tokens → builds groups between `|`, `&&`, `||`, and `;` → returns a vector of non-empty token groups.
 
-**Call relations**: This is the fallback sequence splitter used by `parse_command_impl` when shell AST parsing is not available.
+**Call relations**: `parse_command_impl` calls this after `contains_connectors` finds connector tokens.
 
 *Call graph*: called by 1 (parse_command_impl); 2 external calls (new, take).
 
@@ -3310,11 +3325,11 @@ fn split_on_connectors(tokens: &[String]) -> Vec<Vec<String>>
 fn trim_at_connector(tokens: &[String]) -> Vec<String>
 ```
 
-**Purpose**: Returns only the prefix of a token slice before the first shell connector.
+**Purpose**: Keeps only the part of an argument list before the first connector. This prevents later pipeline text from being mistaken for an argument to the current command.
 
-**Data flow**: Finds the first `|`, `&&`, `||`, or `;` token and clones the slice up to that index; if none exists, it clones the whole slice.
+**Data flow**: It receives tokens → finds the first connector if present → returns a copy of tokens before that point.
 
-**Call relations**: Many operand-extraction helpers call this so they only inspect the current command stage rather than later pipeline or sequence stages.
+**Call relations**: Many command-specific parsers call this before extracting operands, including grep, sed, awk, fd, find, Python, and ripgrep handling.
 
 *Call graph*: called by 7 (awk_data_file_operand, parse_fd_query_and_path, parse_find_query_and_path, parse_grep_like, python_walks_files, sed_read_path, summarize_main_tokens).
 
@@ -3325,11 +3340,11 @@ fn trim_at_connector(tokens: &[String]) -> Vec<String>
 fn short_display_path(path: &str) -> String
 ```
 
-**Purpose**: Produces a concise display string for a path by normalizing separators and dropping unhelpful trailing directory names.
+**Purpose**: Turns a long path into a short, useful label for display. It skips generic directory names like `src`, `dist`, and `node_modules` when possible.
 
-**Data flow**: Takes `&str`, replaces backslashes with `/`, trims trailing `/`, then walks path components from the end while skipping empty parts and the names `build`, `dist`, `node_modules`, and `src`. It returns the first remaining component, or the trimmed original path if nothing better exists.
+**Data flow**: It receives a path string → normalizes backslashes, trims trailing slashes, walks path parts from the end while ignoring generic names → returns the first useful part or the trimmed path.
 
-**Call relations**: This helper is used throughout command summarization to populate human-friendly `path` and `name` fields without losing the full `PathBuf` stored for reads.
+**Call relations**: Search, listing, and read summaries use this through `summarize_main_tokens`, `parse_fd_query_and_path`, and `parse_find_query_and_path`.
 
 *Call graph*: called by 3 (parse_fd_query_and_path, parse_find_query_and_path, summarize_main_tokens).
 
@@ -3340,11 +3355,11 @@ fn short_display_path(path: &str) -> String
 fn skip_flag_values(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a String>
 ```
 
-**Purpose**: Filters an argument list so positional-operand extraction can ignore flags that consume following values and `--flag=value` forms.
+**Purpose**: Filters out command-line flags and the values that belong to specific flags. This helps find real file or query operands.
 
-**Data flow**: Accepts `&[String]` plus a list of flag names that take values. It iterates once, skipping the next token after any matching flag, dropping any `--flag=value` token entirely, and treating `--` as the start of pure positional operands that are all retained. It returns `Vec<&String>` referencing the original arguments.
+**Data flow**: It receives argument tokens and a list of flags that take a following value → skips those flags, their values, and `--flag=value` tokens → returns references to the remaining arguments, with `--` marking the rest as positional.
 
-**Call relations**: Several parsers use this helper before collecting non-flag operands, especially for commands with many option forms like `rg`, `fd`, `awk`, and `sed`.
+**Call relations**: Several parsers use this before deciding which non-flag words are paths or queries.
 
 *Call graph*: called by 4 (awk_data_file_operand, parse_fd_query_and_path, sed_read_path, summarize_main_tokens); 1 external calls (new).
 
@@ -3355,11 +3370,11 @@ fn skip_flag_values(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a Str
 fn first_non_flag_operand(args: &[String], flags_with_vals: &[&str]) -> Option<String>
 ```
 
-**Purpose**: Returns the first positional operand after removing flags and their values.
+**Purpose**: Finds the first positional argument after ignoring known flags. It is useful for commands where the first remaining word is usually a path.
 
-**Data flow**: Delegates to `positional_operands`, takes the first element if any, clones it into a new `String`, and returns `Option<String>`.
+**Data flow**: It receives arguments and flags with values → calls `positional_operands` → returns the first operand copied, or nothing.
 
-**Call relations**: Used by listing-command parsers in `summarize_main_tokens` when they want at most one path operand.
+**Call relations**: `summarize_main_tokens` uses this for listing tools such as `ls`, `tree`, and `du`.
 
 *Call graph*: calls 1 internal fn (positional_operands); called by 1 (summarize_main_tokens).
 
@@ -3370,11 +3385,11 @@ fn first_non_flag_operand(args: &[String], flags_with_vals: &[&str]) -> Option<S
 fn single_non_flag_operand(args: &[String], flags_with_vals: &[&str]) -> Option<String>
 ```
 
-**Purpose**: Returns the sole positional operand only when exactly one exists.
+**Purpose**: Finds a positional argument only when there is exactly one. This avoids calling a command a file read when multiple file-like operands make the meaning unclear.
 
-**Data flow**: Calls `positional_operands`, takes the first operand, and returns `None` if a second operand exists; otherwise it clones and returns the single operand.
+**Data flow**: It receives arguments and flags with values → gathers positional operands → returns the only operand if exactly one exists, otherwise returns nothing.
 
-**Call relations**: Read-command parsers use this to avoid misclassifying commands that mention multiple files or extra operands.
+**Call relations**: `summarize_main_tokens` uses this for file viewers like `cat`, `bat`, `less`, and `more`.
 
 *Call graph*: calls 1 internal fn (positional_operands); called by 1 (summarize_main_tokens).
 
@@ -3385,11 +3400,11 @@ fn single_non_flag_operand(args: &[String], flags_with_vals: &[&str]) -> Option<
 fn positional_operands(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a String>
 ```
 
-**Purpose**: Extracts positional operands from an argument list while respecting `--`, skipping flags, and skipping values consumed by selected flags.
+**Purpose**: Extracts arguments that are not flags and not values consumed by known flags. It is the shared tool for finding real command operands.
 
-**Data flow**: Iterates over `&[String]` with state for `after_double_dash` and `skip_next`. Before `--`, it ignores `--flag=value`, skips configured flag-value pairs, and drops any token starting with `-`; after `--`, it keeps everything. It returns `Vec<&String>` referencing the original slice.
+**Data flow**: It receives argument tokens and flags that consume values → walks left to right, respecting `--` and skipping flags → returns references to the remaining positional operands.
 
-**Call relations**: This is the shared low-level operand extractor behind `first_non_flag_operand` and `single_non_flag_operand`.
+**Call relations**: `first_non_flag_operand` and `single_non_flag_operand` are small wrappers around this function.
 
 *Call graph*: called by 2 (first_non_flag_operand, single_non_flag_operand); 1 external calls (new).
 
@@ -3400,11 +3415,11 @@ fn positional_operands(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a 
 fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand
 ```
 
-**Purpose**: Parses grep-family commands into a `ParsedCommand::Search`, extracting the pattern and optional path while preserving grep-specific semantics.
+**Purpose**: Summarizes `grep`-style commands as searches. It carefully separates the pattern being searched for from the path being searched in.
 
-**Data flow**: Takes the full command tokens and the argument tail. It trims at connectors, scans arguments while honoring `--`, captures the first explicit pattern from `-e/--regexp` or `-f/--file`, skips value-taking flags like `-m`, `-C`, `-A`, and `-B`, and collects remaining non-flag operands. It then chooses the query from the explicit pattern or first operand, chooses the path from the next operand when appropriate, shortens only the path with `short_display_path`, and returns `ParsedCommand::Search { cmd: shlex_join(main_cmd), query, path }`.
+**Data flow**: It receives the full command and its arguments → trims at connectors → handles pattern flags like `-e` and skips option values → chooses a query and optional path → returns a search summary with the joined command text.
 
-**Call relations**: This helper is called by `summarize_main_tokens` for `grep`, `egrep`, `fgrep`, and `git grep`. Its design intentionally avoids shortening slash-containing grep patterns.
+**Call relations**: `summarize_main_tokens` calls this for `grep`, `egrep`, `fgrep`, and `git grep`.
 
 *Call graph*: calls 2 internal fn (shlex_join, trim_at_connector); called by 1 (summarize_main_tokens); 1 external calls (new).
 
@@ -3415,11 +3430,11 @@ fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand
 fn awk_data_file_operand(args: &[String]) -> Option<String>
 ```
 
-**Purpose**: Determines whether an `awk` invocation includes a data file operand and, if so, returns that file path.
+**Purpose**: Finds the data file in an `awk` command when one is clearly present. This distinguishes `awk` used as a pipeline formatter from `awk` reading a file.
 
-**Data flow**: Takes the `awk` argument tail, trims at connectors, checks whether a script file flag `-f/--file` is present, then uses `skip_flag_values` to ignore field-separator, variable-assignment, and script-file options. It filters to non-flag candidates and returns either the first non-flag operand after a script file or the second non-flag operand in the inline-script case.
+**Data flow**: It receives `awk` arguments → trims at connectors → skips known option values → if a script file is used, picks the first non-flag file; otherwise picks the operand after the inline program → returns the file path if found.
 
-**Call relations**: Used both by `is_small_formatting_command` to decide whether `awk` is just a pipeline helper and by `summarize_main_tokens` to emit `Read` for file-reading `awk` commands.
+**Call relations**: `is_small_formatting_command` uses this to classify `awk`, and `summarize_main_tokens` uses it to build read summaries.
 
 *Call graph*: calls 2 internal fn (skip_flag_values, trim_at_connector); called by 2 (is_small_formatting_command, summarize_main_tokens).
 
@@ -3430,11 +3445,11 @@ fn awk_data_file_operand(args: &[String]) -> Option<String>
 fn python_walks_files(args: &[String]) -> bool
 ```
 
-**Purpose**: Heuristically detects Python `-c` snippets that enumerate files or directories.
+**Purpose**: Detects simple Python one-liners that list or walk files. It only looks for common filesystem API names inside `python -c` scripts.
 
-**Data flow**: Trims the argument list at connectors, scans for `-c`, and if present inspects the following script string for substrings such as `os.walk`, `os.listdir`, `os.scandir`, `glob.glob`, `glob.iglob`, `pathlib.Path`, or `.rglob(`. It returns true if any marker is found.
+**Data flow**: It receives Python arguments → finds a `-c` script → searches the script text for APIs like `os.listdir`, `glob.glob`, or `Path.rglob` → returns true if one is found.
 
-**Call relations**: This helper is used by `summarize_main_tokens` after `is_python_command` identifies a Python executable.
+**Call relations**: `summarize_main_tokens` calls this after `is_python_command` identifies a Python executable.
 
 *Call graph*: calls 1 internal fn (trim_at_connector); called by 1 (summarize_main_tokens).
 
@@ -3445,11 +3460,11 @@ fn python_walks_files(args: &[String]) -> bool
 fn is_python_command(cmd: &str) -> bool
 ```
 
-**Purpose**: Recognizes Python executable names that should be eligible for Python-specific heuristics.
+**Purpose**: Recognizes common Python executable names. This lets the parser apply Python-specific one-liner detection.
 
-**Data flow**: Checks a command name string against exact names `python`, `python2`, `python3` and versioned prefixes `python2.` and `python3.`. It returns a boolean.
+**Data flow**: It receives a command name string → checks exact names like `python` and `python3`, plus versioned names like `python3.11` → returns true or false.
 
-**Call relations**: Called only by `summarize_main_tokens` before applying `python_walks_files`.
+**Call relations**: `summarize_main_tokens` uses this before calling `python_walks_files`.
 
 *Call graph*: called by 1 (summarize_main_tokens).
 
@@ -3460,11 +3475,11 @@ fn is_python_command(cmd: &str) -> bool
 fn cd_target(args: &[String]) -> Option<String>
 ```
 
-**Purpose**: Extracts the effective target directory from a `cd` command using permissive heuristics.
+**Purpose**: Extracts the target directory from a `cd` command. It understands simple flags and the `--` marker used before names that may start with a dash.
 
-**Data flow**: Scans the `cd` argument slice left-to-right. If it sees `--`, it returns the following token immediately. It skips `-L`, `-P`, and any other dash-prefixed options, and otherwise keeps updating `target` with each non-flag operand so the last one wins. It returns `Option<String>`.
+**Data flow**: It receives arguments after `cd` → skips `-L`, `-P`, and other flag-looking tokens → honors `--` by taking the next argument → returns the last usable target directory, if any.
 
-**Call relations**: Both `parse_command_impl` and `parse_shell_script` use this to maintain an inferred current working directory across command sequences.
+**Call relations**: `parse_command_impl` and `parse_shell_script` call this while tracking the effective directory for later file reads.
 
 *Call graph*: called by 2 (parse_command_impl, parse_shell_script); 1 external calls (matches!).
 
@@ -3475,11 +3490,11 @@ fn cd_target(args: &[String]) -> Option<String>
 fn is_pathish(s: &str) -> bool
 ```
 
-**Purpose**: Heuristically decides whether a token looks more like a filesystem path than a search query.
+**Purpose**: Guesses whether a string looks like a path rather than a search query. It checks for dots, slashes, and Windows backslashes.
 
-**Data flow**: Returns true for `.`, `..`, strings starting with `./` or `../`, or any string containing `/` or `\`; otherwise false.
+**Data flow**: It receives a string → checks for `.` or `..`, relative path prefixes, forward slashes, or backslashes → returns true if it looks path-like.
 
-**Call relations**: Used by `parse_fd_query_and_path` to distinguish `fd <path>` listing mode from `fd <query> <path>` search mode.
+**Call relations**: `parse_fd_query_and_path` uses this when a single `fd` operand could be either a query or a path.
 
 *Call graph*: called by 1 (parse_fd_query_and_path).
 
@@ -3490,11 +3505,11 @@ fn is_pathish(s: &str) -> bool
 fn parse_fd_query_and_path(tail: &[String]) -> (Option<String>, Option<String>)
 ```
 
-**Purpose**: Extracts the query and path semantics from `fd` commands, which can act as either file listers or searchers.
+**Purpose**: Extracts the search query and/or path from an `fd` file-finder command. `fd` can mean either “list files here” or “find names matching this.”
 
-**Data flow**: Trims at connectors, removes values consumed by flags like `-t`, `-e`, `-E`, and `--search-path` via `skip_flag_values`, then collects non-flag operands. With one operand, it returns `(None, Some(path))` if `is_pathish` says it looks like a path, otherwise `(Some(query), None)`. With two or more operands, it returns the first as query and the second as shortened path.
+**Data flow**: It receives `fd` arguments → trims at connectors and skips flags that take values → inspects remaining non-flag operands → returns optional query and path, shortening paths for display.
 
-**Call relations**: Called by `summarize_main_tokens`, which turns its tuple into either `ParsedCommand::ListFiles` or `ParsedCommand::Search`.
+**Call relations**: `summarize_main_tokens` calls this for `fd` and then chooses either a search or list-files summary.
 
 *Call graph*: calls 4 internal fn (is_pathish, short_display_path, skip_flag_values, trim_at_connector); called by 1 (summarize_main_tokens).
 
@@ -3505,11 +3520,11 @@ fn parse_fd_query_and_path(tail: &[String]) -> (Option<String>, Option<String>)
 fn parse_find_query_and_path(tail: &[String]) -> (Option<String>, Option<String>)
 ```
 
-**Purpose**: Extracts a root path and common name/path/regex filter from `find` commands.
+**Purpose**: Extracts a root path and common name-like filter from a `find` command. It supports simple, useful summaries without trying to understand all of `find`.
 
-**Data flow**: Trims at connectors, scans for the first non-flag token that is not `!`, `(`, or `)` to use as the shortened root path, then scans for `-name`, `-iname`, `-path`, or `-regex` and captures the following token as the query. It returns `(Option<String>, Option<String>)`.
+**Data flow**: It receives `find` arguments → trims at connectors → picks the first non-operator positional argument as the path → looks for filters like `-name`, `-path`, or `-regex` → returns optional query and path.
 
-**Call relations**: Used by `summarize_main_tokens` to decide whether a `find` command is better summarized as a search or a file listing.
+**Call relations**: `summarize_main_tokens` uses this to decide whether `find` is a search or a file listing.
 
 *Call graph*: calls 2 internal fn (short_display_path, trim_at_connector); called by 1 (summarize_main_tokens).
 
@@ -3520,11 +3535,11 @@ fn parse_find_query_and_path(tail: &[String]) -> (Option<String>, Option<String>
 fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>>
 ```
 
-**Purpose**: Detects Bash-compatible shell wrappers and parses their embedded script text using the shell-script parser.
+**Purpose**: Recognizes Bash-like shell wrapper commands and parses their inner script. It keeps PowerShell out because PowerShell has different syntax.
 
-**Data flow**: Accepts the original token vector, calls `extract_bash_command`, and if successful passes the extracted script to `parse_shell_script`, wrapping the result in `Some`. If no Bash-compatible wrapper is found, it returns `None`.
+**Data flow**: It receives original command tokens → asks the Bash extractor for an inner script → if found, passes that script to `parse_shell_script` → returns parsed summaries or nothing.
 
-**Call relations**: This is the first branch in `parse_command_impl`, giving shell-script parsing priority over flat token heuristics.
+**Call relations**: `parse_command_impl` calls this first so shell-wrapped commands get full script-aware parsing.
 
 *Call graph*: calls 2 internal fn (extract_bash_command, parse_shell_script); called by 1 (parse_command_impl).
 
@@ -3535,11 +3550,11 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>>
 fn parse_shell_script(script: &str) -> Vec<ParsedCommand>
 ```
 
-**Purpose**: Parses a Bash-compatible script string into one or more `ParsedCommand` summaries using AST-based command extraction plus the same heuristics used for flat token parsing.
+**Purpose**: Parses a Bash-compatible script string into readable command summaries. It understands command sequences and pipelines better than simple token splitting.
 
-**Data flow**: Takes `&str` script text. It first tries `try_parse_shell` and `try_parse_word_only_commands_sequence`; if either fails or yields no commands, it returns a one-element `Unknown` vector containing the original script. Otherwise it tokenizes the script with `shlex_split`, notes whether multiple commands existed, drops small formatting helpers with `drop_small_formatting_commands`, and if that empties the list returns `Unknown`. It then walks the remaining command token vectors in source order, tracking `cwd` via `cd_target` and `join_paths`, summarizing each with `summarize_main_tokens`, and rewriting `Read` paths relative to `cwd`. For multi-command results it removes `true` unknowns and repeatedly applies `simplify_once`. If exactly one command remains, it may rewrite that command's `cmd` field: for connector-free scripts it uses the joined script tokens; for pipelines it usually keeps only the primary command, except `Read` pipelines involving `sed -n`, where it preserves the full original script string for clearer UX. It returns the final `Vec<ParsedCommand>`.
+**Data flow**: It receives a script string → tries to parse it into a shell syntax tree → extracts word-only commands → drops small formatting helpers → tracks `cd` for read paths → summarizes each main command → simplifies no-ops and adjusts displayed command text → returns parsed summaries, or unknown if parsing fails.
 
-**Call relations**: Called by `parse_shell_lc_commands` and another command-analysis path for memory usage kinds. It is the richer parsing path that uses shell AST extraction before falling back to the same summarization helpers as `parse_command_impl`.
+**Call relations**: `parse_shell_lc_commands` calls this for Bash/zsh wrappers, and memory-related code also uses it to classify commands. It coordinates shell parsing, helper filtering, `summarize_main_tokens`, `join_paths`, and `simplify_once`.
 
 *Call graph*: calls 7 internal fn (try_parse_shell, try_parse_word_only_commands_sequence, cd_target, drop_small_formatting_commands, join_paths, simplify_once, summarize_main_tokens); called by 2 (memories_usage_kinds_from_command, parse_shell_lc_commands); 4 external calls (from, new, split, vec!).
 
@@ -3550,11 +3565,11 @@ fn parse_shell_script(script: &str) -> Vec<ParsedCommand>
 fn is_small_formatting_command(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Classifies commands that are usually harmless formatting or display helpers so they can be dropped from shell-script summaries.
+**Purpose**: Decides whether a command is just shaping output in a pipeline rather than being the main action. Examples include `wc`, `head` without a file, and simple `sed` filters.
 
-**Data flow**: Accepts a token slice and returns false for empty input. It then matches on the command name: always true for helpers like `wc`, `tr`, `cut`, `sort`, `uniq`, `tee`, `column`, `yes`, and `printf`; true for `xargs` only when `is_mutating_xargs_command` is false; true for `awk` when `awk_data_file_operand` finds no data file; true for `head` and `tail` only in no-file forms; and true for `sed` only when `sed_read_path` returns `None`. It returns a boolean and mutates nothing.
+**Data flow**: It receives command tokens → checks the command name and argument shape → returns true for harmless formatting helpers and false for commands that clearly read files or may mutate data.
 
-**Call relations**: Used by `drop_small_formatting_commands` and tested extensively because it strongly influences which pipeline stage becomes the user-visible summary.
+**Call relations**: `drop_small_formatting_commands` uses this when cleaning shell-script pipelines. Its decisions are heavily covered by tests because they affect what users see.
 
 *Call graph*: calls 3 internal fn (awk_data_file_operand, is_mutating_xargs_command, sed_read_path).
 
@@ -3565,11 +3580,11 @@ fn is_small_formatting_command(tokens: &[String]) -> bool
 fn is_mutating_xargs_command(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether an `xargs` pipeline stage invokes a mutating subcommand that should not be discarded as formatting noise.
+**Purpose**: Detects whether an `xargs` command appears to run a file-changing subcommand. This prevents unsafe pipelines from being dismissed as harmless formatting.
 
-**Data flow**: Calls `xargs_subcommand` to extract the delegated command after `xargs` options, then returns whether that subcommand satisfies `xargs_is_mutating_subcommand`.
+**Data flow**: It receives command tokens → extracts the subcommand run by `xargs` → checks whether that subcommand looks mutating → returns true or false.
 
-**Call relations**: This helper is only used by `is_small_formatting_command` to keep dangerous `xargs` stages visible.
+**Call relations**: `is_small_formatting_command` calls this before deciding whether `xargs` can be dropped as a helper.
 
 *Call graph*: calls 1 internal fn (xargs_subcommand); called by 1 (is_small_formatting_command).
 
@@ -3580,11 +3595,11 @@ fn is_mutating_xargs_command(tokens: &[String]) -> bool
 fn xargs_subcommand(tokens: &[String]) -> Option<&[String]>
 ```
 
-**Purpose**: Extracts the subcommand that `xargs` will execute after skipping `xargs`' own options.
+**Purpose**: Finds the command that `xargs` will run after its own options. This is needed to decide whether the pipeline might edit files.
 
-**Data flow**: Checks that the first token is `xargs`, then scans subsequent tokens. It returns the slice after `--`, or the first non-option token onward, while skipping values consumed by short options like `-E`, `-e`, `-I`, `-L`, `-n`, `-P`, and `-s`. If no subcommand is found, it returns `None`.
+**Data flow**: It receives tokens starting with `xargs` → skips known `xargs` options and their values → returns the remaining subcommand tokens, or nothing if none are found.
 
-**Call relations**: Called by `is_mutating_xargs_command` as the first step in analyzing whether an `xargs` stage is safe to drop.
+**Call relations**: `is_mutating_xargs_command` calls this, then passes the result to the mutating-subcommand check.
 
 *Call graph*: called by 1 (is_mutating_xargs_command); 1 external calls (matches!).
 
@@ -3595,11 +3610,11 @@ fn xargs_subcommand(tokens: &[String]) -> Option<&[String]>
 fn xargs_is_mutating_subcommand(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Recognizes mutating subcommands commonly used under `xargs`, such as in-place editors or replacement operations.
+**Purpose**: Checks whether an `xargs` subcommand is a known in-place editing pattern. It focuses on common tools like Perl, Ruby, sed, and ripgrep replacement.
 
-**Data flow**: Takes a token slice for the delegated subcommand, splits off the head command, and returns true for `perl` or `ruby` when `xargs_has_in_place_flag` finds in-place flags, for `sed` when in-place flags or `--in-place` are present, and for `rg` when `--replace` appears. Otherwise it returns false.
+**Data flow**: It receives subcommand tokens → looks at the command name and its flags → returns true for known mutation patterns such as in-place edit flags or `rg --replace`.
 
-**Call relations**: This helper is reached only through `is_mutating_xargs_command` after `xargs_subcommand` has isolated the delegated command.
+**Call relations**: This is used through `is_mutating_xargs_command` to keep dangerous-looking pipelines from being treated as formatting-only.
 
 *Call graph*: calls 1 internal fn (xargs_has_in_place_flag).
 
@@ -3610,11 +3625,11 @@ fn xargs_is_mutating_subcommand(tokens: &[String]) -> bool
 fn xargs_has_in_place_flag(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Detects in-place editing flags in a delegated command's argument list.
+**Purpose**: Detects in-place edit flags in command arguments. These flags mean the command may change files instead of only printing output.
 
-**Data flow**: Scans tokens and returns true if any token equals or starts with `-i` or `-pi`, covering compact forms like `-pi` and attached suffixes.
+**Data flow**: It receives argument tokens → scans for `-i`, `-pi`, or combined forms starting with those prefixes → returns true if found.
 
-**Call relations**: Used by `xargs_is_mutating_subcommand` for `perl`, `ruby`, and `sed` mutation detection.
+**Call relations**: `xargs_is_mutating_subcommand` uses this for Perl, Ruby, and sed subcommands.
 
 *Call graph*: called by 1 (xargs_is_mutating_subcommand).
 
@@ -3625,11 +3640,11 @@ fn xargs_has_in_place_flag(tokens: &[String]) -> bool
 fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<String>>
 ```
 
-**Purpose**: Removes formatting-helper command stages from a shell-script command sequence.
+**Purpose**: Removes pipeline helper commands from a list of command token groups. This leaves the parser focused on the command that produced the meaningful data.
 
-**Data flow**: Takes ownership of `Vec<Vec<String>>`, retains only those token vectors for which `is_small_formatting_command` is false, and returns the filtered vector.
+**Data flow**: It receives a list of command token lists → keeps only those that are not classified as small formatting helpers → returns the filtered list.
 
-**Call relations**: Called by `parse_shell_script` before semantic summarization so pipelines focus on primary actions rather than display helpers.
+**Call relations**: `parse_shell_script` calls this after extracting commands from a shell script.
 
 *Call graph*: called by 1 (parse_shell_script).
 
@@ -3640,11 +3655,11 @@ fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<Str
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand
 ```
 
-**Purpose**: Maps one command token vector to a concrete `ParsedCommand` by applying command-specific heuristics for listing, searching, reading, Python file walks, or unknown commands.
+**Purpose**: Turns one command, already separated from surrounding shell syntax, into a `ParsedCommand` summary. This is where most command-specific knowledge lives.
 
-**Data flow**: Accepts `&[String]`, pattern-matches on the first token, and constructs one of the `ParsedCommand` variants. Listing branches handle `ls`/`eza`/`exa`, `tree`, `du`, `rg --files`, `git ls-files`, `fd` without query, and `find` without filter. Search branches handle `rg`/`rga`, `grep`/`egrep`/`fgrep`, `git grep`, `ag`/`ack`/`pt`, `fd` with query, and `find` with `-name`/`-path`/`-regex`. Read branches handle `cat`, `bat`/`batcat`, `less`, `more`, `head`, `tail`, `awk` with data file, `nl` with file operand, and `sed -n` with valid range. Python commands become `ListFiles` only when `python_walks_files` returns true. Every known branch uses `shlex_join` for the `cmd` field and `short_display_path` for display names or paths while preserving full `PathBuf`s for reads; unmatched commands become `ParsedCommand::Unknown`.
+**Data flow**: It receives tokens for one command → matches the program name against known tools → extracts query, path, or file information while skipping flags → returns `Search`, `ListFiles`, `Read`, or `Unknown`.
 
-**Call relations**: This is the central per-command classifier used by both `parse_command_impl` and `parse_shell_script`. It delegates operand extraction to many small helpers so each command family can be parsed with command-specific rules.
+**Call relations**: `parse_command_impl` and `parse_shell_script` call this for each command segment. It delegates specialized parsing to helpers such as `parse_grep_like`, `parse_fd_query_and_path`, `parse_find_query_and_path`, `sed_read_path`, and `awk_data_file_operand`.
 
 *Call graph*: calls 13 internal fn (awk_data_file_operand, first_non_flag_operand, is_python_command, parse_fd_query_and_path, parse_find_query_and_path, parse_grep_like, python_walks_files, sed_read_path, shlex_join, short_display_path (+3 more)); called by 2 (parse_command_impl, parse_shell_script); 3 external calls (from, new, matches!).
 
@@ -3655,11 +3670,11 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand
 fn is_abs_like(path: &str) -> bool
 ```
 
-**Purpose**: Determines whether a path string should be treated as absolute, including Windows-specific forms not always covered by generic path checks.
+**Purpose**: Checks whether a path is absolute, including Unix, Windows drive-letter, and Windows network-share styles. Absolute paths should not be joined onto a current directory.
 
-**Data flow**: Checks `std::path::Path::new(path).is_absolute()`, then manually recognizes drive-letter paths like `C:\...` and UNC paths beginning with `\\`. It returns a boolean.
+**Data flow**: It receives a path string → asks the standard path library and also checks Windows-specific text patterns → returns true if the path is absolute-like.
 
-**Call relations**: Used only by `join_paths` to avoid incorrectly prefixing an already absolute path with the current working directory.
+**Call relations**: `join_paths` calls this before deciding whether to combine a base directory with a relative path.
 
 *Call graph*: called by 1 (join_paths); 1 external calls (new).
 
@@ -3670,11 +3685,11 @@ fn is_abs_like(path: &str) -> bool
 fn join_paths(base: &str, rel: &str) -> String
 ```
 
-**Purpose**: Combines an inferred current directory with a relative path while preserving absolute paths unchanged.
+**Purpose**: Combines a tracked current directory with a relative file path. It leaves absolute paths alone.
 
-**Data flow**: Takes `base` and `rel` as `&str`. If `rel` is absolute according to `is_abs_like`, it returns `rel.to_string()`. If `base` is empty, it returns `rel.to_string()`. Otherwise it pushes `rel` onto a `PathBuf` built from `base` and returns the lossy string form.
+**Data flow**: It receives a base path and a second path → if the second path is absolute-like, returns it unchanged → otherwise pushes it onto the base path and returns the combined string.
 
-**Call relations**: Both sequence parsers use this helper when a prior `cd` should affect the full path stored in a later `ParsedCommand::Read`.
+**Call relations**: `parse_command_impl` and `parse_shell_script` use this after seeing `cd` commands so later read summaries point to the effective file path.
 
 *Call graph*: calls 1 internal fn (is_abs_like); called by 2 (parse_command_impl, parse_shell_script); 1 external calls (from).
 
@@ -3684,24 +3699,24 @@ These files organize and implement cross-platform safe and dangerous command det
 
 ### `shell-command/src/command_safety/mod.rs`
 
-`orchestration` · `command validation`
+`orchestration` · `cross-cutting`
 
-This module file wires together the command-safety portion of the shell-command crate. It declares the private `powershell_parser` implementation module, publicly exposes the `is_dangerous_command` and `is_safe_command` modules that contain the actual classification logic, and conditionally includes `windows_safe_commands` only on Windows builds. That conditional compilation is significant: Windows-specific allowlists or heuristics are kept out of non-Windows targets entirely.
+This file does not contain the safety checks itself. Instead, it organizes the command-safety toolbox so the rest of the project can use it through one clear place. Think of it like the index page of a handbook: it points to the chapters that know how to spot dangerous commands, how to recognize safe ones, and how to understand PowerShell commands.
 
-The file also re-exports `try_parse_powershell_ast_commands` with crate visibility, making the parser helper available to sibling modules inside the crate without publishing it as part of the external API. This suggests a layered design where safety checks can attempt structured parsing of PowerShell input before falling back to simpler token or string heuristics.
+It declares a private PowerShell parser module, then makes two public modules available: one for detecting dangerous commands and one for checking safe commands. On Windows only, it also includes a Windows-specific list or set of rules for commands considered safe. That conditional loading matters because command behavior can be different across operating systems.
 
-Because there are no functions here, its role is purely structural: it defines which pieces belong to the command-safety subsystem, what is public to downstream crates, and what remains an internal implementation detail. Readers should treat this file as the namespace and compilation boundary for shell safety analysis rather than as a place where policy decisions are implemented directly.
+The file also re-exports `try_parse_powershell_ast_commands` for use inside this crate. In plain terms, that gives nearby code a shared way to ask, “Can we break this PowerShell text into understandable command pieces?” Without this module, other parts of the system would have to know the internal file layout and platform details themselves, making command safety harder to use and easier to misuse.
 
 
 ### `shell-command/src/command_safety/powershell_parser.rs`
 
-`io_transport` · `Windows command parsing during safety checks`
+`io_transport` · `during command safety checks, whenever a PowerShell script needs parsing`
 
-This file provides the AST-backed parsing substrate used by Windows safe-command classification. The bundled `powershell_parser.ps1` script is embedded at compile time, UTF-16LE encoded, base64-wrapped, and launched via `-EncodedCommand` in a child `powershell.exe` or `pwsh.exe` process. Because PowerShell startup is expensive, parser children are cached in a global `LazyLock<Mutex<HashMap<String, PowershellParserProcess>>>`, keyed by executable path so `powershell.exe` and `pwsh.exe` maintain separate parser streams.
+PowerShell has its own syntax rules, and guessing those rules in Rust would be risky. This file solves that by launching PowerShell itself with a bundled helper script, then sending scripts to that helper and reading back a simple answer: either a list of commands and arguments, “unsupported,” or “failed.” This matters for command safety because the rest of the system needs to know what a PowerShell command will actually run before deciding whether it is safe.
 
-`parse_with_powershell_ast` locks the cache and delegates to `parse_with_cached_process`, which lazily spawns a parser process, sends one JSON request containing a monotonic request id and base64-encoded script payload, reads one response line, deserializes it, verifies the response id matches the request, and converts the response into `PowershellParseOutcome`. If a cached child has died or its stdio is broken, the code removes it and retries once with a fresh child before returning `Failed`.
+The file works like a clerk at a translation desk. Rust writes a request as one line of JSON to the helper process’s standard input, and the helper writes one JSON response line to standard output. Each request gets an id number, so Rust can tell if the answer belongs to the question it just asked. Scripts are encoded as PowerShell expects: UTF-16 little-endian bytes, then Base64 text.
 
-`PowershellParserResponse::into_outcome` is intentionally strict: `ok` responses must contain a non-empty command list where every command and every word is non-empty, otherwise the result is downgraded to `Unsupported`. Child setup also validates that stdin and stdout pipes were actually exposed; if not, the partially spawned child is killed immediately. `Drop` for `PowershellParserProcess` always kills and waits on the child to avoid leaks. Windows-only tests verify multi-request reuse and rejection of stop-parsing forms.
+To avoid slow repeated startups, the file caches one long-lived parser process per PowerShell executable path, such as powershell.exe or pwsh.exe. A mutex, which is a lock that lets only one caller use the shared cache at a time, protects these processes. If a cached process dies or its communication breaks, the code drops it and retries once with a fresh process. When a parser process is no longer needed, it is killed and waited on so it does not linger.
 
 #### Function details
 
@@ -3711,11 +3726,11 @@ This file provides the AST-backed parsing substrate used by Windows safe-command
 fn parse_with_powershell_ast(executable: &str, script: &str) -> PowershellParseOutcome
 ```
 
-**Purpose**: Top-level entry point for parsing a PowerShell script through the cached helper-process infrastructure. It ensures parser processes are reused across calls for the same executable.
+**Purpose**: Asks a cached PowerShell parser process to parse a script using PowerShell’s own abstract syntax tree, which is PowerShell’s structured view of the script. This is the main shared entry point for getting a trustworthy parse result.
 
-**Data flow**: It takes an executable path `&str` and script `&str`, locks the global `HashMap<String, PowershellParserProcess>` inside a `Mutex`, recovering from poisoning with `PoisonError::into_inner`, then passes the mutable cache plus inputs to `parse_with_cached_process` and returns the resulting `PowershellParseOutcome`.
+**Data flow**: It receives the PowerShell executable path and the script text. It opens the global cache of parser processes, protected by a lock, then passes that cache plus the request details to parse_with_cached_process. It returns a PowershellParseOutcome: parsed commands, unsupported syntax, or failure.
 
-**Call relations**: It is called by `try_parse_powershell_ast_commands` and by higher-level PowerShell parsing code. It delegates all cache and process management details to `parse_with_cached_process`.
+**Call relations**: This is called by try_parse_powershell_ast_commands when callers only want command lists, and by parse_powershell_script in the wider command safety flow. It delegates the real cache lookup, process startup, retry, and parsing work to parse_with_cached_process.
 
 *Call graph*: calls 1 internal fn (parse_with_cached_process); called by 2 (try_parse_powershell_ast_commands, parse_powershell_script); 1 external calls (new).
 
@@ -3729,11 +3744,11 @@ fn try_parse_powershell_ast_commands(
 ) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Convenience wrapper that returns parsed command vectors only when the parser outcome is a successful `Commands` result. Unsupported or failed parses are collapsed to `None`.
+**Purpose**: Provides a simpler interface for callers that only care about successfully extracted commands. It hides the difference between unsupported PowerShell syntax and parser failure by returning no result for either case.
 
-**Data flow**: It takes an executable path and script, calls `parse_with_powershell_ast`, matches the returned `PowershellParseOutcome`, and returns `Some(Vec<Vec<String>>)` only for the `Commands` variant.
+**Data flow**: It receives an executable path and script text, then calls parse_with_powershell_ast. If the outcome contains commands, it returns them wrapped in Some. If the outcome is unsupported or failed, it returns None.
 
-**Call relations**: It is the simpler optional API layered on top of the richer outcome enum.
+**Call relations**: This function is a convenience wrapper around parse_with_powershell_ast. It is useful for code that can fall back to another approach when the PowerShell parser cannot provide a clean command list.
 
 *Call graph*: calls 1 internal fn (parse_with_powershell_ast).
 
@@ -3748,11 +3763,11 @@ fn parse_with_cached_process(
 ) -> PowershellParseOutcome
 ```
 
-**Purpose**: Maintains one parser child per executable path, spawning lazily and retrying once if a cached child becomes unusable. It is the core request/response orchestration function.
+**Purpose**: Finds or starts the right long-lived PowerShell parser process, sends the script to it, and retries once if the cached process appears broken. This keeps parsing fast without trusting a stale child process forever.
 
-**Data flow**: It takes a mutable parser-process map, an executable path, and a script. It builds a string cache key from the executable, loops for up to two attempts, spawns a `PowershellParserProcess` if the key is absent, fetches the mutable process, calls `parser_process.parse(script)`, returns the outcome on success, removes the cached process and retries once on I/O failure, and otherwise returns `PowershellParseOutcome::Failed`.
+**Data flow**: It receives the mutable process cache, the PowerShell executable path, and script text. It uses the executable path as the cache key, starts a new PowershellParserProcess if needed, and asks that process to parse the script. If the first attempt fails because the process is unusable, it removes the cached process and tries once more. It returns commands, unsupported, or failed.
 
-**Call relations**: It is called only by `parse_with_powershell_ast`. It delegates child creation to `PowershellParserProcess::spawn` and per-request protocol handling to `PowershellParserProcess::parse`.
+**Call relations**: parse_with_powershell_ast calls this after locking the shared cache. When a parser process is missing, this function calls PowershellParserProcess::spawn. Once it has a process, it hands the script to that process’s parse method.
 
 *Call graph*: calls 1 internal fn (spawn); called by 1 (parse_with_powershell_ast).
 
@@ -3763,11 +3778,11 @@ fn parse_with_cached_process(
 fn encode_powershell_base64(script: &str) -> String
 ```
 
-**Purpose**: Encodes a PowerShell script string into the UTF-16LE base64 form expected by PowerShell’s `-EncodedCommand` and by the parser protocol payload. This matches native PowerShell command encoding semantics.
+**Purpose**: Converts text into the Base64 format PowerShell expects for encoded commands and payloads. PowerShell’s encoded-command mode uses UTF-16 little-endian text, not ordinary UTF-8.
 
-**Data flow**: It takes a script `&str`, allocates a `Vec<u8>` sized for UTF-16 bytes, iterates `encode_utf16()`, appends each code unit’s little-endian bytes, base64-encodes the resulting byte vector, and returns the encoded `String`.
+**Data flow**: It receives a Rust string. It turns each character into UTF-16 units, stores those units as little-endian bytes, and Base64-encodes the bytes. It returns the encoded string.
 
-**Call relations**: It is used both to pre-encode the bundled parser script and to encode each script payload sent to the helper process.
+**Call relations**: PowershellParserProcess::parse uses this to encode each script being checked before sending it to the helper process. encoded_parser_script also uses the same conversion indirectly to prepare the bundled parser script.
 
 *Call graph*: called by 1 (parse); 1 external calls (with_capacity).
 
@@ -3778,11 +3793,11 @@ fn encode_powershell_base64(script: &str) -> String
 fn encoded_parser_script() -> &'static str
 ```
 
-**Purpose**: Lazily computes and caches the base64-encoded bundled parser script. This avoids re-encoding the static script on every parser spawn.
+**Purpose**: Provides the bundled PowerShell helper script in the encoded form needed to start PowerShell with -EncodedCommand. It computes this once and reuses it.
 
-**Data flow**: It takes no arguments, initializes a `LazyLock<String>` by calling `encode_powershell_base64(POWERSHELL_PARSER_SCRIPT)` on first use, and returns a shared `&'static str` reference to the cached encoded script.
+**Data flow**: It reads the built-in powershell_parser.ps1 source text. On first use, it Base64-encodes that script in PowerShell’s expected format and stores it. Later calls return a reference to the same encoded string.
 
-**Call relations**: It is called by `PowershellParserProcess::spawn` when launching the helper child.
+**Call relations**: PowershellParserProcess::spawn calls this when launching the helper process. This keeps startup arguments ready without re-encoding the helper script for every new child process.
 
 *Call graph*: called by 1 (spawn); 1 external calls (new).
 
@@ -3793,11 +3808,11 @@ fn encoded_parser_script() -> &'static str
 fn spawn(executable: &str) -> std::io::Result<Self>
 ```
 
-**Purpose**: Launches a PowerShell child process running the bundled parser script and captures its stdin/stdout for the JSON protocol. It validates pipe availability and cleans up on partial setup failure.
+**Purpose**: Starts a new PowerShell child process running the bundled parser helper script. It prepares the pipes that Rust will use to send parse requests and read responses.
 
-**Data flow**: It takes an executable path `&str`, builds a `Command` with `-NoLogo`, `-NoProfile`, `-NonInteractive`, and `-EncodedCommand <encoded_parser_script()>`, configures piped stdin/stdout and null stderr, spawns the child, extracts `ChildStdin` with `take_child_stdin`, extracts `ChildStdout` wrapped in `BufReader` with `take_child_stdout`, kills the child if either extraction fails, and returns a `PowershellParserProcess` with `next_request_id` initialized to 0.
+**Data flow**: It receives a PowerShell executable path. It starts that executable with flags that disable profiles and interactive behavior, passes the encoded helper script, opens standard input and output as pipes, and discards standard error. If either pipe cannot be captured, it kills the child and returns an error. On success, it returns a PowershellParserProcess with request id tracking set to zero.
 
-**Call relations**: It is called by `parse_with_cached_process` on cache misses and directly by Windows tests. It delegates cleanup to `kill_child` and pipe extraction to dedicated helpers.
+**Call relations**: parse_with_cached_process calls this when there is no usable cached process. The Windows tests also call it directly to verify the helper can answer multiple requests and reject unsupported syntax. It relies on encoded_parser_script, take_child_stdin, take_child_stdout, and kill_child.
 
 *Call graph*: calls 4 internal fn (encoded_parser_script, kill_child, take_child_stdin, take_child_stdout); called by 3 (parse_with_cached_process, parser_process_handles_multiple_requests, parser_process_rejects_stop_parsing_forms); 3 external calls (null, piped, new).
 
@@ -3808,11 +3823,11 @@ fn spawn(executable: &str) -> std::io::Result<Self>
 fn parse(&mut self, script: &str) -> std::io::Result<PowershellParseOutcome>
 ```
 
-**Purpose**: Sends one script parse request to the helper child and reads back one structured response. It also detects protocol desynchronization via request ids.
+**Purpose**: Sends one script to an already-running parser process and reads one answer back. It is the core request-and-response conversation with the PowerShell helper.
 
-**Data flow**: It takes `&mut self` and a script `&str`, builds a `PowershellParserRequest` with the current `next_request_id` and base64-encoded payload, increments `next_request_id` with wrapping arithmetic, serializes the request to JSON with `serialize_request`, appends a newline, writes and flushes it to child stdin, reads one line from child stdout, errors on EOF, deserializes the line with `deserialize_response`, verifies `response.id == request.id`, converts the response with `into_outcome`, and returns the outcome or an I/O error.
+**Data flow**: It receives script text and uses the process’s next request id. It Base64-encodes the script, wraps the id and payload in JSON, writes that JSON line to the child process, then reads one response line. It parses the response JSON, checks that the response id matches the request id, and converts the response into a PowershellParseOutcome. It also advances the next request id.
 
-**Call relations**: It is the per-request worker used by `parse_with_cached_process`. Its error results are what trigger cache eviction and one retry in the caller.
+**Call relations**: parse_with_cached_process calls this after finding or creating a parser process. Inside, it uses encode_powershell_base64, serialize_request, deserialize_response, and the process’s stdin/stdout streams. If it detects broken output, end-of-file, or mismatched ids, the caller can discard the cached process.
 
 *Call graph*: calls 3 internal fn (deserialize_response, encode_powershell_base64, serialize_request); 6 external calls (read_line, flush, write_all, new, new, format!).
 
@@ -3823,11 +3838,11 @@ fn parse(&mut self, script: &str) -> std::io::Result<PowershellParseOutcome>
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures the helper child process is terminated when the parser-process wrapper is dropped. This prevents leaked background parser processes.
+**Purpose**: Cleans up the external PowerShell process when the Rust wrapper is destroyed. This prevents helper processes from being left running in the background.
 
-**Data flow**: It takes `&mut self`, calls `kill_child(&mut self.child)`, and returns nothing.
+**Data flow**: It receives the parser process being dropped. It calls kill_child on the stored child process. Nothing is returned; the side effect is process cleanup.
 
-**Call relations**: It runs automatically when cached parser processes are removed or when the cache is dropped at process shutdown.
+**Call relations**: Rust calls this automatically when a PowershellParserProcess leaves the cache or is otherwise dropped. It hands the actual kill-and-wait work to kill_child.
 
 *Call graph*: calls 1 internal fn (kill_child).
 
@@ -3838,11 +3853,11 @@ fn drop(&mut self)
 fn take_child_stdin(child: &mut Child) -> std::io::Result<ChildStdin>
 ```
 
-**Purpose**: Extracts the child process stdin pipe or returns a broken-pipe error if it was not configured. It turns an optional handle into a checked invariant.
+**Purpose**: Takes ownership of the child process’s input pipe so Rust can write parser requests to it. If the pipe is missing, it turns that into a clear input/output error.
 
-**Data flow**: It takes `&mut Child`, calls `child.stdin.take()`, and returns `Ok(ChildStdin)` if present or a `std::io::Error` with `ErrorKind::BrokenPipe` otherwise.
+**Data flow**: It receives a mutable child process. It removes the child’s stdin handle from the child structure and returns it. If there is no stdin pipe, it returns a BrokenPipe error explaining that the parser child did not expose stdin.
 
-**Call relations**: It is used during `PowershellParserProcess::spawn` before the process is considered usable.
+**Call relations**: PowershellParserProcess::spawn calls this immediately after launching PowerShell. If this fails, spawn kills the child because the parser process would be unusable without an input pipe.
 
 *Call graph*: called by 1 (spawn).
 
@@ -3853,11 +3868,11 @@ fn take_child_stdin(child: &mut Child) -> std::io::Result<ChildStdin>
 fn take_child_stdout(child: &mut Child) -> std::io::Result<BufReader<ChildStdout>>
 ```
 
-**Purpose**: Extracts the child process stdout pipe and wraps it in a buffered reader, or returns a broken-pipe error if stdout was unavailable. This prepares line-oriented protocol reads.
+**Purpose**: Takes ownership of the child process’s output pipe and wraps it in a buffered reader, which makes reading one response line at a time efficient and simple.
 
-**Data flow**: It takes `&mut Child`, calls `child.stdout.take()`, maps the handle into `BufReader<ChildStdout>`, and returns an `ErrorKind::BrokenPipe` error if absent.
+**Data flow**: It receives a mutable child process. It removes the child’s stdout handle, wraps it in BufReader, and returns it. If stdout is missing, it returns a BrokenPipe error explaining the problem.
 
-**Call relations**: It is the stdout counterpart to `take_child_stdin`, used during parser-process spawn.
+**Call relations**: PowershellParserProcess::spawn calls this after taking stdin. If this fails, spawn kills the child because Rust would have no way to read parser responses.
 
 *Call graph*: called by 1 (spawn).
 
@@ -3868,11 +3883,11 @@ fn take_child_stdout(child: &mut Child) -> std::io::Result<BufReader<ChildStdout
 fn serialize_request(request: &PowershellParserRequest) -> std::io::Result<String>
 ```
 
-**Purpose**: Serializes a parser request struct to JSON and converts serialization failures into `std::io::Error`. This keeps the parser protocol on one error type.
+**Purpose**: Turns a parser request into JSON text so it can be sent over the child process pipe. JSON is used here as a simple, line-based message format.
 
-**Data flow**: It takes a `&PowershellParserRequest`, calls `serde_json::to_string`, and returns either the JSON `String` or an `ErrorKind::InvalidData` I/O error containing the serialization message.
+**Data flow**: It receives a PowershellParserRequest containing an id and encoded script payload. It asks serde_json to convert it to a string. On success it returns the JSON text; on failure it returns an input/output error with context.
 
-**Call relations**: It is called by `PowershellParserProcess::parse` before writing a request to child stdin.
+**Call relations**: PowershellParserProcess::parse calls this before writing to the PowerShell helper. The resulting text is followed by a newline so the helper can read one complete request.
 
 *Call graph*: called by 1 (parse); 1 external calls (to_string).
 
@@ -3883,11 +3898,11 @@ fn serialize_request(request: &PowershellParserRequest) -> std::io::Result<Strin
 fn deserialize_response(response_line: &str) -> std::io::Result<PowershellParserResponse>
 ```
 
-**Purpose**: Parses one JSON response line from the helper child and converts parse failures into `std::io::Error`. This mirrors `serialize_request` on the receive side.
+**Purpose**: Turns one JSON response line from the PowerShell helper back into a Rust response structure. This is how the file checks what the helper said.
 
-**Data flow**: It takes a response line `&str`, calls `serde_json::from_str` into `PowershellParserResponse`, and returns either the parsed struct or an `ErrorKind::InvalidData` I/O error.
+**Data flow**: It receives a line of response text. It asks serde_json to parse it into a PowershellParserResponse. On success it returns the structured response; on failure it returns an input/output error that includes the parse problem.
 
-**Call relations**: It is called by `PowershellParserProcess::parse` after reading one line from child stdout.
+**Call relations**: PowershellParserProcess::parse calls this after reading from the child process. The parsed response is then checked for the right request id and converted into a higher-level outcome.
 
 *Call graph*: called by 1 (parse); 1 external calls (from_str).
 
@@ -3898,11 +3913,11 @@ fn deserialize_response(response_line: &str) -> std::io::Result<PowershellParser
 fn into_outcome(self) -> PowershellParseOutcome
 ```
 
-**Purpose**: Converts a deserialized protocol response into the public parse outcome enum while validating command payload shape. It treats malformed `ok` payloads as unsupported rather than trusted commands.
+**Purpose**: Converts the raw helper response into the result type used by the rest of this Rust code. It also rejects suspicious or empty command data instead of treating it as a valid parse.
 
-**Data flow**: It takes ownership of `self`, matches `self.status`, returns `Commands(commands)` only when status is `ok` and `commands` is present, non-empty, and every command and word is non-empty; returns `Unsupported` for status `unsupported` or malformed `ok` payloads; and returns `Failed` for any other status.
+**Data flow**: It consumes a response containing a status string and optional command lists. If the status is ok, it accepts the commands only when there is at least one command, every command has at least one word, and no word is empty. Valid commands become PowershellParseOutcome::Commands. Empty or malformed command data becomes Unsupported. A status of unsupported becomes Unsupported, and any other status becomes Failed.
 
-**Call relations**: It is the final interpretation step in `PowershellParserProcess::parse` after JSON deserialization and request-id validation.
+**Call relations**: PowershellParserProcess::parse calls this after confirming the response id matches the request. This function is the final gate between the helper process’s raw message and the safer outcome used by callers.
 
 
 ##### `kill_child`  (lines 262–265)
@@ -3911,11 +3926,11 @@ fn into_outcome(self) -> PowershellParseOutcome
 fn kill_child(child: &mut Child)
 ```
 
-**Purpose**: Best-effort terminates a child process and waits for it to exit. It ignores errors because cleanup should not panic.
+**Purpose**: Stops a PowerShell helper process and waits for it to finish. Waiting matters because it lets the operating system fully clean up the child process.
 
-**Data flow**: It takes `&mut Child`, calls `child.kill()` and `child.wait()`, discards both results, and returns nothing.
+**Data flow**: It receives a mutable child process handle. It asks the operating system to kill the process, then waits for it to exit. It ignores errors because cleanup should not cause a new failure path while already recovering or dropping.
 
-**Call relations**: It is used during spawn cleanup, by `Drop`, and whenever a partially initialized parser child must be torn down.
+**Call relations**: PowershellParserProcess::drop calls this during normal cleanup. PowershellParserProcess::spawn also calls it if startup only partially succeeds and the new child cannot be used.
 
 *Call graph*: called by 2 (drop, spawn); 2 external calls (kill, wait).
 
@@ -3926,11 +3941,11 @@ fn kill_child(child: &mut Child)
 fn parser_process_handles_multiple_requests()
 ```
 
-**Purpose**: Verifies that one parser child can successfully process multiple sequential requests. This confirms the long-lived request/response protocol works across calls.
+**Purpose**: Checks that one parser process can answer more than one request in a row. This protects the caching behavior, because caching only works if the long-lived helper keeps speaking the protocol correctly.
 
-**Data flow**: The test locates a PowerShell executable if available, spawns a `PowershellParserProcess`, parses `Get-Content 'foo bar'` and `Write-Output foo | Measure-Object`, and asserts the returned `PowershellParseOutcome::Commands` values match the expected command vectors.
+**Data flow**: The test looks for an installed PowerShell executable. If none is found, it exits quietly. Otherwise it starts a parser process, sends one script, checks the parsed command result, sends a second script through the same process, and checks that result too.
 
-**Call relations**: It directly exercises `PowershellParserProcess::spawn` and repeated calls to `PowershellParserProcess::parse`.
+**Call relations**: This Windows-only test calls PowershellParserProcess::spawn directly and uses the process’s parse method through the parser value. It supports the design used by parse_with_cached_process, where one child process is reused for repeated safety checks.
 
 *Call graph*: calls 2 internal fn (spawn, try_find_powershell_executable_blocking); 1 external calls (assert_eq!).
 
@@ -3941,24 +3956,24 @@ fn parser_process_handles_multiple_requests()
 fn parser_process_rejects_stop_parsing_forms()
 ```
 
-**Purpose**: Checks that stop-parsing forms such as `--%` are not returned as parsed commands. They should be classified as unsupported by the parser pipeline.
+**Purpose**: Checks that the parser reports PowerShell stop-parsing syntax as unsupported. Stop-parsing syntax can change how later text is interpreted, so treating it as a normal command list would be unsafe.
 
-**Data flow**: The test locates PowerShell if available, spawns a parser process, parses `git log --% HEAD --output=codex_poc.txt`, and asserts the outcome is `PowershellParseOutcome::Unsupported`.
+**Data flow**: The test looks for an installed PowerShell executable. If none is found, it exits quietly. Otherwise it starts a parser process, sends a script using the stop-parsing marker, and verifies that the outcome is Unsupported.
 
-**Call relations**: It validates the parser script plus response interpretation path for unsupported PowerShell syntax.
+**Call relations**: This Windows-only test calls PowershellParserProcess::spawn and then parses a specific risky form. It confirms that the helper response is converted into the conservative outcome expected by the safety-checking flow.
 
 *Call graph*: calls 2 internal fn (spawn, try_find_powershell_executable_blocking); 1 external calls (assert_eq!).
 
 
 ### `shell-command/src/command_safety/windows_dangerous_commands.rs`
 
-`domain_logic` · `Windows command approval and danger heuristics`
+`domain_logic` · `command safety check before execution`
 
-This file contains the Windows-only danger classifier used by the cross-platform `command_might_be_dangerous` wrapper. The top-level flow checks three categories in order: PowerShell invocations, CMD invocations, and direct GUI/browser launchers. PowerShell detection first recognizes `powershell`/`pwsh` executables, then best-effort parses the invocation into tokens using `parse_powershell_invocation`, and finally scans those tokens in lowercase form for URL-bearing launch commands (`Start-Process`, `Invoke-Item`, COM/ShellExecute references, `rundll32 url.dll,FileProtocolHandler`, `mshta`, browsers, `explorer`) or force-delete cmdlets such as `Remove-Item`, `ri`, `rm`, `del`, `erase`, `rd`, and `rmdir` combined with `-Force` in the same rough command segment.
+Windows has several ways to run something indirectly. A command might call PowerShell, CMD, Explorer, rundll32, mshta, or a browser, and those tools can then open a web page or delete files. This file is a safety filter for that situation. It is like a gatekeeper checking a package label before letting it into the building: it does not fully understand every possible script, but it looks for clear warning signs.
 
-CMD detection recognizes `cmd`/`cmd.exe`, skips leading switches until `/c`, `/r`, or `-c`, tokenizes the remaining command body with `shlex`, then further splits embedded operators like `echo hi&del` into separate tokens. It scans each command segment separated by `&`, `&&`, `|`, or `||` for `start <url>`, `del/erase /f`, and `rd/rmdir /s /q`.
+The main entry point first checks whether the command is a PowerShell command. If so, it tries to turn the script text into simple words and looks for dangerous patterns, such as Start-Process with an http or https URL, ShellExecute-style calls, browser launches, or Remove-Item with -Force. Next it checks CMD commands. It looks past CMD options such as /c, splits command chains like "echo hi & del /f file", and flags URL launches or forceful deletion commands. Finally, it checks direct launches of GUI tools, such as msedge.exe or explorer.exe with a URL.
 
-URL detection is heuristic but careful: `looks_like_url` trims common punctuation with a lazily compiled regex, also extracts embedded `http://` or `https://` substrings, and then validates with `url::Url`. Tests cover many bypass-shaped inputs including semicolons, blocks, comma-separated PowerShell tokens, uppercase flags, single-string CMD bodies, and no-space operator concatenation.
+The code is deliberately "best effort." It is not a complete PowerShell or CMD interpreter. Instead, it catches common high-risk forms while avoiding obvious false alarms, such as Explorer opening a local folder or a path that merely contains the letter f.
 
 #### Function details
 
@@ -3968,11 +3983,11 @@ URL detection is heuristic but careful: `looks_like_url` trims common punctuatio
 fn is_dangerous_command_windows(command: &[String]) -> bool
 ```
 
-**Purpose**: Top-level Windows dangerous-command classifier. It checks PowerShell, CMD, and direct GUI/browser launch patterns in that order.
+**Purpose**: This is the main Windows safety question: given a command as a list of words, should it be treated as dangerous? It checks PowerShell, CMD, and direct Windows GUI launches in that order.
 
-**Data flow**: It takes `&[String]`, returns `true` if `is_dangerous_powershell(command)`, `is_dangerous_cmd(command)`, or `is_direct_gui_launch(command)` returns true, and otherwise returns `false`.
+**Data flow**: It receives the full command list, starting with the program name. It asks the PowerShell checker first, then the CMD checker, then the direct-launch checker. It returns true as soon as one checker finds danger, otherwise it returns false.
 
-**Call relations**: It is called by the cross-platform `command_might_be_dangerous` wrapper when compiled on Windows.
+**Call relations**: The broader command safety layer calls this through command_might_be_dangerous when it needs a Windows-specific answer. This function then delegates to is_dangerous_powershell, is_dangerous_cmd, and is_direct_gui_launch so each Windows command style can be inspected in its own way.
 
 *Call graph*: calls 3 internal fn (is_dangerous_cmd, is_dangerous_powershell, is_direct_gui_launch); called by 1 (command_might_be_dangerous).
 
@@ -3983,11 +3998,11 @@ fn is_dangerous_command_windows(command: &[String]) -> bool
 fn is_dangerous_powershell(command: &[String]) -> bool
 ```
 
-**Purpose**: Recognizes dangerous PowerShell invocations by parsing the wrapper and scanning the resulting token stream. It only applies to PowerShell executables.
+**Purpose**: This function checks whether a command is a PowerShell or pwsh invocation that contains risky behavior. It filters out non-PowerShell commands before doing any script-specific inspection.
 
-**Data flow**: It takes `&[String]`, splits off the executable, rejects non-PowerShell executables via `is_powershell_executable`, parses the remaining invocation with `parse_powershell_invocation`, and if successful passes the parsed tokens to `is_dangerous_powershell_words`.
+**Data flow**: It receives the command list, separates the executable name from the rest, and checks whether the executable is PowerShell. If it is, it parses the PowerShell arguments into a flat list of script words, then asks the word-level checker whether those words are dangerous. It returns a yes/no answer.
 
-**Call relations**: It is the first branch checked by `is_dangerous_command_windows`, delegating wrapper parsing and token-level danger checks to helpers.
+**Call relations**: is_dangerous_command_windows calls this first because PowerShell can hide risky actions inside one script string. It uses is_powershell_executable to confirm the program, parse_powershell_invocation to extract script words, and is_dangerous_powershell_words to inspect those words.
 
 *Call graph*: calls 3 internal fn (is_dangerous_powershell_words, is_powershell_executable, parse_powershell_invocation); called by 1 (is_dangerous_command_windows).
 
@@ -3998,11 +4013,11 @@ fn is_dangerous_powershell(command: &[String]) -> bool
 fn is_dangerous_powershell_words(words: &[String]) -> bool
 ```
 
-**Purpose**: Scans tokenized PowerShell words for dangerous URL-launching behavior and force-delete cmdlets. It is designed for both full invocations and already-tokenized PowerShell command words.
+**Purpose**: This function inspects already-parsed PowerShell words for warning signs. It looks for URL-opening commands, ShellExecute-style calls, browser launches, Explorer URL launches, mshta URL launches, and forceful delete operations.
 
-**Data flow**: It takes `&[String]`, builds a lowercase/trimmed token vector, computes `has_url` with `args_have_url`, returns `true` for URL-bearing `Start-Process`/`Invoke-Item` aliases or ShellExecute/COM references, for `rundll32 url.dll,fileprotocolhandler`, `mshta`, browsers, or `explorer` with URLs, and otherwise falls back to `has_force_delete_cmdlet(&tokens_lc)`.
+**Data flow**: It receives a list of words from a PowerShell script. It lowercases and unquotes them for easier comparison, checks whether any word looks like an http or https URL, then searches for risky command names or delete-plus-force combinations. It returns true if it finds one of those patterns.
 
-**Call relations**: It is called from `is_dangerous_powershell` and also exposed indirectly through the cross-platform module for already tokenized PowerShell words.
+**Call relations**: is_dangerous_powershell hands parsed script tokens to this function. It relies on args_have_url to detect web links, is_browser_executable to recognize common browsers, and has_force_delete_cmdlet to catch destructive PowerShell deletion patterns.
 
 *Call graph*: calls 3 internal fn (args_have_url, has_force_delete_cmdlet, is_browser_executable); called by 2 (is_dangerous_powershell_words, is_dangerous_powershell); 1 external calls (matches!).
 
@@ -4013,11 +4028,11 @@ fn is_dangerous_powershell_words(words: &[String]) -> bool
 fn is_dangerous_cmd(command: &[String]) -> bool
 ```
 
-**Purpose**: Detects dangerous CMD invocations such as `start <url>`, `del /f`, and `rd /s /q`, including chained and compact operator forms. It only applies to `cmd`/`cmd.exe` wrappers.
+**Purpose**: This function checks commands run through Windows CMD, especially commands passed after /c or /r. It catches shell launches of URLs and forceful or recursive deletion commands.
 
-**Data flow**: It takes `&[String]`, splits off the executable, normalizes its basename with `executable_basename`, scans wrapper args until `/c`, `/r`, or `-c` while tolerating leading slash switches, collects the remaining command body, tokenizes a single-string body with `shlex_split` or uses the remaining argv directly, refines tokens with `split_embedded_cmd_operators`, splits segments on `&`, `&&`, `|`, and `||`, and returns `true` if any segment matches the dangerous `start`, `del/erase /f`, or `rd/rmdir /s /q` patterns.
+**Data flow**: It receives the full command list, confirms the executable is cmd or cmd.exe, skips CMD startup switches until it reaches the command body, and breaks that body into simpler tokens. It then examines each command segment separated by &, &&, |, or ||. It returns true if a segment starts a URL, force-deletes a file, or removes a directory recursively and quietly.
 
-**Call relations**: It is the second branch checked by `is_dangerous_command_windows`, after PowerShell detection.
+**Call relations**: is_dangerous_command_windows calls this after the PowerShell check. It uses executable_basename to identify CMD and split_embedded_cmd_operators to notice chained commands even when operators are stuck to nearby text.
 
 *Call graph*: calls 1 internal fn (executable_basename); called by 1 (is_dangerous_command_windows); 1 external calls (split).
 
@@ -4028,11 +4043,11 @@ fn is_dangerous_cmd(command: &[String]) -> bool
 fn is_direct_gui_launch(command: &[String]) -> bool
 ```
 
-**Purpose**: Flags direct executable launches that open URLs through Explorer, browsers, `mshta`, or `rundll32 url.dll,FileProtocolHandler`. It catches dangerous forms that are not wrapped in CMD or PowerShell.
+**Purpose**: This function catches direct use of Windows programs that can open web links without going through PowerShell or CMD. Examples include Explorer, mshta, rundll32 with url.dll, and common browsers.
 
-**Data flow**: It takes `&[String]`, splits off the executable, normalizes its basename, checks the remaining args for URLs with `args_have_url`, and returns `true` for `explorer`, `mshta`, `rundll32` with the URL DLL handler, or known browser executables when a URL is present.
+**Data flow**: It receives the command list, extracts the executable name, and looks through the remaining arguments for an http or https URL. If the executable is one of the known URL-opening programs and a URL is present, it returns true. Otherwise it returns false.
 
-**Call relations**: It is the final fallback branch in `is_dangerous_command_windows` after wrapper-specific checks.
+**Call relations**: is_dangerous_command_windows calls this as the final fallback after structured PowerShell and CMD checks. It uses executable_basename, args_have_url, and is_browser_executable to make the decision.
 
 *Call graph*: calls 3 internal fn (args_have_url, executable_basename, is_browser_executable); called by 1 (is_dangerous_command_windows); 1 external calls (matches!).
 
@@ -4043,11 +4058,11 @@ fn is_direct_gui_launch(command: &[String]) -> bool
 fn split_embedded_cmd_operators(token: &str) -> Vec<String>
 ```
 
-**Purpose**: Splits a single CMD token containing concatenated operators into separate tokens, such as turning `echo hi&del` into `echo hi`, `&`, `del`. This improves segment-based CMD analysis.
+**Purpose**: This helper separates CMD chaining symbols from neighboring text. That matters because CMD allows compact forms like "echo hi&del", where the dangerous command is hidden after an ampersand.
 
-**Data flow**: It takes a token `&str`, scans character indices, emits preceding text and operator tokens for `&`, `&&`, `|`, and `||`, retains any trailing text, removes empty/whitespace-only parts, and returns `Vec<String>`.
+**Data flow**: It receives one token of text. It scans for &, &&, |, and ||, cuts the text around those operators, removes empty pieces, and returns a list of cleaner pieces. The returned list can then be examined command by command.
 
-**Call relations**: It is used by `is_dangerous_cmd` after initial tokenization so chained commands without spaces are still analyzed correctly.
+**Call relations**: The CMD checker uses this after basic command splitting, so chained commands can be noticed even when there are no spaces around the operator.
 
 *Call graph*: 1 external calls (new).
 
@@ -4058,11 +4073,11 @@ fn split_embedded_cmd_operators(token: &str) -> Vec<String>
 fn has_force_delete_cmdlet(tokens: &[String]) -> bool
 ```
 
-**Purpose**: Detects PowerShell delete/remove cmdlets combined with `-Force` within the same rough command segment. It is resilient to punctuation, blocks, and compact formatting.
+**Purpose**: This function looks for PowerShell delete commands used with the -Force option in the same command segment. That combination is risky because it can remove protected or read-only files more aggressively.
 
-**Data flow**: It takes tokenized lowercase strings, builds rough segments by splitting on hard separators like `;`, `|`, `&`, and newlines, then within each segment splits tokens on soft punctuation like braces, parens, brackets, commas, and semicolons, scans the resulting atoms for any delete cmdlet alias and any `-force` or `-force:` form, and returns `true` if both appear in one segment.
+**Data flow**: It receives normalized PowerShell tokens. It divides them into rough command segments at hard separators like semicolons, pipes, ampersands, or newlines, then splits punctuation such as braces and commas inside each segment. For each segment, it checks whether a delete command and -Force appear together. It returns true only when both are found in the same segment.
 
-**Call relations**: It is the destructive-operation fallback used by `is_dangerous_powershell_words` after URL-launch checks.
+**Call relations**: is_dangerous_powershell_words calls this after URL-related checks. It is what lets the PowerShell safety path catch commands like Remove-Item test -Force while avoiding a separate harmless -Force used with another command.
 
 *Call graph*: called by 1 (is_dangerous_powershell_words); 3 external calls (new, new, vec!).
 
@@ -4073,11 +4088,11 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool
 fn has_force_flag_cmd(args: &[String]) -> bool
 ```
 
-**Purpose**: Checks whether a CMD argument list contains the `/f` force flag. It is a tiny helper for `del`/`erase` detection.
+**Purpose**: This helper checks whether a CMD command includes the exact /f force flag. It is used for del and erase commands, where /f means force deletion of read-only files.
 
-**Data flow**: It takes `&[String]`, performs a case-insensitive equality check for `/f` across the slice, and returns a boolean.
+**Data flow**: It receives the arguments in one CMD command segment. It scans them case-insensitively for /f and returns true if that exact flag is present. It does not treat ordinary paths containing the letter f as a match.
 
-**Call relations**: It is used by `is_dangerous_cmd` when evaluating `del` and `erase` segments.
+**Call relations**: The CMD danger check uses this when it has found a del or erase command. It supplies the small flag-specific answer needed to decide whether that segment should be blocked.
 
 
 ##### `has_recursive_flag_cmd`  (lines 298–300)
@@ -4086,11 +4101,11 @@ fn has_force_flag_cmd(args: &[String]) -> bool
 fn has_recursive_flag_cmd(args: &[String]) -> bool
 ```
 
-**Purpose**: Checks whether a CMD argument list contains the `/s` recursive flag. It supports dangerous `rd`/`rmdir` detection.
+**Purpose**: This helper checks whether a CMD directory-removal command includes /s, the recursive flag. Recursive removal is risky because it can delete a whole folder tree.
 
-**Data flow**: It takes `&[String]`, scans for a case-insensitive `/s`, and returns a boolean.
+**Data flow**: It receives the arguments in one CMD command segment. It scans them case-insensitively for the exact /s flag and returns true if it is present.
 
-**Call relations**: It is used by `is_dangerous_cmd` together with `has_quiet_flag_cmd`.
+**Call relations**: The CMD danger check uses this for rd and rmdir segments. It is combined with has_quiet_flag_cmd so the code only flags the especially dangerous recursive-and-quiet form.
 
 
 ##### `has_quiet_flag_cmd`  (lines 303–305)
@@ -4099,11 +4114,11 @@ fn has_recursive_flag_cmd(args: &[String]) -> bool
 fn has_quiet_flag_cmd(args: &[String]) -> bool
 ```
 
-**Purpose**: Checks whether a CMD argument list contains the `/q` quiet flag. It is part of the recursive directory removal heuristic.
+**Purpose**: This helper checks whether a CMD directory-removal command includes /q, the quiet flag. Quiet mode is risky because it suppresses confirmation prompts.
 
-**Data flow**: It takes `&[String]`, scans for a case-insensitive `/q`, and returns a boolean.
+**Data flow**: It receives the arguments in one CMD command segment. It scans them case-insensitively for the exact /q flag and returns true if it is present.
 
-**Call relations**: It is used by `is_dangerous_cmd` to require both `/s` and `/q` for dangerous `rd`/`rmdir` classification.
+**Call relations**: The CMD danger check uses this together with has_recursive_flag_cmd for rd and rmdir. Together they identify commands such as rmdir /s /q, which can remove a directory tree without asking.
 
 
 ##### `args_have_url`  (lines 307–309)
@@ -4112,11 +4127,11 @@ fn has_quiet_flag_cmd(args: &[String]) -> bool
 fn args_have_url(args: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether any argument in a slice looks like an HTTP or HTTPS URL. It is a shared helper for launcher heuristics.
+**Purpose**: This helper answers a simple question: does any argument contain an http or https URL? Many dangerous Windows launch paths become risky only when a web link is involved.
 
-**Data flow**: It takes `&[String]`, calls `looks_like_url` on each argument, and returns `true` if any argument matches.
+**Data flow**: It receives a list of argument strings. It checks each one with looks_like_url and returns true as soon as one argument looks like a valid web URL. If none do, it returns false.
 
-**Call relations**: It is used by both PowerShell and direct-launch danger checks.
+**Call relations**: PowerShell and direct GUI launch checks call this when deciding whether a launch command is web-facing. It centralizes URL detection so the same rules are used in multiple safety paths.
 
 *Call graph*: called by 2 (is_dangerous_powershell_words, is_direct_gui_launch).
 
@@ -4127,11 +4142,11 @@ fn args_have_url(args: &[String]) -> bool
 fn looks_like_url(token: &str) -> bool
 ```
 
-**Purpose**: Best-effort URL recognizer for command arguments that may include quotes, parentheses, semicolons, or embedded URL substrings. It only accepts `http` and `https` schemes.
+**Purpose**: This function decides whether one piece of text is an http or https URL, even if it has common shell punctuation around it. It helps avoid missing URLs wrapped in quotes, parentheses, or a trailing semicolon.
 
-**Data flow**: It takes a token `&str`, optionally slices from the first `https://` or `http://` occurrence, uses a lazily compiled regex to trim surrounding punctuation and capture the candidate URL, parses it with `Url::parse`, and returns `true` only if parsing succeeds and the scheme is `http` or `https`.
+**Data flow**: It receives one token. It trims common surrounding characters, or starts from the first embedded http:// or https:// substring if one appears inside a larger token. It then asks the URL parser whether the result is a valid URL and returns true only for http and https schemes.
 
-**Call relations**: It is the primitive used by `args_have_url`, which feeds multiple dangerous-launch heuristics.
+**Call relations**: args_have_url uses this for each argument it scans. It provides the more careful URL recognition needed by the PowerShell and GUI launch checks.
 
 *Call graph*: 3 external calls (new, parse, matches!).
 
@@ -4142,11 +4157,11 @@ fn looks_like_url(token: &str) -> bool
 fn executable_basename(exe: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts and lowercases the basename of an executable path. This normalizes full paths before command-name comparisons.
+**Purpose**: This helper extracts just the program name from an executable path and lowercases it. That lets the safety checks treat C:\Windows\System32\cmd.exe and cmd.exe as the same program.
 
-**Data flow**: It takes an executable string, converts it to a `Path`, extracts the file name and UTF-8 text, lowercases it, and returns `Option<String>`.
+**Data flow**: It receives an executable path string. It asks the path library for the final file-name part, converts it to text if possible, lowercases it, and returns it. If the path has no usable file name, it returns none.
 
-**Call relations**: It is used by `is_dangerous_cmd` and `is_direct_gui_launch` to recognize wrapper and launcher executables.
+**Call relations**: is_dangerous_cmd and is_direct_gui_launch use this before comparing executable names. Other helpers also build on this pattern to recognize PowerShell and browser executables reliably.
 
 *Call graph*: called by 2 (is_dangerous_cmd, is_direct_gui_launch); 1 external calls (new).
 
@@ -4157,11 +4172,11 @@ fn executable_basename(exe: &str) -> Option<String>
 fn is_powershell_executable(exe: &str) -> bool
 ```
 
-**Purpose**: Recognizes supported PowerShell executable names. It accepts both bare names and `.exe` forms for Windows PowerShell and PowerShell Core.
+**Purpose**: This function recognizes Windows PowerShell and modern PowerShell executable names. It accepts both powershell and pwsh, with or without .exe.
 
-**Data flow**: It takes an executable string, normalizes it with `executable_basename`, and returns `true` if the basename is `powershell`, `powershell.exe`, `pwsh`, or `pwsh.exe`.
+**Data flow**: It receives an executable path or name. It extracts the lowercased basename and compares it with the known PowerShell names. It returns true for recognized PowerShell executables and false otherwise.
 
-**Call relations**: It gates `is_dangerous_powershell` so only PowerShell wrappers are parsed as PowerShell.
+**Call relations**: is_dangerous_powershell calls this before trying to parse PowerShell-specific arguments. This prevents ordinary commands from being misread as scripts.
 
 *Call graph*: called by 1 (is_dangerous_powershell); 1 external calls (matches!).
 
@@ -4172,11 +4187,11 @@ fn is_powershell_executable(exe: &str) -> bool
 fn is_browser_executable(name: &str) -> bool
 ```
 
-**Purpose**: Recognizes browser executable names used in direct URL-launch heuristics. The list is explicit and small.
+**Purpose**: This helper recognizes common browser executable names. A browser started with a URL is considered a direct web launch.
 
-**Data flow**: It takes a lowercase executable name `&str` and returns `true` for Chrome, Edge, Firefox, or Internet Explorer names with or without `.exe`.
+**Data flow**: It receives a lowercased executable name. It compares it with known browser names such as chrome, msedge, firefox, and iexplore, with or without .exe. It returns a boolean answer.
 
-**Call relations**: It is used by both `is_dangerous_powershell_words` and `is_direct_gui_launch`.
+**Call relations**: is_dangerous_powershell_words uses it when a PowerShell script appears to directly invoke a browser. is_direct_gui_launch uses it when the original command itself starts a browser.
 
 *Call graph*: called by 2 (is_dangerous_powershell_words, is_direct_gui_launch); 1 external calls (matches!).
 
@@ -4187,11 +4202,11 @@ fn is_browser_executable(name: &str) -> bool
 fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell>
 ```
 
-**Purpose**: Best-effort parses a PowerShell wrapper argv into the underlying command tokens. It understands `-Command`, `/Command`, `-c`, inline `-Command:<script>`, benign wrapper flags, and direct command tails.
+**Purpose**: This function extracts the script words from a PowerShell command line. It supports explicit forms like -Command "..." as well as a plain remaining command.
 
-**Data flow**: It takes the PowerShell argument slice, scans from the front, handles `-command`/`/command`/`-c` by requiring exactly one following script token and no trailing args, handles inline `-command:` and `/command:` similarly, skips benign flags like `-NoLogo` and `-NoProfile`, skips unknown dash-prefixed switches conservatively, and otherwise treats the remaining args as direct command tokens. Script strings are tokenized with `shlex_split`, and the result is wrapped in `ParsedPowershell`.
+**Data flow**: It receives the arguments after the PowerShell executable. It skips common PowerShell startup options, looks for -Command, /Command, -c, or command text attached after a colon, and splits the script string into shell-like tokens. If it cannot parse safely or sees extra unexpected arguments after a command string, it returns none.
 
-**Call relations**: It is used by `is_dangerous_powershell` to obtain a flat token stream for heuristic scanning.
+**Call relations**: is_dangerous_powershell calls this after confirming the executable is PowerShell. Its output is handed to is_dangerous_powershell_words for the actual safety decision.
 
 *Call graph*: called by 1 (is_dangerous_powershell); 1 external calls (split).
 
@@ -4202,11 +4217,11 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell>
 fn vec_str(items: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts string slices into owned argv vectors for tests. It is a local helper.
+**Purpose**: This small test helper turns a list of string literals into owned String values. It keeps the tests short and readable.
 
-**Data flow**: It takes `&[&str]`, maps each item to `String`, collects into `Vec<String>`, and returns it.
+**Data flow**: It receives a slice of text references. It copies each item into a String and returns a vector of those strings, matching the input shape expected by the safety checker.
 
-**Call relations**: All tests in this module use it to build command vectors.
+**Call relations**: The test cases use this helper when building sample command lines. It is only active during tests.
 
 
 ##### `tests::powershell_start_process_url_is_dangerous`  (lines 419–426)
@@ -4215,11 +4230,11 @@ fn vec_str(items: &[&str]) -> Vec<String>
 fn powershell_start_process_url_is_dangerous()
 ```
 
-**Purpose**: Verifies that a PowerShell `Start-Process` invocation targeting an HTTPS URL is flagged as dangerous. This covers the ShellExecute-style URL-launch heuristic.
+**Purpose**: This test proves that PowerShell Start-Process with a web URL is flagged as dangerous.
 
-**Data flow**: The test builds a `powershell -NoLogo -Command "Start-Process 'https://example.com'"` argv vector and asserts `is_dangerous_command_windows` returns `true`.
+**Data flow**: It builds a PowerShell command containing Start-Process and https://example.com, passes it to the Windows danger checker, and expects the answer to be true.
 
-**Call relations**: It exercises the PowerShell wrapper parsing path and URL-launch detection.
+**Call relations**: During the test run, this calls the public checker in the same way production code would. It protects the PowerShell URL-launch rule from being accidentally weakened.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4230,11 +4245,11 @@ fn powershell_start_process_url_is_dangerous()
 fn powershell_start_process_url_with_trailing_semicolon_is_dangerous()
 ```
 
-**Purpose**: Checks that URL-launch detection still works when the PowerShell script includes trailing punctuation. This guards the URL trimming logic.
+**Purpose**: This test checks that a PowerShell URL launch is still caught when written like a function call and followed by a semicolon.
 
-**Data flow**: The test passes `Start-Process('https://example.com');` through `is_dangerous_command_windows` and asserts `true`.
+**Data flow**: It creates a PowerShell -Command string containing Start-Process('https://example.com'); and asserts that the safety checker returns true.
 
-**Call relations**: It specifically covers `looks_like_url` and punctuation handling.
+**Call relations**: It exercises the URL cleanup and PowerShell token scanning path. The test guards against missing URLs because of nearby punctuation.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4245,11 +4260,11 @@ fn powershell_start_process_url_with_trailing_semicolon_is_dangerous()
 fn powershell_start_process_local_is_not_flagged()
 ```
 
-**Purpose**: Ensures local executable launches without URLs are not flagged by the URL-launch heuristic. The danger rule is URL-specific here.
+**Purpose**: This test makes sure that starting a local program with PowerShell is not automatically treated as dangerous.
 
-**Data flow**: The test passes `Start-Process notepad.exe` through `is_dangerous_command_windows` and asserts `false`.
+**Data flow**: It builds a command that runs Start-Process notepad.exe, sends it through the checker, and expects false because no URL or forceful deletion is present.
 
-**Call relations**: It validates that `args_have_url` is required for the launcher branch.
+**Call relations**: It balances the URL-launch tests by checking a harmless-looking Start-Process case. This helps keep the filter from blocking ordinary local launches too broadly.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4260,11 +4275,11 @@ fn powershell_start_process_local_is_not_flagged()
 fn cmd_start_with_url_is_dangerous()
 ```
 
-**Purpose**: Verifies that `cmd /c start https://...` is classified as dangerous. This covers the classic CMD ShellExecute path.
+**Purpose**: This test verifies that CMD's start command with a web URL is considered dangerous.
 
-**Data flow**: The test builds `['cmd', '/c', 'start', 'https://example.com']` and asserts `is_dangerous_command_windows` returns `true`.
+**Data flow**: It builds cmd /c start https://example.com, runs the checker, and expects true.
 
-**Call relations**: It exercises the CMD wrapper parser and segment scanner.
+**Call relations**: It exercises the CMD parsing path through the main Windows checker. It protects the rule for classic CMD-based URL launching.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4275,11 +4290,11 @@ fn cmd_start_with_url_is_dangerous()
 fn msedge_with_url_is_dangerous()
 ```
 
-**Purpose**: Checks that directly launching a browser executable with a URL is flagged. Browser URL opens are treated as dangerous GUI launches.
+**Purpose**: This test checks that directly starting Microsoft Edge with a URL is flagged.
 
-**Data flow**: The test passes `['msedge.exe', 'https://example.com']` to `is_dangerous_command_windows` and asserts `true`.
+**Data flow**: It creates a command whose executable is msedge.exe and whose argument is an https URL. It expects the danger checker to return true.
 
-**Call relations**: It covers the direct GUI/browser launch branch.
+**Call relations**: It goes through the direct GUI launch path. The test confirms that browser launches do not need to be wrapped in PowerShell or CMD to be caught.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4290,11 +4305,11 @@ fn msedge_with_url_is_dangerous()
 fn explorer_with_directory_is_not_flagged()
 ```
 
-**Purpose**: Ensures Explorer launched on a local directory is not mistaken for a dangerous URL open. The heuristic requires a URL argument.
+**Purpose**: This test confirms that Explorer opening a local directory is not treated like Explorer opening a web URL.
 
-**Data flow**: The test passes `['explorer.exe', '.']` and asserts `false`.
+**Data flow**: It builds explorer.exe . and expects the checker to return false because the argument is a local path, not a web link.
 
-**Call relations**: It validates the URL requirement in `is_direct_gui_launch`.
+**Call relations**: It exercises the direct GUI launch path and guards against an overbroad Explorer rule.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4305,11 +4320,11 @@ fn explorer_with_directory_is_not_flagged()
 fn powershell_remove_item_force_is_dangerous()
 ```
 
-**Purpose**: Verifies that `Remove-Item ... -Force` is flagged as dangerous in PowerShell. This is the basic force-delete heuristic.
+**Purpose**: This test verifies that PowerShell Remove-Item with -Force is flagged as dangerous.
 
-**Data flow**: The test passes a `powershell -Command 'Remove-Item test -Force'` argv vector and asserts `true`.
+**Data flow**: It creates a PowerShell command that removes a test item with -Force, sends it to the checker, and expects true.
 
-**Call relations**: It exercises `has_force_delete_cmdlet` through the PowerShell path.
+**Call relations**: It exercises the PowerShell force-delete detection path. The test protects the core destructive-command rule.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4320,11 +4335,11 @@ fn powershell_remove_item_force_is_dangerous()
 fn powershell_remove_item_recurse_force_is_dangerous()
 ```
 
-**Purpose**: Checks that recursive force deletion in PowerShell is also flagged. Additional flags do not suppress the danger classification.
+**Purpose**: This test checks that Remove-Item with both -Recurse and -Force is dangerous.
 
-**Data flow**: The test passes `Remove-Item test -Recurse -Force` and asserts `true`.
+**Data flow**: It builds a PowerShell command that removes an item recursively and forcefully, then asserts that the checker returns true.
 
-**Call relations**: It covers the same force-delete detection with extra arguments present.
+**Call relations**: It confirms that adding -Recurse does not hide or interfere with detection of -Force on a delete command.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4335,11 +4350,11 @@ fn powershell_remove_item_recurse_force_is_dangerous()
 fn powershell_ri_alias_force_is_dangerous()
 ```
 
-**Purpose**: Ensures PowerShell aliases like `ri` are treated the same as `Remove-Item`. Alias handling is part of the delete-cmdlet list.
+**Purpose**: This test verifies that the PowerShell alias ri is treated as a delete command when paired with -Force.
 
-**Data flow**: The test passes `pwsh -Command 'ri test -Force'` and asserts `true`.
+**Data flow**: It builds a pwsh command using ri test -Force and expects the checker to return true.
 
-**Call relations**: It validates alias coverage in `DELETE_CMDLETS`.
+**Call relations**: It exercises both the pwsh executable recognition and alias detection inside the PowerShell delete checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4350,11 +4365,11 @@ fn powershell_ri_alias_force_is_dangerous()
 fn powershell_remove_item_without_force_is_not_flagged()
 ```
 
-**Purpose**: Checks that delete cmdlets without `-Force` are not flagged by this specific heuristic. The rule is intentionally narrower than all deletion.
+**Purpose**: This test ensures that Remove-Item without -Force is not flagged by this particular rule.
 
-**Data flow**: The test passes `Remove-Item test` and asserts `false`.
+**Data flow**: It sends a PowerShell Remove-Item test command to the checker and expects false because the force flag is absent.
 
-**Call relations**: It confirms `has_force_delete_cmdlet` requires both a delete cmdlet and a force flag.
+**Call relations**: It helps keep the force-delete rule precise. The test checks that the code looks for the risky combination, not just the delete command name.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4365,11 +4380,11 @@ fn powershell_remove_item_without_force_is_not_flagged()
 fn cmd_del_force_is_dangerous()
 ```
 
-**Purpose**: Verifies that `cmd /c del /f ...` is classified as dangerous. This is the CMD force-delete counterpart to the PowerShell rule.
+**Purpose**: This test verifies that CMD del /f is flagged as dangerous.
 
-**Data flow**: The test passes `['cmd', '/c', 'del', '/f', 'test.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c del /f test.txt, runs the checker, and expects true.
 
-**Call relations**: It exercises the `del/erase` branch in `is_dangerous_cmd`.
+**Call relations**: It exercises the CMD command-body scanner and the exact /f flag check for file deletion.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4380,11 +4395,11 @@ fn cmd_del_force_is_dangerous()
 fn cmd_erase_force_is_dangerous()
 ```
 
-**Purpose**: Checks that `erase /f` is treated the same as `del /f`. Both commands are force-delete aliases in CMD.
+**Purpose**: This test checks the erase command, which is another CMD name for deleting files, when used with /f.
 
-**Data flow**: The test passes `['cmd', '/c', 'erase', '/f', 'test.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c erase /f test.txt and expects the checker to return true.
 
-**Call relations**: It covers the alternate CMD delete command name.
+**Call relations**: It confirms that the CMD delete rule covers both del and erase.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4395,11 +4410,11 @@ fn cmd_erase_force_is_dangerous()
 fn cmd_del_without_force_is_not_flagged()
 ```
 
-**Purpose**: Ensures `del` without `/f` is not flagged by this heuristic. The dangerous CMD delete rule is specifically force-based.
+**Purpose**: This test makes sure a plain CMD del command is not flagged as a force delete.
 
-**Data flow**: The test passes `['cmd', '/c', 'del', 'test.txt']` and asserts `false`.
+**Data flow**: It builds cmd /c del test.txt and expects false because /f is missing.
 
-**Call relations**: It validates the `/f` requirement in `has_force_flag_cmd`.
+**Call relations**: It guards against making the CMD delete rule too broad. The checker should require the force flag for this case.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4410,11 +4425,11 @@ fn cmd_del_without_force_is_not_flagged()
 fn cmd_rd_recursive_is_dangerous()
 ```
 
-**Purpose**: Verifies that recursive quiet directory removal via `rd /s /q` is flagged. Both recursion and quiet flags are required.
+**Purpose**: This test verifies that CMD rd /s /q is flagged because it can remove a directory tree without asking.
 
-**Data flow**: The test passes `['cmd', '/c', 'rd', '/s', '/q', 'test']` and asserts `true`.
+**Data flow**: It creates cmd /c rd /s /q test, runs the checker, and expects true.
 
-**Call relations**: It exercises the `rd/rmdir` branch in `is_dangerous_cmd`.
+**Call relations**: It exercises the CMD directory-removal rule that combines recursive and quiet flags.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4425,11 +4440,11 @@ fn cmd_rd_recursive_is_dangerous()
 fn cmd_rd_without_quiet_is_not_flagged()
 ```
 
-**Purpose**: Checks that `rd /s` without `/q` is not flagged by this heuristic. The rule intentionally targets the fully forceful recursive form.
+**Purpose**: This test checks that rd /s without /q is not caught by the quiet recursive-removal rule.
 
-**Data flow**: The test passes `['cmd', '/c', 'rd', '/s', 'test']` and asserts `false`.
+**Data flow**: It builds cmd /c rd /s test and expects false because the quiet flag is absent.
 
-**Call relations**: It validates the combined `/s` and `/q` requirement.
+**Call relations**: It keeps the directory-removal detection specific to the /s and /q combination.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4440,11 +4455,11 @@ fn cmd_rd_without_quiet_is_not_flagged()
 fn cmd_rmdir_recursive_is_dangerous()
 ```
 
-**Purpose**: Ensures `rmdir /s /q` is treated the same as `rd /s /q`. Both names are recognized as recursive directory removal.
+**Purpose**: This test verifies that rmdir /s /q is treated the same as rd /s /q.
 
-**Data flow**: The test passes `['cmd', '/c', 'rmdir', '/s', '/q', 'test']` and asserts `true`.
+**Data flow**: It creates cmd /c rmdir /s /q test and expects the checker to return true.
 
-**Call relations**: It covers the alternate directory-removal command name.
+**Call relations**: It confirms that the CMD directory-removal rule covers both command spellings.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4455,11 +4470,11 @@ fn cmd_rmdir_recursive_is_dangerous()
 fn powershell_remove_item_path_recurse_force_is_dangerous()
 ```
 
-**Purpose**: Regression test for a `Remove-Item -Path ... -Recurse -Force` form. Option ordering should not bypass force-delete detection.
+**Purpose**: This test covers a full Remove-Item form using -Path, -Recurse, and -Force.
 
-**Data flow**: The test passes that script through `is_dangerous_command_windows` and asserts `true`.
+**Data flow**: It builds a PowerShell command with Remove-Item -Path 'test' -Recurse -Force and expects true.
 
-**Call relations**: It exercises the segment/atom scanning logic in `has_force_delete_cmdlet`.
+**Call relations**: It protects a real-world scenario where the delete target is supplied with -Path. The PowerShell delete checker must still find the delete command and force flag in the same segment.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4470,11 +4485,11 @@ fn powershell_remove_item_path_recurse_force_is_dangerous()
 fn powershell_remove_item_force_with_semicolon_is_dangerous()
 ```
 
-**Purpose**: Checks that a dangerous force-delete command remains flagged even when followed by another command separated by `;`. Segment splitting must preserve the dangerous segment.
+**Purpose**: This test checks that a force delete before another PowerShell command is still caught.
 
-**Data flow**: The test passes `Remove-Item test -Force; Write-Host done` and asserts `true`.
+**Data flow**: It builds Remove-Item test -Force; Write-Host done, sends it to the checker, and expects true.
 
-**Call relations**: It validates hard-separator handling in `has_force_delete_cmdlet`.
+**Call relations**: It exercises command-segment splitting in the PowerShell delete checker. The semicolon should separate commands without hiding the dangerous first segment.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4485,11 +4500,11 @@ fn powershell_remove_item_force_with_semicolon_is_dangerous()
 fn powershell_remove_item_force_inside_block_is_dangerous()
 ```
 
-**Purpose**: Ensures force-delete detection still works inside PowerShell blocks. Braces should not hide dangerous cmdlets.
+**Purpose**: This test verifies that a force delete inside a PowerShell block is detected.
 
-**Data flow**: The test passes `if ($true) { Remove-Item test -Force}` and asserts `true`.
+**Data flow**: It builds if ($true) { Remove-Item test -Force} and expects the checker to return true.
 
-**Call relations**: It covers soft-separator splitting in `has_force_delete_cmdlet`.
+**Call relations**: It checks the PowerShell token cleanup around braces. The delete checker must see through simple punctuation around command blocks.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4500,11 +4515,11 @@ fn powershell_remove_item_force_inside_block_is_dangerous()
 fn powershell_remove_item_force_inside_brackets_is_dangerous()
 ```
 
-**Purpose**: Checks that bracketed or parenthesized force-delete forms are still detected. Punctuation trimming should not suppress the heuristic.
+**Purpose**: This test verifies that a force delete wrapped in brackets and parentheses is still detected.
 
-**Data flow**: The test passes `[void]( Remove-Item test -Force)]` and asserts `true`.
+**Data flow**: It builds [void]( Remove-Item test -Force)] and expects true.
 
-**Call relations**: It further validates punctuation splitting in `has_force_delete_cmdlet`.
+**Call relations**: It exercises the soft-punctuation splitting used by the PowerShell delete checker, making sure brackets do not hide the command.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4515,11 +4530,11 @@ fn powershell_remove_item_force_inside_brackets_is_dangerous()
 fn cmd_del_path_containing_f_is_not_flagged()
 ```
 
-**Purpose**: Ensures a path containing the letter `f` is not mistaken for the `/f` force flag. Flag detection is exact, not substring-based.
+**Purpose**: This test ensures that a file path containing the letter f is not mistaken for the /f force flag.
 
-**Data flow**: The test passes `['cmd', '/c', 'del', 'C:/foo/bar.txt']` and asserts `false`.
+**Data flow**: It builds cmd /c del C:/foo/bar.txt and expects false because there is no exact /f argument.
 
-**Call relations**: It validates the exact-match behavior of `has_force_flag_cmd`.
+**Call relations**: It protects the exact-flag behavior used by the CMD force-delete check.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4530,11 +4545,11 @@ fn cmd_del_path_containing_f_is_not_flagged()
 fn cmd_rd_path_containing_s_is_not_flagged()
 ```
 
-**Purpose**: Ensures a path containing the letter `s` is not mistaken for the `/s` recursive flag. This guards against naive substring matching.
+**Purpose**: This test ensures that a directory path containing the letter s is not mistaken for the /s recursive flag.
 
-**Data flow**: The test passes `['cmd', '/c', 'rd', 'C:/source']` and asserts `false`.
+**Data flow**: It builds cmd /c rd C:/source and expects false because there is no exact /s argument.
 
-**Call relations**: It validates the exact-match behavior of `has_recursive_flag_cmd`.
+**Call relations**: It guards against false positives in the CMD recursive-removal flag check.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4545,11 +4560,11 @@ fn cmd_rd_path_containing_s_is_not_flagged()
 fn cmd_bypass_chained_del_is_dangerous()
 ```
 
-**Purpose**: Checks that a dangerous `del /f` command chained after a benign command is still detected. Segment splitting across `&` must work.
+**Purpose**: This test verifies that a dangerous CMD command after an ampersand is still caught.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo', 'hello', '&', 'del', '/f', 'file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c echo hello & del /f file.txt and expects true.
 
-**Call relations**: It exercises command segmentation in `is_dangerous_cmd`.
+**Call relations**: It exercises the CMD segment scanning for chained commands. The checker must not stop after the harmless echo command.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4560,11 +4575,11 @@ fn cmd_bypass_chained_del_is_dangerous()
 fn powershell_chained_no_space_is_dangerous()
 ```
 
-**Purpose**: Ensures PowerShell force-delete detection works even when commands are chained without spaces after a semicolon. Compact formatting should not evade detection.
+**Purpose**: This test checks that PowerShell catches a force delete after a semicolon even when there is no space after the semicolon.
 
-**Data flow**: The test passes `Write-Host hi;Remove-Item -Force C:\tmp` and asserts `true`.
+**Data flow**: It builds Write-Host hi;Remove-Item -Force C:\tmp and expects the checker to return true.
 
-**Call relations**: It covers token and separator handling in `has_force_delete_cmdlet`.
+**Call relations**: It protects the PowerShell segment-splitting logic for compact command chains.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4575,11 +4590,11 @@ fn powershell_chained_no_space_is_dangerous()
 fn powershell_comma_separated_is_dangerous()
 ```
 
-**Purpose**: Checks that comma-separated PowerShell tokens like `del,-Force,C:\foo` are still recognized as dangerous. Soft punctuation splitting must catch this form.
+**Purpose**: This test verifies that comma-separated PowerShell tokens can still reveal a delete command and -Force.
 
-**Data flow**: The test passes that script through `is_dangerous_command_windows` and asserts `true`.
+**Data flow**: It builds del,-Force,C:\foo and expects true.
 
-**Call relations**: It specifically validates comma handling in `has_force_delete_cmdlet`.
+**Call relations**: It exercises the soft-punctuation splitting inside the PowerShell delete checker, especially comma handling.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4590,11 +4605,11 @@ fn powershell_comma_separated_is_dangerous()
 fn cmd_echo_del_is_not_dangerous()
 ```
 
-**Purpose**: Ensures benign text mentioning `del /f` is not mistaken for an actual delete command. Only the first token of a segment is treated as the command name.
+**Purpose**: This test ensures that echoing the words del /f is not treated as actually running del /f.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo', 'del', '/f']` and asserts `false`.
+**Data flow**: It builds cmd /c echo del /f and expects false.
 
-**Call relations**: It validates the segment-first-token logic in `is_dangerous_cmd`.
+**Call relations**: It checks that the CMD scanner pays attention to command segments and their first word, rather than flagging any appearance of the text del and /f.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4605,11 +4620,11 @@ fn cmd_echo_del_is_not_dangerous()
 fn cmd_del_single_string_argument_is_dangerous()
 ```
 
-**Purpose**: Checks that a single-string CMD body containing `del /f file.txt` is tokenized and flagged correctly. This covers common `cmd /c "..."` forms.
+**Purpose**: This test checks that CMD commands passed as one string are still parsed well enough to catch del /f.
 
-**Data flow**: The test passes `['cmd', '/c', 'del /f file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c "del /f file.txt" as a single command-body argument and expects true.
 
-**Call relations**: It exercises the `shlex_split` branch in `is_dangerous_cmd`.
+**Call relations**: It exercises the shell-like splitting used when CMD receives the whole body as one string.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4620,11 +4635,11 @@ fn cmd_del_single_string_argument_is_dangerous()
 fn cmd_del_chained_single_string_argument_is_dangerous()
 ```
 
-**Purpose**: Ensures a single-string CMD body with a chained dangerous delete is still detected. Tokenization plus segmentation must cooperate.
+**Purpose**: This test verifies that a chained dangerous CMD command inside one command string is caught.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo hello & del /f file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c "echo hello & del /f file.txt" and expects true.
 
-**Call relations**: It covers both `shlex_split` and segment splitting.
+**Call relations**: It combines single-string parsing with command-chain scanning in the CMD checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4635,11 +4650,11 @@ fn cmd_del_chained_single_string_argument_is_dangerous()
 fn cmd_chained_no_space_del_is_dangerous()
 ```
 
-**Purpose**: Checks that no-space `&` chaining still exposes a dangerous delete command. Embedded operator splitting is required for this case.
+**Purpose**: This test checks the compact CMD form where an ampersand is stuck directly to nearby text.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo hi&del /f file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c "echo hi&del /f file.txt" and expects true.
 
-**Call relations**: It specifically exercises `split_embedded_cmd_operators`.
+**Call relations**: It specifically protects split_embedded_cmd_operators, which separates operators even without surrounding spaces.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4650,11 +4665,11 @@ fn cmd_chained_no_space_del_is_dangerous()
 fn cmd_chained_andand_no_space_del_is_dangerous()
 ```
 
-**Purpose**: Ensures no-space `&&` chaining still detects a dangerous delete command. Doubled operators must be split correctly.
+**Purpose**: This test verifies that the compact && chain operator does not hide a force delete.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo hi&&del /f file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c "echo hi&&del /f file.txt" and expects the checker to return true.
 
-**Call relations**: It covers the doubled-operator branch in `split_embedded_cmd_operators`.
+**Call relations**: It exercises operator splitting for && inside the CMD checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4665,11 +4680,11 @@ fn cmd_chained_andand_no_space_del_is_dangerous()
 fn cmd_chained_oror_no_space_del_is_dangerous()
 ```
 
-**Purpose**: Ensures no-space `||` chaining still detects a dangerous delete command. Alternate doubled operators are also handled.
+**Purpose**: This test verifies that the compact || chain operator does not hide a force delete.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo hi||del /f file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c "echo hi||del /f file.txt" and expects true.
 
-**Call relations**: It further validates `split_embedded_cmd_operators`.
+**Call relations**: It exercises operator splitting for || inside the CMD checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4680,11 +4695,11 @@ fn cmd_chained_oror_no_space_del_is_dangerous()
 fn cmd_start_url_single_string_is_dangerous()
 ```
 
-**Purpose**: Checks that a single-string CMD body launching a URL with `start` is flagged. This covers compact wrapper forms.
+**Purpose**: This test checks that CMD start with a URL is caught even when the command body is one string.
 
-**Data flow**: The test passes `['cmd', '/c', 'start https://example.com']` and asserts `true`.
+**Data flow**: It builds cmd /c "start https://example.com" and expects true.
 
-**Call relations**: It exercises `shlex_split` plus URL-launch detection in `is_dangerous_cmd`.
+**Call relations**: It covers the combination of CMD single-string parsing and URL-launch detection.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4695,11 +4710,11 @@ fn cmd_start_url_single_string_is_dangerous()
 fn cmd_chained_no_space_rmdir_is_dangerous()
 ```
 
-**Purpose**: Ensures no-space chaining also works for dangerous recursive directory removal. Embedded operator splitting must expose `rmdir /s /q`.
+**Purpose**: This test verifies that compact CMD chaining cannot hide rmdir /s /q.
 
-**Data flow**: The test passes `['cmd', '/c', 'echo hi&rmdir /s /q testdir']` and asserts `true`.
+**Data flow**: It builds cmd /c "echo hi&rmdir /s /q testdir" and expects the checker to return true.
 
-**Call relations**: It covers the `rd/rmdir` branch after embedded-operator splitting.
+**Call relations**: It exercises both embedded-operator splitting and the recursive quiet directory-removal rule.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4710,11 +4725,11 @@ fn cmd_chained_no_space_rmdir_is_dangerous()
 fn cmd_del_force_uppercase_flag_is_dangerous()
 ```
 
-**Purpose**: Verifies that CMD force-flag detection is case-insensitive. Uppercase `/F` should still be dangerous.
+**Purpose**: This test confirms that CMD command and flag matching is case-insensitive.
 
-**Data flow**: The test passes `['cmd', '/c', 'DEL', '/F', 'file.txt']` and asserts `true`.
+**Data flow**: It builds cmd /c DEL /F file.txt and expects true.
 
-**Call relations**: It validates the case-insensitive comparisons in CMD flag helpers.
+**Call relations**: It protects the case-insensitive comparisons used by the CMD force-delete checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4725,11 +4740,11 @@ fn cmd_del_force_uppercase_flag_is_dangerous()
 fn cmdexe_r_del_force_is_dangerous()
 ```
 
-**Purpose**: Checks that `cmd.exe /r del /f ...` is treated like `cmd /c`. Alternate wrapper spellings are supported.
+**Purpose**: This test verifies that cmd.exe with /r is treated like a command-running CMD invocation.
 
-**Data flow**: The test passes `['cmd.exe', '/r', 'del', '/f', 'file.txt']` and asserts `true`.
+**Data flow**: It builds cmd.exe /r del /f file.txt and expects the checker to return true.
 
-**Call relations**: It covers executable basename normalization and `/r` handling in `is_dangerous_cmd`.
+**Call relations**: It exercises CMD executable-name recognition and support for /r as a command-body marker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4740,11 +4755,11 @@ fn cmdexe_r_del_force_is_dangerous()
 fn cmd_start_quoted_url_single_string_is_dangerous()
 ```
 
-**Purpose**: Ensures quoted URL arguments to `start` are still recognized as dangerous. URL trimming must handle quotes.
+**Purpose**: This test checks that a quoted URL after CMD start is still detected.
 
-**Data flow**: The test passes `['cmd', '/c', 'start "https://example.com"']` and asserts `true`.
+**Data flow**: It builds cmd /c "start \"https://example.com\"" and expects true.
 
-**Call relations**: It exercises `looks_like_url` on quoted URL tokens.
+**Call relations**: It protects URL detection after shell-like splitting and quote handling.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4755,11 +4770,11 @@ fn cmd_start_quoted_url_single_string_is_dangerous()
 fn cmd_start_title_then_url_is_dangerous()
 ```
 
-**Purpose**: Checks that `start` with an empty title followed by a URL is still flagged. This is a common CMD `start` calling convention.
+**Purpose**: This test covers CMD start's common empty-title form before a URL.
 
-**Data flow**: The test passes `['cmd', '/c', 'start "" https://example.com']` and asserts `true`.
+**Data flow**: It builds cmd /c "start \"\" https://example.com" and expects true.
 
-**Call relations**: It validates that URL presence anywhere in the segment is sufficient for the `start` heuristic.
+**Call relations**: It ensures that the URL detection scans the whole start segment, not just the first argument after start.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4770,11 +4785,11 @@ fn cmd_start_title_then_url_is_dangerous()
 fn powershell_rm_alias_force_is_dangerous()
 ```
 
-**Purpose**: Ensures the `rm` alias in PowerShell is treated as a dangerous force-delete cmdlet when combined with `-Force`. Alias coverage is intentional.
+**Purpose**: This test verifies that the PowerShell alias rm is treated as a delete command when used with -Force.
 
-**Data flow**: The test passes `powershell -Command 'rm test -Force'` and asserts `true`.
+**Data flow**: It builds powershell -Command "rm test -Force" and expects the checker to return true.
 
-**Call relations**: It covers another alias in the delete-cmdlet list.
+**Call relations**: It protects alias coverage in the PowerShell force-delete detector.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4785,24 +4800,26 @@ fn powershell_rm_alias_force_is_dangerous()
 fn powershell_benign_force_separate_command_is_not_dangerous()
 ```
 
-**Purpose**: Checks that `-Force` on a benign command does not taint a later non-force delete command in another segment. Force-delete detection is segment-local.
+**Purpose**: This test ensures that -Force on one PowerShell command does not make a later delete command look forceful.
 
-**Data flow**: The test passes `Get-ChildItem -Force; Remove-Item test` and asserts `false`.
+**Data flow**: It builds Get-ChildItem -Force; Remove-Item test and expects false because -Force and Remove-Item are in different command segments.
 
-**Call relations**: It validates the segment separation logic in `has_force_delete_cmdlet`.
+**Call relations**: It guards the segment-aware behavior of has_force_delete_cmdlet. The checker should only flag delete and -Force when they belong to the same command segment.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `shell-command/src/command_safety/is_dangerous_command.rs`
 
-`domain_logic` · `command approval and unmatched-command rendering`
+`domain_logic` · `command review before execution`
 
-This file contains the negative side of command classification: quick heuristics for commands that are dangerous enough to flag even before broader policy evaluation. The top-level `command_might_be_dangerous` first defers to Windows-specific detection when compiled on Windows, then checks direct argv forms via `is_dangerous_to_call_with_exec`, and finally inspects `bash -lc`/`zsh -lc` wrappers by parsing them into plain command sequences and testing each extracted command individually.
+This file helps the system avoid running commands that could cause obvious damage. Its job is not to understand every possible shell trick. Instead, it catches a small set of high-risk cases before they reach the point where the program would execute them. Think of it like a warning label scanner: it does not inspect the whole factory, but it notices labels that say “explosive.”
 
-The current Unix-side dangerous set is intentionally small and concrete: `rm -f` and `rm -rf`, including the recursive case when wrapped in `sudo`. The file also provides reusable helpers shared with the safe-command classifier: `executable_name_lookup_key` normalizes executable names, stripping path components and Windows executable suffixes, and `find_git_subcommand` scans a git argv while skipping known global options that may precede the real subcommand. That scan stops at the first non-option positional token, preventing later branch names or arguments from being mistaken for subcommands.
+The main entry point, `command_might_be_dangerous`, receives an already-split command, such as `["rm", "-rf", "/"]`. On Windows, it first asks a Windows-specific checker about dangerous commands. Then it checks Unix-style cases in this file, especially `rm -f` and `rm -rf`. It also understands a common wrapper form: `bash -lc "some script"`. In that case, it asks the shell parser to break the inner script into plain commands, then checks each one.
 
-Tests cover the dangerous `rm` cases and the Windows-only PowerShell-word delegation behavior.
+The file also contains helpers for recognizing Git subcommands safely. Git allows global options before the real subcommand, such as `git -C repo status`, so the helper skips those correctly. This matters because safety checks elsewhere must not be fooled by options placed before the actual Git action.
+
+Tests at the bottom confirm that forceful remove commands are marked dangerous and that PowerShell danger checks behave differently on Windows and non-Windows systems.
 
 #### Function details
 
@@ -4812,11 +4829,11 @@ Tests cover the dangerous `rm` cases and the Windows-only PowerShell-word delega
 fn command_might_be_dangerous(command: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether a tokenized command should be treated as dangerous by heuristic rules. It checks direct argv forms, shell-wrapped plain-command sequences, and Windows-specific dangerous patterns when applicable.
+**Purpose**: Decides whether a command should be treated as potentially dangerous before the system runs it. It catches direct dangerous commands and also dangerous commands hidden inside a simple `bash -lc` script.
 
-**Data flow**: It takes `&[String]`, optionally calls `windows_dangerous_commands::is_dangerous_command_windows` on Windows, calls `is_dangerous_to_call_with_exec` on the original argv, then tries `parse_shell_lc_plain_commands` and returns `true` if any extracted inner command is dangerous; otherwise it returns `false`.
+**Data flow**: It receives a list of command words, such as the executable name followed by its arguments. On Windows it first passes the words to the Windows danger checker. Then it checks the command directly with `is_dangerous_to_call_with_exec`. If the command is a supported `bash -lc` form, it parses the inner script into separate commands and checks each one. It returns `true` if any check finds danger, otherwise `false`.
 
-**Call relations**: It is called by unmatched-command decision rendering. It delegates shell unwrapping to the Bash parser and platform-specific logic to the Windows module.
+**Call relations**: This function is called by `render_decision_for_unmatched_command` when the system is deciding what to do with a command it does not already recognize as safe. It delegates the detailed checks to the Windows-specific checker when available, to `is_dangerous_to_call_with_exec` for simple direct commands, and to `parse_shell_lc_plain_commands` when a Bash wrapper may be hiding the real command.
 
 *Call graph*: calls 3 internal fn (parse_shell_lc_plain_commands, is_dangerous_to_call_with_exec, is_dangerous_command_windows); called by 1 (render_decision_for_unmatched_command).
 
@@ -4827,11 +4844,11 @@ fn command_might_be_dangerous(command: &[String]) -> bool
 fn is_dangerous_powershell_words(command: &[String]) -> bool
 ```
 
-**Purpose**: Exposes Windows dangerous-command heuristics for already tokenized PowerShell words. On non-Windows builds it always returns `false`.
+**Purpose**: Checks whether already-split PowerShell words look dangerous, mainly for Windows command safety decisions. On non-Windows systems it always says they are not dangerous because the Windows-specific PowerShell rules are not active there.
 
-**Data flow**: It takes `&[String]`; on Windows it forwards to `windows_dangerous_commands::is_dangerous_powershell_words`, and on other platforms it ignores the input and returns `false`.
+**Data flow**: It receives PowerShell command words. On Windows, it forwards them to the Windows danger-detection code and returns that answer. On other operating systems, it ignores the words and returns `false`.
 
-**Call relations**: It is used by unmatched-command rendering when PowerShell words have already been tokenized separately from a full command invocation.
+**Call relations**: This function is called by `render_decision_for_unmatched_command` when that broader decision code needs PowerShell-specific danger detection. It acts as a small platform bridge: real checking happens in the Windows module, while non-Windows builds get a harmless stub result.
 
 *Call graph*: calls 1 internal fn (is_dangerous_powershell_words); called by 1 (render_decision_for_unmatched_command).
 
@@ -4842,11 +4859,11 @@ fn is_dangerous_powershell_words(command: &[String]) -> bool
 fn is_git_global_option_with_value(arg: &str) -> bool
 ```
 
-**Purpose**: Recognizes git global options that consume the following argv token as their value. This is part of correctly locating the real git subcommand.
+**Purpose**: Recognizes Git global options that take their value from the next word. This helps later code skip over options like `-C repo` so it can find the real Git subcommand.
 
-**Data flow**: It takes one argument string and returns `true` if it matches one of the known value-taking global options such as `-C`, `-c`, `--git-dir`, or `--work-tree`.
+**Data flow**: It receives one argument string from a Git command. It compares that string against a fixed set of Git options known to require a following value. It returns `true` when the argument is one of those options, otherwise `false`.
 
-**Call relations**: It is used only by `find_git_subcommand` to skip over option/value pairs before subcommand detection.
+**Call relations**: This helper is used by `find_git_subcommand` while scanning through a Git command. When it returns `true`, the scanner knows to skip the next word because that next word is an option value, not the Git subcommand.
 
 *Call graph*: called by 1 (find_git_subcommand); 1 external calls (matches!).
 
@@ -4857,11 +4874,11 @@ fn is_git_global_option_with_value(arg: &str) -> bool
 fn is_git_global_option_with_inline_value(arg: &str) -> bool
 ```
 
-**Purpose**: Recognizes git global options whose value is attached inline, such as `--git-dir=.repo` or `-Cpath`. This prevents bypasses through compact option syntax.
+**Purpose**: Recognizes Git global options where the option and its value are written as one word, such as `--git-dir=/tmp/repo` or `-Crepo`. This prevents those option words from being mistaken for the Git subcommand.
 
-**Data flow**: It takes one argument string and returns `true` if it matches any supported `--opt=value` form or a short `-C...`/`-c...` form with extra characters.
+**Data flow**: It receives one argument string. It checks whether the string starts with one of several Git option prefixes that include their value inline. It returns `true` for a match and `false` otherwise.
 
-**Call relations**: It is another helper for `find_git_subcommand`, allowing that scanner to skip inline-valued global options without consuming the next token.
+**Call relations**: This helper is called by `find_git_subcommand` during its scan. If it says an argument is an inline global option, the scanner skips that word and keeps looking for the first real non-option Git command.
 
 *Call graph*: called by 1 (find_git_subcommand); 1 external calls (matches!).
 
@@ -4872,11 +4889,11 @@ fn is_git_global_option_with_inline_value(arg: &str) -> bool
 fn executable_name_lookup_key(raw: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes an executable path into the lookup key used by safety and danger classifiers. On Windows it strips common executable suffixes after taking the basename.
+**Purpose**: Turns an executable path into the plain command name used for comparison. For example, it can reduce a path like `/usr/bin/git` to `git`.
 
-**Data flow**: It takes a raw executable string, converts it to a `Path`, extracts the file name and UTF-8 text, and returns an owned normalized name. On Windows it lowercases and strips `.exe`, `.cmd`, `.bat`, or `.com`; on non-Windows it returns the basename unchanged.
+**Data flow**: It receives a raw executable string, which may be just a name or a full path. It extracts the final path component. On Windows, it lowercases the name and removes common executable endings like `.exe`, `.cmd`, `.bat`, or `.com`; on other systems it keeps the file name as-is. It returns the cleaned-up name, or nothing if the name cannot be read as text.
 
-**Call relations**: It is shared by `find_git_subcommand` here and by safe-command classification elsewhere so both modules reason about executable names consistently.
+**Call relations**: This helper is used by `find_git_subcommand` to decide whether the command really starts with Git. It is also used by `is_safe_to_call_with_exec` elsewhere, so both safety and danger-related code compare executable names in the same way.
 
 *Call graph*: called by 2 (find_git_subcommand, is_safe_to_call_with_exec); 1 external calls (new).
 
@@ -4890,11 +4907,11 @@ fn find_git_subcommand(
 ) -> Option<(usize, &'a str)>
 ```
 
-**Purpose**: Finds the first git subcommand from a supplied allow-list while correctly skipping known global options and their values. It stops at the first non-option positional token if it is not one of the requested subcommands.
+**Purpose**: Finds the actual Git subcommand, such as `status` or `clone`, even when Git-wide options appear before it. This avoids being fooled by commands like `git -C some/repo status`.
 
-**Data flow**: It takes a tokenized command slice and a slice of candidate subcommand strings, verifies argv[0] normalizes to `git`, iterates arguments after the executable while tracking whether the next token should be skipped as an option value, ignores inline-valued global options, ignores `--` and other option-like tokens, returns `(index, subcommand)` on the first matching positional token, or `None` otherwise.
+**Data flow**: It receives a full command word list and a list of Git subcommands to look for. First it checks that the executable name is `git`. Then it walks through the later words, skipping known global options and their values. When it reaches the first real non-option word, it returns its position and text if it is one of the requested subcommands. If the command is not Git, or the first real subcommand is not one of the requested names, it returns nothing.
 
-**Call relations**: It is called by the safe-command module’s git classifier to avoid git-global-option bypasses and branch-name misclassification.
+**Call relations**: This function is called by `is_safe_git_command` in the safe-command side of the system. It relies on `executable_name_lookup_key` to recognize Git and on the two Git option helpers to skip over global options correctly before deciding what the user is actually asking Git to do.
 
 *Call graph*: calls 3 internal fn (executable_name_lookup_key, is_git_global_option_with_inline_value, is_git_global_option_with_value); called by 1 (is_safe_git_command).
 
@@ -4905,11 +4922,11 @@ fn find_git_subcommand(
 fn is_dangerous_to_call_with_exec(command: &[String]) -> bool
 ```
 
-**Purpose**: Applies direct argv heuristics for dangerous commands without shell parsing. The current rules focus on forceful deletion commands.
+**Purpose**: Checks a simple already-tokenized command for known dangerous direct execution patterns. At present, it flags forceful `rm` deletion and also looks through `sudo` to the command being run with elevated privileges.
 
-**Data flow**: It takes `&[String]`, inspects the first token, returns `true` for `rm` when the second token is `-f` or `-rf`, recursively unwraps `sudo` by checking the remaining slice, and returns `false` for everything else.
+**Data flow**: It receives command words. If the first word is `rm`, it looks at the next word and returns `true` for `-f` or `-rf`. If the first word is `sudo`, it repeats the same check on the rest of the command after `sudo`. For anything else, it returns `false`.
 
-**Call relations**: It is the direct-command predicate used by `command_might_be_dangerous` before and after shell-wrapper parsing.
+**Call relations**: This is the direct Unix-style danger checker used by `command_might_be_dangerous`. The outer function calls it on the original command and also on commands parsed out of a `bash -lc` script.
 
 *Call graph*: called by 1 (command_might_be_dangerous); 1 external calls (matches!).
 
@@ -4920,11 +4937,11 @@ fn is_dangerous_to_call_with_exec(command: &[String]) -> bool
 fn vec_str(items: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts string slices into owned `Vec<String>` values for concise tests. It is a local test helper.
+**Purpose**: Builds test command inputs without making each test repeat string-conversion code. It is a small convenience helper for the tests in this file.
 
-**Data flow**: It takes `&[&str]`, maps each item through `ToString::to_string`, collects into `Vec<String>`, and returns it.
+**Data flow**: It receives a list of string slices, which are lightweight references to text. It converts each one into an owned `String` and returns a vector of those strings, matching the input shape used by the real command-checking functions.
 
-**Call relations**: The danger-classification tests use it to build argv vectors.
+**Call relations**: The test functions call this helper when they need to pass sample commands to the safety checks. It keeps the tests focused on the command behavior rather than Rust string setup.
 
 
 ##### `tests::rm_rf_is_dangerous`  (lines 168–170)
@@ -4933,11 +4950,11 @@ fn vec_str(items: &[&str]) -> Vec<String>
 fn rm_rf_is_dangerous()
 ```
 
-**Purpose**: Verifies that `rm -rf /` is classified as dangerous. This locks in the recursive force-delete heuristic.
+**Purpose**: Verifies that `rm -rf /` is treated as dangerous. This protects the basic safety rule for recursive force deletion.
 
-**Data flow**: The test builds the argv vector `['rm', '-rf', '/']`, passes it to `command_might_be_dangerous`, and asserts the result is `true`.
+**Data flow**: It builds the sample command words for `rm -rf /`, passes them to `command_might_be_dangerous`, and asserts that the answer is `true`. The test changes no lasting state.
 
-**Call relations**: It exercises the direct `is_dangerous_to_call_with_exec` path through the public classifier.
+**Call relations**: This test exercises the public danger-checking path, which then reaches `is_dangerous_to_call_with_exec`. It confirms that callers such as `render_decision_for_unmatched_command` can rely on this obvious destructive command being flagged.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4948,11 +4965,11 @@ fn rm_rf_is_dangerous()
 fn rm_f_is_dangerous()
 ```
 
-**Purpose**: Verifies that `rm -f /` is also classified as dangerous. The heuristic is not limited to recursive deletion.
+**Purpose**: Verifies that `rm -f /` is treated as dangerous. This checks the file’s rule for force deletion without the recursive flag.
 
-**Data flow**: The test builds `['rm', '-f', '/']`, calls `command_might_be_dangerous`, and asserts `true`.
+**Data flow**: It builds the sample command words for `rm -f /`, passes them to `command_might_be_dangerous`, and asserts that the result is `true`. It only observes the checker’s answer.
 
-**Call relations**: It covers the second accepted dangerous `rm` flag variant.
+**Call relations**: This test goes through the same public function used by the rest of the program. It confirms that the lower-level `is_dangerous_to_call_with_exec` rule is visible through the normal command danger API.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -4963,24 +4980,24 @@ fn rm_f_is_dangerous()
 fn direct_powershell_words_reuse_windows_dangerous_detection()
 ```
 
-**Purpose**: Checks that tokenized PowerShell-word danger detection delegates to the Windows implementation only on Windows builds. Non-Windows builds must not classify such words as dangerous.
+**Purpose**: Checks that direct PowerShell danger detection is wired to Windows-specific rules on Windows, and disabled elsewhere. This keeps platform behavior explicit.
 
-**Data flow**: The test builds `['Remove-Item', 'test', '-Force']`, then conditionally asserts `is_dangerous_powershell_words` is `true` on Windows and `false` elsewhere.
+**Data flow**: It builds a sample PowerShell command, `Remove-Item test -Force`. If the test is running on Windows, it expects `is_dangerous_powershell_words` to return `true`; on other systems, it expects `false`. The output is the test pass or failure.
 
-**Call relations**: It validates the platform-gated behavior of the public PowerShell-word helper.
+**Call relations**: This test calls `is_dangerous_powershell_words`, which forwards to the Windows checker only on Windows builds. It confirms that `render_decision_for_unmatched_command` will get platform-appropriate PowerShell danger answers.
 
 *Call graph*: 3 external calls (assert!, cfg!, vec_str).
 
 
 ### `shell-command/src/command_safety/windows_safe_commands.rs`
 
-`domain_logic` · `Windows command approval and policy evaluation`
+`domain_logic` · `command approval / request handling`
 
-This file is the Windows counterpart to the Unix-oriented safe-command classifier. Its top-level rule is intentionally narrow: only PowerShell invocations are considered for auto-approval, and only when they can be parsed into discrete command vectors by the AST-backed parser in `powershell_parser`. `is_safe_command_windows` first recognizes PowerShell executables, then `parse_powershell_invocation` accepts a limited wrapper surface: `-Command`, `/Command`, `-c`, inline `-Command:<script>`, a few benign no-arg flags, or direct command tails after benign flags. Opaque or side-effect-prone wrapper options such as `-EncodedCommand`, `-File`, `-ExecutionPolicy`, and unknown switches are rejected outright.
+This file is a safety gate for running commands on Windows. Windows has several ways to start programs and scripts, and some can hide dangerous behavior. To avoid guessing, this file takes a conservative approach: only PowerShell or pwsh invocations are considered, and even then only a small list of read-only commands is allowed. Think of it like a museum guard who only lets visitors into marked public rooms, not locked doors or unknown hallways.
 
-Once a script string is isolated, `parse_powershell_script` delegates to `parse_with_powershell_ast`, which returns a sequence of parsed commands only for supported syntax. Every parsed command must then satisfy `is_safe_powershell_words`. That safelist allows a small set of read-only cmdlets and aliases (`Get-ChildItem`, `Get-Content`, `Select-String`, `Measure-Object`, `Get-Location`, `Test-Path`, `Resolve-Path`, `Select-Object`, `Get-Item`, plus `echo`/`Write-Output`/`Write-Host`), delegates `git` to the shared git safety logic, and applies ripgrep-specific option checks. It also scans every word for nested unsafe cmdlets like `Set-Content`, `Remove-Item`, `Start-Process`, or `Out-File`, so unsafe operations hidden inside parentheses or arguments still fail.
+The flow starts with the full command as a list of words, such as the executable name and its arguments. The code first checks that the executable is PowerShell. It then looks for a script passed through options like -Command, or treats remaining non-option arguments as the script. That script is parsed using a PowerShell parser, not simple string splitting, so tricky syntax such as redirection, dynamic variables, or unsupported constructs can be refused safely.
 
-Argument joining for direct-tail invocations uses single-quote escaping via `quote_argument`, preserving whitespace safely before AST parsing. Tests cover full-path PowerShell executables, pipelines, git override rejection, stop-parsing rejection, dynamic argument rejection, and the important distinction that `pwsh` may accept syntax such as `&&` that `powershell.exe` does not.
+After parsing, each command in a pipeline is checked against a read-only safelist: listing files, reading files, searching text, counting results, asking Git safe questions, and using ripgrep with safe options. Known write-like commands, process-starting commands, encoded scripts, script files, and unknown switches are rejected. Without this file, the system might accidentally treat a destructive Windows command as harmless.
 
 #### Function details
 
@@ -4990,11 +5007,11 @@ Argument joining for direct-tail invocations uses single-quote escaping via `quo
 fn is_safe_command_windows(command: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether a Windows command is safely auto-approvable under the PowerShell-only safelist. Non-PowerShell commands are rejected by default.
+**Purpose**: This is the main Windows safety check. It answers one question: can this command be run automatically, or should it be treated as unsafe?
 
-**Data flow**: It takes `&[String]`, calls `try_parse_powershell_command_sequence`, and returns `true` only if parsing succeeds and every parsed command slice passes `is_safe_powershell_words`; otherwise it returns `false`.
+**Data flow**: It receives the command as separate strings, such as the program name and each argument. It tries to parse the command as a PowerShell invocation; if parsing works, it checks every parsed command against the read-only safelist. It returns true only when all parsed pieces are safe, and false for non-PowerShell commands or anything uncertain.
 
-**Call relations**: It is called by the cross-platform `is_known_safe_command` entry point on Windows builds.
+**Call relations**: The broader command-safety system calls this when it needs a Windows-specific decision. This function delegates the careful PowerShell parsing to try_parse_powershell_command_sequence, then uses the per-command safety rules to make the final yes-or-no decision.
 
 *Call graph*: calls 1 internal fn (try_parse_powershell_command_sequence); called by 1 (is_known_safe_command).
 
@@ -5005,11 +5022,11 @@ fn is_safe_command_windows(command: &[String]) -> bool
 fn try_parse_powershell_command_sequence(command: &[String]) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Recognizes PowerShell invocations and extracts their parsed command sequence if possible. It is the wrapper gate before AST parsing.
+**Purpose**: This function checks whether the command actually starts with a supported PowerShell executable. If it does, it turns the invocation into one or more parsed command word lists.
 
-**Data flow**: It takes `&[String]`, splits off the executable, checks it with `is_powershell_executable`, and if it matches delegates the remaining args to `parse_powershell_invocation`; otherwise it returns `None`.
+**Data flow**: It reads the first word as the executable and the rest as arguments. If the executable name is powershell, powershell.exe, pwsh, or pwsh.exe, it passes the remaining arguments onward for parsing. It returns parsed command sequences on success, or nothing if the command is not PowerShell.
 
-**Call relations**: It is used only by `is_safe_command_windows` to distinguish PowerShell wrappers from everything else.
+**Call relations**: is_safe_command_windows calls this as its first filter. It uses is_powershell_executable to recognize PowerShell, then hands real PowerShell invocations to parse_powershell_invocation.
 
 *Call graph*: calls 2 internal fn (is_powershell_executable, parse_powershell_invocation); called by 1 (is_safe_command_windows).
 
@@ -5020,11 +5037,11 @@ fn try_parse_powershell_command_sequence(command: &[String]) -> Option<Vec<Vec<S
 fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Parses the outer PowerShell argv wrapper into a script string and then into discrete commands, rejecting opaque or suspicious wrapper forms. It is intentionally stricter than PowerShell itself.
+**Purpose**: This function understands the safe shapes of a PowerShell command line. It accepts simple inline commands and rejects forms that are opaque, unnecessary, or risky for read-only checks.
 
-**Data flow**: It takes the executable path and remaining args, rejects empty args, scans wrapper flags from left to right, handles `-command`/`/command`/`-c` by requiring exactly one following script token and no trailing args, handles inline `-command:` and `/command:` similarly, skips benign flags like `-NoLogo` and `-NoProfile`, rejects explicitly forbidden flags such as `-EncodedCommand`, `-File`, `-WindowStyle`, `-ExecutionPolicy`, and `-WorkingDirectory`, rejects unknown switches, and otherwise joins the remaining args into a script with `join_arguments_as_script` before passing the script to `parse_powershell_script`.
+**Data flow**: It receives the PowerShell executable name and its arguments. It skips a few harmless flags, accepts command text passed through -Command or similar forms, rejects dangerous options like encoded commands or script files, and can rebuild a script from remaining plain arguments. It returns parsed command sequences, or nothing if the invocation shape is not trusted.
 
-**Call relations**: It is called by `try_parse_powershell_command_sequence` and delegates actual script parsing to `parse_powershell_script`.
+**Call relations**: try_parse_powershell_command_sequence calls this after confirming the executable is PowerShell. When it finds script text, it sends that text to parse_powershell_script; when plain arguments must be treated as a script, it uses join_arguments_as_script first.
 
 *Call graph*: calls 2 internal fn (join_arguments_as_script, parse_powershell_script); called by 1 (try_parse_powershell_command_sequence).
 
@@ -5035,11 +5052,11 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
 fn parse_powershell_script(executable: &str, script: &str) -> Option<Vec<Vec<String>>>
 ```
 
-**Purpose**: Delegates a PowerShell script string to the AST-backed parser and returns parsed command vectors only on successful structured parsing. Unsupported syntax is rejected with `None`.
+**Purpose**: This function turns a PowerShell script string into structured command pieces. It relies on the real PowerShell-aware parser so the safety checker does not have to guess from raw text.
 
-**Data flow**: It takes an executable path and script `&str`, calls `parse_with_powershell_ast`, and returns `Some(commands)` only when the outcome is `PowershellParseOutcome::Commands`.
+**Data flow**: It receives the executable variant and a script string. It calls the PowerShell abstract syntax tree parser, which means a parser that understands PowerShell code structure rather than just spaces. If the parser reports normal commands, those are returned; otherwise the script is rejected.
 
-**Call relations**: It is the bridge from wrapper parsing into the helper-process parser in `powershell_parser`.
+**Call relations**: parse_powershell_invocation calls this whenever it has identified the script portion of a PowerShell invocation. It hands off to parse_with_powershell_ast, and only passes successful command lists back to the safety-checking path.
 
 *Call graph*: calls 1 internal fn (parse_with_powershell_ast); called by 1 (parse_powershell_invocation).
 
@@ -5050,11 +5067,11 @@ fn parse_powershell_script(executable: &str, script: &str) -> Option<Vec<Vec<Str
 fn is_powershell_executable(exe: &str) -> bool
 ```
 
-**Purpose**: Recognizes supported PowerShell executable names from either bare names or full paths. It lowercases the basename before comparison.
+**Purpose**: This function recognizes whether a program name points to a supported PowerShell binary. It works with both bare names and full paths.
 
-**Data flow**: It takes an executable string, extracts the basename with `Path::new(...).file_name()`, falls back to the original string if needed, lowercases it, and returns `true` for `powershell`, `powershell.exe`, `pwsh`, or `pwsh.exe`.
+**Data flow**: It receives an executable string, extracts the file name if the string is a path, lowercases it, and compares it with known PowerShell names. It returns true for powershell, powershell.exe, pwsh, and pwsh.exe, and false for anything else.
 
-**Call relations**: It gates `try_parse_powershell_command_sequence` so only PowerShell wrappers enter the Windows safelist parser.
+**Call relations**: try_parse_powershell_command_sequence calls this before doing any deeper parsing. It acts as the front-door check that keeps direct CMD commands or unrelated programs out of the automatic-safe path.
 
 *Call graph*: called by 1 (try_parse_powershell_command_sequence); 2 external calls (new, matches!).
 
@@ -5065,11 +5082,11 @@ fn is_powershell_executable(exe: &str) -> bool
 fn join_arguments_as_script(args: &[String]) -> String
 ```
 
-**Purpose**: Reconstructs a PowerShell script string from argv tail tokens when PowerShell is invoked without an explicit `-Command` wrapper. It preserves whitespace-bearing arguments by quoting them.
+**Purpose**: This function rebuilds a PowerShell script string from separate command-line arguments when PowerShell was invoked without an explicit -Command flag. It preserves the first word as the command and quotes later words when needed.
 
-**Data flow**: It takes `&[String]`, allocates a `Vec<String>` with capacity for all args, copies the first token unchanged, quotes each remaining token with `quote_argument`, joins the pieces with spaces, and returns the resulting script `String`.
+**Data flow**: It receives a slice of argument strings. It copies the first argument as-is, quotes later arguments that contain spaces, joins everything with spaces, and returns the rebuilt script string.
 
-**Call relations**: It is used by `parse_powershell_invocation` when non-flag tokens appear directly after benign wrapper flags.
+**Call relations**: parse_powershell_invocation uses this when it reaches plain non-flag arguments. It relies on quote_argument to make space-containing arguments safe to reparse as part of a script.
 
 *Call graph*: calls 1 internal fn (quote_argument); called by 1 (parse_powershell_invocation); 1 external calls (with_capacity).
 
@@ -5080,11 +5097,11 @@ fn join_arguments_as_script(args: &[String]) -> String
 fn quote_argument(arg: &str) -> String
 ```
 
-**Purpose**: Quotes one argument for safe reconstruction into a PowerShell script string. It uses single quotes and doubles embedded single quotes when whitespace is present.
+**Purpose**: This helper prepares one argument to be included in a rebuilt PowerShell script. It adds single quotes only when an argument needs them.
 
-**Data flow**: It takes `&str`, returns `''` for an empty string, returns the original string unchanged if it contains no whitespace, otherwise returns a formatted single-quoted string with internal `'` replaced by `''`.
+**Data flow**: It receives one argument string. Empty arguments become two single quotes, arguments without whitespace are returned unchanged, and arguments with whitespace are wrapped in single quotes with internal single quotes doubled. The result is a PowerShell-friendly text form of the argument.
 
-**Call relations**: It is called by `join_arguments_as_script` for every argument after the first.
+**Call relations**: join_arguments_as_script calls this for arguments after the first one. It keeps rebuilt scripts from accidentally changing meaning when file names or values contain spaces.
 
 *Call graph*: called by 1 (join_arguments_as_script); 1 external calls (format!).
 
@@ -5095,11 +5112,11 @@ fn quote_argument(arg: &str) -> String
 fn is_safe_powershell_words(words: &[String]) -> bool
 ```
 
-**Purpose**: Checks whether one parsed PowerShell command vector stays within the read-only safelist. It rejects both unsafe top-level cmdlets and nested unsafe cmdlets hidden inside words.
+**Purpose**: This function decides whether one parsed PowerShell command is read-only and allowed. It is the main safelist for PowerShell command names and selected external tools.
 
-**Data flow**: It takes `&[String]`, rejects empty command vectors, scans every word after trimming surrounding parentheses and leading dashes for nested unsafe cmdlets like `set-content`, `remove-item`, `start-process`, and `out-file`, then normalizes the first word similarly and matches it against the safelist. It returns `true` for allowed read-only cmdlets and aliases, delegates `git` to `is_safe_git_command`, delegates `rg` to `is_safe_ripgrep`, explicitly returns `false` for common side-effecting cmdlets, and returns `false` for everything else.
+**Data flow**: It receives one command as parsed words, with the command name first. It rejects empty commands, checks all words for nested dangerous cmdlets, normalizes the command name, and compares it with known safe or unsafe commands. It returns true for allowed read-only commands, including safe Git and ripgrep usage, and false otherwise.
 
-**Call relations**: It is called on every parsed command by `is_safe_command_windows`, and is also exposed indirectly through the cross-platform safe-command module for already tokenized PowerShell words.
+**Call relations**: This is used during the final safety pass after parsing has broken a PowerShell script into command pieces. For Git commands it hands the details to is_safe_git_command, and for ripgrep commands it hands the option check to is_safe_ripgrep.
 
 *Call graph*: calls 2 internal fn (is_safe_git_command, is_safe_ripgrep); called by 1 (is_safe_powershell_words); 1 external calls (matches!).
 
@@ -5110,11 +5127,11 @@ fn is_safe_powershell_words(words: &[String]) -> bool
 fn is_safe_ripgrep(words: &[String]) -> bool
 ```
 
-**Purpose**: Applies ripgrep-specific option restrictions within PowerShell command vectors. It rejects options that can spawn helper commands or external decompression tools.
+**Purpose**: This function checks whether an rg, or ripgrep, command avoids options that can run other programs. Ripgrep is normally a read-only search tool, but a few options can make it unsafe.
 
-**Data flow**: It takes `&[String]`, lowercases each argument after the command name, and returns `false` if any argument is `--search-zip` or `-z`, or matches `--pre`, `--pre=...`, `--hostname-bin`, or `--hostname-bin=...`; otherwise it returns `true`.
+**Data flow**: It receives the parsed rg command words. It skips the command name, lowercases each option, and looks for forbidden options such as --pre, --hostname-bin, --search-zip, or -z. It returns true when none of those risky options appear, and false when one does.
 
-**Call relations**: It is called only by `is_safe_powershell_words` when the parsed command name is `rg`.
+**Call relations**: is_safe_powershell_words calls this after recognizing rg as the command. This keeps the general PowerShell safelist simple while giving ripgrep its own detailed option check.
 
 *Call graph*: called by 1 (is_safe_powershell_words).
 
@@ -5125,11 +5142,11 @@ fn is_safe_ripgrep(words: &[String]) -> bool
 fn vec_str(args: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts string slices into owned argv vectors for tests. It is a local helper.
+**Purpose**: This small test helper converts borrowed string literals into owned String values. It makes the tests easier to read because they can write command examples as simple text slices.
 
-**Data flow**: It takes `&[&str]`, maps each item to `String`, collects into `Vec<String>`, and returns it.
+**Data flow**: It receives a slice of string literals. It copies each item into a String and returns a vector of those Strings, matching the input shape expected by the safety functions.
 
-**Call relations**: The Windows safelist tests use it to build command vectors.
+**Call relations**: The test functions use this helper whenever they build example commands. It has no role in production behavior.
 
 
 ##### `tests::recognizes_safe_powershell_wrappers`  (lines 237–267)
@@ -5138,11 +5155,11 @@ fn vec_str(args: &[&str]) -> Vec<String>
 fn recognizes_safe_powershell_wrappers()
 ```
 
-**Purpose**: Verifies that common safe PowerShell wrapper forms are accepted, including `-NoLogo`, `-NoProfile`, explicit `-Command`, direct command tails, and `pwsh` parity. It establishes the accepted wrapper surface.
+**Purpose**: This test checks that normal safe PowerShell wrapper forms are accepted. It covers common flags and simple read-only commands.
 
-**Data flow**: The test builds several PowerShell argv vectors, optionally including a discovered `pwsh` path, passes each to `is_safe_command_windows`, and asserts `true`.
+**Data flow**: It builds several PowerShell command examples, including file listing, Git status, and file reading. Each example is sent into is_safe_command_windows, and the test expects true. If pwsh is available on the machine, it also checks that pwsh works the same way.
 
-**Call relations**: It exercises wrapper parsing, AST parsing, and the read-only PowerShell-word safelist together.
+**Call relations**: This test exercises the main safety entry point through realistic wrapper commands. It uses try_find_pwsh_executable_blocking when it needs a real pwsh path for the local Windows environment.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 1 external calls (assert!).
 
@@ -5153,11 +5170,11 @@ fn recognizes_safe_powershell_wrappers()
 fn accepts_full_path_powershell_invocations()
 ```
 
-**Purpose**: Checks that full executable paths to PowerShell binaries are recognized and classified correctly. Basename extraction must work for path-based invocations.
+**Purpose**: This test proves that the checker recognizes PowerShell even when it is named by a full filesystem path. That matters because callers may not invoke powershell.exe by a short name.
 
-**Data flow**: The test returns early off Windows where appropriate, optionally checks a discovered `pwsh` full path, and asserts that both discovered and hard-coded full PowerShell paths are accepted for read-only commands.
+**Data flow**: It builds commands where the first word is a full path to PowerShell or pwsh. The commands are read-only, so the test expects is_safe_command_windows to return true. On non-Windows platforms, it skips path-sensitive checks.
 
-**Call relations**: It validates `is_powershell_executable` and the overall Windows safelist path handling.
+**Call relations**: This test focuses on is_powershell_executable through the public safety function. It may call try_find_pwsh_executable_blocking to locate a real pwsh installation.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 2 external calls (assert!, cfg!).
 
@@ -5168,11 +5185,11 @@ fn accepts_full_path_powershell_invocations()
 fn allows_read_only_pipelines_and_git_usage()
 ```
 
-**Purpose**: Verifies that parsed PowerShell pipelines composed of safe commands remain safe, and that safe git usage is accepted inside PowerShell. It covers multi-command AST output.
+**Purpose**: This test checks that useful read-only pipelines are allowed. It includes searching, counting, selecting output, reading files, and safe Git inspection.
 
-**Data flow**: The test discovers `pwsh`, builds several `-Command` scripts involving ripgrep pipelines, `Get-Content | Select-Object`, `git show`, parenthesized `Get-Content`, and `Get-Item | Select-Object`, and asserts each is safe.
+**Data flow**: It finds pwsh, builds several PowerShell -Command examples containing pipelines or Git commands, and sends each to is_safe_command_windows. Each example should return true because it reads information without changing files or processes.
 
-**Call relations**: It exercises AST parsing into multiple command vectors and the per-command `is_safe_powershell_words` checks.
+**Call relations**: This test runs through the full path: PowerShell invocation parsing, PowerShell AST parsing, per-command safelist checks, and Git-specific safety checks.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 1 external calls (assert!).
 
@@ -5183,11 +5200,11 @@ fn allows_read_only_pipelines_and_git_usage()
 fn rejects_git_global_override_options()
 ```
 
-**Purpose**: Ensures unsafe git global override options remain unsafe even when invoked through PowerShell. Windows PowerShell safety reuses the shared git rules.
+**Purpose**: This test checks that Git options capable of changing Git’s environment or behavior are not treated as automatically safe. Such options can make an apparently read-only Git command run unexpected helpers or read from attacker-controlled locations.
 
-**Data flow**: The test discovers `pwsh`, iterates over many unsafe git scripts using `-c`, `--config-env`, `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`, and `--super-prefix`, wraps each in a PowerShell command vector, and asserts `is_safe_command_windows` is `false`.
+**Data flow**: It creates a list of Git commands using risky global options such as configuration overrides, custom git directories, work trees, exec paths, namespaces, and super-prefixes. Each command is wrapped in PowerShell and passed to is_safe_command_windows. The expected result is false for every case.
 
-**Call relations**: It validates integration between PowerShell parsing and the shared `is_safe_git_command` logic.
+**Call relations**: This test reaches the Git-specific safety logic through the Windows PowerShell safety path. It uses try_find_pwsh_executable_blocking so the examples can run against a real pwsh executable when available.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 1 external calls (assert!).
 
@@ -5198,11 +5215,11 @@ fn rejects_git_global_override_options()
 fn rejects_git_subcommand_options_with_side_effects()
 ```
 
-**Purpose**: Checks that git subcommand options with side effects are rejected inside PowerShell as well. This includes output-writing and external-diff/textconv behavior.
+**Purpose**: This test checks that dangerous Git subcommand options are rejected. These are options that can write files or run external filters even when the Git command looks like it is only inspecting history.
 
-**Data flow**: The test maps several git scripts into PowerShell command vectors, collects `(script, bool)` results from `is_safe_command_windows`, and asserts they all evaluate to `false`.
+**Data flow**: It builds several PowerShell-wrapped Git examples, records whether each one is considered safe, and compares the collected results with the expected all-false list. A mismatch means a risky Git form slipped through.
 
-**Call relations**: It covers the shared git subcommand option restrictions through the Windows safelist.
+**Call relations**: This test exercises is_safe_command_windows and, through it, the Git safety checker. It uses an equality assertion so the failure output clearly shows which Git example behaved differently.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5213,11 +5230,11 @@ fn rejects_git_subcommand_options_with_side_effects()
 fn rejects_stop_parsing_git_forms()
 ```
 
-**Purpose**: Ensures PowerShell stop-parsing forms are not accepted as safe. Unsupported parser constructs must not fall back to permissive token splitting.
+**Purpose**: This test verifies that PowerShell’s stop-parsing marker is not allowed to hide unsafe Git arguments. The stop-parsing marker can change how following text is interpreted.
 
-**Data flow**: The test passes `git log --% HEAD --output=codex_poc.txt` through `is_safe_command_windows` and asserts `false`.
+**Data flow**: It builds a PowerShell command containing a Git log invocation with --% and a risky output option. It sends the command into is_safe_command_windows and expects false.
 
-**Call relations**: It validates the AST parser’s `Unsupported` outcome propagation through `parse_powershell_script`.
+**Call relations**: This test checks the full parser-and-safelist path for a known tricky syntax form. It helps ensure unsafe Git arguments cannot bypass normal parsing.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5228,11 +5245,11 @@ fn rejects_stop_parsing_git_forms()
 fn rejects_powershell_commands_with_side_effects()
 ```
 
-**Purpose**: Covers a broad set of PowerShell commands and constructs that must remain unsafe, including mutating cmdlets, unsafe ripgrep flags, redirections, call operators, chained safe+unsafe scripts, nested unsafe cmdlets, array expansion, unsupported syntax, sub-expressions, and empty words. It documents the conservative boundaries of the Windows safelist.
+**Purpose**: This test covers many PowerShell patterns that should never be auto-approved because they can write files, start commands, redirect output, or use confusing syntax. It is a broad guard against accidental loosening of the safety rules.
 
-**Data flow**: The test builds many PowerShell command vectors and asserts `is_safe_command_windows` returns `false` for each.
+**Data flow**: It builds many example PowerShell commands, including Remove-Item, Set-Content, unsafe ripgrep options, redirection, call operators, chained safe-and-unsafe commands, nested unsafe commands, array expansion, unsupported operators, sub-expressions, and empty parsed commands. Each is sent to is_safe_command_windows, and each must return false.
 
-**Call relations**: It exercises wrapper rejection, AST parser rejection, nested-unsafe-word scanning, and top-level command safelist rejection.
+**Call relations**: This test stresses both the PowerShell parser and is_safe_powershell_words. It confirms that unsafe syntax is rejected before or during the per-command safelist check.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5243,11 +5260,11 @@ fn rejects_powershell_commands_with_side_effects()
 fn accepts_constant_expression_arguments()
 ```
 
-**Purpose**: Verifies that constant quoted string arguments are accepted by the AST-backed parser and safelist. Literal strings with spaces should remain safe.
+**Purpose**: This test checks that simple quoted literal arguments are accepted. File names with spaces should be safe when they are fixed text, not dynamic code.
 
-**Data flow**: The test passes `Get-Content 'foo bar'` and `Get-Content "foo bar"` through `is_safe_command_windows` and asserts `true`.
+**Data flow**: It creates PowerShell commands that read files named with quoted strings. The commands go into is_safe_command_windows, and the expected result is true.
 
-**Call relations**: It covers AST parsing of constant expression arguments and acceptance by `is_safe_powershell_words`.
+**Call relations**: This test exercises the parser’s ability to accept constant expressions and pass them to the safelist as ordinary command words. It protects useful read-only cases from being blocked too aggressively.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5258,11 +5275,11 @@ fn accepts_constant_expression_arguments()
 fn rejects_dynamic_arguments()
 ```
 
-**Purpose**: Ensures dynamic PowerShell arguments such as variables and interpolated strings are rejected. The safelist depends on literal AST-derived words.
+**Purpose**: This test checks that variable-based arguments are rejected. Dynamic values can hide what command will really run or what file will be touched.
 
-**Data flow**: The test passes `Get-Content $foo` and `Write-Output "foo $bar"` through `is_safe_command_windows` and asserts `false`.
+**Data flow**: It creates PowerShell commands that use variables directly or inside strings. Each command is checked with is_safe_command_windows, and the expected result is false.
 
-**Call relations**: It validates that the AST parser does not emit acceptable literal command vectors for dynamic expressions.
+**Call relations**: This test depends on the PowerShell parser refusing dynamic expressions for this safety path. It confirms that only clearly known command words and literal arguments reach the safelist.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5273,24 +5290,24 @@ fn rejects_dynamic_arguments()
 fn uses_invoked_powershell_variant_for_parsing()
 ```
 
-**Purpose**: Checks that parsing semantics depend on the actual invoked PowerShell variant. Syntax accepted by `pwsh` but not by `powershell.exe` should be classified accordingly.
+**Purpose**: This test checks that the parser uses the same PowerShell variant that the user invoked. Windows PowerShell and modern pwsh can understand different syntax, so safety must be judged using the right rules.
 
-**Data flow**: The test returns early off Windows, defines the script `pwd && ls`, asserts it is unsafe under `powershell.exe -Command`, then if `pwsh` is available asserts the same script is safe under `pwsh -Command`.
+**Data flow**: On Windows, it builds a command chain using syntax that differs between powershell.exe and pwsh. It expects the powershell.exe form to be rejected and, if pwsh is available, the pwsh form to be accepted.
 
-**Call relations**: It validates the executable-keyed parser-process cache and the design choice to parse with the real invoked PowerShell variant.
+**Call relations**: This test runs through is_safe_command_windows and parse_powershell_script, with try_find_pwsh_executable_blocking used to locate pwsh. It guards against parsing a command with the wrong PowerShell dialect.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 2 external calls (assert!, cfg!).
 
 
 ### `shell-command/src/command_safety/is_safe_command.rs`
 
-`domain_logic` · `command approval and policy evaluation`
+`domain_logic` · `command approval / request handling`
 
-This file is the core read-only command classifier. `is_known_safe_command` first normalizes `zsh` to `bash` so shell-wrapper handling is shared, then consults Windows-specific logic when applicable, then checks direct argv safety with `is_safe_to_call_with_exec`, and finally parses `bash -lc`/`zsh -lc` scripts into plain command sequences and requires every extracted inner command to be individually safe.
+When an automated tool wants to run a shell command, some commands are clearly low-risk, while others can change files, run hidden programs, or delete data. This file is the project’s conservative “known safe” checklist. It does not try to prove that every possible command is harmless. Instead, it recognizes a small set of commands and options that are expected to only read information.
 
-The direct safelist is explicit and conservative. Some commands are always accepted by executable name (`cat`, `grep`, `ls`, `pwd`, `wc`, etc.), while others are accepted only if dangerous options are absent: `base64` is unsafe with output-writing flags, `find` is unsafe with `-exec`, `-delete`, and file-writing options, and `rg` is unsafe with flags that spawn helper commands or external decompressors. `sed` is only accepted in the narrow `sed -n <line-spec> [file]` form validated by `is_valid_sed_n_arg`.
+The main entry point takes an already-split command, such as `["git", "status"]`. It normalizes a few cases, such as treating `zsh` like `bash`, then checks platform-specific Windows rules if needed. After that it checks a built-in allow-list: commands like `ls`, `cat`, `grep`, `pwd`, and selected forms of `git`, `find`, `rg`, `base64`, and `sed`.
 
-Git handling is more nuanced. `is_safe_git_command` uses the shared `find_git_subcommand` scanner to locate `status`, `log`, `diff`, `show`, or `branch` after skipping global options. It then rejects unsafe global overrides (`-C`, `-c`, `--git-dir`, `--paginate`, etc.) and unsafe subcommand options (`--output`, `--ext-diff`, `--textconv`, `--exec`). `git branch` is only safe for clearly read-only listing/query forms. The `GitOptionPattern` enum encodes exact, prefix, and short-inline-value matching so option checks stay declarative. Tests cover many bypass attempts, shell-wrapped forms, Windows path normalization interactions, and a non-Windows regression ensuring safety classification never spawns a repository-local fake PowerShell binary.
+The important detail is that options matter. For example, `find` can be safe when it searches, but unsafe when it uses `-delete` or `-exec`. `git log` is usually read-only, but Git options that change the working directory, invoke pagers, write output files, or use external helpers are rejected. The file also supports simple `bash -lc "..."` scripts if they are just plain commands joined by basic shell operators like `&&`, `||`, `;`, or `|`. Think of it like a bouncer with a short guest list: familiar names still get checked for dangerous baggage.
 
 #### Function details
 
@@ -5300,11 +5317,11 @@ Git handling is more nuanced. `is_safe_git_command` uses the shared `find_git_su
 fn is_known_safe_command(command: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether a tokenized command is known read-only enough to auto-approve. It supports direct argv forms, Windows PowerShell wrappers, and restricted shell-wrapper scripts whose inner commands are all safe.
+**Purpose**: Decides whether a whole command line is known to be safe enough to auto-approve. This is the main safety question asked before an unmatched command is allowed to run without extra user approval.
 
-**Data flow**: It takes `&[String]`, clones it into a normalized `Vec<String>` that rewrites `zsh` to `bash`, optionally delegates to `is_safe_command_windows` on Windows, checks the normalized argv with `is_safe_to_call_with_exec`, then tries `parse_shell_lc_plain_commands` and returns `true` only if the parsed sequence is non-empty and every inner command passes `is_safe_to_call_with_exec`.
+**Data flow**: It receives a list of command words, changes `zsh` to `bash` for this check, then tries several safety paths: Windows-specific safe commands, direct executable allow-list checks, and simple `bash -lc` command sequences. It returns `true` only if one of those paths proves the command is in the narrow safe set; otherwise it returns `false`.
 
-**Call relations**: It is the top-level safe-command predicate used by unmatched-command decision rendering. It delegates shell parsing to the Bash module and direct executable classification to `is_safe_to_call_with_exec`.
+**Call relations**: When `render_decision_for_unmatched_command` needs to decide what to do with a command, it calls this function. This function then hands the work to the platform-specific Windows checker, the direct command checker, or the shell-script parser depending on what shape the command has.
 
 *Call graph*: calls 3 internal fn (parse_shell_lc_plain_commands, is_safe_to_call_with_exec, is_safe_command_windows); called by 1 (render_decision_for_unmatched_command).
 
@@ -5315,11 +5332,11 @@ fn is_known_safe_command(command: &[String]) -> bool
 fn is_safe_powershell_words(command: &[String]) -> bool
 ```
 
-**Purpose**: Exposes the Windows PowerShell-word safelist for already tokenized PowerShell commands. On non-Windows builds it always returns `false`.
+**Purpose**: Checks whether already-split PowerShell words are safe according to the Windows PowerShell allow-list. On non-Windows systems it deliberately says no.
 
-**Data flow**: It takes `&[String]`; on Windows it forwards to `is_safe_powershell_words_windows`, and on other platforms it ignores the input and returns `false`.
+**Data flow**: It receives PowerShell command words. On Windows, it passes those words to the Windows-specific checker and returns that result; elsewhere it ignores the words and returns `false`.
 
-**Call relations**: It is used by unmatched-command rendering when PowerShell words have already been extracted separately from a full invocation.
+**Call relations**: This is another safety question used by `render_decision_for_unmatched_command`. It keeps PowerShell safety rules behind a platform boundary so that non-Windows systems do not accidentally treat a PowerShell-looking path as safe.
 
 *Call graph*: calls 1 internal fn (is_safe_powershell_words); called by 1 (render_decision_for_unmatched_command).
 
@@ -5330,11 +5347,11 @@ fn is_safe_powershell_words(command: &[String]) -> bool
 fn is_safe_to_call_with_exec(command: &[String]) -> bool
 ```
 
-**Purpose**: Classifies direct argv commands as safe or unsafe based on executable name and option-level heuristics. It is the main non-shell safelist implementation.
+**Purpose**: Checks whether a directly executed command is on the safe allow-list, including its options. It is the core rulebook for non-shell commands.
 
-**Data flow**: It takes `&[String]`, returns `false` for an empty command, normalizes argv[0] with `executable_name_lookup_key`, and matches on the executable name. It returns `true` for a fixed set of read-only commands, conditionally for Linux-only `numfmt` and `tac`, checks option restrictions for `base64`, `find`, and `rg`, delegates git commands to `is_safe_git_command`, accepts only narrow `sed -n` forms validated by `is_valid_sed_n_arg`, and returns `false` otherwise.
+**Data flow**: It receives command words, looks at the first word as the executable name, normalizes that name for lookup, then matches it against known safe commands. For commands with risky options, such as `base64`, `find`, `rg`, `git`, and `sed`, it inspects the remaining words before returning `true`; unknown or risky forms return `false`.
 
-**Call relations**: It is called directly by `is_known_safe_command` and indirectly on each parsed inner shell command. It relies on shared executable normalization and git-specific helpers.
+**Call relations**: The main command checker calls this for direct commands and for each plain command extracted from `bash -lc`. When it sees Git it delegates to `is_safe_git_command`, and when it sees the special safe `sed -n ...p` shape it asks `is_valid_sed_n_arg` to verify the print range.
 
 *Call graph*: calls 3 internal fn (executable_name_lookup_key, is_safe_git_command, is_valid_sed_n_arg); called by 1 (is_known_safe_command); 2 external calls (cfg!, matches!).
 
@@ -5345,11 +5362,11 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool
 fn is_safe_git_command(command: &[String]) -> bool
 ```
 
-**Purpose**: Determines whether a git invocation is read-only under a conservative option policy. It allows only selected subcommands and rejects global or subcommand options that can alter behavior or write output.
+**Purpose**: Decides whether a Git command is only reading information, such as status, logs, diffs, shows, or safe branch listing. It blocks Git forms that can change state, run helpers, or write output.
 
-**Data flow**: It takes `&[String]`, uses `find_git_subcommand` to locate one of `status`, `log`, `diff`, `show`, or `branch`, slices out global args before the subcommand and rejects them if `git_has_unsafe_global_option` is true, slices subcommand args after the subcommand, then for `status/log/diff/show` requires `git_subcommand_args_are_read_only`, and for `branch` additionally requires `git_branch_is_read_only`.
+**Data flow**: It receives all Git command words, finds the first real Git subcommand while skipping allowed-looking global option positions, then checks any global arguments for unsafe options. It then checks the subcommand’s own arguments for write-like or external-execution options, and applies extra strict rules for `git branch`.
 
-**Call relations**: It is called from `is_safe_to_call_with_exec` for direct git commands and is also reused by the Windows PowerShell safelist so git safety rules stay consistent across shells.
+**Call relations**: The direct command checker calls this whenever the executable is Git, and the call graph also shows it participating in the PowerShell safety path. It relies on the shared Git subcommand finder, then hands global options to `git_has_unsafe_global_option`, subcommand options to `git_subcommand_args_are_read_only`, and branch-specific arguments to `git_branch_is_read_only`.
 
 *Call graph*: calls 4 internal fn (find_git_subcommand, git_branch_is_read_only, git_has_unsafe_global_option, git_subcommand_args_are_read_only); called by 2 (is_safe_to_call_with_exec, is_safe_powershell_words); 1 external calls (debug_assert!).
 
@@ -5360,11 +5377,11 @@ fn is_safe_git_command(command: &[String]) -> bool
 fn git_branch_is_read_only(branch_args: &[String]) -> bool
 ```
 
-**Purpose**: Restricts `git branch` to clearly query-only forms. Any positional argument or unrecognized flag is treated as potentially mutating.
+**Purpose**: Separates safe `git branch` queries from branch-changing commands. Listing branches is allowed; creating, deleting, or renaming branches is not.
 
-**Data flow**: It takes the subcommand argument slice, returns `true` for no args, otherwise scans each arg string, marks known listing/query flags such as `--list`, `--show-current`, `-a`, `-r`, `-v`, `-vv`, and `--format=...` as read-only indicators, and returns `false` on any other token. It returns `true` only if at least one recognized read-only flag was seen when args are present.
+**Data flow**: It receives only the arguments after `git branch`. With no arguments it returns `true`, because that lists branches. With arguments, it accepts only clearly read-only flags such as `--list`, `--show-current`, `--all`, or `--format=...`; any unknown flag or branch name makes it return `false`.
 
-**Call relations**: It is the branch-specific refinement step inside `is_safe_git_command`.
+**Call relations**: `is_safe_git_command` calls this only after it has already identified the subcommand as `branch` and checked the general Git safety rules. This function is the final stricter filter for the one Git subcommand whose plain positional arguments can easily mean mutation.
 
 *Call graph*: called by 1 (is_safe_git_command).
 
@@ -5375,11 +5392,11 @@ fn git_branch_is_read_only(branch_args: &[String]) -> bool
 fn matches(self, arg: &str) -> bool
 ```
 
-**Purpose**: Matches one git option argument against a declarative pattern variant. It supports exact equality, short options with inline values, and prefix forms.
+**Purpose**: Checks whether one command-line argument matches a stored Git option pattern. It supports exact option names, short options with attached values, and long-option prefixes.
 
-**Data flow**: It takes `self` and an argument `&str`, compares according to the enum variant, and returns a boolean indicating whether the argument matches the pattern.
+**Data flow**: It receives one pattern and one argument string. Depending on the pattern kind, it compares equality, checks for a short option followed by extra text, or checks whether the argument starts with a prefix, then returns `true` or `false`.
 
-**Call relations**: It is used by `git_matches_option_pattern`, which in turn powers both global and subcommand git option safety checks.
+**Call relations**: This is the small matching rule used by the Git option scanning helpers. It lets the rest of the file describe unsafe Git options in a compact table instead of repeating string-comparison code.
 
 
 ##### `git_matches_option_pattern`  (lines 279–281)
@@ -5388,11 +5405,11 @@ fn matches(self, arg: &str) -> bool
 fn git_matches_option_pattern(arg: &str, patterns: &[GitOptionPattern]) -> bool
 ```
 
-**Purpose**: Checks whether a git argument matches any pattern in a supplied pattern list. It is a small helper to keep option scans concise.
+**Purpose**: Checks whether a Git argument matches any pattern in a given unsafe-option list. It answers the simple question, “Is this argument one of the dangerous forms we know about?”
 
-**Data flow**: It takes an argument `&str` and a slice of `GitOptionPattern`, iterates the patterns, calls `pattern.matches(arg)` on each, and returns `true` if any match.
+**Data flow**: It receives one argument and a list of Git option patterns. It tries the argument against each pattern and returns `true` as soon as any pattern matches; otherwise it returns `false`.
 
-**Call relations**: It is used by both `git_has_unsafe_global_option` and `git_subcommand_args_are_read_only`.
+**Call relations**: The Git global-option and subcommand-option checkers use this as their shared scanner. It sits between the high-level Git safety rules and the low-level `GitOptionPattern::matches` comparison.
 
 *Call graph*: 1 external calls (iter).
 
@@ -5403,11 +5420,11 @@ fn git_matches_option_pattern(arg: &str, patterns: &[GitOptionPattern]) -> bool
 fn git_has_unsafe_global_option(global_args: &[String]) -> bool
 ```
 
-**Purpose**: Detects whether any git global argument belongs to the unsafe global-option set. These options can redirect repositories, alter helpers, or change paging behavior.
+**Purpose**: Detects Git global options that make an otherwise read-only command too risky to auto-approve. These include options that change directories, configuration, execution paths, namespaces, pagination, or work trees.
 
-**Data flow**: It takes the global-argument slice `&[String]`, maps each to `&str`, checks each against `UNSAFE_GIT_GLOBAL_OPTIONS` via `git_matches_option_pattern`, and returns `true` if any unsafe option is present.
+**Data flow**: It receives the words that appear between `git` and the Git subcommand. It checks each word against the unsafe global option patterns and returns `true` if any risky option is present.
 
-**Call relations**: It is called by `is_safe_git_command` after the subcommand position has been identified.
+**Call relations**: `is_safe_git_command` calls this after finding the Git subcommand but before approving any Git operation. If this function finds a risky global option, the Git command is rejected immediately.
 
 *Call graph*: called by 1 (is_safe_git_command).
 
@@ -5418,11 +5435,11 @@ fn git_has_unsafe_global_option(global_args: &[String]) -> bool
 fn git_subcommand_args_are_read_only(args: &[String]) -> bool
 ```
 
-**Purpose**: Rejects git subcommand arguments that can write output files or invoke external helpers. It is shared across the allowed read-only git subcommands.
+**Purpose**: Checks Git subcommand arguments for options that can write files or invoke external tools. It is used for read-only-looking subcommands such as `log`, `diff`, and `show`.
 
-**Data flow**: It takes a subcommand-argument slice `&[String]`, maps each to `&str`, checks each against `UNSAFE_GIT_SUBCOMMAND_OPTIONS` via `git_matches_option_pattern`, and returns `true` only if none match.
+**Data flow**: It receives the arguments after the Git subcommand. It searches for unsafe subcommand options like `--output`, `--ext-diff`, `--textconv`, and `--exec`, returning `false` if any are found and `true` otherwise.
 
-**Call relations**: It is used by `is_safe_git_command` for `status`, `log`, `diff`, `show`, and as one half of the `branch` safety decision.
+**Call relations**: `is_safe_git_command` uses this as the common argument filter for approved Git subcommands. For `git branch`, its result is combined with the stricter branch-only check.
 
 *Call graph*: called by 1 (is_safe_git_command).
 
@@ -5433,11 +5450,11 @@ fn git_subcommand_args_are_read_only(args: &[String]) -> bool
 fn is_valid_sed_n_arg(arg: Option<&str>) -> bool
 ```
 
-**Purpose**: Validates the narrow line-address syntax accepted for safe `sed -n` invocations. Only `Np` or `M,Np` forms made of ASCII digits are allowed.
+**Purpose**: Verifies the one narrow `sed` script shape this file considers safe: printing a single line or a line range, such as `10p` or `1,5p`. This allows simple viewing without allowing general `sed` editing scripts.
 
-**Data flow**: It takes `Option<&str>`, returns `false` on `None`, strips a trailing `p`, splits the remaining core on `,`, and returns `true` only for one or two non-empty all-digit parts.
+**Data flow**: It receives an optional string. If the string is missing, does not end in `p`, has too many comma-separated parts, or contains non-digits in the line numbers, it returns `false`; otherwise it returns `true`.
 
-**Call relations**: It is called by `is_safe_to_call_with_exec` to recognize the one special-case `sed` form considered read-only.
+**Call relations**: `is_safe_to_call_with_exec` calls this when checking the special case `sed -n ...`. It keeps the `sed` allow-list intentionally tiny instead of accepting arbitrary `sed` programs.
 
 *Call graph*: called by 1 (is_safe_to_call_with_exec).
 
@@ -5448,11 +5465,11 @@ fn is_valid_sed_n_arg(arg: Option<&str>) -> bool
 fn vec_str(args: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Builds owned argv vectors from string slices for tests. It is a local convenience helper.
+**Purpose**: Creates test command vectors without making each test write repetitive string conversion code. It is only a convenience helper for the tests in this file.
 
-**Data flow**: It takes `&[&str]`, converts each item to `String`, collects into `Vec<String>`, and returns it.
+**Data flow**: It receives a slice of string literals. It converts each one into an owned `String` and returns them as a `Vec<String>`, matching the input type expected by the safety functions.
 
-**Call relations**: Many tests in this module use it to construct command vectors.
+**Call relations**: The test cases use this helper before calling the safety checks. It has no role in production command approval.
 
 
 ##### `tests::known_safe_examples`  (lines 346–377)
@@ -5461,11 +5478,11 @@ fn vec_str(args: &[&str]) -> Vec<String>
 fn known_safe_examples()
 ```
 
-**Purpose**: Exercises a representative set of direct commands that should be classified as safe. It includes plain utilities, git queries, base64, sed, find, and Linux-only cases.
+**Purpose**: Confirms that ordinary read-only commands are accepted. It covers basic Unix-style tools, safe Git examples, safe `find`, safe `sed`, and Linux-only commands.
 
-**Data flow**: The test builds multiple argv vectors and asserts `is_safe_to_call_with_exec` returns the expected boolean, with conditional expectations for Linux-only commands.
+**Data flow**: The test builds many sample commands and sends them into the direct safety checker. It expects `true` for safe examples, with different expectations for `numfmt` and `tac` depending on the operating system.
 
-**Call relations**: It validates the main direct-command safelist across several branches of `is_safe_to_call_with_exec`.
+**Call relations**: The Rust test runner calls this during testing. It protects the intended allow-list from being accidentally narrowed or changed across platforms.
 
 *Call graph*: 2 external calls (assert!, cfg!).
 
@@ -5476,11 +5493,11 @@ fn known_safe_examples()
 fn git_branch_mutating_flags_are_not_safe()
 ```
 
-**Purpose**: Ensures mutating `git branch` forms are not auto-approved. Creating or deleting branches must require approval.
+**Purpose**: Checks that branch deletion and branch creation are not auto-approved. This protects against treating all `git branch` commands as harmless.
 
-**Data flow**: The test passes `git branch -d feature` and `git branch new-branch` into `is_known_safe_command` and asserts both are unsafe.
+**Data flow**: The test sends `git branch -d feature` and `git branch new-branch` into the main safety checker. It expects both to return `false`.
 
-**Call relations**: It specifically covers `git_branch_is_read_only` through the public safe-command entry point.
+**Call relations**: The Rust test runner calls this to exercise the branch-specific rules inside `is_safe_git_command` and `git_branch_is_read_only`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5491,11 +5508,11 @@ fn git_branch_mutating_flags_are_not_safe()
 fn git_branch_global_options_respect_safety_rules()
 ```
 
-**Purpose**: Checks that safe and unsafe `git branch` forms are distinguished correctly, including shell-wrapped variants. It confirms branch safety rules survive wrapper parsing.
+**Purpose**: Verifies that safe branch queries are allowed while mutating branch commands are rejected, both directly and through `bash -lc`. It checks that shell wrapping does not bypass Git branch safety.
 
-**Data flow**: The test asserts `git branch --show-current` is safe, `git branch -d feature` is unsafe, and `bash -lc 'git branch -d feature'` is also unsafe.
+**Data flow**: The test feeds safe and unsafe branch commands to `is_known_safe_command`. It expects `--show-current` to pass, and deletion examples to fail.
 
-**Call relations**: It exercises both direct git classification and shell-wrapper parsing plus inner-command safety checks.
+**Call relations**: The Rust test runner calls this to cover the path where `is_known_safe_command` may either check Git directly or parse a simple shell command first.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5506,11 +5523,11 @@ fn git_branch_global_options_respect_safety_rules()
 fn git_first_positional_is_the_subcommand()
 ```
 
-**Purpose**: Verifies that later positional arguments are not mistaken for git subcommands. This prevents bypasses like `git checkout status`.
+**Purpose**: Ensures the Git parser treats the first non-option word as the subcommand. This prevents a later word like `status` from making `git checkout status` look safe.
 
-**Data flow**: The test passes `git checkout status` to `is_known_safe_command` and asserts it is unsafe.
+**Data flow**: The test passes `git checkout status` to the main safety checker. It expects `false` because `checkout` is the real subcommand and is not in the read-only allow-list.
 
-**Call relations**: It validates the early-stop behavior in the shared `find_git_subcommand` scanner.
+**Call relations**: The Rust test runner calls this to validate the shared Git subcommand-finding behavior used by `is_safe_git_command`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5521,11 +5538,11 @@ fn git_first_positional_is_the_subcommand()
 fn git_output_flags_are_not_safe()
 ```
 
-**Purpose**: Ensures git output-writing flags are rejected for otherwise read-only subcommands. Writing diff/log/show output to files is not auto-approved.
+**Purpose**: Checks that Git commands with output-writing flags are rejected. A command that writes to a file is not treated as read-only.
 
-**Data flow**: The test checks several `git log/diff/show --output...` forms with `is_known_safe_command` and asserts all are unsafe.
+**Data flow**: The test builds `git log`, `git diff`, and `git show` examples using `--output` or `--output=...`. Each is sent to the main safety checker and expected to return `false`.
 
-**Call relations**: It covers `git_subcommand_args_are_read_only` and the unsafe subcommand option pattern list.
+**Call relations**: The Rust test runner calls this to guard the unsafe Git subcommand option list used by `git_subcommand_args_are_read_only`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5536,11 +5553,11 @@ fn git_output_flags_are_not_safe()
 fn git_global_pagination_flags_are_not_safe()
 ```
 
-**Purpose**: Checks that unsafe git global pagination flags are rejected, including inside shell wrappers. Global options are treated separately from subcommand flags.
+**Purpose**: Confirms that Git global pagination options are rejected. Even though paging output sounds harmless, Git pagers can involve external commands and configuration.
 
-**Data flow**: The test passes direct and `bash -lc` forms using `--paginate` and `-p` before the subcommand and asserts all are unsafe.
+**Data flow**: The test checks direct and `bash -lc` forms of `git --paginate log -1` and `git -p log -1`. It expects all of them to be unsafe.
 
-**Call relations**: It validates `git_has_unsafe_global_option` and shell-wrapper propagation of git safety rules.
+**Call relations**: The Rust test runner calls this to make sure `git_has_unsafe_global_option` applies before subcommand approval, including when the command is inside a simple shell script.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5551,11 +5568,11 @@ fn git_global_pagination_flags_are_not_safe()
 fn git_subcommand_patch_flags_remain_safe()
 ```
 
-**Purpose**: Confirms that `-p` remains safe when used as a subcommand argument to `git log`, `git diff`, or `git show`. The same token is unsafe only as a global option.
+**Purpose**: Makes sure `-p` is still allowed when it is a subcommand option meaning “show patch,” not a global pagination flag. This keeps the Git rules precise instead of over-blocking useful read-only commands.
 
-**Data flow**: The test checks direct and shell-wrapped patch-display forms and asserts they are safe.
+**Data flow**: The test sends `git log -p`, `git diff -p`, `git show -p`, and a shell-wrapped version into the main safety checker. It expects all to return `true`.
 
-**Call relations**: It documents the distinction between global and subcommand argument slices inside `is_safe_git_command`.
+**Call relations**: The Rust test runner calls this to protect the distinction between unsafe global Git options and safe subcommand-level patch flags.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5566,11 +5583,11 @@ fn git_subcommand_patch_flags_remain_safe()
 fn git_global_override_flags_are_not_safe()
 ```
 
-**Purpose**: Exercises a broad set of git global override options that must force approval. These options can redirect repository context, helper binaries, namespaces, or config.
+**Purpose**: Checks that Git global options which alter configuration, paths, namespaces, work trees, or helper locations are rejected. These options can make a read-only-looking command behave in surprising ways.
 
-**Data flow**: The test builds many direct and shell-wrapped git commands using `-C`, `-c`, `--config-env`, `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`, and `--super-prefix`, then asserts each is unsafe.
+**Data flow**: The test feeds many Git commands with global override options into the main safety checker. It expects each one to return `false`, including direct commands and simple `bash -lc` commands.
 
-**Call relations**: It thoroughly covers the `UNSAFE_GIT_GLOBAL_OPTIONS` pattern list and the shared subcommand scanner.
+**Call relations**: The Rust test runner calls this to thoroughly exercise the unsafe global Git option patterns and the shell-command path that eventually reaches the same Git checks.
 
 *Call graph*: 2 external calls (assert!, vec_str).
 
@@ -5581,11 +5598,11 @@ fn git_global_override_flags_are_not_safe()
 fn cargo_check_is_not_safe()
 ```
 
-**Purpose**: Verifies that commands outside the explicit safelist are not auto-approved even if they are often benign. `cargo check` remains unsafe by default.
+**Purpose**: Confirms that `cargo check` is not auto-approved by this allow-list. Even common developer commands can run build scripts or otherwise do more than read files.
 
-**Data flow**: The test passes `cargo check` to `is_known_safe_command` and asserts `false`.
+**Data flow**: The test sends `cargo check` to the main safety checker and expects `false`.
 
-**Call relations**: It confirms the classifier is allow-list based rather than trying to infer safety broadly.
+**Call relations**: The Rust test runner calls this to document and preserve the conservative boundary of the safe-command list.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5596,11 +5613,11 @@ fn cargo_check_is_not_safe()
 fn zsh_lc_safe_command_sequence()
 ```
 
-**Purpose**: Checks that `zsh -lc` wrappers are normalized and classified like Bash wrappers. A simple `ls` script should be safe.
+**Purpose**: Checks that a simple `zsh -lc` command is treated like the equivalent `bash -lc` command. This supports users whose shell is zsh while still using the same cautious parser.
 
-**Data flow**: The test passes `['zsh', '-lc', 'ls']` to `is_known_safe_command` and asserts `true`.
+**Data flow**: The test passes `zsh -lc ls` to the main safety checker. It expects `true` because the function normalizes `zsh` to `bash` before checking.
 
-**Call relations**: It covers the `zsh`→`bash` normalization in `is_known_safe_command` plus shell-wrapper parsing.
+**Call relations**: The Rust test runner calls this to cover the normalization step at the start of `is_known_safe_command`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5611,11 +5628,11 @@ fn zsh_lc_safe_command_sequence()
 fn unknown_or_partial()
 ```
 
-**Purpose**: Verifies that unknown commands, unsupported git subcommands, invalid sed forms, and unsafe `find` options are all rejected. It exercises several negative branches of the direct safelist.
+**Purpose**: Verifies that unknown commands, unsupported Git commands, invalid `sed`, and dangerous `find` options are rejected. It proves the allow-list is not permissive by default.
 
-**Data flow**: The test checks `foo`, `git fetch`, invalid `sed -n xp`, and a list of `find` invocations containing `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, and file-writing options, asserting each is unsafe.
+**Data flow**: The test builds several unsafe or unrecognized commands and sends them to the direct safety checker. It expects `false` for each case, especially `find` options that can delete files, write file lists, or execute other commands.
 
-**Call relations**: It covers the default-false behavior of `is_safe_to_call_with_exec` and the option filters for `find` and `sed`.
+**Call relations**: The Rust test runner calls this to exercise the default rejection path and the special filters for Git, `sed`, and `find`.
 
 *Call graph*: 2 external calls (assert!, vec_str).
 
@@ -5626,11 +5643,11 @@ fn unknown_or_partial()
 fn base64_output_options_are_unsafe()
 ```
 
-**Purpose**: Ensures `base64` is rejected when used with output-writing options. The command is only safe when it does not write to arbitrary files.
+**Purpose**: Checks that `base64` is rejected when it is asked to write output to a file. Reading or printing encoded data can be safe, but writing files is outside this allow-list.
 
-**Data flow**: The test iterates over `base64` argv vectors using `-o`, `--output`, `--output=...`, and compact `-o...` forms, asserting `is_safe_to_call_with_exec` returns `false`.
+**Data flow**: The test sends `base64` commands using `-o`, `--output`, `--output=...`, and attached short-option forms. It expects all of them to return `false`.
 
-**Call relations**: It validates the `UNSAFE_BASE64_OPTIONS` checks in the direct safelist.
+**Call relations**: The Rust test runner calls this to protect the `base64` option filter inside `is_safe_to_call_with_exec`.
 
 *Call graph*: 2 external calls (assert!, vec_str).
 
@@ -5641,11 +5658,11 @@ fn base64_output_options_are_unsafe()
 fn ripgrep_rules()
 ```
 
-**Purpose**: Checks both safe and unsafe ripgrep invocations. It specifically guards against options that execute helper commands or external decompression tools.
+**Purpose**: Tests the special safety rules for `rg`, also known as ripgrep, a fast text search tool. Normal searching is allowed, but options that invoke outside commands or decompression tools are not.
 
-**Data flow**: The test asserts a normal `rg Cargo.toml -n` is safe, then iterates over `--search-zip`, `-z`, `--pre`, `--pre=...`, `--hostname-bin`, and `--hostname-bin=...` forms and asserts each is unsafe.
+**Data flow**: The test sends a normal `rg` search and expects `true`. It then sends commands with `--search-zip`, `-z`, `--pre`, and `--hostname-bin`, including `--option=value` forms, and expects `false`.
 
-**Call relations**: It covers the ripgrep-specific branch in `is_safe_to_call_with_exec`.
+**Call relations**: The Rust test runner calls this to verify the ripgrep branch of `is_safe_to_call_with_exec`.
 
 *Call graph*: 2 external calls (assert!, vec_str).
 
@@ -5656,11 +5673,11 @@ fn ripgrep_rules()
 fn windows_powershell_full_path_is_safe()
 ```
 
-**Purpose**: On Windows, verifies that a discovered full-path PowerShell executable is still recognized as safe for a read-only command. This checks executable basename normalization across paths.
+**Purpose**: On Windows, checks that a full path to PowerShell can still be recognized as safe when running a known read-only command. This matters because executables are often invoked by full path rather than plain name.
 
-**Data flow**: The test returns early off Windows or if no PowerShell executable is found, otherwise converts the discovered path to string and asserts `is_known_safe_command([powershell, '-Command', 'Get-Location'])` is true.
+**Data flow**: The test skips itself on non-Windows systems. On Windows, it tries to find PowerShell, builds a `Get-Location` command, and expects the main safety checker to approve it.
 
-**Call relations**: It exercises Windows-specific safe-command handling together with path-based executable normalization.
+**Call relations**: The Rust test runner calls this only as a platform-sensitive test. It exercises the Windows-specific safety checker reached from `is_known_safe_command`.
 
 *Call graph*: calls 1 internal fn (try_find_pwsh_executable_blocking); 2 external calls (assert!, cfg!).
 
@@ -5671,11 +5688,11 @@ fn windows_powershell_full_path_is_safe()
 fn windows_git_full_path_is_safe()
 ```
 
-**Purpose**: On Windows, verifies that a full path to `git.exe` is recognized as git and classified safely for `status`. This guards the basename extraction logic.
+**Purpose**: On Windows, confirms that Git can be recognized as safe even when invoked by its full installation path. This keeps safe-command detection from depending only on short executable names.
 
-**Data flow**: The test returns early off Windows, otherwise passes a full Git path plus `status` into `is_known_safe_command` and asserts `true`.
+**Data flow**: The test skips itself on non-Windows systems. On Windows, it passes a full `git.exe` path with `status` and expects approval.
 
-**Call relations**: It covers `executable_name_lookup_key` and git safety classification on Windows paths.
+**Call relations**: The Rust test runner calls this to cover executable-name normalization and Windows path handling in the main safety flow.
 
 *Call graph*: 2 external calls (assert!, cfg!).
 
@@ -5686,11 +5703,11 @@ fn windows_git_full_path_is_safe()
 fn bash_lc_safe_examples()
 ```
 
-**Purpose**: Checks representative shell-wrapped scripts that should be accepted as safe. These include simple commands, git status, grep, sed, and find.
+**Purpose**: Checks that simple `bash -lc` scripts made of plain safe commands are approved. This lets common shell-wrapped read-only commands run without unnecessary prompts.
 
-**Data flow**: The test passes several `bash -lc <script>` vectors into `is_known_safe_command` and asserts each is safe.
+**Data flow**: The test sends shell-wrapped examples such as `ls`, `git status`, `grep`, `sed -n`, and safe `find` to the main safety checker. It expects each to return `true`.
 
-**Call relations**: It validates the integration of shell parsing with direct-command safety checks.
+**Call relations**: The Rust test runner calls this to exercise the path where `is_known_safe_command` uses the shell parser and then checks each parsed command with the direct safety checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5701,11 +5718,11 @@ fn bash_lc_safe_examples()
 fn bash_lc_safe_examples_with_operators()
 ```
 
-**Purpose**: Verifies that shell scripts using allowed operators remain safe when every inner command is safe. This includes `||`, `&&`, `;`, and pipelines.
+**Purpose**: Verifies that simple safe commands joined by conservative shell operators are approved. Operators like `&&`, `||`, `;`, and `|` are allowed only when every command around them is safe.
 
-**Data flow**: The test checks shell-wrapped scripts like `grep ... || true`, `ls && pwd`, `echo 'hi' ; ls`, and `ls | wc -l`, asserting each is safe.
+**Data flow**: The test passes shell scripts such as `ls && pwd`, `echo 'hi' ; ls`, and `ls | wc -l`. It expects the main safety checker to accept them.
 
-**Call relations**: It exercises `parse_shell_lc_plain_commands` plus the all-inner-commands-safe requirement in `is_known_safe_command`.
+**Call relations**: The Rust test runner calls this to validate the cooperation between the shell parser and repeated calls to the direct command safety checker.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5716,11 +5733,11 @@ fn bash_lc_safe_examples_with_operators()
 fn bash_lc_unsafe_examples()
 ```
 
-**Purpose**: Covers shell-wrapped forms that must remain unsafe, including malformed wrappers, unsafe `find`, dangerous command sequences, subshells, and redirections. It documents several important rejection boundaries.
+**Purpose**: Checks that unsafe or too-complicated shell forms are rejected. This includes malformed shell invocation, unsafe commands in a sequence, subshell parentheses, and output redirection.
 
-**Data flow**: The test passes multiple `bash -lc` vectors into `is_known_safe_command` and asserts `false`, with explanatory messages for four-arg wrappers, extra quoting, unsafe `find -delete`, `ls && rm -rf /`, subshells, and `> out.txt` redirection.
+**Data flow**: The test sends several `bash -lc` examples to the main safety checker. It expects `false` when the command cannot be confidently parsed as plain safe commands or when any part can change files or run unsafe behavior.
 
-**Call relations**: It validates both shell-parser rejection and inner-command safety rejection paths.
+**Call relations**: The Rust test runner calls this to protect the conservative boundary of `parse_shell_lc_plain_commands` as used by `is_known_safe_command`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5731,11 +5748,11 @@ fn bash_lc_unsafe_examples()
 fn direct_powershell_words_use_windows_safelist()
 ```
 
-**Purpose**: Checks that tokenized PowerShell-word safety delegates to the Windows safelist only on Windows. Non-Windows builds must not classify such words as safe.
+**Purpose**: Checks that direct PowerShell word safety uses the Windows allow-list only on Windows. On other systems, the same words should not be considered safe.
 
-**Data flow**: The test builds `['Get-Content', 'Cargo.toml']`, then conditionally asserts `is_safe_powershell_words` is `true` on Windows and `false` elsewhere.
+**Data flow**: The test builds a `Get-Content Cargo.toml` PowerShell command and passes it to `is_safe_powershell_words`. It expects `true` on Windows and `false` elsewhere.
 
-**Call relations**: It covers the platform-gated public helper for already tokenized PowerShell commands.
+**Call relations**: The Rust test runner calls this to verify the platform split inside `is_safe_powershell_words`.
 
 *Call graph*: 3 external calls (assert!, cfg!, vec_str).
 
@@ -5746,10 +5763,10 @@ fn direct_powershell_words_use_windows_safelist()
 fn non_windows_safe_classification_does_not_spawn_repo_powershell_path()
 ```
 
-**Purpose**: Regression test ensuring non-Windows safety classification never executes a repository-local fake `pwsh` binary while trying to classify a command. Classification must be purely lexical on non-Windows platforms.
+**Purpose**: On Unix-like systems, proves that checking whether a PowerShell-looking path is safe does not execute that path. This prevents safety classification itself from becoming a way to run code.
 
-**Data flow**: The test creates a temporary executable shell script named `pwsh` that would write a marker file if spawned, marks it executable, calls `is_known_safe_command` with that path and a PowerShell-looking command, asserts the result is unsafe and the marker file does not exist, then removes the temp directory.
+**Data flow**: The test creates a temporary fake `pwsh` executable that would write a marker file if run. It asks the main safety checker about that fake PowerShell command, expects `false`, verifies the marker file was not created, and then removes the temporary directory.
 
-**Call relations**: It protects against accidental process spawning during classification, especially around PowerShell detection paths.
+**Call relations**: The Rust test runner calls this Unix-only test to guard against accidental process spawning during non-Windows safety checks, especially around PowerShell detection.
 
 *Call graph*: 10 external calls (now, assert!, format!, create, create_dir, metadata, remove_dir_all, set_permissions, temp_dir, writeln!).

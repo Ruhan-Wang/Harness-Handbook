@@ -1,10 +1,10 @@
 # Generic HTTP client, TLS, cookies, and streaming transport foundations  `stage-19.1`
 
-This stage is the outbound networking foundation that sits beneath higher-level backend, auth, and API clients. It standardizes how the system builds requests, opens TLS connections, retries failures, streams responses, and exposes those capabilities as reusable client surfaces.
+This stage is shared behind-the-scenes networking support. It is the set of pipes, valves, and adapters that lets Codex safely talk to web services. The core client files define a common request and response shape, turn JSON or compressed bodies into bytes, send them with reqwest, retry temporary failures with backoff, and decode long-lived Server-Sent Events streams. The library front doors re-export these pieces so other crates use the same tools.
 
-At its core, codex-client defines the transport-neutral Request/Response model, one-shot body preparation and compression, retry/backoff policy, the reqwest-based transport, SSE decoding, custom CA loading, a restricted Cloudflare-only cookie jar, and a public facade tying those pieces together. Its default client wrappers add trace propagation and structured request logging. Login code reuses that infrastructure to construct the shared authenticated HTTP client configuration.
+Several files add safety and environment support: custom certificate authorities for company proxies, a narrow Cloudflare cookie jar that avoids sharing private session cookies, and default clients that add tracing, user-agent, proxy, residency, and authentication headers. Backend, ChatGPT, cloud task, remote config, LM Studio, and file-upload clients build on these foundations to call their specific services and translate replies into project types.
 
-Built on top of those primitives, backend-client, chatgpt, cloud-tasks-client, thread-config remote loading, LM Studio integration, and file upload support each implement concrete protocol clients for specific services. The codex-api crate then organizes provider configuration, authenticated endpoint sessions, request builders, SSE exports, and shared realtime parsing helpers into the main backend-facing API layer. Together, these parts ensure all outbound HTTP traffic follows consistent security, observability, retry, and streaming behavior.
+The API provider and session code centralize endpoint URLs, headers, retries, telemetry, normal requests, and streaming requests. Endpoint, request, and SSE modules act as organized entry points, while realtime WebSocket helpers translate raw live messages into internal events.
 
 ## Files in this stage
 
@@ -13,11 +13,15 @@ These files define the shared request model, retry behavior, concrete reqwest tr
 
 ### `codex-client/src/request.rs`
 
-`data_model` · `request assembly, auth signing, retry preparation, and transport handoff`
+`io_transport` · `request preparation before network send`
 
-This file is the core request representation used before handing work to a concrete HTTP transport. `Request` stores the HTTP `Method`, URL string, mutable `HeaderMap`, optional `RequestBody`, requested `RequestCompression`, and optional timeout. `RequestBody` distinguishes three cases: structured `Json(Value)`, already serialized `EncodedJson(EncodedJsonBody)`, and arbitrary `Raw(Bytes)`. `EncodedJsonBody` is optimized for retries and tracing: it keeps reference-counted `Bytes`, optionally preserves pre-compression bytes for trace logging, and marks whether the stored bytes are already in final wire form.
+This file is the staging area for outgoing HTTP calls. Before a request can be sent, the client must know its method, URL, headers, body bytes, timeout, and whether the body should be compressed. That sounds simple, but it matters because some authentication systems sign the exact bytes that will be sent. If JSON is serialized twice, or compression happens after signing, the signature could be wrong.
 
-The central logic is `prepare_body_for_send`, which clones headers and converts the body into exact outbound bytes without mutating the request. Raw bodies are passed through unchanged but explicitly reject compression. JSON bodies are serialized once via `EncodedJsonBody::encode`, then delegated to `prepare_encoded_json`, which optionally compresses with zstd level 3, inserts `Content-Encoding: zstd`, logs compression statistics, and ensures `Content-Type: application/json` is present unless already set. `into_prepared` is the mutating counterpart: it computes optional trace bytes when trace logging is enabled, calls `prepare_body_for_send`, writes the prepared headers back into the request, replaces the body with reusable final bytes, and resets `compression` to `None` so later sends do not recompress. The tests focus on preserving immutability in `prepare_body_for_send`, rejecting conflicting `Content-Encoding`, and caching compressed bytes for reuse.
+The main type is Request. It starts as a convenient builder: create it with a method and URL, then add JSON, raw bytes, compression, or a timeout. JSON can be kept as a serde_json::Value, which is a general JSON value, or as EncodedJsonBody, meaning it has already been turned into bytes. Bytes are reference-counted, so clones can share the same memory instead of copying the whole body.
+
+The important step is preparation. prepare_body_for_send looks at the body and returns a PreparedRequestBody: final headers plus final bytes. JSON gets a Content-Type header if one is missing. If zstd compression is requested, the JSON bytes are compressed and Content-Encoding is set. Raw bodies are not allowed to use this compression path, because the file cannot safely assume what raw bytes mean.
+
+into_prepared goes one step further. It rewrites the request so it stores the already-prepared bytes. This is useful for retries: like sealing a package once, then sending the same sealed package again if needed.
 
 #### Function details
 
@@ -27,11 +31,11 @@ The central logic is `prepare_body_for_send`, which clones headers and converts 
 fn encode(value: &T) -> Result<Self, serde_json::Error>
 ```
 
-**Purpose**: Serializes a Rust value into shared JSON bytes that can be reused across clones and retries.
+**Purpose**: Turns any serializable value into JSON bytes once, then stores those bytes in a shareable form. This avoids doing the same JSON conversion again for retries or cloned requests.
 
-**Data flow**: Accepts `&T` where `T: Serialize`, runs `serde_json::to_vec`, wraps the resulting `Vec<u8>` in `Bytes`, sets `trace_bytes` to `None` and `prepared` to `false`, and returns `Result<EncodedJsonBody, serde_json::Error>`.
+**Data flow**: It receives a value that can be written as JSON. It asks serde_json to convert that value into a byte vector, wraps those bytes in Bytes so they can be cheaply shared, marks the body as not yet prepared for sending, and returns either the new EncodedJsonBody or a JSON conversion error.
 
-**Call relations**: This is the canonical JSON encoding path used by request preparation and some streaming/request-building code. Callers use it when they want a body that can later be compressed or reused without reserializing.
+**Call relations**: Higher-level request flows call this when they need JSON in byte form. prepare_body_for_send uses it for ordinary JSON bodies, stream and stream_request use it before sending streamed requests, and the compression reuse test uses it to build a pre-encoded body.
 
 *Call graph*: called by 4 (stream, stream_request, prepare_body_for_send, into_prepared_stores_compressed_body_for_reuse); 1 external calls (to_vec).
 
@@ -42,11 +46,11 @@ fn encode(value: &T) -> Result<Self, serde_json::Error>
 fn as_bytes(&self) -> &[u8]
 ```
 
-**Purpose**: Exposes the currently stored body bytes, whether they are original JSON or already prepared wire bytes.
+**Purpose**: Gives read-only access to the JSON bytes currently stored in an EncodedJsonBody. Code uses this when it needs the body contents without taking ownership of them.
 
-**Data flow**: Reads `self.bytes` and returns it as `&[u8]` without allocation or mutation.
+**Data flow**: It receives an EncodedJsonBody by reference. It returns a borrowed byte slice pointing at the stored bytes, without copying or changing anything.
 
-**Call relations**: Used by `Request::prepare_encoded_json` when feeding bytes into zstd compression.
+**Call relations**: prepare_encoded_json calls this when it needs to feed the body into the zstd compressor. It is the small doorway from the stored body object to the raw bytes used for the final network body.
 
 *Call graph*: called by 1 (prepare_encoded_json).
 
@@ -57,11 +61,11 @@ fn as_bytes(&self) -> &[u8]
 fn trace_bytes(&self) -> &[u8]
 ```
 
-**Purpose**: Returns the bytes that should be shown in trace logs, preferring preserved pre-compression JSON when available.
+**Purpose**: Returns the bytes that should be shown in detailed request-body tracing. When compression is used, this can preserve the original readable JSON for logs instead of showing compressed data.
 
-**Data flow**: Reads `self.trace_bytes`; if present returns that slice, otherwise falls back to `self.bytes`. It does not mutate state.
+**Data flow**: It reads the optional trace copy stored in the body. If trace bytes exist, it returns them; otherwise it returns the main stored bytes. It does not change the body.
 
-**Call relations**: This supports transport-layer trace logging for prepared compressed requests so logs can still show readable JSON rather than compressed wire bytes.
+**Call relations**: This is a support hook for tracing code elsewhere in the client. It pairs with into_prepared, which may save original JSON bytes when trace-level logging is enabled.
 
 
 ##### `RequestBody::json`  (lines 56–61)
@@ -70,11 +74,11 @@ fn trace_bytes(&self) -> &[u8]
 fn json(&self) -> Option<&Value>
 ```
 
-**Purpose**: Provides access to the structured JSON value only when the body is still stored as `RequestBody::Json`.
+**Purpose**: Checks whether a request body is still stored as a plain JSON value and, if so, returns it. This is useful for code that needs to inspect structured JSON rather than already-encoded or raw bytes.
 
-**Data flow**: Matches on `self`; returns `Some(&Value)` for `Json`, and `None` for `EncodedJson` or `Raw`.
+**Data flow**: It receives a RequestBody by reference. If the body is the Json variant, it returns a reference to the JSON value; if it is encoded JSON or raw bytes, it returns nothing.
 
-**Call relations**: This is a small inspection helper for code that wants to look at unencoded JSON bodies without decoding bytes.
+**Call relations**: This is an access helper for callers that care about the high-level JSON form. It does not participate in the send-preparation path, which works with bytes.
 
 
 ##### `PreparedRequestBody::body_bytes`  (lines 71–73)
@@ -83,11 +87,11 @@ fn json(&self) -> Option<&Value>
 fn body_bytes(&self) -> Bytes
 ```
 
-**Purpose**: Returns the prepared body bytes, defaulting to empty bytes when the request has no body.
+**Purpose**: Returns the prepared body bytes, using an empty byte buffer when the request has no body. This gives callers a simple always-bytes answer.
 
-**Data flow**: Clones `self.body` if present; otherwise returns `Bytes::default()`. No mutation occurs.
+**Data flow**: It reads the optional body field. If bytes are present, it clones the cheap Bytes handle; if no body exists, it returns an empty Bytes value. The PreparedRequestBody itself is unchanged.
 
-**Call relations**: Useful to downstream code that wants a concrete byte buffer regardless of whether the request body was optional.
+**Call relations**: This helper is meant for code that needs bytes regardless of whether the original request had a body, such as signing or transport code. It sits after prepare_body_for_send in the request flow.
 
 
 ##### `Request::new`  (lines 87–96)
@@ -96,11 +100,11 @@ fn body_bytes(&self) -> Bytes
 fn new(method: Method, url: String) -> Self
 ```
 
-**Purpose**: Creates a new request with empty headers, no body, no compression, and no timeout.
+**Purpose**: Creates a basic request with a method and URL, but no headers, body, compression, or timeout. It is the starting point for building an outgoing client request.
 
-**Data flow**: Takes an HTTP `Method` and URL `String`, initializes `headers` with `HeaderMap::new()`, sets `body` to `None`, `compression` to `RequestCompression::None`, and `timeout` to `None`, then returns the `Request`.
+**Data flow**: It receives an HTTP method and a URL string. It creates an empty header map, sets the body to none, sets compression to none, leaves the timeout unset, and returns the new Request.
 
-**Call relations**: This is the standard constructor used by production code and tests before chaining body/compression setters.
+**Call relations**: Tests and other modules start with this function before adding details. The thread configuration request path and direct connector tests also call it when they need a simple request object to build on.
 
 *Call graph*: called by 6 (into_prepared_stores_compressed_body_for_reuse, prepare_body_for_send_rejects_existing_content_encoding_when_compressing, prepare_body_for_send_serializes_json_and_sets_content_type, load_thread_config_request, direct_connector_allows_non_public_target_when_local_binding_enabled, direct_connector_rejects_non_public_target_when_local_binding_disabled); 1 external calls (new).
 
@@ -111,11 +115,11 @@ fn new(method: Method, url: String) -> Self
 fn with_json(mut self, body: &T) -> Self
 ```
 
-**Purpose**: Stores a serializable value as a structured JSON `Value` inside the request.
+**Purpose**: Adds a JSON body to a request using a convenient builder style. It lets callers pass normal serializable data instead of manually creating a JSON value.
 
-**Data flow**: Consumes `self` mutably, converts `&T` with `serde_json::to_value`, maps successful conversion to `RequestBody::Json`, assigns it to `self.body`, and returns the updated request. Serialization failure is silently converted to `None` body via `.ok()`.
+**Data flow**: It takes ownership of a Request and receives a serializable body by reference. It tries to convert that body into a serde_json::Value; if conversion succeeds, it stores it as RequestBody::Json. It returns the updated Request.
 
-**Call relations**: This is a convenience builder for callers constructing JSON requests. Actual byte encoding is deferred until preparation.
+**Call relations**: This is usually called after Request::new while constructing a request. Later, prepare_body_for_send will turn this stored JSON value into final bytes and add the JSON content type header.
 
 *Call graph*: 1 external calls (to_value).
 
@@ -126,11 +130,11 @@ fn with_json(mut self, body: &T) -> Self
 fn with_raw_body(mut self, body: impl Into<Bytes>) -> Self
 ```
 
-**Purpose**: Stores arbitrary bytes as an opaque raw request body.
+**Purpose**: Adds an already-made byte body to a request. This is for cases where the caller knows exactly what bytes should be sent and does not want JSON serialization.
 
-**Data flow**: Consumes `self` mutably, converts the input into `Bytes`, wraps it in `RequestBody::Raw`, assigns it to `self.body`, and returns the updated request.
+**Data flow**: It takes ownership of a Request and receives something that can become Bytes. It converts the input into Bytes, stores it as a raw request body, and returns the updated Request.
 
-**Call relations**: Used when the caller already has exact bytes and does not want JSON serialization. Later preparation enforces that such bodies cannot also request compression.
+**Call relations**: This is another builder step after Request::new. When prepare_body_for_send later sees a raw body, it passes those bytes through unchanged and rejects request compression for them.
 
 *Call graph*: 2 external calls (into, Raw).
 
@@ -141,11 +145,11 @@ fn with_raw_body(mut self, body: impl Into<Bytes>) -> Self
 fn with_compression(mut self, compression: RequestCompression) -> Self
 ```
 
-**Purpose**: Marks the request to apply a specific compression scheme during body preparation.
+**Purpose**: Marks the request so its JSON body should be compressed before sending. Currently this supports choosing no compression or zstd compression.
 
-**Data flow**: Consumes `self` mutably, writes the provided `RequestCompression` into `self.compression`, and returns the updated request.
+**Data flow**: It takes ownership of a Request and a compression setting. It stores that setting on the request and returns the updated Request.
 
-**Call relations**: This only records intent; the actual compression work happens later in `prepare_body_for_send` / `prepare_encoded_json`.
+**Call relations**: Callers use this during request construction. prepare_encoded_json later reads the setting to decide whether to compress the JSON bytes and add a Content-Encoding header.
 
 
 ##### `Request::into_prepared`  (lines 118–149)
@@ -154,11 +158,11 @@ fn with_compression(mut self, compression: RequestCompression) -> Self
 fn into_prepared(mut self) -> Result<Self, String>
 ```
 
-**Purpose**: Mutates the request into a reusable, fully prepared form whose body bytes and headers exactly match what the transport will send.
+**Purpose**: Converts a request into a sealed, ready-to-send form where the body bytes and headers are already finalized. This is important for retries and request signing, because every attempt uses the exact same bytes.
 
-**Data flow**: Consumes `self` mutably, first determines whether the body is JSON-like, then conditionally captures pre-compression `trace_bytes` when compression is requested and trace logging for `codex_client::transport` is enabled. It calls `prepare_body_for_send`, replaces `self.headers` with the prepared headers, rewrites `self.body` to either `RequestBody::EncodedJson` with `prepared: true`, `RequestBody::Raw`, or `None`, resets `self.compression` to `None`, and returns `Result<Self, String>`.
+**Data flow**: It takes ownership of a Request. It checks whether the body is JSON-like, optionally keeps original JSON bytes for detailed tracing when compression is enabled, calls prepare_body_for_send to create final headers and body bytes, replaces the request headers and body with those prepared values, clears the compression flag, and returns the updated request or an error string.
 
-**Call relations**: This is the caching path for retries and signing-sensitive flows that need stable final bytes. It delegates the actual preparation rules to `prepare_body_for_send` and then stores the result back into the request.
+**Call relations**: This function sits above prepare_body_for_send. It delegates the actual byte preparation there, then stores the result back into the Request so later transport or retry code can clone and reuse it without re-serializing or re-compressing.
 
 *Call graph*: calls 1 internal fn (prepare_body_for_send); 6 external calls (from, EncodedJson, Raw, matches!, to_vec, enabled!).
 
@@ -169,11 +173,11 @@ fn into_prepared(mut self) -> Result<Self, String>
 fn prepare_body_for_send(&self) -> Result<PreparedRequestBody, String>
 ```
 
-**Purpose**: Computes the exact outbound headers and body bytes for the current request without mutating it.
+**Purpose**: Builds the final headers and body bytes that should be sent, without changing the request. Authentication code can use this to sign exactly what the transport will send.
 
-**Data flow**: Clones `self.headers`, inspects `self.body`, and returns a `PreparedRequestBody`. Raw bodies are cloned directly unless compression was requested, in which case it returns an error string. JSON values are encoded with `EncodedJsonBody::encode` and then passed to `prepare_encoded_json`; already encoded JSON bodies are passed straight through; absent bodies yield `body: None` with cloned headers.
+**Data flow**: It reads the request headers, body, and compression setting. Raw bodies are cloned as-is unless compression was requested, which is rejected. JSON values are encoded into bytes. Already encoded JSON is reused. Missing bodies stay missing. The result is a PreparedRequestBody containing cloned headers plus optional final bytes, or an error string.
 
-**Call relations**: This is the main non-mutating preparation API used by transport building and auth/signing code. It funnels all JSON-specific work into `prepare_encoded_json`.
+**Call relations**: into_prepared calls this when it wants to store final bytes back into the request. Other request-building and authentication paths, including build and apply_auth, call it when they need the final sendable form without mutating the original request.
 
 *Call graph*: calls 2 internal fn (encode, prepare_encoded_json); called by 3 (into_prepared, build, apply_auth); 1 external calls (clone).
 
@@ -188,11 +192,11 @@ fn prepare_encoded_json(
     ) -> Result<PreparedRequestBody, String>
 ```
 
-**Purpose**: Finalizes an encoded JSON body by optionally compressing it, setting content headers, and returning the exact bytes to send.
+**Purpose**: Takes JSON that is already in byte form and makes it ready for the wire: optionally compressing it and ensuring the right HTTP headers are present. It is the shared helper for both freshly encoded and previously encoded JSON.
 
-**Data flow**: Takes cloned/mutable headers and an `EncodedJsonBody`. If `body.prepared` is already true, it returns the stored bytes unchanged. Otherwise, when compression is requested it first rejects any preexisting `Content-Encoding`, measures compression time, compresses `body.as_bytes()` with zstd level 3, inserts `Content-Encoding: zstd`, and logs pre/post sizes and duration. Whether compressed or not, it ensures `Content-Type: application/json` exists, then returns `PreparedRequestBody { headers, body: Some(bytes) }`.
+**Data flow**: It receives a copy of the request headers and an EncodedJsonBody. If the body is already marked prepared, it returns those bytes immediately. Otherwise, if compression is requested, it checks that Content-Encoding is not already set, compresses the JSON bytes with zstd, records Content-Encoding: zstd, and logs compression size and timing. Whether compressed or not, it adds Content-Type: application/json if missing, then returns the final headers and bytes.
 
-**Call relations**: Only `prepare_body_for_send` calls this helper. It encapsulates the invariants around JSON compression, header insertion, and reuse of already prepared bodies.
+**Call relations**: prepare_body_for_send calls this whenever it is dealing with JSON bytes. It uses EncodedJsonBody::as_bytes to read bytes for compression and hands the final PreparedRequestBody back up to preparation, signing, or retry flows.
 
 *Call graph*: calls 2 internal fn (as_bytes, new); called by 1 (prepare_body_for_send); 8 external calls (from, contains_key, insert, from_static, now, debug!, unreachable!, encode_all).
 
@@ -203,11 +207,11 @@ fn prepare_encoded_json(
 fn prepare_body_for_send_serializes_json_and_sets_content_type()
 ```
 
-**Purpose**: Checks that preparing a JSON request serializes the body, adds `application/json`, and leaves the original request unchanged.
+**Purpose**: Verifies that a JSON request is turned into compact JSON bytes and gets an application/json content type. It also checks that the non-mutating preparation step leaves the original request unchanged.
 
-**Data flow**: Builds a POST `Request` with JSON, calls `prepare_body_for_send`, and asserts the prepared bytes, prepared `Content-Type`, original `request.body`, and original `request.compression` all match expected values.
+**Data flow**: The test builds a POST request with a small JSON body, calls prepare_body_for_send, then compares the prepared body and headers with expected values. It also inspects the original request afterward to confirm its body and compression setting are still the same.
 
-**Call relations**: This test guards the non-mutating contract of `prepare_body_for_send` and the default content-type behavior for JSON.
+**Call relations**: This test exercises the normal Request::new plus JSON preparation path. It protects the behavior that callers rely on when they need final send bytes without altering the original request.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, json!).
 
@@ -218,11 +222,11 @@ fn prepare_body_for_send_serializes_json_and_sets_content_type()
 fn prepare_body_for_send_rejects_existing_content_encoding_when_compressing()
 ```
 
-**Purpose**: Verifies that compression fails if the caller already set a `Content-Encoding` header.
+**Purpose**: Verifies that the code refuses to compress a JSON body when the request already has a Content-Encoding header. This prevents the client from sending confusing or dishonest headers about how the body is encoded.
 
-**Data flow**: Builds a JSON POST request, enables zstd compression, manually inserts `Content-Encoding: gzip`, calls `prepare_body_for_send`, captures the error string, and asserts it matches the expected conflict message.
+**Data flow**: The test creates a JSON POST request, asks for zstd compression, manually inserts Content-Encoding: gzip, then calls prepare_body_for_send. It expects an error and checks that the message matches the conflict.
 
-**Call relations**: This test exercises the explicit header-conflict guard inside `prepare_encoded_json`.
+**Call relations**: This test covers the safety check inside prepare_encoded_json through the public prepare_body_for_send path. It confirms that compression does not silently overwrite a caller-supplied encoding header.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (from_static, assert_eq!, json!).
 
@@ -233,22 +237,26 @@ fn prepare_body_for_send_rejects_existing_content_encoding_when_compressing()
 fn into_prepared_stores_compressed_body_for_reuse()
 ```
 
-**Purpose**: Confirms that `into_prepared` stores compressed bytes in the request body and clears the compression flag so later sends reuse the prepared payload.
+**Purpose**: Verifies that into_prepared stores compressed JSON bytes directly on the request and clears the compression setting afterward. This proves retries can reuse the prepared body instead of compressing again.
 
-**Data flow**: Creates an `EncodedJsonBody`, inserts it into a request with zstd compression, calls `into_prepared`, pattern-matches the resulting body back to `RequestBody::EncodedJson`, decompresses `body.as_bytes()`, and asserts the decompressed JSON plus the request’s headers and `compression` field are correct.
+**Data flow**: The test encodes a JSON body, builds a POST request with zstd compression, stores the encoded JSON body, and calls into_prepared. It then reads the resulting encoded body, decompresses it to confirm the original JSON is still there, and checks that the request now has the expected Content-Encoding and Content-Type headers with compression set back to none.
 
-**Call relations**: This test validates the mutating preparation path used for retries and repeated sends.
+**Call relations**: This test exercises EncodedJsonBody::encode, Request::new, and into_prepared together. It protects the sealed-package behavior that later transport and retry code depend on.
 
 *Call graph*: calls 3 internal fn (encode, new, new); 5 external calls (assert_eq!, EncodedJson, json!, panic!, decode_all).
 
 
 ### `codex-client/src/retry.rs`
 
-`domain_logic` · `request execution around transient failures`
+`io_transport` · `request handling`
 
-This file contains the retry control logic for transport failures. `RetryPolicy` bundles three pieces of state: `max_attempts`, a `base_delay`, and a `RetryOn` selector. `RetryOn` is the policy matrix itself, with booleans for retrying HTTP 429 responses, HTTP 5xx responses, and transport-level failures such as timeouts or network errors.
+Network calls can fail for reasons that are not permanent: a server may be busy, a connection may briefly drop, or a request may time out. This file gives the client a simple retry system so it can pause and try again instead of failing immediately.
 
-`RetryOn::should_retry` is the classification function. It first enforces the attempt ceiling, then matches on `TransportError`: `TransportError::Http` is retried only when the status matches the enabled categories (`429` or any server error), `Timeout` and `Network(_)` are controlled by `retry_transport`, and all other variants are terminal. `backoff` computes the sleep duration from the base delay using powers of two with saturating arithmetic and a random jitter factor in the range `0.9..1.1`; attempt zero returns the base delay directly. `run_with_retry` ties everything together: for each attempt from `0` through `max_attempts` inclusive, it asks `make_req` for a fresh `Request`, invokes the async operation `op(req, attempt)`, returns immediately on success, sleeps and retries only when `should_retry` says so, and otherwise returns the encountered error. If the loop somehow exhausts without returning, it emits `TransportError::RetryLimit`. The design assumes requests may need rebuilding because bodies, auth, or timestamps can differ per attempt.
+The main idea is a retry policy. The policy says how many tries are allowed, how long the first delay should be, and which kinds of failures are worth retrying. For example, it can retry HTTP 429 responses, which usually mean “too many requests,” or HTTP 5xx responses, which usually mean the server had a problem. It can also retry transport problems such as timeouts or network errors.
+
+When a request fails, the code first asks whether that error is retryable. If it is, it waits before trying again. The wait time grows with each attempt, like giving a busy shop more time before knocking again. A small random variation, called jitter, is added so many clients do not all retry at exactly the same moment.
+
+The file’s main function, `run_with_retry`, wraps an operation: it creates a fresh request for each attempt, runs the operation, returns success immediately if it works, or stops with the final error when retries are no longer allowed.
 
 #### Function details
 
@@ -258,11 +266,11 @@ This file contains the retry control logic for transport failures. `RetryPolicy`
 fn should_retry(&self, err: &TransportError, attempt: u64, max_attempts: u64) -> bool
 ```
 
-**Purpose**: Decides whether a specific `TransportError` should trigger another attempt under the current retry policy.
+**Purpose**: This function answers the question: “Given this error and this attempt number, should we try again?” It protects the client from retrying forever and only approves retries for the error types enabled in the retry settings.
 
-**Data flow**: Reads `self`’s three booleans plus the current `attempt` and `max_attempts`. It returns `false` immediately when the attempt limit has been reached; otherwise it matches the error: HTTP errors are checked against status 429 and `is_server_error()`, timeout/network errors consult `retry_transport`, and all other variants return `false`.
+**Data flow**: It receives a transport error, the current attempt number, and the maximum number of attempts. It first checks whether the retry limit has already been reached. If not, it looks at the error: selected HTTP 429 responses, selected server-side HTTP 5xx responses, and selected timeout or network failures can be approved for another try. It returns `true` when another attempt should happen, otherwise `false`.
 
-**Call relations**: This is the policy gate used inside `run_with_retry` after a failed operation. It determines whether control flows into backoff-and-sleep or exits with the error.
+**Call relations**: During `run_with_retry`, whenever an operation fails, this function is consulted before any waiting or retrying happens. Its answer decides whether the flow continues to `backoff` and `sleep`, or whether the error is returned to the caller immediately.
 
 
 ##### `backoff`  (lines 38–47)
@@ -271,11 +279,11 @@ fn should_retry(&self, err: &TransportError, attempt: u64, max_attempts: u64) ->
 fn backoff(base: Duration, attempt: u64) -> Duration
 ```
 
-**Purpose**: Computes an exponential retry delay from a base duration, with saturating growth and small random jitter.
+**Purpose**: This function calculates how long to wait before the next retry. The delay grows as attempts continue, with a small random adjustment so repeated retries are less likely to pile up at the same instant.
 
-**Data flow**: Takes `base: Duration` and `attempt: u64`. For attempt 0 it returns `base`; otherwise it computes `2^(attempt-1)` with `saturating_pow`, multiplies the base milliseconds with saturation, samples a jitter factor from `rand::rng().random_range(0.9..1.1)`, and returns `Duration::from_millis` of the jittered result.
+**Data flow**: It receives a base delay and an attempt number. For the first retry timing it starts from the base delay; for later attempts it multiplies that delay by a growing power of two. It then applies a random multiplier between 0.9 and 1.1 and returns the final waiting time as a `Duration`.
 
-**Call relations**: Only `run_with_retry` calls this helper, immediately before sleeping between retry attempts.
+**Call relations**: `run_with_retry` calls this after `RetryOn::should_retry` says a failed request is worth trying again. The returned duration is handed to Tokio’s `sleep`, which pauses the asynchronous task before the next request attempt.
 
 *Call graph*: called by 1 (run_with_retry); 3 external calls (as_millis, from_millis, rng).
 
@@ -290,24 +298,26 @@ async fn run_with_retry(
 ) -> Result<T, TransportError>
 ```
 
-**Purpose**: Executes an async request operation repeatedly under a retry policy, rebuilding the request each time and sleeping between retryable failures.
+**Purpose**: This is the main retry wrapper. It repeatedly builds a fresh request, runs the caller’s operation, and either returns the successful result or retries selected failures according to the policy.
 
-**Data flow**: Consumes a `RetryPolicy`, a mutable request factory `make_req`, and an async operation `op`. For each attempt index it calls `make_req()` to obtain a fresh `Request`, awaits `op(req, attempt)`, returns `Ok(T)` on success, or on retryable `Err(TransportError)` sleeps for `backoff(policy.base_delay, attempt + 1)` before continuing. Non-retryable errors are returned immediately; if the loop exits unexpectedly it returns `TransportError::RetryLimit`.
+**Data flow**: It receives a retry policy, a request-making function, and an operation to run. For each attempt, it asks for a new `Request`, passes that request and the attempt number into the operation, and waits for the result. If the operation succeeds, that result is returned. If it fails with a retryable error, it waits for the calculated backoff delay and tries again. If the error is not retryable, or retries are exhausted, it returns an error.
 
-**Call relations**: This is the orchestration function for retry behavior. It delegates classification to `RetryOn::should_retry`, delay calculation to `backoff`, and actual waiting to `tokio::time::sleep`.
+**Call relations**: This function is the coordinator for the file’s retry behavior. It calls `RetryOn::should_retry` to decide whether a failure deserves another attempt, then calls `backoff` and Tokio’s `sleep` to pause before looping. Code elsewhere in the client would use this function around actual request-sending work so the retry rules are applied consistently.
 
 *Call graph*: calls 1 internal fn (backoff); 1 external calls (sleep).
 
 
 ### `codex-client/src/transport.rs`
 
-`io_transport` · `outbound HTTP execution and response decoding`
+`io_transport` · `request handling`
 
-This file defines the transport boundary for the client. `HttpTransport` is the trait exposing two async operations: `execute` for fully buffered responses and `stream` for byte-streaming responses. `ReqwestTransport` is the concrete implementation, holding a `CodexHttpClient` so all outbound requests inherit trace-header injection and request logging from `default_client.rs`.
+This file is the bridge between “what the Codex client wants to send” and the outside world of HTTP. HTTP is the common web protocol used to talk to APIs. Without this file, higher-level code could build a request, but it would have no standard way to actually send it, receive bytes back, or stream a long-running response.
 
-The private `build` method is the key adapter from the transport-neutral `Request` model to a `CodexRequestBuilder`. It first calls `Request::prepare_body_for_send`, so auth/signing and transport both see the exact same final headers and bytes. It then destructures the original request, reconstructs an `http::Method` from `method.as_str().as_bytes()` with a conservative fallback to `GET`, applies any per-request timeout, installs the prepared headers, and attaches the prepared body bytes if present. `map_error` collapses reqwest errors into `TransportError::Timeout` or `TransportError::Network(String)`. For trace-level logging, `request_body_for_trace` renders JSON bodies as text, encoded JSON via preserved `trace_bytes`, raw bodies as a byte-count placeholder, and absent bodies as empty string.
+The central idea is the `HttpTransport` trait, which describes two ways to send a request: `execute` for a normal request that returns the whole response body at once, and `stream` for a response that arrives piece by piece. The concrete implementation here is `ReqwestTransport`, which uses `reqwest`, a Rust HTTP library, under the hood.
 
-`execute` and `stream` share the same flow: optionally emit a trace log, clone the URL for error reporting, build and send the request, inspect status, and convert non-success responses into `TransportError::Http` carrying status, URL, headers, and optional body text. `execute` buffers the full body into `Bytes`; `stream` instead exposes `resp.bytes_stream()` as a boxed stream of `Bytes` chunks with transport errors mapped lazily.
+Before sending, `ReqwestTransport::build` prepares the request body, headers, method, URL, and optional timeout. After sending, the code checks the HTTP status code. If the server reports success, the response is returned. If the server reports an error, this layer packages the status, headers, URL, and any body text into a `TransportError`, so callers get useful failure details.
+
+The file also includes careful error translation. A timeout becomes a specific timeout error; other `reqwest` failures become network errors. When trace-level logging is enabled, it prints a safe summary of the outgoing request body, avoiding dumping raw bytes directly.
 
 #### Function details
 
@@ -317,11 +327,11 @@ The private `build` method is the key adapter from the transport-neutral `Reques
 fn new(client: reqwest::Client) -> Self
 ```
 
-**Purpose**: Constructs the reqwest-backed transport from an already configured `reqwest::Client`.
+**Purpose**: Creates a `ReqwestTransport` from an existing `reqwest::Client`, so the rest of the Codex client can send HTTP requests through a common transport interface. This is useful when setup code has already configured the underlying HTTP client with things like connection settings or default behavior.
 
-**Data flow**: Takes a `reqwest::Client`, wraps it with `CodexHttpClient::new`, stores that in `ReqwestTransport { client }`, and returns the transport.
+**Data flow**: It receives a ready-made `reqwest::Client`. It wraps that client in the project’s `CodexHttpClient` helper, then stores it inside a new `ReqwestTransport`. The result is a transport object that can later build and send requests.
 
-**Call relations**: This is the standard constructor used by many higher-level clients and tests before issuing requests through the `HttpTransport` trait.
+**Call relations**: This is called by setup and feature code that needs a transport, including model listing, response streaming, realtime call creation, conversation compaction, memory summarization, and test paths that hit model endpoints. After construction, later request flows call `execute` or `stream` on the created transport.
 
 *Call graph*: calls 1 internal fn (new); called by 8 (models_client_hits_models_endpoint, compact_conversation_history, create_realtime_call_with_headers, summarize_memories, stream_responses_api, client, handle_call, list_models).
 
@@ -332,11 +342,11 @@ fn new(client: reqwest::Client) -> Self
 fn build(&self, req: Request) -> Result<CodexRequestBuilder, TransportError>
 ```
 
-**Purpose**: Converts a transport-neutral `Request` into a `CodexRequestBuilder` with prepared headers, body bytes, and timeout applied.
+**Purpose**: Turns the project’s internal `Request` value into a `CodexRequestBuilder`, which is the object used to configure and send the real HTTP request. It is the place where method, URL, headers, body, and timeout are assembled into sendable form.
 
-**Data flow**: Consumes a `Request`, calls `req.prepare_body_for_send()` and maps any string error into `TransportError::Build`. It then destructures the original request to extract `method`, `url`, and `timeout`, reconstructs an `http::Method` from the method bytes with fallback to `GET`, creates a builder via `self.client.request(..., &url)`, conditionally applies timeout, replaces headers with `prepared.headers`, conditionally sets `prepared.body`, and returns `Result<CodexRequestBuilder, TransportError>`.
+**Data flow**: It takes a `Request`. First it asks the request to prepare its body for sending, which may add headers or transform the body into bytes. It then reads the request method, URL, and timeout, creates a request builder from the stored HTTP client, applies the timeout if present, adds the prepared headers, and attaches the prepared body if there is one. It returns the finished builder, or a build error if body preparation failed.
 
-**Call relations**: Both `execute` and `stream` call this before sending. It is the single place where request preparation and reqwest builder assembly are joined.
+**Call relations**: `execute` and `stream` both call this before any network traffic happens. In the bigger flow, it acts like packing a parcel before delivery: higher-level code provides the request details, `build` packages them correctly, and then the caller sends the packaged request.
 
 *Call graph*: calls 2 internal fn (request, prepare_body_for_send); called by 2 (execute, stream); 1 external calls (from_bytes).
 
@@ -347,11 +357,11 @@ fn build(&self, req: Request) -> Result<CodexRequestBuilder, TransportError>
 fn map_error(err: reqwest::Error) -> TransportError
 ```
 
-**Purpose**: Normalizes reqwest transport failures into the client’s `TransportError` enum.
+**Purpose**: Converts errors from the `reqwest` HTTP library into the project’s own `TransportError` type. This keeps the rest of the client from needing to understand `reqwest` directly.
 
-**Data flow**: Takes a `reqwest::Error`, checks `err.is_timeout()`, and returns either `TransportError::Timeout` or `TransportError::Network(err.to_string())`.
+**Data flow**: It receives a `reqwest::Error`. If that error says the request timed out, it returns `TransportError::Timeout`. Otherwise it turns the original error into text and wraps it as a network error. Nothing else is changed.
 
-**Call relations**: Used in both buffered and streaming send paths to keep reqwest-specific error details from leaking past the transport boundary.
+**Call relations**: This helper is used when `execute` and `stream` send requests or read response data. It is the translation point between the outside HTTP library and the Codex client’s own error language.
 
 *Call graph*: 3 external calls (is_timeout, to_string, Network).
 
@@ -362,11 +372,11 @@ fn map_error(err: reqwest::Error) -> TransportError
 fn request_body_for_trace(req: &Request) -> String
 ```
 
-**Purpose**: Formats a request body into a trace-log-friendly string without mutating the request.
+**Purpose**: Creates a readable version of a request body for trace logging, which is very detailed diagnostic logging. It helps developers see what is being sent without treating every body type the same way.
 
-**Data flow**: Reads `req.body.as_ref()` and matches variants: `Json(Value)` becomes `body.to_string()`, `EncodedJson` becomes `String::from_utf8_lossy(body.trace_bytes()).into_owned()`, `Raw(Bytes)` becomes a placeholder string with the byte length, and `None` becomes an empty string.
+**Data flow**: It reads the body field from a `Request`. For a JSON body, it converts the JSON to text. For an already-encoded JSON body, it reads the trace-safe bytes and decodes them as text as best it can. For a raw byte body, it does not print the contents; it returns a placeholder showing only the byte count. If there is no body, it returns an empty string.
 
-**Call relations**: Called by both `execute` and `stream` only when trace logging is enabled, so logs can include a readable representation of the outbound payload.
+**Call relations**: `execute` and `stream` call this only when trace logging is enabled. It feeds the logging message with a body summary before the request is sent, while avoiding accidental noisy output for raw data.
 
 *Call graph*: 3 external calls (from_utf8_lossy, new, format!).
 
@@ -377,11 +387,11 @@ fn request_body_for_trace(req: &Request) -> String
 async fn execute(&self, req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Sends a request and buffers the entire successful response body, or returns a structured HTTP/transport error.
+**Purpose**: Sends a normal HTTP request and waits for the full response body before returning. Callers use this for API calls where the answer is expected as one complete block of bytes.
 
-**Data flow**: Consumes a `Request`. If trace logging is enabled, it logs method, URL, and formatted body via `request_body_for_trace`. It clones `req.url` for later error reporting, builds a `CodexRequestBuilder` with `self.build(req)?`, awaits `builder.send()`, maps reqwest errors through `map_error`, then reads status, clones headers, and awaits `resp.bytes()`. Non-success statuses are converted into `TransportError::Http` with optional UTF-8 body text; success returns `crate::request::Response { status, headers, body: bytes }`.
+**Data flow**: It receives a `Request`. If trace logging is enabled, it logs the method, URL, and a readable body summary. It saves the URL for possible error reporting, calls `build` to create a sendable request, sends it, records the status and headers, and reads the whole response body into memory. If the HTTP status is not successful, it tries to turn the body into text and returns a detailed HTTP error. If the status is successful, it returns a `Response` containing the status, headers, and body bytes.
 
-**Call relations**: This is the non-streaming implementation of `HttpTransport::execute`. It depends on `build` for request assembly and on `CodexRequestBuilder::send` for actual network dispatch with trace propagation.
+**Call relations**: This is one of the two main actions promised by the `HttpTransport` trait. Higher-level client code calls it when it wants a complete response. Internally it relies on `request_body_for_trace` for optional logging, `build` for request construction, and `map_error` to translate network-library failures into project errors.
 
 *Call graph*: calls 1 internal fn (build); 3 external calls (from_utf8, enabled!, trace!).
 
@@ -392,22 +402,24 @@ async fn execute(&self, req: Request) -> Result<Response, TransportError>
 async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Sends a request and returns a streaming response body for successful statuses, or a structured HTTP/transport error otherwise.
+**Purpose**: Sends an HTTP request and returns the response as a stream of byte chunks instead of waiting for the whole body. This is important for long-running or incremental API responses, where data may arrive over time.
 
-**Data flow**: Consumes a `Request`, optionally emits the same trace log as `execute`, clones the URL, builds and sends the request, maps reqwest send errors with `map_error`, and inspects status and headers. For non-success statuses it buffers body text with `resp.text().await.ok()` and returns `TransportError::Http`; for success it converts `resp.bytes_stream()` into a stream of `Result<Bytes, TransportError>` by mapping each chunk error through `map_error`, boxes it, and returns `StreamResponse { status, headers, bytes }`.
+**Data flow**: It receives a `Request`. If trace logging is enabled, it logs the method, URL, and body summary. It keeps the URL for error messages, calls `build`, sends the request, and reads the response status and headers. If the status is not successful, it reads the error body as text if possible and returns a detailed HTTP error. If the status is successful, it converts the response body into a stream where each incoming chunk is either bytes or a translated transport error, then returns a `StreamResponse` containing the status, headers, and byte stream.
 
-**Call relations**: This is the streaming implementation of `HttpTransport::stream`. It shares the same setup path as `execute` but leaves body consumption incremental for SSE and other streaming consumers.
+**Call relations**: This is the streaming counterpart to `execute` in the `HttpTransport` trait. Higher-level code calls it when responses should be consumed piece by piece. Like `execute`, it uses `request_body_for_trace` for optional diagnostics, `build` to prepare the outgoing request, and `map_error` to turn lower-level HTTP failures into the client’s own error type.
 
 *Call graph*: calls 1 internal fn (build); 3 external calls (pin, enabled!, trace!).
 
 
 ### `codex-client/src/sse.rs`
 
-`io_transport` · `streaming response handling`
+`io_transport` · `request handling for streaming responses`
 
-This file contains a single helper, `sse_stream`, that turns a `ByteStream` from the transport layer into a background task producing `Result<String, StreamError>` messages over a Tokio MPSC channel. It uses `eventsource_stream::Eventsource` to parse Server-Sent Events framing from the incoming byte stream after first mapping transport errors into `StreamError::Stream` strings.
+Some API responses do not arrive all at once. Instead, the server keeps a connection open and sends small pieces as they become ready, like a live news ticker. This file provides the small bridge needed to read that kind of response when it uses Server-Sent Events, commonly called SSE. In SSE, each message can contain a `data:` field; this helper extracts that data and forwards it as normal UTF-8 text.
 
-The function immediately spawns an async task and returns, so the caller does not await parsing directly. Inside the task, it repeatedly wraps `stream.next()` in `tokio::time::timeout` using the supplied idle timeout. Four outcomes are handled explicitly: a parsed event sends `Ok(ev.data.clone())`; a parser or upstream stream error sends `Err(StreamError::Stream(...))`; end-of-stream before a terminal event sends a synthetic `StreamError::Stream("stream closed before completion")`; and timeout expiration sends `Err(StreamError::Timeout)`. In every error or closed-channel case the task exits immediately. If the receiver side has already been dropped, even successful event forwarding stops silently by returning early. The helper intentionally forwards only the raw `data` field and ignores other SSE metadata such as event names, IDs, or retry hints, making it suitable for simple text/event-stream APIs where payload frames are the only meaningful output.
+The main job here is to sit between the low-level byte stream from the transport layer and the rest of the client code, which wants plain strings or a clear error. It starts a background asynchronous task, meaning it runs without blocking the caller. Inside that task, it converts raw bytes into SSE events, waits for the next event, and sends each event's data through a channel. A channel is like a small pipe between tasks: one side sends messages and the other side receives them.
+
+It is deliberately strict about failure. If the stream reports an error, closes unexpectedly, or stays silent longer than the allowed idle timeout, this helper sends one final `StreamError` and then stops. If the receiver has gone away, it also stops quietly because there is nobody left to deliver messages to.
 
 #### Function details
 
@@ -421,20 +433,26 @@ fn sse_stream(
 )
 ```
 
-**Purpose**: Spawns a background loop that parses SSE frames from a byte stream and forwards each `data:` payload or terminal error through a channel.
+**Purpose**: Starts a background task that reads a byte stream formatted as Server-Sent Events and forwards each event's `data` text through a message channel. It is used when the client expects a long-running streaming response and needs plain text chunks plus clear error reporting.
 
-**Data flow**: Takes a `ByteStream`, an `idle_timeout: Duration`, and an `mpsc::Sender<Result<String, StreamError>>`. It maps transport errors into `StreamError::Stream`, converts the stream into an SSE parser, then in a spawned task repeatedly awaits `timeout(idle_timeout, stream.next())`. Parsed events yield `Ok(ev.data.clone())` sent on `tx`; parser errors, premature EOF, and timeout each send an `Err(StreamError)` variant before returning. If `tx.send(...)` fails because the receiver is gone, the task exits without further work.
+**Data flow**: It receives three things: a raw `ByteStream` from the network layer, an `idle_timeout` that says how long silence is allowed, and a sending side of a channel for results. It first wraps stream errors into this project's `StreamError` type, then parses the bytes as SSE events. For each valid event, it sends `Ok(text)` through the channel. If parsing fails, the stream ends too early, or no event arrives before the timeout, it sends `Err(StreamError)` once and exits. If the receiving side of the channel is already closed, it exits because there is nowhere useful to send data.
 
-**Call relations**: This helper sits between the transport layer’s raw byte streaming and higher-level consumers expecting discrete SSE payload strings. It delegates framing to `eventsource_stream` and uses Tokio spawning so callers can continue immediately after wiring the channel.
+**Call relations**: This function is called by higher-level client code when it has opened a streaming response and wants to consume it as simple text updates. It hands the ongoing work to `tokio::spawn`, so the caller can continue immediately while the background task reads the stream. Inside that task it uses stream mapping to convert low-level errors, `eventsource` parsing to understand SSE framing, `next` to wait for the next event, `timeout` to detect silence, and channel `send` calls to pass either message text or a final error back to the rest of the program.
 
 *Call graph*: 6 external calls (map, next, send, Stream, spawn, timeout).
 
 
 ### `codex-client/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting`
 
-This crate root wires together the client subsystem by declaring its internal modules and re-exporting the types and functions intended for consumers. The internal layout separates concerns cleanly: host and Cloudflare-cookie helpers for ChatGPT-specific access control, custom certificate-authority support, a default HTTP client implementation, request/response body abstractions, retry policy machinery, SSE streaming, telemetry hooks, and transport traits plus reqwest-backed implementations. The public exports define the crate's usable surface: callers can construct requests with `Request`, `RequestBody`, `PreparedRequestBody`, `EncodedJsonBody`, and `RequestCompression`; execute them through `CodexHttpClient`, `CodexRequestBuilder`, `HttpTransport`, or `ReqwestTransport`; consume responses via `Response`, `ByteStream`, and `StreamResponse`; and configure resilience with `RetryPolicy`, `RetryOn`, `backoff`, and `run_with_retry`. It also exposes `sse_stream` for event streams and `RequestTelemetry` for per-attempt instrumentation. A notable design detail is the hidden-but-public subprocess helper for custom CA tests: it remains exported solely so a separate binary target can reuse it, while docs steer normal users toward `build_reqwest_client_with_custom_ca`. Overall, this file is the crate's compatibility boundary: internal modules can evolve as long as these re-exports remain stable.
+This file does not contain the networking logic itself. Instead, it acts like the reception desk for the `codex-client` crate: callers come here to find the approved tools for making HTTP requests, streaming server-sent events, retrying failed calls, adding custom certificate authorities, handling errors, and collecting request telemetry.
+
+The first group of lines declares the private internal modules, such as request building, retry behavior, transport, and custom certificate support. These are the rooms behind the reception desk. The later `pub use` lines choose which items from those rooms are exposed as the library’s public interface.
+
+This matters because it keeps the rest of the project from needing to know the crate’s internal file layout. A caller can import `CodexHttpClient`, `Request`, `RetryPolicy`, or `sse_stream` from the crate directly, instead of reaching into submodules. That makes the library easier to use and gives maintainers freedom to reorganize internal files later without breaking callers.
+
+One item is deliberately marked as hidden from normal documentation: `build_reqwest_client_for_subprocess_tests`. It is public only so a test helper binary can reuse it. The comment warns ordinary users to use the normal custom certificate client builder instead.
 
 
 ### HTTP client configuration
@@ -442,13 +460,13 @@ These files build the reusable outbound client setup around tracing, custom CA h
 
 ### `codex-client/src/chatgpt_cloudflare_cookies.rs`
 
-`io_transport` · `cross-cutting HTTP client setup and request/response cookie handling`
+`io_transport` · `cross-cutting during HTTP client setup and request handling`
 
-This module implements a deliberately narrow cookie policy for Codex HTTP clients talking to ChatGPT surfaces. A global `LazyLock<Arc<ChatGptCloudflareCookieStore>>` exposes one shared store per process, but the store is safe to share only because it hard-restricts both where cookies may be stored and which cookie names survive. The internal `ChatGptCloudflareCookieStore` wraps reqwest's `Jar` and implements `reqwest::cookie::CookieStore`.
+When Codex talks to ChatGPT, Cloudflare may set small infrastructure cookies that prove the client has passed bot or routing checks. Reusing those cookies can make later requests work smoothly. But cookies can also contain sensitive account information, so a process-wide shared jar would be dangerous if it stored everything. This file solves that by acting like a strict gatekeeper: it only accepts cookies from approved ChatGPT HTTPS hosts, and only if the cookie name is on a Cloudflare allowlist.
 
-On writes, `set_cookies` first rejects any non-HTTPS or non-allowed ChatGPT URL via `is_chatgpt_cookie_url`. For accepted URLs, it filters incoming `Set-Cookie` headers through `is_allowed_cloudflare_set_cookie_header`, which parses just the cookie name and checks it against a Cloudflare allowlist plus the `cf_chl_` prefix. On reads, `cookies` again requires an allowed ChatGPT URL, then asks the underlying jar for the cookie header and strips out any non-Cloudflare cookies with `only_cloudflare_cookies` before returning it. This double filtering means even if the jar ever contained mixed cookies, callers only receive the infrastructure subset.
+The main type, ChatGptCloudflareCookieStore, wraps reqwest's Jar, which is reqwest's built-in place for storing HTTP cookies. Its set_cookies method first checks that the response came from a safe ChatGPT URL, then filters out every Set-Cookie header except known Cloudflare names. Its cookies method does the reverse when sending a request: it only returns cookies for safe ChatGPT HTTPS URLs, and it strips the outgoing Cookie header down to Cloudflare cookies only.
 
-Helper functions encode the policy details: host validation is delegated to `chatgpt_hosts`, only HTTPS is accepted, malformed header values are ignored, and OpenAI/ChatGPT account cookies are intentionally excluded. The tests exercise positive storage, host rejection, mixed-cookie filtering, HTTPS-only behavior, and the exact allowlist boundaries.
+The public function with_chatgpt_cloudflare_cookie_store plugs this shared store into a reqwest ClientBuilder. The important caution is that the store is global inside the process. Like a shared lobby pass, it is acceptable only because it never keeps personal keys such as login or session cookies.
 
 #### Function details
 
@@ -462,11 +480,11 @@ fn set_cookies(
     )
 ```
 
-**Purpose**: Accepts response `Set-Cookie` headers only for approved ChatGPT HTTPS URLs and forwards only Cloudflare-allowed cookies into the underlying jar.
+**Purpose**: This is called when an HTTP response tries to set cookies. It stores only approved Cloudflare cookies from approved ChatGPT HTTPS URLs, and ignores everything else.
 
-**Data flow**: It receives an iterator of `HeaderValue` references and a request URL. It first reads the URL through `is_chatgpt_cookie_url`; if that check fails, it returns without mutating state. Otherwise it filters the header iterator with `is_allowed_cloudflare_set_cookie_header` and passes the reduced stream plus the URL into the inner `Jar::set_cookies`, thereby mutating only the jar's stored Cloudflare cookie state.
+**Data flow**: It receives incoming Set-Cookie headers and the URL they came from. First it checks whether the URL is a valid ChatGPT cookie URL. If not, nothing changes. If the URL is allowed, it filters the headers down to known Cloudflare cookie names and passes only those into the inner cookie jar.
 
-**Call relations**: This method is invoked by reqwest's cookie machinery when responses arrive for clients using this store. It delegates URL policy to `is_chatgpt_cookie_url` and header-name policy to `is_allowed_cloudflare_set_cookie_header` before handing accepted cookies to the standard jar implementation.
+**Call relations**: Reqwest calls this through the CookieStore interface when processing response cookies. It relies on is_chatgpt_cookie_url to reject unsafe origins, uses the Cloudflare header filter before storage, and then hands the safe subset to reqwest's built-in jar.
 
 *Call graph*: calls 1 internal fn (is_chatgpt_cookie_url); 2 external calls (filter, set_cookies).
 
@@ -477,11 +495,11 @@ fn set_cookies(
 fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue>
 ```
 
-**Purpose**: Returns a request `Cookie` header only for approved ChatGPT HTTPS URLs and only containing Cloudflare cookie pairs.
+**Purpose**: This is called when an HTTP request needs a Cookie header. It returns stored Cloudflare cookies only for approved ChatGPT HTTPS URLs.
 
-**Data flow**: It takes a URL reference, checks it with `is_chatgpt_cookie_url`, and if allowed asks the inner jar for its cookie header for that URL. The resulting `HeaderValue` is then transformed by `only_cloudflare_cookies`, which may drop disallowed cookie pairs and return `None` if nothing allowed remains. For non-allowed URLs it returns `None` immediately and reads no jar state.
+**Data flow**: It receives the destination URL. If the URL is not an approved ChatGPT HTTPS URL, it returns no cookies. If it is allowed, it asks the inner jar for cookies and then trims the result so only Cloudflare cookie names remain before returning the header.
 
-**Call relations**: Reqwest calls this during outbound request preparation for clients configured with the store. It mirrors `set_cookies` by enforcing the same URL gate and then delegates final header sanitization to `only_cloudflare_cookies`.
+**Call relations**: Reqwest calls this through the CookieStore interface before sending requests. It uses is_chatgpt_cookie_url as the first safety check and then draws from reqwest's jar, with only_cloudflare_cookies acting as a final cleanup step before anything leaves the process.
 
 *Call graph*: calls 1 internal fn (is_chatgpt_cookie_url); 1 external calls (cookies).
 
@@ -494,11 +512,11 @@ fn with_chatgpt_cloudflare_cookie_store(
 ) -> reqwest::ClientBuilder
 ```
 
-**Purpose**: Attaches the shared process-global Cloudflare-only cookie store to a reqwest client builder.
+**Purpose**: This attaches the shared ChatGPT Cloudflare cookie jar to a reqwest HTTP client builder. Callers use it when they want a client to remember Cloudflare infrastructure cookies across requests.
 
-**Data flow**: It takes ownership of a `reqwest::ClientBuilder`, clones the global `Arc<ChatGptCloudflareCookieStore>`, installs it via `cookie_provider`, and returns the modified builder. No cookie contents are changed here; only builder configuration is updated.
+**Data flow**: It takes a reqwest ClientBuilder as input. It clones the shared reference to the global cookie store, adds it as the client's cookie provider, and returns the updated builder.
 
-**Call relations**: This is the public integration point for callers constructing HTTP clients. Rather than creating per-client stores, it wires the shared allowlisted store into reqwest so later response and request flows hit `set_cookies` and `cookies`.
+**Call relations**: Higher-level client setup code calls this while constructing an HTTP client. It does not inspect cookies itself; it wires the global ChatGptCloudflareCookieStore into reqwest so the store's set_cookies and cookies methods are used later during requests and responses.
 
 *Call graph*: 2 external calls (clone, cookie_provider).
 
@@ -509,11 +527,11 @@ fn with_chatgpt_cloudflare_cookie_store(
 fn is_chatgpt_cookie_url(url: &reqwest::Url) -> bool
 ```
 
-**Purpose**: Determines whether a URL is eligible for shared Cloudflare cookie storage by requiring HTTPS and an allowed ChatGPT host.
+**Purpose**: This decides whether a URL is allowed to use this shared cookie jar. It accepts only HTTPS URLs whose host is one of the approved ChatGPT hosts.
 
-**Data flow**: It reads the URL scheme and host string. Any scheme other than `https` or any URL without a host returns `false`; otherwise it passes the host into `is_allowed_chatgpt_host` and returns that boolean result.
+**Data flow**: It reads the URL's scheme, such as https or http, and its host name. If the scheme is not https or there is no host, it returns false. Otherwise it asks the ChatGPT host allowlist whether the host is acceptable and returns that answer.
 
-**Call relations**: This helper is called by both `ChatGptCloudflareCookieStore::set_cookies` and `ChatGptCloudflareCookieStore::cookies` so read and write paths share identical URL eligibility rules.
+**Call relations**: Both ChatGptCloudflareCookieStore::set_cookies and ChatGptCloudflareCookieStore::cookies call this before storing or sending anything. It is the first lock on the gate, making sure the cookie jar is not used for unrelated sites or plain unencrypted HTTP.
 
 *Call graph*: calls 1 internal fn (is_allowed_chatgpt_host); called by 2 (cookies, set_cookies); 2 external calls (host_str, scheme).
 
@@ -524,11 +542,11 @@ fn is_chatgpt_cookie_url(url: &reqwest::Url) -> bool
 fn is_allowed_cloudflare_set_cookie_header(header: &HeaderValue) -> bool
 ```
 
-**Purpose**: Checks whether a raw `Set-Cookie` header names one of the Cloudflare cookies the shared store is allowed to persist.
+**Purpose**: This checks whether one Set-Cookie header appears to set a Cloudflare cookie that this file is allowed to keep.
 
-**Data flow**: It takes a `HeaderValue`, attempts to decode it to `&str`, extracts the cookie name with `set_cookie_name`, and then tests that name with `is_allowed_cloudflare_cookie_name`. Invalid header encoding or missing names collapse to `false`.
+**Data flow**: It receives a raw HTTP header value. It tries to read it as text, extracts the cookie name before the first equals sign, and checks that name against the Cloudflare allowlist. It returns true only if all of those steps succeed.
 
-**Call relations**: Used as the predicate inside `ChatGptCloudflareCookieStore::set_cookies`'s iterator filter. It delegates parsing and allowlist matching to smaller helpers so malformed headers are simply ignored.
+**Call relations**: ChatGptCloudflareCookieStore::set_cookies uses this as the filter before giving headers to the inner jar. It depends on set_cookie_name to identify the cookie and on is_allowed_cloudflare_cookie_name to decide whether the name is safe.
 
 *Call graph*: 1 external calls (to_str).
 
@@ -539,11 +557,11 @@ fn is_allowed_cloudflare_set_cookie_header(header: &HeaderValue) -> bool
 fn set_cookie_name(header: &str) -> Option<&str>
 ```
 
-**Purpose**: Extracts the cookie name token from a `Set-Cookie` header string.
+**Purpose**: This pulls the cookie name out of a Set-Cookie header string. It is a small parser for the part before the first equals sign.
 
-**Data flow**: It receives a header string, splits once on `'='`, trims the left-hand side, and returns `Some(name)` only if the trimmed name is non-empty. If no equals sign exists or the name is blank, it returns `None`.
+**Data flow**: It receives a header as plain text. It splits the text at the first equals sign, trims spaces from the name, and returns that name if it is not empty. If the header does not look like a cookie assignment, it returns nothing.
 
-**Call relations**: This helper supports `is_allowed_cloudflare_set_cookie_header` by isolating the minimal parsing needed for allowlist checks without interpreting attributes or values.
+**Call relations**: is_allowed_cloudflare_set_cookie_header uses this helper while deciding whether an incoming cookie should be kept. It keeps that filtering code focused on the safety decision rather than on string parsing details.
 
 
 ##### `only_cloudflare_cookies`  (lines 85–102)
@@ -552,11 +570,11 @@ fn set_cookie_name(header: &str) -> Option<&str>
 fn only_cloudflare_cookies(header: HeaderValue) -> Option<HeaderValue>
 ```
 
-**Purpose**: Filters an outbound `Cookie` header down to only the allowed Cloudflare cookie pairs and rebuilds the header if any remain.
+**Purpose**: This cleans an outgoing Cookie header so it contains only allowed Cloudflare cookies. It is a last safety net before cookies are sent on a request.
 
-**Data flow**: It takes an owned `HeaderValue`, converts it to `&str`, splits on semicolons into individual cookie pairs, trims each pair, extracts each cookie name, and keeps only those whose names satisfy `is_allowed_cloudflare_cookie_name`. The surviving pairs are joined with `"; "` and converted back into a `HeaderValue`; if conversion fails or no allowed cookies remain, it returns `None`.
+**Data flow**: It receives a Cookie header value from the inner jar. It turns it into text, splits it into individual cookies separated by semicolons, keeps only entries whose names are on the Cloudflare allowlist, and rebuilds a new header. If nothing safe remains, it returns no header.
 
-**Call relations**: Called by `ChatGptCloudflareCookieStore::cookies` after the underlying jar has produced a combined cookie header. It acts as a final outbound safety filter independent of what may be stored internally.
+**Call relations**: ChatGptCloudflareCookieStore::cookies uses this after asking reqwest's jar for stored cookies. Even if the jar somehow contains something unexpected, this function prevents non-Cloudflare cookies from being returned to the HTTP client.
 
 *Call graph*: 3 external calls (from_str, split, to_str).
 
@@ -567,11 +585,11 @@ fn only_cloudflare_cookies(header: HeaderValue) -> Option<HeaderValue>
 fn is_allowed_cloudflare_cookie_name(name: &str) -> bool
 ```
 
-**Purpose**: Implements the explicit allowlist of Cloudflare service cookie names that may be shared process-wide.
+**Purpose**: This is the central allowlist of Cloudflare cookie names that are safe to store in the shared jar. Anything not on this list is treated as unsafe for this global store.
 
-**Data flow**: It reads a cookie name string and returns `true` if it matches one of the hardcoded documented Cloudflare names or starts with the `cf_chl_` prefix; otherwise it returns `false`. It does not inspect values or mutate state.
+**Data flow**: It receives a cookie name as text. It compares the name with the known Cloudflare service cookie names and also allows names that start with the Cloudflare challenge prefix cf_chl_. It returns true for allowed names and false for all others.
 
-**Call relations**: This is the core policy predicate used by both inbound filtering (`is_allowed_cloudflare_set_cookie_header`) and outbound filtering (`only_cloudflare_cookies`). The tests also exercise it directly to pin the allowlist boundary.
+**Call relations**: The incoming-cookie filter and outgoing-cookie cleanup both depend on this function. It is the policy point that keeps the shared jar limited to Cloudflare infrastructure cookies rather than user-specific ChatGPT cookies.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -582,11 +600,11 @@ fn is_allowed_cloudflare_cookie_name(name: &str) -> bool
 fn stores_and_returns_cloudflare_cookies_for_chatgpt_hosts()
 ```
 
-**Purpose**: Verifies that allowed Cloudflare cookies set on an approved ChatGPT HTTPS URL are stored and later returned as request cookies.
+**Purpose**: This test proves that valid Cloudflare cookies from a ChatGPT HTTPS host are saved and later returned.
 
-**Data flow**: The test constructs a default store, parses a ChatGPT URL, creates `_cfuvid` and `cf_clearance` `HeaderValue`s, feeds them into `set_cookies`, then reads back `cookies`, converts the header to strings, sorts the cookie pairs, and asserts the expected two entries are present.
+**Data flow**: It creates a fresh store, a ChatGPT URL, and two Cloudflare Set-Cookie headers. After storing them, it asks for cookies for the same URL, sorts the returned cookie strings, and checks that both expected cookie name-value pairs are present.
 
-**Call relations**: This test exercises the positive path through both `set_cookies` and `cookies`, confirming that the allowlist and URL gate permit legitimate Cloudflare infrastructure cookies.
+**Call relations**: This test exercises the normal success path through ChatGptCloudflareCookieStore::set_cookies and ChatGptCloudflareCookieStore::cookies. It shows the intended behavior that the rest of the file is built to support.
 
 *Call graph*: 4 external calls (from_static, assert_eq!, default, parse).
 
@@ -597,11 +615,11 @@ fn stores_and_returns_cloudflare_cookies_for_chatgpt_hosts()
 fn ignores_non_chatgpt_cookies()
 ```
 
-**Purpose**: Checks that even allowed Cloudflare cookie names are ignored when the URL host is outside the approved ChatGPT set.
+**Purpose**: This test proves that cookies from non-ChatGPT hosts are not stored, even if their names look like Cloudflare cookies.
 
-**Data flow**: It creates a store, parses an `api.openai.com` URL, constructs an `_cfuvid` header, calls `set_cookies`, then asserts that `cookies` for that URL returns `None`.
+**Data flow**: It creates a fresh store, uses an api.openai.com URL, and tries to store a Cloudflare-looking cookie. When it asks for cookies for that URL, it expects nothing back.
 
-**Call relations**: This test covers the host gate enforced by `is_chatgpt_cookie_url`, showing that cookie-name allowlisting alone is insufficient without an approved HTTPS ChatGPT host.
+**Call relations**: This test checks the host restriction enforced by is_chatgpt_cookie_url through the set_cookies and cookies flow. It confirms that the shared jar is not a general Cloudflare cookie jar for every site.
 
 *Call graph*: 5 external calls (from_static, assert_eq!, default, parse, once).
 
@@ -612,11 +630,11 @@ fn ignores_non_chatgpt_cookies()
 fn ignores_non_cloudflare_cookies_for_chatgpt_hosts()
 ```
 
-**Purpose**: Ensures that ChatGPT account/session cookies are not stored even when they arrive from an approved ChatGPT host.
+**Purpose**: This test proves that user-session-style cookies from ChatGPT hosts are rejected. That is the key privacy and safety promise of this file.
 
-**Data flow**: It builds a store, parses a ChatGPT URL, creates a `__Secure-next-auth.session-token` header, passes it to `set_cookies`, and asserts that no cookies are returned for that URL.
+**Data flow**: It creates a fresh store, uses a ChatGPT URL, and tries to store a cookie named like an authentication session token. Afterward, asking for cookies returns nothing.
 
-**Call relations**: This test targets the cookie-name allowlist path, proving that the shared jar refuses user-specific cookies on otherwise eligible hosts.
+**Call relations**: This test exercises the incoming-cookie filter used by ChatGptCloudflareCookieStore::set_cookies. It confirms that an approved host alone is not enough; the cookie name must also be on the Cloudflare allowlist.
 
 *Call graph*: 5 external calls (from_static, assert_eq!, default, parse, once).
 
@@ -627,11 +645,11 @@ fn ignores_non_cloudflare_cookies_for_chatgpt_hosts()
 fn ignores_mixed_non_cloudflare_cookies_for_chatgpt_hosts()
 ```
 
-**Purpose**: Verifies that mixed `Set-Cookie` input stores only the Cloudflare subset and drops unrelated ChatGPT cookies.
+**Purpose**: This test proves that when safe and unsafe cookies arrive together, the safe one is kept and the unsafe one is discarded.
 
-**Data flow**: It creates a store and ChatGPT URL, constructs one allowed `_cfuvid` header and one disallowed `chatgpt_session` header, stores both, then reads back the cookie header as a string and asserts only `_cfuvid=visitor` remains.
+**Data flow**: It creates a fresh store, a ChatGPT URL, one allowed Cloudflare cookie, and one account-like cookie. After storage, it asks for cookies and expects to see only the Cloudflare cookie.
 
-**Call relations**: This test exercises the filtering behavior inside `set_cookies` and confirms that disallowed cookies do not contaminate the shared jar when mixed with allowed ones.
+**Call relations**: This test checks the filtering behavior inside ChatGptCloudflareCookieStore::set_cookies. It matters because real HTTP responses can include several cookies at once, and the store must not reject the whole batch or keep too much.
 
 *Call graph*: 4 external calls (from_static, assert_eq!, default, parse).
 
@@ -642,11 +660,11 @@ fn ignores_mixed_non_cloudflare_cookies_for_chatgpt_hosts()
 fn does_not_return_chatgpt_cloudflare_cookies_for_other_hosts()
 ```
 
-**Purpose**: Confirms that cookies stored for an approved ChatGPT host are not exposed when requests target a different host.
+**Purpose**: This test proves that a cookie stored for ChatGPT is not sent to a different host.
 
-**Data flow**: It stores an allowed `_cfuvid` cookie against a ChatGPT URL, then asks for cookies on an `api.openai.com` URL and asserts the result is `None`.
+**Data flow**: It stores a Cloudflare cookie using a ChatGPT URL, then asks for cookies using an api.openai.com URL. The expected result is no Cookie header.
 
-**Call relations**: This test covers the outbound read path's URL gate in `cookies`, ensuring host scoping is enforced even after valid cookies have been stored.
+**Call relations**: This test exercises ChatGptCloudflareCookieStore::cookies and its URL check. It confirms that stored ChatGPT Cloudflare cookies stay tied to allowed ChatGPT destinations.
 
 *Call graph*: 5 external calls (from_static, assert_eq!, default, parse, once).
 
@@ -657,11 +675,11 @@ fn does_not_return_chatgpt_cloudflare_cookies_for_other_hosts()
 fn rejects_plain_http_chatgpt_cookie_urls()
 ```
 
-**Purpose**: Checks that plain HTTP ChatGPT URLs are rejected for both storage and retrieval, even though the host itself is otherwise allowed.
+**Purpose**: This test proves that plain HTTP ChatGPT URLs cannot store or receive cookies from this jar. Only encrypted HTTPS is allowed.
 
-**Data flow**: It creates HTTP and HTTPS ChatGPT URLs, attempts to store an allowed `_cfuvid` cookie using the HTTP URL, then asserts that `cookies` returns `None` for both the HTTP and HTTPS URLs.
+**Data flow**: It creates an http:// ChatGPT URL, an https:// version of the same host, and a Cloudflare cookie. It tries to store the cookie through the HTTP URL, then checks that neither the HTTP URL nor the HTTPS URL gets anything back.
 
-**Call relations**: This test exercises the scheme check inside `is_chatgpt_cookie_url`, proving the shared store is HTTPS-only and does not accept downgraded origins.
+**Call relations**: This test covers the scheme check inside is_chatgpt_cookie_url as used by set_cookies and cookies. It protects against accepting cookies from an unencrypted origin and later sending them in a more trusted-looking context.
 
 *Call graph*: 5 external calls (from_static, assert_eq!, default, parse, once).
 
@@ -672,11 +690,11 @@ fn rejects_plain_http_chatgpt_cookie_urls()
 fn only_allows_https_urls()
 ```
 
-**Purpose**: Directly verifies that `is_chatgpt_cookie_url` rejects non-HTTPS schemes such as `http` and `wss`.
+**Purpose**: This test directly checks that the URL filter rejects non-HTTPS schemes.
 
-**Data flow**: It parses two non-HTTPS URLs and asserts that `is_chatgpt_cookie_url` returns false for each.
+**Data flow**: It parses a plain HTTP ChatGPT URL and a WebSocket-style wss URL. It passes each into is_chatgpt_cookie_url and expects both to be rejected.
 
-**Call relations**: This is a focused unit test for the URL predicate used by both cookie read and write paths.
+**Call relations**: This test focuses on is_chatgpt_cookie_url without going through the cookie store. It documents that the store's idea of a safe cookie URL is deliberately limited to HTTPS web requests.
 
 *Call graph*: 2 external calls (assert!, parse).
 
@@ -687,22 +705,24 @@ fn only_allows_https_urls()
 fn allows_only_known_cloudflare_cookie_names()
 ```
 
-**Purpose**: Pins the exact cookie-name allowlist by asserting acceptance of documented Cloudflare names and rejection of unrelated names.
+**Purpose**: This test verifies the cookie-name allowlist. It makes sure known Cloudflare names are accepted and likely account or unrelated names are rejected.
 
-**Data flow**: It iterates over a list of expected-true names and expected-false names, calling `is_allowed_cloudflare_cookie_name` for each and asserting the result.
+**Data flow**: It loops over allowed names and checks that is_allowed_cloudflare_cookie_name returns true. Then it loops over disallowed names and checks that the same function returns false.
 
-**Call relations**: This test directly guards the central allowlist predicate that both inbound and outbound filtering depend on.
+**Call relations**: This test protects the policy encoded in is_allowed_cloudflare_cookie_name. Since both storing and sending cookies depend on that policy, a mistake here could either break Cloudflare flows or leak sensitive user cookies.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `codex-client/src/custom_ca.rs`
 
-`config` · `HTTP/websocket client construction and config load`
+`io_transport` · `outbound HTTP/websocket client construction`
 
-This module is the system's shared trust-store policy for enterprise environments that require custom root CAs. Its public entrypoints build either a reqwest client or an optional rustls `ClientConfig` by consulting `CODEX_CA_CERTIFICATE` first and `SSL_CERT_FILE` second, treating empty values as unset. The core flow is: select a `ConfiguredCaBundle` through the `EnvSource` abstraction, read the PEM file, normalize OpenSSL `TRUSTED CERTIFICATE` labels via `NormalizedPem`, iterate mixed PEM sections, ignore CRLs, extract every certificate DER block, and register those certificates with either reqwest or a rustls `RootCertStore`. When no CA override is configured, reqwest builds with system roots and websocket callers get `Ok(None)` so they can keep their default connector path.
+When Codex connects to HTTPS or secure websocket services, it must decide which certificate authorities, or CAs, it trusts. A CA is an organization or internal system that vouches that a server certificate is legitimate. Normally the operating system supplies this trust list, but many enterprise networks add their own CA so traffic can pass through security gateways. Without this file, some Codex network paths might ignore that custom CA and fail only in those environments.
 
-The file's most important design choices are defensive and operator-facing. Errors are represented by `BuildCustomCaTransportError`, which preserves whether failure came from file I/O, malformed PEM, per-certificate registration, or final client build. The `From<...> for io::Error` conversion maps those variants onto sensible `io::ErrorKind`s. For compatibility, `NormalizedPem` rewrites `TRUSTED CERTIFICATE` labels and trims trailing OpenSSL `X509_AUX` metadata using `first_der_item`/`der_item_length` rather than rejecting such bundles outright. Logging records which environment variable selected the bundle, how many certificates loaded, and whether CRLs or native-root loading issues were encountered. Tests cover precedence, empty-value handling, and rustls config creation against fixture PEM files.
+This module centralizes the rule: first look at CODEX_CA_CERTIFICATE, then fall back to SSL_CERT_FILE, and treat empty values as if they were not set. If a file is selected, it reads the PEM file, which is a text format commonly used for certificates. It accepts ordinary CERTIFICATE blocks, OpenSSL TRUSTED CERTIFICATE blocks, and ignores well-formed certificate revocation list sections. For TRUSTED CERTIFICATE input, it trims off OpenSSL-only extra data before giving the certificate to the TLS library.
+
+The file then builds either a reqwest HTTP client or a rustls websocket TLS configuration with those added roots. If anything is wrong, such as a missing file or malformed certificate, it fails early with a clear message that names the environment variable and file path. Its tests use fake environments so developer machine settings do not accidentally change the result.
 
 #### Function details
 
@@ -712,11 +732,11 @@ The file's most important design choices are defensive and operator-facing. Erro
 fn from(error: BuildCustomCaTransportError) -> Self
 ```
 
-**Purpose**: Converts `BuildCustomCaTransportError` into an `io::Error` while preserving meaningful error kinds for callers that only traffic in I/O-style failures.
+**Purpose**: Turns this module's detailed custom-CA error into a standard input/output error. This lets callers that only understand ordinary I/O errors still receive useful failure information.
 
-**Data flow**: It takes ownership of a `BuildCustomCaTransportError`, pattern-matches its variant, and constructs an `io::Error`: `ReadCaFile` preserves the underlying source kind, parse/registration failures become `InvalidData`, and client-build failures become `io::Error::other`. It returns the new `io::Error` and writes no external state.
+**Data flow**: It receives a custom transport-building error. It keeps the original error message, chooses an appropriate broad error kind such as read failure, invalid data, or general failure, and returns a standard io::Error containing the original details.
 
-**Call relations**: This conversion is used implicitly when higher layers want to collapse custom-CA transport failures into standard I/O errors without losing the formatted diagnostic message.
+**Call relations**: This is used when code outside this module wants to treat custom-CA setup failures like normal I/O failures. It does not build clients itself; it translates the error after another function has already failed.
 
 *Call graph*: 2 external calls (new, other).
 
@@ -729,11 +749,11 @@ fn build_reqwest_client_with_custom_ca(
 ) -> Result<reqwest::Client, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Public production entrypoint for building a reqwest client that honors Codex CA override environment variables.
+**Purpose**: Builds a reqwest HTTP client using Codex's shared custom-certificate policy. Callers use it instead of building a raw HTTP client when outbound HTTPS should work behind enterprise proxies.
 
-**Data flow**: It accepts a caller-prepared `reqwest::ClientBuilder`, passes it with the real `ProcessEnv` into `build_reqwest_client_with_env`, and returns either the built `reqwest::Client` or a `BuildCustomCaTransportError`.
+**Data flow**: It receives a preconfigured reqwest client builder from the caller. It reads the real process environment through ProcessEnv, applies any selected CA bundle, and returns either a ready HTTP client or a clear custom-CA setup error.
 
-**Call relations**: This is the normal HTTP-facing wrapper around `build_reqwest_client_with_env`. Callers use it instead of constructing reqwest clients directly so custom CA policy is consistently applied.
+**Call relations**: This is the production HTTP entry point in this file. It immediately hands the real work to build_reqwest_client_with_env so the same logic can also be tested with fake environments.
 
 *Call graph*: calls 1 internal fn (build_reqwest_client_with_env).
 
@@ -744,11 +764,11 @@ fn build_reqwest_client_with_custom_ca(
 fn maybe_build_rustls_client_config_with_custom_ca() -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Public production entrypoint for optionally building a rustls client config when a custom CA bundle is configured in the environment.
+**Purpose**: Builds a rustls TLS configuration for secure websockets when a custom CA bundle is configured. If no custom CA is requested, it deliberately returns nothing so websocket code can use its normal default path.
 
-**Data flow**: It reads no inputs beyond the real process environment indirectly through `ProcessEnv`, delegates to `maybe_build_rustls_client_config_with_env`, and returns `Ok(None)` when no CA override is selected or `Ok(Some(Arc<ClientConfig>))`/`Err(...)` otherwise.
+**Data flow**: It reads the real process environment. If a CA file is selected, it returns a shared TLS client configuration containing system roots plus the custom roots; if not, it returns Ok(None); if setup fails, it returns a detailed error.
 
-**Call relations**: This is the websocket-facing sibling of the reqwest builder. It exists so websocket code can share the same CA-selection and parsing policy as HTTP code.
+**Call relations**: This is the websocket-facing production entry point. It delegates to maybe_build_rustls_client_config_with_env, which contains the testable selection and loading logic.
 
 *Call graph*: calls 1 internal fn (maybe_build_rustls_client_config_with_env).
 
@@ -761,11 +781,11 @@ fn build_reqwest_client_for_subprocess_tests(
 ) -> Result<reqwest::Client, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Builds a reqwest client through the shared custom-CA path but disables reqwest proxy autodetection for hermetic subprocess tests.
+**Purpose**: Builds a reqwest HTTP client for integration tests that run in child processes. It disables proxy auto-detection so tests can focus on custom certificate behavior instead of platform proxy probing.
 
-**Data flow**: It takes a `reqwest::ClientBuilder`, applies `no_proxy()` to suppress ambient proxy discovery, then delegates to `build_reqwest_client_with_env` with `ProcessEnv`. It returns the resulting client or transport error.
+**Data flow**: It receives a reqwest builder, turns off proxy use on that builder, then applies the same custom-CA environment logic as production. The result is either a test HTTP client or the same kind of setup error production would report.
 
-**Call relations**: This wrapper is called by subprocess test helpers such as the custom CA probe binary. It reuses the production CA logic while altering only proxy behavior to make tests more deterministic.
+**Call relations**: This is used by subprocess tests rather than normal Codex runtime code. After changing the builder with no_proxy, it hands off to build_reqwest_client_with_env for the shared certificate work.
 
 *Call graph*: calls 1 internal fn (build_reqwest_client_with_env); 1 external calls (no_proxy).
 
@@ -778,11 +798,11 @@ fn maybe_build_rustls_client_config_with_env(
 ) -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Internal rustls-config builder that applies environment-driven CA selection, loads native roots, and layers custom certificates on top when configured.
+**Purpose**: Creates the TLS configuration used by secure websocket clients when an environment variable points to a custom CA bundle. It keeps normal system trust and adds Codex's extra trust on top.
 
-**Data flow**: It takes an `EnvSource`, asks it for `configured_ca_bundle`, and returns `Ok(None)` if none is selected. Otherwise it ensures the rustls crypto provider is installed, creates an empty `RootCertStore`, loads native certificates with `rustls_native_certs::load_native_certs`, logs any native-root load errors, adds parsable native certs, loads custom certificates from the selected bundle, and inserts them one by one into the root store. On success it builds a `ClientConfig` with those roots and no client auth, wraps it in `Arc`, and returns `Ok(Some(...))`; on registration failure it returns `RegisterRustlsCertificate`.
+**Data flow**: It receives an environment source, asks it whether a CA bundle is configured, and returns Ok(None) if not. If one is configured, it initializes rustls, loads native system root certificates, reads and parses the custom bundle, adds each parsed certificate to the root store, and returns a shared ClientConfig or an error that names the failing certificate or file.
 
-**Call relations**: This function underlies the public websocket entrypoint and is also called directly by tests using fake env sources. It delegates bundle parsing to `ConfiguredCaBundle::load_certificates` and owns the rustls-specific root-store assembly.
+**Call relations**: The production websocket helper calls this with the real environment, and tests call it with a fake environment. It relies on EnvSource::configured_ca_bundle to choose the file and ConfiguredCaBundle::load_certificates to turn that file into certificate bytes.
 
 *Call graph*: calls 1 internal fn (configured_ca_bundle); called by 3 (maybe_build_rustls_client_config_with_custom_ca, rustls_config_reports_invalid_ca_file, rustls_config_uses_custom_ca_bundle_when_configured); 6 external calls (new, builder, empty, ensure_rustls_crypto_provider, load_native_certs, warn!).
 
@@ -796,11 +816,11 @@ fn build_reqwest_client_with_env(
 ) -> Result<reqwest::Client, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Internal shared implementation that selects a CA bundle from an injected environment source, loads certificates if present, and builds the final reqwest client.
+**Purpose**: Contains the main HTTP-client construction logic in a form that can be tested without changing global environment variables. It preserves the caller's reqwest settings while adding custom CA support when requested.
 
-**Data flow**: It takes an `EnvSource` and mutable `reqwest::ClientBuilder`. If `configured_ca_bundle` returns a bundle, it ensures the rustls provider, logs the selected env/path, switches the builder to rustls, loads certificates from the bundle, converts each DER blob into a `reqwest::Certificate`, adds each as a root certificate, and finally builds the client. Certificate conversion failures become `RegisterCertificate`; final build failures become `BuildClientWithCustomCa`. If no bundle is configured, it logs that system roots are being used, builds the client unchanged, and maps any build failure to `BuildClientWithSystemRoots`.
+**Data flow**: It receives an environment source and a reqwest client builder. If no CA file is configured, it simply builds the client with system roots. If a CA file is configured, it selects rustls as the TLS backend, loads certificate bytes from the bundle, registers each certificate with the builder, and then builds the client; each failure is turned into a specific user-facing error.
 
-**Call relations**: This is the central implementation used by both `build_reqwest_client_with_custom_ca` and `build_reqwest_client_for_subprocess_tests`. It delegates env precedence to `EnvSource::configured_ca_bundle` and PEM parsing to `ConfiguredCaBundle::load_certificates`.
+**Call relations**: Production HTTP setup and subprocess-test setup both call this. It calls EnvSource::configured_ca_bundle for policy, ConfiguredCaBundle::load_certificates for file parsing, and reqwest builder methods to produce the final client.
 
 *Call graph*: calls 1 internal fn (configured_ca_bundle); called by 2 (build_reqwest_client_for_subprocess_tests, build_reqwest_client_with_custom_ca); 8 external calls (add_root_certificate, build, use_rustls_tls, BuildClientWithSystemRoots, ensure_rustls_crypto_provider, info!, from_der, warn!).
 
@@ -811,11 +831,11 @@ fn build_reqwest_client_with_env(
 fn non_empty_path(&self, key: &str) -> Option<PathBuf>
 ```
 
-**Purpose**: Interprets an environment variable as a filesystem path only when it is present and non-empty.
+**Purpose**: Reads one environment value and treats it as a filesystem path only if it is not empty. This prevents an empty variable like CODEX_CA_CERTIFICATE="" from being mistaken for a real file choice.
 
-**Data flow**: It calls `self.var(key)`, filters out empty strings, converts the remaining string into a `PathBuf`, and returns `Option<PathBuf>`. It performs no trimming beyond rejecting exact emptiness.
+**Data flow**: It receives an environment variable name, asks the environment source for its value, filters out empty strings, and converts any remaining string into a PathBuf. The output is either a path or no value.
 
-**Call relations**: This default trait helper is used by `EnvSource::configured_ca_bundle` so precedence logic can treat empty env vars as unset rather than as bogus paths.
+**Call relations**: EnvSource::configured_ca_bundle uses this helper while deciding which CA environment variable wins. Individual environment implementations only provide raw values; this method adds the shared empty-value rule.
 
 *Call graph*: called by 1 (configured_ca_bundle).
 
@@ -826,11 +846,11 @@ fn non_empty_path(&self, key: &str) -> Option<PathBuf>
 fn configured_ca_bundle(&self) -> Option<ConfiguredCaBundle>
 ```
 
-**Purpose**: Applies environment-variable precedence to choose which CA bundle path, if any, should be loaded.
+**Purpose**: Chooses the CA bundle Codex should use, following the module's precedence rule. CODEX_CA_CERTIFICATE wins over SSL_CERT_FILE because it is the Codex-specific setting.
 
-**Data flow**: It queries `non_empty_path(CODEX_CA_CERTIFICATE)` first and, if present, wraps that path in a `ConfiguredCaBundle` tagged with `CODEX_CA_CERTIFICATE`. Otherwise it queries `non_empty_path(SSL_CERT_FILE)` and wraps that path similarly. If neither yields a path, it returns `None`.
+**Data flow**: It checks CODEX_CA_CERTIFICATE for a non-empty path first. If that is missing or empty, it checks SSL_CERT_FILE. It returns a ConfiguredCaBundle containing both the winning path and the variable name that selected it, or returns nothing if neither applies.
 
-**Call relations**: Both reqwest and rustls build paths call this method to share one precedence rule. It depends on `non_empty_path` so empty strings do not win precedence.
+**Call relations**: Both HTTP and websocket setup call this before doing any certificate work. It depends on EnvSource::non_empty_path so production and tests share the same empty-string behavior.
 
 *Call graph*: calls 1 internal fn (non_empty_path); called by 2 (build_reqwest_client_with_env, maybe_build_rustls_client_config_with_env).
 
@@ -841,11 +861,11 @@ fn configured_ca_bundle(&self) -> Option<ConfiguredCaBundle>
 fn var(&self, key: &str) -> Option<String>
 ```
 
-**Purpose**: Production `EnvSource` implementation that reads environment variables from the real process.
+**Purpose**: Reads an environment variable from the real running process. This is the production implementation of the EnvSource abstraction.
 
-**Data flow**: It takes a key string, calls `std::env::var`, converts successful reads into `Some(String)`, and collapses missing or unreadable values into `None`.
+**Data flow**: It receives a variable name, asks the operating system process environment for that value, and returns the string if present and readable. Missing or unreadable values become None.
 
-**Call relations**: This method supplies actual environment values to the public reqwest and rustls entrypoints through the `EnvSource` trait.
+**Call relations**: The public production builders use ProcessEnv so the shared logic sees real CODEX_CA_CERTIFICATE and SSL_CERT_FILE settings. Tests use MapEnv instead so they can avoid changing process-wide state.
 
 *Call graph*: 1 external calls (var).
 
@@ -858,11 +878,11 @@ fn load_certificates(
     ) -> Result<Vec<CertificateDer<'static>>, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Loads and logs the certificate set for the selected CA bundle, wrapping lower-level parse results with bundle-specific diagnostics.
+**Purpose**: Loads all usable certificates from the selected CA bundle and logs whether that succeeded. It is the high-level file-loading step after environment selection has already picked a path.
 
-**Data flow**: It reads `self.source_env` and `self.path`, calls `parse_certificates`, logs success with the certificate count when parsing succeeds, or logs a warning with the error when parsing fails. It returns the parsed `Vec<CertificateDer<'static>>` or propagates the shaped `BuildCustomCaTransportError`.
+**Data flow**: It starts with a ConfiguredCaBundle containing the source environment variable and file path. It calls parse_certificates, logs the certificate count on success or the error on failure, and returns either a list of certificate bytes or the same setup error.
 
-**Call relations**: Called by both reqwest and rustls build paths after env selection. It delegates actual file reading and PEM parsing to `parse_certificates` and owns the high-level success/failure logging for that phase.
+**Call relations**: HTTP and websocket builders call this when they need actual certificates to add to their trust stores. It wraps ConfiguredCaBundle::parse_certificates with consistent logging.
 
 *Call graph*: calls 1 internal fn (parse_certificates); 2 external calls (info!, warn!).
 
@@ -875,11 +895,11 @@ fn parse_certificates(
     ) -> Result<Vec<CertificateDer<'static>>, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Reads the selected PEM bundle, normalizes supported variants, extracts certificate sections, ignores CRLs, and returns all usable certificate DER blobs.
+**Purpose**: Reads and interprets the selected PEM file, accepting the certificate formats Codex expects to see in real deployments. It extracts certificate blocks while ignoring supported non-certificate sections such as CRLs.
 
-**Data flow**: It first calls `read_pem_data` to get raw bytes, then constructs a `NormalizedPem` with `from_pem_data`. It iterates `normalized_pem.sections()`, converting parser errors through `pem_parse_error`. For `SectionKind::Certificate`, it obtains the certificate bytes via `normalized_pem.certificate_der`, errors if trimming fails, and pushes owned `CertificateDer` values into a vector. For the first `SectionKind::Crl`, it logs that CRLs are being ignored; all other section kinds are skipped. If no certificates were collected, it returns a `NoItemsFound`-based invalid-file error; otherwise it returns the vector.
+**Data flow**: It reads the file bytes, normalizes the PEM text, walks through each recognized PEM section, keeps certificate sections, trims OpenSSL TRUSTED CERTIFICATE sections when needed, and ignores well-formed CRL sections. It returns certificate DER bytes, or an invalid-file error if parsing fails or no certificates are found.
 
-**Call relations**: This is the core PEM-processing routine behind `load_certificates`. It delegates raw file I/O to `read_pem_data`, PEM normalization to `NormalizedPem::from_pem_data`, and parse-error shaping to `pem_parse_error`.
+**Call relations**: ConfiguredCaBundle::load_certificates calls this as the actual parser. It uses read_pem_data for disk access, NormalizedPem::from_pem_data and related methods for PEM compatibility, and pem_parse_error or invalid_ca_file to shape user-facing errors.
 
 *Call graph*: calls 3 internal fn (pem_parse_error, read_pem_data, from_pem_data); called by 1 (load_certificates); 3 external calls (from, new, info!).
 
@@ -890,11 +910,11 @@ fn parse_certificates(
 fn read_pem_data(&self) -> Result<Vec<u8>, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Reads the configured CA bundle file from disk and preserves the original filesystem error in a structured transport error.
+**Purpose**: Reads the selected CA bundle file from disk. It keeps the original filesystem error kind so callers can tell, for example, a missing file from another read problem.
 
-**Data flow**: It uses `fs::read(&self.path)` to load the file bytes. On success it returns the `Vec<u8>`; on failure it constructs `BuildCustomCaTransportError::ReadCaFile` containing the source env name, cloned path, and original `io::Error`.
+**Data flow**: It starts with the configured path, tries to read all bytes from that file, and returns those bytes on success. If reading fails, it returns a ReadCaFile error that includes the source environment variable, path, and original I/O error.
 
-**Call relations**: Called only by `parse_certificates` as the first step of bundle loading, separating filesystem failure handling from PEM parsing logic.
+**Call relations**: ConfiguredCaBundle::parse_certificates calls this before any PEM parsing can happen. Later layers use the error it creates to report exactly which configured file could not be read.
 
 *Call graph*: called by 1 (parse_certificates); 1 external calls (read).
 
@@ -905,11 +925,11 @@ fn read_pem_data(&self) -> Result<Vec<u8>, BuildCustomCaTransportError>
 fn pem_parse_error(&self, error: &pem::Error) -> BuildCustomCaTransportError
 ```
 
-**Purpose**: Transforms a low-level PEM parser error into a user-facing invalid-CA error message tied to the selected bundle.
+**Purpose**: Turns a low-level PEM parser error into a clearer configuration error for users. It gives a friendlier message when no certificate blocks are found.
 
-**Data flow**: It takes a `pem::Error`, maps `NoItemsFound` to the friendlier detail `no certificates found in PEM file`, formats all other parser errors into `failed to parse PEM file: ...`, and passes that detail into `invalid_ca_file` to produce a `BuildCustomCaTransportError`.
+**Data flow**: It receives a PEM parsing error. If the parser found no items, it converts that into 'no certificates found in PEM file'; otherwise it includes the parser's message. It then returns an InvalidCaFile error tied to this bundle.
 
-**Call relations**: Used by `parse_certificates` whenever section iteration fails or no certificates are found, so all parse-time failures share consistent wording and remediation hints.
+**Call relations**: ConfiguredCaBundle::parse_certificates calls this when section parsing fails or when the file contains no certificates. It hands off to invalid_ca_file so path and environment details are formatted consistently.
 
 *Call graph*: calls 1 internal fn (invalid_ca_file); called by 1 (parse_certificates); 1 external calls (format!).
 
@@ -920,11 +940,11 @@ fn pem_parse_error(&self, error: &pem::Error) -> BuildCustomCaTransportError
 fn invalid_ca_file(&self, detail: impl std::fmt::Display) -> BuildCustomCaTransportError
 ```
 
-**Purpose**: Constructs the `InvalidCaFile` error variant for this bundle with a supplied detail string.
+**Purpose**: Creates the standard error used when a configured CA file can be read but is not usable. This keeps all invalid-file messages tied to the selected environment variable and path.
 
-**Data flow**: It reads `self.source_env`, clones `self.path`, converts the provided displayable detail into a `String`, and returns `BuildCustomCaTransportError::InvalidCaFile`.
+**Data flow**: It receives a human-readable detail message, combines it with this bundle's source environment variable and path, and returns an InvalidCaFile error. It does not read or parse anything itself.
 
-**Call relations**: This helper is the common sink for parse-related failures, called by `pem_parse_error` and by `parse_certificates` when trusted-certificate DER trimming fails.
+**Call relations**: ConfiguredCaBundle::pem_parse_error and some parser branches in ConfiguredCaBundle::parse_certificates use this helper whenever they need to report malformed or unusable CA data.
 
 *Call graph*: called by 1 (pem_parse_error); 2 external calls (to_string, clone).
 
@@ -935,11 +955,11 @@ fn invalid_ca_file(&self, detail: impl std::fmt::Display) -> BuildCustomCaTransp
 fn from_pem_data(source_env: &'static str, path: &Path, pem_data: &[u8]) -> Self
 ```
 
-**Purpose**: Normalizes raw PEM text into either standard form or a rewritten form that treats OpenSSL `TRUSTED CERTIFICATE` blocks as ordinary certificate blocks.
+**Purpose**: Converts raw PEM file bytes into text shaped for the parser this module uses. In particular, it rewrites OpenSSL TRUSTED CERTIFICATE labels into ordinary CERTIFICATE labels while remembering that trimming may be needed later.
 
-**Data flow**: It takes the source env name, bundle path, and raw PEM bytes, decodes them lossily to text, checks whether the text contains `TRUSTED CERTIFICATE`, and if so logs that normalization is happening and replaces the begin/end labels with standard `CERTIFICATE` labels. It returns either `NormalizedPem::TrustedCertificate` with rewritten contents or `NormalizedPem::Standard` with the original text.
+**Data flow**: It receives the source environment name, file path, and raw file bytes. It decodes the bytes as text, looks for TRUSTED CERTIFICATE labels, optionally replaces those labels, logs that normalization happened, and returns either a Standard or TrustedCertificate normalized PEM value.
 
-**Call relations**: Called by `ConfiguredCaBundle::parse_certificates` before section iteration. It prepares the PEM text so `rustls_pki_types` mixed-section parsing can see trusted-certificate blocks as certificate sections.
+**Call relations**: ConfiguredCaBundle::parse_certificates calls this after reading the file. The returned NormalizedPem later supplies sections and decides whether certificate DER bytes must be trimmed.
 
 *Call graph*: called by 1 (parse_certificates); 4 external calls (Standard, TrustedCertificate, from_utf8_lossy, info!).
 
@@ -950,11 +970,11 @@ fn from_pem_data(source_env: &'static str, path: &Path, pem_data: &[u8]) -> Self
 fn contents(&self) -> &str
 ```
 
-**Purpose**: Returns the normalized PEM text regardless of whether it originated from standard or trusted-certificate input.
+**Purpose**: Returns the normalized PEM text regardless of which variant produced it. This lets later code read the contents without caring whether labels were rewritten.
 
-**Data flow**: It matches on `self` and returns a shared `&str` reference to the stored string contents.
+**Data flow**: It receives a NormalizedPem value by reference and returns a string slice pointing at its stored text. Nothing is copied or changed.
 
-**Call relations**: This small accessor is used by `NormalizedPem::sections` to feed the parser without exposing enum internals to callers.
+**Call relations**: NormalizedPem::sections calls this before passing the text to the PEM section iterator. It is a small helper that hides the Standard-versus-TrustedCertificate distinction for plain text access.
 
 *Call graph*: called by 1 (sections).
 
@@ -965,11 +985,11 @@ fn contents(&self) -> &str
 fn sections(&self) -> impl Iterator<Item = Result<PemSection, pem::Error>> + '_
 ```
 
-**Purpose**: Creates an iterator over parsed PEM sections from the normalized PEM contents.
+**Purpose**: Provides an iterator over the recognized PEM sections in the normalized text. A PEM section is one BEGIN/END block, such as a certificate or a certificate revocation list.
 
-**Data flow**: It reads the normalized text via `contents()`, converts it to bytes, and returns the iterator produced by `PemSection::pem_slice_iter`, yielding `Result<(SectionKind, Vec<u8>), pem::Error>` items.
+**Data flow**: It takes the normalized text, converts it to bytes, and asks the PEM parser to produce section results one by one. Each item is either a section kind with decoded bytes or a parsing error.
 
-**Call relations**: Called by `ConfiguredCaBundle::parse_certificates` to walk mixed PEM content one section at a time.
+**Call relations**: ConfiguredCaBundle::parse_certificates uses this iterator to walk through the bundle. It relies on NormalizedPem::contents to get the actual text.
 
 *Call graph*: calls 1 internal fn (contents); 1 external calls (pem_slice_iter).
 
@@ -980,11 +1000,11 @@ fn sections(&self) -> impl Iterator<Item = Result<PemSection, pem::Error>> + '_
 fn certificate_der(&self, der: &'a [u8]) -> Option<&'a [u8]>
 ```
 
-**Purpose**: Returns the certificate DER bytes for a parsed certificate section, trimming trailing OpenSSL auxiliary metadata when necessary.
+**Purpose**: Returns the certificate bytes that should be registered as a trusted root. For ordinary certificates it keeps the bytes as-is; for OpenSSL trusted certificates it removes trailing OpenSSL-only metadata.
 
-**Data flow**: It takes a borrowed DER byte slice from a parsed PEM section. For `Standard` PEM it returns the slice unchanged; for `TrustedCertificate` PEM it calls `first_der_item` to locate and return only the first top-level DER object. The result is `Option<&[u8]>` so malformed trusted-certificate data can be rejected.
+**Data flow**: It receives decoded bytes from one certificate PEM section. If the PEM was standard, it returns the whole byte slice. If the PEM came from TRUSTED CERTIFICATE labels, it asks first_der_item to find the first DER object and returns only that prefix, or None if the boundary cannot be found.
 
-**Call relations**: Used by `ConfiguredCaBundle::parse_certificates` when converting parsed certificate sections into `CertificateDer` values.
+**Call relations**: ConfiguredCaBundle::parse_certificates calls this for each certificate section before storing it. It delegates the low-level DER boundary calculation to first_der_item.
 
 *Call graph*: calls 1 internal fn (first_der_item).
 
@@ -995,11 +1015,11 @@ fn certificate_der(&self, der: &'a [u8]) -> Option<&'a [u8]>
 fn first_der_item(der: &[u8]) -> Option<&[u8]>
 ```
 
-**Purpose**: Slices out the first top-level DER object from a byte buffer, ignoring any trailing bytes such as OpenSSL `X509_AUX` metadata.
+**Purpose**: Finds the first complete DER-encoded object inside a byte slice. This is used to cut a certificate away from any trailing OpenSSL trust metadata.
 
-**Data flow**: It takes a DER byte slice, calls `der_item_length` to compute the first object's total length, and if successful returns a subslice covering exactly that prefix. If the length cannot be determined, it returns `None`.
+**Data flow**: It receives bytes that should start with a DER object. It asks der_item_length for the length of that first object and, if successful, returns a slice covering only those bytes.
 
-**Call relations**: This helper is called by `NormalizedPem::certificate_der` only for trusted-certificate inputs that may contain appended metadata.
+**Call relations**: NormalizedPem::certificate_der calls this only for OpenSSL TRUSTED CERTIFICATE input. It does not validate the certificate itself; it only finds the safe slice boundary before reqwest or rustls does real certificate parsing.
 
 *Call graph*: calls 1 internal fn (der_item_length); called by 1 (certificate_der).
 
@@ -1010,11 +1030,11 @@ fn first_der_item(der: &[u8]) -> Option<&[u8]>
 fn der_item_length(der: &[u8]) -> Option<usize>
 ```
 
-**Purpose**: Parses the outer DER length encoding of the first ASN.1 item and returns the total byte length of that item.
+**Purpose**: Calculates how many bytes the first DER object occupies. DER is a binary format where the first bytes say how long the object is.
 
-**Data flow**: It reads the second byte of the input as the DER length octet. For short-form lengths it computes `2 + length`; for long-form lengths it reads the declared number of subsequent length bytes, accumulates them into a `usize` content length with checked arithmetic, and returns `length_end + content_length`. It rejects indefinite lengths, arithmetic overflow, missing bytes, and any declared length beyond the input slice by returning `None`.
+**Data flow**: It receives a byte slice, reads the DER length field in either short or long form, checks for invalid or overflowing lengths, and returns the total object size if it fits inside the input. Malformed or incomplete input returns None.
 
-**Call relations**: Called only by `first_der_item`. It intentionally performs just enough DER parsing to find a safe boundary for the leading certificate object.
+**Call relations**: first_der_item depends on this to safely trim OpenSSL TRUSTED CERTIFICATE data. No higher-level client-building code calls it directly.
 
 *Call graph*: called by 1 (first_der_item); 1 external calls (from).
 
@@ -1025,11 +1045,11 @@ fn der_item_length(der: &[u8]) -> Option<usize>
 fn var(&self, key: &str) -> Option<String>
 ```
 
-**Purpose**: Implements the `EnvSource` trait for the test-only in-memory environment map.
+**Purpose**: Provides environment-variable values from an in-memory map for tests. This lets tests check precedence rules without touching the real process environment.
 
-**Data flow**: It takes a key string, looks it up in the `values` `HashMap`, clones the stored string if present, and returns `Option<String>`.
+**Data flow**: It receives a variable name, looks it up in the map, and returns a cloned string if present. Missing keys return None.
 
-**Call relations**: This method lets unit tests drive `configured_ca_bundle` and rustls-config logic deterministically without mutating the real process environment.
+**Call relations**: Test helpers and test cases use MapEnv wherever production code would use ProcessEnv. This feeds fake values into EnvSource::configured_ca_bundle and the rustls config builder.
 
 
 ##### `tests::map_env`  (lines 716–723)
@@ -1038,11 +1058,11 @@ fn var(&self, key: &str) -> Option<String>
 fn map_env(pairs: &[(&str, &str)]) -> MapEnv
 ```
 
-**Purpose**: Builds a `MapEnv` test environment from a slice of key/value pairs.
+**Purpose**: Builds a fake test environment from a small list of key-value pairs. It keeps test setup short and easy to read.
 
-**Data flow**: It takes a slice of `(&str, &str)` pairs, converts each key and value into owned `String`s, collects them into a `HashMap`, wraps that map in `MapEnv`, and returns it.
+**Data flow**: It receives a slice of string pairs, copies them into a HashMap, and returns a MapEnv containing that map.
 
-**Call relations**: Used by the unit tests to create concise fake environments for precedence and empty-value scenarios.
+**Call relations**: The environment-selection tests and rustls-config tests call this before invoking the same EnvSource methods used by production logic.
 
 
 ##### `tests::write_cert_file`  (lines 725–731)
@@ -1051,11 +1071,11 @@ fn map_env(pairs: &[(&str, &str)]) -> MapEnv
 fn write_cert_file(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf
 ```
 
-**Purpose**: Writes a certificate fixture file into a temporary directory and returns its path for tests.
+**Purpose**: Writes certificate fixture text into a temporary file for tests. This gives tests a real path to pass through the normal file-reading code.
 
-**Data flow**: It takes a `TempDir`, filename, and file contents string, joins the filename onto the temp directory path, writes the contents with `fs::write`, panics with a descriptive message if writing fails, and returns the resulting `PathBuf`.
+**Data flow**: It receives a temporary directory, a file name, and file contents. It writes the contents to that file, panics with a helpful message if writing fails, and returns the file path.
 
-**Call relations**: This helper is used by rustls-related tests to materialize PEM fixtures on disk before invoking the bundle-loading code.
+**Call relations**: The rustls tests call this to create valid or invalid CA bundle files. Those paths are then placed into a fake environment made by tests::map_env.
 
 *Call graph*: 2 external calls (path, write).
 
@@ -1066,11 +1086,11 @@ fn write_cert_file(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf
 fn ca_path_prefers_codex_env()
 ```
 
-**Purpose**: Verifies that `CODEX_CA_CERTIFICATE` wins over `SSL_CERT_FILE` when both are set.
+**Purpose**: Checks that CODEX_CA_CERTIFICATE takes priority over SSL_CERT_FILE. This protects the Codex-specific override behavior.
 
-**Data flow**: The test constructs a `MapEnv` containing both variables, calls `configured_ca_bundle`, maps the result to its path, and asserts that the chosen path is the Codex-specific one.
+**Data flow**: It builds a fake environment containing both variables, asks for the configured bundle, and asserts that the chosen path is the CODEX_CA_CERTIFICATE path.
 
-**Call relations**: This test exercises the precedence logic implemented in `EnvSource::configured_ca_bundle`.
+**Call relations**: This test exercises EnvSource::configured_ca_bundle through MapEnv. It focuses only on selection logic, not file parsing or client construction.
 
 *Call graph*: 2 external calls (assert_eq!, map_env).
 
@@ -1081,11 +1101,11 @@ fn ca_path_prefers_codex_env()
 fn ca_path_falls_back_to_ssl_cert_file()
 ```
 
-**Purpose**: Checks that `SSL_CERT_FILE` is selected when the Codex-specific variable is absent.
+**Purpose**: Checks that SSL_CERT_FILE is used when the Codex-specific variable is absent. This supports common TLS tooling conventions without requiring a Codex-only setting.
 
-**Data flow**: It creates a `MapEnv` with only `SSL_CERT_FILE`, calls `configured_ca_bundle`, extracts the path, and asserts that the fallback path is returned.
+**Data flow**: It builds a fake environment with only SSL_CERT_FILE, asks for the configured bundle, and asserts that the SSL_CERT_FILE path is selected.
 
-**Call relations**: This test covers the fallback branch of the environment-selection logic.
+**Call relations**: This test uses tests::map_env and the EnvSource selection logic. It verifies the fallback branch that HTTP and websocket builders rely on.
 
 *Call graph*: 2 external calls (assert_eq!, map_env).
 
@@ -1096,11 +1116,11 @@ fn ca_path_falls_back_to_ssl_cert_file()
 fn ca_path_ignores_empty_values()
 ```
 
-**Purpose**: Ensures that empty environment-variable values are treated as unset rather than as selected paths.
+**Purpose**: Checks that an empty CODEX_CA_CERTIFICATE does not block the SSL_CERT_FILE fallback. This prevents empty environment variables from being treated as real paths.
 
-**Data flow**: It builds a `MapEnv` where `CODEX_CA_CERTIFICATE` is the empty string and `SSL_CERT_FILE` has a real path, calls `configured_ca_bundle`, and asserts that the fallback path is chosen.
+**Data flow**: It creates a fake environment where CODEX_CA_CERTIFICATE is an empty string and SSL_CERT_FILE has a real-looking path. It asks for the configured bundle and asserts that the fallback path is chosen.
 
-**Call relations**: This test specifically validates the `non_empty_path` helper used by the precedence logic.
+**Call relations**: This test covers EnvSource::non_empty_path as used by EnvSource::configured_ca_bundle. It protects the empty-string rule used by both production client builders.
 
 *Call graph*: 2 external calls (assert_eq!, map_env).
 
@@ -1111,11 +1131,11 @@ fn ca_path_ignores_empty_values()
 fn rustls_config_uses_custom_ca_bundle_when_configured()
 ```
 
-**Purpose**: Verifies that the rustls builder path returns a concrete client config when pointed at a valid CA PEM file.
+**Purpose**: Checks that the websocket TLS configuration path actually builds a config when a valid custom CA bundle is provided. This confirms more than just environment selection: it also exercises file loading and certificate registration.
 
-**Data flow**: It creates a temporary directory, writes the test CA fixture to `ca.pem`, builds a `MapEnv` pointing `CODEX_CA_CERTIFICATE` at that file, calls `maybe_build_rustls_client_config_with_env`, unwraps the `Some(config)` result, and asserts that SNI is enabled on the returned config.
+**Data flow**: It creates a temporary CA file from a test certificate, puts that path in a fake CODEX_CA_CERTIFICATE environment, calls the rustls config builder, and asserts that a config is returned with expected normal TLS behavior enabled.
 
-**Call relations**: This test exercises the successful path through env selection, PEM loading, native-root layering, and rustls config construction.
+**Call relations**: This test calls maybe_build_rustls_client_config_with_env directly with MapEnv. That drives the same parsing and rustls root-store setup used by the production websocket helper.
 
 *Call graph*: calls 1 internal fn (maybe_build_rustls_client_config_with_env); 4 external calls (new, assert!, map_env, write_cert_file).
 
@@ -1126,22 +1146,24 @@ fn rustls_config_uses_custom_ca_bundle_when_configured()
 fn rustls_config_reports_invalid_ca_file()
 ```
 
-**Purpose**: Checks that an empty PEM file is reported as an `InvalidCaFile` error by the rustls builder path.
+**Purpose**: Checks that an invalid custom CA file produces the expected structured error. This protects the user-facing failure path for bad or empty CA bundles.
 
-**Data flow**: It creates a temporary directory, writes an empty `empty.pem`, points `CODEX_CA_CERTIFICATE` at that file via `MapEnv`, calls `maybe_build_rustls_client_config_with_env`, captures the error, and asserts it matches `BuildCustomCaTransportError::InvalidCaFile`.
+**Data flow**: It writes an empty PEM file, points fake CODEX_CA_CERTIFICATE at it, calls the rustls config builder, and asserts that the result is an InvalidCaFile error.
 
-**Call relations**: This test covers the parse-failure path from `ConfiguredCaBundle::parse_certificates` through `maybe_build_rustls_client_config_with_env`.
+**Call relations**: This test calls maybe_build_rustls_client_config_with_env and reaches ConfiguredCaBundle parsing through the normal flow. It verifies that malformed input fails early instead of silently producing a bad TLS configuration.
 
 *Call graph*: calls 1 internal fn (maybe_build_rustls_client_config_with_env); 4 external calls (new, assert!, map_env, write_cert_file).
 
 
 ### `codex-client/src/default_client.rs`
 
-`io_transport` · `request construction and outbound HTTP send`
+`io_transport` · `request handling`
 
-This file defines a thin HTTP client façade over `reqwest` with two concrete types: `CodexHttpClient`, which owns a cloneable `reqwest::Client`, and `CodexRequestBuilder`, which preserves the original HTTP `Method` and URL string alongside the underlying `reqwest::RequestBuilder`. The wrapper exists mainly to centralize cross-cutting behavior at send time. Builder-style methods such as `headers`, `header`, `bearer_auth`, `timeout`, `json`, and `body` all route through a private `map` helper so they transform only the inner builder while preserving the stored method/URL metadata for later logging.
+This file is a small but important layer around reqwest, the Rust library used here for making HTTP requests. Its job is to make outgoing web calls behave consistently across the project. Instead of every caller remembering how to add tracing information or log request results, they use CodexHttpClient and CodexRequestBuilder.
 
-The key behavior is in `CodexRequestBuilder::send`: before dispatching, it calls `trace_headers()` to collect the current tracing span’s OpenTelemetry propagation headers into an `http::HeaderMap`, merges those into the outgoing request, then awaits the reqwest send. Success and failure paths both emit `tracing::debug!` records with concrete request metadata; failures include any HTTP status embedded in the `reqwest::Error`. Trace propagation is implemented by `HeaderMapInjector`, an `opentelemetry::propagation::Injector` that inserts only headers whose names and values parse successfully, silently dropping malformed propagation entries rather than failing the request. The included test constructs a tracing subscriber with an OpenTelemetry layer and verifies that `trace_headers()` exports the current span context into W3C trace-context headers that can be extracted back unchanged.
+The main idea is simple: CodexHttpClient starts a request, and CodexRequestBuilder lets the caller add details such as headers, a bearer token, a timeout, JSON data, or a raw body. When send is finally called, the wrapper adds trace headers. These headers carry the identity of the current tracing span, which is like putting a tracking label on a package so another service can connect its logs back to this request. Then it sends the request and writes a debug log with the method, URL, status, and either response details or the error.
+
+The file also includes a tiny adapter, HeaderMapInjector, that lets OpenTelemetry, a standard tracing system, write trace values into an HTTP header map. A test checks that the trace headers really come from the current span, so distributed tracing does not silently break.
 
 #### Function details
 
@@ -1151,11 +1173,11 @@ The key behavior is in `CodexRequestBuilder::send`: before dispatching, it calls
 fn new(inner: reqwest::Client) -> Self
 ```
 
-**Purpose**: Constructs the Codex wrapper around an existing `reqwest::Client` without altering its configuration.
+**Purpose**: Creates a CodexHttpClient from an existing reqwest client. This lets the rest of the project use the shared wrapper while still relying on reqwest for the actual network work.
 
-**Data flow**: Takes a fully built `reqwest::Client` as `inner` and stores it in the `CodexHttpClient { inner }` struct. It returns the wrapper by value and does not perform I/O or mutate external state.
+**Data flow**: It receives a configured reqwest::Client as input. It stores that client inside a new CodexHttpClient. The result is a reusable HTTP client wrapper that can start requests.
 
-**Call relations**: This is the entry constructor used wherever higher-level code has already configured a reqwest client and wants Codex request behavior layered on top. Callers such as client creation paths and timeout-focused tests invoke it before using `get`, `post`, or `request`.
+**Call relations**: Other setup code creates the underlying reqwest client and then calls this function to wrap it. Later flows such as client creation and timeout-related tests depend on this wrapped client before any GET or POST request can be built.
 
 *Call graph*: called by 3 (new, create_client, revoke_request_times_out).
 
@@ -1166,11 +1188,11 @@ fn new(inner: reqwest::Client) -> Self
 fn get(&self, url: U) -> CodexRequestBuilder
 ```
 
-**Purpose**: Starts building a GET request using the wrapped reqwest client.
+**Purpose**: Starts building a GET request, which is normally used to fetch information from a URL. It gives callers a project-specific request builder instead of exposing raw reqwest behavior directly.
 
-**Data flow**: Accepts any `U: IntoUrl`, fixes the HTTP method to `Method::GET`, and forwards both to `self.request`. It returns a `CodexRequestBuilder` carrying the reqwest builder plus copied method/URL metadata.
+**Data flow**: It receives a URL-like value. It passes that URL and the GET method into CodexHttpClient::request. The output is a CodexRequestBuilder that can be further customized and then sent.
 
-**Call relations**: This is a convenience front-end for callers that need a GET without specifying the method explicitly. It delegates all actual builder creation to `CodexHttpClient::request`.
+**Call relations**: When code such as hydrate_personal_access_token needs to fetch data, it calls this method. This method immediately hands off to CodexHttpClient::request so all request setup follows the same path as other HTTP methods.
 
 *Call graph*: calls 1 internal fn (request); called by 1 (hydrate_personal_access_token).
 
@@ -1181,11 +1203,11 @@ fn get(&self, url: U) -> CodexRequestBuilder
 fn post(&self, url: U) -> CodexRequestBuilder
 ```
 
-**Purpose**: Starts building a POST request using the wrapped reqwest client.
+**Purpose**: Starts building a POST request, which is normally used to submit data or trigger an action on a server. It keeps POST requests on the same traced and logged path as other requests.
 
-**Data flow**: Accepts any `U: IntoUrl`, fixes the method to `Method::POST`, and forwards to `self.request`. The returned `CodexRequestBuilder` can then be enriched with headers, auth, body, timeout, and finally sent.
+**Data flow**: It receives a URL-like value. It combines that URL with the POST method by calling CodexHttpClient::request. The result is a CodexRequestBuilder ready for headers, authentication, body data, and sending.
 
-**Call relations**: Used by token refresh and revoke flows that issue POSTs. Like `get`, it is only a convenience shim over `CodexHttpClient::request`.
+**Call relations**: Token-related flows such as request_chatgpt_token_refresh and revoke_oauth_token call this when they need to send data to a server. Like get, it delegates to CodexHttpClient::request for the shared setup.
 
 *Call graph*: calls 1 internal fn (request); called by 2 (request_chatgpt_token_refresh, revoke_oauth_token).
 
@@ -1196,11 +1218,11 @@ fn post(&self, url: U) -> CodexRequestBuilder
 fn request(&self, method: Method, url: U) -> CodexRequestBuilder
 ```
 
-**Purpose**: Creates the underlying reqwest request builder and captures stable request metadata for later logging.
+**Purpose**: Creates the common request builder for any HTTP method. This is the shared doorway that records the method and URL so the eventual send can add trace headers and useful logs.
 
-**Data flow**: Consumes a `Method` and `IntoUrl` input, derives a string form with `url.as_str().to_string()`, clones the method for reqwest, calls `self.inner.request(method.clone(), url)`, and wraps the result with `CodexRequestBuilder::new`. It returns the new builder object.
+**Data flow**: It receives an HTTP method and a URL-like value. It asks the inner reqwest client to create a raw request builder, also saves a string copy of the URL and the method. It returns a CodexRequestBuilder containing both the raw builder and the extra information needed for logging.
 
-**Call relations**: This is the common construction path behind `get`, `post`, and transport-layer build logic. It delegates the final wrapper assembly to `CodexRequestBuilder::new` so all request starts share the same metadata capture.
+**Call relations**: CodexHttpClient::get and CodexHttpClient::post both call this, and other builder-style code can call it too. It hands the raw reqwest builder to CodexRequestBuilder::new, which packages it into the project’s wrapper.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (get, post, build); 3 external calls (clone, as_str, request).
 
@@ -1211,11 +1233,11 @@ fn request(&self, method: Method, url: U) -> CodexRequestBuilder
 fn new(builder: reqwest::RequestBuilder, method: Method, url: String) -> Self
 ```
 
-**Purpose**: Packages a `reqwest::RequestBuilder` together with the request method and URL string that Codex wants to log later.
+**Purpose**: Packages a raw reqwest request builder together with the request method and URL. The method and URL are kept so send can later write meaningful logs.
 
-**Data flow**: Takes the raw reqwest builder, a `Method`, and a `String` URL, stores them in the `CodexRequestBuilder` fields, and returns the struct. No network work occurs here.
+**Data flow**: It receives a reqwest::RequestBuilder, an HTTP method, and a URL string. It stores all three in a CodexRequestBuilder. Nothing is sent yet; the output is only a prepared request object.
 
-**Call relations**: Only `CodexHttpClient::request` calls this constructor, making it the single place where wrapped builders are instantiated.
+**Call relations**: CodexHttpClient::request calls this after reqwest has created the underlying request. From there, callers can chain builder methods such as header, json, timeout, or send.
 
 *Call graph*: called by 1 (request).
 
@@ -1226,11 +1248,11 @@ fn new(builder: reqwest::RequestBuilder, method: Method, url: String) -> Self
 fn map(self, f: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder) -> Self
 ```
 
-**Purpose**: Implements the immutable builder pattern for all request customization methods while preserving stored metadata.
+**Purpose**: Applies one change to the underlying reqwest request builder while preserving the saved method and URL. It is a small helper that keeps all the chainable builder methods consistent.
 
-**Data flow**: Consumes `self` and a closure from `reqwest::RequestBuilder` to `reqwest::RequestBuilder`, applies the closure to `self.builder`, and rebuilds `CodexRequestBuilder` with the transformed builder and the original `method` and `url`. It returns the updated wrapper.
+**Data flow**: It receives the current CodexRequestBuilder and a function that knows how to modify the inner reqwest builder. It runs that function, keeps the same method and URL, and returns a new CodexRequestBuilder with the changed inner builder.
 
-**Call relations**: All fluent modifier methods delegate here so they do not duplicate reconstruction logic. It is the internal backbone for `headers`, `header`, `bearer_auth`, `timeout`, `json`, and `body`.
+**Call relations**: The public builder methods headers, header, bearer_auth, timeout, json, and body all call this. It is the common hinge that lets each customization change only the request details it cares about.
 
 *Call graph*: called by 6 (bearer_auth, body, header, headers, json, timeout).
 
@@ -1241,11 +1263,11 @@ fn map(self, f: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder)
 fn headers(self, headers: HeaderMap) -> Self
 ```
 
-**Purpose**: Replaces or extends the outgoing request headers using an `http::HeaderMap`.
+**Purpose**: Adds a whole set of HTTP headers to the request. Headers are small name-value pieces of metadata, such as content type or authorization information.
 
-**Data flow**: Consumes `self` and a `HeaderMap`, passes them into `reqwest::RequestBuilder::headers` via `map`, and returns the updated `CodexRequestBuilder`.
+**Data flow**: It receives a HeaderMap containing several headers. It passes a change function into CodexRequestBuilder::map, which applies those headers to the inner reqwest builder. The result is a new request builder with those headers attached.
 
-**Call relations**: This is one of the fluent customization methods used by transport code after request preparation. It delegates the actual transformation to `CodexRequestBuilder::map`.
+**Call relations**: Callers use this while preparing a request before send. Internally it relies on map so it does not need to repeat the wrapping logic.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1256,11 +1278,11 @@ fn headers(self, headers: HeaderMap) -> Self
 fn header(self, key: K, value: V) -> Self
 ```
 
-**Purpose**: Adds a single header to the outgoing request with generic key/value conversion matching reqwest’s API.
+**Purpose**: Adds one HTTP header to the request. This is useful when the caller only needs to set a single piece of request metadata.
 
-**Data flow**: Consumes `self`, a header key `K`, and value `V`; relies on `TryFrom` conversions into `HeaderName` and `HeaderValue`; applies `reqwest::RequestBuilder::header` through `map`; and returns the updated wrapper. Conversion failures are deferred to reqwest’s builder error handling semantics.
+**Data flow**: It receives a header name and value in types that can be converted into valid HTTP header forms. It uses map to apply that single header to the inner reqwest builder. It returns a new builder with the header included.
 
-**Call relations**: Used when callers want to append one header rather than supply a whole map. Like the other modifiers, it is implemented entirely through `map`.
+**Call relations**: This is part of the chain used before send, alongside methods like bearer_auth and json. It delegates the actual builder transformation to CodexRequestBuilder::map.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1271,11 +1293,11 @@ fn header(self, key: K, value: V) -> Self
 fn bearer_auth(self, token: T) -> Self
 ```
 
-**Purpose**: Adds an `Authorization: Bearer ...` header using reqwest’s standard formatting.
+**Purpose**: Adds bearer token authentication to the request. A bearer token is like a temporary pass that the server checks to decide whether the request is allowed.
 
-**Data flow**: Consumes `self` and any `Display` token, applies `reqwest::RequestBuilder::bearer_auth` through `map`, and returns the updated builder wrapper.
+**Data flow**: It receives a token value that can be displayed as text. It uses map to tell reqwest to add the standard bearer authorization header. It returns a new builder carrying that authentication information.
 
-**Call relations**: This is a fluent convenience method for authenticated requests. It delegates to `map` so metadata survives unchanged.
+**Call relations**: Code that talks to protected APIs calls this before send. The method uses map so authentication is added without losing the stored method and URL used later for logging.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1286,11 +1308,11 @@ fn bearer_auth(self, token: T) -> Self
 fn timeout(self, timeout: Duration) -> Self
 ```
 
-**Purpose**: Sets a per-request timeout on the underlying reqwest builder.
+**Purpose**: Sets how long the request is allowed to wait before giving up. This prevents a stuck network call from hanging forever.
 
-**Data flow**: Consumes `self` and a `Duration`, applies `reqwest::RequestBuilder::timeout` via `map`, and returns the updated wrapper.
+**Data flow**: It receives a Duration, meaning an amount of time. It uses map to apply that timeout to the inner reqwest request builder. The output is a request builder that will fail if the request takes too long.
 
-**Call relations**: Transport code uses this when a `Request` carries a timeout. The method itself only delegates through `map`.
+**Call relations**: Callers add this before send when a request needs its own time limit. It relies on CodexRequestBuilder::map for the shared builder update pattern.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1301,11 +1323,11 @@ fn timeout(self, timeout: Duration) -> Self
 fn json(self, value: &T) -> Self
 ```
 
-**Purpose**: Serializes a value as JSON and configures the request body using reqwest’s JSON helper.
+**Purpose**: Sets the request body to JSON data. JSON is a common text format used to send structured data such as objects and lists to web APIs.
 
-**Data flow**: Consumes `self` and a borrowed serializable value `&T`, passes it to `reqwest::RequestBuilder::json` through `map`, and returns the updated wrapper. Serialization is handled later by reqwest.
+**Data flow**: It receives a reference to a value that can be serialized, meaning turned into a transferable format. It uses map to ask reqwest to encode that value as JSON in the request body. The returned builder is ready to send that JSON payload.
 
-**Call relations**: Available to callers building requests directly through this wrapper. It shares the common `map` path with the other builder modifiers.
+**Call relations**: Callers use this before send when posting structured data. It hands the actual request modification to map, keeping this wrapper’s behavior consistent with other builder methods.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1316,11 +1338,11 @@ fn json(self, value: &T) -> Self
 fn body(self, body: B) -> Self
 ```
 
-**Purpose**: Sets an arbitrary request body on the underlying reqwest builder.
+**Purpose**: Sets the request body directly. This is used when the caller already has the exact bytes or body format to send.
 
-**Data flow**: Consumes `self` and any `B: Into<reqwest::Body>`, converts through reqwest’s builder API inside `map`, and returns the updated wrapper.
+**Data flow**: It receives something that can become a reqwest body. It uses map to attach that body to the inner request builder. It returns a new builder containing the raw body data.
 
-**Call relations**: Used by transport code after body preparation has produced exact bytes. It delegates to `map` to preserve method/URL metadata.
+**Call relations**: This is another pre-send customization method. Like json, header, and timeout, it uses CodexRequestBuilder::map so the request’s saved method and URL are preserved.
 
 *Call graph*: calls 1 internal fn (map).
 
@@ -1331,11 +1353,11 @@ fn body(self, body: B) -> Self
 async fn send(self) -> Result<Response, reqwest::Error>
 ```
 
-**Purpose**: Injects trace propagation headers, sends the HTTP request, and logs either the completed response metadata or the failure details.
+**Purpose**: Sends the prepared HTTP request. Just before sending, it adds tracing headers, then logs either the successful response details or the failure details.
 
-**Data flow**: Consumes the builder wrapper, calls `trace_headers()` to build a propagation `HeaderMap`, applies those headers to the underlying reqwest builder, and awaits `.send()`. On success it reads response status, headers, and HTTP version for a debug log and returns `Ok(Response)`; on error it extracts any embedded status for logging and returns `Err(reqwest::Error)` unchanged.
+**Data flow**: It receives the completed builder. It calls trace_headers to create headers from the current tracing span, attaches those headers to the request, and awaits the network response. On success it returns the response and writes a debug log with status and response metadata. On failure it returns the reqwest error and writes a debug log with the error and any available status code.
 
-**Call relations**: This is the terminal operation for all requests built through this file. Higher-level transport methods call it after configuring timeout, headers, and body; internally it depends on `trace_headers` for tracing context injection.
+**Call relations**: This is the final step after callers build a request with get, post, and optional customization methods. It calls trace_headers so downstream services can connect this request to the current trace, then relies on reqwest to perform the actual network send.
 
 *Call graph*: calls 1 internal fn (trace_headers); 2 external calls (headers, debug!).
 
@@ -1346,11 +1368,11 @@ async fn send(self) -> Result<Response, reqwest::Error>
 fn set(&mut self, key: &str, value: String)
 ```
 
-**Purpose**: Implements OpenTelemetry header injection into an `http::HeaderMap`, inserting only syntactically valid header names and values.
+**Purpose**: Lets OpenTelemetry write one tracing value into an HTTP header map. It translates plain text key-value tracing data into valid HTTP header names and values.
 
-**Data flow**: Receives a propagation key `&str` and value `String`, attempts `HeaderName::from_bytes` and `HeaderValue::from_str`, and if both succeed inserts the pair into the wrapped mutable `HeaderMap`. Invalid names or values are ignored with no error return.
+**Data flow**: It receives a header key and value from the tracing system. It tries to convert the key into a HeaderName and the value into a HeaderValue. If both conversions are valid, it inserts them into the HeaderMap; if either is invalid, it skips that entry.
 
-**Call relations**: This method is invoked by the OpenTelemetry propagator during `trace_headers()`. Its permissive behavior prevents malformed propagation data from aborting request creation.
+**Call relations**: trace_headers gives this injector to the OpenTelemetry propagator. The propagator calls set for each trace header it wants to add, and this adapter makes those values fit the HTTP header storage type.
 
 *Call graph*: 2 external calls (from_bytes, from_str).
 
@@ -1361,11 +1383,11 @@ fn set(&mut self, key: &str, value: String)
 fn trace_headers() -> HeaderMap
 ```
 
-**Purpose**: Extracts the current tracing span’s OpenTelemetry context into an HTTP header map suitable for outbound propagation.
+**Purpose**: Builds the HTTP headers needed to carry the current trace context to another service. This is what lets logs and traces from separate services be connected into one request story.
 
-**Data flow**: Creates an empty `HeaderMap`, asks `opentelemetry::global::get_text_map_propagator` for the active propagator, and calls `inject_context` with `Span::current().context()` and a `HeaderMapInjector` over the map. It returns the populated header map.
+**Data flow**: It starts with an empty HeaderMap. It asks the global OpenTelemetry text-map propagator to inject the current tracing span’s context into that map through HeaderMapInjector. It returns the filled HeaderMap, which may contain headers such as trace identifiers.
 
-**Call relations**: Called immediately before sending requests so propagation reflects the current span at send time, not builder creation time. The unit test also calls it directly to verify context export behavior.
+**Call relations**: CodexRequestBuilder::send calls this immediately before sending a request. The test inject_trace_headers_uses_current_span_context also calls it to prove it uses the currently active span.
 
 *Call graph*: called by 2 (send, inject_trace_headers_uses_current_span_context); 2 external calls (new, get_text_map_propagator).
 
@@ -1376,11 +1398,11 @@ fn trace_headers() -> HeaderMap
 fn inject_trace_headers_uses_current_span_context()
 ```
 
-**Purpose**: Verifies that `trace_headers()` exports the currently entered tracing span’s trace and span IDs into standard trace-context headers.
+**Purpose**: Checks that trace_headers uses the active tracing span, not some unrelated or empty context. This protects distributed tracing from silently losing the link between caller and callee.
 
-**Data flow**: Installs a `TraceContextPropagator`, builds an OpenTelemetry-backed tracing subscriber, enters a `trace_span!`, captures that span’s context, calls `trace_headers()`, extracts a context back out of the produced headers via `HeaderMapExtractor`, and asserts the extracted context is valid and matches the original trace ID and span ID.
+**Data flow**: The test installs a trace-context propagator, creates a tracer and tracing subscriber, enters a span, and records that span’s trace identifiers. It then calls trace_headers, extracts the trace information back out of the headers, and compares it with the original span. The test passes only if the extracted trace ID and span ID match the active span.
 
-**Call relations**: This test exercises the full propagation path in-process: tracing span → `trace_headers` → header map → propagator extraction. It exists to guard the integration between tracing, OpenTelemetry, and the custom injector.
+**Call relations**: This test drives trace_headers in a controlled tracing setup. It uses HeaderMapExtractor to read the produced headers back in the format expected by OpenTelemetry, then uses assertions to verify the round trip.
 
 *Call graph*: calls 1 internal fn (trace_headers); 8 external calls (builder, new, assert!, assert_eq!, set_text_map_propagator, trace_span!, layer, registry).
 
@@ -1391,11 +1413,11 @@ fn inject_trace_headers_uses_current_span_context()
 fn get(&self, key: &str) -> Option<&str>
 ```
 
-**Purpose**: Provides OpenTelemetry extraction access to a single header value from an `http::HeaderMap` during tests.
+**Purpose**: Reads one header value from a HeaderMap for the test tracing extractor. It gives OpenTelemetry a simple way to look up a header by name.
 
-**Data flow**: Takes a header key `&str`, looks it up in the wrapped `HeaderMap`, attempts UTF-8 conversion with `to_str`, and returns `Option<&str>`.
+**Data flow**: It receives a header key as text. It looks up that key in the stored HeaderMap and tries to view the value as valid text. It returns the text value if present and readable, or nothing if the header is missing or not valid text.
 
-**Call relations**: The test propagator calls this while reconstructing a context from the headers produced by `trace_headers()`.
+**Call relations**: The test’s OpenTelemetry propagator calls this while extracting trace information from the headers made by trace_headers. It is the read-side partner to HeaderMapInjector::set.
 
 
 ##### `tests::HeaderMapExtractor::keys`  (lines 214–216)
@@ -1404,20 +1426,22 @@ fn get(&self, key: &str) -> Option<&str>
 fn keys(&self) -> Vec<&str>
 ```
 
-**Purpose**: Enumerates all header names in the wrapped map for OpenTelemetry extraction during tests.
+**Purpose**: Lists all header names in the test HeaderMap. This lets the OpenTelemetry extractor discover which tracing headers are available.
 
-**Data flow**: Iterates over `self.0.keys()`, converts each `HeaderName` to `&str` with `HeaderName::as_str`, collects them into a `Vec<&str>`, and returns it.
+**Data flow**: It reads the keys from the stored HeaderMap, converts each header name to text, and collects them into a list. The result is a list of header names for the extractor to inspect.
 
-**Call relations**: Used by the propagator in the trace-header test so it can inspect all available header keys during extraction.
+**Call relations**: The trace extraction code in the test can call this when it needs to know what headers exist. Together with tests::HeaderMapExtractor::get, it lets the test verify the headers produced by trace_headers.
 
 
 ### `login/src/auth/default_client.rs`
 
-`io_transport` · `startup and outbound HTTP request setup`
+`io_transport` · `cross-cutting network client setup`
 
-This file centralizes the default outbound HTTP identity for Codex requests. It defines process-global state for two pieces of metadata: an optional `Originator` override cached in `ORIGINATOR`, and an optional residency requirement cached in `REQUIREMENTS_RESIDENCY`. `USER_AGENT_SUFFIX` is a separate global used to append a parenthesized suffix to the generated user agent, primarily for MCP clients. The `Originator` struct stores both the raw string and a prevalidated `HeaderValue`, avoiding repeated parsing when headers are built.
+This file is the shared “front desk badge maker” for Codex network traffic. Before Codex sends HTTP requests, those requests need consistent labels: who is sending them, what app version and operating system they came from, and sometimes whether requests must stay in a required region such as the US. Without this file, different parts of Codex could send inconsistent or missing headers, which would make traffic harder to route, debug, authorize, or audit.
 
-The main flow is: compute an originator value from an environment override, an explicitly set default, or `DEFAULT_ORIGINATOR`; derive a Codex user agent string from package version, OS info, architecture, terminal-detection user agent, and optional suffix; sanitize that string if invalid header characters appear; then assemble a `HeaderMap` containing `originator`, `User-Agent`, and optionally `x-openai-internal-codex-residency`. Client construction uses those headers, disables proxies when `CODEX_SANDBOX=seatbelt`, installs the ChatGPT Cloudflare cookie store, and attempts to layer in custom CA certificates from shared `codex_client` helpers. A key design choice is compatibility: `build_reqwest_client` never fails outwardly. Structured CA-loading errors are available through `try_build_reqwest_client`, but the legacy path logs warnings and falls back first to a simpler builder and finally to `reqwest::Client::new()`.
+The central idea is an originator: a short name for the Codex client, such as the CLI or another first-party client. The file stores a process-wide default originator and lets startup code set it once. It also builds a User-Agent header, which is a standard HTTP label describing the software making the request. The code adds version, operating system, architecture, terminal information, and an optional suffix. Because HTTP headers cannot contain arbitrary characters, the user agent is checked and cleaned before use.
+
+Finally, the file creates reqwest clients, where reqwest is the Rust HTTP library used here. It adds default headers, optional custom certificate authority support, a Cloudflare cookie store for ChatGPT traffic, and disables proxies in a specific sandbox mode. Higher-level Codex code can ask for either a raw reqwest client or a wrapped CodexHttpClient and get consistent behavior everywhere.
 
 #### Function details
 
@@ -1427,11 +1451,11 @@ The main flow is: compute an originator value from an environment override, an e
 fn get_originator_value(provided: Option<String>) -> Originator
 ```
 
-**Purpose**: Computes the effective originator string and converts it into a reusable header-safe representation. It also hardens the result by falling back to the default originator if header parsing fails.
+**Purpose**: Chooses the originator string that will identify this Codex process in HTTP headers. It prefers an internal environment-variable override, then a provided value, and finally the built-in default.
 
-**Data flow**: It accepts an optional provided originator string, then reads `CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR`; the environment value wins over the provided value, which wins over `DEFAULT_ORIGINATOR`. It attempts `HeaderValue::from_str` on the chosen string and returns an `Originator` containing both the original string and parsed header value; on parse failure it logs an error and returns a fallback `Originator` using `DEFAULT_ORIGINATOR` and `HeaderValue::from_static`.
+**Data flow**: It takes an optional originator string. It also reads the CODEX_INTERNAL_ORIGINATOR_OVERRIDE environment variable. It tries to turn the chosen string into a valid HTTP header value; if that fails, it logs an error and falls back to the safe default originator. It returns an Originator containing both the plain text and the prepared header value.
 
-**Call relations**: This is the shared normalization routine used both when explicitly initializing the global originator and when lazily resolving it for request headers.
+**Call relations**: This is the helper behind originator selection. set_default_originator uses it when startup code supplies a custom name, and originator uses it when code later asks, “what should this process call itself?”
 
 *Call graph*: called by 2 (originator, set_default_originator); 4 external calls (from_static, from_str, var, error!).
 
@@ -1442,11 +1466,11 @@ fn get_originator_value(provided: Option<String>) -> Originator
 fn set_default_originator(value: String) -> Result<(), SetOriginatorError>
 ```
 
-**Purpose**: Initializes the process-wide default originator exactly once, rejecting invalid header values and repeated initialization.
+**Purpose**: Sets the process-wide default originator once, usually during startup. This prevents later code from accidentally changing the identity used in outgoing requests.
 
-**Data flow**: It takes an owned `String`, first validates it with `HeaderValue::from_str`, then derives the final `Originator` via `get_originator_value(Some(value))`. It writes that value into the `ORIGINATOR` `RwLock` only if the lock is obtainable and currently empty; otherwise it returns `SetOriginatorError::InvalidHeaderValue` or `SetOriginatorError::AlreadyInitialized`.
+**Data flow**: It receives a proposed originator string. First it checks that the string can legally be used as an HTTP header value. Then it builds the full Originator and writes it into a global lock-protected slot, but only if that slot is still empty. It returns success, or an error if the value is invalid or the originator was already set.
 
-**Call relations**: Startup paths call this to pin the originator before clients are created. It delegates normalization to `get_originator_value` so environment overrides still take precedence over the provided string.
+**Call relations**: Startup flows such as initialize and run_main call this before clients are built. After that, originator and default_headers read the stored value so network requests use the same identity.
 
 *Call graph*: calls 1 internal fn (get_originator_value); called by 2 (initialize, run_main); 1 external calls (from_str).
 
@@ -1457,11 +1481,11 @@ fn set_default_originator(value: String) -> Result<(), SetOriginatorError>
 fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>)
 ```
 
-**Purpose**: Stores the optional residency requirement that should be emitted on future default-client requests.
+**Purpose**: Stores an optional residency requirement for default HTTP clients. A residency requirement tells services that requests should be treated as belonging to a particular region, currently the US.
 
-**Data flow**: It accepts `Option<ResidencyRequirement>`, acquires the `REQUIREMENTS_RESIDENCY` write lock, and replaces the cached value. If the lock cannot be acquired it logs a warning and leaves the previous state unchanged.
+**Data flow**: It receives either a residency requirement or nothing. It writes that value into a global lock-protected slot. If the lock cannot be acquired, it logs a warning and leaves the previous setting unchanged.
 
-**Call relations**: Initialization and runtime sync code call this before requests are built; `default_headers` later reads the cached requirement to decide whether to add the residency header.
+**Call relations**: Configuration and app startup paths call this when they learn the desired residency policy. Later, default_headers reads the stored value and adds the matching HTTP header to new clients.
 
 *Call graph*: called by 6 (sync_default_client_residency_requirement, initialize, run_main, run_main, run_main, run_ratatui_app); 1 external calls (warn!).
 
@@ -1472,11 +1496,11 @@ fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyR
 fn originator() -> Originator
 ```
 
-**Purpose**: Returns the effective originator for this process, using cached state when available and lazily caching environment overrides.
+**Purpose**: Returns the originator that should be used right now. It hides the details of stored defaults, environment overrides, and safe fallback behavior.
 
-**Data flow**: It first tries to read a previously initialized `Originator` from the `ORIGINATOR` lock and clones it if present. If not, it checks whether the override environment variable exists; when it does, it computes an originator with `get_originator_value(None)`, attempts to cache it under the write lock, and returns either the existing cached value or the newly computed one. Without any override, it simply returns a fresh default-derived `Originator` without caching.
+**Data flow**: It first tries to read the cached global originator. If one exists, it returns a clone of it. If an internal environment override is present, it builds and caches that originator if possible. If nothing has been set, it computes an originator from the default rules and returns it.
 
-**Call relations**: Many metadata and request-building paths depend on this function. It is the central read-side accessor that all header generation and user-agent construction flows go through.
+**Call relations**: Many parts of Codex call this when they need to label requests, metadata, plugin information, or connector behavior. It delegates the actual choice and header conversion to get_originator_value.
 
 *Call graph*: calls 1 internal fn (get_originator_value); called by 21 (codex_app_metadata, codex_plugin_metadata, ingest_skill_invoked, connectors_for_plugin_apps, merge_and_filter_plugin_connectors, merge_connectors_with_accessible, list_accessible_connectors_from_mcp_tools_with_mcp_manager, list_tool_suggest_discoverable_tools_with_auth, refresh_accessible_connectors_cache_from_mcp_tools, maybe_prompt_and_install_mcp_dependencies (+11 more)); 1 external calls (var).
 
@@ -1487,11 +1511,11 @@ fn originator() -> Originator
 fn is_first_party_originator(originator_value: &str) -> bool
 ```
 
-**Purpose**: Recognizes originator strings that should be treated as first-party Codex clients.
+**Purpose**: Answers whether an originator name belongs to a recognized first-party Codex client. This is used when behavior should be trusted or simplified for official Codex clients.
 
-**Data flow**: It takes a borrowed originator string and returns `true` if it equals `DEFAULT_ORIGINATOR`, `codex-tui`, `codex_vscode`, or begins with `Codex `; otherwise it returns `false`.
+**Data flow**: It receives an originator string and compares it with known official names and a known prefix pattern. It returns true for recognized first-party names and false otherwise.
 
-**Call relations**: Callers use this classification to gate behavior such as dependency prompts or trust decisions based on whether the request source is an official Codex surface.
+**Call relations**: The MCP dependency installation prompt uses this check to decide whether the current client should be treated as an official Codex originator.
 
 *Call graph*: called by 1 (maybe_prompt_and_install_mcp_dependencies).
 
@@ -1502,11 +1526,11 @@ fn is_first_party_originator(originator_value: &str) -> bool
 fn is_first_party_chat_originator(originator_value: &str) -> bool
 ```
 
-**Purpose**: Recognizes the narrower set of first-party chat-specific originators.
+**Purpose**: Answers whether an originator name belongs to a recognized first-party ChatGPT-style client. This helps gate connector access based on the client family.
 
-**Data flow**: It accepts an originator string and returns `true` only for `codex_atlas` or `codex_chatgpt_desktop`.
+**Data flow**: It receives an originator string and checks it against the known ChatGPT-related originator names. It returns a simple yes-or-no result.
 
-**Call relations**: Authorization and connector-selection code uses this helper when chat-originator-specific policy differs from the broader first-party set.
+**Call relations**: Connector permission code calls this when deciding whether a connector ID is allowed for the current originator.
 
 *Call graph*: called by 1 (is_connector_id_allowed_for_originator).
 
@@ -1517,11 +1541,11 @@ fn is_first_party_chat_originator(originator_value: &str) -> bool
 fn get_codex_user_agent() -> String
 ```
 
-**Purpose**: Constructs the canonical Codex `User-Agent` string, including originator, package version, OS details, terminal-detection metadata, and optional suffix.
+**Purpose**: Builds the User-Agent text sent with Codex HTTP requests. This text tells the server which Codex client, version, operating system, architecture, and terminal environment made the request.
 
-**Data flow**: It reads the crate version from `env!("CARGO_PKG_VERSION")`, obtains OS/type/version/architecture from `os_info::get()`, fetches the current originator via `originator()`, and formats a base prefix string. It then reads `USER_AGENT_SUFFIX` under a mutex, trims and ignores empty values, appends a parenthesized suffix when present, and passes the candidate plus base prefix to `sanitize_user_agent`; the sanitized string is returned.
+**Data flow**: It reads the package version, operating system details, terminal user-agent information, the current originator, and an optional global suffix. It combines those pieces into one string, trims and formats the suffix if present, then sends the result through sanitize_user_agent. It returns a safe user-agent string ready for an HTTP header.
 
-**Call relations**: This function feeds both direct callers that need the UA string and `default_headers`, which inserts it into outbound requests. It delegates validation and fallback behavior to `sanitize_user_agent`.
+**Call relations**: Initialization, authentication, backend setup, ChatGPT header construction, and default_headers call this when they need the standard Codex user agent. It relies on originator for the client identity and sanitize_user_agent for safety.
 
 *Call graph*: calls 2 internal fn (originator, sanitize_user_agent); called by 5 (initialize, from_auth, init_backend, build_chatgpt_headers, default_headers); 3 external calls (env!, format!, get).
 
@@ -1532,11 +1556,11 @@ fn get_codex_user_agent() -> String
 fn sanitize_user_agent(candidate: String, fallback: &str) -> String
 ```
 
-**Purpose**: Ensures the generated user-agent string is valid as an HTTP header value, replacing invalid characters or falling back when necessary.
+**Purpose**: Makes sure a proposed User-Agent string is legal for use as an HTTP header. If it contains invalid characters, it tries to clean it rather than failing the whole request setup.
 
-**Data flow**: It takes a candidate UA string and a fallback base string. If `HeaderValue::from_str` accepts the candidate, it returns it unchanged. Otherwise it maps non-printable/non-ASCII-visible characters to underscores and retries; if that succeeds it logs a warning and returns the sanitized string. If sanitization still fails, it falls back to the provided base string when valid, or finally to `originator().value` after logging warnings.
+**Data flow**: It receives a candidate user-agent string and a fallback string. If the candidate is already valid, it returns it unchanged. Otherwise, it replaces non-standard characters with underscores and checks again. If that still fails, it falls back to the base user-agent string, and if even that is invalid, it falls back to the originator value.
 
-**Call relations**: Only `get_codex_user_agent` calls this helper, making it the validation choke point for any globally configured suffix or unusual platform-derived UA content.
+**Call relations**: get_codex_user_agent calls this as the final safety step before the user-agent text is used by default_headers. It logs warnings when it has to clean or replace the candidate string.
 
 *Call graph*: calls 1 internal fn (originator); called by 1 (get_codex_user_agent); 2 external calls (from_str, warn!).
 
@@ -1547,11 +1571,11 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String
 fn create_client() -> CodexHttpClient
 ```
 
-**Purpose**: Creates the shared high-level `CodexHttpClient` wrapper around the default reqwest client configuration.
+**Purpose**: Creates the standard wrapped Codex HTTP client for callers that do not need to work directly with reqwest. This is the convenient default for most Codex network code.
 
-**Data flow**: It takes no arguments, calls `build_reqwest_client()` to obtain a configured `reqwest::Client`, wraps it with `CodexHttpClient::new`, and returns the wrapper.
+**Data flow**: It builds a configured reqwest client using build_reqwest_client. Then it wraps that lower-level client in CodexHttpClient and returns the wrapper.
 
-**Call relations**: Auth loading, token revocation, update checks, and other HTTP consumers call this convenience constructor when they want the standard Codex client identity and transport behavior.
+**Call relations**: Authentication, update checks, event tracking, token revocation, release fetching, and test helpers call this when they need a ready-to-use Codex client. It hands off the lower-level setup to build_reqwest_client.
 
 *Call graph*: calls 2 internal fn (new, build_reqwest_client); called by 8 (send_track_events_request, chatgpt_get_request_with_timeout, create_dummy_chatgpt_auth_for_testing, from_auth_dot_json, load, revoke_auth_tokens, check_for_update, fetch_latest_github_release_version).
 
@@ -1562,11 +1586,11 @@ fn create_client() -> CodexHttpClient
 fn build_reqwest_client() -> reqwest::Client
 ```
 
-**Purpose**: Builds the default reqwest client while preserving legacy infallible behavior through logged fallbacks.
+**Purpose**: Builds the default reqwest HTTP client and keeps the old infallible behavior: callers get a client even if optional setup fails. This prevents network setup errors, such as bad custom certificate configuration, from crashing older call paths unexpectedly.
 
-**Data flow**: It calls `try_build_reqwest_client()`. On success it returns that client. On error it logs a warning, then tries a simpler `reqwest::Client::builder()` augmented only with the ChatGPT Cloudflare cookie store; if that build also fails it logs again and returns `reqwest::Client::new()`.
+**Data flow**: It calls try_build_reqwest_client. If that succeeds, it returns the configured client. If it fails, it logs a warning and tries to build a simpler fallback client with the ChatGPT Cloudflare cookie store. If even that fails, it returns reqwest’s plain default client.
 
-**Call relations**: Most ordinary HTTP call sites use this function rather than the fallible variant. It delegates the preferred construction path to `try_build_reqwest_client` and only handles compatibility fallbacks itself.
+**Call relations**: Many network features call this directly when they need a raw reqwest client, including client management, pairing, remote control, probes, and plugin fetching. It delegates the preferred build path to try_build_reqwest_client and provides fallback behavior around it.
 
 *Call graph*: calls 1 internal fn (try_build_reqwest_client); called by 38 (send_client_management_request_once, pairing_status, start_pairing, send_remote_control_server_request, http_get_probe_status_with_timeout, http_probe_url_with_timeout, fetch_plugin_detail, fetch_recommended_plugins, fetch_remote_plugin_skill_detail, get_remote_plugin_installed_page (+15 more)).
 
@@ -1577,11 +1601,11 @@ fn build_reqwest_client() -> reqwest::Client
 fn try_build_reqwest_client() -> Result<reqwest::Client, BuildCustomCaTransportError>
 ```
 
-**Purpose**: Performs the full preferred reqwest-client construction and surfaces custom-CA failures to callers.
+**Purpose**: Attempts to build the fully configured default reqwest client and reports structured errors if custom certificate setup fails. Callers use this when they want to know exactly why client construction did not work.
 
-**Data flow**: It starts from `reqwest::Client::builder().default_headers(default_headers())`, conditionally applies `.no_proxy()` when `is_sandboxed()` is true, then wraps the builder with `with_chatgpt_cloudflare_cookie_store`. Finally it passes the builder to `build_reqwest_client_with_custom_ca` and returns that `Result<reqwest::Client, BuildCustomCaTransportError>`.
+**Data flow**: It starts a reqwest client builder with default_headers. If the process is running in the special Codex sandbox, it disables proxy use. It adds the ChatGPT Cloudflare cookie store, then passes the builder to shared custom-certificate setup. It returns either the finished client or a certificate/build error.
 
-**Call relations**: This is the structured, fallible builder used internally by `build_reqwest_client`. It depends on `default_headers` for request identity and `is_sandboxed` for proxy policy.
+**Call relations**: build_reqwest_client calls this as the preferred construction path. It gathers information from default_headers and is_sandboxed, then hands the builder to the shared custom certificate helper.
 
 *Call graph*: calls 2 internal fn (default_headers, is_sandboxed); called by 1 (build_reqwest_client); 3 external calls (builder, build_reqwest_client_with_custom_ca, with_chatgpt_cloudflare_cookie_store).
 
@@ -1592,11 +1616,11 @@ fn try_build_reqwest_client() -> Result<reqwest::Client, BuildCustomCaTransportE
 fn default_headers() -> HeaderMap
 ```
 
-**Purpose**: Assembles the standard header set attached to default Codex HTTP clients and some direct protocol clients.
+**Purpose**: Creates the standard HTTP headers that Codex should attach to outgoing requests. These include the originator, User-Agent, and optionally a residency header.
 
-**Data flow**: It creates a fresh `HeaderMap`, inserts the `originator` header using `originator().header_value`, computes the user agent with `get_codex_user_agent()` and inserts it as `USER_AGENT` if it parses as a `HeaderValue`, then reads `REQUIREMENTS_RESIDENCY`; when a residency requirement is present and the header is not already set, it inserts `x-openai-internal-codex-residency` with the corresponding static value (`us`). It returns the populated map.
+**Data flow**: It starts with an empty header map. It inserts the current originator header, tries to insert the generated Codex User-Agent, then reads the stored residency requirement and adds the residency header if one is set and not already present. It returns the completed header map.
 
-**Call relations**: Websocket setup and reqwest-client construction call this helper to ensure all outbound traffic shares the same identity headers and optional residency constraint.
+**Call relations**: HTTP client creation and several direct network paths call this when opening web sockets, WebRTC sideband input, or reqwest clients. It depends on originator and get_codex_user_agent to fill in the identifying headers.
 
 *Call graph*: calls 2 internal fn (get_codex_user_agent, originator); called by 5 (websocket_reachability_check, connect_websocket, start_inner, spawn_webrtc_sideband_input_task, try_build_reqwest_client); 3 external calls (new, from_static, from_str).
 
@@ -1607,11 +1631,11 @@ fn default_headers() -> HeaderMap
 fn is_sandboxed() -> bool
 ```
 
-**Purpose**: Detects the specific sandbox mode that requires disabling proxy use in the default HTTP client.
+**Purpose**: Detects whether Codex is running inside a specific sandbox mode called seatbelt. In that mode, the HTTP client should avoid proxy settings.
 
-**Data flow**: It reads the `CODEX_SANDBOX` environment variable and returns `true` only when its value is exactly `seatbelt`.
+**Data flow**: It reads the CODEX_SANDBOX environment variable and compares it with the value seatbelt. It returns true only for that exact sandbox marker.
 
-**Call relations**: Only `try_build_reqwest_client` uses this helper, applying `.no_proxy()` when the process is running in that sandbox environment.
+**Call relations**: try_build_reqwest_client calls this while building the reqwest client. If it returns true, the client builder is changed so it will not use proxies.
 
 *Call graph*: called by 1 (try_build_reqwest_client); 1 external calls (var).
 
@@ -1621,13 +1645,15 @@ These files apply the shared transport foundations to concrete authenticated cli
 
 ### `backend-client/src/client.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `cross-cutting backend request handling`
 
-This file defines the backend client used to talk to either Codex-style `/api/codex/...` endpoints or ChatGPT backend-api `/wham/...` endpoints. `PathStyle` selects between those URL schemes, with `Client::new` normalizing common ChatGPT hostnames by trimming trailing slashes and appending `/backend-api` when needed. The client stores a `reqwest::Client`, shared auth provider, optional user-agent, optional ChatGPT account id, optional FedRAMP routing flag, and the chosen path style.
+This file is the program’s “front desk” for backend calls. Other parts of the system should not need to remember whether an endpoint lives under /api/codex or /wham, how to attach auth headers, or how to turn a failed web request into a useful error. The Client type collects those details in one place.
 
-Request plumbing is centralized in `headers`, `exec_request`, `exec_request_detailed`, and `decode_json`. `headers` always sets a user agent, injects auth headers from `SharedAuthProvider`, and conditionally adds `ChatGPT-Account-Id` and `X-OpenAI-Fedramp`. `exec_request` returns body and content type or raises an `anyhow` error with method, URL, status, content type, and body embedded; `exec_request_detailed` preserves non-success responses as structured `RequestError::UnexpectedStatus` instead. `decode_json` adds the same contextual detail on deserialization failures.
+When a Client is created, it normalizes the base URL, chooses a path style, builds a reqwest HTTP client, and starts with either no authentication or the authentication supplied by a logged-in Codex user. Before each request, it builds headers with a user agent, auth data, optional ChatGPT account routing, and optional FedRAMP routing.
 
-The API methods build concrete URLs based on `path_style`, attach headers, optionally add query parameters, and decode typed responses for accounts, token usage profile, tasks, sibling turns, config bundles, and task creation. `create_task` has a notable compatibility fallback: it first looks for `task.id` in the response JSON, then top-level `id`. The latter half of the file is pure mapping logic that converts backend rate-limit payloads into protocol-layer `RateLimitSnapshot`, `RateLimitWindow`, `CreditsSnapshot`, `SpendControlLimitSnapshot`, and `RateLimitReachedType`, including plan-type translation and minute rounding from seconds.
+Most public methods follow the same pattern: choose the correct endpoint, attach headers, send a GET or POST, check that the server returned a successful status, then decode the JSON body into a typed response. A few calls use a richer RequestError so callers can tell, for example, whether a request failed because the user is unauthorized.
+
+The file also includes translation code for rate-limit and credit information. The backend has its own generated data shapes, while the rest of Codex uses protocol-level snapshots. These mapper functions are like adapters between two plug shapes: they preserve the meaning while changing the format.
 
 #### Function details
 
@@ -1637,11 +1663,11 @@ The API methods build concrete URLs based on `path_style`, attach headers, optio
 fn status(&self) -> Option<StatusCode>
 ```
 
-**Purpose**: Extracts the HTTP status code from a structured backend request error when one exists. Non-HTTP wrapper errors return no status.
+**Purpose**: Returns the HTTP status code from a request error when one exists. This lets callers inspect failures without parsing the error text.
 
-**Data flow**: Borrows `self`, matches on `RequestError`, returns `Some(status)` for `UnexpectedStatus` and `None` for `Other`.
+**Data flow**: It receives a RequestError. If the error is an UnexpectedStatus, it takes the stored status code and returns it; if the error came from another source, it returns nothing.
 
-**Call relations**: It is used by `RequestError::is_unauthorized` to classify auth failures.
+**Call relations**: RequestError::is_unauthorized uses this helper so it can ask one simple question about the error: was the status code 401 Unauthorized?
 
 *Call graph*: called by 1 (is_unauthorized).
 
@@ -1652,11 +1678,11 @@ fn status(&self) -> Option<StatusCode>
 fn is_unauthorized(&self) -> bool
 ```
 
-**Purpose**: Reports whether the error corresponds to HTTP 401 Unauthorized. It is a convenience classifier for callers handling auth expiry or login prompts.
+**Purpose**: Answers whether a failed request was rejected because the user is not authorized. Callers can use this to trigger login or show a clearer message.
 
-**Data flow**: Borrows `self`, calls `status()`, compares the result to `Some(StatusCode::UNAUTHORIZED)`, and returns a boolean.
+**Data flow**: It receives a RequestError, asks RequestError::status for its HTTP code, then compares that code with 401 Unauthorized. It returns true or false.
 
-**Call relations**: It builds directly on `RequestError::status`.
+**Call relations**: This sits on top of RequestError::status. Instead of every caller checking status codes by hand, they can call this small, intention-revealing method.
 
 *Call graph*: calls 1 internal fn (status).
 
@@ -1667,11 +1693,11 @@ fn is_unauthorized(&self) -> bool
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats backend request failures with detailed HTTP context or delegates to the wrapped error’s display text. This makes logs and surfaced errors include method, URL, status, content type, and body.
+**Purpose**: Turns a RequestError into a human-readable sentence. This is what appears in logs or user-facing error output.
 
-**Data flow**: Borrows `self` and a formatter; for `UnexpectedStatus` it writes a synthesized message containing method/url/status/content-type/body, and for `Other` it writes the inner error.
+**Data flow**: It receives the error and a formatter. For failed HTTP statuses, it writes the method, URL, status, content type, and body; for other errors, it writes the wrapped error message.
 
-**Call relations**: This is trait plumbing used whenever `RequestError` is rendered.
+**Call relations**: Rust’s formatting system calls this when the error is printed. It uses the standard write operation to build the message.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1682,11 +1708,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn source(&self) -> Option<&(dyn std::error::Error + 'static)>
 ```
 
-**Purpose**: Exposes the underlying error source for wrapped non-HTTP failures. Structured unexpected-status errors intentionally have no source.
+**Purpose**: Reports the underlying cause of the error when there is one. This helps error-reporting tools show the chain of failures.
 
-**Data flow**: Borrows `self`, returns `None` for `UnexpectedStatus` and `Some(err.as_ref())` for `Other`.
+**Data flow**: It receives a RequestError. If it wraps another anyhow error, it returns that inner error as the source; if it is an HTTP status failure recorded directly here, it returns no source.
 
-**Call relations**: This supports standard error chaining for callers inspecting `RequestError`.
+**Call relations**: The standard error system calls this when walking an error chain. It lets RequestError fit into normal Rust error handling.
 
 
 ##### `RequestError::from`  (lines 86–88)
@@ -1695,11 +1721,11 @@ fn source(&self) -> Option<&(dyn std::error::Error + 'static)>
 fn from(err: anyhow::Error) -> Self
 ```
 
-**Purpose**: Converts an `anyhow::Error` into `RequestError::Other`. It is the bridge used when JSON decoding or transport setup fails in APIs that return structured request errors.
+**Purpose**: Converts a general anyhow error into this file’s RequestError type. This makes it easy to use ordinary errors in functions that promise to return RequestError.
 
-**Data flow**: Consumes an `anyhow::Error` and wraps it in `RequestError::Other`.
+**Data flow**: It receives an anyhow error and wraps it in RequestError::Other. The original error is preserved inside the new value.
 
-**Call relations**: It is used, for example, when `get_config_bundle` maps `decode_json` failures into the file’s structured error type.
+**Call relations**: Methods such as get_config_bundle can map JSON decoding or network errors into RequestError through this conversion.
 
 *Call graph*: 1 external calls (Other).
 
@@ -1710,11 +1736,11 @@ fn from(err: anyhow::Error) -> Self
 fn from_base_url(base_url: &str) -> Self
 ```
 
-**Purpose**: Infers whether a base URL should use Codex API paths or ChatGPT backend-api paths. The decision is based on whether the URL already contains `/backend-api`.
+**Purpose**: Chooses which URL layout the backend uses. Codex endpoints and ChatGPT backend endpoints have different path prefixes, and this function picks the right one from the base URL.
 
-**Data flow**: Reads the input `base_url` string, checks for the substring `/backend-api`, and returns `PathStyle::ChatGptApi` if present or `PathStyle::CodexApi` otherwise.
+**Data flow**: It receives a base URL string. If the URL contains /backend-api, it returns ChatGptApi; otherwise it returns CodexApi.
 
-**Call relations**: It is called by `Client::new` after base URL normalization.
+**Call relations**: Client::new calls this after normalizing the base URL, so later request methods can switch paths without re-checking the URL each time.
 
 *Call graph*: called by 1 (new).
 
@@ -1725,11 +1751,11 @@ fn from_base_url(base_url: &str) -> Self
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats the client for debugging while redacting the auth provider internals. It exposes routing-relevant fields but not credential contents.
+**Purpose**: Builds a safe debug view of a Client. It shows useful setup fields while hiding the actual authentication provider details.
 
-**Data flow**: Borrows `self`, writes `base_url`, placeholder auth provider text, optional user agent, optional account id, FedRAMP flag, and path style into a `DebugStruct`, and returns the formatter result.
+**Data flow**: It receives a Client and a formatter. It writes fields such as base URL, user agent, account ID, FedRAMP flag, and path style, but replaces the auth provider with a placeholder.
 
-**Call relations**: This is trait plumbing for safe debug output of client instances.
+**Call relations**: Rust’s debug printing calls this when someone logs or inspects a Client. It relies on the formatter’s debug-struct builder.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1740,11 +1766,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(base_url: impl Into<String>) -> Result<Self>
 ```
 
-**Purpose**: Constructs a backend client from a base URL, normalizing ChatGPT hostnames and building a reqwest client with custom CA and Cloudflare cookie-store support. It initializes the client unauthenticated by default.
+**Purpose**: Creates a backend client from a base URL. It prepares the URL, HTTP engine, default authentication state, and path style needed for future requests.
 
-**Data flow**: Consumes `base_url` into a `String`, strips trailing slashes in a loop, appends `/backend-api` for `chatgpt.com` or `chat.openai.com` URLs that lack it, builds a `reqwest::Client` via `build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(...))`, derives `path_style` with `PathStyle::from_base_url`, and returns a `Client` with default auth/user-agent/account-routing fields.
+**Data flow**: It takes a base URL, trims trailing slashes, adds /backend-api for common ChatGPT hosts when needed, builds a reqwest HTTP client with custom certificate and Cloudflare cookie support, chooses the path style, and returns a ready Client.
 
-**Call relations**: It is the primary constructor used across the codebase and by tests. `Client::from_auth` builds on it, and many higher-level flows start by calling this constructor.
+**Call relations**: This is the basic constructor used directly by tests and other setup code. Client::from_auth builds on it when a logged-in user is available.
 
 *Call graph*: calls 1 internal fn (from_base_url); called by 18 (websocket_transport_serves_health_endpoints_on_same_listener, test_client, test_client, new, models_client_hits_models_endpoint, responses_post_drains_request_body, revoke_request_times_out, cancels_previous_login_server_when_port_is_in_use, creates_missing_codex_home_dir, forced_chatgpt_workspace_id_mismatch_blocks_login (+8 more)); 10 external calls (contains, ends_with, into, pop, starts_with, builder, build_reqwest_client_with_custom_ca, with_chatgpt_cloudflare_cookie_store, unauthenticated_auth_provider, format!).
 
@@ -1755,11 +1781,11 @@ fn new(base_url: impl Into<String>) -> Result<Self>
 fn from_auth(base_url: impl Into<String>, auth: &CodexAuth) -> Result<Self>
 ```
 
-**Purpose**: Constructs a client preconfigured with the standard Codex user agent and an auth provider derived from `CodexAuth`. It is the authenticated convenience constructor.
+**Purpose**: Creates a Client that is already configured for an authenticated Codex user. It is the convenient constructor for normal logged-in use.
 
-**Data flow**: Consumes a base URL and borrows `CodexAuth`, creates a base client with `Client::new`, then applies `with_user_agent(get_codex_user_agent())` and `with_auth_provider(auth_provider_from_auth(auth))`, returning the configured client.
+**Data flow**: It receives a base URL and a CodexAuth object. It creates a plain Client, adds the standard Codex user agent, converts the auth object into an auth header provider, and returns the configured Client.
 
-**Call relations**: It layers authentication and user-agent setup on top of `Client::new`.
+**Call relations**: This wraps Client::new and then applies Client::with_user_agent and Client::with_auth_provider, so callers do not have to repeat that setup.
 
 *Call graph*: calls 1 internal fn (get_codex_user_agent); 2 external calls (new, auth_provider_from_auth).
 
@@ -1770,11 +1796,11 @@ fn from_auth(base_url: impl Into<String>, auth: &CodexAuth) -> Result<Self>
 fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Replaces the client’s auth provider and returns the modified client for builder-style chaining.
+**Purpose**: Returns a copy of the Client configured with a specific authentication provider. Use it when the caller already has a source of auth headers.
 
-**Data flow**: Consumes `self` mutably plus a `SharedAuthProvider`, assigns `self.auth_provider = auth`, and returns `self`.
+**Data flow**: It takes ownership of a Client and an auth provider, replaces the Client’s current provider, and returns the modified Client.
 
-**Call relations**: It is used by `Client::from_auth` and can be used by callers customizing auth behavior.
+**Call relations**: Client::from_auth uses this after converting login information into a provider. Later, Client::headers asks that provider to add auth headers.
 
 
 ##### `Client::with_user_agent`  (lines 188–193)
@@ -1783,11 +1809,11 @@ fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self
 fn with_user_agent(mut self, ua: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets an explicit user-agent header value if the provided string is a valid HTTP header value. Invalid values are silently ignored, leaving the previous/default behavior intact.
+**Purpose**: Sets the User-Agent header, which tells the server what software is making the request. If the supplied value is not a valid header, it leaves the Client unchanged.
 
-**Data flow**: Consumes `self` mutably and a string-like input, converts it into `String`, attempts `HeaderValue::from_str`, stores `Some(hv)` on success, and returns `self`.
+**Data flow**: It receives a Client and a user-agent string-like value. It tries to convert the string into an HTTP header value; on success it stores it, then returns the Client.
 
-**Call relations**: It is used by `Client::from_auth` and by callers that want custom user-agent branding.
+**Call relations**: Client::from_auth uses this to add the standard Codex user agent. Client::headers later includes the stored value, or a default if none was set.
 
 *Call graph*: 2 external calls (from_str, into).
 
@@ -1798,11 +1824,11 @@ fn with_user_agent(mut self, ua: impl Into<String>) -> Self
 fn with_chatgpt_account_id(mut self, account_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Stores a ChatGPT account id to be emitted as a request header on subsequent calls. This supports account-scoped backend routing.
+**Purpose**: Sets the ChatGPT account ID header used to route requests to a particular account or workspace.
 
-**Data flow**: Consumes `self` mutably and a string-like account id, converts it into `String`, stores it in `self.chatgpt_account_id`, and returns `self`.
+**Data flow**: It receives a Client and an account ID, stores the ID as text, and returns the modified Client.
 
-**Call relations**: It participates in later header construction inside `Client::headers`.
+**Call relations**: Client::headers later turns this stored account ID into a ChatGPT-Account-Id header on every request.
 
 *Call graph*: 1 external calls (into).
 
@@ -1813,11 +1839,11 @@ fn with_chatgpt_account_id(mut self, account_id: impl Into<String>) -> Self
 fn with_fedramp_routing_header(mut self) -> Self
 ```
 
-**Purpose**: Enables emission of the FedRAMP routing header on future requests. It is a simple builder toggle.
+**Purpose**: Marks the Client so requests include the FedRAMP routing header. FedRAMP is a government compliance environment, and the server needs this header to route correctly.
 
-**Data flow**: Consumes `self` mutably, sets `self.chatgpt_account_is_fedramp = true`, and returns `self`.
+**Data flow**: It receives a Client, sets a boolean flag to true, and returns the modified Client.
 
-**Call relations**: Its effect is realized later in `Client::headers`.
+**Call relations**: Client::headers reads this flag and adds X-OpenAI-Fedramp: true when requests are sent.
 
 
 ##### `Client::with_path_style`  (lines 205–208)
@@ -1826,11 +1852,11 @@ fn with_fedramp_routing_header(mut self) -> Self
 fn with_path_style(mut self, style: PathStyle) -> Self
 ```
 
-**Purpose**: Overrides the inferred path style for URL construction. This is mainly useful in tests or specialized callers that need explicit routing.
+**Purpose**: Overrides the URL path style used by the Client. This is useful for tests or special routing situations.
 
-**Data flow**: Consumes `self` mutably, assigns `self.path_style = style`, and returns `self`.
+**Data flow**: It receives a Client and a PathStyle value, stores that style, and returns the modified Client.
 
-**Call relations**: Subsequent endpoint methods consult `self.path_style` when building URLs.
+**Call relations**: Request methods later consult the stored path style when choosing between /api/codex and /wham endpoints.
 
 
 ##### `Client::headers`  (lines 210–230)
@@ -1839,11 +1865,11 @@ fn with_path_style(mut self, style: PathStyle) -> Self
 fn headers(&self) -> HeaderMap
 ```
 
-**Purpose**: Builds the common request headers for all backend calls, including user agent, auth, optional ChatGPT account id, and optional FedRAMP routing. It centralizes per-request header policy.
+**Purpose**: Builds the shared HTTP headers used on backend requests. This keeps authentication, user agent, account routing, and FedRAMP routing consistent.
 
-**Data flow**: Reads `self.user_agent`, `self.auth_provider`, `self.chatgpt_account_id`, and `self.chatgpt_account_is_fedramp`. It creates a new `HeaderMap`, inserts either the configured user agent or `codex-cli`, asks the auth provider to mutate the map with auth headers, conditionally inserts `ChatGPT-Account-Id` if both header name and value parse successfully, conditionally inserts `X-OpenAI-Fedramp: true`, and returns the map.
+**Data flow**: It starts with an empty header map, inserts a configured or default user agent, asks the auth provider to add auth headers, optionally adds ChatGPT account and FedRAMP headers, and returns the completed map.
 
-**Call relations**: Nearly every HTTP API method calls this before constructing its request builder.
+**Call relations**: Every request-building method calls this before sending, including account checks, task operations, config fetches, token usage, and add-credit nudges.
 
 *Call graph*: called by 8 (create_task, get_accounts_check, get_config_bundle, get_task_details_with_body, get_token_usage_profile, list_sibling_turns, list_tasks, send_add_credits_nudge_email); 5 external calls (new, from_bytes, from_static, from_str, add_auth_headers).
 
@@ -1859,11 +1885,11 @@ async fn exec_request(
     ) -> Result<(String, String)>
 ```
 
-**Purpose**: Sends a request and returns the response body plus content type, failing with an `anyhow` error that includes full HTTP context on non-success statuses. It is the simpler execution path for APIs that do not need structured status inspection.
+**Purpose**: Sends an HTTP request and treats any non-success status as a general error. It is the common path for ordinary API calls.
 
-**Data flow**: Consumes a `reqwest::RequestBuilder` plus method and URL strings, awaits `send()`, reads status, content type header, and response text, and returns `(body, ct)` if `status.is_success()`. Otherwise it constructs an `anyhow` failure embedding method, URL, status, content type, and body.
+**Data flow**: It receives a prepared request, method name, and URL. It sends the request, records the status, content type, and response body, then returns the body and content type if the status is successful; otherwise it produces an error message with the details.
 
-**Call relations**: It is the common transport helper used by most typed API methods such as task, account, and profile fetches.
+**Call relations**: Methods such as get_accounts_check, list_tasks, get_task_details_with_body, list_sibling_turns, get_token_usage_profile, and create_task use this after they build their request.
 
 *Call graph*: called by 6 (create_task, get_accounts_check, get_task_details_with_body, get_token_usage_profile, list_sibling_turns, list_tasks); 2 external calls (send, bail!).
 
@@ -1879,11 +1905,11 @@ async fn exec_request_detailed(
     ) -> std::result::Result<(String, String), RequestError>
 ```
 
-**Purpose**: Sends a request and preserves non-success HTTP responses as structured `RequestError::UnexpectedStatus` values. This is used where callers need to inspect status codes like 401.
+**Purpose**: Sends an HTTP request but returns a structured RequestError on failure. This is used when callers need to inspect details such as the HTTP status code.
 
-**Data flow**: Consumes a `reqwest::RequestBuilder` plus method and URL strings, awaits `send()`, maps transport errors into `RequestError::Other`, reads status/content type/body, and returns `(body, content_type)` on success or `RequestError::UnexpectedStatus { method, url, status, content_type, body }` on failure.
+**Data flow**: It receives a prepared request, method name, and URL. It sends the request, reads status, content type, and body, returns them on success, or returns RequestError::UnexpectedStatus on a bad HTTP status.
 
-**Call relations**: It is used by `get_config_bundle` and `send_add_credits_nudge_email`, the APIs that expose `RequestError` instead of plain `anyhow::Result`.
+**Call relations**: get_config_bundle and send_add_credits_nudge_email use this because their callers may need more precise failure handling than a plain anyhow error.
 
 *Call graph*: called by 2 (get_config_bundle, send_add_credits_nudge_email); 1 external calls (send).
 
@@ -1894,11 +1920,11 @@ async fn exec_request_detailed(
 fn decode_json(&self, url: &str, ct: &str, body: &str) -> Result<T>
 ```
 
-**Purpose**: Deserializes a response body into a caller-specified type and enriches parse failures with URL, content type, and raw body context. It keeps decoding diagnostics close to the transport layer.
+**Purpose**: Parses a JSON response body into the expected Rust data type. If parsing fails, it includes the URL, content type, and body in the error to make debugging easier.
 
-**Data flow**: Borrows `self`, a URL, content type, and body string; attempts `serde_json::from_str::<T>(body)`; returns the parsed value on success or an `anyhow` error containing the decode error and response context on failure.
+**Data flow**: It receives a URL, content type, and response body text. It asks serde_json to deserialize the body into the requested type, returning the typed value or a detailed decode error.
 
-**Call relations**: It is called after successful HTTP execution by typed endpoint methods and by `get_config_bundle` before mapping into `RequestError`.
+**Call relations**: Request methods call this after exec_request has successfully returned a body, for example when reading account checks, token usage profiles, and task details.
 
 *Call graph*: called by 3 (get_accounts_check, get_task_details_with_body, get_token_usage_profile); 1 external calls (bail!).
 
@@ -1909,11 +1935,11 @@ fn decode_json(&self, url: &str, ct: &str, body: &str) -> Result<T>
 async fn get_rate_limits(&self) -> Result<RateLimitSnapshot>
 ```
 
-**Purpose**: Returns a single preferred rate-limit snapshot, favoring the one whose `limit_id` is `codex`. If no such snapshot exists, it falls back to the first returned snapshot.
+**Purpose**: Returns the main rate-limit snapshot for the user. If multiple limits are available, it prefers the one identified as codex.
 
-**Data flow**: Awaits `get_rate_limits_many()`, scans the resulting vector for a snapshot with `limit_id == Some("codex")`, clones that snapshot if found, otherwise clones index 0, and returns it.
+**Data flow**: It asks get_rate_limits_many for all snapshots, searches for the snapshot whose limit ID is codex, and returns that one; if none is marked codex, it returns the first snapshot.
 
-**Call relations**: It is a convenience wrapper over `Client::get_rate_limits_many` for callers that only want the primary Codex limit.
+**Call relations**: This is the simple single-answer API. It delegates the fetching and conversion work to Client::get_rate_limits_many.
 
 *Call graph*: calls 1 internal fn (get_rate_limits_many).
 
@@ -1924,11 +1950,11 @@ async fn get_rate_limits(&self) -> Result<RateLimitSnapshot>
 async fn get_rate_limits_many(&self) -> Result<Vec<RateLimitSnapshot>>
 ```
 
-**Purpose**: Returns all mapped rate-limit snapshots from the backend, including additional metered-feature limits. It strips off the reset-credit wrapper and exposes only the snapshot list.
+**Purpose**: Returns all available rate-limit snapshots for the user. This is useful when the backend reports more than one metered feature.
 
-**Data flow**: Awaits `get_rate_limits_with_reset_credits()` from the rate-limit-resets submodule and returns its `rate_limits` field.
+**Data flow**: It fetches rate-limit data through the reset-credit-aware helper and returns the list of snapshots inside that result.
 
-**Call relations**: It is called by `Client::get_rate_limits`; the actual HTTP fetch happens in the submodule implementation.
+**Call relations**: Client::get_rate_limits calls this and then picks the preferred codex entry. The underlying fetch-and-reset behavior is supplied by the companion rate_limit_resets module.
 
 *Call graph*: called by 1 (get_rate_limits).
 
@@ -1939,11 +1965,11 @@ async fn get_rate_limits_many(&self) -> Result<Vec<RateLimitSnapshot>>
 async fn get_accounts_check(&self) -> Result<AccountsCheckResponse>
 ```
 
-**Purpose**: Fetches the backend account-check payload from the path appropriate to the current path style. It is a typed GET endpoint wrapper.
+**Purpose**: Asks the backend for account-check information. This likely tells the client whether the current account is valid and usable for Codex.
 
-**Data flow**: Builds either `/api/codex/accounts/check` or `/wham/accounts/check` under `self.base_url`, creates a GET request with `self.headers()`, executes it via `exec_request`, and deserializes the body into `AccountsCheckResponse` with `decode_json`.
+**Data flow**: It chooses the account-check URL for the current path style, builds a GET request with shared headers, sends it, and decodes the JSON body into AccountsCheckResponse.
 
-**Call relations**: It uses the shared header, execution, and decode helpers defined earlier in the file.
+**Call relations**: This method uses Client::headers, Client::exec_request, and Client::decode_json in the standard request pipeline.
 
 *Call graph*: calls 3 internal fn (decode_json, exec_request, headers); 2 external calls (get, format!).
 
@@ -1954,11 +1980,11 @@ async fn get_accounts_check(&self) -> Result<AccountsCheckResponse>
 async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile>
 ```
 
-**Purpose**: Fetches the current token-usage profile for the authenticated user/account. The endpoint path depends on `path_style`.
+**Purpose**: Fetches the current user’s token usage profile. This gives the rest of the app typed information about usage-related account state.
 
-**Data flow**: Computes the URL with `token_usage_profile_url()`, builds a GET request with common headers, executes it via `exec_request`, and decodes the body into `TokenUsageProfile`.
+**Data flow**: It builds the correct profile URL, sends a GET request with shared headers, and decodes the returned JSON into TokenUsageProfile.
 
-**Call relations**: It delegates URL construction to `Client::token_usage_profile_url` and transport work to the shared helpers.
+**Call relations**: It asks Client::token_usage_profile_url for the endpoint, then follows the normal headers, execute, decode flow.
 
 *Call graph*: calls 4 internal fn (decode_json, exec_request, headers, token_usage_profile_url); 1 external calls (get).
 
@@ -1969,11 +1995,11 @@ async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile>
 fn token_usage_profile_url(&self) -> String
 ```
 
-**Purpose**: Builds the token-usage profile endpoint URL for the current path style. It encapsulates the Codex-vs-WHAM path difference.
+**Purpose**: Builds the URL for the current user’s token usage profile. It hides the difference between Codex and ChatGPT backend paths.
 
-**Data flow**: Reads `self.path_style` and `self.base_url`, formats either `{base}/api/codex/profiles/me` or `{base}/wham/profiles/me`, and returns the string.
+**Data flow**: It reads the Client’s base URL and path style, then returns either a /api/codex/profiles/me URL or a /wham/profiles/me URL.
 
-**Call relations**: It is used by `Client::get_token_usage_profile` and validated by tests.
+**Call relations**: Client::get_token_usage_profile calls this before creating the GET request. Tests verify both URL forms.
 
 *Call graph*: called by 1 (get_token_usage_profile); 1 external calls (format!).
 
@@ -1987,11 +2013,11 @@ async fn send_add_credits_nudge_email(
     ) -> std::result::Result<(), RequestError>
 ```
 
-**Purpose**: POSTs a request asking the backend to send an add-credits nudge email for either credits or usage-limit exhaustion. It returns structured request errors so callers can inspect HTTP status.
+**Purpose**: Requests that the backend send an email nudging someone to add credits or raise a usage limit. It is used when the user has hit a credit or usage-control problem.
 
-**Data flow**: Builds the endpoint URL with `send_add_credits_nudge_email_url()`, creates a POST request with common headers and `content-type: application/json`, serializes `SendAddCreditsNudgeEmailRequest { credit_type }` as JSON, executes via `exec_request_detailed`, and returns `Ok(())` on success.
+**Data flow**: It receives a credit type, builds the correct POST URL, sends JSON containing that credit type, and returns success or a structured RequestError.
 
-**Call relations**: It relies on `Client::headers`, `Client::send_add_credits_nudge_email_url`, and `Client::exec_request_detailed`.
+**Call relations**: It uses Client::send_add_credits_nudge_email_url for routing, Client::headers for request headers, and Client::exec_request_detailed so callers can inspect failures.
 
 *Call graph*: calls 3 internal fn (exec_request_detailed, headers, send_add_credits_nudge_email_url); 2 external calls (from_static, post).
 
@@ -2008,11 +2034,11 @@ async fn list_tasks(
     ) -> Result<PaginatedListTask
 ```
 
-**Purpose**: Fetches a paginated task list with optional limit, task filter, environment id, and cursor query parameters. It builds the query incrementally based on which options are present.
+**Purpose**: Fetches a paginated list of Codex tasks. Optional filters let callers limit the number of tasks, choose a task filter, restrict by environment, or continue from a cursor.
 
-**Data flow**: Builds the list URL for the current path style, starts a GET request with common headers, conditionally adds `limit`, `task_filter`, `cursor`, and `environment_id` query pairs when each argument is `Some`, executes via `exec_request`, and decodes into `PaginatedListTaskListItem`.
+**Data flow**: It builds the task-list URL, starts a GET request with shared headers, adds any provided query parameters, sends the request, and decodes the JSON into PaginatedListTaskListItem.
 
-**Call relations**: It is called by higher-level task-listing flows and uses the shared request helpers.
+**Call relations**: Higher-level list commands call this when showing tasks. Internally it follows the same headers, execute, decode pattern as other GET methods.
 
 *Call graph*: calls 2 internal fn (exec_request, headers); called by 1 (list); 2 external calls (get, format!).
 
@@ -2023,11 +2049,11 @@ async fn list_tasks(
 async fn get_task_details(&self, task_id: &str) -> Result<CodeTaskDetailsResponse>
 ```
 
-**Purpose**: Fetches task details and returns only the parsed response object. It is a convenience wrapper over the variant that also exposes raw body and content type.
+**Purpose**: Fetches parsed details for one task. It is the simple version for callers that do not need the raw response body.
 
-**Data flow**: Borrows `task_id`, awaits `get_task_details_with_body(task_id)`, discards the raw body and content type, and returns the parsed `CodeTaskDetailsResponse`.
+**Data flow**: It receives a task ID, calls get_task_details_with_body, discards the raw body and content type, and returns only the parsed CodeTaskDetailsResponse.
 
-**Call relations**: It is used by higher-level task-detail flows and delegates all transport work to `Client::get_task_details_with_body`.
+**Call relations**: Command-running code calls this to inspect a task. It delegates all network work to Client::get_task_details_with_body.
 
 *Call graph*: calls 1 internal fn (get_task_details_with_body); called by 1 (run).
 
@@ -2041,11 +2067,11 @@ async fn get_task_details_with_body(
     ) -> Result<(CodeTaskDetailsResponse, String, String)>
 ```
 
-**Purpose**: Fetches task details and returns the parsed object together with the raw response body and content type. This supports callers that need both structured data and original payload context.
+**Purpose**: Fetches details for one task and also returns the raw server response. This is useful when a caller wants both structured data and the original body for logging or debugging.
 
-**Data flow**: Builds the task-details URL for the current path style and task id, creates a GET request with common headers, executes via `exec_request`, decodes the body into `CodeTaskDetailsResponse`, and returns `(parsed, body, ct)`.
+**Data flow**: It receives a task ID, builds the correct task URL, sends a GET request with shared headers, decodes the body into CodeTaskDetailsResponse, and returns the parsed value plus the raw body and content type.
 
-**Call relations**: It underpins `Client::get_task_details` and any caller that needs raw response inspection.
+**Call relations**: Client::get_task_details calls this and keeps only the parsed result. Other detail-oriented code can call it directly when it needs the raw response too.
 
 *Call graph*: calls 3 internal fn (decode_json, exec_request, headers); called by 2 (get_task_details, details_with_body); 2 external calls (get, format!).
 
@@ -2060,11 +2086,11 @@ async fn list_sibling_turns(
     ) -> Result<TurnAttemptsSiblingTurnsResponse>
 ```
 
-**Purpose**: Fetches sibling turns for a given task and turn id. The endpoint path is nested under the task and turn resources.
+**Purpose**: Lists alternative turns related to a task turn. In plain terms, it asks the backend for neighboring attempts or versions of the same conversation step.
 
-**Data flow**: Formats the sibling-turns URL according to `path_style`, builds a GET request with common headers, executes via `exec_request`, and decodes into `TurnAttemptsSiblingTurnsResponse`.
+**Data flow**: It receives a task ID and turn ID, builds the sibling-turns URL for the current path style, sends a GET request with shared headers, and decodes the response into TurnAttemptsSiblingTurnsResponse.
 
-**Call relations**: It is used by higher-level listing flows and shares the common transport helpers.
+**Call relations**: List-oriented command code calls this when it needs sibling turn information. Internally it uses the standard headers and request execution helpers.
 
 *Call graph*: calls 2 internal fn (exec_request, headers); called by 1 (list); 2 external calls (get, format!).
 
@@ -2077,11 +2103,11 @@ async fn get_config_bundle(
     ) -> std::result::Result<ConfigBundleResponse, RequestError>
 ```
 
-**Purpose**: Fetches the cloud-managed config bundle from the backend and returns structured request errors on HTTP failure. It is one of the endpoints where callers may need status-aware handling.
+**Purpose**: Fetches the selected cloud-managed configuration bundle from the backend. This lets the service provide configuration to the client without shipping it locally.
 
-**Data flow**: Builds either `/api/codex/config/bundle` or `/wham/config/bundle`, creates a GET request with common headers, executes via `exec_request_detailed`, then decodes the body into `ConfigBundleResponse`, mapping any decode failure into `RequestError::Other`.
+**Data flow**: It chooses the config-bundle URL, sends a GET request with shared headers, then decodes the JSON into ConfigBundleResponse. Failures are returned as RequestError so status codes can be inspected.
 
-**Call relations**: It uses the detailed execution path rather than `exec_request` so callers can inspect non-success statuses.
+**Call relations**: It uses Client::exec_request_detailed rather than the simpler executor because configuration fetch failures may need careful handling.
 
 *Call graph*: calls 2 internal fn (exec_request_detailed, headers); 2 external calls (get, format!).
 
@@ -2092,11 +2118,11 @@ async fn get_config_bundle(
 async fn create_task(&self, request_body: serde_json::Value) -> Result<String>
 ```
 
-**Purpose**: Creates a new backend task by POSTing arbitrary JSON and extracting the created task id from the response. It tolerates two response shapes for compatibility.
+**Purpose**: Creates a new backend task by posting a JSON request body. It returns the new task’s ID so the caller can track or fetch it later.
 
-**Data flow**: Builds the create-task URL for the current path style, creates a POST request with common headers and JSON content type, serializes the provided `serde_json::Value`, executes via `exec_request`, parses the response body as generic JSON, then returns `task.id` if present, otherwise top-level `id`, otherwise an `anyhow` error containing response context.
+**Data flow**: It receives a JSON value, chooses the task-creation URL, sends it as an application/json POST with shared headers, reads the response body, and looks for a task ID first at task.id and then at top-level id.
 
-**Call relations**: It is called by higher-level task-creation flows and uses the shared header/execution helpers plus custom response-shape extraction logic.
+**Call relations**: Create-command code calls this to start a task. It uses Client::exec_request for the POST and then performs custom JSON inspection because the backend may return the ID in two possible places.
 
 *Call graph*: calls 2 internal fn (exec_request, headers); called by 1 (create); 4 external calls (from_static, bail!, post, format!).
 
@@ -2109,11 +2135,11 @@ fn rate_limit_snapshots_from_payload(
     ) -> Vec<RateLimitSnapshot>
 ```
 
-**Purpose**: Transforms the backend’s rate-limit status payload into one primary `RateLimitSnapshot` plus zero or more additional snapshots for extra metered features. It also carries through plan type, credits, spend-control limit, and reached-type information.
+**Purpose**: Converts the backend’s rate-limit status payload into the protocol snapshots used by the rest of Codex. It includes the main codex limit and any extra metered limits the backend reports.
 
-**Data flow**: Consumes `RateLimitStatusPayload`, maps `plan_type`, flattens nested optional `rate_limit_reached_type`, extracts optional individual spend-control limit, constructs the primary `codex` snapshot via `make_rate_limit_snapshot`, then extends the vector with snapshots for each entry in `additional_rate_limits`, and returns the vector.
+**Data flow**: It receives a RateLimitStatusPayload, maps plan type, reached-limit reason, spend control, credits, and window data into one primary RateLimitSnapshot, then appends snapshots for additional rate limits.
 
-**Call relations**: It is used by `Client::get_rate_limits_with_reset_credits` in the submodule and heavily exercised by tests in this file.
+**Call relations**: The tests exercise this directly to prove the conversion keeps primary limits, extra limits, credits, spend controls, and reached-limit reasons intact. It relies on the smaller mapping helpers below.
 
 *Call graph*: called by 4 (usage_payload_maps_every_rate_limit_reached_type, usage_payload_maps_primary_and_additional_rate_limits, usage_payload_maps_zero_rate_limit_when_primary_absent, usage_payload_preserves_absent_rate_limit_reached_type); 2 external calls (map_plan_type, vec!).
 
@@ -2128,11 +2154,11 @@ fn make_rate_limit_snapshot(
         credits: Option<crate::type
 ```
 
-**Purpose**: Builds a single protocol-layer `RateLimitSnapshot` from backend rate-limit, credits, spend-control, plan, and reached-type components. It centralizes the field-by-field mapping logic.
+**Purpose**: Builds one RateLimitSnapshot from its pieces. It is the shared constructor used for both the main codex limit and additional limits.
 
-**Data flow**: Consumes optional identifiers plus optional backend detail structs, maps primary and secondary windows through `map_rate_limit_window`, maps credits through `map_credits`, and returns a populated `RateLimitSnapshot` with the provided individual limit, plan type, and reached type.
+**Data flow**: It receives IDs, names, optional backend rate-limit details, optional credits, individual spend control, plan type, and reached-limit reason. It maps the primary and secondary windows plus credits, then returns a complete RateLimitSnapshot.
 
-**Call relations**: It is the internal constructor used by `Client::rate_limit_snapshots_from_payload` for both primary and additional snapshots.
+**Call relations**: Client::rate_limit_snapshots_from_payload uses this to avoid duplicating snapshot-building logic for main and additional limits.
 
 *Call graph*: 2 external calls (map_credits, map_rate_limit_window).
 
@@ -2145,11 +2171,11 @@ fn map_rate_limit_reached_type(
     ) -> Option<RateLimitReachedType>
 ```
 
-**Purpose**: Converts backend-specific rate-limit reached kinds into protocol-layer `RateLimitReachedType` values. Unknown backend values are intentionally dropped as `None`.
+**Purpose**: Translates the backend’s reason for a limit being reached into the protocol reason used elsewhere in the app. Unknown backend values are deliberately dropped.
 
-**Data flow**: Consumes a `BackendRateLimitReachedKind`, matches each known variant to the corresponding `RateLimitReachedType`, and returns `Option<RateLimitReachedType>`.
+**Data flow**: It receives a backend RateLimitReachedKind and returns the matching protocol RateLimitReachedType, or None for Unknown.
 
-**Call relations**: It is used while mapping payloads in `Client::rate_limit_snapshots_from_payload`.
+**Call relations**: Client::rate_limit_snapshots_from_payload uses this while building the main snapshot. Tests cover every known variant.
 
 
 ##### `Client::send_add_credits_nudge_email_url`  (lines 558–571)
@@ -2158,11 +2184,11 @@ fn map_rate_limit_reached_type(
 fn send_add_credits_nudge_email_url(&self) -> String
 ```
 
-**Purpose**: Builds the add-credits-nudge endpoint URL for the current path style. It encapsulates the Codex-vs-WHAM path difference for that POST route.
+**Purpose**: Builds the endpoint URL for the add-credits nudge email request. It hides the path difference between Codex and ChatGPT backends.
 
-**Data flow**: Reads `self.path_style` and `self.base_url`, formats the appropriate endpoint string, and returns it.
+**Data flow**: It reads the Client’s base URL and path style, then returns either the /api/codex/accounts/send_add_credits_nudge_email URL or the /wham/accounts/send_add_credits_nudge_email URL.
 
-**Call relations**: It is used by `Client::send_add_credits_nudge_email` and validated by tests.
+**Call relations**: Client::send_add_credits_nudge_email calls this before making its POST request. Tests verify both path styles.
 
 *Call graph*: called by 1 (send_add_credits_nudge_email); 1 external calls (format!).
 
@@ -2175,11 +2201,11 @@ fn map_rate_limit_window(
     ) -> Option<RateLimitWindow>
 ```
 
-**Purpose**: Converts an optionally nested backend rate-limit window snapshot into the protocol-layer `RateLimitWindow`. It also rounds positive window lengths up to whole minutes.
+**Purpose**: Converts one backend rate-limit window into the protocol window shape. A window is a time bucket, such as a 5-minute or 1-hour usage period.
 
-**Data flow**: Consumes `Option<Option<Box<RateLimitWindowSnapshot>>>`, flattens and dereferences it, converts `used_percent` to `f64`, computes `window_minutes` via `window_minutes_from_seconds`, wraps `reset_at` as `Some(i64)`, and returns `Option<RateLimitWindow>`.
+**Data flow**: It receives an optional nested backend window. If there is no window, it returns None; otherwise it converts used percent to a floating-point number, turns seconds into rounded-up minutes, copies the reset time, and returns a RateLimitWindow.
 
-**Call relations**: It is used by `Client::make_rate_limit_snapshot` for both primary and secondary windows.
+**Call relations**: Client::make_rate_limit_snapshot calls this for primary and secondary windows. It uses Client::window_minutes_from_seconds for the time conversion.
 
 *Call graph*: 3 external calls (window_minutes_from_seconds, from, from).
 
@@ -2190,11 +2216,11 @@ fn map_rate_limit_window(
 fn map_credits(credits: Option<crate::types::CreditStatusDetails>) -> Option<CreditsSnapshot>
 ```
 
-**Purpose**: Converts backend credit-status details into the protocol-layer `CreditsSnapshot`. Missing credit details remain absent.
+**Purpose**: Converts backend credit information into the protocol credit snapshot. This tells the app whether credits exist, whether they are unlimited, and what balance is visible.
 
-**Data flow**: Consumes `Option<CreditStatusDetails>`, returns `None` if absent, otherwise constructs `CreditsSnapshot` from `has_credits`, `unlimited`, and flattened `balance`.
+**Data flow**: It receives optional backend credit details. If absent, it returns None; otherwise it copies has_credits and unlimited and flattens the optional balance into the snapshot.
 
-**Call relations**: It is used by `Client::make_rate_limit_snapshot`.
+**Call relations**: Client::make_rate_limit_snapshot calls this while building each snapshot.
 
 
 ##### `Client::map_individual_limit`  (lines 598–607)
@@ -2205,11 +2231,11 @@ fn map_individual_limit(
     ) -> SpendControlLimitSnapshot
 ```
 
-**Purpose**: Converts backend spend-control limit details into the protocol-layer `SpendControlLimitSnapshot`. It preserves the numeric strings and remaining percentage while normalizing reset time to `i64`.
+**Purpose**: Converts a backend spend-control limit into the protocol snapshot. Spend control is a cap on how much an individual can use.
 
-**Data flow**: Consumes `SpendControlLimitDetails`, copies `limit`, `used`, and `remaining_percent`, converts `reset_at` to `i64`, and returns `SpendControlLimitSnapshot`.
+**Data flow**: It receives backend spend-control details and copies the limit, used amount, remaining percent, and reset time into SpendControlLimitSnapshot.
 
-**Call relations**: It is used by `Client::rate_limit_snapshots_from_payload` when spend-control data is present.
+**Call relations**: Client::rate_limit_snapshots_from_payload uses this when the backend includes an individual spend-control limit.
 
 *Call graph*: 1 external calls (from).
 
@@ -2220,11 +2246,11 @@ fn map_individual_limit(
 fn map_plan_type(plan_type: crate::types::PlanType) -> AccountPlanType
 ```
 
-**Purpose**: Maps backend account plan variants into protocol-layer `AccountPlanType`. Several backend-only or unsupported variants collapse to `Unknown`.
+**Purpose**: Translates backend account plan names into protocol account plan names. This keeps the rest of Codex from depending directly on backend-generated types.
 
-**Data flow**: Consumes `crate::types::PlanType`, matches each variant, and returns the corresponding `AccountPlanType`.
+**Data flow**: It receives a backend PlanType and returns the matching codex_protocol AccountPlanType. Several unsupported or ambiguous plans map to Unknown.
 
-**Call relations**: It is used during rate-limit payload mapping and covered by dedicated tests for usage-based business variants.
+**Call relations**: Client::rate_limit_snapshots_from_payload calls this before producing snapshots. Tests check newer usage-based business variants and unknown-style cases.
 
 
 ##### `Client::window_minutes_from_seconds`  (lines 634–641)
@@ -2233,11 +2259,11 @@ fn map_plan_type(plan_type: crate::types::PlanType) -> AccountPlanType
 fn window_minutes_from_seconds(seconds: i32) -> Option<i64>
 ```
 
-**Purpose**: Rounds a positive window length in seconds up to whole minutes, returning `None` for non-positive values. This normalizes backend window durations for protocol consumers.
+**Purpose**: Turns a window length in seconds into minutes, rounding up. For example, 61 seconds becomes 2 minutes, which is usually clearer for display.
 
-**Data flow**: Consumes an `i32` seconds value; if `<= 0` returns `None`, otherwise converts to `i64`, computes `(seconds + 59) / 60`, and returns `Some(minutes)`.
+**Data flow**: It receives a number of seconds. If the value is zero or negative, it returns None; otherwise it converts to a larger integer type, rounds up to minutes, and returns that value.
 
-**Call relations**: It is used by `Client::map_rate_limit_window`.
+**Call relations**: Client::map_rate_limit_window calls this while converting backend window data.
 
 *Call graph*: 1 external calls (from).
 
@@ -2248,11 +2274,11 @@ fn window_minutes_from_seconds(seconds: i32) -> Option<i64>
 fn map_plan_type_supports_usage_based_business_variants()
 ```
 
-**Purpose**: Verifies that the two usage-based business backend plan variants map to their protocol equivalents rather than collapsing to unknown. This protects a subtle compatibility case.
+**Purpose**: Checks that newer usage-based business plan types are not accidentally collapsed to Unknown.
 
-**Data flow**: Calls `Client::map_plan_type` for `SelfServeBusinessUsageBased` and `EnterpriseCbpUsageBased` and asserts the expected `AccountPlanType` outputs.
+**Data flow**: The test feeds two backend plan variants into Client::map_plan_type and asserts that the exact matching protocol variants come out.
 
-**Call relations**: It targets specific branches in `Client::map_plan_type`.
+**Call relations**: The Rust test runner calls this during tests. It protects the mapping used by Client::rate_limit_snapshots_from_payload.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2263,11 +2289,11 @@ fn map_plan_type_supports_usage_based_business_variants()
 fn usage_payload_maps_primary_and_additional_rate_limits()
 ```
 
-**Purpose**: Verifies full mapping of a rich backend usage payload containing primary and secondary windows, additional limits, credits, spend-control data, and a reached-type. It is the broadest end-to-end mapping test in the file.
+**Purpose**: Verifies that a rich backend rate-limit payload is converted correctly. It covers the main codex limit, an additional limit, credits, spend controls, plan type, and reached-limit reason.
 
-**Data flow**: Constructs a nested `RateLimitStatusPayload` with populated fields, calls `Client::rate_limit_snapshots_from_payload`, and asserts the resulting snapshots contain the expected ids, windows, credits, plan type, reached type, and individual limit values.
+**Data flow**: The test builds a sample RateLimitStatusPayload, passes it to Client::rate_limit_snapshots_from_payload, and checks the resulting snapshots field by field.
 
-**Call relations**: It exercises `rate_limit_snapshots_from_payload` and, indirectly, the helper mappers it uses.
+**Call relations**: The test runner calls this to guard the rate-limit adapter code against regressions.
 
 *Call graph*: calls 1 internal fn (rate_limit_snapshots_from_payload); 4 external calls (new, default, assert_eq!, vec!).
 
@@ -2278,11 +2304,11 @@ fn usage_payload_maps_primary_and_additional_rate_limits()
 fn usage_payload_maps_zero_rate_limit_when_primary_absent()
 ```
 
-**Purpose**: Verifies that the primary `codex` snapshot is still emitted even when the backend omits the main rate-limit details. This preserves a stable snapshot list shape.
+**Purpose**: Checks that conversion still returns a main codex snapshot even when the backend omits the primary rate-limit details.
 
-**Data flow**: Builds a payload with no primary rate limit and one additional limit, maps it through `Client::rate_limit_snapshots_from_payload`, and asserts the primary snapshot exists with `None` windows while the additional snapshot is still present.
+**Data flow**: The test builds a payload with no main rate-limit data but with an additional limit, converts it, and asserts that both expected snapshots exist with missing window data where appropriate.
 
-**Call relations**: It covers the branch where `make_rate_limit_snapshot` receives `None` for rate-limit details.
+**Call relations**: This protects Client::rate_limit_snapshots_from_payload from dropping important entries just because some optional backend fields are absent.
 
 *Call graph*: calls 1 internal fn (rate_limit_snapshots_from_payload); 2 external calls (assert_eq!, vec!).
 
@@ -2293,11 +2319,11 @@ fn usage_payload_maps_zero_rate_limit_when_primary_absent()
 fn preferred_snapshot_selection_matches_get_rate_limits_behavior()
 ```
 
-**Purpose**: Documents the selection rule used by `get_rate_limits`: prefer the snapshot whose `limit_id` is `codex`, otherwise use the first element. It tests the selection logic independently of HTTP fetching.
+**Purpose**: Documents and verifies the rule used by get_rate_limits: prefer the snapshot whose limit ID is codex.
 
-**Data flow**: Creates an array of two `RateLimitSnapshot` values, one non-codex and one codex, runs the same iterator/find/clone fallback logic used in `get_rate_limits`, and asserts the codex snapshot is chosen.
+**Data flow**: The test creates two snapshots, one non-codex and one codex, applies the same selection logic as get_rate_limits, and asserts that the codex snapshot is chosen.
 
-**Call relations**: It mirrors the in-method logic of `Client::get_rate_limits`.
+**Call relations**: The test runner calls this as a safety check for the selection behavior used by Client::get_rate_limits.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2308,11 +2334,11 @@ fn preferred_snapshot_selection_matches_get_rate_limits_behavior()
 fn usage_payload_maps_every_rate_limit_reached_type()
 ```
 
-**Purpose**: Verifies mapping for every backend `RateLimitReachedKind` variant, including the `Unknown` case mapping to `None`. This guards the enum translation table.
+**Purpose**: Checks every known backend reason for a reached limit. This ensures user-facing logic can distinguish credits depleted from usage limits reached and owner from member cases.
 
-**Data flow**: Iterates over backend kind/expected-output pairs, constructs a minimal payload for each, maps it through `Client::rate_limit_snapshots_from_payload`, and asserts the first snapshot’s `rate_limit_reached_type` matches expectation.
+**Data flow**: The test loops through backend reached-limit kinds, creates a payload for each, converts it, and asserts that the expected protocol reason appears in the snapshot.
 
-**Call relations**: It exercises all branches of `Client::map_rate_limit_reached_type` through the higher-level payload mapper.
+**Call relations**: It exercises Client::rate_limit_snapshots_from_payload and, through it, the reached-type mapping helper.
 
 *Call graph*: calls 1 internal fn (rate_limit_snapshots_from_payload); 1 external calls (assert_eq!).
 
@@ -2323,11 +2349,11 @@ fn usage_payload_maps_every_rate_limit_reached_type()
 fn usage_payload_preserves_absent_rate_limit_reached_type()
 ```
 
-**Purpose**: Verifies that a completely absent reached-type field remains absent after mapping. This distinguishes missing data from an explicit known enum value.
+**Purpose**: Verifies that if the backend does not say why a rate limit was reached, the converted snapshot also leaves that reason absent.
 
-**Data flow**: Builds a payload with `rate_limit_reached_type: None`, maps it through `Client::rate_limit_snapshots_from_payload`, and asserts the resulting snapshot has `None` for `rate_limit_reached_type`.
+**Data flow**: The test builds a payload with no reached-limit type, converts it, and checks that the resulting snapshot has None for that field.
 
-**Call relations**: It covers the nested-optional flattening behavior in `Client::rate_limit_snapshots_from_payload`.
+**Call relations**: This protects the conversion code from inventing a reason when the backend did not provide one.
 
 *Call graph*: calls 1 internal fn (rate_limit_snapshots_from_payload); 1 external calls (assert_eq!).
 
@@ -2338,11 +2364,11 @@ fn usage_payload_preserves_absent_rate_limit_reached_type()
 fn add_credits_nudge_email_uses_expected_paths_and_bodies()
 ```
 
-**Purpose**: Verifies endpoint URL construction and JSON serialization for the add-credits-nudge email API under both path styles. It also checks enum serialization names.
+**Purpose**: Checks the URL paths and JSON body shape for add-credit nudge emails. This prevents small naming changes from breaking the backend contract.
 
-**Data flow**: Builds test clients for Codex and ChatGPT path styles, asserts `send_add_credits_nudge_email_url()` outputs, serializes `SendAddCreditsNudgeEmailRequest` for both enum variants, and asserts the resulting JSON values.
+**Data flow**: The test creates Codex-style and ChatGPT-style clients, checks their generated nudge-email URLs, then serializes both credit-type request bodies and compares them to the expected JSON.
 
-**Call relations**: It validates `Client::send_add_credits_nudge_email_url` and the request payload shape used by `Client::send_add_credits_nudge_email`.
+**Call relations**: It calls the test_client helper and exercises Client::send_add_credits_nudge_email_url plus the request-body serialization type.
 
 *Call graph*: 2 external calls (assert_eq!, test_client).
 
@@ -2353,11 +2379,11 @@ fn add_credits_nudge_email_uses_expected_paths_and_bodies()
 fn token_usage_profile_uses_expected_paths()
 ```
 
-**Purpose**: Verifies token-usage profile URL construction for both Codex and ChatGPT path styles. This protects the path-style routing split.
+**Purpose**: Checks that token usage profile URLs are built correctly for both backend path styles.
 
-**Data flow**: Builds test clients for both path styles, calls `token_usage_profile_url()`, and asserts the exact URLs.
+**Data flow**: The test creates one Codex-style client and one ChatGPT-style client, calls token_usage_profile_url on each, and compares the strings to the expected endpoints.
 
-**Call relations**: It directly tests `Client::token_usage_profile_url`.
+**Call relations**: It calls the test_client helper and protects Client::get_token_usage_profile from using the wrong endpoint.
 
 *Call graph*: 2 external calls (assert_eq!, test_client).
 
@@ -2368,24 +2394,24 @@ fn token_usage_profile_uses_expected_paths()
 fn test_client(base_url: &str, path_style: PathStyle) -> Client
 ```
 
-**Purpose**: Builds a minimal client fixture with a plain reqwest client and unauthenticated auth provider. It avoids the heavier constructor path in tests that only need URL or mapping behavior.
+**Purpose**: Creates a lightweight Client for tests without going through the full constructor. This lets tests set the base URL and path style exactly.
 
-**Data flow**: Consumes a base URL and `PathStyle`, constructs a `Client` with those values plus `reqwest::Client::new()`, unauthenticated auth provider, and default optional fields, and returns it.
+**Data flow**: It receives a base URL and path style, fills in a Client with a plain reqwest client, unauthenticated auth provider, no user agent, no account ID, no FedRAMP flag, and the requested path style.
 
-**Call relations**: It is a shared fixture for URL-construction tests in this file.
+**Call relations**: URL-focused tests call this so they can inspect path-building behavior without making network requests or relying on Client::new’s URL normalization.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (unauthenticated_auth_provider).
 
 
 ### `chatgpt/src/chatgpt_client.rs`
 
-`io_transport` · `authenticated backend request handling`
+`io_transport` · `request handling`
 
-This file is the transport shim used by ChatGPT-specific features elsewhere in the crate. `chatgpt_get_request` is a convenience wrapper that forwards to `chatgpt_get_request_with_timeout` with no explicit timeout. The main function, `chatgpt_get_request_with_timeout`, performs both auth validation and HTTP execution.
+This file solves a practical problem: other parts of the program need to ask the ChatGPT backend for information, but they should not each have to repeat the same login checks, URL building, headers, timeout handling, and JSON parsing. Without this file, every caller would need to know exactly how ChatGPT backend authentication works, and mistakes could lead to failed requests or confusing login errors.
 
-It begins by reading `config.chatgpt_base_url` and obtaining a shared `AuthManager` from the current config with Codex API key env support disabled. It then requires a present auth session, verifies that the auth uses the Codex backend, and requires a non-empty account id; otherwise it returns explicit `anyhow` errors instructing the user to log in again. Once auth is validated, it creates the default HTTP client, joins the base URL and requested path while trimming duplicate slashes, and builds a GET request with auth headers from `codex_model_provider::auth_provider_from_auth`, the `OAI-Product-Sku: codex` header, and JSON content type. An optional timeout is applied per request.
+The flow is like showing a membership card before entering a building. First, the code looks up the configured ChatGPT base URL. Then it gets the current authentication details from the shared login system. It refuses to continue unless the authentication is for the Codex backend and includes an account ID, because those are required for this backend. After that, it builds the final URL from the base URL and the requested path, creates an HTTP GET request, adds the authentication headers, marks the request as coming from the Codex product, and optionally applies a timeout.
 
-After sending, success responses are parsed as JSON into generic `T: DeserializeOwned`; parse and send failures are wrapped with context strings. Non-success statuses are not silently ignored: the function reads the response body as text and returns an error containing both HTTP status and body, which is important for debugging backend failures.
+When the backend replies, the file checks whether the HTTP status means success. If it does, it reads the response as JSON and converts it into the type the caller asked for. If the backend returns an error, it includes both the status code and response body in the error message, which makes failures easier to diagnose.
 
 #### Function details
 
@@ -2398,11 +2424,11 @@ async fn chatgpt_get_request(
 ) -> anyhow::Result<T>
 ```
 
-**Purpose**: Issues a ChatGPT backend GET request using the default timeout behavior. It is a thin convenience wrapper around the timeout-capable variant.
+**Purpose**: This is the simple way to make a ChatGPT backend GET request when the caller does not need a custom timeout. It exists as a convenience wrapper so callers can ask for data without thinking about timeout settings.
 
-**Data flow**: It takes a `Config` reference and request path string, forwards both to `chatgpt_get_request_with_timeout(config, path, None).await`, and returns the deserialized `T` or propagated error.
+**Data flow**: It receives the app configuration and a backend path. It passes both to the timeout-aware request function, using no timeout. The result is either parsed JSON in the caller’s requested type or an error explaining what went wrong.
 
-**Call relations**: Called by `get_task` for standard task fetches. It exists so most callers do not need to mention timeout handling explicitly.
+**Call relations**: When code such as get_task needs data from the ChatGPT backend, it calls this simpler function. This function immediately hands the real work to chatgpt_get_request_with_timeout, keeping the common case short and consistent.
 
 *Call graph*: calls 1 internal fn (chatgpt_get_request_with_timeout); called by 1 (get_task).
 
@@ -2417,11 +2443,11 @@ async fn chatgpt_get_request_with_timeout(
 ) -> anyhow::Result<T>
 ```
 
-**Purpose**: Builds and sends an authenticated GET request to the ChatGPT backend, optionally with a timeout, and deserializes a successful JSON response. It also enforces that the current auth session is a Codex-backend ChatGPT session with an account id.
+**Purpose**: This function performs the actual authenticated GET request to the ChatGPT backend. It checks that the user has the right login, builds the HTTP request, optionally sets a timeout, and parses the JSON response.
 
-**Data flow**: It takes `config`, a relative path, and `Option<Duration>`. It reads `config.chatgpt_base_url`, obtains `AuthManager::shared_from_config`, awaits `auth_manager.auth()`, validates auth presence, backend type, and account id, creates an HTTP client, formats the full URL by trimming slashes, and builds a GET request with auth headers, `OAI-Product-Sku`, and `Content-Type`. If `timeout` is `Some`, it applies it to the request. It sends the request, and on success parses JSON into `T`; on failure status it reads the body text and returns an error containing status and body.
+**Data flow**: It receives the app configuration, the API path to request, and an optional timeout. It reads the ChatGPT base URL and authentication details from the configuration, verifies that the login can be used for the Codex backend, builds the full URL, adds authentication and product headers, sends the request, and then either returns the parsed JSON response or an error containing the failed status and response body.
 
-**Call relations**: Used directly by `codex_plugins_enabled_for_workspace` and indirectly by `get_task` through `chatgpt_get_request`. It is the shared transport primitive for ChatGPT backend reads in this crate.
+**Call relations**: This is the shared worker used by the convenience function chatgpt_get_request and by codex_plugins_enabled_for_workspace when a timeout may matter. Inside the request flow, it calls the login system to get authentication, creates an HTTP client, turns the authentication into request headers, and stops early with clear errors if the login or backend response is not acceptable.
 
 *Call graph*: calls 2 internal fn (create_client, shared_from_config); called by 2 (chatgpt_get_request, codex_plugins_enabled_for_workspace); 4 external calls (bail!, ensure!, auth_provider_from_auth, format!).
 
@@ -2430,11 +2456,13 @@ async fn chatgpt_get_request_with_timeout(
 
 `io_transport` · `request handling`
 
-This file contains the production transport implementation for cloud tasks. `HttpClient` wraps a `codex_backend_client::Client` plus the configured `base_url`, exposes builder-style mutators for user agent, auth provider, and ChatGPT account ID, and implements `CloudBackend` by boxing async calls into helper sub-APIs. Those helpers split responsibilities into `api::Tasks` for listing/details/creation, `api::Attempts` for sibling-turn enumeration, and `api::Apply` for local patch application.
+This file is the bridge between the local command-line tool and the cloud service that stores Codex tasks. Without it, the rest of the code could talk about tasks in a clean, project-friendly way, but it would not know how to actually ask the remote server for them or turn the server's raw replies into useful local objects.
 
-The task path is intentionally defensive. Detail fetches use `details_with_body` so callers can inspect both parsed extension methods (`unified_diff`, `assistant_text_messages`, `user_text_prompt`) and the raw JSON body when fields are missing. Summary construction merges metadata from `task`, `task_status_display`, and fallback diff parsing; timestamps fall back from `updated_at` to `created_at` to latest turn timestamps, and diff stats fall back from structured counters to line-by-line unified diff parsing.
+The main type is `HttpClient`. It wraps a lower-level backend HTTP client and implements the `CloudBackend` trait, which is the common interface the rest of the application uses. Think of it like a travel adapter: the app speaks in terms of “task summaries” and “apply this diff,” while the server speaks in JSON responses and HTTP endpoints. This file converts between the two.
 
-Attempt handling extracts diffs and assistant messages from loosely typed `serde_json::Value` maps, then sorts attempts by placement, timestamp, and finally turn ID. Apply logic is local rather than remote: it fetches or accepts a diff override, rejects non-unified patch formats up front, invokes `apply_git_patch`, derives `Success`/`Partial`/`Error` from exit code and path lists, and emits detailed diagnostics to `error.log` including stdout/stderr tails and the full patch on failures. Logging is pervasive but best-effort: `append_error_log` silently ignores file-open/write errors.
+Inside the private `api` module, the work is split into small helper wrappers. `Tasks` covers listing, creating, and reading tasks. `Attempts` reads sibling attempts for a task turn. `Apply` fetches or receives a diff, checks that it is a normal unified git diff, and asks git-apply helper code to test or apply it locally.
+
+The file also contains many translation helpers. They extract assistant messages, diff statistics, timestamps, statuses, environment labels, and attempt counts from sometimes-nested JSON. A small logging helper writes diagnostic information to `error.log`, especially when server responses or patch application do not behave as expected.
 
 #### Function details
 
@@ -2444,11 +2472,11 @@ Attempt handling extracts diffs and assistant messages from loosely typed `serde
 fn new(base_url: impl Into<String>) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Builds a new HTTP cloud-tasks client from a base URL and initializes the underlying backend client against that same endpoint.
+**Purpose**: Creates a new HTTP cloud task client for a given server base URL. This is the starting point for using the cloud backend over the network.
 
-**Data flow**: It takes any `Into<String>` base URL, converts it into an owned `String`, passes a clone into `backend::Client::new`, and returns `Ok(HttpClient { base_url, backend })` on success. Backend-construction failures are propagated as `anyhow::Result` errors.
+**Data flow**: It receives a base URL, turns it into a string, builds the lower-level backend client with the same URL, and returns an `HttpClient` containing both. If the lower-level client cannot be created, the error is returned instead.
 
-**Call relations**: This is the constructor used during backend initialization before auth and user-agent customization are layered on. After creation, callers typically chain `with_user_agent`, `with_auth_provider`, and `with_chatgpt_account_id` before the instance is wrapped behind `CloudBackend`.
+**Call relations**: Startup code calls this through `init_backend` when it needs a real cloud connection. After this, the returned client can be configured further or used through the `CloudBackend` interface.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (init_backend); 2 external calls (clone, into).
 
@@ -2459,11 +2487,11 @@ fn new(base_url: impl Into<String>) -> anyhow::Result<Self>
 fn with_user_agent(mut self, ua: impl Into<String>) -> Self
 ```
 
-**Purpose**: Returns a modified client whose underlying backend client sends a custom user-agent string.
+**Purpose**: Returns a copy of the client that sends a custom user-agent string with HTTP requests. A user-agent identifies the calling program to the server.
 
-**Data flow**: It consumes `self`, clones the embedded backend client, applies `with_user_agent` to that clone, stores the result back into `self.backend`, and returns the updated `HttpClient`. The `base_url` is preserved unchanged.
+**Data flow**: It takes the existing client and a user-agent value, clones the lower-level backend client with that setting added, and returns the updated `HttpClient`.
 
-**Call relations**: This is a builder step used immediately after construction when startup code wants requests tagged with the Codex user agent. It delegates the actual header behavior to the backend client implementation.
+**Call relations**: This is an optional setup step after construction. Later task and apply calls use the configured backend client automatically.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2474,11 +2502,11 @@ fn with_user_agent(mut self, ua: impl Into<String>) -> Self
 fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Attaches an authentication provider to the backend client so subsequent HTTP requests carry ChatGPT/Codex auth.
+**Purpose**: Returns a copy of the client that knows how to authenticate requests. Authentication is how the server knows which user or account is making the request.
 
-**Data flow**: It takes ownership of `self` and a `SharedAuthProvider`, clones the current backend client, applies `with_auth_provider(auth)`, writes the updated backend back into the struct, and returns the modified client.
+**Data flow**: It receives a shared authentication provider, installs it into a cloned backend client, and returns the updated `HttpClient`.
 
-**Call relations**: Startup code invokes this after loading auth state. It is purely a wiring step; all later task and attempt requests rely on the backend client configured here.
+**Call relations**: This is used during client setup before any cloud calls are made. All later task, attempt, and apply API wrappers use this authenticated backend.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2489,11 +2517,11 @@ fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self
 fn with_chatgpt_account_id(mut self, account_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Configures the backend client to send a specific ChatGPT account identifier with requests.
+**Purpose**: Returns a copy of the client that sends a specific ChatGPT account identifier with requests. This lets the backend route requests to the right account context.
 
-**Data flow**: It consumes `self`, converts the provided account ID into a string inside the backend builder call, replaces `self.backend` with the configured clone, and returns the updated client.
+**Data flow**: It takes an account ID, attaches it to a cloned backend client, and returns the updated `HttpClient`.
 
-**Call relations**: This is another optional builder-stage customization used when auth exposes an account ID. It affects all later API calls indirectly through the backend client.
+**Call relations**: This is another optional setup step. Once set, all later requests made through this client carry the account information.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2504,11 +2532,11 @@ fn with_chatgpt_account_id(mut self, account_id: impl Into<String>) -> Self
 fn tasks_api(&self) -> api::Tasks<'_>
 ```
 
-**Purpose**: Creates a lightweight `api::Tasks` view borrowing this client’s base URL and backend client.
+**Purpose**: Creates a small task-specific helper for operations such as listing, reading, and creating tasks. It keeps task-related HTTP details out of the public client methods.
 
-**Data flow**: It reads `self.base_url` and `self.backend` and packages references to them into a new `api::Tasks<'_>` value. No state is mutated.
+**Data flow**: It reads the client’s base URL and backend client reference, wraps them in an `api::Tasks` value, and returns that lightweight wrapper.
 
-**Call relations**: All task-oriented `CloudBackend` methods route through this helper before calling `list`, `summary`, `diff`, `messages`, `task_text`, or `create`. It centralizes the borrow setup for those operations.
+**Call relations**: The public task methods call this just before doing their work. It then hands off to the matching `api::Tasks` method.
 
 *Call graph*: called by 6 (create_task, get_task_diff, get_task_messages, get_task_summary, get_task_text, list_tasks); 1 external calls (new).
 
@@ -2519,11 +2547,11 @@ fn tasks_api(&self) -> api::Tasks<'_>
 fn attempts_api(&self) -> api::Attempts<'_>
 ```
 
-**Purpose**: Creates a borrowed `api::Attempts` helper for sibling-attempt queries.
+**Purpose**: Creates a helper focused on sibling task attempts. These are alternative runs or turns for the same task.
 
-**Data flow**: It reads the embedded backend client reference and returns `api::Attempts::new(self)`. No mutation or I/O occurs here.
+**Data flow**: It borrows the backend client from `HttpClient`, puts it into an `api::Attempts` wrapper, and returns that wrapper.
 
-**Call relations**: The `CloudBackend::list_sibling_attempts` implementation uses this helper to reach the attempt-listing logic.
+**Call relations**: The public sibling-attempt listing method calls this and then delegates the actual server request to `api::Attempts::list`.
 
 *Call graph*: called by 1 (list_sibling_attempts); 1 external calls (new).
 
@@ -2534,11 +2562,11 @@ fn attempts_api(&self) -> api::Attempts<'_>
 fn apply_api(&self) -> api::Apply<'_>
 ```
 
-**Purpose**: Creates a borrowed `api::Apply` helper for local patch application and preflight checks.
+**Purpose**: Creates a helper for applying or preflighting a task’s patch. Preflighting means checking whether a patch would apply cleanly without actually changing files.
 
-**Data flow**: It reads the backend client reference from `self` and returns a new `api::Apply<'_>` wrapper. It has no side effects.
+**Data flow**: It borrows the backend client and returns an `api::Apply` wrapper that can fetch task details and run patch application.
 
-**Call relations**: Both `apply_task` and `apply_task_preflight` delegate through this helper to share the same patch-fetching and git-apply logic.
+**Call relations**: The public apply methods call this wrapper so the patch-specific logic stays grouped in one place.
 
 *Call graph*: called by 2 (apply_task, apply_task_preflight); 1 external calls (new).
 
@@ -2554,11 +2582,11 @@ fn list_tasks(
     ) -> CloudBackendFuture<'a, TaskListPage>
 ```
 
-**Purpose**: Implements the trait method by boxing an async call that fetches one page of task summaries.
+**Purpose**: Implements the public cloud-backend operation for listing tasks. Callers can optionally filter by environment, limit the number of results, and continue from a pagination cursor.
 
-**Data flow**: It accepts optional environment, limit, and cursor parameters, captures them in an async block, invokes `self.tasks_api().list(...)`, and returns a pinned future yielding `Result<TaskListPage>`. It does not itself perform the HTTP request until awaited.
+**Data flow**: It receives the filter and pagination inputs, creates a task API wrapper, and returns an asynchronous future that will produce a `TaskListPage` when awaited.
 
-**Call relations**: Callers use this through the `CloudBackend` trait. The future delegates all real work to `api::Tasks::list`.
+**Call relations**: Higher-level code calls this through the `CloudBackend` trait. The method immediately hands the real work to `api::Tasks::list`.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2569,11 +2597,11 @@ fn list_tasks(
 fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary>
 ```
 
-**Purpose**: Boxes an async request that loads and maps a single task’s summary metadata.
+**Purpose**: Fetches one task’s summary information, such as title, status, updated time, and diff statistics.
 
-**Data flow**: It takes a `TaskId`, captures it in an async block, calls `self.tasks_api().summary(id).await`, and returns a pinned future producing `Result<TaskSummary>`.
+**Data flow**: It receives a task ID, creates a task API wrapper, and returns a future that resolves to a `TaskSummary`.
 
-**Call relations**: Trait consumers invoke this when they need status/title/diff-summary metadata for one task. The mapping logic lives in `api::Tasks::summary`.
+**Call relations**: This is the trait-level entry for summary lookups. It delegates parsing and server details to `api::Tasks::summary`.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2584,11 +2612,11 @@ fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary>
 fn get_task_diff(&self, id: TaskId) -> CloudBackendFuture<'_, Option<String>>
 ```
 
-**Purpose**: Boxes an async request that retrieves the unified diff for a task when present.
+**Purpose**: Fetches the patch or diff produced by a cloud task, if one is available. A diff is a text description of file changes.
 
-**Data flow**: It captures the provided `TaskId`, calls `self.tasks_api().diff(id).await` inside an async block, and returns a pinned future yielding `Result<Option<String>>`.
+**Data flow**: It receives a task ID, creates a task API wrapper, and returns a future that resolves to either a diff string or `None`.
 
-**Call relations**: Used by CLI and TUI detail flows through the `CloudBackend` trait. It delegates extraction and fallback behavior to `api::Tasks::diff`.
+**Call relations**: Cloud-backend callers use this when they need to inspect changes. The actual HTTP fetch is done by `api::Tasks::diff`.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2599,11 +2627,11 @@ fn get_task_diff(&self, id: TaskId) -> CloudBackendFuture<'_, Option<String>>
 fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>>
 ```
 
-**Purpose**: Boxes an async request that retrieves assistant text messages for a task without diff content.
+**Purpose**: Fetches assistant text messages for a task. These are the human-readable responses produced by the assistant during the task.
 
-**Data flow**: It takes a `TaskId`, invokes `self.tasks_api().messages(id).await` inside a boxed async block, and returns a future yielding `Result<Vec<String>>`.
+**Data flow**: It receives a task ID, delegates to the task API wrapper, and returns a future that resolves to a list of message strings.
 
-**Call relations**: This trait method is used when callers want textual assistant output. The actual extraction path is implemented in `api::Tasks::messages`.
+**Call relations**: This is the public trait method for message retrieval. It hands off to `api::Tasks::messages`, which knows how to extract messages from the server response.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2614,11 +2642,11 @@ fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>>
 fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText>
 ```
 
-**Purpose**: Boxes an async request that retrieves the creating prompt, assistant messages, and attempt metadata for a task.
+**Purpose**: Fetches the full text view of a task: the user prompt, assistant messages, and current attempt metadata.
 
-**Data flow**: It captures the `TaskId`, awaits `self.tasks_api().task_text(id)`, and returns a pinned future yielding `Result<TaskText>`.
+**Data flow**: It receives a task ID, creates the task API wrapper, and returns a future producing a `TaskText` structure.
 
-**Call relations**: Higher layers use this for richer detail views and attempt navigation. It delegates parsing to `api::Tasks::task_text`.
+**Call relations**: Higher-level display code can call this through `CloudBackend`. The detailed extraction is performed by `api::Tasks::task_text`.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2633,11 +2661,11 @@ fn list_sibling_attempts(
     ) -> CloudBackendFuture<'_, Vec<TurnAttempt>>
 ```
 
-**Purpose**: Boxes an async request that fetches alternate assistant attempts for a given task turn.
+**Purpose**: Lists alternative attempts for the same task turn. This is useful when a task was run multiple ways and the user wants to compare them.
 
-**Data flow**: It takes a `TaskId` and `turn_id`, captures them in an async block, calls `self.attempts_api().list(task, turn_id).await`, and returns a future yielding `Result<Vec<TurnAttempt>>`.
+**Data flow**: It receives a task ID and turn ID, creates the attempts API wrapper, and returns a future containing sorted `TurnAttempt` values.
 
-**Call relations**: This is invoked after task text reveals sibling turn IDs. The sorting and extraction logic lives in `api::Attempts::list`.
+**Call relations**: The trait method delegates to `api::Attempts::list`, which talks to the backend and converts raw turn data into local attempt objects.
 
 *Call graph*: calls 1 internal fn (attempts_api); 1 external calls (pin).
 
@@ -2652,11 +2680,11 @@ fn apply_task(
     ) -> CloudBackendFuture<'_, ApplyOutcome>
 ```
 
-**Purpose**: Boxes an async operation that applies a task’s diff locally to the working tree.
+**Purpose**: Applies a task’s diff to the current local working directory. This is the action that turns cloud-generated changes into local file edits.
 
-**Data flow**: It accepts a task ID and optional diff override, then awaits `self.apply_api().run(id, diff_override, false)` inside a boxed future. The returned `ApplyOutcome` reflects actual application, not dry-run validation.
+**Data flow**: It receives a task ID and optional diff override, creates the apply API wrapper, and returns a future with an `ApplyOutcome` describing success, partial success, or failure.
 
-**Call relations**: CLI and TUI apply actions call this through the trait. It shares implementation with preflight via `api::Apply::run`.
+**Call relations**: Callers use this when they want to actually change local files. It delegates to `api::Apply::run` with preflight mode turned off.
 
 *Call graph*: calls 1 internal fn (apply_api); 1 external calls (pin).
 
@@ -2671,11 +2699,11 @@ fn apply_task_preflight(
     ) -> CloudBackendFuture<'_, ApplyOutcome>
 ```
 
-**Purpose**: Boxes an async dry-run patch validation for a task diff without modifying the working tree.
+**Purpose**: Checks whether a task’s diff would apply cleanly, without modifying files. This gives users a safe preview before applying changes.
 
-**Data flow**: It takes a task ID and optional diff override, calls `self.apply_api().run(id, diff_override, true)` in an async block, and returns a future yielding `Result<ApplyOutcome>`.
+**Data flow**: It receives a task ID and optional diff override, creates the apply API wrapper, and returns a future with the check result.
 
-**Call relations**: Used before actual apply to surface skipped/conflicting paths. It differs from `apply_task` only by the `preflight` flag passed into shared apply logic.
+**Call relations**: Callers use this before a real apply. It delegates to `api::Apply::run` with preflight mode turned on.
 
 *Call graph*: calls 1 internal fn (apply_api); 1 external calls (pin).
 
@@ -2693,11 +2721,11 @@ fn create_task(
     ) -> CloudBackendFuture<'a, crate::Cr
 ```
 
-**Purpose**: Boxes an async request that submits a new cloud task with environment, prompt, branch, QA mode, and best-of-N settings.
+**Purpose**: Creates a new cloud task from a prompt, environment, git reference, and run options. This starts new work on the server.
 
-**Data flow**: It captures borrowed `env_id`, `prompt`, and `git_ref` plus `qa_mode` and `best_of_n`, awaits `self.tasks_api().create(...)`, and returns a future yielding `Result<CreatedTask>`.
+**Data flow**: It receives the task inputs, builds a task API wrapper, and returns a future that resolves to the newly created task ID.
 
-**Call relations**: CLI exec and TUI new-task submission use this trait method. Request-body construction and logging are delegated to `api::Tasks::create`.
+**Call relations**: This is the public trait entry for task creation. It delegates request-building and error logging to `api::Tasks::create`.
 
 *Call graph*: calls 1 internal fn (tasks_api); 1 external calls (pin).
 
@@ -2708,11 +2736,11 @@ fn create_task(
 fn new(client: &'a HttpClient) -> Self
 ```
 
-**Purpose**: Builds a borrowed task-API helper from an `HttpClient`.
+**Purpose**: Builds the internal task API helper from an `HttpClient`. This helper carries just the pieces needed for task-related server calls.
 
-**Data flow**: It reads `client.base_url` and `client.backend` and stores references to them in a `Tasks<'a>` struct. No allocation beyond the wrapper itself and no I/O occur.
+**Data flow**: It borrows the base URL and backend client from the outer client and stores those references in a new `Tasks` wrapper.
 
-**Call relations**: This helper is created by `HttpClient::tasks_api` before any task-listing, detail, or creation operation.
+**Call relations**: The outer `HttpClient` creates this wrapper whenever a task operation begins, then calls one of its task-specific methods.
 
 
 ##### `api::Tasks::list`  (lines 158–191)
@@ -2726,11 +2754,11 @@ async fn list(
         ) -> Result<TaskListPage>
 ```
 
-**Purpose**: Fetches one page of tasks from the backend, converts each backend list item into a `TaskSummary`, and records a diagnostic log entry.
+**Purpose**: Asks the server for a page of tasks and converts the server’s task rows into local summaries. It also records a short diagnostic log entry.
 
-**Data flow**: It takes optional environment, limit, and cursor inputs; converts `limit` from `i64` to `Option<i32>` when possible; calls `backend.list_tasks(limit_i32, Some("current"), env, cursor)`; maps each returned `backend::TaskListItem` through `map_task_list_item_to_summary`; logs env/limit/cursor/item-count to `error.log`; and returns `TaskListPage { tasks, cursor: resp.cursor }`. HTTP failures are wrapped as `CloudTaskError::Http`.
+**Data flow**: It receives optional environment, limit, and cursor values, sends them to the backend list endpoint, maps each returned item into a `TaskSummary`, and returns a page containing summaries plus the next cursor.
 
-**Call relations**: This is the concrete implementation behind `HttpClient::list_tasks`. It delegates per-item mapping to `map_task_list_item_to_summary` and logging to `append_error_log`.
+**Call relations**: This is reached from `HttpClient::list_tasks`. It relies on `map_task_list_item_to_summary` for the per-task translation and uses `append_error_log` to record what was requested and returned.
 
 *Call graph*: calls 2 internal fn (list_tasks, append_error_log); 1 external calls (format!).
 
@@ -2741,11 +2769,11 @@ async fn list(
 async fn summary(&self, id: TaskId) -> Result<TaskSummary>
 ```
 
-**Purpose**: Loads full task details, decodes raw JSON metadata, and synthesizes a `TaskSummary` with status, timestamps, environment info, diff stats, review flag, and attempt count.
+**Purpose**: Fetches detailed information for one task and turns it into a concise local summary. It fills in status, timestamps, environment labels, review flag, attempt count, and diff stats.
 
-**Data flow**: It takes a `TaskId`, fetches `(details, body, content-type)` via `details_with_body`, parses `body` as `serde_json::Value`, extracts the `task` object and optional `task_status_display`, computes `TaskStatus` via `map_status`, computes `DiffSummary` from structured stats or falls back to parsing `details.unified_diff()`, derives `updated_at` from task timestamps or latest turn timestamps, reads `environment_id`, `environment_label`, `attempt_total`, `title`, and `is_review`, then returns a populated `TaskSummary`. Missing metadata or JSON decode failures become `CloudTaskError::Http` with the raw body embedded for debugging.
+**Data flow**: It receives a task ID, fetches both parsed details and the raw response body, reads JSON fields from the response, computes missing diff statistics from the actual diff when needed, and returns a `TaskSummary`.
 
-**Call relations**: This powers `HttpClient::get_task_summary`. It relies on `details_with_body` for transport, then delegates specific field derivations to `map_status`, `diff_summary_from_status_display`, `diff_summary_from_diff`, `latest_turn_timestamp`, `env_label_from_status_display`, `attempt_total_from_status_display`, and `parse_updated_at`.
+**Call relations**: This is reached from `HttpClient::get_task_summary`. It uses helper functions to interpret status displays, timestamps, diff summaries, environment labels, and attempt counts.
 
 *Call graph*: calls 1 internal fn (details_with_body); 7 external calls (attempt_total_from_status_display, diff_summary_from_diff, diff_summary_from_status_display, env_label_from_status_display, map_status, parse_updated_at, from_str).
 
@@ -2756,11 +2784,11 @@ async fn summary(&self, id: TaskId) -> Result<TaskSummary>
 async fn diff(&self, id: TaskId) -> Result<Option<String>>
 ```
 
-**Purpose**: Retrieves task details and returns the unified diff if the parsed backend response exposes one.
+**Purpose**: Fetches the unified diff for a task when the server has one. A unified diff is the standard text format used by git to describe file changes.
 
-**Data flow**: It takes a `TaskId`, fetches details/body/content-type via `details_with_body`, checks `details.unified_diff()`, and returns `Ok(Some(diff))` when present or `Ok(None)` otherwise. Transport failures are converted into `CloudTaskError::Http`.
+**Data flow**: It receives a task ID, fetches task details with the raw body, asks the parsed response for its diff, and returns that diff or `None`.
 
-**Call relations**: This is the implementation behind `HttpClient::get_task_diff`. It intentionally ignores the raw body unless needed for debugging elsewhere.
+**Call relations**: This is reached from `HttpClient::get_task_diff`. It uses `details_with_body` for the HTTP call, but only needs the parsed detail object for the final answer.
 
 *Call graph*: calls 1 internal fn (details_with_body).
 
@@ -2771,11 +2799,11 @@ async fn diff(&self, id: TaskId) -> Result<Option<String>>
 async fn messages(&self, id: TaskId) -> Result<Vec<String>>
 ```
 
-**Purpose**: Extracts assistant text output from task details, falling back to raw-body JSON traversal and finally to a synthesized failure message when the assistant turn contains an error.
+**Purpose**: Extracts assistant messages for a task, using fallback paths when the normal parsed response does not contain them. It produces text that can be shown to a user.
 
-**Data flow**: It fetches details/body/content-type, starts with `details.assistant_text_messages()`, falls back to `extract_assistant_messages_from_body(&body)` if empty, returns those messages if any exist, otherwise checks `details.assistant_error_message()` and returns a single `Task failed: ...` string, and if still empty constructs a detailed `CloudTaskError::Http` including the inferred details URL, content type, and raw body.
+**Data flow**: It receives a task ID, fetches parsed details plus raw JSON, first asks the parsed response for assistant messages, then falls back to manually scanning the raw body. If the task has an assistant error, it returns a failure message; if nothing useful is found, it returns an HTTP-style error with debugging context.
 
-**Call relations**: This backs `HttpClient::get_task_messages`. It delegates URL formatting to `details_path` and raw JSON scraping to `extract_assistant_messages_from_body`.
+**Call relations**: This is reached from `HttpClient::get_task_messages`. It uses `extract_assistant_messages_from_body` as a fallback and `details_path` to build a helpful URL for error messages.
 
 *Call graph*: calls 1 internal fn (details_with_body); 5 external calls (Http, details_path, extract_assistant_messages_from_body, format!, vec!).
 
@@ -2786,11 +2814,11 @@ async fn messages(&self, id: TaskId) -> Result<Vec<String>>
 async fn task_text(&self, id: TaskId) -> Result<TaskText>
 ```
 
-**Purpose**: Builds a rich `TaskText` object containing the user prompt, assistant messages, and current attempt metadata from task details.
+**Purpose**: Builds a fuller text package for a task, including the user prompt, assistant messages, current turn ID, sibling IDs, attempt placement, and attempt status.
 
-**Data flow**: It fetches details/body, reads `prompt` from `details.user_text_prompt()`, gathers assistant messages from parsed details or raw-body fallback, inspects `details.current_assistant_turn` for `turn_id`, `sibling_turn_ids`, `attempt_placement`, and `turn_status`, maps the status string through `attempt_status_from_str`, and returns a `TaskText` struct.
+**Data flow**: It receives a task ID, fetches task details and raw JSON, extracts prompt and messages, reads current assistant-turn metadata, converts the raw status string into a local status value, and returns `TaskText`.
 
-**Call relations**: This is the implementation behind `HttpClient::get_task_text`. It is used by higher layers that need both conversation text and attempt navigation metadata.
+**Call relations**: This is reached from `HttpClient::get_task_text`. It shares the same message fallback helper as `api::Tasks::messages` and uses `attempt_status_from_str` for status translation.
 
 *Call graph*: calls 1 internal fn (details_with_body); 2 external calls (attempt_status_from_str, extract_assistant_messages_from_body).
 
@@ -2808,11 +2836,11 @@ async fn create(
         ) -> Result<crate::C
 ```
 
-**Purpose**: Constructs the backend JSON payload for a new task submission, optionally injects a starting diff from the environment, adds best-of-N metadata when needed, submits the request, and logs success or failure.
+**Purpose**: Builds the JSON request for a new task and sends it to the server. It can also include a starting diff from an environment variable and metadata for running multiple attempts.
 
-**Data flow**: It takes `env_id`, `prompt`, `git_ref`, `qa_mode`, and `best_of_n`; builds `input_items` starting with a user text message; conditionally appends a `pre_apply_patch` item from `CODEX_STARTING_DIFF`; builds a `new_task` JSON object with environment, branch, and QA mode; inserts `metadata.best_of_n` when `best_of_n > 1`; calls `backend.create_task(request_body)`; logs either the created ID or the failure with prompt length; and returns `CreatedTask { id: TaskId(id) }` or `CloudTaskError::Http`.
+**Data flow**: It receives environment ID, prompt, git branch/reference, QA-mode flag, and best-of count. It constructs the request body, optionally adds `CODEX_STARTING_DIFF` and `best_of_n`, sends the request, logs success or failure, and returns the created task ID or an HTTP error.
 
-**Call relations**: This powers `HttpClient::create_task`. It is the only place in this file that shapes outbound task-creation JSON.
+**Call relations**: This is reached from `HttpClient::create_task`. It hands the final JSON to the lower-level backend client and uses `append_error_log` for audit-style diagnostics.
 
 *Call graph*: calls 2 internal fn (create_task, append_error_log); 6 external calls (new, Http, new, format!, json!, var).
 
@@ -2826,11 +2854,11 @@ async fn details_with_body(
         ) -> anyhow::Result<(backend::CodeTaskDetailsResponse, String, String)>
 ```
 
-**Purpose**: Fetches task details while preserving both the parsed response object and the raw response body/content type.
+**Purpose**: Fetches task details while keeping both the parsed response and the raw server body. The raw body is important for fallback parsing and better error messages.
 
-**Data flow**: It takes a task ID string, awaits `backend.get_task_details_with_body(id)`, and returns the parsed `CodeTaskDetailsResponse`, raw body string, and content-type string as a tuple inside `anyhow::Result`.
+**Data flow**: It receives a task ID string, asks the backend for parsed details plus body and content type, and returns all three together.
 
-**Call relations**: This helper is shared by summary, diff, messages, and task-text retrieval so those paths can combine extension-method access with raw-body diagnostics and fallback parsing.
+**Call relations**: The summary, diff, messages, and task-text flows all call this helper so they can share one consistent way of retrieving task details.
 
 *Call graph*: calls 1 internal fn (get_task_details_with_body); called by 4 (diff, messages, summary, task_text).
 
@@ -2841,11 +2869,11 @@ async fn details_with_body(
 fn new(client: &'a HttpClient) -> Self
 ```
 
-**Purpose**: Builds a borrowed attempts-API helper from an `HttpClient`.
+**Purpose**: Builds the internal attempts API helper from an `HttpClient`. This helper is focused only on sibling-turn lookup.
 
-**Data flow**: It reads the client’s backend reference and stores it in an `Attempts<'a>` wrapper. No I/O or mutation occurs.
+**Data flow**: It borrows the backend client from the outer client and stores that reference in a new `Attempts` wrapper.
 
-**Call relations**: Created by `HttpClient::attempts_api` before sibling-attempt listing.
+**Call relations**: The outer `HttpClient` creates this wrapper when sibling attempts are requested, then calls `api::Attempts::list`.
 
 
 ##### `api::Attempts::list`  (lines 412–426)
@@ -2854,11 +2882,11 @@ fn new(client: &'a HttpClient) -> Self
 async fn list(&self, task: TaskId, turn_id: String) -> Result<Vec<TurnAttempt>>
 ```
 
-**Purpose**: Fetches sibling turns for a task turn, converts each raw map into a `TurnAttempt`, sorts them into display order, and returns the resulting list.
+**Purpose**: Fetches sibling turns for a task and turns them into sorted local attempt objects. This gives callers a clean list of alternative attempts.
 
-**Data flow**: It takes a `TaskId` and `turn_id`, calls `backend.list_sibling_turns(&task.0, &turn_id)`, iterates `resp.sibling_turns`, converts each map with `turn_attempt_from_map`, sorts the resulting vector with `compare_attempts`, and returns it. Backend failures become `CloudTaskError::Http`.
+**Data flow**: It receives a task ID and turn ID, asks the backend for sibling turns, converts each usable raw map into a `TurnAttempt`, sorts the attempts into a stable order, and returns the list.
 
-**Call relations**: This is the concrete implementation behind `HttpClient::list_sibling_attempts`. It delegates extraction and ordering to `turn_attempt_from_map` and `compare_attempts`.
+**Call relations**: This is reached from `HttpClient::list_sibling_attempts`. It depends on `turn_attempt_from_map` for conversion and `compare_attempts` for ordering.
 
 *Call graph*: calls 1 internal fn (list_sibling_turns).
 
@@ -2869,11 +2897,11 @@ async fn list(&self, task: TaskId, turn_id: String) -> Result<Vec<TurnAttempt>>
 fn new(client: &'a HttpClient) -> Self
 ```
 
-**Purpose**: Builds a borrowed apply-API helper from an `HttpClient`.
+**Purpose**: Builds the internal apply API helper from an `HttpClient`. This helper owns the logic for fetching and applying task diffs.
 
-**Data flow**: It stores a reference to the client’s backend in an `Apply<'a>` wrapper. No side effects occur.
+**Data flow**: It borrows the backend client from the outer client and stores that reference in a new `Apply` wrapper.
 
-**Call relations**: Created by `HttpClient::apply_api` before preflight or actual apply operations.
+**Call relations**: The outer `HttpClient` creates this wrapper for both real apply and preflight apply requests, then calls `api::Apply::run`.
 
 
 ##### `api::Apply::run`  (lines 440–571)
@@ -2887,11 +2915,11 @@ async fn run(
         ) -> Result<ApplyOutcome>
 ```
 
-**Purpose**: Fetches or accepts a diff, validates that it is a unified patch, runs local git apply in either preflight or real mode, derives an `ApplyOutcome`, and logs detailed diagnostics for failures or partial application.
+**Purpose**: Applies a task patch locally, or checks whether it would apply cleanly. It protects users from unsupported patch formats and reports detailed success, partial, or failure information.
 
-**Data flow**: It takes a `TaskId`, optional `diff_override`, and `preflight` flag. If no override is supplied, it fetches task details and extracts `unified_diff`, erroring if absent. It rejects non-unified patch formats early with an `ApplyOutcome` carrying `ApplyStatus::Error`. Otherwise it builds `ApplyGitRequest { cwd, diff, revert: false, preflight }`, invokes `apply_git_patch`, derives `ApplyStatus` from exit code and applied/conflicted path counts, computes `applied` as success-and-not-preflight, formats a human-readable message tailored to preflight vs apply, conditionally logs command/stdout/stderr/patch details for partial or failed results, and returns `ApplyOutcome { applied, status, message, skipped_paths, conflict_paths }`. Execution failures of git apply itself become `CloudTaskError::Io`; missing diffs become `CloudTaskError::Msg`; backend fetch failures become `CloudTaskError::Http`.
+**Data flow**: It receives a task ID, an optional diff override, and a preflight flag. If no override is supplied, it fetches the task details and extracts the diff. It rejects non-unified diffs, builds an apply request for the current directory, runs the git patch helper, translates the result into an `ApplyOutcome`, and logs rich diagnostics when something goes wrong.
 
-**Call relations**: Both `HttpClient::apply_task` and `HttpClient::apply_task_preflight` funnel into this shared implementation with different `preflight` flags. It delegates patch-format checks and diagnostics to `is_unified_diff`, `summarize_patch_for_logging`, `tail`, and `append_error_log`.
+**Call relations**: This is reached from `HttpClient::apply_task` and `HttpClient::apply_task_preflight`. It uses diff-format checking, patch summaries, tail extraction, the git-apply helper, and `append_error_log` to make failures understandable.
 
 *Call graph*: calls 2 internal fn (get_task_details, append_error_log); 9 external calls (new, new, is_unified_diff, summarize_patch_for_logging, apply_git_patch, format!, matches!, current_dir, writeln!).
 
@@ -2902,11 +2930,11 @@ async fn run(
 fn details_path(base_url: &str, id: &str) -> Option<String>
 ```
 
-**Purpose**: Infers the human-readable task-details endpoint path shape from the configured base URL.
+**Purpose**: Builds a likely task-details URL for error messages based on the configured base URL shape. It is only for diagnostics, not for making the request.
 
-**Data flow**: It takes `base_url` and task ID, checks whether the base URL contains `/backend-api` or `/api/codex`, and returns the corresponding formatted details URL or `None` if the path style is unknown.
+**Data flow**: It receives a base URL and task ID, checks which known API path style the base URL contains, and returns a formatted details URL when it recognizes the style.
 
-**Call relations**: This helper is only used when `api::Tasks::messages` needs to embed a likely GET URL in an error message.
+**Call relations**: The messages flow uses this when it cannot find assistant text, so the resulting error points to the endpoint that was probably queried.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2917,11 +2945,11 @@ fn details_path(base_url: &str, id: &str) -> Option<String>
 fn extract_assistant_messages_from_body(body: &str) -> Vec<String>
 ```
 
-**Purpose**: Walks raw task-details JSON to recover assistant text messages from the current assistant turn worklog when typed helper methods return nothing.
+**Purpose**: Manually scans the raw JSON response body for assistant messages. This is a fallback for cases where the typed response helper did not expose the text.
 
-**Data flow**: It parses the raw body into `serde_json::Value`, navigates to `current_assistant_turn.worklog.messages`, filters entries whose `author.role` is `assistant`, then extracts text from `content.parts` whether each part is a bare string or an object with `content_type == "text"`. It returns all non-empty text fragments as a `Vec<String>`.
+**Data flow**: It receives a raw JSON string, parses it as generic JSON, walks into the current assistant turn’s worklog messages, collects non-empty text parts written by the assistant, and returns them as strings.
 
-**Call relations**: This is a fallback parser used by both `api::Tasks::messages` and `api::Tasks::task_text` when the backend extension methods do not expose assistant messages.
+**Call relations**: Both `api::Tasks::messages` and `api::Tasks::task_text` use this when their first, cleaner extraction path returns no messages.
 
 *Call graph*: 1 external calls (new).
 
@@ -2932,11 +2960,11 @@ fn extract_assistant_messages_from_body(body: &str) -> Vec<String>
 fn turn_attempt_from_map(turn: &HashMap<String, Value>) -> Option<TurnAttempt>
 ```
 
-**Purpose**: Converts one loosely typed sibling-turn map into a strongly typed `TurnAttempt` if the required turn ID is present.
+**Purpose**: Turns one raw sibling-turn JSON map into a local `TurnAttempt`. It extracts the useful pieces needed for comparison or display.
 
-**Data flow**: It reads `id`, `attempt_placement`, `created_at`, `turn_status`, `output_items`, and message content from a `HashMap<String, Value>`, parses timestamps with `parse_timestamp_value`, maps status with `attempt_status_from_str`, extracts diff and assistant messages with dedicated helpers, and returns `Some(TurnAttempt)` or `None` if no string `id` exists.
+**Data flow**: It receives a map of JSON fields, requires an ID, then reads placement, creation time, status, diff, and assistant messages. If the required ID is missing, it returns nothing; otherwise it returns a populated attempt.
 
-**Call relations**: Used by `api::Attempts::list` as the per-item conversion step before sorting.
+**Call relations**: The attempts listing flow calls this for every sibling turn returned by the backend. It delegates timestamp, status, diff, and message extraction to smaller helpers.
 
 *Call graph*: 4 external calls (attempt_status_from_str, extract_assistant_messages_from_turn, extract_diff_from_turn, parse_timestamp_value).
 
@@ -2947,11 +2975,11 @@ fn turn_attempt_from_map(turn: &HashMap<String, Value>) -> Option<TurnAttempt>
 fn compare_attempts(a: &TurnAttempt, b: &TurnAttempt) -> Ordering
 ```
 
-**Purpose**: Defines stable ordering for attempts: explicit placement first, then creation time, then turn ID.
+**Purpose**: Defines the sort order for task attempts. It prefers explicit attempt placement, then creation time, then turn ID as a final tie-breaker.
 
-**Data flow**: It compares two `TurnAttempt` references by `attempt_placement` when both or either are present; if neither has placement, it compares `created_at`; if timestamps are also absent, it compares `turn_id`. It returns a standard `Ordering`.
+**Data flow**: It receives two `TurnAttempt` values and compares their placement fields first. If those are missing, it compares timestamps, and if those are also missing, it compares IDs.
 
-**Call relations**: This comparator is passed to `sort_by` in `api::Attempts::list` so sibling attempts appear in a predictable sequence.
+**Call relations**: The attempts listing flow uses this after converting raw sibling turns, so callers receive attempts in a predictable, user-friendly order.
 
 
 ##### `api::extract_diff_from_turn`  (lines 658–684)
@@ -2960,11 +2988,11 @@ fn compare_attempts(a: &TurnAttempt, b: &TurnAttempt) -> Ordering
 fn extract_diff_from_turn(turn: &HashMap<String, Value>) -> Option<String>
 ```
 
-**Purpose**: Searches a sibling-turn payload for an embedded diff in either direct `output_diff` items or nested PR output structures.
+**Purpose**: Finds a diff inside one raw turn object. The server may store it in more than one output-item shape, so this helper checks the known places.
 
-**Data flow**: It reads the `output_items` array from a turn map, iterates items, and for each item returns the first non-empty diff string found either at `type == "output_diff"` / `diff` or at `type == "pr"` / `output_diff.diff`. If nothing matches, it returns `None`.
+**Data flow**: It receives a JSON map for a turn, reads its output items, looks for either an `output_diff` item or a pull-request item containing an output diff, and returns the first non-empty diff string found.
 
-**Call relations**: Called by `api::turn_attempt_from_map` to populate `TurnAttempt.diff`.
+**Call relations**: This is used while building a `TurnAttempt` from raw backend data. It lets attempt objects carry their own patch when available.
 
 
 ##### `api::extract_assistant_messages_from_turn`  (lines 686–706)
@@ -2973,11 +3001,11 @@ fn extract_diff_from_turn(turn: &HashMap<String, Value>) -> Option<String>
 fn extract_assistant_messages_from_turn(turn: &HashMap<String, Value>) -> Vec<String>
 ```
 
-**Purpose**: Extracts assistant text message parts from a sibling-turn `output_items` array.
+**Purpose**: Finds assistant text messages inside one raw turn object. It collects the text content from message output items.
 
-**Data flow**: It scans `output_items`, keeps only items with `type == "message"`, iterates their `content` arrays, and collects non-empty `text` fields from parts whose `content_type` is `text`. It returns the collected strings.
+**Data flow**: It receives a JSON map, walks through output items of type `message`, reads text parts from their content arrays, skips empty text, and returns the collected strings.
 
-**Call relations**: Called by `api::turn_attempt_from_map` to populate `TurnAttempt.messages`.
+**Call relations**: This is used by `turn_attempt_from_map` so each sibling attempt can include the assistant response text that belongs to that attempt.
 
 *Call graph*: 1 external calls (new).
 
@@ -2988,11 +3016,11 @@ fn extract_assistant_messages_from_turn(turn: &HashMap<String, Value>) -> Vec<St
 fn attempt_status_from_str(raw: Option<&str>) -> AttemptStatus
 ```
 
-**Purpose**: Maps backend turn-status strings into the local `AttemptStatus` enum.
+**Purpose**: Converts the server’s attempt status text into the project’s local `AttemptStatus` value. Unknown or missing statuses are treated as pending.
 
-**Data flow**: It takes an optional status string, substitutes an empty default when absent, matches known values (`failed`, `completed`, `in_progress`, `pending`), and returns the corresponding enum. Any unknown or missing value currently maps to `AttemptStatus::Pending`.
+**Data flow**: It receives an optional raw status string, matches known values such as failed, completed, in progress, and pending, and returns the corresponding enum value.
 
-**Call relations**: Used when building both `TaskText` and `TurnAttempt` values from backend payloads.
+**Call relations**: Task-text and sibling-attempt conversion use this so the rest of the program does not need to know the server’s exact status strings.
 
 
 ##### `api::parse_timestamp_value`  (lines 718–725)
@@ -3001,11 +3029,11 @@ fn attempt_status_from_str(raw: Option<&str>) -> AttemptStatus
 fn parse_timestamp_value(v: Option<&Value>) -> Option<DateTime<Utc>>
 ```
 
-**Purpose**: Converts an optional JSON numeric Unix timestamp with fractional seconds into `DateTime<Utc>`.
+**Purpose**: Converts a JSON number timestamp into a UTC date-time value. The timestamp is expected to be seconds since the Unix epoch, possibly with decimals.
 
-**Data flow**: It reads an optional `serde_json::Value`, extracts it as `f64`, splits it into integer seconds and fractional nanoseconds, clamps negative seconds to zero, constructs a `Duration` from the Unix epoch, and returns `Some(DateTime<Utc>)` or `None` if parsing fails.
+**Data flow**: It receives an optional JSON value, reads it as a floating-point number, splits it into seconds and nanoseconds, and returns a `DateTime<Utc>` when possible.
 
-**Call relations**: Used by `api::turn_attempt_from_map` for sibling-turn creation timestamps.
+**Call relations**: Sibling-attempt conversion uses this to turn raw creation times into sortable and displayable time values.
 
 *Call graph*: 2 external calls (from, new).
 
@@ -3016,11 +3044,11 @@ fn parse_timestamp_value(v: Option<&Value>) -> Option<DateTime<Utc>>
 fn map_task_list_item_to_summary(src: backend::TaskListItem) -> TaskSummary
 ```
 
-**Purpose**: Converts a backend task-list row into the shared `TaskSummary` model.
+**Purpose**: Converts one task row from the list endpoint into the local `TaskSummary` shape. This keeps the rest of the app independent from the backend’s list response format.
 
-**Data flow**: It takes a `backend::TaskListItem`, reads its `task_status_display`, maps status via `map_status`, parses `updated_at` via `parse_updated_at`, derives environment label and diff summary from status display, marks `is_review` true when `pull_requests` is non-empty, computes `attempt_total`, and returns a `TaskSummary` with `environment_id` left as `None` because list rows do not provide it.
+**Data flow**: It receives a backend task-list item, reads its ID, title, status display, update time, pull-request marker, environment label, diff stats, and attempt count, then returns a `TaskSummary`.
 
-**Call relations**: This is the per-item mapper used by `api::Tasks::list`.
+**Call relations**: The task listing flow applies this to every item returned by the server. It uses the same small helper functions as the detailed summary path where possible.
 
 *Call graph*: 6 external calls (new, attempt_total_from_status_display, diff_summary_from_status_display, env_label_from_status_display, map_status, parse_updated_at).
 
@@ -3031,11 +3059,11 @@ fn map_task_list_item_to_summary(src: backend::TaskListItem) -> TaskSummary
 fn map_status(v: Option<&HashMap<String, Value>>) -> TaskStatus
 ```
 
-**Purpose**: Normalizes backend status-display structures into the local four-state `TaskStatus` enum.
+**Purpose**: Translates server status information into the project’s simpler task status values: pending, ready, applied, or error.
 
-**Data flow**: It inspects an optional status-display map, first preferring `latest_turn_status_display.turn_status` and mapping backend turn states like `completed`, `failed`, `cancelled`, and `in_progress`; if absent, it falls back to top-level `state`; if neither is usable, it returns `TaskStatus::Pending`.
+**Data flow**: It receives optional status-display data, first checks the latest turn status when present, then falls back to a general state field, and returns a local `TaskStatus`. Missing or unknown values become pending.
 
-**Call relations**: Used by both list-item and full-summary mapping so task status is derived consistently across endpoints.
+**Call relations**: Both list and detailed-summary conversion use this so user-facing code sees consistent statuses even though the backend response can vary.
 
 
 ##### `api::parse_updated_at`  (lines 774–783)
@@ -3044,11 +3072,11 @@ fn map_status(v: Option<&HashMap<String, Value>>) -> TaskStatus
 fn parse_updated_at(ts: Option<&f64>) -> DateTime<Utc>
 ```
 
-**Purpose**: Converts an optional floating-point Unix timestamp into `DateTime<Utc>`, defaulting to the current time when absent.
+**Purpose**: Converts an optional numeric timestamp into a UTC date-time, using the current time if no timestamp is available.
 
-**Data flow**: It takes `Option<&f64>`, computes seconds and nanoseconds when present, constructs a UTC datetime from the Unix epoch, and otherwise returns `Utc::now()`. Negative seconds are clamped to zero.
+**Data flow**: It receives an optional floating-point timestamp, turns it into seconds and nanoseconds since the Unix epoch, and returns a `DateTime<Utc>`. If the input is missing, it returns `Utc::now()`.
 
-**Call relations**: Used when mapping both list rows and full task summaries.
+**Call relations**: Task-list and detailed-summary conversion use this to give every summary an updated time, even when the server omits one.
 
 *Call graph*: 3 external calls (from, now, new).
 
@@ -3059,11 +3087,11 @@ fn parse_updated_at(ts: Option<&f64>) -> DateTime<Utc>
 fn env_label_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<String>
 ```
 
-**Purpose**: Extracts the optional human-friendly environment label from a status-display map.
+**Purpose**: Extracts a human-friendly environment label from status-display data. The label is what users can recognize more easily than an internal environment ID.
 
-**Data flow**: It takes an optional `HashMap<String, Value>`, looks up `environment_label`, converts a string value into an owned `String`, and returns `Option<String>`.
+**Data flow**: It receives optional status-display data, looks for the `environment_label` string, and returns it when present.
 
-**Call relations**: Used by both list and summary mapping to populate `TaskSummary.environment_label`.
+**Call relations**: Task-list and detailed-summary conversion call this while building `TaskSummary` values.
 
 
 ##### `api::diff_summary_from_diff`  (lines 792–818)
@@ -3072,11 +3100,11 @@ fn env_label_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<S
 fn diff_summary_from_diff(diff: &str) -> DiffSummary
 ```
 
-**Purpose**: Computes coarse diff statistics directly from unified diff text when structured stats are unavailable.
+**Purpose**: Counts changed files, added lines, and removed lines directly from a diff string. This is a fallback when the server does not provide diff statistics.
 
-**Data flow**: It iterates over diff lines, increments `files_changed` on `diff --git` headers, ignores file headers and hunk markers, counts leading `+` lines as additions and leading `-` lines as removals, and if no file header was seen but the diff is non-empty treats it as one changed file. It returns a `DiffSummary` with those counts.
+**Data flow**: It receives diff text, walks line by line, counts `diff --git` file markers, counts real added and removed lines while ignoring diff headers, and returns a `DiffSummary`.
 
-**Call relations**: Used as a fallback in `api::Tasks::summary` when backend status-display diff stats are all zero.
+**Call relations**: The detailed summary flow uses this only when the status-display diff stats are all zero but an actual diff is available.
 
 
 ##### `api::diff_summary_from_status_display`  (lines 820–839)
@@ -3085,11 +3113,11 @@ fn diff_summary_from_diff(diff: &str) -> DiffSummary
 fn diff_summary_from_status_display(v: Option<&HashMap<String, Value>>) -> DiffSummary
 ```
 
-**Purpose**: Reads structured diff statistics from `latest_turn_status_display.diff_stats` when the backend provides them.
+**Purpose**: Reads diff statistics from the server’s status-display JSON. These stats summarize how many files and lines changed.
 
-**Data flow**: It starts from `DiffSummary::default()`, navigates through the optional status-display map to `latest_turn_status_display.diff_stats`, reads `files_modified`, `lines_added`, and `lines_removed` as signed integers, clamps negatives to zero, and returns the populated summary.
+**Data flow**: It receives optional status-display data, finds the latest turn’s `diff_stats`, reads files modified, lines added, and lines removed, clamps negative values to zero, and returns a `DiffSummary`.
 
-**Call relations**: Used by both list and summary mapping as the preferred source of diff counts.
+**Call relations**: Task-list and detailed-summary conversion use this as the first source of diff statistics.
 
 *Call graph*: 1 external calls (default).
 
@@ -3100,11 +3128,11 @@ fn diff_summary_from_status_display(v: Option<&HashMap<String, Value>>) -> DiffS
 fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<f64>
 ```
 
-**Purpose**: Extracts the latest assistant-turn timestamp from status-display metadata.
+**Purpose**: Finds the newest timestamp from the latest turn status. This gives the summary a useful time even when the top-level task timestamp is missing.
 
-**Data flow**: It navigates an optional status-display map to `latest_turn_status_display`, then returns `updated_at` or `created_at` as `Option<f64>`. If any layer is missing, it returns `None`.
+**Data flow**: It receives optional status-display data, walks into the latest turn object, prefers its updated time, falls back to created time, and returns the numeric timestamp if found.
 
-**Call relations**: Used by `api::Tasks::summary` as a fallback source for `updated_at` when task-level timestamps are absent.
+**Call relations**: The detailed summary flow uses this as a fallback after checking the task’s own updated and created timestamps.
 
 
 ##### `api::attempt_total_from_status_display`  (lines 852–859)
@@ -3113,11 +3141,11 @@ fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<f64>
 fn attempt_total_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<usize>
 ```
 
-**Purpose**: Infers the total number of attempts from sibling turn IDs in status-display metadata.
+**Purpose**: Estimates how many attempts exist for a task turn. It counts sibling turn IDs and adds one for the current turn.
 
-**Data flow**: It navigates to `latest_turn_status_display.sibling_turn_ids`, reads the array length, adds one for the current turn, and returns that as `Option<usize>`. Missing metadata yields `None`.
+**Data flow**: It receives optional status-display data, finds the latest turn’s sibling ID array, and returns its length plus one. If the data is missing, it returns nothing.
 
-**Call relations**: Used by both list and summary mapping to populate `TaskSummary.attempt_total`.
+**Call relations**: Task-list and detailed-summary conversion use this to fill the attempt count shown in `TaskSummary`.
 
 
 ##### `api::is_unified_diff`  (lines 861–869)
@@ -3126,11 +3154,11 @@ fn attempt_total_from_status_display(v: Option<&HashMap<String, Value>>) -> Opti
 fn is_unified_diff(diff: &str) -> bool
 ```
 
-**Purpose**: Performs a lightweight format check to decide whether a patch string looks like a unified git diff.
+**Purpose**: Checks whether patch text looks like a unified git diff. This protects the apply path from sending an incompatible patch format to git.
 
-**Data flow**: It trims leading whitespace, returns true immediately for `diff --git` prefixes, otherwise checks for both `---`/`+++` file headers and at least one `@@` hunk marker. It returns a boolean only and does not parse the patch fully.
+**Data flow**: It receives diff text, trims leading whitespace, then checks for either a `diff --git` header or the standard `---`, `+++`, and hunk-marker pattern. It returns true only when the text looks applyable as a unified diff.
 
-**Call relations**: Used by `api::Apply::run` to reject incompatible patch formats before invoking git.
+**Call relations**: `api::Apply::run` calls this before attempting local patch application. If it fails, the apply flow returns a clear error instead of running git blindly.
 
 
 ##### `api::tail`  (lines 871–877)
@@ -3139,11 +3167,11 @@ fn is_unified_diff(diff: &str) -> bool
 fn tail(s: &str, max: usize) -> String
 ```
 
-**Purpose**: Returns the last `max` bytes of a string for compact logging.
+**Purpose**: Returns the last part of a string, capped to a maximum length. This keeps log entries useful without dumping unlimited command output.
 
-**Data flow**: It takes a string slice and maximum length, returns the whole string if already short enough, otherwise slices from `s.len() - max` to the end and returns that substring as a new `String`.
+**Data flow**: It receives a string and maximum byte length. If the string is short enough it returns the whole string; otherwise it returns only the final slice.
 
-**Call relations**: Used by `api::Apply::run` when logging stdout and stderr tails from git apply failures.
+**Call relations**: `api::Apply::run` uses this when logging stdout and stderr from patch application failures, so the most recent output is preserved.
 
 
 ##### `api::summarize_patch_for_logging`  (lines 879–905)
@@ -3152,11 +3180,11 @@ fn tail(s: &str, max: usize) -> String
 fn summarize_patch_for_logging(patch: &str) -> String
 ```
 
-**Purpose**: Builds a compact textual summary of a patch’s apparent format, size, current working directory, and leading lines for diagnostics.
+**Purpose**: Creates a compact diagnostic summary of a patch. It records the apparent patch kind, size, current directory, and the first few lines.
 
-**Data flow**: It inspects the patch prefix to classify it as `codex-patch`, `git-diff`, `unified-diff`, or `unknown`, counts lines and characters, reads the current working directory if available, captures up to the first 20 lines, truncates that preview to 800 characters, and returns a formatted summary string.
+**Data flow**: It receives patch text, classifies its format, counts lines and characters, reads the current working directory, truncates the first 20 lines if needed, and returns one formatted summary string.
 
-**Call relations**: Used by `api::Apply::run` both when rejecting non-unified patches and when logging partial/error apply results.
+**Call relations**: `api::Apply::run` uses this when a patch is not in the expected format or when apply/preflight fails, making `error.log` easier to understand.
 
 *Call graph*: 2 external calls (format!, current_dir).
 
@@ -3167,11 +3195,11 @@ fn summarize_patch_for_logging(patch: &str) -> String
 fn append_error_log(message: &str)
 ```
 
-**Purpose**: Appends a timestamped diagnostic line to `error.log` on a best-effort basis.
+**Purpose**: Appends a timestamped diagnostic message to `error.log` in the current directory. It is a best-effort helper: logging failures are ignored.
 
-**Data flow**: It gets the current UTC timestamp, opens `error.log` in create-and-append mode, and writes `[timestamp] message` followed by a newline if the file opens successfully. Any file-open or write failure is ignored.
+**Data flow**: It receives a message string, gets the current time, opens or creates `error.log` in append mode, and writes one timestamped line or block.
 
-**Call relations**: This is the shared logging sink used by task listing, task creation, and apply flows to preserve debugging context without interrupting normal execution.
+**Call relations**: Task listing, task creation, and patch application call this to leave breadcrumbs about requests, failures, and patch details without interrupting the main user flow.
 
 *Call graph*: called by 3 (run, create, list); 3 external calls (now, new, writeln!).
 
@@ -3180,11 +3208,11 @@ fn append_error_log(message: &str)
 
 `io_transport` · `config load`
 
-This file is the concrete remote-backed adapter for thread configuration loading. `RemoteThreadConfigLoader` stores a single endpoint string and exposes a trait-compatible `load` method that opens a tonic client connection, sends a `LoadThreadConfigRequest`, and translates the returned protobuf `sources` into local `ThreadConfigSource` values. The request builder preserves the optional `thread_id`, stringifies the optional absolute `cwd`, and sets a fixed 5-second gRPC timeout via request metadata.
+A thread needs configuration before it can run: which model provider to use, which feature flags are on, and how authentication should work. This file is the bridge to a remote configuration service. Without it, any setup stored outside the local machine would be unavailable, and the rest of the app would not know how to ask for it.
 
-Most of the file is conversion and validation logic. `remote_status_to_error` collapses tonic status codes into the crate’s `ThreadConfigLoadErrorCode`, distinguishing auth failures and deadlines from generic request failures. `thread_config_source_from_proto` enforces that the `oneof` payload is present and dispatches session/user variants. `session_thread_config_from_proto` converts repeated model providers into a `HashMap` keyed by provider id and normalizes feature flags into a `BTreeMap`. `model_provider_from_proto` is strict: provider ids must be non-empty, `wire_api` must decode to `Responses` rather than `Unspecified`, and unknown numeric enum values become parse errors. Auth payload conversion additionally requires nonzero `timeout_ms` and an absolute `cwd` validated through `AbsolutePathBuf::from_absolute_path_checked`.
+The main type, RemoteThreadConfigLoader, stores the remote endpoint address. When asked to load configuration, it opens a gRPC client connection, builds a request containing the thread id and current working directory, sets a five-second timeout, sends the request, and receives a list of configuration sources. The remote service replies using generated protocol-buffer types, which are compact network message shapes. This file then translates those wire-format messages into the project’s internal Rust types.
 
-The test module spins up an in-process tonic server implementing the generated service trait, verifies the exact request payload and timeout header, and checks that a rich `ModelProviderInfo` survives proto conversion with headers, retries, websocket flags, and auth command settings intact.
+It is careful about bad remote data. Missing payloads, missing provider ids, unknown wire API values, zero authentication timeouts, and invalid absolute paths become parse errors. Network failures, authentication failures, and timeouts are also converted into the project’s standard ThreadConfigLoadError, so callers do not need to understand gRPC details. The test code starts a small in-process gRPC server to prove that requests are formed correctly and that provider data survives a round trip.
 
 #### Function details
 
@@ -3194,11 +3222,11 @@ The test module spins up an in-process tonic server implementing the generated s
 fn new(endpoint: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a remote loader pointed at a specific gRPC endpoint string. It is the minimal setup entrypoint for callers selecting remote thread-config loading.
+**Purpose**: Creates a remote configuration loader pointed at a specific service address. Callers use this when the app has been configured to fetch thread settings over the network.
 
-**Data flow**: Accepts `endpoint: impl Into<String>` → converts it into an owned `String` → stores it in `RemoteThreadConfigLoader { endpoint }` → returns the loader.
+**Data flow**: It receives an endpoint value, such as a URL-like string, converts it into an owned String, and stores it inside a new RemoteThreadConfigLoader. Nothing is contacted yet; this only prepares the loader for later use.
 
-**Call relations**: Called by configuration assembly code and by the integration-style test before any network activity occurs; later `client` reads the stored endpoint.
+**Call relations**: Higher-level setup code such as configured_thread_config_loader calls this when choosing a remote loader. The integration-style test load_thread_config_calls_remote_service also uses it to point the loader at a temporary test server.
 
 *Call graph*: called by 3 (configured_thread_config_loader, configured_thread_config_loader, load_thread_config_calls_remote_service); 1 external calls (into).
 
@@ -3211,11 +3239,11 @@ async fn client(
     ) -> Result<ThreadConfigLoaderClient<tonic::transport::Channel>, ThreadConfigLoadError>
 ```
 
-**Purpose**: Opens a tonic `ThreadConfigLoaderClient` connected to the configured endpoint and maps transport connection failures into the crate’s thread-config error type.
+**Purpose**: Opens a gRPC client connection to the configured remote service. It hides the network connection details and returns the project’s normal load error if the connection fails.
 
-**Data flow**: Reads `self.endpoint`, clones it, and awaits `ThreadConfigLoaderClient::connect(...)` → on success returns the connected client; on failure constructs `ThreadConfigLoadError` with code `RequestFailed`, no HTTP status code, and a formatted connection message.
+**Data flow**: It reads the loader’s endpoint string, asks the generated ThreadConfigLoaderClient to connect to that address, and returns the connected client. If the connection attempt fails, it turns the low-level connection error into a ThreadConfigLoadError marked as a request failure.
 
-**Call relations**: Used only by `RemoteThreadConfigLoader::load` as the first network step before issuing the RPC.
+**Call relations**: RemoteThreadConfigLoader::load calls this first, before it can ask the service for configuration. If this step fails, the load stops early and no request is sent.
 
 *Call graph*: called by 1 (load); 1 external calls (connect).
 
@@ -3229,11 +3257,11 @@ fn load(
     ) -> ThreadConfigLoaderFuture<'_, Vec<ThreadConfigSource>>
 ```
 
-**Purpose**: Performs the full remote fetch: connect, send the request, map transport status errors, and decode each returned source into local domain values.
+**Purpose**: Fetches thread configuration from the remote service and returns it in the app’s normal configuration shape. This is the main operation provided by the remote loader.
 
-**Data flow**: Consumes `context: ThreadConfigContext` → awaits `self.client()` → builds a tonic request with `load_thread_config_request(context)` → awaits the remote `.load(...)` RPC → maps `tonic::Status` through `remote_status_to_error`, extracts the protobuf body with `into_inner()`, iterates over `response.sources`, converts each via `thread_config_source_from_proto`, and collects into `Result<Vec<ThreadConfigSource>, ThreadConfigLoadError>`.
+**Data flow**: It receives a ThreadConfigContext containing details like the thread id and current directory. It opens a client, turns the context into a timed gRPC request, sends that request, maps any remote status error into a ThreadConfigLoadError, unwraps the response body, and converts each returned source from protocol-buffer form into internal ThreadConfigSource values.
 
-**Call relations**: This async method backs the trait implementation below. It is invoked when the system asks this loader to resolve thread config and delegates request construction and proto decoding to helper functions in this file.
+**Call relations**: The ThreadConfigLoader trait exposes this method to the rest of the configuration system. Internally it depends on client to connect, load_thread_config_request to build the outbound request, remote_status_to_error for failed remote calls, and thread_config_source_from_proto for decoding the reply.
 
 *Call graph*: calls 2 internal fn (client, load_thread_config_request); 1 external calls (pin).
 
@@ -3246,11 +3274,11 @@ fn load_thread_config_request(
 ) -> tonic::Request<proto::LoadThreadConfigRequest>
 ```
 
-**Purpose**: Builds the outbound tonic request for the remote `Load` RPC and attaches the fixed timeout expected by the remote loader contract.
+**Purpose**: Builds the network request sent to the remote configuration service. It also sets a five-second deadline so a stuck service does not make configuration loading hang forever.
 
-**Data flow**: Takes `ThreadConfigContext` with optional `thread_id` and optional `cwd` → constructs `proto::LoadThreadConfigRequest` using the raw thread id and a lossy string conversion of `cwd` when present → wraps it in `tonic::Request::new(...)` → sets timeout to `REMOTE_THREAD_CONFIG_LOAD_TIMEOUT` → returns the request.
+**Data flow**: It receives a ThreadConfigContext, copies the optional thread id and current working directory into a protocol-buffer request message, wraps that message in a tonic request, sets the request timeout, and returns it ready to send.
 
-**Call relations**: Called by `RemoteThreadConfigLoader::load` for real RPCs and by a unit test that inspects the generated `grpc-timeout` metadata.
+**Call relations**: RemoteThreadConfigLoader::load uses this just before calling the remote service. The test load_thread_config_request_sets_timeout calls it directly to confirm the timeout metadata is present.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (load, load_thread_config_request_sets_timeout).
 
@@ -3261,11 +3289,11 @@ fn load_thread_config_request(
 fn remote_status_to_error(status: tonic::Status) -> ThreadConfigLoadError
 ```
 
-**Purpose**: Maps tonic gRPC status codes into the narrower thread-config loader error taxonomy used by the rest of the config subsystem.
+**Purpose**: Turns a gRPC failure status into the project’s own error type. This keeps the rest of the config-loading code from needing to know gRPC status codes.
 
-**Data flow**: Consumes `status: tonic::Status` → matches `status.code()` → maps `Unauthenticated` and `PermissionDenied` to `ThreadConfigLoadErrorCode::Auth`, `DeadlineExceeded` to `Timeout`, and all other non-OK codes to `RequestFailed` → constructs and returns `ThreadConfigLoadError` with no status code and a formatted message containing the original status.
+**Data flow**: It receives a tonic Status from a failed remote call, looks at its code, chooses a matching ThreadConfigLoadErrorCode such as Auth, Timeout, or RequestFailed, and returns a ThreadConfigLoadError with a human-readable message.
 
-**Call relations**: Used as the error adapter on the RPC future in `RemoteThreadConfigLoader::load`; it centralizes transport-to-domain error translation.
+**Call relations**: RemoteThreadConfigLoader::load uses this when the remote load call returns an error. It is the translation checkpoint between network-protocol errors and the configuration system’s shared error language.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (code, format!).
 
@@ -3278,11 +3306,11 @@ fn thread_config_source_from_proto(
 ) -> Result<ThreadConfigSource, ThreadConfigLoadError>
 ```
 
-**Purpose**: Converts one protobuf `ThreadConfigSource` wrapper into the local enum while enforcing that the `oneof` payload is actually present.
+**Purpose**: Converts one remote configuration source from protocol-buffer form into the app’s internal ThreadConfigSource enum. It makes sure the remote message actually contains a usable payload.
 
-**Data flow**: Takes `source: proto::ThreadConfigSource` → matches `source.source` → for `Session(config)` delegates to `session_thread_config_from_proto` and wraps the result in `ThreadConfigSource::Session`; for `User(_)` returns `ThreadConfigSource::User(UserThreadConfig::default())`; for `None` returns a parse error.
+**Data flow**: It receives a proto ThreadConfigSource. If the source is a session config, it converts that nested session data. If it is a user config, it currently returns the default user config. If the source is missing entirely, it returns a parse error.
 
-**Call relations**: Called while collecting the remote response’s `sources` vector. It delegates session payload decoding to the dedicated helper and handles the trivial user case inline.
+**Call relations**: RemoteThreadConfigLoader::load applies this to every source returned by the remote service. It hands session payloads to session_thread_config_from_proto and uses parse_error when the remote message is incomplete.
 
 *Call graph*: calls 2 internal fn (parse_error, session_thread_config_from_proto); 2 external calls (User, default).
 
@@ -3295,11 +3323,11 @@ fn session_thread_config_from_proto(
 ) -> Result<SessionThreadConfig, ThreadConfigLoadError>
 ```
 
-**Purpose**: Transforms a protobuf session config into the local `SessionThreadConfig`, including keyed provider lookup and deterministic feature ordering.
+**Purpose**: Converts a remote session-level configuration message into the app’s SessionThreadConfig type. This includes the chosen model provider, the provider definitions, and feature switches.
 
-**Data flow**: Consumes `proto::SessionThreadConfig` → iterates `config.model_providers`, converting each with `model_provider_from_proto` and collecting into `HashMap<String, ModelProviderInfo>` → converts `config.features` into `BTreeMap<String, bool>` → returns `SessionThreadConfig { model_provider, model_providers, features }` or the first conversion error encountered.
+**Data flow**: It receives a proto SessionThreadConfig, converts each model provider entry into a keyed internal provider record, collects feature flags into an ordered map, and returns a SessionThreadConfig. If any provider is invalid, the whole conversion returns that error.
 
-**Call relations**: Reached from `thread_config_source_from_proto` when the remote source is a session config; it delegates per-provider validation to `model_provider_from_proto`.
+**Call relations**: thread_config_source_from_proto calls this when a remote source is a session config. It relies on model_provider_from_proto for each provider entry so provider-specific validation happens in one place.
 
 *Call graph*: called by 1 (thread_config_source_from_proto).
 
@@ -3312,11 +3340,11 @@ fn model_provider_from_proto(
 ) -> Result<(String, ModelProviderInfo), ThreadConfigLoadError>
 ```
 
-**Purpose**: Validates and converts one protobuf `ModelProvider` into the local `(id, ModelProviderInfo)` pair used inside session config maps.
+**Purpose**: Converts one remote model-provider definition into the internal ModelProviderInfo form. It also validates important fields so the app does not accept broken provider settings.
 
-**Data flow**: Consumes `provider: proto::ModelProvider` → rejects empty `provider.id` with a parse error → decodes numeric `provider.wire_api` via `proto::WireApi::try_from`, accepting only `Responses`, rejecting `Unspecified` and unknown values → builds `ModelProviderInfo` by moving across name/base URL/env/header/retry/websocket fields, converting optional auth via `model_provider_auth_from_proto` with `transpose()`, and leaving `aws` as `None` → returns `(id, info)`.
+**Data flow**: It receives a proto ModelProvider. It checks that the provider has an id, converts the numeric wire API value into the internal WireApi enum, converts optional authentication data, copies URLs, headers, retry limits, timeouts, and capability flags, then returns the provider id together with the built ModelProviderInfo. Bad or missing required values become parse errors.
 
-**Call relations**: Called from `session_thread_config_from_proto` for each repeated provider and directly by the round-trip test. It is the strictest parser in the file because malformed provider metadata would poison downstream model selection.
+**Call relations**: session_thread_config_from_proto uses this while decoding remote session config, and the test model_provider_proto_roundtrips_through_domain_type calls it after producing proto data. It calls model_provider_auth_from_proto for nested authentication details and parse_error for invalid remote data.
 
 *Call graph*: calls 1 internal fn (parse_error); called by 1 (model_provider_proto_roundtrips_through_domain_type); 2 external calls (try_from, format!).
 
@@ -3330,11 +3358,11 @@ fn model_provider_to_proto(
 ) -> proto::ModelProvider
 ```
 
-**Purpose**: Test-only inverse conversion from local `ModelProviderInfo` back into the protobuf `ModelProvider` shape. It exists to verify that the parser and serializer agree on field mapping.
+**Purpose**: Test-only helper that converts an internal ModelProviderInfo back into protocol-buffer form. It lets tests check that provider data can travel through the proto shape without changing.
 
-**Data flow**: Takes an `id` and owned `ModelProviderInfo` → destructures the domain struct, discarding `aws` → converts optional auth with `model_provider_auth_to_proto`, maps `wire_api` through `proto_wire_api`, wraps optional maps with `proto_string_map`, and copies retry/websocket flags → returns `proto::ModelProvider`.
+**Data flow**: It receives a provider id and a ModelProviderInfo, breaks the internal struct into its fields, converts authentication and wire API values into proto equivalents, wraps optional string maps, and returns a proto ModelProvider.
 
-**Call relations**: Used only by the round-trip unit test, where it feeds `model_provider_from_proto` to confirm lossless conversion for supported fields.
+**Call relations**: The test model_provider_proto_roundtrips_through_domain_type uses this to create a proto message, then sends that proto through model_provider_from_proto to verify the conversion path. It calls proto_wire_api for the API enum conversion.
 
 *Call graph*: calls 1 internal fn (proto_wire_api); called by 1 (model_provider_proto_roundtrips_through_domain_type); 1 external calls (into).
 
@@ -3347,11 +3375,11 @@ fn model_provider_auth_from_proto(
 ) -> Result<ModelProviderAuthInfo, ThreadConfigLoadError>
 ```
 
-**Purpose**: Converts protobuf auth-command metadata into the local `ModelProviderAuthInfo` while enforcing nonzero timeout and absolute working-directory validity.
+**Purpose**: Converts remote authentication-helper settings into the app’s internal authentication config. It checks values that would be unsafe or nonsensical if accepted blindly.
 
-**Data flow**: Consumes `auth: proto::ModelProviderAuthInfo` → converts `timeout_ms` into `NonZeroU64`, failing with a parse error if zero → validates `auth.cwd` with `AbsolutePathBuf::from_absolute_path_checked`, mapping path errors into parse errors → returns `ModelProviderAuthInfo { command, args, timeout_ms, refresh_interval_ms, cwd }`.
+**Data flow**: It receives proto authentication data with a command, arguments, timeout, refresh interval, and working directory. It rejects a zero timeout, verifies that the working directory string is an absolute path, and returns a ModelProviderAuthInfo using the validated values.
 
-**Call relations**: Called from `model_provider_from_proto` when a provider includes nested auth info; it isolates the extra validation rules for auth execution settings.
+**Call relations**: model_provider_from_proto calls this when the remote provider includes authentication settings. It uses parse_error-style failures so bad authentication data is reported as a remote parse problem.
 
 *Call graph*: calls 1 internal fn (from_absolute_path_checked); 1 external calls (new).
 
@@ -3362,11 +3390,11 @@ fn model_provider_auth_from_proto(
 fn model_provider_auth_to_proto(auth: ModelProviderAuthInfo) -> proto::ModelProviderAuthInfo
 ```
 
-**Purpose**: Test-only inverse conversion from local auth-command settings into the protobuf auth message. It serializes the validated domain type back into plain wire fields.
+**Purpose**: Test-only helper that converts internal authentication settings into protocol-buffer form. It supports round-trip tests for model provider data.
 
-**Data flow**: Consumes owned `ModelProviderAuthInfo` → destructures it → converts `timeout_ms` from `NonZeroU64` to raw `u64` with `.get()` and stringifies `cwd` → returns `proto::ModelProviderAuthInfo`.
+**Data flow**: It receives a ModelProviderAuthInfo, extracts the command, arguments, non-zero timeout, refresh interval, and working directory, turns the path into a string, and returns a proto ModelProviderAuthInfo.
 
-**Call relations**: Used only by `model_provider_to_proto` in tests to build a protobuf provider payload from a domain provider.
+**Call relations**: model_provider_to_proto uses this for optional provider authentication data during tests. The production load path uses the opposite converter, model_provider_auth_from_proto.
 
 
 ##### `proto_string_map`  (lines 284–286)
@@ -3375,11 +3403,11 @@ fn model_provider_auth_to_proto(auth: ModelProviderAuthInfo) -> proto::ModelProv
 fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap
 ```
 
-**Purpose**: Wraps a plain `HashMap<String, String>` in the protobuf `StringMap` message used by optional header/query fields.
+**Purpose**: Test-only helper that wraps a normal string-to-string map in the generated proto StringMap type. It keeps test setup concise when building provider headers or query parameters.
 
-**Data flow**: Takes `values: HashMap<String, String>` → returns `proto::StringMap { values }` unchanged.
+**Data flow**: It receives a HashMap of strings and places it directly into a proto StringMap. The output is a protocol-buffer wrapper around the same key-value data.
 
-**Call relations**: Test-only helper used by `model_provider_to_proto` when constructing protobuf maps.
+**Call relations**: model_provider_to_proto uses this in test builds when converting optional maps such as query parameters, HTTP headers, and environment-driven headers.
 
 
 ##### `proto_wire_api`  (lines 289–293)
@@ -3388,11 +3416,11 @@ fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi
 ```
 
-**Purpose**: Maps the domain `WireApi` enum into the protobuf `WireApi` enum for test serialization.
+**Purpose**: Test-only helper that converts the internal WireApi enum into the generated proto enum. At present it maps the supported Responses API value.
 
-**Data flow**: Consumes `wire_api: WireApi` → matches supported variants and returns the corresponding `proto::WireApi` variant.
+**Data flow**: It receives a WireApi value and returns the matching proto WireApi value. Since only Responses is represented here, the mapping is direct.
 
-**Call relations**: Called by `model_provider_to_proto` to populate the numeric protobuf enum field.
+**Call relations**: model_provider_to_proto calls this while building a proto provider for tests. Production decoding uses the generated try_from conversion in model_provider_from_proto.
 
 *Call graph*: called by 1 (model_provider_to_proto).
 
@@ -3403,11 +3431,11 @@ fn proto_wire_api(wire_api: WireApi) -> proto::WireApi
 fn parse_error(message: impl Into<String>) -> ThreadConfigLoadError
 ```
 
-**Purpose**: Creates a standardized parse-class `ThreadConfigLoadError` for malformed remote payloads. It keeps parse failures distinct from transport failures.
+**Purpose**: Creates a standard configuration-load error for malformed remote data. It gives all parsing failures the same error code and shape.
 
-**Data flow**: Accepts `message: impl Into<String>` → converts it into a `String` → constructs `ThreadConfigLoadError` with code `Parse`, no status code, and that message → returns the error.
+**Data flow**: It receives a message, converts it into a String, and returns a ThreadConfigLoadError with the Parse code and no HTTP-style status code.
 
-**Call relations**: Shared by the proto-decoding helpers whenever the remote service returns structurally invalid or semantically incomplete data.
+**Call relations**: Conversion functions such as thread_config_source_from_proto and model_provider_from_proto call this when the remote service omits required data or sends values this app cannot understand.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (model_provider_from_proto, thread_config_source_from_proto); 1 external calls (into).
 
@@ -3423,11 +3451,11 @@ fn load(
                 dyn std::future::Future<
 ```
 
-**Purpose**: Implements the test server’s `Load` RPC by asserting the exact incoming request payload and returning a canned response source list.
+**Purpose**: Acts as a fake remote configuration service for tests. It verifies that the client sends the expected request and then returns prepared configuration sources.
 
-**Data flow**: Reads `self.sources` and `self.expected_cwd`; consumes `Request<proto::LoadThreadConfigRequest>` → asserts that `request.into_inner()` equals the expected thread id and cwd → constructs `Response::new(proto::LoadThreadConfigResponse { sources: self.sources.clone() })` → returns it.
+**Data flow**: It receives a gRPC request, checks that the thread id and current directory match the test’s expectations, and returns a response containing the server’s stored proto sources. If the request is wrong, the assertion fails the test.
 
-**Call relations**: Invoked by tonic through the generated server trait implementation during `load_thread_config_calls_remote_service`; it serves as the remote endpoint under test.
+**Call relations**: The test gRPC server calls this when RemoteThreadConfigLoader sends a load request during load_thread_config_calls_remote_service. It plays the remote-service side of the conversation.
 
 *Call graph*: 4 external calls (pin, assert_eq!, new, load).
 
@@ -3438,11 +3466,11 @@ fn load(
 async fn load_thread_config_calls_remote_service()
 ```
 
-**Purpose**: End-to-end test that starts a local tonic server, invokes `RemoteThreadConfigLoader`, and verifies the decoded domain result matches the expected sources.
+**Purpose**: Tests the full remote-loading path against a real in-process gRPC server. It proves that the loader connects, sends the right context, receives sources, and decodes them correctly.
 
-**Data flow**: Builds a workspace cwd and expected string form → binds a local TCP listener on an ephemeral port → spawns a tonic `Server` with `ThreadConfigLoaderServer::new(TestServer { ... })` and shutdown channel → constructs `RemoteThreadConfigLoader` with `http://{addr}` → awaits `loader.load(ThreadConfigContext { ... })` → shuts down the server and asserts the loaded sources equal `expected_sources()`.
+**Data flow**: It creates a fake workspace directory, starts a temporary server with known proto sources, builds a RemoteThreadConfigLoader pointed at that server, asks it to load config for a thread, shuts the server down, and compares the loaded internal sources with the expected result.
 
-**Call relations**: Exercises the full call chain from loader construction through request building, tonic transport, generated client/server bindings, and proto-to-domain conversion.
+**Call relations**: This test uses RemoteThreadConfigLoader::new to create the client side, tests::TestServer::load as the server side, proto_sources as the remote reply, and expected_sources as the value the client should produce.
 
 *Call graph*: calls 1 internal fn (new); 10 external calls (builder, assert_eq!, new, proto_sources, workspace_dir, format!, bind, spawn, channel, new).
 
@@ -3453,11 +3481,11 @@ async fn load_thread_config_calls_remote_service()
 fn load_thread_config_request_sets_timeout()
 ```
 
-**Purpose**: Verifies that outbound remote-load requests carry the intended 5-second gRPC timeout metadata.
+**Purpose**: Checks that outbound remote configuration requests include the intended timeout. This protects against future changes that might accidentally allow remote loading to wait forever.
 
-**Data flow**: Calls `load_thread_config_request(ThreadConfigContext::default())` → reads request metadata key `grpc-timeout` and converts it to `&str` → asserts it equals `Some("5000000u")`.
+**Data flow**: It builds a request from a default ThreadConfigContext, reads the gRPC timeout metadata, and asserts that it matches the five-second timeout encoded in microseconds.
 
-**Call relations**: Targets the request-construction helper directly rather than the network path, ensuring timeout behavior is pinned by a small unit test.
+**Call relations**: It calls load_thread_config_request directly, focusing only on request construction rather than starting a server or making a network call.
 
 *Call graph*: calls 1 internal fn (load_thread_config_request); 2 external calls (assert_eq!, default).
 
@@ -3468,11 +3496,11 @@ fn load_thread_config_request_sets_timeout()
 fn model_provider_proto_roundtrips_through_domain_type()
 ```
 
-**Purpose**: Checks that a representative `ModelProviderInfo` survives conversion to protobuf and back without losing supported fields or changing values.
+**Purpose**: Tests that model provider settings survive conversion to proto form and back into the internal type. This is important because remote configuration depends on this translation being faithful.
 
-**Data flow**: Builds `expected = expected_provider()` → converts it with `model_provider_to_proto("local", expected.clone())` → parses it back with `model_provider_from_proto` → asserts the returned id is `local` and the parsed provider equals `expected`.
+**Data flow**: It builds an expected provider, converts it into a proto provider with id local, converts that proto provider back with model_provider_from_proto, and checks both the id and provider fields against the original.
 
-**Call relations**: Exercises the paired test-only serializer and production parser to lock down field mapping for provider metadata.
+**Call relations**: It uses expected_provider as the source data, model_provider_to_proto for the test-only outgoing conversion, and model_provider_from_proto for the production-style incoming conversion.
 
 *Call graph*: calls 2 internal fn (model_provider_from_proto, model_provider_to_proto); 2 external calls (assert_eq!, expected_provider).
 
@@ -3483,11 +3511,11 @@ fn model_provider_proto_roundtrips_through_domain_type()
 fn proto_sources() -> Vec<proto::ThreadConfigSource>
 ```
 
-**Purpose**: Constructs a realistic protobuf response payload containing both session and user thread-config sources for integration testing.
+**Purpose**: Builds the fake remote service’s response data for tests. The data includes both a session config and a user config source.
 
-**Data flow**: Computes a workspace cwd string → returns a `Vec<proto::ThreadConfigSource>` containing one session source with a populated `proto::SessionThreadConfig` and one user source with `proto::UserThreadConfig {}`.
+**Data flow**: It reads the test workspace directory, creates proto messages for a model provider, authentication helper, headers, query parameters, retry and timeout settings, feature flags, and a user source, then returns them as a vector.
 
-**Call relations**: Used by the remote-service integration test to seed the test server’s canned response.
+**Call relations**: load_thread_config_calls_remote_service gives this data to TestServer so the fake server can return it to RemoteThreadConfigLoader.
 
 *Call graph*: 2 external calls (workspace_dir, vec!).
 
@@ -3498,11 +3526,11 @@ fn proto_sources() -> Vec<proto::ThreadConfigSource>
 fn expected_sources() -> Vec<ThreadConfigSource>
 ```
 
-**Purpose**: Builds the local-domain equivalent of `proto_sources()` for assertion against the loader’s decoded output.
+**Purpose**: Builds the internal configuration values that should result from decoding the fake remote response. It is the test’s answer key.
 
-**Data flow**: Returns a `Vec<ThreadConfigSource>` containing a `Session(SessionThreadConfig { ... })` with provider map and ordered features plus a default `User` source.
+**Data flow**: It creates a vector containing an internal SessionThreadConfig with the expected provider and feature flags, followed by a default UserThreadConfig. The returned value is compared with what the loader actually produced.
 
-**Call relations**: Consumed by `load_thread_config_calls_remote_service` as the expected post-conversion result.
+**Call relations**: load_thread_config_calls_remote_service uses this after the remote load finishes. It relies on expected_provider so the provider details match the proto data from proto_sources.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3513,11 +3541,11 @@ fn expected_sources() -> Vec<ThreadConfigSource>
 fn expected_provider() -> ModelProviderInfo
 ```
 
-**Purpose**: Creates the canonical `ModelProviderInfo` fixture used by both the round-trip test and expected decoded sources.
+**Purpose**: Creates the expected internal model-provider record used by the tests. It centralizes the provider details so both round-trip and remote-load tests compare against the same shape.
 
-**Data flow**: Constructs and returns a `ModelProviderInfo` populated with name, base URL, auth command settings, query/header maps, retry counts, websocket settings, and `aws: None`.
+**Data flow**: It builds a ModelProviderInfo with a name, base URL, authentication command, absolute working directory, wire API, query parameters, headers, retry settings, timeout settings, and capability flags, then returns it.
 
-**Call relations**: Shared fixture builder for `expected_sources` and `model_provider_proto_roundtrips_through_domain_type`.
+**Call relations**: expected_sources uses this as part of the decoded configuration answer key, and model_provider_proto_roundtrips_through_domain_type uses it as the original value for conversion testing.
 
 *Call graph*: 4 external calls (from, new, workspace_dir, vec!).
 
@@ -3528,22 +3556,24 @@ fn expected_provider() -> ModelProviderInfo
 fn workspace_dir() -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a deterministic absolute workspace path fixture rooted under the current directory. This keeps path-sensitive tests stable.
+**Purpose**: Creates a stable absolute path for test workspace data. Tests need an absolute path because authentication configuration rejects relative working directories.
 
-**Data flow**: Calls `AbsolutePathBuf::current_dir()` → appends `workspace` with `.join("workspace")` → returns the resulting absolute path.
+**Data flow**: It reads the current process directory, turns it into an AbsolutePathBuf, appends workspace, and returns that path.
 
-**Call relations**: Used by multiple tests and fixture builders whenever an absolute cwd is needed.
+**Call relations**: proto_sources and expected_provider call this so the proto test data and expected internal data refer to the same working directory. load_thread_config_calls_remote_service also uses it when sending context to the fake server.
 
 *Call graph*: calls 1 internal fn (current_dir).
 
 
 ### `lmstudio/src/client.rs`
 
-`io_transport` · `OSS model setup and local model management`
+`io_transport` · `model setup and local LM Studio communication`
 
-This file defines `LMStudioClient`, a small cloneable wrapper around `reqwest::Client` plus a `base_url` string. Its constructor path is configuration-driven: `try_from_provider` looks up the built-in LM Studio provider by `LMSTUDIO_OSS_PROVIDER_ID` inside `Config.model_providers`, requires a `base_url`, builds a reqwest client with a 5-second connect timeout, and immediately probes the server with `check_server`. That probe performs a GET on `{base_url}/models` and turns either transport failure or non-success HTTP status into an `io::Error` that includes a user-facing installation/startup hint.
+LM Studio lets a user run language models on their own computer. This file gives the rest of the project a small, focused client for talking to that local service, instead of making every caller know the LM Studio web addresses, response shapes, and command-line details. Think of it as a receptionist: it knows where LM Studio is, checks whether anyone is answering, asks for the model list, and sends a small request to wake up a model when needed.
 
-Operational methods map directly to LM Studio endpoints. `fetch_models` GETs `/models`, parses JSON, requires a top-level `data` array, and extracts each model's `id` string. `load_model` POSTs to `/responses` with a minimal JSON body (`model`, empty `input`, `max_output_tokens: 1`) to trigger model loading, logging success via `tracing::info!`. For local downloads, `download_model` shells out to `lms get --yes <model>`, inheriting stdout but discarding stderr, and reports nonzero exit codes as `io::Error`s. The helper `find_lms_with_home_dir` first checks `PATH` via `which`, then falls back to `~/.lmstudio/bin/lms` or `.exe` depending on platform. Tests use `wiremock` to validate happy paths and error handling for `/models` and `/check_server`, and they exercise fallback path construction and the test-only raw constructor `from_host_root`.
+The main type is `LMStudioClient`. It stores an HTTP client, which is the tool used to make web requests, and a `base_url`, which is the root address of the LM Studio server. `try_from_provider` builds this client from the project configuration and refuses to continue if the built-in LM Studio provider is missing or unusable. `check_server` then probes the `/models` endpoint so users get a clear message if LM Studio is not running.
+
+For normal use, `fetch_models` reads the server’s model list, `load_model` sends a tiny request to make LM Studio load a chosen model, and `download_model` shells out to the `lms` command-line program to fetch a missing model. The tests use a fake HTTP server so they can check success and failure cases without depending on a real LM Studio installation.
 
 #### Function details
 
@@ -3553,11 +3583,11 @@ Operational methods map directly to LM Studio endpoints. `fetch_models` GETs `/m
 async fn try_from_provider(config: &Config) -> std::io::Result<Self>
 ```
 
-**Purpose**: Constructs an `LMStudioClient` from the configured built-in LM Studio provider and verifies the server is reachable before returning it.
+**Purpose**: Builds an `LMStudioClient` from the project configuration. It is used when the system wants to use the built-in LM Studio provider and needs a ready-to-use connection object.
 
-**Data flow**: Reads `config.model_providers`, looks up `LMSTUDIO_OSS_PROVIDER_ID`, extracts `base_url`, builds a `reqwest::Client` with a 5-second connect timeout falling back to `reqwest::Client::new()` on builder failure, stores the client and base URL in `LMStudioClient`, awaits `check_server`, and returns either the initialized client or an `io::Error`.
+**Data flow**: It receives the global configuration, looks up the LM Studio provider entry, reads its server address, creates an HTTP client with a short connection timeout, and checks that the server responds. If anything important is missing or the server cannot be reached, it returns an input/output error; otherwise it returns a ready client.
 
-**Call relations**: This is the public constructor used by higher-level OSS setup code; it delegates connectivity validation to `check_server` so callers fail early if LM Studio is not running.
+**Call relations**: `ensure_oss_ready` calls this when preparing the local open-source model flow. This function is the doorway from general configuration into the LM Studio-specific client used by later model operations.
 
 *Call graph*: called by 1 (ensure_oss_ready); 2 external calls (builder, from_secs).
 
@@ -3568,11 +3598,11 @@ async fn try_from_provider(config: &Config) -> std::io::Result<Self>
 async fn check_server(&self) -> io::Result<()>
 ```
 
-**Purpose**: Performs a lightweight health check against the LM Studio `/models` endpoint.
+**Purpose**: Checks whether the LM Studio server is alive and responding. It gives a clear, user-facing error if the local server is missing, stopped, or returning an error.
 
-**Data flow**: Formats `{base_url}/models` after trimming any trailing slash, sends a GET request, and returns `Ok(())` only if the response arrives and has a success status. Non-success statuses become `io::Error::other` with the status code plus the standard connection-help message; transport failures become the same help message without a status.
+**Data flow**: It takes the client’s stored base URL, adds `/models`, and sends a GET request. A successful HTTP status becomes `Ok(())`; a failed status or network failure becomes an error that tells the user to install LM Studio and run `lms server start`.
 
-**Call relations**: Called during client construction and directly by tests to validate both success and failure messaging.
+**Call relations**: This is the client’s health check. Client setup uses it to avoid handing back a connection that cannot actually talk to LM Studio, and the tests exercise both the healthy and failing paths with a fake server.
 
 *Call graph*: 3 external calls (get, other, format!).
 
@@ -3583,11 +3613,11 @@ async fn check_server(&self) -> io::Result<()>
 async fn load_model(&self, model: &str) -> io::Result<()>
 ```
 
-**Purpose**: Triggers LM Studio to load a specific model by sending a minimal responses request.
+**Purpose**: Asks LM Studio to load a specific model into memory. It does this by sending a tiny request that names the model and asks for almost no output.
 
-**Data flow**: Formats `{base_url}/responses`, builds a JSON body containing the model name, empty input, and `max_output_tokens: 1`, POSTs it with `Content-Type: application/json`, maps request errors into `io::Error::other`, and returns success only for HTTP success statuses. On success it logs via `tracing::info!`; on failure it returns an error containing the response status.
+**Data flow**: It receives a model name, builds a JSON request body with that name, an empty input, and `max_output_tokens` set to 1, then posts it to the `/responses` endpoint. If LM Studio accepts the request, it logs success and returns nothing; if the request fails or LM Studio returns an error status, it returns an input/output error.
 
-**Call relations**: Higher-level setup code spawns this in the background after ensuring the model exists locally.
+**Call relations**: This function is used after a model has been chosen and the program wants LM Studio to be ready to answer real prompts. It hands the actual loading work off to LM Studio through its HTTP API.
 
 *Call graph*: 5 external calls (post, other, format!, json!, info!).
 
@@ -3598,11 +3628,11 @@ async fn load_model(&self, model: &str) -> io::Result<()>
 async fn fetch_models(&self) -> io::Result<Vec<String>>
 ```
 
-**Purpose**: Retrieves the list of model IDs currently exposed by the LM Studio server.
+**Purpose**: Gets the list of model IDs currently available from the LM Studio server. Callers use it to show or choose from the local models LM Studio knows about.
 
-**Data flow**: GETs `{base_url}/models`, maps transport errors into `io::Error::other`, and on success parses the body as `serde_json::Value`. It requires `json["data"]` to be an array, extracts each element's `id` string, collects them into `Vec<String>`, and returns that vector. Non-success HTTP statuses and malformed JSON/data shape become `io::Error`s.
+**Data flow**: It sends a GET request to `/models`, parses the response as JSON, expects a `data` array, and pulls each model’s `id` field out as a string. The result is a list of model names; bad HTTP responses, invalid JSON, or a missing `data` array become errors.
 
-**Call relations**: Used by OSS setup to decide whether a model must be downloaded, and heavily exercised by the wiremock tests.
+**Call relations**: This is the read side of the LM Studio client. The test suite calls it through a client pointed at a fake server to confirm that normal model lists, malformed responses, and server errors are all reported correctly.
 
 *Call graph*: 3 external calls (get, other, format!).
 
@@ -3613,11 +3643,11 @@ async fn fetch_models(&self) -> io::Result<Vec<String>>
 fn find_lms() -> std::io::Result<String>
 ```
 
-**Purpose**: Finds the `lms` CLI using the real environment and default home-directory lookup rules.
+**Purpose**: Finds the `lms` command-line program that comes with LM Studio. This is needed before the code can ask LM Studio to download a model from the command line.
 
-**Data flow**: Calls `find_lms_with_home_dir(None)` and returns its `std::io::Result<String>` unchanged.
+**Data flow**: It takes no input and delegates the search to `find_lms_with_home_dir`, using the real home directory from the operating system. The output is either a command name or full path that can be executed, or an error saying LM Studio was not found.
 
-**Call relations**: This is the production entry point for CLI discovery and is used by `download_model`; tests call it directly to tolerate either installed or missing LM Studio.
+**Call relations**: `download_model` relies on this search before running `lms get --yes ...`. The `test_find_lms` test calls it directly and accepts either success, when LM Studio is installed, or the expected not-found error.
 
 *Call graph*: called by 1 (test_find_lms); 1 external calls (find_lms_with_home_dir).
 
@@ -3628,11 +3658,11 @@ fn find_lms() -> std::io::Result<String>
 fn find_lms_with_home_dir(home_dir: Option<&str>) -> std::io::Result<String>
 ```
 
-**Purpose**: Locates the `lms` executable either in `PATH` or in LM Studio's per-user fallback install directory.
+**Purpose**: Searches for the LM Studio `lms` command, with an optional home directory supplied for testing. It first checks the normal command path, then checks LM Studio’s usual install location under the user’s home folder.
 
-**Data flow**: First checks `which::which("lms")`; if found, returns the literal command `"lms"`. Otherwise it determines a home directory from the optional argument or from `HOME`/`USERPROFILE`, constructs a platform-specific fallback path under `.lmstudio/bin`, checks `Path::exists`, and returns either that path string or a `NotFound` error with installation guidance.
+**Data flow**: It receives an optional home directory. It first asks whether `lms` is available in the system `PATH`; if so, it returns `lms`. If not, it builds the platform-specific fallback path, such as `.lmstudio/bin/lms` or `.lmstudio/bin/lms.exe`, checks whether that file exists, and returns that path or a not-found error.
 
-**Call relations**: Called by `find_lms` in production and by tests with a mock home directory to validate fallback path construction without mutating process env.
+**Call relations**: `find_lms` uses this as the real search worker. `test_find_lms_with_mock_home` calls it with a fake home directory so the fallback-path behavior can be checked without changing the user’s environment.
 
 *Call graph*: called by 1 (test_find_lms_with_mock_home); 5 external calls (new, new, format!, var, which).
 
@@ -3643,11 +3673,11 @@ fn find_lms_with_home_dir(home_dir: Option<&str>) -> std::io::Result<String>
 async fn download_model(&self, model: &str) -> std::io::Result<()>
 ```
 
-**Purpose**: Downloads a model through the external `lms` CLI.
+**Purpose**: Downloads a model by running LM Studio’s own `lms` command-line tool. This lets the program fetch a model even though the download operation is not done through the HTTP server.
 
-**Data flow**: Finds the CLI path via `find_lms`, prints a progress line to stderr, runs `lms get --yes <model>` with inherited stdout and null stderr, maps process-launch failures into `io::Error::other`, checks `status.success()`, and returns either `Ok(())` with an info log or an error containing the exit code.
+**Data flow**: It receives a model name, finds the `lms` executable, prints a download message, and runs `lms get --yes <model>`. Standard output is shown to the user, standard error is hidden, and the process exit status is checked. A successful command returns `Ok(())`; a missing command, failed launch, or nonzero exit code becomes an error.
 
-**Call relations**: Called by higher-level OSS setup only when `fetch_models` indicates the requested model is not already present.
+**Call relations**: This function bridges the Rust client to LM Studio’s external command-line program. It depends on `find_lms` for the executable location and then hands the actual download work to that program.
 
 *Call graph*: 8 external calls (find_lms, new, other, eprintln!, format!, inherit, null, info!).
 
@@ -3658,11 +3688,11 @@ async fn download_model(&self, model: &str) -> std::io::Result<()>
 fn from_host_root(host_root: impl Into<String>) -> Self
 ```
 
-**Purpose**: Test-only constructor that creates a client from an arbitrary base URL without consulting configuration or probing the server.
+**Purpose**: Creates an `LMStudioClient` directly from a raw server address. It exists only for tests, where the client needs to point at a fake server instead of reading normal configuration.
 
-**Data flow**: Builds a reqwest client with the same 5-second connect timeout and fallback behavior as the main constructor, converts the supplied host root into a `String`, and returns `LMStudioClient { client, base_url }`.
+**Data flow**: It receives a host root such as `http://localhost:1234`, creates an HTTP client with the same timeout used in normal construction, and stores the given address as the base URL. It returns a client without checking whether the server is real.
 
-**Call relations**: All HTTP unit tests use this helper to point the client at a `wiremock::MockServer`.
+**Call relations**: The tests use this helper to aim the client at a `wiremock` fake server. That keeps tests focused on client behavior without needing a real LM Studio server running.
 
 *Call graph*: called by 6 (test_check_server_error, test_check_server_happy_path, test_fetch_models_happy_path, test_fetch_models_no_data_array, test_fetch_models_server_error, test_from_host_root); 3 external calls (into, builder, from_secs).
 
@@ -3673,11 +3703,11 @@ fn from_host_root(host_root: impl Into<String>) -> Self
 async fn test_fetch_models_happy_path()
 ```
 
-**Purpose**: Verifies that `fetch_models` extracts model IDs from a valid `/models` response.
+**Purpose**: Checks that `fetch_models` succeeds when the server returns a normal model list. It proves the client can read the expected LM Studio response shape.
 
-**Data flow**: Skips when sandboxed networking is disabled via env var; otherwise starts a wiremock server, mounts a `GET /models` response containing a `data` array with one `id`, constructs a client from the mock URI, calls `fetch_models`, and asserts the returned vector contains `openai/gpt-oss-20b`.
+**Data flow**: The test starts a fake HTTP server, configures `/models` to return JSON with one model ID, builds a client with `from_host_root`, calls `fetch_models`, and verifies the returned list contains that model. If network use is disabled in the sandbox, it skips itself.
 
-**Call relations**: This is the positive-path test for the JSON parsing logic in `fetch_models`.
+**Call relations**: This test drives `from_host_root` and then the model-list request path. It stands in for a healthy LM Studio server so the parsing behavior can be checked reliably.
 
 *Call graph*: calls 1 internal fn (from_host_root); 9 external calls (assert!, json!, var, info!, given, start, new, method, path).
 
@@ -3688,11 +3718,11 @@ async fn test_fetch_models_happy_path()
 async fn test_fetch_models_no_data_array()
 ```
 
-**Purpose**: Verifies that `fetch_models` rejects a successful HTTP response whose JSON body lacks the required `data` array.
+**Purpose**: Checks that `fetch_models` reports a clear error when the server response is missing the expected `data` array.
 
-**Data flow**: Optionally skips on disabled networking, serves `{}` from `GET /models`, calls `fetch_models`, asserts the result is an error, and checks the error text contains `No 'data' array in response`.
+**Data flow**: The test starts a fake server that returns an empty JSON object for `/models`, builds a client pointed at that server, and calls `fetch_models`. The expected result is an error whose text mentions that no `data` array was found.
 
-**Call relations**: This covers the schema-validation branch inside `fetch_models`.
+**Call relations**: This test uses `from_host_root` to isolate the client from real LM Studio. It exercises the bad-response branch of the model-list parsing logic.
 
 *Call graph*: calls 1 internal fn (from_host_root); 9 external calls (assert!, json!, var, info!, given, start, new, method, path).
 
@@ -3703,11 +3733,11 @@ async fn test_fetch_models_no_data_array()
 async fn test_fetch_models_server_error()
 ```
 
-**Purpose**: Verifies that non-success HTTP status codes from `/models` are surfaced as fetch errors.
+**Purpose**: Checks that `fetch_models` reports an error when LM Studio returns an HTTP server error. This protects callers from silently treating a failed server response as an empty model list.
 
-**Data flow**: Optionally skips on disabled networking, serves HTTP 500 from `GET /models`, calls `fetch_models`, asserts error, and checks the message contains `Failed to fetch models: 500`.
+**Data flow**: The test starts a fake server that answers `/models` with status 500, builds a client for that server, and calls `fetch_models`. It verifies that the result is an error mentioning the failed status code.
 
-**Call relations**: This covers the non-success status branch in `fetch_models`.
+**Call relations**: This test again uses `from_host_root` to point at a controlled fake server. It confirms the client’s HTTP error handling for model listing.
 
 *Call graph*: calls 1 internal fn (from_host_root); 8 external calls (assert!, var, info!, given, start, new, method, path).
 
@@ -3718,11 +3748,11 @@ async fn test_fetch_models_server_error()
 async fn test_check_server_happy_path()
 ```
 
-**Purpose**: Verifies that `check_server` succeeds when `/models` returns HTTP 200.
+**Purpose**: Checks that the server health check passes when `/models` returns success. This confirms that a reachable LM Studio-like server is accepted.
 
-**Data flow**: Optionally skips on disabled networking, serves HTTP 200 from `GET /models`, constructs a client from the mock URI, and awaits `check_server` expecting success.
+**Data flow**: The test starts a fake server, makes `/models` return status 200, creates a client with `from_host_root`, and calls the health check. The expected output is success, with no error.
 
-**Call relations**: This is the positive-path test for the constructor's connectivity probe.
+**Call relations**: This test builds the client through the test-only constructor and exercises the same health-check endpoint used during normal client setup.
 
 *Call graph*: calls 1 internal fn (from_host_root); 7 external calls (var, info!, given, start, new, method, path).
 
@@ -3733,11 +3763,11 @@ async fn test_check_server_happy_path()
 async fn test_check_server_error()
 ```
 
-**Purpose**: Verifies that `check_server` reports non-success statuses with the expected message prefix.
+**Purpose**: Checks that the server health check fails when `/models` returns an error status. This ensures users get a useful failure instead of a misleading ready client.
 
-**Data flow**: Optionally skips on disabled networking, serves HTTP 404 from `GET /models`, calls `check_server`, asserts error, and checks the message contains `Server returned error: 404`.
+**Data flow**: The test starts a fake server that returns status 404 for `/models`, creates a client pointing at it, and calls the health check. It expects an error message that includes the returned status.
 
-**Call relations**: This covers the HTTP-error branch of the server probe.
+**Call relations**: This test uses `from_host_root` to create a controlled failing server situation. It validates the error path of the LM Studio readiness check.
 
 *Call graph*: calls 1 internal fn (from_host_root); 8 external calls (assert!, var, info!, given, start, new, method, path).
 
@@ -3748,11 +3778,11 @@ async fn test_check_server_error()
 fn test_find_lms()
 ```
 
-**Purpose**: Exercises `find_lms` against the real environment, accepting either an installed CLI or the expected not-found error.
+**Purpose**: Checks the search for the LM Studio `lms` command in the real local environment. The test is written to pass whether or not LM Studio is installed.
 
-**Data flow**: Calls `LMStudioClient::find_lms`; if it returns `Err`, asserts the error text contains `LM Studio not found`; otherwise accepts success without further checks.
+**Data flow**: It calls `find_lms`. If a command path is found, that is acceptable; if not, the error must say that LM Studio was not found.
 
-**Call relations**: This is a tolerant environment-dependent smoke test for CLI discovery.
+**Call relations**: This test calls `find_lms` directly. It gives basic coverage for the command lookup used later by `download_model`.
 
 *Call graph*: calls 1 internal fn (find_lms); 1 external calls (assert!).
 
@@ -3763,11 +3793,11 @@ fn test_find_lms()
 fn test_find_lms_with_mock_home()
 ```
 
-**Purpose**: Checks fallback-path construction using a supplied mock home directory on the current platform.
+**Purpose**: Checks the fallback command search using a made-up home directory. This verifies the path-building logic without depending on the tester’s actual home folder.
 
-**Data flow**: Calls `find_lms_with_home_dir(Some(...))` with a platform-specific fake home path and, if the result is an error, asserts it contains `LM Studio not found`.
+**Data flow**: It passes a fake Unix or Windows home path into `find_lms_with_home_dir`. If the fake fallback path does not exist, the function should return an error that says LM Studio was not found.
 
-**Call relations**: This isolates the fallback-path branch from real environment variables.
+**Call relations**: This test calls the lower-level search helper directly. It supports the reliability of `find_lms`, which is the lookup step used before downloading a model.
 
 *Call graph*: calls 1 internal fn (find_lms_with_home_dir); 1 external calls (assert!).
 
@@ -3778,11 +3808,11 @@ fn test_find_lms_with_mock_home()
 fn test_from_host_root()
 ```
 
-**Purpose**: Verifies that the test-only constructor preserves the provided base URL exactly.
+**Purpose**: Checks that the test-only constructor stores the server address exactly as given. This matters because the other tests depend on it to point at their fake servers.
 
-**Data flow**: Constructs two clients with different URL strings and asserts each client's `base_url` field equals the input string.
+**Data flow**: It creates clients from two sample URLs and compares each client’s stored `base_url` with the original input. The output is only the test assertion result.
 
-**Call relations**: This is a simple constructor sanity test supporting the rest of the wiremock-based suite.
+**Call relations**: This test calls `from_host_root` directly. It gives confidence that the helper used by the HTTP tests does not rewrite or damage the fake server address.
 
 *Call graph*: calls 1 internal fn (from_host_root); 1 external calls (assert_eq!).
 
@@ -3792,13 +3822,15 @@ These files define provider configuration and the endpoint/session scaffolding t
 
 ### `codex-api/src/provider.rs`
 
-`config` · `client setup and request construction`
+`io_transport` · `request handling`
 
-This file packages transport-facing provider settings into two structs: `RetryConfig`, a high-level retry description, and `Provider`, the per-deployment endpoint definition. `RetryConfig` is intentionally simpler than `codex_client::RetryPolicy`; its conversion method fills the nested `RetryOn` flags expected by the lower-level client. `Provider` stores a human-readable `name`, a `base_url`, optional default query parameters, default `HeaderMap` headers, retry behavior, and a stream idle timeout used by streaming consumers.
+This file is the project’s “address book entry” for an API provider. A provider might be OpenAI, Azure OpenAI, or another compatible service. Without this file, the rest of the system would have to repeatedly guess how to build URLs, attach default headers, decide retry behavior, and convert normal web URLs into WebSocket URLs.
 
-The core behavior is `Provider::url_for_path`, which normalizes both sides of the join by trimming trailing `/` from the base and leading `/` from the path, then appends serialized query parameters if configured. Query parameters are emitted by iterating the stored `HashMap` and concatenating `k=v` pairs with `&`; there is no URL encoding here, so callers are expected to provide already-safe values. `build_request` turns that URL plus cloned default headers into a `codex_client::Request` with no body, no compression, and no timeout override.
+The two main pieces are `RetryConfig` and `Provider`. `RetryConfig` is a simple, human-sized retry setup: how many tries are allowed, how long to wait before trying again, and which kinds of failures are worth retrying. It can be converted into the lower-level retry policy used by the HTTP client.
 
-The Azure helpers are a notable design detail: Azure detection can come either from the provider name (`azure`, case-insensitive) or from known Azure hostname/path markers in the base URL. `websocket_url_for_path` reuses normal URL construction, parses it as `url::Url`, and rewrites only `http`→`ws` and `https`→`wss`, leaving existing WebSocket schemes and unknown schemes untouched.
+`Provider` stores the practical details for one API deployment: its name, base URL, optional query parameters, headers, retry settings, and stream idle timeout. It can turn a path like `/responses` into a full URL, build a request object with the provider’s defaults, and produce a WebSocket URL when the connection needs to stay open for real-time communication.
+
+The file also contains Azure detection logic. Some endpoints need slightly different request shapes when they are Azure “responses” endpoints, so this file checks both the provider name and known Azure URL patterns.
 
 #### Function details
 
@@ -3808,11 +3840,11 @@ The Azure helpers are a notable design detail: Azure detection can come either f
 fn to_policy(&self) -> RetryPolicy
 ```
 
-**Purpose**: Converts the file's simplified retry settings into the exact `codex_client::RetryPolicy` structure used by transport retry code. It preserves the attempt count and base delay while nesting the three retry booleans under `RetryOn`.
+**Purpose**: This turns the friendly retry settings stored in `RetryConfig` into the exact retry policy expected by the lower-level HTTP client. It is used when the transport layer needs concrete instructions for when to try a failed request again.
 
-**Data flow**: `self.max_attempts`, `self.base_delay`, and the `retry_429` / `retry_5xx` / `retry_transport` flags are read from the `RetryConfig` instance. They are copied directly into a newly constructed `RetryPolicy` and returned; no external state is mutated.
+**Data flow**: It starts with `max_attempts`, `base_delay`, and three yes-or-no retry choices from the `RetryConfig`. It copies those values into a `RetryPolicy`, grouping the retry reasons into a `RetryOn` object. The result is a ready-to-use retry policy; the original config is not changed.
 
-**Call relations**: This is the bridge from provider configuration into lower-level HTTP execution. It is used when higher-level request orchestration needs a transport retry policy rather than the API-facing config struct.
+**Call relations**: This is the bridge between provider-level configuration and the client code that actually performs retries. Higher-level setup can keep retry rules readable, then call this when it needs the format used by `codex-client`.
 
 
 ##### `Provider::url_for_path`  (lines 53–75)
@@ -3821,11 +3853,11 @@ fn to_policy(&self) -> RetryPolicy
 fn url_for_path(&self, path: &str) -> String
 ```
 
-**Purpose**: Builds the full request URL for a relative API path, including any provider-wide query parameters. It normalizes slash boundaries so callers can pass paths with or without a leading slash.
+**Purpose**: This builds a complete request URL from the provider’s base URL and a path. It also adds any provider-wide query parameters, like fixed options that must be present on every request.
 
-**Data flow**: Reads `self.base_url` and trims trailing `/`; reads the `path` argument and trims leading `/`. It either returns the bare base URL for an empty path or formats `base/path`, then, if `self.query_params` exists and is non-empty, appends `?` plus `key=value` pairs joined by `&`. The result is a `String` URL.
+**Data flow**: It takes a path, removes extra slashes at the join point, and combines it with `base_url`. If the provider has query parameters, it turns them into `key=value` text joined with `&` and appends them after a `?`. The output is a full URL string.
 
-**Call relations**: This is the common URL builder used by both `Provider::build_request` for HTTP requests and `Provider::websocket_url_for_path` before scheme conversion. Those callers rely on it to keep path joining and provider-level query parameters consistent.
+**Call relations**: Other request-building code depends on this as the single place where provider URLs are assembled. `Provider::build_request` uses it for normal HTTP requests, and `Provider::websocket_url_for_path` uses it before converting the URL to WebSocket form.
 
 *Call graph*: called by 2 (build_request, websocket_url_for_path); 1 external calls (format!).
 
@@ -3836,11 +3868,11 @@ fn url_for_path(&self, path: &str) -> String
 fn build_request(&self, method: Method, path: &str) -> Request
 ```
 
-**Purpose**: Creates a baseline `codex_client::Request` for an HTTP method and provider-relative path. The request is intentionally skeletal so later layers can attach body, compression, and timeout details.
+**Purpose**: This creates a basic HTTP request object for a provider and path, already filled with the provider’s URL and default headers. It is useful because callers do not have to remember the provider’s base address or shared headers each time.
 
-**Data flow**: Consumes the `method` and `path` arguments, calls `url_for_path` to compute the URL, clones `self.headers` into the request, and sets `body` to `None`, `compression` to `RequestCompression::None`, and `timeout` to `None`. It returns the assembled `Request` without mutating provider state.
+**Data flow**: It receives an HTTP method, such as GET or POST, and a path. It asks `Provider::url_for_path` for the full URL, clones the provider’s headers so the request has its own copy, and creates a `Request` with no body, no compression, and no custom timeout yet. The result is a request ready for later code to add body data or send.
 
-**Call relations**: Higher-level request code invokes this as the starting point for outbound API calls; the graph shows it feeding a `make_request` path. It delegates URL assembly to `url_for_path` so all request builders share the same base URL and query parameter logic.
+**Call relations**: This is called by `make_request` when the system is preparing an outbound API call. It hands off a standardized request object so later steps can focus on request-specific content instead of provider defaults.
 
 *Call graph*: calls 1 internal fn (url_for_path); called by 1 (make_request); 1 external calls (clone).
 
@@ -3851,11 +3883,11 @@ fn build_request(&self, method: Method, path: &str) -> Request
 fn is_azure_responses_endpoint(&self) -> bool
 ```
 
-**Purpose**: Answers whether this provider should be treated as an Azure Responses endpoint. It combines the provider's configured name and base URL into the shared Azure detection routine.
+**Purpose**: This answers whether this provider should be treated as an Azure Responses endpoint. That matters because Azure-compatible APIs can require different URL or request formatting than the default provider.
 
-**Data flow**: Reads `self.name` and `self.base_url`, passes them to `is_azure_responses_provider`, and returns the resulting boolean. It does not alter any provider fields.
+**Data flow**: It reads the provider’s name and base URL, then passes them to `is_azure_responses_provider`. It returns `true` if either the name or URL suggests Azure, otherwise `false`. It does not change the provider.
 
-**Call relations**: This method is used by request-building logic for Responses requests, where Azure deployments need slightly different behavior. It is a thin instance-level wrapper around the file-level detection helper.
+**Call relations**: This is called by `build_responses_request` when a Responses API request is being prepared. It acts like a routing sign: if the provider looks like Azure, request construction can choose the Azure-specific path.
 
 *Call graph*: calls 1 internal fn (is_azure_responses_provider); called by 1 (build_responses_request).
 
@@ -3866,11 +3898,11 @@ fn is_azure_responses_endpoint(&self) -> bool
 fn websocket_url_for_path(&self, path: &str) -> Result<Url, url::ParseError>
 ```
 
-**Purpose**: Builds a parsed WebSocket URL for a provider-relative path by reusing normal URL construction and then rewriting the scheme when appropriate. It supports HTTP and HTTPS origins while tolerating already-WebSocket or unknown schemes.
+**Purpose**: This creates a WebSocket URL for a provider path. A WebSocket is a long-lived connection used when both sides need to keep talking, like a phone call rather than sending letters one by one.
 
-**Data flow**: Calls `url_for_path(path)` to get a string, parses it into `url::Url`, then inspects `url.scheme()`. For `http` it sets `ws`; for `https` it sets `wss`; for `ws`, `wss`, or any other scheme it returns the parsed URL unchanged. Parse failures are returned as `url::ParseError`.
+**Data flow**: It first builds the normal full URL with `Provider::url_for_path`, then parses it into a URL object. If the URL starts with `http`, it changes that to `ws`; if it starts with `https`, it changes that to `wss`, the encrypted WebSocket form. If the URL is already `ws` or `wss`, it leaves it alone. It returns either the converted URL or a parse error if the URL text is invalid.
 
-**Call relations**: WebSocket connection code invokes this before opening a socket; the graph shows `connect` and `probe_handshake` as consumers. It depends on `url_for_path` so WebSocket and HTTP endpoints stay aligned except for scheme translation.
+**Call relations**: This is used by `connect` and `probe_handshake` when the system needs to open or test a WebSocket connection. It relies on `Provider::url_for_path` so WebSocket connections use the same base URL and query parameters as normal requests.
 
 *Call graph*: calls 1 internal fn (url_for_path); called by 2 (connect, probe_handshake); 1 external calls (parse).
 
@@ -3881,11 +3913,11 @@ fn websocket_url_for_path(&self, path: &str) -> Result<Url, url::ParseError>
 fn is_azure_responses_provider(name: &str, base_url: Option<&str>) -> bool
 ```
 
-**Purpose**: Determines whether a provider should be classified as Azure based on either an explicit provider name or recognizable Azure URL patterns. This lets callers detect Azure even when the provider name is generic.
+**Purpose**: This checks whether a provider should be considered Azure for Responses API behavior. It accepts both an explicit provider name and an optional base URL so it can detect Azure in either place.
 
-**Data flow**: Reads the `name` string first and returns `true` if it equals `azure` ignoring ASCII case. Otherwise, if `base_url` is present, it passes that string to `matches_azure_responses_base_url`; if no URL is provided, it returns `false`.
+**Data flow**: It receives a provider name and maybe a base URL. If the name is `azure`, ignoring letter case, it immediately returns `true`. Otherwise, if a base URL exists, it asks `matches_azure_responses_base_url` whether that URL contains known Azure patterns. If neither check matches, it returns `false`.
 
-**Call relations**: This is the shared predicate behind `Provider::is_azure_responses_endpoint`. It delegates hostname/path pattern matching to `matches_azure_responses_base_url` when name-based detection does not already decide the result.
+**Call relations**: This is the shared Azure decision helper used by `Provider::is_azure_responses_endpoint`. It delegates the URL-pattern details to `matches_azure_responses_base_url` so the top-level check stays easy to read.
 
 *Call graph*: calls 1 internal fn (matches_azure_responses_base_url); called by 1 (is_azure_responses_endpoint).
 
@@ -3896,11 +3928,11 @@ fn is_azure_responses_provider(name: &str, base_url: Option<&str>) -> bool
 fn matches_azure_responses_base_url(base_url: &str) -> bool
 ```
 
-**Purpose**: Checks a base URL string for a fixed set of Azure-specific host and path markers associated with Azure OpenAI-style deployments. The match is substring-based and case-insensitive.
+**Purpose**: This looks for known Azure URL markers inside a provider base URL. It helps catch Azure deployments even when the provider was not explicitly named `azure`.
 
-**Data flow**: Lowercases the `base_url` input, then scans it for any of six constant markers such as `openai.azure.`, `cognitiveservices.azure.`, `azurefd.`, and `windows.net/openai`. It returns `true` on the first contained marker and `false` otherwise.
+**Data flow**: It receives a base URL string, lowercases it so the check is not affected by capitalization, and searches for several known Azure-related text fragments. It returns `true` if any marker appears in the URL, otherwise `false`.
 
-**Call relations**: This helper is only reached through `is_azure_responses_provider`, where it supplies URL-based Azure detection after the provider name check fails.
+**Call relations**: This is called by `is_azure_responses_provider` only after the provider name did not already prove it is Azure. It is the detailed pattern-matching step behind the broader Azure detection flow.
 
 *Call graph*: called by 1 (is_azure_responses_provider).
 
@@ -3911,26 +3943,26 @@ fn matches_azure_responses_base_url(base_url: &str) -> bool
 fn detects_azure_responses_base_urls()
 ```
 
-**Purpose**: Verifies the Azure detection heuristics against representative positive and negative URLs, plus the explicit provider-name override. It documents the accepted Azure host variants and a few near-miss cases that must not match.
+**Purpose**: This test checks that Azure endpoint detection recognizes expected Azure URLs and does not falsely label ordinary or unrelated URLs as Azure. It protects the special Azure request path from being chosen too often or not often enough.
 
-**Data flow**: Builds arrays of positive and negative URL literals, feeds them into `is_azure_responses_provider`, and asserts the expected boolean result for each case. It also checks that the provider name `Azure` forces a positive result even with a non-Azure URL.
+**Data flow**: It feeds several known Azure-looking URLs into `is_azure_responses_provider` and asserts that they return `true`. It also checks that the provider name `Azure` is enough by itself. Then it feeds non-Azure examples and asserts that they return `false`. The output is a passing or failing test result.
 
-**Call relations**: This test exercises the public detection path rather than the private matcher directly, ensuring the combined name-first and URL-fallback logic behaves as intended.
+**Call relations**: This test exercises the public Azure detection helper from the outside, the same way production code reaches it through `Provider::is_azure_responses_endpoint`. If future edits change the marker list or detection rules, this test shows whether the expected behavior was preserved.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `codex-api/src/endpoint/session.rs`
 
-`orchestration` · `cross-cutting request setup`
+`io_transport` · `request handling`
 
-This file defines `EndpointSession<T>`, the common transport wrapper that endpoint-specific clients build on. It owns four pieces of state: the concrete `HttpTransport`, the resolved `Provider`, the shared auth provider, and optional request telemetry. The type is intentionally generic over transport so tests and alternate backends can reuse the same endpoint logic.
+EndpointSession is the shared “messenger” for this API layer. Higher-level endpoint code knows what it wants to do, such as list models or start a stream, but this file knows how to turn that intent into an authenticated HTTP request and send it through the configured transport.
 
-The session's responsibilities are request construction and execution policy. `make_request` starts from `provider.build_request(method, path)`, merges caller-supplied headers, and optionally attaches a cloned `RequestBody`. `provider()` exposes the stored provider so endpoint clients can inspect endpoint-specific capabilities such as Azure behavior or idle timeout.
+The session holds four main pieces: a transport, which is the object that actually sends HTTP requests; a provider, which knows the base API shape and retry rules; an auth provider, which adds credentials; and optional request telemetry, which records information about attempts and timing. In everyday terms, the provider writes the envelope, the auth provider adds the stamp, the transport delivers it, and telemetry keeps the delivery receipt.
 
-There are two execution paths. `execute` is the simple JSON request wrapper and just forwards to `execute_with` with a no-op configurator. `execute_with` converts an optional `serde_json::Value` into `RequestBody::Json`, builds a closure that reconstructs the request each retry attempt, lets the caller mutate the `Request` via `configure`, and then runs the request through `run_with_request_telemetry`. Inside the transport closure, auth is applied asynchronously with `auth.apply_auth`, auth failures are converted into `TransportError`, and the prepared request is sent with `transport.execute`.
+For regular JSON requests, callers use execute or execute_with. These build a request, optionally let the caller tweak it, apply authentication, then send it with retry and telemetry support. For streaming responses, stream_encoded_json_with does a similar job, but prepares an encoded JSON body and calls the transport’s streaming path instead of the normal request path.
 
-`stream_encoded_json_with` is the streaming counterpart for pre-encoded JSON bodies. It builds the request once, applies caller configuration, converts it into a prepared request up front with `into_prepared()` so retries can clone an identical request, and then uses the same telemetry/retry wrapper around `transport.stream`. The design keeps endpoint files focused on endpoint-specific paths and headers while centralizing auth, retries, and request shaping here.
+The important behavior is that retries and telemetry wrap the whole send operation. That means a request can be recreated for each attempt, authentication is applied before each send, and callers get a single success or error result instead of having to coordinate all of that themselves.
 
 #### Function details
 
@@ -3940,11 +3972,11 @@ There are two execution paths. `execute` is the simple JSON request wrapper and 
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a new endpoint session from transport, provider, and auth state. It initializes request telemetry as absent.
+**Purpose**: Creates a fresh endpoint session from the pieces needed to talk to an API provider: the HTTP transport, provider settings, and authentication source. It starts without request telemetry attached.
 
-**Data flow**: Consumes `transport: T`, `provider: Provider`, and `auth: SharedAuthProvider`, stores them in `EndpointSession`, sets `request_telemetry` to `None`, and returns the session.
+**Data flow**: The caller supplies a transport, a provider, and shared authentication. The function stores those inside a new EndpointSession and sets the optional telemetry slot to empty. The result is a ready-to-use session object that endpoint code can keep and use for requests.
 
-**Call relations**: This constructor is called by multiple endpoint clients during their own `new` methods. It is the common root for all authenticated HTTP interactions in this crate.
+**Call relations**: Higher-level constructors call this when they are setting up endpoint-specific clients. It is the starting point before any request is sent; later calls may add telemetry or use the session to execute requests.
 
 *Call graph*: called by 7 (new, new, new, new, new, new, new).
 
@@ -3958,11 +3990,11 @@ fn with_request_telemetry(
     ) -> Self
 ```
 
-**Purpose**: Attaches optional request telemetry to the session in builder style. It allows endpoint clients to opt into instrumentation without mutating shared state in place.
+**Purpose**: Attaches optional request telemetry to a session. Telemetry means a reporting hook that can observe request attempts, timing, and retry behavior.
 
-**Data flow**: Consumes `mut self` and `request: Option<Arc<dyn RequestTelemetry>>`, assigns the telemetry into `self.request_telemetry`, and returns the updated session.
+**Data flow**: It takes an existing session and an optional shared telemetry object. It stores that telemetry object in the session and returns the same session back, now configured to report request activity when requests run.
 
-**Call relations**: This method is called by endpoint-specific `with_telemetry` builders. The stored telemetry is later consumed by `execute_with` and `stream_encoded_json_with` through `run_with_request_telemetry`.
+**Call relations**: Builder-style setup code calls this after creating a session, usually through higher-level with_telemetry methods. The telemetry value it stores is later passed into the retry-and-send wrapper used by execute_with and stream_encoded_json_with.
 
 *Call graph*: called by 7 (with_telemetry, with_telemetry, with_telemetry, with_telemetry, with_telemetry, with_telemetry, with_telemetry).
 
@@ -3973,11 +4005,11 @@ fn with_request_telemetry(
 fn provider(&self) -> &Provider
 ```
 
-**Purpose**: Exposes the resolved provider configuration stored in the session. Endpoint clients use it to inspect provider-specific behavior and timeouts.
+**Purpose**: Gives read-only access to the provider stored in the session. Callers use this when they need to inspect provider details, such as how requests should be shaped for a backend.
 
-**Data flow**: Borrows `self` and returns `&Provider`.
+**Data flow**: It reads the provider field from the session and returns a reference to it. Nothing is copied or changed; the caller simply gets a safe view of the provider configuration.
 
-**Call relations**: This accessor is used by higher-level endpoint clients such as the responses client when they need provider metadata without duplicating storage.
+**Call relations**: Code that checks backend request shape or prepares streaming requests calls this to ask what provider the session is using. It does not send anything itself; it supports decisions made before request execution.
 
 *Call graph*: called by 3 (uses_backend_request_shape, stream_encoded, stream_request).
 
@@ -3994,11 +4026,11 @@ fn make_request(
     ) -> Request
 ```
 
-**Purpose**: Builds a `codex_client::Request` from provider defaults, caller headers, and an optional body. It is the shared request-construction primitive for both execute and stream paths.
+**Purpose**: Builds the common Request object used by the sending functions. It combines the provider’s base request, any extra headers, and an optional body into one complete request package.
 
-**Data flow**: Accepts `method`, `path`, `extra_headers`, and optional `&RequestBody`. It calls `self.provider.build_request(method.clone(), path)`, extends the request headers with a clone of `extra_headers`, clones the body into `req.body` when present, and returns the assembled `Request`.
+**Data flow**: It receives an HTTP method, a path, extra headers, and maybe a request body. It asks the provider to build the base request for that method and path, copies in the extra headers, copies in the body if one was supplied, and returns the completed Request.
 
-**Call relations**: This helper is used directly by `stream_encoded_json_with` and indirectly by `execute_with` through its `make_request` closure. It centralizes provider-based request initialization.
+**Call relations**: The streaming request path calls this before preparing and sending the stream. It relies on the provider’s build_request behavior so all endpoint requests start from the same provider-specific rules.
 
 *Call graph*: calls 1 internal fn (build_request); called by 1 (stream_encoded_json_with); 2 external calls (clone, clone).
 
@@ -4015,11 +4047,11 @@ async fn execute(
     ) -> Result<Response, ApiError>
 ```
 
-**Purpose**: Sends a standard JSON request without any extra request customization. It is the convenience wrapper used by simple endpoints.
+**Purpose**: Sends a normal, non-streaming API request with an optional JSON body. It is the simple version for callers that do not need to customize the raw request.
 
-**Data flow**: Accepts HTTP `method`, `path`, `extra_headers`, and optional JSON `Value`, then forwards them to `execute_with` with a no-op configurator closure. It returns the resulting `Response` or `ApiError`.
+**Data flow**: The caller gives an HTTP method, API path, headers, and optional JSON value. This function forwards those values to execute_with and supplies an empty customization step. The output is either a completed HTTP response or an API error.
 
-**Call relations**: This method is called by endpoint clients like search and other non-streaming APIs. It exists so those callers do not need to supply an explicit configure closure.
+**Call relations**: Endpoint operations such as image requests, summarization, and search call this when the default request shape is enough. It immediately hands the real work to execute_with, which performs building, authentication, retries, telemetry, and transport execution.
 
 *Call graph*: calls 1 internal fn (execute_with); called by 3 (post_image_request, summarize, search).
 
@@ -4037,11 +4069,11 @@ async fn execute_with(
     ) -> Result<Response, ApiErro
 ```
 
-**Purpose**: Executes a JSON request with retry, auth application, optional request mutation, and request telemetry. It is the main non-streaming orchestration path for endpoint clients.
+**Purpose**: Sends a normal API request while allowing the caller to make last-minute changes to the Request before it goes out. This is used when an endpoint needs custom request details beyond method, path, headers, and JSON body.
 
-**Data flow**: Takes HTTP `method`, `path`, `extra_headers`, optional JSON `Value`, and a `configure` closure. It wraps the JSON body as `RequestBody::Json`, defines `make_request` to call `self.make_request(...)` and then apply `configure`, and passes that plus the provider retry policy and optional telemetry into `run_with_request_telemetry`. For each attempt, the async transport closure clones auth, applies it with `auth.apply_auth(req)`, maps auth failures into `TransportError`, and calls `transport.execute(req)`. The awaited result is returned as `Response` or propagated as `ApiError`.
+**Data flow**: It receives request details plus a configure function. It turns the optional JSON value into the internal request-body form, creates a fresh request when needed, lets the configure function edit it, then runs the request through retry and telemetry logic. For each send attempt, authentication is applied first, then the transport executes the request. The final output is a successful response or an API error.
 
-**Call relations**: This method underpins `execute` and is also called directly by endpoint clients that need to tweak the outgoing request. It is the central place where retries, telemetry, auth, and transport execution are wired together.
+**Call relations**: More specialized endpoint actions, including compacting, listing models, and creating requests with custom headers or session architecture details, call this when they need control over the outgoing request. The simpler execute function also delegates to it. It hands request attempts to run_with_request_telemetry so retry policy and measurement are applied around the transport call.
 
 *Call graph*: calls 1 internal fn (run_with_request_telemetry); called by 5 (compact, list_models, create_with_headers, create_with_session_architecture_and_headers, execute).
 
@@ -4059,31 +4091,37 @@ async fn stream_encoded_json_with(
     ) -> Re
 ```
 
-**Purpose**: Executes a streaming request whose JSON body has already been encoded, with retry, auth, and request customization. It is the streaming counterpart to `execute_with`.
+**Purpose**: Starts a streaming API request using an already encoded JSON body. A streaming request is one where the response arrives over time, rather than as one complete response.
 
-**Data flow**: Accepts HTTP `method`, `path`, `extra_headers`, optional `EncodedJsonBody`, and a `configure` closure. It wraps the body as `RequestBody::EncodedJson`, builds a request with `make_request`, applies `configure`, converts the request into a prepared form with `into_prepared()` so it can be cloned safely across retries, and defines `make_request` as `|| request.clone()`. It then calls `run_with_request_telemetry` with the provider retry policy and optional telemetry; each attempt applies auth asynchronously and invokes `transport.stream(req)`. The resulting `StreamResponse` is returned or mapped into `ApiError`.
+**Data flow**: The caller supplies the method, path, headers, optional encoded JSON body, and a configure function. The function builds the request, lets the caller adjust it, prepares it into a send-ready form, and then runs it through the same retry and telemetry wrapper used for normal requests. Before each stream attempt, authentication is applied, and then the transport opens the stream. The result is either a StreamResponse or an API error.
 
-**Call relations**: This method is called by higher-level streaming clients such as `ResponsesClient::stream_encoded`. It centralizes the prepared-request requirement and retry/auth behavior for streaming transports.
+**Call relations**: Streaming endpoint code calls this when it needs a response that can be read piece by piece. It uses make_request to assemble the request and run_with_request_telemetry to wrap the streaming transport call with retry and reporting behavior.
 
 *Call graph*: calls 2 internal fn (make_request, run_with_request_telemetry); called by 1 (stream_encoded).
 
 
 ### `codex-api/src/endpoint/mod.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting API organization`
 
-This module is the public façade over the crate’s endpoint implementations. It declares submodules for compacting, images, memories, models, realtime call transport, realtime websocket transport, standard responses, websocket responses, and search, plus a private `session` helper module. It then re-exports the concrete client types from those modules—such as `CompactClient`, `ImagesClient`, `ResponsesClient`, `SearchClient`, and the realtime websocket/call clients—so callers can construct and use endpoint-specific APIs without depending on the internal directory structure.
+This file does not contain the logic for talking to the API itself. Instead, it acts like a directory desk in a large building: it points to the rooms where the real work happens, and it makes the most important tools easy to find.
 
-Beyond client structs, the file also re-exports endpoint-specific protocol and connection types that are part of the usable surface: realtime websocket parsers and session configuration enums, websocket connection/writer/event stream types, websocket close/probe helpers for responses, and the `session_update_session_json` helper used to build realtime session update payloads. The design choice here is separation of concerns: endpoint implementations remain in dedicated modules, while this file defines the stable namespace that `codex-api` exposes upward through its crate root. There is no runtime logic, but the export list is semantically important because it determines which endpoint capabilities are considered supported and discoverable by downstream code.
+Each `mod` line tells Rust that there is another source file or folder containing code for a specific API area. For example, image-related API calls live under `images`, model listing under `models`, and realtime websocket communication under `realtime_websocket`. The `session` module is kept private to this endpoint area, meaning it is used internally but not offered directly to the rest of the crate.
+
+The `pub use` lines re-export selected types from those modules. In plain terms, that means outside code can import `ResponsesClient` or `ImagesClient` from this endpoint layer without needing to know the exact submodule where each one is defined. This keeps the rest of the project cleaner and protects it from unnecessary file-layout details.
+
+Without this file, callers would need to know and import every endpoint client from its individual module. Adding, renaming, or reorganizing endpoint files would be more painful because those internal paths would leak across the codebase.
 
 
 ### `codex-api/src/requests/mod.rs`
 
 `orchestration` · `request handling`
 
-This module is a small organizational layer over request-building code. It declares two submodules: `headers`, which contains logic for constructing outbound HTTP or websocket headers, and `responses`, which contains request assembly helpers specific to the responses API. From those modules it publicly re-exports `Compression`, making the request compression choice part of the crate’s external API, while only crate-internally re-exporting `attach_item_ids` for use by other internal request-building code.
+This file is like a small index page for request support code. Instead of every caller needing to know exactly where request headers, response helpers, and compression choices live, this module gathers those pieces under one shared place.
 
-The distinction between `pub use` and `pub(crate) use` is the key design detail. `Compression` is intended for callers configuring outbound requests, so it is surfaced publicly. `attach_item_ids`, by contrast, is treated as implementation plumbing: other modules in the crate can share it, but external consumers are prevented from coupling to that helper. This file therefore acts as a narrow visibility gate rather than a logic-bearing module. Its role in the runtime is indirect but important during request assembly, because it centralizes where request helper capabilities are exposed and preserves a clean public API boundary around internal request mutation details.
+It declares two child modules: one for HTTP-style headers and one for response-related helpers. A module is Rust’s way of grouping related code, much like putting papers into labeled folders. This file also re-exports selected items from the response module, which means other code can import them from this higher-level request module instead of reaching into the deeper folder. In particular, it makes the `Compression` choice available outside the response module, and it shares `attach_item_ids` within the crate for internal use.
+
+Without this file, the request code would still exist in separate files, but it would be harder and messier for the rest of the project to find and use it. This file keeps the public shape of the request area tidy: it says, “these are the request-related building blocks, and these are the ones you should reach for from elsewhere.”
 
 
 ### Streaming and upload helpers
@@ -4091,22 +4129,24 @@ These files cover specialized API-side transport helpers for SSE exposure, realt
 
 ### `codex-api/src/sse/mod.rs`
 
-`orchestration` · `request handling`
+`io_transport` · `request handling`
 
-This module is a thin namespace and re-export layer for SSE handling in the API crate. It declares a single internal submodule, `responses`, and then selectively republishes the pieces that other parts of the crate or downstream crates are expected to use: the `ResponsesStreamEvent` event type, the `process_responses_event` helper, and the public `spawn_response_stream` entrypoint. The visibility split is intentional: `responses` itself stays crate-private, while the specific items form the stable interface for consuming streamed response events. Because there is no logic in this file, its main architectural role is to keep the SSE implementation physically isolated while presenting a compact API at `codex_api::sse`. That arrangement also makes it clear that the crate currently centers SSE support around response streaming specifically, rather than a broader event framework. Readers should treat this file as the module boundary that defines what the rest of the system is allowed to know about SSE internals.
+This file does not contain its own logic. Instead, it organizes and re-exports the real server-sent events code from the `responses` module. Server-sent events, often shortened to SSE, are a simple way for a server to keep sending updates to a client over one long-lived web connection, like a live news ticker instead of separate page refreshes.
+
+The file makes three response-streaming pieces available to the rest of the crate: a type representing response stream events, a function that processes incoming response events, and a function that starts or "spawns" the response stream. This matters because other parts of the API should not need to know the exact internal file layout. They can import streaming tools from this `sse` module and let it hide where the implementation lives.
+
+Without this file, callers would have to reach directly into the `responses` submodule, making the code more tightly tied to the folder structure. This small module acts like a reception desk: it does not do the work itself, but it points the rest of the system to the right streaming tools.
 
 
 ### `codex-api/src/endpoint/realtime_websocket/protocol_common.rs`
 
-`util` · `request handling`
+`io_transport` · `realtime WebSocket message handling`
 
-This file contains small parser utilities shared by the v1 and v2 realtime event decoders. Rather than duplicating JSON decoding and field extraction logic in each parser, it centralizes the common pieces here.
+Realtime WebSocket messages arrive as plain text, usually shaped like JSON, which is a common format for sending structured data. This file checks that those messages are understandable and pulls out the few fields the rest of the system needs. Think of it like a mailroom clerk: it opens an envelope, checks the label, and sorts the contents into the right internal form.
 
-`parse_realtime_payload` is the entry helper: it attempts to deserialize the raw websocket text into `serde_json::Value`, logs a debug message and returns `None` on malformed JSON, then extracts the top-level `type` field as a `String`. If the `type` field is missing or not a string, it also logs and returns `None`. Successful callers receive both the parsed JSON tree and the message type string.
+The first step is parsing the text payload into a JSON value and finding its "type" field. Without that, the rest of the realtime code would not know what kind of event it received. If the payload is broken or missing a type, the helper logs a debug message and returns nothing instead of crashing.
 
-The remaining helpers each extract one common event shape from a parsed JSON value. `parse_session_updated_event` reads `session.id` and optional `session.instructions` and returns `RealtimeEvent::SessionUpdated`. `parse_transcript_delta_event` and `parse_transcript_done_event` read a named string field and wrap it in `RealtimeTranscriptDelta` or `RealtimeTranscriptDone`. `parse_error_event` is intentionally tolerant: it first looks for a top-level `message`, then `error.message`, then falls back to serializing the entire `error` field if present, finally wrapping the chosen string in `RealtimeEvent::Error`.
-
-These helpers are pure and side-effect free except for debug logging on malformed payloads, making them easy building blocks for the version-specific parsers.
+The other helpers read specific event shapes: session updates, transcript text as it streams in, finished transcript text, and errors. Each one is deliberately tolerant: if a required field is missing or not a string, it returns nothing. That lets the higher-level protocol parsers decide what to do next. The file matters because it keeps the two realtime protocol versions consistent, avoids duplicated parsing code, and protects the rest of the system from malformed incoming messages.
 
 #### Function details
 
@@ -4116,11 +4156,11 @@ These helpers are pure and side-effect free except for debug logging on malforme
 fn parse_realtime_payload(payload: &str, parser_name: &str) -> Option<(Value, String)>
 ```
 
-**Purpose**: Parses a raw websocket payload into JSON and extracts its top-level event type string.
+**Purpose**: This function does the first basic check on an incoming realtime message. It turns raw text into JSON and extracts the message’s "type", which tells later code how to interpret the event.
 
-**Data flow**: Takes `payload: &str` and `parser_name: &str` → attempts `serde_json::from_str(payload)` into `Value`; on failure logs and returns `None` → reads `parsed["type"]` as `&str`; if missing logs and returns `None` → returns `Some((parsed, message_type.to_string()))`.
+**Data flow**: It receives a text payload and a parser name used only for clearer debug messages. It tries to parse the text as JSON, then looks for a string field named "type". If both steps work, it returns the parsed JSON together with the type string; if not, it logs what went wrong and returns no result.
 
-**Call relations**: Used by both `parse_realtime_event_v1` and `parse_realtime_event_v2` as their common first step before event-specific matching.
+**Call relations**: Both parse_realtime_event_v1 and parse_realtime_event_v2 call this at the start of their work. After this helper identifies the event type, those version-specific parsers can choose the right more specialized helper for the event body.
 
 *Call graph*: called by 2 (parse_realtime_event_v1, parse_realtime_event_v2); 2 external calls (debug!, from_str).
 
@@ -4131,11 +4171,11 @@ fn parse_realtime_payload(payload: &str, parser_name: &str) -> Option<(Value, St
 fn parse_session_updated_event(parsed: &Value) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Extracts a `SessionUpdated` event from a parsed JSON payload when `session.id` is present.
+**Purpose**: This function reads a session update message and turns it into an internal realtime event. It extracts the realtime session ID and, if present, the session instructions.
 
-**Data flow**: Reads `parsed["session"]["id"]` as a string and optional `parsed["session"]["instructions"]` → if `id` exists returns `RealtimeEvent::SessionUpdated { realtime_session_id, instructions }`, otherwise returns `None`.
+**Data flow**: It receives an already-parsed JSON value. It looks inside the "session" object for an "id" string, which is required, and an "instructions" string, which is optional. If the session ID is present, it returns a SessionUpdated event; if not, it returns no result.
 
-**Call relations**: Called by both version-specific parsers for `session.updated` events.
+**Call relations**: The protocol version parsers, parse_realtime_event_v1 and parse_realtime_event_v2, call this when the incoming event type means the session has been updated. This helper supplies the common conversion so both protocol versions produce the same internal event shape.
 
 *Call graph*: called by 2 (parse_realtime_event_v1, parse_realtime_event_v2); 1 external calls (get).
 
@@ -4149,11 +4189,11 @@ fn parse_transcript_delta_event(
 ) -> Option<RealtimeTranscriptDelta>
 ```
 
-**Purpose**: Extracts a transcript delta string from a named field and wraps it in `RealtimeTranscriptDelta`.
+**Purpose**: This function reads a small piece of transcript text from a streaming message. A “delta” means only the newest added text, not the full transcript so far.
 
-**Data flow**: Takes `parsed: &Value` and `field: &str` → reads `parsed[field]` as `&str` → returns `Some(RealtimeTranscriptDelta { delta })` or `None`.
+**Data flow**: It receives parsed JSON and the name of the field where the text is expected. It looks up that field, checks that it is a string, and wraps the string in a RealtimeTranscriptDelta value. If the field is missing or not text, it returns no result.
 
-**Call relations**: Used by both parsers for input/output transcript delta event variants.
+**Call relations**: parse_realtime_event_v1 and parse_realtime_event_v2 call this when they recognize an event that carries partial transcript text. They provide the field name because different event shapes may store the text under different keys.
 
 *Call graph*: called by 2 (parse_realtime_event_v1, parse_realtime_event_v2); 1 external calls (get).
 
@@ -4167,11 +4207,11 @@ fn parse_transcript_done_event(
 ) -> Option<RealtimeTranscriptDone>
 ```
 
-**Purpose**: Extracts a finalized transcript string from a named field and wraps it in `RealtimeTranscriptDone`.
+**Purpose**: This function reads the final completed transcript text from an event. It is used when the stream is no longer just sending small additions, but has the finished text available.
 
-**Data flow**: Takes `parsed: &Value` and `field: &str` → reads `parsed[field]` as `&str` → returns `Some(RealtimeTranscriptDone { text })` or `None`.
+**Data flow**: It receives parsed JSON and the expected text field name. It pulls that field out as a string and wraps it in a RealtimeTranscriptDone value. If it cannot find usable text, it returns no result.
 
-**Call relations**: Used by both parsers for transcript completion event variants.
+**Call relations**: The two protocol parsers, parse_realtime_event_v1 and parse_realtime_event_v2, call this when an event signals that transcript text is complete. This keeps the final-transcript extraction logic shared between protocol versions.
 
 *Call graph*: called by 2 (parse_realtime_event_v1, parse_realtime_event_v2); 1 external calls (get).
 
@@ -4182,24 +4222,24 @@ fn parse_transcript_done_event(
 fn parse_error_event(parsed: &Value) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Normalizes several possible JSON error shapes into `RealtimeEvent::Error`.
+**Purpose**: This function turns an error-shaped JSON message into the project’s internal realtime error event. It accepts a few common error formats so the rest of the code can receive one consistent error type.
 
-**Data flow**: Reads `parsed["message"]`, then `parsed["error"]["message"]`, then falls back to `parsed["error"].to_string()` if present → wraps the chosen string in `RealtimeEvent::Error` → returns `Option<RealtimeEvent>`.
+**Data flow**: It receives parsed JSON. It first looks for a top-level "message" string, then for an "error" object with its own "message" string, and finally falls back to converting the whole "error" value to text. If it finds any of these, it returns a RealtimeEvent::Error containing the message; otherwise it returns no result.
 
-**Call relations**: Used by both version-specific parsers when handling error event payloads.
+**Call relations**: parse_realtime_event_v1 and parse_realtime_event_v2 call this when they detect an error event. This helper absorbs differences in how errors are written in the incoming JSON and hands back one simple internal event.
 
 *Call graph*: called by 2 (parse_realtime_event_v1, parse_realtime_event_v2); 1 external calls (get).
 
 
 ### `codex-api/src/files.rs`
 
-`io_transport` · `file upload`
+`io_transport` · `file upload request handling`
 
-This file contains the complete multi-step OpenAI file upload workflow. It defines constants for the canonical URI prefix (`sediment://`), the 512 MiB upload limit, request/finalization timeouts, retry delay, and the fixed use case string `codex`. `UploadedOpenAiFile` is the success payload returned to callers, while `OpenAiFileError` enumerates validation, request, status, decode, not-ready, and finalization-failed cases.
+This file is the project’s bridge between Codex and OpenAI’s file-upload service. When Codex needs to attach or send a file, it cannot simply invent a link. It must ask OpenAI for an upload slot, stream the bytes to that slot, then tell OpenAI the upload is complete and wait until OpenAI can provide a usable download link. Without this file, larger file attachments would have no safe, consistent path into the OpenAI backend.
 
-`upload_openai_file` performs three sequential phases. First it validates `file_size_bytes` against `OPENAI_FILE_UPLOAD_LIMIT_BYTES`. Then it creates the upload by POSTing authenticated JSON to `{base_url}/files`, expecting a `CreateFileResponse` containing `file_id` and `upload_url`. Next it uploads the raw bytes to the returned blob URL with a plain reqwest client, setting `x-ms-blob-type: BlockBlob`, `Content-Length`, a 60-second timeout, and streaming the provided `Stream<Item = io::Result<Bytes>>` via `reqwest::Body::wrap_stream`.
+The upload works like checking luggage at an airport. First, Codex checks that the file is not too large. Then it asks the backend for a luggage tag: a file ID and a temporary upload URL. Next, it sends the actual file bytes to that temporary URL. Finally, it goes back to the backend and says, “the upload is done.” The backend may answer “not ready yet,” so this file retries briefly before giving up.
 
-Finally it polls `{base_url}/files/{file_id}/uploaded` until the server reports `status: "success"`, `status: "retry"` until a 30-second deadline expires, or any other status indicating failure. On success it constructs `UploadedOpenAiFile`, deriving `uri` from `openai_file_uri`, preserving the original file size, defaulting `file_name` to the caller's original name if omitted, and requiring `download_url` to be present. `authorized_request` centralizes auth-header injection for API-hosted requests, while `build_reqwest_client` applies custom CA configuration and falls back to `reqwest::Client::new()` with a warning if custom TLS setup fails. The test exercises the full happy path, including one retry during finalization and canonical URI generation.
+The file also builds authenticated HTTP requests, meaning requests that include login/account headers supplied by an `AuthProvider`. It uses a custom certificate-aware HTTP client when possible, and falls back to a normal client if that setup fails. The tests set up a fake server and prove that the upload flow returns the expected canonical URI, such as `sediment://file_123`.
 
 #### Function details
 
@@ -4209,11 +4249,11 @@ Finally it polls `{base_url}/files/{file_id}/uploaded` until the server reports 
 fn openai_file_uri(file_id: &str) -> String
 ```
 
-**Purpose**: Builds the canonical OpenAI file URI used by the rest of the system to reference uploaded files. It simply prefixes the file ID with `sediment://`.
+**Purpose**: Creates the project’s standard URI for an uploaded OpenAI file. This turns a raw file ID into a stable reference string that other parts of the system can store or send around.
 
-**Data flow**: Accepts `file_id: &str`, formats `"{OPENAI_FILE_URI_PREFIX}{file_id}"`, and returns the resulting `String`.
+**Data flow**: It receives a file ID such as `file_123` → adds the fixed `sediment://` prefix → returns a string such as `sediment://file_123`. It does not change any outside state.
 
-**Call relations**: This helper is called by `upload_openai_file` after successful finalization so the returned `UploadedOpenAiFile` includes the canonical URI.
+**Call relations**: After `upload_openai_file` finishes the upload and receives a file ID from OpenAI, it calls this helper to produce the canonical URI included in the returned `UploadedOpenAiFile` record.
 
 *Call graph*: called by 1 (upload_openai_file); 1 external calls (format!).
 
@@ -4229,11 +4269,11 @@ async fn upload_openai_file(
     contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static
 ```
 
-**Purpose**: Executes the full OpenAI file upload lifecycle: create upload session, stream file contents to the returned upload URL, and poll finalization until the file is ready or fails. It is the main runtime API in this file.
+**Purpose**: Uploads a file stream to OpenAI’s file service from start to finish. It checks the size, asks for an upload URL, sends the file bytes, waits for OpenAI to finalize the upload, and returns the file’s ID, URI, download URL, name, size, and optional MIME type.
 
-**Data flow**: Takes `base_url`, an auth provider, `file_name`, `file_size_bytes`, and a byte stream of file contents. It first rejects oversized files with `OpenAiFileError::FileTooLarge`. It then POSTs authenticated JSON to `{base_url}/files`, parses `CreateFileResponse`, uploads the content stream with a PUT to `upload_url` using `build_reqwest_client`, and checks each HTTP status for success. After upload, it repeatedly POSTs `{}` to `{base_url}/files/{file_id}/uploaded`, parsing `DownloadLinkResponse` each time. `status == "success"` returns `UploadedOpenAiFile` with canonical URI, required `download_url`, fallback `file_name`, original size, and optional MIME type; `status == "retry"` sleeps `OPENAI_FILE_FINALIZE_RETRY_DELAY` until `OPENAI_FILE_FINALIZE_TIMEOUT` elapses, then returns `UploadNotReady`; any other status returns `UploadFailed` using `error_message` or a default message. Request send failures, non-success HTTP statuses, and JSON decode failures are mapped into the corresponding `OpenAiFileError` variants with the relevant URL attached.
+**Data flow**: It receives a backend base URL, an authentication provider, the file name, the file size, and a stream of file bytes → rejects the upload immediately if the file is over the 512 MB limit → sends an authenticated create-file request to get a file ID and temporary upload URL → streams the bytes to that upload URL → repeatedly tells the backend the upload is complete until it succeeds, fails, or times out → returns an `UploadedOpenAiFile` on success, or an `OpenAiFileError` explaining what went wrong.
 
-**Call relations**: This function is the top-level upload workflow exercised by the integration-style test in this file. It delegates authenticated API request construction to `authorized_request`, raw upload client creation to `build_reqwest_client`, and URI formatting to `openai_file_uri`.
+**Call relations**: This is the main workflow in the file. It calls `authorized_request` when talking to the OpenAI backend because those requests need account/authentication headers. It calls `build_reqwest_client` directly for the raw byte upload to the temporary storage URL. Once finalization succeeds, it calls `openai_file_uri` to create the stable `sediment://...` reference. The test `tests::upload_openai_file_returns_canonical_uri` drives this function through the full happy path, including a retry during finalization.
 
 *Call graph*: calls 3 internal fn (authorized_request, build_reqwest_client, openai_file_uri); called by 1 (upload_openai_file_returns_canonical_uri); 6 external calls (now, wrap_stream, format!, from_str, json!, sleep).
 
@@ -4248,11 +4288,11 @@ fn authorized_request(
 ) -> reqwest::RequestBuilder
 ```
 
-**Purpose**: Builds a reqwest request builder with auth headers and the standard file-request timeout already applied. It is used for the API-hosted create and finalize calls.
+**Purpose**: Builds an HTTP request that already contains the required authentication headers and timeout. This keeps the upload workflow from repeating the same setup for every backend call.
 
-**Data flow**: Accepts an auth provider, HTTP method, and URL. It creates a fresh `http::HeaderMap`, asks `auth.add_auth_headers(&mut headers)` to populate it, obtains a client from `build_reqwest_client()`, and returns `client.request(method, url).timeout(OPENAI_FILE_REQUEST_TIMEOUT).headers(headers)`.
+**Data flow**: It receives an authentication provider, an HTTP method such as POST, and a URL → asks the authentication provider to add headers like authorization/account information → creates an HTTP client → returns a request builder ready for the caller to add a JSON body and send.
 
-**Call relations**: This helper is called by `upload_openai_file` for the create-upload-session and finalize-poll POST requests. It keeps auth/header setup consistent across those API calls.
+**Call relations**: `upload_openai_file` uses this helper for the create-file request and the finalization request, because both go to the authenticated backend API. This helper in turn uses `build_reqwest_client` so those requests share the same client-building behavior.
 
 *Call graph*: calls 1 internal fn (build_reqwest_client); called by 1 (upload_openai_file); 2 external calls (add_auth_headers, new).
 
@@ -4263,11 +4303,11 @@ fn authorized_request(
 fn build_reqwest_client() -> reqwest::Client
 ```
 
-**Purpose**: Creates the reqwest client used for file API and blob-upload requests, honoring any configured custom CA bundle when possible. It falls back to the default reqwest client if custom TLS setup fails.
+**Purpose**: Creates the HTTP client used for file upload requests. It tries to include the project’s custom certificate authority support, which lets the client trust additional configured certificates.
 
-**Data flow**: Starts from `reqwest::Client::builder()`, passes it to `build_reqwest_client_with_custom_ca`, and returns the resulting client on success. If custom-CA setup returns an error, it logs a warning and returns `reqwest::Client::new()` instead.
+**Data flow**: It starts with a standard `reqwest` HTTP client builder → passes it through the project’s custom-certificate setup → returns the configured client if that succeeds. If custom setup fails, it logs a warning and returns a plain default HTTP client instead.
 
-**Call relations**: This helper is used by both `authorized_request` and the raw upload phase inside `upload_openai_file`. It centralizes TLS policy for all file-upload HTTP traffic.
+**Call relations**: `authorized_request` calls this for authenticated backend requests, and `upload_openai_file` calls it directly for the raw PUT upload to the temporary storage URL. This means all network calls in the file go through the same client creation path.
 
 *Call graph*: called by 2 (authorized_request, upload_openai_file); 2 external calls (builder, build_reqwest_client_with_custom_ca).
 
@@ -4278,11 +4318,11 @@ fn build_reqwest_client() -> reqwest::Client
 fn add_auth_headers(&self, headers: &mut reqwest::header::HeaderMap)
 ```
 
-**Purpose**: Adds deterministic authorization headers for the file-upload test server. It simulates the auth shape expected by the backend API.
+**Purpose**: Provides fake authentication headers for the upload test. It stands in for the real authentication provider so the test server can verify that authenticated requests include the expected account information.
 
-**Data flow**: Receives a mutable reqwest `HeaderMap` and inserts `Authorization: Bearer token` plus `ChatGPT-Account-ID: account_id`.
+**Data flow**: It receives a mutable set of HTTP headers → inserts a fixed bearer token and a fixed ChatGPT account ID → leaves the headers ready to be attached to a request. It returns nothing directly.
 
-**Call relations**: This test auth provider is used by `authorized_request` during `upload_openai_file_returns_canonical_uri`, allowing the mock server to assert on expected headers.
+**Call relations**: The helper `tests::chatgpt_auth` returns this test authentication provider. During the test, `upload_openai_file` passes it into `authorized_request`, which calls this method before sending backend requests to the fake server.
 
 *Call graph*: 2 external calls (insert, from_static).
 
@@ -4293,11 +4333,11 @@ fn add_auth_headers(&self, headers: &mut reqwest::header::HeaderMap)
 fn chatgpt_auth() -> ChatGptTestAuth
 ```
 
-**Purpose**: Returns the test auth provider value used by file-upload tests. It is a tiny convenience constructor.
+**Purpose**: Creates the small fake authentication provider used by the test. This keeps the test setup readable and avoids repeating the test-auth type directly.
 
-**Data flow**: Takes no arguments and returns `ChatGptTestAuth`.
+**Data flow**: It takes no input → returns a `ChatGptTestAuth` value → that value can add predictable authentication headers during the test.
 
-**Call relations**: This helper is called by the upload test when invoking `upload_openai_file`.
+**Call relations**: `tests::upload_openai_file_returns_canonical_uri` calls this helper when it invokes `upload_openai_file`, giving the upload flow a known source of authentication headers.
 
 
 ##### `tests::base_url_for`  (lines 271–273)
@@ -4306,11 +4346,11 @@ fn chatgpt_auth() -> ChatGptTestAuth
 fn base_url_for(server: &MockServer) -> String
 ```
 
-**Purpose**: Builds the backend API base URL for a wiremock server. It mirrors the production expectation that file endpoints live under `/backend-api`.
+**Purpose**: Builds the fake backend base URL used in the test. It points the upload code at the mock server instead of the real OpenAI backend.
 
-**Data flow**: Accepts `&MockServer`, formats `"{server.uri()}/backend-api"`, and returns the resulting `String`.
+**Data flow**: It receives a mock server → reads the server’s generated local URL → appends `/backend-api` → returns that full base URL string.
 
-**Call relations**: This helper is used by the upload test to produce the `base_url` argument passed into `upload_openai_file`.
+**Call relations**: `tests::upload_openai_file_returns_canonical_uri` calls this after starting the mock server, then passes the result into `upload_openai_file` so every backend request goes to the test server.
 
 *Call graph*: 1 external calls (format!).
 
@@ -4321,10 +4361,10 @@ fn base_url_for(server: &MockServer) -> String
 async fn upload_openai_file_returns_canonical_uri()
 ```
 
-**Purpose**: Exercises the happy-path file upload flow against a mock server, including one finalization retry and canonical URI generation. It validates request shapes, auth headers, and the returned `UploadedOpenAiFile` fields.
+**Purpose**: Tests the complete successful upload path, including finalization retry and canonical URI creation. It proves that the code sends the expected requests and returns the expected uploaded-file information.
 
-**Data flow**: Starts a `MockServer`, installs mocks for the create POST, blob PUT, and finalize POST endpoints, with the finalize responder returning `status: "retry"` once and `status: "success"` on the second call. It builds the backend base URL, creates a one-chunk byte stream containing `hello`, calls `upload_openai_file`, awaits success, and asserts the returned file ID, `sediment://` URI, download URL, file name, MIME type, and that finalization was attempted twice.
+**Data flow**: It starts a fake HTTP server → configures expected responses for creating a file, uploading bytes, and finalizing the upload → creates a small `hello` byte stream → calls `upload_openai_file` → checks that the returned file ID, `sediment://` URI, download URL, file name, MIME type, and retry count match expectations.
 
-**Call relations**: This test drives the full runtime path through `upload_openai_file`, indirectly exercising `authorized_request`, `build_reqwest_client`, and `openai_file_uri` while validating the polling behavior.
+**Call relations**: This test is the caller that exercises the public upload workflow. It uses `tests::base_url_for` to aim requests at the fake server and `tests::chatgpt_auth` to supply predictable authentication. The upload flow then calls through to `authorized_request`, `build_reqwest_client`, and `openai_file_uri` as it would in real use.
 
 *Call graph*: calls 1 internal fn (upload_openai_file); 17 external calls (clone, new, new, from_static, given, start, new, assert_eq!, base_url_for, chatgpt_auth (+7 more)).

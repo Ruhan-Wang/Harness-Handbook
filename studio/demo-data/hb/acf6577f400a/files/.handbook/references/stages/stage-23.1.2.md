@@ -1,10 +1,12 @@
 # Daemon, transport, and test-client support tests  `stage-23.1.2`
 
-This stage is cross-cutting test and support infrastructure that validates the app-server’s daemon lifecycle, transport behavior, and end-to-end client-facing scenarios. On the daemon side, pid_tests.rs fixes the semantics of PID-file handling and remote-control launch behavior, while managed_install_tests.rs and update_loop_tests.rs lock down how managed binaries are identified and how the updater decides whether to restart or refresh itself after changes.
+This stage is the safety net around the app server’s background service, its communication pipes, and its special test client. It is shared behind-the-scenes support: it does not run the product itself, but it proves that startup, messaging, updates, and test-only tools behave correctly.
 
-On the transport side, unix_socket_tests.rs verifies local Unix-socket setup, parsing, locking, permissions, cleanup, and websocket control-socket behavior; transport_tests.rs checks higher-level routing rules such as capability gating, notification suppression, field stripping, broadcasts under backpressure, and stdio queue behavior. The remote-control HTTP surface is covered by clients_tests.rs for client listing/revocation and pairing_tests.rs for pairing, token refresh, persistence, and backend-error preservation.
+The daemon tests check the background server’s “PID file,” a small record saying which process is running. They cover starting, stopping, stale records, launch arguments, log reading, managed install version checks, and update decisions. One key rule is protected: if the updater program itself changes, that is more urgent than an ordinary version change.
 
-The app-server-test-client crate provides the executable harness for these scenarios: lib.rs launches or connects to the server and drives JSON-RPC flows, loopback_responses_server.rs supplies a minimal fake Responses API, and the plugin_analytics_capture modules plus smoke tests validate that plugin install, uninstall, enable, and usage actions emit the expected analytics events.
+The transport tests check how clients connect and receive messages. Unix-socket tests cover local WebSocket connections, socket-file protection, message forwarding, and avoiding double startup races. Other transport tests make sure messages go only to suitable clients and that one slow client cannot block the rest. Remote-control tests check pairing, client listing, revoking, refreshed authentication, and useful error details.
+
+The test-client files provide a realistic command-line client, fake local HTTP service, and plugin analytics checks, including smoke tests for install, update, use, and removal events.
 
 ## Files in this stage
 
@@ -13,11 +15,15 @@ These tests pin down daemon-side PID handling and managed-install/update identit
 
 ### `app-server-daemon/src/backend/pid_tests.rs`
 
-`test` · `test-time validation of backend startup/shutdown semantics`
+`test` · `test suite`
 
-This test module focuses on the tricky edges of `PidBackend`. Several async tests create temporary pid files and lock files to simulate startup reservations without launching real processes. `locked_empty_pid_file_is_treated_as_active_reservation` and `unlocked_empty_pid_file_is_treated_as_stale_reservation` verify the distinction between an empty pid file that still has a live reservation lock versus one that should be deleted as stale. `stop_waits_for_live_reservation_to_resolve` confirms that shutdown does not fail immediately when it encounters a startup-in-progress marker; instead it waits for the reservation to disappear. `start_retries_stale_empty_pid_file_under_its_own_lock` checks that startup can recover from a stale empty pid file and proceed far enough to fail on the missing executable rather than on pid-file state.
+A PID file is a small file that records the process ID of a running background program. It works a bit like a coat-check ticket: other parts of the system can look at it to know whether the app server is already there. This test file protects the rules around that ticket.
 
-Other tests validate race-safe stale-record cleanup (`stale_record_cleanup_preserves_replacement_record`), exact argv/env generation for updater and remote-control modes, and stderr-tail truncation behavior that preserves only recent complete lines. Together these tests document the backend’s intended invariants: empty pid files are meaningful only in conjunction with the lock, stale cleanup must not delete replacement records, and compatibility with older app-server remote-control behavior is encoded in launch arguments and environment variables.
+The tests cover tricky cases where the PID file exists but is empty. An empty file can mean a server is still starting and has reserved the slot, or it can mean a previous startup died and left junk behind. The difference is decided by a lock file, which is a separate file used like a “do not enter” sign so two processes do not claim the same PID file at once.
+
+The file also checks that stopping the daemon waits politely while a real startup reservation is still active, that stale records are cleaned up without deleting a newer replacement, and that launching the app server uses the right hidden subcommand, flags, and environment variable when remote control is enabled or disabled.
+
+Finally, it tests reading the recent end of a stderr log. Stderr is where programs usually write errors. The test makes sure only recent, complete lines are returned, so users see useful diagnostics rather than a huge or chopped-up log.
 
 #### Function details
 
@@ -27,11 +33,11 @@ Other tests validate race-safe stale-record cleanup (`stale_record_cleanup_prese
 async fn locked_empty_pid_file_is_treated_as_active_reservation()
 ```
 
-**Purpose**: Verifies that an empty pid file plus a held reservation lock is interpreted as `Starting`, not as stale state. It also confirms the pid file is left in place.
+**Purpose**: This test proves that an empty PID file is not automatically treated as garbage. If its matching lock file is still locked, the backend should understand that another startup is in progress.
 
-**Data flow**: Creates a temp directory, writes an empty pid file, constructs a `PidBackend`, opens and locks the backend’s lock file, then calls `read_pid_file_state`. It asserts the returned state is `PidFileState::Starting` and that the pid file still exists.
+**Data flow**: The test creates a temporary directory, writes an empty PID file, builds a PidBackend, opens the lock file, and locks it. Then it asks the backend to read the PID-file state. The expected result is Starting, and the PID file should still exist afterward.
 
-**Call relations**: This test directly exercises `PidBackend::new`, `try_lock_file`, and `read_pid_file_state` to pin down the active-reservation branch used by production startup and stop logic.
+**Call relations**: The test runner calls this function during the async test suite. Inside the test, it relies on PidBackend::new to create the backend setup, try_lock_file to simulate an active reservation, and read_pid_file_state to make the decision being checked.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert!, assert_eq!, new, write).
 
@@ -42,11 +48,11 @@ async fn locked_empty_pid_file_is_treated_as_active_reservation()
 async fn unlocked_empty_pid_file_is_treated_as_stale_reservation()
 ```
 
-**Purpose**: Verifies that an empty pid file without an active lock is treated as stale and cleaned up. This distinguishes abandoned reservations from live startup.
+**Purpose**: This test checks the opposite case from a live reservation. If the PID file is empty and nobody holds the lock, the backend should treat it as a leftover from a failed start and clean it up.
 
-**Data flow**: Creates a temp directory and empty pid file, constructs a backend, calls `read_pid_file_state`, and asserts the result is `PidFileState::Missing`. It then checks that the pid file has been removed.
+**Data flow**: The test creates a temporary directory, writes an empty PID file, and builds a PidBackend. It does not lock the matching lock file. When it reads the PID-file state, the backend should return Missing and remove the stale empty PID file from disk.
 
-**Call relations**: This test covers the stale-empty-file path in `read_pid_file_state` and `inspect_empty_pid_reservation`, documenting the cleanup behavior relied on by later startup attempts.
+**Call relations**: The test runner invokes this async test. It sets up the backend with PidBackend::new, then exercises read_pid_file_state to confirm that stale startup leftovers are removed rather than mistaken for a live daemon.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert!, assert_eq!, write).
 
@@ -57,11 +63,11 @@ async fn unlocked_empty_pid_file_is_treated_as_stale_reservation()
 async fn stop_waits_for_live_reservation_to_resolve()
 ```
 
-**Purpose**: Checks that `stop` waits for an in-progress startup reservation to finish or disappear instead of failing immediately. It models a short-lived reservation that is released asynchronously.
+**Purpose**: This test makes sure stopping the daemon does not race against a startup that is still holding the PID lock. In plain terms, stop should wait until the “someone is starting” sign is taken down.
 
-**Data flow**: Creates an empty pid file and locked reservation, spawns a cleanup task that sleeps briefly, drops the lock, and removes the pid file, then awaits `backend.stop()`. The test passes if stop returns successfully after the reservation resolves.
+**Data flow**: The test creates an empty PID file, locks the matching lock file, and starts a small cleanup task. That cleanup task waits briefly, releases the lock, and removes the PID file. Meanwhile, the test calls backend.stop(). The expected outcome is that stop waits long enough and finishes successfully.
 
-**Call relations**: This test drives the `stop` → `wait_for_pid_start` polling path, proving that shutdown cooperates with concurrent startup reservations.
+**Call relations**: The test runner starts this async test. The test uses PidBackend::new for setup, try_lock_file to create the live reservation, tokio::spawn to run delayed cleanup in parallel, and backend.stop to check that the stop path waits for the reservation to resolve.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (from_millis, new, assert!, new, remove_file, write, spawn, sleep).
 
@@ -72,11 +78,11 @@ async fn stop_waits_for_live_reservation_to_resolve()
 async fn start_retries_stale_empty_pid_file_under_its_own_lock()
 ```
 
-**Purpose**: Ensures startup can recover from a stale empty pid file by cleaning it up under lock and continuing to the actual spawn step. The observed failure should therefore be the missing executable, not pid-file contention.
+**Purpose**: This test checks that starting the daemon can recover from an old empty PID file by taking its own lock and trying to launch anyway. It uses a deliberately missing executable so the launch fails for the expected reason after the stale file is dealt with.
 
-**Data flow**: Creates an empty pid file, constructs a backend pointing at a nonexistent binary, calls `start`, captures the error, and asserts its string begins with the spawn-failure prefix.
+**Data flow**: The test writes an empty PID file and creates a backend whose codex binary path points to something that does not exist. It calls backend.start(), expects an error, and checks that the error says the detached app-server process could not be spawned.
 
-**Call relations**: This test exercises the startup loop that acquires the reservation lock, reinterprets stale pid-file state with lock held, removes stale files, and retries before spawning.
+**Call relations**: The test runner calls this async test. PidBackend::new creates the backend, and backend.start is the behavior under test: it should get past the stale empty PID-file situation and then fail at the actual process-spawning step.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, assert!, write).
 
@@ -87,11 +93,11 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock()
 async fn stale_record_cleanup_preserves_replacement_record()
 ```
 
-**Purpose**: Verifies that stale-record cleanup does not delete a newer pid record written by another actor. Only an exact stale-record match should be removed.
+**Purpose**: This test protects against deleting the wrong PID file. If the backend is cleaning up an old stale record but a newer record has already replaced it, the newer record must be kept.
 
-**Data flow**: Constructs a backend, defines a stale `PidRecord` and a different replacement record, writes the replacement JSON to the pid file, then calls `refresh_after_stale_record(&stale)`. It asserts the returned state is `PidFileState::Running(replacement)`.
+**Data flow**: The test creates two PID records: an old stale one and a newer replacement. It writes the replacement record to the PID file, then asks the backend to refresh after seeing the stale record. The result should report that the replacement process is Running, and the replacement data should remain intact.
 
-**Call relations**: This test targets the compare-before-delete logic in `refresh_after_stale_record`, which production liveness checks and shutdown rely on to avoid races.
+**Call relations**: The test runner invokes this async test. It uses PidBackend::new for setup, serializes the replacement PidRecord to disk, and calls refresh_after_stale_record to verify that cleanup is careful and checks what is currently in the file before removing anything.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert_eq!, to_vec, write).
 
@@ -102,11 +108,11 @@ async fn stale_record_cleanup_preserves_replacement_record()
 fn update_loop_uses_hidden_app_server_subcommand()
 ```
 
-**Purpose**: Checks the exact argv used for updater mode. The updater must launch through the hidden `app-server daemon pid-update-loop` subcommand.
+**Purpose**: This test confirms that the special PID update loop is launched through the intended hidden app-server daemon subcommand. That matters because this helper is an internal maintenance process, not a normal user-facing command.
 
-**Data flow**: Builds a `PidBackend` struct literal with `PidCommandKind::UpdateLoop`, calls `command_args`, and asserts the returned vector matches the expected updater argv.
+**Data flow**: The test builds a PidBackend value configured with PidCommandKind::UpdateLoop. It asks for command_args() and expects the argument list to be app-server daemon pid-update-loop.
 
-**Call relations**: This test documents the updater-specific command generation used by bootstrap when starting the managed update loop.
+**Call relations**: The regular test runner calls this synchronous test. It does not start a process; it only checks the command construction path that production code would later use when spawning the update-loop helper.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -117,11 +123,11 @@ fn update_loop_uses_hidden_app_server_subcommand()
 fn app_server_remote_control_uses_runtime_flag()
 ```
 
-**Purpose**: Checks that enabling remote control adds the explicit `--remote-control` runtime flag to the app-server command line.
+**Purpose**: This test checks that when remote control is enabled, the app server is launched with the command-line flag that turns it on. Remote control here means the server listens for control messages from another process.
 
-**Data flow**: Constructs a normal backend with `remote_control_enabled = true`, calls `command_args`, and asserts the returned argv includes `--remote-control` before `--listen unix://`.
+**Data flow**: The test creates a PidBackend with remote_control_enabled set to true. It asks for command_args() and expects arguments that include --remote-control plus the Unix-socket listen address.
 
-**Call relations**: This test validates the launch behavior selected by `PidBackend::new` and `command_args` for remote-control-enabled daemon settings.
+**Call relations**: The test runner invokes this synchronous test. It uses PidBackend::new to build the same kind of backend production code would use, then checks command_args before any process is actually spawned.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -132,11 +138,11 @@ fn app_server_remote_control_uses_runtime_flag()
 fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env()
 ```
 
-**Purpose**: Checks the compatibility behavior for remote-control-disabled launches: no `--remote-control` flag, plus an explicit disabling environment variable.
+**Purpose**: This test checks the launch settings when remote control is disabled. The command-line stays compatible, and an environment variable is used to tell the runtime that remote control should be off.
 
-**Data flow**: Constructs a backend with `remote_control_enabled = false`, reads both `command_args` and `command_env`, and asserts they match the expected argv and `(REMOTE_CONTROL_DISABLED_ENV_VAR, "1")` pair.
+**Data flow**: The test creates a PidBackend with remote_control_enabled set to false. It checks that command_args() omits --remote-control but still includes the Unix-socket listen option, and that command_env() returns the remote-control-disabled environment variable set to 1.
 
-**Call relations**: This test covers the disabled branch of both `command_args` and `command_env`, documenting how the daemon communicates remote-control-off semantics to the managed binary.
+**Call relations**: The test runner calls this synchronous test. PidBackend::new supplies the backend configuration, while command_args and command_env show what would be handed to the process launcher in real daemon startup.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -147,22 +153,20 @@ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env()
 async fn read_stderr_log_tail_returns_recent_complete_lines()
 ```
 
-**Purpose**: Verifies that stderr-tail reading keeps only recent complete lines when truncating a large log. Partial leading content from the byte cutoff should be discarded.
+**Purpose**: This test makes sure diagnostic log reading returns useful recent error text instead of a huge log or a cut-off partial line. It protects the behavior users rely on when startup fails and the system shows the last stderr output.
 
-**Data flow**: Creates a temp pid file path, derives the stderr log path, writes a log whose first line exceeds the byte limit followed by two short lines, then calls `read_stderr_log_tail`. It asserts the returned `PidLogTail` contains only `recent error\nusage` and the correct path.
+**Data flow**: The test creates a temporary PID-file path, derives the matching stderr log path, and writes a log that starts with a very long old line followed by two recent lines. It then reads the log tail. The expected result is the log path plus only the recent complete lines, "recent error\nusage".
 
-**Call relations**: This test exercises `stderr_log_file_for_pid_file`, `read_stderr_log_tail`, and the partial-line trimming logic in `read_log_tail`, which feeds readiness diagnostics.
+**Call relations**: The async test runner invokes this test. It uses stderr_log_file_for_pid_file to find where the log should live, writes test contents there, and calls read_stderr_log_tail to confirm the diagnostic trimming behavior.
 
 *Call graph*: 5 external calls (new, assert_eq!, format!, stderr_log_file_for_pid_file, write).
 
 
 ### `app-server-daemon/src/managed_install_tests.rs`
 
-`test` · `test-time validation of managed-install helpers`
+`test` · `test run`
 
-This small test module validates the pure helper behavior in `managed_install.rs`. The version-parsing tests define the accepted shape of `codex --version` output: `parses_codex_cli_version_output` confirms that a normal `codex 1.2.3` line yields `1.2.3`, while `rejects_malformed_codex_cli_version_output` ensures that output lacking a second token is rejected rather than silently misparsed. That matters because daemon status reporting and updater restart decisions depend on a trustworthy managed binary version string.
-
-The executable identity test checks that `ExecutableIdentity` is content-based rather than path-based or instance-based. By hashing `b"old"` twice and `b"new"` once, it confirms equal bytes produce equal identities and different bytes produce different identities. This protects updater logic that compares binaries by digest to detect real changes. The tests are intentionally direct and pure: they avoid filesystem or process spawning and instead exercise the parsing and hashing cores in isolation.
+This is a test file, not production code. Its job is to protect a few important assumptions used when the daemon works with a managed Codex executable. One helper reads the output of a command like `codex 1.2.3` and extracts just the version number. These tests make sure the expected format is accepted and an incomplete format is treated as an error, rather than being quietly misunderstood. Another helper creates an identity for an executable from its raw bytes. In everyday terms, this is like giving a file a fingerprint based on what is inside it. If the bytes are the same, the fingerprint should be the same. If the bytes differ, the fingerprint should differ. These checks matter because installation and update logic often depends on knowing exactly which version or binary it is dealing with. Without tests like these, a small parsing mistake or a weak identity check could make the daemon trust the wrong executable or miss that an executable has changed.
 
 #### Function details
 
@@ -172,11 +176,11 @@ The executable identity test checks that `ExecutableIdentity` is content-based r
 fn parses_codex_cli_version_output()
 ```
 
-**Purpose**: Confirms that well-formed `codex --version` output yields the expected version token.
+**Purpose**: This test proves that normal Codex CLI version output can be turned into a plain version string. It uses a sample line, `codex 1.2.3`, and expects the parser to return `1.2.3`.
 
-**Data flow**: Calls `parse_codex_version("codex 1.2.3\n")` and asserts the returned string is `1.2.3`.
+**Data flow**: The test starts with a text string that looks like command-line version output. It sends that text into the version parsing helper, then compares the result with the expected version number. The outcome is pass if the extracted value matches, and fail if it does not.
 
-**Call relations**: This test documents the happy-path parser behavior used by `managed_codex_version`.
+**Call relations**: During the test run, this function acts as a safety check around the version parsing behavior. It finishes by using an equality assertion to confirm that the parser’s answer is exactly what the rest of the daemon would rely on.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -187,11 +191,11 @@ fn parses_codex_cli_version_output()
 fn rejects_malformed_codex_cli_version_output()
 ```
 
-**Purpose**: Confirms that malformed version output lacking a version token is rejected.
+**Purpose**: This test makes sure incomplete Codex CLI version output is treated as invalid. It protects the daemon from accepting `codex` by itself as if it contained a usable version.
 
-**Data flow**: Calls `parse_codex_version("codex\n")` and asserts the result is an error.
+**Data flow**: The test starts with malformed text that is missing the version number. It passes that text to the parser and then checks that the parser reports an error. The result is pass if an error is produced, and fail if the bad text is accepted.
 
-**Call relations**: This test covers the parser’s failure branch, ensuring daemon code does not accept ambiguous version output.
+**Call relations**: During the test run, this function covers the failure path for version parsing. It uses an assertion to make sure the parser does not silently accept input that the managed install flow should not trust.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -202,24 +206,24 @@ fn rejects_malformed_codex_cli_version_output()
 fn executable_identity_uses_binary_contents()
 ```
 
-**Purpose**: Confirms that executable identity depends solely on byte contents. Equal bytes must hash identically and different bytes must not.
+**Purpose**: This test checks that an executable’s identity is based on its actual bytes. The same bytes should give the same identity, while different bytes should give a different identity.
 
-**Data flow**: Computes identities for `b"old"`, `b"old"`, and `b"new"` using `executable_identity_from_bytes`, then asserts equality for the first pair and inequality for the changed contents.
+**Data flow**: The test creates identities from three byte sequences: `old`, `old` again, and `new`. It compares the two identities made from the same bytes and expects them to match. Then it compares the identity from `old` with the one from `new` and expects them to differ.
 
-**Call relations**: This test validates the digest semantics relied on by updater comparison logic.
+**Call relations**: During the test run, this function directly calls the executable identity helper to verify its core promise. It then uses equality and inequality assertions to show that the helper behaves like a content fingerprint, which is important when update code needs to notice whether a binary has changed.
 
 *Call graph*: 3 external calls (assert_eq!, assert_ne!, executable_identity_from_bytes).
 
 
 ### `app-server-daemon/src/update_loop_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This test module exercises only `update_modes_for_identities`, the pure decision function in the updater loop. Rather than constructing real executables, it uses `managed_install::executable_identity_from_bytes` to synthesize deterministic `ExecutableIdentity` values from byte strings. That keeps the tests fast and isolates them from filesystem and process concerns.
+This is a small test file for the update loop logic. The daemon compares the identity of the updater it is currently using with the identity of a newer or candidate updater. An executable identity is like a fingerprint made from the binary's bytes: if the bytes are the same, the fingerprint is the same; if the bytes differ, the program knows the binary really changed.
 
-The first test covers the stable case where the running updater and managed binary identities are equal. In that scenario the updater loop should not force a restart every time; instead it should return `RestartMode::IfVersionChanged` and `UpdaterRefreshMode::None`, meaning the daemon restart logic can rely on version checks and the updater process does not need to re-exec itself.
+The tests check two important cases. First, when the updater identity has not changed, the daemon should not force a special refresh. It can use the ordinary version-based restart rule, meaning it only restarts if the app version changed. Second, when the updater identity has changed, the daemon must be more cautious. Even if version numbers happen to look the same, the actual updater program is different, so the daemon should always restart and re-execute the managed binary if needed.
 
-The second test covers the changed-binary case. When the identities differ, the code must assume the managed binary may have changed even if version metadata is ambiguous or unchanged, so it expects `RestartMode::Always` together with `UpdaterRefreshMode::ReexecIfManagedBinaryChanged`. These assertions document the subtle design choice that executable identity, not just semantic version, drives updater replacement behavior.
+Without these tests, a future code change could accidentally make the daemon ignore a changed updater. That could leave the system running old update code, which is risky because the updater is the part responsible for applying future fixes.
 
 #### Function details
 
@@ -229,11 +233,11 @@ The second test covers the changed-binary case. When the identities differ, the 
 fn unchanged_updater_uses_version_based_restart()
 ```
 
-**Purpose**: Checks that identical updater identities produce the non-forcing restart policy. It verifies the exact tuple returned for the unchanged-binary path.
+**Purpose**: This test checks the calm path: when the old and new updater binaries have the same identity, the daemon should not force an updater refresh. It should rely on the normal rule of restarting only when the version changes.
 
-**Data flow**: Builds two equal synthetic executable identities from the same byte slice, passes them to `update_modes_for_identities`, and compares the returned tuple against `(RestartMode::IfVersionChanged, UpdaterRefreshMode::None)`. It returns no value and mutates no state.
+**Data flow**: It starts with two executable identities made from the same bytes, so they represent the same binary. Those identities are passed into the update-mode decision logic, and the test expects the result to be a version-based restart mode plus no updater refresh. If the result differs, the assertion fails and the test reports that the behavior changed.
 
-**Call relations**: This test directly exercises the pure helper used by `update_once`. It covers the branch where the running updater and managed binary compare equal.
+**Call relations**: During the test run, the test framework calls this function. The function asks the update decision logic what should happen for two matching identities, then uses the assertion macro to compare the actual answer with the expected safe answer.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -244,11 +248,11 @@ fn unchanged_updater_uses_version_based_restart()
 fn changed_updater_forces_refresh_even_when_version_may_match()
 ```
 
-**Purpose**: Checks that differing updater identities force both restart and updater refresh behavior. The test documents that identity mismatch overrides any weaker version-based heuristic.
+**Purpose**: This test checks the cautious path: when the updater binary identity changes, the daemon should force a stronger restart and refresh behavior. This matters because byte-level changes can be important even when a version number might not clearly show them.
 
-**Data flow**: Builds two different synthetic executable identities from distinct byte slices, passes them to `update_modes_for_identities`, and asserts the result is `(RestartMode::Always, UpdaterRefreshMode::ReexecIfManagedBinaryChanged)`. It has no side effects beyond the assertion.
+**Data flow**: It starts with two executable identities made from different bytes, so they represent different binaries. Those identities are fed to the update-mode decision logic, and the test expects an always-restart choice together with a refresh mode that re-executes if the managed binary changed. If the decision logic gives anything else, the assertion fails.
 
-**Call relations**: This test covers the alternate branch of `update_modes_for_identities`, the one consumed by `update_once` when the managed binary differs from the currently running updater.
+**Call relations**: During the test run, the test framework calls this function after discovering it as a test. The function exercises the update decision logic for mismatched identities and hands the result to the assertion macro, which verifies that the daemon would take the safer refresh path.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -258,13 +262,13 @@ These files exercise the server and transport layers from local socket mechanics
 
 ### `app-server-transport/src/transport/unix_socket_tests.rs`
 
-`test` · `test execution for Unix control-socket transport`
+`test` · `test run`
 
-This test module covers the Unix-domain control socket transport end to end. The first three unit tests verify `AppServerTransport::from_listen_url` parsing for the bare `unix://` form, absolute custom paths, and relative custom paths resolved against the current directory. The integration-style socket test starts a real control socket acceptor, connects with `UnixStream`, upgrades to websocket using `client_async`, and then verifies the full transport event lifecycle: `ConnectionOpened`, forwarding of a JSON-RPC text notification as `TransportEvent::IncomingMessage`, automatic pong replies to websocket ping frames, and `ConnectionClosed` after client close. It also confirms the socket path is removed after shutdown.
+This is a test file, not production code. It acts like a careful outside inspector for the app server’s local control connection. The app server can listen on a Unix socket, which is a file-like connection point on the same machine. These tests make sure that setup works from the first URL parsing step through to a real WebSocket conversation.
 
-Additional tests validate startup serialization and filesystem hygiene. `app_server_startup_lock_serializes_waiters` acquires the startup lock once, spawns a second waiter, proves it blocks, then drops the first lock and confirms the second acquires successfully. On Unix, `control_socket_file_is_private_after_bind` checks that the bound socket file has mode `0o600`.
+The smaller tests check that listen URLs such as `unix://`, `unix:///tmp/codex.sock`, and `unix://codex.sock` become the expected transport settings. The larger async test creates a temporary socket, starts the control socket acceptor, connects a fake client, upgrades that connection to WebSocket, sends a JSON-RPC notification, and checks that the server reports the right transport events. It also checks WebSocket ping/pong behavior and confirms cleanup after shutdown.
 
-The helper functions are intentionally concrete: they compute default and temporary socket paths as `AbsolutePathBuf`, connect to the socket with `UnixStream::connect`, and on Unix assert that the socket path no longer exists after shutdown. Together these tests ensure the local control transport is secure, cleans up after itself, and reuses the websocket transport machinery correctly.
+Another test checks the startup lock. That lock is like a bathroom key: only one server startup may hold it at a time, and the next waiter must pause until it is dropped. On Unix, one more test confirms the socket file is private, so other users cannot casually access it. Temporary directories keep these tests isolated from a developer’s real machine state.
 
 #### Function details
 
@@ -274,11 +278,11 @@ The helper functions are intentionally concrete: they compute default and tempor
 fn listen_unix_socket_parses_as_unix_socket_transport()
 ```
 
-**Purpose**: Verifies that the bare `unix://` listen URL selects Unix-socket transport with the default control socket path.
+**Purpose**: This test checks the simplest Unix-socket listen URL, `unix://`. It proves that the transport parser treats it as a request to use the default app server control socket path.
 
-**Data flow**: Calls `AppServerTransport::from_listen_url("unix://")`, computes the expected default path via `default_control_socket_path()`, and asserts the parsed transport equals `AppServerTransport::UnixSocket { socket_path: ... }`.
+**Data flow**: It starts with the text URL `unix://`. The parser turns that text into an `AppServerTransport` value, and the test compares the result with the expected Unix socket transport using the default socket path.
 
-**Call relations**: This is a pure parsing test for transport configuration, independent of live socket behavior.
+**Call relations**: This is an early guard around URL parsing. It relies on the same parsing code used when the server is configured to listen, and it uses an assertion to stop the test if the parsed transport is not exactly what callers expect.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -289,11 +293,11 @@ fn listen_unix_socket_parses_as_unix_socket_transport()
 fn listen_unix_socket_accepts_absolute_custom_path()
 ```
 
-**Purpose**: Verifies that an absolute Unix listen URL path is preserved exactly in the parsed transport configuration.
+**Purpose**: This test checks that a Unix-socket listen URL may name a full filesystem path. It matters because users or callers may want the control socket somewhere other than the default location.
 
-**Data flow**: Parses `"unix:///tmp/codex.sock"`, builds the expected `AbsolutePathBuf` with `absolute_path`, and asserts equality with the resulting `AppServerTransport::UnixSocket` value.
+**Data flow**: It gives the parser `unix:///tmp/codex.sock`. The parser should keep `/tmp/codex.sock` as an absolute path, and the test compares that result with an explicitly built absolute path value.
 
-**Call relations**: Complements the default-path parsing test by covering explicit absolute paths.
+**Call relations**: This supports the transport setup path by verifying one accepted form of configuration input. It uses the helper `absolute_path` indirectly through the expected value construction and then asserts that parser output matches.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -304,11 +308,11 @@ fn listen_unix_socket_accepts_absolute_custom_path()
 fn listen_unix_socket_accepts_relative_custom_path()
 ```
 
-**Purpose**: Verifies that a relative Unix listen URL path is accepted and resolved relative to the current directory.
+**Purpose**: This test checks that a Unix-socket listen URL may name a relative path, such as `codex.sock`. That lets callers give a short path and have it resolved against the current working directory.
 
-**Data flow**: Parses `"unix://codex.sock"`, constructs the expected `AbsolutePathBuf::relative_to_current_dir("codex.sock")`, and asserts the parsed transport matches it.
+**Data flow**: It starts with `unix://codex.sock`. The parser resolves the relative path into an absolute-path wrapper, and the test compares that against the same path resolved from the current directory.
 
-**Call relations**: Complements the absolute-path parsing test by covering relative path handling.
+**Call relations**: This is another URL parsing safety check. It exercises the same public parser used by real setup code and confirms that relative paths are not rejected or misread.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -319,11 +323,11 @@ fn listen_unix_socket_accepts_relative_custom_path()
 async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings()
 ```
 
-**Purpose**: Exercises the live control socket acceptor end to end: websocket upgrade, JSON-RPC forwarding, ping/pong handling, connection lifecycle events, and socket-file cleanup.
+**Purpose**: This end-to-end async test proves that the control socket acceptor can accept a local client, turn the raw socket connection into a WebSocket connection, forward JSON-RPC text messages as transport events, answer WebSocket pings, and shut down cleanly.
 
-**Data flow**: Creates a temp socket path and transport event channel, starts `start_control_socket_acceptor`, connects with `connect_to_socket`, upgrades via `client_async`, waits for `TransportEvent::ConnectionOpened`, sends a JSON-RPC notification as websocket text and asserts the corresponding `IncomingMessage` event, sends a websocket ping and asserts a pong frame is returned, closes the websocket and asserts `ConnectionClosed`, then cancels shutdown, awaits the acceptor, and calls `assert_socket_path_removed`.
+**Data flow**: It creates a temporary socket path, starts the acceptor with a channel for transport events, and connects a fake client to that socket. The client performs a WebSocket upgrade, sends a JSON-RPC notification as text, sends a ping, then closes. The test reads the event channel and WebSocket replies to confirm the server reports connection opened, incoming message, pong reply, and connection closed. Finally it cancels shutdown, waits for the acceptor task to finish, and checks that the socket path was removed where that applies.
 
-**Call relations**: This is the main integration test for `start_control_socket_acceptor` and the shared websocket transport path it delegates to.
+**Call relations**: This test ties many pieces together. It calls `test_socket_path` to create a safe throwaway socket location, `connect_to_socket` to behave like a client, and `assert_socket_path_removed` after shutdown. It drives `start_control_socket_acceptor`, then watches the `TransportEvent` stream to make sure production code hands each important client action to the rest of the app server.
 
 *Call graph*: calls 3 internal fn (assert_socket_path_removed, connect_to_socket, test_socket_path); 14 external calls (from_static, new, from_secs, Ping, Text, Notification, assert!, assert_eq!, panic!, to_string (+4 more)).
 
@@ -334,11 +338,11 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
 async fn app_server_startup_lock_serializes_waiters()
 ```
 
-**Purpose**: Verifies that the startup lock blocks concurrent acquirers until the first holder releases it.
+**Purpose**: This test checks that the app server startup lock allows only one holder at a time. Without that, two app server startups could both believe they are in charge of creating or owning the same control socket.
 
-**Data flow**: Creates a temp lock path, acquires the first lock with `acquire_app_server_startup_lock`, spawns a second acquisition task, asserts that task does not complete within 100 ms, drops the first lock, then awaits the second task and asserts it succeeds.
+**Data flow**: It builds a temporary lock-file path and acquires the first lock. Then it starts a second async task that tries to acquire the same lock. The second task should not finish while the first lock is still held. After the first lock is dropped, the second acquisition is allowed to complete.
 
-**Call relations**: Directly tests the file-locking behavior of `acquire_app_server_startup_lock`.
+**Call relations**: This test focuses on `acquire_app_server_startup_lock`. It uses `test_startup_lock_path` for an isolated lock location, then uses a short timeout to prove the second waiter is blocked until the first holder releases the lock.
 
 *Call graph*: calls 1 internal fn (test_startup_lock_path); 4 external calls (assert!, acquire_app_server_startup_lock, new, spawn).
 
@@ -349,11 +353,11 @@ async fn app_server_startup_lock_serializes_waiters()
 async fn control_socket_file_is_private_after_bind()
 ```
 
-**Purpose**: Checks that the bound control socket file has private permissions on Unix. This enforces local-only access expectations at the filesystem level.
+**Purpose**: This Unix-only test checks that the socket file created by the control socket acceptor has private permissions. In plain terms, it should not be readable or writable by other users on the machine.
 
-**Data flow**: Creates a temp socket path, starts the control socket acceptor, reads metadata for the socket path with `tokio::fs::metadata`, masks the permission bits with `0o777`, and asserts the result is `0o600`; then it cancels shutdown and awaits the acceptor.
+**Data flow**: It creates a temporary socket path, starts the control socket acceptor, reads the filesystem metadata for the socket path, and checks the permission bits. The expected mode is `0600`, meaning only the owner has access. Then it cancels the acceptor and waits for it to stop.
 
-**Call relations**: Tests the effect of `set_control_socket_permissions`, which is invoked during acceptor startup.
+**Call relations**: This test calls `test_socket_path` to avoid touching real app files and `start_control_socket_acceptor` to create an actual socket. It then inspects the file that production code created, confirming a security property right after bind time.
 
 *Call graph*: calls 1 internal fn (test_socket_path); 5 external calls (new, assert_eq!, start_control_socket_acceptor, new, metadata).
 
@@ -364,11 +368,11 @@ async fn control_socket_file_is_private_after_bind()
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Converts a string absolute path into `AbsolutePathBuf` for test expectations.
+**Purpose**: This small helper turns a string that should already be an absolute filesystem path into the project’s absolute-path type. It keeps the URL parsing tests concise and explicit.
 
-**Data flow**: Calls `AbsolutePathBuf::from_absolute_path(path)` and unwraps the result with `expect`.
+**Data flow**: It receives path text such as `/tmp/codex.sock`. It asks `AbsolutePathBuf` to validate and wrap that path as absolute, and returns the wrapped path. If the input is not acceptable, the test fails immediately.
 
-**Call relations**: Used by parsing tests to build expected transport values.
+**Call relations**: It supports the parsing tests by building the expected value for comparisons. Instead of each test repeating the path-conversion call, this helper gives them a clear one-line way to say, 'this should be an absolute path.'
 
 *Call graph*: calls 1 internal fn (from_absolute_path).
 
@@ -379,11 +383,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn default_control_socket_path() -> AbsolutePathBuf
 ```
 
-**Purpose**: Computes the default app-server control socket path under the current Codex home directory.
+**Purpose**: This helper computes the default app server control socket path used when a listen URL does not specify one. It lets tests compare parser output against the same default location the app server would normally use.
 
-**Data flow**: Calls `find_codex_home()` to locate the home directory, then `app_server_control_socket_path(&codex_home)` to derive the socket path, unwrapping both results.
+**Data flow**: It first finds the Codex home directory, which is the project’s user-specific storage location. It then asks the transport code to build the app server control socket path under that home directory and returns the resulting absolute path.
 
-**Call relations**: Used by the bare `unix://` parsing test.
+**Call relations**: It is used by the default URL parsing test. The helper connects configuration discovery, through `find_codex_home`, with transport path construction, through `app_server_control_socket_path`, so the expected test value follows the real app logic.
 
 *Call graph*: calls 1 internal fn (find_codex_home); 1 external calls (app_server_control_socket_path).
 
@@ -394,11 +398,11 @@ fn default_control_socket_path() -> AbsolutePathBuf
 fn test_socket_path(temp_dir: &Path) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a deterministic temporary control socket path under a provided temp directory.
+**Purpose**: This helper creates a throwaway control-socket path inside a temporary directory. It prevents tests from touching a real user’s app server socket.
 
-**Data flow**: Joins `app-server-control/app-server-control.sock` onto `temp_dir`, converts the resulting absolute path into `AbsolutePathBuf`, and unwraps it.
+**Data flow**: It receives the temporary directory path. It appends `app-server-control/app-server-control.sock`, converts the result into the project’s absolute-path type, and returns it. If the path cannot be represented as absolute, the test fails.
 
-**Call relations**: Used by live control-socket tests that need an isolated socket location.
+**Call relations**: The WebSocket end-to-end test and the Unix permissions test both call this before starting the control socket acceptor. It gives those tests a safe, predictable socket location that disappears with the temporary directory.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 2 (control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings, control_socket_file_is_private_after_bind); 1 external calls (join).
 
@@ -409,11 +413,11 @@ fn test_socket_path(temp_dir: &Path) -> AbsolutePathBuf
 fn test_startup_lock_path(temp_dir: &Path) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a deterministic temporary startup-lock path under a provided temp directory.
+**Purpose**: This helper creates a throwaway startup-lock path inside a temporary directory. It lets the lock test run without interfering with any real app server process.
 
-**Data flow**: Joins `app-server-control/app-server-startup.lock` onto `temp_dir`, converts it into `AbsolutePathBuf`, and unwraps it.
+**Data flow**: It receives a temporary directory path. It appends `app-server-control/app-server-startup.lock`, wraps that full path as an absolute path, and returns it. If conversion fails, the test stops with an error.
 
-**Call relations**: Used by the startup-lock serialization test.
+**Call relations**: The startup-lock test calls this before trying to acquire the lock twice. It supplies the isolated file path that `acquire_app_server_startup_lock` uses to prove waiters are serialized.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 1 (app_server_startup_lock_serializes_waiters); 1 external calls (join).
 
@@ -424,11 +428,11 @@ fn test_startup_lock_path(temp_dir: &Path) -> AbsolutePathBuf
 async fn connect_to_socket(socket_path: &Path) -> IoResult<UnixStream>
 ```
 
-**Purpose**: Connects a test client to the Unix control socket path.
+**Purpose**: This helper opens a client connection to the Unix socket under test. It keeps the larger WebSocket test focused on behavior rather than connection boilerplate.
 
-**Data flow**: Calls `UnixStream::connect(socket_path).await` and returns the resulting `IoResult<UnixStream>`.
+**Data flow**: It receives a socket filesystem path. It asks `UnixStream` to connect to that path asynchronously and returns either the connected stream or an input/output error.
 
-**Call relations**: Used by the end-to-end control socket acceptor test before websocket upgrade.
+**Call relations**: The end-to-end control socket test calls this after starting the acceptor. The returned stream is then handed to the WebSocket client code so the test can act like a real app server client.
 
 *Call graph*: calls 1 internal fn (connect); called by 1 (control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings).
 
@@ -439,26 +443,24 @@ async fn connect_to_socket(socket_path: &Path) -> IoResult<UnixStream>
 fn assert_socket_path_removed(_socket_path: &Path)
 ```
 
-**Purpose**: Asserts that the Unix socket filesystem node has been removed after shutdown. On Windows the alternate definition is intentionally a no-op because the implementation differs.
+**Purpose**: This helper checks that the socket path is gone after the acceptor shuts down. On Unix, that cleanup matters because stale socket files can block future server starts or confuse clients.
 
-**Data flow**: On Unix, checks `!socket_path.exists()` and asserts it; on Windows, ignores the argument and performs no filesystem assertion.
+**Data flow**: It receives the socket path that was used by the test. On Unix, it checks the filesystem and fails the test if the path still exists. On Windows, the companion version does nothing because the Windows Unix-domain-socket implementation uses the path differently and there is no Unix socket filesystem node to verify.
 
-**Call relations**: Called by the end-to-end control socket test to verify `ControlSocketFileGuard` cleanup.
+**Call relations**: The end-to-end control socket test calls this after cancelling and joining the acceptor. It is the final cleanup check in the story: start a socket, use it, shut it down, and make sure no stale Unix socket file is left behind.
 
 *Call graph*: called by 1 (control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings); 1 external calls (assert!).
 
 
 ### `app-server/src/transport_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module validates the concrete policies implemented by `route_outgoing_envelope` and its helpers using real Tokio channels and `OutboundConnectionState` instances. Two small helpers reduce fixture noise: `absolute_path` builds `AbsolutePathBuf` values for request payloads, and `thread_realtime_started_notification` constructs an experimental `ServerNotification::ThreadRealtimeStarted` used to test capability gating.
+The app server has to send messages to connected clients. Some clients opt out of certain notifications, and some do not support newer experimental features. This test file checks that the transport layer respects those client differences before putting messages onto each client's outgoing queue.
 
-The first group of tests covers notification suppression and delivery. They create one connection with a writer channel and vary the shared `RwLock<HashSet<String>>` of opted-out methods or the `experimental_api_enabled` atomic. The assertions check whether `writer_rx` receives nothing or the expected notification variant. This verifies both method-name opt-out filtering (`configWarning`) and dropping of experimental notifications for clients without the capability.
+Think of the transport as a mailroom. Each client has a mailbox. Before dropping in a letter, the mailroom checks whether that client asked not to receive that type of letter, and whether the client understands the newer kind of letter. These tests build small fake connection maps, send sample outgoing envelopes through `route_outgoing_envelope`, and then inspect the receiving side of the channel to see what actually arrived.
 
-The next pair of tests targets request rewriting rather than dropping. They send `ServerRequest::CommandExecutionRequestApproval` messages containing `additional_permissions`, serialize the delivered message to JSON, and assert that `additionalPermissions` is absent without experimental capability and preserved with it.
-
-The final tests probe backpressure behavior. `broadcast_does_not_block_on_slow_connection` pre-fills one disconnectable connection’s queue, then confirms a broadcast returns promptly, disconnects only the slow connection, and still delivers to the fast one. `to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is_full` uses a non-disconnectable connection (`disconnect_sender: None`) to show that targeted sends await queue space instead of dropping the connection.
+The file also tests back-pressure, which means what happens when a client's outgoing queue is full. For broadcasts, a full queue should not freeze the whole server; the slow connection is removed and disconnected so fast clients still get their messages. For direct standard I/O style sends, the server should wait for space instead of immediately disconnecting. The tests use Tokio asynchronous channels and short timeouts to prove these timing-sensitive behaviors without depending on real network connections.
 
 #### Function details
 
@@ -468,11 +470,11 @@ The final tests probe backpressure behavior. `broadcast_does_not_block_on_slow_c
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an `AbsolutePathBuf` fixture from a string path for transport tests. It keeps request-payload setup concise.
+**Purpose**: This small helper turns a text path into the project's absolute-path type. Tests use it when they need realistic file-system paths inside request data.
 
-**Data flow**: Accepts `&str`, calls `AbsolutePathBuf::from_absolute_path(path)`, unwraps with `expect("absolute path")`, and returns the resulting absolute path buffer. It has no side effects beyond panicking on invalid input.
+**Data flow**: It receives a string such as `/tmp`, asks `from_absolute_path` to validate and convert it, and returns an `AbsolutePathBuf`. If the test accidentally gives it a non-absolute path, it fails immediately with the message `absolute path`.
 
-**Call relations**: Used by the command-execution approval tests to populate `cwd` and allowed read paths. It isolates path parsing from the assertions those tests care about.
+**Call relations**: The command-approval tests call this helper while building request parameters that include a current working directory and extra readable paths. It keeps those tests focused on transport behavior instead of repeating path-conversion setup.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 2 (command_execution_request_approval_keeps_additional_permissions_with_capability, command_execution_request_approval_strips_additional_permissions_without_capability).
 
@@ -483,11 +485,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn thread_realtime_started_notification() -> ServerNotification
 ```
 
-**Purpose**: Constructs a concrete experimental notification fixture used to test capability-based notification dropping/preservation. It standardizes the payload shape across tests.
+**Purpose**: This helper builds a sample experimental realtime-started notification. Tests use it to check whether clients without the needed capability are protected from messages they may not understand.
 
-**Data flow**: Returns `ServerNotification::ThreadRealtimeStarted(ThreadRealtimeStartedNotification { thread_id: "thread-1".to_string(), realtime_session_id: None, version: RealtimeConversationVersion::V1 })`. No inputs or mutable state are involved.
+**Data flow**: It takes no input, fills in a fixed thread id, no realtime session id, and realtime conversation version `V1`, then returns it wrapped as a `ServerNotification::ThreadRealtimeStarted` value.
 
-**Call relations**: Used by the experimental-notification tests as the message under test. It ensures both tests exercise the same notification variant and differ only in connection capability.
+**Call relations**: The two experimental-notification tests call this helper before routing the notification to a connection. The helper supplies the test message; `route_outgoing_envelope` then decides whether that message should be delivered or dropped based on the connection capability flag.
 
 *Call graph*: called by 2 (experimental_notifications_are_dropped_without_capability, experimental_notifications_are_preserved_with_capability); 1 external calls (ThreadRealtimeStarted).
 
@@ -498,11 +500,11 @@ fn thread_realtime_started_notification() -> ServerNotification
 async fn to_connection_notification_respects_opt_out_filters()
 ```
 
-**Purpose**: Verifies that a targeted notification is dropped when the connection has opted out of that notification method. It tests the direct-send path with an explicit opt-out set.
+**Purpose**: This test proves that a notification sent to one specific connection is dropped when that connection has opted out of that notification method. Without this behavior, clients could receive noisy or unwanted messages they explicitly disabled.
 
-**Data flow**: Creates a connection with `initialized = true`, `experimental_api_enabled = true`, and `opted_out_notification_methods = {"configWarning"}`; inserts it into a connection map; routes a `ToConnection` envelope carrying `ServerNotification::ConfigWarning`; then asserts `writer_rx.try_recv()` fails, meaning nothing was enqueued.
+**Data flow**: The test creates one fake initialized connection whose opt-out set contains `configWarning`. It routes a `ConfigWarning` notification to that connection, then checks the writer channel and expects nothing to be there.
 
-**Call relations**: This test exercises `route_outgoing_envelope` → `send_message_to_connection` → `should_skip_notification_for_connection` on the targeted-send path. It confirms method-name opt-outs are honored before enqueueing.
+**Call relations**: This test constructs an `OutboundConnectionState`, passes it to `route_outgoing_envelope`, and observes the channel that would normally feed the connection writer. The route function is the unit under test: it sees the opt-out filter and does not hand the message onward.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (new, new, new, from, new, ConfigWarning, AppServerNotification, assert!, channel).
 
@@ -513,11 +515,11 @@ async fn to_connection_notification_respects_opt_out_filters()
 async fn to_connection_notifications_are_dropped_for_opted_out_clients()
 ```
 
-**Purpose**: Checks the same opt-out behavior as the previous test with a slightly different fixture setup. It reinforces that opted-out notifications never reach the client queue.
+**Purpose**: This test checks the same real-world rule from the client's point of view: if a client opted out of `configWarning`, that client should not receive `ConfigWarning` notifications.
 
-**Data flow**: Builds one initialized connection with `configWarning` in its opt-out set, routes a targeted `ConfigWarning` notification to it, and asserts the writer channel remains empty via `try_recv().is_err()`. No external state is touched.
+**Data flow**: It starts with a fake connection whose blocked notification list contains `configWarning`. After routing a config-warning message to that connection, the receiving side of the channel is still empty, showing that the message was filtered out.
 
-**Call relations**: Like the previous test, it validates the targeted notification suppression path. It serves as another concrete regression test around opt-out filtering.
+**Call relations**: The test sets up connection state and calls `route_outgoing_envelope` with a direct-to-connection envelope. The routing code performs the filter check before it would normally queue the message for writing.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (new, new, new, from, new, ConfigWarning, AppServerNotification, assert!, channel).
 
@@ -528,11 +530,11 @@ async fn to_connection_notifications_are_dropped_for_opted_out_clients()
 async fn to_connection_notifications_are_preserved_for_non_opted_out_clients()
 ```
 
-**Purpose**: Verifies that a targeted notification is delivered when the connection has not opted out of that method. It tests the positive case for direct notification routing.
+**Purpose**: This test proves the positive case: clients that have not opted out still receive normal notifications. It protects against a filter that is too broad and accidentally drops useful messages.
 
-**Data flow**: Creates one initialized connection with an empty opt-out set, routes a targeted `ConfigWarning` notification, awaits one queued message from `writer_rx`, and pattern-matches that the delivered message is the expected `ConfigWarning` with summary `"task_started"`.
+**Data flow**: The test creates one connection with an empty opt-out set, sends it a `ConfigWarning` notification, waits for a message to arrive on the writer channel, and checks that the received notification still has the expected summary text.
 
-**Call relations**: This test covers the same routing path as the opt-out tests but confirms the message is preserved when suppression conditions are absent. It validates that filtering is selective rather than over-broad.
+**Call relations**: After the test calls `route_outgoing_envelope`, the routing code should pass the message to the connection's outgoing queue. The test then reads that queue to confirm the message was preserved rather than filtered.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (new, new, new, new, new, ConfigWarning, AppServerNotification, assert!, channel).
 
@@ -543,11 +545,11 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients()
 async fn experimental_notifications_are_dropped_without_capability()
 ```
 
-**Purpose**: Verifies that experimental notifications are suppressed for connections that have not enabled the experimental API. It tests capability gating independent of opt-out settings.
+**Purpose**: This test makes sure experimental realtime notifications are not sent to clients that did not say they support experimental features. That avoids breaking older clients with message shapes they may not recognize.
 
-**Data flow**: Creates one initialized connection with `experimental_api_enabled = false` and an empty opt-out set, routes a targeted `ThreadRealtimeStarted` notification from the helper, and asserts the writer channel remains empty via `try_recv().is_err()`.
+**Data flow**: The test creates a connection with its experimental-capability flag set to false. It builds a realtime-started notification, routes it to the connection, and then verifies that the writer channel remains empty.
 
-**Call relations**: This test exercises the experimental branch inside `should_skip_notification_for_connection`. It confirms that capability gating applies even when the client has not explicitly opted out.
+**Call relations**: It uses `thread_realtime_started_notification` to create the sample experimental message, then gives that message to `route_outgoing_envelope`. The routing code notices the missing capability and stops the message before it reaches the writer queue.
 
 *Call graph*: calls 2 internal fn (new, thread_realtime_started_notification); 8 external calls (new, new, new, new, new, AppServerNotification, assert!, channel).
 
@@ -558,11 +560,11 @@ async fn experimental_notifications_are_dropped_without_capability()
 async fn experimental_notifications_are_preserved_with_capability()
 ```
 
-**Purpose**: Verifies that experimental notifications are delivered when the connection has enabled the experimental API. It is the positive counterpart to the previous test.
+**Purpose**: This test checks that experimental realtime notifications do get through when a client has advertised the needed capability. It prevents the compatibility gate from blocking capable clients unnecessarily.
 
-**Data flow**: Creates one initialized connection with `experimental_api_enabled = true`, routes a targeted `ThreadRealtimeStarted` notification, awaits one queued message, and asserts it matches `OutgoingMessage::AppServerNotification(ServerNotification::ThreadRealtimeStarted(_))`.
+**Data flow**: The test creates a connection whose experimental-capability flag is true. It routes a realtime-started notification and then reads the writer channel, expecting to receive a `ThreadRealtimeStarted` notification.
 
-**Call relations**: This test confirms that the capability gate in `should_skip_notification_for_connection` is conditional rather than unconditional. It pairs with the previous test to define the expected behavior boundary.
+**Call relations**: The helper `thread_realtime_started_notification` supplies the message. `route_outgoing_envelope` checks the connection's capability flag and, because it is enabled, forwards the message into the outgoing queue where the test can read it.
 
 *Call graph*: calls 2 internal fn (new, thread_realtime_started_notification); 8 external calls (new, new, new, new, new, AppServerNotification, assert!, channel).
 
@@ -573,11 +575,11 @@ async fn experimental_notifications_are_preserved_with_capability()
 async fn command_execution_request_approval_strips_additional_permissions_without_capability()
 ```
 
-**Purpose**: Verifies that command-execution approval requests are still delivered to non-experimental clients but with `additionalPermissions` stripped out. It tests request rewriting rather than dropping.
+**Purpose**: This test verifies backward compatibility for command-approval requests. If a client does not support the newer `additionalPermissions` field, the server removes that field before sending the request.
 
-**Data flow**: Creates one initialized connection with `experimental_api_enabled = false`, routes a targeted `OutgoingMessage::Request(ServerRequest::CommandExecutionRequestApproval { ... additional_permissions: Some(...) ... })`, receives the queued message, serializes `message.message` to JSON, and asserts `json["params"].get("additionalPermissions") == None`.
+**Data flow**: The test builds a command-execution approval request that includes extra file-system read permission details. It sends that request to a connection without the experimental capability, reads the delivered message, serializes it to JSON, and confirms that `additionalPermissions` is absent.
 
-**Call relations**: This test exercises `route_outgoing_envelope` → `send_message_to_connection` → `filter_outgoing_message_for_connection`. It documents the backward-compatibility policy for approval requests on older clients.
+**Call relations**: The test uses `absolute_path` while constructing the request's path values, then calls `route_outgoing_envelope`. The routing code still delivers the request, but edits the outgoing data first so the older client sees only fields it is expected to understand.
 
 *Call graph*: calls 2 internal fn (new, absolute_path); 11 external calls (new, new, new, new, new, Integer, Request, assert_eq!, channel, to_value (+1 more)).
 
@@ -588,11 +590,11 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
 async fn command_execution_request_approval_keeps_additional_permissions_with_capability()
 ```
 
-**Purpose**: Verifies that command-execution approval requests preserve `additionalPermissions` for clients that support the experimental API. It is the positive counterpart to the stripping test.
+**Purpose**: This test confirms that capable clients receive the full command-approval request, including the newer additional-permissions information. It protects useful permission details from being stripped for clients that can handle them.
 
-**Data flow**: Creates one initialized connection with `experimental_api_enabled = true`, routes the same style of approval request containing `additional_permissions`, receives the queued message, serializes it to JSON, computes the expected allowed path string, and asserts `json["params"]["additionalPermissions"]` equals the expected nested JSON object.
+**Data flow**: The test creates a command-approval request containing an extra readable path, sends it to a connection with the capability flag enabled, reads the outgoing message, turns it into JSON, and checks that the `additionalPermissions` object is still present with the expected path.
 
-**Call relations**: This test validates the no-rewrite branch of `filter_outgoing_message_for_connection`. Together with the previous test it defines the capability-sensitive serialization contract for approval requests.
+**Call relations**: Like the previous command-approval test, it uses `absolute_path` to build valid path fields and sends the request through `route_outgoing_envelope`. Because the connection has the required capability, routing forwards the richer request instead of trimming it.
 
 *Call graph*: calls 2 internal fn (new, absolute_path); 11 external calls (new, new, new, new, new, Integer, Request, assert_eq!, channel, to_value (+1 more)).
 
@@ -603,11 +605,11 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
 async fn broadcast_does_not_block_on_slow_connection()
 ```
 
-**Purpose**: Verifies that broadcasting to multiple disconnectable connections does not stall on a full queue: the slow connection is disconnected and removed while fast connections still receive the message. It tests the transport’s slow-client policy under fan-out.
+**Purpose**: This test proves that broadcasting a message to all clients does not get stuck behind one slow client whose queue is already full. Without this, one stalled connection could freeze notifications for everyone.
 
-**Data flow**: Creates fast and slow connections with queue capacity 1 and disconnect tokens, pre-fills the slow writer queue with an `already-buffered` message, inserts both into the connection map, then routes a broadcast `ConfigWarning` under a 100ms timeout. After completion it asserts the slow connection was removed from the map and its token cancelled, the fast token was not cancelled, the fast writer received the broadcast `test` message, and the slow writer still contains only its original buffered message.
+**Data flow**: The test creates a fast connection and a slow connection, then pre-fills the slow connection's one-message queue. It broadcasts a new notification with a short timeout, expects the call to finish quickly, checks that the slow connection was removed and its disconnect token was cancelled, and confirms the fast connection received the broadcast.
 
-**Call relations**: This test exercises the broadcast branch of `route_outgoing_envelope` and the `try_send`/disconnect path in `send_message_to_connection`. It confirms that one slow queue-backed client cannot block broadcast delivery to others.
+**Call relations**: The test feeds a broadcast envelope into `route_outgoing_envelope`. The routing code tries to queue the broadcast for each connection; when the slow one cannot accept it immediately, the code disconnects that connection rather than waiting, while still handing the message to the fast connection.
 
 *Call graph*: calls 2 internal fn (new, new); 12 external calls (new, new, new, from_millis, new, new, new, ConfigWarning, AppServerNotification, assert! (+2 more)).
 
@@ -618,24 +620,22 @@ async fn broadcast_does_not_block_on_slow_connection()
 async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is_full()
 ```
 
-**Purpose**: Verifies that targeted sends to a non-disconnectable connection (stdio-like) wait for queue space instead of disconnecting when the writer channel is full. It tests the special backpressure behavior for stdio transports.
+**Purpose**: This test checks a different queue-full rule for direct sends: when sending to one connection in this path, the server should wait for room instead of dropping or disconnecting. This matters for reliable ordered delivery to that client.
 
-**Data flow**: Creates a capacity-1 writer channel, fills it with a first `queued` notification, inserts a connection with `disconnect_sender: None`, spawns a task that routes a second targeted notification, receives the first queued message to free space, waits for the routing task to finish within 100ms, then asserts the first message was `queued` and the second message is now present in the channel with summary `second`.
+**Data flow**: The test fills a connection's one-message queue with a first notification, starts routing a second notification in a background task, then drains the first message. Once space is available, the routing task completes and the second message appears in the queue.
 
-**Call relations**: This test exercises the non-disconnectable branch of `send_message_to_connection`, where `writer.send(...).await` is used instead of `try_send`. It documents the distinction between stdio backpressure and remote-connection disconnection.
+**Call relations**: The test calls `route_outgoing_envelope` from a spawned asynchronous task so it can observe that routing waits while the queue is full. After the test reads the already queued message, the route function can finish sending the second one, proving this direct-send path behaves differently from broadcast.
 
 *Call graph*: calls 2 internal fn (new, new); 12 external calls (new, new, from_millis, new, new, new, ConfigWarning, AppServerNotification, assert!, channel (+2 more)).
 
 
 ### `app-server-transport/src/transport/remote_control/tests/clients_tests.rs`
 
-`test` · `test-only`
+`test` · `test suite`
 
-This test file isolates the management endpoints that operate independently of the websocket transport: listing remote-control clients for an environment and revoking a specific client. It builds lightweight `RemoteControlHandle` instances whose desired state is disabled and whose `state_db` is absent, specifically to prove that these APIs are gated only by policy, not by websocket enablement or enrollment state.
+This is a test file for the part of the app server that talks to the remote-control backend about client devices. A “client” here means another device or app enrolled for remote control, such as a phone. The tests create a tiny local HTTP server instead of using the real backend, like setting up a pretend cashier to check what the app asks for and what it does with the reply.
 
-`client_management_handle` constructs that minimal handle with disabled status, empty current enrollment, and a supplied auth manager. The tests then stand up local HTTP listeners and inspect the exact request lines and headers generated by the production client-management code. The list test verifies URL encoding of environment id and cursor, bearer auth, account-id header, and response decoding into `RemoteControlClientsListResponse` with Unix timestamp conversion. The revoke test verifies the DELETE path and successful empty response handling.
-
-The remaining tests focus on auth and error behavior in the lower-level `clients` module. One test simulates a stale access token followed by a fresh token after auth reload and confirms list retries once and succeeds. Another confirms that repeated 401s do not trigger unbounded retries. A revoke test ensures 403 Forbidden is surfaced immediately with request-id and cf-ray context preserved. The final test checks that malformed JSON responses keep HTTP status, body preview, and decode-error details in the returned error string.
+The file verifies several important promises. First, listing and revoking clients must work even when the broader remote-control connection is disabled. That matters because client management is an account operation, not the same as keeping a live remote-control session open. Second, listing clients must include the right authentication token and account header, encode unusual characters safely in URLs, and translate the backend’s JSON response into the simpler protocol response used by the app. Third, if the backend says a token is unauthorized, the code should reload saved credentials and try once more, but not loop forever. Finally, the tests make sure forbidden responses and malformed JSON produce helpful errors, including status codes, request identifiers, and response bodies. Without these checks, users could see silent failures or vague errors when managing their remote-control devices.
 
 #### Function details
 
@@ -648,11 +648,11 @@ fn client_management_handle(
 ) -> RemoteControlHandle
 ```
 
-**Purpose**: Builds a minimal `RemoteControlHandle` suitable for testing client-management APIs while remote control is otherwise disabled.
+**Purpose**: This helper builds a RemoteControlHandle that is suitable for client-management tests. It deliberately starts with remote control disabled, so tests can prove that listing or revoking clients does not require an active remote-control connection.
 
-**Data flow**: Creates a disabled desired-state watch sender and disabled status watch channel, initializes semaphores and empty current enrollment state, stores the supplied `remote_control_url` and `auth_manager`, and returns the assembled handle with policy `Allowed` and no state DB.
+**Data flow**: It receives a remote-control server URL and an authentication manager. It creates the internal channels, locks, status values, and enrollment state that a RemoteControlHandle normally needs, then returns a ready-to-use handle pointed at the test server.
 
-**Call relations**: Used by the handle-level list and revoke tests to prove those APIs work without active websocket transport.
+**Call relations**: The two handle-level tests call this helper before using list_clients or revoke_client. Inside, it creates fresh synchronization pieces such as watch channels and semaphores so each test gets an isolated handle instead of sharing state with other tests.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (remote_control_handle_lists_clients_while_disabled, remote_control_handle_revokes_client_while_disabled); 3 external calls (new, new, channel).
 
@@ -663,11 +663,11 @@ fn client_management_handle(
 fn empty_client_list() -> serde_json::Value
 ```
 
-**Purpose**: Returns the JSON payload representing an empty paginated client list.
+**Purpose**: This small helper creates the JSON shape for a successful response with no remote-control clients. It keeps repeated test setup short and makes the intended backend reply obvious.
 
-**Data flow**: Constructs and returns `{"items": [], "cursor": null}` as `serde_json::Value`.
+**Data flow**: It takes no input. It builds a JSON value containing an empty items list and a null cursor, then returns that value for the fake server to send.
 
-**Call relations**: Used by the auth-recovery list test as the successful backend response body.
+**Call relations**: The authentication-recovery test uses this helper after the simulated backend accepts the refreshed token. It hands the JSON to the response helper so list_remote_control_clients can parse it as a normal empty result.
 
 *Call graph*: called by 1 (list_remote_control_clients_recovers_auth_after_unauthorized); 1 external calls (json!).
 
@@ -678,11 +678,11 @@ fn empty_client_list() -> serde_json::Value
 async fn remote_control_handle_lists_clients_while_disabled()
 ```
 
-**Purpose**: Verifies that `RemoteControlHandle::list_clients` works even when desired state is disabled and checks the exact HTTP request shape.
+**Purpose**: This test proves that RemoteControlHandle can list remote-control clients even when the remote-control feature itself is currently disabled. It also checks the exact URL, query string, authorization header, account header, and parsed response.
 
-**Data flow**: Starts a local listener and server task that captures one request, asserts the encoded GET path, authorization header, and account-id header, then responds with a JSON client list. The test builds a disabled handle, calls `list_clients(...)`, awaits the server task, and asserts the decoded response contains the expected `RemoteControlClient` fields and next cursor.
+**Data flow**: The test starts a local TCP listener, builds a RemoteControlHandle pointing at it, and calls list_clients with an environment id, cursor, limit, and sort order. The fake server receives the request, checks that spaces and special characters were safely encoded, returns one client as JSON, and the test verifies that the final response contains the expected client fields and next cursor.
 
-**Call relations**: Exercises the handle wrapper around the lower-level list API and confirms it is not blocked by disabled transport state.
+**Call relations**: The async test harness runs this function. It calls client_management_handle to build the disabled handle, uses a spawned server task to inspect the outgoing HTTP request, and relies on assertions to confirm that the request and decoded response match the expected remote-control client-list behavior.
 
 *Call graph*: calls 1 internal fn (client_management_handle); 4 external calls (bind, assert_eq!, json!, spawn).
 
@@ -693,11 +693,11 @@ async fn remote_control_handle_lists_clients_while_disabled()
 async fn remote_control_handle_revokes_client_while_disabled()
 ```
 
-**Purpose**: Verifies that `RemoteControlHandle::revoke_client` succeeds while remote control is disabled and uses the expected DELETE path.
+**Purpose**: This test proves that RemoteControlHandle can revoke a remote-control client even while remote control is disabled. It checks that the client and environment identifiers are placed safely into the DELETE request path.
 
-**Data flow**: Starts a local listener and server task that captures one request, asserts the encoded DELETE request line, and responds `204 No Content`. The test builds a disabled handle, calls `revoke_client(...)`, waits for the server task, and asserts the empty success response.
+**Data flow**: The test starts a local listener, creates a disabled RemoteControlHandle, and calls revoke_client with an environment id and client id containing characters that need URL encoding. The fake server checks the DELETE request path, returns a 204 No Content response, and the test confirms that the revoke call returns the expected empty success response.
 
-**Call relations**: Companion handle-level test for the revoke management API.
+**Call relations**: The async test harness runs this function. It calls client_management_handle for the test handle and uses a spawned fake server to verify the outgoing request before the revoke call completes.
 
 *Call graph*: calls 1 internal fn (client_management_handle); 3 external calls (bind, assert_eq!, spawn).
 
@@ -708,11 +708,11 @@ async fn remote_control_handle_revokes_client_while_disabled()
 async fn list_remote_control_clients_recovers_auth_after_unauthorized()
 ```
 
-**Purpose**: Checks that the lower-level list API retries once after a 401 by reloading auth and using the fresh access token.
+**Purpose**: This test checks that listing clients can recover from an expired or stale access token. If the first request gets a 401 Unauthorized response, the code should reload saved credentials and retry with the fresh token.
 
-**Data flow**: Starts a local listener whose first request expects `Bearer stale-token` and returns 401, and whose second request expects `Bearer fresh-token` and returns an empty list. The test writes stale auth to disk, creates an `AuthManager`, overwrites auth on disk with fresh token, calls `list_remote_control_clients`, and asserts the final decoded response is empty.
+**Data flow**: The test first saves credentials containing a stale token, creates an AuthManager from that saved state, then overwrites the saved credentials with a fresh token. The fake server rejects the first request after seeing the stale token, accepts the second request with the fresh token, and returns an empty list. The test confirms that the final result is a successful empty client list.
 
-**Call relations**: Exercises auth-recovery behavior in the client-list transport code.
+**Call relations**: The async test harness runs this function. It calls list_remote_control_clients directly, while the fake server task checks the before-and-after authentication headers. It uses empty_client_list to provide the successful response after the retry.
 
 *Call graph*: calls 4 internal fn (list_remote_control_clients, empty_client_list, default, shared); 5 external calls (default, bind, new, assert_eq!, spawn).
 
@@ -723,11 +723,11 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized()
 async fn list_remote_control_clients_retries_unauthorized_only_once()
 ```
 
-**Purpose**: Ensures the list API does not retry indefinitely when both the original and recovered auth attempts receive 401 responses.
+**Purpose**: This test makes sure the client-list code does not retry forever when authorization keeps failing. It should refresh credentials and try once, then stop if the backend still returns 401 Unauthorized.
 
-**Data flow**: Sets up a listener that returns 401 for both stale-token and fresh-token requests and then asserts no third request arrives. The test writes stale then fresh auth, calls `list_remote_control_clients`, expects an error, and asserts its kind is `PermissionDenied`.
+**Data flow**: The test saves stale credentials, creates an AuthManager, then saves fresh credentials for the retry. The fake server rejects both the stale-token request and the fresh-token request, then waits briefly to ensure no third request arrives. The list call returns an error, and the test checks that the error kind is PermissionDenied.
 
-**Call relations**: Locks in the single-retry policy for unauthorized client-list requests.
+**Call relations**: The async test harness runs this function. It calls list_remote_control_clients directly and uses the spawned fake server to enforce the retry limit: one original request, one recovery request, and no more.
 
 *Call graph*: calls 3 internal fn (list_remote_control_clients, default, shared); 6 external calls (default, bind, new, assert!, assert_eq!, spawn).
 
@@ -738,11 +738,11 @@ async fn list_remote_control_clients_retries_unauthorized_only_once()
 async fn revoke_remote_control_client_does_not_retry_forbidden()
 ```
 
-**Purpose**: Verifies that a 403 revoke failure is surfaced immediately without auth retry and preserves backend correlation headers in the error message.
+**Purpose**: This test checks that revoking a client does not retry when the backend returns 403 Forbidden. Forbidden means the server understood the user but refuses the action, so refreshing the token is not expected to help.
 
-**Data flow**: Starts a listener that returns `403 Forbidden` with `x-request-id` and `cf-ray` headers, calls `revoke_remote_control_client`, expects an error, and asserts both the `PermissionDenied` kind and the fully formatted error string including URL, status, headers, and body.
+**Data flow**: The test starts a fake server that responds to the revoke request with 403 Forbidden, including diagnostic headers and a body. The revoke call returns an error. The test verifies both that the error is classified as PermissionDenied and that its text includes the URL, HTTP status, request id, Cloudflare ray id, and response body.
 
-**Call relations**: Covers non-retriable authorization failure handling for the revoke API.
+**Call relations**: The async test harness runs this function. It calls revoke_remote_control_client directly, while a spawned fake server supplies the forbidden response. The assertions confirm that the revoke path reports the backend failure clearly instead of hiding useful context.
 
 *Call graph*: calls 1 internal fn (revoke_remote_control_client); 3 external calls (bind, assert_eq!, spawn).
 
@@ -753,22 +753,24 @@ async fn revoke_remote_control_client_does_not_retry_forbidden()
 async fn list_remote_control_clients_preserves_decode_error_context()
 ```
 
-**Purpose**: Checks that malformed JSON in a successful client-list response still yields an error containing URL, HTTP status, body preview, and decode details.
+**Purpose**: This test ensures that a malformed successful response produces an error with enough context to debug the problem. A 200 OK response is not useful if the body cannot be parsed as the expected JSON.
 
-**Data flow**: Starts a listener that returns `200 OK` with body `{`, calls `list_remote_control_clients`, expects an error, and asserts the error string contains the response URL prefix, `HTTP 200 OK`, the raw body preview, and a decode-error marker.
+**Data flow**: The test starts a fake server that replies with HTTP 200 OK but sends an invalid JSON body consisting of just an opening brace. The list call fails while trying to decode the response. The test checks that the error message includes the response URL, status, body text, and the underlying decode error.
 
-**Call relations**: Protects the diagnostic formatting of the client-list transport path.
+**Call relations**: The async test harness runs this function. It calls list_remote_control_clients directly and uses a spawned fake server to send the malformed response. The assertions make sure parsing failures keep the evidence needed to diagnose backend or protocol problems.
 
 *Call graph*: calls 1 internal fn (list_remote_control_clients); 4 external calls (default, bind, assert!, spawn).
 
 
 ### `app-server-transport/src/transport/remote_control/tests/pairing_tests.rs`
 
-`test` · `test execution for remote-control pairing flows`
+`test` · `test execution`
 
-This test file builds realistic `RemoteControlEnrollment` values and then drives both low-level enrollment methods (`start_pairing`, `pairing_status`) and higher-level remote-control handle methods that may refresh server tokens, recover user auth, or re-enroll stale servers. Most tests stand up a temporary `TcpListener`, accept one or more raw HTTP requests, assert exact request lines, authorization headers, and JSON bodies, and then return crafted JSON or status responses to force specific branches.
+Remote control pairing is the process that lets this app server connect itself to a remote controller. That process depends on several moving parts: a saved enrollment, a server token, the user’s login token, and backend endpoints for pairing, status checks, refresh, and enrollment. If any of those pieces are stale or wrong, the user needs either automatic recovery or a clear error message.
 
-The helpers `remote_control_enrollment`, `pairing_error`, `pairing_response_error`, and `pairing_status_error` reduce boilerplate for constructing enrollments and capturing formatted errors. The tests verify several subtle invariants: pairing can start before the websocket has connected if the current enrollment is nearly expired; pairing-status accepts either `pairing_code` or `manual_pairing_code`; 401 responses trigger server-token refresh; 404/410 stale-enrollment responses trigger re-enrollment and persistence updates; and responses are discarded if the authenticated account changes while a pairing request is in flight. Error assertions are intentionally concrete, checking inclusion of request IDs, Cloudflare ray IDs, raw response bodies, decode failures, and expiry parse failures so regressions in diagnostics are caught. The file also checks that disabling remote control does not clear the currently selected enrollment, preserving the chosen server for later reuse.
+This test file acts like a rehearsal room for that flow. Each test starts a temporary local TCP listener, which is a tiny fake backend server. The code under test sends real HTTP requests to that listener. The test then inspects the request path, authorization header, and JSON body, and replies with carefully chosen success or failure responses.
+
+The tests cover happy paths, such as returning a pending or claimed pairing status, and harder cases, such as expired server tokens, stale user login tokens, mismatched enrollment data, invalid timestamps, and backend errors with diagnostic headers. A key theme is preserving context: when something fails, the error should include the URL, HTTP status, request id, Cloudflare ray id, response body, and parsing problem when available. Without these tests, regressions could silently break pairing or hide the information needed to diagnose production failures.
 
 #### Function details
 
@@ -781,11 +783,11 @@ fn remote_control_enrollment(
 ) -> RemoteControlEnrollment
 ```
 
-**Purpose**: Constructs a canonical `RemoteControlEnrollment` fixture for tests from a base URL and server token. It normalizes the URL into a `RemoteControlTarget` and fills fixed account, environment, server, and expiry fields.
+**Purpose**: Builds a ready-to-use test enrollment for a remote-control server. Tests use it as the saved identity of an app server before asking the backend to pair or check pairing status.
 
-**Data flow**: Takes `remote_control_url` and `remote_control_token` strings, normalizes the URL, parses a fixed far-future Unix timestamp into `OffsetDateTime`, and returns a populated `RemoteControlEnrollment` with `remote_control_token: Some(...)` and stable IDs/names used by assertions.
+**Data flow**: It receives a remote-control URL and a server token. It normalizes the URL, fills in fixed test account, environment, server, and name values, stores the token, and sets a far-future expiry time. The result is a RemoteControlEnrollment value that other tests can call methods on.
 
-**Call relations**: This helper is used by the error-focused helpers and direct pairing-status tests whenever they need a concrete enrollment object without going through the full handle setup path.
+**Call relations**: This is the common setup helper for several pairing and status tests. Error helpers and direct status tests call it first, then use the returned enrollment to start pairing or ask for pairing status against the fake backend.
 
 *Call graph*: called by 6 (pairing_error, pairing_response_error, pairing_status_error, remote_control_pairing_status_accepts_manual_pairing_code, remote_control_pairing_status_returns_claimed, remote_control_pairing_status_returns_pending); 1 external calls (from_unix_timestamp).
 
@@ -796,11 +798,11 @@ fn remote_control_enrollment(
 async fn pairing_error(status: &'static str, body: &'static str) -> (String, String)
 ```
 
-**Purpose**: Runs a one-request fake pairing server and captures the formatted error produced by `RemoteControlEnrollment::start_pairing`. It also returns the normalized pair URL expected to appear in the error text.
+**Purpose**: Creates a controlled backend failure for starting pairing and returns the resulting error text. It lets multiple tests check that pairing failures keep the right diagnostic details.
 
-**Data flow**: Binds a local `TcpListener`, derives the remote-control URL and normalized `pair_url`, spawns a task that accepts one HTTP request and responds with the supplied status/body plus tracing headers, then invokes `start_pairing` with `manual_code: false`. It returns `(err.to_string(), expected_pair_url)` after awaiting the server task.
+**Data flow**: It takes an HTTP status string and response body. It starts a local fake server, waits for the pairing request, replies with that status plus request-identifying headers, then runs start_pairing on a test enrollment. The output is the error message produced by the client and the expected pairing URL.
 
-**Call relations**: Called by the backend-error and decode-error tests for pairing so those tests can focus on string assertions while this helper encapsulates listener setup and request/response orchestration.
+**Call relations**: The backend-error and decode-error tests call this helper instead of repeating the server setup. Inside, it relies on remote_control_enrollment to create the client-side enrollment and a spawned fake server task to provide the response.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); called by 2 (start_remote_control_pairing_preserves_backend_error_context, start_remote_control_pairing_preserves_decode_error_context); 2 external calls (bind, spawn).
 
@@ -811,11 +813,11 @@ async fn pairing_error(status: &'static str, body: &'static str) -> (String, Str
 async fn pairing_response_error(body: serde_json::Value) -> String
 ```
 
-**Purpose**: Runs a fake pairing endpoint that returns JSON and captures the resulting pairing error string. It is used for semantic response failures rather than HTTP status failures.
+**Purpose**: Tests pairing responses that are HTTP-successful but semantically wrong, such as mismatched server information or an invalid expiry timestamp. It returns the client’s error message for the caller to inspect.
 
-**Data flow**: Creates a local listener, spawns a server task that accepts one request and responds with the provided `serde_json::Value`, then calls `start_pairing` on a fixture enrollment and converts the expected error into a `String`.
+**Data flow**: It receives a JSON value to use as the backend response. It starts a fake server, sends that JSON to the pairing request, then calls start_pairing on a test enrollment. Since the response is intentionally bad for the scenario, it returns the resulting error as text.
 
-**Call relations**: Used by the expiry-parse-error test and supports the mismatched-enrollment test pattern by centralizing the single-response JSON server behavior.
+**Call relations**: Tests that care about bad pairing response contents call this helper. It uses remote_control_enrollment for the client setup and hands the supplied JSON through the fake HTTP response.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); called by 1 (start_remote_control_pairing_preserves_expiry_parse_error_context); 2 external calls (bind, spawn).
 
@@ -826,11 +828,11 @@ async fn pairing_response_error(body: serde_json::Value) -> String
 async fn pairing_status_error(status: &'static str, body: &'static str) -> (io::Error, String)
 ```
 
-**Purpose**: Runs a fake pairing-status endpoint and captures the `io::Error` returned by `RemoteControlEnrollment::pairing_status`, along with the normalized status URL. It supports assertions on both error kind and detailed formatting.
+**Purpose**: Creates a controlled backend failure for checking pairing status. It is used to verify both user-facing error categories and detailed parsing error messages.
 
-**Data flow**: Binds a listener, computes the normalized `pair_status_url`, spawns a task that serves one status/body response with request metadata headers, then calls `pairing_status` using a `pairing_code`. It returns the raw `io::Error` and expected URL after the server task completes.
+**Data flow**: It takes an HTTP status and body, starts a fake server, records the expected status endpoint URL, and replies to the client’s status request with the supplied failure. It returns the io::Error object from the client and the URL the client should mention in messages.
 
-**Call relations**: Shared by tests that verify user-actionable error-kind mapping and decode-error context preservation for pairing-status requests.
+**Call relations**: Status-error tests call this helper to avoid duplicating fake-server setup. It builds its client enrollment with remote_control_enrollment, then exercises pairing_status against the fake backend.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); called by 2 (remote_control_pairing_status_maps_user_actionable_backend_errors, remote_control_pairing_status_preserves_decode_error_context); 2 external calls (bind, spawn).
 
@@ -841,11 +843,11 @@ async fn pairing_status_error(status: &'static str, body: &'static str) -> (io::
 async fn remote_control_handle_starts_pairing_before_websocket_connects()
 ```
 
-**Purpose**: Verifies that a `RemoteControlHandle` can refresh an almost-expired server token and start pairing before any websocket connection has been established. It proves pairing is not blocked on websocket startup.
+**Purpose**: Checks that a remote-control handle can start pairing even before the websocket connection is established. This matters because the UI may ask for a pairing code before the long-lived remote-control connection is ready.
 
-**Data flow**: Creates a listener whose server task expects first a refresh request and then a pair request, asserting exact paths, auth headers, and JSON payloads. The test mutates `current_enrollment.expires_at` to near-expiry, calls `remote_handle.start_pairing(...)`, and asserts the returned `RemoteControlPairingStartResponse` fields including parsed expiry epoch.
+**Data flow**: The test starts a fake backend that first expects a token refresh request and then a pairing request with a manual-code flag. It marks the current enrollment as nearly expired, calls start_pairing on the handle, and expects a pairing response with the returned codes, environment id, and expiry time.
 
-**Call relations**: This is a top-level integration-style test of the handle path, covering the control flow where `start_pairing` notices token expiry, refreshes the server token, and only then issues the pairing request.
+**Call relations**: This is a full-flow test around the higher-level remote-control handle. The fake server supplies a refreshed server token, and the handle then hands that token into the pairing request before producing the final response.
 
 *Call graph*: 6 external calls (now_utc, bind, assert_eq!, json!, seconds, spawn).
 
@@ -856,11 +858,11 @@ async fn remote_control_handle_starts_pairing_before_websocket_connects()
 async fn remote_control_pairing_status_returns_pending()
 ```
 
-**Purpose**: Checks that a successful pairing-status response with `claimed: false` is surfaced unchanged. It also verifies the request shape for code-based status polling.
+**Purpose**: Verifies that a pairing status response saying the code has not been claimed is passed through correctly. This is the normal waiting state while a user has not completed pairing yet.
 
-**Data flow**: Starts a local server that asserts the POST path, bearer token, and JSON body `{ "pairing_code": "pairing-code" }`, then returns `{ "claimed": false }`. The test calls `pairing_status` and asserts the returned response has `claimed == false`.
+**Data flow**: The test creates a fake backend that expects a status request with the pairing code and bearer token. It responds with JSON saying claimed is false. The enrollment’s pairing_status call returns a response whose claimed field should also be false.
 
-**Call relations**: This directly exercises the low-level enrollment method without involving token refresh or handle orchestration, serving as the baseline success case.
+**Call relations**: This test uses remote_control_enrollment directly, so it focuses on the low-level enrollment status request rather than the higher-level handle. The fake backend confirms the request format and supplies the pending result.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); 5 external calls (bind, assert!, assert_eq!, json!, spawn).
 
@@ -871,11 +873,11 @@ async fn remote_control_pairing_status_returns_pending()
 async fn remote_control_pairing_status_accepts_manual_pairing_code()
 ```
 
-**Purpose**: Verifies that pairing-status requests can be keyed by `manual_pairing_code` instead of `pairing_code`. This guards the alternate request encoding path.
+**Purpose**: Verifies that pairing status can be checked using a manual pairing code instead of the regular pairing code. This supports flows where a human types a readable code like ABCD-EFGH.
 
-**Data flow**: Runs a fake server that asserts the request body contains only `{ "manual_pairing_code": "ABCD-EFGH" }`, returns `{ "claimed": false }`, and the test asserts the decoded response remains unclaimed.
+**Data flow**: The test starts a fake backend and expects the JSON body to contain manual_pairing_code only. It replies with claimed false, then the client returns a status response showing the pairing is still pending.
 
-**Call relations**: Like the previous status test, this targets the low-level enrollment API, but specifically the branch that serializes manual pairing codes.
+**Call relations**: Like the pending-status test, this calls remote_control_enrollment directly. It proves the status request builder can send the alternate manual-code field when that is the only code available.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); 5 external calls (bind, assert!, assert_eq!, json!, spawn).
 
@@ -886,11 +888,11 @@ async fn remote_control_pairing_status_accepts_manual_pairing_code()
 async fn remote_control_pairing_status_returns_claimed()
 ```
 
-**Purpose**: Checks that a successful pairing-status response with `claimed: true` is propagated. It confirms the positive completion case for polling.
+**Purpose**: Verifies that a backend response saying the pairing code was claimed becomes a claimed status in the client. This is the success signal that pairing has been completed elsewhere.
 
-**Data flow**: Serves a single JSON response `{ "claimed": true }` to a status request, then asserts the returned response object has `claimed == true`.
+**Data flow**: The fake backend accepts one status request and returns JSON with claimed set to true. The enrollment sends the request and receives a response whose claimed field the test confirms is true.
 
-**Call relations**: This complements the pending-status test by covering the alternate successful backend payload.
+**Call relations**: This is another direct test of the enrollment-level pairing_status method. The fake server supplies the claimed result, and the test checks that no extra interpretation changes it.
 
 *Call graph*: calls 1 internal fn (remote_control_enrollment); 5 external calls (bind, assert!, assert_eq!, json!, spawn).
 
@@ -901,11 +903,11 @@ async fn remote_control_pairing_status_returns_claimed()
 async fn remote_control_handle_refreshes_after_pairing_status_auth_failure()
 ```
 
-**Purpose**: Ensures the higher-level handle retries pairing-status after a 401 by refreshing the remote-control server token. It validates stale-token recovery during polling.
+**Purpose**: Checks that the higher-level handle recovers when a pairing status request fails because the server token is no longer accepted. Instead of giving up on a 401 Unauthorized response, it should refresh the token and retry.
 
-**Data flow**: The fake server first receives a status request with the stale token and returns 401, then receives a refresh request and returns a refreshed token, then receives a second status request with the refreshed token and returns `{ "claimed": true }`. The test calls `remote_handle.pairing_status(...)` and asserts success.
+**Data flow**: The fake backend first receives a status request with the stale server token and returns 401. It then receives a refresh request, returns a new server token, and finally receives a second status request using that new token. The handle returns the successful claimed status.
 
-**Call relations**: This test covers the handle-level retry path where a status poll detects server-token auth failure and delegates to refresh logic before replaying the original status request.
+**Call relations**: This test exercises the handle’s recovery path. The status call triggers a token refresh behind the scenes, then the refreshed enrollment is used for the retry before the final response is returned.
 
 *Call graph*: 5 external calls (bind, assert!, assert_eq!, json!, spawn).
 
@@ -916,11 +918,11 @@ async fn remote_control_handle_refreshes_after_pairing_status_auth_failure()
 async fn remote_control_pairing_status_maps_user_actionable_backend_errors()
 ```
 
-**Purpose**: Checks that selected backend HTTP statuses are translated into actionable `io::ErrorKind` values rather than opaque generic failures. It codifies the user-facing mapping contract.
+**Purpose**: Checks that certain backend status failures become meaningful standard error kinds. This lets callers distinguish, for example, permission problems from invalid or expired pairing information.
 
-**Data flow**: Iterates over `(status, expected_kind)` pairs, invokes `pairing_status_error` for each, extracts the returned `io::Error`, and asserts `err.kind()` matches `PermissionDenied` for 403 and `InvalidInput` for 404/410.
+**Data flow**: For each chosen HTTP status, the test asks pairing_status_error to create that backend response. It then compares the resulting io::Error kind with the expected category, such as PermissionDenied or InvalidInput.
 
-**Call relations**: This is a compact table-driven test built on `pairing_status_error`, focusing only on the status-to-kind mapping branch.
+**Call relations**: This test is a small table of scenarios built on the pairing_status_error helper. The helper supplies the fake backend failure, and this test focuses only on the classification of the resulting error.
 
 *Call graph*: calls 1 internal fn (pairing_status_error); 1 external calls (assert_eq!).
 
@@ -931,11 +933,11 @@ async fn remote_control_pairing_status_maps_user_actionable_backend_errors()
 async fn remote_control_pairing_status_preserves_decode_error_context()
 ```
 
-**Purpose**: Verifies that malformed JSON in a 200 pairing-status response produces an error string containing URL, HTTP status, tracing headers, body preview, and decode details. It protects diagnostic richness.
+**Purpose**: Verifies that an invalid pairing-status response includes useful context in the error message. This is important when a backend says OK but sends broken JSON.
 
-**Data flow**: Calls `pairing_status_error("200 OK", "{")`, converts the returned error to a string, and asserts that string contains the expected normalized URL and contextual fragments.
+**Data flow**: The test makes the fake backend return HTTP 200 with an invalid JSON body. It turns the resulting error into text and checks that the message includes the status URL, HTTP status, request id, Cloudflare ray id, raw body, and decode error.
 
-**Call relations**: Uses the shared helper to isolate assertions about formatting of decode failures rather than transport setup.
+**Call relations**: It uses pairing_status_error to create the malformed response. The test then inspects the error text to make sure the low-level parsing failure is not stripped of debugging information.
 
 *Call graph*: calls 1 internal fn (pairing_status_error); 1 external calls (assert!).
 
@@ -946,11 +948,11 @@ async fn remote_control_pairing_status_preserves_decode_error_context()
 async fn remote_control_handle_refreshes_after_pairing_auth_failure()
 ```
 
-**Purpose**: Ensures `RemoteControlHandle::start_pairing` retries after a 401 pairing response by refreshing the server token first. It validates stale-token recovery for pairing initiation.
+**Purpose**: Checks that starting pairing recovers from an unauthorized server token. If the first pairing request gets 401 Unauthorized, the handle should refresh the server token and try pairing again.
 
-**Data flow**: The fake server expects a stale-token pair request returning 401, then a refresh request authorized with the user access token, then a second pair request authorized with the refreshed server token returning pairing JSON. The test invokes `start_pairing` and asserts the final `RemoteControlPairingStartResponse`.
+**Data flow**: The fake backend first rejects a pairing request using the stale token. It then accepts a refresh request authenticated with the user access token, returns a refreshed server token, and accepts a second pairing request using that new token. The final output is a normal pairing-start response.
 
-**Call relations**: This is the pairing counterpart to the status-auth-failure test, covering the handle branch that refreshes server credentials and replays the pair request.
+**Call relations**: This test drives the higher-level handle rather than the raw enrollment. It proves that the handle connects the failed pairing attempt, refresh operation, and retried pairing request into one smooth recovery flow.
 
 *Call graph*: 5 external calls (bind, default, assert_eq!, json!, spawn).
 
@@ -961,11 +963,11 @@ async fn remote_control_handle_refreshes_after_pairing_auth_failure()
 async fn remote_control_handle_recovers_auth_before_refreshing_pairing()
 ```
 
-**Purpose**: Verifies that if the user access token used for server refresh is itself stale, the handle reloads auth and retries refresh before pairing. It covers nested recovery: auth recovery before server-token refresh.
+**Purpose**: Checks a deeper recovery path: if refreshing the server token fails because the saved user login token is stale, the handle reloads the user auth and retries refresh before pairing. This protects users from transient auth-cache staleness.
 
-**Data flow**: Creates a temp auth home, saves stale auth, constructs an `AuthManager`, then overwrites auth with a fresh token. The fake server returns 401 to the first refresh request using `stale-token`, succeeds on the second refresh using `fresh-token`, then accepts the pairing request with the refreshed server token. The test also marks the current enrollment near expiry and asserts the final pairing response.
+**Data flow**: The test writes stale auth to a temporary home directory, creates an auth manager, then replaces the saved auth with a fresh token. The fake backend rejects the first refresh using the stale token, accepts a second refresh using the fresh token, and then accepts pairing with the refreshed server token. The handle returns the expected pairing response.
 
-**Call relations**: This top-level test drives the deepest recovery chain in the pairing path: near-expiry enrollment triggers refresh, refresh gets 401, auth manager reloads, refresh retries, then pairing proceeds.
+**Call relations**: This test combines filesystem-backed auth, the auth manager, token refresh, and pairing. The handle first tries to refresh with old auth, recovers by reloading auth, then hands the newly refreshed server token into the pairing request.
 
 *Call graph*: calls 2 internal fn (default, shared); 8 external calls (now_utc, bind, new, default, assert_eq!, json!, seconds, spawn).
 
@@ -976,11 +978,11 @@ async fn remote_control_handle_recovers_auth_before_refreshing_pairing()
 async fn start_remote_control_pairing_preserves_backend_error_context()
 ```
 
-**Purpose**: Checks exact formatting of non-200 pairing failures. It ensures backend status, request ID, ray ID, and body are preserved in the surfaced error.
+**Purpose**: Verifies that a backend failure while starting pairing is reported with the exact useful details. The goal is an error message that someone can use to trace the failed backend request.
 
-**Data flow**: Invokes `pairing_error("503 Service Unavailable", "pairing unavailable")` and asserts the returned string exactly matches the expected formatted message including the normalized pair URL.
+**Data flow**: The test asks pairing_error to simulate a 503 Service Unavailable response with a response body and identifying headers. It compares the resulting error text with the exact expected message, including URL, HTTP status, request id, ray id, and body.
 
-**Call relations**: This is a focused assertion layer over `pairing_error`, validating the final user-visible error text for backend failures.
+**Call relations**: This is a focused assertion built on the pairing_error helper. The helper creates the fake failure, and this test confirms that start_pairing preserves the backend context.
 
 *Call graph*: calls 1 internal fn (pairing_error); 1 external calls (assert_eq!).
 
@@ -991,11 +993,11 @@ async fn start_remote_control_pairing_preserves_backend_error_context()
 async fn start_remote_control_pairing_preserves_decode_error_context()
 ```
 
-**Purpose**: Checks that malformed JSON in a 200 pairing response preserves detailed decode context. It guards against losing response metadata when deserialization fails.
+**Purpose**: Verifies that a broken JSON response from the pairing endpoint produces an error with enough detail to debug it. This covers the case where the HTTP request succeeds but the body cannot be understood.
 
-**Data flow**: Calls `pairing_error("200 OK", "{")` and asserts the resulting string contains the pair URL, HTTP status, request metadata headers, raw body, and a decode-error marker.
+**Data flow**: The test uses pairing_error to return HTTP 200 with an invalid JSON body. It checks the error text for the pairing URL, status, request id, ray id, raw body, and the JSON decoding problem.
 
-**Call relations**: Built on the same helper as the backend-error test, but aimed at the parsing-failure branch after a nominally successful HTTP response.
+**Call relations**: The pairing_error helper supplies the malformed success response. This test checks that the parsing layer adds its failure reason without losing the HTTP context.
 
 *Call graph*: calls 1 internal fn (pairing_error); 1 external calls (assert!).
 
@@ -1006,11 +1008,11 @@ async fn start_remote_control_pairing_preserves_decode_error_context()
 async fn start_remote_control_pairing_rejects_mismatched_backend_enrollment()
 ```
 
-**Purpose**: Verifies that pairing responses are rejected if the backend returns a different `server_id` or `environment_id` than the current enrollment. This prevents pairing against the wrong server/environment.
+**Purpose**: Ensures the client rejects a pairing response that belongs to a different server or environment than the enrollment being used. This prevents accidentally accepting a code for the wrong remote-control server.
 
-**Data flow**: Calls `pairing_response_error(...)` with JSON containing mismatched server/environment identifiers and asserts the returned error string exactly describes the expected and actual IDs.
+**Data flow**: The test feeds a pairing response JSON whose server_id and environment_id do not match the enrollment’s expected values. The pairing call fails, and the test compares the error text with the expected mismatch explanation.
 
-**Call relations**: This test targets the semantic validation branch after successful response decoding, ensuring enrollment identity is enforced.
+**Call relations**: This test focuses on validation after the backend response is decoded. It proves that start_pairing does not blindly trust successful-looking data if it points at the wrong enrollment.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1021,11 +1023,11 @@ async fn start_remote_control_pairing_rejects_mismatched_backend_enrollment()
 async fn start_remote_control_pairing_preserves_expiry_parse_error_context()
 ```
 
-**Purpose**: Checks that an invalid `expires_at` timestamp in an otherwise valid pairing response yields a detailed parse error message. It protects diagnostics for timestamp parsing failures.
+**Purpose**: Checks that an invalid expires_at timestamp in a pairing response is reported with context. The expiry controls how long the pairing code is valid, so bad data must not be accepted silently.
 
-**Data flow**: Uses `pairing_response_error` with JSON containing `expires_at: "not-a-timestamp"`, then asserts the error string includes generic parse context, HTTP 200, missing request metadata placeholders, the raw JSON body fragment, and an expiry parse marker.
+**Data flow**: The test asks pairing_response_error to return a JSON response with matching server details but an invalid timestamp string. It then checks that the error mentions parsing the pairing response, HTTP 200, missing diagnostic headers, the bad expires_at value, and the timestamp parse error.
 
-**Call relations**: This complements the generic decode-error test by covering a later validation/parsing step after JSON deserialization succeeds.
+**Call relations**: This test uses pairing_response_error to send malformed but otherwise plausible JSON. It verifies that the response-validation path explains exactly which field failed.
 
 *Call graph*: calls 1 internal fn (pairing_response_error); 2 external calls (assert!, json!).
 
@@ -1036,11 +1038,11 @@ async fn start_remote_control_pairing_preserves_expiry_parse_error_context()
 async fn remote_control_handle_disable_keeps_current_enrollment()
 ```
 
-**Purpose**: Verifies that switching desired state to `Disabled` does not clear the in-memory current enrollment. The selected pairing server remains available for later re-enable or pairing operations.
+**Purpose**: Verifies that disabling remote control does not erase the selected enrollment. This matters because turning the feature off should not make the app forget which server it was paired with.
 
-**Data flow**: Creates a handle with an existing enrollment, sends `RemoteControlDesiredState::Disabled` through `desired_state_tx`, then locks `current_enrollment` and asserts it is still `Some(...)`.
+**Data flow**: The test creates a handle with a current enrollment, sends a Disabled desired state through the handle’s state channel, and then checks that current_enrollment is still present.
 
-**Call relations**: This is a state-retention regression test around desired-state transitions rather than HTTP behavior.
+**Call relations**: This test looks at local handle state only. It does not use a fake backend; it confirms that a state change to Disabled leaves the enrollment ready for later re-enabling.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1051,11 +1053,11 @@ async fn remote_control_handle_disable_keeps_current_enrollment()
 async fn remote_control_handle_reenrolls_after_stale_pairing_enrollment()
 ```
 
-**Purpose**: Ensures a stale persisted enrollment that causes pairing to return 404 is replaced by a fresh enrollment, persisted, and then used for a successful pairing retry. It validates stale-enrollment recovery plus persistence preservation.
+**Purpose**: Checks that the handle can recover when the saved enrollment is stale and the backend no longer recognizes it. In that case, it should enroll again, then start pairing with the new enrollment.
 
-**Data flow**: Creates a temp state DB and handle, persists a stale enrollment with `remote_control_enabled: Some(true)`, enables desired state, and runs a fake server that returns 404 to the first pair request, then succeeds on `/enroll`, then succeeds on a second pair request using the refreshed server token and refreshed IDs. The test asserts the returned pairing response uses the refreshed environment and that the persisted enrollment still records `remote_control_enabled == Some(true)`.
+**Data flow**: The test creates a temporary state database, saves the old enrollment as enabled, and makes the fake backend reject the first pairing request with 404. The backend then accepts a new enrollment request, returns a refreshed server token and new server/environment ids, and accepts a new pairing request. The test confirms the response uses the refreshed environment and that persistence still records remote control as enabled.
 
-**Call relations**: This top-level test covers the branch where pairing discovers the selected server no longer exists, triggers re-enrollment, updates persistence, and retries pairing with the new enrollment.
+**Call relations**: This is a broad recovery test spanning pairing, enrollment, and persisted state. A stale pairing failure leads the handle to re-enroll, then the new enrollment is used immediately for a successful pairing response.
 
 *Call graph*: 6 external calls (bind, new, default, assert_eq!, json!, spawn).
 
@@ -1066,11 +1068,11 @@ async fn remote_control_handle_reenrolls_after_stale_pairing_enrollment()
 async fn remote_control_handle_discards_pairing_response_after_auth_change()
 ```
 
-**Purpose**: Verifies that an in-flight pairing response is discarded if the authenticated account changes before the response is processed. This prevents stale pairing codes from crossing account boundaries.
+**Purpose**: Ensures an in-flight pairing response is thrown away if the logged-in account changes before the response arrives. This avoids showing or accepting a pairing code created under the wrong user account.
 
-**Data flow**: Creates a temp auth home and `AuthManager`, starts `start_pairing` in a spawned task, accepts the outgoing pairing request, rewrites auth on disk to a different account, calls `auth_manager.reload()`, then responds with otherwise valid pairing JSON. The test awaits the pairing task and asserts it fails with the specific unavailable-until-enrollment-completes message.
+**Data flow**: The test starts pairing, captures the outgoing request, then changes the saved auth account and reloads the auth manager before replying to the old request. Even though the fake backend returns a valid-looking pairing response, the pairing task finishes with an error saying pairing is unavailable until enrollment completes.
 
-**Call relations**: This test exercises a race-sensitive safety check in the handle path: auth changes during an outstanding request invalidate the response instead of accepting it.
+**Call relations**: This test combines an asynchronous pairing task, a fake backend, and an auth-manager reload. It proves the handle checks that the account context is still current before trusting a response from an earlier request.
 
 *Call graph*: calls 2 internal fn (default, shared); 6 external calls (bind, new, default, assert_eq!, json!, spawn).
 
@@ -1080,11 +1082,13 @@ These helper modules and focused tests define how plugin analytics captures are 
 
 ### `app-server-test-client/src/plugin_analytics_capture.rs`
 
-`util` · `post-run analytics validation in plugin smoke tests`
+`test` · `test execution`
 
-This module works with analytics capture files written as JSON Lines, where each line contains a payload with an `events` array. `read_events_for_remote_plugin` is the ingestion step: it reads the capture file if present, treats a missing file as an empty event stream, parses each nonblank line as JSON, extracts the `events` array, and filters down to events whose `event_params.plugin_id` matches the requested remote plugin ID. The result is a flat `Vec<Value>` of matching event objects across all lines.
+This file is a test helper for plugin analytics. Analytics events are written to a capture file as one JSON object per line. Each line contains a payload with an `events` list inside it. The code here reads that file, picks out only the events for one remote plugin, and then checks that the expected “plugin installed” event was recorded correctly.
 
-Validation is intentionally narrow. `PluginEventIdentity` carries the expected `plugin_id`, `plugin_name`, and `marketplace_name`. `validate_mutation_events` currently looks specifically for exactly one `codex_plugin_installed` event among the provided events; zero or multiple matches are treated as failures. It then delegates to `validate_event`, which checks the three identity fields with `require_string` and also enforces that several capability/metadata fields (`has_skills`, `mcp_server_count`, `connector_ids`, `product_client_id`) are present and non-null. The functions operate directly on `serde_json::Value` rather than typed structs, which keeps them resilient to partial payloads while still asserting the fields the smoke tests care about.
+This matters because analytics can silently become wrong: an event might be missing, duplicated, tied to the wrong plugin, or missing fields that downstream reporting expects. Without this helper, tests would need to repeat a lot of careful JSON checking, and mistakes in analytics capture could be harder to notice.
+
+The flow is simple. First, `read_events_for_remote_plugin` opens the capture file. If the file does not exist yet, it treats that as “no events yet” instead of an error. It parses each non-empty line as JSON and collects events whose `plugin_id` matches the remote plugin being tested. Then `validate_mutation_events` looks for exactly one `codex_plugin_installed` event. It uses `validate_event` and `require_string` to confirm that the plugin identity fields match and that several required analytics fields are present and not null. The small `PluginEventIdentity` struct is just a bundle of the expected plugin names and IDs used during validation.
 
 #### Function details
 
@@ -1097,11 +1101,11 @@ fn read_events_for_remote_plugin(
 ) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Reads a JSONL analytics capture file and returns only the events whose `event_params.plugin_id` matches the requested remote plugin.
+**Purpose**: Reads an analytics capture file and returns only the events that belong to one remote plugin. Tests use this to ignore unrelated analytics noise and focus on the plugin they just exercised.
 
-**Data flow**: Takes a file path and remote plugin ID, reads the file to string, returns an empty vector if the file is missing, otherwise iterates nonblank lines with line numbers, parses each line as `serde_json::Value`, extracts its `events` array, filters events where `event["event_params"]["plugin_id"] == remote_plugin_id`, clones those matching event values, and accumulates them into a `Vec<Value>`.
+**Data flow**: It receives a file path and the remote plugin ID to look for. It reads the file as text; if the file is missing, it returns an empty list. For each non-empty line, it parses the line as JSON, looks inside the line’s `events` array, keeps events whose `event_params.plugin_id` matches the requested plugin ID, and returns those matching JSON event objects.
 
-**Call relations**: Plugin analytics smoke flows call this after capture to isolate the subset of events relevant to one remote plugin before applying stricter validation.
+**Call relations**: This is called by `wait_for_remote_plugin_event`, which is likely waiting until the expected analytics output appears. After this function filters the raw capture file down to relevant events, later validation code can check whether the right event was actually produced.
 
 *Call graph*: called by 1 (wait_for_remote_plugin_event); 3 external calls (new, read_to_string, from_str).
 
@@ -1115,11 +1119,11 @@ fn validate_mutation_events(
 ) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Asserts that the provided event list contains exactly one plugin-install mutation event for the expected plugin identity and returns that validated event.
+**Purpose**: Checks that the collected events contain exactly one plugin installation analytics event, and that this event describes the expected plugin. This prevents tests from passing when the event is missing, duplicated, or attached to the wrong plugin.
 
-**Data flow**: Consumes a vector of event JSON values plus expected identity fields, filters the events to those whose `event_type` is `codex_plugin_installed`, errors unless exactly one match remains, validates that event with `validate_event`, and returns a one-element vector containing a clone of the validated event.
+**Data flow**: It receives a list of JSON events and a `PluginEventIdentity` containing the expected plugin ID, plugin name, and marketplace name. It filters the events to those whose `event_type` is `codex_plugin_installed`. If there is not exactly one such event, it returns an error. If there is exactly one, it validates the event’s contents and returns that single event in a new list.
 
-**Call relations**: Higher-level plugin mutation smoke tests use this after `read_events_for_remote_plugin` to enforce the expected install-event cardinality and metadata.
+**Call relations**: This function is the main checker after events have been read. It delegates the detailed field-by-field checks to `validate_event`; if the count is wrong, it stops immediately with a clear test failure message.
 
 *Call graph*: calls 1 internal fn (validate_event); 2 external calls (bail!, vec!).
 
@@ -1130,11 +1134,11 @@ fn validate_mutation_events(
 fn validate_event(event: &Value, expected: &PluginEventIdentity<'_>) -> Result<()>
 ```
 
-**Purpose**: Checks that one plugin analytics event has the expected identity fields and includes several required non-null capability metadata fields.
+**Purpose**: Checks the contents of one plugin installation event. It confirms that the event names the expected plugin and that required analytics fields are present.
 
-**Data flow**: Borrows an event JSON value and expected identity, reads `event["event_params"]`, verifies `plugin_id`, `plugin_name`, and `marketplace_name` via `require_string`, then iterates the required metadata field names and errors if any are missing or null. It returns unit on success.
+**Data flow**: It receives one JSON event and the expected plugin identity. It reads the event’s `event_params`, verifies the string fields `plugin_id`, `plugin_name`, and `marketplace_name`, then checks that fields like `has_skills`, `mcp_server_count`, `connector_ids`, and `product_client_id` exist and are not null. It returns success if all checks pass, or an error explaining the first problem found.
 
-**Call relations**: Called by `validate_mutation_events` once the candidate install event has been isolated.
+**Call relations**: `validate_mutation_events` calls this once it has found the single expected installation event. This function uses `require_string` for repeated string comparisons, and performs the remaining required-field checks itself.
 
 *Call graph*: calls 1 internal fn (require_string); called by 1 (validate_mutation_events); 1 external calls (bail!).
 
@@ -1145,24 +1149,26 @@ fn validate_event(event: &Value, expected: &PluginEventIdentity<'_>) -> Result<(
 fn require_string(params: &Value, field: &str, expected: &str) -> Result<()>
 ```
 
-**Purpose**: Validates that a named field inside an event-params object exists as a string and equals an expected value.
+**Purpose**: Verifies that a named JSON field is a string with an exact expected value. It is a small helper that keeps the event validation code clear and gives useful error messages when a field is wrong.
 
-**Data flow**: Looks up `params[field]`, converts it to `Option<&str>`, compares it to `expected`, and returns an error if the value is absent or different; otherwise returns `Ok(())`.
+**Data flow**: It receives a JSON object, the field name to inspect, and the expected string. It looks up that field, treats it as valid only if it is a string equal to the expected value, and returns success or an error showing what value was actually found.
 
-**Call relations**: This is the low-level field assertion helper used by `validate_event` for the identity fields.
+**Call relations**: `validate_event` calls this for each identity field that must match the plugin under test. It does not call other project helpers; it performs one focused comparison and reports failure when the JSON does not match expectations.
 
 *Call graph*: called by 1 (validate_event); 2 external calls (get, bail!).
 
 
 ### `app-server-test-client/src/plugin_analytics_capture_tests.rs`
 
-`test` · `unit test execution`
+`test` · `test run`
 
-This test module exercises the small plugin analytics validation layer in isolation. The main success test, `reads_and_validates_remote_plugin_mutation_events`, creates a unique temp-file path, writes two JSONL payloads containing `events` arrays—one for an unrelated plugin and one for the target plugin—and then verifies that `read_events_for_remote_plugin` filters down to the target plugin’s event and that `validate_mutation_events` accepts it. The test also removes the temporary file afterward.
+This is a test file for plugin analytics capture. The system writes analytics events as JSON lines, meaning each line is a separate JSON object. These tests create small fake capture files and fake event objects, then check that the reader and validator keep only the events for the plugin being tested and reject bad data.
 
-Two negative tests pin the validator’s stricter assumptions. `rejects_duplicate_mutation_events` passes two identical install events and asserts that validation fails with an error mentioning that two were found. `rejects_missing_capability_metadata` mutates the synthetic install event so `has_skills` is null and asserts that validation fails mentioning that field.
+The first test is like checking a mailbox: the capture file contains mail for two plugins, and the code should pick out only the envelope addressed to the target plugin. It writes a temporary file with one unrelated event and one matching event, reads back matching events with read_events_for_remote_plugin, and then asks validate_mutation_events to confirm the event has the expected identity and required fields.
 
-The helper constructors keep the tests concise and explicit. `mutation_event` builds a representative plugin analytics event with all required fields populated; `expected_identity` returns the matching `PluginEventIdentity`; and `unique_capture_path` creates a temp-file path using the current process ID and a nanosecond timestamp to avoid collisions across test runs.
+The next two tests focus on failure cases. One makes two identical install events and confirms validation complains about duplicates. The other removes a required capability field, has_skills, and confirms validation reports that missing metadata.
+
+The helper functions keep the tests readable. mutation_event builds a standard valid event, expected_identity describes the plugin the validator should expect, and unique_capture_path creates a temporary filename that should not collide with other test runs.
 
 #### Function details
 
@@ -1172,11 +1178,11 @@ The helper constructors keep the tests concise and explicit. `mutation_event` bu
 fn reads_and_validates_remote_plugin_mutation_events()
 ```
 
-**Purpose**: Verifies the end-to-end happy path of reading a JSONL capture file, filtering events by plugin ID, and validating the resulting install mutation event.
+**Purpose**: This test proves that the capture reader can find the right remote plugin event inside a file that also contains unrelated plugin events. It also proves that the matching event passes the mutation-event validation rules.
 
-**Data flow**: Builds a unique temp path, constructs one target install event and one unrelated event, serializes two JSON payload lines containing those events, writes them to disk, reads matching events with `read_events_for_remote_plugin`, validates them with `validate_mutation_events`, asserts the validated output equals the original target event, and removes the temp file.
+**Data flow**: It starts by creating a unique temporary path, one valid event for the target plugin, and one similar event for a different plugin. It writes both events into a JSON-lines capture file, reads back only events for the target plugin, validates them against the expected plugin identity, and checks that the single valid event comes out. At the end, it deletes the temporary file it created.
 
-**Call relations**: This test covers both helper functions together, proving that filtering and validation compose correctly on realistic capture-file input.
+**Call relations**: During the test, it uses mutation_event to build the valid sample event, unique_capture_path to avoid filename collisions, and expected_identity to describe what plugin the validator should accept. It then exercises the real reader, read_events_for_remote_plugin, followed by the real validator, validate_mutation_events, to check the full happy path.
 
 *Call graph*: calls 3 internal fn (expected_identity, mutation_event, unique_capture_path); 6 external calls (assert_eq!, remove_file, write, json!, read_events_for_remote_plugin, validate_mutation_events).
 
@@ -1187,11 +1193,11 @@ fn reads_and_validates_remote_plugin_mutation_events()
 fn rejects_duplicate_mutation_events()
 ```
 
-**Purpose**: Ensures validation fails when more than one install mutation event is present for the same plugin.
+**Purpose**: This test checks that validation fails when the same kind of plugin mutation event appears more than once. That matters because duplicate analytics events could make one install or update look like it happened multiple times.
 
-**Data flow**: Constructs two identical install events, passes them to `validate_mutation_events`, captures the expected error, and asserts that the error text mentions `found 2`.
+**Data flow**: It creates one valid install event, duplicates it into a two-item list, and sends that list into validate_mutation_events with the expected plugin identity. Instead of accepting the list, the validator should return an error, and the test checks that the error message mentions that two matching events were found.
 
-**Call relations**: This negative test targets the exact-one-event invariant enforced by `validate_mutation_events`.
+**Call relations**: The test relies on mutation_event for a realistic event shape and expected_identity for the plugin details that validation should compare against. It calls validate_mutation_events specifically to exercise the duplicate-detection branch.
 
 *Call graph*: calls 2 internal fn (expected_identity, mutation_event); 3 external calls (assert!, validate_mutation_events, vec!).
 
@@ -1202,11 +1208,11 @@ fn rejects_duplicate_mutation_events()
 fn rejects_missing_capability_metadata()
 ```
 
-**Purpose**: Ensures validation fails when a required capability metadata field is null or missing.
+**Purpose**: This test checks that validation rejects a plugin event when required capability information is missing. In this case, the missing field is has_skills, which tells whether the plugin includes skills.
 
-**Data flow**: Creates a synthetic install event, mutates `event_params.has_skills` to `Value::Null`, runs `validate_mutation_events`, captures the expected error, and asserts that the error mentions `has_skills`.
+**Data flow**: It creates a normal valid install event, then deliberately changes the has_skills field to null, meaning the value is absent or unusable. It sends that damaged event to validate_mutation_events with the expected identity, expects an error, and checks that the error message points to has_skills.
 
-**Call relations**: This test exercises the required-field checks performed by `validate_event`.
+**Call relations**: The test uses mutation_event to start from a valid baseline and expected_identity to provide the plugin identity being checked. It then calls validate_mutation_events to confirm that the validator catches missing metadata rather than silently accepting it.
 
 *Call graph*: calls 2 internal fn (expected_identity, mutation_event); 3 external calls (assert!, validate_mutation_events, vec!).
 
@@ -1217,11 +1223,11 @@ fn rejects_missing_capability_metadata()
 fn mutation_event(event_type: &str) -> Value
 ```
 
-**Purpose**: Constructs a representative plugin analytics event JSON object with the standard identity and capability metadata fields populated.
+**Purpose**: This helper builds a standard fake plugin analytics event for the tests. It lets each test focus on what it wants to change, instead of repeating the full JSON structure every time.
 
-**Data flow**: Accepts an `event_type` string and returns a `serde_json::Value` object containing that event type plus `event_params` with the fixed remote plugin ID, plugin name, marketplace name, and required metadata fields.
+**Data flow**: It takes an event type string, such as codex_plugin_installed, and places it into a JSON object with event_params for the test plugin. The returned JSON value includes the plugin ID, plugin name, marketplace name, capability fields, connector list, server count, and client ID.
 
-**Call relations**: All three tests use this helper to create baseline event payloads before optional mutation.
+**Call relations**: The three tests call this helper whenever they need a realistic plugin event. Some tests use the event unchanged, while others duplicate it or damage one field to check that validation catches the problem.
 
 *Call graph*: called by 3 (reads_and_validates_remote_plugin_mutation_events, rejects_duplicate_mutation_events, rejects_missing_capability_metadata); 1 external calls (json!).
 
@@ -1232,11 +1238,11 @@ fn mutation_event(event_type: &str) -> Value
 fn expected_identity() -> PluginEventIdentity<'static>
 ```
 
-**Purpose**: Returns the expected plugin identity tuple used by validation assertions in this test module.
+**Purpose**: This helper returns the plugin identity that test events are supposed to match. It keeps the expected plugin ID, plugin name, and marketplace name in one place.
 
-**Data flow**: Constructs and returns a `PluginEventIdentity<'static>` with the fixed remote plugin ID, plugin name, and marketplace name constants used by the synthetic events.
+**Data flow**: It takes no input and returns a PluginEventIdentity containing the constant remote plugin ID plus the sample plugin name and marketplace name used by the fake events.
 
-**Call relations**: Each test passes this helper’s output into `validate_mutation_events` so the expected identity stays centralized.
+**Call relations**: Each validation test calls this helper before calling validate_mutation_events. The validator uses this expected identity as the standard for deciding whether an event belongs to the right plugin.
 
 *Call graph*: called by 3 (reads_and_validates_remote_plugin_mutation_events, rejects_duplicate_mutation_events, rejects_missing_capability_metadata).
 
@@ -1247,24 +1253,26 @@ fn expected_identity() -> PluginEventIdentity<'static>
 fn unique_capture_path(name: &str) -> PathBuf
 ```
 
-**Purpose**: Builds a collision-resistant temporary JSONL file path for analytics capture tests.
+**Purpose**: This helper creates a temporary capture-file path that is very unlikely to conflict with another test. That is important because tests may run more than once or in parallel.
 
-**Data flow**: Reads the current system time since the Unix epoch in nanoseconds, gets the current process ID, formats both plus the supplied name into a filename, joins it under the system temp directory, and returns the resulting `PathBuf`.
+**Data flow**: It takes a short name label, reads the current time and the current process ID, and combines them with the system temporary directory into a filename ending in .jsonl. The result is a PathBuf, which is Rust's owned path type.
 
-**Call relations**: The happy-path file-reading test uses this to avoid temp-file name collisions across runs.
+**Call relations**: The file-reading test calls this helper before writing its fake capture file. The path it returns is then passed to the file writer, the capture reader, and finally file removal after the test finishes.
 
 *Call graph*: called by 1 (reads_and_validates_remote_plugin_mutation_events); 3 external calls (now, format!, temp_dir).
 
 
 ### `app-server-test-client/src/loopback_responses_server.rs`
 
-`io_transport` · `test harness startup and local HTTP request handling`
+`test` · `test startup, request handling, teardown`
 
-This file provides a self-contained fake Responses API endpoint. `LoopbackResponsesServer::start` binds an ephemeral localhost TCP listener, switches it to nonblocking mode, and spawns a background thread that repeatedly accepts connections until an `AtomicBool` shutdown flag is set. Accepted sockets are handled synchronously by `handle_model_connection`; transient `WouldBlock` errors simply sleep for 10 ms and retry, while other accept failures are logged and terminate the thread.
+This file is a test helper. It starts a small web server on the computer’s own loopback address, 127.0.0.1, which means “talk to myself.” That is useful because tests can exercise the real HTTP path while staying fast, private, and predictable.
 
-The request handler is intentionally minimal. It switches the accepted `TcpStream` back to blocking mode, applies a 2-second read timeout, reads the full HTTP request bytes with `read_http_request`, extracts the first request line, and checks for `POST ... /responses ...`. Matching requests receive a `200 OK` response with `Content-Type: text/event-stream` and a fixed SSE body containing `response.created` and `response.completed` events for a synthetic response ID. Any other path or method gets a JSON `404 Not Found` body.
+The server binds to an available random port, records its base URL, and runs in a background thread. Think of it like a temporary clerk at a service window: while the test runs, the clerk waits for requests; when the test ends, the clerk is told to close the window and the thread is joined so it does not keep running.
 
-`read_http_request` reads until `\r\n\r\n`, parses `Content-Length` from headers via `parse_content_length`, and then continues reading until the declared body length is satisfied or EOF occurs. `write_http_response` emits a complete HTTP/1.1 response with content length and closes the connection. Dropping the server flips the shutdown flag and joins the background thread.
+For each incoming connection, the server reads a basic HTTP request. If the first line is a POST request to a path containing `/responses`, it sends back a successful streaming-style response with two events: one saying a response was created, and one saying it completed with zero token usage. If the request is for anything else, it returns a simple 404 “not found” JSON message.
+
+This is intentionally small and limited. It is not a general web server. It only implements enough HTTP behavior for the test client to verify its integration with a Responses API-like endpoint.
 
 #### Function details
 
@@ -1274,11 +1282,11 @@ The request handler is intentionally minimal. It switches the accepted `TcpStrea
 fn start() -> Result<Self>
 ```
 
-**Purpose**: Starts the loopback HTTP server on an ephemeral localhost port and spawns the accept loop in a background thread.
+**Purpose**: Starts the temporary local Responses API server and returns an object that represents it. Tests use this when they need a real URL to send HTTP requests to, without contacting the real external API.
 
-**Data flow**: Binds `TcpListener` to `127.0.0.1:0`, enables nonblocking mode, captures the chosen local address, creates an `Arc<AtomicBool>` shutdown flag, clones it into the thread, and spawns a loop that accepts connections until shutdown is set. It returns `LoopbackResponsesServer` containing the formatted `base_url`, shutdown flag, and join handle.
+**Data flow**: It begins with no server running. It opens a TCP listener on 127.0.0.1 using a random free port, marks it as nonblocking so the background thread can regularly check for shutdown, creates a shared shutdown flag, and starts a thread that accepts connections. It returns a `LoopbackResponsesServer` containing the server’s base URL, the shutdown flag, and the thread handle.
 
-**Call relations**: Other test harness code calls this to obtain a temporary fake Responses API endpoint; the spawned thread delegates each accepted socket to `handle_model_connection`.
+**Call relations**: The broader test run calls this from `run` when it needs the fake Responses API. After startup, the background thread accepts client connections and routes each accepted connection into the request-processing path.
 
 *Call graph*: called by 1 (run); 6 external calls (clone, new, new, bind, format!, spawn).
 
@@ -1289,11 +1297,11 @@ fn start() -> Result<Self>
 fn base_url(&self) -> &str
 ```
 
-**Purpose**: Returns the server’s base HTTP URL string for clients to target.
+**Purpose**: Gives callers the URL of the temporary local server. Tests use this URL as if it were the real Responses API endpoint.
 
-**Data flow**: Borrows `self.base_url` and returns it as `&str` without allocation or mutation.
+**Data flow**: It reads the stored `base_url` string from the server object and returns it as borrowed text. Nothing is changed.
 
-**Call relations**: Callers use this after `start` to configure clients against the loopback server.
+**Call relations**: After `LoopbackResponsesServer::start` creates the server, callers can ask this function for the address to configure their client. It is the handoff point between the test server setup and the code being tested.
 
 
 ##### `LoopbackResponsesServer::drop`  (lines 62–67)
@@ -1302,11 +1310,11 @@ fn base_url(&self) -> &str
 fn drop(&mut self)
 ```
 
-**Purpose**: Stops the background accept loop and waits for the server thread to exit.
+**Purpose**: Shuts down the temporary server when the server object goes away. This prevents background test threads from being left behind.
 
-**Data flow**: Sets the shared shutdown flag to `true` with relaxed ordering, takes the optional join handle, and joins the thread if present. It ignores join errors.
+**Data flow**: It changes the shared shutdown flag from false to true. If there is still a background thread stored in the object, it takes ownership of that thread handle and waits for the thread to finish. It does not return a useful value.
 
-**Call relations**: This destructor runs automatically when the loopback server wrapper goes out of scope.
+**Call relations**: Rust calls this automatically when the `LoopbackResponsesServer` value is dropped. It pairs with `LoopbackResponsesServer::start`: start opens the service window, and drop closes it cleanly.
 
 
 ##### `handle_model_connection`  (lines 70–95)
@@ -1315,11 +1323,11 @@ fn drop(&mut self)
 fn handle_model_connection(mut stream: TcpStream) -> io::Result<()>
 ```
 
-**Purpose**: Processes one accepted TCP connection, recognizes the `/responses` POST endpoint, and writes either a canned SSE success response or a 404 JSON error.
+**Purpose**: Processes one client connection to the fake Responses API. It decides whether the request looks like a supported Responses API call and writes the matching HTTP reply.
 
-**Data flow**: Takes ownership of a `TcpStream`, switches it to blocking mode, sets a 2-second read timeout, reads the full request bytes with `read_http_request`, extracts the first request line, and checks whether it starts with `POST ` and contains `/responses `. On match it writes a `200 OK` text/event-stream response containing fixed `response.created` and `response.completed` events; otherwise it writes a `404 Not Found` JSON body.
+**Data flow**: It receives a TCP stream, makes it blocking for simpler reading, and sets a two-second read timeout so it will not wait forever. It reads the HTTP request, inspects the first request line, and then writes either a successful event-stream response for `POST /responses`-style requests or a 404 JSON response for anything else.
 
-**Call relations**: The background accept loop in `LoopbackResponsesServer::start` calls this for each accepted connection.
+**Call relations**: The server thread created by `LoopbackResponsesServer::start` calls this whenever it accepts a connection. This function relies on `read_http_request` to gather the incoming request and on `write_http_response` to send the final reply.
 
 *Call graph*: calls 2 internal fn (read_http_request, write_http_response); 4 external calls (from_secs, set_nonblocking, set_read_timeout, concat!).
 
@@ -1330,11 +1338,11 @@ fn handle_model_connection(mut stream: TcpStream) -> io::Result<()>
 fn read_http_request(stream: &mut TcpStream) -> io::Result<Vec<u8>>
 ```
 
-**Purpose**: Reads an HTTP request from a TCP stream, including the body when a `Content-Length` header is present.
+**Purpose**: Reads a complete enough HTTP request from a TCP connection for this test server to understand it. It collects the headers first, then reads the body if a content length says one is present.
 
-**Data flow**: Reads chunks into a temporary 4096-byte buffer, appending them to a `Vec<u8>` until it finds the header terminator `\r\n\r\n` or EOF. It then parses the content length from the header bytes with `parse_content_length` and continues reading until the accumulated request length reaches header end plus body length or the peer closes the stream. It returns the collected request bytes.
+**Data flow**: It starts with an empty byte buffer and repeatedly reads from the stream. Once it finds the blank line that ends the HTTP headers, it asks `parse_content_length` how many body bytes to expect. It then keeps reading until it has that many body bytes or the connection closes, and returns the collected request bytes.
 
-**Call relations**: Called by `handle_model_connection` before request-line inspection.
+**Call relations**: `handle_model_connection` calls this before it can decide what response to send. This function hands off header parsing to `parse_content_length`, keeping the connection-reading logic separate from the header interpretation.
 
 *Call graph*: calls 1 internal fn (parse_content_length); called by 1 (handle_model_connection); 2 external calls (read, new).
 
@@ -1345,11 +1353,11 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<Vec<u8>>
 fn parse_content_length(headers: &[u8]) -> usize
 ```
 
-**Purpose**: Extracts the numeric `Content-Length` header value from raw HTTP header bytes, defaulting to zero when absent or invalid.
+**Purpose**: Finds the HTTP `Content-Length` header and turns it into a number of bytes to read. If the header is missing or invalid, it treats the body length as zero.
 
-**Data flow**: Decodes the header bytes lossily to UTF-8, iterates lines, splits each on the first `:`, performs a case-insensitive name check for `content-length`, trims and parses the value as `usize`, and returns the first successful parse or `0`.
+**Data flow**: It receives raw header bytes, converts them into readable text in a forgiving way, scans each header line, and looks for a name matching `content-length` without caring about letter case. If it finds a valid number, it returns that number; otherwise it returns 0.
 
-**Call relations**: Used only by `read_http_request` to know how many body bytes to continue reading.
+**Call relations**: `read_http_request` calls this after it has read the HTTP headers. The result tells `read_http_request` whether it should wait for more bytes belonging to the request body.
 
 *Call graph*: called by 1 (read_http_request); 1 external calls (from_utf8_lossy).
 
@@ -1365,11 +1373,11 @@ fn write_http_response(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Writes a complete HTTP/1.1 response with status line, content type, content length, connection-close header, and body.
+**Purpose**: Writes a simple HTTP response to a TCP connection. It is used for both the successful fake streaming response and the 404 error response.
 
-**Data flow**: Formats the response headers and body directly into the stream with `write!`, using `body.len()` for `Content-Length`, then flushes the stream. It returns any I/O error from writing or flushing.
+**Data flow**: It receives the stream, a status such as `200 OK`, a content type such as `text/event-stream`, and the response body text. It formats these into an HTTP response with a content length and `Connection: close`, writes it to the stream, flushes the stream so the bytes are sent, and returns whether that succeeded.
 
-**Call relations**: `handle_model_connection` uses this helper for both the canned SSE success path and the 404 error path.
+**Call relations**: `handle_model_connection` calls this after deciding what kind of reply the request deserves. This function is the final step that turns the server’s decision into bytes sent back to the test client.
 
 *Call graph*: called by 1 (handle_model_connection); 2 external calls (flush, write!).
 
@@ -1379,13 +1387,15 @@ This sequence introduces the reusable test-client harness and then applies it to
 
 ### `app-server-test-client/src/lib.rs`
 
-`orchestration` · `CLI dispatch, integration-test execution, request handling, and spawned-process cleanup`
+`entrypoint` · `startup and command execution for app-server test runs`
 
-This file is the operational core of the test client binary. At the top, Clap models a large command surface (`Cli`, `CliCommand`) covering basic messaging, v2 thread/turn flows, approval scenarios, login, model/thread listing, elicitation pause controls, and plugin analytics smoke tests. `run` parses CLI arguments, decodes optional dynamic tool specs from inline JSON or `@file`, validates incompatible flag combinations, resolves either a spawned-stdio endpoint or shared websocket endpoint, and dispatches to the appropriate scenario function.
+Think of this file as a remote control and inspection window for the Codex app-server. The app-server speaks JSON-RPC, which is a simple request-and-response message format using JSON. This client lets developers exercise that protocol without needing the real UI.
 
-Transport and protocol handling live in `CodexClient`. It abstracts either a child-process stdio connection or a tungstenite websocket, generates UUID request IDs, serializes `ClientRequest` values into JSON-RPC, injects W3C trace context into outgoing requests, and reads inbound `JSONRPCMessage`s. Responses are matched by request ID; notifications are queued; server-initiated approval requests are handled synchronously by auto-accepting file changes and conditionally accepting/canceling command approvals based on `CommandApprovalBehavior`.
+At startup, it reads command-line options, decides whether to spawn `codex app-server` as a child process or connect to an already running WebSocket server, and then runs one chosen test command. Some commands send a single message. Others resume a thread, list models, test account login, trigger command or file-change approval prompts, or keep watching every server event.
 
-Higher-level scenario helpers (`send_message_v2_with_policies`, `resume_message_v2`, `send_follow_up_v2`, `test_login`, `live_elicitation_timeout_pause`, etc.) all run inside `with_client`, which initializes OTEL tracing, opens a command span, connects a client, executes the scenario closure, and prints a trace summary. `stream_turn` is the main event loop for turn execution: it prints deltas, tracks command execution statuses and aggregated output, detects whether helper-script completion markers were seen, records unexpected items that start before helper completion, and captures final turn status/error. The file also includes process-management helpers (`BackgroundAppServer`, `serve`, graceful `Drop` implementations), shell quoting and port-killing utilities, and tracing bootstrap via `TestClientTracing`.
+The central piece is `CodexClient`. It knows how to write JSON-RPC messages, read responses, save notifications that arrive early, and answer approval requests from the server. It also records useful facts while streaming a turn, such as command execution status and whether a helper script finished before the turn ended.
+
+The file also includes server-launch helpers, dynamic tool parsing, basic shell quoting, and OpenTelemetry tracing setup. Without this file, end-to-end app-server behavior would be much harder to test from scripts or CI because there would be no small, purpose-built client that drives the same protocol paths a real app uses.
 
 #### Function details
 
@@ -1395,11 +1405,11 @@ Higher-level scenario helpers (`send_message_v2_with_policies`, `resume_message_
 async fn run() -> Result<()>
 ```
 
-**Purpose**: Parses CLI arguments, validates cross-option constraints, resolves the target app-server endpoint, and dispatches to the selected integration scenario.
+**Purpose**: This is the top-level driver for the test client. It reads the command-line arguments, checks which options are allowed for the chosen command, chooses a server endpoint, and starts the requested test action.
 
-**Data flow**: Reads command-line state through `Cli::parse`, parses optional dynamic tool JSON into `Option<Vec<DynamicToolSpec>>`, then matches every `CliCommand` variant to build endpoint/config inputs and invoke the corresponding async or sync helper. It returns the selected command’s `Result<()>` and may reject invalid combinations such as unsupported dynamic tools or mutually exclusive endpoint flags.
+**Data flow**: It takes no direct arguments; it reads CLI flags such as `--codex-bin`, `--url`, config overrides, dynamic tools, and a subcommand. It turns those into an endpoint and command-specific inputs, then returns success or an error after the selected operation finishes.
 
-**Call relations**: This is the top-level library entrypoint invoked by `main`. It orchestrates all other scenario helpers and plugin smoke modules based on the chosen subcommand.
+**Call relations**: This is the hub that sends control to helpers such as `serve`, `send_message`, `model_list`, approval tests, login tests, elicitation tests, and plugin analytics modules. Before doing so, it uses `parse_dynamic_tools_arg`, `ensure_dynamic_tools_unused`, `resolve_endpoint`, or `resolve_shared_websocket_url` to make sure each command is set up safely.
 
 *Call graph*: calls 26 internal fn (ensure_dynamic_tools_unused, get_account_rate_limits, live_elicitation_timeout_pause, model_list, no_trigger_cmd_approval, parse_dynamic_tools_arg, from_flag, run, run_cleanup, run (+15 more)); 2 external calls (parse, bail!).
 
@@ -1410,11 +1420,11 @@ async fn run() -> Result<()>
 fn resolve_endpoint(codex_bin: Option<PathBuf>, url: Option<String>) -> Result<Endpoint>
 ```
 
-**Purpose**: Chooses whether the client should spawn a private stdio app-server or connect to an existing websocket server.
+**Purpose**: This decides how the client should reach the app-server. It enforces that the user cannot ask to both spawn a private server and connect to an existing one.
 
-**Data flow**: Consumes optional `codex_bin` and `url` inputs, errors if both are present, otherwise returns `Endpoint::SpawnCodex`, `Endpoint::ConnectWs(url)`, or a default websocket endpoint at `ws://127.0.0.1:4222`. No external state is mutated.
+**Data flow**: It receives an optional Codex binary path and an optional WebSocket URL. It returns either a `SpawnCodex` endpoint, a `ConnectWs` endpoint, or the default local WebSocket URL if neither was provided.
 
-**Call relations**: Most command branches in `run` call this before invoking a scenario helper that can operate over either transport.
+**Call relations**: `run` calls this before most commands. The returned endpoint is later passed into client-driving helpers, which use it to create a `CodexClient`.
 
 *Call graph*: called by 1 (run); 3 external calls (ConnectWs, SpawnCodex, bail!).
 
@@ -1429,11 +1439,11 @@ fn resolve_shared_websocket_url(
 ) -> Result<String>
 ```
 
-**Purpose**: Enforces that certain commands operate only against a shared websocket server rather than a private spawned stdio server.
+**Purpose**: This picks a WebSocket URL for commands that must talk to a shared, already-running app-server. It refuses `--codex-bin` because spawning a private standard-input server would not be visible to helper processes.
 
-**Data flow**: Checks whether `codex_bin` was supplied and bails with a command-specific message if so; otherwise returns the provided URL or the default websocket URL string. It performs no network I/O itself.
+**Data flow**: It receives the optional binary path, optional URL, and command name. It returns the given URL or the default local URL, unless a binary path was supplied, in which case it returns an error.
 
-**Call relations**: `run` uses this for elicitation increment/decrement commands that must target an already-running shared server.
+**Call relations**: `run` uses this for elicitation counter commands. Those commands need a stable WebSocket server that multiple processes can contact.
 
 *Call graph*: called by 1 (run); 1 external calls (bail!).
 
@@ -1444,11 +1454,11 @@ fn resolve_shared_websocket_url(
 fn spawn(codex_bin: &Path, config_overrides: &[String]) -> Result<Self>
 ```
 
-**Purpose**: Starts `codex app-server` as a background websocket server on an ephemeral local port and records the resulting URL and child process.
+**Purpose**: This starts a temporary WebSocket app-server in the background for a live test. It chooses an unused local port automatically so the test does not collide with common ports.
 
-**Data flow**: Binds a temporary `TcpListener` to `127.0.0.1:0` to reserve a free port, derives a websocket URL from the chosen address, builds a `Command` for the `codex` binary, prepends the binary’s parent directory to `PATH`, forwards config overrides as repeated `--config` args, and spawns `codex app-server --listen <url>` with null stdin/stdout and inherited stderr. It returns `BackgroundAppServer { process, url }`.
+**Data flow**: It receives the Codex binary path and config overrides. It reserves a local port, starts `codex app-server --listen <url>`, and returns a `BackgroundAppServer` containing the child process and its URL.
 
-**Call relations**: The live elicitation timeout harness uses this when the caller supplies `--codex-bin` instead of an existing websocket URL.
+**Call relations**: `live_elicitation_timeout_pause` calls this when it needs its own short-lived WebSocket server. The returned object later cleans up the process through its drop behavior.
 
 *Call graph*: called by 1 (live_elicitation_timeout_pause); 8 external calls (from, parent, inherit, null, bind, new, format!, var_os).
 
@@ -1459,11 +1469,11 @@ fn spawn(codex_bin: &Path, config_overrides: &[String]) -> Result<Self>
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures a background app-server child process is terminated when the wrapper is dropped.
+**Purpose**: This is the cleanup safety net for a temporary background app-server. It prevents the spawned server from being left running after the test ends.
 
-**Data flow**: Checks whether the child has already exited via `try_wait`; if so, it prints the exit status. Otherwise it sends `kill`, waits for process termination, and ignores cleanup errors.
+**Data flow**: When the `BackgroundAppServer` value is discarded, it checks whether the child process has already exited. If not, it kills it and waits for it to finish.
 
-**Call relations**: This destructor runs automatically after `live_elicitation_timeout_pause` or any other future owner drops the background server wrapper.
+**Call relations**: It is called automatically by Rust when the background server object goes out of scope, especially after `live_elicitation_timeout_pause` completes or fails.
 
 *Call graph*: 4 external calls (kill, try_wait, wait, println!).
 
@@ -1474,11 +1484,11 @@ fn drop(&mut self)
 fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool) -> Result<()>
 ```
 
-**Purpose**: Launches `codex app-server` detached under `nohup`, optionally killing any existing listener on the same port, and writes logs to a fixed temp directory.
+**Purpose**: This starts `codex app-server` as a long-running WebSocket service for manual or scripted testing. It writes logs to a known temporary directory.
 
-**Data flow**: Creates `/tmp/codex-app-server-test-client`, optionally calls `kill_listeners_on_same_port`, opens/duplicates an append-only log file, constructs a shell command line with `RUST_BACKTRACE`, `RUST_LOG`, config overrides, and `app-server --listen`, then spawns `nohup sh -c <cmdline>` with stdout/stderr redirected to the log. It prints the listen URL, launcher PID, and log path.
+**Data flow**: It receives a Codex binary path, config overrides, a listen URL, and a flag saying whether to kill existing listeners on the same port. It builds a shell command, starts it under `nohup`, and prints the listen address, launcher process id, and log path.
 
-**Call relations**: The `serve` subcommand in `run` delegates here to create a long-lived websocket app-server outside the current process.
+**Call relations**: `run` calls this for the `serve` subcommand. If requested, it first calls `kill_listeners_on_same_port`; it also uses `shell_quote` while building the shell command.
 
 *Call graph*: calls 1 internal fn (kill_listeners_on_same_port); called by 1 (run); 8 external calls (new, from, from, null, new, format!, create_dir_all, println!).
 
@@ -1489,11 +1499,11 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
 fn kill_listeners_on_same_port(listen: &str) -> Result<()>
 ```
 
-**Purpose**: Best-effort kills any processes currently listening on the same TCP port as the requested websocket listen URL.
+**Purpose**: This clears the port that `serve` wants to use. It is a convenience for test setups where an old app-server may still be listening.
 
-**Data flow**: Parses the listen URL, extracts its port, runs `lsof -tiTCP:<port> -sTCP:LISTEN`, parses stdout lines into PIDs, sends `kill` (SIGTERM) to each, sleeps briefly, reruns `lsof`, and sends `kill -9` to any remaining listeners. It returns success even when `lsof` reports no listeners.
+**Data flow**: It receives a listen URL, extracts its port, asks `lsof` which processes are listening there, sends them a normal termination signal, waits briefly, and force-kills any that remain.
 
-**Call relations**: `serve` calls this only when the `--kill` flag is set, to clear port conflicts before launching a detached server.
+**Call relations**: `serve` calls this only when the user passes the kill option. It relies on external system tools, so it is mainly suited to Unix-like development environments.
 
 *Call graph*: called by 1 (serve); 7 external calls (from_millis, from_utf8_lossy, parse, new, format!, println!, sleep).
 
@@ -1504,11 +1514,11 @@ fn kill_listeners_on_same_port(listen: &str) -> Result<()>
 fn shell_quote(input: &str) -> String
 ```
 
-**Purpose**: Produces a single-quoted shell-safe representation of a string for embedding in generated shell command lines.
+**Purpose**: This makes a string safe to place inside a single-quoted shell command. It prevents paths or config values containing quotes from breaking the generated command line.
 
-**Data flow**: Takes an input string, replaces embedded single quotes with the standard shell escape sequence, wraps the result in outer single quotes, and returns the new `String`.
+**Data flow**: It receives plain text and returns the same text wrapped in single quotes, with any internal single quotes escaped in shell syntax.
 
-**Call relations**: Used when constructing shell command lines for detached server launch and the live elicitation helper command.
+**Call relations**: It is used when constructing shell commands in `serve` and `live_elicitation_timeout_pause`, where user-provided paths or URLs must be passed through `sh`.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1523,11 +1533,11 @@ async fn send_message(
 ) -> Result<()>
 ```
 
-**Purpose**: Implements the legacy/simple send-message flow by forwarding to the v2 turn path with default non-experimental, no-approval policies.
+**Purpose**: This sends a basic user message through the newer thread-and-turn flow, but with no experimental options or special policies. It is the simple “ask Codex something” path.
 
-**Data flow**: Receives endpoint, config overrides, and a user message, constructs a `SendMessagePolicies` value with no approval or sandbox overrides and no dynamic tools, and awaits `send_message_v2_with_policies`. It returns that result.
+**Data flow**: It receives an endpoint, config overrides, and user text. It creates a default policy bundle and hands everything to `send_message_v2_with_policies`, then returns that result.
 
-**Call relations**: The `SendMessage` CLI branch uses this as a compatibility wrapper over the shared v2 messaging machinery.
+**Call relations**: `run` calls this for the `send-message` command. It delegates almost all real work to the shared V2 message helper.
 
 *Call graph*: calls 1 internal fn (send_message_v2_with_policies); called by 1 (run).
 
@@ -1543,11 +1553,11 @@ async fn send_message_v2(
 ) -> Result<()>
 ```
 
-**Purpose**: Convenience API for library callers that want to send a v2 message by spawning a specific `codex` binary over stdio.
+**Purpose**: This public helper sends a V2 message by spawning a Codex app-server from a binary path. It exists so other code can reuse the V2 sending behavior without going through the CLI parser.
 
-**Data flow**: Wraps the provided binary path in `Endpoint::SpawnCodex`, forwards config overrides, message text, and dynamic tools to `send_message_v2_endpoint` with `experimental_api` forced to `true`, and returns the async result.
+**Data flow**: It receives a binary path, config overrides, user text, and optional dynamic tool definitions. It wraps the path in a spawn endpoint and forwards the request with experimental API support enabled.
 
-**Call relations**: This is a library-facing helper layered on top of the more general endpoint-based send path.
+**Call relations**: It calls `send_message_v2_endpoint`, which performs validation and then uses the shared message-sending path.
 
 *Call graph*: calls 1 internal fn (send_message_v2_endpoint); 2 external calls (to_path_buf, SpawnCodex).
 
@@ -1564,11 +1574,11 @@ async fn send_message_v2_endpoint(
 ) -
 ```
 
-**Purpose**: Starts a v2 message turn against an arbitrary endpoint, enforcing that dynamic tools require experimental API support.
+**Purpose**: This sends a V2 message to an already chosen endpoint. It also protects users from using dynamic tools unless the experimental API flag is enabled.
 
-**Data flow**: Checks whether `dynamic_tools` is present while `experimental_api` is false and bails if so. Otherwise it builds `SendMessagePolicies` for the `send-message-v2` command and forwards everything to `send_message_v2_with_policies`.
+**Data flow**: It receives the endpoint, config overrides, user text, an experimental flag, and optional dynamic tools. It either rejects an invalid dynamic-tool setup or builds normal send policies and forwards the work.
 
-**Call relations**: Called from both the CLI dispatcher and the binary-path convenience wrapper; it centralizes the dynamic-tools gating rule.
+**Call relations**: `run` calls this for `send-message-v2`, and `send_message_v2` calls it for library-style use. It delegates to `send_message_v2_with_policies`.
 
 *Call graph*: calls 1 internal fn (send_message_v2_with_policies); called by 2 (run, send_message_v2); 1 external calls (bail!).
 
@@ -1585,11 +1595,11 @@ async fn trigger_zsh_fork_multi_cmd_approval(
     dyn
 ```
 
-**Purpose**: Runs a specialized approval scenario that expects multiple command-approval callbacks for one shell command item and optionally cancels a chosen approval index.
+**Purpose**: This runs a test designed to make one shell command require multiple approval callbacks. It verifies that accepting or cancelling those approvals produces the expected command and turn outcome.
 
-**Data flow**: Validates `abort_on >= 1` when present, chooses a default prompt if none was supplied, then uses `with_client` to initialize a client, start a thread, configure command approval behavior and tracking fields, start a turn with `AskForApproval::OnRequest` and read-only sandboxing, stream the turn, and finally assert approval-count and completion-status expectations. It returns an error if the observed approvals or statuses do not match the requested scenario.
+**Data flow**: It receives endpoint details, a prompt, the minimum expected approval count, an optional approval index to cancel, and dynamic tools. It starts a thread, starts a turn with read-only sandboxing and approval-on-request, streams the turn, counts approvals, checks final statuses, and returns an error if expectations are not met.
 
-**Call relations**: This command-specific harness is invoked from `run` and relies on `CodexClient::stream_turn` plus approval-request handling to observe repeated approval callbacks.
+**Call relations**: `run` calls this for the zsh multi-command approval test. Inside `with_client`, it uses `CodexClient` methods for initialize, thread start, turn start, and turn streaming.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run); 1 external calls (bail!).
 
@@ -1606,11 +1616,11 @@ async fn resume_message_v2(
 ) -> Result<()>
 ```
 
-**Purpose**: Resumes an existing thread by ID and sends a new v2 user message into it.
+**Purpose**: This resumes an existing V2 thread and sends a new message into it. It is useful for testing conversation continuity.
 
-**Data flow**: Rejects dynamic tools for this command, then inside `with_client` initializes the server, sends `thread/resume`, constructs a `TurnStartParams` with one text input, starts the turn, and streams notifications until that turn completes. It returns success when the resumed turn finishes without transport/protocol errors.
+**Data flow**: It receives endpoint details, config overrides, a thread id, user text, and dynamic-tool input. It rejects dynamic tools for this command, connects a client, initializes, resumes the thread, starts a new turn, streams it, and returns the final result.
 
-**Call relations**: The `ResumeMessageV2` CLI branch dispatches here; it composes `thread_resume`, `turn_start`, and `stream_turn` into one flow.
+**Call relations**: `run` calls this for `resume-message-v2`. It uses `ensure_dynamic_tools_unused` first, then runs the protocol steps inside `with_client`.
 
 *Call graph*: calls 2 internal fn (ensure_dynamic_tools_unused, with_client); called by 1 (run).
 
@@ -1625,11 +1635,11 @@ async fn thread_resume_follow(
 ) -> Result<()>
 ```
 
-**Purpose**: Resumes an existing thread and then continuously prints inbound notifications without auto-exiting.
+**Purpose**: This resumes an existing thread and then keeps printing server notifications forever. It is a live follow mode for watching what the server emits.
 
-**Data flow**: Within `with_client`, it initializes the connection, sends `thread/resume`, prints the response, and enters `stream_notifications_forever`, which loops until interrupted or an error occurs. It returns only on failure or process termination.
+**Data flow**: It receives endpoint details, config overrides, and a thread id. It initializes, resumes the thread, prints the resume response, and then continuously reads notifications until the process is stopped.
 
-**Call relations**: Used by the `ThreadResume` CLI command as a long-running watcher for an existing thread.
+**Call relations**: `run` calls this for `thread-resume`. It uses `with_client`, then relies on `CodexClient::stream_notifications_forever`.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1640,11 +1650,11 @@ async fn thread_resume_follow(
 async fn watch(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()>
 ```
 
-**Purpose**: Initializes the app-server connection and then continuously dumps inbound notifications/events.
+**Purpose**: This connects to the app-server, initializes the protocol, and dumps incoming messages indefinitely. It is a general-purpose observation command.
 
-**Data flow**: Uses `with_client` to initialize the server, print the handshake response, and call `stream_notifications_forever`. It does not send any thread or turn requests.
+**Data flow**: It receives endpoint details and config overrides. It creates a client, performs the initialize handshake, then reads and prints notifications until interrupted.
 
-**Call relations**: This powers the `Watch` CLI command and is the simplest long-lived observation mode in the file.
+**Call relations**: `run` calls this for `watch`. It shares the same `with_client` wrapper and stream loop used by thread follow mode.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1660,11 +1670,11 @@ async fn trigger_cmd_approval(
 ) -> Result<()>
 ```
 
-**Purpose**: Starts a turn designed to elicit a command-execution approval request under read-only sandboxing.
+**Purpose**: This sends a prompt intended to make Codex ask for command execution approval. It is a quick test that the approval request path works.
 
-**Data flow**: Chooses a default prompt that asks the model to run `touch /tmp/should-trigger-approval`, then forwards the message and policies (`experimental_api = true`, `approval_policy = OnRequest`, read-only sandbox) to `send_message_v2_with_policies`. It returns that scenario’s result.
+**Data flow**: It receives endpoint details, config overrides, an optional prompt, and dynamic tools. It chooses a default prompt if needed, sets approval-on-request with a read-only sandbox, and sends the message through the shared V2 policy helper.
 
-**Call relations**: The `trigger-cmd-approval` CLI branch uses this thin wrapper over the shared send-with-policies flow.
+**Call relations**: `run` calls this for `trigger-cmd-approval`. It delegates the actual client session to `send_message_v2_with_policies`.
 
 *Call graph*: calls 1 internal fn (send_message_v2_with_policies); called by 1 (run).
 
@@ -1680,11 +1690,11 @@ async fn trigger_patch_approval(
 ) -> Result<()>
 ```
 
-**Purpose**: Starts a turn designed to elicit a file-change/apply-patch approval request under read-only sandboxing.
+**Purpose**: This sends a prompt intended to make Codex ask for file-change approval. It tests the app-server path where edits need permission.
 
-**Data flow**: Uses a default prompt requesting file creation via `apply_patch`, then calls `send_message_v2_with_policies` with experimental API enabled, on-request approvals, and read-only sandboxing. It returns the delegated result.
+**Data flow**: It receives endpoint details, config overrides, an optional prompt, and dynamic tools. It chooses a default apply-patch prompt if needed, sets approval-on-request with a read-only sandbox, and sends the message.
 
-**Call relations**: This is the patch-approval counterpart to `trigger_cmd_approval`, selected by its own CLI subcommand.
+**Call relations**: `run` calls this for `trigger-patch-approval`. The shared `send_message_v2_with_policies` function performs the connection and streaming.
 
 *Call graph*: calls 1 internal fn (send_message_v2_with_policies); called by 1 (run).
 
@@ -1699,11 +1709,11 @@ async fn no_trigger_cmd_approval(
 ) -> Result<()>
 ```
 
-**Purpose**: Runs a control scenario that should not trigger command approval because no approval or sandbox overrides are requested.
+**Purpose**: This sends a command-like prompt without special approval settings. It checks that normal policy choices do not accidentally trigger approval prompts.
 
-**Data flow**: Builds a fixed prompt and forwards it to `send_message_v2_with_policies` with experimental API enabled but no approval or sandbox policy overrides. It returns the delegated result.
+**Data flow**: It receives endpoint details, config overrides, and dynamic tools. It sends a fixed prompt using default approval and sandbox settings, then streams the resulting turn.
 
-**Call relations**: Invoked by the `no-trigger-cmd-approval` CLI branch to contrast with the explicit approval-triggering scenarios.
+**Call relations**: `run` calls this for `no-trigger-cmd-approval`. It uses `send_message_v2_with_policies` with no approval or sandbox overrides.
 
 *Call graph*: calls 1 internal fn (send_message_v2_with_policies); called by 1 (run).
 
@@ -1719,11 +1729,11 @@ async fn send_message_v2_with_policies(
 ) -> Result<()>
 ```
 
-**Purpose**: Shared implementation for starting a new thread, sending one text turn, and streaming it to completion under configurable initialization and policy settings.
+**Purpose**: This is the shared recipe for sending one V2 message with optional approval and sandbox rules. It avoids repeating the initialize-thread-turn-stream sequence in every command.
 
-**Data flow**: Runs inside `with_client`: initializes with or without experimental API, starts a thread optionally carrying dynamic tools, constructs `TurnStartParams` with one plain-text `V2UserInput::Text`, applies optional approval and sandbox overrides, sends `turn/start`, and streams the turn until completion. It returns success if the whole request/notification sequence completes cleanly.
+**Data flow**: It receives endpoint details, config overrides, user text, and a policy bundle. It connects a client, initializes with or without experimental support, starts a thread, starts a turn containing the user text, applies the requested policies, streams the turn, and returns success or an error.
 
-**Call relations**: This is the central helper behind `send_message`, `send_message_v2_endpoint`, and the approval-triggering wrappers.
+**Call relations**: It is called by the simple send command and the approval-triggering commands. It runs through `with_client`, which adds tracing and connection setup.
 
 *Call graph*: calls 1 internal fn (with_client); called by 5 (no_trigger_cmd_approval, send_message, send_message_v2_endpoint, trigger_cmd_approval, trigger_patch_approval).
 
@@ -1740,11 +1750,11 @@ async fn send_follow_up_v2(
 ) -> R
 ```
 
-**Purpose**: Exercises two sequential turns in the same thread to validate follow-up behavior.
+**Purpose**: This sends two turns in the same thread. It tests that a follow-up message uses the previous conversation state.
 
-**Data flow**: Within `with_client`, it initializes, starts a thread, sends a first text turn and streams it to completion, then sends a second text turn on the same thread and streams that one as well. It returns success only if both turns complete without protocol errors.
+**Data flow**: It receives endpoint details, config overrides, an initial message, a follow-up message, and optional dynamic tools. It initializes, starts one thread, sends and streams the first turn, then sends and streams the second turn in that same thread.
 
-**Call relations**: The `SendFollowUpV2` CLI branch uses this to test multi-turn continuity within one thread.
+**Call relations**: `run` calls this for `send-follow-up-v2`. It uses `with_client` and the normal `CodexClient` thread and turn methods.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1759,11 +1769,11 @@ async fn test_login(
 ) -> Result<()>
 ```
 
-**Purpose**: Starts either the browser-callback or device-code ChatGPT login flow and waits for the matching completion notification.
+**Purpose**: This starts a ChatGPT account login flow and waits until the server reports completion. It can test either browser-based login or device-code login.
 
-**Data flow**: Inside `with_client`, it initializes, sends the appropriate `account/login/start` request, prints the returned auth URL or verification code, extracts the `login_id`, waits in `wait_for_account_login_completion` until a matching `AccountLoginCompletedNotification` arrives, and then returns success or an error based on `completion.success` and `completion.error`.
+**Data flow**: It receives endpoint details, config overrides, and a flag for device-code mode. It initializes, starts the selected login flow, prints instructions for the user, waits for a matching completion notification, and returns success only if login succeeded.
 
-**Call relations**: Selected by the `TestLogin` CLI command; it combines request/notification handling with user-facing instructions for completing the login flow.
+**Call relations**: `run` calls this for `test-login`. It uses `CodexClient` login methods and `wait_for_account_login_completion` inside `with_client`.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1774,11 +1784,11 @@ async fn test_login(
 async fn get_account_rate_limits(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()>
 ```
 
-**Purpose**: Fetches and prints the current account rate-limit snapshot from the app-server.
+**Purpose**: This asks the app-server for the current account rate limits. It is a small diagnostic command.
 
-**Data flow**: Uses `with_client` to initialize the connection, send `account/rateLimits/read`, print the typed response, and return success. No additional state is tracked.
+**Data flow**: It receives endpoint details and config overrides. It initializes a client, sends the rate-limit read request, prints the response, and returns the result status.
 
-**Call relations**: This is the implementation behind the `GetAccountRateLimits` CLI command.
+**Call relations**: `run` calls this for `get-account-rate-limits`. The request itself is sent through `CodexClient::get_account_rate_limits` inside `with_client`.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1789,11 +1799,11 @@ async fn get_account_rate_limits(endpoint: &Endpoint, config_overrides: &[String
 async fn model_list(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()>
 ```
 
-**Purpose**: Requests and prints the available model list from the app-server.
+**Purpose**: This asks the app-server which models are available. It helps confirm that model discovery works through the app-server protocol.
 
-**Data flow**: Within `with_client`, it initializes, sends `model/list` with default params, prints the typed response, and returns success.
+**Data flow**: It receives endpoint details and config overrides. It initializes, sends a default model-list request, prints the response, and returns success or an error.
 
-**Call relations**: Invoked by the `model-list` CLI branch.
+**Call relations**: `run` calls this for `model-list`. It uses `CodexClient::model_list` inside the shared client wrapper.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1804,11 +1814,11 @@ async fn model_list(endpoint: &Endpoint, config_overrides: &[String]) -> Result<
 async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u32) -> Result<()>
 ```
 
-**Purpose**: Requests and prints a page of stored threads using the supplied limit and otherwise default filters.
+**Purpose**: This lists stored conversation threads. It is useful for checking persistence and thread browsing behavior.
 
-**Data flow**: Inside `with_client`, it initializes, constructs `ThreadListParams` with `limit: Some(limit)` and all other filters unset/defaulted, sends `thread/list`, prints the response, and returns success.
+**Data flow**: It receives endpoint details, config overrides, and a limit. It initializes, builds a thread-list request with that limit and default filters, prints the response, and returns the outcome.
 
-**Call relations**: This powers the `thread-list` CLI command.
+**Call relations**: `run` calls this for `thread-list`. It delegates the protocol request to `CodexClient::thread_list` inside `with_client`.
 
 *Call graph*: calls 1 internal fn (with_client); called by 1 (run).
 
@@ -1824,11 +1834,11 @@ async fn with_client(
 ) -> Result<T>
 ```
 
-**Purpose**: Wraps a scenario closure with tracing initialization, a command-level span, client connection setup, and final trace-summary printing.
+**Purpose**: This wraps a test command in common setup: tracing, a named span, client connection, and trace-summary printing. It is the standard doorway for most command implementations.
 
-**Data flow**: Asynchronously initializes `TestClientTracing` from config overrides, creates a tracing span tagged as a client command, captures a `TraceSummary` inside that span, then in the same span connects a `CodexClient` and invokes the supplied closure. After the closure returns, it prints the trace summary and returns the closure’s `Result<T>`.
+**Data flow**: It receives a command name, endpoint, config overrides, and a callback that uses a mutable `CodexClient`. It initializes tracing, captures trace information, connects the client, runs the callback, prints the trace summary, and returns the callback result.
 
-**Call relations**: Nearly every scenario helper delegates through this function so they all share consistent tracing, connection setup, and teardown behavior.
+**Call relations**: Many command helpers call this instead of creating clients directly. It calls `TestClientTracing::initialize`, `CodexClient::connect`, and `print_trace_summary` around the command-specific work.
 
 *Call graph*: calls 2 internal fn (initialize, print_trace_summary); called by 10 (get_account_rate_limits, model_list, resume_message_v2, send_follow_up_v2, send_message_v2_with_policies, test_login, thread_list, thread_resume_follow, trigger_zsh_fork_multi_cmd_approval, watch); 1 external calls (info_span!).
 
@@ -1839,11 +1849,11 @@ async fn with_client(
 fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()>
 ```
 
-**Purpose**: Connects to a shared websocket app-server and increments the out-of-band elicitation pause counter for a thread.
+**Purpose**: This tells an existing WebSocket app-server to increment a thread's elicitation pause counter. In plain terms, it marks that the thread is waiting on outside input so some timeouts should pause.
 
-**Data flow**: Wraps the URL in `Endpoint::ConnectWs`, connects a `CodexClient`, initializes the server, sends `thread/increment_elicitation` with the provided thread ID, prints the response, and returns success.
+**Data flow**: It receives a WebSocket URL and thread id. It connects, initializes, sends the increment request, prints the response, and returns success or an error.
 
-**Call relations**: The corresponding CLI branch in `run` uses this direct helper instead of `with_client` because it always targets a shared websocket endpoint.
+**Call relations**: `run` calls this after `resolve_shared_websocket_url`. It connects directly with `CodexClient::connect` rather than using `with_client`.
 
 *Call graph*: calls 1 internal fn (connect); called by 1 (run); 2 external calls (ConnectWs, println!).
 
@@ -1854,11 +1864,11 @@ fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()>
 fn thread_decrement_elicitation(url: &str, thread_id: String) -> Result<()>
 ```
 
-**Purpose**: Connects to a shared websocket app-server and decrements the out-of-band elicitation pause counter for a thread.
+**Purpose**: This tells an existing WebSocket app-server to decrement a thread's elicitation pause counter. It is the companion cleanup or resume signal for an elicitation pause.
 
-**Data flow**: Creates a websocket endpoint, connects a client, initializes, sends `thread/decrement_elicitation`, prints the response, and returns success.
+**Data flow**: It receives a WebSocket URL and thread id. It connects, initializes, sends the decrement request, prints the response, and returns success or an error.
 
-**Call relations**: This is the decrement counterpart to `thread_increment_elicitation`, selected by its own CLI branch.
+**Call relations**: `run` calls this after `resolve_shared_websocket_url`. The live elicitation harness also performs a similar decrement through the client after its test.
 
 *Call graph*: calls 1 internal fn (connect); called by 1 (run); 2 external calls (ConnectWs, println!).
 
@@ -1875,11 +1885,11 @@ fn live_elicitation_timeout_pause(
     script: Option<PathBuf>,
 ```
 
-**Purpose**: Runs a live end-to-end harness proving that elicitation pause prevents the unified exec timeout from killing a helper script that intentionally runs longer than 10 seconds.
+**Purpose**: This is a live end-to-end test proving that an elicitation pause can keep a long helper command from being killed by a shorter execution timeout. It is like checking that a stopwatch really pauses while someone is waiting at a service counter.
 
-**Data flow**: Validates platform and `hold_seconds`, optionally spawns a background websocket app-server, resolves the helper script path and canonical workspace, connects a client, initializes, starts a thread with the requested model, constructs an exact shell command embedding the websocket URL, test-client binary path, and hold duration, then starts a turn that instructs the model to run that command exactly once with full access and high reasoning effort. After `stream_turn`, it validates elapsed time, command completion, helper output markers, absence of unexpected items before helper completion, and final turn status; it then best-effort decrements elicitation for cleanup and prints a summary.
+**Data flow**: It receives optional server connection choices, config overrides, model name, workspace, helper script path, and hold time. It may start a background server, connects a client, starts a thread and turn that runs the helper script, streams events, validates timing and completion markers, decrements the elicitation counter for cleanup, and returns an error if any expectation fails.
 
-**Call relations**: This specialized harness is dispatched from `run` and depends heavily on `BackgroundAppServer`, `CodexClient::stream_turn`, and the command-output tracking fields maintained by the client.
+**Call relations**: `run` calls this for `live-elicitation-timeout-pause`. It may call `BackgroundAppServer::spawn`, uses `CodexClient::connect`, and relies on `CodexClient::stream_turn` to collect the evidence it later checks.
 
 *Call graph*: calls 2 internal fn (spawn, connect); called by 1 (run); 11 external calls (default, now, canonicalize, ConnectWs, bail!, cfg!, eprintln!, format!, println!, current_exe (+1 more)).
 
@@ -1893,11 +1903,11 @@ fn ensure_dynamic_tools_unused(
 ) -> Result<()>
 ```
 
-**Purpose**: Rejects commands that were invoked with `--dynamic-tools` even though they do not support dynamic tools.
+**Purpose**: This rejects commands that were given dynamic tools even though they do not support them. It prevents confusing tests where a flag is silently ignored.
 
-**Data flow**: Checks whether the `Option<Vec<DynamicToolSpec>>` is `Some`; if so, returns an error naming the command and suggesting supported usage, otherwise returns `Ok(())`.
+**Data flow**: It receives optional dynamic tools and a command name. If tools are present, it returns an explanatory error; otherwise it returns success.
 
-**Call relations**: Many CLI branches call this early from `run`, and `resume_message_v2` also uses it directly.
+**Call relations**: `run` calls this for commands that do not use dynamic tools, and `resume_message_v2` calls it for its own stricter behavior.
 
 *Call graph*: called by 2 (resume_message_v2, run); 1 external calls (bail!).
 
@@ -1908,11 +1918,11 @@ fn ensure_dynamic_tools_unused(
 fn parse_dynamic_tools_arg(dynamic_tools: &Option<String>) -> Result<Option<Vec<DynamicToolSpec>>>
 ```
 
-**Purpose**: Parses the `--dynamic-tools` CLI argument from inline JSON or an `@file` reference into normalized dynamic tool specs.
+**Purpose**: This turns the `--dynamic-tools` command-line value into structured tool definitions the app-server protocol understands. The value can be raw JSON or a filename prefixed with `@`.
 
-**Data flow**: If the option is absent, returns `Ok(None)`. Otherwise it reads raw JSON either from the argument string or from a file path after `@`, parses it into `serde_json::Value`, accepts either a single object or an array of objects, rejects other JSON shapes, normalizes the values through `normalize_dynamic_tool_specs`, and returns `Some(Vec<DynamicToolSpec>)`.
+**Data flow**: It receives an optional string. It reads JSON from the string or file, accepts either one object or an array of objects, normalizes those into `DynamicToolSpec` values, and returns them or no tools.
 
-**Call relations**: `run` calls this once up front so all command branches receive a pre-decoded dynamic-tools value.
+**Call relations**: `run` calls this once at startup. Commands that support dynamic tools pass the parsed result into thread-start requests.
 
 *Call graph*: calls 1 internal fn (normalize_dynamic_tool_specs); called by 1 (run); 5 external calls (new, bail!, read_to_string, from_str, vec!).
 
@@ -1927,11 +1937,11 @@ fn item_started_before_helper_done_is_unexpected(
 ) -> bool
 ```
 
-**Purpose**: Encodes the harness rule for whether an `ItemStarted` notification should be considered premature while the helper command is still running.
+**Purpose**: This helps the elicitation timeout test decide whether a new thread item appeared too early. It flags suspicious activity after a command starts but before the helper script says it is done.
 
-**Data flow**: Reads the current `ThreadItem` plus booleans indicating whether the command item has started and whether helper completion has been seen. It returns `false` unless a command item is already running and the helper is not done; in that window it treats every item except `ThreadItem::UserMessage` as unexpected.
+**Data flow**: It receives a thread item, whether a command item has started, and whether the helper completion marker has been seen. It returns true only for non-user-message items that start during the protected waiting window.
 
-**Call relations**: `CodexClient::stream_turn` calls this when tracking `unexpected_items_before_helper_done` during the live elicitation timeout harness.
+**Call relations**: `CodexClient::stream_turn` calls this while watching turn notifications for the live elicitation harness.
 
 *Call graph*: called by 1 (stream_turn); 1 external calls (matches!).
 
@@ -1942,11 +1952,11 @@ fn item_started_before_helper_done_is_unexpected(
 fn connect(endpoint: &Endpoint, config_overrides: &[String]) -> Result<Self>
 ```
 
-**Purpose**: Constructs a `CodexClient` over either stdio or websocket transport based on the resolved endpoint.
+**Purpose**: This creates a `CodexClient` using the chosen transport. The transport is either a spawned app-server over standard input/output or a WebSocket connection to an existing server.
 
-**Data flow**: Matches the `Endpoint`: `SpawnCodex` delegates to `spawn_stdio`, while `ConnectWs` delegates to `connect_websocket`. It returns the initialized client with transport-specific state and tracking fields set up.
+**Data flow**: It receives an endpoint and config overrides. It dispatches to `spawn_stdio` for a private child process or `connect_websocket` for a shared server, returning a ready client.
 
-**Call relations**: Scenario helpers and direct elicitation commands use this as the common connection factory.
+**Call relations**: It is used directly by elicitation helpers and by the shared `with_client` wrapper. Downstream code then uses the returned client for JSON-RPC calls.
 
 *Call graph*: called by 3 (live_elicitation_timeout_pause, thread_decrement_elicitation, thread_increment_elicitation); 2 external calls (connect_websocket, spawn_stdio).
 
@@ -1957,11 +1967,11 @@ fn connect(endpoint: &Endpoint, config_overrides: &[String]) -> Result<Self>
 fn spawn_stdio(codex_bin: &Path, config_overrides: &[String]) -> Result<Self>
 ```
 
-**Purpose**: Starts a stdio-connected `codex app-server` child process with no extra environment overrides.
+**Purpose**: This starts `codex app-server` as a child process and communicates through its standard input and output. This is useful for isolated tests that do not need a shared WebSocket server.
 
-**Data flow**: Forwards the binary path and config overrides to `spawn_stdio_with_env` with an empty environment slice and returns the resulting client.
+**Data flow**: It receives a binary path and config overrides. It forwards to `spawn_stdio_with_env` with no extra environment variables and returns the resulting client.
 
-**Call relations**: This is the normal stdio path used by `CodexClient::connect`; other modules can call it when they need a spawned private server.
+**Call relations**: `CodexClient::connect` uses this for `SpawnCodex` endpoints, and plugin cleanup code can also call it through related helpers.
 
 *Call graph*: called by 1 (run_cleanup); 1 external calls (spawn_stdio_with_env).
 
@@ -1976,11 +1986,11 @@ fn spawn_stdio_with_env(
     ) -> Result<Self>
 ```
 
-**Purpose**: Starts `codex app-server` as a child process over piped stdin/stdout, optionally injecting extra environment variables, and initializes all client-side tracking state.
+**Purpose**: This is the full child-process launcher for standard-input communication. It can also add environment variables before starting the app-server.
 
-**Data flow**: Builds a `Command` for the binary, prepends its parent directory to `PATH`, appends config overrides and extra environment pairs, spawns `codex app-server` with piped stdin/stdout and inherited stderr, extracts the child pipes, wraps stdout in `BufReader`, and returns a `CodexClient` with `ClientTransport::Stdio` plus empty notification queues and zeroed approval/turn-tracking fields.
+**Data flow**: It receives a binary path, config overrides, and extra environment variables. It builds the command, pipes stdin and stdout, starts `codex app-server`, stores the child process and streams, and initializes the client's tracking fields.
 
-**Call relations**: This is the concrete stdio transport constructor used by `spawn_stdio` and by external helpers that need custom environment injection.
+**Call relations**: `CodexClient::spawn_stdio` calls this. Other test modules can use it when they need to start the app-server with special environment settings.
 
 *Call graph*: called by 2 (spawn_client, run); 11 external calls (new, from, display, parent, inherit, piped, new, new, new, new (+1 more)).
 
@@ -1991,11 +2001,11 @@ fn spawn_stdio_with_env(
 fn connect_websocket(url: &str) -> Result<Self>
 ```
 
-**Purpose**: Connects to an existing websocket app-server, retrying for up to 10 seconds before failing with a helpful startup hint.
+**Purpose**: This connects to an app-server over WebSocket, retrying briefly while the server starts. WebSocket is a network connection that carries messages both ways over one socket.
 
-**Data flow**: Parses the URL, computes a deadline, repeatedly calls tungstenite `connect(parsed.as_str())`, sleeping 50 ms between failures until success or timeout, then returns a `CodexClient` with `ClientTransport::WebSocket` and freshly initialized tracking fields.
+**Data flow**: It receives a URL string. It parses the URL, tries to connect until a ten-second deadline, then returns a client with an open WebSocket and fresh tracking state.
 
-**Call relations**: This is the websocket transport constructor used by `CodexClient::connect` and direct websocket-only commands.
+**Call relations**: `CodexClient::connect` uses this for `ConnectWs` endpoints. Commands that require a shared server depend on this path.
 
 *Call graph*: 10 external calls (new, from_millis, from_secs, now, new, parse, new, new, sleep, connect).
 
@@ -2006,11 +2016,11 @@ fn connect_websocket(url: &str) -> Result<Self>
 fn note_helper_output(&mut self, output: &str)
 ```
 
-**Purpose**: Accumulates command output text and marks the helper as finished once the special completion marker appears.
+**Purpose**: This records command output from the helper script used in the elicitation timeout test. It watches for a special “done” marker.
 
-**Data flow**: Appends the provided output chunk to `self.command_output_stream`; if the accumulated stream contains `[elicitation-hold] done`, it sets `self.helper_done_seen = true`. It returns unit.
+**Data flow**: It receives a chunk of command output, appends it to an accumulated stream, and flips `helper_done_seen` to true if the completion marker appears.
 
-**Call relations**: `stream_turn` calls this for command output deltas and aggregated command output so the live elicitation harness can detect helper completion robustly.
+**Call relations**: `CodexClient::stream_turn` calls this when output deltas or completed command output arrive. Later validation in `live_elicitation_timeout_pause` reads the recorded flags and output.
 
 *Call graph*: called by 1 (stream_turn).
 
@@ -2021,11 +2031,11 @@ fn note_helper_output(&mut self, output: &str)
 fn initialize(&mut self) -> Result<InitializeResponse>
 ```
 
-**Purpose**: Performs the standard initialize handshake with experimental API enabled.
+**Purpose**: This performs the standard app-server initialize handshake with experimental API support enabled. The handshake tells the server who the client is and what features it wants.
 
-**Data flow**: Calls `initialize_with_experimental_api(true)` and returns its typed `InitializeResponse`.
+**Data flow**: It takes the client state, calls `initialize_with_experimental_api(true)`, and returns the server's initialize response.
 
-**Call relations**: Most scenario helpers use this convenience wrapper instead of specifying the experimental flag explicitly.
+**Call relations**: Most command flows call this through their `CodexClient` before making other requests. It is a convenience wrapper around the more configurable initializer.
 
 *Call graph*: calls 1 internal fn (initialize_with_experimental_api).
 
@@ -2039,11 +2049,11 @@ fn initialize_with_experimental_api(
     ) -> Result<InitializeResponse>
 ```
 
-**Purpose**: Sends the JSON-RPC `initialize` request with client metadata and capabilities, then completes the handshake by sending an `initialized` notification.
+**Purpose**: This performs the app-server initialize handshake and lets the caller choose whether experimental protocol features are enabled.
 
-**Data flow**: Generates a request ID, builds `ClientRequest::Initialize` containing `ClientInfo` and `InitializeCapabilities` (including `experimental_api`, `request_attestation = false`, and the opt-out notification method list), sends it via `send_request`, then writes a raw JSON-RPC `initialized` notification with `write_jsonrpc_message`. It returns the typed initialize response.
+**Data flow**: It creates a request id, builds an initialize request with client info and capabilities, sends it, then sends the follow-up `initialized` notification required to complete the handshake. It returns the server response.
 
-**Call relations**: Called by `initialize` and by scenario helpers that need to toggle experimental API support before any other requests.
+**Call relations**: `CodexClient::initialize` calls this, and message-sending code calls it directly when it needs to control the experimental flag. It uses `send_request` and `write_jsonrpc_message`.
 
 *Call graph*: calls 3 internal fn (request_id, send_request, write_jsonrpc_message); called by 1 (initialize); 2 external calls (Notification, env!).
 
@@ -2054,11 +2064,11 @@ fn initialize_with_experimental_api(
 fn thread_start(&mut self, params: ThreadStartParams) -> Result<ThreadStartResponse>
 ```
 
-**Purpose**: Sends a typed `thread/start` request and returns the decoded response.
+**Purpose**: This asks the app-server to create a new conversation thread. A thread is the container that holds one or more turns.
 
-**Data flow**: Generates a request ID, wraps the provided `ThreadStartParams` in `ClientRequest::ThreadStart`, and delegates to `send_request`. It returns `ThreadStartResponse`.
+**Data flow**: It receives thread-start parameters, creates a unique request id, sends a `thread/start` request, and returns the decoded thread-start response.
 
-**Call relations**: Used by many scenario helpers whenever a new thread must be created before starting a turn.
+**Call relations**: Message and plugin turn flows call this after initialization. It relies on the generic `send_request` machinery.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 1 (run_plugin_turn).
 
@@ -2069,11 +2079,11 @@ fn thread_start(&mut self, params: ThreadStartParams) -> Result<ThreadStartRespo
 fn thread_resume(&mut self, params: ThreadResumeParams) -> Result<ThreadResumeResponse>
 ```
 
-**Purpose**: Sends a typed `thread/resume` request for an existing thread.
+**Purpose**: This asks the app-server to reopen an existing thread by id. It lets tests continue a prior conversation.
 
-**Data flow**: Creates a request ID, builds `ClientRequest::ThreadResume` with the supplied params, and delegates to `send_request`, returning `ThreadResumeResponse`.
+**Data flow**: It receives resume parameters, creates a request id, sends a `thread/resume` request, and returns the decoded response.
 
-**Call relations**: Scenario helpers for resumed-thread flows call this before sending new turns or following notifications.
+**Call relations**: Resume commands call this after initialization. It uses `send_request` for the actual JSON-RPC exchange.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2084,11 +2094,11 @@ fn thread_resume(&mut self, params: ThreadResumeParams) -> Result<ThreadResumeRe
 fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse>
 ```
 
-**Purpose**: Sends a typed `turn/start` request and returns the decoded turn-start response.
+**Purpose**: This starts a new turn in a thread. A turn is one user message plus the app-server's work to answer it.
 
-**Data flow**: Generates a request ID, wraps `TurnStartParams` in `ClientRequest::TurnStart`, and delegates to `send_request`. It returns `TurnStartResponse`.
+**Data flow**: It receives turn parameters such as thread id, input text, approval policy, sandbox policy, model effort, and working directory. It sends `turn/start` and returns the server's turn response.
 
-**Call relations**: This is the core request used by all message-sending scenarios after a thread has been created or resumed.
+**Call relations**: Message flows, follow-up flows, approval tests, live elicitation tests, and plugin turn flows call this after creating or resuming a thread.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 1 (run_plugin_turn).
 
@@ -2099,11 +2109,11 @@ fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse>
 fn login_account_chatgpt(&mut self) -> Result<LoginAccountResponse>
 ```
 
-**Purpose**: Starts the browser-based ChatGPT account login flow.
+**Purpose**: This starts the browser-style ChatGPT account login flow. It asks the server for a login id and authorization URL.
 
-**Data flow**: Generates a request ID, builds `ClientRequest::LoginAccount` with `LoginAccountParams::Chatgpt { codex_streamlined_login: false }`, sends it, and returns the typed `LoginAccountResponse`.
+**Data flow**: It creates a request id, sends `account/login/start` with ChatGPT browser-login parameters, and returns the login response.
 
-**Call relations**: Used by `test_login` when the device-code flag is not set.
+**Call relations**: `test_login` calls this when device-code mode is not requested. The completion is later watched with `wait_for_account_login_completion`.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2114,11 +2124,11 @@ fn login_account_chatgpt(&mut self) -> Result<LoginAccountResponse>
 fn login_account_chatgpt_device_code(&mut self) -> Result<LoginAccountResponse>
 ```
 
-**Purpose**: Starts the device-code ChatGPT account login flow.
+**Purpose**: This starts the device-code ChatGPT login flow. Device-code login gives the user a short code to enter on a verification page.
 
-**Data flow**: Generates a request ID, builds `ClientRequest::LoginAccount` with `LoginAccountParams::ChatgptDeviceCode`, sends it, and returns the typed response.
+**Data flow**: It creates a request id, sends `account/login/start` with device-code parameters, and returns the login response containing the code and verification URL.
 
-**Call relations**: Used by `test_login` when `--device-code` is requested.
+**Call relations**: `test_login` calls this when the device-code option is enabled. The same completion-waiting function is used afterward.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2129,11 +2139,11 @@ fn login_account_chatgpt_device_code(&mut self) -> Result<LoginAccountResponse>
 fn get_account_rate_limits(&mut self) -> Result<GetAccountRateLimitsResponse>
 ```
 
-**Purpose**: Sends `account/rateLimits/read` and decodes the resulting rate-limit snapshot.
+**Purpose**: This sends the protocol request that reads current account rate-limit information.
 
-**Data flow**: Creates a request ID, builds `ClientRequest::GetAccountRateLimits { params: None }`, delegates to `send_request`, and returns `GetAccountRateLimitsResponse`.
+**Data flow**: It creates a request id, sends `account/rateLimits/read` with no extra parameters, and returns the decoded rate-limit response.
 
-**Call relations**: Called by the `get_account_rate_limits` scenario helper.
+**Call relations**: The `get_account_rate_limits` command wrapper calls this after initialization. It uses `send_request` for request writing and response waiting.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2144,11 +2154,11 @@ fn get_account_rate_limits(&mut self) -> Result<GetAccountRateLimitsResponse>
 fn model_list(&mut self, params: ModelListParams) -> Result<ModelListResponse>
 ```
 
-**Purpose**: Sends `model/list` with the provided parameters and returns the decoded model list.
+**Purpose**: This sends the protocol request that lists available models.
 
-**Data flow**: Generates a request ID, wraps `ModelListParams` in `ClientRequest::ModelList`, and delegates to `send_request`, returning `ModelListResponse`.
+**Data flow**: It receives model-list parameters, creates a request id, sends `model/list`, and returns the decoded model-list response.
 
-**Call relations**: Used by the `model_list` scenario helper.
+**Call relations**: The `model_list` command wrapper calls this. It is one of the simple one-request flows built on `send_request`.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2159,11 +2169,11 @@ fn model_list(&mut self, params: ModelListParams) -> Result<ModelListResponse>
 fn thread_list(&mut self, params: ThreadListParams) -> Result<ThreadListResponse>
 ```
 
-**Purpose**: Sends `thread/list` with the provided filters and returns the decoded thread page.
+**Purpose**: This sends the protocol request that lists stored threads using the requested filters and limit.
 
-**Data flow**: Creates a request ID, wraps `ThreadListParams` in `ClientRequest::ThreadList`, and delegates to `send_request`, returning `ThreadListResponse`.
+**Data flow**: It receives thread-list parameters, creates a request id, sends `thread/list`, and returns the decoded thread-list response.
 
-**Call relations**: Used by the `thread_list` scenario helper.
+**Call relations**: The `thread_list` command wrapper calls this after initialization. It uses the same generic request path as other client methods.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2177,11 +2187,11 @@ fn thread_increment_elicitation(
     ) -> Result<ThreadIncrementElicitationResponse>
 ```
 
-**Purpose**: Sends `thread/increment_elicitation` for a thread and returns the typed response.
+**Purpose**: This sends the protocol request to increase a thread's elicitation pause counter.
 
-**Data flow**: Generates a request ID, wraps `ThreadIncrementElicitationParams` in the corresponding client request, and delegates to `send_request`.
+**Data flow**: It receives the thread id wrapped in increment parameters, creates a request id, sends `thread/increment_elicitation`, and returns the decoded response.
 
-**Call relations**: Called by the direct `thread_increment_elicitation` helper and by cleanup/testing flows that manipulate elicitation pause state.
+**Call relations**: `thread_increment_elicitation` calls this after connecting and initializing. It uses `send_request`.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2195,11 +2205,11 @@ fn thread_decrement_elicitation(
     ) -> Result<ThreadDecrementElicitationResponse>
 ```
 
-**Purpose**: Sends `thread/decrement_elicitation` for a thread and returns the typed response.
+**Purpose**: This sends the protocol request to decrease a thread's elicitation pause counter.
 
-**Data flow**: Generates a request ID, wraps `ThreadDecrementElicitationParams` in the corresponding client request, and delegates to `send_request`.
+**Data flow**: It receives the thread id wrapped in decrement parameters, creates a request id, sends `thread/decrement_elicitation`, and returns the decoded response.
 
-**Call relations**: Used by the direct decrement helper and by the live elicitation harness cleanup path.
+**Call relations**: `thread_decrement_elicitation` and the live elicitation harness use this for cleanup or manual counter changes.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -2213,11 +2223,11 @@ fn wait_for_account_login_completion(
     ) -> Result<AccountLoginCompletedNotification>
 ```
 
-**Purpose**: Consumes notifications until it sees an `account/login/completed` notification whose `login_id` matches the expected login flow.
+**Purpose**: This waits until the server reports that a specific login attempt finished. It ignores unrelated login completions.
 
-**Data flow**: Loops on `next_notification`, attempts to deserialize each notification into `ServerNotification`, and when it sees `AccountLoginCompleted`, compares `completion.login_id` to `expected_login_id`. Matching completion is returned; mismatched completions are logged and ignored; rate-limit update notifications are also printed and ignored.
+**Data flow**: It receives the expected login id. It repeatedly reads notifications, converts them into server notification types, returns the matching account-login completion, and prints rate-limit updates along the way.
 
-**Call relations**: `test_login` uses this after starting a login flow so it can wait for the asynchronous completion callback.
+**Call relations**: `test_login` calls this after starting a login flow. It depends on `next_notification` to read the mixed stream of server messages.
 
 *Call graph*: calls 1 internal fn (next_notification); 2 external calls (try_from, println!).
 
@@ -2228,11 +2238,11 @@ fn wait_for_account_login_completion(
 fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()>
 ```
 
-**Purpose**: Processes notifications for one active turn until its matching `TurnCompleted` arrives, printing deltas and updating client-side tracking for approvals, command execution, helper completion, and final turn status.
+**Purpose**: This reads and prints server notifications for one turn until that turn completes. It also answers approval requests and records command output/status details needed by tests.
 
-**Data flow**: Loops on `next_notification`, converts notifications into `ServerNotification`, and matches many variants: prints thread/turn started notices; streams agent and command output deltas to stdout; records terminal stdin echoes; tracks `ItemStarted` and `ItemCompleted` events, including command statuses and aggregated output; updates helper-completion and unexpected-item state; and on matching `TurnCompleted`, stores `last_turn_status` and optional error message, flags premature completion if the helper was still running, prints status/error, and breaks. It returns `Ok(())` after the target turn completes.
+**Data flow**: It receives the expected thread id and turn id. It reads notifications, prints message deltas and item events, tracks command execution output and status, notes early unexpected items, saves final turn status and error text, and stops when the target turn completes.
 
-**Call relations**: This is the main event loop used by nearly every turn-based scenario and by the live elicitation timeout harness. It depends on `item_started_before_helper_done_is_unexpected` and `note_helper_output` for specialized validation.
+**Call relations**: Many message and test flows call this after `turn_start`, including plugin turn flows. It uses `next_notification`, `note_helper_output`, and `item_started_before_helper_done_is_unexpected`.
 
 *Call graph*: calls 3 internal fn (next_notification, note_helper_output, item_started_before_helper_done_is_unexpected); called by 1 (run_plugin_turn); 5 external calls (try_from, matches!, print!, println!, stdout).
 
@@ -2243,11 +2253,11 @@ fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()>
 fn stream_notifications_forever(&mut self) -> Result<()>
 ```
 
-**Purpose**: Continuously reads and discards/prints notifications indirectly by driving the notification loop forever.
+**Purpose**: This keeps consuming server notifications without stopping. It is for watch-style commands.
 
-**Data flow**: Loops indefinitely calling `next_notification`; any returned notification is ignored, and any transport/protocol error breaks the function with an error. It does not maintain additional state beyond what `next_notification` and server-request handlers update.
+**Data flow**: It takes the client state and repeatedly calls `next_notification`. The messages are read and handled, and the loop only ends if reading fails or the process is interrupted.
 
-**Call relations**: Used by `watch` and `thread_resume_follow` for long-running observation modes.
+**Call relations**: `watch` and `thread_resume_follow` call this after initialization or thread resume.
 
 *Call graph*: calls 1 internal fn (next_notification).
 
@@ -2263,11 +2273,11 @@ fn send_request(
     ) -> Result<T>
 ```
 
-**Purpose**: Wraps one typed client request in a tracing span, writes it to the transport, and waits for the matching typed response.
+**Purpose**: This is the generic request-response wrapper for all client-initiated JSON-RPC calls. It also creates a tracing span for the request.
 
-**Data flow**: Accepts a `ClientRequest`, its `RequestId`, and a method name, creates a request-level tracing span with JSON-RPC metadata, then inside that span calls `write_request` followed by `wait_for_response`. It returns the deserialized response type `T` or an error.
+**Data flow**: It receives a typed client request, request id, and method name. It writes the request, waits for the matching response, decodes the response body into the requested type, and returns it.
 
-**Call relations**: All typed request helpers (`initialize_with_experimental_api`, `thread_start`, `turn_start`, login, listing, elicitation controls, etc.) delegate through this common request/response path.
+**Call relations**: Most `CodexClient` protocol methods call this. Internally it writes via `write_request` and waits through `wait_for_response`.
 
 *Call graph*: called by 16 (get_account_rate_limits, initialize_with_experimental_api, login_account_chatgpt, login_account_chatgpt_device_code, model_list, thread_decrement_elicitation, thread_increment_elicitation, thread_list, thread_resume, thread_start (+6 more)); 1 external calls (info_span!).
 
@@ -2278,11 +2288,11 @@ fn send_request(
 fn write_request(&mut self, request: &ClientRequest) -> Result<()>
 ```
 
-**Purpose**: Serializes a typed `ClientRequest` into a JSON-RPC request, injects current trace context, logs a pretty-printed copy, and writes the compact payload to the transport.
+**Purpose**: This serializes a typed client request into the exact JSON-RPC request sent to the app-server. It also attaches trace context so server-side work can be linked to the client trace.
 
-**Data flow**: Converts the typed request to `serde_json::Value`, re-deserializes it as `JSONRPCRequest`, sets its `trace` field from `current_span_w3c_trace_context`, serializes both compact and pretty forms, prints the pretty form with a `> ` prefix, and sends the compact JSON string via `write_payload`.
+**Data flow**: It receives a `ClientRequest`, converts it into a JSON-RPC request, adds the current W3C trace context when available, prints a pretty version for humans, and writes the compact JSON payload to the transport.
 
-**Call relations**: Called only by `send_request`; it is the point where tracing metadata is attached to outgoing JSON-RPC requests.
+**Call relations**: `send_request` uses this before waiting for a response. It calls `print_multiline_with_prefix` and `write_payload`.
 
 *Call graph*: calls 2 internal fn (write_payload, print_multiline_with_prefix); 5 external calls (current_span_w3c_trace_context, from_value, to_string, to_string_pretty, to_value).
 
@@ -2293,11 +2303,11 @@ fn write_request(&mut self, request: &ClientRequest) -> Result<()>
 fn wait_for_response(&mut self, request_id: RequestId, method: &str) -> Result<T>
 ```
 
-**Purpose**: Reads JSON-RPC messages until it finds the response or error matching a specific request ID, while buffering notifications and servicing server-initiated requests along the way.
+**Purpose**: This waits for the response that matches one outstanding request id. It safely deals with other messages that arrive while waiting.
 
-**Data flow**: Loops on `read_jsonrpc_message`. Matching `Response` IDs are deserialized into `T` and returned; matching `Error` IDs become a `bail!`; notifications are pushed into `pending_notifications`; server requests are handled immediately via `handle_server_request`; unrelated responses/errors are ignored by continuing the loop.
+**Data flow**: It receives the expected request id and method name. It reads JSON-RPC messages until it sees the matching response or error, stores unrelated notifications for later, handles server requests immediately, and returns the decoded response payload.
 
-**Call relations**: This is the receive-side half of `send_request`, ensuring synchronous request/response semantics even when notifications and approval requests interleave.
+**Call relations**: `send_request` calls this after writing a request. It uses `read_jsonrpc_message` and may call `handle_server_request` if the server asks for approval mid-wait.
 
 *Call graph*: calls 2 internal fn (handle_server_request, read_jsonrpc_message); 3 external calls (push_back, bail!, from_value).
 
@@ -2308,11 +2318,11 @@ fn wait_for_response(&mut self, request_id: RequestId, method: &str) -> Result<T
 fn next_notification(&mut self) -> Result<JSONRPCNotification>
 ```
 
-**Purpose**: Returns the next available notification, first draining any buffered notifications and otherwise reading messages until a notification arrives.
+**Purpose**: This returns the next server notification, using any notifications saved earlier before reading new data. Notifications are one-way messages from the server.
 
-**Data flow**: If `pending_notifications` is non-empty, pops and returns the front notification. Otherwise it loops on `read_jsonrpc_message`, returning notifications immediately, ignoring stray responses/errors, and handling server requests synchronously via `handle_server_request` before continuing.
+**Data flow**: It first checks the pending-notification queue. If empty, it reads JSON-RPC messages until it finds a notification, ignoring stray responses and answering server requests as needed.
 
-**Call relations**: Turn streaming, login completion waiting, and watch modes all rely on this helper to consume notifications without losing interleaved server requests.
+**Call relations**: Streaming and login-waiting functions call this. It uses `read_jsonrpc_message` and `handle_server_request`.
 
 *Call graph*: calls 2 internal fn (handle_server_request, read_jsonrpc_message); called by 3 (stream_notifications_forever, stream_turn, wait_for_account_login_completion); 1 external calls (pop_front).
 
@@ -2323,11 +2333,11 @@ fn next_notification(&mut self) -> Result<JSONRPCNotification>
 fn read_jsonrpc_message(&mut self) -> Result<JSONRPCMessage>
 ```
 
-**Purpose**: Reads one non-empty raw payload from the transport, parses it as JSON, pretty-prints it, and deserializes it into a `JSONRPCMessage`.
+**Purpose**: This reads one raw transport payload and parses it as a JSON-RPC message. It also prints the incoming JSON in a readable format.
 
-**Data flow**: Loops on `read_payload` until a non-whitespace string is received, parses it into `serde_json::Value`, pretty-serializes and prints it with a `< ` prefix, then converts the value into `JSONRPCMessage` and returns it.
+**Data flow**: It repeatedly reads payloads until it gets non-empty text, parses the text as JSON, prints the formatted JSON, converts it into a `JSONRPCMessage`, and returns it.
 
-**Call relations**: Both `wait_for_response` and `next_notification` use this as the low-level inbound message decoder.
+**Call relations**: `wait_for_response` and `next_notification` call this whenever they need the next incoming message. It relies on `read_payload` for the transport-specific read.
 
 *Call graph*: calls 2 internal fn (read_payload, print_multiline_with_prefix); called by 2 (next_notification, wait_for_response); 3 external calls (from_str, from_value, to_string_pretty).
 
@@ -2338,11 +2348,11 @@ fn read_jsonrpc_message(&mut self) -> Result<JSONRPCMessage>
 fn request_id(&self) -> RequestId
 ```
 
-**Purpose**: Generates a fresh string JSON-RPC request ID using a UUID v4.
+**Purpose**: This creates a fresh unique id for a JSON-RPC request. The id lets the client match a later response to the request that caused it.
 
-**Data flow**: Creates a new UUID, converts it to a string, wraps it in `RequestId::String`, and returns it.
+**Data flow**: It reads no outside input and returns a string request id based on a newly generated UUID.
 
-**Call relations**: Every typed request helper calls this before constructing its `ClientRequest`.
+**Call relations**: Every typed request method calls this before sending through `send_request`.
 
 *Call graph*: called by 16 (get_account_rate_limits, initialize_with_experimental_api, login_account_chatgpt, login_account_chatgpt_device_code, model_list, thread_decrement_elicitation, thread_increment_elicitation, thread_list, thread_resume, thread_start (+6 more)); 2 external calls (new_v4, String).
 
@@ -2353,11 +2363,11 @@ fn request_id(&self) -> RequestId
 fn handle_server_request(&mut self, request: JSONRPCRequest) -> Result<()>
 ```
 
-**Purpose**: Deserializes a raw JSON-RPC server request into a typed `ServerRequest` and dispatches supported approval requests to the appropriate responder.
+**Purpose**: This handles requests that the server sends back to the client, such as asking whether a command or file change is allowed. These are different from notifications because the server expects an answer.
 
-**Data flow**: Attempts `ServerRequest::try_from(request)`, then matches the typed request: command-execution approvals go to `handle_command_execution_request_approval`, file-change approvals go to `approve_file_change_request`, and any other server request causes an error. It returns unit on successful handling.
+**Data flow**: It receives a raw JSON-RPC request, converts it into a typed server request, routes command approvals and file-change approvals to the right handler, and errors on unsupported request types.
 
-**Call relations**: This function is invoked whenever `wait_for_response` or `next_notification` encounters a server-initiated request interleaved with normal traffic.
+**Call relations**: `wait_for_response` and `next_notification` call this whenever a server request appears in the message stream.
 
 *Call graph*: calls 2 internal fn (approve_file_change_request, handle_command_execution_request_approval); called by 2 (next_notification, wait_for_response); 2 external calls (try_from, bail!).
 
@@ -2372,11 +2382,11 @@ fn handle_command_execution_request_approval(
     ) -> Result<()>
 ```
 
-**Purpose**: Logs the details of a command-execution approval request, updates approval-tracking counters, chooses accept vs cancel according to configured behavior, and sends the response.
+**Purpose**: This answers a server request asking whether a proposed command may run. It can always accept, or cancel at a configured approval count for testing.
 
-**Data flow**: Destructures `CommandExecutionRequestApprovalParams`, prints thread/turn/item/approval metadata plus optional reason, network context, decisions, command, cwd, actions, permissions, and policy amendments; increments `command_approval_count` and records `item_id`; computes a `CommandExecutionApprovalDecision` based on `command_approval_behavior`; wraps it in `CommandExecutionRequestApprovalResponse`; and sends it with `send_server_request_response`.
+**Data flow**: It receives a request id and approval details. It prints the command, reason, permissions, and policy amendments, updates approval counters, chooses accept or cancel based on `command_approval_behavior`, sends the response, and records the decision.
 
-**Call relations**: Called only from `handle_server_request` when the server asks the client to approve or cancel command execution. Its counters are later inspected by approval-focused scenario helpers.
+**Call relations**: `handle_server_request` calls this for command-execution approval requests. It replies through `send_server_request_response`.
 
 *Call graph*: calls 1 internal fn (send_server_request_response); called by 1 (handle_server_request); 1 external calls (println!).
 
@@ -2391,11 +2401,11 @@ fn approve_file_change_request(
     ) -> Result<()>
 ```
 
-**Purpose**: Logs a file-change approval request and always responds with acceptance.
+**Purpose**: This answers a server request asking whether a file change may proceed. In this test client, file changes are automatically accepted.
 
-**Data flow**: Destructures `FileChangeRequestApprovalParams`, prints thread/turn/item metadata plus optional reason and grant root, constructs `FileChangeRequestApprovalResponse { decision: Accept }`, sends it via `send_server_request_response`, and returns unit.
+**Data flow**: It receives a request id and file-change approval details. It prints the thread, turn, item, reason, and grant root, sends an accept response, and returns success.
 
-**Call relations**: This is the file-change branch of `handle_server_request`; unlike command approvals, it does not support configurable rejection behavior.
+**Call relations**: `handle_server_request` calls this for file-change approval requests. It sends the protocol reply with `send_server_request_response`.
 
 *Call graph*: calls 1 internal fn (send_server_request_response); called by 1 (handle_server_request); 1 external calls (println!).
 
@@ -2406,11 +2416,11 @@ fn approve_file_change_request(
 fn send_server_request_response(&mut self, request_id: RequestId, response: &T) -> Result<()>
 ```
 
-**Purpose**: Wraps a typed response payload to a server-initiated request in a JSON-RPC response envelope and writes it out.
+**Purpose**: This sends a JSON-RPC response to a request that originally came from the server. It is how the client answers approval prompts.
 
-**Data flow**: Takes a request ID and any serializable response payload, converts the payload to `serde_json::Value`, constructs `JSONRPCMessage::Response(JSONRPCResponse { id, result })`, and delegates to `write_jsonrpc_message`.
+**Data flow**: It receives the server's request id and a serializable response body. It wraps the body in a JSON-RPC response message and writes it to the transport.
 
-**Call relations**: Both approval handlers use this helper to answer server-initiated JSON-RPC requests.
+**Call relations**: Both approval handlers call this. It delegates serialization and output to `write_jsonrpc_message`.
 
 *Call graph*: calls 1 internal fn (write_jsonrpc_message); called by 2 (approve_file_change_request, handle_command_execution_request_approval); 2 external calls (Response, to_value).
 
@@ -2421,11 +2431,11 @@ fn send_server_request_response(&mut self, request_id: RequestId, response: &T) 
 fn write_jsonrpc_message(&mut self, message: JSONRPCMessage) -> Result<()>
 ```
 
-**Purpose**: Serializes an arbitrary JSON-RPC message, pretty-prints it for logging, and writes the compact payload to the active transport.
+**Purpose**: This writes any complete JSON-RPC message, such as a notification or response, to the server. It prints a readable copy first.
 
-**Data flow**: Serializes the message to compact and pretty JSON strings, prints the pretty form with `> ` prefixes, and sends the compact string through `write_payload`.
+**Data flow**: It receives a JSON-RPC message, serializes it to compact JSON for transport and pretty JSON for display, prints the pretty version, then writes the compact payload.
 
-**Call relations**: Used for the post-initialize `initialized` notification and for responses to server-initiated approval requests.
+**Call relations**: `initialize_with_experimental_api` uses this for the `initialized` notification, and `send_server_request_response` uses it for approval replies.
 
 *Call graph*: calls 2 internal fn (write_payload, print_multiline_with_prefix); called by 2 (initialize_with_experimental_api, send_server_request_response); 2 external calls (to_string, to_string_pretty).
 
@@ -2436,11 +2446,11 @@ fn write_jsonrpc_message(&mut self, message: JSONRPCMessage) -> Result<()>
 fn write_payload(&mut self, payload: &str) -> Result<()>
 ```
 
-**Purpose**: Writes one raw JSON payload string to either the child process stdin or the websocket connection.
+**Purpose**: This sends a raw JSON string over the active transport. It hides whether the connection is standard input/output or WebSocket.
 
-**Data flow**: Matches on `self.transport`: for stdio, writes the payload plus newline to the child stdin and flushes it, erroring if stdin is already closed; for websocket, sends a text frame to the stored URL/socket pair. It returns `Ok(())` on successful transport write.
+**Data flow**: It receives a payload string. For standard input, it writes a line and flushes it; for WebSocket, it sends a text frame. It returns an error if the transport is closed or writing fails.
 
-**Call relations**: This is the lowest-level outbound transport primitive used by both request and generic JSON-RPC message writers.
+**Call relations**: `write_request` and `write_jsonrpc_message` call this after they have serialized a JSON-RPC message.
 
 *Call graph*: called by 2 (write_jsonrpc_message, write_request); 3 external calls (bail!, Text, writeln!).
 
@@ -2451,11 +2461,11 @@ fn write_payload(&mut self, payload: &str) -> Result<()>
 fn read_payload(&mut self) -> Result<String>
 ```
 
-**Purpose**: Reads one raw payload string from the active transport, abstracting over line-delimited stdio and framed websocket messages.
+**Purpose**: This reads one raw message payload from the active transport. It hides the difference between line-based standard output and WebSocket frames.
 
-**Data flow**: For stdio, reads one line from the buffered child stdout, errors on EOF, and returns the line string. For websocket, loops reading frames until it gets a text frame, ignoring binary/ping/pong/frame variants and erroring on close. It returns the received text payload.
+**Data flow**: It reads one line from child stdout for standard-input mode, or loops over WebSocket frames until it gets text. It returns the text payload, or an error if the server closes the connection.
 
-**Call relations**: `read_jsonrpc_message` uses this as the lowest-level inbound transport primitive.
+**Call relations**: `read_jsonrpc_message` calls this before parsing incoming JSON.
 
 *Call graph*: called by 1 (read_jsonrpc_message); 2 external calls (new, bail!).
 
@@ -2466,11 +2476,11 @@ fn read_payload(&mut self) -> Result<String>
 fn print_multiline_with_prefix(prefix: &str, payload: &str)
 ```
 
-**Purpose**: Prints each line of a multi-line payload with a consistent prefix for readable request/response logs.
+**Purpose**: This prints multi-line text with a prefix on every line. It makes request and response logs easy to scan, with outgoing messages marked differently from incoming ones.
 
-**Data flow**: Splits the input string on lines and prints each line prefixed with the supplied marker. It returns unit and does not transform data beyond formatting.
+**Data flow**: It receives a prefix and payload text. It splits the payload into lines and prints each line with that prefix.
 
-**Call relations**: Used by request and response logging paths so outbound and inbound JSON are visually distinguished.
+**Call relations**: Request-writing and message-reading helpers call this when showing pretty JSON to the user.
 
 *Call graph*: called by 3 (read_jsonrpc_message, write_jsonrpc_message, write_request); 1 external calls (println!).
 
@@ -2481,11 +2491,11 @@ fn print_multiline_with_prefix(prefix: &str, payload: &str)
 async fn initialize(config_overrides: &[String]) -> Result<Self>
 ```
 
-**Purpose**: Loads config with CLI overrides, initializes OTEL/tracing if configured, and reports whether traces are enabled for the current command.
+**Purpose**: This sets up tracing for the test client using the same configuration system as the rest of Codex. Tracing means recording timing and context so a run can be inspected later in observability tools.
 
-**Data flow**: Parses raw `-c` overrides into `CliConfigOverrides`, asynchronously loads `Config`, builds an OTEL provider with service name `codex-app-server-test-client` and analytics enabled by default, checks whether a tracer provider exists, conditionally installs the provider’s tracing layer into the subscriber registry, and returns `TestClientTracing { _otel_provider, traces_enabled }`.
+**Data flow**: It receives config override strings, parses them, loads the Codex config, builds an OpenTelemetry provider when configured, installs a tracing subscriber if traces are enabled, and returns whether tracing is active.
 
-**Call relations**: `with_client` awaits this before opening the command span so outgoing requests can inherit trace context when tracing is configured.
+**Call relations**: `with_client` calls this before opening a client connection. The result is used to capture and print a trace summary.
 
 *Call graph*: calls 1 internal fn (build_provider); called by 1 (with_client); 3 external calls (load_with_cli_overrides, env!, registry).
 
@@ -2496,11 +2506,11 @@ async fn initialize(config_overrides: &[String]) -> Result<Self>
 fn capture(traces_enabled: bool) -> Self
 ```
 
-**Purpose**: Captures a user-facing trace summary from the current span context when tracing is enabled.
+**Purpose**: This captures a short human-readable trace link if tracing is enabled. If tracing is off or no trace context is available, it records that tracing is disabled.
 
-**Data flow**: If `traces_enabled` is false, returns `TraceSummary::Disabled`. Otherwise it reads the current W3C trace context, attempts to derive a trace URL with `trace_url_from_context`, and returns either `Enabled { url }` or `Disabled` if no usable context is present.
+**Data flow**: It receives a boolean saying whether traces are enabled. If false, it returns `Disabled`; otherwise it reads the current W3C trace context and tries to turn it into a trace URL.
 
-**Call relations**: `with_client` calls this inside the command span so it can print a Datadog-style trace link after the scenario finishes.
+**Call relations**: `with_client` calls this inside the command tracing span. It uses `trace_url_from_context` to build the link.
 
 *Call graph*: 1 external calls (current_span_w3c_trace_context).
 
@@ -2511,11 +2521,11 @@ fn capture(traces_enabled: bool) -> Self
 fn trace_url_from_context(trace: &W3cTraceContext) -> Option<String>
 ```
 
-**Purpose**: Extracts a Datadog-style trace URL path from a W3C `traceparent` header when the trace ID is well-formed.
+**Purpose**: This extracts the trace id from a W3C trace context and formats it as an internal trace URL. W3C trace context is a standard header format for connecting logs and traces across services.
 
-**Data flow**: Reads `trace.traceparent`, splits it on `-`, and if it finds four parts with a 32-character trace ID, formats `go/trace/<trace_id>` and returns it; otherwise returns `None`.
+**Data flow**: It receives a trace context, reads the `traceparent` string, splits it into its standard parts, checks that the trace id has the expected length, and returns `go/trace/<id>` if valid.
 
-**Call relations**: Used only by `TraceSummary::capture` to turn raw trace context into a concise printable link.
+**Call relations**: `TraceSummary::capture` calls this when traces are enabled and a trace context exists.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2526,11 +2536,11 @@ fn trace_url_from_context(trace: &W3cTraceContext) -> Option<String>
 fn print_trace_summary(trace_summary: &TraceSummary)
 ```
 
-**Purpose**: Prints a short Datadog trace section after a command finishes, either showing the trace URL or a disabled message.
+**Purpose**: This prints the trace information for a command run. It tells the user either where to find the Datadog trace or how to enable tracing.
 
-**Data flow**: Prints a `[Datadog trace]` header, matches the `TraceSummary`, and prints either the enabled URL or the constant disabled message. It returns unit.
+**Data flow**: It receives a `TraceSummary`. If it contains a URL, it prints it; otherwise it prints a fixed disabled-tracing message.
 
-**Call relations**: `with_client` calls this after the scenario closure completes so every command ends with a trace summary.
+**Call relations**: `with_client` calls this after the command-specific client work finishes.
 
 *Call graph*: called by 1 (with_client); 1 external calls (println!).
 
@@ -2541,22 +2551,24 @@ fn print_trace_summary(trace_summary: &TraceSummary)
 fn drop(&mut self)
 ```
 
-**Purpose**: Gracefully shuts down a spawned stdio app-server child when the client is dropped, escalating to kill after a timeout if needed.
+**Purpose**: This cleans up a child app-server process when a standard-input client is dropped. It gives the process a short chance to exit gracefully before killing it.
 
-**Data flow**: If the transport is websocket, it returns immediately. For stdio, it drops the stored stdin handle to signal EOF, checks whether the child already exited, then polls `try_wait` until `APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT` using `APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL`; if the child still has not exited, it sends `kill` and waits. It prints exit status when observed.
+**Data flow**: When the client is discarded, it checks whether the transport owns a child process. If so, it closes stdin, waits up to a timeout for exit, prints the exit status if available, and kills the process if it is still running.
 
-**Call relations**: This destructor runs automatically for stdio-backed clients created by `CodexClient::connect`/`spawn_stdio`, ensuring private app-server children do not leak.
+**Call relations**: Rust calls this automatically when a `CodexClient` goes out of scope. It only affects clients created by spawning `codex app-server`; WebSocket clients do not own the server process.
 
 *Call graph*: 3 external calls (now, println!, sleep).
 
 
 ### `app-server-test-client/src/plugin_analytics_smoke.rs`
 
-`test` · `manual smoke test execution during plugin analytics verification`
+`test` · `smoke test run`
 
-This file drives the standard plugin analytics smoke scenario. It creates or reuses a capture JSONL path, deletes any stale file, creates a temporary user config file, starts a loopback responses server, and assembles config overrides that force analytics on, enable plugin features, and point a mock model/provider at the loopback server. The child process receives both the analytics capture path and the temporary config path through environment variables, then the harness waits until the capture file exists before initializing the `CodexClient`.
+This is a safety check for plugin analytics. Analytics are records of important actions, such as “this plugin was enabled” or “this plugin was used.” If this test failed or did not exist, the app could silently stop reporting those actions, and people looking at plugin usage data would get wrong or incomplete information.
 
-Once connected, the test calls `plugin/installed`, searches all marketplaces for exactly one installed plugin matching the requested local plugin id, and verifies that it is installed, enabled, available, and backed by a remote plugin id. It then writes `plugins.<id>.enabled=false` and `true` into the temporary config via `config/value/write`, expecting `WriteStatus::Ok` both times. To prove the plugin is actually usable, it repeatedly starts ephemeral threads and turns that mention `plugin://<plugin_id>` until analytics for that turn include `codex_plugin_used`; this compensates for remote bundle readiness lag. Capture parsing reads JSONL payloads whose top-level `events` arrays are flattened into `Vec<Value>`. Validation requires exactly one each of `codex_plugin_disabled`, `codex_plugin_enabled`, and `codex_plugin_used`, checks plugin identity fields, and for usage events also requires non-null metadata such as thread id, turn id, model slug, connector and MCP fields.
+The file works like a small test harness. First it prepares a fresh capture file, which is just a temporary log where analytics events are written as JSON lines. It also creates a temporary user config file so the test can change plugin settings without touching a real user’s setup. Then it starts a loopback responses server, meaning a local fake model server that answers requests without needing a real external model provider.
+
+Next it launches the Codex binary as a child process with special environment variables and config overrides. It asks the server which plugins are installed, checks that the target plugin is present and usable, writes config changes to disable and re-enable it, and starts a short turn that mentions the plugin. Finally it repeatedly reads the analytics capture file until the required events appear, then validates their identity fields and important metadata. The repeated polling matters because analytics and plugin bundle readiness can be asynchronous, like waiting for a receipt to appear after a checkout.
 
 #### Function details
 
@@ -2571,11 +2583,11 @@ fn run(
 ) -> Result<()>
 ```
 
-**Purpose**: Executes the full plugin analytics smoke test for an already installed plugin, from environment setup through event validation. It is the main entry for the non-destructive analytics smoke command.
+**Purpose**: Runs the whole plugin analytics smoke test from start to finish. It sets up temporary files and fake services, launches Codex, performs plugin actions, then checks the analytics output.
 
-**Data flow**: Takes the Codex binary path, config overrides, target local plugin id, and optional capture-file path. It prepares the capture file, creates a `TemporaryConfigFile`, starts `LoopbackResponsesServer`, extends overrides with `smoke_config_overrides`, spawns a `CodexClient` with analytics and test-config environment variables, waits for capture readiness, initializes the client, discovers the expected plugin via `plugin_installed` and `expected_plugin`, toggles the plugin disabled then enabled via `write_plugin_enabled`, waits for plugin usage readiness, waits for required plugin events, validates them, prints pretty JSON and the capture path, and returns success or the first encountered error.
+**Data flow**: It receives the path to the Codex binary, config override strings, the plugin id to test, and optionally a capture-file path. It creates or cleans the capture file, builds a temporary config, starts a mock responses server, launches Codex with the right environment, drives plugin disable/enable/use actions, reads captured analytics events, validates them, and prints a short success report. The result is success if all required events are present and correct, or an error explaining what went wrong.
 
-**Call relations**: Called by the test client's smoke command dispatcher. It orchestrates nearly every helper in this file, plus the loopback server and client spawn path.
+**Call relations**: This is the main coordinator for the file. It calls the setup helpers first, then uses the client-facing helpers to ask about installed plugins and change config, then waits for plugin usage and analytics validation before returning to the outer test runner.
 
 *Call graph*: calls 12 internal fn (spawn_stdio_with_env, start, create, expected_plugin, plugin_installed, prepare_capture_file, smoke_config_overrides, validate_plugin_events, wait_for_plugin_events, wait_for_plugin_usage (+2 more)); called by 1 (run); 2 external calls (println!, vec!).
 
@@ -2586,11 +2598,11 @@ fn run(
 fn run_plugin_turn(client: &mut CodexClient, expected: &ExpectedPlugin) -> Result<String>
 ```
 
-**Purpose**: Starts an ephemeral thread and turn that mentions the target plugin so the app server attempts to resolve and use it. It fails if the streamed turn does not complete successfully.
+**Purpose**: Starts one temporary Codex conversation turn that mentions the expected plugin. This is how the test causes a real plugin-use analytics event to be produced.
 
-**Data flow**: Accepts a mutable `CodexClient` and `ExpectedPlugin`. It sends `thread_start` with the mock model/provider constants and empty instructions, then `turn_start` with a single `UserInput::Mention` pointing at `plugin://<plugin_id>` and the plugin name, streams the turn to completion, checks `client.last_turn_status` and `client.last_turn_error_message`, and returns the created turn id.
+**Data flow**: It takes a live Codex client and the expected plugin details. It creates an ephemeral thread, starts a turn whose user input mentions the plugin by name and plugin URL, streams the turn until completion, and returns the new turn id. If the turn does not finish successfully, it returns an error with the last known status and error message.
 
-**Call relations**: Called repeatedly by `wait_for_plugin_usage` until a turn's analytics prove the plugin was actually used.
+**Call relations**: It is called by `wait_for_plugin_usage` during retry attempts. It hands back a turn id so the caller can look in the analytics capture file for events belonging to that exact turn.
 
 *Call graph*: calls 3 internal fn (stream_turn, thread_start, turn_start); called by 1 (wait_for_plugin_usage); 4 external calls (default, new, bail!, vec!).
 
@@ -2605,11 +2617,11 @@ fn wait_for_plugin_usage(
 ) -> Result<()>
 ```
 
-**Purpose**: Retries plugin-mention turns until analytics show that the plugin was used in a completed turn, accommodating delayed remote bundle readiness. It treats turn-completion analytics as the barrier for each attempt.
+**Purpose**: Keeps trying short plugin turns until the remote plugin is actually usable and a plugin-used event appears. This protects the smoke test from failing just because a remote plugin bundle is still warming up.
 
-**Data flow**: Takes a mutable client, capture-file path, and expected plugin metadata. It loops until `PLUGIN_READY_TIMEOUT`, incrementing an attempt counter, running a plugin turn, waiting for analytics for that turn id, and scanning those events for a `codex_plugin_used` event whose `turn_id` and `plugin_id` match the attempt. On success it optionally prints how many attempts were needed; on timeout it returns an error mentioning the plugin id and attempt count.
+**Data flow**: It receives a Codex client, the analytics capture path, and expected plugin details. On each attempt it runs a plugin turn, waits until analytics for that turn arrive, and checks whether those events include `codex_plugin_used` for the expected plugin id. It returns when usage is confirmed, or fails after the timeout.
 
-**Call relations**: Called by `run` after toggling enabled state and before final event collection. It delegates each attempt to `run_plugin_turn` and `wait_for_turn_analytics`.
+**Call relations**: The top-level `run` function calls this after enabling the plugin. Internally it calls `run_plugin_turn` to trigger behavior and `wait_for_turn_analytics` to use the completed turn event as a sign that analytics for that attempt have flushed.
 
 *Call graph*: calls 2 internal fn (run_plugin_turn, wait_for_turn_analytics); called by 1 (run); 4 external calls (now, bail!, println!, sleep).
 
@@ -2620,11 +2632,11 @@ fn wait_for_plugin_usage(
 fn plugin_installed(client: &mut CodexClient) -> Result<PluginInstalledResponse>
 ```
 
-**Purpose**: Fetches the installed-plugin inventory from the app server. It is the raw RPC wrapper used before narrowing to the target plugin.
+**Purpose**: Asks the Codex app server for its installed plugin list. The smoke test needs this to prove the target plugin exists before testing its analytics.
 
-**Data flow**: Receives a mutable `CodexClient`, allocates a request id, sends `ClientRequest::PluginInstalled` with empty optional filters, and returns the typed `PluginInstalledResponse`.
+**Data flow**: It takes a mutable Codex client, creates a request id, sends a `PluginInstalled` request with default query parameters, and returns the structured plugin-installed response. If the server rejects or fails the request, the error is returned.
 
-**Call relations**: Called by `run` as the first plugin-discovery step before `expected_plugin` validates the chosen plugin.
+**Call relations**: The top-level `run` function calls this soon after initialization. Its response is passed to `expected_plugin`, which checks that the target plugin is the one the rest of the test should exercise.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 1 (run).
 
@@ -2635,11 +2647,11 @@ fn plugin_installed(client: &mut CodexClient) -> Result<PluginInstalledResponse>
 fn expected_plugin(response: &PluginInstalledResponse, plugin_id: &str) -> Result<ExpectedPlugin>
 ```
 
-**Purpose**: Finds and validates the single installed plugin matching the requested local plugin id across all marketplaces. It extracts the identity fields later used to validate analytics.
+**Purpose**: Finds and checks the one plugin that this smoke test is supposed to test. It makes sure the plugin is installed, enabled, available, and connected to a remote plugin id.
 
-**Data flow**: Consumes a `PluginInstalledResponse` reference and target plugin id. It flattens all marketplace/plugin pairs, collects matches by `plugin.id`, requires exactly one match, checks `installed`, `enabled`, `availability == Available`, and presence of `remote_plugin_id`, then returns `ExpectedPlugin { plugin_id, plugin_name, marketplace_name }`.
+**Data flow**: It receives the full installed-plugin response and the desired local plugin id. It searches all marketplaces for matching plugins, requires exactly one match, checks several health flags, and returns a compact `ExpectedPlugin` record with the plugin id, display name, and marketplace name. If anything is missing or ambiguous, it returns an error.
 
-**Call relations**: Called by `run` immediately after `plugin_installed`; its output feeds config writes, turn generation, and analytics validation.
+**Call relations**: It is called by `run` after `plugin_installed`. The returned expected identity is then used by config-writing, turn-running, and event-validation code so every later check is tied to the same plugin.
 
 *Call graph*: called by 1 (run); 1 external calls (bail!).
 
@@ -2655,11 +2667,11 @@ fn write_plugin_enabled(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes the plugin enabled flag into the temporary config file through the app server's config-write RPC and verifies the write was accepted. It is used to generate disabled/enabled analytics events deterministically.
+**Purpose**: Writes a plugin enabled-or-disabled setting into the temporary config file through the app server. This is how the test deliberately triggers plugin disabled and enabled analytics events.
 
-**Data flow**: Takes a mutable client, config file path, plugin id, and desired boolean. It sends `ClientRequest::ConfigValueWrite` with key path `plugins.<plugin_id>.enabled`, JSON boolean value, `MergeStrategy::Replace`, and the explicit file path, prints the returned status, and returns an error if `response.status` is anything other than `WriteStatus::Ok`.
+**Data flow**: It takes a Codex client, a config file path, a plugin id, and a boolean enabled value. It sends a config write request for `plugins.<id>.enabled`, replacing the value in the chosen config file. It prints the write status and succeeds only if the server reports that the write was accepted normally.
 
-**Call relations**: Called twice by `run`, first with `false` then with `true`, to force both state-transition analytics events.
+**Call relations**: The top-level `run` function calls it twice: first to disable the plugin, then to enable it again. Those two writes are expected to create the `codex_plugin_disabled` and `codex_plugin_enabled` analytics events later validated by the file.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 1 (run); 5 external calls (display, bail!, format!, json!, println!).
 
@@ -2670,11 +2682,11 @@ fn write_plugin_enabled(
 fn smoke_config_overrides(responses_base_url: &str) -> Result<Vec<String>>
 ```
 
-**Purpose**: Builds the fixed set of config overrides needed for the smoke environment, including analytics flags and a mock model provider pointed at the loopback responses server. It serializes string values so they can be passed as config literals.
+**Purpose**: Builds the config override strings needed to run this smoke test in a controlled environment. These overrides turn on plugin and analytics features and point model traffic at the local fake responses server.
 
-**Data flow**: Accepts the loopback server base URL, serializes the provider `/v1` URL as JSON, constructs a `Vec<String>` containing analytics/plugin feature flags, default model/provider selection, provider metadata, wire API, auth requirement, and retry limits, and returns that vector.
+**Data flow**: It receives the base URL of the loopback responses server. It formats that into a provider URL and returns a list of config assignments: analytics enabled, plugin features enabled, mock model and provider names, wire API choice, no OpenAI auth, and zero retries. If string serialization fails, it returns an error.
 
-**Call relations**: Called by `run` during child-process setup. It uses `quoted` for string-valued config entries.
+**Call relations**: The top-level `run` function extends the caller’s config overrides with these smoke-test-specific settings before launching the Codex child process.
 
 *Call graph*: called by 1 (run); 3 external calls (format!, to_string, vec!).
 
@@ -2685,11 +2697,11 @@ fn smoke_config_overrides(responses_base_url: &str) -> Result<Vec<String>>
 fn quoted(value: &str) -> Result<String>
 ```
 
-**Purpose**: Serializes a plain string into a JSON string literal suitable for embedding in config override expressions. This avoids manual escaping bugs.
+**Purpose**: Turns a plain string into a JSON-quoted string suitable for use inside config override text. This avoids broken config when values contain characters that need escaping.
 
-**Data flow**: Takes `&str`, runs `serde_json::to_string`, and returns the serialized string or a contextual error.
+**Data flow**: It receives a string slice, serializes it as a JSON string, and returns the quoted text or an error. For example, a bare name becomes a properly quoted value that can be embedded in an override.
 
-**Call relations**: Used by `smoke_config_overrides` when constructing override values that must remain quoted strings.
+**Call relations**: It is used while building smoke-test config overrides, so model and provider names are written in a safe, parseable form.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -2700,11 +2712,11 @@ fn quoted(value: &str) -> Result<String>
 fn prepare_capture_file(path: &Path) -> Result<()>
 ```
 
-**Purpose**: Ensures the analytics capture path is usable by verifying its parent directory exists and removing any stale file at that path. It intentionally leaves the file absent so the child process can create it.
+**Purpose**: Makes sure the analytics capture file path is ready for a fresh test run. It removes any old file so previous events cannot be mistaken for new ones.
 
-**Data flow**: Accepts a path, checks `parent()` and that the parent is a directory, attempts `fs::remove_file`, ignores `NotFound`, and wraps other filesystem errors with path context. It returns `Ok(())` once the path is clean.
+**Data flow**: It receives a path, checks that the path has an existing parent directory, and tries to delete any file already there. Missing old files are fine; missing parent directories or delete failures become errors. It does not create the new capture file itself.
 
-**Call relations**: Called by both smoke-test files before spawning a child process that will create and append to the capture file.
+**Call relations**: The top-level smoke runner calls this before launching Codex. Afterward, `wait_until_capture_is_ready` waits for the child process to create the actual capture file.
 
 *Call graph*: called by 2 (run, run); 3 external calls (parent, bail!, remove_file).
 
@@ -2715,11 +2727,11 @@ fn prepare_capture_file(path: &Path) -> Result<()>
 fn wait_until_capture_is_ready(path: &Path) -> Result<()>
 ```
 
-**Purpose**: Polls for the analytics capture file to appear, which indicates that the child process supports and has activated capture output. It fails fast with a hint to use a debug Codex binary if the file never appears.
+**Purpose**: Waits for the Codex child process to create the analytics capture file. This confirms that the debug analytics capture hook is active before the test starts making plugin actions.
 
-**Data flow**: Takes the capture-file path, repeatedly checks `fs::metadata` until success or `CAPTURE_READY_TIMEOUT`, ignores `NotFound`, wraps other metadata errors with path context, sleeps `CAPTURE_POLL_INTERVAL` between attempts, and returns `Ok(())` or a timeout error.
+**Data flow**: It receives a file path and repeatedly checks whether filesystem metadata exists for it. If the file appears before the short timeout, it returns success. If the file never appears, it returns an error suggesting that a debug Codex binary may be needed.
 
-**Call relations**: Called by both smoke-test files immediately after spawning the child client and before initialization proceeds.
+**Call relations**: The top-level `run` function calls it right after spawning Codex and before initialization. Later analytics-reading helpers assume this capture file is where events will be written.
 
 *Call graph*: called by 2 (run, run); 4 external calls (now, bail!, metadata, sleep).
 
@@ -2730,11 +2742,11 @@ fn wait_until_capture_is_ready(path: &Path) -> Result<()>
 fn wait_for_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Polls the capture file until all required plugin analytics event types have appeared for the target plugin. It is the final collection barrier before validation.
+**Purpose**: Polls the analytics capture file until all required plugin event types have appeared for the chosen plugin. It gives asynchronous analytics time to be written.
 
-**Data flow**: Accepts the capture-file path and plugin id. It repeatedly reads plugin-filtered events, checks that every event type from `required_event_types()` has count at least one using `event_count`, and returns the collected events once complete. On timeout it returns an error that includes the event types actually seen.
+**Data flow**: It receives the capture-file path and plugin id. It repeatedly reads plugin-specific events and checks for at least one disabled, enabled, and used event. It returns the collected events once all are present, or fails with a timeout message showing which event types were found.
 
-**Call relations**: Called by `run` after plugin usage has been proven. It depends on `read_plugin_events`, `required_event_types`, and `event_count`.
+**Call relations**: The top-level `run` function calls this after plugin usage has been confirmed. It relies on `read_plugin_events` to filter the capture file and on `required_event_types` to know what the smoke test must see.
 
 *Call graph*: calls 2 internal fn (read_plugin_events, required_event_types); called by 1 (run); 3 external calls (now, bail!, sleep).
 
@@ -2745,11 +2757,11 @@ fn wait_for_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>>
 fn wait_for_turn_analytics(path: &Path, turn_id: &str) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Waits until analytics for a specific turn id have been captured, using the turn event as a synchronization point. This lets the caller inspect all events emitted for that attempt.
+**Purpose**: Waits until analytics for a specific turn have been captured. In this file, that turn event acts like a checkpoint showing that analytics for an attempted plugin use have caught up.
 
-**Data flow**: Takes the capture-file path and turn id, repeatedly reads all capture events, scans for a `codex_turn_event` whose `event_params.turn_id` matches, and returns the full event list once found. It times out after `CAPTURE_TIMEOUT` with a path-specific error.
+**Data flow**: It receives the capture path and a turn id. It repeatedly reads all capture events and looks for a `codex_turn_event` whose parameters contain that turn id. It returns the current events once found, or fails if the timeout expires.
 
-**Call relations**: Called by `wait_for_plugin_usage` after each attempted plugin turn.
+**Call relations**: It is called by `wait_for_plugin_usage` after each attempted plugin turn. The returned events are then inspected for a plugin-used event tied to the same turn.
 
 *Call graph*: calls 1 internal fn (read_capture_events); called by 1 (wait_for_plugin_usage); 3 external calls (now, bail!, sleep).
 
@@ -2760,11 +2772,11 @@ fn wait_for_turn_analytics(path: &Path, turn_id: &str) -> Result<Vec<Value>>
 fn read_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Filters the full analytics capture down to events whose `event_params.plugin_id` matches the target plugin. It is a thin convenience wrapper over raw capture parsing.
+**Purpose**: Reads the analytics capture file and keeps only events whose plugin id matches the plugin being tested. This keeps later checks focused on the relevant plugin.
 
-**Data flow**: Accepts the capture-file path and plugin id, calls `read_capture_events`, filters the resulting `Vec<Value>` by `event_params.plugin_id`, and returns the filtered vector.
+**Data flow**: It receives the capture-file path and plugin id. It calls `read_capture_events` to parse all events, filters them by `event_params.plugin_id`, and returns the matching JSON event values.
 
-**Call relations**: Used by `wait_for_plugin_events` to focus only on analytics relevant to the plugin under test.
+**Call relations**: It feeds `wait_for_plugin_events`, which repeatedly calls it while waiting for the disabled, enabled, and used events to appear.
 
 *Call graph*: calls 1 internal fn (read_capture_events); called by 1 (wait_for_plugin_events).
 
@@ -2775,11 +2787,11 @@ fn read_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>>
 fn read_capture_events(path: &Path) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Parses the JSONL analytics capture file into a flat vector of individual event objects. Each non-empty line is expected to contain a payload with an `events` array.
+**Purpose**: Loads and parses the analytics capture file into individual event objects. The capture file is JSON Lines format, meaning each line is a separate JSON payload.
 
-**Data flow**: Takes the capture-file path, reads the file to string, returns an empty vector on `NotFound`, otherwise iterates lines with indexes, skips blank lines, parses each line as `serde_json::Value`, extracts `payload["events"]` as an array, clones each event into an accumulator, and returns the flattened `Vec<Value>`.
+**Data flow**: It receives a path. If the file does not exist yet, it returns an empty list. Otherwise it reads the file as text, skips blank lines, parses each line as JSON, extracts the line’s `events` array, and appends those events into one list. Bad file reads, bad JSON, or missing `events` arrays become errors with context.
 
-**Call relations**: Called by both `read_plugin_events` and `wait_for_turn_analytics`; it is the core capture-file parser for this smoke harness.
+**Call relations**: It is the shared reader for both plugin-level waiting and turn-level waiting. Higher-level helpers build their specific checks on top of this raw capture parsing.
 
 *Call graph*: called by 2 (read_plugin_events, wait_for_turn_analytics); 3 external calls (new, read_to_string, from_str).
 
@@ -2790,11 +2802,11 @@ fn read_capture_events(path: &Path) -> Result<Vec<Value>>
 fn validate_plugin_events(events: Vec<Value>, expected: &ExpectedPlugin) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Checks that the plugin analytics capture contains exactly one event of each required type and that each event carries the expected identity and usage metadata. It returns the validated events in required-type order.
+**Purpose**: Performs the final correctness check on the captured plugin analytics events. It verifies not just that events exist, but that exactly one of each required type exists and that their important fields are correct.
 
-**Data flow**: Consumes a vector of event `Value`s and an `ExpectedPlugin`. For each event type from `required_event_types`, it filters matching events, requires exactly one, validates plugin identity fields, additionally validates usage metadata for `codex_plugin_used`, clones the event into an output vector, and returns that vector or a descriptive error.
+**Data flow**: It receives the plugin-related events and the expected plugin identity. For each required event type, it finds matching events, requires exactly one, validates plugin identity fields, and for the used event also validates extra usage metadata. It returns the validated events for printing.
 
-**Call relations**: Called by `run` after `wait_for_plugin_events` has ensured the required event types are present.
+**Call relations**: The top-level `run` function calls it after `wait_for_plugin_events` has collected enough events. It delegates detailed field checks to `validate_identity` and `validate_used_metadata`.
 
 *Call graph*: calls 3 internal fn (required_event_types, validate_identity, validate_used_metadata); called by 1 (run); 2 external calls (new, bail!).
 
@@ -2805,11 +2817,11 @@ fn validate_plugin_events(events: Vec<Value>, expected: &ExpectedPlugin) -> Resu
 fn required_event_types() -> [&'static str; 3]
 ```
 
-**Purpose**: Defines the exact analytics event types that the smoke test expects from toggling and using a plugin. Keeping them in one place ensures polling and validation stay aligned.
+**Purpose**: Defines the three analytics events this smoke test requires: plugin disabled, plugin enabled, and plugin used. Keeping them in one place makes the waiting and validation steps agree.
 
-**Data flow**: Returns a fixed array of three `&'static str` values: `codex_plugin_disabled`, `codex_plugin_enabled`, and `codex_plugin_used`.
+**Data flow**: It takes no input and returns a fixed array of event type names. The values are used as the checklist for polling and final validation.
 
-**Call relations**: Used by both `wait_for_plugin_events` and `validate_plugin_events` so collection and validation share the same required set.
+**Call relations**: Both the waiting code and the validation code call this, so they are checking the same required set rather than maintaining two separate lists.
 
 *Call graph*: called by 2 (validate_plugin_events, wait_for_plugin_events).
 
@@ -2820,11 +2832,11 @@ fn required_event_types() -> [&'static str; 3]
 fn event_count(events: &[Value], event_type: &str) -> usize
 ```
 
-**Purpose**: Counts how many captured events have a given `event_type`. It supports the polling logic that waits for all required event kinds to appear.
+**Purpose**: Counts how many captured events have a particular event type. It is a small helper for deciding whether enough events have arrived.
 
-**Data flow**: Takes a slice of event `Value`s and an event-type string, filters by `event["event_type"] == event_type`, and returns the count.
+**Data flow**: It receives a slice of JSON event values and an event type string. It scans the events, compares each event’s `event_type` field to the requested type, and returns the count.
 
-**Call relations**: Used by `wait_for_plugin_events` when checking whether every required event type has appeared at least once.
+**Call relations**: It supports the polling logic that waits for required plugin analytics events. Its output is used as a simple yes/no signal: has at least one of this type appeared yet?
 
 *Call graph*: 1 external calls (iter).
 
@@ -2835,11 +2847,11 @@ fn event_count(events: &[Value], event_type: &str) -> usize
 fn validate_identity(event: &Value, expected: &ExpectedPlugin) -> Result<()>
 ```
 
-**Purpose**: Verifies that a captured plugin event names the expected plugin id, plugin name, and marketplace. It enforces consistent identity across all event types.
+**Purpose**: Checks that an analytics event describes the exact plugin and marketplace expected by the test. This catches cases where an event exists but belongs to the wrong plugin or has wrong labels.
 
-**Data flow**: Accepts an event `Value` and `ExpectedPlugin`, reads `event["event_params"]`, and calls `require_string` for `plugin_id`, `plugin_name`, and `marketplace_name`. It returns `Ok(())` only if all three match exactly.
+**Data flow**: It receives one JSON event and the expected plugin details. It looks inside `event_params` and requires matching `plugin_id`, `plugin_name`, and `marketplace_name` string fields. It returns success only if all three match.
 
-**Call relations**: Called by `validate_plugin_events` for every required event before any event is accepted as valid.
+**Call relations**: It is called by `validate_plugin_events` for every required event. It uses `require_string` for the repeated field-by-field comparison work.
 
 *Call graph*: calls 1 internal fn (require_string); called by 1 (validate_plugin_events).
 
@@ -2850,11 +2862,11 @@ fn validate_identity(event: &Value, expected: &ExpectedPlugin) -> Result<()>
 fn validate_used_metadata(event: &Value) -> Result<()>
 ```
 
-**Purpose**: Checks that the `codex_plugin_used` event includes the non-null metadata fields expected from a real plugin invocation, including the mock model slug. This guards against partially populated analytics.
+**Purpose**: Checks the extra fields that must be present on a plugin-used analytics event. These fields describe the context of the usage, such as the turn, thread, model, and plugin resources.
 
-**Data flow**: Takes an event `Value`, inspects `event["event_params"]`, ensures each of `has_skills`, `mcp_server_count`, `connector_ids`, `mcp_server_names`, `thread_id`, `turn_id`, and `model_slug` is present and non-null, then requires `model_slug == MOCK_MODEL_SLUG`.
+**Data flow**: It receives one JSON event. It inspects `event_params` and fails if required fields such as `thread_id`, `turn_id`, `connector_ids`, or `mcp_server_count` are missing or null. It also requires `model_slug` to equal the mock model slug used by this smoke test.
 
-**Call relations**: Called only by `validate_plugin_events` for the `codex_plugin_used` case.
+**Call relations**: It is called only by `validate_plugin_events` when validating the `codex_plugin_used` event. It uses `require_string` for the exact model-slug check.
 
 *Call graph*: calls 1 internal fn (require_string); called by 1 (validate_plugin_events); 1 external calls (bail!).
 
@@ -2865,11 +2877,11 @@ fn validate_used_metadata(event: &Value) -> Result<()>
 fn require_string(params: &Value, field: &str, expected: &str) -> Result<()>
 ```
 
-**Purpose**: Asserts that a JSON object field exists as a string and equals an expected value. It provides the common exact-match check used by event validators.
+**Purpose**: Checks that a JSON object has a named string field with an exact expected value. It gives clearer error messages than a bare comparison would.
 
-**Data flow**: Accepts a JSON `Value` object, field name, and expected string. It reads `params.get(field).and_then(Value::as_str)`, compares it to `Some(expected)`, and returns `Ok(())` or a `bail!` error describing the mismatch.
+**Data flow**: It receives a JSON value, a field name, and the expected string. It reads the field, treats non-string or missing values as no match, and returns success only when the actual string equals the expected one. Otherwise it returns an error saying what was expected and what was found.
 
-**Call relations**: Used by `validate_identity` and `validate_used_metadata` to keep field checking consistent.
+**Call relations**: It is the shared low-level checker used by `validate_identity` and `validate_used_metadata` so those functions can express their checks clearly.
 
 *Call graph*: called by 2 (validate_identity, validate_used_metadata); 2 external calls (get, bail!).
 
@@ -2880,11 +2892,11 @@ fn require_string(params: &Value, field: &str, expected: &str) -> Result<()>
 fn create() -> Result<Self>
 ```
 
-**Purpose**: Creates an empty temporary TOML config file in the system temp directory for the smoke test to mutate. The file path is deterministic per process id.
+**Purpose**: Creates an empty temporary config file for the smoke test. This lets the test write plugin settings without changing a real user configuration file.
 
-**Data flow**: Builds a temp path named `codex-plugin-analytics-config-<pid>.toml`, writes an empty string to it, wraps filesystem errors with path context, and returns `TemporaryConfigFile { path }`.
+**Data flow**: It builds a path in the system temp directory using the current process id, writes an empty file at that path, and returns a `TemporaryConfigFile` wrapper holding the path. If the file cannot be written, it returns an error with the path included.
 
-**Call relations**: Called by `run` during setup so config writes can target an isolated file rather than the user's real config.
+**Call relations**: The top-level `run` function calls this during setup. The resulting object provides the config path for environment setup and later config write requests, and its drop behavior cleans the file up.
 
 *Call graph*: called by 1 (run); 3 external calls (format!, write, temp_dir).
 
@@ -2895,11 +2907,11 @@ fn create() -> Result<Self>
 fn path(&self) -> &Path
 ```
 
-**Purpose**: Returns the filesystem path of the temporary config file. It is a simple accessor used by setup and config-write calls.
+**Purpose**: Returns the path of the temporary config file. Other parts of the smoke test use this path when launching Codex and writing plugin settings.
 
-**Data flow**: Borrows `self` and returns `&Path` referencing the stored `PathBuf`.
+**Data flow**: It receives the temporary config wrapper by reference and returns a borrowed path reference. It does not read, write, or change the file.
 
-**Call relations**: Used by `run` when exporting the config path to the child environment and when issuing `config/value/write` requests.
+**Call relations**: The setup and config-writing parts of `run` call this when they need to pass the same temporary config file path to the child process or to config write requests.
 
 
 ##### `TemporaryConfigFile::drop`  (lines 498–500)
@@ -2908,22 +2920,26 @@ fn path(&self) -> &Path
 fn drop(&mut self)
 ```
 
-**Purpose**: Best-effort deletes the temporary config file when the wrapper goes out of scope. It prevents smoke-test artifacts from accumulating in the temp directory.
+**Purpose**: Deletes the temporary config file when the wrapper goes out of scope. This is cleanup code, like throwing away scratch paper after the test is done.
 
-**Data flow**: On drop, calls `fs::remove_file(&self.path)` and ignores any error.
+**Data flow**: It receives the wrapper during automatic cleanup and attempts to remove the file at its stored path. Any deletion error is ignored, because cleanup failure should not hide the main test result.
 
-**Call relations**: Runs automatically at teardown after `run` returns and the temporary config wrapper is dropped.
+**Call relations**: Rust calls this automatically when `TemporaryConfigFile` is dropped, normally at the end of `run` or during early error unwinding. It complements `TemporaryConfigFile::create` by removing the file it made.
 
 *Call graph*: 1 external calls (remove_file).
 
 
 ### `app-server-test-client/src/plugin_analytics_mutation_smoke.rs`
 
-`test` · `manual smoke test execution and post-failure cleanup`
+`test` · `manual smoke test and cleanup`
 
-This file is a test-driver for account-mutating plugin analytics scenarios. Its top-level flow insists on an explicit `AccountMutationConfirmation` before touching account state, then prepares a JSONL analytics capture file, spawns a `CodexClient` with analytics and remote-plugin features enabled, and waits for the capture sink to appear. After initialization it reads the target plugin through `plugin/read`, materializing a `RemotePluginExpectation` that captures the local plugin id, remote id, display name, marketplace name, install policy, availability, and installed flag. The initial plugin must be uninstalled and installable; otherwise the test aborts early.
+This file exists to test a risky but important path: changing plugin state on a real account and proving that analytics records those changes correctly. A “smoke test” is a broad end-to-end check that asks, “does the whole thing basically work?” Here, the whole thing includes starting the Codex app server, reading a remote plugin from the marketplace, installing it, waiting until the server reports it as installed, uninstalling it, and checking the captured analytics file.
 
-The mutation sequence installs the plugin, polls `plugin/read` until `installed == true`, waits for a `codex_plugin_installed` event to appear in the capture file, then issues uninstall and polls until the backend reports `installed == false`. A notable design choice is that uninstall RPC failure is tracked separately from backend state: if the backend becomes uninstalled but the RPC still errors, the run is treated as a local-cache/client-side failure rather than a dirty backend state. Final analytics validation delegates to shared capture helpers and checks event identity against the remote plugin id/name/marketplace. Cleanup logic classifies outcomes into `Clean`, `LocalCleanupFailure`, `Dirty`, and `Unknown`, and prints a shell-quoted recovery command when manual intervention may be needed.
+The file is careful because it mutates account state. It refuses to run unless the caller explicitly confirms that account mutation is allowed. It also requires the chosen plugin to start out uninstalled, so the test can safely restore the original state afterward.
+
+The flow is like borrowing a tool from a shared workshop: first make sure you are allowed to touch it, record where everything is, take the tool out, confirm the checkout was logged, put it back, and confirm the shelf is clean again. If anything goes wrong, the code tries to clean up by uninstalling the plugin. If cleanup cannot be verified, it prints a recovery command so a human can fix the account state.
+
+It also distinguishes between backend state and local cleanup problems. For example, the plugin may truly be uninstalled on the backend even if the uninstall request reports an error afterward. The file reports those cases separately so failures are easier to diagnose.
 
 #### Function details
 
@@ -2939,11 +2955,11 @@ fn run(
 ) -> Result<()>
 ```
 
-**Purpose**: Executes the full remote-plugin mutation smoke test from confirmation through analytics validation and final state restoration. It is the main destructive test path for install/uninstall analytics.
+**Purpose**: Runs the full analytics mutation smoke test. It starts a Codex client with analytics capture enabled, installs and uninstalls a remote plugin, validates the captured analytics, and then makes sure the plugin is left uninstalled.
 
-**Data flow**: Takes the Codex binary path, config overrides, target remote plugin id, confirmation flag, and optional capture-file path. It validates confirmation, chooses or creates a capture path, prepares the file, spawns and initializes a `CodexClient`, reads and validates the initial remote plugin state, runs the install/uninstall sequence, then attempts cleanup via `restore_uninstalled_state`. It prints progress, pretty-prints validated events on success, and returns `Ok(())` or propagates the most relevant failure depending on whether cleanup was clean, locally inconsistent, dirty, or unverifiable.
+**Data flow**: It receives the Codex binary path, configuration overrides, the remote plugin id, a confirmation value, and optionally a capture-file path. It first refuses to continue without confirmation, prepares the analytics capture file, starts the app server, reads the plugin, checks that it is safe to mutate, runs the install/uninstall sequence, and then attempts cleanup. It returns success only when analytics were validated and the original uninstalled state was restored; otherwise it returns an error and prints a failure category and recovery guidance.
 
-**Call relations**: This is invoked by the test client's command dispatch for the mutation smoke command. It orchestrates the whole flow by calling confirmation checks, capture-file setup helpers from the non-mutation smoke module, client spawning, plugin inspection, the mutation sequence, and cleanup/recovery printers when restoration is not clean.
+**Call relations**: This is the main driver for the smoke test. It calls require_confirmation before touching the account, uses spawn_client to start the test server, uses read_remote_plugin and validate_initial_plugin to confirm the starting state, delegates the core install/uninstall check to run_mutation_sequence, and always follows with restore_uninstalled_state. When cleanup leaves uncertainty or a dirty account, it calls print_dirty_recovery or print_recovery_command to tell the operator what to do next.
 
 *Call graph*: calls 10 internal fn (print_dirty_recovery, print_recovery_command, read_remote_plugin, require_confirmation, restore_uninstalled_state, run_mutation_sequence, spawn_client, validate_initial_plugin, prepare_capture_file, wait_until_capture_is_ready); called by 1 (run); 2 external calls (eprintln!, println!).
 
@@ -2959,11 +2975,11 @@ fn run_cleanup(
 ) -> Result<()>
 ```
 
-**Purpose**: Runs only the restoration logic needed to ensure a remote plugin is uninstalled, without capturing analytics or exercising install/uninstall transitions. It is intended as a recovery command after a dirty or interrupted smoke run.
+**Purpose**: Runs only the cleanup path: it tries to make sure a remote plugin is uninstalled. This is used when the full smoke test failed or when a human wants to restore the account state directly.
 
-**Data flow**: Accepts the Codex binary path, config overrides, remote plugin id, and confirmation. It verifies confirmation, appends overrides that disable analytics but enable plugin features, spawns a stdio `CodexClient`, initializes it, and calls `restore_uninstalled_state`. It prints a PASS message when the plugin is already or becomes uninstalled, otherwise emits categorized failure output and returns the cleanup error.
+**Data flow**: It receives the Codex binary path, configuration overrides, the remote plugin id, and the required confirmation. It adds plugin-related configuration, starts a Codex client without analytics capture, initializes it, and asks restore_uninstalled_state to remove the plugin if needed. It prints success if the plugin is uninstalled, or returns an error if cleanup failed or could not be verified.
 
-**Call relations**: This is called by the CLI cleanup subcommand rather than the main smoke path. It reuses `require_confirmation` and `restore_uninstalled_state`, and delegates dirty-state messaging to `print_dirty_recovery`.
+**Call relations**: This is a smaller companion to run. It still calls require_confirmation because it mutates account state, then relies on restore_uninstalled_state for the actual cleanup. If the plugin still appears installed, it calls print_dirty_recovery so the user gets the same recovery instructions as in the full smoke test.
 
 *Call graph*: calls 4 internal fn (spawn_stdio, print_dirty_recovery, require_confirmation, restore_uninstalled_state); called by 1 (run); 2 external calls (eprintln!, println!).
 
@@ -2974,11 +2990,11 @@ fn run_cleanup(
 fn from_flag(confirm_account_mutation: bool) -> Self
 ```
 
-**Purpose**: Converts the raw CLI boolean into the explicit confirmation enum used by the mutation commands. It centralizes the mapping between a missing flag and a blocked destructive action.
+**Purpose**: Turns a command-line confirmation flag into a small internal value that says whether account mutation was explicitly approved. This keeps the safety check clear and consistent.
 
-**Data flow**: Consumes a `bool` and returns either `AccountMutationConfirmation::Confirmed` or `AccountMutationConfirmation::Missing`. It reads no external state and writes nothing.
+**Data flow**: It takes a boolean from the caller, where true means the user supplied the confirmation flag. It returns AccountMutationConfirmation::Confirmed for true and AccountMutationConfirmation::Missing for false. It does not change anything else.
 
-**Call relations**: Used by higher-level command parsing before `run` or `run_cleanup` are entered, so those functions can enforce confirmation through a typed value instead of a bare boolean.
+**Call relations**: This is used before run or run_cleanup receive their confirmation value. Those later functions pass the value to require_confirmation, which is the gate that stops accidental install and uninstall operations.
 
 *Call graph*: called by 1 (run).
 
@@ -2989,11 +3005,11 @@ fn from_flag(confirm_account_mutation: bool) -> Self
 fn require_confirmation(confirmation: AccountMutationConfirmation) -> Result<()>
 ```
 
-**Purpose**: Rejects execution unless the caller explicitly acknowledged that the command mutates the active account by installing and uninstalling a plugin. Its error message explains the required rerun flag.
+**Purpose**: Protects the active account from accidental changes. It refuses to continue unless the caller has explicitly confirmed that installing and uninstalling a plugin is allowed.
 
-**Data flow**: Takes an `AccountMutationConfirmation`; if it is `Missing`, it returns an `anyhow` error via `bail!`, otherwise returns `Ok(())`. It has no side effects beyond the returned error.
+**Data flow**: It receives an AccountMutationConfirmation value. If the value says confirmation is missing, it returns an error with instructions to rerun using the confirmation flag. If confirmation is present, it returns success and changes nothing.
 
-**Call relations**: Called at the start of both `run` and `run_cleanup` so neither path can proceed to account mutation without explicit user confirmation.
+**Call relations**: Both run and run_cleanup call this before making any request that could change plugin state. It is the safety latch for this file: without it, a developer could accidentally mutate their active account just by running the wrong smoke-test command.
 
 *Call graph*: called by 2 (run, run_cleanup); 2 external calls (bail!, matches!).
 
@@ -3004,11 +3020,11 @@ fn require_confirmation(confirmation: AccountMutationConfirmation) -> Result<()>
 fn is_installed(self) -> bool
 ```
 
-**Purpose**: Maps the internal expected-state enum to the boolean `installed` flag returned by plugin reads. It keeps polling logic readable by avoiding repeated pattern matches.
+**Purpose**: Converts the expected plugin state into a simple true-or-false answer. It lets polling code compare “installed” versus “uninstalled” against the server’s boolean status.
 
-**Data flow**: Consumes `ExpectedInstalledState` and returns `true` for `Installed` and `false` for `Uninstalled`. It reads no external state.
+**Data flow**: It receives an ExpectedInstalledState value. It returns true for Installed and false for Uninstalled. It has no side effects.
 
-**Call relations**: Used only inside `wait_for_installed_state` to compare the polled plugin summary against the desired terminal state.
+**Call relations**: wait_for_installed_state calls this while repeatedly reading the plugin from the server. This small helper keeps the waiting loop readable: the loop can compare the server’s installed flag directly to the expected state.
 
 *Call graph*: called by 1 (wait_for_installed_state); 1 external calls (matches!).
 
@@ -3023,11 +3039,11 @@ fn spawn_client(
 ) -> Result<CodexClient>
 ```
 
-**Purpose**: Builds the child-process configuration for the mutation smoke test and launches a `CodexClient` with analytics capture enabled. It ensures the required feature flags are always present regardless of caller overrides.
+**Purpose**: Starts the Codex app server test client with the exact settings needed for this analytics smoke test. It enables analytics, plugins, and remote plugins, and points analytics capture at a chosen file.
 
-**Data flow**: Receives the Codex binary path, caller-supplied config overrides, and capture-file path. It clones and extends the overrides with `analytics.enabled=true`, `features.plugins=true`, and `features.remote_plugin=true`, constructs an environment vector containing `CODEX_ANALYTICS_EVENTS_CAPTURE_FILE`, and returns the spawned `CodexClient` from `spawn_stdio_with_env`.
+**Data flow**: It receives the Codex binary path, existing configuration overrides, and the analytics capture path. It copies the overrides, adds required feature flags, creates an environment variable that tells the server where to write captured analytics events, and returns a spawned CodexClient connected over standard input and output.
 
-**Call relations**: Called only by `run` during setup. It is the mutation-test-specific counterpart to the simpler client spawn used by `run_cleanup`.
+**Call relations**: run calls this after preparing the capture file. The returned client is then initialized and used for all plugin read, install, and uninstall requests in the test.
 
 *Call graph*: calls 1 internal fn (spawn_stdio_with_env); called by 1 (run); 1 external calls (vec!).
 
@@ -3041,11 +3057,11 @@ fn read_remote_plugin(
 ) -> Result<RemotePluginExpectation>
 ```
 
-**Purpose**: Fetches a single remote plugin via the app-server `plugin/read` RPC and normalizes the response into a local expectation struct. It also verifies that the returned remote id matches the requested plugin id.
+**Purpose**: Asks the app server for information about one remote plugin and packages the important fields into a test-friendly structure. It also checks that the server returned the same remote plugin id that was requested.
 
-**Data flow**: Takes a mutable `CodexClient` and the requested remote plugin id. It allocates a request id, sends `ClientRequest::PluginRead` with `remote_marketplace_name` fixed to `openai-curated-remote` and `plugin_name` set to the requested id, extracts the plugin summary and marketplace name, requires a non-`None` `remote_plugin_id`, checks equality with the requested id, and returns a populated `RemotePluginExpectation`.
+**Data flow**: It receives a mutable CodexClient and a remote plugin id. It sends a plugin/read request using the remote marketplace hint, reads the response, verifies the returned remote id is present and matches the requested id, and returns the plugin’s local id, remote id, name, marketplace name, installed flag, install policy, and availability. If the response is missing or mismatched, it returns an error.
 
-**Call relations**: Used by `run` for the initial precondition check, by `wait_for_installed_state` for polling, and by `restore_uninstalled_state` to determine whether cleanup is needed and whether final verification succeeded.
+**Call relations**: run uses this to inspect the starting plugin state. wait_for_installed_state uses it repeatedly while polling for a state change. restore_uninstalled_state uses it to decide whether cleanup is needed at all.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 3 (restore_uninstalled_state, run, wait_for_installed_state); 1 external calls (bail!).
 
@@ -3056,11 +3072,11 @@ fn read_remote_plugin(
 fn validate_initial_plugin(plugin: &RemotePluginExpectation, remote_plugin_id: &str) -> Result<()>
 ```
 
-**Purpose**: Enforces the preconditions that make the mutation smoke test safe and meaningful: the chosen remote plugin must start uninstalled and be available for installation. It prevents the test from mutating an already-installed account state.
+**Purpose**: Checks that the chosen plugin is safe and meaningful for the smoke test. The test only makes sense if the plugin starts uninstalled and is available to install.
 
-**Data flow**: Consumes a `RemotePluginExpectation` reference and the target remote plugin id string. It inspects `installed`, `availability`, and `install_policy`, returning descriptive `bail!` errors for already-installed, unavailable, or non-installable plugins; otherwise it returns `Ok(())`.
+**Data flow**: It receives the plugin details read from the server and the requested remote plugin id. It returns an error if the plugin is already installed, unavailable, or marked as not installable. If all checks pass, it returns success without changing anything.
 
-**Call relations**: Called by `run` immediately after the initial `plugin/read`, before any install request is sent.
+**Call relations**: run calls this immediately after read_remote_plugin. It prevents the mutation sequence from starting in a bad state, especially one where the test could uninstall a plugin the user already had installed before the test began.
 
 *Call graph*: called by 1 (run); 1 external calls (bail!).
 
@@ -3075,11 +3091,11 @@ fn run_mutation_sequence(
 ) -> MutationSequenceResult
 ```
 
-**Purpose**: Performs the install/uninstall sequence and validates the captured analytics events for that mutation. It preserves whether uninstall failed at the RPC layer even if backend state eventually becomes uninstalled.
+**Purpose**: Performs the core test: install the remote plugin, wait for the installed state, wait for the install analytics event, uninstall the plugin, and validate the full set of mutation analytics events.
 
-**Data flow**: Takes a mutable client, capture-file path, and expected plugin metadata. Inside an inner closure it installs the plugin, waits for installed state, waits for a `codex_plugin_installed` event, attempts uninstall while capturing any uninstall error, waits for uninstalled state with combined error context if both RPC and state verification fail, reads captured events for the remote plugin, validates them against `PluginEventIdentity`, and returns the validated event list. It wraps the result together with a boolean `uninstall_rpc_failed` in `MutationSequenceResult`.
+**Data flow**: It receives the client, the analytics capture-file path, and the expected plugin identity. It sends an install request, waits until the server reports the plugin installed, waits until the install event appears in the capture file, sends an uninstall request, waits until the server reports the plugin uninstalled, then reads and validates the captured analytics events. It returns either the validated event data or an error, plus a flag saying whether the uninstall request itself reported failure.
 
-**Call relations**: Called only by `run` after initial validation. Within the sequence it delegates to install/uninstall RPC helpers, state polling, capture polling, and shared analytics validation helpers from `plugin_analytics_capture`.
+**Call relations**: run delegates the risky middle of the smoke test to this function. Inside the sequence it uses install_remote_plugin, uninstall_remote_plugin, wait_for_installed_state, wait_for_remote_plugin_event, read_events_for_remote_plugin, and validate_mutation_events. The extra uninstall failure flag lets run report a special case where the backend state became clean but the uninstall remote procedure call still failed.
 
 *Call graph*: called by 1 (run).
 
@@ -3090,11 +3106,11 @@ fn run_mutation_sequence(
 fn install_remote_plugin(client: &mut CodexClient, plugin: &RemotePluginExpectation) -> Result<()>
 ```
 
-**Purpose**: Issues the `plugin/install` RPC for the selected remote plugin using the marketplace and remote id discovered from `plugin/read`. It treats any RPC failure as an immediate test failure.
+**Purpose**: Sends the request that installs the chosen remote plugin. It is the test’s deliberate account mutation step.
 
-**Data flow**: Accepts a mutable `CodexClient` and a `RemotePluginExpectation`. It generates a request id, sends `ClientRequest::PluginInstall` with `remote_marketplace_name` and `plugin_name` from the expectation, ignores the typed `PluginInstallResponse` payload, and returns `Ok(())` on success.
+**Data flow**: It receives the Codex client and the plugin details. It builds a plugin/install request using the plugin’s marketplace name and remote plugin id, sends it to the server, and returns success if the server accepts the install response. It does not itself wait for the installed state; it only sends the command.
 
-**Call relations**: Used inside `run_mutation_sequence` as the first mutating step before polling for installed state.
+**Call relations**: run_mutation_sequence uses this at the start of the mutation sequence. After it returns, the sequence calls wait_for_installed_state because installation may not be visible immediately.
 
 *Call graph*: calls 2 internal fn (request_id, send_request).
 
@@ -3105,11 +3121,11 @@ fn install_remote_plugin(client: &mut CodexClient, plugin: &RemotePluginExpectat
 fn uninstall_remote_plugin(client: &mut CodexClient, remote_plugin_id: &str) -> Result<()>
 ```
 
-**Purpose**: Issues the `plugin/uninstall` RPC for the plugin identified by remote plugin id. In this test harness the remote id is passed as the uninstall `plugin_id` parameter.
+**Purpose**: Sends the request that uninstalls a remote plugin. It is used both during the smoke test and during cleanup.
 
-**Data flow**: Takes a mutable `CodexClient` and a remote plugin id string, creates a request id, sends `ClientRequest::PluginUninstall` with `PluginUninstallParams { plugin_id }`, ignores the `PluginUninstallResponse`, and returns success or the RPC error.
+**Data flow**: It receives the Codex client and a remote plugin id. It builds a plugin/uninstall request, sends it to the server, and returns success if the uninstall response is accepted. It does not itself prove the plugin is gone; callers verify that separately.
 
-**Call relations**: Called by `restore_uninstalled_state` during cleanup and by the mutation sequence when transitioning back to the uninstalled state.
+**Call relations**: run_mutation_sequence uses this after the install event has been observed. restore_uninstalled_state also calls it when cleanup finds the plugin still installed. In both cases, callers follow up with wait_for_installed_state to check what actually happened.
 
 *Call graph*: calls 2 internal fn (request_id, send_request); called by 1 (restore_uninstalled_state).
 
@@ -3124,11 +3140,11 @@ fn wait_for_installed_state(
 ) -> Result<RemotePluginExpectation>
 ```
 
-**Purpose**: Polls `plugin/read` until the remote plugin's installed flag matches the expected installed/uninstalled state or a timeout expires. It tolerates transient read failures until the deadline.
+**Purpose**: Waits until the server reports that a plugin is either installed or uninstalled. This accounts for delays between sending a request and seeing the new state.
 
-**Data flow**: Receives a mutable client, remote plugin id, and `ExpectedInstalledState`. It computes a deadline from `STATE_TIMEOUT`, repeatedly calls `read_remote_plugin`, returns the plugin expectation once `plugin.installed` matches `expected_state.is_installed()`, suppresses intermittent read errors before the deadline, and otherwise returns either the last read error at deadline or a timeout error after sleeping `POLL_INTERVAL` between attempts.
+**Data flow**: It receives the client, the remote plugin id, and the desired installed state. Until a timeout is reached, it repeatedly calls read_remote_plugin, compares the returned installed flag to the expected state, and sleeps briefly between attempts. It returns the latest plugin details when the expected state appears, or an error if the timeout expires.
 
-**Call relations**: Used by both `run_mutation_sequence` and `restore_uninstalled_state` as the authoritative backend-state check after install or uninstall requests.
+**Call relations**: run_mutation_sequence calls this after install and after uninstall to confirm each mutation really took effect. restore_uninstalled_state calls it during cleanup to verify that an uninstall actually left the account clean. It uses ExpectedInstalledState::is_installed to compare the enum-like expected state to the server’s boolean value.
 
 *Call graph*: calls 2 internal fn (is_installed, read_remote_plugin); called by 1 (restore_uninstalled_state); 3 external calls (now, bail!, sleep).
 
@@ -3142,11 +3158,11 @@ fn restore_uninstalled_state(
 ) -> RestorationStatus
 ```
 
-**Purpose**: Attempts to leave the target remote plugin uninstalled and classifies the cleanup outcome into clean, locally inconsistent, dirty, or unknown. It distinguishes backend state from RPC/reporting failures.
+**Purpose**: Tries to leave the account in the safe final state: the remote plugin is uninstalled. It classifies cleanup results so callers can tell the difference between a clean account, a local/reporting problem, a dirty account, and an unknown state.
 
-**Data flow**: Takes a mutable client and remote plugin id. It first reads current state; a read failure yields `Unknown`, an already-uninstalled plugin yields `Clean`. Otherwise it sends uninstall, then polls for the uninstalled state. If polling succeeds, uninstall RPC success maps to `Clean` and uninstall RPC failure maps to `LocalCleanupFailure`; if polling fails, it combines uninstall and verification errors when both exist and returns `Dirty`.
+**Data flow**: It receives the client and remote plugin id. It first reads the current plugin state. If the plugin is already uninstalled, it returns Clean. If it is installed, it sends an uninstall request and waits for the server to report uninstalled. Depending on whether the uninstall request and final state check succeeded, it returns Clean, LocalCleanupFailure, Dirty, or Unknown with the relevant error.
 
-**Call relations**: Called by both `run` and `run_cleanup` after or instead of the mutation sequence. Its status drives the top-level result messaging and whether recovery commands are printed.
+**Call relations**: run calls this after the main mutation sequence no matter whether the sequence passed or failed. run_cleanup uses it as its main operation. It relies on read_remote_plugin, uninstall_remote_plugin, and wait_for_installed_state, then hands a clear status back to the caller so the caller can print the right failure message or recovery command.
 
 *Call graph*: calls 3 internal fn (read_remote_plugin, uninstall_remote_plugin, wait_for_installed_state); called by 2 (run, run_cleanup); 4 external calls (anyhow!, Dirty, LocalCleanupFailure, Unknown).
 
@@ -3161,11 +3177,11 @@ fn wait_for_remote_plugin_event(
 ) -> Result<()>
 ```
 
-**Purpose**: Polls the analytics capture file until an event of a specific type appears for the target remote plugin. It acts as a synchronization barrier between backend mutation and later event validation.
+**Purpose**: Waits until a specific analytics event for a remote plugin appears in the capture file. This prevents the test from racing ahead before analytics has had time to write the event.
 
-**Data flow**: Accepts the capture-file path, remote plugin id, and desired event type string. It repeatedly reads plugin-specific events via `read_events_for_remote_plugin`, checks whether any event's `event_type` equals the requested type, and returns `Ok(())` on success or a timeout error after `CAPTURE_TIMEOUT`, sleeping `POLL_INTERVAL` between polls.
+**Data flow**: It receives the capture-file path, the remote plugin id, and the event type to look for. Until a timeout is reached, it reads captured events for that plugin and checks whether any event has the requested event_type. It returns success when the event appears, or an error if it never shows up in time.
 
-**Call relations**: Used inside `run_mutation_sequence` after installation to ensure the install analytics event has actually been captured before proceeding to uninstall and final validation.
+**Call relations**: run_mutation_sequence uses this after installing the plugin, specifically to wait for the codex_plugin_installed event. Later, the sequence reads all plugin events and passes them to validate_mutation_events for stricter validation.
 
 *Call graph*: calls 1 internal fn (read_events_for_remote_plugin); 3 external calls (now, bail!, sleep).
 
@@ -3181,11 +3197,11 @@ fn print_dirty_recovery(
 )
 ```
 
-**Purpose**: Prints a high-signal dirty-state failure message and then emits a concrete recovery command the operator can run. It is reserved for cases where the plugin still appears installed after cleanup attempts.
+**Purpose**: Prints a clear warning when cleanup did not leave the account in the expected uninstalled state. It also prints a command the user can run to try the cleanup again.
 
-**Data flow**: Takes the Codex binary path, config overrides, remote plugin id, and cleanup error. It writes a `FAIL-DIRTY` message to stderr including the formatted error, then delegates command construction and printing to `print_recovery_command`.
+**Data flow**: It receives the Codex binary path, configuration overrides, the remote plugin id, and the cleanup error. It writes a failure message to standard error explaining that the plugin still appears installed, then calls print_recovery_command to show a ready-to-copy cleanup command. It returns nothing.
 
-**Call relations**: Called by both `run` and `run_cleanup` when `restore_uninstalled_state` reports `Dirty`.
+**Call relations**: run and run_cleanup call this when restore_uninstalled_state reports a Dirty result. It delegates the exact command formatting to print_recovery_command so both full-test and cleanup failures give consistent instructions.
 
 *Call graph*: calls 1 internal fn (print_recovery_command); called by 2 (run, run_cleanup); 1 external calls (eprintln!).
 
@@ -3196,10 +3212,10 @@ fn print_dirty_recovery(
 fn print_recovery_command(codex_bin: &Path, config_overrides: &[String], remote_plugin_id: &str)
 ```
 
-**Purpose**: Constructs and prints a shell-quoted invocation of the test client that will uninstall the remote plugin with confirmation. It gives operators an exact copy-paste remediation command.
+**Purpose**: Builds and prints a command-line instruction for manually uninstalling the remote plugin through this test client. This helps a human recover the account if the automated cleanup could not prove success.
 
-**Data flow**: Receives the Codex binary path, config overrides, and remote plugin id. It resolves the current executable path if possible, shell-quotes the executable, Codex binary, each `--config` override, and the plugin id, appends the `plugin-remote-uninstall --confirm-account-mutation` subcommand, and prints the final command to stderr.
+**Data flow**: It receives the Codex binary path, configuration overrides, and remote plugin id. It finds the current test-client executable when possible, quotes command parts so paths and values with spaces are safer to copy, appends the cleanup subcommand and confirmation flag, and prints the final command to standard error.
 
-**Call relations**: Called directly by `run` for unknown final state and indirectly via `print_dirty_recovery` for dirty cleanup outcomes.
+**Call relations**: print_dirty_recovery calls this for dirty cleanup failures, and run calls it directly when the final state cannot be verified. It is the last-resort handoff from automation to a human operator.
 
 *Call graph*: called by 2 (print_dirty_recovery, run); 3 external calls (eprintln!, format!, current_exe).

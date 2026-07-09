@@ -1,6 +1,10 @@
 # Approvals, permissions, hooks, and review-mediation suites  `stage-23.2.4.5`
 
-This stage sits in the runtime mediation layer of the test suite: it verifies the policy gates and interception paths that stand between a model’s requested action and actual execution, plus the review and notification machinery that surrounds those actions. approvals.rs, exec_policy.rs, skill_approval.rs, and unified_exec_zsh_fork_approvals.rs establish the core approval matrix for shell, unified exec, apply_patch, and skill scripts, checking how sandbox limits, escalation requests, saved amendments, parent approvals, and denied reads or writes combine at runtime. request_permissions.rs and request_permissions_tool.rs cover the explicit grant path, from inline additional-permissions requests to the standalone tool, including normalization, sticky and partial grants, and scope across turns or sessions. request_user_input.rs validates the user-elicitation path and its event ordering. review.rs, guardian_review.rs, and mcp_turn_metadata.rs test reviewer routing and metadata propagation for /review, Guardian auto-review, and MCP/app tool calls. hooks.rs, hooks_mcp.rs, and user_notification.rs ensure pre/post-tool hooks, plugin hooks, MCP interception, and end-of-turn notifications observe and influence execution without leaking the wrong conversation state.
+This stage tests the safety gates that sit around Codex while it is doing its main work. These gates decide when an action can run, when the user must be asked, and when something must be blocked. The approval, exec policy, skill approval, and zsh-fork approval tests check shell commands, patches, file writes, network access, and sandbox limits. The permission request tests check the path where Codex asks for extra access, receives a limited grant, and then must obey exactly that grant.
+
+Other tests cover human and reviewer mediation. The request-user-input tests check that Codex can pause to ask a question and resume correctly. The review and Guardian review tests check separate reviewer flows, including automatic safety review, without leaking private review details. MCP metadata tests ensure tool calls to external app servers carry the right approval and review information.
+
+The hook and hook-MCP tests cover small user or plugin scripts that can inspect, block, rewrite, or add context around actions. The notification test checks the final “turn finished” message sent to a user command.
 
 ## Files in this stage
 
@@ -9,11 +13,11 @@ These tests establish the core runtime approval and execution-policy matrix, inc
 
 ### `core/tests/suite/approvals.rs`
 
-`test` · `approval request handling, policy persistence, and command/tool execution during integration tests`
+`test` · `test run`
 
-This file is the central approval-policy integration suite. It introduces small domain enums and structs—`TargetPath`, `ActionKind`, `Expectation`, `Outcome`, `ScenarioSpec`, and `ScenarioGroup`—that let tests describe an action to perform, the sandbox/approval context, the expected approval flow, and the expected observable result. `ActionKind::prepare` is the key fixture generator: depending on the variant, it may mount HTTP mocks, build Python or shell commands, construct `exec_command` or `shell_command` function-call events, or synthesize freeform/shell `apply_patch` payloads. `Expectation::verify` then interprets captured tool output and checks filesystem, network, or stdout effects.
+This is an integration test suite for the permission system. Codex can run shell commands, edit files, apply patches, use the network, and spawn helper agents, but those actions must respect the user's safety settings. This file sets up many realistic situations, like writing inside or outside the workspace, running a trusted command, applying a patch, fetching a URL, or asking for broader permissions. It then checks whether Codex does the right thing: proceed, ask for approval, remember an approved rule, deny access, or retry after a sandbox failure.
 
-The `scenarios()` function enumerates a broad matrix across danger-full-access, read-only, workspace-write, apply-patch, and unified-exec groups, including GPT-5.2 vs GPT-5.4 output-shape differences, escalation requests, prefix-rule amendments, and patch approvals. `run_scenario` wires each case together: configure Codex, optionally write policy files, mount the model event and final assistant response, submit the turn, satisfy or deny approval events as specified, parse the resulting tool output, and verify expectations. Beyond the matrix, targeted tests cover session-scoped patch approvals, persisted execpolicy amendments, propagation of amendments from spawned subagents back to the parent session, zsh-fork nested escalation behavior, fallback rules for invalid requested prefix rules, persisted network deny rules, network approval retries with denied-read sandboxes, and managed-network behavior after danger-full-access startup. Helpers decode zstd-compressed request bodies and poll for spawned threads to support these asynchronous flows.
+A useful way to read it is as a safety checklist. The `ScenarioSpec` entries describe a starting policy, an attempted action, the expected approval behavior, and the final result. Helper functions build fake model responses, submit turns to a test Codex session, wait for approval events, and inspect command output. Extra tests cover longer stories, such as approving a patch once for a session, saving command rules for future runs, propagating approvals from subagents, and network policy amendments. Without this file, changes to sandboxing or approvals could silently allow dangerous actions or annoy users with unnecessary prompts.
 
 #### Function details
 
@@ -23,11 +27,11 @@ The `scenarios()` function enumerates a broad matrix across danger-full-access, 
 fn resolve_for_patch(self, test: &TestCodex) -> (PathBuf, String)
 ```
 
-**Purpose**: Resolves a logical target location into both a concrete filesystem path and the patch-path string that should appear inside an apply-patch payload. Workspace targets use a relative patch path; outside-workspace targets use an absolute-looking display path.
+**Purpose**: Turns a test target name into both a real file path and the path text that should appear in a patch. It lets the same test action target either the temporary workspace or a location outside it.
 
-**Data flow**: Matches on `self`: for `Workspace(name)` it joins `name` under `test.cwd.path()` and returns `(path, name.to_string())`; for `OutsideWorkspace(name)` it joins `name` under the process current directory and returns `(path.clone(), path.display().to_string())`.
+**Data flow**: It receives a `TargetPath` and the current test session. For workspace targets, it joins the name to the test working directory; for outside targets, it joins the name to the process current directory. It returns the real path to touch on disk and the string path to place in patch text.
 
-**Call relations**: Action preparation and expectation verification both rely on this helper so they agree on where files should be created and what path string should appear in generated patches.
+**Call relations**: Patch and file-writing helpers call this before building commands or checking results. It is the small translation step between a scenario's human-readable target and the actual file system location used by the test.
 
 *Call graph*: 1 external calls (current_dir).
 
@@ -38,11 +42,11 @@ fn resolve_for_patch(self, test: &TestCodex) -> (PathBuf, String)
 fn policy_src(&self) -> Option<&'static str>
 ```
 
-**Purpose**: Extracts an optional policy-source string from actions that explicitly carry one. This lets scenario setup write a rules file only when needed.
+**Purpose**: Returns extra rule-file text for actions that need a custom command policy. Most actions do not need one, so they return nothing.
 
-**Data flow**: Returns `Some(policy_src)` for `RunCommandWithPolicy` and `None` for all other action variants.
+**Data flow**: It reads the selected action variant. If the action is `RunCommandWithPolicy`, it extracts the embedded policy source text; otherwise it returns `None`.
 
-**Call relations**: `run_scenario` calls this before building the harness; if present, it installs the returned rule text into `rules/default.rules` via a pre-build hook.
+**Call relations**: The scenario runner asks this before building the test Codex instance. If policy text is present, the runner writes it into the test home directory so the command approval system sees it during the scenario.
 
 
 ##### `ActionKind::prepare`  (lines 150–297)
@@ -57,11 +61,11 @@ async fn prepare(
     ) -> Result<(Value, Option<String>)>
 ```
 
-**Purpose**: Builds the concrete model event and optional expected command string for a scenario’s action. It encapsulates all fixture generation for file writes, network fetches, shell commands, unified exec, and apply-patch variants.
+**Purpose**: Builds the fake model tool call for a scenario. In plain terms, it prepares the exact command, patch, or network request that Codex will be told to execute during the test.
 
-**Data flow**: Given a `TestCodex`, mock server, call ID, and `SandboxPermissions`, it matches on the action variant. File-write actions resolve the target path, remove any preexisting file, build a Python one-liner that writes and prints content, wrap it in a shell event, and return the event plus command string. Network actions mount a GET mock on the server, build a Python urllib script (with or without proxy bypass), wrap it in a shell event, and return the event plus command. Plain shell-command actions build shell events with longer timeouts; prefix-rule actions call `shell_event_with_prefix_rule`; unified-exec actions call `exec_command_event`. Freeform apply-patch actions resolve the target, remove any existing file, build an add-file patch, and return `ev_apply_patch_custom_tool_call` with no command string. Shell apply-patch actions similarly build a patch, wrap it in a heredoc shell script via `shell_apply_patch_command`, and return a shell event plus command string.
+**Data flow**: It receives the action, test environment, mock server, call id, and sandbox permission request. It may create mock HTTP responses, delete leftover files, build shell or exec-command JSON, or create patch text. It returns the model event to feed into Codex plus, when relevant, the command string expected in an approval prompt.
 
-**Call relations**: `run_scenario` delegates all action-specific setup here. The returned event becomes the mocked model output for the first response, and the optional command string is later used to validate approval requests.
+**Call relations**: The main scenario runner calls this for every scenario before mounting mocked server responses. It delegates to helpers such as `shell_event`, `exec_command_event`, `build_add_file_patch`, and `shell_apply_patch_command` so each action is represented in the same format Codex normally receives from the model.
 
 *Call graph*: calls 6 internal fn (ev_apply_patch_custom_tool_call, build_add_file_patch, exec_command_event, shell_apply_patch_command, shell_event, shell_event_with_prefix_rule); 6 external calls (given, new, format!, remove_file, method, path).
 
@@ -72,11 +76,11 @@ async fn prepare(
 fn build_add_file_patch(patch_path: &str, content: &str) -> String
 ```
 
-**Purpose**: Constructs a minimal add-file patch body for a target path and content string. It is used by both freeform and shell apply-patch scenarios.
+**Purpose**: Creates a minimal patch that adds one file with given content. Tests use it to simulate the model asking Codex to apply a file-creation patch.
 
-**Data flow**: Formats `*** Begin Patch\n*** Add File: {patch_path}\n+{content}\n*** End Patch\n` and returns the resulting `String`.
+**Data flow**: It takes the path text that should appear in the patch and the desired file content. It formats those into a Begin Patch / Add File / End Patch block and returns the patch string.
 
-**Call relations**: Called by `ActionKind::prepare` for apply-patch actions and by the session-scoped patch-approval test when constructing two sequential patches.
+**Call relations**: Action preparation uses it for patch scenarios, and a session-level patch approval test uses it directly. It supplies the patch body that later flows into custom patch tool calls or shell `apply_patch` commands.
 
 *Call graph*: called by 2 (prepare, approving_apply_patch_for_session_skips_future_prompts_for_same_file); 1 external calls (format!).
 
@@ -87,11 +91,11 @@ fn build_add_file_patch(patch_path: &str, content: &str) -> String
 fn shell_apply_patch_command(patch: &str) -> String
 ```
 
-**Purpose**: Wraps a patch body in a shell heredoc that invokes `apply_patch`. It normalizes the script to ensure the patch body ends with a newline before the closing marker.
+**Purpose**: Wraps patch text in a shell command that runs `apply_patch` through a here-document. A here-document is a shell way to feed a block of text into a command.
 
-**Data flow**: Starts with `apply_patch <<'PATCH'\n`, appends the patch text, appends a newline if the patch did not already end with one, then appends `PATCH\n` and returns the full shell script string.
+**Data flow**: It receives patch text, starts a command string with `apply_patch <<'PATCH'`, appends the patch, ensures there is a trailing newline, and closes the block. It returns a complete shell command.
 
-**Call relations**: Used by `ActionKind::prepare` for `ApplyPatchShell` scenarios so the model event becomes a shell-command call rather than a freeform custom-tool call.
+**Call relations**: Patch-shell action preparation calls this after building the patch. The result is then passed into `shell_event` so Codex sees it like any other shell command from the model.
 
 *Call graph*: called by 1 (prepare); 1 external calls (from).
 
@@ -107,11 +111,11 @@ fn shell_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds a `shell_command` function-call event without any prefix-rule override. It is a convenience wrapper around the more general shell-event constructor.
+**Purpose**: Creates a model function-call event for the standard shell command tool. It is the simple path when no custom prefix rule is requested.
 
-**Data flow**: Accepts call ID, command string, timeout, and sandbox permissions, forwards them to `shell_event_with_prefix_rule` with `prefix_rule: None`, and returns the resulting JSON event.
+**Data flow**: It receives a call id, command string, timeout, and sandbox permission request. It forwards those values to `shell_event_with_prefix_rule` with no prefix rule. The result is a JSON event representing a shell tool call.
 
-**Call relations**: Used by many action-preparation branches and several targeted tests that need to synthesize shell-command model outputs.
+**Call relations**: Many tests and action preparations use this to create realistic shell calls. It keeps common setup short while leaving the more detailed JSON-building work to `shell_event_with_prefix_rule`.
 
 *Call graph*: calls 1 internal fn (shell_event_with_prefix_rule); called by 6 (prepare, denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt, env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, network_approval_flow_survives_danger_full_access_session_start, network_approval_retry_keeps_deny_read_sandbox_for_escalated_command).
 
@@ -128,11 +132,11 @@ fn shell_event_with_prefix_rule(
 ) -> Result<Value>
 ```
 
-**Purpose**: Constructs the JSON payload for a `shell_command` function call, optionally including requested sandbox override permissions and a requested prefix rule. It serializes the arguments exactly as the model would emit them.
+**Purpose**: Creates a shell-command tool call, optionally including a requested command prefix rule. Prefix rules are saved patterns such as “allow commands starting with `touch file.txt`.”
 
-**Data flow**: Builds a JSON object with `command` and `timeout_ms`; if `sandbox_permissions.requests_sandbox_override()` is true it adds `sandbox_permissions`; if a prefix rule vector is provided it adds `prefix_rule`. It serializes the args to a string and returns `ev_function_call(call_id, "shell_command", &args_str)`.
+**Data flow**: It receives command details, sandbox permissions, and maybe a prefix rule. It builds a JSON argument object, adds sandbox override information only when requested, adds the prefix rule if present, serializes it to text, and returns a function-call event.
 
-**Call relations**: Called by `shell_event`, by `ActionKind::prepare` for prefix-rule scenarios, and by targeted tests that directly exercise invalid or fallback prefix-rule behavior.
+**Call relations**: This is the central helper for shell-command events. `shell_event` calls it for the simple case, while targeted tests call it directly to check how invalid or fallback prefix rules behave.
 
 *Call graph*: calls 2 internal fn (ev_function_call, requests_sandbox_override); called by 4 (prepare, approving_fallback_rule_for_compound_command_works, invalid_requested_prefix_rule_falls_back_for_compound_command, shell_event); 2 external calls (json!, to_string).
 
@@ -149,11 +153,11 @@ fn exec_command_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Constructs the JSON payload for a unified `exec_command` function call, including optional yield time and escalation justification when sandbox override is requested. It mirrors the model-side event shape for unified exec.
+**Purpose**: Creates a model tool call for the newer unified exec command tool. This is used when tests enable the unified execution feature.
 
-**Data flow**: Builds a JSON object with `cmd`; conditionally adds `yield_time_ms`; if sandbox override is requested, adds `sandbox_permissions` and a `justification` string using either the supplied justification or `DEFAULT_UNIFIED_EXEC_JUSTIFICATION`. It serializes the args and returns `ev_function_call(call_id, "exec_command", &args_str)`.
+**Data flow**: It receives a call id, command, optional yield time, sandbox permission request, and optional justification. It builds JSON arguments, includes escalation permissions and a reason when needed, serializes them, and returns an exec-command function-call event.
 
-**Call relations**: Only `ActionKind::prepare` uses this helper for `RunUnifiedExecCommand` scenarios.
+**Call relations**: Unified-exec scenario preparation calls this. It lets the shared scenario runner exercise both old shell-command behavior and the newer exec-command flow.
 
 *Call graph*: calls 2 internal fn (ev_function_call, requests_sandbox_override); called by 1 (prepare); 2 external calls (json!, to_string).
 
@@ -164,11 +168,11 @@ fn exec_command_event(
 fn verify(&self, test: &TestCodex, result: &CommandResult) -> Result<()>
 ```
 
-**Purpose**: Checks the observed command or patch result against the scenario’s expected outcome, including exit-code conventions, stdout diagnostics, filesystem side effects, and cleanup. It centralizes all post-run assertions for the approval matrix.
+**Purpose**: Checks whether the scenario ended the way it promised. It verifies command exit status, output text, file contents, patch results, or network success and failure.
 
-**Data flow**: Matches on the expectation variant and inspects the supplied `CommandResult` plus the `TestCodex` workspace. Depending on the case it may assert exact or optional-zero exit codes, require stdout substrings like `OK:` or `ERR:`, read created or patched files and compare contents, assert files do not exist, and remove created files afterward. For `FileNotCreated`, it supports `|`-separated alternative substrings in diagnostics. It returns `Ok(())` after all assertions pass.
+**Data flow**: It receives the test environment and a parsed command result. Depending on the expectation variant, it reads files, checks stdout, checks exit codes, confirms files exist or do not exist, and cleans up created files. It returns success or fails the test with a clear assertion.
 
-**Call relations**: `run_scenario` parses the final tool output into `CommandResult` and delegates all scenario-specific validation here. Some targeted tests also instantiate `Expectation` variants directly for ad hoc verification.
+**Call relations**: After `run_scenario` extracts the tool output and parses it, it calls this method as the final judge. This is where the scenario's expected behavior becomes concrete test evidence.
 
 *Call graph*: 6 external calls (assert!, assert_eq!, assert_ne!, read_to_string, remove_file, panic!).
 
@@ -184,11 +188,11 @@ async fn submit_turn(
 ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn with explicit approval and sandbox policies plus local environment selection. It is the common turn-submission helper for the matrix and many targeted approval tests.
+**Purpose**: Sends a user message into a test Codex session with the approval and sandbox settings for that scenario. It starts the piece of conversation that should trigger the mocked model tool call.
 
-**Data flow**: Clones the session model from `test.session_configured`, then submits `Op::UserInput` with one text item and `ThreadSettingsOverrides` that set local environments, the provided approval policy, `ApprovalsReviewer::User`, the provided sandbox policy, and a default collaboration mode using the session model. It returns `Ok(())` once submission succeeds.
+**Data flow**: It receives the test session, prompt text, approval policy, and sandbox policy. It builds a user-input operation with local environment selection, user approval reviewer, sandbox policy, and model settings, then submits it to Codex. It returns when the submission has been accepted.
 
-**Call relations**: Matrix execution and many targeted tests call this helper before waiting for approval requests or completion events.
+**Call relations**: The scenario runner and several longer tests call this whenever they need Codex to process a new turn. It is the bridge from test setup into the real Codex event flow.
 
 *Call graph*: calls 1 internal fn (local_selections); called by 9 (approving_apply_patch_for_session_skips_future_prompts_for_same_file, approving_execpolicy_amendment_persists_policy_and_skips_future_prompts, approving_fallback_rule_for_compound_command_works, compound_command_with_one_safe_command_still_requires_approval, denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt, invalid_requested_prefix_rule_falls_back_for_compound_command, network_approval_flow_survives_danger_full_access_session_start, run_scenario, spawned_subagent_execpolicy_amendment_propagates_to_parent_session); 2 external calls (default, vec!).
 
@@ -199,11 +203,11 @@ async fn submit_turn(
 fn parse_result(item: &Value) -> CommandResult
 ```
 
-**Purpose**: Normalizes tool output into a `CommandResult` regardless of whether the output is structured JSON, freeform `Exit code:` text, or plain text without an exit code. It handles both shell-command and apply-patch output formats.
+**Purpose**: Turns the model-facing tool output into a simpler `CommandResult` with an exit code and stdout text. It supports both structured JSON output and older free-form text formats.
 
-**Data flow**: Reads the `output` string from a JSON item. It first tries to parse that string as JSON and, if successful, extracts `metadata.exit_code` and `output`. If JSON parsing fails, it tries two regexes: one for `Exit code: N ... Output:` and one for `Process exited with code N ... Output:`. If either matches, it parses the exit code and captures the output body; otherwise it returns `CommandResult { exit_code: None, stdout: output_str.to_string() }`.
+**Data flow**: It receives a JSON item from the mocked result request. It reads the `output` field, first tries to parse it as JSON, and otherwise uses regular expressions to find an exit code and output section. It returns a normalized command result, using no exit code when the format does not include one.
 
-**Call relations**: `run_scenario` and several targeted tests call this helper after extracting a function-call or custom-tool-call output item from the captured request.
+**Call relations**: Scenario and follow-up tests call this after Codex sends tool results back to the mocked server. Its normalized output is then checked by `Expectation::verify` or direct assertions.
 
 *Call graph*: called by 7 (approving_execpolicy_amendment_persists_policy_and_skips_future_prompts, approving_fallback_rule_for_compound_command_works, denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt, env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, network_approval_retry_keeps_deny_read_sandbox_for_escalated_command, run_scenario); 2 external calls (new, get).
 
@@ -217,11 +221,11 @@ async fn expect_exec_approval(
 ) -> ExecApprovalRequestEvent
 ```
 
-**Purpose**: Waits for the next exec approval request and asserts it targets the expected command. It fails immediately if the turn completes without requesting approval.
+**Purpose**: Waits until Codex asks for command execution approval, and confirms the prompt refers to the expected command. It fails if the turn finishes first.
 
-**Data flow**: Waits on the codex event stream until either `EventMsg::ExecApprovalRequest(_)` or `EventMsg::TurnComplete(_)` appears. If it receives an approval request, it compares the last command argument to `expected_command` and returns the `ExecApprovalRequestEvent`; if completion arrives first or another event slips through, it panics.
+**Data flow**: It receives the test session and expected command string. It waits for either an exec approval request or turn completion, checks that the last command argument matches the expected command, and returns the approval event.
 
-**Call relations**: Matrix scenarios and targeted exec-approval tests use this helper right after submitting a turn when they expect an approval gate before execution can proceed.
+**Call relations**: The scenario runner and command-policy tests call this at the moment an approval prompt should appear. The returned approval is then answered with approved, denied, or a saved policy amendment.
 
 *Call graph*: called by 5 (approving_execpolicy_amendment_persists_policy_and_skips_future_prompts, approving_fallback_rule_for_compound_command_works, compound_command_with_one_safe_command_still_requires_approval, invalid_requested_prefix_rule_falls_back_for_compound_command, run_scenario); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -235,11 +239,11 @@ async fn expect_patch_approval(
 ) -> ApplyPatchApprovalRequestEvent
 ```
 
-**Purpose**: Waits for the next apply-patch approval request and asserts it references the expected call ID. It fails if the turn completes without prompting.
+**Purpose**: Waits until Codex asks for patch approval, and confirms the request belongs to the expected tool call. It fails if Codex completes without asking.
 
-**Data flow**: Waits until either `EventMsg::ApplyPatchApprovalRequest(_)` or `EventMsg::TurnComplete(_)` appears. On approval it asserts `approval.call_id == expected_call_id` and returns the event; on premature completion or unexpected events it panics.
+**Data flow**: It receives the test session and expected call id. It waits for a patch approval request or turn completion, checks the call id, and returns the approval request event.
 
-**Call relations**: Used by patch-approval matrix scenarios and the session-scoped patch-approval persistence test.
+**Call relations**: Patch scenarios and the session-level patch test use this before submitting a patch approval decision. It marks the point where the test verifies that patch safety checks actually interrupted execution.
 
 *Call graph*: called by 2 (approving_apply_patch_for_session_skips_future_prompts_for_same_file, run_scenario); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -250,11 +254,11 @@ async fn expect_patch_approval(
 async fn wait_for_completion_without_approval(test: &TestCodex)
 ```
 
-**Purpose**: Asserts that a turn completes without any exec approval request. It is used for scenarios expected to run automatically under current policy.
+**Purpose**: Waits for a turn to finish and fails if Codex asks for command approval. It is used when a scenario should run automatically.
 
-**Data flow**: Waits until either `ExecApprovalRequest` or `TurnComplete` appears. It returns silently on `TurnComplete`, but panics if an approval request or any other unexpected event is observed.
+**Data flow**: It receives the test session, waits for either an exec approval request or turn completion, accepts only turn completion, and panics if an approval request appears.
 
-**Call relations**: Auto-outcome scenarios and several targeted persistence tests use this helper after submitting a turn that should no longer prompt.
+**Call relations**: Automatic-run scenarios and saved-rule tests call this after submitting a turn. It proves that Codex did not bother the user when the action should already be allowed.
 
 *Call graph*: called by 5 (approving_execpolicy_amendment_persists_policy_and_skips_future_prompts, approving_fallback_rule_for_compound_command_works, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, run_scenario, spawned_subagent_execpolicy_amendment_propagates_to_parent_session); 2 external calls (wait_for_event, panic!).
 
@@ -265,11 +269,11 @@ async fn wait_for_completion_without_approval(test: &TestCodex)
 async fn wait_for_completion(test: &TestCodex)
 ```
 
-**Purpose**: Blocks until the current turn emits `TurnComplete`. It is the simplest completion helper in the file.
+**Purpose**: Waits until Codex reports that the current turn is complete. It is the simple “let the run finish” helper.
 
-**Data flow**: Waits on the codex event stream until `matches!(event, EventMsg::TurnComplete(_))` and then returns.
+**Data flow**: It receives the test session and waits for a `TurnComplete` event. It does not inspect outputs itself.
 
-**Call relations**: Used after approvals are submitted, and by targeted tests that only need to know the turn finished.
+**Call relations**: Tests call this after they have answered an approval request or otherwise expect the workflow to continue. Later steps then inspect files, policy files, or tool output.
 
 *Call graph*: called by 9 (approving_apply_patch_for_session_skips_future_prompts_for_same_file, approving_execpolicy_amendment_persists_policy_and_skips_future_prompts, approving_fallback_rule_for_compound_command_works, compound_command_with_one_safe_command_still_requires_approval, denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt, env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, network_approval_flow_survives_danger_full_access_session_start, network_approval_retry_keeps_deny_read_sandbox_for_escalated_command, run_scenario); 1 external calls (wait_for_event).
 
@@ -280,11 +284,11 @@ async fn wait_for_completion(test: &TestCodex)
 fn body_contains(req: &Request, text: &str) -> bool
 ```
 
-**Purpose**: Checks whether a raw wiremock request body contains a substring, transparently decoding zstd-compressed bodies. It supports matcher-based mock routing in subagent tests.
+**Purpose**: Checks whether a mocked HTTP request body contains a piece of text, even if the request body was compressed with zstd. This lets tests route mock responses based on what Codex sent.
 
-**Data flow**: Inspects `content-encoding` for `zstd`, optionally decodes the body bytes, converts them to UTF-8 if possible, and returns whether the resulting string contains the target text.
+**Data flow**: It receives a mock HTTP request and search text. It checks the content-encoding header, decompresses the body if needed, converts bytes to UTF-8 text, and returns whether the text appears.
 
-**Call relations**: Only matcher-based mock setups use this helper to distinguish parent, child, and follow-up requests by prompt or call ID.
+**Call relations**: Request-matching closures use this in multi-step tests, especially parent/child agent flows. It helps the mock server send the right fake model response for the right conversation stage.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (decode_all).
 
@@ -295,11 +299,11 @@ fn body_contains(req: &Request, text: &str) -> bool
 async fn wait_for_spawned_thread(test: &TestCodex) -> Result<Arc<CodexThread>>
 ```
 
-**Purpose**: Polls the thread manager until a child thread appears that is distinct from the session’s original thread. It provides a concrete `CodexThread` handle for subagent approval tests.
+**Purpose**: Waits for a child Codex thread to appear after a test asks a subagent to be spawned. A thread is a separate conversation or task running under the same test manager.
 
-**Data flow**: Computes a deadline two seconds in the future, repeatedly lists thread IDs, finds one not equal to `test.session_configured.thread_id`, and if found fetches and returns that thread. If none appears before the deadline, it returns an `anyhow::bail!` timeout error after sleeping in 10 ms increments between polls.
+**Data flow**: It receives the test session, repeatedly lists known thread ids until it finds one different from the parent session, retrieves that thread, and returns it. If none appears within the deadline, it returns an error.
 
-**Call relations**: The spawned-subagent execpolicy-amendment test uses this helper after submitting the parent spawn turn so it can observe and approve the child thread’s command.
+**Call relations**: The subagent approval propagation test calls this after the parent turn starts. Once it gets the child thread, the test can listen for and answer the child's approval request.
 
 *Call graph*: called by 1 (spawned_subagent_execpolicy_amendment_propagates_to_parent_session); 5 external calls (from_millis, from_secs, bail!, now, sleep).
 
@@ -310,11 +314,11 @@ async fn wait_for_spawned_thread(test: &TestCodex) -> Result<Arc<CodexThread>>
 fn scenarios() -> Vec<ScenarioSpec>
 ```
 
-**Purpose**: Defines the full approval-behavior matrix as data. It enumerates combinations of sandbox policy, approval policy, action type, requested permissions, enabled features, expected approval flow, and expected result.
+**Purpose**: Defines the main approval test matrix. Each scenario names a policy setup, an attempted action, the expected approval outcome, and the final observable result.
 
-**Data flow**: Constructs helper closures and then returns a large `Vec<ScenarioSpec>` literal. Each entry specifies a scenario name, approval and sandbox policies, an `ActionKind`, sandbox-permission request mode, optional features/model override, an `Outcome` describing whether approval should occur and how it should be answered, and an `Expectation` describing the final observable result.
+**Data flow**: It constructs and returns a vector of `ScenarioSpec` values. The entries cover full access, read-only access, workspace-write access, patch behavior, network behavior, trusted command rules, and unified exec behavior.
 
-**Call relations**: `run_scenario_group` calls this once, filters the returned scenarios by group, and then executes each selected scenario through `run_scenario`.
+**Call relations**: The group runner calls this and filters it by scenario group. The individual scenario runner then executes each selected spec in the same repeatable harness.
 
 *Call graph*: called by 1 (run_scenario_group); 1 external calls (vec!).
 
@@ -325,11 +329,11 @@ fn scenarios() -> Vec<ScenarioSpec>
 async fn approval_matrix_covers_group(group: ScenarioGroup) -> Result<()>
 ```
 
-**Purpose**: Parameterized test entrypoint that runs all scenarios belonging to one scenario group. It lets the large matrix be split into manageable named test cases.
+**Purpose**: Runs the approval matrix for one category of scenarios. The test framework calls it once for each named group.
 
-**Data flow**: Receives a `ScenarioGroup` from `test_case`, calls `run_scenario_group(group).await`, and returns its result.
+**Data flow**: It receives a scenario group from the test-case macro and calls `run_scenario_group`. The result is passed back to the async test framework.
 
-**Call relations**: This is the top-level matrix test wrapper; the actual work is delegated to `run_scenario_group`.
+**Call relations**: This is the test entry point for the large scenario table. It delegates all real work to `run_scenario_group` so each group uses the same runner.
 
 *Call graph*: calls 1 internal fn (run_scenario_group).
 
@@ -340,11 +344,11 @@ async fn approval_matrix_covers_group(group: ScenarioGroup) -> Result<()>
 async fn run_scenario_group(group: ScenarioGroup) -> Result<()>
 ```
 
-**Purpose**: Executes every scenario in one logical group, such as read-only or apply-patch. It ensures the group is non-empty and annotates failures with the scenario name.
+**Purpose**: Runs all matrix scenarios belonging to one group, such as read-only or apply-patch tests. It skips when network-dependent tests cannot run.
 
-**Data flow**: Skips if network is unavailable, calls `scenarios()`, filters the vector by `scenario_group(scenario) == group`, asserts the filtered list is non-empty, then iterates each scenario and awaits `run_scenario(&scenario)`, attaching context `approval scenario failed: {name}` to any error.
+**Data flow**: It receives a group, builds the full scenario list, filters it with `scenario_group`, checks that the group is not empty, and runs each scenario. If one fails, it adds the scenario name to the error context.
 
-**Call relations**: Called only by the parameterized matrix entrypoint; it is the bridge from static scenario data to per-scenario execution.
+**Call relations**: `approval_matrix_covers_group` calls this for each test-case group. It calls `scenarios` to get the data and `run_scenario` to perform the actual Codex interaction.
 
 *Call graph*: calls 2 internal fn (run_scenario, scenarios); called by 1 (approval_matrix_covers_group); 2 external calls (assert!, skip_if_no_network!).
 
@@ -355,11 +359,11 @@ async fn run_scenario_group(group: ScenarioGroup) -> Result<()>
 fn scenario_group(scenario: &ScenarioSpec) -> ScenarioGroup
 ```
 
-**Purpose**: Classifies a scenario into one of the high-level matrix groups based on its action type and sandbox policy. This drives the parameterized grouping used by the matrix test.
+**Purpose**: Classifies a scenario into a broad group so the large matrix can be split into smaller test cases. This keeps failures easier to locate and test runs easier to schedule.
 
-**Data flow**: Matches first on `scenario.action`: apply-patch actions map to `ApplyPatch`, unified exec maps to `UnifiedExec`, and all other actions are grouped by `scenario.sandbox_policy` into `DangerFullAccess`, `ReadOnly`, or `WorkspaceWrite`.
+**Data flow**: It receives a scenario spec and looks at its action and sandbox policy. Patch actions become the patch group, unified exec actions become the unified exec group, and other actions are grouped by sandbox type.
 
-**Call relations**: Used by `run_scenario_group` to filter the full scenario list into the subset relevant for the current parameterized test case.
+**Call relations**: The group runner uses this while filtering the scenario table. It has no side effects; it is just the sorting rule for the matrix.
 
 
 ##### `run_scenario`  (lines 1889–2055)
@@ -368,11 +372,11 @@ fn scenario_group(scenario: &ScenarioSpec) -> ScenarioGroup
 async fn run_scenario(scenario: &ScenarioSpec) -> Result<()>
 ```
 
-**Purpose**: Executes one approval scenario end-to-end: configure Codex, synthesize the model event, submit the turn, satisfy or deny approvals as specified, parse the resulting tool output, and verify the expected outcome. It is the core engine behind the approval matrix.
+**Purpose**: Executes one scenario from start to finish. It is the main harness that turns a scenario description into a real Codex run and checks the result.
 
-**Data flow**: Starts a mock server, extracts scenario settings, builds a `test_codex` harness with the requested model, approval policy, sandbox policy, and enabled features, optionally installs a rules file from `policy_src`, and builds the test. It calls `scenario.action.prepare(...)` to get the first model event and optional expected command, mounts a one-shot SSE response containing that event and a second one-shot assistant completion, then submits the turn via `submit_turn`. It matches on `scenario.outcome`: `Auto` waits for completion without approval; `ExecApproval` waits for an exec approval, optionally checks the reason, submits the configured decision, and waits for completion; `ExecApprovalWithAmendment` additionally checks the proposed amendment before submitting the decision; `PatchApproval` waits for a patch approval, optionally checks the reason, submits the decision, and waits for completion. Finally it extracts either a custom-tool or function-call output item from the captured results request, parses it with `parse_result`, logs it, and delegates verification to `scenario.expectation.verify`.
+**Data flow**: It receives a scenario spec, starts a mock server, builds a configured test Codex session, prepares the action event, mounts fake model responses, submits the user turn, answers any expected approval request, waits for completion, extracts the tool output, parses it, and verifies the expectation.
 
-**Call relations**: Every matrix scenario flows through this function. It orchestrates all helper functions in the file and is the main consumer of `ActionKind`, `Outcome`, and `Expectation`.
+**Call relations**: `run_scenario_group` calls this for every matrix entry. It coordinates the helper functions in this file: action preparation, turn submission, approval waiting, result parsing, and expectation checking.
 
 *Call graph*: calls 10 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, expect_patch_approval, parse_result, submit_turn, wait_for_completion, wait_for_completion_without_approval); called by 1 (run_scenario_group); 4 external calls (assert_eq!, eprintln!, matches!, vec!).
 
@@ -383,11 +387,11 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()>
 async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() -> Result<()>
 ```
 
-**Purpose**: Verifies that approving an apply-patch request for the session suppresses future patch approval prompts for the same file. It checks both the initial approval flow and the no-prompt follow-up.
+**Purpose**: Tests that approving a patch for the whole session lets later patches to the same file proceed without another prompt. This checks that session-scoped patch trust is remembered.
 
-**Data flow**: Builds a harness with `OnRequest` approval and workspace-write sandbox, resolves an outside-workspace target path, constructs an add-file patch and a later update patch for the same path, mounts the first patch response and assistant completion, submits the first turn, waits for patch approval, submits `ReviewDecision::ApprovedForSession`, waits for completion, and asserts the file contains `before`. It then mounts the second patch response and completion, submits a follow-up turn, waits for either patch approval or completion, asserts completion arrives directly with no approval request, and finally checks the file now contains `after` before cleaning it up.
+**Data flow**: It creates an outside-workspace target, sends a first patch that adds the file, approves it with `ApprovedForSession`, confirms the file contains the first content, then sends a second patch updating the file. It expects the second turn to finish without another patch approval and confirms the updated content.
 
-**Call relations**: This targeted test exercises session-scoped patch approval persistence outside the generic matrix because it spans two turns and depends on remembered approval state.
+**Call relations**: This standalone test uses patch-building, turn submission, patch approval waiting, and completion helpers. It covers behavior too specific for the table-driven scenarios.
 
 *Call graph*: calls 8 internal fn (mount_sse_once, sse, start_mock_server, test_codex, build_add_file_patch, expect_patch_approval, submit_turn, wait_for_completion); 9 external calls (assert!, OutsideWorkspace, wait_for_event, format!, remove_file, panic!, skip_if_no_network!, try_from_path, vec!).
 
@@ -398,11 +402,11 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
 async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts() -> Result<()>
 ```
 
-**Purpose**: Checks that approving a proposed execpolicy amendment writes the rule to disk, documents it in developer messages, and suppresses future approval prompts for the same command. It validates both persistence and reuse.
+**Purpose**: Tests that approving a proposed command rule writes it to the rules file and prevents future prompts for the same command. This protects the “remember this command” workflow.
 
-**Data flow**: Builds a read-only `UnlessTrusted` harness, prepares a `touch allow-prefix.txt` shell command event, mounts the first command response and assistant completion, submits the first turn, waits for exec approval, asserts the proposed amendment equals `ExecPolicyAmendment(["touch", "allow-prefix.txt"])`, submits `ApprovedExecpolicyAmendment` with that amendment, waits for completion, inspects the captured developer messages for the saved rule, reads `rules/default.rules` to confirm the persisted `prefix_rule(...)`, parses the first command output and checks success plus file creation. It then mounts the same command again, submits a second turn, waits for completion without approval, parses the second output, and confirms it also succeeded without prompting.
+**Data flow**: It runs a command that should prompt, checks the proposed exec-policy amendment, approves that amendment, verifies the developer message and saved policy file, then runs the same command again. The second run should complete without approval and produce the expected empty file.
 
-**Call relations**: This targeted persistence test extends beyond the matrix by spanning two turns and inspecting both saved policy files and developer-message documentation.
+**Call relations**: This test uses action preparation, exec approval waiting, turn submission, completion waiting, and result parsing. It exercises both the user-facing approval event and the persistent policy file side effect.
 
 *Call graph*: calls 9 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, submit_turn, wait_for_completion, wait_for_completion_without_approval); 7 external calls (new, new_read_only_policy, assert!, assert_eq!, read_to_string, remove_file, vec!).
 
@@ -413,11 +417,11 @@ async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts
 async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() -> Result<()>
 ```
 
-**Purpose**: Verifies that an execpolicy amendment approved inside a spawned subagent propagates back to the parent session, so the parent can later run the same command without another prompt. It tests cross-thread policy sharing.
+**Purpose**: Tests that a command rule approved inside a spawned child agent becomes available to the parent session too. This matters because subagents should not learn safety exceptions in isolation.
 
-**Data flow**: Builds a collaborative read-only harness, mounts matcher-based SSE responses for the parent spawn turn, the child command turn, the child follow-up, the parent follow-up after spawn, and a later parent rerun of the same command. It submits the parent prompt, waits for the spawned child thread via `wait_for_spawned_thread`, waits on the child for an exec approval request, asserts the proposed amendment matches `touch subagent-allow-prefix.txt`, submits `ApprovedExecpolicyAmendment` to the child, waits for the child to complete without a second approval, confirms the child-created file exists and then removes it, submits a parent rerun turn, and waits for completion without approval.
+**Data flow**: It mocks a parent turn that spawns a child, mocks the child running a command, waits for the child approval request, approves the proposed command amendment, confirms the child finishes and creates the file, removes the file, then has the parent run the same command. The parent should complete without another approval.
 
-**Call relations**: This test combines subagent spawning, child-thread approval handling, and parent-session reuse of the approved amendment, which is beyond the scope of the generic matrix.
+**Call relations**: This longer test uses request-body matching, spawned-thread waiting, approval submission, and the no-approval completion helper. It connects the multi-agent flow with the persistent approval-rule flow.
 
 *Call graph*: calls 8 internal fn (mount_sse_once, mount_sse_once_match, sse, start_mock_server, test_codex, submit_turn, wait_for_completion_without_approval, wait_for_spawned_thread); 12 external calls (from_secs, new, new_read_only_policy, assert!, assert_eq!, wait_for_event_with_timeout, remove_file, json!, panic!, to_string (+2 more)).
 
@@ -428,11 +432,11 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
 async fn env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork() -> Result<()>
 ```
 
-**Purpose**: Checks under the zsh-fork runtime that a Python process launching a `#!/usr/bin/env zsh` script can still trigger an approval request for a nested escalated command. It validates nested process attribution and approval routing.
+**Purpose**: Tests a nested process case: Python starts a script whose shebang uses `env zsh`, and that script requests approval for an out-of-workspace write. It ensures the zsh-fork sandbox path still catches nested risky actions.
 
-**Data flow**: Obtains a zsh-fork runtime, builds a restrictive workspace-write test with a rule prompting on `touch`, writes an executable zsh script that touches an outside path and prints a completion marker, wraps execution of that script in a Python `subprocess.run(...)` command, mounts a shell-command response and assistant completion, submits a raw `Op::UserInput` with explicit local environment and permission profile, waits for an exec approval request, asserts the approval command includes both `/touch` and the outside path, submits `ReviewDecision::Approved`, waits for completion, parses the shell output, and asserts success, presence of the completion marker, and existence of the outside file.
+**Data flow**: It builds a zsh-fork test runtime, writes an executable zsh script that touches a file outside the workspace, runs that script through Python, waits for an exec approval request for the nested `touch`, approves it, then checks the command output and file creation.
 
-**Call relations**: This targeted Unix-only test exercises nested process escalation behavior under the zsh-fork sandbox runtime rather than the standard matrix path.
+**Call relations**: This standalone Unix test uses zsh-fork setup helpers, shell-event creation, direct turn submission with permission-profile fields, approval waiting, completion waiting, and result parsing. It covers a process-spawning shape not represented in the main scenario matrix.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, local_selections, turn_permission_fields, build_zsh_fork_test, restrictive_workspace_write_profile, zsh_fork_runtime, parse_result, shell_event (+1 more)); 16 external calls (default, from_secs, assert!, assert_eq!, wait_for_event_with_timeout, format!, metadata, set_permissions, write, panic! (+6 more)).
 
@@ -443,11 +447,11 @@ async fn env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork(
 async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()>
 ```
 
-**Purpose**: Verifies that under zsh-fork, a command matching an allow `prefix_rule` reruns unsandboxed and succeeds without prompting. It checks that the outside file is actually created.
+**Purpose**: Tests that a command matching an allowed prefix rule can run without sandbox blocking under the zsh-fork runtime. It checks that saved allow rules are honored in that execution mode.
 
-**Data flow**: Obtains a zsh-fork runtime, builds a restrictive workspace-write test with a saved allow rule for `touch`, mounts a shell-command response and assistant completion for `touch {outside_path}`, submits a raw `Op::UserInput` with explicit local environment and permission profile, waits for completion without approval, parses the shell output, asserts zero exit code, and confirms the outside file exists.
+**Data flow**: It creates a restrictive profile, writes a rule allowing `touch`, prepares a command that writes outside the workspace, submits the turn, waits for completion without approval, parses the result, and confirms the outside file exists.
 
-**Call relations**: This Unix-only targeted test validates saved-rule execution behavior specifically under the zsh-fork runtime.
+**Call relations**: This Unix test combines zsh-fork setup with the no-approval helper. It focuses on the interaction between prefix rules and the zsh-fork sandbox implementation.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, local_selections, turn_permission_fields, build_zsh_fork_test, restrictive_workspace_write_profile, zsh_fork_runtime, parse_result, shell_event (+1 more)); 8 external calls (default, assert!, assert_eq!, format!, skip_if_no_network!, current_dir, tempdir_in, vec!).
 
@@ -458,11 +462,11 @@ async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()>
 async fn invalid_requested_prefix_rule_falls_back_for_compound_command() -> Result<()>
 ```
 
-**Purpose**: Checks that when a requested prefix rule is too narrow for a compound command, Codex falls back to proposing an amendment for the full command instead of trusting the invalid requested rule. It inspects the proposed amendment only.
+**Purpose**: Tests that when a model requests an unsafe or too-narrow prefix rule for a compound command, Codex falls back to a safer amendment proposal. A compound command is one command line containing multiple operations, such as using `&&`.
 
-**Data flow**: Builds a read-only harness, constructs a shell-command event for a compound command with a requested prefix rule of just `touch`, mounts the response, submits the turn, waits for exec approval, extracts the proposed amendment, and asserts it contains the full compound command string.
+**Data flow**: It prepares a compound command while requesting only a `touch` prefix rule, submits the turn, waits for an exec approval prompt, and checks that the proposed amendment contains the whole command instead of blindly trusting the short prefix.
 
-**Call relations**: This targeted test directly exercises `shell_event_with_prefix_rule` and approval proposal logic for invalid requested rules.
+**Call relations**: This test calls `shell_event_with_prefix_rule` directly because the prefix-rule detail is the point of the test. It uses `expect_exec_approval` to inspect the approval proposal.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, shell_event_with_prefix_rule, submit_turn); 3 external calls (new_read_only_policy, assert!, vec!).
 
@@ -473,11 +477,11 @@ async fn invalid_requested_prefix_rule_falls_back_for_compound_command() -> Resu
 async fn approving_fallback_rule_for_compound_command_works() -> Result<()>
 ```
 
-**Purpose**: Verifies that approving the fallback execpolicy amendment for a compound command persists a usable rule and suppresses future prompts for the same command. It is the two-turn counterpart to the previous fallback-rule test.
+**Purpose**: Tests that the fallback rule proposed for a compound command can be approved and then used later. It verifies that the safety fallback is not only proposed but also functional.
 
-**Data flow**: Builds a read-only harness, mounts a first shell-command response for the compound command with an invalid requested prefix rule, submits the turn, waits for exec approval, captures the proposed fallback amendment, submits `ApprovedExecpolicyAmendment` with that amendment, and waits for completion. It then mounts the same command again plus an assistant completion, submits a second turn, waits for completion without approval, parses the second output, and asserts success with empty stdout.
+**Data flow**: It first runs the compound command with an invalid requested prefix, receives the broader fallback amendment, approves it, and waits for completion. Then it runs the same command again and expects no approval prompt, finally parsing the output to confirm success.
 
-**Call relations**: This targeted test extends the fallback-rule scenario across two turns to prove the approved fallback amendment is persisted and reused.
+**Call relations**: This builds directly on the invalid-prefix-rule case. It uses approval waiting, amendment approval, completion waiting, and result parsing to prove the saved fallback rule takes effect.
 
 *Call graph*: calls 10 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_prefix_rule, submit_turn, wait_for_completion, wait_for_completion_without_approval); 4 external calls (new_read_only_policy, assert!, assert_eq!, vec!).
 
@@ -488,11 +492,11 @@ async fn approving_fallback_rule_for_compound_command_works() -> Result<()>
 async fn denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt() -> Result<()>
 ```
 
-**Purpose**: Checks that denying a proposed network policy amendment writes a deny rule to disk and prevents future network approval prompts for the same host. The command should continue to fail, but without another network approval request.
+**Purpose**: Tests that choosing a network-policy denial writes a deny rule and prevents repeated network approval prompts for the same host. This avoids asking the user the same denied network question again.
 
-**Data flow**: Builds a managed-network workspace-write harness from a temp home config, mounts a shell-command response for a proxied HTTP fetch and an assistant completion, submits the first turn, loops through approval events until it finds the synthetic `network-access` approval request, auto-approving any unrelated command approvals along the way, then inspects the network context and proposed allow/deny amendments. It submits a `ReviewDecision::NetworkPolicyAmendment` choosing the deny amendment, waits for completion, reads `rules/default.rules` to confirm the persisted `network_rule(... decision="deny" ...)`, parses the first command output and verifies failure, then mounts the same fetch again, submits a second turn, loops until completion while asserting no `network-access` approval request appears, parses the second output, and again verifies failure.
+**Data flow**: It creates a managed-network configuration, runs a command that tries to fetch a test host, waits until the special network-access approval appears, chooses the deny amendment, verifies the deny rule was written to the policy file, and checks the command failed. It then repeats the fetch and confirms there is no second network approval prompt while the command still fails.
 
-**Call relations**: This targeted test covers persisted network-policy amendments, which are not represented in the generic scenario matrix.
+**Call relations**: This standalone network test uses shell-event creation, turn submission, manual approval-loop handling, completion waiting, result parsing, and expectation verification. It covers network amendments, which have a different approval context from ordinary command approvals.
 
 *Call graph*: calls 8 internal fn (mount_sse_once, sse, start_mock_server, test_codex, parse_result, shell_event, submit_turn, wait_for_completion); 14 external calls (new, new, assert!, assert_eq!, managed_network_requirements_loader, wait_for_event_with_timeout, format!, read_to_string, write, panic! (+4 more)).
 
@@ -503,11 +507,11 @@ async fn denying_network_policy_amendment_persists_policy_and_skips_future_netwo
 async fn network_approval_retry_keeps_deny_read_sandbox_for_escalated_command() -> Result<()>
 ```
 
-**Purpose**: Verifies that when a command with denied-read filesystem restrictions requests both explicit escalation and later network approval, the approved retry preserves the denied-read sandbox constraints. It also ensures only one outer command approval occurs before the network approval.
+**Purpose**: Tests that approving network access during a retried escalated command does not accidentally remove denied-read filesystem restrictions. In plain terms, granting network should not also grant file-reading permissions that were blocked.
 
-**Data flow**: Builds a managed-network harness, derives a permission profile from workspace-write sandbox plus an added deny-read glob for `*.env`, mounts a shell-command response for a proxied HTTP fetch and an assistant completion, submits a raw `Op::UserInput` with explicit permission profile and `SandboxPermissions::RequireEscalated`, then loops through approval events. It counts non-network command approvals, asserting exactly one occurs and approving it; when the `network-access` approval arrives, it extracts the allow amendment and submits `ReviewDecision::NetworkPolicyAmendment` with that allow rule. After completion it parses the command output and asserts an exit code is present, indicating the approved retry ran and reported output.
+**Data flow**: It builds a permission profile with restricted network and an explicit denied read pattern, runs a network fetch command that asks for escalated permissions, approves the outer command request, then handles the network approval by choosing an allow amendment. It waits for completion and checks that command output was produced.
 
-**Call relations**: This non-Windows targeted test exercises a subtle retry path where network approval happens after an explicit escalation approval under a nontrivial filesystem sandbox.
+**Call relations**: This test uses custom permission-profile setup instead of only legacy sandbox settings. It exercises the combined flow of command escalation followed by network approval retry.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields, parse_result, shell_event, wait_for_completion, from_runtime_permissions (+1 more)); 14 external calls (new, default, new, assert!, assert_eq!, managed_network_requirements_loader, wait_for_event_with_timeout, format!, write, panic! (+4 more)).
 
@@ -518,11 +522,11 @@ async fn network_approval_retry_keeps_deny_read_sandbox_for_escalated_command() 
 async fn network_approval_flow_survives_danger_full_access_session_start() -> Result<()>
 ```
 
-**Purpose**: Checks that a session started under danger-full-access does not activate managed-network proxying, but a later turn using workspace-write sandbox can still trigger and handle a network approval flow correctly. It validates transition behavior across session and turn sandbox modes.
+**Purpose**: Tests that a session initially configured with danger-full-access can still use managed network approval correctly on a later workspace-restricted turn. This guards against startup state disabling later network prompts.
 
-**Data flow**: Builds a harness whose config starts in `DangerFullAccess` despite managed-network config being present, asserts managed-network requirements are inactive and no runtime proxy is exposed in `session_configured`, mounts a shell-command response for a proxied HTTP fetch and an assistant completion, submits a turn using workspace-write sandbox via `submit_turn`, loops through approval events until it finds the `network-access` approval request while auto-approving any unrelated command approvals, asserts the network protocol is HTTP, submits `ReviewDecision::Denied` for the network approval, and waits for completion.
+**Data flow**: It starts a session whose default sandbox is danger-full-access, confirms managed network proxy details are hidden at session start, then submits a turn with workspace-write network restrictions and a network-fetch command. It waits for the special network approval request, verifies its protocol context, denies it, and waits for completion.
 
-**Call relations**: This targeted test covers a session-start edge case where managed-network state is suppressed initially but network approvals must still function on later constrained turns.
+**Call relations**: This test uses shell-event creation and the shared turn-submission helper, but focuses on session startup versus per-turn permissions. It makes sure network approval state is recalculated for the turn that actually runs.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, shell_event, submit_turn, wait_for_completion); 12 external calls (new, new, assert!, assert_eq!, managed_network_requirements_loader, wait_for_event_with_timeout, write, panic!, skip_if_no_network!, from_secs (+2 more)).
 
@@ -533,20 +537,24 @@ async fn network_approval_flow_survives_danger_full_access_session_start() -> Re
 async fn compound_command_with_one_safe_command_still_requires_approval() -> Result<()>
 ```
 
-**Purpose**: Verifies that a compound command is not auto-trusted merely because one component matches an allow prefix rule. The whole command should still require approval under `UnlessTrusted`.
+**Purpose**: Tests that a compound command still asks for approval even if part of it resembles a safe or allowed command. This prevents a dangerous command from hiding behind a trusted prefix.
 
-**Data flow**: Builds a workspace-write `UnlessTrusted` harness, writes a saved allow rule for `touch allow-prefix.txt`, prepares a shell-command event for `touch ./test.txt && rm ./test.txt`, mounts the response and assistant completion, submits the turn, waits for exec approval for the full command, submits `ReviewDecision::Denied`, and waits for completion.
+**Data flow**: It writes a rule allowing one specific touch command, prepares a different compound command that touches and removes a file, submits the turn, waits for an exec approval prompt, denies it, and waits for completion.
 
-**Call relations**: This targeted Unix-only test complements the matrix by checking compound-command trust evaluation against saved prefix rules.
+**Call relations**: This standalone Unix test complements the table-driven compound-command scenarios. It uses action preparation and approval waiting to prove Codex evaluates the full command shape, not just one safe-looking piece.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, submit_turn, wait_for_completion); 5 external calls (new_workspace_write_policy, create_dir_all, write, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/exec_policy.rs`
 
-`test` · `request handling / tool policy evaluation`
+`test` · `test run`
 
-This file mixes small helpers with end-to-end conversation tests that drive tool calls through mocked SSE responses. `collaboration_mode_for_model` constructs a `CollaborationMode` using `ModeKind::Default` and a developer instruction string specifically meant to exercise approval logic. `submit_user_turn` centralizes how tests submit `Op::UserInput`: it derives runtime sandbox fields from a `PermissionProfile` using `turn_permission_fields`, injects local environment selections, sets approval policy, and either uses a supplied collaboration mode or synthesizes a default one from the session model. `assert_no_matched_rules_invariant` inspects serialized function-call output and ensures the internal panic text `matched_rules must be non-empty` never leaks into user-visible output. The tests then cover several scenarios: on Windows, unified exec with Windows sandbox features disabled must reject a managed read-only command as policy-blocked; a local `policy.rules` file forbids shell commands beginning with `echo`; and four collaboration-mode regressions verify that empty-string and whitespace-only scripts for both `shell_command` and `exec_command` complete without surfacing the invariant failure. The common pattern is to mount one SSE response that asks the model to call a tool, a second SSE response for the assistant’s follow-up, submit a user turn with explicit thread settings, wait for `TurnComplete`, and inspect the recorded function-call output.
+This is a test file for Codex’s command-execution safety layer. That layer is the gatekeeper between the assistant and the user’s machine: before a command is run, it checks approval settings, sandbox settings, permission profiles, and local policy rules. Without tests like these, a change could accidentally allow a blocked command to run, or make harmless-but-odd inputs crash the whole turn.
+
+The tests build a fake Codex session and a mock server that pretends to be the model API. The mock server sends scripted events, such as “the assistant wants to call the shell_command tool” or “the assistant wants to call exec_command.” The test then watches what Codex does with that request.
+
+Several tests focus on collaboration mode, where extra model settings are attached to a turn. They deliberately send empty or whitespace-only commands. These are like handing the command runner a blank note: it should decline or report cleanly, not panic because no policy rule matched. Another test writes a local policy file that forbids commands beginning with echo, then confirms that an attempted echo command is rejected. On Windows, one test checks that unified exec is still blocked when the Windows sandbox is disabled and the permission profile is read-only.
 
 #### Function details
 
@@ -556,11 +564,11 @@ This file mixes small helpers with end-to-end conversation tests that drive tool
 fn collaboration_mode_for_model(model: String) -> CollaborationMode
 ```
 
-**Purpose**: Builds a `CollaborationMode` value for a specific model with a fixed developer-instructions string used by the tests. It standardizes the collaboration-mode payload across multiple cases.
+**Purpose**: This helper builds a collaboration-mode setting for a chosen model. The tests use it when they want a user turn to exercise the newer collaboration-mode path instead of the plain default settings.
 
-**Data flow**: Takes a `String` model name and returns `CollaborationMode { mode: ModeKind::Default, settings: Settings { model, reasoning_effort: None, developer_instructions: Some(...) } }`. It does not read or mutate external state.
+**Data flow**: It receives a model name as text. It wraps that model name together with default mode settings, no special reasoning effort, and a short developer instruction used by these tests. It returns a complete CollaborationMode value that can be attached to a test turn.
 
-**Call relations**: This helper is called by the empty-script and whitespace-script collaboration-mode tests so they all submit turns with the same explicit collaboration settings.
+**Call relations**: The empty-command and whitespace-command tests call this before submitting their user turn. Its output is passed into submit_user_turn so the simulated conversation uses collaboration-mode settings while the command policy code is being tested.
 
 *Call graph*: called by 4 (shell_command_empty_script_with_collaboration_mode_does_not_panic, shell_command_whitespace_script_with_collaboration_mode_does_not_panic, unified_exec_empty_script_with_collaboration_mode_does_not_panic, unified_exec_whitespace_script_with_collaboration_mode_does_not_panic).
 
@@ -576,11 +584,11 @@ async fn submit_user_turn(
     collaboration_mode
 ```
 
-**Purpose**: Submits a user text turn to a `TestCodex` instance with explicit approval, sandbox, permission-profile, and collaboration-mode overrides. It hides the repetitive protocol construction needed by the exec-policy tests.
+**Purpose**: This helper sends a user message into the test Codex session with the approval, sandbox, permission, and collaboration settings needed for the scenario. It avoids repeating the same setup code in every test.
 
-**Data flow**: Reads `test.session_configured.model` and `test.config.cwd`, converts the supplied `PermissionProfile` into `(sandbox_policy, permission_profile)` via `turn_permission_fields`, builds `Op::UserInput` containing one `UserInput::Text` item and `ThreadSettingsOverrides` with local environment selections, the requested approval policy, derived sandbox fields, and either the provided collaboration mode or a synthesized default using the session model. It asynchronously submits that op through `test.codex.submit` and returns `Result<()>`.
+**Data flow**: It takes the test session, a prompt, an approval policy, a permission profile, and optionally a collaboration mode. It reads the session’s configured model and working directory, converts the permission profile into the sandbox and permission fields expected by the protocol, builds a UserInput operation, and submits it to Codex. It returns success or an error if submission fails.
 
-**Call relations**: The Windows sandbox rejection test and all collaboration-mode regression tests call this helper instead of constructing `Op::UserInput` inline. It delegates environment selection to `local_selections` and permission translation to `turn_permission_fields` before handing control to the Codex runtime.
+**Call relations**: Most tests use this as the point where the scripted scenario actually starts. Before it is called, the mock server has already been loaded with fake model responses. After it submits the turn, the tests wait for Codex events and inspect the tool-call result that Codex sent back to the mock server.
 
 *Call graph*: calls 2 internal fn (local_selections, turn_permission_fields); called by 5 (shell_command_empty_script_with_collaboration_mode_does_not_panic, shell_command_whitespace_script_with_collaboration_mode_does_not_panic, unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command, unified_exec_empty_script_with_collaboration_mode_does_not_panic, unified_exec_whitespace_script_with_collaboration_mode_does_not_panic); 2 external calls (default, vec!).
 
@@ -591,11 +599,11 @@ async fn submit_user_turn(
 fn assert_no_matched_rules_invariant(output_item: &Value)
 ```
 
-**Purpose**: Checks that a serialized function-call output payload does not contain the internal invariant panic message about empty matched rules. It is a focused regression assertion against leaked internal failures.
+**Purpose**: This helper checks that a command result did not expose a specific internal panic message about missing policy-rule matches. In plain terms, it verifies that an edge case failed gracefully instead of leaking a crash into the tool output.
 
-**Data flow**: Accepts a `serde_json::Value` representing a function-call output item, reads its `output` field as a string, and asserts that the string does not contain `invariant failed: matched_rules must be non-empty`. It returns unit and writes no state.
+**Data flow**: It receives a JSON object representing a function-call output. It reads the string stored under the output field, then asserts that the string does not contain the invariant-failure message. It does not return useful data; it passes silently or fails the test.
 
-**Call relations**: The four collaboration-mode tests call this helper after extracting the tool output from the mock request, using it as the final regression check once the turn has completed.
+**Call relations**: The empty-command and whitespace-command tests call this after Codex finishes the turn and the mock server has captured the tool result. It is the shared final check for the collaboration-mode edge cases.
 
 *Call graph*: called by 4 (shell_command_empty_script_with_collaboration_mode_does_not_panic, shell_command_whitespace_script_with_collaboration_mode_does_not_panic, unified_exec_empty_script_with_collaboration_mode_does_not_panic, unified_exec_whitespace_script_with_collaboration_mode_does_not_panic); 2 external calls (get, assert!).
 
@@ -606,11 +614,11 @@ fn assert_no_matched_rules_invariant(output_item: &Value)
 async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command() -> Result<()>
 ```
 
-**Purpose**: On Windows, verifies that unified exec rejects a managed read-only command when Windows sandbox features are disabled in config. The expected tool output must mention the original command and that it was blocked by policy.
+**Purpose**: This Windows-only test proves that a unified exec command is rejected when the Windows sandbox is disabled and the turn is read-only. It protects against a dangerous failure mode where losing the sandbox might accidentally allow a command to run.
 
-**Data flow**: Builds a test config that enables `Feature::UnifiedExec`, disables `Feature::WindowsSandbox` and `Feature::WindowsSandboxElevated`, and turns off both Windows sandbox booleans. It mounts one SSE sequence that requests `exec_command` with `cmd.exe /c dir`, then a second assistant-completion sequence, submits a user turn via `submit_user_turn` with `AskForApproval::Never` and `PermissionProfile::read_only()`, waits for `TurnComplete`, extracts the function-call output for the known `call_id`, and asserts the output string contains both the command text and `rejected: blocked by policy`.
+**Data flow**: The test enables the unified exec feature, disables Windows sandbox features, and builds a fake session. It scripts the mock model to request an exec_command call for cmd.exe /c dir. It submits a user turn with never-ask approval and a read-only permission profile, waits for the turn to finish, then inspects the captured tool output. The expected result is a rejection message saying the command was blocked by policy.
 
-**Call relations**: This Tokio test is entered by the harness on Windows only. It relies on `submit_user_turn` for protocol submission and on `mount_sse_once`/`wait_for_event` to drive and observe the full request-response cycle.
+**Call relations**: It uses start_mock_server, test_codex, mount_sse_once, and sse to create the fake model conversation. It calls submit_user_turn to feed the scenario into Codex, then waits for TurnComplete and reads the mock server’s recorded function-call output to make the assertion.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, submit_user_turn, read_only); 4 external calls (assert!, wait_for_event, json!, vec!).
 
@@ -621,11 +629,11 @@ async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command
 async fn execpolicy_blocks_shell_invocation() -> Result<()>
 ```
 
-**Purpose**: Confirms that a local exec policy rule forbidding commands starting with `echo` blocks a `shell_command` invocation and surfaces the policy reason in `ExecCommandEnd`. It validates policy-file loading and enforcement.
+**Purpose**: This test confirms that a local execution policy file can forbid a shell command. It checks the important safety promise that user or system rules can stop commands before they run.
 
-**Data flow**: Before building the test instance, it writes `rules/policy.rules` under `config.codex_home` containing `prefix_rule(pattern=["echo"], decision="forbidden")`. It mounts SSE responses that request `shell_command` with `echo blocked`, then manually constructs and submits `Op::UserInput` with local environment selections, `AskForApproval::Never`, and permission fields derived from `PermissionProfile::Disabled`. It waits for an `EventMsg::ExecCommandEnd`, then for `TurnComplete`, and asserts that `end.aggregated_output` contains `policy forbids commands starting with \`echo\``.
+**Data flow**: The test writes a policy file under the test Codex home directory saying that commands starting with echo are forbidden. It then scripts the mock model to request shell_command with echo blocked. It submits a user input turn with approval disabled and local environment settings, waits for the command-end event, and checks that the reported output says the policy forbids echo commands.
 
-**Call relations**: Unlike the other tests in this file, this one inlines the `Op::UserInput` construction instead of using `submit_user_turn`, because it directly inspects the emitted `ExecCommandEnd` event before turn completion.
+**Call relations**: Unlike the shared helper path, this test builds the user submission inline because it also sets up the policy file and exact thread overrides itself. It still relies on the same mock-server machinery to simulate the model request, then listens for ExecCommandEnd and TurnComplete events to verify Codex’s response.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields); 6 external calls (default, assert!, wait_for_event, json!, unreachable!, vec!).
 
@@ -636,11 +644,11 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()>
 async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> Result<()>
 ```
 
-**Purpose**: Regression-tests that an empty `shell_command` script under collaboration mode completes without leaking the matched-rules invariant panic. It targets a previously fragile edge case in approval/policy evaluation.
+**Purpose**: This test makes sure an empty shell_command request in collaboration mode does not crash the command-policy logic. It is checking graceful behavior for a blank command.
 
-**Data flow**: Builds a test instance with model `gpt-5.2` and `Feature::CollaborationModes` enabled, mounts SSE responses that request `shell_command` with an empty `command` string and then complete the turn, constructs a collaboration mode via `collaboration_mode_for_model`, submits the turn through `submit_user_turn` with `AskForApproval::OnRequest` and `PermissionProfile::Disabled`, waits for `TurnComplete`, extracts the function-call output from the recorded request, and passes it to `assert_no_matched_rules_invariant`.
+**Data flow**: The test enables collaboration modes, uses a GPT-5.2 model setting, and scripts the mock model to call shell_command with an empty command string. It submits the turn with on-request approval and disabled permissions, waits until Codex completes the turn, then inspects the tool output. The expected outcome is simply that the internal matched-rules invariant message is absent.
 
-**Call relations**: This test uses both helper functions—`collaboration_mode_for_model` to build thread settings and `submit_user_turn` to send them—then finishes with `assert_no_matched_rules_invariant` as its regression oracle.
+**Call relations**: It prepares the mock conversation with start_mock_server, mount_sse_once, and sse. It uses collaboration_mode_for_model to create the special mode settings and submit_user_turn to start the turn. After wait_for_event reports completion, it hands the captured output to assert_no_matched_rules_invariant.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, assert_no_matched_rules_invariant, collaboration_mode_for_model, submit_user_turn); 3 external calls (wait_for_event, json!, vec!).
 
@@ -651,11 +659,11 @@ async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> 
 async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> Result<()>
 ```
 
-**Purpose**: Checks the same empty-script regression for `exec_command` when unified exec and collaboration modes are enabled. It ensures the unified exec path handles blank commands safely.
+**Purpose**: This test checks the same blank-command edge case for the newer unified exec tool. It ensures that exec_command with an empty cmd field does not surface an internal panic in collaboration mode.
 
-**Data flow**: Creates a test instance with model `gpt-5.2`, enables `Feature::UnifiedExec` and `Feature::CollaborationModes`, mounts SSE responses that request `exec_command` with empty `cmd`, builds a collaboration mode from the session model, submits the turn with `submit_user_turn`, waits for `TurnComplete`, extracts the function-call output for the known call id, and verifies via `assert_no_matched_rules_invariant` that no invariant panic text appears.
+**Data flow**: The test enables both unified exec and collaboration modes, then scripts the mock model to call exec_command with an empty cmd string. It submits a user turn using collaboration-mode settings, waits for completion, fetches the function-call output from the mock server, and verifies that the invariant-failure text is not present.
 
-**Call relations**: This follows the same helper-driven flow as the shell variant, but exercises the unified exec tool path by enabling the feature and mocking `exec_command` instead of `shell_command`.
+**Call relations**: It follows the shared test pattern: mock server first, fake model events next, submit_user_turn to run the scenario, wait_for_event to know the turn is done, and assert_no_matched_rules_invariant for the final safety check.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, assert_no_matched_rules_invariant, collaboration_mode_for_model, submit_user_turn); 3 external calls (wait_for_event, json!, vec!).
 
@@ -666,11 +674,11 @@ async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> R
 async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()>
 ```
 
-**Purpose**: Verifies that a whitespace-only shell script under collaboration mode also avoids the matched-rules invariant panic. It distinguishes blank input from syntactically present but semantically empty input.
+**Purpose**: This test makes sure a shell command made only of spaces, tabs, and newlines does not crash policy evaluation in collaboration mode. It covers the case where a command looks non-empty but has no real content.
 
-**Data flow**: Builds a `gpt-5.2` test instance with collaboration modes enabled, mounts SSE responses that request `shell_command` with `"  \n\t  "`, creates a collaboration mode, submits the turn with `AskForApproval::OnRequest` and disabled permissions, waits for `TurnComplete`, extracts the function-call output, and checks it with `assert_no_matched_rules_invariant`.
+**Data flow**: The test enables collaboration modes and scripts a shell_command call whose command string contains only whitespace. It submits the user turn with the collaboration-mode settings, waits for Codex to finish, then reads the recorded function-call output. The test passes if that output does not contain the internal matched-rules panic message.
 
-**Call relations**: This test mirrors the empty-shell case but changes only the tool argument payload to whitespace, reusing `collaboration_mode_for_model`, `submit_user_turn`, and `assert_no_matched_rules_invariant`.
+**Call relations**: It uses collaboration_mode_for_model and submit_user_turn to run the collaboration-mode scenario. The mock-server helpers provide the fake model events, and assert_no_matched_rules_invariant performs the shared check once wait_for_event confirms the turn is complete.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, assert_no_matched_rules_invariant, collaboration_mode_for_model, submit_user_turn); 3 external calls (wait_for_event, json!, vec!).
 
@@ -681,22 +689,24 @@ async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic(
 async fn unified_exec_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()>
 ```
 
-**Purpose**: Regression-tests whitespace-only unified exec commands under collaboration mode. It ensures the unified exec policy path treats whitespace-only input without panicking.
+**Purpose**: This test applies the whitespace-only command check to the unified exec tool. It ensures that exec_command treats a command with no meaningful characters as a clean edge case, not as a crash.
 
-**Data flow**: Builds a `gpt-5.2` test instance with both unified exec and collaboration modes enabled, mounts SSE responses that request `exec_command` with `cmd` set to whitespace, derives a collaboration mode from the session model, submits the turn through `submit_user_turn`, waits for `TurnComplete`, extracts the output item from the mock request, and asserts through `assert_no_matched_rules_invariant` that the invariant panic text is absent.
+**Data flow**: The test enables unified exec and collaboration modes, then sets up the mock model to request exec_command with a cmd string containing only whitespace. It submits the turn, waits for completion, retrieves the tool output captured by the mock server, and checks that the invariant-failure message is absent.
 
-**Call relations**: This is the unified-exec counterpart to the shell whitespace test, using the same helper chain and differing only in enabled features and mocked tool name.
+**Call relations**: It is the unified-exec counterpart to the shell whitespace test. It depends on the same support helpers for fake model responses, collaboration-mode construction, turn submission, event waiting, and final invariant-output checking.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, assert_no_matched_rules_invariant, collaboration_mode_for_model, submit_user_turn); 3 external calls (wait_for_event, json!, vec!).
 
 
 ### `core/tests/suite/skill_approval.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This Unix-only test file sets up synthetic skills under the Codex home directory and then drives them through the zsh-fork execution path. The helpers create skill metadata (`skills/<name>/agents/openai.yaml`), write executable shell scripts under `skills/<name>/scripts`, and build the exact JSON argument string expected by the `shell_command` tool. `submit_turn_with_policies` is the central turn-submission helper: it derives sandbox and permission-profile fields from the requested profile, injects local environment selections, and submits a `UserInput` turn with explicit approval policy and collaboration settings.
+This is a Unix-only test file. It builds small fake Codex sessions, gives the model mocked tool-call responses, and then watches what happens when Codex tries to run shell commands through the zsh-fork runtime. The main concern is safety: a skill may include scripts and metadata that claim extra file permissions, but those declarations must not widen what the current turn is allowed to do. In plain terms, a skill should not be able to hand itself a bigger keyring than the user gave the session.
 
-The first test constructs a skill whose metadata declares write access to an external directory, but whose script attempts to write outside the workspace under a restrictive workspace-write profile. It then confirms no `ExecApprovalRequest` is emitted, proving the old skill-approval gate is gone, and inspects the recorded tool output to ensure execution was governed by the turn sandbox instead. The second test removes the skill layer entirely and directly verifies that zsh-fork still blocks an out-of-workspace `touch`. A small predicate helper recognizes common sandbox-denial strings across environments (`Permission denied`, `Operation not permitted`, `Read-only file system`), making the assertions robust to platform-specific wording.
+The file creates temporary skill folders, writes script files into them, starts a mock server that pretends to be the model backend, and submits user turns with specific approval and sandbox settings. A sandbox is a protective boundary that limits what a command can read or write. The tests then wait for either an approval request or the end of the turn, inspect the command output, and check the real filesystem to make sure forbidden files were not created.
+
+The first test proves that skill script permission metadata is ignored for shell execution: the script should be governed by the turn sandbox instead. The second test is a simpler guardrail check: even without skill involvement, zsh-fork shell commands must not write outside the allowed workspace.
 
 #### Function details
 
@@ -706,11 +716,11 @@ The first test constructs a skill whose metadata declares write access to an ext
 fn write_skill_metadata(home: &Path, name: &str, contents: &str) -> Result<()>
 ```
 
-**Purpose**: Creates the on-disk metadata file for a test skill under the Codex home directory.
+**Purpose**: Writes a skill's metadata file into the fake Codex home directory used by a test. The metadata can include declared permissions, which the tests use to make sure those declarations do not secretly grant extra power.
 
-**Data flow**: Takes a home path, skill name, and YAML contents. It builds `home/skills/<name>/agents`, creates the directory tree, writes `openai.yaml` there, and returns `Ok(())` or an I/O error.
+**Data flow**: It receives a home directory path, a skill name, and the text to put in the metadata file. It creates the nested `skills/<name>/agents` folder, writes `openai.yaml` there, and returns success or an error if the filesystem work fails.
 
-**Call relations**: Used during zsh-fork test setup to install a skill metadata file that declares permissions, allowing the tests to verify those declarations no longer affect runtime sandboxing.
+**Call relations**: The skill-script test calls this while setting up its fake skill. It prepares the permission declaration that the rest of the test later verifies is not allowed to override the turn sandbox.
 
 *Call graph*: 3 external calls (join, create_dir_all, write).
 
@@ -721,11 +731,11 @@ fn write_skill_metadata(home: &Path, name: &str, contents: &str) -> Result<()>
 fn shell_command_arguments(command: &str) -> Result<String>
 ```
 
-**Purpose**: Serializes a shell command into the JSON argument string expected by the `shell_command` tool in these tests.
+**Purpose**: Builds the JSON argument string for a mocked `shell_command` tool call. This lets the fake model response ask Codex to run a specific shell command with a short timeout.
 
-**Data flow**: Accepts a command string, wraps it in JSON with `timeout_ms: 500`, serializes that JSON to a `String`, and returns it as `Result<String>`.
+**Data flow**: It takes a shell command as text, wraps it with a `timeout_ms` value of 500 in a JSON object, converts that JSON object to a string, and returns the string or an error if serialization fails.
 
-**Call relations**: Both zsh-fork tests call this before mounting a mocked `shell_command` function call response.
+**Call relations**: Both tests use this before mounting the mocked model response. It turns the command each test wants to run into the exact argument format expected by the shell tool call.
 
 *Call graph*: called by 2 (shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox); 2 external calls (json!, to_string).
 
@@ -741,11 +751,11 @@ async fn submit_turn_with_policies(
 ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn with explicit approval and permission settings derived from the requested profile.
+**Purpose**: Submits a user message to the test Codex session while explicitly setting the approval and sandbox rules for that turn. This is how each test says, 'run this prompt under these safety limits.'
 
-**Data flow**: Receives a `TestCodex`, prompt text, `AskForApproval` policy, and `PermissionProfile`. It computes `(sandbox_policy, permission_profile)` via `turn_permission_fields`, builds an `Op::UserInput` containing a single text item plus thread settings such as local environment selections, approval policy, sandbox policy, permission profile, and collaboration mode, submits it through `test.codex`, and returns `Ok(())` after the async submission completes.
+**Data flow**: It receives the test session, the prompt text, an approval policy, and a permission profile. It converts the permission profile into sandbox fields for the current working directory, builds a `UserInput` operation with thread settings such as environment selection, approval policy, sandbox policy, permission profile, and model settings, then sends it to Codex asynchronously.
 
-**Call relations**: This helper is the common entry point for both tests so they can vary approval policy and sandbox profile without duplicating the full `Op::UserInput` construction.
+**Call relations**: Both tests call this after the mock server has been prepared. It is the bridge between test setup and the actual Codex run; after it submits the turn, the tests wait for events and inspect the resulting tool output.
 
 *Call graph*: calls 3 internal fn (cwd_path, local_selections, turn_permission_fields); called by 2 (shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox); 2 external calls (default, vec!).
 
@@ -761,11 +771,11 @@ fn write_skill_with_shell_script_contents(
 ) -> Result<PathBuf>
 ```
 
-**Purpose**: Creates a complete test skill containing `SKILL.md` and an executable shell script.
+**Purpose**: Creates a fake skill containing a runnable shell script. The tests use it to simulate a real installed skill that can provide scripts to Codex.
 
-**Data flow**: Given a home path, skill name, script filename, and script contents, it creates `skills/<name>/scripts`, writes a minimal frontmatter-based `SKILL.md`, writes the script file, reads its metadata, sets Unix mode `0o755`, persists the permissions, and returns the script path.
+**Data flow**: It receives a home directory, skill name, script filename, and script text. It creates the skill and script folders, writes a simple `SKILL.md` description, writes the script file, marks that script as executable on Unix, and returns the script path.
 
-**Call relations**: Used in the first zsh-fork test’s setup hook to install the executable skill script that will attempt a sandboxed write.
+**Call relations**: The skill-permission test uses this during its zsh-fork test setup hook. It gives Codex a concrete skill script to execute, so the test can check which sandbox rules actually apply to that execution.
 
 *Call graph*: 6 external calls (join, format!, create_dir_all, metadata, set_permissions, write).
 
@@ -776,11 +786,11 @@ fn write_skill_with_shell_script_contents(
 fn skill_script_command(test: &TestCodex, script_name: &str) -> Result<String>
 ```
 
-**Purpose**: Builds a shell-safe command string that invokes a specific installed skill script by absolute path.
+**Purpose**: Builds the shell command used to run the fake skill script. It resolves the script to an absolute path and quotes it safely for shell use.
 
-**Data flow**: Takes a `TestCodex` and script name, canonicalizes `codex_home/skills/mbolin-test-skill/scripts/<script_name>`, shell-quotes that single path with `shlex::try_join`, and returns the resulting command string.
+**Data flow**: It reads the test Codex home path, appends the expected skill script location, canonicalizes it into a full real path, shell-quotes that path, and returns the resulting command string.
 
-**Call relations**: The skill-permissions test uses this to ensure the mocked `shell_command` call executes the exact installed script rather than relying on PATH lookup.
+**Call relations**: The skill-permission test calls this after the fake skill has been created. The returned command is then packed into mocked shell-tool arguments so the simulated model asks Codex to run that script.
 
 *Call graph*: calls 1 internal fn (codex_home_path); called by 1 (shell_zsh_fork_skill_scripts_ignore_declared_permissions); 2 external calls (canonicalize, try_join).
 
@@ -791,11 +801,11 @@ fn skill_script_command(test: &TestCodex, script_name: &str) -> Result<String>
 async fn wait_for_exec_approval_request(test: &TestCodex) -> Option<ExecApprovalRequestEvent>
 ```
 
-**Purpose**: Waits until either an execution approval request arrives or the turn completes without one.
+**Purpose**: Waits to see whether Codex asks for approval before executing a command. It returns the approval request if one appears, or `None` if the turn finishes first.
 
-**Data flow**: Observes events from `test.codex` using `wait_for_event_match`. It returns `Some(request)` when it sees `EventMsg::ExecApprovalRequest`, `None` when it sees `TurnComplete` first, and keeps waiting on other events.
+**Data flow**: It listens to events from the test Codex session. If it sees an execution approval request, it clones and returns it; if it sees the turn complete, it returns `None`; other events are ignored while waiting.
 
-**Call relations**: The first test uses this to prove that skill-script execution no longer triggers the removed skill approval path.
+**Call relations**: The skill-permission test uses this to confirm that the removed skill approval path is not triggered. In that story, no separate skill approval should appear; the command should proceed under the normal turn sandbox instead.
 
 *Call graph*: called by 1 (shell_zsh_fork_skill_scripts_ignore_declared_permissions); 1 external calls (wait_for_event_match).
 
@@ -806,11 +816,11 @@ async fn wait_for_exec_approval_request(test: &TestCodex) -> Option<ExecApproval
 async fn wait_for_turn_complete(test: &TestCodex)
 ```
 
-**Purpose**: Blocks until the current turn emits `TurnComplete`.
+**Purpose**: Waits until the Codex turn has finished. Tests use it so they do not inspect command output or filesystem effects too early.
 
-**Data flow**: Consumes a `TestCodex` reference and waits on its event stream until an event matches `EventMsg::TurnComplete(_)`.
+**Data flow**: It listens to events from the test Codex session until it sees a `TurnComplete` event. It does not return data; it simply pauses the test until the turn is done.
 
-**Call relations**: Both tests call this after submission so they can safely inspect recorded tool outputs and filesystem side effects.
+**Call relations**: Both tests call this after submitting a turn, or after checking that no approval request appeared. It marks the point where it is safe for the test to read the mock tool output and check whether files were created.
 
 *Call graph*: called by 2 (shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox); 1 external calls (wait_for_event).
 
@@ -821,11 +831,11 @@ async fn wait_for_turn_complete(test: &TestCodex)
 fn output_shows_sandbox_denial(output: &str) -> bool
 ```
 
-**Purpose**: Recognizes common textual indicators that a shell command was blocked by sandbox restrictions.
+**Purpose**: Recognizes common shell error messages that mean the sandbox blocked an operation. This keeps the tests tolerant of different operating-system wording.
 
-**Data flow**: Takes an output string slice and returns `true` if it contains `Permission denied`, `Operation not permitted`, or `Read-only file system`; otherwise returns `false`.
+**Data flow**: It receives command output as text and checks whether it contains phrases such as `Permission denied`, `Operation not permitted`, or `Read-only file system`. It returns `true` if any of those signs appear, otherwise `false`.
 
-**Call relations**: Used in both tests to make assertions resilient to environment-specific denial wording.
+**Call relations**: Both tests use this when judging command output. Instead of relying on one exact error string, they ask this helper whether the output looks like a sandbox rejection.
 
 
 ##### `shell_zsh_fork_skill_scripts_ignore_declared_permissions`  (lines 142–233)
@@ -834,11 +844,11 @@ fn output_shows_sandbox_denial(output: &str) -> bool
 async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()>
 ```
 
-**Purpose**: Verifies that skill metadata declaring filesystem write permissions does not bypass the turn sandbox when a zsh-fork skill script runs.
+**Purpose**: Tests that a skill script's own permission metadata does not give it extra write access when run through zsh-fork. The script may declare that it can write to a directory, but the turn sandbox must still be the real authority.
 
-**Data flow**: Skips without network, acquires a zsh-fork runtime, defines a granular approval policy with `skill_approval: false`, creates an external allowed directory and a script that writes there, formats matching permissions YAML, starts a mock server, builds a zsh-fork test whose setup hook installs the script and metadata, computes the script command and serialized shell arguments, mounts a mocked `shell_command` response, submits a turn under the restrictive workspace-write profile, waits for any exec approval request, waits for turn completion, then inspects the recorded function-call output and filesystem. It asserts no approval request occurred, no old execution-denied message appears, the sandbox blocked or prevented the write, and the external file was not created.
+**Data flow**: The test skips if network support is unavailable, obtains a zsh-fork runtime, creates a restrictive workspace-write permission profile, and prepares a fake skill whose script tries to write outside the workspace. It also writes skill metadata claiming that outside directory is allowed. It starts a mock server, mounts a fake shell-tool call for the script, submits a user turn that invokes the skill, checks that no execution approval request appears, waits for completion, then inspects the tool output and the target file path. The expected result is that the outside write is blocked and the file does not exist.
 
-**Call relations**: This is the main regression test for the removed skill approval path. It combines all helpers in the file plus zsh-fork-specific builders from test support.
+**Call relations**: This is one of the two top-level async tests in the file. It uses the setup helpers to create the skill and command, uses `submit_turn_with_policies` to start the Codex run, uses `wait_for_exec_approval_request` and `wait_for_turn_complete` to follow the event flow, and uses `output_shows_sandbox_denial` plus a filesystem check to prove the sandbox remained in control.
 
 *Call graph*: calls 10 internal fn (mount_function_call_agent_response, start_mock_server, build_zsh_fork_test, restrictive_workspace_write_profile, zsh_fork_runtime, shell_command_arguments, skill_script_command, submit_turn_with_policies, wait_for_exec_approval_request, wait_for_turn_complete); 8 external calls (Granular, assert!, format!, create_dir_all, try_join, skip_if_no_network!, current_dir, tempdir_in).
 
@@ -849,24 +859,24 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
 async fn shell_zsh_fork_still_enforces_workspace_write_sandbox() -> Result<()>
 ```
 
-**Purpose**: Verifies that zsh-fork execution still respects the workspace-write sandbox for ordinary shell commands that try to write outside the workspace.
+**Purpose**: Tests the basic safety rule that zsh-fork commands cannot write outside the workspace under a restrictive workspace-write policy. This protects against regressions in the sandbox itself, separate from skill behavior.
 
-**Data flow**: Skips without network, acquires a zsh-fork runtime, starts a mock server, defines an outside `/tmp` path, builds a restrictive workspace-write test, serializes a `touch` command into shell arguments, mounts a mocked `shell_command` response, submits the turn with `AskForApproval::Never`, waits for turn completion, then inspects the recorded tool output and the target path. It asserts the output indicates sandbox denial and the outside file does not exist.
+**Data flow**: The test skips if network support is unavailable, gets a zsh-fork runtime, starts a mock server, chooses an outside path under `/tmp`, removes any old file at that path, and builds a test Codex session with a restrictive permission profile. It mounts a fake shell-tool call that runs `touch` on the outside path, submits a turn, waits for it to finish, reads the command output, and verifies both that the output shows a sandbox denial and that the file was not created.
 
-**Call relations**: This is the simpler control test that confirms the underlying turn sandbox remains effective even without any skill metadata involved.
+**Call relations**: This is the second top-level async test. It follows the same overall pattern as the skill test but removes the skill layer, using `shell_command_arguments`, `submit_turn_with_policies`, `wait_for_turn_complete`, and `output_shows_sandbox_denial` to confirm the zsh-fork sandbox still blocks forbidden writes.
 
 *Call graph*: calls 8 internal fn (mount_function_call_agent_response, start_mock_server, build_zsh_fork_test, restrictive_workspace_write_profile, zsh_fork_runtime, shell_command_arguments, submit_turn_with_policies, wait_for_turn_complete); 4 external calls (assert!, format!, remove_file, skip_if_no_network!).
 
 
 ### `core/tests/suite/unified_exec_zsh_fork_approvals.rs`
 
-`test` · `approval handling during integration tests`
+`test` · `test run`
 
-This file focuses on a narrower but subtle integration point: unified exec commands that request sandbox escalation and are executed through the zsh-fork runtime. The tests build a specialized `TestCodex` only when the zsh-fork runtime is available, mount mock `exec_command` tool calls that request `SandboxPermissions::RequireEscalated`, submit turns using the session's configured permission profile, and then drive approval decisions through `Op::ExecApproval`.
+These are integration-style tests: they start a mock server that pretends to be the model API, ask Codex to run a command, and then watch the approval and sandbox behavior end to end. The main concern is safety. Codex may ask the user to approve a command that needs more permissions, such as writing outside the workspace. These tests make sure that approval affects only the right layer of execution and does not accidentally open doors that should stay closed.
 
-The three top-level tests distinguish important policy boundaries. One proves that approving the parent unified-exec command does not erase denied-read restrictions inherited from the permission profile. Another proves that parent approval does allow an intercepted shell redirection to write outside the workspace. The third adds a rules file with `prefix_rule(pattern=["touch"], decision="prompt")` and verifies that even after approving the parent command, an intercepted inner `touch` still triggers its own explicit approval request before completion.
+The file focuses on a zsh-fork runtime, where a parent shell process can intercept and run commands. That is a tricky setup because a shell redirection like `printf hi > file` is not just a normal program call; the shell itself performs the write. The tests verify three important cases: approved shell redirection can write outside the workspace, denied-read rules still block secret files even after approval, and an explicit rule saying “ask before running touch” still triggers a second approval.
 
-Helper functions build permission profiles from TOML, mount the two-step SSE exchange, submit turns with `ApprovalsReviewer::User`, wait for and approve expected exec requests, and parse either JSON or legacy text output into a compact `CommandResult { exit_code, stdout }`. The design intentionally validates both modern structured output and older textual fallback formats.
+Helper functions build the test Codex session, prepare fake model responses, submit a user turn with the right permissions, approve requested commands, and decode the command result returned to the mock server. Together, they act like a small stage crew: one part sets the sandbox, one part plays the model, one part plays the user, and one part inspects what happened.
 
 #### Function details
 
@@ -876,11 +886,11 @@ Helper functions build permission profiles from TOML, mount the two-step SSE exc
 async fn unified_exec_zsh_fork_parent_approval_preserves_denied_reads() -> Result<()>
 ```
 
-**Purpose**: Verifies that approving the parent unified-exec command does not bypass a permission profile's denied-read restriction.
+**Purpose**: This test proves that approving a command does not remove an explicit “deny read” rule. It protects against a serious bug where user approval for execution could accidentally let a command read a secret file.
 
-**Data flow**: It creates a temporary secret file outside the workspace, builds a permission profile that denies reads of that path, confirms the profile reports denied-read restrictions, constructs a zsh-fork test if available, mounts an escalated `exec_command` that runs `cat` on the denied file, submits the turn, approves the expected parent exec request, waits for completion without further approvals, then parses the command result and asserts a non-zero exit code and absence of the secret in stdout.
+**Data flow**: It creates a temporary secret file, builds a permission profile that allows general reading but denies that exact file, and prepares a fake model response asking to run `cat` on the secret. After submitting a user turn and approving the parent command, it waits for completion and checks the recorded command result. The expected outcome is a non-zero exit code and no secret text in the output.
 
-**Call relations**: This test composes nearly all helpers in the file: profile construction, zsh-fork fixture setup, command mounting, turn submission, approval, completion waiting, and result parsing.
+**Call relations**: This is one of the top-level test cases. It uses the setup helper to start the zsh-fork test environment, the mock-response helper to stage the command, the submit helper to start the turn, the approval helper to approve the command, and the result helper to inspect what the command actually returned.
 
 *Call graph*: calls 7 internal fn (approve_expected_exec, build_unified_exec_zsh_fork_test_or_skip, command_result, denied_read_permission_profile, mount_unified_exec_command, submit_turn_with_session_permissions, wait_for_completion_without_approval); 7 external calls (assert!, assert_ne!, format!, write, skip_if_no_network!, current_dir, tempdir_in).
 
@@ -891,11 +901,11 @@ async fn unified_exec_zsh_fork_parent_approval_preserves_denied_reads() -> Resul
 async fn unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec() -> Result<()>
 ```
 
-**Purpose**: Checks that approving the parent unified-exec command allows an intercepted shell redirection to write outside the workspace.
+**Purpose**: This test checks that approval can correctly grant extra permission for a shell operation that the zsh fork intercepts. In plain terms, it makes sure that an approved command can write outside the workspace when that is exactly what the user approved.
 
-**Data flow**: It creates a restrictive workspace-write profile and an out-of-workspace target file, builds the zsh-fork test with a pre-build hook that removes any stale target, mounts an escalated command `printf hi > outside_path`, submits the turn, approves the expected parent exec request, waits for completion without additional approvals, parses the result, and asserts successful exit plus file contents `hi` on disk.
+**Data flow**: It creates a temporary path outside the workspace, prepares a restrictive permission profile, and asks the fake model to run a command that writes `hi` to that path using shell redirection. After the user approval is simulated, it waits for the turn to finish, reads the command result, and then reads the file from disk. The expected outcome is a successful exit code and a file containing `hi`.
 
-**Call relations**: This is the positive escalation case paired with the denied-read test. It uses the same helper flow but validates that parent approval can widen write access for the parent shell execution.
+**Call relations**: This top-level test follows the normal approval flow. It relies on the shared zsh-fork setup, staged server events, user-turn submission, approval waiting, and completion waiting helpers, then verifies both the returned command result and the real filesystem side effect.
 
 *Call graph*: calls 7 internal fn (restrictive_workspace_write_profile, approve_expected_exec, build_unified_exec_zsh_fork_test_or_skip, command_result, mount_unified_exec_command, submit_turn_with_session_permissions, wait_for_completion_without_approval); 6 external calls (assert_eq!, format!, read_to_string, skip_if_no_network!, current_dir, tempdir_in).
 
@@ -906,11 +916,11 @@ async fn unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec() -> R
 async fn unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule() -> Result<()>
 ```
 
-**Purpose**: Ensures that explicit prompt rules still trigger a second approval for intercepted inner commands even after the parent unified-exec command has been approved.
+**Purpose**: This test makes sure that a specific rule saying “prompt before running this command” is still respected after the parent command has already been approved. It prevents broad approval from silently bypassing more precise safety rules.
 
-**Data flow**: It creates a restrictive profile, an out-of-workspace target path, and a rules file containing a `touch` prompt rule via the pre-build hook. It mounts an escalated `touch outside_path` command, submits the turn, approves the parent exec request, waits up to 10 seconds for either an inner `ExecApprovalRequest` or premature completion, asserts the approval request command references `/touch` and the target path, approves that inner request, waits for completion, then parses the result and asserts success and file creation.
+**Data flow**: It creates a temporary outside-workspace path, writes a rule file that says commands starting with `touch` require a prompt, and stages a fake model request to run `touch` on that path. The test first approves the parent unified execution request, then waits for a second approval request for the intercepted `touch` command. After approving that second request, it confirms the turn completes and the file exists.
 
-**Call relations**: This test extends the standard approval flow by explicitly expecting a second approval event after `approve_expected_exec`, proving that parent approval does not suppress rule-driven prompts for intercepted subcommands.
+**Call relations**: This top-level test exercises a two-step approval story. It uses the common setup and submission helpers for the first command, then directly waits for and approves the explicit prompt-rule approval before using the completion and result helpers to verify the end state.
 
 *Call graph*: calls 8 internal fn (restrictive_workspace_write_profile, approve_exec, approve_expected_exec, build_unified_exec_zsh_fork_test_or_skip, command_result, mount_unified_exec_command, submit_turn_with_session_permissions, wait_for_completion); 9 external calls (from_secs, assert!, assert_eq!, wait_for_event_with_timeout, format!, panic!, skip_if_no_network!, current_dir, tempdir_in).
 
@@ -926,11 +936,11 @@ async fn build_unified_exec_zsh_fork_test_or_skip(
 ) -> Result<Option<(MockS
 ```
 
-**Purpose**: Builds the specialized zsh-fork unified-exec test fixture when the runtime is available, otherwise returns `None` so callers can skip cleanly.
+**Purpose**: This helper prepares the full test environment, but cleanly skips the test if the required zsh-fork runtime is not available. That lets these tests run only on systems that can actually exercise this execution path.
 
-**Data flow**: It takes a test name, approval policy, permission profile, and pre-build hook, queries `zsh_fork_runtime`, returns `Ok(None)` if unavailable, otherwise starts a mock server, calls `build_unified_exec_zsh_fork_test` with the runtime and supplied parameters, and returns `Some((MockServer, TestCodex))`.
+**Data flow**: It receives a test name, an approval policy, a permission profile, and a setup callback. It asks for a zsh-fork runtime; if none is available, it returns `None`. Otherwise it starts a mock server, builds a `TestCodex` session with the requested permissions and callback, and returns both pieces to the caller.
 
-**Call relations**: All three top-level tests call this helper first so they can gracefully no-op on systems without the zsh-fork runtime.
+**Call relations**: All three top-level tests call this before doing anything else. It hands them a mock model server and a Codex test harness, which the later helpers use to stage responses, submit user input, and observe events.
 
 *Call graph*: calls 3 internal fn (start_mock_server, build_unified_exec_zsh_fork_test, zsh_fork_runtime); called by 3 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule, unified_exec_zsh_fork_parent_approval_preserves_denied_reads).
 
@@ -941,11 +951,11 @@ async fn build_unified_exec_zsh_fork_test_or_skip(
 fn denied_read_permission_profile(denied_path: &Path) -> Result<PermissionProfile>
 ```
 
-**Purpose**: Constructs a permission profile TOML string that grants broad read access but explicitly denies one target path.
+**Purpose**: This helper creates the special permission profile used by the denied-read test. It describes a sandbox where most files can be read, project roots can be written, but one chosen path is explicitly blocked.
 
-**Data flow**: It converts the denied path into a TOML key string, interpolates it into a TOML snippet with `/ = read`, `:project_roots = write`, the denied path set to `deny`, and network disabled, then delegates to `permission_profile_from_toml`.
+**Data flow**: It receives the path that should be protected, converts it into a TOML-safe key, and builds a small permission-profile text. It then passes that text to the TOML parser helper and returns the resulting runtime permission profile.
 
-**Call relations**: Only the denied-read approval test uses this helper to create a profile with `has_denied_read_restrictions()`.
+**Call relations**: The denied-read top-level test calls this to get the exact sandbox shape it needs. It delegates the detailed conversion from TOML text into a `PermissionProfile` to `permission_profile_from_toml`.
 
 *Call graph*: calls 1 internal fn (permission_profile_from_toml); called by 1 (unified_exec_zsh_fork_parent_approval_preserves_denied_reads); 3 external calls (to_string_lossy, new, format!).
 
@@ -956,11 +966,11 @@ fn denied_read_permission_profile(denied_path: &Path) -> Result<PermissionProfil
 fn permission_profile_from_toml(profile: &str) -> Result<PermissionProfile>
 ```
 
-**Purpose**: Parses a small TOML permission-profile fragment into a runtime `PermissionProfile` with filesystem and network sandbox policies.
+**Purpose**: This helper turns a small TOML permission profile into the runtime permission object that Codex uses during tests. TOML is a human-readable configuration format, so this lets the test describe sandbox rules clearly.
 
-**Data flow**: It deserializes `PermissionProfileToml`, extracts filesystem entries, maps `/` to `FileSystemSpecialPath::Root`, `:project_roots` to the corresponding special path, maps deny entries to `FileSystemPath::GlobPattern`, rejects unsupported entry shapes, builds `FileSystemSandboxEntry` values, creates a restricted `FileSystemSandboxPolicy`, copies `glob_scan_max_depth`, derives `NetworkSandboxPolicy` from `network.enabled`, and returns `PermissionProfile::from_runtime_permissions`.
+**Data flow**: It receives profile text, parses it into the configuration form, extracts filesystem entries, converts special paths like `/` and `:project_roots` into sandbox path objects, and turns denied paths into glob patterns. It also converts the network setting into either enabled or restricted network access. The result is a `PermissionProfile` ready to be used by the test harness.
 
-**Call relations**: This helper is the TOML-to-runtime bridge used by `denied_read_permission_profile`; it encapsulates the exact subset of TOML syntax these tests need.
+**Call relations**: It is used by the denied-read profile helper. That helper supplies the small TOML snippet, and this function performs the lower-level translation into the permission model used by Codex.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); called by 1 (denied_read_permission_profile).
 
@@ -977,11 +987,11 @@ async fn mount_unified_exec_command(
 ) -> Result<ResponseMock>
 ```
 
-**Purpose**: Mounts the standard two-response SSE sequence for an approval-oriented unified-exec command: first the tool call, then a final assistant message.
+**Purpose**: This helper programs the mock model server to ask Codex to run one command, then later return a simple assistant message saying the turn is done. It gives the tests a repeatable fake model conversation.
 
-**Data flow**: It formats response IDs and message IDs from `response_prefix`, builds the `exec_command` event via `exec_command_event`, mounts a first SSE response containing `response_created`, the function call, and `completed`, then mounts a second SSE response containing `assistant_message` and `completed`. It returns the `ResponseMock` for the second mount.
+**Data flow**: It receives the mock server, identifiers, the shell command, and a justification for elevated sandbox permissions. It builds one fake streaming response containing an `exec_command` tool call and completion, then mounts a second fake response containing an assistant message and completion. It returns the mock object that records the second request, so the test can later inspect the command output sent back to the model.
 
-**Call relations**: Each top-level approval test uses this helper to prepare the mock server before submitting the turn.
+**Call relations**: Each top-level test calls this after setup and before submitting the user turn. Internally it uses `exec_command_event` to build the tool-call event and the test support server helpers to mount the fake streaming responses.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, exec_command_event); called by 3 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule, unified_exec_zsh_fork_parent_approval_preserves_denied_reads); 2 external calls (format!, vec!).
 
@@ -996,11 +1006,11 @@ async fn submit_turn_with_session_permissions(
 ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn using the session's configured permission profile and an explicit approval policy suitable for approval-flow tests.
+**Purpose**: This helper submits a user message to the Codex test session while explicitly carrying over the session’s permission and collaboration settings. It makes the test turn look like a real user request with a known approval policy.
 
-**Data flow**: It reads the session model and permission profile from `test.session_configured`, derives sandbox fields with `turn_permission_fields`, constructs `Op::UserInput` with one text item, local environment selections, `approval_policy`, `ApprovalsReviewer::User`, and a default collaboration mode carrying the session model, then submits it through `test.codex`.
+**Data flow**: It reads the model and permission settings from the `TestCodex` session, derives the sandbox and permission fields for the current working directory, and sends a `UserInput` operation to Codex. The submitted operation includes the prompt text, local environment selection, approval policy, user-as-reviewer setting, sandbox policy, permission profile, and collaboration mode.
 
-**Call relations**: All three approval tests call this helper instead of a generic submit helper because they need to preserve the session-configured permission profile and enable user review.
+**Call relations**: All three top-level tests use this to start the actual Codex turn after the mock server has been prepared. Once this is submitted, Codex can receive the fake model response, request approvals, and execute the command.
 
 *Call graph*: calls 2 internal fn (local_selections, turn_permission_fields); called by 3 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule, unified_exec_zsh_fork_parent_approval_preserves_denied_reads); 2 external calls (default, vec!).
 
@@ -1011,11 +1021,11 @@ async fn submit_turn_with_session_permissions(
 async fn approve_expected_exec(test: &TestCodex, expected_command: &str) -> Result<()>
 ```
 
-**Purpose**: Waits for the next expected exec approval request and approves it.
+**Purpose**: This helper waits for the approval request that should match a specific parent command, then approves it. It combines “check that Codex asked for the right thing” with “simulate the user clicking approve.”
 
-**Data flow**: It calls `expect_exec_approval` to retrieve the pending `ExecApprovalRequestEvent`, extracts its effective approval ID, and passes that ID to `approve_exec`. It returns `Ok(())` after the approval submission succeeds.
+**Data flow**: It receives the test harness and the expected command string. It waits for an execution approval request, verifies that the requested parent command matches, extracts the effective approval id, and sends an approval decision for that id. It returns success once the approval operation has been submitted.
 
-**Call relations**: Each top-level test uses this helper for the initial parent unified-exec approval step.
+**Call relations**: The top-level tests use this for the first approval in the flow. It depends on `expect_exec_approval` for the waiting and checking part, then hands the approval id to `approve_exec` to send the decision.
 
 *Call graph*: calls 2 internal fn (approve_exec, expect_exec_approval); called by 3 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule, unified_exec_zsh_fork_parent_approval_preserves_denied_reads).
 
@@ -1026,11 +1036,11 @@ async fn approve_expected_exec(test: &TestCodex, expected_command: &str) -> Resu
 async fn approve_exec(test: &TestCodex, approval_id: String) -> Result<()>
 ```
 
-**Purpose**: Submits an approval decision of `Approved` for a specific exec approval ID.
+**Purpose**: This helper simulates the user approving a pending command execution request. It is the test equivalent of pressing an “Approve” button.
 
-**Data flow**: It constructs `Op::ExecApproval { id, turn_id: None, decision: ReviewDecision::Approved }`, submits it through `test.codex`, and returns `Ok(())` on success.
+**Data flow**: It receives a test harness and an approval id. It submits an `ExecApproval` operation to Codex with the decision set to approved, and returns once Codex accepts that operation.
 
-**Call relations**: Called by `approve_expected_exec` for the parent approval and directly by the explicit-prompt-rule test for the second intercepted-command approval.
+**Call relations**: It is called by `approve_expected_exec` for the normal parent approval. The explicit prompt-rule test also calls it directly for the second approval request, after that test has inspected the intercepted command.
 
 *Call graph*: called by 2 (approve_expected_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule).
 
@@ -1041,11 +1051,11 @@ async fn approve_exec(test: &TestCodex, approval_id: String) -> Result<()>
 fn command_result(results: &ResponseMock, call_id: &str) -> CommandResult
 ```
 
-**Purpose**: Extracts and parses the function-call output for one call ID from a `ResponseMock` into a compact `CommandResult`.
+**Purpose**: This helper retrieves and parses the command result that Codex sent back to the mock model server. It hides the details of where the recorded tool output is stored.
 
-**Data flow**: It reads the single captured request from `results`, fetches the function-call output item for `call_id`, and delegates to `parse_result`, returning the resulting `CommandResult`.
+**Data flow**: It receives a response mock and a tool-call id. It finds the single recorded request, pulls out the function-call output for that id, and passes that value to the parser. It returns a simple `CommandResult` with an optional exit code and stdout text.
 
-**Call relations**: All three top-level tests use this helper after completion to inspect the model-visible command result.
+**Call relations**: The top-level tests call this after the turn completes so they can assert whether the command succeeded and what it printed. It delegates the actual decoding work to `parse_result`.
 
 *Call graph*: calls 2 internal fn (single_request, parse_result); called by 3 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule, unified_exec_zsh_fork_parent_approval_preserves_denied_reads).
 
@@ -1062,11 +1072,11 @@ fn exec_command_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds the JSON event payload for an `exec_command` function call, optionally including yield time and sandbox-escalation fields.
+**Purpose**: This helper builds the fake model event that asks Codex to call the `exec_command` tool. It lets tests specify the command and whether the tool call asks for elevated sandbox permissions.
 
-**Data flow**: It starts with JSON containing `cmd`, conditionally inserts `yield_time_ms`, and if `sandbox_permissions.requests_sandbox_override()` is true also inserts `sandbox_permissions` and `justification`. It serializes the args to a string and wraps them with `ev_function_call(call_id, "exec_command", ...)`.
+**Data flow**: It receives a call id, command text, optional yield time, sandbox permission request, and justification. It creates a JSON argument object, adds timing and sandbox fields when needed, serializes it to a string, and wraps it as a function-call event named `exec_command`.
 
-**Call relations**: Only `mount_unified_exec_command` calls this helper to generate the exact tool-call event shape used in these approval tests.
+**Call relations**: Only `mount_unified_exec_command` calls this. The resulting event becomes part of the mock streaming response that Codex reads as if it came from the model.
 
 *Call graph*: calls 2 internal fn (ev_function_call, requests_sandbox_override); called by 1 (mount_unified_exec_command); 2 external calls (json!, to_string).
 
@@ -1077,11 +1087,11 @@ fn exec_command_event(
 fn parse_result(item: &Value) -> CommandResult
 ```
 
-**Purpose**: Parses a function-call output item into `CommandResult`, supporting both structured JSON output and legacy text formats.
+**Purpose**: This helper turns the raw command-output value into a simple result object. It supports both the newer JSON-shaped output and older plain-text formats.
 
-**Data flow**: It reads `item["output"]` as a string; if absent, it returns `CommandResult { exit_code: None, stdout: "" }`. If the string parses as JSON, it extracts `metadata.exit_code` and `output`. Otherwise it tries two regex-based legacy formats and falls back to treating the whole string as stdout with no exit code.
+**Data flow**: It receives a JSON value from the recorded function-call output. If there is no string output, it returns an empty result. If the output string is JSON, it extracts the exit code from metadata and stdout from the output field. If it is not JSON, it tries known text patterns with regular expressions; if those do not match, it returns the raw text with no exit code.
 
-**Call relations**: This parser is used only by `command_result`, letting the tests tolerate multiple output encodings from the underlying tool implementation.
+**Call relations**: It is called by `command_result` whenever a test wants to inspect what happened after command execution. For fallback text formats, it asks `parsed_regex_result` to do the pattern matching.
 
 *Call graph*: calls 1 internal fn (parsed_regex_result); called by 1 (command_result); 2 external calls (new, get).
 
@@ -1092,11 +1102,11 @@ fn parse_result(item: &Value) -> CommandResult
 fn parsed_regex_result(pattern: &str, output_str: &str) -> Option<CommandResult>
 ```
 
-**Purpose**: Parses one legacy textual command-result format using a supplied regex pattern with exit code and output capture groups.
+**Purpose**: This helper extracts an exit code and output text from an older plain-text command result format. It is a compatibility fallback for results that are not valid JSON.
 
-**Data flow**: It compiles the regex, matches it against `output_str`, parses capture group 1 as `i64` exit code, reads capture group 2 as stdout, and returns `Some(CommandResult)` or `None` if any step fails.
+**Data flow**: It receives a regular expression pattern and an output string. It compiles the pattern, matches it against the output, parses the first captured group as an exit code, and uses the second captured group as stdout. If any step fails, it returns `None`.
 
-**Call relations**: This is a fallback helper used by `parse_result` after JSON parsing fails.
+**Call relations**: It is used only by `parse_result`. `parse_result` tries one text pattern and then another, using this helper as the small reusable matcher.
 
 *Call graph*: called by 1 (parse_result); 1 external calls (new).
 
@@ -1110,11 +1120,11 @@ async fn expect_exec_approval(
 ) -> ExecApprovalRequestEvent
 ```
 
-**Purpose**: Waits for the next exec approval request and asserts it corresponds to the expected parent unified-exec command.
+**Purpose**: This helper waits until Codex either asks for command approval or finishes the turn, then enforces that an approval request arrived first. It also checks that the approval is for the exact parent command the test expected.
 
-**Data flow**: It waits until either `EventMsg::ExecApprovalRequest` or `TurnComplete` arrives. On approval, it inspects the last command argument, asserts it equals `expected_command`, and returns the approval event. On premature completion or any other event shape it panics.
+**Data flow**: It receives the test harness and expected command text. It listens for the next relevant event. If the event is an execution approval request, it compares the last command argument with the expected command and returns the approval object. If the turn finishes first, or any unexpected event appears, it fails the test.
 
-**Call relations**: `approve_expected_exec` uses this helper to ensure the approval being granted is for the intended parent command, not some unrelated request.
+**Call relations**: It is used by `approve_expected_exec`. That wrapper uses this function to get a verified approval request, then passes the request’s effective approval id to `approve_exec`.
 
 *Call graph*: called by 1 (approve_expected_exec); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -1125,11 +1135,11 @@ async fn expect_exec_approval(
 async fn wait_for_completion_without_approval(test: &TestCodex)
 ```
 
-**Purpose**: Waits for turn completion and fails if any unexpected approval request appears first.
+**Purpose**: This helper waits for the turn to finish and fails if Codex asks for another approval first. It is used when a test expects one approval to be enough.
 
-**Data flow**: It waits for either `ExecApprovalRequest` or `TurnComplete`; if completion arrives it returns unit, and if an approval request or other event arrives it panics with diagnostic information.
+**Data flow**: It receives the test harness and listens for either an execution approval request or turn completion. If completion arrives, it returns normally. If another approval request arrives, it panics with the unexpected command.
 
-**Call relations**: The denied-read and parent-escalation tests call this after approving the parent command to assert no second approval is required in those scenarios.
+**Call relations**: The denied-read and approved-write tests call this after approving the parent command. It confirms that no extra approval prompt interrupted the rest of those flows.
 
 *Call graph*: called by 2 (unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_preserves_denied_reads); 2 external calls (wait_for_event, panic!).
 
@@ -1140,11 +1150,11 @@ async fn wait_for_completion_without_approval(test: &TestCodex)
 async fn wait_for_completion(test: &TestCodex)
 ```
 
-**Purpose**: Blocks until the turn emits `TurnComplete`.
+**Purpose**: This helper waits until Codex reports that the turn is complete. It is used when the test has already dealt with all expected approvals.
 
-**Data flow**: It waits on the codex event stream until the predicate matches `EventMsg::TurnComplete(_)`, then returns unit.
+**Data flow**: It receives the test harness and watches Codex events until it sees a turn-complete event. It does not return any data; its result is simply that the test can safely continue after the turn has ended.
 
-**Call relations**: Only the explicit-prompt-rule test uses this simpler helper because it intentionally handles the intermediate approval itself before waiting for final completion.
+**Call relations**: The explicit prompt-rule test calls this after approving the second approval request. It marks the point where the command flow should be finished and the test can inspect the filesystem and recorded command output.
 
 *Call graph*: called by 1 (unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule); 1 external calls (wait_for_event).
 
@@ -1154,13 +1164,13 @@ These files cover how permissions are requested, granted, persisted, and later c
 
 ### `core/tests/suite/request_permissions.rs`
 
-`test` · `integration test execution for approval prompts and permission escalation during command handling`
+`test` · `test run`
 
-This module is a broad integration suite for permission escalation during command execution. It defines lightweight helpers for constructing synthetic tool-call events (`shell_command`, `exec_command`, and `request_permissions`), submitting turns with explicit local environment selections and approval settings, waiting for completion or approval events, and normalizing requested filesystem permissions into `AbsolutePathBuf` roots. The `parse_result` helper is notable: it accepts either structured JSON tool output or legacy textual output formats and extracts an exit code plus stdout, allowing the same assertions to work across multiple execution backends.
+These tests act like a safety checklist for Codex’s permission system. Codex normally runs commands in a sandbox, which is a restricted area that limits what files or network resources a command can touch. Sometimes the model asks for extra access, such as permission to write to a directory outside the current workspace. This file checks that those requests are shown to the user at the right time, normalized into real absolute paths, applied only where intended, and rejected cleanly when the user says no.
 
-The tests cover two related mechanisms. First, inline `additional_permissions` attached to shell/exec calls should trigger `ExecApprovalRequest` under `AskForApproval::OnRequest`, resolve relative paths against the tool workdir, and remain narrowly scoped so read-only profiles do not silently widen to unrelated cwd or tmp writes. Second, the standalone `request_permissions` tool should emit `EventMsg::RequestPermissions`, accept user responses carrying `RequestPermissionsResponse`, and make granted permissions available to later shell/exec calls in the same turn. The suite checks turn-scoped grants, session-scoped grants, non-persistence across turns, partial grants that do not preapprove newly requested roots, and the auto-denial path when granular approval disables request-permissions prompts.
+The tests use a mock server to pretend to be the model. The server sends scripted tool calls such as `shell_command`, `exec_command`, or `request_permissions`. The test then watches Codex events: does it ask for approval, finish without asking, or return a denial message? After approval, the tests inspect real files on disk to confirm what actually happened.
 
-Most tests build a `TestCodex` with `ExecPermissionApprovals` and/or `RequestPermissionsTool` enabled, mount one or more SSE responses to simulate model tool calls, submit a turn, drive the approval or permission-response op back into the runtime, and then inspect both emitted events and actual filesystem side effects. The repeated use of canonicalized paths is intentional: assertions compare normalized permission roots rather than the raw paths originally requested by the model.
+A useful analogy is a building access badge. These tests make sure a temporary badge opens only the approved doors, does not secretly open the whole building, expires when it should, and can last for the whole session only when explicitly granted that way.
 
 #### Function details
 
@@ -1170,11 +1180,11 @@ Most tests build a `TestCodex` with `ExecPermissionApprovals` and/or `RequestPer
 fn absolute_path(path: &Path) -> AbsolutePathBuf
 ```
 
-**Purpose**: Converts a borrowed `Path` into an `AbsolutePathBuf` and panics if the path is not absolute. It is the basic normalization primitive for requested permission roots.
+**Purpose**: Converts a normal filesystem path into the project’s absolute-path type. Tests use it when building expected permission requests, because permissions should name exact locations rather than vague relative paths.
 
-**Data flow**: Takes `&Path`, calls `AbsolutePathBuf::try_from`, and returns the absolute wrapper or panics with `absolute path`.
+**Data flow**: It receives a path, tries to turn it into an absolute path object, and returns that object. If the path is not absolute, the test fails immediately, which keeps bad test setup from hiding permission bugs.
 
-**Call relations**: Used by permission-construction helpers and inline test setup whenever a request profile needs an absolute filesystem root.
+**Call relations**: Permission-building helpers and test setup code call this when they need to describe a directory or file in a permission profile. It hands the converted path to permission structures that compare requested and approved access.
 
 *Call graph*: calls 1 internal fn (try_from).
 
@@ -1185,11 +1195,11 @@ fn absolute_path(path: &Path) -> AbsolutePathBuf
 fn parse_result(item: &Value) -> CommandResult
 ```
 
-**Purpose**: Normalizes tool output into a `CommandResult { exit_code, stdout }` regardless of whether the output is structured JSON or one of two legacy textual formats. This lets tests assert command success/failure uniformly.
+**Purpose**: Reads the output of a mocked tool call and extracts the command’s exit code and printed text. Tests use it to decide whether a command really succeeded or failed after permissions were applied.
 
-**Data flow**: Reads `item["output"]` as a string. It first tries to parse that string as JSON and, if successful, extracts `metadata.exit_code` and `output`. If JSON parsing fails, it applies two regexes matching `Exit code: ... Output:` and `Process exited with code ... Output:` textual layouts; if neither matches, it returns `exit_code = None` and the raw output string as stdout.
+**Data flow**: It receives a JSON item that contains a tool output string. It first tries to read that string as structured JSON; if that does not work, it falls back to matching older plain-text formats with regular expressions. It returns a small `CommandResult` with an optional exit code and captured standard output.
 
-**Call relations**: Many tests call this after extracting a function-call output from the mock request log so they can assert on exit status and stdout without caring which backend formatting was used.
+**Call relations**: Many permission tests call this after Codex finishes a tool call. It turns raw function-call output from the mock response recorder into simple facts the test can assert, such as “exit code was zero” or “the output contains the denial message.”
 
 *Call graph*: called by 12 (partial_request_permissions_grants_do_not_preapprove_new_permissions, read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write, read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write, relative_additional_permissions_resolve_against_tool_workdir, request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns, with_additional_permissions_denied_approval_blocks_execution (+2 more)); 2 external calls (new, get).
 
@@ -1204,11 +1214,11 @@ fn shell_event_with_request_permissions(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds a synthetic `shell_command` function-call event whose arguments request additional sandbox permissions. It is used to simulate model output that asks for inline permission widening.
+**Purpose**: Builds a fake model event for a `shell_command` tool call that asks for extra sandbox permissions. This lets tests simulate a model saying, “run this command, but I need these extra file permissions first.”
 
-**Data flow**: Accepts a call id, shell command string, and serializable additional-permissions payload, wraps them in JSON with `timeout_ms = 1000` and `sandbox_permissions = SandboxPermissions::WithAdditionalPermissions`, serializes the JSON to a string, and returns the `ev_function_call` value.
+**Data flow**: It receives a call id, a shell command, and a serializable permissions object. It packages them into JSON arguments, marks the sandbox permission mode as needing additional permissions, serializes the JSON, and returns a function-call event for the mock server to send.
 
-**Call relations**: Inline-additional-permissions tests use this helper to mount the first SSE response that triggers an exec approval prompt.
+**Call relations**: Tests that exercise inline permissions for shell commands use this helper while scripting mock server responses. The produced event is later consumed by Codex, which should either request user approval or deny the command depending on policy.
 
 *Call graph*: calls 1 internal fn (ev_function_call); called by 5 (read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write, read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write, with_additional_permissions_denied_approval_blocks_execution, with_additional_permissions_requires_approval_under_on_request, workspace_write_with_additional_permissions_can_write_outside_cwd); 2 external calls (json!, to_string).
 
@@ -1223,11 +1233,11 @@ fn request_permissions_tool_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds a synthetic `request_permissions` tool-call event with a reason string and requested permission profile. It models the standalone permission-request tool.
+**Purpose**: Builds a fake model event for the standalone `request_permissions` tool. This represents the model asking the user for permission before running a later command.
 
-**Data flow**: Takes a call id, reason, and `RequestPermissionProfile`, serializes `{ reason, permissions }` to JSON, and returns an `ev_function_call` for tool name `request_permissions`.
+**Data flow**: It receives a call id, a human-readable reason, and a permission profile. It turns those into JSON arguments and wraps them as a model function-call event named `request_permissions`.
 
-**Call relations**: Used by tests that exercise the explicit request-permissions flow before a later shell or exec command.
+**Call relations**: Tests use this when they want the mock model to request a permission grant as its own step. Codex receives the event, may emit a user-facing permission prompt, and the test then sends back an approval or denial response.
 
 *Call graph*: calls 1 internal fn (ev_function_call); called by 1 (request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled); 2 external calls (json!, to_string).
 
@@ -1238,11 +1248,11 @@ fn request_permissions_tool_event(
 fn shell_command_event(call_id: &str, command: &str) -> Result<Value>
 ```
 
-**Purpose**: Constructs a plain `shell_command` function-call event without inline additional permissions. It is used after a prior request-permissions grant should already authorize the command.
+**Purpose**: Builds a fake model event for a plain `shell_command` call with no inline extra permissions. It is used to check whether previously granted permissions are remembered for later shell commands.
 
-**Data flow**: Serializes `{ command, timeout_ms: 1000 }` and wraps it in `ev_function_call(call_id, "shell_command", ...)`, returning the resulting JSON value.
+**Data flow**: It receives a call id and command text, writes them into the JSON shape expected by the shell-command tool, serializes that JSON, and returns a mock function-call event.
 
-**Call relations**: Later-shell-command grant tests use this helper for the second SSE response after a standalone permission grant.
+**Call relations**: Later grant tests script this event after a separate permission request. Codex then decides whether the earlier grant is enough to let the shell command run.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1253,11 +1263,11 @@ fn shell_command_event(call_id: &str, command: &str) -> Result<Value>
 fn exec_command_event(call_id: &str, command: &str) -> Result<Value>
 ```
 
-**Purpose**: Constructs a plain `exec_command` function-call event without inline additional permissions. It represents a later command that should rely on previously granted permissions.
+**Purpose**: Builds a fake model event for a plain `exec_command` call. This is the exec-tool counterpart to `shell_command_event`.
 
-**Data flow**: Serializes `{ cmd, yield_time_ms: 1000 }` and returns `ev_function_call(call_id, "exec_command", ...)`.
+**Data flow**: It receives a call id and command text, places them in the exec tool’s expected argument names, serializes the arguments, and returns a mock function-call event.
 
-**Call relations**: Used in tests where a prior `request_permissions` grant should make a later exec command runnable.
+**Call relations**: Tests use this after permission grants to see whether an ordinary exec command benefits from the granted access. The event flows into Codex’s command execution path.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1272,11 +1282,11 @@ fn exec_command_event_with_request_permissions(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds an `exec_command` event that includes inline `additional_permissions` and the `WithAdditionalPermissions` sandbox mode. It simulates a command explicitly restating the permissions it needs.
+**Purpose**: Builds a fake `exec_command` event that includes inline additional permissions. It tests the case where the command itself carries an explicit permission request.
 
-**Data flow**: Accepts call id, command, and serializable additional-permissions payload, serializes `{ cmd, yield_time_ms, sandbox_permissions, additional_permissions }`, and returns the corresponding `ev_function_call` JSON.
+**Data flow**: It receives a call id, command text, and extra permissions. It creates JSON with the command, timing setting, sandbox mode, and requested permissions, serializes it, and returns a function-call event.
 
-**Call relations**: Used by tests that verify explicit inline permissions can be preapproved by an earlier standalone grant, and by the partial-grant test.
+**Call relations**: Tests use this when checking whether explicit exec permissions are preapproved by an earlier grant or whether they still require a fresh approval. Codex reads the event and compares its requested access against the current grants.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1290,11 +1300,11 @@ fn exec_command_event_with_missing_additional_permissions(
 ) -> Result<Value>
 ```
 
-**Purpose**: Constructs an invalid `exec_command` event that requests `WithAdditionalPermissions` sandbox mode but omits the `additional_permissions` field. It is used to prove grants do not silently carry across turns.
+**Purpose**: Builds a deliberately incomplete `exec_command` event: it says extra permissions are needed but does not include the permissions. This checks that Codex rejects malformed permission requests safely.
 
-**Data flow**: Serializes `{ cmd, yield_time_ms, sandbox_permissions: WithAdditionalPermissions }` without an `additional_permissions` key and returns the `ev_function_call` JSON.
+**Data flow**: It receives a call id and command text, creates JSON that enables the additional-permissions mode without supplying the actual permission object, serializes it, and returns a function-call event.
 
-**Call relations**: Only the cross-turn non-persistence test uses this helper to provoke the expected validation error output.
+**Call relations**: The cross-turn grant test uses this to prove that a turn-scoped grant cannot be silently reused later. Codex should produce an error about the missing permissions instead of running the command.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1310,11 +1320,11 @@ async fn submit_turn(
 ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn configured for local execution with explicit approval policy, permission profile, and collaboration mode. It centralizes the thread-settings boilerplate shared by all permission tests.
+**Purpose**: Starts a test conversation turn with a specific prompt, approval policy, and base permission profile. It centralizes the setup needed to tell Codex what permissions and environment apply to this turn.
 
-**Data flow**: Takes a `TestCodex`, prompt, `AskForApproval`, and core `PermissionProfile`. It derives `(sandbox_policy, permission_profile)` via `turn_permission_fields(permission_profile, test.cwd.path())`, builds an `Op::UserInput` with one text item, local environment selections rooted at `test.config.cwd`, `ApprovalsReviewer::User`, and a default collaboration mode using `test.session_configured.model`, submits it, and returns `Result<()>`.
+**Data flow**: It receives the test harness, prompt text, approval policy, and permission profile. It derives sandbox fields from the profile and current working directory, builds a user-input operation with thread settings, submits it to Codex, and returns success or an error.
 
-**Call relations**: Nearly every test in the file calls this helper before waiting for either an approval event, a request-permissions event, or turn completion.
+**Call relations**: Almost every test calls this after the mock server has been prepared. It is the bridge from test setup into the real Codex turn flow, after which helper functions wait for approval prompts or completion events.
 
 *Call graph*: calls 2 internal fn (local_selections, turn_permission_fields); called by 14 (partial_request_permissions_grants_do_not_preapprove_new_permissions, read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write, read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write, relative_additional_permissions_resolve_against_tool_workdir, request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns (+4 more)); 2 external calls (default, vec!).
 
@@ -1325,11 +1335,11 @@ async fn submit_turn(
 async fn wait_for_completion(test: &TestCodex)
 ```
 
-**Purpose**: Blocks until the current turn emits `EventMsg::TurnComplete`. It is a tiny synchronization helper used after approvals have been resolved.
+**Purpose**: Waits until Codex reports that the current turn is complete. Tests use it so they do not inspect outputs or files before the system has finished working.
 
-**Data flow**: Consumes `&TestCodex`, waits on `wait_for_event` with a predicate matching `TurnComplete`, and returns unit.
+**Data flow**: It receives the test harness, listens to Codex events, and stops when it sees a turn-complete event. It returns nothing; its effect is to pause the test until completion.
 
-**Call relations**: Called after approval or permission-response submission in tests that need to ensure all side effects and mock outputs have been produced.
+**Call relations**: After approvals or permission responses are submitted, tests call this to let Codex finish the scripted model flow. It relies on the shared event-waiting helper from the test support code.
 
 *Call graph*: called by 13 (partial_request_permissions_grants_do_not_preapprove_new_permissions, read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write, read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write, relative_additional_permissions_resolve_against_tool_workdir, request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns (+3 more)); 1 external calls (wait_for_event).
 
@@ -1343,11 +1353,11 @@ async fn expect_exec_approval(
 ) -> ExecApprovalRequestEvent
 ```
 
-**Purpose**: Waits for the next relevant event and asserts it is an `ExecApprovalRequest` for the expected command. It validates the command payload before returning the approval event.
+**Purpose**: Waits for Codex to ask the user to approve a command, and checks that the requested command is the one the test expected. It fails the test if Codex finishes too early or asks about the wrong command.
 
-**Data flow**: Reads events until either `ExecApprovalRequest` or `TurnComplete` appears. On approval, it inspects `approval.command.last()` and asserts it equals `expected_command`, then returns the `ExecApprovalRequestEvent`; on completion or any other event it panics.
+**Data flow**: It receives the test harness and expected command string. It waits for either an exec-approval request or turn completion, compares the last command argument against the expected command, and returns the approval request event.
 
-**Call relations**: Inline-additional-permissions tests and the partial-grant test use this helper to capture the approval prompt they expect before sending `Op::ExecApproval`.
+**Call relations**: Tests that expect user approval call this right after submitting a turn. The returned approval id is then used to send an approved or denied decision back to Codex.
 
 *Call graph*: called by 7 (partial_request_permissions_grants_do_not_preapprove_new_permissions, read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write, read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write, relative_additional_permissions_resolve_against_tool_workdir, with_additional_permissions_denied_approval_blocks_execution, with_additional_permissions_requires_approval_under_on_request, workspace_write_with_additional_permissions_can_write_outside_cwd); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -1360,11 +1370,11 @@ async fn wait_for_exec_approval_or_completion(
 ) -> Option<ExecApprovalRequestEvent>
 ```
 
-**Purpose**: Waits for either an exec approval prompt or immediate turn completion and returns `Some(approval)` only when a prompt actually occurs. It supports tests where a prior grant may or may not suppress approval.
+**Purpose**: Waits for either a command approval prompt or the end of the turn. This is useful for cases where a command may already be allowed and therefore might not need a prompt.
 
-**Data flow**: Consumes `&TestCodex`, waits for `ExecApprovalRequest` or `TurnComplete`, maps approval to `Some(event)`, completion to `None`, and panics on any unexpected event.
+**Data flow**: It receives the test harness, watches Codex events, and returns the approval request if one appears. If the turn completes first, it returns no approval.
 
-**Call relations**: Grant-propagation tests use this helper because the runtime may preapprove the later command and skip the prompt entirely.
+**Call relations**: Grant-reuse tests call this after responding to a permission request. If Codex still asks for approval, the test approves it; if Codex completes without asking, the test treats that as valid preapproval behavior.
 
 *Call graph*: called by 4 (request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_preapprove_explicit_exec_permissions_outside_on_request); 2 external calls (wait_for_event, panic!).
 
@@ -1378,11 +1388,11 @@ async fn expect_request_permissions_event(
 ) -> RequestPermissionProfile
 ```
 
-**Purpose**: Waits for a standalone `request_permissions` prompt and returns the normalized permission profile carried by the event. It fails if the turn completes before the prompt appears.
+**Purpose**: Waits for Codex to emit a user-facing permission request from the `request_permissions` tool. It also checks that the request belongs to the expected tool call.
 
-**Data flow**: Reads events until `RequestPermissions` or `TurnComplete`. On `RequestPermissions`, it asserts the `call_id` matches `expected_call_id` and returns `request.permissions`; on completion or any other event it panics.
+**Data flow**: It receives the test harness and expected call id. It waits for either a permission-request event or turn completion, verifies the call id, and returns the requested permission profile.
 
-**Call relations**: All standalone request-permissions tests call this helper before submitting `Op::RequestPermissionsResponse`.
+**Call relations**: Tests call this after the mock model asks for permissions. The returned profile is compared with the expected normalized permissions, and then the test sends a simulated user response.
 
 *Call graph*: called by 7 (partial_request_permissions_grants_do_not_preapprove_new_permissions, request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -1393,11 +1403,11 @@ async fn expect_request_permissions_event(
 fn workspace_write_excluding_tmp() -> CorePermissionProfile
 ```
 
-**Purpose**: Constructs a core permission profile that grants workspace write access while explicitly excluding tmp-related write allowances. This narrower baseline makes outside-workspace permission requests meaningful in tests.
+**Purpose**: Creates a workspace-write permission profile that intentionally excludes temporary directories. Tests use this to make sure extra permissions, not default temp access, are what allow outside writes.
 
-**Data flow**: Calls `CorePermissionProfile::workspace_write_with(&[], NetworkSandboxPolicy::Restricted, true, true)` and returns the resulting profile.
+**Data flow**: It takes no input. It asks the core permission model for a workspace-write profile with restricted network access and with both environment temp directories and `/tmp` excluded, then returns that profile.
 
-**Call relations**: Used as the baseline permission profile in most tests that need to request additional write access outside the workspace.
+**Call relations**: Many tests use this as the starting permission profile before requesting extra access. That makes the test conditions stricter: outside or temporary writes should only work if the request-permissions flow grants them.
 
 *Call graph*: called by 9 (partial_request_permissions_grants_do_not_preapprove_new_permissions, request_permissions_grants_apply_to_later_exec_command_calls, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns, with_additional_permissions_denied_approval_blocks_execution, workspace_write_with_additional_permissions_can_write_outside_cwd); 1 external calls (workspace_write_with).
 
@@ -1408,11 +1418,11 @@ fn workspace_write_excluding_tmp() -> CorePermissionProfile
 fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile
 ```
 
-**Purpose**: Builds a `RequestPermissionProfile` requesting write access to a specific directory path as originally specified. It preserves the raw absolute path rather than canonicalizing it.
+**Purpose**: Builds a permission request that asks for write access to one directory. This represents what the model asks for before paths are canonicalized.
 
-**Data flow**: Takes `&Path`, wraps it with `absolute_path`, constructs `FileSystemPermissions::from_read_write_roots(Some(vec![]), Some(vec![...]))`, inserts that into a default `RequestPermissionProfile`, and returns it.
+**Data flow**: It receives a path, wraps it as an absolute path, creates filesystem permissions with no read roots and one write root, and returns a request-permission profile.
 
-**Call relations**: Used in tests that compare the model-requested permissions with the normalized permissions later emitted by the runtime.
+**Call relations**: Tests use this to create the request sent through the mock `request_permissions` tool or inline command permissions. Its output is often compared with the normalized version made by `normalized_directory_write_permissions`.
 
 *Call graph*: calls 1 internal fn (from_read_write_roots); called by 7 (partial_request_permissions_grants_do_not_preapprove_new_permissions, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns, request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled); 2 external calls (default, vec!).
 
@@ -1423,11 +1433,11 @@ fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfil
 fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile>
 ```
 
-**Purpose**: Builds a canonicalized `RequestPermissionProfile` for a directory write root. It represents the normalized form the runtime should emit or store after resolving symlinks and relative segments.
+**Purpose**: Builds the expected canonical form of a directory-write permission request. Canonical means the path has been resolved to its real filesystem location, avoiding ambiguity from symlinks or relative pieces.
 
-**Data flow**: Canonicalizes the input path with `path.canonicalize()?`, converts it to `AbsolutePathBuf`, wraps it in `FileSystemPermissions::from_read_write_roots`, inserts that into a default `RequestPermissionProfile`, and returns `Result<RequestPermissionProfile>`.
+**Data flow**: It receives a path, canonicalizes it through the filesystem, converts it to an absolute path object, places it in a write-root permission profile, and returns that profile or an error.
 
-**Call relations**: Tests use this helper for expected values when asserting emitted request-permissions events or approved permission sets.
+**Call relations**: Tests call this when checking what Codex should show or store after it processes a permission request. It provides the expected value for assertions against Codex’s normalized permissions.
 
 *Call graph*: calls 1 internal fn (from_read_write_roots); called by 6 (partial_request_permissions_grants_do_not_preapprove_new_permissions, request_permissions_grants_apply_to_later_shell_command_calls, request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature, request_permissions_grants_do_not_carry_across_turns, request_permissions_preapprove_explicit_exec_permissions_outside_on_request, request_permissions_session_grants_carry_across_turns); 2 external calls (default, vec!).
 
@@ -1438,11 +1448,11 @@ fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissi
 async fn with_additional_permissions_requires_approval_under_on_request() -> Result<()>
 ```
 
-**Purpose**: Verifies that a shell command carrying inline additional permissions triggers an exec approval prompt under `AskForApproval::OnRequest`, and that approving the prompt allows the command to run and create the requested file.
+**Purpose**: Checks that inline extra permissions on a shell command cause an approval prompt when the approval policy is “on request.” It proves that the model cannot silently grant itself extra file access.
 
-**Data flow**: Builds a read-only `TestCodex` with `ExecPermissionApprovals` and `RequestPermissionsTool` enabled, creates a requested directory and expected write path, mounts one SSE response containing a `shell_command` with inline additional write permissions and a second response for completion, submits the turn, captures the `ExecApprovalRequest`, asserts its `additional_permissions` match the requested profile, submits `Op::ExecApproval { Approved }`, waits for completion, parses the tool output with `parse_result`, and asserts success plus file creation.
+**Data flow**: The test starts Codex with read-only permissions, scripts a shell command that asks to write in a specific directory, and submits a turn. It expects an exec approval containing those extra permissions, approves it, waits for completion, then confirms the file was created.
 
-**Call relations**: This is the baseline inline-additional-permissions approval test and uses `shell_event_with_request_permissions`, `submit_turn`, `expect_exec_approval`, and `parse_result` together.
+**Call relations**: This test uses the mock server helpers to send a shell-command event, `submit_turn` to start Codex, `expect_exec_approval` to catch the prompt, and `parse_result` to inspect the command output after approval.
 
 *Call graph*: calls 10 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_request_permissions, submit_turn, wait_for_completion, from_read_write_roots); 9 external calls (read_only, default, assert!, assert_eq!, create_dir_all, remove_file, skip_if_no_network!, skip_if_sandbox!, vec!).
 
@@ -1453,11 +1463,11 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 async fn request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled() -> Result<()>
 ```
 
-**Purpose**: Checks that the standalone `request_permissions` tool is automatically denied when granular approval config disables request-permissions prompts, rather than surfacing an interactive event.
+**Purpose**: Checks that the standalone permission-request tool is automatically denied when the granular setting for request permissions is turned off. This prevents a disabled feature path from still prompting or granting access.
 
-**Data flow**: Builds a read-only `TestCodex` with `AskForApproval::Granular` where `request_permissions = false`, enables `RequestPermissionsTool`, mounts a `request_permissions` tool call followed by completion, submits the turn, waits for either `RequestPermissions` or `TurnComplete`, asserts the turn completed directly, then parses the function-call output as `RequestPermissionsResponse` and checks it is the default empty grant with turn scope.
+**Data flow**: The test configures granular approvals with `request_permissions` disabled, scripts a permission request, and submits a turn. It verifies that no permission prompt is emitted and that the tool output contains an empty permission grant response.
 
-**Call relations**: This test uses `request_permissions_tool_event` and bypasses the normal approval-response loop to prove the auto-denial branch.
+**Call relations**: It builds the fake request with `request_permissions_tool_event`, starts the turn with `submit_turn`, and waits directly for either a permission event or completion. The expected story is completion without a prompt.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, test_codex, request_permissions_tool_event, requested_directory_write_permissions, submit_turn); 10 external calls (read_only, Granular, assert!, assert_eq!, wait_for_event, create_dir_all, from_str, skip_if_no_network!, skip_if_sandbox!, vec!).
 
@@ -1470,11 +1480,11 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 ) -> Result<()>
 ```
 
-**Purpose**: Verifies that relative inline additional-permission paths are resolved against the tool's declared workdir for both `shell_command` and `exec_command` variants.
+**Purpose**: Checks that relative permission paths are resolved from the tool’s working directory, not from some unrelated process directory. This matters because `.` should mean “where the command runs.”
 
-**Data flow**: Parameterized by `AdditionalPermissionsCommandTool`, it builds a read-only `TestCodex` with approval features enabled, creates a nested directory, mounts a tool call whose `workdir` is `nested` and whose additional permissions request write access to `.` relative to that workdir, submits the turn, captures the exec approval, asserts the normalized additional permissions point at the canonical nested directory, approves execution, waits for completion, parses the output, and asserts the file `nested/relative-write.txt` was created successfully.
+**Data flow**: For both shell and exec tools, the test creates a nested directory, asks for write access to `.` while setting the tool workdir to that nested directory, and runs a command that writes there. It expects approval to name the canonical nested directory, then approves and verifies the file was created.
 
-**Call relations**: This test is the only consumer of the local enum `AdditionalPermissionsCommandTool`; it proves path resolution logic is shared correctly across shell and exec tools.
+**Call relations**: The test scripts tool-call events directly, uses `submit_turn` to run them, waits with `expect_exec_approval`, and reads results through `parse_result`. The test-case attribute runs the same scenario for both supported command tools.
 
 *Call graph*: calls 10 internal fn (ev_function_call, mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, submit_turn, wait_for_completion, from_read_write_roots); 11 external calls (read_only, default, assert!, assert_eq!, create_dir_all, remove_file, json!, to_string, skip_if_no_network!, skip_if_sandbox! (+1 more)).
 
@@ -1485,11 +1495,11 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write() -> Result<()>
 ```
 
-**Purpose**: Ensures that under a read-only baseline profile, granting inline additional permissions for one specific path does not implicitly widen write access to other files in the current working directory.
+**Purpose**: On macOS, checks that approving one requested path does not accidentally allow writing anywhere in the current workspace. This guards against a serious sandbox-widening bug.
 
-**Data flow**: On macOS only, it builds a read-only `TestCodex` with approval features enabled, defines one requested file and one different unrequested cwd file, mounts a shell command that writes to the unrequested file while requesting permission only for the requested file, submits the turn, captures and approves the exec approval, waits for completion, parses the output, and asserts the command failed and neither file was created.
+**Data flow**: The test starts in read-only mode, requests permission for one file, but runs a command that writes to a different unrequested file in the current directory. After approving the requested permission, it expects the command to fail and confirms neither file was created.
 
-**Call relations**: This negative test uses the same inline-permission machinery as the positive path but asserts that the sandbox remains narrow after approval.
+**Call relations**: It uses `shell_event_with_request_permissions` to script the command, `expect_exec_approval` to verify the requested permission, and `parse_result` plus filesystem checks to confirm that unrequested current-directory writes remain blocked.
 
 *Call graph*: calls 10 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_request_permissions, submit_turn, wait_for_completion, from_read_write_roots); 9 external calls (read_only, default, assert!, assert_eq!, format!, remove_file, skip_if_no_network!, skip_if_sandbox!, vec!).
 
@@ -1500,11 +1510,11 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd
 async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write() -> Result<()>
 ```
 
-**Purpose**: Checks the same non-widening invariant as the previous test, but for writes into a temporary directory outside the workspace.
+**Purpose**: On macOS, checks that approving one requested path does not accidentally allow writing to temporary directories. Temporary folders are common escape routes, so this is an important sandbox safety test.
 
-**Data flow**: On macOS only, it builds a read-only `TestCodex`, creates a temp directory and a distinct requested file path, mounts a shell command that writes to the temp file while requesting permission only for the unrelated requested path, submits the turn, approves the exec request, waits for completion, parses the output, and asserts the command failed and neither the requested file nor the temp target exists.
+**Data flow**: The test requests permission for a workspace file, but runs a command that writes to a separate temporary-directory file. It approves the request, waits for completion, and expects the write to fail with no files created.
 
-**Call relations**: This complements the cwd-widening test by proving tmp writes are not accidentally granted through unrelated additional permissions.
+**Call relations**: Like the current-directory widening test, it uses the shell-event helper, approval expectation helper, and result parser. Its special focus is the temporary-directory area rather than the workspace current directory.
 
 *Call graph*: calls 10 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_request_permissions, submit_turn, wait_for_completion, from_read_write_roots); 10 external calls (read_only, default, assert!, assert_eq!, format!, remove_file, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1515,11 +1525,11 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp
 async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> Result<()>
 ```
 
-**Purpose**: Verifies that a workspace-write baseline plus approved inline additional permissions can authorize writes outside the workspace without touching unrelated workspace paths.
+**Purpose**: Checks that a user-approved extra permission can let a command write outside the workspace when the base profile allows workspace writing but not that outside location. This verifies that legitimate expansions work.
 
-**Data flow**: Builds a `TestCodex` with `workspace_write_excluding_tmp`, creates an outside temp directory and a placeholder path inside the workspace, mounts a shell command that writes to the outside file while requesting write access to the outside directory, submits the turn, captures the exec approval, asserts the approval carries the canonicalized outside-directory permission, approves it, waits for completion, parses the output, and asserts the outside file contains the expected text while the placeholder remains absent.
+**Data flow**: The test creates a temporary outside directory, scripts a shell command that writes there, and includes a request for that directory. After Codex asks for approval with the normalized permissions, the test approves, waits, and confirms the outside file contains the expected text.
 
-**Call relations**: This is the positive outside-workspace counterpart to the two non-widening negative tests.
+**Call relations**: It combines `workspace_write_excluding_tmp`, `shell_event_with_request_permissions`, `expect_exec_approval`, and `parse_result`. Together they prove the approval path grants exactly the requested outside write.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_request_permissions, submit_turn, wait_for_completion, workspace_write_excluding_tmp (+1 more)); 9 external calls (default, assert!, assert_eq!, format!, remove_file, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1530,11 +1540,11 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 async fn with_additional_permissions_denied_approval_blocks_execution() -> Result<()>
 ```
 
-**Purpose**: Checks that denying an exec approval for inline additional permissions prevents the command from running and returns a rejection message instead of performing the write.
+**Purpose**: Checks that denying an approval request prevents the command from running. This ensures the user’s “no” is enforced, not just recorded.
 
-**Data flow**: Builds a workspace-write `TestCodex` with approval features enabled, mounts a shell command that would write outside the workspace with requested additional permissions, submits the turn, captures the approval, asserts the normalized requested permissions, submits `Op::ExecApproval { Denied }`, waits for completion, parses the output, and asserts nonzero/failed status, `rejected by user` text, and absence of the target file.
+**Data flow**: The test scripts a shell command that would write outside the workspace with requested extra permissions. When Codex asks for approval, the test sends a denied decision, waits for completion, then checks that the output says the command was rejected and no file was created.
 
-**Call relations**: This test follows the same setup as the positive inline-permission path but drives the denial branch of the approval flow.
+**Call relations**: It follows the same setup path as successful extra-permission tests, but sends `ReviewDecision::Denied` after `expect_exec_approval`. `parse_result` and filesystem checks confirm the denial stopped execution.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, test_codex, expect_exec_approval, parse_result, shell_event_with_request_permissions, submit_turn, wait_for_completion, workspace_write_excluding_tmp (+1 more)); 9 external calls (default, assert!, assert_eq!, assert_ne!, format!, remove_file, skip_if_no_network!, tempdir, vec!).
 
@@ -1545,11 +1555,11 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Result<()>
 ```
 
-**Purpose**: Verifies that a standalone `request_permissions` grant for a directory write root applies to a later plain `exec_command` in the same turn.
+**Purpose**: Checks that a permission granted through the standalone request tool can be used by a later `exec_command` in the same turn. This is the “ask first, act later” workflow.
 
-**Data flow**: Builds a workspace-write `TestCodex` with both permission features enabled, creates an outside temp directory and target file, mounts an SSE sequence of `request_permissions`, then plain `exec_command`, then assistant completion, submits the turn, captures the normalized `RequestPermissions` event, responds with `RequestPermissionsResponse { scope: Turn }`, optionally handles an exec approval if one still appears, waits for completion, parses the exec output, and asserts the command succeeded and wrote the expected file contents.
+**Data flow**: The mock model first asks for write access to an outside directory, then later sends an exec command that writes there. The test approves the permission request for the turn, handles any remaining exec approval if Codex asks, and confirms the command wrote the expected file.
 
-**Call relations**: This test uses `expect_request_permissions_event` followed by `wait_for_exec_approval_or_completion` because the grant may preapprove the later command.
+**Call relations**: It uses a sequence of mock server responses, `expect_request_permissions_event` to capture the standalone request, `wait_for_exec_approval_or_completion` for optional command approval, and `parse_result` to verify the later exec call.
 
 *Call graph*: calls 10 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, parse_result, submit_turn, wait_for_completion, wait_for_exec_approval_or_completion, workspace_write_excluding_tmp, from_read_write_roots); 7 external calls (default, assert_eq!, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1560,11 +1570,11 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_request() -> Result<()>
 ```
 
-**Purpose**: Checks that a standalone turn-scoped permission grant also preapproves a later `exec_command` that explicitly repeats the same additional permissions inline.
+**Purpose**: Checks that a later exec command with explicit inline permissions can be preapproved by an earlier matching permission grant. It prevents needless repeated prompts for the same approved access.
 
-**Data flow**: Builds a workspace-write `TestCodex`, prepares an outside directory and command, mounts an SSE sequence of `request_permissions`, then `exec_command` with matching inline additional permissions, then completion, submits the turn, captures and approves the normalized request-permissions event, optionally handles any remaining exec approval, waits for completion, parses the exec output, and asserts success plus file contents.
+**Data flow**: The test first grants directory write access through `request_permissions`. The next mocked response sends an exec command that asks for the same permissions inline. The test allows any approval if it appears, then verifies the command succeeds and writes the expected content.
 
-**Call relations**: This test differs from the previous one by proving that explicit inline restatement of already granted permissions does not force a new approval.
+**Call relations**: It relies on the directory permission helpers to build requested and normalized profiles. The flow goes through `expect_request_permissions_event`, a simulated grant response, optional exec approval, and final result parsing.
 
 *Call graph*: calls 11 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, wait_for_completion, wait_for_exec_approval_or_completion (+1 more)); 7 external calls (assert!, assert_eq!, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1575,11 +1585,11 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Result<()>
 ```
 
-**Purpose**: Verifies that a standalone permission grant applies not only to `exec_command` but also to a later plain `shell_command` in the same turn.
+**Purpose**: Checks that a standalone permission grant can also apply to a later `shell_command`, not just `exec_command`. This keeps both command tools consistent.
 
-**Data flow**: Builds a workspace-write `TestCodex` with both features enabled, mounts `request_permissions` followed by `shell_command` and completion, submits the turn, captures the normalized request-permissions event, responds with a turn-scoped grant, optionally approves execution if prompted, waits for completion, parses the shell output, and asserts the outside file was written successfully.
+**Data flow**: The model first requests permission to write outside the workspace. After the test grants that permission for the turn, the model sends a shell command that writes there. The test then verifies the command output and file contents.
 
-**Call relations**: This is the shell-command analogue of the later-exec grant test.
+**Call relations**: This mirrors the exec-command grant test but uses `shell_command_event` for the later command. It uses the same permission-event, optional approval, completion, and result-parsing helpers.
 
 *Call graph*: calls 11 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, wait_for_completion, wait_for_exec_approval_or_completion (+1 more)); 7 external calls (assert!, assert_eq!, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1590,11 +1600,11 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
 async fn request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature() -> Result<()>
 ```
 
-**Purpose**: Checks that standalone request-permissions grants still authorize later `shell_command` calls even when the inline exec-permission-approvals feature is not enabled.
+**Purpose**: Checks that standalone permission grants work for later shell commands even when the inline exec-permission approval feature is not enabled. This proves the request-permissions tool is useful on its own.
 
-**Data flow**: Builds a workspace-write `TestCodex` with only `RequestPermissionsTool` enabled, mounts `request_permissions`, then plain `shell_command`, then completion, submits the turn, captures and approves the normalized request-permissions event, optionally handles any exec approval, waits for completion, parses the shell output, and asserts the outside file was written.
+**Data flow**: The test enables the request-permissions feature but not the inline permission approvals feature. It grants outside-directory write access, runs a later shell command, and confirms the command succeeds and writes the file.
 
-**Call relations**: This test isolates the standalone grant mechanism from the inline-permission feature flag to prove they are not tightly coupled.
+**Call relations**: It follows the same staged mock response pattern as the previous shell-command test. The key difference is the feature configuration, which proves the later grant path does not depend on inline permission support.
 
 *Call graph*: calls 11 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, wait_for_completion, wait_for_exec_approval_or_completion (+1 more)); 7 external calls (assert!, assert_eq!, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1605,11 +1615,11 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()>
 ```
 
-**Purpose**: Verifies that granting only part of a requested permission set does not preapprove later commands that ask for additional roots beyond the granted subset. The later approval should reflect the union of already granted and newly requested permissions.
+**Purpose**: Checks that a partial grant only preapproves the part the user actually granted. If a later command asks for additional access, Codex must ask again rather than assuming the original larger request was approved.
 
-**Data flow**: Builds a workspace-write `TestCodex`, creates two outside directories, mounts an SSE sequence where `request_permissions` asks for both directories and a later `exec_command` explicitly requests only the second directory, submits the turn, captures the normalized initial request, responds with a grant for only the first directory, captures the later exec approval, extracts and sorts its merged filesystem write roots, compares them against the expected union of first and second directories, approves execution, waits for completion, parses the exec output, and asserts the second-directory write succeeded.
+**Data flow**: The model asks for write access to two outside directories, but the test grants only the first. The later exec command asks for the second directory. Codex should request exec approval with the merged set of granted and newly requested permissions; after approval, the command writes to the second directory successfully.
 
-**Call relations**: This is the most detailed merge-behavior test in the file, combining `expect_request_permissions_event`, `expect_exec_approval`, and manual inspection of merged permission roots.
+**Call relations**: This test ties together the standalone request flow and inline exec approval flow. It uses `expect_request_permissions_event` for the initial broad request, `expect_exec_approval` for the later new access, then parses the command output after approval.
 
 *Call graph*: calls 12 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_exec_approval, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, wait_for_completion (+2 more)); 9 external calls (default, default, assert!, assert_eq!, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1620,11 +1630,11 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()>
 ```
 
-**Purpose**: Ensures that turn-scoped permission grants expire at turn boundaries and cannot be reused implicitly in a later turn.
+**Purpose**: Checks that a turn-scoped permission grant expires after the current turn. This prevents temporary access from becoming a hidden long-term privilege.
 
-**Data flow**: Builds a workspace-write `TestCodex`, mounts a first turn containing `request_permissions` and completion, submits the turn, captures and approves the normalized request with `scope: Turn`, waits for completion, mounts a second turn containing an `exec_command` that requests `WithAdditionalPermissions` but omits `additional_permissions`, submits the second turn, waits for completion, and asserts the tool output contains `missing `additional_permissions``.
+**Data flow**: In the first turn, the test grants outside-directory write access with scope set to the turn. In a second turn, the model tries to run an exec command that says it needs extra permissions but omits the actual permission data. The test confirms Codex rejects it with a missing-permissions message.
 
-**Call relations**: This test uses `exec_command_event_with_missing_additional_permissions` specifically to prove that no hidden carry-over grant fills in the missing permissions on the next turn.
+**Call relations**: It uses `submit_turn` twice against the same test session. `expect_request_permissions_event` and `wait_for_completion` finish the first turn, then the second mock sequence proves the old grant is not silently reused.
 
 *Call graph*: calls 9 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, requested_directory_write_permissions, submit_turn, wait_for_completion, workspace_write_excluding_tmp); 6 external calls (assert!, assert_eq!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1635,24 +1645,24 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()>
 async fn request_permissions_session_grants_carry_across_turns() -> Result<()>
 ```
 
-**Purpose**: Checks that session-scoped permission grants persist across turns and can authorize a later plain `exec_command` in a subsequent turn.
+**Purpose**: On macOS, checks that a session-scoped permission grant can be reused in a later turn. This is the intentional long-lived version of permission granting.
 
-**Data flow**: On macOS only, it builds a workspace-write `TestCodex`, mounts a first turn with `request_permissions`, submits it, captures and approves the normalized request with `scope: Session`, waits for completion, mounts a second turn with a plain `exec_command` writing to the previously granted outside directory, submits the second turn, optionally approves execution if prompted, parses the exec output, and asserts the file write succeeded.
+**Data flow**: The first turn asks for outside-directory write access and the test grants it with session scope. In the second turn, a plain exec command writes to that same directory. The test approves any command prompt if needed, then confirms the command succeeds and the file contains the expected text.
 
-**Call relations**: This is the cross-turn persistence counterpart to the previous test and demonstrates the semantic difference between `PermissionGrantScope::Turn` and `PermissionGrantScope::Session`.
+**Call relations**: This is the companion to the turn-scope expiry test. It uses the same request-event and normalized-permission helpers, but sends a session-scoped response and then verifies reuse in a later submitted turn.
 
 *Call graph*: calls 10 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, wait_for_completion, workspace_write_excluding_tmp); 7 external calls (assert_eq!, wait_for_event, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
 
 ### `core/tests/suite/request_permissions_tool.rs`
 
-`test` · `integration test execution for standalone request-permissions tool flows`
+`test` · `test execution`
 
-This macOS-only module is a narrower companion to the broader request-permissions suite. It defines the same core fixtures—absolute-path conversion, requested versus normalized directory-write permission profiles, command-output parsing across JSON and legacy text formats, and a `submit_turn` helper that wires local environment selections, approval policy, sandbox policy, and optional `ApprovalsReviewer`. The tests here specifically validate that a successful `request_permissions` tool interaction can authorize later operations that do not themselves carry sandbox-expansion arguments.
+This file tests a safety feature: the model can request more permission when it needs to write somewhere it normally cannot. Think of it like a delivery worker asking for a temporary key to one extra room, then using only that key for the rest of the job. Without these tests, Codex might ask for permission but fail to apply it, apply it too broadly, or still interrupt the user with unnecessary approval prompts.
 
-The first test covers the exec path: the model first calls `request_permissions` for an outside directory, then emits a plain `exec_command` that writes into that directory. After the user responds with a turn-scoped `RequestPermissionsResponse`, the test confirms the command succeeds and the file is created with the expected contents. The second top-level test delegates to `apply_patch_after_request_permissions`, which runs twice—once with `strict_auto_review = false` and once with `true`. That helper mounts a sequence where the model requests permissions, then emits a custom `apply_patch` tool call targeting a file outside the workspace. In strict mode it also expects a guardian-style review request containing the patch path and content; in non-strict mode it asserts no `ApplyPatchApprovalRequest` is emitted after the grant. In both cases it extracts the custom tool output from the captured request stream, parses it, and verifies the patch succeeded on disk.
+The tests build a fake Codex session connected to a mock server. The mock server pretends to be the model and sends a sequence of events: first a request for permission to write to a temporary folder, then either a shell command or an apply-patch operation that writes inside that folder, then a final assistant message. The test code watches Codex events, verifies that the requested path is converted to its real absolute form, sends back an approval, and checks that the later operation succeeds.
 
-Overall, the file documents the intended contract of the standalone permission-request tool: once the user grants a normalized folder write root, later exec and patch operations within that root should proceed without needing to restate sandbox arguments, while strict auto-review may still trigger an internal guardian review path.
+There are two main scenarios. One proves that a granted folder write permission lets a later shell command create a file outside the workspace. The other proves the same for apply_patch edits, including a stricter mode where an extra automatic review is expected. The helpers in this file mostly build fake model events, submit a user turn with the right permission settings, wait for key events, and parse tool output so the tests can make clear assertions.
 
 #### Function details
 
@@ -1662,11 +1672,11 @@ Overall, the file documents the intended contract of the standalone permission-r
 fn absolute_path(path: &Path) -> AbsolutePathBuf
 ```
 
-**Purpose**: Converts a borrowed path into `AbsolutePathBuf` and panics if it is not absolute. It supports construction of requested permission profiles.
+**Purpose**: Turns a normal filesystem path into the project’s absolute-path type. The tests use this so permission objects contain paths in the exact form the permission system expects.
 
-**Data flow**: Takes `&Path`, calls `AbsolutePathBuf::try_from`, and returns the absolute wrapper.
+**Data flow**: It receives a path, tries to convert it into an absolute path, and returns that converted value. If the input is not absolute, the test fails immediately because that would make the permission setup invalid.
 
-**Call relations**: Used by the requested-permissions helper to build raw requested write roots.
+**Call relations**: It is used while building requested permission profiles, so later test steps can compare granted permissions using the same path type as the real permission system.
 
 *Call graph*: calls 1 internal fn (try_from).
 
@@ -1681,11 +1691,11 @@ fn request_permissions_tool_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Builds a synthetic `request_permissions` function-call event for the mock SSE stream. It packages the reason and requested permission profile exactly as the model would send them.
+**Purpose**: Builds a fake model tool-call event where the model asks Codex for more permissions. This lets the test server simulate the model saying, “I need write access here, for this reason.”
 
-**Data flow**: Accepts call id, reason, and `RequestPermissionProfile`, serializes them to JSON, and returns `ev_function_call(call_id, "request_permissions", ...)`.
+**Data flow**: It takes a tool call ID, a human-readable reason, and the requested permissions. It packages them as JSON text and wraps that text in a fake `request_permissions` function-call event, returning the event or an error if JSON creation fails.
 
-**Call relations**: Both top-level scenarios use this helper as the first tool call in their mounted SSE sequence.
+**Call relations**: The main tests place this event into the mock server’s response stream before any command or patch is attempted. Codex receives it and should emit a real permission-request event to the test harness.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1696,11 +1706,11 @@ fn request_permissions_tool_event(
 fn exec_command_event(call_id: &str, command: &str) -> Result<Value>
 ```
 
-**Purpose**: Constructs a plain `exec_command` function-call event without sandbox-expansion arguments. It is used to prove that a prior standalone grant is sufficient on its own.
+**Purpose**: Builds a fake model tool-call event that asks Codex to run a shell command. The tests use it after permission approval to check whether the newly granted access really works.
 
-**Data flow**: Serializes `{ cmd, yield_time_ms: 1000 }` and wraps it in `ev_function_call(call_id, "exec_command", ...)`.
+**Data flow**: It receives a call ID and command string, places them into JSON along with a short yield time, then wraps that JSON in an `exec_command` function-call event. The result is a mock event ready to be sent by the fake server.
 
-**Call relations**: Only the exec-unblocking test uses this helper for the second step after a granted permission request.
+**Call relations**: The shell-command test includes this after the permission request. Once the test approves the permission request, Codex should run this command without being blocked by the original sandbox limits.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -1711,11 +1721,11 @@ fn exec_command_event(call_id: &str, command: &str) -> Result<Value>
 fn build_add_file_patch(patch_path: &Path, content: &str) -> String
 ```
 
-**Purpose**: Formats a minimal freeform apply-patch payload that adds a file with one line of content. It produces the exact patch text consumed by the custom apply_patch tool call.
+**Purpose**: Creates the text for a simple patch that adds one new file with one line of content. This gives the apply-patch test a realistic edit to send through Codex.
 
-**Data flow**: Takes a target `&Path` and content string, interpolates them into a `*** Begin Patch` / `*** Add File` / `*** End Patch` patch string, and returns the resulting `String`.
+**Data flow**: It takes a target path and file content, formats them into the patch syntax used by the apply-patch tool, and returns the patch as a string.
 
-**Call relations**: Called only by `apply_patch_after_request_permissions` to generate the patch body for the mocked custom tool call.
+**Call relations**: The apply-patch test calls it after choosing the temporary target file. The resulting patch is then sent through the mock model response as a custom tool call.
 
 *Call graph*: called by 1 (apply_patch_after_request_permissions); 1 external calls (format!).
 
@@ -1726,11 +1736,11 @@ fn build_add_file_patch(patch_path: &Path, content: &str) -> String
 fn workspace_write_excluding_tmp() -> PermissionProfile
 ```
 
-**Purpose**: Creates a baseline workspace-write permission profile that excludes tmp-related write allowances. This keeps the later outside-directory grant meaningful.
+**Purpose**: Creates the starting permission profile for the tests: Codex may write in the workspace, but not in temporary directories. This is important because the tests need the later temporary-folder access to come only from the explicit permission request.
 
-**Data flow**: Calls `PermissionProfile::workspace_write_with(&[], NetworkSandboxPolicy::Restricted, true, true)` and returns the profile.
+**Data flow**: It builds and returns a workspace-write permission profile with network access restricted and temporary-directory exceptions excluded. Nothing is changed outside the returned permission object.
 
-**Call relations**: Used by both main scenarios as the starting permission profile before requesting extra folder access.
+**Call relations**: Both main test flows use this as their baseline. They then request a separate grant for a temporary directory, proving the request-permissions tool is what unlocks the later write.
 
 *Call graph*: calls 1 internal fn (workspace_write_with); called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args).
 
@@ -1741,11 +1751,11 @@ fn workspace_write_excluding_tmp() -> PermissionProfile
 fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile
 ```
 
-**Purpose**: Builds the raw requested folder-write permission profile for a directory path. It reflects what the model asks for before runtime normalization.
+**Purpose**: Builds the permission request that the fake model asks for: write access to one chosen directory and no added read roots. This represents the raw request before Codex normalizes the path.
 
-**Data flow**: Wraps the absolute path in `FileSystemPermissions::from_read_write_roots(Some(vec![]), Some(vec![...]))`, inserts it into a default `RequestPermissionProfile`, and returns it.
+**Data flow**: It receives a directory path, converts it to the absolute-path type, places it in the write-roots list, and returns a request-permission profile containing that filesystem permission.
 
-**Call relations**: Used by both scenarios to populate the `request_permissions` tool call.
+**Call relations**: The shell-command and apply-patch tests pass this to the fake `request_permissions` tool call. Codex should receive the request and then report back an equivalent normalized version.
 
 *Call graph*: calls 1 internal fn (from_read_write_roots); called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args); 2 external calls (default, vec!).
 
@@ -1756,11 +1766,11 @@ fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfil
 fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile>
 ```
 
-**Purpose**: Builds the canonicalized expected folder-write permission profile that the runtime should emit in the `RequestPermissions` event and store after approval.
+**Purpose**: Builds the permission profile the tests expect Codex to produce after resolving the requested directory to its canonical, real filesystem path. This avoids false mismatches caused by path spelling, symbolic links, or temporary-directory aliases.
 
-**Data flow**: Canonicalizes the input directory, converts it to `AbsolutePathBuf`, wraps it in `FileSystemPermissions::from_read_write_roots`, inserts it into a default `RequestPermissionProfile`, and returns `Result<_>`.
+**Data flow**: It receives a directory path, asks the operating system for the canonical version, converts that into the absolute-path type, and returns a request-permission profile with that normalized write root. If canonicalization or conversion fails, it returns an error.
 
-**Call relations**: Both scenarios compare the emitted request-permissions event against this normalized form before responding.
+**Call relations**: Both main test flows compare Codex’s emitted permission request against this normalized value. The same normalized value is then sent back as the approved grant.
 
 *Call graph*: calls 1 internal fn (from_read_write_roots); called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args); 2 external calls (default, vec!).
 
@@ -1771,11 +1781,11 @@ fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissi
 fn parse_result(item: &Value) -> (Option<i64>, String)
 ```
 
-**Purpose**: Parses tool output into `(Option<i64>, String)` across structured JSON and legacy textual formats. It lets the tests assert patch/exec success without depending on one output encoding.
+**Purpose**: Extracts an exit code and visible output from a tool-call result. It understands both structured JSON output and older plain-text formats, making the tests tolerant of different result shapes.
 
-**Data flow**: Reads `item["output"]` as a string, first tries JSON parsing to extract `metadata.exit_code` and `output`, otherwise applies two regexes for textual exit-code/output layouts, and falls back to `(None, raw_output)` if neither matches.
+**Data flow**: It receives a JSON item that should contain an `output` string. It first tries to parse that string as JSON and read the exit code and output from known fields. If that fails, it uses text patterns to pull the same information from a plain message. It returns the optional exit code and the captured output text.
 
-**Call relations**: Used by both the exec and apply-patch scenarios after extracting the relevant custom tool output from captured requests.
+**Call relations**: After the shell command or patch runs, the tests use this helper to check whether the operation succeeded and whether the expected success text or file content appeared.
 
 *Call graph*: called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args); 2 external calls (new, get).
 
@@ -1792,11 +1802,11 @@ async fn submit_turn(
 ) -> Re
 ```
 
-**Purpose**: Submits a local user turn with explicit approval policy, permission profile, and optional reviewer. It centralizes the thread-settings boilerplate for this file's scenarios.
+**Purpose**: Starts a Codex turn in the test session with a user prompt and carefully chosen permission settings. This is the bridge between the test setup and the real turn-processing code under test.
 
-**Data flow**: Takes `&TestCodex`, prompt, `AskForApproval`, `PermissionProfile`, and optional `ApprovalsReviewer`. It derives sandbox and permission fields with `turn_permission_fields`, builds an `Op::UserInput` with local environment selections and a default collaboration mode using the session model, submits it, and returns `Result<()>`.
+**Data flow**: It receives the test session, prompt text, approval policy, permission profile, and optional reviewer setting. It derives the sandbox and permission fields for the current workspace, builds a user-input operation with thread overrides, submits it to Codex, and returns success or an error.
 
-**Call relations**: Both main scenarios call this helper before waiting for the `RequestPermissions` event.
+**Call relations**: Both main test flows call this after mounting mock server responses. Once submitted, Codex begins reading the fake model events, which leads to the permission request and later command or patch.
 
 *Call graph*: calls 2 internal fn (local_selections, turn_permission_fields); called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args); 2 external calls (default, vec!).
 
@@ -1807,11 +1817,11 @@ async fn submit_turn(
 async fn wait_for_completion(test: &TestCodex)
 ```
 
-**Purpose**: Waits until the current turn emits `TurnComplete`. It is used in the strict apply-patch path after all approvals and guardian review have finished.
+**Purpose**: Waits until Codex reports that the current turn is complete. It is a small helper for test steps that need to pause until all model/tool work has finished.
 
-**Data flow**: Consumes `&TestCodex`, waits on `wait_for_event` for `EventMsg::TurnComplete`, and returns unit.
+**Data flow**: It receives the test session and listens to Codex events until it sees a turn-complete event. It does not return data; it simply waits for the right point in the test flow.
 
-**Call relations**: Only `apply_patch_after_request_permissions` uses this helper.
+**Call relations**: The strict apply-patch path uses this after sending the permission response, because that path expects an extra automatic review before final completion.
 
 *Call graph*: called by 1 (apply_patch_after_request_permissions); 1 external calls (wait_for_event).
 
@@ -1825,11 +1835,11 @@ async fn expect_request_permissions_event(
 ) -> RequestPermissionProfile
 ```
 
-**Purpose**: Waits for the standalone permission-request prompt and returns its normalized permission profile, failing if the turn completes first.
+**Purpose**: Waits for Codex to ask for permissions and verifies that the request belongs to the expected tool call. If Codex finishes the turn first, or emits an unexpected event, the test fails.
 
-**Data flow**: Reads events until `RequestPermissions` or `TurnComplete`; on `RequestPermissions` it asserts the `call_id` matches and returns `request.permissions`, otherwise it panics.
+**Data flow**: It receives the test session and expected call ID. It waits for either a permission-request event or turn completion. On a permission request, it checks the call ID and returns the requested permission profile. On completion or any wrong event, it panics because the expected safety flow did not happen.
 
-**Call relations**: Both top-level scenarios use this helper before submitting `Op::RequestPermissionsResponse`.
+**Call relations**: Both main test flows use this immediately after submitting the turn. The returned permission profile is compared with the normalized expected profile before the test sends the approval response back to Codex.
 
 *Call graph*: called by 2 (apply_patch_after_request_permissions, approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args); 3 external calls (assert_eq!, wait_for_event, panic!).
 
@@ -1840,11 +1850,11 @@ async fn expect_request_permissions_event(
 async fn approved_folder_write_request_permissions_unblocks_later_exec_without_sandbox_args() -> Result<()>
 ```
 
-**Purpose**: Verifies that an approved folder-write `request_permissions` call authorizes a later plain `exec_command` that does not include sandbox-expansion arguments.
+**Purpose**: Tests the full path where Codex requests write access to a folder, the test approves it for the current turn, and a later shell command writes to that folder successfully. It specifically checks that the command succeeds because of the permission grant, not because the command was given special sandbox arguments.
 
-**Data flow**: Builds a `TestCodex` with workspace-write baseline, on-request approvals, user reviewer, and both permission features enabled; creates an outside temp directory and target file; mounts an SSE sequence of `request_permissions`, then plain `exec_command`, then completion; submits the turn; captures and asserts the normalized request-permissions event; responds with a turn-scoped grant; optionally approves execution if an `ExecApprovalRequest` still appears; parses the exec output; and asserts success plus file creation and contents.
+**Data flow**: It starts a mock server, configures Codex with request-permissions features enabled, creates a temporary directory and command that writes a file there, and feeds Codex a fake model sequence: permission request, shell command, final message. The test submits a user turn, verifies and approves the normalized permission request, handles any command approval if one appears, then reads the tool output and filesystem to confirm the file was created with the expected content.
 
-**Call relations**: This is the file's direct exec-path proof that standalone grants can unblock later commands without inline sandbox arguments.
+**Call relations**: This is one of the main test cases. It relies on the helpers that build permission profiles, submit the turn, wait for the permission event, and parse the command result. Its success shows that permission grants affect later `exec_command` work inside the same turn.
 
 *Call graph*: calls 9 internal fn (mount_sse_sequence, start_mock_server, test_codex, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn, workspace_write_excluding_tmp); 8 external calls (assert!, assert_eq!, wait_for_event, format!, skip_if_no_network!, skip_if_sandbox!, tempdir, vec!).
 
@@ -1855,11 +1865,11 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
 async fn approved_folder_write_request_permissions_unblocks_later_apply_patch() -> Result<()>
 ```
 
-**Purpose**: Runs the apply-patch-after-grant scenario in both normal and strict-auto-review modes. It is a thin wrapper that ensures both variants are exercised.
+**Purpose**: Runs the apply-patch permission scenario in two modes: normal approval and stricter automatic review. This confirms that folder write grants also work for patch edits, not only shell commands.
 
-**Data flow**: After network and sandbox guards, it calls `apply_patch_after_request_permissions(false)` and then `apply_patch_after_request_permissions(true)`, propagating any error.
+**Data flow**: It first skips the test when network access or the environment sandbox would make the scenario unreliable. Then it calls the shared apply-patch test helper once with strict review off and once with strict review on. It returns success only if both subcases pass.
 
-**Call relations**: This top-level test delegates all substantive work to `apply_patch_after_request_permissions`.
+**Call relations**: This is the public test wrapper for the apply-patch scenario. The real setup and assertions live in `apply_patch_after_request_permissions`, which it invokes for each review mode.
 
 *Call graph*: calls 1 internal fn (apply_patch_after_request_permissions); 2 external calls (skip_if_no_network!, skip_if_sandbox!).
 
@@ -1870,11 +1880,11 @@ async fn approved_folder_write_request_permissions_unblocks_later_apply_patch() 
 async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Result<()>
 ```
 
-**Purpose**: Verifies that a granted folder-write permission request allows a later custom `apply_patch` outside the workspace, with optional strict auto-review behavior. In strict mode it also confirms a guardian review request contains the patch details.
+**Purpose**: Tests the full path where Codex requests write access to a folder and then uses apply_patch to create a file there. It also checks the special strict-review mode, where an extra reviewer request should include the patch details.
 
-**Data flow**: Builds a `TestCodex` with workspace-write baseline and permission features enabled, creates an outside temp directory and target file name/content based on `strict_auto_review`, builds a freeform add-file patch string, mounts an SSE sequence containing `request_permissions`, then `apply_patch`, optionally a guardian assistant message when strict mode is enabled, and finally completion. It submits the turn, captures and asserts the normalized request-permissions event, responds with `RequestPermissionsResponse { scope: Turn, strict_auto_review }`, then either waits for completion and inspects the guardian request body (strict mode) or asserts no `ApplyPatchApprovalRequest` occurs (non-strict mode). Finally it extracts the custom tool output for `apply-patch-call`, parses it, and asserts the patch succeeded and wrote the expected file contents.
+**Data flow**: It receives a boolean saying whether strict automatic review is enabled. It configures a Codex test session, creates a temporary target file, builds a patch for that file, and mounts fake model responses: permission request, apply-patch call, optional strict-review guardian response, and final message. After submitting the turn, it verifies the normalized permission request, sends the approval response, waits for the expected follow-up behavior, then inspects captured requests and patch output and finally reads the created file to confirm the content.
 
-**Call relations**: This helper is called twice by the wrapper test and contains the core logic for both strict and non-strict apply-patch-after-grant scenarios.
+**Call relations**: The apply-patch wrapper test calls this twice. Inside, it uses helpers for baseline permissions, patch text, permission-event waiting, completion waiting, and result parsing. Its success shows that a turn-scoped permission grant can safely unlock later patch writes, while strict review still gets the information it needs.
 
 *Call graph*: calls 12 internal fn (mount_sse_sequence, sse, start_mock_server, test_codex, build_add_file_patch, expect_request_permissions_event, normalized_directory_write_permissions, parse_result, requested_directory_write_permissions, submit_turn (+2 more)); called by 1 (approved_folder_write_request_permissions_unblocks_later_apply_patch); 6 external calls (assert!, assert_eq!, wait_for_event, panic!, tempdir, vec!).
 
@@ -1884,11 +1894,15 @@ These tests follow mediated interaction paths where the system asks the user for
 
 ### `core/tests/suite/request_user_input.rs`
 
-`test` · `integration test execution for interactive tool calls during turn handling`
+`test` · `test run`
 
-This module exercises the runtime path where the model asks the user a structured question via the `request_user_input` tool. Two small helpers, `call_output` and `call_output_content_and_success`, read a captured `function_call_output` from a `ResponsesRequest`, verify the `call_id`, and return the output content with or without the optional success flag. The central helper `request_user_input_round_trip_for_mode` mounts a two-step SSE exchange: first a `request_user_input` tool call (optionally including `autoResolutionMs`) plus a synthetic rate-limits event, then a follow-up assistant response after the user answers. It submits a turn with explicit local environment selections, disabled permissions, and a chosen `CollaborationMode`, waits for `EventMsg::RequestUserInput`, asserts the question payload and optional auto-resolution timeout, and importantly confirms that `TokenCount` events are deferred while the request is pending. After submitting `Op::UserInputAnswer`, it waits for token-count and completion events, then verifies the serialized answer JSON returned to the model.
+These tests protect a user-facing pause-and-confirm flow. In normal chat, the assistant may call a special tool named request_user_input when it needs the person to choose an option before it continues. This file sets up a fake server that pretends to be the model API, feeds Codex scripted responses, and then checks what Codex sends back.
 
-Additional tests cover interruption and mode gating. `request_user_input_interrupt_emits_deferred_token_count` proves that if the turn is interrupted while waiting for user input, the deferred token-count information from the completed upstream response is emitted before `TurnAborted`. The rejection helper `assert_request_user_input_rejected` drives the same tool call under collaboration modes where the tool should be unavailable—Execute, Default without the feature flag, and Pair Programming—and asserts the function-call output contains a human-readable rejection message rather than a structured success payload. A separate positive test enables `Feature::DefaultModeRequestUserInput` and confirms Default mode then behaves like the successful round-trip path.
+The tests cover the happy path first. The fake model asks a question, Codex emits a RequestUserInput event to the outside world, and Codex must not finish the turn or report token counts until the user answers. After the test sends a UserInputAnswer back into Codex, Codex forwards that answer to the model as function-call output and the turn completes.
+
+The file also tests a timeout hint field, autoResolutionMs, to make sure it is preserved in the event shown to the client. Another test interrupts the turn while a user-input request is pending, verifying that token usage is still reported before the turn is marked aborted.
+
+Finally, the file checks mode rules. request_user_input is accepted in Plan mode, and in Default mode only when a feature flag is enabled. It is rejected in Execute, Pair Programming, and ordinary Default mode, with a clear message sent back to the model.
 
 #### Function details
 
@@ -1898,11 +1912,11 @@ Additional tests cover interruption and mode gating. `request_user_input_interru
 fn call_output(req: &ResponsesRequest, call_id: &str) -> String
 ```
 
-**Purpose**: Extracts the content string from a captured `function_call_output` and asserts the output belongs to the expected call id. It is the strict helper for successful round-trip assertions.
+**Purpose**: This helper pulls the text that Codex sent back to the model for a particular tool call. It also double-checks that the returned tool output really belongs to the expected call ID, so a test cannot accidentally inspect the wrong response.
 
-**Data flow**: Takes a `ResponsesRequest` and call id, fetches the raw function-call output object, asserts its `call_id` field matches, calls `function_call_output_content_and_success`, unwraps the content, and returns it as `String`.
+**Data flow**: It receives a recorded fake-server request and a tool call ID. It reads the function-call output from that request, verifies the embedded call ID matches, extracts the output content, and returns that content as a string. If anything is missing or mismatched, the test fails immediately.
 
-**Call relations**: Used by the successful round-trip helper after the second mock request is captured.
+**Call relations**: The round-trip test uses this after Codex resumes from a user answer. It lets request_user_input_round_trip_for_mode inspect the second request sent to the fake model and confirm that the user’s answer was packaged correctly.
 
 *Call graph*: calls 2 internal fn (function_call_output, function_call_output_content_and_success); called by 1 (request_user_input_round_trip_for_mode); 1 external calls (assert_eq!).
 
@@ -1916,11 +1930,11 @@ fn call_output_content_and_success(
 ) -> (String, Option<bool>)
 ```
 
-**Purpose**: Returns both the output content and optional success flag from a captured `function_call_output`, while verifying the call id matches. It supports rejection-path assertions where success may be absent.
+**Purpose**: This helper reads both the text and the optional success flag from a function-call output. It is used when the tests need to confirm not only what Codex said back to the model, but also whether Codex marked the tool call as successful.
 
-**Data flow**: Reads the raw function-call output object from the request, asserts `call_id` equality, calls `function_call_output_content_and_success`, unwraps the content, and returns `(String, Option<bool>)`.
+**Data flow**: It takes a recorded request and a call ID. It finds the matching function-call output, confirms the call ID, extracts the content text and success value, and returns them together. Missing content or a mismatched ID causes the test to fail.
 
-**Call relations**: The rejection helper uses this function to inspect the tool output returned when `request_user_input` is unavailable.
+**Call relations**: The rejection helper uses this after Codex refuses request_user_input in a disallowed mode. It checks that the model received the expected rejection message and that no explicit success value was attached.
 
 *Call graph*: calls 2 internal fn (function_call_output, function_call_output_content_and_success); called by 1 (assert_request_user_input_rejected); 1 external calls (assert_eq!).
 
@@ -1931,11 +1945,11 @@ fn call_output_content_and_success(
 async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs the standard successful `request_user_input` round trip in Plan mode without an auto-resolution timeout.
+**Purpose**: This test verifies the basic successful flow in Plan mode: Codex pauses for user input and then continues once the answer is supplied.
 
-**Data flow**: Delegates directly to `request_user_input_round_trip_for_mode(ModeKind::Plan, None)` and returns its result.
+**Data flow**: It supplies Plan mode with no auto-resolution timeout. The shared round-trip helper drives the fake model interaction, sends an answer, and checks that the final function-call output contains that answer.
 
-**Call relations**: This is a thin wrapper test around the shared round-trip helper.
+**Call relations**: This is a small test entry point. It delegates the full scenario to request_user_input_round_trip_for_mode so the same detailed checks can be reused by other mode and timeout tests.
 
 *Call graph*: calls 1 internal fn (request_user_input_round_trip_for_mode).
 
@@ -1946,11 +1960,11 @@ async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()>
 async fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs the successful round-trip scenario in Plan mode while requesting an `autoResolutionMs` timeout, verifying that the event exposes the configured timeout.
+**Purpose**: This test verifies that when the model includes an auto-resolution timeout value, Codex passes that value through to the client-facing request event.
 
-**Data flow**: Delegates to `request_user_input_round_trip_for_mode(ModeKind::Plan, Some(60_000))`.
+**Data flow**: It runs the shared round-trip scenario in Plan mode with an autoResolutionMs value of 60000. The helper checks that the RequestUserInput event contains the same value and that the rest of the answer flow still works.
 
-**Call relations**: Another thin wrapper around the shared round-trip helper, differing only in the timeout argument.
+**Call relations**: Like the basic round-trip test, this function is a short wrapper around request_user_input_round_trip_for_mode. Its job is to exercise the same machinery with the timeout field present.
 
 *Call graph*: calls 1 internal fn (request_user_input_round_trip_for_mode).
 
@@ -1964,11 +1978,11 @@ async fn request_user_input_round_trip_for_mode(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Implements the full successful `request_user_input` flow for a chosen collaboration mode, including pending-state behavior, answer submission, deferred token counts, and verification of the tool output sent back to the model.
+**Purpose**: This is the main reusable test scenario for a successful request_user_input flow. It proves that Codex can receive a model’s question, pause the turn, accept the user’s answer, and send that answer back to the model before completing.
 
-**Data flow**: Starts a mock server, optionally enables `Feature::DefaultModeRequestUserInput` when `mode == ModeKind::Default`, builds a `TestCodex`, constructs JSON arguments for one question and optionally inserts `autoResolutionMs`, mounts a first SSE response containing `request_user_input`, a synthetic rate-limits event, and completion, mounts a second SSE response with an assistant message, derives sandbox and permission fields for disabled permissions, submits a user turn with local environment selections and the requested collaboration mode, waits for `EventMsg::RequestUserInput`, asserts call id, question count, `auto_resolution_ms`, and `is_other`, then uses a short timeout loop over `codex.next_event()` to assert no `TokenCount` arrives while the request is unresolved. It builds a `RequestUserInputResponse` containing answer `yes`, submits `Op::UserInputAnswer`, waits for `TokenCount` and `TurnComplete`, extracts the function-call output from the second request via `call_output`, parses it as JSON, and asserts it matches the expected answers object.
+**Data flow**: It starts a mock model server, builds a test Codex session, and scripts the first fake model response to call request_user_input. It submits user text into Codex, waits until Codex emits a RequestUserInput event, checks the question details, and confirms token-count reporting is delayed while the question is unresolved. Then it submits a UserInputAnswer, waits for token count and turn completion, reads the next fake-server request, parses the function-call output JSON, and verifies it contains the expected answer.
 
-**Call relations**: This helper underpins the positive tests for Plan mode and feature-enabled Default mode.
+**Call relations**: Several wrapper tests call this with different modes and timeout settings. Inside the scenario it uses the fake response helpers to script server events, test_codex helpers to create a session and permissions, wait helpers to observe Codex events, and call_output to inspect what Codex sends back to the fake model.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields, call_output); called by 3 (request_user_input_round_trip_emits_auto_resolution_ms, request_user_input_round_trip_in_default_mode_with_feature, request_user_input_round_trip_resolves_pending); 10 external calls (default, new, assert!, assert_eq!, wait_for_event, wait_for_event_match, json!, from_str, skip_if_no_network!, vec!).
 
@@ -1979,11 +1993,11 @@ async fn request_user_input_round_trip_for_mode(
 fn ev_rate_limits() -> Value
 ```
 
-**Purpose**: Constructs a synthetic rate-limits event payload inserted into the mocked SSE stream. It lets the tests verify that unrelated upstream events do not bypass the pending user-input gate.
+**Purpose**: This helper creates a fake rate-limit event, like a small status notice from the model service about usage limits. The round-trip test includes it to make sure such an event does not disturb the pending user-input flow.
 
-**Data flow**: Returns a fixed JSON object representing a `codex.rate_limits` event with sample plan and usage fields.
+**Data flow**: It takes no input. It builds and returns a JSON value describing allowed rate limits, usage percentage, and related empty fields.
 
-**Call relations**: Only the round-trip helper inserts this event into the first mocked response.
+**Call relations**: request_user_input_round_trip_for_mode inserts this event into the scripted fake server stream between the tool call and completion. It is not called by other helpers.
 
 *Call graph*: 1 external calls (json!).
 
@@ -1994,11 +2008,11 @@ fn ev_rate_limits() -> Value
 async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that if a turn is interrupted while waiting on `request_user_input`, any token-count information already received from the upstream response is emitted before the turn aborts.
+**Purpose**: This test checks an important cleanup case: if a turn is interrupted while Codex is waiting for user input, Codex still reports the token count from the model response before saying the turn was aborted.
 
-**Data flow**: Starts a mock server, builds a default `TestCodex`, mounts one SSE response containing `request_user_input` followed by `ev_completed_with_tokens(..., 77)`, submits a Plan-mode turn with local environment selections and disabled permissions, waits for the `RequestUserInput` event, submits `Op::Interrupt`, waits for a `TokenCount` event and asserts `total_tokens == 77`, then waits for `TurnAborted` and finally asserts the original request call id.
+**Data flow**: It starts a fake server, scripts a response that calls request_user_input and completes with token usage, then submits a user message to Codex. After Codex emits the pending RequestUserInput event, the test sends an interrupt operation. It then waits for a TokenCount event, checks that the total token count is 77, and finally waits for the turn-aborted event.
 
-**Call relations**: This test covers the interrupt path rather than the answer-submission path and complements the pending-token deferral assertion in the round-trip helper.
+**Call relations**: This test drives the full setup itself rather than using the round-trip helper because the flow ends with an interrupt instead of an answer. It uses the same mock server, scripted SSE response helpers, permission setup, and event-waiting helpers as the successful round-trip tests.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields); 7 external calls (default, assert_eq!, wait_for_event, wait_for_event_match, json!, skip_if_no_network!, vec!).
 
@@ -2009,11 +2023,11 @@ async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Re
 async fn assert_request_user_input_rejected(mode_name: &str, build_mode: F) -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs a `request_user_input` tool call under a supplied collaboration mode and asserts the runtime rejects it with a plain explanatory output instead of surfacing a `RequestUserInput` event.
+**Purpose**: This shared test helper verifies that request_user_input is refused in a particular collaboration mode. It confirms Codex sends a clear rejection message back to the model instead of showing a question to the user.
 
-**Data flow**: Starts a mock server, builds a default `TestCodex`, derives a slugged call id from `mode_name`, mounts a first SSE response containing `request_user_input` and a second response with an assistant message, builds the requested `CollaborationMode` using the session model, derives sandbox and permission fields for disabled permissions, submits a turn with local environment selections and that mode, waits for `TurnComplete`, captures the second request, extracts `(output, success)` via `call_output_content_and_success`, asserts `success == None`, and checks the output string equals `request_user_input is unavailable in <mode_name> mode`.
+**Data flow**: It receives a human-readable mode name and a function that builds that mode’s settings. It starts a fake server, scripts the model to call request_user_input, runs a Codex turn in the chosen mode, and waits for the turn to complete. Then it inspects the follow-up request sent to the model and checks that the function-call output says request_user_input is unavailable in that mode, with no success flag.
 
-**Call relations**: The three rejection tests delegate to this helper with different mode constructors.
+**Call relations**: The Execute, Default, and Pair Programming rejection tests all call this helper. It uses call_output_content_and_success to inspect the model-facing rejection and the common fake-server and test-session helpers to run the scenario.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields, call_output_content_and_success); called by 3 (request_user_input_rejected_in_default_mode_by_default, request_user_input_rejected_in_execute_mode_alias, request_user_input_rejected_in_pair_mode_alias); 7 external calls (default, assert_eq!, wait_for_event, format!, json!, skip_if_no_network!, vec!).
 
@@ -2024,11 +2038,11 @@ async fn assert_request_user_input_rejected(mode_name: &str, build_mode: F) -> a
 async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()>
 ```
 
-**Purpose**: Asserts that `request_user_input` is unavailable in Execute mode.
+**Purpose**: This test verifies that request_user_input is not available in Execute mode. Execute mode is meant for carrying out work, not pausing to ask the user interactive planning questions through this tool.
 
-**Data flow**: Calls `assert_request_user_input_rejected` with mode name `Execute` and a builder that returns `CollaborationMode { mode: ModeKind::Execute, ... }`.
+**Data flow**: It builds an Execute collaboration mode using the current model name and passes it to the shared rejection helper. The result is a completed turn where Codex has returned an unavailable-in-Execute message to the model.
 
-**Call relations**: Thin wrapper around the shared rejection helper.
+**Call relations**: This is a mode-specific wrapper around assert_request_user_input_rejected. The shared helper performs the server setup, Codex submission, and output inspection.
 
 *Call graph*: calls 1 internal fn (assert_request_user_input_rejected).
 
@@ -2039,11 +2053,11 @@ async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<(
 async fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Result<()>
 ```
 
-**Purpose**: Asserts that `request_user_input` is unavailable in Default mode unless the enabling feature flag is turned on.
+**Purpose**: This test verifies that request_user_input is rejected in Default mode unless the special feature flag is turned on. That protects the default behavior from changing unexpectedly.
 
-**Data flow**: Calls `assert_request_user_input_rejected` with mode name `Default` and a builder for `ModeKind::Default`.
+**Data flow**: It builds a Default collaboration mode with normal settings and gives it to the shared rejection helper. The helper then proves that Codex completes the turn by sending an unavailable-in-Default message back to the model.
 
-**Call relations**: This is the negative counterpart to the feature-enabled Default-mode round-trip test.
+**Call relations**: This wrapper calls assert_request_user_input_rejected for the Default mode case. It pairs with request_user_input_round_trip_in_default_mode_with_feature, which checks the feature-flag-enabled exception.
 
 *Call graph*: calls 1 internal fn (assert_request_user_input_rejected).
 
@@ -2054,11 +2068,11 @@ async fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Res
 async fn request_user_input_round_trip_in_default_mode_with_feature() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that Default mode supports `request_user_input` once `Feature::DefaultModeRequestUserInput` is enabled by the shared helper.
+**Purpose**: This test verifies the exception to the Default-mode rule: when the DefaultModeRequestUserInput feature is enabled, Default mode can use request_user_input successfully.
 
-**Data flow**: Delegates to `request_user_input_round_trip_for_mode(ModeKind::Default, None)`.
+**Data flow**: It asks the shared round-trip helper to run in Default mode. That helper enables the needed feature while building the test configuration, then checks the full ask-answer-continue flow.
 
-**Call relations**: Thin wrapper around the shared positive helper, specifically covering feature-gated Default mode.
+**Call relations**: This is a short wrapper around request_user_input_round_trip_for_mode. Together with the Default rejection test, it proves both sides of the feature flag behavior.
 
 *Call graph*: calls 1 internal fn (request_user_input_round_trip_for_mode).
 
@@ -2069,22 +2083,24 @@ async fn request_user_input_round_trip_in_default_mode_with_feature() -> anyhow:
 async fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()>
 ```
 
-**Purpose**: Asserts that `request_user_input` is unavailable in Pair Programming mode.
+**Purpose**: This test verifies that request_user_input is not available in Pair Programming mode. The expected behavior is a clear model-facing rejection rather than a user-facing question.
 
-**Data flow**: Calls `assert_request_user_input_rejected` with mode name `Pair Programming` and a builder for `ModeKind::PairProgramming`.
+**Data flow**: It builds a Pair Programming collaboration mode with the current model name and passes it to the shared rejection helper. The helper runs the fake model turn and checks the rejection text sent back as function-call output.
 
-**Call relations**: Another thin wrapper around the shared rejection helper.
+**Call relations**: This wrapper delegates the complete scenario to assert_request_user_input_rejected, just as the Execute and Default rejection tests do.
 
 *Call graph*: calls 1 internal fn (assert_request_user_input_rejected).
 
 
 ### `core/tests/suite/review.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This file tests review mode as a distinct execution path layered on top of normal Codex threads. The helper functions at the bottom keep setup concise: `assistant_message_sse` and `completed_sse` build common SSE payloads, `start_responses_server_with_sse` mounts one or more scripted Responses streams and returns both the `MockServer` and request log, `new_conversation_for_server` creates a fresh `CodexThread` pointed at the mock `/v1` base URL, and `resume_conversation_for_server` does the same starting from an existing rollout file.
+The review feature is a bit like asking a second specialist to step into the room, inspect something, then hand a summary back to the main conversation. This test file checks that the handoff works safely. It uses a fake Responses API server, so the tests can control exactly what the model “says” without calling the real network service.
 
-The tests assert several review-specific invariants. Structured JSON review output must produce `EnteredReviewMode`, `ExitedReviewMode(Some(review))`, and `TurnComplete`, with the parsed `ReviewOutputEvent` matching the model payload and with parent-thread metadata headers showing `x-openai-subagent: review` plus `parent_thread_id` but no `forked_from_thread_id`. Plain-text review output must fall back into `overall_explanation`. Streaming assistant deltas are filtered during review, and structured review output should surface only one final `AgentMessage`. Model selection prefers `config.review_model` over the session model. Review requests must start from isolated input—environment context plus the review prompt, not prior parent history—while still recording interruption and final review messages back into the parent rollout. Later parent turns should then include those recorded review messages. The final test proves `/review` resolves base-branch prompts using the runtime-overridden cwd by creating a real git repo and checking that the merge-base SHA appears in the request input.
+The tests submit `Op::Review`, which is the operation that starts review mode. They then watch for events from the Codex thread: entering review mode, exiting review mode, and completing the turn. They verify that structured JSON from the reviewer becomes a proper `ReviewOutputEvent`, while plain text still becomes a useful fallback review summary. They also check that noisy streaming assistant text is hidden during review, so the user interface sees the clean review result instead of partial fragments.
+
+Other tests focus on boundaries. A review should use `review_model` when configured, otherwise the normal session model. It should start with its own prompt rather than blindly copying old parent chat history, but after it finishes, its useful results should be available to later parent turns. One test also creates a real temporary Git repository to confirm that base-branch review uses the session’s current working directory, including runtime overrides.
 
 #### Function details
 
@@ -2094,11 +2110,11 @@ The tests assert several review-specific invariants. Structured JSON review outp
 async fn review_op_emits_lifecycle_and_review_output()
 ```
 
-**Purpose**: Validates the happy path where a review request returns structured JSON and the parent thread records both lifecycle events and rendered review output.
+**Purpose**: This test checks the main happy path for review mode. It proves that a structured JSON review from the model turns into a typed review result, that review mode announces its start and finish in order, and that the result is written back into the session history in a readable form.
 
-**Data flow**: It serializes a JSON review payload to text, starts a mock Responses server serving that assistant message, creates a fresh conversation, submits `Op::Review` with a custom target, waits for `EnteredReviewMode`, then for `ExitedReviewMode` and extracts its `review_output`. It compares that output to a fully constructed `ReviewOutputEvent`, waits for `TurnComplete`, reads the rollout file to recover the parent session ID, inspects the outbound request headers and turn metadata, then scans rollout lines to confirm the parent session recorded a user header mentioning full review output, a formatted finding line, a plain assistant review summary equal to `render_review_output_text(&expected)`, and no assistant XML markup.
+**Data flow**: The test starts with a fake model response containing one review finding as JSON. It sends a review request into a test Codex conversation, waits for review lifecycle events, compares the parsed review output against the expected structure, then reads the rollout file on disk to confirm the review was recorded without unwanted XML-style markup. It also inspects the fake server’s captured request to confirm review-specific headers and parent session metadata were sent.
 
-**Call relations**: This top-level test orchestrates nearly every helper in the file: it uses `assistant_message_sse`, `start_responses_server_with_sse`, `new_conversation_for_server`, and `render_review_output_text`. It is the broadest integration check for review mode's child-thread lifecycle and parent-rollout writeback.
+**Call relations**: This is one of the top-level async tests. It builds fake server events with `assistant_message_sse`, mounts them through `start_responses_server_with_sse`, creates a Codex thread with `new_conversation_for_server`, and uses `render_review_output_text` to compare the text that should be saved for later conversation history.
 
 *Call graph*: calls 4 internal fn (render_review_output_text, assistant_message_sse, new_conversation_for_server, start_responses_server_with_sse); 12 external calls (new, new, assert!, assert_eq!, wait_for_event, panic!, from_str, from_value, json!, skip_if_no_network! (+2 more)).
 
@@ -2109,11 +2125,11 @@ async fn review_op_emits_lifecycle_and_review_output()
 async fn review_op_with_plain_text_emits_review_fallback()
 ```
 
-**Purpose**: Checks that non-JSON assistant output during review is wrapped into a fallback `ReviewOutputEvent` rather than failing the review lifecycle.
+**Purpose**: This test checks what happens when the reviewer model does not return JSON. Instead of failing or losing the review, Codex should wrap the plain text in a simple review result.
 
-**Data flow**: It starts a mock server whose assistant emits plain text, creates a conversation, submits `Op::Review`, waits for `EnteredReviewMode` and `ExitedReviewMode`, extracts the `review_output`, and asserts it equals `ReviewOutputEvent { overall_explanation: "just plain text", ..Default::default() }`. It then waits for `TurnComplete` and verifies the mock server consumed its expected request.
+**Data flow**: The input is a fake assistant message saying only `just plain text`. The test submits a review operation, waits for review mode to open and close, and expects the final review output to have that text as its overall explanation with all other review fields left at their default empty values.
 
-**Call relations**: This test reuses the same setup helpers as the structured-output case but changes only the assistant payload. It proves the review parser falls back gracefully while preserving the same lifecycle events.
+**Call relations**: This test uses `assistant_message_sse` to create the fake plain-text model response, `start_responses_server_with_sse` to serve it, and `new_conversation_for_server` to run Codex against that fake server. It then relies on event waiting to observe the review lifecycle.
 
 *Call graph*: calls 3 internal fn (assistant_message_sse, new_conversation_for_server, start_responses_server_with_sse); 7 external calls (new, default, new, assert_eq!, wait_for_event, panic!, skip_if_no_network!).
 
@@ -2124,11 +2140,11 @@ async fn review_op_with_plain_text_emits_review_fallback()
 async fn review_filters_agent_message_related_events()
 ```
 
-**Purpose**: Ensures review mode suppresses assistant streaming events that would normally surface during a standard turn.
+**Purpose**: This test makes sure review mode does not leak partial assistant-message streaming events to callers. That matters because review mode has its own result event, and showing raw streaming fragments could confuse the user interface.
 
-**Data flow**: It scripts a response stream containing message-item-added, output-text deltas, a final assistant message, and completion, creates a conversation, submits `Op::Review`, and then drains events until `TurnComplete`. During that drain it records whether `EnteredReviewMode` and `ExitedReviewMode` were seen and panics immediately if `EventMsg::AgentMessageContentDelta` appears.
+**Data flow**: The fake server sends a sequence like a normal streaming assistant answer: message started, text deltas, final assistant message, and completion. The test submits a review request and drains events until the turn finishes. If an assistant text delta appears during review, the test fails immediately; otherwise it confirms review mode still entered and exited.
 
-**Call relations**: The test is driven directly by the runner and uses `wait_for_event` as a looped event drain. Its role is to verify filtering behavior inside the review flow rather than request contents or parsed review output.
+**Call relations**: This top-level test prepares a custom event list directly, serves it with `start_responses_server_with_sse`, and creates the conversation with `new_conversation_for_server`. It is focused on what events the review flow allows through to the outer Codex thread.
 
 *Call graph*: calls 2 internal fn (new_conversation_for_server, start_responses_server_with_sse); 6 external calls (new, new, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -2139,11 +2155,11 @@ async fn review_filters_agent_message_related_events()
 async fn review_does_not_emit_agent_message_on_structured_output()
 ```
 
-**Purpose**: Verifies that structured review output produces exactly one final non-streaming `AgentMessage` and no extra assistant-message stream artifacts.
+**Purpose**: This test checks that structured review output is surfaced cleanly. The user interface should get the structured review through the review-exit event and only one final assistant message, not a stream of duplicate assistant messages.
 
-**Data flow**: It serves a structured JSON review assistant message, creates a conversation, submits `Op::Review`, then drains events until `TurnComplete` while counting `EventMsg::AgentMessage` occurrences and tracking whether review lifecycle events occurred. At the end it asserts exactly one `AgentMessage` was emitted and both lifecycle events were observed.
+**Data flow**: The test feeds the fake server a JSON review result, submits a review request, and counts `AgentMessage` events until the turn completes. The expected before-and-after is: structured model text goes in, review lifecycle events come out, and exactly one final assistant message is emitted.
 
-**Call relations**: This test complements the streaming-filter test by focusing on the final event count for structured output. It relies on the same helper setup but validates the event stream seen by the UI layer.
+**Call relations**: It uses `assistant_message_sse` for the fake structured model reply, `start_responses_server_with_sse` for the mock Responses API, and `new_conversation_for_server` for the test Codex thread. It complements the filtering test by checking the non-streaming final message count.
 
 *Call graph*: calls 3 internal fn (assistant_message_sse, new_conversation_for_server, start_responses_server_with_sse); 7 external calls (new, new, assert!, assert_eq!, wait_for_event, json!, skip_if_no_network!).
 
@@ -2154,11 +2170,11 @@ async fn review_does_not_emit_agent_message_on_structured_output()
 async fn review_uses_custom_review_model_from_config()
 ```
 
-**Purpose**: Checks that review requests use `config.review_model` instead of the main session model when that override is configured.
+**Purpose**: This test verifies that the review feature honors a special reviewer model setting. If the user configures `review_model`, review requests should use that model instead of the main chat model.
 
-**Data flow**: It starts a mock server with an immediate completion SSE, creates a conversation whose config sets `model = gpt-4.1` and `review_model = gpt-5.4`, submits `Op::Review`, waits for `EnteredReviewMode`, `ExitedReviewMode` with `review_output: None`, and `TurnComplete`, then inspects the single request body and asserts `body["model"] == "gpt-5.4"`.
+**Data flow**: The test creates a config with a normal model and a different review model, then sends a review request. After the fake server receives the request, the test reads the JSON request body and checks that its `model` field is the configured review model.
 
-**Call relations**: This test uses the generic conversation/server helpers and focuses solely on outbound request selection. It pairs with the next test, which removes the review-model override to verify fallback behavior.
+**Call relations**: It uses `completed_sse` because the model response content is not important here, only the outgoing request. `start_responses_server_with_sse` records the request, and `new_conversation_for_server` applies the config mutation before the review operation runs.
 
 *Call graph*: calls 3 internal fn (completed_sse, new_conversation_for_server, start_responses_server_with_sse); 5 external calls (new, new, assert_eq!, wait_for_event, skip_if_no_network!).
 
@@ -2169,11 +2185,11 @@ async fn review_uses_custom_review_model_from_config()
 async fn review_uses_session_model_when_review_model_unset()
 ```
 
-**Purpose**: Verifies that review requests fall back to the session model when no dedicated review model is configured.
+**Purpose**: This test checks the fallback model choice. When no separate review model is configured, the review request should use the same model as the current session.
 
-**Data flow**: It starts a completion-only mock server, creates a conversation with `model = gpt-4.1` and `review_model = None`, submits `Op::Review`, waits through the normal review lifecycle, then inspects the request body and asserts the `model` field is `gpt-4.1`.
+**Data flow**: The test configures the session model and leaves `review_model` empty. It submits a review, waits for completion, then examines the request captured by the mock server. The request body should name the session model.
 
-**Call relations**: This is the control case for `review_uses_custom_review_model_from_config`. Together the two tests pin down the model-selection precedence used when constructing review requests.
+**Call relations**: Like the custom-model test, it uses `completed_sse` because the response details do not matter. It creates the fake API with `start_responses_server_with_sse` and the configured Codex conversation with `new_conversation_for_server`.
 
 *Call graph*: calls 3 internal fn (completed_sse, new_conversation_for_server, start_responses_server_with_sse); 5 external calls (new, new, assert_eq!, wait_for_event, skip_if_no_network!).
 
@@ -2184,11 +2200,11 @@ async fn review_uses_session_model_when_review_model_unset()
 async fn review_input_isolated_from_parent_history()
 ```
 
-**Purpose**: Ensures a review thread starts with only environment context and the review prompt, not prior parent-session chat history, even when resuming from an existing rollout file.
+**Purpose**: This test makes sure a new review does not automatically include earlier parent chat messages as its own input. That isolation matters because the reviewer should judge the requested target, not be biased or cluttered by unrelated old conversation.
 
-**Data flow**: It writes a synthetic resume JSONL file containing session metadata plus prior user and assistant `ResponseItem::Message` entries, resumes a conversation from that file, submits `Op::Review` with a custom prompt, waits through review completion, then inspects the request body. It asserts the `input` array contains environment context text beginning with `ENVIRONMENT_CONTEXT_OPEN_TAG`, contains the raw review prompt exactly once, and uses `REVIEW_PROMPT` as `instructions`. It then reads the rollout file and scans `RolloutLine`s to confirm a user interruption note mentioning review-task interruption was recorded.
+**Data flow**: The test first writes a fake saved conversation file containing earlier user and assistant messages. It resumes Codex from that file, submits a review prompt, and inspects the request sent to the fake model. The request should contain environment context and the raw review prompt, with the review rubric in `instructions`, and the rollout file should also note that the review task was interrupted or recorded in the parent history.
 
-**Call relations**: This test is the only caller of `resume_conversation_for_server`, because it specifically needs preexisting parent history. It validates both request isolation on the child review thread and parent-rollout bookkeeping after the review starts.
+**Call relations**: This is the only test that calls `resume_conversation_for_server`, because it needs a pre-existing session history. It uses `completed_sse` and `start_responses_server_with_sse` for a minimal fake response, then checks both the outgoing model request and the saved rollout records.
 
 *Call graph*: calls 3 internal fn (completed_sse, resume_conversation_for_server, start_responses_server_with_sse); 15 external calls (new, new, new_v4, assert!, assert_eq!, wait_for_event, format!, from_str, from_value, json! (+5 more)).
 
@@ -2199,11 +2215,11 @@ async fn review_input_isolated_from_parent_history()
 async fn review_history_surfaces_in_parent_session()
 ```
 
-**Purpose**: Checks that once a review thread finishes, its recorded conversation becomes visible to later turns in the parent session.
+**Purpose**: This test checks the other side of history isolation: after review finishes, its useful summary should be visible to later parent conversation turns. Without this, the main assistant could not refer back to the review results.
 
-**Data flow**: It starts a mock server expecting two requests, creates a fresh conversation, runs a review turn that yields assistant text, waits for review completion, then submits a normal `Op::UserInput` follow-up turn and waits for completion. It inspects the second request body, asserts the last input item is the follow-up user text, and also asserts that earlier input items include both the review rollout user note (`User initiated a review task.`) and the review assistant output text.
+**Data flow**: The test runs one review turn whose fake assistant output is `review assistant output`. Then it sends a normal user follow-up in the parent session. It inspects the second model request and expects to see the follow-up as the newest user message, plus saved review-related messages from the completed review.
 
-**Call relations**: This test follows the review-isolation case by checking the opposite boundary: review content should be absent from the child request but present in later parent turns. It uses the same fresh-conversation helper and request-log inspection.
+**Call relations**: It creates a two-request fake server using `assistant_message_sse` and `start_responses_server_with_sse`, then starts a fresh conversation with `new_conversation_for_server`. The first request exercises review mode; the second request proves the parent flow can see the review’s recorded output.
 
 *Call graph*: calls 3 internal fn (assistant_message_sse, new_conversation_for_server, start_responses_server_with_sse); 8 external calls (new, default, new, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -2214,11 +2230,11 @@ async fn review_history_surfaces_in_parent_session()
 async fn review_uses_overridden_cwd_for_base_branch_merge_base()
 ```
 
-**Purpose**: Verifies that `/review` resolves base-branch review prompts using the current runtime-selected cwd rather than the original config cwd.
+**Purpose**: This test verifies that base-branch review uses the session’s current working directory, including runtime overrides. This matters because Git comparisons depend on which repository Codex is operating in.
 
-**Data flow**: It creates a real git repository in a temp dir, initializes `main`, commits a file, captures `HEAD` via `git rev-parse`, creates a conversation whose configured cwd points somewhere else, submits thread settings overriding environments to the repo path, then submits `Op::Review { target: BaseBranch { branch: "main" } }`. After waiting for review start and turn completion, it inspects the single request body and asserts some input text contains the computed merge-base SHA.
+**Data flow**: The test creates a temporary Git repository, commits a file, and records the commit SHA. It starts Codex with one initial working directory, then applies thread settings that point to the Git repository. When it submits a base-branch review for `main`, the outgoing review prompt should include the merge-base SHA from the overridden repository path.
 
-**Call relations**: This test combines the review flow with runtime environment overrides and external git commands. It proves the review prompt-generation logic consults the active thread environment rather than stale startup config.
+**Call relations**: This test uses `local_selections` to create the runtime environment override, `completed_sse` for a minimal fake model completion, `start_responses_server_with_sse` to capture the request, and `new_conversation_for_server` to start Codex with a configurable initial directory.
 
 *Call graph*: calls 4 internal fn (local_selections, completed_sse, new_conversation_for_server, start_responses_server_with_sse); 11 external calls (new, default, from_utf8, new, assert!, assert_eq!, new, submit_thread_settings, wait_for_event, skip_if_no_network! (+1 more)).
 
@@ -2229,11 +2245,11 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base()
 fn assistant_message_sse(text: &str) -> Vec<serde_json::Value>
 ```
 
-**Purpose**: Builds the common two-event SSE sequence for tests where the model returns one assistant message and then completes.
+**Purpose**: This helper builds a small fake server-sent event sequence for a completed assistant message. Server-sent events are streamed messages from the server; here they are represented as JSON values for the mock API.
 
-**Data flow**: It takes a text string and returns `Vec<serde_json::Value>` containing `responses::ev_assistant_message("msg-1", text)` followed by `responses::ev_completed("resp-1")`.
+**Data flow**: It takes a text string as input. It wraps that text as an assistant message event, adds a completion event after it, and returns the two events as a list.
 
-**Call relations**: Several review tests call this helper when they need a minimal assistant-producing response stream. It keeps the mock-server setup consistent across structured and plain-text review cases.
+**Call relations**: Several review tests call this helper when they need the fake model to return actual assistant text. The resulting event list is usually handed to `start_responses_server_with_sse`, which serves it through the mock Responses API.
 
 *Call graph*: called by 4 (review_does_not_emit_agent_message_on_structured_output, review_history_surfaces_in_parent_session, review_op_emits_lifecycle_and_review_output, review_op_with_plain_text_emits_review_fallback); 1 external calls (vec!).
 
@@ -2244,11 +2260,11 @@ fn assistant_message_sse(text: &str) -> Vec<serde_json::Value>
 fn completed_sse() -> Vec<serde_json::Value>
 ```
 
-**Purpose**: Builds the minimal SSE sequence representing an immediate completed response with no assistant content.
+**Purpose**: This helper builds the smallest fake streaming response: only a completion event. Tests use it when they care about the outgoing request rather than the model’s answer.
 
-**Data flow**: It returns a one-element `Vec<serde_json::Value>` containing only `responses::ev_completed("resp-1")`.
+**Data flow**: It takes no input. It returns a one-item list containing a fake completed-response event.
 
-**Call relations**: Tests that care only about request construction or lifecycle completion, not assistant output, use this helper when mounting the mock Responses server.
+**Call relations**: Model-selection, history-isolation, and working-directory tests call this helper because they only need Codex to finish the turn. The returned event list is passed into `start_responses_server_with_sse`.
 
 *Call graph*: called by 4 (review_input_isolated_from_parent_history, review_uses_custom_review_model_from_config, review_uses_overridden_cwd_for_base_branch_merge_base, review_uses_session_model_when_review_model_unset); 1 external calls (vec!).
 
@@ -2262,11 +2278,11 @@ async fn start_responses_server_with_sse(
 ) -> (MockServer, ResponseMock)
 ```
 
-**Purpose**: Starts a mock Responses server and mounts the provided SSE payload the requested number of times, returning both the server and request log.
+**Purpose**: This helper starts a fake Responses API server and teaches it what streaming responses to return. It also gives tests a request log so they can inspect what Codex sent.
 
-**Data flow**: It accepts a vector of SSE event JSON values and an `expected_requests` count, starts a `MockServer`, wraps the events with `responses::sse`, duplicates that SSE response `expected_requests` times into a vector, mounts them as a sequence, and returns `(MockServer, ResponseMock)`.
+**Data flow**: It receives a list of fake server-sent events and the number of expected requests. It starts a mock server, converts the events into an SSE response body, repeats that response for the expected number of calls, mounts the sequence on the server, and returns both the server and its request recorder.
 
-**Call relations**: Nearly every test in the file uses this helper as the common server bootstrap. It centralizes the pattern of creating a mock `/v1/responses` server plus a request log for later assertions.
+**Call relations**: Almost every test in this file calls this helper before creating a Codex conversation. It hides the setup details of `start_mock_server`, `responses::sse`, and `mount_sse_sequence` so each test can focus on the review behavior it is checking.
 
 *Call graph*: calls 3 internal fn (mount_sse_sequence, sse, start_mock_server); called by 9 (review_does_not_emit_agent_message_on_structured_output, review_filters_agent_message_related_events, review_history_surfaces_in_parent_session, review_input_isolated_from_parent_history, review_op_emits_lifecycle_and_review_output, review_op_with_plain_text_emits_review_fallback, review_uses_custom_review_model_from_config, review_uses_overridden_cwd_for_base_branch_merge_base, review_uses_session_model_when_review_model_unset); 1 external calls (vec!).
 
@@ -2281,11 +2297,11 @@ async fn new_conversation_for_server(
 ) -> Arc<CodexThread>
 ```
 
-**Purpose**: Creates a fresh `CodexThread` configured to send Responses API traffic to the supplied mock server.
+**Purpose**: This helper creates a fresh Codex conversation that talks to the fake server instead of the real API. Tests can also tweak the configuration before the conversation starts.
 
-**Data flow**: It takes a `MockServer`, shared `TempDir`, and a config mutator closure, formats the server URI into a `/v1` base URL, builds a `test_codex()` fixture with the provided home and a config closure that sets `config.model_provider.base_url` before applying the caller mutator, then builds the fixture and returns its `Arc<CodexThread>`.
+**Data flow**: It receives the mock server, a temporary Codex home directory, and a configuration-changing function. It builds a base URL from the server address, sets that as the model provider endpoint, applies the caller’s config changes, starts the test Codex thread, and returns the thread handle.
 
-**Call relations**: Fresh-session review tests call this helper instead of repeating base-url wiring. It sits between the tests and `test_codex().build(...)`, ensuring all review requests hit the mock server.
+**Call relations**: Most tests call this after setting up the fake server. It delegates to `test_codex` for the actual test harness construction, while the caller supplies only the review-specific configuration changes.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 8 (review_does_not_emit_agent_message_on_structured_output, review_filters_agent_message_related_events, review_history_surfaces_in_parent_session, review_op_emits_lifecycle_and_review_output, review_op_with_plain_text_emits_review_fallback, review_uses_custom_review_model_from_config, review_uses_overridden_cwd_for_base_branch_merge_base, review_uses_session_model_when_review_model_unset); 1 external calls (format!).
 
@@ -2301,20 +2317,26 @@ async fn resume_conversation_for_server(
 ) -> Arc<CodexThread>
 ```
 
-**Purpose**: Creates a resumed `CodexThread` from an existing rollout file while pointing all Responses API traffic at the supplied mock server.
+**Purpose**: This helper creates a Codex conversation by resuming from an existing rollout file, while still pointing network calls at the fake server. It is used when a test needs old session history to exist before review starts.
 
-**Data flow**: It takes a `MockServer`, shared home dir, resume path, and config mutator closure, formats the `/v1` base URL, builds a `test_codex()` fixture with the given home and config mutation, then calls `builder.resume(server, codex_home, resume_path)` and returns the resumed thread.
+**Data flow**: It receives the mock server, temporary Codex home, a saved-session path, and a config mutator. It sets the mock server as the model provider endpoint, applies any config changes, resumes the conversation from the given rollout file, and returns the Codex thread.
 
-**Call relations**: Only the parent-history isolation test uses this helper, because that scenario needs a prewritten rollout file. It mirrors `new_conversation_for_server` but routes through the resume path.
+**Call relations**: The parent-history isolation test calls this helper after writing a fake session file. Internally it uses the same `test_codex` harness idea as `new_conversation_for_server`, but chooses the resume path instead of starting from an empty conversation.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 1 (review_input_isolated_from_parent_history); 1 external calls (format!).
 
 
 ### `core/tests/suite/guardian_review.rs`
 
-`test` · `approval flow / post-turn notification`
+`test` · `integration test run`
 
-This non-Windows file sets up a realistic approval flow where an `exec_command` requiring escalation is routed through Guardian auto-review. The test first skips when networking is unavailable or when already running inside a sandbox. It creates a temporary `notify.sh` script that appends its final argument to `notify.jsonl`, marks it executable, and injects it into `config.notify`. The config also allows `AskForApproval::OnRequest` and installs a legacy workspace-write sandbox policy with no writable roots and no network access. The mocked SSE sequence has three phases: the parent model requests `exec_command` with `SandboxPermissions::RequireEscalated` and a justification, the Guardian review model returns a JSON assistant message approving the action, and the parent model then finishes with `done`. The submitted user turn explicitly sets local environment selections, `approval_policy`, `approvals_reviewer: Some(ApprovalsReviewer::AutoReview)`, and the same sandbox policy. After `TurnComplete`, the test finds the outbound Guardian review request by searching recorded requests for the justification text and asserts the reviewed shell command is present. It then waits for the notify file, parses each JSONL payload into `serde_json::Value`, and asserts there is exactly one payload containing only the original user message and final assistant message. The critical invariant is that the Guardian review transcript prompt must not leak into the legacy notify channel.
+This test protects a privacy and correctness boundary. Codex can be configured to run a notification script after a turn, and it can also ask a separate Guardian reviewer to approve risky actions, such as running a command with extra permissions. Those are two different conversations. The final user-facing notification should describe the normal user session, not include the hidden Guardian review prompt or transcript.
+
+The test sets up a fake server that pretends to be the model service. It then creates a temporary shell script to act as the legacy notification command. That script simply writes the notification payload it receives into a file, like leaving a receipt in a mailbox.
+
+Next, the test starts Codex with that notification script enabled, with approvals required on request, and with a sandbox policy that normally restricts command execution. It sends a user request that causes the mocked model to ask Codex to run a command needing escalated permission. The fake server then provides a Guardian review response saying the command is allowed, followed by a normal assistant response of “done.”
+
+After the turn finishes, the test checks three important things: the Guardian review request really included the command and justification; the notification file contains only one payload for the normal user turn; and that payload does not contain the Guardian review transcript. Finally, it confirms the approved command actually wrote the expected marker file.
 
 #### Function details
 
@@ -2324,22 +2346,26 @@ This non-Windows file sets up a realistic approval flow where an `exec_command` 
 async fn guardian_review_session_does_not_inherit_legacy_notify() -> Result<()>
 ```
 
-**Purpose**: Exercises an auto-reviewed escalated exec command and verifies that the legacy notify hook receives only the normal conversation, not the Guardian review transcript. It also confirms the approved command writes its marker file successfully.
+**Purpose**: This test verifies that Guardian auto-review stays separate from the legacy notification system. Someone would use it to catch regressions where an internal approval conversation is accidentally included in the notification payload sent to a configured script.
 
-**Data flow**: After network and sandbox guards, it starts a mock server, defines `approval_policy` and a `SandboxPolicy::WorkspaceWrite` with no writable roots and no network, creates a temporary executable `notify.sh` that appends its last argument to `notify.jsonl`, and configures `test_codex` with that notify script, permissive constrained approval policy, and the legacy sandbox policy. It builds a command that writes `guardian-approved` into a workspace file, wraps it in `tool_args` with `SandboxPermissions::RequireEscalated` and a justification, mounts a three-response SSE sequence for parent tool call, Guardian review assistant JSON, and final assistant completion, submits `Op::UserInput` with local environment selections, `ApprovalsReviewer::AutoReview`, and the sandbox policy, then waits for `TurnComplete`. It searches recorded requests for the Guardian review request containing the justification, asserts the command text is present, waits for `notify.jsonl`, reads and parses its JSON lines, asserts there is exactly one payload with the expected `input-messages` and `last-assistant-message`, asserts the raw notify payload does not contain the Guardian transcript preamble, and finally asserts the output file contains `guardian-approved`.
+**Data flow**: The test starts by skipping environments where the scenario cannot run, then creates a mock model server, a temporary notification script, and a Codex test instance with approval and sandbox settings. It feeds Codex a user request and pre-arranged mock server responses: first a tool call needing approval, then a Guardian approval message, then a final assistant message. After Codex finishes, it reads the mock server’s recorded requests, the notification output file, and the command’s marker file. The expected result is that the Guardian request contains the command details, the notification payload contains only the normal user-facing conversation, and the command output file says the approved command ran.
 
-**Call relations**: This single Tokio test is the file’s entry point. It orchestrates the whole approval path through `mount_sse_sequence`, then uses `wait_for_event` and filesystem polling to validate both the review request and the downstream notify side effect.
+**Call relations**: This is the top-level test case. It calls the test support helpers to start the fake server, build a Codex instance, choose local environment settings, and mount a sequence of fake streaming responses. During the simulated turn, Codex talks to the mock server, runs the Guardian review path, executes the approved command, and invokes the notification script. The test then gathers those outputs and uses assertions to prove the pieces stayed in the right lanes.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, local_selections, test_codex); 18 external calls (default, from_millis, from_secs, new, assert!, assert_eq!, from_mode, wait_for_event, format!, set_permissions (+8 more)).
 
 
 ### `core/tests/suite/mcp_turn_metadata.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This file exercises the intersection of app-backed MCP tools, approval policy, and turn metadata propagation. Two configuration helpers mutate `Config.config_layer_stack` by synthesizing a TOML user config under `config.codex_home/config.toml`: one sets `[apps.calendar].default_tools_approval_mode`, and the other also sets `[apps._default].approvals_reviewer`. Rather than editing fields directly, they rebuild the layered config stack so the tests mimic real user configuration precedence. A third helper, `submit_user_turn`, standardizes turn submission with disabled permission profile, local environment selection, caller-chosen `AskForApproval`, and either a supplied or default collaboration mode.
+These are end-to-end style tests for a subtle part of Codex’s app-tool flow. In this system, the model can call an external app tool, such as a calendar tool. Some tool calls may need approval before they run. The important question tested here is: if the turn already involved asking the user something, does Codex remember that and attach the right note to the later tool call?
 
-Each test mounts both a mock Responses API server and an `AppsTestServer` that records downstream app tool invocations. The first scenario enables `Feature::ToolCallMcpElicitation`, configures calendar approvals to prompt and the default reviewer to `User`, then verifies that approving the elicitation causes the recorded app tool call to include `_meta.x-codex-turn-metadata.user_input_requested_during_turn = true`. The second flips the default reviewer to `AutoReview` while the global reviewer is `User`, proving that the app approval is routed to Guardian instead of surfacing an `ElicitationRequest`; it inspects the Guardian request body and still confirms the actual calendar tool call arguments. The third scenario has the model first call the built-in `request_user_input` tool, waits for `EventMsg::RequestUserInput`, submits a `UserInputAnswer`, then verifies the subsequent calendar MCP call is marked with the same `user_input_requested_during_turn` metadata. Across all three tests, the key invariant is that any user-input solicitation earlier in the turn is reflected in metadata attached to later MCP/app tool calls.
+The file builds a small fake world: a mock model server sends scripted responses, and a fake apps server records what tool calls it receives. The tests then submit a user message, wait for Codex events, answer approval or user-input prompts when needed, and finally inspect the recorded app call.
+
+Two helper functions edit the test configuration so the calendar app uses a chosen approval style, and another helper submits a complete user turn with the permission and collaboration settings the tests need.
+
+The tests cover three cases. One checks that a user approval prompt before a calendar call causes metadata saying user input was requested during the turn. Another checks that a default app reviewer setting can route approval to an automatic “Guardian” review instead of the user. The last checks the same metadata when the model explicitly uses a request-user-input tool before calling the calendar app.
 
 #### Function details
 
@@ -2349,11 +2375,11 @@ Each test mounts both a mock Responses API server and an `AppsTestServer` that r
 fn set_calendar_approval_mode(config: &mut Config, approval_mode: AppToolApproval)
 ```
 
-**Purpose**: Injects a user-config layer that sets the calendar app’s default tool approval mode. It lets tests simulate persisted app configuration without editing production config files.
+**Purpose**: This helper changes the test configuration so the calendar app uses a specific default approval mode for its tools. It lets each test say whether calendar tool calls should run automatically, ask for a prompt, or be treated as pre-approved.
 
-**Data flow**: Takes a mutable `Config` and an `AppToolApproval`. It maps the enum to the TOML strings `auto`, `prompt`, or `approve`, computes `config.codex_home/config.toml`, formats a TOML snippet containing `[apps.calendar] default_tools_approval_mode = ...`, parses it with `toml::from_str`, and replaces `config.config_layer_stack` with a version extended by `with_user_config(&user_config_path, user_config)`. It returns no value.
+**Data flow**: It receives a mutable test Config and an AppToolApproval value. It turns that approval value into the text that would appear in a user config file, builds a small TOML config snippet for the calendar app, parses it, and adds it to the config layer stack. After it runs, the same Config object contains a calendar-specific approval setting.
 
-**Call relations**: Used in the third test’s builder configuration to make calendar tool calls auto-approved. It is the simpler config helper when no default reviewer override is needed.
+**Call relations**: The test setup uses this helper when it only needs to control the calendar app’s approval behavior. In this file, the request-user-input metadata test uses it before building the TestCodex instance, so the later submitted turn runs with calendar tool calls approved according to that setting.
 
 *Call graph*: 2 external calls (format!, from_str).
 
@@ -2368,11 +2394,11 @@ fn set_calendar_approval_mode_and_default_reviewer(
 )
 ```
 
-**Purpose**: Injects a user-config layer that sets both the global default app approvals reviewer and the calendar app’s default tool approval mode. This allows tests to prove routing comes specifically from `apps._default` rather than the global in-memory config field.
+**Purpose**: This helper changes two pieces of test configuration at once: the calendar app’s tool approval mode and the default reviewer for app approvals. It is used to prove that app-specific default reviewer settings override the global reviewer setting.
 
-**Data flow**: Accepts a mutable `Config`, an `AppToolApproval`, and an `ApprovalsReviewer`. It converts the approval enum to its TOML string, computes the user config path, formats TOML containing `[apps._default] approvals_reviewer = ...` and `[apps.calendar] default_tools_approval_mode = ...`, parses it, and updates `config.config_layer_stack` via `with_user_config`. It mutates config in place and returns nothing.
+**Data flow**: It receives a mutable Config, an approval mode, and a default approval reviewer. It converts the approval mode to config text, writes a TOML snippet with an apps-wide default reviewer plus a calendar approval mode, parses that snippet, and inserts it into the config layer stack. The Config is changed in place so later test setup sees these app approval rules.
 
-**Call relations**: Called by the first two tests inside `search_capable_apps_builder(...).with_config(...)`. Those tests deliberately set the opposite global reviewer on `config.approvals_reviewer` so this helper’s layered config is the source of truth for routing behavior.
+**Call relations**: The approval-routing tests call this during builder configuration. One test sets the app default reviewer to the user, and another sets it to automatic review, so the later tool-call approval follows the app default rather than the intentionally opposite global setting.
 
 *Call graph*: 2 external calls (format!, from_str).
 
@@ -2388,11 +2414,11 @@ async fn submit_user_turn(
 ) -> Result<()>
 ```
 
-**Purpose**: Submits a standardized text turn into a `TestCodex` instance with explicit approval policy, local environment selection, disabled permission profile, and optional collaboration mode override. It removes repetitive turn-construction boilerplate from the MCP metadata tests.
+**Purpose**: This helper sends a user message into a TestCodex session with the permission, sandbox, environment, approval, and collaboration settings needed by these tests. It hides the noisy setup so each test can focus on the behavior being checked.
 
-**Data flow**: Receives a `&TestCodex`, input text, an `AskForApproval` policy, and an optional `CollaborationMode`. It clones the session model, derives sandbox and permission settings from `test.cwd.path()`, constructs `Op::UserInput` with one `UserInput::Text`, no final schema, default additional context, and `ThreadSettingsOverrides` that set local environments from `test.config.cwd`, the supplied approval policy, derived sandbox and permission profile, and either the provided collaboration mode or a default `ModeKind::Default` mode using the session model. It submits the op through `test.codex.submit(...).await?` and returns `Result<()>`.
+**Data flow**: It receives the TestCodex test harness, the user’s text, an approval policy, and an optional collaboration mode. It reads the current model from the session, builds local environment selections, creates permission fields with sandboxing disabled, wraps the text as user input, and submits it to Codex. If the submit succeeds, it returns success; if Codex rejects the operation, the error is returned.
 
-**Call relations**: All three top-level tests call this helper to start their scenario. It sits at the front of each call flow, after builder setup and before waiting for elicitation, request-user-input, or MCP tool-call events.
+**Call relations**: All three async tests call this after they finish configuring mock servers and building the test harness. It is the point where the scripted scenario actually starts: after this function submits the user turn, the tests wait for Codex events such as tool-call starts, approval prompts, user-input requests, and turn completion.
 
 *Call graph*: calls 2 internal fn (local_selections, turn_permission_fields); called by 3 (approved_mcp_tool_call_metadata_records_prior_user_input_request, apps_default_auto_review_routes_actual_mcp_approval_to_guardian, mcp_tool_call_metadata_records_prior_request_user_input_tool); 2 external calls (default, vec!).
 
@@ -2403,11 +2429,11 @@ async fn submit_user_turn(
 async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> Result<()>
 ```
 
-**Purpose**: Verifies that when an app-backed MCP tool call requires user approval and the user accepts, the downstream recorded app tool invocation is tagged with turn metadata indicating user input was requested during the turn. It specifically tests the `ElicitationRequest` approval path.
+**Purpose**: This test verifies that when a calendar app tool call needs user approval, and the user approves it, the actual app call records that user input was requested during the turn. Without this, downstream app tooling would miss an important part of the turn’s history.
 
-**Data flow**: This async test skips without network, starts a mock Responses server and mounts an `AppsTestServer`, defines a calendar tool call ID and JSON arguments, mounts a two-step SSE sequence where the first response requests the calendar MCP tool and the second returns `done`, builds a search-capable app test instance with `Feature::ToolCallMcpElicitation` enabled, global reviewer set opposite to the desired route, and layered config from `set_calendar_approval_mode_and_default_reviewer(AppToolApproval::Prompt, ApprovalsReviewer::User)`, then submits a user turn with `AskForApproval::OnRequest`. It waits for `McpToolCallBegin`, then for either `ElicitationRequest` or `TurnComplete`, asserts it got an elicitation, resolves it with `Op::ResolveElicitation { decision: Accept }`, waits for turn completion, fetches the recorded app tool call by call ID, and asserts `_meta/x-codex-turn-metadata/user_input_requested_during_turn` is `true`.
+**Data flow**: The test creates a fake model response that first asks to call the calendar create-event tool and then later says it is done. It configures the calendar app to prompt for approval and to route that approval to the user. After submitting the user turn, it waits for the calendar tool-call event, waits for the approval request, accepts it, waits for the turn to finish, and then reads the tool call captured by the fake apps server. The expected result is that the recorded call has metadata marking user_input_requested_during_turn as true.
 
-**Call relations**: This is the first of the three metadata-routing scenarios. It uses `submit_user_turn` to start the turn, then drives the approval branch by responding to the emitted `ElicitationRequest`, and finally inspects the app-server recording to verify metadata propagation.
+**Call relations**: This test uses the mock server helpers to stage model output, the apps test server to record the calendar call, set_calendar_approval_mode_and_default_reviewer to force user approval routing, and submit_user_turn to start the scenario. It then drives the approval flow by sending ResolveElicitation back into Codex before checking the final recorded app request.
 
 *Call graph*: calls 6 internal fn (mount, recorded_apps_tool_call_by_call_id, search_capable_apps_builder, mount_sse_sequence, start_mock_server, submit_user_turn); 8 external calls (assert_eq!, wait_for_event, json!, panic!, to_string, skip_if_no_network!, unreachable!, vec!).
 
@@ -2418,11 +2444,11 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> R
 async fn apps_default_auto_review_routes_actual_mcp_approval_to_guardian() -> Result<()>
 ```
 
-**Purpose**: Verifies that `apps._default.approvals_reviewer = auto_review` routes an app MCP approval through Guardian even when the global reviewer is set to `User`. It proves the route decision comes from layered app config and not the global field.
+**Purpose**: This test checks that an app-level default reviewer setting can send an approval decision to the automatic Guardian reviewer instead of asking the user. Guardian here means a model-based safety reviewer that judges whether a planned action should be allowed.
 
-**Data flow**: The test skips without network, starts the mock Responses server and `AppsTestServer`, defines a calendar call ID and arguments, mounts a three-step SSE sequence consisting of the parent tool-call response, a Guardian review response containing a JSON allow decision, and a final parent assistant response, then builds a search-capable app test instance with `Feature::ToolCallMcpElicitation` enabled, global reviewer set to `User`, and layered config from `set_calendar_approval_mode_and_default_reviewer(AppToolApproval::Prompt, ApprovalsReviewer::AutoReview)`. After `submit_user_turn(..., AskForApproval::OnRequest, None)`, it waits for either `ElicitationRequest` or `TurnComplete` and asserts the route completed without surfacing a user elicitation. It then searches recorded HTTP requests for the Guardian review prompt, asserts that request mentions `calendar_create_event` and `Lunch`, fetches the recorded app tool call, and asserts the title argument is `Lunch`.
+**Data flow**: The test scripts three fake model interactions: the main model asks to create a calendar event, the Guardian reviewer returns an allow decision, and the main model then finishes. It configures the global reviewer one way but sets the apps default reviewer to automatic review. After submitting the turn, it expects not to receive a user approval prompt; instead, the turn continues through Guardian review. It then inspects the fake model requests to confirm a Guardian request was made and inspects the fake apps server to confirm the calendar event tool call ran with the expected title.
 
-**Call relations**: This scenario shares setup structure with the previous test but diverges after submission: instead of resolving an elicitation, it proves no user-facing approval request occurs and that Guardian was consulted. It still ends by inspecting the recorded app tool call on the apps server.
+**Call relations**: This test depends on set_calendar_approval_mode_and_default_reviewer to create the routing condition it cares about, and on submit_user_turn to begin the run. The scripted response sequence stands in for both the parent model and the Guardian review. The final checks connect those pieces: no user-facing elicitation event appears, a Guardian prompt is found, and the calendar app receives the approved call.
 
 *Call graph*: calls 6 internal fn (mount, recorded_apps_tool_call_by_call_id, search_capable_apps_builder, mount_sse_sequence, start_mock_server, submit_user_turn); 7 external calls (assert!, assert_eq!, wait_for_event, json!, to_string, skip_if_no_network!, vec!).
 
@@ -2433,11 +2459,11 @@ async fn apps_default_auto_review_routes_actual_mcp_approval_to_guardian() -> Re
 async fn mcp_tool_call_metadata_records_prior_request_user_input_tool() -> Result<()>
 ```
 
-**Purpose**: Verifies that if the model first invokes the built-in `request_user_input` tool and only later calls an app-backed MCP tool, the later app tool call is marked as having requested user input during the turn. It covers metadata propagation from tool-mediated user questioning rather than approval elicitation.
+**Purpose**: This test verifies that if the model uses the request-user-input tool earlier in a turn, a later calendar app tool call includes metadata saying user input was requested during that same turn. It covers the explicit user-question path, not just approval prompts.
 
-**Data flow**: This async test skips without network, starts the mock Responses server and `AppsTestServer`, defines one call ID for `request_user_input` and another for the later calendar call, builds JSON arguments for both, mounts a three-response SSE sequence where the first response calls `request_user_input`, the second calls the calendar MCP tool, and the third returns `done`, then builds a search-capable app test instance with calendar approval mode set to `Approve`. It submits a plan-mode user turn with `AskForApproval::Never`, waits for `EventMsg::RequestUserInput`, asserts the request call ID, submits `Op::UserInputAnswer` containing a `HashMap` answer selecting `Yes (Recommended)`, waits for `McpToolCallBegin` for the calendar call and then `TurnComplete`, fetches the recorded app tool call by the calendar call ID, and asserts `_meta/x-codex-turn-metadata/user_input_requested_during_turn` is `true`.
+**Data flow**: The test scripts the model to first call request_user_input, then call the calendar create-event tool, and finally finish. It configures calendar app calls as approved so the calendar call itself does not need a separate approval prompt. After submitting a planning-mode turn, it waits for the user-input request, sends back a selected answer, waits for the calendar tool call and turn completion, and then reads the recorded calendar app request. The expected output is a recorded app call whose metadata includes user_input_requested_during_turn set to true.
 
-**Call relations**: This is the non-approval metadata scenario. It uses `submit_user_turn` to start in plan mode, then responds to the emitted `RequestUserInput` event before allowing the later MCP tool call to proceed, finally validating metadata on the recorded downstream app invocation.
+**Call relations**: This test uses set_calendar_approval_mode to keep the calendar call from being blocked by approval, and submit_user_turn to start the scripted turn. It then plays the role of the user by answering the RequestUserInput event. Once Codex proceeds to the app call, the fake apps server provides the evidence that the earlier user-input request was remembered and attached to the later MCP tool call.
 
 *Call graph*: calls 6 internal fn (mount, recorded_apps_tool_call_by_call_id, search_capable_apps_builder, mount_sse_sequence, start_mock_server, submit_user_turn); 9 external calls (from, assert_eq!, wait_for_event, wait_for_event_match, json!, to_string, skip_if_no_network!, unreachable!, vec!).
 
@@ -2447,9 +2473,9 @@ These suites verify lifecycle hooks around prompts and tool execution, including
 
 ### `core/tests/suite/hooks.rs`
 
-`test` · `cross-cutting / hook execution around turns and tools`
+`test` · `test execution`
 
-This large test file is the main integration harness for the hooks subsystem. It defines many fixture writers that emit Python hook scripts plus `hooks.json` or `config.toml` entries under a temporary Codex home, covering `SessionStart`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `PreToolUse`, and `PostToolUse`. Those scripts either log JSON payloads, return structured `hookSpecificOutput` such as `additionalContext`, `permissionDecision`, `updatedInput`, or `decision`, or deliberately exit with status 2 so stderr becomes user-visible feedback. Complementary readers parse the resulting JSONL logs back into `serde_json::Value` for assertions, and small helpers extract hook prompt fragments from rollout files or request bodies, detect spilled-output paths, and normalize code-mode custom tool output. The tests then drive realistic conversations through mocked SSE responses, including streaming SSE for queued-prompt behavior and code-mode custom tool execution. They verify persistence of stop-hook continuation prompts across retries and resumes, ordering of session-start versus prompt-submit hooks, spilling of oversized hook context to disk, permission-request auto-approval without user prompts, pre-tool blocking and input rewriting for shell, unified exec, apply_patch, local function tools, and nested code-mode exec, plus post-tool context injection and output replacement after execution. Additional cases cover plugin-discovered hooks, merged hook sources from `hooks.json` and `config.toml`, alias matching such as `Write` and `Edit`, and session-based exec completion via `write_stdin`. The central invariant throughout is that hook decisions and context become visible at the correct protocol boundary—before execution, after execution, or on the next model turn—while preserving transcript materialization and turn identity.
+Hooks are like checkpoint guards around a Codex conversation. A hook can run when a session starts, when the user submits a prompt, before a tool runs, after a tool finishes, when permission is needed, or when the assistant is about to stop. This test file builds many fake Codex sessions, fake model responses, and temporary hook scripts to prove those checkpoints behave correctly. It writes small Python hook programs into temporary home directories, marks those hooks as trusted, starts mock model servers, then submits turns and inspects what happened. The tests cover blocking prompts, retrying after stop hooks, adding extra developer context, spilling very large hook output to files, approving permission requests, changing tool inputs before execution, hiding tool results after execution, and plugin-supplied hooks. They also check details that matter for safety and history: blocked commands must not run, rewritten commands must replace originals, hook logs must contain the right tool and turn identifiers, and resumed or compacted conversations must preserve hook-supplied context. Without tests like these, hook behavior could silently regress, which would be risky because hooks sit directly on the boundary between model decisions, user policy, local tools, and external scripts.
 
 #### Function details
 
@@ -2459,11 +2485,11 @@ This large test file is the main integration harness for the hooks subsystem. It
 fn restrictive_workspace_write_profile() -> PermissionProfile
 ```
 
-**Purpose**: Builds a workspace-write permission profile with restricted network and no temp-directory exceptions. It is used where tests want write capability but still force approval-sensitive behavior.
+**Purpose**: Creates a strict permission profile for tests where writing is limited to the workspace and network access is restricted. Tests use it to force Codex to ask for approval when a tool tries to write outside allowed places.
 
-**Data flow**: Calls `PermissionProfile::workspace_write_with(&[], NetworkSandboxPolicy::Restricted, true, true)` and returns the resulting `PermissionProfile`.
+**Data flow**: It takes no input. It builds a workspace-write permission profile with restricted network rules and extra exclusions for temporary directories, then returns that profile to the caller.
 
-**Call relations**: This helper is used by the apply-patch permission-request test to supply a consistent restrictive baseline profile.
+**Call relations**: The apply-patch permission test calls this when it wants a patch operation to need approval. The helper delegates the actual profile construction to the shared permission-profile builder.
 
 *Call graph*: calls 1 internal fn (workspace_write_with); called by 1 (permission_request_hook_allows_apply_patch_with_write_alias).
 
@@ -2474,11 +2500,11 @@ fn restrictive_workspace_write_profile() -> PermissionProfile
 fn network_workspace_write_profile() -> PermissionProfile
 ```
 
-**Purpose**: Builds a workspace-write permission profile with network enabled and temp-directory access allowed. It supports tests that exercise managed network approval flows.
+**Purpose**: Creates a permission profile for tests where workspace writing is allowed and network access is enabled. It is used when a test needs Codex to exercise network approval behavior.
 
-**Data flow**: Calls `PermissionProfile::workspace_write_with(&[], NetworkSandboxPolicy::Enabled, false, false)` and returns the resulting `PermissionProfile`.
+**Data flow**: It takes no input. It asks the shared permission-profile builder for a workspace-write setup with network access turned on and temporary-directory exclusions disabled, then returns the profile.
 
-**Call relations**: The network approval test calls this helper to create the runtime profile that should trigger network-specific permission handling.
+**Call relations**: The network permission-request test calls this before submitting a turn. The returned profile becomes part of the test session's permission setup.
 
 *Call graph*: calls 1 internal fn (workspace_write_with); called by 1 (permission_request_hook_allows_network_approval_without_prompt).
 
@@ -2489,11 +2515,11 @@ fn network_workspace_write_profile() -> PermissionProfile
 fn code_mode_custom_tool_output_text(output_item: &Value) -> String
 ```
 
-**Purpose**: Normalizes the heterogeneous JSON shapes used for code-mode custom tool outputs into a single text string. It supports assertions across string, array, and object output encodings.
+**Purpose**: Extracts readable text from a code-mode custom tool output, even though that output may be stored in several JSON shapes. This lets tests compare what the code-mode tool actually saw.
 
-**Data flow**: Reads the `output` field from a `serde_json::Value`. If it is a string, it clones and returns it; if it is an array, it concatenates each item's `text` field with newlines; if it is an object, it returns its `content` string or empty string; otherwise it panics with the unexpected shape.
+**Data flow**: It receives a JSON output item. It looks for an output field that may be a string, a list of text spans, or an object with content, converts that to one string, and returns it. If the shape is unexpected, it fails the test.
 
-**Call relations**: The code-mode pre-tool and post-tool tests call this helper after extracting custom tool output so they can assert on a plain string regardless of serialization form.
+**Call relations**: Code-mode tests call this after a mocked model uses a custom tool. It turns the raw output record into plain text so the tests can check whether a hook blocked, rewrote, or hid a tool result.
 
 *Call graph*: called by 3 (assert_post_tool_use_blocks_code_mode_tool_result, pre_tool_use_block_rejects_code_mode_tool_promise_before_execution, pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution); 2 external calls (get, panic!).
 
@@ -2504,11 +2530,11 @@ fn code_mode_custom_tool_output_text(output_item: &Value) -> String
 fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
 ```
 
-**Purpose**: Creates a modified OpenAI provider definition that points at the test server and disables websocket support. It forces compaction-related tests down the non-OpenAI provider path.
+**Purpose**: Builds a test model-provider configuration that talks to the mock server but is treated as a non-websocket provider. This is useful for tests that need a predictable HTTP-style provider setup.
 
-**Data flow**: Clones the built-in `openai` provider from `built_in_model_providers(None)`, changes `name`, sets `base_url` to `<server>/v1`, sets `supports_websockets = false`, and returns the modified `ModelProviderInfo`.
+**Data flow**: It receives the mock server. It copies the built-in OpenAI provider settings, changes the name and base URL to point at the mock server, disables websocket support, and returns the modified provider.
 
-**Call relations**: The compact-session-start test injects this provider into config so compaction behavior is exercised under the intended provider assumptions.
+**Call relations**: The compact-session hook test uses this provider so the fake model requests go to the test server while still exercising the provider configuration path.
 
 *Call graph*: called by 1 (compact_session_start_hook_records_additional_context_for_next_turn); 2 external calls (built_in_model_providers, format!).
 
@@ -2519,11 +2545,11 @@ fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
 fn trust_plugin_hooks(config: &mut Config, plugin_hook_sources: Vec<PluginHookSource>)
 ```
 
-**Purpose**: Enables hooks, discovers hook definitions from plugin sources, asserts discovery succeeded, and marks those hooks as trusted in config. It is the plugin-specific counterpart to the generic trust helpers.
+**Purpose**: Enables hook support for plugin hooks and marks the discovered plugin hooks as trusted for the test. This avoids interactive trust prompts and lets the test focus on hook behavior.
 
-**Data flow**: Mutates the provided `Config` by enabling `Feature::CodexHooks`, calling `codex_hooks::list_hooks` with `feature_enabled: true`, the config layer stack, and the supplied `plugin_hook_sources`, asserting the discovered hook list is non-empty, then passing the discovered hooks into `trust_hooks(config, listed.hooks)`.
+**Data flow**: It receives a mutable test configuration and plugin hook sources. It turns on the hooks feature, asks the hook system to list hooks from those sources, checks that at least one hook was found, and records those hooks as trusted in the config.
 
-**Call relations**: Only the plugin hook integration test uses this helper, because that test needs to synthesize plugin hook sources and then trust the discovered plugin-defined hooks.
+**Call relations**: Plugin-hook setup uses this helper before building the test Codex instance. It bridges plugin hook discovery and the generic test support helper that trusts hooks.
 
 *Call graph*: calls 1 internal fn (trust_hooks); 3 external calls (assert!, list_hooks, default).
 
@@ -2534,11 +2560,11 @@ fn trust_plugin_hooks(config: &mut Config, plugin_hook_sources: Vec<PluginHookSo
 fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()>
 ```
 
-**Purpose**: Writes a Python stop-hook fixture and matching `hooks.json` that blocks a configurable number of times before allowing completion. The script also logs each invocation to JSONL.
+**Purpose**: Writes a temporary Stop hook script and hooks.json file for tests. The generated hook can block one or more assistant completions and ask Codex to retry with specific continuation prompts.
 
-**Data flow**: Given a home directory and a slice of block prompts, it computes script and log paths, serializes the prompts to JSON, formats a Python script that reads stdin JSON, appends the payload to `stop_hook_log.jsonl`, counts prior invocations, prints a blocking decision with the corresponding prompt while prompts remain, and otherwise prints a passing `systemMessage`. It writes the script file and a `hooks.json` containing a `Stop` hook group invoking that script, then returns `Result<()>`.
+**Data flow**: It receives a temporary home directory and a list of prompts. It writes a Python script that logs each hook input, blocks while prompts remain, and otherwise allows the stop. It also writes hooks.json pointing Codex at that script.
 
-**Call relations**: Several stop-hook tests call this fixture writer during `with_pre_build_hook` setup so the runtime will execute the generated hook during turn completion.
+**Call relations**: Stop-hook tests install this fixture before building Codex. Later, those tests read the hook log and inspect model requests to confirm the continuation prompts were preserved.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2549,11 +2575,11 @@ fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()>
 fn write_parallel_stop_hooks(home: &Path, prompts: &[&str]) -> Result<()>
 ```
 
-**Purpose**: Creates multiple stop-hook scripts that can each independently block and contribute continuation prompts. It is used to test accumulation of multiple hook prompt fragments in one retry cycle.
+**Purpose**: Creates several Stop hooks that can all block the same stop event. This tests how Codex combines multiple continuation prompts from multiple hooks.
 
-**Data flow**: Iterates over the supplied prompts with indices, writes one Python script per prompt that logs stdin payload and either emits `decision: block` with that prompt or a `systemMessage` when `stop_hook_active` is already true, collects corresponding hook entries, wraps them in a `Stop` hook group JSON object, writes `hooks.json`, and returns `Result<()>`.
+**Data flow**: It receives a home directory and prompts. For each prompt it writes a separate Python hook script, then writes one hooks.json file that lists all those scripts under the Stop event.
 
-**Call relations**: The multiple-blocking-stop-hooks test uses this helper to install more than one stop hook and verify both prompts persist in request and rollout history.
+**Call relations**: The multiple-blocking-stop-hooks test installs these scripts and then checks that the next model request and rollout history contain all hook prompt fragments in order.
 
 *Call graph*: 3 external calls (join, write, json!).
 
@@ -2568,11 +2594,11 @@ fn write_user_prompt_submit_hook(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a `UserPromptSubmit` hook fixture that logs every prompt and blocks one specific prompt while attaching additional context. It models prompt rejection before the model sees the text.
+**Purpose**: Writes a UserPromptSubmit hook that can block one specific user prompt and attach extra context for the next turn. This lets tests verify that blocked user text is not sent to the model.
 
-**Data flow**: Computes script and log paths, serializes the blocked prompt and additional context, formats a Python script that appends each stdin payload to `user_prompt_submit_hook_log.jsonl` and, when `payload['prompt']` matches the blocked prompt, prints a JSON block decision with `hookSpecificOutput.additionalContext`. It writes the script and a `hooks.json` registering it under `UserPromptSubmit`.
+**Data flow**: It receives a home directory, the prompt to block, and extra context text. It writes a Python script that logs every input and, when the prompt matches, returns a block decision plus hook-specific additional context. It also writes hooks.json for the event.
 
-**Call relations**: The blocked-prompt tests install this fixture so they can verify blocked prompts are omitted from model input while their additional context persists to later turns.
+**Call relations**: User-prompt tests install this fixture before submitting accepted and blocked prompts. They later read the log and inspect model requests to ensure only accepted prompts move forward.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2583,11 +2609,11 @@ fn write_user_prompt_submit_hook(
 fn write_session_start_and_user_prompt_submit_order_hooks(home: &Path) -> Result<()>
 ```
 
-**Purpose**: Creates paired `SessionStart` and `UserPromptSubmit` hooks that log minimal identifying fields to a shared file. It is used to assert hook ordering on the first turn.
+**Purpose**: Writes two hooks that record when SessionStart and UserPromptSubmit run. It is used to prove the first session-start hook happens before the first prompt-submit hook.
 
-**Data flow**: Builds script paths for both hooks and a shared `hook_order_log.jsonl`, formats one Python script that logs `hook_event_name` and `source` from session-start payloads and another that logs `hook_event_name` and `prompt` from prompt-submit payloads, writes both scripts, writes a `hooks.json` registering each under its event, and returns `Result<()>`.
+**Data flow**: It receives a home directory. It writes two Python scripts that append small JSON records to the same log file, then writes hooks.json registering one script for each event.
 
-**Call relations**: The ordering test installs these fixtures and later reads the shared log to confirm `SessionStart` ran before `UserPromptSubmit`.
+**Call relations**: The hook-order test installs these scripts, submits one turn, then reads the shared log to verify the observed order.
 
 *Call graph*: 4 external calls (join, format!, write, json!).
 
@@ -2603,11 +2629,11 @@ fn write_pre_tool_use_hook(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a configurable `PreToolUse` hook fixture that can deny, attach context, deny with context, or fail via exit status 2. It also optionally scopes itself with a matcher.
+**Purpose**: Writes a configurable PreToolUse hook, which runs before a tool executes. The generated hook can deny a tool, add context, return both, or fail with exit code 2 to simulate hook feedback.
 
-**Data flow**: Given a home path, optional matcher, mode, and reason, it computes script and log paths, serializes mode and reason, formats a Python script that logs stdin payload to `pre_tool_use_hook_log.jsonl` and then emits one of several JSON responses depending on mode (`permissionDecision: deny`, `additionalContext`, both, or stderr plus exit 2). It builds a hook group JSON object, inserts `matcher` when provided, writes the script and `hooks.json`, and returns `Result<()>`.
+**Data flow**: It receives a home directory, an optional matcher, a mode, and a reason or context string. It writes a Python script that logs the incoming hook payload and prints a JSON response based on the chosen mode, then writes hooks.json for PreToolUse.
 
-**Call relations**: Many pre-tool tests use this fixture writer to install the exact hook behavior they want to observe before shell, exec, apply_patch, or local function execution.
+**Call relations**: Many tests install this fixture before asking the model to call tools. The resulting hook output decides whether the test command runs, is blocked, or adds information to the next model request.
 
 *Call graph*: 6 external calls (join, String, format!, write, json!, to_string).
 
@@ -2622,11 +2648,11 @@ fn write_updating_pre_tool_use_hook(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a `PreToolUse` hook fixture that always allows execution but rewrites the tool input to a supplied JSON value. It is the basis for input-rewrite tests.
+**Purpose**: Writes a PreToolUse hook that allows a tool call but replaces its input first. This tests hook-based rewriting, such as changing a shell command or patch before it runs.
 
-**Data flow**: Computes script and log paths, serializes `updated_input`, formats a Python script that logs stdin payload and prints `hookSpecificOutput` with `permissionDecision: allow` and `updatedInput`, writes the script and a `hooks.json` containing a matcher-scoped `PreToolUse` hook, and returns `Result<()>`.
+**Data flow**: It receives a home directory, a matcher, and the replacement input as JSON. It writes a Python script that logs the original input and prints an allow decision containing updatedInput, then registers it in hooks.json.
 
-**Call relations**: The rewrite tests for shell, exec, apply_patch, and local function tools install this fixture so the runtime should execute the rewritten input instead of the original.
+**Call relations**: Rewrite tests use this fixture before tool execution. They then verify that the original action did not happen, the rewritten action did happen, and the hook log still captured the original request.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2644,11 +2670,11 @@ fn write_pre_tool_use_hook_toml(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a `PreToolUse` hook fixture configured through `config.toml` instead of `hooks.json`. It lets tests verify TOML-defined hooks and source merging.
+**Purpose**: Writes a PreToolUse hook using config.toml instead of hooks.json. This checks that hooks defined in the main configuration file work like hooks defined in a separate hooks file.
 
-**Data flow**: Creates script and log paths, serializes mode and reason, formats a Python script that logs stdin payload and either emits a deny decision or exits 2, constructs a TOML config string enabling hooks and defining `[[hooks.PreToolUse]]` plus nested command hook entries with an optional matcher line, writes the script and `config.toml`, and returns `Result<()>`.
+**Data flow**: It receives file names, an optional matcher, a mode, and a reason. It writes a Python hook script, then writes a config.toml that enables hooks and registers that script.
 
-**Call relations**: The config-TOML and merged-source tests use this helper to ensure hooks loaded from TOML behave the same as hooks from `hooks.json`.
+**Call relations**: Configuration-source tests install this fixture to verify config.toml hooks can block tools and can coexist with hooks.json hooks.
 
 *Call graph*: 4 external calls (join, format!, write, to_string).
 
@@ -2664,11 +2690,11 @@ fn write_permission_request_hook(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a `PermissionRequest` hook fixture that can auto-allow, auto-deny with a message, or fail via exit status 2. It logs every invocation for later inspection.
+**Purpose**: Writes a PermissionRequest hook, which can approve or deny a permission request before Codex asks the user. This lets tests check policy automation around risky actions.
 
-**Data flow**: Computes script and log paths, serializes mode and reason, formats a Python script that appends stdin payload to `permission_request_hook_log.jsonl` and prints a `hookSpecificOutput.decision` object for allow or deny modes, or writes stderr and exits 2. It optionally inserts a matcher into the hook group, writes the script and `hooks.json`, and returns `Result<()>`.
+**Data flow**: It receives a home directory, optional matcher, mode, and reason. It writes a Python script that logs the permission request and prints an allow or deny decision, or exits with feedback. It then writes hooks.json for PermissionRequest.
 
-**Call relations**: This is the underlying fixture writer for all permission-request hook tests and is wrapped by `install_allow_permission_request_hook` for the common allow case.
+**Call relations**: The allow-permission helper calls this with the standard Bash matcher. Permission-request tests use the generated hook to bypass or inspect approval flows.
 
 *Call graph*: called by 1 (install_allow_permission_request_hook); 6 external calls (join, String, format!, write, json!, to_string).
 
@@ -2679,11 +2705,11 @@ fn write_permission_request_hook(
 fn install_allow_permission_request_hook(home: &Path) -> Result<()>
 ```
 
-**Purpose**: Installs the standard allow-all permission-request hook used by multiple tests. It hardcodes the Bash matcher and the nominal allow reason constant.
+**Purpose**: Installs the common permission-request fixture that automatically allows Bash permission requests. It keeps repeated tests from spelling out the same setup.
 
-**Data flow**: Calls `write_permission_request_hook(home, Some(PERMISSION_REQUEST_HOOK_MATCHER), "allow", PERMISSION_REQUEST_ALLOW_REASON)` and returns its `Result<()>`.
+**Data flow**: It receives a home directory. It calls the lower-level writer with the standard Bash matcher, allow mode, and a placeholder reason, then returns that result.
 
-**Call relations**: Several permission-request tests call this convenience wrapper during setup instead of specifying the common allow fixture manually.
+**Call relations**: Several permission-request tests use this helper during test setup. It hands off the actual file writing to write_permission_request_hook.
 
 *Call graph*: calls 1 internal fn (write_permission_request_hook).
 
@@ -2699,11 +2725,11 @@ fn write_post_tool_use_hook(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a configurable `PostToolUse` hook fixture that can attach context, block with a decision, stop with `continue: false`, or fail via exit status 2. It logs the full post-tool payload for assertions.
+**Purpose**: Writes a PostToolUse hook, which runs after a tool has produced a result. The generated hook can add context, replace the result with a reason, stop continuation, or fail with feedback.
 
-**Data flow**: Given home, optional matcher, mode, and reason, it computes script and log paths, serializes mode and reason, formats a Python script that logs stdin payload to `post_tool_use_hook_log.jsonl` and emits one of several JSON responses depending on mode, optionally inserts a matcher into the hook group, writes the script and `hooks.json`, and returns `Result<()>`.
+**Data flow**: It receives a home directory, optional matcher, mode, and reason or context. It writes a Python script that logs the tool input and response, prints behavior based on the mode, and registers the hook in hooks.json.
 
-**Call relations**: All post-tool tests use this fixture writer to synthesize the exact post-execution behavior they want to validate.
+**Call relations**: Post-tool tests install this fixture before triggering shell, exec, or apply_patch tool calls. They then inspect the next model request and hook log to confirm the post-tool effect.
 
 *Call graph*: 6 external calls (join, String, format!, write, json!, to_string).
 
@@ -2714,11 +2740,11 @@ fn write_post_tool_use_hook(
 fn write_logging_pre_and_blocking_post_tool_use_hooks(home: &Path, feedback: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a paired Bash `PreToolUse` logger and `PostToolUse` hook that always fails with stderr feedback after execution. It is tailored for exec-session tests that need both pre- and post-hook logs.
+**Purpose**: Writes a pair of hooks: one PreToolUse hook that only logs and one PostToolUse hook that blocks the final result. It is designed for tests of long-running exec sessions.
 
-**Data flow**: Computes script and log paths for both hooks, serializes the feedback string, formats a pre-hook Python script that only logs stdin payload and a post-hook script that logs payload, writes feedback to stderr, and exits 2. It writes both scripts plus a `hooks.json` registering matcher-scoped `PreToolUse` and `PostToolUse` hooks for `Bash`, then returns `Result<()>`.
+**Data flow**: It receives a home directory and feedback text. It writes two Python scripts and a hooks.json file. The pre hook records the starting command; the post hook records the completed output, writes feedback to stderr, and exits with code 2.
 
-**Call relations**: The exec-session completion-via-`write_stdin` test installs this combined fixture so it can assert both the initial pre-hook input and the final post-hook output.
+**Call relations**: The exec-session completion test uses these hooks to confirm the post hook runs only after the session has finished and can replace the result returned to the model.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2729,11 +2755,11 @@ fn write_logging_pre_and_blocking_post_tool_use_hooks(home: &Path, feedback: &st
 fn write_session_start_hook_recording_transcript(home: &Path) -> Result<()>
 ```
 
-**Purpose**: Writes a `SessionStart` hook that records the provided transcript path and whether that path already exists on disk. It verifies transcript materialization timing.
+**Purpose**: Writes a SessionStart hook that records whether the transcript file path exists. This proves Codex has created the transcript before running startup hooks.
 
-**Data flow**: Computes script and log paths, formats a Python script that reads stdin JSON, extracts `transcript_path`, computes an `exists` boolean using `Path(transcript_path).exists()`, appends that record to `session_start_hook_log.jsonl`, writes the script and a `hooks.json` registering it under `SessionStart`, and returns `Result<()>`.
+**Data flow**: It receives a home directory. It writes a Python script that reads transcript_path from stdin, checks whether that file exists, logs the result, and registers the script in hooks.json.
 
-**Call relations**: The transcript-path test installs this fixture and later reads the log to confirm the runtime materialized the transcript before invoking the hook.
+**Call relations**: The transcript-path test installs this fixture, submits a turn, and reads the log to verify the hook saw a real transcript file.
 
 *Call graph*: 4 external calls (join, format!, write, json!).
 
@@ -2744,11 +2770,11 @@ fn write_session_start_hook_recording_transcript(home: &Path) -> Result<()>
 fn write_session_start_hook_with_context(home: &Path, additional_context: &str) -> Result<()>
 ```
 
-**Purpose**: Writes a simple `SessionStart` hook that emits additional developer context without reading stdin. It is used to test context injection and spill behavior.
+**Purpose**: Writes a SessionStart hook that returns additional developer context. This checks that startup hook context is included in the next model request.
 
-**Data flow**: Computes the script path, serializes the additional context string, formats a Python script that prints `hookSpecificOutput` with `hookEventName: SessionStart` and the supplied `additionalContext`, writes the script and a `hooks.json` registering it, and returns `Result<()>`.
+**Data flow**: It receives a home directory and context text. It writes a Python script that prints hook-specific additionalContext and writes hooks.json to register it.
 
-**Call relations**: The large-context spill test uses this fixture to inject a very large session-start context into the next model request.
+**Call relations**: The large session-start context test installs this fixture, then checks whether Codex includes the context directly or spills it to a file when it is too large.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2762,11 +2788,11 @@ fn write_compact_session_start_hook_with_context(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes a `SessionStart` hook that matches only `compact` source events, logs its payload, and emits additional context. It supports tests around compaction-triggered session restarts.
+**Purpose**: Writes a SessionStart hook that only matches compacted sessions and adds context after compaction. This tests that compact-specific startup hooks do not run at ordinary startup.
 
-**Data flow**: Computes script and log paths, serializes the additional context, formats a Python script that logs stdin payload to `session_start_hook_log.jsonl` and prints `hookSpecificOutput.additionalContext`, writes the script and a `hooks.json` with a `SessionStart` matcher of `compact`, and returns `Result<()>`.
+**Data flow**: It receives a home directory and context text. It writes a Python script that logs the hook input, returns additional context, and writes hooks.json with a SessionStart matcher of compact.
 
-**Call relations**: The compact-session-start test installs this fixture so only the post-compaction session-start event contributes developer context.
+**Call relations**: The compact-session test installs this fixture, triggers compaction, and verifies the hook context appears on the next turn rather than the initial turn.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2781,11 +2807,11 @@ fn write_resume_and_compact_session_start_hook_with_context(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes one script shared by two `SessionStart` matcher groups, returning different additional context for `resume` and `compact` sources. It lets tests verify both hooks run in sequence on resumed threads that compact.
+**Purpose**: Writes SessionStart hooks for both resume and compact sources. It lets tests prove both kinds of session-start context are carried into a resumed conversation that also auto-compacts.
 
-**Data flow**: Computes script and log paths, serializes the resume and compact context strings, formats a Python script that logs stdin payload and selects context from a `contexts` map keyed by `payload['source']`, writes the script and a `hooks.json` containing two `SessionStart` groups with matchers `resume` and `compact`, and returns `Result<()>`.
+**Data flow**: It receives a home directory plus separate resume and compact context strings. It writes one Python script that chooses context based on the hook payload source, then registers that script twice with different matchers.
 
-**Call relations**: The resumed-thread compaction test installs this fixture to assert that both resume and compact contexts are injected before the next model turn.
+**Call relations**: The resume-plus-compact test installs this fixture before the initial run. After resuming, it reads logs and model requests to confirm both matched hooks ran.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -2796,11 +2822,11 @@ fn write_resume_and_compact_session_start_hook_with_context(
 fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>>
 ```
 
-**Purpose**: Extracts persisted hook prompt fragments from a rollout JSONL string by scanning user message content. It is a rollout-side counterpart to request inspection.
+**Purpose**: Extracts hook-generated prompt fragments from a rollout transcript. A rollout is the saved conversation history, one JSON line at a time.
 
-**Data flow**: Takes rollout text, iterates over non-empty lines, parses each as `RolloutLine`, filters for `RolloutItem::ResponseItem(ResponseItem::Message { role: "user", content, .. })`, scans `ContentItem::InputText` entries, passes each text through `parse_hook_prompt_fragment`, collects the fragment text strings into a `Vec<String>`, and returns `Result<Vec<String>>`.
+**Data flow**: It receives rollout text. It parses each non-empty line as a rollout record, looks for user message input text, extracts hook prompt fragments, and returns their plain text in order.
 
-**Call relations**: The multi-block stop-hook test calls this helper after reading the rollout file to verify continuation prompts were persisted into history.
+**Call relations**: Stop-hook tests use this after reading the saved rollout file. It confirms that continuation prompts from hooks were persisted, not just sent once.
 
 *Call graph*: calls 1 internal fn (parse_hook_prompt_fragment); called by 1 (stop_hook_can_block_multiple_times_in_same_turn); 2 external calls (new, from_str).
 
@@ -2813,11 +2839,11 @@ fn request_hook_prompt_texts(
 ) -> Vec<String>
 ```
 
-**Purpose**: Extracts hook prompt fragments from the user messages of a captured outbound request. It is used to verify what continuation prompts were actually sent back to the model.
+**Purpose**: Extracts hook-generated prompt fragments from a model request. This is the request-side version of the rollout extractor.
 
-**Data flow**: Reads all user message texts from a `ResponsesRequest`, runs each through `parse_hook_prompt_fragment`, keeps only successful parses, maps them to fragment text, and returns the collected `Vec<String>`.
+**Data flow**: It receives a captured test request. It collects user input texts from the request, keeps only those that parse as hook prompt fragments, and returns the fragment text.
 
-**Call relations**: The stop-hook spill test uses this helper to inspect the second request and confirm the continuation prompt was included, possibly via a spill reference.
+**Call relations**: Stop-hook tests call this on captured mock-server requests to verify retry prompts are included in the next model call.
 
 *Call graph*: calls 1 internal fn (message_input_texts); called by 1 (stop_hook_spills_large_continuation_prompt).
 
@@ -2828,11 +2854,11 @@ fn request_hook_prompt_texts(
 fn spilled_hook_output_path(text: &str) -> Option<&str>
 ```
 
-**Purpose**: Finds the spill-file path embedded in a hook-generated message that says `Full hook output saved to: ...`. It supports tests for oversized hook output spilling.
+**Purpose**: Finds the file path mentioned in a message that says large hook output was saved to disk. This is used when hook text is too big to include directly.
 
-**Data flow**: Scans the lines of the input text and returns the suffix of the first line beginning with `Full hook output saved to: `, or `None` if no such line exists.
+**Data flow**: It receives text. It scans each line for the fixed prefix 'Full hook output saved to: ' and returns the path after that prefix if present.
 
-**Call relations**: Several spill-related tests call this helper after locating a developer or tool-output message that mentions truncation, then read the referenced file to verify the full content.
+**Call relations**: Large-output tests use this after inspecting model-visible text. They then read the referenced file to confirm the full hook output was preserved.
 
 *Call graph*: called by 4 (post_tool_use_spills_large_feedback_message, pre_tool_use_hook_spills_large_additional_context, session_start_hook_spills_large_additional_context, stop_hook_spills_large_continuation_prompt).
 
@@ -2843,11 +2869,11 @@ fn spilled_hook_output_path(text: &str) -> Option<&str>
 fn read_stop_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads and parses the stop-hook JSONL log into structured values. It is a specialized log reader for stop-hook assertions.
+**Purpose**: Reads the JSON log written by the Stop hook fixture. This lets tests inspect exactly what Codex sent to Stop hooks.
 
-**Data flow**: Reads `<home>/stop_hook_log.jsonl` to string, filters out blank lines, parses each remaining line as `serde_json::Value`, collects them into a vector, and returns `Result<Vec<Value>>`.
+**Data flow**: It receives the test home directory. It reads stop_hook_log.jsonl, parses each non-empty line as JSON, and returns the list of hook input records.
 
-**Call relations**: The repeated-stop-hook test uses this helper to inspect turn IDs and `stop_hook_active` flags across multiple invocations.
+**Call relations**: The multiple-stop-blocks test calls this after a turn finishes to check turn IDs and stop_hook_active values.
 
 *Call graph*: called by 1 (stop_hook_can_block_multiple_times_in_same_turn); 2 external calls (join, read_to_string).
 
@@ -2858,11 +2884,11 @@ fn read_stop_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 fn read_pre_tool_use_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads the standard pre-tool-use hook log from the Codex home directory. It centralizes the log path used by many pre-tool tests.
+**Purpose**: Reads the standard PreToolUse hook log from the test home. It gives tests a structured view of pre-tool hook payloads.
 
-**Data flow**: Builds `<home>/pre_tool_use_hook_log.jsonl` and delegates parsing to `read_hook_inputs_from_log`, returning its `Result<Vec<Value>>`.
+**Data flow**: It receives the home directory, points to pre_tool_use_hook_log.jsonl, and delegates parsing to the shared log reader. The output is a list of JSON records.
 
-**Call relations**: Most pre-tool tests call this helper after execution to inspect the exact hook payload the runtime supplied.
+**Call relations**: Many pre-tool tests call this after tool execution or blocking. It relies on read_hook_inputs_from_log for the common file parsing work.
 
 *Call graph*: calls 1 internal fn (read_hook_inputs_from_log); called by 12 (assert_pre_tool_use_rewrites_bash_surface, post_tool_use_blocks_when_exec_session_completes_via_write_stdin, pre_tool_use_block_rejects_code_mode_tool_promise_before_execution, pre_tool_use_blocks_apply_patch_before_execution, pre_tool_use_blocks_apply_patch_with_write_alias, pre_tool_use_blocks_exec_command_before_execution, pre_tool_use_blocks_local_function_tool_before_execution, pre_tool_use_blocks_shell_command_before_execution, pre_tool_use_merges_hooks_json_and_config_toml, pre_tool_use_rewrites_apply_patch_before_execution (+2 more)); 1 external calls (join).
 
@@ -2873,11 +2899,11 @@ fn read_pre_tool_use_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 fn read_permission_request_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads and parses the permission-request hook JSONL log. It is the raw input source for permission-request assertions.
+**Purpose**: Reads the PermissionRequest hook log. Tests use it to check what information a permission hook received before approval was granted or denied.
 
-**Data flow**: Reads `<home>/permission_request_hook_log.jsonl`, filters blank lines, parses each line as `serde_json::Value`, collects them, and returns `Result<Vec<Value>>`.
+**Data flow**: It receives a home directory. It reads permission_request_hook_log.jsonl, skips blank lines, parses each line as JSON, and returns the records.
 
-**Call relations**: The higher-level permission-request assertion helpers call this function before checking tool name, command, and omitted fields.
+**Call relations**: The single-permission-request assertion helper calls this, then validates the one expected hook payload.
 
 *Call graph*: called by 1 (assert_single_permission_request_hook_input_for_tool); 2 external calls (join, read_to_string).
 
@@ -2893,11 +2919,11 @@ fn assert_permission_request_hook_input(
 )
 ```
 
-**Purpose**: Asserts that one permission-request hook payload has the expected tool name, command, optional description, and absence of unrelated fields. It codifies the expected schema for these hook inputs.
+**Purpose**: Checks that one PermissionRequest hook input has the expected basic shape. It protects tests from accidentally accepting extra or missing permission fields.
 
-**Data flow**: Reads fields from a `serde_json::Value` and asserts exact equality for `hook_event_name`, `tool_name`, `tool_input.command`, and `tool_input.description`, while also asserting that `approval_attempt`, `sandbox_permissions`, `additional_permissions`, `justification`, `host`, and `protocol` are absent.
+**Data flow**: It receives a hook input JSON value, expected tool name, command, and optional description. It compares those fields and asserts that unrelated approval or network fields are absent.
 
-**Call relations**: This helper is called by `assert_single_permission_request_hook_input_for_tool` after the log has been loaded and cardinality checked.
+**Call relations**: The single-permission-request helper calls this after reading a log entry. It is the common validator used by permission-request tests.
 
 *Call graph*: called by 1 (assert_single_permission_request_hook_input_for_tool); 2 external calls (assert!, assert_eq!).
 
@@ -2912,11 +2938,11 @@ fn assert_single_permission_request_hook_input(
 ) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Convenience wrapper that asserts exactly one permission-request hook input for the default Bash tool. It reduces duplication in shell and exec permission-request tests.
+**Purpose**: Checks that exactly one Bash permission-request hook input was logged. It is a convenience wrapper for the common Bash case.
 
-**Data flow**: Delegates to `assert_single_permission_request_hook_input_for_tool(home, "Bash", command, description)` and returns the resulting parsed hook inputs.
+**Data flow**: It receives the home directory, expected command, and optional description. It passes those values along with tool name Bash to the more general helper and returns the parsed hook records.
 
-**Call relations**: Several permission-request tests call this wrapper when the expected tool name is the default Bash surface.
+**Call relations**: Several permission-request tests call this after running a shell or exec command. It delegates all validation to assert_single_permission_request_hook_input_for_tool.
 
 *Call graph*: calls 1 internal fn (assert_single_permission_request_hook_input_for_tool); called by 4 (permission_request_hook_allows_network_approval_without_prompt, permission_request_hook_allows_shell_command_without_user_approval, permission_request_hook_sees_raw_exec_command_input, permission_request_hook_sees_retry_context_after_sandbox_denial).
 
@@ -2932,11 +2958,11 @@ fn assert_single_permission_request_hook_input_for_tool(
 ) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Loads permission-request hook inputs, asserts there is exactly one, and validates its contents for a specific tool name. It combines cardinality and schema checks.
+**Purpose**: Checks that exactly one permission-request hook input exists for a named tool and that its fields match expectations.
 
-**Data flow**: Calls `read_permission_request_hook_inputs(home)`, asserts the resulting vector length is 1, passes the sole entry to `assert_permission_request_hook_input` with the expected tool name, command, and description, and returns the parsed vector.
+**Data flow**: It receives the home directory, expected tool name, command, and optional description. It reads the hook log, asserts there is one entry, validates that entry, and returns the log records.
 
-**Call relations**: This helper underpins both the generic wrapper and the apply-patch permission-request test, which needs a non-Bash tool name.
+**Call relations**: The Bash wrapper and apply_patch permission test use this. It combines log reading with the lower-level field validator.
 
 *Call graph*: calls 2 internal fn (assert_permission_request_hook_input, read_permission_request_hook_inputs); called by 2 (assert_single_permission_request_hook_input, permission_request_hook_allows_apply_patch_with_write_alias); 1 external calls (assert_eq!).
 
@@ -2947,11 +2973,11 @@ fn assert_single_permission_request_hook_input_for_tool(
 fn read_post_tool_use_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads the standard post-tool-use hook log from the Codex home directory. It centralizes the path used by post-tool assertions.
+**Purpose**: Reads the standard PostToolUse hook log from the test home. Tests use it to inspect what Codex reported after a tool finished.
 
-**Data flow**: Builds `<home>/post_tool_use_hook_log.jsonl` and delegates parsing to `read_hook_inputs_from_log`, returning `Result<Vec<Value>>`.
+**Data flow**: It receives the home directory, builds the path to post_tool_use_hook_log.jsonl, and delegates parsing to the shared log reader. It returns parsed JSON entries.
 
-**Call relations**: All post-tool tests call this helper to inspect the hook payload, especially `tool_response` and `tool_input.command`.
+**Call relations**: Post-tool tests call this after checking model output. It shares parsing behavior with pre-tool and hook-order log readers.
 
 *Call graph*: calls 1 internal fn (read_hook_inputs_from_log); called by 8 (assert_post_tool_use_blocks_code_mode_tool_result, post_tool_use_block_decision_replaces_shell_command_output_with_reason, post_tool_use_blocks_when_exec_session_completes_via_write_stdin, post_tool_use_continue_false_replaces_shell_command_output_with_stop_reason, post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedback, post_tool_use_records_additional_context_for_apply_patch, post_tool_use_records_additional_context_for_shell_command, post_tool_use_records_apply_patch_context_with_edit_alias); 1 external calls (join).
 
@@ -2962,11 +2988,11 @@ fn read_post_tool_use_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 fn read_hook_inputs_from_log(log_path: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Generic JSONL hook-log reader used by multiple hook types and custom log filenames. It parses each non-empty line into `serde_json::Value`.
+**Purpose**: Parses a JSON-lines hook log file into JSON values. JSON-lines means one JSON object per line, which is convenient for append-only test logs.
 
-**Data flow**: Reads the specified log path to string, filters blank lines, parses each line as JSON, collects the values into a vector, and returns `Result<Vec<Value>>`, attaching the log path to read errors.
+**Data flow**: It receives a log path. It reads the file, skips blank lines, parses each line as JSON, and returns the collected records or an error with file context.
 
-**Call relations**: This is the shared parser behind pre-tool, post-tool, hook-order, plugin, and config-TOML log inspections.
+**Call relations**: Several specialized log readers and plugin/config tests use this helper so they do not repeat the same parsing code.
 
 *Call graph*: called by 6 (plugin_pre_tool_use_blocks_shell_command_before_execution, pre_tool_use_blocks_shell_when_defined_in_config_toml, pre_tool_use_merges_hooks_json_and_config_toml, read_hook_order_inputs, read_post_tool_use_hook_inputs, read_pre_tool_use_hook_inputs); 1 external calls (read_to_string).
 
@@ -2977,11 +3003,11 @@ fn read_hook_inputs_from_log(log_path: &Path) -> Result<Vec<serde_json::Value>>
 fn read_session_start_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads and parses the session-start hook JSONL log. It supports assertions about startup, resume, and compact hook invocations.
+**Purpose**: Reads the SessionStart hook log from the test home. It lets tests verify startup, resume, and compact hook payloads.
 
-**Data flow**: Reads `<home>/session_start_hook_log.jsonl`, filters blank lines, parses each line as `serde_json::Value`, collects them, and returns `Result<Vec<Value>>`.
+**Data flow**: It receives a home directory. It reads session_start_hook_log.jsonl, parses non-empty lines as JSON, and returns the records.
 
-**Call relations**: Session-start-related tests call this helper after turns or resumes to inspect `source`, `transcript_path`, and other logged fields.
+**Call relations**: Session-start tests use this after turns, compaction, or resume to check which source triggered the hook and what transcript information was present.
 
 *Call graph*: called by 3 (compact_session_start_hook_records_additional_context_for_next_turn, resumed_thread_runs_resume_then_compact_session_start_hooks, session_start_hook_sees_materialized_transcript_path); 2 external calls (join, read_to_string).
 
@@ -2992,11 +3018,11 @@ fn read_session_start_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 fn read_user_prompt_submit_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads and parses the user-prompt-submit hook JSONL log. It is used to verify prompt ordering, blocking, and turn ID propagation.
+**Purpose**: Reads the UserPromptSubmit hook log. This shows which user prompts were examined by the hook, including blocked queued prompts.
 
-**Data flow**: Reads `<home>/user_prompt_submit_hook_log.jsonl`, filters blank lines, parses each line as `serde_json::Value`, collects them, and returns `Result<Vec<Value>>`.
+**Data flow**: It receives a home directory. It reads user_prompt_submit_hook_log.jsonl, parses each non-empty line as JSON, and returns the records.
 
-**Call relations**: The blocked-prompt tests call this helper to confirm both blocked and accepted prompts were seen by the hook and share the same turn ID when queued.
+**Call relations**: Prompt-submit tests call this after submitting accepted and blocked prompts to confirm the hook saw each prompt with consistent turn IDs.
 
 *Call graph*: called by 2 (blocked_queued_prompt_does_not_strand_earlier_accepted_prompt, blocked_user_prompt_submit_persists_additional_context_for_next_turn); 2 external calls (join, read_to_string).
 
@@ -3007,11 +3033,11 @@ fn read_user_prompt_submit_hook_inputs(home: &Path) -> Result<Vec<serde_json::Va
 fn read_hook_order_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads the shared hook-order log used by the session-start versus prompt-submit ordering test. It is a thin path-specific wrapper.
+**Purpose**: Reads the shared hook-order log used by the ordering test. It keeps that test focused on event order rather than file parsing.
 
-**Data flow**: Builds `<home>/hook_order_log.jsonl`, delegates to `read_hook_inputs_from_log`, and returns the parsed vector.
+**Data flow**: It receives a home directory, points to hook_order_log.jsonl, and uses the shared log parser. It returns the ordered JSON records.
 
-**Call relations**: Only the ordering test uses this helper after installing the paired order-recording hooks.
+**Call relations**: The SessionStart-before-UserPromptSubmit test calls this after one turn to compare the recorded event names.
 
 *Call graph*: calls 1 internal fn (read_hook_inputs_from_log); called by 1 (session_start_runs_before_user_prompt_submit_on_first_turn); 1 external calls (join).
 
@@ -3022,11 +3048,11 @@ fn read_hook_order_inputs(home: &Path) -> Result<Vec<serde_json::Value>>
 fn ev_message_item_done(id: &str, text: &str) -> Value
 ```
 
-**Purpose**: Constructs a synthetic SSE event representing completion of an assistant message item with output text. It supports streaming-SSE tests.
+**Purpose**: Builds a fake streaming event that says an assistant message item is complete. Tests use it to simulate model streaming without a real model.
 
-**Data flow**: Takes an item id and text, builds a JSON value with `type: response.output_item.done` and a nested assistant message item containing one `output_text` content span, and returns that `Value`.
+**Data flow**: It receives a message ID and text. It creates a JSON event with type response.output_item.done and embeds the assistant message content, then returns that JSON value.
 
-**Call relations**: The queued-prompt streaming test uses this helper when assembling chunked SSE bodies for the first response.
+**Call relations**: Streaming tests include this event in mock server chunks so Codex believes a model message has finished.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3037,11 +3063,11 @@ fn ev_message_item_done(id: &str, text: &str) -> Value
 fn sse_event(event: Value) -> String
 ```
 
-**Purpose**: Wraps a single JSON event into an SSE-formatted string. It is a convenience helper for streaming chunk construction.
+**Purpose**: Wraps one JSON event as a server-sent event stream body. Server-sent events are a simple text format used for streaming model responses.
 
-**Data flow**: Places the provided `Value` into a one-element vector, passes it to `sse`, and returns the resulting event-stream string.
+**Data flow**: It receives one JSON event. It puts it in a one-item list and passes it to the shared SSE formatter, returning the formatted string.
 
-**Call relations**: The queued-prompt test uses this helper to build individual streaming chunks around synthetic events.
+**Call relations**: The queued-prompt streaming test uses this to build individual chunks for the fake streaming server.
 
 *Call graph*: calls 1 internal fn (sse); 1 external calls (vec!).
 
@@ -3052,11 +3078,11 @@ fn sse_event(event: Value) -> String
 fn request_message_input_texts(body: &[u8], role: &str) -> Vec<String>
 ```
 
-**Purpose**: Extracts plain input-text spans for a given role directly from a raw request body. It is used when tests capture raw HTTP requests instead of higher-level request wrappers.
+**Purpose**: Extracts message input text for a given role from a raw captured request body. It is used when the test server records bytes rather than a richer request helper.
 
-**Data flow**: Parses the byte slice as JSON, navigates `input` array items of type `message` with the requested `role`, flattens their `content` arrays, filters spans of type `input_text`, collects each `text` string into a `Vec<String>`, and returns it.
+**Data flow**: It receives raw request bytes and a role name such as user. It parses the bytes as JSON, walks the input messages, filters by role and input_text spans, and returns the text strings.
 
-**Call relations**: The queued-prompt streaming test uses this helper on raw server requests to verify which queued prompts reached the second model request.
+**Call relations**: The queued-prompt test uses this on captured streaming-server requests to verify the accepted queued prompt was sent and the blocked one was not.
 
 *Call graph*: called by 1 (blocked_queued_prompt_does_not_strand_earlier_accepted_prompt); 1 external calls (from_slice).
 
@@ -3067,11 +3093,11 @@ fn request_message_input_texts(body: &[u8], role: &str) -> Vec<String>
 async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that a stop hook can block the same turn multiple times, injecting successive continuation prompts that persist in both subsequent requests and rollout history. It also checks that all stop-hook invocations share one turn ID and correctly toggle `stop_hook_active`.
+**Purpose**: Tests that a Stop hook can block more than once during a single user turn and that Codex retries with accumulating continuation prompts.
 
-**Data flow**: After the network guard, it mounts three sequential assistant responses, installs a stop-hook fixture with two block prompts, builds the test instance, submits one turn, then inspects the three captured requests to assert the second request contains the first continuation prompt and the third request contains both prompts. It reads stop-hook log inputs with `read_stop_hook_inputs`, asserts there are three entries, extracts and compares `turn_id` values, checks `stop_hook_active` values `[false, true, true]`, reads the rollout file text, extracts persisted hook prompt fragments with `rollout_hook_prompt_texts`, and asserts both prompts are present.
+**Data flow**: It sets up three fake model responses and a Stop hook that blocks twice. It submits one prompt, then checks that three model requests happened, hook prompts accumulated, hook inputs kept one turn ID, and rollout history saved both prompts.
 
-**Call relations**: This is the main stop-hook persistence test. It depends on `write_stop_hook` for setup and on both request-side and rollout-side helper readers to validate the runtime’s retry behavior.
+**Call relations**: This test uses the Stop hook writer, request-log helpers, stop-hook log reader, and rollout extractor to follow the same continuation prompt from hook output to model request to saved history.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_stop_hook_inputs, rollout_hook_prompt_texts); 5 external calls (assert!, assert_eq!, read_to_string, skip_if_no_network!, vec!).
 
@@ -3082,11 +3108,11 @@ async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()>
 async fn session_start_hook_sees_materialized_transcript_path() -> Result<()>
 ```
 
-**Purpose**: Checks that the transcript file path passed to a `SessionStart` hook is non-empty and already exists on disk when the hook runs. It validates transcript materialization ordering.
+**Purpose**: Tests that SessionStart hooks receive a transcript_path that is not empty and already exists on disk.
 
-**Data flow**: It mounts a one-shot assistant response, installs the transcript-recording session-start hook, builds the test instance, submits a turn, reads the session-start hook log with `read_session_start_hook_inputs`, asserts there is one entry, asserts `transcript_path` is present and non-empty, and asserts `exists == true`.
+**Data flow**: It installs a hook that logs transcript existence, runs one turn against a mock response, reads the hook log, and asserts the path was present and materialized.
 
-**Call relations**: This test uses `write_session_start_hook_recording_transcript` during setup and then validates the logged payload after a normal turn.
+**Call relations**: The test depends on the transcript-recording hook fixture and the session-start log reader to verify startup timing.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, read_session_start_hook_inputs); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -3097,11 +3123,11 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()>
 async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that `SessionStart` hooks run before `UserPromptSubmit` hooks on the first turn of a session. It checks both event order and the key payload fields each hook receives.
+**Purpose**: Tests that SessionStart runs before UserPromptSubmit on the first turn. This matters because startup context should be ready before the prompt is processed.
 
-**Data flow**: It mounts a one-shot assistant response, installs paired order-recording hooks, builds the test instance, submits `hello`, reads the shared order log with `read_hook_order_inputs`, asserts the logged `hook_event_name` sequence is `[SessionStart, UserPromptSubmit]`, then asserts the first entry has `source == startup` and the second has `prompt == hello`.
+**Data flow**: It installs two logging hooks, submits one prompt, reads the shared order log, and checks that SessionStart with source startup appears before UserPromptSubmit with the prompt text.
 
-**Call relations**: This test relies on `write_session_start_and_user_prompt_submit_order_hooks` to create a shared log that captures relative ordering across two hook types.
+**Call relations**: The test uses the ordering fixture and hook-order reader to observe the event sequence inside Codex.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, read_hook_order_inputs); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -3112,11 +3138,11 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
 async fn session_start_hook_spills_large_additional_context() -> Result<()>
 ```
 
-**Purpose**: Checks that oversized `SessionStart` additional context is truncated in the developer message and spilled to a file whose contents preserve the full text. It validates the spill mechanism for hook-generated context.
+**Purpose**: Tests that very large SessionStart additional context is written to a file instead of being fully inserted into the model request.
 
-**Data flow**: It mounts a one-shot assistant response, creates a very large repeated context string, installs a session-start hook that emits that context, builds the test instance, submits a turn, inspects the captured request’s developer messages to find one containing a spill path via `spilled_hook_output_path`, asserts the message mentions token truncation, reads the referenced file, and asserts its contents equal the original large context.
+**Data flow**: It creates a long context string, installs a startup hook that returns it, submits a turn, finds the spill-path message in the developer input, and verifies the file contains the full context.
 
-**Call relations**: This test uses `write_session_start_hook_with_context` for setup and `spilled_hook_output_path` to locate the spill file referenced in the outbound request.
+**Call relations**: The test uses the session-start context fixture and spilled-path helper to confirm Codex protects request size while preserving complete hook output.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, spilled_hook_output_path); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3127,11 +3153,11 @@ async fn session_start_hook_spills_large_additional_context() -> Result<()>
 async fn pre_tool_use_hook_spills_large_additional_context() -> Result<()>
 ```
 
-**Purpose**: Verifies that oversized `PreToolUse` additional context is spilled to disk and referenced from the follow-up developer message. It ensures pre-tool hook context uses the same truncation/spill path as session-start context.
+**Purpose**: Tests that large PreToolUse additional context is spilled to a file before the follow-up model request.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `shell_command` and then completes, creates a large repeated pre-tool context string, installs a matcher-scoped pre-tool hook in `context` mode, builds the test instance, submits a turn, inspects the second captured request’s developer messages for one containing a spill path, asserts the message mentions token truncation, reads the spill file, and asserts it contains the full original context.
+**Data flow**: It mocks a shell tool call followed by a normal assistant response, installs a pre-tool hook returning long context, runs a turn, then checks the second request for a spill notice and verifies the saved file.
 
-**Call relations**: This test depends on `write_pre_tool_use_hook` to generate the large context and on `spilled_hook_output_path` to recover the saved file path from the follow-up request.
+**Call relations**: The test combines the pre-tool hook writer, mock response sequence, and spill-path helper to validate large context handling around tool calls.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, spilled_hook_output_path); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3142,11 +3168,11 @@ async fn pre_tool_use_hook_spills_large_additional_context() -> Result<()>
 async fn compact_session_start_hook_records_additional_context_for_next_turn() -> Result<()>
 ```
 
-**Purpose**: Checks that a `SessionStart` hook matching `compact` injects additional context only after compaction and before the next model turn. It also verifies the hook log records `source: compact`.
+**Purpose**: Tests that a SessionStart hook with a compact matcher runs after compaction and supplies context to the next normal turn.
 
-**Data flow**: It mounts three sequential assistant responses, creates a non-OpenAI model provider, installs a compact-only session-start hook with fixed context, configures the test instance to use that provider and trusted hooks, submits an initial turn, submits `Op::Compact`, waits for `TurnComplete`, submits a second turn, then inspects the three captured requests. It asserts the first request’s developer messages do not contain the compact context, while the third request’s developer messages do. Finally it reads the session-start hook log and asserts there is one entry with `source == compact`.
+**Data flow**: It installs a compact-only hook, submits an initial turn, triggers compaction, waits for completion, submits another turn, and checks only the post-compact request contains the hook context.
 
-**Call relations**: This test combines `non_openai_model_provider`, `write_compact_session_start_hook_with_context`, and `wait_for_event` to validate hook behavior across an explicit compaction boundary.
+**Call relations**: This test uses the non-OpenAI provider helper, compact hook fixture, event waiting, and session-start log reader to cover the compaction path.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, non_openai_model_provider, read_session_start_hook_inputs); 5 external calls (assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3157,11 +3183,11 @@ async fn compact_session_start_hook_records_additional_context_for_next_turn() -
 async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result<()>
 ```
 
-**Purpose**: Verifies that resuming a thread and then auto-compacting it triggers both `resume` and `compact` session-start hooks, and that both contexts are injected before the next model turn. It also checks the hook log records both sources in order.
+**Purpose**: Tests that resuming a conversation can run resume and compact SessionStart hooks and include both contexts in the next model request.
 
-**Data flow**: It mounts three responses: an initial turn completed with token count above the auto-compact limit, a compaction output item carrying remote summary text, and a post-resume assistant response. It installs a fixture that emits different contexts for `resume` and `compact`, configures auto-compact token limit, builds an initial session, records its home and rollout path, submits the first turn, then builds a resumed session from the same home and rollout path and submits another turn. It inspects the third captured request’s developer messages to assert both resume and compact contexts are present, then reads the session-start hook log from the resumed home and asserts the recorded `source` values are `['resume', 'compact']`.
+**Data flow**: It starts a session that exceeds the auto-compact token limit, saves its rollout path, resumes it with hooks trusted, submits another turn, and checks the final request and hook log for resume then compact sources.
 
-**Call relations**: This test spans two `test_codex` instances—initial and resumed—and uses the shared session-start fixture to prove both resume and compact hooks fire during resumed-thread startup.
+**Call relations**: The test uses the resume/compact hook fixture, mock model sequence, and session-start log reader to exercise lifecycle behavior across process-like resume.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_session_start_hook_inputs); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3172,11 +3198,11 @@ async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result
 async fn stop_hook_spills_large_continuation_prompt() -> Result<()>
 ```
 
-**Purpose**: Checks that an oversized stop-hook continuation prompt is truncated in the request and spilled to a file containing the full prompt. It validates spill behavior for user hook prompt fragments.
+**Purpose**: Tests that a very large Stop-hook continuation prompt is stored in a file while a short notice is sent in the next model request.
 
-**Data flow**: It mounts two assistant responses, constructs a very large continuation prompt by repeating a phrase 800 times, installs a stop hook that blocks once with that prompt, builds the test instance, submits a turn, inspects the second captured request with `request_hook_prompt_texts`, asserts there is one hook prompt text containing `tokens truncated`, extracts the spill path with `spilled_hook_output_path`, reads the file, and asserts it equals the original continuation prompt.
+**Data flow**: It installs a Stop hook with a long retry prompt, runs a turn that needs one retry, extracts the hook prompt from the second request, finds the spill path, and verifies the file content.
 
-**Call relations**: This test uses `write_stop_hook` for setup and combines request-side hook-fragment extraction with spill-path detection to validate large continuation prompt handling.
+**Call relations**: The test uses Stop hook setup, request prompt extraction, and spill-path detection to confirm large stop feedback is preserved safely.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, request_hook_prompt_texts, spilled_hook_output_path); 5 external calls (assert!, assert_eq!, skip_if_no_network!, repeat_n, vec!).
 
@@ -3187,11 +3213,11 @@ async fn stop_hook_spills_large_continuation_prompt() -> Result<()>
 async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()>
 ```
 
-**Purpose**: Verifies that a stop-hook continuation prompt persisted in rollout history survives a session resume and is sent again on the next turn. It guards against losing hook-generated user context across resumes.
+**Purpose**: Tests that a Stop-hook continuation prompt saved in history still appears after the conversation is resumed.
 
-**Data flow**: It mounts two initial assistant responses, installs a stop hook that blocks once with `FIRST_CONTINUATION_PROMPT`, builds the initial session, records its home and rollout path, submits a turn, then mounts a one-shot response for the resumed session, resumes from the saved home and rollout path, submits another turn, and inspects the resumed request with `request_hook_prompt_texts` to assert it contains exactly the persisted continuation prompt.
+**Data flow**: It runs an initial session where a Stop hook causes a retry, captures the rollout path, resumes the session, submits a new prompt, and checks the resumed request still contains the earlier hook prompt.
 
-**Call relations**: This test uses `write_stop_hook` during the initial session and then relies on `test_codex().resume(...)` plus request inspection to prove the prompt was restored from persisted history.
+**Call relations**: This test connects Stop-hook persistence with the resume flow, using mock responses before and after resume.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, mount_sse_sequence, sse, start_mock_server, test_codex); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -3202,11 +3228,11 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
 async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -> Result<()>
 ```
 
-**Purpose**: Checks that when multiple stop hooks block in parallel, both continuation prompts are preserved in the next request and in rollout history in order. It validates aggregation of multiple hook prompt fragments.
+**Purpose**: Tests that multiple Stop hooks blocking the same stop event produce multiple prompt fragments and preserve their order.
 
-**Data flow**: It mounts two assistant responses, installs parallel stop hooks with `FIRST_CONTINUATION_PROMPT` and `SECOND_CONTINUATION_PROMPT`, builds the test instance, submits a turn, inspects the second request with `request_hook_prompt_texts` to assert both prompts are present in order, reads the rollout file text, extracts persisted hook prompt fragments with `rollout_hook_prompt_texts`, and asserts the same ordered pair is stored there.
+**Data flow**: It installs several Stop hooks, submits one prompt, checks the second model request contains both fragments, then reads the rollout and confirms the same ordered fragments were saved.
 
-**Call relations**: This test depends on `write_parallel_stop_hooks` for setup and uses both request and rollout helpers to verify prompt aggregation.
+**Call relations**: The test uses the parallel Stop hook fixture, request inspection, and rollout extraction to verify combined hook feedback.
 
 *Call graph*: calls 3 internal fn (mount_sse_sequence, start_mock_server, test_codex); 4 external calls (assert_eq!, read_to_string, skip_if_no_network!, vec!).
 
@@ -3217,11 +3243,11 @@ async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -
 async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that a blocked `UserPromptSubmit` hook prevents the blocked prompt from reaching the model but persists its additional context into the next accepted turn. It also checks both hook invocations are logged with non-empty turn IDs.
+**Purpose**: Tests that when a UserPromptSubmit hook blocks a prompt, its additional context is kept for the next accepted prompt.
 
-**Data flow**: It mounts a one-shot assistant response for the second turn, installs a prompt-submit hook that blocks `blocked first prompt` and emits `BLOCKED_PROMPT_CONTEXT`, builds the test instance, submits the blocked prompt and then `second prompt`, inspects the captured request to assert developer messages contain the blocked prompt context, user messages do not contain the blocked prompt, and user messages do contain the second prompt. It then reads the prompt-submit hook log, asserts there are two entries with prompts `blocked first prompt` and `second prompt`, and asserts every logged `turn_id` is non-empty.
+**Data flow**: It installs a hook that blocks one exact prompt, submits that prompt and then another prompt, and checks the model request includes the extra context but not the blocked user text.
 
-**Call relations**: This test uses `write_user_prompt_submit_hook` for setup and then validates both request shaping and hook-log persistence after one blocked and one accepted prompt.
+**Call relations**: The test uses the user-prompt hook fixture and log reader to confirm both prompts were inspected while only the accepted one reached the model.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, read_user_prompt_submit_hook_inputs); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3232,11 +3258,11 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
 async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Result<()>
 ```
 
-**Purpose**: Ensures that when prompts are queued during a streaming response, a later blocked queued prompt does not prevent an earlier accepted queued prompt from being sent once the current turn completes. It also checks all queued prompt-submit hook invocations share the same turn ID.
+**Purpose**: Tests that if prompts are queued while a response is streaming, a later blocked prompt does not prevent an earlier accepted queued prompt from running.
 
-**Data flow**: It builds a streaming SSE server whose first response emits partial assistant output and delays completion behind a oneshot gate, and whose second response handles the accepted queued prompt. It installs a prompt-submit hook that blocks `blocked queued prompt`, builds a streaming test instance, submits `initial prompt`, waits for an `AgentMessageContentDelta`, then submits `accepted queued prompt` and `blocked queued prompt` while the first turn is still open. After a short sleep it releases the completion gate, polls the server until two requests have arrived, extracts user texts from the second raw request with `request_message_input_texts`, asserts the accepted queued prompt is present and the blocked one is absent, then reads the prompt-submit hook log and asserts the three logged prompts are `initial prompt`, `accepted queued prompt`, and `blocked queued prompt`, all with the same non-empty `turn_id`.
+**Data flow**: It starts a streaming fake server, submits an initial prompt, waits until output begins, queues one accepted prompt and one blocked prompt, releases the stream gate, and verifies the second request contains only the accepted queued prompt.
 
-**Call relations**: This is the most orchestration-heavy prompt-submit test: it uses `start_streaming_sse_server`, `ev_message_item_done`, `sse_event`, and raw request inspection to validate queue handling under concurrent prompt submission.
+**Call relations**: This test uses the streaming SSE server, raw request text extractor, and user-prompt hook log reader to cover queue ordering under asynchronous streaming.
 
 *Call graph*: calls 4 internal fn (start_streaming_sse_server, test_codex, read_user_prompt_submit_hook_inputs, request_message_input_texts); 11 external calls (default, from_millis, from_secs, assert!, assert_eq!, wait_for_event, channel, skip_if_no_network!, sleep, timeout (+1 more)).
 
@@ -3247,11 +3273,11 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
 async fn permission_request_hook_allows_shell_command_without_user_approval() -> Result<()>
 ```
 
-**Purpose**: Checks that a permission-request hook can auto-allow a shell command that would otherwise require user approval, and that the command actually executes. It also verifies the hook input omits `tool_use_id` and includes a non-empty `turn_id`.
+**Purpose**: Tests that a PermissionRequest hook can approve a shell command so Codex does not need user approval.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `shell_command` to remove a temp marker file and then completes, installs the standard allow permission-request hook, builds the test instance, seeds the marker file, submits a turn with `AskForApproval::OnRequest` and `PermissionProfile::Disabled`, inspects the second request to ensure function-call output exists, asserts the marker file no longer exists, then loads and validates the single permission-request hook input with `assert_single_permission_request_hook_input`, additionally asserting `tool_use_id` is absent and `turn_id` is non-empty.
+**Data flow**: It creates a marker file, installs an allow hook, asks the model to run a command that removes the marker under an approval-required policy, and verifies the marker is gone and the hook input was logged.
 
-**Call relations**: This test uses `install_allow_permission_request_hook` for setup and the shared permission-request assertion helper to validate the hook payload after the runtime bypasses the normal approval prompt.
+**Call relations**: The test uses the standard allow permission hook and single-input assertion helper to prove the hook approval path replaces a user approval prompt.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, assert_single_permission_request_hook_input); 8 external calls (assert!, assert_eq!, format!, write, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3262,11 +3288,11 @@ async fn permission_request_hook_allows_shell_command_without_user_approval() ->
 async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result<()>
 ```
 
-**Purpose**: Verifies that a permission-request hook matching the `Write` alias can auto-allow an `apply_patch` tool call that writes outside the workspace. It confirms both execution and hook payload normalization for apply_patch.
+**Purpose**: Tests that a PermissionRequest hook matching the Write alias can approve an apply_patch operation.
 
-**Data flow**: It mounts a two-step SSE sequence where the model issues an `apply_patch` custom tool call adding a file via a relative path outside the workspace, installs a permission-request hook with matcher `^Write$` in allow mode, builds the test instance, computes the target path, submits a turn with `AskForApproval::OnRequest` and `restrictive_workspace_write_profile()`, inspects the second request’s custom tool output, asserts the target file now exists, and validates the single permission-request hook input for tool `apply_patch` and the original patch text via `assert_single_permission_request_hook_input_for_tool`.
+**Data flow**: It installs a permission hook for Write, uses a restrictive workspace profile so the patch needs approval, runs a patch outside the usual workspace boundary, and checks the file was created.
 
-**Call relations**: This test combines the restrictive profile helper with the tool-specific permission-request assertion helper to prove alias matching works for apply_patch.
+**Call relations**: The test uses the restrictive profile helper and the permission-input assertion for apply_patch to verify alias matching.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, assert_single_permission_request_hook_input_for_tool, restrictive_workspace_write_profile); 5 external calls (assert!, assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3277,11 +3303,11 @@ async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result
 async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()>
 ```
 
-**Purpose**: Checks that permission-request hooks for unified exec receive the raw command text and justification as the description field. It also verifies the approved exec command actually runs.
+**Purpose**: Tests that PermissionRequest hooks see the intended command and justification for the unified exec_command tool.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `exec_command` with `cmd`, `login`, `sandbox_permissions: require_escalated`, and `justification`, installs the standard allow permission-request hook, enables unified exec in config, builds the test instance, seeds a temp marker file, submits a turn with `AskForApproval::OnRequest` and `PermissionProfile::read_only()`, inspects the second request’s function-call output, asserts the marker file was removed, and validates the single permission-request hook input using the command text and justification string as expected description.
+**Data flow**: It enables the unified exec feature, installs an allow hook, sends an exec_command request with command and justification, and verifies the command executes and the hook log includes the expected description.
 
-**Call relations**: This test uses the common allow hook but custom unified-exec config, then reuses the generic permission-request assertion helper to confirm the hook saw the raw exec input.
+**Call relations**: The test combines feature configuration, the standard allow hook, and the Bash permission assertion helper.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, assert_single_permission_request_hook_input, read_only); 8 external calls (assert!, assert_eq!, format!, write, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3292,11 +3318,11 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()>
 async fn permission_request_hook_allows_network_approval_without_prompt() -> Result<()>
 ```
 
-**Purpose**: Verifies that a permission-request hook can auto-approve managed network access without surfacing an `ExecApprovalRequest` prompt to the user. It also checks the hook sees the synthesized network-access justification.
+**Purpose**: Tests that a PermissionRequest hook can approve a network access request without showing an approval prompt.
 
-**Data flow**: It writes a custom `config.toml` under a temporary home enabling limited network access, mounts a two-step SSE sequence where the model calls `shell_command` that performs an HTTP request, builds a test instance with that home, the allow permission-request hook, managed network requirements bundle, `AskForApproval::OnFailure`, and a network-enabled workspace-write profile. It asserts managed network requirements and proxy config are active, submits the turn, waits until the permission-request hook log file appears, then uses `timeout` around `wait_for_event` to assert no `EventMsg::ExecApprovalRequest` arrives. Finally it validates the single permission-request hook input with the command text and expected description `network-access http://codex-network-test.invalid:80`, then shuts down Codex and waits for `ShutdownComplete`.
+**Data flow**: It configures managed network requirements and network-enabled permissions, installs an allow hook, runs a command that needs network access, waits for the hook log, confirms no approval event appears, and validates the hook input description.
 
-**Call relations**: This test is the network-specific permission-request path: it combines managed network config, the allow hook, and an explicit absence check for approval events to prove the hook bypasses the prompt.
+**Call relations**: The test uses the network profile helper, managed-network test configuration, event waiting, and permission-input assertion to cover network-specific approval.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, assert_single_permission_request_hook_input, network_workspace_write_profile); 14 external calls (clone, new, from_millis, from_secs, new, assert!, managed_network_requirements_loader, wait_for_event, write, json! (+4 more)).
 
@@ -3307,11 +3333,11 @@ async fn permission_request_hook_allows_network_approval_without_prompt() -> Res
 async fn permission_request_hook_sees_retry_context_after_sandbox_denial() -> Result<()>
 ```
 
-**Purpose**: Checks that after an initial sandbox denial, the retry path still invokes the permission-request hook with the original shell command. It verifies the hook participates in escalation after failure.
+**Purpose**: Tests that after a sandbox denial, a permission-request hook sees the retry permission context and can approve the retry.
 
-**Data flow**: On non-Linux targets, it mounts a two-step SSE sequence where the model calls `shell_command` to write a marker file and then completes, installs the standard allow permission-request hook, builds the test instance, removes any stale marker file, submits a turn with `AskForApproval::OnFailure` and `PermissionProfile::read_only()`, inspects the second request’s function-call output, asserts the marker file now contains `retry`, and validates the single permission-request hook input for the original command with no description.
+**Data flow**: It runs a shell command under read-only permissions, lets the first attempt fail due to sandbox limits, uses the hook to approve retry, then checks the command wrote the expected marker file.
 
-**Call relations**: This test exercises the retry-after-denial path rather than initial approval, but still uses the shared allow hook and assertion helper.
+**Call relations**: This platform-limited test uses the standard allow hook and single-input assertion to verify the retry approval path.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, assert_single_permission_request_hook_input, read_only); 6 external calls (assert_eq!, format!, remove_file, json!, skip_if_no_network!, vec!).
 
@@ -3322,11 +3348,11 @@ async fn permission_request_hook_sees_retry_context_after_sandbox_denial() -> Re
 async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook can block a shell command before it runs, surfacing the hook reason and blocked command in tool output. It also checks the hook payload includes transcript and turn identifiers.
+**Purpose**: Tests that a PreToolUse hook can block a shell command before it runs.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `shell_command` to write a temp marker and then completes, installs a Bash-matched pre-tool hook in `json_deny` mode with reason `blocked by pre hook`, builds the test instance, removes any stale marker file, submits a turn with `PermissionProfile::Disabled`, inspects the second request’s function-call output string to assert it contains both the hook reason and `Command: <command>`, asserts the marker file does not exist, then reads the pre-tool hook log and asserts fields including `hook_event_name`, `tool_name`, `tool_use_id`, `tool_input.command`, non-empty existing `transcript_path`, and non-empty `turn_id`.
+**Data flow**: It installs a denying Bash pre-tool hook, prepares a command that would create a marker file, submits a turn, then verifies the tool output reports the hook reason and the marker file was not created.
 
-**Call relations**: This is the baseline pre-tool blocking test. It uses `write_pre_tool_use_hook` for setup and `read_pre_tool_use_hook_inputs` for detailed payload validation after the runtime blocks execution.
+**Call relations**: The test reads the pre-tool hook log afterward to confirm Codex sent the tool name, call ID, command, transcript path, and turn ID to the hook.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 8 external calls (assert!, assert_eq!, format!, remove_file, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3337,11 +3363,11 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()>
 async fn pre_tool_use_records_additional_context_for_shell_command() -> Result<()>
 ```
 
-**Purpose**: Checks that a non-blocking `PreToolUse` hook can attach developer context that appears in the follow-up model request while still allowing the shell command to execute. It validates context propagation without denial.
+**Purpose**: Tests that a PreToolUse hook can add developer context while still allowing a shell command to run.
 
-**Data flow**: It mounts a two-step SSE sequence for a `shell_command` call followed by assistant completion, installs a Bash-matched pre-tool hook in `context` mode with a fixed note, builds the test instance, submits a turn, inspects the second request to assert developer messages contain the note, extracts the function-call output string, and asserts it still contains the shell command’s actual output `pre-tool-output`.
+**Data flow**: It installs a context-returning Bash pre-tool hook, triggers a shell command, and checks the follow-up model request includes the context and the command output.
 
-**Call relations**: This test uses the same fixture writer as the blocking case but changes the mode to `context`, proving the runtime preserves execution while carrying hook context into the next model turn.
+**Call relations**: This test relies on the pre-tool hook fixture and captured mock requests to verify hook context travels into the next model turn.
 
 *Call graph*: calls 3 internal fn (mount_sse_sequence, start_mock_server, test_codex); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3352,11 +3378,11 @@ async fn pre_tool_use_records_additional_context_for_shell_command() -> Result<(
 async fn blocked_pre_tool_use_records_additional_context_for_shell_command() -> Result<()>
 ```
 
-**Purpose**: Verifies that a blocking `PreToolUse` hook can also attach developer context, and that both the context and the block reason are surfaced appropriately. The command itself must not execute.
+**Purpose**: Tests that a blocked PreToolUse hook can still add context for the next model request.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command that would write a marker file, installs a Bash-matched pre-tool hook in `json_deny_with_context` mode using one shared reason/context string, builds the test instance, removes any stale marker, submits a turn with disabled permissions, inspects the second request to assert developer messages contain the context, extracts the function-call output string to assert it contains the block reason, and asserts the marker file was not created.
+**Data flow**: It installs a hook that both denies the command and returns additional context, runs a command that would create a marker, and checks the command did not run while the next request contains the context.
 
-**Call relations**: This test extends the pre-tool context path to the deny case, using the same fixture writer but validating both request-side context injection and execution suppression.
+**Call relations**: The test uses the same pre-tool hook writer but exercises the combined deny-plus-context response shape.
 
 *Call graph*: calls 3 internal fn (mount_sse_sequence, start_mock_server, test_codex); 8 external calls (assert!, assert_eq!, format!, remove_file, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3367,11 +3393,11 @@ async fn blocked_pre_tool_use_records_additional_context_for_shell_command() -> 
 fn slug(self) -> &'static str
 ```
 
-**Purpose**: Returns a stable slug string identifying whether a rewrite test is exercising `exec_command` or `shell_command`. It is used to derive call IDs and marker filenames.
+**Purpose**: Gives a short text label for the Bash-like tool surface being tested. The label is used in IDs and file names.
 
-**Data flow**: Matches on `self` and returns either `exec-command` or `shell-command` as a `&'static str`.
+**Data flow**: It receives either ExecCommand or ShellCommand as self. It returns the matching static string, exec-command or shell-command.
 
-**Call relations**: The shared rewrite assertion helper calls this method to parameterize request IDs, prompts, and filesystem markers by surface.
+**Call relations**: The shared Bash rewrite assertion calls this to build readable call IDs and marker names for both tool variants.
 
 *Call graph*: called by 1 (assert_pre_tool_use_rewrites_bash_surface).
 
@@ -3382,11 +3408,11 @@ fn slug(self) -> &'static str
 fn tool_call(self, call_id: &str, command_text: &str) -> Result<Value>
 ```
 
-**Purpose**: Builds the appropriate mocked function-call SSE event for the selected Bash surface. It abstracts over the argument key difference between `exec_command` and `shell_command`.
+**Purpose**: Builds the correct fake model tool-call event for either shell_command or exec_command. This lets one shared test cover both surfaces.
 
-**Data flow**: Given `self`, a `call_id`, and `command_text`, it matches on the surface and returns a JSON event from `ev_function_call` using tool name `exec_command` with `{cmd: ...}` or `shell_command` with `{command: ...}`, serializing the argument object to string.
+**Data flow**: It receives the surface, call ID, and command text. It wraps the command under the right JSON field, creates a function-call event, and returns it.
 
-**Call relations**: The shared rewrite assertion helper uses this method when mounting the first SSE response so the same test logic can target both surfaces.
+**Call relations**: The shared Bash rewrite test uses this while setting up the mocked model response sequence.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -3397,11 +3423,11 @@ fn tool_call(self, call_id: &str, command_text: &str) -> Result<Value>
 fn original_command(self, marker: &Path) -> String
 ```
 
-**Purpose**: Constructs the original shell command string that writes `original` into a marker file for the selected surface. It gives the rewrite tests a known side effect to suppress.
+**Purpose**: Creates the original command text that would write an 'original' marker. It gives rewrite tests a visible sign if the wrong command ran.
 
-**Data flow**: Formats `printf original > <marker>` using the provided path and returns the resulting `String` for either surface.
+**Data flow**: It receives the surface and a marker path. It formats a shell command that writes 'original' to that path and returns the command string.
 
-**Call relations**: The shared rewrite assertion helper calls this to generate the command that should appear in hook input but should not actually execute after rewriting.
+**Call relations**: The shared Bash rewrite assertion calls this before installing the rewriting hook and later checks this command did not execute.
 
 *Call graph*: called by 1 (assert_pre_tool_use_rewrites_bash_surface); 1 external calls (format!).
 
@@ -3412,11 +3438,11 @@ fn original_command(self, marker: &Path) -> String
 fn rewritten_command(self, marker: &Path) -> String
 ```
 
-**Purpose**: Constructs the rewritten shell command string that writes `rewritten` into a marker file for the selected surface. It is the command the hook should substitute in.
+**Purpose**: Creates the replacement command text that should run after a hook rewrite. It gives tests a visible marker for successful rewriting.
 
-**Data flow**: Formats `printf rewritten > <marker>` using the provided path and returns the resulting `String` for either surface.
+**Data flow**: It receives the surface and a marker path. It formats a shell command that writes 'rewritten' to that path and returns the command string.
 
-**Call relations**: The shared rewrite assertion helper uses this to build the `updatedInput` payload supplied by the pre-tool rewrite hook.
+**Call relations**: The shared Bash rewrite assertion calls this to build the updatedInput returned by the pre-tool hook.
 
 *Call graph*: called by 1 (assert_pre_tool_use_rewrites_bash_surface); 1 external calls (format!).
 
@@ -3427,11 +3453,11 @@ fn rewritten_command(self, marker: &Path) -> String
 fn configure(self, config: &mut Config)
 ```
 
-**Purpose**: Applies the configuration needed for the selected Bash surface, always trusting discovered hooks and enabling unified exec when required. It keeps the shared rewrite helper surface-agnostic.
+**Purpose**: Applies the right Codex configuration for the Bash-like surface under test. ExecCommand needs the unified exec feature enabled; ShellCommand does not.
 
-**Data flow**: Mutates the provided `Config` by calling `trust_discovered_hooks(config)` and, when `self` is `ExecCommand`, setting `use_experimental_unified_exec_tool = true` and enabling `Feature::UnifiedExec`.
+**Data flow**: It receives the surface and a mutable config. It trusts discovered hooks, and when the surface is ExecCommand, it enables the experimental unified exec setting and feature flag.
 
-**Call relations**: The shared rewrite assertion helper delegates per-surface config setup to this method before building the test instance.
+**Call relations**: The shared Bash rewrite test passes this as its configuration hook so each surface runs under the needed feature setup.
 
 *Call graph*: calls 1 internal fn (trust_discovered_hooks); 1 external calls (matches!).
 
@@ -3442,11 +3468,11 @@ fn configure(self, config: &mut Config)
 async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) -> Result<()>
 ```
 
-**Purpose**: Shared assertion routine that verifies a `PreToolUse` hook rewrites either `shell_command` or `exec_command` before execution. It confirms only the rewritten command runs and the hook log still records the original input.
+**Purpose**: Shared test logic proving a PreToolUse hook can rewrite either shell_command or exec_command before execution.
 
-**Data flow**: After the network guard, it starts a mock server, derives a slug, call id, original and rewritten marker paths, builds original and rewritten command strings via the `BashRewriteSurface` methods, mounts a two-step SSE sequence whose first response contains the appropriate tool call event from `surface.tool_call`, installs a pre-tool rewrite hook with `updatedInput = { command: rewritten_command }`, configures the test instance via `surface.configure`, removes any stale marker files, submits a turn with disabled permissions, inspects the second request’s function-call output, asserts the original marker does not exist, reads the rewritten marker and asserts it contains `rewritten`, then reads the pre-tool hook log and asserts the logged `tool_input.command` equals the original command.
+**Data flow**: It receives which Bash surface to test. It prepares original and rewritten marker commands, installs a rewriting hook, runs a turn, then checks only the rewritten marker exists and the hook log captured the original command.
 
-**Call relations**: This helper is called by the two concrete Bash-surface rewrite tests. It centralizes all shared setup and assertions while delegating surface-specific differences to the enum methods.
+**Call relations**: The shell-command and exec-command rewrite tests both call this helper, which uses the BashRewriteSurface methods to customize setup.
 
 *Call graph*: calls 7 internal fn (mount_sse_sequence, start_mock_server, test_codex, original_command, rewritten_command, slug, read_pre_tool_use_hook_inputs); called by 2 (pre_tool_use_rewrites_exec_command_before_execution, pre_tool_use_rewrites_shell_command_before_execution); 8 external calls (assert!, assert_eq!, format!, remove_file, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3457,11 +3483,11 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
 async fn pre_tool_use_rewrites_shell_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Runs the shared pre-tool rewrite assertion against the `shell_command` surface. It proves shell-command input rewriting works end to end.
+**Purpose**: Tests the shared rewrite behavior specifically for shell_command. It is a thin wrapper around the shared Bash rewrite assertion.
 
-**Data flow**: Calls `assert_pre_tool_use_rewrites_bash_surface(BashRewriteSurface::ShellCommand)` and returns its `Result<()>`.
+**Data flow**: It passes ShellCommand into the shared assertion and returns that async result.
 
-**Call relations**: This is a thin Tokio test wrapper around the shared rewrite helper for the shell-command case.
+**Call relations**: This test delegates the real setup and checks to assert_pre_tool_use_rewrites_bash_surface.
 
 *Call graph*: calls 1 internal fn (assert_pre_tool_use_rewrites_bash_surface).
 
@@ -3472,11 +3498,11 @@ async fn pre_tool_use_rewrites_shell_command_before_execution() -> Result<()>
 async fn pre_tool_use_rewrites_exec_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Runs the shared pre-tool rewrite assertion against the `exec_command` surface. It proves unified-exec input rewriting works end to end.
+**Purpose**: Tests the shared rewrite behavior specifically for exec_command. It confirms the unified exec path supports pre-tool rewrites.
 
-**Data flow**: Calls `assert_pre_tool_use_rewrites_bash_surface(BashRewriteSurface::ExecCommand)` and returns its `Result<()>`.
+**Data flow**: It passes ExecCommand into the shared assertion and returns that async result.
 
-**Call relations**: This is the exec-command counterpart to the shell rewrite test, delegating entirely to the shared helper.
+**Call relations**: This test delegates to assert_pre_tool_use_rewrites_bash_surface, which enables the needed feature for exec_command.
 
 *Call graph*: calls 1 internal fn (assert_pre_tool_use_rewrites_bash_surface).
 
@@ -3487,11 +3513,11 @@ async fn pre_tool_use_rewrites_exec_command_before_execution() -> Result<()>
 async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook can rewrite a nested `tools.exec_command` call issued from code mode before the nested command executes. The code-mode tool output should reflect only the rewritten command’s result.
+**Purpose**: Tests that a PreToolUse hook can rewrite a shell command that is nested inside code mode execution.
 
-**Data flow**: It mounts a two-step SSE sequence where the model emits a custom `exec` tool call containing JavaScript that awaits `tools.exec_command({ cmd: original_command })` and prints the result. It installs a Bash-matched pre-tool rewrite hook with `updatedInput.command = rewritten_command`, enables `Feature::CodeMode`, builds the test instance, submits a turn with disabled permissions, extracts the custom tool output text via `code_mode_custom_tool_output_text`, asserts it contains `rewritten-result` and not `original-result`, asserts the original marker file does not exist, reads the rewritten marker file and asserts it contains `rewritten`, then reads the pre-tool hook log and asserts the logged command is the original nested command.
+**Data flow**: It sends a code-mode custom tool call that runs an exec command, installs a hook that rewrites that command, then verifies the code-mode output and marker files show only the rewritten command ran.
 
-**Call relations**: This test extends pre-tool rewriting into nested code-mode tool execution, using the output-normalization helper because custom tool output is not always a plain string.
+**Call relations**: The test uses the code-mode output extractor and pre-tool hook log reader to confirm both the visible result and hook payload.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, code_mode_custom_tool_output_text, read_pre_tool_use_hook_inputs); 8 external calls (new, assert!, assert_eq!, format!, json!, to_string, skip_if_no_network!, vec!).
 
@@ -3502,11 +3528,11 @@ async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() 
 async fn pre_tool_use_block_rejects_code_mode_tool_promise_before_execution() -> Result<()>
 ```
 
-**Purpose**: Checks that a blocking `PreToolUse` hook causes a nested code-mode `tools.exec_command` promise to reject before execution. The code catches the error and surfaces the hook reason instead of a successful result.
+**Purpose**: Tests that blocking a nested code-mode tool call rejects the code promise before the command executes.
 
-**Data flow**: It mounts a two-step SSE sequence where the model emits custom code that tries `tools.exec_command({ cmd: command })`, prints an `unexpected-success` JSON on success, and prints a caught-error JSON on failure. It installs a Bash-matched pre-tool hook in `json_deny` mode with a fixed reason, enables code mode, builds the test instance, submits a turn, normalizes the custom tool output text, asserts it contains `"kind":"caught"` and the reason but not `unexpected-success`, asserts the marker file was never created, then reads the pre-tool hook log and asserts the logged command matches the blocked nested command.
+**Data flow**: It builds code that catches tool errors, installs a denying Bash hook, runs the code-mode call, and checks the output contains the caught error and the marker file was not created.
 
-**Call relations**: This test is the code-mode analogue of shell pre-tool blocking, again relying on `code_mode_custom_tool_output_text` and the pre-tool log reader.
+**Call relations**: The test uses the code-mode output extractor and pre-tool hook log reader to prove the block reached code mode as an error.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, code_mode_custom_tool_output_text, read_pre_tool_use_hook_inputs); 7 external calls (new, assert!, assert_eq!, format!, to_string, skip_if_no_network!, vec!).
 
@@ -3520,11 +3546,11 @@ async fn assert_post_tool_use_blocks_code_mode_tool_result(
 ) -> Result<()>
 ```
 
-**Purpose**: Shared helper that verifies a `PostToolUse` hook can reject the result of a nested code-mode `tools.exec_command` after the command has already executed. It confirms the promise rejects, the original result is hidden, and the side effect still occurred.
+**Purpose**: Shared test logic proving a PostToolUse hook can hide or reject a nested code-mode tool result after the command has already run.
 
-**Data flow**: After the network guard, it mounts a two-step SSE sequence where custom code awaits `tools.exec_command({ cmd: command })` and prints either `unexpected-success` or a caught-error JSON. The command writes `executed` to a marker file and prints `original-post-tool-result`. It installs a Bash-matched post-tool hook with the supplied mode and reason, enables code mode, builds the test instance, submits a turn, normalizes the custom tool output text, asserts it contains `"kind":"caught"` and the reason but not `unexpected-success` or `original-post-tool-result`, reads the marker file to assert the command did execute, then reads the post-tool hook log and asserts the logged command and `tool_response == "original-post-tool-result"`.
+**Data flow**: It receives a hook mode and reason. It creates code that runs a command and catches errors, installs a post-tool hook, runs the code-mode call, then checks the command marker exists but the original result did not reach code mode.
 
-**Call relations**: The two concrete code-mode post-tool rejection tests call this helper with different hook modes (`decision_block` and `exit_2`) to share the same execution and assertion logic.
+**Call relations**: The two code-mode post-tool block tests call this with different hook behaviors: a JSON block decision and exit code 2 feedback.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, code_mode_custom_tool_output_text, read_post_tool_use_hook_inputs); called by 2 (post_tool_use_block_decision_rejects_code_mode_tool_promise, post_tool_use_exit_two_rejects_code_mode_tool_promise); 7 external calls (new, assert!, assert_eq!, format!, to_string, skip_if_no_network!, vec!).
 
@@ -3535,11 +3561,11 @@ async fn assert_post_tool_use_blocks_code_mode_tool_result(
 async fn post_tool_use_block_decision_rejects_code_mode_tool_promise() -> Result<()>
 ```
 
-**Purpose**: Runs the shared code-mode post-tool rejection assertion using a structured `decision: block` response. It proves explicit post-tool block decisions reject nested tool promises.
+**Purpose**: Tests code-mode post-tool blocking through a JSON block decision. It checks that code sees an error instead of the original tool result.
 
-**Data flow**: Calls `assert_post_tool_use_blocks_code_mode_tool_result("decision_block", "blocked nested result by decision")` and returns its `Result<()>`.
+**Data flow**: It calls the shared post-tool code-mode assertion with decision_block mode and a fixed reason.
 
-**Call relations**: This is a thin wrapper around the shared post-tool code-mode helper for the decision-block variant.
+**Call relations**: This wrapper delegates all setup and validation to assert_post_tool_use_blocks_code_mode_tool_result.
 
 *Call graph*: calls 1 internal fn (assert_post_tool_use_blocks_code_mode_tool_result).
 
@@ -3550,11 +3576,11 @@ async fn post_tool_use_block_decision_rejects_code_mode_tool_promise() -> Result
 async fn post_tool_use_exit_two_rejects_code_mode_tool_promise() -> Result<()>
 ```
 
-**Purpose**: Runs the shared code-mode post-tool rejection assertion using hook process exit status 2 and stderr feedback. It proves exit-based post-tool failures also reject nested tool promises.
+**Purpose**: Tests code-mode post-tool blocking through a hook process exiting with code 2. Exit code 2 is treated as hook feedback.
 
-**Data flow**: Calls `assert_post_tool_use_blocks_code_mode_tool_result("exit_2", "blocked nested result by exit two")` and returns its `Result<()>`.
+**Data flow**: It calls the shared post-tool code-mode assertion with exit_2 mode and a fixed reason.
 
-**Call relations**: This is the exit-2 counterpart to the decision-block wrapper, delegating to the same shared helper.
+**Call relations**: This wrapper reuses the same shared checker as the JSON block-decision test.
 
 *Call graph*: calls 1 internal fn (assert_post_tool_use_blocks_code_mode_tool_result).
 
@@ -3565,11 +3591,11 @@ async fn post_tool_use_exit_two_rejects_code_mode_tool_promise() -> Result<()>
 async fn plugin_pre_tool_use_blocks_shell_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a plugin-provided `PreToolUse` hook discovered from plugin metadata can block a shell command before execution. It checks both command suppression and the plugin hook’s logged payload.
+**Purpose**: Tests that a PreToolUse hook supplied by a plugin can block a shell command before it runs.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command that would write a temp marker, creates a temporary home with plugin manifest, plugin config enabling `sample@test`, plugin hook script and `hooks/hooks.json`, constructs `PluginHookSource` values with absolute paths and parsed hook definitions, builds a test instance with `Feature::Plugins` enabled and `trust_plugin_hooks(config, plugin_hook_sources)`, removes any stale marker, submits a turn with `SandboxPolicy::DangerFullAccess`, inspects the second request’s function-call output to assert it contains the plugin hook reason, asserts the marker file does not exist, then reads the plugin hook log directly and asserts fields including `hook_event_name`, `tool_name`, `tool_use_id`, and `tool_input.command`.
+**Data flow**: It creates a fake plugin directory, manifest, plugin hook file, and plugin configuration, trusts the plugin hook, triggers a shell command, then verifies the tool output reports the plugin hook reason and the marker file was not created.
 
-**Call relations**: This test is the only consumer of `trust_plugin_hooks`; it synthesizes plugin discovery inputs and then validates that plugin-defined hooks participate in normal pre-tool interception.
+**Call relations**: The test uses trust_plugin_hooks during setup and reads the plugin hook's own log file with the shared log parser.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_hook_inputs_from_log, try_from); 13 external calls (clone, new, new, assert!, assert_eq!, format!, create_dir_all, remove_file, write, json! (+3 more)).
 
@@ -3580,11 +3606,11 @@ async fn plugin_pre_tool_use_blocks_shell_command_before_execution() -> Result<(
 async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()>
 ```
 
-**Purpose**: Checks that a `PreToolUse` hook defined in `config.toml` blocks a shell command the same way as one defined in `hooks.json`. It validates TOML hook loading and execution.
+**Purpose**: Tests that a PreToolUse hook defined in config.toml can block shell execution. This covers the alternate configuration source.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command that would write a temp marker, installs a TOML-defined pre-tool hook in `json_deny` mode with matcher `^Bash$`, builds the test instance, removes any stale marker, submits a turn with disabled permissions, inspects the second request’s function-call output to assert it contains the TOML hook reason, asserts the marker file does not exist, then reads the custom TOML hook log file and asserts fields including `hook_event_name`, `tool_use_id`, and `tool_input.command`.
+**Data flow**: It writes a config.toml hook fixture, triggers a shell command, and checks the output contains the configured block reason while the marker file remains absent.
 
-**Call relations**: This test uses `write_pre_tool_use_hook_toml` instead of the JSON fixture writer to prove config-TOML hooks are honored by the runtime.
+**Call relations**: The test uses the TOML hook writer and shared log reader to verify config-defined hooks behave like hooks.json hooks.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_hook_inputs_from_log); 8 external calls (assert!, assert_eq!, format!, remove_file, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3595,11 +3621,11 @@ async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()>
 async fn pre_tool_use_merges_hooks_json_and_config_toml() -> Result<()>
 ```
 
-**Purpose**: Verifies that hooks loaded from `hooks.json` and `config.toml` are both active and each receives the same pre-tool payload. The command should still execute because both fixtures are non-blocking.
+**Purpose**: Tests that hooks from hooks.json and config.toml are both active rather than one replacing the other.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command printing `merged-hooks`, installs one `hooks.json` pre-tool hook and one TOML pre-tool hook, both matcher-scoped to Bash and effectively allowing execution, builds the test instance, submits a turn, inspects the second request’s function-call output to assert it contains `merged-hooks`, then reads both the JSON hook log and the TOML hook log, normalizes each entry down to `hook_event_name`, `tool_name`, `tool_use_id`, and `tool_input`, and asserts both logs equal the same expected single-entry vector.
+**Data flow**: It installs one pre-tool hook in hooks.json and another in config.toml, triggers a shell command, checks the command output is returned, and verifies both hook logs received the same tool-call payload.
 
-**Call relations**: This test combines `write_pre_tool_use_hook`, `write_pre_tool_use_hook_toml`, `read_pre_tool_use_hook_inputs`, and `read_hook_inputs_from_log` to validate source merging.
+**Call relations**: The test uses both hook writers, the standard pre-tool log reader, and the shared log parser for the TOML hook log.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_hook_inputs_from_log, read_pre_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3610,11 +3636,11 @@ async fn pre_tool_use_merges_hooks_json_and_config_toml() -> Result<()>
 async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()>
 ```
 
-**Purpose**: Checks that a `PreToolUse` hook can block unified exec before the command runs, surfacing the hook reason and original command in output. It is the exec-command analogue of the shell blocking test.
+**Purpose**: Tests that PreToolUse can block the unified exec_command tool before it runs.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `exec_command` with a command that would write a temp marker, installs a Bash-matched pre-tool hook in `exit_2` mode with reason `blocked exec command`, enables unified exec in config, builds the test instance, removes any stale marker, submits a turn, inspects the second request’s function-call output string to assert it contains both the hook reason and `Command: <command>`, asserts the marker file does not exist, then reads the pre-tool hook log and asserts `tool_use_id`, `tool_input.command`, and non-empty `turn_id`.
+**Data flow**: It enables unified exec, installs a hook that exits with feedback, triggers an exec_command that would create a marker, and confirms the output contains the hook reason and the marker was not created.
 
-**Call relations**: This test reuses the generic pre-tool fixture writer but changes runtime config to route through unified exec.
+**Call relations**: The test reads the pre-tool hook log to verify the unified exec call was normalized to Bash hook input with the expected command.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 8 external calls (assert!, assert_eq!, format!, remove_file, json!, skip_if_no_network!, temp_dir, vec!).
 
@@ -3625,11 +3651,11 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()>
 async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook can block `apply_patch` before any file changes occur. The blocked output should surface the hook reason and the target file should remain absent.
+**Purpose**: Tests that a PreToolUse hook can block apply_patch before it changes files.
 
-**Data flow**: It mounts a two-step SSE sequence where the model issues an `apply_patch` custom tool call adding a file, installs a matcher-scoped pre-tool hook for `^apply_patch$` in `json_deny` mode, builds the test instance, submits a turn, inspects the second request’s custom tool output string to assert it contains the hook reason, asserts the target workspace file does not exist, then reads the pre-tool hook log and asserts `tool_name == apply_patch`, `tool_use_id == call_id`, and `tool_input.command` equals the original patch text.
+**Data flow**: It installs a hook matching apply_patch, sends a patch tool call, and verifies the returned output reports the block reason while the target file does not exist.
 
-**Call relations**: This test extends pre-tool blocking beyond Bash surfaces to the custom apply-patch tool.
+**Call relations**: The test uses the pre-tool hook log reader to confirm the patch text was sent as the hook command input.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3640,11 +3666,11 @@ async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()>
 async fn pre_tool_use_rewrites_apply_patch_before_execution() -> Result<()>
 ```
 
-**Purpose**: Checks that a `PreToolUse` hook can rewrite an `apply_patch` payload before execution so only the rewritten patch is applied. The original patch target must remain untouched.
+**Purpose**: Tests that a PreToolUse hook can replace an apply_patch request with a different patch.
 
-**Data flow**: It mounts a two-step SSE sequence where the model issues an `apply_patch` custom tool call with an original patch, installs a pre-tool rewrite hook matching `^apply_patch$` and supplying `updatedInput.command = rewritten_patch`, builds the test instance, submits a turn, inspects the second request’s custom tool output, asserts the original target file does not exist, reads the rewritten target file and asserts it contains `rewritten\n`, then reads the pre-tool hook log and asserts the logged command is the original patch text.
+**Data flow**: It sends an original patch, installs a hook returning a rewritten patch, runs the turn, then checks the original file was not created and the rewritten file contains the expected text.
 
-**Call relations**: This test uses the generic rewrite fixture writer to prove apply-patch input rewriting works the same way as Bash command rewriting.
+**Call relations**: The test uses the updating pre-tool hook fixture and pre-tool log reader to prove the hook saw the original patch but Codex applied the rewritten one.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 6 external calls (assert!, assert_eq!, format!, json!, skip_if_no_network!, vec!).
 
@@ -3655,11 +3681,11 @@ async fn pre_tool_use_rewrites_apply_patch_before_execution() -> Result<()>
 async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook matching the `Write` alias can block `apply_patch`. It confirms alias-based matching applies before patch execution.
+**Purpose**: Tests that a PreToolUse hook matching the Write alias can block apply_patch. This checks alias matching, not just exact tool names.
 
-**Data flow**: It mounts a two-step SSE sequence for an `apply_patch` call adding a file, installs a pre-tool hook with matcher `^Write$` in `json_deny` mode, builds the test instance, submits a turn, inspects the second request’s custom tool output string to assert it contains the alias-based hook reason, asserts the target file does not exist, then reads the pre-tool hook log and asserts the runtime still reports `tool_name == apply_patch`, the correct `tool_use_id`, and the original patch text as `tool_input.command`.
+**Data flow**: It installs a hook with matcher Write, sends an apply_patch call, and verifies the patch is blocked and the file is not created.
 
-**Call relations**: This test complements the direct apply-patch matcher case by proving alias matching works for pre-tool interception too.
+**Call relations**: The test reads the pre-tool log afterward to confirm the actual tool name is still apply_patch while the alias matcher caused the hook to run.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3670,11 +3696,11 @@ async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()>
 async fn pre_tool_use_blocks_local_function_tool_before_execution() -> Result<()>
 ```
 
-**Purpose**: Checks that `PreToolUse` hooks can block local function tools, not just shell-like tools. The blocked output should mention the tool name and hook reason.
+**Purpose**: Tests that PreToolUse can block a local function tool, not only shell-like tools. A local function tool is code built into the test environment.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls local function tool `test_sync_tool` with empty JSON args, installs a pre-tool hook matching `^test_sync_tool$` in `json_deny` mode, builds the test instance in code-capable model mode, submits a turn, inspects the second request’s function-call output string to assert it contains `Tool call blocked by PreToolUse hook: <reason>. Tool: test_sync_tool`, then reads the pre-tool hook log and asserts `hook_event_name`, `tool_name`, `tool_use_id`, and `tool_input` equal the original empty args object.
+**Data flow**: It installs a denying hook for test_sync_tool, triggers that tool, and verifies the tool output says the call was blocked with the hook reason and tool name.
 
-**Call relations**: This test broadens pre-tool coverage to local function tools and uses the same log reader as the shell and exec cases.
+**Call relations**: The test uses the pre-tool log reader to confirm generic JSON tool input was passed through unchanged.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3685,11 +3711,11 @@ async fn pre_tool_use_blocks_local_function_tool_before_execution() -> Result<()
 async fn pre_tool_use_rewrites_local_function_tool_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook can rewrite the JSON input to a local function tool before invocation. The rewritten call should succeed even if the original arguments would have been invalid.
+**Purpose**: Tests that PreToolUse can rewrite the input for a local function tool before it runs.
 
-**Data flow**: It mounts a two-step SSE sequence where the model calls `test_sync_tool` with an invalid `barrier` object, installs a pre-tool rewrite hook matching `^test_sync_tool$` and supplying empty `{}` as `updatedInput`, builds the test instance, submits a turn, inspects the second request’s function-call output string and asserts it equals `ok`, then reads the pre-tool hook log and asserts the logged `tool_input` is still the original invalid args object.
+**Data flow**: It sends invalid-looking original arguments, installs a hook that replaces them with an empty object, triggers the tool, and checks the tool succeeds with output ok.
 
-**Call relations**: This test is the local-function analogue of the Bash and apply-patch rewrite tests, proving rewrite support is generic across tool types.
+**Call relations**: The test reads the pre-tool log to ensure the hook received the original arguments even though the tool executed with rewritten input.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_pre_tool_use_hook_inputs); 4 external calls (assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3700,11 +3726,11 @@ async fn pre_tool_use_rewrites_local_function_tool_before_execution() -> Result<
 async fn post_tool_use_records_additional_context_for_shell_command() -> Result<()>
 ```
 
-**Purpose**: Checks that a non-blocking `PostToolUse` hook can attach developer context after a shell command executes, while preserving the command output. It also validates the logged post-tool payload.
+**Purpose**: Tests that a PostToolUse hook can add context after a shell command while preserving the command output.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command printing `post-tool-output`, installs a Bash-matched post-tool hook in `context` mode with a fixed note, builds the test instance, submits a turn, inspects the second request to assert developer messages contain the note, extracts the function-call output string and asserts it contains `post-tool-output`, then reads the post-tool hook log and asserts fields including `hook_event_name`, `tool_name`, `tool_use_id`, `tool_input.command`, `tool_response == 'post-tool-output'`, non-empty existing `transcript_path`, and non-empty `turn_id`.
+**Data flow**: It installs a context-returning post-tool hook, triggers a shell command, checks the follow-up request contains the context and command output, then verifies the hook log includes input, response, transcript path, and turn ID.
 
-**Call relations**: This is the baseline post-tool context test, using `write_post_tool_use_hook` for setup and `read_post_tool_use_hook_inputs` for payload validation.
+**Call relations**: The test uses the post-tool hook fixture, captured mock requests, and post-tool log reader.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3715,11 +3741,11 @@ async fn post_tool_use_records_additional_context_for_shell_command() -> Result<
 async fn post_tool_use_block_decision_replaces_shell_command_output_with_reason() -> Result<()>
 ```
 
-**Purpose**: Verifies that a structured `decision: block` from a `PostToolUse` hook replaces the shell command’s output with the hook’s reason after execution. The hook log should still contain the original tool response.
+**Purpose**: Tests that a PostToolUse JSON block decision replaces a shell command's output with the hook reason.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command printing `blocked-output`, installs a Bash-matched post-tool hook in `decision_block` mode with a fixed reason, builds the test instance, submits a turn, inspects the second request’s function-call output string and asserts it equals the reason exactly, then reads the post-tool hook log and asserts `tool_response == 'blocked-output'`.
+**Data flow**: It runs a shell command that prints text, installs a post-tool hook returning decision block, and verifies the model receives the reason instead of the original output.
 
-**Call relations**: This test demonstrates post-execution output replacement rather than pre-execution blocking, using the shared post-tool fixture writer and log reader.
+**Call relations**: The test reads the post-tool hook log to confirm the hook still saw the original tool response before replacing it.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 4 external calls (assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3730,11 +3756,11 @@ async fn post_tool_use_block_decision_replaces_shell_command_output_with_reason(
 async fn post_tool_use_continue_false_replaces_shell_command_output_with_stop_reason() -> Result<()>
 ```
 
-**Purpose**: Checks that a `PostToolUse` hook returning `continue: false` replaces shell command output with its stop reason. It validates the alternate stop-style post-tool contract.
+**Purpose**: Tests that a PostToolUse response with continue false replaces shell output with its stop reason.
 
-**Data flow**: It mounts a two-step SSE sequence for a shell command printing `stop-output`, installs a Bash-matched post-tool hook in `continue_false` mode with a stop reason, builds the test instance, submits a turn, inspects the second request’s function-call output string and asserts it equals the stop reason, then reads the post-tool hook log and asserts `tool_response == 'stop-output'`.
+**Data flow**: It runs a shell command, installs a post-tool hook returning continue false and stopReason, and checks the model-visible tool output equals that stop reason.
 
-**Call relations**: This test is the stop-style counterpart to the decision-block case, proving both post-tool response shapes are honored.
+**Call relations**: The test uses the post-tool log reader to verify the hook observed the original output before Codex substituted the stop reason.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 4 external calls (assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3745,11 +3771,11 @@ async fn post_tool_use_continue_false_replaces_shell_command_output_with_stop_re
 async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedback() -> Result<()>
 ```
 
-**Purpose**: Verifies that when a `PostToolUse` hook exits with status 2 after a one-shot unified exec command, the exec output returned to the model is replaced by the hook’s stderr feedback. The hook log should still capture the original command output.
+**Purpose**: Tests that a PostToolUse hook exiting with code 2 can replace a one-shot exec_command result with feedback.
 
-**Data flow**: It mounts a two-step SSE sequence for `exec_command` printing `post-hook-output`, installs a Bash-matched post-tool hook in `exit_2` mode with feedback `blocked by post hook`, enables unified exec in config, builds the test instance, submits a turn, inspects the second request’s function-call output string and asserts it equals the feedback, then reads the post-tool hook log and asserts the correct `tool_use_id`, `tool_input.command`, and `tool_response == 'post-hook-output'`.
+**Data flow**: It enables unified exec, runs an exec_command, installs a post hook that exits with feedback, and checks the follow-up tool output is exactly that feedback.
 
-**Call relations**: This test applies the post-tool exit-2 path to unified exec rather than shell_command, using the same fixture writer with different runtime config.
+**Call relations**: The test reads the post-tool log to verify the exec command input and original output were passed to the hook.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 4 external calls (assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3760,11 +3786,11 @@ async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedb
 async fn post_tool_use_spills_large_feedback_message() -> Result<()>
 ```
 
-**Purpose**: Checks that oversized post-tool feedback is truncated in the returned tool output and spilled to a file containing the full feedback text. It validates spill behavior for post-tool blocking messages.
+**Purpose**: Tests that very large PostToolUse feedback is spilled to disk instead of being sent inline as tool output.
 
-**Data flow**: It mounts a two-step SSE sequence for `exec_command` printing `post-hook-output`, creates a very large repeated feedback string, installs a Bash-matched post-tool hook in `exit_2` mode with that feedback, enables unified exec, builds the test instance, submits a turn, inspects the second request’s function-call output string to assert it contains `tokens truncated`, extracts the spill path with `spilled_hook_output_path`, reads the file, and asserts it equals the trimmed original feedback.
+**Data flow**: It installs a post-tool hook that exits with a long feedback string, runs an exec command, extracts the spill path from the model-visible output, and verifies the file contains the full feedback.
 
-**Call relations**: This test combines the post-tool fixture writer with the spill-path helper to validate large feedback handling on the exec path.
+**Call relations**: The test uses the post-tool hook writer and spilled-path helper to cover large feedback handling after tool execution.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, spilled_hook_output_path); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3775,11 +3801,11 @@ async fn post_tool_use_spills_large_feedback_message() -> Result<()>
 async fn post_tool_use_blocks_when_exec_session_completes_via_write_stdin() -> Result<()>
 ```
 
-**Purpose**: Verifies that `PostToolUse` still runs and can replace output when an exec session completes on a later `write_stdin` poll rather than in the initial `exec_command` call. It also checks the pre-hook and post-hook logs refer back to the original start call.
+**Purpose**: Tests that PostToolUse runs when a long-running exec session completes through a later write_stdin poll, and can replace that final result.
 
-**Data flow**: After network and non-Windows guards, it mounts a three-step SSE sequence: `exec_command` starts a session running `sleep 1; printf session-post-hook-output`, `write_stdin` polls that session with empty chars, and a final assistant message completes the turn. It installs paired logging pre-hook and blocking post-hook fixtures, enables unified exec, builds the test instance, submits a turn, inspects the third request’s function-call output for the `write_stdin` call and asserts it equals the feedback string, then reads the pre-tool hook log to assert it contains one Bash entry for the original start call and command, and reads the post-tool hook log to assert it also refers to the original start call and that `tool_response` contains `session-post-hook-output`.
+**Data flow**: It starts an exec session, then sends write_stdin to wait for completion. The pre hook logs the initial command, the post hook blocks the final session output, and the test checks the model receives the feedback instead.
 
-**Call relations**: This test is the session-oriented post-tool case, using the combined fixture writer and both hook log readers to prove post-tool evaluation happens when the session finally completes.
+**Call relations**: This test uses the paired pre/post hook fixture plus both log readers to confirm the pre hook is tied to session start while the post hook sees final session output.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs, read_pre_tool_use_hook_inputs); 6 external calls (assert!, assert_eq!, json!, skip_if_no_network!, skip_if_windows!, vec!).
 
@@ -3790,11 +3816,11 @@ async fn post_tool_use_blocks_when_exec_session_completes_via_write_stdin() -> R
 async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()>
 ```
 
-**Purpose**: Checks that a non-blocking `PostToolUse` hook can attach developer context after `apply_patch` executes, while the patch still applies successfully. It also validates the logged textual patch result.
+**Purpose**: Tests that a PostToolUse hook can add context after apply_patch succeeds.
 
-**Data flow**: It mounts a two-step SSE sequence for an `apply_patch` custom tool call adding a file, installs a matcher-scoped post-tool hook for `^apply_patch$` in `context` mode, builds the test instance, submits a turn, inspects the second request to assert developer messages contain the post-tool note, asserts the target file exists, then reads the post-tool hook log and asserts `tool_name == apply_patch`, the correct `tool_use_id`, the original patch text in `tool_input.command`, and a string `tool_response` beginning with `Exit code: 0` and mentioning the added file.
+**Data flow**: It installs a post-tool hook matching apply_patch, sends a patch that creates a file, checks the follow-up request contains the hook context, verifies the file exists, and inspects the hook's recorded response.
 
-**Call relations**: This test extends post-tool context injection to apply_patch and uses the post-tool log reader to inspect the patch tool’s textual success summary.
+**Call relations**: The test uses the post-tool hook fixture and post-tool log reader to confirm apply_patch output is available to hooks.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3805,22 +3831,26 @@ async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()
 async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PostToolUse` hook matching the `Edit` alias can attach context for an `apply_patch` call. It confirms alias matching works on the post-tool path as well.
+**Purpose**: Tests that a PostToolUse hook matching the Edit alias can run for apply_patch and add context.
 
-**Data flow**: It mounts a two-step SSE sequence for an `apply_patch` custom tool call adding a file, installs a post-tool hook with matcher `^Edit$` in `context` mode, builds the test instance, submits a turn, inspects the second request to assert developer messages contain the alias-based context, asserts the target file exists, then reads the post-tool hook log and asserts `tool_name == apply_patch`, the correct `tool_use_id`, and the original patch text in `tool_input.command`.
+**Data flow**: It installs a post-tool hook with matcher Edit, applies a patch, checks the next request includes the context, verifies the file exists, and confirms the hook log records apply_patch as the actual tool.
 
-**Call relations**: This is the alias-matching companion to the direct apply-patch post-tool context test, using the same fixture writer and log reader with a different matcher.
+**Call relations**: This test mirrors the apply_patch post-tool context test but focuses on alias matching behavior.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_post_tool_use_hook_inputs); 5 external calls (assert!, assert_eq!, format!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/hooks_mcp.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This test file builds realistic MCP scenarios by combining a mock Responses API server, a real stdio MCP test server binary, and dynamically generated hook scripts written into the test Codex home directory. It defines constants for the rmcp server name, namespace variants, the fully qualified echo tool name, and the canonical test message so assertions stay tied to one concrete MCP tool path. The helper layer does three things: toggles the `Feature::NonPrefixedMcpToolNames` feature when requested, writes Python hook scripts plus `hooks.json` registrations for `PreToolUse` and `PostToolUse`, and injects an `McpServerConfig` for a stdio-backed rmcp server into `Config.mcp_servers` with explicit startup timeout and approval mode.
+MCP, or Model Context Protocol, is a way for Codex to connect to external tool servers. Hooks are user-defined commands that Codex can run before or after a tool is used, like a checkpoint at a doorway. This test file makes sure those checkpoints still work for MCP tools.
 
-The tests then drive a turn through mocked SSE responses that first ask the model to call the rmcp `echo` tool and then send a follow-up assistant response. In the blocking case, the pre-tool hook returns a deny decision and the test asserts that no real tool output is used; instead the second request contains a synthetic function-call output string naming the hook reason and tool name. In the rewrite case, the hook allows execution but replaces the `message` field, and the test confirms the final tool output reflects only the rewritten input. In the post-tool case, the hook emits `additionalContext`, which must appear in the next developer message while the original MCP structured response is still preserved. All hook scripts append their stdin payloads to JSONL logs, and the tests parse those logs to verify exact hook payload fields and that `transcript_path` files were materialized on disk.
+The tests build a small fake world: a mock model server sends scripted responses asking Codex to call an MCP echo tool, and a local test MCP server provides that tool. The file then writes temporary hook scripts into the test home directory. These scripts read the hook payload from standard input, record it to a log file, and return a JSON decision to Codex.
+
+There are three main behaviors under test. A pre-tool hook can deny the MCP tool before it runs, and Codex should report the block reason back to the model. A pre-tool hook can also allow the call but replace the tool input, and the MCP tool should receive the rewritten message rather than the original one. A post-tool hook can inspect the tool input and response, then add extra context to the next model request.
+
+The file also tests both old prefixed MCP tool names and newer non-prefixed names, because Codex supports both naming styles. Without these tests, changes to hooks, MCP tool naming, or tool-call plumbing could silently break user safety checks and automation around external tools.
 
 #### Function details
 
@@ -3830,11 +3860,11 @@ The tests then drive a turn through mocked SSE responses that first ask the mode
 fn enable_mcp_tool_name_features(config: &mut Config, prefix_mcp_tool_names: bool)
 ```
 
-**Purpose**: Adjusts the test `Config` so MCP tool names are either left in legacy prefixed form or switched to the non-prefixed mode. It only mutates feature flags when the caller explicitly requests non-prefixed names.
+**Purpose**: This helper turns on the feature flag for non-prefixed MCP tool names when a test wants to exercise that newer naming style. It leaves the configuration unchanged when the test is using the legacy prefixed names.
 
-**Data flow**: Takes a mutable `Config` and a `bool` flag. If `prefix_mcp_tool_names` is `false`, it enables `Feature::NonPrefixedMcpToolNames` on `config.features`; otherwise it leaves configuration unchanged. It returns no value and writes only to the feature set inside the provided config.
+**Data flow**: It receives a mutable Codex configuration and a true-or-false choice about prefixed tool names. If prefixed names are not wanted, it enables the feature that lets MCP tools appear without the old prefix; otherwise it does nothing. The changed configuration is kept in the same object passed in.
 
-**Call relations**: This helper is invoked from `enable_hooks_and_rmcp_server` during test setup, before the test instance is built. It exists so the same end-to-end assertions can be run against both namespace conventions without duplicating feature-toggle logic.
+**Call relations**: It is used by enable_hooks_and_rmcp_server while preparing each test configuration. That setup helper combines hook trust, MCP naming behavior, and the test MCP server into one ready-to-use configuration.
 
 *Call graph*: called by 1 (enable_hooks_and_rmcp_server).
 
@@ -3845,11 +3875,11 @@ fn enable_mcp_tool_name_features(config: &mut Config, prefix_mcp_tool_names: boo
 fn write_pre_tool_use_hook(home: &Path, reason: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a Python `PreToolUse` hook fixture that logs its input payload and denies execution with a caller-supplied reason. It also writes the matching `hooks.json` registration that targets the rmcp echo tool.
+**Purpose**: This helper creates a temporary PreToolUse hook that always blocks the MCP echo tool. Tests use it to prove Codex stops the tool before execution and sends the hook’s reason back to the model.
 
-**Data flow**: Receives the test home directory and a denial reason string. It derives `pre_tool_use_hook.py` and `pre_tool_use_hook_log.jsonl` paths under that home, serializes the reason into JSON-safe text, formats a Python script that reads stdin JSON, appends it to the log file, and prints a hook response with `permissionDecision: "deny"` and `permissionDecisionReason`. It then writes both the script file and a `hooks.json` object containing a `PreToolUse` matcher for `RMCP_HOOK_MATCHER` and returns `Result<()>`.
+**Data flow**: It takes a test home directory and a block reason. It writes a small Python script that reads the hook input, appends that input to a JSON-lines log file, and prints a JSON response saying the tool call is denied. It also writes a hooks.json file that tells Codex to run that script for the MCP echo tool.
 
-**Call relations**: Used by the blocking pre-tool tests via `with_pre_build_hook`, so the fixture exists before Codex starts. It does not call other local helpers; instead the later test flow relies on the generated files being discovered after `trust_discovered_hooks` is enabled.
+**Call relations**: The blocking pre-tool test installs this hook during test setup through the test builder’s pre-build hook. Later, when Codex tries to call the MCP echo tool, the hook runs first and its denial becomes the tool-call output inspected by the test.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -3860,11 +3890,11 @@ fn write_pre_tool_use_hook(home: &Path, reason: &str) -> Result<()>
 fn write_updating_pre_tool_use_hook(home: &Path, updated_message: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a Python `PreToolUse` hook fixture that logs the original tool payload and allows execution after rewriting the MCP tool input message. This is the fixture for testing hook-driven input mutation.
+**Purpose**: This helper creates a temporary PreToolUse hook that allows the MCP echo tool but rewrites its input message. Tests use it to confirm that hook-updated input is what actually reaches the MCP tool.
 
-**Data flow**: Accepts the test home path and the replacement message text. It computes script and JSONL log paths, serializes the replacement string, formats a Python script that reads stdin JSON, appends the original payload to the log, and prints a hook response with `permissionDecision: "allow"` plus `updatedInput: { "message": ... }`. It writes the script and a `hooks.json` file registering the command hook for the rmcp echo matcher, then returns `Result<()>`.
+**Data flow**: It receives a test home directory and the replacement message. It writes a Python script that logs the original hook payload, then prints a JSON response saying the call is allowed and providing updated input with the new message. It writes hooks.json so Codex knows to run this script before the MCP echo tool.
 
-**Call relations**: Called from `pre_tool_use_rewrites_mcp_tool_before_execution` during pre-build setup. The later test asserts both sides of this relation: the hook log still contains the original input, while the actual MCP server execution reflects the rewritten input emitted by this script.
+**Call relations**: The input-rewrite test installs this hook before Codex starts. When the model asks for an MCP echo call, Codex runs the hook, accepts the rewritten input, then passes that changed input on to the MCP server.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -3875,11 +3905,11 @@ fn write_updating_pre_tool_use_hook(home: &Path, updated_message: &str) -> Resul
 fn write_post_tool_use_hook(home: &Path, additional_context: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a Python `PostToolUse` hook fixture that records the completed tool payload and emits additional context for the next model request. It is the post-execution analogue of the pre-tool fixtures.
+**Purpose**: This helper creates a temporary PostToolUse hook that records what happened during an MCP tool call and returns extra context for the next model request. Tests use it to prove post-tool hooks see the full MCP payload and can influence the follow-up turn.
 
-**Data flow**: Takes the test home path and an `additional_context` string. It builds `post_tool_use_hook.py` and `post_tool_use_hook_log.jsonl` paths, JSON-escapes the context string, formats a Python script that reads stdin JSON, appends it to the log, and prints a hook response containing `hookEventName: "PostToolUse"` and `additionalContext`. It writes that script and a `hooks.json` registration for the rmcp echo matcher, returning `Result<()>`.
+**Data flow**: It takes a test home directory and a context string. It writes a Python script that reads and logs the post-tool hook payload, then prints JSON containing additional context. It also writes hooks.json so Codex runs this script after the MCP echo tool finishes.
 
-**Call relations**: Installed by `post_tool_use_records_mcp_tool_payload_and_context` before the test instance is built. The subsequent turn execution depends on this fixture to inject developer-visible context into the follow-up request while preserving the original tool output.
+**Call relations**: The post-tool tests install this hook during setup. After Codex executes the MCP echo tool, this hook runs, and its returned context is expected to appear in the next request sent to the mock model server.
 
 *Call graph*: 5 external calls (join, format!, write, json!, to_string).
 
@@ -3890,11 +3920,11 @@ fn write_post_tool_use_hook(home: &Path, additional_context: &str) -> Result<()>
 fn read_hook_inputs(home: &Path, log_name: &str) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Loads the JSONL log produced by a hook script and parses each non-empty line into a `serde_json::Value`. It gives the tests a structured view of the exact hook stdin payloads Codex emitted.
+**Purpose**: This helper reads the log file written by one of the temporary hook scripts. Tests use it to check exactly what Codex sent into the hook.
 
-**Data flow**: Receives the test home path and a log filename. It reads the whole file from `home.join(log_name)`, splits into lines, drops blank lines, parses each remaining line as JSON with contextual error messages, and collects the results into `Vec<Value>`. It returns that vector without mutating any state.
+**Data flow**: It receives the test home directory and the log file name. It reads the file, ignores blank lines, parses each remaining line as JSON, and returns the parsed list. If the file cannot be read or a line is not valid JSON, it reports an error with context about which log failed.
 
-**Call relations**: This helper is called by all three end-to-end hook scenarios after the turn completes. Those tests use it to validate concrete fields such as `hook_event_name`, `tool_name`, `tool_use_id`, `tool_input`, `tool_response`, and `transcript_path` that were written by the runtime into the hook process stdin.
+**Call relations**: The pre-tool block, pre-tool rewrite, and post-tool tests call this after submitting a turn. It lets those tests verify that the hook received the expected event name, tool name, tool input, tool response, and transcript path.
 
 *Call graph*: called by 3 (post_tool_use_records_mcp_tool_payload_and_context, pre_tool_use_blocks_mcp_tool_before_execution, pre_tool_use_rewrites_mcp_tool_before_execution); 2 external calls (join, read_to_string).
 
@@ -3905,11 +3935,11 @@ fn read_hook_inputs(home: &Path, log_name: &str) -> Result<Vec<Value>>
 fn insert_rmcp_test_server(config: &mut Config, command: String, approval_mode: AppToolApproval)
 ```
 
-**Purpose**: Adds a concrete stdio MCP server entry named `rmcp` into the mutable test configuration. The inserted server is enabled, optional, single-call, and configured with the approval mode requested by the test.
+**Purpose**: This helper adds the local RMCP test server to the Codex configuration. It gives the tests a real MCP tool server to connect to, rather than only mocking the model side.
 
-**Data flow**: Takes a mutable `Config`, a command string for the stdio server binary, and an `AppToolApproval`. It clones the current MCP server map, inserts a new `McpServerConfig` keyed by `RMCP_SERVER` with `McpServerTransportConfig::Stdio { command, args: [], env: None, env_vars: [], cwd: None }`, default environment id, `enabled: true`, `required: false`, `supports_parallel_tool_calls: false`, `startup_timeout_sec: Some(Duration::from_secs(10))`, and `default_tools_approval_mode: Some(approval_mode)`, then writes the map back through `config.mcp_servers.set(...)`. It returns no value.
+**Data flow**: It receives a mutable configuration, the command used to start the test MCP server, and the approval mode for tools. It copies the current MCP server map, inserts a server named rmcp using standard input/output transport, sets timeouts and approval settings, then writes the updated server map back into the configuration.
 
-**Call relations**: Called only from `enable_hooks_and_rmcp_server` as part of test configuration assembly. It is the piece that makes the later `wait_for_mcp_server` call meaningful by ensuring the rmcp stdio server exists in the built configuration.
+**Call relations**: It is called by enable_hooks_and_rmcp_server during test setup. Once inserted, the test waits for this server to be ready before asking Codex to process a model turn that calls the echo tool.
 
 *Call graph*: called by 1 (enable_hooks_and_rmcp_server); 3 external calls (from_secs, new, new).
 
@@ -3925,11 +3955,11 @@ fn enable_hooks_and_rmcp_server(
 )
 ```
 
-**Purpose**: Bundles the common test setup needed for MCP hook scenarios: trust hook discovery, choose the MCP naming mode, and register the rmcp stdio server. It centralizes the configuration mutations shared by all hook tests.
+**Purpose**: This setup helper prepares a test configuration with trusted hooks, the requested MCP tool-name style, and the RMCP test server. It keeps repeated setup code out of the individual tests.
 
-**Data flow**: Consumes a mutable `Config`, the rmcp server binary path, an approval mode, and the prefixing flag. It first marks discovered hooks as trusted, then conditionally enables non-prefixed MCP tool names, then inserts the rmcp server definition. It returns no value and mutates only the provided config.
+**Data flow**: It receives the mutable configuration, the path to the RMCP server binary, the tool approval mode, and whether to use prefixed MCP tool names. It marks discovered hooks as trusted, adjusts the MCP naming feature flag if needed, and inserts the RMCP server into the configuration. The result is a configuration ready for hook-and-MCP testing.
 
-**Call relations**: Used inside each test builder’s `with_config` closure. It delegates to `trust_discovered_hooks`, `enable_mcp_tool_name_features`, and `insert_rmcp_test_server` so the actual test bodies can focus on mocked responses and assertions.
+**Call relations**: Each main test passes this helper to the test builder’s configuration step. Internally it calls trust_discovered_hooks, enable_mcp_tool_name_features, and insert_rmcp_test_server to assemble the full test environment.
 
 *Call graph*: calls 3 internal fn (trust_discovered_hooks, enable_mcp_tool_name_features, insert_rmcp_test_server).
 
@@ -3940,11 +3970,11 @@ fn enable_hooks_and_rmcp_server(
 async fn pre_tool_use_blocks_mcp_tool_before_execution_with_legacy_prefixed_names() -> Result<()>
 ```
 
-**Purpose**: Runs the shared pre-tool blocking scenario using the legacy `mcp__rmcp` namespace. It exists to pin behavior for the older naming convention.
+**Purpose**: This test entry checks the blocking PreToolUse behavior when MCP tools use the older prefixed namespace. It exists so the legacy naming path keeps working.
 
-**Data flow**: Takes no arguments and asynchronously calls the shared blocking helper with `prefix_mcp_tool_names = true` and `RMCP_PREFIXED_NAMESPACE`. It returns the helper’s `Result<()>` unchanged.
+**Data flow**: It supplies the shared blocking test with the choice to use prefixed names and the prefixed MCP namespace. The real setup, model simulation, tool call, and assertions happen inside the shared helper it awaits.
 
-**Call relations**: This is a thin `#[tokio::test]` wrapper around `pre_tool_use_blocks_mcp_tool_before_execution`. Its only role in call flow is selecting the prefixed namespace variant.
+**Call relations**: It calls pre_tool_use_blocks_mcp_tool_before_execution as a small wrapper. The wrapper pattern lets the same behavior be tested once with legacy names and once with non-prefixed names.
 
 *Call graph*: calls 1 internal fn (pre_tool_use_blocks_mcp_tool_before_execution).
 
@@ -3955,11 +3985,11 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution_with_legacy_prefixed_name
 async fn pre_tool_use_blocks_mcp_tool_before_execution_with_non_prefixed_names() -> Result<()>
 ```
 
-**Purpose**: Runs the shared pre-tool blocking scenario using the non-prefixed `rmcp` namespace. It verifies the same hook semantics after the naming feature switch.
+**Purpose**: This test entry checks the blocking PreToolUse behavior when MCP tools use the newer non-prefixed namespace. It protects the feature path where MCP tool names are shorter.
 
-**Data flow**: Takes no arguments and asynchronously invokes the shared blocking helper with `prefix_mcp_tool_names = false` and `RMCP_UNPREFIXED_NAMESPACE`. It returns the resulting `Result<()>`.
+**Data flow**: It passes the shared blocking test the choice to disable prefixed names and the unprefixed MCP namespace. The shared helper then runs the full test and verifies the results.
 
-**Call relations**: Like the legacy wrapper, this test delegates entirely to `pre_tool_use_blocks_mcp_tool_before_execution`, differing only in the namespace and feature mode selected.
+**Call relations**: It calls pre_tool_use_blocks_mcp_tool_before_execution. Together with the legacy-name wrapper, it proves the hook behavior is independent of the MCP naming style used by the model response.
 
 *Call graph*: calls 1 internal fn (pre_tool_use_blocks_mcp_tool_before_execution).
 
@@ -3973,11 +4003,11 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution(
 ) -> Result<()>
 ```
 
-**Purpose**: Executes the full deny-before-execution scenario for the rmcp echo tool and proves that a `PreToolUse` hook can stop the MCP call before the stdio server runs. It also verifies the exact hook payload written to disk.
+**Purpose**: This shared test proves that a PreToolUse hook can stop an MCP tool call before the MCP server runs it. It also checks that Codex tells the model why the call was blocked and records the right hook input.
 
-**Data flow**: Accepts the naming-mode flag and expected MCP namespace. It skips when networking is unavailable, starts a mock server, mounts a two-response SSE sequence where the first response emits a function call and the second emits an assistant message, builds a test Codex instance with a generated denying pre-tool hook and rmcp server config, waits for the MCP server to come up, and submits a user turn. After execution it inspects recorded HTTP requests, extracts the function-call output for the original `call_id`, asserts that the output string contains the block reason and fully qualified tool name, reads `pre_tool_use_hook_log.jsonl`, and asserts the logged JSON fields and on-disk `transcript_path`. It returns `Ok(())` on success.
+**Data flow**: It starts a mock model server and scripts two model responses: first a request to call the MCP echo tool, then a final assistant message after receiving the tool output. It writes a blocking pre-tool hook, configures Codex with the RMCP server, waits for that server, and submits a user turn. Afterward it inspects the requests sent back to the mock model and the hook log, confirming the output contains the block reason, the hook saw the expected tool name and input, and the transcript path exists on disk.
 
-**Call relations**: Invoked by both namespace-specific wrapper tests. Internally it orchestrates the whole scenario: mock Responses API setup, fixture generation through `write_pre_tool_use_hook`, config setup through `enable_hooks_and_rmcp_server`, runtime synchronization via `wait_for_mcp_server`, and post-run verification via `read_hook_inputs`.
+**Call relations**: The two name-style wrapper tests call this helper. Inside, it relies on the mock server helpers to imitate model streaming events, the test Codex builder to create an isolated run, enable_hooks_and_rmcp_server to prepare configuration, and read_hook_inputs to inspect what the hook received.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, test_codex, read_hook_inputs); called by 2 (pre_tool_use_blocks_mcp_tool_before_execution_with_legacy_prefixed_names, pre_tool_use_blocks_mcp_tool_before_execution_with_non_prefixed_names); 7 external calls (assert!, assert_eq!, stdio_server_bin, wait_for_mcp_server, json!, skip_if_no_network!, vec!).
 
@@ -3988,11 +4018,11 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution(
 async fn pre_tool_use_rewrites_mcp_tool_before_execution() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `PreToolUse` hook can modify MCP tool input before execution and that the rewritten payload, not the original one, reaches the rmcp server. It also confirms the hook itself saw the original input.
+**Purpose**: This test proves that a PreToolUse hook can change the input to an MCP tool before it runs. It checks that the MCP echo tool uses the rewritten message and not the original one.
 
-**Data flow**: This async test starts a mock server, mounts one SSE response that requests the rmcp echo tool and a second SSE response for the final assistant message, builds a test Codex instance with a generated rewriting pre-tool hook and rmcp server config, waits for the MCP server, and submits a turn. It then inspects the final request’s function-call output string to ensure it contains `ECHOING: {rewritten_message}` and does not contain the original `RMCP_ECHO_MESSAGE`, reads the pre-tool hook JSONL log to confirm the logged `tool_input` still matches the original message, and touches the first mock request to ensure it was consumed. It returns `Result<()>`.
+**Data flow**: It starts a mock model server, scripts a model response that asks for the MCP echo tool with an original message, and scripts a follow-up response. It writes a pre-tool hook that returns updated input, configures Codex with hooks and the RMCP server, waits for the server, and submits a turn. It then checks the final tool output sent to the model: the output must include the rewritten message and must not include the original message. Finally it reads the hook log to confirm the hook was given the original input.
 
-**Call relations**: This is a standalone test rather than a shared helper because only the legacy prefixed namespace is exercised here. It depends on `write_updating_pre_tool_use_hook` for fixture creation, `enable_hooks_and_rmcp_server` for config wiring, and `read_hook_inputs` for validating what the hook process received.
+**Call relations**: This is a standalone asynchronous test. It uses the hook-writing helper to install the rewriting hook, enable_hooks_and_rmcp_server during configuration, mock server helpers to stage model responses, and read_hook_inputs to confirm the hook saw the expected before-rewrite data.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, read_hook_inputs); 7 external calls (assert!, assert_eq!, stdio_server_bin, wait_for_mcp_server, json!, skip_if_no_network!, vec!).
 
@@ -4003,11 +4033,11 @@ async fn pre_tool_use_rewrites_mcp_tool_before_execution() -> Result<()>
 async fn post_tool_use_records_mcp_tool_payload_and_context_with_legacy_prefixed_names() -> Result<()>
 ```
 
-**Purpose**: Runs the shared post-tool hook scenario using the legacy prefixed MCP namespace. It ensures post-execution metadata and context work in the older naming mode.
+**Purpose**: This test entry checks PostToolUse behavior when MCP tools use the older prefixed namespace. It makes sure legacy MCP names still produce the right hook payload and follow-up context.
 
-**Data flow**: Takes no arguments and awaits the shared post-tool helper with `prefix_mcp_tool_names = true` and `RMCP_PREFIXED_NAMESPACE`. It returns the helper’s `Result<()>`.
+**Data flow**: It calls the shared post-tool test with prefixed names enabled and the prefixed MCP namespace. The shared helper performs the full setup, execution, and checks.
 
-**Call relations**: This wrapper exists only to parameterize `post_tool_use_records_mcp_tool_payload_and_context` for the prefixed namespace variant.
+**Call relations**: It is a wrapper around post_tool_use_records_mcp_tool_payload_and_context. It pairs with the non-prefixed wrapper so both MCP naming paths are covered.
 
 *Call graph*: calls 1 internal fn (post_tool_use_records_mcp_tool_payload_and_context).
 
@@ -4018,11 +4048,11 @@ async fn post_tool_use_records_mcp_tool_payload_and_context_with_legacy_prefixed
 async fn post_tool_use_records_mcp_tool_payload_and_context_with_non_prefixed_names() -> Result<()>
 ```
 
-**Purpose**: Runs the shared post-tool hook scenario using the non-prefixed MCP namespace. It verifies that post-tool hook payloads and added context survive the naming-mode change.
+**Purpose**: This test entry checks PostToolUse behavior when MCP tools use the newer non-prefixed namespace. It ensures the newer naming feature does not break post-tool hooks.
 
-**Data flow**: Takes no arguments and awaits the shared helper with `prefix_mcp_tool_names = false` and `RMCP_UNPREFIXED_NAMESPACE`. It returns the resulting `Result<()>`.
+**Data flow**: It calls the shared post-tool test with prefixed names disabled and the unprefixed MCP namespace. The shared helper runs Codex and verifies the hook payload and returned context.
 
-**Call relations**: Like the legacy wrapper, this test delegates all substantive work to `post_tool_use_records_mcp_tool_payload_and_context`, differing only in the namespace and feature flag selection.
+**Call relations**: It delegates to post_tool_use_records_mcp_tool_payload_and_context. Alongside the legacy wrapper, it confirms the same post-tool behavior works under both naming styles.
 
 *Call graph*: calls 1 internal fn (post_tool_use_records_mcp_tool_payload_and_context).
 
@@ -4036,22 +4066,24 @@ async fn post_tool_use_records_mcp_tool_payload_and_context(
 ) -> Result<()>
 ```
 
-**Purpose**: Executes the full post-tool hook scenario and verifies two outputs: the hook receives the exact MCP request/response payload, and its `additionalContext` is injected into the next model request. It also confirms the original tool output still reaches the model.
+**Purpose**: This shared test proves that a PostToolUse hook receives the MCP tool input and response, and that any extra context it returns is included in the next model request. It checks both observation and feedback after a tool call.
 
-**Data flow**: Accepts the naming-mode flag and namespace string. It skips without network, starts a mock server, mounts one SSE response that emits an rmcp echo function call and a second SSE response for the assistant follow-up, builds a test Codex instance with a generated post-tool hook and rmcp server config, waits for the MCP server, and submits a turn. Afterward it inspects the final request to assert the developer message texts include the supplied post-hook context and that the function-call output string still contains `ECHOING: {RMCP_ECHO_MESSAGE}`. It then parses `post_tool_use_hook_log.jsonl` with `read_hook_inputs` and asserts the logged event name, tool name, call id, original input, structured tool response payload, and existence of `transcript_path`, finally confirming the initial call mock was consumed.
+**Data flow**: It starts a mock model server, scripts one response asking Codex to call the MCP echo tool, and scripts a follow-up response. It writes a post-tool hook that logs its input and returns an additional context note, configures Codex with the RMCP server, waits for the server, and submits a turn. It then checks that the next request to the mock model contains the extra developer context, that the MCP echo output is still present, and that the hook log contains the expected event name, tool name, tool input, structured tool response, and a real transcript path.
 
-**Call relations**: Called by both namespace-specific wrapper tests. It ties together fixture generation via `write_post_tool_use_hook`, common config setup via `enable_hooks_and_rmcp_server`, runtime synchronization via `wait_for_mcp_server`, and log verification via `read_hook_inputs`.
+**Call relations**: The two post-tool wrapper tests call this helper with different MCP name styles. It uses mock response helpers for the model side, enable_hooks_and_rmcp_server for setup, wait_for_mcp_server before execution, and read_hook_inputs afterward to inspect what the post-tool hook received.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, read_hook_inputs); called by 2 (post_tool_use_records_mcp_tool_payload_and_context_with_legacy_prefixed_names, post_tool_use_records_mcp_tool_payload_and_context_with_non_prefixed_names); 7 external calls (assert!, assert_eq!, stdio_server_bin, wait_for_mcp_server, json!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/user_notification.rs`
 
-`test` · `post-turn completion hook during integration tests`
+`test` · `test run`
 
-This Unix-only test verifies the `notify` configuration path end to end. It starts a mock server that returns a single assistant message `Done`, then creates a temporary directory containing an executable `notify.sh` script. That script writes its final argument into `notify.txt` atomically via a temporary file and `mv`, which mirrors how a real notification command would receive the payload. The test builds `TestCodex` with `cfg.notify = Some(vec![notify_script_path])`, submits a normal `Op::UserInput` containing `hello world`, and waits for `TurnComplete`.
+This is an integration test: it starts enough of the real system to check that several parts work together. The real-world feature being tested is a “notify me when the agent is done” hook. A user can configure a command, such as a shell script, and Codex should run it when an assistant turn completes, passing along useful information like the user’s message and the assistant’s final reply.
 
-Because the notification script is forked asynchronously, the test then waits for the output file to appear with `fs_wait::wait_for_path_exists`, reads the file contents, parses them as JSON, and asserts the payload shape. Specifically, it expects `type == "agent-turn-complete"`, `input-messages == ["hello world"]`, and `last-assistant-message == "Done"`. The test therefore documents both when notifications fire—after turn completion—and the exact summary fields passed to external hooks.
+The test only runs on non-Windows systems because it writes and executes a Unix shell script and sets Unix-style file permissions. It creates a fake server that returns a simple assistant response, “Done,” then creates a temporary notification script. That script writes the notification payload it receives into a nearby file. This is like asking a messenger to leave a receipt on the table so the test can inspect it later.
+
+Next, the test starts a test Codex instance configured to use that script as its notification command. It submits one user message, waits until the turn is complete, then waits for the script-created file to appear. Finally, it reads the saved payload as JSON and confirms three important facts: the notification type says the agent turn completed, the original user input is included, and the last assistant message is “Done.” Without this test, notification payloads could silently become wrong or stop being sent.
 
 #### Function details
 
@@ -4061,10 +4093,10 @@ Because the notification script is forked asynchronously, the test then waits fo
 async fn summarize_context_three_requests_and_instructions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a configured notify script is invoked after a completed turn and receives a JSON payload summarizing the turn.
+**Purpose**: This test proves that after a normal user message finishes, Codex runs the configured notification script and gives it the expected JSON payload. It protects the user-facing notification feature from regressions.
 
-**Data flow**: It starts a mock SSE server returning one assistant message, writes an executable shell script that stores its last argument into `notify.txt`, builds `TestCodex` with that script in `cfg.notify`, submits a text user turn, waits for `TurnComplete`, waits for the notify file to appear, reads and parses the JSON payload, and asserts the payload type, input messages, and last assistant message.
+**Data flow**: The test starts with a fake response server, a temporary folder, and a small shell script that records its last argument into a file. It configures a test Codex instance to use that script, sends the text “hello world,” and waits for the assistant turn to finish. After the notification script writes its file, the test reads the JSON payload and checks that it says the turn completed, includes the user input, and records the assistant’s final message as “Done.”
 
-**Call relations**: This is the file's only test and covers the full notification path from turn completion through asynchronous external process execution.
+**Call relations**: The async test runner calls this function as a test case. Inside, it asks the response helpers to start a mock server, build a fake server-sent-events response, and mount that response for one request. It then uses the test Codex builder to create a Codex instance with a custom notification command, submits user input to Codex, waits for the turn-complete event, and finally uses file-waiting and JSON assertion helpers to verify what the notification command received.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 13 external calls (default, from_secs, new, assert_eq!, from_mode, wait_for_event, wait_for_path_exists, from_str, skip_if_no_network!, set_permissions (+3 more)).

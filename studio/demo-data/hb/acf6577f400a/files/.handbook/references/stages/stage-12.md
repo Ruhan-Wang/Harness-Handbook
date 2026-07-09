@@ -1,10 +1,10 @@
 # Prompt, context, and extension assembly  `stage-12`
 
-This stage is the last cross-cutting assembly step before any model call. It sits between live session state and request execution, turning everything the runtime knows about the current turn into the exact model-visible prompt, history, and injected context that will drive the next unit of work.
+This stage is the prompt-building workshop. Just before the system sends a turn to the model, it gathers everything the model is allowed to see and shapes it into one clear input package. Some parts provide the raw shelves and labels: shared prompt templates, context fragment formats, and extension hooks so built-in code and add-ons can add text in predictable places.
 
-Its foundation is the prompt/context facade layer, which defines the shared fragment types, prompt slots, and embedded instruction templates used everywhere else. On top of that, the context-fragment and prompt-asset layer provides the concrete building blocks: typed fragments for environment facts, token budgets, permissions, skills, realtime lifecycle messages, and other session signals, plus the canonical instruction text assets they render from.
+Other parts create the actual note cards that go into the prompt. They turn settings and events into model-readable messages: project instructions, permissions, network rules, available skills, memories, goals, IDE details, plugin and app connectors, review requests, and warnings about space limits. They also keep older saved warning formats understandable.
 
-The contributor layer then gathers actual content from user instructions, AGENTS.md, collaboration mode, IDE and terminal context, memories, goals, skills, plugins, apps/connectors, sandbox and approval settings, and review-mode prompts, exposing each as fragments or injected items. Finally, turn-context and history assembly freezes the current settings into an immutable snapshot, normalizes and truncates prior conversation, computes context-change updates, adds incremental fragments, and produces the final prompt state for normal, realtime, debug, and extension-backed flows.
+The turn assembly parts then combine these pieces with the conversation history. They trim old messages when the model’s memory space is limited, remove items the chosen model cannot use, and send only changed context when possible. Realtime startup and developer prompt-debugging use the same machinery to build their own opening briefings.
 
 ## Sub-stages
 
@@ -15,22 +15,27 @@ The contributor layer then gathers actual content from user instructions, AGENTS
 
 ## 📊 State Registers Touched
 
-- `reg-host-platform-facts` — Normalized host identity and platform probe results such as hostname, shell, locale, editor, pager, and cloud-environment facts reused by diagnostics and runtime decisions.
-- `reg-effective-config` — The merged, validated effective configuration assembled from managed, cloud, user, project, thread, and CLI layers with provenance.
-- `reg-permission-policy` — The compiled permission profiles, sandbox mode, filesystem/network ACLs, and related enforcement policy shared by sessions, tools, and transports.
-- `reg-tool-catalog` — The runtime-visible catalog of executable tools and their normalized schemas, exposure rules, and metadata used for dispatch and prompt assembly.
-- `reg-plugin-and-skill-catalog` — The resolved plugin, marketplace, hook, and skill configuration plus loaded skill/plugin metadata shared across startup, prompt assembly, and execution.
-- `reg-model-catalog` — The merged bundled, cached, local-provider, and remotely fetched model inventory and presets used for picker, routing, and turn execution.
-- `reg-connector-catalog` — The refreshed connector/app directory and workspace enablement state that determines which integrations are visible and usable.
-- `reg-live-session-object` — The long-lived session object and shared services that own turn submission, event delivery, approvals, persistence, and runtime configuration.
-- `reg-session-state` — The mutable session-wide state that survives across turns, including conversation history, token/rate-limit accounting, connector selections, and sticky grants.
-- `reg-turn-state` — The mutable active-turn coordination state including pending approvals, waiters, mailbox-delivery phase, and per-turn permission/review flags.
-- `reg-turn-context-snapshot` — The immutable per-turn context snapshot derived from session settings, environments, permissions, model metadata, and runtime services before model calls.
-- `reg-prompt-context-assembly` — The assembled prompt fragments, injected context, normalized history, and final prompt state produced for the current turn.
-- `reg-memory-pipeline-state` — The durable and runtime state for memory extraction/consolidation jobs and filesystem-backed memory artifacts.
-- `reg-extension-runtime-state` — The host-seeded and extension-owned typed attachment stores that let extensions keep shared runtime state across lifecycle callbacks.
-- `reg-token-budget-state` — The live token-budget and remaining-context-window accounting used to shape prompt assembly, compaction decisions, and user-visible budget indicators across turns.
-- `reg-extension-contribution-cache` — The cached resolved outputs of extension contributors—such as prompt fragments, MCP overlays, tool/thread lifecycle contributions, and user instructions—reused across thread and turn assembly.
-- `reg-shell-command-cache` — The session-visible cache of user-run shell command records and approved command-prefix memory that is reused for prompt context and later turns.
-- `reg-connector-selection-state` — The mutable per-session or per-thread selection/enablement state for which connectors/apps are currently chosen for use and prompt injection.
-- `reg-memories-startup-guard` — The startup and runtime guard state that tracks whether memories functionality is currently allowed, blocked, or degraded based on prerequisite checks.
+- `reg-effective-config` — The final set of settings Codex runs with after combining files, policies, profiles, cloud settings, thread overrides, and command-line flags.
+- `reg-feature-flags` — The shared list of enabled or disabled experimental and product features that changes what the app exposes.
+- `reg-shell-workspace-environment` — The current machine, shell, PATH, working directory, project root, Git state, and environment variables used to make commands behave like the user’s terminal.
+- `reg-model-provider-catalog` — The combined menu of usable model providers and models from bundled data, cache, live services, local servers, and account access.
+- `reg-network-proxy-policy` — The managed proxy and network-forwarding state that decides what network traffic is allowed, forwarded, or blocked.
+- `reg-permission-sandbox-policy` — The shared rules for file access, command execution, network access, approvals, and sandbox modes.
+- `reg-mcp-server-sessions` — The configured and connected MCP tool servers, their tools, resources, login state, approval rules, and active sessions.
+- `reg-plugin-marketplace-catalog` — The installed, built-in, workspace, and marketplace plugin information that controls extra tools, hooks, connectors, and prompt additions.
+- `reg-extension-host-state` — The shared extension runtime state and contributor hooks that let add-ons react to threads, turns, tools, prompts, events, and MCP setup.
+- `reg-skills-catalog` — The available skills list, including where each skill came from, whether it is enabled, and the instructions it can add to a session.
+- `reg-memory-store` — The saved long-term user memories and memory search results that can be loaded, updated, and inserted into future conversations.
+- `reg-live-session-services` — The toolbox attached to one running session, such as model access, auth, telemetry, approvals, tools, extensions, networking, and MCP connections.
+- `reg-thread-session-state` — The live state of a conversation thread, including its identity, workspace, selected model, history, permissions, listeners, and lifecycle status.
+- `reg-turn-state` — The shared clipboard for one active assistant turn, tracking the current task, pending replies, granted permissions, cancellations, and bookkeeping.
+- `reg-conversation-history-budget` — The accumulated messages, compacted summaries, token counts, and trimming decisions that determine what conversation context still fits.
+- `reg-prompt-context-stack` — The assembled prompt ingredients, including project instructions, permissions text, goals, memories, skills, plugin text, IDE details, warnings, and changed context.
+- `reg-tool-catalog` — The current set of tools the model may call, with schemas, names, MCP conversions, plugin additions, and execution handlers.
+- `reg-hook-rules` — The configured hooks and hook schemas that let external commands inspect or affect session starts, turns, tool calls, and other lifecycle events.
+- `reg-goal-state` — The live and persisted user goals, goal progress, and goal-thread associations synchronized into prompts, storage, analytics, and UI indicators.
+- `reg-realtime-stream-state` — Active realtime conversation state, including audio/text stream sessions, WebSocket transport state, buffers, and stop/cancel lifecycle data.
+- `reg-connector-directory-cache` — Cached ChatGPT/app connector directories, workspace connector settings, local connector metadata, and fallback lookup results used when exposing connectors to sessions and prompts.
+- `reg-collaboration-mode-catalog` — Built-in and configured collaboration-mode presets/templates that clients can list and apply to choose model, mode, reasoning, and prompt behavior.
+- `reg-ide-integration-state` — Active IDE-link state such as connected IDE clients, workspace metadata, open file or selection context, and IDE details injected into prompts or server notifications.
+- `reg-session-connector-selection` — Per-session selected or enabled app/ChatGPT connectors used to decide which connector context and tools are exposed to the model.

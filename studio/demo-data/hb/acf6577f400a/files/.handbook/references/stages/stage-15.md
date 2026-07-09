@@ -1,10 +1,10 @@
 # Multi-agent, collaboration, and background workflows  `stage-15`
 
-This stage sits above the core turn loop as the system’s collaboration and background-work layer: when a request cannot be completed by one agent in one pass, it spawns child threads, routes messages between them, waits on their progress, and runs longer-lived asynchronous pipelines.
+This stage is the system’s “extra workers” layer. It sits behind the main conversation loop and lets one session start helpers, send them messages, wait for them, stop them, or run background work. The agent files define the shared machinery: the module front door, roles and instructions, the registry of live agents, name-to-thread lookup, completion messages, and short status notes. The control files act like a dispatch desk: they limit how many agents run, keep only some threads loaded, and create, fork, reload, resume, or connect agents.
 
-At its center, the agent subsystem (`core/src/agent/*`) defines roles, resolves agent references, tracks live agents in a registry, enforces concurrency and residency limits, and performs actual spawn/reload/resume operations. `session_prefix.rs`, inter-agent completion messages, and `session/multi_agents.rs` shape the model-visible context around those lifecycle events. The multi-agent tool handlers then expose that control plane to the model: v1 and v2 tools cover spawning, sending input or mailbox messages, follow-up tasks, waiting, listing, interrupting, resuming, and closing agents, with shared validation and result formatting.
+The multi-agent tool files expose this machinery to the assistant. Version 1 and Version 2 tools cover spawning, messaging, follow-up tasks, waiting, listing, interrupting, resuming, and closing agents, with shared helpers for validation and errors. Delegation, review mode, code-mode work, and the Guardian extension use the same pattern to run supervised child agents.
 
-Around that core, `codex_delegate.rs`, review mode, code-mode delegation, and the guardian extension adapt nested or host-backed sub-sessions into the same orchestration model. `agent_jobs/*` scales this pattern across CSV rows by spawning workers and collecting results. The memories write pipeline uses internal spawning for two-phase extraction and consolidation, while `skills_watcher.rs` runs a separate background watcher that invalidates cached skill state when files change.
+Other background workflows reuse the idea at larger scale: agent jobs split CSV rows across workers and collect results; memory startup extracts and consolidates long-term notes; the skills watcher refreshes available skills when files change.
 
 ## Files in this stage
 
@@ -13,20 +13,26 @@ These files define the core agent subsystem, including role application, registr
 
 ### `core/src/agent/mod.rs`
 
-`orchestration` · `agent lifecycle and event processing`
+`other` · `cross-cutting`
 
-This module root declares the internal pieces of the agent subsystem: `agent_resolver`, `control`, `registry`, `role`, and `status`. It then re-exports a narrow set of items for sibling modules inside the crate: the protocol-level `AgentStatus` type, the `AgentControl` abstraction, registry helpers for thread spawn depth accounting, and `agent_status_from_event` for deriving status from events.
+This file does not contain runtime logic itself. Instead, it works like a signpost and service counter for the agent subsystem. In Rust, a `mod.rs` file defines what smaller files belong to a module, and it can choose which items are visible to the rest of the crate.
 
-The selected re-exports show the subsystem's responsibilities. `control` likely encapsulates commands or lifecycle operations for an agent instance; `registry` tracks spawned agent/thread relationships and enforces depth limits through `exceeds_thread_spawn_depth_limit` and `next_thread_spawn_depth`; `status` translates lower-level events into the externally meaningful `AgentStatus`; and `role` plus `agent_resolver` support choosing or interpreting agent identities. This file itself contains no executable logic, but it is the internal API choke point for agent-related coordination inside `core`. By keeping most modules `pub(crate)` and re-exporting only a few symbols, it preserves encapsulation while making the common agent operations available where needed.
+Here, the agent area is split into focused parts: resolving agents, controlling them, keeping a registry, describing roles, and translating or reporting status. Some of those modules are public within the crate, meaning other core code can use them directly. The registry module stays private, but this file still exposes two specific registry helpers for thread-spawn-depth tracking. That lets the rest of the system use the safe, intended entry points without depending on all registry internals.
+
+It also re-exports `AgentStatus` from the shared protocol package, plus `AgentControl` and `agent_status_from_event`, so callers can import common agent concepts from one place. Without this file, other parts of the program would need to know the exact internal file layout of the agent subsystem, making the code more fragile and harder to navigate.
 
 
 ### `core/src/agent/role.rs`
 
-`domain_logic` · `sub-agent spawn configuration and tool-spec generation`
+`config` · `spawn-agent configuration`
 
-This module is the role-resolution and role-application layer for spawned agents. `apply_role_to_config` chooses a role name, defaults missing input to `DEFAULT_ROLE_NAME`, resolves the declaration from either `config.agent_roles` or the built-in registry, and converts any internal loading/parsing failure into the user-facing string `agent type is currently not available` after logging a warning. The inner application path short-circuits when a role has no `config_file` or when the loaded TOML is an empty table. Otherwise it loads TOML from embedded built-ins or a user file, validates it with `deserialize_config_toml_with_base`, resolves relative paths against the role file’s base directory, and decides whether to preserve the current `model_provider` and `service_tier` based on whether the role layer explicitly sets those top-level keys.
+When the system creates a sub-agent, the caller may ask for a role such as `explorer` or `worker`. A role is like a job badge: it can add instructions, choose a model, or lock in other settings for that agent. This file does not decide when to create sub-agents. Instead, it answers: “Given this role name, what configuration should the new agent actually use?”
 
-The nested `reload` module rebuilds a full `Config` by cloning the existing `ConfigLayerStack`, inserting a new `ConfigLayerEntry` sourced from `ConfigLayerSource::SessionFlags` in precedence order, deserializing the effective merged config, and reloading with sticky overrides for cwd and selected runtime fields. The `spawn_tool_spec` module formats a human-readable role catalog, deduplicating user-defined names over built-ins and augmenting descriptions with notes extracted from role TOML when model, reasoning effort, or service tier are locked. The `built_in` module caches built-in role declarations in a `LazyLock` and maps embedded filenames like `explorer.toml` to `include_str!` contents.
+It first looks for a user-defined role, then falls back to built-in roles bundled with the program. If the role points to a role configuration file, the file is read and checked as normal TOML configuration. TOML is a plain text settings format. Relative paths inside that role file are resolved from the right folder, so path-based settings still work.
+
+The important subtlety is precedence. The role’s settings are inserted as a high-priority configuration layer, so they can override saved user config. But the caller’s current model provider and service tier are preserved unless the role explicitly sets them. Without that, spawning a sub-agent could accidentally drop runtime choices and fall back to defaults.
+
+The file also contains the built-in role declarations and a helper that turns all known roles into clear text for the spawn-agent tool.
 
 #### Function details
 
@@ -39,11 +45,11 @@ async fn apply_role_to_config(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Resolves the requested role name, defaults missing input to `default`, and applies that role’s config layer to the mutable session `Config`. It is the public entry point that converts internal failures into stable user-facing error strings.
+**Purpose**: Applies the requested role name to an existing session configuration. If no role is given, it uses the default role; if the role is unknown or cannot be loaded, it returns a user-facing error string.
 
-**Data flow**: Takes `&mut Config` and `Option<&str>` role name, substitutes `DEFAULT_ROLE_NAME` when absent, reads role declarations from `config.agent_roles` and built-ins via `resolve_role_config`, clones the selected `AgentRoleConfig`, and either returns `Err("unknown agent_type '...' ")` or awaits `apply_role_to_config_inner`. On inner failure it logs a warning and returns `AGENT_TYPE_UNAVAILABLE_ERROR`; on success it mutates `*config` in place and returns `Ok(())`.
+**Data flow**: It receives a mutable configuration and an optional role name. It chooses the default name when needed, looks up the matching role declaration, and then asks the inner application step to rebuild the configuration. On success, the input configuration is changed in place; on failure, the caller receives a simple error message.
 
-**Call relations**: Spawn orchestration calls this before creating a sub-agent so the child inherits role-specific settings. It delegates actual TOML loading and config rebuilding to `apply_role_to_config_inner` after `resolve_role_config` chooses the declaration source.
+**Call relations**: This is the main entry point for this file’s role-application work. Spawn-agent handling and related tests call it when a new agent needs role-specific settings. It delegates lookup to `resolve_role_config` and the real reload work to `apply_role_to_config_inner`.
 
 *Call graph*: calls 2 internal fn (apply_role_to_config_inner, resolve_role_config); called by 3 (new_default_turn_uses_config_aware_skills_for_role_overrides, handle_spawn_agent, handle_spawn_agent).
 
@@ -58,11 +64,11 @@ async fn apply_role_to_config_inner(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs the actual role-layer application once a concrete `AgentRoleConfig` has already been resolved. It decides whether any role file exists, loads and validates it, and rebuilds the config with sticky runtime overrides where appropriate.
+**Purpose**: Does the actual work of applying a found role declaration to the current configuration. It loads the role’s configuration layer, decides which runtime choices should be preserved, and replaces the old configuration with the rebuilt one.
 
-**Data flow**: Consumes `&mut Config`, the resolved role name, and `&AgentRoleConfig`. It computes `is_built_in` by checking whether the role name is absent from `config.agent_roles`, exits early if `role.config_file` is `None`, loads TOML with `load_role_layer_toml`, exits early again if the TOML is an empty table, derives two booleans by checking whether `model_provider` and `service_tier` keys are absent, then replaces `*config` with the `Config` returned by `reload::build_next_config`.
+**Data flow**: It receives the current configuration, the role name, and the role declaration. If the role has no config file, nothing changes. If it has a config file, that TOML layer is loaded, inspected for keys such as `model_provider` and `service_tier`, and used to build a new configuration. The mutable configuration is then overwritten with that new version.
 
-**Call relations**: This function is only reached from `apply_role_to_config` after successful role resolution. It delegates file parsing to `load_role_layer_toml` and full config reconstruction to `reload::build_next_config`.
+**Call relations**: `apply_role_to_config` calls this after it has resolved the role name. This function calls `load_role_layer_toml` to get the role settings, then hands those settings to `reload::build_next_config` so the whole configuration stack can be rebuilt cleanly.
 
 *Call graph*: calls 1 internal fn (load_role_layer_toml); called by 1 (apply_role_to_config); 1 external calls (build_next_config).
 
@@ -78,11 +84,11 @@ async fn load_role_layer_toml(
 ) -> anyhow::Result<TomlValue>
 ```
 
-**Purpose**: Loads a role config file into a `TomlValue`, handling built-in embedded files and user-provided files differently. It also validates the resulting config schema and rewrites relative paths against the role file’s base directory.
+**Purpose**: Loads and validates the TOML settings for a role. It supports both built-in role files embedded in the program and user-defined role files on disk.
 
-**Data flow**: Reads `&Config`, `&Path` config file, `bool is_built_in`, and `&str role_name`. For built-ins it fetches embedded text from `built_in::config_file_contents`, parses it with `toml::from_str`, and uses `config.codex_home` as the base path. For user roles it asynchronously reads the file from disk, derives the parent directory, parses through `parse_agent_role_file_contents(..., Some(role_name))`, and extracts `.config`. In both cases it validates with `deserialize_config_toml_with_base`, resolves relative paths with `resolve_relative_paths_in_config_toml`, and returns the transformed `TomlValue`.
+**Data flow**: It receives the current configuration, a role config file path, a flag saying whether the role is built in, and the role name. For built-in roles, it fetches bundled text; for user roles, it reads the file from disk and parses it as an agent role file. It then validates the TOML as configuration and resolves relative paths. The result is a TOML value ready to be inserted as a configuration layer.
 
-**Call relations**: Called only by `apply_role_to_config_inner` when a role has a `config_file`. It centralizes all I/O and TOML parsing so the caller can focus on merge policy.
+**Call relations**: `apply_role_to_config_inner` calls this when a role has an associated config file. It may consult `built_in::config_file_contents` for bundled role files, or use filesystem reading for user files, then relies on the shared config parsing and path-resolution helpers before handing TOML back to the reload path.
 
 *Call graph*: calls 3 internal fn (resolve_relative_paths_in_config_toml, parse_agent_role_file_contents, deserialize_config_toml_with_base); called by 1 (apply_role_to_config_inner); 5 external calls (parent, anyhow!, config_file_contents, read_to_string, from_str).
 
@@ -96,11 +102,11 @@ fn resolve_role_config(
 ) -> Option<&'a AgentRoleConfig>
 ```
 
-**Purpose**: Looks up a role declaration by name, preferring user-defined roles over built-ins. It provides the single resolution rule used by role application.
+**Purpose**: Finds the declaration for a role name. User-defined roles take priority over built-in roles with the same name.
 
-**Data flow**: Accepts `&Config` and `&str role_name`, checks `config.agent_roles.get(role_name)`, and falls back to `built_in::configs().get(role_name)`. Returns `Option<&AgentRoleConfig>` without mutating state.
+**Data flow**: It receives the current configuration and a role name. It first checks the role map stored in the user/session configuration. If nothing is found there, it checks the built-in role map. It returns the matching role declaration if one exists, or nothing if the name is unknown.
 
-**Call relations**: This is the first step in `apply_role_to_config`; if it returns `None`, the caller emits the unknown-role error instead of attempting any file loading.
+**Call relations**: `apply_role_to_config` calls this before attempting to apply a role. Its result decides whether the role application proceeds or whether the caller gets an “unknown agent_type” error.
 
 *Call graph*: called by 1 (apply_role_to_config).
 
@@ -116,11 +122,11 @@ async fn build_next_config(
     ) -> anyhow::Result<C
 ```
 
-**Purpose**: Reconstructs a full `Config` after inserting the role layer into the existing layer stack. It preserves selected runtime overrides that should survive the reload.
+**Purpose**: Rebuilds the full configuration after adding the role layer. This keeps role changes consistent with the same configuration-loading machinery used elsewhere in the application.
 
-**Data flow**: Takes the current `&Config`, a role-layer `TomlValue`, and two booleans controlling sticky preservation. It builds a new `ConfigLayerStack`, deserializes the effective merged `ConfigToml`, computes `ConfigOverrides`, then awaits `Config::load_config_with_layer_stack(...)` using `LOCAL_FS`, the merged config, the overrides, cloned `codex_home`, and the new stack. Returns the newly loaded `Config`.
+**Data flow**: It receives the current configuration, the role’s TOML layer, and two flags saying whether to preserve the current model provider and service tier. It builds a new layer stack, turns the combined settings into a typed config shape, prepares runtime overrides, and loads a fresh `Config`. The output is the new complete configuration.
 
-**Call relations**: Invoked by `apply_role_to_config_inner` after TOML loading. It delegates stack assembly, effective-config deserialization, and override construction to sibling helpers in the `reload` module.
+**Call relations**: `apply_role_to_config_inner` calls this after loading the role TOML. Inside the reload flow, it coordinates `build_config_layer_stack`, `deserialize_effective_config`, and `reload_overrides`, then hands everything to the general config loader.
 
 *Call graph*: 4 external calls (load_config_with_layer_stack, build_config_layer_stack, deserialize_effective_config, reload_overrides).
 
@@ -134,11 +140,11 @@ fn build_config_layer_stack(
     ) -> anyhow::Result<ConfigLayerStack>
 ```
 
-**Purpose**: Creates a new `ConfigLayerStack` by cloning the current layers and inserting the role layer at the correct precedence position. It preserves the existing requirements metadata from the original stack.
+**Purpose**: Creates a new ordered stack of configuration layers with the role layer added at the right priority. A layer stack is like a pile of transparent sheets: higher-priority sheets can cover settings from lower-priority ones.
 
-**Data flow**: Reads the current `Config` and a borrowed role-layer TOML value, clones the existing layers via `existing_layers`, inserts a freshly built role layer with `insert_layer`, then constructs and returns `ConfigLayerStack::new(layers, cloned_requirements, cloned_requirements_toml)`.
+**Data flow**: It receives the current configuration and the role TOML. It copies the existing layers, creates a new role layer from the TOML, inserts that layer into the correct sorted position, and builds a new `ConfigLayerStack` while preserving existing requirements. The result is a full stack that includes the role settings.
 
-**Call relations**: This helper is called from `reload::build_next_config` before deserializing the merged config. It isolates the ordering-sensitive layer-stack manipulation.
+**Call relations**: `reload::build_next_config` calls this first during reload. It relies on `existing_layers` to copy the old stack, `role_layer` to wrap the role TOML, and `insert_layer` to place that new layer correctly.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (clone, existing_layers, insert_layer, role_layer).
 
@@ -152,11 +158,11 @@ fn deserialize_effective_config(
     ) -> anyhow::Result<ConfigToml>
 ```
 
-**Purpose**: Turns the effective merged TOML from a `ConfigLayerStack` back into a typed `ConfigToml` using the session’s codex-home base path. This catches schema or path-resolution issues before the full reload.
+**Purpose**: Converts the combined layer stack into the typed configuration format used by the loader. This catches invalid settings after all layers have been merged.
 
-**Data flow**: Accepts `&Config` and `&ConfigLayerStack`, reads `config_layer_stack.effective_config()`, passes it with `&config.codex_home` to `deserialize_config_toml_with_base`, and returns the typed `ConfigToml`.
+**Data flow**: It receives the current configuration and a completed configuration layer stack. It asks the stack for its effective merged TOML, then deserializes that TOML using the project’s home directory as the base path. The output is a `ConfigToml` value ready for full config loading.
 
-**Call relations**: Used by `reload::build_next_config` after the new stack is assembled and before `Config::load_config_with_layer_stack` is called.
+**Call relations**: `reload::build_next_config` calls this after building the updated layer stack. It bridges the generic layer system and the typed config loader.
 
 *Call graph*: calls 2 internal fn (effective_config, deserialize_config_toml_with_base).
 
@@ -167,11 +173,11 @@ fn deserialize_effective_config(
 fn existing_layers(config: &Config) -> Vec<ConfigLayerEntry>
 ```
 
-**Purpose**: Extracts the current config layers in lowest-precedence-first order, including disabled layers, into an owned vector. This gives the reload path a mutable copy it can edit.
+**Purpose**: Copies the current configuration layers so a role can be added without losing the settings that were already active.
 
-**Data flow**: Reads `config.config_layer_stack`, calls `get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)`, clones each `ConfigLayerEntry`, collects them into `Vec<ConfigLayerEntry>`, and returns that vector.
+**Data flow**: It receives the current configuration. It asks the existing layer stack for all layers from lowest to highest priority, including disabled ones, clones them, and returns them as a vector.
 
-**Call relations**: This helper feeds `reload::build_config_layer_stack`, which needs an owned layer list before inserting the role layer.
+**Call relations**: `reload::build_config_layer_stack` calls this before inserting the role layer. It supplies the starting stack that the role layer is added to.
 
 
 ##### `reload::insert_layer`  (lines 191–195)
@@ -180,11 +186,11 @@ fn existing_layers(config: &Config) -> Vec<ConfigLayerEntry>
 fn insert_layer(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigLayerEntry)
 ```
 
-**Purpose**: Inserts a new config layer into an existing ordered vector while preserving ordering by layer name. It uses partitioning rather than a full sort.
+**Purpose**: Places a new configuration layer into an already sorted list of layers. This keeps the layer order stable and predictable.
 
-**Data flow**: Takes `&mut Vec<ConfigLayerEntry>` and a new `ConfigLayerEntry`, computes an insertion index with `partition_point(|existing_layer| existing_layer.name <= layer.name)`, and inserts the layer at that index. It mutates the vector in place and returns nothing.
+**Data flow**: It receives a mutable list of layers and the new layer to add. It finds the first position after layers whose names sort before or equal to the new layer’s name, then inserts the new layer there. The input list is changed in place.
 
-**Call relations**: Called by `reload::build_config_layer_stack` after cloning existing layers and creating the role layer.
+**Call relations**: `reload::build_config_layer_stack` calls this when adding the role layer. Its job is small but important: the later `ConfigLayerStack` constructor expects the layers to be in the right order.
 
 
 ##### `reload::role_layer`  (lines 197–199)
@@ -193,11 +199,11 @@ fn insert_layer(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigLayerEntry)
 fn role_layer(role_layer_toml: TomlValue) -> ConfigLayerEntry
 ```
 
-**Purpose**: Wraps a role TOML document in a `ConfigLayerEntry` tagged as `SessionFlags`. This gives role settings the same precedence class as session flag overrides.
+**Purpose**: Wraps the role TOML as a configuration layer marked as coming from session flags. That source gives the role high precedence over persisted configuration.
 
-**Data flow**: Consumes a `TomlValue` and returns `ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml)`. No external state is read or written.
+**Data flow**: It receives the role’s TOML settings. It creates and returns a `ConfigLayerEntry` whose source is `SessionFlags` and whose contents are the role TOML.
 
-**Call relations**: Used by `reload::build_config_layer_stack` immediately before insertion into the cloned layer list.
+**Call relations**: `reload::build_config_layer_stack` calls this before insertion. The resulting layer is then passed to `insert_layer` and eventually becomes part of the rebuilt configuration stack.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -212,11 +218,11 @@ fn reload_overrides(
     ) -> ConfigOverrides
 ```
 
-**Purpose**: Builds the `ConfigOverrides` that should survive config reload, including cwd and selected runtime executable paths, and optionally the current provider and service tier. This prevents role application from unintentionally resetting sticky runtime choices.
+**Purpose**: Builds the runtime override values that should survive the reload. These are settings chosen by the current session, not necessarily written into the role file.
 
-**Data flow**: Reads fields from `&Config` and two booleans. It always sets `cwd`, copies `codex_linux_sandbox_exe` and `main_execve_wrapper_exe`, conditionally sets `model_provider` and `service_tier` using `then(...)`, fills the rest from `Default::default()`, and returns the assembled `ConfigOverrides`.
+**Data flow**: It receives the current configuration and two preserve flags. It always carries forward the current working directory and executable paths. It carries forward the current model provider and service tier only when the role did not explicitly set those top-level keys. The output is a `ConfigOverrides` value for the config loader.
 
-**Call relations**: This helper is called by `reload::build_next_config` right before the final `Config::load_config_with_layer_stack` call.
+**Call relations**: `reload::build_next_config` calls this just before loading the fresh configuration. Its result prevents role application from accidentally resetting important runtime choices.
 
 *Call graph*: 1 external calls (default).
 
@@ -227,11 +233,11 @@ fn reload_overrides(
 fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String
 ```
 
-**Purpose**: Builds the full spawn-agent tool description string from both built-in and user-defined roles. It is the public formatter entry point for tool metadata.
+**Purpose**: Builds the text that explains which agent roles are available to the spawn-agent tool. This text helps the main agent choose a valid role name.
 
-**Data flow**: Accepts a `&BTreeMap<String, AgentRoleConfig>` of user-defined roles, fetches built-ins from `built_in::configs()`, passes both maps to `build_from_configs`, and returns the resulting `String`.
+**Data flow**: It receives the user-defined role map. It fetches the built-in roles, combines both sources through `build_from_configs`, and returns a formatted string describing the available roles.
 
-**Call relations**: Callers that need the tool’s role list use this wrapper rather than formatting built-ins and user roles themselves.
+**Call relations**: Code that prepares the spawn-agent tool description calls this. It gathers built-in declarations from `built_in::configs` and delegates formatting and duplicate handling to `spawn_tool_spec::build_from_configs`.
 
 *Call graph*: 2 external calls (configs, build_from_configs).
 
@@ -245,11 +251,11 @@ fn build_from_configs(
     ) -> String
 ```
 
-**Purpose**: Formats the available-role section while deduplicating names and ensuring user-defined roles appear before built-ins. It produces the final multi-line help text shown to the model.
+**Purpose**: Combines user-defined and built-in role declarations into one readable role list. User-defined roles are shown first and can hide built-ins with the same name.
 
-**Data flow**: Reads two ordered `BTreeMap`s, tracks seen names in a `BTreeSet`, pushes formatted role strings into a `Vec<String>` first from user-defined roles and then from built-ins only when unseen, joins them with newlines, and interpolates them into a header string mentioning `DEFAULT_ROLE_NAME`.
+**Data flow**: It receives separate maps for built-in and user-defined roles. It tracks role names it has already included, formats each unique role, and joins the formatted blocks into one instruction string. The result explains the default role and lists all available role names and descriptions.
 
-**Call relations**: This non-inlined helper is called by `spawn_tool_spec::build` and exists partly to make ordering and deduplication behavior easy to test.
+**Call relations**: `spawn_tool_spec::build` calls this after collecting the two role sources. It calls `spawn_tool_spec::format_role` for each role that should appear in the final text.
 
 *Call graph*: 4 external calls (new, new, format_role, format!).
 
@@ -260,11 +266,11 @@ fn build_from_configs(
 fn format_role(name: &str, declaration: &AgentRoleConfig) -> String
 ```
 
-**Purpose**: Formats one role declaration for the spawn-tool spec, optionally augmenting its description with notes about locked model, reasoning effort, and service tier extracted from the role’s config file. Roles without descriptions are rendered as `no description`.
+**Purpose**: Turns one role declaration into the text shown in the spawn-agent tool description. If the role locks certain settings, it adds notes so the caller knows those settings cannot be changed by a spawn request.
 
-**Data flow**: Takes a role name and `&AgentRoleConfig`. If `description` is present, it optionally reads the role config contents from embedded built-ins or the filesystem, parses them as TOML, extracts `model`, `model_reasoning_effort`, and `service_tier` string values, synthesizes explanatory bullet notes, and returns a block like `name: { ... }`. If no description exists, it returns `"name: no description"`.
+**Data flow**: It receives a role name and its declaration. If there is no description, it returns a simple “no description” line. If there is a description, it may read the role’s config file, parse it, look for fixed `model`, `model_reasoning_effort`, and `service_tier` values, and append explanatory notes. The output is one formatted text block for that role.
 
-**Call relations**: Called repeatedly by `spawn_tool_spec::build_from_configs` for each visible role. It is the only formatter that inspects role TOML contents to expose immutable settings in the tool description.
+**Call relations**: `spawn_tool_spec::build_from_configs` calls this while assembling the available-role list. It may consult `built_in::config_file_contents` for bundled files or read a user role file from disk, then includes any discovered locked-setting notes in the final tool text.
 
 *Call graph*: 1 external calls (format!).
 
@@ -275,11 +281,11 @@ fn format_role(name: &str, declaration: &AgentRoleConfig) -> String
 fn configs() -> &'static BTreeMap<String, AgentRoleConfig>
 ```
 
-**Purpose**: Returns the cached map of built-in role declarations. It defines the built-in names, descriptions, and optional embedded config files available even when the user has not configured any roles.
+**Purpose**: Provides the built-in role declarations bundled with the program. These include the default role and special-purpose roles such as `explorer` and `worker`.
 
-**Data flow**: Uses a `static LazyLock<BTreeMap<String, AgentRoleConfig>>` initialized once with entries for `default`, `explorer`, and `worker`, each containing description text, optional `config_file`, and `nickname_candidates`. Returns a shared reference to that map.
+**Data flow**: It takes no input from the caller. The first time it is used, it constructs a sorted map of built-in role names to their descriptions and optional config files; later calls reuse the cached map. It returns a shared reference to that map.
 
-**Call relations**: This function is consulted by both role resolution and spawn-tool-spec generation whenever built-in roles need to be enumerated or looked up.
+**Call relations**: `resolve_role_config` uses this as the fallback after user-defined roles. `spawn_tool_spec::build` also uses it when generating the list of roles that can be passed to the spawn-agent tool.
 
 *Call graph*: 1 external calls (new).
 
@@ -290,26 +296,24 @@ fn configs() -> &'static BTreeMap<String, AgentRoleConfig>
 fn config_file_contents(path: &Path) -> Option<&'static str>
 ```
 
-**Purpose**: Maps a built-in role config path like `explorer.toml` to the embedded TOML source text compiled into the binary. Unknown paths return `None`.
+**Purpose**: Returns the embedded TOML text for a built-in role config file. This lets built-in roles work without needing separate files on the user’s disk.
 
-**Data flow**: Accepts `&Path`, converts it to `&str` with `to_str()`, matches the string against known built-in filenames, and returns `Some(&'static str)` from `include_str!` constants or `None` if there is no embedded file.
+**Data flow**: It receives a path from a role declaration. It converts that path to text and checks for known built-in filenames such as `explorer.toml` and `awaiter.toml`. If the name matches, it returns the compiled-in file contents; otherwise it returns nothing.
 
-**Call relations**: Built-in role loading uses this helper in `load_role_layer_toml`, and spawn-tool-spec formatting uses it to inspect built-in role TOML for locked-setting notes.
+**Call relations**: `load_role_layer_toml` calls this when applying a built-in role with a config file. `spawn_tool_spec::format_role` also uses it when it wants to inspect a built-in role file for locked model or service-tier settings.
 
 *Call graph*: 2 external calls (to_str, include_str!).
 
 
 ### `core/src/agent/registry.rs`
 
-`data_model` · `cross-cutting`
+`domain_logic` · `active during session startup and whenever agents are spawned, queried, updated, or released`
 
-This file defines the shared session-level registry behind `AgentControl`. `AgentRegistry` stores two kinds of state: a `Mutex<ActiveAgents>` containing the `agent_tree` map and nickname bookkeeping, and an atomic `total_count` used for thread-limit enforcement across clones. `AgentMetadata` records the thread ID, optional `AgentPath`, nickname, role, and last plaintext task message for each agent.
+Codex can run a main agent and spawn sub-agents, a bit like a team lead asking helpers to work on separate tasks. This file is the session’s roster and gatekeeper for that team. Without it, Codex could create too many helpers, accidentally reuse the same agent path, lose track of which thread belongs to which agent, or leave behind half-created agents after a failed spawn.
 
-The registry supports both committed and provisional spawn state. `reserve_spawn_slot` increments `total_count`—either atomically bounded by `try_increment_spawned(max_threads)` or unconditionally when no limit applies—and returns a `SpawnReservation`. That reservation can reserve a nickname and/or path before the thread exists. If the reservation is dropped before `commit`, its `Drop` implementation releases any reserved path placeholder and decrements `total_count`, preventing leaked capacity. On successful spawn, `SpawnReservation::commit` clears provisional fields and calls `register_spawned_thread`.
+The central type is `AgentRegistry`. It stores live agent records in a mutex, which is a lock that stops two tasks from changing the same roster at the same time. It also keeps an atomic counter, meaning a number that can be safely updated by several threads without a normal lock. Before a new sub-agent is created, code asks the registry for a `SpawnReservation`. This is like putting a temporary hold on a seat: it counts against the limit immediately, and it can also reserve a nickname and path.
 
-Path handling uses `agent_tree` keys of either the concrete `AgentPath` string or a synthetic `thread:{thread_id}` key for anonymous agents. `reserve_agent_path` inserts a placeholder metadata entry with no `agent_id`, which blocks duplicate paths until commit or drop. Nickname allocation prefers a caller-specified nickname, otherwise chooses randomly from available names after formatting them with `format_agent_nickname`. When the pool is exhausted, it clears `used_agent_nicknames`, increments `nickname_reset_count`, emits an OpenTelemetry counter, and starts reusing names with ordinal suffixes like `the 2nd`.
-
-The file also includes small helpers for spawn-depth accounting and metadata lookup/update, including clearing `last_task_message` when encrypted communication replaces plaintext task text.
+If spawning succeeds, the reservation is committed and becomes a real registered agent. If spawning fails or the reservation is dropped, the temporary hold is automatically undone. The file also supports looking up agents by path or thread id, listing live non-root agents, remembering the last task message, and checking spawn depth so sub-agents cannot nest too deeply.
 
 #### Function details
 
@@ -319,11 +323,11 @@ The file also includes small helpers for spawn-depth accounting and metadata loo
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String
 ```
 
-**Purpose**: Formats a base nickname, optionally appending an ordinal reset suffix when the nickname pool has been recycled. It produces names like `Atlas`, `Atlas the 2nd`, or `Atlas the 11th`.
+**Purpose**: Turns a base nickname into the display name Codex should use for an agent. If the nickname pool has been reset, it adds a human-style suffix such as “the 2nd” so reused names stay distinguishable.
 
-**Data flow**: Takes `name: &str` and `nickname_reset_count: usize`. If the reset count is 0 it returns `name.to_string()`. Otherwise it computes `value = reset_count + 1`, derives the ordinal suffix with special handling for 11–13, formats `"{name} the {value}{suffix}"`, and returns the new `String`.
+**Data flow**: It takes a base name and a reset count. With no resets, it returns the name unchanged. After resets, it calculates the right ordinal suffix and returns a new string like “Scout the 3rd”.
 
-**Call relations**: This helper is used by `AgentRegistry::reserve_agent_nickname` when generating candidate nicknames before and after pool resets.
+**Call relations**: This is a helper for `AgentRegistry::reserve_agent_nickname`. When the registry needs to offer an unused name, it calls this function to produce the exact nickname text before checking whether that text is already taken.
 
 *Call graph*: called by 1 (reserve_agent_nickname); 1 external calls (format!).
 
@@ -334,11 +338,11 @@ fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String
 fn session_depth(session_source: &SessionSource) -> i32
 ```
 
-**Purpose**: Extracts the current spawn depth from a `SessionSource`. Non-thread-spawn sources are treated as depth 0.
+**Purpose**: Finds how deeply nested the current session is in the sub-agent tree. A normal session has depth zero; a thread-spawned sub-agent carries its own recorded depth.
 
-**Data flow**: Pattern-matches `&SessionSource`; for `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. })` it returns that depth, for other subagent variants and non-subagent sources it returns 0.
+**Data flow**: It receives a session source value. If that source says this session came from a thread spawn, it reads and returns the stored depth. For other session types, it returns zero.
 
-**Call relations**: This helper is used only by `next_thread_spawn_depth`.
+**Call relations**: This is used by `next_thread_spawn_depth`. It provides the current depth so the next spawn can be marked as one level deeper.
 
 *Call graph*: called by 1 (next_thread_spawn_depth).
 
@@ -349,11 +353,11 @@ fn session_depth(session_source: &SessionSource) -> i32
 fn next_thread_spawn_depth(session_source: &SessionSource) -> i32
 ```
 
-**Purpose**: Computes the child spawn depth for a new thread relative to an existing session source. It saturates upward from the current depth.
+**Purpose**: Calculates the depth that should be assigned to a newly spawned sub-agent. This helps Codex track and limit nested agent spawning.
 
-**Data flow**: Accepts `&SessionSource`, calls `session_depth(session_source)`, applies `saturating_add(1)`, and returns the resulting `i32`.
+**Data flow**: It receives the current session source, asks `session_depth` for the current depth, then adds one. The addition is saturating, meaning it avoids overflowing if the number is already extremely large.
 
-**Call relations**: This helper wraps `session_depth` for callers that need the next child depth rather than the current one.
+**Call relations**: Code preparing a new thread spawn can call this to label the child agent correctly. It depends on `session_depth` to understand where the parent session currently sits.
 
 *Call graph*: calls 1 internal fn (session_depth).
 
@@ -364,11 +368,11 @@ fn next_thread_spawn_depth(session_source: &SessionSource) -> i32
 fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bool
 ```
 
-**Purpose**: Checks whether a proposed spawn depth is beyond the configured maximum. It is a simple policy predicate.
+**Purpose**: Answers the simple question: is this proposed spawn depth deeper than allowed? It is the yes-or-no check used to enforce nesting limits.
 
-**Data flow**: Takes `depth: i32` and `max_depth: i32`, compares `depth > max_depth`, and returns the boolean result.
+**Data flow**: It takes a proposed depth and the maximum allowed depth. It compares them and returns true if the proposed depth is greater than the limit, otherwise false.
 
-**Call relations**: This standalone helper is available to spawn logic elsewhere in the subsystem.
+**Call relations**: This function stands alone as a policy check. Spawn-preparation code can use it after calculating the next depth to decide whether to allow or reject another nested agent.
 
 
 ##### `AgentRegistry::reserve_spawn_slot`  (lines 80–97)
@@ -380,11 +384,11 @@ fn reserve_spawn_slot(
     ) -> Result<SpawnReservation>
 ```
 
-**Purpose**: Claims one session-level spawn slot and returns an RAII reservation object that can later reserve nickname/path metadata and commit the final agent. It enforces the optional max-thread limit atomically across all control clones.
+**Purpose**: Reserves capacity for a new sub-agent before the agent is actually created. This prevents races where two spawns both think there is room and together exceed the session limit.
 
-**Data flow**: Consumes `self: &Arc<Self>` and `Option<usize>` for `max_threads`. If a limit is present it calls `try_increment_spawned(max_threads)` and returns `Err(CodexErr::AgentLimitReached { max_threads })` on failure; otherwise it increments `total_count` unconditionally with `fetch_add`. On success it returns `SpawnReservation { state: Arc::clone(self), active: true, reserved_agent_nickname: None, reserved_agent_path: None }`.
+**Data flow**: It receives an optional maximum thread count. If there is a maximum, it tries to increase the shared counter only if the limit has not been reached; if there is no maximum, it simply increments the counter. On success it returns a `SpawnReservation`; on failure it returns an error saying the agent limit was reached.
 
-**Call relations**: Spawn and resume paths call this before creating or restoring a thread. It delegates bounded counting to `try_increment_spawned`; later cleanup or finalization happens through `SpawnReservation::drop` or `SpawnReservation::commit`.
+**Call relations**: This is the first step in the spawning flow. It calls `AgentRegistry::try_increment_spawned` when a maximum exists, and the returned `SpawnReservation` is later used to reserve names, reserve paths, and either commit or automatically roll back the attempted spawn.
 
 *Call graph*: calls 1 internal fn (try_increment_spawned); 2 external calls (clone, fetch_add).
 
@@ -395,11 +399,11 @@ fn reserve_spawn_slot(
 fn release_spawned_thread(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Removes a committed agent entry by thread ID and decrements the counted thread total for non-root agents. It is the teardown counterpart to spawn-slot commit.
+**Purpose**: Removes a finished spawned agent from the registry and frees its counted slot. This keeps the session roster and the spawn limit counter from drifting upward forever.
 
-**Data flow**: Takes a `thread_id`, locks `active_agents`, searches `agent_tree` for a metadata entry whose `agent_id == Some(thread_id)`, removes that entry if found, and determines whether it represented a counted non-root agent. If so, it decrements `total_count` with `fetch_sub(1, Ordering::AcqRel)`. It returns no value.
+**Data flow**: It receives a thread id. It searches the active agent records for that thread, removes the matching record if found, and checks whether it was a non-root agent. If so, it subtracts one from the total spawned count.
 
-**Call relations**: Shutdown paths call this after removing a thread from the manager. It works directly on registry state and does not delegate to other file-local helpers.
+**Call relations**: This is used when a spawned thread is no longer active. It updates the same registry that was populated during spawn registration, and it deliberately does not count the root agent as a spawned sub-agent.
 
 *Call graph*: 1 external calls (fetch_sub).
 
@@ -410,11 +414,11 @@ fn release_spawned_thread(&self, thread_id: ThreadId)
 fn register_root_thread(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Registers the root agent path for a session if it is not already present. This anchors the agent tree at `/root` with the given thread ID.
+**Purpose**: Records the main/root agent thread in the registry. The root agent is tracked for lookup, but it is not treated as a spawned helper for limit counting.
 
-**Data flow**: Locks `active_agents`, inserts an `AgentMetadata` with `agent_id: Some(thread_id)` and `agent_path: Some(AgentPath::root())` under the key `AgentPath::ROOT.to_string()` if that entry is currently absent, and returns no value.
+**Data flow**: It receives the root thread id, locks the active-agent roster, and inserts a root-path record if one is not already present. Existing root metadata is left unchanged.
 
-**Call relations**: This is used when establishing the session root. It does not overwrite an existing root entry.
+**Call relations**: This runs when the main session thread needs to be known to the registry. Later lookup functions can find the root by path, while listing and counting logic can exclude it where appropriate.
 
 
 ##### `AgentRegistry::agent_id_for_path`  (lines 136–143)
@@ -423,11 +427,11 @@ fn register_root_thread(&self, thread_id: ThreadId)
 fn agent_id_for_path(&self, agent_path: &AgentPath) -> Option<ThreadId>
 ```
 
-**Purpose**: Looks up the live thread ID currently associated with a given agent path. It returns `None` for unknown paths or placeholder path reservations without a committed thread.
+**Purpose**: Looks up which thread id belongs to a given agent path. This lets other code address an agent by its stable path instead of by an internal thread number.
 
-**Data flow**: Locks `active_agents`, indexes `agent_tree` by `agent_path.as_str()`, extracts `metadata.agent_id`, and returns `Option<ThreadId>`.
+**Data flow**: It receives an `AgentPath`, locks the registry, and searches the agent tree entry for that path string. If the metadata has a thread id, it returns it; otherwise it returns nothing.
 
-**Call relations**: Control logic uses this to resolve path-based agent references into thread IDs.
+**Call relations**: This is a read-only lookup into the roster built by root registration, path reservation, and spawned-thread registration. It uses the path’s string form to find the matching stored record.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -438,11 +442,11 @@ fn agent_id_for_path(&self, agent_path: &AgentPath) -> Option<ThreadId>
 fn agent_metadata_for_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata>
 ```
 
-**Purpose**: Finds and clones the metadata record for a given thread ID. It supports later inspection of path, nickname, role, and last task message.
+**Purpose**: Finds the stored information for an agent when the caller knows the thread id. This is useful when an event comes from a thread and Codex needs to know which agent it represents.
 
-**Data flow**: Locks `active_agents`, scans `agent_tree.values()` for a metadata entry whose `agent_id == Some(thread_id)`, clones that `AgentMetadata`, and returns it as an `Option`.
+**Data flow**: It receives a thread id, locks the registry, scans the stored agent metadata, and returns a cloned copy of the matching metadata if one exists.
 
-**Call relations**: This is used by control logic and tests when they need metadata keyed by thread ID rather than path.
+**Call relations**: This is a read-only query over the same records inserted by registration. It complements `AgentRegistry::agent_id_for_path`: one lookup starts from a path, this one starts from a thread id.
 
 
 ##### `AgentRegistry::live_agents`  (lines 155–167)
@@ -451,11 +455,11 @@ fn agent_metadata_for_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata
 fn live_agents(&self) -> Vec<AgentMetadata>
 ```
 
-**Purpose**: Returns the set of currently committed non-root agents. It filters out the root entry and any placeholder reservations without a thread ID.
+**Purpose**: Returns the currently active sub-agents, excluding the root agent. This gives callers a clean list of helper agents that are still running.
 
-**Data flow**: Locks `active_agents`, iterates `agent_tree.values()`, filters to metadata with `agent_id.is_some()` and `agent_path` not equal to root, clones the remaining metadata entries, collects them into a `Vec<AgentMetadata>`, and returns it.
+**Data flow**: It locks the registry, walks through all metadata records, keeps only records with a thread id and with a path that is not the root path, clones those records, and returns them as a list.
 
-**Call relations**: This provides a snapshot view of active child agents for callers that need to enumerate them.
+**Call relations**: This is a snapshot-style read of the active roster. It depends on registration adding agents and release removing them, so callers see the current non-root agents at the moment of the lock.
 
 
 ##### `AgentRegistry::update_last_task_message`  (lines 169–181)
@@ -464,11 +468,11 @@ fn live_agents(&self) -> Vec<AgentMetadata>
 fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String)
 ```
 
-**Purpose**: Stores the latest plaintext task message for a committed agent thread. This metadata can later be surfaced or cleared when encrypted communication replaces it.
+**Purpose**: Stores the latest task message associated with an agent thread. This gives the registry a small memory of what each live agent was most recently asked to do.
 
-**Data flow**: Takes `thread_id` and `last_task_message: String`, locks `active_agents`, finds the metadata entry whose `agent_id == Some(thread_id)`, and writes `Some(last_task_message)` into `metadata.last_task_message`. It returns no value.
+**Data flow**: It receives a thread id and a message string. It finds the matching metadata record and replaces that record’s `last_task_message` with the new message. If no matching thread is found, nothing changes.
 
-**Call relations**: Control logic calls this when a child receives a plaintext task. The complementary clearing path is `clear_last_task_message`.
+**Call relations**: This updates metadata already registered for a thread. Other registry readers, such as metadata lookup or live-agent listing, can then see the refreshed task message in the returned metadata.
 
 
 ##### `AgentRegistry::clear_last_task_message`  (lines 183–195)
@@ -477,11 +481,11 @@ fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: Strin
 fn clear_last_task_message(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Removes any stored plaintext task message for a committed agent thread. This is used when task content should no longer be retained in metadata.
+**Purpose**: Removes the remembered latest task message for an agent thread. This is used when that task marker is no longer current or should no longer be shown.
 
-**Data flow**: Takes `thread_id`, locks `active_agents`, finds the matching metadata entry by `agent_id`, and sets `metadata.last_task_message = None`. It returns no value.
+**Data flow**: It receives a thread id, finds the matching metadata record, and sets its `last_task_message` field to empty. If the thread is not found, it leaves the registry unchanged.
 
-**Call relations**: Control logic uses this when encrypted inter-agent communication supersedes a previously stored plaintext task.
+**Call relations**: This is the counterpart to `AgentRegistry::update_last_task_message`. Both functions edit the metadata that lookup and listing functions later return.
 
 
 ##### `AgentRegistry::register_spawned_thread`  (lines 197–214)
@@ -490,11 +494,11 @@ fn clear_last_task_message(&self, thread_id: ThreadId)
 fn register_spawned_thread(&self, agent_metadata: AgentMetadata)
 ```
 
-**Purpose**: Commits final metadata for a newly spawned or resumed thread into the registry. It also records the chosen nickname as used.
+**Purpose**: Turns a successfully spawned agent into a real entry in the registry. This is the point where temporary reservation information becomes official active-agent metadata.
 
-**Data flow**: Consumes an `AgentMetadata`. If `agent_metadata.agent_id` is `None`, it returns early. Otherwise it locks `active_agents`, derives the map key from `agent_path.to_string()` or `format!("thread:{thread_id}")`, inserts `agent_nickname` into `used_agent_nicknames` if present, and stores the metadata in `agent_tree` under that key.
+**Data flow**: It receives an `AgentMetadata` value. If the metadata has no thread id, it does nothing. Otherwise it chooses a registry key from the agent path or, if no path exists, from the thread id; records the nickname as used if present; and stores the metadata in the agent tree.
 
-**Call relations**: This is called by `SpawnReservation::commit` after a spawn or resume succeeds.
+**Call relations**: This is part of the commit path for a spawn reservation. After a spawn has succeeded, `SpawnReservation::commit` hands the final metadata here so future lookup, listing, and release operations can find the agent.
 
 
 ##### `AgentRegistry::reserve_agent_nickname`  (lines 216–254)
@@ -503,11 +507,11 @@ fn register_spawned_thread(&self, agent_metadata: AgentMetadata)
 fn reserve_agent_nickname(&self, names: &[&str], preferred: Option<&str>) -> Option<String>
 ```
 
-**Purpose**: Allocates a unique nickname for a pending agent, either honoring a preferred nickname or choosing randomly from the available pool. When the pool is exhausted, it resets nickname usage and starts reusing names with ordinal suffixes.
+**Purpose**: Chooses and reserves a nickname for an agent before it is fully spawned. This helps avoid two active agents being given the same friendly name.
 
-**Data flow**: Accepts a slice of base names and an optional preferred nickname, locks `active_agents`, and either returns the preferred string directly or builds `available_names` by formatting each base name with `format_agent_nickname` and filtering out names already in `used_agent_nicknames`. If any are available it chooses one randomly with `choose(&mut rand::rng())`; otherwise it clears `used_agent_nicknames`, increments `nickname_reset_count`, emits the `codex.multi_agent.nickname_pool_reset` metric if telemetry is available, chooses a random base name, formats it with the new reset count, inserts the chosen nickname into `used_agent_nicknames`, and returns `Some(nickname)`. If the input name list is empty, it returns `None`.
+**Data flow**: It receives a list of possible names and an optional preferred name. If a preferred name is supplied, it uses that directly. Otherwise it formats available names, filters out names already in use, and randomly chooses one. If every name has been used, it clears the used-name set, increments a reset counter, records a metric if metrics are available, and chooses a newly suffixed name. It returns the reserved nickname or nothing if no names are available.
 
-**Call relations**: This internal allocator is used by `SpawnReservation::reserve_agent_nickname_with_preference`. It delegates suffix formatting to `format_agent_nickname`.
+**Call relations**: This is called through `SpawnReservation::reserve_agent_nickname_with_preference`. It relies on `format_agent_nickname` to create names such as reused-name variants, and it updates the registry’s nickname set so later reservations know the name is taken.
 
 *Call graph*: calls 1 internal fn (format_agent_nickname); 2 external calls (global, rng).
 
@@ -518,11 +522,11 @@ fn reserve_agent_nickname(&self, names: &[&str], preferred: Option<&str>) -> Opt
 fn reserve_agent_path(&self, agent_path: &AgentPath) -> Result<()>
 ```
 
-**Purpose**: Reserves an agent path before a thread is committed, preventing duplicate path allocation during concurrent spawns. It inserts a placeholder metadata entry with no thread ID.
+**Purpose**: Temporarily claims an agent path before the agent exists. This prevents another spawn from taking the same path while the first spawn is still being prepared.
 
-**Data flow**: Takes `&AgentPath`, locks `active_agents`, and matches on `agent_tree.entry(agent_path.to_string())`. If occupied, it returns `Err(CodexErr::UnsupportedOperation(format!("agent path `{agent_path}` already exists")))`; if vacant, it inserts `AgentMetadata { agent_path: Some(agent_path.clone()), ..Default::default() }` and returns `Ok(())`.
+**Data flow**: It receives an `AgentPath`, locks the agent tree, and checks whether that path string already exists. If it does, it returns an error. If not, it inserts placeholder metadata containing the path but no thread id, then returns success.
 
-**Call relations**: This internal method is called by `SpawnReservation::reserve_agent_path` during spawn preparation. Placeholder cleanup is handled by `release_reserved_agent_path` if the reservation is dropped.
+**Call relations**: This is called through `SpawnReservation::reserve_agent_path` during spawn preparation. If the spawn is later abandoned, the reservation can be removed; if the spawn succeeds, final metadata replaces or completes the active record.
 
 *Call graph*: 5 external calls (default, format!, clone, to_string, UnsupportedOperation).
 
@@ -533,11 +537,11 @@ fn reserve_agent_path(&self, agent_path: &AgentPath) -> Result<()>
 fn release_reserved_agent_path(&self, agent_path: &AgentPath)
 ```
 
-**Purpose**: Removes a placeholder path reservation if it was never committed to a real thread. It leaves committed path entries intact.
+**Purpose**: Removes a path reservation that never became a real running agent. This cleanup prevents failed spawns from blocking that path forever.
 
-**Data flow**: Takes `&AgentPath`, locks `active_agents`, checks whether `agent_tree.get(agent_path.as_str())` exists and has `agent_id.is_none()`, and if so removes that entry. It returns no value.
+**Data flow**: It receives an agent path, locks the registry, and checks the matching record. It only removes the record if it exists and has no thread id, which means it is still just a placeholder reservation.
 
-**Call relations**: This is called from `SpawnReservation::drop` when a reservation with a reserved path is abandoned.
+**Call relations**: This is used by `SpawnReservation::drop` when a reservation is abandoned before commit. It pairs with `AgentRegistry::reserve_agent_path` to make path reservation safe even when spawning fails midway.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -548,11 +552,11 @@ fn release_reserved_agent_path(&self, agent_path: &AgentPath)
 fn try_increment_spawned(&self, max_threads: usize) -> bool
 ```
 
-**Purpose**: Atomically increments the counted thread total only if it is still below the configured maximum. It provides lock-free limit enforcement shared across all control clones.
+**Purpose**: Safely increases the spawned-agent counter only if doing so would stay under the configured limit. This is the low-level guard that makes the maximum thread count reliable across concurrent spawns.
 
-**Data flow**: Reads `self.total_count` with `load(Ordering::Acquire)`, then loops: if `current >= max_threads` it returns `false`; otherwise it attempts `compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)`. On success it returns `true`; on failure it retries with the updated observed count.
+**Data flow**: It reads the current atomic count. If the count is already at or above the maximum, it returns false. Otherwise it tries to swap the count to one higher; if another thread changed the count first, it rereads and tries again. On a successful increment, it returns true.
 
-**Call relations**: This helper is called only by `AgentRegistry::reserve_spawn_slot` when a bounded max-thread limit is in effect.
+**Call relations**: This is called by `AgentRegistry::reserve_spawn_slot` whenever a maximum thread limit is active. It gives that higher-level reservation function a safe yes-or-no answer about whether a new spawn may proceed.
 
 *Call graph*: called by 1 (reserve_spawn_slot); 2 external calls (compare_exchange_weak, load).
 
@@ -567,11 +571,11 @@ fn reserve_agent_nickname_with_preference(
     ) -> Result<String>
 ```
 
-**Purpose**: Reserves a nickname for the pending spawn and remembers it inside the reservation so the caller can include it in final metadata. It converts an empty nickname pool into a user-facing unsupported-operation error.
+**Purpose**: Adds a nickname hold to an existing spawn reservation. It lets spawn preparation pick a friendly agent name, optionally honoring a requested preferred name.
 
-**Data flow**: Takes mutable `self`, a slice of candidate names, and an optional preferred nickname. It calls `self.state.reserve_agent_nickname(names, preferred)`, converts `None` into `CodexErr::UnsupportedOperation("no available agent nicknames")`, stores the chosen nickname in `self.reserved_agent_nickname`, and returns the nickname string.
+**Data flow**: It receives possible names and an optional preferred name. It asks the registry to reserve a nickname; if none can be reserved, it returns an error. On success, it stores the reserved nickname inside the reservation and returns the nickname to the caller.
 
-**Call relations**: Spawn preparation code calls this while assembling thread-spawn metadata. It delegates actual allocation to `AgentRegistry::reserve_agent_nickname`.
+**Call relations**: The provided call graph shows this being called by `prepare_thread_spawn`. In that flow, after a spawn slot exists, this method claims the nickname that will be used if the new agent is successfully created.
 
 *Call graph*: called by 1 (prepare_thread_spawn).
 
@@ -582,11 +586,11 @@ fn reserve_agent_nickname_with_preference(
 fn reserve_agent_path(&mut self, agent_path: &AgentPath) -> Result<()>
 ```
 
-**Purpose**: Reserves an agent path for the pending spawn and records that reservation for later cleanup if the spawn fails. It is the reservation-layer wrapper over the registry’s path placeholder insertion.
+**Purpose**: Adds a path hold to an existing spawn reservation. This makes sure the new agent’s address in the agent tree is unique before the spawn finishes.
 
-**Data flow**: Takes mutable `self` and `&AgentPath`, calls `self.state.reserve_agent_path(agent_path)?`, stores `Some(agent_path.clone())` in `self.reserved_agent_path`, and returns `Ok(())`.
+**Data flow**: It receives an agent path, asks the registry to reserve that path, and if successful stores a copy of the path inside the reservation. It returns success or the registry’s error if the path was already taken.
 
-**Call relations**: This is called by spawn preparation before thread creation. If the reservation is later dropped without commit, `SpawnReservation::drop` will release the placeholder path.
+**Call relations**: The provided call graph shows this being called by `prepare_thread_spawn`. It is the path-reservation step in the same preparation flow that may also reserve a spawn slot and nickname.
 
 *Call graph*: called by 1 (prepare_thread_spawn); 1 external calls (clone).
 
@@ -597,11 +601,11 @@ fn reserve_agent_path(&mut self, agent_path: &AgentPath) -> Result<()>
 fn commit(mut self, agent_metadata: AgentMetadata)
 ```
 
-**Purpose**: Finalizes a pending spawn reservation after thread creation succeeds. It clears provisional reservation fields, registers the committed metadata, and disables drop cleanup.
+**Purpose**: Finalizes a spawn reservation after the agent has actually been created. Once committed, the reservation will no longer roll itself back when dropped.
 
-**Data flow**: Consumes `self` mutably and an `AgentMetadata`, sets `reserved_agent_nickname` and `reserved_agent_path` to `None`, calls `self.state.register_spawned_thread(agent_metadata)`, sets `self.active = false`, and returns no value.
+**Data flow**: It consumes the reservation and receives the final agent metadata. It clears any temporary nickname and path markers stored on the reservation, registers the spawned thread in the registry, and marks the reservation inactive.
 
-**Call relations**: Spawn and resume orchestration call this after they know the final thread ID and metadata. It delegates registry insertion to `AgentRegistry::register_spawned_thread`.
+**Call relations**: This is the success path for a reservation. It follows earlier calls that reserved a slot, nickname, or path, and hands the completed metadata into the registry so later lookups and releases treat the agent as live.
 
 
 ##### `SpawnReservation::drop`  (lines 346–353)
@@ -610,20 +614,22 @@ fn commit(mut self, agent_metadata: AgentMetadata)
 fn drop(&mut self)
 ```
 
-**Purpose**: Cleans up an abandoned spawn reservation by releasing any reserved path placeholder and decrementing the counted thread total. This prevents leaked capacity and stale path claims on failed spawns.
+**Purpose**: Automatically cleans up an uncommitted spawn reservation. This is Rust’s safety net: if spawn preparation fails or exits early, the reserved count and path do not leak.
 
-**Data flow**: Reads `self.active`; if true, it takes `self.reserved_agent_path` and passes it to `self.state.release_reserved_agent_path`, then decrements `self.state.total_count` with `fetch_sub(1, Ordering::AcqRel)`. It returns no value.
+**Data flow**: When the reservation object is being destroyed, it checks whether it is still active. If so, it releases any reserved path that was only a placeholder and subtracts one from the total spawned count.
 
-**Call relations**: This runs implicitly when a `SpawnReservation` is dropped without `commit`. It is the failure-path counterpart to `SpawnReservation::commit`.
+**Call relations**: This runs automatically when a `SpawnReservation` goes out of scope without `SpawnReservation::commit`. It is the rollback partner to the reservation methods, ensuring partial spawn attempts do not leave stale registry state behind.
 
 
 ### `core/src/context/inter_agent_completion_message.rs`
 
-`domain_logic` · `multi-agent coordination`
+`data_model` · `cross-cutting`
 
-This file defines `InterAgentCompletionMessage`, a small prompt fragment used to serialize one agent’s final answer for another agent or coordinator. The struct stores three fields: `task_name` and `sender`, both typed as `codex_protocol::AgentPath`, and a free-form `payload` string. The constructor accepts the payload as any `Into<String>`, making it easy to pass either borrowed or owned text.
+When several agents work together, one agent may need to tell another, “I am done, and here is my final answer.” This file gives that handoff a consistent shape. It stores three pieces of information: the task name, who sent the message, and the actual final payload. Think of it like a labeled envelope: the outside says which task it belongs to and who sent it, and the inside contains the answer.
 
-As a `ContextualUserFragment`, the message is emitted with role `assistant`, not `user` or `developer`, reflecting that it represents assistant-produced content in an inter-agent exchange. Like several instruction-style fragments, it uses empty markers, so the body is inserted directly rather than wrapped in XML-like tags. The body format is fixed and line-oriented: it begins with `Message Type: FINAL_ANSWER`, then includes `Task name`, `Sender`, and a `Payload:` header followed by the raw payload text. This explicit textual schema makes the message easy for downstream prompt consumers to parse semantically without requiring a separate structured protocol object inside the transcript.
+The struct, `InterAgentCompletionMessage`, is also made into a `ContextualUserFragment`. In plain terms, that means it knows how to present itself as a piece of conversation context for the model. Even though it is a message between agents, its `role` is reported as `assistant`, so it appears as assistant-produced content. It uses no special start or end markers, and its body is formatted with clear labels: message type, task name, sender, and payload.
+
+Without this file, inter-agent completion messages would likely be assembled by hand in multiple places. That would make the format easier to break or accidentally change, which matters because the receiving side depends on a predictable message layout.
 
 #### Function details
 
@@ -633,11 +639,11 @@ As a `ContextualUserFragment`, the message is emitted with role `assistant`, not
 fn new(task_name: AgentPath, sender: AgentPath, payload: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a completion message from a task path, sender path, and payload text. It stores the payload as owned text while preserving the typed agent-path fields.
+**Purpose**: Creates a new completion message from a task name, the sending agent, and the final text payload. This is the normal way to package an agent’s completed work before it is inserted into context.
 
-**Data flow**: It takes `task_name: AgentPath`, `sender: AgentPath`, and `payload: impl Into<String>`, converts the payload with `payload.into()`, stores all three fields in `Self`, and returns the new `InterAgentCompletionMessage`.
+**Data flow**: It receives the task path, sender path, and payload text. The payload can be any value that can be turned into a string, and the function converts it into owned text. It returns a filled `InterAgentCompletionMessage` containing all three pieces.
 
-**Call relations**: This constructor is used by higher-level formatting code that prepares final-answer messages for inter-agent communication.
+**Call relations**: When `format_inter_agent_completion_message` needs to build a completion notice, it calls this constructor first. After this object exists, the context-fragment methods can turn it into the text form used downstream.
 
 *Call graph*: called by 1 (format_inter_agent_completion_message); 1 external calls (into).
 
@@ -648,11 +654,11 @@ fn new(task_name: AgentPath, sender: AgentPath, payload: impl Into<String>) -> S
 fn role(&self) -> &'static str
 ```
 
-**Purpose**: Declares that the fragment should be inserted as assistant-role content. This matches the semantics of one agent delivering a final answer.
+**Purpose**: Says which conversation role this fragment should appear under. For this completion message, it always presents the content as coming from the assistant.
 
-**Data flow**: It takes `&self` and returns the static string `"assistant"`.
+**Data flow**: It reads no changing data from the message. It simply returns the fixed text `assistant`.
 
-**Call relations**: This trait method is consumed by generic prompt assembly code when placing the message into the transcript.
+**Call relations**: This is part of the `ContextualUserFragment` behavior. Code that renders fragments into conversation context can ask this message for its role and use that answer when placing it into the larger prompt or transcript.
 
 
 ##### `InterAgentCompletionMessage::markers`  (lines 27–29)
@@ -661,11 +667,11 @@ fn role(&self) -> &'static str
 fn markers(&self) -> (&'static str, &'static str)
 ```
 
-**Purpose**: Returns empty wrapper markers so the completion message is emitted as plain text. No XML-like envelope surrounds the formatted body.
+**Purpose**: Returns the start and end markers that should wrap this fragment, if any. This message type uses no wrapping markers.
 
-**Data flow**: It takes `&self`, calls `Self::type_markers()`, and returns the empty-string pair.
+**Data flow**: It takes the message object, but does not need to inspect its fields. It asks `type_markers` for the marker pair and returns that pair unchanged.
 
-**Call relations**: This method fulfills the `ContextualUserFragment` trait and delegates marker definition to the type-level function.
+**Call relations**: This is another part of the `ContextualUserFragment` contract. When a renderer wants to know whether to surround this message with special labels, it calls this method, which delegates to `type_markers` so the marker choice is defined in one place.
 
 *Call graph*: 1 external calls (type_markers).
 
@@ -676,11 +682,11 @@ fn markers(&self) -> (&'static str, &'static str)
 fn type_markers() -> (&'static str, &'static str)
 ```
 
-**Purpose**: Defines that this fragment has no opening or closing markers. The line-oriented body text is the entire serialized form.
+**Purpose**: Defines the marker pair for this kind of fragment. For inter-agent completion messages, both markers are empty strings, meaning no extra wrapper text is added.
 
-**Data flow**: It returns `("", "")` directly.
+**Data flow**: It receives no message-specific input. It returns two fixed empty strings: one for the opening marker and one for the closing marker.
 
-**Call relations**: This static marker definition is used by `markers` and by any generic code that needs the fragment’s canonical wrapping behavior.
+**Call relations**: `markers` calls this function to get the marker pair. Keeping this as a separate type-level method lets the marker choice be reused without needing a particular message instance.
 
 
 ##### `InterAgentCompletionMessage::body`  (lines 35–40)
@@ -689,22 +695,24 @@ fn type_markers() -> (&'static str, &'static str)
 fn body(&self) -> String
 ```
 
-**Purpose**: Formats the completion message into a fixed textual schema containing message type, task name, sender, and payload. It is the human- and model-readable serialization of the struct.
+**Purpose**: Builds the readable text body of the completion message. This is the part that spells out the message type, task name, sender, and final payload.
 
-**Data flow**: It reads `self.task_name`, `self.sender`, and `self.payload`, interpolates them into a multiline `format!` string, and returns the resulting `String`.
+**Data flow**: It reads the stored task name, sender, and payload from the message. It formats them into a multi-line string with clear labels and returns that string. It does not change the message.
 
-**Call relations**: This trait method is called during prompt assembly to turn the typed completion message into transcript text for downstream agents or coordinators.
+**Call relations**: When context-rendering code needs the actual text of this fragment, it calls `body`. This is where the structured envelope becomes the plain text that another agent or model can read.
 
 *Call graph*: 1 external calls (format!).
 
 
 ### `core/src/session_prefix.rs`
 
-`util` · `cross-cutting, when synthesizing multi-agent context/history messages`
+`domain_logic` · `agent status updates and conversation context building`
 
-This file contains small formatting helpers for synthetic user-role messages inserted into conversation history to describe multi-agent state. The constants at the top define a strict token budget for completion messages: `COMPLETION_MESSAGE_MAX_TOKENS` is 1000, `COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE` reserves 100 tokens for wrapper text, and `ERROR_MAX_TOKENS` limits the embedded error body accordingly. `ERROR_NEXT_ACTION` is the fixed remediation sentence appended to errored-agent completions.
+This file is a small translator between internal agent state and the text that gets placed into the conversation. In this system, some messages are stored as if they came from the user, but they are not really user requests. They are session markers: notes that tell the model things like “this subagent finished,” “this agent failed,” or “here is the list of available subagents.” Without this file, those updates could be inconsistent, too long, or unclear to the model.
 
-`format_subagent_notification_message` wraps an agent reference and `AgentStatus` in a `SubagentNotification` and renders it. `format_inter_agent_completion_message` is more nuanced: it maps terminal `AgentStatus` variants into payload text, returns `None` for nonterminal states (`PendingInit`, `Running`, `Interrupted`), and for `Errored` statuses truncates the raw error string with `truncate_text(..., TruncationPolicy::Tokens(ERROR_MAX_TOKENS))` before appending the next-action guidance. The final payload is wrapped in `InterAgentCompletionMessage` and rendered. `format_subagent_context_line` produces a compact bullet line for listing subagents, including an optional nickname only when it is present and non-empty. Together these helpers ensure multi-agent state markers are concise, bounded, and consistently phrased.
+The main idea is simple: take structured information, such as an agent name and an AgentStatus, and render it into a standard text shape. For completion messages, the file decides whether there is anything worth saying yet. If an agent is still starting, running, or interrupted, it returns nothing. If the agent completed, errored, shut down, or was not found, it creates a message for the receiving agent to read.
+
+One important safety detail is error length. Error text can be very large, so this file trims it to a token limit. A token is a small chunk of text used by language models. This keeps one failure from flooding the conversation and crowding out useful context. It also adds a suggested next action after an error, so the model knows how to proceed.
 
 #### Function details
 
@@ -717,11 +725,11 @@ fn format_subagent_notification_message(
 ) -> String
 ```
 
-**Purpose**: Formats a subagent status update into the rendered notification string stored in session context. It preserves the provided agent reference and clones the status into the notification object.
+**Purpose**: This function creates a standard notification saying what state a subagent is in. It is used when the system needs to show the model a clear update about a named subagent.
 
-**Data flow**: It takes `agent_reference: &str` and `status: &AgentStatus`, constructs `SubagentNotification::new(agent_reference, status.clone())`, renders it, and returns the resulting `String`.
+**Data flow**: It receives an agent reference, such as a name or path, and an AgentStatus, which describes the agent’s current state. It copies the status, wraps the reference and status into a SubagentNotification object, then renders that object into plain text. The output is the formatted message that can be inserted into the conversation.
 
-**Call relations**: Called by completion-watcher logic when a subagent status change needs to be recorded as a model-visible notification.
+**Call relations**: When the completion watcher is being started, it calls this function to produce the notification text the model should see. This function delegates the exact message shape to SubagentNotification::new and its render step, so the caller does not need to know how the notification is written.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (maybe_start_completion_watcher); 1 external calls (clone).
 
@@ -736,11 +744,11 @@ fn format_inter_agent_completion_message(
 ) -> Option<String>
 ```
 
-**Purpose**: Builds the rendered completion message sent from one agent to another when a child agent reaches a terminal state. It suppresses nonterminal statuses and truncates large error payloads to stay within a fixed token budget.
+**Purpose**: This function creates a message from one agent to another when a task reaches a meaningful end state. It also decides when no message should be sent yet, such as while the agent is still running.
 
-**Data flow**: Inputs are `task_name: AgentPath`, `sender: AgentPath`, and `&AgentStatus`. It pattern matches the status: completed statuses yield the optional completion message or an empty string, errored status yields a truncated error plus `ERROR_NEXT_ACTION`, shutdown/not-found yield fixed strings, and pending/running/interrupted return `None`. For terminal cases it wraps the payload in `InterAgentCompletionMessage::new(task_name, sender, payload)`, renders it, and returns `Some(String)`.
+**Data flow**: It receives the task name, the sending agent, and the sender’s status. If the status is completed, it uses the completion message if one exists, or an empty message if not. If the status is errored, it trims the error text to a safe length and adds guidance about what to do next. If the status says the agent shut down or was not found, it creates a short explanation. If the status is still pending, running, or interrupted, it returns no message. When there is a payload, it wraps the task name, sender, and payload into an InterAgentCompletionMessage and renders it as text.
 
-**Call relations**: Used by completion-forwarding and watcher code whenever a child agent's terminal status should be queued to its parent. It delegates truncation to `truncate_text` with a token-based policy.
+**Call relations**: Several parts of the multi-agent flow call this when they need to tell another agent that a child or collaborator has finished, failed, disappeared, or shut down. The completion watcher uses it during status monitoring, and parent-child forwarding paths use it when relaying a child agent’s result back upward. It hands off final formatting to InterAgentCompletionMessage so every completion notice has the same structure.
 
 *Call graph*: calls 1 internal fn (new); called by 4 (maybe_start_completion_watcher, multi_agent_v2_completion_queues_message_for_direct_parent, forward_child_completion_to_parent, multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn); 4 external calls (new, truncate_text, format!, Tokens).
 
@@ -754,11 +762,11 @@ fn format_subagent_context_line(
 ) -> String
 ```
 
-**Purpose**: Formats one bullet line describing a subagent for inclusion in context text. If a non-empty nickname is present it is appended after the agent reference.
+**Purpose**: This function formats one line in a simple list of subagents. It lets the context show an agent reference by itself, or with a friendly nickname when one is available.
 
-**Data flow**: It takes `agent_reference` and optional `agent_nickname`. It filters out empty nicknames, then returns either `"- {agent_reference}: {agent_nickname}"` or `"- {agent_reference}"`.
+**Data flow**: It receives an agent reference and an optional nickname. If the nickname exists and is not empty, it returns a line like “- reference: nickname.” If there is no nickname, or the nickname is blank, it returns just “- reference.” The only output is that one formatted text line.
 
-**Call relations**: Used by callers that build human-readable subagent listings in prompts or context fragments.
+**Call relations**: This is a helper used when building model-visible context about available subagents. It does not call into the larger agent workflow; it simply provides a consistent list format for whatever code is assembling that context.
 
 *Call graph*: 1 external calls (format!).
 
@@ -767,11 +775,11 @@ fn format_subagent_context_line(
 
 `domain_logic` · `request handling`
 
-This file adds a narrow concurrency-control layer on top of `AgentControl`. The central state is `AgentExecutionLimiter`, which stores an `active` execution count in an `AtomicUsize` and a one-time-configured `max_threads` in a `OnceLock<usize>`. The limiter is intentionally selective: only Multi-Agent V2 sessions whose `SessionSource` is `SubAgent(_)` are counted. Root sessions and V1 sessions bypass the limit entirely.
+This file is a safety gate for multi-agent execution. In this system, an agent can have sub-agents, and those sub-agents can start their own turns of work. Without a limit, a busy or badly behaved session could create too many simultaneous running threads, using too much memory or compute. This file keeps that under control.
 
-`AgentControl::ensure_execution_capacity_for_op` is the higher-level check used before submitting an operation. It first filters to operations that actually begin a turn: `Op::UserInput` and `Op::InterAgentCommunication` with `trigger_turn = true`. It then loads the thread, skips enforcement if that thread already has an `active_turn`, derives the effective `MultiAgentVersion` from the thread or config, and delegates to the synchronous capacity check. That means mailbox-style inter-agent messages that do not trigger a turn do not consume execution capacity.
+The main idea is like a room with a maximum occupancy sign. Before a sub-agent starts a new turn, `AgentControl` asks whether there is still room. If the operation is not the kind that begins a turn, it is allowed through immediately. If the thread already has an active turn, it is also allowed, because it is not starting a new one. Otherwise, the code checks whether this session is the kind that should be limited: specifically, version 2 multi-agent sessions where the session is a sub-agent.
 
-When execution should be counted, `AgentControl::execution_guard` clones the shared limiter and increments `active` by constructing an `AgentExecutionGuard`. The guard’s `Drop` implementation decrements the counter, so callers do not need explicit cleanup paths. A notable design choice is that `initialize` uses `get_or_init`, so the first configured limit wins and later attempts to change it are ignored. If the limiter was never initialized, `max_threads()` falls back to `usize::MAX`, effectively disabling the cap.
+The actual counter lives in `AgentExecutionLimiter`. It stores the maximum allowed count and an atomic active count. “Atomic” means the number can be safely changed by multiple tasks at the same time without corrupting it. When execution starts, an `AgentExecutionGuard` is created and the active count goes up. When that guard is dropped, usually because the work finished, the count goes back down automatically.
 
 #### Function details
 
@@ -781,11 +789,11 @@ When execution should be counted, `AgentControl::execution_guard` clones the sha
 fn drop(&mut self)
 ```
 
-**Purpose**: Releases one counted execution slot when a guard goes out of scope. This is the cleanup mechanism that keeps the active-turn count accurate even on early returns or errors.
+**Purpose**: This automatically releases one execution slot when a guarded agent execution ends. It exists so callers do not have to remember to manually decrement the active count.
 
-**Data flow**: Reads `self.limiter`, then atomically decrements its `active` counter with `fetch_sub(1, Ordering::AcqRel)`. It returns no value and mutates only the shared limiter state.
+**Data flow**: It reads the limiter stored inside the guard, subtracts one from the shared active-execution counter, and returns nothing. The before state is “this execution is counted as active”; the after state is “one fewer execution is counted as active.”
 
-**Call relations**: This runs implicitly whenever a guard produced by `AgentControl::execution_guard` or `AgentExecutionLimiter::guard` is dropped. It is the terminal step in the counted-execution lifecycle and does not delegate further.
+**Call relations**: This is triggered by Rust automatically when an `AgentExecutionGuard` goes out of scope. The guard is created by `AgentExecutionLimiter::guard`, so these two functions work as a pair: one claims a slot, and this one gives it back.
 
 
 ##### `AgentControl::ensure_execution_capacity_for_op`  (lines 30–48)
@@ -798,11 +806,11 @@ async fn ensure_execution_capacity_for_op(
     ) -> CodexResult<()>
 ```
 
-**Purpose**: Checks whether a specific incoming `Op` would start a new counted turn and rejects it if the V2 subagent execution cap is already full. It avoids charging capacity for operations that do not begin work or for threads already in an active turn.
+**Purpose**: This checks whether a specific incoming operation is allowed to start a new agent turn. It is the higher-level check that understands both the operation and the current thread state.
 
-**Data flow**: Consumes `&self`, a `ThreadId`, and `&Op`. It first inspects the op via `op_starts_turn`; if false, it returns `Ok(())`. Otherwise it upgrades the control to live manager state, asynchronously loads the thread, reads `thread.codex.session.active_turn`, fetches session config, derives `MultiAgentVersion` from thread metadata or config features, and passes version plus `thread.session_source` into `ensure_execution_capacity`. It returns `Ok(())` on success or a `CodexErr`, typically `AgentLimitReached`, on failure.
+**Data flow**: It receives a thread id and an operation. First it asks `op_starts_turn` whether the operation would begin a turn; if not, it approves it. If it might begin a turn, it looks up the thread, checks whether that thread already has an active turn, reads the session configuration, decides which multi-agent version applies, and then passes that information to `ensure_execution_capacity`. The output is either success or an error saying the agent limit has been reached.
 
-**Call relations**: This is the op-aware front door for execution limiting. It invokes `op_starts_turn` to decide whether enforcement applies, then delegates the actual policy decision to `AgentControl::ensure_execution_capacity` after gathering thread state and configuration.
+**Call relations**: This is the front door for capacity checking when an operation arrives. It uses `op_starts_turn` as a quick filter, then calls `AgentControl::ensure_execution_capacity` only when a new turn may actually be starting.
 
 *Call graph*: calls 2 internal fn (ensure_execution_capacity, op_starts_turn).
 
@@ -817,11 +825,11 @@ fn ensure_execution_capacity(
     ) -> CodexResult<()>
 ```
 
-**Purpose**: Performs the actual synchronous capacity check for a given multi-agent version and session source. It returns an `AgentLimitReached` error only for counted V2 subagent executions when the limiter is full.
+**Purpose**: This enforces the active-execution limit for sessions that are supposed to be limited. If the limit does not apply, it lets the execution continue.
 
-**Data flow**: Takes `MultiAgentVersion` and `&SessionSource`. It reads the policy predicate from `is_execution_limited`; if limiting does not apply, it returns `Ok(())`. Otherwise it reads the configured maximum from `self.agent_execution_limiter.max_threads()` and current occupancy via `has_capacity()`. It returns `Ok(())` if capacity remains, else `Err(CodexErr::AgentLimitReached { max_threads })`.
+**Data flow**: It receives the multi-agent protocol version and the session source. It asks `is_execution_limited` whether this kind of session should count against the limit. If not, it returns success. If yes, it reads the maximum allowed thread count and checks whether the limiter still has capacity. It returns success when there is room, or a `CodexErr::AgentLimitReached` error with the configured maximum when there is not.
 
-**Call relations**: This function is called by `AgentControl::ensure_execution_capacity_for_op` after that method determines an op would start a fresh turn. It delegates only to `is_execution_limited` for the policy gate and otherwise works directly against the limiter.
+**Call relations**: This is called by `AgentControl::ensure_execution_capacity_for_op` after that function has determined that a new turn may be starting. It relies on `is_execution_limited` to decide whether the shared limiter should matter for this session.
 
 *Call graph*: calls 1 internal fn (is_execution_limited); called by 1 (ensure_execution_capacity_for_op).
 
@@ -836,11 +844,11 @@ fn execution_guard(
     ) -> Option<AgentExecutionGuard>
 ```
 
-**Purpose**: Creates a counting guard for executions that should consume one active V2 subagent slot. For non-limited sessions it returns `None`, so callers can skip bookkeeping entirely.
+**Purpose**: This creates a guard object when an execution should be counted against the limit. The guard keeps the active count accurate for the lifetime of the execution.
 
-**Data flow**: Accepts `MultiAgentVersion` and `&SessionSource`. It evaluates `is_execution_limited`; when true it clones `self.agent_execution_limiter`, calls `guard()` on the cloned `Arc`, and wraps the result in `Some`. When false it returns `None`. The side effect, when present, is incrementing the limiter’s `active` count.
+**Data flow**: It receives the multi-agent version and session source. It checks `is_execution_limited`; if the session is not limited, it returns `None`. If the session is limited, it clones the shared limiter, increments the active count through `AgentExecutionLimiter::guard`, and returns the new guard wrapped in `Some`.
 
-**Call relations**: This is the companion to `ensure_execution_capacity`: callers use it after deciding work should be counted. It relies on `is_execution_limited` to mirror the same policy boundary and delegates guard creation to `AgentExecutionLimiter::guard`.
+**Call relations**: This is used when execution is actually beginning, after capacity has been checked. It uses the same `is_execution_limited` rule as `ensure_execution_capacity`, so only limited sub-agent executions take a slot.
 
 *Call graph*: calls 1 internal fn (is_execution_limited).
 
@@ -851,11 +859,11 @@ fn execution_guard(
 fn initialize(&self, max_threads: usize)
 ```
 
-**Purpose**: Sets the maximum allowed counted executions exactly once. It preserves the first configured limit and ignores later attempts to overwrite it.
+**Purpose**: This sets the maximum number of active limited executions. It only sets the value once, so later attempts do not overwrite the original limit.
 
-**Data flow**: Takes `max_threads: usize` and writes it into `self.max_threads` through `OnceLock::get_or_init`. It returns no value; if the lock was already initialized, state remains unchanged.
+**Data flow**: It receives a maximum thread count. If the limiter does not already have a maximum, it stores that number; if one is already present, it leaves the existing value unchanged. It returns nothing.
 
-**Call relations**: This is setup-time configuration for the limiter, used before runtime checks begin. It delegates storage semantics to `OnceLock::get_or_init` and is validated by the execution tests that confirm reinitialization does not replace the original cap.
+**Call relations**: This prepares the limiter before it is used by capacity checks and guards. Later functions such as `AgentExecutionLimiter::max_threads` read the value that was stored here.
 
 *Call graph*: 1 external calls (get_or_init).
 
@@ -866,11 +874,11 @@ fn initialize(&self, max_threads: usize)
 fn max_threads(&self) -> usize
 ```
 
-**Purpose**: Reads the configured execution cap, defaulting to no practical limit when the limiter has not been initialized. This keeps capacity checks safe before configuration is wired in.
+**Purpose**: This returns the configured maximum number of limited executions. If no maximum has been initialized, it behaves as though there is no practical limit.
 
-**Data flow**: Reads `self.max_threads` via `get()`, copies the stored `usize` if present, and otherwise returns `usize::MAX`. It does not mutate state.
+**Data flow**: It reads the stored maximum thread count. If a value exists, it returns that value. If no value has been set, it returns `usize::MAX`, an extremely large number used here as “effectively unlimited.”
 
-**Call relations**: This helper is used by `AgentExecutionLimiter::has_capacity` and by `AgentControl::ensure_execution_capacity` when constructing an `AgentLimitReached` error payload.
+**Call relations**: This is used by `AgentExecutionLimiter::has_capacity` to compare the active count with the allowed maximum. It is also used indirectly when `AgentControl::ensure_execution_capacity` prepares an error that tells the caller what the maximum is.
 
 *Call graph*: called by 1 (has_capacity); 1 external calls (get).
 
@@ -881,11 +889,11 @@ fn max_threads(&self) -> usize
 fn has_capacity(&self) -> bool
 ```
 
-**Purpose**: Compares the current active execution count against the configured maximum. It is the low-level occupancy test behind the public capacity check.
+**Purpose**: This answers the simple question: is there still room for one more limited execution?
 
-**Data flow**: Reads `self.active` with `load(Ordering::Acquire)` and compares it to `self.max_threads()`. It returns `true` when `active < max_threads`, otherwise `false`, without mutating state.
+**Data flow**: It reads the current active-execution count and the maximum from `max_threads`. If the active count is lower than the maximum, it returns `true`; otherwise it returns `false`. It does not change the count.
 
-**Call relations**: This is called from `AgentControl::ensure_execution_capacity` after the policy says a session should be limited. It delegates the threshold lookup to `max_threads`.
+**Call relations**: This is used during capacity checks before a new limited execution is allowed to start. It calls `AgentExecutionLimiter::max_threads` so it always compares against the configured limit.
 
 *Call graph*: calls 1 internal fn (max_threads); 1 external calls (load).
 
@@ -896,11 +904,11 @@ fn has_capacity(&self) -> bool
 fn guard(self: Arc<Self>) -> AgentExecutionGuard
 ```
 
-**Purpose**: Claims one active execution slot and returns an RAII guard tied to the shared limiter. The returned guard is responsible for releasing the slot on drop.
+**Purpose**: This claims one execution slot and returns a guard that will release the slot later. It is the mechanism that keeps the active count tied to real running work.
 
-**Data flow**: Consumes `self: Arc<Self>`, atomically increments `active` with `fetch_add(1, Ordering::AcqRel)`, and returns `AgentExecutionGuard { limiter: self }`. The mutation is the incremented active count.
+**Data flow**: It receives a shared limiter, adds one to the active-execution counter, and returns an `AgentExecutionGuard` holding that limiter. The before state is “one slot is about to be used”; the after state is “the slot is counted as active and will be released when the guard is dropped.”
 
-**Call relations**: This is invoked by `AgentControl::execution_guard` only when `is_execution_limited` says the session should be counted. Its output later triggers `AgentExecutionGuard::drop` to undo the increment.
+**Call relations**: This is called by `AgentControl::execution_guard` when a limited execution starts. Its counterpart is `AgentExecutionGuard::drop`, which subtracts from the same counter when the execution ends.
 
 *Call graph*: 1 external calls (fetch_add).
 
@@ -911,11 +919,11 @@ fn guard(self: Arc<Self>) -> AgentExecutionGuard
 fn op_starts_turn(op: &Op) -> bool
 ```
 
-**Purpose**: Identifies which protocol operations should be treated as starting a new turn for execution-capacity purposes. It distinguishes turn-triggering work from queued or metadata-only traffic.
+**Purpose**: This identifies which operations can begin a new agent turn. It keeps the limit check from running for operations that cannot start execution.
 
-**Data flow**: Reads `&Op` and pattern-matches it. It returns `true` for `Op::UserInput { .. }` and for `Op::InterAgentCommunication { communication }` when `communication.trigger_turn` is true; otherwise it returns `false`.
+**Data flow**: It receives an operation. It returns `true` for direct user input, and for inter-agent communication only when that communication explicitly says it should trigger a turn. For all other operations, it returns `false`.
 
-**Call relations**: This predicate is used by `AgentControl::ensure_execution_capacity_for_op` as the first filter before any thread lookup or limiter check occurs.
+**Call relations**: This is called by `AgentControl::ensure_execution_capacity_for_op` as the first filter. If it says the operation does not start a turn, the larger capacity-check path is skipped.
 
 *Call graph*: called by 1 (ensure_execution_capacity_for_op); 1 external calls (matches!).
 
@@ -929,24 +937,24 @@ fn is_execution_limited(
 ) -> bool
 ```
 
-**Purpose**: Encodes the policy boundary for execution counting: only V2 subagent sessions are limited. It centralizes the condition so capacity checks and guard creation stay consistent.
+**Purpose**: This decides whether a session should be subject to the active-execution limit. In this file, only version 2 sub-agent sessions are limited.
 
-**Data flow**: Consumes a `MultiAgentVersion` and `&SessionSource`, compares the version to `MultiAgentVersion::V2`, pattern-matches the source against `SessionSource::SubAgent(_)`, and returns a boolean. It does not mutate state.
+**Data flow**: It receives a multi-agent version and a session source. It returns `true` only when the version is `MultiAgentVersion::V2` and the session source says this is a sub-agent. Otherwise it returns `false`.
 
-**Call relations**: Both `AgentControl::ensure_execution_capacity` and `AgentControl::execution_guard` call this helper so they apply the same inclusion rule for counted executions.
+**Call relations**: This is the shared rule used by both `AgentControl::ensure_execution_capacity` and `AgentControl::execution_guard`. That keeps the “should this count against the limit?” decision consistent between checking capacity and actually claiming a slot.
 
 *Call graph*: called by 2 (ensure_execution_capacity, execution_guard); 1 external calls (matches!).
 
 
 ### `core/src/agent/control/residency.rs`
 
-`domain_logic` · `spawn/resume and thread reload`
+`domain_logic` · `request handling and agent-thread lifecycle`
 
-This file implements the in-memory residency policy for Multi-Agent V2 subagents. `V2Residency` wraps a `Mutex<V2ResidencyState>` containing an LRU-style `VecDeque<ThreadId>` of resident threads plus a `pending_slots` counter. The pending count is important: it reserves capacity for threads that are in the middle of being spawned or resumed but do not yet have a committed thread ID in the resident deque.
+This file solves a capacity problem. The system may create many sub-agent threads, but it should not keep unlimited version-2 sub-agents loaded at once. Think of it like a small parking lot: before a new car enters, the lot checks whether there is space; if not, it asks an old parked car that is no longer in use to leave.
 
-`AgentControl::reserve_v2_residency_slot` computes the V2 capacity from `Config::effective_agent_max_threads(MultiAgentVersion::V2)`, defaulting to `usize::MAX`, and asks the shared residency tracker for a slot. `V2Residency::reserve_slot` loops until either `try_reserve_pending_slot` succeeds or `try_unload_one_resident` fails, in which case it returns `CodexErr::AgentLimitReached`. Eviction scans the current resident count, pops LRU candidates while skipping an optional protected thread, reloads each candidate from `ThreadManagerState`, and only unloads threads that are still valid resident candidates and satisfy `is_unloadable`: terminal `AgentStatus` (`Completed`, `Errored`, or `Interrupted`), no `active_turn`, and no pending mailbox items. Non-unloadable or failed-shutdown candidates are touched back to the MRU end.
+The main record is V2Residency. It stores two things behind a mutex, which is a lock that stops two tasks from changing the same list at the same time: a queue of resident thread IDs, and a count of slots that have been reserved but not yet filled. The queue is ordered like a “least recently used” list. Recently touched threads move to the back, while older candidates are checked first for unloading.
 
-`V2ResidencySlot` is an RAII reservation. `commit(thread_id)` converts a pending slot into a resident entry and disables drop cleanup; dropping an uncommitted slot decrements `pending_slots`. The helper predicates deliberately restrict residency to V2 `SessionSource::SubAgent(_)` threads, and `touch_loaded_v2_residency` updates recency only for already-loaded threads that still qualify.
+A caller does not directly add a thread. It first reserves a V2ResidencySlot. If there is room, the slot is held as pending. If there is no room, the code tries to unload one eligible resident thread. Only completed, errored, or interrupted sub-agent threads with no active turn and no queued mailbox work may be unloaded. When the new thread is actually ready, the slot is committed with its thread ID. If the reservation is dropped before commit, it automatically releases its pending space, which prevents leaked capacity.
 
 #### Function details
 
@@ -956,11 +964,11 @@ This file implements the in-memory residency policy for Multi-Agent V2 subagents
 fn commit(mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Finalizes a pending residency reservation by associating it with a concrete thread ID and marking the slot as no longer pending. This converts provisional capacity into an actual resident entry.
+**Purpose**: This confirms that a previously reserved place is now occupied by a real thread. It records the thread as resident and stops the reservation from being automatically released later.
 
-**Data flow**: Consumes `self` mutably and a `thread_id`. It calls `self.residency.commit_slot(thread_id)` to decrement `pending_slots` and touch the resident deque, then sets `self.active = false`. It returns no value.
+**Data flow**: It receives the slot object and the new thread ID. It tells the shared residency tracker to turn one pending slot into a real resident entry, then marks this slot as no longer active. After this, dropping the slot object will not free anything.
 
-**Call relations**: This is called by spawn and reload paths after a thread has been successfully created or resumed. It prevents the slot’s `Drop` implementation from releasing the reservation as if creation had failed.
+**Call relations**: This is used after AgentControl::reserve_v2_residency_slot has successfully made room for a thread. It hands the final thread ID to V2Residency::commit_slot so the residency queue reflects the loaded thread.
 
 
 ##### `V2ResidencySlot::drop`  (lines 40–44)
@@ -969,11 +977,11 @@ fn commit(mut self, thread_id: ThreadId)
 fn drop(&mut self)
 ```
 
-**Purpose**: Releases an uncommitted pending residency reservation when slot ownership is dropped early. It ensures failed or abandoned spawn/resume attempts do not leak capacity.
+**Purpose**: This is the safety cleanup for a reserved slot that was never committed. It prevents the system from permanently thinking space is reserved when the thread was not actually loaded.
 
-**Data flow**: Reads `self.active`; if true, it calls `self.residency.release_pending_slot()`. It returns no value and mutates only the shared residency state.
+**Data flow**: When the slot object is destroyed, it checks whether it is still active. If it is active, it tells the residency tracker to reduce the pending-slot count. If it was already committed, it changes nothing.
 
-**Call relations**: This runs implicitly when a `V2ResidencySlot` falls out of scope without `commit`. It is the cleanup counterpart to `V2ResidencySlot::commit`.
+**Call relations**: This works automatically as part of Rust’s drop behavior. It backs up the reservation flow started by V2Residency::reserve_slot and calls V2Residency::release_pending_slot when the caller abandons the reservation.
 
 
 ##### `AgentControl::reserve_v2_residency_slot`  (lines 48–60)
@@ -987,11 +995,11 @@ async fn reserve_v2_residency_slot(
     ) -> CodexResult<V2ResidencySlot
 ```
 
-**Purpose**: Reserves capacity for a V2 resident thread before it is loaded or spawned. It translates configuration into a numeric capacity and delegates the actual reservation/eviction logic to `V2Residency`.
+**Purpose**: This is the entry point AgentControl uses when it wants to load a version-2 resident sub-agent. It checks the configured maximum number of such threads, then asks the residency tracker to reserve space.
 
-**Data flow**: Takes `&Arc<ThreadManagerState>`, `&Config`, and an optional protected thread ID. It reads `config.effective_agent_max_threads(MultiAgentVersion::V2)`, substitutes `usize::MAX` when absent, clones `self.v2_residency`, and awaits `reserve_slot(state, capacity, protected_thread_id)`. It returns a `CodexResult<V2ResidencySlot>`.
+**Data flow**: It receives the thread manager state, configuration, and an optional thread ID that should not be unloaded. It reads the configured V2 thread limit, using an effectively unlimited number if no limit is set. It returns either a reserved V2ResidencySlot or an error saying the limit has been reached.
 
-**Call relations**: This method is used by V2 spawn and reload flows before they create or restore a thread. It delegates all capacity enforcement and possible eviction to `V2Residency::reserve_slot`.
+**Call relations**: Higher-level agent-control code calls this before loading a V2 resident thread. It uses the shared V2Residency object and delegates the real capacity work to V2Residency::reserve_slot.
 
 *Call graph*: 2 external calls (clone, effective_agent_max_threads).
 
@@ -1006,11 +1014,11 @@ async fn touch_loaded_v2_residency(
     )
 ```
 
-**Purpose**: Marks an already-loaded V2 resident thread as recently used so it is less likely to be evicted next. It ignores threads that are absent or no longer qualify as resident candidates.
+**Purpose**: This tells the residency tracker that a loaded thread was recently used, but only if that thread is the kind that should count as a V2 resident. This keeps active or recently relevant threads from being treated as the oldest unload candidates.
 
-**Data flow**: Accepts manager state and a `thread_id`, asynchronously loads the thread with `state.get_thread(thread_id).await`, checks `is_resident_candidate(thread.as_ref())`, and if true calls `self.v2_residency.touch(thread_id)`. It returns no value.
+**Data flow**: It receives the thread manager state and a thread ID. It tries to look up the thread, checks whether it qualifies as a V2 resident candidate, and if so moves that thread ID to the recently used end of the residency queue. It does not return a value.
 
-**Call relations**: This is used by reload logic after confirming a thread is already loaded, and by race-handling paths that discover another task loaded the thread first. It delegates candidate filtering to `is_resident_candidate`.
+**Call relations**: AgentControl calls this when a loaded thread should be refreshed in the residency list. It relies on is_resident_candidate to avoid tracking unrelated threads, then calls into V2Residency::touch through the shared residency tracker.
 
 *Call graph*: calls 1 internal fn (is_resident_candidate).
 
@@ -1021,11 +1029,11 @@ async fn touch_loaded_v2_residency(
 fn forget_v2_residency(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Removes a thread ID from the residency LRU set when the thread is being torn down or forgotten. This prevents stale resident entries from occupying eviction bookkeeping.
+**Purpose**: This removes a thread from the V2 residency list when it should no longer be considered loaded or resident. It keeps the residency tracker from holding stale thread IDs.
 
-**Data flow**: Takes a `thread_id` and forwards it to `self.v2_residency.remove(thread_id)`. It returns no value and mutates the residency deque.
+**Data flow**: It receives a thread ID and asks the shared residency tracker to remove that ID from its queue. Nothing is returned; the internal list is simply cleaned up.
 
-**Call relations**: This is called from shutdown paths when a thread is removed from memory. It is a thin forwarding method over `V2Residency::remove`.
+**Call relations**: AgentControl uses this during thread cleanup or when a thread is no longer part of residency accounting. It delegates the actual removal to V2Residency::remove.
 
 
 ##### `V2Residency::reserve_slot`  (lines 80–102)
@@ -1039,11 +1047,11 @@ async fn reserve_slot(
     ) -> CodexResult<V2ResidencySlot>
 ```
 
-**Purpose**: Obtains a pending residency slot, evicting unloadable residents if necessary until capacity becomes available. It is the core loop that enforces the V2 loaded-thread cap.
+**Purpose**: This is the main capacity gate. It either reserves space for a new resident thread, unloads an old eligible resident to make space, or reports that no space can be made.
 
-**Data flow**: Consumes `self: Arc<Self>`, a thread manager, numeric `capacity`, and an optional protected thread ID. In a loop it first calls `try_reserve_pending_slot(capacity)`; on success it returns `Ok(V2ResidencySlot { residency: self, active: true })`. If reservation fails, it awaits `try_unload_one_resident`; if no resident can be unloaded, it returns `Err(CodexErr::AgentLimitReached { max_threads: capacity })`.
+**Data flow**: It receives the thread manager, the maximum allowed capacity, and an optional protected thread ID. It first tries to increase the pending-slot count. If that fails because the limit is full, it tries to unload one existing resident thread, avoiding the protected one. It returns a live V2ResidencySlot on success or an AgentLimitReached error if it cannot make room.
 
-**Call relations**: This is invoked by `AgentControl::reserve_v2_residency_slot`. It delegates the fast-path capacity check to `try_reserve_pending_slot` and the eviction attempt to `try_unload_one_resident`.
+**Call relations**: AgentControl::reserve_v2_residency_slot calls this when a new V2 resident may be loaded. It loops between V2Residency::try_reserve_pending_slot and V2Residency::try_unload_one_resident until either a reservation succeeds or unloading is impossible.
 
 *Call graph*: calls 2 internal fn (try_reserve_pending_slot, try_unload_one_resident).
 
@@ -1054,11 +1062,11 @@ async fn reserve_slot(
 fn try_reserve_pending_slot(&self, capacity: usize) -> bool
 ```
 
-**Purpose**: Attempts to claim one pending slot without evicting anything. It treats both committed residents and in-flight pending slots as consuming capacity.
+**Purpose**: This checks whether there is room for one more resident or soon-to-be resident thread. If there is room, it temporarily claims that space.
 
-**Data flow**: Locks `self.state`, reads `state.residents.len()` and `state.pending_slots`, compares their saturating sum to `capacity`, and returns `false` if the limit is already reached. Otherwise it increments `state.pending_slots` and returns `true`.
+**Data flow**: It reads the current resident count and pending reservation count under a mutex lock. If their total is already at capacity, it returns false. Otherwise it adds one to the pending count and returns true.
 
-**Call relations**: This is the first step inside `V2Residency::reserve_slot`. It does not delegate further and provides the cheap uncontended reservation path.
+**Call relations**: V2Residency::reserve_slot calls this before trying any unloading. A true result means the caller can proceed with loading; a false result means reserve_slot must try to free space.
 
 *Call graph*: called by 1 (reserve_slot).
 
@@ -1073,11 +1081,11 @@ async fn try_unload_one_resident(
     ) -> bool
 ```
 
-**Purpose**: Scans resident threads in LRU order and tries to evict one unloadable candidate to free capacity. It skips protected, missing, nonresident, busy, or failed-to-shutdown threads.
+**Purpose**: This tries to free one residency slot by unloading an older resident thread that is safe to remove. It is careful not to kill work that is still active or waiting to be handled.
 
-**Data flow**: Reads the current resident count via `resident_count()`, then loops that many times. Each iteration pops a candidate with `pop_lru_candidate(protected_thread_id)`, reloads it from `manager.get_thread`, filters it through `is_resident_candidate`, and awaits `is_unloadable`. Non-unloadable candidates are re-touched with `touch(candidate_thread_id)`. For unloadable candidates it materializes rollout, attempts `shutdown_and_wait`, logs and re-touches on failure, and on success removes the thread from the manager and returns `true`. If no candidate can be evicted, it returns `false`.
+**Data flow**: It receives the thread manager and an optional protected thread ID. It scans the current resident queue, oldest first, skipping the protected thread. For each candidate, it looks up the thread, verifies it still qualifies as a resident candidate, checks that it is unloadable, materializes rollout data, shuts the thread down, and removes it from the manager. It returns true if one thread was removed, otherwise false.
 
-**Call relations**: This is called by `V2Residency::reserve_slot` only after direct reservation fails. It delegates candidate selection to `pop_lru_candidate`, recency updates to `touch`, and unloadability checks to `is_unloadable`.
+**Call relations**: V2Residency::reserve_slot calls this after a direct reservation fails. This function uses resident_count and pop_lru_candidate to pick candidates, is_unloadable to check safety, touch to re-mark candidates that cannot be removed now, and logs a warning if shutdown fails.
 
 *Call graph*: calls 4 internal fn (pop_lru_candidate, resident_count, touch, is_unloadable); called by 1 (reserve_slot); 1 external calls (warn!).
 
@@ -1088,11 +1096,11 @@ async fn try_unload_one_resident(
 fn resident_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of committed resident thread IDs currently tracked. It is used to bound one eviction scan pass.
+**Purpose**: This reports how many thread IDs are currently listed as V2 residents. It is used to decide how many candidates should be scanned during one unloading attempt.
 
-**Data flow**: Locks `self.state`, reads `residents.len()`, and returns that `usize`. It does not mutate state.
+**Data flow**: It locks the residency state, reads the length of the resident queue, and returns that number. It does not change the queue.
 
-**Call relations**: This helper is used by `V2Residency::try_unload_one_resident` to avoid looping indefinitely while the deque is being rotated.
+**Call relations**: V2Residency::try_unload_one_resident calls this at the start so it scans only the residents that existed when the unload attempt began, rather than looping forever as entries are moved around.
 
 *Call graph*: called by 1 (try_unload_one_resident).
 
@@ -1103,11 +1111,11 @@ fn resident_count(&self) -> usize
 fn pop_lru_candidate(&self, protected_thread_id: Option<ThreadId>) -> Option<ThreadId>
 ```
 
-**Purpose**: Removes and returns the least-recently-used resident candidate, except for an optional protected thread that is rotated to the back instead of being selected. It preserves LRU ordering among the remaining entries.
+**Purpose**: This chooses the oldest resident candidate for possible unloading. It avoids a protected thread by putting that thread back at the recent end of the queue and continuing the search.
 
-**Data flow**: Locks `self.state`, computes the number of residents to scan, repeatedly pops from the front of `state.residents`, compares each ID to `protected_thread_id`, pushes protected IDs back to the rear, and returns the first unprotected ID found. If no eligible candidate exists, it returns `None`.
+**Data flow**: It locks the resident queue and repeatedly takes a thread ID from the front, which represents the least recently used entry. If that ID matches the protected ID, it pushes it to the back and tries another. Otherwise it returns that ID. If no usable candidate exists, it returns nothing.
 
-**Call relations**: This function is called by `V2Residency::try_unload_one_resident` during eviction scans. It does not delegate further.
+**Call relations**: V2Residency::try_unload_one_resident calls this while searching for a thread to unload. The returned ID is then checked against the thread manager and safety rules before any shutdown happens.
 
 *Call graph*: called by 1 (try_unload_one_resident).
 
@@ -1118,11 +1126,11 @@ fn pop_lru_candidate(&self, protected_thread_id: Option<ThreadId>) -> Option<Thr
 fn touch(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Marks a resident thread as most recently used. It removes any existing occurrence and appends the thread ID to the back of the deque.
+**Purpose**: This marks a resident thread as recently used. It helps the unloading policy prefer older, less recently touched threads.
 
-**Data flow**: Locks `self.state` and passes `&mut state.residents` plus `thread_id` to `touch_resident`. It returns no value and mutates the resident ordering.
+**Data flow**: It receives a thread ID, locks the residency state, removes any existing copy of that ID from the queue, and appends it to the back. The result is an updated queue with that thread treated as newest.
 
-**Call relations**: This is used by `AgentControl::touch_loaded_v2_residency` and by eviction logic in `try_unload_one_resident` when a candidate should remain resident but move to the MRU end.
+**Call relations**: AgentControl::touch_loaded_v2_residency uses this through the shared residency tracker, and V2Residency::try_unload_one_resident uses it when a candidate cannot be unloaded right now. It delegates the queue update to touch_resident.
 
 *Call graph*: calls 1 internal fn (touch_resident); called by 1 (try_unload_one_resident).
 
@@ -1133,11 +1141,11 @@ fn touch(&self, thread_id: ThreadId)
 fn remove(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Deletes a thread ID from the resident deque entirely. It is used when a thread is no longer loaded or should no longer participate in residency bookkeeping.
+**Purpose**: This deletes a thread ID from the residency queue. It is used when a thread should no longer count as resident.
 
-**Data flow**: Locks `self.state` and retains only resident IDs not equal to `thread_id`. It returns no value and mutates the deque in place.
+**Data flow**: It receives a thread ID, locks the residency state, and keeps only resident IDs that are not equal to the given one. It returns nothing and leaves the queue without that entry.
 
-**Call relations**: This is reached through `AgentControl::forget_v2_residency` from shutdown and cleanup paths.
+**Call relations**: AgentControl::forget_v2_residency calls this when outside code knows a thread has gone away or should be forgotten. It is a cleanup path separate from the unload path.
 
 
 ##### `V2Residency::commit_slot`  (lines 193–200)
@@ -1146,11 +1154,11 @@ fn remove(&self, thread_id: ThreadId)
 fn commit_slot(&self, thread_id: ThreadId)
 ```
 
-**Purpose**: Converts one pending slot into a committed resident entry for a specific thread. It also updates recency so the committed thread becomes most recently used.
+**Purpose**: This converts a pending reservation into an actual resident thread entry. It is the point where a reserved space becomes tied to a specific thread ID.
 
-**Data flow**: Locks `self.state`, decrements `pending_slots` with `saturating_sub(1)`, then calls `touch_resident(&mut state.residents, thread_id)`. It returns no value.
+**Data flow**: It receives the thread ID for the loaded thread. Under the mutex lock, it reduces the pending-slot count by one, then moves or adds the thread ID to the recently used end of the resident queue. It does not return a value.
 
-**Call relations**: This is invoked by `V2ResidencySlot::commit` after successful spawn or reload. It delegates deque maintenance to `touch_resident`.
+**Call relations**: V2ResidencySlot::commit calls this after loading succeeds. It uses touch_resident so the newly committed thread is recorded as resident and considered recently used.
 
 *Call graph*: calls 1 internal fn (touch_resident).
 
@@ -1161,11 +1169,11 @@ fn commit_slot(&self, thread_id: ThreadId)
 fn release_pending_slot(&self)
 ```
 
-**Purpose**: Drops one pending reservation without creating a resident entry. It is the failure/abandonment cleanup path for reserved capacity.
+**Purpose**: This gives back a reserved slot that was not used. It keeps failed or abandoned load attempts from consuming capacity forever.
 
-**Data flow**: Locks `self.state`, decrements `pending_slots` using `saturating_sub(1)`, and returns no value.
+**Data flow**: It locks the residency state and reduces the pending-slot count by one, using a safe subtraction that will not go below zero. It returns nothing.
 
-**Call relations**: This is called only from `V2ResidencySlot::drop` when a slot was never committed.
+**Call relations**: V2ResidencySlot::drop calls this automatically when a reserved slot is discarded without commit. This is the cleanup counterpart to V2Residency::try_reserve_pending_slot.
 
 
 ##### `touch_resident`  (lines 211–214)
@@ -1174,11 +1182,11 @@ fn release_pending_slot(&self)
 fn touch_resident(residents: &mut VecDeque<ThreadId>, thread_id: ThreadId)
 ```
 
-**Purpose**: Maintains the resident deque as an MRU list by removing duplicates and appending the touched thread ID to the back. It is the shared primitive behind both touch and commit operations.
+**Purpose**: This is the small queue helper that marks a thread as most recently used. It also prevents duplicate copies of the same thread ID in the residency queue.
 
-**Data flow**: Takes `&mut VecDeque<ThreadId>` and a `thread_id`, retains only entries not equal to that ID, then pushes the ID to the back. It returns no value and mutates the deque.
+**Data flow**: It receives the mutable resident queue and a thread ID. It removes any existing matching ID, then appends the ID to the back of the queue. The queue now contains that ID once, in the newest position.
 
-**Call relations**: This helper is called by `V2Residency::touch` and `V2Residency::commit_slot` so both operations enforce the same uniqueness and ordering behavior.
+**Call relations**: V2Residency::touch and V2Residency::commit_slot both use this helper so they update the least-recently-used queue in exactly the same way.
 
 *Call graph*: called by 2 (commit_slot, touch); 2 external calls (push_back, retain).
 
@@ -1189,11 +1197,11 @@ fn touch_resident(residents: &mut VecDeque<ThreadId>, thread_id: ThreadId)
 fn is_resident_candidate(thread: &CodexThread) -> bool
 ```
 
-**Purpose**: Determines whether a loaded thread should participate in V2 residency tracking. Only V2 subagent threads qualify.
+**Purpose**: This decides whether a thread belongs in this V2 residency system at all. Only version-2 threads that came from the right kind of session source are tracked.
 
-**Data flow**: Reads a `&CodexThread`, calls `thread.multi_agent_version()`, checks for `Some(MultiAgentVersion::V2)`, and combines that with `is_v2_resident_session_source(&thread.session_source)`. It returns a boolean.
+**Data flow**: It receives a CodexThread. It reads the thread’s multi-agent version and its session source. It returns true only when the version is V2 and the session source is accepted for V2 residency.
 
-**Call relations**: This predicate is used by `AgentControl::touch_loaded_v2_residency` and by `V2Residency::try_unload_one_resident` to ensure only eligible threads are tracked or considered for eviction.
+**Call relations**: AgentControl::touch_loaded_v2_residency uses this before touching a loaded thread, and V2Residency::try_unload_one_resident uses the same idea when checking whether a candidate is still relevant. It delegates the session-source check to is_v2_resident_session_source.
 
 *Call graph*: calls 2 internal fn (is_v2_resident_session_source, multi_agent_version); called by 1 (touch_loaded_v2_residency).
 
@@ -1204,11 +1212,11 @@ fn is_resident_candidate(thread: &CodexThread) -> bool
 fn is_v2_resident_session_source(session_source: &SessionSource) -> bool
 ```
 
-**Purpose**: Defines which session sources are eligible for V2 residency tracking. The current rule is simply any `SessionSource::SubAgent(_)`.
+**Purpose**: This identifies which session sources should count as V2 resident sessions. In this file, only sub-agent sessions qualify.
 
-**Data flow**: Pattern-matches `&SessionSource` and returns `true` for `SessionSource::SubAgent(_)`, otherwise `false`. It does not mutate state.
+**Data flow**: It receives a session source value and checks its variant. It returns true for SubAgent sources and false for all others.
 
-**Call relations**: This helper is called by `is_resident_candidate` and is also imported by spawn logic to decide whether a new V2 thread should reserve residency.
+**Call relations**: is_resident_candidate calls this as one part of deciding whether a thread should be tracked by the V2 residency rules.
 
 *Call graph*: called by 1 (is_resident_candidate); 1 external calls (matches!).
 
@@ -1219,26 +1227,26 @@ fn is_v2_resident_session_source(session_source: &SessionSource) -> bool
 async fn is_unloadable(thread: &CodexThread) -> bool
 ```
 
-**Purpose**: Checks whether a resident thread is safe to evict from memory. A thread must be terminal, have no active turn, and have no pending mailbox items.
+**Purpose**: This checks whether it is safe to unload a thread. A thread must be finished or stopped, with no active turn and no pending mailbox work.
 
-**Data flow**: Reads a `&CodexThread`, awaits `thread.agent_status()`, matches it against `AgentStatus::Completed(_)`, `Errored(_)`, or `Interrupted`, then awaits `thread.codex.session.active_turn.lock()` and `thread.codex.session.input_queue.has_pending_mailbox_items()`. It returns `true` only if all three conditions indicate the thread is idle and terminal.
+**Data flow**: It receives a CodexThread. It reads the thread’s agent status, checks whether the session currently has an active turn, and asks the input queue whether any mailbox items are waiting. It returns true only when the thread is completed, errored, or interrupted, has no active turn, and has no pending mailbox items.
 
-**Call relations**: This async predicate is called by `V2Residency::try_unload_one_resident` before attempting shutdown and removal of a resident candidate.
+**Call relations**: V2Residency::try_unload_one_resident calls this before shutting down a candidate. If it returns false, the candidate is touched again so it moves to the recent end of the queue instead of being unloaded.
 
 *Call graph*: called by 1 (try_unload_one_resident); 1 external calls (matches!).
 
 
 ### `core/src/agent/control/spawn.rs`
 
-`orchestration` · `spawn/resume and thread reload`
+`orchestration` · `active when agent threads are spawned, forked, resumed, or reloaded`
 
-This file is the core of agent lifecycle creation and restoration. It starts with nickname and fork-history helpers: `default_agent_nickname_list` loads names from `agent_names.txt`, `agent_nickname_candidates` optionally overrides them from role config, `keep_forked_rollout_item` filters which `RolloutItem`s survive into a forked child, and `is_multi_agent_v2_usage_hint_message` identifies developer hint messages that should be stripped or replaced.
+This file solves a practical coordination problem: agents can create other agents, resume old conversations, or fork from an existing conversation. Without this code, the system would not know how many agents are allowed to run, what history a child agent should see, what environment settings it should inherit, or how to reconnect saved agent threads after a restart.
 
-`spawn_agent` and `spawn_agent_with_metadata` are thin wrappers over `spawn_agent_internal`. That internal method computes the effective `MultiAgentVersion`, enforces execution capacity for subagent sources, optionally reserves a V2 residency slot, reserves a spawn slot in the shared registry, computes inherited environments and exec policy, and normalizes `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })` through `prepare_thread_spawn`. It then chooses among three creation paths: forked child via `spawn_forked_thread`, ordinary subagent via `spawn_new_thread_with_source`, or root thread via `spawn_new_thread`. After creation it commits registry and residency reservations, emits analytics for thread-spawn subagents, notifies listeners, persists spawn-edge metadata, sends the initial operation, and for non-V2 children starts a completion watcher.
+The file first provides small helpers for choosing agent nicknames and deciding which parts of a parent conversation are safe to copy into a fork. A fork is like making a new notebook from an old one: this code copies only the useful pages, removes internal tool chatter, and may add a fresh instruction note for newer multi-agent behavior.
 
-`ensure_v2_agent_loaded` lazily reloads an unloaded V2 agent from stored history. It first returns early if the thread is already loaded, rejects unknown or non-V2 threads, reserves residency with the target thread protected from eviction, reconstructs `InitialHistory::Resumed`, restores inherited environments and exec policy, and resumes the thread. A race is handled explicitly: if resume fails but another task loaded the thread in the meantime, the slot is released and the thread is merely touched in residency.
+The main methods live on `AgentControl`. They reserve capacity before starting an agent, so the system does not create too many threads. They decide whether the new agent is a normal thread, a subagent spawned by another thread, or a fork with selected history. They also carry over inherited turn environments and execution policy, which are the settings and rules the new agent should follow.
 
-`spawn_forked_thread` snapshots parent rollout history, flushing pending writes first, optionally truncates to the last N turns, strips stale parent usage hints from both top-level and compacted replacement history, preserves `TurnContext` only for full-history forks, and may append the child’s own V2 subagent usage hint. `resume_agent_from_rollout` and `resume_single_agent_from_rollout` rebuild threads from persisted rollout files, with tree resume for non-V2 descendants based on persisted open spawn edges. The tree-resume logic intentionally skips reopening V2 descendants and tolerates descendant resume failures by logging and continuing only when the parent resumed successfully.
+For saved conversations, the file can reload a version-2 resident agent or resume an agent from its recorded rollout history. After a thread is created or resumed, it records parent-child links, notifies listeners, sends the first operation, and, for older multi-agent mode, starts a watcher that notices when the child finishes.
 
 #### Function details
 
@@ -1248,11 +1256,11 @@ This file is the core of agent lifecycle creation and restoration. It starts wit
 fn default_agent_nickname_list() -> Vec<&'static str>
 ```
 
-**Purpose**: Builds the default pool of agent nicknames from the embedded `agent_names.txt` file. It trims whitespace and drops blank lines.
+**Purpose**: Builds the built-in list of possible agent nicknames. These names come from a bundled text file and are used when configuration does not provide custom names.
 
-**Data flow**: Reads the `AGENT_NAMES` string constant, splits it into lines, applies `str::trim`, filters out empty names, collects the remaining `&'static str` values into a `Vec`, and returns it.
+**Data flow**: It reads the embedded `agent_names.txt` text → splits it into lines, trims whitespace, and skips blank lines → returns a list of non-empty nickname strings.
 
-**Call relations**: This helper is used by `agent_nickname_candidates` when no role-specific nickname list is configured.
+**Call relations**: When the system needs nickname candidates and the role configuration does not supply any, `agent_nickname_candidates` calls this helper to fall back to the default name list.
 
 *Call graph*: called by 1 (agent_nickname_candidates).
 
@@ -1263,11 +1271,11 @@ fn default_agent_nickname_list() -> Vec<&'static str>
 fn agent_nickname_candidates(config: &Config, role_name: Option<&str>) -> Vec<String>
 ```
 
-**Purpose**: Returns the nickname candidates for a spawned agent, preferring role-specific configuration over the default embedded list. It normalizes a missing role name to `DEFAULT_ROLE_NAME`.
+**Purpose**: Finds the list of nicknames that may be used for a spawned agent. It first respects role-specific configuration, and only uses the built-in nickname list if no custom list exists.
 
-**Data flow**: Takes `&Config` and `Option<&str>` for the role name. It resolves the effective role name, queries `resolve_role_config(config, role_name)` for `nickname_candidates`, and if present returns that cloned `Vec<String>`. Otherwise it calls `default_agent_nickname_list()`, converts each borrowed name to an owned `String`, and returns the collected list.
+**Data flow**: It receives the global configuration and an optional role name → looks up that role’s nickname candidates, using the default role when no role is named → returns configured nicknames if found, otherwise returns owned strings made from the default nickname list.
 
-**Call relations**: This function is called by `prepare_thread_spawn` elsewhere in the control subsystem to choose nickname candidates before reserving one in the registry. It delegates fallback list construction to `default_agent_nickname_list`.
+**Call relations**: This is used by `prepare_thread_spawn` when preparing metadata for a thread-spawned agent. It calls `default_agent_nickname_list` only as the fallback path.
 
 *Call graph*: calls 1 internal fn (default_agent_nickname_list); called by 1 (prepare_thread_spawn).
 
@@ -1278,11 +1286,11 @@ fn agent_nickname_candidates(config: &Config, role_name: Option<&str>) -> Vec<St
 fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item: bool) -> bool
 ```
 
-**Purpose**: Decides which rollout items from a parent thread should be preserved when creating a forked child history. The rule keeps durable conversational context while dropping transient tool chatter and most assistant intermediates.
+**Purpose**: Decides whether one saved conversation item should be copied into a forked agent’s starting history. Its job is to keep meaningful context while leaving out internal details that would confuse or bloat the child agent’s prompt.
 
-**Data flow**: Consumes a `&RolloutItem` and a `preserve_reference_context_item` flag. It pattern-matches the item: keeps system/developer/user messages, keeps assistant messages only when `phase == Some(MessagePhase::FinalAnswer)`, drops reasoning/tool/inter-agent items, keeps `TurnContext` only when the flag is true, and always keeps `Compacted`, `EventMsg`, and `SessionMeta`. It returns a boolean and does not mutate state.
+**Data flow**: It receives one rollout item and a flag saying whether reference context should be preserved → checks what kind of item it is → returns `true` for durable context such as system, developer, and user messages, final assistant answers, metadata, compaction records, and sometimes turn context; returns `false` for tool calls, reasoning traces, inter-agent messages, and other internal activity.
 
-**Call relations**: This predicate is used inside `AgentControl::spawn_forked_thread` when filtering the parent rollout before forking.
+**Call relations**: During fork creation, the fork-building flow uses this decision to trim the parent history before creating the child thread. It acts like a filter at the doorway: only suitable history is allowed into the new fork.
 
 
 ##### `is_multi_agent_v2_usage_hint_message`  (lines 67–81)
@@ -1291,11 +1299,11 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
 fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool
 ```
 
-**Purpose**: Recognizes developer messages that exactly match one of the configured V2 usage-hint texts. It is used to strip stale parent hints from forked child history.
+**Purpose**: Detects a specific kind of developer message that contains a multi-agent version-2 usage hint. This matters because forked history should not accidentally carry old usage hints that may no longer fit the new child agent.
 
-**Data flow**: Takes a `&ResponseItem` and a slice of candidate hint strings. It returns `false` unless the item is `ResponseItem::Message` with role `developer` and exactly one `ContentItem::InputText`. It then compares that text against the provided hint strings and returns whether any match exactly.
+**Data flow**: It receives a response item and a list of hint texts to look for → verifies the item is a developer message with exactly one text content block → returns `true` only if that text exactly matches one of the known usage hints.
 
-**Call relations**: This helper is used by `AgentControl::spawn_forked_thread` both when filtering top-level rollout items and when sanitizing `Compacted.replacement_history`.
+**Call relations**: The fork-building flow uses this helper while cleaning copied history. It removes old hint messages, and later may add the correct fresh hint for the new subagent.
 
 
 ##### `AgentControl::spawn_agent`  (lines 86–100)
@@ -1309,11 +1317,11 @@ async fn spawn_agent(
     ) -> CodexResult<ThreadId>
 ```
 
-**Purpose**: Test-only convenience wrapper that spawns an agent thread and returns only its `ThreadId`. It hides the richer `LiveAgent` metadata returned by the internal spawn path.
+**Purpose**: Starts a new agent thread and returns only its thread ID. This is a simpler wrapper used in tests, where callers only need to know which thread was created.
 
-**Data flow**: Accepts a `Config`, initial `Op`, and optional `SessionSource`, then awaits `Box::pin(self.spawn_agent_internal(..., SpawnAgentOptions::default()))`. On success it extracts and returns `spawned_agent.thread_id`; on failure it propagates the `CodexErr`.
+**Data flow**: It receives a configuration, an initial operation to send to the agent, and an optional session source that explains where the agent came from → forwards those values to `spawn_agent_internal` with default spawn options → returns the new thread ID from the created live agent.
 
-**Call relations**: This wrapper is used by tests and delegates all real work to `spawn_agent_internal` with default options.
+**Call relations**: This is a thin entry point into the full spawning machinery. It relies on `spawn_agent_internal` to do the real work: capacity checks, thread creation, notifications, persistence, and sending the first input.
 
 *Call graph*: calls 1 internal fn (spawn_agent_internal); 2 external calls (pin, default).
 
@@ -1329,11 +1337,11 @@ async fn spawn_agent_with_metadata(
         options: SpawnAgentOptions, // TODO(jif
 ```
 
-**Purpose**: Public spawn entry point that creates an agent thread and returns the full `LiveAgent` record. It supports additional spawn options such as parent metadata and fork mode.
+**Purpose**: Starts a new agent thread and returns richer information about it, not just the thread ID. Callers use this when they need the new agent’s metadata and current status.
 
-**Data flow**: Takes a `Config`, initial `Op`, optional `SessionSource`, and `SpawnAgentOptions`, then awaits `Box::pin(self.spawn_agent_internal(...))`. It returns the resulting `LiveAgent` or propagates any `CodexErr`.
+**Data flow**: It receives configuration, the initial operation, an optional session source, and spawn options → passes them into `spawn_agent_internal` → returns a `LiveAgent`, which includes the thread ID, metadata, and status.
 
-**Call relations**: This is the main external spawn API and simply forwards to `spawn_agent_internal`, which performs all orchestration.
+**Call relations**: This is the public internal path for callers that need detailed spawn results. Like `spawn_agent`, it delegates the actual orchestration to `spawn_agent_internal`.
 
 *Call graph*: calls 1 internal fn (spawn_agent_internal); 1 external calls (pin).
 
@@ -1348,11 +1356,11 @@ async fn ensure_v2_agent_loaded(
     ) -> CodexResult<()>
 ```
 
-**Purpose**: Ensures a known V2 agent thread is present in memory, reloading it from stored history if necessary. It also reserves residency before reload so the loaded-thread cap is enforced consistently.
+**Purpose**: Makes sure a saved version-2 agent thread is loaded into memory and ready to use. If it is already loaded, it refreshes its residency; if not, it reloads it from stored history.
 
-**Data flow**: Takes a `Config` and `thread_id`, upgrades to manager state, and first checks `state.get_thread(thread_id).await`; if already loaded, it touches residency and returns `Ok(())`. If registry metadata is absent, it returns `CodexErr::ThreadNotFound(thread_id)`. Otherwise it reads the stored thread with archived history included, reconstructs `InitialHistory::Resumed`, rejects non-V2 histories with `ThreadNotFound`, reserves a protected residency slot, derives resumed `session_source` and `parent_thread_id`, computes inherited environments and exec policy, and calls `state.resume_thread_with_history_with_source(...)`. On success it commits the residency slot, notifies thread creation, and returns `Ok(())`. On error it checks whether another task loaded the thread concurrently; if so it drops the slot, touches residency, and still returns `Ok(())`, otherwise it returns the original error.
+**Data flow**: It receives a configuration and a thread ID → checks whether the thread is already active → if not, confirms metadata exists, reads the stored thread and its history, verifies it is a version-2 multi-agent thread, reserves a residency slot, restores the session source and parent link, inherits environment and execution policy settings, and resumes the thread from history → commits the residency slot and notifies the system that the thread exists again. If the thread cannot be found or is not version 2, it returns a not-found error.
 
-**Call relations**: This method is used when callers need a V2 subagent loaded on demand. It relies on residency helpers from `residency.rs` and on thread-manager resume APIs, but does not call other file-local functions.
+**Call relations**: This method is used when a version-2 resident agent may need to be brought back into active memory. It hands the actual thread reconstruction to the thread manager’s resume path, then notifies listeners after the reload succeeds.
 
 *Call graph*: 2 external calls (ThreadNotFound, Resumed).
 
@@ -1369,11 +1377,11 @@ async fn spawn_agent_internal(
     ) -> CodexRe
 ```
 
-**Purpose**: Performs the full spawn workflow for root threads, ordinary subagents, and forked subagents. It coordinates version selection, capacity checks, registry reservations, residency reservations, inheritance, analytics, persistence, and initial input submission.
+**Purpose**: Does the full work of creating a new agent. It decides the multi-agent mode, reserves capacity, prepares metadata, creates or forks the thread, records parent-child relationships, sends the first operation, and returns the live agent information.
 
-**Data flow**: Consumes `Config`, initial `Op`, optional `SessionSource`, and `SpawnAgentOptions`. It upgrades to manager state, computes `multi_agent_version` from spawn context, optionally enforces execution capacity for subagent sources, reads `agent_max_threads`, decides whether V2 residency applies, optionally reserves a `V2ResidencySlot`, reserves a registry spawn slot, computes inherited environments and exec policy, and normalizes thread-spawn session sources through `prepare_thread_spawn`. It then creates the thread via `spawn_forked_thread`, `state.spawn_new_thread_with_source`, or `state.spawn_new_thread`. After creation it fills `agent_metadata.agent_id`, commits the registry reservation, commits residency if present, optionally emits subagent analytics, notifies thread creation, persists the spawn edge, sends the initial operation through `send_input_after_capacity_check`, optionally starts a completion watcher for non-V2 children, and returns `LiveAgent { thread_id, metadata, status }`.
+**Data flow**: It receives the configuration, initial operation, optional session source, and spawn options → upgrades access to shared thread-manager state, determines which multi-agent version applies, checks execution capacity, reserves the right kind of slot, inherits environment and execution policy settings, and prepares subagent metadata if this is a thread-spawned agent → creates either a normal thread, a sourced subagent thread, or a forked thread → commits reservations, emits analytics for subagent starts, notifies listeners, persists the spawn edge, sends the initial input, possibly starts a completion watcher, and returns a `LiveAgent`.
 
-**Call relations**: This is the central implementation behind both `spawn_agent` and `spawn_agent_with_metadata`. It delegates fork-specific history construction to `spawn_forked_thread` and uses many external manager/control helpers to complete the spawn pipeline.
+**Call relations**: Both `AgentControl::spawn_agent` and `AgentControl::spawn_agent_with_metadata` call this method. When the options request a fork, it hands the history-copying part to `AgentControl::spawn_forked_thread`; otherwise it asks the thread manager to create a fresh thread.
 
 *Call graph*: calls 1 internal fn (spawn_forked_thread); called by 2 (spawn_agent, spawn_agent_with_metadata); 5 external calls (pin, clone, effective_agent_max_threads, default, warn!).
 
@@ -1390,11 +1398,11 @@ async fn spawn_forked_thread(
         inheri
 ```
 
-**Purpose**: Creates a child thread by forking sanitized history from a parent thread. It validates fork prerequisites, flushes parent rollout, filters and truncates history, strips stale usage hints, and then asks the manager to fork the thread.
+**Purpose**: Creates a new subagent thread by copying selected history from a parent thread. This is used when a child agent should start with context from its parent, rather than with a blank conversation.
 
-**Data flow**: Takes manager state, `Config`, a `SessionSource`, `SpawnAgentOptions`, inherited environments/exec policy, and `MultiAgentVersion`. It first validates that `fork_parent_spawn_call_id`, `fork_mode`, and a thread-spawn `SessionSource` are present, returning `CodexErr::Fatal` otherwise. It loads the parent thread if live, materializes and flushes rollout, reads stored parent history, optionally truncates it with `truncate_rollout_to_last_n_fork_turns`, computes the set of V2 usage-hint texts to remove, filters `forked_rollout_items` with `keep_forked_rollout_item` and `is_multi_agent_v2_usage_hint_message`, sanitizes any compacted replacement history similarly, optionally appends the child subagent usage hint for full-history V2 forks, and finally awaits `state.fork_thread_with_source(...)` with `InitialHistory::Forked(forked_rollout_items)`.
+**Data flow**: It receives shared thread-manager state, configuration, a session source, spawn options, inherited settings, and the multi-agent version → validates that the request really is a fork from a thread-spawned parent → flushes the parent’s saved rollout so the snapshot is current → reads the parent’s stored history → optionally truncates it to the last few turns → removes internal or inappropriate items, including old version-2 usage hints → optionally appends a fresh subagent usage hint → asks the thread manager to create a forked thread with that cleaned history and inherited settings → returns the newly created thread.
 
-**Call relations**: This function is called only from `spawn_agent_internal` when a subagent spawn requests fork mode. It delegates item filtering to `keep_forked_rollout_item` and hint detection to `is_multi_agent_v2_usage_hint_message`.
+**Call relations**: `AgentControl::spawn_agent_internal` calls this when spawning with fork options. This method prepares the starting history, then hands off to the thread manager to actually make the forked thread.
 
 *Call graph*: calls 1 internal fn (build_developer_update_item); called by 1 (spawn_agent_internal); 7 external calls (new, clone, matches!, Fatal, Forked, ResponseItem, vec!).
 
@@ -1410,11 +1418,11 @@ async fn resume_agent_from_rollout(
     ) -> CodexResult<ThreadId>
 ```
 
-**Purpose**: Resumes a thread from persisted rollout and, for non-V2 trees, recursively reopens persisted open descendants. It is the high-level resume entry point used for both single-thread and subtree restoration.
+**Purpose**: Restores an agent thread from its recorded rollout file, and in older multi-agent mode also tries to restore its open descendant subagents. A rollout is the saved conversation record used to reconstruct a thread.
 
-**Data flow**: Accepts `Config`, `thread_id`, and `SessionSource`. It computes the root depth from `thread_spawn_depth(&session_source).unwrap_or(0)`, awaits `resume_single_agent_from_rollout`, and receives `(resumed_thread_id, resumed_multi_agent_version)`. If either config features or the resumed thread indicate V2, it returns immediately without reopening descendants. Otherwise it upgrades to manager state, loads the resumed thread and its state DB if available, then breadth-first traverses persisted open spawn edges starting from `(thread_id, root_depth)`. For each child ID it either notes the child is already loaded or constructs a synthetic `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { ... })` and calls `resume_single_agent_from_rollout` for that child. Successful child resumes are enqueued for further traversal; failures are logged and skipped. It finally returns the root resumed thread ID.
+**Data flow**: It receives configuration, a thread ID, and a session source → resumes that one thread through `resume_single_agent_from_rollout` → if version-2 behavior is in use, stops there → otherwise reads persisted child-spawn edges from storage, walks through open children in a queue, and resumes each missing child thread with the correct parent and depth information → returns the ID of the originally resumed thread.
 
-**Call relations**: This is the public resume API and delegates the actual single-thread reconstruction to `resume_single_agent_from_rollout`. It only performs descendant traversal when the resumed tree is not V2.
+**Call relations**: This method is the higher-level resume flow. It calls `resume_single_agent_from_rollout` for the root thread first, then repeatedly calls the same helper for child threads discovered in storage.
 
 *Call graph*: calls 1 internal fn (resume_single_agent_from_rollout); 6 external calls (pin, from, clone, multi_agent_version_from_features, SubAgent, warn!).
 
@@ -1430,24 +1438,24 @@ async fn resume_single_agent_from_rollout(
     ) -> CodexResult<(ThreadId, MultiAgentVersion)
 ```
 
-**Purpose**: Reconstructs one thread from stored rollout history and re-registers it in memory. It also restores thread-spawn metadata such as nickname and role when resuming subagents.
+**Purpose**: Restores one saved agent thread from its stored history. It rebuilds enough in-memory state so the thread can continue as if it had been loaded normally.
 
-**Data flow**: Takes `Config`, `thread_id`, and `SessionSource`, upgrades to manager state, reads the stored thread with archived history included, builds `InitialHistory::Resumed`, computes `multi_agent_version` from the resumed history and source, reserves a registry spawn slot using `config.effective_agent_max_threads(multi_agent_version)`, and if the source is `SubAgent::ThreadSpawn` optionally loads persisted nickname/role from the state DB before calling `prepare_thread_spawn`. It computes inherited environments and exec policy, resumes the thread with `state.resume_thread_with_history_with_source(...)`, fills `agent_metadata.agent_id`, commits the reservation, notifies thread creation, optionally starts a completion watcher for non-V2 children, persists the spawn edge, and returns `(resumed_thread.thread_id, multi_agent_version)`.
+**Data flow**: It receives configuration, a thread ID, and a session source → reads the stored thread and its history → wraps that history as resumed initial history → determines the applicable multi-agent version and reserves spawn capacity → reconstructs subagent metadata when the source says this was a thread-spawned agent, including saved nickname or role when available → inherits environment and execution policy settings → asks the thread manager to resume the thread from history → commits metadata, notifies listeners, possibly starts a completion watcher, persists the spawn edge, and returns the resumed thread ID plus its multi-agent version.
 
-**Call relations**: This function is called by `resume_agent_from_rollout` for the root thread and for each descendant that should be reopened. It is the single-thread resume primitive that the tree-resume loop builds upon.
+**Call relations**: `AgentControl::resume_agent_from_rollout` calls this for the initial thread and, when needed, for each descendant thread. This helper performs the one-thread resume operation, while the caller decides how many related threads should be restored.
 
 *Call graph*: called by 1 (resume_agent_from_rollout); 5 external calls (clone, effective_agent_max_threads, clone, default, Resumed).
 
 
 ### `core/src/agent/control.rs`
 
-`orchestration` · `multi-agent request handling and subagent lifecycle management`
+`orchestration` · `cross-cutting during session setup, agent spawning, message sending, status watching, and cleanup`
 
-This file defines `AgentControl`, the shared handle every session uses to interact with the multi-agent subsystem. Its state combines a root-scoped `SessionId`, a weak pointer to `ThreadManagerState`, an `AgentRegistry` for metadata and path/name reservations, V2 residency tracking, and an execution limiter. Around that state it provides the operational API for sending work to agents, interrupting them, querying status/config, resolving path-like agent references, listing live agents, and formatting subagent context.
+A session can have a main thread and many sub-agents, like a team where one person can delegate tasks to others. This file defines `AgentControl`, the shared handle that lets those threads find each other, talk to each other, and stay registered under the same session instead of becoming loose global state.
 
-Request-sending methods (`send_input`, `send_inter_agent_communication`, `interrupt_agent`) all upgrade the weak manager handle, enforce execution-capacity policy where applicable, dispatch an `Op` to the target thread, and normalize cleanup through `handle_thread_request_result`. Successful sends update the registry's `last_task_message`, derived either from inter-agent communication content or from `render_input_preview` over user input items. If a thread died internally, the control plane removes it from the manager, clears residency, and releases the registry slot.
+The file does not do the agent’s actual thinking. Instead, it coordinates the surrounding bookkeeping. Before sending work to an agent, it checks that the thread manager still exists, asks the execution limiter whether the agent may run, forwards the operation, and records a short “last task” preview for listing agents later. If a target thread has died, it removes stale records so the rest of the system does not keep pointing at a dead agent.
 
-The file also owns root/session bookkeeping (`register_session_root`), path-based resolution (`resolve_agent_reference`), subtree traversal over persisted live thread-spawn edges, and detached completion watching for spawned subagents. `maybe_start_completion_watcher` subscribes to child status changes and, once final, either sends a V2 inter-agent completion message back to the parent or injects a user-visible notification into the parent thread. Additional helpers prepare spawn metadata, inherit environments and exec policy from parent threads, persist spawn edges to the state DB, and implement path-prefix matching for agent listings. Overall, this is orchestration-heavy code that keeps registry metadata, thread-manager state, and user-visible multi-agent behavior in sync.
+It also understands parent-child relationships. When a sub-agent is spawned, this control layer reserves its name or path, records metadata, persists the spawn edge when possible, and can later list children or all descendants. For spawned sub-agents, it can start a background watcher that waits until the child finishes and then notifies the parent. In newer multi-agent mode, that notification is sent as structured inter-agent communication; otherwise it is injected as a plain user-style message. Without this file, agents could still exist as threads, but the system would lose the shared map of who they are, where they belong, and how they should communicate.
 
 #### Function details
 
@@ -1457,11 +1465,11 @@ The file also owns root/session bookkeeping (`register_session_root`), path-base
 fn new(manager: Weak<ThreadManagerState>) -> Self
 ```
 
-**Purpose**: Constructs a new `AgentControl` bound to a weak thread-manager handle, leaving other fields at their defaults.
+**Purpose**: Creates a new `AgentControl` handle tied to the global thread manager. This is the starting point for giving a session the ability to create and contact agents.
 
-**Data flow**: It takes `Weak<ThreadManagerState>`, creates `Self { manager, ..Default::default() }`, and returns the initialized control object.
+**Data flow**: It receives a weak reference to the thread manager, meaning a pointer that does not keep the manager alive by itself. It builds a default control object, stores that weak reference, and leaves the rest of the shared registry and limiter state at their defaults.
 
-**Call relations**: Higher-level session/service construction calls this to create the root control-plane handle before session id and limits are configured.
+**Call relations**: The broader agent-control setup calls this when a session needs its control handle. Later steps can add the session id with `AgentControl::with_session_id` and then use the handle for spawning, messaging, and listing agents.
 
 *Call graph*: called by 1 (agent_control); 1 external calls (default).
 
@@ -1472,11 +1480,11 @@ fn new(manager: Weak<ThreadManagerState>) -> Self
 fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self
 ```
 
-**Purpose**: Attaches the shared multi-agent `SessionId` and initializes the execution limiter with the maximum thread count.
+**Purpose**: Attaches the shared session id to an `AgentControl` and sets the maximum number of agent threads allowed to run. This makes the handle ready for a particular session tree.
 
-**Data flow**: It takes ownership of `self`, a `SessionId`, and `max_threads`, writes `self.session_id`, calls `self.agent_execution_limiter.initialize(max_threads)`, and returns the updated `Self`.
+**Data flow**: It takes an existing control object, a session id, and a thread limit. It stores the session id, initializes the execution limiter with the maximum thread count, and returns the updated control object.
 
-**Call relations**: This is part of control-plane setup immediately after construction.
+**Call relations**: This is used during setup after `AgentControl::new` creates the handle. Other code later reads the stored id through `AgentControl::session_id` and relies on the limiter when sending work.
 
 *Call graph*: called by 1 (new).
 
@@ -1487,11 +1495,11 @@ fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self
 fn session_id(&self) -> SessionId
 ```
 
-**Purpose**: Returns the session-wide id shared by the root thread and all of its subagents.
+**Purpose**: Returns the session id shared by the root thread and its sub-agents. Callers use this when they need to label work or events as belonging to the same session tree.
 
-**Data flow**: It reads `self.session_id` and returns it by value.
+**Data flow**: It reads the stored session id from the control object and returns it unchanged. It does not contact the thread manager or change any state.
 
-**Call relations**: Setup and callers needing to tag operations with the shared multi-agent session use this accessor.
+**Call relations**: This is called by setup or session-related code that needs to know which session this control handle belongs to. It is the simple read side of the value set by `AgentControl::with_session_id`.
 
 *Call graph*: called by 1 (new).
 
@@ -1506,11 +1514,11 @@ async fn send_input(
     ) -> CodexResult<String>
 ```
 
-**Purpose**: Sends an arbitrary initial `Op` to an existing agent thread after ensuring the manager is available and execution capacity permits the operation.
+**Purpose**: Sends a user-style operation to an existing agent thread. It first checks that the thread manager is still available and that running this operation would not break execution limits.
 
-**Data flow**: It takes a target `ThreadId` and an `Op`, upgrades the weak manager to `Arc<ThreadManagerState>`, awaits `ensure_execution_capacity_for_op`, then delegates to `send_input_after_capacity_check`. It returns `CodexResult<String>` from the underlying thread operation.
+**Data flow**: It receives a target agent thread id and an operation. It upgrades the weak thread-manager pointer into a usable shared pointer, asks the execution limiter for permission, then passes the operation to `AgentControl::send_input_after_capacity_check`; the result is either a request id or an error.
 
-**Call relations**: This is the general request-dispatch entrypoint for existing agents; it funnels successful capacity-checked sends into `send_input_after_capacity_check`.
+**Call relations**: This is the public path for sending ordinary input through `AgentControl`. It delegates the actual send and “last task” bookkeeping to `AgentControl::send_input_after_capacity_check`, after `AgentControl::upgrade` confirms the manager still exists.
 
 *Call graph*: calls 2 internal fn (send_input_after_capacity_check, upgrade).
 
@@ -1526,11 +1534,11 @@ async fn send_input_after_capacity_check(
     ) -> CodexResult<String>
 ```
 
-**Purpose**: Dispatches an already-capacity-approved operation to a thread and updates the registry's last-task message on success.
+**Purpose**: Forwards an already-approved operation to an agent and records a readable summary of the task. This keeps agent listings useful by showing what each agent was last asked to do.
 
-**Data flow**: It takes the target thread id, upgraded manager state, and `Op`. It derives `last_task_message` from inter-agent communication content or from `render_input_preview`, sends the op through `state.send_op`, normalizes the result via `handle_thread_request_result`, and if successful either updates or clears `self.state`'s last-task message for that thread. It returns the final `CodexResult<String>`.
+**Data flow**: It receives the target agent id, the thread manager, and the operation. It turns the operation into a short preview, sends the operation to the thread, lets `AgentControl::handle_thread_request_result` clean up if the send discovers a dead agent, and if sending succeeded it updates or clears the agent’s last-task message in the registry.
 
-**Call relations**: Only `send_input` calls this, after capacity checks. It delegates failure cleanup to `handle_thread_request_result` and message extraction to local helpers.
+**Call relations**: `AgentControl::send_input` calls this after capacity has been checked. It uses `render_input_preview`, `last_task_message_from_communication`, and `non_empty_task_message` to prepare display text, then hands the send result through `AgentControl::handle_thread_request_result`.
 
 *Call graph*: calls 4 internal fn (handle_thread_request_result, last_task_message_from_communication, non_empty_task_message, render_input_preview); called by 1 (send_input).
 
@@ -1545,11 +1553,11 @@ async fn send_inter_agent_communication(
     ) -> CodexResult<String>
 ```
 
-**Purpose**: Sends an `InterAgentCommunication` payload to an existing agent thread and updates the registry's last-task message when appropriate.
+**Purpose**: Sends a structured message from one agent to another. This is used when agents talk to each other rather than receiving ordinary user input.
 
-**Data flow**: It takes a target thread id and a communication struct, derives a visible last-task message unless the content is encrypted, upgrades the manager, wraps the communication in `Op::InterAgentCommunication`, enforces execution capacity, sends the op, normalizes the result, and updates or clears the registry's last-task message on success. It returns `CodexResult<String>`.
+**Data flow**: It receives a target agent id and an inter-agent communication object. It extracts a possible last-task display message, wraps the communication into an operation, checks execution capacity, sends it through the thread manager, then updates the registry’s last-task message if the send succeeded.
 
-**Call relations**: This is the specialized messaging path used by inter-agent workflows and by completion watchers sending notifications back to parents.
+**Call relations**: Completion watchers and other multi-agent flows use this when one agent needs to notify another. It follows the same safety pattern as normal input: `AgentControl::upgrade`, capacity checking, thread-manager send, and cleanup through `AgentControl::handle_thread_request_result`.
 
 *Call graph*: calls 3 internal fn (handle_thread_request_result, upgrade, last_task_message_from_communication).
 
@@ -1560,11 +1568,11 @@ async fn send_inter_agent_communication(
 async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String>
 ```
 
-**Purpose**: Sends an interrupt operation to an existing agent thread.
+**Purpose**: Asks an agent thread to stop its current task. This gives the system a controlled way to cancel or interrupt work that is already in progress.
 
-**Data flow**: It upgrades the manager, sends `Op::Interrupt` through `state.send_op`, passes the result through `handle_thread_request_result`, and returns the resulting `CodexResult<String>`.
+**Data flow**: It receives the target agent id, upgrades the thread-manager pointer, sends an interrupt operation to that thread, and returns the thread manager’s result after dead-agent cleanup has had a chance to run.
 
-**Call relations**: This is the control-plane interruption path for live agents and shares the same dead-thread cleanup logic as other request methods.
+**Call relations**: Callers use this as the control-plane cancel path. It relies on `AgentControl::upgrade` to reach the thread manager and `AgentControl::handle_thread_request_result` to remove stale records if the interrupted agent is already gone.
 
 *Call graph*: calls 2 internal fn (handle_thread_request_result, upgrade).
 
@@ -1580,11 +1588,11 @@ async fn handle_thread_request_result(
     ) -> CodexResult<String>
 ```
 
-**Purpose**: Normalizes thread-operation results by cleaning up registry and manager state when a target agent died internally.
+**Purpose**: Examines the result of sending something to an agent and cleans up if the agent died internally. This prevents the registry from keeping a dead thread as if it were still usable.
 
-**Data flow**: It takes the target thread id, manager state, and a `CodexResult<String>`. If the result is `Err(CodexErr::InternalAgentDied)`, it asynchronously removes the thread from the manager, forgets V2 residency, and releases the spawned-thread slot in the registry. It then returns the original result unchanged.
+**Data flow**: It receives the target agent id, the thread manager, and the result of a request. If the result says the internal agent died, it removes the thread from the manager, forgets residency bookkeeping, and releases the spawned-thread record; then it returns the original result unchanged.
 
-**Call relations**: All request-dispatch methods route their results through this helper so dead-agent cleanup is centralized.
+**Call relations**: The send and interrupt paths all pass their thread-manager result through this function. It is the shared cleanup checkpoint for `AgentControl::send_input_after_capacity_check`, `AgentControl::send_inter_agent_communication`, and `AgentControl::interrupt_agent`.
 
 *Call graph*: called by 3 (interrupt_agent, send_input_after_capacity_check, send_inter_agent_communication); 1 external calls (matches!).
 
@@ -1595,11 +1603,11 @@ async fn handle_thread_request_result(
 async fn get_status(&self, agent_id: ThreadId) -> AgentStatus
 ```
 
-**Purpose**: Fetches the current status of an agent thread, returning `AgentStatus::NotFound` if the manager or thread is unavailable.
+**Purpose**: Looks up the latest known status of an agent, such as whether it is running or finished. If the manager or thread cannot be found, it reports `NotFound` instead of failing loudly.
 
-**Data flow**: It upgrades the manager, looks up the thread by id, and awaits `thread.agent_status()`. Any failure to upgrade or fetch the thread yields `AgentStatus::NotFound`.
+**Data flow**: It receives an agent id, tries to reach the thread manager, then tries to fetch the thread. If both steps succeed it asks the thread for its current agent status; otherwise it returns `NotFound`.
 
-**Call relations**: Status polling and completion-watcher fallback logic use this method when a subscription is unavailable or broken.
+**Call relations**: Background watchers use this as a fallback when they cannot subscribe to live status updates. It begins with `AgentControl::upgrade`, because the status lives on the thread manager’s thread objects.
 
 *Call graph*: calls 1 internal fn (upgrade).
 
@@ -1614,11 +1622,11 @@ fn register_session_root(
     )
 ```
 
-**Purpose**: Registers the current thread as a root thread in the registry when it has no parent thread.
+**Purpose**: Records the current thread as the root of an agent session when it has no parent. This anchors the tree so later lookups can include the main thread.
 
-**Data flow**: It takes the current thread id and optional parent thread id. If the parent is `None`, it writes the current thread id into `self.state` as a root thread; otherwise it does nothing.
+**Data flow**: It receives the current thread id and an optional parent thread id. If there is no parent, it stores the current thread as the root thread in the agent registry; otherwise it leaves the registry unchanged.
 
-**Call relations**: This is called from agent-resolution and spawn-preparation flows to keep root-thread bookkeeping accurate.
+**Call relations**: Session setup calls this when a thread starts. The root registration is later used by listing and path-based lookup code, including the root entry shown by `AgentControl::list_agents`.
 
 
 ##### `AgentControl::get_agent_metadata`  (lines 237–239)
@@ -1627,11 +1635,11 @@ fn register_session_root(
 fn get_agent_metadata(&self, agent_id: ThreadId) -> Option<AgentMetadata>
 ```
 
-**Purpose**: Returns the registry metadata for a known agent thread if present.
+**Purpose**: Returns the registry information known for an agent, such as its path, nickname, role, and last task. This is a read-only lookup for callers that already have a thread id.
 
-**Data flow**: It takes a thread id, queries `self.state.agent_metadata_for_thread`, and returns `Option<AgentMetadata>`.
+**Data flow**: It receives an agent id, asks the agent registry for metadata tied to that thread, and returns either the metadata or nothing if the thread is unknown.
 
-**Call relations**: Callers use this as a lightweight metadata lookup without touching the thread manager.
+**Call relations**: Other control-plane code uses this when it needs human-friendly agent information without contacting the live thread. It is a direct read from the shared `AgentRegistry`.
 
 
 ##### `AgentControl::ensure_agent_known`  (lines 241–245)
@@ -1640,11 +1648,11 @@ fn get_agent_metadata(&self, agent_id: ThreadId) -> Option<AgentMetadata>
 fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata>
 ```
 
-**Purpose**: Looks up agent metadata and converts absence into a `ThreadNotFound` protocol error.
+**Purpose**: Checks that an agent id is known to the registry and returns its metadata. Unlike `AgentControl::get_agent_metadata`, it turns a missing entry into a clear thread-not-found error.
 
-**Data flow**: It queries `self.state.agent_metadata_for_thread(agent_id)` and returns the metadata on success or `Err(CodexErr::ThreadNotFound(agent_id))` when missing.
+**Data flow**: It receives an agent id and asks the registry for metadata. If metadata exists, it returns it; if not, it returns a `ThreadNotFound` error for that id.
 
-**Call relations**: This helper is used by callers that need a protocol-level error rather than an `Option` when validating agent existence.
+**Call relations**: Callers use this when the next step requires a real registered agent and should stop immediately if the id is invalid. It is the stricter version of `AgentControl::get_agent_metadata`.
 
 *Call graph*: 1 external calls (ThreadNotFound).
 
@@ -1658,11 +1666,11 @@ async fn list_live_agent_subtree_thread_ids(
     ) -> CodexResult<Vec<ThreadId>>
 ```
 
-**Purpose**: Returns the given agent thread id plus all currently live descendants reachable through thread-spawn edges.
+**Purpose**: Returns the thread ids for one agent and all of its live spawned descendants. This is useful when an operation needs to apply to a whole branch of the agent tree.
 
-**Data flow**: It starts a vector with `agent_id`, extends it with the result of `live_thread_spawn_descendants(agent_id).await?`, and returns the combined `Vec<ThreadId>`.
+**Data flow**: It starts with the requested agent id in a list, asks `AgentControl::live_thread_spawn_descendants` for all live child and grandchild thread ids, appends them, and returns the combined list.
 
-**Call relations**: This is a convenience wrapper over descendant traversal for callers that need the whole live subtree rooted at one agent.
+**Call relations**: Higher-level code calls this when it needs the complete live subtree below a particular agent. It delegates the tree walk to `AgentControl::live_thread_spawn_descendants`.
 
 *Call graph*: calls 1 internal fn (live_thread_spawn_descendants); 1 external calls (vec!).
 
@@ -1676,11 +1684,11 @@ async fn get_agent_config_snapshot(
     ) -> Option<ThreadConfigSnapshot>
 ```
 
-**Purpose**: Fetches a thread's current configuration snapshot if the manager and thread are still available.
+**Purpose**: Fetches a snapshot of an agent thread’s configuration. A snapshot is a point-in-time copy, useful when callers need to inspect settings without changing them.
 
-**Data flow**: It upgrades the manager, gets the thread by id, awaits `thread.config_snapshot()`, and returns `Some(ThreadConfigSnapshot)` or `None` on any lookup failure.
+**Data flow**: It receives an agent id, upgrades the thread-manager reference, fetches the thread, and asks that thread for its configuration snapshot. If the manager or thread is unavailable, it returns nothing.
 
-**Call relations**: Callers use this when they need to inspect a live agent's effective configuration.
+**Call relations**: Control and inspection code use this to understand how a running agent was configured. It depends on `AgentControl::upgrade` because the configuration snapshot is stored on the live thread.
 
 *Call graph*: calls 1 internal fn (upgrade).
 
@@ -1696,11 +1704,11 @@ async fn resolve_agent_reference(
     ) -> CodexResult<ThreadId>
 ```
 
-**Purpose**: Resolves a relative or absolute live-agent path reference against the current session source into a concrete thread id.
+**Purpose**: Turns a human-style agent reference into the actual thread id for a live agent. This lets code refer to agents by paths such as relative names instead of raw thread identifiers.
 
-**Data flow**: It reads the current agent path from `current_session_source`, defaulting to `AgentPath::root()`, resolves the provided `agent_reference` string against that path, looks up the resulting path in the registry, and returns the corresponding `ThreadId` or `CodexErr::UnsupportedOperation` with a descriptive message if no live agent matches.
+**Data flow**: It reads the current session’s agent path, resolves the provided reference against that path, and asks the registry whether any live agent has the resulting path. If found, it returns the thread id; otherwise it returns an unsupported-operation error saying the path was not found.
 
-**Call relations**: This is the path-resolution backend used by tool-facing agent-target resolution after direct thread-id parsing fails.
+**Call relations**: Inter-agent features use this when a message or command names another agent. It relies on path information from the current `SessionSource` and the registry’s path-to-thread mapping.
 
 *Call graph*: 3 external calls (get_agent_path, format!, UnsupportedOperation).
 
@@ -1714,11 +1722,11 @@ async fn subscribe_status(
     ) -> CodexResult<watch::Receiver<AgentStatus>>
 ```
 
-**Purpose**: Subscribes to status updates for a live agent thread.
+**Purpose**: Opens a live subscription to an agent’s status changes. A subscription lets a caller wait for updates instead of repeatedly polling.
 
-**Data flow**: It upgrades the manager, fetches the thread by id, calls `thread.subscribe_status()`, and returns the resulting `watch::Receiver<AgentStatus>` inside `CodexResult`.
+**Data flow**: It receives an agent id, upgrades the thread-manager pointer, fetches the thread, and returns a watch receiver. That receiver first contains the current status and then receives later status changes.
 
-**Call relations**: Completion watchers use this to observe child-agent lifecycle transitions without polling.
+**Call relations**: `AgentControl::maybe_start_completion_watcher` uses this to wait until a child agent reaches a final state. It follows the normal lookup route through `AgentControl::upgrade` and the thread manager.
 
 *Call graph*: calls 1 internal fn (upgrade).
 
@@ -1732,11 +1740,11 @@ async fn format_environment_context_subagents(
     ) -> String
 ```
 
-**Purpose**: Formats a newline-separated summary of direct spawned subagents for inclusion in environment context.
+**Purpose**: Builds a short text block describing the sub-agents directly available under a parent thread. This text can be placed into an environment or prompt so the parent knows who it can refer to.
 
-**Data flow**: It fetches direct children with `open_thread_spawn_children(parent_thread_id).await`, returns an empty string on error, otherwise maps each `(thread_id, metadata)` to a display reference using the agent path name when available or the thread id otherwise, formats each line with `format_subagent_context_line`, joins them with newlines, and returns the resulting string.
+**Data flow**: It receives a parent thread id, asks for that parent’s open spawned children, and formats each child as a context line using either the agent path name or the raw thread id plus any nickname. If the child lookup fails, it returns an empty string.
 
-**Call relations**: This is a presentation helper for parent-thread context assembly and depends on the live child-edge view.
+**Call relations**: Prompt or environment-building code calls this when it wants to show a parent thread its active sub-agents. It gets the child list through `AgentControl::open_thread_spawn_children` and formats each line with session-prefix helpers.
 
 *Call graph*: calls 1 internal fn (open_thread_spawn_children); 1 external calls (new).
 
@@ -1751,11 +1759,11 @@ async fn list_agents(
     ) -> CodexResult<Vec<ListedAgent>>
 ```
 
-**Purpose**: Lists live agents visible from the current session source, optionally filtered by an agent-path prefix, including status and last-task summaries.
+**Purpose**: Produces a user-facing list of live agents, optionally limited to one path prefix. Each entry includes the agent’s name, current status, and the last task message if available.
 
-**Data flow**: It upgrades the manager, resolves the optional prefix relative to the current session source, fetches and sorts live registry metadata by path/id, conditionally inserts the root agent entry when it matches the prefix and is live, then iterates metadata entries, skipping unresolved threads and non-matching prefixes, fetching each thread's status and packaging `ListedAgent { agent_name, agent_status, last_task_message }`. It returns `CodexResult<Vec<ListedAgent>>`.
+**Data flow**: It receives the current session source and an optional path prefix. It resolves the prefix relative to the current agent path, gathers live agent metadata from the registry, sorts it predictably, includes the root thread when it matches, fetches each live thread’s current status, and returns a list of display records.
 
-**Call relations**: This is the main listing API for multi-agent UIs/tools. It relies on `agent_matches_prefix` semantics and combines registry metadata with live thread-manager status.
+**Call relations**: User commands or UI features call this to show what agents exist. It uses `AgentControl::upgrade` to read live thread status and `agent_matches_prefix` to decide which path entries belong in the result.
 
 *Call graph*: calls 2 internal fn (upgrade, root); 1 external calls (with_capacity).
 
@@ -1771,11 +1779,11 @@ fn maybe_start_completion_watcher(
         child_agent_path: Option<Ag
 ```
 
-**Purpose**: Starts a detached task that waits for a spawned child agent to reach a final status and then notifies the parent thread in the appropriate protocol style.
+**Purpose**: Starts a background task that waits for a spawned sub-agent to finish and then tells its parent. This is like assigning someone to watch the mailbox and notify the manager when a delegated task is done.
 
-**Data flow**: It takes child identifiers plus optional session-source/path metadata. If the session source is not `SubAgentSource::ThreadSpawn`, it returns immediately. Otherwise it clones `self` into a spawned async task, subscribes to child status changes or falls back to `get_status`, waits until a final status is observed, upgrades the manager, inspects whether the child uses multi-agent V2, and either sends an `InterAgentCommunication` completion message to the parent or injects a user notification message into the parent thread. It performs asynchronous messaging side effects but returns nothing to the caller.
+**Data flow**: It receives the child thread id, optional session source, a child reference string, and an optional child agent path. If the child was not spawned from a parent thread, it does nothing. Otherwise it starts an asynchronous task that waits for the child status to become final, then sends either structured inter-agent communication or a plain injected notification to the parent.
 
-**Call relations**: Spawn flows call this after creating a child thread so parent threads receive completion notifications automatically. It delegates message formatting to session-prefix helpers and uses `send_inter_agent_communication` for V2-aware paths.
+**Call relations**: The spawn flow calls this after creating a child agent. Inside the background task it uses `AgentControl::subscribe_status` when possible, falls back to `AgentControl::get_status`, checks final states with `is_final`, and then uses either `AgentControl::send_inter_agent_communication` or direct parent-thread message injection.
 
 *Call graph*: calls 4 internal fn (is_final, format_inter_agent_completion_message, format_subagent_notification_message, new); 2 external calls (new, spawn).
 
@@ -1792,11 +1800,11 @@ fn prepare_thread_spawn(
         age
 ```
 
-**Purpose**: Reserves agent-path and nickname metadata for a new spawned thread and constructs the corresponding `SessionSource` and initial `AgentMetadata`.
+**Purpose**: Prepares registry and session metadata before creating a new spawned agent thread. It reserves names and paths early so two children do not accidentally claim the same identity.
 
-**Data flow**: It takes a mutable spawn reservation, config, parent thread id, depth, optional agent path/role, and optional preferred nickname. If `depth == 1` it registers the parent as a root thread. It reserves the agent path when present, computes nickname candidates from config and role, reserves a nickname with optional preference, builds `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { ... })`, constructs `AgentMetadata` with `agent_id: None` and no last-task message, and returns both values in `CodexResult`.
+**Data flow**: It receives a spawn reservation, parent configuration, parent thread id, depth, optional path, optional role, and optional preferred nickname. It may register the parent as root, reserves the requested agent path, chooses and reserves a nickname, builds the child session source, and returns that source together with metadata for the future agent.
 
-**Call relations**: Thread-spawn orchestration uses this helper before actually creating the child thread so naming/path collisions are prevented up front.
+**Call relations**: The agent-spawning code calls this before the actual thread is started. It relies on nickname candidates from the spawn helper module and reservation methods that protect unique paths and nicknames.
 
 *Call graph*: calls 3 internal fn (agent_nickname_candidates, reserve_agent_nickname_with_preference, reserve_agent_path); 1 external calls (SubAgent).
 
@@ -1807,11 +1815,11 @@ fn prepare_thread_spawn(
 fn upgrade(&self) -> CodexResult<Arc<ThreadManagerState>>
 ```
 
-**Purpose**: Upgrades the weak thread-manager handle into a strong `Arc`, returning a protocol error if the manager has already been dropped.
+**Purpose**: Turns the stored weak thread-manager reference into a usable shared reference. If the thread manager has already been dropped, it reports that agent operations are no longer supported.
 
-**Data flow**: It calls `self.manager.upgrade()`, returning the `Arc<ThreadManagerState>` on success or `CodexErr::UnsupportedOperation("thread manager dropped")` on failure.
+**Data flow**: It reads the weak manager pointer from the control object. If the manager is still alive, it returns a strong shared pointer; if not, it returns an unsupported-operation error.
 
-**Call relations**: Nearly every operation that touches live threads begins here, making this the common gateway from control-plane state into the thread manager.
+**Call relations**: Most functions that need live threads call this first, including sending input, interrupting agents, listing agents, getting status, subscribing to status, and reading child edges. It is the safety gate between the control handle and the global thread manager.
 
 *Call graph*: called by 8 (get_agent_config_snapshot, get_status, interrupt_agent, list_agents, live_thread_spawn_children, send_input, send_inter_agent_communication, subscribe_status); 1 external calls (upgrade).
 
@@ -1826,11 +1834,11 @@ async fn inherited_environments_for_source(
     ) -> Option<TurnEnvironmentSnapshot>
 ```
 
-**Purpose**: Fetches the parent thread's environment snapshot for a spawned child session source, if one exists.
+**Purpose**: Gets the parent thread’s environment selections for a child agent when the child was spawned from a thread. Environment selections describe what runtime context, such as chosen environment settings, should carry over.
 
-**Data flow**: It takes upgraded manager state and an optional session source. If the source is `SubAgentSource::ThreadSpawn`, it fetches the parent thread, awaits `turn_environments.snapshot()` from the parent's session services, and returns `Some(TurnEnvironmentSnapshot)`; otherwise it returns `None`.
+**Data flow**: It receives the thread manager and an optional session source. If the source points to a spawned child, it fetches the parent thread and takes a snapshot of the parent’s turn environments; otherwise it returns nothing.
 
-**Call relations**: Spawn logic uses this helper when deciding what environment selections a child thread should inherit from its parent.
+**Call relations**: Spawn setup uses this when deciding what environment context a new child should inherit. It only applies to `ThreadSpawn` sub-agents because other session sources do not have a parent thread to inherit from.
 
 
 ##### `AgentControl::inherited_exec_policy_for_source`  (lines 554–576)
@@ -1844,11 +1852,11 @@ async fn inherited_exec_policy_for_source(
     ) -> Option<Arc<cr
 ```
 
-**Purpose**: Determines whether a spawned child should inherit its parent's execution-policy manager and returns it when policy inheritance is allowed.
+**Purpose**: Decides whether a child agent should share its parent’s execution policy and returns that policy when appropriate. An execution policy is the rule set that controls what commands or actions are allowed.
 
-**Data flow**: It takes upgraded manager state, an optional session source, and the child config. For thread-spawn sources it fetches the parent thread and parent config, checks `child_uses_parent_exec_policy(&parent_config, child_config)`, and if true clones and returns the parent's `exec_policy` manager; otherwise it returns `None`.
+**Data flow**: It receives the thread manager, optional session source, and the child configuration. If the child was spawned from a parent, it loads the parent thread and configuration, checks whether the child should reuse the parent policy, and if so returns a shared pointer to that policy; otherwise it returns nothing.
 
-**Call relations**: Spawn orchestration calls this when wiring child session services so execution-policy inheritance follows configuration rules.
+**Call relations**: The spawn flow uses this during child setup so policy decisions remain consistent when configuration says they should be inherited. It delegates the actual yes-or-no rule to `child_uses_parent_exec_policy`.
 
 *Call graph*: calls 1 internal fn (child_uses_parent_exec_policy); 1 external calls (clone).
 
@@ -1862,11 +1870,11 @@ async fn open_thread_spawn_children(
     ) -> CodexResult<Vec<(ThreadId, AgentMetadata)>>
 ```
 
-**Purpose**: Returns the currently live direct spawned children of a parent thread.
+**Purpose**: Returns the live direct children spawned by one parent thread. It filters the full child map down to just the requested parent.
 
-**Data flow**: It fetches the full parent-to-children map from `live_thread_spawn_children().await?`, removes the entry for `parent_thread_id`, and returns that vector or an empty default vector.
+**Data flow**: It receives a parent thread id, builds the current map of live parent-to-child relationships, removes the entry for the requested parent, and returns that list or an empty list if there are no children.
 
-**Call relations**: This is the direct-children view used by environment-context formatting and other callers that only care about one parent.
+**Call relations**: `AgentControl::format_environment_context_subagents` calls this when building prompt context for a parent. It is also used by waiting code elsewhere, and it gets its data from `AgentControl::live_thread_spawn_children`.
 
 *Call graph*: calls 1 internal fn (live_thread_spawn_children); called by 2 (format_environment_context_subagents, wait_for_live_thread_spawn_children).
 
@@ -1879,11 +1887,11 @@ async fn live_thread_spawn_children(
     ) -> CodexResult<HashMap<ThreadId, Vec<(ThreadId, AgentMetadata)>>>
 ```
 
-**Purpose**: Builds a map from each live parent thread to its live spawned child threads and associated metadata.
+**Purpose**: Builds a sorted map of live spawned-child relationships. The result shows, for each parent thread, which live child threads it currently has and what metadata is known about them.
 
-**Data flow**: It upgrades the manager, initializes an empty `HashMap<ThreadId, Vec<(ThreadId, AgentMetadata)>>`, iterates `state.list_live_thread_spawn_edges().await`, pushes each child into the appropriate parent bucket using registry metadata when available or a default metadata stub otherwise, then sorts each child list by agent path and thread id. It returns the completed map.
+**Data flow**: It upgrades the thread manager, asks it for live spawn edges, and for each edge attaches metadata from the agent registry or a minimal default if no metadata exists. It sorts each parent’s children by agent path and then thread id, and returns the map.
 
-**Call relations**: This is the shared traversal primitive behind direct-child and descendant queries.
+**Call relations**: Tree-related functions use this as their source of truth for live parent-child links. `AgentControl::open_thread_spawn_children` narrows it to one parent, while `AgentControl::live_thread_spawn_descendants` walks through it recursively.
 
 *Call graph*: calls 1 internal fn (upgrade); called by 2 (live_thread_spawn_descendants, open_thread_spawn_children); 2 external calls (default, new).
 
@@ -1899,11 +1907,11 @@ async fn persist_thread_spawn_edge_for_source(
     )
 ```
 
-**Purpose**: Persists an open thread-spawn edge to the state database when the child session source has a parent thread and the thread has DB state available.
+**Purpose**: Stores the parent-child relationship for a spawned thread in the persistent state database when one is available. This helps the system remember or inspect spawn relationships outside the in-memory registry.
 
-**Data flow**: It takes the newly created thread, child thread id, and optional session source. It extracts `parent_thread_id` from the source, obtains the thread's state DB context, and asynchronously calls `upsert_thread_spawn_edge(..., DirectionalThreadSpawnEdgeStatus::Open)`. On failure it emits a warning log and otherwise returns nothing.
+**Data flow**: It receives the child thread object, child thread id, and optional session source. If the source has a parent thread id and the thread has a state database context, it writes an open spawn edge from parent to child; if writing fails, it logs a warning and continues.
 
-**Call relations**: Spawn flows call this after child creation so thread-spawn relationships survive beyond in-memory registry state.
+**Call relations**: The spawn flow calls this after a child thread exists. It does not stop the session on database failure; it only warns, because the live in-memory agent flow can still continue.
 
 *Call graph*: calls 1 internal fn (state_db); 1 external calls (warn!).
 
@@ -1917,11 +1925,11 @@ async fn live_thread_spawn_descendants(
     ) -> CodexResult<Vec<ThreadId>>
 ```
 
-**Purpose**: Traverses the live thread-spawn graph depth-first to collect all descendants of a root thread in stable child-order.
+**Purpose**: Finds every live descendant below a root thread, not just direct children. This walks the agent tree so a caller can work with an entire branch.
 
-**Data flow**: It fetches the parent-to-children map from `live_thread_spawn_children().await?`, seeds a stack with the root's direct children in reverse order, then repeatedly pops a thread id, appends it to `descendants`, and pushes that thread's children in reverse order so original sorted order is preserved. It returns `Vec<ThreadId>`.
+**Data flow**: It receives a root thread id, builds the live children map, starts with the root’s direct children, and uses a stack to visit each child and then its children. It returns the collected thread ids in traversal order.
 
-**Call relations**: This is the descendant traversal backend used by `list_live_agent_subtree_thread_ids`.
+**Call relations**: `AgentControl::list_live_agent_subtree_thread_ids` calls this and adds the root id itself. It depends on `AgentControl::live_thread_spawn_children` for the current parent-child map.
 
 *Call graph*: calls 1 internal fn (live_thread_spawn_children); called by 1 (list_live_agent_subtree_thread_ids); 1 external calls (new).
 
@@ -1932,11 +1940,11 @@ async fn live_thread_spawn_descendants(
 fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> bool
 ```
 
-**Purpose**: Checks whether an optional agent path is equal to or nested under a requested prefix path.
+**Purpose**: Checks whether an agent path belongs under a requested path prefix. This is used to filter agent lists to a subtree.
 
-**Data flow**: It takes `Option<&AgentPath>` and `&AgentPath prefix`. If the prefix is root it returns `true`; otherwise it returns `true` only when the agent path exists and is either exactly equal to the prefix or has the prefix followed by a `/` boundary. It has no side effects.
+**Data flow**: It receives an optional agent path and a required prefix. If the prefix is the root path, it accepts everything; otherwise it accepts only paths that exactly match the prefix or start with the prefix followed by a slash.
 
-**Call relations**: Agent listing uses this helper to implement prefix filtering without accidental partial-segment matches.
+**Call relations**: `AgentControl::list_agents` uses this when a caller asks to list only agents under a certain path. It keeps `/a` from accidentally matching unrelated paths like `/abc` by requiring a slash boundary.
 
 *Call graph*: calls 1 internal fn (is_root).
 
@@ -1947,11 +1955,11 @@ fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> b
 fn render_input_preview(initial_operation: &Op) -> String
 ```
 
-**Purpose**: Builds a human-readable preview string for an `Op`, primarily for storing as an agent's last-task message.
+**Purpose**: Turns an operation into a short human-readable preview. This preview becomes the “last task” text shown when listing agents.
 
-**Data flow**: It matches on `initial_operation`. For `Op::UserInput` it maps each `UserInput` item to a preview string (`text`, `[image]`, `[local_image:path]`, `[skill:$name](path)`, `[mention:$name](path)`, or `[input]`) and joins them with newlines; for `Op::InterAgentCommunication` it returns the communication content; for other ops it returns an empty string.
+**Data flow**: It receives an operation. For user input, it converts text directly, labels images and local images, formats skills and mentions, and uses a generic marker for unknown input items; for inter-agent communication it returns the message content; for other operations it returns an empty string.
 
-**Call relations**: This helper is used when sending input to derive the registry's `last_task_message`, and other call-handling code also uses it for previews.
+**Call relations**: `AgentControl::send_input_after_capacity_check` uses this when recording what an agent was last asked to do. Other call-handling and spawn-handling code also call it to show or store readable task summaries.
 
 *Call graph*: called by 3 (send_input_after_capacity_check, handle_call, handle_spawn_agent); 1 external calls (new).
 
@@ -1962,11 +1970,11 @@ fn render_input_preview(initial_operation: &Op) -> String
 fn last_task_message_from_communication(communication: &InterAgentCommunication) -> Option<String>
 ```
 
-**Purpose**: Extracts a visible last-task message from inter-agent communication unless the content is encrypted.
+**Purpose**: Extracts a displayable last-task message from inter-agent communication. It deliberately hides encrypted content because encrypted text should not be shown as a plain preview.
 
-**Data flow**: It reads `communication.encrypted_content`; if present it returns `None`, otherwise it clones `communication.content`, passes it to `non_empty_task_message`, and returns the resulting `Option<String>`.
+**Data flow**: It receives an inter-agent communication object. If encrypted content is present, it returns nothing; otherwise it passes the visible content through `non_empty_task_message` so empty messages are not recorded.
 
-**Call relations**: Both generic input sending and explicit inter-agent communication sending use this helper when deciding whether to update `last_task_message`.
+**Call relations**: Both normal input sending and direct inter-agent sending use this before updating an agent’s last-task message. It is the privacy-aware wrapper around `non_empty_task_message`.
 
 *Call graph*: calls 1 internal fn (non_empty_task_message); called by 2 (send_input_after_capacity_check, send_inter_agent_communication).
 
@@ -1977,11 +1985,11 @@ fn last_task_message_from_communication(communication: &InterAgentCommunication)
 fn non_empty_task_message(message: String) -> Option<String>
 ```
 
-**Purpose**: Converts an empty message string into `None` and preserves non-empty messages as `Some`.
+**Purpose**: Keeps a task message only if it is not empty. This avoids showing blank last-task entries in agent listings.
 
-**Data flow**: It takes an owned `String`, checks `is_empty()`, and returns `Option<String>` using `then_some(message)`.
+**Data flow**: It receives a string. If the string has any content, it returns that string wrapped as a present value; if the string is empty, it returns nothing.
 
-**Call relations**: This tiny helper centralizes the rule that blank previews should clear rather than populate the last-task field.
+**Call relations**: `AgentControl::send_input_after_capacity_check` and `last_task_message_from_communication` use this small helper before writing last-task text into the registry.
 
 *Call graph*: called by 2 (send_input_after_capacity_check, last_task_message_from_communication).
 
@@ -1992,22 +2000,24 @@ fn non_empty_task_message(message: String) -> Option<String>
 fn thread_spawn_depth(session_source: &SessionSource) -> Option<i32>
 ```
 
-**Purpose**: Extracts the spawn depth from a `SessionSource` when the source represents a thread-spawned subagent.
+**Purpose**: Reads the nesting depth from a session source when that source represents a thread-spawned sub-agent. The depth tells how far down the parent-child agent tree the thread is.
 
-**Data flow**: It matches the `SessionSource`; for `SubAgent(SubAgentSource::ThreadSpawn { depth, .. })` it returns `Some(*depth)`, otherwise `None`.
+**Data flow**: It receives a session source. If it is a thread-spawned sub-agent, it returns the stored depth number; for any other source, it returns nothing.
 
-**Call relations**: This helper provides a compact way for callers to inspect spawn ancestry depth from session metadata.
+**Call relations**: Spawn and session code can use this helper when they need to know whether a thread is part of a spawned-agent chain and how deeply nested it is. It is a simple extractor for the `SessionSource` shape used by this control layer.
 
 
 ### `core/src/agent/agent_resolver.rs`
 
-`orchestration` · `tool call handling for agent references`
+`domain_logic` · `tool call handling`
 
-This file contains the narrow adapter used by tool-facing code that needs to turn a user/model-provided agent target into an internal thread identifier. The main function, `resolve_agent_target`, first calls `register_session_root` so the current thread is recorded as a root when appropriate. It then tries the fast path: parse the `target` string directly as a `ThreadId` via `ThreadId::from_string`. If parsing succeeds, that id is returned immediately.
+When a tool wants to send work to another agent, it may not always have a raw thread ID. It might receive a friendly reference, such as a target name. This file is the small translator that turns that tool-facing target into the real thread ID used internally.
 
-If the target is not a literal thread id, the function delegates to `session.services.agent_control.resolve_agent_reference`, passing the current session's root thread id, the turn's `session_source`, and the unresolved target string. Any resulting `CodexErr` is mapped into `FunctionCallError::RespondToModel`, preserving user-facing error text. `UnsupportedOperation` gets its message extracted directly; all other errors are stringified.
+The main flow first makes sure the agent-control service knows the relationship between the current session thread and its parent thread. This is like telling a receptionist which meeting room you came from before asking them to find someone else in the building. That context can matter when resolving a short or relative agent reference.
 
-The helper `register_session_root` is intentionally tiny but important: it forwards the current thread id and the turn's optional parent thread id into `AgentControl::register_session_root`. This means resolution is not just lookup; it also maintains root-thread bookkeeping needed by the multi-agent control plane.
+After that, the resolver tries the simplest path: if the target string is already a valid `ThreadId`, it returns it directly. If not, it asks the session’s `agent_control` service to resolve the target using the current thread and the turn’s session source. If that service cannot do the lookup, the error is converted into a `FunctionCallError` that can be reported back to the model in plain form.
+
+Without this file, tool calls that refer to agents by name or shorthand would not reliably reach the correct conversation thread, and error messages from failed lookups would not be shaped for model-facing tool responses.
 
 #### Function details
 
@@ -2021,11 +2031,11 @@ async fn resolve_agent_target(
 ) -> Result<ThreadId, FunctionCallError>
 ```
 
-**Purpose**: Resolves a target string to a `ThreadId` by first treating it as a literal thread id and otherwise resolving it as a live agent reference relative to the current session source.
+**Purpose**: This function takes a target string from a tool call and finds the actual `ThreadId` for the agent it points to. It supports both direct thread IDs and more human-friendly references that need to be looked up.
 
-**Data flow**: It takes shared `Session` and `TurnContext` handles plus the raw `target` string. It first registers the session root, then attempts `ThreadId::from_string(target)`; on success it returns that id. On failure it asynchronously calls `agent_control.resolve_agent_reference(...)`, transforms any `CodexErr` into `FunctionCallError::RespondToModel`, and returns the resolved `ThreadId` or mapped error.
+**Data flow**: It receives the current `Session`, the current `TurnContext`, and a target string. First it records the session-root relationship through `register_session_root`. Then it tries to read the target as a `ThreadId`; if that works, it returns that ID. If the target is not already an ID, it asks the session’s agent-control service to resolve it, then returns the found thread ID or turns any lookup failure into a model-facing `FunctionCallError`.
 
-**Call relations**: Tool-facing code calls this when it needs to address another agent. The function delegates root registration to `register_session_root` and path-style resolution to `AgentControl` only when direct thread-id parsing fails.
+**Call relations**: This is the public worker in this file. During tool execution, callers use it when they need to turn an agent target into a concrete thread. It calls `register_session_root` first so the lookup service has context, then uses `ThreadId::from_string` for the fast path before handing unresolved names to the agent-control service.
 
 *Call graph*: calls 2 internal fn (register_session_root, from_string).
 
@@ -2036,20 +2046,26 @@ async fn resolve_agent_target(
 fn register_session_root(session: &Arc<Session>, turn: &Arc<TurnContext>)
 ```
 
-**Purpose**: Forwards the current thread and optional parent thread information to the agent-control layer so root-thread bookkeeping is established before agent resolution.
+**Purpose**: This helper records the link between the current session thread and its parent thread. That gives the agent-control service the context it may need to understand relative agent references.
 
-**Data flow**: It takes shared `Session` and `TurnContext` handles, reads `session.thread_id` and `turn.parent_thread_id`, and passes them to `session.services.agent_control.register_session_root`. It returns nothing and mutates agent-control state indirectly.
+**Data flow**: It receives the current `Session` and `TurnContext`. It reads the session’s thread ID and the turn’s parent thread ID, then passes both to the agent-control service. It does not return a value; its effect is updating the service’s knowledge of the session relationship.
 
-**Call relations**: This helper is called at the start of `resolve_agent_target` so even pure-resolution flows keep the agent-control registry aware of the current root context.
+**Call relations**: It is called only by `resolve_agent_target`, right before any target lookup happens. Its job is to prepare the ground so the later resolution step can interpret the requested agent target in the right session context.
 
 *Call graph*: called by 1 (resolve_agent_target).
 
 
 ### `core/src/session/multi_agents.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `session startup / initial context building`
 
-This file contains a single helper that converts session metadata into a borrowed usage-hint string for prompt/context construction. Its logic is intentionally narrow: it only emits text when the current turn is running under multi-agent protocol version V2 and when the `multi_agent_v2.usage_hint_enabled` flag in the turn configuration is set. Once those two gates pass, it inspects the concrete `SessionSource` to choose between two separately configured hint fields on `turn_context.config.multi_agent_v2`: `subagent_usage_hint_text` for subagents created via `SubAgentSource::ThreadSpawn`, and `root_agent_usage_hint_text` for top-level entry sources such as CLI, VSCode, Exec, MCP, custom integrations, or unknown origins. Other subagent/internal sources are explicitly denied hints by returning `None`, which prevents accidental propagation of root-agent guidance into internal orchestration paths. The function returns `Option<&str>` by borrowing from configuration with `as_deref`, so it performs no allocation and preserves the lifetime of the underlying config strings. In practice, this file acts as a small policy boundary between session provenance and prompt assembly.
+This file is a small decision point for the multi-agent feature. In this project, a “multi-agent” session means the main assistant can work with other helper agents. New users, or even agents themselves, may need a short reminder about how that setup should be used. This file chooses that reminder text.
+
+The logic is deliberately cautious. First, it only does anything for version 2 of the multi-agent system. If the session is using another version, it returns no hint. Next, it checks a configuration switch that can turn these hints on or off. If hints are disabled, it again returns nothing.
+
+If hints are allowed, the file looks at where the session came from. A sub-agent that was created by a thread spawn gets the sub-agent hint text. Normal entry points, such as the command line, VS Code, an execution session, MCP, a custom source, or an unknown source, get the root-agent hint text. Internal sessions and other sub-agent sources get no hint.
+
+An everyday analogy: this is like a receptionist handing out different instruction cards. The main visitor gets one card, a helper sent from another room gets another, and some people get no card at all.
 
 #### Function details
 
@@ -2062,11 +2078,11 @@ fn usage_hint_text(
 ) -> Option<&'a str>
 ```
 
-**Purpose**: Determines whether the current session should receive a usage hint and, if so, selects the appropriate configured text for either a root agent or a thread-spawned subagent. It enforces both protocol-version and feature-flag gating before looking at session origin.
+**Purpose**: Chooses the optional usage hint text for a multi-agent session. It returns a hint only when multi-agent version 2 is active, hints are enabled in configuration, and the session source is one that should receive guidance.
 
-**Data flow**: It takes a borrowed `TurnContext` and a borrowed `SessionSource`. It reads `turn_context.multi_agent_version` and `turn_context.config.multi_agent_v2`, checks `usage_hint_enabled`, then matches on `session_source` to choose either `subagent_usage_hint_text.as_deref()`, `root_agent_usage_hint_text.as_deref()`, or `None`. It returns an `Option<&str>` borrowed from configuration and does not mutate any state.
+**Data flow**: It receives the current turn context, which includes the multi-agent version and configuration, plus the session source, which says where this session came from. It first rejects sessions that are not multi-agent version 2, then rejects sessions where hinting is turned off. If both checks pass, it picks either the sub-agent hint text or the root-agent hint text based on the session source, or returns nothing for sources that should not see a hint.
 
-**Call relations**: This helper is invoked by `build_initial_context` while assembling the initial turn/session context, specifically when prompt metadata is being derived from session state. Within that flow it serves as a leaf policy function: it does not delegate further, but encapsulates the source-based branching so callers do not need to duplicate the version/flag/source checks.
+**Call relations**: This function is called by build_initial_context while the system is preparing the starting context for a session. At that moment, build_initial_context asks this function whether any usage guidance should be included, and this function hands back either the right text or no text at all.
 
 *Call graph*: called by 1 (build_initial_context).
 
@@ -2076,13 +2092,13 @@ This group introduces the shared multi-agent tool contracts and helpers, then wa
 
 ### `core/src/tools/handlers/multi_agents_spec.rs`
 
-`config` · `tool registration and schema/search generation`
+`io_transport` · `startup/tool registration`
 
-This file is the schema-definition layer for multi-agent tools. It declares the shared namespace constants, descriptive text fragments, and two option structs: `SpawnAgentToolOptions`, which controls how spawn schemas expose model/role guidance, and `WaitAgentTimeoutOptions`, which carries default/min/max timeout values and defaults to the constants from `multi_agents_common`.
+This file is like the instruction card and form template for the multi-agent feature. The runtime may know how to start and control sub-agents, but the model needs a clear menu of tools: what each tool is called, what fields it can send, which fields are required, and what kind of answer will come back. Without this file, the model would not have a reliable contract for delegating work or communicating with spawned agents.
 
-The public `create_*` functions build `ToolSpec` values for both namespaced v1 tools and newer direct-function v2 tools. These specs define parameter schemas, output schemas, and extensive natural-language descriptions that shape model behavior. The spawn tool builders are especially rich: they can hide metadata override fields, inject available-model guidance, include optional usage hints, and switch between v1's `message/items/fork_context` shape and v2's `task_name/fork_turns` shape. Other builders cover `send_input`, `send_message`, `followup_task`, `resume_agent`, `wait_agent`, `list_agents`, `close_agent`, and `interrupt_agent`.
+The file builds `ToolSpec` values, which are descriptions of callable tools for the Responses API. It supports older namespace-style tools, such as `multi_agent_v1.spawn_agent`, and newer direct function tools, such as `spawn_agent` and `wait_agent`. It also builds JSON Schema objects. A JSON Schema is a machine-readable description of data, like a form that says “this field must be text” or “this result contains a list of agents.”
 
-Private helpers construct reusable schema fragments: `agent_status_output_schema` models the `AgentStatus` union; output-schema builders define the exact JSON returned by each tool; `create_collab_input_items_schema` describes structured `UserInput` arrays; property builders assemble spawn parameter maps; and description builders generate long-form guidance text, including explicit anti-patterns for overusing delegation. `spawn_agent_models_description` summarizes up to five picker-visible models, truncating long reasoning-effort labels and listing supported service tiers. Together, these functions ensure the model sees a precise, constrained, and behaviorally guided API surface.
+The spawn tools include careful guidance about when delegation is appropriate, how inherited model settings work, and how to avoid wasteful parallel work. Other tools describe how to send messages, wait for updates, list live agents, interrupt work, or close agents. Small helper functions keep repeated pieces consistent, such as the standard agent status format and timeout options.
 
 #### Function details
 
@@ -2092,11 +2108,11 @@ Private helpers construct reusable schema fragments: `agent_status_output_schema
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default timeout configuration for wait-agent schemas from the shared multi-agent timeout constants.
+**Purpose**: Provides the standard timeout settings for waiting on agents. This keeps every caller using the same default, minimum, and maximum wait limits unless they explicitly choose different values.
 
-**Data flow**: Constructs and returns `WaitAgentTimeoutOptions { default_timeout_ms, min_timeout_ms, max_timeout_ms }` using values imported from `multi_agents_common`.
+**Data flow**: It starts with no input from the caller. It reads the shared timeout constants from the common multi-agent module, places them into a `WaitAgentTimeoutOptions` value, and returns that value.
 
-**Call relations**: Used when callers do not supply explicit timeout bounds while constructing wait-agent handlers or specs.
+**Call relations**: Code that creates a wait-agent tool can rely on this default when it does not need custom timeout limits. It acts as the common starting point before the tool schema is built.
 
 
 ##### `create_spawn_agent_tool_v1`  (lines 48–78)
@@ -2105,11 +2121,11 @@ fn default() -> Self
 fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec
 ```
 
-**Purpose**: Builds the namespaced v1 `spawn_agent` tool spec, including parameter schema, output schema, and descriptive guidance tailored by `SpawnAgentToolOptions`.
+**Purpose**: Builds the older, namespace-based `spawn_agent` tool. This tool lets the model start a new sub-agent for a specific task and tells it what fields it may provide.
 
-**Data flow**: Consumes `options: SpawnAgentToolOptions` → optionally derives available-model and inherited-model guidance strings, builds a mutable property map with `spawn_agent_common_properties_v1`, optionally removes metadata override fields with `hide_spawn_agent_metadata_options`, then returns `ToolSpec::Namespace` containing one `ResponsesApiTool` named `spawn_agent` with generated description, object parameters, and `spawn_agent_output_schema_v1()`.
+**Data flow**: It receives options such as available models, whether to hide model-related fields, and whether to include usage guidance. It builds the input fields, optionally removes metadata fields, writes a human-readable description, attaches an output shape for the new agent id and nickname, and returns a complete tool specification.
 
-**Call relations**: Called by the v1 spawn handler's `spec` method to expose the tool contract used at runtime.
+**Call relations**: The broader tool-spec setup calls this when it needs the version 1 spawn tool. Inside, it leans on the shared property builder and may call the metadata-hiding helper before wrapping the result in the multi-agent namespace.
 
 *Call graph*: calls 2 internal fn (hide_spawn_agent_metadata_options, spawn_agent_common_properties_v1); called by 1 (spec); 2 external calls (Namespace, vec!).
 
@@ -2120,11 +2136,11 @@ fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec
 fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec
 ```
 
-**Purpose**: Builds the direct-function v2 `spawn_agent` tool spec with canonical task naming and fork-turn controls.
+**Purpose**: Builds the newer direct `spawn_agent` tool. This version uses task names instead of just agent ids, requires both a task name and message, and supports the newer output format.
 
-**Data flow**: Consumes `options` → derives optional model guidance, builds properties with `spawn_agent_common_properties_v2`, optionally hides metadata fields, inserts a required `task_name` string property, and returns `ToolSpec::Function` with generated description, required `task_name` and `message`, and `spawn_agent_output_schema_v2(...)`.
+**Data flow**: It receives spawn-tool options, creates the common version 2 input fields, optionally removes model and agent-type fields, adds the required `task_name` field, builds the description, chooses the right output schema, and returns the tool specification.
 
-**Call relations**: Used by newer spawn-tool registration paths; it delegates description and output-shape details to dedicated helpers.
+**Call relations**: The tool-spec setup calls this when registering the newer multi-agent interface. It uses helpers for the shared version 2 fields, optional metadata hiding, the version 2 description text, and the version 2 output schema.
 
 *Call graph*: calls 6 internal fn (hide_spawn_agent_metadata_options, spawn_agent_common_properties_v2, spawn_agent_output_schema_v2, spawn_agent_tool_description_v2, object, string); called by 1 (spec); 2 external calls (Function, vec!).
 
@@ -2135,11 +2151,11 @@ fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec
 fn create_send_input_tool_v1() -> ToolSpec
 ```
 
-**Purpose**: Builds the namespaced v1 `send_input` tool spec for messaging an existing agent with either plain text or structured items.
+**Purpose**: Builds the older `send_input` tool, which sends a message or structured input items to an existing agent. It also lets the sender request an interrupt so the message can be handled immediately.
 
-**Data flow**: Creates a `BTreeMap` of properties for `target`, `message`, `items`, and `interrupt`, using `create_collab_input_items_schema` for structured items, then wraps them in a namespaced `ToolSpec` with required `target` and `send_input_output_schema()`.
+**Data flow**: It creates fields for the target agent, a plain text message, structured items, and an interrupt flag. It marks the target as required, adds an output shape containing a queued submission id, and returns the namespace-wrapped tool specification.
 
-**Call relations**: Called by the send-input handler's `spec` method.
+**Call relations**: The tool-spec setup calls this for the version 1 messaging flow. It uses the structured input item schema helper so messages can include more than plain text when needed.
 
 *Call graph*: calls 3 internal fn (create_collab_input_items_schema, boolean, string); called by 1 (spec); 3 external calls (from, Namespace, vec!).
 
@@ -2150,11 +2166,11 @@ fn create_send_input_tool_v1() -> ToolSpec
 fn create_send_message_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds a direct-function `send_message` tool spec for queueing a plain-text message to an existing agent by id or task name.
+**Purpose**: Builds the newer `send_message` tool for sending a queued message to another live agent. It is meant for communication, not for forcing a new turn of work.
 
-**Data flow**: Creates properties for encrypted `message` and `target`, marks both required in a `JsonSchema::object`, and returns `ToolSpec::Function` with no output schema.
+**Data flow**: It creates required fields for the target task or agent and the encrypted message text. It packages those fields into a direct function tool and returns it, without defining a special output body.
 
-**Call relations**: Used by other registration paths outside the v1 namespaced handler set.
+**Call relations**: The tool-spec setup calls this when exposing newer agent-to-agent messaging. It hands off only a simple target-and-message form because delivery behavior is handled elsewhere.
 
 *Call graph*: calls 2 internal fn (object, string); called by 1 (spec); 3 external calls (from, Function, vec!).
 
@@ -2165,11 +2181,11 @@ fn create_send_message_tool() -> ToolSpec
 fn create_followup_task_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds a direct-function `followup_task` tool spec for sending a follow-up task to an existing non-root agent.
+**Purpose**: Builds the `followup_task` tool, which sends a new task to an existing non-root agent. If the agent is idle, this can wake it up for another turn.
 
-**Data flow**: Creates required `target` and encrypted `message` properties, wraps them in a `ToolSpec::Function`, and leaves `output_schema` as `None`.
+**Data flow**: It creates required fields for the target and encrypted message text. It wraps them in a direct function tool whose description explains how delivery differs for idle versus running agents, then returns that tool specification.
 
-**Call relations**: Used by newer collaboration surfaces that distinguish follow-up tasks from generic input submission.
+**Call relations**: The tool-spec setup calls this when it wants agents to be reusable for later tasks. The actual delivery and turn triggering happen outside this file; this file only defines the contract.
 
 *Call graph*: calls 2 internal fn (object, string); called by 1 (spec); 3 external calls (from, Function, vec!).
 
@@ -2180,11 +2196,11 @@ fn create_followup_task_tool() -> ToolSpec
 fn create_resume_agent_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the namespaced v1 `resume_agent` tool spec.
+**Purpose**: Builds the older namespace-based `resume_agent` tool. It allows a previously closed agent to be reopened so it can receive later messages and waits.
 
-**Data flow**: Creates a single required `id` string property and returns a namespaced `ToolSpec` whose output schema is `resume_agent_output_schema()`.
+**Data flow**: It creates a required `id` field, describes the resume action, attaches an output schema that reports the agent status, and returns the tool inside the multi-agent namespace.
 
-**Call relations**: Called by the resume handler's `spec` method.
+**Call relations**: The tool-spec setup calls this for the version 1 resume capability. The output uses the shared status shape so resumed agents report status the same way as other multi-agent tools.
 
 *Call graph*: calls 1 internal fn (string); called by 1 (spec); 3 external calls (from, Namespace, vec!).
 
@@ -2195,11 +2211,11 @@ fn create_resume_agent_tool() -> ToolSpec
 fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec
 ```
 
-**Purpose**: Builds the namespaced v1 `wait_agent` tool spec for waiting on final statuses of specific target agents.
+**Purpose**: Builds the older `wait_agent` tool, which waits for one of a set of target agents to reach a final state. This helps the main agent pause only when it truly needs a delegated result.
 
-**Data flow**: Consumes `options: WaitAgentTimeoutOptions` and returns a namespaced `ToolSpec` containing one `wait_agent` function with parameters from `wait_agent_tool_parameters_v1(options)` and output schema `wait_output_schema_v1()`.
+**Data flow**: It receives timeout limits, creates a namespace-wrapped tool named `wait_agent`, attaches parameters for target agents and timeout, adds an output shape for statuses and timeout information, and returns the finished tool specification.
 
-**Call relations**: Called by the v1 wait handler's `spec` method.
+**Call relations**: The tool-spec setup calls this when registering the version 1 waiting behavior. It is the older targeted wait flow, where the caller names specific agents to wait on.
 
 *Call graph*: called by 1 (spec); 2 external calls (Namespace, vec!).
 
@@ -2210,11 +2226,11 @@ fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec
 fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec
 ```
 
-**Purpose**: Builds the direct-function v2 `wait_agent` tool spec for mailbox-update waiting rather than explicit target-final-status waiting.
+**Purpose**: Builds the newer `wait_agent` tool, which waits for any live agent mailbox update rather than waiting on named targets. It returns a short summary instead of the actual final content.
 
-**Data flow**: Consumes timeout options and returns `ToolSpec::Function` with parameters from `wait_agent_tool_parameters_v2(options)` and output schema `wait_output_schema_v2()`.
+**Data flow**: It receives timeout options, builds the allowed timeout parameter, attaches the version 2 wait output schema, and returns a direct function tool.
 
-**Call relations**: Used by newer wait-tool registration paths and delegates parameter/output details to dedicated helpers.
+**Call relations**: The tool-spec setup calls this for the newer wait flow. It uses the version 2 parameter helper and the version 2 output helper so the direct function form stays consistent.
 
 *Call graph*: calls 2 internal fn (wait_agent_tool_parameters_v2, wait_output_schema_v2); called by 1 (spec); 1 external calls (Function).
 
@@ -2225,11 +2241,11 @@ fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec
 fn create_list_agents_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the direct-function `list_agents` tool spec for enumerating live agents, optionally filtered by task-path prefix.
+**Purpose**: Builds the `list_agents` tool, which reports live agents visible under the current root thread. It can optionally filter by a task-name prefix.
 
-**Data flow**: Creates an optional `path_prefix` string property, wraps it in a function `ToolSpec`, and attaches `list_agents_output_schema()`.
+**Data flow**: It creates an optional `path_prefix` field, builds a direct function tool around it, attaches an output schema containing agent names, statuses, and last task messages, and returns the tool specification.
 
-**Call relations**: Used by registration code for agent-listing capabilities.
+**Call relations**: The tool-spec setup calls this when the model should be able to inspect currently live agents. It relies on the list output schema helper to keep the returned agent list predictable.
 
 *Call graph*: calls 3 internal fn (list_agents_output_schema, object, string); called by 1 (spec); 2 external calls (from, Function).
 
@@ -2240,11 +2256,11 @@ fn create_list_agents_tool() -> ToolSpec
 fn create_close_agent_tool_v1() -> ToolSpec
 ```
 
-**Purpose**: Builds the namespaced v1 `close_agent` tool spec.
+**Purpose**: Builds the older namespace-based `close_agent` tool. It tells the model how to request shutdown for an agent and its open descendants when they are no longer needed.
 
-**Data flow**: Creates a required `target` string property and returns a namespaced `ToolSpec` whose output schema is `agent_previous_status_output_schema(...)` with close-specific wording.
+**Data flow**: It creates a required target field, writes a description that explains why closing matters for concurrency limits, attaches an output schema for the agent’s previous status, and returns the namespace-wrapped tool.
 
-**Call relations**: Called by the close-agent handler's `spec` method.
+**Call relations**: The tool-spec setup calls this for the version 1 close operation. It uses the shared previous-status output pattern so callers can see what state the agent was in before shutdown was requested.
 
 *Call graph*: calls 1 internal fn (string); called by 1 (spec); 3 external calls (from, Namespace, vec!).
 
@@ -2255,11 +2271,11 @@ fn create_close_agent_tool_v1() -> ToolSpec
 fn create_interrupt_agent_tool_v2() -> ToolSpec
 ```
 
-**Purpose**: Builds the direct-function `interrupt_agent` tool spec for interrupting an agent without closing it.
+**Purpose**: Builds the newer `interrupt_agent` tool. This lets the model stop an agent’s current turn without permanently closing that agent.
 
-**Data flow**: Creates a required `target` string property, wraps it in a function `ToolSpec`, and attaches `agent_previous_status_output_schema(...)` with interrupt-specific wording.
+**Data flow**: It creates a required target field, describes the interrupt behavior, attaches an output schema for the status observed before the interrupt, and returns a direct function tool.
 
-**Call relations**: Used by newer collaboration surfaces that expose interruption separately from closure.
+**Call relations**: The tool-spec setup calls this when exposing the newer interruption behavior. It hands off to the previous-status schema helper so interrupt and close-style responses share the same basic shape.
 
 *Call graph*: calls 3 internal fn (agent_previous_status_output_schema, object, string); called by 1 (spec); 3 external calls (from, Function, vec!).
 
@@ -2270,11 +2286,11 @@ fn create_interrupt_agent_tool_v2() -> ToolSpec
 fn agent_status_output_schema() -> Value
 ```
 
-**Purpose**: Defines the reusable JSON schema fragment representing the `AgentStatus` union.
+**Purpose**: Defines the standard shape for reporting an agent’s status. It covers simple states like running, completed states with optional final text, and errored states with an error message.
 
-**Data flow**: Returns a `serde_json::Value` built with `json!` describing a `oneOf` union of string statuses (`pending_init`, `running`, `interrupted`, `shutdown`, `not_found`), a `{ completed: string|null }` object, or an `{ errored: string }` object.
+**Data flow**: It takes no input. It builds a JSON value that says status may be one of several string labels or one of two small objects, then returns that schema value.
 
-**Call relations**: Referenced by multiple output-schema builders so all tools describe agent status consistently.
+**Call relations**: This is a shared building block for many output schemas in the file. Whenever a tool needs to describe an agent’s state, this helper keeps the wording and allowed status shapes consistent.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2285,11 +2301,11 @@ fn agent_status_output_schema() -> Value
 fn spawn_agent_output_schema_v1() -> Value
 ```
 
-**Purpose**: Defines the v1 spawn-agent result schema containing the new thread id and optional nickname.
+**Purpose**: Defines what the older spawn tool returns after creating an agent. The result includes the internal agent id and a user-facing nickname when one exists.
 
-**Data flow**: Returns a JSON object schema with required `agent_id: string` and `nickname: string|null` fields.
+**Data flow**: It takes no input. It builds a JSON object schema with required `agent_id` and `nickname` fields and returns that schema.
 
-**Call relations**: Used by `create_spawn_agent_tool_v1`.
+**Call relations**: The version 1 spawn tool uses this output contract so callers know how to refer to the newly created agent afterward.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2300,11 +2316,11 @@ fn spawn_agent_output_schema_v1() -> Value
 fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value
 ```
 
-**Purpose**: Defines the v2 spawn-agent result schema, optionally hiding nickname metadata.
+**Purpose**: Defines what the newer spawn tool returns. It always includes the canonical task name, and it may include a nickname unless agent metadata is hidden.
 
-**Data flow**: Accepts `hide_agent_metadata: bool` → if true, returns an object schema with only required `task_name`; otherwise returns an object schema with required `task_name` and `nickname`.
+**Data flow**: It receives a flag saying whether metadata should be hidden. If hiding is enabled, it returns a schema with only `task_name`; otherwise, it returns a schema with both `task_name` and `nickname`.
 
-**Call relations**: Called by `create_spawn_agent_tool_v2` to align the output shape with whether metadata fields were hidden from the input schema.
+**Call relations**: The version 2 spawn tool calls this while building its output contract. This keeps privacy or simplification choices reflected directly in the returned data shape.
 
 *Call graph*: called by 1 (create_spawn_agent_tool_v2); 1 external calls (json!).
 
@@ -2315,11 +2331,11 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value
 fn send_input_output_schema() -> Value
 ```
 
-**Purpose**: Defines the send-input result schema containing the queued submission id.
+**Purpose**: Defines the result returned by the older `send_input` tool. The result is a submission id that identifies the queued input.
 
-**Data flow**: Returns a JSON object schema with required `submission_id: string`.
+**Data flow**: It takes no input. It builds a JSON object schema with one required text field, `submission_id`, and returns it.
 
-**Call relations**: Used by `create_send_input_tool_v1`.
+**Call relations**: The version 1 send-input tool uses this so callers can track that their input was accepted into the queue.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2330,11 +2346,11 @@ fn send_input_output_schema() -> Value
 fn list_agents_output_schema() -> Value
 ```
 
-**Purpose**: Defines the list-agents result schema containing an array of live-agent summaries.
+**Purpose**: Defines the result returned by `list_agents`. The result is a list of live agents with their name, last known status, and most recent task message.
 
-**Data flow**: Returns a JSON object schema with required `agents`, where each array item contains `agent_name`, `agent_status` constrained by `agent_status_output_schema()`, and `last_task_message`.
+**Data flow**: It takes no input. It builds a JSON object schema containing an `agents` array, and each array item has a name, a shared status shape, and an optional last task message.
 
-**Call relations**: Used by `create_list_agents_tool`.
+**Call relations**: The list-agents tool calls this when building its output contract. It uses the shared agent status schema so listed agents describe their state the same way as other tools.
 
 *Call graph*: called by 1 (create_list_agents_tool); 1 external calls (json!).
 
@@ -2345,11 +2361,11 @@ fn list_agents_output_schema() -> Value
 fn resume_agent_output_schema() -> Value
 ```
 
-**Purpose**: Defines the resume-agent result schema containing the resulting agent status.
+**Purpose**: Defines what the resume tool returns after trying to reopen an agent. The result is the agent’s status.
 
-**Data flow**: Returns a JSON object schema with required `status` using `agent_status_output_schema()`.
+**Data flow**: It takes no input. It builds a JSON object schema with one required `status` field based on the shared agent status format, then returns it.
 
-**Call relations**: Used by `create_resume_agent_tool`.
+**Call relations**: The resume-agent tool uses this output contract so the caller immediately learns whether the resumed agent is running, completed, missing, or in another known state.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2360,11 +2376,11 @@ fn resume_agent_output_schema() -> Value
 fn wait_output_schema_v1() -> Value
 ```
 
-**Purpose**: Defines the v1 wait-agent result schema containing final statuses keyed by agent id and a timeout flag.
+**Purpose**: Defines the older wait tool’s result. It returns final statuses keyed by agent id and a flag that says whether the wait timed out.
 
-**Data flow**: Returns a JSON object schema with required `status` as an object whose additional properties follow `agent_status_output_schema()`, plus required `timed_out: boolean`.
+**Data flow**: It takes no input. It builds a JSON object schema with a `status` map and a `timed_out` boolean, then returns it.
 
-**Call relations**: Used by `create_wait_agent_tool_v1`.
+**Call relations**: The version 1 wait tool uses this result shape for targeted waits. The shared status schema lets each completed or failed agent report its state consistently.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2375,11 +2391,11 @@ fn wait_output_schema_v1() -> Value
 fn wait_output_schema_v2() -> Value
 ```
 
-**Purpose**: Defines the v2 wait-agent result schema containing only a summary message and timeout flag.
+**Purpose**: Defines the newer wait tool’s result. It returns a brief message summary and a timeout flag, but not the agent’s final content.
 
-**Data flow**: Returns a JSON object schema with required `message: string` and `timed_out: boolean`.
+**Data flow**: It takes no input. It builds a JSON object schema with required `message` and `timed_out` fields, then returns it.
 
-**Call relations**: Used by `create_wait_agent_tool_v2`.
+**Call relations**: The version 2 wait tool calls this while building its output contract. This supports the newer mailbox-update style, where the wait call signals activity without carrying full content.
 
 *Call graph*: called by 1 (create_wait_agent_tool_v2); 1 external calls (json!).
 
@@ -2390,11 +2406,11 @@ fn wait_output_schema_v2() -> Value
 fn agent_previous_status_output_schema(previous_status_description: &str) -> Value
 ```
 
-**Purpose**: Defines a reusable output schema for tools that return the target agent's previous status before an interrupt or close action.
+**Purpose**: Defines a common output shape for tools that change an agent and need to report what state it was in before the change. The caller supplies the wording for that previous-status field.
 
-**Data flow**: Accepts `previous_status_description: &str` and returns a JSON object schema with required `previous_status`, described by the supplied text and constrained by `agent_status_output_schema()`.
+**Data flow**: It receives descriptive text for the `previous_status` field. It builds a JSON object schema that uses that text and the shared agent status shape, then returns it.
 
-**Call relations**: Used by `create_close_agent_tool_v1` and `create_interrupt_agent_tool_v2`.
+**Call relations**: The interrupt tool calls this when defining its response. The same pattern is also useful for close-like operations where the old status matters.
 
 *Call graph*: called by 1 (create_interrupt_agent_tool_v2); 1 external calls (json!).
 
@@ -2405,11 +2421,11 @@ fn agent_previous_status_output_schema(previous_status_description: &str) -> Val
 fn create_collab_input_items_schema() -> JsonSchema
 ```
 
-**Purpose**: Defines the schema for structured collaboration input items such as text, images, skills, and mentions.
+**Purpose**: Defines the shape for structured input items that can be sent to an agent. These items can represent text, images, local files, skills, or mentions, instead of only plain text.
 
-**Data flow**: Builds a property map for `type`, `text`, `image_url`, `path`, and `name`, wraps it in an object schema allowing additional properties to be false, then wraps that object in an array schema with a description explaining structured mentions and connector paths.
+**Data flow**: It takes no input. It builds the allowed fields for one structured item, wraps that item shape in an array schema, adds a description, and returns the schema.
 
-**Call relations**: Used by `create_send_input_tool_v1` and `spawn_agent_common_properties_v1` wherever structured `items` input is allowed.
+**Call relations**: The older send-input tool and the version 1 spawn property builder use this when they allow richer input than a single text message.
 
 *Call graph*: calls 3 internal fn (array, object, string); called by 2 (create_send_input_tool_v1, spawn_agent_common_properties_v1); 1 external calls (from).
 
@@ -2420,11 +2436,11 @@ fn create_collab_input_items_schema() -> JsonSchema
 fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<String, JsonSchema>
 ```
 
-**Purpose**: Builds the shared v1 spawn-agent parameter property map before optional field hiding.
+**Purpose**: Builds the shared input fields for the older spawn-agent tool. These fields cover the initial task, optional structured items, agent type, context forking, and optional model settings.
 
-**Data flow**: Accepts `agent_type_description: &str` and returns a `BTreeMap<String, JsonSchema>` containing `message`, `items`, `agent_type`, `fork_context`, `model`, `reasoning_effort`, and `service_tier` properties.
+**Data flow**: It receives text describing the allowed agent type. It creates a sorted map of field names to JSON schema field descriptions, including the structured items schema, and returns that map.
 
-**Call relations**: Called by `create_spawn_agent_tool_v1`, which may then pass the map through `hide_spawn_agent_metadata_options`.
+**Call relations**: The version 1 spawn tool calls this first, then may remove some fields if metadata should be hidden. It centralizes the older spawn form so the top-level builder stays readable.
 
 *Call graph*: calls 3 internal fn (create_collab_input_items_schema, boolean, string); called by 1 (create_spawn_agent_tool_v1); 1 external calls (from).
 
@@ -2435,11 +2451,11 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
 fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<String, JsonSchema>
 ```
 
-**Purpose**: Builds the shared v2 spawn-agent parameter property map before optional field hiding and task-name insertion.
+**Purpose**: Builds the shared input fields for the newer spawn-agent tool. This version uses encrypted message text and a `fork_turns` setting that controls how much conversation context the new agent receives.
 
-**Data flow**: Accepts `agent_type_description` and returns a `BTreeMap` containing encrypted `message`, `agent_type`, `fork_turns`, `model`, `reasoning_effort`, and `service_tier` properties.
+**Data flow**: It receives text describing the allowed agent type. It creates a sorted map with message, agent type, fork-turns, model, reasoning-effort, and service-tier fields, then returns that map.
 
-**Call relations**: Called by `create_spawn_agent_tool_v2`, which may hide metadata fields and then add `task_name`.
+**Call relations**: The version 2 spawn tool calls this before adding the required task name. It provides the common part of the newer spawn form.
 
 *Call graph*: calls 1 internal fn (string); called by 1 (create_spawn_agent_tool_v2); 1 external calls (from).
 
@@ -2450,11 +2466,11 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>)
 ```
 
-**Purpose**: Removes role/model/reasoning/service-tier override fields from a spawn-agent property map.
+**Purpose**: Removes advanced spawn fields that expose agent type or model-selection details. This is used when the interface should be simpler or should not show those controls.
 
-**Data flow**: Mutably edits `properties: &mut BTreeMap<String, JsonSchema>` by removing `agent_type`, `model`, `reasoning_effort`, and `service_tier` keys.
+**Data flow**: It receives a mutable map of spawn-agent input fields. It removes `agent_type`, `model`, `reasoning_effort`, and `service_tier` from that map, changing the map in place and returning nothing.
 
-**Call relations**: Called by both spawn-tool builders when `SpawnAgentToolOptions.hide_agent_type_model_reasoning` is enabled.
+**Call relations**: Both version 1 and version 2 spawn builders call this when their options request hidden metadata. It is a small cleanup step before the final tool schema is returned.
 
 *Call graph*: called by 2 (create_spawn_agent_tool_v1, create_spawn_agent_tool_v2).
 
@@ -2470,11 +2486,11 @@ fn spawn_agent_tool_description(
     usage
 ```
 
-**Purpose**: Generates the long-form natural-language description for the v1 spawn-agent tool, optionally including model guidance and extensive usage rules.
+**Purpose**: Writes the human-readable description for the older spawn-agent tool. The description explains what spawning does, what it returns, inherited model behavior, and optional usage rules.
 
-**Data flow**: Accepts optional available-model text, optional inherited-model guidance, a return-value description, and usage-hint controls → builds a base description string with `format!`; if usage hints are disabled it returns that base text, if custom hint text is provided it appends it, otherwise it appends a built-in multi-section guidance block covering when to delegate, how to design subtasks, and how to behave after delegation.
+**Data flow**: It receives optional model guidance, optional inherited-model guidance, return-value wording, and usage-hint options. It combines those pieces into a single description string, adding either custom hint text or the built-in delegation guidance when requested.
 
-**Call relations**: Used by `create_spawn_agent_tool_v1` to shape model behavior beyond the raw schema.
+**Call relations**: The version 1 spawn builder uses this to produce the text the model sees before calling the tool. It turns configuration choices into clear instructions.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2490,11 +2506,11 @@ fn spawn_agent_tool_description_v2(
 ) ->
 ```
 
-**Purpose**: Generates the long-form description for the v2 spawn-agent tool, emphasizing canonical task names, communication semantics, and fork-turn behavior.
+**Purpose**: Writes the human-readable description for the newer spawn-agent tool. It explains task names, relative versus canonical names, inherited tools, context forking, and when delegation is appropriate.
 
-**Data flow**: Accepts optional model guidance, optional inherited-model guidance, and usage-hint controls → builds a base description string with `format!` describing task-name resolution, inherited tools, parallelism expectations, and `fork_turns` semantics; if usage hints are enabled and custom text is provided, appends that text, otherwise returns the base description unchanged.
+**Data flow**: It receives optional model guidance, optional inherited-model guidance, and usage-hint options. It builds the standard version 2 description and optionally appends custom usage text, then returns the final string.
 
-**Call relations**: Called by `create_spawn_agent_tool_v2`.
+**Call relations**: The version 2 spawn builder calls this when assembling the tool specification. Its text is important because it guides the model away from unnecessary delegation.
 
 *Call graph*: called by 1 (create_spawn_agent_tool_v2); 1 external calls (format!).
 
@@ -2505,11 +2521,11 @@ fn spawn_agent_tool_description_v2(
 fn spawn_agent_models_description(models: &[ModelPreset]) -> String
 ```
 
-**Purpose**: Summarizes a limited set of picker-visible model overrides, including descriptions, supported reasoning efforts, and service tiers.
+**Purpose**: Creates a readable list of model overrides that may be used when spawning an agent. It only includes picker-visible models and limits the list so the tool description does not become too long.
 
-**Data flow**: Accepts `models: &[ModelPreset]` → filters to `show_in_picker`, takes at most `MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION`, and if none remain returns a fallback string. Otherwise it formats one bullet per visible model, truncating long reasoning-effort labels to `MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION`, marking the default effort, appending service-tier lists when present, joins the bullets with newlines, and prefixes them with an explanatory heading.
+**Data flow**: It receives a list of model presets. It filters to visible models, takes only the first few, formats each model’s slug, description, reasoning effort options, and service tiers, and returns the combined text. If no visible models exist, it returns a short message saying so.
 
-**Call relations**: Used by both spawn-tool builders when metadata override guidance is visible.
+**Call relations**: Spawn tool builders use this when model details are not hidden. The resulting text is folded into the spawn-agent description so the model knows which explicit overrides are available.
 
 *Call graph*: 2 external calls (format!, iter).
 
@@ -2520,11 +2536,11 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String
 fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
 ```
 
-**Purpose**: Builds the v1 wait-agent parameter schema requiring explicit target ids and allowing a bounded timeout override.
+**Purpose**: Builds the input schema for the older wait-agent tool. This version requires a list of target agent ids and allows a timeout.
 
-**Data flow**: Accepts `options: WaitAgentTimeoutOptions` → creates properties for `targets` as an array of strings and `timeout_ms` as a number whose description embeds the default/min/max values via `format!` → returns an object schema requiring `targets` and forbidding additional properties.
+**Data flow**: It receives timeout settings. It creates a required `targets` array field and an optional `timeout_ms` number field whose description includes the default, minimum, and maximum values, then returns the object schema.
 
-**Call relations**: Used by `create_wait_agent_tool_v1`.
+**Call relations**: The version 1 wait tool uses this parameter schema when registering the older targeted wait behavior. The timeout values come from the caller’s options, often the default timeout settings.
 
 *Call graph*: calls 4 internal fn (array, number, object, string); 3 external calls (from, format!, vec!).
 
@@ -2535,26 +2551,24 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
 ```
 
-**Purpose**: Builds the v2 wait-agent parameter schema containing only an optional timeout override.
+**Purpose**: Builds the input schema for the newer wait-agent tool. This version only needs an optional timeout because it waits for any relevant mailbox update.
 
-**Data flow**: Accepts timeout options, creates a single `timeout_ms` number property whose description embeds the configured bounds, and returns an object schema with no required fields and no additional properties.
+**Data flow**: It receives timeout settings. It creates an object schema with an optional `timeout_ms` number field, includes the default, minimum, and maximum values in the description, and returns the schema.
 
-**Call relations**: Called by `create_wait_agent_tool_v2`.
+**Call relations**: The version 2 wait tool calls this while building its direct function specification. It matches the newer wait behavior, where targets are not supplied by the caller.
 
 *Call graph*: calls 2 internal fn (number, object); called by 1 (create_wait_agent_tool_v2); 2 external calls (from, format!).
 
 
 ### `core/src/tools/handlers/multi_agents_common.rs`
 
-`util` · `cross-cutting across all multi-agent tool calls`
+`domain_logic` · `request handling`
 
-This file is the utility backbone for the multi-agent handlers. It defines timeout constants, payload extraction helpers, output serialization helpers, protocol status formatting, normalized collaboration error mapping, input parsing, and the config-building logic that ensures child agents inherit the live turn's runtime state rather than stale persisted config.
+Multi-agent work has many small but important rules. A child agent should start with the right model, safety permissions, working folder, instructions, and service tier. A message sent to another agent should be either plain text or structured input, but not both. Waiting for agents should return statuses in a useful order. This file collects those shared rules so each collaboration tool does not have to re-create them.
 
-At the tool boundary, `function_arguments` enforces that these handlers only accept `ToolPayload::Function`, while `tool_output_json_text`, `tool_output_response_item`, and `tool_output_code_mode_result` standardize how typed results become log strings, `ResponseInputItem`s, and JSON values. `build_wait_agent_statuses` merges raw `HashMap<ThreadId, AgentStatus>` data with optional `CollabAgentRef` metadata, preserving caller order for known agents and appending sorted metadata-less extras.
+Think of it like the checklist a coordinator uses before sending a teammate into another room: give them the right briefing, make sure they have the same safety rules, confirm which tools they may use, and write down a clear way to report back. The helpers here build JSON tool responses, translate lower-level collaboration errors into messages the model can understand, create the source record that says a thread was spawned by another thread, and validate optional choices such as model, reasoning effort, and service tier.
 
-For error handling, `collab_spawn_error` and `collab_agent_error` translate `CodexErr` variants into model-facing `FunctionCallError::RespondToModel` messages, with special cases for unavailable thread managers, missing threads, and closed agents. `thread_spawn_source` reconstructs a `SessionSource::SubAgent(SubAgentSource::ThreadSpawn)` lineage record, optionally extending the parent `AgentPath` with a task name.
-
-The config helpers are especially important. `build_agent_spawn_config` and `build_agent_resume_config` both derive from `build_agent_shared_config`, which clones `turn.config` but refreshes runtime-owned fields such as model slug, provider info, reasoning settings, developer instructions, compact prompt, approval policy, permission profile, sandbox executable, shell environment policy, and cwd. Additional helpers validate spawn-time constraints: `reject_full_fork_spawn_overrides` forbids incompatible overrides on full-history forks; `apply_requested_spawn_agent_model_overrides` resolves requested models through the models manager and validates reasoning effort support; `apply_spawn_agent_service_tier` chooses the first supported service tier from config/request/parent candidates; `find_spawn_agent_model_name` and `validate_spawn_agent_reasoning_effort` produce explicit model-facing errors when overrides are invalid.
+A key detail is that child-agent configuration is not just copied from saved config. Some settings live only in the current turn, such as approval policy, sandbox settings, current directory, and selected model. This file deliberately refreshes those live values so spawned or resumed agents behave like the parent expects.
 
 #### Function details
 
@@ -2564,11 +2578,11 @@ The config helpers are especially important. `build_agent_spawn_config` and `bui
 fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError>
 ```
 
-**Purpose**: Extracts the raw JSON argument string from a function-style tool payload and rejects any other payload kind.
+**Purpose**: Extracts the raw argument string from a tool call payload. It protects collaboration handlers from receiving a payload shape they do not understand.
 
-**Data flow**: Consumes `payload: ToolPayload` → if it is `ToolPayload::Function { arguments }`, returns the owned `arguments` string; otherwise returns `FunctionCallError::RespondToModel("collab handler received unsupported payload")`.
+**Data flow**: It receives a tool payload. If the payload is a function call, it returns the argument text inside it. If it is any other kind of payload, it returns an error message meant to be sent back to the model.
 
-**Call relations**: Called near the start of every concrete multi-agent handler to normalize payload handling before argument deserialization.
+**Call relations**: This is an entry helper for collaboration tool handlers when they begin reading a model-requested tool call. On the error path it creates a model-facing failure through RespondToModel, so the caller can stop cleanly instead of trying to parse the wrong data.
 
 *Call graph*: 1 external calls (RespondToModel).
 
@@ -2579,11 +2593,11 @@ fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError>
 fn tool_output_json_text(value: &T, tool_name: &str) -> String
 ```
 
-**Purpose**: Serializes a tool result value into JSON text for logs and text-based tool outputs, with a fallback error string if serialization fails.
+**Purpose**: Turns a tool result into JSON text for returning to the model. If JSON serialization fails, it still returns a JSON string that explains the failure instead of crashing.
 
-**Data flow**: Takes `value: &T` and `tool_name: &str` where `T: Serialize` → attempts `serde_json::to_string(value)` → returns the JSON string on success or a JSON string containing `failed to serialize <tool_name> result: ...` on failure.
+**Data flow**: It receives any serializable value and the tool's name. It tries to convert the value into a JSON string. The output is either the normal JSON text or a JSON-encoded error message naming the tool and the serialization problem.
 
-**Call relations**: Used directly by result types' `log_preview` methods and indirectly by `tool_output_response_item`.
+**Call relations**: This is the lower-level formatter used by tool_output_response_item. It relies on serde_json serialization, and it gives callers a safe text result even when the value cannot be encoded normally.
 
 *Call graph*: called by 1 (tool_output_response_item); 1 external calls (to_string).
 
@@ -2600,11 +2614,11 @@ fn tool_output_response_item(
 ) -> ResponseInputItem
 ```
 
-**Purpose**: Builds a `ResponseInputItem` from a serializable tool result using the standard function-tool output wrapper.
+**Purpose**: Builds the standard response item that reports a function tool's result back to the model. It packages JSON text together with the original call information and an optional success flag.
 
-**Data flow**: Accepts `call_id`, original `payload`, serializable `value`, optional `success`, and `tool_name` → serializes the value with `tool_output_json_text` → wraps it in `FunctionToolOutput::from_text(..., success)` → converts that wrapper into a `ResponseInputItem` with `.to_response_item(call_id, payload)`.
+**Data flow**: It receives the tool call id, the original payload, the result value, an optional success marker, and the tool name. It converts the result into JSON text, wraps that as a function-tool output, and returns a response item ready to send into the conversation.
 
-**Call relations**: Called by each concrete result type's `to_response_item` implementation so all multi-agent tools emit response items consistently.
+**Call relations**: This sits one step above tool_output_json_text: first it asks that helper for safe JSON text, then it uses FunctionToolOutput::from_text to make the protocol object. Tool handlers use this when they need to answer a model's function call.
 
 *Call graph*: calls 2 internal fn (from_text, tool_output_json_text).
 
@@ -2615,11 +2629,11 @@ fn tool_output_response_item(
 fn tool_output_code_mode_result(value: &T, tool_name: &str) -> JsonValue
 ```
 
-**Purpose**: Serializes a tool result into a structured `JsonValue` for code-mode consumers, with a fallback string on serialization failure.
+**Purpose**: Turns a tool result into a JSON value for code-oriented return paths. It avoids panics by returning a JSON string error if conversion fails.
 
-**Data flow**: Takes `value: &T` and `tool_name: &str` → attempts `serde_json::to_value(value)` → returns the JSON value on success or a `JsonValue::String` describing the serialization failure.
+**Data flow**: It receives a serializable value and the tool name. It tries to convert the value into an in-memory JSON value rather than a text string. The output is that JSON value, or a JSON string describing the serialization failure.
 
-**Call relations**: Used by each concrete result type's `code_mode_result` implementation.
+**Call relations**: This is a sibling to tool_output_json_text for callers that need a JSON value directly. It relies on serde_json conversion and does not call other helpers in this file.
 
 *Call graph*: 1 external calls (to_value).
 
@@ -2633,11 +2647,11 @@ fn build_wait_agent_statuses(
 ) -> Vec<CollabAgentStatusEntry>
 ```
 
-**Purpose**: Combines raw status data and optional agent metadata into ordered `CollabAgentStatusEntry` records for waiting end events.
+**Purpose**: Creates the status list returned when a caller waits on multiple agents. It keeps known receiver agents in the caller's order and still includes extra statuses that were not in that receiver list.
 
-**Data flow**: Accepts `statuses: &HashMap<ThreadId, AgentStatus>` and `receiver_agents: &[CollabAgentRef]` → returns an empty vector if no statuses exist. Otherwise it preallocates output storage, records seen thread ids from `receiver_agents`, pushes entries for any receiver agent that has a status while preserving the receiver list order, then builds extra entries for statuses whose ids were not in `receiver_agents` with `agent_nickname`/`agent_role` set to `None`, sorts those extras by thread-id string, appends them, and returns the combined vector.
+**Data flow**: It receives a map from thread id to agent status, plus a list of receiver agents that may include names and roles. It builds status entries with names and roles when available. Any status for an unknown thread is added afterward, sorted by thread id, and the final list is returned.
 
-**Call relations**: Used by wait-related handlers when emitting `CollabWaitingEndEvent`, ensuring protocol events include metadata when known and deterministic ordering when not.
+**Call relations**: Wait-style collaboration handlers can call this after they collect agent statuses. The function does not hand off to other project helpers; it mainly shapes raw status data into protocol entries that are easier for the model or user to read.
 
 *Call graph*: 4 external calls (with_capacity, new, with_capacity, len).
 
@@ -2648,11 +2662,11 @@ fn build_wait_agent_statuses(
 fn collab_spawn_error(err: CodexErr) -> FunctionCallError
 ```
 
-**Purpose**: Normalizes spawn-related `CodexErr` values into model-facing `FunctionCallError`s with collaboration-specific wording.
+**Purpose**: Turns a lower-level spawn failure into a clear tool error for the model. It gives special wording for common collaboration-manager problems.
 
-**Data flow**: Consumes `err: CodexErr` → maps `UnsupportedOperation("thread manager dropped")` to `RespondToModel("collab manager unavailable")`, other `UnsupportedOperation(message)` to `RespondToModel(message)`, and all remaining errors to `RespondToModel(format!("collab spawn failed: {err}"))`.
+**Data flow**: It receives a CodexErr from an attempted agent spawn. It matches the kind of error and produces a FunctionCallError with a human-readable message, such as 'collab manager unavailable' or 'collab spawn failed: ...'.
 
-**Call relations**: Used by spawn handlers after `agent_control.spawn_*` calls so infrastructure failures become readable model errors.
+**Call relations**: Spawn handlers use this when the collaboration system refuses or cannot create a new agent. It does not retry or repair the problem; it translates the failure into the standard RespondToModel path.
 
 *Call graph*: 2 external calls (format!, RespondToModel).
 
@@ -2663,11 +2677,11 @@ fn collab_spawn_error(err: CodexErr) -> FunctionCallError
 fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError
 ```
 
-**Purpose**: Normalizes non-spawn agent-control errors into model-facing collaboration errors with special handling for missing or closed agents.
+**Purpose**: Turns errors involving an existing agent into clear messages for the model. It distinguishes missing agents, closed agents, unavailable collaboration support, and other failures.
 
-**Data flow**: Consumes `agent_id: ThreadId` and `err: CodexErr` → maps `ThreadNotFound(id)` to `agent with id {id} not found`, `InternalAgentDied` to `agent with id {agent_id} is closed`, any `UnsupportedOperation(_)` to `collab manager unavailable`, and all other errors to `collab tool failed: {err}` wrapped in `FunctionCallError::RespondToModel`.
+**Data flow**: It receives the target agent id and a CodexErr. It checks the error type and returns a FunctionCallError with a specific message. For example, a missing thread becomes 'agent with id ... not found'.
 
-**Call relations**: Used by close, resume, send-input, and wait flows whenever an `agent_control` operation fails.
+**Call relations**: Tools that send to, wait for, or inspect another agent can use this after a collaboration operation fails. Like collab_spawn_error, it funnels errors into RespondToModel so the model gets an understandable response.
 
 *Call graph*: 2 external calls (format!, RespondToModel).
 
@@ -2684,11 +2698,11 @@ fn thread_spawn_source(
 ) -> Result<SessionSourc
 ```
 
-**Purpose**: Constructs the `SessionSource` lineage record for a spawned or resumed child agent, optionally extending the parent task path with a task name.
+**Purpose**: Builds the session-source record for a newly spawned sub-agent. This record explains where the child thread came from and, when possible, where it sits in the parent agent path.
 
-**Data flow**: Accepts `parent_thread_id`, `parent_session_source`, `depth`, optional `agent_role`, and optional `task_name` → if `task_name` is present, obtains the parent's `AgentPath` or root, joins the task name onto it, and maps any path error into `FunctionCallError::RespondToModel`; then returns `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, depth, agent_path, agent_nickname: None, agent_role: agent_role.map(str::to_string) })`.
+**Data flow**: It receives the parent thread id, the parent session source, the nesting depth, an optional role, and an optional task name. If there is a task name, it joins that name onto the parent's agent path. It returns a SessionSource that marks the new session as a sub-agent spawned from the parent thread, or an error if the path cannot be built.
 
-**Call relations**: Called by spawn and resume helpers when invoking `agent_control`, so child agents carry correct ancestry and optional task-path metadata.
+**Call relations**: Spawn code calls this while creating the metadata for a child thread. It hands back a SubAgent session source that later parts of the system can use to show lineage, depth, role, and task path.
 
 *Call graph*: 1 external calls (SubAgent).
 
@@ -2702,11 +2716,11 @@ fn parse_collab_input(
 ) -> Result<Op, FunctionCallError>
 ```
 
-**Purpose**: Validates the mutually exclusive `message`/`items` input forms and converts them into the unified `Op` representation expected by agent-control APIs.
+**Purpose**: Validates and converts the input meant for another agent. It enforces the rule that callers must provide either a simple message or structured items, but not both.
 
-**Data flow**: Accepts `message: Option<String>` and `items: Option<Vec<UserInput>>` → rejects both-present and both-absent cases with model-facing errors; for `Some(message)` it trims and rejects empty text, otherwise wraps the text in a single `UserInput::Text { text, text_elements: Vec::new() }` and converts that vector into `Op`; for `Some(items)` it rejects an empty vector and otherwise converts the items directly into `Op`.
+**Data flow**: It receives an optional message string and an optional list of user-input items. If both are present or both are missing, it returns a model-facing error. If a message is present, it rejects blank text and wraps the message as a text input operation. If items are present, it rejects an empty list and converts the items into an operation.
 
-**Call relations**: Used by spawn and send-input handlers to normalize model arguments before rendering previews or sending work to agents.
+**Call relations**: Collaboration tools use this before sending work to another agent. It stops ambiguous or empty input early and returns an Op object that the rest of the conversation machinery can deliver.
 
 *Call graph*: 2 external calls (RespondToModel, vec!).
 
@@ -2720,11 +2734,11 @@ fn build_agent_spawn_config(
 ) -> Result<Config, FunctionCallError>
 ```
 
-**Purpose**: Builds the base config snapshot for a newly spawned child agent from the current turn plus explicit base instructions.
+**Purpose**: Creates the configuration snapshot for a newly spawned child agent. It starts from the parent's live settings and then adds the base instructions the new agent should follow.
 
-**Data flow**: Accepts `base_instructions: &BaseInstructions` and `turn: &TurnContext` → calls `build_agent_shared_config(turn)` to clone and refresh the parent's effective config → sets `config.base_instructions = Some(base_instructions.text.clone())` → returns the resulting `Config`.
+**Data flow**: It receives base instructions and the current turn context. It asks build_agent_shared_config to copy and refresh the shared runtime settings, then sets the child config's base instructions from the supplied instruction text. The finished Config is returned.
 
-**Call relations**: Called by spawn handlers before applying role/model/service-tier overrides, ensuring new agents start from the live turn's effective configuration.
+**Call relations**: Spawn handlers call this when starting a new agent from scratch. It depends on build_agent_shared_config so all spawned agents inherit current model, permission, sandbox, and working-directory state before role-specific details are layered on.
 
 *Call graph*: calls 1 internal fn (build_agent_shared_config).
 
@@ -2735,11 +2749,11 @@ fn build_agent_spawn_config(
 fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallError>
 ```
 
-**Purpose**: Builds the runtime-correct config used when reloading a previously closed agent, while intentionally leaving base instructions to rollout/session metadata.
+**Purpose**: Creates the configuration snapshot used when resuming an existing agent. It refreshes live runtime settings but leaves base instructions to come from the existing session metadata.
 
-**Data flow**: Accepts `turn: &TurnContext` → calls `build_agent_shared_config(turn)` → sets `config.base_instructions = None` → returns the resulting `Config`.
+**Data flow**: It receives the current turn context. It asks build_agent_shared_config for the refreshed shared configuration, then clears base_instructions so resume logic can use the instructions already tied to the rollout or session. The Config is returned.
 
-**Call relations**: Used by resume flows and by send-input preloading logic when an existing agent may need to be loaded into memory.
+**Call relations**: Resume flows call this when bringing a child agent back. Like build_agent_spawn_config, it uses build_agent_shared_config, but it deliberately avoids overwriting the resumed agent's stored base instructions.
 
 *Call graph*: calls 1 internal fn (build_agent_shared_config).
 
@@ -2750,11 +2764,11 @@ fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallE
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError>
 ```
 
-**Purpose**: Clones the turn's persisted config and refreshes all runtime-owned fields that must match the live parent turn.
+**Purpose**: Builds the common configuration foundation for both spawning and resuming agents. It makes sure the child starts from the parent's effective config plus the current turn's live choices.
 
-**Data flow**: Accepts `turn: &TurnContext` → clones `turn.config` into a mutable `Config` → overwrites `model`, `model_provider`, `model_reasoning_effort`, `model_reasoning_summary`, `developer_instructions`, and `compact_prompt` from live turn state → calls `apply_spawn_agent_runtime_overrides(&mut config, turn)` to copy approval, permission, sandbox, and cwd state → returns the updated config.
+**Data flow**: It reads the turn context, clones the parent's config, updates model name, provider, reasoning effort, reasoning summary, developer instructions, and compact prompt, then calls apply_spawn_agent_runtime_overrides for safety and runtime-only settings. It returns the refreshed Config or an error if a runtime setting cannot be applied.
 
-**Call relations**: This private helper underpins both `build_agent_spawn_config` and `build_agent_resume_config`, centralizing the invariant that child agents must inherit live runtime state rather than stale snapshots.
+**Call relations**: This is the shared middle layer called by build_agent_spawn_config and build_agent_resume_config. It hands off to apply_spawn_agent_runtime_overrides because some important settings are not safely captured by simply cloning the saved config.
 
 *Call graph*: calls 1 internal fn (apply_spawn_agent_runtime_overrides); called by 2 (build_agent_resume_config, build_agent_spawn_config).
 
@@ -2769,11 +2783,11 @@ fn reject_full_fork_spawn_overrides(
 ) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Enforces that full-history forked agents cannot override inherited role, model, or reasoning settings.
+**Purpose**: Prevents callers from changing model-related settings when creating a full-history fork. A full-history fork is meant to inherit the parent's agent type, model, and reasoning effort exactly.
 
-**Data flow**: Accepts optional `agent_type`, `model`, and `reasoning_effort` → if any are present, returns `FunctionCallError::RespondToModel` with a detailed explanation that full-history forks inherit those fields; otherwise returns `Ok(())`.
+**Data flow**: It receives optional agent type, model, and reasoning-effort requests. If any of them are present, it returns a model-facing error explaining that these overrides are not allowed for full-history forks. If none are present, it returns success with no changes.
 
-**Call relations**: Called by spawn logic only when `fork_context` is enabled, guarding a design invariant about identity-preserving forks.
+**Call relations**: Spawn code can call this before building a forked child agent. It acts as a guardrail so later configuration code does not accidentally create a fork that no longer matches the parent history.
 
 *Call graph*: 1 external calls (RespondToModel).
 
@@ -2787,11 +2801,11 @@ fn apply_spawn_agent_runtime_overrides(
 ) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Copies runtime-only turn state such as approval policy, permission profile, sandbox executable, shell environment policy, reviewer, and cwd onto a child config.
+**Purpose**: Copies live, turn-specific runtime settings onto a child agent configuration. These settings include approval rules, shell environment policy, sandbox executable, current working directory, and permission profile.
 
-**Data flow**: Mutably updates `config: &mut Config` from `turn: &TurnContext` → sets `config.permissions.approval_policy` from `turn.approval_policy.value()`, `config.approvals_reviewer`, `config.permissions.shell_environment_policy`, `config.codex_linux_sandbox_exe`, and deprecated `config.cwd` from the turn → sets the permission profile from `turn.permission_profile()` → maps any invalid approval-policy or permission-profile errors into `FunctionCallError::RespondToModel`.
+**Data flow**: It receives a mutable Config and the current turn context. It writes the turn's approval policy, reviewer, shell policy, sandbox path, current directory, and permission profile into the config. If approval policy or permission profile cannot be set, it returns a model-facing error; otherwise it leaves the config updated.
 
-**Call relations**: Called from `build_agent_shared_config`, so every spawn/resume config inherits the live runtime policy envelope.
+**Call relations**: build_agent_shared_config calls this as the final refresh step for spawn and resume configuration. It asks the turn for its permission profile and applies it so the child does not run with stale or unsafe policy.
 
 *Call graph*: calls 1 internal fn (permission_profile); called by 1 (build_agent_shared_config).
 
@@ -2807,11 +2821,11 @@ async fn apply_requested_spawn_agent_model_overrides(
     requested_reasoning_effort: Option<
 ```
 
-**Purpose**: Applies optional model and reasoning-effort overrides to a child config, validating them against the models manager and supported reasoning levels.
+**Purpose**: Applies and validates optional model and reasoning-effort choices for a spawned agent. It makes sure the requested model exists and that the requested reasoning level is supported by that model.
 
-**Data flow**: Accepts `session`, `turn`, mutable `config`, optional `requested_model`, and optional `requested_reasoning_effort`. If neither override is present, it returns immediately. If a model is requested, it awaits `models_manager.list_models(RefreshStrategy::Offline)`, resolves the exact model name with `find_spawn_agent_model_name`, awaits `get_model_info` for that model using `config.to_models_manager_config()`, writes `config.model`, and either validates and sets the requested reasoning effort or falls back to the selected model's default reasoning level. If only reasoning effort is requested, it validates against `turn.model_info.supported_reasoning_levels` and writes `config.model_reasoning_effort`. Errors become `FunctionCallError`.
+**Data flow**: It receives the session, current turn, mutable child config, optional requested model, and optional requested reasoning effort. If no override is requested, it does nothing. If a model is requested, it lists known models, finds the exact model name, fetches model details, updates the config, and validates or defaults the reasoning effort. If only reasoning effort is requested, it validates that against the parent's current model and then writes it into the config.
 
-**Call relations**: Called by spawn logic for non-forked agents before role application, so explicit model/reasoning overrides are validated against actual model capabilities.
+**Call relations**: Spawn handlers call this after the base child config exists. It uses find_spawn_agent_model_name to reject unknown models, validate_spawn_agent_reasoning_effort to reject unsupported reasoning levels, and the models manager configuration to fetch model details.
 
 *Call graph*: calls 2 internal fn (find_spawn_agent_model_name, validate_spawn_agent_reasoning_effort); 1 external calls (to_models_manager_config).
 
@@ -2827,11 +2841,11 @@ async fn apply_spawn_agent_service_tier(
 ) -> Result<(), FunctionCallEr
 ```
 
-**Purpose**: Chooses and validates the child agent's service tier from config, explicit request, and parent fallback candidates against the selected model's supported tiers.
+**Purpose**: Chooses a valid service tier for a child agent. A service tier is a provider-side option such as a performance or availability class, and it must be supported by the selected model.
 
-**Data flow**: Accepts `session`, mutable `config`, optional `parent_service_tier`, and optional `requested_service_tier` → builds an ordered candidate list `[config.service_tier, requested, parent]`. If all are `None`, it clears `config.service_tier` and returns. Otherwise it requires `config.model` to be present, fetches `model_info` from the models manager using `config.to_models_manager_config()`, explicitly rejects an unsupported requested tier with an error listing supported tiers, then sets `config.service_tier` to the first candidate tier supported by the model.
+**Data flow**: It receives the session, mutable child config, optional parent service tier, and optional requested service tier. It considers the config's existing tier, the requested tier, and the parent tier. If none exist, it clears the child tier. Otherwise it fetches model details, rejects an explicitly requested unsupported tier with a clear message, and then picks the first candidate tier that the model supports.
 
-**Call relations**: Called by spawn logic after model resolution so service-tier selection is validated against the actual child model.
+**Call relations**: Spawn code calls this after the child model has been resolved, because tier support depends on the model. It talks to the models manager using the child config, then either updates config.service_tier or returns a RespondToModel error.
 
 *Call graph*: 3 external calls (to_models_manager_config, format!, RespondToModel).
 
@@ -2845,11 +2859,11 @@ fn find_spawn_agent_model_name(
 ) -> Result<String, FunctionCallError>
 ```
 
-**Purpose**: Resolves a requested model slug against the currently available model presets and produces a detailed error if it is unknown.
+**Purpose**: Finds the exact model name requested for a spawned agent. If the name is not known, it builds an error that lists the available choices.
 
-**Data flow**: Accepts `available_models: &[ModelPreset]` and `requested_model: &str` → searches for a preset whose `model` field exactly matches the requested string → returns the matching model name clone on success or `RespondToModel` listing all available model slugs on failure.
+**Data flow**: It receives the available model presets and the requested model string. It searches for a preset whose model name exactly matches the request. On success it returns that model name; on failure it returns a model-facing error that includes all available model names.
 
-**Call relations**: Used only by `apply_requested_spawn_agent_model_overrides` as the first validation step for explicit model overrides.
+**Call relations**: apply_requested_spawn_agent_model_overrides calls this before fetching model details. It is the narrow validation step that turns a user-supplied model string into a trusted model name.
 
 *Call graph*: called by 1 (apply_requested_spawn_agent_model_overrides); 1 external calls (iter).
 
@@ -2864,24 +2878,24 @@ fn validate_spawn_agent_reasoning_effort(
 ) -> Result<(), FunctionCallError
 ```
 
-**Purpose**: Checks that a requested reasoning effort is supported by a given model and reports the supported values when it is not.
+**Purpose**: Checks whether a requested reasoning effort is allowed for a particular model. Reasoning effort means how much thinking budget or depth the model is asked to use.
 
-**Data flow**: Accepts `model`, `supported_reasoning_levels`, and `requested_reasoning_effort` → scans the presets for a matching effort and returns `Ok(())` if found; otherwise joins the supported effort strings and returns `RespondToModel` describing the unsupported request and the allowed values.
+**Data flow**: It receives a model name, that model's supported reasoning-effort presets, and the requested reasoning effort. It scans the supported presets for a match. If found, it returns success; otherwise it returns a model-facing error listing the supported efforts.
 
-**Call relations**: Called by `apply_requested_spawn_agent_model_overrides` for both explicit-model and inherited-model reasoning validation paths.
+**Call relations**: apply_requested_spawn_agent_model_overrides calls this whenever a reasoning effort is requested or paired with a requested model. It prevents the child config from being created with a reasoning setting the model cannot use.
 
 *Call graph*: called by 1 (apply_requested_spawn_agent_model_overrides); 3 external calls (format!, iter, RespondToModel).
 
 
 ### `core/src/tools/handlers/multi_agents.rs`
 
-`orchestration` · `tool registration and every multi-agent tool invocation`
+`orchestration` · `request handling`
 
-This module is the top-level hub for the multi-agent tool family. It re-exports the common helper module and the concrete handler types from the `close_agent`, `resume_agent`, `send_input`, `spawn`, and `wait` submodules so the tool registry can wire them in as a coherent namespace under `MULTI_AGENT_V1_NAMESPACE`. The file itself contains the small but important glue functions that normalize agent identifiers and annotate tool specs for search.
+This file exists so the rest of the system has one clear place to reach the collaboration tools for sub-agents. A sub-agent is another assistant thread that can be spawned by the current assistant turn, like asking a helper to work on a side task while the main conversation continues. Without this file, the system would not have a tidy way to expose those actions as tools, share common parsing rules, or label them in the tool-search interface.
 
-`parse_agent_id_target` converts a model-supplied string into a concrete `ThreadId`, translating parse failures into `FunctionCallError::RespondToModel` so the model gets a user-facing validation error instead of an internal failure. `parse_agent_id_targets` applies that conversion across a list while enforcing the invariant that wait-style operations must receive at least one target. `multi_agent_tool_search_info` wraps a `ToolSpec` with a fixed source label and description (`Multi-agent tools` / `Spawn and manage sub-agents.`), which lets these tools appear in search with consistent provenance.
+Most of the heavy work lives in nearby modules such as spawning, sending input, waiting, resuming, and closing. This file gathers those pieces and re-exports their handler types, so other code can import them from one place. It also imports shared event and protocol types used by those handlers to report what is happening, such as “spawn began,” “interaction ended,” or “waiting ended.”
 
-The imports show the broader contract this module participates in: handlers operate on `ToolInvocation`, emit `ToolOutput`, interact with `Session` and `TurnContext`, and ultimately drive `agent_control` operations while producing collaboration protocol events. The file itself does not execute those workflows, but it defines the shared entry points and naming conventions the submodules rely on.
+The small helper functions here protect the boundary between model text and real system objects. Tool calls arrive with agent IDs as strings. The helpers turn those strings into `ThreadId` values, which are the system’s internal identifier for an agent thread. If the model gives an invalid or empty ID list, the code turns that into a friendly tool error that can be sent back to the model instead of crashing. Another helper builds search metadata so these tools appear under a clear “Multi-agent tools” source when the system lists available tools.
 
 #### Function details
 
@@ -2891,11 +2905,11 @@ The imports show the broader contract this module participates in: handlers oper
 fn parse_agent_id_target(target: &str) -> Result<ThreadId, FunctionCallError>
 ```
 
-**Purpose**: Parses one model-provided agent identifier string into a `ThreadId` and converts parse failures into a model-facing validation error.
+**Purpose**: This function checks one agent ID written as text and converts it into the system’s internal `ThreadId` form. It is used when a tool call needs to point at a specific sub-agent, and it turns bad IDs into a message the model can understand.
 
-**Data flow**: Takes `target: &str` → calls `ThreadId::from_string` → on success returns the parsed `ThreadId`; on failure returns `FunctionCallError::RespondToModel` containing the original target text and debug-formatted parse error.
+**Data flow**: It receives a string such as an agent ID from a tool argument. It asks `ThreadId` to parse that string. If parsing succeeds, the output is a usable `ThreadId`; if parsing fails, the output is a tool-call error saying the agent ID was invalid.
 
-**Call relations**: This helper is used by concrete handlers when they need a single agent target, so they all enforce the same identifier syntax and error wording before calling `agent_control` APIs.
+**Call relations**: When multi-agent tools need to act on an existing sub-agent, they rely on this helper before doing the real work. It hands off the text-to-ID conversion to `ThreadId::from_string`, then wraps any failure as a response meant for the model rather than as an internal crash.
 
 *Call graph*: calls 1 internal fn (from_string).
 
@@ -2908,11 +2922,11 @@ fn parse_agent_id_targets(
 ) -> Result<Vec<ThreadId>, FunctionCallError>
 ```
 
-**Purpose**: Validates and parses a non-empty list of agent id strings into `Vec<ThreadId>` for multi-target operations.
+**Purpose**: This function checks a list of agent IDs and converts every one into internal `ThreadId` values. It also rejects an empty list, because actions aimed at agents need at least one actual target.
 
-**Data flow**: Consumes `targets: Vec<String>` → rejects an empty vector with `RespondToModel("agent ids must be non-empty")` → otherwise maps each string through `parse_agent_id_target` and collects the parsed `ThreadId` values into a vector.
+**Data flow**: It receives a vector of ID strings. First it checks whether the list is empty; if so, it returns a tool-call error. Otherwise it walks through the strings one by one, uses `parse_agent_id_target` for each, and returns a vector of parsed `ThreadId` values if all are valid.
 
-**Call relations**: This is the batch form of single-id parsing and is used by handlers such as waiting logic that operate on multiple agents at once; it delegates per-element validation to `parse_agent_id_target` after enforcing the list-level non-empty invariant.
+**Call relations**: This is the batch version of the single-ID parser. Multi-agent handlers that accept several target agents can call it once, and it will either give them a clean list of real thread IDs or stop early with a model-facing error explaining what was wrong.
 
 *Call graph*: 1 external calls (RespondToModel).
 
@@ -2926,26 +2940,26 @@ fn multi_agent_tool_search_info(
 ) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Builds `ToolSearchInfo` for a multi-agent tool spec with a fixed source name and description so search results are grouped consistently.
+**Purpose**: This function creates the information needed to show a multi-agent tool in tool search results. It labels the tool as coming from “Multi-agent tools” and adds a short description so users and models can understand what category it belongs to.
 
-**Data flow**: Accepts `search_text: &str` and a `codex_tools::ToolSpec` → clones the search text into an owned `String` and passes the spec plus a `ToolSearchSourceInfo` carrying the multi-agent source metadata into `ToolSearchInfo::from_spec` → returns the resulting optional search descriptor.
+**Data flow**: It receives the search text and a tool specification, which describes a tool’s name and shape. It combines those with a source name and description, then returns optional search metadata if the tool specification can be converted into a searchable entry.
 
-**Call relations**: Concrete handler `search_info` methods call this helper after obtaining their own spec, so all multi-agent tools advertise themselves through the same search source branding.
+**Call relations**: When the system builds searchable tool listings, this helper packages multi-agent tools with a consistent source label. It delegates the actual construction to `ToolSearchInfo::from_spec`, while supplying the multi-agent-specific name and description.
 
 *Call graph*: calls 1 internal fn (from_spec).
 
 
 ### `core/src/tools/handlers/multi_agents/spawn.rs`
 
-`domain_logic` · `request handling for creating new sub-agents`
+`orchestration` · `request handling`
 
-This module contains the most involved multi-agent handler because it translates a model tool call into a fully configured child agent. `Handler` stores `SpawnAgentToolOptions`, exposes a constructor, and uses those options when generating the tool schema with `create_spawn_agent_tool_v1`. Search metadata emphasizes delegation, parallel work, and model/reasoning choices.
+This file is the doorway for creating helper agents. In human terms, it is like a dispatcher: when the main agent decides a job should be delegated, this code checks the request, prepares the instructions, starts the helper, and reports back who was created.
 
-`handle_spawn_agent` begins by parsing `SpawnAgentArgs`, trimming `agent_type` into an optional role name, converting `message` or `items` into an `Op`, and rendering a prompt preview. It computes the child depth from the current `session_source` and rejects the request if `exceeds_thread_spawn_depth_limit` says the configured maximum would be exceeded.
+The main `Handler` tells the wider tool system three things: the tool's name, what its input should look like, and how to run it. When the tool is called, `handle_spawn_agent` does the real work. It reads the requested message, optional input items, role, model, reasoning effort, service tier, and whether the new agent should receive the full conversation history. It then checks a safety limit so agents cannot keep spawning deeper and deeper forever.
 
-After emitting `CollabAgentSpawnBeginEvent`, it builds a child config from the live turn using `build_agent_spawn_config`, then layers optional service-tier, model, reasoning, and role overrides. Full-history forks are intentionally constrained: `reject_full_fork_spawn_overrides` forbids changing role/model/reasoning when `fork_context` is true, because those agents must inherit the parent's execution identity. Non-forked spawns instead validate requested model and reasoning through the models manager and apply role-specific config via `apply_role_to_config`. Runtime-only state such as approval policy, sandbox, cwd, and environment selections is preserved through shared helpers.
+Before and after spawning, it sends events so the rest of the system can show or record that an agent was started. It builds a configuration for the child agent, applies allowed overrides such as role or model, and rejects combinations that are not allowed when doing a full-history fork. Then it asks the agent control service to create the new thread.
 
-The actual spawn happens through `agent_control.spawn_agent_with_metadata`, passing a reconstructed `thread_spawn_source` and `SpawnAgentOptions` that include fork metadata, parent thread id, and environment selections. The handler then fetches a config snapshot when possible to derive the effective nickname, role, model, and reasoning effort for the end event. It emits `CollabAgentSpawnEndEvent`, increments `codex.multi_agent.spawn` telemetry tagged with role and version, and returns `SpawnAgentResult { agent_id, nickname }`.
+The result is packaged as `SpawnAgentResult`, which can be logged, returned to the model, or formatted for code-mode output. Without this file, the multi-agent feature would have no concrete tool that turns a delegation request into an actual running sub-agent.
 
 #### Function details
 
@@ -2955,11 +2969,11 @@ The actual spawn happens through `agent_control.spawn_agent_with_metadata`, pass
 fn new(options: SpawnAgentToolOptions) -> Self
 ```
 
-**Purpose**: Constructs a spawn-agent handler with the supplied schema-generation options.
+**Purpose**: Creates a `Handler` with the chosen tool options. This is used when the system is setting up the available tools and needs a configured `spawn_agent` handler.
 
-**Data flow**: Consumes `options: SpawnAgentToolOptions` and stores it in `Self { options }`, returning the new handler.
+**Data flow**: It receives `SpawnAgentToolOptions`, stores them inside a new `Handler`, and returns that handler. Nothing else is changed.
 
-**Call relations**: Called by setup code when registering the spawn tool so the handler can later generate a spec tailored to available models and UI guidance.
+**Call relations**: This is the setup step for the handler. After this object exists, the tool system can ask it for its name, specification, search information, and execution behavior.
 
 
 ##### `Handler::tool_name`  (lines 26–28)
@@ -2968,11 +2982,11 @@ fn new(options: SpawnAgentToolOptions) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the namespaced identifier `multi_agent_v1.spawn_agent`.
+**Purpose**: Returns the official tool name used to identify this tool: the multi-agent namespace plus `spawn_agent`. This keeps the tool from being confused with similarly named tools elsewhere.
 
-**Data flow**: Builds and returns a `ToolName` from the namespace constant and literal tool name.
+**Data flow**: It reads no request data. It combines the multi-agent namespace with the local name `spawn_agent` and returns a `ToolName`.
 
-**Call relations**: Used by the registry to expose and dispatch this handler.
+**Call relations**: The wider tool runtime calls this when registering or matching tools. It uses `namespaced` so the name is built in the same structured way as other namespaced tools.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -2983,11 +2997,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the spawn-agent tool schema using the handler's configured options.
+**Purpose**: Builds the public description of the `spawn_agent` tool, including what inputs it accepts. This is what lets the model know how to call the tool correctly.
 
-**Data flow**: Clones `self.options` and passes them to `create_spawn_agent_tool_v1`, returning the resulting `ToolSpec`.
+**Data flow**: It reads the handler's stored options, clones them, and passes them into the tool-spec builder. The result is a `ToolSpec` that describes the tool interface.
 
-**Call relations**: Used directly by registration and indirectly by `Handler::search_info`; cloning ensures schema generation does not consume the stored options.
+**Call relations**: The tool system can call this directly when exposing tools. `Handler::search_info` also calls it so the searchable description and the actual tool specification stay in sync.
 
 *Call graph*: calls 1 internal fn (create_spawn_agent_tool_v1); called by 1 (search_info); 1 external calls (clone).
 
@@ -2998,11 +3012,11 @@ fn spec(&self) -> ToolSpec
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Provides search metadata for delegation- and spawning-related queries.
+**Purpose**: Provides searchable keywords and metadata for this tool. This helps the system find the `spawn_agent` tool when the user's need sounds like delegation, parallel work, or creating a sub-agent.
 
-**Data flow**: Calls `self.spec()` and combines it with a fixed keyword string through `multi_agent_tool_search_info`, returning an optional search descriptor.
+**Data flow**: It starts with a keyword string, asks `Handler::spec` for the current tool specification, and packages both into optional search information.
 
-**Call relations**: Used by discovery flows and depends on `Handler::spec` for the underlying tool definition.
+**Call relations**: This sits beside the tool specification. When tool discovery or ranking needs hints, it calls this method, which in turn reuses `Handler::spec` rather than rebuilding a separate description by hand.
 
 *Call graph*: calls 1 internal fn (spec).
 
@@ -3013,11 +3027,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the async spawn workflow in the boxed future expected by the executor trait.
+**Purpose**: Starts the actual execution of a `spawn_agent` tool call. It wraps the asynchronous work so the generic tool system can run it like any other tool.
 
-**Data flow**: Consumes a `ToolInvocation`, pins an async block, awaits `handle_spawn_agent(invocation)`, and boxes the successful typed result with `boxed_tool_output`.
+**Data flow**: It receives a `ToolInvocation`, passes that invocation into `handle_spawn_agent`, and wraps the future with `pin` so it can be returned through the shared tool-executor interface. The final successful result is boxed into the standard tool-output shape.
 
-**Call relations**: This is the runtime entrypoint and delegates all substantive work to `handle_spawn_agent`.
+**Call relations**: This is the bridge between the generic tool runtime and the spawn-specific logic. The runtime calls `Handler::handle`; this function then hands control to `handle_spawn_agent`, where the request is parsed, checked, and executed.
 
 *Call graph*: calls 1 internal fn (handle_spawn_agent); 1 external calls (pin).
 
@@ -3030,11 +3044,11 @@ async fn handle_spawn_agent(
 ) -> Result<SpawnAgentResult, FunctionCallError>
 ```
 
-**Purpose**: Parses spawn arguments, validates depth and override rules, builds the child config from live turn state, requests agent creation through `agent_control`, emits spawn events, and returns the new agent id and nickname.
+**Purpose**: Performs the full process of creating a child agent from a tool call. It validates the request, prepares the child agent's configuration, emits start and end events, asks the agent-control service to spawn the agent, and returns the new agent ID.
 
-**Data flow**: Consumes invocation fields `session`, `turn`, `payload`, and `call_id` → extracts arguments and deserializes `SpawnAgentArgs` → normalizes `agent_type` into `role_name`, converts `message`/`items` into `input_items`, and renders a prompt preview. It reads `turn.session_source`, computes `child_depth` with `next_thread_spawn_depth`, compares against `turn.config.agent_max_depth`, and may return `RespondToModel` on limit breach. It writes `CollabAgentSpawnBeginEvent`, builds `config` from `build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())`, optionally sets `config.service_tier`, then either rejects forbidden overrides for full-history forks or applies requested model/reasoning overrides and role config. It applies service-tier validation and runtime overrides, then awaits `spawn_agent_with_metadata(config, input_items, Some(thread_spawn_source(...)?), SpawnAgentOptions { ... })`. From the result it derives `new_thread_id`, metadata, status, optional config snapshot, effective model/reasoning, and nickname; it writes `CollabAgentSpawnEndEvent`, increments `turn.session_telemetry.counter("codex.multi_agent.spawn", 1, &[("role", role_tag), ("version", "v1")])`, and returns `SpawnAgentResult { agent_id: new_thread_id.to_string(), nickname }` or a mapped spawn error.
+**Data flow**: It receives a `ToolInvocation`, pulls out the session, turn, payload, and call ID, then parses the tool arguments. It turns the user's message and input items into child-agent input, makes a readable prompt preview, computes the next spawn depth, and stops with a model-facing error if the depth limit has been reached. It sends a “spawn began” event, builds the child configuration, applies allowed role, model, reasoning, service-tier, environment, and runtime choices, then asks `agent_control` to create the child agent. After the spawn attempt, it gathers the new thread's metadata if available, sends a “spawn ended” event, records telemetry, and returns `SpawnAgentResult` containing the new agent ID and optional nickname. If spawning fails, the error is converted into a tool-call error.
 
-**Call relations**: Invoked only from `Handler::handle`. It is the central orchestration point for all shared config helpers in `multi_agents_common`, role application, event emission, and the final `agent_control` spawn call.
+**Call relations**: This is called by `Handler::handle` whenever the model invokes the tool. Inside the flow, it uses helpers such as `render_input_preview` to make the task readable in events, `next_thread_spawn_depth` and `exceeds_thread_spawn_depth_limit` to prevent runaway nesting, `apply_role_to_config` to shape the child agent's behavior, and `now_unix_timestamp_ms` to timestamp lifecycle events. Its main handoff is to the session's `agent_control.spawn_agent_with_metadata`, which actually creates the new agent thread.
 
 *Call graph*: calls 3 internal fn (render_input_preview, apply_role_to_config, now_unix_timestamp_ms); called by 1 (handle); 4 external calls (pin, exceeds_thread_spawn_depth_limit, next_thread_spawn_depth, RespondToModel).
 
@@ -3045,11 +3059,11 @@ async fn handle_spawn_agent(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this handler to function payloads.
+**Purpose**: Says which kind of tool payload this handler accepts. Here, it only accepts function-call-style payloads.
 
-**Data flow**: Pattern-matches `payload` and returns whether it is `ToolPayload::Function { .. }`.
+**Data flow**: It receives a `ToolPayload`, checks whether it is the `Function` variant, and returns `true` or `false`.
 
-**Call relations**: Used by runtime dispatch before `handle` is entered.
+**Call relations**: The core tool runtime uses this before routing a payload to the handler. It acts like a simple gate, making sure this handler only runs for the payload shape it knows how to interpret.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3060,11 +3074,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Formats the spawn result as JSON text for logs.
+**Purpose**: Creates a short JSON-style preview of the spawn result for logs. This lets logs show the important outcome without inventing a separate logging format.
 
-**Data flow**: Serializes `self` through `tool_output_json_text` with the label `spawn_agent` and returns the string.
+**Data flow**: It reads the `SpawnAgentResult`, formats it using the shared tool-output JSON helper with the name `spawn_agent`, and returns the resulting text.
 
-**Call relations**: Used by generic logging after a successful spawn.
+**Call relations**: After `handle_spawn_agent` succeeds, the generic tool-output system can call this when it needs a human-readable log preview of the returned agent ID and nickname.
 
 
 ##### `SpawnAgentResult::success_for_logging`  (lines 241–243)
@@ -3073,11 +3087,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks spawn results as successful for logging.
+**Purpose**: Marks this result as a successful tool outcome for logging. Since a `SpawnAgentResult` only exists after a successful spawn, it always returns success.
 
-**Data flow**: Returns `true` unconditionally.
+**Data flow**: It takes no meaningful input beyond the result object itself and returns `true`. It does not change anything.
 
-**Call relations**: Consumed by shared logging/output infrastructure.
+**Call relations**: The logging layer calls this through the `ToolOutput` interface when deciding how to record the tool call outcome.
 
 
 ##### `SpawnAgentResult::to_response_item`  (lines 245–247)
@@ -3086,11 +3100,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the typed spawn result into a model-facing response item.
+**Purpose**: Converts the spawn result into the response format sent back through the model/tool conversation. This is how the model learns the new agent's ID and optional nickname.
 
-**Data flow**: Takes `call_id`, `payload`, and `self`, then calls `tool_output_response_item` with success `Some(true)` and tool label `spawn_agent`.
+**Data flow**: It receives the original call ID and payload, combines them with the `SpawnAgentResult`, and returns a `ResponseInputItem` marked as a successful `spawn_agent` output.
 
-**Call relations**: Used by generic tool-output plumbing after `handle_spawn_agent` succeeds.
+**Call relations**: Once `handle_spawn_agent` returns a result, the tool framework can call this to attach the result to the correct tool call in the conversation.
 
 
 ##### `SpawnAgentResult::code_mode_result`  (lines 249–251)
@@ -3099,22 +3113,22 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the structured JSON form of the spawn result.
+**Purpose**: Formats the spawn result for code-mode consumers as JSON data. This gives programmatic callers a structured result instead of plain text.
 
-**Data flow**: Serializes `self` via `tool_output_code_mode_result` and returns the resulting `JsonValue`.
+**Data flow**: It reads the `SpawnAgentResult`, ignores the payload because no extra payload-specific formatting is needed, and returns a JSON value labeled for `spawn_agent`.
 
-**Call relations**: Used by code-mode or structured-output consumers.
+**Call relations**: The tool-output framework calls this when the result needs to be consumed in code mode. It uses the same result produced by `handle_spawn_agent`, just shaped for a different audience.
 
 
 ### `core/src/tools/handlers/multi_agents/send_input.rs`
 
-`domain_logic` · `request handling for follow-up messages to existing agents`
+`orchestration` · `request handling`
 
-This module defines the `multi_agent_v1.send_input` tool. `Handler` exposes the namespaced tool name, schema from `create_send_input_tool_v1`, and search metadata focused on messaging, follow-up work, and interruption. The result type `SendInputResult` contains the `submission_id` returned by the agent-control layer and implements the standard output conversions.
+This file is the bridge between a tool call and the agent-control system that actually talks to another agent. In plain terms, it is like a front desk clerk: it checks the request, finds the intended recipient, makes sure that recipient is ready, records that the handoff started, passes along the message, then records how it ended.
 
-The main logic is in `Handler::handle_call`. It extracts function arguments from the invocation payload, parses `SendInputArgs` (`target`, optional `message`, optional structured `items`, and `interrupt`), converts the target string into a `ThreadId`, and normalizes the input payload through `parse_collab_input`. It then renders a human-readable prompt preview from the resulting `Op` using `render_input_preview`; that preview is included in collaboration events.
+When the tool is invoked, the handler reads the tool arguments. It expects a target agent, plus either a message or structured input items, and an optional flag saying whether to interrupt the target first. It turns those inputs into the internal format used for agent conversations and creates a short preview of what is being sent. If the target agent is known, it makes sure that agent is loaded and ready to resume work. If requested, it interrupts the target so the new input can take priority.
 
-If metadata exists for the target agent, the handler first builds a resume config from the current turn and calls `ensure_v2_agent_loaded`, which ensures a resumable agent is loaded before messaging. If `interrupt` is true, it explicitly interrupts the target before sending input. The handler emits `CollabAgentInteractionBeginEvent`, calls `agent_control.send_input`, fetches the target's latest status, and emits `CollabAgentInteractionEndEvent` with nickname, role, prompt preview, and status. Errors from loading, interrupting, or sending are normalized with `collab_agent_error`; the end event is still emitted after the send attempt because status is fetched regardless of send success.
+The handler then emits a “begin” event, sends the input through the shared agent-control service, checks the recipient’s latest status, and emits an “end” event. Finally, it returns a small result containing a submission ID, which is a receipt showing that the input was accepted. Without this file, the system could define a send-input tool, but tool calls would not actually reach other agents or produce the start/end records needed for tracking.
 
 #### Function details
 
@@ -3124,11 +3138,11 @@ If metadata exists for the target agent, the handler first builds a resume confi
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the namespaced identifier `multi_agent_v1.send_input`.
+**Purpose**: Returns the official name of this tool so the runtime can recognize it as the multi-agent “send_input” command.
 
-**Data flow**: Constructs a `ToolName` from the fixed namespace and literal tool name and returns it.
+**Data flow**: It takes no outside data beyond the handler itself. It combines the multi-agent namespace with the tool name “send_input” and returns that full tool name.
 
-**Call relations**: Used by registration and dispatch code to identify this tool.
+**Call relations**: The tool runtime asks this when it needs to identify which tool this handler represents. It uses the shared namespacing helper so this tool’s name does not collide with unrelated tools.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -3139,11 +3153,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the schema definition for the send-input tool.
+**Purpose**: Provides the formal description of the “send_input” tool: what arguments it accepts and how it should appear to the tool system.
 
-**Data flow**: Returns the `ToolSpec` produced by `create_send_input_tool_v1()`.
+**Data flow**: It starts with no caller-provided values. It calls the tool-spec builder and returns the resulting specification object.
 
-**Call relations**: Consumed by the registry and by `Handler::search_info`.
+**Call relations**: Other parts of the runtime use this specification when exposing or validating the tool. The search metadata function also calls this so the searchable entry is tied to the same actual tool definition.
 
 *Call graph*: calls 1 internal fn (create_send_input_tool_v1); called by 1 (search_info).
 
@@ -3154,11 +3168,11 @@ fn spec(&self) -> ToolSpec
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Provides search metadata for queries about sending messages or redirecting work to an agent.
+**Purpose**: Adds search keywords and metadata so this tool can be found when the system is looking for a tool related to sending a message to another agent.
 
-**Data flow**: Calls `self.spec()` and combines it with a fixed keyword string via `multi_agent_tool_search_info`, returning an optional `ToolSearchInfo`.
+**Data flow**: It builds from a keyword string and the tool specification. The output is optional search information that describes when this tool is relevant.
 
-**Call relations**: Used by tool discovery; it depends on `Handler::spec` for the underlying schema.
+**Call relations**: This function calls `Handler::spec` so its search entry is based on the same definition used by the runtime. It is used when the tool catalog or search layer needs to decide whether “send_input” matches a user or agent need.
 
 *Call graph*: calls 1 internal fn (spec).
 
@@ -3169,11 +3183,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async send-input workflow into the executor trait's future type.
+**Purpose**: Starts the actual work for a “send_input” tool call and returns it as an asynchronous task. Asynchronous means the work may wait for other services, such as agent control, without blocking everything else.
 
-**Data flow**: Consumes a `ToolInvocation` and returns `Box::pin(self.handle_call(invocation))`.
+**Data flow**: It receives a tool invocation containing the session, turn, payload, and call ID. It wraps the deeper `handle_call` work in a pinned future, which is the Rust runtime’s way of keeping an async task safely in place while it runs.
 
-**Call relations**: This trait method is the runtime entrypoint and delegates directly to `Handler::handle_call`.
+**Call relations**: The tool runtime calls this when someone invokes the tool. It immediately hands the real work to `Handler::handle_call`, which performs the parsing, agent lookup, event sending, and final result creation.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3187,11 +3201,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates the target and input payload, optionally loads or interrupts the target agent, sends the input through `agent_control`, emits interaction events, and returns the queued submission id.
+**Purpose**: Carries out the send-input request from start to finish. It validates the request, prepares the target agent, sends the input, records the interaction, and returns a receipt.
 
-**Data flow**: Consumes `ToolInvocation { session, turn, payload, call_id, .. }` → extracts raw arguments with `function_arguments`, parses `SendInputArgs`, parses `args.target` into `receiver_thread_id`, and converts `message`/`items` into an `Op` with `parse_collab_input`. It derives a preview string with `render_input_preview`, reads optional metadata with `get_agent_metadata`, and if metadata exists builds a resume config via `build_agent_resume_config` and awaits `ensure_v2_agent_loaded`. If `args.interrupt` is true it awaits `interrupt_agent(receiver_thread_id)`. It writes `CollabAgentInteractionBeginEvent`, awaits `send_input(receiver_thread_id, input_items)`, reads the latest status with `get_status`, writes `CollabAgentInteractionEndEvent`, and on success returns boxed `SendInputResult { submission_id }`; any `CodexErr` from agent-control calls is mapped through `collab_agent_error`.
+**Data flow**: It receives a full tool invocation. From that, it reads the session, current turn, raw payload, and call ID. It parses the arguments into a target agent, message or input items, and an interrupt flag. It converts the input into the conversation format, makes a readable preview with `render_input_preview`, loads and optionally interrupts the target agent, emits a begin event with the current time from `now_unix_timestamp_ms`, sends the input, checks the target’s status, emits an end event, and finally returns a `SendInputResult` containing the submission ID. If parsing or agent communication fails, it returns an error instead.
 
-**Call relations**: Called only from `Handler::handle`. It sits between model-facing tool arguments and lower-level agent-control messaging, adding validation, optional preloading, optional interruption, and protocol event emission.
+**Call relations**: This is the worker function called by `Handler::handle`. During the flow it calls `render_input_preview` so logs and events can show a safe summary of what was sent, and it calls `now_unix_timestamp_ms` to timestamp the begin and end events. It hands the prepared input to the agent-control service, which is the component that actually delivers the message to the other agent.
 
 *Call graph*: calls 2 internal fn (render_input_preview, now_unix_timestamp_ms); called by 1 (handle).
 
@@ -3202,11 +3216,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Accepts only function payloads for this tool runtime.
+**Purpose**: Tells the runtime that this handler only accepts function-style tool payloads.
 
-**Data flow**: Checks `payload` with `matches!` and returns whether it is `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload and checks its shape. It returns true if the payload is a function call, and false otherwise.
 
-**Call relations**: Used by runtime dispatch before invoking `handle`.
+**Call relations**: The runtime uses this as a quick gate before asking the handler to process a payload. It relies on Rust’s pattern-matching check to keep non-function payloads away from this tool.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3217,11 +3231,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Serializes the submission result into JSON text for logs.
+**Purpose**: Creates the text that should appear in logs for a successful send-input result.
 
-**Data flow**: Passes `self` and the label `send_input` to `tool_output_json_text` and returns the resulting string.
+**Data flow**: It reads the result object, especially the submission ID, and turns it into a JSON-like text preview labeled for the “send_input” tool. It does not change the result.
 
-**Call relations**: Used by shared logging after successful input submission.
+**Call relations**: After `Handler::handle_call` returns a `SendInputResult`, the tool logging path can call this to record a compact, consistent summary of what happened.
 
 
 ##### `SendInputResult::success_for_logging`  (lines 139–141)
@@ -3230,11 +3244,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks send-input results as successful in logs.
+**Purpose**: Marks this result as a successful tool outcome for logging purposes.
 
-**Data flow**: Returns `true` unconditionally.
+**Data flow**: It takes the result object and always returns true. It does not inspect or modify any fields.
 
-**Call relations**: Consumed by generic logging/output infrastructure.
+**Call relations**: The logging system can call this after the handler has produced a result, so the tool call is recorded as successful rather than as a failure or uncertain outcome.
 
 
 ##### `SendInputResult::to_response_item`  (lines 143–145)
@@ -3243,11 +3257,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the result into a `ResponseInputItem` for the model conversation.
+**Purpose**: Turns the send-input result into the response format expected by the surrounding tool protocol.
 
-**Data flow**: Takes `call_id`, `payload`, and `self`, then calls `tool_output_response_item` with success `Some(true)` and tool label `send_input`.
+**Data flow**: It receives the tool call ID and original payload, combines them with the result data, and returns a response item that can be sent back through the conversation/tool interface.
 
-**Call relations**: Used by generic tool-output plumbing after `handle_call` returns.
+**Call relations**: Once the handler has completed, the runtime uses this to package the result for the caller. It keeps the response tied to the original call ID so the caller can match the receipt to the request.
 
 
 ##### `SendInputResult::code_mode_result`  (lines 147–149)
@@ -3256,24 +3270,24 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the JSON-value form of the send-input result.
+**Purpose**: Provides the send-input result in the JSON form used by code-oriented tool callers.
 
-**Data flow**: Serializes `self` through `tool_output_code_mode_result` and returns the `JsonValue`.
+**Data flow**: It reads the result object and converts it into a JSON value labeled for the “send_input” tool. The payload argument is accepted for interface consistency but is not used here.
 
-**Call relations**: Used by code-mode or structured-output consumers.
+**Call relations**: When the system is operating in a code-style tool mode, it calls this after a successful send-input operation so the caller receives structured data rather than only a display-oriented response.
 
 
 ### `core/src/tools/handlers/multi_agents/wait.rs`
 
-`domain_logic` · `request handling while blocked on sub-agent completion`
+`orchestration` · `request handling`
 
-This module provides the `multi_agent_v1.wait_agent` tool. `Handler` stores timeout option values used when generating the schema, exposes a constructor, and advertises search terms around waiting for completion. `WaitAgentResult` returns a map from target identifier to final `AgentStatus` plus a `timed_out` flag.
+In this system, several agents can work at the same time. This file provides the tool an agent uses when it needs to wait for another agent’s answer before continuing. Without it, an agent could start helpers but would not have a clean way to know when they were done, report waiting progress, or avoid waiting forever.
 
-`Handler::handle_call` starts by parsing `WaitArgs`, converting the `targets` strings into `ThreadId`s, and collecting metadata for each target into both `receiver_agents` (for protocol events) and `target_by_thread_id` (for the final response map). It validates `timeout_ms`, rejecting non-positive values and clamping accepted values into the configured min/max range.
+The main piece is `Handler`, the tool executor for `wait_agent`. When the tool is called, it reads the requested target agents and the timeout. It checks that the timeout is valid, then clamps it inside allowed limits so callers cannot ask for an unsafe wait. It sends a “waiting has begun” event so the rest of the system can show or record that one agent is waiting on others.
 
-After emitting `CollabWaitingBeginEvent`, the handler subscribes to each target's status watch channel. If a target is already in a final state, that status is recorded immediately; if the thread is missing, it is treated as `AgentStatus::NotFound`; if subscription fails for another reason, the handler emits an end event with best-effort status and returns an error. When no target is already final, it launches one `wait_for_final_status` future per target in a `FuturesUnordered` and waits until the first final status arrives or the timeout expires. Once one result arrives, it opportunistically drains any other already-ready completions without blocking further.
+For each target agent, it subscribes to that agent’s status updates. A status is “final” when the agent is done in some terminal way, such as completed or not found. If any target is already final, the tool returns that information right away. Otherwise it waits until one subscribed agent reaches a final status, or until the timeout expires. Think of it like waiting at a service counter: if someone’s ticket is already called, you leave immediately; otherwise you wait, but only up to a fixed time.
 
-The handler then builds both protocol-facing `agent_statuses` and model-facing `status` maps, marks `timed_out` when no final statuses were observed, emits `CollabWaitingEndEvent`, and returns the boxed result. `wait_for_final_status` itself loops on a `watch::Receiver<AgentStatus>`, falling back to `get_status` if the channel closes unexpectedly.
+At the end, it sends a matching “waiting has ended” event and returns a `WaitAgentResult` containing the final statuses it found and whether the wait timed out.
 
 #### Function details
 
@@ -3283,11 +3297,11 @@ The handler then builds both protocol-facing `agent_statuses` and model-facing `
 fn new(options: WaitAgentTimeoutOptions) -> Self
 ```
 
-**Purpose**: Constructs a wait-agent handler with the supplied timeout option values.
+**Purpose**: Creates a `Handler` with the timeout settings that should shape the `wait_agent` tool. This is used when the system is setting up the available tools.
 
-**Data flow**: Consumes `options: WaitAgentTimeoutOptions`, stores it in `Self { options }`, and returns the handler.
+**Data flow**: It receives `WaitAgentTimeoutOptions`, stores them inside a new `Handler`, and returns that ready-to-use handler. Nothing else is changed.
 
-**Call relations**: Called during tool registration so the schema and runtime share the same timeout defaults and bounds.
+**Call relations**: This is the setup doorway for this tool handler. Later, the tool framework calls the handler’s methods to advertise the tool and run it when an agent invokes `wait_agent`.
 
 
 ##### `Handler::tool_name`  (lines 31–33)
@@ -3296,11 +3310,11 @@ fn new(options: WaitAgentTimeoutOptions) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the namespaced identifier `multi_agent_v1.wait_agent`.
+**Purpose**: Returns the official name of this tool: the multi-agent namespace plus `wait_agent`. The tool framework uses this name to match a model’s tool call to this handler.
 
-**Data flow**: Constructs and returns a `ToolName` from the namespace constant and literal tool name.
+**Data flow**: It takes no outside data beyond the handler itself, builds a namespaced tool name, and returns it. It does not modify anything.
 
-**Call relations**: Used by the registry to expose and dispatch this handler.
+**Call relations**: When the tool registry asks what this handler represents, this method supplies the name. It relies on the shared namespacing helper so this tool is named consistently with other multi-agent tools.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -3311,11 +3325,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the wait-agent tool schema using the handler's timeout options.
+**Purpose**: Builds the public description of the `wait_agent` tool, including its expected arguments and timeout rules. This description is what the model or tool system can inspect before calling it.
 
-**Data flow**: Passes `self.options` into `create_wait_agent_tool_v1` and returns the resulting `ToolSpec`.
+**Data flow**: It reads the handler’s timeout options, passes them into the tool-spec builder, and returns the resulting `ToolSpec`. It does not perform a wait or touch any agent state.
 
-**Call relations**: Used directly by registration and indirectly by `Handler::search_info`.
+**Call relations**: This is used when the system needs the formal tool definition. `Handler::search_info` also calls it so the searchable metadata points at the same exact tool specification.
 
 *Call graph*: calls 1 internal fn (create_wait_agent_tool_v1); called by 1 (search_info).
 
@@ -3326,11 +3340,11 @@ fn spec(&self) -> ToolSpec
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Provides search metadata for completion-waiting queries.
+**Purpose**: Provides search metadata so the `wait_agent` tool can be found when someone is looking for tool capabilities related to waiting, agent status, completion, or timeouts.
 
-**Data flow**: Calls `self.spec()` and combines it with a fixed keyword string via `multi_agent_tool_search_info`, returning an optional search descriptor.
+**Data flow**: It gathers a short keyword string and the tool spec, then packages them into optional search information. The output is either that metadata wrapped in `Some`, or no metadata if the helper decided not to produce it.
 
-**Call relations**: Used by discovery flows and depends on `Handler::spec`.
+**Call relations**: This sits beside the formal tool definition. When the tool system builds searchable indexes or help-like listings, it asks this method, which reuses `Handler::spec` to stay consistent.
 
 *Call graph*: calls 1 internal fn (spec).
 
@@ -3341,11 +3355,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async wait workflow into the executor trait's future type.
+**Purpose**: Starts processing an actual `wait_agent` tool call. It wraps the real asynchronous work in the future type expected by the tool framework.
 
-**Data flow**: Consumes a `ToolInvocation` and returns `Box::pin(self.handle_call(invocation))`.
+**Data flow**: It receives a `ToolInvocation`, passes it to `Handler::handle_call`, boxes and pins the asynchronous operation, and returns that future. The real waiting happens later when the future is run.
 
-**Call relations**: This is the runtime entrypoint and delegates directly to `Handler::handle_call`.
+**Call relations**: The tool framework calls this after it has matched a model’s request to this handler. This method is the adapter between the framework’s generic executor interface and the detailed `handle_call` workflow.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3359,11 +3373,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Parses target ids and timeout, subscribes to target status streams, waits until at least one final status arrives or the deadline expires, emits begin/end waiting events, and returns the observed final statuses.
+**Purpose**: Carries out the full `wait_agent` operation: read the request, identify target agents, wait for one or more final statuses, record begin/end events, and return the result. This is the heart of the file.
 
-**Data flow**: Consumes `ToolInvocation { session, turn, payload, call_id, .. }` → extracts arguments and deserializes `WaitArgs` → parses `targets` into `receiver_thread_ids` and builds `receiver_agents` plus `target_by_thread_id` from `get_agent_metadata`. It validates `timeout_ms`, rejecting values `<= 0` and clamping others between `MIN_WAIT_TIMEOUT_MS` and `MAX_WAIT_TIMEOUT_MS`. It writes `CollabWaitingBeginEvent`, then for each target awaits `subscribe_status`: successful subscriptions contribute `(id, Receiver<AgentStatus>)` and may also populate `initial_final_statuses`; missing threads contribute `(id, AgentStatus::NotFound)`; other errors trigger an immediate `CollabWaitingEndEvent` with best-effort statuses and return `collab_agent_error`. If any initial final statuses exist, those become the result set. Otherwise it creates a `FuturesUnordered` of `wait_for_final_status(session.clone(), id, rx)` futures, computes a deadline with `Instant::now() + Duration::from_millis(timeout_ms as u64)`, and loops on `timeout_at(deadline, futures.next())` until one final result arrives or time runs out. After the first result it drains any immediately ready additional results with `now_or_never`. It then computes `timed_out`, converts statuses into both `HashMap<ThreadId, AgentStatus>` and response `HashMap<String, AgentStatus>`, builds protocol `agent_statuses` with `build_wait_agent_statuses`, emits `CollabWaitingEndEvent`, and returns boxed `WaitAgentResult`.
+**Data flow**: It receives a tool invocation containing the session, turn, call id, and raw payload. It parses the arguments into target agent ids and a timeout, looks up display information for those agents, sends a waiting-started event, subscribes to status updates, and waits until a target is already final, becomes final, or the timeout is reached. It then builds a `WaitAgentResult`, sends a waiting-ended event, and returns the result as tool output. If arguments are invalid or a status subscription fails unexpectedly, it returns an error instead.
 
-**Call relations**: Called only from `Handler::handle`. It delegates per-target blocking behavior to `wait_for_final_status` and uses shared helpers for target parsing, status-entry formatting, and error normalization.
+**Call relations**: This function is launched by `Handler::handle` whenever the model calls `wait_agent`. It uses `wait_for_final_status` for the repeated “watch this one agent until it is final” task, and it uses final-status checks and timestamp helpers so the collaboration events accurately describe the wait.
 
 *Call graph*: calls 3 internal fn (is_final, wait_for_final_status, now_unix_timestamp_ms); called by 1 (handle); 8 external calls (from_millis, new, with_capacity, now, new, with_capacity, timeout_at, RespondToModel).
 
@@ -3374,11 +3388,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this runtime handler to function payloads.
+**Purpose**: Says which kind of tool payload this handler can accept. Here, it only accepts function-style tool calls.
 
-**Data flow**: Checks `payload` with `matches!` and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload, checks whether it is the function-call form, and returns `true` or `false`. It does not inspect the function arguments themselves.
 
-**Call relations**: Used by runtime dispatch before invoking `handle`.
+**Call relations**: The tool runtime can call this before dispatching work to the handler. It acts like a simple gate, ensuring this handler is only used for the payload shape it knows how to process.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3389,11 +3403,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Serializes the wait result into JSON text for logs.
+**Purpose**: Creates a log-friendly text preview of the `wait_agent` result. This lets logs show what happened without each caller inventing its own formatting.
 
-**Data flow**: Passes `self` and the label `wait_agent` to `tool_output_json_text` and returns the resulting string.
+**Data flow**: It reads the result’s status map and timeout flag, formats them as the standard JSON-like tool output text for `wait_agent`, and returns that string. It does not change the result.
 
-**Call relations**: Used by shared logging after a wait call completes.
+**Call relations**: After `handle_call` returns a `WaitAgentResult`, logging code can ask this method for a compact preview. It connects the result data to the system’s common tool-output logging format.
 
 
 ##### `WaitAgentResult::success_for_logging`  (lines 241–243)
@@ -3402,11 +3416,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks wait-agent results as successful for logging.
+**Purpose**: Marks `wait_agent` outputs as successful for logging purposes. A timeout is still a valid tool outcome, so this method does not treat it as a logging failure.
 
-**Data flow**: Returns `true` unconditionally.
+**Data flow**: It ignores the particular contents of the result and returns `true`. No state is read beyond the method receiver, and nothing is changed.
 
-**Call relations**: Consumed by generic logging/output infrastructure.
+**Call relations**: When the tool framework records the outcome, it can call this to decide how to label the log entry. This keeps expected results, including timeouts, from being logged as execution errors.
 
 
 ##### `WaitAgentResult::to_response_item`  (lines 245–247)
@@ -3415,11 +3429,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the wait result into a response item for the model conversation.
+**Purpose**: Turns the `wait_agent` result into the response item format that can be sent back through the model/tool conversation. This is the bridge from internal Rust data to protocol output.
 
-**Data flow**: Takes `call_id`, `payload`, and `self`, then calls `tool_output_response_item` with success `None` and tool label `wait_agent`, returning the `ResponseInputItem`.
+**Data flow**: It receives the call id and original payload, combines them with the result data, and returns a `ResponseInputItem` in the standard `wait_agent` tool-output shape. It does not modify the result.
 
-**Call relations**: Used by generic tool-output plumbing; unlike most other tools it leaves success unspecified because timeout is represented in-band by the result payload.
+**Call relations**: Once `handle_call` has produced a result, the broader tool system uses this method when it needs to place that result back into the conversation stream.
 
 
 ##### `WaitAgentResult::code_mode_result`  (lines 249–251)
@@ -3428,11 +3442,11 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the structured JSON form of the wait result.
+**Purpose**: Converts the `wait_agent` result into a JSON value for code-oriented consumers. This gives code mode a plain structured object instead of a display string.
 
-**Data flow**: Serializes `self` through `tool_output_code_mode_result` and returns the `JsonValue`.
+**Data flow**: It reads the result’s fields, formats them under the standard `wait_agent` result wrapper, and returns a JSON value. The original result remains unchanged.
 
-**Call relations**: Used by code-mode or structured-output consumers.
+**Call relations**: This is used by the tool-output layer when the consumer expects machine-readable JSON. It provides the same information as the normal response path, but in a form that code can inspect directly.
 
 
 ##### `wait_for_final_status`  (lines 254–274)
@@ -3445,24 +3459,24 @@ async fn wait_for_final_status(
 ) -> Option<(ThreadId, AgentStatus)>
 ```
 
-**Purpose**: Waits on a single agent's watch channel until it reaches a final status, with a fallback status lookup if the channel closes.
+**Purpose**: Watches one agent’s status stream until that agent reaches a final state. It is the small helper that lets the main handler wait on many agents at once.
 
-**Data flow**: Accepts `session: Arc<Session>`, `thread_id: ThreadId`, and `mut status_rx: Receiver<AgentStatus>` → reads the current status with `borrow`; if already final, returns `Some((thread_id, status))`. Otherwise it loops awaiting `status_rx.changed()`. If the channel closes, it fetches the latest status from `session.services.agent_control.get_status(thread_id)` and returns it only if final. After each successful change notification it re-borrows the status and returns `Some((thread_id, status))` once `is_final` becomes true; otherwise it keeps waiting.
+**Data flow**: It receives the current session, a target agent thread id, and a status receiver, which is like a live subscription to status changes. It first checks the current status; if it is final, it returns it immediately. Otherwise it waits for status changes. If the subscription closes, it asks the agent-control service for the latest known status and returns it only if that status is final. The output is either the thread id plus final status, or `None` if no final status can be confirmed.
 
-**Call relations**: Spawned by `Handler::handle_call` inside a `FuturesUnordered` for each subscribed target when no target is already final. It isolates the per-agent watch-loop logic from the multi-target timeout orchestration.
+**Call relations**: During `Handler::handle_call`, one of these watchers is started for each target agent that was not already final. The main handler races those watchers against the timeout and uses any final statuses they return to build the final tool result.
 
 *Call graph*: calls 1 internal fn (is_final); called by 1 (handle_call); 2 external calls (borrow, changed).
 
 
 ### `core/src/tools/handlers/multi_agents/resume_agent.rs`
 
-`domain_logic` · `request handling for reopening previously closed agents`
+`orchestration` · `request handling`
 
-This module provides the `multi_agent_v1.resume_agent` tool. `Handler` supplies the namespaced tool name, schema from `create_resume_agent_tool`, and search metadata keyed to reopening closed agents. The result type, `ResumeAgentResult`, simply wraps the agent's resulting `AgentStatus` and implements the standard `ToolOutput` conversions.
+This file is the bridge between a model asking to “resume agent X” and the system services that know how to find, report on, or restart that agent. In a multi-agent run, agents can have their own thread ids, roles, nicknames, and status. Without this file, the model could not use the `resume_agent` tool to continue work with an existing or closed subagent.
 
-`handle_resume_agent` performs the actual workflow. It parses `ResumeAgentArgs { id }`, converts the id string into a `ThreadId`, and fetches any existing metadata for event decoration. Before attempting a resume, it computes the child depth from `turn.session_source` using `next_thread_spawn_depth` and compares it against `turn.config.agent_max_depth`; if the resumed agent would exceed the nesting limit, it rejects the request with a model-facing error.
+The flow is like a front desk reopening a case file. First, the handler identifies itself as the `resume_agent` tool and provides the tool’s schema, which tells the model what arguments to send. When the tool is called, it reads the requested agent id, turns that text id into an internal thread id, and checks whether starting or resuming another thread would exceed the configured nesting limit. That limit prevents agents from spawning chains of agents forever.
 
-The handler emits `CollabResumeBeginEvent`, then reads the current status. If the agent is not `NotFound`, no resume is needed and the current status is returned. If it is `NotFound`, the handler calls `try_resume_closed_agent`, which rebuilds a runtime-correct config via `build_agent_resume_config` and reconstructs the spawn lineage with `thread_spawn_source` before delegating to `agent_control.resume_agent_from_rollout`. Afterward it refreshes status and metadata, emits `CollabResumeEndEvent`, increments the `codex.multi_agent.resume` telemetry counter on success, and returns the final status. Errors are delayed until after the end event so observers always see a completed resume attempt.
+The handler then sends a “resume begin” event so the rest of the system can show or log that the attempt started. It asks the agent-control service for the target agent’s current status. If the agent is not found, it tries to resume it from saved rollout data. Finally, it sends a “resume end” event with the resulting status, records telemetry for a successful resume request, and returns a small JSON-like result containing the agent status.
 
 #### Function details
 
@@ -3472,11 +3486,11 @@ The handler emits `CollabResumeBeginEvent`, then reads the current status. If th
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the namespaced tool identifier `multi_agent_v1.resume_agent`.
+**Purpose**: Returns the official name of this tool: `resume_agent` inside the multi-agent tool namespace. The system uses this name to match an incoming tool call to this handler.
 
-**Data flow**: Constructs and returns a `ToolName` from the fixed namespace and literal tool name.
+**Data flow**: It takes the handler object, combines the multi-agent namespace with the text name `resume_agent`, and returns a structured tool name. It does not read or change any session state.
 
-**Call relations**: Used by the tool registry to expose and dispatch this handler.
+**Call relations**: This is part of the tool registration story. It calls the shared naming helper `namespaced` so this tool is identified consistently with other multi-agent tools.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -3487,11 +3501,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the tool specification for the resume-agent API.
+**Purpose**: Provides the formal description of the `resume_agent` tool, including what arguments it expects. This is what lets the model know how to call the tool correctly.
 
-**Data flow**: Returns the `ToolSpec` created by `create_resume_agent_tool()`.
+**Data flow**: It takes no outside input beyond the handler, asks `create_resume_agent_tool` to build the tool specification, and returns that specification. Nothing is stored or changed here.
 
-**Call relations**: Referenced directly by registration code and indirectly by `Handler::search_info`.
+**Call relations**: The tool system calls this when it needs the schema for the tool. `Handler::search_info` also calls it so the same specification can be used when making the tool discoverable.
 
 *Call graph*: calls 1 internal fn (create_resume_agent_tool); called by 1 (search_info).
 
@@ -3502,11 +3516,11 @@ fn spec(&self) -> ToolSpec
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Supplies search metadata for queries about reopening or resuming agents.
+**Purpose**: Supplies search keywords and metadata that help the system find this tool when a model or planner is looking for a way to resume an agent. It connects human-like search terms such as “reopen closed agent” to the actual tool.
 
-**Data flow**: Combines a fixed search phrase with `self.spec()` and passes both into `multi_agent_tool_search_info`, returning the optional search descriptor.
+**Data flow**: It starts with a fixed keyword string, gets the tool specification by calling `Handler::spec`, and returns optional search information built from those pieces. It does not inspect a session or modify anything.
 
-**Call relations**: Called by discovery flows; depends on `Handler::spec` to stay synchronized with the actual tool definition.
+**Call relations**: This supports tool discovery rather than execution. Its main handoff is to `Handler::spec`, because the search entry should describe the same tool that will later be executed.
 
 *Call graph*: calls 1 internal fn (spec).
 
@@ -3517,11 +3531,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the async resume workflow in the boxed future expected by the executor trait.
+**Purpose**: Starts the actual asynchronous work when the `resume_agent` tool is invoked. It wraps the main resume logic in the future shape expected by the tool framework.
 
-**Data flow**: Consumes a `ToolInvocation`, pins an async block, awaits `handle_resume_agent(invocation)`, and boxes the successful result with `boxed_tool_output`.
+**Data flow**: It receives a `ToolInvocation`, packages an asynchronous call to `handle_resume_agent`, and maps the successful result into the standard boxed tool output format. The output is a future that will eventually produce either a tool result or an error.
 
-**Call relations**: This is the runtime entrypoint and delegates all substantive behavior to `handle_resume_agent`.
+**Call relations**: This is the entry point from the generic tool executor into this file’s real work. It calls `handle_resume_agent`, which performs validation, event reporting, status lookup, and possible agent resume.
 
 *Call graph*: calls 1 internal fn (handle_resume_agent); 1 external calls (pin).
 
@@ -3534,11 +3548,11 @@ async fn handle_resume_agent(
 ) -> Result<ResumeAgentResult, FunctionCallError>
 ```
 
-**Purpose**: Parses the requested agent id, enforces depth limits, emits begin/end resume events, optionally restores a closed agent from rollout state, and returns the resulting status.
+**Purpose**: Carries out a `resume_agent` request from start to finish. It validates the target agent id, enforces the agent-depth limit, reports progress events, tries to revive a missing closed agent, and returns the target agent’s final status.
 
-**Data flow**: Consumes the invocation fields `session`, `turn`, `payload`, and `call_id` → extracts function arguments and deserializes `ResumeAgentArgs` → parses `args.id` with `ThreadId::from_string`, mapping parse failures to `RespondToModel`. It reads metadata from `agent_control`, computes `child_depth` from `turn.session_source`, and compares it to `turn.config.agent_max_depth`. It writes `CollabResumeBeginEvent`, reads current status via `get_status`, and if that status is `AgentStatus::NotFound` it awaits `try_resume_closed_agent(&session, &turn, receiver_thread_id, child_depth)`. After the attempt it refreshes status and metadata, emits `CollabResumeEndEvent`, increments `turn.session_telemetry.counter("codex.multi_agent.resume", 1, &[])` on success, and returns `ResumeAgentResult { status }` or the deferred `FunctionCallError`.
+**Data flow**: It receives a full tool invocation containing the session, current turn, raw tool payload, and call id. It extracts and parses the arguments, converts the requested id into an internal thread id, reads existing agent metadata and status, and checks whether another nested agent is allowed. It sends a begin event, asks the agent-control service for the target status, optionally calls `try_resume_closed_agent` if the agent is not currently found, sends an end event, records telemetry on success, and returns `ResumeAgentResult` with the final `AgentStatus`. If the id is invalid, the depth limit is reached, or resume fails, it returns an error meant to be shown back to the model.
 
-**Call relations**: Invoked only from `Handler::handle`. It delegates the actual restoration path to `try_resume_closed_agent` only when the target is currently absent; otherwise it acts as a status-reporting no-op with event emission.
+**Call relations**: This is called by `Handler::handle` whenever the tool runs. During the flow it calls helpers such as `now_unix_timestamp_ms` to timestamp events, `next_thread_spawn_depth` to calculate nesting depth, `ThreadId::from_string` to understand the requested id, and `try_resume_closed_agent` when a missing agent might be recoverable.
 
 *Call graph*: calls 3 internal fn (try_resume_closed_agent, now_unix_timestamp_ms, from_string); called by 1 (handle); 4 external calls (pin, next_thread_spawn_depth, matches!, RespondToModel).
 
@@ -3549,11 +3563,11 @@ async fn handle_resume_agent(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this handler only accepts function payloads.
+**Purpose**: Tells the runtime that this handler only accepts function-style tool payloads. In plain terms, it rejects payload shapes that are not ordinary function calls.
 
-**Data flow**: Pattern-matches `payload` and returns `true` for `ToolPayload::Function { .. }`, `false` otherwise.
+**Data flow**: It receives a tool payload, checks whether it is a `Function` payload, and returns `true` or `false`. It does not parse the function arguments or change any state.
 
-**Call relations**: Used by runtime dispatch before `handle` is called.
+**Call relations**: The core tool runtime uses this as an early filter before dispatching work to the handler. It relies on a simple pattern check rather than calling the heavier resume logic.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3564,11 +3578,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Formats the resume result as JSON text for logs.
+**Purpose**: Creates a compact text preview of the resume result for logs. This helps developers and operators see what the tool returned without needing to inspect the full response machinery.
 
-**Data flow**: Serializes `self` through `tool_output_json_text` with the label `resume_agent` and returns the string.
+**Data flow**: It reads the `ResumeAgentResult`, formats it as JSON-style text labeled with `resume_agent`, and returns that string. It does not change the result.
 
-**Call relations**: Consumed by generic logging after a successful resume call.
+**Call relations**: This is used by the generic tool-output logging path after `handle_resume_agent` has produced a result. It turns the result into a readable log snippet.
 
 
 ##### `ResumeAgentResult::success_for_logging`  (lines 161–163)
@@ -3577,11 +3591,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks resume results as successful for logging purposes.
+**Purpose**: Marks this tool output as successful for logging purposes. The result object is only created when the resume request completed well enough to return a status.
 
-**Data flow**: Returns the constant `true`.
+**Data flow**: It receives the result object and always returns `true`. It reads no fields and changes nothing.
 
-**Call relations**: Used by shared logging/output infrastructure.
+**Call relations**: The tool-output framework calls this when deciding how to label the completed tool call in logs. Errors are handled separately before a `ResumeAgentResult` is returned.
 
 
 ##### `ResumeAgentResult::to_response_item`  (lines 165–167)
@@ -3590,11 +3604,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the typed resume result into a model-facing response item.
+**Purpose**: Converts the resume result into the response item format that can be sent back to the model. This is how the model learns the resumed agent’s final status.
 
-**Data flow**: Takes `call_id`, `payload`, and `self`, then calls `tool_output_response_item` with success `Some(true)` and tool label `resume_agent`, returning the resulting `ResponseInputItem`.
+**Data flow**: It receives the original call id, the original tool payload, and the result. It packages them into a `ResponseInputItem` labeled as a successful `resume_agent` output. It does not alter the session or the stored agent state.
 
-**Call relations**: Called by generic tool-output plumbing after `handle_resume_agent` succeeds.
+**Call relations**: After `handle_resume_agent` returns a `ResumeAgentResult`, the tool framework uses this method to hand the result back into the conversation as the tool’s answer.
 
 
 ##### `ResumeAgentResult::code_mode_result`  (lines 169–171)
@@ -3603,11 +3617,11 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces a structured JSON representation of the resume result for code-mode output.
+**Purpose**: Builds the machine-readable version of the resume result for code-oriented tool output. This gives callers a JSON value rather than only a conversational response item.
 
-**Data flow**: Serializes `self` via `tool_output_code_mode_result` and returns the `JsonValue`.
+**Data flow**: It reads the result, ignores the payload because it does not need extra context, and returns a JSON value labeled for `resume_agent`. Nothing else changes.
 
-**Call relations**: Used by alternate output consumers that want raw JSON.
+**Call relations**: The broader tool-output system calls this when it needs a structured result, for example in code-mode paths. It represents the same status returned by `handle_resume_agent` in a JSON-friendly form.
 
 
 ##### `try_resume_closed_agent`  (lines 174–195)
@@ -3621,24 +3635,24 @@ async fn try_resume_closed_agent(
 ) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Reconstructs the runtime config and lineage needed to restore a closed agent from rollout state through `agent_control`.
+**Purpose**: Attempts to restart or reconnect a closed agent from saved rollout information. It is used only when the requested agent is not currently found in the active agent-control service.
 
-**Data flow**: Accepts shared references to `Session` and `TurnContext`, plus `receiver_thread_id` and `child_depth` → builds a resume config with `build_agent_resume_config(turn.as_ref())` → constructs a `SessionSource` via `thread_spawn_source(session.thread_id(), &turn.session_source, child_depth, None, None)` → calls `session.services.agent_control.resume_agent_from_rollout(...)` and maps success to `()` and any `CodexErr` to `FunctionCallError` with `collab_agent_error`.
+**Data flow**: It receives the current session, current turn context, the target agent’s thread id, and the calculated child depth. It builds a resume configuration, creates a thread-spawn source describing who is resuming whom, asks the agent-control service to resume the agent from rollout data, and returns success with no value if that works. If configuration, spawn-source creation, or the resume operation fails, it turns the failure into a `FunctionCallError` tied to the target agent id.
 
-**Call relations**: This helper is called only from `handle_resume_agent` when the target status is `NotFound`, isolating the restoration-specific setup from the broader event and telemetry flow.
+**Call relations**: This is called by `handle_resume_agent` after the first status check says the target agent is `NotFound`. It hands the real restart request to `session.services.agent_control.resume_agent_from_rollout`, then lets `handle_resume_agent` re-check status and report the final end event.
 
 *Call graph*: called by 1 (handle_resume_agent); 1 external calls (pin).
 
 
 ### `core/src/tools/handlers/multi_agents/close_agent.rs`
 
-`domain_logic` · `request handling for explicit agent shutdown`
+`domain_logic` · `request handling`
 
-This file defines the `close_agent` tool executor and the serializable result type returned to the model. `Handler` exposes the tool under the namespaced name `multi_agent_v1.close_agent`, supplies its schema from `create_close_agent_tool_v1`, and advertises search text oriented around shutdown and stopping agents.
+This file is the bridge between a user-visible tool call and the internal agent-control system. In this project, an “agent” is a separate worker thread that can be created to help with a task. Without this file, the system could start or talk to helper agents but would not have this standardized tool path for closing one and reporting what happened.
 
-The core workflow lives in `handle_close_agent`. It destructures the `ToolInvocation`, extracts function arguments, deserializes `CloseAgentArgs { target }`, and parses the target into a `ThreadId`. Before issuing the close, it fetches optional metadata so end events can include nickname and role even if the agent disappears later. It then emits `CollabCloseBeginEvent` with timestamps and sender/receiver thread ids.
+The main piece is `Handler`, which tells the tool system three things: the tool’s name, its formal description, and how to run it when someone calls it. When the tool is invoked, the code reads the provided arguments, extracts the target agent ID, looks up any known nickname or role for that agent, and emits a “close is starting” event. These events are like receipts: they let the rest of the system or UI show that a close request began and later finished.
 
-Status acquisition is careful: it first tries `subscribe_status` to capture the current status from a watch channel; if the thread is already gone but metadata existed, it falls back to `get_status`; for other subscription errors it still emits `CollabCloseEndEvent` with the best-effort status and returns a normalized collaboration error. The actual shutdown is performed through `agent_control.close_agent`. Regardless of success, the handler emits `CollabCloseEndEvent` carrying the pre-close status snapshot. On success it returns `CloseAgentResult { previous_status }`, preserving the status observed before shutdown was requested rather than the post-close state.
+Before closing the agent, the handler tries to capture the agent’s current status. This matters because after shutdown the live status may no longer be available, but callers still need to know what state the agent was in. It then asks `agent_control` to close the agent. Whether the close succeeds or fails, it sends a matching “close ended” event with timing and identity details. On success, it returns a small result object containing the previous status, formatted in the same standard ways as other tool outputs.
 
 #### Function details
 
@@ -3648,11 +3662,11 @@ Status acquisition is careful: it first tries `subscribe_status` to capture the 
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the fully qualified tool name for this executor as `multi_agent_v1.close_agent`.
+**Purpose**: Gives this tool its official name: the multi-agent `close_agent` tool. The tool system uses this name to match an incoming tool request to this handler.
 
-**Data flow**: Reads no mutable state; constructs a `ToolName` from the namespace constant and literal tool name via `ToolName::namespaced` and returns it.
+**Data flow**: It starts with no outside input beyond the handler itself. It combines the shared multi-agent namespace with the specific name `close_agent`, then returns that full tool name.
 
-**Call relations**: The tool registry calls this when registering or dispatching the handler so invocations route to the close-agent implementation.
+**Call relations**: This is part of the tool registration story. It calls the shared name-building helper so the tool is named consistently with the rest of the multi-agent tools.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -3663,11 +3677,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the JSON-schema-backed tool specification for `close_agent`.
+**Purpose**: Returns the formal description of the `close_agent` tool, including what arguments it expects. This is what lets callers know how to use the tool correctly.
 
-**Data flow**: Takes no arguments beyond `&self` and returns the `ToolSpec` produced by `create_close_agent_tool_v1()`.
+**Data flow**: It takes no runtime request data. It asks the multi-agent tool specification code to build the version-1 close-agent tool description, then returns that description.
 
-**Call relations**: This is consumed directly by the registry and indirectly by `Handler::search_info`, which uses the same spec to derive searchable metadata.
+**Call relations**: The handler uses this whenever the tool system needs the tool’s schema. `Handler::search_info` also calls it so the searchable tool entry and the actual callable tool stay based on the same specification.
 
 *Call graph*: calls 1 internal fn (create_close_agent_tool_v1); called by 1 (search_info).
 
@@ -3678,11 +3692,11 @@ fn spec(&self) -> ToolSpec
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Provides search metadata so the tool can be discovered from shutdown-related queries.
+**Purpose**: Provides search keywords and metadata so this tool can be found when the system is deciding which tools may be relevant. The keywords include plain terms like close, shutdown, stop, agent, and thread.
 
-**Data flow**: Uses a fixed keyword string and the current tool spec from `self.spec()` to build an optional `ToolSearchInfo` through `multi_agent_tool_search_info`.
+**Data flow**: It starts with the handler and no request-specific input. It gets the tool specification from `Handler::spec`, combines it with a keyword string, and returns optional search information for discovery.
 
-**Call relations**: Called by tool discovery paths; it depends on `Handler::spec` so the search entry stays aligned with the actual tool schema.
+**Call relations**: This supports the tool-selection layer before an actual call happens. It calls `Handler::spec` so the search entry points back to the same close-agent tool definition used for execution.
 
 *Call graph*: calls 1 internal fn (spec).
 
@@ -3693,11 +3707,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async close-agent workflow into the boxed future shape expected by the tool executor trait.
+**Purpose**: Starts the actual work for a `close_agent` tool call. It wraps the close operation in an asynchronous task, meaning the system can wait for the close without blocking other work.
 
-**Data flow**: Consumes a `ToolInvocation` → creates a pinned async block that awaits `handle_close_agent(invocation)` → maps the typed result into boxed `ToolOutput` with `boxed_tool_output`.
+**Data flow**: It receives a full tool invocation, including the session, turn, payload, and call ID. It passes that invocation to `handle_close_agent`, waits for the result, and wraps the successful result into the standard boxed tool-output form.
 
-**Call relations**: This is the trait entrypoint invoked by the runtime for a tool call; it delegates all substantive work to `handle_close_agent`.
+**Call relations**: This is the handler method the tool runtime calls when the tool is invoked. It hands the real work to `handle_close_agent`, using pinning for the asynchronous future so the runtime can safely poll it.
 
 *Call graph*: calls 1 internal fn (handle_close_agent); 1 external calls (pin).
 
@@ -3710,11 +3724,11 @@ async fn handle_close_agent(
 ) -> Result<CloseAgentResult, FunctionCallError>
 ```
 
-**Purpose**: Validates the target, emits collaboration lifecycle events, captures the target's current status, requests shutdown through `agent_control`, and returns the pre-close status snapshot.
+**Purpose**: Carries out the close-agent request from start to finish. It reads the target agent, records close-start and close-end events, asks the agent-control service to close the agent, and returns the agent’s previous status if the close succeeds.
 
-**Data flow**: Consumes `ToolInvocation { session, turn, payload, call_id, .. }` → extracts raw function arguments with `function_arguments`, parses `CloseAgentArgs`, converts `target` to `ThreadId`, and reads metadata from `session.services.agent_control.get_agent_metadata`. It writes a `CollabCloseBeginEvent` to the session event stream, then reads status either from `subscribe_status().borrow_and_update()`, from `get_status` on a known-but-missing thread, or from `get_status` during error handling. It invokes `close_agent(agent_id)` and maps any `CodexErr` through `collab_agent_error`. It always emits `CollabCloseEndEvent` with timestamps, sender/receiver ids, metadata, and the captured status. On success it returns `CloseAgentResult { previous_status: status }`; on failure it returns a `FunctionCallError`.
+**Data flow**: It receives a tool invocation. From that it pulls out the session, turn, raw payload, and call ID; parses the payload into a target agent ID; looks up metadata such as nickname and role; sends a begin event with the current timestamp; tries to read the agent’s current status; asks the agent-control service to close the target; sends an end event; and finally returns `CloseAgentResult` containing the status from before the close. If parsing fails or agent-control reports an error, the function returns a tool-call error instead of a normal result.
 
-**Call relations**: Reached only from `Handler::handle`. It orchestrates parsing helpers from the shared module, session event emission, and `agent_control` operations so the close request is externally visible and failures still produce a terminal collaboration event.
+**Call relations**: This is called by `Handler::handle` whenever someone invokes the close tool. It calls the timestamp helper when writing begin and end events, and it uses an asynchronous pinned close request so the agent-control service can do the shutdown work. It also talks to session services and event output so the rest of the system can observe the close attempt.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_ms); called by 1 (handle); 1 external calls (pin).
 
@@ -3725,11 +3739,11 @@ async fn handle_close_agent(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this runtime handler to function-style tool payloads.
+**Purpose**: Says which kind of tool payload this handler accepts. Here, it only accepts function-style tool calls.
 
-**Data flow**: Inspects `payload: &ToolPayload` with `matches!` and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload and checks its shape. If the payload is a function call, it returns true; otherwise it returns false.
 
-**Call relations**: The core tool runtime uses this guard before dispatching to `handle`, preventing unsupported payload variants from reaching the close-agent logic.
+**Call relations**: The core tool runtime uses this as a gate before routing work to the handler. It relies on Rust’s pattern-matching check to make sure only the expected payload kind reaches the close-agent execution path.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3740,11 +3754,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Serializes the close result into a compact JSON string for logs.
+**Purpose**: Creates a short text version of the close-agent result for logs. This helps operators or developers see what the tool returned without needing to inspect the raw object.
 
-**Data flow**: Reads `self.previous_status` and passes `self` plus the tool name label to `tool_output_json_text`, returning the resulting string.
+**Data flow**: It receives the result object, including the previous agent status. It formats that result as the standard JSON-like log text for the `close_agent` tool and returns the text.
 
-**Call relations**: Used by generic tool-output logging paths after `handle_close_agent` succeeds.
+**Call relations**: This is used through the shared `ToolOutput` interface after `handle_close_agent` succeeds. It feeds the logging path rather than the agent-control path.
 
 
 ##### `CloseAgentResult::success_for_logging`  (lines 130–132)
@@ -3753,11 +3767,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks successful close-agent results as loggable successes.
+**Purpose**: Tells the logging system that this result represents a successful tool call. It always returns true because this method is only used on a successfully created `CloseAgentResult`.
 
-**Data flow**: Reads no external state and returns the constant `true`.
+**Data flow**: It receives the result object but does not need to inspect its contents. It simply returns true.
 
-**Call relations**: Consumed by logging infrastructure alongside `log_preview` to classify the tool result.
+**Call relations**: This is part of the standard output behavior for tool results. After the close handler returns a result, the logging layer can call this to mark the log entry as successful.
 
 
 ##### `CloseAgentResult::to_response_item`  (lines 134–136)
@@ -3766,11 +3780,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the typed close result into a `ResponseInputItem` suitable for feeding back into the model conversation.
+**Purpose**: Turns the close-agent result into the standard response item sent back to the model or caller. This is the user-facing packaging of the result.
 
-**Data flow**: Takes `call_id`, the original `payload`, and `self` → serializes through `tool_output_response_item` with explicit success `Some(true)` and tool label `close_agent` → returns the response item.
+**Data flow**: It receives the tool call ID, the original payload, and the result object. It builds a response item labeled for `close_agent`, includes the result data, marks it as successful, and returns that response item.
 
-**Call relations**: Called by generic tool-output plumbing after the handler returns a typed result.
+**Call relations**: This is called through the shared tool-output path after the close operation has completed. It converts the internal result into the common response format expected by the surrounding conversation system.
 
 
 ##### `CloseAgentResult::code_mode_result`  (lines 138–140)
@@ -3779,20 +3793,22 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the JSON value form of the close result for code-mode consumers.
+**Purpose**: Formats the close-agent result for code-oriented output, where the caller expects structured JSON rather than a conversational response item.
 
-**Data flow**: Ignores the payload contents, serializes `self` through `tool_output_code_mode_result`, and returns the resulting `JsonValue`.
+**Data flow**: It receives the result object and the original payload, though it does not need the payload here. It converts the result into a JSON value labeled for the `close_agent` tool and returns that value.
 
-**Call relations**: Used by alternate output paths that want structured JSON rather than a response item.
+**Call relations**: This is another branch of the shared `ToolOutput` interface. When the environment wants a code-mode result instead of a normal response item or log preview, this method provides the structured version.
 
 
 ### `core/src/tools/handlers/multi_agents_v2.rs`
 
-`orchestration` · `request handling for MultiAgentV2 tools`
+`orchestration` · `request handling`
 
-This module is the umbrella entry point for the MultiAgentV2 handler family. It gathers the common imports needed by submodules—agent resolution, tool invocation/output types, argument parsing, event types, `AgentPath`, `UserInput`, and shared helper functions from `multi_agents_common`—then re-exports the concrete handler types from `followup_task`, `interrupt_agent`, `list_agents`, `send_message`, `spawn`, and `wait`. The file itself contains almost no control flow; its main role is to define the module tree and provide a single shared helper used by the messaging tools.
+This file exists so the rest of the codebase has one clear place to find the tools used for agent-to-agent collaboration. In this project, a “tool handler” is the code that runs when the model asks to use a named tool, such as spawning another agent, listing agents, sending a message, interrupting an agent, or waiting for one. Instead of making callers know about many separate files, this file collects those handlers and exposes them under clear names like SpawnAgentHandler and SendMessageHandler.
 
-That helper, `communication_from_tool_message`, standardizes how v2 tool-originated messages are encoded: it always creates an `InterAgentCommunication` with encrypted content, no secondary recipients, and `trigger_turn` initially set to `true`. Downstream code in `message_tool.rs` can then selectively flip `trigger_turn` off for queue-only delivery. This design centralizes the invariant that tool-supplied inter-agent messages should travel through the encrypted communication path, while allowing the delivery mode to vary between `send_message` and `followup_task`.
+It also declares the submodules that contain the actual work for each tool. Think of this file like a reception desk: it does not do every job itself, but it knows which office is responsible for each collaboration action.
+
+The one function here, communication_from_tool_message, performs a small but important translation. Tool calls work with plain fields such as author, recipient, and message text. The collaboration system expects an InterAgentCommunication object. This helper wraps the plain message into that structured form, marks it as encrypted, and says it should trigger a turn for the receiving agent. Without this conversion step, a message sent through a tool would not be in the format the agent communication system expects.
 
 #### Function details
 
@@ -3806,24 +3822,24 @@ fn communication_from_tool_message(
 ) -> InterAgentCommunication
 ```
 
-**Purpose**: Builds the canonical encrypted `InterAgentCommunication` object used by MultiAgentV2 messaging tools.
+**Purpose**: Turns a plain tool message into the structured message format used for communication between agents. Someone would use it when a tool has collected the sender, receiver, and text, and needs to hand that message to the collaboration system.
 
-**Data flow**: Takes an author `AgentPath`, recipient `AgentPath`, and plaintext message string; passes them to `InterAgentCommunication::new_encrypted` with an empty `other_recipients` vector and `trigger_turn = true`; returns the resulting communication value without mutating external state.
+**Data flow**: It receives the author agent path, the recipient agent path, and the message text. It packages those into a new encrypted InterAgentCommunication object, with no extra attached items, and marks the message as one that should wake or trigger the recipient agent. The output is the ready-to-send communication object.
 
-**Call relations**: Called by the shared v2 message-dispatch helper before delivery mode is applied, so both `send_message` and `followup_task` start from the same encrypted communication shape.
+**Call relations**: This helper sits between tool-level input and the lower-level inter-agent communication type. Its main handoff is to InterAgentCommunication::new_encrypted, which builds the final message object in the format the protocol expects.
 
 *Call graph*: calls 1 internal fn (new_encrypted); 1 external calls (new).
 
 
 ### `core/src/tools/handlers/multi_agents_v2/message_tool.rs`
 
-`domain_logic` · `request handling for v2 inter-agent messaging`
+`orchestration` · `request handling`
 
-This module factors out the common behavior of the two v2 messaging tools. `MessageDeliveryMode` is a small enum with `QueueOnly` and `TriggerTurn` variants; its `apply` method rewrites the `trigger_turn` field on an `InterAgentCommunication` while preserving all other fields. Two strict argument structs, `SendMessageArgs` and `FollowupTaskArgs`, both contain `target` and `message` and deny unknown fields, which is why legacy `items` or `interrupt` parameters fail parsing in v2.
+This file is a small but important piece of the multi-agent system. It is used when one agent wants to talk to another agent through a tool call. There are two closely related actions: a normal message, which is queued for the other agent, and a follow-up task, which should wake the other agent and make it start working right away. Rather than duplicate the same steps in two places, this file puts the common path in one function.
 
-The helper `message_content` enforces a simple but important invariant: after trimming whitespace, the message must not be empty. The main function, `handle_message_string_tool`, performs the full shared flow. It validates the message, destructures the invocation, resolves the target agent via `resolve_agent_target`, and loads metadata with `ensure_agent_known`. If the mode is `TriggerTurn`, it rejects root targets specifically for follow-up tasks. It also requires the target to have an `agent_path`, because path-based metadata is used for delivery and event reporting.
+The flow is like sending a package through an internal office mailroom. First, the file checks that the package is not empty. Then it resolves the written target name into the actual receiving agent thread. It verifies that the agent is known to the system, and for follow-up tasks it blocks one special case: the root agent cannot be given a follow-up task. After that, it prepares the receiving agent so it can resume work, builds the actual inter-agent communication message, and sends it through the agent control service.
 
-Before sending, it builds a resume config from the current `TurnContext` and calls `ensure_v2_agent_loaded`, allowing messages to reach unloaded-but-known agents. The author path comes from `turn.session_source.get_agent_path()` or defaults to `/root`. It then creates encrypted communication through `communication_from_tool_message`, applies the chosen delivery mode, sends it through `agent_control.send_inter_agent_communication`, and emits a `SubAgentActivityEvent` of kind `Interacted` with the original `call_id` and current timestamp. Success returns an empty-text `FunctionToolOutput` with `Some(true)`.
+The file also records that an interaction happened by sending a sub-agent activity event with a timestamp. This matters because other parts of the system can show or track agent activity. If this file were missing or wrong, agents could send blank messages, target invalid agents, wake the wrong agent, or fail to record that a handoff happened.
 
 #### Function details
 
@@ -3833,11 +3849,11 @@ Before sending, it builds a resume config from the current `TurnContext` and cal
 fn apply(self, communication: InterAgentCommunication) -> InterAgentCommunication
 ```
 
-**Purpose**: Adjusts whether an `InterAgentCommunication` should trigger the recipient's turn immediately or remain queued.
+**Purpose**: This function sets whether a message should simply wait in the target agent's queue or immediately wake that agent to take a turn. It turns the chosen delivery mode into the `trigger_turn` flag on the communication object.
 
-**Data flow**: Takes `self` and an existing `InterAgentCommunication`; returns a new struct using struct-update syntax that preserves all fields except `trigger_turn`, which is set to `false` for `QueueOnly` and `true` for `TriggerTurn`.
+**Data flow**: It receives a delivery mode and an already-built inter-agent communication. If the mode is `QueueOnly`, it returns the same communication with `trigger_turn` set to false. If the mode is `TriggerTurn`, it returns the communication with `trigger_turn` set to true.
 
-**Call relations**: Called inside `handle_message_string_tool` after the encrypted communication is constructed, so `send_message` and `followup_task` can share all other logic.
+**Call relations**: The shared message-sending function calls this right before handing the communication to the agent control service. In the larger flow, it is the final switch that makes `send_message` and `followup_task` behave differently even though they share the same sending pipeline.
 
 *Call graph*: called by 1 (handle_message_string_tool).
 
@@ -3848,11 +3864,11 @@ fn apply(self, communication: InterAgentCommunication) -> InterAgentCommunicatio
 fn message_content(message: String) -> Result<String, FunctionCallError>
 ```
 
-**Purpose**: Validates that a message string contains non-whitespace content.
+**Purpose**: This function rejects messages that are empty or contain only whitespace. It protects the rest of the agent messaging system from receiving meaningless blank communications.
 
-**Data flow**: Consumes a `String`, trims it for emptiness checking, returns `Err(FunctionCallError::RespondToModel(...))` if blank, otherwise returns the original string unchanged.
+**Data flow**: It receives the raw message text from the tool input. It trims the text only for checking whether anything real is there. If the message is blank, it returns an error that can be shown back to the model. Otherwise, it returns the original message unchanged.
 
-**Call relations**: Used at the start of `handle_message_string_tool` to reject empty messages before any target resolution or agent-control side effects occur.
+**Call relations**: The main shared message handler calls this as its first validation step. If this function finds a blank message, the flow stops immediately and no target lookup, agent loading, or message sending happens.
 
 *Call graph*: called by 1 (handle_message_string_tool); 1 external calls (RespondToModel).
 
@@ -3868,22 +3884,26 @@ async fn handle_message_string_tool(
 ) -> Result<FunctionToolOutput, FunctionCallError>
 ```
 
-**Purpose**: Implements the shared MultiAgentV2 message-delivery flow: validate message, resolve target, ensure the target agent is loaded, send encrypted communication with the requested delivery mode, emit an interaction event, and return an empty success output.
+**Purpose**: This is the shared workhorse for the multi-agent `send_message` and `followup_task` tools. It validates the message, finds and prepares the receiving agent, sends the communication, and records an activity event.
 
-**Data flow**: Consumes a `ToolInvocation`, `MessageDeliveryMode`, target string, and message string; validates the message via `message_content`; reads `session`, `turn`, and `call_id` from the invocation; resolves the target to a thread ID; reads agent metadata with `ensure_agent_known`; conditionally rejects root targets when `mode == TriggerTurn`; extracts the target `agent_path`; builds a resume config from `turn`; writes by calling `ensure_v2_agent_loaded(resume_config, receiver_thread_id)`; derives the author path from `turn.session_source` or `/root`; creates encrypted communication with `communication_from_tool_message`; rewrites `trigger_turn` via `mode.apply`; sends it through `send_inter_agent_communication`; emits `SubAgentActivityEvent { kind: Interacted, event_id: call_id, occurred_at_ms, agent_thread_id, agent_path }`; returns `FunctionToolOutput::from_text(String::new(), Some(true))`.
+**Data flow**: It receives the tool invocation context, the delivery mode, the target name, and the message text. It first checks that the message is not empty. Then it uses the current session and turn to resolve the target into a receiver thread, confirms the agent is known, blocks follow-up tasks to the root agent, loads the v2 agent if needed, and builds a communication from the sender to the receiver. It sends that communication with the chosen delivery behavior, emits an activity event with the current time and tool call id, and finally returns an empty successful tool output.
 
-**Call relations**: Called by both `send_message::Handler::handle_call` and `followup_task::Handler::handle_call`; it centralizes all shared behavior so those handlers differ only in argument type and delivery mode.
+**Call relations**: This function is called by the higher-level tool-call handler for both message-style tools. It delegates small pieces of work to helpers: `message_content` checks the text, `MessageDeliveryMode::apply` sets whether the receiver should wake up, and the agent control service performs the actual agent lookup, loading, and message delivery. After delivery, it reports the interaction back to the session event stream so the rest of the system can observe it.
 
 *Call graph*: calls 4 internal fn (from_text, apply, message_content, now_unix_timestamp_ms); called by 2 (handle_call, handle_call); 2 external calls (new, RespondToModel).
 
 
 ### `core/src/tools/handlers/multi_agents_v2/spawn.rs`
 
-`domain_logic` · `tool invocation during multi-agent request handling`
+`orchestration` · `request handling`
 
-This file defines the concrete executor for the `spawn_agent` function tool and the argument/result types that sit at the tool boundary. `Handler` stores `SpawnAgentToolOptions`, exposes the fixed tool name, builds the JSON schema via `create_spawn_agent_tool_v2`, and routes function payloads into the async `handle_spawn_agent` workflow. The main routine unpacks `ToolInvocation`, parses `SpawnAgentArgs`, derives a `SpawnAgentForkMode` from `fork_turns`, and normalizes `agent_type` into an optional role name. It converts the user-supplied message into an initial collaboration `Op`, computes child nesting depth from the current `session_source`, and builds a spawn config from base instructions plus turn context. 
+This file is the doorway between a model asking “please start another agent” and the system actually creating that agent. Without it, the `spawn_agent` tool could be advertised, but a tool call would not know how to turn the model’s JSON arguments into a real new agent thread.
 
-The control flow splits on fork mode: full-history forks reject role/model/reasoning overrides entirely, while non-full forks apply requested model overrides and then asynchronously apply the selected role to the config. Service tier and runtime overrides are layered afterward. The code then constructs a spawn source with canonical agent path metadata, fails if no canonical task name can be derived, and calls `agent_control.spawn_agent_with_metadata`. A notable branch rewrites plain-text `Op::UserInput` into `Op::InterAgentCommunication`, preserving author and recipient agent paths for agent-to-agent messaging. After spawn, it fetches a config snapshot to recover nickname metadata, emits a `SubAgentActivityKind::Started` event with a timestamp, increments telemetry tagged by role and version, and returns either full metadata or only `task_name` depending on `hide_spawn_agent_metadata`. `SpawnAgentArgs::fork_mode` enforces the MultiAgentV2 contract that `fork_context` is unsupported and that `fork_turns` must be `none`, `all`, or a positive integer string.
+The main `Handler` gives the tool its name, its public specification, and the code to run when the tool is called. The heavy work happens in `handle_spawn_agent`. It reads the tool arguments, checks whether the caller asked to fork no history, all history, or only the last few turns, then builds a configuration for the child agent. It can apply a requested role, model, reasoning effort, service tier, and runtime settings, while rejecting combinations that are not allowed for a full-history fork.
+
+Once the configuration is ready, it creates a “spawn source,” which is like a birth certificate for the new task: where it came from, how deep it is in the agent tree, and what its canonical task name is. It then asks the agent control service to start the child agent. If the initial message is plain text, the file wraps it as inter-agent communication so the child sees it as coming from its parent agent, not as an ordinary user message.
+
+After the spawn succeeds, it emits an activity event, records telemetry, and returns either the task name plus nickname or only the task name, depending on configuration.
 
 #### Function details
 
@@ -3893,11 +3913,11 @@ The control flow splits on fork mode: full-history forks reject role/model/reaso
 fn new(options: SpawnAgentToolOptions) -> Self
 ```
 
-**Purpose**: Constructs a spawn-agent handler with a specific set of tool-spec options. It is the only stateful initializer in the file, storing the options used later when advertising the tool schema.
+**Purpose**: Creates a new `spawn_agent` tool handler with the options that control how the tool is described and exposed. Someone uses this when wiring the tool into the runtime.
 
-**Data flow**: Takes a `SpawnAgentToolOptions` value by ownership and places it into the `Handler { options }` field. Returns the initialized `Handler` without side effects.
+**Data flow**: It receives `SpawnAgentToolOptions` as input, stores those options inside a new `Handler`, and returns that handler. Nothing else is changed.
 
-**Call relations**: Used when the tool registry wires up MultiAgentV2 handlers so later `spec` calls can render the correct schema and defaults.
+**Call relations**: This is the setup step for the handler. Later, the runtime calls the same handler’s `tool_name`, `spec`, `matches_kind`, and `handle` methods when it needs to advertise or execute the tool.
 
 
 ##### `Handler::tool_name`  (lines 26–28)
@@ -3906,11 +3926,11 @@ fn new(options: SpawnAgentToolOptions) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the externally visible function-tool name as `spawn_agent`. This is the identifier the runtime uses to match model tool calls to this executor.
+**Purpose**: Tells the tool system that this handler is for the tool named `spawn_agent`. This is how an incoming tool call is matched to the right code.
 
-**Data flow**: Reads no mutable state; converts the static string into a `ToolName` via `ToolName::plain` and returns it.
+**Data flow**: It takes the handler as input, builds a plain tool name from the text `spawn_agent`, and returns that name. It does not read or change the handler’s options.
 
-**Call relations**: Called by tool registration/runtime dispatch paths before execution so the handler can be indexed under the canonical tool name.
+**Call relations**: The tool runtime calls this while registering or matching tools. It hands off to `plain` to create the standard `ToolName` value used by the rest of the tool system.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -3921,11 +3941,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the `ToolSpec` for the spawn tool using the handler's configured options. This determines the schema and descriptive metadata exposed to the model.
+**Purpose**: Builds the public description of the `spawn_agent` tool: what arguments it accepts and how the model should call it. This is the menu entry the model sees before deciding to use the tool.
 
-**Data flow**: Clones `self.options`, passes the clone into `create_spawn_agent_tool_v2`, and returns the resulting `ToolSpec`.
+**Data flow**: It reads the handler’s stored options, clones them so the original handler keeps its copy, passes them into `create_spawn_agent_tool_v2`, and returns the resulting tool specification.
 
-**Call relations**: Invoked by the tool registry or discovery layer when publishing available tools; it delegates schema construction to the shared MultiAgentV2 spec helper.
+**Call relations**: The runtime calls this when it needs to publish the tool schema. The actual schema-building work is delegated to `create_spawn_agent_tool_v2`, while this handler supplies the options chosen at setup time.
 
 *Call graph*: calls 1 internal fn (create_spawn_agent_tool_v2); 1 external calls (clone).
 
@@ -3936,11 +3956,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the spawn workflow in the executor trait's boxed future shape. It converts the typed `SpawnAgentResult` into the generic boxed tool-output object expected by the runtime.
+**Purpose**: Starts the asynchronous work of carrying out a `spawn_agent` tool call. It adapts the real spawning function into the future-based shape expected by the tool runtime.
 
-**Data flow**: Consumes a `ToolInvocation`, starts an async block, awaits `handle_spawn_agent(invocation)`, maps the successful result through `boxed_tool_output`, and returns the boxed future.
+**Data flow**: It receives a `ToolInvocation`, wraps an async call to `handle_spawn_agent` in a pinned future, and arranges for a successful result to be boxed as normal tool output. The returned future will later produce either a tool result or an error.
 
-**Call relations**: This is the trait entrypoint called by the tool runtime after dispatch; it delegates all substantive work to `handle_spawn_agent`.
+**Call relations**: The tool runtime calls this when the model invokes `spawn_agent`. This method immediately hands the real work to `handle_spawn_agent`, which performs the argument parsing, configuration, spawning, event sending, and result creation.
 
 *Call graph*: calls 1 internal fn (handle_spawn_agent); 1 external calls (pin).
 
@@ -3953,11 +3973,11 @@ async fn handle_spawn_agent(
 ) -> Result<SpawnAgentResult, FunctionCallError>
 ```
 
-**Purpose**: Performs the full spawn-agent operation: parse arguments, validate fork semantics, assemble child config, spawn the agent, emit events/telemetry, and return the visible result payload. It contains the file's main business logic.
+**Purpose**: Does the full job of turning a `spawn_agent` tool call into a running child agent. It validates the request, prepares the child’s settings, starts the child thread, announces that it started, and returns the information the model should see.
 
-**Data flow**: Reads `session`, `turn`, `payload`, and `call_id` from `ToolInvocation`; parses function arguments into `SpawnAgentArgs`; derives `fork_mode`, `role_name`, `message`, and an initial `Op`; reads base instructions, session source, thread depth, turn config, environments, and service tier; mutates a local spawn config with requested overrides and role/runtime/service-tier adjustments; builds a spawn source and extracts a canonical `AgentPath`; invokes `session.services.agent_control.spawn_agent_with_metadata` with config, transformed initial operation, spawn metadata, and `SpawnAgentOptions`; then reads the spawned thread id and optional config snapshot to derive nickname, sends a `SubAgentActivityEvent`, records telemetry, and returns either `SpawnAgentResult::HiddenMetadata { task_name }` or `SpawnAgentResult::WithNickname { task_name, nickname }`.
+**Data flow**: It starts with the invocation: the current session, turn, raw tool payload, and call id. It extracts and parses the JSON arguments, decides the fork mode, builds the child agent configuration, applies requested role/model/service settings when allowed, and creates a spawn source with a canonical agent path. It then asks the agent control service to spawn the new agent, possibly converting a plain-text initial message into inter-agent communication. After the child is created, it reads a config snapshot to find a nickname, sends a started event, records telemetry, and returns either `{ task_name, nickname }` or just `{ task_name }` depending on whether metadata should be hidden.
 
-**Call relations**: Reached only from `Handler::handle`. Inside, it conditionally delegates to role/model/service-tier/runtime helpers depending on whether the request is a full-history fork, and it calls into agent-control services to actually create the child thread. Its event emission and telemetry recording happen only after a successful spawn.
+**Call relations**: This is called by `Handler::handle` whenever the tool is executed. It calls helpers such as `next_thread_spawn_depth` to place the child in the agent tree, `apply_role_to_config` to apply a named role, and `now_unix_timestamp_ms` to timestamp the started event. It also uses the session’s agent control service as the final handoff point where the new agent is actually created.
 
 *Call graph*: calls 2 internal fn (apply_role_to_config, now_unix_timestamp_ms); called by 1 (handle); 4 external calls (pin, from, next_thread_spawn_depth, matches!).
 
@@ -3968,11 +3988,11 @@ async fn handle_spawn_agent(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this runtime to function-style tool payloads. It prevents non-function payload variants from being considered compatible with the handler.
+**Purpose**: Says which kind of tool payload this handler accepts. For this handler, only function-style tool calls are valid.
 
-**Data flow**: Examines `payload` by pattern match and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload, checks whether it is a function payload, and returns `true` if it is and `false` otherwise. It does not change any state.
 
-**Call relations**: Used by the core tool runtime during dispatch/filtering before `handle` is invoked.
+**Call relations**: The runtime can call this before dispatching a tool call. It acts as a small gatekeeper so `Handler::handle` is only used for the payload shape it understands.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3983,11 +4003,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError>
 ```
 
-**Purpose**: Interprets the user-facing fork controls into an internal `Option<SpawnAgentForkMode>`. It also enforces the MultiAgentV2-specific prohibition on `fork_context`.
+**Purpose**: Turns the user-facing `fork_turns` argument into the internal choice for how much conversation history the new agent should inherit. It also rejects the older `fork_context` option, which is not supported in MultiAgentV2.
 
-**Data flow**: Reads `self.fork_context` and `self.fork_turns`; if `fork_context` is present, returns `FunctionCallError::RespondToModel`; otherwise trims `fork_turns`, defaults missing/empty values to `"all"`, maps `"none"` to `Ok(None)`, `"all"` to `Ok(Some(FullHistory))`, and parses any other string as a positive `usize` to produce `Ok(Some(LastNTurns(n)))`; parse failures or zero become model-facing errors.
+**Data flow**: It reads `fork_context` and `fork_turns` from the parsed arguments. If `fork_context` is present, it returns an error message for the model. If `fork_turns` is missing or empty, it treats it as `all`; `none` means no fork, `all` means full history, and a positive number means the last N turns. Invalid text or zero becomes a model-facing error.
 
-**Call relations**: Called from `handle_spawn_agent` early in request validation so later config-building and spawn-option assembly can branch on the chosen fork behavior.
+**Call relations**: `handle_spawn_agent` uses this early, before building the child agent. The returned fork mode controls later decisions, including whether model and role overrides are allowed and which spawn options are sent to the agent control service.
 
 *Call graph*: 2 external calls (LastNTurns, RespondToModel).
 
@@ -3998,11 +4018,11 @@ fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError>
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Formats the spawn result for logs as JSON text under the `spawn_agent` tool label. This keeps logging consistent with other tool outputs.
+**Purpose**: Creates a short JSON-style preview of the successful spawn result for logs. This helps operators inspect what happened without needing the full internal object.
 
-**Data flow**: Reads `self`, serializes it through the shared tool-output JSON helper, and returns the preview string.
+**Data flow**: It receives the result value, formats it as tool output text labeled for `spawn_agent`, and returns that string. It does not change the result.
 
-**Call relations**: Used by generic tool-output logging after `handle_spawn_agent` succeeds.
+**Call relations**: The tool output system calls this when it wants a log-friendly preview. It is part of the `ToolOutput` implementation that makes `SpawnAgentResult` usable as a standard tool response.
 
 
 ##### `SpawnAgentResult::success_for_logging`  (lines 252–254)
@@ -4011,11 +4031,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks every successful spawn result as loggable success. The result variants do not encode failure states, so this always returns `true`.
+**Purpose**: Marks every `SpawnAgentResult` value as a successful tool outcome for logging purposes. If this type exists as a result, the spawn operation has already succeeded.
 
-**Data flow**: Reads no external state and returns the constant boolean `true`.
+**Data flow**: It receives the result value and always returns `true`. No input fields are inspected and no state is changed.
 
-**Call relations**: Consumed by the logging/reporting layer when recording tool execution outcomes.
+**Call relations**: The logging layer calls this through the `ToolOutput` interface. It complements `log_preview` by telling logs that this response should be counted as a success.
 
 
 ##### `SpawnAgentResult::to_response_item`  (lines 256–258)
@@ -4024,11 +4044,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the typed spawn result into a protocol `ResponseInputItem` for the model-facing response stream. It preserves the original call id and tags the output as successful.
+**Purpose**: Converts the spawn result into the response item format that can be sent back through the protocol. This is what lets the model receive the tool result in the expected shape.
 
-**Data flow**: Takes `&self`, `call_id`, and the original `payload`; passes them to the shared response-item helper with `Some(true)` and the tool name `spawn_agent`; returns the constructed `ResponseInputItem`.
+**Data flow**: It receives the tool call id, the original payload, and the result. It packages the result as a `spawn_agent` tool output response item, marking it as successful, and returns that protocol item.
 
-**Call relations**: Called by the generic tool framework when serializing tool output back into the conversation protocol.
+**Call relations**: The tool runtime calls this after `handle_spawn_agent` returns successfully. It hands the formatting work to the shared tool-output helper so `spawn_agent` responses look like other tool responses.
 
 
 ##### `SpawnAgentResult::code_mode_result`  (lines 260–262)
@@ -4037,22 +4057,22 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the code-mode JSON representation of the spawn result. It uses the same shared serialization path as other tool outputs.
+**Purpose**: Converts the spawn result into a JSON value for code-mode consumers. Code mode needs machine-readable data rather than a display-oriented response item.
 
-**Data flow**: Reads `self`, ignores the payload contents, and returns a `JsonValue` generated by the shared code-mode helper for `spawn_agent`.
+**Data flow**: It receives the result and the original payload, ignores the payload, formats the result as JSON labeled for `spawn_agent`, and returns that JSON value.
 
-**Call relations**: Used when the runtime needs a structured code-mode result instead of a normal response item.
+**Call relations**: The tool system calls this when the result is needed in code-mode form. Like the other `SpawnAgentResult` output methods, it is part of making the result fit the common `ToolOutput` interface.
 
 
 ### `core/src/tools/handlers/multi_agents_v2/send_message.rs`
 
-`domain_logic` · `request handling for queued v2 agent messages`
+`io_transport` · `request handling`
 
-This file mirrors `followup_task.rs` but selects the non-waking delivery mode. The zero-sized `Handler` implements `ToolExecutor<ToolInvocation>` by returning the plain tool name `send_message`, exposing the schema from `create_send_message_tool`, and boxing an async call to `handle_call`. `CoreToolRuntime::matches_kind` limits dispatch to function payloads.
+This file is a small bridge between the tool system and the multi-agent message system. In this project, tools are actions that an agent can ask the runtime to perform. The `send_message` tool is the action for sending a message to another agent. Without this handler, the tool could still be described in the tool list, but calls to it would not know how to turn the raw request into an actual queued message.
 
-`Handler::handle_call` is intentionally thin. It clones the invocation payload to extract raw function arguments, deserializes them into `SendMessageArgs` with unknown fields denied, and then delegates to `handle_message_string_tool` with `MessageDeliveryMode::QueueOnly`. That shared helper performs all substantive work: empty-message validation, target resolution by path or ID, loading unloaded v2 agents if necessary, constructing encrypted `InterAgentCommunication`, setting `trigger_turn` to false for queue-only delivery, sending the communication through agent-control, and emitting a `SubAgentActivityEvent` of kind `Interacted`.
+The central piece is `Handler`, a lightweight object that tells the runtime three things: the tool is named `send_message`, its public shape comes from the shared tool specification, and calls to it should be processed by `handle_call`. When a call arrives, the handler first extracts the function-style arguments from the tool payload. It then parses those arguments into `SendMessageArgs`, which gives the code clear fields such as the target agent and the message text.
 
-The result is boxed tool output containing an empty text body and `success = Some(true)`. Because parsing is strict and the helper is shared, this tool inherits the v2 guarantees tested elsewhere: no legacy `items` or `interrupt` fields, encrypted transport, and no implicit wake-up of the target agent.
+After parsing, the handler passes the request to the shared message-sending helper, using `MessageDeliveryMode::QueueOnly`. That mode is important: it means the message is added to the recipient’s queue, like putting a letter in a mailbox, instead of trying to force the recipient to answer immediately. The file also tells the broader runtime that this handler only accepts function-call style tool payloads.
 
 #### Function details
 
@@ -4062,11 +4082,11 @@ The result is boxed tool output containing an empty text body and `success = Som
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registry name `send_message`.
+**Purpose**: This function tells the tool runtime the public name of this tool: `send_message`. The runtime uses that name to match an incoming tool request to this handler.
 
-**Data flow**: Constructs and returns a plain `ToolName` from the fixed string.
+**Data flow**: It takes the handler itself as input, reads no outside state, and creates a plain tool name containing `send_message`. The result is returned to the caller so the tool can be registered or looked up by name.
 
-**Call relations**: Used by the registry and dispatch layer to identify this handler.
+**Call relations**: This is part of the standard tool-executor interface. When the runtime is discovering or matching tools, it asks the handler for its name; this function builds that name using the shared plain-name helper.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4077,11 +4097,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Provides the tool specification for the v2 send-message function.
+**Purpose**: This function provides the formal description of the `send_message` tool. That description tells the system, and likely the model using the tool, what arguments the tool expects.
 
-**Data flow**: Calls `create_send_message_tool` and returns the resulting `ToolSpec`.
+**Data flow**: It takes the handler as input, reads no local state, and asks the shared multi-agent specification code to create the `send_message` tool definition. It returns that tool specification to the runtime.
 
-**Call relations**: Invoked when exposing the tool schema to the model/client.
+**Call relations**: During tool setup or exposure, the runtime asks this handler for its specification. Rather than defining the schema here, this function delegates to the shared `create_send_message_tool` builder so the handler and the advertised tool shape stay consistent.
 
 *Call graph*: calls 1 internal fn (create_send_message_tool).
 
@@ -4092,11 +4112,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async send-message implementation into the trait-required future type.
+**Purpose**: This function is the entry point used by the tool runtime when someone actually invokes `send_message`. It wraps the real async work so the runtime can run it later as a future, which is Rust’s way of representing work that may finish asynchronously.
 
-**Data flow**: Consumes a `ToolInvocation`, creates the future from `self.handle_call(invocation)`, pins and boxes it, and returns that future.
+**Data flow**: It receives a `ToolInvocation`, which contains the raw tool call and its payload. It turns the call into an asynchronous task by forwarding it to `handle_call`, boxes and pins that task so it has the shape the tool framework expects, and returns it.
 
-**Call relations**: This is the runtime entrypoint and delegates all behavior to `Handler::handle_call`.
+**Call relations**: The wider tool system calls this function after it has selected this handler for a request. This function does not parse or deliver the message itself; it hands the invocation to `Handler::handle_call`, which performs the actual work.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4110,11 +4130,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Parses `target` and `message` arguments and dispatches them as a queue-only encrypted inter-agent message.
+**Purpose**: This function performs the actual `send_message` work. It reads the tool call’s arguments, turns them into a target and message, and queues the message for delivery.
 
-**Data flow**: Reads `invocation.payload`, extracts function arguments, deserializes them into `SendMessageArgs`, then passes the full invocation plus parsed `target` and `message` into `handle_message_string_tool` with `MessageDeliveryMode::QueueOnly`; on success it wraps the returned `FunctionToolOutput` with `boxed_tool_output`.
+**Data flow**: It starts with a raw `ToolInvocation`. It extracts the function arguments from the payload, parses them into `SendMessageArgs`, then takes the target agent and message text from those parsed arguments. It passes those values, along with the original invocation and the `QueueOnly` delivery mode, to the shared message helper. If everything succeeds, the helper’s output is boxed into the standard tool-output form; if parsing or delivery fails, an error is returned.
 
-**Call relations**: Called only from `Handler::handle`; it delegates validation, target resolution, delivery, and event emission to the shared message helper because `send_message` differs from `followup_task` only in delivery mode.
+**Call relations**: This function is called by `Handler::handle` when the runtime is executing the tool. It relies on common argument parsing helpers before handing the real message operation to `handle_message_string_tool`, so the details of message queuing stay shared with related message tools.
 
 *Call graph*: calls 1 internal fn (handle_message_string_tool); called by 1 (handle).
 
@@ -4125,22 +4145,24 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this handler only accepts function-call payloads.
+**Purpose**: This function tells the core tool runtime which kind of payload this handler can accept. For this handler, only function-call payloads are valid.
 
-**Data flow**: Pattern-matches the `ToolPayload` and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload, checks whether it is the function-call variant, and returns `true` if it is or `false` otherwise. It does not change the payload or any stored state.
 
-**Call relations**: Used by the core runtime to filter incompatible payload kinds before dispatch.
+**Call relations**: The runtime can use this check before dispatching a tool request to the handler. It acts like a simple gatekeeper: only payloads shaped like function calls are allowed through to the rest of the `send_message` handling path.
 
 *Call graph*: 1 external calls (matches!).
 
 
 ### `core/src/tools/handlers/multi_agents_v2/followup_task.rs`
 
-`domain_logic` · `request handling for follow-up task submissions`
+`orchestration` · `tool invocation`
 
-This file defines a zero-sized `Handler` for the `followup_task` tool and wires it into the generic tool runtime traits. The `ToolExecutor` implementation supplies the plain tool name `followup_task`, returns the spec built by `create_followup_task_tool`, and boxes the async execution future. Actual behavior lives in `Handler::handle_call`: it first extracts raw function arguments from the invocation payload, deserializes them into `FollowupTaskArgs` with `deny_unknown_fields`, and then delegates to `handle_message_string_tool` with `MessageDeliveryMode::TriggerTurn`.
+This file is a small adapter between the tool system and the message-sending machinery used by multi-agent features. In plain terms, it teaches the runtime what the `followup_task` tool is called, what its input should look like, when it is allowed to run, and how to turn a tool call into an actual message.
 
-That choice of delivery mode is the key semantic difference from `send_message`: the resulting `InterAgentCommunication` should wake the target immediately if idle, and the shared helper also enforces the extra rule that follow-up tasks cannot target the root agent. The handler itself does not manipulate agent-control state directly; instead it relies on the shared message tool to resolve the target, ensure the v2 agent is loaded, send the encrypted communication, emit a `SubAgentActivityEvent`, and wrap the empty-success response as boxed tool output. `CoreToolRuntime::matches_kind` restricts this handler to function-style payloads only.
+The `Handler` is the main piece. When the tool runtime asks what tool this is, the handler answers `followup_task`. When the runtime needs a formal description of the tool, the handler returns the specification created elsewhere. When the tool is actually called, the handler reads the raw function-call payload, parses it into `FollowupTaskArgs`, and extracts two important fields: the target agent and the message to send.
+
+The key behavior is the delivery mode: this file sends the message with `MessageDeliveryMode::TriggerTurn`. That means the follow-up is not merely recorded like a note on a bulletin board; it is more like ringing someone’s doorbell so they know to act. Without this file, the runtime would not know how to recognize or execute `followup_task` calls, and follow-up work between agents would not be started through this tool.
 
 #### Function details
 
@@ -4150,11 +4172,11 @@ That choice of delivery mode is the key semantic difference from `send_message`:
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registry name for this tool as `followup_task`.
+**Purpose**: This tells the tool system the public name of this tool: `followup_task`. The name is how an incoming tool request is matched to this handler.
 
-**Data flow**: Reads no external state, constructs a plain `ToolName` from the fixed string, and returns it.
+**Data flow**: It takes no outside input beyond the handler itself. It creates a plain tool name from the text `followup_task` and returns that name to the tool registry or dispatcher.
 
-**Call relations**: Used by the tool registry when exposing or dispatching this handler.
+**Call relations**: When the tool system is deciding which executor belongs to a requested tool, it asks this handler for its name. This function uses `plain` to build the standard `ToolName` value that the rest of the runtime can compare.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4165,11 +4187,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Provides the JSON/tooling specification for the `followup_task` function.
+**Purpose**: This returns the formal description of the `followup_task` tool: what it is and what arguments it accepts. The runtime can use that description to expose the tool correctly to a model or caller.
 
-**Data flow**: Calls `create_followup_task_tool` and returns the resulting `ToolSpec` unchanged.
+**Data flow**: It receives only the handler. It calls `create_followup_task_tool`, which builds the tool specification, and returns that specification unchanged.
 
-**Call relations**: Invoked by registry/spec-generation code so callers see the correct v2 schema and description.
+**Call relations**: During setup or tool listing, the runtime asks this handler for its specification. This function delegates the details to `create_followup_task_tool`, keeping this file focused on connecting the tool definition to execution.
 
 *Call graph*: calls 1 internal fn (create_followup_task_tool).
 
@@ -4180,11 +4202,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation into the boxed future type required by `ToolExecutor`.
+**Purpose**: This is the standard entry point used when the `followup_task` tool is invoked. It starts the actual work asynchronously, meaning the runtime can wait for the result without blocking everything else.
 
-**Data flow**: Consumes a `ToolInvocation`, creates the future from `self.handle_call(invocation)`, boxes and pins it, and returns that future.
+**Data flow**: It receives a `ToolInvocation`, which contains the incoming tool call and its payload. It wraps the deeper `handle_call` operation in a pinned future, which is Rust’s way of packaging asynchronous work so the runtime can drive it to completion later.
 
-**Call relations**: This is the trait entrypoint called by the runtime; it delegates all real work to `Handler::handle_call`.
+**Call relations**: The tool runtime calls this when a matching tool invocation arrives. Rather than doing the parsing and sending itself, it hands the invocation to `Handler::handle_call`, which performs the real follow-up task behavior.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4198,11 +4220,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Parses `target` and `message` arguments for `followup_task` and dispatches them as a trigger-turn inter-agent message.
+**Purpose**: This performs the actual `followup_task` action. It reads the tool arguments, finds the intended target and message, and sends that message in a way that triggers the target to take a new turn.
 
-**Data flow**: Reads `invocation.payload`, extracts function arguments, deserializes them into `FollowupTaskArgs`, then passes the full invocation plus parsed `target` and `message` into `handle_message_string_tool` with `MessageDeliveryMode::TriggerTurn`; on success it wraps the returned `FunctionToolOutput` with `boxed_tool_output` and returns it.
+**Data flow**: It starts with a `ToolInvocation` containing a raw payload. It extracts the function arguments from that payload, parses them into `FollowupTaskArgs`, then passes the original invocation, the trigger-turn delivery mode, the target, and the message into `handle_message_string_tool`. The result is converted into the boxed tool-output form expected by the runtime, or an error is returned if argument extraction, parsing, or message delivery fails.
 
-**Call relations**: Called only from `Handler::handle`; it delegates validation, target resolution, delivery, and event emission to the shared message helper because `followup_task` differs from `send_message` only by delivery mode.
+**Call relations**: This function is called by `Handler::handle` after the runtime has dispatched the tool call here. It relies on shared message-tool code, `handle_message_string_tool`, to do the actual delivery so that follow-up messages behave consistently with other message-based tools.
 
 *Call graph*: calls 1 internal fn (handle_message_string_tool); called by 1 (handle).
 
@@ -4213,24 +4235,24 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this runtime only accepts function-call payloads.
+**Purpose**: This tells the core runtime which kind of tool payload this handler accepts. In this case, it only accepts function-style tool calls.
 
-**Data flow**: Examines the `ToolPayload` by pattern match and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a `ToolPayload` and checks whether it is a `Function` payload. It returns `true` for function payloads and `false` for other payload shapes.
 
-**Call relations**: Used by the core tool runtime to filter incompatible payload kinds before dispatch.
+**Call relations**: Before or during dispatch, the core tool runtime can ask whether this handler is suitable for a given payload. This function acts like a simple gatekeeper so the `followup_task` handler is only used for the kind of invocation its parsing code expects.
 
 *Call graph*: 1 external calls (matches!).
 
 
 ### `core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs`
 
-`domain_logic` · `request handling for agent interruption`
+`domain_logic` · `request handling`
 
-This file defines the v2 interrupt handler and its result type. The `Handler` itself is minimal: it advertises the tool name `interrupt_agent`, returns the spec from `create_interrupt_agent_tool_v2`, and boxes an async call to `handle_interrupt_agent`. The core logic destructures `ToolInvocation`, parses strict `InterruptAgentArgs { target }`, and resolves the target through `resolve_agent_target`, which allows either task-path or thread-ID addressing.
+This file is the control point for a tool named `interrupt_agent`. In this system, an agent can spawn other agents to work on subtasks. Sometimes a parent or coordinating agent needs to stop one of those workers early, for example because the work is no longer needed or the plan has changed. This file turns that tool request into a safe interruption.
 
-Once resolved, the handler asks agent-control to `ensure_agent_known`, then enforces two important invariants before sending any side effects: the target must not be the root agent (`agent_path.is_root()`), and the caller must not target its own `session.thread_id`. It also requires the target metadata to contain an `agent_path`, because that path is emitted in the activity event. The handler snapshots the current `AgentStatus`, then calls `interrupt_agent`. `ThreadNotFound` and `InternalAgentDied` are treated as acceptable terminal outcomes rather than hard failures, so callers still receive a successful response with the prior status. After a successful interrupt attempt, it emits a `SubAgentActivityEvent` of kind `Interrupted` with the original `call_id` and current timestamp.
+The main flow starts when the tool runtime calls the handler with a tool invocation. The code reads the tool arguments, finds the requested target agent, and checks that the target is a real known agent. It then refuses two unsafe cases: the root agent cannot be interrupted this way, and an agent cannot interrupt itself. That is like refusing to let a worker pull the main power switch, or cut their own phone line while still expected to report back.
 
-`InterruptAgentResult` is a small serializable wrapper around `previous_status`; its `ToolOutput` implementation consistently renders JSON text, marks logging success as true, and returns a successful response item and code-mode JSON payload.
+Before sending the interrupt, the file asks for the target agent’s current status. That status is returned later so the caller can understand what state the agent was in before the stop request. The interruption itself is sent through the shared agent control service. If the target is already gone or has died internally, the code treats that as acceptable, because the intended result is already true: the agent is no longer running normally. Finally, it emits an activity event so the rest of the session can see that the sub-agent was interrupted.
 
 #### Function details
 
@@ -4240,11 +4262,11 @@ Once resolved, the handler asks agent-control to `ensure_agent_known`, then enfo
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registry name `interrupt_agent` for this handler.
+**Purpose**: Returns the public name of this tool: `interrupt_agent`. The tool runtime uses this name to match an incoming tool call to this handler.
 
-**Data flow**: Constructs and returns a plain `ToolName` from a fixed string, without reading mutable state.
+**Data flow**: It takes no outside data beyond the handler itself. It creates a plain tool name from the text `interrupt_agent` and returns that name to the caller.
 
-**Call relations**: Used by the tool registry and dispatch layer to identify this handler.
+**Call relations**: When the tool system is building or looking up available tools, it asks this handler for its name. This function delegates the small job of constructing the name to the shared `plain` helper.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4255,11 +4277,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Supplies the v2 interrupt-agent tool specification.
+**Purpose**: Provides the formal description of the `interrupt_agent` tool, including what arguments it expects. This is what lets the model or tool runtime know how to call it correctly.
 
-**Data flow**: Calls `create_interrupt_agent_tool_v2` and returns the resulting `ToolSpec`.
+**Data flow**: It receives no input other than the handler. It asks `create_interrupt_agent_tool_v2` to build the tool specification and returns that specification.
 
-**Call relations**: Invoked when the runtime needs to expose the tool schema to the model or client.
+**Call relations**: The runtime calls this when it needs to advertise or validate the tool. Instead of defining the schema here, it hands that work to the shared multi-agent tool specification builder.
 
 *Call graph*: calls 1 internal fn (create_interrupt_agent_tool_v2).
 
@@ -4270,11 +4292,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the interrupt implementation in the boxed future expected by the tool runtime and converts the typed result into boxed output.
+**Purpose**: Starts the actual work when the `interrupt_agent` tool is invoked. It wraps the asynchronous interrupt operation in the future shape expected by the tool runtime.
 
-**Data flow**: Consumes a `ToolInvocation`, creates an async block that awaits `handle_interrupt_agent(invocation)`, maps the successful `InterruptAgentResult` through `boxed_tool_output`, and returns the pinned boxed future.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, current turn, raw tool payload, and call id. It passes that invocation into `handle_interrupt_agent`, waits for the result, and converts a successful result into the generic boxed tool output format used by the rest of the system.
 
-**Call relations**: This is the runtime entrypoint; it delegates all interrupt semantics to `handle_interrupt_agent`.
+**Call relations**: The tool runtime calls this after matching an incoming function-style tool call to this handler. This function is a thin bridge: it pins the asynchronous work so the runtime can drive it, and the real decision-making happens in `handle_interrupt_agent`.
 
 *Call graph*: calls 1 internal fn (handle_interrupt_agent); 1 external calls (pin).
 
@@ -4287,11 +4309,11 @@ async fn handle_interrupt_agent(
 ) -> Result<InterruptAgentResult, FunctionCallError>
 ```
 
-**Purpose**: Parses the target, validates it against root/self restrictions, interrupts the resolved agent, emits an interruption activity event, and returns the target's previous status.
+**Purpose**: Carries out the interruption request safely. It parses the requested target, verifies that the target can be interrupted, asks the agent-control service to interrupt it, records an activity event, and returns the target’s earlier status.
 
-**Data flow**: Reads `session`, `turn`, `payload`, and `call_id` from `ToolInvocation`; extracts function arguments and deserializes `InterruptAgentArgs`; resolves the target to a thread ID; loads agent metadata via `ensure_agent_known`; rejects root or self targets and missing `agent_path`; reads current status with `get_status`; calls `interrupt_agent`; treats `ThreadNotFound` and `InternalAgentDied` as non-fatal; emits `SubAgentActivityEvent { kind: Interrupted, event_id: call_id, occurred_at_ms, agent_thread_id, agent_path }` through `session.send_event`; returns `InterruptAgentResult { previous_status }`.
+**Data flow**: It starts with a full tool invocation. From that it reads the session, current turn, raw payload, and call id. It parses the payload into an argument object containing a target string, resolves that string into an agent id, checks that the agent is known, rejects root-agent and self-interrupt cases, reads the agent’s current status, then sends the interrupt request. After a successful or already-effectively-stopped result, it sends a session event with the time, target id, target path, and interruption kind. It returns an `InterruptAgentResult` containing the status observed before the interrupt.
 
-**Call relations**: Called only from `Handler::handle`; it depends on shared resolution/error helpers and delegates the actual interrupt side effect to `session.services.agent_control`.
+**Call relations**: This is called by `Handler::handle` when the tool is used. It relies on shared helpers to parse arguments and resolve the target, uses the session’s agent-control service for status lookup and interruption, calls `now_unix_timestamp_ms` to timestamp the activity event, and uses model-facing errors when the request is invalid. Its output is later formatted by the `InterruptAgentResult` tool-output methods.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_ms); called by 1 (handle); 1 external calls (RespondToModel).
 
@@ -4302,11 +4324,11 @@ async fn handle_interrupt_agent(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this handler to function-call payloads.
+**Purpose**: Says which kind of tool payload this handler accepts. This handler only accepts function-style tool calls.
 
-**Data flow**: Pattern-matches the provided `ToolPayload` and returns `true` only when it is `ToolPayload::Function { .. }`.
+**Data flow**: It receives a tool payload and checks its shape. It returns `true` if the payload is a function call and `false` otherwise.
 
-**Call relations**: Used by the core runtime before dispatching to this handler.
+**Call relations**: The core tool runtime uses this before routing work to the handler. It acts as a simple gate so non-function payloads are not sent into the interrupt-agent logic.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -4317,11 +4339,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Formats the interrupt result as JSON text for logs.
+**Purpose**: Creates a compact text version of the result for logs. This helps operators or developers see what the tool returned without needing the full response machinery.
 
-**Data flow**: Reads `self.previous_status`, passes `self` and the tool name to the shared JSON preview helper, and returns the resulting string.
+**Data flow**: It reads the `InterruptAgentResult`, especially the previous agent status inside it. It turns that data into JSON-like text labeled as output from `interrupt_agent` and returns the text.
 
-**Call relations**: Called by logging/reporting paths after a successful interrupt.
+**Call relations**: After `handle_interrupt_agent` succeeds, the tool framework can call this when writing logs. It uses the shared tool-output formatting path so logs look consistent with other tools.
 
 
 ##### `InterruptAgentResult::success_for_logging`  (lines 115–117)
@@ -4330,11 +4352,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks interrupt results as successful for logging purposes.
+**Purpose**: Reports that this result should be treated as a successful tool call in logs. If an `InterruptAgentResult` exists, the interruption request completed acceptably.
 
-**Data flow**: Reads no inputs beyond `self` and returns the constant `true`.
+**Data flow**: It does not need to inspect any fields. It simply returns `true`.
 
-**Call relations**: Used by generic tool-output logging to classify this result.
+**Call relations**: The logging layer calls this through the `ToolOutput` interface. Errors are handled before a result is created, so this result type always represents success from the logger’s point of view.
 
 
 ##### `InterruptAgentResult::to_response_item`  (lines 119–121)
@@ -4343,11 +4365,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Serializes the interrupt result into a successful `ResponseInputItem` for the model-facing response stream.
+**Purpose**: Converts the result into the response format sent back through the tool-calling conversation. This is how the caller learns the target agent’s previous status.
 
-**Data flow**: Takes `call_id` and original `payload`, passes `self`, `Some(true)`, and the tool name to `tool_output_response_item`, and returns the produced `ResponseInputItem`.
+**Data flow**: It receives the call id, the original tool payload, and the result data. It packages those into a response item marked as a successful `interrupt_agent` output and returns that response item.
 
-**Call relations**: Invoked by the tool runtime when converting this typed result into protocol output.
+**Call relations**: Once the handler has produced an `InterruptAgentResult`, the tool framework calls this to attach the result to the correct tool call. It delegates to the shared response-item formatter so this tool’s reply matches the system’s standard format.
 
 
 ##### `InterruptAgentResult::code_mode_result`  (lines 123–125)
@@ -4356,22 +4378,22 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the code-mode JSON representation of the interrupt result.
+**Purpose**: Converts the result into a JSON value for code-oriented tool output. This gives programmatic consumers a structured version instead of only human-readable text.
 
-**Data flow**: Ignores the payload contents, passes `self` and the tool name to `tool_output_code_mode_result`, and returns the resulting `JsonValue`.
+**Data flow**: It receives the original payload and the result object. It ignores the payload, serializes the result under the `interrupt_agent` tool name, and returns the JSON value.
 
-**Call relations**: Used when the runtime needs a structured code-mode result instead of a response item.
+**Call relations**: The tool framework calls this when it needs the result in code mode. It uses the shared code-mode formatter, keeping this tool’s structured output consistent with other tool handlers.
 
 
 ### `core/src/tools/handlers/multi_agents_v2/list_agents.rs`
 
-`domain_logic` · `request handling for agent enumeration`
+`orchestration` · `request handling`
 
-This file provides the v2 list-agents handler and a thin result type. The `Handler` advertises the tool name `list_agents`, returns the schema from `create_list_agents_tool`, and boxes an async call into `handle_call`. The actual implementation destructures the `ToolInvocation`, extracts function arguments, and parses them into `ListAgentsArgs { path_prefix: Option<String> }` with unknown fields denied.
+This file is the small bridge between a user-facing tool named `list_agents` and the system that keeps track of running or known agents. Without it, the model or client could request an agent list, but there would be no handler that understands the request, checks its arguments, asks the agent registry, and returns a usable response.
 
-Before listing, it calls `session.services.agent_control.register_session_root(session.thread_id, turn.parent_thread_id)`. That registration step is easy to miss but important: it tells agent-control how to interpret the current session's root context before path-based listing occurs. It then delegates to `agent_control.list_agents(&turn.session_source, args.path_prefix.as_deref())`, which returns a `Vec<ListedAgent>` already shaped for serialization. Errors from listing are translated through `collab_spawn_error`, and successful results are wrapped in `ListAgentsResult` and boxed.
+The flow is like asking a front desk for a list of available staff. The handler first identifies itself as the `list_agents` tool and provides the tool’s public description, so callers know how to invoke it. When a call arrives, it pulls out the session, turn, and payload. It reads the function arguments, parses them into `ListAgentsArgs`, and optionally uses a `path_prefix` to narrow the list. Before listing agents, it registers the session’s root thread with the agent-control service, so the service understands how this session is connected to the broader conversation.
 
-`ListAgentsResult` itself contains only `agents: Vec<ListedAgent>` and implements `ToolOutput` using the shared JSON helpers. Like other successful management tools, it always logs as successful and emits a response item with `success = Some(true)`. The file therefore acts as a narrow adapter between strict argument parsing, session-root registration, and the lower-level agent-control listing API.
+The actual lookup is delegated to `agent_control.list_agents`, which is the service that knows about agents. This handler then wraps the returned `ListedAgent` entries in `ListAgentsResult`. That result knows how to turn itself into logs, normal tool responses, and code-mode JSON output. The file is intentionally focused: it does not decide what an agent is; it just validates the request, calls the right service, and formats the answer.
 
 #### Function details
 
@@ -4381,11 +4403,11 @@ Before listing, it calls `session.services.agent_control.register_session_root(s
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registry name `list_agents`.
+**Purpose**: Returns the public name of this tool: `list_agents`. The tool framework uses this name to match incoming tool calls to this handler.
 
-**Data flow**: Constructs a plain `ToolName` from the fixed string and returns it.
+**Data flow**: It takes no outside data beyond the handler itself. It creates a plain tool name from the text `list_agents` and returns it to the tool runtime.
 
-**Call relations**: Used by the registry and dispatch layer to identify this tool.
+**Call relations**: When the tool system is discovering or dispatching tools, it asks this handler for its name. This function hands back the label that lets the wider system recognize calls meant for the list-agents feature.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4396,11 +4418,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Provides the tool specification for the list-agents function.
+**Purpose**: Returns the formal description of how the `list_agents` tool should be called. This description tells callers what arguments are allowed and what the tool is for.
 
-**Data flow**: Calls `create_list_agents_tool` and returns the resulting `ToolSpec`.
+**Data flow**: It takes no request data. It calls the shared tool-spec builder for `list_agents` and returns the resulting specification.
 
-**Call relations**: Invoked when exposing the tool schema to callers.
+**Call relations**: The tool framework calls this when it needs to advertise or validate available tools. This function delegates the details to `create_list_agents_tool`, keeping the handler aligned with the shared multi-agent tool definition.
 
 *Call graph*: calls 1 internal fn (create_list_agents_tool).
 
@@ -4411,11 +4433,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async list-agents implementation into the trait-required future type.
+**Purpose**: Starts processing one incoming `list_agents` tool call. It wraps the real async work so the tool framework can wait for it in the standard way.
 
-**Data flow**: Consumes a `ToolInvocation`, creates the future from `self.handle_call(invocation)`, pins and boxes it, and returns that future.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn information, and raw tool payload. It passes that invocation into `handle_call`, pins the async task so it can be safely driven by the runtime, and returns that future.
 
-**Call relations**: This is the trait entrypoint and delegates all behavior to `Handler::handle_call`.
+**Call relations**: The tool runtime calls this after it has chosen this handler for a request. This function immediately hands the real work to `Handler::handle_call`, acting as the adapter between the runtime’s expected shape and the handler’s async logic.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4429,11 +4451,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Parses the optional path-prefix filter, registers the session root, queries agent-control for visible agents, and returns them as boxed tool output.
+**Purpose**: Performs the actual `list_agents` request: it reads the tool arguments, asks the agent-control service for matching agents, and returns the result as tool output.
 
-**Data flow**: Reads `session`, `turn`, and `payload` from the invocation; extracts function arguments; deserializes `ListAgentsArgs`; writes session-root metadata via `register_session_root(session.thread_id, turn.parent_thread_id)`; awaits `list_agents(&turn.session_source, args.path_prefix.as_deref())`; maps any error through `collab_spawn_error`; wraps the resulting `Vec<ListedAgent>` in `ListAgentsResult` and `boxed_tool_output`.
+**Data flow**: It receives a full tool invocation. From that, it takes the session, the current turn, and the payload. It extracts function arguments from the payload, parses them into `ListAgentsArgs`, records the relationship between the session thread and parent thread, then asks `agent_control` for agents visible from the turn’s session source, optionally filtered by `path_prefix`. If the service succeeds, it wraps the agent list in `ListAgentsResult`; if the service reports a spawn or collaboration error, it converts that into a tool-call error.
 
-**Call relations**: Called only from `Handler::handle`; it delegates the actual enumeration/filtering logic to `agent_control.list_agents` after establishing root context.
+**Call relations**: This is called by `Handler::handle` whenever the `list_agents` tool is invoked. It sits between the generic tool system and the agent-control subsystem: the tool system supplies the invocation, this function translates it into an agent-control query, and the result is handed back as standardized tool output.
 
 *Call graph*: called by 1 (handle).
 
@@ -4444,11 +4466,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this handler only accepts function payloads.
+**Purpose**: Says whether this handler can process a particular kind of tool payload. Here, it accepts function-style payloads.
 
-**Data flow**: Pattern-matches the `ToolPayload` and returns `true` for `ToolPayload::Function { .. }` only.
+**Data flow**: It receives a `ToolPayload` and checks whether it is the `Function` form. It returns `true` for function payloads and `false` for anything else.
 
-**Call relations**: Used by the core runtime to gate dispatch.
+**Call relations**: The core tool runtime uses this as a quick compatibility check before routing a payload to the handler. It keeps this handler from being used for payload shapes it does not understand.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -4459,11 +4481,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Formats the list-agents result as JSON text for logs.
+**Purpose**: Creates a readable log version of the agent-list result. This lets logs show what the tool returned without each caller inventing its own formatting.
 
-**Data flow**: Reads `self.agents`, passes `self` and the tool name to the shared preview helper, and returns the generated string.
+**Data flow**: It reads the `ListAgentsResult`, including its list of agents. It converts the result into the standard JSON-style text used for `list_agents` log previews and returns that string.
 
-**Call relations**: Used by generic logging after successful list-agents execution.
+**Call relations**: After `handle_call` produces a `ListAgentsResult`, the tool framework can call this when recording the outcome. It relies on the shared tool-output formatting helper so logs for this tool look like logs from other tools.
 
 
 ##### `ListAgentsResult::success_for_logging`  (lines 72–74)
@@ -4472,11 +4494,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks list-agents results as successful in logs.
+**Purpose**: Reports that this result represents a successful tool call for logging purposes. A successfully created `ListAgentsResult` means the agent list request completed.
 
-**Data flow**: Returns the constant `true` without consulting mutable state.
+**Data flow**: It does not need to inspect any fields. It simply returns `true`, marking the result as successful in logs.
 
-**Call relations**: Consumed by generic tool-output logging infrastructure.
+**Call relations**: The logging path calls this when it needs to label the tool outcome. Errors are handled before a `ListAgentsResult` is produced, so this result type always logs as success.
 
 
 ##### `ListAgentsResult::to_response_item`  (lines 76–78)
@@ -4485,11 +4507,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Serializes the list-agents result into a successful response item.
+**Purpose**: Turns the agent-list result into the response item format sent back through the tool system. This is how the raw list becomes something the caller can receive as a tool response.
 
-**Data flow**: Takes `call_id` and original `payload`, passes `self`, `Some(true)`, and the tool name to `tool_output_response_item`, and returns the resulting `ResponseInputItem`.
+**Data flow**: It receives the tool call ID, the original payload, and the result data. It combines those with the serialized agent list, marks the response as successful, labels it as `list_agents`, and returns a `ResponseInputItem`.
 
-**Call relations**: Called by the runtime when emitting the tool result back to the model/client.
+**Call relations**: Once `handle_call` has returned the result, the surrounding tool machinery uses this function to build the actual response object. It passes the formatting work to the shared response helper so the output follows the same pattern as other tools.
 
 
 ##### `ListAgentsResult::code_mode_result`  (lines 80–82)
@@ -4498,20 +4520,22 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the structured code-mode JSON form of the list-agents result.
+**Purpose**: Produces the JSON value used when the system is operating in code-oriented mode. This gives code-mode consumers a structured version of the same agent-list result.
 
-**Data flow**: Ignores payload contents, passes `self` and the tool name to `tool_output_code_mode_result`, and returns the resulting `JsonValue`.
+**Data flow**: It reads the `ListAgentsResult` and ignores the payload because the result does not need extra context. It serializes the agent list under the standard `list_agents` tool-result shape and returns it as JSON.
 
-**Call relations**: Used by code-mode consumers that want structured JSON instead of a response item.
+**Call relations**: Code-mode output paths call this after the handler has produced a result. It uses the common code-mode formatting helper so `list_agents` behaves consistently with other tools in that mode.
 
 
 ### `core/src/tools/handlers/multi_agents_v2/wait.rs`
 
-`domain_logic` · `tool invocation during multi-agent coordination/wait states`
+`domain_logic` · `request handling`
 
-This file provides the waiting side of MultiAgentV2 coordination. `Handler` stores timeout-related spec options, exposes the `wait_agent` tool name and schema, and routes execution into `handle_call`. The handler parses `WaitArgs`, then clamps the requested `timeout_ms` against per-turn configuration: values below `min_wait_timeout_ms` or above `max_wait_timeout_ms` are rejected with model-facing errors, while omitted values fall back to `default_wait_timeout_ms`. 
+In a multi-agent conversation, one agent may need to stop and wait for another agent, a mailbox update, or new steering input from the user. This file provides that waiting behavior. Without it, an agent would either keep checking repeatedly like someone refreshing an inbox, or it could get stuck waiting too long with no clear result.
 
-Before sleeping, the code queries the session input queue for the current sub-turn state and subscribes to activity updates. That subscription returns both a watch receiver and an optional already-pending `InputQueueActivity`; this is important because the implementation avoids missing activity that arrived just before subscription. It emits a `CollabWaitingBeginEvent` with the current thread id, empty receiver lists, and a timestamp, computes a Tokio `Instant` deadline from the validated timeout, and delegates the actual blocking logic to `wait_for_activity`. The resulting `WaitOutcome` is converted into a user-visible `WaitAgentResult` whose `message` distinguishes mailbox activity, steering interruption, and timeout, while `timed_out` is only true for the timeout case. Finally, it emits `CollabWaitingEndEvent` and boxes the result. The helper `wait_for_activity` first consumes pending activity immediately, otherwise waits on `activity_rx.changed()` under `timeout_at`; both channel closure and elapsed timeout are treated as `TimedOut`, which keeps the tool behavior simple and deterministic.
+The main piece is `Handler`, which plugs into the tool system under the name `wait_agent`. When the model calls this tool, the handler reads the requested `timeout_ms`, checks it against configured minimum and maximum limits, and falls back to a default timeout if none is provided. It then subscribes to activity from the session input queue. That activity can mean either mailbox activity, which is a normal “something arrived” wake-up, or steering input, which means the wait was interrupted by new direction.
+
+Before waiting, the handler sends a “waiting began” event. After waiting finishes, it sends a “waiting ended” event. This is like turning on and off a waiting-room sign so the rest of the system can see what happened. The result returned to the model is a small JSON object with a plain message and a `timed_out` flag. The low-level waiting is done by `wait_for_activity`, which first checks whether activity was already pending, then waits only until the deadline.
 
 #### Function details
 
@@ -4521,11 +4545,11 @@ Before sleeping, the code queries the session input queue for the current sub-tu
 fn new(options: WaitAgentTimeoutOptions) -> Self
 ```
 
-**Purpose**: Constructs a wait-agent handler with the configured timeout-spec options. Those options are later used only when publishing the tool schema.
+**Purpose**: Creates a new `wait_agent` handler with the timeout options that should be shown in its tool description. This is used when the tool is being registered or set up.
 
-**Data flow**: Takes `WaitAgentTimeoutOptions` by value, stores it in `Handler { options }`, and returns the new handler.
+**Data flow**: It receives `WaitAgentTimeoutOptions` as input, stores those options inside a new `Handler`, and returns that ready-to-use handler. It does not start any waiting by itself.
 
-**Call relations**: Used during tool registration so the runtime can instantiate a handler whose `spec` reflects deployment-specific timeout settings.
+**Call relations**: This is the construction step before the tool can be used. Later, the tool system calls methods such as `Handler::tool_name`, `Handler::spec`, and `Handler::handle` on the handler it created here.
 
 
 ##### `Handler::tool_name`  (lines 24–26)
@@ -4534,11 +4558,11 @@ fn new(options: WaitAgentTimeoutOptions) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical tool name `wait_agent`. This is the dispatch key for model-issued function calls.
+**Purpose**: Tells the tool system that this handler is responsible for the tool named `wait_agent`. The name is how a model’s tool call is matched to this code.
 
-**Data flow**: Creates and returns a `ToolName` from the static string via `ToolName::plain`.
+**Data flow**: It takes no outside data except the handler itself, builds a plain tool name from the text `wait_agent`, and returns that name to the tool registry.
 
-**Call relations**: Queried by the tool registry/runtime before execution.
+**Call relations**: The tool framework calls this when it needs to identify or register the handler. It uses the shared `plain` helper to turn the string into the project’s `ToolName` type.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4549,11 +4573,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the advertised schema for the wait tool. The schema is parameterized by the handler's timeout options.
+**Purpose**: Provides the public description of the `wait_agent` tool, including its accepted arguments and timeout limits. This is what tells the model how it is allowed to call the tool.
 
-**Data flow**: Reads `self.options`, passes it to `create_wait_agent_tool_v2`, and returns the resulting `ToolSpec`.
+**Data flow**: It reads the timeout options stored in the handler, passes them to `create_wait_agent_tool_v2`, and returns the resulting tool specification.
 
-**Call relations**: Called when the system enumerates available tools for the model.
+**Call relations**: The tool framework calls this during tool setup or exposure to the model. It hands off to `create_wait_agent_tool_v2`, which builds the actual `ToolSpec` object.
 
 *Call graph*: calls 1 internal fn (create_wait_agent_tool_v2).
 
@@ -4564,11 +4588,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async wait implementation to the executor trait's boxed-future interface. It does not perform validation itself.
+**Purpose**: Starts processing one actual `wait_agent` tool call. It wraps the real asynchronous work so the wider tool system can run it in the expected form.
 
-**Data flow**: Takes a `ToolInvocation`, calls `self.handle_call(invocation)`, boxes the future with `Box::pin`, and returns it.
+**Data flow**: It receives a `ToolInvocation`, passes it into `handle_call`, pins the future so it can be safely awaited by the runtime, and returns that future. The result will eventually be either a tool output or an error.
 
-**Call relations**: This is the runtime entrypoint; all substantive work is delegated to `Handler::handle_call`.
+**Call relations**: The tool framework calls this when the model invokes `wait_agent`. This function does not do the waiting itself; it immediately hands the job to `Handler::handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4582,11 +4606,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes a `wait_agent` request end to end: parse timeout, subscribe to queue activity, emit waiting events, block until activity or timeout, and return a structured result. It is the main control-flow function in the file.
+**Purpose**: Performs the full `wait_agent` operation: read the requested timeout, validate it, wait for activity or timeout, send lifecycle events, and return a clear result. This is the heart of the file.
 
-**Data flow**: Reads `session`, `turn`, `payload`, and `call_id` from the invocation; parses `WaitArgs`; reads min/max/default timeout settings from `turn.config.multi_agent_v2`; validates or defaults `timeout_ms`; queries `session.input_queue` for turn state and subscribes to activity, receiving a watch receiver plus optional pending activity; sends a `CollabWaitingBeginEvent` timestamped with `now_unix_timestamp_ms`; computes a deadline from `Instant::now()` plus `Duration::from_millis`; awaits `wait_for_activity`; converts the returned `WaitOutcome` with `WaitAgentResult::from_outcome`; sends a matching `CollabWaitingEndEvent`; and returns the boxed result.
+**Data flow**: It receives a tool invocation containing the session, turn, call id, and raw payload. It extracts and parses the arguments, chooses a timeout using the turn configuration, rejects values outside the allowed range, subscribes to input-queue activity, sends a waiting-started event, waits until activity or the deadline, converts the outcome into `WaitAgentResult`, sends a waiting-ended event, and returns the result as tool output. If the timeout argument is invalid, it returns an error message meant for the model.
 
-**Call relations**: Called only from `Handler::handle`. It delegates the blocking/wakeup logic to `wait_for_activity` and the user-facing message mapping to `WaitAgentResult::from_outcome`.
+**Call relations**: This is called by `Handler::handle` for each tool call. It relies on `wait_for_activity` for the actual sleeping-and-waking behavior, uses `WaitAgentResult::from_outcome` to make the model-facing result, and uses timestamp helpers when sending begin and end events to the session.
 
 *Call graph*: calls 2 internal fn (wait_for_activity, now_unix_timestamp_ms); called by 1 (handle); 7 external calls (from_millis, new, now, new, from_outcome, format!, RespondToModel).
 
@@ -4597,11 +4621,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this handler only accepts function payloads. This keeps dispatch aligned with the tool's schema-driven invocation style.
+**Purpose**: Says which kind of tool payload this handler accepts. Here, it only accepts function-style tool calls.
 
-**Data flow**: Pattern-matches `payload` and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a `ToolPayload`, checks whether it is a `Function` payload, and returns `true` if it is or `false` otherwise. It does not modify the payload.
 
-**Call relations**: Used by the core runtime before invoking `handle`.
+**Call relations**: The core tool runtime uses this as a quick filter before routing work to the handler. It protects this handler from being asked to process payload shapes it does not understand.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -4612,11 +4636,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn from_outcome(outcome: WaitOutcome) -> Self
 ```
 
-**Purpose**: Maps an internal `WaitOutcome` enum into the externally returned message and timeout flag. It centralizes the wording for all wait completions.
+**Purpose**: Turns the internal wait outcome into the small response object returned to the model. It converts system-specific events into plain messages such as “Wait completed” or “Wait timed out.”
 
-**Data flow**: Consumes a `WaitOutcome`, selects one of three fixed strings (`Wait completed.`, `Wait interrupted by new input.`, `Wait timed out.`), computes `timed_out` by equality check against `WaitOutcome::TimedOut`, and returns a populated `WaitAgentResult`.
+**Data flow**: It receives a `WaitOutcome`, chooses the matching human-readable message, sets `timed_out` to `true` only for the timeout case, and returns a `WaitAgentResult` containing both values.
 
-**Call relations**: Called from `Handler::handle_call` immediately after the wait finishes so the internal wakeup reason can be exposed as tool output.
+**Call relations**: After `Handler::handle_call` gets a result from `wait_for_activity`, it calls this function to prepare the final tool output. This keeps the low-level waiting result separate from the response format shown to the model.
 
 
 ##### `WaitAgentResult::log_preview`  (lines 147–149)
@@ -4625,11 +4649,11 @@ fn from_outcome(outcome: WaitOutcome) -> Self
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Serializes the wait result into a JSON log preview labeled as `wait_agent`. This gives logs the same shape as the response payload.
+**Purpose**: Creates a compact JSON-style preview of the result for logs. This lets developers or operators see what the tool returned without changing the actual model response.
 
-**Data flow**: Reads `self`, passes it to the shared JSON-text helper, and returns the resulting string.
+**Data flow**: It reads the `WaitAgentResult`, formats it with the tool name `wait_agent`, and returns the formatted text. It does not change the result.
 
-**Call relations**: Used by generic tool-output logging after successful execution.
+**Call relations**: The tool output system calls this when it needs a log-friendly summary. It delegates the formatting to the shared `tool_output_json_text` helper.
 
 
 ##### `WaitAgentResult::success_for_logging`  (lines 151–153)
@@ -4638,11 +4662,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks all returned wait results as successful from the logging perspective. Even a timeout is represented as a normal tool outcome rather than an execution failure.
+**Purpose**: Marks every completed `wait_agent` result as successful for logging purposes. Even a timeout is considered a valid tool outcome, not a tool failure.
 
-**Data flow**: Returns the constant boolean `true`.
+**Data flow**: It takes the result object and always returns `true`. It does not inspect or modify the message or timeout flag.
 
-**Call relations**: Consumed by the framework's logging layer.
+**Call relations**: The logging layer calls this when deciding how to classify the tool output. This matters because `timed_out: true` is useful information, but it is not treated as an execution error.
 
 
 ##### `WaitAgentResult::to_response_item`  (lines 155–157)
@@ -4651,11 +4675,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the typed wait result into a protocol response item. Unlike some tools, it leaves the explicit success flag unset.
+**Purpose**: Converts the wait result into the response-item format used to send tool output back through the conversation system. This is the model-facing packaging step.
 
-**Data flow**: Takes `&self`, `call_id`, and `payload`; forwards them to the shared response-item helper with `None` for success and the tool label `wait_agent`; returns the resulting `ResponseInputItem`.
+**Data flow**: It receives the call id, original payload, and the result itself. It passes those into a shared response-building helper with the tool name `wait_agent`, and returns a `ResponseInputItem` ready to be inserted into the response flow.
 
-**Call relations**: Called by the tool framework when emitting the tool result back into the conversation stream.
+**Call relations**: The tool framework calls this after the handler has produced a `WaitAgentResult`. It hands off to `tool_output_response_item` so this tool’s output is shaped the same way as other tool outputs.
 
 
 ##### `WaitAgentResult::code_mode_result`  (lines 159–161)
@@ -4664,11 +4688,11 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the structured JSON result used in code mode. It mirrors the normal serialized result.
+**Purpose**: Provides the wait result as JSON for code-oriented execution modes. This gives other parts of the system a structured value instead of only display text.
 
-**Data flow**: Reads `self`, ignores the payload, and returns a `JsonValue` from the shared code-mode helper for `wait_agent`.
+**Data flow**: It reads the `WaitAgentResult`, combines it with the tool name `wait_agent`, and returns a JSON value. The payload argument is not used here.
 
-**Call relations**: Used by code-mode response generation paths.
+**Call relations**: The tool output system calls this when it needs a machine-readable result. It delegates the JSON formatting to the shared `tool_output_code_mode_result` helper.
 
 
 ##### `wait_for_activity`  (lines 171–189)
@@ -4681,11 +4705,11 @@ async fn wait_for_activity(
 ) -> WaitOutcome
 ```
 
-**Purpose**: Waits for either already-pending input-queue activity, a future watch-channel change before the deadline, or timeout/channel closure. It reduces queue activity into the internal `WaitOutcome` enum.
+**Purpose**: Waits until there is input-queue activity or until the deadline passes. It is the small, focused helper that decides whether the wait ended because of mailbox activity, steering input, or timeout.
 
-**Data flow**: Takes a mutable watch `Receiver<InputQueueActivity>`, an optional `pending_activity`, and a Tokio `Instant` deadline. If `pending_activity` is present, it immediately maps `Mailbox` to `MailboxActivity` and `Steer` to `Steered`. Otherwise it awaits `timeout_at(deadline, activity_rx.changed())`; on a successful change it reads the latest activity via `borrow_and_update()` and maps it to `MailboxActivity` or `Steered`; on timeout or receiver error it returns `TimedOut`.
+**Data flow**: It receives a watch receiver for future activity, an optional already-pending activity item, and a deadline. If pending activity already exists, it returns the matching outcome immediately. Otherwise, it waits for the receiver to report a change before the deadline; if activity arrives, it reads whether it was mailbox activity or steering input, and if no activity arrives in time or the channel closes, it returns `TimedOut`.
 
-**Call relations**: Called from `Handler::handle_call` after subscription setup. It encapsulates the race-sensitive waiting logic so the handler can focus on validation and event emission.
+**Call relations**: This is called by `Handler::handle_call` after the handler has subscribed to the session input queue and calculated the deadline. It uses Tokio’s timeout and watch-channel tools to do the actual waiting, then hands a simple `WaitOutcome` back to the handler.
 
 *Call graph*: called by 1 (handle_call); 3 external calls (borrow_and_update, changed, timeout_at).
 
@@ -4695,13 +4719,15 @@ These files cover higher-level nested-session workflows that run delegated child
 
 ### `core/src/codex_delegate.rs`
 
-`orchestration` · `subagent thread execution / delegated request handling`
+`orchestration` · `active while a delegated sub-agent session is being started, run, and shut down`
 
-This file is the delegation/orchestration layer for spawning and supervising sub-agent Codex sessions. `run_codex_thread_interactive` creates bounded submission/event channels, derives inherited context from the parent session and turn context, spawns a child `Codex` with `SessionSource::SubAgent(...)`, emits analytics for the new subagent session, and launches two background tasks: one to forward child events outward while intercepting approval-style events, and one to forward caller submissions into the child. `run_codex_thread_one_shot` wraps that interactive mode, immediately submits a `UserInput` op, then bridges events until `TurnComplete` or `TurnAborted`, at which point it sends `Op::Shutdown` and cancels the child token; it also returns a deliberately closed submission channel so callers cannot send more ops.
+This file is the bridge between a parent Codex session and a delegated child Codex session. A useful way to picture it is a manager sending an assistant to do a task: the assistant can work independently, but any request to run a risky command, edit files, ask the user, or use protected tools must come back through the manager.
 
-The event-forwarding path is selective. `forward_events` suppresses token-count and session-configured noise, routes exec/apply-patch approvals, request-permissions, and request-user-input events back through the parent session, and caches `McpInvocation`s between `McpToolCallBegin` and `McpToolCallEnd` so legacy MCP approval prompts can be reconstructed for guardian review. Cancellation triggers `shutdown_delegate`, which sends `Interrupt` then `Shutdown` and drains events briefly to avoid background send failures.
+The main entry points create a sub-agent with inherited settings from the parent, such as user instructions, environments, execution policy, tools, plugins, and analytics context. They then set up two pipes: one pipe carries user operations into the child, and the other carries child events back out.
 
-The helper functions implement the concrete round trips: approval requests may go through guardian review or ordinary parent-session prompts; request-user-input can be auto-answered for delegated MCP approvals; permission and user-input waits synthesize empty responses on cancellation and notify the parent session accordingly. The key invariant is that child approval events are never surfaced directly to the consumer—they are resolved through the parent and answered back into the child session.
+Most child events are simply forwarded. Some are deliberately intercepted. Approval requests, permission requests, and user-input prompts are routed through the parent session. If a Guardian reviewer is active, Guardian can decide whether a command, patch, or tool call is safe. Otherwise the parent’s normal approval flow is used. The child then receives a clear answer and continues.
+
+The file also pays attention to cancellation. If the parent cancels, or the receiver goes away, the child is interrupted and shut down so background tasks do not keep running or send into closed channels.
 
 #### Function details
 
@@ -4716,11 +4742,11 @@ async fn run_codex_thread_interactive(
     parent_ctx: Arc<TurnContex
 ```
 
-**Purpose**: Spawns an interactive delegated Codex thread and returns channels for submitting ops and receiving non-approval events. It wires the child session to inherited parent context and starts background forwarding tasks.
+**Purpose**: Starts a sub-agent session that can keep receiving more work over time. It returns communication channels so the caller can send operations to the child and receive the child’s non-approval events.
 
-**Data flow**: Inputs: `Config`, `Arc<AuthManager>`, shared models manager, parent `Session`, parent `TurnContext`, cancellation token, `SubAgentSource`, and optional `InitialHistory`. It creates bounded submission/op channels, resolves conversation history and fork lineage, loads parent user instructions, spawns `Codex::spawn` with inherited environment/exec-policy/services/thread-store/attestation and subagent session metadata, emits analytics via `emit_subagent_session_started`, wraps the child in `Arc`, creates child cancellation tokens, allocates a shared `pending_mcp_invocations` map, spawns `forward_events` and `forward_ops`, and returns a `Codex` facade exposing the caller-facing op sender and event receiver.
+**Data flow**: It receives the parent configuration, authentication, model manager, parent session, current turn context, cancellation token, sub-agent source, and optional prior history. It builds a new child Codex session using inherited parent settings, starts background tasks to forward events and operations, records analytics that a sub-agent started, and returns a Codex handle whose input and output are connected to the caller rather than directly to the child internals.
 
-**Call relations**: This is the main delegated-thread constructor. `run_codex_thread_one_shot` builds on it, and tests verify that pre-cancelled spawn exits promptly rather than hanging.
+**Call relations**: This is the main setup routine for delegated work. The one-shot helper uses it when it wants a temporary child, and Guardian review sessions can use it when a review conversation needs its own child thread. After spawning the child session, it hands event traffic to forward_events and operation traffic to forward_ops.
 
 *Call graph*: calls 5 internal fn (forward_events, forward_ops, spawn, emit_subagent_session_started, disabled); called by 2 (run_codex_thread_one_shot, spawn_guardian_review_session); 12 external calls (clone, new, pin, child_token, new, new, new, SubAgent, bounded, default (+2 more)).
 
@@ -4737,11 +4763,11 @@ async fn run_codex_thread_one_shot(
     pa
 ```
 
-**Purpose**: Runs a delegated Codex thread for a single initial prompt and then automatically shuts it down after the turn finishes or aborts. It hides the interactive submission channel from callers after the initial request.
+**Purpose**: Starts a sub-agent for a single prompt and automatically shuts it down after that turn finishes or aborts. It is for callers that want one delegated answer, not an ongoing child conversation.
 
-**Data flow**: Inputs mirror the interactive variant plus initial `Vec<UserInput>` and optional final-output JSON schema. It creates a child cancellation token, awaits `run_codex_thread_interactive`, submits an initial `Op::UserInput` carrying the provided items/schema, creates a bridge channel, clones the child op sender/session/status handles, spawns a task that forwards events from the interactive child into the bridge and on `TurnComplete`/`TurnAborted` sends `Op::Shutdown` then cancels the child token, creates a fresh bounded channel and drops its receiver to produce a permanently closed sender, and returns a `Codex` facade with the bridged event receiver and closed submission sender.
+**Data flow**: It receives the same setup information as the interactive version plus the initial user input and optional final-output schema. It creates a child cancellation token, starts the interactive sub-agent, immediately sends the initial user input, watches events for turn completion or abortion, sends a shutdown request when done, and returns an event stream with a closed input channel so no more work can be submitted.
 
-**Call relations**: Called by higher-level one-shot review/start flows. It delegates setup to `run_codex_thread_interactive` and adds automatic completion detection plus shutdown.
+**Call relations**: This wraps run_codex_thread_interactive for one-time use. It is called by start_review_conversation, which needs a bounded delegated run rather than a long-lived interactive child.
 
 *Call graph*: calls 1 internal fn (run_codex_thread_interactive); called by 1 (start_review_conversation); 7 external calls (clone, pin, child_token, default, bounded, matches!, spawn).
 
@@ -4757,11 +4783,11 @@ async fn forward_events(
     pending_mcp_invocations: Arc<Mutex<HashMap<String, Mc
 ```
 
-**Purpose**: Consumes events from the child Codex session, forwarding ordinary events to the caller while intercepting approvals and request-style events for parent-mediated handling. It also tracks MCP invocation context needed for later guardian auto-review.
+**Purpose**: Reads events from the child agent and decides which ones the outside caller should see. It hides approval-related events from the caller and instead routes those decisions through the parent session.
 
-**Data flow**: Inputs: child `Arc<Codex>`, outbound `Sender<Event>`, parent session/context, shared `pending_mcp_invocations` map, and cancellation token. It pins `cancel_token.cancelled()` and loops with `tokio::select!`: on cancellation it calls `shutdown_delegate` and exits; on each child event it ignores `TokenCount` and `SessionConfigured`, routes `ExecApprovalRequest`, `ApplyPatchApprovalRequest`, `RequestPermissions`, and `RequestUserInput` into their dedicated handlers, caches/removes `McpInvocation`s on `McpToolCallBegin`/`McpToolCallEnd`, and forwards all other events through `forward_event_or_shutdown`, breaking if forwarding fails.
+**Data flow**: It takes the child Codex handle, an output event channel, the parent session and turn context, a cache of in-progress MCP tool calls, and a cancellation token. It repeatedly reads child events. Routine setup and token-count events are dropped, approval and permission events are answered through helper functions, MCP tool-call start and end events update the cache, and ordinary events are forwarded to the caller. If cancellation happens, it shuts the child down.
 
-**Call relations**: Spawned by `run_codex_thread_interactive`. It is the central dispatcher that decides which child events are surfaced and which are resolved through the parent session.
+**Call relations**: run_codex_thread_interactive starts this as a background task. It is the traffic controller for child-to-parent messages: safe progress updates pass through, while decisions that require authority are diverted to approval and permission helpers.
 
 *Call graph*: called by 1 (run_codex_thread_interactive); 3 external calls (cancelled, pin!, select!).
 
@@ -4772,11 +4798,11 @@ async fn forward_events(
 async fn shutdown_delegate(codex: &Codex)
 ```
 
-**Purpose**: Attempts a graceful stop of the delegated child session and drains events briefly so background senders do not race a closed channel. It is the cleanup path used after cancellation or forwarding failure.
+**Purpose**: Politely stops a child agent and briefly drains its remaining events. This prevents background work from continuing after the parent no longer wants the child alive.
 
-**Data flow**: Sends `Op::Interrupt` and `Op::Shutdown` to the child `Codex`, then waits up to 500 ms while repeatedly reading `codex.next_event()` until a `TurnAborted` or `TurnComplete` event appears or the timeout expires.
+**Data flow**: It receives a Codex child handle. It sends an interrupt request, then a shutdown request, then waits up to a short timeout while reading events until it sees the child finish or abort its turn. It does not return a useful value; its effect is to quiet and stop the child.
 
-**Call relations**: Called by `forward_event_or_shutdown` when forwarding to the consumer fails, and by `forward_events` when the delegate cancellation token fires.
+**Call relations**: forward_event_or_shutdown calls this when forwarding fails. forward_events also uses the same shutdown behavior when cancellation asks the delegated agent to stop.
 
 *Call graph*: calls 2 internal fn (next_event, submit); called by 1 (forward_event_or_shutdown); 3 external calls (from_millis, matches!, timeout).
 
@@ -4792,11 +4818,11 @@ async fn forward_event_or_shutdown(
 ) -> bool
 ```
 
-**Purpose**: Attempts to forward one child event to the consumer and shuts down the delegate if the send fails or is cancelled. It converts channel/backpressure failure into orderly child termination.
+**Purpose**: Tries to send one child event to the caller, and shuts down the child if that is no longer possible. It protects the system from a child continuing to work for a listener that has disappeared.
 
-**Data flow**: Inputs: child `Codex`, outbound sender, cancellation token, and event. It awaits `tx_sub.send(event).or_cancel(cancel_token)`; on `Ok(Ok(()))` it returns `true`, otherwise it calls `shutdown_delegate(codex).await` and returns `false`.
+**Data flow**: It receives the child Codex handle, the event sender, the cancellation token, and the event to deliver. If the event is sent successfully before cancellation, it returns true. If sending fails or cancellation wins, it shuts down the child and returns false.
 
-**Call relations**: Used by `forward_events` for all events that should be surfaced to the caller. It encapsulates the policy that a blocked or closed consumer means the child should be stopped.
+**Call relations**: This is used by the event-forwarding loop whenever an event should be passed through. It hands failure cases to shutdown_delegate so the rest of the loop can stop cleanly.
 
 *Call graph*: calls 1 internal fn (shutdown_delegate); 1 external calls (send).
 
@@ -4811,11 +4837,11 @@ async fn forward_ops(
 )
 ```
 
-**Purpose**: Forwards caller submissions into the delegated child session until the op channel closes or cancellation occurs. It is the inbound half of the interactive bridge.
+**Purpose**: Moves operations from the caller’s input channel into the child agent. This is what lets the parent or caller continue giving instructions to an interactive sub-agent.
 
-**Data flow**: Loops receiving `Submission` values from `rx_ops.recv().or_cancel(&cancel_token_ops)` → on each successful submission calls `codex.submit_with_id(submission).await` and ignores the result → exits on channel close or cancellation.
+**Data flow**: It receives the child Codex handle, a receiver for submitted operations, and a cancellation token. It waits for submissions, stops if the channel closes or cancellation happens, and otherwise submits each operation to the child using the original submission identity.
 
-**Call relations**: Spawned by `run_codex_thread_interactive`. Tests verify that it preserves submission trace context when forwarding.
+**Call relations**: run_codex_thread_interactive starts this as a background task. It is the opposite direction from forward_events: instead of child events coming out, caller operations go in.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (run_codex_thread_interactive).
 
@@ -4832,11 +4858,11 @@ async fn handle_exec_approval(
     cancel_token: &Can
 ```
 
-**Purpose**: Resolves a delegated shell-execution approval request through the parent session or guardian review and sends the resulting decision back into the child Codex session. It carefully distinguishes the tool-call id from the approval callback id.
+**Purpose**: Answers a child agent’s request to run a command that needs approval. It makes sure the decision comes from the parent session or Guardian, not from the child itself.
 
-**Data flow**: Inputs: child codex, child turn id, parent session/context, `ExecApprovalRequestEvent`, and cancellation token. It computes `approval_id_for_op = event.effective_approval_id()`, destructures the event, and either: (a) if guardian routing is enabled, spawns a guardian review request describing the shell command/cwd/permissions and awaits it with cancellation support; or (b) asks `parent_session.request_command_approval(...)` and awaits that result with cancellation support. It then submits `Op::ExecApproval { id: approval_id_for_op, turn_id: Some(turn_id), decision }` back to the child.
+**Data flow**: It receives the child Codex handle, the child turn id, parent session and context, the command-approval event, and a cancellation token. It extracts the command, working directory, reason, requested extra permissions, and available decisions. If Guardian review is configured, it creates a Guardian shell-review request and waits for the decision; otherwise it asks the parent session’s normal command-approval path. It then sends an ExecApproval answer back to the child.
 
-**Call relations**: Called by `forward_events` when the child emits `EventMsg::ExecApprovalRequest`. Tests verify that guardian review targets the call id while the reply uses the approval id.
+**Call relations**: The event-forwarding loop calls this when the child asks to execute a protected command. It uses await_approval_with_cancel so cancellation becomes an abort decision, then hands the final decision back to the child agent.
 
 *Call graph*: calls 3 internal fn (await_approval_with_cancel, submit, effective_approval_id); 5 external calls (clone, child_token, new_guardian_review_id, routes_approval_to_guardian, spawn_approval_request_review).
 
@@ -4853,11 +4879,11 @@ async fn handle_patch_approval(
     cancel_token: &
 ```
 
-**Purpose**: Resolves a delegated apply-patch approval request through guardian review or the parent session and replies to the child with the chosen decision. It reconstructs a human-readable patch summary for guardian review.
+**Purpose**: Answers a child agent’s request to apply file changes that need approval. It keeps file edits from a delegated agent under the parent’s review process.
 
-**Data flow**: Inputs: child codex, parent session/context, `ApplyPatchApprovalRequestEvent`, and cancellation token. It derives `approval_id` from `call_id`, and if guardian routing is enabled it computes affected file paths and a textual patch by formatting each `FileChange` variant (`Add`, `Delete`, `Update` with optional move), spawns guardian review, and awaits the decision with cancellation support. If guardian is not used, or after guardian returns `None`, it requests patch approval from the parent session and awaits that result. Finally it submits `Op::PatchApproval { id: approval_id, decision }` to the child.
+**Data flow**: It receives the child Codex handle, parent session and context, the patch-approval event, and a cancellation token. It gathers the proposed file changes and reason. If Guardian review is active, it turns the changes into a readable patch summary and asks Guardian. If not, or if Guardian is not used, it asks the parent session for patch approval. It sends the resulting PatchApproval decision back to the child.
 
-**Call relations**: Called by `forward_events` for `EventMsg::ApplyPatchApprovalRequest`. It parallels `handle_exec_approval` but with patch-specific review payload construction.
+**Call relations**: The event-forwarding loop uses this when a child wants to modify files. Like command approval, it depends on await_approval_with_cancel so a cancelled parent run produces a safe abort-style answer.
 
 *Call graph*: calls 2 internal fn (await_approval_with_cancel, submit); 5 external calls (clone, child_token, new_guardian_review_id, routes_approval_to_guardian, spawn_approval_request_review).
 
@@ -4873,11 +4899,11 @@ async fn handle_request_user_input(
     pending_mcp_invocations: &Arc<Mutex<HashMap<String, Mcp
 ```
 
-**Purpose**: Handles delegated `RequestUserInput` events by either auto-answering legacy MCP approval prompts through guardian review or forwarding the questions to the parent session. It always sends a `UserInputAnswer` back to the child.
+**Purpose**: Answers a child agent’s request to ask the user something. It also recognizes a special legacy tool-approval prompt and may answer it automatically after Guardian review.
 
-**Data flow**: Inputs: child codex, request id, parent session/context, shared pending-MCP map, `RequestUserInputEvent`, and cancellation token. It first calls `maybe_auto_review_mcp_request_user_input(...)`; if that returns a response, it immediately submits `Op::UserInputAnswer { id, response }`. Otherwise it builds `RequestUserInputArgs` from the event questions/timeout, asks `parent_session.request_user_input(...)`, awaits the result via `await_user_input_with_cancel`, and submits the resulting answer op back to the child.
+**Data flow**: It receives the child Codex handle, the request id, parent session and context, cached MCP tool invocations, the user-input event, and a cancellation token. First it checks whether the prompt is really an MCP tool approval that Guardian can review automatically. If so, it sends that generated answer back to the child. Otherwise it asks the parent session to request input from the user, waits with cancellation support, and sends the user-input answer back to the child.
 
-**Call relations**: Called by `forward_events` for `EventMsg::RequestUserInput`. It is the entrypoint for the MCP auto-review compatibility path implemented by `maybe_auto_review_mcp_request_user_input`.
+**Call relations**: The event-forwarding loop calls this when the child raises a RequestUserInput event. It delegates special MCP approval cases to maybe_auto_review_mcp_request_user_input and ordinary questions to await_user_input_with_cancel.
 
 *Call graph*: calls 3 internal fn (await_user_input_with_cancel, maybe_auto_review_mcp_request_user_input, submit).
 
@@ -4892,11 +4918,11 @@ async fn maybe_auto_review_mcp_request_user_input(
     e
 ```
 
-**Purpose**: Detects legacy MCP approval prompts delivered through `RequestUserInput`, reconstructs the original MCP invocation from cached begin events, and—when guardian review is configured—returns a synthetic answer without surfacing the prompt to the user. It bridges an older compatibility path into the newer guardian approval flow.
+**Purpose**: Detects an older-style MCP tool approval prompt and, when Guardian is active, turns it into a real Guardian review instead of showing it as a normal user question. MCP means Model Context Protocol, a way external tools are exposed to the agent.
 
-**Data flow**: Inputs: parent session/context, shared pending-MCP invocation map, `RequestUserInputEvent`, and cancellation token. It finds the first question whose id matches the MCP approval prefix; if none, returns `None`. It looks up the cached `McpInvocation` by `event.call_id`; if missing, returns `None`. It fetches MCP tool metadata, computes the approvals reviewer, and if guardian routing is not enabled for that reviewer returns `None`. Otherwise it spawns guardian review using `build_guardian_mcp_tool_review_request`, awaits the decision with cancellation support, maps the resulting `ReviewDecision` into a selected answer label (`accept`, `accept for session`, or synthetic decline), and returns `Some(RequestUserInputResponse { answers: ... })` keyed by the original question id.
+**Data flow**: It receives the parent session and context, the cache of currently running MCP tool calls, the user-input event, and a cancellation token. It looks for a question that matches the MCP approval-question pattern, finds the original tool invocation by call id, looks up tool metadata, checks whether Guardian should review this tool, and runs the Guardian review. It converts the Guardian decision into the option label expected by the old user-input prompt and returns a RequestUserInputResponse. If any required piece is missing or Guardian should not review it, it returns nothing.
 
-**Call relations**: Called only by `handle_request_user_input`. Tests cover both the cancelled-guardian path producing a synthetic decline answer and the no-metadata path returning `None`.
+**Call relations**: handle_request_user_input calls this before falling back to a normal user question. It relies on the MCP invocation cache maintained by the event-forwarding loop, because the later compatibility prompt does not contain enough tool details by itself.
 
 *Call graph*: calls 4 internal fn (await_approval_with_cancel, build_guardian_mcp_tool_review_request, lookup_mcp_tool_metadata, mcp_approvals_reviewer); called by 1 (handle_request_user_input); 7 external calls (clone, child_token, from, new_guardian_review_id, routes_approval_to_guardian_with_reviewer, spawn_approval_request_review, vec!).
 
@@ -4912,11 +4938,11 @@ async fn handle_request_permissions(
     cancel_token: &CancellationToken,
 ```
 
-**Purpose**: Forwards a delegated permission request to the parent session, waits for the response or cancellation, and sends the resulting permission grant back into the child session. It preserves the child tool-call id for round-trip correlation.
+**Purpose**: Answers a child agent’s request for extra permissions, such as access tied to an environment or working directory. It routes the request through the parent session’s permission system.
 
-**Data flow**: Inputs: child codex, parent session/context, `RequestPermissionsEvent`, and cancellation token. It extracts `call_id`, builds `RequestPermissionsArgs` from environment/reason/permissions, chooses `cwd` from the event or falls back to the parent context cwd, calls `parent_session.request_permissions_for_cwd(...)`, awaits the result via `await_request_permissions_with_cancel`, and submits `Op::RequestPermissionsResponse { id: call_id, response }` to the child.
+**Data flow**: It receives the child Codex handle, parent session and context, the permission-request event, and a cancellation token. It builds permission-request arguments from the event, chooses the event’s working directory or falls back to the parent context directory, asks the parent session for a permission response, waits with cancellation support, and sends a RequestPermissionsResponse back to the child.
 
-**Call relations**: Called by `forward_events` for `EventMsg::RequestPermissions`. Tests verify that the original tool-call id is used both in the parent-facing request and the child-facing response op.
+**Call relations**: The event-forwarding loop calls this when the child asks for permissions. It uses await_request_permissions_with_cancel so cancellation still produces a well-formed empty permission response and notifies the parent.
 
 *Call graph*: calls 2 internal fn (await_request_permissions_with_cancel, submit); 1 external calls (clone).
 
@@ -4932,11 +4958,11 @@ async fn await_user_input_with_cancel(
 ) -> RequestUserInputResponse
 ```
 
-**Purpose**: Waits for a parent-session user-input response but synthesizes and notifies an empty response if delegation is cancelled first. It ensures the parent session sees a terminal answer even on cancellation.
+**Purpose**: Waits for a user-input response, but returns an empty answer if the delegated run is cancelled. This keeps the child from waiting forever for a question that the parent no longer wants answered.
 
-**Data flow**: Inputs: a future yielding `Option<RequestUserInputResponse>`, parent session, sub-id, and cancellation token. In a biased `tokio::select!`, if cancellation fires first it constructs `RequestUserInputResponse { answers: HashMap::new() }`, calls `parent_session.notify_user_input_response(sub_id, empty.clone()).await`, and returns the empty response. Otherwise it awaits the future and returns its value or the same empty default if the future yields `None`.
+**Data flow**: It receives a future that may produce a user-input response, the parent session, the subscription id for the request, and a cancellation token. If cancellation happens first, it creates an empty response, tells the parent session about that response, and returns it. If the real response arrives first, it returns it, or an empty response if the request produced nothing.
 
-**Call relations**: Used by `handle_request_user_input` for the non-auto-reviewed path. It encapsulates cancellation semantics for delegated user-input prompts.
+**Call relations**: handle_request_user_input uses this for ordinary user questions from a child agent. It is the cancellation-aware waiting room between the parent’s user-input system and the child’s need for a concrete answer.
 
 *Call graph*: called by 1 (handle_request_user_input); 1 external calls (select!).
 
@@ -4952,11 +4978,11 @@ async fn await_request_permissions_with_cancel(
 ) -> RequestPermissionsResponse
 ```
 
-**Purpose**: Waits for a parent-session permission response but synthesizes and notifies an empty turn-scoped response if delegation is cancelled first. It mirrors the user-input cancellation helper for permission requests.
+**Purpose**: Waits for a permission response, but returns a safe empty permission grant if the delegated run is cancelled. This avoids leaving a child permission request unresolved.
 
-**Data flow**: Inputs: a future yielding `Option<RequestPermissionsResponse>`, parent session, call id, and cancellation token. In a biased `tokio::select!`, cancellation constructs `RequestPermissionsResponse { permissions: Default::default(), scope: PermissionGrantScope::Turn, strict_auto_review: false }`, notifies the parent session with that response, and returns it. Otherwise it awaits the future and returns its value or the same default if `None`.
+**Data flow**: It receives a future that may produce a permission response, the parent session, the permission call id, and a cancellation token. If cancellation happens first, it creates a response with no permissions, a turn-only scope, and no strict auto-review, notifies the parent session, and returns that response. If the real response arrives first, it returns it, or the same empty response if none was provided.
 
-**Call relations**: Used by `handle_request_permissions`. It guarantees a concrete response object even when the delegated flow is interrupted.
+**Call relations**: handle_request_permissions uses this after sending the permission request through the parent session. It provides a predictable answer for both normal completion and cancellation.
 
 *Call graph*: called by 1 (handle_request_permissions); 1 external calls (select!).
 
@@ -4973,24 +4999,24 @@ async fn await_approval_with_cancel(
 ) -> co
 ```
 
-**Purpose**: Waits for an approval decision but aborts the review and notifies the parent session if delegation is cancelled first. It is the shared cancellation wrapper for exec, patch, and MCP guardian approvals.
+**Purpose**: Waits for an approval decision, but turns cancellation into an explicit abort. This gives command, patch, and tool approvals a safe ending even when the parent run stops.
 
-**Data flow**: Inputs: a future yielding `ReviewDecision`, parent session, approval id, cancellation token, and optional review-cancel token. In a biased `tokio::select!`, cancellation first cancels the review token if present, then calls `parent_session.notify_approval(approval_id, ReviewDecision::Abort).await`, and returns `ReviewDecision::Abort`. Otherwise it awaits and returns the future’s decision.
+**Data flow**: It receives a future that will produce a review decision, the parent session, the approval id, the main cancellation token, and optionally a separate Guardian-review cancellation token. If cancellation happens first, it cancels the Guardian review if one exists, notifies the parent session that the approval was aborted, and returns Abort. If the decision arrives first, it returns that decision unchanged.
 
-**Call relations**: Used by `handle_exec_approval`, `handle_patch_approval`, and `maybe_auto_review_mcp_request_user_input` to unify cancellation behavior across all delegated approval flows.
+**Call relations**: Command approval, patch approval, and automatic MCP tool review all use this helper. It is the shared rule that keeps delegated approval flows from hanging or silently succeeding after cancellation.
 
 *Call graph*: called by 3 (handle_exec_approval, handle_patch_approval, maybe_auto_review_mcp_request_user_input); 1 external calls (select!).
 
 
 ### `core/src/tasks/review.rs`
 
-`domain_logic` · `review-mode turn execution and teardown`
+`orchestration` · `active during a review-mode turn, including cleanup when review mode exits or is aborted`
 
-This module defines `ReviewTask`, a lightweight `SessionTask` whose real work is delegated to a one-shot sub-Codex thread. `run` first increments a `codex.task.review` telemetry counter, then extracts only `UserInput` content from the incoming `Vec<TurnInput>`, ignoring response items and inter-agent messages. It starts a review conversation with `start_review_conversation`, which clones the current config and then deliberately tightens it: web search is forced to `Disabled`, several features (`SpawnCsv`, `Collab`, `MultiAgentV2`) are disabled, base instructions are replaced with `crate::REVIEW_PROMPT`, approval policy is forced to `AskForApproval::Never`, and the model is set to `config.review_model` or the current turn model slug. That constrained config is passed into `run_codex_thread_one_shot`, yielding an event receiver.
+Review mode is like asking a second, more restricted assistant to inspect the current work and report problems. This file is the coordinator for that process. Without it, the app could not launch the reviewer cleanly, keep review-only tool limits in place, or turn the reviewer’s answer into the structured review result shown to the user.
 
-`process_review_events` consumes that receiver and selectively forwards events to the parent session. It buffers the most recent `AgentMessage` instead of forwarding it immediately, suppresses assistant `ItemCompleted` and content-delta events to avoid legacy message duplication, forwards all other events unchanged, and on `TurnComplete` parses the final `last_agent_message` into a `ReviewOutputEvent`. Parsing is resilient: it first tries full JSON deserialization, then the first `{...}` substring, and finally falls back to a default event carrying the raw text in `overall_explanation`.
+The main type is `ReviewTask`, which fits into the normal session task system. When it runs, it pulls only the user’s actual input out of the turn data, then starts a one-shot sub-agent conversation. Before that sub-agent starts, the file tightens its configuration: web search is disabled, collaboration and spawning features are disabled, approval prompts are forbidden, and a review-specific instruction prompt is installed. This keeps review mode focused and prevents the reviewer from quietly using tools that review mode should not allow.
 
-Whether the review succeeds or is interrupted, `exit_review_mode` emits an `ExitedReviewMode` event and records rollout items. On success it formats findings into a user-visible exit message and a structured assistant summary; on interruption it records canned interrupted text. It writes a synthetic user message first, emits the protocol event, then records/emits the assistant message, and finally forces rollout materialization because review turns may occur before any regular user turn has created persistence artifacts.
+As the reviewer produces events, this file forwards useful ones to the main session and hides noisy assistant-message streaming details. When the reviewer finishes, it parses the final message as a `ReviewOutputEvent`, which is the structured review result. Finally, it emits an “exited review mode” event and records synthetic conversation messages so the review appears in history and rollout storage.
 
 #### Function details
 
@@ -5000,11 +5026,11 @@ Whether the review succeeds or is interrupted, `exit_review_mode` emits an `Exit
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the stateless review task value.
+**Purpose**: Creates a new `ReviewTask`. This is used when the system needs an object that represents the review-mode job.
 
-**Data flow**: Takes no arguments and returns `ReviewTask` by value.
+**Data flow**: Nothing goes in. The function returns a plain `ReviewTask` value with no stored settings, because this task gets the session and turn details later when it runs.
 
-**Call relations**: Review-thread startup code and tests instantiate this before spawning a review task.
+**Call relations**: The review thread setup code calls this when it needs to spawn review mode. A test also calls it while checking abort behavior.
 
 *Call graph*: called by 2 (spawn_review_thread, abort_review_task_emits_exited_then_aborted_and_records_history).
 
@@ -5015,11 +5041,11 @@ fn new() -> Self
 fn kind(&self) -> TaskKind
 ```
 
-**Purpose**: Identifies this task as review work.
+**Purpose**: Tells the task system that this task is the review task. This lets the rest of the session machinery label and track it correctly.
 
-**Data flow**: Reads `self` and returns `TaskKind::Review`.
+**Data flow**: It reads no outside data. It simply returns the fixed task kind `Review`.
 
-**Call relations**: The session task framework uses this to classify the running task.
+**Call relations**: This is part of the `SessionTask` interface. The wider task framework can ask the task what kind it is before or while running it.
 
 
 ##### `ReviewTask::span_name`  (lines 47–49)
@@ -5028,11 +5054,11 @@ fn kind(&self) -> TaskKind
 fn span_name(&self) -> &'static str
 ```
 
-**Purpose**: Supplies the tracing span name for spawned review tasks.
+**Purpose**: Gives the review task a stable name for tracing or telemetry. A span is a named section of work used to understand what the program was doing.
 
-**Data flow**: Reads `self` and returns `"session_task.review"`.
+**Data flow**: It takes no changing input and returns the fixed text `session_task.review`.
 
-**Call relations**: Task startup uses this when creating the outer tracing span.
+**Call relations**: This is another piece of the `SessionTask` interface. The task framework can use this name when recording timing or diagnostic information around the review run.
 
 
 ##### `ReviewTask::run`  (lines 51–88)
@@ -5047,11 +5073,11 @@ async fn run(
     ) -> O
 ```
 
-**Purpose**: Runs review mode by extracting user input, launching a constrained sub-agent review conversation, processing its events, and exiting review mode unless cancellation already fired.
+**Purpose**: Runs review mode from start to finish. It gathers the user’s input, launches the reviewer sub-agent, waits for its result, and exits review mode unless the task was cancelled.
 
-**Data flow**: Consumes the task `Arc`, task context, turn context, input vector, and cancellation token. It increments a telemetry counter, filters `TurnInput` down to a flat `Vec<UserInput>`, starts the review sub-conversation, optionally processes returned events into `Option<ReviewOutputEvent>`, and if the cancellation token is still not cancelled calls `exit_review_mode` with that output. It always returns `None` because review completion is surfaced through explicit events and rollout items rather than a final agent message string.
+**Data flow**: It receives the session context, the turn context, the turn input items, and a cancellation token, which is a shared stop signal. It counts a telemetry event, extracts only user-provided content from the turn input, starts the review conversation, processes the reviewer’s events into an optional structured review output, and then records the review exit if cancellation has not already happened. It always returns `None`, because the useful result is sent and recorded through session events rather than returned as a string.
 
-**Call relations**: The generic task runner invokes this for review turns. It delegates setup to `start_review_conversation`, event handling to `process_review_events`, and finalization to `exit_review_mode`.
+**Call relations**: The session task runner calls this when review mode is started. Inside, it hands the prepared user input to `start_review_conversation`, passes the returned event receiver to `process_review_events`, and then calls `exit_review_mode` to publish and store the final review result.
 
 *Call graph*: calls 3 internal fn (exit_review_mode, process_review_events, start_review_conversation); 3 external calls (clone, is_cancelled, new).
 
@@ -5062,11 +5088,11 @@ async fn run(
 async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>)
 ```
 
-**Purpose**: Performs review-specific abort cleanup by explicitly exiting review mode without output.
+**Purpose**: Cleans up review mode when it is stopped early. It makes sure the user interface and history still learn that review mode has ended.
 
-**Data flow**: Consumes task/session context and turn context, clones the session from `SessionTaskContext`, calls `exit_review_mode(..., None, ctx)`, and returns `()`.
+**Data flow**: It receives the session and turn context. Since there is no completed review result, it calls the exit routine with `None`, which produces an interrupted-review message instead of normal findings.
 
-**Call relations**: Abort orchestration calls this after cancelling a running review task so the parent session still receives review-exit signaling and persisted interrupted messages.
+**Call relations**: The task framework calls this when review mode is aborted. It delegates the actual user-visible cleanup to `exit_review_mode`, the same function used after a normal run.
 
 *Call graph*: calls 1 internal fn (exit_review_mode).
 
@@ -5082,11 +5108,11 @@ async fn start_review_conversation(
 ) -> Option<async_channel::Re
 ```
 
-**Purpose**: Builds a constrained sub-agent configuration for review mode and launches a one-shot delegated Codex thread, returning its event receiver on success.
+**Purpose**: Starts the separate reviewer assistant with safe review-only settings. It returns the channel where reviewer events can be read, or nothing if the reviewer could not be started.
 
-**Data flow**: Consumes task context, turn context, flattened `Vec<UserInput>`, and a cancellation token. It clones `ctx.config`, mutates the clone to disable review-forbidden capabilities, sets review prompt instructions and `AskForApproval::Never`, chooses the review model or current model slug, then calls `run_codex_thread_one_shot` with auth/models/session/turn context and `SubAgentSource::Review`. It converts the result into `Option<async_channel::Receiver<Event>>` by discarding errors and extracting `io.rx_event` on success.
+**Data flow**: It receives the session context, turn context, user input, and cancellation token. It copies the current configuration, then locks down tools and permissions: web search is disabled, certain features are disabled, approval prompts are set to never happen, and the review prompt is installed as the reviewer’s instructions. It chooses the configured review model if one exists, otherwise it uses the current model. Then it starts a one-shot Codex sub-agent and returns that sub-agent’s event receiver on success.
 
-**Call relations**: Only `ReviewTask::run` calls this as the setup phase before event processing. It delegates actual sub-thread execution to the codex delegate layer.
+**Call relations**: `ReviewTask::run` calls this after collecting user input. This function hands off to `run_codex_thread_one_shot`, which actually starts the sub-agent conversation. If the configuration cannot support disabling web search, it panics because that should be impossible by construction.
 
 *Call graph*: calls 2 internal fn (allow_only, run_codex_thread_one_shot); called by 1 (run); 1 external calls (panic!).
 
@@ -5101,11 +5127,11 @@ async fn process_review_events(
 ) -> Option<ReviewOutputEvent>
 ```
 
-**Purpose**: Consumes events from the delegated review thread, forwarding only the desired subset to the parent session and extracting structured review output from completion.
+**Purpose**: Reads events from the reviewer and turns them into one final review result. It also forwards selected events so the main session stays informed without showing unwanted streaming noise.
 
-**Data flow**: Consumes task context, turn context, and an async-channel receiver. It loops on `receiver.recv().await`, cloning each event's message for matching. `AgentMessage` events are buffered so only the previous one is forwarded when a newer one arrives; assistant `ItemCompleted` and `AgentMessageContentDelta` are suppressed; `TurnComplete` parses `last_agent_message` with `parse_review_output_event` and returns `Option<ReviewOutputEvent>`; `TurnAborted` returns `None`; all other events are forwarded to the parent session via `send_event`. If the channel closes unexpectedly, it returns `None`.
+**Data flow**: It receives the session, turn context, and an event receiver from the reviewer. It waits for events one by one. Regular assistant-message events are held back so only the right final form is shown. Assistant streaming deltas and assistant item-completed events are suppressed. Other events are forwarded to the main session. When the reviewer reports that the turn is complete, the function parses the last assistant message into an optional `ReviewOutputEvent`; if the turn is aborted or the channel closes early, it returns `None`.
 
-**Call relations**: This is the middle phase of `ReviewTask::run` after sub-thread startup. It delegates parsing to `parse_review_output_event` and event forwarding to the parent session.
+**Call relations**: `ReviewTask::run` calls this after `start_review_conversation` succeeds. While reading from the receiver, it may send non-hidden events into the main session. On completion, it uses `parse_review_output_event` to interpret the reviewer’s final text.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (run).
 
@@ -5116,11 +5142,11 @@ async fn process_review_events(
 fn parse_review_output_event(text: &str) -> ReviewOutputEvent
 ```
 
-**Purpose**: Attempts to recover a `ReviewOutputEvent` from model text, tolerating wrappers or malformed non-JSON output.
+**Purpose**: Converts the reviewer’s final text into the structured review format used by the app. It is forgiving when the model returns extra words around the JSON.
 
-**Data flow**: Consumes `text: &str`. It first tries `serde_json::from_str::<ReviewOutputEvent>(text)`, then searches for the first `{` and last `}` and retries deserialization on that substring, and if both fail returns `ReviewOutputEvent { overall_explanation: text.to_string(), ..Default::default() }`.
+**Data flow**: It receives a text blob from the reviewer. First it tries to read the whole text as JSON shaped like a `ReviewOutputEvent`. If that fails, it looks for the first `{` and the last `}` and tries to parse that slice as JSON. If that also fails, it creates a default review output and stores the raw text as the overall explanation.
 
-**Call relations**: Only `process_review_events` calls this when the delegated review thread completes. It isolates the review-output parsing heuristics from the event loop.
+**Call relations**: This is used when review event processing reaches the reviewer’s turn-complete event. It protects the rest of the flow from imperfect model formatting by always returning a usable review output object.
 
 *Call graph*: 1 external calls (default).
 
@@ -5135,24 +5161,26 @@ async fn exit_review_mode(
 )
 ```
 
-**Purpose**: Finalizes review mode by emitting `ExitedReviewMode`, recording synthetic rollout messages that summarize success or interruption, and ensuring rollout persistence exists.
+**Purpose**: Publishes that review mode has ended and records the review result in conversation history. It handles both successful reviews and interrupted reviews.
 
-**Data flow**: Consumes the parent `Arc<Session>`, optional `ReviewOutputEvent`, and `Arc<TurnContext>`. It chooses fixed rollout message ids, then either formats successful findings using `format_review_findings_block`, `render_review_exit_success`, and `render_review_output_text`, or uses interrupted fallback strings from `render_review_exit_interrupted`. It records a synthetic user `ResponseItem::Message`, sends `EventMsg::ExitedReviewMode` carrying the optional structured output, records and emits an assistant `ResponseItem::Message`, and finally awaits `ensure_rollout_materialized()`. It returns `()`.
+**Data flow**: It receives the main session, an optional review output, and the turn context. If there is a review result, it combines the overall explanation and findings, renders a user-facing review-exit message, and renders an assistant message containing the review output. If there is no result, it creates an interrupted-review message. It then records a synthetic user message, emits an `ExitedReviewMode` event containing the optional review output, records and emits a synthetic assistant message, and finally ensures rollout persistence exists on disk.
 
-**Call relations**: Both normal review completion and review abort paths call this so clients and rollout history see a consistent review-exit sequence. It delegates formatting to review/prompt helpers and persistence/event emission to session methods.
+**Call relations**: `ReviewTask::run` calls this after a completed review conversation, unless cancellation has already taken over. `ReviewTask::abort` also calls it with no review output. It relies on review-formatting helpers and prompt renderers to turn structured findings into readable text before storing and emitting them.
 
 *Call graph*: calls 2 internal fn (format_review_findings_block, render_review_output_text); called by 2 (abort, run); 6 external calls (new, render_review_exit_interrupted, render_review_exit_success, format!, ExitedReviewMode, vec!).
 
 
 ### `core/src/tools/code_mode/delegate.rs`
 
-`orchestration` · `per-turn code-mode execution`
+`orchestration` · `active during a code-mode turn, especially while dispatching cell tool calls and notifications`
 
-This file provides the dispatch side of code mode. `CodeModeDispatchBroker` owns an unbounded async channel carrying `DispatchMessage`s and a mutex-protected `HashMap<CellId, watch::Sender<bool>>` used as per-cell readiness gates. A cell starts with a `false` gate; `mark_cell_ready_for_dispatch` flips it to `true`, and `close_cell` removes the gate entirely. `start_turn_worker` creates a `ToolCallRuntime` bound to the current session and turn, wraps it in `CoreTurnHost`, clones the receiver and gate map, and spawns a background loop that processes dispatch messages until a oneshot shutdown signal arrives or the channel closes.
+Code mode appears to let the model work through separate cells, a bit like notebook cells. This file is the traffic controller between those cells and the main Codex tool-running machinery. Without it, a cell could try to run a nested tool or send a notification before the current turn is ready, or after it has been cancelled, which could lead to lost messages, wrong ordering, or work happening after the user has moved on.
 
-The worker treats notifications and nested tool invocations differently. For `Notify`, it waits until the target cell is ready or cancelled, then calls `CoreTurnHost::notify`; on cancellation it removes the gate and returns an error through a oneshot response channel. For `InvokeTool`, it also waits for readiness, but once ready it spawns a separate task so long-running nested tool calls do not block the main dispatch loop. Cancellation is checked both before queueing and while awaiting the response. `dispatch_gate` and `wait_until_cell_ready_for_dispatch` are careful about poisoned mutexes and watch-channel closure.
+The central piece is CodeModeDispatchBroker. Other code asks the broker to invoke a nested tool or send a notification. The broker puts that request onto an internal queue. A per-turn worker, started by start_turn_worker, reads the queue and performs the request using CoreTurnHost.
 
-`CodeModeDispatchBroker` implements `CodeModeSessionDelegate`, so the external code-mode service can ask core to invoke nested tools or inject notifications. `CoreTurnHost::invoke_tool` delegates to `call_nested_tool`, while `notify` injects a `ResponseItem::CustomToolCallOutput` named with the public code-mode tool into the running session, rejecting empty text and reporting an error if there is no active turn. `CodeModeDispatchWorker` is just a shutdown handle whose `Drop` sends the stop signal.
+The important safety feature is the “dispatch gate” for each cell. A gate starts closed. Requests for that cell wait until mark_cell_ready_for_dispatch opens it. If the cell closes or the request is cancelled, the wait ends and the gate is cleaned up. This is like a train station signal: trains can line up, but they do not enter the track until the signal turns green.
+
+Notifications are injected back into the active session as tool output messages. Nested tool calls are handed to the normal tool runtime, so code mode reuses the same tool execution path as the rest of the system.
 
 #### Function details
 
@@ -5162,11 +5190,11 @@ The worker treats notifications and nested tool invocations differently. For `No
 fn new() -> Self
 ```
 
-**Purpose**: Creates a fresh dispatch broker with an unbounded message queue and no per-cell gates.
+**Purpose**: Creates a new broker that can receive code-mode dispatch requests. It sets up the internal message queue and the table of per-cell readiness gates.
 
-**Data flow**: Allocates an async-channel sender/receiver pair, initializes an empty `HashMap<CellId, watch::Sender<bool>>` inside `Arc<Mutex<_>>`, and returns `CodeModeDispatchBroker`.
+**Data flow**: Nothing comes in. The function creates a sending side and receiving side for an internal queue, creates an empty shared map for cell gates, and returns a ready-to-use CodeModeDispatchBroker.
 
-**Call relations**: Constructed by `CodeModeService::new` as the delegate backing code-mode nested dispatch.
+**Call relations**: This is the starting point for this dispatch system. The broader code creates the broker, then later uses it as the code-mode session delegate and starts a worker from it for each turn.
 
 *Call graph*: called by 1 (new); 4 external calls (new, new, new, unbounded).
 
@@ -5177,11 +5205,11 @@ fn new() -> Self
 fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId)
 ```
 
-**Purpose**: Marks a cell as ready so queued notifications and nested tool calls may proceed.
+**Purpose**: Marks one code cell as ready, so queued work for that cell may proceed. This prevents tool calls or notifications from being released too early.
 
-**Data flow**: Looks up or creates the cell’s watch sender via `dispatch_gate` and calls `send_replace(true)` on it; returns unit.
+**Data flow**: It receives a cell id. It finds or creates that cell’s dispatch gate, then changes the gate value to true, which wakes any waiting tasks for that cell.
 
-**Call relations**: Called by the code-mode execute path once the runtime has started and dispatch into the cell is safe.
+**Call relations**: This function uses dispatch_gate to reach the right readiness signal. The turn worker waits on that same signal before running notifications or nested tool calls.
 
 *Call graph*: calls 1 internal fn (dispatch_gate).
 
@@ -5192,11 +5220,11 @@ fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId)
 fn close_cell(&self, cell_id: &CellId)
 ```
 
-**Purpose**: Removes the readiness gate for a cell, preventing further dispatch waits from succeeding.
+**Purpose**: Removes the readiness gate for a cell that is no longer active. This keeps old cell state from hanging around after the cell is done.
 
-**Data flow**: Calls `remove_dispatch_gate` with the shared gate map and target `cell_id`.
+**Data flow**: It receives a cell id. It removes that cell’s entry from the shared gate map. There is no returned value; the broker’s internal state changes.
 
-**Call relations**: Used directly by `cell_closed` and by the service when a cell’s dispatch lifecycle is finished.
+**Call relations**: This is called by CodeModeDispatchBroker::cell_closed when code mode reports that a cell has closed. It delegates the actual cleanup to remove_dispatch_gate.
 
 *Call graph*: calls 1 internal fn (remove_dispatch_gate); called by 1 (cell_closed).
 
@@ -5212,11 +5240,11 @@ fn start_turn_worker(
     ) -> CodeModeDispatchWorker
 ```
 
-**Purpose**: Starts the background worker that services code-mode notifications and nested tool invocations for a specific turn.
+**Purpose**: Starts the background worker that actually performs queued code-mode requests for one turn. It connects the broker to the tool router, session, turn state, and diff tracker needed to run tools correctly.
 
-**Data flow**: Builds a `ToolCallRuntime` from the provided router, session, turn, and diff tracker; wraps it in `CoreTurnHost`; clones the dispatch receiver and gate map; creates a oneshot shutdown channel; and spawns an async loop. The loop selects between shutdown and incoming `DispatchMessage`s, waits for per-cell readiness with cancellation support, dispatches notifications inline, dispatches tool invocations in detached tasks, removes gates on cancellation, and sends results back through per-request oneshot channels. It returns `CodeModeDispatchWorker` holding the shutdown sender.
+**Data flow**: It receives the current execution context, a tool router, and a shared turn diff tracker. It builds a ToolCallRuntime, wraps that in a CoreTurnHost, clones the broker’s queue receiver and gate table, then spawns an asynchronous loop. That loop reads dispatch messages, waits for the relevant cell gate to open, and either sends notifications or starts nested tool calls. It returns a CodeModeDispatchWorker whose lifetime controls shutdown.
 
-**Call relations**: Called by `CodeModeService::start_turn_worker` when a turn is in code mode and nested dispatch should be enabled.
+**Call relations**: This is the bridge between queued requests and real work. It calls wait_until_cell_ready_for_dispatch before handing work to CoreTurnHost::notify or CoreTurnHost::invoke_tool. If waiting is cancelled, it calls remove_dispatch_gate to clean up. The returned CodeModeDispatchWorker stops the loop when it is dropped.
 
 *Call graph*: calls 3 internal fn (remove_dispatch_gate, wait_until_cell_ready_for_dispatch, new); 6 external calls (clone, new, clone, channel, select!, spawn).
 
@@ -5230,11 +5258,11 @@ fn dispatch_gate(
 ) -> watch::Sender<bool>
 ```
 
-**Purpose**: Fetches or lazily creates the watch sender that represents readiness for a given cell.
+**Purpose**: Finds the readiness gate for a cell, creating it if it does not already exist. A readiness gate is a small shared signal that says whether work for that cell may run.
 
-**Data flow**: Locks the `dispatch_gates` mutex, recovering from poisoning by taking the inner map, inserts `watch::channel(false).0` if the cell id is absent, clones the sender, and returns it.
+**Data flow**: It receives the shared gate map and a cell id. It locks the map, recovers even if the lock was previously poisoned by a panic, then either reuses the existing signal sender or creates a new one starting at false. It returns a clone of that sender.
 
-**Call relations**: Used by readiness marking and by waiters that need to subscribe to a cell’s readiness state.
+**Call relations**: CodeModeDispatchBroker::mark_cell_ready_for_dispatch uses this to open a cell’s gate. wait_until_cell_ready_for_dispatch uses it to subscribe to the same gate and wait until it opens.
 
 *Call graph*: called by 2 (mark_cell_ready_for_dispatch, wait_until_cell_ready_for_dispatch); 1 external calls (clone).
 
@@ -5248,11 +5276,11 @@ fn remove_dispatch_gate(
 )
 ```
 
-**Purpose**: Deletes a cell’s readiness gate from the shared gate map.
+**Purpose**: Deletes the stored readiness gate for a cell. This is cleanup for cells that close or whose pending work is cancelled before dispatch.
 
-**Data flow**: Locks the mutex, recovering from poisoning if necessary, removes the entry for `cell_id`, and returns unit.
+**Data flow**: It receives the shared gate map and a cell id. It locks the map and removes that cell’s entry. It returns nothing, but the shared map no longer keeps state for that cell.
 
-**Call relations**: Called when cells close or when a queued dispatch is cancelled before readiness.
+**Call relations**: CodeModeDispatchBroker::close_cell calls this when a cell is explicitly closed. CodeModeDispatchBroker::start_turn_worker also calls it when a wait is cancelled, so abandoned cells do not leave stale gates behind.
 
 *Call graph*: called by 2 (close_cell, start_turn_worker).
 
@@ -5267,11 +5295,11 @@ async fn wait_until_cell_ready_for_dispatch(
 ) -> bool
 ```
 
-**Purpose**: Waits until a cell’s readiness gate becomes true or the operation is cancelled/closed.
+**Purpose**: Waits until a cell is allowed to dispatch work, unless the operation is cancelled first. This protects the ordering of cell activity.
 
-**Data flow**: Immediately returns `false` if `cancellation_token` is already cancelled. Otherwise it subscribes to the cell’s watch sender via `dispatch_gate(...).subscribe()`, loops checking `borrow_and_update()`, and uses `tokio::select!` to await either `ready_rx.changed()` or `cancellation_token.cancelled()`. It returns `true` on readiness and `false` on cancellation or watch closure.
+**Data flow**: It receives the shared gate map, a cell id, and a cancellation token. If cancellation has already happened, it immediately returns false. Otherwise it subscribes to the cell’s gate and loops until the gate value becomes true. If the gate disappears or the cancellation token fires, it returns false; if the gate opens, it returns true.
 
-**Call relations**: Used by the worker before delivering notifications or nested tool calls to ensure dispatch does not race ahead of runtime startup.
+**Call relations**: CodeModeDispatchBroker::start_turn_worker calls this before processing both notifications and nested tool calls. It relies on dispatch_gate to find the signal that mark_cell_ready_for_dispatch will later open.
 
 *Call graph*: calls 1 internal fn (dispatch_gate); called by 1 (start_turn_worker); 2 external calls (is_cancelled, select!).
 
@@ -5286,11 +5314,11 @@ fn invoke_tool(
     ) -> ToolInvocationFuture<'a>
 ```
 
-**Purpose**: Implements the delegate API for nested tool invocation by queueing a dispatch request and awaiting its JSON result.
+**Purpose**: Accepts a nested tool call from code mode and sends it to the dispatch worker. It gives the caller a future result, meaning the caller can wait asynchronously for the tool output.
 
-**Data flow**: Returns a boxed future that first checks cancellation, creates a oneshot response channel, sends `DispatchMessage::InvokeTool { invocation, cancellation_token: clone, response_tx }` on `dispatch_tx`, maps send failure to an unavailable-dispatcher error, then `select!`s between the oneshot response and cancellation. It returns `Result<JsonValue, String>`.
+**Data flow**: It receives a nested tool invocation and a cancellation token. If already cancelled, it returns an error. Otherwise it creates a one-time response channel, sends an InvokeTool message into the broker’s queue, then waits for either the worker’s response or cancellation. The result is either JSON tool output or a clear error string.
 
-**Call relations**: Called by the external code-mode runtime through the `CodeModeSessionDelegate` trait when script code invokes another tool.
+**Call relations**: This method is part of the CodeModeSessionDelegate implementation, so code-mode session code calls it through that delegate interface. It does not run the tool itself; it hands the request to the worker started by start_turn_worker, which later calls CoreTurnHost::invoke_tool.
 
 *Call graph*: 6 external calls (pin, clone, is_cancelled, send, channel, select!).
 
@@ -5307,11 +5335,11 @@ fn notify(
     ) -> NotificationFuture<'a>
 ```
 
-**Purpose**: Implements the delegate API for runtime notifications by queueing a notify dispatch and awaiting completion.
+**Purpose**: Accepts a text notification from code mode and sends it to the dispatch worker. This lets a cell report output back into the active session in the right order.
 
-**Data flow**: Returns a boxed future that checks cancellation, creates a oneshot response channel, sends `DispatchMessage::Notify { call_id, cell_id, text, cancellation_token: clone, response_tx }`, maps send failure to an unavailable-dispatcher error, then waits for either the response or cancellation and returns `Result<(), String>`.
+**Data flow**: It receives a call id, cell id, text, and cancellation token. If already cancelled, it returns an error. Otherwise it creates a one-time response channel, sends a Notify message into the broker’s queue, then waits for either the worker’s completion result or cancellation. The result is success or an error string.
 
-**Call relations**: Called by the external code-mode runtime when script execution wants to emit incremental output into the active turn.
+**Call relations**: This method is also part of the CodeModeSessionDelegate implementation. It queues the notification, and the worker later waits for the cell gate before calling CoreTurnHost::notify to inject the message into the running session.
 
 *Call graph*: 6 external calls (pin, clone, is_cancelled, send, channel, select!).
 
@@ -5322,11 +5350,11 @@ fn notify(
 fn cell_closed(&self, cell_id: &CellId)
 ```
 
-**Purpose**: Implements the delegate callback that signals a cell has closed.
+**Purpose**: Responds to code mode telling the broker that a cell has closed. It removes that cell’s dispatch state.
 
-**Data flow**: Forwards the provided `cell_id` to `close_cell` and returns unit.
+**Data flow**: It receives a cell id. It passes that id to close_cell, which removes the stored gate for the cell. Nothing is returned.
 
-**Call relations**: Invoked by the code-mode runtime through the delegate trait when a cell’s lifecycle ends.
+**Call relations**: This is the delegate-facing hook for cell cleanup. It simply forwards to CodeModeDispatchBroker::close_cell so the same cleanup path is used consistently.
 
 *Call graph*: calls 1 internal fn (close_cell).
 
@@ -5337,11 +5365,11 @@ fn cell_closed(&self, cell_id: &CellId)
 fn drop(&mut self)
 ```
 
-**Purpose**: Stops the background dispatch loop when the worker handle is dropped.
+**Purpose**: Stops the background dispatch worker when the worker handle is no longer needed. This ties the spawned task’s lifetime to the returned CodeModeDispatchWorker value.
 
-**Data flow**: Takes `shutdown_tx` out of the option and sends `()` on it if present, ignoring send errors.
+**Data flow**: When the CodeModeDispatchWorker is dropped, it takes its stored shutdown sender, if one is still present, and sends a shutdown signal. There is no meaningful returned value; the side effect is that the worker loop can exit.
 
-**Call relations**: Runs automatically when the per-turn worker goes out of scope, ensuring the spawned loop exits.
+**Call relations**: CodeModeDispatchBroker::start_turn_worker creates this worker handle and gives it to the caller. When the caller lets the handle go, this drop method signals the spawned dispatch loop to stop.
 
 
 ##### `CoreTurnHost::invoke_tool`  (lines 280–293)
@@ -5354,11 +5382,11 @@ async fn invoke_tool(
     ) -> Result<JsonValue, String>
 ```
 
-**Purpose**: Executes a nested tool call inside the current turn and converts any tool error into a string.
+**Purpose**: Runs a nested code-mode tool call using the normal core tool execution path. This keeps code-mode tools from needing a separate execution system.
 
-**Data flow**: Clones `exec` and `tool_runtime`, passes them with `invocation` and `cancellation_token` to `call_nested_tool`, awaits the result, and maps `FunctionCallError` to `String` via `to_string()`.
+**Data flow**: It receives a nested tool invocation and a cancellation token. It combines those with the stored execution context and tool runtime, calls call_nested_tool, waits for the result, and turns any error into a plain string. The output is JSON data from the tool or an error string.
 
-**Call relations**: Called by the dispatch worker when it processes an `InvokeTool` message.
+**Call relations**: The dispatch worker calls this after a cell’s gate has opened. This function hands off to call_nested_tool, which is the lower-level path that actually performs the nested tool call.
 
 *Call graph*: 3 external calls (clone, clone, call_nested_tool).
 
@@ -5369,20 +5397,26 @@ async fn invoke_tool(
 async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String>
 ```
 
-**Purpose**: Injects a code-mode notification into the running session as a custom tool-call output item.
+**Purpose**: Injects non-empty code-mode notification text back into the active session as a custom tool output message. Empty or whitespace-only text is ignored.
 
-**Data flow**: If `text.trim().is_empty()`, returns `Ok(())` immediately. Otherwise it builds a single `ResponseItem::CustomToolCallOutput` with the provided `call_id`, `PUBLIC_TOOL_NAME`, and `FunctionCallOutputPayload::from_text(text)`, then calls `session.inject_if_running(...)`. Failure to inject is mapped to an error string mentioning the `cell_id` and lack of an active turn.
+**Data flow**: It receives a call id, cell id, and text. If the text is blank after trimming, it returns success without changing anything. Otherwise it builds a CustomToolCallOutput message using the public tool name and the text payload, then asks the active session to inject it. It returns success, or an error explaining that there was no active turn to receive the message.
 
-**Call relations**: Called by the dispatch worker when it processes a `Notify` message after the target cell becomes ready.
+**Call relations**: The dispatch worker calls this after wait_until_cell_ready_for_dispatch says the cell may dispatch. It hands the finished notification to the session through inject_if_running, so the rest of the system sees it as tool output for the current turn.
 
 *Call graph*: 1 external calls (vec!).
 
 
 ### `ext/guardian/src/lib.rs`
 
-`orchestration` · `thread startup / guardian subagent spawning`
+`orchestration` · `extension install and thread startup`
 
-This file defines two small types and installs one thread lifecycle contributor. `GuardianExtension<S>` stores an arbitrary host-provided spawner implementation and exposes `spawn_subagent`, which simply forwards a guardian-owned spawn request together with the thread to fork from. `GuardianThreadContext` is the thread-local state inserted into extension data at thread start; it stores the current thread's `ThreadId` as the default `forked_from_thread_id` for future guardian subagents. The lifecycle implementation is intentionally conservative: on thread start it attempts to parse the thread store's level id into a `ThreadId`, and if parsing fails it silently returns without inserting context. That means malformed or non-thread-scoped stores do not crash startup, but guardian-dependent code must tolerate missing context. The `install` function wires the extension into the registry only as a thread lifecycle contributor; there are no tools or config hooks here. Overall, the file is mostly glue code, but the important invariant is that guardian subagent spawning should default to the thread that was actually started, as captured in thread-local extension data.
+The Guardian extension needs two things from the wider system: a way to start subagents, and a way to know which conversation thread those subagents should come from. This file provides that bridge. Think of it like a concierge desk: Guardian asks for a new helper agent, but the host owns the keys and actually opens the room.
+
+`GuardianExtension` stores a host-provided agent spawner. When Guardian wants to create a subagent, it does not create one directly. It forwards the request to that spawner, along with the thread ID the new agent should be forked from.
+
+The file also defines `GuardianThreadContext`, a small piece of per-thread state. When a thread starts, the extension looks at the thread store’s level ID and tries to turn it into a `ThreadId`. If that works, it saves the ID into the thread store so later Guardian code can find the correct parent thread. If the ID cannot be parsed, it quietly does nothing rather than stopping thread startup.
+
+Finally, `install` registers this extension with the application’s extension registry, so the host will call it during thread lifecycle events.
 
 #### Function details
 
@@ -5392,11 +5426,11 @@ This file defines two small types and installs one thread lifecycle contributor.
 fn new(agent_spawner: S) -> Self
 ```
 
-**Purpose**: Constructs a guardian extension around a host-provided agent spawner. It is the only stateful initializer in the file.
+**Purpose**: Creates a Guardian extension around the host’s agent-spawning helper. This is used when the extension is being registered with the rest of the system.
 
-**Data flow**: It takes an `agent_spawner` of generic type `S`, stores it in `GuardianExtension`, and returns the new extension value.
+**Data flow**: It receives an agent spawner from the host. It stores that spawner inside a new `GuardianExtension` value. The result is an extension object ready to be registered or cloned.
 
-**Call relations**: It is called by `install` when registering the extension. The resulting instance later services thread-start callbacks and spawn forwarding.
+**Call relations**: During installation, `install` calls this function to build the Guardian extension before placing it into the extension registry.
 
 *Call graph*: called by 1 (install).
 
@@ -5411,11 +5445,11 @@ fn spawn_subagent(
     ) -> AgentSpawnFuture<'a, <S as AgentSpawner<R>>::Spawned, <S as AgentSpawner<R>>::Error>
 ```
 
-**Purpose**: Forwards one guardian subagent spawn request to the wrapped host spawner. It does not add policy or transformation beyond delegation.
+**Purpose**: Asks the host to start a Guardian-owned subagent. Guardian uses this instead of creating agents itself, because the host controls the real spawning process.
 
-**Data flow**: It takes `&self`, a `forked_from_thread_id`, and a generic request `R`, calls `self.agent_spawner.spawn_subagent(forked_from_thread_id, request)`, and returns the host spawner's future.
+**Data flow**: It receives the thread ID to fork from and a spawn request. It passes both to the stored host spawner. It returns a future, meaning the actual spawn completes asynchronously later, with either the spawned agent information or an error.
 
-**Call relations**: It is intended to be called by guardian logic elsewhere once a thread context has identified the correct fork source. Its only downstream dependency is the external `AgentSpawner` implementation.
+**Call relations**: This function is the Guardian extension’s doorway to the host’s spawning system. When Guardian needs a subagent, it forwards the work to the underlying spawner’s own `spawn_subagent` method.
 
 *Call graph*: 1 external calls (spawn_subagent).
 
@@ -5426,11 +5460,11 @@ fn spawn_subagent(
 fn forked_from_thread_id(&self) -> ThreadId
 ```
 
-**Purpose**: Returns the stored default fork source thread id for guardian subagents. It is the read accessor for thread-local guardian context.
+**Purpose**: Returns the parent thread ID saved for this Guardian thread context. Other Guardian code can use it to know which thread future subagents should branch from by default.
 
-**Data flow**: It reads the `forked_from_thread_id` field from `self` and returns that `ThreadId` by value.
+**Data flow**: It reads the stored `forked_from_thread_id` from the context. It returns that ID without changing anything.
 
-**Call relations**: It is used by code that retrieves `GuardianThreadContext` from thread-scoped extension data after `on_thread_start` has inserted it.
+**Call relations**: This is a small accessor for the context created at thread startup. Code that later retrieves `GuardianThreadContext` from the thread store can call this to get the saved parent thread.
 
 
 ##### `GuardianExtension::on_thread_start`  (lines 55–68)
@@ -5442,11 +5476,11 @@ fn on_thread_start(
     ) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Captures the current thread id into thread-scoped guardian context when a thread starts. It seeds the default fork ancestry used by later guardian operations.
+**Purpose**: Runs when the host starts a thread and records the thread ID that Guardian should use as the source for future subagents. This gives later Guardian work a reliable default parent thread.
 
-**Data flow**: It reads `input.thread_store.level_id()`, attempts to parse it with `ThreadId::from_string`, returns early on parse failure, and on success inserts `GuardianThreadContext { forked_from_thread_id }` into the thread store inside a boxed async future.
+**Data flow**: It receives thread-start information, including the thread store. It reads the store’s level ID and tries to convert it into a `ThreadId`. If conversion succeeds, it inserts a `GuardianThreadContext` containing that ID into the thread store; if conversion fails, it leaves the store unchanged. It returns an asynchronous task that completes with no value.
 
-**Call relations**: The extension framework invokes it during thread startup because `GuardianExtension` implements `ThreadLifecycleContributor<Config>`. It prepares the thread-local state later consumed by guardian code.
+**Call relations**: The host calls this through the thread lifecycle system after the extension has been registered. It prepares state that later Guardian code can retrieve, while using an asynchronous wrapper because lifecycle contributors return futures.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (pin).
 
@@ -5457,11 +5491,11 @@ fn on_thread_start(
 fn install(registry: &mut ExtensionRegistryBuilder<Config>, agent_spawner: S)
 ```
 
-**Purpose**: Registers the guardian extension with the extension registry. It is the file's public integration entry point.
+**Purpose**: Registers the Guardian extension with the host’s extension registry. Without this, the Guardian code would not be called when threads start.
 
-**Data flow**: It takes a mutable `ExtensionRegistryBuilder<Config>` and an `agent_spawner`, constructs a `GuardianExtension` wrapped in `Arc`, and registers it as a thread lifecycle contributor.
+**Data flow**: It receives the extension registry builder and the host’s agent spawner. It creates a `GuardianExtension`, wraps it in shared ownership so the registry can keep it safely, and adds it as a thread lifecycle contributor. It changes the registry builder by adding this contributor.
 
-**Call relations**: Hosts call this during extension setup. It delegates construction to `GuardianExtension::new` and registry wiring to `thread_lifecycle_contributor`.
+**Call relations**: This is the setup entry point for the file. The wider application calls it while assembling extensions, and it wires `GuardianExtension::on_thread_start` into the host’s thread-start flow.
 
 *Call graph*: calls 2 internal fn (thread_lifecycle_contributor, new); 1 external calls (new).
 
@@ -5471,15 +5505,13 @@ This group describes the persisted batch-job workflow that spawns worker agents 
 
 ### `core/src/tools/handlers/agent_jobs.rs`
 
-`domain_logic` · `background job execution`
+`orchestration` · `request handling and background job execution`
 
-This file provides the common machinery behind agent-job tools such as spawning workers from CSV rows and reporting results. It defines argument/result structs, job-runner configuration (`JobRunnerOptions`), and in-memory tracking for active worker threads (`ActiveJobItem`). The state DB is mandatory for this subsystem; `required_state_db` fails fast with a fatal error if the session lacks SQLite-backed state.
+This file exists so one user request can be split into many smaller pieces of work. A CSV file is like a stack of forms; this code gives each form to a separate worker agent, asks the worker to report back through a tool call, and then writes a final spreadsheet showing the original data plus job status and results. Without this file, the system could still talk to agents one at a time, but it would not have the machinery to run a large CSV-backed job safely, resume running items, stop stalled workers, or export a useful result file.
 
-`build_runner_options` enforces multi-agent availability and thread limits from `TurnContext`, clamps requested concurrency through `normalize_concurrency`, fetches base instructions from the session, and derives a worker spawn `Config` via `build_agent_spawn_config`. Runtime limits are normalized separately by `normalize_max_runtime_seconds`.
+The main loop reads the job from the state database, starts worker agents up to a safe concurrency limit, watches their status, and marks each row as completed or failed. It also handles practical problems: the multi-agent runtime may be disabled, the system may hit a thread limit, a worker may finish without reporting a result, or a worker may run too long. In those cases, it records clear failure messages rather than silently losing work.
 
-The heart of the file is `run_agent_job_loop`. It loads the persisted job, computes a per-item timeout, recovers any already-running items from the DB, and then loops until all work is done or cancellation drains active workers. Within each iteration it may spawn new workers for pending items up to `max_concurrency`, mark spawn failures in the DB, reap stale active items, detect finished threads, and finalize completed items. Worker prompts are generated by `build_worker_prompt`, which renders row-specific placeholders into the job instruction and instructs the worker to call `report_agent_job_result` exactly once.
-
-The file also contains CSV utilities: `parse_csv` reads flexible-header CSV while stripping a BOM from the first header and skipping fully empty rows; `ensure_unique_headers` rejects duplicate columns; `render_job_csv` writes original row columns plus job metadata/result columns, escaping values with `csv_escape`. Time-based helpers reconstruct `Instant` values from persisted timestamps and detect stale items based on `updated_at`.
+The file also includes small CSV helpers. They read input rows, check headers, choose a default output path, escape CSV values correctly, and render each job item back into a spreadsheet. Think of the file as the foreman for a work crew: it assigns tasks, watches the workers, writes down what happened, and closes the job when the work is done.
 
 #### Function details
 
@@ -5491,11 +5523,11 @@ fn required_state_db(
 ) -> Result<Arc<codex_state::StateRuntime>, FunctionCallError>
 ```
 
-**Purpose**: Fetches the session's state runtime and fails with a fatal tool error if no SQLite-backed state DB is available. Agent jobs cannot operate without persistent state.
+**Purpose**: Gets the session’s state database, which is where agent jobs and their row-by-row progress are stored. If the session has no database, it turns that into a fatal tool error because the job cannot be tracked safely.
 
-**Data flow**: Takes `session: &Arc<Session>` → calls `session.state_db()` → returns `Ok(Arc<StateRuntime>)` if present, otherwise `Err(FunctionCallError::Fatal("sqlite state db is unavailable for this session"))`.
+**Data flow**: It receives a shared session. It asks the session for its state database. If one exists, it returns it; if not, it returns an error explaining that SQLite state storage is unavailable.
 
-**Call relations**: Agent-job handlers call this before performing any DB-backed operation. It has no delegates beyond the session accessor and acts as a prerequisite gate for the subsystem.
+**Call relations**: This is a gatekeeper helper for the agent job tool flow. The call facts do not show a direct caller inside this file, but it is meant to be used before starting or reporting job work so later code can rely on persistent job state.
 
 
 ##### `build_runner_options`  (lines 108–132)
@@ -5508,11 +5540,11 @@ async fn build_runner_options(
 ) -> Result<JobRunnerOptions, FunctionCallError>
 ```
 
-**Purpose**: Validates that multi-agent execution is enabled and capacity exists, then computes the effective concurrency and worker spawn configuration for a job run. It packages those decisions into `JobRunnerOptions`.
+**Purpose**: Prepares the settings needed to run worker agents for a job. It checks whether multi-agent work is allowed, chooses a safe concurrency limit, and builds the configuration that each worker agent will use.
 
-**Data flow**: Takes `session`, `turn`, and optional requested concurrency → reads `turn.multi_agent_version` and rejects `Disabled` with `RespondToModel` → reads `turn.config.effective_agent_max_threads(...)` and rejects `Some(0)` similarly → computes `max_concurrency = normalize_concurrency(requested_concurrency, agent_max_threads)` → awaits `session.get_base_instructions()` → calls `build_agent_spawn_config(&base_instructions, turn.as_ref())` → returns `JobRunnerOptions { max_concurrency, spawn_config }`.
+**Data flow**: It receives the current session, turn context, and an optional requested concurrency. It reads the multi-agent setting and thread limits, rejects the request if workers are not allowed, normalizes the concurrency number, gets the session’s base instructions, builds a spawn configuration, and returns those choices as `JobRunnerOptions`.
 
-**Call relations**: This helper is used by higher-level agent-job handlers before launching `run_agent_job_loop`. It delegates concurrency clamping to `normalize_concurrency` and spawn-config construction to `build_agent_spawn_config`.
+**Call relations**: This function sits before the job loop starts. It calls `normalize_concurrency` to turn user preference and system limits into one number, then calls `build_agent_spawn_config` so `run_agent_job_loop` can later spawn workers with consistent instructions and settings.
 
 *Call graph*: calls 1 internal fn (normalize_concurrency); 2 external calls (build_agent_spawn_config, RespondToModel).
 
@@ -5523,11 +5555,11 @@ async fn build_runner_options(
 fn normalize_concurrency(requested: Option<usize>, max_threads: Option<usize>) -> usize
 ```
 
-**Purpose**: Clamps requested job concurrency to a valid, bounded value and optionally to the session's remaining agent-thread limit. It prevents zero, excessive, or over-capacity worker counts.
+**Purpose**: Turns a requested worker count into a safe, usable number. It enforces a default, a minimum of one, this file’s maximum cap, and any session-wide thread limit.
 
-**Data flow**: Takes `requested: Option<usize>` and `max_threads: Option<usize>` → defaults missing requests to `DEFAULT_AGENT_JOB_CONCURRENCY`, enforces minimum 1, caps at `MAX_AGENT_JOB_CONCURRENCY`, and if `max_threads` is present further caps to `max_threads.max(1)` → returns the effective `usize`.
+**Data flow**: It receives an optional requested count and an optional maximum thread count. Missing input becomes the default, zero becomes one, very large values are capped, and the result is reduced further if the session has a smaller thread limit. It returns the final worker count.
 
-**Call relations**: Called by `build_runner_options` to derive the final worker concurrency. It is a pure helper with no side effects.
+**Call relations**: `build_runner_options` calls this when preparing a job. Its result controls how many items `run_agent_job_loop` may keep active at the same time.
 
 *Call graph*: called by 1 (build_runner_options).
 
@@ -5538,11 +5570,11 @@ fn normalize_concurrency(requested: Option<usize>, max_threads: Option<usize>) -
 fn normalize_max_runtime_seconds(requested: Option<u64>) -> Result<Option<u64>, FunctionCallError>
 ```
 
-**Purpose**: Validates the optional per-item runtime limit supplied by the caller. Zero is rejected because a timeout must be at least one second.
+**Purpose**: Validates the optional maximum runtime for each worker item. It rejects zero because a worker cannot be expected to finish in no time.
 
-**Data flow**: Takes `requested: Option<u64>` → returns `Ok(None)` if absent → if present and zero, returns `Err(FunctionCallError::RespondToModel("max_runtime_seconds must be >= 1"))` → otherwise returns `Ok(Some(requested))`.
+**Data flow**: It receives an optional number of seconds. If no value was provided, it returns no limit override. If the value is zero, it returns a model-facing error. Otherwise, it returns the same number wrapped as an accepted setting.
 
-**Call relations**: Higher-level agent-job handlers use this when parsing tool arguments. It is a pure validation helper.
+**Call relations**: The call facts do not show a direct caller in this file, but this helper belongs to the job-creation path. Its output is later stored on the job and read by `job_runtime_timeout` during execution.
 
 *Call graph*: 1 external calls (RespondToModel).
 
@@ -5559,11 +5591,11 @@ async fn run_agent_job_loop(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs the full lifecycle of an agent job: recovering persisted running items, spawning workers for pending rows, monitoring active threads, timing out stale work, finalizing completed items, exporting the final CSV snapshot, and marking the job complete unless cancelled. It is the main scheduler loop for the subsystem.
+**Purpose**: Runs the main lifecycle of an agent job from pending rows to final export. It starts workers, watches them, records failures, respects cancellation, and marks the job complete when all work is done.
 
-**Data flow**: Takes owned `session`, `turn`, `db`, `job_id`, and `options` → loads the job from DB, computes `runtime_timeout = job_runtime_timeout(&job)`, initializes `active_items`, and calls `recover_running_items(...)`. It then loops: refreshes cancellation state from DB; if not cancelled and capacity remains, fetches pending items up to available slots, builds each worker prompt with `build_worker_prompt`, wraps it as `UserInput::Text`, and calls `session.services.agent_control.spawn_agent_with_metadata(...)` using `options.spawn_config`, parent thread id, and environment selections. Spawn limit errors requeue the item as pending and stop filling slots; other spawn errors mark the item failed. Successfully spawned items are marked running with thread id in DB; if assignment loses a race, the live agent is shut down. Active items store `item_id`, `Instant::now()`, and an optional status subscription receiver. Each loop iteration also calls `reap_stale_active_items(...)`, `find_finished_threads(...)`, and for each finished thread `finalize_finished_item(...)` then removes it from `active_items`. If nothing finished, it checks DB progress to decide whether to break or await `wait_for_status_change(...)`. After the loop, it attempts `export_job_csv_snapshot(...)`; export failure marks the whole job failed. If the job is not cancelled, it marks the job completed in DB.
+**Data flow**: It receives the session, turn context, state database, job id, and runner options. It loads the job, recovers any already-running rows, then repeatedly fills open worker slots with pending items, checks for timed-out workers, detects finished workers, and updates the database. At the end it writes an output CSV snapshot and marks the job completed unless it was cancelled or export failed.
 
-**Call relations**: This function is invoked by the higher-level spawn-agent job handler after job creation. It delegates prompt generation, stale-item cleanup, finished-thread detection, item finalization, waiting, timeout calculation, and CSV export to dedicated helpers, while directly orchestrating DB state transitions and agent-control service calls.
+**Call relations**: This is the central coordinator. It calls `job_runtime_timeout`, `recover_running_items`, `build_worker_prompt`, `reap_stale_active_items`, `find_finished_threads`, `wait_for_status_change`, `finalize_finished_item`, and `export_job_csv_snapshot` as the job moves through assignment, monitoring, cleanup, and export.
 
 *Call graph*: calls 8 internal fn (build_worker_prompt, export_job_csv_snapshot, finalize_finished_item, find_finished_threads, job_runtime_timeout, reap_stale_active_items, recover_running_items, wait_for_status_change); 7 external calls (default, new, now, SubAgent, format!, Other, vec!).
 
@@ -5577,11 +5609,11 @@ async fn export_job_csv_snapshot(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes the current job state to the configured output CSV path. It is used both as the final export step and as a failure point that can mark the job failed if snapshot generation breaks.
+**Purpose**: Writes the current job results to the configured output CSV file. This gives users a durable spreadsheet-style record of every row, status, error, and reported result.
 
-**Data flow**: Takes `db` and `job` → loads all job items with `list_agent_job_items(job.id, None, None)` → renders CSV text with `render_job_csv(job.input_headers.as_slice(), items.as_slice())`, wrapping render errors in `anyhow!` → builds `PathBuf` from `job.output_csv_path`, creates parent directories if needed with `tokio::fs::create_dir_all`, writes the CSV with `tokio::fs::write`, and returns `anyhow::Result<()>`.
+**Data flow**: It receives the state database and job record. It loads all job items, asks `render_job_csv` to turn them into CSV text, creates the output directory if needed, writes the file to disk, and returns success or an error.
 
-**Call relations**: Called at the end of `run_agent_job_loop`. It delegates CSV string generation to `render_job_csv` and filesystem operations to Tokio FS helpers.
+**Call relations**: `run_agent_job_loop` calls this at the end of a job. It hands the rendering work to `render_job_csv`, then uses file-system operations to save the result.
 
 *Call graph*: calls 1 internal fn (render_job_csv); called by 1 (run_agent_job_loop); 3 external calls (from, create_dir_all, write).
 
@@ -5597,11 +5629,11 @@ async fn recover_running_items(
     runtime_timeout: Durat
 ```
 
-**Purpose**: Reconstructs in-memory tracking for job items already marked running in the DB, while cleaning up stale or malformed entries and immediately finalizing workers that have already reached a final status. This lets job execution resume after restarts or interruptions.
+**Purpose**: Rebuilds the in-memory list of workers that were already running when the loop starts. This matters after a restart or handoff, so rows are not forgotten or duplicated.
 
-**Data flow**: Takes `session`, `db`, `job_id`, mutable `active_items`, and `runtime_timeout` → queries running items from DB → for each item: if `is_item_stale(item, runtime_timeout)`, marks it failed with a timeout message and shuts down its assigned thread if parseable; if `assigned_thread_id` is missing, marks failed; if thread id parsing via `ThreadId::from_string` fails, marks failed; otherwise checks current agent status with `session.services.agent_control.get_status(thread_id).await`. If status is final, calls `finalize_finished_item(...)`; else inserts `ActiveJobItem { item_id, started_at: started_at_from_item(&item), status_rx: subscribe_status(thread_id).await.ok() }` into `active_items`.
+**Data flow**: It receives the session, database, job id, active-items map, and timeout. It loads items marked as running. Stale items are failed and their agents are shut down. Items with missing or invalid thread ids are failed. Finished agents are finalized. Still-running agents are put back into the active-items map with their start time and status subscription.
 
-**Call relations**: This helper is called once near the start of `run_agent_job_loop`. It delegates stale detection to `is_item_stale`, start-time reconstruction to `started_at_from_item`, and completion handling to `finalize_finished_item`.
+**Call relations**: `run_agent_job_loop` calls this before entering its main loop. It uses `is_item_stale`, `started_at_from_item`, and `finalize_finished_item`, and it checks final agent states with `is_final`.
 
 *Call graph*: calls 5 internal fn (is_final, finalize_finished_item, is_item_stale, started_at_from_item, from_string); called by 1 (run_agent_job_loop); 1 external calls (format!).
 
@@ -5615,11 +5647,11 @@ async fn find_finished_threads(
 ) -> Vec<(ThreadId, String)>
 ```
 
-**Purpose**: Scans the currently active worker threads and returns those whose agent status is final. It converts the active-item map into a list of thread/item pairs ready for finalization.
+**Purpose**: Finds active worker agents that have reached a final state, such as done or failed. It lets the main loop know which rows are ready for final database cleanup.
 
-**Data flow**: Takes `session` and `active_items: &HashMap<ThreadId, ActiveJobItem>` → iterates each `(thread_id, item)` → awaits `active_item_status(session.as_ref(), *thread_id, item)` → if `is_final(&status)`, pushes `(*thread_id, item.item_id.clone())` into a result vector → returns that vector.
+**Data flow**: It receives the session and the map of active worker items. For each worker thread, it gets the latest status through `active_item_status`; if that status is final, it records the thread id and item id. It returns the list of finished workers.
 
-**Call relations**: Called on each scheduler iteration by `run_agent_job_loop`. It delegates status retrieval to `active_item_status` and finality checks to `is_final`.
+**Call relations**: `run_agent_job_loop` calls this on each pass through the loop. It delegates status lookup to `active_item_status` and uses `is_final` to decide which workers need finalization.
 
 *Call graph*: calls 2 internal fn (is_final, active_item_status); called by 1 (run_agent_job_loop); 1 external calls (new).
 
@@ -5634,11 +5666,11 @@ async fn active_item_status(
 ) -> AgentStatus
 ```
 
-**Purpose**: Retrieves the latest known status for an active worker, preferring a changed watch receiver value when available and falling back to a direct status query. This reduces polling overhead while still handling stale subscriptions.
+**Purpose**: Gets the best available status for one active worker. It prefers a live subscription update when one is available, and falls back to asking the agent controller directly.
 
-**Data flow**: Takes `session: &Session`, `thread_id`, and `item: &ActiveJobItem` → if `item.status_rx` exists and `has_changed().is_ok()`, returns `status_rx.borrow().clone()` → otherwise awaits `session.services.agent_control.get_status(thread_id)` and returns that `AgentStatus`.
+**Data flow**: It receives the session, a worker thread id, and the active item record. If the item has a status receiver with a changed value, it returns that value. Otherwise, it queries the agent control service for the thread’s current status and returns it.
 
-**Call relations**: Used by `find_finished_threads` during each loop iteration. It encapsulates the choice between watch-based updates and direct polling.
+**Call relations**: `find_finished_threads` calls this while scanning active workers. It keeps status checking efficient without making the rest of the loop care where the status came from.
 
 *Call graph*: called by 1 (find_finished_threads).
 
@@ -5649,11 +5681,11 @@ async fn active_item_status(
 async fn wait_for_status_change(active_items: &HashMap<ThreadId, ActiveJobItem>)
 ```
 
-**Purpose**: Sleeps until either one active worker status receiver changes or a short poll interval elapses. It prevents the scheduler loop from busy-spinning when no immediate progress is available.
+**Purpose**: Pauses the job loop briefly when nothing changed, so it does not waste CPU by spinning constantly. It wakes up early if any worker reports a status change.
 
-**Data flow**: Takes `active_items` → builds a `FuturesUnordered` of `status_rx.changed().await` futures for all items that have a receiver → if no waiters exist, sleeps for `STATUS_POLL_INTERVAL` and returns → otherwise awaits `timeout(STATUS_POLL_INTERVAL, waiters.next())` and ignores the result.
+**Data flow**: It receives the active-items map. It builds waiters for each item that has a status subscription. If none exist, it sleeps for a short polling interval. If subscriptions exist, it waits until one changes or the polling interval expires.
 
-**Call relations**: Called by `run_agent_job_loop` only when no threads finished and no other progress occurred. It delegates timing to Tokio `sleep`/`timeout` and uses watch receivers cloned from `ActiveJobItem`.
+**Call relations**: `run_agent_job_loop` calls this only when no progress was made in the current loop pass. It is the loop’s polite waiting room between checks.
 
 *Call graph*: called by 1 (run_agent_job_loop); 3 external calls (new, sleep, timeout).
 
@@ -5669,11 +5701,11 @@ async fn reap_stale_active_items(
     runtime_timeout: Dur
 ```
 
-**Purpose**: Detects active workers whose in-memory runtime has exceeded the allowed timeout, marks their job items failed, shuts down the live agents, and removes them from the active set. It handles timeout enforcement during normal loop execution.
+**Purpose**: Finds active workers that have run longer than allowed and marks their rows as failed. It prevents a stuck worker from blocking the whole job forever.
 
-**Data flow**: Takes `session`, `db`, `job_id`, mutable `active_items`, and `runtime_timeout` → scans `active_items` for entries where `item.started_at.elapsed() >= runtime_timeout`, collecting stale `(thread_id, item_id)` pairs → if none, returns `Ok(false)` → otherwise for each stale item marks the DB row failed with a timeout message, calls `shutdown_live_agent(thread_id)`, removes it from `active_items`, and finally returns `Ok(true)`.
+**Data flow**: It receives the session, database, job id, active-items map, and runtime timeout. It compares each active item’s elapsed time with the timeout, records failures for stale items, shuts down their worker agents, removes them from the active map, and returns whether anything changed.
 
-**Call relations**: Called on each iteration by `run_agent_job_loop` after potential spawning. It complements `recover_running_items`, which handles stale persisted items at startup.
+**Call relations**: `run_agent_job_loop` calls this during each loop pass before looking for normal completions. It acts as the timeout cleanup step for currently tracked workers.
 
 *Call graph*: called by 1 (run_agent_job_loop); 2 external calls (new, format!).
 
@@ -5690,11 +5722,11 @@ async fn finalize_finished_item(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Transitions a finished worker's DB item out of running state based on whether it reported a result, then shuts down the live agent thread. It enforces the invariant that workers must call `report_agent_job_result` before finishing.
+**Purpose**: Closes out a worker after its agent has finished. It marks the row completed only if the worker reported a result; otherwise it marks the row failed with a clear message.
 
-**Data flow**: Takes `session`, `db`, `job_id`, `item_id`, and `thread_id` → loads the item from DB and errors if missing → if `item.status` is still `Running`, checks `item.result_json`: if present, marks the item completed; otherwise marks it failed with `worker finished without calling report_agent_job_result` → regardless, calls `shutdown_live_agent(thread_id)` and returns `Ok(())`.
+**Data flow**: It receives the session, database, job id, item id, and worker thread id. It loads the item from the database. If the item is still marked running, it checks whether result JSON was recorded. A reported result becomes completed; a missing result becomes failed. Finally, it shuts down the worker agent.
 
-**Call relations**: Called by both `recover_running_items` and `run_agent_job_loop` when a worker is already or newly final. It encapsulates the DB completion/failure rule for finished workers.
+**Call relations**: `run_agent_job_loop` calls this for newly finished workers, and `recover_running_items` calls it for workers that were already final when recovery checked them. It is the final cleanup door for one item.
 
 *Call graph*: called by 2 (recover_running_items, run_agent_job_loop); 1 external calls (matches!).
 
@@ -5708,11 +5740,11 @@ fn build_worker_prompt(
 ) -> anyhow::Result<String>
 ```
 
-**Purpose**: Constructs the exact prompt sent to each spawned worker agent for one CSV row. It embeds job/item identifiers, the rendered instruction, the row JSON, the expected output schema, and explicit instructions to call `report_agent_job_result` exactly once.
+**Purpose**: Creates the exact instruction text sent to a worker agent for one CSV row. The prompt tells the worker what row to process and requires it to call `report_agent_job_result` with the job id, item id, and JSON result.
 
-**Data flow**: Takes `job` and `item` → extracts `job_id` and `item_id` → computes `instruction = render_instruction_template(job.instruction.as_str(), &item.row_json)` → pretty-serializes `job.output_schema_json` or uses `{}` → pretty-serializes `item.row_json` → interpolates all of that into a fixed multi-line prompt string and returns it.
+**Data flow**: It receives the job record and one job item. It fills any row placeholders in the instruction, formats the row and expected output schema as readable JSON, and returns a full prompt string containing the task, identifiers, input data, and reporting rules.
 
-**Call relations**: Called by `run_agent_job_loop` before spawning each worker. It delegates placeholder substitution to `render_instruction_template` and JSON formatting to `serde_json::to_string_pretty`.
+**Call relations**: `run_agent_job_loop` calls this right before spawning a worker for a pending item. It uses `render_instruction_template` to customize the user’s instruction for the row.
 
 *Call graph*: calls 1 internal fn (render_instruction_template); called by 1 (run_agent_job_loop); 2 external calls (format!, to_string_pretty).
 
@@ -5723,11 +5755,11 @@ fn build_worker_prompt(
 fn render_instruction_template(instruction: &str, row_json: &Value) -> String
 ```
 
-**Purpose**: Performs simple placeholder substitution in a job instruction using fields from a row JSON object, while preserving escaped literal braces written as `{{` and `}}`. It lets CSV columns parameterize worker instructions.
+**Purpose**: Substitutes row values into an instruction template. For example, an instruction containing `{email}` can be filled with the `email` value from the current CSV row.
 
-**Data flow**: Takes `instruction: &str` and `row_json: &Value` → first replaces `{{`/`}}` with sentinel strings → if `row_json.as_object()` is `None`, restores sentinels back to braces and returns → otherwise for each `(key, value)` in the object, builds placeholder `{key}`, converts the value to either its string contents or JSON string form, and replaces all occurrences in the rendered instruction → finally restores sentinels to literal braces and returns the result.
+**Data flow**: It receives the instruction text and the row as JSON. It temporarily protects doubled braces like `{{` and `}}` so they stay literal, replaces `{column_name}` placeholders with matching row values, restores literal braces, and returns the rendered instruction.
 
-**Call relations**: Called by `build_worker_prompt`. It is a pure string-templating helper with no external side effects.
+**Call relations**: `build_worker_prompt` calls this while preparing the prompt for a worker. It is the small template engine that makes one general instruction become row-specific.
 
 *Call graph*: called by 1 (build_worker_prompt); 2 external calls (as_object, format!).
 
@@ -5738,11 +5770,11 @@ fn render_instruction_template(instruction: &str, row_json: &Value) -> String
 fn ensure_unique_headers(headers: &[String]) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Rejects CSV inputs with duplicate header names. This prevents ambiguous row-object construction and later output rendering errors.
+**Purpose**: Checks that a CSV file does not contain duplicate column names. Duplicate headers would make row data ambiguous because two columns would have the same key.
 
-**Data flow**: Takes `headers: &[String]` → inserts each header into a `HashSet` → if insertion fails for any header, returns `Err(FunctionCallError::RespondToModel(format!("csv header {header} is duplicated")))` → otherwise returns `Ok(())`.
+**Data flow**: It receives the list of headers. It adds each header to a set of names already seen. If a name appears twice, it returns a model-facing error naming the duplicated header; otherwise it returns success.
 
-**Call relations**: Higher-level CSV ingestion code calls this after parsing headers. It is a pure validation helper.
+**Call relations**: The call facts do not show a direct caller in this file, but this helper belongs to the CSV job setup path before rows are stored and assigned to agents.
 
 *Call graph*: 3 external calls (new, format!, RespondToModel).
 
@@ -5753,11 +5785,11 @@ fn ensure_unique_headers(headers: &[String]) -> Result<(), FunctionCallError>
 fn job_runtime_timeout(job: &codex_state::AgentJob) -> Duration
 ```
 
-**Purpose**: Computes the effective per-item runtime timeout for a job. Jobs without an explicit limit use the subsystem default.
+**Purpose**: Chooses how long a worker item may run before being considered stuck. It uses the job’s custom setting when present, otherwise it falls back to the default timeout.
 
-**Data flow**: Takes `job: &codex_state::AgentJob` → reads `job.max_runtime_seconds` → returns `Duration::from_secs(value)` when present or `DEFAULT_AGENT_JOB_ITEM_TIMEOUT` otherwise.
+**Data flow**: It receives a job record. If the job has `max_runtime_seconds`, it converts that to a duration. If not, it returns the built-in default duration.
 
-**Call relations**: Called by `run_agent_job_loop` to set the timeout used by recovery and stale-item reaping.
+**Call relations**: `run_agent_job_loop` calls this when starting so recovery and timeout cleanup use the same limit for the whole job.
 
 *Call graph*: called by 1 (run_agent_job_loop).
 
@@ -5768,11 +5800,11 @@ fn job_runtime_timeout(job: &codex_state::AgentJob) -> Duration
 fn started_at_from_item(item: &codex_state::AgentJobItem) -> Instant
 ```
 
-**Purpose**: Reconstructs an approximate `Instant` start time for a persisted running item based on its `updated_at` timestamp. This allows timeout checks to continue after process restarts.
+**Purpose**: Estimates when a recovered running item started, using the item’s last database update time. This lets timeout checks continue fairly after the loop restarts.
 
-**Data flow**: Takes `item: &codex_state::AgentJobItem` → computes `age = chrono::Utc::now().signed_duration_since(item.updated_at)` → if `age.to_std()` succeeds, returns `Instant::now().checked_sub(age).unwrap_or_else(Instant::now)`; otherwise returns `Instant::now()`.
+**Data flow**: It receives a job item. It compares the item’s `updated_at` timestamp with the current time, converts that age into an `Instant` value, and returns an estimated start time. If the timestamp is in the future or cannot be converted, it returns the current instant.
 
-**Call relations**: Used by `recover_running_items` when rebuilding `ActiveJobItem.started_at`. It bridges persisted wall-clock timestamps into Tokio `Instant` space.
+**Call relations**: `recover_running_items` calls this when putting an already-running item back into the active-items map. The returned time is later used by `reap_stale_active_items`.
 
 *Call graph*: called by 1 (recover_running_items); 2 external calls (now, now).
 
@@ -5783,11 +5815,11 @@ fn started_at_from_item(item: &codex_state::AgentJobItem) -> Instant
 fn is_item_stale(item: &codex_state::AgentJobItem, runtime_timeout: Duration) -> bool
 ```
 
-**Purpose**: Determines whether a persisted running item has exceeded the allowed runtime based on its last update timestamp. It is the startup-time stale check for recovered items.
+**Purpose**: Checks whether a database item has been running longer than the allowed timeout. It is used during recovery before trusting an old running record.
 
-**Data flow**: Takes `item` and `runtime_timeout` → computes age from `chrono::Utc::now().signed_duration_since(item.updated_at)` → if conversion to `std::time::Duration` succeeds, returns `age >= runtime_timeout`; otherwise returns `false`.
+**Data flow**: It receives a job item and timeout duration. It compares the current time with the item’s last update time. If the age is at least the timeout, it returns true; if the time comparison is invalid, it returns false.
 
-**Call relations**: Called by `recover_running_items` before deciding whether to resume tracking a running item.
+**Call relations**: `recover_running_items` calls this while rebuilding active workers. Stale recovered items are failed immediately instead of being treated as still healthy.
 
 *Call graph*: called by 1 (recover_running_items); 1 external calls (now).
 
@@ -5798,11 +5830,11 @@ fn is_item_stale(item: &codex_state::AgentJobItem, runtime_timeout: Duration) ->
 fn default_output_csv_path(input_csv_path: &AbsolutePathBuf, job_id: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Derives a default output CSV path from the input CSV path and job id. It places the output next to the input file and appends a short job-id suffix.
+**Purpose**: Builds a sensible output file path when the user does not provide one. It places the output next to the input CSV and includes part of the job id so names are unlikely to collide.
 
-**Data flow**: Takes `input_csv_path: &AbsolutePathBuf` and `job_id: &str` → extracts the file stem or falls back to `agent_job_output`, takes the first 8 chars of `job_id`, chooses the parent directory or the input path itself, and returns `output_dir.join(format!("{stem}.agent-job-{job_suffix}.csv"))`.
+**Data flow**: It receives the absolute input CSV path and job id. It takes the input file stem, appends `.agent-job-` plus the first eight characters of the job id, and returns a path in the input file’s parent directory.
 
-**Call relations**: Higher-level spawn-job setup code uses this when the caller does not provide an explicit output path. It is a pure path-construction helper.
+**Call relations**: The call facts do not show a direct caller in this file, but this helper is part of job creation. The resulting path is later stored on the job and used by `export_job_csv_snapshot`.
 
 *Call graph*: calls 2 internal fn (as_path, parent); 1 external calls (format!).
 
@@ -5813,11 +5845,11 @@ fn default_output_csv_path(input_csv_path: &AbsolutePathBuf, job_id: &str) -> Ab
 fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String>
 ```
 
-**Purpose**: Parses CSV text into headers and rows with flexible record lengths, strips a UTF-8 BOM from the first header, and skips fully empty rows. It is the ingestion helper for CSV-backed jobs.
+**Purpose**: Reads CSV text into headers and rows. It accepts slightly uneven row lengths, removes a common hidden byte-order marker from the first header, and skips fully empty rows.
 
-**Data flow**: Takes `content: &str` → builds a `csv::ReaderBuilder` with `has_headers(true)` and `flexible(true)` over `content.as_bytes()` → reads headers into `Vec<String>`, trimming a BOM from the first header if present → iterates records, converting each to `Vec<String>`, skipping rows where every field is empty, and collecting the rest → returns `Ok((headers, rows))` or `Err(err.to_string())` on CSV parse failure.
+**Data flow**: It receives raw CSV content as text. It uses a CSV reader to read the header row, cleans the first header if needed, then reads each data record into a vector of strings. It returns the header list and row list, or a string error if parsing fails.
 
-**Call relations**: Called by higher-level CSV job creation code before header validation and row-to-JSON conversion. It is a pure parser helper.
+**Call relations**: The call facts do not show a direct caller in this file, but this is the input-reading helper for the CSV-backed job setup path.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -5831,11 +5863,11 @@ fn render_job_csv(
 ) -> Result<String, FunctionCallError>
 ```
 
-**Purpose**: Renders the current job items back into a CSV snapshot containing original input columns plus job metadata, status, errors, result JSON, and timestamps. It is the export formatter used for final job snapshots.
+**Purpose**: Turns the job’s stored items back into CSV text for the output file. It preserves the original columns and adds job-specific columns such as status, errors, result JSON, and timestamps.
 
-**Data flow**: Takes original `headers` and `items` → clones headers into `output_headers` and appends metadata columns (`job_id`, `item_id`, `row_index`, `source_id`, `status`, `attempt_count`, `last_error`, `result_json`, `reported_at`, `completed_at`) → writes the escaped header row → for each item, requires `item.row_json` to be an object or returns `RespondToModel` error, then for each original header pulls the corresponding value from the row object and converts it with `value_to_csv_string`, escapes all fields with `csv_escape`, appends metadata fields similarly, joins with commas, and appends a newline → returns the full CSV string.
+**Data flow**: It receives the original headers and a list of job items. It writes a header line with both original and extra columns. For each item, it reads values from the item’s row JSON, adds job metadata and result fields, escapes each cell safely, and appends a CSV row. It returns the completed CSV string or an error if a row is not a JSON object.
 
-**Call relations**: Called by `export_job_csv_snapshot`. It delegates scalar conversion to `value_to_csv_string` and CSV quoting to `csv_escape`.
+**Call relations**: `export_job_csv_snapshot` calls this before writing the file. It relies on `csv_escape` for safe CSV formatting and uses `value_to_csv_string` to turn JSON values into cell text.
 
 *Call graph*: calls 1 internal fn (csv_escape); called by 1 (export_job_csv_snapshot); 2 external calls (new, new).
 
@@ -5846,11 +5878,11 @@ fn render_job_csv(
 fn value_to_csv_string(value: &Value) -> String
 ```
 
-**Purpose**: Converts a JSON value into the scalar string representation used in exported CSV cells. Complex arrays/objects are serialized as compact JSON.
+**Purpose**: Converts a JSON value into a plain string suitable for a CSV cell. It keeps simple values readable and serializes arrays or objects as JSON text.
 
-**Data flow**: Takes `value: &Value` → matches `Null` to `""`, `String` to clone, `Bool`/`Number` to `to_string()`, and `Array`/`Object` to `value.to_string()` → returns the resulting string.
+**Data flow**: It receives one JSON value. Null becomes an empty string, strings are copied as-is, booleans and numbers become their text form, and arrays or objects become compact JSON text. It returns that string.
 
-**Call relations**: Used by `render_job_csv` when exporting original row values from `row_json`.
+**Call relations**: `render_job_csv` uses this when copying original row values into the output CSV. It is the translator between JSON storage and spreadsheet cells.
 
 *Call graph*: 2 external calls (new, to_string).
 
@@ -5861,26 +5893,26 @@ fn value_to_csv_string(value: &Value) -> String
 fn csv_escape(value: &str) -> String
 ```
 
-**Purpose**: Escapes a string for CSV output by quoting fields that contain commas, newlines, carriage returns, or quotes, and doubling embedded quotes. It ensures exported snapshots remain valid CSV.
+**Purpose**: Formats one value so it is safe to place in a CSV file. It quotes values that contain commas, newlines, carriage returns, or quote marks, and doubles embedded quotes as CSV requires.
 
-**Data flow**: Takes `value: &str` → if it contains `,`, `\n`, `\r`, or `"`, replaces `"` with `""`, wraps the result in surrounding quotes via `format!("\"{escaped}\"")`, and returns it; otherwise returns `value.to_string()` unchanged.
+**Data flow**: It receives a cell value as text. If the text contains characters that would confuse a CSV reader, it replaces each quote with two quotes and wraps the whole value in quotes. Otherwise, it returns the text unchanged.
 
-**Call relations**: Called repeatedly by `render_job_csv` for both headers and row fields. It is the low-level CSV quoting helper.
+**Call relations**: `render_job_csv` calls this for every header and every cell. It is the final safety step before text is written into the output CSV.
 
 *Call graph*: called by 1 (render_job_csv); 1 external calls (format!).
 
 
 ### `core/src/tools/handlers/agent_jobs/report_agent_job_result.rs`
 
-`domain_logic` · `worker tool call handling`
+`domain_logic` · `request handling`
 
-This file defines `ReportAgentJobResultHandler`, the tool executor for the worker-facing `report_agent_job_result` function. The handler is intentionally narrow: it only accepts `ToolPayload::Function`, advertises its schema via `create_report_agent_job_result_tool`, and delegates the actual business logic to the free async `handle` function.
+This file is the bridge between a model-facing tool call and the internal agent job system. In plain terms, it is like the receiving desk where a worker drops off a completed task: the desk checks the form, records it in the ledger, and gives back a receipt.
 
-`handle_call` extracts the session and payload from `ToolInvocation`, rejects unsupported payload kinds with a model-facing error, and then forwards the raw argument string to `handle`, boxing the resulting `FunctionToolOutput`. The `CoreToolRuntime` implementation further narrows applicability by returning `true` from `matches_kind` only for function payloads.
+The handler advertises a tool named `report_agent_job_result` and provides its tool specification, which tells the outside caller what shape the tool call should have. When the tool is invoked, the file first makes sure the call is a normal function-style tool payload, then extracts the raw argument text.
 
-The free `handle` function performs the real work. It parses JSON arguments into `ReportAgentJobResultArgs`, requires `result` to be a JSON object, and obtains the persistent state runtime through `required_state_db`. It uses the current session's `thread_id` as the reporting worker identity and calls `db.report_agent_job_item_result(job_id, item_id, reporting_thread_id, &result)`. Database errors are rewritten into `FunctionCallError::RespondToModel` with both job and item ids included. If the DB accepted the result and the worker set `stop: true`, the function best-effort marks the whole job cancelled with the message `cancelled by worker request`. Finally it serializes `ReportAgentJobResultToolResult { accepted }` to JSON text and returns it as a successful `FunctionToolOutput`.
+The main `handle` function parses those arguments into the expected job result fields. It rejects the call if the reported `result` is not a JSON object, because downstream job storage expects a structured object rather than a string, list, or number. It then finds the session’s state database and records the result for a specific job item, including the thread that reported it. If the report is accepted and the worker also asked to stop, it tries to mark the whole job as cancelled with a clear message.
 
-A key invariant here is that only object-shaped `result` payloads are accepted; scalar or array results are rejected before touching the DB.
+Finally, it returns a small JSON response saying whether the result was accepted. Errors that the model can fix are returned as messages to the model; unexpected serialization failure is treated as fatal.
 
 #### Function details
 
@@ -5890,11 +5922,11 @@ A key invariant here is that only object-shaped `result` payloads are accepted; 
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the plain tool name handled by this executor. It binds the handler to `report_agent_job_result` in the tool registry.
+**Purpose**: Returns the public name of this tool: `report_agent_job_result`. The tool registry uses this name so a tool call can be routed to the right handler.
 
-**Data flow**: Takes `&self` → returns `ToolName::plain("report_agent_job_result")`.
+**Data flow**: It takes no outside data beyond the handler itself. It creates a plain tool name from the fixed text `report_agent_job_result` and returns that name.
 
-**Call relations**: The tool registry calls this during registration and dispatch. It delegates name construction to `ToolName::plain`.
+**Call relations**: When the tool system is building or searching its registry, it asks this handler for its name. This function hands back the name by calling the basic `plain` constructor for tool names.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -5905,11 +5937,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the tool specification for `report_agent_job_result`. This exposes the worker-facing schema to the runtime/model.
+**Purpose**: Returns the formal description of what this tool expects and produces. This lets the model or tool caller know how to call `report_agent_job_result` correctly.
 
-**Data flow**: Takes `&self` → calls `create_report_agent_job_result_tool()` → returns the resulting `ToolSpec`.
+**Data flow**: It receives only the handler reference. It asks `create_report_agent_job_result_tool` to build the tool specification and returns that specification unchanged.
 
-**Call relations**: The registry invokes this when enumerating tool metadata. It delegates schema construction to the sibling spec module.
+**Call relations**: During tool setup or advertisement, the registry asks this handler for its specification. This function delegates that work to `create_report_agent_job_result_tool`, keeping the schema definition in the shared agent-jobs specification code.
 
 *Call graph*: calls 1 internal fn (create_report_agent_job_result_tool).
 
@@ -5920,11 +5952,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async handler implementation to the boxed future type required by the tool executor trait. It is the trait-facing execution entry point.
+**Purpose**: Starts processing an incoming tool invocation. It wraps the real asynchronous work in a future so the tool runtime can run it later without blocking.
 
-**Data flow**: Takes `&self` and `invocation: ToolInvocation` → creates `self.handle_call(invocation)` → boxes and pins the future → returns `ToolExecutorFuture<'_>`.
+**Data flow**: It receives a `ToolInvocation`, which contains the session and the payload sent by the caller. It passes that invocation to `handle_call`, pins the future in place as required by Rust’s async runtime, and returns it to the caller.
 
-**Call relations**: Tool dispatch calls this when the worker invokes `report_agent_job_result`. It delegates all substantive logic to `handle_call`.
+**Call relations**: The tool runtime calls this when a `report_agent_job_result` invocation arrives. Rather than doing the work inline, it hands off to `handle_call`, which performs payload checking and then calls the top-level `handle` function.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -5938,11 +5970,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Extracts the function arguments from the invocation, rejects unsupported payload kinds, and forwards the request to the shared `handle` function. It also boxes the resulting output for trait-object return.
+**Purpose**: Checks that the incoming invocation is the kind this handler understands, then extracts its arguments and starts the real job-result recording work.
 
-**Data flow**: Consumes `ToolInvocation`, extracting `session` and `payload` → if payload is `ToolPayload::Function { arguments }`, calls `handle(session, arguments).await` and maps the `FunctionToolOutput` through `boxed_tool_output`; otherwise returns `Err(FunctionCallError::RespondToModel("report_agent_job_result handler received unsupported payload"))`.
+**Data flow**: It receives a full tool invocation. It pulls out the session and payload. If the payload is a function call, it extracts the argument string and passes the session plus arguments to `handle`; if the payload is some other kind, it returns a model-facing error explaining that this handler received unsupported input. On success, it boxes the tool output into the standard output type used by the tool framework.
 
-**Call relations**: This function is invoked only by `ReportAgentJobResultHandler::handle`. It delegates business logic to the free `handle` function and output boxing to `boxed_tool_output`.
+**Call relations**: This is called by `ReportAgentJobResultHandler::handle` after the runtime dispatches a tool call here. It is the safety gate before the main `handle` function: only function-style payloads are allowed through, while unsupported payloads are turned into `RespondToModel` errors the caller can see.
 
 *Call graph*: calls 1 internal fn (handle); called by 1 (handle); 1 external calls (RespondToModel).
 
@@ -5953,11 +5985,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this runtime to function-style payloads. It prevents the handler from being considered for custom or search payload kinds.
+**Purpose**: Tells the core tool runtime whether a given payload type belongs to this handler. This prevents non-function payloads from being sent to a function-only tool.
 
-**Data flow**: Takes `&self` and `payload: &ToolPayload` → returns `matches!(payload, ToolPayload::Function { .. })`.
+**Data flow**: It receives a tool payload by reference. It checks whether the payload is the `Function` variant and returns `true` if so, otherwise `false`.
 
-**Call relations**: The core tool runtime uses this during dispatch filtering. It complements `handle_call`'s runtime check with an earlier applicability signal.
+**Call relations**: The runtime uses this as a quick compatibility check before or during dispatch. It mirrors the stricter check in `handle_call`, so normal routing can avoid sending unsupported payloads here in the first place.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -5971,22 +6003,26 @@ async fn handle(
 ) -> Result<FunctionToolOutput, FunctionCallError>
 ```
 
-**Purpose**: Parses and validates a worker's reported job result, records it in the state DB under the current worker thread id, optionally cancels the job, and returns a JSON acknowledgment indicating whether the report was accepted. It is the file's main business-logic function.
+**Purpose**: Records an agent job item result in the state database and returns a small receipt saying whether the report was accepted. It also honors a worker’s optional request to cancel the job after reporting.
 
-**Data flow**: Takes `session: Arc<Session>` and raw `arguments: String` → parses `ReportAgentJobResultArgs` with `parse_arguments(arguments.as_str())` → rejects non-object `args.result` with `RespondToModel` → obtains `db = required_state_db(&session)?` → computes `reporting_thread_id = session.thread_id.to_string()` → awaits `db.report_agent_job_item_result(args.job_id, args.item_id, reporting_thread_id, &args.result)`, mapping DB errors to `RespondToModel` with job/item context → if `accepted` and `args.stop.unwrap_or(false)`, best-effort awaits `db.mark_agent_job_cancelled(args.job_id, "cancelled by worker request")` and ignores failure → serializes `ReportAgentJobResultToolResult { accepted }` to JSON text, mapping serialization failure to `FunctionCallError::Fatal` → returns `FunctionToolOutput::from_text(content, Some(true))`.
+**Data flow**: It receives the current session and the raw argument string from the tool call. It parses the arguments into fields such as job id, item id, result, and optional stop flag. It verifies that `result` is a JSON object, gets the session’s required state database, and writes the result under the given job item and reporting thread. If the database accepts the result and the caller requested `stop`, it asks the database to mark the job cancelled. It then serializes `{ accepted }` into JSON text and returns it as successful tool output. If validation, database recording, or serialization fails, it returns an appropriate error.
 
-**Call relations**: This function is called by `ReportAgentJobResultHandler::handle_call`. It depends on shared helpers from the parent module (`parse_arguments`, `required_state_db`) and returns a `FunctionToolOutput` that the handler boxes for the generic tool pipeline.
+**Call relations**: This is the core worker called by `ReportAgentJobResultHandler::handle_call` after the invocation has been identified as a function-style tool call. It talks to the state database to save the result and may also ask that same database to cancel the job. At the end it uses JSON serialization and `FunctionToolOutput::from_text` to hand a clear response back through the tool framework.
 
 *Call graph*: calls 1 internal fn (from_text); called by 1 (handle_call); 2 external calls (to_string, RespondToModel).
 
 
 ### `core/src/tools/handlers/agent_jobs/spawn_agents_on_csv.rs`
 
-`domain_logic` · `tool invocation; synchronous job creation and completion wait`
+`orchestration` · `tool invocation / request handling`
 
-This file is the execution side of the CSV-backed agent-jobs feature. `SpawnAgentsOnCsvHandler` exposes the tool name/spec and accepts only function-style payloads; its async path unwraps the invocation and forwards the raw JSON argument string into the top-level `handle` function. The main `handle` routine performs the full workflow: parse `SpawnAgentsOnCsvArgs`, reject blank `instruction`, require exactly one non-remote turn environment, derive the local cwd, and fetch the session state database. It reads the input CSV from disk with Tokio, parses headers and rows, rejects missing headers, duplicate header names, and row/header length mismatches, then converts each row into a `codex_state::AgentJobItemCreateParams` containing a stable `item_id`, optional `source_id`, zero-based `row_index`, and a `row_json` object mapping header names to string values.
+This file is the bridge between a model-facing tool call and the agent job system. Its real job is to let someone say: “Here is a spreadsheet-like CSV file; run the same instruction once for each row, filling in that row’s values.” Without this file, the tool named `spawn_agents_on_csv` would not know how to read the CSV, create job items, run them, or report where the results were written.
 
-It generates a UUID job id, computes the output CSV path and job name, normalizes worker runtime limits, and persists the job plus all items with `auto_export` enabled. Before execution it derives runner options from session/turn state; if that setup fails it proactively marks the job failed. Otherwise it transitions the job to running, invokes the agent-job loop, and on runner failure records a job-level failure in the database. After execution it reloads the job, ensures an output CSV exists by exporting a snapshot if needed, loads progress counters, and assembles a compact result payload including status, output path, totals, optional job error, and up to five failed-item error summaries. A notable invariant is that duplicate or blank source ids never collide: the code synthesizes `row-N` ids and appends numeric suffixes until unique.
+The handler first identifies itself to the tool registry with a name and a tool specification, which is the schema describing how the tool should be called. When invoked, it accepts only function-style tool payloads, extracts the JSON argument string, and passes it into the main `handle` function.
+
+The main flow is careful and defensive. It parses the arguments, checks that the instruction is not empty, requires exactly one local working directory, reads the CSV file, validates the headers, and creates one job item per row. If the caller names an ID column, that column is used to label rows; duplicate IDs are made unique by adding suffixes, like turning “abc” into “abc-2”.
+
+Then it creates a new agent job in the state database, chooses concurrency settings, marks the job as running, and runs the job loop to completion. Finally it makes sure an output CSV exists, gathers progress and failure details, and returns a JSON text result to the model.
 
 #### Function details
 
@@ -5996,11 +6032,11 @@ It generates a UUID job id, computes the output CSV path and job name, normalize
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registered tool identifier for this handler as the plain name `spawn_agents_on_csv`.
+**Purpose**: This tells the tool system the public name of this tool: `spawn_agents_on_csv`. The name is how a model or caller asks for this specific CSV-to-agent-job behavior.
 
-**Data flow**: It reads no invocation state and constructs a `ToolName` constant from the literal string. It returns that `ToolName` without side effects.
+**Data flow**: It takes no outside input beyond the handler itself. It creates a plain tool name from the fixed string `spawn_agents_on_csv` and returns that name to the tool registry.
 
-**Call relations**: The tool registry queries this when wiring executors so requests can be matched to this handler; it delegates only to the `ToolName::plain` constructor.
+**Call relations**: When the tool registry asks this handler what it should be called, this function answers by calling `plain` to build the tool name in the standard format.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -6011,11 +6047,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Supplies the function-call schema advertised to models for the CSV spawning tool.
+**Purpose**: This provides the formal description of the tool’s inputs. That description is what lets callers know which arguments are allowed, such as the CSV path, instruction template, output path, and concurrency settings.
 
-**Data flow**: It takes no inputs beyond `self`, reads no mutable state, and returns the `ToolSpec` built by the shared spec factory.
+**Data flow**: It takes the handler as input, calls `create_spawn_agents_on_csv_tool`, and returns the resulting tool specification. It does not read files or change state.
 
-**Call relations**: Called during tool registration/introspection; it forwards spec construction to `create_spawn_agents_on_csv_tool` so the runtime and schema stay aligned.
+**Call relations**: The tool registry calls this when it needs to advertise or validate the tool. This function delegates the actual specification-building to `create_spawn_agents_on_csv_tool`, keeping this handler focused on execution.
 
 *Call graph*: calls 1 internal fn (create_spawn_agents_on_csv_tool).
 
@@ -6026,11 +6062,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Bridges the synchronous executor trait to the async implementation by boxing the future returned from `handle_call`.
+**Purpose**: This is the entry point used by the tool runtime when the tool is actually called. It wraps the real asynchronous work in a future, which is the Rust way of saying “work that will finish later.”
 
-**Data flow**: It consumes a `ToolInvocation`, wraps the async call in a pinned boxed future, and returns that future to the tool framework. It does not inspect payload contents itself.
+**Data flow**: It receives a `ToolInvocation`, passes it into `handle_call`, and boxes/pins the resulting future so the shared tool runtime can store and run it uniformly. The output will eventually be either a tool result or an error.
 
-**Call relations**: The tool framework invokes this entry on each matching tool call; it immediately delegates all real work to `SpawnAgentsOnCsvHandler::handle_call`.
+**Call relations**: The runtime calls this after choosing this handler for an invocation. It immediately hands off to `handle_call`, while `pin` packages the asynchronous operation in the shape expected by the tool framework.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -6044,11 +6080,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates that the invocation carries function arguments, extracts session/turn context, and dispatches to the CSV job runner.
+**Purpose**: This checks that the incoming tool request is the kind this handler understands, extracts the argument string, and starts the CSV job flow. It acts like a front desk: it rejects the wrong kind of request before the expensive work begins.
 
-**Data flow**: From `ToolInvocation` it reads `session`, `turn`, and `payload`. If the payload is `ToolPayload::Function`, it extracts the raw `arguments` string and passes it to `handle`; otherwise it returns a `FunctionCallError::RespondToModel`. On success it wraps the returned `FunctionToolOutput` into the boxed trait object expected by the executor interface.
+**Data flow**: It receives a `ToolInvocation` containing the session, turn context, and payload. If the payload is a function call, it pulls out the arguments and sends them to `handle`; if not, it returns a model-visible error. On success, it boxes the tool output into the common output type.
 
-**Call relations**: This is called only by `SpawnAgentsOnCsvHandler::handle`. It is the narrow adapter layer between generic tool invocation plumbing and the file's top-level `handle` business logic.
+**Call relations**: It is called by `SpawnAgentsOnCsvHandler::handle`. After checking the payload, it calls the file’s main `handle` function to do the real CSV reading, job creation, running, and result reporting. If the payload is unsupported, it uses `RespondToModel` so the model gets a clear explanation rather than an internal crash.
 
 *Call graph*: calls 1 internal fn (handle); called by 1 (handle); 1 external calls (RespondToModel).
 
@@ -6059,11 +6095,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this runtime only accepts function-style tool payloads.
+**Purpose**: This tells the core runtime whether this handler can process a given payload. Here, it accepts only function-style payloads, not other tool payload shapes.
 
-**Data flow**: It inspects the provided `ToolPayload` by pattern match and returns a boolean. It does not mutate any state.
+**Data flow**: It receives a `ToolPayload` reference and checks whether it matches the `Function` variant. It returns `true` for function calls and `false` for anything else.
 
-**Call relations**: The core runtime uses this predicate before dispatching invocations; it prevents custom/freeform payloads from reaching `handle_call`.
+**Call relations**: The core tool runtime uses this as a quick filter before dispatching work. It mirrors the stricter check in `handle_call`, so the system can usually choose the right handler before execution starts.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -6078,11 +6114,11 @@ async fn handle(
 ) -> Result<FunctionToolOutput, FunctionCallError>
 ```
 
-**Purpose**: Creates, executes, and summarizes an agent job whose items come from CSV rows and whose worker prompts are templated from row data.
+**Purpose**: This is the main worker for the tool. It reads the requested CSV, creates an agent job with one item per row, runs that job, exports results to CSV if needed, and returns a compact JSON summary.
 
-**Data flow**: Inputs are `Arc<Session>`, `Arc<TurnContext>`, and the raw JSON argument string. It parses arguments, reads turn environment state and the session DB, reads the CSV file from disk, transforms headers/rows into persisted job metadata and `AgentJobItemCreateParams`, writes the new job and items to the DB, computes runner options, updates job status to running/failed as needed, runs the job loop, optionally exports a CSV snapshot, reloads job/progress/item failure data from the DB, serializes a `SpawnAgentsOnCsvResult` JSON string, and returns it as `FunctionToolOutput`. It writes durable state through `create_agent_job`, `mark_agent_job_running`, `mark_agent_job_failed`, and possibly CSV export side effects on disk.
+**Data flow**: It receives the current session, the current turn context, and the raw argument string from the tool call. It parses the arguments, finds the local working directory, reads and parses the CSV, validates the header row, builds job items from rows, creates a job record in the state database, runs the agent job loop, checks or creates the output CSV, gathers progress and failure details, and returns a text tool output containing JSON. Along the way it changes persistent job state in the database, including creating the job, marking it running, and marking it failed if setup or running breaks.
 
-**Call relations**: Invoked by `SpawnAgentsOnCsvHandler::handle_call` after payload extraction. Internally it relies on helper/parsing utilities from the surrounding module for argument parsing, CSV parsing, header validation, runtime normalization, runner option construction, job execution, and export; its control flow explicitly marks the job failed when runner setup or execution breaks so later inspection sees terminal state.
+**Call relations**: It is called by `SpawnAgentsOnCsvHandler::handle_call` after the payload has been accepted. Early in its flow it calls `single_local_environment_cwd` to make sure file access is safe and local. It also calls into helper and subsystem functions outside this file for parsing arguments, parsing CSV, building runner options, running the job loop, exporting CSV snapshots, and formatting the final response with `from_text`.
 
 *Call graph*: calls 2 internal fn (from_text, single_local_environment_cwd); called by 1 (handle_call); 10 external calls (new, from, new_v4, Object, with_capacity, format!, to_string, read_to_string, try_exists, RespondToModel).
 
@@ -6093,11 +6129,11 @@ async fn handle(
 fn single_local_environment_cwd(turn: &TurnContext) -> Result<AbsolutePathBuf, FunctionCallError>
 ```
 
-**Purpose**: Extracts the sole local environment working directory for this tool and rejects unsupported environment layouts.
+**Purpose**: This finds the one local working directory that the CSV file path should be resolved against. It protects the tool from accidentally trying to read files in an unsupported remote or ambiguous environment.
 
-**Data flow**: It reads `turn.environments.turn_environments`, requires the slice to contain exactly one entry, checks that the environment is not remote, converts that environment's cwd into an `AbsolutePathBuf`, and returns it. Any mismatch or host-incompatible path becomes a `RespondToModel` error with a user-facing explanation.
+**Data flow**: It receives the current turn context and looks at the environments attached to that turn. If there is not exactly one environment, or if that environment is remote, it returns a model-visible error. If there is exactly one local environment, it converts its current working directory into an absolute path on the Codex host and returns it.
 
-**Call relations**: Called early by `handle` before any filesystem access. It enforces the file's design constraint that CSV input/output currently operate only against one host-native local environment.
+**Call relations**: The main `handle` function calls this before reading the CSV. If this check succeeds, `handle` can safely join the caller’s CSV path to a known local directory; if it fails, the function uses `RespondToModel` so the caller gets a clear message about why the tool cannot proceed.
 
 *Call graph*: called by 1 (handle); 1 external calls (RespondToModel).
 
@@ -6107,15 +6143,13 @@ These files implement the asynchronous startup pipeline that prepares runtime co
 
 ### `memories/write/src/runtime.rs`
 
-`orchestration` · `startup and request execution`
+`orchestration` · `memory startup and consolidation`
 
-This file defines two key runtime types. `StageOneRequestContext` is a lightweight, cloneable bundle of `ModelInfo`, `SessionTelemetry`, reasoning settings, and optional service tier used for phase-1 extraction requests. `MemoryStartupContext` is the heavier startup-scoped handle that owns the current thread ID, thread, thread manager, auth manager, shared model provider, and base telemetry.
+The memory-writing system needs to ask a model for help, record useful measurements, and sometimes start a separate internal agent to consolidate memories. This file is the toolbox that makes those actions safe and consistent. Without it, the memory startup code would have to rebuild model clients, authentication details, telemetry labels, thread IDs, and cleanup rules in many places, which would make failures and metrics much harder to reason about.
 
-Construction starts with `MemoryStartupContext::new`, which creates a provider from config and auth, then delegates to `new_with_provider`. That helper snapshots cached auth details, derives telemetry metadata such as auth mode, account identity, originator, user agent, and auth-environment telemetry, and builds a `SessionTelemetry` tagged to the startup thread and session source.
+The main type is MemoryStartupContext. Think of it like a trip folder for one memory-startup run: it carries the thread being worked on, the thread manager that can create or remove threads, the authentication manager, the model provider, and telemetry for measuring what happened. It can build a smaller StageOneRequestContext for the first model request, including model information, reasoning settings, service tier, and counters or timers.
 
-For phase 1, `stage_one_request_context` resolves live model info through the models manager and captures the current thread config snapshot so service-tier overrides from the running thread are honored. `stream_stage_one_prompt` then performs a detached model request: it resolves installation metadata, creates a `ModelClient`, builds detached memory response metadata, streams response events, concatenates text deltas or fallback message text, and returns the final string plus optional `TokenUsage`.
-
-For phase 2, `spawn_consolidation_agent` starts a new internal thread with `SessionSource::Internal(MemoryConsolidation)` and `ThreadSource::MemoryConsolidation`, submits the prompt as user input, and cleans up on submit failure. `shutdown_consolidation_agent` removes the thread from the manager if possible and waits up to 10 seconds for shutdown.
+The file also knows how to stream a prompt to the model and collect the answer as plain text while saving token usage. For longer consolidation work, it can start a separate internal thread, send it user input, and shut it down with a timeout. The important behavior is cleanup: if submitting work to the consolidation agent fails, the code tries to shut that agent down immediately so an unused background thread is not left running.
 
 #### Function details
 
@@ -6125,11 +6159,11 @@ For phase 2, `spawn_consolidation_agent` starts a new internal thread with `Sess
 fn start_timer(&self, name: &str) -> Option<codex_otel::Timer>
 ```
 
-**Purpose**: Starts a telemetry timer scoped to the stage-one request context. It hides the underlying telemetry error handling by returning `None` on failure.
+**Purpose**: Starts a telemetry timer for a named part of the stage-one memory request. A timer is a measurement that records how long something takes.
 
-**Data flow**: Takes a metric name string, forwards it to `session_telemetry.start_timer(name, &[])`, converts the result to `Option<codex_otel::Timer>` with `.ok()`, and returns it. It does not mutate other state.
+**Data flow**: It receives a timer name and reads the telemetry object stored in the request context. It asks telemetry to start timing that name, ignores telemetry errors by turning them into no timer, and returns either a usable timer or nothing.
 
-**Call relations**: Used by phase-1 `run` to measure end-to-end extraction time with the stage-one-specific telemetry context.
+**Call relations**: This is a small wrapper around the shared telemetry system. Code doing stage-one work can call it before an operation starts, then let the returned timer record the duration when it is dropped or finished by the telemetry library.
 
 *Call graph*: calls 1 internal fn (start_timer).
 
@@ -6140,11 +6174,11 @@ fn start_timer(&self, name: &str) -> Option<codex_otel::Timer>
 fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a counter metric on the stage-one telemetry context. It is a thin convenience wrapper around `SessionTelemetry`.
+**Purpose**: Adds to a named telemetry counter for the stage-one request. Counters are used for events such as 'one more job succeeded' or 'one more fallback was used.'
 
-**Data flow**: Accepts a metric name, increment value, and tag slice, then forwards them directly to `session_telemetry.counter`. It returns no value.
+**Data flow**: It receives a metric name, an amount to add, and small label pairs called tags. It forwards those values to the request context's telemetry object and does not return anything.
 
-**Call relations**: Called by phase-1 `emit_metrics` so all phase-1 counters are attributed to the stage-one request context rather than the broader startup context.
+**Call relations**: The metrics-emitting code calls this when it wants to count something that happened during stage one. This function keeps the rest of the memory code from needing to know the exact telemetry object layout.
 
 *Call graph*: calls 1 internal fn (counter); called by 1 (emit_metrics).
 
@@ -6155,11 +6189,11 @@ fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a histogram metric on the stage-one telemetry context. It mirrors the counter wrapper for histogram values.
+**Purpose**: Records a numeric measurement for the stage-one request, such as a size, count, or duration bucket. A histogram groups many values so operators can see typical and unusual cases.
 
-**Data flow**: Accepts a metric name, numeric value, and tag slice, then forwards them to `session_telemetry.histogram`. It returns nothing.
+**Data flow**: It receives a metric name, a numeric value, and tags. It passes them to the request telemetry and returns no value.
 
-**Call relations**: Used by phase-1 `emit_metrics` for token-usage histograms.
+**Call relations**: The metrics-emitting code uses this after it has a value worth measuring. This function is the simple doorway from memory-stage logic into the telemetry system.
 
 *Call graph*: calls 1 internal fn (histogram); called by 1 (emit_metrics).
 
@@ -6176,11 +6210,11 @@ fn new(
         source: Sess
 ```
 
-**Purpose**: Constructs a startup context using a provider created from the configured model-provider settings and auth manager. It is the normal production constructor.
+**Purpose**: Creates a MemoryStartupContext for normal production use. It builds the model provider from configuration and then delegates the shared setup work to the common constructor.
 
-**Data flow**: Inputs are the thread manager, auth manager, startup thread ID, startup thread handle, config, and session source. It creates a shared model provider with `create_model_provider(config.model_provider.clone(), Some(auth_manager.clone()))`, then delegates all remaining initialization to `new_with_provider` and returns the resulting `MemoryStartupContext`.
+**Data flow**: It receives the thread manager, authentication manager, current thread ID, current thread, configuration, and session source. It creates a model provider using the configured provider and authentication, then returns a fully built MemoryStartupContext.
 
-**Call relations**: Called by `start_memories_startup_task` in production and by a startup test that verifies live service-tier behavior.
+**Call relations**: The memory startup task calls this when it begins working with a live thread. Tests that exercise live-style behavior can also use it. Internally it hands off to MemoryStartupContext::new_with_provider so telemetry and stored fields are set up in one place.
 
 *Call graph*: called by 2 (start_memories_startup_task, memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata); 3 external calls (clone, new_with_provider, create_model_provider).
 
@@ -6196,11 +6230,11 @@ fn new_for_testing(
         config: &Config,
 ```
 
-**Purpose**: Constructs a startup context with an explicitly supplied provider, allowing tests to override provider defaults. It otherwise shares the same initialization path as production.
+**Purpose**: Creates a MemoryStartupContext for tests while letting the test supply its own model provider. This makes tests predictable because they can use a fake or controlled provider instead of the real service setup.
 
-**Data flow**: Receives the same inputs as `new` plus a `SharedModelProvider`. It forwards everything to `new_with_provider` and returns the context.
+**Data flow**: It receives the same basic context as the production constructor, plus a provider chosen by the test. It passes everything to the shared constructor and returns the resulting MemoryStartupContext.
 
-**Call relations**: Used by test helpers to inject `MockMemoryModelProvider` when verifying provider-selected phase-1 and phase-2 models.
+**Call relations**: Test helper code calls this when it needs a context with a custom provider. It reuses MemoryStartupContext::new_with_provider so tests and production get the same telemetry and field initialization.
 
 *Call graph*: called by 1 (memory_startup_context_with_provider); 1 external calls (new_with_provider).
 
@@ -6216,11 +6250,11 @@ fn new_with_provider(
         config: &Config,
 ```
 
-**Purpose**: Performs the actual initialization of `MemoryStartupContext`, including telemetry enrichment from auth and environment metadata. It centralizes all constructor logic shared by production and tests.
+**Purpose**: Performs the shared setup for a MemoryStartupContext once a model provider is already known. It gathers authentication and environment details so telemetry can describe the session correctly.
 
-**Data flow**: Consumes thread manager, auth manager, thread ID, thread, config, session source, and provider. It reads cached auth from the auth manager, derives auth mode/account ID/account email, chooses a model label from `config.model` or `unknown`, collects auth-environment telemetry, constructs `SessionTelemetry::new(...)` with originator and user agent, attaches auth-env metadata, and stores all fields in a new `MemoryStartupContext`.
+**Data flow**: It receives thread objects, authentication, configuration, session source, and a provider. It reads cached authentication, account details, model name, user agent, and authentication-environment telemetry, builds a SessionTelemetry object, and stores all of these runtime pieces in a new context.
 
-**Call relations**: Internal constructor used by both `new` and `new_for_testing`. The resulting context is then passed throughout phase 1 and phase 2.
+**Call relations**: Both the production constructor and the testing constructor call this. It calls helpers that identify the request origin, collect authentication-environment metadata, create telemetry, and read the terminal user agent, then returns the context used by the rest of the memory startup flow.
 
 *Call graph*: calls 3 internal fn (originator, collect_auth_env_telemetry, new); 1 external calls (user_agent).
 
@@ -6231,11 +6265,11 @@ fn new_with_provider(
 fn thread_id(&self) -> ThreadId
 ```
 
-**Purpose**: Returns the startup thread ID associated with this memory pipeline context. It is a simple accessor used for DB leasing and telemetry correlation.
+**Purpose**: Returns the ID of the thread this memory startup context belongs to. Other parts of the memory system use this to associate work with the right conversation thread.
 
-**Data flow**: Reads the stored `thread_id` field and returns it by value. No state changes occur.
+**Data flow**: It reads the thread_id stored in the context and returns it unchanged. It does not modify anything.
 
-**Call relations**: Called by phase-1 and phase-2 claim helpers when acquiring DB leases tied to the current startup thread.
+**Call relations**: Job-claiming code calls this when it needs to mark or claim startup work for the current thread. It is a simple accessor that avoids exposing the whole context internals.
 
 *Call graph*: called by 2 (claim_startup_jobs, claim).
 
@@ -6246,11 +6280,11 @@ fn thread_id(&self) -> ThreadId
 fn state_db(&self) -> Option<Arc<StateRuntime>>
 ```
 
-**Purpose**: Exposes the optional state database attached to the underlying startup thread. The memories pipeline uses this to decide whether startup work can proceed.
+**Purpose**: Gives access to the thread's state database if one exists. The state database is the stored record used to claim jobs, mark success or failure, and prune old memory-startup records.
 
-**Data flow**: Calls `self.thread.state_db()` and returns `Option<Arc<StateRuntime>>`. It does not cache or mutate the result.
+**Data flow**: It asks the current Codex thread for its state runtime. The result is either a shared pointer to that state store or nothing if the thread has no state database attached.
 
-**Call relations**: Used across phase 1 and phase 2 for job claiming, success/failure marking, and pruning; many callers treat `None` as a skip or hard failure.
+**Call relations**: Memory job code calls this while claiming work, recording failure, recording no output, recording success, and pruning. This function is the bridge from runtime context to persistent state.
 
 *Call graph*: called by 5 (claim_startup_jobs, failed, no_output, success, prune).
 
@@ -6261,11 +6295,11 @@ fn state_db(&self) -> Option<Arc<StateRuntime>>
 fn provider(&self) -> &dyn ModelProvider
 ```
 
-**Purpose**: Returns the model-provider trait object associated with the startup context. This lets memory phases query provider-specific preferred models.
+**Purpose**: Returns the model provider stored in the context. A model provider is the component that knows how to talk to the configured model backend.
 
-**Data flow**: Borrows the stored shared provider and returns `&dyn ModelProvider` via `as_ref()`. No state is modified.
+**Data flow**: It reads the shared provider object from the context and exposes it as a provider interface. It returns a borrowed view, not a new provider.
 
-**Call relations**: Used by phase-1 `build_request_context` and phase-2 `agent::get_config` to choose default extraction and consolidation models.
+**Call relations**: Other memory code can use this when it needs provider capabilities without caring which concrete provider implementation was configured. The function simply unwraps the shared provider into the common interface.
 
 *Call graph*: 1 external calls (as_ref).
 
@@ -6276,11 +6310,11 @@ fn provider(&self) -> &dyn ModelProvider
 fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a counter metric on the startup-scoped telemetry context. It is the phase-2 and startup-level counterpart to the stage-one telemetry wrapper.
+**Purpose**: Adds to a named telemetry counter for the overall memory startup context. This records how often important events happen during memory writing.
 
-**Data flow**: Accepts a metric name, increment, and tags, then forwards them to `session_telemetry.counter`. It returns no value.
+**Data flow**: It receives a metric name, increment amount, and tags, then forwards them to the context's session telemetry. It changes telemetry state outside the context and returns nothing.
 
-**Call relations**: Called by phase-2 metric emitters and job-state helpers, and by the startup task when rate limits cause a skip.
+**Call relations**: Metrics and job-state code call this when memory work is claimed, fails, succeeds, or otherwise emits measurements. It gives those callers one consistent way to count events for this session.
 
 *Call graph*: calls 1 internal fn (counter); called by 4 (emit_metrics, claim, failed, succeed).
 
@@ -6291,11 +6325,11 @@ fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a histogram metric on the startup-scoped telemetry context. It is used for phase-2 token-usage reporting.
+**Purpose**: Records a numeric telemetry value for the memory startup context. It is useful for values such as token counts or other measured quantities.
 
-**Data flow**: Accepts a metric name, value, and tags, then forwards them to `session_telemetry.histogram`. It returns nothing.
+**Data flow**: It receives a metric name, value, and tags. It forwards them to session telemetry and returns no value.
 
-**Call relations**: Used by `emit_token_usage_metrics` in phase 2.
+**Call relations**: Token-usage metrics code calls this after model usage information is known. This keeps token measurements tied to the same session telemetry created when the memory context started.
 
 *Call graph*: calls 1 internal fn (histogram); called by 1 (emit_token_usage_metrics).
 
@@ -6306,11 +6340,11 @@ fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)])
 fn start_timer(&self, name: &str) -> Option<codex_otel::Timer>
 ```
 
-**Purpose**: Starts a startup-scoped telemetry timer and suppresses telemetry errors by returning `None`. It mirrors the stage-one timer helper.
+**Purpose**: Starts a telemetry timer for work done under the memory startup context. This lets the system measure how long named steps take.
 
-**Data flow**: Forwards the metric name to `session_telemetry.start_timer(name, &[])`, converts the result to `Option<Timer>` with `.ok()`, and returns it.
+**Data flow**: It receives a timer name and asks the context's telemetry to begin timing it. If telemetry cannot start the timer, it returns nothing instead of failing the memory flow.
 
-**Call relations**: Used by phase-2 `run` to measure end-to-end consolidation setup and completion.
+**Call relations**: Memory startup code can call this around slower operations. It wraps the telemetry call so timing failures do not become user-visible runtime failures.
 
 *Call graph*: calls 1 internal fn (start_timer).
 
@@ -6326,11 +6360,11 @@ async fn stage_one_request_context(
     ) -> StageOneRequestContext
 ```
 
-**Purpose**: Builds the per-request context for phase-1 extraction, including live model info, reasoning settings, telemetry rebinding to the chosen model, and the current thread service tier. It intentionally reads the thread’s latest config snapshot rather than trusting the startup config alone.
+**Purpose**: Builds the smaller context needed for the first model request in memory writing. It gathers model details, reasoning settings, telemetry, and service tier into one package.
 
-**Data flow**: Inputs are the config, chosen model name, and reasoning effort. It awaits `thread.config_snapshot()`, fetches `ModelInfo` from the thread manager’s models manager using `config.to_models_manager_config()`, derives `reasoning_summary` from config or the model default, clones and retags session telemetry with the chosen model, and returns a `StageOneRequestContext` containing model info, telemetry, reasoning effort, reasoning summary, and `service_tier` from the live config snapshot.
+**Data flow**: It receives configuration, a model name, and the requested reasoning effort. It reads the thread's current configuration snapshot, asks the models manager for information about the named model, chooses the reasoning summary from config or the model default, clones telemetry with the active model name, and returns a StageOneRequestContext.
 
-**Call relations**: Called by phase-1 `build_request_context`. A startup test verifies that this path picks up live thread service-tier overrides.
+**Call relations**: The request-building code calls this before sending the stage-one prompt. It talks to the thread manager's models manager and the thread's config snapshot so the later streaming call has the correct model metadata and service-tier information.
 
 *Call graph*: called by 1 (build_request_context); 2 external calls (to_models_manager_config, clone).
 
@@ -6346,11 +6380,11 @@ async fn stream_stage_one_prompt(
     ) -> anyhow::Result<(String, Option<TokenUsage>)>
 ```
 
-**Purpose**: Executes a detached phase-1 model request and collects the final textual output plus token usage from the response stream. It is specialized for memory extraction requests rather than normal interactive turns.
+**Purpose**: Sends the stage-one prompt to the model and streams the model's answer back as a single text string. It also captures token usage when the model reports it.
 
-**Data flow**: Takes config, a `Prompt`, and a `StageOneRequestContext`. It resolves the installation ID, reads the live thread config snapshot for session source, derives a `SessionId` from the thread ID, constructs a `ModelClient` with auth and feature flags, creates detached memory response metadata via `detached_memory_responses_metadata`, and starts a streaming request with model info, telemetry, reasoning settings, service tier, and disabled inference tracing. It iterates stream events, appending `OutputTextDelta` text, falling back to `OutputItemDone` message text if no deltas were seen, captures `Completed.token_usage`, and returns `(result_string, Option<TokenUsage>)`.
+**Data flow**: It receives configuration, the prompt to send, and the stage-one request context. It resolves the installation ID, reads the thread's session source, builds a model client, prepares metadata that identifies this detached memory request, starts a streaming model call, appends text chunks as they arrive, falls back to completed message text if needed, saves token usage from the completion event, and returns the final text plus optional token usage.
 
-**Call relations**: Called by `job::sample` in phase 1. A startup test inspects the outgoing request metadata produced by this detached-request path.
+**Call relations**: Sampling code calls this when it needs an actual model response for memory stage one. This function creates the ModelClient, uses detached memory response metadata, disables inference tracing for this request, consumes ResponseEvent messages from the stream, and hands the caller a plain result instead of raw stream events.
 
 *Call graph*: calls 3 internal fn (new, from, disabled); called by 1 (sample); 7 external calls (clone, new, content_items_to_text, detached_memory_responses_metadata, resolve_installation_id, format!, to_string).
 
@@ -6365,11 +6399,11 @@ async fn spawn_consolidation_agent(
     ) -> anyhow::Result<SpawnedConsolidationAgent>
 ```
 
-**Purpose**: Starts a new internal Codex thread configured for memory consolidation and submits the consolidation prompt as user input. It cleans up the thread if prompt submission fails.
+**Purpose**: Starts a separate internal Codex thread to run memory consolidation work and sends it the initial prompt. This is like opening a side workspace so memory cleanup can happen without taking over the main thread.
 
-**Data flow**: Consumes an owned `Config` and prompt `Vec<UserInput>`. It computes default environment selections for the config cwd, starts a new thread with `InitialHistory::New`, internal memory-consolidation session/thread sources, no dynamic tools, and default extension init, then wraps the returned thread ID and thread in `SpawnedConsolidationAgent`. It submits `Op::UserInput` containing the prompt; on submit error it attempts `shutdown_consolidation_agent` and returns the error, otherwise it returns the spawned agent.
+**Data flow**: It receives a configuration and a list of user-input items. It asks the thread manager for default environments, starts a new thread marked as internal memory consolidation, wraps the new thread and ID in a SpawnedConsolidationAgent, submits the prompt to that thread, and returns the agent if submission succeeds. If submission fails, it tries to shut the agent down before returning the error.
 
-**Call relations**: Called by phase-2 `run` after prompt generation. Its returned `SpawnedConsolidationAgent` is then handed to `agent::handle` for asynchronous monitoring.
+**Call relations**: Memory consolidation code uses this when it needs an internal agent. It relies on the thread manager to start the thread and on the thread's submit operation to begin work; if that handoff breaks, it calls MemoryStartupContext::shutdown_consolidation_agent and logs a warning if cleanup also fails.
 
 *Call graph*: calls 1 internal fn (shutdown_consolidation_agent); 4 external calls (default, new, Internal, warn!).
 
@@ -6383,24 +6417,24 @@ async fn shutdown_consolidation_agent(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Removes a spawned consolidation thread from the thread manager if present and waits for it to shut down, with a hard timeout. It is the cleanup path for both normal completion and submit failures.
+**Purpose**: Stops a consolidation agent and waits for it to finish, with a limit on how long it will wait. This prevents internal memory threads from lingering forever.
 
-**Data flow**: Takes ownership of `SpawnedConsolidationAgent`, extracts `thread_id` and `thread`, asks the thread manager to remove the thread and falls back to the passed thread if removal returns `None`, then awaits `thread.shutdown_and_wait()` under a 10-second timeout. It returns `Ok(())` on clean shutdown or an `anyhow` error on timeout or shutdown failure.
+**Data flow**: It receives a SpawnedConsolidationAgent containing a thread ID and thread object. It asks the thread manager to remove that thread from active tracking, falls back to the supplied thread if it was not found, then waits up to ten seconds for shutdown to complete. It returns success, a shutdown error, or a timeout error.
 
-**Call relations**: Called by `spawn_consolidation_agent` when prompt submission fails, and by phase-2 `agent::handle` in a background cleanup task after the agent reaches a terminal state.
+**Call relations**: MemoryStartupContext::spawn_consolidation_agent calls this when prompt submission fails, and other consolidation cleanup code can use it after an agent is no longer needed. It combines thread-manager removal with the thread's own shutdown routine so both bookkeeping and background execution are cleaned up.
 
 *Call graph*: called by 1 (spawn_consolidation_agent); 2 external calls (from_secs, timeout).
 
 
 ### `memories/write/src/start.rs`
 
-`entrypoint` · `startup`
+`orchestration` · `startup`
 
-This file contains the single entrypoint that wires the memories startup subsystem into a live Codex session. `start_memories_startup_task` first applies coarse eligibility checks: it returns immediately for ephemeral sessions, when the `MemoryTool` feature is disabled, or when the session source indicates a non-root agent. For eligible sessions it constructs a `MemoryStartupContext` from the thread manager, auth manager, current thread, config, and session source.
+This file protects the memory system from doing work when it should not. A memory startup pipeline can be useful, but it costs time and may use model quota later, so the code first checks whether the session is allowed to use it. It skips temporary sessions, sessions where the memory feature is turned off, and non-root agent sessions, which are helper sessions rather than the main user session.
 
-Before spawning background work, it verifies that the underlying thread exposes a state DB; if not, it logs a warning and skips the pipeline entirely. The actual startup work runs in a detached Tokio task. That task ensures the memories root directory exists under `codex_home`, seeds extension instruction files, and then performs a DB-only prune of stale phase-1 outputs. Because pruning does not consume model quota, it happens before the rate-limit guard.
+If the session is eligible, the file builds a shared startup context. That context is like a folder of supplies for the later steps: it carries access to the thread, authentication, configuration, session source, and the state database. If there is no state database, the pipeline cannot safely record or read the needed memory state, so it logs a warning and stops.
 
-If `guard::rate_limits_ok` fails, the task emits a `MEMORY_STARTUP` counter tagged `skipped_rate_limit` and exits. Otherwise it runs the two phases in strict order: phase 1 extraction first, then phase 2 consolidation. The function itself does not await completion; it only schedules the background pipeline.
+The real work is launched as a background asynchronous task, meaning the main session does not have to wait. The task creates the memories folder on disk, seeds extension instruction files, prunes old or oversized memory data, checks rate limits, and then runs two memory phases in order. Pruning happens before the quota check because it does not consume model tokens. The rate-limit check acts like a turnstile: if the user has no available quota, the pipeline records that it skipped and exits instead of spending more resources.
 
 #### Function details
 
@@ -6416,24 +6450,24 @@ fn start_memories_startup_task(
     source:
 ```
 
-**Purpose**: Checks whether memories startup should run for the current session and, if so, launches the full asynchronous startup pipeline. It is the top-level integration point for memory generation and consolidation at session startup.
+**Purpose**: This function starts the memory startup pipeline for a session, but only when that session is allowed to use memories. It keeps the rest of the system safe by skipping background memory work for temporary sessions, disabled features, helper-agent sessions, missing databases, or exhausted rate limits.
 
-**Data flow**: Inputs are the thread manager, auth manager, current thread ID, current thread handle, shared config, and session source. It reads `config.ephemeral`, the `MemoryTool` feature flag, and `source.is_non_root_agent()` to decide whether to return early. For eligible sessions it constructs `MemoryStartupContext`, checks `state_db()`, and if present spawns a Tokio task that creates the memories root directory, seeds extension instructions, calls `phase1::prune`, checks `guard::rate_limits_ok`, emits a skipped-rate-limit metric if needed, then awaits `phase1::run` followed by `phase2::run`. It returns immediately after scheduling the task.
+**Data flow**: It receives shared access to the thread manager, authentication manager, current thread ID, current thread, configuration, and session source. It first reads the configuration and session source to decide whether to stop immediately. If allowed, it builds a `MemoryStartupContext`, checks that a state database exists, and then launches an asynchronous background task. Inside that task it creates the memory directory, seeds instruction files, prunes memory storage, checks rate limits, records a skip metric if quota is unavailable, and otherwise passes the context and configuration through phase 1 and phase 2. The function itself returns right away after scheduling the background work; the visible changes happen later through files, database state, metrics, and the memory phases.
 
-**Call relations**: This is the startup entrypoint invoked by the wider system when a session begins. Inside the spawned task it orchestrates the entire memories pipeline by calling the phase-specific modules in order.
+**Call relations**: This is the gateway into the memory startup flow. It creates the shared startup context with `MemoryStartupContext::new`, prepares the memory root, asks `seed_extension_instructions` to place needed instruction files, calls `phase1::prune` before any quota-consuming work, uses `guard::rate_limits_ok` as the final permission check, then hands control to `phase1::run` and `phase2::run` in order. Nothing else in this file performs memory work directly; this function wires the pieces together and starts them at the right time.
 
 *Call graph*: calls 5 internal fn (seed_extension_instructions, rate_limits_ok, prune, run, new); 9 external calls (clone, new, clone, is_non_root_agent, memory_root, run, create_dir_all, spawn, warn!).
 
 
 ### `memories/write/src/phase1.rs`
 
-`domain_logic` · `startup`
+`orchestration` · `startup memory extraction`
 
-This file is the phase-1 extraction driver for the memories startup pipeline. Its top-level `run` function builds a `StageOneRequestContext` once, starts an end-to-end timer, claims startup jobs from the state DB, and exits early on missing DB access or zero candidates. Claimed jobs are processed concurrently with `buffer_unordered`, each producing a `JobResult` that combines a `JobOutcome` enum (`SucceededWithOutput`, `SucceededNoOutput`, `Failed`) with optional `TokenUsage`. After all jobs finish, `aggregate_stats` folds counts and summed token usage into `Stats`, and `emit_metrics` publishes counters and histograms.
+This file is active during memory startup. Its job is to turn eligible saved conversations, called rollouts, into raw memory records that later phases can refine and use. Without it, the system would have no fresh raw material for long-term memories, and old unused stage-1 records could pile up in the database.
 
-The extraction payload is constrained by `StageOneOutput`, a strict JSON-deserializable schema with `raw_memory`, `rollout_summary`, and nullable `rollout_slug`; `output_schema` mirrors that contract for the model request. Inside `job::sample`, the code loads rollout items from disk, filters them down to memory-safe `ResponseItem`s, serializes them to JSON, redacts secrets, and renders a stage-one prompt using rollout path/cwd metadata plus truncated rollout contents. The model response is streamed, parsed as JSON, and redacted again before persistence.
+The main flow is deliberately ordered. First it builds a request context, which is the shared setup needed to talk to the extraction model. Then it claims a limited number of eligible jobs from the state database, using a lease-like ownership token so two workers do not process the same rollout at the same time. Next it runs those jobs in parallel, but only up to a fixed concurrency limit so startup work does not overwhelm the model service.
 
-Filtering is intentionally opinionated: developer messages are dropped entirely, user messages have AGENTS.md instruction blocks and `<skill>...</skill>` fragments removed, but environment context and inter-agent communications are preserved. Persistence paths distinguish hard failures, successful jobs with empty output, and successful jobs with stored memory rows, all guarded by ownership tokens from the DB lease system.
+Each job loads one rollout file, filters out parts that should not become memory, redacts secrets, and sends the remaining conversation to the model with a strict JSON schema. The expected answer contains a detailed raw memory, a short summary, and an optional filename-friendly slug. The job then marks the database row as succeeded, succeeded with no useful output, or failed for retry. Finally, the file totals the outcomes and token usage, emits metrics, and logs a human-readable summary.
 
 #### Function details
 
@@ -6443,11 +6477,11 @@ Filtering is intentionally opinionated: developer messages are dropped entirely,
 async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>)
 ```
 
-**Purpose**: Executes the full phase-1 startup pass from request-context creation through job claiming, parallel extraction, and final metrics/logging. It short-circuits when the state DB is unavailable or when no rollout candidates are claimable.
+**Purpose**: Runs the whole phase-1 memory extraction pass. It claims eligible rollout jobs, processes them through the model, and records metrics about what happened.
 
-**Data flow**: Takes an `Arc<MemoryStartupContext>` and `Arc<Config>`. It derives a `StageOneRequestContext`, starts an E2E timer on that telemetry context, asks the DB for startup claims using memory-related config limits, then feeds the claimed `Stage1JobClaim` list into parallel job execution. The collected `Vec<JobResult>` is reduced into `Stats`, which are emitted as counters/histograms and summarized in an info log; no value is returned.
+**Data flow**: It receives a startup context and configuration. It builds the model request context, asks the database for work, sends claimed jobs into the parallel job runner, combines the job results into counts, emits metrics, and writes a summary log. If there is no database work, it exits early.
 
-**Call relations**: This is the phase-1 entry used by the startup task after rate-limit checks. It first delegates model/telemetry setup to `build_request_context`, then DB leasing to `claim_startup_jobs`, then per-rollout work to `run_jobs`; once those complete it delegates summarization to `aggregate_stats` and telemetry emission to `emit_metrics`.
+**Call relations**: This is the top-level driver for this file. It calls build_request_context before work begins, claim_startup_jobs to reserve work, run_jobs to process that work, then aggregate_stats and emit_metrics to summarize the run.
 
 *Call graph*: calls 5 internal fn (aggregate_stats, build_request_context, claim_startup_jobs, emit_metrics, run_jobs); 1 external calls (info!).
 
@@ -6458,11 +6492,11 @@ async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>)
 async fn prune(context: &MemoryStartupContext, config: &Config)
 ```
 
-**Purpose**: Deletes stale, unused stage-1 output rows from the memories database according to retention settings. It is a best-effort cleanup step that logs but does not fail startup.
+**Purpose**: Deletes old, unused phase-1 raw memory rows according to the configured retention period. This keeps the memory database from growing with stale material that was never used later.
 
-**Data flow**: Reads the optional state DB from `MemoryStartupContext` and `max_unused_days` from `Config.memories`. If a DB exists, it invokes the memories retention prune with a fixed batch size and logs either the number of rows removed or a warning on error. It returns no value and does not mutate in-memory state.
+**Data flow**: It reads the state database from the startup context and the maximum unused age from the configuration. It asks the database to remove a batch of stale stage-1 outputs, logs how many were removed, and warns if the database operation fails.
 
-**Call relations**: This function is invoked by `start_memories_startup_task` before quota checks because it consumes no model tokens. It does not call deeper crate logic beyond the DB accessor and relies on logging to surface failures.
+**Call relations**: The startup memory task calls this as a cleanup step. It works independently from extraction jobs, but uses the same state database area where phase-1 outputs are stored.
 
 *Call graph*: calls 1 internal fn (state_db); called by 1 (start_memories_startup_task); 2 external calls (info!, warn!).
 
@@ -6473,11 +6507,11 @@ async fn prune(context: &MemoryStartupContext, config: &Config)
 fn output_schema() -> Value
 ```
 
-**Purpose**: Builds the JSON Schema that constrains phase-1 model output to the exact `StageOneOutput` shape. The schema requires all three keys and forbids extra properties.
+**Purpose**: Builds the strict JSON shape that the model must return for phase-1 extraction. This helps prevent vague or malformed model answers.
 
-**Data flow**: Produces a `serde_json::Value` object literal describing an object with string `rollout_summary`, nullable/string `rollout_slug`, and string `raw_memory`, all listed in `required` with `additionalProperties: false`. It reads no external state.
+**Data flow**: It takes no input. It returns a JSON schema requiring three fields: rollout_summary, rollout_slug, and raw_memory, while allowing rollout_slug to be either a string or null.
 
-**Call relations**: Used by `job::sample` to request strict structured output from the model, and by a unit test that verifies `rollout_slug` remains required yet nullable.
+**Call relations**: job::sample attaches this schema to the prompt before calling the model. A test also checks that rollout_slug is required but nullable, so callers can rely on that contract.
 
 *Call graph*: called by 2 (sample, output_schema_requires_rollout_slug_and_keeps_it_nullable); 1 external calls (json!).
 
@@ -6491,11 +6525,11 @@ async fn claim_startup_jobs(
 ) -> Option<Vec<codex_state::Stage1JobClaim>>
 ```
 
-**Purpose**: Claims a bounded set of eligible rollout threads for phase-1 processing during startup. It applies source, age, idle-time, scan-limit, and lease constraints from configuration and constants.
+**Purpose**: Reserves a batch of rollout jobs for this startup run. This prevents multiple workers from extracting memory from the same rollout at once.
 
-**Data flow**: Consumes a `MemoryStartupContext` and `MemoriesConfig`. It reads the state DB and current startup thread ID, constructs `allowed_sources` from `INTERACTIVE_SESSION_SOURCES`, then submits `Stage1StartupClaimParams` containing scan limit, max claimed jobs, max age, minimum idle hours, allowed sources, and lease duration. It returns `Some(Vec<Stage1JobClaim>)` on success, `None` if the DB is missing or the claim query errors.
+**Data flow**: It reads the state database, current thread id, allowed rollout sources, and memory limits from configuration. It asks the database to claim eligible jobs using age, idle-time, count, and lease settings. It returns the claimed jobs, or no result if the database is unavailable or the claim fails.
 
-**Call relations**: Called only by `run` before any model work begins. Its output determines whether phase 1 proceeds at all; failures are converted into warnings and a skipped phase rather than propagated.
+**Call relations**: run calls this before launching any extraction jobs. The claimed job list is handed to run_jobs; if claiming fails, run stops instead of guessing what work is safe.
 
 *Call graph*: calls 2 internal fn (state_db, thread_id); called by 1 (run); 1 external calls (warn!).
 
@@ -6509,11 +6543,11 @@ async fn build_request_context(
 ) -> StageOneRequestContext
 ```
 
-**Purpose**: Chooses the model name for phase-1 extraction and asks the runtime to build a telemetry/model-info snapshot for requests. It prefers an explicit config override and otherwise falls back to the provider’s memory-extraction default.
+**Purpose**: Prepares the shared information needed to ask the model for memory extraction. It chooses the extraction model and builds a context for metrics, timing, and model calls.
 
-**Data flow**: Reads `config.memories.extract_model`; if absent, it queries `context.provider().memory_extraction_preferred_model()`. It then passes the chosen model name plus the fixed stage-one reasoning effort into `MemoryStartupContext::stage_one_request_context` and returns the resulting `StageOneRequestContext`.
+**Data flow**: It reads the configured extraction model if one is set. If not, it asks the provider for its preferred memory extraction model. It then returns a StageOneRequestContext built with that model and the phase-1 reasoning setting.
 
-**Call relations**: This is the first helper used by `run`, ensuring all later jobs share the same model metadata and telemetry wrapper. It delegates the actual model-info lookup and service-tier capture to the runtime layer.
+**Call relations**: run calls this first so later steps have a single consistent model context. job::sample later uses that context when it sends prompts to the model.
 
 *Call graph*: calls 1 internal fn (stage_one_request_context); called by 1 (run).
 
@@ -6529,11 +6563,11 @@ async fn run_jobs(
 ) -> Vec<Jo
 ```
 
-**Purpose**: Runs all claimed phase-1 jobs concurrently up to the configured concurrency limit. It preserves no ordering and simply collects each job’s terminal result.
+**Purpose**: Runs all claimed phase-1 jobs in parallel, while keeping the number of simultaneous jobs under a fixed limit. This speeds up startup without flooding the model service.
 
-**Data flow**: Takes shared startup context/config, a vector of `Stage1JobClaim`s, and a `StageOneRequestContext`. It turns the claims into a futures stream, clones the shared inputs per claim, invokes `job::run` for each, buffers them unordered with the stage-one concurrency constant, and collects the resulting `JobResult`s into a `Vec`.
+**Data flow**: It receives the shared context, configuration, claimed jobs, and request context. For each claim, it starts job::run, buffers the tasks with the configured concurrency limit, waits for all of them, and returns their JobResult values.
 
-**Call relations**: Called by `run` after claims are acquired. It is the bridge from orchestration into per-rollout extraction logic, delegating every individual claim to `job::run`.
+**Call relations**: run calls this after claiming jobs. It delegates the real per-rollout extraction to job::run and gives the completed job results back to run for counting and metrics.
 
 *Call graph*: called by 1 (run); 1 external calls (iter).
 
@@ -6549,11 +6583,11 @@ async fn run(
     ) -> JobResult
 ```
 
-**Purpose**: Processes one claimed rollout thread end-to-end: sample the model, classify empty output versus usable output, and mark the DB row accordingly. It converts all failures into DB failure marks tied to the claim ownership token.
+**Purpose**: Processes one claimed rollout job from start to finish. It turns one rollout into a model-produced memory result and records the outcome in the database.
 
-**Data flow**: Accepts the startup context, config, one `Stage1JobClaim`, and the shared request context. It extracts the claimed thread metadata, calls `sample` with rollout path/cwd, and on error records failure via `result::failed` and returns `JobResult { Failed, None }`. On success it inspects `StageOneOutput`; empty `raw_memory` or `rollout_summary` triggers `result::no_output`, otherwise it calls `result::success` with thread ID, ownership token, source timestamp, raw memory, summary, and optional slug. It returns the resulting `JobOutcome` plus any token usage from sampling.
+**Data flow**: It receives one database claim, including the rollout path, working directory, thread id, update time, and ownership token. It calls job::sample to extract model output. If sampling fails, it records a failed job. If the model returns empty required content, it records a no-output success. Otherwise it records the raw memory, summary, slug, and source timestamp as a successful output.
 
-**Call relations**: Invoked from `run_jobs` for each claimed candidate. It delegates model interaction to `sample` and all DB state transitions to the nested `result` helpers so the orchestration path stays focused on classification.
+**Call relations**: run_jobs calls this for each claimed job. It hands failed cases to job::result::failed, empty cases to job::result::no_output, and useful extracted memories to job::result::success.
 
 *Call graph*: 4 external calls (sample, failed, no_output, success).
 
@@ -6570,11 +6604,11 @@ async fn sample(
     ) ->
 ```
 
-**Purpose**: Loads a rollout from disk, filters and serializes memory-safe items, constructs the stage-one prompt, streams the model response, and parses/redacts the structured output. This is the actual extraction step that turns rollout history into `StageOneOutput`.
+**Purpose**: Loads one rollout and asks the model to extract phase-1 memory from it. This is where saved conversation history becomes structured memory text.
 
-**Data flow**: Inputs are the startup context, config, rollout file path, rollout cwd, and request context. It reads rollout items via `RolloutRecorder::load_rollout_items`, converts them to a redacted JSON string with `serialize_filtered_rollout_response_items`, builds a `Prompt` containing one user `ResponseItem::Message` whose text comes from `build_stage_one_input_message`, sets base instructions and strict `output_schema`, then calls `stream_stage_one_prompt`. The returned text is deserialized into `StageOneOutput`, whose fields are individually passed through `redact_secrets`; it returns `(StageOneOutput, Option<TokenUsage>)` or an error.
+**Data flow**: It receives the rollout file path, rollout working directory, configuration, and request context. It loads rollout items from disk, filters and serializes the parts safe for memory extraction, builds a prompt with base instructions and the strict output schema, sends the prompt to the model, parses the model's JSON answer, redacts secrets from the returned text, and returns the StageOneOutput plus optional token usage.
 
-**Call relations**: Called only by `job::run`. It depends on `output_schema` for structured output enforcement and on the runtime’s streaming API for model execution.
+**Call relations**: job::run calls this as the core extraction step. It uses output_schema to constrain the model response and job::serialize_filtered_rollout_response_items to prepare the conversation for the prompt.
 
 *Call graph*: calls 4 internal fn (default, output_schema, stream_stage_one_prompt, load_rollout_items); 4 external calls (redact_secrets, serialize_filtered_rollout_response_items, from_str, vec!).
 
@@ -6590,11 +6624,11 @@ async fn failed(
         )
 ```
 
-**Purpose**: Marks a claimed phase-1 job as failed in the DB and schedules it for retry after a fixed delay. It also emits a warning with the thread ID and failure reason.
+**Purpose**: Records that one phase-1 job failed and should be retried later. It also logs the reason so operators can investigate repeated failures.
 
-**Data flow**: Takes the startup context, thread ID, ownership token, and textual reason. It logs the failure, reads the optional state DB, and if present calls `mark_stage1_job_failed` with the retry delay constant. It returns no value and ignores DB write errors.
+**Data flow**: It receives the context, thread id, ownership token, and failure reason. It writes a warning log, then, if the state database is available, asks the database to mark the job failed with a retry delay. It does not return a value.
 
-**Call relations**: Used by `job::run` whenever sampling or prompt execution fails. It is intentionally fire-and-forget so one failed persistence update does not panic the startup pipeline.
+**Call relations**: job::run calls this when job::sample returns an error. It is the failure-recording branch of the per-job workflow.
 
 *Call graph*: calls 1 internal fn (state_db); 1 external calls (warn!).
 
@@ -6609,11 +6643,11 @@ async fn no_output(
         ) -> JobOutcome
 ```
 
-**Purpose**: Marks a claimed phase-1 job as successfully processed but producing no usable memory output. It treats missing DB access or a rejected ownership update as a failure outcome.
+**Purpose**: Records that a job completed but produced no useful memory text. This is different from an error: the rollout may simply contain nothing worth remembering.
 
-**Data flow**: Consumes the startup context, thread ID, and ownership token. It fetches the state DB; if absent it immediately returns `JobOutcome::Failed`. Otherwise it calls `mark_stage1_job_succeeded_no_output` and maps a successful `true` result to `SucceededNoOutput`, with all other cases becoming `Failed`.
+**Data flow**: It receives the context, thread id, and ownership token. It asks the database to mark the job as succeeded with no output. It returns SucceededNoOutput if the database confirms the update, otherwise Failed.
 
-**Call relations**: Called by `job::run` when the model returns an empty `raw_memory` or empty `rollout_summary`. It isolates the DB-specific success/no-output transition from the extraction logic.
+**Call relations**: job::run calls this when the model result has an empty raw memory or empty summary. The returned outcome is later counted by aggregate_stats.
 
 *Call graph*: calls 1 internal fn (state_db).
 
@@ -6629,11 +6663,11 @@ async fn success(
             raw_me
 ```
 
-**Purpose**: Persists a non-empty phase-1 extraction result and marks the claimed job as succeeded with output. It writes both the raw memory body and the compact rollout summary, plus optional slug metadata.
+**Purpose**: Stores a useful phase-1 memory result in the database and marks the job complete. This is the successful end of one rollout extraction.
 
-**Data flow**: Inputs are the startup context, thread ID, ownership token, source update timestamp, `raw_memory`, `rollout_summary`, and optional `rollout_slug`. It reads the state DB; if absent it returns `Failed`. Otherwise it calls `mark_stage1_job_succeeded` and maps a successful `true` response to `SucceededWithOutput`, with all other outcomes mapped to `Failed`.
+**Data flow**: It receives the context, thread id, ownership token, source update timestamp, raw memory, rollout summary, and optional slug. It asks the database to save those values and mark the claim as succeeded. It returns SucceededWithOutput if the database accepts the update, otherwise Failed.
 
-**Call relations**: Called by `job::run` only after `sample` returns non-empty fields. It is the persistence endpoint that also triggers downstream phase-2 eligibility in the DB layer.
+**Call relations**: job::run calls this after job::sample returns non-empty memory and summary text. The outcome then flows back through run_jobs and into aggregate_stats.
 
 *Call graph*: calls 1 internal fn (state_db).
 
@@ -6646,11 +6680,11 @@ fn serialize_filtered_rollout_response_items(
     ) -> codex_protocol::error::Result<String>
 ```
 
-**Purpose**: Converts rollout trace items into the subset of `ResponseItem`s that are safe and useful for memory extraction prompts. It drops unsupported rollout item kinds, preserves inter-agent communications, serializes the result to JSON, and redacts secrets before upload.
+**Purpose**: Turns selected rollout items into a JSON string suitable for including in the model prompt. It removes items that should not influence memory and redacts secrets before upload.
 
-**Data flow**: Takes a slice of `RolloutItem`. It iterates through items, mapping `RolloutItem::ResponseItem` through `sanitize_response_item_for_memories`, converting `InterAgentCommunication` to model input items, and discarding session metadata, compacted items, turn context, and event messages. The filtered vector is serialized with `serde_json::to_string`; serialization errors become `CodexErr::InvalidRequest`. The final JSON string is passed through `redact_secrets` and returned.
+**Data flow**: It receives a list of rollout items. It keeps memory-relevant response items, converts inter-agent messages into model input form, drops metadata and other non-conversation records, serializes the remaining items to JSON, redacts secret-looking values, and returns the safe string or an error if serialization fails.
 
-**Call relations**: Used by `job::sample` before prompt rendering, and exercised by multiple tests that verify contextual filtering, secret redaction, and inter-agent communication preservation.
+**Call relations**: job::sample calls this before building the prompt. Several tests call it directly to confirm that unwanted context is removed, secrets are hidden, and inter-agent communications are preserved.
 
 *Call graph*: 3 external calls (redact_secrets, iter, to_string).
 
@@ -6661,11 +6695,11 @@ fn serialize_filtered_rollout_response_items(
 fn sanitize_response_item_for_memories(item: &ResponseItem) -> Option<ResponseItem>
 ```
 
-**Purpose**: Applies per-`ResponseItem` filtering rules tailored for memory extraction. It removes developer messages entirely, strips certain contextual fragments from user messages, and otherwise preserves items that the rollout policy allows.
+**Purpose**: Decides whether a single model response item should be kept for memory extraction, and trims user messages when only part of them should be excluded.
 
-**Data flow**: Accepts a `&ResponseItem`. Non-message items are returned only if `should_persist_response_item_for_memories` says they should be kept, in which case the item is cloned. For `ResponseItem::Message`, developer-role messages return `None`; non-user roles are cloned unchanged; user-role messages have `content` filtered to remove fragments identified by `is_memory_excluded_contextual_user_fragment`. If all content is removed, it returns `None`; otherwise it reconstructs and returns a cloned message with filtered content.
+**Data flow**: It receives one response item. Non-message items are kept only if the rollout policy says they are safe for memories. Developer messages are dropped. Non-user messages are kept unchanged. User messages have AGENTS.md instruction fragments and skill fragments removed; if nothing remains, the whole message is dropped.
 
-**Call relations**: Called from `serialize_filtered_rollout_response_items` for every response item in a rollout. It is the core policy gate that decides what conversational material reaches the phase-1 model.
+**Call relations**: job::serialize_filtered_rollout_response_items uses this while walking through rollout items. It relies on job::is_memory_excluded_contextual_user_fragment to identify user-message fragments that are context setup rather than conversation content.
 
 *Call graph*: 2 external calls (should_persist_response_item_for_memories, clone).
 
@@ -6676,11 +6710,11 @@ fn sanitize_response_item_for_memories(item: &ResponseItem) -> Option<ResponseIt
 fn is_memory_excluded_contextual_user_fragment(content_item: &ContentItem) -> bool
 ```
 
-**Purpose**: Recognizes user text fragments that are contextual scaffolding rather than conversation content and should be omitted from memory extraction. The current exclusions are AGENTS.md instruction wrappers and `<skill>` blocks.
+**Purpose**: Recognizes user-message text blocks that are contextual setup and should not become memory. In practice, it excludes injected AGENTS.md instructions and skill definitions.
 
-**Data flow**: Takes a `&ContentItem`. If the item is not `ContentItem::InputText`, it returns `false`. For text items, it checks the text against two start/end marker pairs via `matches_marked_fragment` and returns `true` if either pair matches.
+**Data flow**: It receives one content item. If the item is not input text, it returns false. If it is text, it checks whether the text is wrapped in known start and end markers for excluded fragments, and returns true only for those cases.
 
-**Call relations**: Used by `sanitize_response_item_for_memories` while filtering user message content. Its behavior is pinned by a dedicated unit test covering positive and negative examples.
+**Call relations**: job::sanitize_response_item_for_memories calls this for each content fragment in a user message. The unit test job::tests::classifies_memory_excluded_fragments checks the intended classifications.
 
 *Call graph*: 1 external calls (matches_marked_fragment).
 
@@ -6691,11 +6725,11 @@ fn is_memory_excluded_contextual_user_fragment(content_item: &ContentItem) -> bo
 fn matches_marked_fragment(text: &str, start_marker: &str, end_marker: &str) -> bool
 ```
 
-**Purpose**: Performs a case-insensitive boundary check for a text block wrapped by a specific start marker and end marker. It ignores leading and trailing whitespace around the markers.
+**Purpose**: Checks whether a piece of text starts and ends with a specific marker pair, ignoring leading/trailing whitespace and letter case. It is a small helper for recognizing whole marked blocks.
 
-**Data flow**: Receives the full text plus `start_marker` and `end_marker`. It trims leading whitespace and checks whether the beginning equals the start marker ignoring ASCII case, then trims trailing whitespace and checks whether the end equals the end marker ignoring ASCII case. It returns `true` only if both conditions hold.
+**Data flow**: It receives text, a start marker, and an end marker. It trims the outside whitespace, compares the beginning and ending parts with case-insensitive matching, and returns true only if both markers match.
 
-**Call relations**: This helper is only used by `is_memory_excluded_contextual_user_fragment` to implement marker-based exclusion without parsing the inner body.
+**Call relations**: job::is_memory_excluded_contextual_user_fragment calls this twice: once for AGENTS.md instruction blocks and once for skill blocks.
 
 
 ##### `job::tests::classifies_memory_excluded_fragments`  (lines 490–523)
@@ -6704,11 +6738,11 @@ fn matches_marked_fragment(text: &str, start_marker: &str, end_marker: &str) -> 
 fn classifies_memory_excluded_fragments()
 ```
 
-**Purpose**: Verifies that AGENTS.md instruction wrappers and `<skill>` blocks are excluded, while environment context and subagent notifications are retained. It codifies the intended filtering boundary for user content fragments.
+**Purpose**: Tests that the fragment filter excludes only the intended contextual blocks. This protects against accidentally storing project instructions or skill definitions as memories.
 
-**Data flow**: Builds several sample text cases, wraps each in `ContentItem::InputText`, passes them to `is_memory_excluded_contextual_user_fragment`, and asserts the returned boolean matches the expected classification. It writes no external state.
+**Data flow**: It builds several sample text fragments with expected true-or-false answers. For each one, it wraps the text as an input content item, runs job::is_memory_excluded_contextual_user_fragment, and checks the result.
 
-**Call relations**: This unit test directly exercises the fragment classifier used by `sanitize_response_item_for_memories`.
+**Call relations**: This test exercises the helper used by job::sanitize_response_item_for_memories. It gives confidence that serialization will keep environment and subagent context while dropping AGENTS.md and skill fragments.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6719,11 +6753,11 @@ fn classifies_memory_excluded_fragments()
 fn output_schema_requires_rollout_slug_and_keeps_it_nullable()
 ```
 
-**Purpose**: Checks that the phase-1 output schema explicitly declares `rollout_slug`, requires it, and allows either string or null values. This prevents schema drift between prompt constraints and `StageOneOutput` deserialization.
+**Purpose**: Tests the contract of the model output schema. It ensures rollout_slug is present in the schema and may be null.
 
-**Data flow**: Calls `output_schema`, navigates the resulting JSON to inspect `properties` and `required`, sorts the required keys and rollout-slug type entries, and asserts the expected contents. It returns nothing.
+**Data flow**: It calls output_schema, inspects the properties and required fields, sorts the relevant lists, and asserts that raw_memory, rollout_summary, and rollout_slug are required while rollout_slug accepts both null and string.
 
-**Call relations**: This test guards the contract consumed by `job::sample`, ensuring the model is asked for the same shape the code expects to parse.
+**Call relations**: This test protects output_schema, which job::sample depends on when asking the model for structured JSON.
 
 *Call graph*: calls 1 internal fn (output_schema); 2 external calls (assert!, assert_eq!).
 
@@ -6734,11 +6768,11 @@ fn output_schema_requires_rollout_slug_and_keeps_it_nullable()
 fn aggregate_stats(outcomes: Vec<JobResult>) -> Stats
 ```
 
-**Purpose**: Reduces per-job outcomes into aggregate counts and summed token usage for the whole phase-1 run. It preserves `None` token usage when no job reported usage at all.
+**Purpose**: Turns a list of individual job results into totals for logging and metrics. It also adds up reported model token usage.
 
-**Data flow**: Consumes a `Vec<JobResult>`. It counts total claimed jobs from vector length, increments success/no-output/failure counters based on each `JobOutcome`, and accumulates any present `TokenUsage` into a default-initialized total while tracking whether at least one usage was seen. It returns a `Stats` struct whose `total_token_usage` is `Some(total)` only if any job supplied usage.
+**Data flow**: It receives all JobResult values from a phase-1 run. It counts how many were claimed, succeeded with output, succeeded with no output, and failed. For jobs that include token usage, it adds their input, cached input, output, reasoning output, and total token counts. It returns a Stats summary.
 
-**Call relations**: Called by `run` after all jobs complete, and by tests that verify token-usage summation and the empty-usage case.
+**Call relations**: run calls this after run_jobs finishes. The tests call it directly to confirm token totals are added correctly and remain absent when no job reports usage.
 
 *Call graph*: called by 3 (run, count_outcomes_keeps_usage_empty_when_no_job_reports_it, count_outcomes_sums_token_usage_across_all_jobs); 1 external calls (default).
 
@@ -6749,11 +6783,11 @@ fn aggregate_stats(outcomes: Vec<JobResult>) -> Stats
 fn emit_metrics(context: &StageOneRequestContext, counts: &Stats)
 ```
 
-**Purpose**: Publishes phase-1 counters and token-usage histograms from aggregated stats. It emits only non-zero count metrics and breaks token usage into total, input, cached input, output, and reasoning output buckets.
+**Purpose**: Reports phase-1 job counts and token usage to the metrics system. These numbers let operators see how much work ran and how expensive it was.
 
-**Data flow**: Reads a `StageOneRequestContext` and `Stats`. For each non-zero count field it increments `MEMORY_PHASE_ONE_JOBS` with an appropriate status tag, increments `MEMORY_PHASE_ONE_OUTPUT` for successful outputs, and if token usage exists records multiple histograms derived from the `TokenUsage` fields using `max(0)` or `cached_input()`. It returns no value.
+**Data flow**: It receives the request context and aggregated Stats. It increments counters for claimed, succeeded, no-output, failed, and output-producing jobs when their counts are nonzero. If token usage exists, it records histograms for total, input, cached input, output, and reasoning-output tokens.
 
-**Call relations**: Invoked by `run` after `aggregate_stats`. It uses the telemetry wrapper methods on `StageOneRequestContext`, which in turn forward to session telemetry.
+**Call relations**: run calls this after aggregate_stats. It uses the StageOneRequestContext as the bridge to the metrics system.
 
 *Call graph*: calls 2 internal fn (counter, histogram); called by 1 (run).
 
@@ -6764,11 +6798,11 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats)
 fn serializes_memory_rollout_with_agents_removed_but_environment_kept()
 ```
 
-**Purpose**: Confirms rollout serialization removes AGENTS.md and skill fragments from user messages while preserving environment context and subagent notifications. It validates the exact filtered JSON shape fed into phase-1 prompts.
+**Purpose**: Tests that rollout serialization removes instruction and skill blocks but keeps useful context such as environment information and subagent notifications.
 
-**Data flow**: Constructs mixed `ResponseItem::Message` values, wraps them as `RolloutItem::ResponseItem`, serializes them with `job::serialize_filtered_rollout_response_items`, parses the JSON back into `Vec<ResponseItem>`, and asserts the resulting vector contains only the expected retained content. No external state is touched.
+**Data flow**: It builds sample rollout response items containing AGENTS.md instructions, a skill definition, environment context, and a subagent notification. It serializes them through job::serialize_filtered_rollout_response_items, parses the JSON back into response items, and compares the result to the expected kept messages.
 
-**Call relations**: This test exercises the combined behavior of `serialize_filtered_rollout_response_items`, `sanitize_response_item_for_memories`, and the fragment classifier.
+**Call relations**: This test exercises the same serialization path that job::sample uses before prompting the model. It guards the filtering behavior used by job::sanitize_response_item_for_memories.
 
 *Call graph*: 5 external calls (assert_eq!, serialize_filtered_rollout_response_items, ResponseItem, from_str, vec!).
 
@@ -6779,11 +6813,11 @@ fn serializes_memory_rollout_with_agents_removed_but_environment_kept()
 fn serializes_memory_rollout_redacts_secrets_before_prompt_upload()
 ```
 
-**Purpose**: Verifies that serialized rollout content is secret-redacted before being embedded in a model prompt. It specifically checks a function-call output containing an API-token-like string.
+**Purpose**: Tests that secrets are hidden before serialized rollout data is sent to the model. This reduces the risk of leaking API keys or similar sensitive values.
 
-**Data flow**: Builds a rollout containing one `ResponseItem::FunctionCallOutput` with a secret-looking token in text, serializes it through `job::serialize_filtered_rollout_response_items`, and asserts the raw secret is absent while `[REDACTED_SECRET]` is present. It returns nothing.
+**Data flow**: It creates a function-call output containing a secret-looking token. It serializes the rollout item and then asserts that the original token is gone and the redaction marker is present.
 
-**Call relations**: This test targets the final redaction step inside `serialize_filtered_rollout_response_items`, which is used by `job::sample`.
+**Call relations**: This test directly checks job::serialize_filtered_rollout_response_items, which job::sample relies on before any prompt upload.
 
 *Call graph*: 4 external calls (assert!, serialize_filtered_rollout_response_items, Text, ResponseItem).
 
@@ -6794,11 +6828,11 @@ fn serializes_memory_rollout_redacts_secrets_before_prompt_upload()
 fn serializes_inter_agent_communications_for_memory()
 ```
 
-**Purpose**: Checks that plaintext and encrypted inter-agent communications are converted into model-input response items and preserved in serialized rollout memory input. This ensures multi-agent coordination artifacts remain available to phase 1.
+**Purpose**: Tests that messages between agents are preserved in the memory prompt input. These messages can explain what happened during a rollout and may be important for later memory extraction.
 
-**Data flow**: Creates plaintext and encrypted `InterAgentCommunication` values, computes the expected `ResponseItem` forms via `to_model_input_item`, serializes them as `RolloutItem::InterAgentCommunication`, parses the JSON back into `Vec<ResponseItem>`, and asserts equality with the expected vector.
+**Data flow**: It creates both plaintext and encrypted inter-agent communication records, converts the expected versions to model input items, serializes the rollout items, parses the JSON, and checks that the parsed output matches the expected model input items.
 
-**Call relations**: This test covers the non-response-item branch in `serialize_filtered_rollout_response_items` that maps inter-agent communication into prompt-visible items.
+**Call relations**: This test covers the InterAgentCommunication branch inside job::serialize_filtered_rollout_response_items, the helper used by job::sample.
 
 *Call graph*: calls 3 internal fn (root, new, new_encrypted); 6 external calls (new, assert_eq!, serialize_filtered_rollout_response_items, InterAgentCommunication, from_str, vec!).
 
@@ -6809,11 +6843,11 @@ fn serializes_inter_agent_communications_for_memory()
 fn count_outcomes_sums_token_usage_across_all_jobs()
 ```
 
-**Purpose**: Verifies that aggregate stats count each outcome category correctly and sum token usage across multiple jobs. It covers mixed success, no-output, and failure cases.
+**Purpose**: Tests that aggregate_stats counts job outcomes and adds token usage across multiple jobs. This keeps metrics accurate when some jobs succeed, some produce no memory, and some fail.
 
-**Data flow**: Builds a vector of `JobResult` values with explicit `TokenUsage` on two jobs and none on one failed job, passes it to `aggregate_stats`, and asserts the resulting counts and summed usage fields match the expected totals. It returns nothing.
+**Data flow**: It builds three sample JobResult values with different outcomes and token usage. It passes them to aggregate_stats and checks the resulting counts and summed token fields.
 
-**Call relations**: This test directly validates `aggregate_stats`, which is used by the top-level phase-1 `run` function.
+**Call relations**: This test protects the summary step used by run before emit_metrics reports the numbers.
 
 *Call graph*: calls 1 internal fn (aggregate_stats); 2 external calls (assert_eq!, vec!).
 
@@ -6824,24 +6858,24 @@ fn count_outcomes_sums_token_usage_across_all_jobs()
 fn count_outcomes_keeps_usage_empty_when_no_job_reports_it()
 ```
 
-**Purpose**: Ensures aggregate stats leave `total_token_usage` as `None` when every job lacks usage information. This distinguishes 'no usage reported' from 'reported zero tokens'.
+**Purpose**: Tests that aggregate_stats does not invent token usage when no job reports any. This lets metrics distinguish between zero usage and unavailable usage data.
 
-**Data flow**: Constructs two `JobResult`s with `token_usage: None`, calls `aggregate_stats`, and asserts the claimed count and `None` usage result. It has no side effects.
+**Data flow**: It builds sample JobResult values with no token usage, calls aggregate_stats, and checks that the total_token_usage field is absent.
 
-**Call relations**: This is the companion test for `aggregate_stats`, covering the branch where the accumulator never sees any token-usage payload.
+**Call relations**: This test protects aggregate_stats, which run uses to decide whether emit_metrics should publish token histograms.
 
 *Call graph*: calls 1 internal fn (aggregate_stats); 2 external calls (assert_eq!, vec!).
 
 
 ### `memories/write/src/phase2.rs`
 
-`domain_logic` · `startup`
+`orchestration` · `startup/background memory consolidation`
 
-This file drives the second half of memory startup: consolidating DB-backed stage-1 outputs into the on-disk memories workspace. `run` starts an E2E timer, requires a state DB, computes the memory root, and acquires a global phase-2 lease through `job::claim`. It then prepares the workspace baseline repository, builds a restricted agent config, loads current phase-2 inputs from the DB, computes a completion watermark from the newest selected memory, and syncs those inputs into files under the memory root.
+This file is the coordinator for memory consolidation. Phase 1 has already produced raw memory records from user activity. Phase 2 turns those raw records into a cleaner memory workspace, using a special internal agent. Without this file, raw memories could pile up, two workers could race to rewrite the same files, or a failed agent could leave the system thinking consolidation succeeded.
 
-The sync step writes rollout summaries, rebuilds `raw_memories.md`, and prunes old extension resources. After syncing, the code asks git for a workspace diff; if nothing changed, it marks the global job successful without spawning an agent. Otherwise it writes the diff to disk, builds a consolidation prompt, and starts an internal consolidation thread.
+The flow is deliberately linear, like a checklist. First it claims a global job lease in the state database. A lease is a temporary lock: it says “this worker owns this job for now,” and it must be refreshed while the job runs. Then it prepares the memory folder as a git-backed workspace, builds a locked-down configuration for the consolidation agent, loads the raw memories that should be processed, writes those inputs into files, and checks whether the workspace actually changed.
 
-The nested `agent` module is responsible for hardening the spawned thread: it forces `ephemeral = true`, disables memory generation/use and multiple features, constrains MCP servers to none, sets approval to `Never`, and applies a workspace-write/no-network sandbox rooted only at the memories directory. `agent::handle` then runs asynchronously: it heartbeats the global lease while polling agent status, emits token-usage metrics on completion, confirms ownership again before resetting the git baseline, and marks the global job succeeded or failed depending on agent status, ownership, and baseline reset outcome.
+If there is no change, the job can finish without running an agent. If there is a change, the file writes a diff for the agent to inspect, starts the agent with a consolidation prompt, and then watches it in the background. While the agent runs, the code sends heartbeats to keep the lease alive. If the agent succeeds and the lock is still owned, the workspace baseline is reset and the database is marked successful. Metrics are recorded throughout so operators can see job counts, input sizes, failures, and token use.
 
 #### Function details
 
@@ -6851,11 +6885,11 @@ The nested `agent` module is responsible for hardening the spawned thread: it fo
 async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>)
 ```
 
-**Purpose**: Executes the full phase-2 consolidation flow from global lock acquisition through workspace sync, diff detection, optional agent spawn, and dispatch metrics. It exits early on any failure, marking the global job with a specific failure reason where applicable.
+**Purpose**: Runs the whole phase-2 consolidation job from start to dispatching the agent. It follows a strict order so the memory workspace is prepared, locked, updated, checked, and handed to the agent safely.
 
-**Data flow**: Takes shared startup context and config. It starts an E2E timer, reads the state DB, computes the memory root and memory-selection limits, claims the global phase-2 job, prepares the workspace, derives a restricted agent config, loads selected `Stage1Output` rows from the DB, computes `new_watermark`, syncs those rows into workspace files, computes a git diff, and either marks success immediately when there are no changes or writes the diff, spawns a consolidation agent, and hands off asynchronous completion handling. It finally emits input-count and agent-spawned metrics; it returns no value.
+**Data flow**: It receives a startup context and the main configuration. From those it reads the state database, memory settings, model provider, and memory root folder. It claims the global job lock, loads raw phase-1 memory outputs, writes them into the workspace, computes the new completion watermark, checks for file changes, writes a diff, starts the consolidation agent, and records metrics. If any step fails, it marks the database job as failed with a specific reason and stops early.
 
-**Call relations**: Called by `start_memories_startup_task` after phase 1 and by a dedicated model-request test. It delegates lock transitions to `job::claim`/`job::failed`/`job::succeed`, file sync to `sync_phase2_workspace_inputs`, workspace inspection to git helpers, agent setup to `agent::get_config` and `agent::get_prompt`, and long-running completion logic to `agent::handle`.
+**Call relations**: This is called by the memory startup task, and also by a model-request test. It is the top-level story in this file: it calls the job helpers to claim or finish work, the workspace helpers to prepare and compare files, the agent helpers to configure and launch the internal agent, and the metric helpers to report what happened.
 
 *Call graph*: calls 6 internal fn (emit_metrics, get_watermark, sync_phase2_workspace_inputs, memory_workspace_diff, prepare_memory_workspace, write_workspace_diff); called by 2 (start_memories_startup_task, run_memory_phase_two_model_request_test); 9 external calls (clone, get_config, get_prompt, handle, memory_root, claim, failed, succeed, error!).
 
@@ -6869,11 +6903,11 @@ async fn sync_phase2_workspace_inputs(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Materializes the selected phase-2 inputs into the memory workspace and prunes stale extension resources. It is the file-system synchronization step before git diffing.
+**Purpose**: Copies the selected raw memories into the on-disk memory workspace in the format the consolidation agent expects. It also removes old extension-related resources so the workspace stays clean.
 
-**Data flow**: Receives the memory root path and a slice of `Stage1Output`. It computes the count once, then calls `sync_rollout_summaries_from_memories`, `rebuild_raw_memories_file_from_memories`, and `prune_old_extension_resources` in sequence. It returns `std::io::Result<()>`, propagating any error from the first two operations while ignoring the prune helper’s lack of result.
+**Data flow**: It receives the memory root folder and a list of raw memory outputs. It writes rollout summaries, rebuilds the raw memories file from the selected records, prunes stale extension resources, and returns success or an input/output error if writing fails.
 
-**Call relations**: Used only by `run` after DB input selection succeeds. Its output determines what `memory_workspace_diff` sees as changed.
+**Call relations**: The main run flow calls this after choosing the phase-2 inputs and before checking the git diff. Its output is not a data object but a changed workspace on disk, which the later diff step and agent then inspect.
 
 *Call graph*: called by 1 (run); 4 external calls (prune_old_extension_resources, rebuild_raw_memories_file_from_memories, sync_rollout_summaries_from_memories, len).
 
@@ -6887,11 +6921,11 @@ async fn claim(
     ) -> Result<Claim, &'static str>
 ```
 
-**Purpose**: Attempts to acquire the singleton global phase-2 lease and translates DB claim outcomes into either a usable `Claim` or a stable status string. It also emits the 'claimed' metric when ownership is obtained.
+**Purpose**: Tries to reserve the global phase-2 job for this worker. This prevents multiple workers from consolidating the same memory workspace at once.
 
-**Data flow**: Inputs are the startup context and `StateRuntime`. It calls `try_claim_global_phase2_job` with the current thread ID and lease duration. DB errors become `Err("failed_claim")`; a claimed outcome yields a `Claim { token, watermark }` and increments `MEMORY_PHASE_TWO_JOBS` with status `claimed`; skipped retry/cooldown/running outcomes become corresponding `Err(&'static str)` values.
+**Data flow**: It reads the current thread id from the context and asks the database to claim the phase-2 job lease. If the database grants ownership, it returns a Claim containing an ownership token and the previous input watermark. If the job is already running, cooling down, or unavailable for retry, it returns a short status string explaining why no work should start.
 
-**Call relations**: Called at the start of `run` before any workspace mutation. Its returned status string is used directly by `run` to emit a skip/failure metric and abort phase 2.
+**Call relations**: The main run function calls this first, before touching workspace files. On success, later helpers use the returned token to prove they still own the job when sending heartbeats or marking the job finished.
 
 *Call graph*: calls 3 internal fn (counter, thread_id, memories).
 
@@ -6907,11 +6941,11 @@ async fn failed(
     )
 ```
 
-**Purpose**: Marks the global phase-2 job as failed and schedules a retry delay, with a fallback path for the case where the caller no longer owns the lease. It always emits a failure-status counter first.
+**Purpose**: Records that the phase-2 job failed and schedules it for retry later. It also increments a metric with the failure reason so failures can be counted by cause.
 
-**Data flow**: Takes the startup context, DB handle, `Claim`, and static reason string. It increments `MEMORY_PHASE_TWO_JOBS` with that reason, then calls `mark_global_phase2_job_failed`. If that returns `Ok(false)`, it attempts `mark_global_phase2_job_failed_if_unowned` with the same token and retry delay. It returns no value.
+**Data flow**: It receives the context, database, current claim, and a fixed failure reason. It reports the reason as a job metric, then asks the database to mark the job failed using the ownership token. If the normal update says the job is no longer owned, it tries a fallback update for the unowned case.
 
-**Call relations**: Used throughout `run` for synchronous setup failures and inside `agent::handle` for asynchronous ownership, baseline-reset, or agent-status failures. The fallback unowned path matters when the lease was lost between work and finalization.
+**Call relations**: The main run flow calls this whenever setup, input loading, workspace syncing, diff writing, or agent launch fails. The background agent handler also calls it if the running agent fails, the workspace baseline cannot be reset, or ownership cannot be confirmed.
 
 *Call graph*: calls 2 internal fn (counter, memories); 1 external calls (matches!).
 
@@ -6927,11 +6961,11 @@ async fn succeed(
         selected_outputs: &[codex_state::Stage1Output],
 ```
 
-**Purpose**: Marks the global phase-2 job as successfully completed with a completion watermark and the exact selected stage-1 outputs that were consolidated. It also emits a success-status counter.
+**Purpose**: Records that the phase-2 job completed successfully. It advances the database watermark so the system knows which raw memories were covered by this consolidation run.
 
-**Data flow**: Consumes the startup context, DB handle, `Claim`, completion watermark, selected outputs slice, and static reason string. It increments `MEMORY_PHASE_TWO_JOBS` with that reason, calls `mark_global_phase2_job_succeeded`, and returns the DB boolean result, defaulting to `false` on error.
+**Data flow**: It receives the current claim, the completion watermark, the selected raw outputs, and a success reason. It reports the success as a metric, then asks the database to mark the job succeeded for that ownership token and selected inputs. It returns true if the database accepted the success update, otherwise false.
 
-**Call relations**: Called by `run` when the synced workspace has no changes and by `agent::handle` after a successful agent run and baseline reset. The boolean return lets callers detect a failed final state transition.
+**Call relations**: The main run flow uses this when the workspace had no actual changes after syncing inputs. The agent handler uses it after the agent completes and the workspace baseline is safely reset.
 
 *Call graph*: calls 2 internal fn (counter, memories).
 
@@ -6942,11 +6976,11 @@ async fn succeed(
 fn get_config(config: &Config, provider: &dyn ModelProvider) -> Option<Config>
 ```
 
-**Purpose**: Builds the hardened configuration used for the internal consolidation agent. It rewrites the caller’s config so the agent can only edit the memories workspace locally and cannot recursively trigger other subsystems.
+**Purpose**: Builds the special configuration used for the internal consolidation agent. The goal is to let the agent edit only the memory workspace, with no network access, no approval prompts, and no recursive memory generation.
 
-**Data flow**: Takes the parent `Config` and a `ModelProvider`. It clones the config, sets `cwd` to the memory root, forces `ephemeral`, disables memory generation/use and app instructions, constrains MCP servers to an empty allowlist, sets approval policy to `AskForApproval::Never`, disables several features (`SpawnCsv`, `Collab`, `MemoryTool`, `Apps`, `Plugins`, `SkillMcpDependencyInstall`), applies a `SandboxPolicy::WorkspaceWrite` with no network and only the memory root writable, and chooses the model from `memories.consolidation_model` or the provider default. It sets reasoning effort and returns `Some(config)` or `None` if sandbox policy application fails.
+**Data flow**: It takes the normal application config and a model provider. It clones the config, changes the working directory to the memory root, disables memory reading and writing for the agent itself, disables app/plugin/delegation features, removes external server access, sets approval to never ask, sets a write-only sandbox for the memory root, and chooses the consolidation model. It returns the locked-down config, or nothing if the sandbox policy cannot be set.
 
-**Call relations**: Called by `run` before any agent is spawned. If it returns `None`, `run` records `failed_sandbox_policy` and aborts phase 2.
+**Call relations**: The main run flow calls this before loading inputs into the agent. Its result is passed to the startup context when spawning the consolidation agent, ensuring the worker runs with safer limits than a normal user-facing agent.
 
 *Call graph*: calls 1 internal fn (allow_only); 4 external calls (new, clone, memory_root, vec!).
 
@@ -6957,11 +6991,11 @@ fn get_config(config: &Config, provider: &dyn ModelProvider) -> Option<Config>
 fn get_prompt(root: &Path) -> Vec<UserInput>
 ```
 
-**Purpose**: Wraps the rendered consolidation prompt text into the `UserInput` vector expected by thread submission. It produces a single text input item.
+**Purpose**: Creates the user-style prompt that tells the consolidation agent what to do. The prompt is wrapped as text input because the agent interface expects user input messages.
 
-**Data flow**: Accepts the memory root path, calls `build_consolidation_prompt`, and returns `vec![UserInput::Text { text, text_elements: vec![] }]`. It reads no mutable state.
+**Data flow**: It receives the memory root path, builds a consolidation prompt for that folder, and returns a one-item list containing that prompt as text.
 
-**Call relations**: Used by `run` immediately before `spawn_consolidation_agent`, separating prompt rendering from thread creation.
+**Call relations**: The main run flow calls this immediately before spawning the agent. The prompt and the locked-down agent configuration together define what the internal agent sees and what it is allowed to change.
 
 *Call graph*: 2 external calls (build_consolidation_prompt, vec!).
 
@@ -6977,11 +7011,11 @@ fn handle(
         memory_root: codex_utils_abso
 ```
 
-**Purpose**: Owns the asynchronous lifecycle after the consolidation agent is spawned: wait for completion, heartbeat the global lease, emit token metrics, reset the workspace baseline, mark success/failure, and schedule agent shutdown. It decouples long-running completion logic from the synchronous startup path.
+**Purpose**: Watches the consolidation agent after it has been started. It keeps the job lease alive, records token-use metrics, finalizes the database job, resets the workspace baseline, and shuts the agent down afterward.
 
-**Data flow**: Takes the startup context, `Claim`, new watermark, selected outputs, memory-root path, spawned agent, and optional E2E timer. It reads the state DB and, if present, spawns a Tokio task that waits for `loop_agent` to return a final `AgentStatus`. On `Completed`, it optionally reads token usage from the thread and emits metrics, heartbeats once more to confirm ownership, resets the workspace baseline, and calls `job::succeed`; on any failure branch it calls `job::failed`. It then spawns a second cleanup task that invokes `shutdown_consolidation_agent` and warns if shutdown fails.
+**Data flow**: It receives the context, ownership claim, new watermark, selected raw outputs, memory root, spawned agent, and end-to-end timer. It starts a background task, waits for the agent loop to return a final status, and then branches. If the agent completed, it records token usage, confirms the lease is still owned, resets the git baseline for the workspace, and marks the job succeeded. If the agent failed or ownership is lost, it records failure. Finally it starts a cleanup task to close the agent thread.
 
-**Call relations**: Called by `run` after successful agent spawn. It delegates status/heartbeat polling to `loop_agent`, final DB transitions to `job::failed`/`job::succeed`, baseline cleanup to `reset_memory_workspace_baseline`, and telemetry to `emit_token_usage_metrics`.
+**Call relations**: The main run function hands control to this after spawning the agent. Inside the background task it calls the agent loop to monitor status and heartbeats, calls job success or failure helpers to update the database, and calls workspace reset only after confirming ownership.
 
 *Call graph*: calls 2 internal fn (emit_token_usage_metrics, reset_memory_workspace_baseline); 8 external calls (clone, failed, succeed, matches!, loop_agent, spawn, error!, warn!).
 
@@ -6997,11 +7031,11 @@ async fn loop_agent(
     ) -> AgentStatus
 ```
 
-**Purpose**: Polls the consolidation thread until it reaches a final status while periodically heartbeating the global phase-2 lease. It converts premature thread termination or heartbeat loss into `AgentStatus::Errored`.
+**Purpose**: Polls the running consolidation agent until it reaches a final result, while periodically refreshing the database lease. This stops long-running consolidation from losing its lock silently.
 
-**Data flow**: Inputs are the shared DB handle, ownership token, spawned thread ID, and `CodexThread`. It creates heartbeat and status-poll intervals, pins `wait_until_terminated`, and loops: fetch current `agent_status`, break if final, otherwise `select!` between session termination, a one-second poll tick, and a heartbeat tick. Heartbeat success continues; heartbeat false or error breaks with an errored status string. It returns the final or synthesized `AgentStatus`.
+**Data flow**: It receives the database, ownership token, agent thread id, and agent thread. It repeatedly checks the agent status. Every heartbeat interval it asks the database to extend the job lease. It also watches for the agent session ending unexpectedly. It returns the final agent status: completed if all went well, or an error status if ownership is lost, heartbeat update fails, or the session exits before a final status is available.
 
-**Call relations**: Used only by `agent::handle` inside the spawned task. It relies on `is_final_agent_status` to decide when polling can stop.
+**Call relations**: The agent handler calls this inside its background task. It relies on is_final_agent_status to know when polling can stop, and its returned status decides whether the handler records success or failure.
 
 *Call graph*: calls 3 internal fn (agent_status, wait_until_terminated, is_final_agent_status); 4 external calls (from_secs, pin!, select!, interval).
 
@@ -7015,11 +7049,11 @@ fn get_watermark(
 ) -> i64
 ```
 
-**Purpose**: Computes the completion watermark for phase 2 as the maximum of the claimed watermark and the newest selected stage-1 source timestamp. This prevents the watermark from moving backward when no newer inputs are present.
+**Purpose**: Computes the completion watermark for this consolidation run. A watermark is a timestamp marker that tells future runs how far through the raw memory inputs this job got.
 
-**Data flow**: Takes the claimed watermark and a slice of `Stage1Output`. It maps each memory to `source_updated_at.timestamp()`, takes the maximum if any, falls back to the claimed watermark when the slice is empty, and finally returns the max of that value and the claimed watermark.
+**Data flow**: It receives the watermark from the claimed job and the selected raw memory outputs. It looks for the newest source update timestamp among those outputs. It returns the newer of that timestamp and the claimed watermark, so the marker never moves backward. If there are no selected memories, it returns the claimed watermark.
 
-**Call relations**: Called by `run` after loading phase-2 inputs and before final success marking. Its result is passed into either immediate success or asynchronous completion handling.
+**Call relations**: The main run flow calls this after loading the raw inputs. The resulting value is later passed to job success recording, either immediately for a no-change run or after the agent completes.
 
 *Call graph*: called by 1 (run); 1 external calls (iter).
 
@@ -7030,11 +7064,11 @@ fn get_watermark(
 fn is_final_agent_status(status: &AgentStatus) -> bool
 ```
 
-**Purpose**: Classifies whether an `AgentStatus` is terminal for consolidation handling. Pending, running, and interrupted are treated as non-final; everything else is final.
+**Purpose**: Answers whether an agent status means the agent is done. Running-like states are treated as not final; everything else is final.
 
-**Data flow**: Reads an `&AgentStatus` and returns a boolean based on a `matches!` negation. It has no side effects.
+**Data flow**: It receives one agent status value. It checks whether the status is pending initialization, running, or interrupted. If so, it returns false; otherwise it returns true.
 
-**Call relations**: Used by `agent::loop_agent` both before and after waiting for thread termination to decide whether polling should stop.
+**Call relations**: The agent loop uses this every time it checks the agent. It is the small decision point that tells the monitoring loop whether to keep waiting or hand a final result back to the handler.
 
 *Call graph*: called by 1 (loop_agent); 1 external calls (matches!).
 
@@ -7045,11 +7079,11 @@ fn is_final_agent_status(status: &AgentStatus) -> bool
 fn emit_metrics(context: &MemoryStartupContext, counters: Counters)
 ```
 
-**Purpose**: Emits phase-2 dispatch metrics after the agent has been launched or the run has reached the dispatch point. It records the number of selected raw memories and an `agent_spawned` job event.
+**Purpose**: Records basic phase-2 dispatch metrics after the consolidation agent has been started. These metrics show how many raw memories were sent and that an agent was spawned.
 
-**Data flow**: Consumes the startup context and a `Counters` struct. If `input > 0`, it increments `MEMORY_PHASE_TWO_INPUT`; it always increments `MEMORY_PHASE_TWO_JOBS` with status `agent_spawned`. It returns no value.
+**Data flow**: It receives the context and a Counters value containing the input count. If the input count is positive, it increments the phase-2 input metric by that amount. It also increments the job metric with the status "agent_spawned".
 
-**Call relations**: Called by `run` at the end of the synchronous setup path after handing off to `agent::handle`.
+**Call relations**: The main run function calls this after handing the spawned agent to the background handler. It complements the job-claim, success, and failure metrics emitted by the job helpers.
 
 *Call graph*: calls 1 internal fn (counter); called by 1 (run).
 
@@ -7060,11 +7094,11 @@ fn emit_metrics(context: &MemoryStartupContext, counters: Counters)
 fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenUsage)
 ```
 
-**Purpose**: Publishes phase-2 token-usage histograms from the consolidation agent’s final usage totals. It mirrors the phase-1 token breakdown categories.
+**Purpose**: Records how many model tokens the consolidation agent used. Tokens are chunks of text the model processes or produces, and tracking them helps measure cost and load.
 
-**Data flow**: Reads the startup context and a `TokenUsage` reference. It records histograms for total, input, cached input, output, and reasoning output tokens, clamping signed fields with `max(0)` where needed. It returns nothing.
+**Data flow**: It receives the context and a TokenUsage summary. It writes histogram measurements for total tokens, input tokens, cached input tokens, output tokens, and reasoning-output tokens. Negative token counts are clamped to zero where needed.
 
-**Call relations**: Called by `agent::handle` only when the consolidation agent completed successfully and exposed token-usage info.
+**Call relations**: The agent handler calls this only after the consolidation agent completes and token usage information is available from the thread. These metrics connect the background agent work to operational monitoring.
 
 *Call graph*: calls 2 internal fn (histogram, cached_input); called by 1 (handle).
 
@@ -7074,13 +7108,15 @@ This final background component watches skill directories for changes and broadc
 
 ### `app-server/src/skills_watcher.rs`
 
-`orchestration` · `startup and background file-change monitoring`
+`orchestration` · `startup, configuration changes, background watching, shutdown`
 
-This file wraps `codex_file_watcher` behind a higher-level `SkillsWatcher` that is tailored to the app-server’s skill-loading model. The struct stores a `FileWatcherSubscriber`, a mutex-protected `WatchRegistration` for mutable runtime extra roots, and a `CancellationToken` plus `DropGuard` to stop the background listener cleanly.
+A “skill” is project-provided or plugin-provided behavior that Codex can load and use. This file keeps that skill information fresh. It sets up a file watcher, subscribes to change events, and runs a small background loop that reacts when watched files are edited, added, or removed.
 
-`SkillsWatcher::new` attempts to create a real `FileWatcher`; if initialization fails it logs a warning and falls back to `FileWatcher::noop()`, preserving the rest of the server startup path. It subscribes to watcher events, creates shutdown tokens, and starts a Tokio task via `spawn_event_loop`. That loop wraps the raw receiver in `ThrottledWatchReceiver` using a long production debounce interval (10s, shortened in tests), then waits for either shutdown or a file event. Any event causes `skills_manager.clear_cache()` and an async `ServerNotification::SkillsChanged(SkillsChangedNotification {})` broadcast.
+The main type is `SkillsWatcher`. Think of it like a librarian watching the shelves: when someone changes a book, it tells the catalog to forget its old listing and alerts the front desk that the catalog should be refreshed. Here, the “catalog” is the `SkillsManager` cache, and the “front desk” is the outgoing message channel to the client.
 
-The registration methods separate two watch scopes. `register_runtime_extra_roots` replaces the current extra-root registration under a poisoned-mutex-tolerant lock, ensuring old registrations are dropped when new roots arrive. `register_thread_config` is async because it resolves environment, plugin-derived skill roots, and filesystem-aware skill roots through `ThreadManager`, `Config`, and `SkillsLoadInput`. It deliberately returns an empty registration when there is no selected environment, the environment is unknown, or it is remote, so only local filesystems are watched.
+The watcher can monitor two kinds of locations. First, it can watch extra root folders that are added while the app is already running. Second, it can inspect a thread’s configuration and environment, figure out which local skill folders apply, and register those folders with the file watcher. Remote environments are skipped, because this local file watcher cannot reliably watch files on another machine.
+
+Change events are throttled, meaning bursts of many file changes are grouped so the app does not spam refresh messages. On shutdown, a cancellation token stops the background task cleanly.
 
 #### Function details
 
@@ -7093,11 +7129,11 @@ fn new(
     ) -> Arc<Self>
 ```
 
-**Purpose**: Builds a watcher instance, initializes the underlying file watcher if possible, and launches the background event loop that reacts to file changes. It also prepares shutdown state and storage for mutable runtime watch registrations.
+**Purpose**: Creates a new skills watcher and starts its background listener. If a real file watcher cannot be created, it falls back to a no-op watcher so the server can keep running, just without live skill change detection.
 
-**Data flow**: Consumes `Arc<SkillsManager>` and `Arc<OutgoingMessageSender>`. It attempts `FileWatcher::new()`, falls back to `FileWatcher::noop()` on error, obtains a `(FileWatcherSubscriber, Receiver)` pair, creates a root `CancellationToken` and `DropGuard`, spawns the event loop with a child token, and returns `Arc<SkillsWatcher>` containing the subscriber, a default `WatchRegistration` inside `Mutex`, and shutdown fields.
+**Data flow**: It receives a shared `SkillsManager`, which owns the cached skill information, and an outgoing message sender, which can notify clients. It tries to create a file watcher, subscribes to its events, creates a shutdown signal, starts the event loop, and returns a shared `SkillsWatcher` object that other parts of the server can use to register folders or stop watching.
 
-**Call relations**: Called by higher-level server construction to enable skills invalidation. It delegates watcher creation to `codex_file_watcher`, logs initialization failures, and immediately hands the receiver to `SkillsWatcher::spawn_event_loop` so change processing begins as soon as the object exists.
+**Call relations**: This is the construction point for the watcher during server setup. It prepares the subscription and then hands the event stream to `SkillsWatcher::spawn_event_loop`, which does the ongoing background work. If setup fails, it logs a warning and still returns a usable watcher built around a no-op file watcher.
 
 *Call graph*: calls 3 internal fn (new, noop, default); called by 1 (new); 5 external calls (new, new, new, spawn_event_loop, warn!).
 
@@ -7108,11 +7144,11 @@ fn new(
 fn shutdown(&self)
 ```
 
-**Purpose**: Stops the background watcher loop by cancelling its shutdown token. This is the explicit teardown hook for the watcher.
+**Purpose**: Stops the watcher’s background task. Someone would call this when the server or owning component is shutting down and should no longer listen for skill file changes.
 
-**Data flow**: Takes `&self`, reads `self.shutdown_token`, and calls `cancel()` on it. It returns `()` and does not otherwise mutate local fields.
+**Data flow**: It reads the watcher’s cancellation token and marks it as cancelled. That cancellation signal is picked up by the background event loop, which then exits instead of waiting for more file events.
 
-**Call relations**: Used during server shutdown or watcher teardown to terminate the spawned listener task. The actual loop exit happens inside `spawn_event_loop`, which is selecting on this token’s cancellation.
+**Call relations**: This is the clean stop button for the work started by `SkillsWatcher::new`. The event loop created by `SkillsWatcher::spawn_event_loop` is waiting for either file changes or this shutdown signal, so calling this tells that loop to finish.
 
 *Call graph*: 1 external calls (cancel).
 
@@ -7123,11 +7159,11 @@ fn shutdown(&self)
 fn register_runtime_extra_roots(&self, extra_roots: &[AbsolutePathBuf])
 ```
 
-**Purpose**: Replaces the set of extra filesystem roots that should be watched recursively at runtime. It is intended for roots discovered outside static thread configuration.
+**Purpose**: Adds extra skill folders to the watcher while the app is already running. This is useful when new roots are discovered or supplied after initial startup.
 
-**Data flow**: Accepts `&[AbsolutePathBuf]`, maps each path into a recursive `WatchPath`, registers them through `self.subscriber.register_paths`, then locks `runtime_extra_roots_registration` and overwrites the stored `WatchRegistration` with the new one. Replacing the registration implicitly drops the previous registration and its watches.
+**Data flow**: It receives a list of absolute folder paths. For each one, it builds a watch request that includes all nested files and folders, registers those paths with the file watcher subscriber, and stores the returned registration. Storing the registration keeps those watches active and replaces any previous runtime extra-root registration.
 
-**Call relations**: Called when runtime-discovered roots change. It delegates actual watch installation to the subscriber and uses the stored registration slot so only the latest extra-root set remains active.
+**Call relations**: Other runtime setup code can call this when extra skill roots become known. It hands the folder list to the file watcher subscriber; later, changes inside those folders flow into the same background event loop that clears the skills cache and notifies clients.
 
 *Call graph*: calls 1 internal fn (register_paths); 1 external calls (iter).
 
@@ -7143,11 +7179,11 @@ async fn register_thread_config(
     ) -> WatchRegistration
 ```
 
-**Purpose**: Computes and registers the skill roots implied by a thread’s config, plugin setup, and selected environment. It returns the resulting `WatchRegistration` so the caller can tie those watches to the thread listener lifecycle.
+**Purpose**: Figures out which skill folders apply to a particular thread configuration and registers them for watching. It avoids watching when there is no environment, when the environment is unknown, or when the environment is remote.
 
-**Data flow**: Takes `&self`, `&Config`, `&ThreadManager`, and a slice of `TurnEnvironmentSelection`. It reads the first environment selection, resolves the environment from `thread_manager.environment_manager()`, bails out with `WatchRegistration::default()` if none exists, the environment is unknown, or it is remote, then derives plugin roots from `config.plugins_config_input()` and `plugins_manager.plugins_for_config(...).await`. It builds `SkillsLoadInput` from cwd, effective plugin skill roots, config layer stack, and bundled-skills flag; asks `skills_manager.skill_roots_for_config(...).await` for concrete roots using the environment filesystem; converts them into recursive `WatchPath`s; and returns `self.subscriber.register_paths(roots)`.
+**Data flow**: It receives the current configuration, the thread manager, and the selected environments. It takes the first environment selection, looks up the matching environment, skips remote environments, asks the plugin system which plugin skill roots apply, builds a `SkillsLoadInput`, asks the skills manager for the final skill roots, converts those roots into recursive watch paths, and returns a watch registration that keeps those watches alive.
 
-**Call relations**: Invoked when attaching or configuring a thread listener so the server watches the exact local skill directories relevant to that thread. It orchestrates environment lookup, plugin resolution, and skill-root computation before delegating final registration to the file watcher subscriber.
+**Call relations**: This function connects configuration, environments, plugins, and skill loading into the watcher. It is called when a thread’s config needs file watching set up. It consults the thread manager’s environment, plugin, and skills components, then hands the resulting local folders to the file watcher subscriber.
 
 *Call graph*: calls 6 internal fn (new, environment_manager, plugins_manager, skills_manager, register_paths, default); 4 external calls (bundled_skills_enabled, plugins_config_input, first, warn!).
 
@@ -7163,25 +7199,28 @@ fn spawn_event_loop(
     )
 ```
 
-**Purpose**: Starts the asynchronous loop that consumes throttled file-watch events, invalidates the skills cache, and notifies clients that skills changed. It encapsulates the watcher’s long-lived background behavior.
+**Purpose**: Starts the background task that reacts to skill file changes. Its job is to turn low-level file change events into one clear action: clear cached skills and notify the client that skills changed.
 
-**Data flow**: Consumes a raw `Receiver`, `Arc<SkillsManager>`, `Arc<OutgoingMessageSender>`, and a `CancellationToken`. It wraps the receiver in `ThrottledWatchReceiver` with `WATCHER_THROTTLE_INTERVAL`, tries to obtain the current Tokio runtime handle, and if successful spawns an async loop. Each iteration waits on either `shutdown_token.cancelled()` or `rx.recv()`. On any received event (`Some(_)`), it calls `skills_manager.clear_cache()` and awaits `outgoing.send_server_notification(ServerNotification::SkillsChanged(SkillsChangedNotification {}))`; on cancellation or closed receiver (`None`) it breaks.
+**Data flow**: It receives the raw file-watch event stream, the shared skills manager, the outgoing message sender, and a shutdown token. It wraps the event stream in a throttled receiver so rapid changes are grouped, finds the current Tokio runtime, and spawns an async loop. Each time a change arrives, it clears the skills cache and sends a `SkillsChanged` server notification. If shutdown is requested or the event stream closes, the loop stops.
 
-**Call relations**: Only `SkillsWatcher::new` starts this loop. It depends on a Tokio runtime being present; otherwise it logs a warning and skips listener startup entirely. Within the loop it delegates cache invalidation to `SkillsManager` and client fan-out to `OutgoingMessageSender`.
+**Call relations**: `SkillsWatcher::new` calls this after subscribing to file watcher events. Once running, it sits in the background between the file watcher and the rest of the app: file changes come in from the watcher, and outgoing notifications go out to clients. If there is no Tokio runtime available to run async work, it logs a warning and does not start the listener.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (SkillsChanged, try_current, select!, warn!).
 
 ## 📊 State Registers Touched
 
-- `reg-plugin-and-skill-catalog` — The resolved plugin, marketplace, hook, and skill configuration plus loaded skill/plugin metadata shared across startup, prompt assembly, and execution.
-- `reg-thread-metadata-index` — The structured thread metadata, reconciliation, spawn-edge, and listing state maintained in SQLite for thread ownership and browsing.
-- `reg-live-thread-registry` — The in-memory registry of active threads and reconstructed thread runtimes that stabilizes ownership across resumes, forks, and UI switching.
-- `reg-live-session-object` — The long-lived session object and shared services that own turn submission, event delivery, approvals, persistence, and runtime configuration.
-- `reg-input-queues` — The buffered pending-input and mailbox queues that coordinate user steering, inter-agent delivery, and turn scheduling.
-- `reg-agent-registry` — The in-memory registry of active agents, spawn reservations, path/nickname allocation, and concurrency/residency limits for multi-agent work.
-- `reg-agent-job-pipeline` — The persisted and live background workflow state for agent-job batches, worker progress, and other longer-lived asynchronous pipelines.
-- `reg-memory-pipeline-state` — The durable and runtime state for memory extraction/consolidation jobs and filesystem-backed memory artifacts.
-- `reg-extension-runtime-state` — The host-seeded and extension-owned typed attachment stores that let extensions keep shared runtime state across lifecycle callbacks.
-- `reg-skills-watch-state` — The background file-watch and invalidation state that monitors skill sources and marks cached skill data stale for later reload.
-- `reg-background-watchers-and-timers` — Long-lived watcher/timer task state such as code-mode timers and other runtime background loops that persist across requests until shutdown.
-- `reg-agent-graph-store` — The durable graph of thread spawn relationships and lifecycle edges exposed independently of live thread metadata for agent-tree queries and teardown consistency.
+- `reg-state-databases` — The opened local SQLite stores and migration state that hold structured runtime data for threads, agents, goals, jobs, and summaries.
+- `reg-rollout-thread-store` — The durable conversation log and searchable thread index used to resume, rebuild, archive, restore, and display sessions.
+- `reg-extension-host-state` — The shared extension runtime state and contributor hooks that let add-ons react to threads, turns, tools, prompts, events, and MCP setup.
+- `reg-skills-catalog` — The available skills list, including where each skill came from, whether it is enabled, and the instructions it can add to a session.
+- `reg-memory-store` — The saved long-term user memories and memory search results that can be loaded, updated, and inserted into future conversations.
+- `reg-live-session-services` — The toolbox attached to one running session, such as model access, auth, telemetry, approvals, tools, extensions, networking, and MCP connections.
+- `reg-thread-session-state` — The live state of a conversation thread, including its identity, workspace, selected model, history, permissions, listeners, and lifecycle status.
+- `reg-turn-state` — The shared clipboard for one active assistant turn, tracking the current task, pending replies, granted permissions, cancellations, and bookkeeping.
+- `reg-conversation-history-budget` — The accumulated messages, compacted summaries, token counts, and trimming decisions that determine what conversation context still fits.
+- `reg-prompt-context-stack` — The assembled prompt ingredients, including project instructions, permissions text, goals, memories, skills, plugin text, IDE details, warnings, and changed context.
+- `reg-agent-registry-graph` — The live and persisted map of parent agents, child agents, thread names, statuses, and which helper agents are still open.
+- `reg-background-work-queues` — The shared set of background tasks such as cloud refreshes, cleanup jobs, memory jobs, skill watchers, agent jobs, update checks, and session maintenance.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.
+- `reg-filesystem-watch-subscriptions` — Active file and directory watch subscriptions, invalidation signals, and watcher-to-client mappings used for skills, plugin/config refreshes, and app-server file APIs.
+- `reg-memory-write-safety-state` — Cached or in-flight safety decisions for whether proposed long-term memory writes should be allowed before they update the memory store.

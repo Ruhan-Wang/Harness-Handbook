@@ -1,6 +1,6 @@
 # Configuration, metadata, schema, auth, and network glue utilities  `stage-22.3`
 
-This stage is cross-cutting infrastructure: it sits beneath startup, request execution, and UI flows, supplying the normalization, validation, and adapter code that turns raw user input, config files, protocol metadata, and external service details into safe, consistent runtime values. The configuration pieces do most of the startup shaping: config constraints, source labeling, legacy key aliasing, JSON↔TOML conversion, CLI override parsing, approval/sandbox CLI enums, plugin-toggle extraction, and version constants let commands assemble a canonical configuration model while preserving diagnostics and backward compatibility. Network and policy helpers then normalize hosts and URLs, classify private or loopback targets, compile domain rules, and validate proxy settings so later enforcement compares against one canonical form. Auth and API glue covers PKCE generation, readable login error extraction, secure API-key reading, request-header construction, RMCP environment/header setup, and cloud-tasks helpers for auth headers, backend URLs, task links, logging, and user-agent formatting. Metadata/schema utilities provide connector labels and install URLs, memory JSON Schema generation, plugin mention syntax, and skill-name collision counts. Finally, TUI/npm/update helpers validate publish metadata and compare versions for release checks.
+This stage is shared behind-the-scenes support. It is the toolbox other features reach for when they need clean settings, safe network rules, login helpers, or small bits of display data. The cloud tasks, login, API, proxy, MCP, and Ollama helpers prepare authentication, headers, URLs, readable errors, and server environment values so requests leave the app with the right context and fewer secret-handling mistakes. The configuration helpers explain where settings came from, enforce allowed values, rename old keys, convert JSON to TOML, and turn command-line options such as approval mode, sandbox mode, and key=value overrides into the internal settings the program uses. Metadata helpers give connectors, plugins, skills, mentions, memories, and execution-policy errors consistent names, schemas, counts, symbols, and messages. The network proxy files turn user-facing allow and deny rules into normalized host and IP policies, blocking risky local targets and choosing safe listen addresses. Finally, the TUI version helpers read baked-in version data, compare releases, and check npm registry records before treating an update as real. Together, these files act like adapters and gauges that keep the larger machine understandable and safe.
 
 ## Files in this stage
 
@@ -11,13 +11,11 @@ These helpers shape outbound request metadata, normalize service URLs, and suppo
 
 `util` · `cross-cutting`
 
-This file collects operational helpers that sit between application logic and external libraries. `set_user_agent_suffix` mutates the shared `codex_login::default_client::USER_AGENT_SUFFIX` mutex so cloud-tasks requests identify themselves consistently. `append_error_log` appends timestamped lines to a local `error.log`, intentionally swallowing file-open and write failures so logging never crashes the app.
+This file is the toolbox for the cloud tasks part of the project. It does not define the main task workflow itself. Instead, it solves repeated support problems that many parts of that workflow need: making sure web addresses have the shape the backend expects, building the right HTTP headers for ChatGPT-backed requests, loading saved login information, writing emergency errors to a local log file, and turning timestamps into labels like “5m ago”.
 
-Backend URL handling is centralized in `normalize_base_url`, which strips trailing slashes and rewrites ChatGPT-style roots to include `/backend-api` when missing. `task_url` then derives a browser-facing task page URL from several possible backend URL shapes, handling `/backend-api`, `/api/codex`, and `/codex` suffixes explicitly before falling back to `/codex/tasks/{id}`.
+A useful way to think about it is as the “front desk supplies” for the app. Before the app can talk to the cloud service, it needs a standard base URL, a User-Agent header that identifies this client, and sometimes authorization headers from the user’s stored login. Before it can show links to users, it needs to turn backend URLs into browser-friendly task URLs. Before it can show task status, it needs dates in a form people can quickly read.
 
-Authentication setup is asynchronous. `load_auth_manager` loads the standard Codex config with no CLI overrides and constructs an `AuthManager` using config-derived home directory, credential-store mode, optional base URL override, and keyring backend. `build_chatgpt_headers` uses that manager to assemble a `reqwest::HeaderMap` containing a `User-Agent` and, when the resolved auth uses the Codex backend, authorization headers from `codex_model_provider`.
-
-The remaining helpers format timestamps for UI display. `format_relative_time` clamps future times to zero elapsed seconds, emits compact `s/m/h ago` strings for recent timestamps, and falls back to local `%b %e %H:%M` formatting for older entries; `format_relative_time_now` simply supplies `Utc::now()` as the reference.
+The file is careful to fail softly in a few places. If the error log cannot be opened, it simply skips logging. If authentication cannot be loaded, header creation still returns a basic header map. That makes these helpers safe to use during startup and command execution, where a secondary failure should not crash the whole tool.
 
 #### Function details
 
@@ -27,11 +25,11 @@ The remaining helpers format timestamps for UI display. `format_relative_time` c
 fn set_user_agent_suffix(suffix: &str)
 ```
 
-**Purpose**: Sets the process-wide user-agent suffix used by the shared Codex login client. It quietly does nothing if the mutex cannot be locked.
+**Purpose**: Sets a short label that is added to the program’s User-Agent string, which is the name an HTTP client sends to a server to identify itself. This lets backend services see that requests are coming from the cloud tasks text interface rather than some other Codex client.
 
-**Data flow**: Takes `suffix: &str`, attempts to lock `codex_login::default_client::USER_AGENT_SUFFIX`, and if successful replaces the stored optional suffix with `Some(suffix.to_string())`. It returns no value.
+**Data flow**: It receives a suffix string. It tries to take a lock on the shared User-Agent suffix setting, and if that succeeds, it replaces the old suffix with the new one. It does not return a value; the visible result is that later HTTP requests can include the updated client label.
 
-**Call relations**: Called during backend initialization and ChatGPT header construction so outgoing requests identify the cloud-tasks client variant before HTTP calls are made.
+**Call relations**: Startup code uses this when preparing the backend, and header-building code uses it just before creating ChatGPT request headers. After this helper sets the shared suffix, the code that asks for the full Codex User-Agent can include that suffix in the outgoing request metadata.
 
 *Call graph*: called by 2 (init_backend, build_chatgpt_headers).
 
@@ -42,11 +40,11 @@ fn set_user_agent_suffix(suffix: &str)
 fn append_error_log(message: impl AsRef<str>)
 ```
 
-**Purpose**: Appends a timestamped diagnostic line to `error.log` in the current working directory. It is intentionally best-effort and suppresses all I/O failures.
+**Purpose**: Adds a timestamped message to a local `error.log` file. It gives the tool a simple fallback place to record problems, especially during startup or main command execution when richer reporting may not be available.
 
-**Data flow**: Accepts any `message` implementing `AsRef<str>`, gets the current UTC timestamp as RFC3339, opens `error.log` in create+append mode, and if successful writes a line of the form `[timestamp] message`. It returns no value and ignores open/write errors.
+**Data flow**: It receives any message that can be viewed as text. It gets the current time in UTC, opens or creates `error.log` in append mode, and writes one line containing the timestamp and message. It returns nothing, and if opening or writing fails, it quietly ignores that logging failure.
 
-**Call relations**: Used by startup and main-run paths to persist unexpected failures without interrupting control flow. It delegates timestamp generation to `Utc::now()` and file output to standard library I/O.
+**Call relations**: Backend initialization and the main run path call this when they need to record an error for later inspection. It relies only on the system clock and local file writing, so it can be used even when network or authentication setup is failing.
 
 *Call graph*: called by 2 (init_backend, run_main); 3 external calls (now, new, writeln!).
 
@@ -57,11 +55,11 @@ fn append_error_log(message: impl AsRef<str>)
 fn normalize_base_url(input: &str) -> String
 ```
 
-**Purpose**: Canonicalizes a configured backend base URL into the form expected by the backend client. It removes trailing slashes and patches ChatGPT host roots to include `/backend-api` when absent.
+**Purpose**: Turns a configured service URL into the standard form expected by backend clients. This avoids small URL differences, like extra slashes or missing backend path segments, causing requests to go to the wrong place.
 
-**Data flow**: Takes `input: &str`, copies it into a mutable `String`, repeatedly pops trailing `/`, then checks for `https://chatgpt.com` or `https://chat.openai.com` prefixes and appends `/backend-api` if that segment is not already present. Returns the normalized string.
+**Data flow**: It receives a URL as text. It removes trailing `/` characters, then checks whether the URL points at a ChatGPT host and is missing `/backend-api`; if so, it adds that path. It returns the cleaned-up URL string.
 
-**Call relations**: Called wherever backend URLs need stable interpretation, including environment resolution, main startup logic, and browser task URL generation via `task_url`.
+**Call relations**: Code that resolves environments, runs the main command flow, and builds task links calls this before using a base URL. It is also the first step inside `task_url`, where a backend-style URL must be converted into a browser-style task page link.
 
 *Call graph*: called by 3 (resolve_environment_id, run_main, task_url); 1 external calls (format!).
 
@@ -72,11 +70,11 @@ fn normalize_base_url(input: &str) -> String
 async fn load_auth_manager(chatgpt_base_url: Option<String>) -> Option<AuthManager>
 ```
 
-**Purpose**: Loads Codex configuration and constructs an `AuthManager` suitable for ChatGPT-backed requests. It returns `None` if configuration loading fails.
+**Purpose**: Loads the app’s configuration and creates an authentication manager, which is the object responsible for finding the user’s saved login credentials. Other code uses it when it needs to make authenticated ChatGPT-backed requests.
 
-**Data flow**: Accepts an optional `chatgpt_base_url`, asynchronously calls `Config::load_with_cli_overrides(Vec::new())`, and on success passes config-derived paths and auth settings into `AuthManager::new`, using the explicit base URL when provided or the config’s `chatgpt_base_url` otherwise. It returns `Some(AuthManager)` after awaiting construction, or `None` on config-load failure.
+**Data flow**: It receives an optional ChatGPT base URL override. It loads the normal Codex configuration without command-line overrides, then builds an `AuthManager` using the Codex home directory, credential storage settings, chosen ChatGPT base URL, and keyring backend. If configuration loading fails, it returns `None`; otherwise it returns the ready authentication manager.
 
-**Call relations**: Used by backend initialization and `build_chatgpt_headers` when authenticated request headers may be needed. It encapsulates the exact config-to-auth-manager wiring so callers do not duplicate it.
+**Call relations**: Backend startup and ChatGPT header creation call this before they need credentials. Once it returns an authentication manager, callers can ask that manager for the current auth data and turn it into request headers.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (init_backend, build_chatgpt_headers); 2 external calls (new, load_with_cli_overrides).
 
@@ -87,11 +85,11 @@ async fn load_auth_manager(chatgpt_base_url: Option<String>) -> Option<AuthManag
 async fn build_chatgpt_headers() -> HeaderMap
 ```
 
-**Purpose**: Builds the HTTP headers needed for ChatGPT-backed requests, always including `User-Agent` and conditionally including auth headers when Codex-backed auth is available. It standardizes request identity and authentication in one async helper.
+**Purpose**: Builds the HTTP headers needed for requests to ChatGPT-backed services. At minimum it sets a User-Agent, and when a suitable saved login exists, it also adds authorization information.
 
-**Data flow**: Sets the user-agent suffix to `codex_cloud_tasks_tui`, obtains the full user-agent string, inserts it into a new `HeaderMap` with a fallback static value if parsing fails, then awaits `load_auth_manager(None)`. If an auth manager exists, yields auth, and that auth reports `uses_codex_backend()`, it extends the header map with headers from `codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers()`. It returns the populated `HeaderMap`.
+**Data flow**: It first sets the User-Agent suffix for the cloud tasks interface, then asks the shared client code for the full User-Agent string. It creates a new header map and inserts that User-Agent. It then tries to load authentication, read the current auth data, and, if that auth is for the Codex backend, convert it into authorization headers. The result is a header map ready to attach to outgoing HTTP requests.
 
-**Call relations**: Called by environment-resolution and main-run code before making ChatGPT-backed HTTP requests. It depends on `set_user_agent_suffix` and `load_auth_manager` to prepare both identity and authorization.
+**Call relations**: Environment resolution and the main run flow call this before making ChatGPT-backed network requests. Internally it depends on `set_user_agent_suffix` for client identification and `load_auth_manager` for credentials, then hands the finished headers back to the caller for use in request setup.
 
 *Call graph*: calls 3 internal fn (load_auth_manager, set_user_agent_suffix, get_codex_user_agent); called by 2 (resolve_environment_id, run_main); 4 external calls (new, from_static, from_str, auth_provider_from_auth).
 
@@ -102,11 +100,11 @@ async fn build_chatgpt_headers() -> HeaderMap
 fn task_url(base_url: &str, task_id: &str) -> String
 ```
 
-**Purpose**: Converts a backend base URL plus task ID into a browser-friendly task page URL. It understands several backend path conventions and rewrites them to the corresponding `/codex/tasks/{id}` route.
+**Purpose**: Creates a browser-friendly web link for a specific cloud task. This matters because backend API base URLs are not always the same as the web page URLs a person should open in a browser.
 
-**Data flow**: Takes `base_url` and `task_id`, normalizes the base URL, then checks suffixes in order: `/backend-api`, `/api/codex`, and `/codex`. Depending on the match, it formats the appropriate browser URL; if none match, it appends `/codex/tasks/{task_id}` to the normalized base. Returns the resulting `String`.
+**Data flow**: It receives a base URL and a task ID. It first normalizes the base URL, then checks for known API suffixes such as `/backend-api` or `/api/codex` and removes or reshapes them as needed. It returns a URL pointing at the task page, usually ending in `/codex/tasks/{task_id}` or `/codex/tasks/{task_id}`-equivalent form for that host.
 
-**Call relations**: Used when formatting task listings and executing commands that need a human-facing task link. It delegates canonicalization to `normalize_base_url` before applying suffix-specific rewrites.
+**Call relations**: Task list formatting calls this to show usable links, and command execution calls it when it needs to open or report a task URL. It leans on `normalize_base_url` so callers do not have to worry about small differences in configured service addresses.
 
 *Call graph*: calls 1 internal fn (normalize_base_url); called by 2 (format_task_list_lines, run_exec_command); 1 external calls (format!).
 
@@ -117,11 +115,11 @@ fn task_url(base_url: &str, task_id: &str) -> String
 fn format_relative_time(reference: DateTime<Utc>, ts: DateTime<Utc>) -> String
 ```
 
-**Purpose**: Formats a UTC timestamp relative to a supplied UTC reference time using compact recent-time strings and a local-time fallback for older entries. It also guards against future timestamps by treating them as zero elapsed time.
+**Purpose**: Formats a timestamp as a short, human-readable age such as `12s ago`, `8m ago`, or `3h ago`. For older times, it switches to a local calendar-style date so the display stays useful.
 
-**Data flow**: Takes `reference` and `ts`, computes elapsed seconds as `(reference - ts).num_seconds()`, clamps negatives to zero, and returns `"{secs}s ago"`, `"{mins}m ago"`, or `"{hours}h ago"` for intervals under 60 seconds, 60 minutes, or 24 hours respectively. For older timestamps it converts `ts` to `Local` and formats it as `%b %e %H:%M`.
+**Data flow**: It receives a reference time and the timestamp to describe, both in UTC. It subtracts the timestamp from the reference time, clamps future timestamps to zero seconds, and chooses seconds, minutes, hours, or a local date format depending on how old the timestamp is. It returns the formatted text.
 
-**Call relations**: Called by status/list formatting code and by `format_relative_time_now`, which supplies the current time automatically.
+**Call relations**: Task status formatting uses this when it already has a reference time, which keeps multiple displayed times consistent. `format_relative_time_now` also delegates to it after choosing the current time as the reference.
 
 *Call graph*: called by 2 (format_task_status_lines, format_relative_time_now); 2 external calls (with_timezone, format!).
 
@@ -132,24 +130,24 @@ fn format_relative_time(reference: DateTime<Utc>, ts: DateTime<Utc>) -> String
 fn format_relative_time_now(ts: DateTime<Utc>) -> String
 ```
 
-**Purpose**: Convenience wrapper that formats a timestamp relative to the current UTC time. It keeps callers from having to fetch `Utc::now()` themselves.
+**Purpose**: Formats a timestamp relative to the current moment. It is a convenience wrapper for places that simply want to show how long ago something happened.
 
-**Data flow**: Takes `ts: DateTime<Utc>`, obtains `Utc::now()`, forwards both values to `format_relative_time`, and returns the resulting string.
+**Data flow**: It receives a UTC timestamp. It gets the current UTC time, passes both times into `format_relative_time`, and returns the resulting label such as `2m ago`.
 
-**Call relations**: Used by UI task-row rendering so each task item can show a relative update time with one call.
+**Call relations**: Task item rendering calls this while drawing each task entry. Rather than duplicating time comparison logic, it hands the work to `format_relative_time`, which keeps all relative-time labels consistent.
 
 *Call graph*: calls 1 internal fn (format_relative_time); called by 1 (render_task_item); 1 external calls (now).
 
 
 ### `codex-api/src/requests/headers.rs`
 
-`util` · `request assembly`
+`io_transport` · `request preparation`
 
-This file contains narrowly scoped header-construction utilities used by request-building code. `build_session_headers` creates a fresh `http::HeaderMap` and conditionally inserts `session-id` and `thread-id` when the caller supplies those identifiers. It consumes the optional `String`s rather than borrowing them, which fits the common pattern of assembling request options into a one-off header map.
+When the client talks to the API, it sometimes needs to attach extra labels to the request. These labels are HTTP headers: small name-and-value fields sent alongside the main request, like a shipping label on a package. This file creates those labels for session tracking and sub-agent tracking.
 
-`subagent_header` translates `codex_protocol::protocol::SessionSource` into the string expected by the backend's `x-openai-subagent`-style header. It only returns a value for `SessionSource::SubAgent`; all other session sources are ignored. The mapping is explicit and stable: `Review` becomes `review`, `Compact` becomes `compact`, `MemoryConsolidation` becomes `memory_consolidation`, `ThreadSpawn { .. }` becomes `collab_spawn`, and `Other(label)` preserves the caller-provided label.
+The main job is to add optional session and thread identifiers only when they exist. If there is no session ID or thread ID, the file simply leaves that header out rather than sending an empty or invalid value. It also translates a `SessionSource` into a short text label when the request comes from a sub-agent, such as a review task, a compaction task, or a spawned collaboration thread.
 
-The low-level `insert_header` helper is intentionally forgiving. It parses the header name into `http::HeaderName` and the value into `HeaderValue`, but if either parse fails it simply does nothing instead of returning an error. That design keeps higher-level request assembly simple and avoids failing an entire request because optional metadata contained an invalid header token.
+A small helper, `insert_header`, does the careful part: it only inserts a header if both the header name and value can be converted into valid HTTP header forms. That means bad header text is silently ignored instead of causing a crash here. In the bigger request flow, this file is used while preparing a streaming API request, so the server can understand which session, thread, or sub-agent the request belongs to.
 
 #### Function details
 
@@ -159,11 +157,11 @@ The low-level `insert_header` helper is intentionally forgiving. It parses the h
 fn build_session_headers(session_id: Option<String>, thread_id: Option<String>) -> HeaderMap
 ```
 
-**Purpose**: Builds a header map containing optional session and thread identifiers. It only inserts headers for values that are present.
+**Purpose**: Creates a fresh collection of HTTP headers for optional session and thread IDs. It is used when an outgoing request should tell the server which conversation session or thread it belongs to.
 
-**Data flow**: Creates a new `HeaderMap`, consumes `session_id` and `thread_id`, and for each `Some(id)` calls `insert_header` with `session-id` or `thread-id`. It returns the populated map.
+**Data flow**: It receives an optional session ID and an optional thread ID. It starts with an empty header collection, adds a `session-id` header if a session ID was provided, adds a `thread-id` header if a thread ID was provided, and returns the finished header collection.
 
-**Call relations**: Request-building code calls this from `stream_request` when assembling metadata headers for a Responses stream request. It delegates actual parsing/insertion safety to `insert_header`.
+**Call relations**: During request setup, `stream_request` calls this function when it needs session-related headers. This function delegates the actual safe insertion work to `insert_header`, so it does not have to repeat the rules for turning plain strings into valid HTTP headers.
 
 *Call graph*: calls 1 internal fn (insert_header); called by 1 (stream_request); 1 external calls (new).
 
@@ -174,11 +172,11 @@ fn build_session_headers(session_id: Option<String>, thread_id: Option<String>) 
 fn subagent_header(source: &Option<SessionSource>) -> Option<String>
 ```
 
-**Purpose**: Maps a `SessionSource` into the backend's subagent label string when the source represents a subagent. Non-subagent sources produce no header value.
+**Purpose**: Turns a sub-agent source into the text value used for a request header. This lets the API know whether a request came from a review helper, a compacting helper, a memory-consolidation helper, a spawned thread, or another labeled source.
 
-**Data flow**: Reads the borrowed `Option<SessionSource>`, pattern-matches `SessionSource::SubAgent(sub)`, and converts each `SubAgentSource` variant into a specific owned `String`. If the option is `None` or not a subagent, it returns `None`.
+**Data flow**: It receives an optional `SessionSource`, which says where a session or request came from. If there is no source, or the source is not a sub-agent, it returns nothing. If it is a sub-agent, it returns the matching short label, such as `review`, `compact`, `memory_consolidation`, `collab_spawn`, or a custom label.
 
-**Call relations**: This helper is consulted by `stream_request` to decide whether to emit a subagent-identifying header alongside session metadata.
+**Call relations**: `stream_request` calls this while preparing an outgoing streaming request. The returned text, when present, can then be placed into a header so the server gets a clear origin label for the request.
 
 *Call graph*: called by 1 (stream_request).
 
@@ -189,22 +187,26 @@ fn subagent_header(source: &Option<SessionSource>) -> Option<String>
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str)
 ```
 
-**Purpose**: Safely inserts a header into a mutable `HeaderMap` only when both the name and value are syntactically valid. Invalid inputs are ignored rather than surfaced as errors.
+**Purpose**: Safely adds one HTTP header to an existing header collection. It protects the request-building code from invalid header names or values by inserting only when both are acceptable to the HTTP library.
 
-**Data flow**: Takes mutable access to `headers` plus raw `name` and `value` strings, parses the name as `http::HeaderName` and the value as `HeaderValue`, and if both succeed inserts them into the map. It returns unit and mutates the provided map in place.
+**Data flow**: It receives a mutable header collection, a header name as plain text, and a header value as plain text. It tries to convert the name and value into valid HTTP header types. If both conversions succeed, it adds the header to the collection; if either fails, it leaves the collection unchanged.
 
-**Call relations**: This is the common insertion primitive used by `build_session_headers` and by higher-level request assembly in `stream_request`.
+**Call relations**: `build_session_headers` uses this helper when adding session and thread headers, and `stream_request` also calls it directly when preparing other request headers. The actual storage is handed off to the HTTP header map's insert operation after the text has been validated.
 
 *Call graph*: called by 2 (stream_request, build_session_headers); 2 external calls (insert, from_str).
 
 
 ### `codex-client/src/chatgpt_hosts.rs`
 
-`util` · `cross-cutting host validation during ChatGPT-specific request handling`
+`domain_logic` · `request handling`
 
-This small utility module centralizes host matching for ChatGPT-specific behavior. `is_allowed_chatgpt_host` accepts a raw host string and checks it against two static policies: exact matches for `chatgpt.com`, `chat.openai.com`, and `chatgpt-staging.com`, plus suffix matches for subdomains under `.chatgpt.com` and `.chatgpt-staging.com`. The split is intentional: `chat.openai.com` is allowed only as an exact host, so `foo.chat.openai.com` does not accidentally inherit first-party treatment.
+Codex sometimes needs to decide whether a web address belongs to ChatGPT itself, for example when checking whether a cookie URL should be treated as ChatGPT-related. This file is the small gatekeeper for that decision.
 
-The implementation avoids common suffix-trick bugs by using exact host equality for base domains and requiring a leading dot in suffix entries. That means `evilchatgpt.com` and `chatgpt.com.evil.example` are rejected even though they contain the trusted domain text. The module has no state and no transport code; it exists so higher-level components such as the Cloudflare cookie store can share one precise definition of which hosts are eligible for special handling. The accompanying test enumerates both accepted and rejected examples to document the intended boundary.
+The core idea is an allowlist: only a few exact host names are accepted, such as `chatgpt.com`, `chat.openai.com`, and `chatgpt-staging.com`. It also accepts real subdomains of selected ChatGPT domains, such as `foo.chatgpt.com`, by requiring the host to end with a suffix that includes the dot before the domain. That dot matters. It means `foo.chatgpt.com` is allowed, but `evilchatgpt.com` is not, even though the text `chatgpt.com` appears inside it.
+
+An everyday analogy is checking an ID badge at a building entrance. The guard accepts badges from the company and its official branch offices, but does not accept a fake badge that merely contains the company name as part of a longer word.
+
+The included test locks down this safety behavior. It checks both accepted hosts and common “suffix trick” attempts, where a hostile site tries to look legitimate by putting `chatgpt.com` in the wrong place.
 
 #### Function details
 
@@ -214,11 +216,11 @@ The implementation avoids common suffix-trick bugs by using exact host equality 
 fn is_allowed_chatgpt_host(host: &str) -> bool
 ```
 
-**Purpose**: Returns whether a host string belongs to the approved ChatGPT host set or one of the explicitly allowed subdomain families.
+**Purpose**: This function answers a yes-or-no question: does this host name belong to the set of ChatGPT hosts Codex is allowed to trust? It is used to avoid treating misleading lookalike domains as real ChatGPT traffic.
 
-**Data flow**: It takes `&str` host input, compares it against the `EXACT_HOSTS` slice, and if no exact match is found iterates `SUBDOMAIN_SUFFIXES` to see whether the host ends with one of those dotted suffixes. It returns a boolean and does not read or mutate external state.
+**Data flow**: It takes a host name as text. It first checks whether the host exactly matches one of the approved names. If not, it checks whether the host ends with an approved subdomain suffix, including the leading dot so only true subdomains match. It returns `true` for trusted ChatGPT hosts and `false` for everything else; it does not change any outside state.
 
-**Call relations**: This predicate is called by `is_chatgpt_cookie_url` in the cookie-store module to decide whether ChatGPT-specific cookie behavior may apply to a URL.
+**Call relations**: When `is_chatgpt_cookie_url` needs to decide whether a cookie URL belongs to ChatGPT, it calls this function for the host-name part of the URL. This function gives back the trust decision that the cookie-checking logic can then use.
 
 *Call graph*: called by 1 (is_chatgpt_cookie_url).
 
@@ -229,24 +231,24 @@ fn is_allowed_chatgpt_host(host: &str) -> bool
 fn recognizes_chatgpt_hosts_without_suffix_tricks()
 ```
 
-**Purpose**: Verifies that the host predicate accepts intended ChatGPT hosts and rejects lookalikes or over-broad subdomains.
+**Purpose**: This test proves that the host checker accepts the intended ChatGPT hosts and rejects common fake-looking alternatives. It protects the security-sensitive boundary around which domains are considered trusted.
 
-**Data flow**: The test loops over known-good host strings and asserts `is_allowed_chatgpt_host` is true, then loops over deceptive or disallowed hosts and asserts it is false.
+**Data flow**: It feeds several known-good host names into `is_allowed_chatgpt_host` and asserts that each one is accepted. Then it feeds several known-bad host names, including domains that merely contain `chatgpt.com` as text, and asserts that each one is rejected. The output is the test result: pass if all checks behave as expected, fail if any host is classified incorrectly.
 
-**Call relations**: This test documents and locks down the matching policy that downstream modules rely on for security-sensitive host gating.
+**Call relations**: During the test run, this function exercises the host-checking function directly. It uses assertions to stop the test if the allowlist logic ever becomes too broad or too narrow.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `login/src/auth/util.rs`
 
-`util` · `cross-cutting`
+`util` · `error handling during authentication requests`
 
-This utility file contains one production helper, `try_parse_error_message`, plus focused tests. The function is intentionally forgiving: it logs the raw response body at debug level, attempts to parse it as `serde_json::Value`, and then looks specifically for the nested shape `{ "error": { "message": ... } }`, which matches common OAuth/OpenAI error responses. If that nested string exists, it returns just the message text.
+When the login system talks to a server, failures may come back in different shapes. Some replies are structured JSON, which is a common text format for sending named fields. OpenAI-style errors often put the useful human message inside `error.message`. This file looks for that specific place and pulls the message out.
 
-If parsing fails or the expected nested fields are absent, the function does not treat that as an error. Instead it falls back to returning `"Unknown error"` for an empty body or the original raw response text for any non-empty body. That design preserves backend detail for user-facing errors without forcing every caller to duplicate JSON probing logic. The helper is used by token-refresh and token-revocation code paths, where HTTP failures often include either structured JSON or plain-text diagnostics.
+The main helper, `try_parse_error_message`, is deliberately forgiving. It first logs the raw server text for debugging. Then it tries to read the text as JSON. If the text is not valid JSON, it does not crash; it treats it as empty structured data and keeps going. If it finds `error.message` and that value is plain text, it returns only that message. If the structured message is not present, it falls back to returning the original text. If there is no text at all, it returns `Unknown error`.
 
-The tests document both branches: successful extraction from an OpenAI-style nested error object and fallback to the untouched raw text when the payload has a different JSON shape.
+An everyday analogy is opening a letter from a help desk: if there is a clearly marked “reason” box, this helper copies that. If not, it hands you the whole letter. The tests check both the successful extraction case and the fallback case.
 
 #### Function details
 
@@ -256,11 +258,11 @@ The tests document both branches: successful extraction from an OpenAI-style nes
 fn try_parse_error_message(text: &str) -> String
 ```
 
-**Purpose**: Extracts a human-readable message from a server error body, preferring nested `error.message` JSON fields when present.
+**Purpose**: This function extracts the most useful human-readable error message from a server response. It is used when authentication requests fail, especially token refresh or token revocation, so the rest of the login flow can report a clearer reason.
 
-**Data flow**: Accepts a response body `&str`, logs it with `debug!`, parses it into `serde_json::Value` with `unwrap_or_default()`, and checks for `json["error"]["message"]` as a string. If found, it returns that string. If the input text is empty, it returns `"Unknown error"`; otherwise it returns the original text unchanged.
+**Data flow**: It receives raw response text from the server. It logs that text for debugging, tries to interpret it as JSON, and looks for a nested `error.message` field. If that field exists and is text, it returns that message; if the input is empty, it returns `Unknown error`; otherwise it returns the original text unchanged.
 
-**Call relations**: Called by auth flows that need to surface backend error detail, notably token refresh and token revocation. It centralizes tolerant parsing so those callers can format better `io::Error` messages without embedding JSON traversal logic.
+**Call relations**: The token refresh and token revocation flows call this when the server sends back an error. Instead of forcing those flows to understand every possible error format, they hand the raw response here and get back one clean string. The test functions also call it to prove both the OpenAI-style extraction path and the fallback path work.
 
 *Call graph*: called by 4 (request_chatgpt_token_refresh, revoke_oauth_token, try_parse_error_message_extracts_openai_error_message, try_parse_error_message_falls_back_to_raw_text); 1 external calls (debug!).
 
@@ -271,11 +273,11 @@ fn try_parse_error_message(text: &str) -> String
 fn try_parse_error_message_extracts_openai_error_message()
 ```
 
-**Purpose**: Verifies that the helper extracts the nested OpenAI-style error message instead of returning the whole JSON blob.
+**Purpose**: This test proves that the helper can find the useful message inside an OpenAI-style error response. It protects the behavior that turns nested JSON into a simple sentence.
 
-**Data flow**: Supplies a multiline JSON string containing `error.message`, calls `try_parse_error_message`, and asserts the returned string equals the nested message text.
+**Data flow**: It builds a sample JSON error response with `error.message` filled in. It passes that text into `try_parse_error_message`, then checks that the returned value is exactly the nested message and not the whole JSON block.
 
-**Call relations**: This test documents the preferred structured parsing behavior relied on by callers formatting user-visible auth errors.
+**Call relations**: This test calls `try_parse_error_message` in the same way the authentication code would after a failed server request. It uses an equality check to confirm the helper returns the clean message expected by callers.
 
 *Call graph*: calls 1 internal fn (try_parse_error_message); 1 external calls (assert_eq!).
 
@@ -286,22 +288,24 @@ fn try_parse_error_message_extracts_openai_error_message()
 fn try_parse_error_message_falls_back_to_raw_text()
 ```
 
-**Purpose**: Verifies that unsupported JSON shapes are returned verbatim rather than producing an empty or generic message.
+**Purpose**: This test proves that the helper does not invent or discard information when the expected `error.message` field is missing. It confirms callers still get the original server text back.
 
-**Data flow**: Passes a JSON string with only a top-level `message` field to `try_parse_error_message` and asserts the exact original text is returned.
+**Data flow**: It creates JSON text that has a `message` field at the top level, but not the expected nested `error.message` field. It sends that text into `try_parse_error_message` and checks that the result is the unchanged input text.
 
-**Call relations**: This test covers the fallback branch, showing that the helper is intentionally conservative about which JSON structures it interprets.
+**Call relations**: This test exercises the fallback path of `try_parse_error_message`. It helps ensure that token refresh and token revocation errors remain visible even when the server response is not in the expected OpenAI-style shape.
 
 *Call graph*: calls 1 internal fn (try_parse_error_message); 1 external calls (assert_eq!).
 
 
 ### `login/src/pkce.rs`
 
-`util` · `interactive login startup`
+`domain_logic` · `login startup`
 
-This small utility module defines `PkceCodes`, the pair of strings needed for OAuth PKCE: `code_verifier` and `code_challenge`. The sole function, `generate_pkce`, creates 64 random bytes using the thread-local RNG, base64url-encodes them without padding to produce a verifier in the allowed PKCE length range, then computes the SHA-256 digest of that verifier string and base64url-encodes the digest without padding to produce the S256 challenge.
+This file implements PKCE, which stands for Proof Key for Code Exchange. In plain terms, PKCE is a safety check used during OAuth-style login. It is like giving the login provider a sealed clue at the start, then later proving you still have the original clue when the login comes back.
 
-The implementation follows the standard PKCE convention exactly: the challenge is derived from the verifier string bytes, not directly from the original random bytes. Returning both values together in a dedicated struct keeps callers from accidentally mismatching them. In this crate, the generated pair is used by the localhost login server flow when constructing the authorize URL and later exchanging the authorization code for tokens.
+The file defines `PkceCodes`, a small container with two strings. The `code_verifier` is a random secret kept by this app. The `code_challenge` is a transformed version of that secret, safe to send to the login provider. The challenge is made by hashing the verifier with SHA-256, which turns text into a fixed-size fingerprint, then encoding it in URL-safe Base64, a text format that can travel safely in web addresses.
+
+Without this file, the login server would not have the PKCE values it needs to start the login securely. That would weaken the flow because another program could try to reuse or intercept the login response. The important behavior is that every login attempt gets fresh random bytes, so the verifier and challenge are different each time.
 
 #### Function details
 
@@ -311,22 +315,24 @@ The implementation follows the standard PKCE convention exactly: the challenge i
 fn generate_pkce() -> PkceCodes
 ```
 
-**Purpose**: Creates a fresh PKCE verifier/challenge pair suitable for OAuth S256 authorization-code exchange.
+**Purpose**: Creates a fresh PKCE verifier and matching challenge for one login attempt. The verifier is the secret the app keeps, and the challenge is the related value sent to the login provider.
 
-**Data flow**: Allocates a 64-byte array, fills it with random bytes via `rand::rng().fill_bytes`, base64url-encodes those bytes without padding into `code_verifier`, computes `Sha256::digest(code_verifier.as_bytes())`, base64url-encodes that digest without padding into `code_challenge`, and returns `PkceCodes { code_verifier, code_challenge }`.
+**Data flow**: It starts with an empty 64-byte buffer, fills it with random data, and turns those bytes into a URL-safe Base64 string to become the `code_verifier`. It then hashes that verifier with SHA-256 and Base64-encodes the hash to make the `code_challenge`. It returns both strings together inside a `PkceCodes` value and does not change any outside state.
 
-**Call relations**: Called by `run_login_server` before the browser auth URL is built, supplying the PKCE material later reused during token exchange.
+**Call relations**: When `run_login_server` is preparing a login flow, it calls `generate_pkce` to get the secret pair it needs. Inside this function, the random-number generator provides unpredictable bytes, and the SHA-256 digest function turns the verifier into the challenge that can be safely shared.
 
 *Call graph*: called by 1 (run_login_server); 2 external calls (digest, rng).
 
 
 ### `ollama/src/url.rs`
 
-`util` · `client construction and URL normalization`
+`util` · `config load`
 
-This utility module encapsulates the string-level URL rules used by `OllamaClient` construction. The first helper, `is_openai_compatible_base_url`, answers whether a provider `base_url` should be treated as an OpenAI-compatible root by trimming trailing slashes and checking for a final `/v1` path segment. The second helper, `base_url_to_host_root`, converts either form into the native Ollama host root expected by the rest of the client code: it trims trailing slashes, removes a terminal `/v1` if present, trims any slash left behind by that removal, and returns the normalized `String`.
+Ollama can be reached through different URL shapes. Some clients talk to an OpenAI-compatible endpoint, which commonly ends in `/v1`, while Ollama’s own host root does not need that suffix. This file keeps that small but important distinction in one place.
 
-These helpers deliberately avoid full URL parsing and instead rely on simple suffix manipulation because the only distinction the client needs is whether the configured base URL ends at `/v1`. That normalization is important because the client probes `/v1/models` when operating in compatibility mode but still uses native endpoints like `/api/tags`, `/api/version`, and `/api/pull` against the host root. The included test covers the common cases of a `/v1` URL, a plain host root, and a host root with a trailing slash, documenting the exact normalization behavior.
+Think of it like removing the department name from a mailing address when you only need the building address. If a provider is configured as `http://localhost:11434/v1`, the OpenAI-compatible API lives under `/v1`, but the Ollama host itself is `http://localhost:11434`. Code that needs the host root should not have to guess or duplicate string cleanup rules.
+
+The helpers first ignore harmless trailing slashes, so `.../v1/` is treated the same as `.../v1`. One function answers the yes-or-no question: “does this look like an OpenAI-compatible base URL?” The other returns a cleaned host root, removing `/v1` only when it is actually present at the end. A small test checks the common cases, including URLs with and without trailing slashes.
 
 #### Function details
 
@@ -336,11 +342,11 @@ These helpers deliberately avoid full URL parsing and instead rely on simple suf
 fn is_openai_compatible_base_url(base_url: &str) -> bool
 ```
 
-**Purpose**: Determines whether a configured base URL points at an OpenAI-compatible Ollama API root. The check is purely suffix-based.
+**Purpose**: This function checks whether a configured base URL points to an OpenAI-compatible API root. In plain terms, it answers: “does this URL end with `/v1`, ignoring extra slashes at the end?”
 
-**Data flow**: Takes `base_url: &str`, trims trailing `/` characters, tests whether the result ends with `"/v1"`, and returns that boolean.
+**Data flow**: It receives a URL as text. It first removes any trailing `/` characters, then checks whether the remaining text ends with `/v1`. It returns `true` if it does, and `false` otherwise; it does not change anything outside itself.
 
-**Call relations**: It is called by `OllamaClient::try_from_provider` to decide which probe endpoint to use and whether the configured URL needs host-root normalization.
+**Call relations**: When provider configuration is being converted in `try_from_provider`, this helper is used to recognize the OpenAI-compatible URL shape. That lets the caller decide which kind of provider endpoint it is dealing with before continuing setup.
 
 *Call graph*: called by 1 (try_from_provider).
 
@@ -351,11 +357,11 @@ fn is_openai_compatible_base_url(base_url: &str) -> bool
 fn base_url_to_host_root(base_url: &str) -> String
 ```
 
-**Purpose**: Normalizes a provider base URL into the native Ollama host root by removing trailing slashes and an optional terminal `/v1`. This gives the client a stable base for native API paths.
+**Purpose**: This function turns a configured provider base URL into the plain Ollama host root. It is useful when the input might include the OpenAI-style `/v1` suffix, but later code needs the underlying server address.
 
-**Data flow**: Consumes `base_url: &str`, computes `trimmed = base_url.trim_end_matches('/')`, and if `trimmed` ends with `"/v1"` returns `trimmed.trim_end_matches("/v1").trim_end_matches('/').to_string()`. Otherwise it returns `trimmed.to_string()`.
+**Data flow**: It receives a URL as text. It removes trailing slashes, then, if the cleaned URL ends in `/v1`, it removes that suffix and cleans up any slash left behind. It returns the cleaned URL as a new string, leaving the input unchanged.
 
-**Call relations**: It is used by `OllamaClient::try_from_provider` alongside `is_openai_compatible_base_url`. The two helpers together derive the client's `host_root` and compatibility mode.
+**Call relations**: During provider conversion, `try_from_provider` calls this function after reading the provider’s base URL. The cleaned host root it returns can then be passed along to code that needs to contact Ollama at its native root rather than at the OpenAI-compatible path.
 
 *Call graph*: called by 1 (try_from_provider).
 
@@ -366,24 +372,24 @@ fn base_url_to_host_root(base_url: &str) -> String
 fn test_base_url_to_host_root()
 ```
 
-**Purpose**: Verifies that host-root normalization removes `/v1` and trailing slashes but leaves an already normalized root unchanged. This documents the exact string transformations expected by the client.
+**Purpose**: This test proves that `base_url_to_host_root` returns the expected host root for the main URL forms the project cares about. It protects against accidental changes that would leave `/v1` attached or fail to remove a trailing slash.
 
-**Data flow**: Calls `base_url_to_host_root` with three representative inputs and asserts each returned string equals the expected normalized host root.
+**Data flow**: It feeds several example URLs into `base_url_to_host_root`: one with `/v1`, one already at the host root, and one with a trailing slash. For each example, it compares the returned string with the expected cleaned URL using test assertions. The output is a passing or failing test result.
 
-**Call relations**: This test directly exercises the normalization helper in isolation from the client constructor that consumes it.
+**Call relations**: This test is run by Rust’s test system, not by normal application code. It calls `assert_eq!` to check the helper’s behavior, giving future maintainers quick feedback if URL cleanup stops working as intended.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `responses-api-proxy/src/read_api_key.rs`
 
-`util` · `startup secret ingestion`
+`io_transport` · `startup`
 
-This file is a security-focused helper for obtaining the upstream Authorization header. The public entrypoint `read_auth_header_from_stdin` is platform-specific: on Unix it delegates to a low-level `read(2)` wrapper, while on Windows it currently falls back to `std::io::stdin().read`. The central logic lives in `read_auth_header_with`, which is carefully written to avoid extra allocations and lingering secret copies.
+This file solves a small but sensitive problem: the proxy needs an API key, but API keys are secrets. If this code were careless, the key could be copied into hidden buffers, left behind in memory, or accepted in a malformed form. The file reads the key from stdin, which means the caller can pipe it in from an environment variable or another command. It then adds the `Bearer ` prefix expected by HTTP Authorization headers.
 
-It allocates a fixed 1024-byte stack buffer, writes the literal prefix `Bearer ` into the front, and then repeatedly fills the remaining token region using the supplied read function. It tracks total bytes read, whether a newline was seen, and whether EOF occurred. Reading stops on newline, EOF, or buffer exhaustion; filling the buffer without newline/EOF is treated as an error. After reading, trailing `\n` and `\r` are trimmed, empty input is rejected with a usage-oriented error, and the token bytes are validated to contain only ASCII alphanumerics, `-`, or `_`.
+The main routine reads into a fixed-size byte buffer, stops at a newline or end of input, trims trailing newline characters, and rejects empty input. It also checks that the key contains only simple safe characters: letters, numbers, hyphen, and underscore. Think of it like a secure mail slot: it accepts one secret, checks it is shaped correctly, then seals it in the form the rest of the program needs.
 
-If validation passes, the prefix-plus-token slice is interpreted as UTF-8, copied once into a `String`, and the stack buffer is immediately zeroized. The string is then leaked to obtain `&'static mut str`, and `mlock_str` is called so the backing pages are pinned in memory on Unix. `mlock_str` computes page-aligned bounds carefully with overflow checks and silently returns on any unsupported or degenerate condition. The tests cover short reads, newline trimming, empty input, oversized keys, I/O propagation, and invalid byte handling.
+On Unix systems, it avoids Rust's usual buffered stdin because that could keep an extra hidden copy of the key. It reads directly from the operating system instead. After building the final header string, it wipes the temporary buffer and tries to lock the final string's memory so the operating system will not swap it to disk. Tests cover normal reads, split-up reads, newline trimming, empty input, oversized input, I/O errors, and invalid characters.
 
 #### Function details
 
@@ -393,11 +399,11 @@ If validation passes, the prefix-plus-token slice is interpreted as UTF-8, copie
 fn read_auth_header_from_stdin() -> Result<&'static str>
 ```
 
-**Purpose**: Platform-specific public entrypoint that reads stdin and returns a leaked static `Bearer ...` header string. It hides the low-level read strategy behind a single API.
+**Purpose**: This is the public helper used by the proxy startup code to get the API key from stdin and return it as a ready-to-use Authorization header. On Unix it uses the safer low-level stdin reader; on Windows it currently falls back to standard input reading.
 
-**Data flow**: Takes no arguments. On Unix it calls `read_auth_header_with(read_from_unix_stdin)`; on Windows it passes a closure that reads from `std::io::stdin()` into the provided buffer. It returns `Result<&'static str>`.
+**Data flow**: It takes no direct arguments. It chooses a platform-appropriate way to read bytes from stdin, passes that reader into `read_auth_header_with`, and returns either a leaked static header string such as `Bearer sk-...` or an error explaining why reading failed.
 
-**Call relations**: Called during proxy startup from `run_main`. It delegates all parsing, validation, zeroization, and memory locking to `read_auth_header_with`.
+**Call relations**: During startup, `run_main` calls this function when the proxy needs credentials. This function does not do the parsing itself; it hands the actual read-and-validate work to `read_auth_header_with`.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); called by 1 (run_main).
 
@@ -408,11 +414,11 @@ fn read_auth_header_from_stdin() -> Result<&'static str>
 fn read_from_unix_stdin(buffer: &mut [u8]) -> std::io::Result<usize>
 ```
 
-**Purpose**: Performs a single low-level `read(2)` into a caller-provided buffer, retrying on EINTR. It avoids Rust stdio buffering so secret stdin bytes are not retained in hidden internal buffers.
+**Purpose**: This Unix-only helper reads raw bytes directly from stdin without using Rust's normal buffered stdin wrapper. It exists to avoid hidden extra copies of the API key in memory.
 
-**Data flow**: Takes `buffer: &mut [u8]`, calls `libc::read(STDIN_FILENO, ...)` in a loop, returns `Ok(0)` on EOF, retries if `last_os_error().kind()` is `Interrupted`, returns `Err(err)` for other negative results, and otherwise returns the positive byte count as `usize`.
+**Data flow**: It receives a mutable byte slice to fill. It asks the operating system to read into that exact slice, retries if the read was interrupted, and returns the number of bytes placed there, zero for end of input, or an I/O error.
 
-**Call relations**: Used only on Unix by `read_auth_header_from_stdin` through `read_auth_header_with`. The caller handles looping across multiple reads, newline detection, and buffer limits.
+**Call relations**: On Unix, `read_auth_header_from_stdin` supplies this function to `read_auth_header_with`. It relies on the operating system read call and checks `last_os_error` when that call reports a failure.
 
 *Call graph*: 1 external calls (last_os_error).
 
@@ -423,11 +429,11 @@ fn read_from_unix_stdin(buffer: &mut [u8]) -> std::io::Result<usize>
 fn read_auth_header_with(mut read_fn: F) -> Result<&'static str>
 ```
 
-**Purpose**: Implements the full secure read/validate/build pipeline for the Authorization header. It is the core routine that minimizes copies, trims line endings, validates allowed characters, zeroizes temporary storage, leaks the final string, and locks it in memory.
+**Purpose**: This is the core routine that reads an API key, turns it into a `Bearer ...` header, validates it, wipes temporary memory, and protects the final string as much as the platform allows. Tests also use it with fake readers so they can check edge cases without real stdin.
 
-**Data flow**: Accepts a mutable read callback `F: FnMut(&mut [u8]) -> std::io::Result<usize>`. It allocates a fixed stack buffer, writes `AUTH_HEADER_PREFIX` into the front, then repeatedly reads into the remaining capacity while tracking `total_read`, `saw_newline`, and `saw_eof`. On read error it zeroizes the buffer and returns the error. If the token region fills without newline/EOF, it zeroizes and returns an oversize error. It trims trailing `\n`/`\r`, rejects empty input, validates the token bytes with `validate_auth_header_bytes`, converts the prefix-plus-token slice to UTF-8, copies it into a `String`, zeroizes the stack buffer, leaks the string to `&'static mut str`, calls `mlock_str` on it, and returns the leaked `&'static str`.
+**Data flow**: It receives a function that can fill a byte buffer with input. It first writes `Bearer ` into a local buffer, then reads the key after that prefix until it sees a newline, reaches end of input, or fills the buffer. It trims newline characters, rejects empty, oversized, or invalid keys, converts the bytes to text, copies the final header into a string, zeroes the temporary buffer, leaks the string so it can live for the rest of the process, tries to lock its memory with `mlock_str`, and returns the static string.
 
-**Call relations**: This is the central implementation used by `read_auth_header_from_stdin` and all tests. It delegates character checks to `validate_auth_header_bytes` and post-allocation page locking to `mlock_str`.
+**Call relations**: `read_auth_header_from_stdin` calls this in real startup flow. The test functions call it with small custom read functions to simulate normal input, short reads, no input, errors, oversized input, and invalid bytes. Inside, it delegates key character checking to `validate_auth_header_bytes` and memory locking to `mlock_str`.
 
 *Call graph*: calls 2 internal fn (mlock_str, validate_auth_header_bytes); called by 9 (read_auth_header_from_stdin, errors_on_invalid_characters, errors_on_invalid_utf8, errors_when_buffer_filled, errors_when_no_input_provided, propagates_io_error, reads_key_and_trims_newlines, reads_key_with_no_newlines, reads_key_with_short_reads); 3 external calls (from, anyhow!, from_utf8).
 
@@ -438,11 +444,11 @@ fn read_auth_header_with(mut read_fn: F) -> Result<&'static str>
 fn mlock_str(_value: &str)
 ```
 
-**Purpose**: Best-effort locks the memory pages containing the leaked header string so the secret is less likely to be swapped out. It is a no-op on non-Unix platforms and silently gives up on invalid page-size or overflow cases.
+**Purpose**: This helper tries to keep the final Authorization header in physical memory so the operating system will not copy it to swap space on disk. On non-Unix platforms in this file, it does nothing.
 
-**Data flow**: On Unix, takes `value: &str`, returns immediately if empty, queries page size with `sysconf(_SC_PAGESIZE)`, computes page-aligned start and end addresses covering the string bytes with checked arithmetic, derives the total size, and calls `mlock(start as *const c_void, size)`, ignoring the result. On non-Unix, it accepts the string and does nothing.
+**Data flow**: It receives the final header string. On Unix, it calculates the memory pages that contain that string and asks the operating system to lock those pages; it does not return an error if locking fails. On non-Unix systems, the input is ignored and nothing changes.
 
-**Call relations**: Called only by `read_auth_header_with` after the final `String` has been leaked, so the locked memory corresponds to the long-lived static header bytes rather than the temporary stack buffer.
+**Call relations**: `read_auth_header_with` calls this after it has built and leaked the final header string. It is the last protective step after the temporary buffer has already been wiped.
 
 *Call graph*: called by 1 (read_auth_header_with).
 
@@ -453,11 +459,11 @@ fn mlock_str(_value: &str)
 fn validate_auth_header_bytes(key_bytes: &[u8]) -> Result<()>
 ```
 
-**Purpose**: Rejects any API key bytes outside a narrow ASCII allowlist. This prevents embedded control characters, NULs, and other unexpected bytes from entering the Authorization header.
+**Purpose**: This function checks that the API key contains only allowed plain ASCII characters: letters, numbers, hyphen, or underscore. This prevents surprising bytes such as null characters, punctuation, or invalid text from becoming part of an HTTP header.
 
-**Data flow**: Takes `key_bytes: &[u8]`, checks that every byte is ASCII alphanumeric or one of `-` / `_`, returns `Ok(())` if all pass, and otherwise returns an `anyhow!` error with a fixed validation message.
+**Data flow**: It receives the bytes of the key without the `Bearer ` prefix. It scans every byte and returns success if all bytes match the allowed set; otherwise it returns an error message saying what characters are permitted.
 
-**Call relations**: Used by `read_auth_header_with` before UTF-8 conversion and string allocation, so malformed or suspicious input is rejected while still in the temporary buffer.
+**Call relations**: `read_auth_header_with` calls this after trimming the input and before converting the full header to UTF-8 text. If validation fails, the caller wipes the temporary buffer and stops.
 
 *Call graph*: called by 1 (read_auth_header_with); 1 external calls (anyhow!).
 
@@ -468,11 +474,11 @@ fn validate_auth_header_bytes(key_bytes: &[u8]) -> Result<()>
 fn reads_key_with_no_newlines()
 ```
 
-**Purpose**: Verifies that a single read containing only the key bytes produces the expected `Bearer` header without requiring a trailing newline. It covers the EOF-terminated happy path.
+**Purpose**: This test confirms that a key does not need to end with a newline. A single chunk of input followed by end-of-file should still produce a valid `Bearer ...` header.
 
-**Data flow**: Defines a closure that returns `sk-abc123` once and then EOF, passes it to `read_auth_header_with`, unwraps the result, and asserts the returned string equals `Bearer sk-abc123`.
+**Data flow**: It feeds `sk-abc123` into `read_auth_header_with` through a fake reader. The function returns a header string, and the test checks that it exactly equals `Bearer sk-abc123`.
 
-**Call relations**: This test directly exercises `read_auth_header_with`’s basic read, prefixing, and EOF handling.
+**Call relations**: The test directly exercises `read_auth_header_with` with controlled input. It verifies the normal success path used indirectly by `read_auth_header_from_stdin` during startup.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 1 external calls (assert_eq!).
 
@@ -483,11 +489,11 @@ fn reads_key_with_no_newlines()
 fn reads_key_with_short_reads()
 ```
 
-**Purpose**: Checks that the reader correctly assembles a key from multiple short reads and stops at newline. It simulates fragmented stdin delivery.
+**Purpose**: This test confirms that the reader can handle input arriving in several small pieces. That matters because real I/O is not guaranteed to deliver all bytes at once.
 
-**Data flow**: Builds a `VecDeque` of byte chunks `sk-`, `abc`, and `123\n`, feeds them one by one through a closure passed to `read_auth_header_with`, unwraps the result, and asserts the final header string is `Bearer sk-abc123`.
+**Data flow**: It gives `read_auth_header_with` three chunks: `sk-`, `abc`, and `123\n`. The function joins what it reads, stops at the newline, trims it, and returns `Bearer sk-abc123`, which the test checks.
 
-**Call relations**: This test validates the loop in `read_auth_header_with`, especially accumulation across reads and newline detection in only the newly written region.
+**Call relations**: The test calls `read_auth_header_with` with a fake chunked reader. It protects the loop inside that function from regressions where only the first read would be used.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 3 external calls (from, assert_eq!, vec!).
 
@@ -498,11 +504,11 @@ fn reads_key_with_short_reads()
 fn reads_key_and_trims_newlines()
 ```
 
-**Purpose**: Ensures trailing CRLF is removed from stdin input before constructing the Authorization header. It covers common shell/pipe line-ending behavior.
+**Purpose**: This test checks that common line endings are removed from the key. This lets users pipe values from shell commands that naturally add `\n` or `\r\n`.
 
-**Data flow**: Supplies a single chunk `sk-abc123\r\n` through `read_auth_header_with`, unwraps the result, and asserts the returned string omits the line endings.
+**Data flow**: It feeds `sk-abc123\r\n` into `read_auth_header_with`. The function trims the carriage return and newline, returns `Bearer sk-abc123`, and the test compares that result to the expected string.
 
-**Call relations**: This test targets the trimming loop in `read_auth_header_with` after reading has completed.
+**Call relations**: The test calls `read_auth_header_with` and focuses on its trimming step. It supports the real stdin path, where users often provide secrets one line at a time.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 1 external calls (assert_eq!).
 
@@ -513,11 +519,11 @@ fn reads_key_and_trims_newlines()
 fn errors_when_no_input_provided()
 ```
 
-**Purpose**: Confirms that empty stdin is rejected with a helpful message instead of producing `Bearer ` with no token. It protects against accidental startup without credentials.
+**Purpose**: This test confirms that empty stdin is treated as a clear error instead of creating an unusable `Bearer ` header with no key.
 
-**Data flow**: Passes a closure that immediately returns EOF to `read_auth_header_with`, captures the error, formats it with alternate debug display, and asserts the message contains `must be provided`.
+**Data flow**: It gives `read_auth_header_with` a fake reader that immediately reports end-of-input. The function returns an error, and the test checks that the message tells the user an API key must be provided.
 
-**Call relations**: This test exercises the empty-input guard in `read_auth_header_with` after trimming.
+**Call relations**: The test calls `read_auth_header_with` directly. It verifies the failure path that `read_auth_header_from_stdin` would expose if startup received no key.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 2 external calls (assert!, format!).
 
@@ -528,11 +534,11 @@ fn errors_when_no_input_provided()
 fn errors_when_buffer_filled()
 ```
 
-**Purpose**: Verifies that an overlong key filling the entire token buffer without newline or EOF is rejected. This prevents silent truncation of credentials.
+**Purpose**: This test makes sure an API key that fills the entire allowed space without a newline or end-of-input is rejected as too large. This prevents silent truncation, where the program would use only part of the secret.
 
-**Data flow**: Creates a vector of `a` bytes exactly filling the token capacity, copies it into the provided buffer in one read, calls `read_auth_header_with`, captures the error text, and asserts it contains the expected buffer-size message.
+**Data flow**: It fills the available token area of the buffer with `a` bytes. `read_auth_header_with` sees that the buffer is full without a stopping point, returns a size error, and the test checks for that message.
 
-**Call relations**: This test targets the explicit overflow check in `read_auth_header_with` when `total_read == capacity` and no terminator was seen.
+**Call relations**: The test calls `read_auth_header_with` with oversized simulated input. It protects the code's safety rule that too-long keys must fail loudly instead of being cut off.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 2 external calls (assert!, format!).
 
@@ -543,11 +549,11 @@ fn errors_when_buffer_filled()
 fn propagates_io_error()
 ```
 
-**Purpose**: Checks that underlying read errors are returned intact rather than being masked by generic parsing failures. It preserves diagnosability of stdin problems.
+**Purpose**: This test confirms that read failures are not hidden or rewritten beyond recognition. If stdin reading fails, callers should be able to see the original I/O error.
 
-**Data flow**: Passes a closure that returns `io::Error::other("boom")` to `read_auth_header_with`, unwraps the error, downcasts it back to `io::Error`, and asserts both kind and message.
+**Data flow**: It gives `read_auth_header_with` a fake reader that returns an I/O error saying `boom`. The function returns that error, and the test checks that the error kind and message are preserved.
 
-**Call relations**: This test covers the early error path in `read_auth_header_with` where the temporary buffer is zeroized and the original I/O error is propagated.
+**Call relations**: The test calls `read_auth_header_with` directly. It verifies the path where the supplied reader fails before a usable key can be built.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 1 external calls (assert_eq!).
 
@@ -558,11 +564,11 @@ fn propagates_io_error()
 fn errors_on_invalid_utf8()
 ```
 
-**Purpose**: Ensures non-ASCII/invalid bytes in the key are rejected by validation before a header string is produced. It demonstrates that malformed UTF-8 does not slip through.
+**Purpose**: This test checks that non-text or otherwise invalid bytes are rejected before they can become part of the Authorization header.
 
-**Data flow**: Feeds `sk-abc\xff` through `read_auth_header_with`, captures the resulting error text, and asserts it contains the fixed allowed-characters validation message.
+**Data flow**: It feeds bytes containing `0xff` into `read_auth_header_with`. The validation step rejects the byte because it is not an allowed ASCII letter, number, hyphen, or underscore, and the test checks for the expected error message.
 
-**Call relations**: This test exercises `validate_auth_header_bytes` as called from `read_auth_header_with`, showing that invalid bytes are rejected before UTF-8 conversion.
+**Call relations**: The test drives `read_auth_header_with`, which in turn uses `validate_auth_header_bytes`. It confirms invalid byte input is stopped before UTF-8 conversion and header creation.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 2 external calls (assert!, format!).
 
@@ -573,24 +579,26 @@ fn errors_on_invalid_utf8()
 fn errors_on_invalid_characters()
 ```
 
-**Purpose**: Checks that punctuation outside the allowlist, such as `!`, causes validation failure. It enforces the restricted token character set.
+**Purpose**: This test confirms that punctuation outside the allowed key format is rejected. For example, an exclamation mark should not be accepted in the API key.
 
-**Data flow**: Feeds `sk-abc!23` through `read_auth_header_with`, captures the formatted error, and asserts it contains the allowed-characters message.
+**Data flow**: It feeds `sk-abc!23` into `read_auth_header_with`. The validation step finds the `!`, returns an error, and the test checks that the error explains the allowed character set.
 
-**Call relations**: This test complements the invalid-UTF8 case by covering printable but disallowed characters rejected by `validate_auth_header_bytes`.
+**Call relations**: The test calls `read_auth_header_with` and indirectly checks `validate_auth_header_bytes`. It protects the rule that only simple safe key characters may enter the final header.
 
 *Call graph*: calls 1 internal fn (read_auth_header_with); 2 external calls (assert!, format!).
 
 
 ### `rmcp-client/src/utils.rs`
 
-`util` · `startup and transport setup`
+`util` · `server launch and HTTP client setup`
 
-This utility module supports both stdio-based MCP server launch and Streamable HTTP client setup. Its environment-building path distinguishes two execution models: local stdio servers inherit a curated baseline of host variables (`DEFAULT_ENV_VARS`) plus explicitly configured MCP variables, while remote stdio servers receive only an overlay of explicitly named local variables and literal overrides so the remote executor can supply its own `PATH`, `HOME`, and similar process context. The helper `local_stdio_env_var_names` enforces an important invariant: any `McpServerEnvVar` marked with source `remote` is invalid for local stdio launch and causes an error instead of being silently ignored. Environment values are read with `env::var_os`, preserving non-UTF-8 data such as Unix `PATH` bytes.
+An MCP server is an external helper process or service that the client talks to. Before starting or contacting one, the client needs two kinds of setup: the right environment variables, and the right HTTP headers. This file is the small toolbox for that setup.
 
-The HTTP side converts optional static header maps and environment-backed header definitions into a `HeaderMap`. Invalid header names or values are not fatal; they are skipped with `tracing::warn!`, allowing partially valid configuration to proceed. Environment-derived headers are only inserted when the named environment variable exists and its trimmed value is non-empty. `apply_default_headers` then conditionally clones the map into a `reqwest::ClientBuilder`, avoiding unnecessary builder mutation when no defaults exist.
+For local stdio servers, it builds a safe environment by copying a short allowlist of familiar variables such as PATH, HOME, and LANG, then adding any extra variables named in the MCP configuration, and finally applying explicit overrides. This is like packing a travel bag with only the essentials, plus anything the user specifically asked for. It also rejects variables marked as coming from a remote source, because those only make sense when the server runs somewhere else.
 
-The test module uses an RAII `EnvVarGuard` to serialize and restore process environment mutations, covering override precedence, explicit forwarding behavior, rejection of remote-only vars in local mode, extraction of remote var names, and preservation of non-UTF-8 environment values.
+For remote stdio servers, it is more careful. It does not copy PATH or HOME from the orchestrator process, because those belong to the wrong machine. Instead, it forwards only locally sourced variables explicitly named in the configuration, plus literal overrides.
+
+The HTTP side turns configured header names and values into reqwest header objects. Invalid names or values are skipped with a warning rather than crashing the whole setup. The file also includes tests that temporarily change environment variables and then restore them, so the tests do not leak state into each other.
 
 #### Function details
 
@@ -603,11 +611,11 @@ fn create_env_for_mcp_server(
 ) -> Result<HashMap<OsString, OsString>>
 ```
 
-**Purpose**: Builds the full environment map for launching a local stdio MCP server. It starts from the platform whitelist, adds configured MCP variable names after validating they are local-only, then overlays explicit per-server overrides.
+**Purpose**: Builds the environment map for a local MCP server process. It copies a default safe set of variables, adds extra configured variables, and lets explicit overrides win.
 
-**Data flow**: It takes optional `extra_env: Option<HashMap<OsString, OsString>>` and a slice of `McpServerEnvVar`. It reads the current process environment via `env::var_os` for each whitelisted/default variable and each configured variable name returned by `local_stdio_env_var_names`, preserving `OsString` values exactly, then chains any `extra_env` entries on top and collects everything into a `HashMap<OsString, OsString>`. It returns `Result<HashMap<OsString, OsString>>`, failing if any configured variable is marked as remote-source.
+**Data flow**: It receives optional override variables and a list of configured environment-variable requests. It first asks local_stdio_env_var_names to confirm that none are marked as remote-only. Then it reads the allowed variables from the current process environment, merges in the overrides, and returns the finished map or an error.
 
-**Call relations**: This is the local-launch path used by client/server construction code when creating stdio MCP processes, and by tests that verify override precedence and validation. Before collecting variables it delegates to `local_stdio_env_var_names` specifically to reject remote-only configuration early rather than producing a misleading partial environment.
+**Call relations**: This is used when a local server is created or launched, including from new and launch_server. The tests call it to prove overrides work, extra allowlisted variables are included, non-UTF-8 PATH values are preserved, and remote-only variables are rejected before a local process is started.
 
 *Call graph*: calls 1 internal fn (local_stdio_env_var_names); called by 6 (new, launch_server, create_env_honors_overrides, create_env_includes_additional_whitelisted_variables, create_env_preserves_path_when_it_is_not_utf8, create_local_env_rejects_remote_source_variables).
 
@@ -621,11 +629,11 @@ fn create_env_overlay_for_remote_mcp_server(
 ) -> HashMap<OsString, OsString>
 ```
 
-**Purpose**: Builds only the explicit environment overlay that should be sent to a remote executor for remote stdio MCP launch. It intentionally avoids copying the local process baseline such as `PATH` or `HOME`.
+**Purpose**: Builds only the environment overlay that should be sent for a remote MCP stdio server. It avoids copying machine-local defaults like PATH or HOME from the orchestrator, because those may be wrong on the remote executor.
 
-**Data flow**: It accepts optional `extra_env` and configured `env_vars`. It filters the `McpServerEnvVar` slice to entries whose source is not remote, reads those names from the current process with `env::var_os`, converts names to `OsString`, chains any literal overrides from `extra_env`, and collects the result into a `HashMap<OsString, OsString>`. It writes no external state and never errors.
+**Data flow**: It receives optional overrides and configured environment-variable requests. It reads values only for variables whose source is not marked remote, combines those with explicit overrides, and returns the resulting map.
 
-**Call relations**: Launch code uses this on the remote stdio path so the executor-side runtime remains responsible for its own core environment. Tests invoke it to confirm that default inherited variables are excluded and that `source: remote` entries are not copied from the orchestrator process.
+**Call relations**: launch_server uses this when the MCP server will run remotely. The related tests check that default variables are not copied by accident and that variables marked as remote-source are left for the remote side instead of being read locally.
 
 *Call graph*: called by 3 (launch_server, create_remote_env_overlay_does_not_copy_remote_source_variables, create_remote_env_overlay_only_forwards_explicit_variables); 1 external calls (iter).
 
@@ -636,11 +644,11 @@ fn create_env_overlay_for_remote_mcp_server(
 fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Vec<String>
 ```
 
-**Purpose**: Extracts just the names of MCP environment variables whose source is explicitly `remote`. The result is suitable for telling a remote runtime which variables it must resolve on its own side.
+**Purpose**: Extracts the names of configured environment variables that must be supplied by the remote side. This lets the launch flow tell the remote executor which variables it should look up there.
 
-**Data flow**: It reads a slice of `McpServerEnvVar`, filters to `is_remote_source()`, maps each to `name().to_string()`, and returns a `Vec<String>`. It does not inspect the process environment or mutate state.
+**Data flow**: It receives the configured environment-variable list. It filters that list down to entries marked with source remote, converts their names into strings, and returns those names.
 
-**Call relations**: Remote launch orchestration uses this alongside the local overlay builder to split configuration into 'forward from orchestrator' versus 'resolve remotely'. The dedicated unit test exercises the mixed legacy/local/remote cases.
+**Call relations**: launch_server calls this as part of preparing a remote MCP server. Its test checks that legacy and local entries are ignored while the remote entry is returned.
 
 *Call graph*: called by 2 (launch_server, remote_mcp_env_var_names_returns_remote_source_names); 1 external calls (iter).
 
@@ -651,11 +659,11 @@ fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Vec<String>
 fn local_stdio_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<impl Iterator<Item = &str>>
 ```
 
-**Purpose**: Validates that a local stdio launch configuration contains no remote-sourced environment variables, then exposes the configured variable names as an iterator. Its main job is policy enforcement, not collection.
+**Purpose**: Checks which configured environment variables may be copied for a local stdio MCP server. It prevents remote-only variables from being used in the wrong launch mode.
 
-**Data flow**: It takes a slice of `McpServerEnvVar`, scans it for the first entry where `is_remote_source()` is true, and if found returns an `anyhow!` error mentioning the offending variable name and the requirement for remote MCP stdio. Otherwise it returns an iterator over `McpServerEnvVar::name` values as `&str`.
+**Data flow**: It receives a list of configured environment-variable requests. If any entry is marked as remote-source, it returns an explanatory error. Otherwise, it returns an iterator over the variable names.
 
-**Call relations**: Only `create_env_for_mcp_server` calls this, using it as a gate before reading any configured variables from the local process environment. That keeps local launch semantics strict and makes misconfiguration visible immediately.
+**Call relations**: create_env_for_mcp_server calls this before reading environment values. That keeps local launch setup honest: remote-source entries must go through the remote stdio path instead.
 
 *Call graph*: called by 1 (create_env_for_mcp_server); 2 external calls (anyhow!, iter).
 
@@ -669,11 +677,11 @@ fn build_default_headers(
 ) -> Result<HeaderMap>
 ```
 
-**Purpose**: Constructs a reqwest `HeaderMap` from two optional configuration sources: literal header values and environment-backed header values. It tolerates malformed entries by logging warnings and skipping them.
+**Purpose**: Creates the default HTTP headers that should be attached to MCP HTTP requests. It supports both literal configured header values and values read from environment variables, such as tokens.
 
-**Data flow**: It accepts `http_headers: Option<HashMap<String, String>>` and `env_http_headers: Option<HashMap<String, String>>`. For static headers it parses each key with `HeaderName::from_bytes` and each value with `HeaderValue::from_str`; valid pairs are inserted into a mutable `HeaderMap`. For env-backed headers it reads each referenced environment variable with `env::var`, ignores missing vars and blank/whitespace-only values, parses the configured header name and the fetched value, and inserts valid pairs. It returns `Result<HeaderMap>`, though parse failures are downgraded to warnings rather than returned as errors.
+**Data flow**: It receives optional static headers and optional mappings from header names to environment-variable names. It validates each header name and value, reads environment-backed values when available and non-empty, skips invalid entries with a warning, and returns a reqwest HeaderMap.
 
-**Call relations**: HTTP transport setup and OAuth/auth-status discovery call this before creating clients or pending transports. It serves as the normalization point so downstream code can work with a ready `HeaderMap` instead of repeating parsing and validation logic.
+**Call relations**: This is used during HTTP setup in new, create_pending_transport, determine_streamable_http_auth_status, and discover_streamable_http_oauth. It prepares a clean header set before later code decides how to connect or authenticate.
 
 *Call graph*: called by 4 (determine_streamable_http_auth_status, discover_streamable_http_oauth, new, create_pending_transport); 5 external calls (new, from_bytes, from_str, var, warn!).
 
@@ -687,11 +695,11 @@ fn apply_default_headers(
 ) -> ClientBuilder
 ```
 
-**Purpose**: Applies a prepared default header set to a `reqwest::ClientBuilder` only when the set is non-empty. This avoids unnecessary cloning and builder modification for the common no-header case.
+**Purpose**: Adds a prepared set of default headers to a reqwest HTTP client builder, but only when there are headers to add. This avoids changing the builder unnecessarily.
 
-**Data flow**: It takes ownership of a `ClientBuilder` and borrows a `HeaderMap`. If `default_headers.is_empty()` it returns the builder unchanged; otherwise it clones the map and returns `builder.default_headers(...)`. It mutates only the builder value being returned.
+**Data flow**: It receives a ClientBuilder and a HeaderMap. If the map is empty, it returns the builder unchanged. Otherwise, it clones the headers into the builder and returns the updated builder.
 
-**Call relations**: Client-construction paths call this after `build_default_headers` has produced a normalized header map. It is the final adapter from internal header representation into reqwest client configuration.
+**Call relations**: This is called by flows that build HTTP clients, including new, discover_streamable_http_oauth_with_headers, and create_oauth_transport_and_runtime. It takes the header map prepared earlier and attaches it at the last step where the HTTP client is being assembled.
 
 *Call graph*: called by 3 (discover_streamable_http_oauth_with_headers, new, create_oauth_transport_and_runtime); 3 external calls (default_headers, clone, is_empty).
 
@@ -702,11 +710,11 @@ fn apply_default_headers(
 fn set(key: &str, value: impl AsRef<OsStr>) -> Self
 ```
 
-**Purpose**: Temporarily sets a process environment variable for a test while remembering the previous value for restoration. It provides deterministic setup around globally shared environment state.
+**Purpose**: Temporarily sets an environment variable for a test while remembering its previous value. It lets tests change process-wide environment state safely.
 
-**Data flow**: It takes a key and a value implementing `AsRef<OsStr>`, reads the original value with `std::env::var_os`, then uses unsafe `std::env::set_var` to install the new value. It returns an `EnvVarGuard` containing the key string and optional original `OsString`.
+**Data flow**: It receives a variable name and a value. It reads and stores the current value, sets the new value, and returns an EnvVarGuard that owns the saved state.
 
-**Call relations**: The environment-mutating tests construct this guard before invoking the utility functions under test. Restoration is deferred to `tests::EnvVarGuard::drop`, so callers only need to keep the guard alive for the test scope.
+**Call relations**: Several tests call this before exercising environment-building functions. The returned guard later restores the old value through tests::EnvVarGuard::drop when the test scope ends.
 
 *Call graph*: 3 external calls (as_ref, set_var, var_os).
 
@@ -717,11 +725,11 @@ fn set(key: &str, value: impl AsRef<OsStr>) -> Self
 fn drop(&mut self)
 ```
 
-**Purpose**: Restores or removes the guarded environment variable when the test scope ends. This ensures tests do not leak process-wide environment mutations into later cases.
+**Purpose**: Restores an environment variable after a test finishes. This prevents one test’s temporary environment changes from affecting later tests.
 
-**Data flow**: It reads `self.original`; if present it uses unsafe `std::env::set_var` to restore the previous value, otherwise it uses unsafe `std::env::remove_var` to delete the variable. It returns no value and writes only process environment state.
+**Data flow**: It reads the saved original value inside the guard. If there was an original value, it sets the variable back to that value; if not, it removes the variable.
 
-**Call relations**: This runs automatically when an `EnvVarGuard` created by `tests::EnvVarGuard::set` goes out of scope. The serial test annotations complement it by preventing concurrent tests from racing on the same environment keys.
+**Call relations**: Rust calls this automatically when an EnvVarGuard goes out of scope. It completes the cleanup for tests that used tests::EnvVarGuard::set.
 
 *Call graph*: 2 external calls (remove_var, set_var).
 
@@ -732,11 +740,11 @@ fn drop(&mut self)
 async fn create_env_honors_overrides()
 ```
 
-**Purpose**: Verifies that explicit `extra_env` entries override values inherited from the default environment whitelist. The test specifically checks replacement of `TZ`.
+**Purpose**: Checks that explicit environment overrides take priority when building a local MCP server environment. This matters because user configuration should be able to replace inherited defaults.
 
-**Data flow**: It constructs an override map containing `TZ=custom`, calls `create_env_for_mcp_server` with no configured extra variable names, and reads the resulting map entry for `TZ`. It asserts that the returned `OsString` matches the override value.
+**Data flow**: It creates an override for TZ, calls create_env_for_mcp_server with that override, and then checks that the returned environment contains the override value.
 
-**Call relations**: This test exercises the final chaining order inside `create_env_for_mcp_server`, proving that explicit launch-time overrides win over inherited process values.
+**Call relations**: This test exercises create_env_for_mcp_server directly. It verifies the merge order used by the local launch setup.
 
 *Call graph*: calls 1 internal fn (create_env_for_mcp_server); 3 external calls (from, from, assert_eq!).
 
@@ -747,11 +755,11 @@ async fn create_env_honors_overrides()
 fn create_env_includes_additional_whitelisted_variables()
 ```
 
-**Purpose**: Checks that configured MCP environment variable names beyond the built-in whitelist are copied from the current process into a local stdio environment. It covers the positive path for explicit extra forwarding.
+**Purpose**: Checks that a configured extra environment variable is copied into the local MCP server environment. This lets users deliberately pass through variables beyond the built-in defaults.
 
-**Data flow**: It uses `EnvVarGuard::set` to install `EXTRA_RMCP_ENV=from-env`, passes that variable name as a one-element `McpServerEnvVar` slice to `create_env_for_mcp_server`, and inspects the returned map. It asserts that the custom variable is present with the expected `OsString` value.
+**Data flow**: It temporarily sets an environment variable, asks create_env_for_mcp_server to include that variable, and checks that the returned map contains the expected value.
 
-**Call relations**: The test validates the branch where `create_env_for_mcp_server` extends `DEFAULT_ENV_VARS` with names yielded by `local_stdio_env_var_names`.
+**Call relations**: It uses tests::EnvVarGuard::set to safely alter the test environment, then calls create_env_for_mcp_server to confirm configured local pass-through variables are honored.
 
 *Call graph*: calls 2 internal fn (set, create_env_for_mcp_server); 2 external calls (from, assert_eq!).
 
@@ -762,11 +770,11 @@ fn create_env_includes_additional_whitelisted_variables()
 fn create_remote_env_overlay_only_forwards_explicit_variables()
 ```
 
-**Purpose**: Confirms that the remote overlay builder does not copy baseline default environment variables and forwards only explicitly named variables. This protects remote execution from inheriting orchestrator-local process context.
+**Purpose**: Checks that remote MCP environment overlays do not include default local variables automatically. This protects remote launches from accidentally receiving PATH, HOME, or similar values from the orchestrator machine.
 
-**Data flow**: It sets one default variable and one custom variable in the process environment, calls `create_env_overlay_for_remote_mcp_server` with only the custom variable configured, and compares the entire returned `HashMap`. The expected map contains only the custom variable/value pair.
+**Data flow**: It temporarily sets one default variable and one custom variable. It asks create_env_overlay_for_remote_mcp_server to build an overlay for only the custom variable, then checks that only the custom variable appears.
 
-**Call relations**: This test targets the remote-launch semantics of `create_env_overlay_for_remote_mcp_server`, demonstrating the contrast with the local environment builder.
+**Call relations**: It uses tests::EnvVarGuard::set for temporary environment changes and then tests create_env_overlay_for_remote_mcp_server’s remote-specific filtering behavior.
 
 *Call graph*: calls 2 internal fn (set, create_env_overlay_for_remote_mcp_server); 2 external calls (from, assert_eq!).
 
@@ -777,11 +785,11 @@ fn create_remote_env_overlay_only_forwards_explicit_variables()
 fn create_remote_env_overlay_does_not_copy_remote_source_variables()
 ```
 
-**Purpose**: Verifies that variables marked with `source: remote` are excluded from the orchestrator-side overlay even if they exist locally. Only variables marked local are forwarded.
+**Purpose**: Checks that variables marked as remote-source are not read from the local process environment. They should be supplied by the remote executor instead.
 
-**Data flow**: It sets both a remote-only and a local variable in the process environment, constructs two `McpServerEnvVar::Config` entries with different `source` values, calls `create_env_overlay_for_remote_mcp_server`, and asserts that the resulting map contains only the local variable/value pair.
+**Data flow**: It temporarily sets both a remote-marked variable and a local-marked variable. It calls create_env_overlay_for_remote_mcp_server with both entries and checks that only the local-marked variable is copied.
 
-**Call relations**: This test covers the `!var.is_remote_source()` filter in the remote overlay builder and documents the intended split between local forwarding and remote-side resolution.
+**Call relations**: This test focuses on the source flag used by create_env_overlay_for_remote_mcp_server. It proves the remote launch path separates local-sourced and remote-sourced variables correctly.
 
 *Call graph*: calls 2 internal fn (set, create_env_overlay_for_remote_mcp_server); 2 external calls (from, assert_eq!).
 
@@ -792,11 +800,11 @@ fn create_remote_env_overlay_does_not_copy_remote_source_variables()
 fn remote_mcp_env_var_names_returns_remote_source_names()
 ```
 
-**Purpose**: Checks that only remote-sourced configuration entries are returned by the remote-name extractor. Legacy/plain and explicitly local entries are omitted.
+**Purpose**: Checks that only remote-source environment variable names are returned for remote lookup. Local and legacy entries should not be included in that list.
 
-**Data flow**: It builds a mixed slice containing a legacy string-converted entry, a local config entry, and a remote config entry, passes it to `remote_mcp_env_var_names`, and asserts that the returned vector is exactly `["REMOTE"]`.
+**Data flow**: It builds a small list containing legacy, local-source, and remote-source entries. It calls remote_mcp_env_var_names and checks that the result contains only the remote name.
 
-**Call relations**: This test isolates the filtering logic used by remote launch orchestration when deciding which variable names the executor must source remotely.
+**Call relations**: This directly tests remote_mcp_env_var_names, which launch_server uses to tell the remote executor what environment names it should resolve.
 
 *Call graph*: calls 1 internal fn (remote_mcp_env_var_names); 1 external calls (assert_eq!).
 
@@ -807,11 +815,11 @@ fn remote_mcp_env_var_names_returns_remote_source_names()
 fn create_local_env_rejects_remote_source_variables()
 ```
 
-**Purpose**: Ensures local stdio environment construction fails fast when configuration includes a remote-sourced variable. The test checks the user-facing error wording.
+**Purpose**: Checks that local MCP environment creation refuses variables marked as remote-source. This prevents a misleading configuration from being silently interpreted on the wrong machine.
 
-**Data flow**: It calls `create_env_for_mcp_server` with a single `McpServerEnvVar::Config` whose source is `remote`, captures the error via `expect_err`, converts it to string, and asserts that the message mentions the requirement for remote MCP stdio.
+**Data flow**: It calls create_env_for_mcp_server with a remote-source variable. It expects an error and checks that the error message explains that remote MCP stdio is required.
 
-**Call relations**: This test exercises the error path produced by `local_stdio_env_var_names` and propagated by `create_env_for_mcp_server`.
+**Call relations**: This test verifies the guardrail enforced by local_stdio_env_var_names through create_env_for_mcp_server.
 
 *Call graph*: calls 1 internal fn (create_env_for_mcp_server); 1 external calls (assert!).
 
@@ -822,11 +830,11 @@ fn create_local_env_rejects_remote_source_variables()
 fn create_env_preserves_path_when_it_is_not_utf8()
 ```
 
-**Purpose**: Verifies that environment collection preserves non-UTF-8 bytes in inherited variables on Unix. It specifically guards against accidental lossy conversion of `PATH`.
+**Purpose**: Checks that the local environment builder preserves a PATH value even when it is not valid UTF-8 text. This matters on Unix systems, where environment values can be arbitrary bytes.
 
-**Data flow**: It constructs a raw byte `OsStr` containing an invalid UTF-8 byte, sets `PATH` to that value with `EnvVarGuard::set`, calls `create_env_for_mcp_server`, and compares the returned `PATH` entry against the original `OsString`. No string conversion is performed in the assertion path.
+**Data flow**: It creates a raw byte PATH value, temporarily sets PATH to that value, calls create_env_for_mcp_server, and checks that the exact byte value is still present in the returned environment.
 
-**Call relations**: This Unix-only test validates the use of `env::var_os` inside `create_env_for_mcp_server`, documenting why the function works with `OsString` rather than `String`.
+**Call relations**: This Unix-only test uses tests::EnvVarGuard::set and then exercises create_env_for_mcp_server. It confirms the code uses OsString-style values rather than forcing everything into normal text strings.
 
 *Call graph*: calls 2 internal fn (set, create_env_for_mcp_server); 2 external calls (assert_eq!, from_bytes).
 
@@ -836,13 +844,13 @@ This group provides the shared building blocks for labeling, constraining, renam
 
 ### `config/src/config_layer_source.rs`
 
-`util` · `cross-cutting diagnostics and config source reporting`
+`util` · `config load and reporting`
 
-This utility file contains a single formatting function that centralizes the display strings for every `codex_app_server_protocol::ConfigLayerSource` variant. The output is intentionally semantic rather than debug-oriented: MDM sources become `MDM (domain:key)`, system and user sources include the underlying file path, enterprise-managed layers include both the backend-provided name and id, project layers render the `.codex` directory plus the supplied config filename, and session flags / legacy managed-config variants use fixed labels.
+Configuration can come from several places, and that can be confusing for a person trying to understand why the program behaves a certain way. This file solves that by giving each configuration source a short, readable name. Think of it like labeling boxes in a storage room: instead of seeing an internal code, you see “user (/path/to/file)” or “project (/path/.codex/config.toml)”.
 
-The `config_toml_file` parameter matters only for the `Project` variant, where the source stores the `.codex` folder rather than the full config file path; the function appends the caller-provided filename to produce a complete display path. All path-bearing variants call `as_path().display()` so formatting stays platform-correct without allocating intermediate path strings.
+The main idea is simple. The function receives a `ConfigLayerSource`, which is an enum: a value that can be one of several named choices. Each choice represents a different origin for configuration, such as mobile device management policy, a system file, an enterprise-managed setting, a user config file, a project config folder, command-line session flags, or legacy managed config locations.
 
-Because this logic is centralized, downstream diagnostics such as layer listings and config parse errors can present consistent source names across local files, MDM, enterprise-managed cloud fragments, and legacy managed-config mechanisms.
+For each possible source, the function builds a string that includes the source type and, when useful, identifying details like a file path, policy domain and key, or enterprise name and ID. The project case also receives the expected config file name separately, so it can show the full project config path. Without this helper, different parts of the program might describe the same source in inconsistent or unclear ways.
 
 #### Function details
 
@@ -852,22 +860,24 @@ Because this logic is centralized, downstream diagnostics such as layer listings
 fn format_config_layer_source(source: &ConfigLayerSource, config_toml_file: &str) -> String
 ```
 
-**Purpose**: Maps each `ConfigLayerSource` variant to the exact human-readable string used to describe that configuration layer’s origin.
+**Purpose**: This function makes a readable label for a configuration source. Someone would use it when they need to show a person where a setting came from, instead of exposing the program’s internal representation.
 
-**Data flow**: Reads a borrowed `ConfigLayerSource` and `config_toml_file` string. It pattern-matches the source variant and returns a formatted `String`: MDM uses domain/key, system/user/legacy-file variants include displayed paths, enterprise-managed uses name and id, project combines the `.codex` folder path with `config_toml_file`, and session/legacy-MDM variants return fixed literals.
+**Data flow**: It receives a `ConfigLayerSource`, meaning the recorded origin of some configuration, plus the filename used for the main config TOML file. It checks which kind of source it is, pulls out useful details such as file paths, policy names, or IDs, and returns one finished text string. It does not change the source or write anything anywhere.
 
-**Call relations**: Called by higher-level config diagnostics and reporting code whenever a layer source must be rendered consistently for users.
+**Call relations**: Inside this file, the function’s only work is building strings using Rust’s formatting macro. The call graph shows it calling `format!` to assemble those labels; no callers are listed here, so it acts as a reusable helper for whichever part of the configuration system needs to present source information to a human.
 
 *Call graph*: 1 external calls (format!).
 
 
 ### `config/src/constraint.rs`
 
-`util` · `cross-cutting`
+`config` · `config load and configuration updates`
 
-This file implements the reusable constraint machinery that the requirements system builds on. `ConstraintError` is the common failure type, with variants for invalid candidate values, empty required fields, and execution-policy parse failures; invalid-value errors carry the field name, a formatted candidate, the allowed set description, and a `RequirementSource` so diagnostics can point back to the enforcing layer. A `From<ConstraintError> for std::io::Error` adapter lets callers surface these failures through standard I/O-style APIs.
+Configuration often has limits: a field may have to be non-empty, a mode may have to come from an approved list, or a value may need to be forced into a safe form before use. This file provides the shared tool for that: `Constrained<T>`, a wrapper around any value `T` that keeps the value together with the rule used to check it. Think of it like a gate in front of a setting: every new value must pass through the gate before it can replace the old one.
 
-The main type is `Constrained<T>`, which stores a current value, an `Arc`-wrapped validator closure, and an optional `Arc` normalizer closure. `new` validates the initial value before constructing the wrapper. `normalized` installs a normalizer and an allow-all validator, applying normalization immediately to the initial value. `allow_any`, `allow_only`, and `allow_any_from_default` are convenience constructors for common policies. Runtime interaction is intentionally split: `can_set` probes a candidate without mutating state, `set` optionally normalizes then validates before replacing the stored value, and `add_validator` composes an additional validator onto the existing one while first ensuring the current value still satisfies the combined rule. `Deref`, `Debug`, and `PartialEq` are implemented in terms of the stored value only, so the wrapper behaves like the underlying value for most read-only comparisons while still enforcing constraints on mutation.
+The file also defines `ConstraintError`, the standard way to explain why a value was rejected. These errors include a bad value, an empty field, or invalid requirement rules. They carry enough detail to tell the user which field failed and, when relevant, where the rule came from.
+
+`Constrained` can be used in several ways. It can accept anything, accept only one fixed value, validate with a custom rule, or normalize values first. A normalizer is a small cleanup step that transforms a value into the form the program wants, such as turning a negative number into zero, before validation. The important safety behavior is that `set` checks the candidate first and only changes the stored value if the check passes. That prevents a bad update from corrupting the current configuration.
 
 #### Function details
 
@@ -877,11 +887,11 @@ The main type is `Constrained<T>`, which stores a current value, an `Arc`-wrappe
 fn empty_field(field_name: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs the `EmptyField` error variant from any string-like field name input.
+**Purpose**: Creates a standard error saying that a named configuration field was left empty. This gives callers a short, consistent way to report missing required text or data.
 
-**Data flow**: Consumes `field_name: impl Into<String>`, converts it into a `String`, and returns `ConstraintError::EmptyField { field_name }`.
+**Data flow**: It receives a field name in any form that can become a string. It converts that name into a stored string and returns a `ConstraintError::EmptyField` containing it.
 
-**Call relations**: Used by requirement-compilation code when a managed allowlist or required nested field is present but empty.
+**Call relations**: Configuration conversion code calls this when building constrained settings and discovers that a required field has no value. It does not call other project code; it only converts the provided name into owned text.
 
 *Call graph*: called by 1 (try_from); 1 external calls (into).
 
@@ -892,11 +902,11 @@ fn empty_field(field_name: impl Into<String>) -> Self
 fn from(err: ConstraintError) -> Self
 ```
 
-**Purpose**: Converts a `ConstraintError` into an `std::io::Error` with `InvalidInput` kind.
+**Purpose**: Turns a `ConstraintError` into a standard input/output error. This lets constraint failures be returned through APIs that expect `std::io::Error` instead of this crate's custom error type.
 
-**Data flow**: Consumes a `ConstraintError`, wraps it with `std::io::Error::new(std::io::ErrorKind::InvalidInput, err)`, and returns the I/O error.
+**Data flow**: It receives a constraint error. It wraps that error inside a standard I/O error marked as invalid input, then returns the wrapped error.
 
-**Call relations**: Lets callers that expose I/O-oriented APIs propagate constraint failures without inventing a separate error channel.
+**Call relations**: This is used automatically by Rust's conversion system when code needs to treat a configuration constraint failure like a general invalid-input error. It hands the original error message to the standard library's error constructor.
 
 *Call graph*: 1 external calls (new).
 
@@ -910,11 +920,11 @@ fn new(
     ) -> ConstraintResult<Self>
 ```
 
-**Purpose**: Creates a constrained value with a validator and rejects invalid initial values immediately.
+**Purpose**: Creates a constrained value with a caller-provided validation rule. It is used when a configuration value must be checked before it is accepted.
 
-**Data flow**: Takes an initial value and a validator closure, wraps the closure in `Arc`, runs it against the initial value, and on success stores the value, validator, and `None` normalizer in a new `Constrained<T>`. On failure it returns the validator's `ConstraintError`.
+**Data flow**: It receives an initial value and a validator function. It stores the validator in shared form, runs it against the initial value, and returns either a ready `Constrained` value or the validation error. If the initial value fails, nothing is created.
 
-**Call relations**: Used heavily by requirement compilation to turn allowlists and exact-match requirements into active runtime constraints.
+**Call relations**: Many configuration-building paths call this when turning raw config into safer, rule-checked settings. Tests also call it to prove invalid starting values are rejected, later updates are checked, and validators can be combined.
 
 *Call graph*: called by 13 (try_from, constrained_add_validator_composes_with_existing_validator, constrained_can_set_allows_probe_without_setting, constrained_new_rejects_invalid_initial_value, constrained_set_rejects_invalid_value_and_leaves_previous, derive_sandbox_policy_falls_back_to_read_only_for_implicit_defaults, derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallback, test_requirements_web_search_mode_allowlist_does_not_warn_when_unset, web_search_mode_for_turn_falls_back_when_live_is_disallowed, from_constrained_resolved (+3 more)); 1 external calls (new).
 
@@ -928,11 +938,11 @@ fn normalized(
     ) -> ConstraintResult<Self>
 ```
 
-**Purpose**: Creates a constrained value that first normalizes inputs and then accepts any normalized result.
+**Purpose**: Creates a constrained value that first rewrites values into an acceptable form. This is useful when a setting should be automatically cleaned up or forced into a safe range instead of simply rejected.
 
-**Data flow**: Takes an initial value and a normalizer closure, wraps an allow-all validator and the normalizer in `Arc`, applies the normalizer to the initial value, validates the normalized result, and stores it with the normalizer attached.
+**Data flow**: It receives an initial value and a normalizer function. It applies the normalizer to the initial value, uses an always-accepting validator, stores both the normalized value and the normalizer, and returns the constrained value.
 
-**Call relations**: Used where callers want canonicalization on both initialization and later `set` operations without imposing additional validation rules.
+**Call relations**: Code that constrains MCP server configuration uses this when values need automatic adjustment. The related test shows that the same normalizer is applied both at creation time and when setting a new value.
 
 *Call graph*: called by 2 (constrained_normalizer_applies_on_init_and_set, constrain_mcp_servers); 1 external calls (new).
 
@@ -943,11 +953,11 @@ fn normalized(
 fn allow_any(initial_value: T) -> Self
 ```
 
-**Purpose**: Constructs a constraint wrapper that accepts any value and performs no normalization.
+**Purpose**: Creates a constrained value that accepts every future value. This is used when the rest of the system expects a `Constrained` wrapper, but this particular setting has no extra rule.
 
-**Data flow**: Stores the provided initial value, an allow-all validator closure, and `None` for the normalizer.
+**Data flow**: It receives an initial value. It stores that value with a validator that always says yes and no normalizer, then returns the wrapper immediately.
 
-**Call relations**: Used as the default unconstrained state for many config fields when no managed requirement applies.
+**Call relations**: Many parts of the system use this for settings or cached data that need the common constrained-value shape without actual restrictions. Tests use it to confirm that any replacement value is accepted.
 
 *Call graph*: called by 39 (list_all_tools_accepts_canonical_namespaced_tool_names, list_all_tools_adds_server_metadata_to_cached_tools, list_all_tools_applies_legacy_mcp_prefix_by_default, list_all_tools_blocks_while_client_is_pending_without_cached_tool_info_snapshot, list_all_tools_does_not_block_when_cached_tool_info_snapshot_is_empty, list_all_tools_uses_cached_tool_info_snapshot_when_client_startup_fails, list_all_tools_uses_cached_tool_info_snapshot_while_client_is_pending, list_available_server_infos_uses_cache_while_client_is_pending, no_local_runtime_fails_local_stdio_but_keeps_local_http_server, shutdown_cancels_pending_tool_listing (+15 more)); 1 external calls (new).
 
@@ -958,11 +968,11 @@ fn allow_any(initial_value: T) -> Self
 fn allow_only(only_value: T) -> Self
 ```
 
-**Purpose**: Constructs a constraint wrapper that permits exactly one value and rejects all others with a generic invalid-value error.
+**Purpose**: Creates a constrained value that can only ever be set to one specific value. This is useful when requirements lock a setting so later code cannot change it to something else.
 
-**Data flow**: Clones the provided `only_value` into a captured `allowed_value`, stores the original as the current value, and installs a validator closure that compares candidates for equality and otherwise returns `ConstraintError::InvalidValue` with field name `<unknown>` and source `Unknown`.
+**Data flow**: It receives the only allowed value. It clones that value for comparison, stores the original as the current value, and builds a validator that rejects every candidate except the allowed one with an `InvalidValue` error.
 
-**Call relations**: Used in places that need a fixed immutable setting rather than an allowlist.
+**Call relations**: Permission and sandbox configuration code calls this when a session or requirement fixes a setting. Tests confirm that the allowed value still works and any different value is rejected while the old value remains unchanged.
 
 *Call graph*: called by 8 (resolve_allowed_windows_sandbox_setup_mode_rejects_disallowed_mode, constrained_allow_only_rejects_different_values, replace_permission_profile_from_session_snapshot, permission_snapshot_setter_preserves_permission_constraints, build_guardian_review_session_config, start_review_conversation, get_config, on_session_configured_with_display_and_fork_parent_title); 2 external calls (new, clone).
 
@@ -973,11 +983,11 @@ fn allow_only(only_value: T) -> Self
 fn allow_any_from_default() -> Self
 ```
 
-**Purpose**: Constructs an unconstrained wrapper using `T::default()` as the initial value.
+**Purpose**: Creates an unrestricted constrained value using the type's default value as its starting point. This is a convenience for settings where the normal default is acceptable and no rule is needed.
 
-**Data flow**: Calls `T::default()` and passes the result to `Constrained::allow_any`.
+**Data flow**: It asks the inner type for its default value, then passes that value to `allow_any`. The result is a `Constrained` wrapper that accepts any later value.
 
-**Call relations**: Used by default config/requirements constructors for unconstrained fields whose type has a natural default.
+**Call relations**: Default-building and conversion code call this when a setting should start from its normal default. The test verifies that, for an integer, the stored starting value is zero.
 
 *Call graph*: called by 2 (default, try_from); 2 external calls (allow_any, default).
 
@@ -988,11 +998,11 @@ fn allow_any_from_default() -> Self
 fn get(&self) -> &T
 ```
 
-**Purpose**: Returns a shared reference to the stored value.
+**Purpose**: Returns a shared reference to the stored value without copying it. This is used when callers need to inspect larger or non-copyable configuration data safely.
 
-**Data flow**: Reads `self.value` and returns `&T`.
+**Data flow**: It receives the constrained wrapper by reference. It returns a reference to the inner value and does not change anything.
 
-**Call relations**: Used by callers that need borrowed access without copying or deref coercion.
+**Call relations**: Configuration snapshot and permission-profile code call this when they need to read the current constrained setting. It keeps the constraint wrapper in place while letting other code look at the value.
 
 *Call graph*: called by 7 (new_uninitialized, to_mcp_config_with_plugin_registrations, active_permission_profile, from_constrained_active_profile, from_constrained_legacy, permission_profile, profile_workspace_roots).
 
@@ -1003,11 +1013,11 @@ fn get(&self) -> &T
 fn value(&self) -> T
 ```
 
-**Purpose**: Returns the stored value by copy for `Copy` types.
+**Purpose**: Returns a copied version of the stored value for small copyable types. This is a convenience for simple settings such as numbers, booleans, or small enums.
 
-**Data flow**: Reads and returns `self.value`.
+**Data flow**: It receives the constrained wrapper by reference. Because the inner type can be copied, it returns a copy of the current value and leaves the stored value unchanged.
 
-**Call relations**: Used by callers and tests that want the current scalar value without borrowing.
+**Call relations**: Runtime configuration code calls this when it needs the current setting to build thread snapshots, turn context, approval policy, or web-search decisions. It is the read path for simple constrained values.
 
 *Call graph*: called by 6 (new, new_uninitialized_with_permission_profile, set_approval_policy, resolve_web_search_mode_for_turn, thread_config_snapshot, to_turn_context_item).
 
@@ -1018,11 +1028,11 @@ fn value(&self) -> T
 fn can_set(&self, candidate: &T) -> ConstraintResult<()>
 ```
 
-**Purpose**: Checks whether a candidate value would satisfy the current constraint without mutating the stored value.
+**Purpose**: Checks whether a candidate value would be accepted without actually changing the stored value. This is useful for asking, 'would this update be legal?' before deciding what to do.
 
-**Data flow**: Passes `candidate` to the stored validator closure and returns its `ConstraintResult<()>`.
+**Data flow**: It receives a reference to a candidate value. It runs the stored validator on that candidate and returns success or the validation error, while leaving the current value untouched.
 
-**Call relations**: Used throughout config resolution to probe whether a derived or requested value is allowed before committing it.
+**Call relations**: Decision-making code uses this to test possible web-search or permission-profile changes before applying them. The test confirms that rejected candidates do not alter the existing value.
 
 *Call graph*: called by 2 (resolve_web_search_mode_for_turn, can_set_legacy_permission_profile).
 
@@ -1036,11 +1046,11 @@ fn add_validator(
     ) -> ConstraintResult<()>
 ```
 
-**Purpose**: Adds an additional validation rule on top of the existing one and ensures the current value still satisfies the combined constraint before installing it.
+**Purpose**: Adds another validation rule on top of the rule already attached to a constrained value. This lets configuration become stricter over time while preserving the old checks.
 
-**Data flow**: Clones the existing validator `Arc`, builds a new combined validator that runs the old validator then the new closure, validates `self.value` with the combined validator, and if successful replaces `self.validator` with it.
+**Data flow**: It receives a new validator. It builds a combined validator that first runs the existing rule and then the new one, checks that the current stored value passes both, and only then installs the combined rule.
 
-**Call relations**: Used when constraints need to be tightened incrementally after construction.
+**Call relations**: This function is a helper for code that needs layered requirements. The related test shows the intended story: start with one rule, add another, and then candidates must satisfy both.
 
 *Call graph*: 1 external calls (new).
 
@@ -1051,11 +1061,11 @@ fn add_validator(
 fn set(&mut self, value: T) -> ConstraintResult<()>
 ```
 
-**Purpose**: Attempts to replace the stored value, applying normalization first if configured and then validating the result.
+**Purpose**: Attempts to replace the stored value while respecting the constraint. It is the safe update path for constrained configuration.
 
-**Data flow**: Consumes a new value `T`, runs it through `self.normalizer` if present, validates the normalized value with `self.validator`, and on success writes it into `self.value`; on failure it leaves the previous value unchanged and returns the error.
+**Data flow**: It receives a new value. If a normalizer exists, it rewrites the value first; then it runs the validator. If validation succeeds, it stores the new value and returns success. If validation fails, it returns the error and keeps the old value.
 
-**Call relations**: This is the mutation point enforced by all compiled requirement constraints.
+**Call relations**: Permission-profile update code calls this when applying requested changes. Tests cover the key safety behavior: invalid updates are rejected and the previous value remains in place.
 
 *Call graph*: called by 2 (set_legacy_permission_profile, set_permission_profile_snapshot).
 
@@ -1066,11 +1076,11 @@ fn set(&mut self, value: T) -> ConstraintResult<()>
 fn deref(&self) -> &Self::Target
 ```
 
-**Purpose**: Provides shared-reference deref access to the stored value.
+**Purpose**: Lets a `Constrained<T>` be read like a reference to its inner `T` in places where Rust supports automatic dereferencing. This makes the wrapper less awkward to use while still protecting updates.
 
-**Data flow**: Returns `&self.value`.
+**Data flow**: It receives the wrapper by reference and returns a reference to the stored value. It does not validate or change anything.
 
-**Call relations**: Allows `Constrained<T>` to be used ergonomically in read-only contexts as if it were `&T`.
+**Call relations**: This is used implicitly by Rust when code treats a constrained value like its inner value for reading. It supports convenient access without bypassing the checked `set` path for writes.
 
 
 ##### `Constrained::fmt`  (lines 183–187)
@@ -1079,11 +1089,11 @@ fn deref(&self) -> &Self::Target
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats the wrapper for debugging by showing only the current value, not the validator or normalizer internals.
+**Purpose**: Defines how a constrained value appears in debug output. It shows the stored value but not the validator or normalizer functions, which are not useful to print.
 
-**Data flow**: Builds a debug struct named `Constrained` with a single `value` field and writes it to the formatter.
+**Data flow**: It receives a formatter and the constrained value. It builds a debug structure named `Constrained`, includes the current `value` field, and writes that representation to the formatter.
 
-**Call relations**: Used in tests and diagnostics where the current constrained value matters but closure internals are opaque.
+**Call relations**: Rust's debug-printing tools call this when developers log or inspect a `Constrained` value. It hands formatting work to the standard debug builder.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1094,11 +1104,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn eq(&self, other: &Self) -> bool
 ```
 
-**Purpose**: Defines equality for constrained values in terms of their stored values only.
+**Purpose**: Defines equality for constrained values by comparing only their stored values. Two wrappers are considered equal if the values inside are equal, even if their validation functions differ.
 
-**Data flow**: Compares `self.value == other.value` and returns the boolean result.
+**Data flow**: It receives two constrained values. It compares their inner values and returns true or false.
 
-**Call relations**: Lets tests and callers compare constrained wrappers without considering validator identity.
+**Call relations**: Rust's equality checks and assertions use this when comparing constrained values. This is especially useful in tests and snapshots where the meaningful part is the current stored setting.
 
 
 ##### `tests::invalid_value`  (lines 201–208)
@@ -1107,11 +1117,11 @@ fn eq(&self, other: &Self) -> bool
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError
 ```
 
-**Purpose**: Builds a standard `ConstraintError::InvalidValue` fixture with unknown field/source for test assertions.
+**Purpose**: Builds the expected `InvalidValue` error used by the tests. It avoids repeating the same error construction in every test case.
 
-**Data flow**: Converts the candidate and allowed inputs into strings and returns the assembled error value.
+**Data flow**: It receives a candidate value and an allowed-values description as string-like inputs. It converts both into owned strings and returns a `ConstraintError::InvalidValue` with an unknown field and unknown requirement source.
 
-**Call relations**: Shared helper for the unit tests in this file.
+**Call relations**: The test functions call this helper when checking that rejection errors are exactly what they expect. It mirrors the error shape produced by constrained validators in the tests.
 
 *Call graph*: 1 external calls (into).
 
@@ -1122,11 +1132,11 @@ fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> Co
 fn constrained_allow_any_accepts_any_value()
 ```
 
-**Purpose**: Verifies that `allow_any` permits mutation to arbitrary values.
+**Purpose**: Checks that an unrestricted constrained value really accepts a replacement value. This protects the simple 'no rule' case from accidentally becoming restrictive.
 
-**Data flow**: Creates `Constrained::allow_any(5)`, sets it to `-10`, and asserts the stored value changed.
+**Data flow**: It creates a constrained integer starting at 5 with `allow_any`, sets it to -10, and then reads the stored value. The expected result is that the stored value becomes -10.
 
-**Call relations**: Covers the unconstrained mutation path.
+**Call relations**: This test drives `Constrained::allow_any` and then the update path through `set`. It uses an assertion to confirm the wrapper accepted the new value.
 
 *Call graph*: calls 1 internal fn (allow_any); 1 external calls (assert_eq!).
 
@@ -1137,11 +1147,11 @@ fn constrained_allow_any_accepts_any_value()
 fn constrained_allow_any_default_uses_default_value()
 ```
 
-**Purpose**: Checks that `allow_any_from_default` initializes from `T::default()`.
+**Purpose**: Checks that the default-based constructor starts with the type's normal default value. For integers, that default is zero.
 
-**Data flow**: Constructs `Constrained::<i32>::allow_any_from_default()` and asserts the stored value is `0`.
+**Data flow**: It creates an unrestricted constrained `i32` using `allow_any_from_default`, reads the copied value, and compares it to 0.
 
-**Call relations**: Covers the default-based convenience constructor.
+**Call relations**: This test exercises the convenience constructor that delegates to the unrestricted constructor. It confirms default initialization works as expected.
 
 *Call graph*: 2 external calls (allow_any_from_default, assert_eq!).
 
@@ -1152,11 +1162,11 @@ fn constrained_allow_any_default_uses_default_value()
 fn constrained_allow_only_rejects_different_values()
 ```
 
-**Purpose**: Ensures `allow_only` accepts the fixed value and rejects any different value without changing stored state.
+**Purpose**: Checks that a value locked to one allowed choice rejects any different value. It also confirms that a failed update does not change the stored value.
 
-**Data flow**: Creates `allow_only(5)`, successfully sets `5`, attempts to set `6`, asserts the returned error, and confirms the stored value remains `5`.
+**Data flow**: It creates a constrained value that only allows 5, successfully sets 5, then tries to set 6. The attempt returns an `InvalidValue` error, and the stored value remains 5.
 
-**Call relations**: Covers the exact-match validator generated by `allow_only`.
+**Call relations**: This test drives `Constrained::allow_only` and the `set` path. It verifies the fixed-value rule that permission and session configuration code relies on.
 
 *Call graph*: calls 1 internal fn (allow_only); 1 external calls (assert_eq!).
 
@@ -1167,11 +1177,11 @@ fn constrained_allow_only_rejects_different_values()
 fn constrained_normalizer_applies_on_init_and_set() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that `normalized` applies its normalizer both to the initial value and to later `set` inputs.
+**Purpose**: Checks that a normalizer is applied both when the constrained value is created and when it is updated later. This proves cleanup is not a one-time operation.
 
-**Data flow**: Creates `Constrained::normalized(-1, |value| value.max(0))`, asserts the initial stored value is normalized to `0`, then sets `-5` and `10` and asserts the normalized results.
+**Data flow**: It creates a normalized integer where negative values become zero. The initial -1 becomes 0, setting -5 also leaves 0, and setting 10 stores 10.
 
-**Call relations**: Covers the normalizer path in both construction and mutation.
+**Call relations**: This test exercises `Constrained::normalized` and later updates through `set`. It shows how the normalizer sits before storage every time.
 
 *Call graph*: calls 1 internal fn (normalized); 1 external calls (assert_eq!).
 
@@ -1182,11 +1192,11 @@ fn constrained_normalizer_applies_on_init_and_set() -> anyhow::Result<()>
 fn constrained_add_validator_composes_with_existing_validator() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `add_validator` combines old and new validation rules and enforces both on future probes.
+**Purpose**: Checks that adding a validator keeps the old rule and adds the new one. A candidate must pass both rules to be accepted.
 
-**Data flow**: Creates a constraint requiring nonnegative values, adds a second validator requiring values <= 10, then asserts `can_set` succeeds for `7` and fails for `11` and `-1`.
+**Data flow**: It creates a constrained integer that must be at least 0, then adds a second rule requiring it to be at most 10. It probes 7, 11, and -1, expecting only 7 to pass.
 
-**Call relations**: Exercises validator composition and current-value revalidation.
+**Call relations**: This test starts with `Constrained::new`, then uses `add_validator` and `can_set`. It confirms validators are composed rather than replaced.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1197,11 +1207,11 @@ fn constrained_add_validator_composes_with_existing_validator() -> anyhow::Resul
 fn constrained_new_rejects_invalid_initial_value()
 ```
 
-**Purpose**: Ensures `new` fails immediately when the initial value violates the validator.
+**Purpose**: Checks that construction fails if the starting value does not satisfy the validator. This prevents invalid configuration from entering the system at creation time.
 
-**Data flow**: Attempts to construct a positive-only constraint with initial value `0` and asserts the returned error.
+**Data flow**: It tries to create a constrained integer with initial value 0 while the validator only allows positive values. The result is an `InvalidValue` error instead of a constructed wrapper.
 
-**Call relations**: Covers eager validation during construction.
+**Call relations**: This test directly exercises `Constrained::new`. It proves the initial value goes through the same kind of gate as later updates.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1212,11 +1222,11 @@ fn constrained_new_rejects_invalid_initial_value()
 fn constrained_set_rejects_invalid_value_and_leaves_previous()
 ```
 
-**Purpose**: Verifies that `set` rejects invalid values and preserves the previous stored value on failure.
+**Purpose**: Checks that a rejected update does not overwrite the last valid value. This is the main safety guarantee of the `set` method.
 
-**Data flow**: Creates a positive-only constraint with initial value `1`, attempts to set `-5`, asserts the error, and confirms the stored value is still `1`.
+**Data flow**: It creates a constrained integer starting at 1 with a positive-only rule. It tries to set -5, receives an `InvalidValue` error, and then confirms the stored value is still 1.
 
-**Call relations**: Covers the failure path of `set`.
+**Call relations**: This test uses `Constrained::new` to establish the rule, then tests the update behavior of `set`. It protects callers that rely on failed updates being harmless.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1227,24 +1237,26 @@ fn constrained_set_rejects_invalid_value_and_leaves_previous()
 fn constrained_can_set_allows_probe_without_setting()
 ```
 
-**Purpose**: Checks that `can_set` validates candidates without mutating the stored value.
+**Purpose**: Checks that `can_set` can test possible values without changing the current value. This supports decision code that needs to preview whether an update would be legal.
 
-**Data flow**: Creates a positive-only constraint, probes `2` and `-1` with `can_set`, asserts the outcomes, and confirms the stored value remains `1`.
+**Data flow**: It creates a positive-only constrained integer starting at 1. It probes 2 and gets success, probes -1 and gets an error, then confirms the stored value remains 1.
 
-**Call relations**: Covers the non-mutating probe API.
+**Call relations**: This test uses `Constrained::new` and then the non-mutating check path through `can_set`. It confirms probing and setting are separate operations.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
 
 ### `config/src/key_aliases.rs`
 
-`util` · `config normalization`
+`config` · `config load`
 
-This file defines a tiny aliasing layer over raw `toml::Value` trees. Its core data model is the private `ConfigKeyAlias` struct, which names a target table path plus a `legacy_key` and `canonical_key`. The current alias table contains one migration under `[memories]`, mapping `no_memories_if_mcp_or_web_search` to `disable_on_external_context`.
+Configuration files often live longer than the code that reads them. If a setting is renamed, people may still have the old name in their files. This file is the small translation layer that protects those users from sudden breakage.
 
-The normalization logic is path-sensitive: aliases are only applied when the current table path exactly matches the alias's `table_path`. `normalize_key_aliases` mutates a `TomlMap<String, TomlValue>` in place by removing the legacy entry and inserting its value under the canonical key only if the canonical key is absent. That means explicit canonical configuration wins over migrated legacy input.
+It knows about one alias today: inside the `memories` table, the old key `no_memories_if_mcp_or_web_search` now means `disable_on_external_context`. When config TOML is read, this code walks through the TOML value tree. A TOML value can be a table, an array, a string, a number, and so on. When it reaches a table, it first normalizes any child values, then checks whether that table is one of the known places where an old key might appear.
 
-`normalized_with_key_aliases` performs a full recursive copy of a TOML value. For tables, it descends into each child while extending the path with the child key, rebuilds a fresh `TomlMap`, then applies alias normalization to the rebuilt table at the current path. For arrays, it recursively normalizes each element using the same path, which matters for arrays of tables nested under aliased sections. Scalars are cloned unchanged. The design intentionally avoids mutating the original tree and ensures aliases are applied consistently after children have already been normalized.
+If the old key is found, the code removes it and inserts the value under the new key, but only if the new key is not already present. That last rule matters: if a user wrote both names, the newer name wins. An everyday analogy is mail forwarding: letters sent to an old address are redirected to the new one, unless the new address already has its own delivery instructions.
+
+Without this file, renamed settings would be ignored or rejected, making upgrades more fragile for users with existing config files.
 
 #### Function details
 
@@ -1254,11 +1266,11 @@ The normalization logic is path-sensitive: aliases are only applied when the cur
 fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String, TomlValue>)
 ```
 
-**Purpose**: Applies any configured legacy-to-canonical key renames for one specific TOML table path. It performs a non-destructive migration in the sense that an existing canonical key is never replaced by a legacy value.
+**Purpose**: This function rewrites known old key names to their current names inside one TOML table. It is used so a user’s older config spelling can still produce the same setting value.
 
-**Data flow**: Inputs are the current table path as `&[String]` and a mutable `TomlMap<String, TomlValue>`. It compares the path against each `ConfigKeyAlias.table_path`; on a match, it removes `alias.legacy_key` from the table and inserts that value at `alias.canonical_key` only if no canonical entry already exists. It returns `()` after mutating the provided map in place.
+**Data flow**: It receives the current table path, such as `memories`, and a mutable TOML table. It checks the built-in alias list, and when the path matches an alias location, it removes the legacy key from the table if present. It then inserts that value under the canonical key, unless the canonical key already exists, leaving the table in its normalized form.
 
-**Call relations**: This function is invoked after a table has been assembled from recursive traversal, including by `normalized_with_key_aliases`, and also by merge-time normalization elsewhere. It delegates only to map operations like `remove`/`entry` because its job is the final path-local rewrite step.
+**Call relations**: This is the local table-level cleanup step. `normalized_with_key_aliases` calls it after walking through nested config values, and `merge_toml_values_at_path` also calls it when combining TOML values at a specific path. It relies on normal map operations such as removing an old entry and inserting a new one only when needed.
 
 *Call graph*: called by 2 (normalized_with_key_aliases, merge_toml_values_at_path); 2 external calls (entry, remove).
 
@@ -1269,20 +1281,26 @@ fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String, TomlValue>
 fn normalized_with_key_aliases(value: &TomlValue, path: &[String]) -> TomlValue
 ```
 
-**Purpose**: Recursively rebuilds a TOML value tree while applying key alias normalization to every table node. It is the tree-wide entry point for alias-aware normalization.
+**Purpose**: This function creates a normalized copy of a TOML value, with legacy config keys translated anywhere they appear in the supported structure. It is useful when the code wants to treat old and new config spellings as the same before later processing.
 
-**Data flow**: Inputs are an immutable `&TomlValue` and the current traversal path `&[String]`. For `TomlValue::Table`, it creates a new `TomlMap`, recursively normalizes each child using `path + key`, then calls `normalize_key_aliases` on the rebuilt table and returns `TomlValue::Table(normalized)`. For `TomlValue::Array`, it maps each element through the same function with the unchanged path and returns a new array. For all other variants, it returns `value.clone()`.
+**Data flow**: It receives a TOML value and the path showing where that value sits in the config tree. If the value is a table, it builds a new table, recursively normalizes each child, then applies key alias cleanup to that table. If the value is an array, it normalizes each item in the array. If it is any other kind of value, it simply copies it. The output is a new TOML value with known aliases converted.
 
-**Call relations**: This function is called by higher-level config merge/origin code when a whole TOML subtree needs alias normalization. Its main delegation is recursive self-calls for structural traversal and a final call to `normalize_key_aliases` at each table boundary.
+**Call relations**: This is the recursive walker that prepares config data for the rest of the configuration system. It calls `normalize_key_aliases` whenever it finishes rebuilding a table, so table-specific aliases can be applied at the right location. It is called by `merge_toml_values_at_path` during config merging and by `origins` when config origin tracking needs the same normalized view.
 
 *Call graph*: calls 1 internal fn (normalize_key_aliases); called by 2 (merge_toml_values_at_path, origins); 4 external calls (new, Array, Table, clone).
 
 
 ### `utils/json-to-toml/src/lib.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting, whenever JSON data needs to be represented as TOML; tests run during automated test execution`
 
-This file is a small recursive conversion utility between two generic value representations. The public function `json_to_toml` pattern-matches on `serde_json::Value` and constructs the nearest `toml::Value` equivalent. Primitive mappings are straightforward for booleans and strings. Numbers are handled carefully: the converter prefers `as_i64()` and emits `TomlValue::Integer` when possible, otherwise falls back to `as_f64()` and emits `TomlValue::Float`; if neither representation is available, it serializes the JSON number to text and stores it as a TOML string. Arrays are converted element-by-element by recursively calling `json_to_toml`, and objects are converted into `toml::value::Table` by preserving keys and recursively converting values. One notable design choice is the treatment of JSON `null`: because TOML has no null value, this utility maps it to an empty string rather than omitting the field or inventing a custom sentinel. The inline test module documents these semantics with focused examples for integers, floats, booleans, arrays, nulls, and nested objects, making the intended lossy/null behavior explicit.
+JSON and TOML can describe many of the same things: text, numbers, true-or-false values, lists, and nested objects. This file is the bridge between those two worlds. Its main function, `json_to_toml`, takes a `serde_json::Value`, which is Rust’s general-purpose representation of any JSON value, and produces the matching `toml::Value`, which is the equivalent representation for TOML.
+
+The conversion is mostly direct. A JSON boolean becomes a TOML boolean. A JSON integer becomes a TOML integer. A JSON floating-point number becomes a TOML float. A JSON string stays a string. A JSON array is converted item by item, like translating every word in a sentence. A JSON object becomes a TOML table, which is TOML’s name for a group of key-value pairs.
+
+One important detail is JSON `null`. TOML does not have a real `null` value, so this converter turns it into an empty string. That is a deliberate compromise: it preserves the shape of the data, but readers should know that “missing value” becomes “blank text.”
+
+The rest of the file is a set of tests that check the converter on numbers, arrays, booleans, floats, nulls, and nested objects.
 
 #### Function details
 
@@ -1292,11 +1310,11 @@ This file is a small recursive conversion utility between two generic value repr
 fn json_to_toml(v: JsonValue) -> TomlValue
 ```
 
-**Purpose**: Recursively converts a `serde_json::Value` into a `toml::Value` using a fixed mapping for each JSON variant.
+**Purpose**: Converts one JSON value into the closest matching TOML value. Someone would use it when data has already been parsed as JSON but must be passed on, saved, or compared in TOML form.
 
-**Data flow**: It consumes a `JsonValue`. `Null` becomes `TomlValue::String(String::new())`; booleans and strings map directly; numbers are inspected as `i64` first, then `f64`, else stringified; arrays are transformed by recursively mapping each element; objects are transformed by recursively mapping each value and collecting key-value pairs into a TOML table. It returns the fully converted `TomlValue` tree.
+**Data flow**: It receives a single JSON value. It looks at what kind of value it is: null, true-or-false, number, text, list, or object. Simple values are turned directly into TOML values; lists are converted one item at a time; objects are converted one field at a time into a TOML table. The result is a new TOML value, and the original JSON value is consumed during the conversion.
 
-**Call relations**: This is the file’s main exported utility and the target of all tests below. Its recursive self-calls implement deep conversion for arrays and objects.
+**Call relations**: This is the central function in the file. When it sees an array or object, it calls itself again for each nested value, so deeply nested JSON is translated all the way down. The tests call it with different kinds of sample JSON values to prove each branch of the conversion behaves as expected.
 
 *Call graph*: 7 external calls (new, Array, Boolean, Float, Integer, String, Table).
 
@@ -1307,11 +1325,11 @@ fn json_to_toml(v: JsonValue) -> TomlValue
 fn json_number_to_toml()
 ```
 
-**Purpose**: Tests that an integer JSON number converts to `TomlValue::Integer`.
+**Purpose**: Checks that a whole JSON number becomes a TOML integer. This guards the basic number conversion path.
 
-**Data flow**: It builds `json!(123)`, passes it to `json_to_toml`, and asserts the result equals `TomlValue::Integer(123)`.
+**Data flow**: It creates the JSON value `123`, sends it through `json_to_toml`, and compares the result with the expected TOML integer `123`. Nothing is returned; the test passes if the two values match and fails if they do not.
 
-**Call relations**: This unit test invokes the public converter on the integer-number branch to lock in numeric precedence for integral values.
+**Call relations**: This test is run by Rust’s test runner. It exercises the integer branch of `json_to_toml`, making sure ordinary whole numbers are not accidentally treated as text or floating-point numbers.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1322,11 +1340,11 @@ fn json_number_to_toml()
 fn json_array_to_toml()
 ```
 
-**Purpose**: Tests recursive conversion of a mixed JSON array into a TOML array.
+**Purpose**: Checks that a JSON list becomes a TOML array and that each item inside the list is converted too. This matters because arrays are containers, not just single values.
 
-**Data flow**: It constructs `json!([true, 1])`, converts it, and asserts the result is a `TomlValue::Array` containing `Boolean(true)` and `Integer(1)`.
+**Data flow**: It builds a JSON array containing `true` and `1`, passes that array into `json_to_toml`, and expects a TOML array containing a boolean and an integer. The before-and-after comparison proves both the outer list and its inner values were translated correctly.
 
-**Call relations**: This test exercises the array branch and, indirectly, recursive conversion of boolean and integer elements.
+**Call relations**: This test is run by the test runner and focuses on the recursive part of `json_to_toml`. It shows that when the converter meets a list, it hands each list item back through the same converter rather than leaving the contents unchanged.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1337,11 +1355,11 @@ fn json_array_to_toml()
 fn json_bool_to_toml()
 ```
 
-**Purpose**: Tests direct boolean conversion from JSON to TOML.
+**Purpose**: Checks that a JSON true-or-false value becomes the matching TOML true-or-false value. This protects one of the simplest and most common conversions.
 
-**Data flow**: It creates `json!(false)`, converts it with `json_to_toml`, and asserts the result is `TomlValue::Boolean(false)`.
+**Data flow**: It creates the JSON value `false`, converts it with `json_to_toml`, and compares the result with TOML `false`. The test changes no shared state; it only verifies the returned value.
 
-**Call relations**: This is a focused unit test for the boolean match arm in the converter.
+**Call relations**: This test is invoked during automated testing. It exercises the boolean branch of `json_to_toml`, confirming that boolean meaning is preserved exactly.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1352,11 +1370,11 @@ fn json_bool_to_toml()
 fn json_float_to_toml()
 ```
 
-**Purpose**: Tests that a non-integer JSON number converts to `TomlValue::Float`.
+**Purpose**: Checks that a JSON decimal number becomes a TOML floating-point number. This is separate from whole-number testing because TOML stores integers and decimals differently.
 
-**Data flow**: It builds `json!(1.25)`, converts it, and asserts the result equals `TomlValue::Float(1.25)`.
+**Data flow**: It creates the JSON value `1.25`, passes it to `json_to_toml`, and expects the TOML float `1.25`. If the converter returned an integer or string instead, the comparison would fail.
 
-**Call relations**: This test covers the numeric fallback from integer parsing to floating-point parsing.
+**Call relations**: This test is run by the test runner and covers the decimal-number path in `json_to_toml`. It complements the integer test so both common number forms are checked.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1367,11 +1385,11 @@ fn json_float_to_toml()
 fn json_null_to_toml()
 ```
 
-**Purpose**: Tests the crate’s explicit null-mapping policy.
+**Purpose**: Checks the file’s special rule for JSON `null`: it becomes an empty TOML string. This is important because TOML has no direct `null` equivalent.
 
-**Data flow**: It uses `serde_json::Value::Null`, converts it, and asserts the result is `TomlValue::String(String::new())`.
+**Data flow**: It starts with a JSON null value, sends it through `json_to_toml`, and expects an empty TOML string. The test documents and verifies this deliberate fallback behavior.
 
-**Call relations**: This test documents the intentionally lossy handling of JSON null, which TOML cannot represent natively.
+**Call relations**: This test is run by the test runner and focuses on the most surprising conversion rule in the file. It makes sure future changes do not silently alter how missing JSON values are represented in TOML.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1382,20 +1400,24 @@ fn json_null_to_toml()
 fn json_object_nested()
 ```
 
-**Purpose**: Tests recursive conversion of nested JSON objects into nested TOML tables.
+**Purpose**: Checks that nested JSON objects become nested TOML tables. This proves the converter works for structured configuration-like data, not only simple single values.
 
-**Data flow**: It constructs `json!({ "outer": { "inner": 2 } })`, manually builds the expected nested `toml::value::Table`, converts the JSON value, and asserts equality.
+**Data flow**: It creates a JSON object with an `outer` field containing another object with an `inner` number. It manually builds the expected nested TOML table, converts the JSON with `json_to_toml`, and compares the two. The result should preserve both the keys and the nested shape.
 
-**Call relations**: This test exercises the object branch and recursive descent through nested maps, confirming key preservation and nested table construction.
+**Call relations**: This test is run by the test runner and exercises the object/table branch of `json_to_toml`. It also confirms the converter’s recursive behavior for objects: inner values are translated before being placed into the final TOML table.
 
 *Call graph*: 5 external calls (Integer, Table, assert_eq!, json!, new).
 
 
 ### `utils/cli/src/config_override.rs`
 
-`config` · `CLI argument parsing and config load`
+`config` · `config load and command startup`
 
-This module provides the reusable CLI-side machinery for ad hoc configuration overrides. `CliConfigOverrides` is a `clap::Parser` fragment whose `raw_overrides: Vec<String>` collects every `-c` / `--config key=value` occurrence without eagerly interpreting either side. `prepend_root_overrides` supports precedence handling by splicing root-level overrides to the front so later subcommand-specific flags win naturally. `parse_overrides` is the main parser: it iterates over each raw string, splits only on the first `=`, trims whitespace, rejects missing or empty keys, and then tries to parse the right-hand side as a TOML value using a sentinel assignment (`_x_ = ...`). If TOML parsing fails, it falls back to a literal string after trimming surrounding single or double quotes. Keys are canonicalized through `canonicalize_override_key`, which currently rewrites the legacy alias `use_legacy_landlock` to `features.use_legacy_landlock`. `apply_on_value` then walks the parsed `(path, value)` pairs and applies each one into a mutable `toml::Value`, creating intermediate `Table` nodes as needed and replacing any existing value at the destination leaf. The implementation treats dotted keys as nested table paths and will overwrite non-table intermediates by replacing them with fresh tables. Tests cover scalar, boolean, array, and inline-table parsing, alias canonicalization, and root-override prepending.
+This file solves a practical problem: users often need to change one setting for one run without editing their main config file. It provides a shared `CliConfigOverrides` command-line option so different Codex tools can all understand flags like `-c model="o3"` or `-c shell_environment_policy.inherit=all` in the same way.
+
+The file first stores each override exactly as the user typed it. Later, it splits each string at the first `=`, treats the left side as a dotted path such as `foo.bar.baz`, and parses the right side as TOML, the same configuration language used by the config file. This means numbers, booleans, arrays, and inline tables can become real typed values instead of plain text. If parsing fails, it falls back to using the value as a string, which keeps simple commands like `-c model=o3` convenient.
+
+It can also apply the overrides onto an existing TOML configuration tree, creating missing nested tables as needed. Think of the dotted key as directions through folders: if a folder does not exist yet, this file creates it before putting the value inside. It also preserves one older shortcut, `use_legacy_landlock`, by rewriting it to its newer full path.
 
 #### Function details
 
@@ -1405,11 +1427,11 @@ This module provides the reusable CLI-side machinery for ad hoc configuration ov
 fn prepend_root_overrides(&mut self, root_overrides: Self)
 ```
 
-**Purpose**: Prepends one set of raw overrides ahead of another so the prepended values have lower precedence than later entries. This supports root-level flags being overridden by subcommand-specific flags parsed afterward.
+**Purpose**: This puts configuration flags from the top-level command before flags from a subcommand. That ordering matters because later overrides can win over earlier ones when the final config is built.
 
-**Data flow**: Takes `&mut self` and `root_overrides: Self`, then splices `root_overrides.raw_overrides` into `self.raw_overrides` at range `0..0`. It mutates `self.raw_overrides` in place and returns no value.
+**Data flow**: It starts with one `CliConfigOverrides` value already holding subcommand override strings, and another holding root-level override strings. It inserts the root strings at the front of the existing list. The result is the same object, now ordered from broader settings first to more specific settings later.
 
-**Call relations**: Higher-level CLI assembly code calls this before final override parsing. It does not parse values itself; it only reorders the raw strings that `parse_overrides` will later consume.
+**Call relations**: This is used when command-line parsing has collected some `-c` flags before a subcommand and some after it. `prepend_config_flags` calls it to combine those two groups while keeping the intended priority order.
 
 *Call graph*: called by 1 (prepend_config_flags).
 
@@ -1420,11 +1442,11 @@ fn prepend_root_overrides(&mut self, root_overrides: Self)
 fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String>
 ```
 
-**Purpose**: Parses the collected raw `key=value` strings into canonicalized dotted keys and TOML values. It preserves literal strings when TOML parsing fails.
+**Purpose**: This turns raw `key=value` command-line text into cleaned-up configuration paths paired with TOML values. Callers use it when they need the overrides in a structured form instead of as strings.
 
-**Data flow**: Reads `self.raw_overrides`, iterates over each string, splits on the first `=`, trims key and value text, errors on missing `=` or empty keys, then tries `parse_toml_value(value_str)`. On success it uses the parsed `toml::Value`; on failure it trims surrounding quotes and wraps the raw text in `Value::String`. Each key is passed through `canonicalize_override_key`, and the function collects the resulting `Vec<(String, Value)>` or returns the first error string encountered.
+**Data flow**: It reads the stored list of raw override strings. For each one, it splits only at the first `=`, trims whitespace, checks that the key is not empty, parses the value as TOML when possible, and otherwise keeps it as a plain string with surrounding quotes removed. It also rewrites known legacy keys to their current full path. It returns either a list of `(path, value)` pairs or an error message explaining what was malformed.
 
-**Call relations**: Many config-loading and command-execution paths call this as the main interpretation step for CLI overrides. `apply_on_value` builds on it, while this function itself delegates to `parse_toml_value` and `canonicalize_override_key`.
+**Call relations**: Many command and config-loading paths call this when they need to interpret `-c` flags, including main command execution, sandboxed command execution, config loading, exec server config loading, and several subcommands. Inside the parsing flow, it relies on the TOML parsing helper for typed values and the key-normalizing helper for compatibility with older flag names.
 
 *Call graph*: called by 17 (run_main_with_transport_options, run_command_under_sandbox, load_config, load_exec_server_config, load_config_or_exit, run_add, run_get, run_list, run_login, run_logout (+7 more)).
 
@@ -1435,11 +1457,11 @@ fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String>
 fn apply_on_value(&self, target: &mut Value) -> Result<(), String>
 ```
 
-**Purpose**: Applies all parsed CLI overrides onto a mutable TOML configuration tree, creating intermediate tables as needed. Later overrides in the parsed list replace earlier values at the same path.
+**Purpose**: This applies all command-line overrides directly onto an existing TOML configuration value. It is useful when code already has a config tree and wants the `-c` flags to modify it in place.
 
-**Data flow**: Takes `&self` and `target: &mut Value`, first calls `self.parse_overrides()?` to obtain `(path, value)` pairs, then iterates through them and passes each into `apply_single_override(target, &path, value)`. It mutates the supplied TOML value tree in place and returns `Ok(())` or a parse error string.
+**Data flow**: It takes a mutable TOML value as the target. First it parses the raw override strings into paths and values. Then, for each parsed override, it walks or creates the needed nested tables and writes the new value at the destination. It returns success when every override is applied, or an error if parsing the raw flags failed.
 
-**Call relations**: Callers use this when they already have a mutable config tree and want CLI overrides merged in. It orchestrates parsing plus per-entry application by delegating to `parse_overrides` and `apply_single_override`.
+**Call relations**: This is the bridge between parsing and changing the actual config tree. It calls `CliConfigOverrides::parse_overrides` to understand the user input, then calls `apply_single_override` once for each parsed item to make the concrete edit.
 
 *Call graph*: calls 2 internal fn (parse_overrides, apply_single_override).
 
@@ -1450,11 +1472,11 @@ fn apply_on_value(&self, target: &mut Value) -> Result<(), String>
 fn canonicalize_override_key(key: &str) -> String
 ```
 
-**Purpose**: Rewrites legacy or aliased override keys into their canonical dotted-path form. At present it only special-cases `use_legacy_landlock`.
+**Purpose**: This converts supported old shortcut keys into their current full configuration path. It keeps older command examples or user habits working after the config layout has changed.
 
-**Data flow**: Reads `key: &str`; if it equals `"use_legacy_landlock"` it returns `"features.use_legacy_landlock".to_string()`, otherwise it returns `key.to_string()`. It has no side effects.
+**Data flow**: It receives one key string from an override. If the key is exactly `use_legacy_landlock`, it returns `features.use_legacy_landlock`; otherwise it returns the key unchanged. Nothing else is modified.
 
-**Call relations**: This helper is called from `CliConfigOverrides::parse_overrides` so all parsed overrides use the same canonical key space before application.
+**Call relations**: It is part of the override parsing path. After a key is split from `key=value`, this helper gives the rest of the system the canonical path that should be written into the config tree.
 
 
 ##### `apply_single_override`  (lines 108–148)
@@ -1463,11 +1485,11 @@ fn canonicalize_override_key(key: &str) -> String
 fn apply_single_override(root: &mut Value, path: &str, value: Value)
 ```
 
-**Purpose**: Writes one parsed override into a TOML value tree, creating or replacing intermediate tables along the dotted path. It ensures the destination leaf receives the provided value even if existing structure is incompatible.
+**Purpose**: This writes one parsed override into the correct place inside a TOML configuration tree. It also creates missing parent tables so a deeply nested setting can be added even if its path does not exist yet.
 
-**Data flow**: Takes `root: &mut Value`, `path: &str`, and `value: Value`, splits the path on `.` into parts, and walks `current` through the tree. For non-final segments, if `current` is a `Value::Table` it uses `entry(...).or_insert_with(|| Value::Table(Table::new()))`; otherwise it replaces `current` with a fresh table and then descends. At the final segment, if `current` is a table it inserts the value under that key; otherwise it replaces `current` with a new one-entry table containing the final key and value.
+**Data flow**: It receives a mutable root TOML value, a dotted path such as `a.b.c`, and the TOML value to place there. It splits the path into parts, walks down through TOML tables, creates new tables where needed, and finally inserts or replaces the value at the last path part. The root value may be changed in place, including being turned into a table if it was not one already.
 
-**Call relations**: Only `CliConfigOverrides::apply_on_value` calls this helper. It is the mutation engine that turns parsed dotted paths into nested TOML table updates.
+**Call relations**: This function is called by `CliConfigOverrides::apply_on_value` for each parsed override. It is the low-level writer that turns a user’s dotted path into actual nested TOML table updates.
 
 *Call graph*: called by 1 (apply_on_value); 2 external calls (new, Table).
 
@@ -1478,11 +1500,11 @@ fn apply_single_override(root: &mut Value, path: &str, value: Value)
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error>
 ```
 
-**Purpose**: Parses a raw CLI value string as a TOML value by embedding it into a temporary one-key TOML document. This allows reuse of the TOML parser for scalars, arrays, and inline tables.
+**Purpose**: This tries to read a single command-line value using TOML rules. That lets overrides preserve real types like booleans, numbers, arrays, and inline tables instead of treating everything as text.
 
-**Data flow**: Reads `raw: &str`, formats a wrapper string `_x_ = {raw}`, parses it as `toml::Table` with `toml::from_str`, then clones and returns the `_x_` entry. If parsing fails or the sentinel key is missing, it returns a `toml::de::Error`.
+**Data flow**: It receives a raw value string such as `true`, `42`, or `[1, 2, 3]`. Because the TOML parser expects a full assignment, it temporarily wraps the value as `_x_ = <value>`, parses that mini TOML document, and then pulls out the `_x_` value. It returns the parsed TOML value or a TOML parsing error.
 
-**Call relations**: This helper is called by `CliConfigOverrides::parse_overrides` and directly by several unit tests. It isolates the TOML parsing trick from the higher-level override logic.
+**Call relations**: The override parser uses this to decide whether a right-hand side is a real TOML value. The test functions also call it directly to confirm that common value forms succeed or fail as expected.
 
 *Call graph*: called by 4 (parses_array, parses_basic_scalar, parses_bool, parses_inline_table); 2 external calls (format!, from_str).
 
@@ -1493,11 +1515,11 @@ fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error>
 fn parses_basic_scalar()
 ```
 
-**Purpose**: Verifies that a numeric literal is parsed as a TOML integer value. It covers the simplest successful TOML parse case.
+**Purpose**: This test checks that a simple numeric override value is parsed as a number. It protects the behavior that `-c some_number=42` should not become the string `"42"`.
 
-**Data flow**: Calls `parse_toml_value("42")`, unwraps the result, reads `as_integer()`, and asserts it equals `Some(42)`. It has no side effects.
+**Data flow**: It sends the text `42` into `parse_toml_value`. It then checks that the returned TOML value contains the integer 42. The test passes if the parsed type and value are correct.
 
-**Call relations**: This unit test is run by the harness and directly exercises `parse_toml_value`.
+**Call relations**: This is part of the file’s test coverage for `parse_toml_value`. It directly exercises the helper that production override parsing depends on for typed values.
 
 *Call graph*: calls 1 internal fn (parse_toml_value); 1 external calls (assert_eq!).
 
@@ -1508,11 +1530,11 @@ fn parses_basic_scalar()
 fn parses_bool()
 ```
 
-**Purpose**: Checks that boolean literals parse correctly as TOML booleans. It covers both `true` and `false` cases.
+**Purpose**: This test checks that TOML boolean text becomes real true and false values. It ensures flags like `-c feature_enabled=true` behave like booleans, not strings.
 
-**Data flow**: Calls `parse_toml_value("true")` and `parse_toml_value("false")`, unwraps both, reads `as_bool()`, and asserts the expected `Some(true)` and `Some(false)` results. No external state is modified.
+**Data flow**: It sends `true` and `false` into `parse_toml_value` separately. For each returned value, it checks that the TOML boolean matches the expected result. Nothing outside the test is changed.
 
-**Call relations**: The test harness invokes this to validate boolean parsing through `parse_toml_value`.
+**Call relations**: This test directly checks `parse_toml_value`, supporting the larger override parsing behavior used by command and config-loading code.
 
 *Call graph*: calls 1 internal fn (parse_toml_value); 1 external calls (assert_eq!).
 
@@ -1523,11 +1545,11 @@ fn parses_bool()
 fn fails_on_unquoted_string()
 ```
 
-**Purpose**: Confirms that a bare unquoted string is not valid TOML in this parsing context. This justifies the higher-level fallback to treating such values as literal strings.
+**Purpose**: This test confirms that bare words are not considered valid TOML strings by the low-level TOML parser. That distinction matters because the higher-level override parser deliberately falls back to plain strings when this parsing fails.
 
-**Data flow**: Calls `parse_toml_value("hello")` and asserts the result is an error. It performs no mutation.
+**Data flow**: It tries to parse the text `hello` as a TOML value. The expected result is an error, because TOML strings normally need quotes. The test passes when parsing fails.
 
-**Call relations**: This test is run by the harness and documents the failure mode that `parse_overrides` intentionally catches and converts into `Value::String`.
+**Call relations**: This test explains an important part of the design around `parse_toml_value`: failure is not always bad at the higher level, because `CliConfigOverrides::parse_overrides` can use that failure to choose the convenient string fallback.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1538,11 +1560,11 @@ fn fails_on_unquoted_string()
 fn parses_array()
 ```
 
-**Purpose**: Verifies that TOML array syntax is accepted and preserved as an array value. It covers a structured non-scalar parse case.
+**Purpose**: This test checks that array values are accepted in overrides. It protects use cases like passing lists of permissions or other multi-value settings from the command line.
 
-**Data flow**: Calls `parse_toml_value("[1, 2, 3]")`, unwraps the result, reads `as_array()`, and asserts the array length is 3. No external state is changed.
+**Data flow**: It gives `parse_toml_value` the text `[1, 2, 3]`. It then reads the parsed value as an array and checks that it has three items. The test passes if the TOML parser preserved the array shape.
 
-**Call relations**: The test harness invokes this to validate array parsing through the sentinel-document approach.
+**Call relations**: This directly exercises `parse_toml_value`, which is the same helper used when command-line overrides contain TOML arrays.
 
 *Call graph*: calls 1 internal fn (parse_toml_value); 1 external calls (assert_eq!).
 
@@ -1553,11 +1575,11 @@ fn parses_array()
 fn canonicalizes_use_legacy_landlock_alias()
 ```
 
-**Purpose**: Checks that the legacy override key `use_legacy_landlock` is rewritten to `features.use_legacy_landlock` during parsing. It also confirms the associated value is parsed as a boolean.
+**Purpose**: This test checks that the old `use_legacy_landlock` override name is rewritten to its newer full path. It helps keep backward compatibility from breaking silently.
 
-**Data flow**: Constructs `CliConfigOverrides` with one raw override string, calls `parse_overrides()`, then inspects the first tuple's key and value and asserts they equal the canonical dotted key and `Some(true)`. It mutates only test-local data.
+**Data flow**: It creates a `CliConfigOverrides` value containing `use_legacy_landlock=true`. It parses the overrides and checks that the resulting key is `features.use_legacy_landlock` and the value is the boolean `true`. The test only inspects the parsed output.
 
-**Call relations**: This unit test is run by the harness and exercises the interaction between `parse_overrides`, `canonicalize_override_key`, and `parse_toml_value`.
+**Call relations**: This test covers the compatibility behavior used during `CliConfigOverrides::parse_overrides`. It indirectly verifies that key normalization is part of the parsing path.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1568,11 +1590,11 @@ fn canonicalizes_use_legacy_landlock_alias()
 fn prepends_root_overrides()
 ```
 
-**Purpose**: Verifies that root overrides are inserted before subcommand overrides in the raw override list. It documents the precedence-ordering behavior without involving parsing.
+**Purpose**: This test checks that root-level config flags are placed before subcommand-level flags. It protects the priority rule where more specific command flags can appear later and override earlier broad settings.
 
-**Data flow**: Creates two `CliConfigOverrides` values, calls `prepend_root_overrides` on the subcommand one, and asserts the resulting `raw_overrides` vector has the root entry first and the subcommand entry second. No external state is touched.
+**Data flow**: It creates one override list for a subcommand and another for the root command. It calls `prepend_root_overrides`, then checks that the root value appears first and the subcommand value remains after it. The changed list is inspected in memory.
 
-**Call relations**: The test harness invokes this to validate the list-splicing behavior of `prepend_root_overrides`.
+**Call relations**: This test directly exercises `CliConfigOverrides::prepend_root_overrides`, the helper used when command-line parsing needs to merge root and subcommand config flags.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1583,20 +1605,26 @@ fn prepends_root_overrides()
 fn parses_inline_table()
 ```
 
-**Purpose**: Checks that TOML inline-table syntax parses into a table value with the expected entries. It covers another structured TOML case.
+**Purpose**: This test checks that inline TOML tables can be used as override values. That allows a single `-c` flag to provide a small group of related settings.
 
-**Data flow**: Calls `parse_toml_value("{a = 1, b = 2}")`, unwraps the result, reads `as_table()`, and asserts the `a` and `b` entries are integers `1` and `2`. It has no side effects.
+**Data flow**: It passes `{a = 1, b = 2}` into `parse_toml_value`. It then reads the result as a table and checks that keys `a` and `b` contain the integers 1 and 2. The test passes if the structure and values are preserved.
 
-**Call relations**: This unit test is run by the harness and directly exercises `parse_toml_value` on inline-table input.
+**Call relations**: This test directly checks `parse_toml_value`, strengthening confidence that the override parser can accept more than just simple scalar values.
 
 *Call graph*: calls 1 internal fn (parse_toml_value); 1 external calls (assert_eq!).
 
 
 ### `utils/cli/src/approval_mode_cli_arg.rs`
 
-`config` · `CLI argument parsing`
+`config` · `command-line parsing and startup configuration`
 
-This file is a small CLI adapter around approval policy selection. `ApprovalModeCliArg` is a `clap::ValueEnum` with `rename_all = "kebab-case"`, so command-line values map cleanly to variants like `untrusted`, `on-failure`, `on-request`, and `never`. The enum's doc comments are user-facing help text that explains the semantics and notes that `OnFailure` is deprecated in favor of `on-request` or `never` depending on interactivity. The only behavior in the file is the `From<ApprovalModeCliArg> for AskForApproval` implementation, which translates the CLI-specific variants into the protocol-layer enum used elsewhere in the system. The mapping is mostly one-to-one, except `Untrusted` becomes `AskForApproval::UnlessTrusted`, reflecting the protocol's more explicit naming. This separation lets clap derive parsing and help output from a stable CLI type while the rest of the application consumes the shared protocol enum.
+This file is a small bridge between what a person types in the terminal and what the program needs internally. The `--approval-mode` option controls when the tool should stop and ask the user before running a command. That matters because some commands are safe and routine, while others could change files, expose data, or need to run outside a sandbox.
+
+The file defines `ApprovalModeCliArg`, an enum, which is a fixed list of allowed choices. The command-line parser, `clap`, can use this list to accept values like `untrusted`, `on-failure`, `on-request`, and `never`. The `kebab-case` setting means the typed command-line names use dashes instead of Rust-style names.
+
+Each option describes a different trust style. For example, `untrusted` allows only known safe commands without asking, while `never` means the tool will not ask for approval at all. `on-failure` is kept for compatibility but is marked as deprecated in the comments.
+
+The rest of the application does not use this CLI-specific enum directly. Instead, the file converts it into `AskForApproval`, the shared protocol type used deeper in the system. In everyday terms, this file is like a receptionist translating a visitor’s plain-language choice into the exact internal badge the building security system understands.
 
 #### Function details
 
@@ -1606,22 +1634,24 @@ This file is a small CLI adapter around approval policy selection. `ApprovalMode
 fn from(value: ApprovalModeCliArg) -> Self
 ```
 
-**Purpose**: Converts a parsed CLI approval-mode value into the corresponding protocol-layer `AskForApproval` variant. It bridges clap-facing naming to the internal/shared representation.
+**Purpose**: This function converts a command-line approval choice into the internal approval setting used by the application. It keeps the user-facing names separate from the protocol-level values used elsewhere.
 
-**Data flow**: Takes `value: ApprovalModeCliArg`, matches on the enum variant, and returns `AskForApproval::UnlessTrusted`, `OnFailure`, `OnRequest`, or `Never`. It reads no external state and writes nothing.
+**Data flow**: It receives one `ApprovalModeCliArg`, such as `OnRequest` or `Never`. It matches that choice to the corresponding `AskForApproval` value, such as `AskForApproval::OnRequest` or `AskForApproval::Never`, and returns that internal value without changing anything else.
 
-**Call relations**: This conversion is invoked implicitly wherever code calls `.into()` or `AskForApproval::from(...)` on a parsed CLI value. It is a leaf mapping function with no further delegation.
+**Call relations**: After the command-line parser has accepted an approval mode, this conversion is the handoff from CLI setup into the rest of the program. It does not call other project functions; it simply maps each accepted CLI option to the approval policy that later command-execution code can follow.
 
 
 ### `utils/cli/src/sandbox_mode_cli_arg.rs`
 
-`data_model` · `startup`
+`config` · `startup / command-line parsing`
 
-This file introduces `SandboxModeCliArg`, a small enum derived with `clap::ValueEnum` so Clap can parse `--sandbox` values directly from kebab-case command-line strings. The variants are intentionally data-free mirrors of `codex_protocol::config_types::SandboxMode`: `ReadOnly`, `WorkspaceWrite`, and `DangerFullAccess`. The module-level documentation explains the design constraint: advanced `workspace-write` tuning is not represented here and must instead come from config overrides or config files.
+This file is a small bridge between what a person types in the terminal and what the program uses internally. The sandbox setting controls how much access the tool has to the user’s machine, such as read-only access, write access inside the workspace, or full access. Because command-line flags need to be simple words, this file defines a plain enum, `SandboxModeCliArg`, with the three supported choices.
 
-The only behavior is an implementation of `From<SandboxModeCliArg> for SandboxMode`, which performs a one-to-one variant mapping with an exhaustive `match`. There is no fallback or transformation logic beyond preserving the semantic mode choice across the CLI/protocol boundary. Because the enum derives `Clone`, `Copy`, and `Debug`, it is cheap to pass around and easy to inspect in parsed argument structs.
+The file uses `clap`, a command-line parsing library, so these choices can be accepted directly from the command line. The setting names are written in kebab-case for users, so `WorkspaceWrite` becomes `workspace-write`, which is easier and more conventional to type in a shell.
 
-The test asserts each variant maps to the expected protocol enum value, effectively locking in the correspondence between the CLI surface and the protocol configuration type.
+The internal protocol already has its own `SandboxMode` type. This file does not replace it. Instead, it converts the command-line version into that internal version. Think of it like a ticket counter: the user asks for a simple ticket by name, and this file hands the rest of the system the official form it expects.
+
+Without this file, each command-line entry point would need to repeat the same sandbox flag definitions and conversion rules, increasing the chance that one command would interpret sandbox modes differently from another.
 
 #### Function details
 
@@ -1631,11 +1661,11 @@ The test asserts each variant maps to the expected protocol enum value, effectiv
 fn from(value: SandboxModeCliArg) -> Self
 ```
 
-**Purpose**: Converts a parsed `SandboxModeCliArg` into the protocol-layer `SandboxMode`. The mapping is direct and exhaustive across all three supported modes.
+**Purpose**: This function converts a sandbox choice parsed from the command line into the internal sandbox mode used by the rest of the program. It keeps the user-facing flag names separate from the deeper configuration type.
 
-**Data flow**: It takes `value: SandboxModeCliArg`, matches on the enum variant, and returns the corresponding `codex_protocol::config_types::SandboxMode` variant: `ReadOnly`, `WorkspaceWrite`, or `DangerFullAccess`. It does not read or mutate any external state.
+**Data flow**: It receives one `SandboxModeCliArg`, such as `ReadOnly` or `WorkspaceWrite`. It matches that choice to the equivalent `SandboxMode` value. It returns the internal value and does not change anything else.
 
-**Call relations**: This conversion is used wherever parsed CLI options need to be translated into protocol/config values. Within this file, the unit test invokes it via `.into()` to verify the mapping.
+**Call relations**: This conversion is used after the command-line parser has turned the user’s `--sandbox` value into a `SandboxModeCliArg`. The result is handed onward to configuration or startup code that needs the real sandbox policy. The test in this file checks that each command-line option maps to the expected internal mode.
 
 
 ##### `tests::maps_cli_args_to_protocol_modes`  (lines 36–46)
@@ -1644,11 +1674,11 @@ fn from(value: SandboxModeCliArg) -> Self
 fn maps_cli_args_to_protocol_modes()
 ```
 
-**Purpose**: Verifies that each CLI enum variant converts to the matching protocol enum variant. This guards against accidental drift between the command-line API and protocol configuration.
+**Purpose**: This test proves that every command-line sandbox option converts to the correct internal sandbox mode. It protects against accidental mismatches if either enum changes later.
 
-**Data flow**: The test applies `.into()` to `SandboxModeCliArg::ReadOnly`, `WorkspaceWrite`, and `DangerFullAccess`, and asserts equality with the corresponding `SandboxMode` values. No shared state is involved.
+**Data flow**: It creates each command-line sandbox value, converts it with `.into()`, and compares the result with the expected internal `SandboxMode`. It produces no runtime output unless a comparison fails during testing.
 
-**Call relations**: It directly exercises the `From<SandboxModeCliArg> for SandboxMode` implementation for all variants.
+**Call relations**: This function runs only in the test build. It calls the external `assert_eq!` macro to compare expected and actual values, confirming that `SandboxMode::from` behaves correctly for all three sandbox choices.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1658,13 +1688,13 @@ These files define small reusable adapters for connector metadata, plugin and sk
 
 ### `connectors/src/metadata.rs`
 
-`util` · `cross-cutting formatting and ordering of connector metadata`
+`util` · `cross-cutting`
 
-This file is a compact utility layer over `AppInfo`. `connector_display_label` currently returns the connector’s `name` unchanged, making that field the canonical human-facing label. `connector_mention_slug` derives a mention-safe slug from that display label, and `connector_mention_slug_from_name` exposes the same slugging logic directly from a raw name by delegating to the crate-level `connector_name_slug`. `connector_install_url` similarly re-exports the crate-level URL builder so callers outside `lib.rs` can generate canonical ChatGPT app URLs without depending on private internals.
+A connector is an external app or service that this system can talk to. This file is like the label maker and filing rulebook for those connectors. It answers simple but important questions: What name should users see? What short text should represent this connector when someone mentions it? What install link should be shown? In what order should connectors appear?
 
-The one transformation that differs slightly is `sanitize_name`, which slugifies a name and then replaces hyphens with underscores; this is useful where identifier-like formatting is preferred over URL formatting.
+Most of the functions are thin wrappers around shared naming rules elsewhere in the crate. That is deliberate: it gives the rest of the program one clear place to ask for connector-facing metadata, instead of repeating string cleanup rules in many places. For example, a connector name may need to become a “slug,” which means a safe, simplified version of text that can be used in mentions or URLs.
 
-The only non-wrapper function with substantive behavior is `sort_connectors_by_accessibility_and_name`. It sorts a mutable slice of `AppInfo` in-place with a stable ordering policy: accessible connectors come first (`right.is_accessible.cmp(&left.is_accessible)`), then names ascending, then IDs ascending as a deterministic tie-breaker. That ordering is reused by merge code so connector lists present installed/accessible apps before merely discoverable ones while still remaining predictable across runs.
+The sorting function is the only place here with a little more policy. It puts accessible connectors first, then sorts by name, then by id as a final tie-breaker. That means users see the usable connectors before unavailable ones, and the order stays predictable even when two connectors have the same name. Without this file, connector names, mention forms, install URLs, and list ordering could drift apart across the interface.
 
 #### Function details
 
@@ -1674,11 +1704,11 @@ The only non-wrapper function with substantive behavior is `sort_connectors_by_a
 fn connector_display_label(connector: &AppInfo) -> String
 ```
 
-**Purpose**: Returns the human-facing label used to display a connector.
+**Purpose**: Returns the human-readable name for a connector. Other parts of the system use this when they need the label a user should actually see.
 
-**Data flow**: Reads `connector: &AppInfo`, clones `connector.name`, and returns the cloned `String`.
+**Data flow**: It receives an AppInfo object, reads its name field, copies that name into a new string, and returns it. It does not change the connector.
 
-**Call relations**: It is used as the first step in mention-slug generation and by UI/message-building code that needs a display label abstraction.
+**Call relations**: When the interface or mention-building code needs a connector label, it calls this function first. The mention slug builder also uses it so that mention text is based on the same display name users see.
 
 *Call graph*: called by 3 (connector_mention_slug, mention_items, connectors_popup_params).
 
@@ -1689,11 +1719,11 @@ fn connector_display_label(connector: &AppInfo) -> String
 fn connector_mention_slug(connector: &AppInfo) -> String
 ```
 
-**Purpose**: Builds a normalized mention slug for a connector based on its display label.
+**Purpose**: Turns a connector into the short, safe name used when mentioning that connector in text. This helps the system recognize references like app mentions consistently.
 
-**Data flow**: Accepts `&AppInfo`, obtains the display label via `connector_display_label`, passes that string reference into `connector_mention_slug_from_name`, and returns the resulting slug.
+**Data flow**: It receives an AppInfo object, asks connector_display_label for the connector’s visible name, then passes that name to connector_mention_slug_from_name. The result is a cleaned-up slug string.
 
-**Call relations**: Mention parsing and rendering flows call this helper so they all derive slugs from the same display-label policy.
+**Call relations**: This is the common path used by mention-related code when it starts from a full connector record. It sits between raw connector metadata and features that count, collect, submit, or find connector mentions.
 
 *Call graph*: calls 2 internal fn (connector_display_label, connector_mention_slug_from_name); called by 5 (build_connector_slug_counts, collect_explicit_app_ids_from_skill_items, mention_items, submit_user_message_with_history_and_shell_escape_policy, find_app_mentions).
 
@@ -1704,11 +1734,11 @@ fn connector_mention_slug(connector: &AppInfo) -> String
 fn connector_mention_slug_from_name(name: &str) -> String
 ```
 
-**Purpose**: Converts an arbitrary connector name into the canonical mention slug format.
+**Purpose**: Turns a plain connector name into a mention-friendly slug. Use this when the code has only the name, not the full connector record.
 
-**Data flow**: Takes `name: &str`, delegates to `crate::connector_name_slug(name)`, and returns the slug string.
+**Data flow**: It receives a name as text, sends it to the crate’s shared connector name slug function, and returns the cleaned-up version. The exact cleanup rule lives in that shared function.
 
-**Call relations**: It is the name-based backend for `connector_mention_slug`.
+**Call relations**: connector_mention_slug calls this after extracting the display label. This function hands the actual name-cleaning work to the shared slug helper so mention formatting stays consistent with the rest of the connector code.
 
 *Call graph*: called by 1 (connector_mention_slug); 1 external calls (connector_name_slug).
 
@@ -1719,11 +1749,11 @@ fn connector_mention_slug_from_name(name: &str) -> String
 fn connector_install_url(name: &str, connector_id: &str) -> String
 ```
 
-**Purpose**: Exposes the canonical connector install URL builder from the crate root.
+**Purpose**: Builds the installation URL for a connector from its name and connector id. This gives UI and merging code a single way to produce the link used to install or connect an app.
 
-**Data flow**: Accepts `name` and `connector_id`, forwards them to `crate::connector_install_url`, and returns the resulting URL string.
+**Data flow**: It receives a connector name and connector id, passes both to the crate’s shared install URL builder, and returns the finished URL string.
 
-**Call relations**: Merge code and tests call this wrapper when they need install URLs without reaching into the main module’s private helpers.
+**Call relations**: Code that combines connector records or converts plugin connector data into app information calls this when it needs an install link. This wrapper keeps URL creation centralized rather than scattered through those conversion paths.
 
 *Call graph*: called by 4 (merged_app, named_app, merge_connectors, plugin_connector_to_app_info); 1 external calls (connector_install_url).
 
@@ -1734,11 +1764,11 @@ fn connector_install_url(name: &str, connector_id: &str) -> String
 fn sanitize_name(name: &str) -> String
 ```
 
-**Purpose**: Produces an identifier-safe connector name by slugifying and replacing hyphens with underscores.
+**Purpose**: Creates a stricter safe version of a connector name by making a slug and replacing dashes with underscores. This is useful when a name must fit places where underscores are preferred over hyphens.
 
-**Data flow**: Reads `name: &str`, slugifies it with `crate::connector_name_slug`, replaces all `-` characters with `_`, and returns the transformed `String`.
+**Data flow**: It receives raw name text, converts it with the shared connector slug rule, then replaces every hyphen in that result with an underscore. It returns the sanitized string and changes nothing else.
 
-**Call relations**: It is a standalone formatting helper for callers that need underscore-separated names rather than URL slugs.
+**Call relations**: This function is a standalone naming helper. It relies on the same shared slug logic as mention naming, then applies one extra transformation for callers that need underscore-style names.
 
 *Call graph*: 1 external calls (connector_name_slug).
 
@@ -1749,22 +1779,24 @@ fn sanitize_name(name: &str) -> String
 fn sort_connectors_by_accessibility_and_name(connectors: &mut [AppInfo])
 ```
 
-**Purpose**: Sorts connectors so accessible ones appear first, then orders ties by name and ID.
+**Purpose**: Sorts a list of connectors so the most useful ones appear first. Accessible connectors come before inaccessible ones, then names are alphabetical, and ids break any remaining ties.
 
-**Data flow**: Mutably borrows a slice `&mut [AppInfo]`, sorts it in place with a comparator that compares `is_accessible` descending, `name` ascending, and `id` ascending, and returns no value.
+**Data flow**: It receives a mutable slice of AppInfo connector records. It reorders that slice in place: first by whether each connector is accessible, then by name, then by id. It returns no separate value because the input list itself is changed.
 
-**Call relations**: It is the shared ordering primitive used by connector merge functions after they finish assembling and normalizing connector lists.
+**Call relations**: After connector lists are merged from different sources, merge code calls this to make the final order predictable and user-friendly. It delegates the actual rearranging to Rust’s standard sorting operation, while this function supplies the comparison rule.
 
 *Call graph*: called by 2 (merge_connectors, merge_plugin_connectors); 1 external calls (sort_by).
 
 
 ### `core-plugins/src/toggles.rs`
 
-`domain_logic` · `config write handling`
+`domain_logic` · `configuration write handling`
 
-This file centers on one utility, `collect_plugin_enabled_candidates`, that scans an iterator of configuration edits expressed as `(key_path, JsonValue)` pairs and derives a `BTreeMap<String, bool>` keyed by plugin ID. The function recognizes three concrete edit shapes under the `plugins` namespace: a direct leaf write like `plugins.<plugin_id>.enabled = <bool>`, a whole-plugin object write like `plugins.<plugin_id> = { enabled: <bool>, ... }`, and a whole-plugins-table write like `plugins = { <plugin_id>: { enabled: <bool> }, ... }`. For each incoming edit, it splits the dotted key path into owned `String` segments, pattern-matches on the segment slice, and only records values when the JSON shape actually contains a boolean `enabled` field. Non-boolean values, unrelated paths, non-object `plugins` tables, and plugin objects lacking `enabled` are silently ignored.
+Plugins can be enabled or disabled through configuration, but that configuration may be written in different ways. Someone might write one exact value like `plugins.sample@test.enabled = true`, replace one plugin's whole settings table, or replace the entire `plugins` table. This file is the small translator that recognizes all of those forms and extracts only the meaningful toggle changes.
 
-A notable design choice is that results are accumulated in a `BTreeMap`, giving deterministic ordering and naturally implementing last-write-wins semantics: later edits for the same plugin overwrite earlier entries via `insert`. This matters because callers such as batch and single-write paths can feed mixed edit forms in sequence and rely on the final map to reflect the effective pending toggle state. The included tests document both mixed-shape extraction and overwrite behavior for repeated writes to the same plugin.
+The main function reads a stream of edited key paths and JSON values. A JSON value is a general data value such as a boolean, object, string, or number. The function looks for paths that start with `plugins`, then checks whether the edit contains an `enabled` boolean. If it does, it records the plugin ID and the requested true-or-false state. If the edit is about something else, or if `enabled` is missing or not a boolean, it ignores it.
+
+The result is a sorted map, like a tidy checklist: each plugin ID points to its final requested enabled state. If the same plugin appears more than once, the later edit wins because it overwrites the earlier map entry. This matters during configuration writes: the rest of the system can ask, “Which plugin toggles changed?” without needing to understand every possible JSON shape a user may have edited.
 
 #### Function details
 
@@ -1776,11 +1808,11 @@ fn collect_plugin_enabled_candidates(
 ) -> BTreeMap<String, bool>
 ```
 
-**Purpose**: Parses a stream of edited configuration paths and JSON values, extracting only plugin `enabled` booleans into a normalized map keyed by plugin ID. It supports direct field writes, whole-plugin object writes, and whole-`plugins` table writes.
+**Purpose**: This function scans configuration edits and pulls out plugin enable or disable requests. It is used when the system needs a clean list of plugin IDs and their desired on/off state, regardless of how the configuration edit was shaped.
 
-**Data flow**: It takes an iterator of `(&String, &serde_json::Value)` edit entries and initializes an empty `BTreeMap<String, bool>`. For each edit, it reads the dotted key path, splits it into `Vec<String>` segments, then matches the segment pattern against supported `plugins` path forms; from the associated JSON value it reads either the boolean directly or an `enabled` field via `get(...).and_then(JsonValue::as_bool)`. Each discovered `(plugin_id, enabled)` pair is inserted into the map, overwriting any prior value for that plugin, and the completed map is returned.
+**Data flow**: It receives an iterator of key paths paired with JSON values. For each edit, it splits the key path on dots and checks for three supported forms: a direct `plugins.<id>.enabled` boolean, a whole `plugins.<id>` object containing an `enabled` boolean, or a whole `plugins` object containing plugin objects. It adds any found plugin toggle to a sorted map, overwriting earlier entries for the same plugin if a later edit appears. It returns that map and does not change anything outside itself.
 
-**Call relations**: This function is invoked by both `batch_write_inner` and `write_value` when configuration mutations need to be inspected for plugin toggle changes, and by the two unit tests in this file. Internally it does not delegate to other project functions; its only external interaction is constructing the result map and using `serde_json::Value` accessors to interpret edit payloads.
+**Call relations**: During normal configuration writes, callers such as `batch_write_inner` and `write_value` call this function to detect plugin toggle changes before applying or reacting to them. The test functions also call it directly with sample edits to prove it recognizes the supported edit shapes and uses the latest value when the same plugin is written twice.
 
 *Call graph*: called by 4 (batch_write_inner, write_value, collect_plugin_enabled_candidates_tracks_direct_and_table_writes, collect_plugin_enabled_candidates_uses_last_write_for_same_plugin); 1 external calls (new).
 
@@ -1791,11 +1823,11 @@ fn collect_plugin_enabled_candidates(
 fn collect_plugin_enabled_candidates_tracks_direct_and_table_writes()
 ```
 
-**Purpose**: Verifies that the collector recognizes all supported edit shapes in one pass: direct `enabled` writes, whole-plugin object writes, and whole-`plugins` table writes. It also confirms that entries without an `enabled` boolean are ignored.
+**Purpose**: This test proves that plugin toggle changes are found in all supported configuration shapes. It checks direct writes, single-plugin table writes, and whole-plugin-list writes in one example.
 
-**Data flow**: The test builds an inline iterator of three edit tuples using `json!`: one direct boolean leaf, one plugin object containing `enabled` plus an unrelated field, and one `plugins` object containing both a valid nested plugin and an invalid one without `enabled`. It passes that iterator to `collect_plugin_enabled_candidates` and compares the returned `BTreeMap` against an expected map containing exactly the three valid plugin toggle results.
+**Data flow**: It builds three sample JSON edits: one direct enabled flag, one plugin object with an enabled flag, and one whole plugins object containing both a valid enabled flag and an irrelevant entry. It sends those edits into `collect_plugin_enabled_candidates`, then compares the returned map with the expected plugin IDs and boolean states. Nothing is changed outside the test.
 
-**Call relations**: This test calls `collect_plugin_enabled_candidates` directly as a focused specification of accepted input forms. It does not participate in runtime flow; its role is to lock in the extraction behavior and filtering rules during test execution.
+**Call relations**: This test exercises the main collection function as a safety check. It uses JSON-building and equality-checking helpers to create readable test data and confirm that only real plugin enabled values are passed through.
 
 *Call graph*: calls 1 internal fn (collect_plugin_enabled_candidates); 2 external calls (assert_eq!, json!).
 
@@ -1806,22 +1838,24 @@ fn collect_plugin_enabled_candidates_tracks_direct_and_table_writes()
 fn collect_plugin_enabled_candidates_uses_last_write_for_same_plugin()
 ```
 
-**Purpose**: Checks that repeated edits for the same plugin resolve to the final observed value rather than preserving the first one. This documents the intended overwrite semantics of the accumulator map.
+**Purpose**: This test proves that when the same plugin is mentioned more than once, the later edit wins. That matches how layered or repeated configuration writes are expected to behave.
 
-**Data flow**: The test constructs two edits for `sample@test`: first a direct `enabled = true` write, then a whole-plugin object with `enabled = false`. It feeds them in order to `collect_plugin_enabled_candidates` and asserts that the returned `BTreeMap` contains only `sample@test -> false`.
+**Data flow**: It creates two edits for the same plugin: first setting it to enabled, then replacing the plugin object with `enabled` set to false. It passes both edits to `collect_plugin_enabled_candidates` and checks that the final map contains only the later false value for that plugin. The test only observes the returned result.
 
-**Call relations**: This test exercises `collect_plugin_enabled_candidates` under a duplicate-plugin scenario to validate the last-write-wins behavior produced by repeated `BTreeMap::insert` calls. Like the other test, it is only executed in the test suite and serves as executable documentation for callers such as write paths.
+**Call relations**: This test focuses on the overwrite behavior inside the main collection function. It protects callers such as configuration write paths from accidentally acting on an earlier toggle value when a later edit has replaced it.
 
 *Call graph*: calls 1 internal fn (collect_plugin_enabled_candidates); 2 external calls (assert_eq!, json!).
 
 
 ### `core-skills/src/mention_counts.rs`
 
-`util` · `skill catalog preparation`
+`domain_logic` · `skill discovery or validation`
 
-This file is a tiny utility focused on one concrete transformation: scanning a slice of `SkillMetadata` and tallying how many enabled skills share the same `name`. It maintains two `HashMap<String, usize>` accumulators in parallel. The first preserves the original `skill.name` exactly, which is useful for exact display or exact-match collision checks. The second normalizes each name with `to_ascii_lowercase()`, giving a case-insensitive count for ASCII names without performing full Unicode case folding.
+Skills appear to be described by metadata, including a skill name and the path to that skill's `SKILLS.md` file. This file answers a simple but important question: “How many active skills use this name?” That matters because duplicate names can make references ambiguous, especially if two names differ only by letter case, such as `Deploy` and `deploy`.
 
-The function explicitly excludes any skill whose `path_to_skills_md` appears in the provided `HashSet<AbsolutePathBuf>` of disabled paths. That means the counts reflect the currently enabled catalog rather than the raw loaded set. Control flow is linear: initialize empty maps, iterate over `skills`, skip disabled entries with `continue`, then increment both counters using `entry(...).or_insert(0) += 1`. The return value is a tuple `(exact_counts, lower_counts)` so callers can choose the appropriate view without recomputing. A subtle design choice is that disabled filtering is path-based, not name-based, so duplicate names among disabled skills do not affect the visible counts at all.
+The main function walks through a list of skills one by one. Before counting a skill, it checks whether that skill's path is in a set of disabled paths. A disabled path is skipped, like ignoring a closed shop when making a list of open stores. For every enabled skill, it updates two count tables. One table uses the name exactly as written. The other converts the name to ASCII lowercase first, so names that differ only by basic English letter casing are grouped together.
+
+At the end, the function returns both tables. Other code can then use the exact table to find truly identical names, and the lowercase table to find names that may look the same to a user even if their capitalization differs.
 
 #### Function details
 
@@ -1834,22 +1868,24 @@ fn build_skill_name_counts(
 ) -> (HashMap<String, usize>, HashMap<String, usize>)
 ```
 
-**Purpose**: Builds two frequency tables for enabled skills: one keyed by the original `SkillMetadata.name` and one keyed by its ASCII-lowercased form. This lets downstream code detect exact duplicates and case-insensitive collisions separately.
+**Purpose**: This function counts enabled skill names in two ways: exactly as written, and after converting ASCII letters to lowercase. It is useful when the system needs to detect duplicate skill names or names that only differ by capitalization.
 
-**Data flow**: It takes a slice of `SkillMetadata` plus a `HashSet<AbsolutePathBuf>` of disabled `SKILLS.md` paths. For each skill whose `path_to_skills_md` is not in the disabled set, it clones the name into `exact_counts` and inserts the ASCII-lowercased name into `lower_counts`, incrementing each count. It returns both populated `HashMap<String, usize>` values as a tuple and does not mutate external state.
+**Data flow**: It receives a list of skill metadata and a set of disabled skill file paths. It creates two empty count tables, skips any skill whose path is disabled, then adds one count for the skill's exact name and one count for its ASCII-lowercase name. It returns the two completed tables and does not change the input lists or paths.
 
-**Call relations**: This is a leaf-style helper: callers provide the already-loaded skills and disabled-path state, and the function performs the counting directly without delegating to other project-local logic.
+**Call relations**: When some other part of the skill system needs name counts, it can call this function with the current skills and disabled paths. Inside, the function only relies on standard map creation and updating: it starts fresh count tables, fills them from the enabled skills, and hands the finished counts back to the caller for later decisions.
 
 *Call graph*: 1 external calls (new).
 
 
 ### `ext/memories/src/schema.rs`
 
-`util` · `tool specification construction`
+`util` · `schema generation`
 
-This file is a schema-shaping utility used when publishing memory tools to the Responses API. The public helpers `input_schema_for` and `output_schema_for` are thin wrappers around a shared generator, differing only in whether `Option<T>` fields should emit an explicit JSON `null` type. Inputs disable `option_add_null_type`, which keeps request schemas stricter and avoids advertising `null` as a valid argument value unless the type itself encodes it another way. Outputs enable it so optional response fields can be represented naturally.
+This file is a translator between Rust types and JSON Schema, which is a standard way to describe the shape of JSON data. In plain terms, it creates a form or checklist that says: this value is an object, these fields may appear, these fields are required, and extra fields may or may not be allowed.
 
-The internal `schema_for` function builds a `schemars` generator from `SchemaSettings::draft2019_09()`, mutates the settings to inline subschemas and apply the requested nullability behavior, then generates a root schema for `T`. It serializes that schema to `serde_json::Value` and asserts two invariants: serialization must succeed, and the root schema must be a JSON object. It then constructs a new `Map` containing only a curated subset of top-level keys: `properties`, `required`, `type`, `additionalProperties`, `$defs`, and `definitions`. By stripping metadata and unrelated fields, the function produces a leaner schema payload tailored for tool registration while preserving the structural information needed for argument parsing and output validation.
+The file has two public helpers for the rest of this crate. One is for input schemas, where optional fields are treated normally. The other is for output schemas, where optional values may also be written as null. That difference matters because data coming out of a tool or API may need to explicitly say “there is no value here,” while incoming data may follow stricter expectations.
+
+The shared worker function builds a schema using schemars, a Rust library that can inspect types which implement JsonSchema. It asks for the 2019-09 version of JSON Schema, inlines nested schemas to make the result easier to pass around, serializes the generated schema into JSON, and then keeps only the pieces this project cares about. It is like taking a full instruction manual and copying only the pages needed by a particular form validator.
 
 #### Function details
 
@@ -1859,11 +1895,11 @@ The internal `schema_for` function builds a `schemars` generator from `SchemaSet
 fn input_schema_for() -> Value
 ```
 
-**Purpose**: Builds the JSON Schema used for tool input parameters, without adding `null` to optional-field types.
+**Purpose**: Creates a JSON Schema for data that will be accepted as input. It is used when the system needs to describe what callers are allowed to send in.
 
-**Data flow**: It is generic over `T: JsonSchema`, passes `false` into `schema_for`, and returns the resulting `serde_json::Value` unchanged.
+**Data flow**: It receives a Rust type through its generic parameter, as long as that type knows how to describe itself as JSON Schema. It passes that type to the shared schema builder with the setting that optional values should not automatically include null. It returns the resulting schema as a JSON value.
 
-**Call relations**: Tool-spec construction uses this for request argument schemas so model-facing parameter definitions stay strict. It is a convenience wrapper over `schema_for`.
+**Call relations**: This is a small front door into the shared schema-building logic. When code needs an input schema, it calls this function, which delegates the real work to schema_for with the input-specific setting.
 
 
 ##### `output_schema_for`  (lines 10–12)
@@ -1872,11 +1908,11 @@ fn input_schema_for() -> Value
 fn output_schema_for() -> Value
 ```
 
-**Purpose**: Builds the JSON Schema used for tool outputs, allowing optional fields to advertise `null` where appropriate.
+**Purpose**: Creates a JSON Schema for data that the system may produce as output. It allows optional output fields to be represented as null, which is common when a value is intentionally absent.
 
-**Data flow**: It is generic over `T: JsonSchema`, passes `true` into `schema_for`, and returns the resulting `serde_json::Value`.
+**Data flow**: It receives a Rust type through its generic parameter. It sends that type to the shared schema builder with the setting that optional values should include null as an allowed type. It returns the cleaned-up schema as a JSON value.
 
-**Call relations**: Tool-spec construction uses this for response schemas attached to function tools. Like `input_schema_for`, it simply selects one configuration of `schema_for`.
+**Call relations**: This is the output-focused front door into the shared schema-building logic. Code that needs to publish or validate an output shape calls this function, and it asks schema_for to do the actual generation with output-friendly rules.
 
 
 ##### `schema_for`  (lines 14–42)
@@ -1885,11 +1921,11 @@ fn output_schema_for() -> Value
 fn schema_for(option_add_null_type: bool) -> Value
 ```
 
-**Purpose**: Generates a root schema for a Rust type, serializes it to JSON, and trims it down to the subset of top-level keys the tool layer wants to expose.
+**Purpose**: Builds the actual JSON Schema for a Rust type and trims it down to the fields this project wants to expose. This keeps schema generation consistent for both inputs and outputs.
 
-**Data flow**: It takes a boolean controlling `option_add_null_type`, creates draft-2019-09 schema settings, mutates them to inline subschemas and apply the nullability flag, generates a root schema for `T`, serializes that schema with `serde_json::to_value`, and pattern-matches the result into an object map. It then removes selected keys from the generated object and inserts them into a fresh `Map`, finally returning `Value::Object(tool_schema)`.
+**Data flow**: It takes a yes-or-no setting that says whether optional values should also allow null. It creates schema-generation settings, asks schemars to generate a root schema for the given Rust type, converts that schema into ordinary JSON, checks that the root is a JSON object, and then copies only selected top-level fields such as properties, required, type, and definitions into a new JSON object. The returned value is the simplified schema.
 
-**Call relations**: Both `input_schema_for` and `output_schema_for` funnel through this implementation. It delegates schema generation to `schemars` and enforces internal invariants with panic/unreachable paths because malformed generated schemas are treated as programmer errors.
+**Call relations**: This function is the shared engine behind input_schema_for and output_schema_for. Inside, it relies on external library calls from schemars to build the schema and serde_json to turn it into JSON. If schema generation ever produced something impossible, such as a non-object root schema, the function treats that as a programmer error rather than trying to recover.
 
 *Call graph*: 5 external calls (new, draft2019_09, Object, to_value, unreachable!).
 
@@ -1898,9 +1934,11 @@ fn schema_for(option_add_null_type: bool) -> Value
 
 `config` · `cross-cutting`
 
-This file is a tiny but important shared syntax definition module. It exports two public `char` constants: `TOOL_MENTION_SIGIL`, set to `$`, and `PLUGIN_TEXT_MENTION_SIGIL`, set to `@`. The accompanying comments clarify the intended semantics: `$` is the default plaintext sigil for tools, while `@` is used for plugins in linked plaintext outside the TUI.
+When people write plain text that refers to a tool or plugin, the system needs a simple way to spot that reference. This file names the two marker characters, or “sigils,” used for that purpose. A sigil is a leading symbol, like the dollar sign in `$tool`, that tells the reader or program, “the next word has a special meaning.”
 
-Although there is no executable logic, centralizing these values avoids subtle drift between crates that generate, parse, or display mentions. Any code that tokenizes user text, renders references, or maps plaintext mentions to plugin/tool entities can depend on these constants instead of hard-coding punctuation. The distinction between tool and plugin sigils also documents a design choice in the user-facing syntax: tools and plugins occupy different namespaces in plaintext and are visually differentiated by separate prefix characters. Because these are plain constants, the module is active wherever mention syntax is needed, with no state or side effects.
+The file sets `$` as the default marker for tools, and `@` as the marker for plugins in linked plain text outside the terminal user interface. By putting these choices in one shared file, the rest of the codebase can import the same constants instead of hard-coding the characters in many places. That matters because if one part of the system looked for `$` while another produced `@` for the same kind of mention, links or references could fail in confusing ways.
+
+There are no functions here because nothing needs to be calculated. The file acts like a small shared dictionary of punctuation rules for plugin-related text.
 
 
 ### Network policy and proxy configuration
@@ -1910,9 +1948,11 @@ This cluster covers the error model, host and domain normalization rules, and th
 
 `data_model` · `cross-cutting error reporting`
 
-This module centralizes error representation for the execpolicy crate. It introduces lightweight position types—`TextPosition`, `TextRange`, and `ErrorLocation`—that describe a path plus 1-based line/column spans. The main `Error` enum covers invalid decisions, patterns, examples, and rules; example/rule consistency failures with optional attached locations; and wrapped `starlark::Error` values. The exported `Result<T>` alias standardizes use of this error type across parsing and validation code.
+This file is the project’s error-reporting vocabulary for execution policy code. Instead of every part of the program inventing its own failure messages, it defines one `Error` enum, which is a list of known problem types such as an invalid rule, an invalid example, or an error coming from Starlark, the embedded configuration language.
 
-The two methods on `Error` are about location propagation and extraction. `with_location` is intentionally selective: it only attaches a provided `ErrorLocation` to `ExampleDidNotMatch` and `ExampleDidMatch` when those variants currently have `location: None`; all other variants, or already-located example errors, are returned unchanged. That preserves original context instead of overwriting it. `location` performs the inverse lookup. For the example mismatch variants it clones and returns the stored location. For `Error::Starlark`, it derives an `ErrorLocation` from the Starlark span by resolving the span and converting begin/end coordinates from zero-based to one-based indexing. All other variants report no location. This design lets callers uniformly ask for source context even when the underlying error originated in different subsystems.
+It also defines small location types: `TextPosition`, `TextRange`, and `ErrorLocation`. These describe where a problem happened in a file: the file path, the starting line and column, and the ending line and column. This matters because policy files are read by people. A message like “example matched when it should not” is much more useful when it can point to the exact place in the source text.
+
+Two special error cases, `ExampleDidNotMatch` and `ExampleDidMatch`, can carry an optional location. The file provides helper methods to add that location later, or to ask an error whether it knows where it came from. For Starlark errors, it can translate Starlark’s own span information into this crate’s simpler `ErrorLocation` shape. Without this file, callers would have less consistent error messages and weaker links between failures and the policy text that caused them.
 
 #### Function details
 
@@ -1922,11 +1962,11 @@ The two methods on `Error` are about location propagation and extraction. `with_
 fn with_location(self, location: ErrorLocation) -> Self
 ```
 
-**Purpose**: Attaches an `ErrorLocation` to example-mismatch errors that do not already have one. It leaves all other error variants untouched, preserving existing context.
+**Purpose**: Adds a source-code location to certain example-related errors, but only if they do not already have one. This lets code create the error first and attach the file position later when that position becomes known.
 
-**Data flow**: It consumes `self` and a provided `location: ErrorLocation`. Through pattern matching, it rewrites `Error::ExampleDidNotMatch` and `Error::ExampleDidMatch` only when their `location` field is `None`, returning a new enum value with `Some(location)`. If the variant already has a location or is any other `Error` variant, it returns the original error unchanged.
+**Data flow**: It takes an existing `Error` and an `ErrorLocation`, which contains a file path and text range. If the error is `ExampleDidNotMatch` or `ExampleDidMatch` and its location is currently empty, it returns a new version of that same error with the location filled in. For all other errors, or for example errors that already have a location, it returns the original error unchanged.
 
-**Call relations**: This is a utility method for callers that enrich validation errors after construction. It does not call other crate functions; its role is to preserve or add source metadata at error propagation boundaries.
+**Call relations**: This method is used as a finishing step in error creation: after another part of the policy checker detects a mismatch involving examples, it can call this to pin the error to a place in the source file. It does not call out to other project code; it simply reshapes the error value before it is handed upward to whoever will display or return it.
 
 
 ##### `Error::location`  (lines 78–100)
@@ -1935,22 +1975,24 @@ fn with_location(self, location: ErrorLocation) -> Self
 fn location(&self) -> Option<ErrorLocation>
 ```
 
-**Purpose**: Extracts a normalized `ErrorLocation` from an error when one is available directly or can be derived from a wrapped Starlark span. It gives callers a uniform way to retrieve source coordinates.
+**Purpose**: Looks at an error and returns the best source-code location known for it, if there is one. This is useful for showing users where to look in a policy file when something goes wrong.
 
-**Data flow**: It borrows `self` and pattern-matches on the error variant. For `ExampleDidNotMatch` and `ExampleDidMatch`, it clones and returns the stored `Option<ErrorLocation>`. For `Error::Starlark(err)`, it queries `err.span()`, resolves the span if present, and constructs a new `ErrorLocation` with the filename and a `TextRange` whose line and column values are incremented by 1 from the resolved zero-based coordinates. All other variants return `None`.
+**Data flow**: It reads the current `Error`. For example-matching errors, it copies out the stored `ErrorLocation` if present. For a Starlark error, it asks Starlark for its span, converts that span into this crate’s path, start position, and end position, and adjusts line and column numbers into the usual human-friendly one-based form. For errors that do not carry location information, it returns nothing.
 
-**Call relations**: This method is used wherever higher layers need to display or serialize source locations for errors. It is self-contained except for consulting the wrapped Starlark error's span metadata.
+**Call relations**: This method sits at the reporting boundary: when higher-level code needs to present an error to a person, it can call `location` to find out whether the message can include a file position. It bridges internal errors from this crate and location data supplied by Starlark, turning both into the same simple `ErrorLocation` format.
 
 
 ### `network-proxy/src/policy.rs`
 
-`domain_logic` · `config compilation and per-request host evaluation`
+`domain_logic` · `config load and request handling`
 
-This file turns messy host inputs and user-configured domain patterns into normalized, comparable forms. `Host` is a thin validated wrapper around a normalized host string; `Host::parse` trims whitespace, lowercases DNS names, strips trailing dots, removes brackets around IPv6 literals, and defensively strips `:port` only when there is exactly one colon so unbracketed IPv6 is preserved. Scoped IPv6 literals are normalized so `%25` and `%` forms become a consistent `%scope` representation.
+A network proxy sits between a client and the outside network, so it needs clear rules about where traffic may go. This file is the rulebook for host names, IP addresses, and domain patterns. Without it, the proxy could treat the same host differently depending on spelling, or accidentally allow requests to private addresses such as `localhost`, `127.0.0.1`, or internal network ranges. That matters for preventing server-side request forgery, often called SSRF: an attacker tricking a server into connecting to places it should not.
 
-For SSRF-style protections, `is_loopback_host` recognizes `localhost`, loopback IP literals, and scoped IP literals after removing the scope for classification. `is_non_public_ip` delegates to IPv4/IPv6 helpers that treat loopback, RFC1918, link-local, unspecified, multicast, CGNAT, TEST-NET, benchmarking, and reserved ranges as non-public. IPv6-mapped IPv4 addresses are reduced back through the IPv4 classifier.
+The file first defines `Host`, a small wrapper around a normalized host string. Normalizing means trimming spaces, lowercasing names, removing harmless trailing dots, stripping ports when safe, and handling IPv6 brackets and scope IDs. This is like writing every address in the same handwriting before comparing it.
 
-Pattern handling is split between glob compilation and semantic comparison. `normalize_pattern` preserves leading `*.` or `**.` wildcard prefixes while normalizing the remainder like a host. `compile_globset_with_policy` expands `*.example.com` into `?*.example.com` so the apex does not match, expands `**.example.com` into both `example.com` and `?*.example.com`, deduplicates candidates, and rejects global wildcard patterns for deny lists. Separately, `DomainPattern` parses patterns into `Exact`, `SubdomainsOnly`, or `ApexAndSubdomains` so constraint checks can ask whether one managed pattern semantically allows another without relying on glob syntax internals.
+It then classifies addresses. It can tell whether a host is loopback, meaning it points back to the same machine, and whether an IP address is non-public, meaning it belongs to private, local, testing, multicast, reserved, or otherwise not globally reachable ranges.
+
+Finally, it compiles human-friendly domain rules into glob sets, which are efficient pattern matchers. It supports exact hosts, one-level-or-more subdomain patterns like `*.example.com`, apex-plus-subdomain patterns like `**.example.com`, and carefully controls the global `*` wildcard so deny rules cannot accidentally block everything.
 
 #### Function details
 
@@ -1960,11 +2002,11 @@ Pattern handling is split between glob compilation and semantic comparison. `nor
 fn parse(input: &str) -> Result<Self>
 ```
 
-**Purpose**: Normalizes an input host string and rejects the empty result.
+**Purpose**: Creates a `Host` value from raw text after putting it into the proxy's standard host format. It rejects an empty result so later policy checks do not compare against a meaningless blank host.
 
-**Data flow**: Takes `&str`, passes it through `normalize_host`, checks with `ensure!` that the normalized string is non-empty, and returns `Ok(Host(normalized))` or an error.
+**Data flow**: It receives a string from another part of the proxy, sends it through `normalize_host`, checks that the normalized text is not empty, and returns either a `Host` containing that clean text or an error.
 
-**Call relations**: Called by runtime host checks and domain-list mutation paths so later policy logic always works with normalized host strings.
+**Call relations**: When code such as `host_blocked` or `update_domain_list` needs to evaluate a host against policy, it calls this first so all later checks work with a consistent spelling.
 
 *Call graph*: calls 1 internal fn (normalize_host); called by 2 (host_blocked, update_domain_list); 1 external calls (ensure!).
 
@@ -1975,11 +2017,11 @@ fn parse(input: &str) -> Result<Self>
 fn as_str(&self) -> &str
 ```
 
-**Purpose**: Exposes the normalized inner host string.
+**Purpose**: Gives read-only access to the normalized host text inside a `Host`. This lets policy checks inspect the host without changing it.
 
-**Data flow**: Borrows `self.0` and returns `&str`.
+**Data flow**: It takes an existing `Host`, reads its stored string, and returns that string as a borrowed view. Nothing is modified.
 
-**Call relations**: Used by loopback checks and explicit-local-allowlist matching in runtime policy evaluation.
+**Call relations**: `is_loopback_host` and `is_explicit_local_allowlisted` call this when they need the plain host text for comparisons.
 
 *Call graph*: called by 2 (is_loopback_host, is_explicit_local_allowlisted).
 
@@ -1990,11 +2032,11 @@ fn as_str(&self) -> &str
 fn is_loopback_host(host: &Host) -> bool
 ```
 
-**Purpose**: Determines whether a normalized host refers to localhost or a loopback IP literal.
+**Purpose**: Answers whether a host points back to the same machine, such as `localhost`, `127.0.0.1`, or `::1`. This is important because proxies often must prevent outside requests from reaching local-only services.
 
-**Data flow**: Reads `host.as_str()`, strips any IPv6 scope with `unscoped_ip_literal`, compares against `localhost`, otherwise parses as `IpAddr` and returns `ip.is_loopback()`, falling back to `false`.
+**Data flow**: It receives a normalized `Host`, reads its string, removes an IPv6 scope suffix if present, checks for the special name `localhost`, then tries to parse the host as an IP address and asks whether that IP is loopback. It returns true or false.
 
-**Call relations**: Called by `NetworkProxyState::host_blocked` as part of local/private-network protection.
+**Call relations**: `host_blocked` calls this during request policy checks. Internally it uses `Host::as_str` to read the host and `unscoped_ip_literal` to compare scoped IP literals safely.
 
 *Call graph*: calls 2 internal fn (as_str, unscoped_ip_literal); called by 1 (host_blocked).
 
@@ -2005,11 +2047,11 @@ fn is_loopback_host(host: &Host) -> bool
 fn is_non_public_ip(ip: IpAddr) -> bool
 ```
 
-**Purpose**: Classifies an IP address as non-public regardless of whether it is IPv4 or IPv6.
+**Purpose**: Classifies an IP address as not publicly reachable or otherwise unsafe for open proxying. This includes private networks, loopback, link-local, multicast, testing, and reserved ranges.
 
-**Data flow**: Matches on `IpAddr` and delegates to `is_non_public_ipv4` or `is_non_public_ipv6`, returning the boolean result.
+**Data flow**: It receives either an IPv4 or IPv6 address, chooses the matching helper, and returns true if the address belongs to a non-public category.
 
-**Call relations**: Used by runtime host checks, DNS-resolution checks, and connection policy enforcement.
+**Call relations**: Connection and blocking paths such as `connect`, `host_blocked`, and `host_resolves_to_non_public_ip` call this before allowing traffic to proceed.
 
 *Call graph*: calls 2 internal fn (is_non_public_ipv4, is_non_public_ipv6); called by 3 (connect, host_blocked, host_resolves_to_non_public_ip).
 
@@ -2020,11 +2062,11 @@ fn is_non_public_ip(ip: IpAddr) -> bool
 fn is_non_public_ipv4(ip: Ipv4Addr) -> bool
 ```
 
-**Purpose**: Recognizes IPv4 addresses that should be treated as local/internal/non-public for sandboxing.
+**Purpose**: Checks an IPv4 address against the set of local, private, reserved, testing, and special-use IPv4 ranges. This is the detailed IPv4 part of the proxy's safety check.
 
-**Data flow**: Reads an `Ipv4Addr`, checks stdlib predicates (`is_loopback`, `is_private`, `is_link_local`, `is_unspecified`, `is_multicast`, `is_broadcast`) and several explicit CIDR ranges via `ipv4_in_cidr`, then returns whether any match.
+**Data flow**: It receives an IPv4 address, applies built-in address classification checks where available, then checks extra special ranges using CIDR matching. It returns true when the address is not considered public.
 
-**Call relations**: Called directly for IPv4 inputs and indirectly from IPv6 classification for IPv4-mapped addresses.
+**Call relations**: `is_non_public_ip` calls this for normal IPv4 addresses, and `is_non_public_ipv6` calls it for IPv6 addresses that contain an embedded IPv4 address.
 
 *Call graph*: calls 1 internal fn (ipv4_in_cidr); called by 2 (is_non_public_ip, is_non_public_ipv6); 6 external calls (is_broadcast, is_link_local, is_loopback, is_multicast, is_private, is_unspecified).
 
@@ -2035,11 +2077,11 @@ fn is_non_public_ipv4(ip: Ipv4Addr) -> bool
 fn ipv4_in_cidr(ip: Ipv4Addr, base: [u8; 4], prefix: u8) -> bool
 ```
 
-**Purpose**: Tests whether an IPv4 address falls within a given CIDR block.
+**Purpose**: Checks whether an IPv4 address falls inside a particular CIDR range. A CIDR range is a compact way to describe a block of IP addresses, like saying 'all addresses starting with these bits.'
 
-**Data flow**: Converts the IP and base address to `u32`, computes a prefix mask (special-casing prefix 0), compares masked values, and returns the equality result.
+**Data flow**: It receives an IPv4 address, a base address, and a prefix length. It converts both addresses to numbers, builds a bit mask, compares the shared prefix bits, and returns true if they match.
 
-**Call relations**: Internal helper used by `is_non_public_ipv4` for ranges not covered by stable stdlib helpers.
+**Call relations**: `is_non_public_ipv4` uses this for special IPv4 ranges that the standard library does not fully classify on its own.
 
 *Call graph*: called by 1 (is_non_public_ipv4); 2 external calls (from, from).
 
@@ -2050,11 +2092,11 @@ fn ipv4_in_cidr(ip: Ipv4Addr, base: [u8; 4], prefix: u8) -> bool
 fn is_non_public_ipv6(ip: Ipv6Addr) -> bool
 ```
 
-**Purpose**: Recognizes IPv6 addresses that are not globally routable and should be treated as local/internal.
+**Purpose**: Checks whether an IPv6 address is local, private-like, multicast, unspecified, or otherwise not globally routable. It also handles IPv6 addresses that wrap an IPv4 address.
 
-**Data flow**: If the IPv6 address maps to IPv4, delegates to `is_non_public_ipv4(v4)` and also checks IPv6 loopback. Otherwise checks loopback, unspecified, multicast, unique-local, and unicast link-local predicates and returns whether any are true.
+**Data flow**: It receives an IPv6 address. If the address contains an IPv4 address, it checks that embedded IPv4 address too. Otherwise it applies IPv6-specific local and special-range tests, then returns true or false.
 
-**Call relations**: Called by `is_non_public_ip` for IPv6 inputs.
+**Call relations**: `is_non_public_ip` calls this for IPv6 inputs. It delegates embedded IPv4 cases to `is_non_public_ipv4` so the same IPv4 safety rules apply everywhere.
 
 *Call graph*: calls 1 internal fn (is_non_public_ipv4); called by 1 (is_non_public_ip); 6 external calls (is_loopback, is_multicast, is_unicast_link_local, is_unique_local, is_unspecified, to_ipv4).
 
@@ -2065,11 +2107,11 @@ fn is_non_public_ipv6(ip: Ipv6Addr) -> bool
 fn normalize_host(host: &str) -> String
 ```
 
-**Purpose**: Canonicalizes host fragments for policy matching while preserving unbracketed IPv6 literals.
+**Purpose**: Turns host text into a predictable form before any policy comparison. It trims spaces, lowercases domain names, removes IPv6 brackets, strips a simple `:port`, and treats trailing-dot domain names the same as ordinary ones.
 
-**Data flow**: Trims whitespace; if the string starts with `[` and contains `]`, extracts the bracketed portion and normalizes it; otherwise, if there is exactly one colon, strips the trailing `:port`; finally delegates to `normalize_dns_host_or_ip_literal`. Returns the normalized `String`.
+**Data flow**: It receives raw host text, detects bracketed IPv6 and simple host-plus-port forms, then passes the host portion to `normalize_dns_host_or_ip_literal`. The output is a cleaned string suitable for matching.
 
-**Call relations**: This is the central normalization routine used by HTTP/SOCKS handlers, MITM code, host parsing, and pattern normalization.
+**Call relations**: Many request and MITM policy paths call this before deciding what to do with a host, including HTTP proxy handling, CONNECT handling, hook evaluation, and `Host::parse`.
 
 *Call graph*: calls 1 internal fn (normalize_dns_host_or_ip_literal); called by 12 (http_connect_accept, http_connect_proxy, http_plain_proxy, evaluate_mitm_policy, mitm_stream, evaluate_mitm_hooks, normalize_hook_host, parse, normalize_pattern, host_has_mitm_hooks (+2 more)).
 
@@ -2080,11 +2122,11 @@ fn normalize_host(host: &str) -> String
 fn normalize_dns_host_or_ip_literal(host: &str) -> String
 ```
 
-**Purpose**: Lowercases DNS names, strips trailing dots, and preserves normalized IP literals including scoped IPv6.
+**Purpose**: Applies the final shared cleanup for either a DNS name or an IP literal. DNS means a normal name like `example.com`; an IP literal means an address written directly, like `::1`.
 
-**Data flow**: Lowercases the input, trims trailing `.`, tries `normalize_ip_literal`, and returns either the normalized IP string or the lowercased hostname.
+**Data flow**: It lowercases the host, removes trailing dots, asks `normalize_ip_literal` whether the result is an IP address that needs special handling, and returns either the normalized IP string or the normalized domain string.
 
-**Call relations**: Used only by `normalize_host` after bracket/port handling.
+**Call relations**: `normalize_host` calls this after it has dealt with brackets and simple ports.
 
 *Call graph*: calls 1 internal fn (normalize_ip_literal); called by 1 (normalize_host).
 
@@ -2095,11 +2137,11 @@ fn normalize_dns_host_or_ip_literal(host: &str) -> String
 fn unscoped_ip_literal(host: &str) -> Option<&str>
 ```
 
-**Purpose**: Extracts the IP portion of a scoped IP literal if the prefix parses as an IP address.
+**Purpose**: Removes the scope part from an IP literal when one is present, after confirming the part before `%` is a real IP address. IPv6 scope IDs name a local network interface, such as `%lo0`.
 
-**Data flow**: Splits the host once on `%`; if present and the left side parses as `IpAddr`, returns `Some(ip_part)`, otherwise `None`.
+**Data flow**: It receives host text, splits it at `%`, verifies that the left side parses as an IP address, and returns that left side if valid. If the host is not a scoped IP literal, it returns nothing.
 
-**Call relations**: Used by loopback checks and runtime matching so scoped IPv6 literals can be compared against unscoped allow/deny entries.
+**Call relations**: `is_loopback_host`, `host_blocked`, `globset_matches_host_or_unscoped`, and `is_explicit_local_allowlisted` use this when policy should compare the address itself without being confused by the local scope label.
 
 *Call graph*: called by 4 (is_loopback_host, host_blocked, globset_matches_host_or_unscoped, is_explicit_local_allowlisted).
 
@@ -2110,11 +2152,11 @@ fn unscoped_ip_literal(host: &str) -> Option<&str>
 fn normalize_ip_literal(host: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes plain or scoped IP literals into a consistent string representation.
+**Purpose**: Recognizes IP addresses written directly and normalizes scoped IPv6 spellings. In particular, it treats `%25` in bracketed URLs as the same scope separator as `%`.
 
-**Data flow**: If the whole host parses as `IpAddr`, returns it unchanged as `String`. Otherwise tries delimiters `%25` and `%`; when the left side parses as an IP, returns `format!("{ip}%{scope}")`. Returns `None` if the input is not an IP literal.
+**Data flow**: It receives lowercase host text. If the whole string is an IP address, it returns it. Otherwise it looks for `%25` or `%`, confirms the part before it is an IP address, and returns the IP plus a normalized `%scope` suffix.
 
-**Call relations**: Called by `normalize_dns_host_or_ip_literal` to preserve IP literals rather than treating them as ordinary hostnames.
+**Call relations**: `normalize_dns_host_or_ip_literal` calls this so IP literals are preserved and scope IDs are made consistent before policy matching.
 
 *Call graph*: called by 1 (normalize_dns_host_or_ip_literal); 1 external calls (format!).
 
@@ -2125,11 +2167,11 @@ fn normalize_ip_literal(host: &str) -> Option<String>
 fn normalize_pattern(pattern: &str) -> String
 ```
 
-**Purpose**: Normalizes a configured domain pattern while preserving supported wildcard prefixes.
+**Purpose**: Normalizes a domain rule pattern while preserving its wildcard meaning. For example, it can clean `*.Example.COM.` into `*.example.com`.
 
-**Data flow**: Trims the pattern, returns `*` unchanged for the global wildcard, strips and remembers a leading `**.` or `*.` prefix if present, normalizes the remainder with `normalize_host`, then reattaches the prefix if needed.
+**Data flow**: It receives a pattern string, trims it, preserves a bare `*`, separates special prefixes like `*.` or `**.`, normalizes the domain part with `normalize_host`, and returns the rebuilt pattern.
 
-**Call relations**: Used before wildcard detection and glob compilation so pattern matching is case-insensitive and trailing-dot tolerant.
+**Call relations**: `compile_globset_with_policy` calls this before compiling patterns, and `is_global_wildcard_domain_pattern` calls it before checking whether a pattern expands to `*`.
 
 *Call graph*: calls 1 internal fn (normalize_host); called by 2 (compile_globset_with_policy, is_global_wildcard_domain_pattern); 1 external calls (format!).
 
@@ -2140,11 +2182,11 @@ fn normalize_pattern(pattern: &str) -> String
 fn is_global_wildcard_domain_pattern(pattern: &str) -> bool
 ```
 
-**Purpose**: Detects whether a pattern semantically expands to a global wildcard match.
+**Purpose**: Detects whether a domain pattern effectively means 'match every host.' This matters because such a rule is allowed in some allowlist cases but rejected for denylists.
 
-**Data flow**: Normalizes the pattern, expands it with `expand_domain_pattern`, and returns true if any expanded candidate equals `*`.
+**Data flow**: It receives pattern text, normalizes it, expands it into the actual matching candidates, and returns true if any candidate is exactly `*`.
 
-**Call relations**: Used to reject unsupported global wildcard patterns in deny lists and managed constraints.
+**Call relations**: `compile_globset_with_policy` uses this when building a denylist so it can reject a global wildcard before it becomes an overly broad block rule.
 
 *Call graph*: calls 2 internal fn (expand_domain_pattern, normalize_pattern); called by 1 (compile_globset_with_policy).
 
@@ -2155,11 +2197,11 @@ fn is_global_wildcard_domain_pattern(pattern: &str) -> bool
 fn compile_allowlist_globset(patterns: &[String]) -> Result<GlobSet>
 ```
 
-**Purpose**: Compiles allowlist patterns into a `GlobSet`, permitting explicit global wildcard patterns.
+**Purpose**: Builds an efficient matcher for allowed host patterns. Unlike denylists, it permits the global `*` wildcard when the caller explicitly wants an allow-everything rule.
 
-**Data flow**: Passes the pattern slice and `GlobalWildcard::Allow` to `compile_globset_with_policy` and returns the resulting `GlobSet` or error.
+**Data flow**: It receives a list of pattern strings and passes them to the shared compiler with the policy that global wildcards are allowed. It returns a compiled `GlobSet` or an error.
 
-**Call relations**: Called when building runtime config state and in tests validating allowlist behavior.
+**Call relations**: Configuration-building paths such as `network_proxy_state_for_policy` and `build_config_state` call this when turning allowlist settings into something fast to use during requests.
 
 *Call graph*: calls 1 internal fn (compile_globset_with_policy); called by 3 (network_proxy_state_for_policy, compile_globset_allows_global_wildcard_when_enabled, build_config_state).
 
@@ -2170,11 +2212,11 @@ fn compile_allowlist_globset(patterns: &[String]) -> Result<GlobSet>
 fn compile_denylist_globset(patterns: &[String]) -> Result<GlobSet>
 ```
 
-**Purpose**: Compiles denylist patterns into a `GlobSet`, rejecting global wildcard patterns.
+**Purpose**: Builds an efficient matcher for blocked host patterns. It rejects a bare global wildcard so a denylist cannot accidentally mean 'block every possible host.'
 
-**Data flow**: Delegates to `compile_globset_with_policy` with `GlobalWildcard::Reject`.
+**Data flow**: It receives a list of pattern strings and passes them to the shared compiler with the policy that global wildcards are rejected. It returns a compiled `GlobSet` or an error.
 
-**Call relations**: Used during config-state construction and by tests covering denylist normalization and validation.
+**Call relations**: The proxy's configuration setup and many tests call this to turn denylist settings into matchers. It relies on `compile_globset_with_policy` for the actual normalization and compilation.
 
 *Call graph*: calls 1 internal fn (compile_globset_with_policy); called by 12 (compile_globset_normalizes_apex_and_subdomains, compile_globset_normalizes_bracketed_ipv6_literals, compile_globset_normalizes_trailing_dots, compile_globset_normalizes_wildcards, compile_globset_preserves_scoped_ipv6_literals, compile_globset_supports_mid_label_wildcards, network_proxy_state_for_policy, compile_globset_dedupes_patterns_without_changing_behavior, compile_globset_excludes_apex_for_subdomain_patterns, compile_globset_includes_apex_for_double_wildcard_patterns (+2 more)).
 
@@ -2188,11 +2230,11 @@ fn compile_globset_with_policy(
 ) -> Result<GlobSet>
 ```
 
-**Purpose**: Normalizes, validates, expands, deduplicates, and compiles domain patterns into a case-insensitive `GlobSet` under either allowlist or denylist wildcard rules.
+**Purpose**: Does the real work of turning human-written host patterns into a `GlobSet`, an efficient collection of wildcard match rules. It also enforces whether `*` is allowed.
 
-**Data flow**: Creates a `GlobSetBuilder` and `HashSet` of seen candidates. For each input pattern, optionally rejects global wildcards, normalizes it, expands it into one or more concrete glob candidates, skips duplicates, builds each candidate with `GlobBuilder::case_insensitive(true)`, adds it to the builder, then builds and returns the final `GlobSet`.
+**Data flow**: It receives pattern strings and a wildcard policy. For each pattern it may reject a global wildcard, normalizes the pattern, expands domain shorthand into concrete glob patterns, skips duplicates, builds each glob case-insensitively, and returns the finished matcher.
 
-**Call relations**: Shared implementation behind both allowlist and denylist compilation.
+**Call relations**: Both `compile_allowlist_globset` and `compile_denylist_globset` use this shared path so allowlists and denylists interpret domain syntax the same way, except for the global wildcard rule.
 
 *Call graph*: calls 3 internal fn (expand_domain_pattern, is_global_wildcard_domain_pattern, normalize_pattern); called by 2 (compile_allowlist_globset, compile_denylist_globset); 4 external calls (new, new, new, bail!).
 
@@ -2203,11 +2245,11 @@ fn compile_globset_with_policy(
 fn parse(input: &str) -> Self
 ```
 
-**Purpose**: Parses a pattern into a semantic wildcard form without validating domain syntax.
+**Purpose**: Interprets a domain pattern as one of three meanings: exact host, subdomains only, or apex plus subdomains. The apex is the base domain itself, such as `example.com`.
 
-**Data flow**: Trims input, returns `Exact("")` for empty strings, recognizes `**.` as `ApexAndSubdomains`, `*.` as `SubdomainsOnly`, and otherwise returns `Exact(input.to_string())`, using `parse_domain` for wildcard cases.
+**Data flow**: It receives trimmed pattern text, checks for `**.` or `*.` prefixes, and returns the matching `DomainPattern` variant with the remaining domain text. Empty input becomes an exact empty pattern.
 
-**Call relations**: Used by `expand_domain_pattern` to interpret wildcard prefixes cheaply.
+**Call relations**: `expand_domain_pattern` calls this when converting policy syntax into glob strings for matching.
 
 *Call graph*: called by 1 (expand_domain_pattern); 3 external calls (Exact, parse_domain, new).
 
@@ -2218,11 +2260,11 @@ fn parse(input: &str) -> Self
 fn parse_for_constraints(input: &str) -> Self
 ```
 
-**Purpose**: Parses a pattern for managed-constraint comparisons while validating domain-like inputs through `url::Host` parsing.
+**Purpose**: Parses a domain pattern for comparing policy constraints, while also validating and normalizing domain parts through the URL library when possible.
 
-**Data flow**: Trims input, handles empty strings, recognizes `**.` and `*.` prefixes, normalizes the remainder with `parse_domain_for_constraints`, and returns the corresponding `DomainPattern` variant.
+**Data flow**: It receives pattern text, checks the same wildcard prefixes as `parse`, sends the domain portion through `parse_domain_for_constraints`, and returns a `DomainPattern` variant.
 
-**Call relations**: Used by constraint validation to compare candidate patterns against managed baselines semantically.
+**Call relations**: No caller is shown in the provided graph, but this function is designed for constraint comparison code that needs cleaner, validated domain names before using `DomainPattern::allows`.
 
 *Call graph*: calls 1 internal fn (parse_domain_for_constraints); 4 external calls (ApexAndSubdomains, Exact, SubdomainsOnly, new).
 
@@ -2233,11 +2275,11 @@ fn parse_for_constraints(input: &str) -> Self
 fn parse_domain(domain: &str, build: impl FnOnce(String) -> Self) -> Self
 ```
 
-**Purpose**: Helper for wildcard parsing that trims the domain portion and collapses empty wildcard domains to `Exact("")`.
+**Purpose**: Small helper used while parsing wildcard domain patterns. It avoids creating wildcard variants with an empty domain.
 
-**Data flow**: Trims the domain string; if empty returns `Exact(String::new())`, otherwise applies the supplied constructor to `domain.to_string()`.
+**Data flow**: It receives a domain fragment and a builder function for the desired pattern kind. After trimming, it returns an exact empty pattern if the domain is blank, or calls the builder with the domain string.
 
-**Call relations**: Internal helper used by `DomainPattern::parse`.
+**Call relations**: `DomainPattern::parse` uses this after it has identified whether the input began with `*.` or `**.`.
 
 *Call graph*: 2 external calls (Exact, new).
 
@@ -2248,11 +2290,11 @@ fn parse_domain(domain: &str, build: impl FnOnce(String) -> Self) -> Self
 fn allows(&self, candidate: &DomainPattern) -> bool
 ```
 
-**Purpose**: Determines whether one semantic domain pattern permits another exact or wildcard candidate pattern.
+**Purpose**: Decides whether one domain pattern is broad enough to include another. This is useful when checking whether a requested or configured rule fits inside a permitted constraint.
 
-**Data flow**: Matches on `self` and `candidate`, then uses `domain_eq`, `is_strict_subdomain`, or `is_subdomain_or_equal` to decide whether the candidate is equal to or narrower than the managed pattern. Returns a boolean.
+**Data flow**: It receives the current pattern and a candidate pattern. It compares exact names, subdomain relationships, and apex-plus-subdomain relationships, then returns true if the current pattern covers the candidate.
 
-**Call relations**: Used by managed-constraint validation to ensure user-supplied allowlist entries do not widen the managed baseline.
+**Call relations**: No direct caller is shown in the provided graph. Inside, it uses `domain_eq`, `is_subdomain_or_equal`, and `is_strict_subdomain` to make the coverage decision.
 
 *Call graph*: calls 3 internal fn (domain_eq, is_strict_subdomain, is_subdomain_or_equal).
 
@@ -2263,11 +2305,11 @@ fn allows(&self, candidate: &DomainPattern) -> bool
 fn parse_domain_for_constraints(domain: &str) -> String
 ```
 
-**Purpose**: Normalizes a domain string for constraint comparison, validating ordinary host syntax while preserving wildcard-like or scoped forms as-is.
+**Purpose**: Cleans and validates a domain-like value for constraint comparisons. It avoids treating malformed host text as a real normalized domain.
 
-**Data flow**: Trims whitespace and trailing dots, strips surrounding brackets if present, returns the original domain when it contains `*`, `?`, or `%`, otherwise tries `UrlHost::parse(host)` and returns its normalized string or an empty string on parse failure.
+**Data flow**: It receives a domain string, trims whitespace and a trailing dot, removes surrounding IPv6 brackets when present, leaves wildcard-like or scoped strings alone, and otherwise asks the URL host parser to normalize it. Invalid ordinary host text becomes an empty string.
 
-**Call relations**: Called by `DomainPattern::parse_for_constraints`.
+**Call relations**: `DomainPattern::parse_for_constraints` calls this for the domain portion of exact and wildcard constraint patterns.
 
 *Call graph*: called by 1 (parse_for_constraints); 2 external calls (new, parse).
 
@@ -2278,11 +2320,11 @@ fn parse_domain_for_constraints(domain: &str) -> String
 fn expand_domain_pattern(pattern: &str) -> Vec<String>
 ```
 
-**Purpose**: Expands a semantic domain pattern into one or more glob candidates used by `globset`.
+**Purpose**: Turns the project's domain pattern shorthand into the concrete glob patterns used by the matcher. For example, `**.example.com` becomes one pattern for `example.com` and one for its subdomains.
 
-**Data flow**: Parses the pattern with `DomainPattern::parse`; returns `[domain]` for exact patterns, `["?*.{domain}"]` for subdomains-only patterns, and `[domain, "?*.{domain}"]` for apex-and-subdomains patterns.
+**Data flow**: It receives normalized pattern text, parses it into a `DomainPattern`, and returns a list of one or more glob strings that represent the same meaning.
 
-**Call relations**: Used by wildcard detection and globset compilation.
+**Call relations**: `compile_globset_with_policy` calls this while building matchers, and `is_global_wildcard_domain_pattern` calls it when checking for a global `*`.
 
 *Call graph*: calls 1 internal fn (parse); called by 2 (compile_globset_with_policy, is_global_wildcard_domain_pattern); 1 external calls (vec!).
 
@@ -2293,11 +2335,11 @@ fn expand_domain_pattern(pattern: &str) -> Vec<String>
 fn normalize_domain(domain: &str) -> String
 ```
 
-**Purpose**: Canonicalizes a domain string for equality/subdomain comparisons.
+**Purpose**: Puts a domain into a simple comparison form by removing trailing dots and lowercasing it. This keeps `Example.COM.` and `example.com` from being treated as different domains.
 
-**Data flow**: Strips trailing dots and lowercases ASCII characters, returning the normalized `String`.
+**Data flow**: It receives domain text and returns a lowercase, trailing-dot-free string.
 
-**Call relations**: Shared helper for exact and subdomain comparison functions.
+**Call relations**: `domain_eq`, `is_subdomain_or_equal`, and `is_strict_subdomain` call this before comparing domain relationships.
 
 *Call graph*: called by 3 (domain_eq, is_strict_subdomain, is_subdomain_or_equal).
 
@@ -2308,11 +2350,11 @@ fn normalize_domain(domain: &str) -> String
 fn domain_eq(left: &str, right: &str) -> bool
 ```
 
-**Purpose**: Performs case-insensitive, trailing-dot-insensitive domain equality.
+**Purpose**: Checks whether two domain names are the same after normalizing their spelling. It is a safer equality check for policy comparisons than raw string equality.
 
-**Data flow**: Normalizes both inputs with `normalize_domain` and compares the resulting strings.
+**Data flow**: It receives two domain strings, normalizes both with `normalize_domain`, compares them, and returns true or false.
 
-**Call relations**: Used by `DomainPattern::allows` for exact-pattern comparisons.
+**Call relations**: `DomainPattern::allows` calls this when an exact pattern must match another exact domain.
 
 *Call graph*: calls 1 internal fn (normalize_domain); called by 1 (allows).
 
@@ -2323,11 +2365,11 @@ fn domain_eq(left: &str, right: &str) -> bool
 fn is_subdomain_or_equal(child: &str, parent: &str) -> bool
 ```
 
-**Purpose**: Checks whether one domain is equal to or a descendant of another.
+**Purpose**: Checks whether one domain is either the same as another domain or sits beneath it. For example, `api.example.com` is under `example.com`, and `example.com` is equal to itself.
 
-**Data flow**: Normalizes child and parent, returns true if equal, otherwise checks whether the child ends with `.{parent}`.
+**Data flow**: It receives child and parent domain strings, normalizes both, first checks equality, then checks whether the child ends with `.` plus the parent. It returns true if either condition holds.
 
-**Call relations**: Used by `DomainPattern::allows` for apex-inclusive wildcard semantics.
+**Call relations**: `DomainPattern::allows` uses this for patterns that include the apex domain as well as its subdomains.
 
 *Call graph*: calls 1 internal fn (normalize_domain); called by 1 (allows); 1 external calls (format!).
 
@@ -2338,11 +2380,11 @@ fn is_subdomain_or_equal(child: &str, parent: &str) -> bool
 fn is_strict_subdomain(child: &str, parent: &str) -> bool
 ```
 
-**Purpose**: Checks whether one domain is a proper subdomain of another, excluding equality.
+**Purpose**: Checks whether one domain is beneath another but not exactly the same. For example, `api.example.com` qualifies, but `example.com` does not.
 
-**Data flow**: Normalizes child and parent and returns true only if they differ and the child ends with `.{parent}`.
+**Data flow**: It receives child and parent domain strings, normalizes both, verifies they are not equal, then checks whether the child ends with `.` plus the parent. It returns true or false.
 
-**Call relations**: Used by `DomainPattern::allows` for `*.example.com` semantics where the apex must not match.
+**Call relations**: `DomainPattern::allows` uses this for `*.example.com` style rules, where subdomains are allowed but the base domain itself is not.
 
 *Call graph*: calls 1 internal fn (normalize_domain); called by 1 (allows); 1 external calls (format!).
 
@@ -2353,11 +2395,11 @@ fn is_strict_subdomain(child: &str, parent: &str) -> bool
 fn method_allowed_full_allows_everything()
 ```
 
-**Purpose**: Verifies that full network mode permits representative HTTP methods including CONNECT.
+**Purpose**: Verifies that full network mode allows common HTTP methods, including methods that can change data or open tunnels.
 
-**Data flow**: Calls `NetworkMode::Full.allows_method(...)` for several methods and asserts each result is true.
+**Data flow**: The test calls the method policy for `GET`, `POST`, and `CONNECT`, then asserts each one is accepted.
 
-**Call relations**: Regression test for method-policy behavior defined elsewhere but exercised from this module.
+**Call relations**: This test exercises `NetworkMode::Full` behavior from the configuration module rather than the helper functions in this file.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2368,11 +2410,11 @@ fn method_allowed_full_allows_everything()
 fn method_allowed_limited_allows_only_safe_methods()
 ```
 
-**Purpose**: Verifies that limited mode allows safe methods and rejects mutating/tunneling methods.
+**Purpose**: Verifies that limited network mode only permits safer HTTP methods and rejects riskier ones.
 
-**Data flow**: Checks `GET`, `HEAD`, and `OPTIONS` are allowed and `POST` and `CONNECT` are rejected.
+**Data flow**: The test checks that `GET`, `HEAD`, and `OPTIONS` are allowed, while `POST` and `CONNECT` are not.
 
-**Call relations**: Documents the expected method policy used by HTTP/SOCKS guards.
+**Call relations**: This test protects the expected behavior of `NetworkMode::Limited`, which is used alongside host policy when deciding what network access is permitted.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2383,11 +2425,11 @@ fn method_allowed_limited_allows_only_safe_methods()
 fn compile_globset_normalizes_trailing_dots()
 ```
 
-**Purpose**: Confirms denylist compilation strips trailing dots and lowercases hostnames.
+**Purpose**: Checks that a domain pattern with a trailing dot matches the ordinary version of the same domain. This mirrors how fully qualified domain names are often written.
 
-**Data flow**: Builds a deny globset from `Example.COM.`, then asserts it matches `example.com` but not `api.example.com`.
+**Data flow**: The test builds a denylist matcher from `Example.COM.`, then confirms it matches `example.com` but not `api.example.com`.
 
-**Call relations**: Covers normalization behavior in `compile_denylist_globset`.
+**Call relations**: It calls `compile_denylist_globset`, which routes through the normal pattern normalization and glob compilation path.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2398,11 +2440,11 @@ fn compile_globset_normalizes_trailing_dots()
 fn compile_globset_normalizes_wildcards()
 ```
 
-**Purpose**: Checks wildcard deny patterns are normalized and still exclude the apex.
+**Purpose**: Checks that wildcard domain patterns are lowercased and have trailing dots removed before matching.
 
-**Data flow**: Compiles `*.Example.COM.` and asserts it matches `api.example.com` but not `example.com`.
+**Data flow**: The test compiles `*.Example.COM.`, then confirms a subdomain matches while the base domain itself does not.
 
-**Call relations**: Exercises wildcard-prefix preservation in `normalize_pattern` and expansion logic.
+**Call relations**: It calls `compile_denylist_globset` to exercise wildcard normalization through the same path used by real denylist configuration.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2413,11 +2455,11 @@ fn compile_globset_normalizes_wildcards()
 fn compile_globset_supports_mid_label_wildcards()
 ```
 
-**Purpose**: Verifies ordinary glob wildcards inside labels are preserved by compilation.
+**Purpose**: Verifies that wildcard characters can appear inside a domain label, not only at the beginning of a full subdomain pattern.
 
-**Data flow**: Compiles `region*.v2.argotunnel.com` and asserts matching/non-matching host examples.
+**Data flow**: The test compiles `region*.v2.argotunnel.com`, then checks that matching names beginning with `region` are accepted and unrelated or deeper names are rejected.
 
-**Call relations**: Shows that only leading `*.`/`**.` receive special semantic handling; other glob syntax is passed through.
+**Call relations**: It uses `compile_denylist_globset`, confirming that the glob compiler preserves this more specific wildcard behavior.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2428,11 +2470,11 @@ fn compile_globset_supports_mid_label_wildcards()
 fn compile_globset_normalizes_apex_and_subdomains()
 ```
 
-**Purpose**: Checks `**.` patterns match both the apex and subdomains after normalization.
+**Purpose**: Checks that `**.example.com` means both the base domain and its subdomains.
 
-**Data flow**: Compiles `**.Example.COM.` and asserts matches for `example.com` and `api.example.com`.
+**Data flow**: The test compiles `**.Example.COM.`, then confirms the resulting matcher accepts both `example.com` and `api.example.com`.
 
-**Call relations**: Covers the dual-candidate expansion in `expand_domain_pattern`.
+**Call relations**: It calls `compile_denylist_globset`, which uses `expand_domain_pattern` to turn the apex-plus-subdomains shorthand into concrete glob patterns.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2443,11 +2485,11 @@ fn compile_globset_normalizes_apex_and_subdomains()
 fn compile_globset_normalizes_bracketed_ipv6_literals()
 ```
 
-**Purpose**: Verifies bracketed IPv6 literals are normalized before glob matching.
+**Purpose**: Verifies that bracketed IPv6 addresses are normalized before matching. Brackets are common in URLs but should not be part of the address comparison.
 
-**Data flow**: Compiles `[::1]` and asserts the resulting set matches `::1`.
+**Data flow**: The test compiles a denylist pattern for `[::1]` and confirms it matches the plain address `::1`.
 
-**Call relations**: Tests host normalization for IP literals inside pattern compilation.
+**Call relations**: It calls `compile_denylist_globset`, indirectly exercising `normalize_host` and IP literal normalization.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2458,11 +2500,11 @@ fn compile_globset_normalizes_bracketed_ipv6_literals()
 fn compile_globset_preserves_scoped_ipv6_literals()
 ```
 
-**Purpose**: Checks scoped IPv6 literals retain their scope and normalize `%25` encoding.
+**Purpose**: Checks that IPv6 scope IDs are preserved and decoded consistently. Scope IDs matter because they distinguish local network interfaces.
 
-**Data flow**: Compiles `[fe80::1%25lo0]` and asserts it matches `fe80::1%lo0` but not a different scope or the unscoped literal.
+**Data flow**: The test compiles `[fe80::1%25lo0]`, then confirms it matches `fe80::1%lo0` but not a different scope or the same address without a scope.
 
-**Call relations**: Documents the exact-scope matching behavior of normalized IP literals.
+**Call relations**: It calls `compile_denylist_globset`, protecting the scope-handling behavior in `normalize_ip_literal`.
 
 *Call graph*: calls 1 internal fn (compile_denylist_globset); 1 external calls (assert_eq!).
 
@@ -2473,11 +2515,11 @@ fn compile_globset_preserves_scoped_ipv6_literals()
 fn is_loopback_host_handles_localhost_variants()
 ```
 
-**Purpose**: Verifies localhost names are recognized case-insensitively and with trailing dots.
+**Purpose**: Confirms that different spellings of `localhost` are recognized as loopback while unrelated names are not.
 
-**Data flow**: Parses several host strings into `Host` and asserts loopback classification results.
+**Data flow**: The test parses several host strings and asserts that `localhost`, `localhost.`, and uppercase `LOCALHOST` are loopback, while `notlocalhost` is not.
 
-**Call relations**: Covers `Host::parse` normalization plus `is_loopback_host` logic.
+**Call relations**: Although the function list only records assertions, the test is meant to protect the behavior of `Host::parse`, `normalize_host`, and `is_loopback_host` together.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2488,11 +2530,11 @@ fn is_loopback_host_handles_localhost_variants()
 fn is_loopback_host_handles_ip_literals()
 ```
 
-**Purpose**: Verifies loopback classification for IPv4 and IPv6 literals.
+**Purpose**: Confirms that direct loopback IP addresses are detected correctly.
 
-**Data flow**: Parses IP literal hosts and asserts loopback/non-loopback outcomes.
+**Data flow**: The test parses `127.0.0.1`, `::1`, and `1.2.3.4`, then asserts that only the loopback addresses are classified as loopback.
 
-**Call relations**: Regression test for IP parsing inside `is_loopback_host`.
+**Call relations**: This test protects the IP parsing path used by `is_loopback_host` during request blocking.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2503,11 +2545,11 @@ fn is_loopback_host_handles_ip_literals()
 fn is_non_public_ip_rejects_private_and_loopback_ranges()
 ```
 
-**Purpose**: Checks the non-public IP classifier across many IPv4, IPv6, and IPv4-mapped IPv6 ranges.
+**Purpose**: Verifies that the non-public IP classifier catches many important unsafe ranges and does not reject a normal public address like `8.8.8.8`.
 
-**Data flow**: Parses representative addresses and asserts expected true/false results for private, loopback, CGNAT, test-net, reserved, and public addresses.
+**Data flow**: The test feeds many IPv4, IPv6, and IPv4-embedded-IPv6 addresses into the classifier and asserts the expected true or false result for each.
 
-**Call relations**: Documents the security-sensitive address ranges treated as local/internal.
+**Call relations**: The recorded calls are assertions, but the test is designed to protect `is_non_public_ip` and its IPv4 and IPv6 helper logic.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2518,11 +2560,11 @@ fn is_non_public_ip_rejects_private_and_loopback_ranges()
 fn normalize_host_lowercases_and_trims()
 ```
 
-**Purpose**: Verifies basic whitespace trimming and lowercasing.
+**Purpose**: Checks that host normalization removes surrounding spaces and lowercases domain names.
 
-**Data flow**: Calls `normalize_host` on a mixed-case padded hostname and asserts the normalized string.
+**Data flow**: The test passes spaced mixed-case text into `normalize_host` and asserts the clean lowercase domain comes out.
 
-**Call relations**: Simple unit test for the main normalization entry point.
+**Call relations**: This protects the first and most common cleanup step used before host policy matching.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2533,11 +2575,11 @@ fn normalize_host_lowercases_and_trims()
 fn normalize_host_strips_port_for_host_port()
 ```
 
-**Purpose**: Checks that a single `:port` suffix is removed from ordinary hostnames.
+**Purpose**: Checks that a simple `host:port` string is reduced to just the host.
 
-**Data flow**: Normalizes `example.com:1234` and asserts the result is `example.com`.
+**Data flow**: The test normalizes `example.com:1234` and expects `example.com`.
 
-**Call relations**: Covers the defensive host:port stripping branch.
+**Call relations**: This protects `normalize_host` behavior for callers that may pass a host header or address containing a port.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2548,11 +2590,11 @@ fn normalize_host_strips_port_for_host_port()
 fn normalize_host_preserves_unbracketed_ipv6()
 ```
 
-**Purpose**: Ensures unbracketed IPv6 literals are not mangled by the single-colon host:port heuristic.
+**Purpose**: Checks that an IPv6 address without brackets is not accidentally cut at a colon as if it were `host:port`.
 
-**Data flow**: Normalizes `2001:db8::1` and asserts it is unchanged.
+**Data flow**: The test normalizes `2001:db8::1` and expects the same IPv6 address back.
 
-**Call relations**: Protects the invariant that IPv6 literals survive normalization intact.
+**Call relations**: This protects the colon-counting branch in `normalize_host`, which must distinguish IPv6 from a simple port suffix.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2563,11 +2605,11 @@ fn normalize_host_preserves_unbracketed_ipv6()
 fn normalize_host_strips_trailing_dot()
 ```
 
-**Purpose**: Verifies fully qualified domain names normalize to their dotless lowercase form.
+**Purpose**: Checks that fully qualified domain spellings with a final dot compare the same as ordinary domain names.
 
-**Data flow**: Normalizes dotted mixed-case hostnames and asserts the trailing dot is removed.
+**Data flow**: The test normalizes lowercase and mixed-case domains ending in `.` and expects lowercase names without the dot.
 
-**Call relations**: Covers DNS-name normalization behavior.
+**Call relations**: This protects normalization used by both direct host checks and pattern compilation.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2578,11 +2620,11 @@ fn normalize_host_strips_trailing_dot()
 fn normalize_host_strips_trailing_dot_with_port()
 ```
 
-**Purpose**: Checks that trailing-dot hostnames still normalize correctly when a port is present.
+**Purpose**: Checks that a domain with both a trailing dot and a port is normalized correctly.
 
-**Data flow**: Normalizes `example.com.:443` and asserts the result is `example.com`.
+**Data flow**: The test passes `example.com.:443` into `normalize_host` and expects `example.com`.
 
-**Call relations**: Exercises combined host:port stripping and trailing-dot normalization.
+**Call relations**: This protects the combined behavior of port stripping and trailing-dot cleanup in `normalize_host`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2593,11 +2635,11 @@ fn normalize_host_strips_trailing_dot_with_port()
 fn normalize_host_strips_brackets_for_ipv6()
 ```
 
-**Purpose**: Verifies bracketed IPv6 literals normalize to bare literals, with or without a port suffix.
+**Purpose**: Checks that bracketed IPv6 addresses are converted to the plain address form used for matching.
 
-**Data flow**: Normalizes `[::1]` and `[::1]:443` and asserts both become `::1`.
+**Data flow**: The test normalizes `[::1]` and `[::1]:443`, expecting `::1` in both cases.
 
-**Call relations**: Covers the bracket-handling branch in `normalize_host`.
+**Call relations**: This protects the bracket-handling branch in `normalize_host`, which is important for IPv6 addresses taken from URLs.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2608,24 +2650,24 @@ fn normalize_host_strips_brackets_for_ipv6()
 fn normalize_host_preserves_ipv6_scope_ids()
 ```
 
-**Purpose**: Checks that scoped IPv6 literals preserve their scope and normalize `%25` encoding.
+**Purpose**: Checks that scoped IPv6 addresses keep their scope information, while URL-encoded `%25` is normalized to `%`.
 
-**Data flow**: Normalizes scoped literals in bare and bracketed forms and asserts the canonical `%scope` output.
+**Data flow**: The test normalizes unbracketed, bracketed, and `%25`-encoded scoped IPv6 inputs and expects the same canonical scoped address form.
 
-**Call relations**: Regression test for scoped IPv6 normalization used by allow/deny matching.
+**Call relations**: This protects the interaction between `normalize_host` and `normalize_ip_literal` for link-local IPv6 addresses.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `network-proxy/src/config.rs`
 
-`config` · `config load and startup validation`
+`config` · `config load and startup`
 
-This file is the proxy’s configuration model plus the logic that interprets it. `NetworkProxyConfig` wraps `NetworkProxySettings`, whose defaults describe a disabled local proxy listening on loopback HTTP and SOCKS ports, with upstream proxying enabled, MITM disabled, and no domain or unix-socket exceptions. Domain policy is represented as ordered `NetworkDomainPermissionEntry` values, but serialization collapses duplicates into an effective map where enum ordering (`None < Allow < Deny`) makes deny win over allow for the same pattern. That precedence is preserved by `effective_entries`, which keeps first-seen pattern order while upgrading the stored permission when a stronger duplicate appears.
+This file is the proxy's rulebook and safety checker. It describes the settings a user can write, supplies safe defaults, and validates risky options before the proxy starts. Without it, the proxy could listen on unsafe network addresses, accept malformed socket paths, or apply allow and deny rules inconsistently.
 
-The file also provides mutators for allowed/denied domains and allowed unix sockets. These methods intentionally preserve opposite-permission entries, deduplicate exact duplicates, and drop the optional wrapper back to `None` when no entries remain. `NetworkMode` encodes the HTTP method policy: full mode allows everything, limited mode only GET/HEAD/OPTIONS.
+The main configuration type is `NetworkProxySettings`. It includes the HTTP proxy address, SOCKS5 proxy address, network mode, domain permissions, Unix socket permissions, and several deliberately named dangerous escape hatches. The file treats those escape hatches carefully. For example, if a user asks the proxy to listen on `0.0.0.0`, meaning every network interface, the code normally clamps that back to `127.0.0.1`, meaning only this machine. That is like moving a front-door service back behind a locked office door unless the user explicitly accepts the risk.
 
-Runtime resolution is safety-focused. `resolve_runtime` validates every allowlisted unix-socket path as absolute, parses proxy URLs or loose host:port strings into `SocketAddr`s, maps `localhost` and unresolved hostnames to loopback, and then clamps non-loopback bind addresses unless explicitly allowed. Even when non-loopback binding is enabled, unix-socket proxying forces both listeners back to loopback to avoid exposing local-daemon access remotely. The host/port parser handles URL-like inputs, strips userinfo, preserves unbracketed IPv6 literals, and falls back carefully when URL parsing fails.
+Domain rules are stored so that deny wins over allow when the same pattern appears twice. Unix socket paths are checked to make sure they are absolute paths, because relative paths can point somewhere surprising depending on where the program runs. The file also parses loose address strings, such as `localhost:3128` or IPv6 forms, into concrete socket addresses. The tests at the bottom lock down these safety and parsing behaviors.
 
 #### Function details
 
@@ -2635,11 +2677,11 @@ Runtime resolution is safety-focused. `resolve_runtime` validates every allowlis
 fn serialize(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes domain permissions as a map from pattern to effective permission rather than preserving raw duplicate entries. This ensures persisted config reflects the deny-wins semantics users actually experience.
+**Purpose**: Turns the domain permission list into the map shape used in saved or exported configuration. It writes only the effective result, so duplicate patterns collapse into one final permission.
 
-**Data flow**: It takes `&self` and a Serde serializer. It computes `self.effective_entries()`, converts those entries into a `BTreeMap<String, NetworkDomainPermission>`, and serializes that map.
+**Data flow**: It starts with the in-memory list of domain permission entries. It asks `effective_entries` to resolve duplicates, turns those entries into a sorted map from pattern to permission, and gives that map to the serializer. The output is serialized configuration data.
 
-**Call relations**: Serde invokes this when writing config. It depends on `effective_entries` so duplicate raw entries collapse into a single visible permission per pattern.
+**Call relations**: Serialization code calls this when `NetworkDomainPermissions` needs to be written out. It delegates the important conflict-resolution step to `effective_entries` before handing the clean map to Serde, the Rust library used for reading and writing structured data.
 
 *Call graph*: calls 1 internal fn (effective_entries).
 
@@ -2650,11 +2692,11 @@ fn serialize(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
 fn deserialize(deserializer: D) -> std::result::Result<Self, D::Error>
 ```
 
-**Purpose**: Deserializes domain permissions from a simple map shape into the internal entry-vector representation.
+**Purpose**: Reads domain permission settings from configuration data. It accepts a map such as domain pattern to allow or deny and converts it into the internal list format.
 
-**Data flow**: It takes a Serde deserializer, reads a `BTreeMap<String, NetworkDomainPermission>`, maps each pair into `NetworkDomainPermissionEntry { pattern, permission }`, collects them into `entries`, and returns `NetworkDomainPermissions { entries }`.
+**Data flow**: It receives serialized data from the deserializer. That data is read as a sorted map, each map pair becomes a `NetworkDomainPermissionEntry`, and the entries are stored in a new `NetworkDomainPermissions` value.
 
-**Call relations**: Serde uses this when loading config. It reconstructs the internal list form expected by the rest of the file.
+**Call relations**: Serde calls this while loading configuration. Unlike serialization, this step mostly reshapes the data; later code such as `effective_entries` decides what happens if entries conflict.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -2665,11 +2707,11 @@ fn deserialize(deserializer: D) -> std::result::Result<Self, D::Error>
 fn effective_entries(&self) -> Vec<NetworkDomainPermissionEntry>
 ```
 
-**Purpose**: Computes the effective permission list after resolving duplicate patterns with precedence rules while preserving first-seen pattern order.
+**Purpose**: Calculates the final domain rules after duplicate patterns are considered. If the same pattern appears with conflicting permissions, the stronger permission wins, with deny stronger than allow.
 
-**Data flow**: It reads `self.entries`, tracks first occurrence order in a `Vec<String>`, stores strongest permission per pattern in a `BTreeMap`, upgrades an existing permission when a later entry has a larger enum value, then emits `NetworkDomainPermissionEntry` values in original pattern order using the final effective permission.
+**Data flow**: It reads the stored entries in order. It remembers the first time each pattern appeared, keeps the strongest permission seen for that pattern, and then returns a cleaned list in original pattern order.
 
-**Call relations**: Serialization and domain filtering rely on this helper to present the actual policy rather than raw historical edits.
+**Call relations**: `NetworkDomainPermissions::serialize` calls this so saved configuration reflects the real rules. `NetworkProxySettings::domain_entries` also relies on this behavior indirectly when it asks for allowed or denied domains.
 
 *Call graph*: called by 1 (serialize); 2 external calls (new, new).
 
@@ -2680,11 +2722,11 @@ fn effective_entries(&self) -> Vec<NetworkDomainPermissionEntry>
 fn default() -> Self
 ```
 
-**Purpose**: Constructs the baseline local-use proxy configuration with conservative safety defaults and no explicit allowlists.
+**Purpose**: Builds the default network proxy settings used when the user leaves fields out. The defaults keep the proxy disabled, bind it locally, and leave risky behavior turned off.
 
-**Data flow**: It returns a `NetworkProxySettings` with fixed booleans and URLs: disabled proxy, loopback HTTP/SOCKS URLs, SOCKS enabled, upstream proxying allowed, non-loopback and broad unix-socket access disabled, mode `Full`, no domain or unix-socket entries, local binding disabled, MITM disabled, and empty MITM hooks.
+**Data flow**: It creates a full `NetworkProxySettings` value from fixed defaults, including default HTTP and SOCKS addresses, full network mode, no domain or socket rules, and empty MITM hook settings. The result is a complete settings object.
 
-**Call relations**: Many tests and runtime builders start from this baseline and then override only the fields relevant to the scenario under test.
+**Call relations**: Configuration loading uses this default when fields are missing. Many tests and other proxy components call it as a safe baseline before changing just the setting they care about.
 
 *Call graph*: calls 2 internal fn (default_proxy_url, default_socks_url); called by 50 (network_domain_permissions_serialize_to_effective_map_shape, partial_network_config_uses_struct_defaults_for_missing_fields, set_allowed_domains_preserves_existing_deny_for_same_pattern, settings_with_unix_sockets, direct_connector_allows_non_public_target_when_local_binding_enabled, direct_connector_rejects_non_public_target_when_local_binding_disabled, http_connect_accept_allows_allowlisted_host_in_full_mode, http_connect_accept_blocks_in_limited_mode, http_connect_accept_denies_denylisted_host, http_plain_proxy_attempts_allowed_unix_socket_proxy (+15 more)); 2 external calls (new, default).
 
@@ -2695,11 +2737,11 @@ fn default() -> Self
 fn allowed_domains(&self) -> Option<Vec<String>>
 ```
 
-**Purpose**: Returns the effective allowlisted domain patterns, if any exist.
+**Purpose**: Returns the list of domain patterns that are effectively allowed. It hides empty results by returning nothing instead of an empty list.
 
-**Data flow**: It takes `&self`, delegates to `domain_entries(NetworkDomainPermission::Allow)`, and returns `Option<Vec<String>>`.
+**Data flow**: It asks `domain_entries` for entries with the allow permission. If allow rules exist, it returns their patterns; if not, it returns `None`.
 
-**Call relations**: Higher-level policy code uses this accessor when it needs only allow entries rather than the full mixed permission structure.
+**Call relations**: Higher-level domain rule code calls this when it needs the allow side of the configuration. It is the public, simple wrapper around the shared filtering logic in `domain_entries`.
 
 *Call graph*: calls 1 internal fn (domain_entries); called by 2 (entries, opposite_entries).
 
@@ -2710,11 +2752,11 @@ fn allowed_domains(&self) -> Option<Vec<String>>
 fn denied_domains(&self) -> Option<Vec<String>>
 ```
 
-**Purpose**: Returns the effective denylisted domain patterns, if any exist.
+**Purpose**: Returns the list of domain patterns that are effectively denied. It is the deny-side counterpart to `allowed_domains`.
 
-**Data flow**: It takes `&self`, delegates to `domain_entries(NetworkDomainPermission::Deny)`, and returns `Option<Vec<String>>`.
+**Data flow**: It asks `domain_entries` for entries with the deny permission. If denied patterns exist, it returns them; otherwise it returns `None`.
 
-**Call relations**: This is the deny-side counterpart to `allowed_domains`, used by policy consumers that need explicit blocked patterns.
+**Call relations**: Higher-level domain rule code calls this when it needs to know what should be blocked. It shares the same filtering path as allowed-domain lookup, so allow and deny results are based on the same conflict rules.
 
 *Call graph*: calls 1 internal fn (domain_entries); called by 2 (entries, opposite_entries).
 
@@ -2725,11 +2767,11 @@ fn denied_domains(&self) -> Option<Vec<String>>
 fn domain_entries(&self, permission: NetworkDomainPermission) -> Option<Vec<String>>
 ```
 
-**Purpose**: Filters the effective domain-permission set down to patterns with a specific permission and suppresses empty results.
+**Purpose**: Filters the configured domain rules down to only one permission type, either allow or deny. It also avoids returning meaningless empty lists.
 
-**Data flow**: It takes `&self` and a `NetworkDomainPermission`. If `self.domains` is present, it computes `effective_entries()`, filters entries whose permission matches the requested one, clones their patterns into a `Vec<String>`, and returns `Some(vec)` only when non-empty.
+**Data flow**: It reads the optional domain permissions from the settings. If present, it takes the effective entries, keeps only entries with the requested permission, copies their patterns, and returns them if the result is non-empty.
 
-**Call relations**: Both `allowed_domains` and `denied_domains` are thin wrappers around this helper.
+**Call relations**: `allowed_domains` and `denied_domains` call this to avoid duplicating the same filtering work. It sits between the raw stored rules and the simple lists used elsewhere.
 
 *Call graph*: called by 2 (allowed_domains, denied_domains).
 
@@ -2740,11 +2782,11 @@ fn domain_entries(&self, permission: NetworkDomainPermission) -> Option<Vec<Stri
 fn allow_unix_sockets(&self) -> Vec<String>
 ```
 
-**Purpose**: Extracts the configured unix-socket allowlist paths from the flattened permission map.
+**Purpose**: Returns the Unix socket paths that the proxy is allowed to reach. A Unix socket is a local file-like endpoint used by services on the same machine, such as Docker.
 
-**Data flow**: It takes `&self`, reads `self.unix_sockets`, filters entries whose permission is `Allow`, clones the path keys into a `Vec<String>`, and returns an empty vector when no unix-socket config exists.
+**Data flow**: It reads the optional Unix socket permission map. It keeps only entries marked allow, copies their path strings, and returns an empty list if no socket rules are configured.
 
-**Call relations**: Bind-address clamping and unix-socket validation use this accessor to decide whether local-daemon proxying is enabled.
+**Call relations**: `clamp_bind_addrs` calls this to decide whether Unix socket proxying is enabled. That matters because enabling local socket access forces the proxy to bind only to loopback addresses for safety.
 
 *Call graph*: called by 1 (clamp_bind_addrs).
 
@@ -2755,11 +2797,11 @@ fn allow_unix_sockets(&self) -> Vec<String>
 fn set_allowed_domains(&mut self, allowed_domains: Vec<String>)
 ```
 
-**Purpose**: Replaces all current allow entries with the provided patterns while preserving deny entries.
+**Purpose**: Replaces the current allow-list domain entries with a new set. It is a convenience method for callers that want to update allowed domains without touching deny rules directly.
 
-**Data flow**: It takes `&mut self` and `allowed_domains: Vec<String>`, then forwards to `set_domain_entries(..., Allow)`.
+**Data flow**: It receives a list of domain patterns. It passes that list and the allow permission to `set_domain_entries`, which rewrites the allow entries while preserving other permission types.
 
-**Call relations**: Tests and config mutation paths call this when constructing or updating allowlists.
+**Call relations**: Callers that edit configuration use this as the allow-specific front door. It hands the real update work to `set_domain_entries`.
 
 *Call graph*: calls 1 internal fn (set_domain_entries).
 
@@ -2770,11 +2812,11 @@ fn set_allowed_domains(&mut self, allowed_domains: Vec<String>)
 fn set_denied_domains(&mut self, denied_domains: Vec<String>)
 ```
 
-**Purpose**: Replaces all current deny entries with the provided patterns while preserving allow entries.
+**Purpose**: Replaces the current deny-list domain entries with a new set. It lets callers update blocked domains while leaving allow entries alone.
 
-**Data flow**: It takes `&mut self` and `denied_domains: Vec<String>`, then forwards to `set_domain_entries(..., Deny)`.
+**Data flow**: It receives domain patterns to deny. It passes them with the deny permission to `set_domain_entries`, which updates the stored domain permission list.
 
-**Call relations**: This is the deny-side counterpart to `set_allowed_domains`.
+**Call relations**: Callers that edit configuration use this as the deny-specific front door. It shares the same underlying update logic as `set_allowed_domains`.
 
 *Call graph*: calls 1 internal fn (set_domain_entries).
 
@@ -2790,11 +2832,11 @@ fn upsert_domain_permission(
     )
 ```
 
-**Purpose**: Adds or replaces a single domain permission after normalizing patterns for equality comparison. It is designed for interactive updates where equivalent host spellings should overwrite each other.
+**Purpose**: Adds or replaces one domain permission, using a caller-provided normalizer to decide when two patterns mean the same host. This is useful when a single domain rule changes interactively.
 
-**Data flow**: It takes `&mut self`, `host: String`, a `permission`, and a normalization closure. It removes any existing entries whose normalized pattern matches the normalized new host, pushes a new `NetworkDomainPermissionEntry { pattern: host, permission }`, and stores `Some(domains)` only if entries remain.
+**Data flow**: It takes a host string, a permission, and a normalization function. It removes existing entries whose normalized pattern matches the new normalized host, appends the new entry, and stores the updated domain list or clears it if empty.
 
-**Call relations**: This function is used by callers that need one-at-a-time edits rather than wholesale replacement lists.
+**Call relations**: This is an editing helper for code that updates one rule at a time. It does not call other project functions, but it follows the same storage format used by the rest of the settings.
 
 
 ##### `NetworkProxySettings::set_allow_unix_sockets`  (lines 234–236)
@@ -2803,11 +2845,11 @@ fn upsert_domain_permission(
 fn set_allow_unix_sockets(&mut self, allow_unix_sockets: Vec<String>)
 ```
 
-**Purpose**: Replaces all current allowed unix-socket paths with the provided list.
+**Purpose**: Replaces the configured list of Unix socket paths that are allowed. It is the public helper for setting socket allow rules.
 
-**Data flow**: It takes `&mut self` and `allow_unix_sockets: Vec<String>`, then delegates to `set_unix_socket_entries(..., Allow)`.
+**Data flow**: It receives path strings and passes them with the allow permission to `set_unix_socket_entries`. The settings are updated to contain those allowed socket paths.
 
-**Call relations**: Tests and config-building code use this helper to populate the unix-socket allowlist.
+**Call relations**: Callers use this instead of editing the socket permission map directly. It hands the detailed map update to `set_unix_socket_entries`.
 
 *Call graph*: calls 1 internal fn (set_unix_socket_entries).
 
@@ -2818,11 +2860,11 @@ fn set_allow_unix_sockets(&mut self, allow_unix_sockets: Vec<String>)
 fn set_domain_entries(&mut self, entries: Vec<String>, permission: NetworkDomainPermission)
 ```
 
-**Purpose**: Rewrites all entries for one domain-permission class while leaving opposite-permission entries intact and avoiding exact duplicates.
+**Purpose**: Updates all domain entries for one permission type while preserving entries of other types. It also avoids adding exact duplicates for the same pattern and permission.
 
-**Data flow**: It takes `&mut self`, `entries: Vec<String>`, and a `permission`. It removes existing entries with that permission, then for each new pattern pushes a `NetworkDomainPermissionEntry` only if an identical pattern/permission pair is not already present. Finally it stores `None` if the resulting list is empty.
+**Data flow**: It temporarily takes the current domain list, removes entries with the target permission, appends the new non-duplicate entries, and then stores the list back only if it is not empty.
 
-**Call relations**: Both `set_allowed_domains` and `set_denied_domains` funnel through this helper.
+**Call relations**: `set_allowed_domains` and `set_denied_domains` call this as their shared worker. It keeps the two public setters consistent.
 
 *Call graph*: called by 2 (set_allowed_domains, set_denied_domains).
 
@@ -2837,11 +2879,11 @@ fn set_unix_socket_entries(
     )
 ```
 
-**Purpose**: Rewrites all unix-socket entries for one permission class and stores them in the flattened map representation.
+**Purpose**: Updates Unix socket permission entries for one permission type. In this file it is used to set the allow list.
 
-**Data flow**: It takes `&mut self`, `entries: Vec<String>`, and a `NetworkUnixSocketPermission`. It removes existing map entries with that permission, inserts each provided path with the new permission, and stores `None` if the map ends up empty.
+**Data flow**: It temporarily takes the current socket permission map, removes entries with the target permission, inserts each new path with that permission, and then stores the map back only if it still has entries.
 
-**Call relations**: Currently `set_allow_unix_sockets` is the public wrapper that uses this helper.
+**Call relations**: `set_allow_unix_sockets` calls this to perform the actual map update. The resulting paths are later read by `allow_unix_sockets` and validated before runtime.
 
 *Call graph*: called by 1 (set_allow_unix_sockets).
 
@@ -2852,11 +2894,11 @@ fn set_unix_socket_entries(
 fn allows_method(self, method: &str) -> bool
 ```
 
-**Purpose**: Encodes the proxy’s HTTP method policy for full versus limited network mode.
+**Purpose**: Decides whether an HTTP method is permitted under the selected network mode. In limited mode, only read-style methods are allowed.
 
-**Data flow**: It takes `self` and `method: &str`. In `Full` mode it returns `true` for any method; in `Limited` mode it returns `true` only for `GET`, `HEAD`, or `OPTIONS`.
+**Data flow**: It receives a network mode and a method string such as `GET` or `POST`. Full mode returns true for everything; limited mode returns true only for `GET`, `HEAD`, or `OPTIONS`.
 
-**Call relations**: HTTP and MITM request paths consult this method when enforcing limited-mode restrictions.
+**Call relations**: Request-handling code can call this when deciding whether to allow an HTTP request. It is the small policy check behind the larger limited-versus-full network behavior.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -2867,11 +2909,11 @@ fn allows_method(self, method: &str) -> bool
 fn default_proxy_url() -> String
 ```
 
-**Purpose**: Supplies the default HTTP proxy listener URL.
+**Purpose**: Provides the default HTTP proxy listen address. The default points to localhost on port 3128.
 
-**Data flow**: It returns the fixed string `http://127.0.0.1:3128`.
+**Data flow**: It takes no input. It returns the string `http://127.0.0.1:3128`.
 
-**Call relations**: Used only by `NetworkProxySettings::default`.
+**Call relations**: `NetworkProxySettings::default` calls this when building the default settings, and Serde also uses it for the `proxy_url` field when that field is missing.
 
 *Call graph*: called by 1 (default).
 
@@ -2882,11 +2924,11 @@ fn default_proxy_url() -> String
 fn default_socks_url() -> String
 ```
 
-**Purpose**: Supplies the default SOCKS5 proxy listener URL.
+**Purpose**: Provides the default SOCKS5 proxy listen address. The default points to localhost on port 8081.
 
-**Data flow**: It returns the fixed string `http://127.0.0.1:8081`.
+**Data flow**: It takes no input. It returns the string `http://127.0.0.1:8081`.
 
-**Call relations**: Used only by `NetworkProxySettings::default`.
+**Call relations**: `NetworkProxySettings::default` calls this when building the default settings, and Serde uses it for the `socks_url` field when omitted.
 
 *Call graph*: called by 1 (default).
 
@@ -2902,11 +2944,11 @@ fn clamp_non_loopback(
 ) -> SocketAddr
 ```
 
-**Purpose**: For a single listener address, either preserves a loopback bind, allows a dangerous non-loopback bind with a warning, or rewrites it to loopback with the same port.
+**Purpose**: Prevents the proxy from listening on outside-facing network addresses unless the user explicitly allows that dangerous behavior. A loopback address is one reachable only from the same machine.
 
-**Data flow**: It takes `addr: SocketAddr`, `allow_non_loopback: bool`, and descriptive names. If `addr.ip().is_loopback()` it returns the address unchanged. If non-loopback is explicitly allowed it logs a dangerous warning and returns the original address. Otherwise it warns and returns `127.0.0.1:<same port>`.
+**Data flow**: It receives a socket address, a boolean saying whether non-loopback binding is allowed, a human-readable proxy name, and the setting name for warnings. It returns the address unchanged if safe or explicitly allowed; otherwise it returns the same port on `127.0.0.1` and logs a warning.
 
-**Call relations**: Called by `clamp_bind_addrs` for both HTTP and SOCKS listener addresses.
+**Call relations**: `clamp_bind_addrs` calls this once for the HTTP proxy and once for the SOCKS5 proxy. It is the first safety gate for bind addresses.
 
 *Call graph*: called by 1 (clamp_bind_addrs); 4 external calls (from, ip, port, warn!).
 
@@ -2921,11 +2963,11 @@ fn clamp_bind_addrs(
 ) -> (SocketAddr, SocketAddr)
 ```
 
-**Purpose**: Applies bind-address safety rules to both HTTP and SOCKS listeners, with an extra hard clamp when unix-socket proxying is enabled.
+**Purpose**: Applies final safety rules to the HTTP and SOCKS5 listen addresses before the proxy starts. It especially protects Unix socket access from being exposed to other machines.
 
-**Data flow**: It takes `http_addr`, `socks_addr`, and `cfg: &NetworkProxySettings`. It first clamps each address individually via `clamp_non_loopback`. If no unix sockets are allowlisted and `dangerously_allow_all_unix_sockets` is false, it returns those results. Otherwise it warns that unix-socket proxying overrides dangerous non-loopback settings and returns both addresses rewritten to `127.0.0.1` with their original ports.
+**Data flow**: It receives proposed HTTP and SOCKS addresses plus the network settings. It first clamps each address with `clamp_non_loopback`; then, if Unix socket proxying is enabled, it forces both addresses to `127.0.0.1` even if non-loopback binding was otherwise allowed.
 
-**Call relations**: Runtime resolution and some builder paths call this after parsing configured listener URLs. It depends on `allow_unix_sockets()` to detect whether local-daemon proxying is active.
+**Call relations**: `resolve_runtime` calls this after parsing configured addresses. Proxy startup code also uses it when building the running service, and tests check its safety behavior.
 
 *Call graph*: calls 2 internal fn (allow_unix_sockets, clamp_non_loopback); called by 5 (resolve_runtime, clamp_bind_addrs_allows_non_loopback_when_enabled, clamp_bind_addrs_forces_loopback_when_all_unix_sockets_enabled, clamp_bind_addrs_forces_loopback_when_unix_sockets_enabled, build); 4 external calls (from, ip, port, warn!).
 
@@ -2936,11 +2978,11 @@ fn clamp_bind_addrs(
 fn parse(value: &str) -> Option<Self>
 ```
 
-**Purpose**: Recognizes strings that look like Unix absolute paths even when the host platform may not treat them as native absolute paths.
+**Purpose**: Recognizes paths that are absolute in Unix style because they start with `/`. This helps accept Unix-looking socket paths even on systems where Rust's native path rules may differ.
 
-**Data flow**: It takes `value: &str` and returns `Some(UnixStyleAbsolutePath(value.to_string()))` when the string starts with `/`, otherwise `None`.
+**Data flow**: It receives a path string. If the string starts with `/`, it wraps and returns it; otherwise it returns nothing.
 
-**Call relations**: Used by `ValidatedUnixSocketPath::parse` as a fallback after native absolute-path parsing.
+**Call relations**: `ValidatedUnixSocketPath::parse` calls this after trying the platform-native absolute path check. It is the fallback for Unix-style absolute paths.
 
 *Call graph*: called by 1 (parse).
 
@@ -2951,11 +2993,11 @@ fn parse(value: &str) -> Option<Self>
 fn parse(socket_path: &str) -> Result<Self>
 ```
 
-**Purpose**: Validates that a configured unix-socket path is absolute, either as a native absolute path or as a Unix-style absolute path string.
+**Purpose**: Checks that a Unix socket allow-list path is absolute. Absolute paths are required so the proxy does not accidentally trust a path whose meaning changes with the current directory.
 
-**Data flow**: It takes `socket_path: &str`. If `Path::new(socket_path).is_absolute()` it normalizes it into `AbsolutePathBuf` and returns `ValidatedUnixSocketPath::Native`. Otherwise it tries `UnixStyleAbsolutePath::parse` and returns `UnixStyleAbsolute` if that succeeds. If neither path form is absolute, it returns an error.
+**Data flow**: It receives a socket path string. It first accepts native absolute paths and normalizes them; if that fails, it accepts Unix-style paths starting with `/`; otherwise it returns an error explaining that an absolute path was expected.
 
-**Call relations**: Allowlist validation and runtime unix-socket permission checks use this parser to reject relative paths early.
+**Call relations**: `validate_unix_socket_allowlist_paths` calls this during startup validation, and socket permission checks can call it when deciding whether a socket path is allowed.
 
 *Call graph*: calls 2 internal fn (parse, from_absolute_path); called by 2 (validate_unix_socket_allowlist_paths, is_unix_socket_allowed); 4 external calls (new, Native, UnixStyleAbsolute, bail!).
 
@@ -2966,11 +3008,11 @@ fn parse(socket_path: &str) -> Result<Self>
 fn validate_unix_socket_allowlist_paths(cfg: &NetworkProxyConfig) -> Result<()>
 ```
 
-**Purpose**: Validates every configured allowlisted unix-socket path and annotates errors with the offending list index.
+**Purpose**: Validates every configured allowed Unix socket path. It makes configuration errors clear before the proxy starts.
 
-**Data flow**: It takes `cfg: &NetworkProxyConfig`, iterates over `cfg.network.allow_unix_sockets()` with indices, parses each path via `ValidatedUnixSocketPath::parse`, and returns `Ok(())` only if all entries are valid absolute paths.
+**Data flow**: It reads allowed Unix socket paths from the network settings. Each path is passed to `ValidatedUnixSocketPath::parse`; if any path is invalid, the returned error includes the list index that failed.
 
-**Call relations**: Called during runtime resolution and config-state building so invalid unix-socket allowlists fail before the proxy starts.
+**Call relations**: `resolve_runtime` calls this before resolving bind addresses, and configuration-state building code also calls it. It is the startup guard for socket allow-list correctness.
 
 *Call graph*: calls 1 internal fn (parse); called by 2 (resolve_runtime, build_config_state).
 
@@ -2981,11 +3023,11 @@ fn validate_unix_socket_allowlist_paths(cfg: &NetworkProxyConfig) -> Result<()>
 fn resolve_runtime(cfg: &NetworkProxyConfig) -> Result<RuntimeConfig>
 ```
 
-**Purpose**: Turns user configuration into concrete listener socket addresses after validating unix-socket allowlists and applying bind-address safety clamps.
+**Purpose**: Turns user configuration into the concrete runtime addresses the proxy will use. It validates socket paths, parses listen URLs, and applies safety clamps.
 
-**Data flow**: It takes `cfg: &NetworkProxyConfig`. It first calls `validate_unix_socket_allowlist_paths(cfg)`, parses `cfg.network.proxy_url` and `cfg.network.socks_url` into `SocketAddr`s via `resolve_addr` with default ports 3128 and 8081, clamps them with `clamp_bind_addrs`, and returns `RuntimeConfig { http_addr, socks_addr }`.
+**Data flow**: It receives the full proxy config. It validates Unix socket allow-list paths, resolves the HTTP and SOCKS address strings into `SocketAddr` values, clamps unsafe bind addresses, and returns a `RuntimeConfig` with final addresses.
 
-**Call relations**: Startup code calls this to derive actual listener addresses. It orchestrates validation, parsing, and safety clamping rather than implementing those pieces inline.
+**Call relations**: Proxy startup calls this before binding network listeners. It coordinates `validate_unix_socket_allowlist_paths`, `resolve_addr`, and `clamp_bind_addrs` into one startup-ready result.
 
 *Call graph*: calls 3 internal fn (clamp_bind_addrs, resolve_addr, validate_unix_socket_allowlist_paths); called by 2 (resolve_runtime_rejects_relative_allow_unix_sockets_entries, build).
 
@@ -2996,11 +3038,11 @@ fn resolve_runtime(cfg: &NetworkProxyConfig) -> Result<RuntimeConfig>
 fn resolve_addr(url: &str, default_port: u16) -> Result<SocketAddr>
 ```
 
-**Purpose**: Parses a configured proxy address string into a concrete `SocketAddr`, mapping hostnames to loopback rather than performing DNS resolution.
+**Purpose**: Converts a configured address string into a concrete IP address and port. Hostnames are deliberately mapped to loopback rather than resolved through DNS.
 
-**Data flow**: It takes `url: &str` and `default_port: u16`. It parses host and port via `parse_host_port`, rewrites `localhost` to `127.0.0.1`, then tries to parse the host as `IpAddr`. If parsing succeeds it returns that IP with the parsed port; otherwise it falls back to `127.0.0.1:<port>`.
+**Data flow**: It receives a URL-like address and a default port. It uses `parse_host_port` to extract host and port, turns `localhost` into `127.0.0.1`, keeps literal IP addresses, and maps other hostnames to `127.0.0.1` with the chosen port.
 
-**Call relations**: Used by `resolve_runtime` for both HTTP and SOCKS listener URLs. The deliberate hostname-to-loopback fallback keeps listener binding local even when users specify names.
+**Call relations**: `resolve_runtime` calls this for both the HTTP proxy URL and the SOCKS URL. It provides the concrete addresses that `clamp_bind_addrs` then safety-checks.
 
 *Call graph*: calls 1 internal fn (parse_host_port); called by 1 (resolve_runtime); 2 external calls (from, new).
 
@@ -3011,11 +3053,11 @@ fn resolve_addr(url: &str, default_port: u16) -> Result<SocketAddr>
 fn host_and_port_from_network_addr(value: &str, default_port: u16) -> String
 ```
 
-**Purpose**: Formats a user-supplied network address string into a normalized `host:port` display string, with graceful fallback for malformed input.
+**Purpose**: Formats a network address setting as a simple `host:port` display string. It is forgiving, so it can still produce a useful display even for imperfect input.
 
-**Data flow**: It takes `value: &str` and `default_port: u16`. It trims whitespace, returns `<missing>` for empty input, otherwise tries `parse_host_port`; on success it formats the parsed host and port with `format_host_and_port`, and on parse failure it formats the raw trimmed input with the default port.
+**Data flow**: It receives an address string and a default port. Empty input becomes `<missing>`; parseable input is normalized with `parse_host_port`; unparseable input is formatted with the default port.
 
-**Call relations**: This helper is for display/reporting paths that need a readable endpoint string without failing hard on bad input.
+**Call relations**: This helper uses `parse_host_port` for normal cases and `format_host_and_port` for final display formatting. It is meant for showing addresses, not for opening sockets.
 
 *Call graph*: calls 2 internal fn (format_host_and_port, parse_host_port).
 
@@ -3026,11 +3068,11 @@ fn host_and_port_from_network_addr(value: &str, default_port: u16) -> String
 fn format_host_and_port(host: &str, port: u16) -> String
 ```
 
-**Purpose**: Formats a host and port pair, adding IPv6 brackets when needed.
+**Purpose**: Builds a display string from a host and port, using brackets when needed for IPv6 addresses. Brackets keep IPv6 colons from being confused with the port separator.
 
-**Data flow**: It takes `host: &str` and `port: u16`. If the host contains `:`, it returns `[{host}]:{port}`; otherwise it returns `{host}:{port}`.
+**Data flow**: It receives a host string and a port number. If the host contains a colon, it returns `[host]:port`; otherwise it returns `host:port`.
 
-**Call relations**: Used by `host_and_port_from_network_addr` after parsing or fallback.
+**Call relations**: `host_and_port_from_network_addr` calls this after it has chosen the host and port to display.
 
 *Call graph*: called by 1 (host_and_port_from_network_addr); 1 external calls (format!).
 
@@ -3041,11 +3083,11 @@ fn format_host_and_port(host: &str, port: u16) -> String
 fn parse_host_port(url: &str, default_port: u16) -> Result<SocketAddressParts>
 ```
 
-**Purpose**: Parses a broad range of proxy address inputs—URLs, loose host:port strings, bracketed IPv6, and bare IP literals—into normalized host and port parts.
+**Purpose**: Extracts a host and port from flexible address input. It accepts full URLs, plain `host:port`, hostnames without ports, and IPv6 forms.
 
-**Data flow**: It takes `url: &str` and `default_port: u16`. It trims whitespace and errors on empty input. If the trimmed string is an unbracketed IPv6 literal, it returns that host with the default port immediately. Otherwise it prefixes `http://` when no scheme is present, tries `Url::parse`, extracts and de-brackets the host plus parsed or default port when successful, and falls back to `parse_host_port_fallback` if URL parsing does not yield a host.
+**Data flow**: It trims the input, rejects empty values, treats unbracketed IPv6 literals carefully, tries the standard URL parser with a temporary scheme if needed, and falls back to manual parsing if the URL parser cannot help.
 
-**Call relations**: Both runtime address resolution and display formatting depend on this parser. It delegates edge-case recovery to `parse_host_port_fallback`.
+**Call relations**: `resolve_addr` calls this for runtime binding, and `host_and_port_from_network_addr` calls it for display. It hands difficult leftovers to `parse_host_port_fallback`.
 
 *Call graph*: calls 1 internal fn (parse_host_port_fallback); called by 2 (host_and_port_from_network_addr, resolve_addr); 4 external calls (parse, bail!, format!, matches!).
 
@@ -3056,11 +3098,11 @@ fn parse_host_port(url: &str, default_port: u16) -> Result<SocketAddressParts>
 fn parse_host_port_fallback(input: &str, default_port: u16) -> Result<SocketAddressParts>
 ```
 
-**Purpose**: Recovers host and port information from malformed or loosely structured address strings when standard URL parsing is insufficient.
+**Purpose**: Manually extracts host and port when normal URL parsing is not enough. It covers loose or unusual address strings without accidentally breaking IPv6 addresses.
 
-**Data flow**: It takes `input: &str` and `default_port: u16`. It strips any scheme prefix, truncates at the first `/`, strips userinfo before `@`, handles bracketed IPv6 with optional port, treats `host:port` specially only when there is exactly one colon, falls back to the default port when port parsing fails, and errors if the resulting host is empty.
+**Data flow**: It removes any scheme, path, and user-info prefix, then looks for bracketed IPv6 with an optional port or a single-colon `host:port` form. If no port is found, it uses the default port; if no host exists, it returns an error.
 
-**Call relations**: This helper is only called from `parse_host_port` after the preferred URL-based parse path fails.
+**Call relations**: `parse_host_port` calls this only after its preferred parsing path fails. It is the backup parser that keeps configuration input flexible.
 
 *Call graph*: called by 1 (parse_host_port); 1 external calls (bail!).
 
@@ -3071,11 +3113,11 @@ fn parse_host_port_fallback(input: &str, default_port: u16) -> Result<SocketAddr
 fn settings_with_unix_sockets(unix_sockets: &[&str]) -> NetworkProxySettings
 ```
 
-**Purpose**: Builds a `NetworkProxySettings` test fixture with an optional unix-socket allowlist.
+**Purpose**: Builds test settings with a chosen Unix socket allow list. It saves each test from repeating setup code.
 
-**Data flow**: It starts from `NetworkProxySettings::default()`, and when the input slice is non-empty it converts each `&str` path into `String` and calls `set_allow_unix_sockets`; then it returns the settings.
+**Data flow**: It receives a slice of socket path strings. It starts from default settings, optionally sets those paths as allowed Unix sockets, and returns the settings.
 
-**Call relations**: Several tests use this fixture helper to avoid repeating allowlist setup.
+**Call relations**: Several tests call this helper before checking address clamping or runtime validation. It relies on `NetworkProxySettings::default` for the safe baseline.
 
 *Call graph*: calls 1 internal fn (default).
 
@@ -3086,11 +3128,11 @@ fn settings_with_unix_sockets(unix_sockets: &[&str]) -> NetworkProxySettings
 fn network_proxy_settings_default_matches_local_use_baseline()
 ```
 
-**Purpose**: Asserts that the `Default` implementation matches the intended baseline local proxy configuration exactly.
+**Purpose**: Checks that the default settings stay aligned with the intended safe local baseline. This prevents accidental changes to important defaults.
 
-**Data flow**: The test constructs `NetworkProxySettings::default()` and compares it against a fully spelled-out expected struct.
+**Data flow**: It constructs the default settings and compares them with an explicitly written expected settings value. The test passes only if every field matches.
 
-**Call relations**: It guards against accidental default changes that would alter startup behavior or serialized config shape.
+**Call relations**: The Rust test runner calls this test. It protects `NetworkProxySettings::default` from quiet regressions.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3101,11 +3143,11 @@ fn network_proxy_settings_default_matches_local_use_baseline()
 fn partial_network_config_uses_struct_defaults_for_missing_fields()
 ```
 
-**Purpose**: Verifies Serde defaulting fills in omitted network settings when only a subset of fields is provided.
+**Purpose**: Checks that loading a partial configuration fills in missing network fields with defaults. Users should not have to specify every field manually.
 
-**Data flow**: It deserializes JSON containing only `network.enabled = true`, constructs an expected settings struct using `..Default::default()`, and asserts equality.
+**Data flow**: It parses JSON containing only `enabled: true`, builds the expected settings by changing that one default field, and compares the two.
 
-**Call relations**: This test covers the interaction between `#[serde(default)]` and the manual `Default` implementation.
+**Call relations**: The test runner calls this test. It verifies the interaction between Serde configuration loading and `NetworkProxySettings::default`.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (assert_eq!, from_str).
 
@@ -3116,11 +3158,11 @@ fn partial_network_config_uses_struct_defaults_for_missing_fields()
 fn set_allowed_domains_preserves_existing_deny_for_same_pattern()
 ```
 
-**Purpose**: Checks that replacing allow entries does not erase an existing deny entry for the same domain pattern.
+**Purpose**: Checks that deny wins when the same domain is both denied and allowed. This protects the safer conflict rule.
 
-**Data flow**: It creates default settings, sets a deny for `example.com`, then sets an allow for the same pattern and asserts that effective allows are `None` while denies still contain `example.com`.
+**Data flow**: It starts from default settings, denies `example.com`, then tries to allow the same domain. It verifies there is no effective allow entry and that the deny entry remains.
 
-**Call relations**: This test exercises the deny-wins semantics encoded by `effective_entries` and the mutator behavior that preserves opposite-permission entries.
+**Call relations**: The test runner calls this test. It exercises the domain setters and the effective permission logic used by `allowed_domains` and `denied_domains`.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (assert_eq!, vec!).
 
@@ -3131,11 +3173,11 @@ fn set_allowed_domains_preserves_existing_deny_for_same_pattern()
 fn network_domain_permissions_serialize_to_effective_map_shape()
 ```
 
-**Purpose**: Verifies that serialized config emits only effective domain permissions, not raw duplicate allow/deny entries.
+**Purpose**: Checks that domain permissions serialize as the final effective map, not as raw duplicate entries. This keeps saved configuration clean and faithful to actual behavior.
 
-**Data flow**: It builds settings with both deny and allow for `example.com`, wraps them in `NetworkProxyConfig`, serializes to JSON value, and asserts the `domains` object contains only `example.com: deny`.
+**Data flow**: It creates settings with conflicting allow and deny entries for the same domain, serializes the config to JSON, and compares it with JSON containing only the effective deny rule.
 
-**Call relations**: This test specifically covers `NetworkDomainPermissions::serialize` and `effective_entries`.
+**Call relations**: The test runner calls this test. It verifies `NetworkDomainPermissions::serialize` and its use of effective entries.
 
 *Call graph*: calls 1 internal fn (default); 3 external calls (assert_eq!, to_value, vec!).
 
@@ -3146,11 +3188,11 @@ fn network_domain_permissions_serialize_to_effective_map_shape()
 fn parse_host_port_defaults_for_empty_string()
 ```
 
-**Purpose**: Ensures empty address strings are rejected rather than silently defaulted.
+**Purpose**: Checks that an empty address is rejected instead of silently becoming some default host. That makes missing configuration obvious.
 
-**Data flow**: It calls `parse_host_port("", 1234)` and asserts the result is an error.
+**Data flow**: It passes an empty string to `parse_host_port` and asserts that the result is an error.
 
-**Call relations**: This is one of several parser edge-case tests for startup validation.
+**Call relations**: The test runner calls this test. It protects the missing-host error path in `parse_host_port`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3161,11 +3203,11 @@ fn parse_host_port_defaults_for_empty_string()
 fn parse_host_port_defaults_for_whitespace()
 ```
 
-**Purpose**: Ensures whitespace-only address strings are rejected.
+**Purpose**: Checks that an address containing only spaces is rejected. Whitespace should be treated as missing input.
 
-**Data flow**: It calls `parse_host_port("   ", 5555)` and asserts the result is an error.
+**Data flow**: It passes a whitespace-only string to `parse_host_port` and asserts that parsing fails.
 
-**Call relations**: It complements the empty-string parser test.
+**Call relations**: The test runner calls this test. It verifies that trimming in `parse_host_port` does not hide an empty value.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3176,11 +3218,11 @@ fn parse_host_port_defaults_for_whitespace()
 fn parse_host_port_parses_host_port_without_scheme()
 ```
 
-**Purpose**: Checks that loose `host:port` input parses correctly without requiring a URL scheme.
+**Purpose**: Checks that plain `host:port` input works even without `http://`. This supports convenient configuration.
 
-**Data flow**: It calls `parse_host_port("127.0.0.1:8080", 3128)` and compares the result to the expected `SocketAddressParts`.
+**Data flow**: It parses `127.0.0.1:8080` with a default port and expects host `127.0.0.1` and port `8080`.
 
-**Call relations**: This covers the scheme-prefixing path in `parse_host_port`.
+**Call relations**: The test runner calls this test. It protects the common loose-address path in `parse_host_port`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3191,11 +3233,11 @@ fn parse_host_port_parses_host_port_without_scheme()
 fn parse_host_port_parses_host_port_with_scheme_and_path()
 ```
 
-**Purpose**: Checks that URL-like inputs with paths still yield the correct host and port.
+**Purpose**: Checks that full URL input is parsed correctly, ignoring the path for bind-address purposes. Only host and port matter here.
 
-**Data flow**: It parses `http://example.com:8080/some/path` and asserts the extracted host is `example.com` and port is `8080`.
+**Data flow**: It parses `http://example.com:8080/some/path` and expects host `example.com` with port `8080`.
 
-**Call relations**: This exercises the preferred `Url::parse` branch.
+**Call relations**: The test runner calls this test. It verifies the standard URL parser path inside `parse_host_port`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3206,11 +3248,11 @@ fn parse_host_port_parses_host_port_with_scheme_and_path()
 fn parse_host_port_strips_userinfo()
 ```
 
-**Purpose**: Verifies that embedded userinfo does not become part of the parsed host.
+**Purpose**: Checks that usernames and passwords in URL-like input do not become part of the host. This keeps parsing correct for addresses that include credentials.
 
-**Data flow**: It parses `http://user:pass@host.example:5555` and asserts the host is `host.example` and port `5555`.
+**Data flow**: It parses `http://user:pass@host.example:5555` and expects only `host.example` and port `5555`.
 
-**Call relations**: This covers both URL parsing and fallback expectations around userinfo stripping.
+**Call relations**: The test runner calls this test. It verifies that `parse_host_port` extracts the real host from URL-style input.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3221,11 +3263,11 @@ fn parse_host_port_strips_userinfo()
 fn parse_host_port_parses_ipv6_with_brackets()
 ```
 
-**Purpose**: Checks bracketed IPv6 parsing with an explicit port.
+**Purpose**: Checks that bracketed IPv6 addresses parse correctly. IPv6 uses colons internally, so brackets show where the host ends and the port begins.
 
-**Data flow**: It parses `http://[::1]:9999` and asserts host `::1` and port `9999`.
+**Data flow**: It parses `http://[::1]:9999` and expects host `::1` and port `9999`.
 
-**Call relations**: This validates the IPv6-aware host extraction path.
+**Call relations**: The test runner calls this test. It protects IPv6 support in `parse_host_port`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3236,11 +3278,11 @@ fn parse_host_port_parses_ipv6_with_brackets()
 fn parse_host_port_does_not_treat_unbracketed_ipv6_as_host_port()
 ```
 
-**Purpose**: Ensures bare IPv6 literals are not misinterpreted as `host:port` pairs.
+**Purpose**: Checks that an unbracketed IPv6 address is not mistaken for a `host:port` pair. This avoids splitting IPv6 at the wrong colon.
 
-**Data flow**: It parses `2001:db8::1` with default port `3128` and asserts the host remains the full IPv6 literal and the port stays at the default.
+**Data flow**: It parses `2001:db8::1` with default port `3128` and expects the whole string as the host plus the default port.
 
-**Call relations**: This covers the early IPv6-literal special case in `parse_host_port`.
+**Call relations**: The test runner calls this test. It verifies the special IPv6 guard near the start of `parse_host_port`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3251,11 +3293,11 @@ fn parse_host_port_does_not_treat_unbracketed_ipv6_as_host_port()
 fn parse_host_port_falls_back_to_default_port_when_port_is_invalid()
 ```
 
-**Purpose**: Checks that malformed port text does not fail parsing when a host is still recoverable.
+**Purpose**: Checks that an invalid port text falls back to the default port. This matches the parser's forgiving behavior for loose input.
 
-**Data flow**: It parses `example.com:notaport` and asserts the host is `example.com` and the port falls back to `3128`.
+**Data flow**: It parses `example.com:notaport` with default port `3128` and expects host `example.com` with port `3128`.
 
-**Call relations**: This exercises the fallback parser’s forgiving invalid-port behavior.
+**Call relations**: The test runner calls this test. It covers the fallback behavior used by `parse_host_port` and its manual parser.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3266,11 +3308,11 @@ fn parse_host_port_falls_back_to_default_port_when_port_is_invalid()
 fn host_and_port_from_network_addr_defaults_for_empty_string()
 ```
 
-**Purpose**: Verifies the display helper returns a placeholder for missing input.
+**Purpose**: Checks that display formatting reports missing address input clearly. Empty input should show as `<missing>`.
 
-**Data flow**: It calls `host_and_port_from_network_addr("", 1234)` and asserts the result is `<missing>`.
+**Data flow**: It passes an empty string to `host_and_port_from_network_addr` and expects the string `<missing>`.
 
-**Call relations**: This covers the non-erroring display-oriented wrapper around address parsing.
+**Call relations**: The test runner calls this test. It verifies the user-facing display helper's empty-input branch.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3281,11 +3323,11 @@ fn host_and_port_from_network_addr_defaults_for_empty_string()
 fn host_and_port_from_network_addr_formats_ipv6()
 ```
 
-**Purpose**: Checks that the display helper preserves IPv6 bracket formatting.
+**Purpose**: Checks that IPv6 display strings include brackets. This makes the displayed host and port unambiguous.
 
-**Data flow**: It formats `http://[::1]:8080` and asserts the output is `[::1]:8080`.
+**Data flow**: It formats `http://[::1]:8080` and expects `[::1]:8080`.
 
-**Call relations**: This indirectly covers both parsing and `format_host_and_port`.
+**Call relations**: The test runner calls this test. It covers `host_and_port_from_network_addr` and the bracket logic in `format_host_and_port`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3296,11 +3338,11 @@ fn host_and_port_from_network_addr_formats_ipv6()
 fn resolve_addr_maps_localhost_to_loopback()
 ```
 
-**Purpose**: Ensures `localhost` is normalized to an explicit loopback IP address.
+**Purpose**: Checks that `localhost` becomes the concrete loopback IP address. This avoids depending on hostname lookup.
 
-**Data flow**: It calls `resolve_addr("localhost", 3128)` and asserts the result is `127.0.0.1:3128`.
+**Data flow**: It resolves `localhost` with default port `3128` and expects `127.0.0.1:3128`.
 
-**Call relations**: This covers the special-case hostname rewrite in runtime address resolution.
+**Call relations**: The test runner calls this test. It protects the hostname mapping behavior in `resolve_addr`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3311,11 +3353,11 @@ fn resolve_addr_maps_localhost_to_loopback()
 fn resolve_addr_parses_ip_literals()
 ```
 
-**Purpose**: Checks that IPv4 literals are preserved as concrete bind addresses.
+**Purpose**: Checks that plain IPv4 address strings resolve directly. Literal IP addresses should be preserved.
 
-**Data flow**: It resolves `1.2.3.4` with default port `80` and asserts the resulting `SocketAddr` matches.
+**Data flow**: It resolves `1.2.3.4` with default port `80` and expects `1.2.3.4:80`.
 
-**Call relations**: This covers the successful `IpAddr` parse branch in `resolve_addr`.
+**Call relations**: The test runner calls this test. It verifies the IP-literal path in `resolve_addr`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3326,11 +3368,11 @@ fn resolve_addr_parses_ip_literals()
 fn resolve_addr_parses_ipv6_literals()
 ```
 
-**Purpose**: Checks that IPv6 literals survive runtime address resolution.
+**Purpose**: Checks that IPv6 literal URLs resolve correctly. This confirms IPv6 bind addresses are supported.
 
-**Data flow**: It resolves `http://[::1]:8080` and asserts the resulting `SocketAddr` is `[::1]:8080`.
+**Data flow**: It resolves `http://[::1]:8080` and expects the matching IPv6 socket address.
 
-**Call relations**: This complements the IPv4 literal resolution test.
+**Call relations**: The test runner calls this test. It exercises `resolve_addr` through the IPv6 parsing path.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3341,11 +3383,11 @@ fn resolve_addr_parses_ipv6_literals()
 fn resolve_addr_falls_back_to_loopback_for_hostnames()
 ```
 
-**Purpose**: Verifies that non-IP hostnames do not trigger DNS resolution and instead bind to loopback with the parsed port.
+**Purpose**: Checks that ordinary hostnames do not cause external DNS resolution for bind addresses. They are mapped to loopback with the configured port.
 
-**Data flow**: It resolves `http://example.com:5555` and asserts the result is `127.0.0.1:5555`.
+**Data flow**: It resolves `http://example.com:5555` and expects `127.0.0.1:5555`.
 
-**Call relations**: This covers the hostname fallback branch in `resolve_addr`.
+**Call relations**: The test runner calls this test. It protects the safety choice made inside `resolve_addr` for non-IP hostnames.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3356,11 +3398,11 @@ fn resolve_addr_falls_back_to_loopback_for_hostnames()
 fn clamp_bind_addrs_allows_non_loopback_when_enabled()
 ```
 
-**Purpose**: Checks that dangerous non-loopback binding is preserved when explicitly enabled and unix-socket proxying is not active.
+**Purpose**: Checks that the explicit dangerous setting really allows outside-facing bind addresses when no Unix socket proxying is enabled.
 
-**Data flow**: It builds settings with `dangerously_allow_non_loopback_proxy = true`, passes `0.0.0.0` HTTP and SOCKS addresses into `clamp_bind_addrs`, and asserts both remain unchanged.
+**Data flow**: It builds settings with non-loopback binding allowed, passes `0.0.0.0` HTTP and SOCKS addresses to `clamp_bind_addrs`, and expects both addresses to remain unchanged.
 
-**Call relations**: This test covers the permissive branch of bind-address clamping.
+**Call relations**: The test runner calls this test. It verifies the override path through `clamp_bind_addrs` and `clamp_non_loopback`.
 
 *Call graph*: calls 1 internal fn (clamp_bind_addrs); 2 external calls (default, assert_eq!).
 
@@ -3371,11 +3413,11 @@ fn clamp_bind_addrs_allows_non_loopback_when_enabled()
 fn clamp_bind_addrs_forces_loopback_when_unix_sockets_enabled()
 ```
 
-**Purpose**: Verifies that enabling specific unix-socket proxying forces listener binds back to loopback even when dangerous non-loopback binding is requested.
+**Purpose**: Checks that Unix socket proxying forces local-only binding even when the dangerous non-loopback setting is enabled. This prevents remote users from reaching local sockets through the proxy.
 
-**Data flow**: It builds settings with an allowlisted unix socket and `dangerously_allow_non_loopback_proxy = true`, clamps `0.0.0.0` addresses, and asserts both become loopback.
+**Data flow**: It creates settings with an allowed Unix socket and non-loopback binding enabled, passes outside-facing addresses to `clamp_bind_addrs`, and expects both to become `127.0.0.1` on the same ports.
 
-**Call relations**: This covers the extra safety rule that protects local-daemon access from remote exposure.
+**Call relations**: The test runner calls this test. It uses `settings_with_unix_sockets` and checks the Unix-socket safety branch in `clamp_bind_addrs`.
 
 *Call graph*: calls 1 internal fn (clamp_bind_addrs); 2 external calls (assert_eq!, settings_with_unix_sockets).
 
@@ -3386,11 +3428,11 @@ fn clamp_bind_addrs_forces_loopback_when_unix_sockets_enabled()
 fn clamp_bind_addrs_forces_loopback_when_all_unix_sockets_enabled()
 ```
 
-**Purpose**: Verifies the same loopback-forcing behavior when broad unix-socket access is enabled globally rather than via an explicit allowlist.
+**Purpose**: Checks the same local-only safety rule when all Unix sockets are allowed. This is an even broader and riskier setting, so loopback binding is required.
 
-**Data flow**: It builds settings with `dangerously_allow_all_unix_sockets = true` and dangerous non-loopback binding enabled, clamps `0.0.0.0` addresses, and asserts both become loopback.
+**Data flow**: It creates settings with `dangerously_allow_all_unix_sockets` and non-loopback binding enabled, runs `clamp_bind_addrs`, and expects both addresses to be clamped to `127.0.0.1`.
 
-**Call relations**: This is the broad-access counterpart to the explicit-allowlist clamp test.
+**Call relations**: The test runner calls this test. It covers the all-sockets branch of the safety logic in `clamp_bind_addrs`.
 
 *Call graph*: calls 1 internal fn (clamp_bind_addrs); 2 external calls (default, assert_eq!).
 
@@ -3401,11 +3443,11 @@ fn clamp_bind_addrs_forces_loopback_when_all_unix_sockets_enabled()
 fn resolve_runtime_rejects_relative_allow_unix_sockets_entries()
 ```
 
-**Purpose**: Ensures startup runtime resolution fails when the unix-socket allowlist contains a relative path.
+**Purpose**: Checks that startup rejects relative Unix socket allow-list entries. Relative paths are unsafe because their target depends on the process working directory.
 
-**Data flow**: It builds a config with `relative.sock` in the allowlist, calls `resolve_runtime`, expects an error, and asserts the message points to `network.allow_unix_sockets[0]`.
+**Data flow**: It builds a config allowing `relative.sock`, calls `resolve_runtime`, expects an error, and checks that the error message points to the bad allow-list index.
 
-**Call relations**: This test covers indexed error annotation from `validate_unix_socket_allowlist_paths`.
+**Call relations**: The test runner calls this test. It verifies that `resolve_runtime` calls `validate_unix_socket_allowlist_paths` before accepting runtime settings.
 
 *Call graph*: calls 1 internal fn (resolve_runtime); 3 external calls (assert!, settings_with_unix_sockets, panic!).
 
@@ -3416,11 +3458,11 @@ fn resolve_runtime_rejects_relative_allow_unix_sockets_entries()
 fn resolve_runtime_accepts_unix_style_absolute_allow_unix_sockets_entries()
 ```
 
-**Purpose**: Checks that Unix-style absolute paths are accepted as valid allowlist entries.
+**Purpose**: Checks that Unix-style absolute socket paths are accepted. Paths beginning with `/` should work for Unix socket allow lists.
 
-**Data flow**: It builds a config with `/private/tmp/example.sock` in the allowlist, calls `resolve_runtime`, and asserts success.
+**Data flow**: It builds a config allowing `/private/tmp/example.sock` and asserts that `resolve_runtime` succeeds.
 
-**Call relations**: This covers the `UnixStyleAbsolutePath` fallback accepted by `ValidatedUnixSocketPath::parse`.
+**Call relations**: The test runner calls this test. It confirms the positive path through `ValidatedUnixSocketPath::parse` and runtime resolution.
 
 *Call graph*: 2 external calls (assert!, settings_with_unix_sockets).
 
@@ -3430,9 +3472,15 @@ These utilities expose the current build version and validate or compare externa
 
 ### `tui/src/npm_registry.rs`
 
-`domain_logic` · `release/update validation`
+`domain_logic` · `update checking`
 
-This file defines a small deserialization model for the npm registry response and a strict readiness check used by update/publish logic. `NpmPackageInfo` mirrors the registry JSON shape with a renamed `dist-tags` map and a `versions` map keyed by version string; each version may contain optional `dist` metadata, and that metadata may in turn contain optional `tarball` and `integrity` strings. The central invariant is that a version is only considered ready if the package-level `latest` dist-tag exactly equals the requested version after trimming whitespace, and the corresponding version entry exists with non-empty `dist.tarball` and `dist.integrity` values. The helper `version_info_with_dist` performs the structural checks in order and emits precise `anyhow` errors for each missing piece, so callers can distinguish stale tags from incomplete publish propagation. In non-debug builds the file also exposes the concrete registry URL for `@openai/codex`. The tests build synthetic registry payloads with `serde_json`, covering the success path, stale `latest` tags, and missing `dist` metadata to lock in both acceptance criteria and human-readable error wording.
+This file is a safety check around npm, the package registry used for JavaScript packages. The app can compare a GitHub release version with the npm registry entry for `@openai/codex`. Before saying an update is available, it needs to know that npm has really finished publishing that exact version.
+
+The file defines simple data shapes for the parts of the npm response it cares about: the `dist-tags` map, the list of versions, and each version's `dist` data. In npm, the `latest` dist-tag is like a store shelf label saying “this is the current version.” The `dist` section then gives the actual package download address and an integrity string, which is a checksum-like value used to verify the downloaded package has not been changed.
+
+The main check, `ensure_version_ready`, first trims the requested version and confirms that npm's `latest` tag points to that exact version. Then it asks `version_info_with_dist` to make sure that version exists and has both a non-empty tarball URL and non-empty integrity value. If anything is missing or stale, it returns a clear error instead of silently accepting a half-published package.
+
+The tests build small fake npm responses and verify the important cases: a good package passes, a stale `latest` tag fails, and missing distribution metadata fails.
 
 #### Function details
 
@@ -3445,11 +3493,11 @@ fn ensure_version_ready(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks whether a specific npm version is fully publish-ready according to the registry metadata. It first verifies that the package's `latest` dist-tag points at the requested version, then verifies that the version entry has complete distribution metadata.
+**Purpose**: Checks whether the npm registry data says a particular version is truly ready to use. It makes sure npm's `latest` label matches the expected release version and that the package version has the download and verification details needed for installation.
 
-**Data flow**: Reads `package_info.dist_tags` and `package_info.versions`, and trims the input `version` string. It compares the trimmed version against the `latest` dist-tag, then delegates structural validation of the version entry to `version_info_with_dist`; it returns `Ok(())` on success or an `anyhow` error describing the exact mismatch or missing field.
+**Data flow**: It receives parsed npm package information and a version string. It trims extra spaces from the version, reads the `latest` entry from the registry's dist-tags, compares it with the expected version, then asks `version_info_with_dist` to inspect the version's distribution data. If all checks pass, it returns success with no extra value; if something is wrong, it returns an explanatory error.
 
-**Call relations**: This is the public checker used by `check_for_update` and by the unit tests. After the top-level dist-tag gate passes, it delegates the deeper per-version checks to `version_info_with_dist`; otherwise it exits early with `bail!` for stale or absent `latest` metadata.
+**Call relations**: This is the public check used by the update flow, including `check_for_update`, before trusting npm as ready for a release. The tests also call it directly to prove that good metadata is accepted and broken metadata is rejected. When the top-level `latest` tag looks right, it hands the deeper version-specific validation to `version_info_with_dist`.
 
 *Call graph*: calls 1 internal fn (version_info_with_dist); called by 4 (ready_version_rejects_missing_root_dist, ready_version_rejects_stale_latest_dist_tag, ready_version_requires_latest_dist_tag_and_root_dist, check_for_update); 1 external calls (bail!).
 
@@ -3463,11 +3511,11 @@ fn version_info_with_dist(
 ) -> anyhow::Result<&'a NpmPackageVersionInfo>
 ```
 
-**Purpose**: Looks up one version entry in the npm metadata and enforces that its `dist`, `dist.tarball`, and `dist.integrity` fields are present and non-empty. It is the low-level validator behind the public readiness check.
+**Purpose**: Looks up one exact package version and verifies that npm included the metadata needed to download and verify it. This is the stricter, version-level part of the readiness check.
 
-**Data flow**: Consumes `package_info` plus a version string, reads `package_info.versions[version]`, then inspects nested optional fields under `dist`. It returns a borrowed `&NpmPackageVersionInfo` when all checks pass; otherwise it produces an `anyhow` error naming the missing version, missing `dist`, missing tarball, or missing integrity field.
+**Data flow**: It receives the parsed package information and the version to find. It searches the `versions` map for that version, checks that the version has a `dist` section, then confirms that `dist.tarball` and `dist.integrity` are both present and not empty. It returns a reference to the version information when everything is valid, or an error describing the missing piece.
 
-**Call relations**: This helper is only reached from `ensure_version_ready` after the `latest` tag has already been validated. It centralizes the nested metadata checks so the caller can keep the top-level control flow focused on tag consistency.
+**Call relations**: It is called by `ensure_version_ready` after the registry's `latest` tag has already matched the expected version. This keeps the larger check readable: `ensure_version_ready` decides whether npm points at the right release, while this helper confirms the release entry is complete enough to use.
 
 *Call graph*: called by 1 (ensure_version_ready); 1 external calls (bail!).
 
@@ -3478,11 +3526,11 @@ fn version_info_with_dist(
 fn version_json(version: &str) -> serde_json::Value
 ```
 
-**Purpose**: Builds a synthetic JSON object for one npm version entry with valid `dist.integrity` and `dist.tarball` fields. It gives tests a compact way to create realistic version metadata.
+**Purpose**: Builds a small fake npm version entry for tests. It creates realistic-looking `dist` data for a supplied version so the tests do not need to repeat the same JSON shape by hand.
 
-**Data flow**: Takes a version string and formats it into a `serde_json::Value` object containing a `dist` object with deterministic integrity and tarball strings. It returns that JSON value without mutating external state.
+**Data flow**: It receives a version string. It inserts that version into a fake integrity value and tarball URL, wraps them in a JSON object shaped like npm's version metadata, and returns that JSON value for test setup.
 
-**Call relations**: Used by `tests::package_info` to populate the `versions` map in test fixtures. It isolates the exact JSON shape expected by deserialization.
+**Call relations**: The test helper `tests::package_info` calls this when it needs to create a complete fake version entry. It is part of the test scaffolding that lets the actual test cases focus on what condition is being checked.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3493,11 +3541,11 @@ fn version_json(version: &str) -> serde_json::Value
 fn package_info(github_latest: &str, npm_latest: &str) -> NpmPackageInfo
 ```
 
-**Purpose**: Constructs a deserialized `NpmPackageInfo` fixture with a chosen GitHub-latest version entry and an independently chosen npm `latest` dist-tag. This lets tests model both aligned and stale registry states.
+**Purpose**: Creates a fake parsed npm package response for tests. It lets each test choose what GitHub thinks the latest version is and what npm's `latest` tag says.
 
-**Data flow**: Accepts `github_latest` and `npm_latest`, creates a JSON object map containing one version entry from `tests::version_json`, then deserializes the assembled JSON into `NpmPackageInfo`. It returns the parsed struct and panics only if the fixture shape is invalid.
+**Data flow**: It receives two version strings: one to include as the available version entry, and one to use as npm's `latest` tag. It builds a JSON object with `dist-tags` and `versions`, uses `tests::version_json` to make the version's download metadata, then deserializes the JSON into `NpmPackageInfo`. The result is ready to pass into `ensure_version_ready`.
 
-**Call relations**: Called by the readiness tests to avoid repeating fixture assembly. It feeds `ensure_version_ready` with controlled combinations of version presence and dist-tag values.
+**Call relations**: The positive test and stale-tag test call this helper to create their input data. It sits between raw JSON construction and the real validation function, so the tests exercise the same parsed data shape that production code uses.
 
 *Call graph*: 4 external calls (new, from_value, json!, version_json).
 
@@ -3508,11 +3556,11 @@ fn package_info(github_latest: &str, npm_latest: &str) -> NpmPackageInfo
 fn ready_version_requires_latest_dist_tag_and_root_dist()
 ```
 
-**Purpose**: Verifies the happy path where the npm `latest` tag matches the requested version and the version entry contains complete `dist` metadata. It confirms that the validator accepts a fully propagated release.
+**Purpose**: Tests the happy path: npm says the expected version is `latest`, and that version has the needed distribution metadata. It proves that valid registry data is accepted.
 
-**Data flow**: Creates a fixture via `tests::package_info`, passes it with the same version string into `ensure_version_ready`, and asserts that the result is successful. It writes no shared state.
+**Data flow**: It creates fake package information where both the expected release and npm's `latest` tag are `1.2.3`. It passes that data into `ensure_version_ready` and expects the result to be successful.
 
-**Call relations**: This test exercises the normal call path into `ensure_version_ready` and implicitly through `version_info_with_dist`, proving the acceptance criteria for a ready package.
+**Call relations**: This test uses `tests::package_info` to build valid input, then calls the same `ensure_version_ready` function used by update checking. It confirms the guard does not block a properly published package.
 
 *Call graph*: calls 1 internal fn (ensure_version_ready); 1 external calls (package_info).
 
@@ -3523,11 +3571,11 @@ fn ready_version_requires_latest_dist_tag_and_root_dist()
 fn ready_version_rejects_stale_latest_dist_tag()
 ```
 
-**Purpose**: Checks that readiness fails when npm's `latest` dist-tag still points to an older version. It also verifies that the resulting error message explicitly mentions the dist-tag problem.
+**Purpose**: Tests that a package is rejected when npm's `latest` label still points to an older version. This protects users from a release state where GitHub and npm disagree.
 
-**Data flow**: Builds a fixture whose version map contains `1.2.3` but whose `latest` tag is `1.2.2`, calls `ensure_version_ready`, captures the error, and asserts that its string contains `latest dist-tag`. It returns no value beyond the test assertion outcome.
+**Data flow**: It creates fake package information where the desired version exists as `1.2.3`, but npm's `latest` tag says `1.2.2`. It calls `ensure_version_ready`, expects an error, and checks that the error message mentions the stale `latest` tag.
 
-**Call relations**: This test targets the early branch in `ensure_version_ready` before `version_info_with_dist` can make the version pass. It documents that stale tag propagation is treated as a hard failure.
+**Call relations**: This test uses `tests::package_info` to create a mismatch, then exercises `ensure_version_ready`. It verifies the first stage of the readiness check: npm must point `latest` at the same version the update flow expects.
 
 *Call graph*: calls 1 internal fn (ensure_version_ready); 2 external calls (assert!, package_info).
 
@@ -3538,26 +3586,24 @@ fn ready_version_rejects_stale_latest_dist_tag()
 fn ready_version_rejects_missing_root_dist()
 ```
 
-**Purpose**: Ensures that a version entry without `dist` metadata is rejected even if the package-level `latest` tag is correct. It locks in the specific missing-metadata failure mode.
+**Purpose**: Tests that a version is rejected when its npm entry lacks the `dist` metadata needed for downloading and verification. This catches a package record that exists but is not usable.
 
-**Data flow**: Deserializes a hand-written JSON payload with matching `latest` and version keys but an empty version object, calls `ensure_version_ready`, captures the error, and asserts that the message mentions missing dist metadata. It mutates no external state.
+**Data flow**: It builds fake npm package information where the `latest` tag points to `1.2.3` and the version entry exists, but that entry has no `dist` section. It passes the data to `ensure_version_ready`, expects an error, and checks that the error explains the missing distribution metadata.
 
-**Call relations**: This test drives `ensure_version_ready` past the dist-tag check and into `version_info_with_dist`, validating the nested metadata guardrails.
+**Call relations**: This test constructs its JSON directly so it can leave out the `dist` section on purpose. It calls `ensure_version_ready`, which in turn relies on `version_info_with_dist` to catch the missing metadata.
 
 *Call graph*: calls 1 internal fn (ensure_version_ready); 3 external calls (assert!, from_value, json!).
 
 
 ### `tui/src/update_versions.rs`
 
-`util` · `update version parsing and comparison during startup checks`
+`util` · `upgrade check`
 
-This file contains pure helpers for interpreting version strings in the limited format the updater expects. The internal workhorse is `parse_version`, which trims surrounding whitespace, splits on `.`, parses exactly three numeric components into `(u64, u64, u64)`, and returns `None` if any component is missing or non-numeric. Because it does not understand prerelease or build metadata, strings like `0.11.0-beta.1` intentionally fail to parse.
+This file supports the app’s upgrade-checking behavior. When the program hears about a latest release, it needs to answer simple questions: “What version number is in this tag?”, “Is that newer than what I am running?”, and “Am I running a special source build where update checks should be skipped?” Without these helpers, the update prompt could show at the wrong time, fail on valid release tags, or try to compare versions it does not understand.
 
-`is_newer` uses that parser on both the fetched latest version and the current version. If both parse successfully, it compares the tuples lexicographically and returns `Some(true)` or `Some(false)`; if either side is unparsable, it returns `None` rather than guessing. That conservative behavior prevents prerelease tags or malformed data from triggering misleading update banners.
+The file deliberately uses a simple version format: three numbers separated by dots, like `1.2.3`. This is often called semantic versioning, but this code only accepts the plain numeric shape. If a version has extra labels such as `1.0.0-rc.1` or `0.11.0-beta.1`, the parser rejects it instead of guessing. In that case, comparison returns `None`, meaning “I cannot safely say.”
 
-`extract_version_from_latest_tag` converts GitHub release tags into plain version strings by requiring the `rust-v` prefix and stripping it; any other tag shape becomes an error with the original tag embedded in the message. `is_source_build_version` treats exactly `0.0.0` as the sentinel for source builds, allowing higher-level update logic to skip network checks for locally built binaries.
-
-The tests document the intended semantics: strict prefix parsing for tags, no prerelease support, ordinary numeric comparisons, source-build detection, and whitespace tolerance.
+The main flow is like checking dates on two product labels. First, `parse_version` trims whitespace and splits a version into major, minor, and patch numbers. Then `is_newer` compares those number triples. `extract_version_from_latest_tag` removes the project’s expected GitHub tag prefix, `rust-v`, so `rust-v1.5.0` becomes `1.5.0`. The tests pin down these rules so update messages stay predictable.
 
 #### Function details
 
@@ -3567,11 +3613,11 @@ The tests document the intended semantics: strict prefix parsing for tags, no pr
 fn is_newer(latest: &str, current: &str) -> Option<bool>
 ```
 
-**Purpose**: Compares two plain three-part numeric versions and reports whether the first is newer than the second.
+**Purpose**: Compares two plain version strings and says whether the latest one is newer than the current one. If either version is not in the simple `number.number.number` format, it returns “unknown” instead of making a risky guess.
 
-**Data flow**: It takes `latest` and `current` as `&str`, parses both with `parse_version`, and if both succeed compares the resulting tuples with `>`. It returns `Some(bool)` on successful parsing or `None` if either version string is outside the supported format.
+**Data flow**: It receives two text strings: the reported latest version and the current running version. It sends both through `parse_version`, which tries to turn each into three numbers. If both parse successfully, it compares the number triples and returns `Some(true)` or `Some(false)`; if either parse fails, it returns `None`.
 
-**Call relations**: Higher-level update logic uses this helper after reading cached or fetched version strings. Its `None` result is treated conservatively by callers so malformed or prerelease versions do not trigger update notices.
+**Call relations**: This function relies on `parse_version` for the careful text-to-number step. It is the comparison layer that other update-checking code can use after a latest release version has been discovered.
 
 *Call graph*: calls 1 internal fn (parse_version).
 
@@ -3582,11 +3628,11 @@ fn is_newer(latest: &str, current: &str) -> Option<bool>
 fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String>
 ```
 
-**Purpose**: Converts a GitHub release tag name like `rust-v1.5.0` into the bare version string `1.5.0`.
+**Purpose**: Pulls the usable version number out of a GitHub release tag that is expected to start with `rust-v`. For example, it turns `rust-v1.5.0` into `1.5.0`.
 
-**Data flow**: It takes `latest_tag_name`, attempts `strip_prefix("rust-v")`, clones the remainder into an owned `String` on success, and otherwise constructs an `anyhow` error mentioning the original tag. It returns `anyhow::Result<String>`.
+**Data flow**: It receives a tag name as text. It checks whether the text begins with `rust-v`; if so, it removes that prefix and returns the rest as the version string. If the prefix is missing, it returns an error explaining that the tag could not be parsed.
 
-**Call relations**: This function is called by `fetch_latest_github_release_version` after deserializing the GitHub API response, isolating tag-shape validation from the HTTP code.
+**Call relations**: This function is called by `fetch_latest_github_release_version` after release information has been fetched. It translates the release tag into the plain version text that the rest of the upgrade-checking path can compare.
 
 *Call graph*: called by 1 (fetch_latest_github_release_version).
 
@@ -3597,11 +3643,11 @@ fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<Stri
 fn is_source_build_version(version: &str) -> bool
 ```
 
-**Purpose**: Recognizes the special `0.0.0` version used to identify source builds that should not participate in normal update checks.
+**Purpose**: Detects the special version `0.0.0`, which represents a build made from source rather than a normal packaged release. The update UI can use this to avoid showing normal upgrade checks for that kind of build.
 
-**Data flow**: It parses the input string with `parse_version` and compares the result to `Some((0, 0, 0))`. It returns a boolean and does not mutate state.
+**Data flow**: It receives a version string. It uses `parse_version` to turn the text into three numbers, then checks whether those numbers are exactly `(0, 0, 0)`. It returns `true` only for that exact parsed value; otherwise it returns `false`.
 
-**Call relations**: Both `get_upgrade_version` and `get_upgrade_version_for_popup` call this early to short-circuit update logic for source-built binaries.
+**Call relations**: This function is used by `get_upgrade_version` and `get_upgrade_version_for_popup` when deciding whether an upgrade check or popup should proceed. It hands those callers a simple yes-or-no answer about whether the current version is a source build.
 
 *Call graph*: calls 1 internal fn (parse_version); called by 2 (get_upgrade_version, get_upgrade_version_for_popup).
 
@@ -3612,11 +3658,11 @@ fn is_source_build_version(version: &str) -> bool
 fn parse_version(v: &str) -> Option<(u64, u64, u64)>
 ```
 
-**Purpose**: Parses a trimmed dotted version string into a numeric `(major, minor, patch)` tuple.
+**Purpose**: Turns a simple version string like `1.2.3` into three numbers that Rust can compare safely. It is intentionally strict and does not accept prerelease suffixes or other extra text.
 
-**Data flow**: It trims the input, splits on `.`, reads the first three segments, parses each as `u64`, and returns `Some((maj, min, pat))` if all succeed. Missing segments, extra prerelease text in a segment, or parse failures produce `None`.
+**Data flow**: It receives version text, trims surrounding whitespace, and splits the text at dots. It then tries to read the first three pieces as unsigned numbers: major, minor, and patch. If all three are present and numeric, it returns them as a tuple; if any part is missing or not numeric, it returns `None`.
 
-**Call relations**: This private helper underpins both `is_newer` and `is_source_build_version`, centralizing the file's intentionally strict version grammar.
+**Call relations**: This is the shared helper underneath `is_newer` and `is_source_build_version`. Those functions depend on it to reject unclear version strings before they make update decisions.
 
 *Call graph*: called by 2 (is_newer, is_source_build_version).
 
@@ -3627,11 +3673,11 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)>
 fn extracts_version_from_latest_tag()
 ```
 
-**Purpose**: Confirms that a correctly prefixed GitHub tag is reduced to the expected bare version string.
+**Purpose**: Checks that a correctly formatted release tag can be converted into a plain version string.
 
-**Data flow**: It calls `extract_version_from_latest_tag("rust-v1.5.0")`, unwraps the result, and asserts equality with `"1.5.0"`.
+**Data flow**: It gives `extract_version_from_latest_tag` the text `rust-v1.5.0`. The function should remove the expected prefix and return `1.5.0`; the test compares the result with that expected value.
 
-**Call relations**: This test protects the tag parsing relied on by the GitHub release fetch path.
+**Call relations**: This test protects the behavior used later by `fetch_latest_github_release_version`, making sure release tags from GitHub are translated in the format the comparison code expects.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3642,11 +3688,11 @@ fn extracts_version_from_latest_tag()
 fn latest_tag_without_prefix_is_invalid()
 ```
 
-**Purpose**: Confirms that tags missing the required `rust-v` prefix are rejected.
+**Purpose**: Checks that a tag without the required `rust-v` prefix is treated as invalid.
 
-**Data flow**: It calls `extract_version_from_latest_tag("v1.5.0")` and asserts that the result is an error.
+**Data flow**: It passes `v1.5.0` into `extract_version_from_latest_tag`. Because the expected prefix is missing, the function should return an error, and the test confirms that an error occurred.
 
-**Call relations**: This test documents the invariant that only the expected release-tag naming scheme is accepted.
+**Call relations**: This test supports the same release-fetching path by making sure unexpected tag names do not silently turn into misleading version numbers.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3657,11 +3703,11 @@ fn latest_tag_without_prefix_is_invalid()
 fn prerelease_version_is_not_considered_newer()
 ```
 
-**Purpose**: Verifies that prerelease strings are outside the supported parser and therefore do not produce a newer/not-newer answer.
+**Purpose**: Checks that prerelease-style versions, such as beta or release-candidate labels, are not compared as if they were ordinary releases.
 
-**Data flow**: It calls `is_newer` with prerelease examples and asserts both results are `None`.
+**Data flow**: It asks `is_newer` to compare `0.11.0-beta.1` with `0.11.0`, and `1.0.0-rc.1` with `1.0.0`. Since those latest-version strings are not plain three-number versions, the result should be `None` in both cases.
 
-**Call relations**: This test captures the deliberate design choice that update comparison is strict numeric semver only, with no prerelease handling.
+**Call relations**: This test protects the strict parsing rule used by `is_newer`: if `parse_version` cannot understand a version cleanly, update-checking code should get “unknown,” not a possibly wrong newer-or-older answer.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3672,11 +3718,11 @@ fn prerelease_version_is_not_considered_newer()
 fn plain_semver_comparisons_work()
 ```
 
-**Purpose**: Checks ordinary numeric comparisons across patch, minor, and major boundaries.
+**Purpose**: Checks that ordinary three-part version comparisons behave as people expect.
 
-**Data flow**: It invokes `is_newer` on several plain version pairs and asserts the expected `Some(true)` or `Some(false)` results.
+**Data flow**: It feeds several plain version pairs into `is_newer`: patch increases, patch decreases, major version increases, and major version decreases. Each call should return `Some(true)` or `Some(false)` according to the numeric ordering.
 
-**Call relations**: This test validates the tuple-comparison semantics used by cached update evaluation.
+**Call relations**: This test confirms that `is_newer` and `parse_version` work together for the normal release versions the upgrade checker is designed to handle.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3687,11 +3733,11 @@ fn plain_semver_comparisons_work()
 fn source_build_version_is_not_checked()
 ```
 
-**Purpose**: Confirms that only `0.0.0` is treated as the source-build sentinel.
+**Purpose**: Checks that only `0.0.0` is recognized as the special source-build version.
 
-**Data flow**: It calls `is_source_build_version` with `0.0.0` and `0.1.0` and asserts true for the former and false for the latter.
+**Data flow**: It calls `is_source_build_version` with `0.0.0` and expects `true`. It then calls the same function with `0.1.0` and expects `false`.
 
-**Call relations**: This test protects the startup short-circuit used by update-checking code.
+**Call relations**: This test protects the decision used by `get_upgrade_version` and `get_upgrade_version_for_popup`, so normal versions are not accidentally skipped and source builds are not accidentally prompted for regular upgrades.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3702,17 +3748,21 @@ fn source_build_version_is_not_checked()
 fn whitespace_is_ignored()
 ```
 
-**Purpose**: Verifies that surrounding whitespace does not affect parsing or comparison.
+**Purpose**: Checks that extra spaces or newline characters around a version do not stop parsing or comparison.
 
-**Data flow**: It calls `parse_version` on a whitespace-padded string and `is_newer` on a padded latest version, asserting successful parsing and comparison.
+**Data flow**: It gives `parse_version` the text ` 1.2.3 \n` and expects the numbers `(1, 2, 3)`. It also asks `is_newer` to compare ` 1.2.3 ` with `1.2.2` and expects the latest version to be considered newer.
 
-**Call relations**: This test documents the parser's initial `trim()` behavior, which makes network or file inputs slightly more robust.
+**Call relations**: This test confirms that `parse_version` cleans up harmless surrounding whitespace before `is_newer` or other callers rely on its result.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `tui/src/version.rs`
 
-`config` · `startup`
+`config` · `compile time and version reporting`
 
-This module defines one public constant, `CODEX_CLI_VERSION`, whose value comes from Rust’s `env!` macro reading `CARGO_PKG_VERSION` during compilation. That means the version string is baked into the binary and always matches the package version Cargo built, with no runtime environment dependency and no parsing step. The constant is `pub`, not `pub(crate)`, so it is intended as a broadly consumable identifier for version banners, status screens, diagnostics, or protocol metadata that needs to report the CLI build. The implementation is deliberately minimal because the important behavior is the compile-time contract: if the package metadata changes, the embedded version changes automatically on rebuild. There are no fallback paths or formatting rules here; consumers receive the raw Cargo version string exactly as declared in the package manifest. This file serves as the canonical source for version identity within the TUI codebase.
+This file is a tiny but useful source of truth for the app's version number. When the Codex CLI is compiled, Rust reads the package version from the project's build metadata and places it into the program as a constant named `CODEX_CLI_VERSION`. That means the running program does not need to open a file or ask an external service to know its own version; the answer is already built in.
+
+This matters for things like `--version` output, diagnostics, logs, bug reports, or user interface screens that need to say exactly which release is running. Without this file, different parts of the program might invent their own way to find the version, which could lead to duplicated code or inconsistent answers.
+
+A simple analogy: this is like a label printed on a product at the factory. Once the product ships, anyone can read the label to know which version they have.

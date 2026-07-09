@@ -1,10 +1,10 @@
 # Cross-cutting observability, analytics, and feedback  `stage-20` (cross-cutting infrastructure)
 
-This stage is the system’s cross-cutting observability and diagnostics layer: it is initialized during startup, stays active through request handling, streaming, tool execution, and rollout processing, and continues to matter during shutdown when buffered telemetry and logs are flushed or persisted. Its job is to make execution inspectable without changing core control flow.
+This stage is the project’s shared “instrument panel.” It runs across startup, normal request handling, streaming, tool use, and shutdown, watching what happens so developers and operators can understand problems and usage without interrupting the main work.
 
-The OpenTelemetry foundation installs global tracing, logging, metrics, propagation, and exporter configuration that every other subsystem builds on. Session telemetry and feature-specific instrumentation then attach stable session, turn, auth, model, tool, memory, and product-area context so emitted signals are comparable and privacy-bounded. The analytics subsystem separately models low-level facts, reduces them into higher-level product events, deduplicates and batches them, and sends them to external analytics sinks or debug captures.
+Analytics event modeling turns scattered facts, such as errors, tool runs, settings, and accepted code changes, into safe summary events and sends them in the background. OpenTelemetry setup provides standard observability: logs, traces, and metrics. A trace is a linked timeline for one piece of work; metrics are counted or timed measurements. Session telemetry adds more detailed trip-recording for each conversation, request, tool call, login state, database startup, and feature outcome.
 
-For deeper debugging, rollout tracing records deterministic execution bundles and later replays them into structured conversation and tool/inference timelines. Feedback capture and log persistence collect redacted artifacts, response-debug metadata, proxy and doctor-report attachments, and durable SQLite-backed runtime logs for later support investigation. `windows-sandbox-rs/src/logging.rs` complements these shared facilities with lightweight rolling file logs for sandbox command activity on Windows.
+Rollout tracing is the flight recorder. It can save raw events from conversations, tools, model calls, terminals, and threads, then reduce them into a replayable story. Feedback and debug capture gathers recent logs, failed response details, diagnostics, and local evidence, while sanitizing secrets before anything is stored or sent. The Windows sandbox logging file adds a simple daily text trail for sandbox command starts, successes, failures, and debug notes.
 
 ## Sub-stages
 
@@ -19,13 +19,13 @@ For deeper debugging, rollout tracing records deterministic execution bundles an
 ### Cross-cutting observability, analytics, and feedback
 ### `windows-sandbox-rs/src/logging.rs`
 
-`util` · `cross-cutting during setup, launch, and runtime diagnostics`
+`io_transport` · `cross-cutting`
 
-This file is the sandbox crate's small logging layer. It writes plain text lines into daily-rotated files using `tracing_appender::rolling::RollingFileAppender`, with filenames like `sandbox.YYYY-MM-DD.log` and a retention cap of 90 files. `log_file_path_for_utc_date`, `current_log_file_path`, and `current_log_file_path_for_codex_home` expose the naming convention and the default `.sandbox` log directory under `codex_home`.
+This file is the sandbox's small diary. When the sandbox runs a command, the rest of the program can ask this file to write a line such as START, SUCCESS, FAILURE, or DEBUG into a daily log file. Without it, failures would be harder to explain because there would be no durable record of which command ran, when it ran, and what broad result it had.
 
-For message formatting, `exe_label` lazily caches the current executable's filename in a `OnceLock<String>` and falls back to `proc` if discovery fails. `preview` joins a command vector into a single string and truncates it to `LOG_COMMAND_PREVIEW_LIMIT` bytes using `take_bytes_at_char_boundary`, which avoids splitting UTF-8 code points. `append_line` is the low-level writer: if the base directory exists and a rolling appender can be built, it appends a single line and ignores write failures.
+The log files live in a sandbox log directory and are named by date, like `sandbox.2026-05-21.log`. A rolling appender is used, meaning the logging library opens the right daily file and keeps only a limited number of old log files. This avoids one huge file growing forever.
 
-The public logging API is intentionally narrow. `log_start`, `log_success`, and `log_failure` format command-oriented messages using `preview` and route them through `log_note`. `log_note` always writes a timestamped line with local time and the executable label. `debug_log` is gated by `SBX_DEBUG=1`; when enabled it writes a `DEBUG:` line to the log and also echoes the raw message to stderr. Tests verify UTF-8-safe preview truncation, actual file creation for `log_note`, and path naming helpers.
+The file also protects logs from becoming unreadable or unsafe. Long commands are shortened before being logged, and the shortening is careful not to cut a multi-byte UTF-8 character in half. Each normal note gets a timestamp and the current executable name, so the log line says not only what happened but which program wrote it. Debug messages are different: they are written only when `SBX_DEBUG=1`, which keeps everyday logs quiet unless someone is actively investigating a problem.
 
 #### Function details
 
@@ -35,11 +35,11 @@ The public logging API is intentionally narrow. `log_start`, `log_success`, and 
 fn exe_label() -> &'static str
 ```
 
-**Purpose**: Computes and caches the current executable's filename for inclusion in log lines. It falls back to `proc` if the executable path cannot be determined.
+**Purpose**: Finds a short label for the running program, usually the executable file name. This label is included in log lines so a reader can tell which process wrote them.
 
-**Data flow**: It uses a `OnceLock<String>` to initialize the label once per process. During initialization it calls `std::env::current_exe()`, extracts the file name if possible, converts it to an owned string, and stores it; subsequent calls return the cached string reference.
+**Data flow**: It reads the current executable path from the operating system. If it can get a file name, it stores and reuses that string; if not, it falls back to `proc`. The output is a stable text label for later log messages.
 
-**Call relations**: It is used by `log_note` to annotate every log line with the emitting executable. Caching avoids repeated filesystem/process queries during frequent logging.
+**Call relations**: This is used inside `log_note` when a normal log line is built. It is cached with a one-time storage cell so repeated log writes do not repeatedly ask the operating system for the same executable name.
 
 *Call graph*: 1 external calls (new).
 
@@ -50,11 +50,11 @@ fn exe_label() -> &'static str
 fn preview(command: &[String]) -> String
 ```
 
-**Purpose**: Builds a bounded-length printable preview of a command vector for log messages. It preserves UTF-8 validity when truncating long commands.
+**Purpose**: Creates a safe, shortened version of a command for logging. It keeps log lines readable and prevents very long commands from flooding the log file.
 
-**Data flow**: It takes a slice of command strings, joins them with spaces, and compares the resulting string length to `LOG_COMMAND_PREVIEW_LIMIT`. If short enough it returns the full joined string; otherwise it truncates at a character boundary using `take_bytes_at_char_boundary` and returns the shortened string.
+**Data flow**: It takes a list of command words, joins them with spaces, and checks the total length. If the text is short enough, it returns it unchanged; if it is too long, it trims it at a valid character boundary so text like emoji or non-English characters is not broken.
 
-**Call relations**: It is called by `log_start`, `log_success`, and `log_failure` before those functions format their final messages. This keeps command-oriented logs compact and safe for arbitrary Unicode input.
+**Call relations**: `log_start`, `log_success`, and `log_failure` call this before writing command-related log lines. It hands those functions a compact command summary that can safely be placed in the log.
 
 *Call graph*: called by 3 (log_failure, log_start, log_success); 1 external calls (take_bytes_at_char_boundary).
 
@@ -65,11 +65,11 @@ fn preview(command: &[String]) -> String
 fn log_file_path_for_utc_date(base_dir: &Path, date: chrono::NaiveDate) -> PathBuf
 ```
 
-**Purpose**: Constructs the exact daily log filename for a given UTC date under a base directory. It encodes the crate's rolling log naming convention.
+**Purpose**: Builds the expected log file path for a specific UTC date. This gives other code and tests a predictable way to know what the daily log file should be called.
 
-**Data flow**: It takes a base directory path and a `chrono::NaiveDate`, formats the filename as `sandbox.<YYYY-MM-DD>.log`, joins it to `base_dir`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a base directory and a calendar date. It formats the date into the standard file name pattern, then joins that name onto the directory path. The result is a full path such as `logs/sandbox.2026-05-21.log`.
 
-**Call relations**: It is used by `current_log_file_path` and tested directly against the expected filename format. This helper keeps path construction consistent with the rolling appender configuration.
+**Call relations**: `current_log_file_path` uses this after choosing today's date. The function mirrors the naming scheme used by the rolling log writer, so callers can locate the same file that logging will write to.
 
 *Call graph*: called by 1 (current_log_file_path); 2 external calls (join, format!).
 
@@ -80,11 +80,11 @@ fn log_file_path_for_utc_date(base_dir: &Path, date: chrono::NaiveDate) -> PathB
 fn current_log_file_path(base_dir: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the path of today's sandbox log file in a given directory. It is a convenience wrapper around the date-specific path helper.
+**Purpose**: Returns the path where today's sandbox log file should be. It is useful when another part of the program wants to show or refer to the current log file.
 
-**Data flow**: It takes a base directory path, obtains the current UTC date via `chrono::Utc::now().date_naive()`, passes that date to `log_file_path_for_utc_date`, and returns the resulting `PathBuf`.
+**Data flow**: It takes a base log directory, reads the current UTC date, and passes both to `log_file_path_for_utc_date`. It returns the resulting path for today's daily log.
 
-**Call relations**: It is used by `current_log_file_path_for_codex_home` and other setup code that needs to know where today's log file should live. It does not itself create the file.
+**Call relations**: `current_log_file_path_for_codex_home` calls this after finding the sandbox directory under a Codex home. Setup-related code such as `run_setup_refresh_inner` also calls it when it needs the current log path.
 
 *Call graph*: calls 1 internal fn (log_file_path_for_utc_date); called by 2 (current_log_file_path_for_codex_home, run_setup_refresh_inner); 1 external calls (now).
 
@@ -95,11 +95,11 @@ fn current_log_file_path(base_dir: &Path) -> PathBuf
 fn current_log_file_path_for_codex_home(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes today's sandbox log file path for a given `codex_home`. It anchors logging under the crate's standard sandbox directory.
+**Purpose**: Finds today's log file path when the caller only knows the Codex home directory. It hides the detail that sandbox logs live under the sandbox subdirectory.
 
-**Data flow**: It takes `codex_home`, computes `crate::sandbox_dir(codex_home)`, passes that directory to `current_log_file_path`, and returns the resulting path.
+**Data flow**: It receives a Codex home path, turns that into the sandbox directory path, then asks `current_log_file_path` for today's log file inside that directory. The output is the expected daily log path.
 
-**Call relations**: It is a convenience helper for callers that know only `codex_home`. This keeps log-path derivation aligned with the rest of the sandbox directory layout.
+**Call relations**: This is a convenience wrapper around `current_log_file_path`. It relies on the crate-level sandbox directory helper so all code uses the same location convention.
 
 *Call graph*: calls 1 internal fn (current_log_file_path); 1 external calls (sandbox_dir).
 
@@ -110,11 +110,11 @@ fn current_log_file_path_for_codex_home(codex_home: &Path) -> PathBuf
 fn log_writer(base_dir: &Path) -> Option<RollingFileAppender>
 ```
 
-**Purpose**: Builds a daily rolling file appender for a log directory if that directory already exists. It returns `None` instead of creating directories or surfacing builder errors.
+**Purpose**: Creates a writer that appends to the daily sandbox log file. It also sets the rotation rule, which means logs are split by day and old files are capped.
 
-**Data flow**: It takes a base directory path, checks `is_dir()`, and if true configures a `RollingFileAppender` builder with daily rotation, the `sandbox` prefix, `log` suffix, and `MAX_LOG_FILES` retention. It returns `Some(appender)` on successful build or `None` if the directory is absent or appender construction fails.
+**Data flow**: It receives a base directory. If that directory does not exist, it returns nothing; otherwise it builds a rolling file appender with the sandbox file prefix, log suffix, daily rotation, and maximum file count. The output is an optional writer ready to receive log text.
 
-**Call relations**: It is used only by `append_line`. By returning `Option`, it lets higher-level logging stay best-effort and side-effect-light.
+**Call relations**: `append_line` calls this whenever a line needs to be written. By keeping the file-opening details here, the rest of the logging functions only have to think in terms of messages.
 
 *Call graph*: called by 1 (append_line); 2 external calls (is_dir, builder).
 
@@ -125,11 +125,11 @@ fn log_writer(base_dir: &Path) -> Option<RollingFileAppender>
 fn append_line(line: &str, base_dir: Option<&Path>)
 ```
 
-**Purpose**: Appends a single formatted line to the rolling sandbox log if logging is possible. It is the low-level sink behind note and debug logging.
+**Purpose**: Writes one finished line of text to the sandbox log, if a log directory is available. It is the final step between a prepared message and bytes on disk.
 
-**Data flow**: It takes a line string and an optional base directory. If a directory is provided and `log_writer(dir)` succeeds, it writes the line plus newline with `writeln!`; any write failure is ignored. It returns no value.
+**Data flow**: It receives a complete log line and an optional base directory. If there is no directory, or if a writer cannot be made, it silently does nothing; otherwise it writes the line plus a newline to the current rolling log file.
 
-**Call relations**: It is called by `debug_log` and `log_note`. Those higher-level functions are responsible for formatting timestamps and prefixes before handing off to this sink.
+**Call relations**: `debug_log` and `log_note` both send their finished messages here. This function then asks `log_writer` for the actual file writer and performs the write.
 
 *Call graph*: calls 1 internal fn (log_writer); called by 2 (debug_log, log_note); 1 external calls (writeln!).
 
@@ -140,11 +140,11 @@ fn append_line(line: &str, base_dir: Option<&Path>)
 fn log_start(command: &[String], base_dir: Option<&Path>)
 ```
 
-**Purpose**: Logs a standardized `START:` line for a command invocation. It uses the bounded command preview rather than the full command vector.
+**Purpose**: Records that a sandbox command is beginning. This helps a later reader match an attempted action with its final success or failure.
 
-**Data flow**: It takes a command slice and optional base directory, computes `preview(command)`, formats `START: <preview>`, and passes that message to `log_note`.
+**Data flow**: It receives the command as a list of strings and an optional log directory. It makes a shortened command preview, prefixes it with `START:`, and passes that note to `log_note`, which adds time and process details before writing.
 
-**Call relations**: It is called by spawn-preparation and elevated capture code at the beginning of command execution. It delegates all timestamping and file writing to `log_note`.
+**Call relations**: This is called by sandbox launch preparation paths, including permission-profile and spawn-context setup. It marks the beginning of work before those flows continue into actually running or preparing a sandboxed process.
 
 *Call graph*: calls 2 internal fn (log_note, preview); called by 3 (run_windows_sandbox_capture_for_permission_profile, prepare_elevated_spawn_context_for_permissions, prepare_spawn_context_common); 1 external calls (format!).
 
@@ -155,11 +155,11 @@ fn log_start(command: &[String], base_dir: Option<&Path>)
 fn log_success(command: &[String], base_dir: Option<&Path>)
 ```
 
-**Purpose**: Logs a standardized `SUCCESS:` line for a command that exited successfully. It mirrors `log_start` and `log_failure` formatting.
+**Purpose**: Records that a sandbox command completed successfully. It gives the log a clear positive end marker for a command that was started earlier.
 
-**Data flow**: It takes a command slice and optional base directory, computes the preview string, formats `SUCCESS: <preview>`, and sends it to `log_note`.
+**Data flow**: It receives the command and optional log directory, shortens the command text with `preview`, formats it as `SUCCESS: ...`, and sends it through `log_note` for timestamped writing.
 
-**Call relations**: It is called by capture/finalization code when a sandboxed command exits with code 0. It is the success-side counterpart to `log_failure`.
+**Call relations**: Exit-finalizing code and sandbox capture code call this when a run ends cleanly. It pairs with `log_start` and contrasts with `log_failure`, making the command lifecycle easy to read in the log.
 
 *Call graph*: calls 2 internal fn (log_note, preview); called by 2 (finalize_exit, run_windows_sandbox_capture_with_filesystem_overrides); 1 external calls (format!).
 
@@ -170,11 +170,11 @@ fn log_success(command: &[String], base_dir: Option<&Path>)
 fn log_failure(command: &[String], detail: &str, base_dir: Option<&Path>)
 ```
 
-**Purpose**: Logs a standardized `FAILURE:` line for a command that failed, including a caller-supplied detail string such as an exit code. It keeps failure formatting consistent across backends.
+**Purpose**: Records that a sandbox command failed, along with a short reason. This is the main breadcrumb someone checks when investigating why a sandbox run did not work.
 
-**Data flow**: It takes a command slice, a detail string, and an optional base directory, computes the preview string, formats `FAILURE: <preview> (<detail>)`, and passes it to `log_note`.
+**Data flow**: It receives the command, a failure detail string, and an optional log directory. It shortens the command preview, combines it with `FAILURE:` and the detail, then gives the message to `log_note` for final formatting and writing.
 
-**Call relations**: It is called by capture/finalization code when a sandboxed command exits nonzero or otherwise fails. It shares the same preview path as `log_start` and `log_success`.
+**Call relations**: Exit-finalizing code and sandbox capture code call this when a run ends badly. Like `log_success`, it relies on `preview` for readable command text and `log_note` for the shared log-line format.
 
 *Call graph*: calls 2 internal fn (log_note, preview); called by 2 (finalize_exit, run_windows_sandbox_capture_with_filesystem_overrides); 1 external calls (format!).
 
@@ -185,11 +185,11 @@ fn log_failure(command: &[String], detail: &str, base_dir: Option<&Path>)
 fn debug_log(msg: &str, base_dir: Option<&Path>)
 ```
 
-**Purpose**: Emits debug-only diagnostics to both the sandbox log and stderr when `SBX_DEBUG=1`. It is intentionally silent unless explicitly enabled.
+**Purpose**: Writes extra troubleshooting messages only when debugging is explicitly turned on. This keeps normal logs from becoming noisy while still giving developers a way to inspect detailed behavior.
 
-**Data flow**: It takes a message string and optional base directory, reads `SBX_DEBUG` from the process environment, and if the value is exactly `1` formats `DEBUG: <msg>`, appends it via `append_line`, and writes the raw message to stderr with `eprintln!`. Otherwise it does nothing.
+**Data flow**: It reads the `SBX_DEBUG` environment variable. If the value is exactly `1`, it writes a `DEBUG:` line to the log and also prints the message to standard error; otherwise it does nothing.
 
-**Call relations**: It is used by setup, process creation, and state-loading code for noisy diagnostics that should not appear in normal logs. It delegates file output to `append_line` and supplements it with stderr for immediate visibility.
+**Call relations**: Lower-level operations such as user loading, marker loading, desktop access grants, and process creation call this when they have useful diagnostic details. It hands enabled debug messages to `append_line`, bypassing the normal timestamped `log_note` format.
 
 *Call graph*: calls 1 internal fn (append_line); called by 6 (create, grant_desktop_access, load_marker, load_users, remove_sandbox_users_file, create_process_as_user); 3 external calls (eprintln!, format!, var).
 
@@ -200,11 +200,11 @@ fn debug_log(msg: &str, base_dir: Option<&Path>)
 fn log_note(msg: &str, base_dir: Option<&Path>)
 ```
 
-**Purpose**: Writes an unconditional timestamped note line to the sandbox log. It is the common sink for most human-readable operational messages.
+**Purpose**: Writes a normal timestamped note to the daily sandbox log. Most non-debug logging flows pass through this function so log entries share one consistent shape.
 
-**Data flow**: It takes a message string and optional base directory, computes a local timestamp with millisecond precision, obtains the executable label from `exe_label()`, formats `[<timestamp> <exe>] <msg>`, and passes the line to `append_line`.
+**Data flow**: It receives a message and an optional log directory. It gets the local time, gets the executable label, formats a line like `[time exe] message`, and sends that finished line to `append_line` for writing.
 
-**Call relations**: It is called widely across the crate, including helper materialization, user hiding, setup, and command lifecycle logging. Higher-level helpers like `log_start` and `log_failure` build on it rather than writing directly.
+**Call relations**: Command logging functions call this, and many sandbox operations call it directly when they need to record important actions such as permission changes, helper resolution, profile hiding, or writable-directory audits. It is the central formatter for ordinary log entries.
 
 *Call graph*: calls 1 internal fn (append_line); called by 16 (apply_capability_denies_for_world_writable_for_permissions, apply_world_writable_scan_and_denies_for_permissions, audit_everyone_writable, copy_helper_if_needed, resolve_current_exe_for_launch, resolve_helper_for_launch, hide_current_user_profile_dir, hide_newly_created_users, hide_users_in_winlogon, require_logon_sandbox_creds (+6 more)); 2 external calls (now, format!).
 
@@ -215,11 +215,11 @@ fn log_note(msg: &str, base_dir: Option<&Path>)
 fn preview_does_not_panic_on_utf8_boundary()
 ```
 
-**Purpose**: Verifies that command preview truncation never panics when the truncation point would otherwise split a multibyte UTF-8 character. It specifically targets the byte-boundary safety guarantee.
+**Purpose**: Checks that command preview shortening does not crash when a long command contains a multi-byte character. This protects against a common text-cutting bug where bytes are split in the middle of one visible character.
 
-**Data flow**: The test constructs a command string whose final character is a 4-byte emoji positioned at the preview limit boundary, runs `preview` inside `catch_unwind`, asserts that no panic occurred, unwraps the result, and asserts that the preview length does not exceed the configured limit.
+**Data flow**: It builds a command string that places an emoji right where unsafe byte trimming would fail. It runs `preview` inside a panic catcher, then verifies the call succeeded and the result stayed within the preview limit.
 
-**Call relations**: It directly validates the use of `take_bytes_at_char_boundary` inside `preview`. This protects logging from malformed truncation on Unicode-heavy commands.
+**Call relations**: This test exercises `preview` directly. It exists because `log_start`, `log_success`, and `log_failure` depend on `preview` to safely shorten command text before logging.
 
 *Call graph*: 3 external calls (assert!, catch_unwind, vec!).
 
@@ -230,11 +230,11 @@ fn preview_does_not_panic_on_utf8_boundary()
 fn log_note_writes_to_daily_rolling_log()
 ```
 
-**Purpose**: Checks that `log_note` actually creates a daily log file and writes the provided message into it. It exercises the rolling-appender path end to end.
+**Purpose**: Checks that a normal note really creates a daily log file and writes the message into it. This proves the logging path works end to end on disk.
 
-**Data flow**: The test creates a temporary directory, calls `log_note("hello daily log", Some(tempdir.path()))`, reads the directory entries, asserts that exactly one log file exists with the expected prefix/suffix pattern, reads the file contents, and asserts that the message text is present.
+**Data flow**: It creates a temporary directory, calls `log_note` with a sample message, reads the directory entries, checks that one log file was created with the expected name shape, then reads the file and confirms the message is present.
 
-**Call relations**: It validates the interaction between `log_note`, `append_line`, and `log_writer`. This ensures the best-effort logging path works when given a valid directory.
+**Call relations**: This test drives `log_note`, which in turn uses `append_line` and `log_writer`. It verifies that the formatting and rolling-file writer cooperate to produce an actual readable log file.
 
 *Call graph*: calls 1 internal fn (log_note); 5 external calls (assert!, assert_eq!, read_dir, read_to_string, tempdir).
 
@@ -245,11 +245,11 @@ fn log_note_writes_to_daily_rolling_log()
 fn log_file_path_for_utc_date_matches_rolling_appender_name()
 ```
 
-**Purpose**: Verifies that the helper for computing log file paths matches the naming convention used by the rolling appender. It pins down the exact filename format.
+**Purpose**: Checks that the helper for building a dated log path uses the same naming pattern as the rolling log writer. This prevents code from looking for a file under a name that logging would never create.
 
-**Data flow**: The test constructs a fixed `NaiveDate`, calls `log_file_path_for_utc_date(Path::new("logs"), date)`, and asserts that the result equals `logs/sandbox.2026-05-21.log`.
+**Data flow**: It creates a fixed date, asks `log_file_path_for_utc_date` for the path under `logs`, and compares the result to the expected `logs/sandbox.2026-05-21.log` path.
 
-**Call relations**: It directly covers `log_file_path_for_utc_date`. This keeps path helpers and appender configuration from drifting apart.
+**Call relations**: This test covers `log_file_path_for_utc_date`, the helper used by `current_log_file_path`. It guards the shared file naming convention used across the logging code.
 
 *Call graph*: 2 external calls (assert_eq!, from_ymd_opt).
 
@@ -260,25 +260,39 @@ fn log_file_path_for_utc_date_matches_rolling_appender_name()
 fn current_log_file_path_for_codex_home_uses_sandbox_dir()
 ```
 
-**Purpose**: Checks that codex-home-based log path resolution uses the `.sandbox` directory. It validates the directory-layout assumption behind sandbox logging.
+**Purpose**: Checks that a Codex home directory is converted into the sandbox subdirectory before choosing the current log file path. This protects the expected log location convention.
 
-**Data flow**: The test creates a sample `codex_home` path, calls `current_log_file_path_for_codex_home(codex_home)`, and asserts that it equals `current_log_file_path(&codex_home.join(".sandbox"))`.
+**Data flow**: It starts with a sample Codex home path. It compares `current_log_file_path_for_codex_home` against the path produced by calling `current_log_file_path` on `codex-home/.sandbox`.
 
-**Call relations**: It covers the wrapper around `sandbox_dir` plus `current_log_file_path`. This ensures callers using only `codex_home` land in the expected log directory.
+**Call relations**: This test exercises the wrapper `current_log_file_path_for_codex_home`. It confirms that the wrapper delegates to the common current-log-path helper after applying the sandbox directory rule.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
 ## 📊 State Registers Touched
 
-- `reg-host-platform-facts` — Normalized host identity and platform probe results such as hostname, shell, locale, editor, pager, and cloud-environment facts reused by diagnostics and runtime decisions.
-- `reg-feature-flags` — The resolved experimental-feature and startup feature-enablement state that gates runtime behavior and can be surfaced or updated through server APIs.
-- `reg-auth-state` — The active authentication mode and loaded credential state selected from storage or environment, including refresh and mode restrictions.
-- `reg-installation-identity` — The stable per-installation identity used to distinguish this machine/runtime instance across auth, backend, and telemetry flows.
-- `reg-sandbox-user-credentials` — The Windows sandbox local-account and protected-credential state used to run isolated commands safely.
-- `reg-state-runtime` — The shared SQLite-backed runtime handle and opened databases that provide durable local state services to higher layers.
-- `reg-rate-limit-account-snapshot` — The current account, plan, usage, and rate-limit snapshot fetched from backends and replayed into UI and reconnecting clients.
-- `reg-observability-context` — The global tracing/logging/metrics context and stable session-turn-auth-model-tool tags attached to emitted telemetry throughout runtime.
-- `reg-analytics-pipeline` — The in-memory and batched analytics facts/events pipeline that reduces observations into product events and ships or captures them.
-- `reg-runtime-log-store` — The durable runtime log and feedback artifact store used for diagnostics, support capture, and later investigation.
-- `reg-feedback-upload-buffer` — The queued/redacted feedback submission state, including pending attachments and thread/log references, held until feedback is uploaded or persisted for retry.
-- `reg-rollout-trace-buffer` — The active rollout-tracing capture state that accumulates deterministic execution traces for later replay, export, or debugging.
+- `reg-feature-flags` — The shared list of enabled or disabled experimental and product features that changes what the app exposes.
+- `reg-install-home-context` — The discovered Codex home folder, install location, bundled resources, and stable local installation identity.
+- `reg-auth-identity` — The signed-in user or service identity, including account facts such as email, plan, workspace, and login mode.
+- `reg-rate-limit-quota` — The current account limits, credit status, token usage, and reset information used to avoid overusing backend services.
+- `reg-state-databases` — The opened local SQLite stores and migration state that hold structured runtime data for threads, agents, goals, jobs, and summaries.
+- `reg-rollout-thread-store` — The durable conversation log and searchable thread index used to resume, rebuild, archive, restore, and display sessions.
+- `reg-http-network-client` — The shared network client setup, including retries, streaming, cookies, proxy settings, TLS handling, and request failure reporting.
+- `reg-app-server-runtime` — The live app-server or daemon state, including open transports, connected clients, request routing, and server lifecycle status.
+- `reg-remote-control-relay` — The remote-control, relay, socket, WebSocket, and encrypted connection state used to connect clients and helper processes.
+- `reg-network-proxy-policy` — The managed proxy and network-forwarding state that decides what network traffic is allowed, forwarded, or blocked.
+- `reg-permission-sandbox-policy` — The shared rules for file access, command execution, network access, approvals, and sandbox modes.
+- `reg-process-registry` — The shared record of running or tracked external processes, their identifiers, input/output streams, terminal sizes, and completion state.
+- `reg-plugin-marketplace-catalog` — The installed, built-in, workspace, and marketplace plugin information that controls extra tools, hooks, connectors, and prompt additions.
+- `reg-extension-host-state` — The shared extension runtime state and contributor hooks that let add-ons react to threads, turns, tools, prompts, events, and MCP setup.
+- `reg-live-session-services` — The toolbox attached to one running session, such as model access, auth, telemetry, approvals, tools, extensions, networking, and MCP connections.
+- `reg-thread-session-state` — The live state of a conversation thread, including its identity, workspace, selected model, history, permissions, listeners, and lifecycle status.
+- `reg-turn-state` — The shared clipboard for one active assistant turn, tracking the current task, pending replies, granted permissions, cancellations, and bookkeeping.
+- `reg-conversation-history-budget` — The accumulated messages, compacted summaries, token counts, and trimming decisions that determine what conversation context still fits.
+- `reg-prompt-context-stack` — The assembled prompt ingredients, including project instructions, permissions text, goals, memories, skills, plugin text, IDE details, warnings, and changed context.
+- `reg-tool-catalog` — The current set of tools the model may call, with schemas, names, MCP conversions, plugin additions, and execution handlers.
+- `reg-hook-rules` — The configured hooks and hook schemas that let external commands inspect or affect session starts, turns, tool calls, and other lifecycle events.
+- `reg-agent-registry-graph` — The live and persisted map of parent agents, child agents, thread names, statuses, and which helper agents are still open.
+- `reg-background-work-queues` — The shared set of background tasks such as cloud refreshes, cleanup jobs, memory jobs, skill watchers, agent jobs, update checks, and session maintenance.
+- `reg-tui-visible-state` — The current terminal user-interface state, including visible transcript cells, inputs, popups, keymaps, headers, status lines, notifications, and restored history.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.
+- `reg-launch-invocation-context` — The raw launch context, including invoked binary/arg0, selected subcommand or runtime mode, startup flags, and output/interaction mode chosen before dispatch.

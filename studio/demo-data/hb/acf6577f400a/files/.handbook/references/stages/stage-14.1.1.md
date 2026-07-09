@@ -1,10 +1,12 @@
 # Approval policy and request-decision engines  `stage-14.1.1`
 
-This stage is the system’s central gatekeeper: it sits on the execution path between a requested action and actually running it, deciding whether shell commands, network access, patch application, or sandbox changes may proceed automatically, require user approval, or be denied.
+This stage is the system’s safety gate. It works behind the scenes whenever a shell command, code patch, network request, or sandbox change is about to happen. Its job is to answer: allow it, block it, or ask the user first.
 
-The modern execution-policy engine lives in execpolicy and core. execpolicy/src/parser.rs reads Starlark policy files into the rule model from rule.rs, preserving source locations and validating examples, hosts, and network rules. policy.rs then evaluates commands and network requests against those rules, merges layered policies, and resolves host-specific executables; lib.rs exposes that API. core/src/exec_policy.rs applies those policies at runtime, combining parsed rules with sandbox state, approval settings, and fallback heuristics to produce concrete approval requirements. core/src/network_policy_decision.rs converts low-level network decisions into user-facing prompts and persisted rule amendments, while core/src/safety.rs performs the equivalent decision process for apply_patch. core/src/tools/sandboxing.rs supplies shared approval caches, sandbox override logic, and runtime traits.
+The newer execpolicy library is the main rule engine. Its front door exposes the useful pieces. Its parser reads policy files written in a small Starlark-based language, meaning a simple scripting format for rules. The rule and policy files define what rules look like, check examples, match commands or hosts, and produce allow, deny, or prompt decisions.
 
-Alongside this, execpolicy-legacy preserves the older evaluator: its parser, policy structures, argv/program matchers, and execv checker still compile and enforce legacy command policies where compatibility is required.
+The core files connect those decisions to real tools. sandboxing defines the shared approval and sandbox contract. exec_policy loads and updates command and network rules. network_policy_decision turns network events into clear approval prompts and saved rules. safety does the same kind of gatekeeping for file-writing patches.
+
+The legacy execpolicy library keeps older rule formats working. It parses old policies, matches program arguments, checks per-program rules, validates examples, and ensures commands cannot read or write outside approved folders.
 
 ## Files in this stage
 
@@ -13,24 +15,26 @@ These files define the modern execution-policy API, rule model, parser, and runt
 
 ### `execpolicy/src/lib.rs`
 
-`orchestration` · `policy API use during config load and command evaluation`
+`orchestration` · `cross-cutting`
 
-This file defines the module structure and public surface of the `execpolicy` crate. Internally it splits responsibilities across amendment logic (`amend`), decision and evaluation types, parser and policy representation, executable-name handling, and rule definitions. Most modules are crate-private, while `rule` is public, signaling that rule types are intended for direct consumer use.
+This file does not contain the policy-checking logic itself. Instead, it acts like a reception desk for the execpolicy crate: it points to the rooms where the real work lives, then re-exports the most important names so callers do not need to know the internal layout. The library appears to deal with execution policy decisions: parsing policy text, representing rules, checking whether something is allowed, reporting errors with text locations, and amending policy files with new allow or network rules.
 
-The bulk of the file is `pub use` re-exports that flatten those internals into a coherent API. Consumers get amendment helpers and `AmendError`; decision and evaluation outputs (`Decision`, `Evaluation`); parser entrypoints (`PolicyParser`); the main `Policy` type and `MatchOptions`; rich error reporting (`Error`, `Result`, `ErrorLocation`, `TextPosition`, `TextRange`); the `ExecPolicyCheckCommand`; and the rule vocabulary including `Rule`, `RuleRef`, `RuleMatch`, `PrefixRule`, `PrefixPattern`, `PatternToken`, and `NetworkRuleProtocol`.
+The module declarations split the work into focused areas. For example, parsing lives in `parser`, decisions live in `decision`, rule shapes live in `rule`, and policy evaluation lives in `policy`. Some modules are marked `pub(crate)`, meaning they are visible inside this library but not directly exposed to outside users. The `rule` module is public, so outside code can reach it as a module too.
 
-This crate root therefore encodes the intended layering of the policy subsystem: parse policy text into structured rules, evaluate commands or network actions against those rules, optionally amend policies programmatically, and report precise source locations on failure. There is no executable logic here, but it is the authoritative import surface that external code relies on instead of reaching into internal modules directly.
+The `pub use` lines are the important outward-facing part. They make selected items available from the crate root, such as `Policy`, `PolicyParser`, `Decision`, `Rule`, and `ExecPolicyCheckCommand`. Without this file, users would have to dig through internal module paths, and the crate would not present a clean, stable public interface.
 
 
 ### `execpolicy/src/rule.rs`
 
-`domain_logic` · `policy load and request handling`
+`domain_logic` · `policy load and command matching`
 
-This file contains the low-level domain objects that `Policy` and the parser manipulate. `PatternToken` models one command-position matcher as either an exact string or a set of alternatives, and `PrefixPattern` combines a fixed first token with an `Arc<[PatternToken]>` tail so rules can be keyed efficiently by program name while still supporting alternative tokens later in the command. `PrefixRule` implements the `Rule` trait by delegating to `PrefixPattern::matches_prefix` and packaging successful matches as `RuleMatch::PrefixRuleMatch`, including optional justification text.
+This file is the rulebook machinery for deciding whether a command or network access should be allowed, denied, or treated another way. A command is seen as a list of words, such as `git`, `commit`, and `-m`. A prefix rule matches the beginning of that list, like checking whether a sentence starts with certain words. Some words can have alternatives, so a rule can say “the second word may be `install` or `add`.”
 
-`RuleMatch` is the serialized runtime evidence returned by policy evaluation. It can represent either a concrete prefix-rule match or a synthetic heuristics fallback, and it supports post-processing through `with_resolved_program` so basename-based host executable matches can retain the original absolute path. The file also defines `NetworkRuleProtocol` parsing and string rendering, plus `normalize_network_rule_host`, which aggressively rejects malformed hosts: empty strings, schemes, paths, queries, fragments, wildcards, whitespace, invalid bracketed IPv6 literals, and unsupported suffixes. It strips ports where supported, trims trailing dots, and lowercases the host.
+The main pieces are small and focused. `PatternToken` represents one expected command word, either one exact word or a list of allowed choices. `PrefixPattern` uses those tokens to check whether the start of a command matches. `PrefixRule` connects a pattern to a `Decision`, which is the policy answer returned when the rule matches. `RuleMatch` records the result in a form that can be returned or serialized, including the matched command prefix and optional explanation.
 
-Finally, the example validators are semantic checks used during parsing. They build on `Policy::matches_for_command_with_options` with host executable resolution enabled, ensuring positive examples match at least one rule and negative examples match none. Error payloads include rendered shell commands via `shlex::try_join` and debug-formatted rules for diagnostics.
+The file also defines network rule support. `NetworkRuleProtocol` turns policy text like `https` or `socks5_tcp` into a safer internal value, and `normalize_network_rule_host` cleans and checks host names so rules cannot accidentally contain full URLs, paths, wildcards, or malformed ports.
+
+Finally, the validation helpers test examples written in a policy. Positive examples must match at least one rule, and negative examples must not match. Without this file, the policy system would lack its basic vocabulary for matching commands and checking whether rules are written correctly.
 
 #### Function details
 
@@ -40,11 +44,11 @@ Finally, the example validators are semantic checks used during parsing. They bu
 fn matches(&self, token: &str) -> bool
 ```
 
-**Purpose**: Checks whether one command token satisfies this pattern token. It supports either exact equality or membership in an alternatives list.
+**Purpose**: Checks whether one command word fits one pattern token. A token can require one exact word, or it can allow any one word from a small list of alternatives.
 
-**Data flow**: It takes `&self` and a candidate `&str`. For `Single`, it compares directly to the stored string; for `Alts`, it scans the alternatives for equality. It returns a boolean and does not mutate state.
+**Data flow**: It receives the command word as text. If the pattern token is a single expected word, it compares the two directly. If the token contains alternatives, it looks through them for a match. It returns `true` when the word is accepted and `false` otherwise.
 
-**Call relations**: Used internally by `PrefixPattern::matches_prefix` while comparing a command against a stored prefix pattern.
+**Call relations**: This is the small comparison step used by prefix matching. When a command is being checked against a `PrefixPattern`, each pattern token asks this function whether the corresponding command word is acceptable.
 
 
 ##### `PatternToken::alternatives`  (lines 29–34)
@@ -53,11 +57,11 @@ fn matches(&self, token: &str) -> bool
 fn alternatives(&self) -> &[String]
 ```
 
-**Purpose**: Returns the token’s allowed strings as a slice regardless of whether it is stored as a single value or multiple alternatives. This gives callers a uniform view of head-token expansion choices.
+**Purpose**: Returns the list of words that this pattern token can accept. This gives callers a uniform view whether the token has one allowed word or several.
 
-**Data flow**: It borrows `self` and returns `&[String]`: a one-element slice via `from_ref` for `Single`, or the underlying alternatives slice for `Alts`.
+**Data flow**: It reads the token. For a single expected word, it returns a one-item slice pointing at that word. For an alternatives token, it returns the stored list. It does not change anything.
 
-**Call relations**: Used by the parser’s `prefix_rule` builtin when expanding only the first pattern token into multiple concrete `PrefixRule` instances.
+**Call relations**: This is a helper for code that wants to inspect or display the possible words in a pattern. It uses `from_ref` to treat a single string as a one-item list without copying it.
 
 *Call graph*: 1 external calls (from_ref).
 
@@ -68,11 +72,11 @@ fn alternatives(&self) -> &[String]
 fn matches_prefix(&self, cmd: &[String]) -> Option<Vec<String>>
 ```
 
-**Purpose**: Determines whether a command begins with this prefix pattern and, if so, returns the matched prefix tokens. It enforces both minimum command length and per-position token matching.
+**Purpose**: Checks whether the start of a command matches this prefix pattern. It is like comparing the first few words of a sentence against a template.
 
-**Data flow**: It takes a command slice, computes the required pattern length as `rest.len() + 1`, returns `None` if the command is too short or the first token differs from `first`, then zips tail pattern tokens with the corresponding command tokens and rejects on the first mismatch. On success it clones `cmd[..pattern_length]` into a new `Vec<String>` and returns `Some` of that prefix.
+**Data flow**: It receives a command as a list of strings. It first checks that the command is long enough and that the first command word equals the pattern's fixed first word. Then it compares each remaining pattern token with the matching command word. If all required words match, it returns the matched prefix as a new list. If anything does not match, it returns nothing.
 
-**Call relations**: Called by `PrefixRule::matches` to implement the actual prefix-matching semantics for runtime evaluation.
+**Call relations**: This is called by `PrefixRule::matches` when a rule is asked whether it applies to a command. It does the detailed word-by-word check, and `PrefixRule::matches` turns a successful check into a policy match result.
 
 *Call graph*: called by 1 (matches).
 
@@ -83,11 +87,11 @@ fn matches_prefix(&self, cmd: &[String]) -> Option<Vec<String>>
 fn decision(&self) -> Decision
 ```
 
-**Purpose**: Extracts the decision carried by any rule match variant. This lets aggregation code treat concrete and heuristics matches uniformly.
+**Purpose**: Extracts the policy decision from a rule match. Callers use it when they only care about the outcome, not the details of how the command matched.
 
-**Data flow**: It matches on `self` and returns the stored `Decision` from either `PrefixRuleMatch` or `HeuristicsRuleMatch`.
+**Data flow**: It reads a `RuleMatch`, whether it came from a prefix rule or from heuristics. In both cases it takes the stored `Decision` and returns it. It does not change the match.
 
-**Call relations**: Used by `Evaluation::from_matches` when computing the strictest decision across all matches.
+**Call relations**: This is a convenience method for later policy code that receives a `RuleMatch` and needs the allow-or-deny style answer. It hides the difference between prefix-based matches and heuristic matches.
 
 
 ##### `RuleMatch::with_resolved_program`  (lines 92–107)
@@ -96,11 +100,11 @@ fn decision(&self) -> Decision
 fn with_resolved_program(self, resolved_program: &AbsolutePathBuf) -> Self
 ```
 
-**Purpose**: Annotates a prefix-rule match with the original absolute executable path that was resolved to a basename. Non-prefix matches are left unchanged.
+**Purpose**: Adds the resolved program path to a prefix-rule match when that information is available. A resolved program path means the system has found the actual executable file behind the command name.
 
-**Data flow**: It takes ownership of a `RuleMatch` and a borrowed `AbsolutePathBuf`. For `PrefixRuleMatch`, it reconstructs the variant with `resolved_program: Some(resolved_program.clone())` while preserving matched prefix, decision, and justification; for any other variant it returns the original value unchanged.
+**Data flow**: It takes an existing rule match and an absolute path to a program. If the match is a prefix-rule match, it returns a new match with the same prefix, decision, and justification, plus a copy of the resolved program path. If the match is not a prefix-rule match, it returns it unchanged.
 
-**Call relations**: Used by `Policy::match_host_executable_rules` after matching basename-keyed rules against a rewritten command.
+**Call relations**: This fits into command matching when the policy system optionally resolves command names to real executable paths. It keeps the original rule result but enriches it with extra path information for later reporting or decisions.
 
 *Call graph*: 1 external calls (clone).
 
@@ -111,11 +115,11 @@ fn with_resolved_program(self, resolved_program: &AbsolutePathBuf) -> Self
 fn parse(raw: &str) -> Result<Self>
 ```
 
-**Purpose**: Parses the textual protocol name accepted by network policy declarations. It also accepts a couple of compatibility aliases for HTTPS.
+**Purpose**: Turns a protocol name written in policy text into the internal protocol value used by the program. It rejects unknown protocol names with a clear policy error.
 
-**Data flow**: It takes a raw `&str`, matches known strings to enum variants (`http`, `https`, `https_connect`, `http-connect`, `socks5_tcp`, `socks5_udp`), and returns `Error::InvalidRule` for anything else.
+**Data flow**: It receives raw text such as `http`, `https`, `socks5_tcp`, or `socks5_udp`. It maps accepted spellings to the matching `NetworkRuleProtocol` value, including a few alternate names for HTTPS-style connect traffic. If the text is not recognized, it returns an `InvalidRule` error explaining the valid choices.
 
-**Call relations**: Used by the parser’s `network_rule` builtin before constructing a `NetworkRule`.
+**Call relations**: This is used when network rules are read or added. It acts as the front door that prevents misspelled or unsupported protocol names from entering the policy data.
 
 *Call graph*: 2 external calls (InvalidRule, format!).
 
@@ -126,11 +130,11 @@ fn parse(raw: &str) -> Result<Self>
 fn as_policy_string(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical policy-language string for a protocol enum value. This is the inverse display form used when serializing or appending rules.
+**Purpose**: Converts an internal network protocol value back into the standard text spelling used in policy files. This is useful when writing or displaying policy rules.
 
-**Data flow**: It takes the enum by value and returns a static string literal corresponding to the variant.
+**Data flow**: It receives a `NetworkRuleProtocol` value and returns a fixed string such as `http`, `https`, `socks5_tcp`, or `socks5_udp`. It does not allocate new data or change anything.
 
-**Call relations**: Used by higher-level code that emits policy text, such as network-rule append helpers.
+**Call relations**: This is called by `blocking_append_network_rule` when a network rule needs to be written out in policy form. It is the reverse of parsing, but it always uses one canonical spelling.
 
 *Call graph*: called by 1 (blocking_append_network_rule).
 
@@ -141,11 +145,11 @@ fn as_policy_string(self) -> &'static str
 fn normalize_network_rule_host(raw: &str) -> Result<String>
 ```
 
-**Purpose**: Validates and canonicalizes a network rule host string into a lowercase host/IP literal without scheme, path, wildcard, or unsupported suffixes. It also strips supported port syntax and trailing dots.
+**Purpose**: Cleans and validates the host part of a network rule. It makes sure the rule names one specific host, not a full URL, path, wildcard pattern, or malformed address.
 
-**Data flow**: Input is raw host text. It trims whitespace, rejects empty strings and any value containing `://`, `/`, `?`, or `#`; handles bracketed IPv6 literals by validating the closing bracket and optional numeric port; handles single-colon host:port syntax for non-bracketed hosts; trims trailing dots and whitespace; lowercases the result; then rejects empty normalized values, wildcards, and embedded whitespace. On success it returns the normalized host string.
+**Data flow**: It receives raw host text. It trims surrounding spaces, rejects empty input, rejects URL-like text with schemes or paths, and handles optional ports. For bracketed IPv6 addresses, it extracts the address inside the brackets and permits a numeric port after the closing bracket. For ordinary `host:port` text, it removes the numeric port. It then removes a trailing dot, lowercases the host, and rejects empty results, wildcards, and whitespace. On success it returns the normalized host string; on failure it returns an `InvalidRule` error.
 
-**Call relations**: Called by parser-side and programmatic network-rule creation so both paths share identical host validation semantics.
+**Call relations**: This is called by `blocking_append_network_rule` and `add_network_rule` before a network rule is stored. It protects the policy from ambiguous host entries, much like checking a mailing address before adding it to an address book.
 
 *Call graph*: called by 2 (blocking_append_network_rule, add_network_rule); 2 external calls (InvalidRule, format!).
 
@@ -156,11 +160,11 @@ fn normalize_network_rule_host(raw: &str) -> Result<String>
 fn program(&self) -> &str
 ```
 
-**Purpose**: Returns the first token used to key this rule in policy storage. For prefix rules, that is always the fixed `pattern.first` string.
+**Purpose**: Returns the first command word that this rule is keyed by. For a command rule, this is usually the program name, such as `git` or `npm`.
 
-**Data flow**: It borrows `self` and returns `&str` referencing `self.pattern.first`.
+**Data flow**: It reads the rule's prefix pattern and returns the fixed first word as text. It does not copy or modify the rule.
 
-**Call relations**: Used by `PolicyBuilder::add_rule` when inserting a generic `RuleRef` into the multimap.
+**Call relations**: This implements the shared `Rule` interface for `PrefixRule`. Policy lookup code can ask any rule what program name it belongs to without needing to know the rule's concrete type.
 
 
 ##### `PrefixRule::matches`  (lines 229–238)
@@ -169,11 +173,11 @@ fn program(&self) -> &str
 fn matches(&self, cmd: &[String]) -> Option<RuleMatch>
 ```
 
-**Purpose**: Attempts to match this prefix rule against a command and, on success, produces a concrete `RuleMatch`. It preserves the rule’s decision and optional justification in the output.
+**Purpose**: Checks whether this prefix rule applies to a command and, if it does, builds the match result that carries the rule's decision.
 
-**Data flow**: It takes a command slice, delegates to `self.pattern.matches_prefix(cmd)`, and maps a successful matched prefix into `RuleMatch::PrefixRuleMatch { matched_prefix, decision: self.decision, resolved_program: None, justification: self.justification.clone() }`. It returns `Option<RuleMatch>`.
+**Data flow**: It receives the command as a list of strings. It asks the rule's `PrefixPattern` to match the command prefix. If there is no match, it returns nothing. If there is a match, it returns a `PrefixRuleMatch` containing the matched prefix, the rule's `Decision`, no resolved program yet, and a copy of the optional justification.
 
-**Call relations**: Called by policy evaluation when iterating candidate rules from `match_exact_rules` or `match_host_executable_rules`.
+**Call relations**: This is the main `Rule` interface method for prefix rules. It delegates the word-by-word checking to `PrefixPattern::matches_prefix`, then wraps the successful result in the standard `RuleMatch` shape used by the rest of the policy system.
 
 *Call graph*: calls 1 internal fn (matches_prefix).
 
@@ -184,11 +188,11 @@ fn matches(&self, cmd: &[String]) -> Option<RuleMatch>
 fn as_any(&self) -> &dyn Any
 ```
 
-**Purpose**: Exposes the rule as `dyn Any` for downcasting. This supports inspection code that needs to recover concrete rule types from `RuleRef` trait objects.
+**Purpose**: Allows a `PrefixRule` stored behind the generic `Rule` interface to be inspected as its concrete type later. This is a Rust pattern for safe downcasting, meaning checking the real type behind a generic trait object.
 
-**Data flow**: It borrows `self` and returns `self` as `&dyn Any` without mutation.
+**Data flow**: It receives a reference to the rule and returns it as a general `Any` reference. Nothing is copied or changed.
 
-**Call relations**: Used by `Policy::get_allowed_prefixes` and test helpers that downcast `RuleRef` values back to `PrefixRule`.
+**Call relations**: This completes the `Rule` interface for `PrefixRule`. Other code that holds a generic rule can use this hook if it needs to recognize that the rule is specifically a `PrefixRule`.
 
 
 ##### `validate_match_examples`  (lines 246–279)
@@ -201,11 +205,11 @@ fn validate_match_examples(
 ) -> Result<()>
 ```
 
-**Purpose**: Checks that every positive example command matches at least one rule in the supplied temporary policy. It reports all unmatched examples together in one error.
+**Purpose**: Checks that every positive example command in a policy actually matches at least one rule. This helps policy authors catch rules that are too narrow, misspelled, or otherwise ineffective.
 
-**Data flow**: Inputs are a `Policy`, the declaration’s `rules`, and a slice of positive example token vectors. It enables `MatchOptions { resolve_host_executables: true }`, iterates examples, calls `policy.matches_for_command_with_options(example, None, &options)`, and collects shell-rendered strings for any examples that produce no matches. It returns `Ok(())` if none are unmatched, otherwise `Error::ExampleDidNotMatch { rules: debug-formatted rules, examples: unmatched_examples, location: None }`.
+**Data flow**: It receives the policy, the related rules, and a list of example commands that are expected to match. For each example, it asks the policy to find matches using options that resolve host executables. If an example has no matches, it formats that command into a readable shell-like string and records it. If all examples match, it returns success. If any do not, it returns an `ExampleDidNotMatch` error containing the rules and the unmatched examples.
 
-**Call relations**: Called by `PolicyBuilder::validate_pending_examples_from` after negative examples have been checked, so parse-time validation can reject rules whose declared positive examples do not actually match.
+**Call relations**: This is called by `validate_pending_examples_from` during policy validation. It uses the policy's command-matching path rather than duplicating the matching logic, so examples are tested the same way real commands are.
 
 *Call graph*: called by 1 (validate_pending_examples_from); 4 external calls (iter, new, matches_for_command_with_options, try_join).
 
@@ -220,22 +224,24 @@ fn validate_not_match_examples(
 ) -> Result<()>
 ```
 
-**Purpose**: Checks that every negative example command fails to match the supplied temporary policy. It stops at the first violating example and reports the matching rule.
+**Purpose**: Checks that every negative example command in a policy does not match any rule. This helps prove that a rule is not too broad.
 
-**Data flow**: Inputs are a `Policy`, an unused rules slice, and negative example token vectors. It enables host executable resolution in `MatchOptions`, iterates examples, and for each one calls `policy.matches_for_command_with_options(example, None, &options)`. If the first match exists, it returns `Error::ExampleDidMatch { rule: format!("{rule:?}"), example: rendered shell string, location: None }`; otherwise it returns `Ok(())` after all examples pass.
+**Data flow**: It receives the policy, a rules list that is not used here, and commands that are expected not to match. For each command, it asks the policy for matches using executable resolution. If a match is found, it formats both the matching rule and the example command into readable text and returns an `ExampleDidMatch` error. If no negative examples match, it returns success.
 
-**Call relations**: Called by `PolicyBuilder::validate_pending_examples_from` before positive-example validation so parse-time errors can identify examples that unexpectedly match.
+**Call relations**: This is called by `validate_pending_examples_from` alongside the positive example validator. Together they let policy files include both “should match” and “should not match” examples, giving authors a simple safety check for rule behavior.
 
 *Call graph*: called by 1 (validate_pending_examples_from); 3 external calls (matches_for_command_with_options, format!, try_join).
 
 
 ### `execpolicy/src/parser.rs`
 
-`orchestration` · `policy load`
+`config` · `config load`
 
-This file is the policy-language front end for the exec policy subsystem. `PolicyParser` owns a mutable `PolicyBuilder` behind `RefCell` so Starlark builtin functions can mutate shared parse state through `Evaluator.extra` while a module is being evaluated. Parsing proceeds by configuring the Starlark `Dialect` with f-strings enabled, building a globals table containing the custom builtins from `policy_builtins`, evaluating the AST, and then validating only the newly added example assertions from this parse call. That incremental validation matters because a single parser instance can ingest multiple policy files, and each file’s examples should be checked against the cumulative host executable map and the rules introduced so far.
+A policy file is like a rulebook for what programs may run, what network access is allowed, and which host executables are trusted by name. This parser reads that rulebook and builds a structured Policy from it. The policy language is powered by Starlark, a small Python-like configuration language, but this file defines the project-specific words that policy authors can use: prefix_rule, network_rule, and host_executable.
 
-`PolicyBuilder` accumulates three concrete policy data sets: prefix rules keyed by program in a `MultiMap<String, RuleRef>`, `Vec<NetworkRule>`, and host executable allowlists in `HashMap<String, Arc<[AbsolutePathBuf]>>`. It also stores deferred `PendingExampleValidation` records because example checks need a temporary `Policy` assembled after all declarations in the current file have run. Helper parsers convert Starlark values into `PatternToken`s and example token vectors, reject empty patterns/examples, enforce absolute host paths, and ensure host executable names are bare basenames. Error helpers translate `FileSpan` into the crate’s `ErrorLocation` and attach that location to validation failures, so semantic example mismatches point back to the originating rule declaration rather than only reporting a generic validation error.
+The main flow is simple. PolicyParser creates a PolicyBuilder, parses the policy text as Starlark, exposes the policy helper functions to that Starlark program, and lets the program run. As the Starlark file calls those helpers, the builder collects command rules, network rules, and executable mappings. After parsing, examples attached to new prefix rules are checked, so a policy can say “this should match” or “this should not match” and get an error if reality disagrees.
+
+A key detail is error friendliness. The parser keeps line and column information from the Starlark call site, then attaches it to validation errors. Without this file, policy files would either not load at all, or they would load without the careful checks that prevent confusing, unsafe, or misspelled rules from entering the system.
 
 #### Function details
 
@@ -245,11 +251,11 @@ This file is the policy-language front end for the exec policy subsystem. `Polic
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default parser instance by delegating to the normal constructor. It exists so callers and tests can create a fresh parser through standard Rust defaults.
+**Purpose**: Creates a default PolicyParser. This lets other code ask for a parser without spelling out how it should be initialized.
 
-**Data flow**: It takes no inputs, creates no custom state itself, and forwards construction to `PolicyParser::new`. It returns a parser whose internal `builder` contains empty rule, network, host-executable, and pending-validation collections.
+**Data flow**: No outside data comes in. It simply calls the normal constructor and returns a fresh parser with an empty policy builder inside.
 
-**Call relations**: This is invoked implicitly or explicitly wherever a default parser is desired; in practice it is just a thin wrapper over the main constructor and adds no extra behavior.
+**Call relations**: When generic Rust code asks for a default value, this function hands the job to PolicyParser::new so there is only one real setup path.
 
 *Call graph*: 1 external calls (new).
 
@@ -260,11 +266,11 @@ fn default() -> Self
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a fresh parser with an empty mutable `PolicyBuilder`. The parser is reusable across multiple policy files so later parses append to the same accumulated state.
+**Purpose**: Creates a new parser ready to read policy files. It starts with an empty PolicyBuilder where discovered rules will be collected.
 
-**Data flow**: It allocates a new `PolicyBuilder`, wraps it in `RefCell`, and stores it in `PolicyParser`. The returned parser starts with no rules, no network rules, no host executable mappings, and no deferred example validations.
+**Data flow**: No policy text comes in yet. The function creates a new PolicyBuilder, wraps it in a RefCell, which is Rust’s way of allowing carefully checked interior mutation, and returns a PolicyParser containing it.
 
-**Call relations**: This is the main entry used by policy-loading code and many tests before calling `parse` one or more times and finally `build`.
+**Call relations**: This is the entry point used by policy loading code and many tests before they call parse. PolicyParser::default also uses it so all fresh parsers are set up the same way.
 
 *Call graph*: calls 1 internal fn (new); called by 40 (load_exec_policy, heuristics_apply_when_other_commands_match_policy, mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision, mixed_rule_and_sandbox_prompt_rejects_when_granular_rules_are_disabled, policy_from_src, denied_reads_keep_granular_sandbox_rejection_for_escalation, denied_reads_keep_prefix_rule_allow_inside_sandbox, evaluate_intercepted_exec_policy_matches_inner_shell_commands_when_enabled, evaluate_intercepted_exec_policy_uses_wrapper_command_when_shell_wrapper_parsing_disabled, intercepted_exec_policy_rejects_disallowed_host_executable_mapping (+15 more)); 1 external calls (new).
 
@@ -275,11 +281,11 @@ fn new() -> Self
 fn parse(&mut self, policy_identifier: &str, policy_file_contents: &str) -> Result<()>
 ```
 
-**Purpose**: Parses and evaluates one Starlark policy source string, then validates any examples introduced by that source. It tags syntax/runtime errors with the supplied policy identifier and preserves source locations for later semantic validation failures.
+**Purpose**: Reads one policy file’s text and adds its rules to the parser. It also validates any examples that were introduced by that file.
 
-**Data flow**: Inputs are `policy_identifier` and raw file contents. It reads the current length of `pending_example_validations`, configures `Dialect::Extended` with f-strings enabled, parses an `AstModule`, builds globals with `policy_builtins`, and evaluates the module inside `Module::with_temp_heap` using an `Evaluator` whose `extra` points at the shared builder. After evaluation, it asks the builder to validate deferred examples starting at the saved index, returning `Result<()>`; on success the builder has been mutated with newly declared rules, network rules, host executable mappings, and validated example metadata.
+**Data flow**: It receives a policy identifier, used in error messages, and the policy file contents. It parses the text as Starlark, runs it with the project’s custom policy functions available, lets those functions fill the builder, then checks only the newly added example validations. It returns success or an Error with details.
 
-**Call relations**: Callers use this during policy ingestion, often repeatedly on the same parser. Internally it drives the whole parse/eval flow and relies on the Starlark builtins to populate builder state; after evaluation it triggers `PolicyBuilder::validate_pending_examples_from` for only the newly added validations.
+**Call relations**: Callers create a PolicyParser, call parse for policy text, and later call build. During evaluation, this function makes the PolicyBuilder available to the Starlark built-ins, so calls like prefix_rule and network_rule can add data to the builder.
 
 *Call graph*: 3 external calls (parse, standard, with_temp_heap).
 
@@ -290,11 +296,11 @@ fn parse(&mut self, policy_identifier: &str, policy_file_contents: &str) -> Resu
 fn build(self) -> crate::policy::Policy
 ```
 
-**Purpose**: Consumes the parser and produces the final immutable `Policy`. It is the handoff point from parse-time accumulation to runtime policy evaluation.
+**Purpose**: Finishes parsing and returns the completed Policy. Someone calls this after all desired policy files have been parsed.
 
-**Data flow**: It takes ownership of `self`, extracts the inner `PolicyBuilder` from the `RefCell`, and converts that builder into `crate::policy::Policy`. The returned policy contains all accumulated prefix rules, network rules, and host executable mappings.
+**Data flow**: It consumes the PolicyParser, takes out its PolicyBuilder, and asks that builder to produce the final Policy object. Nothing is left behind in the parser because it is used up.
 
-**Call relations**: This is called after one or more successful `parse` calls. It delegates the actual assembly to `PolicyBuilder::build`.
+**Call relations**: This is the final step after PolicyParser::parse has collected rules. It delegates the actual assembly to PolicyBuilder::build.
 
 
 ##### `PolicyBuilder::new`  (lines 95–102)
@@ -303,11 +309,11 @@ fn build(self) -> crate::policy::Policy
 fn new() -> Self
 ```
 
-**Purpose**: Initializes the mutable accumulator used while evaluating policy files. It centralizes the empty-state setup for all parse-time collections.
+**Purpose**: Creates the empty collection buckets used while a policy file is being read. These buckets hold program rules, network rules, executable mappings, and deferred example checks.
 
-**Data flow**: It creates an empty `MultiMap` for rules, empty `Vec`s for network rules and pending validations, and an empty `HashMap` for host executable mappings. It returns the fully initialized builder.
+**Data flow**: No input is needed. It creates an empty multimap for rules by program name, an empty list for network rules, an empty map for host executables, and an empty list of pending validations.
 
-**Call relations**: Used by `PolicyParser::new` and nowhere else directly in normal flow; it defines the baseline state that Starlark builtins mutate.
+**Call relations**: PolicyParser::new uses this to prepare a parser. The builder is then mutated by the policy built-ins while Starlark evaluation runs.
 
 *Call graph*: called by 2 (parse, new); 3 external calls (new, new, new).
 
@@ -318,11 +324,11 @@ fn new() -> Self
 fn add_rule(&mut self, rule: RuleRef)
 ```
 
-**Purpose**: Adds one parsed rule into the builder under its program lookup key. The key comes from the rule object itself via dynamic dispatch.
+**Purpose**: Adds one command-prefix rule to the growing policy. The rule is stored under the program name it applies to, so later lookup can start from the executable being run.
 
-**Data flow**: It takes a `RuleRef`, reads `rule.program()`, clones that program name into a `String`, and inserts the rule into `rules_by_program`. It mutates builder state but returns no value.
+**Data flow**: A RuleRef comes in. The function reads the rule’s program name and inserts the rule into rules_by_program under that name. It changes the builder and returns nothing.
 
-**Call relations**: This is used by the `prefix_rule` builtin after constructing one or more `PrefixRule` instances, especially when the first pattern token expands into multiple head alternatives.
+**Call relations**: The prefix_rule built-in creates one or more rules and calls this for each of them. Those collected rules are later included when PolicyBuilder::build creates the final Policy.
 
 *Call graph*: 2 external calls (insert, program).
 
@@ -333,11 +339,11 @@ fn add_rule(&mut self, rule: RuleRef)
 fn add_network_rule(&mut self, rule: NetworkRule)
 ```
 
-**Purpose**: Appends a parsed `NetworkRule` to the builder’s ordered network rule list. Ordering is preserved for later compilation semantics.
+**Purpose**: Adds one network access rule to the growing policy. This covers decisions about hosts and protocols, such as whether a certain host should be allowed or denied.
 
-**Data flow**: It accepts a concrete `NetworkRule` and pushes it onto `network_rules`. It mutates only that vector and returns nothing.
+**Data flow**: A NetworkRule comes in. The function appends it to the builder’s network_rules list. It changes the builder and returns nothing.
 
-**Call relations**: Called from the `network_rule` builtin once protocol, decision, host normalization, and justification validation have succeeded.
+**Call relations**: The network_rule Starlark built-in calls this after it has parsed and checked the host, protocol, decision, and optional justification.
 
 
 ##### `PolicyBuilder::add_host_executable`  (lines 113–115)
@@ -346,11 +352,11 @@ fn add_network_rule(&mut self, rule: NetworkRule)
 fn add_host_executable(&mut self, name: String, paths: Vec<AbsolutePathBuf>)
 ```
 
-**Purpose**: Registers the allowed absolute paths for a host executable name. A later definition replaces any earlier mapping for the same normalized name.
+**Purpose**: Records which absolute paths may count as a named host executable. This is useful when policy rules refer to an executable by name but the system needs known trusted paths.
 
-**Data flow**: It takes a normalized executable `name` and a `Vec<AbsolutePathBuf>`, converts the vector into `Arc<[AbsolutePathBuf]>`, and inserts it into `host_executables_by_name`. Existing entries for the same key are overwritten.
+**Data flow**: A normalized executable name and a list of absolute paths come in. The paths are stored under that name, replacing any previous entry for the same name. The builder is updated in place.
 
-**Call relations**: Used by the `host_executable` builtin after validating the name, parsing each path, checking basename consistency, and deduplicating repeated paths.
+**Call relations**: The host_executable built-in calls this after checking that the name is bare, the paths are absolute, and each path’s basename matches the name.
 
 
 ##### `PolicyBuilder::add_pending_example_validation`  (lines 117–131)
@@ -364,11 +370,11 @@ fn add_pending_example_validation(
         location: Option<ErrorLocation>,
 ```
 
-**Purpose**: Queues example assertions for deferred validation after the current policy file finishes evaluating. Deferral allows examples to see declarations that appear later in the same file, such as `host_executable` mappings.
+**Purpose**: Saves examples that should be checked after the current Starlark rule call finishes. These examples prove that a rule matches the commands it is meant to match and does not match commands it should ignore.
 
-**Data flow**: It receives the concrete `rules` created for one declaration, parsed positive and negative example token lists, and an optional source `location`. It packages them into `PendingExampleValidation` and pushes that record onto `pending_example_validations`.
+**Data flow**: It receives the rules being tested, example command lines expected to match, example command lines expected not to match, and an optional source location. It wraps them in a PendingExampleValidation record and appends it to the builder’s validation list.
 
-**Call relations**: Called by the `prefix_rule` builtin immediately after rule construction and before the rules are inserted, so semantic checks can run later against a temporary policy assembled from the relevant rules plus current host executable state.
+**Call relations**: The prefix_rule built-in calls this before adding the new rules to the builder. Later, PolicyParser::parse asks PolicyBuilder::validate_pending_examples_from to check the new saved validations.
 
 
 ##### `PolicyBuilder::validate_pending_examples_from`  (lines 133–152)
@@ -377,11 +383,11 @@ fn add_pending_example_validation(
 fn validate_pending_examples_from(&self, start: usize) -> Result<()>
 ```
 
-**Purpose**: Runs semantic validation for deferred `match` and `not_match` examples added since a given index. Each validation is checked against a temporary policy containing only the declaration’s rules plus the current host executable map.
+**Purpose**: Checks saved match and not-match examples starting at a chosen point in the validation list. This prevents broken examples from silently becoming misleading documentation.
 
-**Data flow**: Input is a starting index into `pending_example_validations`. For each queued validation from that slice, it rebuilds a temporary `MultiMap<String, RuleRef>` from the validation’s `rules`, constructs a temporary `Policy` with no network rules and a clone of `host_executables_by_name`, then runs `validate_not_match_examples` followed by `validate_match_examples`. Any returned `Error` is rewritten with `attach_validation_location`; on success it returns `Ok(())` without mutating builder state.
+**Data flow**: It receives an index saying where new validations begin. For each saved validation from that point onward, it builds a temporary Policy containing just the relevant rules and current host executable map, then runs the not-match checks and match checks. If a check fails, it attaches the original source location when available and returns an error.
 
-**Call relations**: Invoked by `PolicyParser::parse` after Starlark evaluation completes. It delegates the actual matching semantics to the rule-layer validators and exists to bridge parse-time declarations into runtime-style policy checks.
+**Call relations**: PolicyParser::parse records how many validations existed before running a policy file, then calls this afterward to check only the examples added by that parse. It calls validate_not_match_examples and validate_match_examples to do the actual rule testing.
 
 *Call graph*: calls 2 internal fn (validate_match_examples, validate_not_match_examples); 3 external calls (new, new, from_parts).
 
@@ -392,11 +398,11 @@ fn validate_pending_examples_from(&self, start: usize) -> Result<()>
 fn build(self) -> crate::policy::Policy
 ```
 
-**Purpose**: Converts the accumulated parse state into the runtime `Policy` object. It is the final assembly step once parsing and validation are complete.
+**Purpose**: Turns the builder’s collected pieces into the final Policy object. This is the handoff from temporary parsing state to the usable rulebook.
 
-**Data flow**: It consumes the builder, moving out `rules_by_program`, `network_rules`, and `host_executables_by_name`, and passes them to `Policy::from_parts`. It returns the resulting `Policy`.
+**Data flow**: It consumes the builder and moves out the rules by program, network rules, and host executable mappings. Those parts are passed into Policy::from_parts, which returns a Policy.
 
-**Call relations**: Reached from `PolicyParser::build` after all desired files have been parsed.
+**Call relations**: PolicyParser::build delegates to this after parsing is complete. The resulting Policy is what other parts of the system use when making execution decisions.
 
 *Call graph*: 1 external calls (from_parts).
 
@@ -407,11 +413,11 @@ fn build(self) -> crate::policy::Policy
 fn parse_pattern(pattern: UnpackList<Value<'v>>) -> Result<Vec<PatternToken>>
 ```
 
-**Purpose**: Parses a Starlark list representing a command pattern into internal `PatternToken`s. It also enforces the invariant that a rule pattern cannot be empty.
+**Purpose**: Converts a Starlark list-like pattern into internal pattern tokens for a prefix rule. It rejects empty patterns because a rule with no command tokens would be meaningless.
 
-**Data flow**: It takes `UnpackList<Value>` from Starlark, maps each item through `parse_pattern_token`, and collects the results into `Vec<PatternToken>`. If the resulting vector is empty it returns `Error::InvalidPattern`; otherwise it returns the parsed token vector.
+**Data flow**: It receives a Starlark unpacked list of values. Each item is passed to parse_pattern_token, producing a list of PatternToken values. If the list is empty or any token is invalid, it returns an error; otherwise it returns the token list.
 
-**Call relations**: Used by the `prefix_rule` builtin before rule construction so malformed patterns fail early with policy-parse errors.
+**Call relations**: The prefix_rule built-in uses this before creating PrefixRule objects. It relies on parse_pattern_token for the item-by-item conversion.
 
 *Call graph*: 1 external calls (InvalidPattern).
 
@@ -422,11 +428,11 @@ fn parse_pattern(pattern: UnpackList<Value<'v>>) -> Result<Vec<PatternToken>>
 fn parse_pattern_token(value: Value<'v>) -> Result<PatternToken>
 ```
 
-**Purpose**: Converts one Starlark pattern element into either a single-token matcher or an alternatives matcher. It accepts a string or a list of strings and rejects all other shapes.
+**Purpose**: Converts one item from a rule pattern into a token the matcher understands. A token can be a single string or a list of alternative strings.
 
-**Data flow**: Input is a Starlark `Value`. If it unpacks as a string, it returns `PatternToken::Single`; if it is a list, it iterates the list content, requires every element to be a string, and returns `Single` for a one-element list or `Alts(Vec<String>)` for multiple alternatives. Empty alternative lists and non-string elements produce `Error::InvalidPattern` with type-specific messages.
+**Data flow**: It receives one Starlark value. If the value is a string, it becomes a single-token pattern. If it is a list, each item must be a string; an empty list is rejected, a one-item list is simplified to a single token, and a multi-item list becomes an alternatives token. Any other kind of value produces an invalid-pattern error.
 
-**Call relations**: Called by `parse_pattern` for each element of a `prefix_rule` pattern. Its output directly determines whether the first token expands into multiple rules or later tokens remain grouped as alternatives.
+**Call relations**: parse_pattern calls this for every item in a prefix_rule pattern. The resulting PatternToken values later become the first and remaining parts of PrefixPattern.
 
 *Call graph*: 6 external calls (from_value, unpack_str, InvalidPattern, Alts, Single, format!).
 
@@ -437,11 +443,11 @@ fn parse_pattern_token(value: Value<'v>) -> Result<PatternToken>
 fn parse_examples(examples: UnpackList<Value<'v>>) -> Result<Vec<Vec<String>>>
 ```
 
-**Purpose**: Parses a Starlark list of example commands into tokenized command vectors. It is a bulk wrapper around single-example parsing.
+**Purpose**: Converts the examples attached to a rule into command-token lists. These examples are later used to check that the rule behaves as the policy author expected.
 
-**Data flow**: It takes `UnpackList<Value>`, applies `parse_example` to each item, and collects the resulting `Vec<String>` commands into `Vec<Vec<String>>`. Any invalid example aborts the whole parse with an `Error`.
+**Data flow**: It receives a Starlark unpacked list of example values. Each example is passed to parse_example, and the results are collected into a list of token lists. If any example is invalid, the whole conversion returns an error.
 
-**Call relations**: Used by the `prefix_rule` builtin for both `match` and `not_match` arguments.
+**Call relations**: The prefix_rule built-in calls this for the optional match and not_match arguments. It hands each individual example to parse_example.
 
 
 ##### `parse_literal_absolute_path`  (lines 223–232)
@@ -450,11 +456,11 @@ fn parse_examples(examples: UnpackList<Value<'v>>) -> Result<Vec<Vec<String>>>
 fn parse_literal_absolute_path(raw: &str) -> Result<AbsolutePathBuf>
 ```
 
-**Purpose**: Validates that a raw string is an absolute filesystem path and converts it into `AbsolutePathBuf`. It produces user-facing `InvalidRule` errors with the original literal embedded.
+**Purpose**: Checks and converts a path string from host_executable into an absolute path object. It refuses relative paths so the policy cannot depend on the caller’s current directory.
 
-**Data flow**: Input is a raw `&str`. It first checks `Path::new(raw).is_absolute()`, then attempts `AbsolutePathBuf::try_from(raw.to_string())`; success returns the typed absolute path, while either failure path returns `Error::InvalidRule` describing the problem.
+**Data flow**: A raw string path comes in. The function first checks whether it is absolute, then asks AbsolutePathBuf to validate and store it. It returns the absolute path object or an invalid-rule error explaining the problem.
 
-**Call relations**: Called from the `host_executable` builtin for each declared path before basename checks and deduplication.
+**Call relations**: The host_executable built-in calls this for every listed path after confirming the Starlark value is a string. The parsed paths are later stored by PolicyBuilder::add_host_executable.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (new, InvalidRule, format!).
 
@@ -465,11 +471,11 @@ fn parse_literal_absolute_path(raw: &str) -> Result<AbsolutePathBuf>
 fn validate_host_executable_name(name: &str) -> Result<()>
 ```
 
-**Purpose**: Ensures a `host_executable` name is a non-empty bare executable basename rather than a path. This prevents ambiguous or platform-dependent lookup keys.
+**Purpose**: Makes sure a host executable name is just a bare executable name, not a path. This avoids confusing entries like folders, empty names, or names with separators.
 
-**Data flow**: It takes a `&str`, rejects the empty string, then uses `Path` component and filename checks to ensure the value consists of exactly one path component whose file name round-trips to the original string. It returns `Ok(())` on success or `Error::InvalidRule` on failure.
+**Data flow**: A name string comes in. The function rejects an empty name and checks that the path parser sees exactly one filename component matching the original string. It returns success or an invalid-rule error.
 
-**Call relations**: Used by the `host_executable` builtin before any path parsing so invalid names fail immediately.
+**Call relations**: The host_executable built-in calls this before looking at paths. If the name is invalid, parsing stops before any executable mapping is added.
 
 *Call graph*: 3 external calls (new, InvalidRule, format!).
 
@@ -480,11 +486,11 @@ fn validate_host_executable_name(name: &str) -> Result<()>
 fn parse_network_rule_decision(raw: &str) -> Result<Decision>
 ```
 
-**Purpose**: Parses the decision string for `network_rule`, with a compatibility alias that maps `deny` to `Decision::Forbidden`. Other values are delegated to the standard decision parser.
+**Purpose**: Converts the decision text in a network_rule into the internal Decision value. It treats the word deny as the project’s Forbidden decision while letting other decision names use the normal parser.
 
-**Data flow**: It accepts a raw decision string, matches the special case `"deny"`, otherwise calls `Decision::parse`. It returns the parsed `Decision` or an error from the delegated parser.
+**Data flow**: A raw decision string comes in. If it is exactly deny, the function returns Decision::Forbidden. Otherwise it passes the string to Decision::parse and returns that result.
 
-**Call relations**: Called only by the `network_rule` builtin because network policy syntax accepts `deny` in addition to the generic decision vocabulary.
+**Call relations**: The network_rule built-in uses this when reading its decision argument. This keeps network policy wording compatible with both deny and the shared Decision parser.
 
 *Call graph*: calls 1 internal fn (parse).
 
@@ -495,11 +501,11 @@ fn parse_network_rule_decision(raw: &str) -> Result<Decision>
 fn error_location_from_file_span(span: FileSpan) -> ErrorLocation
 ```
 
-**Purpose**: Translates a Starlark `FileSpan` into the crate’s source-location structure with 1-based line and column numbers. This normalizes parser/runtime spans into the error format used elsewhere in the policy subsystem.
+**Purpose**: Turns a Starlark source-code span into the project’s error location format. This lets validation errors point back to the policy file line and column that caused them.
 
-**Data flow**: It reads the span filename and resolved begin/end positions, increments line and column values from Starlark’s zero-based coordinates, and constructs `ErrorLocation { path, range: TextRange { start, end } }`. It returns that location object without side effects.
+**Data flow**: A FileSpan from the Starlark evaluator comes in. The function resolves it into beginning and ending line and column positions, converts those to one-based numbers that humans expect, and returns an ErrorLocation with the filename and text range.
 
-**Call relations**: Used by the `prefix_rule` builtin when capturing the declaration site for deferred example validation errors.
+**Call relations**: The prefix_rule built-in uses this when saving example validations. If validation later fails, attach_validation_location can add this location to the error.
 
 *Call graph*: 2 external calls (filename, resolve_span).
 
@@ -510,11 +516,11 @@ fn error_location_from_file_span(span: FileSpan) -> ErrorLocation
 fn attach_validation_location(error: Error, location: Option<ErrorLocation>) -> Error
 ```
 
-**Purpose**: Adds an optional source location to a validation error if one is available. It preserves the original error unchanged when no location was captured.
+**Purpose**: Adds a saved source location to an error when one is available. This makes example validation failures easier to fix in the policy file.
 
-**Data flow**: It takes an `Error` and `Option<ErrorLocation>`. If the option is `Some`, it calls `with_location` on the error and returns the enriched error; otherwise it returns the original error.
+**Data flow**: An Error and an optional ErrorLocation come in. If there is a location, the error is returned with that location attached; otherwise the original error is returned unchanged.
 
-**Call relations**: Used inside `PolicyBuilder::validate_pending_examples_from` to rewrite semantic example-validation failures with the originating rule’s source span.
+**Call relations**: PolicyBuilder::validate_pending_examples_from uses this around errors from validate_not_match_examples and validate_match_examples.
 
 *Call graph*: 1 external calls (with_location).
 
@@ -525,11 +531,11 @@ fn attach_validation_location(error: Error, location: Option<ErrorLocation>) -> 
 fn parse_example(value: Value<'v>) -> Result<Vec<String>>
 ```
 
-**Purpose**: Parses one example command from either shell-like string syntax or an explicit token list. It rejects any other Starlark value type.
+**Purpose**: Converts one example command into a list of command tokens. It accepts either a shell-like string or an explicit list of strings.
 
-**Data flow**: Input is a Starlark `Value`. If it unpacks as a string, it delegates to `parse_string_example`; if it is a list, it delegates to `parse_list_example`; otherwise it returns `Error::InvalidExample` mentioning the actual Starlark type. The output is a non-empty `Vec<String>` token sequence.
+**Data flow**: A Starlark value comes in. If it is a string, parse_string_example splits it like a shell command line. If it is a list, parse_list_example checks and copies its string items. Any other value becomes an invalid-example error.
 
-**Call relations**: Called by `parse_examples` for each `match` or `not_match` entry.
+**Call relations**: parse_examples calls this for each example supplied to prefix_rule. It delegates to parse_string_example or parse_list_example depending on the example’s shape.
 
 *Call graph*: calls 2 internal fn (parse_list_example, parse_string_example); 4 external calls (from_value, unpack_str, InvalidExample, format!).
 
@@ -540,11 +546,11 @@ fn parse_example(value: Value<'v>) -> Result<Vec<String>>
 fn parse_string_example(raw: &str) -> Result<Vec<String>>
 ```
 
-**Purpose**: Tokenizes a shell-style example string using `shlex`. It ensures the resulting command is syntactically valid and non-empty.
+**Purpose**: Splits a string example into command tokens using shell-style quoting rules. This lets policy authors write natural examples such as a command line with quoted arguments.
 
-**Data flow**: It takes a raw string, runs `shlex::split`, converts split failure into `Error::InvalidExample`, and rejects an empty token vector with a dedicated message. On success it returns the parsed tokens.
+**Data flow**: A raw example string comes in. shlex splitting turns it into tokens, or fails if the shell syntax is invalid. Empty strings are rejected; otherwise the token list is returned.
 
-**Call relations**: Reached from `parse_example` when an example is written as a single string literal such as `"git status"`.
+**Call relations**: parse_example calls this when an example is written as a single string. The returned tokens are later used by example validation.
 
 *Call graph*: called by 1 (parse_example); 2 external calls (InvalidExample, split).
 
@@ -555,11 +561,11 @@ fn parse_string_example(raw: &str) -> Result<Vec<String>>
 fn parse_list_example(list: &ListRef) -> Result<Vec<String>>
 ```
 
-**Purpose**: Parses an example written as an explicit list of string tokens. It enforces that every element is a string and that the list is not empty.
+**Purpose**: Checks and copies an example that is already written as a list of command tokens. This is the stricter alternative to shell-string examples.
 
-**Data flow**: It iterates `ListRef::content()`, unpacks each value as a string, clones each token into a `Vec<String>`, and returns that vector. Non-string elements or an empty list produce `Error::InvalidExample`.
+**Data flow**: A Starlark list reference comes in. Every item must be a string, and those strings are copied into a Rust vector. An empty list or a non-string item produces an invalid-example error.
 
-**Call relations**: Reached from `parse_example` when an example is written as a Starlark list like `["git", "status"]`.
+**Call relations**: parse_example calls this when an example is written as a list. The returned tokens are later compared against the prefix rules during validation.
 
 *Call graph*: called by 1 (parse_example); 2 external calls (content, InvalidExample).
 
@@ -570,11 +576,11 @@ fn parse_list_example(list: &ListRef) -> Result<Vec<String>>
 fn policy_builder(eval: &Evaluator<'v, 'a, '_>) -> RefMut<'a, PolicyBuilder>
 ```
 
-**Purpose**: Retrieves the mutable `PolicyBuilder` stored in the current Starlark evaluator. It is the bridge that lets builtin functions mutate parser state during module evaluation.
+**Purpose**: Retrieves the shared PolicyBuilder from the current Starlark evaluator. The custom Starlark functions use it as their way to add rules to the parser’s collected state.
 
-**Data flow**: It takes an `Evaluator`, reads `eval.extra`, downcasts it to `RefCell<PolicyBuilder>`, and returns a `RefMut<PolicyBuilder>`. Missing or wrongly typed `extra` triggers internal `expect` panics because this is treated as an evaluator setup invariant.
+**Data flow**: It receives an Evaluator. The function expects Evaluator.extra to contain a RefCell<PolicyBuilder>, downcasts it to that type, borrows it mutably, and returns the mutable borrow. If the evaluator was not prepared correctly, it panics with a developer-facing message.
 
-**Call relations**: Used by all stateful builtins inside `policy_builtins` after argument parsing succeeds.
+**Call relations**: PolicyParser::parse stores the builder in the evaluator before running the Starlark module. The built-ins defined by policy_builtins call policy_builder whenever they need to add a rule, network rule, or executable mapping.
 
 
 ##### `policy_builtins`  (lines 348–473)
@@ -583,20 +589,22 @@ fn policy_builder(eval: &Evaluator<'v, 'a, '_>) -> RefMut<'a, PolicyBuilder>
 fn policy_builtins(builder: &mut GlobalsBuilder)
 ```
 
-**Purpose**: Registers the Starlark functions that policy files can call: `prefix_rule`, `network_rule`, and `host_executable`. These builtins parse user syntax, validate arguments, and mutate the shared `PolicyBuilder`.
+**Purpose**: Registers the policy language functions that a Starlark policy file is allowed to call. These functions are the bridge between human-written policy text and the internal builder.
 
-**Data flow**: It receives a mutable `GlobalsBuilder` and defines three builtin functions. `prefix_rule` parses decision, justification, pattern tokens, and optional examples; captures source location; expands first-token alternatives into multiple `PrefixRule` values; queues deferred example validation; and inserts each rule. `network_rule` parses protocol and decision, normalizes the host, validates optional justification, and appends a `NetworkRule`. `host_executable` validates the executable name, parses each path as `AbsolutePathBuf`, checks basename consistency via executable lookup helpers, deduplicates repeated paths, and stores the normalized mapping. Each builtin returns `NoneType` on success and surfaces crate errors through `anyhow::Result`.
+**Data flow**: A GlobalsBuilder comes in from the Starlark setup code. This module adds prefix_rule, network_rule, and host_executable to it. When the policy file calls those names, the nested Rust functions parse arguments, validate them, and update the PolicyBuilder; the registration itself returns through the Starlark macro machinery.
 
-**Call relations**: This function is passed into `GlobalsBuilder::with` by `PolicyParser::parse`, making the declared builtins available during Starlark module evaluation. The nested builtins all rely on `policy_builder` to reach shared parse state.
+**Call relations**: PolicyParser::parse builds Starlark globals with policy_builtins before evaluating a policy file. The registered functions call helpers such as parse_pattern, parse_examples, parse_network_rule_decision, validate_host_executable_name, parse_literal_absolute_path, and policy_builder to turn Starlark calls into builder updates.
 
 
 ### `execpolicy/src/policy.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `request handling and policy evaluation`
 
-This file contains the core runtime representation of parsed execution policy. `Policy` stores prefix rules in a `MultiMap<String, RuleRef>` keyed by the command’s first token, network rules in insertion order, and optional host executable allowlists keyed by normalized executable name. The matching path is intentionally layered: `matches_for_command_with_options` first tries exact first-token lookup, then optionally rewrites an absolute executable path to its basename through `match_host_executable_rules`, and only if both produce no matches does it synthesize a `RuleMatch::HeuristicsRuleMatch` from the caller-provided fallback. Exact matches always win over host-executable resolution, and host resolution can be constrained by an explicit allowlist or allowed to fall back when no mapping exists.
+This file answers a practical question: “Is this command or network access allowed?” A policy is like a rulebook. Some rules apply to programs and their arguments, such as a command starting with `git status`. Other rules apply to network hosts. Without this file, the rest of the system could store rules but would not have one clear place to combine them, look them up, and produce a final answer.
 
-The file also exposes mutation helpers used by tests and higher-level code: adding prefix rules constructs `PrefixRule` objects from raw token slices, adding network rules normalizes hosts and rejects blank justifications, and host executable paths can be set directly. `merge_overlay` preserves base rules while appending overlay rules and network rules, but host executable mappings are replaced per key by the overlay. `compiled_network_domains` reduces ordered network rules into final allow and deny domain lists, removing earlier contradictory entries and ignoring prompt-only rules. `Evaluation::from_matches` encodes the invariant that callers must only construct evaluations from non-empty match sets, deriving the final decision as the maximum severity across all matched rules.
+The `Policy` type keeps three main collections: command rules grouped by program name, network rules, and a map of known host-machine executable paths. When a command is checked, the policy first looks for rules whose first word exactly matches the program name. If configured to do so, it can also recognize an absolute path like `/usr/bin/git` as the host executable named `git`, then match rules written for `git`. If no rule matches, a caller-provided fallback can make a best-effort decision.
+
+The `Evaluation` type is the final report. It contains the strongest decision found among all matching rules and the list of rules that led to that result. Network rules are compiled into separate allow and deny domain lists, with later rules replacing earlier ones for the same host.
 
 #### Function details
 
@@ -606,11 +614,11 @@ The file also exposes mutation helpers used by tests and higher-level code: addi
 fn new(rules_by_program: MultiMap<String, RuleRef>) -> Self
 ```
 
-**Purpose**: Constructs a policy from only prefix rules, defaulting network rules and host executable mappings to empty collections. It is the simplest constructor for callers that already have a populated rule multimap.
+**Purpose**: Creates a policy from command rules only. It starts with no network rules and no host-executable path information.
 
-**Data flow**: It takes `rules_by_program`, supplies `Vec::new()` and `HashMap::new()` for the other two fields, and forwards all three pieces to `Policy::from_parts`. It returns the assembled `Policy`.
+**Data flow**: It receives a map from program names to rules. It passes that map, plus empty network and executable-path collections, into the fuller policy constructor. The result is a ready-to-use `Policy`.
 
-**Call relations**: Used by `Policy::empty` and any caller that wants a policy without network or host-executable metadata.
+**Call relations**: This is the simple constructor used when callers only have command rules. It delegates to `Policy::from_parts` so all policy construction goes through the same shape.
 
 *Call graph*: 3 external calls (new, from_parts, new).
 
@@ -625,11 +633,11 @@ fn from_parts(
     ) -> Self
 ```
 
-**Purpose**: Builds a `Policy` from its three concrete storage components. It is the canonical constructor used by parsing, merging, and temporary validation policies.
+**Purpose**: Builds a policy from all of its pieces at once. This is useful when rules, network permissions, and host executable paths have already been loaded or combined elsewhere.
 
-**Data flow**: It consumes a `MultiMap<String, RuleRef>`, `Vec<NetworkRule>`, and `HashMap<String, Arc<[AbsolutePathBuf]>>`, stores them directly in the struct, and returns the resulting `Policy`.
+**Data flow**: It receives command rules, network rules, and a name-to-paths table. It stores those three collections directly inside a new `Policy` and returns it.
 
-**Call relations**: Called by constructors in this file, by the parser when finalizing a policy, and by parse-time example validation when creating temporary policies.
+**Call relations**: This is the central constructor. Other constructors and combining operations use it when they need to assemble a complete policy object.
 
 
 ##### `Policy::empty`  (lines 51–53)
@@ -638,11 +646,11 @@ fn from_parts(
 fn empty() -> Self
 ```
 
-**Purpose**: Creates a policy with no rules of any kind. It is mainly a convenience for tests and fallback scenarios.
+**Purpose**: Creates a policy with no rules at all. This is useful as a safe starting point before adding rules or as a default that permits nothing by rule.
 
-**Data flow**: It constructs an empty `MultiMap` and passes it to `Policy::new`, which fills in the remaining empty collections. It returns the empty policy.
+**Data flow**: It creates an empty rule map and passes it to `Policy::new`. The returned policy has no command rules, no network rules, and no host executable paths.
 
-**Call relations**: Used in tests and any code path that needs a baseline policy before adding rules incrementally.
+**Call relations**: This is the blank-rulebook shortcut. It relies on `Policy::new` to build the actual policy.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -653,11 +661,11 @@ fn empty() -> Self
 fn rules(&self) -> &MultiMap<String, RuleRef>
 ```
 
-**Purpose**: Exposes the internal prefix-rule multimap for inspection. It provides read-only access to the keyed rule storage.
+**Purpose**: Lets other code read the command-rule table without taking ownership of it. This is for inspection, exporting, or further processing.
 
-**Data flow**: It takes `&self` and returns `&MultiMap<String, RuleRef>` referencing `rules_by_program` without copying or mutation.
+**Data flow**: It reads the policy’s internal command-rule map and returns a shared reference to it. Nothing is changed.
 
-**Call relations**: Primarily used by tests and introspection code to inspect parsed rules.
+**Call relations**: This is an accessor. It gives callers a view of the stored command rules while keeping the `Policy` in control of the data.
 
 
 ##### `Policy::network_rules`  (lines 59–61)
@@ -666,11 +674,11 @@ fn rules(&self) -> &MultiMap<String, RuleRef>
 fn network_rules(&self) -> &[NetworkRule]
 ```
 
-**Purpose**: Returns the ordered slice of configured network rules. This lets callers inspect the exact parsed network policy.
+**Purpose**: Lets other code read the stored network rules. These are the rules that say whether access to particular hosts is allowed, denied, or should prompt.
 
-**Data flow**: It borrows `self.network_rules` and returns it as `&[NetworkRule]`.
+**Data flow**: It reads the policy’s internal network-rule list and returns it as a shared slice. The policy is not changed.
 
-**Call relations**: Used by tests and any code that needs direct access to network rule declarations.
+**Call relations**: This accessor supports code that needs to inspect or serialize network permissions without editing them.
 
 
 ##### `Policy::host_executables`  (lines 63–65)
@@ -679,11 +687,11 @@ fn network_rules(&self) -> &[NetworkRule]
 fn host_executables(&self) -> &HashMap<String, Arc<[AbsolutePathBuf]>>
 ```
 
-**Purpose**: Returns the host executable mapping table. The map associates normalized executable names with allowed absolute paths.
+**Purpose**: Lets other code read the table of known host executable paths. This table helps match rules written for names like `python` against full paths like `/usr/bin/python`.
 
-**Data flow**: It borrows `self.host_executables_by_name` and returns `&HashMap<String, Arc<[AbsolutePathBuf]>>`.
+**Data flow**: It returns a shared reference to the internal name-to-paths map. No data is copied or changed.
 
-**Call relations**: Used by tests and policy consumers that need to inspect host executable resolution state.
+**Call relations**: This accessor supports policy inspection and any code that needs to know which absolute paths are trusted matches for executable names.
 
 
 ##### `Policy::get_allowed_prefixes`  (lines 67–89)
@@ -692,11 +700,11 @@ fn host_executables(&self) -> &HashMap<String, Arc<[AbsolutePathBuf]>>
 fn get_allowed_prefixes(&self) -> Vec<Vec<String>>
 ```
 
-**Purpose**: Extracts a deduplicated, human-readable list of all allow-decision prefix rules. It ignores non-prefix rule types and non-allow decisions.
+**Purpose**: Collects the command prefixes that are explicitly allowed by prefix rules. A prefix is the beginning of a command, like the first few words that a rule matches.
 
-**Data flow**: It iterates `rules_by_program.iter_all()`, downcasts each `RuleRef` to `PrefixRule`, filters to `Decision::Allow`, reconstructs each prefix as `Vec<String>` by combining `pattern.first` with rendered tail tokens, then sorts and deduplicates the resulting list. It returns the final `Vec<Vec<String>>`.
+**Data flow**: It walks through all command rules, keeps only prefix rules whose decision is `Allow`, turns each pattern into plain strings, sorts them, removes duplicates, and returns the resulting list.
 
-**Call relations**: This is an inspection/helper path rather than part of command evaluation. It depends on `render_pattern_token` semantics to stringify alternative tokens.
+**Call relations**: This function reads from the command-rule table. It uses `render_pattern_token` behavior indirectly through the helper to make pattern pieces readable for callers.
 
 *Call graph*: 3 external calls (iter_all, new, with_capacity).
 
@@ -707,11 +715,11 @@ fn get_allowed_prefixes(&self) -> Vec<Vec<String>>
 fn add_prefix_rule(&mut self, prefix: &[String], decision: Decision) -> Result<()>
 ```
 
-**Purpose**: Adds a simple prefix rule directly from a token slice and decision. It is a programmatic counterpart to the parsed `prefix_rule` builtin and does not support examples or justification.
+**Purpose**: Adds a new rule that matches commands beginning with a given sequence of words. This lets code build or extend a policy programmatically.
 
-**Data flow**: Input is a token slice and `Decision`. It splits the slice into first token and rest, errors with `InvalidPattern` if empty, converts the rest into `PatternToken::Single` values, wraps them in a `PrefixRule` with `justification: None`, stores it as `RuleRef`, inserts it into `rules_by_program` under the first token, and returns `Result<()>`.
+**Data flow**: It receives a command prefix and a decision. If the prefix is empty, it returns an error because a rule needs at least a program name. Otherwise it builds a `PrefixRule`, stores it under the first command word, and returns success.
 
-**Call relations**: Used by tests and any code constructing policies without going through the Starlark parser.
+**Call relations**: This is one of the policy-editing entry points. It creates a rule object and inserts it into the same command-rule map later used by command matching.
 
 *Call graph*: 3 external calls (from, new, insert).
 
@@ -728,11 +736,11 @@ fn add_network_rule(
     ) -> Result<()>
 ```
 
-**Purpose**: Appends a network rule after validating and normalizing its host and optional justification. It is the programmatic equivalent of the parsed `network_rule` declaration.
+**Purpose**: Adds a rule for network access to a host. It records whether that host should be allowed, forbidden, or left to a prompt.
 
-**Data flow**: It takes raw host text, a `NetworkRuleProtocol`, a `Decision`, and optional justification. It normalizes the host with `normalize_network_rule_host`, rejects blank justifications after trimming, pushes a `NetworkRule` into `self.network_rules`, and returns `Result<()>`.
+**Data flow**: It receives a host name, protocol, decision, and optional explanation. It normalizes the host into a consistent form, rejects an explanation that is only blank text, then appends a new `NetworkRule` to the policy.
 
-**Call relations**: Used by callers building policies in memory rather than through the parser. It shares host-normalization rules with parse-time network rule handling.
+**Call relations**: This is the network counterpart to adding command rules. It uses `normalize_network_rule_host` to keep host names consistent before `compiled_network_domains` later interprets the final list.
 
 *Call graph*: calls 1 internal fn (normalize_network_rule_host); 1 external calls (InvalidRule).
 
@@ -743,11 +751,11 @@ fn add_network_rule(
 fn set_host_executable_paths(&mut self, name: String, paths: Vec<AbsolutePathBuf>)
 ```
 
-**Purpose**: Sets or replaces the allowed absolute paths for one executable name. It is a direct mutator for host executable resolution state.
+**Purpose**: Records which absolute paths on the host machine belong to a given executable name. This prevents a random path with the same file name from automatically matching trusted rules.
 
-**Data flow**: It takes a normalized `name` and `Vec<AbsolutePathBuf>`, converts the vector into `Arc<[AbsolutePathBuf]>`, and inserts it into `host_executables_by_name`, overwriting any previous entry for that key.
+**Data flow**: It receives an executable name and a list of absolute paths. It stores the paths under that name, replacing any previous entry for the same name.
 
-**Call relations**: Used by programmatic policy construction paths; unlike parser-side validation, it assumes the caller already provides valid normalized data.
+**Call relations**: This feeds the optional host-executable matching path. When command matching tries to resolve `/some/path/name` back to `name`, this table can confirm whether that path is one of the known ones.
 
 
 ##### `Policy::merge_overlay`  (lines 141–165)
@@ -756,11 +764,11 @@ fn set_host_executable_paths(&mut self, name: String, paths: Vec<AbsolutePathBuf
 fn merge_overlay(&self, overlay: &Policy) -> Policy
 ```
 
-**Purpose**: Combines a base policy with an overlay policy, preserving all base rules while layering overlay additions and replacements on top. Overlay host executable mappings override base mappings by key.
+**Purpose**: Creates a combined policy where another policy is layered on top of this one. This is useful when a base rulebook needs temporary or user-specific additions.
 
-**Data flow**: It clones the base rule multimap, appends every overlay rule into it, clones and extends network rules, clones the host executable map and extends it with overlay entries, then returns a new `Policy` from those combined parts. The original policies are left unchanged.
+**Data flow**: It copies the current command rules, network rules, and host executable paths. Then it appends or overwrites with the overlay policy’s corresponding data. It returns a new combined `Policy` and leaves both originals unchanged.
 
-**Call relations**: This is used when policy sources are layered. It delegates final assembly to `Policy::from_parts` after performing collection-level merge semantics.
+**Call relations**: This is how policies are composed. After merging, normal checking functions operate on the combined rulebook as if it had been built that way from the start.
 
 *Call graph*: 2 external calls (clone, from_parts).
 
@@ -771,11 +779,11 @@ fn merge_overlay(&self, overlay: &Policy) -> Policy
 fn compiled_network_domains(&self) -> (Vec<String>, Vec<String>)
 ```
 
-**Purpose**: Reduces ordered network rules into final allow and deny domain lists suitable for downstream enforcement. Later allow/deny rules replace earlier contradictory entries for the same host, while prompt rules do not contribute.
+**Purpose**: Turns the ordered network-rule list into two simple lists: allowed domains and denied domains. Later rules for the same host win over earlier ones.
 
-**Data flow**: It iterates `self.network_rules`, maintaining mutable `allowed` and `denied` vectors. For `Allow`, it removes the host from `denied` and upserts it into `allowed`; for `Forbidden`, it removes from `allowed` and upserts into `denied`; for `Prompt`, it does nothing. It returns `(allowed, denied)`.
+**Data flow**: It starts with empty allowed and denied lists. For each network rule, an allow removes that host from denied and adds it to allowed; a forbid does the reverse; a prompt does not enter either list. It returns both lists.
 
-**Call relations**: Used after policy load when network policy needs to be compiled into coarse domain lists. It relies on `upsert_domain` to preserve last-writer ordering semantics.
+**Call relations**: This is used after network rules have been collected. It relies on `upsert_domain` to move a host to the end of the relevant list while avoiding duplicates.
 
 *Call graph*: calls 1 internal fn (upsert_domain); 1 external calls (new).
 
@@ -786,11 +794,11 @@ fn compiled_network_domains(&self) -> (Vec<String>, Vec<String>)
 fn check(&self, cmd: &[String], heuristics_fallback: &F) -> Evaluation
 ```
 
-**Purpose**: Evaluates one command against the policy using default match options and a required heuristics fallback. It returns an aggregate `Evaluation` rather than raw matches.
+**Purpose**: Checks one command using default matching behavior and returns the final evaluation. This is the common “tell me the decision for this command” call.
 
-**Data flow**: It takes a command slice and fallback closure, calls `matches_for_command_with_options` with `MatchOptions::default()`, then converts the resulting non-empty match list into `Evaluation` via `Evaluation::from_matches`. The returned evaluation contains the strictest decision and all contributing matches.
+**Data flow**: It receives a command and a fallback decision function. It finds matching rules with default options, then turns those matches into an `Evaluation` containing the final decision and supporting matches.
 
-**Call relations**: This is the common single-command entrypoint. It delegates matching to `matches_for_command_with_options` and aggregation to `Evaluation::from_matches`.
+**Call relations**: This is a convenience wrapper around `matches_for_command_with_options` and `Evaluation::from_matches`. Callers use it when they do not need special matching options.
 
 *Call graph*: calls 2 internal fn (from_matches, matches_for_command_with_options); 1 external calls (default).
 
@@ -806,11 +814,11 @@ fn check_with_options(
     ) -> Evaluation
 ```
 
-**Purpose**: Evaluates one command with explicit matching options, such as host executable resolution. It is the configurable variant of `check`.
+**Purpose**: Checks one command with custom matching options. The main option controls whether absolute host executable paths should be resolved to executable names.
 
-**Data flow**: Inputs are command tokens, fallback closure, and `MatchOptions`. It forwards them to `matches_for_command_with_options`, then wraps the resulting matches in `Evaluation::from_matches`.
+**Data flow**: It receives a command, a fallback decision function, and match options. It gathers matching rules according to those options and converts them into an `Evaluation`.
 
-**Call relations**: Used when callers need to enable or disable host executable resolution while still receiving an aggregate evaluation.
+**Call relations**: This is the configurable version of `Policy::check`. It still uses `matches_for_command_with_options` for the search and `Evaluation::from_matches` for the final report.
 
 *Call graph*: calls 2 internal fn (from_matches, matches_for_command_with_options).
 
@@ -825,11 +833,11 @@ fn check_multiple(
     ) -> Evaluation
 ```
 
-**Purpose**: Evaluates multiple commands and aggregates all matches into one `Evaluation` using default options. The final decision is the strictest across every matched rule from every command.
+**Purpose**: Checks several commands together using default matching behavior. This is useful when a larger operation is made of multiple commands and needs one combined decision.
 
-**Data flow**: It takes any iterable of command-like items plus a fallback closure, supplies `MatchOptions::default()`, and delegates to `check_multiple_with_options`. It returns the combined evaluation.
+**Data flow**: It receives an iterable collection of commands and a fallback decision function. It forwards them with default options and returns the combined `Evaluation`.
 
-**Call relations**: This is the convenience wrapper for batch evaluation and simply forwards to the configurable multi-command path.
+**Call relations**: This is a convenience wrapper. It hands the real work to `Policy::check_multiple_with_options` with the default `MatchOptions`.
 
 *Call graph*: calls 1 internal fn (check_multiple_with_options); 1 external calls (default).
 
@@ -845,11 +853,11 @@ fn check_multiple_with_options(
     ) -> Evaluation
 ```
 
-**Purpose**: Evaluates an iterable of commands with explicit options and aggregates all resulting matches. It preserves duplicate matches across commands rather than deduplicating them.
+**Purpose**: Checks several commands together with custom matching options and produces one combined evaluation. The final decision reflects the strongest decision among all matched rules.
 
-**Data flow**: It consumes `commands`, iterates them, calls `matches_for_command_with_options` for each command reference, flattens all `Vec<RuleMatch>` results into one `Vec<RuleMatch>`, and passes that vector to `Evaluation::from_matches`. It returns the aggregate evaluation.
+**Data flow**: It receives many commands, a fallback decision function, and match options. For each command, it gathers matching rules, flattens all those matches into one list, and builds a single `Evaluation` from that list.
 
-**Call relations**: Called by `check_multiple`; internally it repeatedly uses the same single-command matching logic so batch and single evaluation share semantics.
+**Call relations**: This is called by `Policy::check_multiple`. It uses the same matching machinery as single-command checks, then relies on `Evaluation::from_matches` to summarize all matches.
 
 *Call graph*: calls 1 internal fn (from_matches); called by 1 (check_multiple); 1 external calls (into_iter).
 
@@ -864,11 +872,11 @@ fn matches_for_command(
     ) -> Vec<RuleMatch>
 ```
 
-**Purpose**: Returns the raw rule matches for one command using default options. If no policy rule matches and a fallback is supplied, it returns a single heuristics match.
+**Purpose**: Returns the raw rule matches for one command using default matching options. This is useful when callers want to inspect why a command was allowed or denied instead of only seeing the final decision.
 
-**Data flow**: It takes a command slice and optional fallback closure, supplies `MatchOptions::default()`, and returns the `Vec<RuleMatch>` from `matches_for_command_with_options` directly.
+**Data flow**: It receives a command and an optional fallback function. It calls the option-aware matcher with default options and returns the list of rule matches.
 
-**Call relations**: This is the raw-match counterpart to `check`, used when callers want detailed matches without immediate aggregation.
+**Call relations**: This is the simpler form of `Policy::matches_for_command_with_options`. Other code can use it when it wants match details but not custom matching behavior.
 
 *Call graph*: calls 1 internal fn (matches_for_command_with_options); 1 external calls (default).
 
@@ -884,11 +892,11 @@ fn matches_for_command_with_options(
     ) -> Vec<RuleMatch>
 ```
 
-**Purpose**: Implements the full command-matching algorithm with optional host executable resolution and optional heuristics fallback. It enforces the precedence order exact match > resolved-host match > heuristics.
+**Purpose**: Finds the rules that match a command, optionally using special matching behavior. If no real rule matches, it can create a fallback match so the caller still gets a decision.
 
-**Data flow**: Inputs are command tokens, optional fallback closure, and `MatchOptions`. It first calls `match_exact_rules`; if that yields a non-empty vector, those matches are used. Otherwise, if `options.resolve_host_executables` is true, it calls `match_host_executable_rules` and uses those matches if non-empty. If both paths produce no matches and a fallback exists, it returns a one-element vector containing `RuleMatch::HeuristicsRuleMatch { command: cmd.to_vec(), decision: heuristics_fallback(cmd) }`; otherwise it returns the matched rules or an empty vector.
+**Data flow**: It receives a command, an optional fallback decision function, and matching options. It first tries exact program-name rules. If configured, it may also try resolving an absolute executable path to a known program name. If still nothing matches and a fallback exists, it returns one fallback match; otherwise it returns the real matches or an empty list.
 
-**Call relations**: This is the central runtime matcher used by `check`, `check_with_options`, `check_multiple_with_options`, `matches_for_command`, and parse-time example validation in `rule.rs`.
+**Call relations**: This is the main matching engine used by `Policy::check`, `Policy::check_with_options`, and `Policy::matches_for_command`. It calls `Policy::match_exact_rules` first, and it is the point where fallback decisions enter the result.
 
 *Call graph*: calls 1 internal fn (match_exact_rules); called by 3 (check, check_with_options, matches_for_command); 1 external calls (vec!).
 
@@ -899,11 +907,11 @@ fn matches_for_command_with_options(
 fn match_exact_rules(&self, cmd: &[String]) -> Option<Vec<RuleMatch>>
 ```
 
-**Purpose**: Looks up and evaluates rules keyed by the command’s literal first token. It does not attempt any path-to-basename rewriting.
+**Purpose**: Looks for command rules whose stored program name exactly matches the first word of the command. This is the fastest and most direct rule lookup.
 
-**Data flow**: It takes a command slice, returns `None` if the command is empty, otherwise fetches `rules_by_program.get_vec(first)` and runs `rule.matches(cmd)` for each candidate, collecting successful `RuleMatch` values into a vector. It wraps that vector in `Some`, even if empty.
+**Data flow**: It reads the first string in the command. If there is no first word, it returns no result. Otherwise it fetches rules stored under that program name, asks each rule whether it matches the full command, and returns the matches.
 
-**Call relations**: Called first by `matches_for_command_with_options` because exact first-token matches have highest precedence.
+**Call relations**: This is called by `Policy::matches_for_command_with_options` as the first matching attempt. It uses the policy’s program-to-rules map to avoid scanning unrelated rules.
 
 *Call graph*: called by 1 (matches_for_command_with_options); 1 external calls (get_vec).
 
@@ -914,11 +922,11 @@ fn match_exact_rules(&self, cmd: &[String]) -> Option<Vec<RuleMatch>>
 fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch>
 ```
 
-**Purpose**: Attempts to match a command whose first token is an absolute executable path against basename-keyed rules. It optionally enforces that the path appears in a configured allowlist for that basename.
+**Purpose**: Matches commands that start with an absolute executable path against rules written for the executable’s short name. For example, it can treat `/usr/bin/git status` as `git status` when that path is trusted.
 
-**Data flow**: It takes a command slice and returns an empty vector on any early failure: empty command, non-absolute first token, missing basename, or no rules for that basename. If a host executable mapping exists for the basename and the absolute path is not in that list, it also returns empty. Otherwise it builds a rewritten command whose first token is the basename and remaining tokens are copied from the original command, matches all basename-keyed rules against that rewritten command, then rewrites each resulting `RuleMatch` with `with_resolved_program(&program)` so the original absolute path is preserved in the output.
+**Data flow**: It receives a command. It checks that the first word is an absolute path, extracts a lookup name from that path, finds rules for that name, and verifies the path if the policy has known paths for the name. It then rewrites only the program part to the short name for matching, and marks matches with the resolved original path.
 
-**Call relations**: Called by `matches_for_command_with_options` only when exact matching found nothing and `resolve_host_executables` is enabled.
+**Call relations**: This supports the optional host-executable resolution path used during command matching. It calls `executable_path_lookup_key` to derive the short executable name and then uses the same rule matching style as exact command lookup.
 
 *Call graph*: calls 2 internal fn (executable_path_lookup_key, try_from); 3 external calls (get_vec, new, once).
 
@@ -929,11 +937,11 @@ fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch>
 fn upsert_domain(entries: &mut Vec<String>, host: &str)
 ```
 
-**Purpose**: Maintains a domain list with last-write-wins semantics for one host. It removes any existing occurrence before appending the new one.
+**Purpose**: Adds a host to a domain list while making sure it appears only once. If the host was already present, it is moved to the newest position.
 
-**Data flow**: It takes a mutable `Vec<String>` and a host string, retains only entries not equal to the host, then pushes `host.to_string()`. It mutates the vector in place and returns nothing.
+**Data flow**: It receives a mutable list and a host string. It removes any existing copy of that host, then pushes the host onto the end of the list.
 
-**Call relations**: Used exclusively by `Policy::compiled_network_domains` to keep allow and deny lists free of duplicates while preserving rule order.
+**Call relations**: This helper is called by `Policy::compiled_network_domains`. It keeps the compiled allow and deny lists free of duplicates while preserving the effect of later rules.
 
 *Call graph*: called by 1 (compiled_network_domains).
 
@@ -944,11 +952,11 @@ fn upsert_domain(entries: &mut Vec<String>, host: &str)
 fn render_pattern_token(token: &PatternToken) -> String
 ```
 
-**Purpose**: Converts a `PatternToken` into a displayable string form. Alternative tokens are rendered in bracketed pipe-separated notation.
+**Purpose**: Turns one command-pattern token into a readable string. Single words stay as-is, while alternatives are shown in a bracketed form.
 
-**Data flow**: It matches on `PatternToken`: `Single(value)` clones and returns the string, while `Alts(alternatives)` formats them as `[a|b|c]`. It has no side effects.
+**Data flow**: It receives a pattern token. If the token is a single value, it returns that value. If the token is a set of alternatives, it joins them with `|` and wraps them in brackets, such as `[build|test]`.
 
-**Call relations**: Used by `Policy::get_allowed_prefixes` when reconstructing readable prefixes from stored rule patterns.
+**Call relations**: This helper is used when allowed prefix rules are presented as plain strings. It translates internal pattern pieces into a format a caller can display or compare.
 
 *Call graph*: 1 external calls (format!).
 
@@ -959,11 +967,11 @@ fn render_pattern_token(token: &PatternToken) -> String
 fn is_match(&self) -> bool
 ```
 
-**Purpose**: Reports whether an evaluation contains at least one real policy-rule match rather than only heuristics fallback. This distinguishes explicit policy coverage from default behavior.
+**Purpose**: Tells whether an evaluation was based on at least one real policy rule. A fallback-only decision does not count as a true rule match.
 
-**Data flow**: It reads `self.matched_rules` and returns `true` if any element is not `RuleMatch::HeuristicsRuleMatch`, otherwise `false`.
+**Data flow**: It reads the evaluation’s matched rules. If any match is not a heuristics fallback match, it returns `true`; otherwise it returns `false`.
 
-**Call relations**: Used by callers inspecting evaluation results after `check` or `check_multiple`.
+**Call relations**: This helps callers distinguish “a written rule matched” from “the system guessed using the fallback.” It only inspects the `Evaluation` it is called on.
 
 
 ##### `Evaluation::from_matches`  (lines 365–374)
@@ -972,11 +980,11 @@ fn is_match(&self) -> bool
 fn from_matches(matched_rules: Vec<RuleMatch>) -> Self
 ```
 
-**Purpose**: Builds an aggregate evaluation from a non-empty list of rule matches. The final decision is the maximum-severity decision among those matches.
+**Purpose**: Builds the final evaluation report from a non-empty list of rule matches. It chooses the strongest decision among the matches and keeps the evidence list.
 
-**Data flow**: It takes ownership of `matched_rules`, maps each match through `RuleMatch::decision`, computes the maximum decision, panics if the vector is empty, and returns `Evaluation { decision, matched_rules }`.
+**Data flow**: It receives matched rules and expects the list to contain at least one item. It asks each match for its decision, picks the maximum decision according to the project’s decision ordering, and returns an `Evaluation` with that decision and the original matches.
 
-**Call relations**: Called by `Policy::check`, `Policy::check_with_options`, and `Policy::check_multiple_with_options` after those methods ensure a non-empty match list via either policy matches or heuristics fallback.
+**Call relations**: This is called by `Policy::check`, `Policy::check_with_options`, and `Policy::check_multiple_with_options`. It is the final summarizing step after rule matching has produced the evidence.
 
 *Call graph*: called by 3 (check, check_multiple_with_options, check_with_options).
 
@@ -986,13 +994,15 @@ These core modules apply approval, sandbox, patch, and network-decision logic on
 
 ### `core/src/tools/sandboxing.rs`
 
-`domain_logic` · `cross-cutting during approval and sandbox orchestration`
+`domain_logic` · `request handling`
 
-This file is the common contract layer between tool-specific runtimes and the orchestrator. `ApprovalStore` is a simple serialized-key cache of `ReviewDecision`s, used by `with_cached_approval` to skip repeated prompts when all approval keys for a request were previously approved for the session. `ApprovalCtx` carries the session, turn, call id, optional Guardian review id, retry reason, and optional network approval context needed to start an approval flow. `PermissionRequestPayload` standardizes hook input as a tool name plus JSON payload; the provided `bash` constructor emits `{command, description?}` under the bash hook tool name.
+Tools in this system can do powerful things, such as running commands or changing files. This file is the safety desk they must pass through. It gives the rest of the codebase a shared vocabulary for three questions: “Do we need approval?”, “Can we remember that approval for later?”, and “How tightly should this tool be sandboxed?” A sandbox is a restricted environment, like letting someone work at a bench with only certain drawers unlocked.
 
-`ExecApprovalRequirement` captures whether a tool call should be skipped, prompted, or forbidden, including optional proposed exec-policy amendments and a `bypass_sandbox` bit for trusted allow decisions. `default_exec_approval_requirement` derives that requirement from `AskForApproval` and the current filesystem sandbox kind. The file also encodes a subtle invariant around denied reads: `unsandboxed_execution_allowed` returns false when the filesystem policy contains deny-read restrictions, because bypassing the sandbox would silently drop those restrictions. That invariant drives both `sandbox_override_for_first_attempt` and `sandbox_permissions_preserving_denied_reads`, ensuring explicit escalation or policy-based sandbox bypass does not erase deny-read enforcement.
+The file includes a small approval cache, `ApprovalStore`, so if a user says “allow this for the session,” the same request does not keep interrupting them. `with_cached_approval` applies that cache to one or more approval keys, which matters for tools like patching that may touch several files at once.
 
-Finally, the traits `Approvable`, `Sandboxable`, and `ToolRuntime` define the hooks runtimes expose to orchestration, while `SandboxAttempt` packages the concrete sandbox transform context and provides `env_for`, which turns a `SandboxCommand` plus `ExecOptions` into an executable `ExecRequest` via `SandboxManager::transform`.
+It also defines traits, which are like promises a tool runtime makes. `Approvable` says how a tool asks for approval. `Sandboxable` says how it prefers to be sandboxed. `ToolRuntime` ties those together with the actual act of running the tool.
+
+The helper functions protect an important edge case: some file rules deny read access to particular paths. Those denials only exist inside the sandbox, so the code avoids “escaping” the sandbox when doing so would silently remove those protections. Finally, `SandboxAttempt::env_for` turns a planned command plus sandbox settings into an executable request.
 
 #### Function details
 
@@ -1002,11 +1012,11 @@ Finally, the traits `Approvable`, `Sandboxable`, and `ToolRuntime` define the ho
 fn get(&self, key: &K) -> Option<ReviewDecision>
 ```
 
-**Purpose**: Looks up a cached approval decision by serializing an arbitrary approval key to JSON. This lets different runtimes share one generic approval cache without custom key storage logic.
+**Purpose**: Looks up whether a particular approval request has already been approved for this session. It lets later tool calls reuse an earlier “allow for session” decision instead of asking the user again.
 
-**Data flow**: Takes a serializable key reference, attempts `serde_json::to_string(key)`, returns `None` on serialization failure, otherwise looks up the resulting string in `self.map`, clones the stored `ReviewDecision`, and returns it.
+**Data flow**: It receives a key that describes the approval request. It serializes that key into text, uses that text to search the store, and returns the saved review decision if one exists. If the key cannot be serialized or nothing is saved, it returns nothing.
 
-**Call relations**: Used indirectly by `with_cached_approval` when checking whether all approval keys for a request were already approved for the session.
+**Call relations**: This is used by the approval caching flow inside `with_cached_approval`. Before asking the user or guardian review system, that flow checks every approval key through this lookup to see whether the request can be skipped.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -1017,11 +1027,11 @@ fn get(&self, key: &K) -> Option<ReviewDecision>
 fn put(&mut self, key: K, value: ReviewDecision)
 ```
 
-**Purpose**: Stores a cached approval decision under a serialized approval key. Failed key serialization is ignored rather than surfacing an error.
+**Purpose**: Saves a review decision under a request key, so the same kind of request can be recognized later in the session. It is mainly used to remember “approved for session” decisions.
 
-**Data flow**: Takes an owned serializable key and a `ReviewDecision`, serializes the key with `serde_json::to_string(&key)`, and if successful inserts the string/value pair into `self.map`.
+**Data flow**: It receives an approval key and a decision. It serializes the key into text and, if that succeeds, stores the decision in the internal map under that text. It does not return a value; it changes the approval store.
 
-**Call relations**: Called by `with_cached_approval` when a request receives `ApprovedForSession`, so future equivalent requests can bypass prompting.
+**Call relations**: This is called by the approval caching path after a user approves something for the whole session. The cache stores each key separately so a later request touching only part of the same area can still be auto-approved.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -1038,11 +1048,11 @@ async fn with_cached_approval(
 ) -> ReviewDecision
 ```
 
-**Purpose**: Wraps an approval fetch operation with session-level caching semantics across one or more approval keys. It skips prompting when all keys are already approved for session, records telemetry for actual approval requests, and stores `ApprovedForSession` decisions per key.
+**Purpose**: Runs the common “check cache, maybe ask, then remember the answer” approval flow. It prevents repeated approval prompts when the user has already approved the same request for the current session.
 
-**Data flow**: Consumes session services, a tool name string, a vector of serializable keys, and an async `fetch` closure. If `keys` is empty it immediately awaits `fetch`. Otherwise it locks `services.tool_approvals`, checks whether every key maps to `ReviewDecision::ApprovedForSession`, and returns that decision early if so. If not, it awaits `fetch`, increments the `codex.approval.requested` telemetry counter with tool and opaque decision labels, and if the decision is `ApprovedForSession`, locks the approval store again and writes that decision for each key. Returns the final `ReviewDecision`.
+**Data flow**: It receives session services, a tool name for telemetry, a list of approval keys, and a callback that can fetch a fresh decision. If there are no keys, it simply asks for a fresh decision. Otherwise it checks whether every key is already approved for the session. If yes, it returns that approval immediately. If not, it calls the provided approval callback, records telemetry about the request, and caches the result for each key if the decision was “approved for session.”
 
-**Call relations**: Called by shell, unified-exec, and other runtimes’ `start_approval_async` implementations to share consistent approval caching behavior.
+**Call relations**: Several `start_approval_async` implementations call this when beginning approval for a tool. It sits between the specific tool runtime and the user or guardian approval process, adding shared caching and metrics around whatever approval prompt the tool provides.
 
 *Call graph*: called by 3 (start_approval_async, start_approval_async, start_approval_async); 1 external calls (matches!).
 
@@ -1053,11 +1063,11 @@ async fn with_cached_approval(
 fn bash(command: String, description: Option<String>) -> Self
 ```
 
-**Purpose**: Constructs the standard hook payload for bash-like command approval checks. It always includes the command string and includes a description only when one is provided.
+**Purpose**: Builds the standard permission-request payload for a bash command. This gives policy hooks and approval systems a consistent shape for command approval data.
 
-**Data flow**: Takes a command `String` and optional description `String`. It builds a `serde_json::Map` with `command`, conditionally inserts `description`, wraps it as `serde_json::Value::Object`, and returns `PermissionRequestPayload { tool_name: HookToolName::bash(), tool_input }`.
+**Data flow**: It receives a command string and an optional human-readable description. It creates a JSON object containing the command and, when present, the description. It returns a `PermissionRequestPayload` marked as a bash tool request.
 
-**Call relations**: Used by shell and unified-exec runtimes for approval-time hooks, and by the Unix execve prompt path when running permission-request hooks before prompting.
+**Call relations**: Approval-related code such as inline policy handling, prompts, and tool-specific permission payload builders call this when they need to describe a shell command to policy or review code.
 
 *Call graph*: calls 1 internal fn (bash); called by 4 (handle_inline_policy_request, permission_request_payload, prompt, permission_request_payload); 3 external calls (new, Object, String).
 
@@ -1068,11 +1078,11 @@ fn bash(command: String, description: Option<String>) -> Self
 fn proposed_execpolicy_amendment(&self) -> Option<&ExecPolicyAmendment>
 ```
 
-**Purpose**: Extracts the optional proposed exec-policy amendment from either `NeedsApproval` or `Skip` variants. This lets approval UIs surface or apply future-approval shortcuts without caring which variant carried the amendment.
+**Purpose**: Extracts the suggested future policy change, if this approval decision includes one. This is used when the system wants to ask not only “may I run this now?” but also “should similar commands be allowed later?”
 
-**Data flow**: Matches on `self`; returns `Some(&ExecPolicyAmendment)` when the variant is `NeedsApproval` or `Skip` with a populated amendment, otherwise returns `None`.
+**Data flow**: It reads the current approval requirement. If the requirement is either “needs approval” or “skip approval” and carries a proposed exec policy amendment, it returns a reference to that amendment. Otherwise it returns nothing.
 
-**Call relations**: Shell and unified-exec approval flows call this when passing approval metadata into `session.request_command_approval`.
+**Call relations**: This method is a small helper for code that has already decided the approval requirement and now wants to inspect whether that decision came with a reusable policy suggestion.
 
 
 ##### `default_exec_approval_requirement`  (lines 202–238)
@@ -1084,11 +1094,11 @@ fn default_exec_approval_requirement(
 ) -> ExecApprovalRequirement
 ```
 
-**Purpose**: Derives the default exec approval requirement from the current `AskForApproval` policy and filesystem sandbox kind. It also converts granular policies that forbid sandbox approval into an immediate `Forbidden` result.
+**Purpose**: Turns the configured approval policy into a concrete decision for one command: skip approval, ask for approval, or forbid the command. It is the default rulebook used when a tool has no special approval logic of its own.
 
-**Data flow**: Consumes an `AskForApproval` and a `FileSystemSandboxPolicy`. It computes `needs_approval` based on policy and whether the filesystem sandbox kind is `Restricted`. If approval is needed and granular policy disables sandbox approval, it returns `ExecApprovalRequirement::Forbidden` with a fixed reason. If approval is needed otherwise, it returns `NeedsApproval { reason: None, proposed_execpolicy_amendment: None }`. If approval is not needed, it returns `Skip { bypass_sandbox: false, proposed_execpolicy_amendment: None }`.
+**Data flow**: It receives the user’s approval policy and the current filesystem sandbox policy. It checks whether the policy normally requires asking and whether the filesystem is restricted. If granular approval is configured but sandbox approval prompts are disabled, it returns a forbidden result. If approval is needed, it returns “needs approval.” Otherwise it returns “skip approval” while still keeping the sandbox by default.
 
-**Call relations**: Used by higher-level orchestration when a runtime does not provide a custom exec approval requirement.
+**Call relations**: Tool approval orchestration can fall back to this when `Approvable::exec_approval_requirement` does not provide a custom answer. It converts broad configuration into the specific instruction the tool runner needs.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1103,11 +1113,11 @@ fn sandbox_override_for_first_attempt(
 )
 ```
 
-**Purpose**: Determines whether the first execution attempt should bypass the sandbox entirely. It respects explicit escalation and trusted exec-policy bypasses, but refuses to bypass when deny-read restrictions would be lost.
+**Purpose**: Decides whether the first attempt to run a command should bypass the sandbox. It balances convenience for trusted or escalated commands with the need to keep read-denial protections in force.
 
-**Data flow**: Consumes requested `SandboxPermissions`, an `ExecApprovalRequirement`, and the active `FileSystemSandboxPolicy`. It first returns `NoOverride` if `unsandboxed_execution_allowed` is false. Otherwise, if the approval requirement is `Skip { bypass_sandbox: true, .. }`, it returns `BypassSandboxFirstAttempt`. Failing that, it returns `BypassSandboxFirstAttempt` when `sandbox_permissions.requires_escalated_permissions()` is true, else `NoOverride`.
+**Data flow**: It receives requested sandbox permissions, the approval requirement, and the filesystem sandbox policy. First it checks whether unsandboxed execution is safe under the current filesystem rules. If not, it refuses to bypass the sandbox. If the approval requirement explicitly says to skip approval and bypass the sandbox, it allows bypassing. Otherwise, it bypasses only when the requested permissions require escalation.
 
-**Call relations**: Called by the main tool orchestration run path when selecting the first sandbox attempt.
+**Call relations**: The main tool running flow calls this when preparing the first run attempt. It relies on `unsandboxed_execution_allowed` and the sandbox permission flags to choose between a normal sandboxed attempt and an intentionally unsandboxed one.
 
 *Call graph*: calls 2 internal fn (unsandboxed_execution_allowed, requires_escalated_permissions); called by 1 (run); 1 external calls (matches!).
 
@@ -1120,11 +1130,11 @@ fn unsandboxed_execution_allowed(
 ) -> bool
 ```
 
-**Purpose**: Reports whether the active filesystem policy can be represented safely by running without a filesystem sandbox. Denied-read restrictions make the answer false because they only exist inside the sandbox.
+**Purpose**: Checks whether it is safe to run without the filesystem sandbox. It protects denied-read rules, because those rules only work while the sandbox is active.
 
-**Data flow**: Reads `file_system_sandbox_policy.has_denied_read_restrictions()` and returns its negation.
+**Data flow**: It receives the filesystem sandbox policy. It asks whether that policy contains denied-read restrictions. If there are denied reads, it returns false; otherwise it returns true.
 
-**Call relations**: This helper underpins first-attempt sandbox override logic, denied-read-preserving permission normalization, and Unix zsh-fork escalation decisions.
+**Call relations**: This helper is used by command-running, action selection, escalation handling, and sandbox permission adjustment code. Those callers use it before allowing sandbox bypass so they do not accidentally grant access to files that were supposed to stay unreadable.
 
 *Call graph*: calls 1 internal fn (has_denied_read_restrictions); called by 5 (run, determine_action, shell_request_escalation_execution, sandbox_override_for_first_attempt, sandbox_permissions_preserving_denied_reads).
 
@@ -1138,11 +1148,11 @@ fn sandbox_permissions_preserving_denied_reads(
 ) -> SandboxPermissions
 ```
 
-**Purpose**: Normalizes sandbox permissions so explicit escalation does not silently discard deny-read filesystem restrictions. It only rewrites permission modes that would otherwise bypass the sandbox.
+**Purpose**: Adjusts sandbox permissions so denied-read protections are not lost. If escalation would normally mean “run outside the sandbox,” this function can turn that back into a normal sandboxed run when denied reads are active.
 
-**Data flow**: Consumes `SandboxPermissions` and a `FileSystemSandboxPolicy`. If the permission mode requires escalated permissions and `unsandboxed_execution_allowed` is false, it returns `SandboxPermissions::UseDefault`; otherwise it returns the original permission mode.
+**Data flow**: It receives requested sandbox permissions and the filesystem sandbox policy. If the request requires escalation and unsandboxed execution is not allowed, it changes the permission choice to the default sandboxed mode. Otherwise it leaves the requested permissions unchanged.
 
-**Call relations**: Used by shell and unified-exec runtimes, plus the Unix zsh-fork backend, before network approval and execution preparation.
+**Call relations**: Network approval setup and tool-running paths call this before deciding the final execution environment. It works with `unsandboxed_execution_allowed` to keep sensitive read restrictions alive even during escalated requests.
 
 *Call graph*: calls 2 internal fn (unsandboxed_execution_allowed, requires_escalated_permissions); called by 5 (network_approval_spec, run, try_run_zsh_fork, network_approval_spec, run).
 
@@ -1156,11 +1166,11 @@ fn managed_network_for_sandbox_permissions(
 ) -> Option<&NetworkProxy>
 ```
 
-**Purpose**: Determines whether managed-network proxying should remain active for a given sandbox permission mode. Explicitly escalated execution disables managed networking.
+**Purpose**: Decides whether the managed network proxy should be used for a run. If a command is escalated to run outside the normal sandbox, the managed network proxy is removed.
 
-**Data flow**: Takes an optional `&NetworkProxy` and `SandboxPermissions`. Returns `None` when `sandbox_permissions.requires_escalated_permissions()` is true; otherwise returns the original network proxy reference.
+**Data flow**: It receives an optional network proxy and the sandbox permissions for the request. If the permissions require escalation, it returns no proxy. Otherwise it passes through the original proxy unchanged.
 
-**Call relations**: Called by shell, unified-exec, and zsh-fork execution paths when computing network approval and execution environment.
+**Call relations**: Tool-running and network approval code call this while preparing execution. It connects the sandbox choice to network control, so sandboxed runs can use managed networking while escalated runs do not pretend to be under that same managed network enforcement.
 
 *Call graph*: calls 1 internal fn (requires_escalated_permissions); called by 6 (explicit_escalation_prepares_exec_without_managed_network, network_approval_spec, run, try_run_zsh_fork, network_approval_spec, run).
 
@@ -1171,11 +1181,11 @@ fn managed_network_for_sandbox_permissions(
 fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions
 ```
 
-**Purpose**: Provides the default per-request sandbox permission mode for runtimes that do not override it. The default is to use the ambient sandbox policy unchanged.
+**Purpose**: Provides the per-request sandbox permission preference for a tool. The default says to use the normal ambient sandbox policy.
 
-**Data flow**: Ignores the request and returns `SandboxPermissions::UseDefault`.
+**Data flow**: It receives the tool request but, by default, does not inspect it. It returns `UseDefault`, meaning the current session’s normal sandbox permissions should apply.
 
-**Call relations**: Concrete runtimes like shell and unified exec override this when they need request-specific sandbox behavior.
+**Call relations**: Tool runtimes that implement `Approvable` inherit this behavior unless they override it. The broader tool execution flow asks for these permissions before choosing how the command should be sandboxed.
 
 
 ##### `Approvable::should_bypass_approval`  (lines 334–340)
@@ -1184,11 +1194,11 @@ fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions
 fn should_bypass_approval(&self, policy: AskForApproval, already_approved: bool) -> bool
 ```
 
-**Purpose**: Implements the default rule for skipping approval prompts: skip if the request is already approved, or if policy is `AskForApproval::Never`. This keeps repeated approvals and never-prompt policies centralized.
+**Purpose**: Answers whether the approval prompt can be skipped. By default, it skips approval if the request was already approved or if the global policy says never ask.
 
-**Data flow**: Consumes `AskForApproval` and an `already_approved` boolean. Returns true immediately when `already_approved` is true; otherwise returns whether the policy matches `Never`.
+**Data flow**: It receives the configured approval policy and a flag saying whether this request has already been approved. If already approved, it returns true. Otherwise it returns true only for the “never ask” policy and false for other policies.
 
-**Call relations**: Used by higher-level approval orchestration for runtimes implementing `Approvable`.
+**Call relations**: Tool runtimes use this default decision unless they need custom behavior. It is part of the approval path that decides whether to show a prompt or move straight to execution.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1199,11 +1209,11 @@ fn should_bypass_approval(&self, policy: AskForApproval, already_approved: bool)
 fn exec_approval_requirement(&self, _req: &Req) -> Option<ExecApprovalRequirement>
 ```
 
-**Purpose**: Default hook for runtimes that do not provide a custom exec approval requirement. Returning `None` tells orchestration to derive the requirement from policy.
+**Purpose**: Lets a tool provide a custom approval requirement for a specific request. The default provides no custom answer, meaning the shared policy-based rules should be used instead.
 
-**Data flow**: Ignores the request and returns `None`.
+**Data flow**: It receives the tool request but, by default, does not inspect it. It returns nothing, which signals the caller to fall back to the normal approval requirement calculation.
 
-**Call relations**: Shell and unified-exec override this to forward request-specific approval requirements.
+**Call relations**: The approval orchestration asks this before using default policy logic. Tool runtimes can override it when they have special knowledge about whether a command should be allowed, denied, or approved.
 
 
 ##### `Approvable::permission_request_payload`  (lines 350–352)
@@ -1212,11 +1222,11 @@ fn exec_approval_requirement(&self, _req: &Req) -> Option<ExecApprovalRequiremen
 fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayload>
 ```
 
-**Purpose**: Default hook for runtimes that do not participate in approval-time permission-request hooks. Returning `None` means no hook payload is available.
+**Purpose**: Lets a tool describe its request in a standard form for approval-time policy hooks. The default says there is no extra payload.
 
-**Data flow**: Ignores the request and returns `None`.
+**Data flow**: It receives the tool request but, by default, ignores it. It returns nothing, meaning no hook-specific permission payload is supplied.
 
-**Call relations**: Shell and unified-exec override this to provide bash-style hook payloads.
+**Call relations**: Approval flows can ask a runtime for this payload before guardian or user approval. Tools that need policy hooks to inspect command details override this, often using helpers such as `PermissionRequestPayload::bash`.
 
 
 ##### `Approvable::wants_no_sandbox_approval`  (lines 355–363)
@@ -1225,11 +1235,11 @@ fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayl
 fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool
 ```
 
-**Purpose**: Determines whether a runtime should request approval for no-sandbox execution under the current approval policy. It encodes the policy-specific meaning of sandbox escalation prompts.
+**Purpose**: Decides whether the tool should ask for approval to run without the sandbox. This is used for cases where the normal sandbox might block the command and the system may need permission to retry with fewer restrictions.
 
-**Data flow**: Matches on `AskForApproval`: returns true for `OnFailure` and `UnlessTrusted`, false for `Never` and `OnRequest`, and for `Granular` returns the `sandbox_approval` flag.
+**Data flow**: It receives the configured approval policy. It returns true for policies that allow asking after failure or when trust is required, false for policies that never ask or only ask on request, and follows the granular policy’s sandbox-approval setting when granular controls are active.
 
-**Call relations**: Used by orchestration when deciding whether to ask for approval before retrying outside the sandbox.
+**Call relations**: Tool approval and retry logic use this default unless a runtime overrides it. It helps determine whether a failed sandboxed command can lead to a no-sandbox approval prompt.
 
 
 ##### `Sandboxable::escalate_on_failure`  (lines 374–376)
@@ -1238,11 +1248,11 @@ fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool
 fn escalate_on_failure(&self) -> bool
 ```
 
-**Purpose**: Provides the default runtime behavior of allowing escalation after sandbox failure. Runtimes can override this to disable fallback escalation.
+**Purpose**: States whether a sandboxed tool is allowed to try a more permissive path after failure. The default says yes.
 
-**Data flow**: Returns `true` with no inputs beyond `self`.
+**Data flow**: It takes no request-specific input. It returns true, meaning the runtime may consider escalation after a sandbox-related failure.
 
-**Call relations**: Queried by orchestration for any runtime implementing `Sandboxable`.
+**Call relations**: Tool runtimes that implement `Sandboxable` inherit this unless they override it. The execution flow can consult it when deciding whether a failed sandbox attempt should lead to an approval or retry path.
 
 
 ##### `ToolRuntime::network_approval_spec`  (lines 393–395)
@@ -1251,11 +1261,11 @@ fn escalate_on_failure(&self) -> bool
 fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec>
 ```
 
-**Purpose**: Default implementation for runtimes that do not require managed-network approval metadata. It indicates no network approval is needed.
+**Purpose**: Lets a tool describe what network access it wants approved. The default says the tool does not need a special network approval request.
 
-**Data flow**: Ignores request and context and returns `None`.
+**Data flow**: It receives the tool request and the tool context, but by default does not inspect them. It returns nothing, meaning no network approval specification is provided.
 
-**Call relations**: Shell and unified-exec override this to provide concrete network approval triggers.
+**Call relations**: The tool-running orchestration can ask this before execution when network access may matter. Specific runtimes override it when they need to request or explain network use.
 
 
 ##### `ToolRuntime::sandbox_cwd`  (lines 397–399)
@@ -1264,11 +1274,11 @@ fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApp
 fn sandbox_cwd(&self, _req: &'a Req) -> Option<&'a AbsolutePathBuf>
 ```
 
-**Purpose**: Default implementation for runtimes that do not need a distinct sandbox cwd. It leaves sandbox cwd selection to the orchestrator’s defaults.
+**Purpose**: Lets a tool provide a custom working directory for sandbox policy decisions. The default says there is no special sandbox working directory.
 
-**Data flow**: Ignores the request and returns `None`.
+**Data flow**: It receives the tool request and, by default, ignores it. It returns nothing, so the caller uses the normal sandbox working directory.
 
-**Call relations**: Unified exec overrides this to supply its trusted sandbox cwd.
+**Call relations**: Execution setup can call this while preparing a sandbox attempt. Tools that need path rules interpreted from a particular directory can override it.
 
 
 ##### `SandboxAttempt::env_for`  (lines 424–452)
@@ -1282,24 +1292,26 @@ fn env_for(
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr>
 ```
 
-**Purpose**: Transforms a high-level `SandboxCommand` plus execution options into a concrete `ExecRequest` for the current sandbox attempt. It is the shared bridge from runtime-level command preparation into sandbox-manager execution requests.
+**Purpose**: Builds the final executable request for a command under a specific sandbox attempt. It translates high-level sandbox settings into the concrete environment the command runner needs.
 
-**Data flow**: Consumes a `SandboxCommand`, `ExecOptions`, and optional network proxy reference. It calls `self.manager.transform` with `SandboxTransformRequest` built from the attempt’s permission profile, sandbox type, managed-network enforcement flag, sandbox cwd, optional Linux sandbox executable, landlock flag, and Windows sandbox settings. It maps transform errors into `CodexErr`, then converts the sandbox manager’s request into `crate::sandboxing::ExecRequest::from_sandbox_exec_request`, cloning workspace roots into the request. Returns the resulting `ExecRequest`.
+**Data flow**: It receives a sandbox command, execution options, and an optional network proxy. It sends the command plus permissions, sandbox type, working directory, platform-specific sandbox settings, and network enforcement choice to the sandbox manager for transformation. If that succeeds, it wraps the transformed request with execution options and workspace roots and returns it. If transformation fails, it returns a Codex error.
 
-**Call relations**: Called by shell runtime, unified-exec runtime, and Unix zsh-fork preparation/execution paths whenever they need a concrete executable request for the current attempt.
+**Call relations**: Tool runtimes call this during their `run` paths, including command and zsh-fork execution flows. It hands the sandbox manager all the details needed to prepare the command, then gives the resulting execution request back to the runner.
 
 *Call graph*: calls 2 internal fn (from_sandbox_exec_request, transform); called by 3 (run, try_run_zsh_fork, run); 1 external calls (to_vec).
 
 
 ### `core/src/exec_policy.rs`
 
-`domain_logic` · `command approval and policy load/update`
+`domain_logic` · `config load, request handling, and policy updates`
 
-This file is the heart of command approval logic. It defines `ExecPolicyManager`, which stores the current `codex_execpolicy::Policy` in an `ArcSwap<Policy>` for lock-free reads and uses a single-permit `Semaphore` to serialize on-disk rule amendments. Policy loading walks trusted config layers in precedence order, collects `*.rules` files from each layer’s `rules/` directory, parses them with `PolicyParser`, and overlays any requirements policy from configuration. Parse failures are intentionally downgraded to warnings by `load_exec_policy_with_warning`, yielding an empty policy so the system can continue running.
+This file is the command gatekeeper. Before Codex runs a command, it needs to know whether the command is explicitly allowed, needs approval, or is forbidden. Without this file, commands would either run too freely or be blocked without a consistent reason.
 
-For command evaluation, `create_exec_approval_requirement_for_command` first lowers wrapper commands such as `bash -lc ...` and, on Windows, PowerShell `-Command` invocations into inner plain commands via `commands_for_exec_policy`. It then evaluates all segments against explicit policy rules, using `render_decision_for_unmatched_command` as the fallback for unmatched commands. That fallback blends command safelists/danger heuristics, `AskForApproval`, filesystem sandbox shape, Windows sandbox backend availability, and requested sandbox escalation into a concrete `Decision`.
+The file works like a security desk. First it loads rule files ending in `.rules` from configured `rules` folders. Lower-priority configuration layers are read first, so higher-priority layers can override them. If a rule file has a parsing problem, the system can keep going with an empty policy but report a warning.
 
-The file also derives human-facing reasons for prompt/forbidden outcomes, computes whether sandbox bypass is justified only when every parsed segment is explicitly allowed by policy, and proposes `ExecPolicyAmendment`s when heuristics—not existing rules—caused a prompt or allow. Suggested amendments are carefully suppressed for heredoc fallback parsing, banned broad prefixes like `python -c` or shell wrappers, and cases where an added prefix rule would not approve every parsed command segment. Finally, append methods update both the default rules file on disk and the in-memory policy atomically enough to keep future checks consistent.
+At run time, `ExecPolicyManager` holds the current policy in a safely replaceable shared pointer. When a command arrives, it may split wrapper commands such as `bash -lc "..."` into the real inner commands. It then checks all parsed commands against policy rules. If no rule matches, it falls back to safety heuristics: known safe commands may run, dangerous commands usually prompt or fail, and sandbox settings influence whether approval is needed.
+
+The file can also append new allow rules or network rules to the default policy file and immediately refresh the in-memory policy. A semaphore, which is a one-at-a-time lock, prevents two updates from writing at once.
 
 #### Function details
 
@@ -1309,11 +1321,11 @@ The file also derives human-facing reasons for prompt/forbidden outcomes, comput
 fn child_uses_parent_exec_policy(parent_config: &Config, child_config: &Config) -> bool
 ```
 
-**Purpose**: Determines whether a child configuration can safely reuse the parent’s already-loaded exec policy instead of reloading rules. It compares only exec-policy-relevant configuration state, ignoring unrelated layers.
+**Purpose**: Checks whether a child configuration should reuse the parent configuration's executable policy. This matters when spawning related sessions, because policy inheritance is only safe if both configurations point at the same policy sources and requirements.
 
-**Data flow**: Reads `parent_config` and `child_config`, extracts each config’s enabled layer config folders in lowest-precedence-first order, compares those folder lists, compares the `ignore_user_and_project_exec_policy_rules` flag, and compares `requirements().exec_policy`. Returns `true` only if all three match.
+**Data flow**: It receives a parent `Config` and a child `Config`. It extracts the active configuration folders from each, compares whether user and project policy rules are ignored in the same way, and compares any required policy overlay. It returns `true` only when all those policy-related pieces match.
 
-**Call relations**: This helper is used when deciding inheritance of exec-policy state for spawned/internal child contexts. It does not load policy itself; it isolates the exact config dimensions that affect rule resolution.
+**Call relations**: When `inherited_exec_policy_for_source` is deciding whether a child can inherit policy from its parent, it calls this function as the compatibility check.
 
 *Call graph*: called by 1 (inherited_exec_policy_for_source).
 
@@ -1324,11 +1336,11 @@ fn child_uses_parent_exec_policy(parent_config: &Config, child_config: &Config) 
 fn is_policy_match(rule_match: &RuleMatch) -> bool
 ```
 
-**Purpose**: Classifies a `RuleMatch` as coming from an explicit policy rule rather than heuristic fallback. Prefix-rule matches count as policy; heuristic matches do not.
+**Purpose**: Tells whether a rule match came from an explicit policy rule rather than from a fallback safety guess. This distinction is important because explicit user or project rules should be treated differently from automatic heuristics.
 
-**Data flow**: Reads a `RuleMatch` enum and pattern-matches it, returning `true` for `PrefixRuleMatch` and `false` for `HeuristicsRuleMatch`.
+**Data flow**: It receives a `RuleMatch`. If the match is a prefix rule from policy, it returns `true`; if it is a heuristic match, it returns `false`.
 
-**Call relations**: This predicate is used throughout amendment derivation, prompt handling, and sandbox-bypass checks to distinguish user-authored policy from heuristic decisions.
+**Call relations**: This is a small local helper used when later decisions need to know whether a policy rule, not a built-in safety fallback, caused a prompt, allow, or forbid result.
 
 
 ##### `prompt_is_rejected_by_policy`  (lines 174–197)
@@ -1340,11 +1352,11 @@ fn prompt_is_rejected_by_policy(
 ) -> Option<&'static str>
 ```
 
-**Purpose**: Translates `AskForApproval` settings into an optional hard rejection reason when a prompt would otherwise be shown. It distinguishes rule-driven prompts from sandbox/escalation prompts so granular settings can reject them independently.
+**Purpose**: Decides whether the current approval settings forbid showing an approval prompt to the user. For example, if approval is set to never ask, a command that would need approval must be rejected instead.
 
-**Data flow**: Reads `approval_policy` and `prompt_is_rule`; matches on `AskForApproval`; returns `Some(&'static str)` with one of the predefined rejection reasons when prompting is disallowed, otherwise `None`.
+**Data flow**: It receives the approval policy and a flag saying whether the prompt came from a rule. It checks broad modes like `Never` and detailed granular settings for rule approval or sandbox approval. It returns no reason when prompting is allowed, or a fixed human-readable rejection reason when prompting is not allowed.
 
-**Call relations**: It is called during approval-requirement construction after policy evaluation has already decided `Prompt`. The caller uses its result to convert a would-be approval request into `ExecApprovalRequirement::Forbidden`.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this after policy evaluation says a command should prompt, so the final result can become either `NeedsApproval` or `Forbidden` depending on user settings.
 
 *Call graph*: called by 1 (create_exec_approval_requirement_for_command).
 
@@ -1355,11 +1367,11 @@ fn prompt_is_rejected_by_policy(
 fn new(policy: Arc<Policy>) -> Self
 ```
 
-**Purpose**: Constructs a manager around an already-built policy with serialized update capability. It is the basic in-memory policy holder used by tests and production loaders.
+**Purpose**: Creates an `ExecPolicyManager` around an already-built policy. It sets up both the current shared policy and the one-at-a-time update lock.
 
-**Data flow**: Consumes an `Arc<Policy>`, stores it in `ArcSwap`, creates a `Semaphore` with one permit, and returns a new `ExecPolicyManager`.
+**Data flow**: It receives a shared `Policy`. It stores that policy in an atomic swap container, which lets readers see the current policy while updates replace it safely, and creates a semaphore with one permit. It returns a ready-to-use manager.
 
-**Call relations**: Called by the async loader, the `Default` implementation, and tests that want to inject a handcrafted policy. It does not parse or evaluate rules itself; it prepares shared state for later reads and updates.
+**Call relations**: This is used by loading code, defaults, runtime setup, and tests whenever a manager is needed around a known policy.
 
 *Call graph*: called by 4 (exec_approval_requirement_for_command, mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision, mixed_rule_and_sandbox_prompt_rejects_when_granular_rules_are_disabled, verify_approval_requirement_for_unsafe_powershell_command); 2 external calls (from, new).
 
@@ -1370,11 +1382,11 @@ fn new(policy: Arc<Policy>) -> Self
 async fn load(config_stack: &ConfigLayerStack) -> Result<Self, ExecPolicyError>
 ```
 
-**Purpose**: Loads exec-policy rules from the configuration stack and returns a ready-to-use manager. Parse errors are logged as warnings and replaced with an empty policy rather than aborting startup.
+**Purpose**: Loads executable policy rules from the configuration stack and returns a manager for them. If rule parsing fails, it logs a warning and uses an empty policy rather than stopping the whole system.
 
-**Data flow**: Reads `config_stack`, awaits `load_exec_policy_with_warning`, logs a warning if the returned warning is `Some`, wraps the resulting `Policy` in `Arc`, and returns `ExecPolicyManager::new(...)`.
+**Data flow**: It receives a `ConfigLayerStack`. It asks `load_exec_policy_with_warning` for a policy plus any non-fatal warning, logs the warning if present, wraps the policy in an `Arc`, and returns a new `ExecPolicyManager`.
 
-**Call relations**: This is the production entry point for policy initialization during startup/config refresh. It delegates file discovery and parsing to `load_exec_policy_with_warning` and only handles warning/reporting plus manager construction.
+**Call relations**: Startup and spawning paths call this when they need the policy manager for a session. It delegates the actual file reading and parsing to `load_exec_policy_with_warning`, then uses `ExecPolicyManager::new` to package the result.
 
 *Call graph*: calls 1 internal fn (load_exec_policy_with_warning); called by 3 (returns_empty_policy_when_no_policy_files_exist, spawn_internal, guardian_subagent_does_not_inherit_parent_exec_policy_rules); 3 external calls (new, new, warn!).
 
@@ -1385,11 +1397,11 @@ async fn load(config_stack: &ConfigLayerStack) -> Result<Self, ExecPolicyError>
 fn current(&self) -> Arc<Policy>
 ```
 
-**Purpose**: Returns the current policy snapshot for lock-free readers. It exposes the `Arc<Policy>` currently stored in the manager.
+**Purpose**: Returns the policy that is currently active. Callers use it when they need a stable snapshot for checking or updating rules.
 
-**Data flow**: Reads the internal `ArcSwap<Policy>` and returns `load_full()`.
+**Data flow**: It reads the manager's atomically stored policy pointer and returns a cloned shared pointer to the current `Policy`. The policy itself is not changed.
 
-**Call relations**: Used by evaluation and update methods whenever they need a stable policy snapshot. Because it returns an `Arc`, callers can evaluate without holding locks while updates replace the stored policy atomically.
+**Call relations**: Command checking and both update methods call this before evaluating or cloning the current policy.
 
 *Call graph*: called by 3 (append_amendment_and_update, append_network_rule_and_update, create_exec_approval_requirement_for_command); 1 external calls (load_full).
 
@@ -1403,11 +1415,11 @@ async fn create_exec_approval_requirement_for_command(
     ) -> ExecApprovalRequirement
 ```
 
-**Purpose**: Evaluates a command against explicit exec-policy rules plus heuristic fallback and converts the result into an `ExecApprovalRequirement`. It also computes prompt/forbidden reasons, sandbox-bypass eligibility, and proposed policy amendments.
+**Purpose**: Turns a command into the final answer Codex needs: run it, ask for approval, or block it. It combines explicit policy rules, command parsing, safety heuristics, sandbox state, and approval settings.
 
-**Data flow**: Consumes an `ExecApprovalRequest`, reads the current policy, lowers the command into one or more parsed command segments via `commands_for_exec_policy`, builds an unmatched-command fallback closure using `render_decision_for_unmatched_command`, and evaluates all segments with `check_multiple_with_options`. It may derive a requested amendment from `prefix_rule`, or heuristic amendments for prompt/allow outcomes. It returns `Forbidden { reason }`, `NeedsApproval { reason, proposed_execpolicy_amendment }`, or `Skip { bypass_sandbox, proposed_execpolicy_amendment }` based on `evaluation.decision` and approval-policy rejection checks.
+**Data flow**: It receives an approval request containing the command, approval mode, permission profile, sandbox details, and any requested prefix rule. It gets the current policy, rewrites shell wrapper commands into the inner commands when possible, checks them against policy with a fallback decision function, and then builds an `ExecApprovalRequirement`. The result may include a reason and a proposed policy amendment for future runs.
 
-**Call relations**: This is the central call path used whenever core needs to decide whether a command can run, needs approval, or must be blocked. It delegates parsing, fallback heuristics, reason rendering, prompt rejection, and amendment derivation to several helpers so each concern stays isolated.
+**Call relations**: This is the main request-time policy decision point. It calls `current`, `commands_for_exec_policy`, `render_decision_for_unmatched_command` through a fallback closure, amendment-derivation helpers, `prompt_is_rejected_by_policy`, and reason-formatting helpers before returning the decision to the command execution path.
 
 *Call graph*: calls 7 internal fn (current, commands_for_exec_policy, derive_forbidden_reason, derive_prompt_reason, derive_requested_execpolicy_amendment_from_prefix_rule, prompt_is_rejected_by_policy, try_derive_execpolicy_amendment_for_allow_rules).
 
@@ -1422,11 +1434,11 @@ async fn append_amendment_and_update(
     ) -> Result<(), ExecPolicyUpdateError>
 ```
 
-**Purpose**: Appends an allow-prefix amendment to the default rules file and updates the in-memory policy to match. It serializes concurrent updates and avoids duplicating an already-effective allow rule in memory.
+**Purpose**: Adds a new allow-prefix rule to the default policy file and updates the in-memory policy so the change takes effect immediately. This is used after a user approves a suggested executable policy amendment.
 
-**Data flow**: Reads `codex_home` and `amendment`, acquires the single-permit `update_lock`, computes `default_policy_path`, runs `blocking_append_allow_prefix_rule` in `spawn_blocking`, then reloads the current policy snapshot and checks whether the amendment command is already explicitly allowed. If not already allowed, it clones the policy, adds the prefix allow rule in memory, stores the new `Arc<Policy>`, and returns `Ok(())`; otherwise it returns early after the file update.
+**Data flow**: It receives the Codex home directory and an `ExecPolicyAmendment`. It takes the update lock, computes the default rules file path, appends the allow rule on a blocking worker thread, checks whether the current policy already allows it, and if not, clones the current policy, adds the rule, and swaps the updated policy into place. It returns success or a detailed update error.
 
-**Call relations**: This method is called after a user accepts a proposed exec-policy amendment. It coordinates disk persistence and in-memory state replacement so future evaluations immediately see the new rule.
+**Call relations**: Policy amendment flows call this after approval. It uses `default_policy_path` for the file location and `current` to compare and refresh the in-memory policy.
 
 *Call graph*: calls 2 internal fn (current, default_policy_path); 4 external calls (new, store, acquire, spawn_blocking).
 
@@ -1443,11 +1455,11 @@ async fn append_network_rule_and_update(
         justification: Option<
 ```
 
-**Purpose**: Appends a network rule to the default rules file and mirrors that change into the in-memory policy. It is the network analogue of command-prefix amendment updates.
+**Purpose**: Adds a network policy rule to disk and updates the active in-memory policy. This lets newly approved or denied network access be remembered and applied right away.
 
-**Data flow**: Reads `codex_home`, `host`, `protocol`, `decision`, and optional `justification`; acquires `update_lock`; computes the default policy path; clones string inputs for a blocking closure; runs `blocking_append_network_rule` in `spawn_blocking`; clones the current policy, adds the network rule in memory, stores the updated `Arc<Policy>`, and returns success or a structured update error.
+**Data flow**: It receives the Codex home directory, host, protocol, decision, and optional justification. It takes the update lock, appends the rule to the default policy file on a blocking worker thread, clones the current policy, adds the same network rule in memory, and swaps that updated policy into active use. It returns success or an update error.
 
-**Call relations**: Used when the system persists a user-approved network access decision. Like command amendments, it serializes updates and keeps file-backed and in-memory policy state aligned.
+**Call relations**: Network approval flows use this when a host/protocol decision should be saved. It follows the same lock, file-append, and in-memory-refresh pattern as `append_amendment_and_update`.
 
 *Call graph*: calls 2 internal fn (current, default_policy_path); 4 external calls (new, store, acquire, spawn_blocking).
 
@@ -1458,11 +1470,11 @@ async fn append_network_rule_and_update(
 fn default() -> Self
 ```
 
-**Purpose**: Creates a manager with an empty policy for tests and fallback scenarios. It provides a no-rules baseline where all decisions come from heuristics.
+**Purpose**: Creates a manager with no executable policy rules. This is a safe baseline for tests or cases where policy has not been loaded yet.
 
-**Data flow**: Constructs `Policy::empty()`, wraps it in `Arc`, passes it to `ExecPolicyManager::new`, and returns the manager.
+**Data flow**: It builds an empty `Policy`, wraps it in a shared pointer, and passes it to `ExecPolicyManager::new`. The returned manager will rely on fallback heuristics unless rules are later added.
 
-**Call relations**: Widely used by tests that want to exercise heuristic behavior without any explicit rules. It is also a convenient fallback constructor when no policy files exist.
+**Call relations**: Many tests and some internal setup paths use this when they need a working manager without reading policy files.
 
 *Call graph*: called by 13 (append_execpolicy_amendment_rejects_empty_prefix, append_execpolicy_amendment_updates_policy_and_file, empty_bash_lc_script_falls_back_to_original_command, exec_approval_requirement_falls_back_to_heuristics, request_rule_falls_back_when_prefix_rule_does_not_approve_all_commands, request_rule_uses_prefix_rule, whitespace_bash_lc_script_falls_back_to_original_command, spawn_internal, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx (+3 more)); 3 external calls (new, new, empty).
 
@@ -1475,11 +1487,11 @@ async fn check_execpolicy_for_warnings(
 ) -> Result<Option<ExecPolicyError>, ExecPolicyError>
 ```
 
-**Purpose**: Loads exec policy only far enough to surface parse warnings without constructing a manager. It lets callers report non-fatal policy issues separately from normal loading.
+**Purpose**: Loads policy only far enough to find non-fatal warnings, especially parse warnings. This lets the application report rule problems without necessarily failing startup.
 
-**Data flow**: Reads `config_stack`, awaits `load_exec_policy_with_warning`, discards the returned `Policy`, and returns just the optional warning.
+**Data flow**: It receives a configuration stack, calls `load_exec_policy_with_warning`, ignores the loaded policy, and returns the optional warning. Serious read errors still come back as errors.
 
-**Call relations**: Called by warning/reporting paths that need to know whether trusted rules contain parse errors. It delegates all actual loading logic to `load_exec_policy_with_warning`.
+**Call relations**: Warning-checking code calls this as a lightweight validation path. It shares the same loader as `ExecPolicyManager::load`, so warnings are discovered consistently.
 
 *Call graph*: calls 1 internal fn (load_exec_policy_with_warning).
 
@@ -1490,11 +1502,11 @@ async fn check_execpolicy_for_warnings(
 fn exec_policy_message_for_display(source: &codex_execpolicy::Error) -> String
 ```
 
-**Purpose**: Extracts a concise, user-facing error message from a verbose `codex_execpolicy::Error`. It prefers the most actionable line over raw parser output.
+**Purpose**: Turns a raw policy parser error into a shorter message suitable for showing to a person. Parser errors can contain extra technical wrapping, so this pulls out the useful part.
 
-**Data flow**: Converts `source` to a string, searches for a line beginning with `error: `, otherwise tries to strip a `: starlark error: ` prefix from the first line, otherwise falls back to the first trimmed line. Returns the chosen message string.
+**Data flow**: It receives a `codex_execpolicy::Error`, converts it to text, looks for a line starting with `error: ` or a Starlark error detail, and otherwise uses the first trimmed line. It returns the cleaned-up message string.
 
-**Call relations**: Used by `format_exec_policy_error_with_source` to produce cleaner diagnostics for UI or logs. It encapsulates parser-message normalization.
+**Call relations**: `format_exec_policy_error_with_source` calls this when building the final user-facing error message for a parse failure.
 
 *Call graph*: called by 1 (format_exec_policy_error_with_source); 1 external calls (to_string).
 
@@ -1505,11 +1517,11 @@ fn exec_policy_message_for_display(source: &codex_execpolicy::Error) -> String
 fn parse_starlark_line_from_message(message: &str) -> Option<(PathBuf, usize)>
 ```
 
-**Purpose**: Parses a `path:line:column: starlark error:` prefix out of a textual parser error message. It recovers source location when structured location data is absent or incomplete.
+**Purpose**: Tries to recover a file path and line number from a Starlark parser error message. Starlark is the rule language engine used underneath, and its raw messages sometimes hide the useful location in text.
 
-**Data flow**: Reads the first line of `message`, splits it around `: starlark error:`, parses the trailing column and line numbers with `rsplitn`, converts the remaining prefix into a `PathBuf`, rejects line `0`, and returns `Some((path, line))` or `None`.
+**Data flow**: It receives an error message string. It inspects the first line, splits out a path, line, and column if they match the expected format, rejects line zero, and returns the path and line number when successful.
 
-**Call relations**: This helper feeds `format_exec_policy_error_with_source`, which combines structured and parsed locations to render better diagnostics.
+**Call relations**: `format_exec_policy_error_with_source` uses this as a backup source of location information when structured error location data is missing or misleading.
 
 *Call graph*: called by 1 (format_exec_policy_error_with_source); 1 external calls (from).
 
@@ -1520,11 +1532,11 @@ fn parse_starlark_line_from_message(message: &str) -> Option<(PathBuf, usize)>
 fn format_exec_policy_error_with_source(error: &ExecPolicyError) -> String
 ```
 
-**Purpose**: Formats `ExecPolicyError` values into user-facing strings that include source file and approximate line information when available. Parse errors get special treatment; other errors use their default display text.
+**Purpose**: Formats an executable policy error into a clear message for humans, including source location when possible. This is especially helpful when a `.rules` file has a syntax or policy-language problem.
 
-**Data flow**: Reads an `ExecPolicyError`; for `ParsePolicy`, it renders the underlying source, extracts structured and parsed locations, chooses the best location, derives a concise message via `exec_policy_message_for_display`, and returns a formatted string with `path:line:` and an `on or around line` hint when possible. For non-parse errors it returns `error.to_string()`.
+**Data flow**: It receives an `ExecPolicyError`. For parse errors, it gathers structured location data from the parser, also tries to parse location from the raw message, chooses the best line number, cleans the message, and returns a formatted string. For other errors, it returns the normal error text.
 
-**Call relations**: Used by callers that need a polished diagnostic rather than the raw error enum. It delegates message cleanup and fallback line parsing to dedicated helpers.
+**Call relations**: User-facing error reporting calls this when policy loading fails or warns. It combines `exec_policy_message_for_display` and `parse_starlark_line_from_message` to make parser errors easier to act on.
 
 *Call graph*: calls 2 internal fn (exec_policy_message_for_display, parse_starlark_line_from_message); 2 external calls (to_string, format!).
 
@@ -1537,11 +1549,11 @@ async fn load_exec_policy_with_warning(
 ) -> Result<(Policy, Option<ExecPolicyError>), ExecPolicyError>
 ```
 
-**Purpose**: Loads exec policy while downgrading parse failures into warnings and an empty policy. This keeps malformed trusted rules from crashing the system while still surfacing the issue.
+**Purpose**: Loads executable policy while treating parse failures as warnings instead of fatal errors. This allows Codex to continue with an empty policy if the rules are malformed.
 
-**Data flow**: Awaits `load_exec_policy(config_stack)`; on success returns `(policy, None)`; on `ExecPolicyError::ParsePolicy` returns `(Policy::empty(), Some(err))`; on other errors returns `Err(err)`.
+**Data flow**: It receives a configuration stack and calls `load_exec_policy`. If loading succeeds, it returns the policy and no warning. If parsing fails, it returns an empty policy plus the parse error as a warning. If reading directories or files fails, it returns the error.
 
-**Call relations**: Called by both `ExecPolicyManager::load` and `check_execpolicy_for_warnings`. It is the boundary where parse errors become non-fatal warnings.
+**Call relations**: `ExecPolicyManager::load` and `check_execpolicy_for_warnings` call this so both startup and validation use the same warning behavior.
 
 *Call graph*: calls 1 internal fn (load_exec_policy); called by 2 (load, check_execpolicy_for_warnings); 1 external calls (empty).
 
@@ -1552,11 +1564,11 @@ async fn load_exec_policy_with_warning(
 async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy, ExecPolicyError>
 ```
 
-**Purpose**: Discovers, reads, parses, and merges all applicable exec-policy rule files from the configuration stack. It also overlays requirements-specified policy after file-based rules are loaded.
+**Purpose**: Reads all applicable `.rules` files from the active configuration layers and builds one executable policy from them. It also overlays any policy required directly by configuration.
 
-**Data flow**: Reads `config_stack`, iterates enabled layers in lowest-precedence-first order, skips user/project layers when `ignore_user_and_project_exec_policy_rules()` is set, collects `rules/*.rules` paths via `collect_policy_files`, reads each file asynchronously with `fs::read_to_string`, parses contents into a `PolicyParser`, builds the final `Policy`, and if `requirements().exec_policy` exists merges it as an overlay before returning.
+**Data flow**: It receives a `ConfigLayerStack`. It walks active layers from lowest to highest precedence, skips user/project rule folders when configured to ignore them, collects `.rules` files from each layer's `rules` directory, reads and parses each file, builds the combined `Policy`, and merges any required policy overlay. It returns the final policy or a read/parse error.
 
-**Call relations**: This is the core policy-loading routine used by startup, warning checks, and config-state builders. It delegates directory scanning to `collect_policy_files` and leaves warning downgrading to `load_exec_policy_with_warning`.
+**Call relations**: This is the core loader behind `load_exec_policy_with_warning` and other config-state building paths. It delegates directory scanning to `collect_policy_files` and parsing to `PolicyParser`.
 
 *Call graph*: calls 5 internal fn (get_layers, ignore_user_and_project_exec_policy_rules, requirements, collect_policy_files, new); called by 4 (loads_requirements_exec_policy_without_rules_files, merges_requirements_exec_policy_with_file_rules, load_exec_policy_with_warning, build_config_state_with_mtimes); 5 external calls (new, read_to_string, matches!, debug!, trace!).
 
@@ -1570,11 +1582,11 @@ fn render_decision_for_unmatched_command(
 ) -> Decision
 ```
 
-**Purpose**: Computes the fallback `Decision` for a command segment that matched no explicit exec-policy rule. It combines command safety heuristics, approval policy, sandbox shape, Windows backend availability, and escalation requests.
+**Purpose**: Chooses what to do with a command when no explicit executable policy rule matched it. It is the safety fallback that balances known-safe commands, dangerous commands, approval settings, and sandbox protection.
 
-**Data flow**: Reads `command` and `UnmatchedCommandContext`; determines whether the command is known-safe using generic or PowerShell-specific classifiers; computes whether managed filesystem restrictions exist without a usable Windows sandbox backend; checks dangerous-command heuristics; then branches on `AskForApproval` and filesystem sandbox kind to return `Decision::Allow`, `Decision::Prompt`, or `Decision::Forbidden`.
+**Data flow**: It receives command words and an `UnmatchedCommandContext` containing approval mode, permission profile, sandbox state, parsing details, and command origin. It checks whether the command is known safe, whether it might be dangerous, whether Windows filesystem restrictions lack a sandbox backend, and how the current approval mode treats unmatched commands. It returns `Allow`, `Prompt`, or `Forbidden`.
 
-**Call relations**: This function is passed as the fallback closure into policy evaluation from `create_exec_approval_requirement_for_command`. It is the heuristic engine used only when no explicit rule decides the command.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` passes this as the fallback used by policy evaluation whenever no explicit rule applies. It calls `profile_has_managed_filesystem_restrictions` and command safety classifiers.
 
 *Call graph*: calls 5 internal fn (profile_has_managed_filesystem_restrictions, command_might_be_dangerous, is_dangerous_powershell_words, is_known_safe_command, is_safe_powershell_words); 2 external calls (cfg!, matches!).
 
@@ -1585,11 +1597,11 @@ fn render_decision_for_unmatched_command(
 fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionProfile) -> bool
 ```
 
-**Purpose**: Detects whether a `PermissionProfile` represents a managed restricted filesystem policy that does not grant full-disk write access. This is used to decide whether lack of a real Windows sandbox backend should force conservative prompting.
+**Purpose**: Checks whether a permission profile represents managed, restricted filesystem access without full disk write permission. This matters for conservative decisions when sandbox enforcement may not really be active.
 
-**Data flow**: Reads `permission_profile`, obtains its filesystem sandbox policy, checks that the profile is `PermissionProfile::Managed`, the sandbox kind is `Restricted`, and `has_full_disk_write_access()` is false. Returns a boolean.
+**Data flow**: It receives a `PermissionProfile`, gets its filesystem sandbox policy, and checks that the profile is managed, restricted, and not allowed full disk writes. It returns a boolean.
 
-**Call relations**: Called only from `render_decision_for_unmatched_command` as part of the Windows-specific conservative fallback logic.
+**Call relations**: `render_decision_for_unmatched_command` calls this when deciding whether unmatched commands should be treated more cautiously, especially on Windows when the sandbox backend is disabled.
 
 *Call graph*: calls 1 internal fn (file_system_sandbox_policy); called by 1 (render_decision_for_unmatched_command); 1 external calls (matches!).
 
@@ -1600,11 +1612,11 @@ fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionPr
 fn default_policy_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the path of the default writable rules file under the Codex home directory. This is where appended amendments and network rules are persisted.
+**Purpose**: Builds the path to the default executable policy file under the Codex home directory. This keeps all rule-appending code writing to the same place.
 
-**Data flow**: Reads `codex_home`, joins `rules` and `default.rules`, and returns the resulting `PathBuf`.
+**Data flow**: It receives the Codex home path, appends `rules`, then appends `default.rules`, and returns the resulting path.
 
-**Call relations**: Used by both append/update methods to know where to write new rules on disk.
+**Call relations**: Both `append_amendment_and_update` and `append_network_rule_and_update` call this before writing saved policy changes.
 
 *Call graph*: called by 2 (append_amendment_and_update, append_network_rule_and_update); 1 external calls (join).
 
@@ -1615,11 +1627,11 @@ fn default_policy_path(codex_home: &Path) -> PathBuf
 fn commands_for_exec_policy(command: &[String]) -> ExecPolicyCommands
 ```
 
-**Purpose**: Normalizes a top-level command into the command segments that exec-policy should evaluate. It understands shell wrappers and PowerShell wrappers and records whether parsing had to fall back to a less precise mode.
+**Purpose**: Prepares a command for policy checking by extracting the real commands hidden inside common shell wrappers when possible. This lets rules apply to `python script.py` inside `bash -lc "python script.py"`, not just to `bash` itself.
 
-**Data flow**: Reads `command`; first tries `parse_shell_lc_plain_commands`, then on Windows tries PowerShell lowering, then tries `parse_shell_lc_single_command_prefix` for complex/heredoc fallback, and finally falls back to the original argv as a single command. Returns `ExecPolicyCommands { commands, used_complex_parsing, command_origin }`.
+**Data flow**: It receives the original command argument list. It first tries plain parsing for shell `-lc` forms, then on Windows tries PowerShell command parsing, then falls back to a single-command prefix parser, and finally uses the original command unchanged. It returns the list of command segments, whether complex parsing was used, and the command origin.
 
-**Call relations**: Called by `create_exec_approval_requirement_for_command` before policy evaluation. Its output influences both rule matching and whether automatic amendment suggestions are allowed.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this before evaluating policy, so all later rule checks and fallback heuristics operate on the best available command words.
 
 *Call graph*: calls 3 internal fn (parse_shell_lc_plain_commands, parse_shell_lc_single_command_prefix, parse_powershell_command_into_plain_commands); called by 1 (create_exec_approval_requirement_for_command); 1 external calls (vec!).
 
@@ -1632,11 +1644,11 @@ fn try_derive_execpolicy_amendment_for_prompt_rules(
 ) -> Option<ExecPolicyAmendment>
 ```
 
-**Purpose**: Suggests an exec-policy amendment for a prompt outcome only when no explicit policy rule already prompted. It chooses the first heuristic prompt command as the amendment target.
+**Purpose**: Suggests an allow rule when a command prompted only because of fallback heuristics, not because of an explicit prompt rule. This helps future similar commands avoid repeated approval prompts.
 
-**Data flow**: Reads `matched_rules`; if any explicit policy match has `Decision::Prompt`, returns `None`; otherwise scans for the first `HeuristicsRuleMatch` with `Decision::Prompt` and converts its command into `ExecPolicyAmendment`.
+**Data flow**: It receives the matched rule records from an evaluation. If any explicit policy rule already prompted, it returns nothing because an amendment would not remove that requirement. Otherwise it finds the first heuristic prompt match and turns its command into an `ExecPolicyAmendment`.
 
-**Call relations**: Used from `create_exec_approval_requirement_for_command` when a command needs approval and no requested prefix-rule amendment was accepted. It avoids suggesting amendments that would not actually remove a policy-driven prompt.
+**Call relations**: The prompt branch of `ExecPolicyManager::create_exec_approval_requirement_for_command` uses this as a fallback suggestion when no user-requested prefix amendment was suitable.
 
 *Call graph*: 1 external calls (iter).
 
@@ -1649,11 +1661,11 @@ fn try_derive_execpolicy_amendment_for_allow_rules(
 ) -> Option<ExecPolicyAmendment>
 ```
 
-**Purpose**: Suggests an amendment for heuristic allow decisions so future runs can bypass sandbox for similar commands. It only does so when no explicit policy rule matched at all.
+**Purpose**: Suggests an allow rule for a command that was allowed only by heuristics. The suggestion can later be used to bypass sandbox for similar commands after a sandbox failure approval flow.
 
-**Data flow**: Reads `matched_rules`; returns `None` if any rule is an explicit policy match; otherwise finds the first `HeuristicsRuleMatch` with `Decision::Allow` and wraps its command in `ExecPolicyAmendment`.
+**Data flow**: It receives matched rule records. If any explicit policy rule matched, it returns nothing because policy already says what to do. Otherwise it finds a heuristic allow match and turns its command into an `ExecPolicyAmendment`.
 
-**Call relations**: Called from `create_exec_approval_requirement_for_command` when the overall decision is `Allow`. It is specifically used to propose future sandbox bypasses for commands currently allowed only by heuristics.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this in the allow case to attach a possible amendment to a `Skip` result.
 
 *Call graph*: called by 1 (create_exec_approval_requirement_for_command); 1 external calls (iter).
 
@@ -1669,11 +1681,11 @@ fn derive_requested_execpolicy_amendment_from_prefix_rule(
     exec_poli
 ```
 
-**Purpose**: Validates and possibly accepts a caller-supplied prefix rule as the proposed amendment for a command. It rejects empty, banned, conflicting, or ineffective prefixes.
+**Purpose**: Validates a user-requested prefix rule before suggesting it as a policy amendment. It avoids overly broad suggestions like allowing all `bash` or all `python` commands.
 
-**Data flow**: Reads optional `prefix_rule`, `matched_rules`, `exec_policy`, parsed `commands`, fallback closure, and `match_options`; returns `None` if the prefix is missing, empty, exactly matches a banned suggestion, or any explicit policy rule already matched. Otherwise constructs an `ExecPolicyAmendment` and returns it only if `prefix_rule_would_approve_all_commands(...)` is true.
+**Data flow**: It receives an optional prefix rule, existing matched rules, the current policy, parsed commands, the fallback decision function, and match options. It rejects missing, empty, banned, or conflicting prefixes, then tests whether adding the prefix would allow every parsed command. It returns an amendment only if the proposed rule is safe and effective.
 
-**Call relations**: This helper is consulted first by `create_exec_approval_requirement_for_command` when the caller supplied a preferred amendment prefix. It delegates the effectiveness check to `prefix_rule_would_approve_all_commands`.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this before using other amendment suggestions. It delegates the simulated-policy check to `prefix_rule_would_approve_all_commands`.
 
 *Call graph*: calls 1 internal fn (prefix_rule_would_approve_all_commands); called by 1 (create_exec_approval_requirement_for_command); 2 external calls (new, iter).
 
@@ -1689,11 +1701,11 @@ fn prefix_rule_would_approve_all_commands(
     match_opti
 ```
 
-**Purpose**: Checks whether adding a proposed allow-prefix rule would make every parsed command segment evaluate to `Allow`. This prevents suggesting a prefix that only covers part of a multi-command script.
+**Purpose**: Tests a proposed allow-prefix rule without changing the real policy. It answers whether that new rule would actually approve all command pieces being evaluated.
 
-**Data flow**: Clones `exec_policy`, attempts to add the proposed allow prefix rule, returns `false` if rule insertion fails, otherwise evaluates every command in `commands` with `check_with_options` using the supplied fallback and match options, and returns `true` only if all decisions are `Allow`.
+**Data flow**: It receives the current policy, proposed prefix, parsed command list, fallback decision function, and match options. It clones the policy, tries to add the allow rule, then checks every command against the cloned policy. It returns `true` only if every command would become allowed.
 
-**Call relations**: Used exclusively by `derive_requested_execpolicy_amendment_from_prefix_rule` to validate caller-supplied amendment prefixes against the actual parsed command set.
+**Call relations**: `derive_requested_execpolicy_amendment_from_prefix_rule` calls this as the final proof that a requested prefix amendment would solve the approval need.
 
 *Call graph*: called by 1 (derive_requested_execpolicy_amendment_from_prefix_rule); 1 external calls (clone).
 
@@ -1704,11 +1716,11 @@ fn prefix_rule_would_approve_all_commands(
 fn derive_prompt_reason(command_args: &[String], evaluation: &Evaluation) -> Option<String>
 ```
 
-**Purpose**: Builds a human-readable reason string for prompt outcomes when an explicit policy prompt rule caused the prompt. It prefers the most specific matching prompt rule and includes user justification when present.
+**Purpose**: Builds a user-facing reason for an approval prompt when an explicit policy rule caused it. If the prompt came only from heuristics, it deliberately returns no reason.
 
-**Data flow**: Reads original `command_args` and `evaluation`, renders the command with `render_shlex_command`, scans `matched_rules` for `PrefixRuleMatch` entries with `Decision::Prompt`, chooses the longest matched prefix, and returns `Some(String)` with either the rule justification or a generic policy message; returns `None` if no policy prompt rule matched.
+**Data flow**: It receives the original command arguments and the policy evaluation. It renders the command as shell-like text, finds the most specific prompt prefix rule, and uses that rule's justification if present. It returns an optional reason string.
 
-**Call relations**: Called by `create_exec_approval_requirement_for_command` when converting a `Decision::Prompt` evaluation into `ExecApprovalRequirement::NeedsApproval`.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this when returning `NeedsApproval`, so the approval UI can explain policy-driven prompts.
 
 *Call graph*: calls 1 internal fn (render_shlex_command); called by 1 (create_exec_approval_requirement_for_command); 1 external calls (format!).
 
@@ -1719,11 +1731,11 @@ fn derive_prompt_reason(command_args: &[String], evaluation: &Evaluation) -> Opt
 fn render_shlex_command(args: &[String]) -> String
 ```
 
-**Purpose**: Formats argv into a shell-escaped command string suitable for user-facing messages. It falls back to simple space-joining if shell escaping fails.
+**Purpose**: Formats command arguments into a readable shell-style command string. This makes error and prompt messages easier to understand.
 
-**Data flow**: Reads `args`, attempts `shlex::try_join` over `&str` slices, and returns the escaped string or `args.join(" ")` on failure.
+**Data flow**: It receives a list of command arguments. It tries to quote and join them using shell-style escaping, and if that fails, falls back to joining with spaces. It returns the rendered command string.
 
-**Call relations**: Used by both prompt and forbidden reason renderers so user-visible messages show the original command in a readable form.
+**Call relations**: `derive_prompt_reason` and `derive_forbidden_reason` call this whenever they need to include a command in a human-readable message.
 
 *Call graph*: called by 2 (derive_forbidden_reason, derive_prompt_reason); 1 external calls (try_join).
 
@@ -1734,11 +1746,11 @@ fn render_shlex_command(args: &[String]) -> String
 fn derive_forbidden_reason(command_args: &[String], evaluation: &Evaluation) -> String
 ```
 
-**Purpose**: Builds the rejection message for forbidden command outcomes. It prefers the most specific matching forbidden prefix rule and includes any rule justification.
+**Purpose**: Builds a clear explanation for why a command was blocked. If a policy rule supplied a justification, that message is used.
 
-**Data flow**: Reads `command_args` and `evaluation`, renders the full command string, scans `matched_rules` for `PrefixRuleMatch` entries with `Decision::Forbidden`, chooses the longest matched prefix, and returns a formatted string using either the rule justification, the matched prefix, or a generic `blocked by policy` fallback.
+**Data flow**: It receives the original command arguments and the evaluation result. It renders the command, finds the most specific forbidden prefix rule, and returns a message using either the rule's justification, the forbidden prefix, or a generic policy-blocked reason.
 
-**Call relations**: Called by `create_exec_approval_requirement_for_command` when the final evaluation decision is `Forbidden`.
+**Call relations**: `ExecPolicyManager::create_exec_approval_requirement_for_command` calls this when policy evaluation returns `Forbidden`, so callers can show a useful rejection message.
 
 *Call graph*: calls 1 internal fn (render_shlex_command); called by 1 (create_exec_approval_requirement_for_command); 1 external calls (format!).
 
@@ -1749,22 +1761,28 @@ fn derive_forbidden_reason(command_args: &[String], evaluation: &Evaluation) -> 
 async fn collect_policy_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, ExecPolicyError>
 ```
 
-**Purpose**: Lists and sorts all `.rules` files in a policy directory, treating a missing directory as empty. It is the filesystem discovery step for policy loading.
+**Purpose**: Finds all `.rules` files in one policy directory. Missing directories are treated as normal, because not every configuration layer has policy rules.
 
-**Data flow**: Reads `dir`, attempts `fs::read_dir`; returns an empty vector on `NotFound`, otherwise wraps read errors in `ExecPolicyError::ReadDir`. It iterates directory entries, fetches each `file_type`, keeps only regular files whose extension equals `RULE_EXTENSION`, sorts the resulting `Vec<PathBuf>`, logs a debug message, and returns it.
+**Data flow**: It receives a directory path. It tries to read the directory, returns an empty list if it does not exist, reports read errors otherwise, scans entries, keeps regular files whose extension is `.rules`, sorts the paths, and returns them.
 
-**Call relations**: Called by `load_exec_policy` for each applicable config layer’s `rules/` directory. It isolates directory traversal and error mapping from parser logic.
+**Call relations**: `load_exec_policy` calls this for each configuration layer's `rules` directory before reading and parsing the files in precedence order.
 
 *Call graph*: called by 1 (load_exec_policy); 5 external calls (as_ref, to_path_buf, new, read_dir, debug!).
 
 
 ### `core/src/network_policy_decision.rs`
 
-`domain_logic` · `network approval handling and blocked-request reporting`
+`domain_logic` · `request handling and approval persistence`
 
-This file contains small but important conversion logic around network approvals. `ExecPolicyNetworkRuleAmendment` is a local struct representing the subset of an approval amendment needed to write an exec-policy network rule: protocol, allow/forbid decision, and a human-readable justification. The private parser `parse_network_policy_decision` recognizes only the string values `deny` and `ask`, matching the serialized forms used by blocked proxy requests.
+This file sits between the network proxy, the user approval flow, and the execution policy system. In plain terms, it answers two questions: “Can we ask the user about this network request?” and “How do we record the user's answer as a rule?” Without this file, blocked network requests would be harder to explain, and approved network changes would not be converted into the format used by the sandbox policy engine.
 
-`network_approval_context_from_payload` extracts a `NetworkApprovalContext` only from payloads that represent an ask decision originating from the decider. It requires both a protocol and a non-empty trimmed host, so malformed or already-final decisions never produce approval context. `denied_network_policy_message` turns a `BlockedRequest` into a user-facing explanation only when the blocked request’s serialized decision is `deny`; it maps known reason codes like `denied`, `not_allowed`, `not_allowed_local`, `method_not_allowed`, and `proxy_disabled` to explicit text, with a generic fallback and a special host-empty fallback message. Finally, `execpolicy_network_rule_amendment` maps protocol enums from approval-layer types to exec-policy types, converts allow/deny actions into `ExecPolicyDecision::{Allow,Forbidden}`, and synthesizes a justification string such as `Allow https_connect access to example.com`.
+The file first defines a small internal record, ExecPolicyNetworkRuleAmendment, which is the shape needed when saving a new network rule for the execution policy. It includes the network protocol, the allow-or-deny decision, and a human-readable reason.
+
+For incoming policy decision payloads, the file checks that the request is actually one where the decider wants to ask the user. It then extracts the protocol and a non-empty host name, producing a NetworkApprovalContext that the approval prompt can use.
+
+For already-blocked requests, it creates friendly messages such as “Network access to example.com was blocked...” and explains the reason in everyday terms where possible.
+
+Finally, when a user approves or denies a network rule, it maps protocol names and actions from the approval system into the execution policy system. This is like translating a form filled out by a person into the exact wording needed by the rulebook.
 
 #### Function details
 
@@ -1774,11 +1792,11 @@ This file contains small but important conversion logic around network approvals
 fn parse_network_policy_decision(value: &str) -> Option<NetworkPolicyDecision>
 ```
 
-**Purpose**: Parses the serialized decision string found on blocked requests into a `NetworkPolicyDecision` enum for the subset of values this module cares about.
+**Purpose**: This small helper reads a text value from a blocked request and turns known policy words into the program's internal decision type. It only accepts the meaningful values this file cares about: deny and ask.
 
-**Data flow**: Takes a `&str`, matches `"deny"` to `Some(NetworkPolicyDecision::Deny)`, `"ask"` to `Some(NetworkPolicyDecision::Ask)`, and returns `None` for any other string.
+**Data flow**: It receives a string such as "deny" or "ask". It compares that string against the supported policy decision words. If the word is recognized, it returns the matching NetworkPolicyDecision; otherwise it returns nothing, so the caller knows the value was not useful.
 
-**Call relations**: Used internally by `denied_network_policy_message` to decide whether a blocked request should produce a denial message.
+**Call relations**: This function is used inside denied_network_policy_message when the code needs to decide whether a blocked request was truly denied by policy. It keeps that message-building function from having to compare raw text itself.
 
 
 ##### `network_approval_context_from_payload`  (lines 26–44)
@@ -1789,11 +1807,11 @@ fn network_approval_context_from_payload(
 ) -> Option<NetworkApprovalContext>
 ```
 
-**Purpose**: Extracts the host/protocol pair needed for a network approval prompt from a network policy decision payload, but only for decider-originated ask decisions.
+**Purpose**: This function decides whether a network policy decision payload contains enough trustworthy information to show an approval prompt. If it does, it builds the small context object the prompt needs: the host and the protocol.
 
-**Data flow**: Reads `payload.is_ask_from_decider()`, `payload.protocol`, and `payload.host`. If the payload is not an ask-from-decider, lacks a protocol, lacks a host, or has an empty trimmed host, it returns `None`. Otherwise it returns `Some(NetworkApprovalContext { host: trimmed_host.to_string(), protocol })`.
+**Data flow**: It receives a NetworkPolicyDecisionPayload, which may or may not represent a request that should be shown to the user. First it asks the payload whether it is an "ask" decision from the decider. Then it requires a protocol and a host name. It trims extra space from the host and rejects an empty host. If everything is valid, it returns a NetworkApprovalContext with the cleaned host and protocol; otherwise it returns nothing.
 
-**Call relations**: Called by approval-handling code when deciding whether a blocked network event should be turned into an approval request.
+**Call relations**: This function calls is_ask_from_decider on the payload as its first gate. It is meant to be used when the system receives a network policy decision and needs to know whether that decision can become a user approval request.
 
 *Call graph*: calls 1 internal fn (is_ask_from_decider).
 
@@ -1804,11 +1822,11 @@ fn network_approval_context_from_payload(
 fn denied_network_policy_message(blocked: &BlockedRequest) -> Option<String>
 ```
 
-**Purpose**: Builds a user-facing explanation for a blocked network request when policy has definitively denied it.
+**Purpose**: This function turns a blocked network request into a clear message for a person. It only produces a message when the request was actually denied by policy.
 
-**Data flow**: Reads `blocked.decision`, parses it with `parse_network_policy_decision`, and returns `None` unless the result is `Some(Deny)`. It trims `blocked.host`; if empty, it returns a generic denial message. Otherwise it maps `blocked.reason` to a detailed explanation string and returns `Some(format!(...))` naming the host and detail.
+**Data flow**: It receives a BlockedRequest from the network proxy. It reads the request's decision text and uses parse_network_policy_decision to understand it. If the decision is not "deny", it returns nothing. If the host is blank, it returns a general blocked-by-policy message. If there is a host, it looks at the reason code and chooses a plain-language explanation, then returns a sentence naming the host and the reason it was blocked.
 
-**Call relations**: Called by `record_blocked_request` when surfacing blocked network activity to the user or transcript.
+**Call relations**: record_blocked_request calls this when a blocked network request is being recorded or reported. This function does the user-facing explanation work, using format! to assemble the final sentence.
 
 *Call graph*: called by 1 (record_blocked_request); 1 external calls (format!).
 
@@ -1823,22 +1841,26 @@ fn execpolicy_network_rule_amendment(
 ) -> ExecPolicyNetworkRuleAmendment
 ```
 
-**Purpose**: Converts an approval-layer network amendment into the exec-policy representation used for persistence.
+**Purpose**: This function converts a user's network policy choice into the rule-amendment format used by the execution policy system. It is used when the system needs to persist an allow or deny rule after an approval decision.
 
-**Data flow**: Takes a `NetworkPolicyAmendment`, `NetworkApprovalContext`, and host string. It maps `NetworkApprovalProtocol` to `ExecPolicyNetworkRuleProtocol`, maps amendment action `Allow`/`Deny` to `ExecPolicyDecision::Allow`/`Forbidden` plus an action verb, derives a protocol label string, formats a justification like `Deny socks5_udp access to example.com`, and returns `ExecPolicyNetworkRuleAmendment { protocol, decision, justification }`.
+**Data flow**: It receives the user's NetworkPolicyAmendment, the NetworkApprovalContext that says which protocol was involved, and the host name the rule applies to. It maps the approval protocol into the matching execution-policy protocol. It maps the user's action into either an allow decision or a forbidden decision. It also builds a short justification such as allowing HTTPS access to a host. It returns an ExecPolicyNetworkRuleAmendment containing those translated pieces.
 
-**Call relations**: Called by `persist_network_policy_amendment` after the user has approved or denied a network rule change, providing the exact exec-policy fields to write.
+**Call relations**: persist_network_policy_amendment calls this when saving a network policy change. This function acts as the translator between the approval layer's language and the execution policy layer's language, then hands back a ready-to-save amendment.
 
 *Call graph*: called by 1 (persist_network_policy_amendment); 1 external calls (format!).
 
 
 ### `core/src/safety.rs`
 
-`domain_logic` · `patch application approval check before executing apply_patch`
+`domain_logic` · `request handling`
 
-This file contains the core patch-safety policy for write operations. It defines `SafetyCheck` as the three possible outcomes: auto-approve with a specific `SandboxType` and approval provenance flag, ask the user, or reject with a concrete reason string. `assess_patch_safety` is the main decision engine. It first rejects empty patches outright. It then interprets `AskForApproval`: `UnlessTrusted` immediately forces `AskUser`, while the other modes continue into sandbox analysis. A derived `rejects_sandbox_approval` flag captures the stricter cases where the system is not allowed to ask for sandbox approval (`Never` or granular config with `sandbox_approval: false`).
+This file protects the user’s files when Codex applies a patch. A patch can create, delete, update, or move files, so the program needs a clear answer before doing anything: is this patch allowed automatically, does the user need to approve it, or should it be rejected outright?
 
-The key safety test is `is_write_patch_constrained_to_writable_paths`, which checks every changed path in the patch against the filesystem sandbox policy after resolving paths against `cwd` and normalizing `.` and `..` components without touching the filesystem. Adds and deletes must target writable paths; updates must allow both the source path and any move destination. If the patch is constrained to writable paths, or the policy is `OnFailure`, the code tries to auto-approve. For `PermissionProfile::Disabled` and `External`, that means no outer Codex filesystem sandbox (`SandboxType::None`). For managed profiles, auto-approval requires an actual platform sandbox from `get_platform_sandbox`; otherwise the code either rejects with a reason derived by `patch_rejection_reason` or asks the user. `patch_rejection_reason` distinguishes read-only managed sandboxes with no writable roots from the broader "outside project" case.
+The main idea is similar to a building security desk. If a visitor only wants to enter rooms they are already allowed to enter, they may pass with the right badge. If their request is unclear or goes outside the allowed area, security asks a human. If the rules say not to ask and the request is unsafe, security refuses.
+
+The file uses several pieces of information: the patch contents, the user’s approval setting, the current permission profile, the filesystem sandbox policy, the current working directory, and Windows sandbox settings. A sandbox is a controlled environment that limits what the patch process can touch, like putting a messy task inside a sealed workbench.
+
+The key result is a `SafetyCheck`: automatically approve with a chosen sandbox, ask the user, or reject with a human-readable reason. The file also checks whether every file path in the patch falls within writable roots, including move destinations. Importantly, even when paths look allowed, the code may still require a sandbox because filesystem tricks such as hard links could point outside the apparent project area.
 
 #### Function details
 
@@ -1853,11 +1875,11 @@ fn assess_patch_safety(
     cwd: &Absol
 ```
 
-**Purpose**: Determines whether a patch operation should be auto-approved, escalated to the user, or rejected under the current approval mode, permission profile, filesystem sandbox policy, and platform sandbox availability.
+**Purpose**: This is the main decision point for patch safety. It looks at the patch, approval rules, permission profile, writable filesystem areas, and sandbox availability, then decides whether to auto-approve, ask the user, or reject the patch.
 
-**Data flow**: It takes an `ApplyPatchAction`, approval policy, permission profile, filesystem sandbox policy, current working directory, and Windows sandbox level. It first reads `action.is_empty()` and returns `Reject { reason: "empty patch" }` if true. It then branches on `policy`, immediately returning `AskUser` for `UnlessTrusted` and otherwise computing whether sandbox approval is disallowed. Next it evaluates `is_write_patch_constrained_to_writable_paths(action, file_system_sandbox_policy, cwd)` or accepts `OnFailure` as auto-approvable. In that branch it returns `AutoApprove { sandbox_type: None, ... }` for `Disabled` and `External` profiles, or for managed profiles tries `get_platform_sandbox(...)`; success yields `AutoApprove` with that sandbox type, failure yields either `Reject` with `patch_rejection_reason(...).to_string()` or `AskUser`. If the patch is not constrained and sandbox approval is disallowed, it rejects with the same reason; otherwise it returns `AskUser`.
+**Data flow**: It receives the patch action, approval policy, permission settings, filesystem sandbox rules, current directory, and Windows sandbox level. First it rejects an empty patch. Then it checks whether the user’s approval policy allows automatic decisions, whether the patch stays inside writable paths, and whether a real sandbox can be used. It returns a `SafetyCheck`: either approval with a sandbox type, a request to ask the user, or rejection with a reason.
 
-**Call relations**: This function is called by `apply_patch` before patch execution. It delegates path-scope analysis to `is_write_patch_constrained_to_writable_paths`, rejection-message selection to `patch_rejection_reason`, and platform sandbox discovery to `get_platform_sandbox`, making it the top-level policy coordinator for patch approval.
+**Call relations**: This function is called by `apply_patch` before the patch is actually applied. During its decision, it asks `is_write_patch_constrained_to_writable_paths` whether the patch only writes where it should, calls `get_platform_sandbox` to see whether the operating system can enforce a sandbox, and uses `patch_rejection_reason` when it needs a clear explanation for refusing the patch.
 
 *Call graph*: calls 3 internal fn (is_empty, is_write_patch_constrained_to_writable_paths, patch_rejection_reason); called by 1 (apply_patch); 2 external calls (get_platform_sandbox, matches!).
 
@@ -1872,11 +1894,11 @@ fn patch_rejection_reason(
 ) -> &'static str
 ```
 
-**Purpose**: Chooses the specific static rejection reason string for a denied patch based on the permission profile and whether the managed filesystem sandbox is effectively read-only.
+**Purpose**: This helper chooses the message shown when a patch is rejected. It distinguishes between a truly read-only sandbox and a patch that tries to write outside the project or allowed area.
 
-**Data flow**: It takes references to the permission profile, filesystem sandbox policy, and current working directory. For `PermissionProfile::Managed` it checks `has_full_disk_write_access()` and `get_writable_roots_with_cwd(cwd.as_path())`; if there is no full-disk write access and no writable roots, it returns `PATCH_REJECTED_READ_ONLY_REASON`, otherwise it returns `PATCH_REJECTED_OUTSIDE_PROJECT_REASON`. For `Disabled` and `External` it also returns the outside-project reason. It returns a `&'static str` and mutates nothing.
+**Data flow**: It receives the permission profile, filesystem sandbox policy, and current directory. It checks whether the managed sandbox has full disk write access or any writable roots for the current directory. From that, it returns one of two fixed explanation strings: either writing is blocked by a read-only sandbox, or the patch is trying to write outside the project.
 
-**Call relations**: This helper is called only by `assess_patch_safety` in rejection paths. It isolates the wording logic so the main decision tree can reuse the same reason selection in multiple branches.
+**Call relations**: This function is used only by `assess_patch_safety`, at the moments when the policy says Codex should not ask the user for sandbox approval and therefore must reject unsafe work instead. It calls into the sandbox policy to understand what write access exists before choosing the user-facing reason.
 
 *Call graph*: calls 3 internal fn (get_writable_roots_with_cwd, has_full_disk_write_access, as_path); called by 1 (assess_patch_safety).
 
@@ -1891,11 +1913,11 @@ fn is_write_patch_constrained_to_writable_paths(
 ) -> bool
 ```
 
-**Purpose**: Checks whether every path touched by a patch falls within locations writable under the current filesystem sandbox policy. It is the core predicate used to decide whether a patch can be safely auto-approved.
+**Purpose**: This helper checks whether every file path touched by a patch is inside an area that the sandbox policy says is writable. It is used to decide whether a patch can be treated as safely contained.
 
-**Data flow**: It takes an `ApplyPatchAction`, filesystem sandbox policy, and current working directory. Internally it defines `normalize`, which removes `.` and resolves `..` path components syntactically, and a closure `is_path_writable` that resolves each candidate path against `cwd` with `resolve_path`, normalizes it, and asks `file_system_sandbox_policy.can_write_path_with_cwd(&abs, cwd)`. It then iterates over `action.changes()`: `Add` and `Delete` require the target path to be writable; `Update` requires both the original path and any `move_path` destination to be writable. It returns `false` on the first violation and `true` only if all touched paths pass.
+**Data flow**: It receives the patch action, filesystem sandbox policy, and current directory. For each changed file, it turns the path into an absolute path relative to the current directory, cleans up `.` and `..` path pieces without reading the disk, and asks the sandbox policy whether that path can be written. Adds, deletes, and updates must have writable source paths; moves must also have writable destination paths. It returns `true` only if every relevant path is writable.
 
-**Call relations**: This predicate is called by `assess_patch_safety` before any auto-approval decision. It does not call other file-local helpers, but it encapsulates the detailed per-change path validation that the top-level policy depends on.
+**Call relations**: This function is called by `assess_patch_safety` while deciding whether automatic approval is possible. It reads the patch’s list of changes through `changes`, checks each one against the filesystem policy, and hands back a simple yes-or-no answer that drives the larger safety decision.
 
 *Call graph*: calls 1 internal fn (changes); called by 1 (assess_patch_safety).
 
@@ -1905,11 +1927,13 @@ These legacy-policy files expose the old API, parse Starlark policies, and imple
 
 ### `execpolicy-legacy/src/lib.rs`
 
-`orchestration` · `startup`
+`config` · `startup / config load`
 
-This is the library root for the legacy exec policy crate. It declares the internal modules that implement argument matching, parsing, policy evaluation, executable checking, and validated command representations, then re-exports the main types (`Policy`, `PolicyParser`, `ExecCall`, `ExecvChecker`, `ProgramSpec`, `MatchedExec`, `ValidExec`, error/result types, and supporting argument/option types) so downstream code can use the crate without importing submodules directly. It also embeds `default.policy` at compile time with `include_str!`, making the default ruleset part of the binary rather than a runtime file dependency.
+This file is like the public counter at a workshop: the real tools live in separate rooms, but this is where outside code comes to ask for them. It declares the library’s internal modules, such as argument matching, policy parsing, program rules, and validation of executable calls. Then it re-exports the important types, so users of the library can write simple imports instead of knowing the internal file layout.
 
-The only behavior in this file is `get_default_policy`, which constructs a `PolicyParser` with a synthetic source name `#default` and the embedded policy text, then parses it into a `Policy`. Because it returns `starlark::Result<Policy>`, callers can distinguish parser/evaluator failures from later policy-checking errors. This file is intentionally thin: it centralizes module wiring and stable exports while leaving all substantive parsing and checking logic to the dedicated modules.
+The file also embeds a default policy file directly into the compiled program. That means the program does not need to find a separate policy file on disk just to get its baseline rules. The helper function `get_default_policy` takes that embedded text, creates a `PolicyParser` for it, and turns it into a `Policy` object the rest of the system can use.
+
+Without this file, other parts of the project would have to know many internal module paths, and there would be no single easy way to load the standard built-in policy. The important behavior to notice is that the default policy is included at compile time, not read from disk at runtime.
 
 #### Function details
 
@@ -1919,11 +1943,11 @@ The only behavior in this file is `get_default_policy`, which constructs a `Poli
 fn get_default_policy() -> starlark::Result<Policy>
 ```
 
-**Purpose**: Parses the built-in `default.policy` text into a `Policy` object ready for command checking.
+**Purpose**: Loads the library’s built-in default execution policy and turns it into a usable `Policy`. Code uses this when it wants the standard rules without supplying a separate policy file.
 
-**Data flow**: Reads the compile-time constant `DEFAULT_POLICY`, constructs a `PolicyParser` with source label `#default`, invokes `parse`, and returns the resulting `starlark::Result<Policy>` without additional transformation.
+**Data flow**: It starts with `DEFAULT_POLICY`, which is policy text embedded in the program when it is built. It creates a `PolicyParser` with the label `#default` and that text, then asks the parser to parse it. The result is either a ready-to-use `Policy` or an error explaining why the built-in policy could not be parsed.
 
-**Call relations**: Called by the CLI `main` path when the user does not supply `--policy`, providing the default ruleset for the rest of execution.
+**Call relations**: The application’s `main` function calls this during setup when it needs the default rules. `get_default_policy` hands the embedded text to `PolicyParser::new`, then relies on the parser to produce the final policy object that later checks attempted program executions.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (main).
 
@@ -1932,11 +1956,13 @@ fn get_default_policy() -> starlark::Result<Policy>
 
 `config` · `config load`
 
-This file is the configuration-loading core of the crate. `PolicyParser` stores a source label and raw policy text, then `parse` configures a Starlark `Dialect::Extended` with f-strings enabled, parses the source into an `AstModule`, builds globals extended with typing support plus the local `policy_builtins`, and evaluates the module inside `Module::with_temp_heap`. Before evaluation it seeds the module with constants such as `ARG_RFILE`, `ARG_WFILE`, `ARG_POS_INT`, and `ARG_SED_COMMAND`, each allocated from an `ArgMatcher` variant so policy authors can refer to typed argument patterns directly.
+This file is the bridge between a policy file people write and the structured rules the execution policy engine uses later. The policy text is written in Starlark, a small Python-like configuration language. Instead of treating that text as plain data, the parser runs it in a controlled environment that exposes only the policy-building commands this project wants to allow.
 
-State accumulation happens through `PolicyBuilder`, which is attached to `Evaluator.extra` and uses `RefCell` fields to gather `ProgramSpec`s, forbidden program regexes, and forbidden substrings during evaluation. After the Starlark module runs, `PolicyBuilder::build` consumes those collections and calls `Policy::new`, converting regex-construction failures into Starlark "other" errors.
+The main flow starts with PolicyParser. It stores where the policy came from and the policy text itself. When asked to parse, it reads the text as Starlark, creates a temporary Starlark module, and installs special constants such as ARG_RFILE or ARG_POS_INT. These constants describe what kind of command-line argument is acceptable, for example a readable file or a positive integer.
 
-The `#[starlark_module]` function defines the policy DSL surface. `define_program` normalizes optional parameters, rejects duplicate option names by building a `HashMap<String, Opt>`, constructs a `ProgramSpec`, and registers it with the builder. `forbid_substrings` and `forbid_program_regex` append global bans. `opt` and `flag` are convenience constructors that produce `Opt` values with `OptMeta::Value(...)` or `OptMeta::Flag`. The design keeps parsing declarative: Starlark code only calls builtins, while all semantic objects are created in Rust.
+A PolicyBuilder sits behind the scenes while the Starlark policy runs. Think of it like a clipboard held by the parser: every time the policy script calls define_program, forbid_substrings, or forbid_program_regex, information is added to that clipboard. After the script finishes, the builder turns the collected information into a Policy.
+
+Important behavior: option names are checked for duplicates within a program definition, and forbidden program regular expressions are compiled during parsing. That means mistakes in the policy are caught early, before the policy is used to approve or reject real commands.
 
 #### Function details
 
@@ -1946,11 +1972,11 @@ The `#[starlark_module]` function defines the policy DSL surface. `define_progra
 fn new(policy_source: &str, unparsed_policy: &str) -> Self
 ```
 
-**Purpose**: Creates a parser instance holding the policy source name and raw policy text.
+**Purpose**: Creates a parser for one policy text. It remembers both the policy source name, such as a filename, and the raw policy content that will be parsed later.
 
-**Data flow**: Copies `policy_source` and `unparsed_policy` into owned `String` fields and returns a `PolicyParser`.
+**Data flow**: It receives two pieces of text: where the policy came from and the policy body. It copies both into a new PolicyParser object. The result is a ready-to-use parser, but no parsing has happened yet.
 
-**Call relations**: Used by both library and tests before invoking `parse`; it is the lightweight setup step for policy compilation.
+**Call relations**: This is the setup step before PolicyParser::parse does the real work. Code that wants to load a policy first creates this object, then asks it to parse the stored text.
 
 
 ##### `PolicyParser::parse`  (lines 36–67)
@@ -1959,11 +1985,11 @@ fn new(policy_source: &str, unparsed_policy: &str) -> Self
 fn parse(&self) -> starlark::Result<Policy>
 ```
 
-**Purpose**: Compiles and evaluates the Starlark policy text, then converts the collected declarations into a `Policy`.
+**Purpose**: Reads and executes the Starlark policy text, then returns a structured Policy. This is where a written policy becomes enforceable rules.
 
-**Data flow**: Reads `self.policy_source` and `self.unparsed_policy`, configures a Starlark dialect, parses an `AstModule`, builds globals with `policy_builtins`, creates a fresh `PolicyBuilder`, and evaluates the module in a temporary heap after injecting predefined `ARG_*` constants. Evaluation mutates the builder through `Evaluator.extra`; afterward the builder is consumed with `build()`. Any builder/regex error is wrapped into a Starlark `ErrorKind::Other`.
+**Data flow**: It starts with the stored policy source name and policy text. It parses the text as Starlark using an extended dialect, prepares a controlled set of global policy functions and argument-matcher constants, and runs the policy script. As the script runs, it fills a PolicyBuilder. After execution, it asks the builder to produce a Policy, or returns an error if parsing, execution, duplicate checks, or regular expression compilation fail.
 
-**Call relations**: This is the main parser entry used by `get_default_policy`, the CLI when loading a policy file, and tests. It delegates declaration handling to the builtins and final assembly to `PolicyBuilder::build`.
+**Call relations**: This is the central flow in the file. It creates the PolicyBuilder with PolicyBuilder::new, uses Starlark parsing and temporary module setup, exposes policy_builtins to the script, and finally relies on PolicyBuilder::build to hand back the finished Policy.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (parse, extended_by, with_temp_heap).
 
@@ -1974,11 +2000,11 @@ fn parse(&self) -> starlark::Result<Policy>
 fn new() -> Self
 ```
 
-**Purpose**: Initializes an empty mutable collector for program specs and global forbid rules discovered during policy evaluation.
+**Purpose**: Creates an empty collector for policy rules. It starts with no allowed program definitions, no forbidden program regular expressions, and no forbidden substrings.
 
-**Data flow**: Creates empty `MultiMap`, `Vec<ForbiddenProgramRegex>`, and `Vec<String>` values inside `RefCell`s and returns the assembled builder.
+**Data flow**: It takes no input. It creates empty internal containers: one for program rules, one for forbidden regex rules, and one for forbidden text snippets. The output is a PolicyBuilder ready to be filled while the Starlark policy runs.
 
-**Call relations**: Constructed inside `PolicyParser::parse` and then exposed to builtin functions through `Evaluator.extra`.
+**Call relations**: PolicyParser::parse calls this before evaluating the policy script. The built-in policy functions then add information to this builder as the script describes rules.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -1989,11 +2015,11 @@ fn new() -> Self
 fn build(self) -> Result<Policy, regex_lite::Error>
 ```
 
-**Purpose**: Consumes the builder and turns its accumulated declarations into a compiled `Policy`.
+**Purpose**: Turns the collected rule pieces into a final Policy object. This marks the end of policy loading.
 
-**Data flow**: Takes ownership of `self`, extracts the inner `programs`, `forbidden_program_regexes`, and `forbidden_substrings` from their `RefCell`s, and passes them to `Policy::new`, returning its result.
+**Data flow**: It consumes the builder, takes out the accumulated program definitions, forbidden regex rules, and forbidden substrings, and passes them into Policy::new. The result is either a valid Policy or an error from policy construction.
 
-**Call relations**: Called at the end of `PolicyParser::parse` after Starlark evaluation has finished populating the builder.
+**Call relations**: PolicyParser::parse calls this after the Starlark policy has finished running. It is the handoff point from temporary collection to the Policy used by the rest of the system.
 
 *Call graph*: 1 external calls (new).
 
@@ -2004,11 +2030,11 @@ fn build(self) -> Result<Policy, regex_lite::Error>
 fn add_program_spec(&self, program_spec: ProgramSpec)
 ```
 
-**Purpose**: Registers one parsed `ProgramSpec` under its program name in the builder's multimap.
+**Purpose**: Adds one allowed-program rule to the policy being built. A program rule says which command name is recognized and what options and arguments are acceptable for it.
 
-**Data flow**: Reads `program_spec.program` to clone the key, logs the full spec with `info!`, mutably borrows `self.programs`, and inserts the spec into the multimap.
+**Data flow**: It receives a ProgramSpec, logs that it is being added, reads the program name from it, and stores the rule under that name. The builder is changed by adding this new program specification.
 
-**Call relations**: Invoked by the `define_program` builtin each time the policy declares a program rule.
+**Call relations**: The define_program Starlark built-in creates a ProgramSpec from the policy script and then uses this builder method to store it. Later, PolicyBuilder::build includes these stored program rules in the final Policy.
 
 *Call graph*: 1 external calls (info!).
 
@@ -2019,11 +2045,11 @@ fn add_program_spec(&self, program_spec: ProgramSpec)
 fn add_forbidden_substrings(&self, substrings: &[String])
 ```
 
-**Purpose**: Appends a batch of forbidden argument substrings to the builder's global list.
+**Purpose**: Adds text fragments that should be forbidden wherever the policy later checks for dangerous command content. This is a simple way to block known bad snippets.
 
-**Data flow**: Mutably borrows `self.forbidden_substrings` and extends it from the provided slice of `String`s.
+**Data flow**: It receives a list of strings from the policy script. It appends those strings to the builder’s existing forbidden-substring list. Nothing is returned, but the builder now contains more blocked text patterns.
 
-**Call relations**: Called by the `forbid_substrings` builtin when the policy declares globally banned substrings.
+**Call relations**: The forbid_substrings Starlark built-in uses this when a policy author names substrings to block. PolicyBuilder::build later carries these strings into the final Policy.
 
 
 ##### `PolicyBuilder::add_forbidden_program_regex`  (lines 111–114)
@@ -2032,11 +2058,11 @@ fn add_forbidden_substrings(&self, substrings: &[String])
 fn add_forbidden_program_regex(&self, regex: Regex, reason: String)
 ```
 
-**Purpose**: Stores one compiled forbidden-program regex and its explanatory reason.
+**Purpose**: Adds one forbidden program-name pattern, along with a human-readable reason. A regular expression is a text pattern used to match many possible strings, not just one exact name.
 
-**Data flow**: Mutably borrows `self.forbidden_program_regexes` and pushes a new `ForbiddenProgramRegex { regex, reason }`.
+**Data flow**: It receives an already-compiled regular expression and a reason string. It wraps them together as a ForbiddenProgramRegex and appends that rule to the builder. The builder is changed by gaining another forbidden pattern.
 
-**Call relations**: Called by the `forbid_program_regex` builtin after the regex string has been compiled successfully.
+**Call relations**: The forbid_program_regex Starlark built-in compiles the pattern text and then calls this method to store it. When PolicyBuilder::build runs, these stored regex rules become part of the final Policy.
 
 
 ##### `policy_builtins`  (lines 118–222)
@@ -2045,20 +2071,22 @@ fn add_forbidden_program_regex(&self, regex: Regex, reason: String)
 fn policy_builtins(builder: &mut GlobalsBuilder)
 ```
 
-**Purpose**: Defines the Starlark builtin functions that make up the policy DSL: program declarations, global forbids, and option constructors.
+**Purpose**: Defines the small set of functions policy authors are allowed to call from Starlark. These functions are the policy language: define_program, forbid_substrings, forbid_program_regex, opt, and flag.
 
-**Data flow**: Receives a mutable `GlobalsBuilder` and registers nested builtin functions. `define_program` reads typed Starlark arguments, normalizes missing lists/booleans to defaults, builds a deduplicated `HashMap<String, Opt>`, constructs a `ProgramSpec`, retrieves the attached `PolicyBuilder` from `eval.extra`, and stores the spec. `forbid_substrings` and `forbid_program_regex` retrieve the same builder and append global rules, compiling regex text in the latter case. `opt` and `flag` transform Starlark declarations into `Opt` values using `OptMeta` and `ArgMatcher::arg_type()`.
+**Data flow**: It adds policy-specific commands to Starlark’s global environment. When the policy script calls define_program, the inputs from the script are converted into Rust data such as ProgramSpec, Opt, and ArgMatcher values, duplicate option names are rejected, and the current PolicyBuilder is updated. forbid_substrings adds blocked text snippets. forbid_program_regex compiles a pattern and stores it with its reason. opt and flag create option descriptions that define_program can use.
 
-**Call relations**: Installed into the Starlark globals by `PolicyParser::parse`; these builtins are invoked by evaluated policy source and are the only sanctioned way for policy code to mutate the builder.
+**Call relations**: PolicyParser::parse registers these built-ins before running the policy script. During script evaluation, these functions are the controlled doorway from Starlark into Rust: they collect policy facts into the PolicyBuilder, which PolicyParser::parse later turns into the final Policy.
 
 
 ### `execpolicy-legacy/src/arg_resolver.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `policy check / argument validation`
 
-This file implements the legacy argument-binding algorithm used when checking whether an exec call conforms to a policy. `PositionalArg` stores the original argument index and string value so later errors and matched results preserve source positions. The main function, `resolve_observed_args_with_patterns`, first calls `partition_args` to divide the declared matcher list into fixed-width prefix patterns, an optional single vararg pattern, and fixed-width suffix patterns, while also precomputing how many observed arguments the prefix and suffix must consume.
+This file is like the seating plan for command-line arguments. A policy may say, for example, “the first argument is a file, then there may be many labels, then the last argument is an output path.” The code here lines up the real arguments with those expected patterns.
 
-Matching then proceeds in three phases. First, it slices the observed arguments for the prefix using `get_range_checked`, requires each prefix pattern to have exact cardinality, and constructs `MatchedArg` values with `MatchedArg::new`, which validates each string against the pattern’s derived `ArgType`. Second, if a vararg pattern exists, it binds all arguments between the consumed prefix and the reserved suffix tail; `AtLeastOne` rejects an empty middle section, `ZeroOrMore` accepts zero or more, and `One` is treated as an internal invariant violation because fixed-width patterns should never become the vararg slot. Third, it matches the suffix against the remaining tail slice in the same exact-cardinality manner. The function returns structured errors for too few args, overlapping prefix/suffix ranges, multiple vararg patterns, invalid slice bounds, or leftover unmatched arguments. `get_range_checked` centralizes slice-bound validation so these failures become domain errors instead of panics.
+The main challenge is variable-length arguments: one pattern may accept many values, like “zero or more files” or “at least one option.” The resolver first splits the patterns into three parts: fixed patterns before the variable part, the one variable pattern if there is one, and fixed patterns after it. Then it matches the beginning arguments to the prefix, reserves enough arguments for the suffix, and gives whatever remains in the middle to the variable pattern.
+
+Along the way it checks for policy mistakes and user mistakes. It rejects policies with more than one variable-length pattern, reports when there are not enough arguments, catches overlap between prefix and suffix, and reports extra arguments that no pattern claimed. For each successful match it creates a MatchedArg, which records the original argument position, the expected argument type, and the value. This matters because later policy checks need to know not just the raw text, but what role each argument was meant to play.
 
 #### Function details
 
@@ -2072,11 +2100,11 @@ fn resolve_observed_args_with_patterns(
 ) -> Result<Vec<MatchedArg>>
 ```
 
-**Purpose**: Binds a concrete argument vector to a declared matcher sequence and returns validated `MatchedArg` entries in positional order. It is the main legacy policy argument-resolution routine.
+**Purpose**: This is the main resolver. It takes the arguments observed for a program and the patterns allowed by policy, then tries to pair each real argument with the correct pattern and produce validated MatchedArg records.
 
-**Data flow**: Inputs are the program name, a `Vec<PositionalArg>`, and a pattern list `&Vec<ArgMatcher>`. It partitions the patterns, slices the observed args into prefix/middle/suffix regions with `get_range_checked`, converts each bound argument through `pattern.arg_type()`, validates and wraps it with `MatchedArg::new`, and accumulates the results. It returns `Ok(Vec<MatchedArg>)` on a full match or a domain `Error` for invariant violations, insufficient args, empty required varargs, overlapping ranges, out-of-bounds slices, or extra unmatched arguments.
+**Data flow**: It receives a program name, a list of positional arguments, and a list of argument matchers. First it asks partition_args to split the matchers into fixed prefix patterns, one possible variable-length middle pattern, and fixed suffix patterns. It then safely slices the observed arguments with get_range_checked, creates MatchedArg values for each matched argument, and returns the full list. If the arguments do not fit, it returns a specific error, such as not enough arguments, too many arguments, a missing required variable argument, or an internal range/cardinality problem.
 
-**Call relations**: This function is called by higher-level policy checking code. Internally it delegates structural preprocessing to `partition_args` and safe slicing to `get_range_checked`, then performs the actual binding and validation loop itself.
+**Call relations**: This function is called by check when the system is deciding whether an observed command matches an execution policy. It relies on partition_args to understand the shape of the pattern list before matching begins, and on get_range_checked whenever it needs a safe section of the argument list. For every successful pairing, it hands the raw value and expected type to MatchedArg::new so the rest of the policy checker can work with typed matched arguments instead of loose strings.
 
 *Call graph*: calls 3 internal fn (get_range_checked, partition_args, new); called by 1 (check); 1 external calls (new).
 
@@ -2087,11 +2115,11 @@ fn resolve_observed_args_with_patterns(
 fn partition_args(program: &str, arg_patterns: &Vec<ArgMatcher>) -> Result<ParitionedArgs>
 ```
 
-**Purpose**: Splits the declared matcher list into fixed-width prefix patterns, one optional vararg pattern, and fixed-width suffix patterns. It also counts how many observed arguments the fixed sections must consume.
+**Purpose**: This helper sorts the policy’s argument patterns into the fixed part before a variable-length pattern, the variable-length pattern itself, and the fixed part after it. It also counts how many real arguments the fixed prefix and suffix require.
 
-**Data flow**: Takes the program name and matcher vector reference, initializes a default `ParitionedArgs`, and iterates the patterns in order. Exact-cardinality patterns are cloned into either the prefix or suffix list depending on whether a vararg has been seen; the first variable-cardinality pattern becomes `vararg_pattern` and flips subsequent exact patterns into the suffix; a second variable-cardinality pattern returns `Error::MultipleVarargPatterns`. On success it returns the populated `ParitionedArgs`.
+**Data flow**: It receives the program name and the list of argument matchers. It walks through the patterns in order. Exact-size patterns go into the prefix until a variable-length pattern is found; after that, exact-size patterns go into the suffix. The first variable-length pattern is saved as the middle pattern. If a second variable-length pattern appears, it returns an error because the resolver would not know how to divide the arguments between two open-ended patterns.
 
-**Call relations**: Only `resolve_observed_args_with_patterns` calls this helper. It performs the one-time structural analysis that lets the main resolver compute the middle vararg span without backtracking.
+**Call relations**: resolve_observed_args_with_patterns calls this before doing any matching. The returned split tells the resolver how many arguments must be kept for the fixed beginning and ending, and which pattern, if any, should receive the flexible middle section.
 
 *Call graph*: called by 1 (resolve_observed_args_with_patterns); 1 external calls (default).
 
@@ -2102,24 +2130,26 @@ fn partition_args(program: &str, arg_patterns: &Vec<ArgMatcher>) -> Result<Parit
 fn get_range_checked(vec: &[T], range: std::ops::Range<usize>) -> Result<&[T]>
 ```
 
-**Purpose**: Safely converts a requested index range into a slice, returning domain errors instead of panicking on invalid bounds. It is a small guardrail around Rust slice indexing.
+**Purpose**: This small safety helper returns a slice of a list only if the requested start and end positions make sense. It turns bad ranges into clear project errors instead of risking a crash.
 
-**Data flow**: Accepts a slice `&[T]` and a `Range<usize>`. If `start > end` it returns `Error::RangeStartExceedsEnd`; if `end > vec.len()` it returns `Error::RangeEndOutOfBounds`; otherwise it returns `Ok(&vec[range])`.
+**Data flow**: It receives a list and a requested range. If the start is after the end, it returns a RangeStartExceedsEnd error. If the end goes past the list length, it returns a RangeEndOutOfBounds error. Otherwise it returns the requested section of the list without changing the list.
 
-**Call relations**: The main resolver calls this repeatedly before indexing prefix, vararg, suffix, and extra-argument regions. Centralizing the checks keeps the matching algorithm explicit and panic-free.
+**Call relations**: resolve_observed_args_with_patterns calls this whenever it needs the prefix, variable-length middle, suffix, or unexpected extra arguments. This keeps the main matching logic readable while centralizing the boundary checks in one place.
 
 *Call graph*: called by 1 (resolve_observed_args_with_patterns); 1 external calls (len).
 
 
 ### `execpolicy-legacy/src/program.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `command validation and policy self-checking`
 
-This file contains the heart of command validation. `ProgramSpec` describes one acceptable shape for a program invocation: exact program name, optional concrete `system_path` candidates, option parsing modes, a map of allowed options (`HashMap<String, Opt>`), positional argument patterns (`Vec<ArgMatcher>`), an optional `forbidden` reason that converts a successful parse into a denial, a precomputed `required_options` set, and embedded positive/negative example lists for policy QA. `ProgramSpec::new` derives `required_options` from `allowed_options` once so checks do not need to recompute it.
+This file is the heart of deciding whether a command is allowed for a particular program. A `ProgramSpec` is like a checklist for one executable: its name, where it may be found on the system path, which options are allowed, which options are required, what normal arguments should look like, and whether the whole program is forbidden for a stated reason.
 
-`ProgramSpec::check` walks `exec_call.args` left to right, maintaining `expecting_option_value` state for options whose `OptMeta` requires a following value. It rejects unsupported `--`, unknown options, missing option values, and the case where an option expecting a value is followed by another option token. Recognized flags become `MatchedFlag`; recognized valued options become `MatchedOpt`; non-option tokens become `PositionalArg` with original index preserved. After the scan, it resolves positional arguments against `self.arg_patterns` using `resolve_observed_args_with_patterns`, then verifies that all required options were present by comparing matched option names against `required_options`. A successful parse yields `ValidExec`; if the spec itself is marked forbidden, the result is `MatchedExec::Forbidden { cause: Forbidden::Exec, reason }`, otherwise `MatchedExec::Match`.
+The main work happens when an `ExecCall` arrives. An `ExecCall` is the observed command someone wants to run: a program plus its command-line arguments. `ProgramSpec::check` walks through those arguments from left to right. It separates plain arguments from options, records simple flags, and makes sure options that need a value actually get one. If it sees an unknown option, a missing value, or a not-yet-supported `--` marker, it returns an error instead of approving the command.
 
-The two verification helpers replay the embedded `should_match` and `should_not_match` examples through `check`, collecting structured violations for policy authors.
+After the basic option parsing, it asks the argument resolver to match the remaining positional arguments against the allowed argument patterns. Then it confirms that every required option was present. If everything fits, it builds a `ValidExec`, which is the cleaned-up, trusted version of the command. If the spec says the program is forbidden, it returns a forbidden result with the reason instead of a normal match.
+
+The file also supports self-checking rule files: “should match” examples must pass, and “should not match” examples must fail.
 
 #### Function details
 
@@ -2135,11 +2165,11 @@ fn new(
         arg_patterns: Ve
 ```
 
-**Purpose**: Constructs a `ProgramSpec` and precomputes the set of required option names from the supplied allowed-options map.
+**Purpose**: Creates a complete rulebook for one program. It also precomputes which options are required, so later checks can quickly tell whether a command forgot any mandatory option.
 
-**Data flow**: Takes ownership of all spec fields, iterates `allowed_options` to collect keys whose `Opt.required` is true into a `HashSet<String>`, and returns a `ProgramSpec` containing both the original map and the derived `required_options`.
+**Data flow**: It receives the program name, allowed system paths, option behavior settings, the allowed options, argument patterns, an optional forbidden reason, and example argument lists. It scans the allowed options, collects the names marked as required, and stores everything inside a new `ProgramSpec`. The result is a ready-to-use policy object for that program.
 
-**Call relations**: Called by the policy parser's `define_program` builtin when translating a policy declaration into an executable spec.
+**Call relations**: This is the setup step for the rest of the file. Once a `ProgramSpec` has been built, callers can use `ProgramSpec::check` to test real commands and can use the verification functions to test the examples stored inside the spec.
 
 
 ##### `ProgramSpec::check`  (lines 94–195)
@@ -2148,11 +2178,11 @@ fn new(
 fn check(&self, exec_call: &ExecCall) -> Result<MatchedExec>
 ```
 
-**Purpose**: Parses one `ExecCall` according to this program spec and either returns a validated execution shape or a precise policy error.
+**Purpose**: Decides whether one requested command line fits this program’s rules. It turns a raw command into either a trusted `ValidExec`, a forbidden result with a reason, or a clear error explaining what was wrong.
 
-**Data flow**: Reads `self.allowed_options`, `self.arg_patterns`, `self.required_options`, `self.system_path`, and `self.forbidden`, then scans `exec_call.args` in order. It accumulates `MatchedFlag`, `MatchedOpt`, and positional `PositionalArg` values while tracking whether the previous option requires a value. It returns early on malformed option sequences or unknown options. After scanning, it resolves positional args with `resolve_observed_args_with_patterns`, computes the set of matched option names, compares it against `required_options`, and may return `MissingRequiredOptions`. On success it builds a `ValidExec`; if `self.forbidden` is `Some`, it wraps that exec in `MatchedExec::Forbidden`, otherwise in `MatchedExec::Match`.
+**Data flow**: It takes an `ExecCall`, which contains a program and its raw argument strings. It reads each argument in order, sorting them into flags, options with values, and plain positional arguments. If an option needs a value, it treats the next argument as that value and rejects the command if the next item is another option or if no value appears. It rejects unknown options and unsupported `--` usage. Then it sends the collected positional arguments to `resolve_observed_args_with_patterns`, which matches them against the allowed argument patterns. After that, it compares the seen options with the required options. If all checks pass, it builds a `ValidExec`; if this program spec is marked forbidden, it wraps that valid command in a forbidden result instead of approving it.
 
-**Call relations**: Invoked by `Policy::check` when trying candidate specs for a program name, and by the example-verification helpers in this same file. It delegates positional-pattern matching to `resolve_observed_args_with_patterns` and constructors for matched option/arg records.
+**Call relations**: This is the central checker used by the file. `ProgramSpec::verify_should_match_list` calls it for examples that ought to pass, and `ProgramSpec::verify_should_not_match_list` calls it for examples that ought to fail. Inside the check, it hands positional arguments to `resolve_observed_args_with_patterns` because argument matching is handled by that separate resolver, and it creates matched option records so the final `ValidExec` contains structured, validated command data rather than raw strings.
 
 *Call graph*: calls 2 internal fn (resolve_observed_args_with_patterns, new); called by 2 (verify_should_match_list, verify_should_not_match_list); 3 external calls (new, new, new).
 
@@ -2163,11 +2193,11 @@ fn check(&self, exec_call: &ExecCall) -> Result<MatchedExec>
 fn verify_should_match_list(&self) -> Vec<PositiveExampleFailedCheck>
 ```
 
-**Purpose**: Checks every positive example attached to the spec and records those that fail unexpectedly.
+**Purpose**: Tests the positive examples stored in the program spec. These are example commands that the policy author says should be accepted.
 
-**Data flow**: Creates an empty violations vector, then for each `good` argv list in `self.should_match` constructs an `ExecCall` using `self.program` and `good.clone()`. It calls `self.check(&exec_call)` and, on error, pushes a `PositiveExampleFailedCheck { program, args, error }`. The final vector is returned.
+**Data flow**: It reads each argument list from `should_match` and turns it into an `ExecCall` for this program. It passes that command to `ProgramSpec::check`. If the check succeeds, nothing is recorded. If the check returns an error, it creates a `PositiveExampleFailedCheck` containing the program, the example arguments, and the error. The output is a list of all positive examples that unexpectedly failed.
 
-**Call relations**: Called by `Policy::check_each_good_list_individually` during policy self-validation; it uses `ProgramSpec::check` as the oracle.
+**Call relations**: This function is a policy sanity check. It relies on `ProgramSpec::check` as the real source of truth, so it does not duplicate the validation rules. It is useful when loading or testing policy definitions: if a supposed good example fails, the rulebook or the example is probably wrong.
 
 *Call graph*: calls 1 internal fn (check); 1 external calls (new).
 
@@ -2178,22 +2208,26 @@ fn verify_should_match_list(&self) -> Vec<PositiveExampleFailedCheck>
 fn verify_should_not_match_list(&self) -> Vec<NegativeExamplePassedCheck>
 ```
 
-**Purpose**: Checks every negative example attached to the spec and records those that pass unexpectedly.
+**Purpose**: Tests the negative examples stored in the program spec. These are example commands that the policy author says should be rejected.
 
-**Data flow**: Creates an empty violations vector, then for each `bad` argv list in `self.should_not_match` constructs an `ExecCall` and calls `self.check(&exec_call)`. If the result is `Ok`, it pushes `NegativeExamplePassedCheck { program, args }`. It returns the accumulated violations.
+**Data flow**: It reads each argument list from `should_not_match` and turns it into an `ExecCall` for this program. It passes that command to `ProgramSpec::check`. If the check fails, that is expected and nothing is recorded. If the check succeeds, it creates a `NegativeExamplePassedCheck` containing the program and arguments. The output is a list of bad examples that were unexpectedly accepted.
 
-**Call relations**: Called by `Policy::check_each_bad_list_individually` for policy QA, again using `ProgramSpec::check` to determine whether an example incorrectly matches.
+**Call relations**: This function is the mirror image of `ProgramSpec::verify_should_match_list`. It calls `ProgramSpec::check` to use the same validation path as real commands. It helps catch policies that are too loose, because any negative example that passes shows a command the current rules would allow even though the author expected it to be blocked.
 
 *Call graph*: calls 1 internal fn (check); 1 external calls (new).
 
 
 ### `execpolicy-legacy/src/policy.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `request handling and policy validation`
 
-This file defines `Policy`, the compiled form produced by the parser. Its state has three layers: a `MultiMap<String, ProgramSpec>` keyed by program name so multiple specs can exist for one executable, a list of `ForbiddenProgramRegex` entries that immediately ban matching program names with a human-readable reason, and an optional compiled regex that matches any forbidden substring inside arguments. `Policy::new` builds that substring regex once up front by escaping each configured substring and joining them with `|`; if no substrings are configured, it stores `None` to avoid unnecessary regex work.
+This file is the heart of the legacy execution-policy checker. Its job is to look at an attempted command, made of a program name and its arguments, and compare it with a stored set of rules. Without this file, the system would have rule data but no central place that turns those rules into a yes-or-no decision.
 
-`Policy::check` enforces policy in a strict order. It first scans forbidden program regexes and returns `MatchedExec::Forbidden` with `Forbidden::Program` if the executable name matches. It then scans every argument against the compiled forbidden-substring regex and returns `Forbidden::Arg` if any argument contains a banned fragment. Only after those global bans pass does it look up program specs by exact program name. It tries each `ProgramSpec` in insertion order, returning the first successful `MatchedExec`; if all specs fail, it preserves the last error encountered, defaulting to `Error::NoSpecForProgram` when no spec exists at all. The two verification helpers iterate every stored spec and aggregate violations from embedded positive and negative example lists, which is useful for validating policy quality rather than checking a live command.
+The `Policy` struct is like a security desk with three lists. First, it has allowed program specifications, grouped by program name. Second, it has regular expressions, which are text patterns, for program names that are always forbidden. Third, it can build one combined pattern for argument text that must never appear.
+
+When a command is checked, the strict bans are tried first. If the program name matches a forbidden pattern, the command is rejected right away. Then every argument is scanned for forbidden pieces of text. Only if those checks pass does the policy look up the detailed rule list for that program and ask each matching `ProgramSpec` whether the command fits. The first successful match wins. If none match, the last useful error is returned, such as “no rule for this program.”
+
+The file also includes two self-check methods. They walk through all program rules and test the policy author’s positive and negative examples, helping catch mistakes in the rulebook itself.
 
 #### Function details
 
@@ -2207,11 +2241,11 @@ fn new(
     ) -> std::result::Result<Self, Re
 ```
 
-**Purpose**: Constructs a compiled `Policy`, precompiling the forbidden-substring matcher when needed.
+**Purpose**: Builds a `Policy` from already-parsed rule data. It also turns the list of forbidden argument substrings into one reusable regular expression, so later checks can scan arguments quickly.
 
-**Data flow**: Takes ownership of `programs`, `forbidden_program_regexes`, and `forbidden_substrings`. If the substring list is empty it stores `None`; otherwise it escapes each substring, joins them with `|`, compiles a `Regex` from the grouped pattern, and stores it in `forbidden_substrings_pattern`. It returns either the assembled `Policy` or a regex compilation error.
+**Data flow**: It receives the allowed program rules, the forbidden program-name patterns, and a list of forbidden text snippets for arguments. If there are no forbidden snippets, it stores no argument pattern. If there are snippets, it escapes them so they are treated as literal text, joins them into one pattern, and tries to compile that pattern. The result is either a ready-to-use `Policy` or a regular-expression error if the pattern could not be built.
 
-**Call relations**: Called by `PolicyBuilder::build` after Starlark evaluation has collected all policy declarations.
+**Call relations**: This is the setup step for the policy object. It calls the regular expression constructor to prepare the forbidden-substring scanner, then stores all rule lists together so later calls to `Policy::check` and the example-checking methods can use the same prepared policy.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -2222,11 +2256,11 @@ fn new(
 fn check(&self, exec_call: &ExecCall) -> Result<MatchedExec>
 ```
 
-**Purpose**: Evaluates one `ExecCall` against global forbids and then the set of program-specific specs.
+**Purpose**: Decides what happens to one attempted execution. It returns a successful match when the command is allowed by a rule, a forbidden result when it hits a ban, or an error when no rule accepts it.
 
-**Data flow**: Reads `exec_call.program` and `exec_call.args`. It first tests the program against each stored forbidden regex and may return `MatchedExec::Forbidden { cause: Forbidden::Program, reason }`. Next it tests each arg against `forbidden_substrings_pattern` and may return `Forbidden::Arg`. If neither global rule fires, it looks up all `ProgramSpec`s for the program name, tries `spec.check(exec_call)` on each, returns the first success, and otherwise returns the last error seen or `Error::NoSpecForProgram` if no spec was found.
+**Data flow**: It receives an `ExecCall`, which contains a program name and its argument list. First it compares the program name with every forbidden program pattern. If one matches, it returns a forbidden result explaining that the program itself is banned. Next it scans each argument for forbidden substrings; if one is found, it returns a forbidden result explaining which argument caused the problem. If those checks pass, it looks up all specifications stored for that program name and asks each one to check the command. The first successful specification result is returned. If all fail, it returns the last error seen, or a “no spec for program” error if there were no rules for that program.
 
-**Call relations**: This is the main library entry for policy evaluation. It is called directly by the CLI checker and by `ExecvChecker::r#match`, and it delegates detailed argv interpretation to `ProgramSpec::check`.
+**Call relations**: This is the main decision point other parts of the system would call when a command is about to run. It uses the stored forbidden-pattern lists directly, looks up candidate program rules through the multimap, and then hands the detailed argument matching work to each `ProgramSpec`. It clones pieces of the command only when it needs to include them in the returned explanation.
 
 *Call graph*: 3 external calls (get_vec, clone, format!).
 
@@ -2237,11 +2271,11 @@ fn check(&self, exec_call: &ExecCall) -> Result<MatchedExec>
 fn check_each_good_list_individually(&self) -> Vec<PositiveExampleFailedCheck>
 ```
 
-**Purpose**: Runs every program spec's positive example list and collects examples that unexpectedly fail.
+**Purpose**: Checks the positive examples written inside every program rule. A positive example is a command that the policy author expected to match; this function reports any that fail.
 
-**Data flow**: Creates an empty `Vec<PositiveExampleFailedCheck>`, iterates all `(program, spec)` pairs from `self.programs.flat_iter()`, extends the vector with each spec's `verify_should_match_list()` output, and returns the accumulated violations.
+**Data flow**: It starts with an empty list of violations. It walks through every stored program specification, asks that specification to verify its “should match” examples, and adds any failures to the list. The output is a collection of positive examples that did not pass their rule.
 
-**Call relations**: Used for policy self-validation rather than live command checking; it delegates the actual example execution to each `ProgramSpec`.
+**Call relations**: This is a policy self-test helper rather than a command-decision function. It walks through all stored rules using the multimap’s flat iterator and delegates the actual example testing to each `ProgramSpec`, collecting the results into one report.
 
 *Call graph*: 2 external calls (flat_iter, new).
 
@@ -2252,11 +2286,11 @@ fn check_each_good_list_individually(&self) -> Vec<PositiveExampleFailedCheck>
 fn check_each_bad_list_individually(&self) -> Vec<NegativeExamplePassedCheck>
 ```
 
-**Purpose**: Runs every program spec's negative example list and collects examples that unexpectedly pass.
+**Purpose**: Checks the negative examples written inside every program rule. A negative example is a command that the policy author expected not to match; this function reports any that accidentally pass.
 
-**Data flow**: Creates an empty `Vec<NegativeExamplePassedCheck>`, iterates all stored specs via `flat_iter()`, extends the vector with each spec's `verify_should_not_match_list()` output, and returns the combined violations.
+**Data flow**: It starts with an empty list of violations. It visits every stored program specification, asks that specification to verify its “should not match” examples, and appends any mistakes it finds. The output is a collection of negative examples that were accepted even though they were meant to be rejected.
 
-**Call relations**: Like the positive-example checker, this supports policy QA and delegates per-spec evaluation to `ProgramSpec`.
+**Call relations**: This complements the positive-example self-test. It iterates over every program specification in the policy and hands off to each `ProgramSpec` for the detailed check, then returns a combined list that can be shown to the policy author or a test runner.
 
 *Call graph*: 2 external calls (flat_iter, new).
 
@@ -2266,11 +2300,15 @@ This final legacy checker performs post-match validation of filesystem access an
 
 ### `execpolicy-legacy/src/execv_checker.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `command validation before execution`
 
-This file wraps a parsed `Policy` in `ExecvChecker` and adds runtime checks that the policy alone cannot decide. `ExecvChecker::r#match` delegates to policy matching and returns a `MatchedExec`; `ExecvChecker::check` then consumes a `ValidExec` and inspects every matched positional argument and option value by iterating over both `valid_exec.args` and `valid_exec.opts` as `(ArgType, String)` pairs. For `ArgType::ReadableFile` and `ArgType::WriteableFile`, it converts the supplied string into an absolute `PathBuf` with `ensure_absolute_path`, using `cwd` for relative paths and returning `CannotCheckRelativePath` if no working directory is available. It then enforces a prefix invariant: the resolved path must start with at least one canonical folder in the corresponding allowlist, otherwise it returns `ReadablePathNotInReadableFolders` or `WriteablePathNotInWriteableFolders` carrying the offending file and the full folder list.
+This file provides `ExecvChecker`, a checker that sits between a requested command and actually running it. First, it asks a policy whether the command shape is allowed: for example, whether `cp` is expected to have one readable file argument and one writeable file argument. Then it checks the real paths in those arguments against folder lists supplied by the caller.
 
-Non-file argument kinds are intentionally ignored here because they were already validated structurally during policy matching. After argument checks pass, the function resolves the executable string to return: it starts with `valid_exec.program`, then scans `valid_exec.system_path` and picks the first entry that exists and is executable according to `is_executable_file` (Unix checks any execute bit via `PermissionsExt`; Windows currently accepts any regular file). Tests exercise missing folder allowlists, folder-vs-file arguments, and parent-directory rejection, and rely on the documented precondition that readable/writeable folder inputs are already canonicalized by the caller.
+The key idea is simple: a command may be allowed in general, but its file arguments still need boundaries. A kitchen knife is allowed in a kitchen, but not everywhere. Here, readable files must be under approved readable folders, and writeable files must be under approved writeable folders.
+
+The checker also turns relative paths into absolute paths using the current working directory. This matters because `../secret` might look small but point outside the safe area. If there is no current working directory for a relative path, the checker refuses to guess.
+
+Finally, it chooses the actual program path to run. If the policy lists possible system paths, it picks the first one that exists and is executable. The tests build a fake `cp` command and verify that the checker accepts safe inputs and rejects paths outside the allowed folders.
 
 #### Function details
 
@@ -2280,11 +2318,11 @@ Non-file argument kinds are intentionally ignored here because they were already
 fn new(execv_policy: Policy) -> Self
 ```
 
-**Purpose**: Constructs an `ExecvChecker` by storing the parsed `Policy` that will be used for later matching and validation.
+**Purpose**: Creates a new command checker from an execution policy. Use this when the policy has already been parsed and you want an object that can apply it to requested commands.
 
-**Data flow**: Takes ownership of a `Policy` as `execv_policy` and returns `Self { execv_policy }`. It does not read external state or perform validation.
+**Data flow**: It receives a `Policy`, stores it inside a new `ExecvChecker`, and returns that checker. Nothing is checked yet; this only prepares the checker for later use.
 
-**Call relations**: Used by test setup to create the checker instance before exercising matching and path validation behavior.
+**Call relations**: The test helper builds a policy from a small policy text, then calls this constructor so the tests can exercise the real checker behavior.
 
 *Call graph*: called by 1 (setup).
 
@@ -2295,11 +2333,11 @@ fn new(execv_policy: Policy) -> Self
 fn r#match(&self, exec_call: &ExecCall) -> Result<MatchedExec>
 ```
 
-**Purpose**: Runs the policy matcher against an `ExecCall` and returns the policy-level result unchanged.
+**Purpose**: Compares a requested command against the stored policy to see whether it matches an allowed command pattern. This is the first safety step before checking folders and file paths.
 
-**Data flow**: Reads `self.execv_policy` and borrows the incoming `ExecCall`; forwards both into `Policy::check` and returns its `Result<MatchedExec>` directly.
+**Data flow**: It receives an `ExecCall`, which contains the requested program name and arguments. It passes that request to the policy, and returns the policy's answer: either a matched, structured command or an error/no-match result.
 
-**Call relations**: This is the first phase before `ExecvChecker::check`; callers invoke it when they need to classify a raw command line into matched, forbidden, or error outcomes.
+**Call relations**: Callers use this before `ExecvChecker::check`. In the tests, the requested `cp` command is matched first, and only the resulting validated command shape is passed on for folder permission checks.
 
 *Call graph*: 1 external calls (check).
 
@@ -2316,11 +2354,11 @@ fn check(
     ) -> Result<String>
 ```
 
-**Purpose**: Validates a previously matched `ValidExec` against runtime filesystem constraints and resolves the executable path to run.
+**Purpose**: Checks that the file arguments of an already matched command stay inside the folders the caller allowed for reading and writing. It also chooses the executable program path that should be used.
 
-**Data flow**: Consumes `valid_exec`, reads `cwd`, `readable_folders`, and `writeable_folders`, then iterates through all matched args and opts. File-typed values are converted to absolute `PathBuf`s via `ensure_absolute_path` and checked for prefix membership in the corresponding folder slice; failures return specific `Error` variants. After all values pass, it scans `valid_exec.system_path`, replacing the initial `valid_exec.program` string with the first executable candidate found by `is_executable_file`, and returns that final program string.
+**Data flow**: It receives a `ValidExec`, an optional current working directory, readable folders, and writeable folders. For each argument or option marked as a readable or writeable file, it converts the path to an absolute path and confirms it starts inside one of the matching allowed folders. Arguments that are not file paths are ignored for folder checks. Then it looks through the policy's possible system paths and returns the first one that is an executable file, or falls back to the program name if none is found. If any path is outside its allowed folders, it returns a clear error instead.
 
-**Call relations**: Called after a successful policy match when the caller wants stronger guarantees about file access. Internally it delegates path normalization to `ensure_absolute_path`, executable probing to `is_executable_file`, and uses the `check_file_in_folders!` macro to enforce allowlist membership.
+**Call relations**: This is the main enforcement step after `ExecvChecker::r#match` has produced a `ValidExec`. It relies on `ensure_absolute_path` so relative paths cannot hide where they really point, uses the folder-checking macro to reject paths outside the allowed areas, and calls `is_executable_file` when selecting a concrete program path.
 
 *Call graph*: calls 2 internal fn (ensure_absolute_path, is_executable_file); 1 external calls (check_file_in_folders!).
 
@@ -2331,11 +2369,11 @@ fn check(
 fn ensure_absolute_path(path: &str, cwd: &Option<OsString>) -> Result<PathBuf>
 ```
 
-**Purpose**: Turns a path string into an owned absolute `PathBuf`, using the provided current working directory for relative inputs.
+**Purpose**: Turns a file path into an absolute, cleaned-up path so it can be safely compared with allowed folders. This prevents misleading relative paths such as `../something` from bypassing folder checks.
 
-**Data flow**: Builds a `PathBuf` from `path`. If it is relative, it reads `cwd`: with `Some`, it calls `absolutize_from`; with `None`, it returns `CannotCheckRelativePath { file }`. If already absolute, it calls `absolutize`. Successful `Cow<Path>` results are converted into owned `PathBuf`s; failures are mapped into `CannotCanonicalizePath { file, error }` using the original string and the underlying error kind.
+**Data flow**: It receives a path string and an optional current working directory. If the path is relative, it combines it with the current working directory; if there is no current working directory, it returns an error. If the path is already absolute, it cleans it directly. The result is a `PathBuf` that represents the path in absolute form, or an error explaining why that could not be done.
 
-**Call relations**: Used only by `ExecvChecker::check` for file-bearing arguments and option values so folder-prefix checks operate on absolute paths.
+**Call relations**: `ExecvChecker::check` calls this for every readable or writeable file argument before comparing it with the approved folder lists. Its output becomes the path that the folder check trusts.
 
 *Call graph*: called by 1 (check); 1 external calls (from).
 
@@ -2346,11 +2384,11 @@ fn ensure_absolute_path(path: &str, cwd: &Option<OsString>) -> Result<PathBuf>
 fn is_executable_file(path: &str) -> bool
 ```
 
-**Purpose**: Checks whether a candidate path on disk should be treated as an executable program.
+**Purpose**: Answers the practical question: does this path point to a file that can be run as a program? This helps the checker pick a real executable from the policy's possible system paths.
 
-**Data flow**: Reads filesystem metadata for the supplied string path. On Unix, it returns true only for regular files with any execute bit set (`mode() & 0o111 != 0`); on Windows, it currently returns true for any regular file. Metadata lookup failure or non-file entries produce `false`.
+**Data flow**: It receives a path string, asks the operating system for information about that path, and returns `true` only if it is a file that appears executable. On Unix-like systems it checks the executable permission bits; on Windows it currently treats any file as executable. If the file does not exist or metadata cannot be read, it returns `false`.
 
-**Call relations**: Called from `ExecvChecker::check` while scanning `ValidExec.system_path` so the checker can prefer a concrete executable path over the bare program name.
+**Call relations**: `ExecvChecker::check` calls this while walking through candidate system paths. The first candidate that passes this test becomes the program path returned to the caller.
 
 *Call graph*: called by 1 (check); 2 external calls (new, metadata).
 
@@ -2361,11 +2399,11 @@ fn is_executable_file(path: &str) -> bool
 fn setup(fake_cp: &Path) -> ExecvChecker
 ```
 
-**Purpose**: Builds a minimal policy containing a single `cp` program spec whose `system_path` points at a temporary executable used by the tests.
+**Purpose**: Builds a small test policy that allows a fake `cp` command with one readable file and one writeable file. It keeps the tests focused on checker behavior instead of repeating policy setup.
 
-**Data flow**: Formats a Starlark policy source string embedding `fake_cp`, parses it with `PolicyParser::new(...).parse().unwrap()`, then wraps the resulting `Policy` in `ExecvChecker::new` and returns it.
+**Data flow**: It receives the path to a fake `cp` executable, writes that path into a policy string, parses the policy, and returns an `ExecvChecker` built from it.
 
-**Call relations**: Invoked by the file's test case to centralize creation of a checker configured with a known executable path.
+**Call relations**: The main test calls this after creating a temporary fake executable. This helper then uses `ExecvChecker::new` to produce the checker that the test will run through several safe and unsafe cases.
 
 *Call graph*: calls 2 internal fn (new, new); 1 external calls (format!).
 
@@ -2376,10 +2414,10 @@ fn setup(fake_cp: &Path) -> ExecvChecker
 fn test_check_valid_input_files() -> Result<()>
 ```
 
-**Purpose**: Exercises the full match-then-check flow for readable/writeable file arguments, including success and several failure modes.
+**Purpose**: Tests the main safety behavior of the checker: safe file paths are accepted, missing folder permissions are rejected, executable lookup works, and parent folders cannot be used to escape the allowed area.
 
-**Data flow**: Creates a temporary directory and fake executable, constructs root/source/dest paths and a `cwd`, then uses `setup` plus `ExecvChecker::r#match` to obtain a `ValidExec`. It repeatedly calls `ExecvChecker::check` with different readable/writeable folder allowlists and asserts exact `Ok` or `Err` values. It also constructs alternate `ExecCall` and `ValidExec` inputs to verify that passing the folder itself is allowed while passing a parent directory is rejected.
+**Data flow**: It creates a temporary directory, places a fake executable there, builds source and destination paths, and creates a checker with the test policy. It matches a `cp` call, then runs `check` with different readable and writeable folder lists. The expected outputs are explicit: errors when folders are missing or too broad in the wrong direction, and success when both file paths are inside approved folders.
 
-**Call relations**: This test drives both public methods and indirectly covers `ensure_absolute_path`, `is_executable_file`, and the folder-prefix macro through realistic command inputs.
+**Call relations**: This test drives the whole flow the way a real caller would: set up policy, match a command with `ExecvChecker::r#match`, then enforce folder boundaries with `ExecvChecker::check`. It also uses `tests::setup` to keep policy construction out of the main test story.
 
 *Call graph*: 8 external calls (default, new, assert_eq!, setup, panic!, create, set_permissions, vec!).

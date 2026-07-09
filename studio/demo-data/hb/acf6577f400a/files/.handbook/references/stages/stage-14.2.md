@@ -1,8 +1,10 @@
 # Execution backends and sandboxed command runtimes  `stage-14.2`
 
-This stage is the system’s execution substrate: it sits below tool handlers, RPC endpoints, and the TUI, and above the OS-specific process and sandbox primitives. Its job is to turn command-like requests—shell, unified-exec, code-mode actions, and apply_patch—into real running processes or controlled filesystem mutations, with streaming I/O, session tracking, approval checks, and sandbox enforcement.
+This stage is the system’s safe command-running workshop. It is used in the main work loop when the assistant needs to run a shell command, edit files with apply_patch, start an interactive program, or pause briefly with the built-in sleep tool. It also provides shared support behind the scenes so those actions work locally, remotely, and across operating systems.
 
-Execution-facing app-server and core orchestration receives command/process requests from clients and tools, converts them into executable plans, and manages interactive lifecycles. Unified-exec sessions and PTY/process backends provide the concrete process objects, PTY or pipe transport, local/remote adapters, and background-job management those plans run on. Patch application adapters specialize that path for model-emitted patches, validating syntax and policy before applying edits through the patch engine. Sandbox selection and Unix launchers decide whether and how Unix commands run under bubblewrap, Landlock, or shell-escalation wrappers. Exec-server filesystem sandbox services supply the matching local, remote, and helper-mediated filesystem backends used during execution. Windows sandbox provisioning and launch internals perform the equivalent setup and process creation on Windows. The directly assigned sleep tool is a lightweight command-like runtime that pauses execution while still integrating with turn history and interruption by new input.
+The command orchestration pieces act like the front desk: they receive requests, check rules, start commands, stream output, accept input, cancel work, and clean up. The unified-exec and PTY/process backends are the engine room, keeping interactive sessions alive through pipes or terminal-like connections. The patch engine is the file-editing arm: it recognizes patch requests, parses them, applies changes, and reports what happened.
+
+Sandbox selection and platform launchers are the safety cage. On Unix they choose Linux or macOS restrictions and handle permission escalation. On Windows they create restricted users, permissions, firewall rules, and process settings. Exec-server filesystem services let local, sandboxed, or remote commands read and write files safely. The sleep tool simply waits, but can be interrupted when new user input arrives.
 
 ## Sub-stages
 
@@ -18,11 +20,15 @@ Execution-facing app-server and core orchestration receives command/process requ
 ### Execution backends and sandboxed command runtimes
 ### `core/src/tools/handlers/sleep.rs`
 
-`domain_logic` · `tool execution during request handling`
+`domain_logic` · `tool execution during a turn`
 
-This file contains both the `sleep` tool specification and its runtime executor. The schema is simple: a single required `duration_ms` number with a hard upper bound of one hour (`MAX_SLEEP_DURATION_MS`). The runtime side is more nuanced. `SleepHandler::handle` accepts only function payloads, parses them into the private `SleepArgs` struct with `deny_unknown_fields`, and rejects durations outside `1..=3_600_000` with a model-facing error.
+This file is the small “pause button” for the tool system. It gives the model a tool named `sleep` that can wait for a number of milliseconds, up to one hour. That is useful when the model needs to delay before continuing, but it must not make the session feel frozen if the user says something new.
 
-On success, the handler records `Instant::now()`, emits a `TurnItem::Sleep` started event carrying the call ID and requested duration, and then subscribes to activity on the current turn via the session’s input queue. If activity is already pending, the sleep is considered immediately interrupted. Otherwise it races a `tokio::time::sleep` future against `activity_rx.changed()` using `tokio::select!`. A successful activity notification interrupts the sleep; a closed activity channel falls back to awaiting the timer to completion. After either path, it emits the completed turn item and returns a text `FunctionToolOutput` reporting elapsed wall-clock seconds to four decimals plus either `Sleep interrupted by new input.` or `Sleep completed.`. The design makes sleep observable in turn history and responsive to user interaction rather than blindly blocking for the full duration.
+The file first describes the tool in a machine-readable way: it has one required input, `duration_ms`, meaning the number of milliseconds to wait. It then implements `SleepHandler`, the object that the larger tool runtime calls when the model asks to use this tool.
+
+When the tool runs, it checks that the request is really a function-style tool call, parses the JSON arguments, and rejects invalid durations. It records the start time, emits a “sleep started” item into the current turn, and subscribes to activity on the input queue. Then it waits for whichever happens first: the requested time passes, or new input appears for the active turn. This is like setting a kitchen timer but also listening for someone at the door; if they knock, you stop waiting.
+
+Finally, it emits a “sleep completed” item and returns text saying how much real wall-clock time passed and whether the sleep finished normally or was interrupted.
 
 #### Function details
 
@@ -32,11 +38,11 @@ On success, the handler records `Instant::now()`, emits a `TurnItem::Sleep` star
 fn create_sleep_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the `sleep` tool specification exposed to the model. The schema advertises a single bounded duration parameter and explains that sleep may end early on new input.
+**Purpose**: Builds the public description of the `sleep` tool so the rest of the system, and ultimately the model, know how to call it. It says the tool needs a `duration_ms` number and explains the allowed range.
 
-**Data flow**: It creates a one-entry `BTreeMap` for `duration_ms`, formatting the maximum allowed value into the field description, then wraps that map in a `ResponsesApiTool` named `sleep`. The returned `ToolSpec` requires `duration_ms`, forbids additional properties, and has no explicit output schema.
+**Data flow**: It starts with the fixed sleep tool name and maximum allowed duration. It creates a JSON-style schema, meaning a structured description of the expected input, then wraps that in a tool specification. The result is a `ToolSpec` that can be registered and shown as an available tool.
 
-**Call relations**: This helper is called by `SleepHandler::spec` so the runtime executor and published schema stay colocated.
+**Call relations**: This helper is used by `SleepHandler::spec` when the tool runtime asks, “What does this tool look like?” It does not run the sleep itself; it only provides the instruction sheet for using the tool.
 
 *Call graph*: calls 2 internal fn (number, object); called by 1 (spec); 4 external calls (from, format!, Function, vec!).
 
@@ -47,11 +53,11 @@ fn create_sleep_tool() -> ToolSpec
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical tool name used to register and dispatch the sleep handler. It keeps the runtime name aligned with the schema builder’s constant.
+**Purpose**: Returns the official name of this tool: `sleep`. The registry uses this name to match a model’s tool request to this handler.
 
-**Data flow**: It reads the `SLEEP_TOOL_NAME` constant and converts it into a `ToolName` via `ToolName::plain`, returning that value.
+**Data flow**: It takes no outside data beyond the handler itself. It turns the fixed string `sleep` into the system’s `ToolName` type and returns it.
 
-**Call relations**: The tool registry calls this method when wiring handlers by name; it pairs with `SleepHandler::spec` and `SleepHandler::handle` as part of the `ToolExecutor` implementation.
+**Call relations**: The tool registry calls this when it needs to identify or look up the handler. It is the label on the drawer; `SleepHandler::handle` is what runs after that drawer has been opened.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -62,11 +68,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Supplies the published tool specification for this handler. It is a thin adapter from the executor trait to the local schema-construction helper.
+**Purpose**: Provides the full tool description for `sleep`, including its input shape and human-readable description. This lets the tool runtime advertise the tool correctly.
 
-**Data flow**: It takes `&self`, calls `create_sleep_tool()`, and returns the resulting `ToolSpec` unchanged.
+**Data flow**: It receives the handler object, calls `create_sleep_tool`, and returns the resulting tool specification unchanged.
 
-**Call relations**: The registry invokes this method during tool registration or schema enumeration; all actual schema assembly is delegated to `create_sleep_tool`.
+**Call relations**: The tool runtime calls this during setup or tool discovery. It delegates the actual construction to `create_sleep_tool` so the schema-building details stay in one place.
 
 *Call graph*: calls 1 internal fn (create_sleep_tool).
 
@@ -77,10 +83,10 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Executes a sleep request, interrupting early if the active turn receives new input, and returns a textual summary of elapsed time. It also emits turn-item lifecycle events so the sleep appears in session history.
+**Purpose**: Runs the actual sleep request. It waits for the requested duration unless fresh input arrives first, then reports how long the wait really lasted.
 
-**Data flow**: It consumes a `ToolInvocation`, destructures out `session`, `turn`, `call_id`, and `payload`, rejects non-function payloads, and parses JSON arguments into `SleepArgs` with `parse_arguments`. After validating `duration_ms`, it records the start time, constructs a `TurnItem::Sleep`, emits a started event, obtains turn state and an activity subscription from `session.input_queue`, and determines interruption either from existing pending activity or by racing a timer against `activity_rx.changed()`. It then emits the completed event, computes elapsed seconds from `Instant`, formats a status message, wraps it in `FunctionToolOutput::from_text`, boxes it with `boxed_tool_output`, and returns it.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, current turn, call id, and payload from the model. It accepts only function-style payloads, parses the JSON arguments into `duration_ms`, checks that the duration is between 1 millisecond and one hour, and records the current time. It then emits a started item, listens for new input, waits either for the timer or for activity, emits a completed item, and returns a text result with elapsed wall-clock time and an interruption message.
 
-**Call relations**: This is the main execution path invoked by the tool runtime when the `sleep` tool is called. It delegates argument parsing to `parse_arguments` and output boxing to `boxed_tool_output`, but owns the control flow around event emission and interruption handling.
+**Call relations**: The tool runtime calls this when the model invokes `sleep`. Inside the flow it uses `parse_arguments` to turn raw JSON into typed arguments, asks the session input queue whether new activity has arrived, emits turn items so the rest of the system can observe the sleep’s lifecycle, and wraps the final text with `boxed_tool_output` so it fits the common tool-output format.
 
 *Call graph*: calls 3 internal fn (from_text, boxed_tool_output, parse_arguments); 9 external calls (pin, from_millis, now, Sleep, format!, pin!, select!, sleep, RespondToModel).

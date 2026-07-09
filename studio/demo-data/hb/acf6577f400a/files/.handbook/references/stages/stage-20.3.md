@@ -1,8 +1,10 @@
 # Session telemetry and feature-specific instrumentation  `stage-20.3`
 
-This stage is cross-cutting instrumentation that sits alongside startup and the main request/turn loop, giving the rest of the system a consistent way to observe what happened in a session without leaking sensitive data. At its center, otel/src/events/session_telemetry.rs provides the session-scoped façade that enriches logs, traces, and metrics with shared identifiers, auth context, model details, and timing tags. core/src/turn_timing.rs adds per-turn latency milestones and phase profiles, while login/src/auth_env_telemetry.rs contributes a privacy-bounded snapshot of auth environment state.
+This stage is behind-the-scenes instrumentation for a running session. It does not make the assistant smarter by itself. Instead, it acts like a dashboard and trip recorder, noting what happened, how long it took, and where problems appeared.
 
-Several files attach that common telemetry model to specific subsystems. app-server/src/app_server_tracing.rs creates standardized request spans for server traffic; core/src/tools/tool_dispatch_trace.rs records tool-dispatch activity into rollout traces; core/src/sandbox_tags.rs summarizes sandbox policy into compact tags. Product-area metrics are centralized in cloud-config/src/metrics.rs, core/src/guardian/metrics.rs, ext/goal/src/metrics.rs, and ext/memories/src/metrics.rs. Memory access is instrumented end to end by memories/read/src/metrics.rs, memories/read/src/usage.rs, core/src/memory_usage.rs, and memories/write/src/metrics.rs. Finally, rollout/src/sqlite_metrics.rs and state/src/telemetry.rs cover lightweight SQLite startup and fallback telemetry.
+The central session telemetry file records session events, results, durations, and safe context. Turn timing adds finer stopwatch data for each assistant reply, such as time to first output and time spent waiting on tools. App-server tracing wraps incoming requests in trace spans, which are linked log sections that let one request be followed across the system. Tool dispatch tracing records tool calls without cluttering the tool runner itself.
+
+Several files add safe labels and counters for specific features. Auth environment telemetry notes which login settings exist without recording secrets. Sandbox tags summarize permission mode. Guardian, cloud-config, goals, and memories files count feature activity and outcomes using stable metric names and labels. Memory usage code detects when commands read memory-related files. Finally, SQLite telemetry records database startup, fallback behavior, counts, and timings, including lightweight metrics for rollout and state startup.
 
 ## Files in this stage
 
@@ -11,13 +13,15 @@ These files establish the shared session-scoped telemetry surface and the core t
 
 ### `login/src/auth_env_telemetry.rs`
 
-`config` · `startup`
+`domain_logic` · `startup/auth setup and telemetry collection`
 
-This file defines `AuthEnvTelemetry`, a compact struct of booleans and optional metadata describing whether key auth-related environment variables are present. The fields cover OpenAI API key presence, Codex API key presence, whether Codex API key env support is enabled by configuration, whether the selected model provider has an env-key configured, whether that provider env var is present, and whether a refresh-token URL override env var is set.
+Authentication often depends on environment variables, which are named settings supplied outside the program, such as API keys. This file acts like a privacy-safe checklist. It asks, “Is an OpenAI API key set?”, “Is a Codex API key set?”, “Did this provider have its own configured key?”, and “Was a refresh-token URL override supplied?” It deliberately stores only yes/no answers, not the actual secrets.
 
-The key privacy design choice is in `collect_auth_env_telemetry`: when a `ModelProviderInfo` contains `env_key`, the code does not copy the actual environment variable name into telemetry. Instead it buckets that fact as `Some("configured")`, while separately checking presence by dereferencing the real env var name only locally. This avoids leaking provider-specific secret names into telemetry payloads. `env_var_present` also treats non-Unicode environment values as present, since the signal of interest is existence/non-emptiness rather than readability.
+The central type, AuthEnvTelemetry, is a small record of those answers. collect_auth_env_telemetry fills in that record by looking at the current process environment and at the selected model provider’s configuration. One important safety detail is that the provider’s environment key name is not copied into telemetry. If a provider key exists, the file records only the word “configured,” avoiding accidental leakage of a sensitive or user-specific string.
 
-`AuthEnvTelemetry::to_otel_metadata` converts the local struct into `codex_otel::AuthEnvTelemetryMetadata` for emission. The included test specifically locks down the bucketing behavior so a configured provider env key never appears verbatim in telemetry.
+env_var_present is the small helper that decides whether an environment variable counts as present. Empty or whitespace-only values do not count. Values that exist but are not valid text still count as present, because the important telemetry question is whether something was supplied.
+
+Finally, to_otel_metadata converts the local record into the format expected by the telemetry system, OpenTelemetry, which is a common way to collect diagnostic signals from software.
 
 #### Function details
 
@@ -27,11 +31,11 @@ The key privacy design choice is in `collect_auth_env_telemetry`: when a `ModelP
 fn to_otel_metadata(&self) -> AuthEnvTelemetryMetadata
 ```
 
-**Purpose**: Converts the local telemetry snapshot into the OpenTelemetry metadata type used by the broader telemetry pipeline.
+**Purpose**: This converts the file’s internal authentication-environment summary into the telemetry format used by the wider observability system. It is used when the program is ready to report these safe yes/no details outside this module.
 
-**Data flow**: Reads all fields from `self`, clones `provider_env_key_name`, copies the booleans and optional presence flag into a new `AuthEnvTelemetryMetadata`, and returns it.
+**Data flow**: It starts with an AuthEnvTelemetry value containing booleans and optional provider-key information. It copies those fields into a new AuthEnvTelemetryMetadata value, cloning the optional provider key label so the original record is unchanged. The output is a telemetry-ready metadata object with the same safe summary information.
 
-**Call relations**: This is the final adaptation step after collection, allowing callers that gather auth-env telemetry to pass it into the telemetry subsystem without exposing the internal struct.
+**Call relations**: After collect_auth_env_telemetry has built the local summary, this method is the bridge to the OpenTelemetry-facing type. It does not gather new data itself; it simply repackages what was already collected so another part of the system can attach it to telemetry.
 
 
 ##### `collect_auth_env_telemetry`  (lines 31–43)
@@ -43,11 +47,11 @@ fn collect_auth_env_telemetry(
 ) -> AuthEnvTelemetry
 ```
 
-**Purpose**: Builds an `AuthEnvTelemetry` snapshot from the current process environment and the selected model provider configuration.
+**Purpose**: This builds a privacy-safe snapshot of the authentication environment. It checks whether expected API-key and override environment variables are set, and it records whether provider-specific key configuration exists without revealing the actual key name or value.
 
-**Data flow**: Accepts a `&ModelProviderInfo` and a `codex_api_key_env_enabled` flag. It checks `OPENAI_API_KEY_ENV_VAR`, `CODEX_API_KEY_ENV_VAR`, and `REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR` with `env_var_present`; sets `provider_env_key_name` to `Some("configured")` when `provider.env_key` exists; and sets `provider_env_key_present` by checking the actual provider env var name when configured.
+**Data flow**: It receives a model provider description and a flag saying whether the Codex API key environment path is enabled. It reads several environment variables through env_var_present, looks at whether the provider has an env_key configured, replaces that provider key name with the safe label "configured," and returns an AuthEnvTelemetry record. It changes no environment variables; it only observes them.
 
-**Call relations**: Called during higher-level initialization paths that assemble telemetry context. It delegates raw environment probing to `env_var_present` and intentionally buckets provider key naming for privacy.
+**Call relations**: This is the main collection point for this file. It is called when authentication setup is being created, including flows represented by new and new_with_provider, and it is also called by the test in this file. During its work it delegates each environment-variable check to env_var_present so the meaning of “present” stays consistent.
 
 *Call graph*: calls 1 internal fn (env_var_present); called by 3 (new, collect_auth_env_telemetry_buckets_provider_env_key_name, new_with_provider).
 
@@ -58,11 +62,11 @@ fn collect_auth_env_telemetry(
 fn env_var_present(name: &str) -> bool
 ```
 
-**Purpose**: Determines whether an environment variable should count as present for telemetry purposes.
+**Purpose**: This answers the simple question: does this environment variable really have a usable value? It treats missing variables and blank text as absent, while treating non-text values as present because something was supplied.
 
-**Data flow**: Reads `std::env::var(name)`. It returns `true` for non-empty Unicode values, `true` for `NotUnicode`, and `false` only for `NotPresent` or empty/whitespace-only Unicode values.
+**Data flow**: It receives the name of an environment variable. It asks the operating system for that variable’s value. If the value exists and is not just whitespace, it returns true; if it is missing, it returns false; if it exists but cannot be read as normal text, it still returns true.
 
-**Call relations**: Used exclusively by `collect_auth_env_telemetry` so all auth-env presence checks share the same semantics, especially around blank values and non-Unicode entries.
+**Call relations**: collect_auth_env_telemetry calls this helper for every environment setting it wants to summarize. The helper wraps the standard environment lookup in one consistent rule, so callers do not have to repeat the same edge-case decisions.
 
 *Call graph*: called by 1 (collect_auth_env_telemetry); 1 external calls (var).
 
@@ -73,24 +77,24 @@ fn env_var_present(name: &str) -> bool
 fn collect_auth_env_telemetry_buckets_provider_env_key_name()
 ```
 
-**Purpose**: Verifies that telemetry records only the bucketed marker `configured` rather than the provider’s actual env var name.
+**Purpose**: This test checks that provider-specific key information is not leaked into telemetry. It proves that when a provider has an env_key value, telemetry records only the safe label "configured" rather than the actual string.
 
-**Data flow**: Constructs a `ModelProviderInfo` with `env_key: Some("sk-should-not-leak")`, calls `collect_auth_env_telemetry`, and asserts `provider_env_key_name == Some("configured".to_string())`.
+**Data flow**: It creates a sample model provider whose env_key contains a secret-looking value. It passes that provider into collect_auth_env_telemetry with Codex API-key environment support disabled. It then compares the resulting provider_env_key_name field with the expected safe value, Some("configured").
 
-**Call relations**: This test locks down the privacy-sensitive behavior in `collect_auth_env_telemetry` for provider env-key reporting.
+**Call relations**: This test directly exercises collect_auth_env_telemetry. Its role is to guard the privacy behavior described above, so future changes do not accidentally start copying sensitive provider key text into telemetry.
 
 *Call graph*: calls 1 internal fn (collect_auth_env_telemetry); 1 external calls (assert_eq!).
 
 
 ### `otel/src/events/session_telemetry.rs`
 
-`domain_logic` · `startup, request handling, streaming, tool execution, and cross-cutting telemetry throughout a session`
+`domain_logic` · `cross-cutting`
 
-This file is the core telemetry surface for a single Codex session. It defines two metadata structs—`AuthEnvTelemetryMetadata` for environment/auth discovery flags and `SessionTelemetryMetadata` for conversation ID, account identity, originator, model/slug, terminal type, and prompt-redaction policy—plus the `SessionTelemetry` wrapper that optionally owns a `MetricsClient`. Construction starts with `SessionTelemetry::new`, which sanitizes the originator, captures the crate version, and attaches the globally installed metrics client if one exists. Builder-style methods then override auth environment details, model/slug, service name, or metrics behavior, including a mode that suppresses automatic metadata tags.
+A Codex session talks to APIs, streams server events, opens WebSockets, runs tools, asks for approvals, and processes user prompts. This file gives all of those moments a common way to be written down as logs, traces, and metrics. Logs are event records, traces are timeline breadcrumbs inside a larger operation, and metrics are numbers that can be graphed, such as counts and durations.
 
-The implementation splits into three concerns. First, generic metric helpers (`counter`, `histogram`, `record_duration`, `start_timer`) merge caller tags with session-derived tags via `metadata_tag_refs`, validate through the metrics layer, and downgrade failures to warnings. Second, domain-specific recorders emit concrete telemetry for startup phases, turn TTFT, plugin install prompts, API requests, websocket connect/request/event lifecycles, auth recovery, SSE polling, user prompts, tool approvals, sandbox outcomes, and tool execution results. These methods consistently derive success/failure tags, serialize durations in milliseconds, and include auth-env booleans and request identifiers where relevant. Third, response-stream helpers inspect `ResponseEvent`, `ResponseItem`, SSE payloads, and websocket JSON messages to classify event kinds, extract token usage, and parse special `responsesapi.websocket_timing` payloads into dedicated duration metrics.
+The central type is SessionTelemetry. It carries session metadata, such as conversation id, model, app version, authentication environment, and whether user prompts may be logged. Most public methods describe one real-world event: an API request completed, a WebSocket event arrived, a tool finished, a plugin suggestion was shown, or startup passed a phase. The methods usually do two things: update counters or timing measurements, then emit a structured event.
 
-Notable design choices: ping/pong websocket frames are ignored entirely; malformed websocket/SSE payloads are counted as failed events rather than panicking; user prompt text is logged only when `log_user_prompts` is enabled, while traces always omit raw prompt text; runtime metric snapshots are optional and used both for summaries and for resetting delta accumulators by collecting-and-discarding a snapshot.
+A useful analogy is a flight recorder. The application keeps flying normally, but this file writes down speed, route, warnings, and unusual events. If metrics are disabled or fail, the code warns instead of crashing the session. It also adds common session tags to metrics so production dashboards can group results by model, source, auth mode, and version.
 
 #### Function details
 
@@ -100,11 +104,11 @@ Notable design choices: ping/pong websocket frames are ignored entirely; malform
 fn trace_field_value(fields: &'a [(&str, &str)], key: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Looks up a named field inside a slice of `(key, value)` trace-field pairs and returns the matching string value if present. It is a tiny extractor used to pull specific optional annotations back out of caller-supplied metadata.
+**Purpose**: Looks up one named field inside a small list of trace fields. It is used when tool telemetry needs optional details such as which MCP server a tool came from.
 
-**Data flow**: Reads the borrowed `fields` slice and the target `key`, scans linearly with `iter().find_map`, compares each tuple's key to `key`, and returns `Option<&str>` pointing into the original slice without allocating.
+**Data flow**: It receives a list of key-value text pairs and a key to search for. It scans the list and returns the matching value if it finds one; otherwise it returns nothing.
 
-**Call relations**: It is used during tool result emission when `SessionTelemetry::tool_result_with_tags` needs to recover `mcp_server` and `mcp_server_origin` from the extra trace fields supplied by its caller.
+**Call relations**: When SessionTelemetry::tool_result_with_tags records a tool result, it calls this helper to pull out special trace fields before writing the log and trace event.
 
 *Call graph*: called by 1 (tool_result_with_tags).
 
@@ -115,11 +119,11 @@ fn trace_field_value(fields: &'a [(&str, &str)], key: &str) -> Option<&'a str>
 fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self
 ```
 
-**Purpose**: Overrides the auth-environment metadata attached to the session telemetry object. This lets callers enrich an already-created session with discovered environment-key presence and related auth flags.
+**Purpose**: Adds authentication environment details to an existing telemetry object. This lets later events say whether relevant API key environment variables were present.
 
-**Data flow**: Consumes `self` mutably plus an `AuthEnvTelemetryMetadata`, writes that value into `self.metadata.auth_env`, and returns the updated `SessionTelemetry` by value.
+**Data flow**: It receives a SessionTelemetry value and an AuthEnvTelemetryMetadata value. It replaces the stored auth environment metadata and returns the updated telemetry value.
 
-**Call relations**: This is a builder-style customization step applied after construction and before telemetry emission so later event methods include the updated auth environment fields.
+**Call relations**: This is a setup-time builder method. Code that creates session telemetry can call it before events are recorded so later API and conversation events include auth environment context.
 
 
 ##### `SessionTelemetry::with_model`  (lines 115–119)
@@ -128,11 +132,11 @@ fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self
 fn with_model(mut self, model: &str, slug: &str) -> Self
 ```
 
-**Purpose**: Replaces the session's model and slug metadata. It is used when the effective model identity becomes known or needs to be overridden after initial construction.
+**Purpose**: Updates the model name and model slug attached to telemetry. This matters when configuration overrides the model after the telemetry object was first created.
 
-**Data flow**: Consumes `self`, clones the provided `model` and `slug` strings into owned `String`s, stores them in `self.metadata`, and returns the modified session telemetry.
+**Data flow**: It receives model and slug strings. It copies them into the session metadata and returns the updated telemetry value.
 
-**Call relations**: As a builder method, it prepares metadata consumed later by all log/trace macros and by metric-tag generation.
+**Call relations**: This is part of the setup path for tailoring session metadata before recording metrics and events. Later metric tags and logs read these stored model fields.
 
 
 ##### `SessionTelemetry::with_metrics_service_name`  (lines 121–124)
@@ -141,11 +145,11 @@ fn with_model(mut self, model: &str, slug: &str) -> Self
 fn with_metrics_service_name(mut self, service_name: &str) -> Self
 ```
 
-**Purpose**: Sets the service-name metric tag attached to this session, sanitizing it for metric-tag safety. This affects only metric tagging, not the general event payload fields.
+**Purpose**: Sets the service name used as a metric tag. The value is cleaned first so it is safe for metric systems that restrict tag characters.
 
-**Data flow**: Consumes `self`, reads the input `service_name`, passes it through `sanitize_metric_tag_value`, stores the sanitized string in `self.metadata.service_name`, and returns the updated object.
+**Data flow**: It receives a service name string, sanitizes it, stores it in metadata, and returns the updated telemetry value.
 
-**Call relations**: It is part of session setup; later `metadata_tag_refs` includes this field when automatic metadata tags are enabled.
+**Call relations**: This builder method uses sanitize_metric_tag_value before metadata is used by SessionTelemetry::metadata_tag_refs to attach standard tags to metrics.
 
 *Call graph*: 1 external calls (sanitize_metric_tag_value).
 
@@ -156,11 +160,11 @@ fn with_metrics_service_name(mut self, service_name: &str) -> Self
 fn with_metrics(mut self, metrics: MetricsClient) -> Self
 ```
 
-**Purpose**: Attaches a concrete metrics client and enables automatic session metadata tags on all metric emissions. It is the normal path for turning on metrics for a session.
+**Purpose**: Attaches a metrics client to the telemetry object and enables normal session metadata tags. This turns metric recording on for this session.
 
-**Data flow**: Consumes `self`, stores `Some(metrics)` into `self.metrics`, sets `metrics_use_metadata_tags` to `true`, and returns the updated telemetry object.
+**Data flow**: It receives a MetricsClient, stores it, sets the flag that says metadata tags should be included, and returns the updated telemetry value.
 
-**Call relations**: It is the common sink used by configuration-based and provider-based setup paths so subsequent metric helpers can emit through the attached client.
+**Call relations**: SessionTelemetry::with_metrics_config and SessionTelemetry::with_provider_metrics both delegate here after obtaining a metrics client.
 
 *Call graph*: called by 2 (with_metrics_config, with_provider_metrics).
 
@@ -171,11 +175,11 @@ fn with_metrics(mut self, metrics: MetricsClient) -> Self
 fn with_metrics_without_metadata_tags(mut self, metrics: MetricsClient) -> Self
 ```
 
-**Purpose**: Attaches a metrics client but disables automatic session metadata tags. This supports callers that want explicit tags only, without originator/model/auth/session-source enrichment.
+**Purpose**: Attaches a metrics client but chooses not to add the usual session metadata tags. This is useful when callers want raw or test metrics without labels like model or auth mode.
 
-**Data flow**: Consumes `self`, stores `Some(metrics)`, sets `metrics_use_metadata_tags` to `false`, and returns the modified telemetry object.
+**Data flow**: It receives a MetricsClient, stores it, turns off metadata tag merging, and returns the updated telemetry value.
 
-**Call relations**: This is an alternate setup path chosen when the caller wants metrics enabled but does not want `metadata_tag_refs` merged into every metric.
+**Call relations**: This is an alternate setup path to SessionTelemetry::with_metrics. Later metric methods still record values, but SessionTelemetry::metadata_tag_refs returns no common tags.
 
 
 ##### `SessionTelemetry::with_metrics_config`  (lines 138–141)
@@ -184,11 +188,11 @@ fn with_metrics_without_metadata_tags(mut self, metrics: MetricsClient) -> Self
 fn with_metrics_config(self, config: MetricsConfig) -> MetricsResult<Self>
 ```
 
-**Purpose**: Builds a `MetricsClient` from a `MetricsConfig` and attaches it to the session. It combines metrics-client construction with the standard metadata-tag-enabled attachment behavior.
+**Purpose**: Builds a metrics client from configuration and attaches it to the session. It gives callers a one-step way to enable metrics from settings.
 
-**Data flow**: Consumes `self` and a `MetricsConfig`, invokes `MetricsClient::new(config)` which may fail, then on success feeds the client into `with_metrics` and returns `MetricsResult<Self>`.
+**Data flow**: It receives a MetricsConfig. It tries to create a MetricsClient; if that works, it returns the telemetry object with metrics attached, and if not, it returns the metrics error.
 
-**Call relations**: This is used during setup when the caller has raw metrics configuration rather than an already-instantiated provider or client.
+**Call relations**: After creating the client, it hands off to SessionTelemetry::with_metrics so the normal metrics setup path is reused.
 
 *Call graph*: calls 2 internal fn (with_metrics, new).
 
@@ -199,11 +203,11 @@ fn with_metrics_config(self, config: MetricsConfig) -> MetricsResult<Self>
 fn with_provider_metrics(self, provider: &OtelProvider) -> Self
 ```
 
-**Purpose**: Copies the metrics client out of an `OtelProvider` if one is installed and attaches it to the session. If the provider has no metrics client, it leaves the session unchanged.
+**Purpose**: Copies a metrics client from an OpenTelemetry provider if that provider has one. This lets session telemetry share the provider's metric pipeline.
 
-**Data flow**: Consumes `self` and reads `provider.metrics()`. On `Some`, it clones the provider's `MetricsClient` and passes it to `with_metrics`; on `None`, it returns the original `self`.
+**Data flow**: It receives an OtelProvider. If the provider exposes a metrics client, it clones and attaches it; otherwise it leaves the telemetry object unchanged.
 
-**Call relations**: This is the provider-wiring path during initialization, bridging provider-level OTEL setup into session-scoped telemetry.
+**Call relations**: It asks the provider for metrics and, when present, delegates to SessionTelemetry::with_metrics. This keeps provider-based setup consistent with direct setup.
 
 *Call graph*: calls 2 internal fn (with_metrics, metrics).
 
@@ -214,11 +218,11 @@ fn with_provider_metrics(self, provider: &OtelProvider) -> Self
 fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Emits a single counter increment through the attached metrics client, automatically merging session metadata tags when configured. It intentionally swallows exporter/validation failures after logging a warning.
+**Purpose**: Adds to a named count metric, such as number of API calls or tool calls. It quietly skips work when metrics are disabled and warns if the metric system rejects the write.
 
-**Data flow**: Reads `self.metrics`; if absent, returns early with success semantics. Otherwise it calls `tags_with_metadata(tags)`, then `metrics.counter(name, inc, &tags)`. Any `MetricsError` is caught and logged with `tracing::warn!`; no value is returned.
+**Data flow**: It receives a metric name, an increment amount, and tags. It merges in session metadata tags, sends the count to the metrics client, and produces no return value.
 
-**Call relations**: This is the shared primitive behind many higher-level telemetry methods such as API, websocket, SSE, plugin, and tool metrics, and is also used elsewhere in the crate for ad hoc counters.
+**Call relations**: Many higher-level event methods call this when something countable happens. Other parts of the project also call it directly for subsystem-specific metrics.
 
 *Call graph*: called by 17 (force_http_fallback, emit_guardian_review_metrics, emit_compact_metric, emit_turn_memory_metric, emit_turn_network_proxy_metric, emit_unified_exec_tty_metric, emit_metrics, counter, counter, record_api_request (+7 more)); 1 external calls (warn!).
 
@@ -229,11 +233,11 @@ fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records an integer histogram sample through the attached metrics client with optional session metadata tags. Like `counter`, it treats metrics failures as non-fatal.
+**Purpose**: Records a numeric value in a histogram, which is a metric that shows distribution rather than just a total. This is useful for values like token counts.
 
-**Data flow**: Reads the optional metrics client, merges metadata tags via `tags_with_metadata`, calls `metrics.histogram(name, value, &tags)`, and logs a warning if validation or export fails.
+**Data flow**: It receives a metric name, a number, and tags. If metrics are enabled, it adds metadata tags and sends the value to the metrics client; on failure it logs a warning.
 
-**Call relations**: It serves as the generic histogram helper for callers that need raw integer samples rather than duration-specific recording.
+**Call relations**: Subsystem metric emitters call this for value distributions. It follows the same safe pattern as SessionTelemetry::counter: telemetry failure should not break the app.
 
 *Call graph*: called by 3 (emit_guardian_token_usage_histograms, histogram, histogram); 1 external calls (warn!).
 
@@ -244,11 +248,11 @@ fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)])
 fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a `Duration` sample into a duration histogram metric, enriching tags with session metadata when enabled. It is the standard duration-recording primitive used throughout the file.
+**Purpose**: Records how long something took. It is the common timing helper used for API calls, WebSocket events, startup phases, and response engine timings.
 
-**Data flow**: Reads `self.metrics`; if present, merges tags with `tags_with_metadata`, forwards to `metrics.record_duration(name, duration, &tags)`, and warns on any `MetricsError`. It returns nothing.
+**Data flow**: It receives a metric name, a Duration, and tags. It adds session metadata tags, sends the timing measurement to the metrics client, and warns if recording fails.
 
-**Call relations**: Most timing-oriented methods delegate here, including startup phases, API requests, websocket requests/events, turn TTFT, tool durations, and parsed responses timing metrics.
+**Call relations**: Higher-level methods such as SessionTelemetry::record_api_request, SessionTelemetry::record_websocket_event, and SessionTelemetry::record_startup_phase call this whenever they need a duration metric.
 
 *Call graph*: called by 11 (emit_guardian_review_metrics, resolve, record_api_request, record_responses_websocket_timing_metrics, record_startup_phase, record_turn_ttft, record_websocket_event, record_websocket_request, sse_event, sse_event_failed (+1 more)); 1 external calls (warn!).
 
@@ -264,11 +268,11 @@ fn record_startup_phase(
     )
 ```
 
-**Purpose**: Records a coarse startup phase duration both as a metric and as a structured production telemetry event. It optionally tags the phase with a status string such as success/failure.
+**Purpose**: Records the duration of one named startup phase. This helps production teams see which part of startup is slow or failing.
 
-**Data flow**: Builds a small `Vec` of tags containing `phase` and optional `status`, sends the duration to `STARTUP_PHASE_DURATION_METRIC` via `record_duration`, then emits a combined log/trace event with `event.name`, phase, status, and `duration_ms`.
+**Data flow**: It receives a phase name, elapsed time, and optional status. It records a duration metric tagged with that phase and status, then writes a structured log and trace event.
 
-**Call relations**: It is invoked during startup-resolution flows to produce latency breakdown telemetry while reusing the generic duration recorder.
+**Call relations**: Startup resolving code calls this as phases complete. Internally it uses SessionTelemetry::record_duration and the shared log-and-trace event macro.
 
 *Call graph*: calls 1 internal fn (record_duration); called by 1 (resolve); 2 external calls (log_and_trace_event!, vec!).
 
@@ -279,11 +283,11 @@ fn record_startup_phase(
 fn record_turn_ttft(&self, duration: Duration)
 ```
 
-**Purpose**: Captures time-to-first-token for a turn as both a metric and a structured event. This gives both aggregate latency histograms and per-turn observability.
+**Purpose**: Records time to first token for a model turn. Time to first token means how long the user waits before the first piece of output appears.
 
-**Data flow**: Writes the duration to `TURN_TTFT_DURATION_METRIC` with no extra tags, then emits a log-and-trace event named `codex.turn_ttft` containing `duration_ms`.
+**Data flow**: It receives a duration. It records that duration as a metric and emits a telemetry event with the duration in milliseconds.
 
-**Call relations**: It is called when the system determines the first-token latency for a turn and delegates metric storage to `record_duration`.
+**Call relations**: This is called by turn-processing code when the first response token arrives. It reuses SessionTelemetry::record_duration and the standard log-and-trace path.
 
 *Call graph*: calls 1 internal fn (record_duration); 1 external calls (log_and_trace_event!).
 
@@ -299,11 +303,11 @@ fn record_plugin_install_elicitation_sent(
     )
 ```
 
-**Purpose**: Records that the UI or agent surfaced an install elicitation for a plugin or connector. It captures the tool type in metrics and the concrete tool identity in event telemetry.
+**Purpose**: Records that Codex asked the user about installing a plugin or connector. This helps measure how often install prompts are shown.
 
-**Data flow**: Increments `PLUGIN_INSTALL_ELICITATION_SENT_METRIC` with a `tool_type` tag, then emits a log/trace event containing `tool_type`, `tool_id`, and `tool_name` under `plugin_install.*` fields.
+**Data flow**: It receives the tool type, id, and display name. It increments a metric tagged by tool type and logs/traces the prompt details.
 
-**Call relations**: This is a specialized domain event emitted at the moment an install prompt is dispatched.
+**Call relations**: Plugin installation flows call this at the moment an install elicitation is dispatched. It uses SessionTelemetry::counter for the metric and then emits the event.
 
 *Call graph*: calls 1 internal fn (counter); 1 external calls (log_and_trace_event!).
 
@@ -321,11 +325,11 @@ fn record_plugin_install_suggestion(
         comple
 ```
 
-**Purpose**: Records the outcome of a plugin or connector install suggestion, including the surfaced action, whether the user confirmed it, and whether the flow completed. Metrics aggregate by tool type, action, and completion state.
+**Purpose**: Records what happened after a plugin or connector install suggestion was shown. It captures whether the user confirmed and whether the process completed.
 
-**Data flow**: Converts `completed` to a string tag, increments `PLUGIN_INSTALL_SUGGESTION_METRIC` with `tool_type`, `response_action`, and `completed`, then emits a structured event with tool identity plus boolean `user_confirmed` and `completed` fields.
+**Data flow**: It receives tool identity, the response action, and two booleans for user confirmation and completion. It converts completion into a metric tag, increments the suggestion metric, and writes a structured event.
 
-**Call relations**: It is used after a suggestion interaction resolves, complementing the earlier elicitation event.
+**Call relations**: Plugin suggestion flows call this after the user or system responds. It builds on SessionTelemetry::counter and the shared log-and-trace macro.
 
 *Call graph*: calls 1 internal fn (counter); 1 external calls (log_and_trace_event!).
 
@@ -336,11 +340,11 @@ fn record_plugin_install_suggestion(
 fn start_timer(&self, name: &str, tags: &[(&str, &str)]) -> Result<Timer, MetricsError>
 ```
 
-**Purpose**: Starts a metrics timer for a named metric using the session's metrics client and merged metadata tags. Unlike the fire-and-forget helpers, it returns an error if metrics are unavailable or tags are invalid.
+**Purpose**: Starts a metric timer that can later record elapsed time. This is useful when the caller wants a stopwatch-like object instead of manually measuring duration.
 
-**Data flow**: Reads `self.metrics`; if absent, returns `MetricsError::ExporterDisabled`. Otherwise it computes merged tags with `tags_with_metadata` and calls `metrics.start_timer(name, &tags)`, returning the resulting `Timer`.
+**Data flow**: It receives a metric name and tags. If metrics are enabled, it adds metadata tags and asks the metrics client to create a Timer; if metrics are disabled, it returns an error.
 
-**Call relations**: This is used by callers that want scoped timing with explicit error handling rather than silent warning-based recording.
+**Call relations**: Other timer wrappers call this when they need a session-aware timer. It relies on SessionTelemetry::tags_with_metadata before handing off to the metrics client.
 
 *Call graph*: calls 1 internal fn (tags_with_metadata); called by 2 (start_timer, start_timer).
 
@@ -351,11 +355,11 @@ fn start_timer(&self, name: &str, tags: &[(&str, &str)]) -> Result<Timer, Metric
 fn shutdown_metrics(&self) -> MetricsResult<()>
 ```
 
-**Purpose**: Flushes and shuts down the attached metrics provider if one exists. If metrics are disabled, it succeeds without doing anything.
+**Purpose**: Flushes and shuts down the metrics client if one is attached. This helps make sure buffered metric data is sent before the process exits.
 
-**Data flow**: Reads `self.metrics`; on `Some`, forwards to `metrics.shutdown()`, otherwise returns `Ok(())`.
+**Data flow**: It reads the optional metrics client. If no client exists it succeeds immediately; otherwise it calls the client's shutdown operation and returns that result.
 
-**Call relations**: This is a teardown helper used when the session or process is ending and metrics should be flushed.
+**Call relations**: Teardown code can call this near the end of a run. It is intentionally harmless when metrics were never enabled.
 
 
 ##### `SessionTelemetry::snapshot_metrics`  (lines 310–315)
@@ -364,11 +368,11 @@ fn shutdown_metrics(&self) -> MetricsResult<()>
 fn snapshot_metrics(&self) -> MetricsResult<ResourceMetrics>
 ```
 
-**Purpose**: Collects a runtime metrics snapshot from the attached metrics client. It requires a runtime reader to have been configured and returns an explicit error otherwise.
+**Purpose**: Collects the current metrics snapshot. A snapshot is a point-in-time copy of accumulated metric data.
 
-**Data flow**: Reads `self.metrics`; if absent, returns `MetricsError::ExporterDisabled`. Otherwise it calls `metrics.snapshot()` and returns the resulting `ResourceMetrics`.
+**Data flow**: It checks whether a metrics client exists. If yes, it asks for a ResourceMetrics snapshot; if not, it returns an exporter-disabled error.
 
-**Call relations**: It underpins both runtime-summary generation and the reset-by-snapshot behavior.
+**Call relations**: SessionTelemetry::reset_runtime_metrics and SessionTelemetry::runtime_metrics_summary both call this to inspect or clear accumulated runtime metrics.
 
 *Call graph*: called by 2 (reset_runtime_metrics, runtime_metrics_summary).
 
@@ -379,11 +383,11 @@ fn snapshot_metrics(&self) -> MetricsResult<ResourceMetrics>
 fn reset_runtime_metrics(&self)
 ```
 
-**Purpose**: Collects and discards a runtime metrics snapshot solely to reset delta accumulators in the manual reader. It is a best-effort maintenance operation.
+**Purpose**: Takes and discards a runtime metrics snapshot so delta-style counters reset. This is like emptying a measuring cup before the next measurement period.
 
-**Data flow**: Checks whether `self.metrics` is present; if not, returns immediately. Otherwise it calls `snapshot_metrics()`, ignores the snapshot, and logs a debug message if collection fails.
+**Data flow**: It first checks whether metrics exist. If they do, it calls SessionTelemetry::snapshot_metrics and ignores the data; if snapshotting fails, it writes a debug message.
 
-**Call relations**: This is used when the caller wants future runtime summaries to start from a fresh delta baseline.
+**Call relations**: Debug or runtime-monitoring code can call this before measuring a new interval. It depends on SessionTelemetry::snapshot_metrics for the actual collection.
 
 *Call graph*: calls 1 internal fn (snapshot_metrics); 1 external calls (debug!).
 
@@ -394,11 +398,11 @@ fn reset_runtime_metrics(&self)
 fn runtime_metrics_summary(&self) -> Option<RuntimeMetricsSummary>
 ```
 
-**Purpose**: Builds a compact `RuntimeMetricsSummary` from the current runtime snapshot, returning `None` when snapshots are unavailable or contain no nonzero data. It converts raw OTEL metric data into session-level totals.
+**Purpose**: Builds a small human-readable summary of runtime metrics when snapshots are available. It returns nothing if metrics are disabled or the snapshot has no useful data.
 
-**Data flow**: Calls `snapshot_metrics()`, returning `None` on error. On success it passes the `ResourceMetrics` to `RuntimeMetricsSummary::from_snapshot`, then returns `Some(summary)` unless `summary.is_empty()` is true.
+**Data flow**: It asks for a metrics snapshot. If successful, it converts the snapshot into RuntimeMetricsSummary and returns it only when the summary is not empty.
 
-**Call relations**: This is the high-level read path for runtime metrics introspection and depends on the runtime-metrics summarizer in `metrics/runtime_metrics.rs`.
+**Call relations**: Runtime diagnostics call this to show recent metric information. It uses SessionTelemetry::snapshot_metrics and RuntimeMetricsSummary::from_snapshot.
 
 *Call graph*: calls 2 internal fn (snapshot_metrics, from_snapshot).
 
@@ -412,11 +416,11 @@ fn tags_with_metadata(
     ) -> MetricsResult<Vec<(&'a str, &'a str)>>
 ```
 
-**Purpose**: Merges caller-supplied metric tags with the session's standard metadata tags. It is the central place where per-session metric enrichment happens.
+**Purpose**: Combines caller-provided metric tags with the standard session tags. This keeps dashboards consistently labeled without every caller repeating the same metadata.
 
-**Data flow**: Calls `metadata_tag_refs()` to obtain a `Vec` of borrowed metadata tags, extends that vector with the provided `tags` slice, and returns the merged vector or a validation error from metadata-tag generation.
+**Data flow**: It receives a slice of tags. It first gets metadata tags, appends the caller's tags, and returns the merged list.
 
-**Call relations**: It is used by all metric-emitting helpers and by `start_timer` so they all share identical metadata-tag behavior.
+**Call relations**: SessionTelemetry::start_timer uses this helper before creating timers. The counter, histogram, and duration methods follow the same merging pattern internally.
 
 *Call graph*: calls 1 internal fn (metadata_tag_refs); called by 1 (start_timer).
 
@@ -427,11 +431,11 @@ fn tags_with_metadata(
 fn metadata_tag_refs(&self) -> MetricsResult<Vec<(&str, &str)>>
 ```
 
-**Purpose**: Builds the standard metric-tag set derived from session metadata, or returns an empty set when metadata tagging is disabled. The tags include auth mode, session source, originator, service name, model, and app version.
+**Purpose**: Builds the standard metric tags from session metadata, such as auth mode, source, originator, service name, model, and app version.
 
-**Data flow**: Reads `metrics_use_metadata_tags`; if false, returns an empty `Vec`. Otherwise it constructs `SessionMetricTagValues` from fields in `self.metadata` and calls `into_tags()` to validate and materialize the borrowed tag vector.
+**Data flow**: It checks whether metadata tags are enabled. If not, it returns an empty list; otherwise it reads fields from metadata and converts them into metric tag pairs.
 
-**Call relations**: This is an internal helper called only by `tags_with_metadata`, isolating the policy for which metadata becomes metric tags.
+**Call relations**: SessionTelemetry::tags_with_metadata calls this whenever it needs the common session labels. The values are prepared using SessionMetricTagValues.
 
 *Call graph*: called by 1 (tags_with_metadata); 1 external calls (new).
 
@@ -448,11 +452,11 @@ fn new(
         auth_mode: Option<TelemetryAuthMo
 ```
 
-**Purpose**: Constructs a new session telemetry object with core conversation metadata and any globally installed metrics client. It is the canonical entry point for creating session-scoped telemetry.
+**Purpose**: Creates the base telemetry object for a session. It captures the identifying and configuration details that later events will reuse.
 
-**Data flow**: Consumes conversation identifiers and session settings, converts optional `TelemetryAuthMode` and `SessionSource` to strings, sanitizes `originator`, initializes `auth_env` with `Default`, captures `env!("CARGO_PKG_VERSION")`, stores model/slug and prompt logging policy, reads `crate::metrics::global()` into `metrics`, enables metadata tags, and returns the assembled `SessionTelemetry`.
+**Data flow**: It receives conversation id, model, account details, authentication mode, originator, prompt-logging preference, terminal type, and session source. It sanitizes metric-sensitive text, fills metadata, attaches any global metrics client, and returns SessionTelemetry.
 
-**Call relations**: This is called broadly by session setup and tests; later builder methods may refine the metadata or metrics attachment before event methods are used.
+**Call relations**: Session setup and tests call this as the starting point. Later builder methods can adjust auth environment, model, or metrics before the object is used across the run.
 
 *Call graph*: calls 1 internal fn (global); called by 25 (test_session_telemetry, test_session_telemetry, new, session_telemetry, test_session_telemetry_without_metadata, test_session_telemetry, responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids (+15 more)); 4 external calls (to_string, sanitize_metric_tag_value, env!, default).
 
@@ -463,11 +467,11 @@ fn new(
 fn record_responses(&self, handle_responses_span: &Span, event: &ResponseEvent)
 ```
 
-**Purpose**: Annotates an existing tracing span with fields derived from a `ResponseEvent`, including event type, tool name for function-call items, and token usage on completion. It does not emit a new event; it enriches the current span.
+**Purpose**: Adds details from a Responses API event to an existing trace span. A span is a timed trace section that can hold fields for later debugging.
 
-**Data flow**: Reads the `ResponseEvent`, computes a string kind via `responses_type`, writes it into `handle_responses_span` under `otel.name`, then pattern-matches the event to optionally record `from`, `tool_name`, and several token-usage counters on the span.
+**Data flow**: It receives a tracing Span and a ResponseEvent. It records the event type, tool names for function-call items, and token usage for completed responses when available.
 
-**Call relations**: It is used while handling streamed Responses API events so the active tracing span reflects the specific event subtype and any available usage data.
+**Call relations**: Response-processing code calls this while handling streamed response events. It uses SessionTelemetry::responses_type to turn the event into a readable category.
 
 *Call graph*: calls 1 internal fn (responses_type); 1 external calls (record).
 
@@ -483,11 +487,11 @@ fn conversation_starts(
         context_window: Option<i64>,
 ```
 
-**Purpose**: Emits the session-start event describing provider choice, reasoning settings, context-window limits, approval/sandbox policy, and MCP server presence. It captures both auth-environment discovery and startup configuration in one structured record.
+**Purpose**: Records the start of a conversation with key setup choices. This gives later investigations context about model provider, reasoning settings, sandbox policy, and auth environment.
 
-**Data flow**: Reads many fields from `self.metadata.auth_env` plus the function arguments, logs MCP server names only to the log target as a comma-joined string, records only the MCP server count to the trace target, and emits a combined `codex.conversation_starts` event.
+**Data flow**: It receives provider and configuration details plus the MCP server names. It writes one structured event, logging server names while tracing only the count.
 
-**Call relations**: This is called near the beginning of a conversation after configuration has been resolved and before substantive request handling begins.
+**Call relations**: Conversation startup code calls this once the session parameters are known. It uses the shared log-and-trace macro to send the same event to both observability channels.
 
 *Call graph*: 1 external calls (log_and_trace_event!).
 
@@ -498,11 +502,11 @@ fn conversation_starts(
 async fn log_request(&self, attempt: u64, f: F) -> Result<Response, Error>
 ```
 
-**Purpose**: Wraps an async HTTP request future, measures its elapsed time, derives status/error information from the result, records API-request telemetry, and returns the original result unchanged. It is a convenience wrapper for instrumenting outbound requests.
+**Purpose**: Wraps an HTTP request so the request duration and outcome are recorded automatically. It is a convenience helper for simple request paths.
 
-**Data flow**: Captures `Instant::now()`, awaits the closure `f`, computes elapsed `Duration`, extracts `status` and optional error string from `Result<Response, reqwest::Error>`, calls `record_api_request` with default auth/recovery placeholders and endpoint `"unknown"`, then returns the original response result.
+**Data flow**: It receives an attempt number and an async function that performs the request. It measures elapsed time, extracts status or error text, records the API request telemetry, and returns the original response result unchanged.
 
-**Call relations**: It is used when callers want automatic timing and telemetry around a single request attempt without manually assembling all API-request fields.
+**Call relations**: Request code can call this around a reqwest request. It delegates the actual telemetry formatting to SessionTelemetry::record_api_request.
 
 *Call graph*: calls 1 internal fn (record_api_request); 1 external calls (now).
 
@@ -520,11 +524,11 @@ fn record_api_request(
         auth_heade
 ```
 
-**Purpose**: Records a fully described API request attempt as both count/duration metrics and a structured event. It captures HTTP status, retry/auth-recovery context, endpoint identity, and auth-environment diagnostics.
+**Purpose**: Records the result of an HTTP API call. It captures success, status code, duration, retry/auth recovery details, endpoint, request identifiers, and auth errors.
 
-**Data flow**: Computes `success` from 2xx status plus absence of an error string, converts status to a string tag or `"none"`, increments `API_CALL_COUNT_METRIC`, records `API_CALL_DURATION_METRIC`, and emits `codex.api_request` with duration, status, error, attempt number, auth-header/recovery fields, endpoint, auth-env booleans, request IDs, and auth error details.
+**Data flow**: It receives request outcome details. It decides whether the call succeeded, increments the API call count, records the duration, and emits a structured event with both network and auth context.
 
-**Call relations**: It is the detailed API telemetry sink used directly by request middleware and indirectly by `log_request`.
+**Call relations**: HTTP hooks and SessionTelemetry::log_request call this after requests finish. It uses SessionTelemetry::counter and SessionTelemetry::record_duration before emitting the log and trace event.
 
 *Call graph*: calls 2 internal fn (counter, record_duration); called by 2 (on_request, log_request); 1 external calls (log_and_trace_event!).
 
@@ -541,11 +545,11 @@ fn record_websocket_connect(
         auth_header_name: Option<&
 ```
 
-**Purpose**: Emits a structured event describing websocket connection establishment, including latency, HTTP status if available, auth/recovery context, and whether an existing connection was reused. Unlike request/event methods, it does not emit metrics here.
+**Purpose**: Records an attempt to open a WebSocket connection. A WebSocket is a long-lived connection used to exchange messages with the server.
 
-**Data flow**: Derives a success string from `error` and optional `status`, then emits `codex.websocket_connect` with duration, status, success, error, auth-header/recovery fields, endpoint, auth-env metadata, connection reuse, request IDs, and auth error details.
+**Data flow**: It receives duration, optional status and error, auth/recovery details, endpoint, reuse flag, and request identifiers. It calculates success and writes one structured event.
 
-**Call relations**: It is called by websocket connection setup code after a connect attempt completes.
+**Call relations**: The WebSocket connection code calls this after connect attempts. Unlike per-message events, this method focuses on the connection handshake and authentication context.
 
 *Call graph*: called by 1 (connect_websocket); 1 external calls (log_and_trace_event!).
 
@@ -561,11 +565,11 @@ fn record_websocket_request(
     )
 ```
 
-**Purpose**: Records a websocket request/roundtrip as both metrics and a structured event. It aggregates success/failure counts and durations separately from lower-level websocket event telemetry.
+**Purpose**: Records a request sent over an existing WebSocket connection. It measures whether the send/request step succeeded and how long it took.
 
-**Data flow**: Converts presence of `error` into a `success` tag, increments `WEBSOCKET_REQUEST_COUNT_METRIC`, records `WEBSOCKET_REQUEST_DURATION_METRIC`, and emits `codex.websocket_request` with duration, success, error, auth-env flags, and `connection_reused`.
+**Data flow**: It receives duration, optional error text, and whether the connection was reused. It increments a request count, records request duration, and logs/traces the result with auth environment context.
 
-**Call relations**: It is invoked by websocket request handling code after a request over an established websocket completes.
+**Call relations**: WebSocket request hooks call this after sending work over the socket. It uses SessionTelemetry::counter and SessionTelemetry::record_duration for metrics.
 
 *Call graph*: calls 2 internal fn (counter, record_duration); called by 1 (on_ws_request); 1 external calls (log_and_trace_event!).
 
@@ -583,11 +587,11 @@ fn record_auth_recovery(
         auth_error: Option<&str>,
 ```
 
-**Purpose**: Emits a structured event for auth-recovery workflows such as retries, token refreshes, or fallback steps. It captures the recovery mode, step, outcome, and any server-provided auth diagnostics.
+**Purpose**: Records a step in authentication recovery, such as retrying after an unauthorized response. This helps diagnose sign-in and token-refresh problems.
 
-**Data flow**: Reads the supplied mode/step/outcome and optional request IDs, Cloudflare ray, auth error/code, recovery reason, and state-change flag, then emits a combined `codex.auth_recovery` log/trace event.
+**Data flow**: It receives the recovery mode, step, outcome, optional request ids, server error details, reason, and whether auth state changed. It emits those fields as one structured event.
 
-**Call relations**: It is called from unauthorized-handling logic to make auth remediation visible in telemetry.
+**Call relations**: Unauthorized-response handling calls this during recovery. It does not update counters; it focuses on making the recovery story visible in logs and traces.
 
 *Call graph*: called by 1 (handle_unauthorized); 1 external calls (log_and_trace_event!).
 
@@ -604,11 +608,11 @@ fn record_websocket_event(
                     tokio_tu
 ```
 
-**Purpose**: Classifies a single websocket receive result, records success/failure metrics and duration, and emits a structured event. It also parses special timing payloads from Responses API websocket messages into dedicated latency metrics.
+**Purpose**: Records one event received from a WebSocket stream. It classifies the event, detects failures, and records timing metrics.
 
-**Data flow**: Pattern-matches the nested `Result<Option<Result<Message, tungstenite::Error>>, ApiError>`. For text messages it attempts JSON parsing, extracts the `type` field as `kind`, records timing metrics when the kind is `responsesapi.websocket_timing`, and treats `response.failed` as unsuccessful with an extracted error payload. Binary, close, frame, parse errors, stream closure, tungstenite errors, and API errors all become failed events with synthesized error messages; ping/pong return early without metrics. It then emits `WEBSOCKET_EVENT_COUNT_METRIC`, `WEBSOCKET_EVENT_DURATION_METRIC`, and a `codex.websocket_event` log/trace event.
+**Data flow**: It receives a nested result representing a possible WebSocket message or API error, plus duration. It parses text messages as JSON, extracts the event type, treats failures and unexpected messages as unsuccessful, records count and duration metrics, and logs/traces the outcome.
 
-**Call relations**: This is the per-message telemetry sink used by websocket event loops; it delegates timing-payload extraction to `record_responses_websocket_timing_metrics`.
+**Call relations**: WebSocket event hooks call this for each received event. If it sees a special response timing event, it calls SessionTelemetry::record_responses_websocket_timing_metrics before recording the general WebSocket event.
 
 *Call graph*: calls 3 internal fn (counter, record_duration, record_responses_websocket_timing_metrics); called by 1 (on_ws_event); 1 external calls (log_and_trace_event!).
 
@@ -623,11 +627,11 @@ fn log_sse_event(
     )
 ```
 
-**Purpose**: Interprets the result of polling an SSE stream and routes it to success or failure telemetry paths. It validates certain event payloads more deeply than others, especially `response.failed` and `response.output_item.done`.
+**Purpose**: Records one Server-Sent Events poll result. Server-Sent Events, or SSE, are a streaming HTTP format where the server sends named events over time.
 
-**Data flow**: Reads `Result<Option<Result<StreamEvent, StreamError<E>>>, Elapsed>`. For successful SSE events, `[DONE]` is treated as a normal event; otherwise it parses `sse.data` as JSON. `response.failed` payloads are sent to `sse_event_failed`; `response.output_item.done` is additionally deserialized into `ResponseItem` and treated as failed if that parse fails; other valid JSON events go to `sse_event`. Stream errors and idle timeouts go to `sse_event_failed`; `Ok(None)` produces no telemetry.
+**Data flow**: It receives a poll result and duration. It distinguishes successful events, response failures, parse errors, stream errors, end-of-stream, and idle timeout, then routes to the success or failure helper.
 
-**Call relations**: It is called by SSE polling code and delegates the actual metric/event emission to `sse_event` and `sse_event_failed`.
+**Call relations**: SSE polling code calls this after each poll. It delegates successful events to SessionTelemetry::sse_event and failures to SessionTelemetry::sse_event_failed.
 
 *Call graph*: calls 2 internal fn (sse_event, sse_event_failed); called by 1 (on_sse_poll).
 
@@ -638,11 +642,11 @@ fn log_sse_event(
 fn sse_event(&self, kind: &str, duration: Duration)
 ```
 
-**Purpose**: Records a successful SSE event kind as both metrics and a log event. It is the happy-path sink for parsed SSE messages.
+**Purpose**: Records a successful SSE event. It counts the event, records how long the poll took, and writes a log entry.
 
-**Data flow**: Increments `SSE_EVENT_COUNT_METRIC` with `kind` and `success=true`, records `SSE_EVENT_DURATION_METRIC` with the same tags, and emits a log-only `codex.sse_event` containing the kind and duration in milliseconds.
+**Data flow**: It receives an event kind and duration. It records success-tagged count and duration metrics, then logs the event name, kind, and elapsed milliseconds.
 
-**Call relations**: It is called only from `log_sse_event` after the SSE payload has been accepted as valid.
+**Call relations**: SessionTelemetry::log_sse_event calls this when a streamed SSE message parses successfully or marks normal completion.
 
 *Call graph*: calls 2 internal fn (counter, record_duration); called by 1 (log_sse_event); 1 external calls (log_event!).
 
@@ -653,11 +657,11 @@ fn sse_event(&self, kind: &str, duration: Duration)
 fn sse_event_failed(&self, kind: Option<&String>, duration: Duration, error: &T)
 ```
 
-**Purpose**: Records a failed SSE event or polling failure as metrics plus both log and trace events. It preserves the event kind when known and falls back to `unknown` otherwise.
+**Purpose**: Records a failed SSE event or failed SSE poll. It captures the kind when known and includes an error message.
 
-**Data flow**: Maps `Option<&String>` to a `kind_str`, increments `SSE_EVENT_COUNT_METRIC` and records `SSE_EVENT_DURATION_METRIC` with `success=false`, emits a log event that conditionally includes `event.kind`, and always emits a trace event with kind, duration, and formatted error message.
+**Data flow**: It receives an optional event kind, duration, and displayable error. It substitutes "unknown" when the kind is missing, records failure-tagged metrics, logs the error, and emits a trace event.
 
-**Call relations**: It is the failure sink used by `log_sse_event` for malformed payloads, stream errors, and idle timeouts.
+**Call relations**: SessionTelemetry::log_sse_event calls this for parse errors, stream errors, response.failed events, and idle timeouts.
 
 *Call graph*: calls 2 internal fn (counter, record_duration); called by 1 (log_sse_event); 2 external calls (log_event!, trace_event!).
 
@@ -668,11 +672,11 @@ fn sse_event_failed(&self, kind: Option<&String>, duration: Duration, error: &T)
 fn see_event_completed_failed(&self, error: &T)
 ```
 
-**Purpose**: Emits a telemetry event indicating that processing of the terminal `response.completed` SSE event failed. Despite the method name typo, it specifically reports completion-event failure.
+**Purpose**: Records that processing a response.completed SSE event failed. The function name appears to contain "see" rather than "sse", but it logs the SSE completion failure.
 
-**Data flow**: Formats the supplied displayable `error` into a combined log/trace event named `codex.sse_event` with `event.kind = "response.completed"` and `error.message`.
+**Data flow**: It receives an error value. It emits a structured log and trace event with kind response.completed and the error message.
 
-**Call relations**: It is called from response-event mapping logic when completion parsing or handling fails after the stream reaches the completed event.
+**Call relations**: Response event mapping code calls this when it cannot process a completion event. It uses the shared log-and-trace macro.
 
 *Call graph*: called by 1 (map_response_events); 1 external calls (log_and_trace_event!).
 
@@ -689,11 +693,11 @@ fn sse_event_completed(
         too
 ```
 
-**Purpose**: Emits the parsed token-usage details from a successful `response.completed` SSE event. It records counts for input, output, cached, reasoning, and tool tokens.
+**Purpose**: Records token counts from a completed SSE response. This gives observability into how many input, output, cached, reasoning, and tool tokens were involved.
 
-**Data flow**: Takes concrete token counts and optional cached/reasoning counts and emits a combined `codex.sse_event` log/trace event with `event.kind = "response.completed"` and the token fields.
+**Data flow**: It receives several token counts, some optional. It emits them in a structured log and trace event for response.completed.
 
-**Call relations**: It is called by response-event mapping code after a completion event has been successfully parsed.
+**Call relations**: Response event mapping code calls this after successfully extracting completion usage information from the stream.
 
 *Call graph*: called by 1 (map_response_events); 1 external calls (log_and_trace_event!).
 
@@ -704,11 +708,11 @@ fn sse_event_completed(
 fn user_prompt(&self, items: &[UserInput])
 ```
 
-**Purpose**: Logs user input telemetry for a turn, including prompt length and modality counts, while optionally redacting the actual prompt text. It separates privacy-sensitive logging from trace-safe aggregate counts.
+**Purpose**: Records that the user submitted input, including prompt length and counts of text and image inputs. It only logs the actual prompt text if the session allows prompt logging.
 
-**Data flow**: Iterates over `items: &[UserInput]`, concatenates all `UserInput::Text` contents into one `String`, counts text/image/local-image items, chooses either the real prompt or `"[REDACTED]"` based on `self.metadata.log_user_prompts`, logs `codex.user_prompt` with prompt length and chosen prompt text, and traces the same event with prompt length plus modality counts but no raw prompt.
+**Data flow**: It receives a list of user input items. It combines text parts, counts text/image/local-image items, redacts the prompt if configured, then logs prompt length and traces input counts.
 
-**Call relations**: It is emitted when a user turn is submitted so downstream observability can correlate prompt size and modality mix without always exposing content.
+**Call relations**: User-input handling code calls this when a prompt enters the session. The split between log and trace keeps sensitive prompt text controlled while still preserving useful counts.
 
 *Call graph*: 3 external calls (iter, log_event!, trace_event!).
 
@@ -725,11 +729,11 @@ fn tool_decision(
     )
 ```
 
-**Purpose**: Logs the approval or review decision made for a tool call, including whether it came from the user, config, or automated reviewer. It records the decision as a lowercased string.
+**Purpose**: Records the approval decision made for a tool call. This is useful when a tool needed review before running.
 
-**Data flow**: Reads `tool_name`, `call_id`, `ReviewDecision`, and `ToolDecisionSource`, converts the decision to lowercase text and the source to string, and emits a log-only `codex.tool_decision` event.
+**Data flow**: It receives tool name, call id, decision, and decision source. It converts the decision to lowercase text and logs a structured tool decision event.
 
-**Call relations**: It is called from approval-request flows when a tool invocation is accepted, rejected, or otherwise decided.
+**Call relations**: Approval request code calls this after a review decision is made. It records the decision but does not update metrics.
 
 *Call graph*: called by 1 (request_approval); 1 external calls (log_event!).
 
@@ -747,11 +751,11 @@ fn sandbox_outcome(
     )
 ```
 
-**Purpose**: Logs the outcome of sandboxed tool execution, including initial and optional escalated durations. It clamps duration conversions to `i64` milliseconds for trace/log field compatibility.
+**Purpose**: Records what happened when a tool ran under sandbox rules. A sandbox is a restricted environment that limits what a command can do.
 
-**Data flow**: Converts `initial_duration` and optional `escalated_duration` to bounded `i64` millisecond values, then emits both log and trace `codex.sandbox_outcome` events with tool name, call ID, outcome, and the duration fields.
+**Data flow**: It receives tool identity, outcome, initial run duration, and optional escalated duration. It converts durations to milliseconds safely and writes both log and trace events.
 
-**Call relations**: It is used after sandbox execution completes, especially when an escalation path may have added a second timing component.
+**Call relations**: Tool execution code can call this after a sandboxed run completes. It makes both the first attempt and any escalated attempt visible.
 
 *Call graph*: 3 external calls (as_millis, log_event!, trace_event!).
 
@@ -768,11 +772,11 @@ async fn log_tool_result_with_tags(
         extra_trace_fields: &[(&str, &s
 ```
 
-**Purpose**: Wraps an async tool execution, measures elapsed time, derives a preview/error string and success flag, emits tool-result telemetry with caller-supplied tags and trace fields, and returns the original result. It is the async convenience wrapper around `tool_result_with_tags`.
+**Purpose**: Wraps an async tool execution so the tool result is timed and recorded automatically. It returns the original tool result unchanged.
 
-**Data flow**: Captures `Instant::now()`, awaits the closure `f`, computes elapsed duration, maps `Ok((preview, success))` to a borrowed output string and `Err(error)` to an owned error string with `success=false`, calls `tool_result_with_tags(...)`, and finally returns the original `Result<(String, bool), E>` unchanged.
+**Data flow**: It receives tool identity, arguments, extra metric tags, extra trace fields, and an async function to run. It measures duration, turns either the tool preview or error into output text, records the result, and returns the original result.
 
-**Call relations**: Callers use this when they want timing and telemetry around a tool invocation without manually measuring duration or formatting failure output.
+**Call relations**: Tool-running code can use this wrapper around actual tool work. It delegates recording to SessionTelemetry::tool_result_with_tags.
 
 *Call graph*: calls 1 internal fn (tool_result_with_tags); 3 external calls (Borrowed, Owned, now).
 
@@ -783,11 +787,11 @@ async fn log_tool_result_with_tags(
 fn log_tool_failed(&self, tool_name: &str, error: &str)
 ```
 
-**Purpose**: Emits an immediate failed tool-result event without timing or call ID context, intended for failures that occur before normal tool execution telemetry can be produced. It marks the tool as builtin and records output/error length in the trace.
+**Purpose**: Records a tool failure that happened before normal timing/result wrapping was possible. It logs zero duration and marks success as false.
 
-**Data flow**: Uses `Duration::ZERO` as the duration, logs `codex.tool_result` with `success=false`, the error string as `output`, and empty MCP fields, then traces the same event with output length, line count, builtin origin, and `error.message`.
+**Data flow**: It receives a tool name and error text. It writes a log event with the error as output and a trace event with output length, line count, builtin origin, and error message.
 
-**Call relations**: This is a fallback path for early tool failures when the richer `tool_result_with_tags` flow is not available.
+**Call relations**: Early tool failure paths can call this when there is no full tool call context. It uses direct log and trace event macros rather than the metric helper.
 
 *Call graph*: 2 external calls (log_event!, trace_event!).
 
@@ -806,11 +810,11 @@ fn tool_result_with_tags(
         extra
 ```
 
-**Purpose**: Records the result of a tool call as metrics plus structured log/trace events, incorporating extra metric tags and extra trace fields. It distinguishes builtin tools from MCP-backed tools by inspecting supplied trace fields.
+**Purpose**: Records the final result of a tool call, including metrics and structured event fields. It supports extra tags and trace hints for special tool sources such as MCP servers.
 
-**Data flow**: Builds a tag vector containing `tool`, `success`, and any `extra_tags`, increments `TOOL_CALL_COUNT_METRIC`, records `TOOL_CALL_DURATION_METRIC`, extracts `mcp_server` and `mcp_server_origin` from `extra_trace_fields` via `trace_field_value`, logs `codex.tool_result` with arguments and output text, and traces aggregate-safe fields such as argument/output lengths, line count, tool origin, and whether it is an MCP tool.
+**Data flow**: It receives tool name, call id, arguments, duration, success flag, output, extra metric tags, and extra trace fields. It records count and duration metrics, extracts MCP details from trace fields, logs full arguments/output, and traces safer summary fields such as lengths.
 
-**Call relations**: It is the concrete sink used by `log_tool_result_with_tags` after async execution completes.
+**Call relations**: SessionTelemetry::log_tool_result_with_tags calls this after a wrapped tool finishes. It uses trace_field_value to pick out MCP-related fields before emitting telemetry.
 
 *Call graph*: calls 3 internal fn (counter, record_duration, trace_field_value); called by 1 (log_tool_result_with_tags); 3 external calls (with_capacity, log_event!, trace_event!).
 
@@ -821,11 +825,11 @@ fn tool_result_with_tags(
 fn record_responses_websocket_timing_metrics(&self, value: &serde_json::Value)
 ```
 
-**Purpose**: Extracts Responses API timing breakdown fields from a websocket JSON payload and records each present duration into its dedicated metric. It ignores missing, malformed, negative, or non-finite values.
+**Purpose**: Extracts detailed timing measurements from a special Responses API WebSocket event. These timings separate overhead, inference, and engine time-to-first-token or time-between-token costs.
 
-**Data flow**: Reads `value["timing_metrics"]`, then individually looks up overhead, inference, engine IAPI TTFT, engine service TTFT, engine IAPI TBT, and engine service TBT fields. Each field is converted with `duration_from_ms_value`; successful conversions are forwarded to `record_duration` with the corresponding metric name and no extra tags.
+**Data flow**: It receives a JSON value. It looks inside the timing_metrics object, reads known millisecond fields, converts valid values to Duration, and records each matching metric.
 
-**Call relations**: It is called only from `record_websocket_event` when a websocket message's `type` is `responsesapi.websocket_timing`.
+**Call relations**: SessionTelemetry::record_websocket_event calls this when a WebSocket message has the special timing event type. It relies on duration_from_ms_value to safely parse each timing value.
 
 *Call graph*: calls 2 internal fn (record_duration, duration_from_ms_value); called by 1 (record_websocket_event); 1 external calls (get).
 
@@ -836,11 +840,11 @@ fn record_responses_websocket_timing_metrics(&self, value: &serde_json::Value)
 fn responses_type(event: &ResponseEvent) -> String
 ```
 
-**Purpose**: Maps a `ResponseEvent` enum variant to a stable string label suitable for tracing span annotation. For item-carrying variants it delegates to item-type classification.
+**Purpose**: Turns a ResponseEvent into a short readable category name for tracing. This makes response traces easier to search and group.
 
-**Data flow**: Pattern-matches the `ResponseEvent` and returns an owned `String` such as `created`, `completed`, `text_delta`, or an item-derived label from `responses_item_type`.
+**Data flow**: It receives a ResponseEvent. It matches the event variant and returns a string such as created, completed, text_delta, or a response item type.
 
-**Call relations**: It is used by `record_responses` to populate the span's `otel.name` field.
+**Call relations**: SessionTelemetry::record_responses calls this before recording the event type on a trace span. For item-based events, it delegates to SessionTelemetry::responses_item_type.
 
 *Call graph*: calls 1 internal fn (responses_item_type); called by 1 (record_responses).
 
@@ -851,11 +855,11 @@ fn responses_type(event: &ResponseEvent) -> String
 fn responses_item_type(item: &ResponseItem) -> String
 ```
 
-**Purpose**: Maps a `ResponseItem` variant to a stable string label, including role-specific labels for message items. This normalizes heterogeneous response items into telemetry-friendly names.
+**Purpose**: Turns a response item into a short readable type name. It distinguishes messages, reasoning, tool calls, web search, image generation, compaction, and other item kinds.
 
-**Data flow**: Pattern-matches the `ResponseItem` and returns an owned `String`; `Message { role, .. }` becomes `message_from_<role>`, while all other variants map to fixed strings like `function_call`, `tool_search_output`, or `other`.
+**Data flow**: It receives a ResponseItem. It matches the item variant and returns a string label; for normal messages it includes the message role.
 
-**Call relations**: It is called by `responses_type` whenever a response event wraps a `ResponseItem`.
+**Call relations**: SessionTelemetry::responses_type calls this when a Responses API event contains an added or completed output item.
 
 *Call graph*: called by 1 (responses_type); 1 external calls (format!).
 
@@ -866,24 +870,24 @@ fn responses_item_type(item: &ResponseItem) -> String
 fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
 ```
 
-**Purpose**: Converts a JSON numeric value interpreted as milliseconds into a `Duration`, rejecting invalid numbers. It accepts floating-point, signed integer, and unsigned integer JSON representations.
+**Purpose**: Converts a JSON number measured in milliseconds into a Rust Duration. It rejects missing, negative, infinite, or non-number values.
 
-**Data flow**: Reads an optional `serde_json::Value`, extracts it as `f64` via `as_f64`/`as_i64`/`as_u64`, returns `None` for missing, non-finite, or negative values, clamps large values to `u64::MAX`, rounds to the nearest millisecond, and returns `Some(Duration::from_millis(...))`.
+**Data flow**: It receives an optional JSON value. It tries to read it as a floating-point, signed, or unsigned number, validates it, clamps it to the maximum Duration milliseconds, rounds it, and returns a Duration if valid.
 
-**Call relations**: It is the numeric parsing helper used by `record_responses_websocket_timing_metrics` for each timing field.
+**Call relations**: SessionTelemetry::record_responses_websocket_timing_metrics calls this for each timing field before recording detailed Responses API duration metrics.
 
 *Call graph*: called by 1 (record_responses_websocket_timing_metrics); 1 external calls (from_millis).
 
 
 ### `core/src/turn_timing.rs`
 
-`domain_logic` · `throughout a turn; updated at turn start, during streaming, around sampling/tool execution, and at completion`
+`domain_logic` · `per-turn request handling and telemetry recording`
 
-This module maintains two related timing models for a turn. `TurnTimingStateInner`, protected by an async `tokio::sync::Mutex`, records coarse milestones: when the turn started, the Unix start timestamp, when the first token arrived, and when the first assistant message item arrived. `TurnProfileState`, protected by a standard mutex, accumulates a richer phase profile for analytics: time before first sampling, active sampling time, overhead between sampling requests, tool-blocking time, idle time after the last sampling phase, counts of sampling requests and retries, and an optional cached completed `TurnProfile`.
+A “turn” is one round of interaction where the user asks something and the assistant works toward an answer. This file acts like a stopwatch set with several lap buttons. It records when the turn starts, when the first token or first full message appears, and how much time is spent in major phases such as sampling from the model or waiting on tools.
 
-The public helpers `record_turn_ttft_metric` and `record_turn_ttfm_metric` are adapters from streaming events into telemetry. They ask the turn's timing state to record TTFT or TTFM only once, then emit the resulting duration through session telemetry. Event classification is explicit: text deltas, reasoning deltas, non-empty assistant messages, reasoning items with non-empty text, and tool-call items count toward TTFT; agent messages and output items like function-call outputs do not.
+There are two layers of timing here. TurnTimingStateInner tracks simple milestones: start time, first token, and first message. TurnProfileState tracks a fuller profile of the turn: time before the first model request, time spent sampling, idle time between sampling requests, time blocked by tools, and time after the last sampling request. A mutex, which is a lock that stops two tasks from changing the same data at once, protects each shared state.
 
-Phase profiling uses RAII guards. `begin_sampling` and `begin_tool_blocking` attempt to enter a phase and return `TurnProfileTimingGuard`; on drop, an active guard ends its phase automatically. `TurnProfileState::advance` attributes elapsed time since the last transition to the currently active phase or to pre/post-sampling idle buckets. `complete` finalizes the profile once, computes total elapsed time from `started_at`, and assigns any rounding remainder back into the final active or idle bucket so the classified durations sum to the total. The design prevents overlapping phases, ignores retries after completion, and tolerates clock anomalies via saturating duration arithmetic.
+The file also decides which response events count as “first token” events. For example, actual assistant text or reasoning text counts, but metadata and rate-limit messages do not. Timing guards mark phases automatically: when a guard is created, a phase starts; when it is dropped, the phase ends. This makes phase timing harder to forget, much like a kitchen timer that stops when you take it off the counter.
 
 #### Function details
 
@@ -893,11 +897,11 @@ Phase profiling uses RAII guards. `begin_sampling` and `begin_tool_blocking` att
 async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent)
 ```
 
-**Purpose**: Records and emits the turn's time-to-first-token metric when a response event qualifies as the first token-bearing output.
+**Purpose**: Records the turn’s “time to first token,” meaning how long it took before the user could see the first meaningful piece of assistant output. It only records the metric once, and only for events that actually represent visible output.
 
-**Data flow**: Reads `turn_context.turn_timing_state`, awaits `record_ttft_for_response_event(event)`, and if it returns `Some(duration)` forwards that duration to `turn_context.session_telemetry.record_turn_ttft(duration)`. Otherwise it returns without emitting anything.
+**Data flow**: It receives the current turn context and a response event. It asks the turn timing state whether this event should set the first-token time; if a duration comes back, it sends that duration to the session telemetry. If the event does not count, or the first token was already recorded, nothing is changed.
 
-**Call relations**: Called by `try_run_sampling_request` as streaming response events arrive.
+**Call relations**: During sampling, try_run_sampling_request calls this as response events arrive. This function delegates the decision to the turn timing state, then hands the final duration to telemetry so the rest of the system can report it.
 
 *Call graph*: called by 1 (try_run_sampling_request).
 
@@ -908,11 +912,11 @@ async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEve
 async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem)
 ```
 
-**Purpose**: Records and emits the turn's time-to-first-message metric when the first `TurnItem::AgentMessage` is completed.
+**Purpose**: Records the turn’s “time to first message,” meaning how long it took before the first completed assistant message item was produced. This is separate from first token because a token can arrive before a full message is ready.
 
-**Data flow**: Awaits `turn_context.turn_timing_state.record_ttfm_for_turn_item(item)`, and if a duration is returned, emits it through `session_telemetry.record_duration(TURN_TTFM_DURATION_METRIC, duration, &[])`.
+**Data flow**: It receives the current turn context and a completed turn item. It asks the timing state whether that item is the first agent message; if so, it gets back a duration and records it under the turn time-to-first-message metric. Otherwise it leaves telemetry unchanged.
 
-**Call relations**: Called by `emit_turn_item_completed` when turn items are finalized.
+**Call relations**: emit_turn_item_completed calls this when a turn item finishes. The function filters through TurnTimingState and then sends the resulting measurement to the session telemetry recorder.
 
 *Call graph*: called by 1 (emit_turn_item_completed).
 
@@ -923,11 +927,11 @@ async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem)
 async fn mark_turn_started(&self, started_at: Instant) -> i64
 ```
 
-**Purpose**: Initializes timing state for a new turn, resetting first-token/message markers and starting a fresh profile timeline.
+**Purpose**: Starts timing a new turn. It resets earlier first-token and first-message markers so measurements from a previous turn cannot leak into the new one.
 
-**Data flow**: Computes `started_at_unix_ms` via `now_unix_timestamp_ms()`, locks the async state, stores `started_at`, stores Unix seconds as `started_at_unix_ms / 1000`, clears `first_token_at` and `first_message_at`, then resets the profile state with `start(started_at)`. It returns the Unix-millisecond timestamp.
+**Data flow**: It receives an Instant, which is Rust’s steady clock value for measuring elapsed time. It also reads the current wall-clock Unix time in milliseconds, stores the start time and Unix seconds, clears old milestone times, starts the detailed profile, and returns the Unix millisecond timestamp.
 
-**Call relations**: Called when a turn begins so later TTFT/TTFM and profile measurements have a baseline.
+**Call relations**: This is called near the beginning of a turn. It uses now_unix_timestamp_ms for a wall-clock timestamp and profile_state to reset the detailed phase profiler.
 
 *Call graph*: calls 2 internal fn (profile_state, now_unix_timestamp_ms).
 
@@ -938,11 +942,11 @@ async fn mark_turn_started(&self, started_at: Instant) -> i64
 async fn started_at_unix_secs(&self) -> Option<i64>
 ```
 
-**Purpose**: Returns the stored Unix-seconds start timestamp for the current turn, if one has been recorded.
+**Purpose**: Returns the turn start time as Unix seconds, if the turn has been started. This is useful when reports or protocol messages need a normal wall-clock timestamp.
 
-**Data flow**: Locks the async state and returns `started_at_unix_secs`.
+**Data flow**: It reads the locked timing state and returns the stored Unix-second start time. If no turn start was recorded yet, it returns nothing.
 
-**Call relations**: Used by callers that need the coarse wall-clock start time.
+**Call relations**: Other code can call this after mark_turn_started has stored the timestamp. It does not call into the profiling code; it only reads the simple milestone state.
 
 
 ##### `TurnTimingState::completed_at_and_duration_ms`  (lines 101–108)
@@ -951,11 +955,11 @@ async fn started_at_unix_secs(&self) -> Option<i64>
 async fn completed_at_and_duration_ms(&self) -> (Option<i64>, Option<i64>)
 ```
 
-**Purpose**: Returns the current completion wall-clock time and elapsed duration since turn start in milliseconds.
+**Purpose**: Reports when the turn completed and how many milliseconds it lasted. It gives callers both a wall-clock completion time and an elapsed duration from the stored start time.
 
-**Data flow**: Locks the async state, computes `completed_at` from `now_unix_timestamp_secs()`, derives `duration_ms` from `started_at.elapsed().as_millis()` if a start exists, saturating to `i64::MAX` on conversion overflow, and returns the pair `(Some(completed_at), Option<duration_ms>)`.
+**Data flow**: It locks the timing state, gets the current Unix time in seconds, and compares the saved start Instant with the current time. It returns a pair: completion timestamp and duration in milliseconds, with no duration if the turn was never started.
 
-**Call relations**: Used when finalizing turn analytics or metadata at completion.
+**Call relations**: This is used when finishing or reporting a turn. It calls now_unix_timestamp_secs for the wall-clock completion time and reads the already stored start Instant for elapsed time.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_secs).
 
@@ -966,11 +970,11 @@ async fn completed_at_and_duration_ms(&self) -> (Option<i64>, Option<i64>)
 async fn time_to_first_token_ms(&self) -> Option<i64>
 ```
 
-**Purpose**: Returns the already-recorded time to first token in milliseconds, if TTFT has been observed.
+**Purpose**: Returns the already-recorded time to first token in milliseconds. It does not create the measurement; it only reads it.
 
-**Data flow**: Locks the async state, calls `state.time_to_first_token()`, converts the resulting `Duration` to `i64` milliseconds with saturation, and returns it as `Option<i64>`.
+**Data flow**: It locks the timing state and asks the inner state for the duration between turn start and first token. If both times exist, it converts that duration to milliseconds; otherwise it returns nothing.
 
-**Call relations**: Provides a read-only accessor after TTFT has been recorded.
+**Call relations**: This is a read-only view over TurnTimingStateInner::time_to_first_token. It is useful after response events have already had a chance to record the first token.
 
 
 ##### `TurnTimingState::complete_profile`  (lines 117–119)
@@ -979,11 +983,11 @@ async fn time_to_first_token_ms(&self) -> Option<i64>
 fn complete_profile(&self) -> TurnProfile
 ```
 
-**Purpose**: Finalizes and returns the turn's classified `TurnProfile`, caching the result so repeated calls are stable.
+**Purpose**: Finishes the detailed turn profile and returns the final breakdown of where the turn’s time went. Calling it more than once returns the same completed profile rather than recalculating a different result.
 
-**Data flow**: Locks the profile mutex via `profile_state()`, calls `complete(Instant::now())`, and returns the resulting `TurnProfile`.
+**Data flow**: It gets the profile state, supplies the current Instant as the finish time, and receives a TurnProfile containing measured millisecond totals and sampling counts. The profile state is updated so the result is remembered.
 
-**Call relations**: Used at turn completion to emit or persist the phase breakdown.
+**Call relations**: Turn-ending code calls this when it needs the final performance profile. It uses profile_state to reach the shared profiler, and TurnProfileState::complete does the detailed accounting.
 
 *Call graph*: calls 1 internal fn (profile_state); 1 external calls (now).
 
@@ -994,11 +998,11 @@ fn complete_profile(&self) -> TurnProfile
 fn begin_sampling(self: &Arc<Self>) -> TurnProfileTimingGuard
 ```
 
-**Purpose**: Attempts to enter the sampling phase and returns an RAII guard that will end the phase on drop if activation succeeded.
+**Purpose**: Marks the start of a model sampling phase, where the system is asking the model to generate or reason. It returns a guard object that will automatically stop timing this phase when the guard is dropped.
 
-**Data flow**: Locks the profile state, calls `begin_sampling(Instant::now())` to determine whether the phase can start, then returns `TurnProfileTimingGuard { timing: Arc::clone(self), phase: Sampling, active }`.
+**Data flow**: It reads the current time, asks the profile state to begin sampling, and builds a TurnProfileTimingGuard holding a shared reference back to this timing state. If the phase could not start, the guard is inactive and will do nothing when dropped.
 
-**Call relations**: Used around model sampling requests so elapsed time is attributed to sampling until the guard is dropped.
+**Call relations**: Sampling code calls this at the start of a model request. It uses profile_state to update the profile and returns a guard whose Drop behavior later calls back to end the phase.
 
 *Call graph*: calls 1 internal fn (profile_state); 2 external calls (clone, now).
 
@@ -1009,11 +1013,11 @@ fn begin_sampling(self: &Arc<Self>) -> TurnProfileTimingGuard
 fn record_sampling_retry(&self)
 ```
 
-**Purpose**: Increments the sampling-retry counter for the current profile when retries occur before completion.
+**Purpose**: Counts an extra sampling attempt, such as when a model request must be retried. This helps performance reports distinguish one long request from repeated attempts.
 
-**Data flow**: Locks the profile state and calls `record_sampling_retry()`.
+**Data flow**: It locks the profile state and increments the retry count if the profile is active and not yet complete. If the turn was not started or is already complete, nothing changes.
 
-**Call relations**: Used by retry logic to annotate the eventual `TurnProfile`.
+**Call relations**: Sampling code can call this when retrying a model request. It passes the work directly to TurnProfileState::record_sampling_retry through profile_state.
 
 *Call graph*: calls 1 internal fn (profile_state).
 
@@ -1024,11 +1028,11 @@ fn record_sampling_retry(&self)
 fn begin_tool_blocking(self: &Arc<Self>) -> TurnProfileTimingGuard
 ```
 
-**Purpose**: Attempts to enter the tool-blocking phase and returns an RAII guard that ends the phase on drop if activation succeeded.
+**Purpose**: Marks the start of time spent blocked on a tool, such as waiting for a command or external operation before the assistant can continue. Like sampling, it returns a guard that ends the phase automatically.
 
-**Data flow**: Locks the profile state, calls `begin_tool_blocking(Instant::now())`, and returns `TurnProfileTimingGuard { timing: Arc::clone(self), phase: ToolBlocking, active }`.
+**Data flow**: It gets the current time, asks the profile state to enter the tool-blocking phase, and returns a TurnProfileTimingGuard tied to that phase. If another phase is already active or the turn is not in a valid state, the guard is inactive.
 
-**Call relations**: Used around synchronous tool waits so that blocked time is separated from sampling and idle overhead.
+**Call relations**: Tool-running code calls this when the assistant is waiting on tool work. The returned guard later uses Drop to tell the profile state that tool blocking ended.
 
 *Call graph*: calls 1 internal fn (profile_state); 2 external calls (clone, now).
 
@@ -1042,11 +1046,11 @@ async fn record_ttft_for_response_event(
     ) -> Option<Duration>
 ```
 
-**Purpose**: Records TTFT exactly once when a response event is classified as token-bearing.
+**Purpose**: Checks whether a response event should count as the first visible output and, if so, records the time to first token. It protects against recording this milestone more than once.
 
-**Data flow**: Checks `response_event_records_turn_ttft(event)`; if false returns `None`. Otherwise it locks the async state and calls `state.record_turn_ttft()`, returning the resulting `Option<Duration>`.
+**Data flow**: It receives a response event. First it asks response_event_records_turn_ttft whether the event is meaningful output; if not, it returns nothing. If the event qualifies, it locks the timing state and tries to set the first-token timestamp, returning the elapsed duration if this was the first one.
 
-**Call relations**: Called by `record_turn_ttft_metric`; event classification is delegated to `response_event_records_turn_ttft`.
+**Call relations**: record_turn_ttft_metric calls this while processing model output. This function uses response_event_records_turn_ttft as the filter, then TurnTimingStateInner::record_turn_ttft to store the milestone.
 
 *Call graph*: calls 1 internal fn (response_event_records_turn_ttft).
 
@@ -1057,11 +1061,11 @@ async fn record_ttft_for_response_event(
 async fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration>
 ```
 
-**Purpose**: Records TTFM exactly once when the first completed turn item is an `AgentMessage`.
+**Purpose**: Records the time to the first completed assistant message item. It ignores other turn items because they are not the first full agent message shown to the user.
 
-**Data flow**: Returns `None` unless `item` matches `TurnItem::AgentMessage(_)`. For agent messages it locks the async state and calls `state.record_turn_ttfm()`, returning the resulting duration if this is the first message.
+**Data flow**: It receives a turn item and checks whether it is an AgentMessage. If not, it returns nothing. If it is, it locks the timing state and records the first-message time, returning the duration from turn start if this is the first message.
 
-**Call relations**: Called by `record_turn_ttfm_metric` during turn-item completion.
+**Call relations**: record_turn_ttfm_metric calls this after turn items complete. It performs the item-type filter itself, then relies on TurnTimingStateInner::record_turn_ttfm for the one-time recording.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1072,11 +1076,11 @@ async fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration>
 fn profile_state(&self) -> std::sync::MutexGuard<'_, TurnProfileState>
 ```
 
-**Purpose**: Obtains the synchronous mutex guard for the profile state, recovering from poisoning by taking the inner value.
+**Purpose**: Gives safe access to the detailed profile state protected by a standard mutex, which is a lock for shared data. It also recovers the state if a previous holder panicked while holding the lock.
 
-**Data flow**: Locks `self.profile` and on poison uses `PoisonError::into_inner` to return the guard anyway.
+**Data flow**: It locks the profile mutex and returns the lock guard, which lets the caller read or change the profile. If the lock is poisoned by a panic, it still returns the contained state instead of failing.
 
-**Call relations**: Internal helper used by profile-related methods such as start, begin/end phase, retry recording, and completion.
+**Call relations**: The public profile methods use this helper before starting, stopping, completing, or updating phase timing. It centralizes the locking behavior so those methods do not repeat it.
 
 *Call graph*: called by 5 (begin_sampling, begin_tool_blocking, complete_profile, mark_turn_started, record_sampling_retry); 1 external calls (lock).
 
@@ -1087,11 +1091,11 @@ fn profile_state(&self) -> std::sync::MutexGuard<'_, TurnProfileState>
 fn drop(&mut self)
 ```
 
-**Purpose**: Automatically ends the associated profile phase when the guard goes out of scope, but only if phase entry actually succeeded.
+**Purpose**: Automatically ends a timed profile phase when the guard goes out of scope. This prevents callers from having to remember a separate “stop timing” call.
 
-**Data flow**: Checks `self.active`; if true, locks the timing state's profile and calls `end_phase(Instant::now(), self.phase)`. It returns no value.
+**Data flow**: When the guard is destroyed, it checks whether it was active. If so, it gets the current time and tells the profile state to end the phase it started.
 
-**Call relations**: Completes the RAII pattern started by `begin_sampling` and `begin_tool_blocking`.
+**Call relations**: Guards are created by TurnTimingState::begin_sampling and TurnTimingState::begin_tool_blocking. Rust calls this drop method automatically, and it hands the end timestamp to TurnProfileState::end_phase.
 
 *Call graph*: 1 external calls (now).
 
@@ -1102,11 +1106,11 @@ fn drop(&mut self)
 fn now_unix_timestamp_secs() -> i64
 ```
 
-**Purpose**: Returns the current Unix timestamp in whole seconds.
+**Purpose**: Returns the current wall-clock time as Unix seconds, meaning seconds since January 1, 1970. This format is common in logs and telemetry.
 
-**Data flow**: Calls `now_unix_timestamp_ms()` and divides the result by 1000.
+**Data flow**: It calls now_unix_timestamp_ms to get milliseconds, divides by 1000, and returns seconds.
 
-**Call relations**: Used by `completed_at_and_duration_ms` for completion wall-clock time.
+**Call relations**: TurnTimingState::completed_at_and_duration_ms uses this when it needs a human-comparable completion timestamp rather than just elapsed time.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_ms); called by 1 (completed_at_and_duration_ms).
 
@@ -1117,11 +1121,11 @@ fn now_unix_timestamp_secs() -> i64
 fn now_unix_timestamp_ms() -> i64
 ```
 
-**Purpose**: Returns the current Unix timestamp in milliseconds, saturating to zero/default on clock errors and `i64::MAX` on conversion overflow.
+**Purpose**: Returns the current wall-clock time as Unix milliseconds. Many parts of the system use this when they need timestamps for events, requests, approvals, or telemetry.
 
-**Data flow**: Reads `SystemTime::now()`, computes duration since `UNIX_EPOCH` with `unwrap_or_default()`, converts `as_millis()` to `i64` with `try_from`, and returns the result or `i64::MAX` on overflow.
+**Data flow**: It reads the system clock, measures the duration since the Unix epoch, converts that duration to milliseconds, and fits it into an i64 number. If conversion would overflow, it returns the largest possible i64.
 
-**Call relations**: Used widely across the system for timestamping; within this file it initializes turn start time and supports completion timestamps.
+**Call relations**: This is a shared timestamp helper used in this file when a turn starts and by many other parts of the system that stamp events with the current time.
 
 *Call graph*: called by 22 (stamp_ws_stream_request_start_ms, run_guardian_review, emit_turn_item_completed, emit_turn_item_started, request_command_approval, request_patch_approval, request_permissions_for_environment, execute_user_shell_command, emit_exec_command_begin, emit_exec_end (+12 more)); 2 external calls (now, try_from).
 
@@ -1132,11 +1136,11 @@ fn now_unix_timestamp_ms() -> i64
 fn duration_to_u64_ms(duration: Duration) -> u64
 ```
 
-**Purpose**: Converts a `Duration` to milliseconds as `u64`, saturating on overflow.
+**Purpose**: Converts a Duration into an unsigned millisecond count for telemetry profiles. It safely caps very large values instead of overflowing.
 
-**Data flow**: Reads `duration.as_millis()`, converts it with `u64::try_from`, and returns the result or `u64::MAX`.
+**Data flow**: It receives a Duration, reads its millisecond length, converts that value to u64, and returns u64::MAX if the value is too large to fit.
 
-**Call relations**: Used when finalizing `TurnProfile` fields in `TurnProfileState::complete`.
+**Call relations**: TurnProfileState::complete uses this when turning internal Duration values into the numeric fields of a TurnProfile.
 
 *Call graph*: called by 1 (complete); 2 external calls (as_millis, try_from).
 
@@ -1147,11 +1151,11 @@ fn duration_to_u64_ms(duration: Duration) -> u64
 fn start(&mut self, started_at: Instant)
 ```
 
-**Purpose**: Resets the profile state for a new turn starting at the given instant.
+**Purpose**: Resets the detailed profile for a fresh turn and records the starting point. This clears any phase timings left from a previous turn.
 
-**Data flow**: Replaces `self` with a new `TurnProfileState` whose `started_at` and `last_transition_at` are `Some(started_at)` and whose remaining fields come from `Default::default()`.
+**Data flow**: It receives the turn’s starting Instant. It replaces the whole profile state with a new default state that has started_at and last_transition_at set to that Instant.
 
-**Call relations**: Called by `TurnTimingState::mark_turn_started`.
+**Call relations**: TurnTimingState::mark_turn_started calls this at the beginning of a turn. It prepares the profile so later calls to begin_sampling or begin_tool_blocking can classify elapsed time correctly.
 
 *Call graph*: 1 external calls (default).
 
@@ -1162,11 +1166,11 @@ fn start(&mut self, started_at: Instant)
 fn begin_sampling(&mut self, now: Instant) -> bool
 ```
 
-**Purpose**: Starts a sampling phase if profiling is active, not completed, and no other phase is currently active.
+**Purpose**: Starts measuring a sampling phase if the profile is in a valid state. It also counts this as one sampling request.
 
-**Data flow**: Returns `false` if a completed profile exists, no start time exists, or another phase is active. Otherwise it calls `advance(now)`, moves any pending idle-after-sampling time into `between_sampling_overhead` if sampling has been seen before, marks `seen_sampling = true`, sets `active_phase = Some(Sampling)`, increments `sampling_request_count` with saturation, and returns `true`.
+**Data flow**: It receives the current Instant. If the profile is already complete, not started, or already in another active phase, it returns false. Otherwise it first assigns elapsed idle time to the right bucket, marks sampling as active, increments the sampling request count, and returns true.
 
-**Call relations**: Called by `TurnTimingState::begin_sampling` before constructing the guard.
+**Call relations**: TurnTimingState::begin_sampling calls this when model sampling begins. It uses advance to classify time since the previous transition before switching into the Sampling phase.
 
 *Call graph*: calls 1 internal fn (advance); 1 external calls (take).
 
@@ -1177,11 +1181,11 @@ fn begin_sampling(&mut self, now: Instant) -> bool
 fn record_sampling_retry(&mut self)
 ```
 
-**Purpose**: Increments the retry counter for sampling attempts as long as profiling has started and not yet completed.
+**Purpose**: Adds one to the sampling retry count for an active, unfinished turn. This records that the system had to try sampling again.
 
-**Data flow**: Checks that `completed_profile` is `None` and `started_at` is `Some`, then increments `sampling_retry_count` with saturation.
+**Data flow**: It checks whether the profile has started and is not completed. If so, it increments the retry count using saturating arithmetic, which means it stops at the maximum value instead of wrapping around.
 
-**Call relations**: Called by `TurnTimingState::record_sampling_retry`.
+**Call relations**: TurnTimingState::record_sampling_retry calls this when sampling code reports a retry. It only updates the counter; it does not change the current timing phase.
 
 
 ##### `TurnProfileState::begin_tool_blocking`  (lines 226–236)
@@ -1190,11 +1194,11 @@ fn record_sampling_retry(&mut self)
 fn begin_tool_blocking(&mut self, now: Instant) -> bool
 ```
 
-**Purpose**: Starts a tool-blocking phase if profiling is active, not completed, and no other phase is currently active.
+**Purpose**: Starts measuring time spent blocked on a tool. It refuses to start if the profile is complete, not started, or already timing another phase.
 
-**Data flow**: Returns `false` if completed, not started, or already in another phase. Otherwise it calls `advance(now)`, sets `active_phase = Some(ToolBlocking)`, and returns `true`.
+**Data flow**: It receives the current Instant. If the state is invalid for starting a new phase, it returns false. Otherwise it classifies time since the last transition, sets the active phase to ToolBlocking, and returns true.
 
-**Call relations**: Called by `TurnTimingState::begin_tool_blocking`.
+**Call relations**: TurnTimingState::begin_tool_blocking calls this when tool wait time begins. Like sampling, it uses advance first so the gap before the tool wait is not lost.
 
 *Call graph*: calls 1 internal fn (advance).
 
@@ -1205,11 +1209,11 @@ fn begin_tool_blocking(&mut self, now: Instant) -> bool
 fn end_phase(&mut self, now: Instant, phase: TurnProfilePhase)
 ```
 
-**Purpose**: Ends the currently active phase if it matches the expected phase and profiling has not already completed.
+**Purpose**: Stops the currently active profiling phase, but only if it matches the phase that the caller says is ending. This prevents one guard from accidentally ending a different phase.
 
-**Data flow**: Checks that `completed_profile` is `None` and `active_phase == Some(phase)`; if so it calls `advance(now)` and then clears `active_phase`.
+**Data flow**: It receives the current Instant and the phase expected to end. If the profile is complete or the active phase is different, it does nothing. Otherwise it adds elapsed time to the active phase through advance and clears the active phase.
 
-**Call relations**: Invoked from `TurnProfileTimingGuard::drop` to close sampling or tool-blocking intervals.
+**Call relations**: TurnProfileTimingGuard::drop calls this automatically when a sampling or tool-blocking guard is destroyed. It is the closing half of begin_sampling and begin_tool_blocking.
 
 *Call graph*: calls 1 internal fn (advance).
 
@@ -1220,11 +1224,11 @@ fn end_phase(&mut self, now: Instant, phase: TurnProfilePhase)
 fn advance(&mut self, now: Instant)
 ```
 
-**Purpose**: Attributes elapsed time since the last transition to the appropriate bucket based on the current active phase and whether sampling has begun before.
+**Purpose**: Classifies the time since the last profile transition into the right bucket. This is the core bookkeeping that turns a raw timeline into meaningful categories.
 
-**Data flow**: Replaces `last_transition_at` with `now`; if there was no previous timestamp it returns. Otherwise it computes `elapsed = now.saturating_duration_since(previous)` and adds it to `sampling`, `tool_blocking`, `pending_idle_after_sampling`, or `before_first_sampling` depending on `active_phase` and `seen_sampling`.
+**Data flow**: It receives the current Instant and compares it with the previous transition time. Depending on the active phase, it adds the elapsed time to sampling or tool blocking; if no phase is active, it adds the time either before first sampling or to idle time after sampling.
 
-**Call relations**: Internal accounting primitive used by phase transitions and completion.
+**Call relations**: begin_sampling, begin_tool_blocking, end_phase, and complete all call this before changing or finalizing state. It is the shared “move the stopwatch forward” step.
 
 *Call graph*: called by 4 (begin_sampling, begin_tool_blocking, complete, end_phase); 1 external calls (saturating_duration_since).
 
@@ -1235,11 +1239,11 @@ fn advance(&mut self, now: Instant)
 fn complete(&mut self, now: Instant) -> TurnProfile
 ```
 
-**Purpose**: Finalizes the classified turn profile once, ensuring all elapsed time is accounted for and caching the result for future calls.
+**Purpose**: Finalizes the detailed turn profile and returns a stable summary of the turn’s timing. It preserves the first completed result so repeated calls do not change the numbers.
 
-**Data flow**: If `completed_profile` already exists, it clones and returns it. Otherwise it remembers `final_phase`, calls `advance(now)`, drains `pending_idle_after_sampling` into `after_last_sampling` if sampling occurred, constructs a `TurnProfile` from all duration buckets and counters using `duration_to_u64_ms`, computes total elapsed time from `started_at`, calculates any rounding remainder between total and classified milliseconds, adds that remainder back into the bucket corresponding to `final_phase` or idle state, clears `active_phase`, stores a clone in `completed_profile`, and returns it.
+**Data flow**: It receives the finish Instant. If a profile was already completed, it returns that saved copy. Otherwise it advances timing to the finish point, moves any final idle time into “after last sampling,” converts durations to milliseconds, fills in request and retry counts, adjusts for tiny rounding differences, stores the completed profile, and returns it.
 
-**Call relations**: Called by `TurnTimingState::complete_profile`; it is the terminal aggregation step for phase analytics.
+**Call relations**: TurnTimingState::complete_profile calls this when the turn is being reported. It uses advance for final classification and duration_to_u64_ms to build the TurnProfile fields.
 
 *Call graph*: calls 2 internal fn (advance, duration_to_u64_ms); 1 external calls (take).
 
@@ -1250,11 +1254,11 @@ fn complete(&mut self, now: Instant) -> TurnProfile
 fn time_to_first_token(&self) -> Option<Duration>
 ```
 
-**Purpose**: Computes the elapsed duration from turn start to the recorded first-token instant, if both timestamps exist.
+**Purpose**: Calculates the elapsed time between turn start and first token, if both moments are known. It is a small read-only helper for the simple timing state.
 
-**Data flow**: Uses `self.first_token_at?` and `self.started_at?` to compute `first_token_at.duration_since(started_at)` and returns it as `Option<Duration>`.
+**Data flow**: It reads started_at and first_token_at from the inner state. If either is missing, it returns nothing; otherwise it returns the duration from start to first token.
 
-**Call relations**: Used by `record_turn_ttft` and indirectly by the public TTFT accessor.
+**Call relations**: TurnTimingStateInner::record_turn_ttft calls this right after setting the first-token timestamp, and TurnTimingState::time_to_first_token_ms uses the same idea when reporting milliseconds.
 
 *Call graph*: called by 1 (record_turn_ttft).
 
@@ -1265,11 +1269,11 @@ fn time_to_first_token(&self) -> Option<Duration>
 fn record_turn_ttft(&mut self) -> Option<Duration>
 ```
 
-**Purpose**: Records the first-token timestamp exactly once and returns the resulting TTFT duration.
+**Purpose**: Records the first-token timestamp exactly once and returns the resulting duration from turn start. It refuses to overwrite an earlier first-token measurement.
 
-**Data flow**: Returns `None` if `first_token_at` is already set or `started_at` is absent. Otherwise it stores `Instant::now()` into `first_token_at` and returns `self.time_to_first_token()`.
+**Data flow**: It checks whether first_token_at is already set; if so, it returns nothing. It also requires a started_at value. If the turn has started and no first token was recorded, it stores the current Instant and returns the calculated time to first token.
 
-**Call relations**: Called by `TurnTimingState::record_ttft_for_response_event` after event classification passes.
+**Call relations**: TurnTimingState::record_ttft_for_response_event calls this after confirming that a response event counts as visible output. It relies on time_to_first_token to calculate the final duration.
 
 *Call graph*: calls 1 internal fn (time_to_first_token); 1 external calls (now).
 
@@ -1280,11 +1284,11 @@ fn record_turn_ttft(&mut self) -> Option<Duration>
 fn record_turn_ttfm(&mut self) -> Option<Duration>
 ```
 
-**Purpose**: Records the first-message timestamp exactly once and returns the elapsed duration since turn start.
+**Purpose**: Records the first-message timestamp exactly once and returns the duration from turn start. This tracks when the first complete agent message appears.
 
-**Data flow**: Returns `None` if `first_message_at` is already set or `started_at` is absent. Otherwise it captures `Instant::now()`, stores it in `first_message_at`, computes `duration_since(started_at)`, and returns that duration.
+**Data flow**: It checks whether first_message_at is already set; if so, it returns nothing. It requires a saved start time, stores the current Instant as the first message time, and returns the elapsed duration.
 
-**Call relations**: Called by `TurnTimingState::record_ttfm_for_turn_item` for the first agent message.
+**Call relations**: TurnTimingState::record_ttfm_for_turn_item calls this after confirming that the completed item is an agent message. The returned duration is later sent to telemetry by record_turn_ttfm_metric.
 
 *Call graph*: 1 external calls (now).
 
@@ -1295,11 +1299,11 @@ fn record_turn_ttfm(&mut self) -> Option<Duration>
 fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool
 ```
 
-**Purpose**: Classifies whether a streaming `ResponseEvent` should count as the first token-bearing output for TTFT purposes.
+**Purpose**: Decides whether a response event should count as the first meaningful assistant output. This keeps metadata and bookkeeping events from falsely improving the first-token measurement.
 
-**Data flow**: Pattern-matches the event: output-item events delegate to `response_item_records_turn_ttft`, text and reasoning deltas return `true`, and lifecycle/control events such as `Created`, `Completed`, moderation metadata, tool-call input deltas, rate limits, and model metadata return `false`.
+**Data flow**: It receives a ResponseEvent. For item-added or item-done events, it delegates to response_item_records_turn_ttft. For text or reasoning deltas, it returns true. For creation notices, model metadata, moderation metadata, rate limits, completion notices, and similar non-output events, it returns false.
 
-**Call relations**: Used by `TurnTimingState::record_ttft_for_response_event` to gate TTFT recording.
+**Call relations**: TurnTimingState::record_ttft_for_response_event calls this before recording time to first token. It is the event-level filter, and response_item_records_turn_ttft is the item-level filter it uses when the event contains a response item.
 
 *Call graph*: calls 1 internal fn (response_item_records_turn_ttft); called by 1 (record_ttft_for_response_event).
 
@@ -1310,11 +1314,11 @@ fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool
 fn response_item_records_turn_ttft(item: &ResponseItem) -> bool
 ```
 
-**Purpose**: Classifies whether a `ResponseItem` contains user-visible output that should count as TTFT.
+**Purpose**: Decides whether a response item contains meaningful output for the time-to-first-token metric. It treats actual assistant text, reasoning text, and tool-call starts as output, while ignoring final tool outputs and non-visible triggers.
 
-**Data flow**: For `Message`, it extracts raw assistant text with `raw_assistant_output_text_from_item` and requires non-empty text. For `Reasoning`, it checks summary/content entries for non-empty text. `AgentMessage` returns false. Tool-call and shell-call items return true because they are visible output. Output items like `FunctionCallOutput`, `ToolSearchOutput`, and `Other` return false.
+**Data flow**: It receives a ResponseItem. For normal messages, it extracts raw assistant text and checks that it is not empty. For reasoning items, it looks for non-empty summary or content text. Some tool-call and compaction items count as output because they show the assistant doing work; agent messages, tool outputs, compaction triggers, and unknown items do not.
 
-**Call relations**: Called by `response_event_records_turn_ttft` when TTFT classification depends on a completed or added response item.
+**Call relations**: response_event_records_turn_ttft calls this when a response event contains an item. It uses raw_assistant_output_text_from_item to inspect message text without duplicating the text-extraction rules.
 
 *Call graph*: calls 1 internal fn (raw_assistant_output_text_from_item); called by 1 (response_event_records_turn_ttft).
 
@@ -1324,11 +1328,13 @@ These files attach telemetry to request handling and tool execution paths, inclu
 
 ### `app-server/src/app_server_tracing.rs`
 
-`util` · `per-request tracing during request processing`
+`util` · `request handling and cross-cutting telemetry`
 
-This file centralizes how request spans are created so telemetry is consistent across stdio, websocket, Unix-socket, and in-process callers. `request_span` handles parsed `JSONRPCRequest` values from transport-based JSON-RPC, while `typed_request_span` mirrors the same shape for typed `ClientRequest` values used by the in-process path. Both functions create spans through `app_server_request_span_template`, which stamps stable OpenTelemetry and RPC fields such as `otel.kind=server`, `rpc.system=jsonrpc`, `rpc.method`, `rpc.transport`, `rpc.request_id`, `app_server.connection_id`, and placeholders for client name/version and turn ID.
+This file is about observability: making the server’s work visible while it runs. A tracing span is like a labeled folder for one piece of work. Everything logged while the request is being processed can be attached to that folder, along with useful labels such as the RPC method, transport type, request id, connection id, client name, and client version.
 
-Client identity is derived carefully. For initialize requests, `initialize_client_info` or `initialize_client_info_from_typed_request` extracts `InitializeParams.client_info`; otherwise the code falls back to `ConnectionSessionState` via `client_name` and `client_version`. `record_client_info` writes only present values into the span. Parent tracing context is attached by `attach_parent_context`: if the inbound JSON-RPC request carries a W3C trace carrier, it attempts to set that as the parent and warns if invalid; otherwise it falls back to any ambient `traceparent` context from the environment. This preserves distributed tracing continuity for both external and embedded callers while keeping span field names identical across transports.
+The main job here is to build that folder in a consistent shape for two paths. `request_span` is used for normal JSON-RPC requests that come through transports such as stdio, Unix sockets, or websockets. `typed_request_span` is used when code calls the app server directly in-process, without a JSON envelope. Both paths create the same kind of span so monitoring tools can compare them fairly.
+
+The file also tries to connect incoming work to a larger distributed trace. A distributed trace is a way to follow one user action across multiple services. If the request includes W3C trace context information, this file attaches it as the parent of the new span. If not, it may fall back to trace information from the process environment. Client identity is taken from an `initialize` request when present, or otherwise from the saved session state. Without this file, request logs would be harder to group, compare, and connect across transports and services.
 
 #### Function details
 
@@ -1343,11 +1349,11 @@ fn request_span(
 ) -> Span
 ```
 
-**Purpose**: Builds the tracing span for a transport-delivered JSON-RPC request, including transport name, request ID, client identity, and optional inbound trace context.
+**Purpose**: Creates the tracing span for a JSON-RPC app-server request. It labels the request with method, transport, request id, connection id, client information, and any incoming trace context so later logs and telemetry can be tied back to this request.
 
-**Data flow**: Takes a `JSONRPCRequest`, `AppServerTransport`, `ConnectionId`, and `ConnectionSessionState`; extracts optional initialize params with `initialize_client_info`, derives the method string, creates a span via `app_server_request_span_template`, records client name/version using initialize params or session fallbacks, constructs an optional `W3cTraceContext` from `request.trace`, attaches parent context with `attach_parent_context`, and returns the configured `Span`.
+**Data flow**: It receives the parsed JSON-RPC request, the transport it arrived on, the connection id, and the current session state. It checks whether this is an `initialize` request with fresh client details, builds a standard span, records the best available client name and version, attaches parent trace information if present, and returns the completed span.
 
-**Call relations**: Called by request-processing code for JSON-RPC transports. It delegates transport labeling, client-info extraction, and parent-context handling to helpers in this file.
+**Call relations**: When `process_request` starts handling a JSON-RPC request, it calls this function first to create the telemetry wrapper for that work. This function gathers details through helpers such as `initialize_client_info`, `transport_name`, `client_name`, and `client_version`, then uses `app_server_request_span_template`, `record_client_info`, and `attach_parent_context` to assemble the final span.
 
 *Call graph*: calls 7 internal fn (app_server_request_span_template, attach_parent_context, client_name, client_version, initialize_client_info, record_client_info, transport_name); called by 1 (process_request).
 
@@ -1362,11 +1368,11 @@ fn typed_request_span(
 ) -> Span
 ```
 
-**Purpose**: Builds the tracing span for an in-process typed `ClientRequest`, mirroring the JSON-RPC span shape while stamping transport as `in-process`.
+**Purpose**: Creates the same kind of tracing span for an in-process request, where the caller uses typed Rust request values instead of a JSON-RPC envelope. This keeps embedded calls visible in telemetry in the same way as socket-based calls.
 
-**Data flow**: Takes a typed request, connection ID, and session state; reads `request.method()` and `request.id()`, creates a span with `app_server_request_span_template(..., "in-process", ...)`, extracts optional initialize client info from the typed request, records client name/version using that info or session fallbacks, attaches parent context using only ambient environment trace context, and returns the span.
+**Data flow**: It receives a typed client request, a connection id, and session state. It reads the request method and id from the typed request, marks the transport as `in-process`, extracts client information if the request is an initialize request, falls back to session client information if needed, attaches any available parent context from the environment, and returns the span.
 
-**Call relations**: Called by in-process request handling so embedded callers produce spans comparable to transport-based requests.
+**Call relations**: When `process_client_request` handles an in-process request, it calls this function to create comparable request telemetry. The function reuses the shared span template and client-recording helpers, but gets method, id, and initialize details from the typed request instead of from a JSON-RPC object.
 
 *Call graph*: calls 6 internal fn (app_server_request_span_template, attach_parent_context, initialize_client_info_from_typed_request, record_client_info, app_server_client_name, client_version); called by 1 (process_client_request); 2 external calls (id, method).
 
@@ -1377,11 +1383,11 @@ fn typed_request_span(
 fn transport_name(transport: &AppServerTransport) -> &'static str
 ```
 
-**Purpose**: Maps `AppServerTransport` variants to the stable string values recorded in tracing spans.
+**Purpose**: Turns the server transport choice into a short stable text label for telemetry. This lets dashboards and logs say whether a request came from stdio, a Unix socket, websocket, or an off/disabled transport setting.
 
-**Data flow**: Matches on `AppServerTransport` and returns one of the static strings `"stdio"`, `"unix_socket"`, `"websocket"`, or `"off"`.
+**Data flow**: It receives an `AppServerTransport` value. It matches the variant and returns a fixed string such as `stdio`, `unix_socket`, `websocket`, or `off`.
 
-**Call relations**: Used only by `request_span` when filling the `rpc.transport` field.
+**Call relations**: `request_span` calls this while building telemetry for JSON-RPC requests. The returned label is passed into `app_server_request_span_template` so the span records the request’s transport in a consistent field.
 
 *Call graph*: called by 1 (request_span).
 
@@ -1397,11 +1403,11 @@ fn app_server_request_span_template(
 ) -> Span
 ```
 
-**Purpose**: Creates the base tracing span with the standard app-server/OpenTelemetry field set and empty placeholders for client metadata.
+**Purpose**: Builds the common tracing span shape used for all app-server requests. It is the shared template that keeps telemetry fields consistent across different ways of calling the server.
 
-**Data flow**: Takes method, transport string, request ID display value, and connection ID, and returns an `info_span!` named `app_server.request` populated with fixed fields plus empty `app_server.client_name`, `app_server.client_version`, and `turn.id` fields.
+**Data flow**: It receives the RPC method, transport label, request id, and connection id. It creates a span named `app_server.request` with standard labels for OpenTelemetry, JSON-RPC details, app-server API version, and placeholders for client and turn information. It returns that span for callers to fill in further.
 
-**Call relations**: Shared by both `request_span` and `typed_request_span` so all request spans have the same shape.
+**Call relations**: Both `request_span` and `typed_request_span` call this before adding client details and parent trace context. It is the central place that defines what every app-server request span looks like.
 
 *Call graph*: called by 2 (request_span, typed_request_span); 1 external calls (info_span!).
 
@@ -1412,11 +1418,11 @@ fn app_server_request_span_template(
 fn record_client_info(span: &Span, client_name: Option<&str>, client_version: Option<&str>)
 ```
 
-**Purpose**: Writes optional client name and version values into an existing span only when present.
+**Purpose**: Adds client name and client version labels to a span when those values are known. This helps operators answer questions like which editor, tool, or integration sent a request.
 
-**Data flow**: Takes a `Span` plus `Option<&str>` for client name and version; if each option is `Some`, it records the corresponding field on the span.
+**Data flow**: It receives a span plus optional client name and version strings. For each value that exists, it records that value into the corresponding span field. It does not return a new value; it updates the span it was given.
 
-**Call relations**: Used by both span-construction entrypoints after they derive client identity from initialize params or session state.
+**Call relations**: `request_span` and `typed_request_span` call this after they have chosen the best source of client information. It fills in fields that were left empty by `app_server_request_span_template`.
 
 *Call graph*: called by 2 (request_span, typed_request_span); 1 external calls (record).
 
@@ -1432,11 +1438,11 @@ fn attach_parent_context(
 )
 ```
 
-**Purpose**: Attaches distributed tracing parent context to a span from either an inbound W3C trace carrier or ambient environment context.
+**Purpose**: Connects this request span to an existing distributed trace when possible. This lets one user action be followed across process or service boundaries instead of appearing as unrelated work.
 
-**Data flow**: Takes a span, method, request ID, and optional `W3cTraceContext`. If a parent trace is provided it calls `set_parent_from_w3c_trace_context`; invalid carriers trigger a warning with method and request ID. If no explicit parent trace exists, it checks `traceparent_context_from_env()` and, when present, applies it with `set_parent_from_context`.
+**Data flow**: It receives the span, the request method, the request id, and optional W3C trace context from the request. If request trace data is present, it tries to set it as the span’s parent and warns if the trace data is invalid. If no request trace is present, it checks the process environment for trace context and uses that if found. It updates the span’s parent relationship and returns nothing.
 
-**Call relations**: Called by both `request_span` and `typed_request_span` so parent-trace behavior is consistent across transport and in-process requests.
+**Call relations**: `request_span` calls this with trace data extracted from the JSON-RPC request. `typed_request_span` calls it without request-provided trace data, allowing the environment fallback. It delegates the actual trace attachment to OpenTelemetry helper functions.
 
 *Call graph*: called by 2 (request_span, typed_request_span); 4 external calls (set_parent_from_context, set_parent_from_w3c_trace_context, traceparent_context_from_env, warn!).
 
@@ -1450,11 +1456,11 @@ fn client_name(
 ) -> Option<&'a str>
 ```
 
-**Purpose**: Chooses the client name for a transport request, preferring initialize params over previously stored session state.
+**Purpose**: Chooses the best available client name for a JSON-RPC request. A fresh name from an `initialize` request takes priority; otherwise it uses the name saved in the connection session.
 
-**Data flow**: Takes optional `InitializeParams` and a `ConnectionSessionState`; returns `Some(params.client_info.name.as_str())` when initialize params are present, otherwise returns `session.app_server_client_name()`.
+**Data flow**: It receives optional initialize parameters and the session state. If initialize parameters are present, it returns the client name from them. If not, it asks the session for the previously stored app-server client name and returns that if available.
 
-**Call relations**: Used by `request_span` during client-info recording.
+**Call relations**: `request_span` calls this after trying to parse initialize parameters from the request. Its answer is passed to `record_client_info` so the span can be labeled with the client name.
 
 *Call graph*: calls 1 internal fn (app_server_client_name); called by 1 (request_span).
 
@@ -1468,11 +1474,11 @@ fn client_version(
 ) -> Option<&'a str>
 ```
 
-**Purpose**: Chooses the client version for a transport request, preferring initialize params over previously stored session state.
+**Purpose**: Chooses the best available client version for a JSON-RPC request. It prefers the version sent in the current `initialize` request and falls back to the version remembered in the session.
 
-**Data flow**: Takes optional `InitializeParams` and a `ConnectionSessionState`; returns `Some(params.client_info.version.as_str())` when initialize params are present, otherwise returns `session.client_version()`.
+**Data flow**: It receives optional initialize parameters and the session state. If initialize parameters exist, it returns the version from those parameters. Otherwise it asks the session for the stored client version and returns that if available.
 
-**Call relations**: Used by `request_span` during client-info recording.
+**Call relations**: `request_span` calls this alongside `client_name`. The selected version is then written into the span by `record_client_info`.
 
 *Call graph*: calls 1 internal fn (client_version); called by 1 (request_span).
 
@@ -1483,11 +1489,11 @@ fn client_version(
 fn initialize_client_info(request: &JSONRPCRequest) -> Option<InitializeParams>
 ```
 
-**Purpose**: Extracts `InitializeParams` from a parsed JSON-RPC request only when the method is `initialize`.
+**Purpose**: Extracts client information from a JSON-RPC `initialize` request, if the current request is one. This is important because initialize is where clients introduce themselves to the server.
 
-**Data flow**: Checks `request.method`; if it is not `"initialize"` returns `None`. Otherwise clones `request.params`, deserializes them with `serde_json::from_value`, and returns `Option<InitializeParams>`.
+**Data flow**: It receives a JSON-RPC request. If the method is not `initialize`, it returns nothing. If it is `initialize`, it clones the request parameters and tries to decode them into `InitializeParams`; on success it returns those parameters, and on missing or invalid parameters it returns nothing.
 
-**Call relations**: Used by `request_span` to derive client name/version from the initialize request itself.
+**Call relations**: `request_span` calls this before choosing client name and version. The parsed initialize data is then used by `client_name` and `client_version` to label the span with the newest client identity.
 
 *Call graph*: called by 1 (request_span); 1 external calls (from_value).
 
@@ -1498,22 +1504,26 @@ fn initialize_client_info(request: &JSONRPCRequest) -> Option<InitializeParams>
 fn initialize_client_info_from_typed_request(request: &ClientRequest) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Extracts client name and version from a typed `ClientRequest::Initialize` variant.
+**Purpose**: Extracts client name and version from a typed in-process initialize request. It is the typed-request equivalent of reading initialize parameters from a JSON-RPC request.
 
-**Data flow**: Matches on `ClientRequest`; for `Initialize { params, .. }` it returns `Some((&params.client_info.name, &params.client_info.version))`, otherwise `None`.
+**Data flow**: It receives a typed `ClientRequest`. If the request is an `Initialize` variant, it returns references to the client name and version inside its parameters. For any other request type, it returns nothing.
 
-**Call relations**: Used by `typed_request_span` as the typed-request analogue of `initialize_client_info`.
+**Call relations**: `typed_request_span` calls this while building telemetry for in-process requests. If it returns client details, those details are recorded on the span; otherwise `typed_request_span` falls back to the session’s stored client information.
 
 *Call graph*: called by 1 (typed_request_span).
 
 
 ### `core/src/sandbox_tags.rs`
 
-`util` · `cross-cutting telemetry/tag generation during request dispatch and turn metadata assembly`
+`util` · `cross-cutting`
 
-This file reduces rich permission and sandbox configuration into short static strings suitable for analytics, telemetry, or event tagging. `permission_profile_sandbox_tag` answers the question "what sandbox implementation is effectively in play?" It immediately classifies `PermissionProfile::Disabled` as `"none"` and `External` as `"external"`. For managed profiles, it first converts the file-system config into a sandbox policy and asks `should_require_platform_sandbox` whether a platform sandbox is actually needed given the filesystem policy, network mode, and `enforce_managed_network` flag. If not, the tag is also `"none"`. Otherwise, Windows gets a special `"windows_elevated"` tag when the target OS is Windows and the configured level is `Elevated`; all other cases query `get_platform_sandbox`, convert the resulting `SandboxType` to its metric tag, and fall back to `"none"` if no platform sandbox is available.
+This file answers a simple but important question: “How locked down is this run?” The project has several ways to limit what a task can do, such as no sandbox, an external sandbox, a managed file and network policy, or a platform sandbox supplied by the operating system. Other parts of the system need compact labels for that state, especially for metadata and reporting. This file produces those labels in one consistent place.
 
-`permission_profile_policy_tag` answers a different question: "what high-level access policy does this profile represent from the caller's perspective?" Disabled maps to `"danger-full-access"`, external to `"external-sandbox"`, and managed profiles are classified by inspecting the derived filesystem sandbox policy. Full-disk write access becomes `"danger-full-access"`; zero writable roots relative to `cwd` becomes `"read-only"`; otherwise the tag is `"workspace-write"`. Together these functions provide stable, low-cardinality summaries of both enforcement mechanism and effective write scope.
+Think of it like printing a badge for a visitor. The detailed permission rules may be complicated, but the badge needs to say something clear like “read-only,” “workspace-write,” or “windows_elevated.”
+
+The first function decides the sandbox label. It checks whether sandboxing is disabled, delegated to something external, or managed by this program. For managed profiles, it asks whether the file and network rules are strict enough to require a real platform sandbox. If not, it reports no sandbox. On Windows, it has a special label for elevated Windows sandboxing. Otherwise, it asks the sandboxing layer which platform sandbox is available and converts that into a metric-friendly tag.
+
+The second function decides the policy label. It looks at the effective file-system policy and classifies it as full access, read-only, or writable workspace access.
 
 #### Function details
 
@@ -1527,11 +1537,11 @@ fn permission_profile_sandbox_tag(
 ) -> &'static str
 ```
 
-**Purpose**: Returns a static tag describing the effective sandbox implementation for a permission profile, taking platform requirements and Windows sandbox level into account.
+**Purpose**: This function chooses a short label describing what kind of sandbox is actually being used. It is useful when the system needs to record run metadata without carrying around the full permission configuration.
 
-**Data flow**: It takes a `PermissionProfile`, `WindowsSandboxLevel`, and `enforce_managed_network` flag. It pattern-matches the profile: `Disabled` returns `"none"`, `External` returns `"external"`, and `Managed` derives a filesystem sandbox policy and calls `should_require_platform_sandbox`; if that returns false it returns `"none"`. Otherwise, on Windows with `Elevated` level it returns `"windows_elevated"`; in all remaining cases it calls `get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled)`, maps the resulting `SandboxType` through `SandboxType::as_metric_tag`, and falls back to `"none"` if no sandbox is available.
+**Data flow**: It receives a permission profile, the chosen Windows sandbox level, and a flag saying whether managed network rules must be enforced. It first handles simple cases: disabled permissions become "none" and externally provided sandboxing becomes "external". For managed permissions, it converts the file-system rules into a sandbox policy and asks whether those rules require a platform sandbox at all. If they do, it checks for the special elevated Windows case, otherwise asks the sandboxing library what platform sandbox is available and turns that into a tag. The output is a fixed text label such as "none", "external", "windows_elevated", or a platform-specific sandbox tag.
 
-**Call relations**: This helper is called by telemetry-producing flows such as `dispatch_any_with_terminal_outcome`, metadata construction in `new`, and tests validating platform sandbox tagging. It delegates the managed-profile requirement decision to `should_require_platform_sandbox` and platform detection to `get_platform_sandbox`.
+**Call relations**: This function is called while dispatching work with a terminal outcome, while constructing new state, and by code that records whether turn metadata uses a platform sandbox tag. Inside, it relies on the sandboxing policy code to decide whether a platform sandbox is needed, and then on the platform sandbox lookup to name the sandbox that will be reported.
 
 *Call graph*: calls 1 internal fn (should_require_platform_sandbox); called by 3 (dispatch_any_with_terminal_outcome, new, turn_metadata_state_uses_platform_sandbox_tag); 3 external calls (cfg!, get_platform_sandbox, matches!).
 
@@ -1545,24 +1555,26 @@ fn permission_profile_policy_tag(
 ) -> &'static str
 ```
 
-**Purpose**: Returns a static tag describing the effective high-level access policy implied by a permission profile and current working directory.
+**Purpose**: This function chooses a short label for the file-access policy: full access, external sandboxing, read-only, or workspace-write. It helps callers describe the permission level in plain categories rather than detailed rule objects.
 
-**Data flow**: It takes a `PermissionProfile` and `cwd: &Path`. `Disabled` maps directly to `"danger-full-access"`, `External` to `"external-sandbox"`, and `Managed` derives `profile.file_system_sandbox_policy()`, then checks `has_full_disk_write_access()` and `get_writable_roots_with_cwd(cwd)` to classify the profile as `"danger-full-access"`, `"read-only"`, or `"workspace-write"`. It returns a `&'static str` and mutates nothing.
+**Data flow**: It receives a permission profile and the current working directory. If permissions are disabled, it returns "danger-full-access". If an external sandbox is responsible, it returns "external-sandbox". For managed permissions, it reads the file-system sandbox policy from the profile, checks whether full disk writes are allowed, then checks whether there are any writable roots once the current directory is considered. The result is one fixed text label describing the effective file-writing power.
 
-**Call relations**: This function is used by `dispatch_any_with_terminal_outcome` when emitting policy-oriented telemetry. It complements `permission_profile_sandbox_tag` by summarizing access scope rather than sandbox mechanism.
+**Call relations**: This function is used when dispatching work with a terminal outcome, so the run can be tagged with the policy that was in force. It delegates the detailed interpretation of managed file rules to the profile’s file-system sandbox policy, then reduces that detail to a simple reporting label.
 
 *Call graph*: calls 1 internal fn (file_system_sandbox_policy); called by 1 (dispatch_any_with_terminal_outcome).
 
 
 ### `core/src/tools/tool_dispatch_trace.rs`
 
-`orchestration` · `tool dispatch; wraps each registry invocation/result with rollout tracing`
+`orchestration` · `tool dispatch`
 
-This module is a thin adapter around `codex_rollout_trace`. `ToolDispatchTrace` owns a `ToolDispatchTraceContext` started from the session's `rollout_thread_trace`, and its methods ensure dispatch success and failure paths emit matching trace end events. The adapter is intentionally separate from registry control flow so the registry can stay focused on dispatch semantics while this file handles schema translation.
+When the system asks a tool to run, that work may succeed, fail, or return different shapes of output depending on who asked for it. This file is the small adapter that records that story for rollout tracing. A rollout trace is like a flight recorder: it captures important events so someone can inspect what happened later.
 
-`start` snapshots a `ToolInvocation` into a `ToolDispatchInvocation`, including thread and turn identifiers, tool name and namespace, requester identity, and a normalized payload. Requester mapping is source-sensitive: direct model calls become `ToolDispatchRequester::Model` with the model-visible call id, while code-mode calls become `ToolDispatchRequester::CodeCell` with runtime cell and tool-call ids.
+The main type, `ToolDispatchTrace`, wraps a trace context from the `codex-rollout-trace` crate. The trace crate owns the event format and the actual recording behavior. This file only translates core tool-dispatch objects into that trace format.
 
-On completion, `record_completed` first checks whether tracing is enabled, then converts the invocation/result pair into a `ToolDispatchResult`. Direct calls serialize the model-facing response item via `to_response_item`; code-mode calls serialize the JavaScript-facing value via `code_mode_result`. The method derives `ExecutionStatus::Completed` versus `Failed` from `result.success_for_logging()`, so tool-level failures still produce a completed trace record with failed status rather than disappearing. `record_failed` delegates fatal or early-return errors directly to the trace context. Payload conversion is centralized in `tool_dispatch_payload`, which preserves the original argument or custom-input string for function, tool-search, and custom payload variants.
+The flow is simple. When dispatch begins, `ToolDispatchTrace::start` builds a trace “invocation” from the current `ToolInvocation`: thread, turn, tool name, tool call id, requester, and payload. Later, if the tool finishes, `record_completed` converts the tool output into the correct trace result. A direct model tool call is recorded as a normal response item, while a code-mode tool call is recorded as a code-mode value. If the tool fails before completion, `record_failed` records the error.
+
+An important detail is that tracing can be disabled. In that case, completion recording returns early and avoids building unnecessary trace data.
 
 #### Function details
 
@@ -1572,11 +1584,11 @@ On completion, `record_completed` first checks whether tracing is enabled, then 
 fn start(invocation: &ToolInvocation) -> Self
 ```
 
-**Purpose**: Begins a rollout-trace span for a tool dispatch using the current invocation as the source of trace metadata.
+**Purpose**: Starts a trace record for one tool dispatch. Someone uses this at the beginning of a tool call so the later success or failure can be tied back to the same request.
 
-**Data flow**: Reads the invocation's session services, calls `start_tool_dispatch_trace` with a closure that builds a `ToolDispatchInvocation`, and stores the returned `ToolDispatchTraceContext` inside a new `ToolDispatchTrace`.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn, tool name, caller, and input payload. It asks the session’s rollout trace service to start a tool-dispatch trace, giving it a recipe for building the trace invocation. It returns a `ToolDispatchTrace` object that holds the trace context for later updates.
 
-**Call relations**: Called by `dispatch_any_with_terminal_outcome` at the start of registry dispatch so later success or failure paths can close the trace consistently.
+**Call relations**: The tool-dispatch path calls this when it begins running a tool. The trace service then calls back into the local conversion helper, `tool_dispatch_invocation`, when it needs the event details.
 
 *Call graph*: called by 1 (dispatch_any_with_terminal_outcome).
 
@@ -1593,11 +1605,11 @@ fn record_completed(
     )
 ```
 
-**Purpose**: Finishes a dispatch trace for a completed tool call, recording either completed or failed execution status based on the tool output's logging success flag.
+**Purpose**: Records the end of a tool dispatch when the tool produced an output. It marks the trace as completed or failed based on whether the output counts as successful for logging.
 
-**Data flow**: Takes the original `ToolInvocation`, the response `call_id`, the `ToolPayload`, and a `dyn ToolOutput`. It first checks `self.context.is_enabled()`, then builds a `ToolDispatchResult` via `tool_dispatch_result`; if conversion succeeds, it computes `ExecutionStatus` from `result.success_for_logging()` and writes the completion event through `self.context.record_completed`.
+**Data flow**: It takes the original invocation, the call id, the payload sent to the tool, and the tool’s output. First it checks whether tracing is enabled. If not, it does nothing. If tracing is enabled, it converts the output into the trace result shape, checks whether the output should be logged as success, and then records the completed trace event with the final status and result data.
 
-**Call relations**: Used on successful dispatch return paths. It delegates payload/result-shape conversion to `tool_dispatch_result` so the registry does not need to know trace schema details.
+**Call relations**: This is used after a dispatched tool returns. It relies on `tool_dispatch_result` to translate the output into the trace crate’s event format, asks the output whether it was successful for logging, and then hands the final event to the trace context’s `record_completed` method.
 
 *Call graph*: calls 3 internal fn (tool_dispatch_result, is_enabled, record_completed); 1 external calls (success_for_logging).
 
@@ -1608,11 +1620,11 @@ fn record_completed(
 fn record_failed(&self, error: &FunctionCallError)
 ```
 
-**Purpose**: Finishes a dispatch trace with a failure event derived from a `FunctionCallError`.
+**Purpose**: Records that a tool dispatch failed with an error before a normal output was available. This keeps failed early-exit paths visible in the trace instead of silently disappearing.
 
-**Data flow**: Consumes a shared reference to self and a `FunctionCallError`, then forwards that error to `self.context.record_failed`. It does not transform the error locally.
+**Data flow**: It receives a `FunctionCallError`, which describes what went wrong. It passes that error to the stored trace context, which records the failed trace event. It does not return a value or change the tool result itself.
 
-**Call relations**: Used by dispatch failure paths to ensure unsupported tools, incompatible payloads, and other early errors still produce terminal trace records.
+**Call relations**: The tool-dispatch code can call this when dispatch fails. This method is a thin bridge to the rollout trace context’s own failure-recording behavior.
 
 *Call graph*: calls 1 internal fn (record_failed).
 
@@ -1623,11 +1635,11 @@ fn record_failed(&self, error: &FunctionCallError)
 fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchInvocation>
 ```
 
-**Purpose**: Converts a core `ToolInvocation` into the rollout-trace invocation schema, including requester identity and normalized payload.
+**Purpose**: Builds the trace description of the tool request at the moment dispatch starts. It translates core project objects into the event shape expected by the rollout trace system.
 
-**Data flow**: Reads `invocation.source` to choose either `ToolDispatchRequester::Model` or `ToolDispatchRequester::CodeCell`, copies thread id, turn id, call id, tool name, and namespace from the invocation, converts `invocation.payload` with `tool_dispatch_payload`, and returns `Some(ToolDispatchInvocation)`.
+**Data flow**: It reads the invocation’s source, session thread id, turn id, call id, tool name, namespace, and payload. If the source is a direct model request, it records the model-visible call id. If the source is code mode, it records the code cell id and runtime tool-call id. It also converts the payload into the trace payload format. The result is a `ToolDispatchInvocation` wrapped in `Some`.
 
-**Call relations**: Used only by `ToolDispatchTrace::start` as the lazy builder passed into the rollout-trace context.
+**Call relations**: This helper is used by `ToolDispatchTrace::start` through the trace service’s start call. It delegates payload conversion to `tool_dispatch_payload` so the requester details and payload details stay cleanly separated.
 
 *Call graph*: calls 1 internal fn (tool_dispatch_payload).
 
@@ -1643,11 +1655,11 @@ fn tool_dispatch_result(
 ) -> Option<ToolDispatchResult>
 ```
 
-**Purpose**: Converts a completed tool output into the rollout-trace result schema appropriate for the invocation source.
+**Purpose**: Converts a finished tool output into the form that should be written to the trace. The exact shape depends on whether the tool was called directly by the model or from code mode.
 
-**Data flow**: Reads `invocation.source`; for `Direct` it calls `result.to_response_item(call_id, payload)` and wraps it in `ToolDispatchResult::DirectResponse`, while for `CodeMode` it calls `result.code_mode_result(payload)` and wraps it in `ToolDispatchResult::CodeModeResponse`. It returns the constructed result as `Some(...)`.
+**Data flow**: It receives the original invocation, call id, original payload, and the tool output. For a direct call, it asks the output to become a normal response item. For a code-mode call, it asks the output for the value that code mode should see. It returns the matching trace result wrapped in `Some`.
 
-**Call relations**: Called by `ToolDispatchTrace::record_completed` to keep source-specific result serialization out of the tracing wrapper's control flow.
+**Call relations**: `ToolDispatchTrace::record_completed` calls this before recording a finished trace. This helper hands off to the tool output object for the final formatting, because each output type knows how to present itself as a model response or code-mode result.
 
 *Call graph*: calls 1 internal fn (code_mode_result); called by 1 (record_completed); 1 external calls (to_response_item).
 
@@ -1658,11 +1670,11 @@ fn tool_dispatch_result(
 fn tool_dispatch_payload(payload: &ToolPayload) -> ToolDispatchPayload
 ```
 
-**Purpose**: Normalizes core tool payload variants into the rollout-trace payload enum while preserving the raw input strings.
+**Purpose**: Copies a tool input payload into the rollout trace payload format. This lets the trace record show what kind of input the tool received without exposing core-only data structures.
 
-**Data flow**: Pattern-matches `ToolPayload`: function arguments become `ToolDispatchPayload::Function`, tool-search arguments become `ToolDispatchPayload::ToolSearch`, and custom input becomes `ToolDispatchPayload::Custom`, each cloning the underlying string.
+**Data flow**: It receives a `ToolPayload`. If it is a function call, tool search, or custom input, it clones the corresponding arguments or input text into the matching `ToolDispatchPayload` variant. The output is a trace-friendly copy of the input payload.
 
-**Call relations**: Used by `tool_dispatch_invocation` so trace records retain the original invocation payload regardless of tool type.
+**Call relations**: `tool_dispatch_invocation` calls this while building the start-of-dispatch trace event. It is the small translator responsible only for the payload part of that larger event.
 
 *Call graph*: called by 1 (tool_dispatch_invocation).
 
@@ -1672,11 +1684,13 @@ These files provide focused instrumentation for specific product areas such as g
 
 ### `core/src/guardian/metrics.rs`
 
-`util` · `cross-cutting; whenever a guardian review finishes`
+`util` · `cross-cutting`
 
-This file is the guardian review telemetry adapter between `GuardianReviewAnalyticsResult` and the concrete metric instruments exposed by `SessionTelemetry`. The main entrypoint builds a shared tag set from review outcome data, increments the guardian review counter, records total review latency, optionally records time-to-first-token, and, when token accounting is present, emits one histogram sample per token category. The tag set is intentionally normalized into low-cardinality strings: enums such as `GuardianReviewDecision`, `GuardianReviewTerminalStatus`, `GuardianRiskLevel`, and `GuardianUserAuthorization` are mapped to fixed literals, optional booleans become `true`/`false`/`unknown`, and free-form model / reasoning-effort strings are sanitized before use as metric tags. Missing optional fields are consistently represented as `none` rather than omitted, which keeps metric dimensions stable.
+Guardian appears to be a safety review step: before some action is allowed, it can approve, deny, abort, or fail. This file is the bridge between that review result and the metrics system, which is the project’s way of collecting numbers for monitoring and analysis. Without it, operators could still run Guardian reviews, but they would lose the easy view of how often reviews happen, how many fail, what kinds of actions are reviewed, how slow they are, and how many model tokens they consume.
 
-Token usage emission is split out so each histogram point reuses the same base tags plus a `token_type` dimension for `total`, `input`, `cached_input`, `non_cached_input`, `output`, and `reasoning_output`. Negative token counts are clamped to zero before recording, matching the defensive handling in `TokenUsage`. The tests construct an in-memory metrics client, emit a representative approved network-access review, then inspect exported metric points to verify exact attributes and histogram sums, including sanitization of `guardian_model` into `gpt-5.4_guardian`.
+The main function, `emit_guardian_review_metrics`, receives a completed review result, the action that was reviewed, where the approval request came from, and the total completion time. It first builds a set of labels, called metric tags. A tag is like a label on a jar: it says “this count was for a denied network request” or “this duration came from a reused Guardian session.” It then records a review count, the total duration, optionally the time to first token, and optionally token usage.
+
+Most of the rest of the file is careful translation. Internal enum values such as “High risk” or “Timed out” are converted into stable lowercase strings like `high` and `timed_out`. This matters because metric systems depend on consistent names. The test section builds an in-memory metrics collector and proves that a sample Guardian review produces the expected counts, durations, tags, and token breakdowns.
 
 #### Function details
 
@@ -1690,11 +1704,11 @@ fn emit_guardian_review_metrics(
     reviewed_action:
 ```
 
-**Purpose**: Builds the full guardian review tag set and records the core review metrics for one completed review. It always emits count and total duration, and conditionally emits TTFT and token-usage histograms when those fields are present in the analytics result.
+**Purpose**: Records all metrics for one finished Guardian review. Someone would use it after a review completes so dashboards and logs can show review volume, speed, result, and token cost.
 
-**Data flow**: Reads `session_telemetry`, the completed `GuardianReviewAnalyticsResult`, the approval source, reviewed action, and wall-clock completion latency in milliseconds. It transforms the analytics result into `Vec<(&'static str, String)>` tags via `guardian_review_metric_tags`, converts them into borrowed `(&str, &str)` pairs, increments `GUARDIAN_REVIEW_COUNT_METRIC`, records `GUARDIAN_REVIEW_DURATION_METRIC` from `completion_latency_ms`, optionally records `GUARDIAN_REVIEW_TTFT_DURATION_METRIC` from `result.time_to_first_token_ms`, and, if `result.token_usage` exists, delegates token histogram emission. It returns no value and writes only telemetry side effects.
+**Data flow**: It takes a telemetry recorder, the review result, the source of the approval request, the reviewed action, and the total completion time in milliseconds. It turns the result and action into metric tags, increments the review counter, records the total duration, records time to first token if that value exists, and records token usage histograms if token usage exists. The output is not a returned value; the change is that metrics are written into the session telemetry system.
 
-**Call relations**: This is the file’s public metric entrypoint. It is invoked by guardian review orchestration after a review completes, and by the unit test that validates emitted metrics. After assembling tags, it delegates token-specific work to `emit_guardian_token_usage_histograms` so the main review path stays focused on the common metrics.
+**Call relations**: In the normal flow, `track_guardian_review` calls this after a Guardian review has enough information to report. This function first asks `guardian_review_metric_tags` to prepare the shared labels, then uses the telemetry recorder’s `counter` and `record_duration` methods, and hands token details to `emit_guardian_token_usage_histograms` when token data is present. The test `guardian_review_metrics_record_counts_durations_and_token_usage` also calls it to verify the emitted metrics.
 
 *Call graph*: calls 4 internal fn (emit_guardian_token_usage_histograms, guardian_review_metric_tags, counter, record_duration); called by 2 (guardian_review_metrics_record_counts_durations_and_token_usage, track_guardian_review); 1 external calls (from_millis).
 
@@ -1709,11 +1723,11 @@ fn emit_guardian_token_usage_histograms(
 )
 ```
 
-**Purpose**: Records guardian token usage as multiple histogram samples, one per token category. It expands a single `TokenUsage` struct into six tagged measurements.
+**Purpose**: Records the token counts for a Guardian review, split into useful categories such as input, cached input, output, and reasoning output. This helps people understand what parts of the review are costing model tokens.
 
-**Data flow**: Consumes `session_telemetry`, a `TokenUsage` reference, and an owned base tag vector. For each derived token type/value pair, it clones the base tags, appends `("token_type", ...)`, converts tags to borrowed references, and records a histogram sample to `GUARDIAN_REVIEW_TOKEN_USAGE_METRIC`. It reads `cached_input()` and `non_cached_input()` from `TokenUsage`, clamps signed token counters with `.max(0)`, and returns nothing.
+**Data flow**: It receives the telemetry recorder, a `TokenUsage` summary, and the base metric tags already built for the review. For each token category, it adds one extra tag named `token_type` and records that category’s value in the token usage histogram. It does not return anything; it writes several metric samples.
 
-**Call relations**: Only `emit_guardian_review_metrics` calls this helper, and only when the analytics result includes token usage. Its role is to fan out one logical token-usage payload into the metric backend’s preferred per-sample representation.
+**Call relations**: `emit_guardian_review_metrics` calls this only when the review result includes token usage. This helper relies on the token usage object for derived values like cached and non-cached input, then hands each number to the telemetry recorder’s `histogram` method.
 
 *Call graph*: calls 3 internal fn (histogram, cached_input, non_cached_input); called by 1 (emit_guardian_review_metrics).
 
@@ -1728,11 +1742,11 @@ fn guardian_review_metric_tags(
 ) -> Vec<(&'static
 ```
 
-**Purpose**: Constructs the canonical guardian review metric dimensions from analytics fields and request metadata. It centralizes all tag naming and defaulting rules in one place.
+**Purpose**: Builds the full set of labels attached to Guardian review metrics. These labels make raw numbers useful by showing what kind of review each number came from.
 
-**Data flow**: Reads the review `result`, `approval_request_source`, and `reviewed_action`. It maps each field through the local tag helpers, sanitizes optional `guardian_model` and `guardian_reasoning_effort` strings, substitutes `none` for absent optional values, and returns a `Vec<(&'static str, String)>` containing tags such as `decision`, `terminal_status`, `failure_reason`, `action`, `session_kind`, `risk_level`, and `outcome`.
+**Data flow**: It takes the review result, the approval request source, and the reviewed action. It converts each important field into a safe string tag: decision, terminal status, failure reason, source, action type, session kind, prior context, truncation, risk level, user authorization, outcome, model, and reasoning effort. It returns a vector of key-value tag pairs.
 
-**Call relations**: This helper is called by `emit_guardian_review_metrics` before any metric emission. It depends on the small enum-to-string helpers below to keep the tag vocabulary stable and low-cardinality.
+**Call relations**: `emit_guardian_review_metrics` calls this before recording any metrics, so all count, duration, and token metrics can share the same context. The small tag conversion helpers in this file provide the stable string values used here.
 
 *Call graph*: called by 1 (emit_guardian_review_metrics); 1 external calls (vec!).
 
@@ -1743,11 +1757,11 @@ fn guardian_review_metric_tags(
 fn decision_tag(decision: GuardianReviewDecision) -> &'static str
 ```
 
-**Purpose**: Maps a `GuardianReviewDecision` enum to its metric string literal.
+**Purpose**: Turns a Guardian review decision into a short metric-friendly word. This keeps metric labels stable instead of depending on internal enum formatting.
 
-**Data flow**: Takes a `GuardianReviewDecision`, matches its variant, and returns one of `approved`, `denied`, or `aborted`. It has no side effects.
+**Data flow**: It receives a decision value: approved, denied, or aborted. It matches that value and returns the corresponding lowercase string. Nothing else is changed.
 
-**Call relations**: Used indirectly through `guardian_review_metric_tags` to normalize decision values before metric emission.
+**Call relations**: This is one of the small translators used by `guardian_review_metric_tags` when it builds the labels for metrics.
 
 
 ##### `terminal_status_tag`  (lines 145–153)
@@ -1756,11 +1770,11 @@ fn decision_tag(decision: GuardianReviewDecision) -> &'static str
 fn terminal_status_tag(status: GuardianReviewTerminalStatus) -> &'static str
 ```
 
-**Purpose**: Maps the terminal review status enum to the metric tag vocabulary, including timeout and fail-closed cases.
+**Purpose**: Turns the final status of a Guardian review into a stable tag string. This captures how the review ended, including outcomes like timeout or failed closed.
 
-**Data flow**: Consumes a `GuardianReviewTerminalStatus` and returns a static string such as `approved`, `denied`, `aborted`, `timed_out`, or `failed_closed`.
+**Data flow**: It receives a terminal status value. It maps approved, denied, aborted, timed out, and failed closed to fixed lowercase strings. The returned string is used as a metric tag value.
 
-**Call relations**: Called from `guardian_review_metric_tags` so terminal-state analytics become stable metric dimensions.
+**Call relations**: It feeds `guardian_review_metric_tags`, which uses the result to label every emitted Guardian review metric.
 
 
 ##### `failure_reason_tag`  (lines 155–164)
@@ -1769,11 +1783,11 @@ fn terminal_status_tag(status: GuardianReviewTerminalStatus) -> &'static str
 fn failure_reason_tag(reason: Option<GuardianReviewFailureReason>) -> &'static str
 ```
 
-**Purpose**: Converts an optional guardian failure reason into a metric-safe string, with `none` for successful reviews.
+**Purpose**: Turns an optional Guardian failure reason into a metric tag. It also makes the absence of a failure explicit by returning `none`.
 
-**Data flow**: Reads `Option<GuardianReviewFailureReason>`, pattern-matches each known failure variant, and returns `timeout`, `cancelled`, `prompt_build_error`, `session_error`, `parse_error`, or `none`.
+**Data flow**: It receives either a specific failure reason or no reason. Known reasons such as timeout, cancellation, prompt-building failure, session error, and parse error become fixed strings; no reason becomes `none`. It returns that string and changes no state.
 
-**Call relations**: Used by `guardian_review_metric_tags` to preserve failure classification even when the terminal status is broader.
+**Call relations**: It is used by `guardian_review_metric_tags` so metrics can distinguish successful reviews from different kinds of failures.
 
 
 ##### `approval_request_source_tag`  (lines 166–171)
@@ -1782,11 +1796,11 @@ fn failure_reason_tag(reason: Option<GuardianReviewFailureReason>) -> &'static s
 fn approval_request_source_tag(source: GuardianApprovalRequestSource) -> &'static str
 ```
 
-**Purpose**: Normalizes the source of the approval request into a fixed metric tag.
+**Purpose**: Names where the approval request came from in a form suitable for metrics. This helps separate reviews requested by the main turn from those requested by delegated subagents.
 
-**Data flow**: Takes `GuardianApprovalRequestSource` and returns `main_turn` or `delegated_subagent`.
+**Data flow**: It receives an approval request source value. It returns either `main_turn` or `delegated_subagent`. Nothing is written or mutated.
 
-**Call relations**: Called during tag construction so metrics distinguish reviews initiated by the main turn from delegated subagents.
+**Call relations**: `guardian_review_metric_tags` calls this while assembling the shared metric labels for a review.
 
 
 ##### `reviewed_action_tag`  (lines 173–183)
@@ -1795,11 +1809,11 @@ fn approval_request_source_tag(source: GuardianApprovalRequestSource) -> &'stati
 fn reviewed_action_tag(action: &GuardianReviewedAction) -> &'static str
 ```
 
-**Purpose**: Classifies the reviewed action variant into a compact action tag.
+**Purpose**: Converts the type of action being reviewed into a short tag. This lets metrics answer questions like whether reviews mostly involve shell commands, network access, or tool calls.
 
-**Data flow**: Matches a borrowed `GuardianReviewedAction` and returns a static label such as `shell`, `unified_exec`, `execve`, `apply_patch`, `network_access`, `mcp_tool_call`, or `request_permissions`.
+**Data flow**: It receives a reviewed action object. It looks only at which kind of action it is, not the detailed contents, and returns strings such as `shell`, `network_access`, or `mcp_tool_call`. It has no side effects.
 
-**Call relations**: Used by `guardian_review_metric_tags` to expose what kind of action guardian reviewed without embedding action payload details.
+**Call relations**: This helper supplies the `action` label used by `guardian_review_metric_tags`, which then passes it to all emitted Guardian review metrics.
 
 
 ##### `session_kind_tag`  (lines 185–192)
@@ -1808,11 +1822,11 @@ fn reviewed_action_tag(action: &GuardianReviewedAction) -> &'static str
 fn session_kind_tag(kind: Option<GuardianReviewSessionKind>) -> &'static str
 ```
 
-**Purpose**: Maps optional guardian session reuse metadata into a metric tag.
+**Purpose**: Turns the Guardian review session kind into a metric tag. It also records `none` when there was no session kind available.
 
-**Data flow**: Consumes `Option<GuardianReviewSessionKind>` and returns `trunk_new`, `trunk_reused`, `ephemeral_forked`, or `none`.
+**Data flow**: It receives an optional session kind. A new trunk session, reused trunk session, or forked temporary session becomes a fixed string; a missing value becomes `none`. The string is returned to the caller.
 
-**Call relations**: Called from `guardian_review_metric_tags` so metrics can distinguish fresh, reused, and forked guardian sessions.
+**Call relations**: `guardian_review_metric_tags` uses this to label whether the review used a new, reused, or temporary Guardian session.
 
 
 ##### `optional_bool_tag`  (lines 194–200)
@@ -1821,11 +1835,11 @@ fn session_kind_tag(kind: Option<GuardianReviewSessionKind>) -> &'static str
 fn optional_bool_tag(value: Option<bool>) -> &'static str
 ```
 
-**Purpose**: Encodes tri-state optional booleans for metrics.
+**Purpose**: Converts an optional true-or-false value into a metric tag string. It preserves the difference between false and unknown.
 
-**Data flow**: Reads `Option<bool>` and returns `true`, `false`, or `unknown`.
+**Data flow**: It receives `Some(true)`, `Some(false)`, or no value. It returns `true`, `false`, or `unknown` respectively. There are no side effects.
 
-**Call relations**: Used for tags like `had_prior_review_context`, where absence is semantically different from false.
+**Call relations**: `guardian_review_metric_tags` uses this for fields where the system may not know the answer, such as whether there was prior review context.
 
 
 ##### `bool_tag`  (lines 202–204)
@@ -1834,11 +1848,11 @@ fn optional_bool_tag(value: Option<bool>) -> &'static str
 fn bool_tag(value: bool) -> &'static str
 ```
 
-**Purpose**: Encodes a plain boolean as a metric tag string.
+**Purpose**: Converts a plain true-or-false value into the strings `true` or `false` for metric labels.
 
-**Data flow**: Takes `bool` and returns `true` or `false`.
+**Data flow**: It receives a boolean value. If the value is true, it returns `true`; otherwise it returns `false`. It does not read or change anything else.
 
-**Call relations**: Used by `guardian_review_metric_tags` for non-optional flags such as `reviewed_action_truncated`.
+**Call relations**: `guardian_review_metric_tags` uses this for known boolean fields, such as whether the reviewed action text had to be truncated.
 
 
 ##### `risk_level_tag`  (lines 206–214)
@@ -1847,11 +1861,11 @@ fn bool_tag(value: bool) -> &'static str
 fn risk_level_tag(risk_level: Option<GuardianRiskLevel>) -> &'static str
 ```
 
-**Purpose**: Maps optional guardian risk levels into metric strings.
+**Purpose**: Turns an optional Guardian risk level into a stable metric label. This lets metrics group reviews by low, medium, high, or critical risk.
 
-**Data flow**: Consumes `Option<GuardianRiskLevel>` and returns `low`, `medium`, `high`, `critical`, or `none`.
+**Data flow**: It receives a risk level or no value. Known levels become `low`, `medium`, `high`, or `critical`; no value becomes `none`. It returns that string.
 
-**Call relations**: Part of the tag-construction pipeline for completed reviews.
+**Call relations**: `guardian_review_metric_tags` calls this when preparing the risk-level label for each Guardian review metric.
 
 
 ##### `user_authorization_tag`  (lines 216–224)
@@ -1860,11 +1874,11 @@ fn risk_level_tag(risk_level: Option<GuardianRiskLevel>) -> &'static str
 fn user_authorization_tag(user_authorization: Option<GuardianUserAuthorization>) -> &'static str
 ```
 
-**Purpose**: Maps optional user-authorization assessments into metric strings.
+**Purpose**: Turns the user authorization level into a metric label. This records how much permission the user had granted or whether it was unknown.
 
-**Data flow**: Consumes `Option<GuardianUserAuthorization>` and returns `unknown`, `low`, `medium`, `high`, or `none`.
+**Data flow**: It receives an optional user authorization value. It maps unknown, low, medium, and high authorization to fixed strings, and maps a missing value to `none`. It returns the chosen string.
 
-**Call relations**: Used by `guardian_review_metric_tags` to expose guardian’s authorization judgment in telemetry.
+**Call relations**: This is used inside `guardian_review_metric_tags` so emitted metrics can be filtered or grouped by the authorization level involved in the review.
 
 
 ##### `outcome_tag`  (lines 226–232)
@@ -1873,11 +1887,11 @@ fn user_authorization_tag(user_authorization: Option<GuardianUserAuthorization>)
 fn outcome_tag(outcome: Option<GuardianAssessmentOutcome>) -> &'static str
 ```
 
-**Purpose**: Maps optional guardian allow/deny outcomes into metric strings.
+**Purpose**: Converts the Guardian assessment outcome into a metric tag. It records whether the assessment said to allow or deny, or `none` if there was no assessment outcome.
 
-**Data flow**: Consumes `Option<GuardianAssessmentOutcome>` and returns `allow`, `deny`, or `none`.
+**Data flow**: It receives an optional outcome. `Allow` becomes `allow`, `Deny` becomes `deny`, and no value becomes `none`. It returns the string without changing anything.
 
-**Call relations**: Called during metric tag assembly so the final assessment outcome is available as a dimension.
+**Call relations**: `guardian_review_metric_tags` uses this helper when creating the shared labels for review metrics.
 
 
 ##### `tests::test_session_telemetry`  (lines 251–271)
@@ -1886,11 +1900,11 @@ fn outcome_tag(outcome: Option<GuardianAssessmentOutcome>) -> &'static str
 fn test_session_telemetry() -> SessionTelemetry
 ```
 
-**Purpose**: Builds a `SessionTelemetry` instance backed by an in-memory OpenTelemetry exporter for metric assertions. It strips metadata tags so tests can compare only guardian-specific attributes.
+**Purpose**: Creates a test-only telemetry setup that stores metrics in memory instead of sending them elsewhere. This gives the tests a safe place to record metrics and inspect them afterward.
 
-**Data flow**: Creates an `InMemoryMetricExporter`, wraps it in `MetricsClient::new(MetricsConfig::in_memory(...).with_runtime_reader())`, constructs a `SessionTelemetry` with synthetic thread/model/session metadata, and returns the telemetry object configured with metrics but without metadata tags.
+**Data flow**: It starts with no inputs. It builds an in-memory metrics exporter and metrics client, creates a session telemetry object with test values, attaches the metrics client, and returns that ready-to-use telemetry object.
 
-**Call relations**: Used by the metrics test as the fixture that captures emitted guardian metrics without requiring external telemetry infrastructure.
+**Call relations**: The test `tests::guardian_review_metrics_record_counts_durations_and_token_usage` calls this first so it can run the real metric-emitting code and then examine the recorded results.
 
 *Call graph*: calls 4 internal fn (new, new, in_memory, new); 2 external calls (default, env!).
 
@@ -1901,11 +1915,11 @@ fn test_session_telemetry() -> SessionTelemetry
 fn find_metric(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric
 ```
 
-**Purpose**: Searches a `ResourceMetrics` snapshot for a metric by name and panics if it is absent.
+**Purpose**: Finds a metric with a given name inside an in-memory metrics snapshot. It is a test helper that keeps assertions focused on the metric being checked.
 
-**Data flow**: Iterates through scope metrics and their contained metrics, compares each metric name to the requested `name`, and returns a borrowed `Metric` reference on match. If no metric matches, it panics with a descriptive message.
+**Data flow**: It receives a metrics snapshot and a metric name. It searches through the snapshot’s metric groups until it finds a matching metric, then returns it. If the metric is missing, it stops the test with an error.
 
-**Call relations**: Shared by the test helpers that decode counters and histograms from the in-memory exporter snapshot.
+**Call relations**: Other test helpers, such as `tests::counter_point` and `tests::histogram_sums`, call this before reading a metric’s data.
 
 *Call graph*: 2 external calls (scope_metrics, panic!).
 
@@ -1918,11 +1932,11 @@ fn attributes_to_map(
     ) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Converts OpenTelemetry attribute iterators into a deterministic `BTreeMap` for assertions.
+**Purpose**: Turns metric attributes into a sorted map so tests can compare them easily. Attributes are the metric tags, such as `decision=approved`.
 
-**Data flow**: Consumes an iterator of `&KeyValue`, maps each key/value to owned `String`s, and collects them into a sorted `BTreeMap<String, String>`.
+**Data flow**: It receives an iterator over metric key-value attributes. It converts each key and value to strings and collects them into a `BTreeMap`, which keeps entries ordered. It returns that map for assertions.
 
-**Call relations**: Used by `counter_point` and `histogram_sums` so tests can compare metric attributes independent of iteration order.
+**Call relations**: `tests::counter_point` uses this to compare the counter’s tags with the expected set. `tests::histogram_sums` performs the same kind of conversion directly when reading histogram points.
 
 *Call graph*: 1 external calls (map).
 
@@ -1936,11 +1950,11 @@ fn counter_point(
     ) -> (BTreeMap<String, String>, u64)
 ```
 
-**Purpose**: Extracts the single data point from a u64 sum metric and returns its attributes and value. It asserts the expected aggregation shape used by the guardian counter metric.
+**Purpose**: Reads one counter metric from a test snapshot and returns its tags and value. It assumes the counter should have exactly one recorded data point.
 
-**Data flow**: Looks up the metric by name with `find_metric`, matches the metric data as `AggregatedMetrics::U64(MetricData::Sum)`, asserts there is exactly one point, converts that point’s attributes with `attributes_to_map`, and returns `(BTreeMap<String, String>, u64)`. Unexpected aggregation types cause a panic.
+**Data flow**: It receives a metrics snapshot and a metric name. It finds the metric, checks that it is an unsigned integer sum counter, checks that there is exactly one point, converts that point’s attributes into a map, and returns the attributes together with the counter value. If the metric shape is not what the test expects, it fails the test.
 
-**Call relations**: Called by the main metrics test to inspect `GUARDIAN_REVIEW_COUNT_METRIC` after emitting one review.
+**Call relations**: The main test calls this after emitting Guardian metrics to confirm the review count was incremented once and had exactly the expected labels. It depends on `tests::find_metric` to locate the metric and `tests::attributes_to_map` to prepare the labels.
 
 *Call graph*: 4 external calls (assert_eq!, attributes_to_map, find_metric, panic!).
 
@@ -1951,11 +1965,11 @@ fn counter_point(
 fn histogram_sums(resource_metrics: &ResourceMetrics, name: &str) -> BTreeMap<String, u64>
 ```
 
-**Purpose**: Reads histogram points from a metric snapshot and indexes them by `token_type` or a fallback sample label. This lets tests compare guardian duration and token-usage histograms by summed value.
+**Purpose**: Reads a histogram metric from a test snapshot and returns the total recorded value for each token type or sample. A histogram is a metric form used for distributions, but this helper checks only the sums.
 
-**Data flow**: Finds the metric, matches it as `AggregatedMetrics::F64(MetricData::Histogram)`, iterates data points, converts attributes to a map, extracts `token_type` when present or uses `sample`, and collects a `BTreeMap<String, u64>` from label to `point.sum() as u64`.
+**Data flow**: It receives a metrics snapshot and a metric name. It finds the metric, checks that it is a floating-point histogram, walks over its data points, reads each point’s attributes, chooses the `token_type` tag when present or `sample` when absent, and returns a map from that label to the point’s summed value. If the metric is not shaped as expected, it fails the test.
 
-**Call relations**: Used by the main test to validate token usage, total duration, and TTFT histograms emitted by `emit_guardian_review_metrics`.
+**Call relations**: The main test uses this helper to verify token usage, total review duration, and time-to-first-token duration after `emit_guardian_review_metrics` has recorded them.
 
 *Call graph*: 2 external calls (find_metric, panic!).
 
@@ -1966,26 +1980,24 @@ fn histogram_sums(resource_metrics: &ResourceMetrics, name: &str) -> BTreeMap<St
 fn guardian_review_metrics_record_counts_durations_and_token_usage()
 ```
 
-**Purpose**: End-to-end test that verifies guardian review metrics include the expected tags, durations, and token-usage breakdown. It exercises approved network-access review telemetry with populated optional fields.
+**Purpose**: Checks that a representative Guardian review produces the expected metric count, tags, durations, and token usage. It protects the metrics contract from accidental changes.
 
-**Data flow**: Creates test telemetry, builds a `GuardianReviewAnalyticsResult` with decision, terminal status, risk, authorization, outcome, session kind, model metadata, prior-context flag, truncation flag, token usage, and TTFT, then calls `emit_guardian_review_metrics`. It snapshots metrics and asserts the counter value and exact attribute map, plus histogram sums for token categories and durations.
+**Data flow**: It creates test telemetry, builds a sample successful Guardian review result with risk, authorization, model, token usage, and timing data, then calls `emit_guardian_review_metrics`. After taking a metrics snapshot, it reads the counter and histograms and compares their values and tags with the expected results. The outcome is a passing test if the emitted metrics match, or a failed test if anything differs.
 
-**Call relations**: This test is the direct caller of `emit_guardian_review_metrics` in the file and validates the full tag vocabulary and optional metric branches.
+**Call relations**: This test drives the real production function `emit_guardian_review_metrics`. It uses `tests::test_session_telemetry` for setup, `tests::counter_point` to inspect the count metric, and `tests::histogram_sums` to inspect duration and token usage metrics.
 
 *Call graph*: calls 2 internal fn (without_session, emit_guardian_review_metrics); 3 external calls (assert_eq!, counter_point, test_session_telemetry).
 
 
 ### `cloud-config/src/metrics.rs`
 
-`util` · `cross-cutting during fetch retries, final outcomes, and load completion`
+`io_transport` · `cross-cutting`
 
-This file is a small telemetry helper layer around `codex_otel::global()`. It defines three metric names: per-attempt fetches, final fetch outcomes, and overall load outcomes. The public helpers build consistent tag sets so the service code does not duplicate string formatting or omit dimensions.
+Cloud configuration is fetched and loaded in the background, and that can fail for many reasons: a bad network response, an authorization problem, an empty bundle, or no bundle at all. This file is the project’s small reporting desk for those events. Each public helper builds a metric, which is a counted event sent to the telemetry system, and attaches labels called tags. Tags are short pieces of context, such as the trigger that caused the fetch, the attempt number, the HTTP status code, or what kind of bundle was seen.
 
-`emit_fetch_attempt_metric` records each backend attempt with `trigger` (for example startup or refresh), numeric `attempt`, textual `outcome`, and a normalized `status_code` tag. `emit_fetch_final_metric` records the terminal result of a fetch sequence, adding `reason`, total `attempt_count`, and `bundle_shape`. `emit_load_metric` records the higher-level startup/refresh load outcome and also includes `bundle_shape`.
+The file records three main moments. First, each fetch attempt can be counted. Second, the final result of a fetch can be counted once retries are over. Third, loading a bundle can be counted. To keep those reports consistent, helper functions turn optional data into stable words: no status code becomes "none", no bundle becomes "none", and a bundle with no relevant enterprise data becomes "empty". If the bundle contains enterprise-managed config or requirements, the metric records that shape.
 
-`bundle_shape_tag` is the only domain-aware helper here. It maps `None` to `"none"`, an empty bundle to `"empty"`, and otherwise inspects whether `config_toml.enterprise_managed` and/or `requirements_toml.enterprise_managed` are non-empty. It emits stable comma-separated labels sorted lexicographically, so the combined case is always `enterprise_config,enterprise_requirements` regardless of insertion order. `status_code_tag` similarly normalizes absent codes to `"none"`.
-
-The private `emit_metric` function is intentionally best-effort: if no global metrics backend is installed, it silently does nothing; otherwise it converts owned tag strings into borrowed `(&str, &str)` pairs and increments the named counter by 1.
+At the bottom, `emit_metric` is the actual bridge to the telemetry library. If telemetry is available, it sends a counter increment. If not, it quietly does nothing. That means metrics never block or break the cloud-config path.
 
 #### Function details
 
@@ -2000,11 +2012,11 @@ fn emit_fetch_attempt_metric(
 )
 ```
 
-**Purpose**: Emits a counter event for one individual backend fetch attempt.
+**Purpose**: Records one attempt to fetch the cloud configuration bundle. This helps answer questions like “how many retries are happening?” and “what status codes are we seeing during fetches?”
 
-**Data flow**: Takes `trigger`, numeric `attempt`, textual `outcome`, and optional `status_code`. It converts `attempt` to a string, normalizes the status code via `status_code_tag`, assembles four tags, and passes them to `emit_metric` under `codex.cloud_config_bundle.fetch_attempt`.
+**Data flow**: It receives the reason the fetch was triggered, the attempt number, an outcome word, and an optional HTTP status code. It turns the attempt and status code into text tags, adds the trigger and outcome, and sends one counter event for a fetch attempt. It does not return data; its effect is the metric it tries to emit.
 
-**Call relations**: Called by the service on successful fetch validation, retryable request failures, and unauthorized responses so each attempt is observable regardless of final outcome.
+**Call relations**: The fetch and retry code calls this when a remote bundle request is tried or when authorization and validation paths need to record an attempt. It prepares the human-readable tags, asks `status_code_tag` to normalize the status code, and hands the finished metric to `emit_metric` for delivery.
 
 *Call graph*: calls 2 internal fn (emit_metric, status_code_tag); called by 3 (handle_unauthorized, retry_after_request_failure, validate_and_cache_remote_bundle); 1 external calls (vec!).
 
@@ -2022,11 +2034,11 @@ fn emit_fetch_final_metric(
 )
 ```
 
-**Purpose**: Emits the terminal metric for a fetch sequence after success or permanent failure.
+**Purpose**: Records the final result of trying to fetch the cloud configuration bundle after the process has either succeeded or given up. It captures not just success or failure, but also why it ended that way and what kind of bundle was found, if any.
 
-**Data flow**: Takes `trigger`, `outcome`, `reason`, `attempt_count`, optional `status_code`, and optional bundle reference. It stringifies `attempt_count`, normalizes the status code, derives `bundle_shape` from the bundle, builds the tag vector, and sends it to `emit_metric` under `codex.cloud_config_bundle.fetch_final`.
+**Data flow**: It receives the trigger, outcome, reason, total attempt count, optional HTTP status code, and optional bundle. It converts the count and status code into tag text, summarizes the bundle’s contents, and emits one final fetch counter. It returns nothing; the output is the telemetry event.
 
-**Call relations**: Used by the service when a remote bundle is accepted, when validation fails, when auth recovery fails or is unavailable, and when retries are exhausted.
+**Call relations**: The higher-level fetch flow calls this when retries are finished, and some error paths call it when they end early. It uses `status_code_tag` for a consistent status-code label, uses the bundle-shape helper to summarize bundle contents, and then passes the complete metric to `emit_metric`.
 
 *Call graph*: calls 2 internal fn (emit_metric, status_code_tag); called by 3 (fetch_remote_bundle_and_update_cache_with_retries, handle_unauthorized, validate_and_cache_remote_bundle); 1 external calls (vec!).
 
@@ -2037,11 +2049,11 @@ fn emit_fetch_final_metric(
 fn emit_load_metric(trigger: &str, outcome: &str, bundle: Option<&CloudConfigBundle>)
 ```
 
-**Purpose**: Emits the higher-level load metric for startup or refresh operations.
+**Purpose**: Records whether loading a cloud configuration bundle succeeded or failed. This is useful because fetching a bundle and successfully applying or loading it are related but separate events.
 
-**Data flow**: Takes `trigger`, `outcome`, and optional bundle reference. It derives `bundle_shape`, builds three tags, and forwards them to `emit_metric` under `codex.cloud_config_bundle.load`.
+**Data flow**: It receives the trigger, an outcome word, and an optional bundle. It summarizes the bundle into a simple shape tag, combines that with the trigger and outcome, and emits one load counter. It returns nothing and only changes the outside world by attempting to send telemetry.
 
-**Call relations**: Called by startup timeout handling and by refresh paths to record whether the overall load cycle succeeded or failed, independent of lower-level retry details.
+**Call relations**: Startup loading and background refresh code call this when they load or try to load cached or remote configuration. It builds the metric tags and hands them to `emit_metric`, so the rest of the system does not need to know the exact metric name or tag format.
 
 *Call graph*: calls 1 internal fn (emit_metric); called by 3 (load_startup_bundle_with_timeout, refresh_cache_in_background, refresh_cache_once); 1 external calls (vec!).
 
@@ -2052,11 +2064,11 @@ fn emit_load_metric(trigger: &str, outcome: &str, bundle: Option<&CloudConfigBun
 fn bundle_shape_tag(bundle: Option<&CloudConfigBundle>) -> String
 ```
 
-**Purpose**: Summarizes the structural contents of a bundle into a stable tag string for metrics.
+**Purpose**: Turns a cloud configuration bundle into a short label describing what it contains. This keeps metrics useful without sending the full configuration contents.
 
-**Data flow**: Accepts `Option<&CloudConfigBundle>`. `None` returns `"none"`. For `Some(bundle)`, it creates a mutable `Vec<&str>`, pushes `enterprise_config` if `config_toml.enterprise_managed` is non-empty and `enterprise_requirements` if `requirements_toml.enterprise_managed` is non-empty, then returns `"empty"` if no sources were present or a sorted comma-joined string otherwise.
+**Data flow**: It receives either no bundle or a reference to a bundle. If there is no bundle, it returns "none". If there is a bundle but it has no enterprise-managed config or requirements, it returns "empty". If those sections are present, it returns a comma-separated label such as "enterprise_config" or "enterprise_config,enterprise_requirements".
 
-**Call relations**: Used by final fetch and load metric helpers so telemetry can distinguish empty bundles from bundles containing config fragments, requirements fragments, or both.
+**Call relations**: The metric-building functions use this when they need to describe a bundle in a safe, compact way. It acts like a shipping label: it says what category of package arrived without opening and printing everything inside.
 
 *Call graph*: 1 external calls (new).
 
@@ -2067,11 +2079,11 @@ fn bundle_shape_tag(bundle: Option<&CloudConfigBundle>) -> String
 fn status_code_tag(status_code: Option<u16>) -> String
 ```
 
-**Purpose**: Normalizes an optional HTTP status code into a metric tag value.
+**Purpose**: Turns an optional HTTP status code into a stable text label for metrics. This avoids having some metrics omit the tag when there was no response code.
 
-**Data flow**: Takes `Option<u16>`, converts `Some(code)` to `code.to_string()`, and maps `None` to the literal string `"none"`.
+**Data flow**: It receives either a numeric status code or nothing. If a code is present, it converts it to text, such as "200" or "401". If no code is present, it returns "none".
 
-**Call relations**: Shared by both fetch metric helpers to keep status-code tagging consistent across attempt-level and final metrics.
+**Call relations**: Fetch-attempt and final-fetch metric functions call this before sending telemetry. That keeps both metric types using the same wording for missing status codes.
 
 *Call graph*: called by 2 (emit_fetch_attempt_metric, emit_fetch_final_metric).
 
@@ -2082,22 +2094,26 @@ fn status_code_tag(status_code: Option<u16>) -> String
 fn emit_metric(metric_name: &str, tags: Vec<(&str, String)>)
 ```
 
-**Purpose**: Performs the actual best-effort counter emission through the global OpenTelemetry facade.
+**Purpose**: Sends a counter metric to the project’s telemetry system, if that system is available. It is the one place in this file that talks directly to the metrics backend.
 
-**Data flow**: Consumes a metric name and owned tag vector `Vec<(&str, String)>`. It queries `codex_otel::global()`, and if metrics are available, converts each tag value to `&str`, collects borrowed tag refs, and calls `metrics.counter(metric_name, 1, &tag_refs)`. If no global metrics backend exists, it returns without output.
+**Data flow**: It receives a metric name and a list of tag names and values. It asks the global telemetry system for a metrics reporter. If one exists, it converts the owned strings into borrowed text references and increments the named counter by one. If telemetry is not set up, it does nothing.
 
-**Call relations**: This private sink is used by all public metric helpers so service code only needs to supply semantic fields, not telemetry plumbing.
+**Call relations**: All three public metric helpers call this after they have built their tags. It is the final handoff point: the rest of the file decides what should be reported, and this function performs the actual report without letting telemetry failures disturb the cloud-config workflow.
 
 *Call graph*: called by 3 (emit_fetch_attempt_metric, emit_fetch_final_metric, emit_load_metric); 1 external calls (global).
 
 
 ### `ext/goal/src/metrics.rs`
 
-`orchestration` · `whenever goal lifecycle transitions are persisted`
+`domain_logic` · `cross-cutting during goal creation and status updates`
 
-This file is the metrics adapter for the goal subsystem. `GoalMetrics` simply wraps `Option<MetricsClient>`, making all metric emission no-ops when metrics are unavailable. The public methods correspond to semantic lifecycle moments rather than raw metric names: `record_created`, `record_resumed`, `record_resumed_if_status_changed`, and `record_terminal_if_status_changed`.
+This file is a small bridge between the goal feature and the project’s telemetry system. Telemetry means automatic measurements that help operators understand what the software is doing, like a dashboard in a car showing speed, fuel, and warning lights.
 
-The conditional methods encode the subsystem’s metric policy. A goal is considered resumed only when its new status is `Active` and the previous status was one of `Paused`, `Blocked`, or `UsageLimited`; transitions from `BudgetLimited` are intentionally excluded. Terminal metrics are emitted only when status actually changes and the new status is one of `Blocked`, `UsageLimited`, `BudgetLimited`, or `Complete`. In that case the code increments the corresponding terminal counter and also records `goal.tokens_used` and `goal.time_used_seconds` into histograms tagged with the final status string. Active and paused states are explicitly ignored for terminal metrics. This keeps metric cardinality and semantics stable while letting runtime and tool code report status transitions through a small, focused API.
+The central type, GoalMetrics, wraps an optional MetricsClient. If a metrics client is available, it sends counters and histograms. A counter is a number that goes up, such as “one more goal was created.” A histogram records measured values, such as how many tokens a goal used or how many seconds it ran. If no metrics client is configured, every method quietly does nothing. That makes metrics safe to use in places where telemetry may be disabled.
+
+The file is careful not to double-count. For example, it only records a “resumed” event when a goal moves from paused, blocked, or usage-limited back to active. It only records terminal events when the goal’s status actually changed. Terminal here means an important stopping or limiting state, such as complete, blocked, budget-limited, or usage-limited.
+
+Without this file, the system could still run goals, but operators would lose visibility into how often goals are created, where they stop, how long they take, and how many tokens they consume.
 
 #### Function details
 
@@ -2107,11 +2123,11 @@ The conditional methods encode the subsystem’s metric policy. A goal is consid
 fn new(metrics_client: Option<MetricsClient>) -> Self
 ```
 
-**Purpose**: Constructs the metrics wrapper around an optional metrics client. It allows the rest of the subsystem to emit metrics without repeatedly checking for client presence.
+**Purpose**: Creates a GoalMetrics helper around an optional metrics client. Code uses this so later goal operations can record measurements if telemetry is available, while still working normally if it is not.
 
-**Data flow**: Takes `Option<MetricsClient>`, stores it in `GoalMetrics { metrics_client }`, and returns the wrapper. No metrics are emitted here.
+**Data flow**: It receives either a MetricsClient or nothing. It stores that value inside a new GoalMetrics object. The result is a small reusable recorder that other goal code can keep and call later.
 
-**Call relations**: Called during extension construction so runtime and tool code can share one metrics adapter.
+**Call relations**: new_with_host_capabilities calls this during setup, after deciding whether metrics support is available from the host. From that point on, the returned GoalMetrics object is passed into goal-related flows that may report events.
 
 *Call graph*: called by 1 (new_with_host_capabilities).
 
@@ -2122,11 +2138,11 @@ fn new(metrics_client: Option<MetricsClient>) -> Self
 fn record_created(&self)
 ```
 
-**Purpose**: Increments the goal-created counter if metrics are enabled. It is the direct metric for new goal creation.
+**Purpose**: Records that a new goal was created. This feeds a simple count of goal creation events into the metrics system.
 
-**Data flow**: Checks `self.metrics_client.as_ref()`, returns early if `None`, otherwise calls `metrics_client.counter(GOAL_CREATED_METRIC, 1, &[])` and ignores the result.
+**Data flow**: It looks inside the GoalMetrics object for a metrics client. If none is present, it stops without changing anything. If one is present, it asks the client to increase the goal-created counter by one, and ignores any reporting error so metrics cannot interrupt normal goal work.
 
-**Call relations**: Used by goal creation flows after a new goal is established. It is a leaf emission helper with no additional policy.
+**Call relations**: handle_create calls this when a goal is created. The function does not call other project logic; it simply sends the creation count to the metrics client if possible.
 
 *Call graph*: called by 1 (handle_create).
 
@@ -2137,11 +2153,11 @@ fn record_created(&self)
 fn record_resumed(&self)
 ```
 
-**Purpose**: Increments the goal-resumed counter if metrics are enabled. It records explicit resumption events.
+**Purpose**: Records that a goal resumed work. This is the low-level helper used when the code has already decided a resume event should be counted.
 
-**Data flow**: Returns early when no metrics client exists; otherwise calls `metrics_client.counter(GOAL_RESUMED_METRIC, 1, &[])` and discards the result.
+**Data flow**: It checks whether a metrics client is stored. With no client, it returns immediately. With a client, it increases the goal-resumed counter by one and discards any error from the metrics system.
 
-**Call relations**: Called directly by resume restoration and indirectly by `record_resumed_if_status_changed` when a qualifying status transition occurs.
+**Call relations**: record_resumed_if_status_changed calls this after confirming that a status change really represents a resume. Keeping this as a separate helper means the actual counter-writing step is simple and reusable.
 
 *Call graph*: called by 1 (record_resumed_if_status_changed).
 
@@ -2156,11 +2172,11 @@ fn record_resumed_if_status_changed(
     )
 ```
 
-**Purpose**: Conditionally records a resumed metric when a goal transitions into `Active` from a resumable non-active state. It prevents counting unchanged or non-resume transitions.
+**Purpose**: Decides whether a status change should count as a goal being resumed, and records it only in that case. It prevents false resume counts when the goal was already active or changed from some unrelated state.
 
-**Data flow**: Accepts `previous_status` and `goal_status`, checks whether `goal_status == Active` and `previous_status` matches `Paused | Blocked | UsageLimited`, and if so calls `self.record_resumed()`. Otherwise it returns without side effects.
+**Data flow**: It receives the previous goal status, which may be missing, and the new goal status. It checks whether the new status is Active and the previous status was Paused, Blocked, or UsageLimited. If that pattern matches, it calls record_resumed; otherwise it does nothing.
 
-**Call relations**: Used after external goal sets or updates where both old and new statuses are known. It delegates actual metric emission to `record_resumed`.
+**Call relations**: This function is used when code has both the old and new status and needs a safe way to count resumes. It hands off to record_resumed only after its status-change check says the event is meaningful.
 
 *Call graph*: calls 1 internal fn (record_resumed); 1 external calls (matches!).
 
@@ -2175,11 +2191,11 @@ fn record_terminal_if_status_changed(
     )
 ```
 
-**Purpose**: Records terminal-status metrics when a goal’s status changes into a terminal or limited state. It emits both a counter for the status and histograms for cumulative tokens and duration.
+**Purpose**: Records important stopping or limiting outcomes for a goal, but only when the goal has newly entered that status. It also records how many tokens and seconds the goal used at that point.
 
-**Data flow**: Takes `previous_status` and a goal reference, returns immediately if the status is unchanged, matches `goal.status` to choose one of `GOAL_BLOCKED_METRIC`, `GOAL_USAGE_LIMITED_METRIC`, `GOAL_BUDGET_LIMITED_METRIC`, or `GOAL_COMPLETED_METRIC`, and returns early for `Active` or `Paused`. If a metrics client exists, it builds `status_tag = [("status", goal.status.as_str())]`, increments the chosen counter, and records `goal.tokens_used` and `goal.time_used_seconds` into the corresponding histograms with that tag.
+**Data flow**: It receives the previous status and the current ThreadGoal. First it compares the previous status with the goal’s current status; if they are the same, it returns so the event is not counted twice. Then it chooses the right counter for Blocked, UsageLimited, BudgetLimited, or Complete. Active and Paused are not treated as terminal metrics here, so the function returns for those. If a metrics client exists, it increments the chosen counter and records token count and duration histograms tagged with the goal’s status.
 
-**Call relations**: Called by runtime accounting and update flows after persistence. It centralizes the policy for which statuses count as terminal/limited and what aggregate values to record alongside them.
+**Call relations**: account_active_goal_progress and handle_update call this when goal progress or status changes are processed. The function turns those domain changes into telemetry, sending counters and measurements to the metrics client while leaving normal goal processing unaffected if metrics are unavailable.
 
 *Call graph*: called by 2 (account_active_goal_progress, handle_update).
 
@@ -2189,11 +2205,15 @@ These files define the metric vocabulary and classification logic for memory rea
 
 ### `ext/memories/src/metrics.rs`
 
-`util` · `cross-cutting during tool request handling`
+`io_transport` · `request handling`
 
-This file is the metrics adapter for the memories extension. Its central constant, `MEMORIES_TOOL_CALL_METRIC`, names the counter emitted whenever a memory tool runs. `record_tool_call` is intentionally defensive: it exits immediately when no `MetricsClient` was wired in, so callers can unconditionally invoke it without branching. When metrics are enabled, it constructs a fully namespaced `tool` tag from `MEMORY_TOOLS_NAMESPACE` and the operation name, then increments the counter with a fixed tag set: tool, operation, scope, status, and truncated. The rest of the file exists to keep those tags low-cardinality and stable.
+The memory tools need a way to answer basic operational questions: Are people calling these tools? Which parts of the memory area are they touching? Are calls succeeding or failing? This file provides that reporting layer.
 
-`scope_from_path` canonicalizes user/backend paths into a small set of semantic buckets rather than emitting raw paths. It trims leading/trailing slashes, strips a leading `./`, then recognizes specific top-level files and directories such as `MEMORY.md`, `memory_summary.md`, `rollout_summaries`, `skills`, and `extensions/ad_hoc/notes`; everything else collapses to `other`. `scope_from_optional_path` preserves that mapping while supplying a caller-chosen default when no path was provided. `truncated_tag` similarly converts `Option<bool>` into the string tags `true`, `false`, or `unknown`, and the private `status_tag` maps success booleans to `succeeded`/`failed`. The design keeps metric dimensions bounded and comparable across list/read/search/add-note operations.
+Its main job is to send a counter metric every time a memory tool is called. A counter is a number that only goes up, like a turnstile counting visitors. The metric is tagged with small pieces of context: the tool name, the operation name, the broad area of memory being used, the success or failure status, and whether a response was truncated, meaning shortened because it was too large.
+
+The file also keeps those tags consistent. Instead of reporting every raw path, `scope_from_path` groups paths into friendly buckets such as `memory_md`, `skills`, or `rollout_summaries`. This matters because metrics systems work best with a small, predictable set of labels. If every unique file path became a label, dashboards could become noisy, expensive, or hard to search.
+
+If no metrics client is available, recording quietly does nothing. That lets the memory tools run normally in environments where telemetry is disabled or not configured.
 
 #### Function details
 
@@ -2209,11 +2229,11 @@ fn record_tool_call(
 )
 ```
 
-**Purpose**: Emits one counter increment for a memory-tool invocation, annotated with normalized tags describing which operation ran and whether it succeeded or returned truncated output.
+**Purpose**: Records that a memory tool operation was attempted. It captures enough context to later see which operation ran, what memory area it touched, whether it succeeded, and whether the result was shortened.
 
-**Data flow**: It takes an optional `&MetricsClient`, the operation name, a precomputed scope tag, a success flag, and a truncated tag string. If the client is `None`, it returns immediately without side effects; otherwise it formats a namespaced tool identifier, derives the status tag via `status_tag`, and calls the client's `counter` method with increment `1` and the assembled tag slice.
+**Data flow**: It receives an optional metrics client, an operation name, a scope label, a success flag, and a truncation label. If there is no metrics client, it stops immediately and changes nothing. If metrics are available, it builds a full tool name using the memory tools namespace, converts the success flag into `succeeded` or `failed`, and sends a counter increment with all these labels attached.
 
-**Call relations**: Each tool-specific `handle_call` path invokes this after awaiting its backend operation so telemetry reflects the actual outcome. It delegates only the status-string conversion to `status_tag`; callers are responsible for computing scope and truncation tags before entering.
+**Call relations**: The memory tool call flow invokes this after handling different tool requests. Before sending the metric, it asks `status_tag` to turn the true-or-false success value into a readable label, then hands the finished metric to the metrics client.
 
 *Call graph*: calls 1 internal fn (status_tag); called by 4 (handle_call, handle_call, handle_call, handle_call); 1 external calls (format!).
 
@@ -2224,11 +2244,11 @@ fn record_tool_call(
 fn scope_from_path(path: &str) -> &'static str
 ```
 
-**Purpose**: Maps a concrete memory-store path string into a fixed telemetry scope category.
+**Purpose**: Turns a specific memory-related path into a broad category name for metrics. This keeps reporting useful without exposing or multiplying every individual path.
 
-**Data flow**: It reads a raw path string, strips surrounding `/` characters and an optional leading `./`, then compares the normalized path against known files and directory prefixes. It returns one of several static strings such as `root`, `memory_md`, `memory_summary`, `rollout_summaries`, `skills`, `ad_hoc_notes`, or `other`.
+**Data flow**: It receives a path string, trims leading and trailing slashes, and ignores a leading `./` if present. It then compares the cleaned path with known memory locations and returns a fixed label such as `root`, `memory_md`, `skills`, `ad_hoc_notes`, or `other`.
 
-**Call relations**: The read-tool handling flow uses this when it has an explicit path and wants a stable metric tag instead of the literal user-supplied path. It performs no I/O and delegates to no other local helper.
+**Call relations**: The memory tool call flow uses this when it has a concrete path and needs a stable scope label before recording metrics. Its output is typically passed onward to `record_tool_call` as the `scope` tag.
 
 *Call graph*: called by 1 (handle_call).
 
@@ -2239,11 +2259,11 @@ fn scope_from_path(path: &str) -> &'static str
 fn scope_from_optional_path(path: Option<&str>, default: &'static str) -> &'static str
 ```
 
-**Purpose**: Provides the same scope categorization as `scope_from_path`, but for optional path arguments.
+**Purpose**: Chooses a scope label when a path may or may not be present. It gives callers a clean way to use a default label if there is no path to inspect.
 
-**Data flow**: It accepts `Option<&str>` plus a static default scope. If a path is present it forwards to `scope_from_path`; if absent it returns the supplied default unchanged.
+**Data flow**: It receives an optional path and a default scope label. If the path exists, it sends that path through `scope_from_path` and returns the resulting category. If the path is missing, it returns the provided default unchanged.
 
-**Call relations**: List/search handlers call this when path filtering is optional and they need a deterministic scope tag even for root-wide operations. It is a thin wrapper around `scope_from_path` to keep call sites concise.
+**Call relations**: The memory tool call flow uses this for operations where a path is optional. It either delegates to `scope_from_path` for real path classification or supplies the caller’s default scope so metric recording can still proceed.
 
 *Call graph*: called by 2 (handle_call, handle_call).
 
@@ -2254,11 +2274,11 @@ fn scope_from_optional_path(path: Option<&str>, default: &'static str) -> &'stat
 fn truncated_tag(truncated: Option<bool>) -> &'static str
 ```
 
-**Purpose**: Converts an optional truncation flag into the exact string tag expected by metrics.
+**Purpose**: Turns an optional truncation value into a clear metric label. This lets dashboards distinguish between responses that were shortened, not shortened, or where that information was not known.
 
-**Data flow**: It matches on `Option<bool>` and returns `true` for `Some(true)`, `false` for `Some(false)`, and `unknown` for `None`.
+**Data flow**: It receives an optional true-or-false value. `Some(true)` becomes `true`, `Some(false)` becomes `false`, and a missing value becomes `unknown`. It returns one of those three fixed strings.
 
-**Call relations**: Tool handlers use this after backend completion when truncation may or may not be known from the response shape. It feeds directly into `record_tool_call` as the `truncated` tag value.
+**Call relations**: The memory tool call flow uses this before recording metrics for calls where truncation may be relevant. The returned label is passed to `record_tool_call` as the `truncated` tag.
 
 *Call graph*: called by 3 (handle_call, handle_call, handle_call).
 
@@ -2269,33 +2289,35 @@ fn truncated_tag(truncated: Option<bool>) -> &'static str
 fn status_tag(success: bool) -> &'static str
 ```
 
-**Purpose**: Turns a success boolean into the low-cardinality status label used on tool-call metrics.
+**Purpose**: Converts a success flag into the metric wording used for call outcomes. It keeps success and failure labels consistent everywhere this file records tool calls.
 
-**Data flow**: It reads a `bool` and returns `succeeded` when true, otherwise `failed`.
+**Data flow**: It receives a boolean value. If the value is true, it returns `succeeded`; if false, it returns `failed`.
 
-**Call relations**: Only `record_tool_call` invokes it while assembling metric tags, keeping status-string policy private to this file.
+**Call relations**: `record_tool_call` uses this while building the metric tags. It is a small helper kept private to this file because only the metric-recording code needs it.
 
 *Call graph*: called by 1 (record_tool_call).
 
 
 ### `memories/read/src/metrics.rs`
 
-`config` · `cross-cutting`
+`config` · `cross-cutting telemetry`
 
-This file contains one public constant, `MEMORIES_USAGE_METRIC`, with the value `"codex.memories.usage"`. Its purpose is to give the memories read path a stable metric key that can be imported wherever telemetry is emitted, avoiding duplicated string literals and accidental naming drift.
+This file is a tiny but useful naming anchor for telemetry. Telemetry means the measurements a system records so people can understand how it is behaving, such as how often a feature is used. Here, the feature is “memories,” and the metric name is stored in one public constant: `MEMORIES_USAGE_METRIC`.
 
-Because the constant is `pub`, other modules or crates can depend on the exact metric identifier when recording, aggregating, or testing telemetry. The naming suggests this metric captures usage-level information for memory reads rather than phase timing or token accounting. Keeping the identifier in its own file makes the telemetry contract explicit and easy to audit.
+Instead of writing the text `codex.memories.usage` directly in many places, other code can import this constant. That is like putting an address in a shared contacts list instead of typing it from memory every time. If the metric name ever needs to change, it can be changed here in one place, and the rest of the code can keep referring to the same constant.
 
-There is no logic here, but the design matters operationally: metric names are effectively part of an observability API. Changing this constant would alter dashboards, alerts, and downstream aggregation behavior, so centralization reduces that risk and makes such changes deliberate.
+Without this file, callers might duplicate the metric string by hand. That can lead to small spelling differences, which would split the recorded data across multiple metric names and make usage reports misleading.
 
 
 ### `memories/read/src/usage.rs`
 
-`domain_logic` · `tool-read telemetry classification`
+`domain_logic` · `tool command analysis and metric reporting`
 
-This module turns a shell command string into zero or more `MemoriesUsageKind` values that can be emitted as metrics tags. The enum captures the specific memory surfaces the system cares about: `MEMORY.md`, `memory_summary.md`, `raw_memories.md`, rollout summaries, and skills. `MemoriesUsageKind::as_tag` maps each variant to the stable lowercase metric tag string used externally.
+This file exists so the system can measure how different memory sources are being used without treating every file path as a separate thing. For example, reading `memories/MEMORY.md` and searching inside `memories/skills/` are different kinds of memory usage, and this code classifies them into a few clear buckets.
 
-The main classifier, `memories_usage_kinds_from_command`, is deliberately conservative. It first asks `parse_shell_script_into_commands` to split the shell script into command units; if parsing fails, it returns an empty vector immediately. It then requires every parsed command to satisfy `is_known_safe_command`; any unsafe or unknown command causes the entire classification to return empty, preventing telemetry from being inferred from arbitrary shell text. Only then does it parse the script into higher-level `ParsedCommand` values and inspect each one. `Read` commands classify directly from their path, `Search` commands classify only when they include a path, and `ListFiles`/`Unknown` commands are ignored. `get_memory_kind` performs simple substring checks against canonical memory path fragments and returns the matching enum variant. The output preserves one classification per matching parsed command and does not deduplicate repeated kinds.
+The main idea is cautious: it first parses the user’s shell command, then only continues if every parsed command is known to be safe. That matters because shell text can be complicated, and the system does not want to draw conclusions from commands it does not trust or understand. If parsing fails, or if any command is not on the safe list, it returns no usage categories.
+
+Once the command is considered safe, the file parses it into higher-level actions such as “read this path” or “search this path.” It then checks the path text for known memory locations, such as `MEMORY.md`, `memory_summary.md`, raw memories, rollout summaries, or skills. Each match becomes a `MemoriesUsageKind` value. That value can later be turned into a short metric tag, like a label on a filing cabinet drawer.
 
 #### Function details
 
@@ -2305,11 +2327,11 @@ The main classifier, `memories_usage_kinds_from_command`, is deliberately conser
 fn as_tag(self) -> &'static str
 ```
 
-**Purpose**: Maps a `MemoriesUsageKind` enum variant to the stable metric tag string used in telemetry. The mapping is a fixed one-to-one conversion.
+**Purpose**: This converts a memory usage category into the short text label used for metrics. It gives the rest of the system stable names like `memory_md` or `skills` instead of exposing Rust enum names directly.
 
-**Data flow**: Consumes `self` by value, matches on the enum variant, and returns the corresponding `&'static str` such as `"memory_md"` or `"rollout_summaries"`.
+**Data flow**: It starts with one `MemoriesUsageKind` value, such as `MemorySummary`. It matches that value to its fixed lowercase tag string. The output is a static text label, and nothing else is changed.
 
-**Call relations**: This method is used after classification when metrics code needs a string tag. It is pure and does not depend on any parser state.
+**Call relations**: After some other code has identified what kind of memory was used, this method provides the metric-friendly name for that category. It is the final labeling step before the category can be counted or reported.
 
 
 ##### `memories_usage_kinds_from_command`  (lines 29–48)
@@ -2318,11 +2340,11 @@ fn as_tag(self) -> &'static str
 fn memories_usage_kinds_from_command(command: &str) -> Vec<MemoriesUsageKind>
 ```
 
-**Purpose**: Parses a shell command string and extracts memory-usage categories for safe read/search operations targeting known memory paths. It refuses to classify commands that cannot be parsed safely.
+**Purpose**: This looks at a shell command and returns the memory categories that command reads or searches. It is used when the system wants to emit a metric for tool-based memory access.
 
-**Data flow**: Accepts `command: &str`, attempts to split it with `parse_shell_script_into_commands`, returns an empty `Vec` if that fails, checks that every parsed command passes `is_known_safe_command` and returns empty if any do not, reparses the script into `ParsedCommand` values with `parse_shell_script`, maps `Read` and `Search` paths through `get_memory_kind`, drops `ListFiles` and `Unknown`, collects the surviving `MemoriesUsageKind` values into a vector, and returns it.
+**Data flow**: It receives raw shell command text. First it tries to split that text into shell commands; if that fails, it returns an empty list. Next it checks that every command is known to be safe; if not, it again returns an empty list. Then it parses the command into actions like reading a file or searching a path, asks `get_memory_kind` whether each relevant path belongs to a known memory area, and returns the matching categories as a list.
 
-**Call relations**: This function is called by `emit_metric_for_tool_read` to derive telemetry labels from shell activity. Internally it delegates path classification to `get_memory_kind` and relies on shell-command parsing utilities to gate classification on safe, understood commands.
+**Call relations**: `emit_metric_for_tool_read` calls this function when it needs to know what kind of memory a tool command touched. This function relies on shell parsing helpers to understand the command safely, then hands each read or search path to `get_memory_kind` to classify it.
 
 *Call graph*: calls 2 internal fn (parse_shell_script_into_commands, parse_shell_script); called by 1 (emit_metric_for_tool_read); 1 external calls (new).
 
@@ -2333,20 +2355,22 @@ fn memories_usage_kinds_from_command(command: &str) -> Vec<MemoriesUsageKind>
 fn get_memory_kind(path: String) -> Option<MemoriesUsageKind>
 ```
 
-**Purpose**: Classifies a single path string into one of the known memory usage categories based on substring matching. It recognizes specific files and directory prefixes under `memories/`.
+**Purpose**: This checks one file path and decides whether it points to a known kind of memory content. It is the small lookup rulebook for mapping memory paths to memory usage categories.
 
-**Data flow**: Takes ownership of `path: String`, checks it in priority order for `memories/MEMORY.md`, `memories/memory_summary.md`, `memories/raw_memories.md`, `memories/rollout_summaries/`, and `memories/skills/`, returning the corresponding `Some(MemoriesUsageKind)` or `None` if no known memory path fragment is present.
+**Data flow**: It takes a path as text. It checks whether that text contains one of the recognized memory path patterns, such as `memories/MEMORY.md` or `memories/skills/`. If a pattern matches, it returns the matching `MemoriesUsageKind`; if none match, it returns nothing.
 
-**Call relations**: This is an internal helper used by `memories_usage_kinds_from_command` after shell parsing has identified a read/search path. It encapsulates the concrete path-to-category mapping.
+**Call relations**: `memories_usage_kinds_from_command` uses this function after it has found a read or search path inside a safe command. This helper does the focused path-to-category decision, while the caller takes care of command parsing and collecting the results.
 
 
 ### `core/src/memory_usage.rs`
 
-`util` · `post-tool execution telemetry emission`
+`domain_logic` · `tool completion / telemetry reporting`
 
-This file is a small telemetry adapter between generic tool invocation records and the `codex_memories_read` usage classifier. The public function `emit_metric_for_tool_read` is called after tool execution completes. It first tries to recover the shell command string from the invocation using `shell_script_for_invocation`; only two unnamespaced function tools are recognized: `shell_command`, whose JSON arguments deserialize as `ShellCommandToolCallParams`, and `exec_command`, whose arguments deserialize as `ExecCommandArgs`. Any other tool namespace/name combination or non-function payload is ignored.
+This file answers a simple question: “Did a tool invocation read memory data, and should we count that?” In this project, tools can run commands such as shell commands or exec commands. Some of those commands may access memory-related files or features. Rather than guessing later, this file looks at the command text at the moment the tool finishes and emits a metric if the command matches known memory-use patterns.
 
-When a command string is available, the function computes a string success tag (`"true"` or `"false"`), flattens the tool name with `flat_tool_name`, and asks `memories_usage_kinds_from_command` to classify the command into one or more memory-usage kinds. For each returned kind it increments the session telemetry counter named `MEMORIES_USAGE_METRIC` by 1, tagging the metric with the usage kind, flattened tool name, and success flag. The implementation is intentionally conservative: malformed JSON arguments, unsupported tools, and non-function payloads simply produce no metric rather than failing the caller.
+The main flow is like a checkout scanner. First it tries to pull the actual command string out of the tool invocation. If the invocation is not a supported function-style command, or its arguments cannot be understood, it quietly stops. Then it asks a memory-usage helper to classify the command into one or more “kinds” of memory usage. For each kind, it increments a telemetry counter. The counter includes tags: the memory kind, the tool name in a flattened readable form, and whether the tool run succeeded.
+
+An important detail is that this file is deliberately conservative. If it cannot confidently extract a shell script from the tool call, it records nothing. That avoids misleading metrics from unrelated or malformed tool calls.
 
 #### Function details
 
@@ -2356,11 +2380,11 @@ When a command string is available, the function computes a string success tag (
 fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool)
 ```
 
-**Purpose**: Detects memory-read usage in supported shell-like tool invocations and emits one telemetry counter increment per detected usage kind.
+**Purpose**: This function records a memory-usage metric for a completed tool invocation, but only when the tool contains a recognizable command. It is used so the system can later understand how often memory data is being read, by which tool, and whether those attempts succeeded.
 
-**Data flow**: Reads a `ToolInvocation` and a `success` boolean. It calls `shell_script_for_invocation`; if that returns `None`, it exits early. Otherwise it converts success to `"true"`/`"false"`, flattens `invocation.tool_name`, classifies the command with `memories_usage_kinds_from_command`, and for each kind writes to `invocation.turn.session_telemetry.counter` using `MEMORIES_USAGE_METRIC` and tags `kind`, `tool`, and `success`.
+**Data flow**: It receives a tool invocation and a success flag. It first asks for the command text hidden inside that invocation; if no supported command is found, it does nothing. If a command is found, it turns the success flag into a text tag, flattens the tool name into a metric-friendly label, asks which memory-usage kinds the command matches, and increments one telemetry counter for each matched kind.
 
-**Call relations**: Invoked by `dispatch_any_with_terminal_outcome` after tool completion. It delegates command extraction to `shell_script_for_invocation` and classification to the memories usage library.
+**Call relations**: After a tool finishes, dispatch_any_with_terminal_outcome calls this function as part of reporting the final outcome. This function delegates command extraction to shell_script_for_invocation, uses flat_tool_name to make the tool name safe for telemetry tags, and relies on memories_usage_kinds_from_command to decide whether the command represents memory reading before it writes the metric.
 
 *Call graph*: calls 3 internal fn (shell_script_for_invocation, flat_tool_name, memories_usage_kinds_from_command); called by 1 (dispatch_any_with_terminal_outcome).
 
@@ -2371,11 +2395,11 @@ fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool)
 fn shell_script_for_invocation(invocation: &ToolInvocation) -> Option<String>
 ```
 
-**Purpose**: Extracts the shell command string from supported tool invocation payloads.
+**Purpose**: This helper tries to extract the actual command string from a tool invocation. It supports the project’s two plain command tools: shell_command and exec_command.
 
-**Data flow**: Reads `invocation.payload`; if it is not `ToolPayload::Function { arguments }`, returns `None`. For unnamespaced tool name `shell_command`, it deserializes `arguments` as `ShellCommandToolCallParams` and returns `params.command` on success. For unnamespaced `exec_command`, it deserializes as `ExecCommandArgs` and returns `params.cmd`. Any namespaced tool, other tool name, or deserialization failure yields `None`.
+**Data flow**: It receives a tool invocation and looks at its payload. If the payload is not a function call with JSON arguments, it returns nothing. If the tool is shell_command, it parses the arguments as shell command parameters and returns the command field. If the tool is exec_command, it parses the arguments as exec command parameters and returns the cmd field. For namespaced tools, unknown tools, or invalid JSON, it returns nothing.
 
-**Call relations**: Used only by `emit_metric_for_tool_read` as the gate that determines whether telemetry should be emitted at all.
+**Call relations**: emit_metric_for_tool_read calls this first because telemetry only makes sense when there is real command text to inspect. This helper does not emit metrics itself; it only hands back the command string, or declines by returning no value when the invocation is not one of the supported command shapes.
 
 *Call graph*: called by 1 (emit_metric_for_tool_read).
 
@@ -2384,11 +2408,11 @@ fn shell_script_for_invocation(invocation: &ToolInvocation) -> Option<String>
 
 `config` · `cross-cutting`
 
-This file is a constants module for observability in the memories write subsystem. It declares a set of `pub(crate)` string constants covering startup and two processing phases. `MEMORY_STARTUP` identifies startup telemetry. Phase one has separate metric names for job count, end-to-end latency in milliseconds, output volume, and token usage. Phase two similarly defines names for job count, end-to-end latency, input volume, and token usage.
+This file is a small label sheet for observability. Observability means the information a running system emits so people can understand what it is doing, such as timings, counts, and token usage. Here, each constant is the official text name of a metric related to the memory-writing pipeline.
 
-The constants are crate-visible rather than fully public, which indicates these identifiers are intended for internal coordination within the memories write crate, not as an external API for other crates. The naming scheme is systematic: all metrics share the `codex.memory` prefix, then a phase-specific suffix such as `phase1.e2e_ms` or `phase2.token_usage`. That consistency is important for dashboards and aggregation queries.
+The metrics are grouped around startup and two phases of work. The startup metric marks memory system startup. Phase one metrics track how many phase-one jobs happen, how long the phase takes end to end, what it outputs, and how many model tokens it uses. Phase two has matching labels for its jobs, total time, input, and token use.
 
-There is no executable behavior, but this file encodes the telemetry vocabulary of the write pipeline. It implicitly documents the pipeline structure as a startup stage followed by at least two measurable phases, each tracking throughput-like counts and resource-consumption metrics. Centralizing these names prevents subtle mismatches between emitters and consumers of telemetry.
+The important point is not that this file performs measurement itself. It does not start timers, count jobs, or send data anywhere. Instead, it provides the exact names that other code uses when reporting those measurements. Like printed labels on folders, these constants make sure all reports land under the same names. Without this file, metric names might be copied by hand in several places, making mistakes harder to find and dashboards or alerts less reliable.
 
 
 ### SQLite startup telemetry
@@ -2396,13 +2420,13 @@ These files adapt metrics sinks and classify database initialization outcomes so
 
 ### `rollout/src/sqlite_metrics.rs`
 
-`util` · `cross-cutting`
+`io_transport` · `cross-cutting during database activity`
 
-This file is a thin telemetry bridge between `codex_state` and `codex_otel`. Its central type, `OtelDbTelemetry`, stores a `codex_otel::MetricsClient` plus a `'static` originator string that has already been normalized through `bounded_originator_tag_value`. By implementing `codex_state::DbTelemetry`, it lets the SQLite runtime emit counters and duration measurements without depending directly on OTEL-specific APIs.
+Database code often wants to say things like “one query ran” or “this operation took 12 milliseconds,” but it should not need to know the details of the metrics system. This file is the small adapter between those two worlds. It implements the database telemetry interface, `DbTelemetry`, using a `MetricsClient` from `codex_otel`, which is the project’s observability layer for recording measurements.
 
-The implementation is intentionally minimal: both trait methods first call the local `with_originator` helper, which clones the incoming slice of `(&str, &str)` tags into a `Vec` and appends `(ORIGINATOR_TAG, originator)`. They then forward the metric to the underlying client and explicitly ignore the result with `let _ = ...`, making telemetry best-effort rather than able to fail database operations.
+The key idea is that every metric is given an extra label called an originator tag. A tag is a small piece of text attached to a metric so people can later filter or group it, like putting a return address on a letter. Here, the originator says which part of the system produced the database metric. The `recorder` function builds a shared telemetry object, wrapping it in an `Arc` so multiple parts of the program can safely hold the same recorder. It also trims or normalizes the originator value through `bounded_originator_tag_value`, so the tag stays within expected limits.
 
-The exported constructor, `recorder`, wraps the adapter in an `Arc` and returns the `DbTelemetryHandle` alias expected by `codex_state`. A subtle design choice is that the stored originator is `'static`; the constructor achieves this by passing the caller-provided `&str` through `bounded_originator_tag_value`, so later metric emission does not borrow from transient caller state. The file contains no mutable shared state beyond the owned metrics client and performs no batching or caching.
+When database code records a counter or duration, this adapter adds the originator tag, then forwards the metric to the real metrics client. It deliberately ignores errors from the metrics client, so a failure to report telemetry does not break normal database work.
 
 #### Function details
 
@@ -2412,11 +2436,11 @@ The exported constructor, `recorder`, wraps the adapter in an `Arc` and returns 
 fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Emits a database counter metric through the wrapped OTEL client after adding the standard originator tag.
+**Purpose**: Records a count-based database metric, such as “this happened once” or “five rows were affected.” It also adds the originator label so the metric can be traced back to the part of the system that produced it.
 
-**Data flow**: Reads `self.metrics` and `self.originator`, plus the caller-provided metric `name`, increment `inc`, and tag slice. It builds a new `Vec<(&str, &str)>` via `with_originator`, then forwards that enriched tag set to `MetricsClient::counter`. It returns `()` and does not mutate persistent state; any metrics-client error is discarded.
+**Data flow**: It receives a metric name, an amount to add, and any existing tags. It copies those tags, adds the originator tag, and sends the finished metric to the metrics client. Nothing is returned, and any reporting error is ignored so telemetry cannot interrupt database work.
 
-**Call relations**: This method is invoked by code using the `DbTelemetry` trait on the returned recorder handle. In that path it delegates first to `with_originator` so all DB counters are attributed, then to the OTEL client's counter emission API.
+**Call relations**: Database telemetry users call this through the `DbTelemetry` interface when they want to report a count. Before handing the metric to the underlying metrics client’s `counter` call, it asks `with_originator` to add the required originator tag.
 
 *Call graph*: calls 2 internal fn (counter, with_originator).
 
@@ -2427,11 +2451,11 @@ fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)])
 fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Records a duration-valued database metric through OTEL with the originator tag appended.
+**Purpose**: Records how long a database-related action took. This is used for timing measurements, such as how long a query or transaction lasted.
 
-**Data flow**: Consumes `name`, a `Duration`, and a borrowed tag slice while reading `self.originator` and `self.metrics`. It clones and extends the tags with `with_originator`, then passes the duration and tags to `MetricsClient::record_duration`. It returns `()` and suppresses any downstream telemetry failure.
+**Data flow**: It receives a metric name, a time duration, and any existing tags. It adds the originator tag to those tags, then forwards the name, duration, and completed tag list to the metrics client. It returns nothing and does not let telemetry failures affect the caller.
 
-**Call relations**: This is the duration-reporting half of the `DbTelemetry` implementation used by the SQLite runtime. It follows the same flow as `counter`: enrich tags locally, then delegate to the OTEL client for actual export.
+**Call relations**: Database telemetry users call this through the `DbTelemetry` interface when they need to report timing information. It relies on `with_originator` to prepare the tags, then passes the measurement to the underlying metrics client’s `record_duration` call.
 
 *Call graph*: calls 2 internal fn (record_duration, with_originator).
 
@@ -2442,11 +2466,11 @@ fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)])
 fn recorder(metrics: codex_otel::MetricsClient, originator: &str) -> DbTelemetryHandle
 ```
 
-**Purpose**: Constructs the shared `DbTelemetryHandle` that exposes OTEL-backed telemetry to the state runtime.
+**Purpose**: Creates the database telemetry recorder used by SQLite-related code. It packages a metrics client together with a safe originator label and returns it in a shared handle.
 
-**Data flow**: Takes ownership of a `codex_otel::MetricsClient` and borrows an `originator` string from the caller. It converts the originator into a bounded `'static` value with `bounded_originator_tag_value`, stores both fields in `OtelDbTelemetry`, wraps that struct in `Arc`, and returns it as `DbTelemetryHandle`.
+**Data flow**: It takes a metrics client and an originator string. It converts the originator into a bounded static tag value, builds an `OtelDbTelemetry` object with that value, wraps it in an `Arc` shared pointer, and returns it as a `DbTelemetryHandle`.
 
-**Call relations**: This helper is called by `sqlite_telemetry_recorder` in `state_db.rs` when higher-level startup code wants to attach telemetry to SQLite operations. It does not emit metrics itself; it prepares the adapter object that later trait calls use.
+**Call relations**: The wider rollout setup calls this from `sqlite_telemetry_recorder` when it needs a telemetry object for SQLite. After this function builds the adapter, database code can use the returned handle without knowing anything about the OpenTelemetry metrics client underneath.
 
 *Call graph*: called by 1 (sqlite_telemetry_recorder); 2 external calls (new, bounded_originator_tag_value).
 
@@ -2460,22 +2484,26 @@ fn with_originator(
 ) -> Vec<(&'a str, &'a str)>
 ```
 
-**Purpose**: Creates a new tag vector from an existing slice and appends the standard OTEL originator tag pair.
+**Purpose**: Adds the standard originator tag to a metric’s existing tags. This keeps every database metric consistently labeled with its source.
 
-**Data flow**: Accepts a borrowed slice of tag tuples and a `'static` originator string. It clones the slice into a mutable `Vec`, pushes `(ORIGINATOR_TAG, originator)`, and returns the resulting vector. It does not read or write any external state.
+**Data flow**: It receives a slice of existing tag pairs and the originator value. It copies the tags into a new list, appends the originator tag, and returns the new list. The original tag list is not changed.
 
-**Call relations**: This helper sits directly underneath both `OtelDbTelemetry::counter` and `OtelDbTelemetry::record_duration`. Its sole role in the call flow is to centralize tag augmentation so both metric paths behave identically.
+**Call relations**: Both `OtelDbTelemetry::counter` and `OtelDbTelemetry::record_duration` call this just before sending data to the metrics client. It is the small shared helper that makes sure both count and timing metrics carry the same origin information.
 
 *Call graph*: called by 2 (counter, record_duration).
 
 
 ### `state/src/telemetry.rs`
 
-`util` · `startup and fallback instrumentation across database initialization paths`
+`util` · `database startup and fallback reporting`
 
-This module defines a small abstraction, `DbTelemetry`, for emitting counters and duration metrics about SQLite startup and fallback paths without coupling database behavior to any particular telemetry backend. A process-global sink can be installed once through `install_process_db_telemetry`, stored in a `OnceLock<Arc<dyn DbTelemetry>>`; low-level database code may also pass an explicit sink override. The exported helpers `record_init_result`, `record_backfill_gate`, and `record_fallback` build low-cardinality tag sets around metric names such as `DB_INIT_METRIC`, `DB_INIT_DURATION_METRIC`, and `DB_FALLBACK_METRIC`.
+This file is a small reporting layer for the project’s SQLite databases. Its job is to answer questions like: did the database start successfully, how long did it take, which database was it, and if it failed, what broad kind of error happened? Without this file, startup problems would be harder to understand from logs or metrics, and fallback paths could happen silently.
 
-The module’s main logic is error classification. `DbKind` maps the database being initialized (`State`, `Logs`, `Goals`, `Memories`) to a stable tag string. `DbOutcomeTags::from_result` turns an `anyhow::Result` into `status=success|failed` plus an `error` tag. `classify_error` walks the full `anyhow` cause chain and recognizes `sqlx::Error`, migration errors, serde failures, and I/O failures. SQLx database errors are further reduced by `classify_sqlx_error`, which extracts SQLite result codes and passes them to `classify_sqlite_code`; extended SQLite codes are masked down to their primary low byte so tags like `busy`, `locked`, `corrupt`, `cantopen`, and `constraint` remain stable. If no sink is available, metric emission is silently skipped by design.
+The main idea is deliberately simple. A `DbTelemetry` sink is something that can count events and record durations. Startup code can install one shared, process-wide sink after telemetry has been set up. Later database code can either use that shared sink or pass in a specific one. If no sink exists, the recording functions quietly do nothing. This is important: monitoring must never be the reason the database fails.
+
+The file also keeps metric labels low-cardinality, meaning it uses a small fixed set of tag values instead of unbounded details like full error messages. This keeps monitoring systems healthy and searchable. For example, it turns database errors into broad labels such as `busy`, `locked`, `io`, `serde`, or `constraint`.
+
+In short, this file acts like a dashboard clerk: it notes that something happened, puts it into a small set of useful categories, and moves on without interrupting the real work.
 
 #### Function details
 
@@ -2485,11 +2513,11 @@ The module’s main logic is error classification. `DbKind` maps the database be
 fn install_process_db_telemetry(telemetry: DbTelemetryHandle) -> bool
 ```
 
-**Purpose**: Installs the process-wide default telemetry sink used by low-level database code when no explicit sink is supplied. Only the first installation wins.
+**Purpose**: Installs the shared telemetry sink that database code can use when it wants to report metrics. It only accepts the first sink installed, so later duplicate setup attempts do not replace the original.
 
-**Data flow**: It takes an `Arc<dyn DbTelemetry>`, attempts to store it in `PROCESS_DB_TELEMETRY`, and returns `true` on first install or `false` if a sink was already present. On duplicate installation it emits a debug log and leaves the original sink unchanged.
+**Data flow**: It receives a telemetry handle. If no process-wide database telemetry sink has been set yet, it stores this handle and returns `true`. If one is already present, it leaves the existing sink in place, writes a debug message, and returns `false`.
 
-**Call relations**: Startup code calls this once after telemetry initialization. Later metric helpers rely on `resolve_telemetry` to read the installed sink when callers do not pass an override.
+**Call relations**: Startup code is expected to call this after the broader telemetry system is ready. Later, `record_counter` and `record_duration` can find this installed sink through `resolve_telemetry` when callers do not provide their own sink.
 
 *Call graph*: 1 external calls (debug!).
 
@@ -2500,11 +2528,11 @@ fn install_process_db_telemetry(telemetry: DbTelemetryHandle) -> bool
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Maps the internal database kind enum to the stable string tag used in metrics. This keeps metric cardinality fixed and explicit.
+**Purpose**: Turns an internal database kind into the short text label used in telemetry tags. This keeps metric output consistent, using names like `state`, `logs`, `goals`, and `memories`.
 
-**Data flow**: It takes `self` by value and returns one of the static strings `state`, `logs`, `goals`, or `memories`. No external state is read or written.
+**Data flow**: It receives a `DbKind` value. It matches that value to a fixed string. The string is returned so it can be attached to a metric as the database name.
 
-**Call relations**: Only `record_init_result` calls this helper when assembling the `db` metric tag.
+**Call relations**: It is used by `record_init_result` when building the tags for startup metrics. That lets callers pass a typed database choice while the telemetry system sends plain text labels.
 
 *Call graph*: called by 1 (record_init_result).
 
@@ -2521,11 +2549,11 @@ fn record_init_result(
 )
 ```
 
-**Purpose**: Emits both a counter and a duration metric for a database initialization phase, tagged with database kind and classified outcome. It is the main telemetry entrypoint for startup/open paths.
+**Purpose**: Records both the result and the duration of a database initialization step. It is used to show whether startup phases succeeded or failed, how long they took, and which database and phase were involved.
 
-**Data flow**: Inputs are an optional telemetry sink, `DbKind`, phase string, elapsed `Duration`, and a borrowed `anyhow::Result<T>`. The function derives `DbOutcomeTags` from the result, builds a four-tag array (`status`, `phase`, `db`, `error`), then calls `record_counter` and `record_duration` with the configured metric names.
+**Data flow**: It receives an optional telemetry sink, a database kind, a phase name, a duration, and the operation result. It turns the result into simple outcome tags, turns the database kind into a label, then records one counter metric and one duration metric. It returns nothing; its effect is sending telemetry if a sink is available.
 
-**Call relations**: Initialization code such as `init_inner` and `open_sqlite` calls this after each startup phase, and `record_backfill_gate` delegates to it for the state DB backfill gate phase.
+**Call relations**: Database startup paths such as `init_inner` and `open_sqlite`, plus `record_backfill_gate`, call this after an initialization attempt. It relies on `DbOutcomeTags::from_result` to summarize success or failure, `DbKind::as_str` for the database label, and then hands the final metric data to `record_counter` and `record_duration`.
 
 *Call graph*: calls 4 internal fn (as_str, from_result, record_counter, record_duration); called by 3 (init_inner, open_sqlite, record_backfill_gate).
 
@@ -2540,11 +2568,11 @@ fn record_backfill_gate(
 )
 ```
 
-**Purpose**: Specialized wrapper that records telemetry for the state database backfill gate phase. It standardizes the phase and database tags for that event.
+**Purpose**: Records telemetry for the state database’s `backfill_gate` phase. A backfill is a process that fills in missing or older data, and this function reports whether that gate step worked and how long it took.
 
-**Data flow**: It takes an optional telemetry sink, a duration, and a `Result<()>`, then forwards them to `record_init_result` with `DbKind::State` and phase `backfill_gate`.
+**Data flow**: It receives an optional telemetry sink, the time spent, and a success-or-failure result. It fills in the database kind as `State` and the phase name as `backfill_gate`, then passes everything to `record_init_result`. It returns nothing.
 
-**Call relations**: Callers use this instead of constructing the tags manually for backfill gating. It is a thin convenience layer over `record_init_result`.
+**Call relations**: This is a convenience wrapper around `record_init_result`. Callers use it when they specifically want to report the state database backfill gate without repeating the database and phase labels.
 
 *Call graph*: calls 1 internal fn (record_init_result).
 
@@ -2559,11 +2587,11 @@ fn record_fallback(
 )
 ```
 
-**Purpose**: Emits a fallback counter tagged by caller and reason. It is used when code abandons a preferred database path and switches to a fallback behavior.
+**Purpose**: Records that the code used a fallback path, along with who triggered it and why. This helps operators notice when the system is surviving by using a backup behavior instead of the preferred one.
 
-**Data flow**: Inputs are static `caller` and `reason` strings plus an optional telemetry override. The function builds a two-tag slice and passes it to `record_counter` with `DB_FALLBACK_METRIC`.
+**Data flow**: It receives a caller label, a reason label, and an optional telemetry sink. It packages the caller and reason as tags, then records a fallback counter. It returns nothing; it only sends the metric if telemetry is available.
 
-**Call relations**: Fallback-capable code paths call this helper directly. It shares the same sink-resolution behavior as initialization metrics through `record_counter`.
+**Call relations**: Code that chooses a fallback path calls this at the moment the fallback is taken. It delegates the actual metric sending to `record_counter`, which chooses either the supplied telemetry sink or the process-wide one.
 
 *Call graph*: calls 1 internal fn (record_counter).
 
@@ -2574,11 +2602,11 @@ fn record_fallback(
 fn record_counter(telemetry: Option<&dyn DbTelemetry>, name: &str, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Internal helper that emits a single incrementing counter if a telemetry sink is available. Missing telemetry is treated as a no-op.
+**Purpose**: Records a single count for a named metric. It is the shared helper for events where the important question is “how many times did this happen?”
 
-**Data flow**: It takes an optional sink, metric name, and tag slice, resolves the effective sink with `resolve_telemetry`, and if present calls `telemetry.counter(name, 1, tags)`. It returns no value and writes only to the telemetry sink.
+**Data flow**: It receives an optional telemetry sink, a metric name, and tags. It asks `resolve_telemetry` for the sink to use. If one exists, it increments the named counter by 1 with those tags; if not, it does nothing.
 
-**Call relations**: Both `record_init_result` and `record_fallback` delegate counter emission here so sink resolution and no-op behavior are centralized.
+**Call relations**: `record_init_result` uses this to count database initialization outcomes, and `record_fallback` uses it to count fallback events. It sits between higher-level reporting functions and the actual `DbTelemetry` implementation.
 
 *Call graph*: calls 1 internal fn (resolve_telemetry); called by 2 (record_fallback, record_init_result).
 
@@ -2594,11 +2622,11 @@ fn record_duration(
 )
 ```
 
-**Purpose**: Internal helper that records a duration metric if a telemetry sink is available. Like counters, missing telemetry is silently ignored.
+**Purpose**: Records how long a named operation took. It is the shared helper for timing metrics, such as database initialization duration.
 
-**Data flow**: It accepts an optional sink, metric name, `Duration`, and tags, resolves the sink via `resolve_telemetry`, and if present calls `telemetry.record_duration(name, duration, tags)`.
+**Data flow**: It receives an optional telemetry sink, a metric name, a duration, and tags. It asks `resolve_telemetry` for a usable sink. If one exists, it records the duration with the given name and tags; if not, it quietly skips recording.
 
-**Call relations**: Only `record_init_result` uses this helper, pairing it with `record_counter` for each initialization outcome.
+**Call relations**: `record_init_result` calls this after building the tags for a database startup phase. Like `record_counter`, it hides the detail of whether telemetry came from an explicit override or the process-wide sink.
 
 *Call graph*: calls 1 internal fn (resolve_telemetry); called by 1 (record_init_result).
 
@@ -2609,11 +2637,11 @@ fn record_duration(
 fn resolve_telemetry(telemetry: Option<&dyn DbTelemetry>) -> Option<&dyn DbTelemetry>
 ```
 
-**Purpose**: Chooses the telemetry sink to use for an emission attempt. An explicit override wins; otherwise the process-wide installed sink is used if present.
+**Purpose**: Chooses which telemetry sink should be used for a metric. It prefers the sink passed directly by the caller, and falls back to the process-wide sink if one was installed.
 
-**Data flow**: It takes `Option<&dyn DbTelemetry>` and returns either that same reference or, if absent, a borrowed reference to the sink stored in `PROCESS_DB_TELEMETRY`. If neither exists it returns `None`.
+**Data flow**: It receives an optional telemetry reference. If that reference is present, it returns it. Otherwise, it looks for the globally installed database telemetry sink and returns that if available. If neither exists, it returns nothing.
 
-**Call relations**: Both `record_counter` and `record_duration` call this helper before attempting emission, making it the single sink-selection point in the module.
+**Call relations**: `record_counter` and `record_duration` both call this before sending metrics. This keeps the fallback rule in one place, so all database telemetry behaves the same way.
 
 *Call graph*: called by 2 (record_counter, record_duration).
 
@@ -2624,11 +2652,11 @@ fn resolve_telemetry(telemetry: Option<&dyn DbTelemetry>) -> Option<&dyn DbTelem
 fn from_result(result: &anyhow::Result<T>) -> Self
 ```
 
-**Purpose**: Converts a generic `anyhow::Result` into the low-cardinality `status` and `error` tags used by initialization metrics. Successful results always map to `success/none`.
+**Purpose**: Turns a success-or-failure result into simple telemetry labels. It marks successful operations as `success` with no error, and failed operations as `failed` with a broad error category.
 
-**Data flow**: It borrows a `Result<T>`, pattern matches on `Ok` versus `Err`, and returns a `DbOutcomeTags` struct. On errors it calls `classify_error` to derive the stable `error` tag.
+**Data flow**: It receives a result from some database operation. If the result is successful, it creates tags saying status is `success` and error is `none`. If the result is an error, it calls `classify_error` to choose a short error label, then creates tags saying status is `failed`.
 
-**Call relations**: `record_init_result` uses this helper before assembling metric tags, so all initialization telemetry shares the same success/failure classification rules.
+**Call relations**: `record_init_result` calls this while preparing initialization metrics. When there is a failure, this function hands the detailed error to `classify_error` so the metric gets a safe, limited category instead of a noisy full error message.
 
 *Call graph*: calls 1 internal fn (classify_error); called by 1 (record_init_result).
 
@@ -2639,11 +2667,11 @@ fn from_result(result: &anyhow::Result<T>) -> Self
 fn classify_error(err: &anyhow::Error) -> &'static str
 ```
 
-**Purpose**: Walks an `anyhow::Error` chain and reduces it to a stable telemetry category such as `migration`, `serde`, `io`, or a SQLite-derived class. It prefers more specific inner causes when present.
+**Purpose**: Looks through an error and its causes, then chooses a broad category for telemetry. This makes failures easier to group without exposing or storing detailed error text in metrics.
 
-**Data flow**: It iterates `err.chain()`, checking each cause for `sqlx::Error`, `sqlx::migrate::MigrateError`, `serde_json::Error`, or `std::io::Error`. On the first recognized cause it returns the corresponding static tag, delegating SQLx errors to `classify_sqlx_error`; if nothing matches it returns `unknown`.
+**Data flow**: It receives an `anyhow::Error`, which can wrap several underlying causes. It walks through that chain of causes. If it finds a SQL database error, migration error, JSON parsing error, or input/output error, it returns the matching category. If nothing recognizable is found, it returns `unknown`.
 
-**Call relations**: Only `DbOutcomeTags::from_result` calls this helper. It is the top-level classifier that bridges rich error chains into low-cardinality telemetry tags.
+**Call relations**: `DbOutcomeTags::from_result` calls this for failed results. If the error is from SQLx, the database library used here, it passes that error to `classify_sqlx_error` for more specific classification.
 
 *Call graph*: calls 1 internal fn (classify_sqlx_error); called by 1 (from_result); 1 external calls (chain).
 
@@ -2654,11 +2682,11 @@ fn classify_error(err: &anyhow::Error) -> &'static str
 fn classify_sqlx_error(err: &sqlx::Error) -> &'static str
 ```
 
-**Purpose**: Classifies a `sqlx::Error` into a stable telemetry tag, with special handling for SQLite database result codes and serde decode failures. It distinguishes pool timeout and I/O from generic unknown SQLx failures.
+**Purpose**: Classifies errors reported by SQLx, the library used to talk to SQL databases. It turns detailed SQLx error variants into stable labels such as `pool_timeout`, `io`, `serde`, or a SQLite-specific category.
 
-**Data flow**: It pattern matches on the `sqlx::Error` variant. For `Database`, it extracts the optional database code, defaults to borrowed `"none"`, converts it to a string, and passes it to `classify_sqlite_code`; for `PoolTimedOut`, `Io`, and serde-backed decode variants it returns fixed tags; otherwise it returns `unknown`.
+**Data flow**: It receives a SQLx error. If the error came from the database itself, it reads the database error code and sends it to `classify_sqlite_code`. If it is a timeout, input/output error, or JSON decoding problem, it returns the matching label. Anything else becomes `unknown`.
 
-**Call relations**: `classify_error` delegates SQLx-specific classification here. This helper is where SQLite result-code interpretation is separated from broader SQLx transport and decoding failures.
+**Call relations**: `classify_error` calls this when it finds a SQLx error in the error chain. For actual SQLite result codes, this function hands off to `classify_sqlite_code` so SQLite’s numeric codes are translated in one dedicated place.
 
 *Call graph*: calls 1 internal fn (classify_sqlite_code); called by 1 (classify_error); 1 external calls (Borrowed).
 
@@ -2669,11 +2697,11 @@ fn classify_sqlx_error(err: &sqlx::Error) -> &'static str
 fn classify_sqlite_code(code: &str) -> &'static str
 ```
 
-**Purpose**: Maps a SQLite result code string to a stable primary-category telemetry tag. Extended result codes are reduced to their primary low-byte code before classification.
+**Purpose**: Translates SQLite numeric result codes into short human-readable categories for telemetry. For example, it can turn SQLite’s `5` into `busy` and a constraint failure into `constraint`.
 
-**Data flow**: It parses the input string as `i32`, masks the parsed value with `0xff` to obtain the primary SQLite code, and matches that code to tags like `busy`, `locked`, `readonly`, `io`, `corrupt`, `full`, `cantopen`, `schema`, and `constraint`. Unparseable or unmapped codes return `unknown`.
+**Data flow**: It receives a SQLite result code as text. It tries to parse it as a number, extracts the primary SQLite code from the low byte, then matches that code to a fixed label such as `locked`, `readonly`, `corrupt`, or `cantopen`. If parsing fails or the code is not recognized, it returns `unknown`.
 
-**Call relations**: This is the final step in SQLx database-error classification, called only by `classify_sqlx_error`. The included test locks in the extended-code masking behavior.
+**Call relations**: `classify_sqlx_error` calls this when SQLx reports a database error with a SQLite code. The test in this file also calls it indirectly through assertions to confirm normal and extended SQLite codes are categorized correctly.
 
 *Call graph*: called by 1 (classify_sqlx_error).
 
@@ -2684,10 +2712,10 @@ fn classify_sqlite_code(code: &str) -> &'static str
 fn classifies_extended_sqlite_codes()
 ```
 
-**Purpose**: Regression test for SQLite code classification, especially the handling of extended result codes. It ensures the low-byte masking logic maps extended codes to their primary category.
+**Purpose**: Checks that SQLite error code classification works for both ordinary codes and extended codes. Extended codes are larger numbers that still contain the main SQLite error type inside them.
 
-**Data flow**: The test passes fixed code strings into `classify_sqlite_code` and asserts the returned tags for `5`, `6`, and extended code `2067`. No external state is involved.
+**Data flow**: It supplies sample SQLite code strings to `classify_sqlite_code`. It compares the returned labels with the expected labels. If any label differs, the test fails.
 
-**Call relations**: This synchronous unit test is run by the test harness and directly validates the helper used by SQLx error telemetry classification.
+**Call relations**: This test protects the behavior of `classify_sqlite_code`, especially the detail that extended SQLite codes should still map to their primary category. It runs only during the test lifecycle, not in normal application execution.
 
 *Call graph*: 1 external calls (assert_eq!).

@@ -1,10 +1,10 @@
 # Provider and backend auth adaptation  `stage-5.2`
 
-This stage is cross-cutting authentication infrastructure that sits between configuration/login state and the clients that actually send HTTP, websocket, and RPC traffic. Its job is to normalize many auth schemes into reusable runtime adapters so later execution can attach the right headers or signatures without reinterpreting provider-specific rules.
+This stage is shared behind-the-scenes support. It prepares the “ID badges” that later network clients attach to HTTP, websocket, and RPC requests. The model-provider front door and provider definition describe what a model service needs: its address, credentials, models, and features. The auth files then turn saved logins, provider API keys, external token commands, account routing IDs, and FedRAMP markers into bearer-token headers.
 
-At the top, model-provider/src/lib.rs and provider.rs expose the public provider API and choose the generic provider path or the Amazon Bedrock specialization. Generic auth assembly lives in model-provider/src/auth.rs and bearer_auth_provider.rs, which turn API keys, PATs, ChatGPT tokens, agent identity, or command-produced bearer tokens into a common AuthProvider. external_bearer.rs supplies the shell-command token source, while agent-identity/src/lib.rs and login/src/auth/agent_identity.rs manage agent keys, signed assertions, JWTs, registration state, and backend URL resolution for agent-authenticated requests.
+For Amazon Bedrock, the Bedrock files choose between a simple bearer token and AWS SigV4, Amazon’s method of signing a request to prove who sent it and that it was not changed. The AWS helper files load credentials and region settings, check they are usable, and add those signatures.
 
-AWS-backed auth is handled by aws-auth: config.rs loads SDK credentials and region, signing.rs performs SigV4 signing, and lib.rs exposes the loaded signing context. Bedrock-specific files adapt those pieces to Mantle URLs, supported regions, and Bedrock-only auth choices. core/src/attestation.rs defines optional per-request attestation headers, codex-api/src/auth.rs gives transport-facing auth abstractions, and remote-control, MCP, and account backend files consume these adapters for their own authenticated flows.
+Agent identity files create or read cryptographic keys, register the running agent task, verify identity tokens, and build signed headers proving which agent made a request. The API auth and attestation files give the rest of the system one simple plug-in point for auth and optional proof metadata. Remote-control and MCP auth files decide when ChatGPT, bearer, or OAuth login is needed. The rate-limit reset processor uses backend auth to safely call an account action.
 
 ## Files in this stage
 
@@ -13,20 +13,26 @@ Defines the public model-provider API and the main runtime wiring that selects a
 
 ### `model-provider/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting library interface`
 
-This file is a pure module-and-reexport boundary for the model-provider crate. It declares the internal implementation modules `amazon_bedrock`, `auth`, `bearer_auth_provider`, `models_endpoint`, and `provider`, then selectively republishes the crate’s stable surface so downstream code can depend on a compact API without knowing the internal module layout. The exported items show the crate’s responsibilities: building authentication providers (`auth_provider_from_auth`, `unauthenticated_auth_provider`, `BearerAuthProvider`), representing provider-linked account state (`ProviderAccount`, `ProviderAccountState`, `ProviderAccountError`, `ProviderAccountResult`), describing provider capabilities (`ProviderCapabilities`), and constructing or sharing provider instances (`ModelProvider`, `ModelProviderFuture`, `SharedModelProvider`, `create_model_provider`). One notable design choice is aliasing `BearerAuthProvider` as `CoreAuthProvider`, which preserves compatibility for callers expecting a more generic auth-provider name while still exposing the concrete bearer-token implementation. Because this file contains no executable logic, its importance is architectural: it defines what the rest of the workspace is allowed to import from this crate and hides implementation details such as Bedrock-specific support and model-endpoint internals behind a curated facade.
+This file does not contain the provider logic itself. Instead, it works like the reception desk of the crate, which is Rust’s name for a library package. It names the internal modules that make up model-provider, such as authentication, bearer-token authentication, Amazon Bedrock support, model endpoint access, and the core provider code.
+
+Its main job is to provide a clean public interface. The internal files can stay organized by topic, while users of this library can import the important items from one place. For example, outside code can ask for `ModelProvider`, `create_model_provider`, or `BearerAuthProvider` without needing to know which internal source file defines them.
+
+This matters because it keeps the rest of the project from depending on the library’s private folder layout. If the implementation moves around later, callers do not have to change as long as this public surface stays the same. It also makes intentional choices about what is public: account types, provider state and capability types, authentication helpers, and provider construction are exposed, while lower-level details remain inside their modules.
 
 
 ### `model-provider/src/provider.rs`
 
-`orchestration` · `provider creation and cross-cutting runtime dispatch`
+`domain_logic` · `cross-cutting: provider setup, request preparation, account display, and model catalog refresh`
 
-This file is the central runtime abstraction for model providers. It defines lightweight data types first: `ProviderCapabilities` advertises provider-owned feature limits with a permissive default of all `true`; `ProviderAccountState` exposes app-visible account information; and `ProviderAccountError` captures two concrete failure modes when deriving account state from auth, with human-readable `Display` messages. It also defines default preferred-model constants used by providers that do not need backend-specific IDs.
+Codex can talk to more than one kind of model service. This file is the shared front desk for those services. Instead of the rest of the app needing to know every provider’s quirks, it can ask a `ModelProvider` for the same basic things: provider settings, login information, account state, feature limits, the base URL to call, and a model catalog manager.
 
-The `ModelProvider` trait combines metadata access, capability reporting, preferred-model selection, auth exposure, account-state reporting, API-provider construction, runtime base URL lookup, request-auth resolution, and model-manager creation. Several methods have default implementations: generic providers derive API provider and auth from `self.info()` plus current auth, and default runtime base URL simply echoes configured `base_url`.
+The key idea is a trait, `ModelProvider`, which is like a contract: every provider must be able to answer these questions, though it may answer them differently. The default `ConfiguredModelProvider` covers normal configured OpenAI-compatible providers. Amazon Bedrock is special, so `create_model_provider` detects it and builds an Amazon Bedrock provider instead.
 
-`create_model_provider` is the factory: Bedrock configs instantiate `AmazonBedrockModelProvider`, everything else becomes `ConfiguredModelProvider`. The generic implementation wraps `ModelProviderInfo` plus an optional auth manager, but `ConfiguredModelProvider::new` may replace that manager with a provider-scoped external bearer manager when command auth is configured. Its `account_state` logic is the most nuanced part of the file: for providers requiring OpenAI auth, it inspects cached auth only if there is no recorded refresh failure, maps API keys to `ProviderAccount::ApiKey`, rejects Bedrock API keys, and requires both email and plan type for ChatGPT-like auth before returning `ProviderAccount::Chatgpt`. `supports_attestation` is enabled only for cached ChatGPT auth. Finally, `models_manager` chooses between a `StaticModelsManager` when a catalog is configured and an `OpenAiModelsManager` backed by `OpenAiModelsEndpoint` when models must be fetched remotely. The extensive tests cover provider selection, auth-manager behavior, account-state edge cases, Bedrock specialization, static versus remote model catalogs, and provider-owned bearer-token precedence.
+The file also defines provider capabilities, such as whether web search or image generation should be exposed. These are upper bounds: the provider can say “this is not supported,” and the app must not show that feature even if another setting would allow it.
+
+Authentication is central here. The provider can return an authentication manager, fetch current credentials, translate those credentials into API-client form, and describe the user-visible account state. For model lists, it either uses a static catalog supplied by configuration or creates a manager that fetches models from a provider endpoint. The tests check these important boundaries, especially account reporting, Bedrock behavior, and token use.
 
 #### Function details
 
@@ -36,11 +42,11 @@ The `ModelProvider` trait combines metadata access, capability reporting, prefer
 fn default() -> Self
 ```
 
-**Purpose**: Supplies the default capability set for providers that do not override feature support.
+**Purpose**: Creates the normal capability set for a provider. By default, Codex assumes provider-backed tools such as namespace tools, image generation, and web search are allowed unless a provider says otherwise.
 
-**Data flow**: It returns `ProviderCapabilities { namespace_tools: true, image_generation: true, web_search: true }`.
+**Data flow**: No outside input is needed. It builds a `ProviderCapabilities` value with all three feature flags set to true, then returns that value.
 
-**Call relations**: This default is used by the trait's `capabilities` method for generic providers and any provider that does not supply a narrower capability set.
+**Call relations**: The default `ModelProvider::capabilities` method calls this when a provider has not supplied stricter limits. Provider implementations can override the default if some features should be hidden.
 
 *Call graph*: called by 1 (capabilities).
 
@@ -51,11 +57,11 @@ fn default() -> Self
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats provider account-state errors into user-facing messages.
+**Purpose**: Turns account-state errors into clear human-readable messages. This matters because callers may need to show why Codex cannot describe or use a provider account.
 
-**Data flow**: It matches `self` and writes either the missing-ChatGPT-details message or the unsupported-Bedrock-auth message into the formatter.
+**Data flow**: It receives one specific `ProviderAccountError` value and a formatter. It chooses the matching message, writes that message into the formatter, and returns the formatting result.
 
-**Call relations**: This implementation is used whenever `ProviderAccountError` is displayed or converted into text by callers or tests.
+**Call relations**: This is used through Rust’s standard display mechanism whenever an account error is printed or converted to text. It delegates the actual text writing to the formatter.
 
 *Call graph*: 1 external calls (write!).
 
@@ -66,11 +72,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn capabilities(&self) -> ProviderCapabilities
 ```
 
-**Purpose**: Provides the trait default capability set for providers that do not override it.
+**Purpose**: Gives callers the provider’s feature limits. The default answer is that all optional provider-backed features are available.
 
-**Data flow**: It calls `ProviderCapabilities::default()` and returns that value.
+**Data flow**: It reads no provider-specific data in the default implementation. It asks `ProviderCapabilities::default` for the standard all-enabled capability set and returns it.
 
-**Call relations**: Configured providers inherit this implementation; Bedrock overrides it with a narrower set.
+**Call relations**: Code that wants to decide whether to expose provider-backed features can call this through the `ModelProvider` trait. Special providers can replace this default with a narrower answer.
 
 *Call graph*: calls 1 internal fn (default).
 
@@ -81,11 +87,11 @@ fn capabilities(&self) -> ProviderCapabilities
 fn approval_review_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Provides the default preferred model for automatic approval review.
+**Purpose**: Returns the model name Codex should prefer for automatic approval review when the provider does not need a special backend-specific model ID.
 
-**Data flow**: It returns the constant `DEFAULT_APPROVAL_REVIEW_PREFERRED_MODEL`.
+**Data flow**: It takes the provider object as context but reads no stored fields in the default implementation. It returns the shared default approval-review model string.
 
-**Call relations**: Providers that need backend-specific IDs, such as Bedrock, override this method.
+**Call relations**: Callers use this through the provider abstraction when choosing a model for approval review. Providers with different model naming rules can override it.
 
 
 ##### `ModelProvider::memory_extraction_preferred_model`  (lines 118–120)
@@ -94,11 +100,11 @@ fn approval_review_preferred_model(&self) -> &'static str
 fn memory_extraction_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Provides the default preferred model for memory extraction.
+**Purpose**: Returns the default model name Codex should use when extracting useful memory from interactions. It gives ordinary providers a common fallback.
 
-**Data flow**: It returns the constant `DEFAULT_MEMORY_EXTRACTION_PREFERRED_MODEL`.
+**Data flow**: It receives the provider object but does not inspect it by default. It returns the shared default memory-extraction model string.
 
-**Call relations**: This default is used by generic providers; specialized providers may override it.
+**Call relations**: Memory-related code can ask the active provider for this preference without knowing what kind of provider it is. Providers may override it when their model IDs differ.
 
 
 ##### `ModelProvider::memory_consolidation_preferred_model`  (lines 125–127)
@@ -107,11 +113,11 @@ fn memory_extraction_preferred_model(&self) -> &'static str
 fn memory_consolidation_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Provides the default preferred model for memory consolidation.
+**Purpose**: Returns the default model name Codex should use when combining or cleaning up stored memories. It supplies a provider-neutral fallback.
 
-**Data flow**: It returns the constant `DEFAULT_MEMORY_CONSOLIDATION_PREFERRED_MODEL`.
+**Data flow**: It uses no input other than being called on a provider. It returns the shared default memory-consolidation model string.
 
-**Call relations**: This is the generic fallback for providers without backend-specific consolidation routing.
+**Call relations**: Memory consolidation code calls this through the provider interface. Providers that require special model IDs can provide their own answer.
 
 
 ##### `ModelProvider::supports_attestation`  (lines 130–132)
@@ -120,11 +126,11 @@ fn memory_consolidation_preferred_model(&self) -> &'static str
 fn supports_attestation(&self) -> bool
 ```
 
-**Purpose**: Declares whether requests through the provider should include attestation by default.
+**Purpose**: Says whether requests through this provider should include attestation, which is extra proof about the client or session. The default is no.
 
-**Data flow**: It returns `false` unconditionally.
+**Data flow**: It reads no provider data in the default implementation. It simply returns false.
 
-**Call relations**: Configured providers override this based on cached ChatGPT auth; Bedrock leaves the default false.
+**Call relations**: Request-building code can ask this before adding attestation data. `ConfiguredModelProvider` overrides it for ChatGPT-style authentication.
 
 
 ##### `ModelProvider::api_provider`  (lines 149–155)
@@ -133,11 +139,11 @@ fn supports_attestation(&self) -> bool
 fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>>
 ```
 
-**Purpose**: Builds a generic API provider configuration from provider metadata and current auth mode.
+**Purpose**: Builds the provider configuration in the form expected by the API client. It combines static provider settings with the current authentication mode.
 
-**Data flow**: It returns a boxed future that awaits `self.auth()`, maps the optional auth to `CodexAuth::auth_mode`, and passes that into `self.info().to_api_provider(...)`.
+**Data flow**: It starts with the provider object. When awaited, it fetches current auth, extracts the auth mode if auth exists, asks the provider info to convert itself into API-client settings, and returns either that configuration or an error.
 
-**Call relations**: This default implementation is used by generic providers; Bedrock overrides it to inject a runtime-resolved Mantle base URL.
+**Call relations**: This default trait method is available to all provider implementations. It packages the work as an asynchronous future so callers can await it during request setup.
 
 *Call graph*: 1 external calls (pin).
 
@@ -150,11 +156,11 @@ fn runtime_base_url(
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<Option<String>>>
 ```
 
-**Purpose**: Returns the configured base URL as the default runtime URL for providers without dynamic endpoint resolution.
+**Purpose**: Returns the base URL that requests should use for this provider at runtime. The default is the URL stored in provider configuration.
 
-**Data flow**: It returns a boxed future that clones `self.info().base_url` and wraps it in `Ok(...)`.
+**Data flow**: It reads the provider info’s `base_url` field, clones that optional string, wraps it in a successful result, and returns it asynchronously.
 
-**Call relations**: Configured providers inherit this behavior; Bedrock overrides it because its URL depends on resolved region/auth.
+**Call relations**: Request setup code can call this through any `ModelProvider`. Providers with dynamic endpoint rules can override it.
 
 *Call graph*: 1 external calls (pin).
 
@@ -167,11 +173,11 @@ fn api_auth(
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<SharedAuthProvider>>
 ```
 
-**Purpose**: Resolves the generic request auth provider from current auth and provider metadata.
+**Purpose**: Creates the credential-attaching object used by the API client. In plain terms, it decides how requests will prove they are allowed to use the provider.
 
-**Data flow**: It returns a boxed future that awaits `self.auth()`, then calls `resolve_provider_auth(auth.as_ref(), self.info())` and returns the resulting `SharedAuthProvider` or error.
+**Data flow**: When awaited, it fetches current provider auth, reads provider metadata, passes both to `resolve_provider_auth`, and returns either a shared auth provider or an error.
 
-**Call relations**: This default path is used by generic providers. Bedrock overrides it to use Bedrock-specific auth resolution instead of the generic resolver.
+**Call relations**: This default trait method is part of request preparation. It hands off the provider-specific credential decision to the auth helper so the API client receives a uniform auth object.
 
 *Call graph*: 2 external calls (pin, resolve_provider_auth).
 
@@ -185,11 +191,11 @@ fn create_model_provider(
 ) -> SharedModelProvider
 ```
 
-**Purpose**: Factory-selects the runtime provider implementation appropriate for the configured provider metadata.
+**Purpose**: Builds the runtime provider object for configured provider settings. It is the main factory that chooses between the special Amazon Bedrock implementation and the normal configured provider.
 
-**Data flow**: It takes `provider_info` and an optional `Arc<AuthManager>`, checks `provider_info.is_amazon_bedrock()`, and returns either `Arc<AmazonBedrockModelProvider::new(...)>` or `Arc<ConfiguredModelProvider::new(...)>` as `SharedModelProvider`.
+**Data flow**: It receives provider metadata and an optional authentication manager. It checks whether the metadata describes Amazon Bedrock; if so, it constructs an Amazon Bedrock provider, otherwise it constructs a `ConfiguredModelProvider`. In both cases it returns the result behind a shared reference-counted handle so many parts of the app can use it safely.
 
-**Call relations**: This is the main entry point used by the rest of the system to instantiate providers. It dispatches between the Bedrock-specialized and generic implementations.
+**Call relations**: Many tests call this because it is the public doorway into this file’s behavior. In production, higher-level setup code would call it after loading provider configuration, then pass the shared provider through the rest of the system.
 
 *Call graph*: calls 3 internal fn (is_amazon_bedrock, new, new); called by 15 (amazon_bedrock_provider_creates_static_models_manager, amazon_bedrock_provider_returns_bedrock_account_state, configured_bedrock_catalog_only_allows_default_service_tier, configured_provider_models_manager_uses_provider_bearer_token, configured_provider_runtime_base_url_uses_configured_base_url, configured_provider_uses_default_approval_review_preferred_model, configured_provider_uses_default_capabilities, create_model_provider_builds_command_auth_manager_without_base_manager, create_model_provider_does_not_use_openai_auth_manager_for_amazon_bedrock_provider, create_model_provider_uses_managed_auth_for_amazon_bedrock_provider (+5 more)); 1 external calls (new).
 
@@ -200,11 +206,11 @@ fn create_model_provider(
 fn new(provider_info: ModelProviderInfo, auth_manager: Option<Arc<AuthManager>>) -> Self
 ```
 
-**Purpose**: Constructs the generic runtime provider and applies provider-scoped auth-manager substitution when command auth is configured.
+**Purpose**: Creates the standard provider implementation from provider metadata and optional authentication. It also adapts the authentication manager so it matches this specific provider’s rules.
 
-**Data flow**: It takes `provider_info` and an optional auth manager, passes both to `auth_manager_for_provider`, and stores the resulting manager alongside the original `provider_info` in a new `ConfiguredModelProvider`.
+**Data flow**: It receives `ModelProviderInfo` and maybe an `AuthManager`. It asks `auth_manager_for_provider` whether that manager should be used, replaced, or omitted for this provider, then stores the provider info and resulting auth manager in a new `ConfiguredModelProvider`.
 
-**Call relations**: This constructor is called by `create_model_provider` for all non-Bedrock providers. Its only delegation is to auth-manager selection logic.
+**Call relations**: `create_model_provider` calls this for non-Bedrock providers. It is the setup step that keeps later provider methods from needing to repeat auth-manager selection logic.
 
 *Call graph*: calls 1 internal fn (auth_manager_for_provider); called by 1 (create_model_provider).
 
@@ -215,11 +221,11 @@ fn new(provider_info: ModelProviderInfo, auth_manager: Option<Arc<AuthManager>>)
 fn info(&self) -> &ModelProviderInfo
 ```
 
-**Purpose**: Returns the stored generic provider metadata.
+**Purpose**: Returns the stored provider metadata for a configured provider. This metadata contains settings such as name, base URL, auth requirements, retry limits, and protocol style.
 
-**Data flow**: It reads `self.info` and returns a shared reference.
+**Data flow**: It receives the provider object and returns a shared reference to its stored `ModelProviderInfo`. Nothing is copied or changed.
 
-**Call relations**: This satisfies the trait's metadata accessor for generic providers.
+**Call relations**: This fulfills the required `ModelProvider::info` contract for `ConfiguredModelProvider`. Default trait methods such as API provider and base URL resolution rely on this information.
 
 
 ##### `ConfiguredModelProvider::auth_manager`  (lines 221–223)
@@ -228,11 +234,11 @@ fn info(&self) -> &ModelProviderInfo
 fn auth_manager(&self) -> Option<Arc<AuthManager>>
 ```
 
-**Purpose**: Exposes the provider's auth manager, if any.
+**Purpose**: Returns the authentication manager attached to this provider, if it has one. The manager is the object that can cache, refresh, or fetch credentials.
 
-**Data flow**: It clones and returns `self.auth_manager`.
+**Data flow**: It reads the provider’s optional auth manager, clones the shared handle if present, and returns it. The underlying manager is not duplicated; the clone is another pointer to the same shared object.
 
-**Call relations**: This is the straightforward generic implementation of the trait method; unlike Bedrock, it does not filter by auth type.
+**Call relations**: Callers and tests use this through the `ModelProvider` trait to inspect whether a provider has provider-scoped authentication available.
 
 
 ##### `ConfiguredModelProvider::supports_attestation`  (lines 225–230)
@@ -241,11 +247,11 @@ fn auth_manager(&self) -> Option<Arc<AuthManager>>
 fn supports_attestation(&self) -> bool
 ```
 
-**Purpose**: Enables attestation only when the cached auth is ChatGPT-based.
+**Purpose**: Reports whether this configured provider should include attestation with requests. It returns true only when cached authentication is ChatGPT-style auth.
 
-**Data flow**: It reads `self.auth_manager`, obtains `auth_cached()` if present, and returns true only when the cached auth exists and `auth.is_chatgpt_auth()` is true.
+**Data flow**: It looks for an auth manager, asks it for cached auth, and checks whether that auth is ChatGPT authentication. If any piece is missing or the auth is a different kind, it returns false.
 
-**Call relations**: This overrides the trait default so generic providers can opt into attestation based on current auth state.
+**Call relations**: This overrides the trait’s default false answer. Request-building code can ask the active provider and only attach attestation when this method says it is supported.
 
 
 ##### `ConfiguredModelProvider::auth`  (lines 232–239)
@@ -254,11 +260,11 @@ fn supports_attestation(&self) -> bool
 fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 ```
 
-**Purpose**: Asynchronously fetches the current auth snapshot from the provider's auth manager.
+**Purpose**: Fetches the current authentication value for this provider. If the provider has no auth manager, it reports that no auth is available.
 
-**Data flow**: It returns a boxed future that checks `self.auth_manager`; if present it awaits `auth_manager.auth()` and returns the result, otherwise it returns `None`.
+**Data flow**: It creates an asynchronous operation. When awaited, that operation checks whether an auth manager exists; if it does, it awaits the manager’s current auth value, otherwise it returns `None`.
 
-**Call relations**: This method feeds the trait defaults for API-provider and API-auth construction, as well as account-state logic in callers.
+**Call relations**: Default trait methods such as `api_provider` and `api_auth` use provider auth to prepare requests. This implementation supplies that value for ordinary configured providers.
 
 *Call graph*: 1 external calls (pin).
 
@@ -269,11 +275,11 @@ fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 fn account_state(&self) -> ProviderAccountResult
 ```
 
-**Purpose**: Derives the app-visible account state for generic providers from provider requirements and cached auth details.
+**Purpose**: Builds the account information that the app can show for this provider. It distinguishes no-auth state, API-key state, ChatGPT account state, and unsupported Bedrock API-key use.
 
-**Data flow**: If `self.info.requires_openai_auth` is false, it returns `ProviderAccountState { account: None, requires_openai_auth: false }`. Otherwise it inspects `self.auth_manager`, fetches cached auth only when there is no recorded refresh failure for that auth, and maps auth variants: `ApiKey` becomes `ProviderAccount::ApiKey`; `BedrockApiKey` returns `Err(UnsupportedBedrockApiKeyAuth)`; ChatGPT-like, agent-identity, and PAT auth require both `get_account_email()` and `account_plan_type()` to produce `ProviderAccount::Chatgpt { email, plan_type }`, otherwise they return `Err(MissingChatgptAccountDetails)`. The final `ProviderAccountState` always echoes `requires_openai_auth` from config.
+**Data flow**: It first checks whether this provider requires OpenAI authentication. If not, it returns no account and marks auth as not required. If auth is required, it reads cached auth only when there is no refresh failure. API keys become an API-key account, ChatGPT-like auth must provide both email and plan type, and Bedrock API-key auth becomes an error. The result is a `ProviderAccountState` or a specific account error.
 
-**Call relations**: This method is called by UI/status code to summarize provider auth state. It is self-contained and does not delegate to local helpers, because it encodes the generic provider's account-state policy directly.
+**Call relations**: UI or status code can call this through the provider to describe the active account. The tests exercise the main paths: unauthenticated OpenAI, API key, incomplete ChatGPT details, wrong Bedrock auth, and non-OpenAI providers.
 
 
 ##### `ConfiguredModelProvider::models_manager`  (lines 283–305)
@@ -286,11 +292,11 @@ fn models_manager(
     ) -> SharedModelsManager
 ```
 
-**Purpose**: Chooses between a static and remote models manager for generic providers based on whether a model catalog is configured.
+**Purpose**: Creates the object that knows how to list models for this configured provider. It chooses between a fixed catalog from configuration and a live OpenAI-compatible `/models` endpoint.
 
-**Data flow**: It takes `codex_home` and optional `config_model_catalog`. If a catalog is provided, it returns `Arc<StaticModelsManager::new(self.auth_manager.clone(), model_catalog)>`. Otherwise it constructs an `Arc<OpenAiModelsEndpoint>` from cloned provider info and auth manager, then returns `Arc<OpenAiModelsManager::new(codex_home, endpoint, self.auth_manager.clone())>`.
+**Data flow**: It receives the Codex home directory and an optional model catalog. If a catalog is provided, it builds a static manager around that catalog. If not, it builds an `OpenAiModelsEndpoint` from provider info and auth, then creates an `OpenAiModelsManager` that can fetch and cache models using that endpoint. It returns the chosen manager behind a shared handle.
 
-**Call relations**: This method is the generic provider's model-catalog strategy switch. It delegates to `OpenAiModelsEndpoint` and `OpenAiModelsManager` for remote catalogs, or `StaticModelsManager` for configured catalogs.
+**Call relations**: Model discovery code asks the provider for this manager after provider setup. Tests verify that configured providers use provider tokens correctly and that catalog choices behave as expected.
 
 *Call graph*: calls 3 internal fn (new, new, new); 2 external calls (new, clone).
 
@@ -301,11 +307,11 @@ fn models_manager(
 fn provider_info_with_command_auth() -> ModelProviderInfo
 ```
 
-**Purpose**: Creates a generic provider fixture configured with command-backed auth.
+**Purpose**: Creates test provider metadata that uses an external command to obtain authentication. This lets tests verify command-based auth setup without needing a real provider.
 
-**Data flow**: It builds `ModelProviderAuthInfo` with command metadata and current directory, embeds it into an OpenAI provider config, and returns the resulting `ModelProviderInfo`.
+**Data flow**: It starts from OpenAI-style provider defaults, fills in command-auth settings such as command name, timeout, refresh interval, and current working directory, and returns the completed `ModelProviderInfo`.
 
-**Call relations**: This helper supports tests around provider construction and command-auth manager creation.
+**Call relations**: The command-auth test calls this helper, then passes the result to `create_model_provider` to check that a provider-scoped auth manager is created.
 
 *Call graph*: calls 1 internal fn (create_openai_provider); 3 external calls (new, new, current_dir).
 
@@ -316,11 +322,11 @@ fn provider_info_with_command_auth() -> ModelProviderInfo
 fn test_codex_home() -> std::path::PathBuf
 ```
 
-**Purpose**: Builds a temporary per-process path used as a fake Codex home directory in tests.
+**Purpose**: Builds a temporary Codex home path for tests. It keeps model-manager test files away from a real user’s configuration.
 
-**Data flow**: It reads `std::env::temp_dir()`, appends a process-ID-based suffix, and returns the resulting `PathBuf`.
+**Data flow**: It reads the system temporary directory and the current process ID, combines them into a unique-looking directory name, and returns that path.
 
-**Call relations**: This helper is used by tests that instantiate models managers requiring a home directory path.
+**Call relations**: Model-manager tests call this when they need a home directory argument. It is test plumbing, not production behavior.
 
 *Call graph*: 2 external calls (format!, temp_dir).
 
@@ -331,11 +337,11 @@ fn test_codex_home() -> std::path::PathBuf
 fn provider_for(base_url: String) -> ModelProviderInfo
 ```
 
-**Purpose**: Constructs a minimal custom provider configuration for tests targeting generic provider behavior.
+**Purpose**: Creates simple provider metadata for a mock HTTP server. Tests use it when they need a provider with a known base URL and no real authentication requirement.
 
-**Data flow**: It takes a base URL string and returns a `ModelProviderInfo` populated with explicit fields such as `name`, `base_url`, `wire_api`, retry settings, and `requires_openai_auth: false`.
+**Data flow**: It receives a base URL string, fills a `ModelProviderInfo` with that URL and predictable test settings such as zero retries, and returns the metadata.
 
-**Call relations**: This fixture is used by tests that need a non-OpenAI, non-Bedrock provider with predictable settings.
+**Call relations**: Runtime-base-URL and remote-model-catalog tests use this helper before calling `create_model_provider`.
 
 
 ##### `tests::remote_model`  (lines 373–398)
@@ -344,11 +350,11 @@ fn provider_for(base_url: String) -> ModelProviderInfo
 fn remote_model(slug: &str) -> ModelInfo
 ```
 
-**Purpose**: Builds a realistic `ModelInfo` test value from JSON for remote-model catalog tests.
+**Purpose**: Creates a realistic model entry for tests from a short model slug. This avoids repeating a large model JSON object in every test.
 
-**Data flow**: It interpolates the provided slug into a JSON object containing many `ModelInfo` fields, deserializes it with `serde_json::from_value`, and returns the parsed model.
+**Data flow**: It receives a slug string, inserts it into a JSON value with all required model fields, parses that JSON into a `ModelInfo`, and returns the parsed model. If the test data is invalid, the test fails immediately.
 
-**Call relations**: This helper supplies remote catalog payloads for tests involving the generic provider's remote models manager.
+**Call relations**: The provider-token model-manager test uses this helper to prepare the fake server’s `/models` response.
 
 *Call graph*: 2 external calls (json!, from_value).
 
@@ -359,11 +365,11 @@ fn remote_model(slug: &str) -> ModelInfo
 fn bedrock_api_key_auth() -> CodexAuth
 ```
 
-**Purpose**: Creates a reusable Bedrock API-key auth fixture for tests.
+**Purpose**: Creates a fake Amazon Bedrock API-key authentication value for tests. It gives tests a consistent Bedrock credential without using a real secret.
 
-**Data flow**: It constructs and returns `CodexAuth::BedrockApiKey(BedrockApiKeyAuth { api_key, region })` with fixed test values.
+**Data flow**: It constructs a `CodexAuth::BedrockApiKey` value with a test API key and AWS region, then returns it.
 
-**Call relations**: This helper is used by tests that verify Bedrock auth handling and rejection in generic provider paths.
+**Call relations**: Tests use this helper when checking Bedrock auth behavior and when verifying that ordinary OpenAI providers reject Bedrock API-key account state.
 
 *Call graph*: 1 external calls (BedrockApiKey).
 
@@ -374,11 +380,11 @@ fn bedrock_api_key_auth() -> CodexAuth
 fn configured_provider_uses_default_capabilities()
 ```
 
-**Purpose**: Verifies that generic configured providers inherit the default capability set.
+**Purpose**: Checks that a normal configured provider uses the standard capability set. This protects the default behavior that optional provider-backed features start enabled.
 
-**Data flow**: It creates a generic provider with `create_model_provider`, calls `capabilities()`, and asserts equality with `ProviderCapabilities::default()`.
+**Data flow**: It creates OpenAI-style provider info, builds a provider with no auth manager, asks for capabilities, and compares the result to `ProviderCapabilities::default`.
 
-**Call relations**: This test covers the trait default `capabilities` path as exercised through the generic provider implementation.
+**Call relations**: This test goes through `create_model_provider`, so it verifies the public construction path rather than directly constructing the implementation.
 
 *Call graph*: calls 2 internal fn (create_openai_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -389,11 +395,11 @@ fn configured_provider_uses_default_capabilities()
 fn configured_provider_uses_default_approval_review_preferred_model()
 ```
 
-**Purpose**: Checks that generic providers use the default approval-review preferred model constant.
+**Purpose**: Checks that a normal configured provider returns the shared default model for approval review. This catches accidental changes to the provider default.
 
-**Data flow**: It creates a generic provider and asserts `approval_review_preferred_model()` equals `DEFAULT_APPROVAL_REVIEW_PREFERRED_MODEL`.
+**Data flow**: It builds an OpenAI-style provider, asks it for the approval-review preferred model, and compares the answer to the default constant.
 
-**Call relations**: This test validates the inherited trait default for approval-review model selection.
+**Call relations**: The test uses `create_model_provider` and then calls the trait method as production code would.
 
 *Call graph*: calls 2 internal fn (create_openai_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -404,11 +410,11 @@ fn configured_provider_uses_default_approval_review_preferred_model()
 async fn configured_provider_runtime_base_url_uses_configured_base_url()
 ```
 
-**Purpose**: Ensures the generic provider's runtime base URL simply reflects configured provider metadata.
+**Purpose**: Checks that the runtime base URL comes from provider configuration for a normal provider. This is important because requests must go to the user-configured endpoint.
 
-**Data flow**: It creates a provider from `provider_for("https://example.test/v1")`, awaits `runtime_base_url()`, and asserts the result is that same URL wrapped in `Some`.
+**Data flow**: It creates provider metadata with `https://example.test/v1`, builds a provider, awaits `runtime_base_url`, and verifies that the same URL comes back.
 
-**Call relations**: This test covers the trait default `runtime_base_url` implementation through a generic provider.
+**Call relations**: This test exercises the default trait method through a provider made by `create_model_provider`.
 
 *Call graph*: calls 1 internal fn (create_model_provider); 2 external calls (assert_eq!, provider_for).
 
@@ -419,11 +425,11 @@ async fn configured_provider_runtime_base_url_uses_configured_base_url()
 fn create_model_provider_builds_command_auth_manager_without_base_manager()
 ```
 
-**Purpose**: Verifies that command-auth providers get a provider-scoped auth manager even when no base manager is supplied.
+**Purpose**: Checks that command-based provider auth works even when no general auth manager is supplied. This supports providers whose tokens come from an external command.
 
-**Data flow**: It creates a provider from `provider_info_with_command_auth()` and `None`, retrieves `auth_manager()`, and asserts `has_external_auth()` is true.
+**Data flow**: It creates provider info with command auth, builds a provider with no base auth manager, retrieves the provider’s auth manager, and asserts that it reports external auth support.
 
-**Call relations**: This test exercises `create_model_provider` plus `ConfiguredModelProvider::new` and `auth_manager_for_provider` on the command-auth path.
+**Call relations**: The test connects `provider_info_with_command_auth`, `create_model_provider`, and `ConfiguredModelProvider::new` behavior through the public trait interface.
 
 *Call graph*: calls 1 internal fn (create_model_provider); 2 external calls (assert!, provider_info_with_command_auth).
 
@@ -434,11 +440,11 @@ fn create_model_provider_builds_command_auth_manager_without_base_manager()
 fn create_model_provider_does_not_use_openai_auth_manager_for_amazon_bedrock_provider()
 ```
 
-**Purpose**: Checks that the provider factory does not expose an OpenAI auth manager through a Bedrock provider.
+**Purpose**: Checks that an OpenAI API-key auth manager is not incorrectly reused for an Amazon Bedrock provider configured for AWS-managed credentials. This prevents credentials for one service from leaking into another.
 
-**Data flow**: It creates a Bedrock provider with an auth manager containing an OpenAI API key and asserts `provider.auth_manager()` is `None`.
+**Data flow**: It creates Bedrock provider info with AWS profile settings and supplies an OpenAI API-key auth manager. After building the provider, it checks that the provider exposes no auth manager.
 
-**Call relations**: This test validates factory dispatch to the Bedrock implementation and Bedrock's auth filtering behavior.
+**Call relations**: This test verifies the Bedrock branch in `create_model_provider` and the special auth rules of the Amazon Bedrock provider.
 
 *Call graph*: calls 4 internal fn (from_auth_for_testing, from_api_key, create_amazon_bedrock_provider, create_model_provider); 1 external calls (assert!).
 
@@ -449,11 +455,11 @@ fn create_model_provider_does_not_use_openai_auth_manager_for_amazon_bedrock_pro
 async fn create_model_provider_uses_managed_auth_for_amazon_bedrock_provider()
 ```
 
-**Purpose**: Verifies that the provider factory preserves managed Bedrock auth when constructing a Bedrock provider.
+**Purpose**: Checks that Amazon Bedrock can use a managed Bedrock API-key auth value when that is the auth supplied. This protects the supported Bedrock API-key path.
 
-**Data flow**: It creates a Bedrock provider with an auth manager containing `bedrock_api_key_auth()`, awaits `provider.auth()`, and asserts the returned auth matches the fixture.
+**Data flow**: It creates fake Bedrock API-key auth, wraps it in a test auth manager, builds a Bedrock provider, awaits provider auth, and compares the returned auth to the original value.
 
-**Call relations**: This test covers factory dispatch plus Bedrock provider auth exposure on the managed-auth path.
+**Call relations**: The test uses `bedrock_api_key_auth` and `create_model_provider` to confirm that Bedrock-specific provider construction preserves appropriate auth.
 
 *Call graph*: calls 3 internal fn (from_auth_for_testing, create_amazon_bedrock_provider, create_model_provider); 2 external calls (assert_eq!, bedrock_api_key_auth).
 
@@ -464,11 +470,11 @@ async fn create_model_provider_uses_managed_auth_for_amazon_bedrock_provider()
 fn openai_provider_returns_unauthenticated_openai_account_state()
 ```
 
-**Purpose**: Checks the generic account-state result for an OpenAI provider with no auth.
+**Purpose**: Checks what account state an OpenAI provider reports when no auth is available. The expected state is that auth is required but no account is currently known.
 
-**Data flow**: It creates an OpenAI provider without an auth manager and asserts `account_state()` returns `account: None` and `requires_openai_auth: true`.
+**Data flow**: It builds an OpenAI provider with no auth manager, calls `account_state`, and compares the result to an empty account with `requires_openai_auth` set to true.
 
-**Call relations**: This test covers the no-auth branch of `ConfiguredModelProvider::account_state` when auth is required.
+**Call relations**: This test exercises `ConfiguredModelProvider::account_state` through the normal provider factory.
 
 *Call graph*: calls 2 internal fn (create_openai_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -479,11 +485,11 @@ fn openai_provider_returns_unauthenticated_openai_account_state()
 fn openai_provider_returns_api_key_account_state()
 ```
 
-**Purpose**: Verifies that cached API-key auth maps to `ProviderAccount::ApiKey` for OpenAI providers.
+**Purpose**: Checks that an OpenAI provider using an API key reports an API-key account state. This lets the app show a sensible account status without exposing the key itself.
 
-**Data flow**: It creates an OpenAI provider with an auth manager containing `CodexAuth::ApiKey`, calls `account_state()`, and asserts the returned state contains `Some(ProviderAccount::ApiKey)` with `requires_openai_auth: true`.
+**Data flow**: It creates a test OpenAI API-key auth manager, builds an OpenAI provider, calls `account_state`, and expects `ProviderAccount::ApiKey` with OpenAI auth required.
 
-**Call relations**: This test exercises the API-key mapping branch in `ConfiguredModelProvider::account_state`.
+**Call relations**: The test goes through `create_model_provider`, then verifies the API-key branch inside `ConfiguredModelProvider::account_state`.
 
 *Call graph*: calls 4 internal fn (from_auth_for_testing, from_api_key, create_openai_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -494,11 +500,11 @@ fn openai_provider_returns_api_key_account_state()
 fn openai_provider_rejects_chatgpt_account_state_without_email()
 ```
 
-**Purpose**: Checks that ChatGPT-like auth without complete account details is rejected when deriving account state.
+**Purpose**: Checks that ChatGPT-style auth is not shown as a complete account unless it includes required account details. Email and plan type are needed for the app-visible account record.
 
-**Data flow**: It creates an OpenAI provider with dummy ChatGPT auth lacking required details, calls `account_state()`, and asserts the result is `Err(ProviderAccountError::MissingChatgptAccountDetails)`.
+**Data flow**: It builds an OpenAI provider with dummy ChatGPT auth that lacks full account details, calls `account_state`, and expects the missing-details error.
 
-**Call relations**: This test covers the validation branch in `ConfiguredModelProvider::account_state` that requires both email and plan type.
+**Call relations**: This protects the validation path in `ConfiguredModelProvider::account_state` for ChatGPT-like authentication.
 
 *Call graph*: calls 4 internal fn (from_auth_for_testing, create_dummy_chatgpt_auth_for_testing, create_openai_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -509,11 +515,11 @@ fn openai_provider_rejects_chatgpt_account_state_without_email()
 fn openai_provider_rejects_bedrock_api_key_account_state()
 ```
 
-**Purpose**: Verifies that Bedrock API-key auth is invalid for generic OpenAI provider account-state derivation.
+**Purpose**: Checks that a normal OpenAI provider does not accept Bedrock API-key auth as its account state. This prevents mixing incompatible credential types.
 
-**Data flow**: It creates an OpenAI provider with cached `bedrock_api_key_auth()`, calls `account_state()`, and asserts the result is `Err(ProviderAccountError::UnsupportedBedrockApiKeyAuth)`.
+**Data flow**: It creates a provider with OpenAI settings but supplies fake Bedrock API-key auth. Calling `account_state` should return the unsupported-Bedrock-auth error.
 
-**Call relations**: This test covers the explicit Bedrock-auth rejection branch in `ConfiguredModelProvider::account_state`.
+**Call relations**: The test uses `bedrock_api_key_auth` and the standard factory to exercise the rejection branch in `ConfiguredModelProvider::account_state`.
 
 *Call graph*: calls 3 internal fn (from_auth_for_testing, create_openai_provider, create_model_provider); 2 external calls (assert_eq!, bedrock_api_key_auth).
 
@@ -524,11 +530,11 @@ fn openai_provider_rejects_bedrock_api_key_account_state()
 fn custom_non_openai_provider_returns_no_account_state()
 ```
 
-**Purpose**: Checks that providers not requiring OpenAI auth report no account information.
+**Purpose**: Checks that a custom provider that does not require OpenAI auth reports no OpenAI account state. This matters for local or third-party providers that do not use OpenAI login.
 
-**Data flow**: It creates a custom provider with `requires_openai_auth: false`, calls `account_state()`, and asserts the result contains `account: None` and `requires_openai_auth: false`.
+**Data flow**: It creates custom provider metadata with `requires_openai_auth` set to false, builds a provider, calls `account_state`, and expects no account and no OpenAI-auth requirement.
 
-**Call relations**: This test covers the early-return branch in `ConfiguredModelProvider::account_state` for providers that do not require OpenAI auth.
+**Call relations**: This test verifies the non-auth-required branch of `ConfiguredModelProvider::account_state` through `create_model_provider`.
 
 *Call graph*: calls 1 internal fn (create_model_provider); 2 external calls (default, assert_eq!).
 
@@ -539,11 +545,11 @@ fn custom_non_openai_provider_returns_no_account_state()
 fn amazon_bedrock_provider_returns_bedrock_account_state()
 ```
 
-**Purpose**: Verifies that Bedrock providers report an Amazon Bedrock account state with AWS-managed credentials by default.
+**Purpose**: Checks that an Amazon Bedrock provider reports an Amazon Bedrock account state using AWS-managed credentials. This gives the app a provider-specific account description.
 
-**Data flow**: It creates a Bedrock provider without managed auth, calls `account_state()`, and asserts the result contains `ProviderAccount::AmazonBedrock { credential_source: AwsManaged }` and `requires_openai_auth: false`.
+**Data flow**: It creates default Bedrock provider info, builds the provider, calls `account_state`, and expects an Amazon Bedrock account with AWS-managed credential source and no OpenAI-auth requirement.
 
-**Call relations**: This test validates factory dispatch to the Bedrock implementation and Bedrock-specific account-state reporting.
+**Call relations**: This test verifies that `create_model_provider` chooses the Bedrock implementation and that the Bedrock provider supplies its own account-state behavior.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, create_model_provider); 1 external calls (assert_eq!).
 
@@ -554,11 +560,11 @@ fn amazon_bedrock_provider_returns_bedrock_account_state()
 async fn amazon_bedrock_provider_creates_static_models_manager()
 ```
 
-**Purpose**: Checks that Bedrock providers use a static models manager with the expected built-in catalog and default model ordering.
+**Purpose**: Checks that Amazon Bedrock uses a static model catalog with the expected Bedrock model IDs and default model. This avoids trying to fetch models from an OpenAI-style endpoint for Bedrock.
 
-**Data flow**: It creates a Bedrock provider, builds its models manager with no configured catalog, fetches the raw catalog and listed presets, collects model slugs, and asserts the catalog contains `openai.gpt-5.5` then `openai.gpt-5.4`, with GPT-5.5 marked as the default preset.
+**Data flow**: It builds a Bedrock provider, asks it for a models manager, requests the raw catalog online, collects model IDs, and verifies the expected Bedrock IDs. It also lists models and checks that the default model is the expected one.
 
-**Call relations**: This test exercises `create_model_provider`, Bedrock `models_manager`, and the static catalog path end-to-end.
+**Call relations**: This test exercises the Bedrock provider returned by `create_model_provider`, while using `test_codex_home` only as safe test storage.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, create_model_provider); 2 external calls (assert_eq!, test_codex_home).
 
@@ -569,11 +575,11 @@ async fn amazon_bedrock_provider_creates_static_models_manager()
 async fn configured_bedrock_catalog_only_allows_default_service_tier()
 ```
 
-**Purpose**: Verifies that even a caller-supplied Bedrock catalog is normalized to remove explicit service-tier options.
+**Purpose**: Checks that when a configured catalog is used for Bedrock, extra service-tier choices are stripped away. This matters because Bedrock only supports the default service tier in this path.
 
-**Data flow**: It loads the bundled GPT-5.5 model, asserts that its original tier fields are non-empty, creates a Bedrock provider, passes a one-model `ModelsResponse` into `models_manager`, fetches the resulting raw catalog, and asserts the returned model keeps slug `gpt-5.5` but has empty `additional_speed_tiers`, empty `service_tiers`, and `default_service_tier: None`.
+**Data flow**: It loads bundled model data, selects a model that has speed and service tiers, builds a Bedrock provider, gives that model as a configured catalog, then reads the resulting catalog and verifies that additional speed tiers, service tiers, and default service tier were removed.
 
-**Call relations**: This test covers the Bedrock provider's configured-catalog path and the application of `with_default_only_service_tier`.
+**Call relations**: The test combines bundled catalog data, `create_model_provider`, and the provider’s `models_manager` behavior to protect Bedrock-specific catalog adaptation.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, create_model_provider); 5 external calls (assert!, assert_eq!, bundled_models_response, test_codex_home, vec!).
 
@@ -584,11 +590,11 @@ async fn configured_bedrock_catalog_only_allows_default_service_tier()
 async fn configured_provider_models_manager_uses_provider_bearer_token()
 ```
 
-**Purpose**: Checks that a generic provider's remote models fetch uses the provider-configured bearer token rather than caller auth.
+**Purpose**: Checks that a configured provider’s model-list request uses the bearer token set on that provider. This ensures model discovery authenticates with the provider’s own token rather than unrelated user auth.
 
-**Data flow**: It starts a mock server, configures it to expect `GET /models` with `Authorization: Bearer provider-token`, builds a provider whose `experimental_bearer_token` is set while the auth manager contains dummy ChatGPT auth, creates the models manager, fetches the raw catalog online, and asserts the returned models include `provider-model`.
+**Data flow**: It starts a mock HTTP server, sets an expectation for `GET /models` with an `Authorization: Bearer provider-token` header, and makes the server return a fake model catalog. It then builds provider info with that bearer token, creates a provider, asks its models manager for the catalog, and verifies that the returned models include the fake provider model.
 
-**Call relations**: This test exercises the generic provider's remote models-manager path together with `OpenAiModelsEndpoint` and generic auth resolution, proving provider-owned bearer auth takes precedence.
+**Call relations**: This test drives the full configured-provider model-list path: mock server, provider metadata from `provider_for`, `create_model_provider`, `ConfiguredModelProvider::models_manager`, and the OpenAI-compatible models endpoint.
 
 *Call graph*: calls 3 internal fn (from_auth_for_testing, create_dummy_chatgpt_auth_for_testing, create_model_provider); 10 external calls (given, start, new, assert!, provider_for, test_codex_home, vec!, header_regex, method, path).
 
@@ -598,15 +604,13 @@ Builds the reusable auth primitives and identity-backed token sources used by no
 
 ### `agent-identity/src/lib.rs`
 
-`domain_logic` · `authentication / registration / request signing`
+`domain_logic` · `startup, identity setup, task registration, and request authorization`
 
-This library concentrates the mechanics for proving agent identity to backend services. It defines lightweight input structs such as `AgentIdentityKey` and `AgentTaskAuthorizationTarget`, output structs like `GeneratedAgentKeyMaterial`, and protocol payload types including `AgentIdentityJwtClaims`, `AgentAssertionEnvelope`, `RegisterTaskRequest`, and `RegisterTaskResponse`.
+This file is the security toolkit for agent identity. Without it, the agent could not safely prove who it is, register a task with the backend, or attach trustworthy authorization to later task requests. The basic idea is like issuing an employee badge and then requiring signed slips for each job: the badge identifies the agent, and each signed slip proves the agent is allowed to act for a specific task.
 
-The signing path uses Ed25519 PKCS#8 private keys stored as base64. `authorization_header_for_agent_task` validates that the stored runtime id matches the target runtime id, timestamps the assertion with RFC3339 seconds precision, signs the `agent_runtime_id:task_id:timestamp` payload, serializes a deterministic JSON envelope via a `BTreeMap`, base64url-encodes it, and prefixes it with `AgentAssertion `. Task registration uses a similar timestamped signature over `agent_runtime_id:timestamp`, posts JSON to the registration endpoint, and accepts either plaintext task ids or encrypted task ids. Encrypted task ids are decrypted by deriving a Curve25519 secret key from the Ed25519 signing key using SHA-512 plus clamping, then calling `crypto_box` unseal.
+The file works with two main kinds of proof. First, it reads an Agent Identity JWT, which is a signed JSON token from the server containing facts such as the agent runtime id, account id, user email, plan type, and private key. If trusted public keys are available, it verifies the token signature and checks that the issuer and audience are the expected ones. Second, it uses the agent private key to sign short pieces of text, such as task registration requests and per-task authorization assertions.
 
-JWT handling has two modes: if no JWKS is supplied, `decode_agent_identity_jwt` decodes only the payload segment after validating the three-part JWT shape and base64url/JSON syntax; if JWKS is present, it extracts `kid`, finds the trusted JWK, builds an RS256 decoding key, and enforces issuer and audience constants. Utility functions derive verifying keys, SSH public keys, request ids, and endpoint URLs, including a special JWKS path when the base URL contains `/backend-api`.
-
-Tests cover signature correctness, runtime mismatch rejection, JWT claim decoding and verification, plan alias mapping, and URL construction. The file’s main invariants are stable payload formats, strict issuer/audience checks when trust material exists, and consistent derivation from the stored PKCS#8 private key.
+It also creates new Ed25519 key material, converts public keys into SSH public key format, derives a Curve25519 key for decrypting encrypted task ids, and builds the backend URLs used for registration and public key lookup. The tests at the bottom check the most sensitive behavior: signatures, JWT decoding and verification, rejected bad keys, and URL shape.
 
 #### Function details
 
@@ -619,11 +623,11 @@ fn authorization_header_for_agent_task(
 ) -> Result<String>
 ```
 
-**Purpose**: Builds the `Authorization` header value used to authenticate an agent for a specific task by embedding a signed assertion envelope.
+**Purpose**: Builds the HTTP authorization header used when an agent makes a request for a specific task. It proves both the agent runtime id and the task id by signing them with the stored private key.
 
-**Data flow**: Takes an `AgentIdentityKey` and `AgentTaskAuthorizationTarget`; first checks the runtime ids match with `ensure!`; generates an RFC3339 UTC timestamp; signs `agent_runtime_id:task_id:timestamp` via `sign_agent_assertion_payload`; constructs an `AgentAssertionEnvelope`; serializes it with `serialize_agent_assertion`; returns `Ok("AgentAssertion <base64url-payload>")` or an error.
+**Data flow**: It receives stored agent key information and a target task. It first checks that both refer to the same agent runtime id, adds the current time, signs the agent id, task id, and timestamp, serializes that bundle, and returns a string beginning with `AgentAssertion`. If the ids do not match or signing fails, it returns an error instead.
 
-**Call relations**: Used by callers preparing authenticated task-scoped requests, and exercised by tests for both success and mismatch failure. It delegates signature creation and deterministic envelope serialization to private helpers.
+**Call relations**: This is the public entry point for making a task-scoped proof. It calls `sign_agent_assertion_payload` to make the signature and `serialize_agent_assertion` to pack the proof into a header-safe token. The tests call it to confirm both the happy path and the mismatch rejection.
 
 *Call graph*: calls 2 internal fn (serialize_agent_assertion, sign_agent_assertion_payload); called by 2 (authorization_header_for_agent_task_rejects_mismatched_runtime, authorization_header_for_agent_task_serializes_signed_agent_assertion); 3 external calls (now, ensure!, format!).
 
@@ -637,11 +641,11 @@ async fn fetch_agent_identity_jwks(
 ) -> Result<JwkSet>
 ```
 
-**Purpose**: Downloads the trusted JWKS document used to verify agent identity JWTs from the backend.
+**Purpose**: Downloads the trusted public keys used to verify agent identity JWTs. JWKS means JSON Web Key Set, a standard JSON document that lists public signing keys.
 
-**Data flow**: Accepts a `reqwest::Client` and base URL, derives the JWKS endpoint with `agent_identity_jwks_url`, performs a GET with a 10-second timeout, converts transport and HTTP status failures into contextual `anyhow` errors, then deserializes the response body as `JwkSet`.
+**Data flow**: It receives an HTTP client and the ChatGPT base URL. It builds the correct JWKS URL, sends a GET request with a short timeout, checks that the server returned success, decodes the JSON body, and returns the key set.
 
-**Call relations**: This is the network-fetch companion to `decode_agent_identity_jwt`. Callers fetch JWKS first, then pass the resulting set into JWT verification.
+**Call relations**: This function gets the trusted keys that can later be passed to `decode_agent_identity_jwt`. It relies on `agent_identity_jwks_url` so callers do not have to know the exact backend path.
 
 *Call graph*: calls 1 internal fn (agent_identity_jwks_url); 1 external calls (get).
 
@@ -655,11 +659,11 @@ fn decode_agent_identity_jwt(
 ) -> Result<AgentIdentityJwtClaims>
 ```
 
-**Purpose**: Decodes agent identity JWT claims, optionally verifying the token signature and trusted issuer/audience when a JWKS is available.
+**Purpose**: Reads an agent identity JWT and returns its claims, meaning the facts carried inside the token. When trusted public keys are supplied, it also verifies that the token was signed by a trusted server and was meant for this app.
 
-**Data flow**: Takes a JWT string and optional `&JwkSet`. If `jwks` is `None`, it returns `decode_agent_identity_jwt_payload(jwt)`. Otherwise it decodes the header, extracts `kid`, finds the matching JWK, builds an RS256 `DecodingKey`, configures `Validation` with the fixed audience and issuer constants plus required `iss`/`aud` claims, verifies the token with `jsonwebtoken::decode`, and returns the decoded `AgentIdentityJwtClaims`.
+**Data flow**: It receives the JWT text and optionally a JWKS key set. Without keys, it only decodes the payload JSON. With keys, it reads the token header, finds the matching trusted key by key id, builds a verification key, checks the signature, issuer, and audience, and returns the decoded claims.
 
-**Call relations**: This is the main JWT entry point, used by tests for raw payload decoding and verified decoding. It branches between an unverified payload-only path and a fully verified JWKS-backed path.
+**Call relations**: This is the main JWT reader. It falls back to `decode_agent_identity_jwt_payload` when no JWKS is available, and otherwise uses the JWT library for full verification. Several tests call it to check plain decoding, plan mapping, trusted verification, untrusted key rejection, and required issuer/audience checks.
 
 *Call graph*: calls 1 internal fn (decode_agent_identity_jwt_payload); called by 4 (decode_agent_identity_jwt_maps_raw_plan_aliases, decode_agent_identity_jwt_reads_claims, decode_agent_identity_jwt_rejects_untrusted_kid, decode_agent_identity_jwt_requires_issuer_and_audience); 3 external calls (from_jwk, new, decode_header).
 
@@ -670,11 +674,11 @@ fn decode_agent_identity_jwt(
 fn decode_agent_identity_jwt_payload(jwt: &str) -> Result<T>
 ```
 
-**Purpose**: Parses the payload segment of a JWT without verifying its signature, for environments where no JWKS trust material is supplied.
+**Purpose**: Decodes only the middle payload section of a JWT, without checking its signature. This is useful when the caller only wants to inspect the token contents or when verification keys are not available.
 
-**Data flow**: Splits the JWT on `.` into exactly three non-empty parts, rejects malformed shapes with `bail!`/`ensure!`, base64url-decodes the payload segment with `URL_SAFE_NO_PAD`, then deserializes the bytes into generic `T: DeserializeOwned` using `serde_json::from_slice`.
+**Data flow**: It receives a JWT string, splits it into its three dot-separated parts, decodes the payload from base64url, parses the bytes as JSON, and returns the requested data type. Bad format, bad base64, or invalid JSON becomes an error.
 
-**Call relations**: Called only from `decode_agent_identity_jwt` when verification is intentionally skipped. It isolates the structural and decoding checks for the unverified path.
+**Call relations**: It is the lightweight helper used by `decode_agent_identity_jwt` when no JWKS is provided. It deliberately does not verify trust; it only extracts the payload.
 
 *Call graph*: called by 1 (decode_agent_identity_jwt); 3 external calls (bail!, ensure!, from_slice).
 
@@ -688,11 +692,11 @@ fn sign_task_registration_payload(
 ) -> Result<String>
 ```
 
-**Purpose**: Signs the backend task-registration payload for an agent using its stored Ed25519 private key.
+**Purpose**: Signs the message used to register a new task for an agent. The signature lets the backend confirm that the request came from someone who has the agent private key.
 
-**Data flow**: Receives `AgentIdentityKey` and a timestamp string, reconstructs the `SigningKey` from base64 PKCS#8 via `signing_key_from_private_key_pkcs8_base64`, formats the payload as `agent_runtime_id:timestamp`, signs the bytes, base64-encodes the signature, and returns it.
+**Data flow**: It receives the stored agent key and a timestamp. It decodes the private signing key, builds the text `agent_runtime_id:timestamp`, signs that text, base64-encodes the signature, and returns it.
 
-**Call relations**: Used by `register_agent_task` to populate `RegisterTaskRequest.signature`. It shares the same key-decoding helper used by other signing and derivation functions.
+**Call relations**: It is called by `register_agent_task` just before sending the task registration request. It depends on `signing_key_from_private_key_pkcs8_base64` to turn the stored key text back into a usable signing key.
 
 *Call graph*: calls 1 internal fn (signing_key_from_private_key_pkcs8_base64); called by 1 (register_agent_task); 1 external calls (format!).
 
@@ -707,11 +711,11 @@ async fn register_agent_task(
 ) -> Result<String>
 ```
 
-**Purpose**: Registers a new task for an agent with the backend and returns the resulting task id, whether plaintext or encrypted.
+**Purpose**: Asks the ChatGPT backend to create or register a task for this agent runtime. It sends a signed request so the server can trust that the agent is the one making the request.
 
-**Data flow**: Builds a current timestamp, signs it with `sign_task_registration_payload`, constructs `RegisterTaskRequest`, derives the endpoint with `agent_task_registration_url`, POSTs JSON with a 30-second timeout, and on non-success reads and truncates the response body to 512 characters before bailing. On success it deserializes `RegisterTaskResponse` and extracts/decrypts the task id via `task_id_from_register_task_response`.
+**Data flow**: It receives an HTTP client, a base URL, and the agent key. It creates a timestamp, signs the registration payload, builds the task registration URL, sends a JSON POST request, reports non-success responses with a trimmed response body, decodes the JSON response, and returns the task id.
 
-**Call relations**: This is the main registration workflow, delegating URL construction, signing, and response interpretation to helpers. It is the only function in the file that handles both HTTP transport and encrypted task-id fallback.
+**Call relations**: This is the network-facing task registration flow. It calls `sign_task_registration_payload` for proof, `agent_task_registration_url` for the endpoint, and `task_id_from_register_task_response` to extract or decrypt the returned task id.
 
 *Call graph*: calls 3 internal fn (agent_task_registration_url, sign_task_registration_payload, task_id_from_register_task_response); 4 external calls (now, bail!, post, format!).
 
@@ -725,11 +729,11 @@ fn task_id_from_register_task_response(
 ) -> Result<String>
 ```
 
-**Purpose**: Normalizes the backend registration response by accepting either snake_case/camelCase plaintext task ids or encrypted task ids.
+**Purpose**: Pulls the task id out of a registration response, including older or alternate field names. If the server encrypted the task id, it decrypts it before returning it.
 
-**Data flow**: Consumes an `AgentIdentityKey` and `RegisterTaskResponse`. It first checks `task_id` then `task_id_camel`; if either exists it returns that string. Otherwise it checks `encrypted_task_id` then `encrypted_task_id_camel`, errors if absent, and decrypts the chosen ciphertext with `decrypt_task_id_response`.
+**Data flow**: It receives the agent key and the parsed server response. It first looks for a plain `task_id` value, accepting both snake_case and camelCase names. If none is present, it looks for an encrypted task id and passes it through decryption. If no task id is present at all, it returns an error.
 
-**Call relations**: Called only by `register_agent_task` after JSON decoding. It encapsulates the response-shape compatibility logic so the registration flow does not care which field naming the server used.
+**Call relations**: It is called by `register_agent_task` after the HTTP response has been decoded. It hands encrypted ids to `decrypt_task_id_response` so the rest of the code receives a normal task id string.
 
 *Call graph*: calls 1 internal fn (decrypt_task_id_response); called by 1 (register_agent_task).
 
@@ -743,11 +747,11 @@ fn decrypt_task_id_response(
 ) -> Result<String>
 ```
 
-**Purpose**: Decrypts an encrypted task id returned by the backend using a Curve25519 key derived from the stored Ed25519 private key.
+**Purpose**: Decrypts an encrypted task id returned by the backend. This protects the task id in transit while still letting the intended agent read it.
 
-**Data flow**: Takes `AgentIdentityKey` and a base64 ciphertext string, reconstructs the Ed25519 `SigningKey`, base64-decodes the ciphertext, derives a `Curve25519SecretKey` with `curve25519_secret_key_from_signing_key`, calls `unseal` to decrypt, and converts the plaintext bytes into UTF-8 `String`.
+**Data flow**: It receives the stored agent key and a base64 encrypted task id. It decodes the private signing key, decodes the encrypted bytes, derives a Curve25519 decryption key from the signing key, opens the encrypted message, converts the decrypted bytes to UTF-8 text, and returns the task id.
 
-**Call relations**: Used by `task_id_from_register_task_response` when the backend omits plaintext ids. It depends on the shared key-decoding and Ed25519→Curve25519 derivation helpers.
+**Call relations**: It is used by `task_id_from_register_task_response` only when the server sends an encrypted task id. It shares key-decoding work with `signing_key_from_private_key_pkcs8_base64` and key-derivation work with `curve25519_secret_key_from_signing_key`.
 
 *Call graph*: calls 2 internal fn (curve25519_secret_key_from_signing_key, signing_key_from_private_key_pkcs8_base64); called by 1 (task_id_from_register_task_response); 1 external calls (from_utf8).
 
@@ -758,11 +762,11 @@ fn decrypt_task_id_response(
 fn generate_agent_key_material() -> Result<GeneratedAgentKeyMaterial>
 ```
 
-**Purpose**: Generates fresh Ed25519 agent key material and returns both the PKCS#8 private key and SSH-formatted public key.
+**Purpose**: Creates a fresh private/public key pair for an agent identity. The private key is stored for signing, and the public key can be shared with a service that needs to recognize the agent.
 
-**Data flow**: Fills a 32-byte array from `OsRng`, constructs a `SigningKey`, encodes it as PKCS#8 DER, base64-encodes the DER bytes, derives the verifying key, converts that to SSH public-key text with `encode_ssh_ed25519_public_key`, and returns `GeneratedAgentKeyMaterial`.
+**Data flow**: It fills 32 random bytes from the operating system’s secure random source, turns them into an Ed25519 signing key, encodes the private key as PKCS#8 DER and then base64, converts the public key into SSH public key text, and returns both values.
 
-**Call relations**: This is the key-generation entry point for provisioning new agent identities. It delegates only the SSH formatting step; all randomness and PKCS#8 encoding happen here.
+**Call relations**: This is used when new agent identity key material is needed. It calls `encode_ssh_ed25519_public_key` so the public half is in the standard SSH-style format expected by other systems.
 
 *Call graph*: calls 1 internal fn (encode_ssh_ed25519_public_key); 1 external calls (from_bytes).
 
@@ -775,11 +779,11 @@ fn public_key_ssh_from_private_key_pkcs8_base64(
 ) -> Result<String>
 ```
 
-**Purpose**: Reconstructs the SSH public key string corresponding to a stored base64 PKCS#8 private key.
+**Purpose**: Recreates the SSH-formatted public key from a stored private key. This is useful when only the private key was saved but the public key needs to be shown or registered again.
 
-**Data flow**: Accepts the base64 PKCS#8 private key string, decodes it into a `SigningKey` with `signing_key_from_private_key_pkcs8_base64`, obtains the verifying key, formats it with `encode_ssh_ed25519_public_key`, and returns the SSH string.
+**Data flow**: It receives a base64 PKCS#8 private key, decodes it into a signing key, extracts the verifying public key, encodes that public key as SSH text, and returns it.
 
-**Call relations**: Used when callers already have persisted private key material and need the matching public key without generating a new pair.
+**Call relations**: It combines `signing_key_from_private_key_pkcs8_base64` and `encode_ssh_ed25519_public_key`. It is a convenience path for callers that need public key text from stored private key material.
 
 *Call graph*: calls 2 internal fn (encode_ssh_ed25519_public_key, signing_key_from_private_key_pkcs8_base64).
 
@@ -792,11 +796,11 @@ fn verifying_key_from_private_key_pkcs8_base64(
 ) -> Result<VerifyingKey>
 ```
 
-**Purpose**: Extracts the Ed25519 verifying key from stored base64 PKCS#8 private key material.
+**Purpose**: Extracts the public verifying key from a stored private signing key. A verifying key is the public half used to check signatures.
 
-**Data flow**: Decodes the PKCS#8 base64 string into a `SigningKey` via `signing_key_from_private_key_pkcs8_base64` and returns `signing_key.verifying_key()`.
+**Data flow**: It receives the base64 PKCS#8 private key, decodes it into a signing key, takes the public verifying key from it, and returns that key object.
 
-**Call relations**: This is a small derivation helper for callers that need the typed `VerifyingKey` rather than an SSH string.
+**Call relations**: It relies on `signing_key_from_private_key_pkcs8_base64` for parsing. Other code can use the returned verifying key to validate signatures made by the matching private key.
 
 *Call graph*: calls 1 internal fn (signing_key_from_private_key_pkcs8_base64).
 
@@ -809,11 +813,11 @@ fn curve25519_secret_key_from_private_key_pkcs8_base64(
 ) -> Result<Curve25519SecretKey>
 ```
 
-**Purpose**: Derives the Curve25519 secret key used for sealed-box decryption from stored Ed25519 PKCS#8 private key material.
+**Purpose**: Derives a Curve25519 secret key from the stored Ed25519 private key. Curve25519 is the key type used here for decrypting sealed messages, while Ed25519 is used for signatures.
 
-**Data flow**: Decodes the base64 PKCS#8 private key into a `SigningKey`, passes it to `curve25519_secret_key_from_signing_key`, and returns the resulting `Curve25519SecretKey`.
+**Data flow**: It receives the stored base64 PKCS#8 private key, decodes it into a signing key, transforms that signing key into a Curve25519 secret key, and returns it.
 
-**Call relations**: This is the public wrapper around the private Ed25519→Curve25519 derivation logic, mirroring the decryption path used internally by `decrypt_task_id_response`.
+**Call relations**: It is the public wrapper around `curve25519_secret_key_from_signing_key`. It shares the same private-key parser used by the signing functions.
 
 *Call graph*: calls 2 internal fn (curve25519_secret_key_from_signing_key, signing_key_from_private_key_pkcs8_base64).
 
@@ -824,11 +828,11 @@ fn curve25519_secret_key_from_private_key_pkcs8_base64(
 fn agent_registration_url(chatgpt_base_url: &str) -> String
 ```
 
-**Purpose**: Builds the backend URL for agent registration from a configurable base URL.
+**Purpose**: Builds the backend URL for registering an agent. It hides the exact path so callers only need to provide the base URL.
 
-**Data flow**: Trims any trailing slash from `chatgpt_base_url` and formats `<trimmed>/v1/agent/register`.
+**Data flow**: It receives a ChatGPT base URL, removes any trailing slash, appends `/v1/agent/register`, and returns the full URL string.
 
-**Call relations**: A pure URL helper for callers constructing registration requests. It keeps path concatenation consistent with the other endpoint builders in this file.
+**Call relations**: This is a small URL helper used by code that needs the agent registration endpoint. It follows the same trimming pattern as the other URL builders in this file.
 
 *Call graph*: 1 external calls (format!).
 
@@ -841,9 +845,9 @@ fn agent_task_registration_url(chatgpt_base_url: &str, agent_runtime_id: &str) -
 
 **Purpose**: Builds the backend URL for registering a task under a specific agent runtime id.
 
-**Data flow**: Trims trailing slashes from the base URL and formats `<trimmed>/v1/agent/{agent_runtime_id}/task/register`.
+**Data flow**: It receives a base URL and an agent runtime id. It trims a trailing slash from the base URL, inserts the runtime id into the task registration path, and returns the full URL.
 
-**Call relations**: Called by `register_agent_task` to target the correct per-agent registration endpoint.
+**Call relations**: It is called by `register_agent_task` before sending the POST request. This keeps URL construction in one place instead of scattering path strings through the code.
 
 *Call graph*: called by 1 (register_agent_task); 1 external calls (format!).
 
@@ -854,11 +858,11 @@ fn agent_task_registration_url(chatgpt_base_url: &str, agent_runtime_id: &str) -
 fn agent_identity_biscuit_url(chatgpt_base_url: &str) -> String
 ```
 
-**Purpose**: Builds the endpoint URL used for the agent identity biscuit/authentication flow.
+**Purpose**: Builds the URL used for the agent identity authentication flow named `authenticate_app_v2`. The name “biscuit” here refers to a backend authentication step, not a browser cookie.
 
-**Data flow**: Trims trailing slashes from the base URL and formats `<trimmed>/authenticate_app_v2`.
+**Data flow**: It receives a base URL, removes any trailing slash, appends `/authenticate_app_v2`, and returns the result.
 
-**Call relations**: This is another pure endpoint helper, grouped with the registration and JWKS URL builders.
+**Call relations**: This helper gives other parts of the system a single reliable way to reach the identity authentication endpoint.
 
 *Call graph*: 1 external calls (format!).
 
@@ -869,11 +873,11 @@ fn agent_identity_biscuit_url(chatgpt_base_url: &str) -> String
 fn agent_identity_jwks_url(chatgpt_base_url: &str) -> String
 ```
 
-**Purpose**: Builds the JWKS endpoint URL, with special handling for ChatGPT `/backend-api` base URLs.
+**Purpose**: Builds the URL where trusted JWT public keys can be fetched. It accounts for two different backend URL layouts.
 
-**Data flow**: Trims trailing slashes from the base URL, checks whether the trimmed string contains `/backend-api`, and returns either `<trimmed>/wham/agent-identities/jwks` or `<trimmed>/agent-identities/jwks`.
+**Data flow**: It receives a base URL and trims a trailing slash. If the URL already points at `/backend-api`, it appends `/wham/agent-identities/jwks`; otherwise it appends `/agent-identities/jwks`.
 
-**Call relations**: Used by `fetch_agent_identity_jwks` and covered by tests for both backend-api and codex-api style base URLs. The conditional path logic is the notable compatibility behavior here.
+**Call relations**: It is called by `fetch_agent_identity_jwks`, and tests check both URL layouts. This prevents callers from having to know which backend shape they are using.
 
 *Call graph*: called by 1 (fetch_agent_identity_jwks); 1 external calls (format!).
 
@@ -884,11 +888,11 @@ fn agent_identity_jwks_url(chatgpt_base_url: &str) -> String
 fn agent_identity_request_id() -> Result<String>
 ```
 
-**Purpose**: Generates a unique request id string for agent identity operations.
+**Purpose**: Creates a unique request id for an agent identity request. This helps trace or match requests without exposing meaningful user data.
 
-**Data flow**: Fills 16 random bytes from `OsRng`, base64url-encodes them without padding, prefixes them with `codex-agent-identity-`, and returns the resulting string.
+**Data flow**: It generates 16 secure random bytes, encodes them in URL-safe base64 without padding, prefixes them with `codex-agent-identity-`, and returns the string.
 
-**Call relations**: A standalone utility for callers that need a request correlation id in this subsystem.
+**Call relations**: This is a standalone helper for identity request setup. It uses the operating system random source in the same spirit as key generation.
 
 *Call graph*: 1 external calls (format!).
 
@@ -899,11 +903,11 @@ fn agent_identity_request_id() -> Result<String>
 fn build_abom(session_source: SessionSource) -> AgentBillOfMaterials
 ```
 
-**Purpose**: Constructs an `AgentBillOfMaterials` describing the running agent version, harness identity, and runtime location.
+**Purpose**: Builds an agent bill of materials, a short description of what agent build is running and where it is running. This helps the backend understand the client environment.
 
-**Data flow**: Takes a `SessionSource`, reads the crate version from `env!("CARGO_PKG_VERSION")`, maps `SessionSource::VSCode` to harness id `codex-app` and all other listed sources to `codex-cli`, formats `running_location` as `<session_source>-<os>`, and returns `AgentBillOfMaterials`.
+**Data flow**: It receives the session source, reads the crate version compiled into the program, chooses a harness id such as `codex-app` or `codex-cli`, combines the session source with the operating system name, and returns an `AgentBillOfMaterials` value.
 
-**Call relations**: This is metadata assembly rather than crypto. It is used when callers need a concise description of the running agent environment.
+**Call relations**: This is used when identity or registration flows need to describe the running agent. It translates internal session source values into the simpler labels expected by the backend.
 
 *Call graph*: 2 external calls (env!, format!).
 
@@ -914,11 +918,11 @@ fn build_abom(session_source: SessionSource) -> AgentBillOfMaterials
 fn encode_ssh_ed25519_public_key(verifying_key: &VerifyingKey) -> String
 ```
 
-**Purpose**: Formats an Ed25519 verifying key into standard OpenSSH `ssh-ed25519 <base64>` text.
+**Purpose**: Formats an Ed25519 public key as an SSH public key string. This is the familiar `ssh-ed25519 ...` form used by many systems.
 
-**Data flow**: Allocates a blob buffer with capacity for two SSH strings, appends the algorithm name `ssh-ed25519` and the 32-byte public key using `append_ssh_string`, base64-encodes the blob, and prefixes it with `ssh-ed25519 `.
+**Data flow**: It receives a verifying public key, builds the SSH binary blob by writing the key type and key bytes with length prefixes, base64-encodes that blob, prefixes it with `ssh-ed25519`, and returns the text.
 
-**Call relations**: Called by both key-generation and public-key-derivation helpers. It centralizes the SSH wire-format encoding details.
+**Call relations**: It is called when generating new key material and when reconstructing a public key from a stored private key. It uses `append_ssh_string` to write the SSH length-prefixed pieces correctly.
 
 *Call graph*: calls 1 internal fn (append_ssh_string); called by 2 (generate_agent_key_material, public_key_ssh_from_private_key_pkcs8_base64); 3 external calls (with_capacity, as_bytes, format!).
 
@@ -933,11 +937,11 @@ fn sign_agent_assertion_payload(
 ) -> Result<String>
 ```
 
-**Purpose**: Signs the payload used inside task authorization assertions.
+**Purpose**: Creates the cryptographic signature inside an agent task authorization assertion. The signature ties together the agent runtime id, task id, and timestamp.
 
-**Data flow**: Decodes the stored PKCS#8 private key into a `SigningKey`, formats `agent_runtime_id:task_id:timestamp`, signs the bytes, base64-encodes the signature, and returns it.
+**Data flow**: It receives the stored key, task id, and timestamp. It decodes the private signing key, builds the text `agent_runtime_id:task_id:timestamp`, signs those bytes, base64-encodes the signature, and returns it.
 
-**Call relations**: Used only by `authorization_header_for_agent_task` as the cryptographic core of the assertion header.
+**Call relations**: It is called by `authorization_header_for_agent_task` when building the final header. It uses `signing_key_from_private_key_pkcs8_base64` so all private-key parsing follows one path.
 
 *Call graph*: calls 1 internal fn (signing_key_from_private_key_pkcs8_base64); called by 1 (authorization_header_for_agent_task); 1 external calls (format!).
 
@@ -948,11 +952,11 @@ fn sign_agent_assertion_payload(
 fn serialize_agent_assertion(envelope: &AgentAssertionEnvelope) -> Result<String>
 ```
 
-**Purpose**: Serializes an assertion envelope into a deterministic base64url payload suitable for the `AgentAssertion` authorization scheme.
+**Purpose**: Packs an agent assertion into a compact token safe to put in an HTTP header. It uses a predictable field order so the serialized form is stable.
 
-**Data flow**: Takes an `AgentAssertionEnvelope`, constructs a `BTreeMap` with keys `agent_runtime_id`, `signature`, `task_id`, and `timestamp`, serializes that map to JSON bytes with `serde_json::to_vec`, base64url-encodes the bytes without padding, and returns the encoded string.
+**Data flow**: It receives an assertion envelope containing agent id, task id, timestamp, and signature. It places those values into an ordered map, serializes the map as JSON bytes, base64url-encodes the bytes without padding, and returns the token string.
 
-**Call relations**: Called only by `authorization_header_for_agent_task`. The use of `BTreeMap` ensures stable key ordering in the serialized JSON payload.
+**Call relations**: It is called by `authorization_header_for_agent_task` after the signature has been made. Its output becomes the part after `AgentAssertion ` in the final header.
 
 *Call graph*: called by 1 (authorization_header_for_agent_task); 2 external calls (from, to_vec).
 
@@ -963,11 +967,11 @@ fn serialize_agent_assertion(envelope: &AgentAssertionEnvelope) -> Result<String
 fn curve25519_secret_key_from_signing_key(signing_key: &SigningKey) -> Curve25519SecretKey
 ```
 
-**Purpose**: Derives a Curve25519 secret key from an Ed25519 signing key using the standard SHA-512-and-clamp transformation.
+**Purpose**: Converts an Ed25519 signing key into a Curve25519 secret key for decryption. This lets one stored private key support both signing and encrypted task-id delivery.
 
-**Data flow**: Hashes `signing_key.to_bytes()` with SHA-512, copies the first 32 digest bytes into a mutable array, applies Curve25519 clamping to bytes 0 and 31, and returns `Curve25519SecretKey::from(secret_key)`.
+**Data flow**: It receives an Ed25519 signing key, hashes its private bytes with SHA-512, takes and clamps the first 32 bytes in the way Curve25519 expects, and returns a Curve25519 secret key.
 
-**Call relations**: This private helper underpins both public Curve25519 derivation and encrypted task-id decryption. It isolates the exact derivation algorithm from the higher-level workflows.
+**Call relations**: It is used by `decrypt_task_id_response` and by the public wrapper `curve25519_secret_key_from_private_key_pkcs8_base64`. It is the low-level bridge between the signing-key world and the encryption-key world.
 
 *Call graph*: called by 2 (curve25519_secret_key_from_private_key_pkcs8_base64, decrypt_task_id_response); 3 external calls (from, digest, to_bytes).
 
@@ -978,11 +982,11 @@ fn curve25519_secret_key_from_signing_key(signing_key: &SigningKey) -> Curve2551
 fn append_ssh_string(buf: &mut Vec<u8>, value: &[u8])
 ```
 
-**Purpose**: Appends one SSH binary string field to a buffer using a 4-byte big-endian length prefix followed by raw bytes.
+**Purpose**: Writes one length-prefixed byte string in the format SSH public keys expect. A length prefix tells the reader exactly how many bytes belong to the next value.
 
-**Data flow**: Mutably borrows a `Vec<u8>` buffer and a byte slice, extends the buffer with the slice length as `u32` big-endian bytes, then extends it with the slice contents.
+**Data flow**: It receives a mutable byte buffer and a byte slice. It appends the value length as four big-endian bytes, then appends the value bytes themselves, changing the buffer in place.
 
-**Call relations**: Used twice by `encode_ssh_ed25519_public_key` to build the SSH public-key blob.
+**Call relations**: It is a small helper used by `encode_ssh_ed25519_public_key` to build the SSH public key blob correctly.
 
 *Call graph*: called by 1 (encode_ssh_ed25519_public_key).
 
@@ -993,11 +997,11 @@ fn append_ssh_string(buf: &mut Vec<u8>, value: &[u8])
 fn signing_key_from_private_key_pkcs8_base64(private_key_pkcs8_base64: &str) -> Result<SigningKey>
 ```
 
-**Purpose**: Decodes stored base64 PKCS#8 private key material into an Ed25519 `SigningKey` with contextual error messages.
+**Purpose**: Turns the stored private key text back into an Ed25519 signing key object. PKCS#8 is a standard wrapper format for private keys.
 
-**Data flow**: Base64-decodes the input string with `BASE64_STANDARD`, then parses the resulting DER bytes with `SigningKey::from_pkcs8_der`, returning the `SigningKey` or an `anyhow` error describing invalid base64 or invalid PKCS#8.
+**Data flow**: It receives base64 text, decodes it into bytes, parses those bytes as a PKCS#8 private key, and returns a signing key. Invalid base64 or invalid key format becomes an error with context.
 
-**Call relations**: This is the shared key-loading primitive used by all signing, verifying-key derivation, SSH encoding, Curve25519 derivation, and decryption helpers.
+**Call relations**: This is the shared private-key parser for signing, public-key extraction, decryption setup, and verifying-key extraction. Many higher-level functions call it so key parsing behavior stays consistent.
 
 *Call graph*: called by 6 (curve25519_secret_key_from_private_key_pkcs8_base64, decrypt_task_id_response, public_key_ssh_from_private_key_pkcs8_base64, sign_agent_assertion_payload, sign_task_registration_payload, verifying_key_from_private_key_pkcs8_base64); 1 external calls (from_pkcs8_der).
 
@@ -1008,11 +1012,11 @@ fn signing_key_from_private_key_pkcs8_base64(private_key_pkcs8_base64: &str) -> 
 fn authorization_header_for_agent_task_serializes_signed_agent_assertion()
 ```
 
-**Purpose**: Verifies that task authorization headers contain a decodable assertion envelope whose signature validates against the expected payload.
+**Purpose**: Checks that a task authorization header contains the expected agent id and task id and that its signature is real.
 
-**Data flow**: Creates a deterministic signing key, encodes it as PKCS#8 base64, builds matching key/target inputs, calls `authorization_header_for_agent_task`, strips the scheme prefix, base64url-decodes and deserializes the envelope, asserts its fields, decodes the signature bytes, and verifies the signature over `agent_runtime_id:task_id:timestamp`.
+**Data flow**: The test creates a fixed signing key, builds an authorization header, decodes the header payload, compares the visible fields, decodes the signature, and verifies the signature against the original message.
 
-**Call relations**: This test exercises the happy path through header construction, envelope serialization, and signature generation.
+**Call relations**: It exercises `authorization_header_for_agent_task` as a caller would use it, then independently checks the cryptographic result with the verifying key.
 
 *Call graph*: calls 1 internal fn (authorization_header_for_agent_task); 5 external calls (from_slice, from_bytes, assert_eq!, format!, from_slice).
 
@@ -1023,11 +1027,11 @@ fn authorization_header_for_agent_task_serializes_signed_agent_assertion()
 fn authorization_header_for_agent_task_rejects_mismatched_runtime()
 ```
 
-**Purpose**: Checks that authorization header creation fails when the target runtime id does not match the stored key’s runtime id.
+**Purpose**: Checks that the code refuses to create a task assertion when the stored agent id and requested task agent id are different.
 
-**Data flow**: Builds a deterministic key, constructs a mismatched target, calls `authorization_header_for_agent_task`, captures the error, and asserts the exact error string.
+**Data flow**: The test creates key material for `agent-123` but asks for a header targeting `agent-456`. It expects an error and compares the error message to the intended explanation.
 
-**Call relations**: This test covers the early `ensure!` guard in `authorization_header_for_agent_task` before any signing or serialization occurs.
+**Call relations**: It calls `authorization_header_for_agent_task` on the failure path. This protects against accidentally signing authorization for the wrong agent runtime.
 
 *Call graph*: calls 1 internal fn (authorization_header_for_agent_task); 2 external calls (from_bytes, assert_eq!).
 
@@ -1038,11 +1042,11 @@ fn authorization_header_for_agent_task_rejects_mismatched_runtime()
 fn decode_agent_identity_jwt_reads_claims()
 ```
 
-**Purpose**: Confirms that the payload-only JWT decoding path reads all expected claims into `AgentIdentityJwtClaims`.
+**Purpose**: Checks that an unsigned test JWT payload can be decoded into the expected agent identity claims when verification keys are not supplied.
 
-**Data flow**: Constructs an unsigned-style JWT string with `jwt_with_payload`, calls `decode_agent_identity_jwt` with `jwks` set to `None`, and asserts the returned claims struct matches the expected values including plan type.
+**Data flow**: The test builds a JWT-like string with known JSON fields, decodes it with `decode_agent_identity_jwt`, and compares the returned claims to the expected struct.
 
-**Call relations**: This test drives the unverified branch of `decode_agent_identity_jwt`, which delegates to `decode_agent_identity_jwt_payload`.
+**Call relations**: It covers the no-JWKS branch of `decode_agent_identity_jwt`, which internally uses the payload-only decoder.
 
 *Call graph*: calls 1 internal fn (decode_agent_identity_jwt); 3 external calls (jwt_with_payload, assert_eq!, json!).
 
@@ -1053,11 +1057,11 @@ fn decode_agent_identity_jwt_reads_claims()
 fn decode_agent_identity_jwt_maps_raw_plan_aliases()
 ```
 
-**Purpose**: Verifies that raw plan aliases in JWT payloads deserialize into the normalized `AuthPlanType` representation.
+**Purpose**: Checks that a raw plan value from the token can be mapped to the project’s known plan type. In this case, `hc` becomes the enterprise plan.
 
-**Data flow**: Builds a JWT payload containing `plan_type: "hc"`, decodes it without JWKS verification, and asserts the resulting `plan_type` is `Known(Enterprise)`.
+**Data flow**: The test creates a JWT payload with `plan_type` set to `hc`, decodes it, and verifies that the resulting plan type is enterprise.
 
-**Call relations**: This test focuses on serde-level claim decoding behavior inside `AgentIdentityJwtClaims`, reached through `decode_agent_identity_jwt`.
+**Call relations**: It calls `decode_agent_identity_jwt` and confirms that deserialization of the claims matches the plan naming rules from the protocol crate.
 
 *Call graph*: calls 1 internal fn (decode_agent_identity_jwt); 3 external calls (jwt_with_payload, assert_eq!, json!).
 
@@ -1068,11 +1072,11 @@ fn decode_agent_identity_jwt_maps_raw_plan_aliases()
 fn decode_agent_identity_jwt_verifies_when_jwks_is_present()
 ```
 
-**Purpose**: Checks that a JWT signed with the matching RSA key verifies successfully against a trusted JWKS and yields the expected claims.
+**Purpose**: Checks the full trusted JWT path: the token is signed, the matching public key is present, and the claims are accepted.
 
-**Data flow**: Builds a test JWKS and claims, encodes a JWT with a matching `kid` and RSA private key, calls `decode_agent_identity_jwt` with `Some(&jwks)`, and asserts the verified claims equal the expected struct.
+**Data flow**: The test builds a JWKS containing a test key id, creates claims, signs a JWT with the matching RSA private key, decodes it with the JWKS, and compares the verified claims to the expected values.
 
-**Call relations**: This test exercises the verified branch of `decode_agent_identity_jwt`, including header decoding, `kid` lookup, JWK conversion, and issuer/audience validation.
+**Call relations**: It exercises `decode_agent_identity_jwt` with real signature verification. It uses the test helpers `test_jwks`, `test_jwt_header`, and `test_rsa_encoding_key` to assemble the trusted token setup.
 
 *Call graph*: 7 external calls (Known, test_jwks, test_jwt_header, test_rsa_encoding_key, assert_eq!, encode, json!).
 
@@ -1083,11 +1087,11 @@ fn decode_agent_identity_jwt_verifies_when_jwks_is_present()
 fn decode_agent_identity_jwt_rejects_untrusted_kid()
 ```
 
-**Purpose**: Ensures JWT verification fails when the token header references a `kid` not present in the trusted JWKS.
+**Purpose**: Checks that a signed JWT is rejected when its key id is not found in the trusted key set.
 
-**Data flow**: Creates a JWKS with a different key id, encodes a JWT with `kid = test-key`, and asserts that `decode_agent_identity_jwt(..., Some(&jwks))` returns an error.
+**Data flow**: The test creates a JWKS with one key id, signs a JWT whose header names a different key id, and expects decoding to fail.
 
-**Call relations**: This test covers the trust-selection failure path in `decode_agent_identity_jwt` before signature verification can proceed.
+**Call relations**: It calls `decode_agent_identity_jwt` on the untrusted-key path. This confirms that the code does not accept any valid signature unless the signing key is explicitly trusted.
 
 *Call graph*: calls 1 internal fn (decode_agent_identity_jwt); 5 external calls (test_jwks, test_jwt_header, test_rsa_encoding_key, encode, json!).
 
@@ -1098,11 +1102,11 @@ fn decode_agent_identity_jwt_rejects_untrusted_kid()
 fn decode_agent_identity_jwt_requires_issuer_and_audience()
 ```
 
-**Purpose**: Verifies that the verified JWT path rejects tokens missing required `iss` and `aud` claims.
+**Purpose**: Checks that verified JWTs must include the expected issuer and audience fields. These fields say who issued the token and who it is meant for.
 
-**Data flow**: Builds a JWKS and encodes a JWT payload without issuer or audience, then asserts that verified decoding returns an error.
+**Data flow**: The test creates a signed JWT that omits issuer and audience, then tries to decode it with trusted keys and expects an error.
 
-**Call relations**: This test targets the explicit `Validation` configuration in `decode_agent_identity_jwt`, especially the required spec claims set.
+**Call relations**: It calls `decode_agent_identity_jwt` to confirm the validation settings are strict enough, not just signature-based.
 
 *Call graph*: calls 1 internal fn (decode_agent_identity_jwt); 5 external calls (test_jwks, test_jwt_header, test_rsa_encoding_key, encode, json!).
 
@@ -1113,11 +1117,11 @@ fn decode_agent_identity_jwt_requires_issuer_and_audience()
 fn test_jwt_header(kid: &str) -> Header
 ```
 
-**Purpose**: Creates a JWT header configured for RS256 with a caller-specified key id for verification tests.
+**Purpose**: Creates a JWT header for tests using RSA SHA-256 signing and a chosen key id.
 
-**Data flow**: Constructs `Header::new(Algorithm::RS256)`, sets `header.kid` to the provided string, and returns the header.
+**Data flow**: It receives a key id string, creates a JWT header with the RS256 algorithm, stores the key id in the header, and returns it.
 
-**Call relations**: Used by the JWT verification tests to produce tokens whose `kid` can be matched or intentionally mismatched against test JWKS data.
+**Call relations**: It is a test helper used by the JWT verification tests to make signed tokens that point at a specific JWKS key.
 
 *Call graph*: 1 external calls (new).
 
@@ -1128,11 +1132,11 @@ fn test_jwt_header(kid: &str) -> Header
 fn test_rsa_encoding_key() -> EncodingKey
 ```
 
-**Purpose**: Parses the embedded PEM RSA private key used to sign JWTs in verification tests.
+**Purpose**: Loads a fixed RSA private key for signing test JWTs. The key is hard-coded because it is only used inside tests.
 
-**Data flow**: Feeds a hardcoded PEM byte string into `EncodingKey::from_rsa_pem` and returns the resulting encoding key.
+**Data flow**: It parses the embedded PEM-formatted private key text and returns a JWT encoding key. If the test key cannot be parsed, the test fails immediately.
 
-**Call relations**: Shared by the JWT verification tests that need to produce RS256-signed tokens.
+**Call relations**: It is used by the signed-JWT tests together with `test_jwt_header` and `test_jwks` to create tokens that can be verified.
 
 *Call graph*: 1 external calls (from_rsa_pem).
 
@@ -1143,11 +1147,11 @@ fn test_rsa_encoding_key() -> EncodingKey
 fn test_jwks(kid: &str) -> jsonwebtoken::jwk::JwkSet
 ```
 
-**Purpose**: Builds a minimal RSA JWKS document with a caller-selected `kid` for verification tests.
+**Purpose**: Builds a test JWKS containing the public half of the fixed RSA key under a chosen key id.
 
-**Data flow**: Constructs a JSON value containing one RSA key with the supplied `kid`, modulus `n`, and exponent `e`, deserializes it into `jsonwebtoken::jwk::JwkSet`, and returns it.
+**Data flow**: It receives a key id, constructs a JSON Web Key Set as JSON, parses it into the JWT library’s JWKS type, and returns it.
 
-**Call relations**: Used by the JWT verification tests to control whether a token’s `kid` is trusted.
+**Call relations**: It supports the JWT verification tests by providing either a matching trusted key id or a deliberately mismatched one.
 
 *Call graph*: 2 external calls (from_value, json!).
 
@@ -1158,11 +1162,11 @@ fn test_jwks(kid: &str) -> jsonwebtoken::jwk::JwkSet
 fn agent_identity_jwks_url_uses_backend_api_base_url()
 ```
 
-**Purpose**: Checks that JWKS URLs under `/backend-api` use the special `/wham/agent-identities/jwks` suffix.
+**Purpose**: Checks that JWKS URLs are built correctly when the base URL points at the ChatGPT backend API path.
 
-**Data flow**: Calls `agent_identity_jwks_url` with backend-api base URLs with and without trailing slash and asserts the exact resulting strings.
+**Data flow**: The test calls the URL builder with backend-api URLs with and without a trailing slash, then compares both results to the expected `/wham/agent-identities/jwks` path.
 
-**Call relations**: This test locks down the conditional path branch inside `agent_identity_jwks_url`.
+**Call relations**: It protects the special branch inside `agent_identity_jwks_url` for backend-api-style base URLs.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1173,11 +1177,11 @@ fn agent_identity_jwks_url_uses_backend_api_base_url()
 fn agent_identity_jwks_url_uses_codex_api_base_url()
 ```
 
-**Purpose**: Checks that non-backend-api base URLs use the plain `/agent-identities/jwks` suffix.
+**Purpose**: Checks that JWKS URLs are built correctly for the Codex API base URL shape.
 
-**Data flow**: Calls `agent_identity_jwks_url` with codex-api style base URLs with and without trailing slash and asserts the exact resulting strings.
+**Data flow**: The test calls the URL builder with Codex API URLs with and without a trailing slash, then compares both results to the expected `/agent-identities/jwks` path.
 
-**Call relations**: This complements the backend-api URL test by covering the default branch of `agent_identity_jwks_url`.
+**Call relations**: It protects the non-backend-api branch inside `agent_identity_jwks_url`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1188,22 +1192,26 @@ fn agent_identity_jwks_url_uses_codex_api_base_url()
 fn jwt_with_payload(payload: serde_json::Value) -> String
 ```
 
-**Purpose**: Constructs a syntactically valid JWT string with a caller-provided JSON payload and dummy signature for payload-decoding tests.
+**Purpose**: Creates a simple JWT-like string for tests that only need payload decoding. It is not meant to represent a trusted signed token.
 
-**Data flow**: Base64url-encodes a fixed `{"alg":"none","typ":"JWT"}` header, serializes and base64url-encodes the provided payload JSON, base64url-encodes the bytes `sig`, and joins the three segments with periods into a JWT string.
+**Data flow**: It receives a JSON payload, base64url-encodes a fixed `alg: none` header, the payload bytes, and a dummy signature, joins the three parts with dots, and returns the string.
 
-**Call relations**: Used by the payload-only JWT tests so they can exercise decoding logic without needing real signature verification.
+**Call relations**: It is used by payload-decoding tests for `decode_agent_identity_jwt`, letting those tests focus on claim parsing without setting up real cryptographic signing.
 
 *Call graph*: 2 external calls (format!, to_vec).
 
 
 ### `login/src/auth/agent_identity.rs`
 
-`domain_logic` · `auth initialization and request header preparation`
+`domain_logic` · `authentication startup and later request authentication`
 
-This module defines `AgentIdentityAuth`, the runtime representation of agent-identity authentication after the process has registered itself with the auth API. The struct stores the original `AgentIdentityAuthRecord` plus a `process_task_id` returned by `codex_agent_identity::register_agent_task`. The async constructor `load` is the key behavior: it computes the auth API base URL from `CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL` or the production constant, builds a reqwest client via `build_reqwest_client`, derives an `AgentIdentityKey` borrowing the runtime ID and private key from the record, and registers the current process task. Registration failures are converted into `std::io::Error::other`.
+This file is part of the login system for “agent identity” authentication. A stored record already contains account details and private key material. This file wraps that record in an `AgentIdentityAuth` object and, during loading, contacts the auth API to register the current agent task. Think of it like checking in at a front desk: the stored credential proves who you are, and the returned process task ID is the badge for this running session.
 
-The rest of the impl is intentionally accessor-heavy and side-effect free. Methods expose the underlying record, task ID, account ID, ChatGPT user ID, email, plan type, and FedRAMP flag so other auth code can attach headers or inspect account metadata without reaching into storage types directly. The helper `agent_identity_authapi_base_url` trims whitespace and trailing slashes from the environment override and falls back to the production URL when the variable is unset or empty. Tests use a small `EnvVarGuard` RAII helper plus `serial_test` to safely mutate process environment and verify both override and default URL behavior.
+The main work happens in `AgentIdentityAuth::load`. It chooses the auth API address, builds an HTTP client, turns the stored record into the key format expected by the agent identity library, and asks that library to register the task. If registration succeeds, the file keeps both the original record and the new task ID together.
+
+Most other methods are simple read-only accessors. They expose account ID, user ID, email, plan type, FedRAMP status, and the registered process task ID to code that later adds authentication headers to network requests.
+
+A small helper chooses the auth API base URL. It normally uses the production OpenAI URL, but tests or special deployments can override it with an environment variable. The test helper `EnvVarGuard` safely restores environment variables after tests, so one test does not accidentally affect another.
 
 #### Function details
 
@@ -1213,11 +1221,11 @@ The rest of the impl is intentionally accessor-heavy and side-effect free. Metho
 async fn load(record: AgentIdentityAuthRecord) -> std::io::Result<Self>
 ```
 
-**Purpose**: Creates a runtime `AgentIdentityAuth` by registering the agent task with the auth API using the persisted record's key material.
+**Purpose**: Creates a usable `AgentIdentityAuth` from a stored agent identity record. It also registers this running process as an agent task with the auth service, which produces the process task ID needed for later authenticated requests.
 
-**Data flow**: Consumes an `AgentIdentityAuthRecord`, computes the auth API base URL, builds a reqwest client, derives an `AgentIdentityKey` borrowing fields from the record, awaits `register_agent_task`, maps any registration error into `std::io::Error::other`, and returns `AgentIdentityAuth { record, process_task_id }`.
+**Data flow**: It receives an `AgentIdentityAuthRecord` containing account details and private key data. It chooses the auth API URL, builds an HTTP client, extracts the key fields from the record, and sends them to the agent identity registration service. If that succeeds, it returns a new `AgentIdentityAuth` containing the original record plus the returned process task ID; if it fails, it returns an I/O-style error.
 
-**Call relations**: Called when an agent-identity JWT has already been validated and converted into a record; it performs the extra runtime registration step needed before authenticated requests can be made.
+**Call relations**: `from_agent_identity_jwt` calls this when a stored agent identity login needs to become active. Inside, it asks `agent_identity_authapi_base_url` where to send registration, uses `key` to shape the credential data, uses `build_reqwest_client` for HTTP, and hands the request to the external `register_agent_task` function.
 
 *Call graph*: calls 3 internal fn (agent_identity_authapi_base_url, key, build_reqwest_client); called by 1 (from_agent_identity_jwt); 1 external calls (register_agent_task).
 
@@ -1228,11 +1236,11 @@ async fn load(record: AgentIdentityAuthRecord) -> std::io::Result<Self>
 fn record(&self) -> &AgentIdentityAuthRecord
 ```
 
-**Purpose**: Returns the full underlying persisted agent-identity record.
+**Purpose**: Gives read-only access to the full stored authentication record. This is useful when later code needs more than one field from the original login data.
 
-**Data flow**: Borrows `self.record` and returns `&AgentIdentityAuthRecord` without mutation.
+**Data flow**: It reads the `record` field already stored inside `AgentIdentityAuth` and returns a shared reference to it. Nothing is copied or changed.
 
-**Call relations**: Downstream header-building code uses this when it needs the complete stored record rather than individual fields.
+**Call relations**: `add_auth_headers` calls this when preparing outbound request headers and needs the original authentication details. This method is a simple doorway to the saved record.
 
 *Call graph*: called by 1 (add_auth_headers).
 
@@ -1243,11 +1251,11 @@ fn record(&self) -> &AgentIdentityAuthRecord
 fn process_task_id(&self) -> &str
 ```
 
-**Purpose**: Returns the registered process task identifier assigned by the auth API.
+**Purpose**: Returns the process task ID that was assigned when this agent process registered with the auth service. Later requests use this value to identify this particular running agent session.
 
-**Data flow**: Borrows `self.process_task_id` and returns it as `&str`.
+**Data flow**: It reads the `process_task_id` string stored during `AgentIdentityAuth::load` and returns it as text. It does not change the authentication object.
 
-**Call relations**: Header-building code uses this to attach the runtime task identifier to outgoing requests.
+**Call relations**: `add_auth_headers` calls this while building authentication headers for network requests. The value it returns is one of the pieces that ties a request back to the registered agent task.
 
 *Call graph*: called by 1 (add_auth_headers).
 
@@ -1258,11 +1266,11 @@ fn process_task_id(&self) -> &str
 fn account_id(&self) -> &str
 ```
 
-**Purpose**: Returns the ChatGPT account/workspace identifier associated with the agent identity.
+**Purpose**: Returns the account ID from the stored agent identity record. This tells other code which account the agent identity belongs to.
 
-**Data flow**: Borrows `self.record.account_id` and returns it as `&str`.
+**Data flow**: It reads `account_id` from the embedded record and returns it as text. The stored record remains unchanged.
 
-**Call relations**: Used by downstream auth/header logic when account scoping must be attached or checked.
+**Call relations**: `add_auth_headers` calls this when it needs to include account identity information in outgoing authentication headers.
 
 *Call graph*: called by 1 (add_auth_headers).
 
@@ -1273,11 +1281,11 @@ fn account_id(&self) -> &str
 fn chatgpt_user_id(&self) -> &str
 ```
 
-**Purpose**: Returns the ChatGPT user identifier from the stored record.
+**Purpose**: Returns the ChatGPT user ID associated with this agent identity. This identifies the user side of the account record.
 
-**Data flow**: Borrows `self.record.chatgpt_user_id` and returns it as `&str`.
+**Data flow**: It reads `chatgpt_user_id` from the stored record and returns it as text. No data is modified.
 
-**Call relations**: This accessor is available for consumers that need user-level identity metadata.
+**Call relations**: This accessor is available to any code that needs the user ID from the agent identity record. In this call graph, no direct caller is shown, so it is likely provided for nearby auth code or future use.
 
 
 ##### `AgentIdentityAuth::email`  (lines 51–53)
@@ -1286,11 +1294,11 @@ fn chatgpt_user_id(&self) -> &str
 fn email(&self) -> &str
 ```
 
-**Purpose**: Returns the account email address associated with the agent identity.
+**Purpose**: Returns the email address stored with the agent identity. This can be used for display, logging, or account-related decisions where the user’s email is needed.
 
-**Data flow**: Borrows `self.record.email` and returns it as `&str`.
+**Data flow**: It reads the `email` field from the embedded record and returns it as text. The object is left unchanged.
 
-**Call relations**: Exposes email metadata to callers without requiring direct access to the storage record.
+**Call relations**: This is a read-only convenience method for code that needs the account email. The provided call graph does not show a current caller.
 
 
 ##### `AgentIdentityAuth::plan_type`  (lines 55–57)
@@ -1299,11 +1307,11 @@ fn email(&self) -> &str
 fn plan_type(&self) -> AccountPlanType
 ```
 
-**Purpose**: Returns the account plan type stored in the agent-identity record.
+**Purpose**: Returns the account plan type, such as the subscription or account category represented by the stored record. Other code can use this to adjust behavior based on account capabilities.
 
-**Data flow**: Reads `self.record.plan_type` and returns the copied `AccountPlanType` value.
+**Data flow**: It reads `plan_type` from the stored record and returns that value. Because the plan type is copied out, the original record is not changed.
 
-**Call relations**: Used by auth consumers that need to surface or branch on account plan information.
+**Call relations**: This method exposes plan information to the rest of the authentication system. The provided call graph does not show a direct caller in this slice.
 
 
 ##### `AgentIdentityAuth::is_fedramp_account`  (lines 59–61)
@@ -1312,11 +1320,11 @@ fn plan_type(&self) -> AccountPlanType
 fn is_fedramp_account(&self) -> bool
 ```
 
-**Purpose**: Returns whether the associated ChatGPT account is marked as FedRAMP.
+**Purpose**: Reports whether this account is marked as a FedRAMP account. FedRAMP is a U.S. government security compliance program, so this flag can affect which services or headers are allowed.
 
-**Data flow**: Reads `self.record.chatgpt_account_is_fedramp` and returns the boolean.
+**Data flow**: It reads the boolean `chatgpt_account_is_fedramp` from the stored record and returns true or false. It does not change any state.
 
-**Call relations**: Header-building code uses this to propagate compliance/account-class metadata.
+**Call relations**: `add_auth_headers` calls this when building request headers, so outgoing requests can carry or respect the account’s FedRAMP status.
 
 *Call graph*: called by 1 (add_auth_headers).
 
@@ -1327,11 +1335,11 @@ fn is_fedramp_account(&self) -> bool
 fn agent_identity_authapi_base_url() -> String
 ```
 
-**Purpose**: Resolves the base URL for agent-identity auth API calls from environment or production default.
+**Purpose**: Chooses which auth API base URL should be used for agent identity registration. It normally returns the production OpenAI auth URL, but allows an environment variable to override it.
 
-**Data flow**: Reads `CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL` from the environment, trims whitespace and trailing slashes, filters out empty strings, and returns the cleaned override or `PROD_AGENT_IDENTITY_AUTHAPI_BASE_URL` if no usable override exists.
+**Data flow**: It reads the `CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL` environment variable. If the variable exists, it trims whitespace and removes trailing slashes, then uses it if it is not empty. If the variable is missing or empty after trimming, it returns the built-in production URL.
 
-**Call relations**: Called by `AgentIdentityAuth::load` so runtime registration targets the correct auth API endpoint.
+**Call relations**: `AgentIdentityAuth::load` calls this before registering the agent task, so registration goes to the correct auth API. The tests in this file check both the override path and the default production path.
 
 *Call graph*: called by 1 (load); 1 external calls (var).
 
@@ -1342,11 +1350,11 @@ fn agent_identity_authapi_base_url() -> String
 fn key(record: &AgentIdentityAuthRecord) -> AgentIdentityKey<'_>
 ```
 
-**Purpose**: Builds the borrowed `AgentIdentityKey` view required by the registration API from a stored auth record.
+**Purpose**: Builds the key object needed by the agent identity registration library from the stored authentication record. It selects only the two pieces registration needs: the runtime ID and the private key.
 
-**Data flow**: Borrows `agent_runtime_id` and `agent_private_key` from the provided `AgentIdentityAuthRecord` and returns an `AgentIdentityKey<'_>` referencing those fields.
+**Data flow**: It receives an `AgentIdentityAuthRecord`, borrows `agent_runtime_id` and `agent_private_key` from it, and returns an `AgentIdentityKey` that points at those values. It does not copy or alter the sensitive key material.
 
-**Call relations**: Used only by `AgentIdentityAuth::load` to adapt storage data to the registration API's expected input type.
+**Call relations**: `AgentIdentityAuth::load` calls this right before calling the external `register_agent_task` function. It acts as a small adapter between this project’s stored record format and the agent identity library’s expected input.
 
 *Call graph*: called by 1 (load).
 
@@ -1357,11 +1365,11 @@ fn key(record: &AgentIdentityAuthRecord) -> AgentIdentityKey<'_>
 fn agent_identity_authapi_base_url_prefers_env_value()
 ```
 
-**Purpose**: Verifies that the environment override is used and normalized by trimming the trailing slash.
+**Purpose**: Checks that the auth API URL helper respects the environment variable override. This protects test, staging, or custom deployments from accidentally using the production URL when an override was provided.
 
-**Data flow**: Sets the override env var through `EnvVarGuard::set`, calls `agent_identity_authapi_base_url`, and asserts the returned string equals the trimmed custom URL.
+**Data flow**: It temporarily sets `CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL` to a test URL with a trailing slash. Then it calls `agent_identity_authapi_base_url` and verifies that the returned URL matches the test value with the trailing slash removed.
 
-**Call relations**: This test covers the override branch of the base-URL resolver.
+**Call relations**: This test uses `tests::EnvVarGuard::set` to change the environment safely for the duration of the test. The serial test marker makes sure environment-changing tests do not run at the same time and interfere with each other.
 
 *Call graph*: calls 1 internal fn (set); 1 external calls (assert_eq!).
 
@@ -1372,11 +1380,11 @@ fn agent_identity_authapi_base_url_prefers_env_value()
 fn agent_identity_authapi_base_url_uses_prod_authapi_by_default()
 ```
 
-**Purpose**: Verifies that the production auth API URL is used when no override environment variable is present.
+**Purpose**: Checks that the helper falls back to the production auth API URL when no override is set. This confirms the normal runtime behavior.
 
-**Data flow**: Removes the override env var through `EnvVarGuard::remove`, calls `agent_identity_authapi_base_url`, and asserts the result equals the production constant.
+**Data flow**: It temporarily removes the auth API environment variable. Then it calls `agent_identity_authapi_base_url` and verifies that the result is the built-in production URL.
 
-**Call relations**: This test covers the default branch of the base-URL resolver.
+**Call relations**: This test uses `tests::EnvVarGuard::remove` to clear the environment variable and restore it afterward. Like the other environment test, it runs serially to avoid cross-test interference.
 
 *Call graph*: 2 external calls (remove, assert_eq!).
 
@@ -1387,11 +1395,11 @@ fn agent_identity_authapi_base_url_uses_prod_authapi_by_default()
 fn set(key: &'static str, value: &str) -> Self
 ```
 
-**Purpose**: Temporarily sets an environment variable for a test while remembering its previous value.
+**Purpose**: Temporarily sets an environment variable for a test while remembering its previous value. This prevents a test from leaving the process environment in a changed state.
 
-**Data flow**: Reads the original value with `env::var_os`, unsafely sets the new value with `env::set_var`, and returns `EnvVarGuard { key, original }`.
+**Data flow**: It receives an environment variable name and a new value. It first reads and stores the original value, then sets the variable to the requested value, and returns an `EnvVarGuard` that knows how to restore the original later.
 
-**Call relations**: Tests use this RAII helper to isolate environment mutations around base-URL resolution.
+**Call relations**: `tests::agent_identity_authapi_base_url_prefers_env_value` uses this before checking URL override behavior. When the guard is dropped at the end of the test, `tests::EnvVarGuard::drop` restores the environment.
 
 *Call graph*: 2 external calls (set_var, var_os).
 
@@ -1402,11 +1410,11 @@ fn set(key: &'static str, value: &str) -> Self
 fn remove(key: &'static str) -> Self
 ```
 
-**Purpose**: Temporarily removes an environment variable for a test while remembering its previous value.
+**Purpose**: Temporarily removes an environment variable for a test while remembering whether it existed before. This lets a test simulate a missing setting without permanently changing the test process.
 
-**Data flow**: Reads the original value with `env::var_os`, unsafely removes the variable with `env::remove_var`, and returns `EnvVarGuard { key, original }`.
+**Data flow**: It receives an environment variable name. It reads and stores the current value, removes the variable, and returns an `EnvVarGuard` that can restore the old value or keep it removed as appropriate.
 
-**Call relations**: Used by tests that need to force the resolver onto its default path.
+**Call relations**: `tests::agent_identity_authapi_base_url_uses_prod_authapi_by_default` uses this to test the default production URL path. Cleanup is handled later by `tests::EnvVarGuard::drop`.
 
 *Call graph*: 2 external calls (remove_var, var_os).
 
@@ -1417,24 +1425,26 @@ fn remove(key: &'static str) -> Self
 fn drop(&mut self)
 ```
 
-**Purpose**: Restores the original environment variable state when the guard goes out of scope.
+**Purpose**: Restores an environment variable when an `EnvVarGuard` goes out of scope. This is the cleanup step that keeps environment-based tests from leaking changes into each other.
 
-**Data flow**: On drop, checks `self.original`; if `Some`, unsafely restores it with `env::set_var`, otherwise removes the variable with `env::remove_var`.
+**Data flow**: It looks at the original value saved in the guard. If there was an original value, it sets the variable back to that value; if there was none, it removes the variable again.
 
-**Call relations**: This cleanup logic makes the environment-mutating tests safe to run serially without leaking state.
+**Call relations**: This runs automatically after tests that created an `EnvVarGuard` with `set` or `remove`. It completes the temporary-environment-change story by putting the process environment back the way it was.
 
 *Call graph*: 2 external calls (remove_var, set_var).
 
 
 ### `login/src/auth/external_bearer.rs`
 
-`domain_logic` · `request-time external auth resolution and refresh`
+`domain_logic` · `cross-cutting during authentication lookup and token refresh`
 
-This file adapts `ModelProviderAuthInfo` command-based auth into the generic external-auth mechanism used by `AuthManager`. `BearerTokenRefresher` is a thin cloneable wrapper around shared `ExternalBearerAuthState`, which stores the provider config and an async `Mutex<Option<CachedExternalBearerToken>>`. The cache records both the token string and the `Instant` when it was fetched.
+Some model providers do not store a fixed API key in the app. Instead, they expect the app to ask another tool for a short-lived bearer token, which is a string used as proof that the user is allowed to make requests. This file is the adapter for that style of authentication.
 
-The main behavior lives in `resolve` and `refresh`. `resolve` first locks the cache and, if a token exists, decides whether it is still usable based on `config.refresh_interval()`: with no interval configured it reuses indefinitely, otherwise it compares elapsed time against the interval. On a cache miss or stale entry, it intentionally holds the mutex across the provider command execution so concurrent callers do not spawn duplicate refresh commands. `refresh` always reruns the command and overwrites the cache. Both methods wrap the token in `ExternalAuthTokens::access_token_only`, and `auth_mode` reports `AuthMode::ApiKey`, meaning the manager treats the token as a bearer/API-key credential rather than ChatGPT metadata-bearing auth.
+The main type, `BearerTokenRefresher`, is like a small ticket office. When the rest of the app asks for credentials, it first checks whether it already has a recent ticket in its cache. If the cached token is still fresh, it reuses it. If not, it runs the configured provider command, reads the command's standard output, trims it, and treats that text as the access token.
 
-`run_provider_auth_command` handles the shell-out details: resolve the executable path relative to `cwd` when needed, run with null stdin and piped stdout/stderr, enforce a timeout, surface startup and non-zero-exit failures with stderr text, require UTF-8 stdout, trim whitespace, and reject empty output. `resolve_provider_auth_program` preserves absolute paths, joins multi-component relative paths against `cwd`, and leaves bare command names for PATH lookup.
+The file is careful about failures. It sets a timeout so a stuck command cannot hang forever. It captures error output so failures can explain what went wrong. It rejects non-text output and empty tokens, because those would not be usable credentials.
+
+One important detail is that cache misses hold a mutex, which is a lock that stops two tasks touching the same cached value at once, while the command runs. That is intentional: if several requests arrive together, only one external command should be launched instead of many duplicate token refreshes.
 
 #### Function details
 
@@ -1444,11 +1454,11 @@ The main behavior lives in `resolve` and `refresh`. `resolve` first locks the ca
 fn new(config: ModelProviderAuthInfo) -> Self
 ```
 
-**Purpose**: Constructs a new external bearer refresher around a provider-auth command configuration.
+**Purpose**: Creates a new token refresher from the provider authentication configuration. Someone uses this when they want the login system to obtain tokens by running the configured external command.
 
-**Data flow**: It takes a `ModelProviderAuthInfo`, creates an `ExternalBearerAuthState` with that config and an empty cached token, wraps the state in an `Arc`, and returns a `BearerTokenRefresher` holding it.
+**Data flow**: It receives `ModelProviderAuthInfo`, which contains details such as the command, arguments, working directory, timeout, and refresh interval. It builds an `ExternalBearerAuthState` around that configuration, wraps it in shared ownership so clones can point to the same cache, and returns a ready-to-use `BearerTokenRefresher`.
 
-**Call relations**: `AuthManager::external_bearer_only` uses this constructor to install command-based external API-key auth into a manager instance.
+**Call relations**: In the known flow, `external_bearer_only` calls this to set up external bearer authentication. This constructor immediately hands the configuration to `ExternalBearerAuthState::new`, so later resolve and refresh calls all share the same cached token.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (external_bearer_only); 1 external calls (new).
 
@@ -1459,11 +1469,11 @@ fn new(config: ModelProviderAuthInfo) -> Self
 fn auth_mode(&self) -> AuthMode
 ```
 
-**Purpose**: Declares that this external provider supplies API-key-style auth.
+**Purpose**: Tells the rest of the authentication system what broad kind of credential this refresher supplies. Here it reports `ApiKey`, meaning the token is used like a single secret value attached to requests.
 
-**Data flow**: It takes `&self` and returns the constant `AuthMode::ApiKey`.
+**Data flow**: It takes the refresher object but does not need to read its stored configuration or cache. It simply returns the fixed authentication mode `AuthMode::ApiKey`.
 
-**Call relations**: The `ExternalAuth` machinery consults this to decide whether refreshed tokens should be persisted as ChatGPT auth or simply treated as direct bearer/API-key credentials.
+**Call relations**: The external authentication manager can ask this method when it needs to label or route credentials. It does not call other project code; it just answers with the mode expected by the surrounding authentication interface.
 
 
 ##### `BearerTokenRefresher::resolve`  (lines 77–79)
@@ -1472,11 +1482,11 @@ fn auth_mode(&self) -> AuthMode
 fn resolve(&self) -> ExternalAuthFuture<'_, Option<ExternalAuthTokens>>
 ```
 
-**Purpose**: Returns a cached bearer token when still fresh, otherwise runs the provider command once and caches the result.
+**Purpose**: Provides an access token for normal use, reusing a cached token when it is still valid and running the provider command when it is missing or too old. This avoids unnecessary external command calls while still keeping credentials fresh.
 
-**Data flow**: It locks `self.state.cached_token`, inspects any existing `CachedExternalBearerToken`, and compares `fetched_at.elapsed()` against `self.state.config.refresh_interval()`. If the cached token is still valid, it immediately returns `Ok(Some(ExternalAuthTokens::access_token_only(cloned_token)))`. Otherwise it calls `run_provider_auth_command`, stores a new cached token with `Instant::now()`, and returns the new token wrapped the same way.
+**Data flow**: It starts with the shared state: configuration plus an optional cached token. If a cached token exists and the configured refresh interval says it is still fresh, it returns that token wrapped as `ExternalAuthTokens`. Otherwise it runs `run_provider_auth_command`, stores the new token with the current time, and returns the new token. If the external command fails, the error is passed back instead of a token.
 
-**Call relations**: This is the concrete implementation behind the trait-level `resolve` future. `AuthManager::resolve_external_api_key_auth` invokes it when external API-key auth is active and a caller asks for current auth.
+**Call relations**: When the authentication manager asks for credentials, this method is exposed through the `ExternalAuth` trait as a pinned future, which is Rust's way of returning an asynchronous operation that can be waited on. On a cache miss it delegates the real token fetching to `run_provider_auth_command`, then packages the result with `ExternalAuthTokens::access_token_only`.
 
 *Call graph*: calls 2 internal fn (run_provider_auth_command, access_token_only); 2 external calls (pin, now).
 
@@ -1490,11 +1500,11 @@ fn refresh(
     ) -> ExternalAuthFuture<'_, ExternalAuthTokens>
 ```
 
-**Purpose**: Forces a fresh provider-command execution and replaces the cached bearer token regardless of cache age.
+**Purpose**: Forces a fresh access token to be fetched, even if a cached one already exists. This is useful after a request fails because the old token may have expired or been rejected.
 
-**Data flow**: It ignores the supplied `ExternalAuthRefreshContext`, calls `run_provider_auth_command(&self.state.config)`, then locks `cached_token` and overwrites it with the new token plus `Instant::now()`. It returns `ExternalAuthTokens::access_token_only(access_token)`.
+**Data flow**: It receives a refresh context, though this implementation does not use the context details. It runs the configured provider command, replaces the cached token with the new value and the current fetch time, and returns the new value as `ExternalAuthTokens`. Any command or output error becomes an I/O error returned to the caller.
 
-**Call relations**: This method backs the trait-level refresh future and is used by unauthorized-recovery flows when the manager wants to retry external bearer auth after a 401.
+**Call relations**: The external authentication manager calls this through the `ExternalAuth` trait when it wants a deliberate refresh. Like `resolve`, it is returned as an asynchronous pinned future and relies on `run_provider_auth_command` to do the actual command execution.
 
 *Call graph*: calls 2 internal fn (run_provider_auth_command, access_token_only); 2 external calls (pin, now).
 
@@ -1505,11 +1515,11 @@ fn refresh(
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Provides a non-exhaustive debug representation that avoids exposing internal state details.
+**Purpose**: Provides a safe debug representation of the refresher. It lets logs or developer tools identify the object without printing sensitive token values or command details.
 
-**Data flow**: It writes a `debug_struct("BearerTokenRefresher")` and finishes it as non-exhaustive without printing the token cache or command configuration.
+**Data flow**: It receives a formatter from Rust's debug-printing system. It writes a non-exhaustive debug struct named `BearerTokenRefresher`, intentionally leaving internal fields out, and returns the formatting result.
 
-**Call relations**: This supports diagnostics when the refresher is embedded in larger debug output, while intentionally keeping sensitive or unstable internals out of logs.
+**Call relations**: This is called automatically when code tries to debug-print a `BearerTokenRefresher`. It uses the standard formatter's `debug_struct` helper and does not interact with the token fetching path.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1520,11 +1530,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(config: ModelProviderAuthInfo) -> Self
 ```
 
-**Purpose**: Initializes the shared state object for command-based bearer auth with an empty cache.
+**Purpose**: Builds the shared internal state used by a bearer token refresher. It keeps the provider configuration and starts with no cached token.
 
-**Data flow**: It takes a `ModelProviderAuthInfo`, stores it in `config`, initializes `cached_token` to `Mutex::new(None)`, and returns the state struct.
+**Data flow**: It receives the provider authentication configuration. It stores that configuration and creates a mutex-protected empty cache, then returns the state object.
 
-**Call relations**: Only `BearerTokenRefresher::new` calls this helper to build the shared state wrapped by `Arc`.
+**Call relations**: `BearerTokenRefresher::new` calls this during setup. After that, `BearerTokenRefresher::resolve` and `BearerTokenRefresher::refresh` read the configuration from this state and update its cached token.
 
 *Call graph*: called by 1 (new); 1 external calls (new).
 
@@ -1535,11 +1545,11 @@ fn new(config: ModelProviderAuthInfo) -> Self
 async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result<String>
 ```
 
-**Purpose**: Executes the configured provider-auth command, enforces timeout and output validity, and returns the trimmed stdout token string.
+**Purpose**: Runs the configured external authentication command and turns its output into an access token. This is the bridge between this app and whatever outside tool knows how to issue provider credentials.
 
-**Data flow**: It receives a `ModelProviderAuthInfo`, resolves the executable path with `resolve_provider_auth_program`, builds a `tokio::process::Command` with configured args and cwd, null stdin, piped stdout/stderr, and `kill_on_drop(true)`, then awaits `command.output()` under `tokio::time::timeout(config.timeout(), ...)`. It maps timeout, startup failure, non-success exit status, non-UTF-8 stdout, and empty trimmed stdout into `io::Error::other(...)`; on success it returns the non-empty trimmed stdout token.
+**Data flow**: It receives `ModelProviderAuthInfo`. First it resolves the command path with `resolve_provider_auth_program`. Then it starts the command with the configured arguments and working directory, gives it no input, captures its output, and enforces the configured timeout. If the command times out, fails to start, exits unsuccessfully, writes non-UTF-8 text, or prints an empty token, it returns a clear I/O error. If everything succeeds, it trims standard output and returns that string as the access token.
 
-**Call relations**: Both `BearerTokenRefresher::resolve` and `BearerTokenRefresher::refresh` delegate token acquisition to this function so all command execution, timeout, and error formatting logic stays in one place.
+**Call relations**: `BearerTokenRefresher::resolve` calls this when the cache cannot be used, and `BearerTokenRefresher::refresh` calls it whenever a forced refresh is needed. Before launching the process, it asks `resolve_provider_auth_program` to interpret the configured command relative to the configured working directory when appropriate.
 
 *Call graph*: calls 1 internal fn (resolve_provider_auth_program); called by 2 (refresh, resolve); 10 external calls (null, piped, from_utf8, from_utf8_lossy, new, new, other, timeout, format!, timeout).
 
@@ -1550,22 +1560,26 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
 fn resolve_provider_auth_program(command: &str, cwd: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Determines how to interpret the configured command string as an executable path.
+**Purpose**: Decides what program path should be used for the provider authentication command. This makes relative command names behave predictably with the configured working directory.
 
-**Data flow**: It takes the raw `command` string and a working directory `cwd`. If `command` parses as an absolute path, it returns that path unchanged. If it has more than one path component, it joins it against `cwd`. Otherwise it returns `PathBuf::from(command)` so bare command names can be resolved via PATH by the process launcher.
+**Data flow**: It receives the command string and the configured current working directory. If the command is an absolute path, it returns that path unchanged. If the command contains path components, such as `scripts/get-token`, it joins it to the working directory. If it is just a bare program name, such as `get-token`, it leaves it as a plain program name so the operating system can find it through the normal command search path.
 
-**Call relations**: `run_provider_auth_command` calls this before spawning the process, ensuring relative script paths are anchored to the configured working directory while preserving PATH-based commands.
+**Call relations**: `run_provider_auth_command` calls this before spawning the external process. Its result becomes the executable path passed into the asynchronous process runner.
 
 *Call graph*: called by 1 (run_provider_auth_command); 3 external calls (join, new, from).
 
 
 ### `model-provider/src/bearer_auth_provider.rs`
 
-`util` · `per-request header construction`
+`io_transport` · `request handling`
 
-This file contains the small `BearerAuthProvider` data type and its `AuthProvider` implementation. The struct stores three pieces of request-auth state: an optional bearer token, an optional `ChatGPT-Account-ID`, and a boolean indicating whether the account should be routed through FedRAMP infrastructure. `new` is the production constructor and initializes only the token, leaving account ID absent and FedRAMP disabled. `for_test` is a convenience constructor that accepts borrowed string options and materializes owned values for tests.
+When this project talks to a model provider over HTTP, the provider often needs proof of who is making the request. This file supplies that proof by implementing a small authentication provider called `BearerAuthProvider`. A bearer token is like a temporary badge: the client puts it in the request, and the server uses it to decide whether the request is allowed.
 
-The core behavior lives in `add_auth_headers`. It conditionally inserts `Authorization: Bearer <token>` when `token` is present and can be converted into a valid `HeaderValue`. It separately inserts `ChatGPT-Account-ID` when `account_id` is present and valid, and adds `X-OpenAI-Fedramp: true` when `is_fedramp_account` is set. Like the agent-identity provider, invalid header values are ignored rather than causing an error, so auth attachment is best-effort at the header-construction layer. Tests verify both telemetry-visible behavior—whether an authorization header would be attached—and concrete header insertion for bearer token, account ID, and FedRAMP routing.
+The main struct stores three pieces of information: an optional token, an optional account ID, and a flag saying whether the account should be routed as a FedRAMP account. FedRAMP is a U.S. government security compliance program, so those accounts may need special routing.
+
+The important behavior is in `add_auth_headers`. Given a mutable set of HTTP headers, it adds an `Authorization` header in the form `Bearer <token>` when a token is available. If an account ID is available, it also adds `ChatGPT-Account-ID`. If the FedRAMP flag is set, it adds `X-OpenAI-Fedramp: true`.
+
+The file is deliberately careful: it only inserts headers when the values can be turned into valid HTTP header values. If a token or account ID is missing, it simply leaves that header out rather than failing. The tests confirm that telemetry can detect when an auth header will be attached, that normal auth and account headers are added, and that the FedRAMP routing header appears for FedRAMP accounts.
 
 #### Function details
 
@@ -1575,11 +1589,11 @@ The core behavior lives in `add_auth_headers`. It conditionally inserts `Authori
 fn new(token: String) -> Self
 ```
 
-**Purpose**: Creates a bearer auth provider from a token string for normal runtime use.
+**Purpose**: Creates a normal bearer authentication provider from a token string. This is used when the system has an access token and needs an object that can later add it to outgoing HTTP requests.
 
-**Data flow**: It takes an owned token `String` and returns `BearerAuthProvider { token: Some(token), account_id: None, is_fedramp_account: false }`.
+**Data flow**: A token string goes in. The function stores it as the provider's token, leaves the account ID empty, sets the FedRAMP flag to false, and returns the ready-to-use `BearerAuthProvider`.
 
-**Call relations**: This constructor is used when provider configuration supplies an API key or explicit bearer token, via `bearer_auth_for_provider`.
+**Call relations**: This constructor is called by `bearer_auth_for_provider` when the larger provider setup needs a simple bearer-token auth provider. It prepares the data that `BearerAuthProvider::add_auth_headers` will later turn into HTTP headers.
 
 *Call graph*: called by 1 (bearer_auth_for_provider).
 
@@ -1590,11 +1604,11 @@ fn new(token: String) -> Self
 fn for_test(token: Option<&str>, account_id: Option<&str>) -> Self
 ```
 
-**Purpose**: Builds a bearer auth provider from optional borrowed token and account ID values for tests.
+**Purpose**: Builds a `BearerAuthProvider` from optional string slices for use in tests. It lets tests easily try cases with or without a token and with or without an account ID.
 
-**Data flow**: It accepts `Option<&str>` for token and account ID, maps each to owned `String` values when present, sets `is_fedramp_account` to `false`, and returns the resulting struct.
+**Data flow**: Optional borrowed strings for the token and account ID go in. The function copies any provided values into owned strings, sets the FedRAMP flag to false, and returns a provider shaped for the test case.
 
-**Call relations**: This helper is used by tests that need a compact way to create a provider with or without token/account headers.
+**Call relations**: This helper is called by tests such as `bearer_auth_provider_adds_auth_headers`, and also by another telemetry-related test elsewhere. It exists so tests can quickly set up the provider state before calling code that reads or adds auth headers.
 
 *Call graph*: called by 2 (auth_request_telemetry_context_tracks_attached_auth_and_retry_phase, bearer_auth_provider_adds_auth_headers).
 
@@ -1605,11 +1619,11 @@ fn for_test(token: Option<&str>, account_id: Option<&str>) -> Self
 fn add_auth_headers(&self, headers: &mut HeaderMap)
 ```
 
-**Purpose**: Attaches bearer-token auth and related routing headers to an outgoing request.
+**Purpose**: Adds authentication and routing headers to an outgoing HTTP request header map. This is the core action that turns stored auth information into the actual headers the model provider will receive.
 
-**Data flow**: It reads `self.token`, `self.account_id`, and `self.is_fedramp_account`. If a token exists and `HeaderValue::from_str("Bearer {token}")` succeeds, it inserts `Authorization`. If an account ID exists and parses, it inserts `ChatGPT-Account-ID`. If the FedRAMP flag is true, it inserts `X-OpenAI-Fedramp: true`.
+**Data flow**: A `BearerAuthProvider` and a mutable HTTP header map go in. The function checks whether a token exists, formats it as `Bearer <token>`, and inserts it as the `Authorization` header if it is a valid header value. It then does the same kind of safe insertion for the optional account ID, and adds `X-OpenAI-Fedramp: true` when the FedRAMP flag is set. The same header map comes out changed in place.
 
-**Call relations**: This method is called by HTTP request code through the `AuthProvider` trait whenever a request resolves to bearer-style auth.
+**Call relations**: This method fulfills the `AuthProvider` trait, meaning other request-building code can treat this provider as a standard source of auth headers. Its behavior is exercised by the tests in this file, which check the normal bearer header, the account ID header, and the FedRAMP routing header.
 
 *Call graph*: 4 external calls (insert, from_static, from_str, format!).
 
@@ -1620,11 +1634,11 @@ fn add_auth_headers(&self, headers: &mut HeaderMap)
 fn bearer_auth_provider_reports_when_auth_header_will_attach()
 ```
 
-**Purpose**: Verifies that telemetry sees an authorization header as attached when the provider has a token.
+**Purpose**: Checks that shared auth telemetry can see that this provider will attach an authorization header. Telemetry here means reporting information about what the auth layer is doing, without sending the request itself.
 
-**Data flow**: It constructs a `BearerAuthProvider` with a token, passes it to `codex_api::auth_header_telemetry`, and asserts the returned telemetry reports `attached: true` and `name: Some("authorization")`.
+**Data flow**: The test creates a provider with a token and no account ID. It passes that provider to `codex_api::auth_header_telemetry`, then compares the returned telemetry with the expected result: an auth header is attached, and its name is `authorization`.
 
-**Call relations**: This test validates the observable behavior of the provider as consumed by telemetry helpers, not just raw header insertion.
+**Call relations**: This test calls into the broader `codex_api` telemetry helper rather than calling `add_auth_headers` directly. It verifies that `BearerAuthProvider` works correctly with the common `AuthProvider` interface used elsewhere in the system.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1635,11 +1649,11 @@ fn bearer_auth_provider_reports_when_auth_header_will_attach()
 fn bearer_auth_provider_adds_auth_headers()
 ```
 
-**Purpose**: Checks that bearer token and account ID are inserted into the expected HTTP headers.
+**Purpose**: Confirms that a provider with both a token and an account ID writes the expected HTTP headers. This protects the basic request-authentication behavior from accidental changes.
 
-**Data flow**: It creates a provider with `for_test(Some("access-token"), Some("workspace-123"))`, applies `add_auth_headers` to a fresh `HeaderMap`, and asserts the resulting `Authorization` and `ChatGPT-Account-ID` values match the expected strings.
+**Data flow**: The test builds a provider using `BearerAuthProvider::for_test`, creates an empty header map, and asks the provider to add its headers. It then reads the header map back and checks that `Authorization` contains `Bearer access-token` and `ChatGPT-Account-ID` contains `workspace-123`.
 
-**Call relations**: This test exercises the main happy path of `add_auth_headers`.
+**Call relations**: This test uses the test constructor to set up a clear scenario, then exercises `BearerAuthProvider::add_auth_headers`. It proves that the main method produces the exact headers later request-sending code depends on.
 
 *Call graph*: calls 1 internal fn (for_test); 2 external calls (new, assert_eq!).
 
@@ -1650,22 +1664,26 @@ fn bearer_auth_provider_adds_auth_headers()
 fn bearer_auth_provider_adds_fedramp_routing_header_for_fedramp_accounts()
 ```
 
-**Purpose**: Verifies that FedRAMP accounts receive the extra routing header.
+**Purpose**: Confirms that FedRAMP accounts get the special routing header. This matters because those requests may need to be directed through a different compliant path.
 
-**Data flow**: It constructs a `BearerAuthProvider` with token, account ID, and `is_fedramp_account: true`, applies `add_auth_headers`, and asserts the `X-OpenAI-Fedramp` header is present with value `true`.
+**Data flow**: The test creates a provider with a token, an account ID, and `is_fedramp_account` set to true. It starts with an empty header map, calls `add_auth_headers`, and then checks that the map contains `X-OpenAI-Fedramp` with the value `true`.
 
-**Call relations**: This test covers the conditional FedRAMP branch in `add_auth_headers`.
+**Call relations**: This test directly exercises the FedRAMP branch inside `BearerAuthProvider::add_auth_headers`. It makes sure the special routing signal is added only through the same header-writing path used for real outgoing requests.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
 
 ### `model-provider/src/auth.rs`
 
-`domain_logic` · `request auth resolution and provider initialization`
+`io_transport` · `provider setup and request preparation`
 
-This file is the central auth adapter for non-Bedrock providers. It defines two concrete `AuthProvider` implementations. `AgentIdentityAuthProvider` turns a `codex_login::auth::AgentIdentityAuth` snapshot into request headers by deriving an authorization header with `authorization_header_for_agent_task`, adding `ChatGPT-Account-ID`, and conditionally adding `X-OpenAI-Fedramp: true`. Header insertion is intentionally best-effort: invalid generated values are silently skipped rather than failing the request setup path. `UnauthenticatedAuthProvider` is the opposite extreme and writes nothing at all.
+Different model providers expect different proof that a request is allowed. OpenAI-style services often use a bearer token, which is a secret string placed in an Authorization header. Some local or test providers need no authentication at all. Agent identity auth is more specialized: it signs a request for a particular agent task, like writing a tamper-resistant permission slip for that task.
 
-The exported helpers decide which auth path to use. `auth_manager_for_provider` swaps in an external-bearer-only `AuthManager` when the provider config contains command-backed auth; otherwise it preserves the caller-supplied manager. `resolve_provider_auth` then applies precedence rules for actual request headers: Bedrock API-key auth is rejected here with `UnsupportedOperation`, provider-owned credentials from `provider.api_key()` or `experimental_bearer_token` override any caller auth, and only if neither is present does it fall back to converting the supplied `CodexAuth` via `auth_provider_from_auth`. That conversion maps agent identity to the custom provider above and all token-like first-party auth variants to `BearerAuthProvider`, carrying token, account ID, and FedRAMP routing state. Tests cover the unauthenticated path and the explicit rejection of Bedrock API-key auth for ordinary providers.
+This file is the small switchboard that picks the right kind of authentication for a provider. First it checks for provider-specific secrets, such as an API key configured directly on the provider. Those override the general Codex login. If there is no provider-specific secret, it uses the supplied Codex login snapshot. If there is no login and the provider does not require one, it returns an auth provider that deliberately adds nothing.
+
+It also prevents one important mistake: a Bedrock API key is rejected here unless the actual Amazon Bedrock provider is being used. Without that guard, the system might send the wrong kind of credential to the wrong service.
+
+The result is always a shared auth provider object. Later, when an HTTP request is being prepared, that object is asked to add the correct headers.
 
 #### Function details
 
@@ -1675,11 +1693,11 @@ The exported helpers decide which auth path to use. `auth_manager_for_provider` 
 fn add_auth_headers(&self, headers: &mut HeaderMap)
 ```
 
-**Purpose**: Adds agent-identity request headers derived from the stored auth snapshot. It signs an agent-task authorization target, attaches account routing metadata, and marks FedRAMP accounts when applicable.
+**Purpose**: Adds the special HTTP headers needed when Codex is acting with an agent identity. This proves both which agent runtime is making the request and which task it is authorized for.
 
-**Data flow**: It reads the embedded `AgentIdentityAuth`, extracts its record, builds `AgentIdentityKey` and `AgentTaskAuthorizationTarget`, and calls `authorization_header_for_agent_task`. If that succeeds and parses as an HTTP header value, it inserts `Authorization`. It separately inserts `ChatGPT-Account-ID` from `account_id()` when valid, and inserts `X-OpenAI-Fedramp: true` when `is_fedramp_account()` is true.
+**Data flow**: It reads the stored agent identity record, including the runtime id and private key, and combines that with the current task id. It asks the agent identity library to create an Authorization header, then places that header into the request if it can be built safely. It also adds the ChatGPT account id, and adds a FedRAMP marker header when the account is a FedRAMP account.
 
-**Call relations**: This method is invoked by HTTP request code through the `AuthProvider` trait whenever a provider resolves to agent-identity auth. It does not call other local helpers; its work is the terminal header-construction step.
+**Call relations**: The HTTP layer calls this through the shared AuthProvider interface when it is preparing request headers. This function gathers details from the agent auth object, delegates the signing work to authorization_header_for_agent_task, and writes the finished headers back into the HeaderMap used for the outgoing request.
 
 *Call graph*: calls 4 internal fn (account_id, is_fedramp_account, process_task_id, record); 4 external calls (insert, from_static, from_str, authorization_header_for_agent_task).
 
@@ -1690,11 +1708,11 @@ fn add_auth_headers(&self, headers: &mut HeaderMap)
 fn add_auth_headers(&self, _headers: &mut HeaderMap)
 ```
 
-**Purpose**: Implements a no-op auth provider for providers that should send no auth headers.
+**Purpose**: Intentionally adds no authentication headers. It is used for providers such as local open-source model servers or tests where sending credentials would be unnecessary or wrong.
 
-**Data flow**: It accepts a mutable `HeaderMap` and leaves it unchanged.
+**Data flow**: It receives the request header collection, ignores it, and leaves it unchanged. The before and after are the same: no auth information is added.
 
-**Call relations**: This is used when `resolve_provider_auth` determines that neither provider-owned credentials nor caller auth should be attached.
+**Call relations**: The request-building code calls this through the AuthProvider interface just like any other auth provider. It exists so the rest of the system can use one common path for authenticated and unauthenticated providers without adding special cases later.
 
 
 ##### `unauthenticated_auth_provider`  (lines 65–67)
@@ -1703,11 +1721,11 @@ fn add_auth_headers(&self, _headers: &mut HeaderMap)
 fn unauthenticated_auth_provider() -> SharedAuthProvider
 ```
 
-**Purpose**: Constructs the shared no-auth provider instance used by unauthenticated providers.
+**Purpose**: Creates a reusable shared auth provider that represents “send no credentials.” This gives callers a standard object even when no login is needed.
 
-**Data flow**: It allocates `UnauthenticatedAuthProvider` inside an `Arc` and returns it as `SharedAuthProvider`.
+**Data flow**: It takes no input, wraps an UnauthenticatedAuthProvider in a shared reference-counted pointer, and returns it. The returned object can be cloned and used wherever a normal auth provider is expected.
 
-**Call relations**: This helper is called by `resolve_provider_auth` on the final fallback path when no other auth source applies.
+**Call relations**: resolve_provider_auth calls this when there is no Codex auth snapshot and no provider-specific bearer token or API key. It hands back the no-op provider so later request preparation can proceed normally.
 
 *Call graph*: called by 1 (resolve_provider_auth); 1 external calls (new).
 
@@ -1721,11 +1739,11 @@ fn auth_manager_for_provider(
 ) -> Option<Arc<AuthManager>>
 ```
 
-**Purpose**: Chooses the auth manager that should be associated with a provider at runtime. Providers with command-backed auth get a provider-scoped external bearer manager instead of reusing the caller's base manager.
+**Purpose**: Chooses which auth manager should be used for a specific provider. If the provider declares its own command-backed authentication, this function creates a provider-scoped manager for that; otherwise it keeps the caller’s existing manager.
 
-**Data flow**: It takes an optional existing `Arc<AuthManager>` and a `ModelProviderInfo`. If `provider.auth` is `Some`, it clones that config into `AuthManager::external_bearer_only(config)` and returns the new manager; otherwise it returns the original `auth_manager` unchanged.
+**Data flow**: It receives an optional base AuthManager and the provider description. If the provider has custom auth configuration, it builds a new AuthManager that only supplies an external bearer token. If not, it returns the original manager unchanged.
 
-**Call relations**: This function is used during generic provider construction so command-auth providers can refresh their own bearer tokens independently of any global auth manager.
+**Call relations**: Provider construction code calls this during setup, from its new flow, to decide where future credentials should come from. It delegates custom command-backed auth setup to AuthManager::external_bearer_only.
 
 *Call graph*: calls 1 internal fn (external_bearer_only); called by 1 (new).
 
@@ -1739,11 +1757,11 @@ fn resolve_provider_auth(
 ) -> codex_protocol::error::Result<SharedAuthProvider>
 ```
 
-**Purpose**: Resolves the concrete request-header auth provider for a non-Bedrock model provider, applying provider-owned credentials first and rejecting misplaced Bedrock auth.
+**Purpose**: Picks the final authentication strategy for one provider. It decides between provider-specific bearer auth, normal Codex auth, no auth, or an error for an unsupported credential type.
 
-**Data flow**: It accepts an optional `CodexAuth` reference and a `ModelProviderInfo`. If the auth is `CodexAuth::BedrockApiKey`, it returns `Err(CodexErr::UnsupportedOperation(...))`. Otherwise it asks `bearer_auth_for_provider(provider)` for provider-owned bearer credentials; if present, it wraps and returns them. If not, it converts the supplied auth with `auth_provider_from_auth`, or falls back to `unauthenticated_auth_provider()` when no auth exists.
+**Data flow**: It receives an optional Codex auth snapshot and the provider description. First it rejects Bedrock API key auth in this non-Bedrock path. Then it checks whether the provider itself supplies an API key or bearer token. If so, it returns a BearerAuthProvider for that. If not, it converts the Codex auth snapshot into an auth provider, or returns the unauthenticated provider when there is no auth.
 
-**Call relations**: This is the main auth-resolution entry point used by generic provider request setup and models-endpoint fetching. It delegates to `bearer_auth_for_provider` for provider-configured secrets, `auth_provider_from_auth` for first-party auth snapshots, and `unauthenticated_auth_provider` as the terminal fallback.
+**Call relations**: Tests call this directly to verify the key behaviors. In normal use, provider setup calls it before requests are made. It hands off provider-specific secret lookup to bearer_auth_for_provider, Codex login conversion to auth_provider_from_auth, and no-auth creation to unauthenticated_auth_provider.
 
 *Call graph*: calls 3 internal fn (auth_provider_from_auth, bearer_auth_for_provider, unauthenticated_auth_provider); called by 2 (openai_provider_rejects_bedrock_api_key_auth, unauthenticated_auth_provider_adds_no_headers); 3 external calls (new, matches!, UnsupportedOperation).
 
@@ -1756,11 +1774,11 @@ fn bearer_auth_for_provider(
 ) -> codex_protocol::error::Result<Option<BearerAuthProvider>>
 ```
 
-**Purpose**: Extracts provider-owned bearer credentials from provider configuration. It supports both standard provider API keys and an experimental explicit bearer token field.
+**Purpose**: Looks for authentication secrets that are configured directly on the model provider. These provider-level secrets take priority over the general Codex login.
 
-**Data flow**: It reads `provider.api_key()?`; if present, it returns `Some(BearerAuthProvider::new(api_key))`. Otherwise it checks `provider.experimental_bearer_token.clone()` and returns a bearer provider for that token if present. If neither exists, it returns `Ok(None)`.
+**Data flow**: It reads the provider description. If the provider exposes an API key, it wraps that key in a BearerAuthProvider. If there is no API key but there is an experimental bearer token, it wraps that token instead. If neither exists, it returns None.
 
-**Call relations**: This helper is called only by `resolve_provider_auth` and implements the precedence rule that provider-configured credentials override caller auth.
+**Call relations**: resolve_provider_auth calls this early in its decision process. When this function finds a provider-specific secret, resolve_provider_auth uses it immediately and does not fall back to the broader Codex auth snapshot.
 
 *Call graph*: calls 2 internal fn (api_key, new); called by 1 (resolve_provider_auth).
 
@@ -1771,11 +1789,11 @@ fn bearer_auth_for_provider(
 fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider
 ```
 
-**Purpose**: Converts a first-party `CodexAuth` snapshot into a concrete `SharedAuthProvider` implementation suitable for request headers.
+**Purpose**: Turns a saved Codex authentication snapshot into the kind of object that can add HTTP auth headers. It is the bridge between login state and outgoing request headers.
 
-**Data flow**: It pattern-matches the input auth. `AgentIdentity` becomes `Arc<AgentIdentityAuthProvider { auth: clone }}`. `BedrockApiKey` is marked unreachable because callers should have rejected it earlier. `ApiKey`, `Chatgpt`, `ChatgptAuthTokens`, and `PersonalAccessToken` become `Arc<BearerAuthProvider>` populated from `get_token().ok()`, `get_account_id()`, and `is_fedramp_account()`.
+**Data flow**: It receives a CodexAuth value. For agent identity auth, it clones the agent identity data into an AgentIdentityAuthProvider. For API-key, ChatGPT, token, or personal-access-token auth, it extracts the token, account id, and FedRAMP status and stores them in a BearerAuthProvider. Bedrock API key auth is marked unreachable here because resolve_provider_auth is expected to reject it before this point.
 
-**Call relations**: This function is the fallback conversion path inside `resolve_provider_auth` after provider-owned credentials have been ruled out.
+**Call relations**: resolve_provider_auth calls this after provider-specific auth has been ruled out. The returned shared provider is then used later by request-building code to add the correct headers.
 
 *Call graph*: calls 3 internal fn (get_account_id, get_token, is_fedramp_account); called by 1 (resolve_provider_auth); 3 external calls (new, clone, unreachable!).
 
@@ -1786,11 +1804,11 @@ fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider
 fn unauthenticated_auth_provider_adds_no_headers()
 ```
 
-**Purpose**: Verifies that a provider with no auth requirements resolves to an auth provider that leaves headers empty.
+**Purpose**: Checks that a provider which does not require OpenAI authentication really sends no auth headers. This protects local or open-source provider support from accidentally leaking credentials.
 
-**Data flow**: It creates an OSS provider with a localhost base URL, calls `resolve_provider_auth(None, &provider)`, converts the result to headers, and asserts the header map is empty.
+**Data flow**: It creates a local-style provider, asks resolve_provider_auth to choose auth with no Codex login supplied, then converts the result into headers. The expected output is an empty header set.
 
-**Call relations**: This test covers the final fallback branch in `resolve_provider_auth`, including construction of `UnauthenticatedAuthProvider`.
+**Call relations**: This test exercises resolve_provider_auth’s no-auth branch. It confirms that resolve_provider_auth reaches unauthenticated_auth_provider and that the resulting provider leaves the header map empty.
 
 *Call graph*: calls 1 internal fn (resolve_provider_auth); 2 external calls (assert!, create_oss_provider_with_base_url).
 
@@ -1801,11 +1819,11 @@ fn unauthenticated_auth_provider_adds_no_headers()
 fn openai_provider_rejects_bedrock_api_key_auth()
 ```
 
-**Purpose**: Checks that Bedrock API-key auth cannot be used with an ordinary OpenAI provider.
+**Purpose**: Checks that a Bedrock API key is not accepted for an OpenAI provider. This prevents a credential meant for Amazon Bedrock from being used in the wrong place.
 
-**Data flow**: It creates an OpenAI provider and a `CodexAuth::BedrockApiKey`, calls `resolve_provider_auth(Some(&auth), &provider)`, matches the result, and asserts the error is `CodexErr::UnsupportedOperation` with the exact unsupported-message constant.
+**Data flow**: It creates an OpenAI provider and a fake Bedrock API key auth value, then asks resolve_provider_auth to resolve it. The expected result is an UnsupportedOperation error containing the specific Bedrock-only message; any success or different error fails the test.
 
-**Call relations**: This test validates the early rejection guard at the top of `resolve_provider_auth`.
+**Call relations**: This test exercises the early rejection path inside resolve_provider_auth. It verifies that the function stops before building any auth provider and returns the documented error message.
 
 *Call graph*: calls 2 internal fn (create_openai_provider, resolve_provider_auth); 3 external calls (assert_eq!, BedrockApiKey, panic!).
 
@@ -1817,11 +1835,11 @@ Implements Bedrock-specific endpoint resolution and auth selection on top of AWS
 
 `config` · `config load`
 
-This file contains the AWS SDK integration layer used by `AwsAuthContext::load`. `load_sdk_config` validates one critical invariant up front: `AwsAuthConfig.service` must not be blank after trimming. It then starts from `aws_config::defaults(BehaviorVersion::latest())` and conditionally applies the configured profile name and region override before asynchronously loading the final `SdkConfig`.
+AWS clients need a few pieces of information before they can talk to AWS: which service is being used, which account credentials to sign requests with, and which AWS region to target. This file is the bridge between the project’s own `AwsAuthConfig` and the official AWS SDK setup machinery.
 
-The other two helpers turn optional SDK outputs into explicit crate-level errors. `credentials_provider` extracts the SDK’s resolved credentials provider and fails with `AwsAuthError::MissingCredentialsProvider` if the SDK did not produce one. `resolved_region` similarly converts the SDK’s optional region into an owned `String`, failing with `AwsAuthError::MissingRegion` when absent.
+The main flow starts by checking that the configured AWS service name is not blank. That matters because AWS request signing depends on the service name; without it, the system would not know what kind of AWS request it is preparing. Then it builds an SDK loader using the AWS SDK’s current behavior rules. If the user supplied an AWS profile, like a named section in an AWS credentials file, it tells the loader to use that. If the user supplied a region, it tells the loader to use that too. Finally, it asks the SDK to load the full configuration, which may include reading environment variables, local AWS config files, or other standard AWS sources.
 
-The design keeps AWS-specific loading concerns isolated from signing logic. It also means `AwsAuthContext::load` receives already-validated, concrete pieces: a `SharedCredentialsProvider`, a resolved region string, and the trimmed service name. That separation makes retryability and signing errors easier to reason about later, because configuration resolution failures are surfaced early and with dedicated error variants.
+After loading, the helper functions pull out the credential provider and resolved region. A credential provider is like a safe key dispenser: it knows how to fetch usable AWS credentials when needed. If either credentials or region are missing, this file returns clear project-specific errors instead of letting the failure appear later in a more confusing place.
 
 #### Function details
 
@@ -1831,11 +1849,11 @@ The design keeps AWS-specific loading concerns isolated from signing logic. It a
 async fn load_sdk_config(config: &AwsAuthConfig) -> Result<SdkConfig, AwsAuthError>
 ```
 
-**Purpose**: Builds and asynchronously loads an AWS `SdkConfig` from `AwsAuthConfig`, applying optional profile and region overrides. It rejects empty or whitespace-only service names before touching the SDK.
+**Purpose**: Builds an AWS SDK configuration from the project’s AWS authentication settings. It refuses to continue if the AWS service name is empty, because request signing needs a real service name.
 
-**Data flow**: Reads `config.service`, `config.profile`, and `config.region`. If the trimmed service is empty it returns `AwsAuthError::EmptyService`; otherwise it creates an AWS config loader with latest behavior version, conditionally sets profile and region, awaits `load()`, and returns the resulting `SdkConfig`.
+**Data flow**: It receives an `AwsAuthConfig`, reads the service name, optional profile, and optional region, then creates an AWS SDK configuration loader. It adds the profile and region when they are present, waits for the SDK to load the full configuration, and returns either that completed `SdkConfig` or an `AwsAuthError` if the service name was blank.
 
-**Call relations**: It is called by `AwsAuthContext::load` as the first step in constructing a signing context.
+**Call relations**: This is called by `load` when the broader authentication setup begins. Inside, it relies on the AWS SDK’s default configuration loader, using the latest SDK behavior rules and creating a region value when the caller supplied one.
 
 *Call graph*: called by 1 (load); 3 external calls (latest, new, defaults).
 
@@ -1848,11 +1866,11 @@ fn credentials_provider(
 ) -> Result<SharedCredentialsProvider, AwsAuthError>
 ```
 
-**Purpose**: Extracts the resolved credentials provider from an AWS `SdkConfig`. It converts the SDK’s optional provider into a required value for this crate.
+**Purpose**: Extracts the AWS credential provider from an already-loaded SDK configuration. This confirms that the SDK knows where to get credentials before the rest of the authentication code tries to sign requests.
 
-**Data flow**: Borrows `sdk_config`, calls `credentials_provider()`, and returns the `SharedCredentialsProvider` on success or `AwsAuthError::MissingCredentialsProvider` if absent.
+**Data flow**: It receives an `SdkConfig`, asks it for its credential provider, and returns that provider if one exists. If the SDK configuration has no credential provider, it returns a `MissingCredentialsProvider` error instead.
 
-**Call relations**: It is called by `AwsAuthContext::load` after SDK config loading succeeds.
+**Call relations**: This is called by `load` after the SDK configuration has been loaded. It hands back the credential source that later authentication work needs in order to obtain AWS signing credentials.
 
 *Call graph*: called by 1 (load); 1 external calls (credentials_provider).
 
@@ -1863,11 +1881,11 @@ fn credentials_provider(
 fn resolved_region(sdk_config: &SdkConfig) -> Result<String, AwsAuthError>
 ```
 
-**Purpose**: Extracts the resolved AWS region from an AWS `SdkConfig` as an owned string. It treats missing region resolution as a hard configuration error.
+**Purpose**: Finds the final AWS region chosen by the SDK configuration and returns it as plain text. This makes sure the system has a concrete region to use for AWS signing and requests.
 
-**Data flow**: Borrows `sdk_config`, calls `region()`, converts the region to `String` with `ToString`, and returns it or `AwsAuthError::MissingRegion` if no region is present.
+**Data flow**: It receives an `SdkConfig`, reads the region that the SDK resolved from explicit settings, environment variables, or AWS config files, and converts it to a string. If no region was found, it returns a `MissingRegion` error.
 
-**Call relations**: It is called by `AwsAuthContext::load` alongside `credentials_provider` to finalize the auth context.
+**Call relations**: This is called by `load` after configuration loading is complete. It supplies the resolved region to the rest of the authentication setup, so later code does not have to guess or repeat the SDK lookup.
 
 *Call graph*: called by 1 (load); 1 external calls (region).
 
@@ -1876,11 +1894,11 @@ fn resolved_region(sdk_config: &SdkConfig) -> Result<String, AwsAuthError>
 
 `domain_logic` · `request signing`
 
-This file converts `AwsRequestToSign` into the AWS SigV4 library’s expected structures and then applies the resulting signing instructions back onto an `http::Request`. The main function, `sign_request`, first walks the incoming `HeaderMap` and converts each header value to UTF-8 text, failing with `AwsAuthError::InvalidHeaderValue` if any header cannot be represented as a string. Those headers, along with the method, URL, and raw body bytes, are used to build an `aws_sigv4::http_request::SignableRequest`.
+AWS services usually do not accept a plain request with just a password-like token. Instead, the client must add a special cryptographic signature to the request. This file is the small bridge between this project’s request type and Amazon’s official Signature Version 4 signing library. Think of it like sealing an envelope with a tamper-proof stamp: the request still has the same destination and content, but now it carries proof of who sent it and when.
 
-It then clones the provided `Credentials` into an identity, builds `v4::SigningParams` with region, service name, explicit signing time, and default signing settings, and calls `aws_sigv4::http_request::sign`. Any failure in request construction, signing parameter construction, or signing itself is mapped into a distinct `AwsAuthError` variant.
+The main function takes AWS credentials, the target region, the AWS service name, the request to send, and the time to use for signing. It first converts the request headers into a form the AWS signing library can read. If any header contains text that cannot safely be used, it returns an error instead of producing a bad signature. It then builds a signable version of the request, creates signing settings, asks the AWS library to calculate the signature, and applies the resulting header changes to an HTTP request object.
 
-After signing, the function reparses the URL into an `http::Uri`, constructs an empty-body `http::Request<()>`, restores the original headers, and applies the signing instructions in HTTP/1.x form. The returned `AwsSignedRequest` contains the final URL string and cloned signed headers. The test-only `header_value` helper extracts UTF-8 header values from a `HeaderMap` for assertions.
+The result is not the full request body again. It returns the signed URL and signed headers, which are the parts needed by the rest of the system to send an authenticated request. The file also includes a tiny test-only helper for reading header values as strings.
 
 #### Function details
 
@@ -1896,11 +1914,11 @@ fn sign_request(
 ) -> Result<AwsSignedRequest, AwsAuthError>
 ```
 
-**Purpose**: Builds a signable AWS request, computes SigV4 headers for the given credentials/region/service/time, and returns the signed URL and headers. It is the concrete implementation behind `AwsAuthContext::sign_at`.
+**Purpose**: Adds AWS Signature Version 4 authentication information to a request. Someone uses this when they have a request ready to send to AWS and need AWS to trust that it came from the owner of the supplied credentials.
 
-**Data flow**: Consumes borrowed `Credentials`, borrowed region and service strings, an `AwsRequestToSign`, and a `SystemTime`. It converts request headers into `(name, utf8_value)` pairs, builds a `SignableRequest`, clones credentials into an identity, builds signing params, signs the request, reparses the URL into `Uri`, constructs an `http::Request<()>`, restores original headers, applies signing instructions, and returns `AwsSignedRequest { url, headers }`. Errors are mapped into `AwsAuthError` variants at each conversion/signing step.
+**Data flow**: It receives AWS credentials, a region such as where the AWS service lives, a service name, a request containing method, URL, headers, and body, plus the time to sign with. It converts the headers and body into the AWS signing library’s expected shape, builds signing parameters, asks the library to compute the signature, and applies the resulting changes to a temporary HTTP request. It returns a new signed request containing the final URL and headers, or an error if any part could not be converted, signed, or rebuilt safely.
 
-**Call relations**: It is called only from `AwsAuthContext::sign_at`, which supplies resolved credentials and signer configuration.
+**Call relations**: This function is called by sign_at, which supplies the exact signing time. Inside, it relies on outside library builders and signing routines to do the cryptographic work rather than implementing the signature math itself. After the external signing function produces instructions, this function applies those instructions to the HTTP request so the rest of the project can send it as an authenticated AWS request.
 
 *Call graph*: called by 1 (sign_at); 8 external calls (clone, Bytes, new, default, from_str, sign, builder, builder).
 
@@ -1911,24 +1929,26 @@ fn sign_request(
 fn header_value(headers: &http::HeaderMap, name: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts a named header as a UTF-8 `String` for tests. It is a convenience helper for asserting on signed header contents.
+**Purpose**: Reads one header from a header map and returns it as ordinary text, but only in test builds. It is a convenience helper for tests that need to check whether signing added the expected header value.
 
-**Data flow**: Borrows a `HeaderMap` and header name, looks up the header, converts it to `&str` if valid UTF-8, clones it into `String`, and returns `Option<String>`.
+**Data flow**: It receives a collection of HTTP headers and the name of the header to look up. It searches for that header, tries to interpret its value as valid text, and returns that text as a String if everything succeeds. If the header is missing or cannot be read as text, it returns nothing.
 
-**Call relations**: It is used only by tests in `aws-auth/src/lib.rs` to inspect signing output.
+**Call relations**: This helper is only compiled for tests. It uses the header map’s lookup operation to make assertions easier, so tests can focus on the meaning of a signed header instead of repeatedly writing the same conversion code.
 
 *Call graph*: 1 external calls (get).
 
 
 ### `aws-auth/src/lib.rs`
 
-`domain_logic` · `request signing`
+`io_transport` · `startup and request handling`
 
-This file exposes the types consumers use to configure and perform AWS SigV4 signing. `AwsAuthConfig` carries optional profile and region plus the required service name. `AwsRequestToSign` is a generic HTTP request shape with `Method`, URL string, `HeaderMap`, and raw `Bytes` body; `AwsSignedRequest` returns the signed URL and headers. `AwsAuthError` enumerates configuration, credential, URI/header conversion, and signing failures with precise variants.
+AWS services usually require requests to be signed with SigV4, Amazon’s request-signing scheme that proves who sent the request and that it was not changed in transit. This file gives the rest of the project a small, simple wrapper around that process. Without it, callers would need to know how to find AWS credentials, choose a region, build the right signing inputs, and decide which failures are worth retrying.
 
-`AwsAuthContext` is the loaded signer state: a `SharedCredentialsProvider`, resolved region string, and trimmed service string. Its custom `Debug` implementation intentionally omits credentials and prints only non-sensitive fields. `load` delegates SDK resolution to the `config` module, then stores the provider and resolved region while normalizing the service name with `trim()`. `sign` is the public convenience method that signs at `SystemTime::now()`, while `sign_at` exists for deterministic testing and delegates the actual SigV4 transformation to `signing::sign_request` after asynchronously fetching credentials.
+The main type is AwsAuthContext. Think of it like a stamped envelope kit: once it has loaded the right credentials, region, and service name, callers can hand it an HTTP request and get back the same request with the AWS signature headers added. AwsAuthConfig is the setup form for that kit: optional profile, optional region, and the AWS service name. AwsRequestToSign and AwsSignedRequest are plain containers for the request before and after signing.
 
-The file also defines retry semantics through `AwsAuthError::is_retryable`. Only transient credential-provider failures (`ProviderTimedOut` and `ProviderError`) are considered retryable; malformed input, missing config, and deterministic signing/build failures are not. Tests verify header preservation, session-token propagation, empty-service rejection, and the retryability classification.
+The file also defines AwsAuthError, which turns many possible setup and signing failures into clear project-level errors. One important detail is retry behavior: temporary credential-provider failures may be worth trying again, but broken inputs such as an invalid URL or missing region are treated as fixed problems that retrying will not solve.
+
+The tests use fixed credentials and time values so the signing behavior is predictable. They check that existing headers survive, signature headers are added, session tokens are included, and empty service names are rejected.
 
 #### Function details
 
@@ -1938,11 +1958,11 @@ The file also defines retry semantics through `AwsAuthError::is_retryable`. Only
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats `AwsAuthContext` for debugging without exposing credential material. It shows only region and service and marks the struct as non-exhaustive.
+**Purpose**: This controls how an AwsAuthContext is shown in debug output. It deliberately shows the region and service, but not the credentials, so logs can be useful without leaking secrets.
 
-**Data flow**: Reads `self.region` and `self.service`, writes them into a `DebugStruct`, omits `credentials_provider`, and returns the formatter result.
+**Data flow**: It receives the authentication context and a debug formatter. It writes a short debug view containing the region and service, then returns the formatter result. The hidden credential provider is not printed.
 
-**Call relations**: This is Rust trait plumbing used whenever the context is debug-printed; it supports safe observability around the signer state.
+**Call relations**: This is called automatically by Rust’s debug-printing machinery when someone formats AwsAuthContext for diagnostics. It hands the work to the standard debug builder so the output looks like other Rust debug output.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1953,11 +1973,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 async fn load(config: AwsAuthConfig) -> Result<Self, AwsAuthError>
 ```
 
-**Purpose**: Resolves AWS SDK configuration into a reusable signing context. It validates config indirectly through the config helpers and stores the normalized service name.
+**Purpose**: This builds a ready-to-use AWS authentication context from user configuration. Callers use it before sending signed AWS requests.
 
-**Data flow**: Consumes an `AwsAuthConfig`, awaits `config::load_sdk_config(&config)`, extracts a `SharedCredentialsProvider` and region string via `config::credentials_provider` and `config::resolved_region`, trims `config.service`, and returns a populated `AwsAuthContext`.
+**Data flow**: It takes an AwsAuthConfig containing an optional profile, optional region, and service name. It asks the config module to load AWS SDK settings, extracts a credentials provider and resolved region, trims the service name, and returns an AwsAuthContext. If credentials, region, or service setup cannot be resolved, it returns an AwsAuthError instead.
 
-**Call relations**: It is called by higher-level auth resolution code and by a test that verifies empty service names are rejected. It delegates all SDK loading details to `aws-auth/src/config.rs`.
+**Call relations**: This is the setup step used by higher-level authentication selection, including resolve_auth_method. In tests, load_rejects_empty_service_name calls it to confirm invalid service names fail early. Internally it relies on load_sdk_config, credentials_provider, and resolved_region to do the AWS SDK-specific setup.
 
 *Call graph*: calls 3 internal fn (credentials_provider, load_sdk_config, resolved_region); called by 2 (load_rejects_empty_service_name, resolve_auth_method).
 
@@ -1968,11 +1988,11 @@ async fn load(config: AwsAuthConfig) -> Result<Self, AwsAuthError>
 fn region(&self) -> &str
 ```
 
-**Purpose**: Returns the resolved AWS region stored in the auth context. It is a simple accessor for callers that need to inspect signer configuration.
+**Purpose**: This returns the AWS region stored in the loaded authentication context. It lets other code inspect which region will be used for signing.
 
-**Data flow**: Borrows `self` and returns `&self.region`.
+**Data flow**: It reads the region string already stored in the context and returns it as borrowed text. It does not change anything.
 
-**Call relations**: This is a leaf accessor used by consumers of the loaded context.
+**Call relations**: This is a small accessor for callers that need to report or use the resolved region after AwsAuthContext::load has completed.
 
 
 ##### `AwsAuthContext::service`  (lines 96–98)
@@ -1981,11 +2001,11 @@ fn region(&self) -> &str
 fn service(&self) -> &str
 ```
 
-**Purpose**: Returns the normalized AWS service name stored in the auth context. It exposes the service used for SigV4 scope construction.
+**Purpose**: This returns the AWS service name stored in the loaded authentication context. The service name is part of the AWS signature, so callers may need to inspect it for diagnostics or routing.
 
-**Data flow**: Borrows `self` and returns `&self.service`.
+**Data flow**: It reads the service string already stored in the context and returns it as borrowed text. It does not change the context.
 
-**Call relations**: This is a leaf accessor used by consumers of the loaded context.
+**Call relations**: This is a small accessor used after the context has been loaded, giving other parts of the program a safe read-only view of the service name.
 
 
 ##### `AwsAuthContext::sign`  (lines 100–102)
@@ -1994,11 +2014,11 @@ fn service(&self) -> &str
 async fn sign(&self, request: AwsRequestToSign) -> Result<AwsSignedRequest, AwsAuthError>
 ```
 
-**Purpose**: Signs a request using the current wall-clock time. It is the public convenience API for normal request signing.
+**Purpose**: This signs an outgoing HTTP request using the current time. It is the normal method callers use right before sending a request to AWS.
 
-**Data flow**: Consumes an `AwsRequestToSign`, reads the current `SystemTime::now()`, forwards both to `self.sign_at`, and returns the resulting `AwsSignedRequest` or `AwsAuthError`.
+**Data flow**: It takes an unsigned request containing method, URL, headers, and body. It gets the current system time, passes the request and time to sign_at, and returns the signed URL and headers or an authentication error.
 
-**Call relations**: It is invoked by higher-level outbound auth application code. Internally it delegates all real work to `AwsAuthContext::sign_at`.
+**Call relations**: This is called by apply_auth during request preparation. It delegates the real work to sign_at so production code can use the current time while tests can use a fixed time.
 
 *Call graph*: calls 1 internal fn (sign_at); called by 1 (apply_auth); 1 external calls (now).
 
@@ -2013,11 +2033,11 @@ async fn sign_at(
     ) -> Result<AwsSignedRequest, AwsAuthError>
 ```
 
-**Purpose**: Signs a request at an explicit timestamp, mainly to support deterministic tests. It first resolves credentials, then performs SigV4 signing with the stored region and service.
+**Purpose**: This does the actual signing work for a request at a specific time. The fixed time makes signing testable and repeatable.
 
-**Data flow**: Consumes an `AwsRequestToSign` and a `SystemTime`, awaits `self.credentials_provider.provide_credentials()`, then passes the credentials, `self.region`, `self.service`, request, and time into `signing::sign_request`; returns the signed request or any propagated auth/signing error.
+**Data flow**: It receives an unsigned request and a timestamp. It asks the stored credentials provider for AWS credentials, then passes those credentials, the context’s region and service, the request, and the time to the signing module. The result is a signed request or an AwsAuthError.
 
-**Call relations**: It is called by `AwsAuthContext::sign` in production and directly by tests that need stable timestamps. It delegates the HTTP/SigV4 transformation to `aws-auth/src/signing.rs`.
+**Call relations**: AwsAuthContext::sign calls this with the current time. The unit tests call it directly with a fixed timestamp so they can make stable assertions. It hands the low-level SigV4 work to signing::sign_request after credentials have been fetched.
 
 *Call graph*: calls 1 internal fn (sign_request); called by 1 (sign); 1 external calls (provide_credentials).
 
@@ -2028,11 +2048,11 @@ async fn sign_at(
 fn is_retryable(&self) -> bool
 ```
 
-**Purpose**: Classifies auth errors by whether retrying the outbound request could plausibly succeed. Only transient credential-provider failures are treated as retryable.
+**Purpose**: This answers a practical question: if authentication failed, is it worth trying the request again? It marks temporary credential-provider problems as retryable and fixed input/configuration problems as not retryable.
 
-**Data flow**: Borrows `self`, pattern-matches on the error variant, and returns `true` only for `AwsAuthError::Credentials` wrapping `ProviderTimedOut` or `ProviderError`; all other variants return `false`.
+**Data flow**: It reads the specific AwsAuthError variant. If the error came from loading credentials, it checks whether the credential provider timed out or reported a provider-side problem. It returns true for those temporary-looking cases and false for all deterministic failures such as bad URLs, missing region, or signing construction errors.
 
-**Call relations**: It is consumed by higher-level error translation logic to decide retry behavior. Tests in this file cover both retryable and non-retryable cases.
+**Call relations**: aws_auth_error_to_auth_error calls this when converting AWS authentication failures into the project’s broader authentication error type. That lets higher-level retry logic make a sensible decision without knowing AWS-specific error details.
 
 *Call graph*: called by 1 (aws_auth_error_to_auth_error); 1 external calls (matches!).
 
@@ -2043,11 +2063,11 @@ fn is_retryable(&self) -> bool
 fn test_context(session_token: Option<&str>) -> AwsAuthContext
 ```
 
-**Purpose**: Builds a deterministic `AwsAuthContext` backed by static test credentials. It optionally includes a session token to exercise token propagation.
+**Purpose**: This builds a fake AwsAuthContext for tests using known example credentials. It avoids depending on real AWS accounts or local machine configuration.
 
-**Data flow**: Takes an optional session-token string, constructs `Credentials`, wraps them in `SharedCredentialsProvider`, fills fixed region and service strings, and returns the resulting `AwsAuthContext`.
+**Data flow**: It receives an optional session token. It creates static AWS credentials, wraps them in a shared credentials provider, and returns an AwsAuthContext for region us-east-1 and service bedrock.
 
-**Call relations**: It is a shared fixture for signing tests in this file.
+**Call relations**: The signing tests call this helper when they need a predictable context. It supplies the credentials that sign_at later uses, making the tests self-contained.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -2058,11 +2078,11 @@ fn test_context(session_token: Option<&str>) -> AwsAuthContext
 fn test_request() -> AwsRequestToSign
 ```
 
-**Purpose**: Builds a representative Bedrock HTTP request with headers and JSON body for signing tests. It provides stable input for verifying header preservation and SigV4 additions.
+**Purpose**: This creates a sample HTTP request for signing tests. It includes a JSON body and a couple of existing headers so tests can check that signing does not erase caller-provided headers.
 
-**Data flow**: Creates a `HeaderMap`, inserts `content-type` and `x-test-header`, constructs an `AwsRequestToSign` with POST method, fixed URL, those headers, and a static JSON `Bytes` body, and returns it.
+**Data flow**: It creates a new header map, inserts content-type and x-test-header values, then returns an AwsRequestToSign with POST method, a Bedrock Runtime URL, those headers, and a small JSON body.
 
-**Call relations**: It is used by the signing tests that call `sign_at`.
+**Call relations**: The signing tests call this helper before passing the request to sign_at. It provides a consistent before-signing request shape for assertions.
 
 *Call graph*: 3 external calls (from_static, new, from_static).
 
@@ -2073,11 +2093,11 @@ fn test_request() -> AwsRequestToSign
 async fn sign_adds_sigv4_headers_and_preserves_existing_headers()
 ```
 
-**Purpose**: Verifies that signing adds SigV4 metadata while leaving original headers and URL intact. It checks both preservation and augmentation behavior.
+**Purpose**: This test proves that signing adds the AWS SigV4 headers while keeping headers that were already present. It protects against a common bug where authentication code accidentally rebuilds a request and drops user headers.
 
-**Data flow**: Creates a test context without session token, signs a fixed request at a fixed UNIX timestamp, then asserts that original headers remain, the URL is unchanged, and `authorization` plus `x-amz-date` headers were added.
+**Data flow**: It builds a test context without a session token and a sample request. It signs the request at a fixed time, then checks that content-type and x-test-header are still present, the URL is unchanged, an Authorization header was added, and an x-amz-date header exists.
 
-**Call relations**: It directly exercises `AwsAuthContext::sign_at` and indirectly `signing::sign_request`.
+**Call relations**: This test uses tests::test_context and tests::test_request to set up predictable inputs. It exercises AwsAuthContext::sign_at, which then calls the real signing path.
 
 *Call graph*: 5 external calls (from_secs, assert!, assert_eq!, test_context, test_request).
 
@@ -2088,11 +2108,11 @@ async fn sign_adds_sigv4_headers_and_preserves_existing_headers()
 fn credentials_provider_failures_are_retryable()
 ```
 
-**Purpose**: Verifies that transient credential-provider failures are classified as retryable. This documents the intended retry policy boundary.
+**Purpose**: This test confirms that temporary credential-loading problems are marked as retryable. That matters because a later attempt might succeed if a provider was briefly unavailable or slow.
 
-**Data flow**: Constructs `AwsAuthError::Credentials` values for provider error and provider timeout cases, calls `is_retryable`, and asserts both return true.
+**Data flow**: It creates two credential errors: one provider error and one timeout. It wraps each in AwsAuthError::Credentials and checks that is_retryable returns true.
 
-**Call relations**: It targets the positive branches of `AwsAuthError::is_retryable`.
+**Call relations**: This test directly exercises AwsAuthError::is_retryable. It supports the higher-level retry behavior used when AWS authentication errors are converted for the rest of the system.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2103,11 +2123,11 @@ fn credentials_provider_failures_are_retryable()
 fn deterministic_aws_auth_errors_are_not_retryable()
 ```
 
-**Purpose**: Verifies that deterministic configuration and credential failures are not marked retryable. This prevents pointless retries on malformed or absent configuration.
+**Purpose**: This test confirms that fixed problems are not treated as retryable. Retrying cannot fix an empty service name, missing credential source, invalid configuration, or unexpected credential error classified as non-temporary.
 
-**Data flow**: Constructs several non-transient `AwsAuthError` values, including empty service and multiple credential error kinds, calls `is_retryable`, and asserts each returns false.
+**Data flow**: It creates several deterministic authentication errors and checks that is_retryable returns false for each one.
 
-**Call relations**: It targets the negative branches of `AwsAuthError::is_retryable`.
+**Call relations**: This test directly exercises AwsAuthError::is_retryable. It guards the boundary between useful retries and pointless repeated failures.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2118,11 +2138,11 @@ fn deterministic_aws_auth_errors_are_not_retryable()
 async fn sign_includes_session_token_when_credentials_have_one()
 ```
 
-**Purpose**: Verifies that temporary-session credentials produce the `x-amz-security-token` header during signing. This is required for AWS session-based auth to work.
+**Purpose**: This test checks that temporary AWS credentials include their session token in the signed request. AWS rejects temporary credentials if the token is missing, even when the access key and signature are present.
 
-**Data flow**: Creates a test context with a session token, signs the fixed request at a fixed timestamp, and asserts the signed headers contain the expected security token value.
+**Data flow**: It builds a test context with a session token, signs a sample request at a fixed time, and verifies that the signed headers contain x-amz-security-token with the expected token value.
 
-**Call relations**: It exercises `AwsAuthContext::sign_at` with credential state that changes the signing output.
+**Call relations**: This test uses tests::test_context and tests::test_request, then exercises AwsAuthContext::sign_at. It verifies that the signing module receives and preserves session-token information from the credentials.
 
 *Call graph*: 4 external calls (from_secs, assert_eq!, test_context, test_request).
 
@@ -2133,22 +2153,24 @@ async fn sign_includes_session_token_when_credentials_have_one()
 async fn load_rejects_empty_service_name()
 ```
 
-**Purpose**: Verifies that loading an auth context fails when the configured service name is blank after trimming. This protects later signing code from invalid SigV4 scope input.
+**Purpose**: This test makes sure an all-whitespace AWS service name is rejected during context loading. The service name is required for SigV4 signing, so accepting an empty one would cause confusing failures later.
 
-**Data flow**: Calls `AwsAuthContext::load` with `service` set to whitespace and no profile/region overrides, awaits the error, and asserts the rendered message matches the `EmptyService` variant.
+**Data flow**: It calls AwsAuthContext::load with no profile, no region, and a service string containing only spaces. It expects loading to fail and checks that the error message says the AWS service name must not be empty.
 
-**Call relations**: It exercises the validation path reached through `config::load_sdk_config` from `AwsAuthContext::load`.
+**Call relations**: This test calls AwsAuthContext::load directly. Through that path it verifies that the setup code refuses invalid service configuration before any request signing happens.
 
 *Call graph*: calls 1 internal fn (load); 1 external calls (assert_eq!).
 
 
 ### `model-provider/src/amazon_bedrock/auth.rs`
 
-`domain_logic` · `provider auth resolution and per-request signing for Amazon Bedrock`
+`io_transport` · `startup and request handling`
 
-This module encapsulates all Bedrock auth branching. `BedrockAuthMethod` is the internal enum describing the three supported modes: a managed bearer token supplied by login state, a bearer token from `AWS_BEARER_TOKEN_BEDROCK`, or full AWS SDK auth via `AwsAuthContext`. `resolve_auth_method` chooses among them in priority order: managed auth wins first, then a non-empty env bearer token, and finally SDK-based auth loaded from `aws_auth_config(aws)`. When bearer-token auth is selected, `bearer_token_region` resolves the required region from `model_providers.amazon-bedrock.aws.region`, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, trimming whitespace and failing with a fatal `CodexErr` if none are set. `resolve_provider_auth` turns the chosen method into a `SharedAuthProvider`, either a simple `BearerAuthProvider` or a `BedrockMantleSigV4AuthProvider` wrapped in `Arc`.
+Amazon Bedrock can accept more than one kind of authentication. This file is the switchboard that chooses the right one and prepares outgoing requests so Bedrock will trust them. First it looks for a managed Bedrock API key that was already supplied by the login/config system. If that is not present, it checks the AWS_BEARER_TOKEN_BEDROCK environment variable. If neither bearer-token path is available, it falls back to AWS SDK-style authentication, where credentials are found from the normal AWS setup and each request is signed with SigV4.
 
-Error conversion helpers map `AwsAuthError` into either fatal Codex errors during setup or retryable/non-retryable `AuthError` values during request signing. The Bedrock-specific transport quirk is handled by `remove_headers_not_preserved_by_bedrock_mantle`: any header whose name contains an underscore is removed before signing because Mantle drops those legacy OpenAI-compatibility headers before SigV4 verification. `BedrockMantleSigV4AuthProvider::apply_auth` prepares the request body for sending, signs method/url/headers/body through `AwsAuthContext::sign`, then replaces the request URL and headers with the signed versions, rewrites the body as raw bytes, and disables compression. The embedded tests cover region precedence, missing-region failure, and underscore-header stripping.
+The bearer-token path is like showing a pass at the door: the request gets an Authorization: Bearer ... header. For that mode, the code must also know the AWS region, so it looks in provider config first, then AWS_REGION, then AWS_DEFAULT_REGION.
+
+The SigV4 path is stricter. Before signing, the file removes headers containing underscores because Bedrock Mantle does not preserve those headers before checking the signature. If Codex signed headers that Bedrock later dropped, the signature would no longer match and the request would fail. Then it prepares the body as raw bytes, asks the AWS auth context to sign the method, URL, headers, and body, and replaces the request with the signed version.
 
 #### Function details
 
@@ -2161,11 +2183,11 @@ async fn resolve_auth_method(
 ) -> Result<BedrockAuthMethod>
 ```
 
-**Purpose**: Chooses which Bedrock authentication mechanism to use based on managed login state, environment variables, and AWS config.
+**Purpose**: Chooses the concrete authentication method Codex should use for Amazon Bedrock. It prefers an explicitly managed Bedrock API key, then an environment bearer token, and finally AWS SDK credential signing.
 
-**Data flow**: It takes an optional `&BedrockApiKeyAuth` and `&ModelProviderAwsAuthInfo`. If managed auth is present, it returns `BedrockAuthMethod::ManagedBearerToken` with cloned token and region. Otherwise it checks `AWS_BEARER_TOKEN_BEDROCK` via `non_empty_env_var_from`; if present, it resolves the region with `bearer_token_region` and returns `EnvBearerToken`. If neither bearer-token source is available, it builds AWS auth config with `aws_auth_config(aws)`, asynchronously loads an `AwsAuthContext`, maps any `AwsAuthError` through `aws_auth_error_to_codex_error`, and returns `AwsSdkAuth { context }`.
+**Data flow**: It receives optional managed Bedrock login data and AWS provider settings. It checks those inputs and selected environment variables, builds either a bearer-token choice with a region or loads an AWS authentication context, then returns the chosen BedrockAuthMethod or a fatal error if AWS auth cannot be loaded.
 
-**Call relations**: Both `resolve_provider_auth` and a separate region-resolution path call this as the central Bedrock auth-selection routine. It delegates env-var normalization, region lookup, and AWS SDK context loading to helpers.
+**Call relations**: resolve_provider_auth calls this when it needs an actual auth provider object. Another Bedrock flow, resolve_region, also calls it when it needs to know which auth route and region apply. Inside, it uses non_empty_env_var_from to read clean environment values, bearer_token_region to find a region for token auth, aws_auth_config to build AWS settings, and AwsAuthContext::load to initialize AWS signing.
 
 *Call graph*: calls 4 internal fn (load, bearer_token_region, non_empty_env_var_from, aws_auth_config); called by 2 (resolve_provider_auth, resolve_region).
 
@@ -2179,11 +2201,11 @@ async fn resolve_provider_auth(
 ) -> Result<SharedAuthProvider>
 ```
 
-**Purpose**: Builds the concrete shared auth provider object corresponding to the resolved Bedrock auth method.
+**Purpose**: Turns the chosen Bedrock authentication method into the shared AuthProvider object used by the request-sending code. This hides whether Bedrock is using a bearer token or SigV4 signing from the rest of the client.
 
-**Data flow**: It takes optional managed auth and AWS config, awaits `resolve_auth_method`, then matches the result. For managed or env bearer-token methods it constructs a `BearerAuthProvider` with the token and no account metadata, wraps it in `Arc`, and returns it as `SharedAuthProvider`. For `AwsSdkAuth` it constructs `BedrockMantleSigV4AuthProvider::new(context)`, wraps that in `Arc`, and returns it.
+**Data flow**: It receives the same managed-auth and AWS configuration inputs as resolve_auth_method. After resolve_auth_method returns a choice, it wraps a BearerAuthProvider for token auth or creates a BedrockMantleSigV4AuthProvider for AWS signing, then returns it behind a shared pointer so other code can use it uniformly.
 
-**Call relations**: Higher-level provider setup calls this after deciding to use the Bedrock provider. It delegates the actual auth-mode decision to `resolve_auth_method` and then adapts that decision into the trait object expected by the client layer.
+**Call relations**: This is the bridge between auth selection and request sending. It calls resolve_auth_method first, then either hands off to BearerAuthProvider for simple Authorization headers or to BedrockMantleSigV4AuthProvider::new for per-request AWS signing.
 
 *Call graph*: calls 2 internal fn (new, resolve_auth_method); 1 external calls (new).
 
@@ -2197,11 +2219,11 @@ fn non_empty_env_var_from(
 ) -> Option<String>
 ```
 
-**Purpose**: Reads an environment variable through an injected accessor and returns a trimmed value only when it is present and non-empty.
+**Purpose**: Reads an environment variable only if it exists and has real content after trimming spaces. This prevents blank variables from being mistaken for useful credentials or settings.
 
-**Data flow**: It takes a static variable name and an env-var lookup function, calls the function, converts success into a trimmed `String`, filters out empty results, and returns `Option<String>`.
+**Data flow**: It receives an environment variable name and a function that can read environment variables. It tries to read the value, trims leading and trailing whitespace, rejects an empty result, and returns either the cleaned string or nothing.
 
-**Call relations**: This helper is used by `resolve_auth_method` to detect `AWS_BEARER_TOKEN_BEDROCK` and by `bearer_token_region` to probe region environment variables in a testable way.
+**Call relations**: resolve_auth_method uses this to look for AWS_BEARER_TOKEN_BEDROCK. bearer_token_region also uses the same helper indirectly through its own environment lookups for AWS_REGION and AWS_DEFAULT_REGION.
 
 *Call graph*: called by 1 (resolve_auth_method).
 
@@ -2215,11 +2237,11 @@ fn bearer_token_region(
 ) -> Result<String>
 ```
 
-**Purpose**: Resolves the AWS region required for Bedrock bearer-token auth, preferring explicit provider config over environment variables.
+**Purpose**: Finds the AWS region needed when Bedrock is authenticated with a bearer token. Without a region, the Bedrock bearer-token setup is incomplete and the code reports a clear fatal error.
 
-**Data flow**: It takes `&ModelProviderAwsAuthInfo` and an env-var accessor. It first asks `region_from_config(aws)` for a trimmed configured region, then falls back to `AWS_REGION`, then `AWS_DEFAULT_REGION` via `non_empty_env_var_from`. If none yield a value, it returns `CodexErr::Fatal` with a message explaining the required config/env sources; otherwise it returns the chosen region string.
+**Data flow**: It receives AWS provider settings and an environment-reading function. It checks the configured region first, then AWS_REGION, then AWS_DEFAULT_REGION, trimming blank values along the way; it returns the first usable region or a fatal error explaining what must be set.
 
-**Call relations**: `resolve_auth_method` uses this when bearer-token auth is selected, and the unit tests call it directly to verify precedence and failure behavior.
+**Call relations**: resolve_auth_method calls this after finding an environment bearer token. The tests call it directly to prove the priority order and the missing-region error. It depends on region_from_config to read and normalize the provider configuration value.
 
 *Call graph*: calls 1 internal fn (region_from_config); called by 5 (resolve_auth_method, bedrock_bearer_auth_prefers_configured_region_and_uses_header, bedrock_bearer_auth_rejects_missing_configured_region, bedrock_bearer_auth_uses_aws_default_region_env, bedrock_bearer_auth_uses_aws_region_env).
 
@@ -2230,11 +2252,11 @@ fn bearer_token_region(
 fn aws_auth_error_to_codex_error(error: AwsAuthError) -> CodexErr
 ```
 
-**Purpose**: Converts AWS auth setup failures into fatal Codex errors with Bedrock-specific context.
+**Purpose**: Converts an AWS authentication setup failure into the project’s general fatal error type. This gives users a Bedrock-specific message instead of leaking a lower-level AWS error shape.
 
-**Data flow**: It takes an `AwsAuthError`, formats it into `"failed to resolve Amazon Bedrock auth: ..."`, wraps that string in `CodexErr::Fatal`, and returns it.
+**Data flow**: It receives an AwsAuthError. It formats that error into a sentence saying Amazon Bedrock auth could not be resolved, then returns it as a fatal CodexErr.
 
-**Call relations**: `resolve_auth_method` uses this when `AwsAuthContext::load` fails during provider setup.
+**Call relations**: resolve_auth_method uses this when AwsAuthContext::load fails while preparing AWS SDK-style signing.
 
 *Call graph*: 2 external calls (format!, Fatal).
 
@@ -2245,11 +2267,11 @@ fn aws_auth_error_to_codex_error(error: AwsAuthError) -> CodexErr
 fn aws_auth_error_to_auth_error(error: AwsAuthError) -> AuthError
 ```
 
-**Purpose**: Maps AWS signing errors into retryable or non-retryable client auth errors based on the error’s retryability flag.
+**Purpose**: Converts an AWS signing error into the auth error type used while sending requests. It keeps an important distinction: retryable problems are temporary, while non-retryable problems mean the request could not be built correctly.
 
-**Data flow**: It takes an `AwsAuthError`, checks `error.is_retryable()`, and returns `AuthError::Transient(error.to_string())` for retryable failures or `AuthError::Build(error.to_string())` otherwise.
+**Data flow**: It receives an AwsAuthError and asks whether it is retryable. If yes, it returns a transient AuthError; otherwise it returns a build AuthError. In both cases, the original AWS error text is preserved for diagnosis.
 
-**Call relations**: `BedrockMantleSigV4AuthProvider::apply_auth` uses this when request signing fails so the client layer can decide whether to retry.
+**Call relations**: BedrockMantleSigV4AuthProvider::apply_auth uses this after asking the AWS auth context to sign a request.
 
 *Call graph*: calls 1 internal fn (is_retryable); 3 external calls (to_string, Build, Transient).
 
@@ -2260,11 +2282,11 @@ fn aws_auth_error_to_auth_error(error: AwsAuthError) -> AuthError
 fn remove_headers_not_preserved_by_bedrock_mantle(headers: &mut HeaderMap)
 ```
 
-**Purpose**: Removes request headers whose names contain underscores because Bedrock Mantle drops them before SigV4 verification, which would otherwise invalidate the signature.
+**Purpose**: Removes request headers with underscores in their names before AWS signing. This prevents Bedrock Mantle from rejecting requests because the signed headers do not match what Bedrock actually receives.
 
-**Data flow**: It takes a mutable `HeaderMap`, collects all header names whose `as_str()` contains `'_'` into a temporary vector, then iterates that vector and removes each header from the map.
+**Data flow**: It receives a mutable header map. It finds every header name containing an underscore, collects those names, removes them from the map, and leaves all other headers untouched.
 
-**Call relations**: The SigV4 auth provider calls this immediately before signing requests, and the dedicated unit test calls it directly to verify the filtering rule.
+**Call relations**: BedrockMantleSigV4AuthProvider::apply_auth calls this immediately before preparing and signing a request. The dedicated test calls it directly to confirm underscore headers are removed while normal hyphenated headers remain.
 
 *Call graph*: called by 2 (apply_auth, bedrock_mantle_sigv4_strips_headers_not_preserved_by_mantle); 2 external calls (keys, remove).
 
@@ -2275,11 +2297,11 @@ fn remove_headers_not_preserved_by_bedrock_mantle(headers: &mut HeaderMap)
 fn new(context: AwsAuthContext) -> Self
 ```
 
-**Purpose**: Constructs the Bedrock SigV4 auth provider from a preloaded AWS auth context.
+**Purpose**: Creates the Bedrock SigV4 auth provider around an already-loaded AWS authentication context. The context is the object that knows how to sign requests using AWS credentials.
 
-**Data flow**: It takes an `AwsAuthContext`, stores it in the struct’s `context` field, and returns the new provider instance.
+**Data flow**: It receives an AwsAuthContext and stores it inside a new BedrockMantleSigV4AuthProvider. The result is ready to sign outgoing Bedrock Mantle requests.
 
-**Call relations**: `resolve_provider_auth` uses this when AWS SDK auth is selected instead of bearer-token auth.
+**Call relations**: resolve_provider_auth calls this when resolve_auth_method selected AWS SDK authentication instead of bearer-token authentication.
 
 *Call graph*: called by 1 (resolve_provider_auth).
 
@@ -2290,11 +2312,11 @@ fn new(context: AwsAuthContext) -> Self
 fn add_auth_headers(&self, _headers: &mut HeaderMap)
 ```
 
-**Purpose**: Implements the `AuthProvider` trait’s header-only hook as a no-op because Bedrock SigV4 auth is applied by rewriting the full request, not by prepopulating static headers.
+**Purpose**: Does nothing because SigV4 authentication cannot be added as a simple static header. The signature depends on the full request, including method, URL, headers, and body.
 
-**Data flow**: It accepts a mutable `HeaderMap` reference and intentionally leaves it unchanged, returning unit.
+**Data flow**: It receives a mutable header map but deliberately leaves it unchanged. No value is returned beyond completing the method call.
 
-**Call relations**: The client layer may call this through the `AuthProvider` trait, but for this provider all meaningful work happens in `apply_auth`.
+**Call relations**: This satisfies the AuthProvider interface, which supports simple header-based auth providers too. For this provider, the real work happens later in BedrockMantleSigV4AuthProvider::apply_auth, when the whole request is available.
 
 
 ##### `BedrockMantleSigV4AuthProvider::apply_auth`  (lines 163–165)
@@ -2303,11 +2325,11 @@ fn add_auth_headers(&self, _headers: &mut HeaderMap)
 fn apply_auth(&self, request: Request) -> codex_api::AuthProviderFuture<'_>
 ```
 
-**Purpose**: Signs a Bedrock request with AWS SigV4 after normalizing headers and preparing the body for transmission.
+**Purpose**: Signs a full outgoing Bedrock Mantle request using AWS SigV4. This is needed because AWS verifies the signature against the exact request content it receives.
 
-**Data flow**: It takes ownership of a `Request`, mutably removes underscore-containing headers via `remove_headers_not_preserved_by_bedrock_mantle`, calls `request.prepare_body_for_send()` and maps preparation failures to `AuthError::Build`, then asynchronously signs an `AwsRequestToSign` containing the request method, URL, prepared headers, and body bytes using `self.context.sign(...)`. On success it replaces `request.url` and `request.headers` with the signed values, rewrites `request.body` to `RequestBody::Raw` from the prepared body, sets `request.compression = RequestCompression::None`, and returns the modified request; signing failures are mapped through `aws_auth_error_to_auth_error`.
+**Data flow**: It receives a Request. It removes unsupported underscore headers, prepares the body as bytes, sends the method, URL, headers, and body bytes to the AWS signing context, then replaces the request URL and headers with the signed versions, stores the prepared raw body, disables compression, and returns the signed request or an auth error.
 
-**Call relations**: This is the core per-request path used through the `AuthProvider` trait implementation when Bedrock AWS SDK auth is active. It depends on the header-stripping helper and AWS signing context.
+**Call relations**: The request-sending layer calls this through the AuthProvider trait when a Bedrock request is about to be sent. It uses remove_headers_not_preserved_by_bedrock_mantle before signing, prepare_body_for_send so the body bytes are stable, and the AWS context’s sign operation to produce the final authenticated request.
 
 *Call graph*: calls 3 internal fn (sign, prepare_body_for_send, remove_headers_not_preserved_by_bedrock_mantle); 1 external calls (pin).
 
@@ -2318,11 +2340,11 @@ fn apply_auth(&self, request: Request) -> codex_api::AuthProviderFuture<'_>
 fn missing_env_var(_: &'static str) -> std::result::Result<String, std::env::VarError>
 ```
 
-**Purpose**: Test helper that simulates an environment lookup where every variable is absent.
+**Purpose**: Provides a fake environment-variable reader that always says the variable is missing. Tests use it to check the missing-region error path without depending on the real machine environment.
 
-**Data flow**: It ignores the requested variable name and always returns `Err(std::env::VarError::NotPresent)`.
+**Data flow**: It receives an environment variable name and ignores it. It always returns a NotPresent error.
 
-**Call relations**: The missing-region test passes this helper into `bearer_token_region` to force the fatal error path without mutating real process environment.
+**Call relations**: tests::bedrock_bearer_auth_rejects_missing_configured_region passes this helper into bearer_token_region to simulate a completely unset environment.
 
 
 ##### `tests::bedrock_bearer_auth_prefers_configured_region_and_uses_header`  (lines 181–210)
@@ -2331,11 +2353,11 @@ fn missing_env_var(_: &'static str) -> std::result::Result<String, std::env::Var
 fn bedrock_bearer_auth_prefers_configured_region_and_uses_header()
 ```
 
-**Purpose**: Verifies that bearer-token region resolution prefers the configured AWS region over environment variables and that bearer auth writes an `Authorization` header.
+**Purpose**: Checks that a region written in provider configuration wins over AWS_REGION, and that bearer-token authentication creates an Authorization header. This protects the intended priority order for user settings.
 
-**Data flow**: It constructs AWS config with a whitespace-padded `region`, passes a closure that would otherwise return `AWS_REGION`, calls `bearer_token_region`, builds a `BearerAuthProvider` with a test token, adds auth headers into a fresh `HeaderMap`, and asserts the resolved region is trimmed to `us-west-2` and the authorization header starts with `Bearer bedrock-api-key-`.
+**Data flow**: The test builds fake AWS provider settings with a configured region and a fake environment containing a different AWS_REGION. It calls bearer_token_region, creates a BearerAuthProvider with a test token, asks it to add headers, and asserts that the chosen region is the configured one and the Authorization header starts with the expected Bearer token text.
 
-**Call relations**: This test covers both the precedence logic in `bearer_token_region` and the downstream compatibility of the chosen bearer-token auth path.
+**Call relations**: This test directly exercises bearer_token_region and the bearer provider behavior that resolve_provider_auth would use after token auth is selected.
 
 *Call graph*: calls 1 internal fn (bearer_token_region); 3 external calls (assert!, assert_eq!, new).
 
@@ -2346,11 +2368,11 @@ fn bedrock_bearer_auth_prefers_configured_region_and_uses_header()
 fn bedrock_bearer_auth_uses_aws_region_env()
 ```
 
-**Purpose**: Checks that `AWS_REGION` is used when no region is configured in provider settings.
+**Purpose**: Checks that AWS_REGION is used when no region is set in the provider configuration. This confirms the normal AWS environment convention works for Bedrock bearer-token auth.
 
-**Data flow**: It constructs AWS config with `region: None`, passes an env-var closure that returns a whitespace-padded `AWS_REGION`, calls `bearer_token_region`, and asserts the result is the trimmed region string.
+**Data flow**: The test provides AWS settings with no region and a fake environment where AWS_REGION has a value with extra spaces. It calls bearer_token_region and asserts the returned region is trimmed and correct.
 
-**Call relations**: This test exercises the first environment-variable fallback branch in `bearer_token_region`.
+**Call relations**: This test focuses on one fallback branch inside bearer_token_region, the same branch resolve_auth_method uses after finding an environment bearer token.
 
 *Call graph*: calls 1 internal fn (bearer_token_region); 1 external calls (assert_eq!).
 
@@ -2361,11 +2383,11 @@ fn bedrock_bearer_auth_uses_aws_region_env()
 fn bedrock_bearer_auth_uses_aws_default_region_env()
 ```
 
-**Purpose**: Checks that `AWS_DEFAULT_REGION` is used when neither provider config nor `AWS_REGION` supplies a region.
+**Purpose**: Checks that AWS_DEFAULT_REGION is used as a backup when neither provider config nor AWS_REGION supplies a region. This matches common AWS tooling behavior.
 
-**Data flow**: It constructs AWS config with no region, passes an env-var closure that returns only `AWS_DEFAULT_REGION`, calls `bearer_token_region`, and asserts the returned region matches that value.
+**Data flow**: The test provides AWS settings with no region and a fake environment where only AWS_DEFAULT_REGION is present. It calls bearer_token_region and asserts that this default-region value is returned.
 
-**Call relations**: This test covers the second environment-variable fallback branch in `bearer_token_region`.
+**Call relations**: This test covers the final successful fallback inside bearer_token_region before it would produce an error.
 
 *Call graph*: calls 1 internal fn (bearer_token_region); 1 external calls (assert_eq!).
 
@@ -2376,11 +2398,11 @@ fn bedrock_bearer_auth_uses_aws_default_region_env()
 fn bedrock_bearer_auth_rejects_missing_configured_region()
 ```
 
-**Purpose**: Ensures bearer-token auth fails with the documented fatal error when no region can be resolved from config or environment.
+**Purpose**: Checks that bearer-token authentication fails clearly when no region can be found. This matters because silently guessing a region would send requests to the wrong place or fail later with a harder-to-understand error.
 
-**Data flow**: It constructs AWS config with no region, calls `bearer_token_region` using `missing_env_var`, captures the error, and asserts its string form matches the expected fatal message.
+**Data flow**: The test provides AWS settings with no region and an environment reader that reports every variable as missing. It calls bearer_token_region, expects an error, and checks that the message tells the user exactly which config or environment variables can fix it.
 
-**Call relations**: This test targets the final error path in `bearer_token_region`.
+**Call relations**: This test uses tests::missing_env_var to force bearer_token_region into its error path.
 
 *Call graph*: calls 1 internal fn (bearer_token_region); 1 external calls (assert_eq!).
 
@@ -2391,22 +2413,24 @@ fn bedrock_bearer_auth_rejects_missing_configured_region()
 fn bedrock_mantle_sigv4_strips_headers_not_preserved_by_mantle()
 ```
 
-**Purpose**: Verifies that underscore-containing headers are removed before signing while normal hyphenated headers are preserved.
+**Purpose**: Checks that headers with underscores are removed before signing, while normal headers are kept. This guards against a subtle Bedrock Mantle signature failure.
 
-**Data flow**: It creates a `HeaderMap`, inserts `session_id`, `thread_id`, `future_identity_header`, and `x-client-request-id`, calls `remove_headers_not_preserved_by_bedrock_mantle`, then asserts the underscore headers are absent and the hyphenated request-id header remains with its original value.
+**Data flow**: The test builds a header map containing several underscore-style headers and one hyphenated request-id header. It calls remove_headers_not_preserved_by_bedrock_mantle, then asserts that the underscore headers are gone and the hyphenated header still has its original value.
 
-**Call relations**: This test directly validates the Bedrock Mantle compatibility workaround used by `BedrockMantleSigV4AuthProvider::apply_auth`.
+**Call relations**: This test directly verifies the cleanup step that BedrockMantleSigV4AuthProvider::apply_auth performs before calling AWS SigV4 signing.
 
 *Call graph*: calls 1 internal fn (remove_headers_not_preserved_by_bedrock_mantle); 4 external calls (new, from_static, assert!, assert_eq!).
 
 
 ### `model-provider/src/amazon_bedrock/mantle.rs`
 
-`config` · `provider auth resolution and request URL setup`
+`io_transport` · `provider setup and request preparation`
 
-This file encapsulates the Bedrock Mantle-specific pieces that differ from generic OpenAI-compatible providers. It defines the AWS service name `bedrock-mantle` and a fixed allowlist of 12 supported regions. `aws_auth_config` converts `ModelProviderAwsAuthInfo` into `AwsAuthConfig`, preserving the configured profile and normalizing the configured region through `region_from_config`, which trims whitespace and drops empty strings so downstream AWS resolution does not see meaningless values.
+Amazon Bedrock Mantle is exposed through region-specific web addresses, so Codex cannot send every request to one fixed URL. This file is the small map and rulebook for that connection. It names the AWS service as `bedrock-mantle`, lists the regions that are allowed, turns user AWS settings into an authentication configuration, and builds the final OpenAI-compatible base URL for the selected region.
 
-For endpoint construction, `base_url` validates that a region is in the supported list before formatting `https://bedrock-mantle.{region}.api.aws/openai/v1`; unsupported regions become a fatal `CodexErr`, not a fallback. Runtime resolution is slightly more dynamic: `runtime_base_url` first asks `resolve_region` to determine the effective region from whichever Bedrock auth method is active. That helper delegates to `resolve_auth_method` and then extracts the region from one of three variants: managed bearer token auth, environment bearer token auth, or AWS SDK auth context. This means the final URL can come from managed Bedrock credentials even when static config also contains AWS profile/region data. Tests cover endpoint formatting, unsupported-region rejection, and the exact `AwsAuthConfig` produced from profile and region inputs.
+The flow is like choosing the right branch office before mailing a package. First, the code looks at the user or managed login settings to decide which AWS region should be used. If the user wrote a region with extra spaces, it trims those spaces. Then it checks the region against Mantle’s supported-region list. If the region is valid, it returns a URL such as `https://bedrock-mantle.ap-northeast-1.api.aws/openai/v1`. If not, it stops with a clear fatal error instead of letting a later network request fail in a confusing way.
+
+The file also supports different authentication paths: managed bearer tokens, environment-provided bearer tokens, or AWS SDK credentials. No matter which path is used, this file extracts the region and turns it into the endpoint Codex should call.
 
 #### Function details
 
@@ -2416,11 +2440,11 @@ For endpoint construction, `base_url` validates that a region is in the supporte
 fn aws_auth_config(aws: &ModelProviderAwsAuthInfo) -> AwsAuthConfig
 ```
 
-**Purpose**: Builds the AWS SDK auth configuration used for Bedrock Mantle requests. It fixes the AWS service name to `bedrock-mantle` and carries through provider-specific profile and normalized region settings.
+**Purpose**: Builds the AWS authentication settings needed when Codex signs requests for Bedrock Mantle. It preserves the chosen AWS profile, cleans up the configured region, and always uses the Mantle service name.
 
-**Data flow**: It takes a `ModelProviderAwsAuthInfo`, clones its `profile`, derives `region` by calling `region_from_config`, and returns an `AwsAuthConfig` struct with those values plus `service: "bedrock-mantle"`.
+**Data flow**: It receives `ModelProviderAwsAuthInfo`, which may contain an AWS profile name and a region. It copies the profile, asks `region_from_config` to normalize the region, adds the fixed service name `bedrock-mantle`, and returns an `AwsAuthConfig` ready for the authentication layer.
 
-**Call relations**: This function is used during Bedrock auth-method resolution when AWS SDK credentials may be needed. It delegates region cleanup to `region_from_config` so all callers share the same trimming and empty-string filtering.
+**Call relations**: This is called by `resolve_auth_method` when the broader Bedrock authentication code decides it needs AWS SDK-style authentication. It hands back the exact AWS signing settings that the rest of the authentication flow can use.
 
 *Call graph*: calls 1 internal fn (region_from_config); called by 1 (resolve_auth_method).
 
@@ -2431,11 +2455,11 @@ fn aws_auth_config(aws: &ModelProviderAwsAuthInfo) -> AwsAuthConfig
 fn region_from_config(aws: &ModelProviderAwsAuthInfo) -> Option<String>
 ```
 
-**Purpose**: Normalizes an optional configured AWS region string into a usable value. It removes surrounding whitespace and treats blank strings as absent.
+**Purpose**: Extracts a usable AWS region from provider settings. It treats missing, blank, or all-space regions as no region at all.
 
-**Data flow**: It reads `aws.region`, converts the `Option<String>` to `Option<&str>`, trims whitespace, filters out empty results, and returns an owned `Option<String>` containing the cleaned region if present.
+**Data flow**: It receives AWS provider settings. It looks at the optional region string, trims spaces from both ends, discards it if it becomes empty, and otherwise returns the cleaned region as `Some(...)`; if there is no usable region, it returns `None`.
 
-**Call relations**: It is called by `aws_auth_config` and elsewhere in Bedrock auth logic to ensure configured regions are consistently sanitized before use.
+**Call relations**: This helper is used by `aws_auth_config` when building AWS signing settings and by `bearer_token_region` elsewhere in the Bedrock authentication code. It keeps region cleanup consistent across authentication paths.
 
 *Call graph*: called by 2 (bearer_token_region, aws_auth_config).
 
@@ -2446,11 +2470,11 @@ fn region_from_config(aws: &ModelProviderAwsAuthInfo) -> Option<String>
 fn base_url(region: &str) -> Result<String>
 ```
 
-**Purpose**: Validates a Bedrock region and formats the exact Mantle OpenAI-compatible base URL for that region. Unsupported regions are rejected with a fatal error.
+**Purpose**: Turns a supported AWS region into the Bedrock Mantle API base URL. It also blocks unsupported regions with a clear error message.
 
-**Data flow**: It accepts a region string, checks membership in the `BEDROCK_MANTLE_SUPPORTED_REGIONS` array, and either returns `Ok("https://bedrock-mantle.{region}.api.aws/openai/v1")` or `Err(CodexErr::Fatal(...))` naming the unsupported region.
+**Data flow**: It receives a region string. It checks whether that region is in the fixed supported-region list. If it is, it formats and returns the Mantle OpenAI-compatible URL for that region; if not, it returns a fatal Codex error explaining that Mantle does not support the region.
 
-**Call relations**: It is the final URL formatter used by `runtime_base_url` after region resolution, and it is also exercised directly by tests and by code that wants to validate a configured endpoint shape.
+**Call relations**: This is used by `runtime_base_url` after the region has been resolved. It is also exercised by tests and by provider-level checks that make sure configured bearer-token regions produce the expected endpoint.
 
 *Call graph*: called by 3 (runtime_base_url, base_url_rejects_unsupported_region, api_provider_for_bedrock_bearer_token_uses_configured_region_endpoint); 2 external calls (format!, Fatal).
 
@@ -2464,11 +2488,11 @@ async fn runtime_base_url(
 ) -> Result<String>
 ```
 
-**Purpose**: Computes the effective Bedrock Mantle base URL at runtime from the active auth context and provider AWS settings. It ensures the URL reflects the resolved region rather than blindly trusting static config.
+**Purpose**: Finds the correct Bedrock Mantle base URL at runtime, after taking the active authentication method into account. This is the main async entry point in this file for code that needs to know where to send requests.
 
-**Data flow**: It takes an optional managed `BedrockApiKeyAuth` reference and a `ModelProviderAwsAuthInfo`, awaits `resolve_region` to get the effective region string, then passes that region to `base_url` and returns the resulting `Result<String>`.
+**Data flow**: It receives optional managed API-key authentication plus AWS provider settings. It asks `resolve_region` to determine the effective region, then passes that region to `base_url`; the result is either a ready-to-use URL string or an error if the region is unsupported or authentication resolution fails.
 
-**Call relations**: This function is called by the Bedrock provider when constructing API provider metadata and when reporting the runtime base URL. It delegates first to auth-aware region resolution and then to strict region validation/formatting.
+**Call relations**: Provider setup code calls this when it needs the final endpoint for Bedrock Mantle. Internally it delegates region choice to `resolve_region` and endpoint construction to `base_url`, keeping those two decisions separate.
 
 *Call graph*: calls 2 internal fn (base_url, resolve_region); called by 2 (api_provider, runtime_base_url).
 
@@ -2482,11 +2506,11 @@ async fn resolve_region(
 ) -> Result<String>
 ```
 
-**Purpose**: Extracts the effective AWS region from the resolved Bedrock authentication method. It unifies bearer-token and AWS-SDK auth paths into a single region string.
+**Purpose**: Determines which AWS region should be used, based on the authentication method that is actually active. Different login methods store or discover the region in different places, and this function hides that difference.
 
-**Data flow**: It accepts optional managed Bedrock auth and provider AWS config, awaits `resolve_auth_method`, pattern-matches the returned `BedrockAuthMethod`, and returns either the embedded bearer-token region or `context.region().to_string()` from AWS SDK auth.
+**Data flow**: It receives optional managed bearer-token authentication and AWS provider settings. It calls `resolve_auth_method`, then pattern-matches the result: bearer-token methods already include a region, while AWS SDK authentication carries a context object whose region is read and converted to text. It returns the resolved region string.
 
-**Call relations**: It is an internal helper used only by `runtime_base_url`. Its key role is to centralize the precedence rules already encoded in `resolve_auth_method` and expose only the region needed for URL construction.
+**Call relations**: This function is called by `runtime_base_url` before the endpoint URL can be built. It depends on `resolve_auth_method`, which makes the larger decision about whether Codex is using a managed token, an environment token, or AWS SDK credentials.
 
 *Call graph*: calls 1 internal fn (resolve_auth_method); called by 1 (runtime_base_url).
 
@@ -2497,11 +2521,11 @@ async fn resolve_region(
 fn base_url_uses_region_endpoint()
 ```
 
-**Purpose**: Checks that a supported region is interpolated into the expected Mantle endpoint URL.
+**Purpose**: Checks that a known supported region is turned into the exact expected Mantle URL. This protects the URL format from accidental changes.
 
-**Data flow**: It calls `base_url("ap-northeast-1")`, unwraps the success case, and asserts the returned string matches the exact regional URL.
+**Data flow**: The test gives `base_url` the region `ap-northeast-1`. It expects a successful result and compares the returned string with the exact region-specific URL.
 
-**Call relations**: This test directly validates the happy-path formatting logic in `base_url`.
+**Call relations**: This test directly exercises `base_url`, confirming the happy path that production code uses after `runtime_base_url` has resolved a region.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2512,11 +2536,11 @@ fn base_url_uses_region_endpoint()
 fn base_url_rejects_unsupported_region()
 ```
 
-**Purpose**: Verifies that unsupported regions fail with the intended fatal error message.
+**Purpose**: Checks that unsupported regions are rejected with a clear fatal error. This ensures users get an understandable message instead of a mysterious failed network call later.
 
-**Data flow**: It calls `base_url("us-west-1")`, expects an error, converts that error to string form, and asserts the message names the unsupported region.
+**Data flow**: The test calls `base_url` with `us-west-1`, which is not in the supported list. It expects an error, converts that error to text, and compares it with the exact message.
 
-**Call relations**: This test covers the rejection branch in `base_url`, ensuring unsupported regions do not silently produce endpoints.
+**Call relations**: This test covers the failure path inside `base_url`, the same guard that `runtime_base_url` relies on before any Mantle request is attempted.
 
 *Call graph*: calls 1 internal fn (base_url); 1 external calls (assert_eq!).
 
@@ -2527,11 +2551,11 @@ fn base_url_rejects_unsupported_region()
 fn aws_auth_config_uses_profile_and_mantle_service()
 ```
 
-**Purpose**: Confirms that AWS auth config preserves the configured profile and always uses the Mantle service name.
+**Purpose**: Checks that AWS authentication settings keep the configured profile and use the correct Mantle service name when no region is configured.
 
-**Data flow**: It constructs a `ModelProviderAwsAuthInfo` with a profile and no region, passes it to `aws_auth_config`, and asserts the returned `AwsAuthConfig` contains the same profile, no region, and `service: "bedrock-mantle"`.
+**Data flow**: The test builds provider AWS settings with profile `codex-bedrock` and no region. It calls `aws_auth_config` and compares the result with an `AwsAuthConfig` containing that profile, no region, and service `bedrock-mantle`.
 
-**Call relations**: This test validates the struct assembly performed by `aws_auth_config` on the no-region path.
+**Call relations**: This test verifies the data that `aws_auth_config` hands to the broader `resolve_auth_method` authentication flow when AWS SDK credentials are used.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2542,24 +2566,24 @@ fn aws_auth_config_uses_profile_and_mantle_service()
 fn aws_auth_config_uses_configured_region()
 ```
 
-**Purpose**: Checks that configured regions are trimmed before being embedded in the AWS auth config.
+**Purpose**: Checks that a configured region is cleaned before being placed into AWS authentication settings. This prevents harmless extra spaces in configuration from breaking authentication.
 
-**Data flow**: It builds `ModelProviderAwsAuthInfo` with a whitespace-padded region, calls `aws_auth_config`, and asserts the returned `AwsAuthConfig.region` is the trimmed string while the service remains `bedrock-mantle`.
+**Data flow**: The test creates provider AWS settings with the region string ` us-west-2 `. It calls `aws_auth_config` and expects the returned config to contain `us-west-2` without surrounding spaces, along with the Mantle service name.
 
-**Call relations**: This test exercises the interaction between `aws_auth_config` and `region_from_config`, specifically the normalization behavior.
+**Call relations**: This test confirms that `aws_auth_config` correctly relies on `region_from_config`, which is also used elsewhere for consistent region cleanup.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `model-provider/src/amazon_bedrock/mod.rs`
 
-`domain_logic` · `provider instantiation and Bedrock request handling`
+`domain_logic` · `provider setup and request handling`
 
-This module wires together Bedrock-specific auth, endpoint, and catalog behavior behind `AmazonBedrockModelProvider`. The struct stores the original `ModelProviderInfo`, a normalized `ModelProviderAwsAuthInfo` extracted from it, and an optional shared `AuthManager`. Construction fills in missing AWS config with `{ profile: None, region: None }` so later code can rely on `self.aws` always existing.
+Amazon Bedrock can be reached in two different ways here: with a Codex-managed Bedrock API key, or with normal AWS-managed credentials such as an AWS profile and region. This file is the adapter that hides that choice from the rest of the application. A useful analogy is a travel plug adapter: the app speaks one familiar “OpenAI-style” shape, and this provider makes it fit Bedrock’s socket.
 
-A central design choice is that only managed Bedrock API-key auth is visible to this provider. `managed_auth` reads the cached auth snapshot from the manager and returns `Some(BedrockApiKeyAuth)` only for `CodexAuth::BedrockApiKey`; all OpenAI/ChatGPT/PAT/agent auth variants are ignored. That choice drives several behaviors: `auth_manager()` only exposes the manager when Bedrock auth is actually present, `auth()` returns only Bedrock auth, `account_state()` reports `CodexManaged` versus `AwsManaged` credential source based on that presence, and `api_auth()` delegates to Bedrock-specific auth resolution.
+The central type is `AmazonBedrockModelProvider`. It stores the provider’s general information, Bedrock-specific AWS settings, and optionally an `AuthManager`, which is the part of the system that remembers login credentials. When asked for authentication, it deliberately accepts only Bedrock API-key credentials from that manager. If the cached login is an OpenAI key, ChatGPT login, personal access token, or another unrelated credential, it is ignored so that secrets for one service are not accidentally sent to another.
 
-Request configuration is also dynamic. `api_provider()` clones `self.info`, computes the runtime Mantle URL from auth and AWS config, writes it into `base_url`, and converts the result to a `codex_api::Provider`. `runtime_base_url()` exposes the same computed URL directly. For models, Bedrock never uses the remote models endpoint: `models_manager()` always returns a `StaticModelsManager`, using either the built-in Bedrock catalog or a caller-supplied catalog normalized through `with_default_only_service_tier`. Capability flags disable unsupported hosted features, and all preferred-model selectors point to the Bedrock GPT-5.4 model ID except the static catalog default ordering, which still prefers GPT-5.5.
+When the app needs to call Bedrock, this provider builds the correct runtime base URL from the selected region, prepares the right authorization method, reports the account state, and supplies a static model catalog. It also tells the rest of the system which hosted tools are supported: namespace tools are allowed, but image generation and web search are disabled for this provider.
 
 #### Function details
 
@@ -2572,11 +2596,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a Bedrock provider instance from serialized provider metadata and an optional auth manager. It also normalizes missing AWS config into an explicit empty `ModelProviderAwsAuthInfo`.
+**Purpose**: Creates a Bedrock model provider from general provider settings and an optional login manager. It also extracts the AWS profile and region settings, falling back to empty AWS settings if none were supplied.
 
-**Data flow**: It takes `provider_info` and `auth_manager`, clones `provider_info.aws` if present or substitutes `{ profile: None, region: None }`, and stores `info`, `aws`, and `auth_manager` in a new `AmazonBedrockModelProvider`.
+**Data flow**: It receives `ModelProviderInfo` and maybe an `AuthManager`. It reads the AWS-specific section from the provider info, or creates a default with no profile and no region. It returns an `AmazonBedrockModelProvider` containing the original provider info, the chosen AWS settings, and the optional auth manager.
 
-**Call relations**: This constructor is selected by `create_model_provider` whenever `ModelProviderInfo` identifies Amazon Bedrock, and it is used directly in Bedrock-focused tests. It does not delegate further.
+**Call relations**: This is the starting point used by the wider provider factory, `create_model_provider`, when Bedrock is selected. The tests also call it to build providers with different credential setups before checking authentication, capabilities, and preferred model behavior.
 
 *Call graph*: called by 5 (approval_review_preferred_model_uses_bedrock_gpt_5_4, capabilities_disable_unsupported_hosted_tools, managed_auth_takes_precedence_over_aws_auth, openai_auth_is_not_exposed_to_bedrock, create_model_provider).
 
@@ -2587,11 +2611,11 @@ fn new(
 fn managed_auth(&self) -> Option<BedrockApiKeyAuth>
 ```
 
-**Purpose**: Extracts Bedrock-managed credentials from the shared auth manager while intentionally ignoring all non-Bedrock auth types. This is the gate that prevents OpenAI auth from leaking into Bedrock behavior.
+**Purpose**: Looks inside the optional login manager and returns a Bedrock API-key login only if one is present. It protects against accidentally treating other kinds of login, such as an OpenAI API key, as Bedrock credentials.
 
-**Data flow**: It reads `self.auth_manager`, asks for `auth_cached()`, pattern-matches the resulting `CodexAuth`, and returns `Some(BedrockApiKeyAuth)` only for `CodexAuth::BedrockApiKey`; every other variant yields `None`.
+**Data flow**: It reads the cached authentication from `auth_manager`, if there is one. If the cached value is `CodexAuth::BedrockApiKey`, it returns that Bedrock API-key data. For every other login type, or if no login manager/cache exists, it returns nothing.
 
-**Call relations**: This helper is the common dependency for account-state reporting, auth exposure, runtime URL resolution, and API auth/provider construction. It is called by nearly every Bedrock-specific method to enforce Bedrock-auth precedence rules.
+**Call relations**: This is the provider’s credential gatekeeper. The account-state, auth, auth-manager exposure, endpoint-building, API-provider-building, and API-auth-building paths all call it first so they can decide whether Codex-managed Bedrock credentials should take priority over AWS-managed credentials.
 
 *Call graph*: called by 6 (account_state, api_auth, api_provider, auth, auth_manager, runtime_base_url).
 
@@ -2602,11 +2626,11 @@ fn managed_auth(&self) -> Option<BedrockApiKeyAuth>
 fn info(&self) -> &ModelProviderInfo
 ```
 
-**Purpose**: Returns the stored provider metadata for trait consumers.
+**Purpose**: Returns the provider’s stored description and configuration information. Other parts of the system use this when they need to inspect what provider this is and how it was configured.
 
-**Data flow**: It reads `self.info` and returns a shared reference without modification.
+**Data flow**: It takes the provider object as input and reads its `info` field. It returns a shared reference to that existing information without changing anything.
 
-**Call relations**: This is the trait-required metadata accessor for callers using the provider polymorphically. It does not delegate.
+**Call relations**: This fulfills the common `ModelProvider` interface, so generic provider code can ask any provider for its basic information in the same way.
 
 
 ##### `AmazonBedrockModelProvider::capabilities`  (lines 104–110)
@@ -2615,11 +2639,11 @@ fn info(&self) -> &ModelProviderInfo
 fn capabilities(&self) -> ProviderCapabilities
 ```
 
-**Purpose**: Declares the Bedrock provider's supported feature upper bounds. It explicitly disables hosted image generation and web search while leaving namespace tools enabled.
+**Purpose**: Tells the rest of the app which optional hosted features Bedrock supports through this provider. In this implementation, namespace tools are allowed, while image generation and web search are not.
 
-**Data flow**: It constructs and returns a `ProviderCapabilities` value with `namespace_tools: true`, `image_generation: false`, and `web_search: false`.
+**Data flow**: It reads no external data. It returns a fixed `ProviderCapabilities` value with `namespace_tools` set to true and both `image_generation` and `web_search` set to false.
 
-**Call relations**: This overrides the trait default so UI and runtime logic can suppress unsupported features for Bedrock.
+**Call relations**: Generic model-provider code can call this before enabling features. The `capabilities_disable_unsupported_hosted_tools` test checks that unsupported hosted tools stay disabled.
 
 
 ##### `AmazonBedrockModelProvider::approval_review_preferred_model`  (lines 112–114)
@@ -2628,11 +2652,11 @@ fn capabilities(&self) -> ProviderCapabilities
 fn approval_review_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Returns the Bedrock-specific model ID preferred for automatic approval review.
+**Purpose**: Chooses the Bedrock model the system should prefer for approval review tasks. Approval review is a special internal use case, so the provider names a known Bedrock GPT model for it.
 
-**Data flow**: It returns the constant `AMAZON_BEDROCK_GPT_5_4_MODEL_ID`.
+**Data flow**: It takes no dynamic input and returns the constant Bedrock GPT 5.4 model ID. It does not modify provider state.
 
-**Call relations**: This overrides the generic trait default because Bedrock requires backend-specific model IDs rather than generic OpenAI slugs.
+**Call relations**: The broader system can call this when it needs a default model for approval review work. The `approval_review_preferred_model_uses_bedrock_gpt_5_4` test verifies that this provider returns the expected Bedrock model ID.
 
 
 ##### `AmazonBedrockModelProvider::memory_extraction_preferred_model`  (lines 116–118)
@@ -2641,11 +2665,11 @@ fn approval_review_preferred_model(&self) -> &'static str
 fn memory_extraction_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Returns the Bedrock-specific model ID preferred for memory extraction tasks.
+**Purpose**: Chooses the Bedrock model the system should prefer when extracting useful memory from text. It uses the same Bedrock GPT 5.4 model as the provider’s other internal memory-related defaults.
 
-**Data flow**: It returns the constant `AMAZON_BEDROCK_GPT_5_4_MODEL_ID`.
+**Data flow**: It receives only the provider object and returns a fixed model ID constant. Nothing is read from external services, and no state changes.
 
-**Call relations**: Like the approval-review selector, this overrides the generic trait default for Bedrock-specific routing.
+**Call relations**: The memory subsystem can call this through the shared `ModelProvider` interface when it needs a suitable Bedrock model for memory extraction.
 
 
 ##### `AmazonBedrockModelProvider::memory_consolidation_preferred_model`  (lines 120–122)
@@ -2654,11 +2678,11 @@ fn memory_extraction_preferred_model(&self) -> &'static str
 fn memory_consolidation_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Returns the Bedrock-specific model ID preferred for memory consolidation tasks.
+**Purpose**: Chooses the Bedrock model the system should prefer when consolidating or summarizing stored memories. It points to the provider’s standard Bedrock GPT 5.4 model.
 
-**Data flow**: It returns the constant `AMAZON_BEDROCK_GPT_5_4_MODEL_ID`.
+**Data flow**: It returns a fixed model ID constant and does not depend on runtime configuration. The provider remains unchanged.
 
-**Call relations**: This is the third preferred-model override, keeping all memory-related Bedrock defaults aligned on GPT-5.4.
+**Call relations**: The memory subsystem can call this through the common provider interface when it needs a default Bedrock model for memory consolidation.
 
 
 ##### `AmazonBedrockModelProvider::auth_manager`  (lines 124–127)
@@ -2667,11 +2691,11 @@ fn memory_consolidation_preferred_model(&self) -> &'static str
 fn auth_manager(&self) -> Option<Arc<AuthManager>>
 ```
 
-**Purpose**: Exposes the underlying auth manager only when it currently contains managed Bedrock auth. This prevents unrelated auth managers from being treated as Bedrock-capable.
+**Purpose**: Exposes the login manager only when it actually contains Bedrock API-key credentials. This prevents unrelated credentials from being treated as usable Bedrock login state.
 
-**Data flow**: It calls `managed_auth()`; if that returns `Some`, it clones and returns `self.auth_manager`, otherwise it returns `None`.
+**Data flow**: It first asks `managed_auth` whether a Bedrock API-key login is cached. If yes, it returns a shared pointer to the original auth manager. If no, it returns nothing.
 
-**Call relations**: Trait consumers call this to discover provider-scoped auth management. Its behavior depends entirely on `managed_auth`, which enforces the Bedrock-only filter.
+**Call relations**: This method is part of the common provider interface. It relies on `managed_auth` as a safety check, and the authentication tests use it to confirm that Bedrock credentials are exposed while OpenAI credentials are not.
 
 *Call graph*: calls 1 internal fn (managed_auth).
 
@@ -2682,11 +2706,11 @@ fn auth_manager(&self) -> Option<Arc<AuthManager>>
 fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 ```
 
-**Purpose**: Returns the current provider-scoped auth snapshot as a future, but only for managed Bedrock credentials.
+**Purpose**: Returns the provider’s current Bedrock authentication, if Codex is managing a Bedrock API key. It presents the result in the asynchronous shape expected by the shared provider interface.
 
-**Data flow**: It calls `managed_auth()`, maps the result into `CodexAuth::BedrockApiKey`, boxes the async result with `Box::pin`, and yields `Option<CodexAuth>`.
+**Data flow**: It checks `managed_auth`. If Bedrock API-key data exists, it wraps that data as `CodexAuth::BedrockApiKey`; otherwise it produces no authentication. The trait method boxes and pins the asynchronous work so callers can await it uniformly.
 
-**Call relations**: This is the trait-facing async auth accessor. It is used by callers that need the provider's current auth state and relies on `managed_auth` to suppress non-Bedrock auth.
+**Call relations**: Generic provider code calls this when it wants to know the provider’s login state. Internally it depends on `managed_auth`, and the tests check both the Bedrock-key case and the unrelated OpenAI-key case.
 
 *Call graph*: calls 1 internal fn (managed_auth); 1 external calls (pin).
 
@@ -2697,11 +2721,11 @@ fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 fn account_state(&self) -> ProviderAccountResult
 ```
 
-**Purpose**: Reports Bedrock account visibility to the app, distinguishing between Codex-managed Bedrock credentials and AWS-managed credentials.
+**Purpose**: Reports what kind of Bedrock account access is currently being used. It says whether credentials come from Codex-managed Bedrock auth or from AWS-managed credential lookup.
 
-**Data flow**: It checks whether `managed_auth()` returns `Some`. If so, it sets `credential_source` to `AmazonBedrockCredentialSource::CodexManaged`; otherwise it uses `AwsManaged`. It wraps that in `ProviderAccount::AmazonBedrock` and returns `ProviderAccountState { account: Some(...), requires_openai_auth: false }`.
+**Data flow**: It asks `managed_auth` whether a Bedrock API key is cached. If one exists, it marks the credential source as `CodexManaged`; otherwise it marks it as `AwsManaged`. It returns a `ProviderAccountState` for Amazon Bedrock and says OpenAI authentication is not required.
 
-**Call relations**: This method is called by higher-level account/status UI logic. It does not delegate beyond `managed_auth`, because Bedrock account state is derived solely from auth-source presence.
+**Call relations**: This is called by account/status flows that need to display or reason about provider login state. Its decision is grounded in `managed_auth`, and the tests verify both managed-Bedrock and ignored-OpenAI credential paths.
 
 *Call graph*: calls 1 internal fn (managed_auth).
 
@@ -2712,11 +2736,11 @@ fn account_state(&self) -> ProviderAccountResult
 fn api_provider(&self) -> ModelProviderFuture<'_, Result<Provider>>
 ```
 
-**Purpose**: Builds the concrete API provider configuration used for Bedrock requests, including the runtime-resolved Mantle base URL.
+**Purpose**: Builds the API-provider object that the rest of the app can use to talk to Bedrock’s OpenAI-compatible endpoint. It fills in the correct Bedrock Mantle base URL at runtime before converting the provider info into the generic API shape.
 
-**Data flow**: It reads managed Bedrock auth via `managed_auth()`, clones `self.info` into a mutable `api_provider_info`, computes `base_url` by awaiting `mantle::runtime_base_url(managed_auth.as_ref(), &self.aws)`, writes that URL into `api_provider_info.base_url`, and converts the result with `to_api_provider(None)`.
+**Data flow**: It checks for managed Bedrock auth, clones the stored provider info, computes the runtime Bedrock base URL from credentials and AWS settings, inserts that URL into the cloned info, and converts the result into a `Provider`. The trait method returns this work as an awaitable future.
 
-**Call relations**: This async helper backs the trait's `api_provider()` method for Bedrock. It delegates URL computation to the Mantle module so auth-derived region selection is reflected in the final provider config.
+**Call relations**: Request-building code calls this when it needs a concrete provider endpoint. It calls `managed_auth` to know whether a managed Bedrock region should be used, then calls the Mantle URL resolver before handing back the generic API provider.
 
 *Call graph*: calls 2 internal fn (managed_auth, runtime_base_url); 2 external calls (pin, clone).
 
@@ -2727,11 +2751,11 @@ fn api_provider(&self) -> ModelProviderFuture<'_, Result<Provider>>
 fn runtime_base_url(&self) -> ModelProviderFuture<'_, Result<Option<String>>>
 ```
 
-**Purpose**: Exposes the exact Bedrock Mantle base URL that will be used at request time.
+**Purpose**: Computes the actual Bedrock Mantle endpoint URL that should be used at runtime. This matters because the URL depends on the Bedrock region, which may come from managed Bedrock auth or AWS settings.
 
-**Data flow**: It obtains optional managed auth from `managed_auth()`, awaits `mantle::runtime_base_url(managed_auth.as_ref(), &self.aws)`, wraps the resulting string in `Some`, and returns `Result<Option<String>>`.
+**Data flow**: It checks `managed_auth`, passes the optional managed credentials and stored AWS settings to the Mantle URL resolver, and wraps the resulting URL in `Some`. The trait method exposes the asynchronous computation as a pinned future.
 
-**Call relations**: This is the trait-facing runtime URL accessor. It shares the same Mantle resolution path as `api_provider` but returns only the URL instead of a full API provider struct.
+**Call relations**: This is used when callers need just the URL, and it is also part of the flow used by `api_provider`. Tests confirm that managed Bedrock auth chooses the managed auth region for the endpoint.
 
 *Call graph*: calls 2 internal fn (managed_auth, runtime_base_url); 1 external calls (pin).
 
@@ -2742,11 +2766,11 @@ fn runtime_base_url(&self) -> ModelProviderFuture<'_, Result<Option<String>>>
 fn api_auth(&self) -> ModelProviderFuture<'_, Result<SharedAuthProvider>>
 ```
 
-**Purpose**: Resolves the request-header auth provider appropriate for Bedrock, using managed Bedrock auth when available and AWS-based fallback otherwise.
+**Purpose**: Creates the authorization provider used when making API calls to Bedrock. It chooses between Codex-managed Bedrock API-key authorization and AWS-based authorization.
 
-**Data flow**: It reads optional managed auth with `managed_auth()`, passes `managed_auth.as_ref()` and `&self.aws` to Bedrock-specific `resolve_provider_auth`, awaits the result, and returns a `SharedAuthProvider`.
+**Data flow**: It asks `managed_auth` for a Bedrock API key if one exists. It then passes that optional key and the AWS settings into `resolve_provider_auth`, which returns a shared authorization provider capable of producing request headers or signing behavior. The trait method returns the result asynchronously.
 
-**Call relations**: This async helper backs the trait's `api_auth()` implementation for Bedrock. It delegates to the Bedrock auth module because generic provider auth resolution does not understand Bedrock's AWS and bearer-token modes.
+**Call relations**: API request code calls this before sending traffic to Bedrock. The method delegates the detailed credential resolution to `resolve_provider_auth`, and the managed-auth test checks that a managed Bedrock key becomes a Bearer authorization header.
 
 *Call graph*: calls 1 internal fn (managed_auth); 2 external calls (pin, resolve_provider_auth).
 
@@ -2761,11 +2785,11 @@ fn models_manager(
     ) -> SharedModelsManager
 ```
 
-**Purpose**: Creates the Bedrock models manager, always using a static catalog rather than a remote models endpoint.
+**Purpose**: Supplies the list of models available for this Bedrock provider. It uses a static model list, optionally adjusted by a model catalog supplied from configuration.
 
-**Data flow**: It ignores `codex_home`, takes an optional `config_model_catalog`, and constructs a `StaticModelsManager` with no auth manager. If a catalog is provided, it normalizes it with `with_default_only_service_tier`; otherwise it generates the built-in catalog with `static_model_catalog`.
+**Data flow**: It receives the Codex home path and an optional configured model catalog. The path is not used here. If a catalog is supplied, it is transformed so only the default service tier is used; otherwise the built-in static Bedrock catalog is used. It returns a shared `StaticModelsManager` built from that catalog.
 
-**Call relations**: This overrides the generic provider behavior because Bedrock model metadata is fixed and provider-owned. It delegates to the catalog module and wraps the result in `Arc<StaticModelsManager>`.
+**Call relations**: The wider system calls this when it needs model metadata for Bedrock. Instead of fetching models live from a service, this provider hands off a fixed catalog through `StaticModelsManager`.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (new).
 
@@ -2776,11 +2800,11 @@ fn models_manager(
 fn api_provider_for_bedrock_bearer_token_uses_configured_region_endpoint()
 ```
 
-**Purpose**: Verifies that a Bedrock provider configured with a supported region produces the expected Mantle base URL in API-provider form.
+**Purpose**: Checks that a Bedrock provider configured for a specific region produces the expected Mantle endpoint URL. This protects the region-to-URL mapping for bearer-token style Bedrock access.
 
-**Data flow**: It creates Bedrock `ModelProviderInfo`, sets `base_url` using `mantle::base_url(region)`, converts it with `to_api_provider(None)`, and asserts the resulting `Provider.base_url` matches the regional Mantle URL.
+**Data flow**: The test creates Bedrock provider info, sets its base URL to the Mantle URL for `eu-central-1`, converts that info into a generic API provider, and compares the resulting base URL to the expected string.
 
-**Call relations**: This test validates the endpoint shape expected by Bedrock API-provider construction, using the Mantle URL formatter directly.
+**Call relations**: This test exercises the lower-level provider-info conversion and Mantle URL helper rather than constructing the full runtime provider. It supports the same endpoint-building behavior used by `AmazonBedrockModelProvider::api_provider` and `AmazonBedrockModelProvider::runtime_base_url`.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, base_url); 1 external calls (assert_eq!).
 
@@ -2791,11 +2815,11 @@ fn api_provider_for_bedrock_bearer_token_uses_configured_region_endpoint()
 async fn managed_auth_takes_precedence_over_aws_auth()
 ```
 
-**Purpose**: Checks that managed Bedrock API-key auth overrides configured AWS profile/region settings across auth exposure, account state, runtime URL, and request headers.
+**Purpose**: Verifies that a Codex-managed Bedrock API key wins over AWS profile and region settings. This is important because a user who explicitly logged in with a Bedrock key should not silently use some other AWS credential source.
 
-**Data flow**: It builds a managed `BedrockApiKeyAuth`, wraps it in an `AuthManager`, constructs a provider whose config also contains AWS profile and region, then asserts: the same auth manager is exposed, `auth()` returns the Bedrock auth, `account_state()` reports `CodexManaged`, `runtime_base_url()` uses the managed auth region, and `api_auth().to_auth_headers()` contains a bearer authorization header with the managed API key.
+**Data flow**: The test builds managed Bedrock auth with an API key and `us-east-1`, then creates a provider that also has AWS settings for a different profile and region. It checks that the provider exposes the managed auth manager, returns the managed Bedrock auth, reports `CodexManaged`, builds a `us-east-1` endpoint, and produces a Bearer authorization header with the managed key.
 
-**Call relations**: This test exercises the full Bedrock provider flow from `managed_auth` through account-state, URL resolution, and auth-provider generation, proving managed credentials win over static AWS config.
+**Call relations**: This test calls `AmazonBedrockModelProvider::new` to set up the scenario, then drives the same public methods used in real provider flows: `auth_manager`, `auth`, `account_state`, `runtime_base_url`, and `api_auth`.
 
 *Call graph*: calls 3 internal fn (from_auth_for_testing, create_amazon_bedrock_provider, new); 3 external calls (assert!, assert_eq!, BedrockApiKey).
 
@@ -2806,11 +2830,11 @@ async fn managed_auth_takes_precedence_over_aws_auth()
 async fn openai_auth_is_not_exposed_to_bedrock()
 ```
 
-**Purpose**: Ensures that an auth manager containing ordinary OpenAI auth is ignored by the Bedrock provider.
+**Purpose**: Checks that an OpenAI API key stored in the auth manager is ignored by the Bedrock provider. This prevents credentials for one service from leaking into requests for another service.
 
-**Data flow**: It constructs a Bedrock provider with an auth manager holding `CodexAuth::ApiKey`, then asserts `auth_manager()` returns `None`, `auth().await` returns `None`, and `account_state()` reports `AwsManaged` rather than a managed Bedrock source.
+**Data flow**: The test creates an auth manager containing an OpenAI API key, builds a Bedrock provider with it, and then checks that the provider exposes no auth manager, returns no Bedrock auth, and reports that Bedrock credentials should come from AWS-managed sources instead.
 
-**Call relations**: This test directly validates the filtering behavior in `managed_auth` and the downstream methods that depend on it.
+**Call relations**: This test focuses on the safety filter inside `managed_auth`, as observed through public methods like `auth_manager`, `auth`, and `account_state`.
 
 *Call graph*: calls 4 internal fn (from_auth_for_testing, from_api_key, create_amazon_bedrock_provider, new); 2 external calls (assert!, assert_eq!).
 
@@ -2821,11 +2845,11 @@ async fn openai_auth_is_not_exposed_to_bedrock()
 fn capabilities_disable_unsupported_hosted_tools()
 ```
 
-**Purpose**: Confirms the Bedrock provider advertises the intended capability restrictions.
+**Purpose**: Confirms that the Bedrock provider advertises only the hosted features it supports. In particular, it keeps image generation and web search turned off.
 
-**Data flow**: It constructs a Bedrock provider and asserts that `capabilities()` returns `namespace_tools: true`, `image_generation: false`, and `web_search: false`.
+**Data flow**: The test creates a default Bedrock provider and calls `capabilities`. It compares the returned capability flags to the expected values: namespace tools enabled, image generation disabled, and web search disabled.
 
-**Call relations**: This test covers the Bedrock-specific override of the trait default capability set.
+**Call relations**: This test protects the behavior of `AmazonBedrockModelProvider::capabilities`, which feature-selection code relies on before enabling provider-specific tools.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, new); 1 external calls (assert_eq!).
 
@@ -2836,11 +2860,11 @@ fn capabilities_disable_unsupported_hosted_tools()
 fn approval_review_preferred_model_uses_bedrock_gpt_5_4()
 ```
 
-**Purpose**: Checks that approval review uses the Bedrock GPT-5.4 model ID rather than a generic default.
+**Purpose**: Checks that the provider’s preferred model for approval review is the expected Bedrock GPT 5.4 model. This keeps internal review tasks pointed at the intended model.
 
-**Data flow**: It constructs a Bedrock provider and asserts `approval_review_preferred_model()` equals `AMAZON_BEDROCK_GPT_5_4_MODEL_ID`.
+**Data flow**: The test creates a default Bedrock provider, calls `approval_review_preferred_model`, and compares the returned model ID to the Bedrock GPT 5.4 constant.
 
-**Call relations**: This test validates one of the Bedrock-specific preferred-model overrides.
+**Call relations**: This test directly verifies `AmazonBedrockModelProvider::approval_review_preferred_model`, which higher-level approval-review flows can call through the common provider interface.
 
 *Call graph*: calls 2 internal fn (create_amazon_bedrock_provider, new); 1 external calls (assert_eq!).
 
@@ -2850,22 +2874,28 @@ Provides shared auth interfaces and attestation boundaries that downstream HTTP-
 
 ### `core/src/attestation.rs`
 
-`domain_logic` · `request handling`
+`data_model` · `request handling`
 
-This file establishes a small but important integration contract around request attestation. The constant `X_OAI_ATTESTATION_HEADER` fixes the outbound HTTP header name as `x-oai-attestation`, ensuring all callers and providers use the same wire-level identifier. `AttestationContext` is a lightweight request-scoped struct containing the `ThreadId` whose upstream request is being prepared; this gives providers enough context to apply policy or derive a token without exposing unrelated request internals.
+Some requests may need an extra HTTP header called `x-oai-attestation`. An HTTP header is a small named piece of metadata sent with a web request. In this case, the header value is not built directly by the core system. Instead, the surrounding host integration decides whether attestation is needed and, if so, produces the value just in time.
 
-Because attestation generation may involve asynchronous work, the file defines `GenerateAttestationFuture<'a>` as a boxed, pinned, `Send` future yielding `Option<HeaderValue>`. Returning `None` explicitly represents the policy decision not to attach an attestation header. The `AttestationProvider` trait is the host integration boundary: implementations own the logic for whether attestation should be attempted and, if so, produce the concrete `HeaderValue`. Requiring `Debug + Send + Sync` makes providers suitable for shared use in concurrent runtime components. The design keeps attestation policy decoupled from HTTP request construction: core code can ask for a header in a uniform way, while platform-specific integrations decide how and when to mint one.
+This file is the boundary between those two worlds. It names the header, defines the request information the host is allowed to see, and describes the trait, `AttestationProvider`, that a host must implement if it wants to supply attestations. The context currently contains the `thread_id`, so the provider can make a decision based on which conversation or request thread is being sent upstream.
+
+The result is asynchronous: creating the header may require waiting on another service, secure hardware, or some host-specific check. That is why the provider returns a future, which is a value representing work that will finish later. The future produces either a header value or `None`, meaning no attestation should be sent.
+
+Without this file, the core request code would have to know host-specific attestation rules. This keeps that policy outside the core, like a security desk that decides whether to stamp a package before it leaves the building.
 
 
 ### `codex-api/src/auth.rs`
 
-`config` · `request preparation`
+`io_transport` · `outbound API request preparation and telemetry`
 
-This file provides the core auth contract for outbound API requests. `AuthError` distinguishes between build-time failures (`Build`) and transient failures (`Transient`), and its `From<AuthError> for TransportError` implementation preserves that distinction by mapping build failures to `TransportError::Build` and transient ones to `TransportError::Network`.
+When the API client sends a request, it often needs proof that the caller is allowed to use the service, such as an Authorization header. This file is the small “authentication adapter” layer that makes that possible without every caller needing to know the details.
 
-The central trait, `AuthProvider`, is intentionally split into a cheap header-only path and a full-request path. Implementers must provide `add_auth_headers(&mut HeaderMap)`, which is documented as non-blocking and suitable for telemetry or non-HTTP code paths. The default `to_auth_headers` helper materializes those headers into a fresh `HeaderMap`. The default `apply_auth` implementation takes ownership of a `codex_client::Request`, mutates its header map via `add_auth_headers`, and returns the updated request asynchronously through the boxed `AuthProviderFuture`; providers that need to sign the full request can override this method.
+The main piece is AuthProvider, a trait, which is Rust’s way of saying “anything that promises to provide these methods.” Simple providers can just add headers, like putting a badge on an envelope before mailing it. More advanced providers can inspect and sign the whole request, including the final URL, headers, and body, before it is sent.
 
-The file also defines shared type aliases: `AuthProviderFuture` for the boxed async result and `SharedAuthProvider` as `Arc<dyn AuthProvider>`. Finally, `AuthHeaderTelemetry` and `auth_header_telemetry` provide a lightweight way to inspect whether an auth provider attaches an `Authorization` header, returning a stable telemetry shape with `attached` and optional header-name fields rather than exposing raw credentials.
+The file also defines AuthError, which separates two kinds of authentication failure: a build problem, meaning the request could not be prepared correctly, and a transient problem, meaning something temporary went wrong. Those errors can be turned into the transport layer’s error type so the rest of the request-sending code can treat authentication failures like other send-time failures.
+
+Finally, auth_header_telemetry checks whether an authentication header would be attached, without exposing the secret value. That is useful for logging or metrics: the system can know “auth was present” without recording sensitive credentials.
 
 #### Function details
 
@@ -2875,11 +2905,11 @@ The file also defines shared type aliases: `AuthProviderFuture` for the boxed as
 fn from(error: AuthError) -> Self
 ```
 
-**Purpose**: Converts an `AuthError` into the transport-layer error type expected by HTTP execution code.
+**Purpose**: This converts an authentication error into the broader transport error type used when sending requests. It matters because callers higher up can deal with one common kind of send failure instead of learning every auth-specific error.
 
-**Data flow**: Consumes an `AuthError`, matches on its variant, and returns either `TransportError::Build(message)` for deterministic request-construction failures or `TransportError::Network(message)` for transient auth failures. No shared state is accessed.
+**Data flow**: It receives an AuthError. If the problem was building authentication data, it turns that into a transport build error. If the problem was temporary, it turns that into a network-style transport error. The output is a TransportError that can travel through the normal request-sending error path.
 
-**Call relations**: This conversion is used wherever auth application is folded into transport execution, preserving whether the failure should be treated as a build problem or a retryable/transient network-like issue.
+**Call relations**: This function is used whenever an AuthError needs to be treated as a TransportError. It hands the failure off to the transport layer’s existing error categories, using Build for preparation failures and Network for temporary authentication failures.
 
 *Call graph*: 2 external calls (Build, Network).
 
@@ -2890,11 +2920,11 @@ fn from(error: AuthError) -> Self
 fn to_auth_headers(&self) -> HeaderMap
 ```
 
-**Purpose**: Builds a standalone header map containing whatever headers the provider can attach without inspecting the full request.
+**Purpose**: This creates and returns a fresh set of authentication headers from an auth provider. It is useful when code needs just the headers, not a full request.
 
-**Data flow**: Allocates a fresh `HeaderMap`, calls `self.add_auth_headers(&mut headers)`, and returns the populated map. It reads provider state through the trait object and writes only into the local header map.
+**Data flow**: It starts with no headers. It asks the auth provider to add whatever authentication headers it can provide cheaply. It returns the filled HeaderMap, which may contain headers such as Authorization or may be empty.
 
-**Call relations**: Serves callers that need auth headers outside the full request path, such as telemetry or alternate transports, and is layered directly on top of the required `add_auth_headers` method.
+**Call relations**: This is a default helper built on top of AuthProvider::add_auth_headers. Code that needs header-only authentication can call this instead of preparing a whole request, while each provider still controls exactly which headers get added.
 
 *Call graph*: 1 external calls (new).
 
@@ -2905,11 +2935,11 @@ fn to_auth_headers(&self) -> HeaderMap
 fn apply_auth(&self, request: Request) -> AuthProviderFuture<'_>
 ```
 
-**Purpose**: Default async implementation for applying authentication to an owned outbound request.
+**Purpose**: This applies authentication to a complete outgoing request and returns the request that should actually be sent. The default behavior is simple: add authentication headers and leave the rest of the request unchanged.
 
-**Data flow**: Takes ownership of a `Request`, boxes an async block, mutates `request.headers` by calling `self.add_auth_headers`, and returns `Ok(request)`. It does not inspect the body or URL unless an implementer overrides it.
+**Data flow**: It receives an owned Request, meaning it can safely modify it. The default implementation adds auth headers to the request’s header collection, then returns the updated request inside an asynchronous result. If a provider overrides this method, it may inspect or replace the whole request before returning it.
 
-**Call relations**: Used by API clients as the authoritative auth application step before sending a request. Header-only providers rely on this default; request-signing providers can override it to perform richer transformations.
+**Call relations**: The transport path calls this before sending a request. Header-only providers rely on this default implementation, while request-signing providers can override it when they need the final URL, headers, and body bytes before deciding how to authenticate.
 
 *Call graph*: 1 external calls (pin).
 
@@ -2920,11 +2950,11 @@ fn apply_auth(&self, request: Request) -> AuthProviderFuture<'_>
 fn auth_header_telemetry(auth: &dyn AuthProvider) -> AuthHeaderTelemetry
 ```
 
-**Purpose**: Produces a minimal telemetry summary indicating whether an auth provider attaches an `Authorization` header.
+**Purpose**: This checks whether an auth provider would attach an Authorization header, without recording the header’s secret value. It supports safe telemetry: the system can report that authentication was attached without leaking credentials.
 
-**Data flow**: Creates a fresh `HeaderMap`, asks the provider to add auth headers, checks whether the map contains `http::header::AUTHORIZATION`, and returns `AuthHeaderTelemetry { attached, name }` where `name` is `Some("authorization")` only when present.
+**Data flow**: It creates an empty header map, asks the auth provider to add its usual headers, and then checks whether the standard Authorization header is present. It returns AuthHeaderTelemetry with attached set to true or false, and with the header name set to "authorization" only when that header exists.
 
-**Call relations**: This helper is a read-only probe over `AuthProvider::add_auth_headers`, intended for instrumentation paths that need to know whether auth was attached without exposing header values.
+**Call relations**: Telemetry code can call this when it wants to describe authentication behavior safely. It uses the provider’s add_auth_headers method, just like normal header-only authentication, but it only keeps the fact that the header exists, not the sensitive contents.
 
 *Call graph*: 2 external calls (new, add_auth_headers).
 
@@ -2934,11 +2964,13 @@ Adapts authentication state for remote-control transport and MCP servers, includ
 
 ### `app-server-transport/src/transport/remote_control/auth.rs`
 
-`domain_logic` · `remote-control enrollment, reconnect, and unauthorized recovery`
+`domain_logic` · `remote-control setup, enrollment, and reconnect/recovery`
 
-This file contains the small but important auth helpers used by the remote-control subsystem. `RemoteControlConnectionAuth` packages the two pieces remote control needs to talk to backend services: a `SharedAuthProvider` that can add request headers and the authenticated ChatGPT `account_id`. `load_remote_control_auth` repeatedly queries `AuthManager` for current auth, forcing at most one reload when auth is missing or when Codex-backend auth lacks an account id. A key invariant is that API-key auth is explicitly rejected: remote control requires ChatGPT authentication, and if the selected auth does not use the Codex backend the function returns `PermissionDenied`. If auth exists but still lacks an account id after a reload, the function returns `WouldBlock`, signaling that enrollment should wait rather than fail permanently.
+Remote control needs a real ChatGPT account, not just an API key. This file is the gatekeeper for that rule. Before pairing, enrolling, refreshing enrollment, or sending remote-control management requests, other parts of the system ask it to load usable authentication. It checks the current login state, gives the login manager one chance to reload stale information, rejects API-key-only authentication, and returns the two things remote control needs: an auth provider that can supply credentials, and the ChatGPT account id.
 
-`recover_remote_control_auth` drives one step of `UnauthorizedRecovery` after a 401-style failure. It snapshots the auth-change watch revision before recovery, runs the next recovery step, and if that step reports `auth_state_changed == Some(true)` it calls `mark_recovery_auth_change_seen`. That helper intentionally consumes only the single watch revision caused by the recovery itself when the revision advanced by exactly one; if additional external auth changes raced with recovery, they remain pending so the outer reconnect loop still wakes up and reacts. The logging distinguishes successful and failed recovery attempts with mode and step names for observability.
+The file also helps when the server rejects a request as unauthorized. Instead of immediately giving up, it can run the next available recovery step from `UnauthorizedRecovery`, which is a helper that may refresh or repair the saved login. If recovery changes the auth state, the file carefully marks that expected change as already seen in a `watch` channel. A watch channel is like a notice board that wakes listeners when a value changes. This avoids making the outer reconnect loop wake up again for the very change it just caused, while still preserving any separate auth changes that happened at the same time.
+
+Without this file, remote control could start with the wrong kind of login, miss the account id it needs for enrollment, or reconnect too much after recovery.
 
 #### Function details
 
@@ -2950,11 +2982,11 @@ async fn load_remote_control_auth(
 ) -> io::Result<RemoteControlConnectionAuth>
 ```
 
-**Purpose**: Loads the current remote-control-capable auth state from `AuthManager`, reloading once if necessary, and returns the auth provider plus ChatGPT account id. It rejects unsupported auth modes and incomplete auth state with precise `io::ErrorKind`s.
+**Purpose**: This function loads the authentication needed to open or maintain a remote-control connection. It enforces the important rule that remote control requires ChatGPT account authentication and cannot use API-key-only authentication.
 
-**Data flow**: Takes `&Arc<AuthManager>`, loops calling `auth_manager.auth().await`, optionally triggers `auth_manager.reload().await` once when auth is missing or when Codex-backend auth lacks an account id, rejects non-Codex-backend auth with `PermissionDenied`, converts the final auth into a `SharedAuthProvider` via `auth_provider_from_auth`, extracts `account_id`, and returns `RemoteControlConnectionAuth` or an `io::Error` (`PermissionDenied` or `WouldBlock`).
+**Data flow**: It receives a shared `AuthManager`, which is the component that knows the current saved login. It asks for the current auth state; if none is available, or if the account id may be stale, it reloads once and checks again. It then rejects unsupported auth, builds an auth provider from the accepted login, extracts the account id, and returns both wrapped in `RemoteControlConnectionAuth`. If the login is missing or unsuitable, it returns an I/O-style error explaining what is wrong.
 
-**Call relations**: Called by many remote-control operations before making backend requests or enrolling. It is the common prerequisite for obtaining authenticated headers and the account id header.
+**Call relations**: Remote-control actions such as pairing, enrollment, preference persistence, and client-management requests call this before they proceed. It hands them a ready-to-use credential provider and account id, so those higher-level flows do not each need to repeat the same login checks.
 
 *Call graph*: called by 11 (pairing_status, persist_preference, start_pairing, send_client_management_request, enable, resolve_persisted_preference, enroll_pairing_server, refresh_pairing_enrollment, resolve_unknown_desired_state, prepare_remote_control_enrollment (+1 more)); 2 external calls (new, auth_provider_from_auth).
 
@@ -2968,11 +3000,11 @@ async fn recover_remote_control_auth(
 ) -> bool
 ```
 
-**Purpose**: Attempts one unauthorized-recovery step after a remote-control request fails with an auth error, and updates auth-change watch state so the outer reconnect loop does not double-handle recovery-induced changes. It reports whether recovery actually ran successfully.
+**Purpose**: This function tries one step of authentication recovery after remote control hits an unauthorized error. It lets the system refresh or repair login state instead of immediately failing the whole remote-control operation.
 
-**Data flow**: Accepts a mutable `UnauthorizedRecovery` and mutable auth-change `watch::Receiver<u64>`. It returns `false` immediately if no recovery step remains; otherwise it records the current revision, captures the recovery mode and step names, awaits `auth_recovery.next()`, optionally calls `mark_recovery_auth_change_seen` when the step reports that auth state changed, logs success or failure, and returns `true` on successful recovery step completion or `false` on error.
+**Data flow**: It receives an `UnauthorizedRecovery` object, which knows possible recovery steps, and a watch receiver that tracks auth-state revisions. It first checks whether another recovery step exists. If so, it records the current auth revision, runs the next recovery step, logs whether it succeeded, and returns `true` on success or `false` on failure. When the recovery step says it changed auth state, it also updates the watch receiver so the expected recovery-triggered change is not treated as a separate outside change.
 
-**Call relations**: Called by remote-control request/enrollment flows after unauthorized responses. It delegates revision bookkeeping to `mark_recovery_auth_change_seen`.
+**Call relations**: Remote-control request and enrollment flows call this when authorization fails. When recovery reports that auth changed, this function delegates to `mark_recovery_auth_change_seen` to keep the surrounding reconnect logic from reacting twice to the same recovery event.
 
 *Call graph*: calls 5 internal fn (mark_recovery_auth_change_seen, has_next, mode_name, next, step_name); called by 5 (send_client_management_request, enroll_pairing_server, refresh_pairing_enrollment, enroll_and_persist_remote_control_server, prepare_remote_control_enrollment); 3 external calls (borrow, info!, warn!).
 
@@ -2986,24 +3018,26 @@ fn mark_recovery_auth_change_seen(
 )
 ```
 
-**Purpose**: Consumes exactly the auth-change watch revision produced by a recovery step, but leaves later racing revisions pending. This preserves the outer reconnect loop's ability to notice external auth changes that happened during recovery.
+**Purpose**: This function marks exactly one expected auth-change notification as already seen after recovery changes the login state. Its job is to prevent a needless reconnect wake-up without hiding later, separate auth changes.
 
-**Data flow**: Takes a mutable auth-change receiver and the revision observed before recovery. It reads the current revision; if it equals `before.wrapping_add(1)`, it calls `borrow_and_update()` to mark that single revision seen. Otherwise it does nothing.
+**Data flow**: It receives the watch receiver and the auth revision number from before recovery began. It compares that old revision with the receiver’s current revision. If the current value is exactly one step newer, it treats that single change as the recovery’s own update and marks it seen. If the value has moved further, it leaves the notification pending because another auth change may have arrived while recovery was running.
 
-**Call relations**: Called by `recover_remote_control_auth` when a recovery step reports that it changed auth state, and directly exercised by tests covering revision-race behavior.
+**Call relations**: It is called by `recover_remote_control_auth` after a successful recovery step that changed auth state. Tests also exercise it directly to confirm the careful behavior: mark only the recovery revision, but do not swallow a racing external auth change.
 
 *Call graph*: called by 3 (recover_remote_control_auth, mark_recovery_auth_change_seen_marks_only_recovery_revision_seen, mark_recovery_auth_change_seen_preserves_racing_auth_change); 2 external calls (borrow, borrow_and_update).
 
 
 ### `rmcp-client/src/auth_status.rs`
 
-`domain_logic` · `connection setup, auth capability detection`
+`domain_logic` · `MCP server connection setup and authentication checks`
 
-This file implements authentication-status inference for HTTP-based MCP servers. The top-level decision function, `determine_streamable_http_auth_status`, follows a deliberate precedence order. First, if a bearer-token environment variable is configured, it immediately returns `McpAuthStatus::BearerToken`. Next it builds default headers from explicit and environment-derived header maps; if those headers already contain `Authorization`, it also returns bearer-token mode. Only if no bearer token is configured does it consult local OAuth storage via `oauth_token_status`: a usable stored token yields `OAuth`, an authorization-required state yields `NotLoggedIn`, and a missing token falls through to network discovery.
+When the client is about to connect to an MCP server over HTTP, it needs to answer a practical question: “Do we already have credentials, do we need to ask the user to log in, or is login not available?” This file is that decision point.
 
-Discovery is split into public wrappers and a private implementation. `discover_streamable_http_oauth_with_headers` parses the base URL, builds a reqwest client with a 5-second timeout and `no_proxy()` workaround, applies default headers, and probes a sequence of well-known metadata paths derived from the base path. For each candidate it sends a GET with `MCP-Protocol-Version: 2024-11-05`, ignores non-200 responses, and attempts to deserialize `OAuthDiscoveryMetadata`. OAuth support is recognized only when both `authorization_endpoint` and `token_endpoint` are present. Optional `scopes_supported` values are normalized by trimming whitespace, dropping empties, and deduplicating while preserving order.
+It checks the simplest cases first. If the server configuration names a bearer token environment variable, or if the configured HTTP headers already include an Authorization header, the server is treated as using a bearer token. A bearer token is like a pre-issued pass that gets shown with each request.
 
-Errors during probing are intentionally soft: the function remembers the last request/JSON error for debug logging, but callers generally degrade to `Unsupported` rather than failing the whole auth-status computation. The tests cover bearer-token precedence, environment-backed header expansion, scope normalization, empty-scope suppression, and the fact that OAuth support does not require `scopes_supported` to be present.
+If no bearer token is present, the file asks the OAuth token store whether there is already a usable saved OAuth token. OAuth is a standard way for a user to approve access without directly sharing a password. If a saved token is usable, the server is marked as OAuth-authenticated. If the token store says user approval is required, the server is marked as not logged in.
+
+If no saved token exists, the file tries OAuth discovery. It sends short timed HTTP requests to standard “well-known” URLs and looks for metadata containing both an authorization endpoint and a token endpoint. Those are the two basic addresses needed to start and finish an OAuth login. It also cleans up advertised scopes, which are permission names, by trimming blanks and removing duplicates. If discovery fails or finds nothing, the server is treated as unsupported for OAuth login.
 
 #### Function details
 
@@ -3018,11 +3052,11 @@ async fn determine_streamable_http_auth_status(
     env_http_headers: O
 ```
 
-**Purpose**: Computes the effective authentication mode for a streamable HTTP MCP server by checking bearer-token configuration first, then stored OAuth token state, then live OAuth discovery. It intentionally treats discovery failures as non-fatal and falls back to `Unsupported`.
+**Purpose**: Decides the current authentication state for one streamable HTTP MCP server. It answers whether the client should use a bearer token, use an existing OAuth login, ask the user to log in, or treat OAuth as unavailable.
 
-**Data flow**: Takes server identity/config inputs: `server_name`, `url`, optional `bearer_token_env_var`, optional explicit and env-derived HTTP header maps, and OAuth storage settings. If `bearer_token_env_var` is present it returns `BearerToken`. Otherwise it builds default headers with `build_default_headers`; if those contain `AUTHORIZATION`, it returns `BearerToken`. It then queries `oauth_token_status(server_name, url, store_mode, keyring_backend_kind)`: `Usable` maps to `OAuth`, `AuthorizationRequired` to `NotLoggedIn`, and `Missing` continues. Finally it awaits `discover_streamable_http_oauth_with_headers(url, &default_headers)` and maps `Some(_)` to `NotLoggedIn`, `None` to `Unsupported`, and any error to a debug log plus `Unsupported`.
+**Data flow**: It receives the server name, server URL, possible bearer-token configuration, configured HTTP headers, and settings for where OAuth tokens are stored. It first checks for bearer-token evidence, then checks the saved OAuth token store, then tries live OAuth discovery against the server. It returns an McpAuthStatus value and does not change the server; it only reads configuration, stored token status, and possible discovery responses.
 
-**Call relations**: This is the main policy function used by callers deciding how to authenticate to an MCP server. It delegates header synthesis to `build_default_headers`, local credential inspection to `oauth_token_status`, and network probing to `discover_streamable_http_oauth_with_headers`.
+**Call relations**: This is the main public decision function in the file. The tests call it to confirm bearer-token cases. During its work it asks build_default_headers to combine header configuration, oauth_token_status to inspect saved login state, and discover_streamable_http_oauth_with_headers to see whether the server advertises OAuth support. If discovery errors, it logs a debug message and chooses the safe fallback of Unsupported.
 
 *Call graph*: calls 3 internal fn (discover_streamable_http_oauth_with_headers, oauth_token_status, build_default_headers); called by 2 (determine_auth_status_uses_bearer_token_when_authorization_header_present, determine_auth_status_uses_bearer_token_when_env_authorization_header_present); 1 external calls (debug!).
 
@@ -3033,11 +3067,11 @@ async fn determine_streamable_http_auth_status(
 async fn supports_oauth_login(url: &str) -> Result<bool>
 ```
 
-**Purpose**: Provides a simple yes/no wrapper around OAuth discovery with no custom headers. It answers whether the server advertises OAuth login capability at all.
+**Purpose**: Checks whether a server appears to support OAuth login at all. It is a simpler yes-or-no wrapper for callers that do not need the full authentication status.
 
-**Data flow**: Takes `url: &str`, calls `discover_streamable_http_oauth(url, None, None).await?`, converts the resulting `Option` to `bool` with `.is_some()`, and returns `Result<bool>`.
+**Data flow**: It receives a server URL. It runs OAuth discovery without extra headers, then turns “some discovery metadata was found” into true and “nothing was found” into false. Errors from discovery are passed back to the caller.
 
-**Call relations**: Used by tests and higher-level callers that only need capability detection, not full auth-status classification. It delegates all probing work to `discover_streamable_http_oauth`.
+**Call relations**: This function sits above discover_streamable_http_oauth as a convenience layer. The test supports_oauth_login_does_not_require_scopes_supported calls it to verify that a server can count as OAuth-capable even if it does not list permission scopes.
 
 *Call graph*: calls 1 internal fn (discover_streamable_http_oauth); called by 1 (supports_oauth_login_does_not_require_scopes_supported).
 
@@ -3052,11 +3086,11 @@ async fn discover_streamable_http_oauth(
 ) -> Result<Option<StreamableHttpOAuth
 ```
 
-**Purpose**: Builds default headers from configuration and performs OAuth discovery against the target URL. It is the public discovery entrypoint when callers may supply custom headers.
+**Purpose**: Looks for OAuth discovery metadata for a server, while allowing the caller to provide normal or environment-based HTTP headers. Use this when you want the discovered details, not just a yes-or-no answer.
 
-**Data flow**: Takes `url`, optional explicit `http_headers`, and optional `env_http_headers`. It computes a `HeaderMap` via `build_default_headers` and then awaits `discover_streamable_http_oauth_with_headers(url, &default_headers)`, returning the resulting `Option<StreamableHttpOAuthDiscovery>`.
+**Data flow**: It receives a URL and optional header maps. It builds a final set of default headers, then passes the URL and those headers to the lower-level discovery function. It returns either discovery details, no discovery result, or an error if header building or discovery fails.
 
-**Call relations**: Called by `supports_oauth_login` and tests. It exists mainly to separate header construction from the lower-level probing loop in `discover_streamable_http_oauth_with_headers`.
+**Call relations**: This is the public discovery entry point. supports_oauth_login calls it for a boolean check, and discovery-focused tests call it to confirm scope cleanup. It delegates header preparation to build_default_headers and actual network probing to discover_streamable_http_oauth_with_headers.
 
 *Call graph*: calls 2 internal fn (discover_streamable_http_oauth_with_headers, build_default_headers); called by 3 (supports_oauth_login, discover_streamable_http_oauth_ignores_empty_scopes, discover_streamable_http_oauth_returns_normalized_scopes).
 
@@ -3070,11 +3104,11 @@ async fn discover_streamable_http_oauth_with_headers(
 ) -> Result<Option<StreamableHttpOAuthDiscovery>>
 ```
 
-**Purpose**: Probes RFC 8414-style well-known metadata endpoints derived from the server URL and returns normalized OAuth discovery data when both authorization and token endpoints are advertised. It tolerates individual request and parse failures across candidate paths.
+**Purpose**: Performs the actual HTTP probing for OAuth discovery metadata. It tries the standard OAuth discovery paths and accepts a server as OAuth-capable only when the metadata contains both authorization and token endpoints.
 
-**Data flow**: Takes `url: &str` and a prepared `default_headers: &HeaderMap`. It parses the URL, builds a reqwest `Client` with `DISCOVERY_TIMEOUT` and `no_proxy()`, applies default headers via `apply_default_headers`, and initializes `last_error`. It iterates over `discovery_paths(base_url.path())`, cloning the base URL and replacing its path for each candidate. For each URL it sends a GET with header `MCP-Protocol-Version: 2024-11-05`; request errors are stored in `last_error` and skipped. Non-200 responses are ignored. Successful 200 responses are parsed as `OAuthDiscoveryMetadata`; JSON errors are stored and skipped. If both `authorization_endpoint` and `token_endpoint` are present, it returns `Some(StreamableHttpOAuthDiscovery { scopes_supported: normalize_scopes(metadata.scopes_supported) })`. After all candidates, it debug-logs `last_error` if any and returns `Ok(None)`.
+**Data flow**: It receives a URL and already-built default headers. It parses the URL, creates a short-timeout HTTP client with those headers, computes possible discovery paths, and sends GET requests with the MCP protocol-version discovery header. For each successful OK response, it parses JSON metadata and checks for the two required OAuth endpoint fields. If found, it returns discovery details with cleaned scopes; otherwise it returns None after trying all paths. It records and logs request or JSON parse failures but keeps trying other paths.
 
-**Call relations**: This private helper is the engine behind both `determine_streamable_http_auth_status` and `discover_streamable_http_oauth`. It delegates candidate generation to `discovery_paths`, header application to `apply_default_headers`, and scope cleanup to `normalize_scopes`.
+**Call relations**: This is the engine used by both the full authentication decision and the public discovery function. It relies on discovery_paths to know where to look, apply_default_headers to attach configured headers to the HTTP client, and normalize_scopes to tidy the permission list before returning it.
 
 *Call graph*: calls 3 internal fn (discovery_paths, normalize_scopes, apply_default_headers); called by 2 (determine_streamable_http_auth_status, discover_streamable_http_oauth); 3 external calls (parse, builder, debug!).
 
@@ -3085,11 +3119,11 @@ async fn discover_streamable_http_oauth_with_headers(
 fn normalize_scopes(scopes_supported: Option<Vec<String>>) -> Option<Vec<String>>
 ```
 
-**Purpose**: Cleans up the optional `scopes_supported` list from discovery metadata by trimming whitespace, removing empty entries, and deduplicating while preserving first-seen order. It returns `None` when nothing meaningful remains.
+**Purpose**: Cleans up the OAuth permission names advertised by a server. This keeps later code from seeing duplicate scopes or scopes that are only blank spaces.
 
-**Data flow**: Takes `Option<Vec<String>>`; if `None`, returns `None` immediately. Otherwise it iterates through the vector, trims each scope, skips empties, converts the trimmed value back to `String`, pushes it into a new `Vec` only if not already present, and finally returns `Some(normalized)` unless the normalized vector is empty, in which case it returns `None`.
+**Data flow**: It receives an optional list of scope strings. If there is no list, it returns None. If there is a list, it trims whitespace from each item, skips empty items, keeps only the first copy of each unique scope, and returns the cleaned list. If nothing meaningful remains, it returns None.
 
-**Call relations**: Called only by `discover_streamable_http_oauth_with_headers` after successful metadata parsing, so callers receive a cleaned scope list instead of raw server-provided strings.
+**Call relations**: discover_streamable_http_oauth_with_headers calls this after it has accepted valid OAuth metadata. The discovery tests exercise this behavior by serving duplicated, padded, and empty scope values.
 
 *Call graph*: called by 1 (discover_streamable_http_oauth_with_headers); 1 external calls (new).
 
@@ -3100,11 +3134,11 @@ fn normalize_scopes(scopes_supported: Option<Vec<String>>) -> Option<Vec<String>
 fn discovery_paths(base_path: &str) -> Vec<String>
 ```
 
-**Purpose**: Generates the ordered set of well-known OAuth discovery paths to try for a given base path, following RFC 8414-style conventions and avoiding duplicates. It handles both root and nested MCP paths.
+**Purpose**: Builds the list of well-known URL paths where OAuth discovery metadata might live for a given server path. This follows the standard OAuth discovery rule while also trying practical alternatives for MCP servers mounted under a path.
 
-**Data flow**: Takes `base_path: &str`, trims leading/trailing slashes, defines the canonical path `/.well-known/oauth-authorization-server`, and returns either `[canonical]` for an empty path or a deduplicated vector containing `canonical/trimmed`, `/trimmed/.well-known/oauth-authorization-server`, and `canonical` in that order.
+**Data flow**: It receives the path part of the server URL. It removes leading and trailing slashes, then creates one or more candidate discovery paths. For a root server it returns only the canonical well-known path. For a server under a path, it returns unique candidates that place the well-known OAuth path before, inside, and at the root.
 
-**Call relations**: Used by `discover_streamable_http_oauth_with_headers` to decide which metadata endpoints to probe for a given server URL.
+**Call relations**: discover_streamable_http_oauth_with_headers calls this before sending network requests. It acts like a small route planner: given the server’s base address, it tells the probing code which doors to knock on.
 
 *Call graph*: called by 1 (discover_streamable_http_oauth_with_headers); 3 external calls (new, format!, vec!).
 
@@ -3115,11 +3149,11 @@ fn discovery_paths(base_path: &str) -> Vec<String>
 fn drop(&mut self)
 ```
 
-**Purpose**: Stops the spawned test HTTP server when the helper struct goes out of scope. It ensures tests do not leave background tasks running.
+**Purpose**: Stops a temporary test web server when the test helper object goes away. This prevents background test servers from continuing to run after a test is finished.
 
-**Data flow**: Mutably borrows `self` and calls `self.handle.abort()`. It returns `()` and performs no other cleanup.
+**Data flow**: It reads the stored background task handle inside the TestServer helper. When the helper is dropped, it aborts that task. It returns nothing, but it changes the running test environment by stopping the spawned server task.
 
-**Call relations**: Triggered automatically at the end of tests that use `spawn_oauth_discovery_server`, providing teardown for the background Axum server task.
+**Call relations**: This is used automatically by Rust when a TestServer value leaves scope. The test server is created by tests::spawn_oauth_discovery_server, and this drop behavior is the cleanup step for those tests.
 
 *Call graph*: 1 external calls (abort).
 
@@ -3130,11 +3164,11 @@ fn drop(&mut self)
 async fn spawn_oauth_discovery_server(metadata: serde_json::Value) -> TestServer
 ```
 
-**Purpose**: Starts a temporary local Axum server that serves fixed OAuth discovery metadata at the expected well-known path for `/mcp`. It gives tests a controllable discovery target.
+**Purpose**: Starts a tiny local HTTP server for tests that need fake OAuth discovery metadata. It lets tests check discovery behavior without depending on an external network service.
 
-**Data flow**: Takes `metadata: serde_json::Value`, binds a Tokio TCP listener on `127.0.0.1:0`, reads the assigned address, builds a `Router` with a GET route at `/.well-known/oauth-authorization-server/mcp` returning `Json(metadata.clone())`, spawns `axum::serve(listener, app)`, and returns `TestServer { url: format!("http://{address}/mcp"), handle }`.
+**Data flow**: It receives a JSON value to serve as OAuth metadata. It binds a local TCP port, creates a route at the expected well-known discovery path, spawns the server in the background, and returns a TestServer containing the URL and task handle. The caller can then point discovery code at that URL.
 
-**Call relations**: Used by the discovery-related async tests to exercise `discover_streamable_http_oauth` and `supports_oauth_login` against a real HTTP endpoint.
+**Call relations**: The OAuth discovery tests call this to set up controlled server responses. The returned TestServer later triggers tests::TestServer::drop for cleanup.
 
 *Call graph*: 7 external calls (new, clone, get, serve, format!, bind, spawn).
 
@@ -3145,11 +3179,11 @@ async fn spawn_oauth_discovery_server(metadata: serde_json::Value) -> TestServer
 fn set(key: &str, value: &str) -> Self
 ```
 
-**Purpose**: Temporarily sets an environment variable for a test while remembering its previous value. It supports restoration in the guard’s `Drop` implementation.
+**Purpose**: Temporarily sets an environment variable for a test while remembering its previous value. This keeps tests from permanently changing the process environment.
 
-**Data flow**: Takes `key` and `value`, reads the original value with `std::env::var_os(key)`, unsafely sets the new value with `std::env::set_var`, and returns `EnvVarGuard { key: key.to_string(), original }`.
+**Data flow**: It receives an environment variable name and value. It reads the original value, sets the new value, and returns an EnvVarGuard containing both the key and the original value. The changed environment remains in place until the guard is dropped.
 
-**Call relations**: Used by the env-header auth-status test to inject a bearer token source that `build_default_headers` can resolve.
+**Call relations**: The environment-header bearer-token test calls this before running determine_streamable_http_auth_status. Its companion cleanup happens in tests::EnvVarGuard::drop.
 
 *Call graph*: 2 external calls (set_var, var_os).
 
@@ -3160,11 +3194,11 @@ fn set(key: &str, value: &str) -> Self
 fn drop(&mut self)
 ```
 
-**Purpose**: Restores the environment variable state captured by `EnvVarGuard::set`. It either resets the original value or removes the variable entirely.
+**Purpose**: Restores an environment variable after a test changed it. This protects other tests from being affected by leftover environment settings.
 
-**Data flow**: On drop, checks `self.original`; if present it unsafely calls `std::env::set_var(&self.key, value)`, otherwise it unsafely calls `std::env::remove_var(&self.key)`.
+**Data flow**: It reads the key and saved original value stored in the guard. If the variable existed before, it sets it back to that value. If it did not exist before, it removes the variable. It returns nothing, but it restores the process environment.
 
-**Call relations**: Runs automatically after tests using `EnvVarGuard::set`, ensuring environment mutations do not leak across serial or unrelated tests.
+**Call relations**: Rust calls this automatically when the EnvVarGuard leaves scope. It completes the temporary setup started by tests::EnvVarGuard::set.
 
 *Call graph*: 2 external calls (remove_var, set_var).
 
@@ -3175,11 +3209,11 @@ fn drop(&mut self)
 async fn determine_auth_status_uses_bearer_token_when_authorization_header_present()
 ```
 
-**Purpose**: Verifies that an explicit Authorization header in configured HTTP headers takes precedence and yields `BearerToken` without requiring URL validity or discovery. It checks the early-return path.
+**Purpose**: Verifies that an explicit Authorization HTTP header makes the server count as bearer-token authenticated. This protects the shortcut that avoids unnecessary OAuth checks when a token is already configured.
 
-**Data flow**: Calls `determine_streamable_http_auth_status` with `http_headers` containing `Authorization: Bearer token`, no env headers, and default keyring backend, awaits the result, and asserts it equals `McpAuthStatus::BearerToken`.
+**Data flow**: It builds a header map containing an Authorization value and calls determine_streamable_http_auth_status with an intentionally invalid URL. Because the header should be enough, the function should not need to parse or contact that URL. The test expects the returned status to be BearerToken.
 
-**Call relations**: This test targets the branch in `determine_streamable_http_auth_status` immediately after `build_default_headers` where presence of `AUTHORIZATION` short-circuits all later OAuth logic.
+**Call relations**: This test directly exercises determine_streamable_http_auth_status. It confirms that build_default_headers and the early bearer-token check happen before any OAuth discovery work.
 
 *Call graph*: calls 2 internal fn (default, determine_streamable_http_auth_status); 2 external calls (from, assert_eq!).
 
@@ -3190,11 +3224,11 @@ async fn determine_auth_status_uses_bearer_token_when_authorization_header_prese
 async fn determine_auth_status_uses_bearer_token_when_env_authorization_header_present()
 ```
 
-**Purpose**: Checks that an Authorization header sourced indirectly from an environment variable is also recognized as bearer-token mode. It validates integration between env expansion and auth-status precedence.
+**Purpose**: Verifies that an Authorization header whose value comes from an environment variable also counts as bearer-token authentication. This covers the common pattern of keeping secrets out of static config files.
 
-**Data flow**: Creates an `EnvVarGuard` setting a token variable, calls `determine_streamable_http_auth_status` with `env_http_headers` mapping `Authorization` to that variable name, awaits the result, and asserts `BearerToken`.
+**Data flow**: It temporarily sets an environment variable to a bearer-token value, configures the Authorization header to read from that variable, and calls determine_streamable_http_auth_status. The expected result is BearerToken. After the test, the environment variable is restored by the guard.
 
-**Call relations**: This test exercises the interaction between `build_default_headers` and `determine_streamable_http_auth_status`, proving env-derived Authorization headers trigger the same early return as explicit ones.
+**Call relations**: This test uses tests::EnvVarGuard::set for safe environment setup and then calls determine_streamable_http_auth_status. It checks the path where build_default_headers resolves environment-based header values before the main function checks for Authorization.
 
 *Call graph*: calls 3 internal fn (set, default, determine_streamable_http_auth_status); 2 external calls (from, assert_eq!).
 
@@ -3205,11 +3239,11 @@ async fn determine_auth_status_uses_bearer_token_when_env_authorization_header_p
 async fn discover_streamable_http_oauth_returns_normalized_scopes()
 ```
 
-**Purpose**: Verifies that discovery succeeds when both OAuth endpoints are present and that scope normalization trims whitespace, removes empties, and deduplicates. It checks the exact shape of returned `scopes_supported`.
+**Purpose**: Verifies that OAuth discovery returns a cleaned scope list. It makes sure duplicate scopes, padded spaces, and blank entries do not leak into the result.
 
-**Data flow**: Spawns a local discovery server returning metadata with authorization/token endpoints and a noisy `scopes_supported` array, calls `discover_streamable_http_oauth(&server.url, None, None).await`, unwraps the `Some` result, and asserts the scopes equal `["profile", "email"]`.
+**Data flow**: It starts a local test server that returns valid OAuth metadata with messy scopes. It calls discover_streamable_http_oauth against that server URL. The expected discovery result contains only profile and email, with whitespace removed and the duplicate profile removed.
 
-**Call relations**: This test drives the full discovery path through `discover_streamable_http_oauth`, `discover_streamable_http_oauth_with_headers`, and `normalize_scopes`.
+**Call relations**: This test uses tests::spawn_oauth_discovery_server to provide fake metadata, then drives discover_streamable_http_oauth. Through that path it also verifies the behavior of discover_streamable_http_oauth_with_headers and normalize_scopes.
 
 *Call graph*: calls 1 internal fn (discover_streamable_http_oauth); 3 external calls (assert_eq!, spawn_oauth_discovery_server, json!).
 
@@ -3220,11 +3254,11 @@ async fn discover_streamable_http_oauth_returns_normalized_scopes()
 async fn discover_streamable_http_oauth_ignores_empty_scopes()
 ```
 
-**Purpose**: Ensures that a discovery document with only blank scope strings still counts as OAuth-capable but returns `None` for `scopes_supported`. It validates the empty-result behavior of normalization.
+**Purpose**: Verifies that a server listing only blank scopes is treated as having no useful scope list. This keeps meaningless permission names out of the discovery result.
 
-**Data flow**: Starts a local server whose metadata includes valid endpoints and only empty/whitespace scopes, calls `discover_streamable_http_oauth`, unwraps the discovery result, and asserts `discovery.scopes_supported == None`.
+**Data flow**: It starts a local test server with valid OAuth endpoints but scopes that are empty strings or only spaces. It calls discover_streamable_http_oauth and expects discovery to succeed, while scopes_supported is None.
 
-**Call relations**: This test specifically targets `normalize_scopes` returning `None` after filtering all entries away, while discovery itself still succeeds.
+**Call relations**: This test again uses the local discovery server helper and the public discovery function. It specifically protects the branch in normalize_scopes that turns an empty cleaned list into None.
 
 *Call graph*: calls 1 internal fn (discover_streamable_http_oauth); 3 external calls (assert_eq!, spawn_oauth_discovery_server, json!).
 
@@ -3235,22 +3269,28 @@ async fn discover_streamable_http_oauth_ignores_empty_scopes()
 async fn supports_oauth_login_does_not_require_scopes_supported()
 ```
 
-**Purpose**: Checks that OAuth support detection depends only on the presence of authorization and token endpoints, not on `scopes_supported`. It guards against over-strict discovery requirements.
+**Purpose**: Verifies that a server can support OAuth login even if it does not advertise scopes. The required evidence is the authorization endpoint and token endpoint, not a permission list.
 
-**Data flow**: Spawns a local server returning metadata with only `authorization_endpoint` and `token_endpoint`, calls `supports_oauth_login(&server.url).await`, and asserts the boolean is true.
+**Data flow**: It starts a local test server returning OAuth metadata with the two required endpoints and no scopes_supported field. It calls supports_oauth_login and expects true.
 
-**Call relations**: This test exercises the simplified wrapper `supports_oauth_login`, which delegates to `discover_streamable_http_oauth` and succeeds even when scope metadata is absent.
+**Call relations**: This test calls supports_oauth_login, which in turn calls discover_streamable_http_oauth. It confirms the higher-level yes-or-no check is based on OAuth endpoint discovery rather than optional scope metadata.
 
 *Call graph*: calls 1 internal fn (supports_oauth_login); 3 external calls (assert!, spawn_oauth_discovery_server, json!).
 
 
 ### `codex-mcp/src/mcp/auth.rs`
 
-`domain_logic` · `auth discovery and snapshot collection`
+`domain_logic` · `auth setup and server status checking`
 
-This file concentrates the auth-facing logic for MCP servers. Its small data types capture three distinct concerns: `McpOAuthLoginConfig` describes a streamable-HTTP server that can participate in OAuth login, `McpOAuthLoginSupport` distinguishes supported/unsupported/errored discovery outcomes, and `ResolvedMcpOAuthScopes` records both the chosen scope list and whether it came from explicit input, config, discovery, or an empty fallback. The scope resolver is intentionally precedence-based: explicit scopes always win, configured scopes override discovery even when configured as an empty list, and discovered scopes are only used when non-empty. That preserves user intent and avoids silently broadening requests.
+MCP servers can be reached in different ways. Some run locally over standard input/output, while others are remote HTTP services that may need a bearer token or an OAuth login. This file is the project’s “auth checker” for those servers. Without it, the rest of the system would not know whether a server is already usable, needs OAuth, has a token, or cannot be authenticated through this flow.
 
-For runtime status collection, the file walks effective servers concurrently with `join_all`, cloning each server name and optional configured `McpServerConfig` into a `McpAuthStatusEntry`. A special case marks the built-in `codex_apps` server as `BearerToken` when ChatGPT-backed runtime auth is active and the transport does not already specify a bearer-token environment variable. Disabled servers, stdio transports, missing configs, and failures to inspect auth all collapse to `McpAuthStatus::Unsupported`, with failures logged via `tracing::warn` rather than propagated. Streamable HTTP auth determination is delegated to `codex_rmcp_client`, but this file decides when that machinery is applicable and how errors affect user-visible status. The included tests pin down subtle scope precedence and retry behavior for provider-side `invalid_scope` style failures.
+The file first defines small data shapes for describing OAuth login support, where scopes came from, and the final authentication status for a server. A scope is a named permission requested during OAuth, like asking for “read files” rather than “full access.”
+
+For a single HTTP transport, `oauth_login_support` asks the remote service whether it advertises OAuth support. It refuses OAuth when the config already says to use a bearer token from an environment variable, because that is a different auth path. `discover_supported_scopes` is a lighter helper that only returns the scopes discovered from the server.
+
+When scopes can come from several places, `resolve_oauth_scopes` applies a clear priority: caller-provided scopes first, then configured scopes, then discovered non-empty scopes, then no scopes. `should_retry_without_scopes` adds one practical fallback: if server-discovered scopes are rejected by the OAuth provider, try again without them.
+
+Finally, `compute_auth_statuses` checks many servers at once and records each server’s config plus its current auth status. It delegates each individual decision to `compute_auth_status`, which separates unsupported local servers, disabled servers, runtime Codex auth, bearer-token HTTP, and OAuth-capable HTTP.
 
 #### Function details
 
@@ -3260,11 +3300,11 @@ For runtime status collection, the file walks effective servers concurrently wit
 async fn oauth_login_support(transport: &McpServerTransportConfig) -> McpOAuthLoginSupport
 ```
 
-**Purpose**: Checks whether a transport can use Codex's interactive OAuth login flow. It only considers `McpServerTransportConfig::StreamableHttp` transports without a configured bearer-token environment variable, then performs OAuth discovery against the server URL.
+**Purpose**: Checks whether one MCP server transport can use OAuth login. It only supports streamable HTTP transports without a preconfigured bearer-token environment variable, then asks the server whether it advertises OAuth details.
 
-**Data flow**: Reads a borrowed `McpServerTransportConfig`. If the transport is not `StreamableHttp`, or if `bearer_token_env_var` is present, it immediately returns `McpOAuthLoginSupport::Unsupported`. Otherwise it clones the URL and optional header maps, calls remote discovery, and converts `Ok(Some(...))` into `Supported(McpOAuthLoginConfig { url, http_headers, env_http_headers, discovered_scopes })`, `Ok(None)` into `Unsupported`, and discovery errors into `Unknown(anyhow::Error)`.
+**Data flow**: It receives a transport configuration. If the transport is not streamable HTTP, or if it already uses a bearer token from an environment variable, it returns “unsupported.” Otherwise it sends the URL and any configured HTTP headers to OAuth discovery; a successful discovery becomes a login config with the URL, headers, and discovered scopes, no discovery becomes “unsupported,” and a discovery failure becomes “unknown” with the error attached.
 
-**Call relations**: This is the primitive used by `discover_supported_scopes` when callers only need scopes. Its main delegation is to `discover_streamable_http_oauth`, because this file decides eligibility for discovery while the external client library performs the actual protocol probe.
+**Call relations**: This is the deeper check used by `discover_supported_scopes` when code only wants to know which scopes the server says it supports. It hands the network discovery work to `discover_streamable_http_oauth`, then wraps the result in this file’s simpler support categories.
 
 *Call graph*: called by 1 (discover_supported_scopes); 3 external calls (Supported, Unknown, discover_streamable_http_oauth).
 
@@ -3277,11 +3317,11 @@ async fn discover_supported_scopes(
 ) -> Option<Vec<String>>
 ```
 
-**Purpose**: Extracts only the discovered OAuth scopes for a transport, if interactive OAuth login is supported. Unsupported transports and discovery failures both collapse to `None`.
+**Purpose**: Returns the OAuth scopes advertised by a server, if OAuth discovery succeeds. It is a convenience wrapper for callers that do not need the full login-support result.
 
-**Data flow**: Accepts a borrowed `McpServerTransportConfig`, awaits `oauth_login_support`, and pattern-matches the result. It returns `config.discovered_scopes` from the supported case and `None` for unsupported or unknown outcomes.
+**Data flow**: It receives a transport configuration and passes it to `oauth_login_support`. If OAuth is supported, it extracts the discovered scopes from the returned login config. If OAuth is unsupported or discovery failed, it returns nothing.
 
-**Call relations**: This is a thin convenience wrapper over `oauth_login_support`, used when callers do not need the full login configuration or error classification.
+**Call relations**: This function sits one level above `oauth_login_support`. It calls that fuller checker, then narrows the answer down to just the optional list of scopes for later OAuth login decisions.
 
 *Call graph*: calls 1 internal fn (oauth_login_support).
 
@@ -3296,11 +3336,11 @@ fn resolve_oauth_scopes(
 ) -> ResolvedMcpOAuthScopes
 ```
 
-**Purpose**: Chooses the final OAuth scope list from explicit input, server configuration, and discovery results, while recording where that choice came from. It preserves an explicitly empty configured scope list instead of falling through to discovery.
+**Purpose**: Chooses which OAuth scopes to request when several possible sources exist. This keeps scope selection predictable and makes it clear whether the scopes were chosen by the caller, the user’s config, server discovery, or not at all.
 
-**Data flow**: Consumes three `Option<Vec<String>>` inputs in priority order. It returns a `ResolvedMcpOAuthScopes` containing the first applicable vector and a matching `McpOAuthScopesSource`: `Explicit`, then `Configured`, then non-empty `Discovered`; if none apply, it returns an empty vector with source `Empty`.
+**Data flow**: It receives three optional scope lists: explicit scopes, configured scopes, and discovered scopes. It returns the first valid choice in priority order: explicit scopes if present, otherwise configured scopes if present, otherwise discovered scopes only if that list is not empty, otherwise an empty list. The result also records which source won.
 
-**Call relations**: This function is exercised directly by the unit tests in this file, which verify the precedence rules and the special handling of empty configured scopes. It is pure logic and does not delegate to runtime services.
+**Call relations**: The test functions in this file call it to lock down its priority rules. Other OAuth login code can rely on this helper so every caller follows the same “who gets to decide permissions” rule.
 
 *Call graph*: called by 5 (resolve_oauth_scopes_falls_back_to_empty, resolve_oauth_scopes_prefers_configured_over_discovered, resolve_oauth_scopes_prefers_explicit, resolve_oauth_scopes_preserves_explicitly_empty_configured_scopes, resolve_oauth_scopes_uses_discovered_when_needed); 1 external calls (new).
 
@@ -3311,11 +3351,11 @@ fn resolve_oauth_scopes(
 fn should_retry_without_scopes(scopes: &ResolvedMcpOAuthScopes, error: &anyhow::Error) -> bool
 ```
 
-**Purpose**: Decides whether an OAuth login attempt should be retried with no scopes after a failure. The retry is only allowed when the rejected scopes came from discovery rather than explicit or configured input.
+**Purpose**: Decides whether an OAuth login should be tried again with no scopes. This is a safety valve for the case where the server advertised scopes, but the OAuth provider rejects them.
 
-**Data flow**: Reads a `ResolvedMcpOAuthScopes` and an `anyhow::Error`. It returns `true` only if `scopes.source == McpOAuthScopesSource::Discovered` and the error can be downcast to `OAuthProviderError`; otherwise it returns `false`.
+**Data flow**: It receives the previously resolved scopes and an error from a failed OAuth attempt. It returns true only when the scopes came from discovery and the error is specifically an OAuth provider error. It returns false for user-configured scopes, explicit scopes, empty scopes, or unrelated errors.
 
-**Call relations**: This is standalone decision logic used by higher-level OAuth flows to avoid overriding explicit user or config choices while still recovering from provider-side scope rejection.
+**Call relations**: This function is tested by `tests::should_retry_without_scopes_only_for_discovered_provider_errors`. It is meant to be used after a failed OAuth attempt, so the caller can distinguish “server guessed badly” from “the user asked for these scopes and they failed.”
 
 
 ##### `compute_auth_statuses`  (lines 131–186)
@@ -3329,11 +3369,11 @@ async fn compute_auth_statuses(
 ) -> HashMap<String, McpAuthS
 ```
 
-**Purpose**: Builds a map of auth status entries for all effective MCP servers concurrently. It preserves each server's optional configured config alongside the computed `McpAuthStatus`.
+**Purpose**: Computes the authentication status for many MCP servers at once. It produces the status snapshot used by higher-level features that need to show or act on server auth state.
 
-**Data flow**: Consumes an iterable of `(&String, &EffectiveMcpServer)` plus credential-store settings and optional runtime `CodexAuth`. For each server it clones the name, clones any configured config, computes a `has_runtime_auth` flag for the special `codex_apps` case, then either awaits `compute_auth_status` or falls back to `Unsupported` on missing config or errors. It logs failures, wraps the result in `McpAuthStatusEntry { config, auth_status }`, and collects all `(name, entry)` pairs into a `HashMap<String, McpAuthStatusEntry>` after `join_all`.
+**Data flow**: It receives an iterable collection of server names and effective server definitions, plus OAuth credential storage settings, keyring settings, and optional Codex login information. For each server, it keeps a copy of the configured server config if one exists, works out whether special runtime Codex auth applies, then asks `compute_auth_status` for the server’s status. If status detection fails, it logs a warning and marks that server unsupported. It returns a map from server name to an entry containing the config and status.
 
-**Call relations**: This function is invoked by both snapshot collection and direct resource reads before constructing an `McpConnectionManager`. It delegates per-server classification to `compute_auth_status`, while owning the fan-out/fan-in concurrency and the special runtime-auth shortcut for the built-in apps server.
+**Call relations**: This is called by higher-level flows such as `collect_mcp_server_status_snapshot_with_detail` and `read_mcp_resource` when they need current auth information. Inside, it fans out checks for all servers and waits for them together with `join_all`, like sending several inspectors out at once and collecting their reports.
 
 *Call graph*: called by 2 (collect_mcp_server_status_snapshot_with_detail, read_mcp_resource); 2 external calls (into_iter, join_all).
 
@@ -3349,11 +3389,11 @@ async fn compute_auth_status(
     has_runtime_auth: bo
 ```
 
-**Purpose**: Computes the auth status for one configured MCP server. It short-circuits disabled servers and runtime-authenticated apps servers before consulting transport-specific auth inspection.
+**Purpose**: Determines the authentication status for one configured MCP server. It is the single-server decision point used by the bulk status checker.
 
-**Data flow**: Reads `server_name`, a borrowed `McpServerConfig`, credential-store settings, and `has_runtime_auth`. If `config.enabled` is false it returns `Unsupported`; if `has_runtime_auth` is true it returns `BearerToken`. Otherwise it matches on `config.transport`: `Stdio` returns `Unsupported`, while `StreamableHttp` clones headers and forwards URL, optional bearer-token env var, and storage settings to `determine_streamable_http_auth_status`, returning that async result.
+**Data flow**: It receives the server name, its config, credential storage settings, keyring backend kind, and a flag saying whether runtime Codex auth is already available. If the server is disabled, it returns unsupported. If runtime auth applies, it returns bearer-token status. For local stdio servers it returns unsupported because this OAuth/bearer-token check is for HTTP auth. For streamable HTTP servers, it passes the URL, bearer-token setting, headers, and credential settings to the lower-level HTTP auth status detector and returns that result.
 
-**Call relations**: This is the per-server worker used by `compute_auth_statuses`. It delegates actual HTTP/OAuth/keyring inspection to `determine_streamable_http_auth_status`, keeping transport gating and built-in shortcuts local to this crate.
+**Call relations**: This function is called from `compute_auth_statuses` for each server that has a config. It delegates the HTTP-specific probing to `determine_streamable_http_auth_status`, while keeping the project-specific rules about disabled servers, local transports, and Codex runtime auth in one place.
 
 *Call graph*: 1 external calls (determine_streamable_http_auth_status).
 
@@ -3364,11 +3404,11 @@ async fn compute_auth_status(
 fn resolve_oauth_scopes_prefers_explicit()
 ```
 
-**Purpose**: Verifies that explicit scopes override both configured and discovered scopes. The test locks in the highest-precedence branch of `resolve_oauth_scopes`.
+**Purpose**: Checks that explicitly supplied scopes win over every other source. This protects the rule that the immediate caller’s choice has the highest priority.
 
-**Data flow**: Constructs three non-empty scope vectors, passes them to `resolve_oauth_scopes`, and asserts that the returned struct contains only the explicit vector with source `Explicit`.
+**Data flow**: It builds three possible scope lists: explicit, configured, and discovered. It passes them to `resolve_oauth_scopes` and verifies that the result contains only the explicit scope and marks the source as explicit.
 
-**Call relations**: This unit test directly exercises `resolve_oauth_scopes` under the all-inputs-present condition to document intended precedence.
+**Call relations**: This test calls `resolve_oauth_scopes` directly. It confirms the first branch of that function’s priority order.
 
 *Call graph*: calls 1 internal fn (resolve_oauth_scopes); 2 external calls (assert_eq!, vec!).
 
@@ -3379,11 +3419,11 @@ fn resolve_oauth_scopes_prefers_explicit()
 fn resolve_oauth_scopes_prefers_configured_over_discovered()
 ```
 
-**Purpose**: Verifies that configured scopes win when explicit scopes are absent. It ensures discovery does not override persisted configuration.
+**Purpose**: Checks that configured scopes win over scopes discovered from the server. This matters because user or project configuration should override what the server advertises.
 
-**Data flow**: Calls `resolve_oauth_scopes` with `None` for explicit scopes and non-empty configured and discovered vectors, then asserts the result contains the configured vector and source `Configured`.
+**Data flow**: It passes no explicit scopes, but provides both configured and discovered scopes. It verifies that `resolve_oauth_scopes` returns the configured list and records the source as configured.
 
-**Call relations**: This test covers the second precedence branch of `resolve_oauth_scopes`.
+**Call relations**: This test calls `resolve_oauth_scopes` to confirm the second priority level: when there is no explicit request, the saved configuration is trusted before discovery.
 
 *Call graph*: calls 1 internal fn (resolve_oauth_scopes); 2 external calls (assert_eq!, vec!).
 
@@ -3394,11 +3434,11 @@ fn resolve_oauth_scopes_prefers_configured_over_discovered()
 fn resolve_oauth_scopes_uses_discovered_when_needed()
 ```
 
-**Purpose**: Verifies that discovered scopes are used only when neither explicit nor configured scopes are supplied. It confirms the fallback-to-discovery path.
+**Purpose**: Checks that discovered scopes are used when no explicit or configured scopes exist. This lets the system benefit from the server’s advertised defaults when nothing stronger is provided.
 
-**Data flow**: Passes `None` for explicit and configured scopes and a non-empty discovered vector into `resolve_oauth_scopes`, then asserts the returned scopes and source are `Discovered`.
+**Data flow**: It passes no explicit scopes and no configured scopes, but provides discovered scopes. It verifies that `resolve_oauth_scopes` returns the discovered list and marks the source as discovered.
 
-**Call relations**: This test documents the intended use of discovery as a fallback rather than a primary source.
+**Call relations**: This test calls `resolve_oauth_scopes` to confirm the fallback path where server discovery is the best available source of permission information.
 
 *Call graph*: calls 1 internal fn (resolve_oauth_scopes); 2 external calls (assert_eq!, vec!).
 
@@ -3409,11 +3449,11 @@ fn resolve_oauth_scopes_uses_discovered_when_needed()
 fn resolve_oauth_scopes_preserves_explicitly_empty_configured_scopes()
 ```
 
-**Purpose**: Verifies that an explicitly configured empty scope list is preserved. This prevents accidental fallback to discovered scopes when config intentionally requests none.
+**Purpose**: Checks that an intentionally empty configured scope list is respected. This is important because “the user configured no scopes” is different from “there was no configuration.”
 
-**Data flow**: Calls `resolve_oauth_scopes` with `None` explicit scopes, `Some(Vec::new())` configured scopes, and a non-empty discovered vector, then asserts the result is an empty vector with source `Configured`.
+**Data flow**: It passes no explicit scopes, an empty configured list, and a discovered list that would otherwise be usable. It verifies that `resolve_oauth_scopes` returns an empty list with the source marked as configured, proving the discovered scopes were ignored.
 
-**Call relations**: This test captures a subtle invariant in `resolve_oauth_scopes`: `Some(empty)` is meaningful and distinct from `None`.
+**Call relations**: This test calls `resolve_oauth_scopes` to protect a subtle behavior: an empty configured list still counts as a real configuration choice.
 
 *Call graph*: calls 1 internal fn (resolve_oauth_scopes); 3 external calls (new, assert_eq!, vec!).
 
@@ -3424,11 +3464,11 @@ fn resolve_oauth_scopes_preserves_explicitly_empty_configured_scopes()
 fn resolve_oauth_scopes_falls_back_to_empty()
 ```
 
-**Purpose**: Verifies the final fallback when no scope source is available. It ensures the resolver returns a stable empty result rather than `None`.
+**Purpose**: Checks the final fallback when no scope source is available. The expected behavior is to request no scopes and clearly record that the source is empty.
 
-**Data flow**: Invokes `resolve_oauth_scopes` with all three inputs absent and asserts that the returned struct contains an empty vector and source `Empty`.
+**Data flow**: It passes no explicit, configured, or discovered scopes. It verifies that `resolve_oauth_scopes` returns an empty list and marks the source as empty.
 
-**Call relations**: This test covers the terminal branch of the scope-resolution decision tree.
+**Call relations**: This test calls `resolve_oauth_scopes` to confirm the last branch of the selection logic, where there is nothing to choose from.
 
 *Call graph*: calls 1 internal fn (resolve_oauth_scopes); 1 external calls (assert_eq!).
 
@@ -3439,11 +3479,11 @@ fn resolve_oauth_scopes_falls_back_to_empty()
 fn should_retry_without_scopes_only_for_discovered_provider_errors()
 ```
 
-**Purpose**: Verifies that retry-without-scopes is limited to provider errors on discovered scopes. It rejects retries for configured scopes and for unrelated error types.
+**Purpose**: Checks that retrying without scopes is allowed only in the narrow safe case: discovered scopes failed because the OAuth provider rejected them. It prevents the fallback from hiding other kinds of problems.
 
-**Data flow**: Builds a discovered-scope `ResolvedMcpOAuthScopes`, wraps an `OAuthProviderError` in `anyhow!`, and asserts `should_retry_without_scopes` returns true. It then constructs a configured-scope variant and a generic timeout error and asserts both return false.
+**Data flow**: It creates a resolved scope list whose source is discovered and an OAuth provider error, then verifies that `should_retry_without_scopes` returns true. It then tries configured scopes with the same provider error and discovered scopes with an unrelated timeout-style error, and verifies both return false.
 
-**Call relations**: This test documents the narrow recovery policy encoded by `should_retry_without_scopes`.
+**Call relations**: This test exercises `should_retry_without_scopes` around its intended boundary. It shows that the retry rule is only for scopes learned from discovery, not for scopes the user configured and not for unrelated login failures.
 
 *Call graph*: 3 external calls (anyhow!, assert!, vec!).
 
@@ -3455,11 +3495,11 @@ Uses the adapted backend authentication machinery to execute an authenticated ac
 
 `domain_logic` · `request handling`
 
-This small extension module keeps the rate-limit-reset-credit flow separate from the rest of account processing. The public method, `consume_account_rate_limit_reset_credit`, is a JSON-RPC-facing operation that first rejects empty `idempotency_key` values, then obtains a backend client through a dedicated helper that enforces both authentication presence and the requirement that the current auth uses the Codex backend rather than plain ChatGPT auth.
+This file exists for a very specific user-facing action: a signed-in account can use a saved credit to reset a rate limit. Think of the credit like a one-use coupon. The server must make sure the coupon request has a label that prevents accidental double-spending, confirm the user is authenticated in the right way, ask the backend to redeem the coupon, and report what happened.
 
-The backend call is wrapped in a timeout (`RATE_LIMIT_RESET_REQUEST_TIMEOUT`, 10 seconds by default). In debug builds, that timeout can be overridden via `CODEX_TEST_RATE_LIMIT_RESET_REQUEST_TIMEOUT_MS`, which is useful for tests or local fault injection. After the backend responds, the method translates `BackendConsumeRateLimitResetCreditCode` into the protocol enum `ConsumeAccountRateLimitResetCreditOutcome`, preserving the four distinct cases: `Reset`, `NothingToReset`, `NoCredit`, and `AlreadyRedeemed`.
+The main method first rejects an empty idempotency key. An idempotency key is a unique request label that lets systems safely recognize repeat attempts, so a retry does not accidentally spend the same thing twice. It then builds a backend client from the current account authentication. If there is no Codex/ChatGPT-style backend authentication, the request is rejected because the server cannot safely redeem the credit.
 
-The helper `rate_limit_reset_backend_client` centralizes auth validation and backend-client construction, returning user-facing `invalid_request` errors for missing/wrong auth mode and `internal_error` for client-construction failures. The main invariant is that this operation is only available to authenticated Codex-backend users and is always idempotency-keyed.
+The backend call is wrapped in a timeout, normally ten seconds. In debug builds, an environment variable can override that timeout, which is useful for tests. If the backend is too slow or returns an error, this file turns that into an internal JSON-RPC error. If the backend succeeds, its result is translated into one of four plain outcomes: the rate limit was reset, there was nothing to reset, there was no credit, or the credit was already redeemed.
 
 #### Function details
 
@@ -3472,11 +3512,11 @@ async fn consume_account_rate_limit_reset_credit(
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError>
 ```
 
-**Purpose**: Consumes one rate-limit reset credit through the backend and returns the resulting outcome as a protocol response.
+**Purpose**: This is the request handler for spending a rate-limit reset credit. It validates the request, asks the backend to redeem the credit, and returns a clear outcome to the client.
 
-**Data flow**: Takes `ConsumeAccountRateLimitResetCreditParams`, rejects empty `idempotency_key` with `invalid_request`, awaits `rate_limit_reset_backend_client()`, chooses a timeout from the constant or debug env override, wraps `client.consume_rate_limit_reset_credit(&params.idempotency_key)` in `tokio::time::timeout`, maps timeout/backend failures to internal errors, converts the backend response code into `ConsumeAccountRateLimitResetCreditOutcome`, wraps it in `ConsumeAccountRateLimitResetCreditResponse`, converts that into `ClientResponsePayload`, and returns it inside `Some`.
+**Data flow**: It receives request parameters containing an idempotency key. If that key is empty, it immediately returns a client-facing invalid-request error. Otherwise it gets an authenticated backend client, waits up to the configured timeout while asking the backend to consume the credit, converts backend failures or timeouts into internal errors, and finally turns the backend's status code into a response payload for the client.
 
-**Call relations**: Called by the account request dispatcher when the client invokes the rate-limit reset credit consumption API.
+**Call relations**: This function is the top-level flow for this account action. When it needs a backend connection, it calls AccountRequestProcessor::rate_limit_reset_backend_client to build one from the current authentication. It then hands the actual redemption request to the backend client and uses the timeout wrapper so one slow backend call does not leave the request hanging forever.
 
 *Call graph*: calls 1 internal fn (rate_limit_reset_backend_client); 2 external calls (var, timeout).
 
@@ -3487,10 +3527,10 @@ async fn consume_account_rate_limit_reset_credit(
 async fn rate_limit_reset_backend_client(&self) -> Result<BackendClient, JSONRPCErrorError>
 ```
 
-**Purpose**: Builds an authenticated backend client for rate-limit reset operations after enforcing the required auth mode.
+**Purpose**: This helper creates the backend client needed to redeem rate-limit reset credits. It also enforces that the current user is authenticated with the kind of account that the backend can use for this feature.
 
-**Data flow**: Awaits `auth_manager.auth()`, returns `invalid_request` if no auth is present or if the auth does not use the Codex backend, otherwise constructs `BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)` and maps construction failures to `internal_error`.
+**Data flow**: It reads the current authentication state from the account processor. If there is no authentication, or if the authentication is not for the Codex backend, it returns an invalid-request error. If the authentication is acceptable, it combines the configured ChatGPT backend base URL with the auth information to build a BackendClient; construction failures become internal errors.
 
-**Call relations**: Used only by `consume_account_rate_limit_reset_credit` to centralize auth validation and client creation.
+**Call relations**: AccountRequestProcessor::consume_account_rate_limit_reset_credit calls this before contacting the backend. This helper keeps the authentication checks and client construction in one place, then hands back a ready-to-use BackendClient for the redemption request.
 
 *Call graph*: called by 1 (consume_account_rate_limit_reset_credit); 1 external calls (from_auth).

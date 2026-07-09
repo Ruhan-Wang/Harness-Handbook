@@ -1,8 +1,10 @@
 # Testing, fixtures, and developer verification harnesses  `stage-23` (cross-cutting infrastructure)
 
-This stage is the repository’s top-level verification infrastructure: it sits outside normal startup, request loops, and teardown, and exists to prove that every executable path and subsystem behaves correctly under test. It ties together the dedicated test trees, fake services, smoke clients, snapshot suites, and helper binaries that developers and CI use to validate the system end to end.
+This stage is the project’s test workshop. It is not used by normal users during startup, daily work, or shutdown. Instead, developers and automated checks use it to make sure every major part still behaves correctly before changes are shipped.
 
-Its sub-stages divide that job by surface area. App-server suites verify protocol contracts, daemon/update behavior, transports, and full RPC flows. Core runtime and session harnesses exercise session lifecycle, tools, approvals, persistence, replay, and complete conversations. CLI, exec, login, and MCP verification covers the developer-facing commands and helper processes actually invoked from the shell. Exec-server, sandbox, and remote transport harnesses launch real subprocesses and sockets to validate execution backends, encrypted transports, and platform isolation. TUI tests render realistic terminal states and drive interactive workflows without a real terminal. Cross-cutting library suites lock down telemetry, config, plugins, models, persistence, and utility behavior. Supporting them all, test-binary-support/lib.rs provides arg0-based test binary alias dispatch, temporary CODEX_HOME setup, and early helper execution so suites can launch the right test personalities reproducibly.
+The app-server tests prove the server starts, speaks the expected message formats, and supports real client workflows. The core runtime tests check conversations, tools, permissions, saved history, recovery, and safe stopping. The CLI, exec, login, and MCP tests run the command-line programs like real users would, including patching files, signing in, streaming results, and handling failures. The exec-server, sandbox, and remote transport tests protect command execution, file access, encrypted connections, relays, and platform-specific safety rules. The TUI tests draw the terminal interface into fake screens and check chat behavior, popups, layout, scrolling, and rendering. The cross-cutting library tests cover shared pieces such as telemetry, configuration, plugins, APIs, persistence, and utilities.
+
+The direct support file, `test-binary-support/lib.rs`, lets tests imitate different installed command names using temporary aliases and a temporary home folder, then cleans everything up afterward.
 
 ## Sub-stages
 
@@ -18,11 +20,13 @@ Its sub-stages divide that job by surface area. App-server suites verify protoco
 ### Testing, fixtures, and developer verification harnesses
 ### `test-binary-support/lib.rs`
 
-`orchestration` · `test startup`
+`test` · `test startup`
 
-This small support crate exists for test binaries that need to behave like installed multi-call executables. Its main type, `TestBinaryDispatchGuard`, owns a temporary `TempDir` used as synthetic `CODEX_HOME`, an `Arg0PathEntryGuard` returned by `codex_arg0::arg0_dispatch`, and the previous `CODEX_HOME` value so the environment can be restored after alias installation. The guard intentionally keeps the temp directory alive for as long as the alias path entries are needed.
+Some command-line programs choose what to do based on the name they were started with. That name is often called “argv0”, meaning the first command-line value passed to a process. This file provides test-only support for that behavior. It lets a test binary decide whether to do normal alias dispatch, skip setup, or install temporary command aliases for the test run.
 
-The core function, `configure_test_binary_dispatch`, inspects `argv[0]` and optionally `argv[1]`, then delegates the decision to a caller-provided classifier closure that returns one of three `TestBinaryDispatchMode` values. In `DispatchArg0Only`, it immediately invokes `arg0_dispatch()` and returns `None`, allowing the process to behave as the dispatched alias without installing test fixtures. In `Skip`, it does nothing. In `InstallAliases`, it creates a temporary CODEX_HOME directory with a caller-supplied prefix, temporarily sets the `CODEX_HOME` environment variable before calling `arg0_dispatch()` so alias installation lands in that temp home, restores the previous environment variable afterward, and returns a guard holding the temp directory and dispatch path entry. Failures to create the temp directory or configure aliases are treated as hard test setup errors via `panic!`.
+The main idea is a safety wrapper called TestBinaryDispatchGuard. Think of it like a hotel key card for a temporary test room: as long as the guard exists, the temporary setup exists too. It keeps a temporary CODEX_HOME directory alive and stores the alias-dispatch setup returned by the lower-level codex_arg0 code.
+
+The setup function first looks at how the current test process was started: the executable name and the first argument. A caller-provided classifier then chooses the mode. In one mode, the file only runs the normal argv0 dispatch and stops. In another, it does nothing. In the full setup mode, it creates a temporary CODEX_HOME, briefly points the environment variable CODEX_HOME at it, asks codex_arg0 to create dispatch aliases, then restores the previous environment value. If temporary directory creation or alias setup fails, it panics, because the test cannot run meaningfully without that setup.
 
 #### Function details
 
@@ -32,11 +36,11 @@ The core function, `configure_test_binary_dispatch`, inspects `argv[0]` and opti
 fn paths(&self) -> &Arg0DispatchPaths
 ```
 
-**Purpose**: Exposes the installed arg0 dispatch paths held by the guard. This lets tests inspect where aliases and executables were configured.
+**Purpose**: This gives callers access to the dispatch paths that were created for the test aliases. A test can use these paths to run or inspect the temporary command aliases.
 
-**Data flow**: Reads `self.arg0`, calls its `paths()` accessor, and returns a shared reference to `Arg0DispatchPaths` without modifying guard state.
+**Data flow**: It starts with an existing TestBinaryDispatchGuard, reads the stored arg0 dispatch guard inside it, and asks that inner guard for its paths. It returns a shared reference to those paths without changing anything.
 
-**Call relations**: This is a simple accessor used after `configure_test_binary_dispatch` returns a guard in `InstallAliases` mode.
+**Call relations**: After configure_test_binary_dispatch creates a guard, test code can call TestBinaryDispatchGuard::paths to find the alias locations. This method simply passes the request through to the lower-level arg0 guard’s paths method.
 
 *Call graph*: calls 1 internal fn (paths).
 
@@ -50,10 +54,10 @@ fn configure_test_binary_dispatch(
 ) -> Option<TestBinaryDispatchGuard>
 ```
 
-**Purpose**: Determines whether a test binary should dispatch immediately, skip dispatch setup, or install temporary arg0 aliases under a synthetic `CODEX_HOME`. It centralizes all environment and temp-directory manipulation needed for those modes.
+**Purpose**: This sets up command-name dispatch for tests, depending on what kind of test run is being started. It can skip setup, run dispatch immediately, or install temporary aliases that let one test binary act like multiple commands.
 
-**Data flow**: Reads process arguments via `std::env::args_os`, derives `exe_name` from `argv[0]` and an optional UTF-8 `argv[1]`, and passes them to the `classify` closure. For `DispatchArg0Only`, it invokes `arg0_dispatch()` and returns `None`. For `Skip`, it returns `None` unchanged. For `InstallAliases`, it creates a prefixed `TempDir`, snapshots `CODEX_HOME` with `var_os`, unsafely sets `CODEX_HOME` to the temp path, calls `arg0_dispatch()` expecting an `Arg0PathEntryGuard`, restores the previous `CODEX_HOME` with `set_var` or `remove_var`, and returns `Some(TestBinaryDispatchGuard { ... })`.
+**Data flow**: It reads the current process arguments, pulls out the executable name and first argument, and gives those to the caller’s classify function. If the result says to dispatch only, it calls arg0_dispatch and returns no guard. If the result says to skip, it returns no guard. If the result says to install aliases, it creates a temporary CODEX_HOME directory, saves the old CODEX_HOME environment value, temporarily sets CODEX_HOME to the new directory, calls arg0_dispatch to build the aliases, restores the old environment value, and returns a TestBinaryDispatchGuard that keeps the temporary directory and alias setup alive.
 
-**Call relations**: This is the file’s orchestration entry point, intended to be called from test initialization code before parallel test threads begin so the temporary environment mutation remains safe.
+**Call relations**: This is the main setup entry used by test binaries or test startup code. It relies on the caller’s classifier to decide the mode, uses standard environment and argument-reading functions to inspect and adjust the process, and hands the actual alias creation to codex_arg0::arg0_dispatch. If setup succeeds, it returns the guard that later lets tests inspect the created paths.
 
 *Call graph*: 8 external calls (new, arg0_dispatch, panic!, args_os, remove_var, set_var, var_os, new).

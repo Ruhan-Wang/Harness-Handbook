@@ -1,10 +1,12 @@
 # Process entrypoints and binary dispatch  `stage-1`
 
-This stage is the process-start boundary for every native executable in the codebase. It sits at startup, before any long-running loop or service logic begins, and turns raw process state—argv, argv[0], environment, and top-level config overrides—into a specific runtime mode. Its job is to decide which binary personality is being invoked, parse the corresponding command surface, and hand control to the appropriate library or server entrypoint.
+This stage is the system’s set of starting doors. It runs at process startup, when the operating system has launched a native binary and passed in the command name and arguments. Its job is to read what was invoked, understand the flags and subcommands, and hand control to the right runtime mode.
 
-The primary user-facing launch surfaces cover the main `codex` CLI, standalone TUI startup, cloud-tasks, desktop opening, remote-control and sandbox utilities, doctor checks, MCP management, and other focused top-level commands. They share typed command definitions and common config/backend setup so different launch paths behave consistently. The auxiliary binaries and developer tools provide separate executables for schema generation, protocol export, patching and search utilities, logging and diagnostics, alternate servers and bridges, sample clients, and platform-specific sandbox or policy wrappers.
+The primary user-facing launch surfaces are the main front desk. They route everyday commands into the text interface, one-shot exec mode, cloud tasks, desktop app launch, sandbox tools, remote control, doctor checks, MCP server commands, or session archive tools. They also define the options each mode accepts before the real work begins.
 
-`exec/src/main.rs` is the dedicated `codex-exec` binary entrypoint within this layer. It parses root config overrides, supports argv[0]-based alternate behavior, and forwards standard exec invocations into the exec runtime, complementing the broader dispatch machinery used by the other binaries.
+The auxiliary binaries and developer tools are the side workbench. They generate schemas, refresh protocol files, apply patches, search files, inspect logs, start helper services, run test clients, and launch commands inside safer restricted environments.
+
+The directly assigned exec/src/main.rs is a small but important switch. It starts codex-exec, then decides whether to run the normal non-interactive agent or behave like the codex-linux-sandbox helper.
 
 ## Sub-stages
 
@@ -16,11 +18,13 @@ The primary user-facing launch surfaces cover the main `codex` CLI, standalone T
 ### Process entrypoints and binary dispatch
 ### `exec/src/main.rs`
 
-`entrypoint` · `process startup`
+`entrypoint` · `startup`
 
-This binary crate is intentionally thin. It declares `TopCli`, a small clap parser that flattens two layers of arguments: root-level `CliConfigOverrides` and the library's `Cli`. That split exists because the binary needs to accept global `--config` overrides before or around subcommands while leaving the downstream library API unchanged. The file-level documentation explains the other major responsibility: arg0 dispatch. If the executable is invoked under a special name such as `codex-linux-sandbox`, the process should run sandbox-specific behavior instead of the normal exec CLI.
+This file is like the front desk for the executable. When the operating system starts this program, control begins here. Most of the time, it reads the user’s command-line options and starts the normal `codex-exec` flow, which runs Codex without an interactive user interface. There is one important twist: the same binary can also behave as `codex-linux-sandbox` if it was launched under that name. That lets the project ship one executable that can wear two different “badges,” depending on how it was called.
 
-The `main` function delegates all of that to `codex_arg0::arg0_dispatch_or_else`. In the normal branch, it parses `TopCli`, moves the root-level overrides into `inner.config_overrides` via `prepend_root_overrides`, and then awaits `codex_exec::run_main`. There is no business logic here beyond wiring: no config loading, no event processing, and no protocol handling. The design keeps the binary-specific concerns—arg0 dispatch and clap shape—separate from the reusable library runtime in `exec/src/lib.rs`.
+The file defines a small command-line shape called `TopCli`. It combines general configuration overrides with the real `codex-exec` options. After parsing the command line, `main` moves the top-level configuration overrides into the inner command options. This keeps the deeper execution code simple: downstream code only needs to look in one place for configuration.
+
+The actual decision about the program name is delegated to `arg0_dispatch_or_else`. “arg0” means the name used to invoke the program. If that name matches the sandbox mode, the sandbox path can take over. Otherwise, this file runs the normal Codex entry flow through `run_main`.
 
 #### Function details
 
@@ -30,15 +34,19 @@ The `main` function delegates all of that to `codex_arg0::arg0_dispatch_or_else`
 fn main() -> anyhow::Result<()>
 ```
 
-**Purpose**: Acts as the executable entrypoint, performing arg0 dispatch and normal CLI parsing before handing control to the library runtime. It also merges root-level config overrides into the inner exec CLI struct.
+**Purpose**: This is the first Rust function run when the `codex-exec` binary starts. It chooses the right startup path, parses command-line options, folds shared configuration into the main CLI settings, and starts the main non-interactive Codex run when appropriate.
 
-**Data flow**: Takes no explicit arguments, invokes `arg0_dispatch_or_else` with an async closure that receives `Arg0DispatchPaths`, parses `TopCli`, mutates `inner.config_overrides` by prepending root overrides, then awaits `run_main(inner, arg0_paths)` and returns `anyhow::Result<()>`.
+**Data flow**: The function begins with the process invocation details, especially the program name and command-line arguments. It asks the arg0 dispatcher to check whether this launch should be treated as a special sandbox command. For the normal path, it parses the command line into `TopCli`, moves root-level configuration overrides into the inner `Cli` value, then passes that prepared CLI data plus dispatch path information into `run_main`. It returns success if startup and execution complete cleanly, or an error if parsing or execution fails.
 
-**Call relations**: This is the top of the binary call flow. In normal `codex-exec` invocations it delegates entirely to `run_main`; in alternate arg0 cases, `arg0_dispatch_or_else` routes execution elsewhere before the closure runs.
+**Call relations**: The operating system effectively hands control to `main` when the binary starts. `main` immediately hands the program-name decision to `arg0_dispatch_or_else`; inside the normal fallback path, it prepares the CLI data and then hands off to the broader Codex execution logic through `run_main`.
 
 *Call graph*: 1 external calls (arg0_dispatch_or_else).
 
 ## 📊 State Registers Touched
 
-- `reg-process-environment` — The process-wide environment and argv/arg0-derived launch context that is sanitized, augmented, and then reused by later startup and runtime code.
-- `reg-effective-config` — The merged, validated effective configuration assembled from managed, cloud, user, project, thread, and CLI layers with provenance.
+- `reg-effective-config` — The final set of settings Codex runs with after combining files, policies, profiles, cloud settings, thread overrides, and command-line flags.
+- `reg-app-server-runtime` — The live app-server or daemon state, including open transports, connected clients, request routing, and server lifecycle status.
+- `reg-remote-control-relay` — The remote-control, relay, socket, WebSocket, and encrypted connection state used to connect clients and helper processes.
+- `reg-exec-environment` — The active command-execution setup, including local or remote executor choice, sandbox helper paths, runtime paths, and process execution capabilities.
+- `reg-cloud-task-state` — Cloud task lists, task details, submission attempts, selected task environments, and polling/refresh status shared by cloud task commands and clients.
+- `reg-launch-invocation-context` — The raw launch context, including invoked binary/arg0, selected subcommand or runtime mode, startup flags, and output/interaction mode chosen before dispatch.

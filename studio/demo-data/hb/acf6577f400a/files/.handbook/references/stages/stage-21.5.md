@@ -1,10 +1,10 @@
 # External session import persistence  `stage-21.5`
 
-This stage is the persistence and parsing layer behind external session import. It sits in cross-cutting import infrastructure rather than the main runtime loop: when the system scans external agent session files, decides whether they are new, and prepares them for ingestion, it relies on this stage to remember prior imports and to turn raw source data into Codex-compatible records.
+This stage is shared behind-the-scenes support for bringing in conversation history from another agent tool. It does not run the main chat loop itself. Instead, it helps the import feature answer two questions: “What is inside this outside session file?” and “Have we already imported this exact version?”
 
-ledger.rs provides the durable import ledger. It stores imported file versions by canonical source path and content hash, so the importer can quickly tell whether a session file has already been seen, avoid duplicate work, and refresh metadata during discovery and pre-import checks. This gives the rest of the pipeline a stable notion of file identity and versioning.
+The records file is the reader and translator. It opens saved external conversation logs, parses their contents, and reshapes them into this project’s normal conversation format. It also creates short summaries, so the rest of the system can show a safe list of possible sessions before importing them.
 
-records.rs is the reader and normalizer for the source session files themselves. It parses external-agent JSONL into either lightweight summaries for inspection or full message streams ready for import. While doing so, it reconciles inconsistent source structures—message bodies, titles, timestamps, and tool-call blocks—into normalized Codex text. Together, these files let the system safely detect, deduplicate, and faithfully ingest external sessions.
+The ledger file is the memory book. It stores a small record on disk of external session files that were already imported. If the same file content appears again, the system can skip it and avoid duplicates. If the file has changed, the ledger allows it to be imported again. Together, these parts make external imports repeatable, safe, and understandable.
 
 ## Files in this stage
 
@@ -13,13 +13,13 @@ The ledger persists and refreshes knowledge about previously imported external s
 
 ### `external-agent-sessions/src/ledger.rs`
 
-`io_transport` · `discovery/import bookkeeping`
+`domain_logic` · `session import detection and recording`
 
-This file defines the import ledger format and all read/write logic around it. The persisted `ImportedExternalAgentSessionLedger` is a JSON file named `external_agent_session_imports.json` under `codex_home`, containing a vector of `ImportedExternalAgentSessionRecord` entries. Each record stores the canonical source path, SHA-256 of the file contents at import time, the destination `ThreadId`, the import timestamp, and an optional source modification timestamp in nanoseconds.
+An external agent session is a file produced outside this system, and importing it creates or updates a Codex thread. This file acts like a receipt book for those imports. Each receipt records where the source file was, a SHA-256 content hash (a fingerprint of the file contents), which thread it became, and when the import happened. Without this ledger, the importer would have a hard time knowing whether a session file is truly new or just the same old file seen again.
 
-The ledger serves two related but distinct checks. `contains_current_source` canonicalizes a candidate path, avoids hashing entirely if the ledger is empty or has no record for that path, and otherwise hashes the current file to see whether that exact version was imported. `refresh_current_source` performs the same path/hash match but, when successful, updates `imported_at` and `source_modified_at` in-place so detection can suppress already imported current files without re-importing them. `record_completed_session_imports` is the write path after successful imports: it loads the ledger, stamps all imports with one `now_unix_seconds()` value, updates an existing matching record if present, or appends a new one.
+The ledger is stored as a JSON file named external_agent_session_imports.json inside the Codex home directory. When the system wants to check a session, it loads that JSON file, canonicalizes the source path (turns it into its real absolute path), and hashes the current file contents. A match on both path and hash means this exact version has already been imported.
 
-Helper functions isolate path canonicalization, ledger path construction, content hashing with a 64 KiB buffer, and best-effort mtime extraction. Tests in the companion file emphasize an important invariant: empty or path-missing ledgers must not try to read source files, and completed imports can still be recorded even if the source file has already been deleted.
+When an import finishes, this file updates the ledger. If the same path and content were recorded before, it moves that record to the end and refreshes its thread and timestamps. If it is new content, it adds a new record. This is like checking both the label and the contents of a document before deciding whether it is a duplicate.
 
 #### Function details
 
@@ -32,11 +32,11 @@ fn has_current_session_been_imported(
 ) -> io::Result<bool>
 ```
 
-**Purpose**: Answers whether the current on-disk contents of a source session file already exist in the import ledger.
+**Purpose**: Checks whether the current contents of a source session file have already been imported. This is used to avoid importing the same session version more than once.
 
-**Data flow**: It takes `codex_home` and `source_path`, loads the ledger from disk with `load_import_ledger`, calls `contains_current_source` on the loaded ledger, and returns the resulting `io::Result<bool>`.
+**Data flow**: It receives the Codex home directory and a source file path. It loads the import ledger from disk, then asks the ledger whether that file path and its current content fingerprint are already present. It returns true or false, or an input/output error if the ledger or source file cannot be read.
 
-**Call relations**: This is the public query used by `prepare_validated_session_import` before doing any heavier import preparation.
+**Call relations**: During validated session import preparation, prepare_validated_session_import calls this function before doing the expensive or duplicate work of importing. This function delegates the actual file reading to load_import_ledger and the detailed comparison to the ledger object.
 
 *Call graph*: calls 1 internal fn (load_import_ledger); called by 1 (prepare_validated_session_import).
 
@@ -51,11 +51,11 @@ fn record_imported_session(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Test-only convenience wrapper that records one imported session by canonicalizing the path and hashing the current file contents.
+**Purpose**: Test-only helper that records one imported session in the same way production code records completed imports. It makes tests easier to read by hiding the details of path cleanup and hashing.
 
-**Data flow**: It accepts `codex_home`, `source_path`, and `imported_thread_id`, canonicalizes the source path, computes its SHA-256 via `session_content_sha256`, wraps those values into a one-element `Vec<CompletedExternalAgentSessionImport>`, and forwards to `record_completed_session_imports`.
+**Data flow**: It receives the Codex home directory, a source path, and the thread id that the source was imported into. It turns the source path into its canonical real path, calculates the source file hash, wraps those values into a completed-import record, and passes that list on for saving.
 
-**Call relations**: Used only in tests across this crate to seed or update the ledger before calling detection or validation logic.
+**Call relations**: Several tests call this helper to set up a ledger state before checking detection behavior. It hands the real work to canonical_source_path and record_completed_session_imports so tests exercise the normal recording path.
 
 *Call graph*: calls 2 internal fn (canonical_source_path, record_completed_session_imports); called by 4 (detects_sessions_in_batches, redetects_sessions_when_source_contents_change_after_import, skips_already_imported_current_session_versions, skips_session_that_was_already_imported); 1 external calls (vec!).
 
@@ -69,11 +69,11 @@ fn record_completed_session_imports(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Writes one or more completed imports into the ledger, replacing metadata on an existing identical source-path/content-hash record when necessary.
+**Purpose**: Writes completed imports into the ledger after one or more external sessions have been imported. It keeps the ledger up to date so future scans know what has already been handled.
 
-**Data flow**: It takes `codex_home` and a vector of completed imports. If the vector is empty it returns immediately. Otherwise it loads the current ledger, captures one `imported_at` timestamp, and for each import tries to read the source file's modified time with `session_modified_at`. If a record with the same canonical source path and content hash already exists, it removes that record, updates its thread ID, import time, and `source_modified_at` (preferring the new value when available), then pushes it back. If no match exists, it appends a new `ImportedExternalAgentSessionRecord`. Finally it persists the ledger with `save_import_ledger`.
+**Data flow**: It receives the Codex home directory and a list of completed imports. If the list is empty, it does nothing. Otherwise it loads the existing ledger, gets the current time, adds or refreshes one record per import, captures the source file's modified time when possible, and saves the updated ledger back to disk.
 
-**Call relations**: This is the main ledger mutation path, called by the test helper `record_imported_session`. It delegates persistence and metadata extraction to `load_import_ledger`, `session_modified_at`, and `save_import_ledger`.
+**Call relations**: The test helper record_imported_session calls this for single-session setup, and production import code can call it after successful imports. It relies on load_import_ledger to get the old receipt book, session_modified_at to add file timing details, and save_import_ledger to persist the new receipt book.
 
 *Call graph*: calls 3 internal fn (load_import_ledger, save_import_ledger, session_modified_at); called by 1 (record_imported_session); 1 external calls (now_unix_seconds).
 
@@ -84,11 +84,11 @@ fn record_completed_session_imports(
 fn source_states(&self) -> HashMap<&Path, ImportedSourceState>
 ```
 
-**Purpose**: Builds a path-indexed snapshot of the latest known import metadata for each recorded source path.
+**Purpose**: Builds a quick lookup table showing the latest known timing state for each imported source path. This helps other code compare recently seen files with what the ledger remembers.
 
-**Data flow**: It reads `self.records`, inserts each record into a new `HashMap<&Path, ImportedSourceState>`, and returns that map. Later records for the same path overwrite earlier ones because insertion uses the same key.
+**Data flow**: It reads the ledger's list of records. For each record, it stores the source path as a key and the remembered source modified time plus import time as the value. The result is a map from source paths to their saved state.
 
-**Call relations**: Used by `detect_recent_sessions` to cheaply compare candidate files against prior imported mtimes/import times before doing content hashing.
+**Call relations**: This method is part of the ledger's public-in-this-module toolkit. Detection code can use it after loading the ledger when it needs a compact view of known source files instead of scanning the full list repeatedly.
 
 *Call graph*: 1 external calls (new).
 
@@ -99,11 +99,11 @@ fn source_states(&self) -> HashMap<&Path, ImportedSourceState>
 fn contains_current_source(&self, source_path: &Path) -> io::Result<bool>
 ```
 
-**Purpose**: Checks whether the ledger contains an entry for the canonical source path whose stored content hash matches the file's current contents.
+**Purpose**: Answers the key duplicate-detection question: has this exact file version already been imported? It checks both the real path and the current file contents.
 
-**Data flow**: It first returns `false` if `self.records` is empty. Otherwise it canonicalizes `source_path`; if no record exists for that canonical path it returns `false` without hashing. If the path is present, it computes the current SHA-256 with `session_content_sha256` and returns whether any record matches both path and hash.
+**Data flow**: It reads the ledger records and receives a source path. If there are no records, or no record for that canonical path, it returns false. If the path exists in the ledger, it hashes the current file contents and returns true only if a record has both the same path and the same hash.
 
-**Call relations**: Called by `has_current_session_been_imported`. Its early exits are important for avoiding unnecessary filesystem reads and for the empty-ledger test case.
+**Call relations**: has_current_session_been_imported loads the ledger and then uses this method to make the final yes-or-no decision. The method depends on canonical_source_path to normalize the path and session_content_sha256 to compute the content fingerprint.
 
 *Call graph*: calls 2 internal fn (canonical_source_path, session_content_sha256).
 
@@ -118,11 +118,11 @@ fn refresh_current_source(
     ) -> io::Result<bool>
 ```
 
-**Purpose**: Refreshes ledger metadata for a source file when its current contents already match an imported record.
+**Purpose**: Refreshes the ledger entry for a source file when the current contents are already known. This updates the import time and remembered file modified time without creating a new duplicate record.
 
-**Data flow**: It takes a mutable ledger, a source path, and the caller-supplied source modified time in nanoseconds. It canonicalizes the path, returns `false` if no record exists for that path, hashes the current file, finds the most recent matching record by path and hash, removes it, updates `imported_at` to now and `source_modified_at` to the supplied value, pushes it back, and returns `true`.
+**Data flow**: It receives a source path and a modified-time value. It canonicalizes the path, checks that the path exists in the ledger, hashes the current file contents, and looks for the most recent matching path-and-hash record. If found, it removes that record, updates its timestamps, appends it to the end, and returns true. If no matching current version is found, it returns false.
 
-**Call relations**: Used by `detect_recent_sessions` during candidate processing. A `true` result means the detector should skip summarization and later persist the refreshed ledger.
+**Call relations**: This method is used by ledger-aware detection flows that want to mark an already-imported source as freshly seen. It uses canonical_source_path and session_content_sha256 to make sure it is refreshing the exact current file version, and it uses now_unix_seconds for the new import timestamp.
 
 *Call graph*: calls 2 internal fn (canonical_source_path, session_content_sha256); 1 external calls (now_unix_seconds).
 
@@ -135,11 +135,11 @@ fn load_import_ledger(
 ) -> io::Result<ImportedExternalAgentSessionLedger>
 ```
 
-**Purpose**: Loads the JSON ledger file from disk, treating a missing file as an empty ledger and malformed JSON as invalid data.
+**Purpose**: Reads the import ledger JSON file from disk and turns it into the in-memory ledger object. If the file does not exist yet, it starts with an empty ledger.
 
-**Data flow**: It derives the ledger path with `import_ledger_path`, reads the file as a string, returns `ImportedExternalAgentSessionLedger::default()` on `NotFound`, otherwise deserializes with `serde_json::from_str`, mapping parse failures into `io::ErrorKind::InvalidData` with a descriptive message.
+**Data flow**: It receives the Codex home directory, builds the path to external_agent_session_imports.json, and tries to read it as text. Missing file becomes an empty ledger. Existing text is parsed as JSON. Bad JSON becomes an invalid-data input/output error.
 
-**Call relations**: This function is the shared read entry used by detection, import validation, and ledger mutation paths.
+**Call relations**: Detection and recording flows call this whenever they need the current receipt book. It is used by detect_recent_sessions, has_current_session_been_imported, and record_completed_session_imports, and it uses import_ledger_path to agree on the ledger file location.
 
 *Call graph*: calls 1 internal fn (import_ledger_path); called by 3 (detect_recent_sessions, has_current_session_been_imported, record_completed_session_imports); 3 external calls (default, read_to_string, from_str).
 
@@ -153,11 +153,11 @@ fn save_import_ledger(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Serializes the ledger to pretty JSON and writes it under the Codex home directory.
+**Purpose**: Writes the in-memory ledger back to disk as readable JSON. This is what makes import history survive after the process exits.
 
-**Data flow**: It ensures `codex_home` exists with `create_dir_all`, computes the ledger file path, serializes `ledger` with `serde_json::to_vec_pretty`, maps serialization errors to `io::Error`, writes the bytes to disk, and returns the write result.
+**Data flow**: It receives the Codex home directory and a ledger object. It makes sure the Codex home directory exists, converts the ledger to pretty-printed JSON bytes, and writes those bytes to the ledger file path.
 
-**Call relations**: Called after ledger mutations from `record_completed_session_imports` and after metadata refreshes from `detect_recent_sessions`.
+**Call relations**: After import detection or recording changes the ledger, detect_recent_sessions and record_completed_session_imports call this to persist those changes. It uses import_ledger_path so it writes to the same place that load_import_ledger reads from.
 
 *Call graph*: calls 1 internal fn (import_ledger_path); called by 2 (detect_recent_sessions, record_completed_session_imports); 3 external calls (create_dir_all, write, to_vec_pretty).
 
@@ -168,11 +168,11 @@ fn save_import_ledger(
 fn import_ledger_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the full path to the ledger JSON file under the Codex home directory.
+**Purpose**: Builds the full filesystem path to the ledger file inside the Codex home directory. This keeps the filename choice in one place.
 
-**Data flow**: It joins `codex_home` with the constant filename `external_agent_session_imports.json` and returns the resulting `PathBuf`.
+**Data flow**: It receives the Codex home directory path and appends external_agent_session_imports.json to it. It returns that combined path.
 
-**Call relations**: A small helper shared by both ledger load and save operations so they target the same file.
+**Call relations**: Both load_import_ledger and save_import_ledger call this so reading and writing always refer to the same ledger file.
 
 *Call graph*: called by 2 (load_import_ledger, save_import_ledger); 1 external calls (join).
 
@@ -183,11 +183,11 @@ fn import_ledger_path(codex_home: &Path) -> PathBuf
 fn canonical_source_path(path: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Normalizes a source session path to its canonical filesystem path.
+**Purpose**: Turns a source file path into its real, canonical filesystem path. This avoids treating different spellings of the same file as different sources.
 
-**Data flow**: It takes a `&Path`, calls `fs::canonicalize`, and returns the canonical `PathBuf` or the underlying I/O error.
+**Data flow**: It receives a path, asks the operating system to resolve it, and returns the canonical path. If the path does not exist or cannot be resolved, it returns an input/output error.
 
-**Call relations**: Used before recording imports and before path-based ledger lookups so equivalent paths compare consistently.
+**Call relations**: The duplicate-checking and refresh methods use this before comparing paths, and the test helper uses it before recording. This makes ledger entries consistent even if callers pass relative paths or paths with symbolic links.
 
 *Call graph*: called by 3 (contains_current_source, refresh_current_source, record_imported_session); 1 external calls (canonicalize).
 
@@ -198,11 +198,11 @@ fn canonical_source_path(path: &Path) -> io::Result<PathBuf>
 fn session_content_sha256(path: &Path) -> io::Result<String>
 ```
 
-**Purpose**: Computes the lowercase hexadecimal SHA-256 digest of a session file's raw bytes.
+**Purpose**: Computes a SHA-256 hash for a session file, which serves as a stable fingerprint of its contents. If even a small part of the file changes, the fingerprint changes.
 
-**Data flow**: It opens the file, allocates a fixed 64 KiB buffer, repeatedly reads chunks until EOF, feeds each chunk into a `Sha256` hasher, finalizes the digest, formats it as hex, and returns the string.
+**Data flow**: It receives a file path, opens the file, reads it in 64 KB chunks, feeds each chunk into a SHA-256 hasher, and returns the final hash as a lowercase hexadecimal string. Reading or opening failures become input/output errors.
 
-**Call relations**: This helper underpins content-version matching in `contains_current_source`, `refresh_current_source`, and the test-only `record_imported_session` wrapper.
+**Call relations**: contains_current_source and refresh_current_source use this when they need to know whether the file currently on disk matches a ledger record. It is central to distinguishing 'same file path, same contents' from 'same file path, changed contents.'
 
 *Call graph*: called by 2 (contains_current_source, refresh_current_source); 3 external calls (open, new, format!).
 
@@ -213,11 +213,11 @@ fn session_content_sha256(path: &Path) -> io::Result<String>
 fn session_modified_at(path: &Path) -> io::Result<Option<i64>>
 ```
 
-**Purpose**: Extracts a file's modification time as nanoseconds since the Unix epoch when representable.
+**Purpose**: Reads the source file's last modified time so the ledger can remember when the file itself changed. This gives later detection code another clue about whether a source is fresh or stale.
 
-**Data flow**: It reads filesystem metadata, gets the modified `SystemTime`, computes duration since `UNIX_EPOCH`, converts nanoseconds to `i64` if possible, and returns `Ok(Some(value))`; if the duration is before the epoch or the conversion overflows, it returns `Ok(None)`.
+**Data flow**: It receives a file path, reads the file metadata, asks for the modified time, measures that time since the Unix epoch, and tries to store it as an i64 number of nanoseconds. It returns that value inside an option, or None if the timestamp cannot be represented that way.
 
-**Call relations**: Used by `record_completed_session_imports` to capture source mtime opportunistically without failing the whole ledger write when the timestamp cannot be represented.
+**Call relations**: record_completed_session_imports calls this while writing import records. If the timestamp is available, it is stored alongside the content hash and import time; if not, recording can still continue without that optional field.
 
 *Call graph*: called by 1 (record_completed_session_imports); 1 external calls (metadata).
 
@@ -227,13 +227,13 @@ The record reader parses external-agent JSONL sessions into summaries or full me
 
 ### `external-agent-sessions/src/records.rs`
 
-`domain_logic` · `session file parsing during discovery and import`
+`io_transport` · `session discovery and import`
 
-This file contains the low-level JSONL parser for external-agent session records. It supports two passes with different outputs: `summarize_session` scans for enough information to advertise a migration candidate, while `read_session_import` performs a single full read that also computes a SHA-256 over the raw file contents for ledgering. Both functions tolerate malformed or irrelevant lines by skipping them rather than failing the whole file.
+External agent sessions are stored as line-by-line JSON records, often called JSONL: each line is one small JSON object. This file is the translator for those records. Without it, the project could not reliably discover old external sessions, choose a useful title for them, or import their messages into the local conversation model.
 
-Record parsing recognizes `custom-title` and `ai-title` metadata, with custom titles taking precedence over AI titles and both outranking the fallback title derived from the first user message. `conversation_message_from_owned_record` accepts only `user` and `assistant` records, rejects meta and sidechain entries, parses RFC3339 timestamps, and extracts message text from either a plain string or a structured content array. Structured content is flattened by `extract_message_text`: text blocks are copied, `tool_use` blocks become bounded note sections tagged with `external_agent_tool_call`, `tool_result` blocks become bounded note sections tagged with `external_agent_tool_result`, `thinking` blocks are dropped, and unknown block types are rendered as explicit placeholder text.
+The main flow is simple. First, the file opens a session log and reads it one line at a time, so even large logs do not need to be loaded all at once. It ignores blank lines and broken JSON lines rather than failing the whole import. It looks for the working directory, title records, timestamps, and real user or assistant messages. Meta records and sidechain records are skipped because they are not part of the main conversation.
 
-A notable nuance is `only_tool_result`: if a nominal user record contains only tool-result blocks, it is reclassified as an assistant message so imported history reads naturally. Tool-call and tool-result payloads are truncated to fixed limits to avoid exploding imported transcripts. Tests cover one-pass import parsing and the exact formatting of tool annotations.
+Messages can be plain text or structured blocks. Structured blocks are flattened into readable text. Tool calls and tool results are wrapped in clear tags, like labels on a package, so later code can see that this text came from an external tool interaction. Long tool notes are shortened to protect the imported conversation from huge outputs. The file can either produce a lightweight session summary or a fuller import result with all parsed messages and a SHA-256 content hash, which is a fingerprint used to recognize the exact file contents.
 
 #### Function details
 
@@ -243,11 +243,11 @@ A notable nuance is `only_tool_result`: if a nominal user record contains only t
 fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>>
 ```
 
-**Purpose**: Reads a session file and extracts just enough information to decide whether it is importable and how it should be labeled in discovery results.
+**Purpose**: Reads a session file just enough to decide whether it is a usable conversation and to build a short summary for listing or migration. It finds the working directory, best available title, and latest message time.
 
-**Data flow**: It opens the file, iterates line by line through a `BufReader`, trims and skips empty lines, attempts to parse each line as `serde_json::Value`, captures the first available `cwd`, updates `custom_title` and `ai_title` when matching records appear, converts message records with `conversation_message_from_owned_record`, tracks whether any message was seen, derives a fallback title from the first user message via `summarize_for_label`, and keeps the maximum parsed timestamp. It returns `Ok(None)` if cwd is missing, no message was found, or no timestamp was parsed; otherwise it returns `SessionSummary { latest_timestamp, migration: ExternalAgentSessionMigration { path, cwd, title } }` where title preference is custom > AI > first user message.
+**Data flow**: It receives a file path, opens the file, then reads each line as a possible JSON record. From those records it gathers the first working directory, any custom or AI-generated title, user/assistant messages, and message timestamps. It returns no summary if the file has no working directory, no usable messages, or no timestamp; otherwise it returns a SessionSummary containing the latest timestamp and migration information.
 
-**Call relations**: Called by `detect_recent_sessions` after filesystem and ledger filtering. It delegates title extraction and message normalization to the helper functions in this file.
+**Call relations**: This is a top-level reader for quick scanning. As it walks through records, it asks custom_title_from_record and ai_title_from_record to recognize title records, and conversation_message_from_owned_record to turn message records into local ConversationMessage values. When the first user message has no better title, it hands that text to summarize_for_label to make a readable label.
 
 *Call graph*: calls 3 internal fn (ai_title_from_record, conversation_message_from_owned_record, custom_title_from_record); 4 external calls (new, open, to_path_buf, summarize_for_label).
 
@@ -258,11 +258,11 @@ fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>>
 fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport>
 ```
 
-**Purpose**: Performs a single pass over a session file to collect cwd, preferred source title, normalized conversation messages, and a SHA-256 of the raw file contents.
+**Purpose**: Fully reads an external session file for import. It collects the parsed messages, the best source title, the working directory if present, and a hash of the exact file contents.
 
-**Data flow**: It opens the file, wraps it in a `BufReader`, repeatedly reads each raw line into a reusable `String`, updates a `Sha256` hasher with the exact bytes read, trims and skips empty lines, parses JSON values when possible, captures the first cwd, updates custom and AI titles, converts message records with `conversation_message_from_owned_record`, and pushes successful messages into a vector. At EOF it returns `ParsedSessionImport { cwd, source_title: custom_title.or(ai_title), messages, content_sha256 }` where the hash is the hex digest of the full raw file.
+**Data flow**: It receives a file path, opens the file, and reads it line by line. Each raw line is fed into a SHA-256 hasher before parsing, so the final result reflects the exact original content. Valid JSON records may add a working directory, titles, or conversation messages; invalid and blank lines are skipped. It returns a ParsedSessionImport with the collected data and the final hexadecimal content hash.
 
-**Call relations**: This is the parser used by the export layer's `load_session_for_import_with_content_sha256`, and it is directly exercised by the one-pass parsing test.
+**Call relations**: This is used by load_session_for_import_with_content_sha256 when the system actually imports a session, and by its test to prove the one-pass behavior. During the read, it delegates title recognition to custom_title_from_record and ai_title_from_record, and message conversion to conversation_message_from_owned_record.
 
 *Call graph*: calls 3 internal fn (ai_title_from_record, conversation_message_from_owned_record, custom_title_from_record); called by 2 (load_session_for_import_with_content_sha256, reads_session_import_in_one_pass); 6 external calls (new, open, new, new, new, format!).
 
@@ -273,11 +273,11 @@ fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport>
 fn custom_title_from_record(record: &JsonValue) -> Option<&str>
 ```
 
-**Purpose**: Extracts a non-empty trimmed custom title from a JSON record when the record type is `custom-title`.
+**Purpose**: Checks whether a JSON record is a user-supplied custom title. Custom titles are preferred because they usually reflect what the user intentionally named the session.
 
-**Data flow**: It takes a `JsonValue`, forwards to `title_from_record(record, "custom-title", "customTitle")`, and returns the resulting optional string slice.
+**Data flow**: It receives one JSON record and asks title_from_record to look for a record of type custom-title with a customTitle field. If the field exists after trimming whitespace and is not empty, it returns that title text; otherwise it returns nothing.
 
-**Call relations**: Used by both `summarize_session` and `read_session_import` as part of title precedence tracking.
+**Call relations**: Both summarize_session and read_session_import call this while scanning records. It is a thin, named wrapper around title_from_record so the title priority rules stay easy to read.
 
 *Call graph*: calls 1 internal fn (title_from_record); called by 2 (read_session_import, summarize_session).
 
@@ -288,11 +288,11 @@ fn custom_title_from_record(record: &JsonValue) -> Option<&str>
 fn ai_title_from_record(record: &JsonValue) -> Option<&str>
 ```
 
-**Purpose**: Extracts a non-empty trimmed AI-generated title from a JSON record when the record type is `ai-title`.
+**Purpose**: Checks whether a JSON record contains an AI-generated title. This gives the importer a useful fallback title when there is no custom title.
 
-**Data flow**: It takes a `JsonValue`, forwards to `title_from_record(record, "ai-title", "aiTitle")`, and returns the resulting optional string slice.
+**Data flow**: It receives one JSON record and asks title_from_record to look for a record of type ai-title with an aiTitle field. If the value is present, trimmed, and non-empty, that title is returned; otherwise the result is empty.
 
-**Call relations**: Used alongside `custom_title_from_record` in both summary and full-import parsing.
+**Call relations**: summarize_session and read_session_import call this beside custom_title_from_record while walking through the file. It relies on title_from_record for the shared title-extraction rules.
 
 *Call graph*: calls 1 internal fn (title_from_record); called by 2 (read_session_import, summarize_session).
 
@@ -303,11 +303,11 @@ fn ai_title_from_record(record: &JsonValue) -> Option<&str>
 fn title_from_record(record: &'a JsonValue, record_type: &str, field: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Implements the common logic for matching a record type and pulling a non-empty title field from it.
+**Purpose**: Contains the common rule for pulling a title out of a JSON record. It prevents empty or whitespace-only titles from being treated as real names.
 
-**Data flow**: It reads `record["type"]` as a string, compares it to `record_type`, and if equal, reads `record[field]` as a string, trims whitespace, filters out empty results, and returns `Option<&str>`.
+**Data flow**: It receives a JSON record, the expected record type, and the field name where the title should live. It checks that the record type matches, reads the requested field as text, trims spaces, rejects empty results, and returns the cleaned title if all checks pass.
 
-**Call relations**: Shared helper behind both title extractors so title parsing rules stay identical for custom and AI titles.
+**Call relations**: custom_title_from_record and ai_title_from_record both call this so they do not duplicate the same checking logic. It sits underneath the higher-level session readers as a small title filter.
 
 *Call graph*: called by 2 (ai_title_from_record, custom_title_from_record); 1 external calls (get).
 
@@ -318,11 +318,11 @@ fn title_from_record(record: &'a JsonValue, record_type: &str, field: &str) -> O
 fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<ConversationMessage>
 ```
 
-**Purpose**: Converts a mutable JSON record into a normalized `ConversationMessage`, filtering out unsupported record kinds and extracting text from nested message content.
+**Purpose**: Turns one external JSON message record into the project’s ConversationMessage type. It filters out records that are not real main-thread user or assistant messages.
 
-**Data flow**: It reads the record `type`, returns `None` unless it is `assistant` or `user`, rejects records marked `isMeta` or `isSidechain`, parses the optional RFC3339 timestamp with `parse_timestamp`, takes ownership of `message.content` via `get_mut(...).take()`, and then either accepts a non-empty string directly or delegates structured content to `extract_message_text`. It returns `ConversationMessage { role, text, timestamp }`, where role is assistant if the original type was assistant or if the extracted content consisted only of tool-result blocks; otherwise role is user.
+**Data flow**: It receives a mutable JSON record. It first checks that the type is user or assistant, then skips meta and sidechain records. It reads the timestamp if one is present, takes the message content out of the JSON, and either uses plain text directly or asks extract_message_text to flatten structured content. It returns a ConversationMessage with a role, text, and optional timestamp, or nothing if the record is not usable.
 
-**Call relations**: This is the core normalization helper used by both `summarize_session` and `read_session_import`.
+**Call relations**: summarize_session uses this to know whether a file contains messages and to find timestamps and possible label text. read_session_import uses it to build the imported message list. For structured content, it hands the hard part to extract_message_text.
 
 *Call graph*: calls 1 internal fn (extract_message_text); called by 2 (read_session_import, summarize_session); 2 external calls (get, get_mut).
 
@@ -333,11 +333,11 @@ fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<Conv
 fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage>
 ```
 
-**Purpose**: Flattens structured message content blocks into one displayable text string while preserving tool activity as bounded note sections.
+**Purpose**: Converts structured message content into a single readable text string. This is needed because external agent messages can contain text, tool calls, tool results, and other block types rather than just one plain sentence.
 
-**Data flow**: It converts the input content into a vector of blocks with `content_blocks`, initializes `parts` and an `only_tool_result` flag, then iterates each block by `type`: `text` appends non-empty text and clears the flag, `tool_use` appends `tool_call_note` and clears the flag, `tool_result` appends `tool_result_note`, `thinking` is ignored, unknown types append a placeholder string and clear the flag, and missing types are skipped. It joins non-empty parts with blank lines and returns `Some(ExtractedMessage { text, only_tool_result })` unless the final text is empty.
+**Data flow**: It receives JSON content and first turns it into a list of content blocks using content_blocks. It walks those blocks, keeping normal text, converting tool calls with tool_call_note, converting tool results with tool_result_note, ignoring hidden thinking blocks, and marking unsupported block types with a clear warning. It joins the non-empty pieces with blank lines and returns the text plus a flag saying whether the message contained only tool results.
 
-**Call relations**: Called only by `conversation_message_from_owned_record` when `message.content` is not a plain string.
+**Call relations**: conversation_message_from_owned_record calls this whenever the message content is not already a simple string. It coordinates the smaller block helpers so imported structured messages become readable local messages.
 
 *Call graph*: calls 3 internal fn (content_blocks, tool_call_note, tool_result_note); called by 1 (conversation_message_from_owned_record); 2 external calls (new, format!).
 
@@ -348,11 +348,11 @@ fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage>
 fn content_blocks(content: &JsonValue) -> Vec<JsonValue>
 ```
 
-**Purpose**: Normalizes message content into a vector of object-like blocks regardless of whether the source stored it as a string or an array.
+**Purpose**: Normalizes message content into a list of object-shaped blocks. This lets later code treat plain strings and arrays of blocks in a consistent way.
 
-**Data flow**: If `content` is a string, it wraps it into a synthetic one-element array containing a `{type: "text", text: ...}` JSON object. Otherwise it reads `content` as an array, filters to object values, clones them into a `Vec<JsonValue>`, and returns an empty vector when neither form applies.
+**Data flow**: It receives a JSON value. If the value is a string, it wraps it in a simple text block. If it is an array, it keeps only the items that are JSON objects and clones them into a new list. Anything else becomes an empty list.
 
-**Call relations**: Used by `extract_message_text` to unify downstream block handling.
+**Call relations**: extract_message_text calls this before examining individual message parts. It acts like a sorter at the start of an assembly line, making sure the next stage sees a predictable shape.
 
 *Call graph*: called by 1 (extract_message_text); 3 external calls (as_array, as_str, vec!).
 
@@ -363,11 +363,11 @@ fn content_blocks(content: &JsonValue) -> Vec<JsonValue>
 fn tool_call_note(block: &JsonValue) -> String
 ```
 
-**Purpose**: Formats a `tool_use` block into a bounded textual note with explicit opening and closing tags and selected structured fields.
+**Purpose**: Turns an external tool-use block into a short, tagged note that can be stored as conversation text. The tag makes it clear that this part of the message represents a tool call, not ordinary chat.
 
-**Data flow**: It reads the tool `name` with fallback `unknown`, starts a line vector with `[external_agent_tool_call: name]`, then inspects `input`. For object inputs it preferentially emits `description`, `command`, and `file`/`file_path`; if none of those fields are present it serializes the whole object and truncates it to `NOTE_MAX_LEN`. For non-object inputs it serializes and truncates the raw input value. It appends the closing tag and joins lines with newlines.
+**Data flow**: It receives one JSON tool-use block. It reads the tool name, then tries to extract friendly fields such as description, command, and file path from the tool input. If no friendly fields are available, it includes a shortened JSON version of the input. It returns a multi-line note wrapped in external_agent_tool_call start and end tags.
 
-**Call relations**: Called by `extract_message_text` for `tool_use` blocks so tool invocations survive import as readable annotations.
+**Call relations**: extract_message_text calls this when it sees a tool_use content block. The produced note is inserted into the flattened message text alongside normal text and tool results.
 
 *Call graph*: called by 1 (extract_message_text); 3 external calls (get, format!, vec!).
 
@@ -378,11 +378,11 @@ fn tool_call_note(block: &JsonValue) -> String
 fn tool_result_note(block: &JsonValue) -> String
 ```
 
-**Purpose**: Formats a `tool_result` block into a bounded tagged note, distinguishing error results from normal ones.
+**Purpose**: Turns an external tool-result block into a tagged note, including a special label when the tool result represents an error. This keeps tool output understandable after import.
 
-**Data flow**: It checks `is_error` to choose either `[external_agent_tool_result]` or `[external_agent_tool_result: error]`, obtains the textual payload from `tool_result_text(block.get("content"))`, and returns either an empty-body tagged block or a block containing the truncated text limited by `TOOL_RESULT_MAX_LEN`.
+**Data flow**: It receives one JSON tool-result block. It chooses a normal or error tag, asks tool_result_text to pull out readable result text, shortens that text if needed, and returns a multi-line note wrapped in external_agent_tool_result tags. If there is no readable content, it returns just the opening and closing tags.
 
-**Call relations**: Called by `extract_message_text` for `tool_result` blocks.
+**Call relations**: extract_message_text calls this for tool_result blocks. It delegates the details of reading result content to tool_result_text, then formats the result for inclusion in the imported message.
 
 *Call graph*: calls 1 internal fn (tool_result_text); called by 1 (extract_message_text); 2 external calls (get, format!).
 
@@ -393,11 +393,11 @@ fn tool_result_note(block: &JsonValue) -> String
 fn tool_result_text(content: Option<&JsonValue>) -> String
 ```
 
-**Purpose**: Extracts plain text from the `content` field of a tool-result block.
+**Purpose**: Extracts plain text from the content field of a tool result. It supports both simple string results and arrays of smaller text items.
 
-**Data flow**: If content is a string, it clones and returns it. If content is an array, it collects non-empty `text` fields from each item and joins them with newlines. For any other shape or missing content, it returns an empty string.
+**Data flow**: It receives an optional JSON value. If the value is a string, it returns that string. If it is an array, it collects each item’s non-empty text field and joins them with newlines. If the content is missing or in another shape, it returns an empty string.
 
-**Call relations**: Used only by `tool_result_note` to isolate the shape-specific extraction logic.
+**Call relations**: tool_result_note calls this before adding tags and length limits. This keeps content extraction separate from presentation.
 
 *Call graph*: called by 1 (tool_result_note); 1 external calls (new).
 
@@ -408,11 +408,11 @@ fn tool_result_text(content: Option<&JsonValue>) -> String
 fn parse_timestamp(timestamp: &str) -> Option<i64>
 ```
 
-**Purpose**: Parses an RFC3339 timestamp string into Unix seconds.
+**Purpose**: Converts an RFC 3339 timestamp string, such as 2026-06-03T12:00:00Z, into a Unix timestamp in seconds. A Unix timestamp is a standard count of seconds since January 1, 1970.
 
-**Data flow**: It calls `chrono::DateTime::parse_from_rfc3339`, converts a successful parse to `timestamp()`, and returns `Option<i64>`.
+**Data flow**: It receives a timestamp string. It asks the date-time library to parse the string using RFC 3339 rules, and if that succeeds it returns the timestamp as seconds. If parsing fails, it returns nothing.
 
-**Call relations**: Used by `conversation_message_from_owned_record` when normalizing message records.
+**Call relations**: conversation_message_from_owned_record uses this when it finds a timestamp field on a message record. The resulting number is later used by summarize_session to choose the latest message time.
 
 *Call graph*: 1 external calls (parse_from_rfc3339).
 
@@ -423,11 +423,11 @@ fn parse_timestamp(timestamp: &str) -> Option<i64>
 fn reads_session_import_in_one_pass()
 ```
 
-**Purpose**: Verifies that full import parsing collects cwd, title, messages, and content hash correctly while skipping malformed lines.
+**Purpose**: Tests that read_session_import can read a mixed session file correctly while computing the hash of the original contents. It also checks that custom titles override AI titles.
 
-**Data flow**: It writes a session file containing a valid user record, an invalid JSON line, an AI title, and a custom title; calls `read_session_import`; and asserts the parsed cwd, preferred title, message count/text, and SHA-256 of the raw contents.
+**Data flow**: The test creates a temporary session file containing a valid user message, an invalid line, an AI title, and a custom title. It calls read_session_import, then checks the parsed working directory, chosen title, message text, and SHA-256 hash. The before state is a small fake file; the after state is proof that the parser extracted the intended data.
 
-**Call relations**: This test directly exercises `read_session_import` and documents its tolerance for malformed lines plus custom-over-AI title precedence.
+**Call relations**: This test directly calls read_session_import as a safety check for the import path. It uses JSON-building and file-writing helpers to create realistic input without needing an actual external session.
 
 *Call graph*: calls 1 internal fn (read_session_import); 4 external calls (new, assert_eq!, json!, write).
 
@@ -438,11 +438,11 @@ fn reads_session_import_in_one_pass()
 fn converts_tool_use_blocks_to_bounded_external_agent_tags()
 ```
 
-**Purpose**: Checks the exact textual rendering of a structured tool-use block.
+**Purpose**: Tests that a tool-use block becomes the expected tagged note. This protects the readable format used for imported external tool calls.
 
-**Data flow**: It constructs a JSON `tool_use` block with name, description, and command, calls `tool_call_note`, and asserts the returned multiline string matches the expected tagged format.
+**Data flow**: The test builds a fake tool_use JSON block with a tool name, description, and command. It compares the produced note against the exact expected multi-line string. The result confirms that key tool-call details are preserved in a predictable form.
 
-**Call relations**: This test targets the formatting helper used by `extract_message_text`.
+**Call relations**: Although the call graph only records JSON construction and assertion helpers here, the test is meant to exercise tool_call_note. It supports the larger extract_message_text flow, which relies on that formatting.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -453,11 +453,11 @@ fn converts_tool_use_blocks_to_bounded_external_agent_tags()
 fn converts_tool_result_blocks_to_bounded_external_agent_tags()
 ```
 
-**Purpose**: Checks the exact textual rendering of a normal tool-result block.
+**Purpose**: Tests that a normal tool-result block is converted into the expected tagged note. This ensures imported tool output remains clearly marked.
 
-**Data flow**: It constructs a JSON `tool_result` block with string content, calls `tool_result_note`, and asserts the returned tagged string matches the expected format.
+**Data flow**: The test builds a fake tool_result JSON block containing a string result. It checks that the note uses the normal external_agent_tool_result tag and includes the result text between the opening and closing tags.
 
-**Call relations**: This test validates the non-error branch of `tool_result_note`.
+**Call relations**: Although the call graph lists only helper macro calls, the test is intended to verify tool_result_note. That helper is used by extract_message_text when flattening structured external messages.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -468,10 +468,10 @@ fn converts_tool_result_blocks_to_bounded_external_agent_tags()
 fn converts_error_tool_result_blocks_to_bounded_external_agent_tags()
 ```
 
-**Purpose**: Checks the exact textual rendering of an error tool-result block.
+**Purpose**: Tests that an error tool-result block is labeled as an error in the imported note. This matters because failed tool output should not look the same as successful output.
 
-**Data flow**: It constructs a JSON `tool_result` block with `is_error: true`, calls `tool_result_note`, and asserts the returned string uses the error-tag variant.
+**Data flow**: The test builds a fake tool_result JSON block with is_error set to true and content saying the command failed. It checks that the formatted note uses the error label and includes the failure text.
 
-**Call relations**: This test validates the error-label branch of `tool_result_note`.
+**Call relations**: This test protects the error branch of tool_result_note, which extract_message_text depends on when importing structured tool-result blocks.
 
 *Call graph*: 2 external calls (assert_eq!, json!).

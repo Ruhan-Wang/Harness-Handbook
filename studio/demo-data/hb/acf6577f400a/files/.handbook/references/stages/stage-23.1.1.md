@@ -1,8 +1,12 @@
 # Protocol schema and wire-format verification  `stage-23.1.1`
 
-This stage is a cross-cutting verification layer for the protocol boundary: it does not drive startup or the main loop itself, but protects the wire contracts that every client, server, and remote-control integration depends on. Its tests act as an executable specification for JSON-RPC payloads, remote-control messages, and generated schema artifacts.
+This stage is a behind-the-scenes safety check for the project’s communication rules. It does not run the app’s main work. Instead, it makes sure the messages sent between the app server and its clients keep the same shape over time. That “wire format” is the agreed JSON layout used on the network, like a shared form both sides know how to fill in.
 
-common_tests.rs checks a narrow but important conversion seam in the app-server protocol, verifying exactly how ClientResponsePayload variants are split between JSON-RPC result bodies and any higher-level client response wrapper. remote_control_tests.rs locks down the v2 remote-control encoding rules, especially tricky serde cases such as nullable optional fields and responses that must serialize as empty objects. v2/tests.rs provides the broad regression net for the main v2 protocol surface, covering compatibility shims, enum mappings, experimental feature gating, and wire-format behavior across threads, permissions, filesystem, commands, MCP, plugins, skills, and realtime APIs. schema_fixtures.rs then verifies that generated TypeScript and JSON schema outputs still match the vendored fixtures, ensuring the documented schema and the runtime protocol evolve together.
+The common protocol tests check how client response data becomes JSON-RPC response parts. JSON-RPC is a simple request-and-response message style using JSON. These tests confirm when a response should also create an internal client response object, and when it should remain only a plain JSON-RPC result.
+
+The version 2 remote-control tests focus on remote-control messages, checking that Rust data structures turn into exactly the expected JSON and can be read back correctly. The broader version 2 protocol tests cover app-server messages, older accepted JSON shapes, and conversions to and from core Codex protocol types.
+
+Finally, the schema fixture test compares generated protocol schemas with the checked-in copies, catching accidental protocol changes.
 
 ## Files in this stage
 
@@ -11,9 +15,15 @@ These tests establish the core response-conversion behavior that underpins highe
 
 ### `app-server-protocol/src/protocol/common_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-The file is a small protocol test module that exercises two distinct serialization paths exposed by `ClientResponsePayload::into_jsonrpc_parts_and_payload`. It imports the surrounding protocol module via `super::*`, uses `anyhow::Result` so each test can use `?`, and compares produced JSON with `serde_json::json` plus `pretty_assertions::assert_eq` for readable failures. The first test covers the `ThreadArchive` variant and verifies the dual-output contract: converting the payload with a concrete `RequestId::Integer(7)` must preserve that request id, emit an empty JSON object as the JSON-RPC `result`, and also return an auxiliary payload that can later be turned back into a typed `ClientResponse::ThreadArchive` tied to the same request id. The second test covers `InterruptConversation`, which is intentionally JSON-RPC-only: conversion must still preserve the request id and serialize the abort reason as `{ "abortReason": "interrupted" }`, but the optional payload channel must be `None`. Together these tests document an important protocol distinction: some response variants participate in both JSON-RPC and internal client-response reconstruction, while others are represented only as plain JSON-RPC results with no follow-on typed payload.
+This is a small test file for the protocol layer, the part of the system that shapes messages sent between the app server and its clients. The main question it checks is: when the server has a typed response object, how should that become a JSON-RPC response? JSON-RPC is a common message format where each reply has an id and a JSON result.
+
+The file covers two important cases. First, a thread archive response should preserve the original request id, produce an empty JSON result, and also be convertible into a richer internal `ClientResponse`. That richer response is useful when the system wants to treat the message as a typed event rather than just raw JSON.
+
+Second, an interrupt conversation response should also preserve its request id and produce the expected JSON result, including the abort reason. But unlike the thread archive case, it should not create an extra client response payload. In other words, this response should remain just the normal JSON-RPC reply.
+
+These tests matter because protocol conversion bugs are easy to miss but can break communication between server and client. They act like a customs checkpoint: each outgoing response must have the right id, the right JSON shape, and the right follow-up behavior.
 
 #### Function details
 
@@ -23,11 +33,11 @@ The file is a small protocol test module that exercises two distinct serializati
 fn client_response_payload_returns_jsonrpc_parts_and_client_response() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `ClientResponsePayload::ThreadArchive` conversion produces all three expected pieces: the original request id, the JSON-RPC result body, and an auxiliary payload that reconstructs into a typed `ClientResponse::ThreadArchive`.
+**Purpose**: This test checks that a thread archive response is split into the correct JSON-RPC pieces and can still become a typed client response. It protects the rule that this kind of response is both a normal JSON-RPC result and something the client-response layer can understand by name.
 
-**Data flow**: The test constructs `ClientResponsePayload::ThreadArchive(v2::ThreadArchiveResponse {})` and passes `RequestId::Integer(7)` into `into_jsonrpc_parts_and_payload`. It receives a tuple of `(request_id, result, payload)`, asserts that the returned id is still integer 7 and that the JSON result is an empty object, then consumes the optional payload with `and_then(|payload| payload.into_client_response(RequestId::Integer(7)))`. From that reconstructed client response it extracts the embedded `request_id`, asserts it is also integer 7, and returns `Ok(())`; if the payload is absent or of the wrong variant, the test aborts with `panic!`.
+**Data flow**: It starts with a `ThreadArchive` response and a request id of `7`. The conversion turns that into three things: the same request id, an empty JSON result, and an optional payload. The test then turns that optional payload back into a `ClientResponse` and verifies that the response is specifically a thread archive response with the same request id.
 
-**Call relations**: This is a standalone unit test invoked by Rust’s test harness. Its role is to exercise the branch where `into_jsonrpc_parts_and_payload` emits both JSON-RPC data and a follow-up payload, and then to validate the downstream reconstruction path through `into_client_response` under the expected `ThreadArchive` case.
+**Call relations**: The Rust test runner calls this function during automated tests. Inside the test, it creates a thread archive payload, asks the protocol conversion code to break it into JSON-RPC-style parts, and uses equality checks to confirm the conversion kept the id and produced the expected JSON. If the optional payload cannot become the expected client response, the test deliberately fails.
 
 *Call graph*: 4 external calls (ThreadArchive, Integer, assert_eq!, panic!).
 
@@ -38,11 +48,11 @@ fn client_response_payload_returns_jsonrpc_parts_and_client_response() -> Result
 fn interrupt_conversation_payload_stays_jsonrpc_only() -> Result<()>
 ```
 
-**Purpose**: Verifies that `ClientResponsePayload::InterruptConversation` serializes into JSON-RPC output only and does not produce any auxiliary client-response payload.
+**Purpose**: This test checks that an interrupt conversation response becomes only a JSON-RPC response and does not create an extra typed client response payload. It protects the rule that interruption replies report their abort reason in JSON but do not continue through the client-response path.
 
-**Data flow**: The test builds `ClientResponsePayload::InterruptConversation(v1::InterruptConversationResponse { abort_reason: TurnAbortReason::Interrupted })` and converts it with `RequestId::Integer(8)`. It checks that the returned request id remains integer 8, that the JSON result exactly matches an object containing `"abortReason": "interrupted"`, and that the optional payload is `None`. It then returns `Ok(())`.
+**Data flow**: It starts with an `InterruptConversation` response whose abort reason is `Interrupted`, plus a request id of `8`. The conversion produces the same request id, a JSON result containing `abortReason: "interrupted"`, and no optional payload. The test verifies all three outcomes.
 
-**Call relations**: This test is also run directly by the test harness. It covers the contrasting conversion path where `into_jsonrpc_parts_and_payload` should stop at JSON-RPC serialization and intentionally omit any typed payload, documenting that interrupt responses are not expected to flow through the client-response reconstruction mechanism.
+**Call relations**: The Rust test runner calls this function as part of the protocol tests. The test builds an interrupt response, sends it through the same conversion path used by real protocol code, then checks that the JSON result is correct and that the extra payload slot is empty.
 
 *Call graph*: 4 external calls (InterruptConversation, Integer, assert!, assert_eq!).
 
@@ -52,11 +62,13 @@ These tests progressively lock down the v2 protocol’s serialization rules, fro
 
 ### `app-server-protocol/src/protocol/v2/remote_control_tests.rs`
 
-`test` · `test-time protocol regression checks`
+`test` · `test suite`
 
-This test file exercises a narrow but important slice of the remote-control protocol contract. It verifies that `RemoteControlClientsListParams` serializes optional pagination and ordering fields as explicit JSON `null` values rather than omitting them, which matters for clients and servers that distinguish absent from null. It also confirms the inverse direction: camelCase JSON fields such as `environmentId` and lowercase enum values like `"asc"` deserialize into the Rust struct and `RemoteControlClientsListOrder::Asc` correctly.
+This is a small test file for the remote-control part of the protocol. Its job is to make sure the JSON seen outside the program matches the Rust structures used inside the program. That matters because a protocol is like a contract: if one side sends `environmentId` but the other side expects `environment_id`, or if missing optional values disappear instead of becoming `null`, clients can break even though the Rust code still compiles.
 
-The final test checks that `RemoteControlClientsRevokeResponse`, an empty marker struct, serializes as `{}` rather than `null` or some tagged representation. Together these tests protect the serde annotations in `remote_control.rs`, especially around `rename_all = "camelCase"`, nullable option handling, and zero-field response objects. There is no helper logic here beyond direct `serde_json::to_value`/`from_value` assertions, so each test acts as an executable specification for one wire-format invariant.
+The tests focus on two remote-control messages. First, they check `RemoteControlClientsListParams`, the input used when asking for a list of remote-control clients. The file confirms that Rust’s snake_case field `environment_id` becomes the camelCase JSON field `environmentId`, and that optional fields such as cursor, limit, and order are serialized as explicit `null` values when empty. It also checks the reverse direction: JSON with camelCase field names and an order value like `asc` becomes the right Rust struct and enum value.
+
+Second, it checks `RemoteControlClientsRevokeResponse`. This response has no fields, so the test makes sure it is still sent as an empty JSON object, `{}`, rather than some other shape like `null`. These tests act as guardrails around small details that are easy to change by accident but important for compatibility.
 
 #### Function details
 
@@ -66,11 +78,11 @@ The final test checks that `RemoteControlClientsRevokeResponse`, an empty marker
 fn remote_control_clients_list_params_serialize_nullable_optional_fields()
 ```
 
-**Purpose**: Verifies that `RemoteControlClientsListParams` emits nullable optional fields as explicit `null` entries in JSON. This protects the exact request shape expected by clients and servers.
+**Purpose**: This test proves that list-client request parameters serialize to the expected JSON when optional fields are not set. It specifically protects the choice to send those empty optional values as `null` instead of leaving them out.
 
-**Data flow**: Constructs a `RemoteControlClientsListParams` with `environment_id` set and `cursor`, `limit`, and `order` all `None`; serializes it with `serde_json::to_value`; and asserts the result equals a JSON object containing `environmentId` plus `cursor: null`, `limit: null`, and `order: null`.
+**Data flow**: It starts with a `RemoteControlClientsListParams` Rust value containing an environment id and no cursor, limit, or order. The value is converted into JSON. The test then compares that JSON with the expected object containing `environmentId` and three explicit `null` fields; if they differ, the test fails.
 
-**Call relations**: Run by the Rust test harness as a unit test. It does not delegate to project helpers beyond serde and assertion macros; its role is to pin the serialization contract for list params.
+**Call relations**: During the test run, the Rust test harness runs this function as an independent check. Inside it, the final decision is handed to `assert_eq!`, which compares the produced JSON with the expected JSON and reports a clear failure if the protocol shape changed.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -81,11 +93,11 @@ fn remote_control_clients_list_params_serialize_nullable_optional_fields()
 fn remote_control_clients_list_params_deserialize_camel_case_fields()
 ```
 
-**Purpose**: Checks that camelCase JSON input and lowercase enum strings deserialize into the Rust list-params type correctly. It confirms both field renaming and enum decoding.
+**Purpose**: This test checks that incoming JSON using the protocol’s camelCase field names can be read into the correct Rust data structure. It protects compatibility with clients that send fields such as `environmentId` and values such as `asc`.
 
-**Data flow**: Feeds a JSON object with `environmentId`, `cursor`, `limit`, and `order: "asc"` into `serde_json::from_value::<RemoteControlClientsListParams>` and asserts the decoded struct contains the expected string values, numeric limit, and `RemoteControlClientsListOrder::Asc`.
+**Data flow**: It begins with a JSON object that looks like a real request from outside the program. That JSON is deserialized, meaning it is translated into a `RemoteControlClientsListParams` Rust value. The test compares the result with the exact Rust value expected: the environment id as text, the cursor and limit filled in, and the order converted into the `Asc` enum value.
 
-**Call relations**: Executed by the test harness to validate the inbound wire format. It complements the serialization test by covering the reverse direction of the same schema.
+**Call relations**: The test harness calls this function while running the project’s tests. The function uses `assert_eq!` at the end to confirm that the deserialized Rust value matches the expected one, catching mistakes in field naming or enum value mapping.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -96,22 +108,24 @@ fn remote_control_clients_list_params_deserialize_camel_case_fields()
 fn remote_control_clients_revoke_response_serializes_as_empty_object()
 ```
 
-**Purpose**: Ensures the empty revoke-response marker struct serializes to `{}`. This prevents accidental schema drift for a response with no payload fields.
+**Purpose**: This test makes sure an empty revoke response is still represented as an empty JSON object. That matters because clients may expect `{}` as the response shape, not `null` or some omitted value.
 
-**Data flow**: Constructs `RemoteControlClientsRevokeResponse {}`, serializes it with `serde_json::to_value`, and asserts the result is exactly an empty JSON object.
+**Data flow**: It creates an empty `RemoteControlClientsRevokeResponse` Rust value and converts it to JSON. The output is compared with `{}`. If serialization ever changes to produce a different JSON shape, the comparison fails.
 
-**Call relations**: Run as a unit test for the revoke endpoint’s response schema. It guards against serde behavior changes that might otherwise encode an empty struct unexpectedly.
+**Call relations**: The Rust test harness runs this function as one protocol compatibility check. The function relies on `assert_eq!` to compare the actual serialized response with the required empty object shape.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `app-server-protocol/src/protocol/v2/tests.rs`
 
-`test` · `test-time protocol regression and compatibility verification`
+`test` · `test/CI`
 
-This file is the main protocol conformance test suite for the v2 module. It defines three small path helpers at the top, then a large set of unit tests that serialize and deserialize protocol structs, compare conversion results against core types, and verify backward-compatibility behavior. The tests are intentionally concrete: they assert exact JSON field names, null-vs-omitted semantics, enum spellings, alias acceptance, and default values. Examples include `ThreadListCwdFilter` accepting either a single string or an array, `Turn.items_view` defaulting to `Full` for legacy payloads, double-option fields preserving explicit `null` for `serviceTier`, and removed fields like `forceRemoteSync` being ignored on plugin requests.
+The protocol is the shared language between the app server and its clients. If one field name changes, a missing value is treated differently, or an old client sends a now-legacy shape, real users can see broken conversations, failed approvals, bad file paths, or unusable plugins. This test file protects that contract.
 
-A major theme is compatibility between API-layer types and core protocol/config types. Tests round-trip `AskForApproval`, sandbox policies, permission profiles, MCP elicitation schemas, thread items, plugin metadata, and remote-control payloads. Another theme is experimental API gating: several tests call `ExperimentalApi::experimental_reason` to ensure nested fields and variants trigger the correct feature gate strings. The suite also checks path handling carefully, including absolute-path enforcement and syntax preservation across platforms. Overall, this file is less about algorithmic logic than about pinning the exact external contract of the app-server protocol so schema changes, serde annotation tweaks, or conversion regressions are caught immediately.
+Most tests build a protocol value, serialize it to JSON, and compare it with the public API shape. Many also deserialize JSON back into Rust values to prove the round trip works. Others check compatibility rules, such as accepting old field names, defaulting missing fields, rejecting unsafe relative paths, and marking experimental features with the right warning reason.
+
+The file covers many protocol areas: threads and turns, permission requests, filesystem calls, command and process streaming, sandbox policies, MCP server messages, network rules, conversation items, skills, plugins, marketplace sharing, error details, dynamic tools, service tiers, environments, and realtime text input. The small path helper functions keep path tests portable across operating systems. Think of this file as a customs checklist at the border between the server and every client: it makes sure every package is labeled, shaped, and accepted exactly as agreed.
 
 #### Function details
 
@@ -121,11 +135,11 @@ A major theme is compatibility between API-layer types and core protocol/config 
 fn absolute_path_string(path: &str) -> String
 ```
 
-**Purpose**: Builds a normalized absolute path string for tests from a possibly relative fragment. It ensures test JSON uses host-appropriate absolute path formatting.
+**Purpose**: Builds a test-only absolute path and returns it as a display string. Tests use it when they need the JSON form of an absolute path.
 
-**Data flow**: Accepts `&str path`, prefixes it with `/` after trimming any leading slash, converts it through `test_path_buf`, then returns the displayed path as a `String`.
+**Data flow**: It receives a path fragment, makes sure it starts with a slash, passes it through the test path helper, and returns the resulting path as text.
 
-**Call relations**: Used by many tests that need stable JSON path literals without manually branching on platform formatting. It is a local helper and does not participate in production code paths.
+**Call relations**: Individual tests call this helper when building expected JSON. It relies on the shared test path builder so path text matches the current platform.
 
 *Call graph*: 2 external calls (test_path_buf, format!).
 
@@ -136,11 +150,11 @@ fn absolute_path_string(path: &str) -> String
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an `AbsolutePathBuf` test value from a path fragment. It is the typed counterpart to `absolute_path_string`.
+**Purpose**: Builds a test-only absolute path object. Tests use it when they need the Rust value form of an absolute path.
 
-**Data flow**: Takes `&str path`, normalizes it to start with `/`, passes it to `test_path_buf`, converts the result to an absolute path via `.abs()`, and returns the `AbsolutePathBuf`.
+**Data flow**: It receives a path fragment, normalizes it into an absolute-looking path, converts it through the test path helper, and returns an AbsolutePathBuf.
 
-**Call relations**: Called by many tests that need typed absolute paths for protocol structs, including filesystem, sandbox, thread resume, and permission tests. `test_absolute_path` is a thin wrapper around it.
+**Call relations**: Filesystem, sandbox, thread, and permission tests call this helper to avoid repeating path setup. It hands those tests a safe absolute path value.
 
 *Call graph*: called by 8 (additional_file_system_permissions_populates_entries_for_legacy_roots, fs_copy_params_round_trip_with_recursive_directory_copy, fs_create_directory_params_round_trip_with_default_recursive, fs_read_file_params_round_trip, fs_write_file_params_round_trip_with_base64_data, sandbox_policy_deserializes_legacy_workspace_write_full_access_field, test_absolute_path, thread_resume_response_round_trips_initial_turns_page); 2 external calls (test_path_buf, format!).
 
@@ -151,11 +165,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn test_absolute_path() -> AbsolutePathBuf
 ```
 
-**Purpose**: Provides one fixed absolute path fixture used by process-spawn tests. It avoids repeating the same literal setup.
+**Purpose**: Provides one standard absolute path used by process-spawn tests. It avoids repeating the same sample path in several places.
 
-**Data flow**: Takes no input and returns `absolute_path("readable")`.
+**Data flow**: It takes no input, asks absolute_path for the path named readable, and returns that absolute path object.
 
-**Call relations**: Used by the process spawn tests to keep expected structs concise. It delegates entirely to `absolute_path`.
+**Call relations**: The process spawn tests call this helper when they need a consistent current working directory. It delegates all path construction to absolute_path.
 
 *Call graph*: calls 1 internal fn (absolute_path); called by 2 (process_spawn_params_distinguish_omitted_null_and_value_limits, process_spawn_params_round_trips_without_sandbox_policy).
 
@@ -166,11 +180,11 @@ fn test_absolute_path() -> AbsolutePathBuf
 fn thread_sources_round_trip_as_scalar_labels()
 ```
 
-**Purpose**: Verifies that `ThreadSource` serializes as a plain string label, deserializes back, and round-trips through the core thread-source type. It covers built-in and feature-string variants.
+**Purpose**: Checks that thread source values are encoded as simple JSON strings and can be decoded back. This protects the public labels clients see.
 
-**Data flow**: Iterates over several `(ThreadSource, label)` pairs, serializes each source to JSON, asserts the scalar string matches the expected label, deserializes it back to `ThreadSource`, converts the source into `codex_protocol::protocol::ThreadSource`, and asserts converting back with `ThreadSource::from` reproduces the original value.
+**Data flow**: It tries several thread source variants, serializes each to JSON, compares the JSON string label, deserializes it, and also checks conversion through the core protocol type.
 
-**Call relations**: Run by the test harness to validate the custom string-based serde and core conversion logic in `thread_data.rs`. It exercises both directions of the boundary conversion.
+**Call relations**: The test runner calls this test. It exercises serde JSON conversion and core-protocol conversion for ThreadSource.
 
 *Call graph*: 3 external calls (Feature, assert_eq!, to_value).
 
@@ -181,11 +195,11 @@ fn thread_sources_round_trip_as_scalar_labels()
 fn approvals_reviewer_serializes_auto_review_and_accepts_legacy_guardian_subagent()
 ```
 
-**Purpose**: Checks canonical serialization and legacy alias deserialization for `ApprovalsReviewer`. It ensures compatibility with older `guardian_subagent` payloads while emitting `auto_review`.
+**Purpose**: Checks how approval reviewer choices appear in JSON, including an old name that must still be accepted. This keeps older clients from breaking.
 
-**Data flow**: Serializes `ApprovalsReviewer::User` and `AutoReview` to strings and asserts the exact JSON text. Then it loops over `user`, `auto_review`, and `guardian_subagent`, deserializes each string into `ApprovalsReviewer`, computes the expected enum, and asserts equality.
+**Data flow**: It serializes current reviewer values, then deserializes user, auto_review, and the legacy guardian_subagent label, expecting the legacy label to map to AutoReview.
 
-**Call relations**: This test protects the custom serde aliasing and schema intent defined in `shared.rs`. It is especially important because the enum has a manual `JsonSchema` implementation and compatibility semantics.
+**Call relations**: The test runner calls this test. It depends on the protocol type's serializer and deserializer to enforce compatibility.
 
 *Call graph*: 3 external calls (assert_eq!, format!, from_str).
 
@@ -196,11 +210,11 @@ fn approvals_reviewer_serializes_auto_review_and_accepts_legacy_guardian_subagen
 fn turn_defaults_legacy_missing_items_view_to_full()
 ```
 
-**Purpose**: Ensures legacy turn payloads that omit `itemsView` still deserialize with `TurnItemsView::Full`. This preserves backward compatibility for older stored or upstream data.
+**Purpose**: Makes sure old turn JSON without an itemsView field still means a full item list. This protects stored or older responses from changing meaning.
 
-**Data flow**: Deserializes a JSON turn object lacking `itemsView` into `Turn` and asserts the resulting `turn.items_view` equals `TurnItemsView::Full`.
+**Data flow**: It feeds a legacy turn JSON object into deserialization and checks that the resulting turn has items_view set to Full.
 
-**Call relations**: Executed as a regression test for the `#[serde(default)]` behavior on `Turn.items_view` in `thread_data.rs`.
+**Call relations**: The test runner calls this test during protocol compatibility checks. It exercises Turn deserialization defaults.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -211,11 +225,11 @@ fn turn_defaults_legacy_missing_items_view_to_full()
 fn thread_turns_list_params_accepts_items_view()
 ```
 
-**Purpose**: Verifies that `ThreadTurnsListParams` accepts the `itemsView` field and decodes it into the enum. It confirms the request schema for paginated turn listing.
+**Purpose**: Checks that requests for listing turns can ask whether turn items are loaded. This lets clients request lighter or fuller responses.
 
-**Data flow**: Deserializes a JSON object containing `threadId`, `cursor`, `limit`, `sortDirection`, and `itemsView: "notLoaded"` into `ThreadTurnsListParams`, then asserts the thread id and parsed `items_view` value.
+**Data flow**: It deserializes JSON containing threadId and itemsView, then checks that the thread id and parsed view option match the request.
 
-**Call relations**: Covers the request-side serde contract for turn listing in `thread.rs`.
+**Call relations**: The test runner calls this test. It validates the request type used before the server lists thread turns.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -226,11 +240,11 @@ fn thread_turns_list_params_accepts_items_view()
 fn thread_resume_params_accept_turns_page_bootstrap()
 ```
 
-**Purpose**: Checks that `ThreadResumeParams` can carry an `initialTurnsPage` bootstrap request. It validates nested deserialization of pagination options.
+**Purpose**: Checks that resuming a thread can include initial turn-page options. This lets a client resume and request a first page of turns in one payload.
 
-**Data flow**: Deserializes JSON with `threadId` and nested `initialTurnsPage` fields into `ThreadResumeParams`, then asserts `thread_id` and the fully populated `ThreadResumeInitialTurnsPageParams` value.
+**Data flow**: It deserializes resume JSON with initialTurnsPage settings and checks that limit, sort direction, and item view are preserved.
 
-**Call relations**: Protects the experimental resume bootstrap shape defined in `thread.rs`.
+**Call relations**: The test runner calls this test. It validates ThreadResumeParams before resume orchestration would use it.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -241,11 +255,11 @@ fn thread_resume_params_accept_turns_page_bootstrap()
 fn thread_resume_response_round_trips_initial_turns_page()
 ```
 
-**Purpose**: Verifies that `ThreadResumeResponse` serializes and deserializes an embedded `initialTurnsPage` correctly. It also checks the surrounding thread payload shape.
+**Purpose**: Checks that a thread resume response can include an initial page of turns and survive JSON round trip. This protects pagination data sent at resume time.
 
-**Data flow**: Constructs a full `ThreadResumeResponse` with a nested `Thread`, path values from `absolute_path`, and a populated `TurnsPage`; serializes it to JSON; asserts the `initialTurnsPage` subobject matches the expected camelCase structure; deserializes back; and asserts full equality.
+**Data flow**: It builds a full response, serializes it, checks the initialTurnsPage JSON, then deserializes the value and compares it with the original response.
 
-**Call relations**: Exercises the response schema in `thread.rs`, including `TurnsPage` and several shared protocol types. It uses `absolute_path` to build typed cwd values.
+**Call relations**: The test runner calls this test. It uses absolute_path to construct path fields and exercises response serialization and deserialization.
 
 *Call graph*: calls 1 internal fn (absolute_path); 4 external calls (new, new, assert_eq!, to_value).
 
@@ -256,11 +270,11 @@ fn thread_resume_response_round_trips_initial_turns_page()
 fn thread_turns_items_list_round_trips()
 ```
 
-**Purpose**: Checks serialization of turn-item list params and response payloads. It confirms cursor fields and tagged `ThreadItem` encoding.
+**Purpose**: Checks the JSON shape for listing items inside a specific turn. This protects the paging contract for individual turn contents.
 
-**Data flow**: Constructs `ThreadTurnsItemsListParams`, serializes and compares JSON; then constructs `ThreadTurnsItemsListResponse` with a `ThreadItem::ContextCompaction`, serializes it, and asserts the exact JSON shape including `backwardsCursor`.
+**Data flow**: It builds request parameters and a response with one context-compaction item, serializes both, and compares them to the expected JSON.
 
-**Call relations**: Validates the paginated item-listing protocol in `thread.rs`.
+**Call relations**: The test runner calls this test. It focuses on the thread-turn item listing request and response types.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -271,11 +285,11 @@ fn thread_turns_items_list_round_trips()
 fn thread_list_params_accepts_single_cwd()
 ```
 
-**Purpose**: Ensures `ThreadListParams.cwd` accepts a single string and decodes it as `ThreadListCwdFilter::One`. It also checks the default for `use_state_db_only`.
+**Purpose**: Checks that thread listing can filter by one working directory. This supports a convenient client shortcut.
 
-**Data flow**: Deserializes JSON containing only `cwd: "/workspace"` into `ThreadListParams`, then asserts `cwd` is `Some(One(...))` and `use_state_db_only` is false.
+**Data flow**: It deserializes JSON with cwd as one string and checks that the filter becomes the One variant and the state-db-only flag remains false.
 
-**Call relations**: Covers the untagged cwd filter shape in `thread.rs` and its default boolean behavior.
+**Call relations**: The test runner calls this test. It validates ThreadListParams deserialization for a single directory filter.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, json!).
 
@@ -286,11 +300,11 @@ fn thread_list_params_accepts_single_cwd()
 fn thread_list_params_accepts_multiple_cwds()
 ```
 
-**Purpose**: Ensures `ThreadListParams.cwd` also accepts an array of strings and decodes it as `ThreadListCwdFilter::Many`. This preserves the dual-form filter contract.
+**Purpose**: Checks that thread listing can filter by several working directories. This lets clients ask for conversations across multiple projects.
 
-**Data flow**: Deserializes JSON with `cwd` as an array of two paths into `ThreadListParams` and asserts the resulting enum is `Many` with both strings preserved.
+**Data flow**: It deserializes JSON where cwd is an array and checks that the filter becomes the Many variant with the same directory strings.
 
-**Call relations**: Pairs with the single-cwd test to cover both branches of the untagged enum.
+**Call relations**: The test runner calls this test. It covers the alternate array form of the same thread-list filter.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -301,11 +315,11 @@ fn thread_list_params_accepts_multiple_cwds()
 fn thread_list_params_accepts_state_db_only_flag()
 ```
 
-**Purpose**: Checks that the `useStateDbOnly` flag deserializes to `true` when present. It protects the scan-vs-state-db selection flag on thread listing.
+**Purpose**: Checks that thread listing can request only the state database. This protects a flag used to avoid other sources of thread data.
 
-**Data flow**: Deserializes JSON containing `useStateDbOnly: true` into `ThreadListParams` and asserts the boolean field is true.
+**Data flow**: It deserializes JSON with useStateDbOnly set to true and checks that the boolean is true in the parsed parameters.
 
-**Call relations**: Validates the explicit opt-in flag in the thread listing request schema.
+**Call relations**: The test runner calls this test. It validates one optional flag in ThreadListParams.
 
 *Call graph*: 2 external calls (assert!, json!).
 
@@ -316,11 +330,11 @@ fn thread_list_params_accepts_state_db_only_flag()
 fn collab_agent_state_maps_interrupted_status()
 ```
 
-**Purpose**: Verifies conversion from core agent status to the API collaboration agent state for the interrupted case. It ensures the mapping preserves status and leaves message empty.
+**Purpose**: Checks that an interrupted core agent status becomes the app protocol's interrupted collaboration state. This keeps collaborative UI state accurate.
 
-**Data flow**: Converts `CoreAgentStatus::Interrupted` via `CollabAgentState::from` and asserts the resulting struct has `status: Interrupted` and `message: None`.
+**Data flow**: It converts CoreAgentStatus::Interrupted into CollabAgentState and compares the result with the expected status and no message.
 
-**Call relations**: Exercises a conversion defined elsewhere in the v2 module; this file uses it as a regression check.
+**Call relations**: The test runner calls this test. It exercises the conversion from core protocol status into the v2 app protocol type.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -331,11 +345,11 @@ fn collab_agent_state_maps_interrupted_status()
 fn external_agent_config_plugins_details_round_trip()
 ```
 
-**Purpose**: Checks deserialization of a migration item carrying plugin-install details. It validates nested legacy plugin migration payload structure.
+**Purpose**: Checks that plugin migration details from an external agent config deserialize correctly. This supports importing settings from other tools.
 
-**Data flow**: Deserializes a JSON `ExternalAgentConfigMigrationItem` with `itemType: PLUGINS`, a cwd string, and nested `details.plugins`, then asserts the resulting Rust struct including `MigrationDetails` and `PluginsMigration` contents.
+**Data flow**: It deserializes JSON describing a plugin migration item, including a marketplace and plugin name, and compares it with the expected Rust value.
 
-**Call relations**: Protects compatibility for external-agent config import payloads.
+**Call relations**: The test runner calls this test. It verifies the migration item type and nested details used by external config import.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -346,11 +360,11 @@ fn external_agent_config_plugins_details_round_trip()
 fn external_agent_config_import_params_accept_legacy_plugin_details()
 ```
 
-**Purpose**: Ensures the top-level import params accept the same legacy plugin details shape inside `migrationItems`. It validates the batch wrapper around migration items.
+**Purpose**: Checks that import parameters still accept the older plugin-details shape. This keeps legacy import data usable.
 
-**Data flow**: Deserializes JSON into `ExternalAgentConfigImportParams` with one migration item and asserts the resulting nested structs match the expected values.
+**Data flow**: It deserializes a migrationItems array containing plugin details and compares the parsed import parameters with the expected structure.
 
-**Call relations**: Complements the previous test by covering the enclosing request type rather than the item alone.
+**Call relations**: The test runner calls this test. It covers the wrapper request type around the same migration item format.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -361,11 +375,11 @@ fn external_agent_config_import_params_accept_legacy_plugin_details()
 fn command_execution_request_approval_localization_rejects_relative_additional_permission_paths()
 ```
 
-**Purpose**: Verifies that relative filesystem paths are rejected when API additional permissions are localized into core permission profiles. This prevents unsafe or ambiguous path handling.
+**Purpose**: Checks that extra filesystem permissions in a command approval cannot use relative paths. This is a safety rule because permissions must name exact absolute locations.
 
-**Data flow**: Deserializes `CommandExecutionRequestApprovalParams` from JSON containing a relative read path, extracts `additional_permissions`, attempts `CoreAdditionalPermissionProfile::try_from`, expects an error, and asserts the error kind is `InvalidInput`.
+**Data flow**: It deserializes an approval request containing a relative read path, extracts additional permissions, tries to convert them to core permissions, and expects an invalid-input error.
 
-**Call relations**: Tests the boundary between API permission payloads and core/native path validation.
+**Call relations**: The test runner calls this test. It uses the core permission converter as the final safety check after API deserialization.
 
 *Call graph*: 3 external calls (try_from, assert_eq!, json!).
 
@@ -376,11 +390,11 @@ fn command_execution_request_approval_localization_rejects_relative_additional_p
 fn permissions_request_approval_uses_request_permission_profile()
 ```
 
-**Purpose**: Checks that permissions-request approval payloads deserialize into the API request-permission profile and convert cleanly into the core profile. It covers both network and filesystem permissions.
+**Purpose**: Checks that a permission request uses the request-permission profile shape and converts to the core protocol correctly. This protects the approval flow for adding network and filesystem access.
 
-**Data flow**: Builds platform-specific absolute path strings, deserializes `PermissionsRequestApprovalParams`, asserts parsed cwd, environment id, and `RequestPermissionProfile` contents, then converts `params.permissions` with `CoreRequestPermissionProfile::try_from` and asserts the resulting core network and filesystem permissions.
+**Data flow**: It builds JSON with network and read/write path permissions, deserializes it, checks the v2 representation, then converts it to the core permission profile and compares the result.
 
-**Call relations**: Exercises both serde and conversion logic for the newer request-permission profile path.
+**Call relations**: The test runner calls this test. It bridges the app-server protocol request type to the core protocol permission model.
 
 *Call graph*: 3 external calls (assert_eq!, cfg!, json!).
 
@@ -391,11 +405,11 @@ fn permissions_request_approval_uses_request_permission_profile()
 fn permissions_request_approval_rejects_macos_permissions()
 ```
 
-**Purpose**: Ensures unsupported `macos` permission fields are rejected during deserialization. This prevents clients from sending stale schema fields silently.
+**Purpose**: Checks that Mac-specific permission fields are not accepted in this request. This prevents clients from sending unsupported permission categories.
 
-**Data flow**: Attempts to deserialize `PermissionsRequestApprovalParams` from JSON containing a `macos` object, expects an error, and asserts the error message mentions the unknown field.
+**Data flow**: It tries to deserialize JSON containing a macos permission block and expects an error that reports an unknown field.
 
-**Call relations**: Acts as a negative compatibility test for strict request schema enforcement.
+**Call relations**: The test runner calls this test. It relies on strict deserialization of PermissionsRequestApprovalParams.
 
 *Call graph*: 2 external calls (assert!, json!).
 
@@ -406,11 +420,11 @@ fn permissions_request_approval_rejects_macos_permissions()
 fn additional_file_system_permissions_preserves_canonical_entries()
 ```
 
-**Purpose**: Verifies that canonical filesystem sandbox entries survive conversion from core to API and back without loss. It covers special paths, glob patterns, access modes, and glob depth.
+**Purpose**: Checks that the newer canonical filesystem permission entries are preserved. This matters for special paths, glob patterns, and deny rules that cannot be represented by simple read/write roots.
 
-**Data flow**: Constructs a `CoreFileSystemPermissions` with explicit `entries` and `glob_scan_max_depth`, converts it to `AdditionalFileSystemPermissions::from`, asserts the API representation including `entries`, then converts back with `CoreFileSystemPermissions::try_from` and asserts equality with the original core value.
+**Data flow**: It builds core permissions with a root write entry and an env-file deny glob, converts them to v2 permissions, checks the entries, then converts back to core and compares.
 
-**Call relations**: Tests the canonical entry-based permission representation rather than legacy read/write roots.
+**Call relations**: The test runner calls this test. It exercises conversion in both directions between core filesystem permissions and v2 API permissions.
 
 *Call graph*: calls 1 internal fn (from); 3 external calls (new, assert_eq!, vec!).
 
@@ -421,11 +435,11 @@ fn additional_file_system_permissions_preserves_canonical_entries()
 fn additional_file_system_permissions_populates_entries_for_legacy_roots()
 ```
 
-**Purpose**: Checks that legacy read/write root permissions are mirrored into canonical `entries` when converted to the API type. This preserves compatibility while exposing the newer normalized form.
+**Purpose**: Checks that older read/write root fields still populate the newer entries list. This keeps old clients compatible while exposing the newer canonical form.
 
-**Data flow**: Creates absolute read-only and read-write roots with `absolute_path`, builds core permissions via `from_read_write_roots`, converts to `AdditionalFileSystemPermissions`, computes legacy API path strings with `LegacyAppPathString::from_abs_path`, asserts both legacy `read`/`write` fields and synthesized `entries`, then converts back to core and asserts equality.
+**Data flow**: It builds core permissions from read and write roots, converts to v2 permissions, checks both legacy fields and entries, then converts back to core.
 
-**Call relations**: Covers the compatibility bridge between legacy root lists and canonical sandbox entries.
+**Call relations**: The test runner calls this test. It uses absolute_path and LegacyAppPathString to compare path values in both old and new forms.
 
 *Call graph*: calls 3 internal fn (from, absolute_path, from_abs_path); 3 external calls (from_read_write_roots, assert_eq!, vec!).
 
@@ -436,11 +450,11 @@ fn additional_file_system_permissions_populates_entries_for_legacy_roots()
 fn additional_file_system_permissions_rejects_zero_glob_scan_depth()
 ```
 
-**Purpose**: Ensures `globScanMaxDepth` cannot be zero when deserializing filesystem permissions. This protects the `NonZeroUsize` invariant.
+**Purpose**: Checks that a glob scan depth of zero is rejected. A nonzero depth is required so the limit has a meaningful value.
 
-**Data flow**: Attempts to deserialize `AdditionalFileSystemPermissions` from JSON with `globScanMaxDepth: 0` and expects deserialization to fail.
+**Data flow**: It tries to deserialize filesystem permissions with globScanMaxDepth set to 0 and expects deserialization to fail.
 
-**Call relations**: Regression test for numeric validation encoded in the type definition.
+**Call relations**: The test runner calls this test. It exercises validation built into AdditionalFileSystemPermissions.
 
 *Call graph*: 1 external calls (json!).
 
@@ -451,11 +465,11 @@ fn additional_file_system_permissions_rejects_zero_glob_scan_depth()
 fn legacy_current_working_directory_special_path_deserializes_as_project_roots()
 ```
 
-**Purpose**: Verifies that the legacy special-path kind `current_working_directory` is accepted and normalized to `project_roots`. It also checks canonical reserialization.
+**Purpose**: Checks that an old special path name for the current working directory maps to the newer project-roots concept. This preserves old saved permission data.
 
-**Data flow**: Deserializes a `FileSystemSpecialPath` from JSON `{ "kind": "current_working_directory" }`, asserts it becomes `ProjectRoots { subpath: None }`, then serializes it back and asserts the canonical JSON uses `project_roots` with `subpath: null`.
+**Data flow**: It deserializes the legacy special path JSON, checks the Rust value is ProjectRoots with no subpath, then checks that serialization uses the new name.
 
-**Call relations**: Protects backward compatibility for renamed special-path identifiers.
+**Call relations**: The test runner calls this test. It validates backward compatibility and canonical output for FileSystemSpecialPath.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -466,11 +480,11 @@ fn legacy_current_working_directory_special_path_deserializes_as_project_roots()
 fn permissions_request_approval_response_uses_granted_permission_profile_without_macos()
 ```
 
-**Purpose**: Checks that approval responses use the granted-permission profile shape and convert into core additional permissions without any macOS-specific fields. It mirrors the request-side test for responses.
+**Purpose**: Checks that approval responses use the granted-permission profile shape and exclude unsupported Mac permissions. This protects the data returned after a user grants access.
 
-**Data flow**: Deserializes `PermissionsRequestApprovalResponse` from JSON containing network and filesystem permissions, asserts the API `GrantedPermissionProfile`, then converts it with `CoreAdditionalPermissionProfile::try_from` and asserts the resulting core permissions.
+**Data flow**: It deserializes a response with network and file permissions, checks the v2 granted profile, then converts it to the core additional-permission profile and compares it.
 
-**Call relations**: Validates the response-side permission conversion boundary.
+**Call relations**: The test runner calls this test. It connects the response type to the core permission model used after approval.
 
 *Call graph*: 3 external calls (assert_eq!, cfg!, json!).
 
@@ -481,11 +495,11 @@ fn permissions_request_approval_response_uses_granted_permission_profile_without
 fn permissions_request_approval_response_defaults_scope_to_turn()
 ```
 
-**Purpose**: Ensures the permission grant scope defaults to `Turn` and `strict_auto_review` defaults to `None` when omitted. This locks down response defaults.
+**Purpose**: Checks that a permission grant response defaults to turn scope. This means missing scope only grants access for the current turn, not longer.
 
-**Data flow**: Deserializes `PermissionsRequestApprovalResponse` from minimal JSON with empty `permissions`, then asserts `scope == PermissionGrantScope::Turn` and `strict_auto_review == None`.
+**Data flow**: It deserializes a response with empty permissions and checks that scope is Turn and strict auto-review is absent.
 
-**Call relations**: Covers defaulting behavior on the approval response schema.
+**Call relations**: The test runner calls this test. It validates safe defaults in PermissionsRequestApprovalResponse.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -496,11 +510,11 @@ fn permissions_request_approval_response_defaults_scope_to_turn()
 fn permissions_request_approval_response_accepts_strict_auto_review()
 ```
 
-**Purpose**: Checks that the optional `strictAutoReview` field is accepted and preserved. It validates an additional response flag without affecting defaults.
+**Purpose**: Checks that approval responses can carry the strictAutoReview flag. This lets clients ask for tighter automatic review behavior.
 
-**Data flow**: Deserializes `PermissionsRequestApprovalResponse` from JSON containing `strictAutoReview: true` and asserts the field becomes `Some(true)`.
+**Data flow**: It deserializes a response with strictAutoReview true and checks that the parsed field is Some(true).
 
-**Call relations**: Complements the default-scope test by covering the explicit optional flag path.
+**Call relations**: The test runner calls this test. It covers an optional response field used by the permission approval flow.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -511,11 +525,11 @@ fn permissions_request_approval_response_accepts_strict_auto_review()
 fn permission_profile_selection_uses_id_string()
 ```
 
-**Purpose**: Verifies that several request types represent permission profile selection as a plain string id. This ensures the API uses profile identifiers rather than embedded policy objects.
+**Purpose**: Checks that permission profiles are selected by simple string identifiers in several request types. This avoids embedding full permission profiles where only an ID is expected.
 
-**Data flow**: Deserializes `ThreadStartParams`, `TurnStartParams`, `CommandExecParams`, `ThreadResumeParams`, and `ThreadForkParams` from JSON containing permission/profile id strings, then asserts each corresponding field stores the expected string.
+**Data flow**: It deserializes thread start, turn start, command exec, thread resume, and thread fork JSON with permission profile strings and checks each parsed field.
 
-**Call relations**: Cross-cuts multiple request schemas to pin a shared design choice around permission profile references.
+**Call relations**: The test runner calls this test. It validates a shared convention across several client request types.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -526,11 +540,11 @@ fn permission_profile_selection_uses_id_string()
 fn thread_path_params_deserialize_empty_path_as_none()
 ```
 
-**Purpose**: Ensures empty string path values are treated as absent for resume and fork params, while non-empty paths are preserved. This matches the documented semantics in `thread.rs`.
+**Purpose**: Checks that an empty path string means no path for resume and fork requests. This keeps clients that send empty strings from accidentally creating invalid paths.
 
-**Data flow**: Deserializes `ThreadResumeParams` and `ThreadForkParams` from JSON with `path: ""` and asserts `path == None`; then deserializes a resume payload with a non-empty path and asserts it becomes `Some(PathBuf(...))`.
+**Data flow**: It deserializes resume and fork JSON with an empty path and checks they become None, then checks a real path becomes Some(PathBuf).
 
-**Call relations**: Tests the custom `deserialize_empty_path_as_none` helper wired into thread path fields.
+**Call relations**: The test runner calls this test. It exercises custom path deserialization on thread lifecycle request types.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -541,11 +555,11 @@ fn thread_path_params_deserialize_empty_path_as_none()
 fn fs_get_metadata_response_round_trips_minimal_fields()
 ```
 
-**Purpose**: Checks exact JSON encoding and decoding for the minimal filesystem metadata response. It validates camelCase field names and numeric timestamps.
+**Purpose**: Checks the JSON shape for filesystem metadata responses. This protects clients that inspect whether a path is a file, directory, or symlink and when it changed.
 
-**Data flow**: Constructs `FsGetMetadataResponse`, serializes it, asserts the JSON object fields, deserializes back, and asserts equality.
+**Data flow**: It builds a metadata response, serializes it to JSON with camelCase fields, deserializes it back, and compares the result.
 
-**Call relations**: Part of the filesystem protocol regression coverage.
+**Call relations**: The test runner calls this test. It validates the fs/getMetadata response contract.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -556,11 +570,11 @@ fn fs_get_metadata_response_round_trips_minimal_fields()
 fn fs_read_file_response_round_trips_base64_data()
 ```
 
-**Purpose**: Verifies that file-read responses carry base64 data under `dataBase64` and round-trip cleanly. It protects the binary-content wire format.
+**Purpose**: Checks that file-read responses carry file bytes as base64 text. Base64 is used so arbitrary binary data can travel through JSON safely.
 
-**Data flow**: Constructs `FsReadFileResponse`, serializes to JSON, asserts the exact field name and value, deserializes back, and asserts equality.
+**Data flow**: It builds a response with base64 data, serializes it, compares the JSON, deserializes it, and checks equality.
 
-**Call relations**: Covers the response half of the fs/readFile protocol.
+**Call relations**: The test runner calls this test. It validates the fs/readFile response type.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -571,11 +585,11 @@ fn fs_read_file_response_round_trips_base64_data()
 fn fs_read_file_params_round_trip()
 ```
 
-**Purpose**: Checks request serialization and deserialization for reading a file by absolute path. It ensures path fields use the expected string representation.
+**Purpose**: Checks the JSON shape for reading a file path. This protects the client-to-server request format for file reads.
 
-**Data flow**: Constructs `FsReadFileParams` with `absolute_path`, serializes it, asserts the JSON path string, deserializes back, and asserts equality.
+**Data flow**: It builds params with an absolute path, serializes them to JSON, compares the path string, deserializes, and checks equality.
 
-**Call relations**: Uses the local absolute-path helper to validate the fs/readFile request schema.
+**Call relations**: The test runner calls this test. It uses absolute_path to create the path under test.
 
 *Call graph*: calls 1 internal fn (absolute_path); 2 external calls (assert_eq!, to_value).
 
@@ -586,11 +600,11 @@ fn fs_read_file_params_round_trip()
 fn fs_create_directory_params_round_trip_with_default_recursive()
 ```
 
-**Purpose**: Verifies create-directory params preserve an explicit `recursive: null` when the optional field is unset. This distinguishes null from omission in the wire contract.
+**Purpose**: Checks the JSON shape for creating a directory when recursive is unspecified. This preserves the difference between a missing decision and a chosen true or false.
 
-**Data flow**: Constructs `FsCreateDirectoryParams` with `recursive: None`, serializes it, asserts JSON contains `recursive: null`, deserializes back, and asserts equality.
+**Data flow**: It builds create-directory params with recursive set to None, serializes to JSON where recursive is null, deserializes, and compares.
 
-**Call relations**: Covers nullable optional behavior for filesystem mutation params.
+**Call relations**: The test runner calls this test. It uses absolute_path for the directory path.
 
 *Call graph*: calls 1 internal fn (absolute_path); 2 external calls (assert_eq!, to_value).
 
@@ -601,11 +615,11 @@ fn fs_create_directory_params_round_trip_with_default_recursive()
 fn fs_write_file_params_round_trip_with_base64_data()
 ```
 
-**Purpose**: Checks write-file request encoding for absolute path plus base64 payload. It protects the binary write request schema.
+**Purpose**: Checks the JSON shape for writing binary file data. Base64 text is used so bytes fit safely inside JSON.
 
-**Data flow**: Constructs `FsWriteFileParams`, serializes to JSON, asserts `path` and `dataBase64`, deserializes back, and asserts equality.
+**Data flow**: It builds write-file params with an absolute path and base64 data, serializes, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Filesystem request regression test.
+**Call relations**: The test runner calls this test. It uses absolute_path for the destination path.
 
 *Call graph*: calls 1 internal fn (absolute_path); 2 external calls (assert_eq!, to_value).
 
@@ -616,11 +630,11 @@ fn fs_write_file_params_round_trip_with_base64_data()
 fn fs_copy_params_round_trip_with_recursive_directory_copy()
 ```
 
-**Purpose**: Verifies copy params serialize source, destination, and recursive flag correctly. It covers directory-copy request shape.
+**Purpose**: Checks the JSON shape for copying a path recursively. This protects directory-copy requests.
 
-**Data flow**: Constructs `FsCopyParams` with two absolute paths and `recursive: true`, serializes to JSON, asserts the exact object, deserializes back, and asserts equality.
+**Data flow**: It builds copy params with source, destination, and recursive true, serializes them, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Another filesystem request schema test using the path helper.
+**Call relations**: The test runner calls this test. It uses absolute_path for both source and destination paths.
 
 *Call graph*: calls 1 internal fn (absolute_path); 2 external calls (assert_eq!, to_value).
 
@@ -631,11 +645,11 @@ fn fs_copy_params_round_trip_with_recursive_directory_copy()
 fn thread_shell_command_params_round_trip()
 ```
 
-**Purpose**: Checks the thread shell-command request schema, especially preserving the raw shell command string. It validates the unsandboxed shell-command API payload.
+**Purpose**: Checks the JSON shape for sending a shell command to a thread. This protects a small request used to run command text in a thread context.
 
-**Data flow**: Constructs `ThreadShellCommandParams`, serializes it, asserts `threadId` and `command`, deserializes back, and asserts equality.
+**Data flow**: It builds params with a thread id and command string, serializes them, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Covers the thread shell-command types defined in `thread.rs`.
+**Call relations**: The test runner calls this test. It validates ThreadShellCommandParams.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -646,11 +660,11 @@ fn thread_shell_command_params_round_trip()
 fn thread_shell_command_response_round_trip()
 ```
 
-**Purpose**: Ensures the empty shell-command response serializes as `{}` and deserializes back. It protects the marker response shape.
+**Purpose**: Checks that the shell-command response is an empty JSON object. This confirms the response carries no extra data.
 
-**Data flow**: Constructs `ThreadShellCommandResponse {}`, serializes to JSON, asserts `{}`, deserializes back, and asserts equality.
+**Data flow**: It builds the empty response, serializes it to {}, deserializes it, and checks equality.
 
-**Call relations**: Pairs with the shell-command params test for the response side.
+**Call relations**: The test runner calls this test. It validates ThreadShellCommandResponse.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -661,11 +675,11 @@ fn thread_shell_command_response_round_trip()
 fn fs_changed_notification_round_trips()
 ```
 
-**Purpose**: Verifies the filesystem change notification schema, including watch id and changed absolute paths. It protects event-stream payload formatting.
+**Purpose**: Checks the notification sent when watched filesystem paths change. This protects file-watch updates for clients.
 
-**Data flow**: Constructs `FsChangedNotification` with a watch id and two absolute paths, serializes it, asserts the JSON object and path strings, deserializes back, and asserts equality.
+**Data flow**: It builds a notification with a watch id and changed paths, serializes it to JSON, compares the path strings, deserializes, and checks equality.
 
-**Call relations**: Notification schema regression test for filesystem watching.
+**Call relations**: The test runner calls this test. It uses absolute path helper output in the expected JSON.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -676,11 +690,11 @@ fn fs_changed_notification_round_trips()
 fn command_exec_params_default_optional_streaming_flags()
 ```
 
-**Purpose**: Checks default values for omitted command-exec streaming and timeout-related booleans. It ensures deserialization fills in the intended defaults.
+**Purpose**: Checks default values for command execution streaming flags. This ensures old or simple requests do not accidentally enable streaming or TTY behavior.
 
-**Data flow**: Deserializes `CommandExecParams` from minimal JSON containing command, timeout, and cwd, then asserts the resulting struct has false/default values for tty, streaming flags, output-cap flags, and other omitted optionals.
+**Data flow**: It deserializes command JSON with only command, timeout, and cwd, then compares the parsed params with expected false flags and empty optional fields.
 
-**Call relations**: Protects defaulting behavior in the command execution request schema.
+**Call relations**: The test runner calls this test. It validates CommandExecParams defaults.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -691,11 +705,11 @@ fn command_exec_params_default_optional_streaming_flags()
 fn command_exec_params_round_trips_disable_timeout()
 ```
 
-**Purpose**: Verifies command-exec params preserve the `disableTimeout` flag and nullable optional fields during round-trip serialization. It distinguishes disabling timeout from specifying a timeout value.
+**Purpose**: Checks that command execution can explicitly disable timeouts. This is important for long-running commands.
 
-**Data flow**: Constructs `CommandExecParams` with `disable_timeout: true`, serializes it, asserts the JSON includes `disableTimeout: true` and explicit nulls for nullable fields, deserializes back, and asserts equality.
+**Data flow**: It builds params with disable_timeout true, serializes them, checks JSON, deserializes, and compares with the original.
 
-**Call relations**: Covers one branch of command execution limit semantics.
+**Call relations**: The test runner calls this test. It exercises CommandExecParams serialization around timeout fields.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -706,11 +720,11 @@ fn command_exec_params_round_trips_disable_timeout()
 fn process_spawn_params_round_trips_without_sandbox_policy()
 ```
 
-**Purpose**: Checks process-spawn params serialize correctly when no sandbox policy exists on this older/lower-level API. It validates required and nullable fields.
+**Purpose**: Checks the newer process-spawn request shape when no sandbox policy field exists. This protects process startup messages.
 
-**Data flow**: Constructs `ProcessSpawnParams` using `test_absolute_path`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds process-spawn params with a command, handle, cwd, and defaults, serializes them, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Uses the fixed path helper and covers the process API distinct from command/exec.
+**Call relations**: The test runner calls this test. It uses test_absolute_path for the current working directory.
 
 *Call graph*: calls 1 internal fn (test_absolute_path); 3 external calls (assert_eq!, to_value, vec!).
 
@@ -721,11 +735,11 @@ fn process_spawn_params_round_trips_without_sandbox_policy()
 fn process_spawn_params_distinguish_omitted_null_and_value_limits()
 ```
 
-**Purpose**: Ensures `ProcessSpawnParams` preserves the three-way distinction for optional limits: omitted, explicit null, and explicit numeric value. This is a subtle but important wire-format invariant.
+**Purpose**: Checks that process-spawn output and timeout limits distinguish omitted fields, explicit null, and numeric values. This matters because those three cases mean default, disabled, and set limit.
 
-**Data flow**: Builds a base JSON object and deserializes it to assert omitted limits become `None`; deserializes a variant with `outputBytesCap: null` and `timeoutMs: null` to assert `Some(None)`; then deserializes a variant with numeric values to assert `Some(Some(...))` for both fields.
+**Data flow**: It deserializes three JSON shapes: no limits, null limits, and numeric limits. It compares each result with the expected nested option values.
 
-**Call relations**: Regression test for double-option semantics on process spawn limits.
+**Call relations**: The test runner calls this test. It uses test_absolute_path and focuses on ProcessSpawnParams limit semantics.
 
 *Call graph*: calls 1 internal fn (test_absolute_path); 3 external calls (assert_eq!, json!, vec!).
 
@@ -736,11 +750,11 @@ fn process_spawn_params_distinguish_omitted_null_and_value_limits()
 fn command_exec_params_round_trips_disable_output_cap()
 ```
 
-**Purpose**: Verifies command-exec params preserve the `disableOutputCap` flag and related nullable fields. It distinguishes disabling the cap from setting a numeric cap.
+**Purpose**: Checks that command execution can explicitly disable output size limits. This supports commands that may produce lots of output.
 
-**Data flow**: Constructs `CommandExecParams` with `disable_output_cap: true`, serializes it, asserts the JSON shape, deserializes back, and asserts equality.
+**Data flow**: It builds params with streaming output and disable_output_cap true, serializes them, checks JSON, deserializes, and compares.
 
-**Call relations**: Complements the disable-timeout test for the other execution limit flag.
+**Call relations**: The test runner calls this test. It validates CommandExecParams output-cap fields.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -751,11 +765,11 @@ fn command_exec_params_round_trips_disable_output_cap()
 fn command_exec_params_round_trips_env_overrides_and_unsets()
 ```
 
-**Purpose**: Checks that command-exec environment overrides serialize as a string-or-null map and round-trip correctly. It covers both setting and unsetting environment variables.
+**Purpose**: Checks command environment overrides, additions, and removals. A null environment value means unset this variable.
 
-**Data flow**: Constructs `CommandExecParams` with an `env: HashMap<String, Option<String>>`, serializes it, asserts JSON contains string values and `null` for unset variables, deserializes back, and asserts equality.
+**Data flow**: It builds params with env entries containing strings and nulls, serializes to JSON, compares the map, deserializes, and checks equality.
 
-**Call relations**: Protects the environment override contract for command execution.
+**Call relations**: The test runner calls this test. It validates the environment map inside CommandExecParams.
 
 *Call graph*: 4 external calls (from, assert_eq!, to_value, vec!).
 
@@ -766,11 +780,11 @@ fn command_exec_params_round_trips_env_overrides_and_unsets()
 fn command_exec_write_round_trips_close_only_payload()
 ```
 
-**Purpose**: Verifies the stdin-write request can represent a close-only operation with no data payload. It checks explicit null encoding for `deltaBase64`.
+**Purpose**: Checks the request for closing a command's standard input without sending more bytes. This supports interactive process control.
 
-**Data flow**: Constructs `CommandExecWriteParams` with `delta_base64: None` and `close_stdin: true`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds write params with no data and close_stdin true, serializes them, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Covers one control-path request in the command execution API.
+**Call relations**: The test runner calls this test. It validates CommandExecWriteParams.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -781,11 +795,11 @@ fn command_exec_write_round_trips_close_only_payload()
 fn command_exec_terminate_round_trips()
 ```
 
-**Purpose**: Checks the terminate request schema for command execution. It ensures the process id field is named and encoded correctly.
+**Purpose**: Checks the request used to terminate a running command. This protects the process id field name.
 
-**Data flow**: Constructs `CommandExecTerminateParams`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds terminate params, serializes them to JSON, compares the processId field, deserializes, and checks equality.
 
-**Call relations**: Simple regression test for the terminate control request.
+**Call relations**: The test runner calls this test. It validates CommandExecTerminateParams.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -796,11 +810,11 @@ fn command_exec_terminate_round_trips()
 fn command_exec_params_round_trip_with_size()
 ```
 
-**Purpose**: Verifies PTY size information round-trips inside command-exec params. It covers the nested terminal-size object.
+**Purpose**: Checks command execution with a terminal size. This matters for TTY commands whose layout depends on rows and columns.
 
-**Data flow**: Constructs `CommandExecParams` with `tty: true` and a `size` struct, serializes it, asserts the nested `rows`/`cols` JSON, deserializes back, and asserts equality.
+**Data flow**: It builds params with tty true and a size, serializes them, checks nested rows and cols JSON, deserializes, and compares.
 
-**Call relations**: Covers terminal-oriented command execution requests.
+**Call relations**: The test runner calls this test. It validates terminal-size support in CommandExecParams.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -811,11 +825,11 @@ fn command_exec_params_round_trip_with_size()
 fn command_exec_resize_round_trips()
 ```
 
-**Purpose**: Checks the resize request schema for an existing command-exec PTY. It validates the nested size object and process id field.
+**Purpose**: Checks the request for resizing a running command terminal. This keeps interactive terminal resizing messages stable.
 
-**Data flow**: Constructs `CommandExecResizeParams`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds resize params with a process id and terminal size, serializes them, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Regression test for PTY resize control messages.
+**Call relations**: The test runner calls this test. It validates CommandExecResizeParams.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -826,11 +840,11 @@ fn command_exec_resize_round_trips()
 fn command_exec_output_delta_round_trips()
 ```
 
-**Purpose**: Verifies the streamed command-exec output delta notification schema. It protects stream enum encoding, base64 delta field naming, and cap flag behavior.
+**Purpose**: Checks streamed command output notifications. A delta is a small chunk of output, encoded as base64 so bytes stay safe in JSON.
 
-**Data flow**: Constructs `CommandExecOutputDeltaNotification`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds an output-delta notification, serializes it, compares process id, stream, delta, and cap flag, deserializes, and checks equality.
 
-**Call relations**: Notification-side counterpart to command execution request tests.
+**Call relations**: The test runner calls this test. It validates CommandExecOutputDeltaNotification.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -841,11 +855,11 @@ fn command_exec_output_delta_round_trips()
 fn process_control_params_round_trip()
 ```
 
-**Purpose**: Checks three lower-level process control request types in one test: write stdin, resize PTY, and kill. It validates their exact JSON shapes.
+**Purpose**: Checks the newer process-control request shapes for writing stdin, resizing a pseudo-terminal, and killing a process. This protects interactive process control.
 
-**Data flow**: Constructs `ProcessWriteStdinParams`, `ProcessResizePtyParams`, and `ProcessKillParams`; serializes each; asserts the expected JSON; deserializes each back; and asserts equality.
+**Data flow**: It builds each control request, serializes it to JSON, compares the expected fields, deserializes it, and checks equality.
 
-**Call relations**: Groups related process-control schema checks for the process API.
+**Call relations**: The test runner calls this test. It covers ProcessWriteStdinParams, ProcessResizePtyParams, and ProcessKillParams together.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -856,11 +870,11 @@ fn process_control_params_round_trip()
 fn process_notifications_round_trip()
 ```
 
-**Purpose**: Verifies process output and exit notifications serialize and deserialize correctly. It covers both streaming deltas and terminal exit summaries.
+**Purpose**: Checks process output and exit notifications. This protects the messages clients receive while a spawned process runs and finishes.
 
-**Data flow**: Constructs `ProcessOutputDeltaNotification` and `ProcessExitedNotification`, serializes each, asserts the exact JSON objects, deserializes back, and asserts equality.
+**Data flow**: It builds an output-delta notification and an exited notification, serializes each, compares JSON fields, deserializes, and checks equality.
 
-**Call relations**: Notification regression coverage for the process subsystem.
+**Call relations**: The test runner calls this test. It validates ProcessOutputDeltaNotification and ProcessExitedNotification.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -871,11 +885,11 @@ fn process_notifications_round_trip()
 fn command_execution_output_delta_round_trips()
 ```
 
-**Purpose**: Checks the item-scoped command execution output delta notification used in thread item streams. It ensures text deltas and item identifiers are preserved.
+**Purpose**: Checks streamed output attached to a command-execution item inside a conversation turn. This keeps UI updates for command output stable.
 
-**Data flow**: Constructs `CommandExecutionOutputDeltaNotification`, serializes it, asserts the JSON object, deserializes back, and asserts equality.
+**Data flow**: It builds a notification with thread, turn, item, and text delta, serializes it, compares JSON, deserializes, and checks equality.
 
-**Call relations**: Covers the thread/item-level command output event distinct from raw process notifications.
+**Call relations**: The test runner calls this test. It validates item-level command execution output notifications.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -886,11 +900,11 @@ fn command_execution_output_delta_round_trips()
 fn sandbox_policy_round_trips_external_sandbox_network_access()
 ```
 
-**Purpose**: Verifies `SandboxPolicy::ExternalSandbox` converts to and from the core sandbox policy while preserving network access mode. It checks one branch of sandbox conversion logic.
+**Purpose**: Checks that external sandbox policies preserve network-access settings when converted to and from the core protocol. This protects sandbox configuration.
 
-**Data flow**: Constructs a v2 `SandboxPolicy::ExternalSandbox`, converts it with `to_core`, asserts the core enum value, converts back with `SandboxPolicy::from`, and asserts equality with the original v2 value.
+**Data flow**: It builds a v2 external sandbox policy, converts it to the core policy, checks the result, converts back to v2, and checks equality.
 
-**Call relations**: Exercises conversion logic defined elsewhere in the protocol module.
+**Call relations**: The test runner calls this test. It exercises SandboxPolicy conversion methods.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (assert_eq!).
 
@@ -901,11 +915,11 @@ fn sandbox_policy_round_trips_external_sandbox_network_access()
 fn sandbox_policy_round_trips_read_only_network_access()
 ```
 
-**Purpose**: Checks round-trip conversion for the read-only sandbox policy with boolean network access. It validates another sandbox variant.
+**Purpose**: Checks that read-only sandbox policies preserve their network-access flag through core conversion. This keeps sandbox behavior predictable.
 
-**Data flow**: Constructs `SandboxPolicy::ReadOnly`, converts to core, asserts the core value, converts back, and asserts equality.
+**Data flow**: It builds a v2 read-only policy, converts it to core, compares, converts back, and compares again.
 
-**Call relations**: Companion test to the external-sandbox conversion case.
+**Call relations**: The test runner calls this test. It validates one SandboxPolicy variant's conversion path.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (assert_eq!).
 
@@ -916,11 +930,11 @@ fn sandbox_policy_round_trips_read_only_network_access()
 fn ask_for_approval_granular_round_trips_request_permissions_flag()
 ```
 
-**Purpose**: Verifies that the granular approval policy preserves the `request_permissions` flag through conversion to and from the core type. This guards a newer field in the granular config.
+**Purpose**: Checks that granular approval policy preserves the request-permissions flag through core conversion. This protects fine-grained approval settings.
 
-**Data flow**: Constructs `AskForApproval::Granular` with explicit booleans, converts it to core with `to_core`, asserts the embedded `CoreGranularApprovalConfig`, converts back with `AskForApproval::from`, and asserts equality.
+**Data flow**: It builds a granular v2 policy, converts it to core config, compares all booleans, converts back, and checks equality.
 
-**Call relations**: Directly exercises the conversion functions in `shared.rs`.
+**Call relations**: The test runner calls this test. It exercises AskForApproval conversion between v2 and core types.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (assert_eq!).
 
@@ -931,11 +945,11 @@ fn ask_for_approval_granular_round_trips_request_permissions_flag()
 fn ask_for_approval_granular_defaults_missing_optional_flags_to_false()
 ```
 
-**Purpose**: Ensures omitted optional granular approval flags deserialize as `false`. It protects backward-compatible defaults for newer booleans.
+**Purpose**: Checks that missing granular approval flags default to false. This gives old or partial JSON a safe, predictable meaning.
 
-**Data flow**: Deserializes `AskForApproval` from JSON containing only some granular fields, then asserts the resulting enum has `skill_approval: false` and `request_permissions: false` while preserving provided values.
+**Data flow**: It deserializes granular approval JSON missing some flags and compares the result with all missing flags set to false.
 
-**Call relations**: Covers serde defaulting behavior for the granular approval variant.
+**Call relations**: The test runner calls this test. It validates AskForApproval deserialization defaults.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -946,11 +960,11 @@ fn ask_for_approval_granular_defaults_missing_optional_flags_to_false()
 fn ask_for_approval_granular_is_marked_experimental()
 ```
 
-**Purpose**: Checks that the granular approval variant is tagged with the expected experimental gate string while non-granular variants are not. It validates metadata generated by the `ExperimentalApi` derive.
+**Purpose**: Checks that granular approval is reported as experimental, while ordinary approval is not. This helps clients warn users about unstable features.
 
-**Data flow**: Calls `ExperimentalApi::experimental_reason` on a granular `AskForApproval` value and on `AskForApproval::OnRequest`, then asserts the first returns `Some("askForApproval.granular")` and the second returns `None`.
+**Data flow**: It asks the experimental API helper for a reason on granular approval and on on-request approval, then compares the reasons.
 
-**Call relations**: Tests experimental gating metadata rather than serde or conversion behavior.
+**Call relations**: The test runner calls this test. It exercises the ExperimentalApi trait for AskForApproval.
 
 *Call graph*: 2 external calls (experimental_reason, assert_eq!).
 
@@ -961,11 +975,11 @@ fn ask_for_approval_granular_is_marked_experimental()
 fn config_granular_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Ensures a `Config` containing granular approval policy reports the granular experimental gate. It checks nested experimental propagation.
+**Purpose**: Checks that a config containing granular approval is marked experimental. This prevents experimental settings from being silently accepted.
 
-**Data flow**: Constructs a `Config` with `approval_policy: Some(AskForApproval::Granular { ... })`, calls `ExperimentalApi::experimental_reason`, and asserts the returned reason string.
+**Data flow**: It builds a Config with a granular approval policy and asks for its experimental reason, expecting askForApproval.granular.
 
-**Call relations**: Validates that nested experimental fields bubble up through larger config objects.
+**Call relations**: The test runner calls this test. It validates experimental detection on Config.
 
 *Call graph*: 3 external calls (new, experimental_reason, assert_eq!).
 
@@ -976,11 +990,11 @@ fn config_granular_approval_policy_is_marked_experimental()
 fn config_approvals_reviewer_is_marked_experimental()
 ```
 
-**Purpose**: Checks that setting `approvals_reviewer` in `Config` triggers the expected experimental gate string. It protects field-level gating metadata.
+**Purpose**: Checks that setting the approvals reviewer to automatic review in config is marked experimental. This protects a newer review feature.
 
-**Data flow**: Constructs a `Config` with `approvals_reviewer: Some(ApprovalsReviewer::AutoReview)`, calls `ExperimentalApi::experimental_reason`, and asserts it returns `Some("config/read.approvalsReviewer")`.
+**Data flow**: It builds a Config with approvals_reviewer set to AutoReview and checks the experimental reason string.
 
-**Call relations**: Another experimental metadata regression test.
+**Call relations**: The test runner calls this test. It exercises experimental detection for Config reviewer settings.
 
 *Call graph*: 3 external calls (new, experimental_reason, assert_eq!).
 
@@ -991,11 +1005,11 @@ fn config_approvals_reviewer_is_marked_experimental()
 fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Ensures granular approval policies inside `ConfigRequirements.allowed_approval_policies` are marked experimental. It checks gating through collection fields.
+**Purpose**: Checks that allowing granular approval in config requirements is also marked experimental. This catches experimental use even in policy allow-lists.
 
-**Data flow**: Constructs `ConfigRequirements` with a vector containing one granular approval policy, calls `ExperimentalApi::experimental_reason`, and asserts the granular gate string.
+**Data flow**: It builds ConfigRequirements with a granular approval policy in allowed_approval_policies and checks the experimental reason.
 
-**Call relations**: Covers nested experimental propagation through requirement lists.
+**Call relations**: The test runner calls this test. It validates experimental detection on ConfigRequirements.
 
 *Call graph*: 3 external calls (experimental_reason, assert_eq!, vec!).
 
@@ -1006,11 +1020,11 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
 fn client_request_thread_start_granular_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Checks that a `ClientRequest::ThreadStart` carrying granular approval policy is marked experimental. It validates gating at the top-level request enum.
+**Purpose**: Checks that a thread-start client request using granular approval is marked experimental. This catches experimental use at the request boundary.
 
-**Data flow**: Constructs a `ClientRequest::ThreadStart` with integer request id and `ThreadStartParams` containing granular approval policy, calls `ExperimentalApi::experimental_reason`, and asserts the granular gate string.
+**Data flow**: It builds a ClientRequest::ThreadStart with granular approval params and checks the experimental reason.
 
-**Call relations**: Ensures request-envelope experimental detection sees nested thread-start fields.
+**Call relations**: The test runner calls this test. It exercises experimental detection for a thread start request.
 
 *Call graph*: 4 external calls (default, experimental_reason, Integer, assert_eq!).
 
@@ -1021,11 +1035,11 @@ fn client_request_thread_start_granular_approval_policy_is_marked_experimental()
 fn client_request_thread_resume_granular_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Checks the same experimental propagation for `ClientRequest::ThreadResume`. It validates the resume request path.
+**Purpose**: Checks that a thread-resume request using granular approval is marked experimental. This keeps resume-time settings under the same gate.
 
-**Data flow**: Constructs a `ClientRequest::ThreadResume` with granular approval policy in params, calls `experimental_reason`, and asserts the expected string.
+**Data flow**: It builds a ClientRequest::ThreadResume with granular approval params and checks the experimental reason.
 
-**Call relations**: Companion to the thread-start request gating test.
+**Call relations**: The test runner calls this test. It validates experimental detection for thread resume requests.
 
 *Call graph*: 4 external calls (default, experimental_reason, Integer, assert_eq!).
 
@@ -1036,11 +1050,11 @@ fn client_request_thread_resume_granular_approval_policy_is_marked_experimental(
 fn client_request_thread_fork_granular_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Checks experimental propagation for `ClientRequest::ThreadFork` with granular approval policy. It covers the fork request path.
+**Purpose**: Checks that a thread-fork request using granular approval is marked experimental. This protects fork-time approval configuration.
 
-**Data flow**: Constructs a `ClientRequest::ThreadFork` carrying granular approval policy, calls `experimental_reason`, and asserts the granular gate string.
+**Data flow**: It builds a ClientRequest::ThreadFork with granular approval params and checks the experimental reason.
 
-**Call relations**: Another top-level request gating regression test.
+**Call relations**: The test runner calls this test. It validates experimental detection for thread fork requests.
 
 *Call graph*: 4 external calls (default, experimental_reason, Integer, assert_eq!).
 
@@ -1051,11 +1065,11 @@ fn client_request_thread_fork_granular_approval_policy_is_marked_experimental()
 fn client_request_turn_start_granular_approval_policy_is_marked_experimental()
 ```
 
-**Purpose**: Checks experimental propagation for `ClientRequest::TurnStart` with granular approval policy. It covers turn-start requests specifically.
+**Purpose**: Checks that a turn-start request using granular approval is marked experimental. This catches per-turn experimental approval settings.
 
-**Data flow**: Constructs a `ClientRequest::TurnStart` with empty input and granular approval policy, calls `experimental_reason`, and asserts the expected string.
+**Data flow**: It builds a ClientRequest::TurnStart with granular approval params and checks the experimental reason.
 
-**Call relations**: Completes the set of request-envelope gating tests for approval policy.
+**Call relations**: The test runner calls this test. It validates experimental detection for turn start requests.
 
 *Call graph*: 5 external calls (default, new, experimental_reason, Integer, assert_eq!).
 
@@ -1066,11 +1080,11 @@ fn client_request_turn_start_granular_approval_policy_is_marked_experimental()
 fn mcp_server_elicitation_response_round_trips_rmcp_result()
 ```
 
-**Purpose**: Verifies conversion between RMCP elicitation results and the v2 MCP elicitation response type. It ensures action, content, and metadata survive both directions.
+**Purpose**: Checks conversion between the app protocol's MCP elicitation response and the RMCP library result type. Elicitation means a tool asks the user for extra input.
 
-**Data flow**: Constructs an `rmcp::model::CreateElicitationResult`, converts it to `McpServerElicitationRequestResponse::from`, asserts the v2 struct, converts back with `rmcp::model::CreateElicitationResult::from`, and asserts equality with the original RMCP value.
+**Data flow**: It builds an RMCP result, converts it to the v2 response, compares fields, converts back to RMCP, and checks equality.
 
-**Call relations**: Exercises conversion logic for the MCP elicitation bridge.
+**Call relations**: The test runner calls this test. It exercises bidirectional conversion for MCP elicitation responses.
 
 *Call graph*: calls 1 internal fn (from); 2 external calls (assert_eq!, json!).
 
@@ -1081,11 +1095,11 @@ fn mcp_server_elicitation_response_round_trips_rmcp_result()
 fn mcp_server_elicitation_request_from_core_url_request()
 ```
 
-**Purpose**: Checks conversion from a core URL-based elicitation request into the v2 MCP request enum. It validates the URL branch of the conversion.
+**Purpose**: Checks conversion of a core MCP URL elicitation request into the app protocol. This supports requests like asking a user to finish sign-in in a browser.
 
-**Data flow**: Constructs `CoreElicitationRequest::Url`, converts it with `McpServerElicitationRequest::try_from`, unwraps success, and asserts the resulting v2 enum variant and fields.
+**Data flow**: It builds a core URL request, tries to convert it to v2, and compares the resulting URL request fields.
 
-**Call relations**: Covers one accepted input shape for MCP elicitation conversion.
+**Call relations**: The test runner calls this test. It validates TryFrom conversion for one core elicitation request variant.
 
 *Call graph*: calls 1 internal fn (try_from); 1 external calls (assert_eq!).
 
@@ -1096,11 +1110,11 @@ fn mcp_server_elicitation_request_from_core_url_request()
 fn mcp_server_elicitation_request_from_core_form_request()
 ```
 
-**Purpose**: Checks conversion from a core form-based elicitation request into the v2 MCP request enum, including schema parsing. It validates the form branch and schema decoding.
+**Purpose**: Checks conversion of a core MCP form elicitation request into the app protocol. This supports user prompts that need structured answers.
 
-**Data flow**: Constructs `CoreElicitationRequest::Form` with a JSON schema, converts it via `try_from`, separately deserializes the expected schema into `McpElicitationSchema`, and asserts the resulting v2 request matches the expected form variant.
+**Data flow**: It builds a core form request with a JSON schema, converts it to v2, separately parses the expected schema, and compares the full request.
 
-**Call relations**: Exercises the more complex MCP elicitation conversion path that parses structured schema content.
+**Call relations**: The test runner calls this test. It validates TryFrom conversion and schema parsing for form elicitations.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (assert_eq!, json!, from_value).
 
@@ -1111,11 +1125,11 @@ fn mcp_server_elicitation_request_from_core_form_request()
 fn mcp_elicitation_schema_matches_mcp_2025_11_25_primitives()
 ```
 
-**Purpose**: Verifies that the v2 MCP elicitation schema type accepts and preserves the supported primitive schema forms from the MCP 2025-11-25 shape. It covers string, integer, boolean, and legacy titled enum properties.
+**Purpose**: Checks that the MCP elicitation schema type accepts the primitive fields expected by the MCP specification version named in the test. This protects structured user-input forms.
 
-**Data flow**: Deserializes a JSON schema object into `McpElicitationSchema` and asserts the resulting nested Rust structure, including schema URI, object type, ordered properties map, primitive schema variants, defaults, formats, and required fields.
+**Data flow**: It deserializes a JSON schema with string, integer, boolean, and enum properties, then compares the detailed typed schema result.
 
-**Call relations**: Acts as a detailed executable spec for the accepted MCP form-schema subset.
+**Call relations**: The test runner calls this test. It exercises McpElicitationSchema and its primitive property variants.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1126,11 +1140,11 @@ fn mcp_elicitation_schema_matches_mcp_2025_11_25_primitives()
 fn mcp_server_elicitation_request_rejects_null_core_form_schema()
 ```
 
-**Purpose**: Ensures a core form elicitation request with `requested_schema: null` is rejected. This prevents invalid form requests from silently converting.
+**Purpose**: Checks that a form elicitation with a null schema is rejected. A form request needs a real schema so the client knows what to ask.
 
-**Data flow**: Constructs `CoreElicitationRequest::Form` with `requested_schema: JsonValue::Null`, attempts `McpServerElicitationRequest::try_from`, and asserts the result is an error.
+**Data flow**: It builds a core form request whose requested_schema is null, tries to convert it to v2, and expects an error.
 
-**Call relations**: Negative test for MCP form-schema validation.
+**Call relations**: The test runner calls this test. It validates error behavior in McpServerElicitationRequest conversion.
 
 *Call graph*: calls 1 internal fn (try_from); 2 external calls (assert!, json!).
 
@@ -1141,11 +1155,11 @@ fn mcp_server_elicitation_request_rejects_null_core_form_schema()
 fn mcp_server_elicitation_request_rejects_invalid_core_form_schema()
 ```
 
-**Purpose**: Ensures invalid nested schema content in a core form elicitation request is rejected during conversion. It protects the schema parser against unsupported object-valued properties.
+**Purpose**: Checks that invalid form schemas are rejected. This prevents clients from receiving forms they cannot render safely.
 
-**Data flow**: Constructs `CoreElicitationRequest::Form` with an invalid property schema, attempts conversion with `try_from`, and asserts the result is an error.
+**Data flow**: It builds a core form request whose property uses an unsupported object type, converts it, and expects an error.
 
-**Call relations**: Companion negative test to the null-schema case.
+**Call relations**: The test runner calls this test. It exercises schema validation during MCP request conversion.
 
 *Call graph*: calls 1 internal fn (try_from); 2 external calls (assert!, json!).
 
@@ -1156,11 +1170,11 @@ fn mcp_server_elicitation_request_rejects_invalid_core_form_schema()
 fn mcp_server_elicitation_response_serializes_nullable_content()
 ```
 
-**Purpose**: Checks that MCP elicitation responses serialize absent `content` and `meta` as explicit nulls. It protects the exact response wire shape.
+**Purpose**: Checks that an MCP elicitation response serializes absent content as explicit null. This keeps the JSON shape predictable for decline or cancel actions.
 
-**Data flow**: Constructs `McpServerElicitationRequestResponse` with `content: None` and `meta: None`, serializes it, and asserts the JSON object contains `content: null` and `_meta: null`.
+**Data flow**: It builds a decline response with no content or metadata, serializes it, and compares the JSON including null fields.
 
-**Call relations**: Response-side serialization regression test for MCP elicitation.
+**Call relations**: The test runner calls this test. It validates McpServerElicitationRequestResponse serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1171,11 +1185,11 @@ fn mcp_server_elicitation_response_serializes_nullable_content()
 fn mcp_server_status_serializes_absent_server_info_as_null()
 ```
 
-**Purpose**: Verifies that MCP server status responses serialize missing `serverInfo` as `null`. It protects nullable nested object behavior.
+**Purpose**: Checks that MCP server status includes serverInfo as null when a server is not ready. This helps clients distinguish absent information from missing fields.
 
-**Data flow**: Constructs `ListMcpServerStatusResponse` with one `McpServerStatus` whose `server_info` is `None`, serializes it, and asserts the JSON object contains `serverInfo: null` plus empty collections for tools/resources.
+**Data flow**: It builds a status response with one server whose server_info is None, serializes it, and compares the JSON.
 
-**Call relations**: Covers one branch of MCP server status serialization.
+**Call relations**: The test runner calls this test. It validates ListMcpServerStatusResponse serialization.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1186,11 +1200,11 @@ fn mcp_server_status_serializes_absent_server_info_as_null()
 fn mcp_server_status_updated_accepts_missing_thread_id()
 ```
 
-**Purpose**: Ensures the MCP server status-updated notification accepts an omitted `threadId` and normalizes it to `None`, then serializes back as `null`. This preserves compatibility for notifications not tied to a thread.
+**Purpose**: Checks that MCP server status update notifications can omit threadId. This supports global or legacy status updates.
 
-**Data flow**: Deserializes `McpServerStatusUpdatedNotification` from JSON lacking `threadId`, asserts the resulting struct has `thread_id: None`, then serializes it back and asserts `threadId: null` appears in JSON.
+**Data flow**: It deserializes a notification without threadId, compares the parsed value with thread_id None, then serializes it and checks threadId becomes null.
 
-**Call relations**: Tests optional-thread association behavior for MCP status notifications.
+**Call relations**: The test runner calls this test. It validates McpServerStatusUpdatedNotification compatibility.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1201,11 +1215,11 @@ fn mcp_server_status_updated_accepts_missing_thread_id()
 fn mcp_server_status_serializes_absent_server_info_metadata_as_null()
 ```
 
-**Purpose**: Checks that optional metadata fields inside present `serverInfo` objects serialize as nulls. It validates nested nullable fields in MCP server info.
+**Purpose**: Checks that optional metadata inside MCP serverInfo serializes as null when absent. This gives clients a stable object shape.
 
-**Data flow**: Constructs `ListMcpServerStatusResponse` with `server_info: Some(McpServerInfo { title: None, description: None, icons: None, website_url: None, ... })`, serializes it, and asserts those nested fields appear as `null`.
+**Data flow**: It builds a status response with server info that has only name and version, serializes it, and checks all optional metadata fields are null.
 
-**Call relations**: Complements the absent-server-info test by covering the present-but-partially-null case.
+**Call relations**: The test runner calls this test. It validates nested McpServerInfo serialization in server status responses.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1216,11 +1230,11 @@ fn mcp_server_status_serializes_absent_server_info_metadata_as_null()
 fn sandbox_policy_round_trips_workspace_write_access()
 ```
 
-**Purpose**: Verifies round-trip conversion for the workspace-write sandbox policy, including writable roots and tmp exclusions. It covers the most parameterized sandbox variant.
+**Purpose**: Checks that workspace-write sandbox policies preserve all flags through core conversion. This protects the policy that allows writes only in selected workspace areas.
 
-**Data flow**: Constructs `SandboxPolicy::WorkspaceWrite`, converts to core with `to_core`, asserts the core value, converts back with `SandboxPolicy::from`, and asserts equality.
+**Data flow**: It builds a v2 workspace-write policy, converts it to core, compares, converts back, and checks equality.
 
-**Call relations**: Completes the sandbox conversion coverage alongside read-only and external-sandbox tests.
+**Call relations**: The test runner calls this test. It exercises SandboxPolicy conversion for workspace-write mode.
 
 *Call graph*: calls 1 internal fn (from); 2 external calls (assert_eq!, vec!).
 
@@ -1231,11 +1245,11 @@ fn sandbox_policy_round_trips_workspace_write_access()
 fn sandbox_policy_deserializes_legacy_read_only_full_access_field()
 ```
 
-**Purpose**: Ensures legacy `readOnly.access.fullAccess` payloads are accepted and ignored when deserializing the modern read-only sandbox policy. This preserves backward compatibility with removed fields.
+**Purpose**: Checks that an old read-only sandbox field saying fullAccess is ignored. This keeps old JSON compatible when the field no longer matters.
 
-**Data flow**: Deserializes `SandboxPolicy` from JSON containing a legacy nested `access` object and `networkAccess`, then asserts the resulting policy is simply `ReadOnly { network_access: true }`.
+**Data flow**: It deserializes readOnly policy JSON with a legacy access fullAccess object and checks the resulting policy only uses network_access.
 
-**Call relations**: Compatibility test for removed legacy sandbox subfields.
+**Call relations**: The test runner calls this test. It validates legacy-tolerant SandboxPolicy deserialization.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1246,11 +1260,11 @@ fn sandbox_policy_deserializes_legacy_read_only_full_access_field()
 fn sandbox_policy_deserializes_legacy_workspace_write_full_access_field()
 ```
 
-**Purpose**: Ensures legacy `workspaceWrite.readOnlyAccess.fullAccess` payloads are accepted and ignored. It preserves compatibility for the workspace-write variant.
+**Purpose**: Checks that an old workspace-write readOnlyAccess fullAccess field is ignored. This keeps older clients compatible with the newer sandbox shape.
 
-**Data flow**: Builds an absolute writable root with `absolute_path`, deserializes `SandboxPolicy` from JSON containing legacy `readOnlyAccess`, and asserts the resulting modern `WorkspaceWrite` policy fields.
+**Data flow**: It deserializes workspaceWrite JSON with writable roots and a legacy fullAccess field, then compares the resulting policy.
 
-**Call relations**: Companion compatibility test for the workspace-write sandbox variant.
+**Call relations**: The test runner calls this test. It uses absolute_path for the writable root and validates SandboxPolicy compatibility.
 
 *Call graph*: calls 1 internal fn (absolute_path); 2 external calls (assert_eq!, json!).
 
@@ -1261,11 +1275,11 @@ fn sandbox_policy_deserializes_legacy_workspace_write_full_access_field()
 fn sandbox_policy_rejects_legacy_read_only_restricted_access_field()
 ```
 
-**Purpose**: Checks that removed legacy restricted-access payloads are rejected rather than silently interpreted. This prevents ambiguous downgrade behavior.
+**Purpose**: Checks that a removed restricted access field is rejected for read-only sandbox policy. This prevents unsafe or unsupported old semantics from being accepted.
 
-**Data flow**: Attempts to deserialize `SandboxPolicy` from JSON containing `readOnly.access.type: restricted`, expects an error, and asserts the error message mentions `readOnly.access`.
+**Data flow**: It tries to deserialize readOnly JSON with a restricted access object and expects an error mentioning readOnly.access.
 
-**Call relations**: Negative compatibility test for unsupported legacy sandbox fields.
+**Call relations**: The test runner calls this test. It validates strict rejection in SandboxPolicy deserialization.
 
 *Call graph*: 2 external calls (assert!, json!).
 
@@ -1276,11 +1290,11 @@ fn sandbox_policy_rejects_legacy_read_only_restricted_access_field()
 fn sandbox_policy_rejects_legacy_workspace_write_restricted_read_access_field()
 ```
 
-**Purpose**: Checks that removed restricted `readOnlyAccess` payloads are rejected for workspace-write policies. It mirrors the read-only negative test.
+**Purpose**: Checks that a removed restricted read access field is rejected for workspace-write sandbox policy. This prevents ambiguous old rules from slipping through.
 
-**Data flow**: Attempts to deserialize `SandboxPolicy` from JSON containing `workspaceWrite.readOnlyAccess.type: restricted`, expects an error, and asserts the message mentions `workspaceWrite.readOnlyAccess`.
+**Data flow**: It tries to deserialize workspaceWrite JSON with restricted readOnlyAccess and expects an error mentioning workspaceWrite.readOnlyAccess.
 
-**Call relations**: Companion negative test for workspace-write legacy field rejection.
+**Call relations**: The test runner calls this test. It validates SandboxPolicy rejection of unsupported legacy shapes.
 
 *Call graph*: 2 external calls (assert!, json!).
 
@@ -1291,11 +1305,11 @@ fn sandbox_policy_rejects_legacy_workspace_write_restricted_read_access_field()
 fn automatic_approval_review_deserializes_aborted_status()
 ```
 
-**Purpose**: Verifies that guardian approval reviews accept the `aborted` status and deserialize optional fields as `None`. It protects a specific review-state enum branch.
+**Purpose**: Checks that automatic approval review can report an aborted status. This supports review runs that stop before producing a decision.
 
-**Data flow**: Deserializes `GuardianApprovalReview` from JSON with `status: "aborted"` and null optional fields, then asserts the resulting struct fields.
+**Data flow**: It deserializes review JSON with status aborted and null optional fields, then compares the resulting GuardianApprovalReview.
 
-**Call relations**: Regression test for guardian/auto-review protocol types.
+**Call relations**: The test runner calls this test. It validates GuardianApprovalReview deserialization.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1306,11 +1320,11 @@ fn automatic_approval_review_deserializes_aborted_status()
 fn guardian_approval_review_action_round_trips_command_shape()
 ```
 
-**Purpose**: Checks the tagged command action shape for guardian approval review actions. It validates both deserialization and reserialization of the command variant.
+**Purpose**: Checks the JSON shape for a guardian review action describing a shell command. This lets automatic review reason about exactly what command would run.
 
-**Data flow**: Creates a JSON object for a command action, deserializes it into `GuardianApprovalReviewAction`, asserts the enum variant and fields including absolute cwd, then serializes back and asserts the original JSON.
+**Data flow**: It deserializes a command action JSON, compares the typed value, serializes it again, and checks it matches the original JSON.
 
-**Call relations**: Covers one action variant in the guardian review protocol.
+**Call relations**: The test runner calls this test. It validates GuardianApprovalReviewAction command serialization and deserialization.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1321,11 +1335,11 @@ fn guardian_approval_review_action_round_trips_command_shape()
 fn network_requirements_deserializes_legacy_fields()
 ```
 
-**Purpose**: Ensures legacy network requirement fields (`allowedDomains`, `deniedDomains`, `allowUnixSockets`) still deserialize into the modern struct. It preserves backward compatibility for older config payloads.
+**Purpose**: Checks that older network requirement fields still deserialize. This keeps policy data using allowedDomains, deniedDomains, and allowUnixSockets usable.
 
-**Data flow**: Deserializes `NetworkRequirements` from JSON containing only legacy fields and asserts the resulting struct has those legacy vectors populated while canonical fields remain `None`.
+**Data flow**: It deserializes legacy network requirement JSON and compares it with a NetworkRequirements value where only legacy fields are set.
 
-**Call relations**: Compatibility test for network requirement schema evolution.
+**Call relations**: The test runner calls this test. It validates backward compatibility for NetworkRequirements.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1336,11 +1350,11 @@ fn network_requirements_deserializes_legacy_fields()
 fn network_requirements_serializes_canonical_and_legacy_fields()
 ```
 
-**Purpose**: Checks that `NetworkRequirements` serializes both canonical map-based fields and legacy list-based fields together when populated. This supports mixed-version consumers.
+**Purpose**: Checks that network requirements serialize both newer canonical fields and older compatibility fields. This helps old and new clients read the same policy.
 
-**Data flow**: Constructs a `NetworkRequirements` with canonical booleans, ports, domain/unix-socket maps, and legacy allow/deny lists, serializes it, and asserts the full JSON object including both representations.
+**Data flow**: It builds a NetworkRequirements value with ports, domain maps, unix socket maps, and legacy arrays, then serializes and compares all JSON fields.
 
-**Call relations**: Serialization-side counterpart to the legacy deserialization test.
+**Call relations**: The test runner calls this test. It validates complete NetworkRequirements serialization.
 
 *Call graph*: 3 external calls (from, assert_eq!, vec!).
 
@@ -1351,11 +1365,11 @@ fn network_requirements_serializes_canonical_and_legacy_fields()
 fn core_turn_item_into_thread_item_converts_supported_variants()
 ```
 
-**Purpose**: Exhaustively verifies conversion from core `TurnItem` variants into API `ThreadItem` variants for the supported cases. It covers user messages, agent messages, reasoning, web search, image view, file changes, and MCP tool calls.
+**Purpose**: Checks conversion from core conversation turn items into app protocol thread items. This is central to showing conversation history correctly in clients.
 
-**Data flow**: Constructs multiple core `TurnItem` values with nested content and metadata, converts each via `ThreadItem::from`, and asserts the resulting API enum variant and fields, including text concatenation for agent messages, memory citation field renaming, patch change flattening, MCP result boxing, and duration conversion from `Duration` to milliseconds.
+**Data flow**: It builds core user, agent, reasoning, web search, image view, file change, and MCP tool-call items, converts each to ThreadItem, and compares the expected v2 item.
 
-**Call relations**: This is one of the broadest conversion tests in the suite, exercising many `From` implementations defined across the v2 module.
+**Call relations**: The test runner calls this test. It exercises many From conversions that bridge stored/core turn data into API-visible thread items.
 
 *Call graph*: 14 external calls (from_millis, from, new, assert_eq!, AgentMessage, FileChange, ImageView, McpToolCall, Reasoning, UserMessage (+4 more)).
 
@@ -1366,11 +1380,11 @@ fn core_turn_item_into_thread_item_converts_supported_variants()
 fn user_input_into_core_preserves_image_detail()
 ```
 
-**Purpose**: Checks that API `UserInput` image variants preserve `ImageDetail` when converted into core user input. It covers both remote and local image forms.
+**Purpose**: Checks that image detail settings survive conversion from v2 user input into core user input. This keeps image quality/detail choices intact.
 
-**Data flow**: Constructs `UserInput::Image` and `UserInput::LocalImage`, calls `.into_core()` on each, and asserts the resulting `CoreUserInput` variants retain the same URL/path and `detail` value.
+**Data flow**: It converts remote-image and local-image v2 inputs with ImageDetail::Original into core inputs and compares the results.
 
-**Call relations**: Regression test for user-input conversion fidelity.
+**Call relations**: The test runner calls this test. It validates UserInput::into_core for image variants.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1381,11 +1395,11 @@ fn user_input_into_core_preserves_image_detail()
 fn skills_list_params_serialization_uses_force_reload()
 ```
 
-**Purpose**: Verifies `SkillsListParams` omits fields when empty/default and emits `forceReload` when true. It protects the request schema for skill discovery.
+**Purpose**: Checks the JSON shape for listing skills, including when forceReload is used. This protects clients that refresh skill discovery.
 
-**Data flow**: Serializes one `SkillsListParams` with empty `cwds` and `force_reload: false` and asserts `{}`; serializes another with one cwd and `force_reload: true` and asserts JSON contains `cwds` and `forceReload`.
+**Data flow**: It serializes empty/default params and params with a cwd plus force_reload true, comparing each JSON output.
 
-**Call relations**: Covers serde defaults and skip rules in `plugin.rs`.
+**Call relations**: The test runner calls this test. It validates SkillsListParams serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1396,11 +1410,11 @@ fn skills_list_params_serialization_uses_force_reload()
 fn skills_extra_roots_set_params_serialization_uses_extra_roots()
 ```
 
-**Purpose**: Checks that `SkillsExtraRootsSetParams` serializes its absolute path list under `extraRoots`. It validates the request field naming and path encoding.
+**Purpose**: Checks that setting extra skill roots uses the extraRoots JSON field. This protects the API for adding skill search locations.
 
-**Data flow**: Constructs `SkillsExtraRootsSetParams` with one absolute path from `absolute_path`, serializes it, and asserts the JSON object contains `extraRoots` with the expected path string.
+**Data flow**: It builds params with one absolute extra root, serializes them, and compares the JSON path array.
 
-**Call relations**: Simple serialization test for the extra-roots API.
+**Call relations**: The test runner calls this test. It uses the absolute path helper output in the expected JSON.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1411,11 +1425,11 @@ fn skills_extra_roots_set_params_serialization_uses_extra_roots()
 fn skills_extra_roots_set_params_rejects_relative_roots()
 ```
 
-**Purpose**: Ensures relative paths are rejected when deserializing `SkillsExtraRootsSetParams`. This protects the absolute-path invariant on extra skill roots.
+**Purpose**: Checks that extra skill roots must be absolute paths. This avoids ambiguous or unsafe relative search roots.
 
-**Data flow**: Attempts to deserialize `SkillsExtraRootsSetParams` from JSON containing `"relative/path"` and asserts the result is an error.
+**Data flow**: It tries to deserialize params with a relative extraRoots entry and expects an error.
 
-**Call relations**: Negative test for path validation in the skills API.
+**Call relations**: The test runner calls this test. It validates path checking in SkillsExtraRootsSetParams.
 
 *Call graph*: 2 external calls (assert!, json!).
 
@@ -1426,11 +1440,11 @@ fn skills_extra_roots_set_params_rejects_relative_roots()
 fn plugin_source_serializes_local_git_and_remote_variants()
 ```
 
-**Purpose**: Verifies tagged serialization for all `PluginSource` variants. It ensures local paths, git metadata, and remote-only sources use the expected JSON shapes.
+**Purpose**: Checks the JSON shapes for plugin sources: local path, git repository, and remote-only. This protects plugin listing and install metadata.
 
-**Data flow**: Builds a platform-specific `AbsolutePathBuf`, serializes `PluginSource::Local`, `PluginSource::Git`, and `PluginSource::Remote`, and asserts each JSON object’s `type` tag and associated fields.
+**Data flow**: It creates each PluginSource variant, serializes it, and compares the expected type tag and fields.
 
-**Call relations**: Covers the discriminated union schema for plugin source metadata.
+**Call relations**: The test runner calls this test. It uses platform-aware absolute paths for the local source.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1441,11 +1455,11 @@ fn plugin_source_serializes_local_git_and_remote_variants()
 fn marketplace_add_params_serialization_uses_optional_ref_name_and_sparse_paths()
 ```
 
-**Purpose**: Checks `MarketplaceAddParams` serialization with absent and present optional git fields. It validates explicit null handling for `refName` and `sparsePaths`.
+**Purpose**: Checks marketplace-add request JSON for optional git ref and sparse path settings. Sparse paths mean only selected subdirectories are used.
 
-**Data flow**: Serializes one `MarketplaceAddParams` with `None` optionals and asserts null-valued fields; serializes another with concrete `ref_name` and `sparse_paths` and asserts those values appear in camelCase JSON.
+**Data flow**: It serializes params without optional values and with both optional values, comparing the JSON each time.
 
-**Call relations**: Serialization regression test for marketplace add requests.
+**Call relations**: The test runner calls this test. It validates MarketplaceAddParams serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1456,11 +1470,11 @@ fn marketplace_add_params_serialization_uses_optional_ref_name_and_sparse_paths(
 fn marketplace_upgrade_params_serialization_uses_optional_marketplace_name()
 ```
 
-**Purpose**: Verifies `MarketplaceUpgradeParams` serializes and deserializes the optional marketplace selector correctly. It covers both omitted and explicit values.
+**Purpose**: Checks marketplace-upgrade request JSON when a marketplace name is omitted or provided. This protects both upgrade-all and upgrade-one requests.
 
-**Data flow**: Serializes `MarketplaceUpgradeParams { marketplace_name: None }` and asserts `marketplaceName: null`; deserializes `{}` and asserts `None`; serializes a value with `Some("debug")` and asserts the string field.
+**Data flow**: It serializes params with None and Some marketplace_name, and also checks that an empty JSON object deserializes to None.
 
-**Call relations**: Covers nullable optional behavior for marketplace upgrade requests.
+**Call relations**: The test runner calls this test. It validates MarketplaceUpgradeParams serialization and defaults.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1471,11 +1485,11 @@ fn marketplace_upgrade_params_serialization_uses_optional_marketplace_name()
 fn plugin_marketplace_entry_serializes_remote_only_path_as_null()
 ```
 
-**Purpose**: Ensures remote-only marketplace entries serialize `path` as `null` rather than omitting it. This distinguishes remote catalogs from local files explicitly.
+**Purpose**: Checks that a remote-only plugin marketplace entry serializes its path as null. This distinguishes remote marketplaces from local files.
 
-**Data flow**: Constructs `PluginMarketplaceEntry` with `path: None`, serializes it, and asserts the JSON object contains `path: null` plus empty plugin list and null interface.
+**Data flow**: It builds a PluginMarketplaceEntry with no path, serializes it, and compares the JSON including null path and interface.
 
-**Call relations**: Regression test for marketplace entry response shape.
+**Call relations**: The test runner calls this test. It validates PluginMarketplaceEntry serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1486,11 +1500,11 @@ fn plugin_marketplace_entry_serializes_remote_only_path_as_null()
 fn plugin_interface_serializes_local_paths_and_remote_urls_separately()
 ```
 
-**Purpose**: Checks that `PluginInterface` keeps local asset paths and remote asset URLs in separate fields during serialization. It validates the dual-source media metadata design.
+**Purpose**: Checks that plugin interface metadata keeps local image paths and remote image URLs in separate fields. This prevents confusing file paths with web URLs.
 
-**Data flow**: Builds a platform-specific absolute icon path, constructs `PluginInterface` with both local and remote asset fields, serializes it, and asserts the JSON object contains distinct `composerIcon`, `composerIconUrl`, `logo`, `logoUrl`, `screenshots`, and `screenshotUrls` fields.
+**Data flow**: It builds PluginInterface metadata with local composer icon and remote URLs, serializes it, and compares all camelCase fields.
 
-**Call relations**: Covers a nuanced response schema in `plugin.rs`.
+**Call relations**: The test runner calls this test. It uses platform-aware absolute paths and validates PluginInterface serialization.
 
 *Call graph*: calls 1 internal fn (try_from); 5 external calls (from, new, assert_eq!, cfg!, vec!).
 
@@ -1501,11 +1515,11 @@ fn plugin_interface_serializes_local_paths_and_remote_urls_separately()
 fn plugin_list_params_ignore_removed_force_remote_sync_field()
 ```
 
-**Purpose**: Ensures the removed `forceRemoteSync` field is ignored when deserializing `PluginListParams`. This preserves compatibility with older clients.
+**Purpose**: Checks that a removed forceRemoteSync field is ignored when listing plugins. This keeps old clients from failing after the field was removed.
 
-**Data flow**: Deserializes `PluginListParams` from JSON containing `cwds: null` and `forceRemoteSync: true`, then asserts the resulting struct only contains `cwds: None` and `marketplace_kinds: None`.
+**Data flow**: It deserializes plugin-list JSON containing forceRemoteSync and checks that only the supported fields remain at default values.
 
-**Call relations**: Compatibility test for removed plugin-list request fields.
+**Call relations**: The test runner calls this test. It validates backward-compatible PluginListParams deserialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1516,11 +1530,11 @@ fn plugin_list_params_ignore_removed_force_remote_sync_field()
 fn plugin_list_params_serializes_marketplace_kind_filter()
 ```
 
-**Purpose**: Verifies serialization of the marketplace-kind filter enum values in `PluginListParams`. It checks the exact kebab-case strings for all variants.
+**Purpose**: Checks that plugin listing can filter by marketplace kind. This lets clients request local, vertical, workspace, shared, or created-by-me remote marketplaces.
 
-**Data flow**: Constructs `PluginListParams` with a vector of all `PluginListMarketplaceKind` variants, serializes it, and asserts the JSON array contains `local`, `vertical`, `workspace-directory`, `shared-with-me`, and `created-by-me-remote`.
+**Data flow**: It serializes PluginListParams with several marketplace kinds and compares the expected string labels.
 
-**Call relations**: Covers enum wire-format stability for plugin listing filters.
+**Call relations**: The test runner calls this test. It validates PluginListParams serialization for marketplaceKinds.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1531,11 +1545,11 @@ fn plugin_list_params_serializes_marketplace_kind_filter()
 fn plugin_installed_params_serializes_install_suggestion_names()
 ```
 
-**Purpose**: Checks serialization of `installSuggestionPluginNames` in `PluginInstalledParams`. It validates the mention-surface install suggestion field.
+**Purpose**: Checks that installed-plugin requests can include plugin names used for install suggestions. This supports recommendation-related filtering.
 
-**Data flow**: Constructs `PluginInstalledParams` with two suggestion names, serializes it, and asserts the JSON object contains the expected camelCase array field.
+**Data flow**: It serializes params with two suggestion plugin names and compares the JSON array.
 
-**Call relations**: Serialization regression test for installed-plugin listing params.
+**Call relations**: The test runner calls this test. It validates PluginInstalledParams serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1546,11 +1560,11 @@ fn plugin_installed_params_serializes_install_suggestion_names()
 fn plugin_read_params_serialization_uses_install_source_fields()
 ```
 
-**Purpose**: Verifies `PluginReadParams` supports both local marketplace path and remote marketplace name selectors, while ignoring removed sync fields. It covers both serialization and deserialization paths.
+**Purpose**: Checks plugin-read parameters for both local marketplace paths and remote marketplace names. This protects how clients choose where to read a plugin from.
 
-**Data flow**: Builds a platform-specific marketplace path, serializes params with `marketplace_path: Some(...)`, asserts JSON fields, deserializes JSON containing `forceRemoteSync` and a local path, asserts the struct, then deserializes a remote-marketplace variant and asserts that branch.
+**Data flow**: It serializes local-source params, deserializes legacy JSON with forceRemoteSync ignored, and deserializes remote-source params, comparing all results.
 
-**Call relations**: Covers the dual-source selector design for plugin reads.
+**Call relations**: The test runner calls this test. It validates PluginReadParams serialization and compatibility.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1561,11 +1575,11 @@ fn plugin_read_params_serialization_uses_install_source_fields()
 fn plugin_install_params_serialization_omits_force_remote_sync()
 ```
 
-**Purpose**: Checks the same local-vs-remote selector behavior for `PluginInstallParams` and confirms removed `forceRemoteSync` is ignored. It protects install request compatibility.
+**Purpose**: Checks plugin-install parameters and confirms the removed forceRemoteSync field is ignored. This keeps old install requests working.
 
-**Data flow**: Builds a marketplace path, serializes local install params and asserts JSON, deserializes local and remote JSON payloads containing `forceRemoteSync`, and asserts the resulting structs ignore that removed field.
+**Data flow**: It serializes local install params, deserializes local JSON with forceRemoteSync ignored, and deserializes remote install JSON with that field ignored.
 
-**Call relations**: Companion test to plugin-read params for the install endpoint.
+**Call relations**: The test runner calls this test. It validates PluginInstallParams serialization and backward compatibility.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1576,11 +1590,11 @@ fn plugin_install_params_serialization_omits_force_remote_sync()
 fn plugin_skill_read_params_serialization_uses_remote_plugin_id()
 ```
 
-**Purpose**: Verifies the remote plugin skill-read request uses `remotePluginId` and related camelCase fields. It protects the remote skill content lookup schema.
+**Purpose**: Checks the JSON shape for reading a skill from a remote plugin. This protects the fields used to locate remote plugin skills.
 
-**Data flow**: Constructs `PluginSkillReadParams`, serializes it, and asserts the JSON object contains `remoteMarketplaceName`, `remotePluginId`, and `skillName`.
+**Data flow**: It serializes params with remote marketplace name, remote plugin id, and skill name, then compares the JSON.
 
-**Call relations**: Simple serialization test for remote skill reads.
+**Call relations**: The test runner calls this test. It validates PluginSkillReadParams serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1591,11 +1605,11 @@ fn plugin_skill_read_params_serialization_uses_remote_plugin_id()
 fn plugin_share_params_and_response_serialization_use_camel_case_fields()
 ```
 
-**Purpose**: Checks a wide range of plugin sharing request and response types for exact camelCase field names, enum spellings, and nullable option handling. It covers save, update-targets, list, checkout, and delete payloads.
+**Purpose**: Checks many plugin-sharing request and response shapes. This protects remote sharing, target permissions, checkout, listing, and deletion field names.
 
-**Data flow**: Builds platform-specific plugin and marketplace paths, serializes multiple sharing structs (`PluginShareSaveParams`, `PluginShareSaveResponse`, `PluginShareUpdateTargetsParams`, `PluginShareUpdateTargetsResponse`, `PluginShareCheckoutParams`, `PluginShareCheckoutResponse`, `PluginShareDeleteParams`), deserializes `PluginShareListParams` from `{}`, and asserts each JSON shape exactly.
+**Data flow**: It serializes save, save response, update targets, update response, checkout params, checkout response, delete params, and deserializes list params, comparing each JSON shape.
 
-**Call relations**: This is the main regression test for the plugin sharing protocol surface in `plugin.rs`.
+**Call relations**: The test runner calls this test. It validates the plugin sharing API as a group, using platform-aware absolute paths where needed.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1606,11 +1620,11 @@ fn plugin_share_params_and_response_serialization_use_camel_case_fields()
 fn plugin_share_list_response_serializes_share_items()
 ```
 
-**Purpose**: Verifies the list-shared-plugins response shape, including nested `PluginSummary` and nullable local path. It protects the response schema for shared plugin listings.
+**Purpose**: Checks the JSON shape for a response listing shared plugins. This protects how remote plugin summaries and local checkout paths are presented.
 
-**Data flow**: Constructs `PluginShareListResponse` with one `PluginShareListItem` containing a remote `PluginSummary`, serializes it, and asserts the nested JSON object including `remotePluginId`, `source`, install/auth policy enums, and `localPluginPath: null`.
+**Data flow**: It builds a share-list response with one remote plugin summary and no local path, serializes it, and compares the nested JSON.
 
-**Call relations**: Response-side sharing schema regression test.
+**Call relations**: The test runner calls this test. It validates PluginShareListResponse and PluginSummary serialization together.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1621,11 +1635,11 @@ fn plugin_share_list_response_serializes_share_items()
 fn plugin_summary_defaults_missing_availability_to_available()
 ```
 
-**Purpose**: Ensures `PluginSummary.availability` defaults to `Available` when omitted and that other optional fields default to `None`. This preserves compatibility with older payloads.
+**Purpose**: Checks that old plugin summaries without availability default to available. This keeps older server or cache data usable.
 
-**Data flow**: Deserializes `PluginSummary` from JSON lacking `availability`, `localVersion`, and `shareContext`, then asserts `availability == PluginAvailability::Available` and the omitted optionals are `None`.
+**Data flow**: It deserializes a plugin summary JSON missing availability, localVersion, and shareContext, then checks their default parsed values.
 
-**Call relations**: Covers serde defaults in the plugin summary model.
+**Call relations**: The test runner calls this test. It validates PluginSummary deserialization defaults.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1636,11 +1650,11 @@ fn plugin_summary_defaults_missing_availability_to_available()
 fn plugin_availability_deserializes_enabled_alias()
 ```
 
-**Purpose**: Checks that the upstream alias `ENABLED` deserializes as `PluginAvailability::Available` and reserializes canonically as `AVAILABLE`. It protects compatibility with upstream service responses.
+**Purpose**: Checks that the old availability label ENABLED is accepted as AVAILABLE. This preserves compatibility with older plugin data.
 
-**Data flow**: Deserializes `PluginAvailability` from JSON string `"ENABLED"`, asserts the enum value is `Available`, serializes it back, and asserts the canonical JSON string `"AVAILABLE"`.
+**Data flow**: It deserializes the string ENABLED into PluginAvailability, checks it becomes Available, then serializes it back as AVAILABLE.
 
-**Call relations**: Regression test for the aliasing behavior documented in `plugin.rs`.
+**Call relations**: The test runner calls this test. It validates alias handling in PluginAvailability.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1651,11 +1665,11 @@ fn plugin_availability_deserializes_enabled_alias()
 fn plugin_uninstall_params_serialization_omits_force_remote_sync()
 ```
 
-**Purpose**: Ensures uninstall params serialize only `pluginId` and ignore removed `forceRemoteSync` on input. It covers both marketplace-style and remote-plugin-style ids.
+**Purpose**: Checks plugin-uninstall parameters and confirms the removed forceRemoteSync field is ignored. This protects old uninstall requests.
 
-**Data flow**: Serializes `PluginUninstallParams` for two different plugin id formats and asserts the JSON object each time; deserializes JSON containing `forceRemoteSync` for both ids and asserts the resulting structs ignore that field.
+**Data flow**: It serializes uninstall params for local-style and remote-style plugin ids, and deserializes JSON that includes forceRemoteSync, expecting the same params.
 
-**Call relations**: Compatibility test for uninstall request schema evolution.
+**Call relations**: The test runner calls this test. It validates PluginUninstallParams serialization and backward compatibility.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1666,11 +1680,11 @@ fn plugin_uninstall_params_serialization_omits_force_remote_sync()
 fn marketplace_remove_response_serializes_nullable_installed_root()
 ```
 
-**Purpose**: Checks that marketplace remove responses serialize `installedRoot` as either a path string or `null`. It validates nullable path behavior in the response.
+**Purpose**: Checks that marketplace-remove responses include installedRoot as either a path or null. This tells clients whether a local installed root existed.
 
-**Data flow**: Builds a platform-specific absolute path, serializes `MarketplaceRemoveResponse` once with `Some(installed_root)` and once with `None`, and asserts the corresponding JSON objects.
+**Data flow**: It serializes a response with an installed root and one without, comparing the JSON in both cases.
 
-**Call relations**: Response schema regression test for marketplace removal.
+**Call relations**: The test runner calls this test. It validates MarketplaceRemoveResponse serialization with platform-aware absolute paths.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1681,11 +1695,11 @@ fn marketplace_remove_response_serializes_nullable_installed_root()
 fn marketplace_upgrade_response_serializes_camel_case_fields()
 ```
 
-**Purpose**: Verifies the marketplace upgrade response uses the expected camelCase field names and nested error objects. It protects the batch-upgrade result schema.
+**Purpose**: Checks the JSON shape for marketplace-upgrade responses. This protects selected marketplace names, upgraded roots, and error details.
 
-**Data flow**: Builds a platform-specific upgraded root path, constructs `MarketplaceUpgradeResponse` with selected marketplaces, upgraded roots, and one error, serializes it, and asserts the exact JSON object.
+**Data flow**: It builds an upgrade response with one selected marketplace, one upgraded root, and one error, serializes it, and compares camelCase JSON fields.
 
-**Call relations**: Serialization test for marketplace upgrade results.
+**Call relations**: The test runner calls this test. It validates MarketplaceUpgradeResponse serialization.
 
 *Call graph*: calls 1 internal fn (try_from); 3 external calls (from, assert_eq!, cfg!).
 
@@ -1696,11 +1710,11 @@ fn marketplace_upgrade_response_serializes_camel_case_fields()
 fn codex_error_info_serializes_http_status_code_in_camel_case()
 ```
 
-**Purpose**: Checks that structured `CodexErrorInfo` variants serialize nested `httpStatusCode` in camelCase. It validates one of the richer error payload shapes.
+**Purpose**: Checks that a too-many-failed-attempts error includes httpStatusCode in camelCase. This protects client error parsing.
 
-**Data flow**: Constructs `CodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code: Some(401) }`, serializes it, and asserts the tagged JSON object contains `httpStatusCode`.
+**Data flow**: It serializes the error info variant with status code 401 and compares the nested JSON object.
 
-**Call relations**: Regression test for error enum serialization in `shared.rs`.
+**Call relations**: The test runner calls this test. It validates CodexErrorInfo serialization.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1711,11 +1725,11 @@ fn codex_error_info_serializes_http_status_code_in_camel_case()
 fn codex_error_info_serializes_cyber_policy_in_camel_case()
 ```
 
-**Purpose**: Ensures the simple `CyberPolicy` error variant serializes as the camelCase string `cyberPolicy`. It protects enum casing.
+**Purpose**: Checks the JSON label for the cyber policy error. This keeps the public error string stable.
 
-**Data flow**: Serializes `CodexErrorInfo::CyberPolicy` and asserts the resulting JSON string.
+**Data flow**: It serializes the CyberPolicy error info variant and compares it with the expected cyberPolicy string.
 
-**Call relations**: Simple enum serialization test for shared error types.
+**Call relations**: The test runner calls this test. It validates one CodexErrorInfo unit variant.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1726,11 +1740,11 @@ fn codex_error_info_serializes_cyber_policy_in_camel_case()
 fn codex_error_info_serializes_active_turn_not_steerable_turn_kind_in_camel_case()
 ```
 
-**Purpose**: Checks serialization of the nested `turnKind` field inside `ActiveTurnNotSteerable`. It validates both outer and inner camelCase naming.
+**Purpose**: Checks the JSON shape for an active-turn-not-steerable error. This tells clients why a turn cannot be changed.
 
-**Data flow**: Constructs `CodexErrorInfo::ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind::Review }`, serializes it, and asserts the JSON object contains `turnKind: "review"`.
+**Data flow**: It serializes the error with turn_kind Review and compares the nested camelCase JSON.
 
-**Call relations**: Covers the nested enum serialization path in shared error reporting.
+**Call relations**: The test runner calls this test. It validates CodexErrorInfo serialization with NonSteerableTurnKind.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1741,11 +1755,11 @@ fn codex_error_info_serializes_active_turn_not_steerable_turn_kind_in_camel_case
 fn dynamic_tool_response_serializes_content_items()
 ```
 
-**Purpose**: Verifies serialization of a dynamic tool response containing one text content item. It protects the tagged content-item schema.
+**Purpose**: Checks dynamic tool responses containing text output items. Dynamic tools can return content that later becomes model input.
 
-**Data flow**: Constructs `DynamicToolCallResponse` with one `InputText` content item and `success: true`, serializes it, and asserts the JSON object including the tagged `contentItems` entry.
+**Data flow**: It serializes a successful dynamic tool response with one inputText item and compares the JSON.
 
-**Call relations**: Regression test for dynamic tool output payloads.
+**Call relations**: The test runner calls this test. It validates DynamicToolCallResponse serialization.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -1756,11 +1770,11 @@ fn dynamic_tool_response_serializes_content_items()
 fn dynamic_tool_response_serializes_text_and_image_content_items()
 ```
 
-**Purpose**: Checks serialization of mixed text and image dynamic tool content items. It validates multiple tagged variants in one response.
+**Purpose**: Checks dynamic tool responses containing both text and image items. This protects mixed content returned by tools.
 
-**Data flow**: Constructs `DynamicToolCallResponse` with `InputText` and `InputImage` items, serializes it, and asserts the JSON array contains both tagged objects with the expected fields.
+**Data flow**: It serializes a successful response with an inputText item and an inputImage item, then compares the JSON array.
 
-**Call relations**: Companion test to the single-item dynamic tool response case.
+**Call relations**: The test runner calls this test. It validates multiple DynamicToolCallOutputContentItem variants.
 
 *Call graph*: 3 external calls (assert_eq!, to_value, vec!).
 
@@ -1771,11 +1785,11 @@ fn dynamic_tool_response_serializes_text_and_image_content_items()
 fn thread_start_params_preserve_explicit_null_service_tier()
 ```
 
-**Purpose**: Ensures `ThreadStartParams.service_tier` preserves explicit `null` distinctly from omission. This protects the double-option semantics for clearing overrides.
+**Purpose**: Checks that thread-start params preserve the difference between omitted serviceTier and explicit null. Explicit null means the client intentionally clears or overrides the value.
 
-**Data flow**: Deserializes `ThreadStartParams` from JSON with `serviceTier: null`, asserts `service_tier == Some(None)`, serializes back and asserts the field is present as JSON null, then serializes `ThreadStartParams::default()` and asserts the field is omitted.
+**Data flow**: It deserializes JSON with serviceTier null and checks it becomes Some(None), serializes it and sees null, then compares default params where the field is omitted.
 
-**Call relations**: Regression test for the custom double-option serde helpers used in thread params.
+**Call relations**: The test runner calls this test. It validates nested option behavior in ThreadStartParams.
 
 *Call graph*: 5 external calls (default, assert_eq!, json!, from_value, to_value).
 
@@ -1786,11 +1800,11 @@ fn thread_start_params_preserve_explicit_null_service_tier()
 fn thread_lifecycle_responses_default_missing_optional_fields()
 ```
 
-**Purpose**: Checks that thread start/resume/fork responses default several optional fields when omitted in JSON. It protects backward compatibility for older response payloads.
+**Purpose**: Checks that thread start, resume, and fork responses default newly optional fields when older JSON omits them. This keeps older responses readable.
 
-**Data flow**: Builds one JSON response object missing fields like `instructionSources`, `parentThreadId`, `activePermissionProfile`, and `initialTurnsPage`, deserializes it into `ThreadStartResponse`, `ThreadResumeResponse`, and `ThreadForkResponse`, then asserts the omitted fields default to empty vectors or `None` as appropriate.
+**Data flow**: It deserializes the same response JSON into three lifecycle response types and checks default instruction sources, parent thread id, active permission profile, and initial turns page.
 
-**Call relations**: Covers response-side defaulting behavior across three related thread lifecycle types.
+**Call relations**: The test runner calls this test. It validates compatibility defaults across thread lifecycle responses.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1801,11 +1815,11 @@ fn thread_lifecycle_responses_default_missing_optional_fields()
 fn turn_start_params_preserve_explicit_null_service_tier()
 ```
 
-**Purpose**: Ensures `TurnStartParams.service_tier` also preserves explicit null distinctly from omission. It mirrors the thread-start service-tier semantics.
+**Purpose**: Checks that turn-start params preserve explicit null serviceTier separately from omission. This lets clients intentionally set no service tier for one turn.
 
-**Data flow**: Deserializes `TurnStartParams` from JSON with `serviceTier: null`, asserts `Some(None)`, serializes back and checks the field is present as null, then serializes a manually constructed params value with `service_tier: None` and asserts the field is omitted.
+**Data flow**: It deserializes params with serviceTier null, checks Some(None), serializes and confirms null, then serializes params with no override and confirms the field is absent.
 
-**Call relations**: Companion double-option test for turn-start requests.
+**Call relations**: The test runner calls this test. It validates nested option behavior in TurnStartParams.
 
 *Call graph*: 5 external calls (assert_eq!, json!, from_value, to_value, vec!).
 
@@ -1816,11 +1830,11 @@ fn turn_start_params_preserve_explicit_null_service_tier()
 fn thread_settings_update_params_preserve_explicit_null_service_tier()
 ```
 
-**Purpose**: Checks explicit-null preservation for `ThreadSettingsUpdateParams.service_tier`. It validates the same clear-vs-omit semantics on settings updates.
+**Purpose**: Checks that thread settings updates preserve explicit null serviceTier separately from omission. This protects settings update intent.
 
-**Data flow**: Deserializes `ThreadSettingsUpdateParams` from JSON with `serviceTier: null`, asserts `Some(None)`, serializes back and checks for JSON null, then serializes a default-like value with `service_tier: None` and asserts omission.
+**Data flow**: It deserializes update params with serviceTier null, checks Some(None), serializes it as null, then checks a default update omits the field.
 
-**Call relations**: Completes the service-tier double-option coverage across thread lifecycle/update requests.
+**Call relations**: The test runner calls this test. It validates ThreadSettingsUpdateParams serialization and deserialization.
 
 *Call graph*: 5 external calls (default, assert_eq!, json!, from_value, to_value).
 
@@ -1831,11 +1845,11 @@ fn thread_settings_update_params_preserve_explicit_null_service_tier()
 fn thread_settings_update_params_preserve_field_level_experimental_gates()
 ```
 
-**Purpose**: Verifies that specific experimental fields on `ThreadSettingsUpdateParams` report the correct gate strings independently. It checks permissions, granular approval policy, and collaboration mode.
+**Purpose**: Checks that experimental warnings are attached to specific thread settings fields. This prevents experimental settings from being enabled without notice.
 
-**Data flow**: Constructs three `ThreadSettingsUpdateParams` values, each setting one experimental field, calls `ExperimentalApi::experimental_reason` on each, and asserts the returned gate string matches the field or nested variant.
+**Data flow**: It builds settings updates for permissions, granular approval, and collaboration mode, asking each for an experimental reason and comparing the expected strings.
 
-**Call relations**: Regression test for field-level experimental metadata on settings updates.
+**Call relations**: The test runner calls this test. It exercises ExperimentalApi behavior for ThreadSettingsUpdateParams.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -1846,11 +1860,11 @@ fn thread_settings_update_params_preserve_field_level_experimental_gates()
 fn turn_start_params_round_trip_environments()
 ```
 
-**Purpose**: Checks that `TurnStartParams.environments` preserves foreign path syntax and triggers the experimental gate when present. It validates nested environment selection payloads.
+**Purpose**: Checks that turn-start params can include per-environment working directories and that this feature is marked experimental. This supports running turns across named environments.
 
-**Data flow**: Builds a platform-foreign raw cwd string, deserializes it into `LegacyAppPathString`, deserializes `TurnStartParams` containing one environment entry, asserts the parsed environments vector and experimental reason, serializes back, and asserts the JSON `environments` field matches the original syntax-preserving value.
+**Data flow**: It deserializes params with one environment, checks the parsed environment list, checks the experimental reason, serializes, and compares the environments JSON.
 
-**Call relations**: Covers both serde and experimental gating for turn environment overrides.
+**Call relations**: The test runner calls this test. It validates TurnStartParams environment handling and experimental gating.
 
 *Call graph*: 4 external calls (assert_eq!, json!, from_value, to_value).
 
@@ -1861,11 +1875,11 @@ fn turn_start_params_round_trip_environments()
 fn turn_start_params_preserve_empty_environments()
 ```
 
-**Purpose**: Ensures an explicitly empty `environments` array is preserved as `Some(Vec::new())` and still counts as using the experimental field. This distinguishes empty from omitted/null.
+**Purpose**: Checks that an explicit empty environments array is preserved and still counts as using the experimental environments feature. This keeps client intent visible.
 
-**Data flow**: Deserializes `TurnStartParams` from JSON with `environments: []`, asserts the field is `Some(Vec::new())`, checks the experimental reason string, serializes back, and asserts the JSON field is an empty array.
+**Data flow**: It deserializes params with environments as an empty array, checks it becomes Some(empty vector), checks the experimental reason, then serializes it back as an empty array.
 
-**Call relations**: Companion test to the non-empty environments case.
+**Call relations**: The test runner calls this test. It validates the empty-list case for TurnStartParams environments.
 
 *Call graph*: 4 external calls (assert_eq!, json!, from_value, to_value).
 
@@ -1876,11 +1890,11 @@ fn turn_start_params_preserve_empty_environments()
 fn turn_start_params_treat_null_or_omitted_environments_as_default()
 ```
 
-**Purpose**: Checks that null or omitted `environments` both mean the default behavior and do not trigger experimental gating. It protects the tri-state semantics of the field.
+**Purpose**: Checks that null or omitted environments mean the default behavior and do not trigger the experimental gate. This distinguishes no feature use from an explicit environment list.
 
-**Data flow**: Deserializes two `TurnStartParams` values, one with `environments: null` and one with the field omitted, asserts both have `environments: None`, and asserts `ExperimentalApi::experimental_reason` returns `None` for both.
+**Data flow**: It deserializes one payload with environments null and one without the field, checks both become None, and checks neither has an experimental reason.
 
-**Call relations**: Completes the environments-field semantics coverage by testing the non-opt-in cases.
+**Call relations**: The test runner calls this test. It validates default handling for TurnStartParams environments.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1891,11 +1905,11 @@ fn turn_start_params_treat_null_or_omitted_environments_as_default()
 fn realtime_append_text_defaults_role_to_user()
 ```
 
-**Purpose**: Ensures `ThreadRealtimeAppendTextParams.role` defaults to `ConversationTextRole::User` when omitted. It protects a convenience default in the realtime API.
+**Purpose**: Checks that realtime appended text defaults to the user role when no role is provided. This gives simple clients the expected conversation role automatically.
 
-**Data flow**: Deserializes `ThreadRealtimeAppendTextParams` from JSON containing only `threadId` and `text`, then asserts the resulting struct has `role: ConversationTextRole::User`.
+**Data flow**: It deserializes append-text params with thread id and text only, then compares the parsed value with role set to ConversationTextRole::User.
 
-**Call relations**: Regression test for defaulting behavior in the realtime request schema.
+**Call relations**: The test runner calls this test. It validates ThreadRealtimeAppendTextParams deserialization defaults.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -1905,13 +1919,15 @@ These tests finalize the stage by checking that generated TypeScript and JSON sc
 
 ### `app-server-protocol/tests/schema_fixtures.rs`
 
-`test` · `test execution and schema fixture verification`
+`test` · `test run`
 
-This test file is the enforcement layer for schema fixture drift. The two top-level tests cover TypeScript and JSON separately. The TypeScript test reads the vendored `schema/typescript` subtree and compares it against an in-memory tree produced by `generate_typescript_schema_fixture_subtree_for_tests`; the JSON test uses a temporary directory, runs the real JSON generator into it, then compares that generated subtree against vendored `schema/json` fixtures.
+The app-server protocol has schema files in two forms: TypeScript files and JSON schema files. These are like written contracts that say what messages the app server can send and receive. This file makes sure those written contracts are not stale. It reads the schema fixtures already stored in the repository, generates fresh versions from the current Rust code, and compares the two trees file by file.
 
-The comparison logic lives in `assert_schema_trees_match`. It first compares the sorted path lists from the two `BTreeMap`s; if the file sets differ, it renders a unified diff of the path lists and panics with an instruction to run `just write-app-server-schema`. If the file sets match, it compares each file’s bytes and, on mismatch, renders a unified line diff of the decoded contents for a more actionable failure.
+There are two main tests. One checks the TypeScript schema fixtures, using an in-memory generator. The other checks the JSON schema fixtures by generating them into a temporary folder first. Both tests then use the same comparison helper.
 
-`schema_root` is careful about Bazel runfiles: instead of assuming directories resolve reliably, it locates known fixture files (`schema/typescript/index.ts` and the JSON bundle), walks up to their parents, and asserts both derivations agree on the same schema root. `read_tree` is a small wrapper that adds context around subtree reads.
+The comparison is strict. First it checks that the same files exist on both sides. Then it checks that every file has exactly the same bytes. If anything differs, the test prints a readable unified diff, which is the familiar “before versus after” patch-style view. The error message also tells the developer to run `just write-app-server-schema` to refresh the checked-in fixtures.
+
+A small but important detail is how the test finds the schema directory. In Bazel test runs, directories can be hard to locate directly, so the file resolves known schema files first and then walks up to the shared schema root. This makes the test work in more build environments.
 
 #### Function details
 
@@ -1921,11 +1937,11 @@ The comparison logic lives in `assert_schema_trees_match`. It first compares the
 fn typescript_schema_fixtures_match_generated() -> Result<()>
 ```
 
-**Purpose**: Checks that vendored TypeScript schema fixtures exactly match the current in-memory TypeScript schema generation output.
+**Purpose**: This is the test that verifies the checked-in TypeScript schema fixture files match the TypeScript schema that the current code would generate. It catches forgotten fixture updates after protocol changes.
 
-**Data flow**: Resolves the schema root, reads the vendored `typescript` subtree into a `BTreeMap`, generates a fresh TypeScript fixture tree in memory, and passes both maps to `assert_schema_trees_match`. It returns success only if both file paths and contents match.
+**Data flow**: It starts by finding the schema fixture root on disk. It reads the existing `typescript` fixture subtree from that root, asks the protocol crate to generate a fresh TypeScript schema subtree in memory, and then passes both trees to the shared comparison function. If they match, the test returns success; if not, the comparison function stops the test with a clear diff.
 
-**Call relations**: This is one of the two top-level test entrypoints. It orchestrates fixture loading and delegates all detailed comparison logic to `assert_schema_trees_match`.
+**Call relations**: As a top-level test, it drives the TypeScript side of the fixture check. It calls `schema_root` to locate the fixture directory, `read_tree` to load the checked-in files, `generate_typescript_schema_fixture_subtree_for_tests` to produce the fresh expected output, and `assert_schema_trees_match` to do the final strict comparison.
 
 *Call graph*: calls 3 internal fn (assert_schema_trees_match, read_tree, schema_root); 1 external calls (generate_typescript_schema_fixture_subtree_for_tests).
 
@@ -1936,11 +1952,11 @@ fn typescript_schema_fixtures_match_generated() -> Result<()>
 fn json_schema_fixtures_match_generated() -> Result<()>
 ```
 
-**Purpose**: Checks that vendored JSON schema fixtures match the output of the real JSON schema generator with experimental API disabled.
+**Purpose**: This is the test that verifies the checked-in JSON schema fixture files match freshly generated JSON schema output. It keeps the repository’s JSON version of the protocol contract in sync with the generator.
 
-**Data flow**: Calls `assert_schema_fixtures_match_generated` with the `json` label and a closure that runs `generate_json_with_experimental(output_dir, false)`. It returns that helper’s result.
+**Data flow**: It supplies the label `json` and a small generator callback to the shared fixture-checking helper. That helper then finds the stored fixtures, generates fresh JSON schema files, compares the two, and returns success or fails the test.
 
-**Call relations**: This top-level test is a thin wrapper around the generic fixture-generation assertion helper.
+**Call relations**: This test is a thin wrapper around `assert_schema_fixtures_match_generated`. It exists because JSON schema generation writes files into a directory, so the shared helper creates a temporary output location and runs the JSON generator there.
 
 *Call graph*: calls 1 internal fn (assert_schema_fixtures_match_generated).
 
@@ -1954,11 +1970,11 @@ fn assert_schema_fixtures_match_generated(
 ) -> Result<()>
 ```
 
-**Purpose**: Generates one labeled schema subtree into a temporary directory and compares it against the vendored fixture subtree under the repository schema root.
+**Purpose**: This helper performs the common “read stored fixtures, generate fresh files, compare them” workflow for schema formats that generate into a directory. In this file it is used for the JSON schema test.
 
-**Data flow**: Resolves the schema root, reads the vendored subtree for `label`, creates a temporary directory, generates fresh schema files into `temp_dir/label` via the supplied closure, reads the generated subtree back, and compares the two trees with `assert_schema_trees_match`. It returns `Ok(())` if they match.
+**Data flow**: It receives a label, such as `json`, and a generation function. It finds the schema root, reads the existing fixture files for that label, creates a temporary directory, asks the generator to write fresh files there, reads those generated files back, and sends both file trees to the comparison function. It returns success if everything matches, or an error if setup or reading fails; mismatches cause the comparison to panic with a diff.
 
-**Call relations**: The JSON test uses this helper to exercise the actual on-disk generator path while reusing the common tree comparison logic.
+**Call relations**: `json_schema_fixtures_match_generated` calls this helper instead of repeating the same setup steps. Inside the workflow, it relies on `schema_root` to locate repository fixtures, `read_tree` to load both old and newly generated files, `tempdir` to create a safe throwaway output folder, and `assert_schema_trees_match` to decide whether the generated output is acceptable.
 
 *Call graph*: calls 3 internal fn (assert_schema_trees_match, read_tree, schema_root); called by 1 (json_schema_fixtures_match_generated); 1 external calls (tempdir).
 
@@ -1973,11 +1989,11 @@ fn assert_schema_trees_match(
 ) -> Result<()>
 ```
 
-**Purpose**: Compares two schema fixture trees first by relative file set and then by per-file contents, producing unified diffs on failure.
+**Purpose**: This function compares two schema file trees and explains any difference in a developer-friendly way. It is the final gate that decides whether the checked-in fixtures are up to date.
 
-**Data flow**: Takes two `BTreeMap<PathBuf, Vec<u8>>` trees, derives ordered display-string path lists from their keys, and if those differ, computes a line diff and panics. Otherwise it iterates each fixture file, fetches the generated bytes by path, skips exact matches, and for mismatches decodes both sides lossily to UTF-8, computes a unified diff, and panics with a file-specific message. It returns `Ok(())` only when every path and file matches.
+**Data flow**: It receives a label plus two maps: one for the stored fixture files and one for freshly generated files. First it turns each map’s paths into ordered lists and checks whether the same file names exist on both sides. If the file sets differ, it builds a unified diff and fails the test. If the file names match, it compares each file’s contents. Matching files are skipped; differing files are converted to readable text when possible, diffed, and reported in a failure message. If no differences are found, it returns success.
 
-**Call relations**: Both top-level tests and the generic generation helper funnel through this function, making it the central assertion engine for schema fixture drift.
+**Call relations**: Both schema tests eventually call this function: the TypeScript test calls it directly, and the JSON test reaches it through `assert_schema_fixtures_match_generated`. It uses `TextDiff::from_lines` to produce useful patch-style output and `panic!` to fail the test immediately when the repository fixtures do not match generated output.
 
 *Call graph*: called by 2 (assert_schema_fixtures_match_generated, typescript_schema_fixtures_match_generated); 3 external calls (from_utf8_lossy, from_lines, panic!).
 
@@ -1988,11 +2004,11 @@ fn assert_schema_trees_match(
 fn schema_root() -> Result<PathBuf>
 ```
 
-**Purpose**: Finds the repository schema root by resolving known fixture files through Bazel/cargo resource lookup and walking up from those files.
+**Purpose**: This function finds the directory that contains the checked-in schema fixtures. It does this in a way that works even in Bazel test environments, where asking for a directory directly may not be reliable.
 
-**Data flow**: Uses `find_resource!` to locate `schema/typescript/index.ts`, derives its grandparent as `schema_root`, then resolves the JSON schema bundle and derives its grandparent as `json_root`. It asserts the two roots are equal and returns the shared `PathBuf`.
+**Data flow**: It resolves a known TypeScript fixture file, `schema/typescript/index.ts`, then walks up two directory levels to get the common schema root. It also resolves a known JSON fixture file and walks up from there. It checks that both routes lead to the same root directory, then returns that path. If either file cannot be found, or the two roots disagree, it returns an error.
 
-**Call relations**: Both test flows call this before reading fixtures so they can work reliably in environments where directory resolution is unreliable.
+**Call relations**: The TypeScript test and the shared JSON helper both call this before reading fixtures. It uses the `find_resource!` macro to locate known test resources and `ensure!` to guard against accidentally comparing files from inconsistent schema locations.
 
 *Call graph*: called by 2 (assert_schema_fixtures_match_generated, typescript_schema_fixtures_match_generated); 2 external calls (ensure!, find_resource!).
 
@@ -2003,10 +2019,10 @@ fn schema_root() -> Result<PathBuf>
 fn read_tree(root: &Path, label: &str) -> Result<BTreeMap<PathBuf, Vec<u8>>>
 ```
 
-**Purpose**: Reads one labeled schema subtree from a root path and adds contextual error text naming the subtree and root.
+**Purpose**: This small helper reads one schema fixture subtree, such as `typescript` or `json`, into memory. It wraps the lower-level reader with a clearer error message that says what label and root path were being read.
 
-**Data flow**: Accepts `root` and `label`, calls `read_schema_fixture_subtree`, and wraps any error with a formatted message including the root path. It returns the resulting `BTreeMap` on success.
+**Data flow**: It receives a root directory and a label. It asks `read_schema_fixture_subtree` to collect the files under that labeled schema subtree into an ordered map from relative path to file bytes. If reading fails, it adds context showing which subtree and root were involved; otherwise it returns the populated map.
 
-**Call relations**: This helper is used by both top-level tests and the generic generation assertion helper to keep subtree reads consistent and well-contextualized.
+**Call relations**: The TypeScript test uses this to load the checked-in TypeScript fixtures, and the shared JSON helper uses it to load both the checked-in JSON fixtures and the newly generated JSON output. It is the bridge between files on disk and the in-memory maps that `assert_schema_trees_match` can compare.
 
 *Call graph*: called by 2 (assert_schema_fixtures_match_generated, typescript_schema_fixtures_match_generated); 1 external calls (read_schema_fixture_subtree).

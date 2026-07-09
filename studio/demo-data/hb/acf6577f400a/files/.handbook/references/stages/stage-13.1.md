@@ -1,10 +1,10 @@
 # Model transport execution  `stage-13.1`
 
-This stage is the outbound inference transport layer: after higher-level code decides to ask a model for work, these components shape the request, send it over HTTP/SSE, WebSocket, or WebRTC, decode streamed results, and normalize failures and telemetry before control returns to the main conversation flow.
+This stage is the network layer for talking to model services during the main work of a session, with a little startup help. Shared request plumbing in client_common, responses_metadata, responses.rs, and tools/responses_api shapes Codex turns, IDs, metadata, and tool descriptions before they leave the app. The main client chooses HTTP streaming or WebSocket, adds authentication, sends the request, records telemetry, and uses retry policy when a stream fails.
 
-At its center, core/src/client.rs manages provider sessions, auth, sticky routing, transport selection, websocket reuse, and reporting. Shared request/stream data lives in client_common.rs, while responses_metadata.rs and codex-api/src/requests/responses.rs build the canonical Responses payload and metadata, including item-ID preservation and compression flags. tools/src/responses_api.rs converts internal tool definitions into the wire format expected by the Responses API.
+Endpoint clients are the doorways to specific remote jobs: Responses, compact history, memories, images, search, and realtime calls. Their companion decoders turn raw server streams, JSON, SSE events, WebSocket messages, or WebRTC answers into clear Codex events and typed results. api_bridge makes network and HTTP failures understandable to the rest of the program.
 
-The codex-api endpoint clients execute concrete calls: responses.rs and sse/responses.rs handle HTTP plus SSE streaming; responses_websocket.rs provides the WebSocket variant; compact.rs, memories.rs, images.rs, and search.rs cover specialized inference endpoints; realtime_call.rs and the realtime_websocket modules implement realtime session creation, protocol-version-specific message shapes, and event parsing. realtime-webrtc and realtime_conversation.rs add live audio/video transport. responses_retry.rs, session_startup_prewarm.rs, compact_remote_v2.rs, image-generation backend glue, and api_bridge.rs supply retries, warmup, compaction semantics, extension integration, and public error mapping.
+Realtime files are the live conversation machinery. They hide protocol version differences, build outgoing voice/text messages, decode incoming events, and run WebSocket or WebRTC audio sessions. Higher-level orchestration starts realtime conversations, prewarms connections during session startup, and runs remote compaction so long chats stay usable.
 
 ## Files in this stage
 
@@ -13,13 +13,13 @@ These files define the common request payload helpers, metadata, stream wrappers
 
 ### `core/src/client_common.rs`
 
-`data_model` · `cross-cutting request/stream representation`
+`io_transport` · `request handling`
 
-This file holds the lightweight types that sit between higher-level turn orchestration and the lower-level API client in `client.rs`. `Prompt` is the in-memory representation of a single model turn request: conversation `input` as `Vec<ResponseItem>`, available `ToolSpec`s, whether parallel tool calls are allowed, base instructions, optional personality, optional JSON output schema, and whether that schema should be enforced strictly. Its `Default` implementation intentionally produces an empty, schema-free, tool-free prompt with strict schema validation enabled if a schema is later supplied.
+This file is a small shared toolkit for talking to the model API. Its main request type, `Prompt`, is the bundle of information needed for one model turn: the conversation so far, the tools the model may call, the base instructions, optional personality settings, and optional rules for the shape of the answer. Think of it like the envelope prepared before mailing a question to the model.
 
-The main behavior here is `Prompt::get_formatted_input_for_request`. It clones the prompt input and, when `use_responses_lite` is true, strips `detail` fields from embedded input images. The helper `strip_image_details` walks both ordinary message content (`ContentItem::InputImage`) and tool/function output payloads (`FunctionCallOutputContentItem::InputImage`) while leaving all other `ResponseItem` variants untouched. This is a targeted wire-shape normalization rather than a general transformation.
+One important detail is that the file can prepare the prompt differently depending on which API mode is being used. For the lighter Responses API mode, it removes image “detail” settings from image inputs. The images themselves remain, but the extra detail preference is stripped out so the request matches what that mode expects.
 
-`ResponseStream` wraps a Tokio mpsc receiver of `Result<ResponseEvent>` plus a `CancellationToken`. It implements `futures::Stream` by polling the receiver directly, and its `Drop` implementation cancels the token so the background mapper task in `client.rs` can detect that the consumer stopped polling and record cancellation/partial-output trace state.
+The other main type, `ResponseStream`, is a wrapper around a channel that receives response events over time. A stream means the caller can read pieces of the model response as they arrive instead of waiting for everything at once. If the caller stops reading early, the stream’s cleanup code sends a cancellation signal to the background task that was mapping provider events. This prevents unused work from continuing after the consumer has walked away.
 
 #### Function details
 
@@ -29,11 +29,11 @@ The main behavior here is `Prompt::get_formatted_input_for_request`. It clones t
 fn default() -> Self
 ```
 
-**Purpose**: Creates an empty prompt with no input, no tools, no personality, and no output schema. It establishes the baseline defaults used by tests and request-building code.
+**Purpose**: Creates a safe, empty starting prompt. Code uses this when it wants a blank request and will fill in only the parts it needs.
 
-**Data flow**: Constructs and returns `Prompt` with `input = Vec::new()`, `tools = Vec::new()`, `parallel_tool_calls = false`, `base_instructions = BaseInstructions::default()`, `personality = None`, `output_schema = None`, and `output_schema_strict = true`.
+**Data flow**: It takes no input. It builds a `Prompt` with no conversation items, no tools, no personality, no output schema, parallel tool calls turned off, strict schema checking turned on, and default base instructions. The result is a ready-to-edit prompt value.
 
-**Call relations**: Used widely in tests and fixture builders as the starting point for prompt construction. Production request building later consumes these fields in `ModelClient::build_responses_request`.
+**Call relations**: Many tests and setup helpers call this when they need a simple prompt to customize. It relies on the default value for base instructions and creates new empty lists for fields like input and tools.
 
 *Call graph*: calls 1 internal fn (default); called by 8 (responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids, send_provider_auth_request, prompt_with_input, sample, memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata); 1 external calls (new).
 
@@ -47,11 +47,11 @@ fn get_formatted_input_for_request(
     ) -> Vec<ResponseItem>
 ```
 
-**Purpose**: Produces the request-ready copy of prompt input, optionally normalizing image detail fields for Responses Lite. It preserves the original prompt input unchanged.
+**Purpose**: Returns the conversation input in the exact form needed for an outgoing API request. It preserves the original prompt while making a request-specific copy.
 
-**Data flow**: Clones `self.input` into a mutable local vector → if `use_responses_lite` is true, passes the clone to `strip_image_details` → returns the cloned/transformed `Vec<ResponseItem>`.
+**Data flow**: It reads the prompt’s stored input items and makes a clone of them. If the caller says the lighter Responses API mode is being used, it edits that copied input to remove image detail settings. It returns the copied, possibly simplified input list and does not change the original prompt.
 
-**Call relations**: Called by `ModelClient::build_responses_request` before constructing the wire request. Tests verify both that image details are stripped for Responses Lite and that the original prompt input remains intact.
+**Call relations**: The request-building code calls this while assembling a Responses API request. When the lighter API mode needs image details removed, this function hands the copied input to `strip_image_details` before returning it.
 
 *Call graph*: calls 1 internal fn (strip_image_details); called by 1 (build_responses_request).
 
@@ -62,11 +62,11 @@ fn get_formatted_input_for_request(
 fn strip_image_details(items: &mut [ResponseItem])
 ```
 
-**Purpose**: Removes `detail` values from embedded input-image content inside response items. It only touches the specific variants that can carry image detail metadata.
+**Purpose**: Removes optional image detail settings from conversation items. This keeps image content while dropping a setting that is not wanted for certain request formats.
 
-**Data flow**: Mutably iterates over a slice of `ResponseItem` → for `ResponseItem::Message`, walks `content` and sets `detail = None` on each `ContentItem::InputImage`; for `FunctionCallOutput` and `CustomToolCallOutput`, obtains mutable content items from the payload and sets `detail = None` on each `FunctionCallOutputContentItem::InputImage`; all other response-item variants are ignored.
+**Data flow**: It receives a mutable list of response items. It walks through each item, looks inside normal messages and tool-output messages, and when it finds an image input it sets that image’s `detail` field to `None`. Items that cannot contain those image details are left unchanged.
 
-**Call relations**: Used only by `Prompt::get_formatted_input_for_request`. It is intentionally narrow so request normalization does not accidentally rewrite unrelated response-item content.
+**Call relations**: This is an internal helper used by `Prompt::get_formatted_input_for_request`. It is only part of the request-preparation path, and its job is narrowly focused: clean image detail metadata from a copied prompt before that copy is sent onward.
 
 *Call graph*: called by 1 (get_formatted_input_for_request).
 
@@ -77,11 +77,11 @@ fn strip_image_details(items: &mut [ResponseItem])
 fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>
 ```
 
-**Purpose**: Implements the `Stream` trait for `ResponseStream` by polling the underlying mpsc receiver. It exposes mapped response events to consumers one item at a time.
+**Purpose**: Lets callers read the next streamed response event, if one is ready. This is what makes `ResponseStream` behave like an asynchronous stream.
 
-**Data flow**: Receives `Pin<&mut Self>` and task context → delegates to `self.rx_event.poll_recv(cx)` → returns `Poll<Option<Result<ResponseEvent>>>`.
+**Data flow**: It receives a pinned mutable reference to the stream and the task wake-up context used by asynchronous Rust. It asks the internal receiving channel for the next item. The output is either a response event, an error wrapped in the shared result type, a signal that nothing is ready yet, or the end of the stream.
 
-**Call relations**: This method is exercised whenever callers iterate or `.next().await` a `ResponseStream` returned from `client.rs` streaming methods.
+**Call relations**: Any code consuming `ResponseStream` calls this indirectly through normal stream-reading operations. The function delegates the actual waiting and receiving work to the underlying channel receiver.
 
 *Call graph*: 1 external calls (poll_recv).
 
@@ -92,22 +92,26 @@ fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self
 fn drop(&mut self)
 ```
 
-**Purpose**: Signals that the consumer abandoned the stream before the provider emitted a terminal event. This lets the background mapper task record cancellation and stop work.
+**Purpose**: Stops background response work when the response stream is abandoned. This is cleanup code that prevents the provider-mapping task from continuing after nobody is listening.
 
-**Data flow**: On drop, calls `self.consumer_dropped.cancel()` and performs no other cleanup.
+**Data flow**: It runs automatically when a `ResponseStream` is destroyed. It does not return a value. It sends a cancellation signal through the stored cancellation token, changing shared state so the mapper task can notice that the consumer stopped polling early.
 
-**Call relations**: The cancellation token is observed by `map_response_events` in `client.rs`. Tests specifically validate that dropping the stream causes cancellation traces to be recorded with any partial output already seen.
+**Call relations**: This is called by Rust automatically during cleanup, not by ordinary application code. It hands off to the cancellation token’s `cancel` operation so the background mapper can shut down instead of continuing to process provider events for a dropped stream.
 
 *Call graph*: 1 external calls (cancel).
 
 
 ### `core/src/responses_metadata.rs`
 
-`data_model` · `request construction for Responses API and websocket/HTTP compatibility metadata emission`
+`io_transport` · `request building`
 
-This file is the central model-and-rendering layer for Codex request metadata sent to the Responses API. It defines constants for all owned metadata keys, a reserved-key denylist used to protect core-owned fields from caller-supplied overrides, and several small types that describe request identity. `CompactionTurnMetadata` captures dispatch-time compaction attributes such as trigger, reason, implementation, phase, and a fixed `Memento` strategy. `CodexResponsesRequestKind` distinguishes normal turns, prewarm requests, compaction requests, and memory requests; notably, memory requests are treated specially and do not carry turn identity.
+When Codex sends a request to the model service, the service needs context: which installation sent it, which conversation thread it belongs to, whether it is a normal turn or a background memory task, and whether it came from a subagent. This file is the central place that turns that context into metadata for the Responses API.
 
-The main struct, `CodexResponsesMetadata`, stores installation/session/thread/window identifiers, optional turn and parent/fork lineage, subagent labels, sandbox/workspace context, turn start time, and arbitrary extra metadata. Its methods render this snapshot in three forms: a serialized turn-metadata blob (`turn_metadata_json` / `turn_metadata_value`), a flat `HashMap<String, String>` for `client_metadata`, and direct HTTP compatibility headers. The internal `turn_metadata_payload` method is where the important shaping happens: it derives `request_kind`, conditionally includes identity fields depending on whether the request kind has turn identity, omits empty workspace maps, and flattens caller extras into the payload. The file also translates `SessionSource` values into legacy subagent header strings and richer metadata kinds, inserts HTTP headers only when values parse cleanly, and filters extra metadata so reserved Codex keys cannot be shadowed.
+The main object, CodexResponsesMetadata, is like a shipping label for a model request. It stores the official Codex fields, optional details such as parent thread and sandbox, workspace snapshots, and caller-provided extra fields. It can then print that label in a few formats: a structured JSON blob, a flat client_metadata map, and older compatibility HTTP headers.
+
+The file also protects reserved names. App-server clients may add extra metadata, but they are not allowed to replace core fields such as installation_id, thread_id, or x-codex-turn-metadata. Without this filtering, outside metadata could accidentally or deliberately confuse request tracking.
+
+A special path exists for compaction, which is the process of shortening or summarizing conversation history. Compaction requests carry extra metadata describing why and how compaction is being done. Memory requests are treated differently from normal turns, so some turn identity fields are intentionally left out.
 
 #### Function details
 
@@ -122,11 +126,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs the metadata payload describing a compaction request at dispatch time. It fills the caller-provided compaction dimensions and hard-codes the strategy to `CompactionStrategy::Memento`.
+**Purpose**: Creates the small metadata record used when a request is for conversation compaction. It records why compaction is happening, what triggered it, which implementation is being used, and which phase the operation is in.
 
-**Data flow**: It takes `trigger`, `reason`, `implementation`, and `phase` enums from analytics-oriented call sites and returns a `CompactionTurnMetadata` struct containing those values plus `strategy: Memento`. It does not read or mutate external state.
+**Data flow**: The caller gives the trigger, reason, implementation, and phase. The function packages those into a CompactionTurnMetadata value and sets the compaction strategy to Memento by default. The result is returned to be attached to a compaction request.
 
-**Call relations**: This constructor is used by local and remote compaction execution paths such as `run_compact_task_inner` and `run_remote_compact_task_inner`, and by a test that verifies compaction-only overlay behavior. It is a leaf constructor that feeds into `CodexResponsesRequestKind::Compaction` and later serialization.
+**Call relations**: Compaction flows call this when they are preparing local or remote compaction work. The resulting value is later carried inside CodexResponsesRequestKind::Compaction so the request metadata can include compaction details.
 
 *Call graph*: called by 4 (run_compact_task_inner, run_remote_compact_task_inner, run_remote_compact_task_inner, turn_metadata_state_overlays_compaction_only_on_compaction_requests).
 
@@ -137,11 +141,11 @@ fn new(
 fn metadata(self) -> (&'static str, Option<CompactionTurnMetadata>)
 ```
 
-**Purpose**: Maps a request-kind enum variant to the serialized request-kind label and optional embedded compaction metadata. It is the normalization step used before payload serialization.
+**Purpose**: Turns an internal request kind into the simple label that will appear in metadata, such as "turn", "prewarm", "compaction", or "memory". For compaction, it also returns the attached compaction details.
 
-**Data flow**: It consumes `self` and returns a tuple of `(&'static str, Option<CompactionTurnMetadata>)`: `"turn"`, `"prewarm"`, `"compaction"` plus metadata, or `"memory"`. No state is read or written.
+**Data flow**: It receives one request-kind value. It matches that value to a text label and, only for compaction, keeps the CompactionTurnMetadata alongside it. It returns both pieces as a pair.
 
-**Call relations**: This helper is used inside `CodexResponsesMetadata::turn_metadata_payload` when converting the enum into wire-ready fields. It does not call further internal helpers.
+**Call relations**: This is used while building the turn metadata payload. It translates Rust enum choices into the plain metadata values that can be serialized and sent with the request.
 
 
 ##### `CodexResponsesRequestKind::has_turn_identity`  (lines 113–115)
@@ -150,11 +154,11 @@ fn metadata(self) -> (&'static str, Option<CompactionTurnMetadata>)
 fn has_turn_identity(self) -> bool
 ```
 
-**Purpose**: Determines whether a request kind should carry turn/session/thread identity fields in the metadata payload. Memory requests are the only variant excluded.
+**Purpose**: Answers whether this kind of request should be treated as belonging to a normal conversation turn. Memory requests are the exception, because they are background-style work and should not carry the same turn identity.
 
-**Data flow**: It consumes `self`, pattern-matches against `CodexResponsesRequestKind::Memory`, and returns `false` only for that variant and `true` otherwise. It has no side effects.
+**Data flow**: It receives a request kind and checks whether it is Memory. It returns false for Memory and true for the other request kinds.
 
-**Call relations**: This predicate is consulted by `CodexResponsesMetadata::turn_metadata_payload` to decide which identity fields to include. It is part of the file's invariant that detached memory requests omit turn identity.
+**Call relations**: The metadata payload builder uses this to decide which identity fields to include. This prevents memory requests from being labeled like regular user turns.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -170,11 +174,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Creates a fresh metadata snapshot with the required installation, session, thread, and window identifiers populated and all optional fields empty.
+**Purpose**: Creates a fresh metadata object with the required identity fields filled in. It starts with only the core request identifiers and leaves optional fields empty until other code adds them.
 
-**Data flow**: It takes owned `String` values for `installation_id`, `session_id`, `thread_id`, and `window_id`, and returns a `CodexResponsesMetadata` with `turn_id`, request kind, lineage, subagent fields, sandbox, and timestamp set to `None`, `workspaces` and `extra` initialized as empty `BTreeMap`s. It allocates those empty maps but writes no external state.
+**Data flow**: The caller provides installation ID, session ID, thread ID, and window ID. The function stores those strings, sets optional fields such as turn ID, subagent, sandbox, and request kind to none, and starts the workspace and extra metadata maps empty. It returns the ready-to-fill metadata object.
 
-**Call relations**: This constructor is called by metadata-building entry points such as `responses_metadata`, `responses_metadata_template`, and `detached_memory_responses_metadata`. Those callers then enrich the returned struct before rendering it through the methods below.
+**Call relations**: Request setup code calls this when it needs a metadata template for normal Responses API calls, detached memory work, or reusable response metadata. Later steps enrich the object before it is converted into client metadata or headers.
 
 *Call graph*: called by 3 (responses_metadata, responses_metadata_template, detached_memory_responses_metadata); 1 external calls (new).
 
@@ -185,11 +189,11 @@ fn new(
 fn has_turn_metadata(&self) -> bool
 ```
 
-**Purpose**: Reports whether this metadata snapshot should emit the structured turn-metadata blob. The decision is based solely on whether a request kind has been assigned.
+**Purpose**: Checks whether this metadata object has enough request-kind information to produce the full Codex turn metadata blob. In practice, it means the request has been labeled as a turn, prewarm, compaction, or memory request.
 
-**Data flow**: It reads `self.request_kind` and returns `true` when it is `Some(_)` and `false` otherwise. It does not mutate state.
+**Data flow**: It reads the request_kind field from the metadata object. If that field is present, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Both `client_metadata` and `compatibility_headers` call this method to gate emission of `x-codex-turn-metadata`. It is a small guard that prevents empty or meaningless metadata blobs from being attached.
+**Call relations**: The client metadata and compatibility header builders call this before adding x-codex-turn-metadata. That keeps incomplete metadata objects from sending a misleading or premature turn metadata blob.
 
 *Call graph*: called by 2 (client_metadata, compatibility_headers).
 
@@ -200,11 +204,11 @@ fn has_turn_metadata(&self) -> bool
 fn turn_metadata_json(&self) -> Option<String>
 ```
 
-**Purpose**: Serializes the canonical turn metadata payload into an ASCII-safe JSON string suitable for transport in metadata fields and headers.
+**Purpose**: Builds the canonical Codex turn metadata blob as an ASCII JSON string. This is the main serialized form sent under x-codex-turn-metadata.
 
-**Data flow**: It reads the current struct state, builds a borrowed `CodexTurnMetadataPayload` via `turn_metadata_payload`, then passes that payload to `to_ascii_json_string`. If serialization succeeds it returns `Some(String)`; on serialization failure it returns `None` rather than propagating an error.
+**Data flow**: It first asks turn_metadata_payload to assemble the structured payload from the current metadata fields. Then it converts that payload into an ASCII-only JSON string. If serialization succeeds, it returns the string; if not, it returns nothing.
 
-**Call relations**: This method is called by both `client_metadata` and `compatibility_headers` when they need the canonical JSON blob. It delegates all field-shaping decisions to `turn_metadata_payload` and all string encoding to the external JSON utility.
+**Call relations**: Both client_metadata and compatibility_headers call this when they need to attach the full turn metadata blob. It is the bridge between the in-memory metadata object and the wire format sent to the Responses API.
 
 *Call graph*: calls 1 internal fn (turn_metadata_payload); called by 2 (client_metadata, compatibility_headers); 1 external calls (to_ascii_json_string).
 
@@ -215,11 +219,11 @@ fn turn_metadata_json(&self) -> Option<String>
 fn turn_metadata_value(&self) -> Option<Value>
 ```
 
-**Purpose**: Serializes the canonical turn metadata payload into a `serde_json::Value` for in-process consumers that want structured JSON rather than a string.
+**Purpose**: Builds the same Codex turn metadata payload as a serde_json Value, which is a generic JSON value used inside Rust. This is useful when code wants structured JSON rather than a string.
 
-**Data flow**: It reads the struct, constructs the borrowed payload with `turn_metadata_payload`, and converts it using `serde_json::to_value`. It returns `Some(Value)` on success or `None` if serialization fails.
+**Data flow**: It asks turn_metadata_payload for the current structured payload, then converts that payload into a JSON value. If conversion succeeds, it returns that value; otherwise it returns nothing.
 
-**Call relations**: This is the structured counterpart to `turn_metadata_json`. It shares the same payload-building path but is intended for callers that need JSON values instead of transport strings.
+**Call relations**: This function uses the same payload-building path as turn_metadata_json, so callers get the same metadata content in a different form. It is not part of the listed outgoing request-building calls, but it provides a structured view for code that needs one.
 
 *Call graph*: calls 1 internal fn (turn_metadata_payload); 1 external calls (to_value).
 
@@ -230,11 +234,11 @@ fn turn_metadata_value(&self) -> Option<Value>
 fn client_metadata(&self) -> HashMap<String, String>
 ```
 
-**Purpose**: Builds the flat `client_metadata` map sent with Responses requests, including compatibility projections of the canonical metadata snapshot.
+**Purpose**: Creates the flat client_metadata map sent with a Responses API request. This includes core identifiers and, when available, the full x-codex-turn-metadata JSON blob.
 
-**Data flow**: It starts a `HashMap<String, String>` with installation ID, session ID, thread ID, and window ID under specific header/key names. It conditionally inserts `turn_id`, `x-openai-subagent`, and parent thread ID when present, and if `has_turn_metadata()` is true and `turn_metadata_json()` succeeds, it inserts the serialized blob under `x-codex-turn-metadata`. It returns the completed map without mutating `self`.
+**Data flow**: It reads the metadata object and starts a string-to-string map with installation ID, session ID, thread ID, and window ID. It adds optional fields such as turn ID, subagent header, parent thread ID, and the serialized turn metadata when those are present. The finished map is returned.
 
-**Call relations**: This method is used by request builders such as `build_responses_request` and websocket metadata assembly in `build_ws_client_metadata`. It depends on `has_turn_metadata` and `turn_metadata_json` to decide whether to include the canonical turn metadata projection.
+**Call relations**: Request-building code calls this when constructing normal Responses requests or WebSocket client metadata. It packages the metadata into the format expected by the API client.
 
 *Call graph*: calls 2 internal fn (has_turn_metadata, turn_metadata_json); called by 2 (build_responses_request, build_ws_client_metadata); 1 external calls (from).
 
@@ -245,11 +249,11 @@ fn client_metadata(&self) -> HashMap<String, String>
 fn compatibility_headers(&self) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds direct HTTP headers that mirror selected metadata fields for older or compatibility-oriented consumers. It intentionally treats these headers as projections of the canonical metadata object, not independent sources of truth.
+**Purpose**: Creates older-style HTTP headers that mirror selected metadata fields. These headers exist for compatibility, while newer consumers should prefer the client_metadata form.
 
-**Data flow**: It creates a new `http::HeaderMap`, inserts the window ID header unconditionally, then conditionally inserts `x-codex-turn-metadata`, parent thread ID, and subagent headers when those values are present and serializable. Header insertion is delegated to `insert_header`, which silently skips invalid header values. The method returns the populated `HeaderMap`.
+**Data flow**: It starts with an empty HTTP header map. It inserts the window ID, optionally inserts the serialized turn metadata, and also adds parent-thread and subagent headers when present. Invalid header values are quietly skipped by insert_header, and the finished header map is returned.
 
-**Call relations**: This method is called by `build_responses_compatibility_headers` when constructing outbound HTTP requests. It mirrors the same turn-metadata gating used by `client_metadata` and delegates actual header parsing/insertion to `insert_header`.
+**Call relations**: The compatibility-header builder calls this when an outgoing request still needs direct HTTP headers. It reuses the same turn_metadata_json output as client_metadata, so both formats come from the same source.
 
 *Call graph*: calls 3 internal fn (has_turn_metadata, turn_metadata_json, insert_header); called by 1 (build_responses_compatibility_headers); 1 external calls (new).
 
@@ -260,11 +264,11 @@ fn compatibility_headers(&self) -> ApiHeaderMap
 fn turn_metadata_payload(&self) -> CodexTurnMetadataPayload<'_>
 ```
 
-**Purpose**: Assembles the canonical borrowed payload object that all turn-metadata serialization flows use. It encodes the file's key inclusion rules, especially around request kind and identity suppression.
+**Purpose**: Assembles the structured contents of the Codex turn metadata blob. It decides exactly which fields belong in the JSON before serialization happens.
 
-**Data flow**: It reads all fields from `self`, derives `(request_kind_value, compaction)` from `self.request_kind` via `CodexResponsesRequestKind::metadata`, computes `has_turn_identity` and `has_request_identity` using `CodexResponsesRequestKind::has_turn_identity`, and constructs a `CodexTurnMetadataPayload<'_>`. Identity fields such as installation ID and window ID are included only when appropriate; `turn_id` is flattened from `Option<Option<&str>>`; `workspaces` is passed through `non_empty_workspaces` so empty maps serialize as absent; and `extra` is flattened into the payload. It returns the borrowed payload object.
+**Data flow**: It reads the metadata object, translates the request kind into a label and optional compaction details, and decides whether turn identity fields should be included. It includes workspace data only when the workspace map is not empty, carries through extra metadata, and returns a lightweight payload object that borrows from the original metadata.
 
-**Call relations**: This internal method is the shared source for both `turn_metadata_json` and `turn_metadata_value`. It delegates only the empty-workspace suppression to `non_empty_workspaces`; all other shaping logic lives here.
+**Call relations**: turn_metadata_json and turn_metadata_value call this before converting metadata into JSON. It is the central rulebook for what appears inside x-codex-turn-metadata.
 
 *Call graph*: calls 1 internal fn (non_empty_workspaces); called by 2 (turn_metadata_json, turn_metadata_value).
 
@@ -275,11 +279,11 @@ fn turn_metadata_payload(&self) -> CodexTurnMetadataPayload<'_>
 fn subagent_header_value(session_source: &SessionSource) -> Option<String>
 ```
 
-**Purpose**: Translates a `SessionSource` into the legacy string value used for the `x-openai-subagent` header. It preserves known labels for specific subagent and internal memory-consolidation sources.
+**Purpose**: Converts a session source into the short subagent header value used on requests. This tells the receiving side whether the request came from a review agent, compact agent, memory consolidation, thread spawn, or another labeled subagent.
 
-**Data flow**: It pattern-matches on `&SessionSource` and returns `Some(String)` for subagent-related sources such as review, compact, memory consolidation, thread spawn, or custom `Other(label)` values; for CLI, VSCode, Exec, MCP, Custom, and Unknown sources it returns `None`. It clones or constructs the returned string as needed.
+**Data flow**: It receives a SessionSource. If the source represents a subagent or internal memory consolidation, it returns the appropriate text label. If the source is a normal client such as CLI, VS Code, exec, MCP, custom, or unknown, it returns nothing.
 
-**Call relations**: This helper is used while building metadata and headers in flows such as `build_subagent_headers`, `responses_metadata`, and `detached_memory_responses_metadata`. It provides the compatibility header representation, distinct from the richer metadata kind.
+**Call relations**: Metadata-building and subagent-header code call this when preparing request metadata. Its result may be stored in CodexResponsesMetadata and later emitted through client metadata or compatibility headers.
 
 *Call graph*: called by 4 (build_subagent_headers, responses_metadata, new, detached_memory_responses_metadata).
 
@@ -290,11 +294,11 @@ fn subagent_header_value(session_source: &SessionSource) -> Option<String>
 fn subagent_metadata_kind(session_source: &SessionSource) -> Option<String>
 ```
 
-**Purpose**: Extracts the normalized subagent kind string for inclusion in structured turn metadata. Unlike the header helper, it only emits values for actual `SubAgent` session sources.
+**Purpose**: Extracts the broader subagent kind for the structured turn metadata blob. This is separate from the HTTP-style subagent header value.
 
-**Data flow**: It reads `&SessionSource`, returns `Some(subagent_source.kind().to_string())` for `SessionSource::SubAgent(_)`, and `None` for all other source categories including internal sessions. It allocates only the returned string.
+**Data flow**: It receives a SessionSource. If the source is a SubAgent, it asks that subagent source for its kind and returns it as text. For normal, internal, custom, or unknown sources, it returns nothing.
 
-**Call relations**: This function is called during metadata construction in `new`-style metadata assembly paths to populate `subagent_kind`. It complements `subagent_header_value` by feeding the canonical metadata blob rather than the compatibility header.
+**Call relations**: Metadata construction code calls this when filling CodexResponsesMetadata. The resulting value can later be included in the turn metadata payload as subagent_kind.
 
 *Call graph*: called by 1 (new).
 
@@ -305,11 +309,11 @@ fn subagent_metadata_kind(session_source: &SessionSource) -> Option<String>
 fn insert_header(headers: &mut ApiHeaderMap, name: &'static str, value: &str)
 ```
 
-**Purpose**: Safely inserts a string header into an HTTP header map only when the value can be parsed as a valid `HeaderValue`. Invalid values are dropped rather than causing request construction to fail.
+**Purpose**: Safely inserts one string value into an HTTP header map. It avoids adding the header if the value cannot legally be used as an HTTP header value.
 
-**Data flow**: It takes a mutable `ApiHeaderMap`, a static header name, and a string value. It attempts `HeaderValue::from_str(value)` and, on success, inserts the parsed value into the map; on failure it performs no insertion and returns `()`. The only mutation is to the provided header map.
+**Data flow**: It receives a mutable header map, a header name, and a string value. It tries to convert the string into an HTTP HeaderValue. If that succeeds, it inserts the header into the map; if it fails, the map is left unchanged for that header.
 
-**Call relations**: This helper is used exclusively by `CodexResponsesMetadata::compatibility_headers` to centralize header validation and insertion. It prevents malformed metadata strings from poisoning the entire header set.
+**Call relations**: compatibility_headers uses this helper for every compatibility header it emits. This keeps header creation safe and keeps invalid metadata values from breaking request construction.
 
 *Call graph*: called by 1 (compatibility_headers); 2 external calls (insert, from_str).
 
@@ -320,11 +324,11 @@ fn insert_header(headers: &mut ApiHeaderMap, name: &'static str, value: &str)
 fn filter_extra_metadata(extra: HashMap<String, String>) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Removes caller-supplied metadata entries that would collide with Codex-owned keys or compatibility header names. It enforces the invariant that external metadata can enrich but not override core metadata.
+**Purpose**: Removes caller-provided metadata entries that try to use Codex-reserved names. This protects core request fields from being overwritten by extra app-server metadata.
 
-**Data flow**: It takes an owned `HashMap<String, String>`, iterates through its entries, filters out any whose key appears in `RESERVED_METADATA_KEYS`, and collects the survivors into a `BTreeMap<String, String>`. It returns that filtered map.
+**Data flow**: It receives a HashMap of extra string metadata. It walks through every key-value pair and keeps only entries whose key is not in the reserved list. It returns the filtered entries in a sorted BTreeMap.
 
-**Call relations**: This function is called by `set_responsesapi_client_metadata` when extra metadata enters turn state. Its output later becomes the flattened `extra` portion of `CodexTurnMetadataPayload`.
+**Call relations**: set_responsesapi_client_metadata calls this when accepting extra metadata from outside callers. The filtered result can then be merged into the turn metadata blob without risking conflicts with Codex-owned fields.
 
 *Call graph*: called by 1 (set_responsesapi_client_metadata).
 
@@ -337,24 +341,24 @@ fn non_empty_workspaces(
 ) -> Option<&BTreeMap<String, TurnMetadataWorkspace>>
 ```
 
-**Purpose**: Converts an empty workspace map into `None` so serialization omits the field entirely. Non-empty maps are passed through by reference.
+**Purpose**: Includes workspace metadata only when there is something to say. This keeps the serialized JSON from containing an empty workspaces field.
 
-**Data flow**: It reads a borrowed `BTreeMap<String, TurnMetadataWorkspace>` and returns `Some(&map)` when the map is non-empty or `None` when it is empty. It performs no allocation or mutation.
+**Data flow**: It receives the workspace map by reference. If the map is empty, it returns nothing. If the map has entries, it returns a reference to that same map.
 
-**Call relations**: This helper is called only by `CodexResponsesMetadata::turn_metadata_payload` to implement `skip_serializing_if` behavior for workspace metadata without cloning the map.
+**Call relations**: turn_metadata_payload calls this while building the metadata blob. It is a small cleanup step that keeps outgoing metadata compact and avoids meaningless empty fields.
 
 *Call graph*: called by 1 (turn_metadata_payload).
 
 
 ### `codex-api/src/requests/responses.rs`
 
-`domain_logic` · `request payload preparation`
+`io_transport` · `request handling`
 
-This file is small but important for request fidelity. The `Compression` enum is the API-facing choice for request-body compression, with `None` as the default and `Zstd` as the only compressed option. Higher layers can expose this enum without leaking transport-specific details.
+This file sits at the boundary between the project’s internal Rust data and the JSON sent to an API. JSON is a flexible text-like format used for exchanging data, while `ResponseItem` is the project’s structured Rust version of a response item. When the system turns structured items into JSON, some item IDs may need to be copied back onto the outgoing JSON so the API can recognize or continue tracking the same conversation pieces. Without this step, later parts of the conversation could lose their identity, a bit like mailing several forms without their reference numbers attached.
 
-The main behavior is `attach_item_ids`, which mutates a JSON payload before it is sent to the Responses API. The function expects the payload to contain an `input` field that is a JSON array aligned positionally with the original `&[ResponseItem]` slice used to build the payload. If either assumption fails—missing `input`, non-array `input`, non-object array elements—it exits quietly rather than erroring.
+The file also defines a small `Compression` choice, saying whether data should be left uncompressed or compressed with Zstandard (`Zstd`, a common compression method that makes data smaller). In the shown code, this is just a simple option type, not active behavior.
 
-For each zipped pair of serialized JSON value and original `ResponseItem`, it selectively copies the item's `id` into the outgoing JSON object. Only item variants that can carry stable IDs are considered: `Reasoning`, `Message` with `Some(id)`, `WebSearchCall`, `FunctionCall`, `ToolSearchCall`, `LocalShellCall`, and `CustomToolCall`, each requiring a present non-empty ID. Empty IDs are intentionally skipped. This logic is especially relevant for providers such as Azure that expect stored input items to retain explicit IDs even if the default serializer omitted them.
+The key function, `attach_item_ids`, looks inside a JSON payload for an `input` array. It then walks through that JSON array side by side with the original `ResponseItem` list. For item kinds that can carry an ID, it copies a non-empty ID into the matching JSON object. It is deliberately cautious: if the payload does not have the expected shape, or an ID is missing or empty, it simply leaves that part unchanged.
 
 #### Function details
 
@@ -364,20 +368,24 @@ For each zipped pair of serialized JSON value and original `ResponseItem`, it se
 fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem])
 ```
 
-**Purpose**: Copies stable item IDs from the original typed `ResponseItem` list into the serialized JSON request payload's `input` array. It only touches item variants that meaningfully support IDs and skips empty IDs.
+**Purpose**: This function copies known item IDs from the original structured response items into the matching JSON objects in an outgoing payload. It is used so the JSON sent onward preserves the identity of messages, tool calls, reasoning items, and similar conversation pieces.
 
-**Data flow**: Takes mutable access to `payload_json` and a borrowed slice of `original_items`. It looks up `payload_json["input"]`, returns early if absent or not a `Value::Array`, then iterates `items.iter_mut().zip(original_items.iter())`. For matching `ResponseItem` variants with a non-empty `id`, it mutates the corresponding JSON object by inserting an `"id"` field containing a cloned `Value::String`.
+**Data flow**: It receives a mutable JSON payload and a list of original `ResponseItem` values. It looks for an `input` field in the JSON, checks that it is an array, then pairs each JSON array entry with the corresponding original item. If the original item has a non-empty ID and the JSON entry is an object, it inserts that ID into the JSON object. The function returns nothing; its result is the changed JSON payload.
 
-**Call relations**: This helper is used during Responses request construction when the serialized payload needs to preserve item identity from the original typed request model.
+**Call relations**: This function is called during request preparation, after the system already has both the JSON payload and the original response items. Internally it uses standard JSON and collection operations to find the `input` field, walk through the items, and create string keys when inserting IDs. It does not call other project-specific helpers; it acts as a small final repair step before the payload moves on.
 
 *Call graph*: 3 external calls (String, get_mut, iter).
 
 
 ### `tools/src/responses_api.rs`
 
-`io_transport` · `tool spec serialization and API adaptation`
+`io_transport` · `tool registration and request preparation`
 
-This module is the translation layer between internal tool metadata and the JSON shape expected by the Responses API. It defines several serializable structs and enums: `FreeformTool` and `FreeformToolFormat` for freeform tools, `ResponsesApiTool` for function-style tools, `LoadableToolSpec` as a tagged enum that can be either a top-level function or a namespace, `ResponsesApiNamespace` for grouped tools, and `ResponsesApiNamespaceTool` for tools nested inside a namespace. Serialization details matter here: `LoadableToolSpec` and `ResponsesApiNamespaceTool` use `#[serde(tag = "type")]`, `ResponsesApiTool.defer_loading` is omitted when `None`, and `output_schema` is skipped entirely during serialization even though it is retained in memory. The conversion functions all funnel through `tool_definition_to_responses_api_tool`, which copies name, description, input schema, and output schema from `ToolDefinition`, forces `strict` to `false`, and maps the internal boolean `defer_loading` into `Option<bool>` so only `true` serializes. `dynamic_tool_to_responses_api_tool` parses a `DynamicToolFunctionSpec`, while the MCP adapters parse an `rmcp::model::Tool`, rename it to the externally chosen `ToolName`, and optionally mark it deferred by clearing output schema and setting defer-loading. `coalesce_loadable_tool_specs` preserves order while merging namespace entries that share the same namespace name by appending child tools into the first matching namespace encountered.
+The system has tools from more than one source. Some are dynamic tools defined by the Codex protocol, and some come from MCP, the Model Context Protocol, which is a standard way for external services to offer tools. The Responses API expects these tools to be described in a particular format: each tool needs a name, a description, input parameters as a JSON schema, and a few extra flags.
+
+This file provides the shared structures for that API-facing shape, such as `ResponsesApiTool`, `LoadableToolSpec`, and `ResponsesApiNamespace`. A namespace is a named group of tools, like a labeled drawer in a toolbox. The file also contains conversion functions that take a tool from another format, parse it into the project's common `ToolDefinition`, and then turn that into a `ResponsesApiTool`.
+
+One important behavior is namespace coalescing. If several tool groups have the same namespace name, `coalesce_loadable_tool_specs` merges their tool lists instead of leaving duplicate namespaces. Without this file, the rest of the system would need to know the details of every tool source and the exact JSON layout expected by the Responses API, which would make tool loading harder to keep consistent.
 
 #### Function details
 
@@ -387,11 +395,11 @@ This module is the translation layer between internal tool metadata and the JSON
 fn default_namespace_description(namespace_name: &str) -> String
 ```
 
-**Purpose**: Generates the fallback human-readable description for a namespace when no custom description is supplied. The wording is fixed and derived solely from the namespace name.
+**Purpose**: Creates a simple fallback description for a group of tools when no custom description is supplied. This keeps namespace descriptions predictable and human-readable.
 
-**Data flow**: Accepts `namespace_name: &str`, interpolates it into the string `"Tools in the {namespace_name} namespace."`, and returns the resulting `String` without mutating any external state.
+**Data flow**: It receives a namespace name as text. It inserts that name into the sentence "Tools in the ... namespace." and returns the finished sentence.
 
-**Call relations**: This is a small helper used wherever namespace specs need a default description. It does not call into other module logic beyond string formatting.
+**Call relations**: This is a small helper used when building Responses API namespace information. It does not call into the rest of this file; it only formats a standard description string.
 
 *Call graph*: 1 external calls (format!).
 
@@ -404,11 +412,11 @@ fn dynamic_tool_to_responses_api_tool(
 ) -> Result<ResponsesApiTool, serde_json::Error>
 ```
 
-**Purpose**: Converts a dynamic tool function spec from protocol form into a `ResponsesApiTool`. It first normalizes the dynamic spec into the crate’s internal `ToolDefinition` and then maps that into the Responses API shape.
+**Purpose**: Turns a dynamic Codex tool description into a tool description suitable for the Responses API. Someone would use it when a tool is defined dynamically but still needs to be advertised to the API in the standard format.
 
-**Data flow**: Takes `&DynamicToolFunctionSpec`, passes it to `parse_dynamic_tool` to deserialize and validate its input schema into a `ToolDefinition`, then feeds the result into `tool_definition_to_responses_api_tool`. Returns `Result<ResponsesApiTool, serde_json::Error>`, propagating parse failures unchanged.
+**Data flow**: It receives a `DynamicToolFunctionSpec`, which is the Codex protocol's description of a tool. It first asks `parse_dynamic_tool` to turn that into the project's common `ToolDefinition`; if that parsing fails, the error is returned. If parsing succeeds, it passes the common definition into `tool_definition_to_responses_api_tool` and returns the resulting `ResponsesApiTool`.
 
-**Call relations**: This adapter is one of the public entry points into the module’s conversion pipeline. It delegates parsing to `parse_dynamic_tool` and relies on `tool_definition_to_responses_api_tool` for the final field mapping.
+**Call relations**: This function sits at the edge between dynamic tool definitions and the Responses API format. It relies on `parse_dynamic_tool` to understand the incoming dynamic format, then hands the normalized result to `tool_definition_to_responses_api_tool` for the final API-facing conversion.
 
 *Call graph*: calls 1 internal fn (tool_definition_to_responses_api_tool); 1 external calls (parse_dynamic_tool).
 
@@ -421,11 +429,11 @@ fn coalesce_loadable_tool_specs(
 ) -> Vec<LoadableToolSpec>
 ```
 
-**Purpose**: Merges multiple `LoadableToolSpec` values into a single list where namespaces with the same name are combined. Top-level function specs are preserved as independent entries.
+**Purpose**: Combines tool specifications so that namespaces with the same name are merged into one namespace. This prevents the final tool list from containing several separate groups with the same label.
 
-**Data flow**: Consumes any iterator of `LoadableToolSpec` and builds a new `Vec<LoadableToolSpec>`. For each `Function`, it pushes the spec directly. For each `Namespace`, it searches the accumulated vector for an existing namespace with the same `name`; if found, it appends the incoming namespace’s `tools` into the existing namespace’s `tools`, otherwise it pushes the namespace as a new entry. Returns the coalesced vector.
+**Data flow**: It receives any iterable collection of `LoadableToolSpec` values. It walks through them in order. Plain function tools are copied into the output as-is. Namespace specs are either added as new namespaces or, if a namespace with the same name already exists, their tools are appended to the existing namespace. It returns the cleaned-up list.
 
-**Call relations**: This function sits after individual tool specs have already been constructed and before they are serialized or exposed. It does not parse tools itself; instead it organizes already-built `LoadableToolSpec` values into a more compact namespace layout.
+**Call relations**: This function is used after tools have already been shaped as loadable Responses API specs. It does not convert individual tools; instead, it organizes the list so later code can send or load a simpler, consolidated set of tool groups.
 
 *Call graph*: 3 external calls (new, Function, Namespace).
 
@@ -439,11 +447,11 @@ fn mcp_tool_to_responses_api_tool(
 ) -> Result<ResponsesApiTool, serde_json::Error>
 ```
 
-**Purpose**: Converts an MCP tool into a non-deferred `ResponsesApiTool`, renaming it to the externally selected `ToolName`. It preserves output schema information from the parsed MCP definition.
+**Purpose**: Turns an MCP tool into a normal Responses API tool description. It also applies the project’s chosen tool name, which may differ from the original name supplied by the MCP server.
 
-**Data flow**: Accepts a `&ToolName` and `&rmcp::model::Tool`, parses the MCP tool with `parse_mcp_tool` into a `ToolDefinition`, replaces the definition’s name via `renamed(tool_name.name.clone())`, and converts the result with `tool_definition_to_responses_api_tool`. Returns a `Result`, forwarding any JSON/schema parse error.
+**Data flow**: It receives a `ToolName` and an MCP `Tool`. It asks `parse_mcp_tool` to convert the MCP tool into the project's common `ToolDefinition`; if that fails, the error is returned. It then renames the parsed definition to match `ToolName`, converts it with `tool_definition_to_responses_api_tool`, and returns the finished API tool.
 
-**Call relations**: This is the standard MCP conversion path used when the tool should be fully described up front. It delegates schema extraction to `parse_mcp_tool`, name rewriting to `ToolDefinition::renamed`, and final API-shape mapping to `tool_definition_to_responses_api_tool`.
+**Call relations**: This function is the normal path for MCP tools that should be fully described up front. It depends on `parse_mcp_tool` to understand the MCP format, then uses `tool_definition_to_responses_api_tool` to produce the Responses API structure.
 
 *Call graph*: calls 1 internal fn (tool_definition_to_responses_api_tool); 1 external calls (parse_mcp_tool).
 
@@ -457,11 +465,11 @@ fn mcp_tool_to_deferred_responses_api_tool(
 ) -> Result<ResponsesApiTool, serde_json::Error>
 ```
 
-**Purpose**: Converts an MCP tool into a deferred-loading `ResponsesApiTool`. Compared with the non-deferred path, it explicitly strips output schema and marks the tool as deferred before serialization.
+**Purpose**: Turns an MCP tool into a Responses API tool description marked for deferred loading. Deferred loading means the tool details can be treated as not fully loaded until later, which is useful when tools are discovered or expanded lazily.
 
-**Data flow**: Takes `&ToolName` and `&rmcp::model::Tool`, parses the MCP tool, renames it to `tool_name.name.clone()`, then calls `into_deferred()` on the `ToolDefinition` to clear `output_schema` and set `defer_loading = true`. The transformed definition is then mapped into `ResponsesApiTool` and returned as `Result<ResponsesApiTool, serde_json::Error>`.
+**Data flow**: It receives a `ToolName` and an MCP `Tool`. It parses the MCP tool into a common `ToolDefinition`, renames it to the project’s chosen name, marks it as deferred, and then converts it into a `ResponsesApiTool`. If parsing fails, it returns the JSON-related error instead of a tool.
 
-**Call relations**: This function is the deferred counterpart to `mcp_tool_to_responses_api_tool`. It follows the same parse-and-rename pipeline but inserts the `ToolDefinition::into_deferred` transformation before the final conversion.
+**Call relations**: This is the deferred-loading version of `mcp_tool_to_responses_api_tool`. Like the normal version, it starts with `parse_mcp_tool` and finishes through `tool_definition_to_responses_api_tool`, but it changes the intermediate tool definition so the final API object carries the deferred-loading flag.
 
 *Call graph*: calls 1 internal fn (tool_definition_to_responses_api_tool); 1 external calls (parse_mcp_tool).
 
@@ -472,24 +480,26 @@ fn mcp_tool_to_deferred_responses_api_tool(
 fn tool_definition_to_responses_api_tool(tool_definition: ToolDefinition) -> ResponsesApiTool
 ```
 
-**Purpose**: Performs the direct field-by-field conversion from the crate’s internal `ToolDefinition` into the Responses API function-tool struct. It centralizes the mapping used by all higher-level adapters.
+**Purpose**: Converts the project's common internal tool description into the exact structure used for the Responses API. This is the central final step shared by the other conversion functions.
 
-**Data flow**: Consumes a `ToolDefinition`, moving out its `name`, `description`, `input_schema`, and `output_schema`. It constructs and returns a `ResponsesApiTool` with `strict` hard-coded to `false`, `defer_loading` set to `Some(true)` only when `tool_definition.defer_loading` is true, and `parameters` populated from `input_schema`.
+**Data flow**: It receives a `ToolDefinition` containing the tool name, description, input JSON schema, optional output schema, and deferred-loading setting. It copies those fields into a new `ResponsesApiTool`, sets `strict` to false, turns the deferred-loading boolean into an optional API field, and returns the new tool object.
 
-**Call relations**: This is the common sink for `dynamic_tool_to_responses_api_tool`, `mcp_tool_to_responses_api_tool`, and `mcp_tool_to_deferred_responses_api_tool`. Those callers handle parsing and optional renaming/deferment; this function only performs the final structural mapping.
+**Call relations**: This function is called by the dynamic-tool and MCP-tool conversion paths after they have parsed their source-specific formats. It is the common exit point that ensures all tool sources end up with the same Responses API shape.
 
 *Call graph*: called by 3 (dynamic_tool_to_responses_api_tool, mcp_tool_to_deferred_responses_api_tool, mcp_tool_to_responses_api_tool).
 
 
 ### `codex-api/src/api_bridge.rs`
 
-`domain_logic` · `error handling`
+`domain_logic` · `request handling`
 
-This file is the boundary between `codex-api`'s internal `ApiError`/`TransportError` types and the protocol-facing `CodexErr` enum consumed by callers. The main function, `map_api_error`, performs a large pattern match over semantic API errors first, then drills into HTTP transport failures by status code and sometimes by JSON body contents or response headers.
+When Codex talks to an API, many things can go wrong: the request may be too large, the server may be overloaded, the user may have hit a usage limit, the network may time out, or the API may return a detailed error hidden inside a JSON body or an HTTP header. This file is the translator for those situations.
 
-Several branches contain nuanced behavior. A 503 with JSON error code `server_is_overloaded` or `slow_down` is normalized to `CodexErr::ServerOverloaded`. A 400 body is parsed for `error.code == "cyber_policy"`; if present, it extracts a non-empty message or falls back to a fixed cybersecurity warning. Another 400 special-case recognizes the invalid-image text emitted by image endpoints. For 429 responses, the code attempts to deserialize a `UsageErrorResponse`; `usage_limit_reached` becomes `UsageLimitReachedError` enriched with plan type, reset timestamp, parsed rate-limit snapshot, promo message, and reached-type metadata from headers, while `usage_not_included` maps separately. Unrecognized 429s become `RetryLimitReachedError` with a tracking ID.
+Its main job is to take an internal `ApiError` and convert it into a `CodexErr`, which is the error shape expected by the rest of the Codex system. Think of it like an interpreter at a help desk: it listens to many different ways the API can say “no” or “try later,” then rewrites that into a standard form the application knows how to display or react to.
 
-Helper functions encapsulate header lookup precedence: request IDs prefer `x-request-id` then `x-oai-request-id`, tracking IDs fall back to `cf-ray`, and `x-error-json` is base64-decoded and parsed to extract an identity error code. The result is a single place where wire-level quirks are normalized into stable protocol errors.
+The most important function, `map_api_error`, looks at the kind of failure and preserves useful details where it can. For example, it recognizes when a 429 “too many requests” response is really a usage-limit problem, extracts reset times and plan information, and includes rate-limit details from headers. It also catches special cases such as server overload, invalid image uploads, cybersecurity policy blocks, request timeouts, and unexpected statuses.
+
+The smaller helper functions read useful tracking information from HTTP headers, such as request IDs or Cloudflare ray IDs. Those IDs matter because they help support teams and logs connect a user-visible failure to the exact request that failed.
 
 #### Function details
 
@@ -499,11 +509,11 @@ Helper functions encapsulate header lookup precedence: request IDs prefer `x-req
 fn map_api_error(err: ApiError) -> CodexErr
 ```
 
-**Purpose**: Converts an `ApiError` into the externally exposed `CodexErr`, including status-specific HTTP decoding and header/body enrichment.
+**Purpose**: This function converts an `ApiError` into a `CodexErr`, which is the error format used outside the API layer. It keeps important details such as status codes, retry information, usage-limit reset times, and request tracking IDs so the caller can respond properly.
 
-**Data flow**: Consumes an `ApiError` and pattern-matches it. Simple semantic variants map directly to corresponding `CodexErr` variants. For `ApiError::Transport`, it inspects the nested `TransportError`: HTTP errors read status, optional URL, optional headers, and optional body text; parse JSON bodies for overload, cyber-policy, and usage-limit cases; extract request IDs, Cloudflare ray IDs, authorization error headers, and base64-encoded identity error codes; and build structured `UnexpectedResponseError`, `UsageLimitReachedError`, or `RetryLimitReachedError` values. It returns a fully translated `CodexErr` and writes no shared state.
+**Data flow**: It receives one API-side error. It inspects the error kind, and for HTTP failures it also reads the status code, response body, URL, and headers. It then matches known cases such as bad requests, server overload, rate limits, timeouts, and policy blocks, sometimes parsing JSON from the response body or headers. The result is a single `CodexErr` value that carries the clearest available explanation and any useful supporting details.
 
-**Call relations**: This is the file's central adapter and the only consumer of the helper extraction functions. It delegates repeated header parsing to `extract_header`, `extract_request_id`, `extract_request_tracking_id`, and `extract_x_error_json_code` so the status-handling branches stay focused on mapping logic.
+**Call relations**: This is the central bridge function in the file. When it needs extra information from HTTP headers, it asks `extract_header`, `extract_request_id`, `extract_request_tracking_id`, or `extract_x_error_json_code` to pull out those details. It also uses rate-limit parsing helpers from the rate limit module when a usage limit has been reached, so the final error can include more than just “too many requests.”
 
 *Call graph*: calls 4 internal fn (extract_header, extract_request_id, extract_request_tracking_id, extract_x_error_json_code); 7 external calls (matches!, InvalidImageRequest, InvalidRequest, RetryLimit, Stream, UnexpectedStatus, UsageLimitReached).
 
@@ -514,11 +524,11 @@ fn map_api_error(err: ApiError) -> CodexErr
 fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String>
 ```
 
-**Purpose**: Finds the best available request-tracking identifier for retry-limit style errors.
+**Purpose**: This function finds the best available ID for tracking a failed request. It first looks for a normal request ID, and if that is missing it falls back to the Cloudflare ray ID, another identifier that can help trace a request through infrastructure.
 
-**Data flow**: Takes optional response headers, first asks `extract_request_id` for a canonical request ID, and if absent falls back to the `cf-ray` header via `extract_header`. It returns `Option<String>` and does not mutate state.
+**Data flow**: It receives optional HTTP headers. It asks `extract_request_id` for the preferred request identifier. If that returns nothing, it tries to read the `cf-ray` header instead. It returns either a tracking string or nothing if no useful header is present.
 
-**Call relations**: Called only from `map_api_error` when constructing `RetryLimitReachedError`, where either a request ID or Cloudflare ray ID is useful for support/debugging.
+**Call relations**: It is called by `map_api_error` when building retry-limit errors. In that situation, the caller may not need all response details, but it still benefits from a compact tracking ID that can be shown in logs or support messages.
 
 *Call graph*: calls 1 internal fn (extract_request_id); called by 1 (map_api_error).
 
@@ -529,11 +539,11 @@ fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String>
 fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String>
 ```
 
-**Purpose**: Extracts the canonical request ID from response headers using the preferred header order.
+**Purpose**: This function looks for the standard request identifier headers used by the API. It checks both the common request ID header and an OpenAI-specific alternative.
 
-**Data flow**: Reads optional headers and tries `x-request-id` first, then `x-oai-request-id`, returning the first successfully decoded header value as an owned `String`. No state is modified.
+**Data flow**: It receives optional HTTP headers. It tries to read `x-request-id`; if that is not present or not readable, it tries `x-oai-request-id`. It returns the first valid string it finds, or nothing if neither header is available.
 
-**Call relations**: Used directly by `map_api_error` for unexpected-status errors and indirectly by `extract_request_tracking_id` to preserve the preferred request-ID precedence.
+**Call relations**: It is used directly by `map_api_error` when reporting unexpected HTTP statuses, and indirectly through `extract_request_tracking_id` for retry-limit errors. It relies on `extract_header` for the actual safe reading of a named header.
 
 *Call graph*: calls 1 internal fn (extract_header); called by 2 (extract_request_tracking_id, map_api_error).
 
@@ -544,11 +554,11 @@ fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String>
 fn extract_header(headers: Option<&HeaderMap>, name: &str) -> Option<String>
 ```
 
-**Purpose**: Safely reads a named HTTP header as UTF-8 text.
+**Purpose**: This small helper safely reads one named HTTP header as text. It avoids crashes or invalid text by returning nothing when the header is missing or cannot be converted into a normal string.
 
-**Data flow**: Given optional `HeaderMap` and a header name, it looks up the header, attempts `to_str()`, and converts the result into an owned `String`. Invalid or missing headers yield `None` rather than an error.
+**Data flow**: It receives optional HTTP headers and the name of the header to read. If the headers exist, it looks up that name, checks that the value is valid text, and copies it into a new string. The output is either that string or nothing.
 
-**Call relations**: This is the low-level helper used by all other extraction functions and by `map_api_error` itself for fields like active limit ID, Cloudflare ray, and authorization error details.
+**Call relations**: This is the basic header-reading tool used by the rest of the file. `map_api_error` calls it for details such as Cloudflare ray IDs and authorization errors, `extract_request_id` uses it to check request ID headers, and `extract_x_error_json_code` uses it before decoding the special error header.
 
 *Call graph*: called by 3 (extract_request_id, extract_x_error_json_code, map_api_error).
 
@@ -559,11 +569,11 @@ fn extract_header(headers: Option<&HeaderMap>, name: &str) -> Option<String>
 fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String>
 ```
 
-**Purpose**: Decodes the `x-error-json` header and extracts the nested `error.code` field when present.
+**Purpose**: This function reads a special header that contains encoded JSON error information and extracts the error code from it. It is used when the API has put structured error details in a header instead of only in the response body.
 
-**Data flow**: Reads the `x-error-json` header via `extract_header`, base64-decodes it, parses the decoded bytes as JSON `Value`, navigates to `error.code`, and returns that string if all steps succeed. Any missing header, invalid base64, invalid JSON, or absent code produces `None`.
+**Data flow**: It receives optional HTTP headers. It first reads the `x-error-json` header, then decodes it from base64, which is a text-safe way to pack raw data into a header. It parses the decoded bytes as JSON and looks for `error.code`. If every step succeeds, it returns that code as text; if any step fails, it returns nothing.
 
-**Call relations**: Used by `map_api_error` when building `UnexpectedResponseError` for identity/auth failures, allowing callers to see a structured backend error code even when it is only present in encoded header metadata.
+**Call relations**: It is called by `map_api_error` while building an unexpected-status error. That lets the final `CodexErr` carry an identity or authorization error code when the server supplied one in this encoded header.
 
 *Call graph*: calls 1 internal fn (extract_header); called by 1 (map_api_error).
 
@@ -575,11 +585,11 @@ These files implement the concrete HTTP, SSE, and WebSocket clients for Response
 
 `io_transport` · `request handling`
 
-This file defines `ResponsesClient<T>`, a thin endpoint-specific wrapper around `EndpointSession<T>` for the Responses API over HTTP with server-sent events. The client stores the shared session machinery plus optional SSE telemetry. `ResponsesOptions` carries per-request metadata such as `session_id`, `thread_id`, `session_source`, arbitrary extra headers, request compression, and an optional `OnceLock<String>` used to capture turn state returned by the server.
+This file is about one job: take a request for the Responses API, package it correctly, send it over HTTP, and return a live stream of events from the server. Without it, the rest of the system could build response requests, but it would not know how to address the right endpoint, add the right authentication/session headers, request streaming output, or decode the server’s event stream.
 
-There are two public streaming entrypoints. `stream_request` accepts a typed `ResponsesApiRequest`; it conditionally rewrites the JSON body for Azure's responses endpoint when `request.store` is true by serializing to `serde_json::Value`, calling `attach_item_ids` on `request.input`, and then encoding that modified body. Otherwise it encodes the typed request directly. It then mutates headers in a specific order: starts from caller-supplied headers, mirrors `thread_id` into `x-client-request-id`, extends with `build_session_headers(session_id, thread_id)`, and optionally adds `x-openai-subagent` derived from `session_source`.
+The main type is `ResponsesClient`. It owns an `EndpointSession`, which is the lower-level piece that knows how to talk to a provider using an HTTP transport and authentication. `ResponsesClient` adds Responses-specific behavior on top: it always posts to the `responses` path, asks for `text/event-stream` data, optionally compresses the request body, and can attach telemetry so the system can observe request and stream behavior.
 
-`stream` is the raw-JSON variant and simply encodes a provided `serde_json::Value`. Both paths converge in `stream_encoded`, which maps the crate's `Compression` enum to `codex_client::RequestCompression`, invokes `EndpointSession::stream_encoded_json_with` using `POST` to the fixed `responses` path, forces `Accept: text/event-stream`, and passes the resulting transport stream into `spawn_response_stream` along with provider idle timeout, optional SSE telemetry, and optional turn-state storage.
+There are two ways to send data. `stream_request` accepts a structured `ResponsesApiRequest` and builds the final JSON body and headers. It has special Azure behavior: when storing a response through Azure’s Responses endpoint, it adds item IDs into the JSON body before sending. `stream` is a more direct escape hatch for callers that already have raw JSON. Both routes end in `stream_encoded`, which does the common HTTP work and then starts the server-sent-event stream. A server-sent event stream is like a live news ticker: the server sends small pieces over time instead of one finished answer.
 
 #### Function details
 
@@ -589,11 +599,11 @@ There are two public streaming entrypoints. `stream_request` accepts a typed `Re
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a `ResponsesClient` bound to a transport, provider, and auth source, with SSE telemetry initially disabled. It is the standard factory for HTTP responses streaming.
+**Purpose**: Creates a new Responses API client from an HTTP transport, a provider description, and shared authentication. Callers use this when they are ready to talk to the Responses endpoint.
 
-**Data flow**: Consumes `transport: T`, `provider: Provider`, and `auth: SharedAuthProvider`, creates an `EndpointSession` from them, stores it in the client, and sets `sse_telemetry` to `None`. It returns the fully initialized `ResponsesClient<T>`.
+**Data flow**: It receives the network transport, provider settings, and authentication provider. It wraps them in an `EndpointSession`, starts with no streaming telemetry attached, and returns a ready-to-use `ResponsesClient`.
 
-**Call relations**: This constructor is used by callers and tests that need a fresh responses HTTP client. It delegates session setup to `EndpointSession::new`, after which later request methods reuse that shared session state.
+**Call relations**: Tests and higher-level setup code call this first to create the client. The client it returns is then used for streaming requests, including checks around authentication, retries, correct endpoint paths, and end-to-end streamed response parsing.
 
 *Call graph*: calls 1 internal fn (new); called by 8 (azure_default_store_attaches_ids_and_headers, responses_client_stream_request_preserves_exact_json_body, responses_client_uses_responses_path, streaming_client_adds_auth_headers, streaming_client_does_not_retry_auth_build_error, streaming_client_retries_on_transient_auth_error, streaming_client_retries_on_transport_error, responses_stream_parses_items_and_completed_end_to_end).
 
@@ -608,11 +618,11 @@ fn with_telemetry(
     ) -> Self
 ```
 
-**Purpose**: Returns a copy of the client configured with request-level telemetry and optional SSE telemetry hooks. It is a builder-style customization step rather than a mutating setter.
+**Purpose**: Returns a copy of the client with optional telemetry added. Telemetry means observation hooks that record what happened during requests and streamed responses.
 
-**Data flow**: Consumes `self`, plus optional `Arc<dyn RequestTelemetry>` and `Arc<dyn SseTelemetry>`. It replaces the embedded session with `self.session.with_request_telemetry(request)` and stores the provided SSE telemetry handle, returning a new `ResponsesClient<T>`.
+**Data flow**: It takes an existing client plus optional request telemetry and optional stream telemetry. It passes the request telemetry into the underlying session, stores the stream telemetry on the client, and returns the updated client.
 
-**Call relations**: This method is called after construction when the caller wants instrumentation around HTTP requests and SSE event processing. It delegates request telemetry wiring to `EndpointSession` and keeps SSE telemetry locally for later use in `stream_encoded`.
+**Call relations**: This is used after creating a client when the caller wants monitoring. Later, when a request is sent, the stored request telemetry is used by the session and the stored stream telemetry is passed into the response-stream machinery.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -627,11 +637,11 @@ async fn stream_request(
     ) -> Result<ResponseStream, ApiError>
 ```
 
-**Purpose**: Builds and sends a typed Responses API request over HTTP streaming, including Azure-specific body rewriting and session/subagent headers. It is the high-level typed entrypoint most callers use.
+**Purpose**: Sends a normal structured Responses API request and returns a live response stream. It is the main high-level method for callers that have a `ResponsesApiRequest` rather than raw JSON.
 
-**Data flow**: Accepts a `ResponsesApiRequest` and `ResponsesOptions`, destructures the options, then chooses how to encode the body. For Azure responses endpoints with `request.store == true`, it serializes the request to `Value`, mutates that JSON with `attach_item_ids(&mut body, &request.input)`, and encodes the modified value; otherwise it encodes the typed request directly. It then starts from `extra_headers`, optionally inserts `x-client-request-id` from `thread_id`, extends with `build_session_headers(session_id, thread_id)`, optionally inserts `x-openai-subagent` from `subagent_header(&session_source)`, and forwards the encoded body plus headers, compression, and turn-state sink to `stream_encoded`. It returns a `ResponseStream` or an `ApiError::Stream` if JSON encoding fails.
+**Data flow**: It receives the request plus options such as session ID, thread ID, source information, extra headers, compression choice, and shared turn state. It turns the request into JSON, adds Azure-specific item IDs when required, builds the needed headers, and then hands the encoded body and headers to `stream_encoded`. The output is either a `ResponseStream` or an API error explaining what failed.
 
-**Call relations**: This public method is the typed wrapper above `stream_encoded`. It consults `self.session.provider()` to detect Azure-specific behavior, uses header helpers to assemble request metadata, and then delegates the actual HTTP streaming setup to the shared lower-level method.
+**Call relations**: This method sits above `stream_encoded`. It prepares the Responses-specific request details first: encoding the request, adding session headers, adding a client request ID from the thread ID, and adding a subagent header when the session source calls for it. Once the request is fully prepared, it delegates the actual HTTP streaming work to `stream_encoded`.
 
 *Call graph*: calls 6 internal fn (stream_encoded, provider, build_session_headers, insert_header, subagent_header, encode); 2 external calls (attach_item_ids, to_value).
 
@@ -642,11 +652,11 @@ async fn stream_request(
 fn path() -> &'static str
 ```
 
-**Purpose**: Defines the fixed relative API path for this endpoint. It centralizes the literal so all request methods target the same route.
+**Purpose**: Gives the fixed API path used by this client: `responses`. Keeping it in one small function avoids repeating the endpoint string in multiple places.
 
-**Data flow**: Takes no arguments and returns the static string slice `"responses"`.
+**Data flow**: It takes no input and returns the static path string used for the Responses API endpoint.
 
-**Call relations**: This helper is used by `stream_encoded` when constructing the outbound POST request. Keeping it separate avoids repeating the endpoint path literal.
+**Call relations**: The lower-level sending code uses this when building the HTTP request. This keeps the client consistently pointed at the Responses endpoint.
 
 
 ##### `ResponsesClient::stream`  (lines 124–135)
@@ -661,11 +671,11 @@ async fn stream(
     ) -> Result<ResponseStre
 ```
 
-**Purpose**: Sends a raw JSON body to the Responses streaming endpoint without typed request preprocessing. It is the lower-friction variant for callers that already have a `serde_json::Value` payload.
+**Purpose**: Sends a raw JSON body to the Responses endpoint and returns a live response stream. This is useful when the caller already has the exact JSON it wants to send.
 
-**Data flow**: Accepts `body: Value`, `extra_headers`, `compression`, and optional `turn_state`. It encodes the JSON value into `EncodedJsonBody`, maps encoding failures into `ApiError::Stream`, and then forwards the encoded body and remaining parameters to `stream_encoded`. It returns the resulting `ResponseStream`.
+**Data flow**: It receives a JSON value, extra headers, a compression choice, and optional turn state. It encodes the JSON body, reports an API error if encoding fails, and then passes the encoded body to `stream_encoded`. The result is a streamed response or an error.
 
-**Call relations**: This method is a sibling to `stream_request`: both converge on `stream_encoded`, but this one skips typed request serialization, Azure item-ID attachment, and session-header assembly.
+**Call relations**: This is the simpler sibling of `stream_request`. It skips the structured request and session-header building done by `stream_request`, then joins the same common path by calling `stream_encoded`.
 
 *Call graph*: calls 2 internal fn (stream_encoded, encode).
 
@@ -682,24 +692,24 @@ async fn stream_encoded(
     ) -> R
 ```
 
-**Purpose**: Performs the actual HTTP streaming request setup for the Responses endpoint and wraps the transport stream as a parsed `ResponseStream`. It is the common implementation behind both typed and raw-body entrypoints.
+**Purpose**: Does the shared low-level work of sending an already encoded request body and turning the HTTP response into a usable event stream. Both public streaming methods rely on it.
 
-**Data flow**: Takes an already encoded JSON body, caller-supplied headers, a `Compression` enum, and optional turn-state storage. It maps `Compression::{None,Zstd}` to `RequestCompression::{None,Zstd}`, then calls `self.session.stream_encoded_json_with(Method::POST, Self::path(), extra_headers, Some(body), |req| { ... })`. Inside the configure closure it inserts `Accept: text/event-stream` and sets `req.compression`. After awaiting the `StreamResponse`, it passes that stream, the provider's `stream_idle_timeout`, cloned SSE telemetry, and turn-state sink into `spawn_response_stream`, returning the resulting `ResponseStream`.
+**Data flow**: It receives an encoded JSON body, headers, a compression setting, and optional shared turn state. It translates the file’s compression option into the transport layer’s compression option, sends a POST request to the `responses` path, adds an `Accept: text/event-stream` header so the server knows to stream events, and then wraps the HTTP stream with timeout and telemetry support. It returns a `ResponseStream` or passes back any API error from the session.
 
-**Call relations**: This private method is called by both `stream_request` and `stream`. It relies on `EndpointSession` for authenticated transport setup and on `spawn_response_stream` to transform the raw SSE byte stream into higher-level response events.
+**Call relations**: `stream_request` and `stream` both hand off to this function after preparing the body. It calls the underlying session to perform the HTTP request, then gives the raw streaming response to `spawn_response_stream`, which is responsible for reading server-sent events over time and applying stream telemetry, idle timeout behavior, and turn-state tracking.
 
 *Call graph*: calls 2 internal fn (provider, stream_encoded_json_with); called by 2 (stream, stream_request); 2 external calls (path, spawn_response_stream).
 
 
 ### `codex-api/src/sse/responses.rs`
 
-`io_transport` · `stream request handling`
+`io_transport` · `request handling: active while a Responses API stream is being read`
 
-This file turns a `codex_client::StreamResponse` byte stream into a channel-driven `ResponseStream` of typed `ResponseEvent`s. `spawn_response_stream` performs the initial HTTP-header pass before any SSE frames are read: it parses all rate-limit snapshots from headers, extracts `X-Models-Etag`, `openai-model`, `x-reasoning-included`, and `x-request-id`, optionally stores `x-codex-turn-state` into a shared `OnceLock<String>`, then spawns an async task that emits those header-derived events before entering the SSE loop.
+When the server sends a response, it arrives as a sequence of small text events over a server-sent events stream, often called SSE: a simple web format for sending updates one after another. This file is the translator at that boundary. It reads the raw stream, pulls useful header information such as the model name, request id, rate limits, and model metadata, then emits cleaner internal events like “text delta arrived”, “tool call input arrived”, “response completed”, or “quota exceeded”.
 
-The SSE payload side is modeled by `ResponsesStreamEvent`, a partially typed deserialization target that keeps flexible JSON fields (`headers`, `metadata`, `response`, `item`) as `serde_json::Value`. Helper methods derive higher-level metadata from those blobs: `response_model` prefers `response.headers` over top-level `headers`, `model_verifications` only reads `response.metadata` events and deduplicates recognized verification strings, and `turn_moderation_metadata` wraps a raw metadata JSON value into `TurnModerationMetadataEvent`.
+The main flow starts with `spawn_response_stream`, which creates a background task and a channel. Think of the channel like a conveyor belt: the background task puts parsed events on it, and the rest of the app takes them off. `process_sse` then keeps reading the byte stream, applies an idle timeout so it does not wait forever, parses each SSE message as JSON, extracts side metadata, and hands normal response events to `process_responses_event`.
 
-`process_responses_event` is the event classifier. It maps known event kinds like `response.output_item.done`, text/tool/reasoning deltas, `response.created`, and `response.completed` into `ResponseEvent`s, while `response.failed` is converted into a typed `ApiError`. Error classification is concrete and ordered: context-window, quota, usage-not-included, cyber-policy, invalid-prompt, and overloaded-server codes become specific fatal variants; everything else becomes `ApiError::Retryable` with an optional delay parsed from human-readable rate-limit text. `process_sse` enforces an idle timeout around each poll, reports poll timing to optional `SseTelemetry`, emits model/verification/moderation metadata as soon as seen, remembers the last emitted server model to avoid duplicates, and only terminates cleanly after sending a `Completed` event. If the stream closes first, it emits either the last remembered API error or a generic `stream closed before response.completed` error.
+The file is also careful about errors. Some server failures are not all the same: a too-large prompt, exhausted quota, cyber-safety block, overloaded server, and rate limit each become a different `ApiError`. That distinction matters because callers may retry some failures but must stop or show a specific message for others.
 
 #### Function details
 
@@ -714,11 +724,11 @@ fn spawn_response_stream(
 ) -> ResponseStr
 ```
 
-**Purpose**: Creates the public `ResponseStream` wrapper around an HTTP streaming response and launches the background SSE-processing task. It emits header-derived metadata events before consuming any SSE frames.
+**Purpose**: Starts reading a streamed response in the background and returns a `ResponseStream` that the rest of the app can receive events from. It also immediately forwards useful response headers, such as model name, rate limits, model list tag, and request id.
 
-**Data flow**: Reads `stream_response.headers` to compute rate-limit snapshots, optional models etag, optional server model, reasoning-included flag, optional upstream request id, and optional turn-state header. If a shared `OnceLock<String>` is provided and the turn-state header exists, it stores that string. It creates an `mpsc` channel, spawns a task that sends initial `ResponseEvent::ServerModel`, `RateLimits`, `ModelsEtag`, and `ServerReasoningIncluded` messages as applicable, then awaits `process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry)`. It returns `ResponseStream { rx_event, upstream_request_id }`.
+**Data flow**: It receives a `StreamResponse` containing headers and a byte stream, plus timeout, optional telemetry, and optional shared turn-state storage. It reads metadata from the headers, creates a channel, starts an async task, sends header-derived events into the channel, then passes the raw byte stream to `process_sse`. It returns the receiving side of the channel and the upstream request id.
 
-**Call relations**: Higher-level Responses client code calls this after obtaining a `StreamResponse` from the transport. It delegates ongoing byte-stream decoding to `process_sse` and uses `parse_all_rate_limits` to surface header metadata immediately.
+**Call relations**: This is the entry point for this file's streaming work. Tests call it to verify header behavior, and in real use it hands off the long-running stream parsing to `process_sse` inside a spawned task.
 
 *Call graph*: calls 2 internal fn (parse_all_rate_limits, process_sse); called by 2 (spawn_response_stream_emits_header_events, spawn_response_stream_ignores_model_verification_header); 5 external calls (ModelsEtag, RateLimits, ServerModel, ServerReasoningIncluded, spawn).
 
@@ -729,11 +739,11 @@ fn spawn_response_stream(
 fn from(val: ResponseCompletedUsage) -> Self
 ```
 
-**Purpose**: Converts the wire-format `ResponseCompletedUsage` struct into the protocol-level `TokenUsage` used by downstream consumers. Missing nested detail blocks default their specialized counts to zero.
+**Purpose**: Converts the server's completed-response usage format into the project's common token-usage format. This lets the rest of the system use one shape for token counts.
 
-**Data flow**: Consumes a `ResponseCompletedUsage`, copies `input_tokens`, `output_tokens`, and `total_tokens`, extracts `cached_tokens` from `input_tokens_details` if present or uses `0`, extracts `reasoning_tokens` from `output_tokens_details` if present or uses `0`, and returns a new `TokenUsage`.
+**Data flow**: It receives a `ResponseCompletedUsage` value from parsed JSON. It copies total input, output, and total token counts, fills in cached input tokens and reasoning output tokens when those details are present, and uses zero when they are absent. It returns a `TokenUsage` value.
 
-**Call relations**: This conversion is used when `process_responses_event` successfully parses a `response.completed` payload and needs to attach token accounting to `ResponseEvent::Completed`.
+**Call relations**: It is used when `process_responses_event` parses a `response.completed` event and needs to include usage information in the internal completion event.
 
 
 ##### `ResponsesStreamEvent::kind`  (lines 163–165)
@@ -742,11 +752,11 @@ fn from(val: ResponseCompletedUsage) -> Self
 fn kind(&self) -> &str
 ```
 
-**Purpose**: Returns the event type string stored in the deserialized SSE payload. It is a tiny accessor used to keep kind checks consistent.
+**Purpose**: Returns the event type string, such as `response.completed` or `response.metadata`. Other helpers use this to decide whether an event can contain certain metadata.
 
-**Data flow**: Borrows `self.kind` and returns it as `&str` without allocation or mutation.
+**Data flow**: It reads the `kind` field already deserialized from JSON and returns it as a borrowed string. It does not change the event.
 
-**Call relations**: The metadata helper methods `turn_state`, `model_verifications`, and `turn_moderation_metadata` call this first to ensure they only inspect `response.metadata` events.
+**Call relations**: The metadata helpers call this before looking for turn state, model verification, or moderation metadata, so they only read those fields from the right kind of event.
 
 *Call graph*: called by 3 (model_verifications, turn_moderation_metadata, turn_state).
 
@@ -757,11 +767,11 @@ fn kind(&self) -> &str
 fn response_model(&self) -> Option<String>
 ```
 
-**Purpose**: Extracts the effective server model name from event JSON, preferring nested `response.headers` over top-level `headers`. This matches the precedence documented in the method comment.
+**Purpose**: Finds the effective server model name reported inside a stream event, if one is present. It prefers model information attached to the response itself, then falls back to top-level headers.
 
-**Data flow**: Reads `self.response`, looks for a nested `headers` object, and passes it to `header_openai_model_value_from_json`. If that yields `Some(model)`, it returns it; otherwise it falls back to `self.headers` and the same helper. The result is an owned `Option<String>`.
+**Data flow**: It looks inside `response.headers` first and then `headers`, checking for model header names regardless of letter case. If a value is found, it returns the model name as a string; otherwise it returns nothing.
 
-**Call relations**: The SSE loop uses this on every parsed event to emit `ResponseEvent::ServerModel` whenever the reported model changes.
+**Call relations**: `process_sse` calls this for every parsed event so it can emit a `ServerModel` event when the server reports or changes the model.
 
 
 ##### `ResponsesStreamEvent::turn_state`  (lines 188–196)
@@ -770,11 +780,11 @@ fn response_model(&self) -> Option<String>
 fn turn_state(&self) -> Option<String>
 ```
 
-**Purpose**: Extracts the turn-state header from metadata events only. Non-metadata events are ignored even if they happen to contain a `headers` field.
+**Purpose**: Extracts the Codex turn state from metadata events. Turn state is extra server-provided state about the current conversation turn.
 
-**Data flow**: Checks `self.kind()` and returns `None` unless it equals `response.metadata`. For metadata events, it reads `self.headers` and passes the JSON value to `header_turn_state_value_from_json`, returning the resulting optional string.
+**Data flow**: It first checks that the event type is `response.metadata`. If so, it looks in the event's headers for the turn-state header and returns its string value if present.
 
-**Call relations**: This helper encapsulates the event-kind guard for turn-state extraction; callers do not need to inspect raw JSON directly.
+**Call relations**: It relies on `kind` to avoid reading irrelevant events. This helper is available to stream users, although this file's main loop currently extracts turn state from initial response headers instead.
 
 *Call graph*: calls 1 internal fn (kind).
 
@@ -785,11 +795,11 @@ fn turn_state(&self) -> Option<String>
 fn model_verifications(&self) -> Option<Vec<ModelVerification>>
 ```
 
-**Purpose**: Parses model-verification recommendations from metadata events into a deduplicated vector of known `ModelVerification` enums. Unknown strings and non-metadata events are ignored.
+**Purpose**: Reads model verification recommendations from a metadata event. These recommendations tell the rest of the system about special verification status, such as trusted cyber access.
 
-**Data flow**: Returns `None` unless `self.kind()` is `response.metadata`. For metadata events, it reads `self.metadata["openai_verification_recommendation"]` and passes that JSON value to `model_verifications_from_json_value`, returning the helper's `Option<Vec<ModelVerification>>`.
+**Data flow**: It checks that the event is `response.metadata`, then looks under `metadata.openai_verification_recommendation`. It parses known string values into `ModelVerification` entries, removes duplicates, and returns them only if at least one known value was found.
 
-**Call relations**: The SSE loop calls this before normal event processing so verification recommendations can be emitted as standalone `ResponseEvent::ModelVerifications` messages.
+**Call relations**: `process_sse` calls this on each stream event and sends a `ModelVerifications` event when the server includes recognized recommendations.
 
 *Call graph*: calls 1 internal fn (kind).
 
@@ -800,11 +810,11 @@ fn model_verifications(&self) -> Option<Vec<ModelVerification>>
 fn turn_moderation_metadata(&self) -> Option<TurnModerationMetadataEvent>
 ```
 
-**Purpose**: Extracts moderation metadata from metadata events and wraps the raw JSON in `TurnModerationMetadataEvent`. It preserves the payload verbatim rather than interpreting its schema here.
+**Purpose**: Pulls moderation metadata for the current turn out of a metadata event. This gives callers extra safety or presentation information from the server.
 
-**Data flow**: Returns `None` unless `self.kind()` is `response.metadata`. For metadata events, it clones `self.metadata["openai_chatgpt_moderation_metadata"]` if present and maps it into `TurnModerationMetadataEvent { metadata }`.
+**Data flow**: It checks that the event type is `response.metadata`, then looks for `metadata.openai_chatgpt_moderation_metadata`. If found, it clones that JSON value into a `TurnModerationMetadataEvent`.
 
-**Call relations**: The SSE loop uses this to emit moderation metadata as soon as it appears, separate from the main response-item event stream.
+**Call relations**: `process_sse` calls this while reading the stream and forwards the result as a `TurnModerationMetadata` event.
 
 *Call graph*: calls 1 internal fn (kind).
 
@@ -815,11 +825,11 @@ fn turn_moderation_metadata(&self) -> Option<TurnModerationMetadataEvent>
 fn header_openai_model_value_from_json(value: &Value) -> Option<String>
 ```
 
-**Purpose**: Finds an OpenAI model header inside a JSON object, accepting either `openai-model` or `x-openai-model` case-insensitively. It also tolerates header values represented as arrays.
+**Purpose**: Finds an OpenAI model header inside a JSON object that represents headers. It accepts both `openai-model` and `x-openai-model`, ignoring letter case.
 
-**Data flow**: Treats the input `Value` as an object, iterates its key/value pairs, and for the first key matching the accepted header names calls `json_value_as_string` on the value. It returns the resulting `Option<String>`.
+**Data flow**: It receives a JSON value, treats it as an object if possible, scans its header names, and converts the matching header value into a string. If the JSON is not an object or no matching header exists, it returns nothing.
 
-**Call relations**: This helper underpins `ResponsesStreamEvent::response_model` for both nested response headers and top-level metadata headers.
+**Call relations**: `ResponsesStreamEvent::response_model` uses this to read model names from both response-level and top-level header JSON.
 
 *Call graph*: 1 external calls (as_object).
 
@@ -830,11 +840,11 @@ fn header_openai_model_value_from_json(value: &Value) -> Option<String>
 fn header_turn_state_value_from_json(value: &Value) -> Option<String>
 ```
 
-**Purpose**: Finds the `x-codex-turn-state` header inside a JSON object, ignoring key case. It converts the associated JSON value into a string using the same tolerant logic as model-header parsing.
+**Purpose**: Finds the Codex turn-state header inside a JSON header object. This helps extract conversation-turn state from metadata-like payloads.
 
-**Data flow**: Treats the input `Value` as an object, scans entries for a key equal to `X_CODEX_TURN_STATE_HEADER` ignoring ASCII case, and returns `json_value_as_string(value)` for the first match.
+**Data flow**: It receives a JSON value, checks that it is an object, searches for the configured turn-state header name ignoring letter case, and returns its string value if present.
 
-**Call relations**: This helper is used by `ResponsesStreamEvent::turn_state` to isolate the JSON header-scanning logic.
+**Call relations**: `ResponsesStreamEvent::turn_state` uses this after confirming that the event is a metadata event.
 
 *Call graph*: 1 external calls (as_object).
 
@@ -845,11 +855,11 @@ fn header_turn_state_value_from_json(value: &Value) -> Option<String>
 fn model_verifications_from_json_value(value: &Value) -> Option<Vec<ModelVerification>>
 ```
 
-**Purpose**: Converts a JSON array of verification recommendation strings into a deduplicated vector of recognized `ModelVerification` values. Empty, malformed, or entirely unknown inputs collapse to `None`.
+**Purpose**: Turns a JSON list of verification recommendation strings into typed `ModelVerification` values. It ignores unknown entries and avoids returning duplicates.
 
-**Data flow**: If `value` is an array, it iterates string elements, maps each through `parse_model_verification`, and pushes only values not already present into a local `Vec<ModelVerification>`. Non-array input yields an empty vector. It returns `Some(vec)` when the vector is non-empty, otherwise `None`.
+**Data flow**: It receives a JSON value, reads it as an array when possible, keeps only string items, parses known verification names, and collects unique results. It returns `None` when nothing recognized was found.
 
-**Call relations**: This helper is called by `ResponsesStreamEvent::model_verifications` after the metadata field has been located.
+**Call relations**: `ResponsesStreamEvent::model_verifications` calls this after locating the verification field inside event metadata.
 
 *Call graph*: 1 external calls (as_array).
 
@@ -860,11 +870,11 @@ fn model_verifications_from_json_value(value: &Value) -> Option<Vec<ModelVerific
 fn parse_model_verification(value: &str) -> Option<ModelVerification>
 ```
 
-**Purpose**: Maps a raw verification recommendation string to a known `ModelVerification` enum variant. At present it recognizes only the trusted-access-for-cyber marker.
+**Purpose**: Recognizes one model verification string and maps it to the project's enum value. Currently it knows the trusted-access-for-cyber recommendation.
 
-**Data flow**: Matches the input `&str` against `TRUSTED_ACCESS_FOR_CYBER_VERIFICATION` and returns `Some(ModelVerification::TrustedAccessForCyber)` for that exact token, otherwise `None`.
+**Data flow**: It receives a string from server metadata. If it matches the known trusted cyber access value, it returns the corresponding `ModelVerification`; otherwise it returns nothing.
 
-**Call relations**: This is the per-item decoder used by `model_verifications_from_json_value`.
+**Call relations**: `model_verifications_from_json_value` calls this for each string in the metadata array.
 
 
 ##### `json_value_as_string`  (lines 277–283)
@@ -873,11 +883,11 @@ fn parse_model_verification(value: &str) -> Option<ModelVerification>
 fn json_value_as_string(value: &Value) -> Option<String>
 ```
 
-**Purpose**: Extracts a string from a JSON value, with special handling for arrays by recursively reading the first element. This accommodates header representations that may be scalar or list-valued.
+**Purpose**: Extracts a string from a JSON header value, including the common case where a header value is represented as a one-item array. This makes header parsing tolerant of slightly different JSON shapes.
 
-**Data flow**: If `value` is `Value::String`, it clones and returns the string. If it is `Value::Array`, it takes the first element and recursively tries again. All other JSON types return `None`.
+**Data flow**: It receives a JSON value. If it is a string, it clones and returns it; if it is an array, it tries the first item; for other JSON types it returns nothing.
 
-**Call relations**: Header-parsing helpers use this to normalize JSON header values before comparing or emitting them.
+**Call relations**: The header-reading helpers use this so they can accept both plain string headers and array-style headers.
 
 *Call graph*: 1 external calls (clone).
 
@@ -888,11 +898,11 @@ fn json_value_as_string(value: &Value) -> Option<String>
 fn into_api_error(self) -> ApiError
 ```
 
-**Purpose**: Unwraps the internal event-processing error wrapper into the underlying `ApiError`. The enum currently has only one variant, but this method isolates callers from that representation.
+**Purpose**: Unwraps this file's local response-event error into the shared `ApiError` type. This keeps the public error shape consistent for callers.
 
-**Data flow**: Consumes `self`, pattern-matches `ResponsesEventError::Api(error)`, and returns the contained `ApiError`.
+**Data flow**: It receives a `ResponsesEventError`. If it contains an API error, it returns that API error.
 
-**Call relations**: The SSE loop uses this when `process_responses_event` reports an error so it can remember the last API error seen before stream termination.
+**Call relations**: `process_sse` uses this when `process_responses_event` reports a response failure, storing the underlying API error for later emission.
 
 
 ##### `process_responses_event`  (lines 298–432)
@@ -903,11 +913,11 @@ fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError>
 ```
 
-**Purpose**: Interprets one deserialized `ResponsesStreamEvent` and converts it into either a typed `ResponseEvent`, no event, or an `ApiError`. It is the central event-kind dispatch table for Responses SSE payloads.
+**Purpose**: Converts one parsed Responses stream event into one internal `ResponseEvent`, or into a meaningful `ApiError`. This is the central event translator for normal response content and server-side failures.
 
-**Data flow**: Consumes a `ResponsesStreamEvent` and matches on `event.kind.as_str()`. For known success cases it reads fields like `item`, `delta`, `item_id`, `call_id`, `summary_index`, `content_index`, and `response`, deserializes nested JSON into `ResponseItem` or `ResponseCompleted` where needed, and returns `Ok(Some(ResponseEvent::...))`. For `response.failed`, it inspects the nested `error` object, deserializes it into the local `Error` struct, classifies codes with helpers such as `is_context_window_error`, `is_quota_exceeded_error`, `is_usage_not_included`, `is_cyber_policy_error`, `is_invalid_prompt_error`, and `is_server_overloaded_error`, optionally parses a retry delay with `try_parse_retry_after`, and returns `Err(ResponsesEventError::Api(...))`. Unknown or malformed-but-nonfatal events fall through to `Ok(None)` after optional debug/trace logging.
+**Data flow**: It receives a `ResponsesStreamEvent` parsed from JSON. It switches on the event type, extracts fields like output items, text deltas, tool input deltas, reasoning deltas, completion usage, and error details. It returns an optional internal event, or an error when the server reports failure or an incomplete response.
 
-**Call relations**: This function is called on every parsed SSE payload by `process_sse`. It delegates specialized error classification and retry-delay extraction to the helper functions in this file so the main dispatch remains readable.
+**Call relations**: `process_sse` calls this after parsing each SSE message. It delegates error classification to helpers such as `is_context_window_error`, `is_quota_exceeded_error`, `cyber_policy_message`, and `try_parse_retry_after`.
 
 *Call graph*: calls 8 internal fn (cyber_policy_message, is_context_window_error, is_cyber_policy_error, is_invalid_prompt_error, is_quota_exceeded_error, is_server_overloaded_error, is_usage_not_included, try_parse_retry_after); called by 1 (process_sse); 8 external calls (OutputItemAdded, OutputItemDone, OutputTextDelta, Stream, Api, debug!, format!, trace!).
 
@@ -923,11 +933,11 @@ async fn process_sse(
 )
 ```
 
-**Purpose**: Runs the main SSE read loop over a byte stream, enforcing idle timeouts, reporting telemetry, decoding JSON events, emitting metadata events, and forwarding typed response events onto a channel. It is responsible for deciding when the stream ends successfully versus with an error.
+**Purpose**: Reads the live SSE byte stream until the response completes, fails, times out, or closes unexpectedly. It sends cleaned-up events and errors into a channel for the rest of the app.
 
-**Data flow**: Consumes a `ByteStream`, an `mpsc::Sender<Result<ResponseEvent, ApiError>>`, an `idle_timeout`, and optional `SseTelemetry`. It wraps the byte stream with `eventsource()`, then loops: records `Instant::now()`, awaits `timeout(idle_timeout, stream.next())`, reports the poll result and elapsed time to telemetry, and handles four poll outcomes—valid SSE event, SSE parser error, clean EOF, or timeout. Valid SSE data is deserialized into `ResponsesStreamEvent`; parse failures are logged and skipped. For each event it computes optional model verifications and moderation metadata, emits `ServerModel` only when changed from `last_server_model`, emits verification and moderation events immediately, then calls `process_responses_event`. Successful events are sent to the channel; if the event is `Completed`, the function returns immediately. Errors from `process_responses_event` are stored in `response_error` but not sent until the stream later closes, allowing the loop to prefer a terminal protocol error over a generic premature-close message.
+**Data flow**: It receives a byte stream, an event sender, an idle timeout, and optional telemetry. It converts bytes into SSE events, waits for each next item with a timeout, logs or reports parse problems, extracts model and metadata side events, translates response events, and sends results through the channel. It stops after a completed response, a stream error, an idle timeout, or a closed stream.
 
-**Call relations**: This is the worker launched by `spawn_response_stream`, and the test helpers `collect_events`, `run_sse`, and `emits_completed_without_stream_end` invoke it directly. It depends on `process_responses_event` for semantic decoding and on the telemetry trait for per-poll instrumentation.
+**Call relations**: `spawn_response_stream` starts this in the background, and tests call it directly through helpers. It calls `process_responses_event` for the main event translation and sends `ServerModel`, `ModelVerifications`, and `TurnModerationMetadata` events itself.
 
 *Call graph*: calls 1 internal fn (process_responses_event); called by 4 (spawn_response_stream, collect_events, emits_completed_without_stream_end, run_sse); 13 external calls (eventsource, next, now, send, ModelVerifications, ServerModel, TurnModerationMetadata, Stream, debug!, matches! (+3 more)).
 
@@ -938,11 +948,11 @@ async fn process_sse(
 fn try_parse_retry_after(err: &Error) -> Option<Duration>
 ```
 
-**Purpose**: Extracts a retry delay from a human-readable rate-limit error message when the error code is `rate_limit_exceeded`. It supports both fractional seconds and millisecond wording.
+**Purpose**: Tries to pull a suggested retry delay out of a rate-limit error message. This lets callers know how long to wait before trying again.
 
-**Data flow**: Reads `err.code` and returns `None` unless it equals `rate_limit_exceeded`. It obtains a compiled regex from `rate_limit_regex`, applies it to `err.message`, parses the captured numeric value as `f64`, lowercases the captured unit, and returns `Duration::from_secs_f64(value)` for `s`/`second(s)` or `Duration::from_millis(value as u64)` for `ms`. Any mismatch or parse failure yields `None`.
+**Data flow**: It receives a parsed server error. If the code is not `rate_limit_exceeded`, it returns nothing. Otherwise it searches the message for phrases like “try again in 11.054s”, “28ms”, or “35 seconds” and converts the number and unit into a `Duration`.
 
-**Call relations**: This helper is used during `response.failed` handling inside `process_responses_event` so retryable API errors can carry a server-suggested backoff.
+**Call relations**: `process_responses_event` uses this when turning unknown rate-limit failures into retryable API errors. Tests call it with several message formats.
 
 *Call graph*: calls 1 internal fn (rate_limit_regex); called by 4 (process_responses_event, test_try_parse_retry_after, test_try_parse_retry_after_azure, test_try_parse_retry_after_no_delay); 2 external calls (from_millis, from_secs_f64).
 
@@ -953,11 +963,11 @@ fn try_parse_retry_after(err: &Error) -> Option<Duration>
 fn is_context_window_error(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether an error code indicates the request exceeded the model context window. This maps directly to a fatal `ApiError::ContextWindowExceeded` classification.
+**Purpose**: Checks whether a server error means the request was too large for the model's context window. A context window is the amount of text the model can consider at once.
 
-**Data flow**: Reads `error.code` and returns true only when it is exactly `Some("context_length_exceeded")`.
+**Data flow**: It reads the error code and returns true only when it is `context_length_exceeded`.
 
-**Call relations**: Called by `process_responses_event` early in failed-response classification.
+**Call relations**: `process_responses_event` uses this to emit `ContextWindowExceeded` instead of treating the failure as retryable.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -968,11 +978,11 @@ fn is_context_window_error(error: &Error) -> bool
 fn is_quota_exceeded_error(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether an error code indicates insufficient quota. This is treated as a fatal quota error rather than a generic retryable failure.
+**Purpose**: Checks whether a server error means the account has no available quota. This is a hard stop rather than a normal transient stream failure.
 
-**Data flow**: Reads `error.code` and compares it to `Some("insufficient_quota")`, returning the boolean result.
+**Data flow**: It reads the error code and returns true only when it is `insufficient_quota`.
 
-**Call relations**: Used by `process_responses_event` when mapping `response.failed` payloads to specific `ApiError` variants.
+**Call relations**: `process_responses_event` uses this to emit `QuotaExceeded`.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -983,11 +993,11 @@ fn is_quota_exceeded_error(error: &Error) -> bool
 fn is_usage_not_included(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether the server reported that usage information is unavailable or excluded. This becomes a dedicated `ApiError::UsageNotIncluded`.
+**Purpose**: Checks whether the server rejected the request because usage information is not included. This maps a specific server code to a specific user-facing API error.
 
-**Data flow**: Reads `error.code` and returns true only for `Some("usage_not_included")`.
+**Data flow**: It reads the error code and returns true only when it is `usage_not_included`.
 
-**Call relations**: Part of the ordered error-classification chain in `process_responses_event`.
+**Call relations**: `process_responses_event` uses this while classifying `response.failed` events.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -998,11 +1008,11 @@ fn is_usage_not_included(error: &Error) -> bool
 fn is_invalid_prompt_error(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether the server rejected the prompt as invalid. This drives conversion to `ApiError::InvalidRequest` with the server message preserved.
+**Purpose**: Checks whether the server says the prompt itself is invalid. This allows the caller to show the server's message instead of retrying.
 
-**Data flow**: Reads `error.code` and compares it to `Some("invalid_prompt")`.
+**Data flow**: It reads the error code and returns true only when it is `invalid_prompt`.
 
-**Call relations**: Used by `process_responses_event` after more specific fatal checks like context-window and quota errors.
+**Call relations**: `process_responses_event` uses this to build an `InvalidRequest` error with the server message or a fallback.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -1013,11 +1023,11 @@ fn is_invalid_prompt_error(error: &Error) -> bool
 fn is_cyber_policy_error(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether the failure was caused by cyber-policy enforcement. This triggers a dedicated `ApiError::CyberPolicy` path.
+**Purpose**: Checks whether the request was blocked by a cybersecurity policy rule. This lets the app surface a clear safety-related message.
 
-**Data flow**: Reads `error.code` and returns true only for `Some("cyber_policy")`.
+**Data flow**: It reads the error code and returns true only when it is `cyber_policy`.
 
-**Call relations**: Called by `process_responses_event`, which then uses `cyber_policy_message` to ensure a non-empty user-facing message.
+**Call relations**: `process_responses_event` uses this with `cyber_policy_message` to create a `CyberPolicy` error.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -1028,11 +1038,11 @@ fn is_cyber_policy_error(error: &Error) -> bool
 fn is_server_overloaded_error(error: &Error) -> bool
 ```
 
-**Purpose**: Checks whether the server reported overload or slowdown conditions. These are treated specially as `ApiError::ServerOverloaded`.
+**Purpose**: Checks whether the server says it is overloaded or asking the client to slow down. This separates capacity problems from other stream errors.
 
-**Data flow**: Reads `error.code` and returns true when it is `Some("server_is_overloaded")` or `Some("slow_down")`.
+**Data flow**: It reads the error code and returns true for `server_is_overloaded` or `slow_down`.
 
-**Call relations**: This helper participates in `response.failed` classification inside `process_responses_event`.
+**Call relations**: `process_responses_event` uses this to emit `ServerOverloaded`.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -1043,11 +1053,11 @@ fn is_server_overloaded_error(error: &Error) -> bool
 fn cyber_policy_fallback_message() -> String
 ```
 
-**Purpose**: Provides the default user-facing message for cyber-policy failures when the server did not send a meaningful message. It centralizes the fallback wording in one place.
+**Purpose**: Provides a default message for cybersecurity policy blocks when the server does not send a useful one.
 
-**Data flow**: Allocates and returns the fixed string `This request has been flagged for possible cybersecurity risk.` as a `String`.
+**Data flow**: It takes no input and returns a fixed human-readable string explaining that the request was flagged for possible cybersecurity risk.
 
-**Call relations**: Used only by `cyber_policy_message` as the fallback branch.
+**Call relations**: `cyber_policy_message` calls this when the server's message is missing or blank.
 
 
 ##### `cyber_policy_message`  (lines 586–590)
@@ -1056,11 +1066,11 @@ fn cyber_policy_fallback_message() -> String
 fn cyber_policy_message(message: Option<String>) -> String
 ```
 
-**Purpose**: Normalizes an optional cyber-policy error message so callers always get a non-empty string. Blank or whitespace-only messages are replaced with the standard fallback.
+**Purpose**: Chooses the message to show for a cybersecurity policy block. It preserves a non-empty server message and otherwise uses a safe default.
 
-**Data flow**: Consumes `message: Option<String>`, filters out strings whose trimmed content is empty, and returns the original message when present and nonblank; otherwise it calls `cyber_policy_fallback_message` and returns that string.
+**Data flow**: It receives an optional string. If the string exists and is not just whitespace, it returns it; otherwise it returns `cyber_policy_fallback_message`.
 
-**Call relations**: This helper is used by `process_responses_event` when converting cyber-policy failures into `ApiError::CyberPolicy`.
+**Call relations**: `process_responses_event` calls this when classifying a `cyber_policy` failure.
 
 *Call graph*: called by 1 (process_responses_event).
 
@@ -1071,11 +1081,11 @@ fn cyber_policy_message(message: Option<String>) -> String
 fn rate_limit_regex() -> &'static regex_lite::Regex
 ```
 
-**Purpose**: Lazily initializes and returns the compiled regex used to parse retry delays from rate-limit messages. The regex is cached globally so repeated error parsing does not recompile it.
+**Purpose**: Builds and reuses the regular expression used to find retry delays in rate-limit messages. A regular expression is a pattern for searching text.
 
-**Data flow**: Uses a static `OnceLock<regex_lite::Regex>` and `get_or_init` to compile the case-insensitive pattern `try again in <number> <unit>` once, then returns a shared reference to the compiled regex.
+**Data flow**: It creates the pattern the first time it is needed and stores it in a `OnceLock`, which is a safe one-time initializer. Later calls return the same compiled pattern.
 
-**Call relations**: This helper is called by `try_parse_retry_after` whenever a retryable rate-limit message needs delay extraction.
+**Call relations**: `try_parse_retry_after` calls this before searching an error message for delay text.
 
 *Call graph*: called by 1 (try_parse_retry_after); 1 external calls (new).
 
@@ -1086,11 +1096,11 @@ fn rate_limit_regex() -> &'static regex_lite::Regex
 async fn collect_events(chunks: &[&[u8]]) -> Vec<Result<ResponseEvent, ApiError>>
 ```
 
-**Purpose**: Test helper that feeds raw byte chunks through `process_sse` and collects every emitted channel item. It simulates a streaming transport at the byte level.
+**Purpose**: Test helper that feeds raw byte chunks into `process_sse` and collects every result it sends. It lets tests simulate a streaming server without making a network request.
 
-**Data flow**: Builds a mock async reader from the provided chunk slices, wraps it in `ReaderStream`, maps I/O errors into `TransportError::Network`, creates an `mpsc` channel, spawns `process_sse`, then drains the receiver into a `Vec<Result<ResponseEvent, ApiError>>` which it returns.
+**Data flow**: It receives byte chunks, builds a fake async reader, wraps it as a byte stream, starts `process_sse`, and receives all channel outputs into a vector. It returns both successful response events and API errors.
 
-**Call relations**: Many async SSE tests use this helper when they want precise control over raw SSE framing and stream termination.
+**Call relations**: Many tests use this helper when they need low-level control over the exact SSE text or stream ending behavior.
 
 *Call graph*: calls 1 internal fn (process_sse); 6 external calls (pin, new, new, new, idle_timeout, spawn).
 
@@ -1101,11 +1111,11 @@ async fn collect_events(chunks: &[&[u8]]) -> Vec<Result<ResponseEvent, ApiError>
 async fn run_sse(events: Vec<serde_json::Value>) -> Vec<ResponseEvent>
 ```
 
-**Purpose**: Test helper that converts a vector of JSON event payloads into a textual SSE stream and returns the successfully decoded `ResponseEvent`s. It is a higher-level fixture than `collect_events`.
+**Purpose**: Test helper that turns JSON event objects into SSE-formatted text and returns only successful `ResponseEvent` values. It makes event-focused tests shorter and easier to read.
 
-**Data flow**: Builds an SSE body string by formatting each JSON event as `event:` plus optional `data:` lines, wraps the body in a `ReaderStream`, spawns `process_sse`, then drains the receiver and unwraps each `Ok` event into a `Vec<ResponseEvent>`.
+**Data flow**: It receives JSON events, formats each as an SSE event with `event:` and `data:` lines, runs `process_sse` on that text, and collects successful events. If an error appears, the helper fails the test.
 
-**Call relations**: Most behavior-focused SSE tests use this helper to express fixtures as JSON values instead of raw bytes.
+**Call relations**: Tests use this helper for normal stream scenarios where they expect parsing to succeed.
 
 *Call graph*: calls 2 internal fn (process_sse, new); 7 external calls (pin, new, new, new, idle_timeout, format!, spawn).
 
@@ -1116,11 +1126,11 @@ async fn run_sse(events: Vec<serde_json::Value>) -> Vec<ResponseEvent>
 fn idle_timeout() -> Duration
 ```
 
-**Purpose**: Provides a consistent short timeout for SSE tests. Keeping it centralized makes the tests easier to tune and read.
+**Purpose**: Provides a standard timeout duration for stream tests. This keeps tests consistent and avoids repeating the same number everywhere.
 
-**Data flow**: Returns `Duration::from_millis(1000)` with no inputs or side effects.
+**Data flow**: It takes no input and returns a one-second `Duration`.
 
-**Call relations**: Used by the test helpers and direct `process_sse` tests whenever an idle timeout argument is required.
+**Call relations**: The test helpers and several direct stream tests pass this value to `process_sse` or `spawn_response_stream`.
 
 *Call graph*: 1 external calls (from_millis).
 
@@ -1131,11 +1141,11 @@ fn idle_timeout() -> Duration
 async fn parses_items_and_completed()
 ```
 
-**Purpose**: Verifies that normal `response.output_item.done` events deserialize into `ResponseItem`s and that a trailing `response.completed` produces the expected completion event. It also checks preservation of message role and optional phase.
+**Purpose**: Verifies that completed output items and the final completion event are parsed correctly. It checks both an item with a message phase and one without.
 
-**Data flow**: Constructs three JSON payload strings, wraps them as SSE frames, feeds them through `collect_events`, and asserts the resulting event sequence and parsed fields.
+**Data flow**: It builds three SSE messages, collects parsed results, and asserts that two output items and one completion event come out with the expected fields.
 
-**Call relations**: This test exercises the happy path through `process_sse` and `process_responses_event` for output items plus completion.
+**Call relations**: This test exercises `collect_events`, which runs `process_sse`, which in turn calls `process_responses_event`.
 
 *Call graph*: 7 external calls (assert!, assert_eq!, assert_matches!, collect_events, format!, json!, panic!).
 
@@ -1146,11 +1156,11 @@ async fn parses_items_and_completed()
 async fn error_when_missing_completed()
 ```
 
-**Purpose**: Checks that a stream ending after output items but before `response.completed` yields a terminal stream error. This captures the invariant that completion is required for a clean end.
+**Purpose**: Checks that a stream ending without `response.completed` is treated as an error. This protects callers from silently accepting an unfinished answer.
 
-**Data flow**: Builds a single output-item SSE frame, runs it through `collect_events`, and asserts that the second emitted channel item is `Err(ApiError::Stream("stream closed before response.completed"))`.
+**Data flow**: It sends one output item and then ends the fake stream. It expects the item event followed by a stream error saying the stream closed before completion.
 
-**Call relations**: This test targets the EOF branch in `process_sse` when no prior terminal protocol error has been remembered.
+**Call relations**: It uses `collect_events` to drive `process_sse` through the premature-close path.
 
 *Call graph*: 6 external calls (assert_eq!, assert_matches!, collect_events, format!, json!, panic!).
 
@@ -1161,11 +1171,11 @@ async fn error_when_missing_completed()
 async fn parses_tool_search_call_items()
 ```
 
-**Purpose**: Verifies that `response.output_item.done` can deserialize a `tool_search_call` item variant with its call id, execution mode, and arguments intact. It confirms that non-message output items are supported.
+**Purpose**: Verifies that tool search call output items are parsed into the correct internal item type. This matters because tool calls need structured arguments, not just text.
 
-**Data flow**: Builds a small event sequence with a tool-search item and a completion event, runs it through `run_sse`, and asserts the parsed `ResponseItem::ToolSearchCall` fields.
+**Data flow**: It sends a tool search call item followed by completion, then checks the call id, execution mode, and JSON arguments in the first emitted event.
 
-**Call relations**: This test exercises the generic `ResponseItem` deserialization path inside `process_responses_event`.
+**Call relations**: It uses `run_sse`, so it exercises the normal successful path through `process_sse` and `process_responses_event`.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, run_sse, vec!).
 
@@ -1176,11 +1186,11 @@ async fn parses_tool_search_call_items()
 async fn parses_tool_call_input_deltas()
 ```
 
-**Purpose**: Checks that custom tool input delta events are converted into `ResponseEvent::ToolCallInputDelta` and that unrelated delta kinds not explicitly handled are ignored. The test also confirms the stream still completes normally.
+**Purpose**: Checks that custom tool call input deltas are emitted as tool input updates, while unrelated function-call argument deltas are ignored here. This prevents mixing unsupported event types into the internal stream.
 
-**Data flow**: Creates a sequence containing a handled `response.custom_tool_call_input.delta`, an unhandled `response.function_call_arguments.delta`, and a completion event, runs it through `run_sse`, and asserts the resulting event list.
+**Data flow**: It sends a custom tool call delta, an unhandled function call argument delta, and a completion. It expects a tool input delta followed by completion.
 
-**Call relations**: This test documents the current event-kind coverage in `process_responses_event`.
+**Call relations**: It relies on `run_sse` and indirectly verifies the event-type matching inside `process_responses_event`.
 
 *Call graph*: 3 external calls (assert_matches!, run_sse, vec!).
 
@@ -1191,11 +1201,11 @@ async fn parses_tool_call_input_deltas()
 async fn emits_completed_without_stream_end()
 ```
 
-**Purpose**: Ensures that receiving `response.completed` causes `process_sse` to stop immediately even if the underlying byte stream never closes. This prevents hanging on long-lived or stalled transports after logical completion.
+**Purpose**: Verifies that `process_sse` stops as soon as it sees `response.completed`, even if the underlying byte stream stays open. This avoids hanging while waiting for a server connection to close.
 
-**Data flow**: Builds a stream containing one completion SSE frame followed by a pending stream, spawns `process_sse`, collects channel output under a timeout, and asserts that exactly one completed event was emitted.
+**Data flow**: It creates a stream that sends a completion event and then never ends. It runs `process_sse` and asserts that exactly one completion event is collected within the test timeout.
 
-**Call relations**: This test targets the early-return branch in `process_sse` after sending a `Completed` event.
+**Call relations**: This test calls `process_sse` directly to exercise its stop-on-completion behavior.
 
 *Call graph*: calls 1 internal fn (process_sse); 14 external calls (pin, from_millis, new, assert!, assert_eq!, idle_timeout, format!, json!, panic!, iter (+4 more)).
 
@@ -1206,11 +1216,11 @@ async fn emits_completed_without_stream_end()
 async fn error_when_error_event()
 ```
 
-**Purpose**: Verifies that a `response.failed` event with a rate-limit message becomes `ApiError::Retryable` and that the retry delay is parsed from the message text. It covers the generic retryable-error path.
+**Purpose**: Checks that a rate-limit `response.failed` event becomes a retryable API error with a parsed delay. This ensures callers can back off for the right amount of time.
 
-**Data flow**: Feeds a raw failed-response SSE frame through `collect_events` and asserts that the sole emitted error contains the original message and a parsed `Duration::from_secs_f64(11.054)` delay.
+**Data flow**: It sends a server failure message containing `rate_limit_exceeded` and “try again in 11.054s”. It expects an `ApiError::Retryable` with the original message and a duration of 11.054 seconds.
 
-**Call relations**: This test exercises `process_responses_event` together with `try_parse_retry_after`.
+**Call relations**: It drives `process_sse` through `collect_events`; `process_responses_event` classifies the error and calls `try_parse_retry_after`.
 
 *Call graph*: 4 external calls (assert_eq!, collect_events, format!, panic!).
 
@@ -1221,11 +1231,11 @@ async fn error_when_error_event()
 async fn context_window_error_is_fatal()
 ```
 
-**Purpose**: Checks that `context_length_exceeded` is classified as the dedicated fatal `ApiError::ContextWindowExceeded`. This distinguishes it from retryable stream failures.
+**Purpose**: Verifies that a context-window error is classified as `ContextWindowExceeded`. This prevents the app from retrying a request that is too large to fit.
 
-**Data flow**: Builds a failed-response SSE frame with that error code, runs it through `collect_events`, and asserts the emitted error variant.
+**Data flow**: It sends a failed response with code `context_length_exceeded` and checks that the collected result is the specific fatal error.
 
-**Call relations**: This test covers the `is_context_window_error` branch in `process_responses_event`.
+**Call relations**: It exercises `process_responses_event` through `collect_events` and the `is_context_window_error` helper.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, collect_events, format!).
 
@@ -1236,11 +1246,11 @@ async fn context_window_error_is_fatal()
 async fn context_window_error_with_newline_is_fatal()
 ```
 
-**Purpose**: Confirms that context-window classification depends on the error code, not the exact formatting of the message text. A newline in the message must not change the fatal classification.
+**Purpose**: Checks that a context-window error is still recognized when the server message contains a newline. The classification depends on the code, not fragile message text.
 
-**Data flow**: Feeds a failed-response SSE frame whose message contains a newline through `collect_events` and asserts `ApiError::ContextWindowExceeded`.
+**Data flow**: It sends a failed response with code `context_length_exceeded` and a multi-line message. It expects `ApiError::ContextWindowExceeded`.
 
-**Call relations**: This test reinforces that `process_responses_event` uses code-based classification rather than brittle message matching.
+**Call relations**: It uses `collect_events` to run the same error path as real streaming.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, collect_events, format!).
 
@@ -1251,11 +1261,11 @@ async fn context_window_error_with_newline_is_fatal()
 async fn quota_exceeded_error_is_fatal()
 ```
 
-**Purpose**: Verifies that `insufficient_quota` maps to `ApiError::QuotaExceeded`. This is another dedicated fatal classification path.
+**Purpose**: Verifies that an insufficient-quota server error becomes `QuotaExceeded`. This tells callers that account limits, not a temporary stream issue, stopped the request.
 
-**Data flow**: Constructs a failed-response SSE frame with the quota error code, runs it through `collect_events`, and asserts the resulting error variant.
+**Data flow**: It sends a failed response with code `insufficient_quota` and asserts that the parsed result is the quota error.
 
-**Call relations**: This test covers the `is_quota_exceeded_error` branch in `process_responses_event`.
+**Call relations**: It reaches `is_quota_exceeded_error` through `process_responses_event` and `collect_events`.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, collect_events, format!).
 
@@ -1266,11 +1276,11 @@ async fn quota_exceeded_error_is_fatal()
 async fn cyber_policy_error_is_fatal()
 ```
 
-**Purpose**: Checks that cyber-policy failures become `ApiError::CyberPolicy` and preserve a non-empty server-provided message. It validates the specialized policy-error path.
+**Purpose**: Checks that a cyber policy block becomes a `CyberPolicy` error with the server's message. This preserves the explanation the server provided.
 
-**Data flow**: Feeds a failed-response SSE frame with code `cyber_policy` and a message through `collect_events`, then matches the emitted error and asserts the message text.
+**Data flow**: It sends a failed response with code `cyber_policy` and a non-empty message. It asserts that the emitted error contains that exact message.
 
-**Call relations**: This test exercises `is_cyber_policy_error` and `cyber_policy_message` in the non-fallback case.
+**Call relations**: It exercises `is_cyber_policy_error` and `cyber_policy_message` through the stream-processing path.
 
 *Call graph*: 4 external calls (assert_eq!, collect_events, format!, panic!).
 
@@ -1281,11 +1291,11 @@ async fn cyber_policy_error_is_fatal()
 async fn cyber_policy_error_uses_fallback_for_empty_message()
 ```
 
-**Purpose**: Ensures that blank cyber-policy messages are replaced with the standard fallback text. This avoids surfacing empty user-facing errors.
+**Purpose**: Checks that a blank cyber policy message is replaced with a useful fallback. This avoids showing users an empty error message.
 
-**Data flow**: Builds a failed-response SSE frame whose cyber-policy message is whitespace, runs it through `collect_events`, and asserts that the emitted `ApiError::CyberPolicy` contains the fallback string.
+**Data flow**: It sends a `cyber_policy` failure whose message is only spaces. It expects a `CyberPolicy` error with the default cybersecurity-risk text.
 
-**Call relations**: This test specifically covers the fallback branch in `cyber_policy_message`.
+**Call relations**: It verifies the `cyber_policy_message` and `cyber_policy_fallback_message` behavior through `process_responses_event`.
 
 *Call graph*: 4 external calls (assert_eq!, collect_events, format!, panic!).
 
@@ -1296,11 +1306,11 @@ async fn cyber_policy_error_uses_fallback_for_empty_message()
 async fn invalid_prompt_without_type_is_invalid_request()
 ```
 
-**Purpose**: Verifies that `invalid_prompt` is classified as `ApiError::InvalidRequest` even when no extra error type field is present. The server message should be preserved.
+**Purpose**: Verifies that an invalid prompt failure becomes an invalid request error using the server's message. This gives callers a clear reason to show to the user.
 
-**Data flow**: Feeds a failed-response SSE frame with code `invalid_prompt` through `collect_events` and asserts the resulting invalid-request message.
+**Data flow**: It sends a failed response with code `invalid_prompt` and checks that the resulting `InvalidRequest` error carries the same message.
 
-**Call relations**: This test covers the `is_invalid_prompt_error` branch in `process_responses_event`.
+**Call relations**: It exercises `is_invalid_prompt_error` through the normal SSE processing path.
 
 *Call graph*: 4 external calls (assert_eq!, collect_events, format!, panic!).
 
@@ -1311,11 +1321,11 @@ async fn invalid_prompt_without_type_is_invalid_request()
 async fn table_driven_event_kinds()
 ```
 
-**Purpose**: Exercises several event kinds in a compact table-driven style, including created, output-item, and unknown events. It verifies both first-event classification and total emitted event count.
+**Purpose**: Checks several event kinds in one compact test table: created events, output item events, and unknown events. This confirms that known events are emitted and unknown events are ignored.
 
-**Data flow**: Defines local test cases with JSON payloads and predicates, appends a shared completion event to each case, runs them through `run_sse`, and asserts the expected length and first-event predicate result.
+**Data flow**: It builds multiple test cases, appends a completion event to each, runs them through `run_sse`, and checks the number and type of emitted events.
 
-**Call relations**: This test gives broad coverage of `process_responses_event` dispatch behavior, especially the `Ok(None)` path for unknown events.
+**Call relations**: It broadly exercises the event-kind switch inside `process_responses_event`.
 
 *Call graph*: 5 external calls (assert!, assert_eq!, run_sse, json!, vec!).
 
@@ -1326,11 +1336,11 @@ async fn table_driven_event_kinds()
 async fn spawn_response_stream_emits_header_events()
 ```
 
-**Purpose**: Checks that `spawn_response_stream` emits header-derived metadata before any SSE body events and preserves the upstream request id on the returned stream wrapper. It specifically validates server-model extraction from HTTP headers.
+**Purpose**: Verifies that `spawn_response_stream` reads important headers before processing the body. In particular, it checks request id and server model forwarding.
 
-**Data flow**: Constructs a `StreamResponse` with `x-request-id` and `openai-model` headers and an empty byte stream, calls `spawn_response_stream`, asserts `upstream_request_id`, receives the first channel event, and checks that it is `ResponseEvent::ServerModel`.
+**Data flow**: It creates a fake `StreamResponse` with request-id and model headers but no body bytes. It starts `spawn_response_stream`, checks the returned request id, and reads the first emitted server-model event.
 
-**Call relations**: This test targets the pre-SSE setup logic in `spawn_response_stream` rather than the SSE loop itself.
+**Call relations**: This test calls `spawn_response_stream` directly and confirms the setup work that happens before `process_sse` reads the stream.
 
 *Call graph*: calls 1 internal fn (spawn_response_stream); 8 external calls (pin, new, from_static, new, assert_eq!, idle_timeout, panic!, iter).
 
@@ -1341,11 +1351,11 @@ async fn spawn_response_stream_emits_header_events()
 async fn spawn_response_stream_ignores_model_verification_header()
 ```
 
-**Purpose**: Verifies that model-verification recommendations are not sourced from HTTP headers at stream startup. They should only come from metadata events inside the SSE payload.
+**Purpose**: Checks that model verification recommendations are not read from initial HTTP headers. They should come from stream metadata events instead.
 
-**Data flow**: Creates a `StreamResponse` with an `openai-verification-recommendation` header and a completion SSE body, runs `spawn_response_stream`, drains all emitted events, and asserts that none are `ResponseEvent::ModelVerifications`.
+**Data flow**: It builds a response with a verification recommendation header and a normal completion SSE event. It collects all emitted events and asserts that none are `ModelVerifications`.
 
-**Call relations**: This test documents the separation between startup header metadata and in-band event metadata.
+**Call relations**: It calls `spawn_response_stream` and verifies that only `process_sse` metadata extraction, not header parsing, can emit model verifications.
 
 *Call graph*: calls 1 internal fn (spawn_response_stream); 10 external calls (pin, new, from_static, new, assert!, idle_timeout, format!, json!, iter, vec!).
 
@@ -1356,11 +1366,11 @@ async fn spawn_response_stream_ignores_model_verification_header()
 async fn process_sse_ignores_response_model_field_in_payload()
 ```
 
-**Purpose**: Checks that `process_sse` does not treat `response.model` as the authoritative server-model source. Only header-style fields should trigger `ServerModel` events.
+**Purpose**: Verifies that plain `response.model` fields do not cause server model events. Only header-shaped model data is trusted for this purpose.
 
-**Data flow**: Runs a created/completed event sequence whose `response` objects contain a `model` field but no headers, then asserts that only `Created` and `Completed` events are emitted.
+**Data flow**: It sends created and completed events whose response objects contain a `model` field. It expects only created and completed events, with no server-model event.
 
-**Call relations**: This test validates the narrow extraction logic in `ResponsesStreamEvent::response_model`.
+**Call relations**: It uses `run_sse` to confirm the behavior of `ResponsesStreamEvent::response_model` as called by `process_sse`.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, run_sse, vec!).
 
@@ -1371,11 +1381,11 @@ async fn process_sse_ignores_response_model_field_in_payload()
 async fn process_sse_emits_server_model_from_response_headers_payload()
 ```
 
-**Purpose**: Verifies that a model reported inside `response.headers` is emitted as a `ServerModel` event before the semantic event that carried it. This confirms the precedence and timing of model extraction.
+**Purpose**: Checks that model information embedded in `response.headers` is emitted as a server model event. This covers streams where the model arrives inside the event payload.
 
-**Data flow**: Runs a created event whose nested `response.headers` contains `OpenAI-Model`, followed by completion, and asserts the emitted sequence `ServerModel`, `Created`, `Completed`.
+**Data flow**: It sends a created event containing `response.headers.OpenAI-Model`, then a completion. It expects a server-model event before the created and completed events.
 
-**Call relations**: This test covers `ResponsesStreamEvent::response_model` together with the deduplicating model-emission logic in `process_sse`.
+**Call relations**: It tests the path from `process_sse` through `ResponsesStreamEvent::response_model` and `header_openai_model_value_from_json`.
 
 *Call graph*: 4 external calls (assert_eq!, assert_matches!, run_sse, vec!).
 
@@ -1386,11 +1396,11 @@ async fn process_sse_emits_server_model_from_response_headers_payload()
 async fn process_sse_emits_model_verification_field()
 ```
 
-**Purpose**: Checks that metadata events carrying `openai_verification_recommendation` are converted into `ResponseEvent::ModelVerifications`. It validates the metadata side channel in the SSE loop.
+**Purpose**: Verifies that known model verification metadata is emitted as an internal event. This checks the trusted-access-for-cyber metadata path.
 
-**Data flow**: Runs a metadata event with the trusted-access recommendation followed by completion, then asserts that the first emitted event contains the expected `ModelVerification` vector.
+**Data flow**: It sends a `response.metadata` event with a verification recommendation array, followed by completion. It expects a `ModelVerifications` event containing `TrustedAccessForCyber`.
 
-**Call relations**: This test exercises `ResponsesStreamEvent::model_verifications`, `model_verifications_from_json_value`, and the metadata emission branch in `process_sse`.
+**Call relations**: It exercises `ResponsesStreamEvent::model_verifications`, `model_verifications_from_json_value`, and `parse_model_verification` through `process_sse`.
 
 *Call graph*: 3 external calls (assert_matches!, run_sse, vec!).
 
@@ -1401,11 +1411,11 @@ async fn process_sse_emits_model_verification_field()
 async fn process_sse_emits_turn_moderation_metadata_field()
 ```
 
-**Purpose**: Verifies that moderation metadata embedded in a metadata event is surfaced as `ResponseEvent::TurnModerationMetadata` with the raw JSON preserved. It confirms that this metadata is emitted independently of normal response items.
+**Purpose**: Checks that turn moderation metadata is forwarded when present. This ensures safety or presentation metadata is not lost during stream parsing.
 
-**Data flow**: Runs a metadata event containing `openai_chatgpt_moderation_metadata` followed by completion and asserts the emitted moderation metadata payload.
+**Data flow**: It sends a metadata event with `openai_chatgpt_moderation_metadata`, followed by completion. It expects a `TurnModerationMetadata` event containing the same JSON object.
 
-**Call relations**: This test covers `ResponsesStreamEvent::turn_moderation_metadata` and the corresponding send path in `process_sse`.
+**Call relations**: It verifies the `turn_moderation_metadata` helper as used by `process_sse`.
 
 *Call graph*: 3 external calls (assert_matches!, run_sse, vec!).
 
@@ -1416,11 +1426,11 @@ async fn process_sse_emits_turn_moderation_metadata_field()
 fn responses_stream_event_response_model_reads_top_level_headers()
 ```
 
-**Purpose**: Unit-tests that `ResponsesStreamEvent::response_model` can read the model from top-level `headers` when nested response headers are absent. This is the websocket-metadata fallback path.
+**Purpose**: Verifies that `response_model` can read model names from top-level headers on metadata events. This covers websocket-style metadata shapes.
 
-**Data flow**: Deserializes a JSON value into `ResponsesStreamEvent`, calls `response_model()`, and asserts the returned string.
+**Data flow**: It deserializes a JSON event with top-level `headers.openai-model` and checks that `response_model` returns that model string.
 
-**Call relations**: This test isolates the accessor logic without involving the SSE loop.
+**Call relations**: It tests `ResponsesStreamEvent::response_model` and the header model extraction helper directly.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1431,11 +1441,11 @@ fn responses_stream_event_response_model_reads_top_level_headers()
 fn responses_stream_event_response_model_prefers_response_headers()
 ```
 
-**Purpose**: Checks that nested `response.headers` take precedence over top-level `headers` when both contain model information. This enforces the documented precedence rule.
+**Purpose**: Checks that response-level headers win over top-level headers when both contain a model. This avoids using less-specific metadata when a direct response header is available.
 
-**Data flow**: Deserializes an event containing both header locations, calls `response_model()`, and asserts that the nested response-header value wins.
+**Data flow**: It creates an event with different model names in top-level headers and `response.headers`. It asserts that `response_model` returns the response-level model.
 
-**Call relations**: This test directly targets the precedence logic inside `ResponsesStreamEvent::response_model`.
+**Call relations**: It directly verifies the precedence documented in `ResponsesStreamEvent::response_model`.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1446,11 +1456,11 @@ fn responses_stream_event_response_model_prefers_response_headers()
 fn responses_stream_event_model_verification_reads_metadata_field()
 ```
 
-**Purpose**: Verifies that a metadata event with a recognized verification recommendation yields the expected enum vector. It confirms the positive path for metadata parsing.
+**Purpose**: Verifies that model verification recommendations are read from the expected metadata field. This confirms the happy path for known verification values.
 
-**Data flow**: Deserializes a metadata JSON value into `ResponsesStreamEvent`, calls `model_verifications()`, and asserts the returned vector.
+**Data flow**: It deserializes a metadata event with a recommendation array containing the trusted cyber access value and checks that the helper returns the matching enum.
 
-**Call relations**: This test isolates the accessor and parsing helpers from the rest of the SSE machinery.
+**Call relations**: It tests `ResponsesStreamEvent::model_verifications` and its parsing helpers directly.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1461,11 +1471,11 @@ fn responses_stream_event_model_verification_reads_metadata_field()
 fn responses_stream_event_model_verification_ignores_unknown_field()
 ```
 
-**Purpose**: Checks that unknown verification recommendation strings are ignored rather than propagated. If nothing recognized remains, the result should be `None`.
+**Purpose**: Checks that unknown verification recommendation strings are ignored. This keeps future or unexpected server values from breaking clients.
 
-**Data flow**: Deserializes a metadata event whose recommendation array contains only `unknown`, calls `model_verifications()`, and asserts `None`.
+**Data flow**: It deserializes a metadata event with an array containing `unknown` and asserts that no verifications are returned.
 
-**Call relations**: This test covers the filtering behavior in `parse_model_verification` and `model_verifications_from_json_value`.
+**Call relations**: It directly tests the filtering behavior in `parse_model_verification` and `model_verifications_from_json_value`.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1476,11 +1486,11 @@ fn responses_stream_event_model_verification_ignores_unknown_field()
 fn responses_stream_event_model_verification_ignores_non_array_field()
 ```
 
-**Purpose**: Ensures that malformed non-array verification metadata is ignored. The parser requires an array of strings.
+**Purpose**: Checks that the verification field must be an array. This avoids treating malformed metadata as a valid recommendation.
 
-**Data flow**: Deserializes a metadata event whose recommendation field is a scalar string, calls `model_verifications()`, and asserts `None`.
+**Data flow**: It deserializes a metadata event where the recommendation field is a single string instead of a list and expects no result.
 
-**Call relations**: This test covers the non-array branch in `model_verifications_from_json_value`.
+**Call relations**: It verifies the array check inside `model_verifications_from_json_value` through `ResponsesStreamEvent::model_verifications`.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -1491,11 +1501,11 @@ fn responses_stream_event_model_verification_ignores_non_array_field()
 fn test_try_parse_retry_after()
 ```
 
-**Purpose**: Verifies millisecond retry-delay extraction from a rate-limit message. It covers the `ms` unit branch.
+**Purpose**: Verifies that millisecond retry delays can be parsed from rate-limit messages. This covers messages that say things like `28ms`.
 
-**Data flow**: Constructs a local `Error` with code `rate_limit_exceeded` and a message containing `28ms`, calls `try_parse_retry_after`, and asserts the returned duration.
+**Data flow**: It builds an `Error` with code `rate_limit_exceeded` and a message containing `try again in 28ms`, calls `try_parse_retry_after`, and expects a 28 millisecond duration.
 
-**Call relations**: This test directly exercises the regex-based delay parser.
+**Call relations**: It tests `try_parse_retry_after` directly, including its use of `rate_limit_regex`.
 
 *Call graph*: calls 1 internal fn (try_parse_retry_after); 1 external calls (assert_eq!).
 
@@ -1506,11 +1516,11 @@ fn test_try_parse_retry_after()
 fn test_try_parse_retry_after_no_delay()
 ```
 
-**Purpose**: Verifies fractional-second retry-delay extraction from a standard OpenAI-style rate-limit message. It covers the seconds branch with decimal values.
+**Purpose**: Verifies that fractional-second retry delays can be parsed from rate-limit messages. Despite the name, this test expects a delay from `1.898s`.
 
-**Data flow**: Builds an `Error` containing `Please try again in 1.898s`, calls `try_parse_retry_after`, and asserts `Duration::from_secs_f64(1.898)`.
+**Data flow**: It builds a rate-limit `Error` message containing `try again in 1.898s`, calls `try_parse_retry_after`, and checks for a 1.898 second duration.
 
-**Call relations**: This test complements the millisecond case for `try_parse_retry_after`.
+**Call relations**: It directly exercises the seconds branch in `try_parse_retry_after`.
 
 *Call graph*: calls 1 internal fn (try_parse_retry_after); 1 external calls (assert_eq!).
 
@@ -1521,24 +1531,24 @@ fn test_try_parse_retry_after_no_delay()
 fn test_try_parse_retry_after_azure()
 ```
 
-**Purpose**: Checks that Azure-style wording `Try again in 35 seconds` is also parsed correctly. This broadens compatibility beyond one provider's exact phrasing.
+**Purpose**: Verifies that Azure-style rate-limit wording with full `seconds` units is parsed. This makes retry behavior work across slightly different server messages.
 
-**Data flow**: Constructs an `Error` with a message containing `35 seconds`, calls `try_parse_retry_after`, and asserts `Duration::from_secs(35)`.
+**Data flow**: It builds a rate-limit `Error` with the message `Try again in 35 seconds`, calls `try_parse_retry_after`, and expects a 35 second duration.
 
-**Call relations**: This test documents why the regex accepts both abbreviated and full-word second units.
+**Call relations**: It directly tests `try_parse_retry_after` and the shared retry-delay regular expression.
 
 *Call graph*: calls 1 internal fn (try_parse_retry_after); 1 external calls (assert_eq!).
 
 
 ### `codex-api/src/endpoint/responses_websocket.rs`
 
-`io_transport` · `connection setup and websocket request handling`
+`io_transport` · `websocket connection setup and response streaming`
 
-This file is the full websocket transport for the `responses` endpoint. At the bottom is `WsStream`, an internal wrapper around `tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>` that spawns a pump task. That task multiplexes outbound commands from an `mpsc` channel with inbound websocket frames via `tokio::select!`, automatically answers `Ping` with `Pong`, suppresses incoming `Pong`, forwards text/binary/close/frame messages to an unbounded receiver, and terminates on send/read errors or close. `Drop` aborts the pump task.
+A normal HTTP request is like mailing a letter and waiting for a reply. A WebSocket is more like keeping a phone line open: the client can send a request, and the server can stream back many small updates as work progresses. This file builds and protects that phone line for the Responses API.
 
-`ResponsesWebsocketClient` owns a `Provider` and auth source and can either establish a reusable `ResponsesWebsocketConnection` or perform a handshake-only probe. Connection setup builds the websocket URL from the provider, merges provider/extra/default headers with HTTP-like precedence, adds auth headers, ensures the rustls crypto provider is installed, optionally builds a custom-CA TLS connector, enables permessage-deflate, performs the upgrade, and captures response metadata such as reasoning support, models ETag, selected model, and optional turn-state header.
+The lower layer, `WsStream`, wraps the raw WebSocket connection. It runs a background task that is the only place allowed to touch the socket directly. That task sends outgoing messages, reads incoming messages, answers server pings with pongs, and forwards useful messages to the rest of the code. This avoids two async tasks writing to or reading from the same socket at the same time.
 
-`ResponsesWebsocketConnection::stream_request` serializes a `ResponsesWsRequest`, emits initial synthetic `ResponseEvent`s for server metadata, then locks the shared `WsStream` for the lifetime of one response stream so requests are strictly serialized on a connection. `run_websocket_response_stream` sends the request with timeout/telemetry, then loops reading frames under an idle timeout. Text frames are first checked for wrapped websocket error payloads that can become retryable or HTTP transport errors; otherwise they are parsed as `ResponsesStreamEvent`, used to update turn state and emit rate-limit/model-verification/moderation metadata events, and finally converted through `process_responses_event`. The loop exits only on `ResponseEvent::Completed`; binary frames, premature close, parse failures in wrapped errors, or consumer drop become stream errors. The file also includes tests for serialization fidelity, websocket config, wrapped-error mapping, and header precedence.
+`ResponsesWebsocketClient` knows how to create a connection: build the provider URL, combine headers, add authentication, configure TLS certificate trust, and read special headers returned by the server. `ResponsesWebsocketConnection` then uses that open connection to stream a request. It serializes the request as JSON, sends it, waits for text events, maps rate limits and wrapped server errors, records turn state, and stops only when it sees the final completed event. If anything goes wrong, it closes the shared connection so later code does not reuse a broken socket.
 
 #### Function details
 
@@ -1548,11 +1558,11 @@ This file is the full websocket transport for the `responses` endpoint. At the b
 fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self
 ```
 
-**Purpose**: Wraps a raw tungstenite websocket stream in a background pump task that serializes outbound commands and forwards inbound frames through channels. It also implements automatic ping/pong handling.
+**Purpose**: Creates a safe wrapper around a raw WebSocket connection. It starts a background pump task that owns the actual socket, so all reads and writes happen in one controlled place.
 
-**Data flow**: Consumes `inner: WebSocketStream<MaybeTlsStream<TcpStream>>`, creates a bounded command channel and unbounded message channel, then spawns an async loop owning `inner`. That loop selects between outbound commands and inbound websocket messages: send commands call `inner.send`, returning the result through a oneshot; incoming `Ping` frames trigger an immediate `Pong`; `Pong` is ignored; text, binary, close, and frame messages are forwarded to `rx_message`; any websocket error is forwarded as `Err`. It returns a `WsStream` containing the command sender, message receiver, and join handle.
+**Data flow**: It receives an open WebSocket stream. It creates one channel for outgoing commands and another for incoming messages, then starts a background task that sends messages, reads messages, replies to pings, ignores pongs, and forwards text, binary, close, or error results. It returns a `WsStream` containing the command sender, message receiver, and task handle.
 
-**Call relations**: This constructor is used by `connect_websocket` after a successful upgrade. It creates the internal concurrency boundary that later methods (`send`, `next`) and higher-level response streaming rely on.
+**Call relations**: This is used after `connect_websocket` successfully upgrades to a WebSocket. Later, `WsStream::send` asks the pump to write, and `WsStream::next` receives messages that the pump has read.
 
 *Call graph*: 2 external calls (select!, spawn).
 
@@ -1566,11 +1576,11 @@ async fn request(
     ) -> Result<(), WsError>
 ```
 
-**Purpose**: Sends one command to the pump task and waits for the command-specific completion result. It is the generic request/response primitive behind websocket writes.
+**Purpose**: Sends a command to the WebSocket pump and waits to learn whether it succeeded. It is a small helper used to make socket operations feel like direct async calls while still going through the pump task.
 
-**Data flow**: Takes a closure that builds a `WsCommand` from a oneshot sender, allocates that oneshot pair, sends the command over `tx_command`, and awaits the reply. If the command channel is closed or the oneshot is dropped, it returns `WsError::ConnectionClosed`; otherwise it returns the pump task's `Result<(), WsError>` for that command.
+**Data flow**: It receives a function that builds a command, creates a one-use reply channel, sends the command to the pump, and waits for the reply. If the pump is gone or does not answer, it returns a closed-connection error.
 
-**Call relations**: This helper is called by `WsStream::send` to implement actual websocket writes. It centralizes the channel/oneshot handshake so additional command types could reuse the same pattern.
+**Call relations**: `WsStream::send` calls this when it wants to write a message. The background pump created by `WsStream::new` receives the command and sends the success or failure result back.
 
 *Call graph*: called by 1 (send); 2 external calls (send, channel).
 
@@ -1581,11 +1591,11 @@ async fn request(
 async fn send(&self, message: Message) -> Result<(), WsError>
 ```
 
-**Purpose**: Queues a websocket message for transmission through the pump task. It provides the write-side API used by higher-level request sending.
+**Purpose**: Queues one WebSocket message to be sent. Callers use it when they need to send a request frame without directly touching the socket.
 
-**Data flow**: Accepts a tungstenite `Message`, wraps it in `WsCommand::Send` via `WsStream::request`, and returns the resulting `Result<(), WsError>` from the pump task.
+**Data flow**: It receives a WebSocket message, wraps it in a send command, passes it through `WsStream::request`, and returns either success or the socket write error.
 
-**Call relations**: This method is called by `send_websocket_request`, which adds timeout and telemetry around the actual send. It delegates all synchronization and error propagation to `request`.
+**Call relations**: `send_websocket_request` calls this to send the serialized Responses request. Internally it hands the work to `WsStream::request`, which hands it to the pump task.
 
 *Call graph*: calls 1 internal fn (request).
 
@@ -1596,11 +1606,11 @@ async fn send(&self, message: Message) -> Result<(), WsError>
 async fn next(&mut self) -> Option<Result<Message, WsError>>
 ```
 
-**Purpose**: Receives the next forwarded inbound websocket message from the pump task. It is the read-side API exposed to the response-stream loop.
+**Purpose**: Waits for the next meaningful incoming WebSocket message or socket error. It gives higher-level code a simple way to consume messages that the pump task has already filtered.
 
-**Data flow**: Mutably borrows `self`, awaits `rx_message.recv()`, and returns `Option<Result<Message, WsError>>`, where `None` means the pump task has stopped and closed the channel.
+**Data flow**: It reads from the incoming message channel. The result is either the next message, an error from the socket, or `None` if the stream has ended.
 
-**Call relations**: This method is used by `run_websocket_response_stream` and by the handshake probe path to consume incoming frames without touching the raw tungstenite stream directly.
+**Call relations**: `run_websocket_response_stream` uses this while waiting for server response events. `probe_handshake` also uses it briefly to see whether the server closes immediately after connecting.
 
 *Call graph*: 1 external calls (recv).
 
@@ -1611,11 +1621,11 @@ async fn next(&mut self) -> Option<Result<Message, WsError>>
 fn drop(&mut self)
 ```
 
-**Purpose**: Stops the background pump task when the wrapper is dropped. This prevents orphaned websocket tasks from lingering after the stream is no longer used.
+**Purpose**: Stops the background WebSocket pump when the wrapper is no longer needed. This prevents an abandoned task from continuing to run after the connection has been discarded.
 
-**Data flow**: On drop, it calls `abort()` on the stored `JoinHandle<()>`. It does not return a value or perform graceful shutdown.
+**Data flow**: When the `WsStream` is dropped, it aborts the pump task stored inside it. Nothing is returned, but the background task is told to stop.
 
-**Call relations**: This destructor runs automatically when a `WsStream` is removed from a connection or dropped after a failed stream. It complements `WsStream::new` by cleaning up the spawned task.
+**Call relations**: This runs automatically when a connection is closed or removed from `ResponsesWebsocketConnection`. It cleans up the task started by `WsStream::new`.
 
 *Call graph*: 1 external calls (abort).
 
@@ -1626,11 +1636,11 @@ fn drop(&mut self)
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Provides a redacted `Debug` representation for websocket connections. It exposes configuration and cached metadata while hiding the live stream internals and telemetry object details.
+**Purpose**: Provides a safe debug view of a WebSocket connection. It shows useful connection settings without trying to print the raw socket or telemetry object.
 
-**Data flow**: Reads `idle_timeout`, `server_reasoning_included`, `models_etag`, `server_model`, and whether telemetry is present, then writes those fields into a `debug_struct`. The actual stream is rendered as the placeholder string `"<ws-stream>"`.
+**Data flow**: It receives the connection and a debug formatter. It writes fields like timeout, server feature flags, model information, and placeholders for private or complex fields.
 
-**Call relations**: This formatting implementation is used whenever the connection is logged or debug-printed. It avoids leaking transport internals while still surfacing useful state.
+**Call relations**: Rust debugging tools call this when the connection is formatted with debug output. It avoids exposing low-level stream details while still helping diagnose state.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1647,11 +1657,11 @@ fn new(
         telemetry:
 ```
 
-**Purpose**: Constructs a reusable websocket connection object from an established `WsStream` and handshake metadata. It packages the stream behind shared mutable state so one request stream can lock it at a time.
+**Purpose**: Builds the reusable connection object after a WebSocket has been opened. It stores the stream, timeout, server-provided metadata, and optional telemetry hooks together.
 
-**Data flow**: Consumes a `WsStream`, idle timeout, booleans/strings captured from upgrade headers, and optional websocket telemetry. It wraps the stream in `Arc<Mutex<Option<WsStream>>>`, stores the metadata fields, and returns `ResponsesWebsocketConnection`.
+**Data flow**: It receives a `WsStream`, an idle timeout, server capability flags, optional model metadata, and optional telemetry. It wraps the stream in a shared async lock and returns a `ResponsesWebsocketConnection` ready to stream requests.
 
-**Call relations**: This constructor is called by `ResponsesWebsocketClient::connect` after `connect_websocket` succeeds. The `Option<WsStream>` wrapper is later used by `stream_request` to permanently take and drop the stream on terminal failure.
+**Call relations**: `ResponsesWebsocketClient::connect` calls this after `connect_websocket` succeeds. Later, `stream_request` uses the stored pieces to send a request and report events.
 
 *Call graph*: called by 1 (connect); 2 external calls (new, new).
 
@@ -1662,11 +1672,11 @@ fn new(
 async fn is_closed(&self) -> bool
 ```
 
-**Purpose**: Reports whether the underlying websocket stream has already been removed from the connection. It is a lightweight health check for callers managing connection reuse.
+**Purpose**: Checks whether this connection has already been marked unusable. It is a simple health check before trying to reuse the WebSocket.
 
-**Data flow**: Locks `self.stream` asynchronously and returns `true` if the inner `Option<WsStream>` is `None`, otherwise `false`.
+**Data flow**: It locks the shared stream slot and checks whether the slot is empty. It returns `true` if the stream has been removed and `false` if a stream is still present.
 
-**Call relations**: This method is called by external connection-management code before attempting reuse. It reads the state that `stream_request` mutates when a terminal stream error occurs.
+**Call relations**: Other code can call this before deciding whether to reuse or replace the connection. The slot becomes empty when streaming hits a terminal error and `stream_request` removes the failed stream.
 
 
 ##### `ResponsesWebsocketConnection::stream_request`  (lines 214–287)
@@ -1680,11 +1690,11 @@ async fn stream_request(
     ) -> Result<ResponseStream, ApiErro
 ```
 
-**Purpose**: Starts one streamed Responses request over an existing websocket connection and returns a `ResponseStream` backed by a spawned task. It also emits initial metadata events derived from the handshake before reading response frames.
+**Purpose**: Starts one Responses request over the existing WebSocket and returns a stream of app-level events. It keeps exclusive use of the shared socket until that response finishes, so overlapping requests do not mix their messages.
 
-**Data flow**: Accepts a typed `ResponsesWsRequest`, a `connection_reused` flag, and optional turn-state storage. It creates an `mpsc` channel for `Result<ResponseEvent, ApiError>`, clones connection state needed by the task, serializes the request with `serialize_websocket_request`, and spawns an instrumented async task. That task first sends synthetic `ServerModel`, `ModelsEtag`, and `ServerReasoningIncluded` events when available, then locks the shared `Arc<Mutex<Option<WsStream>>>`; if the stream is absent it sends `ApiError::Stream("websocket connection is closed")`. Otherwise it calls `run_websocket_response_stream`. On terminal error it takes the `WsStream` out of the `Option`, drops it to abort the pump, and forwards the error to the consumer. The method immediately returns `ResponseStream { rx_event, upstream_request_id: None }`.
+**Data flow**: It receives a request, a flag saying whether the connection was reused, and optional turn-state storage. It serializes the request to JSON, creates an event channel for the caller, sends initial server metadata events, locks the socket, and spawns a task that runs the actual streaming loop. It returns a `ResponseStream` immediately, while the spawned task feeds events or errors into it.
 
-**Call relations**: This is the main per-request entrypoint on an established connection. It delegates request serialization to `serialize_websocket_request` and all frame-level protocol handling to `run_websocket_response_stream`, while owning the connection-locking and failure-teardown policy.
+**Call relations**: Callers use this after `ResponsesWebsocketClient::connect` has produced a connection. It delegates request encoding to `serialize_websocket_request` and message processing to `run_websocket_response_stream`; if that lower-level stream fails, it removes the socket so the broken connection will not be reused.
 
 *Call graph*: calls 2 internal fn (run_websocket_response_stream, serialize_websocket_request); 7 external calls (clone, current, ModelsEtag, ServerModel, ServerReasoningIncluded, Stream, spawn).
 
@@ -1695,11 +1705,11 @@ async fn stream_request(
 fn new(provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a websocket client bound to a specific provider and auth source. It is the factory for both full connections and handshake probes.
+**Purpose**: Creates a client tied to one provider and one authentication source. This gives later connection attempts everything they need to know where to connect and how to prove identity.
 
-**Data flow**: Consumes `provider: Provider` and `auth: SharedAuthProvider` and returns `ResponsesWebsocketClient { provider, auth }`.
+**Data flow**: It receives a `Provider` and shared authentication provider, stores them in a new `ResponsesWebsocketClient`, and returns it.
 
-**Call relations**: This constructor is used by callers that want websocket access to the Responses endpoint. Subsequent `connect` and `probe_handshake` calls reuse the stored provider and auth configuration.
+**Call relations**: The websocket reachability check and normal API setup can create this client before calling `connect` or `probe_handshake`.
 
 *Call graph*: called by 1 (websocket_reachability_check).
 
@@ -1715,11 +1725,11 @@ async fn connect(
         telemetry: Option<Arc<dyn WebsocketTel
 ```
 
-**Purpose**: Establishes a real websocket connection to the Responses endpoint, including URL construction, header merging, authentication, TLS setup, and handshake metadata capture. It returns a reusable `ResponsesWebsocketConnection`.
+**Purpose**: Opens a real Responses WebSocket connection for streaming model responses. It applies provider headers, caller headers, default headers, and authentication before connecting.
 
-**Data flow**: Accepts caller `extra_headers`, `default_headers`, optional turn-state storage, and optional websocket telemetry. It asks the provider for `websocket_url_for_path("responses")`, merges provider/extra/default headers via `merge_request_headers`, mutates the merged map with auth headers, then awaits `connect_websocket`. From the returned stream, status-independent metadata, and provider idle timeout it constructs `ResponsesWebsocketConnection::new(...)` and returns it. URL-construction failures are mapped to `ApiError::Stream`.
+**Data flow**: It receives extra headers, default headers, optional turn-state storage, and optional telemetry. It asks the provider for the `responses` WebSocket URL, merges headers, adds auth, calls `connect_websocket`, then wraps the resulting stream and server metadata in a `ResponsesWebsocketConnection`.
 
-**Call relations**: This public method is the normal connection-establishment path. It delegates header precedence to `merge_request_headers` and the actual websocket/TLS handshake to `connect_websocket`.
+**Call relations**: Higher-level code calls this when it needs a usable WebSocket. It relies on `merge_request_headers` for header precedence, `connect_websocket` for the network handshake, and `ResponsesWebsocketConnection::new` for the final connection object.
 
 *Call graph*: calls 4 internal fn (new, connect_websocket, merge_request_headers, websocket_url_for_path); 1 external calls (add_auth_headers).
 
@@ -1735,11 +1745,11 @@ async fn probe_handshake(
     ) -> Result<ResponsesWebsocketProbe, ApiEr
 ```
 
-**Purpose**: Performs a handshake-only websocket probe that validates upgrade success and optionally captures an immediate close frame for diagnostics. It uses the same URL, headers, auth, and TLS path as a real connection but does not send a request.
+**Purpose**: Tests whether a Responses WebSocket handshake works without sending an actual model request. It is used for diagnostics, like checking whether the server upgrades successfully or closes immediately.
 
-**Data flow**: Takes `extra_headers`, `default_headers`, and an `immediate_close_timeout`. It builds the websocket URL, merges headers, adds auth headers, and calls `connect_websocket` with no turn-state sink. After upgrade it waits up to the supplied timeout for `stream.next()`, converts any received close frame through `immediate_close_from_message`, and returns `ResponsesWebsocketProbe` containing the URL string, HTTP status, booleans indicating presence of reasoning/model headers, and optional immediate-close details. Read failures become `ApiError::Stream`.
+**Data flow**: It builds the same URL and headers as a real connection, adds authentication, connects, then waits only briefly for a close message. It returns a probe report containing the URL, HTTP upgrade status, server feature hints, and any immediate close reason.
 
-**Call relations**: This method is a sibling to `connect`, sharing the same setup helpers but stopping after the handshake. It uses `immediate_close_from_message` to distinguish a healthy upgrade from a server that immediately closes the socket.
+**Call relations**: Diagnostic code calls this instead of `connect` when it only wants reachability information. It uses `connect_websocket` for the same connection path as production traffic and `immediate_close_from_message` to interpret a quick close frame.
 
 *Call graph*: calls 3 internal fn (connect_websocket, merge_request_headers, websocket_url_for_path); 2 external calls (add_auth_headers, timeout).
 
@@ -1750,11 +1760,11 @@ async fn probe_handshake(
 fn immediate_close_from_message(message: Message) -> Option<ResponsesWebsocketClose>
 ```
 
-**Purpose**: Extracts probe-friendly close information from a websocket message only when that message is a close frame. Non-close messages are ignored.
+**Purpose**: Extracts close information from a WebSocket message if the message is a close frame. It helps diagnostic probes describe why a server accepted a connection and then immediately ended it.
 
-**Data flow**: Consumes a tungstenite `Message`; if it is `Message::Close(frame)`, it maps the optional `CloseFrame` through `close_frame_to_probe`, otherwise it returns `None`.
+**Data flow**: It receives one WebSocket message. If it is not a close message, it returns nothing; if it is a close message with frame details, it converts those details into a `ResponsesWebsocketClose`.
 
-**Call relations**: This helper is used by `probe_handshake` after waiting briefly for a post-upgrade frame. It isolates the close-frame pattern match from the probe orchestration.
+**Call relations**: `probe_handshake` calls this after its short wait for an immediate server message. It hands close frames to `close_frame_to_probe` for formatting.
 
 
 ##### `close_frame_to_probe`  (lines 414–419)
@@ -1763,11 +1773,11 @@ fn immediate_close_from_message(message: Message) -> Option<ResponsesWebsocketCl
 fn close_frame_to_probe(frame: CloseFrame) -> ResponsesWebsocketClose
 ```
 
-**Purpose**: Converts a tungstenite `CloseFrame` into the public diagnostic struct `ResponsesWebsocketClose`. It preserves the server's close code and reason as strings.
+**Purpose**: Turns a low-level WebSocket close frame into a small diagnostic record. This makes the close code and human-readable reason easy to include in probe results.
 
-**Data flow**: Takes `frame: CloseFrame` and returns `ResponsesWebsocketClose { code: frame.code.to_string(), reason: frame.reason.to_string() }`.
+**Data flow**: It receives a close frame from the WebSocket library. It copies the close code and reason into strings and returns a `ResponsesWebsocketClose`.
 
-**Call relations**: This helper is only called by `immediate_close_from_message` when the handshake probe receives a close frame.
+**Call relations**: `immediate_close_from_message` calls this when the probe sees a close frame right after connection.
 
 
 ##### `merge_request_headers`  (lines 421–434)
@@ -1780,11 +1790,11 @@ fn merge_request_headers(
 ) -> HeaderMap
 ```
 
-**Purpose**: Combines provider, extra, and default headers using HTTP-like precedence rules. Provider headers win over defaults, and explicit extra headers win over provider values.
+**Purpose**: Combines headers from three sources using the same priority rules as HTTP requests elsewhere in the client. Provider headers come first, extra caller headers can override them, and defaults only fill missing names.
 
-**Data flow**: Clones `provider_headers` into a new `HeaderMap`, extends it with `extra_headers` so duplicates are overwritten by extra values, then iterates `default_headers` and inserts each only if that header name is currently vacant. It returns the merged `HeaderMap`.
+**Data flow**: It receives provider headers by reference plus owned extra and default headers. It clones the provider headers, extends them with extra headers, then inserts each default only if that header is still absent. It returns the merged header map.
 
-**Call relations**: This helper is used by both `connect` and `probe_handshake` before auth headers are added. The included test verifies the intended precedence ordering.
+**Call relations**: `ResponsesWebsocketClient::connect` and `probe_handshake` call this before adding authentication and connecting. The test `tests::merge_request_headers_matches_http_precedence` checks the intended priority order.
 
 *Call graph*: called by 3 (connect, probe_handshake, merge_request_headers_matches_http_precedence); 1 external calls (clone).
 
@@ -1799,11 +1809,11 @@ async fn connect_websocket(
 ) -> Result<(WsStream, StatusCode, bool, Option<String>, Option<String>), ApiError>
 ```
 
-**Purpose**: Performs the low-level websocket upgrade, TLS/custom-CA configuration, compression setup, and extraction of handshake metadata. It is the shared transport primitive behind both real connections and probes.
+**Purpose**: Performs the actual network handshake for a Responses WebSocket. It builds the request, applies TLS settings, connects to the server, reads useful upgrade headers, and wraps the socket for safe use.
 
-**Data flow**: Accepts a `Url`, merged `HeaderMap`, and optional turn-state `OnceLock`. It ensures the rustls crypto provider is installed, builds a client request from the URL string, extends request headers, optionally creates a rustls connector from custom CA configuration, and calls `connect_async_tls_with_config` with `websocket_config()`. On success it logs response headers, reads `x-reasoning-included`, `x-models-etag`, `openai-model`, and optionally `x-codex-turn-state` from the upgrade response, storing turn state into the provided `OnceLock` if present. It returns `(WsStream::new(stream), response.status(), reasoning_included, models_etag, server_model)`. On failure it logs and maps the tungstenite error through `map_ws_error`.
+**Data flow**: It receives a WebSocket URL, headers, and optional turn-state storage. It ensures the TLS crypto provider is ready, builds a WebSocket request, attaches headers, optionally builds a custom certificate configuration, connects, and maps any connection failure to `ApiError`. On success, it records server flags and headers such as reasoning support, model ETag, selected model, and turn state, then returns a `WsStream`, HTTP status, and metadata.
 
-**Call relations**: This function is called by both `ResponsesWebsocketClient::connect` and `probe_handshake`. It is the single place where websocket-specific TLS policy, compression configuration, and handshake-header extraction are implemented.
+**Call relations**: Both `ResponsesWebsocketClient::connect` and `probe_handshake` call this. It uses `websocket_config` for compression support, `map_ws_error` for failed handshakes, and `WsStream::new` to wrap the connected socket.
 
 *Call graph*: calls 3 internal fn (new, map_ws_error, websocket_config); called by 2 (connect, probe_handshake); 6 external calls (as_str, maybe_build_rustls_client_config_with_custom_ca, ensure_rustls_crypto_provider, error!, info!, connect_async_tls_with_config).
 
@@ -1814,11 +1824,11 @@ async fn connect_websocket(
 fn websocket_config() -> WebSocketConfig
 ```
 
-**Purpose**: Builds the tungstenite websocket configuration used for Responses connections. Its only customization is enabling permessage-deflate compression.
+**Purpose**: Creates the WebSocket configuration used by this client. Its important choice is enabling per-message deflate, which is compression for individual WebSocket messages.
 
-**Data flow**: Creates default `ExtensionsConfig`, sets `permessage_deflate` to `Some(DeflateConfig::default())`, creates default `WebSocketConfig`, assigns the extensions config, and returns the resulting `WebSocketConfig`.
+**Data flow**: It starts from default extension and socket settings, enables deflate compression in the extensions, places those extensions into the WebSocket config, and returns the config.
 
-**Call relations**: This helper is called by `connect_websocket` for every upgrade attempt. A dedicated test asserts that permessage-deflate is enabled.
+**Call relations**: `connect_websocket` passes this configuration into the WebSocket library during connection. The test `tests::websocket_config_enables_permessage_deflate` verifies compression is enabled.
 
 *Call graph*: called by 2 (connect_websocket, websocket_config_enables_permessage_deflate); 3 external calls (default, default, default).
 
@@ -1829,11 +1839,11 @@ fn websocket_config() -> WebSocketConfig
 fn map_ws_error(err: WsError, url: &Url) -> ApiError
 ```
 
-**Purpose**: Translates tungstenite connection errors into the crate's `ApiError` model, preserving HTTP upgrade failures when possible. It distinguishes HTTP, closed-connection, I/O, and generic network errors.
+**Purpose**: Converts errors from the WebSocket library into the API client's own error types. This keeps callers from needing to understand the WebSocket library's private error vocabulary.
 
-**Data flow**: Consumes `err: WsError` and the target `url`. For `WsError::Http(response)`, it extracts status, cloned headers, and an optional UTF-8 body and returns `ApiError::Transport(TransportError::Http { ... })`. For `ConnectionClosed` or `AlreadyClosed` it returns `ApiError::Stream("websocket closed")`. For `Io(err)` and all other variants it returns `ApiError::Transport(TransportError::Network(...))` using stringified error text.
+**Data flow**: It receives a WebSocket error and the URL being contacted. HTTP handshake failures become transport HTTP errors with status, headers, body, and URL; closed connections become stream errors; input/output and other failures become network transport errors.
 
-**Call relations**: This helper is only used by `connect_websocket` when the upgrade fails. It centralizes the policy for preserving as much diagnostic information as possible from tungstenite errors.
+**Call relations**: `connect_websocket` calls this when the handshake fails. The mapped `ApiError` then travels back to `connect` or `probe_handshake`.
 
 *Call graph*: called by 1 (connect_websocket); 5 external calls (to_string, to_string, Stream, Transport, Network).
 
@@ -1844,11 +1854,11 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError
 fn parse_wrapped_websocket_error_event(payload: &str) -> Option<WrappedWebsocketErrorEvent>
 ```
 
-**Purpose**: Parses a websocket text payload into the internal wrapped-error struct only when the payload is an `error` event. It filters out normal response events early.
+**Purpose**: Recognizes server-sent WebSocket text messages that are wrapped error events. It separates real error envelopes from normal response events.
 
-**Data flow**: Takes `payload: &str`, attempts `serde_json::from_str::<WrappedWebsocketErrorEvent>`, returns `None` on parse failure, then checks `event.kind == "error"`. If the kind matches it returns `Some(event)`, otherwise `None`.
+**Data flow**: It receives a text payload, tries to parse it as JSON shaped like a wrapped error event, and checks that its type is `error`. It returns the parsed error event only when both parsing and the type check succeed.
 
-**Call relations**: This helper is called from `run_websocket_response_stream` before normal response-event parsing so wrapped transport-style errors can be surfaced immediately. Several tests exercise both matching and non-matching payloads.
+**Call relations**: `run_websocket_response_stream` calls this before normal event parsing so server errors can become proper `ApiError`s. Several tests call it directly to confirm error and non-error payloads are distinguished.
 
 *Call graph*: called by 6 (run_websocket_response_stream, parse_wrapped_websocket_error_event_ignores_non_error_payloads, parse_wrapped_websocket_error_event_maps_to_transport_http, parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable, parse_wrapped_websocket_error_event_with_status_maps_invalid_request, parse_wrapped_websocket_error_event_without_status_is_not_mapped); 1 external calls (from_str).
 
@@ -1862,11 +1872,11 @@ fn map_wrapped_websocket_error_event(
 ) -> Option<ApiError>
 ```
 
-**Purpose**: Converts a parsed wrapped websocket error payload into a concrete `ApiError` when the payload represents a meaningful transport or retryable failure. It has special handling for the server's websocket connection-limit code.
+**Purpose**: Turns a parsed wrapped WebSocket error event into the API client's error type when enough information is present. It also treats the known WebSocket connection time-limit error as retryable, because the client can open a new connection.
 
-**Data flow**: Consumes `WrappedWebsocketErrorEvent` plus the original payload string. If `error.code == "websocket_connection_limit_reached"`, it returns `ApiError::Retryable` with the server message or a built-in default. Otherwise it requires a numeric `status`, converts it to `StatusCode`, ignores success statuses, and returns `ApiError::Transport(TransportError::Http { status, url: None, headers: headers.map(json_headers_to_http_headers), body: Some(original_payload) })`. If required fields are absent or the status is successful, it returns `None`.
+**Data flow**: It receives the parsed event and the original JSON text. If the error code says the connection limit was reached, it returns a retryable error. Otherwise it requires a non-success HTTP status, converts any JSON headers to real HTTP headers, and returns a transport HTTP error containing the original payload as the body. If there is no status or the status is successful, it returns nothing.
 
-**Call relations**: This helper is called by `run_websocket_response_stream` after `parse_wrapped_websocket_error_event` succeeds. The tests in this file verify its mapping for HTTP-style errors, invalid requests, connection-limit retryability, and missing-status cases.
+**Call relations**: `run_websocket_response_stream` calls this right after `parse_wrapped_websocket_error_event`. The tests cover rate-limit-like HTTP errors, invalid requests, connection-limit retry behavior, and missing-status cases.
 
 *Call graph*: called by 5 (run_websocket_response_stream, parse_wrapped_websocket_error_event_maps_to_transport_http, parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable, parse_wrapped_websocket_error_event_with_status_maps_invalid_request, parse_wrapped_websocket_error_event_without_status_is_not_mapped); 2 external calls (from_u16, Transport).
 
@@ -1877,11 +1887,11 @@ fn map_wrapped_websocket_error_event(
 fn json_headers_to_http_headers(headers: JsonMap<String, Value>) -> HeaderMap
 ```
 
-**Purpose**: Converts a JSON object of header names and primitive values into an `http::HeaderMap`. Invalid names or unsupported values are skipped rather than failing the whole conversion.
+**Purpose**: Converts headers represented in a JSON object into a normal HTTP header map. This is needed because wrapped WebSocket errors may carry HTTP-like headers inside their JSON payload.
 
-**Data flow**: Takes `JsonMap<String, Value>`, creates an empty `HeaderMap`, iterates each `(name, value)` pair, parses the name with `HeaderName::from_bytes`, converts the value with `json_header_value`, and inserts successful pairs into the map. It returns the populated `HeaderMap`.
+**Data flow**: It receives a JSON map from header names to JSON values. For each entry, it keeps only valid header names and values that can become strings, then inserts them into a new header map. Invalid names or unsupported value shapes are skipped.
 
-**Call relations**: This helper is used by `map_wrapped_websocket_error_event` when turning wrapped websocket error metadata into a transport-style HTTP error.
+**Call relations**: `map_wrapped_websocket_error_event` uses this when a wrapped error event includes headers. It calls `json_header_value` to convert each JSON value safely.
 
 *Call graph*: calls 1 internal fn (json_header_value); 2 external calls (new, from_bytes).
 
@@ -1892,11 +1902,11 @@ fn json_headers_to_http_headers(headers: JsonMap<String, Value>) -> HeaderMap
 fn json_header_value(value: Value) -> Option<HeaderValue>
 ```
 
-**Purpose**: Converts a JSON primitive into an `http::HeaderValue`. Only string, number, and boolean values are accepted.
+**Purpose**: Converts one JSON value into an HTTP header value when that is safe and meaningful. It accepts simple string, number, and boolean values and rejects structured values like arrays and objects.
 
-**Data flow**: Consumes a `serde_json::Value`; strings are used directly, numbers and booleans are stringified, and all other JSON types return `None`. The resulting string is validated with `HeaderValue::from_str`, returning `Some(HeaderValue)` on success or `None` on invalid header syntax.
+**Data flow**: It receives a JSON value. Strings are used as-is, numbers and booleans are converted to text, and other JSON shapes return nothing; then it tries to build a valid HTTP header value from the text.
 
-**Call relations**: This helper is called by `json_headers_to_http_headers` for each candidate header value. It isolates the primitive-type filtering and header-value validation.
+**Call relations**: `json_headers_to_http_headers` calls this for every header value found inside a wrapped WebSocket error payload.
 
 *Call graph*: called by 1 (json_headers_to_http_headers); 2 external calls (from_str, to_string).
 
@@ -1911,11 +1921,11 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
 ```
 
-**Purpose**: Drives one full request/response exchange over an already-open websocket, enforcing idle timeouts, emitting telemetry, parsing protocol events, and stopping only when a completed response arrives. It is the core websocket streaming loop.
+**Purpose**: Runs the main loop for one Responses request over an existing WebSocket. It sends the request, reads server events until completion, translates them into `ResponseEvent`s, and turns bad or unexpected messages into API errors.
 
-**Data flow**: Takes a mutable `WsStream`, an event sender, serialized `request_text`, idle timeout, optional telemetry, a `connection_reused` flag, and optional turn-state sink. It first calls `send_websocket_request`; then in a loop it times out `ws_stream.next()` by `idle_timeout`, reports poll latency to telemetry, and matches the resulting `Message`. For `Text`, it logs the payload, checks for wrapped websocket errors via `parse_wrapped_websocket_error_event` and `map_wrapped_websocket_error_event`, otherwise parses `ResponsesStreamEvent` from JSON. Parsed events may update `turn_state`, emit `RateLimits`, `ServerModel`, `ModelVerifications`, and `TurnModerationMetadata`, and are then passed to `process_responses_event`; returned `ResponseEvent`s are forwarded to `tx_event`, and the loop breaks on `ResponseEvent::Completed`. Binary frames, premature close, websocket read errors, idle timeout, or dropped consumers become `ApiError` failures. `Frame` is ignored; ping/pong should already be handled by the pump but are tolerated.
+**Data flow**: It receives the WebSocket stream, an event sender, serialized request text, timeout, optional telemetry, reuse flag, and optional turn-state storage. It sends the request, then repeatedly waits for the next message with an idle timeout. Text messages are checked for wrapped errors, parsed as response events, used to update turn state and model metadata, and forwarded as app-level events. Rate-limit snapshots, model verifications, and moderation metadata are sent as special events. The loop exits successfully only after a completed event; socket errors, binary messages, early closes, idle timeouts, and dropped consumers become errors.
 
-**Call relations**: This function is called exclusively by `ResponsesWebsocketConnection::stream_request` inside the spawned task that holds the websocket lock. It depends on `send_websocket_request` for the initial write and on SSE-layer helpers like `process_responses_event` and `parse_rate_limit_event` to interpret text payloads.
+**Call relations**: `ResponsesWebsocketConnection::stream_request` calls this inside a spawned task while holding exclusive access to the connection. It calls `send_websocket_request` first, then uses `parse_wrapped_websocket_error_event`, `map_wrapped_websocket_error_event`, `parse_rate_limit_event`, and `process_responses_event` to turn raw messages into meaningful results.
 
 *Call graph*: calls 4 internal fn (map_wrapped_websocket_error_event, parse_wrapped_websocket_error_event, send_websocket_request, parse_rate_limit_event); called by 1 (stream_request); 13 external calls (now, send, ModelVerifications, RateLimits, ServerModel, TurnModerationMetadata, next, Stream, process_responses_event, debug! (+3 more)).
 
@@ -1932,11 +1942,11 @@ async fn send_websocket_request(
 ) ->
 ```
 
-**Purpose**: Sends the serialized request frame over the websocket with an idle timeout and telemetry reporting. It converts tungstenite send failures into `ApiError::Stream`.
+**Purpose**: Sends the already-serialized Responses request over the WebSocket and records timing information. It makes sure a stuck send does not hang forever by applying the connection's idle timeout.
 
-**Data flow**: Accepts a `WsStream`, `request_text`, idle timeout, optional telemetry reference, and `connection_reused` flag. It logs the outgoing text, records `Instant::now()`, wraps `ws_stream.send(Message::Text(...))` in `tokio::time::timeout`, maps timeout and send errors into `ApiError::Stream`, reports the elapsed duration and any error to telemetry via `on_ws_request`, and returns `Ok(())` only if the send succeeded.
+**Data flow**: It receives the stream, request JSON text, timeout, optional telemetry, and whether the connection was reused. It sends the text as a WebSocket text message inside a timeout, maps timeout or send failures into `ApiError`, reports duration and errors to telemetry if present, and returns success only after the message was sent.
 
-**Call relations**: This helper is called at the start of `run_websocket_response_stream` before any response frames are read. It isolates outbound timing/error instrumentation from the main receive loop.
+**Call relations**: `run_websocket_response_stream` calls this before it starts reading response events. It uses `WsStream::send` to hand the outgoing frame to the pump task.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (run_websocket_response_stream); 4 external calls (now, timeout, trace!, Text).
 
@@ -1947,11 +1957,11 @@ async fn send_websocket_request(
 fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<String, ApiError>
 ```
 
-**Purpose**: Serializes a typed websocket request enum into the exact JSON text sent on the wire. It preserves the request payload shape by relying on serde's normal serialization.
+**Purpose**: Encodes a Responses WebSocket request as JSON text ready to send over the wire. It keeps request serialization in one small place so errors can be reported consistently.
 
-**Data flow**: Takes `&ResponsesWsRequest`, calls `serde_json::to_string`, and returns the resulting `String` or `ApiError::Stream` if serialization fails.
+**Data flow**: It receives a `ResponsesWsRequest`, asks the JSON library to turn it into a string, and returns that string. If encoding fails, it returns an API stream error describing the failure.
 
-**Call relations**: This helper is used by `ResponsesWebsocketConnection::stream_request` before spawning the response task. A test verifies that its output round-trips to the same JSON value as direct serde serialization.
+**Call relations**: `ResponsesWebsocketConnection::stream_request` calls this before spawning the streaming task. The test `tests::direct_serialization_preserves_websocket_request_payload` checks that the WebSocket payload matches the normal JSON form.
 
 *Call graph*: called by 2 (stream_request, direct_serialization_preserves_websocket_request_payload); 1 external calls (to_string).
 
@@ -1962,11 +1972,11 @@ fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<String, A
 fn direct_serialization_preserves_websocket_request_payload()
 ```
 
-**Purpose**: Verifies that `serialize_websocket_request` produces JSON equivalent to direct serde serialization of a rich `ResponsesWsRequest`. The test guards against accidental wire-format drift.
+**Purpose**: Checks that WebSocket request serialization does not reshape or lose fields from a Responses request. This protects the wire format sent to the server.
 
-**Data flow**: Builds a `ResponsesWsRequest::ResponseCreate` containing model, instructions, previous response ID, message input, tools, include fields, service tier, prompt cache key, and client metadata. It serializes the request both with `serde_json::to_value` and with `serialize_websocket_request` followed by `serde_json::from_str::<Value>`, then asserts the two JSON values are equal.
+**Data flow**: It builds a detailed sample request, serializes it once to a JSON value and once through `serialize_websocket_request`, parses the string back to JSON, and compares the two JSON values. The test passes only if they are identical.
 
-**Call relations**: This test exercises `serialize_websocket_request` in isolation. It ensures the websocket-specific serialization helper does not mutate or omit fields compared with ordinary serde output.
+**Call relations**: This test calls `serialize_websocket_request` directly. It guards the path used by `ResponsesWebsocketConnection::stream_request` before sending a request.
 
 *Call graph*: calls 1 internal fn (serialize_websocket_request); 5 external calls (from, assert_eq!, ResponseCreate, to_value, vec!).
 
@@ -1977,11 +1987,11 @@ fn direct_serialization_preserves_websocket_request_payload()
 fn websocket_config_enables_permessage_deflate()
 ```
 
-**Purpose**: Checks that websocket connections are configured to negotiate permessage-deflate compression. It protects the explicit compression setting in `websocket_config`.
+**Purpose**: Checks that the WebSocket configuration enables message compression. This prevents an accidental change from silently disabling deflate support.
 
-**Data flow**: Calls `websocket_config()` and asserts that `config.extensions.permessage_deflate.is_some()`.
+**Data flow**: It creates a config with `websocket_config` and asserts that the per-message deflate setting is present.
 
-**Call relations**: This test directly validates the helper used by `connect_websocket` during upgrades.
+**Call relations**: This test protects the configuration that `connect_websocket` uses for real WebSocket handshakes.
 
 *Call graph*: calls 1 internal fn (websocket_config); 1 external calls (assert!).
 
@@ -1992,11 +2002,11 @@ fn websocket_config_enables_permessage_deflate()
 fn parse_wrapped_websocket_error_event_maps_to_transport_http()
 ```
 
-**Purpose**: Confirms that a wrapped websocket `error` payload with HTTP status and JSON headers maps to `ApiError::Transport(Http)` with converted headers and preserved body text. It covers numeric header-value conversion as well.
+**Purpose**: Checks that a wrapped error event with an HTTP status and headers becomes a transport HTTP error. This matters for rate-limit and usage-limit style server responses sent over WebSocket text.
 
-**Data flow**: Constructs a JSON string representing an error event with status 429, nested error details, and mixed string/number headers. It parses the payload with `parse_wrapped_websocket_error_event`, maps it with `map_wrapped_websocket_error_event`, destructures the resulting `ApiError::Transport(TransportError::Http { ... })`, and asserts the status, converted headers, and body contents.
+**Data flow**: It builds a JSON error payload with status 429 and headers, parses it with `parse_wrapped_websocket_error_event`, maps it with `map_wrapped_websocket_error_event`, and asserts that the resulting error contains the expected status, headers, and body text.
 
-**Call relations**: This test exercises the wrapped-error parsing/mapping path used by `run_websocket_response_stream` before normal event decoding.
+**Call relations**: This test covers the same wrapped-error path that `run_websocket_response_stream` uses before normal response event processing.
 
 *Call graph*: calls 2 internal fn (map_wrapped_websocket_error_event, parse_wrapped_websocket_error_event); 4 external calls (assert!, assert_eq!, json!, panic!).
 
@@ -2007,11 +2017,11 @@ fn parse_wrapped_websocket_error_event_maps_to_transport_http()
 fn parse_wrapped_websocket_error_event_ignores_non_error_payloads()
 ```
 
-**Purpose**: Verifies that non-`error` websocket payloads are not misclassified as wrapped transport errors. This keeps normal response events on the standard parsing path.
+**Purpose**: Checks that normal response events are not mistaken for wrapped errors. Without this, ordinary streaming messages could be diverted into error handling.
 
-**Data flow**: Builds a JSON payload with `type: "response.created"`, passes it to `parse_wrapped_websocket_error_event`, and asserts the result is `None`.
+**Data flow**: It builds a sample non-error JSON payload, passes it to `parse_wrapped_websocket_error_event`, and asserts that the result is empty.
 
-**Call relations**: This test validates the early kind filter inside `parse_wrapped_websocket_error_event`, which `run_websocket_response_stream` relies on before attempting wrapped-error mapping.
+**Call relations**: This protects `run_websocket_response_stream`, which calls the parser on every incoming text message before trying normal event parsing.
 
 *Call graph*: calls 1 internal fn (parse_wrapped_websocket_error_event); 2 external calls (assert!, json!).
 
@@ -2022,11 +2032,11 @@ fn parse_wrapped_websocket_error_event_ignores_non_error_payloads()
 fn parse_wrapped_websocket_error_event_with_status_maps_invalid_request()
 ```
 
-**Purpose**: Checks that a wrapped websocket error with status 400 becomes an HTTP transport error carrying the original payload body. It specifically covers invalid-request style failures.
+**Purpose**: Checks that an invalid-request error sent over the WebSocket becomes an HTTP-style API error. This lets callers see the same kind of error they would expect from an HTTP endpoint.
 
-**Data flow**: Creates a JSON error payload with status 400 and an `invalid_request_error` message, parses it, maps it, destructures the resulting `ApiError::Transport(TransportError::Http { status, body, .. })`, and asserts the status and body contents.
+**Data flow**: It builds a JSON error payload with status 400, parses it, maps it, and asserts that the result is a transport HTTP error with bad-request status and the original message in the body.
 
-**Call relations**: This test covers another branch of `map_wrapped_websocket_error_event`, ensuring non-success statuses become transport HTTP errors.
+**Call relations**: This test exercises `parse_wrapped_websocket_error_event` and `map_wrapped_websocket_error_event`, the same pair used inside `run_websocket_response_stream`.
 
 *Call graph*: calls 2 internal fn (map_wrapped_websocket_error_event, parse_wrapped_websocket_error_event); 4 external calls (assert!, assert_eq!, json!, panic!).
 
@@ -2037,11 +2047,11 @@ fn parse_wrapped_websocket_error_event_with_status_maps_invalid_request()
 fn parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable()
 ```
 
-**Purpose**: Verifies the special-case mapping for the server's websocket connection-limit error code. Instead of an HTTP transport error, the payload should become `ApiError::Retryable`.
+**Purpose**: Checks that the known WebSocket connection time-limit error is marked retryable. That tells higher-level code it can recover by opening a fresh WebSocket connection.
 
-**Data flow**: Builds a JSON error payload whose nested `error.code` is `websocket_connection_limit_reached`, parses and maps it, destructures the result as `ApiError::Retryable { message, delay }`, and asserts the expected message and `None` delay.
+**Data flow**: It builds a wrapped error payload with the connection-limit code, parses and maps it, then asserts that the result is a retryable error with the expected message and no fixed delay.
 
-**Call relations**: This test exercises the highest-priority branch in `map_wrapped_websocket_error_event`, which `run_websocket_response_stream` uses to signal reconnect-worthy failures.
+**Call relations**: This test protects the special branch in `map_wrapped_websocket_error_event` that `run_websocket_response_stream` depends on when a long-lived connection expires.
 
 *Call graph*: calls 2 internal fn (map_wrapped_websocket_error_event, parse_wrapped_websocket_error_event); 3 external calls (assert_eq!, json!, panic!).
 
@@ -2052,11 +2062,11 @@ fn parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable()
 fn parse_wrapped_websocket_error_event_without_status_is_not_mapped()
 ```
 
-**Purpose**: Ensures that wrapped websocket error payloads lacking an HTTP status are not converted into transport errors. This avoids manufacturing incomplete HTTP diagnostics.
+**Purpose**: Checks that a wrapped error without an HTTP status is not forced into an HTTP transport error. This avoids inventing missing status information.
 
-**Data flow**: Creates a JSON `error` payload without `status`, parses it successfully, passes it to `map_wrapped_websocket_error_event`, and asserts the mapping result is `None`.
+**Data flow**: It builds an error JSON payload with headers but no status, parses it, tries to map it, and asserts that no API error is produced.
 
-**Call relations**: This test validates the status requirement in `map_wrapped_websocket_error_event`, which affects whether `run_websocket_response_stream` treats a wrapped error as terminal.
+**Call relations**: This test covers the cautious behavior of `map_wrapped_websocket_error_event`, which is used by `run_websocket_response_stream`.
 
 *Call graph*: calls 2 internal fn (map_wrapped_websocket_error_event, parse_wrapped_websocket_error_event); 2 external calls (assert!, json!).
 
@@ -2067,11 +2077,11 @@ fn parse_wrapped_websocket_error_event_without_status_is_not_mapped()
 fn merge_request_headers_matches_http_precedence()
 ```
 
-**Purpose**: Checks the precedence rules used when combining provider, extra, and default websocket headers. It documents that extra overrides provider, while defaults only fill gaps.
+**Purpose**: Checks the intended priority order when combining provider, extra, and default headers. This prevents subtle authentication or routing bugs caused by the wrong header winning.
 
-**Data flow**: Builds three `HeaderMap`s with overlapping keys, calls `merge_request_headers`, and asserts that provider values beat defaults, extra values beat provider values, and default-only keys are inserted.
+**Data flow**: It creates provider headers, extra headers, and default headers with overlapping names, merges them with `merge_request_headers`, and asserts that provider-only values stay, extra headers override provider values, and defaults fill only missing names.
 
-**Call relations**: This test directly validates the helper used by both `connect` and `probe_handshake` before auth headers are added.
+**Call relations**: This test protects the header-building step used by both `ResponsesWebsocketClient::connect` and `probe_handshake`.
 
 *Call graph*: calls 1 internal fn (merge_request_headers); 3 external calls (new, from_static, assert_eq!).
 
@@ -2080,11 +2090,13 @@ fn merge_request_headers_matches_http_precedence()
 
 `io_transport` · `request handling`
 
-This endpoint wrapper is a thin layer over `EndpointSession<T>`. `CompactClient` stores a session configured with a transport, provider, and shared auth provider, and offers an optional `with_telemetry` builder that swaps in request telemetry on the underlying session.
+Conversation history can grow too large to send around in full. This file is the small client wrapper that asks the server to compact that history into a shorter form. In everyday terms, it is like sending a long stack of notes to a summarizing service and getting back a smaller set of notes that still matter.
 
-The endpoint path is fixed by `path()` as `responses/compact`, and the main work happens in `compact`. That method accepts a prebuilt JSON body, extra headers, a request timeout, and an optional `OnceLock<String>` for turn state. It sends a POST request through `session.execute_with`, using the closure argument to set `req.timeout = Some(request_timeout)` before dispatch. After a successful response, it looks for the `x-codex-turn-state` header; if both the caller supplied a `OnceLock` and the header is present and valid UTF-8, it stores the header value once and ignores any failure from `set` (for example if already initialized). It then deserializes the response body into the private `CompactHistoryResponse { output: Vec<ResponseItem> }`, mapping JSON decode failures to `ApiError::Stream`.
+The main type is `CompactClient`, which owns an `EndpointSession`. The session is the shared helper that knows how to build authenticated HTTP requests for a provider. `CompactClient` adds the endpoint-specific details: the path is `responses/compact`, the HTTP method is POST, and the response is expected to contain an `output` list.
 
-`compact_input` is the typed convenience layer: it serializes a `CompactionInput` with `serde_json::to_value`, wraps serialization failures with a contextual message, and delegates to `compact`. The test module provides a dummy transport that should never be called and asserts the path string exactly, preserving wire compatibility.
+There are two ways to use it. `compact_input` accepts a structured `CompactionInput`, converts it into JSON, and then calls `compact`. `compact` accepts JSON directly, sends it to the server, optionally stores a returned `x-codex-turn-state` header, parses the JSON body, and returns a list of `ResponseItem` values.
+
+The optional turn-state header is important because it lets later requests carry forward server-side state from this compaction turn. The test code only checks that the endpoint path is correct, using a dummy transport that should never actually send a request.
 
 #### Function details
 
@@ -2094,11 +2106,11 @@ The endpoint path is fixed by `path()` as `responses/compact`, and the main work
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a compact-endpoint client around a freshly created `EndpointSession`.
+**Purpose**: Creates a new client for the compact-history endpoint. A caller uses this when it has a transport for sending HTTP requests, a provider configuration, and shared authentication.
 
-**Data flow**: Consumes a transport, provider configuration, and shared auth provider, passes them to `EndpointSession::new`, and stores the resulting session inside `CompactClient`. It returns the new client and does not touch external state.
+**Data flow**: It receives the HTTP transport, provider details, and shared authentication provider. It wraps them in an `EndpointSession`, which becomes the stored session inside a new `CompactClient`. The result is a ready-to-use client object.
 
-**Call relations**: This is the standard constructor used by higher-level API setup code before any compact requests are issued.
+**Call relations**: This is the setup step before any compaction call can happen. It delegates the common request setup work to `EndpointSession::new`, so later methods can focus only on the compact endpoint’s specific behavior.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -2109,11 +2121,11 @@ fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 ```
 
-**Purpose**: Returns a copy of the client whose underlying session includes optional request telemetry hooks.
+**Purpose**: Returns a copy of the client with optional request telemetry attached. Telemetry means extra observation data, such as timing or request metadata, used to understand how requests behave.
 
-**Data flow**: Consumes `self` and an optional `Arc<dyn RequestTelemetry>`, calls `self.session.with_request_telemetry(request)`, and wraps the updated session in a new `CompactClient`.
+**Data flow**: It takes an existing client and an optional telemetry object. It asks the stored session to attach that telemetry, then returns a new `CompactClient` containing the updated session. The original request behavior stays the same except for added observation.
 
-**Call relations**: Acts as a builder-style adapter layered on top of `CompactClient::new`, allowing callers to attach telemetry without mutating the original client in place.
+**Call relations**: This is used after client creation when callers want request-level reporting. It passes the work down to the session’s `with_request_telemetry` helper, because telemetry is a general endpoint-session feature rather than something unique to compaction.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -2124,11 +2136,11 @@ fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 fn path() -> &'static str
 ```
 
-**Purpose**: Defines the fixed relative path for the compaction endpoint.
+**Purpose**: Provides the fixed API path for the compact-history endpoint. Keeping it in one function makes the endpoint string easy to reuse and test.
 
-**Data flow**: Returns the static string `responses/compact`. It is pure and side-effect free.
+**Data flow**: It takes no input and returns the literal path string `responses/compact`. It does not read or change any state.
 
-**Call relations**: Used internally by `compact` and validated by the test module to guard wire-path compatibility.
+**Call relations**: The main `compact` request uses this path when sending the POST request. The test also calls it directly to make sure the client points at the expected endpoint.
 
 
 ##### `CompactClient::compact`  (lines 40–70)
@@ -2143,11 +2155,11 @@ async fn compact(
     ) -> Result<Ve
 ```
 
-**Purpose**: Posts a raw JSON compaction request, optionally captures turn-state metadata, and decodes the compacted output items.
+**Purpose**: Sends a JSON compaction request to the server and returns the compacted response items. Use this when the caller already has the request body as JSON.
 
-**Data flow**: Accepts a JSON body, extra headers, timeout duration, and optional `OnceLock<String>`. It sends a POST request via `session.execute_with`, mutating the outbound request timeout in the provided closure. On success it optionally reads `x-codex-turn-state` from response headers and stores it into the supplied `OnceLock`. It then deserializes `resp.body` into `CompactHistoryResponse` and returns `parsed.output`, or converts JSON decode failures into `ApiError::Stream`.
+**Data flow**: It receives a JSON body, extra HTTP headers, a timeout, and an optional place to store turn-state returned by the server. It sends a POST request to `responses/compact`, applies the timeout, reads the response headers, saves the `x-codex-turn-state` header if one is present, parses the response body as JSON, and returns the `output` list. If sending or parsing fails, it returns an `ApiError` instead.
 
-**Call relations**: This is the core transport method for the endpoint. `compact_input` delegates to it after typed serialization, and callers use it when they already have a raw JSON payload.
+**Call relations**: `compact_input` calls this after converting a structured input into JSON. Inside, it relies on the shared endpoint session’s `execute_with` method to perform the actual HTTP request, uses `path` to choose the endpoint, and uses JSON parsing to turn the server’s bytes into a `CompactHistoryResponse`.
 
 *Call graph*: calls 1 internal fn (execute_with); called by 1 (compact_input); 2 external calls (path, from_slice).
 
@@ -2164,11 +2176,11 @@ async fn compact_input(
     ) ->
 ```
 
-**Purpose**: Serializes a typed `CompactionInput` and submits it to the compact endpoint.
+**Purpose**: Accepts a structured compaction request and sends it through the compact endpoint. This is the friendlier entry point for callers that have a `CompactionInput` rather than raw JSON.
 
-**Data flow**: Takes a borrowed typed input plus headers, timeout, and optional turn-state sink; serializes the input with `serde_json::to_value`; maps serialization failures to `ApiError::Stream` with contextual text; and forwards the resulting JSON body to `compact`, returning its `Vec<ResponseItem>` result.
+**Data flow**: It receives a `CompactionInput`, headers, timeout, and optional turn-state storage. It converts the input into a JSON value. If that conversion works, it hands the JSON to `compact`; if conversion fails, it returns an `ApiError` explaining that the input could not be encoded.
 
-**Call relations**: This is the typed convenience entrypoint layered directly over `compact`, used when callers want compile-time request structure rather than constructing JSON manually.
+**Call relations**: This function sits one layer above `compact`. It prepares the body in the format the lower-level request function expects, then lets `compact` do the network call, header capture, and response parsing.
 
 *Call graph*: calls 1 internal fn (compact); 1 external calls (to_value).
 
@@ -2179,11 +2191,11 @@ async fn compact_input(
 async fn execute(&self, _req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Test stub that fails if a non-streaming HTTP execute call is unexpectedly attempted.
+**Purpose**: Provides a fake HTTP `execute` method for the test-only dummy transport. It exists only so the dummy type can satisfy the same transport interface as a real network transport.
 
-**Data flow**: Ignores the incoming request and returns `Err(TransportError::Build("execute should not run"))`. It reads and writes no shared state.
+**Data flow**: It receives a request but ignores it. Instead of sending anything, it immediately returns a build error saying this method should not run.
 
-**Call relations**: Used only in the path test's dummy client type parameter; its failure behavior ensures the test remains focused on static path logic rather than accidentally performing transport work.
+**Call relations**: The path test does not need real network traffic, but `CompactClient` is generic over an HTTP transport, so the test needs a placeholder transport type. If this method were accidentally called during the path test, the returned error would make that mistake obvious.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2194,11 +2206,11 @@ async fn execute(&self, _req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Test stub that fails if a streaming transport call is unexpectedly attempted.
+**Purpose**: Provides a fake streaming method for the test-only dummy transport. Streaming means receiving a response in pieces over time, but this test transport never actually streams.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("stream should not run"))`.
+**Data flow**: It receives a request but does not inspect or send it. It immediately returns a build error saying streaming should not run.
 
-**Call relations**: Completes the `HttpTransport` implementation for the dummy test transport and guards against accidental use of the streaming path in this module's tests.
+**Call relations**: This completes the dummy implementation of the HTTP transport interface. The endpoint path test only needs the type to exist, and this method acts as a guard against accidental network-like behavior in the test.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2209,11 +2221,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn path_is_responses_compact()
 ```
 
-**Purpose**: Asserts that the endpoint path constant remains the expected wire-compatible value.
+**Purpose**: Checks that the compact client uses the exact endpoint path expected by the API. This protects against accidental changes to the URL path string.
 
-**Data flow**: Calls `CompactClient::<DummyTransport>::path()` and compares the returned string to `responses/compact`.
+**Data flow**: It asks `CompactClient` for its path using the dummy transport type, then compares the returned string with `responses/compact`. The test passes if they match and fails if they do not.
 
-**Call relations**: This test protects the static path used by `CompactClient::compact`, catching accidental endpoint renames.
+**Call relations**: This test directly exercises `CompactClient::path`. It does not create a real client or send a request, which is why the dummy transport methods are designed never to run.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2222,11 +2234,13 @@ fn path_is_responses_compact()
 
 `io_transport` · `request handling`
 
-This module follows the same endpoint-client pattern as other `codex-api` transports. `MemoriesClient<T>` wraps an `EndpointSession<T>` and exposes a constructor plus `with_telemetry` builder. The endpoint path is intentionally fixed as `memories/trace_summarize`; the dedicated path test documents that this exact string is required for wire compatibility.
+This file is a small doorway from local Rust code to a remote “memories” API endpoint. Its job is to take memory trace data, turn it into JSON, send it with an HTTP POST request, and turn the server’s JSON reply back into Rust values the rest of the program can use. Without this file, callers would have to know the exact URL path, request format, headers, and response format themselves, which would make the code easier to break when the API contract changes.
 
-The transport logic is split between `summarize` and `summarize_input`. `summarize` accepts a raw JSON body and extra headers, performs a POST to the fixed path through `session.execute`, and deserializes the response body into the private `SummarizeResponse { output: Vec<MemorySummarizeOutput> }`. Decode failures are converted into `ApiError::Stream` using the serde error text directly. `summarize_input` is the typed wrapper: it serializes `MemorySummarizeInput` with `serde_json::to_value`, wraps serialization failures with the message `failed to encode memory summarize input: ...`, and delegates to `summarize`.
+The main type is `MemoriesClient`. It wraps an `EndpointSession`, which is the shared helper that knows how to build and send authenticated HTTP requests for a configured provider. The client fixes the endpoint path to `memories/trace_summarize`, preserving compatibility with the server. Callers can either pass an already-built JSON body to `summarize`, or pass a typed `MemorySummarizeInput` to `summarize_input`, which first converts the structured input into JSON.
 
-The test module includes both a `DummyTransport` that should never be used and a `CapturingTransport` that records the outgoing request while returning a canned successful response. Combined with a no-op `DummyAuth` and a deterministic `Provider` fixture, the main async test verifies that `summarize_input` sends a POST to `.../memories/trace_summarize`, serializes `raw_memories` under the wire key `traces`, preserves nested metadata like `source_path`, and correctly parses the returned `trace_summary`/`memory_summary` pair into `MemorySummarizeOutput` values.
+The response is expected to be JSON with an `output` field containing a list of memory summaries. If the server reply cannot be decoded, the file turns that into an `ApiError` so callers get a clear failure instead of bad data.
+
+The test code uses fake transports, like a pretend mail carrier, to inspect the outgoing request without making a real network call.
 
 #### Function details
 
@@ -2236,11 +2250,11 @@ The test module includes both a `DummyTransport` that should never be used and a
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a memory-summarization client around a new endpoint session.
+**Purpose**: Creates a new memories API client. A caller uses this when they have an HTTP transport, provider settings such as the base URL, and an authentication provider ready to use.
 
-**Data flow**: Consumes a transport, provider, and shared auth provider, creates an `EndpointSession`, and stores it in `MemoriesClient`.
+**Data flow**: It receives a transport, provider configuration, and shared authentication provider. It passes those into `EndpointSession::new`, then stores the resulting session inside a `MemoriesClient`. The result is a ready-to-use client that knows where and how to send memory summarization requests.
 
-**Call relations**: Used by production setup and by the module's integration-style test before calling `summarize_input`.
+**Call relations**: In normal use, this is the starting point for this client. The test `tests::summarize_input_posts_expected_payload_and_parses_output` calls it to build a client around a capturing fake transport, so the test can later verify the request that was sent.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (summarize_input_posts_expected_payload_and_parses_output).
 
@@ -2251,11 +2265,11 @@ fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 ```
 
-**Purpose**: Returns a client whose underlying session has optional request telemetry attached.
+**Purpose**: Returns a copy of the client with optional request telemetry attached. Telemetry means extra observation data about requests, such as timing or tracing information, used to understand what the client is doing.
 
-**Data flow**: Consumes `self`, applies `with_request_telemetry` to the stored session, and returns a new `MemoriesClient` containing the updated session.
+**Data flow**: It takes an existing client and an optional shared telemetry object. It asks the inner session to attach that telemetry, then wraps the updated session in a new `MemoriesClient`. The old client is consumed, and the returned client is the one to use afterward.
 
-**Call relations**: Builder-style companion to `MemoriesClient::new`, used when callers want instrumentation on summarize requests.
+**Call relations**: This function fits into setup before requests are sent. It delegates the actual telemetry attachment to the shared endpoint session through `with_request_telemetry`, because the session is the part that builds and executes HTTP requests.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -2266,11 +2280,11 @@ fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 fn path() -> &'static str
 ```
 
-**Purpose**: Defines the fixed relative path for the memory trace summarization endpoint.
+**Purpose**: Returns the fixed server path for the memory summarization endpoint. Keeping this in one place helps prevent accidental changes to the API route.
 
-**Data flow**: Returns the static string `memories/trace_summarize`.
+**Data flow**: It takes no input and returns the string `memories/trace_summarize`. It does not read or change any outside state.
 
-**Call relations**: Used internally by `summarize` and guarded by a dedicated test to preserve backend compatibility.
+**Call relations**: The request-sending function `MemoriesClient::summarize` uses this path when building the HTTP request. The test `tests::path_is_memories_trace_summarize_for_wire_compatibility` checks it directly to protect compatibility with the server.
 
 
 ##### `MemoriesClient::summarize`  (lines 36–48)
@@ -2283,11 +2297,11 @@ async fn summarize(
     ) -> Result<Vec<MemorySummarizeOutput>, ApiError>
 ```
 
-**Purpose**: Posts a raw JSON summarize request and decodes the returned list of memory summaries.
+**Purpose**: Sends a memory summarization request using a JSON body that has already been prepared. This is the lower-level request method for callers that already have the exact JSON payload they want to send.
 
-**Data flow**: Accepts a JSON body and extra headers, sends a POST via `session.execute` to `Self::path()`, deserializes the response body into `SummarizeResponse`, and returns its `output` vector. JSON decode failures become `ApiError::Stream` containing the serde error string.
+**Data flow**: It receives a JSON value and any extra HTTP headers. It sends a POST request to the memories summarization path through the endpoint session. When the response comes back, it reads the response body as JSON, expects an `output` list inside it, and returns that list of `MemorySummarizeOutput` values. If sending fails or the response cannot be decoded, it returns an `ApiError`.
 
-**Call relations**: This is the core transport method for the endpoint. `summarize_input` delegates to it after serializing the typed input.
+**Call relations**: This is the core network call in the file. `MemoriesClient::summarize_input` calls it after converting typed input into JSON. It relies on the shared session’s `execute` method for the actual HTTP work and uses `MemoriesClient::path` to choose the correct endpoint.
 
 *Call graph*: calls 1 internal fn (execute); called by 1 (summarize_input); 2 external calls (path, from_slice).
 
@@ -2302,11 +2316,11 @@ async fn summarize_input(
     ) -> Result<Vec<MemorySummarizeOutput>, ApiError>
 ```
 
-**Purpose**: Serializes a typed `MemorySummarizeInput` and submits it to the summarize endpoint.
+**Purpose**: Lets callers send a typed `MemorySummarizeInput` instead of manually building JSON. This is the friendlier, safer method for ordinary use.
 
-**Data flow**: Takes a borrowed typed input and extra headers, serializes the input with `to_value`, maps serialization failures to `ApiError::Stream` with contextual text, and forwards the JSON body to `summarize`, returning its parsed output.
+**Data flow**: It receives a structured memory summarization input and extra headers. It converts the input into JSON; if that conversion fails, it returns an `ApiError` with a message explaining the encoding problem. If conversion succeeds, it passes the JSON body to `MemoriesClient::summarize` and returns the summaries from the server.
 
-**Call relations**: Typed convenience wrapper over `summarize`, used by callers and by the module's main test.
+**Call relations**: This sits one level above `MemoriesClient::summarize`. It prepares the body, then hands off to `summarize` for the actual HTTP request and response parsing. The main behavior test calls this method to verify the complete path from typed input to outgoing request to parsed output.
 
 *Call graph*: calls 1 internal fn (summarize); 1 external calls (to_value).
 
@@ -2317,11 +2331,11 @@ async fn summarize_input(
 async fn execute(&self, _req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Test stub that fails if a non-streaming execute call is unexpectedly made.
+**Purpose**: Provides a fake HTTP `execute` method for tests where no request should actually be sent. If this method runs, the test has gone down the wrong path.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("execute should not run"))`.
+**Data flow**: It receives a request but ignores it. Instead of returning a response, it immediately returns a transport build error saying `execute should not run`.
 
-**Call relations**: Used only for the static path test, ensuring no real transport behavior is involved.
+**Call relations**: This belongs to `DummyTransport`, a simple stand-in used when tests only need a transport type but do not want network behavior. If a test accidentally triggers an HTTP execute call through this dummy, the error makes that mistake obvious.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2332,11 +2346,11 @@ async fn execute(&self, _req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Test stub that fails if a streaming call is unexpectedly attempted.
+**Purpose**: Provides a fake streaming HTTP method for tests where streaming must not be used. Streaming means receiving a response in pieces over time rather than as one complete body.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("stream should not run"))`.
+**Data flow**: It receives a request but ignores it. It returns a transport build error saying `stream should not run`.
 
-**Call relations**: Completes the dummy transport implementation for tests that only care about static endpoint metadata.
+**Call relations**: This is part of the dummy test transport. It protects tests from silently using the wrong kind of HTTP operation, because the memories endpoint in this file uses normal request-response execution, not streaming.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2347,11 +2361,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn add_auth_headers(&self, _headers: &mut HeaderMap)
 ```
 
-**Purpose**: No-op auth provider used in tests.
+**Purpose**: Acts as a no-op authentication provider for tests. It satisfies the same interface as real authentication without adding any headers.
 
-**Data flow**: Receives a mutable header map and leaves it unchanged.
+**Data flow**: It receives a mutable set of HTTP headers and leaves it unchanged. Nothing is returned beyond the normal completion of the method.
 
-**Call relations**: Supplies the auth dependency when constructing `MemoriesClient` in tests without affecting request assertions.
+**Call relations**: Tests use this when they need to construct a `MemoriesClient` but do not care about real credentials. It lets the test focus on the memories request body and URL rather than authentication.
 
 
 ##### `tests::CapturingTransport::new`  (lines 115–120)
@@ -2360,11 +2374,11 @@ fn add_auth_headers(&self, _headers: &mut HeaderMap)
 fn new(response_body: Vec<u8>) -> Self
 ```
 
-**Purpose**: Creates a transport that records the last request and returns a fixed response body.
+**Purpose**: Builds a fake transport that records the last request it was asked to send and returns a chosen response body. This lets tests inspect outgoing HTTP requests without using the network.
 
-**Data flow**: Initializes `last_request` as `Arc<Mutex<Option<Request>>>` set to `None`, stores the provided response bytes in an `Arc<Vec<u8>>`, and returns the configured transport.
+**Data flow**: It receives bytes for the fake response body. It creates shared storage for the last request, initially empty, and shared storage for the response bytes. It returns a `CapturingTransport` holding both pieces.
 
-**Call relations**: Used by the summarize-input test to inspect the exact request emitted by `MemoriesClient`.
+**Call relations**: The main behavior test creates this transport before building the client. Later, when the client sends a request, `tests::CapturingTransport::execute` stores that request so the test can check the method, URL, and JSON body.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -2375,11 +2389,11 @@ fn new(response_body: Vec<u8>) -> Self
 async fn execute(&self, req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Captures the outgoing request and returns a canned successful response.
+**Purpose**: Pretends to send an HTTP request while actually saving it for inspection and returning a canned successful response.
 
-**Data flow**: Stores the incoming `Request` in the mutex-protected slot, then returns `Response { status: 200 OK, headers: empty, body: cloned canned bytes }`.
+**Data flow**: It receives a request from the client. It locks the shared request store, saves a copy of the request there, and then returns an HTTP 200 OK response whose body is the preconfigured fake response bytes. It does not contact any server.
 
-**Call relations**: This is the transport path exercised by `MemoriesClient::summarize` in the async test.
+**Call relations**: This is the key test double for the end-to-end client test. `MemoriesClient::summarize_input` eventually causes the endpoint session to call this method, and the test later reads the captured request to confirm the client built it correctly.
 
 *Call graph*: 1 external calls (new).
 
@@ -2390,11 +2404,11 @@ async fn execute(&self, req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Fails if the streaming transport path is used during memory endpoint tests.
+**Purpose**: Rejects streaming calls in tests that use the capturing transport. The memories client should not stream for this endpoint.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("stream should not run"))`.
+**Data flow**: It receives a request but ignores it. It returns a transport build error saying `stream should not run`.
 
-**Call relations**: Ensures the tested endpoint remains on the ordinary request/response path.
+**Call relations**: This guards the test setup. If the memories client accidentally used the streaming path instead of the normal execute path, the test would fail clearly rather than hiding the mistake.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2405,11 +2419,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn provider(base_url: &str) -> Provider
 ```
 
-**Purpose**: Builds a deterministic provider fixture with a caller-supplied base URL.
+**Purpose**: Creates a small provider configuration for tests. A provider is the bundle of settings that tells the client the service name, base URL, retry rules, and timeout behavior.
 
-**Data flow**: Returns a `Provider` populated with the given base URL, fixed name `test`, empty headers/query params, a one-attempt retry policy, and a one-second stream idle timeout.
+**Data flow**: It receives a base URL string. It builds a `Provider` named `test` with that base URL, no query parameters, empty default headers, short retry delays, and a short stream idle timeout. It returns the completed provider configuration.
 
-**Call relations**: Used by the summarize-input test so the expected full request URL can be asserted exactly.
+**Call relations**: The main behavior test calls this helper while constructing the `MemoriesClient`. Keeping the provider setup in one helper makes the test easier to read and keeps unrelated configuration details out of the request assertions.
 
 *Call graph*: 3 external calls (from_millis, from_secs, new).
 
@@ -2420,11 +2434,11 @@ fn provider(base_url: &str) -> Provider
 fn path_is_memories_trace_summarize_for_wire_compatibility()
 ```
 
-**Purpose**: Asserts that the endpoint path remains the exact backend-compatible string.
+**Purpose**: Checks that the endpoint path remains exactly `memories/trace_summarize`. This protects the client-server contract, because changing this string would send requests to a different URL.
 
-**Data flow**: Calls `MemoriesClient::<DummyTransport>::path()` and compares it to `memories/trace_summarize`.
+**Data flow**: It calls `MemoriesClient::path`, compares the returned string to the expected path, and passes only if they match. It does not send any request or change state.
 
-**Call relations**: Protects the static path consumed by `MemoriesClient::summarize` from accidental renaming.
+**Call relations**: This test directly protects the helper used by `MemoriesClient::summarize`. If someone edits the path by accident, this test fails before that change can break real API calls.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2435,11 +2449,11 @@ fn path_is_memories_trace_summarize_for_wire_compatibility()
 async fn summarize_input_posts_expected_payload_and_parses_output()
 ```
 
-**Purpose**: Verifies that `summarize_input` serializes the typed request under the expected wire keys, posts to the correct URL, and parses the returned summaries.
+**Purpose**: Tests the full happy path for summarizing typed memory input. It proves that the client sends the right POST request, formats the JSON body correctly, and reads the server’s response into useful output values.
 
-**Data flow**: Creates a capturing transport with a canned response containing one output item, constructs a client, builds a `MemorySummarizeInput` with one `RawMemory`, calls `summarize_input`, and asserts the parsed output length and fields. It then inspects the captured request to verify method `POST`, the full URL ending in `/memories/trace_summarize`, and JSON body fields including `model`, `traces[0].id`, and nested `metadata.source_path`.
+**Data flow**: It creates a fake server response containing one summary, builds a capturing transport and client, and prepares a `MemorySummarizeInput` with a model name and one raw memory trace. It calls `summarize_input`, checks that one parsed output came back with the expected summary text, then inspects the captured request to confirm the HTTP method, URL, model field, trace id, and trace metadata were all correct.
 
-**Call relations**: Exercises the full typed path `summarize_input` → `summarize` → transport and validates both serialization and deserialization contracts for the endpoint.
+**Call relations**: This test ties together most of the file’s production path: it constructs the client with `MemoriesClient::new`, creates provider settings with `tests::provider`, sends through `MemoriesClient::summarize_input`, which calls `MemoriesClient::summarize`, and relies on `tests::CapturingTransport::execute` to capture the request instead of making a real network call.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, new, assert_eq!, new, provider, json!, to_vec, vec!).
 
@@ -2448,11 +2462,13 @@ async fn summarize_input_posts_expected_payload_and_parses_output()
 
 `io_transport` · `request handling`
 
-This module wraps image-related REST endpoints behind `ImagesClient<T>`, another thin `EndpointSession`-based transport client. The constructor and `with_telemetry` mirror other endpoint clients. Public methods `generate` and `edit` differ only in endpoint path and operation label; both delegate to the private generic helper `post_image_request`.
+This file is the bridge between the project’s image features and the remote provider’s image API. Without it, the rest of the code could build an image request, but would not have a clear, reusable way to send that request to the right web endpoint or decode the answer.
 
-`post_image_request` is the core implementation. It accepts any serializable request type, converts it to `serde_json::Value`, and on serialization failure returns `ApiError::Stream` with an operation-specific message such as `failed to encode image generation request`. It then performs a POST through `session.execute` and deserializes the response body into `ImageResponse`, again wrapping decode failures with operation-specific context. This keeps the public methods small while preserving precise error messages.
+The main type is `ImagesClient`. It wraps an `EndpointSession`, which is the shared helper that knows the provider’s base URL, authentication, headers, retries, and actual HTTP transport. Think of `ImagesClient` as a small service desk: callers hand it a well-shaped image request, and it fills out the shipping label, sends it to the right address, and opens the reply package.
 
-The test module builds realistic end-to-end fixtures. `DummyAuth` contributes no headers. `CapturingTransport` stores the last `Request` in a mutex and returns a canned JSON body, allowing tests to inspect the exact URL and JSON payload sent by `generate` and `edit`. Helper functions construct a provider, a representative successful response body, the expected typed `ImageResponse`, and the captured request. The tests verify that optional fields are omitted from request JSON when absent, that the correct endpoint paths are used (`images/generations` and `images/edits`), and that malformed responses missing required `data` fail with a decode error wrapped as `ApiError::Stream`.
+There are two public operations. `generate` sends a request to create an image from a prompt. `edit` sends a request to modify an existing image. Both use the same private helper, `post_image_request`, because the steps are almost identical: serialize the request into JSON, POST it to the correct path, and deserialize the response body into an `ImageResponse`.
+
+The tests build a fake transport that records the outgoing request instead of using the network. They verify that generation and editing use the correct URL, omit empty optional fields from JSON, parse valid image responses, and report an error if the response is missing required image data.
 
 #### Function details
 
@@ -2462,11 +2478,11 @@ The test module builds realistic end-to-end fixtures. `DummyAuth` contributes no
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs an image-endpoint client around a new `EndpointSession`.
+**Purpose**: Creates a new image API client. A caller uses this when it has an HTTP transport, provider settings, and an authentication provider ready to use.
 
-**Data flow**: Consumes a transport, provider, and shared auth provider, creates an `EndpointSession` from them, and stores it in `ImagesClient`.
+**Data flow**: It receives a transport, provider configuration, and shared authentication provider. It passes those into a new `EndpointSession`, then stores that session inside an `ImagesClient`. The result is a client ready to make image API calls.
 
-**Call relations**: Used by production setup and by the module's tests before calling `generate` or `edit`.
+**Call relations**: This is the setup step for the image endpoint. The tests and higher-level client construction call it before making image requests. Internally it hands the real connection details to `EndpointSession::new`, so later calls such as `generate` and `edit` can focus only on image-specific paths and data.
 
 *Call graph*: calls 1 internal fn (new); called by 4 (edit_posts_typed_request_and_parses_image_response, generate_posts_typed_request_and_parses_image_response, image_response_requires_image_data, client).
 
@@ -2477,11 +2493,11 @@ fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 ```
 
-**Purpose**: Returns a client whose underlying session includes optional request telemetry.
+**Purpose**: Returns a copy of the client with optional request telemetry attached. Telemetry means extra observation code that can record details about outgoing requests, such as timing or metadata.
 
-**Data flow**: Consumes `self`, applies `with_request_telemetry` to the stored session, and returns a new `ImagesClient` containing the updated session.
+**Data flow**: It takes the existing client and an optional shared telemetry object. It asks the underlying session to attach that telemetry, then returns a new `ImagesClient` containing the updated session. It does not send any request by itself.
 
-**Call relations**: Builder-style companion to `ImagesClient::new`, allowing instrumentation to be attached before requests are sent.
+**Call relations**: This fits into client configuration before requests are made. It delegates the actual telemetry attachment to `EndpointSession::with_request_telemetry`, so image operations later benefit from the same request-observation machinery as other endpoints.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -2496,11 +2512,11 @@ async fn generate(
     ) -> Result<ImageResponse, ApiError>
 ```
 
-**Purpose**: Sends a typed image-generation request to the `images/generations` endpoint and decodes the typed image response.
+**Purpose**: Sends an image generation request. A caller uses it when they want the provider to create an image from a prompt and options such as size, quality, or background.
 
-**Data flow**: Accepts an `ImageGenerationRequest` reference and extra headers, then forwards them to `post_image_request` with the generation path and operation label `image generation`. It returns the resulting `ImageResponse` or `ApiError`.
+**Data flow**: It receives an `ImageGenerationRequest` and any extra HTTP headers. It chooses the `images/generations` API path and labels the operation as `image generation`, then passes everything to the shared POST helper. It returns either a parsed `ImageResponse` or an `ApiError` if sending or decoding fails.
 
-**Call relations**: Public convenience method layered over `post_image_request`; exercised by generation tests and by higher-level callers needing image creation.
+**Call relations**: This is the public entry for image creation. It is called by tests and by any code that wants generated images. Rather than duplicating HTTP and JSON work, it hands off to `ImagesClient::post_image_request`.
 
 *Call graph*: calls 1 internal fn (post_image_request).
 
@@ -2515,11 +2531,11 @@ async fn edit(
     ) -> Result<ImageResponse, ApiError>
 ```
 
-**Purpose**: Sends a typed image-edit request to the `images/edits` endpoint and decodes the typed image response.
+**Purpose**: Sends an image edit request. A caller uses it when they have an existing image and want the provider to change it according to a prompt.
 
-**Data flow**: Accepts an `ImageEditRequest` reference and extra headers, then delegates to `post_image_request` with the edit path and operation label `image edit`.
+**Data flow**: It receives an `ImageEditRequest` and any extra HTTP headers. It chooses the `images/edits` API path and labels the operation as `image edit`, then passes everything to the shared POST helper. It returns a parsed `ImageResponse` or an `ApiError`.
 
-**Call relations**: Public counterpart to `generate`, sharing all transport and error-handling logic through `post_image_request`.
+**Call relations**: This is the public entry for image editing. It follows the same flow as generation, but targets a different endpoint. It relies on `ImagesClient::post_image_request` for the common send-and-decode work.
 
 *Call graph*: calls 1 internal fn (post_image_request).
 
@@ -2536,11 +2552,11 @@ async fn post_image_request(
     ) -> Result<ImageResponse, ApiError>
 ```
 
-**Purpose**: Implements the shared POST/serialize/decode flow for both image generation and image editing.
+**Purpose**: Performs the common work for both image generation and image editing. It converts a typed request into JSON, sends it as an HTTP POST, and converts the response JSON back into an image response.
 
-**Data flow**: Takes an endpoint path, a serializable request reference, extra headers, and an operation label. It serializes the request with `to_value`, mapping failures to `ApiError::Stream` with contextual text; sends a POST via `session.execute`; then deserializes `resp.body` into `ImageResponse`, mapping decode failures to another contextual `ApiError::Stream`. It returns the typed response on success.
+**Data flow**: It receives the API path, the request object, extra headers, and a human-readable operation name. First it serializes the request to JSON; if that fails, it returns an `ApiError` explaining that the request could not be encoded. Then it asks the session to execute a POST request. Finally it reads the response body and deserializes it into `ImageResponse`; if that fails, it returns an `ApiError` explaining that the response could not be decoded.
 
-**Call relations**: This private helper is the common implementation invoked by both `generate` and `edit`, ensuring identical transport behavior and consistent error wording.
+**Call relations**: `generate` and `edit` both call this helper because their mechanics are the same. It hands the actual HTTP work to `EndpointSession::execute`, and uses JSON conversion functions to move between Rust data structures and wire-format JSON.
 
 *Call graph*: calls 1 internal fn (execute); called by 2 (edit, generate); 2 external calls (from_slice, to_value).
 
@@ -2551,11 +2567,11 @@ async fn post_image_request(
 fn add_auth_headers(&self, _headers: &mut HeaderMap)
 ```
 
-**Purpose**: No-op auth provider used in tests so request assertions are not polluted by authentication headers.
+**Purpose**: Provides a no-op authentication provider for tests. It satisfies the client’s need for an auth object without adding real credentials.
 
-**Data flow**: Receives a mutable `HeaderMap` and intentionally leaves it unchanged.
+**Data flow**: It receives mutable HTTP headers but deliberately leaves them unchanged. Nothing is returned, and no authentication data is added.
 
-**Call relations**: Supplies the `AuthProvider` dependency when constructing `ImagesClient` in tests.
+**Call relations**: The test clients pass `DummyAuth` into `ImagesClient::new`. This keeps the tests focused on image request formatting and response parsing, not on authentication behavior.
 
 
 ##### `tests::CapturingTransport::new`  (lines 108–113)
@@ -2564,11 +2580,11 @@ fn add_auth_headers(&self, _headers: &mut HeaderMap)
 fn new(response_body: Vec<u8>) -> Self
 ```
 
-**Purpose**: Creates a test transport that records the last request and returns a fixed response body.
+**Purpose**: Creates a fake HTTP transport for tests. It records the last request it was asked to send and returns a pre-chosen response body.
 
-**Data flow**: Wraps an initially empty `Mutex<Option<Request>>` and the provided response bytes in `Arc`s, then returns the configured `CapturingTransport`.
+**Data flow**: It receives response bytes that should be returned later. It creates shared storage for the last request, wraps the response body so cloned transports share it, and returns a `CapturingTransport` ready for use.
 
-**Call relations**: Used by all endpoint tests in this module to inspect outbound requests while controlling the inbound response payload.
+**Call relations**: The image client tests call this before creating an `ImagesClient`. Later, when the client sends a request, `tests::CapturingTransport::execute` stores that request so the test can inspect it.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -2579,11 +2595,11 @@ fn new(response_body: Vec<u8>) -> Self
 async fn execute(&self, req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Captures the outgoing request and returns a successful HTTP response containing the canned body.
+**Purpose**: Pretends to send an HTTP request during tests. Instead of using the network, it captures the request and returns a successful response with the prepared body.
 
-**Data flow**: Stores the incoming `Request` into `last_request`, then returns `Response { status: 200 OK, headers: empty, body: cloned canned bytes }`.
+**Data flow**: It receives a `Request`. It stores a copy in shared test storage, then builds a response with status OK, empty headers, and the configured body bytes. It returns that response as if it came from a real server.
 
-**Call relations**: This is the transport path exercised by `ImagesClient::post_image_request` in the tests, enabling assertions on URL and JSON body.
+**Call relations**: This is called indirectly when `ImagesClient::post_image_request` asks the session to execute the HTTP POST. The tests then call `tests::captured_request` to check whether the client built the correct URL and JSON body.
 
 *Call graph*: 1 external calls (new).
 
@@ -2594,11 +2610,11 @@ async fn execute(&self, req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Fails if the streaming transport path is used during image endpoint tests.
+**Purpose**: Rejects streaming requests in these tests. Image generation and editing here are expected to use normal request-response HTTP, not streaming.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("stream should not run"))`.
+**Data flow**: It receives a request but ignores it. It returns a transport build error saying streaming should not run.
 
-**Call relations**: Completes the `HttpTransport` implementation for the capturing transport while ensuring image requests remain non-streaming.
+**Call relations**: This exists because the fake transport must implement the full `HttpTransport` interface. If image code accidentally tried to stream, this method would make the test fail clearly.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2609,11 +2625,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn provider() -> Provider
 ```
 
-**Purpose**: Builds a deterministic `Provider` fixture for image endpoint tests.
+**Purpose**: Builds a simple provider configuration for tests. It supplies a base URL and retry settings without depending on real production configuration.
 
-**Data flow**: Returns a `Provider` with fixed name `test`, base URL `https://example.com/api/codex`, empty headers/query params, a one-attempt retry policy, and a one-second stream idle timeout.
+**Data flow**: It creates a `Provider` with the name `test`, a fixed base URL, no query parameters, empty headers, short retry delays, and a short stream idle timeout. The finished provider is returned to the caller.
 
-**Call relations**: Used by the request/response tests to ensure generated URLs are stable and easy to assert.
+**Call relations**: The tests pass this provider into `ImagesClient::new`. It gives the session enough information to construct full request URLs such as `https://example.com/api/codex/images/generations`.
 
 *Call graph*: 3 external calls (from_millis, from_secs, new).
 
@@ -2624,11 +2640,11 @@ fn provider() -> Provider
 fn response_body() -> Vec<u8>
 ```
 
-**Purpose**: Constructs a representative successful image API response body as raw JSON bytes.
+**Purpose**: Builds a realistic successful image API response body for tests. It gives the fake transport JSON bytes that the client should be able to parse.
 
-**Data flow**: Builds a JSON object containing creation time, background, one `b64_json` image datum, output format, quality, size, and usage details, then serializes it to `Vec<u8>`.
+**Data flow**: It creates a JSON value containing creation time, image data, format-like metadata, quality, size, and usage information. It serializes that JSON into bytes and returns the byte vector.
 
-**Call relations**: Supplies the canned response returned by `CapturingTransport::new` in the success-path tests.
+**Call relations**: The generation and edit tests feed this body into `tests::CapturingTransport::new`. When the client sends a request, the fake transport returns these bytes, and `ImagesClient::post_image_request` must decode them into an `ImageResponse`.
 
 *Call graph*: 2 external calls (json!, to_vec).
 
@@ -2639,11 +2655,11 @@ fn response_body() -> Vec<u8>
 fn expected_response() -> ImageResponse
 ```
 
-**Purpose**: Builds the typed `ImageResponse` value expected after decoding the canned success body.
+**Purpose**: Builds the `ImageResponse` value that the tests expect after decoding the fake JSON response.
 
-**Data flow**: Returns an `ImageResponse` with the same semantic fields as `response_body`, including one `ImageData` entry and selected optional enums.
+**Data flow**: It creates an `ImageResponse` with the expected timestamp, background, one base64 image entry, quality, and size. It returns that structured value for comparison.
 
-**Call relations**: Used by both success-path tests to compare the decoded response against a typed expected value.
+**Call relations**: The generation and edit tests compare the actual client result with this expected value. This confirms that response parsing keeps the fields the image API client cares about.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -2654,11 +2670,11 @@ fn expected_response() -> ImageResponse
 fn captured_request(transport: &CapturingTransport) -> Request
 ```
 
-**Purpose**: Retrieves the last request recorded by the capturing transport, failing the test if none was stored.
+**Purpose**: Retrieves the request that the fake transport most recently recorded. Tests use it to inspect what the client tried to send.
 
-**Data flow**: Locks the transport's mutex, clones the stored `Request`, and unwraps the `Option`, returning the captured request.
+**Data flow**: It receives a reference to the fake transport. It locks the shared request storage, clones the saved request, and returns it. If no request was saved, the test fails with a clear message.
 
-**Call relations**: Shared helper for the success-path tests after `generate` or `edit` has run.
+**Call relations**: After `generate` or `edit` runs, the tests call this helper. It connects the fake transport’s captured data back to the assertions about URL and JSON request body.
 
 
 ##### `tests::generate_posts_typed_request_and_parses_image_response`  (lines 195–231)
@@ -2667,11 +2683,11 @@ fn captured_request(transport: &CapturingTransport) -> Request
 async fn generate_posts_typed_request_and_parses_image_response()
 ```
 
-**Purpose**: Verifies that `generate` posts the expected JSON payload to the correct URL and decodes the response body into `ImageResponse`.
+**Purpose**: Tests the image generation path from typed request to outgoing HTTP request to parsed response.
 
-**Data flow**: Creates a capturing transport with the canned response, constructs a client, calls `generate` with a populated `ImageGenerationRequest`, asserts the returned typed response equals `expected_response`, then inspects the captured request URL and JSON body to ensure optional fields were serialized correctly.
+**Data flow**: It creates a fake transport loaded with a valid response body, builds an image client, and sends an `ImageGenerationRequest`. It checks that the returned response matches `tests::expected_response`, then retrieves the captured request and checks that the URL and JSON body are correct.
 
-**Call relations**: Exercises the full `ImagesClient::generate` → `post_image_request` → transport path for the generation endpoint.
+**Call relations**: This test exercises `ImagesClient::new`, `ImagesClient::generate`, the shared POST helper, and the fake transport. It proves that generation calls the `images/generations` endpoint and serializes only the intended fields.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (new, new, assert_eq!, new, captured_request, provider, response_body).
 
@@ -2682,11 +2698,11 @@ async fn generate_posts_typed_request_and_parses_image_response()
 async fn edit_posts_typed_request_and_parses_image_response()
 ```
 
-**Purpose**: Verifies that `edit` posts the expected JSON payload to the edit URL and decodes the response body correctly.
+**Purpose**: Tests the image editing path from typed request to outgoing HTTP request to parsed response.
 
-**Data flow**: Builds a client over a capturing transport, calls `edit` with an `ImageEditRequest` containing one image URL and prompt, asserts the typed response matches `expected_response`, and checks the captured request URL and JSON body omit absent optional fields.
+**Data flow**: It creates a fake transport with a valid response body, builds an image client, and sends an `ImageEditRequest` containing an image URL and prompt. It checks the parsed response, then inspects the captured request to verify the edit URL and JSON body.
 
-**Call relations**: Exercises the full `ImagesClient::edit` path and confirms it differs from generation only in endpoint path and request shape.
+**Call relations**: This test exercises `ImagesClient::new`, `ImagesClient::edit`, the shared POST helper, and the fake transport. It proves that editing calls the `images/edits` endpoint and omits optional fields that were not set.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, new, assert_eq!, new, captured_request, provider, response_body, vec!).
 
@@ -2697,26 +2713,26 @@ async fn edit_posts_typed_request_and_parses_image_response()
 async fn image_response_requires_image_data()
 ```
 
-**Purpose**: Checks that decoding fails when the server response omits the required `data` field.
+**Purpose**: Tests that the client rejects an image response without required image data. This protects callers from receiving a supposedly successful result that contains no usable image.
 
-**Data flow**: Creates a transport whose body is minimal JSON lacking `data`, calls `generate`, expects an error, destructures it as `ApiError::Stream`, and asserts the message begins with the contextual decode prefix plus serde's missing-field text.
+**Data flow**: It creates a fake response body containing only a creation timestamp and no `data` field. It sends a generation request and expects an error. It then checks that the error message says decoding failed because the required `data` field is missing.
 
-**Call relations**: Covers the error path in `post_image_request` where response deserialization fails and must be wrapped with an operation-specific message.
+**Call relations**: This test drives the same `ImagesClient::generate` and response-decoding path as the happy-path generation test, but with invalid response JSON. It confirms that `ImagesClient::post_image_request` reports malformed provider responses instead of silently accepting them.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, new, assert!, new, provider, json!, panic!, to_vec).
 
 
 ### `codex-api/src/endpoint/search.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `active whenever a search API request is made; test helpers run during tests`
 
-This file defines `SearchClient<T>`, a minimal endpoint client that sends `SearchRequest` values and decodes `SearchResponse` values over the shared HTTP transport/session layer. Compared with the responses clients, the implementation is intentionally small: there is no streaming path, no custom headers beyond what the caller supplies, and no endpoint-specific body rewriting.
+This file exists so the rest of the project can ask for a web-style search without hand-building HTTP requests each time. Instead of every caller remembering the URL path, headers, authentication, JSON shape, and response parsing rules, they use `SearchClient`.
 
-The client stores only an `EndpointSession<T>`. Construction and telemetry wiring mirror other endpoint clients: `new` creates the session from transport, provider, and auth; `with_telemetry` returns a rebuilt client with request telemetry attached to the session. The endpoint path is fixed as `alpha/search`.
+`SearchClient` is built around an `EndpointSession`, which is the shared piece that knows how to talk to a provider: where the API lives, how authentication headers are added, and how the actual HTTP transport is used. The search client adds the search-specific part: the endpoint path is `alpha/search`, the method is POST, and the body is a serialized `SearchRequest`.
 
-`search` is the core operation. It serializes the typed `SearchRequest` into `serde_json::Value` with `serde_json::to_value`, maps serialization failures into `ApiError::Stream`, performs a POST through `EndpointSession::execute`, and then deserializes the raw response body bytes into `SearchResponse` with `serde_json::from_slice`, again mapping decode failures into `ApiError::Stream`.
+The main flow is simple. A caller creates a client with a transport, provider settings, and an authentication provider. When `search` is called, the typed request is converted into JSON. The session sends that JSON to the search endpoint with any extra headers the caller supplied. When bytes come back, they are decoded as a `SearchResponse`. If the request cannot be encoded or the response cannot be decoded, the function returns an API error with a clear message.
 
-The test module supplies a `DummyAuth` that adds no headers and a `CapturingTransport` that records the outgoing `Request` while returning a canned JSON body. The end-to-end test verifies both directions: the response body is decoded into the expected `SearchResponse`, and the emitted JSON request body exactly matches the nested search schema, including multimodal input items, command lists, location/filter/image settings, allowed callers, and token limits.
+The test code builds a fake transport that records the outgoing request instead of using the network. That lets the test prove two things: the client sends the exact JSON shape expected by the API, and it correctly reads the response JSON.
 
 #### Function details
 
@@ -2726,11 +2742,11 @@ The test module supplies a `DummyAuth` that adds no headers and a `CapturingTran
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a search client from a transport, provider, and auth source. It initializes the shared endpoint session used for all search requests.
+**Purpose**: Creates a search client ready to send requests through a chosen HTTP transport, provider configuration, and authentication provider. Use this when code wants to talk to the search endpoint without manually wiring those pieces each time.
 
-**Data flow**: Consumes `transport: T`, `provider: Provider`, and `auth: SharedAuthProvider`, creates `EndpointSession::new(transport, provider, auth)`, stores it in `SearchClient`, and returns the client.
+**Data flow**: It receives a transport, provider settings such as the base URL, and shared authentication. It wraps them in an `EndpointSession`, which is the common request-sending helper, and stores that session inside a new `SearchClient`. The result is a client object that can later send search requests.
 
-**Call relations**: This constructor is used by production code and tests before any search call can be made. It delegates common HTTP/auth setup to `EndpointSession`.
+**Call relations**: Higher-level code, including `handle_call` and the test in this file, calls this first to build the client. Internally it hands the setup work to `EndpointSession::new`, so later `SearchClient::search` can focus only on the search-specific request.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (search_posts_typed_request_and_parses_output, handle_call).
 
@@ -2741,11 +2757,11 @@ fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 ```
 
-**Purpose**: Returns a copy of the client with request telemetry attached to its session. It is a builder-style customization step.
+**Purpose**: Returns a copy of the search client that also reports request telemetry, if telemetry is supplied. Telemetry means extra observation data about requests, such as timing or tracing, used to understand what happened during a call.
 
-**Data flow**: Consumes `self` and an optional `Arc<dyn RequestTelemetry>`, replaces the embedded session with `self.session.with_request_telemetry(request)`, and returns the rebuilt `SearchClient<T>`.
+**Data flow**: It takes an existing client and an optional shared telemetry object. It passes that telemetry into the stored endpoint session and returns a new `SearchClient` containing the updated session. Nothing is sent immediately; it only changes how future requests are observed.
 
-**Call relations**: This method is called when callers want request instrumentation around search HTTP calls. It relies on `EndpointSession` to store and later use the telemetry hook.
+**Call relations**: This sits between client creation and actual searching. It delegates to the session's telemetry setup, then later `SearchClient::search` benefits from that session configuration when it sends the request.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -2756,11 +2772,11 @@ fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 fn path() -> &'static str
 ```
 
-**Purpose**: Defines the fixed relative route for the search endpoint. It avoids repeating the literal path string.
+**Purpose**: Provides the fixed API path used for search requests. Keeping this in one small function avoids scattering the endpoint string through the file.
 
-**Data flow**: Takes no arguments and returns `"alpha/search"`.
+**Data flow**: It takes no input and always returns the same text path, `alpha/search`. It does not read or change any outside state.
 
-**Call relations**: This helper is used by `SearchClient::search` when issuing the POST request.
+**Call relations**: `SearchClient::search` asks this function for the path right before sending the POST request. This keeps the endpoint address separate from the rest of the request-building steps.
 
 
 ##### `SearchClient::search`  (lines 35–48)
@@ -2773,11 +2789,11 @@ async fn search(
     ) -> Result<SearchResponse, ApiError>
 ```
 
-**Purpose**: Sends a typed search request as JSON and decodes the JSON response into `SearchResponse`. It is the file's main endpoint operation.
+**Purpose**: Sends one typed search request to the API and returns the typed search response. This is the main function callers use when they want the service to perform a search.
 
-**Data flow**: Accepts `&SearchRequest` and caller-supplied `HeaderMap`. It serializes the request with `to_value`, maps serialization errors to `ApiError::Stream`, then calls `self.session.execute(Method::POST, Self::path(), extra_headers, Some(body))`. After awaiting the HTTP response, it deserializes `resp.body` with `serde_json::from_slice` into `SearchResponse`, mapping decode failures to `ApiError::Stream`, and returns the typed response.
+**Data flow**: It receives a `SearchRequest` and any extra HTTP headers. First it converts the request into JSON; if that fails, it returns an API error. Then it asks the endpoint session to POST that JSON to `alpha/search`. When the response body comes back as bytes, it decodes those bytes into a `SearchResponse`; if decoding fails, it returns an API error instead.
 
-**Call relations**: This public method is the only runtime operation in the file. It delegates transport/auth/retry behavior to `EndpointSession::execute` and keeps only endpoint-specific serialization and path selection locally.
+**Call relations**: Callers use this after building a client with `SearchClient::new`. During the call it gets the endpoint from `SearchClient::path`, relies on the session's `execute` method to do the actual HTTP work, and uses JSON conversion functions to move between Rust data and API wire format.
 
 *Call graph*: calls 1 internal fn (execute); 3 external calls (path, from_slice, to_value).
 
@@ -2788,11 +2804,11 @@ async fn search(
 fn add_auth_headers(&self, _headers: &mut HeaderMap)
 ```
 
-**Purpose**: Implements a no-op auth provider for tests. It allows request construction without introducing authorization headers into assertions.
+**Purpose**: Provides a no-op authentication provider for tests. It lets the test build a realistic client without adding real credentials or changing the outgoing headers.
 
-**Data flow**: Receives a mutable `HeaderMap` reference and intentionally leaves it unchanged.
+**Data flow**: It receives mutable HTTP headers, but deliberately leaves them unchanged. It returns nothing and has no side effects.
 
-**Call relations**: This test helper is used indirectly when `SearchClient::new` is given `Arc::new(DummyAuth)` in the end-to-end serialization test.
+**Call relations**: The test passes `DummyAuth` into `SearchClient::new` so the normal client setup path is used. When the endpoint session asks authentication to add headers, this test implementation quietly does nothing.
 
 
 ##### `tests::CapturingTransport::new`  (lines 94–99)
@@ -2801,11 +2817,11 @@ fn add_auth_headers(&self, _headers: &mut HeaderMap)
 fn new(response_body: Vec<u8>) -> Self
 ```
 
-**Purpose**: Creates a fake HTTP transport that records the last request and returns a fixed response body. It is used to inspect what `SearchClient` sends.
+**Purpose**: Creates a fake HTTP transport for tests that records the request it was asked to send and later returns a prepared response body. This is like a mailbox with a camera: it captures what was posted and hands back a canned reply.
 
-**Data flow**: Consumes `response_body: Vec<u8>`, wraps an initially empty `Option<Request>` in `Arc<Mutex<_>>`, wraps the response bytes in `Arc<Vec<u8>>`, and returns `CapturingTransport` holding both.
+**Data flow**: It receives response bytes that should be returned later. It creates shared storage for the last request, initially empty, and shared storage for the response body. The result is a `CapturingTransport` that can be cloned while still sharing the same captured request.
 
-**Call relations**: This constructor is used by the search test before building `SearchClient`. The resulting transport's `execute` method captures the request emitted by `SearchClient::search`.
+**Call relations**: The search endpoint test calls this before building the client. Later, when `SearchClient::search` sends a request through the session, the session reaches this fake transport's `execute` method, which records the request for inspection.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -2816,11 +2832,11 @@ fn new(response_body: Vec<u8>) -> Self
 async fn execute(&self, req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Implements the fake transport's non-streaming request path by recording the request and returning a canned successful response. It simulates the HTTP layer for the search test.
+**Purpose**: Pretends to send an HTTP request during tests, while actually saving the request and returning a fixed successful response. This avoids network access and makes the test fully predictable.
 
-**Data flow**: Accepts a `Request`, stores it into `last_request` under a mutex, and returns `Ok(Response { status: 200 OK, headers: HeaderMap::new(), body: cloned response_body })`.
+**Data flow**: It receives a request from the endpoint session. It stores that request in the shared `last_request` slot, then builds a response with status OK, empty headers, and the preconfigured response body. The returned response is what the client later parses.
 
-**Call relations**: This method is invoked by `EndpointSession::execute` during the search test. It provides the captured request body that the test later inspects.
+**Call relations**: This is called indirectly when `SearchClient::search` asks the session to execute the POST request. After the search call finishes, the test reads the stored request to check that the JSON body was exactly what it expected.
 
 *Call graph*: 1 external calls (new).
 
@@ -2831,11 +2847,11 @@ async fn execute(&self, req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Rejects streaming calls on the fake transport because the search endpoint should not use them. It makes accidental use of the wrong transport path fail loudly in tests.
+**Purpose**: Rejects streaming requests in this test transport because the search client path under test should not use streaming. If streaming happens, the test should fail loudly.
 
-**Data flow**: Ignores the incoming `Request` and returns `Err(TransportError::Build("stream should not run".to_string()))`.
+**Data flow**: It receives a request but ignores it. It immediately returns a transport build error saying that streaming should not run. No request is stored and no response stream is created.
 
-**Call relations**: This method would only be reached if the search client incorrectly used the streaming transport API. Its presence enforces the intended non-streaming behavior in tests.
+**Call relations**: This completes the fake transport's required interface, but the search test expects `SearchClient::search` to use normal `execute`, not `stream`. If some future change accidentally switches this code path to streaming, this function will expose that mistake.
 
 *Call graph*: 1 external calls (Build).
 
@@ -2846,11 +2862,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn provider() -> Provider
 ```
 
-**Purpose**: Builds a deterministic `Provider` configuration for tests. It supplies a base URL, empty headers, and a simple retry/timeout policy.
+**Purpose**: Builds a simple provider configuration for tests. It gives the client a base URL, headers, retry rules, and timeouts without depending on real project configuration.
 
-**Data flow**: Constructs and returns a `Provider` with name `test`, base URL `https://example.com/v1`, no query params, empty headers, retry config with one attempt and short delays, and a one-second stream idle timeout.
+**Data flow**: It takes no input. It creates a `Provider` named `test` with base URL `https://example.com/v1`, no query parameters, empty headers, one retry attempt, short retry delays, and a short stream idle timeout. The completed provider is returned to the test.
 
-**Call relations**: This helper is used by the search test when constructing `SearchClient`. It supplies the provider metadata consumed by `EndpointSession`.
+**Call relations**: The main test calls this when constructing `SearchClient::new`. The provider then flows into the endpoint session, which uses it while forming the request that the fake transport captures.
 
 *Call graph*: 3 external calls (from_millis, from_secs, new).
 
@@ -2861,24 +2877,26 @@ fn provider() -> Provider
 async fn search_posts_typed_request_and_parses_output()
 ```
 
-**Purpose**: Exercises `SearchClient::search` end to end, verifying both typed response decoding and exact JSON request serialization for a complex search payload. It serves as the contract test for this endpoint wrapper.
+**Purpose**: Checks that the search client sends the right JSON request and reads the JSON response correctly. It protects the contract between the typed Rust search structures and the API's expected wire format.
 
-**Data flow**: Creates a `CapturingTransport` with a canned JSON response body, builds a `SearchClient` with the test provider and dummy auth, and calls `search` with a richly populated `SearchRequest` containing multimodal input, search/open commands, settings, and token limits. After awaiting success, it asserts the returned `SearchResponse`, retrieves the captured `Request` from the transport, extracts its JSON body, and asserts exact equality with the expected nested JSON structure.
+**Data flow**: It prepares a fake response body containing `encrypted_output` and `output`, builds a fake transport and search client, then calls `search` with a rich `SearchRequest` containing messages, image input, search commands, settings, and token limits. After the call, it verifies the returned `SearchResponse`. It then inspects the captured outgoing request body and compares it to the exact JSON the API should receive.
 
-**Call relations**: This test drives the full runtime path through `SearchClient::new`, `SearchClient::search`, `EndpointSession::execute`, and the fake transport's `execute`, then inspects the captured request to validate serialization.
+**Call relations**: This test drives the full local flow: it creates the fake transport with `tests::CapturingTransport::new`, creates provider settings with `tests::provider`, builds the client with `SearchClient::new`, and then calls `SearchClient::search`. The fake transport's `execute` method supplies the response and records the request so the test can assert both directions of the conversion.
 
 *Call graph*: calls 1 internal fn (new); 10 external calls (new, default, new, assert_eq!, new, provider, Items, json!, to_vec, vec!).
 
 
 ### `codex-api/src/endpoint/realtime_call.rs`
 
-`domain_logic` · `request handling`
+`io_transport` · `realtime call setup`
 
-This file defines `RealtimeCallClient<T>`, the HTTP-side companion to the realtime websocket code. It creates realtime calls by POSTing SDP offers to `realtime/calls` and decoding two pieces of response state: the returned SDP answer body and the call identifier embedded in the `Location` header. The client is built on `EndpointSession<T>`, so auth, provider headers, retries, and telemetry are inherited from the common endpoint layer.
+A WebRTC call starts with an SDP message, which is a text description of media settings and network details. This file packages that SDP offer into the right HTTP request, sends it to the Realtime call endpoint, then unpacks the response so the rest of the app can finish connecting. Without this file, the client could not start Realtime voice or audio calls through the HTTP API.
 
-The central complexity is in `create_with_session_architecture_and_headers`. It first converts `RealtimeSessionConfig` into JSON using the websocket session-update schema, then removes the `id` field because call creation should not send a session identifier in the embedded session payload. It supports two wire formats: providers whose base URL contains `/backend-api` receive a JSON body shaped as `{ sdp, session }`, while the public API receives a manually assembled multipart/form-data body with `sdp` and `session` parts. Architecture-specific query parameters are added for `Avas` calls (`intent=quicksilver&architecture=avas`).
+The main type is RealtimeCallClient. It wraps an EndpointSession, which knows the provider URL, authentication, retries, and request execution. The simplest path sends only raw SDP with the content type application/sdp. A richer path also sends an initial Realtime session configuration, so the server knows things like model, voice, instructions, and output mode as soon as the call begins.
 
-Helper functions keep the parsing and URL shaping explicit: `decode_sdp_response` enforces UTF-8 SDP bodies, `decode_call_id_from_location` extracts either `rtc_...` IDs or UUIDs from the `Location` path, and `is_realtime_call_id_segment` encodes that acceptance rule. Tests cover raw SDP requests, backend forwarding quirks, multipart vs JSON body selection, AVAS query parameters, and missing or malformed `Location` headers.
+There is one important split: normal API URLs receive a multipart form body, like a package with two labeled compartments: one for SDP and one for session JSON. Backend API URLs receive a single JSON object instead, because that route currently expects a different shape.
+
+After each request, the file decodes the response body as SDP and extracts the call ID from the Location header. The call ID matters because a later sideband WebSocket connection uses it to join this exact call.
 
 #### Function details
 
@@ -2888,11 +2906,11 @@ Helper functions keep the parsing and URL shaping explicit: `decode_sdp_response
 fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 ```
 
-**Purpose**: Constructs a realtime call client backed by an `EndpointSession`.
+**Purpose**: Creates a Realtime call client from a network transport, provider settings, and shared authentication. Use this when code needs an object that can start Realtime WebRTC calls.
 
-**Data flow**: Consumes `transport: T`, `provider: Provider`, and `auth: SharedAuthProvider` → creates `EndpointSession::new(...)` → returns `RealtimeCallClient<T>`.
+**Data flow**: It receives the HTTP transport, the provider information, and an auth provider. It puts them into an EndpointSession, which becomes the client’s stored connection context. The result is a ready-to-use RealtimeCallClient.
 
-**Call relations**: Used by callers and tests before any call-creation method can run. It establishes the shared session object that all later HTTP requests use.
+**Call relations**: The test cases call this before making any Realtime call request. Inside, it hands the raw pieces to EndpointSession::new so later methods can focus on call creation instead of rebuilding request setup each time.
 
 *Call graph*: calls 1 internal fn (new); called by 6 (errors_when_location_is_missing, extracts_call_id_from_forwarded_backend_location, sends_api_session_call_as_multipart_body, sends_avas_session_call_query_params, sends_backend_session_call_as_json_body, sends_sdp_offer_as_raw_body).
 
@@ -2903,11 +2921,11 @@ fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self
 fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 ```
 
-**Purpose**: Returns a copy of the client whose underlying session emits optional request telemetry.
+**Purpose**: Returns a copy of the client that will attach optional request telemetry. Telemetry means extra measurement or tracing information about outgoing requests.
 
-**Data flow**: Consumes `self` and `request: Option<Arc<dyn RequestTelemetry>>` → applies `with_request_telemetry` to the session → returns a new client.
+**Data flow**: It takes an existing client and an optional telemetry object. It asks the stored EndpointSession to attach that telemetry, then returns a new RealtimeCallClient with the updated session. It does not send a request itself.
 
-**Call relations**: This is a configuration hook for callers that want telemetry attached to subsequent `create*` requests.
+**Call relations**: This is a setup step used before real call creation. It delegates to the session’s telemetry support, so the create methods later benefit from request measurement without knowing the telemetry details.
 
 *Call graph*: calls 1 internal fn (with_request_telemetry).
 
@@ -2918,11 +2936,11 @@ fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self
 fn path() -> &'static str
 ```
 
-**Purpose**: Supplies the relative endpoint path for realtime call creation.
+**Purpose**: Provides the fixed API path for creating Realtime calls. Keeping it in one function avoids repeating the string in every request builder.
 
-**Data flow**: Returns the static string `"realtime/calls"`.
+**Data flow**: It takes no input. It returns the endpoint path string realtime/calls. Nothing else changes.
 
-**Call relations**: Referenced by all request-building methods in this file when invoking `EndpointSession::execute_with`.
+**Call relations**: The request-making methods use this path when they ask EndpointSession to execute a POST request. The session combines it with the provider’s base URL.
 
 
 ##### `RealtimeCallClient::uses_backend_request_shape`  (lines 66–68)
@@ -2931,11 +2949,11 @@ fn path() -> &'static str
 fn uses_backend_request_shape(&self) -> bool
 ```
 
-**Purpose**: Detects whether the provider expects the backend JSON request format instead of the public multipart format.
+**Purpose**: Decides whether this client should use the backend-specific request format instead of the public API format. This matters because the two endpoints expect different body shapes.
 
-**Data flow**: Reads `self.session.provider().base_url` → checks whether it contains `"/backend-api"` → returns `bool`.
+**Data flow**: It reads the provider base URL from the stored session. If the URL contains /backend-api, it returns true; otherwise it returns false. It does not modify anything.
 
-**Call relations**: Called only from `RealtimeCallClient::create_with_session_architecture_and_headers` to choose between the backend `{sdp, session}` JSON body and the multipart API body.
+**Call relations**: The session-aware call creation method uses this as a fork in the road. A true result leads to a JSON request body, while a false result leads to a multipart form body.
 
 *Call graph*: calls 1 internal fn (provider); called by 1 (create_with_session_architecture_and_headers).
 
@@ -2946,11 +2964,11 @@ fn uses_backend_request_shape(&self) -> bool
 async fn create(&self, sdp: String) -> Result<RealtimeCallResponse, ApiError>
 ```
 
-**Purpose**: Creates a realtime call from an SDP offer using default empty extra headers.
+**Purpose**: Starts a Realtime call using only an SDP offer and no extra headers. This is the simplest way to create a call.
 
-**Data flow**: Takes `sdp: String` → constructs an empty `HeaderMap` → forwards to `create_with_headers` → returns the resulting `RealtimeCallResponse` or `ApiError`.
+**Data flow**: It receives the local SDP offer as text. It passes that text along with an empty header map to create_with_headers. It returns the server’s SDP answer and call ID, or an API error.
 
-**Call relations**: This is the simplest public entrypoint for call creation. It is a convenience wrapper over `create_with_headers`.
+**Call relations**: This is a convenience wrapper. It is called by tests that check the plain SDP flow, and it hands the actual request work to create_with_headers.
 
 *Call graph*: calls 1 internal fn (create_with_headers); 1 external calls (new).
 
@@ -2965,11 +2983,11 @@ async fn create_with_session(
     ) -> Result<RealtimeCallResponse, ApiError>
 ```
 
-**Purpose**: Creates a realtime call while embedding an initial session configuration, using no extra headers.
+**Purpose**: Starts a Realtime call and includes an initial session configuration. Use this when the server should know model, voice, and instructions during call creation.
 
-**Data flow**: Takes `sdp: String` and `session_config: RealtimeSessionConfig` → forwards them with an empty `HeaderMap` to `create_with_session_and_headers` → returns the response or error.
+**Data flow**: It receives SDP text and a Realtime session configuration. It adds no custom headers, then forwards everything to create_with_session_and_headers. The output is the same call response or an error.
 
-**Call relations**: Convenience wrapper for callers that want the initial session payload included but do not need custom headers.
+**Call relations**: This is a convenience wrapper for the more complete session creation flow. Tests use it to verify both public API and backend API session request formats.
 
 *Call graph*: calls 1 internal fn (create_with_session_and_headers); 1 external calls (new).
 
@@ -2984,11 +3002,11 @@ async fn create_with_headers(
     ) -> Result<RealtimeCallResponse, ApiError>
 ```
 
-**Purpose**: Posts a raw SDP offer as `application/sdp`, then decodes the SDP answer and call ID from the response.
+**Purpose**: Starts a Realtime call with raw SDP and caller-supplied extra HTTP headers. This is useful when a caller needs to add special headers while keeping the basic SDP-only request.
 
-**Data flow**: Reads `sdp: String` and `extra_headers: HeaderMap` → calls `session.execute_with` using `POST`, path `realtime/calls`, no JSON body, and a closure that sets `Content-Type: application/sdp` and `RequestBody::Raw(Bytes::from(sdp.clone()))` → decodes `resp.body` with `decode_sdp_response` and `resp.headers` with `decode_call_id_from_location` → returns `RealtimeCallResponse { sdp, call_id }`.
+**Data flow**: It receives SDP text and extra headers. It builds a POST request to realtime/calls, marks the body as application/sdp, sends the raw SDP bytes, then waits for the response. It turns the response body into SDP text and pulls the call ID from the Location header.
 
-**Call relations**: Called by `RealtimeCallClient::create`. It is the non-session branch for plain call creation and delegates response parsing to the local helper functions.
+**Call relations**: The simple create method calls this. It relies on EndpointSession to send the request, then uses decode_sdp_response and decode_call_id_from_location to turn the HTTP response into a RealtimeCallResponse.
 
 *Call graph*: calls 3 internal fn (decode_call_id_from_location, decode_sdp_response, execute_with); called by 1 (create); 1 external calls (path).
 
@@ -3004,11 +3022,11 @@ async fn create_with_session_and_headers(
     ) -> Result<RealtimeCallResponse, Api
 ```
 
-**Purpose**: Creates a realtime call with an initial session payload using the default `RealtimeApi` architecture.
+**Purpose**: Starts a Realtime call with session configuration and extra headers, using the default Realtime API conversation architecture. It is a middle-level helper for callers that need headers but not architecture customization.
 
-**Data flow**: Takes `sdp`, `session_config`, and `extra_headers` → forwards them plus `RealtimeConversationArchitecture::RealtimeApi` to `create_with_session_architecture_and_headers` → returns its result.
+**Data flow**: It receives SDP, session configuration, and headers. It adds the default architecture choice and forwards everything to create_with_session_architecture_and_headers. It returns the created call response or an error.
 
-**Call relations**: Called by `create_with_session`; it exists to keep architecture selection explicit while preserving a simpler public API.
+**Call relations**: create_with_session calls this with empty headers. This function then hands off to the most detailed session-aware creation method.
 
 *Call graph*: calls 1 internal fn (create_with_session_architecture_and_headers); called by 1 (create_with_session).
 
@@ -3023,11 +3041,11 @@ async fn create_with_session_architecture_and_headers(
         architecture: RealtimeConversationArchitecture,
 ```
 
-**Purpose**: Builds and sends the full realtime call creation request with embedded session state, selecting backend JSON or public multipart encoding and optionally AVAS query parameters.
+**Purpose**: Creates a Realtime call while also sending session settings, extra headers, and an architecture choice. This is the main full-featured call creation path.
 
-**Data flow**: Consumes `sdp: String`, `session_config: RealtimeSessionConfig`, `architecture`, and `extra_headers` → logs the outgoing SDP → converts session config with `realtime_session_json`, removes `id` from the resulting object, then branches: if `uses_backend_request_shape()` is true, wraps `{ sdp, session }` into JSON and sends it via `execute_with` while `configure_realtime_call_request` may append architecture query params; otherwise serializes the session to a JSON string, manually assembles a multipart body using the fixed boundary constants, sets multipart `Content-Type`, and sends raw bytes. In both branches it decodes the response body as UTF-8 SDP and extracts `call_id` from `Location`, returning `RealtimeCallResponse`.
+**Data flow**: It receives SDP text, a session configuration, a conversation architecture, and extra headers. It converts the session configuration into JSON, removes the session id because call creation should not send it, then chooses a body format. Backend URLs get a JSON object containing SDP and session data; normal API URLs get a multipart body with separate SDP and session sections. It sends the POST request, decodes the returned SDP answer, extracts the call ID, and returns both.
 
-**Call relations**: This is the file’s main implementation path, reached from `create_with_session_and_headers`. It delegates session JSON generation to `realtime_session_json`, request URL shaping to `configure_realtime_call_request`, transport execution to `EndpointSession::execute_with`, and response parsing to `decode_sdp_response` and `decode_call_id_from_location`.
+**Call relations**: create_with_session_and_headers calls this. It uses realtime_session_json to prepare the session, uses uses_backend_request_shape to choose the request format, uses configure_realtime_call_request to add architecture-specific URL details, and finally uses the decode helpers to interpret the response.
 
 *Call graph*: calls 5 internal fn (uses_backend_request_shape, decode_call_id_from_location, decode_sdp_response, realtime_session_json, execute_with); called by 1 (create_with_session_and_headers); 6 external calls (path, new, format!, to_string, to_value, trace!).
 
@@ -3041,11 +3059,11 @@ fn configure_realtime_call_request(
 )
 ```
 
-**Purpose**: Applies architecture-specific URL query parameters to an outgoing realtime call request.
+**Purpose**: Adds architecture-specific URL query parameters to a Realtime call request when needed. Query parameters are the key-value options after a question mark in a URL.
 
-**Data flow**: Takes `request: &mut Request` and `architecture` → leaves the URL unchanged for `RealtimeApi` or appends `intent=quicksilver` and `architecture=avas` for `Avas`.
+**Data flow**: It receives a mutable request and an architecture choice. For the standard Realtime API architecture, it leaves the request unchanged. For the Avas architecture, it appends intent=quicksilver and architecture=avas to the request URL.
 
-**Call relations**: Used inside both request-shaping closures in `create_with_session_architecture_and_headers` so architecture-specific routing is applied consistently regardless of body format.
+**Call relations**: The session-aware call creation method calls this while preparing the HTTP request. When it needs to add URL options, it delegates the actual string editing to append_query_pair.
 
 *Call graph*: calls 1 internal fn (append_query_pair).
 
@@ -3056,11 +3074,11 @@ fn configure_realtime_call_request(
 fn append_query_pair(url: &mut String, key: &str, value: &str)
 ```
 
-**Purpose**: Appends one `key=value` pair to a URL string, choosing `?` or `&` based on whether a query already exists.
+**Purpose**: Adds one key-value pair to the query part of a URL string. It is a small helper that avoids duplicating the question-mark-versus-ampersand rule.
 
-**Data flow**: Mutates `url: &mut String` by inspecting for `?`, then pushing separator, key, `=`, and value.
+**Data flow**: It receives a mutable URL string plus a key and value. If the URL already has a question mark, it adds an ampersand; otherwise it adds a question mark. Then it appends key=value to the URL.
 
-**Call relations**: Called by `configure_realtime_call_request` to build the AVAS query string incrementally.
+**Call relations**: configure_realtime_call_request calls this when building the Avas-specific request URL. It does not know anything about Realtime calls; it only edits the URL text.
 
 *Call graph*: called by 1 (configure_realtime_call_request).
 
@@ -3071,11 +3089,11 @@ fn append_query_pair(url: &mut String, key: &str, value: &str)
 fn realtime_session_json(session_config: RealtimeSessionConfig) -> Result<Value, ApiError>
 ```
 
-**Purpose**: Converts a `RealtimeSessionConfig` into the JSON session object used in realtime call creation and rewrites serialization failures as `ApiError::Stream`.
+**Purpose**: Converts a Realtime session configuration into JSON for call creation. JSON is a common text-like data format used in API requests.
 
-**Data flow**: Consumes `session_config` → calls `session_update_session_json(session_config)` → on success returns `serde_json::Value`; on failure returns `ApiError::Stream("failed to encode realtime call session: ...")`.
+**Data flow**: It receives a RealtimeSessionConfig. It asks the websocket session code to build the session.update-style JSON, then converts any encoding failure into this file’s API error type. The result is a JSON value ready to include in the call request.
 
-**Call relations**: Used by `create_with_session_architecture_and_headers` and by tests that need to compare the exact embedded session payload.
+**Call relations**: The full session call creation method uses this before sending a request. Some tests also call it to build the expected request body and compare that expected body against what the client sent.
 
 *Call graph*: called by 3 (create_with_session_architecture_and_headers, sends_api_session_call_as_multipart_body, sends_backend_session_call_as_json_body); 1 external calls (session_update_session_json).
 
@@ -3086,11 +3104,11 @@ fn realtime_session_json(session_config: RealtimeSessionConfig) -> Result<Value,
 fn decode_sdp_response(body: &[u8]) -> Result<String, ApiError>
 ```
 
-**Purpose**: Interprets the HTTP response body as a UTF-8 SDP answer string.
+**Purpose**: Turns the HTTP response body into SDP text. This is needed because the server’s WebRTC answer is returned as raw bytes.
 
-**Data flow**: Takes `body: &[u8]` → clones to `Vec<u8>` and runs `String::from_utf8` → returns the decoded `String` or `ApiError::Stream` if the bytes are not valid UTF-8.
+**Data flow**: It receives a byte slice from the response body. It tries to read those bytes as UTF-8 text, the usual encoding for strings on the web. On success it returns the SDP string; on failure it returns an API error explaining that the SDP response could not be decoded.
 
-**Call relations**: Called after successful HTTP execution in both `create_with_headers` and `create_with_session_architecture_and_headers`.
+**Call relations**: Both raw SDP and session-aware call creation paths use this after EndpointSession returns a response. It is one half of turning a generic HTTP response into a RealtimeCallResponse.
 
 *Call graph*: called by 2 (create_with_headers, create_with_session_architecture_and_headers); 1 external calls (from_utf8).
 
@@ -3101,11 +3119,11 @@ fn decode_sdp_response(body: &[u8]) -> Result<String, ApiError>
 fn decode_call_id_from_location(headers: &HeaderMap) -> Result<String, ApiError>
 ```
 
-**Purpose**: Extracts the realtime call identifier from the response `Location` header, accepting either `rtc_...` IDs or UUID path segments.
+**Purpose**: Finds the Realtime call ID inside the response Location header. The call ID is needed later so a sideband WebSocket can join the exact call that was just created.
 
-**Data flow**: Reads `headers: &HeaderMap` → fetches `LOCATION`, errors if missing, converts it to `&str`, strips any query string, splits path segments from the end, selects the first segment accepted by `is_realtime_call_id_segment`, and returns it as `String`; otherwise returns an `ApiError::Stream` describing the malformed location.
+**Data flow**: It receives response headers. It looks for the Location header, checks that it is valid text, ignores any query string, then scans path segments from the end until it finds something that looks like a Realtime call ID. It returns that ID as a string or an API error if none can be found.
 
-**Call relations**: Used by both call-creation response paths and directly by tests. It is the only place that understands forwarded backend locations like `/v1/realtime/calls/calls/rtc_backend_test`.
+**Call relations**: The call creation methods use this after every successful HTTP response. Tests call it directly to confirm that missing or malformed locations fail and UUID-shaped call IDs are accepted.
 
 *Call graph*: called by 4 (create_with_headers, create_with_session_architecture_and_headers, accepts_uuid_call_id_from_location, rejects_location_without_call_id); 2 external calls (get, trace!).
 
@@ -3116,11 +3134,11 @@ fn decode_call_id_from_location(headers: &HeaderMap) -> Result<String, ApiError>
 fn is_realtime_call_id_segment(segment: &str) -> bool
 ```
 
-**Purpose**: Recognizes valid call-id path segments by either the `rtc_` prefix convention or canonical 36-character UUID formatting.
+**Purpose**: Checks whether one URL path segment looks like a valid Realtime call ID. It accepts both rtc_-prefixed IDs and UUID-style IDs.
 
-**Data flow**: Takes `segment: &str` → returns `true` if it starts with `rtc_` and has additional characters, or if it is 36 chars long with hyphens at UUID positions and hex digits elsewhere; otherwise returns `false`.
+**Data flow**: It receives one piece of a URL path. If the piece starts with rtc_ and has more characters after that, it returns true. Otherwise it checks for the 36-character UUID pattern with dashes in the right places and hexadecimal digits elsewhere. It returns true or false.
 
-**Call relations**: Called only by `decode_call_id_from_location` to validate candidate path segments.
+**Call relations**: decode_call_id_from_location uses this while scanning the Location header. This helper keeps the ID recognition rule separate from the header parsing work.
 
 
 ##### `tests::CapturingTransport::new`  (lines 310–312)
@@ -3129,11 +3147,11 @@ fn is_realtime_call_id_segment(segment: &str) -> bool
 fn new() -> Self
 ```
 
-**Purpose**: Creates a test transport whose response includes a default `Location` header containing `rtc_test`.
+**Purpose**: Creates a fake HTTP transport for tests with a normal Realtime call Location header. It lets tests inspect what request the client tried to send.
 
-**Data flow**: Delegates to `with_location("/v1/realtime/calls/rtc_test")` and returns the resulting transport.
+**Data flow**: It takes no input. It calls the location-based constructor with /v1/realtime/calls/rtc_test. The result is a CapturingTransport that will save the next request and return a canned response.
 
-**Call relations**: Used by most tests as the standard successful transport fixture.
+**Call relations**: Most tests use this to stand in for the network. It delegates to tests::CapturingTransport::with_location so all fake transport setup stays in one place.
 
 *Call graph*: 1 external calls (with_location).
 
@@ -3144,11 +3162,11 @@ fn new() -> Self
 fn with_location(location: &str) -> Self
 ```
 
-**Purpose**: Creates a test transport that records the last request and returns a response with a caller-specified `Location` header.
+**Purpose**: Creates a fake test transport that returns a chosen Location header. This helps tests check how call IDs are extracted from different server locations.
 
-**Data flow**: Takes `location: &str` → builds a `HeaderMap` containing `LOCATION` parsed from that string, initializes `last_request` to `None`, and returns `CapturingTransport`.
+**Data flow**: It receives a Location header string. It creates response headers containing that value, initializes empty storage for the last request, and returns the fake transport. Later, execute will store the request and return these headers.
 
-**Call relations**: Used by tests that need to verify call-id extraction from different location formats, including forwarded backend paths.
+**Call relations**: The default fake transport constructor calls this, and tests use it directly for backend-style Location paths. It supports tests that need precise control over the server’s fake response.
 
 *Call graph*: 4 external calls (new, new, from_str, new).
 
@@ -3159,11 +3177,11 @@ fn with_location(location: &str) -> Self
 fn without_location() -> Self
 ```
 
-**Purpose**: Creates a test transport whose response omits the `Location` header entirely.
+**Purpose**: Creates a fake test transport that returns no Location header. This is used to prove the client reports a clear error when the server response is incomplete.
 
-**Data flow**: Constructs `last_request` with no captured request and an empty `response_headers` map → returns the transport.
+**Data flow**: It takes no input. It creates empty last-request storage and an empty header map. The returned transport will still return a successful status and body, but without the call ID location.
 
-**Call relations**: Used by the missing-header error test to force `decode_call_id_from_location` failure through the normal client path.
+**Call relations**: The missing-location test uses this before calling the client. It sets up the exact failure condition that decode_call_id_from_location should detect.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -3174,11 +3192,11 @@ fn without_location() -> Self
 async fn execute(&self, req: Request) -> Result<Response, TransportError>
 ```
 
-**Purpose**: Implements the test HTTP transport by capturing the request and returning a fixed SDP answer body plus configured headers.
+**Purpose**: Imitates sending an HTTP request in tests, without using the network. It records the request so the test can inspect it afterward.
 
-**Data flow**: Stores `req` into `last_request`, clones `response_headers`, and returns `Response { status: 200 OK, headers, body: b"v=0\r\n" }`.
+**Data flow**: It receives a Request. It stores that request in shared test memory, then returns a fake successful response with the configured headers and a small SDP body. The outside world is not contacted.
 
-**Call relations**: Invoked by the session layer during all realtime call tests so assertions can inspect the exact outgoing request.
+**Call relations**: EndpointSession calls this when the client under test thinks it is making a real HTTP request. The tests then read the captured request to confirm URL, headers, and body.
 
 *Call graph*: 2 external calls (from_static, clone).
 
@@ -3189,11 +3207,11 @@ async fn execute(&self, req: Request) -> Result<Response, TransportError>
 async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 ```
 
-**Purpose**: Fails if any test accidentally tries to use streaming transport for realtime call creation.
+**Purpose**: Rejects streaming requests in this fake transport. These tests are only about one-shot HTTP calls, not streaming responses.
 
-**Data flow**: Ignores the request and returns `Err(TransportError::Build("stream should not run"))`.
+**Data flow**: It receives a request but ignores it. It returns a transport build error saying streaming should not run. Nothing is recorded or streamed.
 
-**Call relations**: Acts as a negative assertion that this endpoint uses ordinary HTTP execution only.
+**Call relations**: This completes the HttpTransport interface for the fake transport. If code accidentally tries to use streaming during these tests, the test will fail loudly.
 
 *Call graph*: 1 external calls (Build).
 
@@ -3204,11 +3222,11 @@ async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError>
 fn add_auth_headers(&self, headers: &mut HeaderMap)
 ```
 
-**Purpose**: Adds a fixed bearer token to test requests so auth propagation can be asserted.
+**Purpose**: Adds a fixed test Authorization header. This proves that the client includes authentication without needing real credentials.
 
-**Data flow**: Mutates the provided `HeaderMap` by inserting `Authorization: Bearer test-token`.
+**Data flow**: It receives mutable HTTP headers. It inserts Authorization: Bearer test-token. It returns nothing, but the headers are changed.
 
-**Call relations**: Used by all client-construction tests; it lets request assertions confirm that auth headers from the session layer are preserved.
+**Call relations**: EndpointSession calls this while preparing requests in tests. The raw SDP test then checks that the captured request contains the expected auth header.
 
 *Call graph*: 2 external calls (insert, from_static).
 
@@ -3219,11 +3237,11 @@ fn add_auth_headers(&self, headers: &mut HeaderMap)
 fn provider(base_url: &str) -> Provider
 ```
 
-**Purpose**: Builds a deterministic `Provider` fixture for realtime call tests.
+**Purpose**: Builds provider settings for tests. A provider describes the API base URL, retry behavior, headers, and timeouts.
 
-**Data flow**: Takes `base_url` and returns a `Provider` with fixed name, empty headers, no query params, single-attempt retry config, and short timeout values.
+**Data flow**: It receives a base URL string. It creates a Provider named test with that base URL, no extra query parameters, empty headers, short retry delays, and a short stream idle timeout. The result is passed into RealtimeCallClient::new.
 
-**Call relations**: Supplies the base URL that drives backend/public request-shape branching in the client under test.
+**Call relations**: All client tests use this to create public API or backend API providers. Changing the base URL lets tests exercise both request body formats.
 
 *Call graph*: 3 external calls (from_millis, from_secs, new).
 
@@ -3234,11 +3252,11 @@ fn provider(base_url: &str) -> Provider
 fn realtime_session_config(session_id: &str) -> RealtimeSessionConfig
 ```
 
-**Purpose**: Creates a representative `RealtimeSessionConfig` fixture with audio conversational defaults and a caller-specified session ID.
+**Purpose**: Builds a standard Realtime session configuration for tests. This avoids repeating model, voice, mode, and instruction settings in every test.
 
-**Data flow**: Takes `session_id: &str` → fills `instructions`, `model`, `session_id`, parser `RealtimeV2`, mode `Conversational`, output modality `Audio`, and voice `Marin` → returns the config.
+**Data flow**: It receives a session ID string. It returns a RealtimeSessionConfig with fixed instructions, model, parser, mode, audio output, and voice, plus the provided session ID.
 
-**Call relations**: Used by session-bearing call tests to generate consistent embedded session payloads.
+**Call relations**: The session-related tests call this before creating calls or building expected JSON. It gives all those tests a consistent session input.
 
 
 ##### `tests::sends_sdp_offer_as_raw_body`  (lines 388–427)
@@ -3247,11 +3265,11 @@ fn realtime_session_config(session_id: &str) -> RealtimeSessionConfig
 async fn sends_sdp_offer_as_raw_body()
 ```
 
-**Purpose**: Verifies that plain call creation sends the SDP offer as a raw `application/sdp` body and decodes the response correctly.
+**Purpose**: Checks that the simplest call creation path sends raw SDP correctly. It also confirms the response is decoded into SDP and call ID.
 
-**Data flow**: Builds a default transport and client, calls `create("v=offer\r\n")`, asserts the returned `RealtimeCallResponse`, then inspects the captured request method, URL, content type, auth header, and raw body.
+**Data flow**: It creates a fake transport, provider, auth, and client. It calls create with an SDP offer, then compares the returned response with the expected SDP answer and call ID. It also inspects the captured request for method, URL, content type, auth header, and raw body.
 
-**Call relations**: Exercises the `create` → `create_with_headers` path and validates the non-session request shape.
+**Call relations**: This test exercises RealtimeCallClient::new and the create path through the fake transport. It verifies the behavior of create_with_headers indirectly.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert_eq!, new, provider).
 
@@ -3262,11 +3280,11 @@ async fn sends_sdp_offer_as_raw_body()
 async fn extracts_call_id_from_forwarded_backend_location()
 ```
 
-**Purpose**: Checks that call IDs are extracted correctly from backend-forwarded `Location` paths containing extra `calls/` segments.
+**Purpose**: Checks that the client can find a call ID in a backend-forwarded Location path. Backend paths may include extra segments, so the parser must not assume the ID is always in one exact position.
 
-**Data flow**: Uses a transport with location `/v1/realtime/calls/calls/rtc_backend_test`, constructs a backend-base-url client, calls `create`, and asserts both the parsed response and the captured request URL/body.
+**Data flow**: It creates a fake transport with a backend-like Location value, then calls create. It expects the response call ID to be rtc_backend_test and checks that the request used the backend base URL while still sending raw SDP.
 
-**Call relations**: Covers the `decode_call_id_from_location` logic for forwarded backend paths while still using the normal client request flow.
+**Call relations**: This test uses RealtimeCallClient::new and the raw create path. It especially confirms decode_call_id_from_location can scan through a forwarded backend Location.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert_eq!, with_location, provider).
 
@@ -3277,11 +3295,11 @@ async fn extracts_call_id_from_forwarded_backend_location()
 async fn sends_api_session_call_as_multipart_body()
 ```
 
-**Purpose**: Verifies that public API session-bearing call creation uses multipart/form-data with separate `sdp` and `session` parts.
+**Purpose**: Checks that public API session-aware calls are sent as multipart form data. Multipart form data is like an envelope with separate labeled parts.
 
-**Data flow**: Creates an API-base-url client, calls `create_with_session`, asserts the response, extracts the raw request body as UTF-8, reconstructs the expected session JSON with `id` removed, and compares the full multipart payload string and content type.
+**Data flow**: It creates a client for the public API URL and calls create_with_session. Then it inspects the captured request, checks the multipart content type, rebuilds the expected session JSON with the id removed, and compares the whole raw multipart body to the expected text.
 
-**Call relations**: Exercises the non-backend branch of `create_with_session_architecture_and_headers`.
+**Call relations**: This test exercises the non-backend branch of create_with_session_architecture_and_headers. It also calls realtime_session_json directly to build the expected session part.
 
 *Call graph*: calls 2 internal fn (new, realtime_session_json); 8 external calls (new, assert_eq!, new, provider, realtime_session_config, panic!, to_string, from_utf8).
 
@@ -3292,11 +3310,11 @@ async fn sends_api_session_call_as_multipart_body()
 async fn sends_avas_session_call_query_params()
 ```
 
-**Purpose**: Checks that AVAS architecture requests append the expected query parameters to the realtime call URL.
+**Purpose**: Checks that the Avas architecture adds the right query parameters to the call creation URL. This ensures the server receives the architecture hint it expects.
 
-**Data flow**: Calls `create_with_session_architecture_and_headers` with `RealtimeConversationArchitecture::Avas`, then inspects the captured request URL for `?intent=quicksilver&architecture=avas`.
+**Data flow**: It creates a public API client and calls create_with_session_architecture_and_headers with the Avas architecture. It then checks that the captured request URL includes intent=quicksilver and architecture=avas.
 
-**Call relations**: Targets `configure_realtime_call_request` and the architecture-specific branch inside the main session-bearing create method.
+**Call relations**: This test goes through the full session-aware creation method. It verifies the effect of configure_realtime_call_request and append_query_pair from the outside.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, new, assert_eq!, new, provider, realtime_session_config).
 
@@ -3307,11 +3325,11 @@ async fn sends_avas_session_call_query_params()
 async fn sends_backend_session_call_as_json_body()
 ```
 
-**Purpose**: Verifies that backend-base-url session-bearing call creation sends a JSON body shaped as `{ sdp, session }`.
+**Purpose**: Checks that backend API session-aware calls are sent as JSON, not multipart form data. This protects compatibility with the backend route’s current expectations.
 
-**Data flow**: Creates a backend-base-url client, calls `create_with_session`, reconstructs the expected session JSON with `id` removed, and asserts that the captured request body is `RequestBody::Json(to_value(BackendRealtimeCallRequest { ... }))`.
+**Data flow**: It creates a client whose base URL contains /backend-api, calls create_with_session, then inspects the captured request. It builds the expected session JSON with the id removed and compares the request body to the expected JSON object containing SDP and session.
 
-**Call relations**: Exercises the backend branch selected by `uses_backend_request_shape`.
+**Call relations**: This test exercises the backend branch selected by uses_backend_request_shape. It calls realtime_session_json directly to build the expected body for comparison.
 
 *Call graph*: calls 2 internal fn (new, realtime_session_json); 5 external calls (new, assert_eq!, new, provider, realtime_session_config).
 
@@ -3322,11 +3340,11 @@ async fn sends_backend_session_call_as_json_body()
 async fn errors_when_location_is_missing()
 ```
 
-**Purpose**: Confirms that call creation fails when the response omits the `Location` header.
+**Purpose**: Checks that the client fails clearly when the server response does not include a Location header. Without that header, the client cannot know the call ID.
 
-**Data flow**: Uses `CapturingTransport::without_location`, calls `create`, captures the error, and asserts its string form.
+**Data flow**: It creates a fake transport with no Location header, then calls create. It expects an error and compares the error text to the expected missing-Location message.
 
-**Call relations**: Drives the normal client path into the missing-header error branch of `decode_call_id_from_location`.
+**Call relations**: This test uses RealtimeCallClient::new and the raw create path. It verifies that decode_call_id_from_location reports the missing header instead of silently returning a bad response.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert_eq!, without_location, provider).
 
@@ -3337,11 +3355,11 @@ async fn errors_when_location_is_missing()
 fn rejects_location_without_call_id()
 ```
 
-**Purpose**: Checks that a `Location` path lacking any valid call-id segment is rejected.
+**Purpose**: Checks that a Location header without an actual call ID is rejected. This prevents later code from trying to join a call with an empty or wrong identifier.
 
-**Data flow**: Builds a `HeaderMap` with `/v1/realtime/calls`, calls `decode_call_id_from_location`, expects an error, and asserts the message.
+**Data flow**: It creates headers with Location set to /v1/realtime/calls, then calls decode_call_id_from_location directly. It expects an error and checks the exact message.
 
-**Call relations**: Directly unit-tests the helper parser without going through HTTP execution.
+**Call relations**: This test focuses on the call ID parser without making a full client request. It confirms the parser does not mistake ordinary path words for a call ID.
 
 *Call graph*: calls 1 internal fn (decode_call_id_from_location); 3 external calls (new, from_static, assert_eq!).
 
@@ -3352,11 +3370,11 @@ fn rejects_location_without_call_id()
 fn accepts_uuid_call_id_from_location()
 ```
 
-**Purpose**: Checks that UUID-form call IDs are accepted in addition to `rtc_...` identifiers.
+**Purpose**: Checks that UUID-shaped call IDs are accepted, not only IDs that start with rtc_. A UUID is a common 36-character identifier with dashes.
 
-**Data flow**: Builds headers containing a UUID path segment, calls `decode_call_id_from_location`, and asserts the returned string.
+**Data flow**: It creates headers containing a Location path ending in a UUID-like value. It calls decode_call_id_from_location and expects that UUID string to be returned.
 
-**Call relations**: Directly covers the UUID branch in `is_realtime_call_id_segment` via the public helper parser.
+**Call relations**: This test directly exercises the call ID decoding helper. It confirms the ID recognition rule in is_realtime_call_id_segment supports both current accepted formats.
 
 *Call graph*: calls 1 internal fn (decode_call_id_from_location); 3 external calls (new, from_static, assert_eq!).
 
@@ -3366,13 +3384,13 @@ These files assemble session-scoped model transport behavior in core, including 
 
 ### `core/src/client.rs`
 
-`io_transport` · `request handling / model turn execution`
+`io_transport` · `request handling`
 
-This is the core transport/orchestration layer for model access. `ModelClient` owns session-stable state: thread id, provider/auth plumbing, session source, verbosity/compression/timing flags, optional attestation support, a session-wide websocket-disable switch, and a cached `WebsocketSession`. `ModelClientSession` is created per turn and carries the reusable websocket connection plus turn-local sticky routing state in `Arc<OnceLock<String>>` so `x-codex-turn-state` is replayed only within the same turn.
+This file exists so the rest of Codex can ask a model for work without knowing all the details of provider setup, authentication, routing headers, retry rules, WebSocket reuse, and streaming event conversion. Think of it as the travel desk for model calls: callers say where they need to go, and this file books the route, carries the right papers, watches for delays, and switches trains if needed.
 
-Request construction is explicit and concrete. `build_responses_request` derives `ResponsesApiRequest` from `Prompt`, `ModelInfo`, reasoning settings, service tier, and `CodexResponsesMetadata`; it strips metadata for non-OpenAI providers, emits tool JSON, computes `text` controls for verbosity/output schema, and sets `store` for Azure responses endpoints. HTTP streaming uses `ApiResponsesClient`; websocket streaming uses `ApiWebSocketResponsesClient` and can compress requests to incremental deltas by comparing non-input request properties and subtracting prior input plus server-returned output items. Warmup sends `generate=false` and waits for completion so later requests can reuse the same connection and `previous_response_id`.
+The long-lived `ModelClient` stores session-wide facts such as the provider, thread id, auth environment, feature headers, attestation support, and whether WebSockets have been disabled after a failure. For each user turn, `ModelClientSession` holds short-lived state: a reusable WebSocket connection, the previous request/response needed for incremental WebSocket sends, and a sticky routing token called `x-codex-turn-state` that must stay within one turn only.
 
-The file also handles 401 recovery through `UnauthorizedRecovery`, emits detailed session and feedback telemetry through `ApiTelemetry`, maps provider streams into internal `ResponseStream`s while preserving partial output for tracing, and permanently falls back from websocket to HTTP when required. Auxiliary unary paths cover conversation compaction, memory summarization, and realtime WebRTC call creation with sideband auth/header reuse.
+The main path builds a Responses API request from a prompt, model settings, tools, reasoning options, output schema controls, and metadata. If WebSockets are available, it tries that first, including optional preconnect or prewarm. If WebSockets are unsupported or fail in specific ways, it falls back to HTTP streaming for the rest of the session. It also supports non-streaming calls for conversation compaction, memory summarization, and starting realtime WebRTC calls. Along the way it refreshes auth once after unauthorized responses, records timing and failure details, and maps low-level API events into Codex's internal response stream.
 
 #### Function details
 
@@ -3382,11 +3400,11 @@ The file also handles 401 recovery through `UnauthorizedRecovery`, emits detaile
 fn for_endpoint(endpoint: &'static str) -> Self
 ```
 
-**Purpose**: Creates a tiny telemetry descriptor that tags requests with a fixed endpoint path. It standardizes endpoint labeling across HTTP, websocket, compact, and memory-summary calls.
+**Purpose**: Creates a small telemetry label that says which API endpoint a request is using. This lets later logging distinguish, for example, normal response streaming from compaction or memory summarization.
 
-**Data flow**: Accepts `endpoint: &'static str` → wraps it in `RequestRouteTelemetry { endpoint }` → returns the struct by value.
+**Data flow**: It receives a fixed endpoint string, stores it in a `RequestRouteTelemetry` value, and returns that value for telemetry code to read later.
 
-**Call relations**: Callers use this helper whenever they build request/websocket telemetry contexts, including compaction, memory summarization, websocket preconnect, HTTP streaming, and websocket streaming. It feeds endpoint names into `ApiTelemetry` so downstream metrics and feedback tags can distinguish `/responses`, `/responses/compact`, and `/memories/trace_summarize`.
+**Call relations**: Higher-level request paths create this label before building telemetry. The label is then carried into API, SSE, or WebSocket telemetry so records can be tied back to the endpoint being contacted.
 
 *Call graph*: called by 5 (compact_conversation_history, summarize_memories, preconnect_websocket, stream_responses_api, stream_responses_websocket).
 
@@ -3400,11 +3418,11 @@ fn responses_request_properties_match(
 ) -> bool
 ```
 
-**Purpose**: Compares two `ResponsesApiRequest` values for websocket incremental-reuse compatibility while intentionally ignoring `input` and `client_metadata`. It enforces that only requests with identical non-input semantics can reuse prior websocket state.
+**Purpose**: Checks whether two Responses API requests are the same in every way that matters for safely sending only a WebSocket delta. It deliberately ignores the input and client metadata because those are checked or handled separately.
 
-**Data flow**: Takes `previous` and `current` requests → destructures both exhaustively, excluding `input` and `client_metadata` from equality checks → compares model, instructions, tools, tool choice, parallel tool calls, reasoning, store, stream, include, service tier, prompt cache key, and text → returns `true` only if all those fields match.
+**Data flow**: It receives a previous request and a current request, compares model, instructions, tools, reasoning, streaming options, service tier, cache key, and text controls, and returns `true` only when those request settings match.
 
-**Call relations**: This helper is only used by `ModelClientSession::get_incremental_items`. Its exhaustive destructuring is a design guard: adding a new request field forces an explicit decision about whether that field affects websocket reuse.
+**Call relations**: The WebSocket incremental-send logic calls this before trying to reuse the previous response id. If the settings changed, the session sends a full request instead of a smaller follow-up.
 
 *Call graph*: called by 1 (get_incremental_items).
 
@@ -3415,11 +3433,11 @@ fn responses_request_properties_match(
 fn set_connection_reused(&self, connection_reused: bool)
 ```
 
-**Purpose**: Stores whether the current websocket request reused an existing connection. The flag is mutex-protected because `WebsocketSession` itself is reused and queried across async request paths.
+**Purpose**: Records whether the current WebSocket request is using an already-open connection. This matters for telemetry and auth debugging.
 
-**Data flow**: Accepts `connection_reused: bool` → locks `self.connection_reused`, recovering from poison if necessary → overwrites the stored boolean.
+**Data flow**: It receives a boolean, locks a small shared value inside the WebSocket session, and replaces the old reuse flag with the new one.
 
-**Call relations**: Called when preconnecting, resetting, or obtaining a websocket connection. `preconnect_websocket` and `websocket_connection` set it based on whether a fresh handshake occurred; `reset_websocket_session` clears it during transport reset.
+**Call relations**: Connection setup, reset, and preconnect code update this flag. Later, the WebSocket streaming path reads it and passes it to the API layer so timing records can say whether the socket was fresh or reused.
 
 *Call graph*: called by 3 (preconnect_websocket, reset_websocket_session, websocket_connection); 1 external calls (lock).
 
@@ -3430,11 +3448,11 @@ fn set_connection_reused(&self, connection_reused: bool)
 fn connection_reused(&self) -> bool
 ```
 
-**Purpose**: Reads the current connection-reuse flag for websocket request telemetry. It exposes whether the next websocket request should be reported as using an existing socket.
+**Purpose**: Reads the remembered WebSocket reuse flag. Callers use it when reporting or sending a request over the socket.
 
-**Data flow**: Locks `self.connection_reused`, recovering from poison if necessary → copies out the stored `bool` → returns it.
+**Data flow**: It locks the stored boolean, copies its current value, and returns it without changing the session.
 
-**Call relations**: Used by `ModelClientSession::stream_responses_websocket` immediately before sending a websocket request so the provider client and telemetry know whether the socket was reused.
+**Call relations**: The WebSocket streaming path asks for this value just before sending a request. That value is then handed to the underlying WebSocket connection for telemetry.
 
 *Call graph*: called by 1 (stream_responses_websocket); 1 external calls (lock).
 
@@ -3445,11 +3463,11 @@ fn connection_reused(&self) -> bool
 fn sideband_websocket_auth_headers(api_auth: &dyn AuthProvider) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds auth headers for joining a realtime call over the sideband websocket using the same identity that created the call over HTTP. It preserves bearer/account-id semantics across the two transport phases.
+**Purpose**: Builds the authentication headers needed for a realtime sideband WebSocket to join a WebRTC call created earlier. It preserves the same identity used to create the call.
 
-**Data flow**: Creates an empty `ApiHeaderMap` → asks the supplied `AuthProvider` to add its auth headers into that map → returns the populated headers.
+**Data flow**: It receives an auth provider, creates an empty header map, asks the auth provider to add its headers, and returns the filled map.
 
-**Call relations**: Used only by `ModelClient::create_realtime_call_with_headers`. That method clones ordinary extra headers, extends them with these auth headers, and returns them to the caller for the later sideband websocket join.
+**Call relations**: Realtime call creation uses this after preparing the HTTP call request. The returned headers are stored with the call details so later sideband WebSocket machinery can join the same call.
 
 *Call graph*: called by 1 (create_realtime_call_with_headers); 2 external calls (new, add_auth_headers).
 
@@ -3465,11 +3483,11 @@ fn new(
         model_verbosity: Option<Ve
 ```
 
-**Purpose**: Constructs the session-scoped model client with provider/auth state, telemetry metadata, websocket fallback state, and optional attestation support. It is the root initializer for all later turn sessions.
+**Purpose**: Creates the long-lived model client for one Codex session. It gathers stable session settings such as provider choice, auth setup, telemetry context, WebSocket state, and attestation support.
 
-**Data flow**: Accepts optional `AuthManager`, `ThreadId`, `ModelProviderInfo`, `SessionSource`, verbosity/compression/timing flags, beta header, and optional attestation provider → creates a shared model provider via `create_model_provider` → derives auth-environment telemetry and whether attestation is supported → allocates `ModelClientState` inside an `Arc`, initializing `disable_websockets` to `false` and `cached_websocket_session` to default → returns `ModelClient` with no prompt-cache override.
+**Data flow**: It receives session configuration and an optional auth manager, builds a shared provider, collects auth-environment telemetry, creates default WebSocket cache state, and returns a `ModelClient` ready to create per-turn sessions.
 
-**Call relations**: This constructor is used broadly by production setup and tests. Later methods like `new_session`, `compact_conversation_history`, and `summarize_memories` all depend on the state assembled here.
+**Call relations**: Session setup code and tests construct this client before any model calls happen. Later methods clone it cheaply and use its shared state for streaming, compaction, memory, and realtime requests.
 
 *Call graph*: calls 1 internal fn (collect_auth_env_telemetry); called by 13 (model_client_with_counting_attestation, test_model_client, new, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, test_model_client_session, responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids (+3 more)); 5 external calls (new, new, new, create_model_provider, default).
 
@@ -3483,11 +3501,11 @@ fn with_prompt_cache_key_override(
     ) -> Self
 ```
 
-**Purpose**: Returns a clone-like modified client that uses a caller-specified prompt cache key instead of the thread id. This is a narrow customization hook for request construction.
+**Purpose**: Returns a copy of the client that uses a caller-supplied prompt cache key instead of the session thread id. This is useful when tests or special flows need cache behavior to be controlled explicitly.
 
-**Data flow**: Takes ownership of `self` and `prompt_cache_key_override: Option<String>` → stores the override in the struct → returns the updated `ModelClient`.
+**Data flow**: It receives the client by value plus an optional string, stores that optional override, and returns the modified client.
 
-**Call relations**: This helper affects later `build_responses_request` calls indirectly through `prompt_cache_key`. It does not perform I/O or mutate shared session state.
+**Call relations**: When request-building later asks for the prompt cache key, this override wins. If no override was set, normal session-based caching is used.
 
 
 ##### `ModelClient::prompt_cache_key`  (lines 418–422)
@@ -3496,11 +3514,11 @@ fn with_prompt_cache_key_override(
 fn prompt_cache_key(&self) -> String
 ```
 
-**Purpose**: Computes the prompt cache key to embed in Responses API requests. It prefers an explicit override and otherwise uses the session thread id.
+**Purpose**: Chooses the prompt cache key to attach to model requests. The cache key helps the provider reuse prior prompt processing for the same thread or chosen override.
 
-**Data flow**: Reads `self.prompt_cache_key_override` → if present, clones and returns it; otherwise converts `self.state.thread_id` to string and returns that.
+**Data flow**: It reads the optional override; if present it returns that string, otherwise it converts the session thread id into a string and returns it.
 
-**Call relations**: Called by `build_responses_request` so every request gets a stable cache key. The override path exists for callers that need cache grouping different from the thread id.
+**Call relations**: The Responses request builder calls this while assembling the request body. The resulting value travels to the provider as part of every relevant model request.
 
 *Call graph*: called by 1 (build_responses_request).
 
@@ -3511,11 +3529,11 @@ fn prompt_cache_key(&self) -> String
 fn new_session(&self) -> ModelClientSession
 ```
 
-**Purpose**: Creates a fresh turn-scoped `ModelClientSession` that can lazily open and reuse a websocket within that turn. It also transfers any cached websocket session from the parent client into the new turn object.
+**Purpose**: Starts a fresh per-turn model session. It gives the turn its own sticky routing state while reusing any cached WebSocket connection from the long-lived client.
 
-**Data flow**: Clones `self` into the session, calls `take_cached_websocket_session()` to move out any session-level cached websocket state, creates a new `Arc<OnceLock<String>>` for turn state, and returns `ModelClientSession`.
+**Data flow**: It takes any cached WebSocket session from shared storage, creates a new one-time turn-state holder, and returns a `ModelClientSession` tied to this client.
 
-**Call relations**: This is the bridge from session-scoped to turn-scoped behavior. The returned session later drives `prewarm_websocket`, `stream`, and turn-state propagation; on drop it stores websocket state back into the parent client.
+**Call relations**: Turn execution code calls this before streaming. When the session is later dropped, its WebSocket state is stored back for possible reuse by the next turn.
 
 *Call graph*: calls 1 internal fn (take_cached_websocket_session); 2 external calls (new, new).
 
@@ -3526,11 +3544,11 @@ fn new_session(&self) -> ModelClientSession
 fn auth_manager(&self) -> Option<Arc<AuthManager>>
 ```
 
-**Purpose**: Exposes the underlying optional `AuthManager` from the shared provider. It is a convenience accessor for callers that need auth recovery or inspection.
+**Purpose**: Exposes the optional authentication manager associated with the model provider. Callers use it when they need session auth services directly.
 
-**Data flow**: Reads `self.state.provider` and returns its `auth_manager()` result.
+**Data flow**: It reads the provider's stored auth manager and returns a cloned shared pointer if one exists.
 
-**Call relations**: This accessor is not central to transport flow in this file, but it provides external code a way to reach the provider’s auth manager without exposing the whole provider.
+**Call relations**: This is a small access point from the model client to the login layer. Most request paths instead use `current_client_setup`, which resolves auth for a specific attempt.
 
 
 ##### `ModelClient::take_cached_websocket_session`  (lines 440–447)
@@ -3539,11 +3557,11 @@ fn auth_manager(&self) -> Option<Arc<AuthManager>>
 fn take_cached_websocket_session(&self) -> WebsocketSession
 ```
 
-**Purpose**: Moves the cached websocket session state out of the shared client so a new turn can own it exclusively. This prevents concurrent reuse of the same cached transport state.
+**Purpose**: Moves the cached WebSocket session out of the shared client state so a new turn can use it. This avoids two turn sessions trying to own the same socket state at once.
 
-**Data flow**: Locks `self.state.cached_websocket_session`, recovering from poison if needed → `std::mem::take`s the stored `WebsocketSession`, leaving a default in its place → returns the taken session.
+**Data flow**: It locks the shared cache, replaces it with an empty default session, and returns the previous cached session.
 
-**Call relations**: Called only by `new_session`. It pairs with `store_cached_websocket_session`, which writes the session back when a turn ends or fallback resets state.
+**Call relations**: Only new per-turn session creation uses this. The matching drop path later puts the WebSocket session back into the client cache.
 
 *Call graph*: called by 1 (new_session); 1 external calls (take).
 
@@ -3554,11 +3572,11 @@ fn take_cached_websocket_session(&self) -> WebsocketSession
 fn store_cached_websocket_session(&self, websocket_session: WebsocketSession)
 ```
 
-**Purpose**: Writes a `WebsocketSession` back into the shared client cache. This preserves reusable websocket state across turn boundaries when appropriate.
+**Purpose**: Stores WebSocket session state back into the long-lived client. This makes connection reuse possible across turn sessions.
 
-**Data flow**: Accepts a `WebsocketSession` by value → locks `self.state.cached_websocket_session` → replaces the stored session with the provided one.
+**Data flow**: It receives a WebSocket session, locks the shared cache, and replaces whatever was there with the provided session.
 
-**Call relations**: Used by `force_http_fallback` to clear cached websocket state and by `ModelClientSession::drop` to return turn-owned websocket state to the parent client.
+**Call relations**: A `ModelClientSession` calls this when it is dropped. HTTP fallback also calls it with an empty session to clear any unusable socket state.
 
 *Call graph*: called by 2 (force_http_fallback, drop).
 
@@ -3573,11 +3591,11 @@ fn force_http_fallback(
     ) -> bool
 ```
 
-**Purpose**: Session-scopingly disables websocket transport and clears cached websocket state, recording telemetry the first time fallback activates. It is the irreversible switch from websocket to HTTP for the remainder of the session.
+**Purpose**: Permanently switches this Codex session away from Responses-over-WebSocket and onto HTTP. This is used when WebSockets are unsupported or unhealthy enough that retrying them would waste time.
 
-**Data flow**: Checks `responses_websocket_enabled()` → atomically sets `disable_websockets` to `true` if websockets were still active → on first activation logs a warning and increments `codex.transport.fallback_to_http` telemetry → stores a default `WebsocketSession` into the cache → returns whether fallback was newly activated.
+**Data flow**: It checks whether WebSockets were still enabled, atomically marks them disabled, records a fallback telemetry counter if this call caused the switch, clears cached WebSocket state, and returns whether fallback was newly activated.
 
-**Call relations**: Called by `ModelClientSession::try_switch_fallback_transport` after websocket upgrade failures or exhausted retry/fallback logic. It centralizes the session-wide side effects so all later turns observe HTTP-only behavior.
+**Call relations**: The per-turn session calls this through `try_switch_fallback_transport`. After it runs, later streams skip the WebSocket path and go straight to HTTP.
 
 *Call graph*: calls 3 internal fn (responses_websocket_enabled, store_cached_websocket_session, counter); called by 1 (try_switch_fallback_transport); 2 external calls (default, warn!).
 
@@ -3593,11 +3611,11 @@ async fn compact_conversation_history(
         settings: CompactConversationR
 ```
 
-**Purpose**: Calls the unary `/responses/compact` endpoint to compact an existing conversation transcript into a smaller list of `ResponseItem`s. It builds the same auth, request, header, and telemetry context used by normal Responses requests, but repackages the payload for compaction.
+**Purpose**: Sends the current conversation transcript to the compact endpoint and receives a shorter replacement transcript. This keeps long sessions from growing too large while preserving useful context.
 
-**Data flow**: Inputs: `Prompt`, `ModelInfo`, optional turn-state lock, compaction settings, session telemetry, compaction trace context, and responses metadata. If `prompt.input` is empty, returns an empty vector immediately. Otherwise it resolves current auth/provider setup, builds request telemetry, constructs a full `ResponsesApiRequest`, destructures it into an `ApiCompactionInput`, assembles extra headers (installation id, beta/turn-state headers, compatibility headers, session headers, optional attestation, optional responses-lite header), computes a unary timeout from provider idle timeout, sends `compact_input`, records the trace attempt result, maps API errors, and returns the compacted `Vec<ResponseItem>`.
+**Data flow**: It receives a prompt, model settings, optional turn state, telemetry, trace context, and metadata. If there is no input it returns an empty list; otherwise it resolves auth/provider setup, builds a Responses-like payload and headers, calls the compact API, records the trace result, and returns compacted response items or an error.
 
-**Call relations**: This is a unary sibling to streaming turn execution. It depends on `current_client_setup`, `build_responses_request`, `build_responses_compatibility_headers`, `build_request_telemetry`, and `generate_attestation_header_for`; downstream it delegates the actual HTTP call to `ApiCompactClient`.
+**Call relations**: Compaction flows call this when they need to shrink history. It reuses the same request-building, auth, header, attestation, and telemetry conventions as normal model calls so compaction behaves like the rest of the session.
 
 *Call graph*: calls 11 internal fn (new, new, build_responses_compatibility_headers, build_responses_request, current_client_setup, generate_attestation_header_for, for_endpoint, add_responses_lite_header, build_responses_headers, build_reqwest_client (+1 more)); 7 external calls (new, new, from_str, build_request_telemetry, new, build_session_headers, default).
 
@@ -3613,11 +3631,11 @@ async fn create_realtime_call_with_headers(
         mut ex
 ```
 
-**Purpose**: Creates a realtime WebRTC call over HTTP and returns the SDP answer plus sideband websocket headers needed to attach control traffic to the same call. It preserves the exact auth identity used for call creation.
+**Purpose**: Starts a realtime WebRTC call through the model provider and returns the details needed to connect media and sideband control. WebRTC is a browser-style realtime media connection; the sideband WebSocket is a separate control channel for the same call.
 
-**Data flow**: Accepts SDP offer string, realtime session config, conversation architecture, mutable extra headers, and optional provider override → resolves current auth/provider setup → optionally inserts attestation into the outgoing headers → clones those headers and extends the clone with auth headers from `sideband_websocket_auth_headers` → creates a reqwest transport and chooses either the override provider or the resolved provider → calls `ApiRealtimeCallClient::create_with_session_architecture_and_headers` → returns `RealtimeWebrtcCallStart { sdp, call_id, sideband_headers }`.
+**Data flow**: It receives an SDP offer string, realtime session config, architecture choice, extra headers, and an optional provider override. It resolves auth/provider setup, adds attestation if available, prepares sideband auth headers, sends the HTTP call-create request, and returns the SDP answer, call id, and sideband headers.
 
-**Call relations**: This method is the realtime-call setup path. It shares auth resolution and attestation generation with other request methods, then hands off to the realtime API client and packages the returned call id together with sideband join headers.
+**Call relations**: Realtime session setup calls this before ordinary realtime WebSocket control attaches. The function keeps the HTTP-created call identity and the sideband auth identity aligned.
 
 *Call graph*: calls 5 internal fn (new, current_client_setup, generate_attestation_header_for, sideband_websocket_auth_headers, build_reqwest_client); 3 external calls (clone, insert, new).
 
@@ -3633,11 +3651,11 @@ async fn summarize_memories(
         session_telemetry: &SessionT
 ```
 
-**Purpose**: Calls the unary `/memories/trace_summarize` endpoint to summarize normalized raw memories. It is a lightweight non-streaming path parallel to conversation compaction.
+**Purpose**: Asks the provider to summarize raw memory records. This helps memory-related flows turn normalized raw facts into concise summaries.
 
-**Data flow**: Inputs: `raw_memories`, `ModelInfo`, optional reasoning effort, and session telemetry. If `raw_memories` is empty, returns an empty vector immediately. Otherwise it resolves current auth/provider setup, builds request telemetry for the memories endpoint, constructs `ApiMemorySummarizeInput` with model slug and optional `Reasoning`, builds subagent headers, sends `summarize_input`, maps API errors, and returns `Vec<ApiMemorySummarizeOutput>`.
+**Data flow**: It receives raw memories, model info, optional reasoning effort, and telemetry. If there are no memories it returns an empty list; otherwise it resolves auth/provider setup, builds telemetry and a memory-summary payload, sends it with subagent headers, and returns provider summaries or an error.
 
-**Call relations**: This method uses `current_client_setup`, `build_request_telemetry`, and `build_subagent_headers`, then delegates the actual HTTP request to `ApiMemoriesClient`. Tests specifically exercise the empty-input fast path.
+**Call relations**: Memory consolidation paths use this unary API call. It shares auth setup and telemetry style with the rest of the client but uses the memories endpoint instead of response streaming.
 
 *Call graph*: calls 6 internal fn (new, new, build_subagent_headers, current_client_setup, for_endpoint, build_reqwest_client); 4 external calls (new, build_request_telemetry, new, default).
 
@@ -3648,11 +3666,11 @@ async fn summarize_memories(
 fn build_subagent_headers(&self) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds extra headers that identify subagent/memory-consolidation request context for endpoints that need it. It translates session source into concrete HTTP headers.
+**Purpose**: Builds headers that identify special internal subagent work, especially memory consolidation. These headers let the provider know the request is not a normal user-facing turn.
 
-**Data flow**: Starts with an empty `ApiHeaderMap` → if `subagent_header_value(&self.state.session_source)` returns a string that can be parsed as a header value, inserts `x-openai-subagent` → if the session source is `Internal(MemoryConsolidation)`, also inserts `x-openai-memgen-request: true` → returns the header map.
+**Data flow**: It reads the session source, creates a header map, adds a subagent header when one applies, adds a memory-generation marker for memory consolidation sessions, and returns the headers.
 
-**Call relations**: Used by `summarize_memories`. It is the memory-summary-specific counterpart to `build_responses_compatibility_headers`, which applies similar session-source compatibility headers to Responses requests.
+**Call relations**: Memory summarization calls this before sending its request. The headers become part of the provider call so backend routing or accounting can treat the request appropriately.
 
 *Call graph*: calls 1 internal fn (subagent_header_value); called by 1 (summarize_memories); 4 external calls (new, from_static, from_str, matches!).
 
@@ -3666,11 +3684,11 @@ fn build_responses_compatibility_headers(
     ) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds compatibility headers derived from `CodexResponsesMetadata` and session source for Responses-family requests. It augments metadata-provided headers with internal memory-consolidation signaling.
+**Purpose**: Builds compatibility headers for Responses API calls and adds memory-consolidation markers when needed. These headers help older or special backend paths understand Codex requests.
 
-**Data flow**: Starts from `responses_metadata.compatibility_headers()` → if the session source is `Internal(MemoryConsolidation)`, inserts `x-openai-memgen-request: true` → returns the resulting `ApiHeaderMap`.
+**Data flow**: It starts with compatibility headers from response metadata, checks whether the session is an internal memory-consolidation session, possibly adds a memory-generation header, and returns the combined map.
 
-**Call relations**: Called by websocket handshake construction, compaction requests, and per-request Responses options. It keeps compatibility/header policy consistent across HTTP and websocket transports.
+**Call relations**: HTTP response options, WebSocket handshakes, and compaction requests all call this. It keeps those different transports using the same compatibility markers.
 
 *Call graph*: calls 1 internal fn (compatibility_headers); called by 3 (build_websocket_headers, compact_conversation_history, build_responses_options); 2 external calls (from_static, matches!).
 
@@ -3685,11 +3703,11 @@ fn build_ws_client_metadata(
     ) -> HashMap<String, String>
 ```
 
-**Purpose**: Builds websocket request `client_metadata` from `CodexResponsesMetadata`, optionally tagging the request as Responses Lite. This metadata travels inside the websocket payload rather than only in HTTP headers.
+**Purpose**: Builds metadata that travels inside a WebSocket response-create request. It includes normal Codex metadata and, when needed, a marker saying the request uses Responses Lite.
 
-**Data flow**: Copies the metadata map from `responses_metadata.client_metadata()` → if `use_responses_lite` is true, inserts `ws_request_header_x_openai_internal_codex_responses_lite = "true"` → returns the `HashMap<String, String>`.
+**Data flow**: It receives response metadata and a boolean for Responses Lite, copies the metadata into a string map, optionally inserts the Responses Lite marker, and returns the map.
 
-**Call relations**: Used by `ModelClientSession::stream_responses_websocket` before constructing `ResponseCreateWsRequest`. Tests verify that this metadata includes installation/session/thread/window lineage and turn metadata.
+**Call relations**: The WebSocket streaming path uses this before creating its WebSocket payload. Later it may also add the turn-state token before sending.
 
 *Call graph*: calls 1 internal fn (client_metadata); called by 1 (stream_responses_websocket).
 
@@ -3700,11 +3718,11 @@ fn build_ws_client_metadata(
 async fn generate_attestation_header_for(&self) -> Option<HeaderValue>
 ```
 
-**Purpose**: Asynchronously asks the configured attestation provider for a request header when the current provider/session supports attestation. It suppresses attestation entirely for unsupported providers.
+**Purpose**: Creates an attestation header when this provider and session require one. Attestation is a signed or verifiable proof about the client context sent with a request.
 
-**Data flow**: Reads `self.state.include_attestation`; if false, returns `None` immediately. Otherwise looks up `self.state.attestation_provider`, builds `AttestationContext { thread_id }`, awaits `header_for_request`, and returns the resulting `Option<HeaderValue>`.
+**Data flow**: It checks whether attestation is enabled, looks up the attestation provider, asks it for a header using the session thread id, and returns the header value if one can be made.
 
-**Call relations**: Shared by websocket handshake construction, compaction, realtime call creation, and per-request Responses options. Tests verify both the positive ChatGPT/OpenAI path and the omission path for non-attested providers.
+**Call relations**: Request-building paths for compaction, realtime calls, HTTP streaming options, and WebSocket handshakes call this so protected provider requests carry the same proof.
 
 *Call graph*: called by 4 (build_websocket_headers, compact_conversation_history, create_realtime_call_with_headers, build_responses_options).
 
@@ -3719,11 +3737,11 @@ fn build_request_telemetry(
         auth_env_te
 ```
 
-**Purpose**: Creates a request-telemetry object for unary API calls. It wraps session telemetry, auth context, endpoint labeling, and auth-environment metadata into a single `RequestTelemetry` trait object.
+**Purpose**: Creates telemetry for non-streaming, one-shot API calls. Telemetry records timing, status, auth details, and endpoint information.
 
-**Data flow**: Accepts `SessionTelemetry`, `AuthRequestTelemetryContext`, `RequestRouteTelemetry`, and `AuthEnvTelemetry` → constructs `ApiTelemetry::new(...)` inside an `Arc` → coerces it to `Arc<dyn RequestTelemetry>` and returns it.
+**Data flow**: It receives session telemetry, auth context, route information, and auth-environment information, wraps them in an `ApiTelemetry` object, and returns it as a request telemetry interface.
 
-**Call relations**: Used by unary methods like `compact_conversation_history` and `summarize_memories`. Streaming paths instead use `build_streaming_telemetry` or `build_websocket_telemetry` to obtain multiple telemetry trait views over the same `ApiTelemetry` instance.
+**Call relations**: Compaction and memory summarization use this before constructing their API clients. The API client then calls the telemetry object as requests finish.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, clone).
 
@@ -3738,11 +3756,11 @@ fn build_reasoning(
     ) -> Option<Reasoning>
 ```
 
-**Purpose**: Builds the optional `Reasoning` block for a request based on model capabilities and caller-selected effort/summary settings. It also chooses the reasoning context behavior for Responses Lite.
+**Purpose**: Builds the reasoning settings for a model request when the model supports reasoning summaries. Reasoning settings control effort level, summary reporting, and context scope.
 
-**Data flow**: Inputs: `ModelInfo`, optional effort, and summary config. If the model does not support reasoning summaries, returns `None`. Otherwise returns `Some(Reasoning)` with effort defaulting to the model’s default reasoning level when absent, summary omitted only when configured as `None`, and `context` set to `AllTurns` only when `use_responses_lite` is true.
+**Data flow**: It receives model info, optional effort, and requested summary behavior. If unsupported it returns nothing; otherwise it fills defaults from the model, omits summary when set to none, sets Responses Lite context when appropriate, and returns a reasoning block.
 
-**Call relations**: Called only by `build_responses_request`. Its output also controls whether the request includes `reasoning.encrypted_content` in the `include` list.
+**Call relations**: The main Responses request builder calls this for every model request. Its output determines whether reasoning-related fields and includes are sent to the provider.
 
 
 ##### `ModelClient::build_responses_request`  (lines 774–831)
@@ -3757,11 +3775,11 @@ fn build_responses_request(
         summa
 ```
 
-**Purpose**: Constructs the canonical `ResponsesApiRequest` for both HTTP and websocket turn execution. It folds together prompt content, tool definitions, model capabilities, verbosity/schema controls, service tier, prompt cache key, and metadata.
+**Purpose**: Turns Codex's internal prompt and model settings into the provider's Responses API request body. This is the central place where instructions, conversation items, tools, reasoning, output schema, cache key, and service tier become one request.
 
-**Data flow**: Inputs: provider, `Prompt`, `ModelInfo`, optional effort, summary config, optional service tier, and `CodexResponsesMetadata`. It clones base instructions, formats input via `Prompt::get_formatted_input_for_request`, strips item metadata for non-OpenAI providers, serializes tools with `create_tools_json_for_responses_api`, computes optional reasoning via `build_reasoning`, sets `include` accordingly, resolves verbosity only if the model supports it (warning otherwise), builds `text` controls from verbosity/output schema, computes prompt cache key and service tier, sets `store` for Azure responses endpoints, and returns a fully populated streaming `ResponsesApiRequest` with `client_metadata` from `responses_metadata`.
+**Data flow**: It receives provider info, prompt, model info, reasoning choices, service tier, and metadata. It formats input, strips metadata for non-OpenAI providers, converts tools, builds reasoning and text controls, chooses cache and tier settings, and returns a complete `ResponsesApiRequest`.
 
-**Call relations**: This is the shared request builder used by compaction, HTTP streaming, and websocket streaming. It is the main place where prompt/model/provider state is normalized into the wire request shape.
+**Call relations**: Streaming over HTTP, streaming over WebSocket, and compaction all use this shared builder. That keeps request bodies consistent even though the transport differs.
 
 *Call graph*: calls 5 internal fn (is_azure_responses_endpoint, prompt_cache_key, get_formatted_input_for_request, client_metadata, service_tier_for_request); called by 3 (compact_conversation_history, stream_responses_api, stream_responses_websocket); 6 external calls (build_reasoning, new, create_text_param_for_request, create_tools_json_for_responses_api, vec!, warn!).
 
@@ -3772,11 +3790,11 @@ fn build_responses_request(
 fn responses_websocket_enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether websocket transport is currently allowed for this session. It combines provider capability with the session-wide fallback-disable flag.
+**Purpose**: Answers whether this session should currently try Responses over WebSocket. It combines provider capability with the session-wide fallback flag.
 
-**Data flow**: Reads `self.state.provider.info().supports_websockets` and `self.state.disable_websockets` → returns `false` if the provider lacks websocket support or fallback has disabled websockets; otherwise returns `true`.
+**Data flow**: It reads provider capabilities and the atomic disable flag. It returns `false` if WebSockets are unsupported or already disabled, otherwise `true`.
 
-**Call relations**: Queried before preconnect, prewarm, normal streaming, and fallback activation. It is the gate that prevents websocket attempts after session-wide fallback has been triggered.
+**Call relations**: Preconnect, prewarm, normal stream selection, and fallback activation all consult this. Once fallback disables WebSockets, this function steers future turns to HTTP.
 
 *Call graph*: called by 4 (force_http_fallback, preconnect_websocket, prewarm_websocket, stream).
 
@@ -3787,11 +3805,11 @@ fn responses_websocket_enabled(&self) -> bool
 async fn current_client_setup(&self) -> Result<CurrentClientSetup>
 ```
 
-**Purpose**: Resolves the current auth and provider configuration from the shared model provider. It keeps auth/provider lookup logic in one place so all request paths stay synchronized.
+**Purpose**: Resolves the current auth and provider objects for one request attempt. Keeping this in one place prevents prewarm, WebSocket, HTTP, compaction, and memory calls from drifting apart.
 
-**Data flow**: Awaits `self.state.provider.auth()`, `api_provider()`, and `api_auth()` → packages them into `CurrentClientSetup { auth, api_provider, api_auth }` → returns the bundle or propagates provider-resolution errors.
+**Data flow**: It asks the shared model provider for the current Codex auth, API provider configuration, and API auth provider, then returns them bundled together.
 
-**Call relations**: Used by compaction, realtime call creation, memory summarization, websocket preconnect, HTTP streaming, and websocket streaming. It is the common setup step before any actual network request.
+**Call relations**: Every network path that needs provider credentials calls this shortly before sending. If auth state changes after recovery, the next loop iteration resolves fresh setup here.
 
 *Call graph*: called by 6 (compact_conversation_history, create_realtime_call_with_headers, summarize_memories, preconnect_websocket, stream_responses_api, stream_responses_websocket).
 
@@ -3807,11 +3825,11 @@ async fn connect_websocket(
         responses_metadata: &C
 ```
 
-**Purpose**: Performs a websocket handshake with the same headers, auth context, timeout handling, and telemetry/reporting used by normal turn execution. It is the shared connection path for prewarm and reconnect.
+**Purpose**: Opens a Responses API WebSocket connection with the same headers, auth, timeout, and telemetry behavior used by normal turns. It is the common handshake path for preconnect and reconnect.
 
-**Data flow**: Inputs: session telemetry, resolved provider/auth, responses metadata, auth telemetry context, and endpoint telemetry. It builds websocket headers, constructs websocket telemetry, computes the provider-specific connect timeout, attempts `ApiWebSocketResponsesClient::connect` under `tokio::time::timeout`, converts timeout expiry into `ApiError::Transport(Timeout)`, extracts debug/status info from any error, records websocket-connect telemetry and feedback tags, and returns either an `ApiWebSocketConnection` or `ApiError`.
+**Data flow**: It receives telemetry, provider/auth objects, response metadata, and auth/route context. It builds headers, creates WebSocket telemetry, attempts the connection with a provider-specific timeout, records success or error details, emits feedback tags, and returns the connection or API error.
 
-**Call relations**: Called by `ModelClientSession::preconnect_websocket` and `ModelClientSession::websocket_connection`. It centralizes handshake behavior so startup preconnect and in-turn reconnects behave identically.
+**Call relations**: Preconnect and the turn-time WebSocket connection getter both call this. Its result becomes the stored socket used by streaming requests.
 
 *Call graph*: calls 4 internal fn (build_websocket_headers, build_websocket_telemetry, default_headers, record_websocket_connect); called by 2 (preconnect_websocket, websocket_connection); 5 external calls (new, now, Transport, emit_feedback_request_tags_with_auth_env, timeout).
 
@@ -3825,11 +3843,11 @@ async fn build_websocket_headers(
     ) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds the HTTP headers used during websocket handshake for Responses-over-WebSocket. It combines beta flags, session/thread identifiers, compatibility headers, optional attestation, websocket beta opt-in, and optional timing metrics.
+**Purpose**: Builds headers for the WebSocket handshake. These headers carry session identity, compatibility flags, beta WebSocket version, optional timing metrics, and optional attestation.
 
-**Data flow**: Starts from `build_responses_headers(beta_features, None)` → inserts `x-client-request-id` from `responses_metadata.thread_id` when valid → extends with session headers and compatibility headers → optionally inserts attestation → inserts `OpenAI-Beta: responses_websockets=2026-02-06` → optionally inserts `x-responsesapi-include-timing-metrics: true` → returns the header map.
+**Data flow**: It receives response metadata, starts with shared Responses headers, adds request/session/thread identifiers, compatibility headers, attestation if available, the required WebSocket beta header, and timing metrics when enabled, then returns the map.
 
-**Call relations**: Used only by `connect_websocket`. It is the handshake-specific counterpart to `ModelClientSession::build_responses_options`, which builds per-request headers for HTTP streaming.
+**Call relations**: Only the WebSocket connect path calls this. The resulting headers are sent during the socket handshake before any prompt payload is streamed.
 
 *Call graph*: calls 3 internal fn (build_responses_compatibility_headers, generate_attestation_header_for, build_responses_headers); called by 1 (connect_websocket); 3 external calls (from_static, from_str, build_session_headers).
 
@@ -3840,11 +3858,11 @@ async fn build_websocket_headers(
 fn drop(&mut self)
 ```
 
-**Purpose**: Returns the turn-owned websocket session state to the parent `ModelClient` when the turn session is dropped. This preserves reusable connection/request state across turns when fallback has not cleared it.
+**Purpose**: Returns this turn session's WebSocket state to the long-lived client when the turn session goes away. This enables safe connection reuse across turns.
 
-**Data flow**: Takes ownership of `self.websocket_session` via `std::mem::take` → passes it to `self.client.store_cached_websocket_session(...)` → leaves the dropped session with default websocket state.
+**Data flow**: It takes the session's WebSocket state, leaves an empty one behind, and stores the taken state in the parent client cache.
 
-**Call relations**: This destructor closes the lifecycle loop started by `ModelClient::new_session`, which moved cached websocket state into the turn session.
+**Call relations**: Rust calls this automatically when a `ModelClientSession` is dropped. It pairs with `new_session`, which takes the cached state at the start of a turn.
 
 *Call graph*: calls 1 internal fn (store_cached_websocket_session); 1 external calls (take).
 
@@ -3855,11 +3873,11 @@ fn drop(&mut self)
 fn turn_state(&self) -> Arc<OnceLock<String>>
 ```
 
-**Purpose**: Exposes the per-turn sticky-routing token container so other subsystems can pass it into related requests such as compaction. The returned `Arc<OnceLock<String>>` is shared, not copied.
+**Purpose**: Gives callers shared access to this turn's sticky routing token holder. The token is set once when received and then reused for requests in the same turn.
 
-**Data flow**: Clones and returns `self.turn_state`.
+**Data flow**: It clones the shared `OnceLock` pointer that may eventually contain the turn-state string and returns it.
 
-**Call relations**: Used externally by code such as auto-compaction to ensure follow-up requests reuse the same `x-codex-turn-state` captured during the turn.
+**Call relations**: Auto-compaction and related flows can pass this holder into request methods. The request header builders read the stored value when it exists.
 
 *Call graph*: called by 1 (run_auto_compact); 1 external calls (clone).
 
@@ -3870,11 +3888,11 @@ fn turn_state(&self) -> Arc<OnceLock<String>>
 fn reset_websocket_session(&mut self)
 ```
 
-**Purpose**: Clears all cached websocket connection and incremental-reuse state for the current turn. It is the hard reset path after connection failure or timeout.
+**Purpose**: Clears all stored WebSocket state for the current turn. This is used when a socket is known to be bad or timed out.
 
-**Data flow**: Sets `connection`, `last_request`, and `last_response_rx` to `None`, clears `last_response_from_untraced_warmup`, and marks `connection_reused` false.
+**Data flow**: It removes the connection, previous request, pending previous response, warmup marker, and resets the connection-reused flag to false.
 
-**Call relations**: Called by `websocket_connection` when a timeout during reconnect should invalidate all websocket state. It ensures later requests start from a clean websocket baseline.
+**Call relations**: The WebSocket connection getter calls this after certain connection failures. After reset, later WebSocket use must open a fresh connection and send full request state.
 
 *Call graph*: calls 1 internal fn (set_connection_reused); called by 1 (websocket_connection).
 
@@ -3890,11 +3908,11 @@ async fn build_responses_options(
     ) -> ApiResponsesOptions
 ```
 
-**Purpose**: Builds the shared `ApiResponsesOptions` used by HTTP Responses requests. It consolidates session/thread ids, session source, extra headers, compression choice, and turn-state propagation.
+**Purpose**: Builds the transport options for an HTTP Responses API stream. These options include session ids, headers, compression choice, and the turn-state holder.
 
-**Data flow**: Inputs: responses metadata, compression mode, and `use_responses_lite`. It creates `ApiResponsesOptions` with session/thread ids and session source, builds extra headers from beta/turn-state headers plus compatibility headers, optional attestation, and optional responses-lite header, and stores `Some(Arc::clone(&self.turn_state))` in `turn_state`.
+**Data flow**: It receives metadata, compression mode, and Responses Lite choice. It builds common headers, compatibility headers, optional attestation, optional Responses Lite header, and returns an `ApiResponsesOptions` value.
 
-**Call relations**: Used by `stream_responses_api`. It keeps request-scoped header construction consistent regardless of the specific HTTP streaming call site.
+**Call relations**: The HTTP streaming path calls this just before sending a request. It keeps request-scoped headers consistent with compaction and WebSocket setup where appropriate.
 
 *Call graph*: calls 4 internal fn (build_responses_compatibility_headers, generate_attestation_header_for, add_responses_lite_header, build_responses_headers); called by 1 (stream_responses_api); 1 external calls (clone).
 
@@ -3910,11 +3928,11 @@ fn get_incremental_items(
     ) -> Option<Vec<ResponseItem>>
 ```
 
-**Purpose**: Determines whether the current request can be sent as an incremental websocket delta and, if so, computes the exact suffix of input items to send. It enforces strict reuse invariants around request shape and prior server output.
+**Purpose**: Finds the new input items that can be sent over WebSocket instead of resending the whole conversation. This is an optimization that only runs when the current request safely extends the previous one.
 
-**Data flow**: Inputs: current `ResponsesApiRequest`, optional `LastResponse`, and `allow_empty_delta`. It reads `self.websocket_session.last_request`; if absent, returns `None`. It rejects reuse unless `responses_request_properties_match` succeeds. It then checks that current input is a strict extension of previous input, subtracts any server-returned output items from the baseline, optionally strips metadata from those output items for non-OpenAI providers, rejects mismatches or empty deltas when disallowed, and returns `Some(Vec<ResponseItem>)` containing only the incremental suffix.
+**Data flow**: It receives the current request, an optional previous response, and whether an empty delta is allowed. It checks non-input request properties, compares current input against previous input plus server-added output items, strips provider metadata when needed, and returns only the new items or `None`.
 
-**Call relations**: Called by `prepare_websocket_request`. It is the core logic that enables websocket request compression/reuse without accidentally changing request semantics.
+**Call relations**: WebSocket request preparation uses this after reading the last response. If it cannot prove the request is a clean extension, the caller sends a full response-create payload instead.
 
 *Call graph*: calls 1 internal fn (responses_request_properties_match); called by 1 (prepare_websocket_request); 1 external calls (trace!).
 
@@ -3925,11 +3943,11 @@ fn get_incremental_items(
 fn get_last_response(&mut self) -> Option<LastResponse>
 ```
 
-**Purpose**: Non-blockingly retrieves the cached terminal response information from the previous websocket request if it has already arrived. It consumes the stored oneshot receiver.
+**Purpose**: Retrieves the completed previous WebSocket response if it is already available. This gives the session the response id and output items needed for incremental follow-up requests.
 
-**Data flow**: Takes `self.websocket_session.last_response_rx`, if any → calls `try_recv()` on the receiver → returns `Some(LastResponse)` only when the terminal response has already been delivered; returns `None` on closed or empty receiver states.
+**Data flow**: It takes the stored one-shot receiver, tries to read from it without waiting, and returns the `LastResponse` if one has arrived; otherwise it returns nothing.
 
-**Call relations**: Used by `prepare_websocket_request` to decide whether a previous response id and output-item baseline are available for incremental websocket reuse.
+**Call relations**: WebSocket request preparation calls this before deciding whether it can use `previous_response_id`. The receiver is produced by the stream-mapping code when a response completes.
 
 *Call graph*: called by 1 (prepare_websocket_request).
 
@@ -3944,11 +3962,11 @@ fn prepare_websocket_request(
     ) -> (ResponsesWsRequest, bool)
 ```
 
-**Purpose**: Transforms a full websocket payload into either a normal `response.create` request or an incremental one that references `previous_response_id`. It also reports whether that previous response id came from an untraced warmup request.
+**Purpose**: Chooses whether a WebSocket request should be full or incremental. Incremental requests can reference the previous response id and send only new input items.
 
-**Data flow**: Inputs: a `ResponseCreateWsRequest` payload and the corresponding full `ResponsesApiRequest`. It tries to fetch the last response via `get_last_response`; if unavailable, returns a plain `ResponsesWsRequest::ResponseCreate(payload)` and `false`. If available, it computes incremental items via `get_incremental_items`; if that fails or the previous response id is empty, it falls back to a plain request. Otherwise it returns a new `ResponseCreate` request with `previous_response_id` set and `input` replaced by the incremental suffix, plus a boolean indicating whether the reused response id came from untraced warmup.
+**Data flow**: It receives a WebSocket payload and the full logical request. It tries to read the last response, checks whether the current request is an incremental extension, and returns either the original full request or a modified request with `previous_response_id` and reduced input, plus a flag about warmup tracing.
 
-**Call relations**: Called by `stream_responses_websocket` after building the websocket payload. It bridges prior websocket state into the next request while preserving rollout-trace correctness.
+**Call relations**: The WebSocket streaming path calls this after building the payload and before sending. The returned request is what gets stamped with timing metadata and sent over the socket.
 
 *Call graph*: calls 2 internal fn (get_incremental_items, get_last_response); called by 1 (stream_responses_websocket); 2 external calls (ResponseCreate, trace!).
 
@@ -3963,11 +3981,11 @@ async fn preconnect_websocket(
     ) -> std::result::Result<(), ApiError>
 ```
 
-**Purpose**: Opportunistically opens a websocket connection for the current turn without sending any prompt payload. It is a pure connection warmup step.
+**Purpose**: Opens a WebSocket early for the current turn without sending prompt content. This can reduce delay when the real model request starts.
 
-**Data flow**: Checks `self.client.responses_websocket_enabled()` and whether a connection already exists; if either condition says no work is needed, returns `Ok(())`. Otherwise resolves current client setup, builds an auth telemetry context, calls `self.client.connect_websocket(...)`, stores the resulting connection in `self.websocket_session.connection`, marks `connection_reused` false, and returns success or the handshake error.
+**Data flow**: It checks whether WebSockets are enabled and no connection already exists. If so, it resolves auth/provider setup, builds auth telemetry context, opens the socket, stores it, marks it as not reused yet, and returns success or an API error.
 
-**Call relations**: This method is an explicit preconnect path separate from full prewarm. It delegates handshake details to `ModelClient::connect_websocket` and is used when callers want the socket ready before the first streamed request.
+**Call relations**: Startup or turn-preparation code can call this as an opportunistic warmup. Later streaming reuses the stored connection if it is still open.
 
 *Call graph*: calls 6 internal fn (new, connect_websocket, current_client_setup, responses_websocket_enabled, for_endpoint, set_connection_reused); 1 external calls (default).
 
@@ -3981,11 +3999,11 @@ async fn websocket_connection(
     ) -> std::result::Result<&ApiWebSocketConnection, ApiError>
 ```
 
-**Purpose**: Returns a usable websocket connection for the current turn, reconnecting if the cached one is absent or closed. It also updates reuse bookkeeping and resets state on timeout failures.
+**Purpose**: Returns an open WebSocket connection for the current turn, creating a new one if needed. It also marks whether the connection is reused.
 
-**Data flow**: Inputs are bundled in `WebsocketConnectParams`. It checks whether the existing connection is missing or `is_closed().await`; if a new connection is needed, it clears last-request/last-response state, calls `self.client.connect_websocket(...)`, resets the whole websocket session on timeout errors, stores the new connection, and marks reuse false. If the existing connection is still open, it marks reuse true. Finally it returns a reference to the stored connection or an `ApiError::Stream` if unexpectedly absent.
+**Data flow**: It receives connection parameters, checks whether the stored socket is missing or closed, clears previous incremental state when opening a new socket, calls the shared connect function, handles timeout reset behavior, stores the new connection, and returns a reference to it.
 
-**Call relations**: Called by `stream_responses_websocket` before each websocket request. It is the in-turn connection manager layered on top of `ModelClient::connect_websocket`.
+**Call relations**: The WebSocket streaming path calls this before sending a request. If it returns specific provider errors, the caller may fall back to HTTP or retry after auth recovery.
 
 *Call graph*: calls 3 internal fn (connect_websocket, reset_websocket_session, set_connection_reused); called by 1 (stream_responses_websocket); 2 external calls (Stream, matches!).
 
@@ -3996,11 +4014,11 @@ async fn websocket_connection(
 fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression
 ```
 
-**Purpose**: Chooses whether outgoing HTTP Responses requests should use zstd compression. Compression is enabled only for a narrow combination of session config, auth backend, and provider type.
+**Purpose**: Chooses whether to compress an HTTP Responses request body. Compression is only used when enabled, when authenticated through the Codex backend, and when the provider is OpenAI.
 
-**Data flow**: Reads `self.client.state.enable_request_compression`, the optional `CodexAuth`, and provider info → returns `Compression::Zstd` only when compression is enabled, auth exists and uses the Codex backend, and the provider is OpenAI; otherwise returns `Compression::None`.
+**Data flow**: It receives optional auth, reads session settings and provider info, and returns either Zstd compression or no compression.
 
-**Call relations**: Used by `stream_responses_api` when building `ApiResponsesOptions`. It keeps compression policy centralized and conservative.
+**Call relations**: The HTTP streaming path calls this before building request options. The selected compression mode is passed into the Responses API client.
 
 *Call graph*: called by 1 (stream_responses_api).
 
@@ -4016,11 +4034,11 @@ async fn stream_responses_api(
         effort: Option<ReasoningEffortConfig>,
 ```
 
-**Purpose**: Executes a streamed turn over the HTTP Responses API with SSE, including auth-recovery retry on 401 and rollout-trace recording. It is the fallback and non-websocket transport path.
+**Purpose**: Streams a model response through the HTTP Responses API. It is the reliable fallback path when WebSockets are unavailable or disabled.
 
-**Data flow**: Inputs: prompt, model info, session telemetry, reasoning effort/summary, service tier, responses metadata, and inference trace context. It loops: resolve current client setup, build auth/request/SSE telemetry, choose compression, build `ApiResponsesOptions`, build the `ResponsesApiRequest`, start an inference trace attempt, attach trace headers, create `ApiResponsesClient`, and call `stream_request`. On success it maps the provider stream through `map_response_stream` and returns the internal `ResponseStream`. On HTTP 401 it records failure, runs `handle_unauthorized`, converts the result into `PendingUnauthorizedRetry`, and retries. On any other error it records failure and returns the mapped `CodexErr`.
+**Data flow**: It receives prompt, model settings, telemetry, metadata, and trace context. It loops through request attempts, resolves auth/provider setup, builds telemetry, compression, options, and request body, sends the HTTP stream, maps successful API events into Codex events, and on unauthorized errors tries auth recovery once before retrying.
 
-**Call relations**: Called by `stream` when websocket transport is unavailable or has fallen back. It depends on `current_client_setup`, `build_responses_options`, `build_responses_request`, `responses_request_compression`, `build_streaming_telemetry`, and `handle_unauthorized`.
+**Call relations**: The public `stream` method calls this when it chooses HTTP. It hands successful streams to the common stream mapper so callers see the same `ResponseStream` shape as WebSocket calls.
 
 *Call graph*: calls 12 internal fn (new, new, build_responses_request, current_client_setup, build_responses_options, responses_request_compression, from_recovery, for_endpoint, handle_unauthorized, map_response_stream (+2 more)); called by 1 (stream); 7 external calls (new, build_streaming_telemetry, map_api_error, extract_response_debug_context, extract_response_debug_context_from_api_error, default, clone).
 
@@ -4036,11 +4054,11 @@ async fn stream_responses_websocket(
         effort: Option<ReasoningEffortCon
 ```
 
-**Purpose**: Executes a streamed turn over the Responses websocket transport, including optional warmup mode, incremental request reuse, sticky turn-state propagation, auth-recovery retry, and HTTP fallback signaling. It is the preferred transport when supported and healthy.
+**Purpose**: Streams a model response over the Responses WebSocket transport. It handles warmup requests, connection reuse, incremental request payloads, auth recovery, and fallback signals.
 
-**Data flow**: Inputs: prompt, model info, session telemetry, reasoning effort/summary, service tier, responses metadata, `warmup` flag, optional W3C trace context, and inference trace context. In a retry loop it resolves current client setup, builds auth context, constructs the full `ResponsesApiRequest`, derives websocket `client_metadata` (including turn state if already known), converts to `ResponseCreateWsRequest`, sets `generate=false` for warmup, obtains a websocket connection via `websocket_connection`, handling `426 UPGRADE_REQUIRED` as `FallbackToHttp` and `401` via `handle_unauthorized`. It then prepares an incremental or full websocket request, stamps send-start metadata, records rollout-trace start using either the logical request or websocket delta depending on warmup reuse, stores last-request bookkeeping, sends `stream_request`, maps the resulting stream through `map_response_stream`, caches the returned last-response receiver, and returns `WebsocketStreamOutcome::Stream(stream)`.
+**Data flow**: It receives prompt, model settings, telemetry, metadata, a warmup flag, trace context, and inference trace context. It resolves auth/provider setup, builds the logical request and WebSocket payload, gets a socket, prepares full or incremental sending, records tracing, sends the request, maps the resulting stream, and returns either a stream or a signal to fall back to HTTP.
 
-**Call relations**: Called by both `prewarm_websocket` and `stream`. It relies on `build_ws_client_metadata`, `prepare_websocket_request`, `websocket_connection`, `stamp_ws_stream_request_start_ms`, and `map_response_stream`; callers react to `FallbackToHttp` by switching the session to HTTP.
+**Call relations**: Both prewarm and normal streaming call this. Normal streaming consumes the returned stream; prewarm consumes it only until the warmup completion event.
 
 *Call graph*: calls 15 internal fn (from, new, build_responses_request, build_ws_client_metadata, current_client_setup, prepare_websocket_request, websocket_connection, from_recovery, for_endpoint, connection_reused (+5 more)); called by 2 (prewarm_websocket, stream); 6 external calls (clone, map_api_error, response_create_client_metadata, default, Stream, clone).
 
@@ -4055,11 +4073,11 @@ fn build_streaming_telemetry(
         auth_env_
 ```
 
-**Purpose**: Creates a shared `ApiTelemetry` instance and exposes it as both `RequestTelemetry` and `SseTelemetry` for HTTP streaming. This ensures request-level and SSE-poll telemetry share the same auth and endpoint context.
+**Purpose**: Creates telemetry objects for HTTP streaming: one for the request itself and one for server-sent event polling. Server-sent events are the HTTP streaming chunks sent by the provider.
 
-**Data flow**: Accepts session telemetry, auth context, route telemetry, and auth-env telemetry → constructs `ApiTelemetry::new(...)` in an `Arc` → clones/coerces it into `(Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>)` and returns the pair.
+**Data flow**: It receives session telemetry, auth context, route information, and auth-environment information, creates one shared `ApiTelemetry`, and returns it through both request and SSE telemetry interfaces.
 
-**Call relations**: Used by `stream_responses_api`. It is the streaming analogue of `build_request_telemetry` for unary calls.
+**Call relations**: The HTTP streaming path calls this before constructing the API client. The client then reports request attempts and stream polling activity through these interfaces.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, clone).
 
@@ -4074,11 +4092,11 @@ fn build_websocket_telemetry(
         auth_env_
 ```
 
-**Purpose**: Creates a websocket telemetry object backed by `ApiTelemetry`. It packages auth, endpoint, and auth-environment context for websocket request/event reporting.
+**Purpose**: Creates telemetry for WebSocket requests and events. This lets the session record socket request timing, reuse, errors, and incoming event timing.
 
-**Data flow**: Accepts session telemetry, auth context, route telemetry, and auth-env telemetry → constructs `ApiTelemetry::new(...)` in an `Arc` → coerces it to `Arc<dyn WebsocketTelemetry>` and returns it.
+**Data flow**: It receives session telemetry, auth context, route information, and auth-environment information, wraps them in `ApiTelemetry`, and returns it as a WebSocket telemetry interface.
 
-**Call relations**: Used by `ModelClient::connect_websocket` during websocket handshake setup. It gives the websocket client a telemetry sink that records request and event timing.
+**Call relations**: The shared WebSocket connection function calls this during handshake setup. The underlying WebSocket client uses it while sending requests and reading events.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (connect_websocket); 2 external calls (new, clone).
 
@@ -4094,11 +4112,11 @@ async fn prewarm_websocket(
         effort: Option<ReasoningEffortConfig>,
 ```
 
-**Purpose**: Performs a best-effort websocket warmup request for the current turn by sending a `generate=false` websocket `response.create` and waiting for completion. This primes connection reuse and previous-response-id reuse before the first real turn request.
+**Purpose**: Performs a WebSocket warmup request for the turn using `generate=false`, meaning it prepares the connection and response chain without asking the model to generate user-visible output. This can make the following real request faster and eligible for incremental reuse.
 
-**Data flow**: Checks whether websockets are enabled and whether a request has already been sent this turn; if not eligible, returns `Ok(())`. Otherwise creates a disabled inference trace context and calls `stream_responses_websocket(..., warmup=true, current_span_w3c_trace_context(), &disabled_trace)`. If that returns a stream, it consumes events until `ResponseEvent::Completed`, returning any stream error immediately. If websocket transport reports `FallbackToHttp`, it switches fallback transport and returns success. Other errors are propagated.
+**Data flow**: It checks whether WebSockets are enabled and no prior request exists. It calls the WebSocket stream path in warmup mode with tracing disabled, waits until a completion event arrives, switches to HTTP fallback if instructed, and returns success or error.
 
-**Call relations**: Called by higher-level turn orchestration before the first streamed request. It delegates the actual websocket request to `stream_responses_websocket` and reacts to fallback by invoking `try_switch_fallback_transport`.
+**Call relations**: Turn execution can call this before the first real stream. Its completed warmup response may be reused by the next WebSocket request, but it is intentionally omitted from inference traces.
 
 *Call graph*: calls 4 internal fn (responses_websocket_enabled, stream_responses_websocket, try_switch_fallback_transport, disabled); 1 external calls (current_span_w3c_trace_context).
 
@@ -4115,11 +4133,11 @@ async fn stream(
         summar
 ```
 
-**Purpose**: Runs a single model request for the current turn, choosing websocket transport first when available and falling back to HTTP otherwise. It is the main turn-scoped streaming entrypoint.
+**Purpose**: Streams one model request for the current turn using the best available transport. It prefers WebSocket when enabled and falls back to HTTP when necessary.
 
-**Data flow**: Inputs: prompt, model info, session telemetry, reasoning effort/summary, service tier, responses metadata, and inference trace context. It inspects the provider `wire_api`; for `WireApi::Responses`, if websockets are enabled it captures the current span trace context and calls `stream_responses_websocket`. A websocket `Stream` result is returned directly; `FallbackToHttp` triggers `try_switch_fallback_transport`. It then calls `stream_responses_api` as the fallback/remaining path and returns that stream result.
+**Data flow**: It receives prompt, model settings, telemetry, metadata, and trace context. It checks the provider wire API, tries WebSocket first when allowed, switches fallback on provider upgrade-required signals, and otherwise sends the request through HTTP, returning a `ResponseStream`.
 
-**Call relations**: This is the primary method invoked by higher-level turn runners. It orchestrates between `stream_responses_websocket`, `try_switch_fallback_transport`, and `stream_responses_api`.
+**Call relations**: Higher-level Codex execution code calls this for actual model turns, sampling requests, and remote compaction work. It hides transport selection so callers only consume a unified stream.
 
 *Call graph*: calls 4 internal fn (responses_websocket_enabled, stream_responses_api, stream_responses_websocket, try_switch_fallback_transport); called by 5 (drain_to_completed, run_remote_compaction_request_v2, try_run_sampling_request, stream_until_complete_with_metadata, stream_until_complete_with_model_info); 1 external calls (current_span_w3c_trace_context).
 
@@ -4134,11 +4152,11 @@ fn try_switch_fallback_transport(
     ) -> bool
 ```
 
-**Purpose**: Activates session-wide HTTP fallback and clears the current turn’s websocket state. It is the turn-local wrapper around the parent client’s irreversible fallback switch.
+**Purpose**: Disables WebSockets for the whole Codex session and clears this turn's WebSocket state. It returns whether this call was the one that actually activated fallback.
 
-**Data flow**: Calls `self.client.force_http_fallback(...)` to flip the session-wide disable flag and emit telemetry if newly activated → replaces `self.websocket_session` with `WebsocketSession::default()` → returns whether fallback was newly activated.
+**Data flow**: It receives telemetry and model info, asks the parent client to force HTTP fallback, replaces the local WebSocket session with a default empty one, and returns the activation flag.
 
-**Call relations**: Called after websocket warmup or streaming determines HTTP fallback is necessary, and by retry/error handling elsewhere. It combines session-wide and turn-local cleanup.
+**Call relations**: Prewarm, normal stream selection, and retry/error handling call this when WebSocket should no longer be used. Future turns then skip WebSocket because the parent client records the disabled state.
 
 *Call graph*: calls 1 internal fn (force_http_fallback); called by 3 (prewarm_websocket, stream, handle_retryable_response_stream_error); 1 external calls (default).
 
@@ -4149,11 +4167,11 @@ fn try_switch_fallback_transport(
 fn stamp_ws_stream_request_start_ms(request: &mut ResponsesWsRequest)
 ```
 
-**Purpose**: Adds a client-side send timestamp to websocket request metadata immediately before transmission. This captures realistic transport timing for downstream analysis.
+**Purpose**: Adds the current client-side send time to a WebSocket request's metadata. This helps measure realistic transport timing from just before the request leaves the client.
 
-**Data flow**: Takes `&mut ResponsesWsRequest`, pattern-matches the `ResponseCreate` payload, ensures `client_metadata` exists, inserts `x-codex-ws-stream-request-start-ms` with the current Unix timestamp in milliseconds, and mutates the request in place.
+**Data flow**: It receives a mutable WebSocket request, ensures the request has a metadata map, inserts the current Unix timestamp in milliseconds under a Codex-specific key, and changes the request in place.
 
-**Call relations**: Called by `stream_responses_websocket` just before `stream_request`. It enriches websocket payload metadata without affecting request semantics.
+**Call relations**: The WebSocket streaming path calls this immediately before recording and sending the request. The provider or telemetry systems can later use the timestamp for timing analysis.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_ms); called by 1 (stream_responses_websocket).
 
@@ -4167,11 +4185,11 @@ fn build_responses_headers(
 ) -> ApiHeaderMap
 ```
 
-**Purpose**: Builds the common Codex-specific extra headers for Responses-family requests. It currently carries beta-feature flags and the sticky turn-state token.
+**Purpose**: Builds common Codex headers for Responses API calls. These include optional beta feature flags and the per-turn sticky routing token.
 
-**Data flow**: Starts with an empty `ApiHeaderMap` → if `beta_features_header` is present, non-empty, and parses as a header value, inserts `x-codex-beta-features` → if `turn_state` is provided and already initialized, inserts `x-codex-turn-state` with that value → returns the header map.
+**Data flow**: It receives an optional beta feature string and optional turn-state holder. It creates a header map, adds the beta header when non-empty and valid, adds `x-codex-turn-state` when a token exists and is valid, and returns the headers.
 
-**Call relations**: Used by websocket handshake construction, compaction requests, and HTTP Responses options. It is the shared low-level helper for Codex-specific request headers.
+**Call relations**: HTTP options, WebSocket handshake setup, and compaction request setup all call this. It keeps the same header rules across transports.
 
 *Call graph*: called by 3 (build_websocket_headers, compact_conversation_history, build_responses_options); 2 external calls (new, from_str).
 
@@ -4182,11 +4200,11 @@ fn build_responses_headers(
 fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: bool)
 ```
 
-**Purpose**: Adds the internal Responses Lite opt-in header when the selected model/request path requires it. It mutates an existing header map in place.
+**Purpose**: Adds the internal Responses Lite header when a model request should use Responses Lite. Responses Lite is a lighter provider mode controlled by model information.
 
-**Data flow**: Accepts `headers: &mut ApiHeaderMap` and `use_responses_lite: bool` → if true, inserts `x-openai-internal-codex-responses-lite: true`; otherwise leaves the map unchanged.
+**Data flow**: It receives a mutable header map and a boolean. If the boolean is true, it inserts the static Responses Lite header; otherwise it leaves the map unchanged.
 
-**Call relations**: Called by compaction request setup and HTTP Responses option construction. Websocket requests encode the same concept in client metadata via `build_ws_client_metadata`.
+**Call relations**: Compaction and HTTP streaming options call this while preparing headers. WebSocket requests carry the same idea through client metadata instead.
 
 *Call graph*: called by 2 (compact_conversation_history, build_responses_options); 2 external calls (insert, from_static).
 
@@ -4201,11 +4219,11 @@ fn map_response_stream(
 ) -> (ResponseStream, oneshot::Receiver<
 ```
 
-**Purpose**: Adapts a provider `codex_api::ResponseStream` into the internal `ResponseStream` type while preserving the upstream request id for tracing/feedback. It strips the upstream id from the provider stream object and forwards it separately.
+**Purpose**: Converts the API crate's response stream wrapper into Codex's internal response stream wrapper. It also preserves the upstream request id for tracing and feedback tags.
 
-**Data flow**: Destructures `codex_api::ResponseStream` into `rx_event` and `upstream_request_id`, rebuilds a provider stream with `upstream_request_id: None`, and passes both pieces plus telemetry and trace attempt into `map_response_events` → returns the mapped `ResponseStream` and `oneshot::Receiver<LastResponse>`.
+**Data flow**: It receives an API stream, session telemetry, and an inference trace attempt. It separates out the upstream request id, rebuilds the stream without that id, delegates event conversion, and returns the Codex stream plus a receiver for the final response summary.
 
-**Call relations**: Used by both HTTP and websocket streaming paths after a provider stream has been established. It is a thin wrapper over `map_response_events` specialized for the provider stream struct.
+**Call relations**: Both HTTP and WebSocket streaming paths call this after the provider accepts a request. The returned stream is what higher-level Codex code consumes.
 
 *Call graph*: calls 1 internal fn (map_response_events); called by 2 (stream_responses_api, stream_responses_websocket).
 
@@ -4221,11 +4239,11 @@ fn map_response_events(
 ) -> (ResponseStream, o
 ```
 
-**Purpose**: Runs the background mapping task that converts provider response events into the internal stream channel, tracks partial output, emits telemetry/feedback tags, and produces the terminal `LastResponse` summary for websocket incremental reuse. It is the central stream-adaptation and trace-recording loop.
+**Purpose**: Pumps provider response events into Codex's internal stream while recording telemetry, trace results, and the last completed response. This is the event translator and bookkeeper for streaming.
 
-**Data flow**: Inputs: optional upstream request id, any async stream of `Result<ResponseEvent, ApiError>`, session telemetry, and an `InferenceTraceAttempt`. It creates an mpsc channel for downstream events, a oneshot channel for `LastResponse`, and a cancellation token. In a spawned task it loops over provider events or consumer cancellation: accumulates `OutputItemDone` items, forwards events downstream, records token usage and completion on `Completed`, sends `LastResponse { response_id, items_added }` once, maps provider errors into internal errors while recording failure telemetry, and records cancellation if the consumer drops early or send fails under backpressure. If the provider stream ends without `response.completed`, it records a failed trace with the partial items.
+**Data flow**: It receives an upstream request id, an event stream, session telemetry, and an inference trace attempt. It spawns a task that reads events, forwards them through a channel, tracks output items, records completion, failure, cancellation, and token usage, and sends the final response id/items through a one-shot channel.
 
-**Call relations**: Called only by `map_response_stream`, but it underpins all streamed turn execution. Tests in `client_tests.rs` specifically validate its cancellation behavior, partial-output preservation, and feedback-tag emission.
+**Call relations**: The stream wrapper calls this for all transports. WebSocket incremental sending later reads the last-response channel to decide whether it can send only new input.
 
 *Call graph*: calls 5 internal fn (see_event_completed_failed, sse_event_completed, record_cancelled, record_completed, record_failed); called by 1 (map_response_stream); 9 external calls (new, new, OutputItemDone, map_api_error, extract_response_debug_context_from_api_error, feedback_tags!, take, select!, spawn).
 
@@ -4236,11 +4254,11 @@ fn map_response_events(
 fn from_recovery(recovery: UnauthorizedRecoveryExecution) -> Self
 ```
 
-**Purpose**: Converts a successful unauthorized-recovery execution into retry metadata that will be attached to the next request’s telemetry. It marks the next attempt as a follow-up after auth recovery.
+**Purpose**: Creates retry telemetry state after an auth recovery step succeeds. It marks the next request as a retry caused by an unauthorized response.
 
-**Data flow**: Accepts `UnauthorizedRecoveryExecution { mode, phase }` → returns `PendingUnauthorizedRetry` with `retry_after_unauthorized = true` and the supplied mode/phase stored.
+**Data flow**: It receives the recovery execution details, sets `retry_after_unauthorized` to true, stores the recovery mode and phase, and returns the pending retry record.
 
-**Call relations**: Used by both HTTP and websocket streaming loops after `handle_unauthorized` succeeds. Tests also verify that this metadata is reflected by `AuthRequestTelemetryContext::new`.
+**Call relations**: HTTP and WebSocket streaming loops use this after `handle_unauthorized` succeeds. The next attempt's telemetry then explains why it is being retried.
 
 *Call graph*: called by 3 (stream_responses_api, stream_responses_websocket, auth_request_telemetry_context_tracks_attached_auth_and_retry_phase).
 
@@ -4255,11 +4273,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Builds the auth-related telemetry context for a request from auth mode, attached auth headers, and pending retry metadata. It normalizes several auth modes into stable telemetry strings.
+**Purpose**: Builds the auth-related telemetry snapshot for one request attempt. It records what kind of auth is being used, whether an auth header was attached, and whether this is a retry after recovery.
 
-**Data flow**: Inputs: optional `AuthMode`, `&dyn AuthProvider`, and `PendingUnauthorizedRetry`. It queries `auth_header_telemetry(api_auth)` to determine whether an auth header is attached and its name, maps `AuthMode` variants into either `"ApiKey"` or `"Chatgpt"`, copies retry/recovery fields from `PendingUnauthorizedRetry`, and returns `AuthRequestTelemetryContext`.
+**Data flow**: It receives optional Codex auth mode, an API auth provider, and pending retry info. It inspects the auth headers, maps auth modes into telemetry-friendly labels, combines retry details, and returns the context.
 
-**Call relations**: Constructed by compaction, memory summarization, websocket preconnect, HTTP streaming, and websocket streaming before telemetry objects are built. Tests verify that attached auth and retry phase are captured correctly.
+**Call relations**: All major request paths create this before building telemetry or opening WebSockets. Later telemetry callbacks read it when recording requests and feedback tags.
 
 *Call graph*: called by 6 (compact_conversation_history, summarize_memories, preconnect_websocket, stream_responses_api, stream_responses_websocket, auth_request_telemetry_context_tracks_attached_auth_and_retry_phase); 1 external calls (auth_header_telemetry).
 
@@ -4274,11 +4292,11 @@ async fn handle_unauthorized(
 ) -> Result<UnauthorizedRecoveryExecution>
 ```
 
-**Purpose**: Handles a 401 transport error by attempting one step of configured auth recovery, recording telemetry for success/failure/not-run cases, and returning either retry instructions or a mapped terminal error. It is the shared 401 recovery policy for HTTP and websocket requests.
+**Purpose**: Handles a 401 Unauthorized response by running the available auth recovery step, usually refreshing ChatGPT tokens, and telling the caller whether to retry. If recovery cannot run or fails, it returns a user-facing Codex error.
 
-**Data flow**: Inputs: the unauthorized `TransportError`, mutable optional `UnauthorizedRecovery`, and session telemetry. It extracts response debug context, checks whether a recovery step is available, and if so runs `recovery.next().await`. On success it records `recovery_succeeded` telemetry/feedback and returns `UnauthorizedRecoveryExecution { mode, phase }`. On permanent or transient refresh failure it records the corresponding failure telemetry and returns `CodexErr::RefreshTokenFailed` or `CodexErr::Io`. If no recovery can run, it records `recovery_not_run` with a reason and returns the mapped original transport error.
+**Data flow**: It receives the transport error, mutable recovery state, and session telemetry. It extracts debug details, runs the next recovery step if available, records success or permanent/transient failure, emits feedback tags, and returns recovery execution details or a mapped error.
 
-**Call relations**: Called by both `stream_responses_api` and `stream_responses_websocket` when they receive HTTP 401s. Its successful output is immediately converted into `PendingUnauthorizedRetry` for the next loop iteration.
+**Call relations**: HTTP and WebSocket streaming loops call this when an API attempt returns unauthorized. On success, those loops rebuild auth/provider setup and retry the original request.
 
 *Call graph*: calls 2 internal fn (emit_feedback_auth_recovery_tags, record_auth_recovery); called by 2 (stream_responses_api, stream_responses_websocket); 5 external calls (Transport, map_api_error, extract_response_debug_context, Io, RefreshTokenFailed).
 
@@ -4289,11 +4307,11 @@ async fn handle_unauthorized(
 fn api_error_http_status(error: &ApiError) -> Option<u16>
 ```
 
-**Purpose**: Extracts an HTTP status code from an `ApiError` when the error is specifically an HTTP transport failure. It is a small helper for telemetry/reporting paths.
+**Purpose**: Extracts an HTTP status code from an API error when the error came from an HTTP response. It returns nothing for non-HTTP errors such as timeouts or stream errors.
 
-**Data flow**: Matches on `ApiError` → returns `Some(status.as_u16())` for `ApiError::Transport(TransportError::Http { status, .. })` → otherwise returns `None`.
+**Data flow**: It receives an API error, checks whether it wraps an HTTP transport error, and returns the numeric status code if present.
 
-**Call relations**: Used by websocket connect/request telemetry to populate follow-up status fields and feedback tags.
+**Call relations**: WebSocket connection and telemetry code use this to attach status codes to records and feedback tags. It is a small helper for error reporting.
 
 
 ##### `ApiTelemetry::new`  (lines 2113–2125)
@@ -4306,11 +4324,11 @@ fn new(
         auth_env_telemetry: AuthEnvTelem
 ```
 
-**Purpose**: Constructs the shared telemetry adapter used for request, SSE, and websocket telemetry traits. It stores all context needed to emit session metrics and feedback tags.
+**Purpose**: Creates the shared telemetry object used by request, SSE, and WebSocket reporting. It bundles session telemetry with auth context, route labels, and auth-environment details.
 
-**Data flow**: Accepts `SessionTelemetry`, `AuthRequestTelemetryContext`, `RequestRouteTelemetry`, and `AuthEnvTelemetry` → stores them in `ApiTelemetry` → returns the struct.
+**Data flow**: It receives the four telemetry ingredients, stores them in an `ApiTelemetry` struct, and returns it.
 
-**Call relations**: Instantiated by `build_request_telemetry`, `build_streaming_telemetry`, and `build_websocket_telemetry`, then viewed through different telemetry trait objects depending on transport.
+**Call relations**: Telemetry builder functions create this and then expose it through the interface needed by each transport. The API clients call its trait methods as network activity happens.
 
 *Call graph*: called by 3 (build_request_telemetry, build_streaming_telemetry, build_websocket_telemetry).
 
@@ -4327,11 +4345,11 @@ fn on_request(
     )
 ```
 
-**Purpose**: Records telemetry for a completed HTTP request attempt and emits corresponding feedback tags. It captures status, transport error message, duration, auth context, endpoint, and response-debug identifiers.
+**Purpose**: Records the result of an HTTP API request attempt. It captures status, error text, duration, auth header details, endpoint, and server debug identifiers.
 
-**Data flow**: Inputs: attempt number, optional HTTP status, optional `TransportError`, and duration. It derives a telemetry-safe error message, converts status to `u16`, extracts response debug context from the error when present, records the API request via `session_telemetry.record_api_request`, then emits `FeedbackRequestTags` enriched with auth-env telemetry and optional recovery-followup success/status fields.
+**Data flow**: It receives attempt number, optional status, optional transport error, and duration. It extracts a plain error message and debug context, records the API request in session telemetry, and emits feedback request tags with auth-environment information.
 
-**Call relations**: This is invoked by the underlying API client through the `RequestTelemetry` trait whenever unary or HTTP streaming requests complete an attempt.
+**Call relations**: The HTTP API client invokes this through the request telemetry interface. It is used for both streaming and unary HTTP calls that opted into this telemetry.
 
 *Call graph*: calls 1 internal fn (record_api_request); 1 external calls (emit_feedback_request_tags_with_auth_env).
 
@@ -4346,11 +4364,11 @@ fn on_sse_poll(
             tokio::time::error::Elapsed,
 ```
 
-**Purpose**: Records telemetry for an SSE poll iteration during HTTP streaming. It delegates the raw poll result and duration to session telemetry.
+**Purpose**: Records timing and result information for polling the next server-sent event from an HTTP stream. This helps diagnose slow or failing streaming reads.
 
-**Data flow**: Accepts the SSE poll result and elapsed duration → passes both to `self.session_telemetry.log_sse_event(...)`.
+**Data flow**: It receives the poll result and how long the poll took, then passes both to session telemetry for logging.
 
-**Call relations**: Used only when `ApiTelemetry` is supplied as `SseTelemetry` in `stream_responses_api`.
+**Call relations**: The HTTP streaming API client invokes this while reading streamed events. It complements request-level telemetry by measuring the stream after the request has started.
 
 *Call graph*: calls 1 internal fn (log_sse_event).
 
@@ -4361,11 +4379,11 @@ fn on_sse_poll(
 fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool)
 ```
 
-**Purpose**: Records telemetry for a websocket request send/response cycle and emits feedback tags including whether the connection was reused. It mirrors `on_request` but for websocket semantics.
+**Purpose**: Records the result of sending a request over WebSocket. It includes duration, error details, whether the connection was reused, and auth recovery follow-up information.
 
-**Data flow**: Inputs: duration, optional `ApiError`, and `connection_reused`. It derives an error message and optional HTTP status, extracts response debug context from the API error, records websocket-request telemetry via `session_telemetry.record_websocket_request`, and emits `FeedbackRequestTags` with auth context, reuse flag, debug ids, and optional recovery-followup fields.
+**Data flow**: It receives request duration, optional API error, and the connection-reused flag. It extracts error message, status, and debug context, records WebSocket request telemetry, and emits feedback tags.
 
-**Call relations**: Invoked by the websocket client through the `WebsocketTelemetry` trait for each websocket request. It complements `connect_websocket`’s separate handshake telemetry.
+**Call relations**: The WebSocket client invokes this for WebSocket request sends. It gives the same auth and endpoint visibility that HTTP request telemetry provides.
 
 *Call graph*: calls 1 internal fn (record_websocket_request); 1 external calls (emit_feedback_request_tags_with_auth_env).
 
@@ -4380,22 +4398,26 @@ fn on_ws_event(
     )
 ```
 
-**Purpose**: Records telemetry for individual websocket event polls. It forwards the raw websocket event result and timing to session telemetry.
+**Purpose**: Records timing and result information for receiving WebSocket events. This helps track how long socket reads take and whether they fail.
 
-**Data flow**: Accepts the websocket event poll result and duration → calls `self.session_telemetry.record_websocket_event(result, duration)`.
+**Data flow**: It receives the WebSocket event result and duration, then forwards them to session telemetry.
 
-**Call relations**: Used by the websocket client through the `WebsocketTelemetry` trait during websocket streaming.
+**Call relations**: The WebSocket client invokes this while reading messages from the provider. It pairs with `on_ws_request` to describe both sending and receiving on the socket.
 
 *Call graph*: calls 1 internal fn (record_websocket_event).
 
 
 ### `core/src/responses_retry.rs`
 
-`orchestration` · `stream request error handling during sampling and remote compaction loops`
+`domain_logic` · `request handling`
 
-This file centralizes the policy for what to do after a retryable streaming failure from the Responses API. It defines `ResponsesStreamRequest` to distinguish ordinary sampling streams from remote compaction streams so logging can be tailored per request type. The main async function, `handle_retryable_response_stream_error`, is designed to be called from request loops after a stream error has already been classified as retryable.
+Some model requests arrive as a stream, meaning the program receives pieces of the answer over time rather than one single finished reply. Streams can fail for ordinary reasons, such as a temporary network drop or a WebSocket connection closing. This file is the safety routine for those moments.
 
-Its control flow has three tiers. First, if the retry budget has been exhausted but the `ModelClientSession` can switch to a fallback transport, it flips transport mode, emits a warning event to the session explaining that the system is falling back from WebSockets to HTTPS, resets the retry counter to zero, and tells the caller to retry immediately. Second, if retries remain, it increments the counter, computes a delay either from the `CodexErr::Stream` embedded requested delay or from the shared `backoff` helper, logs the retry with `log_retry`, optionally surfaces a `notify_stream_error` message to the UI, sleeps for the delay, and returns `Ok(())` so the outer loop retries. The first websocket retry is intentionally hidden in release builds to reduce noisy transient reconnect messages; debug builds and non-websocket transports always report it. If neither fallback nor retry is available, the original error is returned unchanged.
+Its main job is to answer: should we try again, should we switch to a different transport, or should we give up? A transport is the route used to talk to the model service. Here, the system may fall back from WebSockets, which keep an open two-way connection, to HTTPS, the more traditional request-and-response web method.
+
+The key function receives the current error, how many retries have already happened, the allowed maximum, and context about the current user turn. If retries are still available, it increases the retry count, chooses a waiting time using either the error's requested delay or an exponential-style backoff helper, logs what is happening, optionally tells the user interface that it is reconnecting, waits, and then tells the caller it is safe to retry. If retries are exhausted, it may first try switching transport and reset the retry count. If neither retrying nor fallback is allowed, it returns the original error.
+
+This matters because without it, a brief connection hiccup could end a request immediately, or users might see a frozen screen with no explanation.
 
 #### Function details
 
@@ -4411,11 +4433,11 @@ async fn handle_retryable_response_stream_error(
     turn_context: &Tur
 ```
 
-**Purpose**: Applies the shared retry/fallback policy after a retryable stream failure and tells the caller whether to continue retrying or fail the request. It also emits user-facing and telemetry-oriented notifications at the right moments.
+**Purpose**: This function is the decision point after a streamed model request fails in a way that might be temporary. It decides whether to retry, switch from WebSockets to HTTPS, notify the user interface, wait for a safe delay, or finally return the error.
 
-**Data flow**: It takes a mutable retry counter, a retry limit, the encountered `CodexErr`, mutable access to `ModelClientSession`, and references to `Session`, `TurnContext`, and the request kind. If retries are exhausted and `try_switch_fallback_transport` succeeds, it sends a `WarningEvent` through `sess.send_event`, resets `*retries` to `0`, and returns `Ok(())`. Otherwise, if retries remain, it increments `*retries`, derives a delay from `CodexErr::Stream`'s optional requested delay or `backoff(retry_count)`, logs via `log_retry`, conditionally calls `sess.notify_stream_error` with a reconnect message, sleeps for that delay, and returns `Ok(())`. If no retry path applies, it returns `Err(err)` unchanged.
+**Data flow**: It receives a retry counter that it can change, a maximum retry limit, the error that occurred, the model client session, the wider session, the current turn context, and the kind of request that failed. If the retry limit has been reached, it first checks whether the model client can switch to a fallback transport; if so, it sends a warning event, resets the retry counter, and returns success so the caller can try again. If retries remain, it increments the counter, chooses a delay from the error or from the shared backoff helper, records a warning log, may notify the front end with a reconnecting message, waits for that delay, and returns success. If no retry or fallback is possible, it returns the original error unchanged.
 
-**Call relations**: This function is called from both `run_remote_compaction_request_v2` and `run_sampling_request` inside their retry loops. It delegates transport switching to `ModelClientSession::try_switch_fallback_transport`, delay logging to `log_retry`, delay calculation to `backoff`, and user/session notifications to `Session` methods so the outer request loops can stay focused on request execution.
+**Call relations**: The streaming request loops for sampling and remote compaction call this function when their stream fails. This function uses the client session to attempt a transport fallback, uses the session to send warning or reconnect messages outward, calls `log_retry` to write a developer-facing warning, and uses the shared `backoff` helper to avoid retrying too aggressively. Its return value tells the caller whether to continue the request loop or stop with an error.
 
 *Call graph*: calls 3 internal fn (try_switch_fallback_transport, log_retry, backoff); called by 2 (run_remote_compaction_request_v2, run_sampling_request); 6 external calls (cfg!, notify_stream_error, send_event, format!, Warning, sleep).
 
@@ -4433,24 +4455,24 @@ fn log_retry(
 )
 ```
 
-**Purpose**: Emits a request-type-specific warning log entry describing a pending retry after a stream failure. It formats sampling and remote compaction retries differently.
+**Purpose**: This function writes a warning log entry whenever the system is about to retry a failed stream. It keeps the log message appropriate for the kind of request that failed.
 
-**Data flow**: It takes the request kind, turn context, error reference, retry counters, and computed delay. For `Sampling` it logs a generic warning including retry counts and delay; for `RemoteCompactionV2` it logs structured fields including `turn_id`, retry counts, and the compact error text. It returns `()` and only writes to the tracing log sink.
+**Data flow**: It receives the request kind, the current turn context, the error, the retry number, the retry limit, and the delay before the next attempt. For a normal sampling request, it logs a short message saying the stream disconnected and will be retried. For remote compaction, it logs more structured details, including the turn id and error, so that debugging can connect the retry to the right background operation. It does not return data or change state; its output is the log entry.
 
-**Call relations**: This helper is called only by `handle_retryable_response_stream_error` after the retry delay has been chosen. It exists to keep request-specific logging details out of the main retry control flow.
+**Call relations**: `handle_retryable_response_stream_error` calls this after it has decided that another retry will happen and has chosen the delay. The function hands information to the tracing/logging system through the `warn!` macro so operators and developers can later understand why the request paused and retried.
 
 *Call graph*: called by 1 (handle_retryable_response_stream_error); 1 external calls (warn!).
 
 
 ### `core/src/session_startup_prewarm.rs`
 
-`orchestration` · `startup, before first regular turn`
+`orchestration` · `startup and first regular turn`
 
-This file adds an optional startup optimization layer around model-client session creation. `SessionStartupPrewarmHandle` wraps a spawned task that should eventually yield a ready `ModelClientSession`, along with the instant it started and the timeout budget. Its `resolve` method is careful about outcomes: if the task already finished it converts the join result immediately; otherwise it waits until either the caller's cancellation token fires or the remaining timeout elapses. It records startup-phase and duration telemetry for consumed, failed, timed-out, join-failed, and cancelled outcomes, and aborts the task when necessary. `resolution_from_join_result` centralizes the mapping from join/task result to `SessionStartupPrewarmResolution`.
+When a session starts, the first message can feel slow because the system must build the prompt, prepare tools, collect metadata, and open a websocket connection to the model service. This file creates a “prewarm” path: it does much of that work early, before the user’s first normal turn needs it. Think of it like turning on an oven before you start cooking, so it is hot when you need it.
 
-On the session side, `schedule_startup_prewarm` checks whether response websockets are enabled, spawns the background prewarm task, records total prewarm telemetry, and stores the handle. `consume_startup_prewarm_for_regular_turn` retrieves and resolves that handle for the first ordinary turn, returning `Unavailable { status: "not_scheduled" }` when no prewarm exists.
+The main object is `SessionStartupPrewarmHandle`, which owns the background task doing the prewarm. It remembers when the task started and how long it is allowed to run. Later, when the first regular turn begins, the session can try to consume this prepared model client session. If the prewarm is ready, the turn can use it. If it failed, timed out, was cancelled, or was never scheduled, the system reports that cleanly and the regular path can continue without it.
 
-The actual work happens in `schedule_startup_prewarm_inner`: it creates a preview turn context using `INITIAL_SUBMIT_ID`, builds tools and an empty prompt with supplied base instructions, derives `CodexResponsesMetadata` for `Prewarm`, creates a fresh `ModelClientSession`, and calls `prewarm_websocket` on it. Each phase records timing into `SessionTelemetry`, so startup latency can be broken down into turn-context creation, tool building, prompt building, and websocket warmup.
+The file also records telemetry, meaning timing and status measurements used to understand startup performance. It records how long each phase took, whether the prewarm was ready or failed, and how old the prewarm was when the first turn tried to use it. This matters because startup speed is user-visible, and failures here should not break the session; they should simply fall back to the normal connection path.
 
 #### Function details
 
@@ -4464,11 +4486,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Wraps a spawned prewarm task together with its start time and timeout budget. The task is stored in an `AbortOnDropHandle` so dropping the handle cancels the background work.
+**Purpose**: Creates a small owner object for a background prewarm task. It wraps the task so that dropping the handle will abort the task, which prevents stray startup work from continuing after it is no longer useful.
 
-**Data flow**: It takes a `JoinHandle<CodexResult<ModelClientSession>>`, `started_at: Instant`, and `timeout: Duration`, wraps the join handle in `AbortOnDropHandle::new`, stores all three fields, and returns `SessionStartupPrewarmHandle`.
+**Data flow**: It receives a running task, the time that task started, and the allowed timeout. It wraps the task in an abort-on-drop guard, stores the timing information, and returns a `SessionStartupPrewarmHandle` that can later be waited on, cancelled, or consumed.
 
-**Call relations**: Called by `Session::schedule_startup_prewarm` after spawning the background prewarm task, and also by tests that construct synthetic handles.
+**Call relations**: This is used when `Session::schedule_startup_prewarm` has just spawned the background prewarm job and needs to store it on the session. Tests also construct it directly to check behavior around interrupted or non-blocking regular turns.
 
 *Call graph*: called by 3 (interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted, regular_turn_emits_turn_started_with_trace_id_without_waiting_for_startup_prewarm, schedule_startup_prewarm); 1 external calls (new).
 
@@ -4479,11 +4501,11 @@ fn new(
 async fn abort(self)
 ```
 
-**Purpose**: Cancels the background prewarm task and waits for it to finish aborting. This is the explicit teardown path for an unused prewarm handle.
+**Purpose**: Stops the background prewarm task on purpose. This is used when the prewarm work should not continue, for example because the session no longer needs it.
 
-**Data flow**: It takes ownership of `self`, calls `self.task.abort()`, awaits the task once to observe completion, ignores the result, and returns `()`. No telemetry is recorded here.
+**Data flow**: It takes ownership of the handle, sends an abort signal to the task, then waits for the task to finish shutting down. It does not return a useful value; its result is that the background work is no longer running.
 
-**Call relations**: Used by callers that want to discard a scheduled prewarm rather than resolve it for a turn.
+**Call relations**: This is a direct cleanup path for a prewarm handle. It calls the task’s abort operation and then awaits the task so cancellation is actually observed instead of leaving unfinished async work behind.
 
 *Call graph*: 1 external calls (abort).
 
@@ -4498,11 +4520,11 @@ async fn resolve(
     ) -> SessionStartupPrewarmResolution
 ```
 
-**Purpose**: Waits for the startup prewarm task to become usable, time out, or be cancelled, and records detailed telemetry about the outcome. It converts the background task result into a `SessionStartupPrewarmResolution` suitable for the first regular turn.
+**Purpose**: Decides what happened to the prewarm when the first regular turn wants to use it. It returns either a ready model client session, a clean cancellation, or an explanation that the prewarm is unavailable.
 
-**Data flow**: Inputs are the handle itself, `&SessionTelemetry`, and a cancellation token. It computes the prewarm age and remaining timeout, either consumes an already-finished task or waits with `tokio::select!` between cancellation and `tokio::time::timeout`. It maps successful joins through `resolution_from_join_result`, aborts on timeout or cancellation, records startup-phase and duration metrics with status labels, and returns `Cancelled`, `Ready(Box<ModelClientSession>)`, or `Unavailable { status, prewarm_duration }`.
+**Data flow**: It receives the stored background task, session telemetry, and a cancellation token, which is a shared signal that says “stop waiting.” It checks whether the task is already done; otherwise it waits only for the remaining timeout or until cancellation. It turns the outcome into a clear resolution and records timing measurements such as how long the prewarm had been running and whether it was consumed, failed, timed out, or cancelled.
 
-**Call relations**: Called by `Session::consume_startup_prewarm_for_regular_turn` when the first real turn wants to use the prewarm. It delegates join-result interpretation to `resolution_from_join_result`.
+**Call relations**: This is the bridge between startup work and the first normal turn. `Session::consume_startup_prewarm_for_regular_turn` calls it when a regular turn tries to take the prewarmed session. If the task completes, it hands the raw task result to `SessionStartupPrewarmHandle::resolution_from_join_result`; if it times out or is cancelled, it aborts the task and records the appropriate telemetry.
 
 *Call graph*: calls 2 internal fn (record_duration, record_startup_phase); 5 external calls (now, resolution_from_join_result, Ready, info!, select!).
 
@@ -4516,11 +4538,11 @@ fn resolution_from_join_result(
     ) -> SessionStartupPrewarmResolution
 ```
 
-**Purpose**: Maps the raw join/task result from the background prewarm task into a stable resolution enum. It distinguishes successful prewarm, task-level failure, and join failure.
+**Purpose**: Converts the low-level result of the background task into a simple prewarm outcome. It hides the difference between a model setup error and the async task itself failing to join.
 
-**Data flow**: It takes `Result<CodexResult<ModelClientSession>, tokio::task::JoinError>` plus `started_at`. `Ok(Ok(session))` becomes `Ready(Box::new(session))`; `Ok(Err(err))` logs a warning and becomes `Unavailable { status: "failed", prewarm_duration: None }`; `Err(join_err)` logs a warning and becomes `Unavailable { status: "join_failed", prewarm_duration: Some(started_at.elapsed()) }`.
+**Data flow**: It receives the completed task result and the original start time. If the task produced a ready `ModelClientSession`, it boxes that session and returns `Ready`. If the prewarm code returned an error, it logs a warning and returns `Unavailable` with a failed status. If the task itself failed or was aborted unexpectedly, it logs that and returns `Unavailable` with a join-failed status and elapsed duration.
 
-**Call relations**: Used internally by `resolve` whenever the background task has produced a join result.
+**Call relations**: This is called by `SessionStartupPrewarmHandle::resolve` after the background task finishes. It keeps `resolve` focused on waiting, timeout, and telemetry, while this helper focuses on translating task completion into a human-readable status.
 
 *Call graph*: 4 external calls (new, elapsed, Ready, warn!).
 
@@ -4531,11 +4553,11 @@ fn resolution_from_join_result(
 async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String)
 ```
 
-**Purpose**: Starts the background startup prewarm task if websocket responses are enabled and stores a handle for later consumption by the first regular turn. It also records total prewarm telemetry once the task finishes.
+**Purpose**: Starts the startup prewarm in the background if websocket prewarming is enabled. This lets the session prepare a model connection before the first user turn needs it.
 
-**Data flow**: It takes `&Arc<Self>` and the base-instructions string. If the model client does not support response websockets it returns immediately. Otherwise it clones telemetry and session state, captures the provider's websocket connect timeout and current time, spawns an async task that runs `schedule_startup_prewarm_inner` and records total-duration metrics with status `ready` or `failed`, wraps the task in `SessionStartupPrewarmHandle::new`, and stores it via `set_session_startup_prewarm`.
+**Data flow**: It reads the session’s model-client settings and returns immediately if websocket use is disabled. Otherwise it captures telemetry, the websocket connection timeout, the current time, the session itself, and the base instructions. It spawns an async task that runs the real prewarm work, records whether that work ended ready or failed, wraps the task in a `SessionStartupPrewarmHandle`, and stores that handle on the session.
 
-**Call relations**: Called during session startup. It delegates the actual prewarm work to `schedule_startup_prewarm_inner` and later pairs with `consume_startup_prewarm_for_regular_turn`.
+**Call relations**: This is the entry point for prewarming from the session startup flow. It creates the background task that calls `schedule_startup_prewarm_inner`, then uses `SessionStartupPrewarmHandle::new` so the task can later be consumed or aborted safely.
 
 *Call graph*: calls 2 internal fn (new, schedule_startup_prewarm_inner); 3 external calls (clone, now, spawn).
 
@@ -4549,11 +4571,11 @@ async fn consume_startup_prewarm_for_regular_turn(
     ) -> SessionStartupPrewarmResolution
 ```
 
-**Purpose**: Retrieves the stored startup prewarm handle, if any, and resolves it for use by the first ordinary turn. If no prewarm was scheduled, it returns an explicit unavailable status.
+**Purpose**: Lets the first regular turn try to use the prewarmed model client session. If no prewarm exists, it reports that fact without treating it as an error.
 
-**Data flow**: It takes `&self` and a cancellation token, removes any stored prewarm handle with `take_session_startup_prewarm`, and either returns `SessionStartupPrewarmResolution::Unavailable { status: "not_scheduled", prewarm_duration: None }` or awaits `startup_prewarm.resolve(...)` and returns that result.
+**Data flow**: It receives a cancellation token from the regular turn. It tries to take the stored prewarm handle from the session. If there is none, it returns an unavailable result with `not_scheduled`. If there is one, it asks the handle to resolve itself using the session telemetry and the cancellation token, then returns that resolution to the caller.
 
-**Call relations**: Called by regular-turn startup logic before creating a fresh model client session. It is the consumer-side counterpart to `schedule_startup_prewarm`.
+**Call relations**: This function is called when a normal turn reaches the point where a prewarmed connection could help. It hands control to `SessionStartupPrewarmHandle::resolve`, which either supplies the ready model client session or explains why the normal turn must proceed without it.
 
 
 ##### `schedule_startup_prewarm_inner`  (lines 232–300)
@@ -4565,24 +4587,24 @@ async fn schedule_startup_prewarm_inner(
 ) -> CodexResult<ModelClientSession>
 ```
 
-**Purpose**: Performs the actual startup prewarm work: build a preview turn context, construct tools and an empty prompt, derive prewarm metadata, create a model client session, and warm its websocket connection. It returns the ready `ModelClientSession` on success.
+**Purpose**: Performs the actual prewarm work: it builds the same kind of context, tools, prompt, metadata, and model client session that the first turn will need, then warms the websocket connection.
 
-**Data flow**: Inputs are `Arc<Session>` and the base-instructions string. It creates a startup-prewarm turn context with `INITIAL_SUBMIT_ID`, records phase timings, builds tools with `built_tools`, builds an empty prompt with `build_prompt` and `BaseInstructions { text: base_instructions }`, computes `responses_metadata` for `CodexResponsesRequestKind::Prewarm`, creates `session.services.model_client.new_session()`, calls `prewarm_websocket(...)`, records the websocket-warmup phase timing, and returns `CodexResult<ModelClientSession>`.
+**Data flow**: It receives the session and the base instructions text. It creates a startup-only turn context, builds the tool router, builds a prompt with no user messages yet, gathers window and response metadata, creates a new model client session, and calls `prewarm_websocket` with the prompt, model settings, reasoning settings, service tier, telemetry, and metadata. If all of that succeeds, it returns the warmed `ModelClientSession`; if any step fails, it returns an error.
 
-**Call relations**: Executed inside the spawned task created by `Session::schedule_startup_prewarm`. It reuses the same prompt/tool-building helpers as real turns so the warmed session matches the first-turn environment as closely as possible.
+**Call relations**: `Session::schedule_startup_prewarm` runs this inside a spawned background task. This function delegates prompt construction to `build_prompt`, tool setup to `built_tools`, and websocket warming to the model client session, while recording timing for each startup-prewarm phase so the system can see where startup time was spent.
 
 *Call graph*: calls 2 internal fn (build_prompt, built_tools); called by 1 (schedule_startup_prewarm); 3 external calls (new, now, new).
 
 
 ### `core/src/compact_remote_v2.rs`
 
-`domain_logic` · `turn compaction`
+`orchestration` · `during manual or automatic context compaction`
 
-This file is a newer remote compaction implementation built on the normal Responses streaming API rather than a dedicated compact endpoint. The wrapper structure mirrors the older remote path: `run_inline_remote_auto_compact_task` and `run_remote_compact_task` feed into `run_remote_compact_task_inner`, which handles analytics, pre/post compact hooks, and error-event emission. The implementation-specific work happens in `run_remote_compact_task_inner_impl`.
+A model can only read a limited amount of conversation at once; that limit is called the context window. This file is the “moving company” for old context: it decides what must be kept, asks the remote model service to create a compacted record, and replaces the bulky history with a smaller version. It supports both automatic compaction, which happens inside a normal turn when space is needed, and manual compaction, which starts its own turn.
 
-That function clones and optionally rewrites history with `trim_function_call_history_to_fit_context_window`, builds model-visible tools, then appends a synthetic `ResponseItem::CompactionTrigger` to the prompt input before starting a traced streaming request. `run_remote_compaction_request_v2` owns the transport retry loop, capping retries at the smaller of provider stream retries and `MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES`; retryable failures are delegated to `handle_retryable_response_stream_error`. `collect_compaction_output` then enforces the protocol contract: the stream must reach `response.completed` and must contain exactly one `ResponseItem::Compaction`, though other output items may appear and are ignored.
+The flow starts by recording analytics and running pre-compaction hooks, which are project-defined checks that may allow or stop the work. It then prepares the current history: it trims oversized tool-call output, builds a prompt with visible tools and instructions, and sends a special compaction request to the Responses API. The response stream must contain exactly one compaction item; extra ordinary output items are ignored, but missing or duplicate compaction items are treated as errors.
 
-Once the compaction item arrives, `build_v2_compacted_history` reconstructs installed history by retaining only message items with roles `user`, `developer`, or `system`, filtering them again through `should_keep_compacted_history_item`, truncating retained text from newest to oldest under a 64k-token budget, counting retained input images, and finally appending the compaction output. The resulting history is then sanitized and context-reinjected by the shared remote helper before installation. The embedded tests lock down retention filtering, image accounting, truncation order, and stream-output validation.
+After the compacted output returns, the file builds the replacement history. It keeps only selected user/developer/system messages, applies a retained-message token budget, counts retained images, appends the new compaction item, and installs the result into the session. It also records trace data, token usage, and hook outcomes so operators can understand whether compaction helped or failed.
 
 #### Function details
 
@@ -4596,11 +4618,11 @@ async fn run_inline_remote_auto_compact_task(
     initial_context_injection: InitialContextInje
 ```
 
-**Purpose**: Runs automatic remote compaction v2 inline, optionally reusing an existing `ModelClientSession`. It is the auto-compaction entry point for the streamed Responses-based implementation.
+**Purpose**: Starts an automatic remote compaction while another turn is already in progress. It is used when the system notices the conversation is getting too large and needs to shrink history without creating a separate user-visible compaction turn.
 
-**Data flow**: Takes shared `Session`, `TurnContext`, mutable `ModelClientSession`, injection mode, reason, and phase → forwards them to `run_remote_compact_task_inner` with `CompactionTrigger::Auto` and `Some(client_session)` → returns the inner result.
+**Data flow**: It receives the session, current turn context, an existing model-client session, instructions about whether to inject current context, and analytics labels explaining why compaction is happening. It passes all of that into the shared compaction runner with the trigger marked as automatic, then returns success or the error from that shared runner.
 
-**Call relations**: Called by auto-compaction orchestration when the v2 remote compaction path is selected and a caller wants to reuse a client session.
+**Call relations**: The automatic compaction path calls this when it needs inline cleanup. This function does not do the compaction itself; it hands the work to run_remote_compact_task_inner so automatic and manual compaction share the same checks, request logic, analytics, and error handling.
 
 *Call graph*: calls 1 internal fn (run_remote_compact_task_inner); called by 1 (run_auto_compact).
 
@@ -4614,11 +4636,11 @@ async fn run_remote_compact_task(
 ) -> CodexResult<()>
 ```
 
-**Purpose**: Runs a manual standalone remote compaction v2 turn and emits `TurnStarted` first. It is the user-requested entry point for the streamed Responses-based implementation.
+**Purpose**: Starts a user-requested remote compaction as its own turn. It announces that a new turn has started, then runs the same core compaction process used by automatic compaction.
 
-**Data flow**: Accepts shared `Session` and `TurnContext` → sends `EventMsg::TurnStarted` built from turn metadata → calls `run_remote_compact_task_inner` with no client session, `InitialContextInjection::DoNotInject`, `CompactionTrigger::Manual`, `CompactionReason::UserRequested`, and `CompactionPhase::StandaloneTurn` → returns the inner result.
+**Data flow**: It takes the session and turn context, builds a turn-started event with timing, trace, model-window, and collaboration-mode details, and sends that event to listeners. It then asks the shared compaction runner to compact without injecting extra initial context, marking the reason as user requested.
 
-**Call relations**: Called by the general run path when manual compaction uses the v2 remote implementation.
+**Call relations**: The top-level run flow calls this for a standalone compact command. After sending the user-visible start event, it delegates to run_remote_compact_task_inner, which performs hooks, analytics, remote request, and history replacement.
 
 *Call graph*: calls 1 internal fn (run_remote_compact_task_inner); called by 1 (run); 1 external calls (TurnStarted).
 
@@ -4633,11 +4655,11 @@ async fn run_remote_compact_task_inner(
     initial_context_injection: InitialContext
 ```
 
-**Purpose**: Wraps remote compaction v2 execution with analytics, hook handling, and error-event emission. It is the common control shell for both manual and automatic v2 compaction.
+**Purpose**: Wraps the real compaction work with safety checks, hooks, analytics, and user-facing error reporting. It is the common control shell for both automatic and manual remote compaction.
 
-**Data flow**: Takes session/context refs, optional mutable client session, injection mode, trigger, reason, and phase → builds `CompactionTurnMetadata` for `ResponsesCompactionV2`, seeds analytics details with current token usage, starts `CompactionAnalyticsAttempt`, runs pre-compact hooks and aborts with tracked `TurnAborted` if stopped → awaits `run_remote_compact_task_inner_impl` → computes status with `compaction_status_from_result` → optionally runs post-compact hooks and converts success to `TurnAborted` → tracks analytics → on error, records turn error, emits `EventMsg::Error` with a remote-compaction prefix, and returns the error; otherwise returns `Ok(())`.
+**Data flow**: It receives session state, turn state, optional model-client connection, context-injection behavior, and labels describing the compaction. It records starting token counts, begins an analytics attempt, runs pre-compaction hooks, and either stops early or calls the implementation function. Afterward it runs post-compaction hooks when appropriate, records the final status, sends an error event if compaction failed, and returns success or failure.
 
-**Call relations**: Called by both v2 entry points so analytics and hook semantics remain consistent.
+**Call relations**: Both public entry functions feed into this function. It calls run_remote_compact_task_inner_impl for the actual remote request and replacement-history work, while surrounding that call with run_pre_compact_hooks, run_post_compact_hooks, analytics tracking, and session error reporting.
 
 *Call graph*: calls 6 internal fn (begin, compaction_status_from_result, run_remote_compact_task_inner_impl, run_post_compact_hooks, run_pre_compact_hooks, new); called by 2 (run_inline_remote_auto_compact_task, run_remote_compact_task); 2 external calls (default, Error).
 
@@ -4652,11 +4674,11 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialCo
 ```
 
-**Purpose**: Performs the actual remote compaction v2 request, retention shaping, rollout tracing, and history installation. This is the core algorithm for the streamed Responses-based compaction path.
+**Purpose**: Performs the main compaction job: prepare the conversation, ask the remote model service for a compacted item, build the new history, and install it into the session. This is where the old large history is actually turned into a smaller usable history.
 
-**Data flow**: Accepts session/context refs, optional mutable client session, injection mode, compaction metadata, and mutable analytics details → creates a `ContextCompactionItem` and compaction trace context, emits started turn item, clones history and base instructions, rewrites oversized outputs with `trim_function_call_history_to_fit_context_window`, adjusts analytics token counts, snapshots trace input history, builds prompt input and tools, appends `ResponseItem::CompactionTrigger`, computes responses metadata, starts a trace attempt, obtains or creates a `ModelClientSession`, and calls `run_remote_compaction_request_v2` → records trace result from the returned compaction output → updates analytics details from returned `TokenUsage` if present → builds retained history plus image count with `build_v2_compacted_history`, processes it with shared `process_compacted_history`, advances window ID, constructs `CompactedItem`, records installed checkpoint trace, replaces compacted history in session, recomputes token usage, emits completed turn item, and returns `Ok(())`.
+**Data flow**: It starts with the current session history and turn settings. It creates a context-compaction item for UI/tracing, trims large function-call history so the request can fit, builds a prompt that includes current history, tools, instructions, and a compaction trigger, and sends it through run_remote_compaction_request_v2. When the remote compaction item returns, it records token usage, builds compacted history, optionally adds a reference to the current turn context, replaces the session history, recomputes token usage, emits completion, and returns success.
 
-**Call relations**: Called only by `run_remote_compact_task_inner`; it delegates transport/retry handling to `run_remote_compaction_request_v2` and transcript shaping to `build_v2_compacted_history` plus shared remote helpers.
+**Call relations**: run_remote_compact_task_inner calls this after hooks allow the work to continue. This function calls built_tools to describe model-visible tools, run_remote_compaction_request_v2 to talk to the model service, build_v2_compacted_history to shape the replacement history, and process_compacted_history before installing the final history into the session.
 
 *Call graph*: calls 6 internal fn (process_compacted_history, trim_function_call_history_to_fit_context_window, build_v2_compacted_history, run_remote_compaction_request_v2, built_tools, new); called by 1 (run_remote_compact_task_inner); 6 external calls (new, new, ContextCompaction, Compaction, info!, json!).
 
@@ -4672,11 +4694,11 @@ async fn run_remote_compaction_request_v2(
     responses_metadata: &CodexResponses
 ```
 
-**Purpose**: Executes the streamed Responses request for remote compaction v2 with a small retry budget. It retries only retryable transport/model errors and reuses the provided client session across attempts.
+**Purpose**: Sends the compaction prompt to the model service and retries a small number of times if the streaming response fails in a retryable way. It protects long compaction jobs from transient network or service problems without retrying forever.
 
-**Data flow**: Takes `&Session`, `&TurnContext`, mutable `ModelClientSession`, prompt, and responses metadata → computes `max_retries` as provider stream retries capped by `MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES` → loops: starts `client_session.stream(...)` with disabled inference tracing, then either passes the stream to `collect_compaction_output` or propagates stream-start error → returns immediately on success or non-retryable error → on retryable error, calls `handle_retryable_response_stream_error(...)` to update retry state, notify session/turn context, and reset transport state as needed before retrying.
+**Data flow**: It receives the session, turn context, model-client session, prompt, and request metadata. It opens a streaming model request, passes the stream to collect_compaction_output, and either returns the collected compaction output or examines the error. Non-retryable errors come back immediately; retryable errors are handed to the retry helper, which may wait, reset state, and allow another loop attempt.
 
-**Call relations**: Used by `run_remote_compact_task_inner_impl` as the transport layer for v2 compaction requests.
+**Call relations**: The implementation function calls this when the prompt is ready. This function calls the model-client stream method, then hands the stream to collect_compaction_output; on retryable failures it calls handle_retryable_response_stream_error before trying again.
 
 *Call graph*: calls 4 internal fn (stream, collect_compaction_output, handle_retryable_response_stream_error, disabled); called by 1 (run_remote_compact_task_inner_impl).
 
@@ -4689,11 +4711,11 @@ async fn collect_compaction_output(
 ) -> CodexResult<RemoteCompactionV2Output>
 ```
 
-**Purpose**: Consumes a Responses stream and extracts exactly one compaction output item plus optional completed token usage. It enforces the protocol contract for remote compaction v2 streams.
+**Purpose**: Reads the model service’s streaming response and extracts the one compaction item the rest of the system needs. It enforces the rule that a remote compaction response must finish cleanly and contain exactly one compaction result.
 
-**Data flow**: Takes mutable `ResponseStream` → iterates events with `next()` → counts all `OutputItemDone` items and separately counts `ResponseItem::Compaction`, storing the first compaction item seen → on `Completed`, records token usage and stops → ignores other events → if the stream ends before `Completed`, returns `CodexErr::Stream`; if the number of compaction items is not exactly one, returns `CodexErr::Fatal`; otherwise returns `RemoteCompactionV2Output { compaction_output, token_usage }`.
+**Data flow**: It receives a response stream. As events arrive, it counts completed output items, remembers the first compaction item, and watches for the final completed event and its token usage. If the stream ends before completion, it returns a stream error; if there are zero or multiple compaction items, it returns a fatal error; otherwise it returns the compaction item plus any token-usage data.
 
-**Call relations**: Called by `run_remote_compaction_request_v2`; tests also call it directly to verify that extra non-compaction output items are tolerated.
+**Call relations**: run_remote_compaction_request_v2 calls this after opening a stream. A test also calls it with a fake stream to prove that ordinary extra output items can appear, as long as there is exactly one compaction item and a completed event.
 
 *Call graph*: called by 2 (run_remote_compaction_request_v2, collect_compaction_output_accepts_additional_output_items); 5 external calls (next, format!, Fatal, Stream, unreachable!).
 
@@ -4707,11 +4729,11 @@ fn build_v2_compacted_history(
 ) -> (Vec<ResponseItem>, usize)
 ```
 
-**Purpose**: Constructs the installed transcript shape for remote compaction v2 from the original prompt input and the returned compaction item. It retains only selected prompt messages, truncates them under a token budget, counts retained images, and appends the compaction output.
+**Purpose**: Creates the replacement conversation history that will be installed after remote compaction. It keeps a limited set of original messages, trims them to a token budget, counts retained images, and appends the new compacted record.
 
-**Data flow**: Takes prompt input slice and a `ResponseItem` compaction output → filters prompt items through `is_retained_for_remote_compaction_v2` and `should_keep_compacted_history_item`, cloning survivors into a vector → truncates retained messages with `truncate_retained_messages_for_remote_compaction(..., RETAINED_MESSAGE_TOKEN_BUDGET)` → sums retained input images with `retained_input_image_count` → pushes the compaction output → returns `(history, retained_image_count)`.
+**Data flow**: It receives the prompt input used for compaction and the remote compaction output. It filters the input down to retained message types, applies additional compacted-history filtering, truncates retained messages to the configured token budget, counts input images that survived, appends the compaction output, and returns the new history plus the image count.
 
-**Call relations**: Used by `run_remote_compact_task_inner_impl`; multiple tests target it to lock down retention filtering and image counting.
+**Call relations**: run_remote_compact_task_inner_impl calls this after the remote model produces the compaction item. The tests call it directly to verify that it keeps the intended history shape, discards unwanted messages before truncation, and reports retained images correctly.
 
 *Call graph*: calls 1 internal fn (truncate_retained_messages_for_remote_compaction); called by 4 (run_remote_compact_task_inner_impl, build_v2_compacted_history_counts_retained_input_images, build_v2_compacted_history_discards_messages_before_truncating, build_v2_compacted_history_filters_to_installed_retention_shape); 1 external calls (iter).
 
@@ -4722,11 +4744,11 @@ fn build_v2_compacted_history(
 fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool
 ```
 
-**Purpose**: Determines whether a prompt item is even eligible for retention in the v2 installed transcript before deeper filtering. It keeps only message items with roles `user`, `developer`, or `system`.
+**Purpose**: Decides whether a response item is even eligible to remain alongside the compacted summary. In this version, only user, developer, and system messages pass this first gate.
 
-**Data flow**: Matches a `&ResponseItem` → returns `true` only for `ResponseItem::Message` whose `role` is one of `user`, `developer`, or `system`; otherwise returns `false`.
+**Data flow**: It receives one response item. If the item is not a message, it returns false; if it is a message, it checks the role string and returns true only for user, developer, or system roles.
 
-**Call relations**: Used by `build_v2_compacted_history` as the first-pass retention filter before shared remote-history sanitation.
+**Call relations**: This helper is used during compacted-history construction before token trimming. It acts like a first sieve, removing assistant replies, tool calls, old compaction items, and other non-message records from the retained-history candidates.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -4737,11 +4759,11 @@ fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool
 fn retained_input_image_count(item: &ResponseItem) -> usize
 ```
 
-**Purpose**: Counts how many `InputImage` content parts are present in a retained message item. It is used for compaction analytics detail reporting.
+**Purpose**: Counts how many input images are present in a retained message. This lets analytics record how much image context survived compaction.
 
-**Data flow**: Takes `&ResponseItem` → if it is a `Message`, iterates `content` and counts `ContentItem::InputImage`; otherwise returns `0`.
+**Data flow**: It receives one response item. Non-message items count as zero; message items are scanned content by content, and each input-image content item adds one to the returned count.
 
-**Call relations**: Used by `build_v2_compacted_history` after truncation to report how many images remain in the installed retained transcript.
+**Call relations**: The history-building step uses this after truncation so it counts only images that actually remain in the replacement history.
 
 
 ##### `truncate_retained_messages_for_remote_compaction`  (lines 467–491)
@@ -4753,11 +4775,11 @@ fn truncate_retained_messages_for_remote_compaction(
 ) -> Vec<ResponseItem>
 ```
 
-**Purpose**: Applies the retained-message token budget for remote compaction v2, keeping newest messages first and truncating at most one older message to fit. Image-only messages still consume a minimum budget unit.
+**Purpose**: Cuts retained messages down to a maximum text-token budget while favoring the newest messages. A token is a rough chunk of text the model reads; limiting tokens keeps the replacement history from becoming too large again.
 
-**Data flow**: Takes owned `Vec<ResponseItem>` and `max_tokens` → walks items from newest to oldest → if budget is exhausted, drops older items → computes each item’s token charge with `message_text_token_count().max(1)` → keeps whole items that fit, otherwise tries `truncate_message_text_to_token_budget(item, remaining)` and keeps the truncated result if nonempty, then sets remaining to zero → reverses back to chronological order and returns the truncated vector.
+**Data flow**: It receives retained response items and a maximum token count. It walks from newest to oldest, spending the remaining budget on each message, keeping whole messages when they fit, truncating one message when only part fits, and dropping older messages after the budget is gone. It reverses the kept items back into chronological order and returns them.
 
-**Call relations**: Used by `build_v2_compacted_history`; several tests validate ordering, image charging, and truncation behavior.
+**Call relations**: build_v2_compacted_history calls this before appending the new compaction output. Several tests call it directly to confirm that newest messages win, images are preserved when their message is kept, image-only messages still consume a minimum budget slot, and older items are dropped after the budget is spent.
 
 *Call graph*: calls 2 internal fn (message_text_token_count, truncate_message_text_to_token_budget); called by 5 (build_v2_compacted_history, retained_history_truncation_charges_image_only_messages, retained_history_truncation_drops_image_only_messages_after_budget_is_spent, retained_history_truncation_keeps_newest_messages_first, retained_history_truncation_preserves_images_and_truncates_later_text_parts); 1 external calls (with_capacity).
 
@@ -4768,11 +4790,11 @@ fn truncate_retained_messages_for_remote_compaction(
 fn message_text_token_count(item: &ResponseItem) -> usize
 ```
 
-**Purpose**: Estimates the text-token cost of a message item by summing token counts across text content parts. Images contribute zero here and are charged separately via the caller’s `.max(1)` rule.
+**Purpose**: Estimates how many text tokens a message contains. This gives the truncation code a simple way to decide whether a message fits in the retained-message budget.
 
-**Data flow**: Takes `&ResponseItem` → if it is a `Message`, iterates `content`, sums `approx_token_count(text)` for `InputText` and `OutputText`, and ignores `InputImage`; otherwise returns `0`.
+**Data flow**: It receives one response item. Non-message items count as zero; for message items, it adds approximate token counts for input-text and output-text content while treating images as zero text tokens.
 
-**Call relations**: Used by `truncate_retained_messages_for_remote_compaction` to decide which retained messages fit within the token budget.
+**Call relations**: truncate_retained_messages_for_remote_compaction calls this for each retained candidate while spending the token budget from newest to oldest.
 
 *Call graph*: called by 1 (truncate_retained_messages_for_remote_compaction).
 
@@ -4786,11 +4808,11 @@ fn truncate_message_text_to_token_budget(
 ) -> Option<ResponseItem>
 ```
 
-**Purpose**: Truncates the text portions of a single message item to fit a token budget while preserving images and message metadata. It may drop the item entirely if no content remains after truncation.
+**Purpose**: Shortens the text parts of a single message so they fit within a remaining token budget, while preserving images and message metadata. It is used when a whole message is too large but part of it can still be kept.
 
-**Data flow**: Takes owned `ResponseItem` and `max_tokens` → if not a `Message`, returns it unchanged in `Some` → otherwise iterates content parts in order with a remaining-token counter: keeps images unchanged, keeps text parts that fit, truncates the first over-budget text part with `truncate_text(TruncationPolicy::Tokens(remaining))`, drops later text once budget is zero, and omits empty text parts → returns `None` if all content was removed, else reconstructs and returns a `ResponseItem::Message` with original id/role/phase/metadata and truncated content.
+**Data flow**: It receives a response item and a maximum token allowance. For non-message items, it returns the item unchanged; for messages, it walks through each content piece, keeps or truncates text based on the remaining budget, always keeps image content, drops empty text pieces, and returns either the rebuilt message or nothing if no content remains.
 
-**Call relations**: Used by `truncate_retained_messages_for_remote_compaction` when a retained message partially fits the remaining budget.
+**Call relations**: truncate_retained_messages_for_remote_compaction calls this when the next newest message is larger than the remaining budget. It uses the shared text-truncation utility so the shortened text clearly marks that content was removed.
 
 *Call graph*: called by 1 (truncate_retained_messages_for_remote_compaction); 4 external calls (with_capacity, approx_token_count, truncate_text, Tokens).
 
@@ -4801,11 +4823,11 @@ fn truncate_message_text_to_token_budget(
 fn message(role: &str, text: &str, phase: Option<MessagePhase>) -> ResponseItem
 ```
 
-**Purpose**: Builds a minimal `ResponseItem::Message` fixture for the v2 compaction tests. It reduces boilerplate when constructing retained-history examples.
+**Purpose**: Creates a small test message item with a chosen role, text, and optional phase. It keeps the tests readable by hiding the repeated response-item construction.
 
-**Data flow**: Takes role, text, and optional `MessagePhase` → constructs a `ResponseItem::Message` with one `ContentItem::InputText`, no id, and no metadata → returns it.
+**Data flow**: It takes a role string, text string, and optional message phase. It wraps the text as input-text content inside a response message and returns that test item.
 
-**Call relations**: Used by multiple tests in this module to create concise message fixtures.
+**Call relations**: Many tests call this helper when they need simple user, developer, system, or assistant messages. It supports tests for history filtering and truncation without distracting setup code.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4816,11 +4838,11 @@ fn message(role: &str, text: &str, phase: Option<MessagePhase>) -> ResponseItem
 fn response_stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream
 ```
 
-**Purpose**: Builds a synthetic `ResponseStream` from a fixed list of test events. It lets tests drive `collect_compaction_output` without a real model client.
+**Purpose**: Builds a fake response stream for tests. It lets a test feed predetermined stream events into collect_compaction_output without contacting a real model service.
 
-**Data flow**: Takes `Vec<CodexResult<ResponseEvent>>` → creates an mpsc channel sized to at least one event → `try_send`s each event into the channel, drops the sender, and returns `ResponseStream { rx_event, consumer_dropped: CancellationToken::new() }`.
+**Data flow**: It receives a list of stream events or errors. It sends them into an in-memory channel, closes the sender, and returns a ResponseStream that will yield those events to the collector.
 
-**Call relations**: Used by the stream-collection test to simulate a completed remote compaction v2 response.
+**Call relations**: The stream-collection test calls this helper to simulate the Responses API. That test then passes the fake stream to collect_compaction_output and checks the extracted compaction item and token usage.
 
 *Call graph*: 2 external calls (new, channel).
 
@@ -4831,11 +4853,11 @@ fn response_stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream
 fn build_v2_compacted_history_filters_to_installed_retention_shape()
 ```
 
-**Purpose**: Verifies that v2 retained history keeps only the installed transcript shape: real retained user content plus the new compaction item. It confirms assistant/tool/old-compaction items are discarded.
+**Purpose**: Checks that compacted history keeps only the kinds of items intended for installation. It guards against accidentally preserving assistant messages, tool calls, or old compaction records.
 
-**Data flow**: Builds a mixed prompt input containing developer, system, user, assistant, function-call, and old compaction items plus a new compaction output → calls `build_v2_compacted_history` → asserts the resulting history is `[user_message, new_compaction]`.
+**Data flow**: It builds mixed input containing developer, system, user, assistant, function-call, and old compaction items, plus a new compaction output. It runs build_v2_compacted_history and verifies that the final history contains only the expected retained user message and the new compaction output.
 
-**Call relations**: Exercises the combined effect of `is_retained_for_remote_compaction_v2` and `should_keep_compacted_history_item` inside `build_v2_compacted_history`.
+**Call relations**: This test calls build_v2_compacted_history directly. It protects the replacement-history contract used by run_remote_compact_task_inner_impl before session history is replaced.
 
 *Call graph*: calls 1 internal fn (build_v2_compacted_history); 2 external calls (assert_eq!, vec!).
 
@@ -4846,11 +4868,11 @@ fn build_v2_compacted_history_filters_to_installed_retention_shape()
 fn build_v2_compacted_history_discards_messages_before_truncating()
 ```
 
-**Purpose**: Verifies that messages filtered out by retention rules do not consume the retained-message token budget. This ensures truncation is applied only after irrelevant messages are discarded.
+**Purpose**: Checks that unwanted context-like messages are removed before the retained-message token budget is applied. This prevents huge discarded messages from crowding out useful newer user messages.
 
-**Data flow**: Builds input with an old user message, a huge developer message, a huge contextual user wrapper message, and a new user message → calls `build_v2_compacted_history` → asserts the result keeps the old and new real user messages plus the compaction output, with the huge discarded messages not forcing truncation.
+**Data flow**: It creates old and new user messages plus very large developer/contextual messages. After build_v2_compacted_history runs, the test verifies that the old user message, new user message, and new compaction output remain, showing that discarded material did not consume the truncation budget.
 
-**Call relations**: Targets the ordering inside `build_v2_compacted_history`: filter first, then truncate.
+**Call relations**: This test calls build_v2_compacted_history. It confirms the order of operations that the main compaction installer relies on: filter first, then truncate.
 
 *Call graph*: calls 1 internal fn (build_v2_compacted_history); 4 external calls (assert_eq!, message, format!, vec!).
 
@@ -4861,11 +4883,11 @@ fn build_v2_compacted_history_discards_messages_before_truncating()
 fn build_v2_compacted_history_counts_retained_input_images()
 ```
 
-**Purpose**: Verifies that retained input images are counted correctly for analytics. It checks that image-bearing user messages contribute to the returned image count.
+**Purpose**: Checks that retained images are counted correctly when building compacted history. This supports accurate analytics after compaction.
 
-**Data flow**: Builds a single retained user message containing one text part and two `InputImage` parts plus a compaction output → calls `build_v2_compacted_history` → asserts the returned retained image count is `2`.
+**Data flow**: It creates a retained user message containing one text item and two input images, then adds a compaction output. It runs build_v2_compacted_history and verifies that the reported retained image count is two.
 
-**Call relations**: Exercises `retained_input_image_count` through the public retained-history builder.
+**Call relations**: This test calls build_v2_compacted_history, which uses the image-counting helper internally. It validates the analytics number later stored by run_remote_compact_task_inner_impl.
 
 *Call graph*: calls 1 internal fn (build_v2_compacted_history); 2 external calls (assert_eq!, vec!).
 
@@ -4876,11 +4898,11 @@ fn build_v2_compacted_history_counts_retained_input_images()
 fn retained_history_truncation_keeps_newest_messages_first()
 ```
 
-**Purpose**: Verifies that retained-history truncation spends budget from newest to oldest and truncates an older message rather than dropping the newest one. It locks in recency-first retention semantics.
+**Purpose**: Checks that token-budget truncation favors recent conversation. This matters because the latest messages are usually most important for the model to answer correctly.
 
-**Data flow**: Builds three user messages ordered old/middle/new → calls `truncate_retained_messages_for_remote_compaction` with a tiny budget → asserts the result contains a truncated middle message followed by the full newest message.
+**Data flow**: It creates old, middle, and new user messages, then truncates with a tiny token budget. It verifies that the newest message is kept and the middle message is shortened, while the oldest message is dropped.
 
-**Call relations**: Directly tests the reverse-walk truncation strategy used by the v2 retained-history builder.
+**Call relations**: This test calls truncate_retained_messages_for_remote_compaction directly. It protects the newest-first behavior used when build_v2_compacted_history prepares replacement history.
 
 *Call graph*: calls 1 internal fn (truncate_retained_messages_for_remote_compaction); 3 external calls (assert_eq!, message, vec!).
 
@@ -4891,11 +4913,11 @@ fn retained_history_truncation_keeps_newest_messages_first()
 fn retained_history_truncation_preserves_images_and_truncates_later_text_parts()
 ```
 
-**Purpose**: Verifies that truncating a single retained message preserves embedded images and truncates later text content parts when budget runs out. It checks content-part-level truncation behavior.
+**Purpose**: Checks that truncating a mixed message keeps images and trims text only as needed. This prevents image context from being lost just because surrounding text is too long.
 
-**Data flow**: Builds one user message with input text, an image, and output text → truncates retained messages under a small budget → asserts the first text and image remain while the later text part is truncated with a marker.
+**Data flow**: It builds one message with text, an input image, and more text, then applies a small token budget. It verifies that the first text and image remain and that the later text is shortened with a visible truncation marker.
 
-**Call relations**: Exercises `truncate_message_text_to_token_budget` through the retained-history truncation helper.
+**Call relations**: This test calls truncate_retained_messages_for_remote_compaction. It indirectly exercises truncate_message_text_to_token_budget, which performs the per-content trimming.
 
 *Call graph*: calls 1 internal fn (truncate_retained_messages_for_remote_compaction); 2 external calls (assert_eq!, vec!).
 
@@ -4906,11 +4928,11 @@ fn retained_history_truncation_preserves_images_and_truncates_later_text_parts()
 fn retained_history_truncation_charges_image_only_messages()
 ```
 
-**Purpose**: Verifies that image-only messages still consume retained-history budget via the minimum charge rule. This prevents unlimited retention of image-only messages.
+**Purpose**: Checks that image-only messages still consume a small amount of retained-history budget. This prevents unlimited image-only messages from slipping through a text-token budget for free.
 
-**Data flow**: Builds retained history with an old text message, an image-only message, and a newest text message → truncates under a small budget → asserts the image-only message and newest message remain while the oldest text message is dropped.
+**Data flow**: It builds an older text message, an image-only message, and the newest text message, then truncates with a budget of two. It verifies that the image-only message and newest message remain while the older text message is dropped.
 
-**Call relations**: Tests the `.max(1)` charging rule inside `truncate_retained_messages_for_remote_compaction`.
+**Call relations**: This test calls truncate_retained_messages_for_remote_compaction. It confirms the helper’s rule that every kept message costs at least one budget unit, even if it has no text tokens.
 
 *Call graph*: calls 1 internal fn (truncate_retained_messages_for_remote_compaction); 3 external calls (assert_eq!, message, vec!).
 
@@ -4921,11 +4943,11 @@ fn retained_history_truncation_charges_image_only_messages()
 fn retained_history_truncation_drops_image_only_messages_after_budget_is_spent()
 ```
 
-**Purpose**: Verifies that image-only messages are dropped once the retained-history budget has already been exhausted by newer items. It complements the previous image-charging test.
+**Purpose**: Checks that image-only messages are not kept once the retained-message budget has already been used up. This is the companion case to charging image-only messages.
 
-**Data flow**: Builds retained history with an image-only message followed by a newest text message → truncates under a one-token budget → asserts only the newest text message remains.
+**Data flow**: It builds an image-only message followed by the newest text message, then truncates with a budget of one. The newest message uses the budget, so the test verifies that the older image-only message is dropped.
 
-**Call relations**: Confirms that image-only messages are not retained for free after newer content consumes the budget.
+**Call relations**: This test calls truncate_retained_messages_for_remote_compaction. It guards the budget-enforcement behavior used before compacted history is installed.
 
 *Call graph*: calls 1 internal fn (truncate_retained_messages_for_remote_compaction); 3 external calls (assert_eq!, message, vec!).
 
@@ -4936,20 +4958,26 @@ fn retained_history_truncation_drops_image_only_messages_after_budget_is_spent()
 async fn collect_compaction_output_accepts_additional_output_items()
 ```
 
-**Purpose**: Verifies that stream collection tolerates extra non-compaction output items as long as exactly one compaction item appears and the stream completes. It also checks token-usage propagation.
+**Purpose**: Checks that the stream collector accepts harmless extra output items as long as exactly one compaction item is present. This matches real streaming behavior where the model service may emit ordinary output around the compaction result.
 
-**Data flow**: Builds a synthetic response stream containing an assistant message output, one compaction output, and a completed event with token usage → calls `collect_compaction_output` → asserts the returned compaction item and token usage match the expected values.
+**Data flow**: It creates a fake stream containing an ordinary assistant output item, one compaction item, and a completed event with token usage. It passes that stream to collect_compaction_output and verifies that the compaction item and token-usage numbers are returned.
 
-**Call relations**: Directly tests the protocol contract enforced by `collect_compaction_output`.
+**Call relations**: This test uses response_stream to build the fake stream and then calls collect_compaction_output. It protects the stream-reading rule used by run_remote_compaction_request_v2 during real remote compaction.
 
 *Call graph*: calls 1 internal fn (collect_compaction_output); 3 external calls (assert_eq!, response_stream, vec!).
 
 
 ### `ext/image-generation/src/backend.rs`
 
-`io_transport` · `tool request handling / outbound API calls`
+`io_transport` · `request handling`
 
-This file wraps provider resolution and HTTP client construction for image requests. `CodexImagesBackend` stores a `SharedModelProvider`, which can asynchronously supply both the current API provider configuration and the corresponding authentication material. The private `client` method is the key piece: it awaits `api_provider()` and `api_auth()`, converts either failure into a plain `String`, builds a fresh reqwest client via `build_reqwest_client`, wraps it in `ReqwestTransport`, and constructs an `ImagesClient<ReqwestTransport>`. The two public async methods then use that client for specific API calls. `generate` sends an `ImageGenerationRequest` with an empty `HeaderMap`; `edit` does the same for `ImageEditRequest`. Both propagate backend errors as strings rather than richer error types, which keeps the extension/tool layer simple at the cost of typed error detail. There is no caching of the `ImagesClient`; each call resolves provider/auth anew, which ensures requests use current credentials and provider settings.
+The image-generation extension needs a safe, consistent way to talk to the image service. This file provides that small bridge. Think of it like a front desk clerk: the rest of the extension hands it an image request, and it figures out which service desk to use, which credentials to show, and how to send the request.
+
+The central type is `CodexImagesBackend`. It keeps a shared model provider, which is the project’s source of truth for “which API provider are we using?” and “what authentication should we use?” Authentication means the proof, such as a token, that the request is allowed.
+
+Before every image request, the backend asks the shared provider for the current API provider and auth details. It then builds an `ImagesClient`, using a `ReqwestTransport`. `reqwest` is the HTTP library used to make web requests, so this transport is the piece that actually sends data over the network.
+
+The public methods are simple: `generate` sends a new image creation request, and `edit` sends an image editing request. Both create a fresh client, send the request with empty extra HTTP headers, and convert any lower-level error into a plain string. Without this file, callers would need to repeat provider lookup, authentication, HTTP client setup, and error conversion every time they wanted to use the image API.
 
 #### Function details
 
@@ -4959,11 +4987,11 @@ This file wraps provider resolution and HTTP client construction for image reque
 fn new(provider: SharedModelProvider) -> Self
 ```
 
-**Purpose**: Constructs an image backend bound to a shared model-provider handle. It stores the dependency needed to resolve provider and auth at request time.
+**Purpose**: Creates a new image backend tied to the shared model provider. Callers use this when they want one object that knows how to send image requests through the currently configured provider.
 
-**Data flow**: It takes a `SharedModelProvider`, stores it in `CodexImagesBackend`, and returns the new backend.
+**Data flow**: It receives a shared provider object as input. It stores that provider inside a new `CodexImagesBackend`. The result is a backend value ready to be cloned and used for later image generation or editing calls.
 
-**Call relations**: It is called by the image-generation extension when constructing the tool executor. The resulting backend is later used by `generate` and `edit`.
+**Call relations**: This is the setup step for the backend. Later, when request-handling code needs to generate or edit an image, it uses the backend created here rather than rebuilding the provider connection logic itself.
 
 
 ##### `CodexImagesBackend::client`  (lines 22–38)
@@ -4972,11 +5000,11 @@ fn new(provider: SharedModelProvider) -> Self
 async fn client(&self) -> Result<ImagesClient<ReqwestTransport>, String>
 ```
 
-**Purpose**: Builds a ready-to-use `ImagesClient` for the current request by resolving provider configuration and authentication from the shared provider. It centralizes all setup needed before making image API calls.
+**Purpose**: Builds a ready-to-use image API client for the current request. It gathers the current provider and login information, then combines them with an HTTP transport so the next step can actually contact the image service.
 
-**Data flow**: It reads `self.provider`, awaits `api_provider()` and `api_auth()`, maps either error to `String`, constructs a reqwest client with `build_reqwest_client`, wraps it in `ReqwestTransport`, creates `ImagesClient::new(transport, provider, auth)`, and returns the client.
+**Data flow**: It starts with the backend’s stored shared provider. It asks that provider for the active API provider and the authentication details. If either lookup fails, the error is turned into a plain string. If both succeed, it builds a reqwest HTTP client, wraps it in a transport, and returns an `ImagesClient` configured with the provider and auth.
 
-**Call relations**: It is called by both `generate` and `edit` immediately before issuing a request. Those methods rely on it so they do not duplicate provider/auth resolution logic.
+**Call relations**: This function is the common preparation step used by both `CodexImagesBackend::generate` and `CodexImagesBackend::edit`. Those higher-level methods call it first so they do not need to know how provider lookup, authentication, or HTTP setup works.
 
 *Call graph*: calls 3 internal fn (new, new, build_reqwest_client); called by 2 (edit, generate); 2 external calls (api_auth, api_provider).
 
@@ -4990,11 +5018,11 @@ async fn generate(
     ) -> Result<ImageResponse, String>
 ```
 
-**Purpose**: Sends a standalone image generation request through the configured images API client. It is the backend path for prompt-to-image generation.
+**Purpose**: Sends a request to create a new image. It is the method other parts of the image-generation feature call when the user or system asks for an image to be generated from scratch.
 
-**Data flow**: It takes an `ImageGenerationRequest`, awaits `self.client()`, calls `.generate(&request, HeaderMap::new())` on the resulting client, awaits the API response, maps any API error to `String`, and returns `ImageResponse` on success.
+**Data flow**: It receives an `ImageGenerationRequest`, which contains the details of the desired image. It first asks `CodexImagesBackend::client` for an authenticated image API client. Then it sends the request with no extra HTTP headers. The output is either an `ImageResponse` from the service or a plain string describing what went wrong.
 
-**Call relations**: It is invoked by the image-generation tool's call handler when the request is a generation rather than an edit. It delegates setup to `client` and transport execution to `ImagesClient::generate`.
+**Call relations**: This method is called by `handle_call` when an incoming tool or extension request asks for image generation. It delegates setup to `CodexImagesBackend::client`, then hands the prepared request to the image API client’s generate operation.
 
 *Call graph*: calls 1 internal fn (client); called by 1 (handle_call); 1 external calls (new).
 
@@ -5005,11 +5033,11 @@ async fn generate(
 async fn edit(&self, request: ImageEditRequest) -> Result<ImageResponse, String>
 ```
 
-**Purpose**: Sends a standalone image edit request through the configured images API client. It is the backend path for image-edit operations.
+**Purpose**: Sends a request to edit an existing image. It is used when the feature needs to modify an image rather than create one entirely from scratch.
 
-**Data flow**: It takes an `ImageEditRequest`, awaits `self.client()`, calls `.edit(&request, HeaderMap::new())`, awaits the API response, maps any API error to `String`, and returns `ImageResponse` on success.
+**Data flow**: It receives an `ImageEditRequest`, which describes the image-editing job. It builds an authenticated client through `CodexImagesBackend::client`, sends the edit request with no extra HTTP headers, and returns either the image service’s `ImageResponse` or a plain string error.
 
-**Call relations**: It is called by the image-generation tool's handler for edit-style requests. Like `generate`, it relies on `client` for provider/auth resolution and transport setup.
+**Call relations**: This method is called by `handle_call` when an incoming request asks for image editing. Like generation, it relies on `CodexImagesBackend::client` for provider, authentication, and transport setup, then passes the actual edit work to the image API client.
 
 *Call graph*: calls 1 internal fn (client); called by 1 (handle_call); 1 external calls (new).
 
@@ -5019,22 +5047,26 @@ These files organize the realtime websocket module, define version-specific mess
 
 ### `codex-api/src/endpoint/realtime_websocket/mod.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `cross-cutting`
 
-This file organizes the realtime websocket subsystem into two parallel families of modules: `methods*` modules for client-side websocket operations and `protocol*` modules for parsing and representing realtime events. The presence of `methods_v1`/`methods_v2` and `protocol_v1`/`protocol_v2`, alongside shared `*_common` modules, shows that the subsystem supports multiple protocol versions behind a single public interface. The top-level `methods` and `protocol` modules act as version-selecting façades, while this file re-exports the unified types that callers should use.
+This module is like the reception desk for realtime WebSocket support. A WebSocket is a long-lived network connection that lets the client and server send messages back and forth without reopening a new connection each time. The actual work is split across several smaller files: some describe the wire protocol, some provide client methods, and some keep shared behavior used by multiple protocol versions.
 
-The exported method-side API includes `RealtimeWebsocketClient`, `RealtimeWebsocketConnection`, `RealtimeWebsocketEvents`, and `RealtimeWebsocketWriter`, covering connection establishment, event consumption, and outbound message writing. On the protocol side it exposes `RealtimeEventParser`, `RealtimeOutputModality`, `RealtimeSessionConfig`, and `RealtimeSessionMode`, plus the shared helper `session_update_session_json` for constructing session update payloads. This module contains no executable code itself; its main job is to hide version-specific implementation details and present a stable, coherent websocket API. That version-bridging role is the subtle but important design choice: consumers interact with one namespace while the crate retains freedom to evolve protocol internals per version.
+The important job of this file is to hide that internal layout from the rest of the codebase. Other code can import clear names such as `RealtimeWebsocketClient`, `RealtimeWebsocketConnection`, `RealtimeWebsocketWriter`, `RealtimeEventParser`, and `RealtimeSessionConfig` from this module instead of knowing which versioned subfile contains them. That makes the realtime endpoint easier to use and easier to change later.
+
+It also separates public-facing pieces from private building blocks. Version-specific modules for v1 and v2 are kept inside this folder, while only the chosen shared interface is re-exported. Without this file, callers would need to depend directly on the internal file structure, which would make future protocol changes more fragile.
 
 
 ### `codex-api/src/endpoint/realtime_websocket/methods_common.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `websocket setup and message sending`
 
-This file is the compatibility layer between the generic websocket client code and the version-specific realtime protocol builders in `methods_v1` and `methods_v2`. It exports a shared audio sample-rate constant and a small set of dispatch functions keyed by `RealtimeEventParser`.
+The realtime WebSocket endpoint has two protocol shapes: V1 and Realtime V2. They are similar in purpose, but the exact messages are not always the same. This file acts like a translator at a front desk: the rest of the system says what it wants to do, and this file chooses the right wording for the protocol version being used.
 
-`normalized_session_mode` encodes an important invariant: v1 does not support a distinct transcription mode, so any requested mode is coerced to `RealtimeSessionMode::Conversational`, while Realtime V2 preserves the caller’s requested mode. The message builders follow the same pattern. `conversation_item_create_message` selects the correct item-create payload shape for the active protocol version. `conversation_function_call_output_message` is more nuanced: v1 has no function-call-output item, so it maps the output into a legacy `conversation.handoff.append` message and prefixes the text with `"Agent Final Message":\n\n`; v2 emits a proper function-call-output conversation item.
+Most functions take a RealtimeEventParser value, which tells the code which protocol version is active. They then call the matching V1 or V2 helper. For normal conversation text, both versions have a message creator. For function-call output, V2 has a direct message type, while V1 uses a handoff-style message and adds a special "Agent Final Message" prefix so the older protocol understands the result in the expected format.
 
-`session_update_session` chooses the correct session schema builder after normalizing the mode, and `session_update_session_json` turns a full `RealtimeSessionConfig` into a serializable JSON object while injecting `session_id` and `model` into the generated session structure. Finally, `websocket_intent` exposes the version-specific websocket query intent, which is `Some("quicksilver")` for v1 and `None` for v2.
+Session setup is also normalized here. V1 only supports conversational behavior, so any requested session mode is forced to Conversational for V1. V2 keeps the requested mode and can also include output style and voice settings. One public helper turns the final session update into JSON, ready to be sent over the wire.
+
+Without this file, callers would need repeated version checks everywhere, making the WebSocket code easier to break when protocol details change.
 
 #### Function details
 
@@ -5047,11 +5079,11 @@ fn normalized_session_mode(
 ) -> RealtimeSessionMode
 ```
 
-**Purpose**: Normalizes requested session mode according to protocol-version capabilities.
+**Purpose**: This function makes sure the requested realtime session mode is valid for the protocol version in use. It hides an important rule: V1 always behaves as a conversational session, while Realtime V2 can use the requested mode.
 
-**Data flow**: Takes `event_parser` and `session_mode` → returns `Conversational` for `RealtimeEventParser::V1`, otherwise returns the original `session_mode` for `RealtimeV2`.
+**Data flow**: It receives the active parser version and a requested session mode. If the parser is V1, it replaces the requested mode with Conversational. If the parser is Realtime V2, it leaves the mode unchanged. The result is the mode that should actually be used when building a session update.
 
-**Call relations**: Used by session-building code in both `send_session_update` and `session_update_session` so v1 callers cannot accidentally request an unsupported transcription session shape.
+**Call relations**: When a session update is being prepared, session_update_session calls this first so it can build a version-appropriate update. send_session_update also relies on the same normalization path before sending session settings to the WebSocket service.
 
 *Call graph*: called by 2 (send_session_update, session_update_session).
 
@@ -5066,11 +5098,11 @@ fn conversation_item_create_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Dispatches conversation item creation to the correct version-specific message builder.
+**Purpose**: This function builds an outbound conversation text message in the correct protocol format. Callers can provide text and a speaker role without worrying about whether the WebSocket connection is V1 or Realtime V2.
 
-**Data flow**: Consumes `event_parser`, `text`, and `role` → calls either `methods_v1::conversation_item_create_message` or `methods_v2::conversation_item_create_message` → returns a `RealtimeOutboundMessage`.
+**Data flow**: It receives the active protocol version, the text to send, and the role for that text, such as which side of the conversation it belongs to. It chooses the V1 message builder for V1 connections or the V2 message builder for Realtime V2 connections. It returns a RealtimeOutboundMessage ready for the sending layer.
 
-**Call relations**: Called by `RealtimeWebsocketWriter::send_conversation_item_create` to hide protocol-version branching from the writer.
+**Call relations**: send_conversation_item_create calls this when it needs to send a new conversation item. This function then hands the work to the version-specific message creator, so the sending code stays simple and does not duplicate protocol checks.
 
 *Call graph*: calls 2 internal fn (conversation_item_create_message, conversation_item_create_message); called by 1 (send_conversation_item_create).
 
@@ -5085,11 +5117,11 @@ fn conversation_function_call_output_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Builds the correct outbound representation of function-call output for the active realtime protocol version.
+**Purpose**: This function builds a message containing the result of a function call or handoff, using the format expected by the current realtime protocol. It is especially important because V1 and V2 represent this result differently.
 
-**Data flow**: Takes `event_parser`, `call_id`, and `output_text` → for v1, prefixes the text with `AGENT_FINAL_MESSAGE_PREFIX` and wraps it in a legacy handoff-append message; for v2, builds a function-call-output conversation item → returns `RealtimeOutboundMessage`.
+**Data flow**: It receives the protocol version, a call identifier, and the output text produced by the function. For V2, it sends those directly into the V2 function-call-output message builder. For V1, it wraps the output text with the special "Agent Final Message" label and sends it through the V1 handoff-append message builder. The output is a RealtimeOutboundMessage ready to send.
 
-**Call relations**: Used by `RealtimeWebsocketWriter::send_conversation_function_call_output`; it centralizes the biggest semantic difference between v1 and v2 outbound handoff/output handling.
+**Call relations**: send_conversation_function_call_output calls this after there is function-call output to report back. This function then chooses either the older V1 handoff-style path or the newer V2 direct function-output path, preserving the meaning across both protocols.
 
 *Call graph*: calls 2 internal fn (conversation_handoff_append_message, conversation_function_call_output_message); called by 1 (send_conversation_function_call_output); 1 external calls (format!).
 
@@ -5105,11 +5137,11 @@ fn session_update_session(
     voice: RealtimeVoice
 ```
 
-**Purpose**: Builds the version-appropriate `SessionUpdateSession` payload from generic session inputs.
+**Purpose**: This function creates a session update object with the right fields for the current realtime protocol. It centralizes the rules for instructions, session mode, output style, and voice selection.
 
-**Data flow**: Consumes `event_parser`, `instructions`, `session_mode`, `output_modality`, and `voice` → normalizes the mode → calls the v1 or v2 session builder → returns `SessionUpdateSession`.
+**Data flow**: It receives instructions, a requested session mode, an output modality, and a voice, along with the protocol version. First it normalizes the session mode so V1 is always conversational. Then it builds either a V1 session update, which uses instructions and voice, or a V2 session update, which can also include session mode and output modality. It returns a SessionUpdateSession object.
 
-**Call relations**: Used by `RealtimeWebsocketWriter::send_session_update` and `session_update_session_json` so both websocket bootstrap and HTTP realtime-call embedding share the same session schema logic.
+**Call relations**: send_session_update uses this when it needs to send fresh session settings over the WebSocket. session_update_session_json also uses it as the first step before adding identifiers and turning the session update into JSON.
 
 *Call graph*: calls 3 internal fn (normalized_session_mode, session_update_session, session_update_session); called by 2 (send_session_update, session_update_session_json).
 
@@ -5120,11 +5152,11 @@ fn session_update_session(
 fn session_update_session_json(config: RealtimeSessionConfig) -> JsonResult<Value>
 ```
 
-**Purpose**: Converts a full `RealtimeSessionConfig` into a JSON session object suitable for embedding in HTTP realtime call creation.
+**Purpose**: This public helper turns a full realtime session configuration into JSON that can be sent or stored. It is the bridge from the project’s structured Rust data into a generic JSON value.
 
-**Data flow**: Consumes `config` → builds a `SessionUpdateSession` via `session_update_session`, then sets `session.id = config.session_id` and `session.model = config.model` → serializes the struct to `serde_json::Value` with `to_value`.
+**Data flow**: It receives a RealtimeSessionConfig containing the parser version, instructions, mode, output modality, voice, session id, and model. It builds the protocol-specific session update, fills in the session id and model afterward, and then serializes the result into a JSON value. It returns either that JSON value or a JSON serialization error.
 
-**Call relations**: Called by realtime call creation code when embedding session state into HTTP requests.
+**Call relations**: This function calls session_update_session to reuse the same version-selection logic as normal WebSocket sending. After the structured message is complete, it hands it to serde_json’s to_value function so outside code can work with a JSON representation.
 
 *Call graph*: calls 1 internal fn (session_update_session); 1 external calls (to_value).
 
@@ -5135,26 +5167,24 @@ fn session_update_session_json(config: RealtimeSessionConfig) -> JsonResult<Valu
 fn websocket_intent(event_parser: RealtimeEventParser) -> Option<&'static str>
 ```
 
-**Purpose**: Returns the protocol-version-specific websocket `intent` query parameter, if any.
+**Purpose**: This function returns the optional intent string that should be attached to a WebSocket URL for the active protocol version. It lets URL-building code ask one common question instead of knowing version-specific rules.
 
-**Data flow**: Takes `event_parser` → returns `Some("quicksilver")` for v1 via `methods_v1::websocket_intent` or `None` for v2 via `methods_v2::websocket_intent`.
+**Data flow**: It receives the active protocol version. For V1 it asks the V1 helper for the intent value, and for Realtime V2 it asks the V2 helper. It returns either a static text value or nothing, depending on what that protocol requires.
 
-**Call relations**: Used by `websocket_url_from_api_url` during websocket URL construction.
+**Call relations**: websocket_url_from_api_url calls this while constructing the WebSocket URL. This function delegates the protocol detail to the matching V1 or V2 helper, so URL construction does not need to know which versions require which intent marker.
 
 *Call graph*: calls 2 internal fn (websocket_intent, websocket_intent); called by 1 (websocket_url_from_api_url).
 
 
 ### `codex-api/src/endpoint/realtime_websocket/methods_v1.rs`
 
-`domain_logic` · `request handling`
+`io_transport` · `websocket session setup and message sending`
 
-This file contains the v1-specific builders selected by `methods_common`. The payloads here target the older quicksilver-style realtime websocket API, which has a simpler session schema and no native function-call-output item type.
+This file is a small adapter between the rest of the application and the realtime WebSocket protocol. A WebSocket is a long-lived network connection where both sides can send messages at any time. The rest of the code should not have to remember every nested field needed by that protocol, so this file provides focused helper functions that assemble the right shapes.
 
-`conversation_item_create_message` constructs a `RealtimeOutboundMessage::ConversationItemCreate` whose payload is a `ConversationItemPayload::Message`. The embedded `ConversationMessageItem` is always typed as `Message`, preserves the caller’s `ConversationTextRole`, and carries a single `ConversationItemContent` entry of type `InputText` containing the provided text.
+Think of it like pre-printed shipping labels. Other code supplies the important content, such as a user message or session instructions, and these helpers put that content into the exact envelope the realtime service understands.
 
-`conversation_handoff_append_message` exposes the legacy handoff output wire shape directly as `RealtimeOutboundMessage::ConversationHandoffAppend { handoff_id, output_text }`. This is what the compatibility layer uses to emulate function-call output on v1.
-
-`session_update_session` builds the v1 `SessionUpdateSession`: `type` is `SessionType::Quicksilver`, `instructions` is always present, `model` and `id` are left unset for later injection if needed, input audio is fixed to PCM at `REALTIME_AUDIO_SAMPLE_RATE`, and output audio contains only the selected `RealtimeVoice` with no explicit output format. Noise reduction, transcription, turn detection, tools, tool choice, and output modalities are all omitted. `websocket_intent` returns the required `quicksilver` query parameter for v1 websocket URLs.
+The file covers four version-1 protocol needs. It can create a conversation message containing input text and a role, append text to a conversation handoff, build a session update that sets instructions, voice, and audio format, and declare the WebSocket intent string for this version. The session update is especially important because it fixes the audio input format to PCM audio at the shared realtime sample rate and selects the Quicksilver session type. Without these helpers, callers would need to duplicate protocol details, making mistakes more likely whenever the realtime message format changes.
 
 #### Function details
 
@@ -5167,11 +5197,11 @@ fn conversation_item_create_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Builds the v1 conversation-item-create message for a single text input item.
+**Purpose**: Creates an outbound realtime message that adds a text message to the conversation. Callers use it when they have plain text plus a speaker role, such as user or assistant, and need to send it in the WebSocket protocol format.
 
-**Data flow**: Consumes `text` and `role` → constructs `RealtimeOutboundMessage::ConversationItemCreate` containing `ConversationItemPayload::Message(ConversationMessageItem { type: Message, role, content: [InputText{text}] })` → returns it.
+**Data flow**: It receives the message text and the conversation role. It wraps them into a message item, marks the content as input text, puts that single content block into a list, and returns a `RealtimeOutboundMessage` ready to send over the realtime connection. It does not change any outside state.
 
-**Call relations**: Called indirectly through `methods_common::conversation_item_create_message` when the active parser/version is v1.
+**Call relations**: In the bigger flow, this is the packaging step before a text message leaves the application. The call graph shows it reached through the same-named conversation item creation path; inside, it relies on standard constructors such as the message variant and a small list builder to form the protocol object.
 
 *Call graph*: called by 1 (conversation_item_create_message); 2 external calls (Message, vec!).
 
@@ -5185,11 +5215,11 @@ fn conversation_handoff_append_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Builds the legacy v1 handoff append message used to send delegated output back into the conversation.
+**Purpose**: Creates an outbound message that appends output text to an existing handoff. A handoff is a tracked transfer or continuation identified by an ID, so the receiving side knows which ongoing exchange the text belongs to.
 
-**Data flow**: Takes `handoff_id` and `output_text` and returns `RealtimeOutboundMessage::ConversationHandoffAppend { handoff_id, output_text }`.
+**Data flow**: It receives a handoff ID and the text to append. It places both values into a `ConversationHandoffAppend` outbound message and returns that message unchanged otherwise. Nothing is written to storage or sent directly here; this function only builds the payload.
 
-**Call relations**: Used indirectly by `methods_common::conversation_function_call_output_message` to emulate function-call output on v1.
+**Call relations**: This helper is used when `conversation_function_call_output_message` has produced text that should be attached to a handoff. It gives that caller the correctly shaped realtime message, which can then be passed onward to the WebSocket sending layer.
 
 *Call graph*: called by 1 (conversation_function_call_output_message).
 
@@ -5203,11 +5233,11 @@ fn session_update_session(
 ) -> SessionUpdateSession
 ```
 
-**Purpose**: Builds the v1 quicksilver session-update payload with fixed PCM input audio and voiced output audio.
+**Purpose**: Builds the session settings sent to the realtime service. It sets the session instructions, chooses the voice for audio output, and describes the audio input format the service should expect.
 
-**Data flow**: Consumes `instructions` and `voice` → returns `SessionUpdateSession` with `type: Quicksilver`, `instructions: Some(...)`, `audio.input.format` set to PCM/24kHz, `audio.output` set to `Some(SessionAudioOutput { format: None, voice })`, and all v2-only fields omitted.
+**Data flow**: It receives instruction text and a voice choice. It returns a `SessionUpdateSession` object with the Quicksilver session type, the instructions filled in, audio input set to PCM at the shared realtime sample rate, and audio output configured with the requested voice. Optional fields such as tools, model, transcription, and turn detection are left empty.
 
-**Call relations**: Called indirectly through `methods_common::session_update_session` whenever a v1 websocket or realtime-call session payload is needed.
+**Call relations**: This function is part of session setup or session reconfiguration. The call graph shows it reached through the same-named session update path; its job is to centralize the version-1 defaults so callers do not each rebuild the nested session structure by hand.
 
 *Call graph*: called by 1 (session_update_session).
 
@@ -5218,26 +5248,24 @@ fn session_update_session(
 fn websocket_intent() -> Option<&'static str>
 ```
 
-**Purpose**: Supplies the required v1 websocket intent string.
+**Purpose**: Returns the intent label used when opening or identifying this realtime WebSocket mode. In this version, the intent is always `quicksilver`.
 
-**Data flow**: Returns `Some("quicksilver")`.
+**Data flow**: It takes no input and returns a fixed optional text value containing `quicksilver`. It reads no external settings and changes nothing.
 
-**Call relations**: Used indirectly through `methods_common::websocket_intent` during websocket URL construction for v1 sessions.
+**Call relations**: This is a small identification hook for the WebSocket setup flow. The call graph shows it reached through the same-named intent path, where callers need the protocol-specific intent string before or during connection setup.
 
 *Call graph*: called by 1 (websocket_intent).
 
 
 ### `codex-api/src/endpoint/realtime_websocket/methods_v2.rs`
 
-`domain_logic` · `request handling`
+`io_transport` · `WebSocket session setup and realtime message sending`
 
-This file contains the Realtime V2-specific builders used by the shared websocket layer. Compared with v1, V2 supports richer session configuration, explicit function-call-output items, and a distinct transcription-only mode.
+This file is a small message factory for the realtime WebSocket API. A WebSocket is a long-lived connection where both sides can send messages at any time, which is useful for live voice and text interaction. The rest of the system should not have to remember every field the realtime API requires, so this file gathers those details in one place.
 
-`conversation_item_create_message` mirrors the v1 text-item shape but is selected for V2 sessions. `conversation_function_call_output_message` uses the newer `ConversationItemPayload::FunctionCallOutput` variant, producing a `conversation.item.create` message whose item type is `FunctionCallOutput` and whose payload carries `call_id` plus raw `output` text.
+It creates two kinds of conversation messages: a normal text message and the output from a tool call. It also builds the session update message that tells the realtime service how the session should behave. In conversational mode, the session is set up for live audio input, optional audio or text output, voice selection, transcription, turn detection, and two callable tools. One tool sends work to a background agent; the other means “stay silent” when speaking would be distracting. In transcription mode, the setup is much simpler: accept audio and transcribe it, without responses, tools, or voice output.
 
-The main logic is `session_update_session`, which branches on `RealtimeSessionMode`. In `Conversational` mode it builds a `SessionUpdateSession` of type `Realtime` with instructions, one output modality (`"text"` or `"audio"`), PCM 24 kHz input and output audio, near-field noise reduction, input transcription using `gpt-4o-mini-transcribe`, server VAD turn detection, and two function tools: `background_agent` with a required `prompt` string parameter and `remain_silent` with an empty object schema. Tool choice is fixed to `"auto"`. In `Transcription` mode it instead emits type `Transcription`, omits instructions, output modalities, output audio, tools, and turn detection, and keeps only PCM input plus transcription.
-
-`output_modality_value` maps the enum to the exact wire strings, and `websocket_intent` returns `None`, meaning V2 websocket URLs do not carry the legacy `intent` query parameter.
+A useful analogy is a restaurant order pad: callers say what they want in human-sized terms, and this file fills out the exact form the kitchen requires. Without it, session setup and outbound messages would be duplicated and easy to get subtly wrong.
 
 #### Function details
 
@@ -5250,11 +5278,11 @@ fn conversation_item_create_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Builds the V2 conversation-item-create message for a single text input item.
+**Purpose**: Creates an outbound realtime message that adds a plain text conversation item. Callers use it when they need to send user, assistant, or system-style text into the realtime conversation.
 
-**Data flow**: Consumes `text` and `role` → constructs `RealtimeOutboundMessage::ConversationItemCreate` containing a message item with one `input_text` content entry → returns it.
+**Data flow**: It receives the text to send and the conversation role, meaning who the text is from. It wraps that text in the protocol’s message shape, marks the content as input text, and returns a `RealtimeOutboundMessage` ready to be sent over the WebSocket. It does not change any stored state.
 
-**Call relations**: Selected indirectly by `methods_common::conversation_item_create_message` when the active parser/version is `RealtimeV2`.
+**Call relations**: When higher-level realtime code needs to add a text item to the conversation, it calls this helper instead of constructing the nested protocol object by hand. Inside, the helper builds the message payload and uses a vector because the protocol stores message content as a list, even when there is only one text part.
 
 *Call graph*: called by 1 (conversation_item_create_message); 2 external calls (Message, vec!).
 
@@ -5268,11 +5296,11 @@ fn conversation_function_call_output_message(
 ) -> RealtimeOutboundMessage
 ```
 
-**Purpose**: Builds the V2 function-call-output conversation item message.
+**Purpose**: Creates an outbound realtime message that reports the result of a function/tool call back to the realtime service. This is used after local code has completed work requested by the model, such as a background-agent action.
 
-**Data flow**: Consumes `call_id` and `output_text` → constructs `RealtimeOutboundMessage::ConversationItemCreate { item: FunctionCallOutput { type: FunctionCallOutput, call_id, output } }` → returns it.
+**Data flow**: It receives a tool call identifier and the output text for that call. It packages both into a function-call-output conversation item and returns it as a `RealtimeOutboundMessage`. The call identifier lets the realtime service match this result to the original tool request.
 
-**Call relations**: Selected indirectly by `methods_common::conversation_function_call_output_message` for V2 sessions.
+**Call relations**: In the broader realtime flow, code that finishes a requested function call uses this helper to answer the service in the expected format. The function hands off to the protocol data types that represent a function-call output item.
 
 *Call graph*: called by 1 (conversation_function_call_output_message); 1 external calls (FunctionCallOutput).
 
@@ -5288,11 +5316,11 @@ fn session_update_session(
 ) -> SessionUpdateSession
 ```
 
-**Purpose**: Builds the V2 session-update payload for either conversational or transcription mode.
+**Purpose**: Builds the session configuration sent to the realtime service. It decides whether the connection should behave like a full conversation or like a transcription-only audio listener.
 
-**Data flow**: Consumes `instructions`, `session_mode`, `output_modality`, and `voice` → matches on `session_mode`: conversational returns a `SessionUpdateSession` with type `Realtime`, instructions, output modalities, full audio config, background-agent and remain-silent tools, and `tool_choice: auto`; transcription returns type `Transcription` with only input PCM plus transcription and omits instructions/output/tools.
+**Data flow**: It receives instructions, a session mode, the desired output style, and the voice to use if audio output is enabled. For conversational sessions, it creates a realtime session with audio input, noise reduction, speech transcription, server-side voice activity detection, optional text or audio output, and two tools: one for delegating work to the background agent and one for remaining silent. For transcription sessions, it creates a simpler session that only accepts audio and transcribes it. The result is a `SessionUpdateSession` object ready to serialize and send.
 
-**Call relations**: Called indirectly through `methods_common::session_update_session` for websocket bootstrap and HTTP realtime-call session embedding.
+**Call relations**: This is the main setup helper in the file. Session-starting code calls it when it needs to tell the realtime service what kind of interaction to run. It uses `output_modality_value` to translate the local output choice into the exact string the version 2 protocol expects.
 
 *Call graph*: called by 1 (session_update_session); 1 external calls (vec!).
 
@@ -5303,11 +5331,11 @@ fn session_update_session(
 fn output_modality_value(output_modality: RealtimeOutputModality) -> &'static str
 ```
 
-**Purpose**: Maps `RealtimeOutputModality` to the exact V2 wire string.
+**Purpose**: Translates the program’s output-mode choice into the exact protocol word used by the realtime API. It keeps the string values `text` and `audio` in one place so callers do not repeat them.
 
-**Data flow**: Takes `output_modality` and returns either `"text"` or `"audio"`.
+**Data flow**: It receives a `RealtimeOutputModality`, which is the local enum for choosing text or audio output. It matches that choice and returns the corresponding static string: `text` for text output or `audio` for audio output.
 
-**Call relations**: Used internally by `session_update_session` when populating `output_modalities` in conversational mode.
+**Call relations**: This helper is used while building a conversational session update. `session_update_session` calls it so the final session object contains the protocol’s expected output modality string.
 
 
 ##### `websocket_intent`  (lines 171–173)
@@ -5316,24 +5344,24 @@ fn output_modality_value(output_modality: RealtimeOutputModality) -> &'static st
 fn websocket_intent() -> Option<&'static str>
 ```
 
-**Purpose**: Indicates that Realtime V2 websocket URLs do not use a legacy intent query parameter.
+**Purpose**: Provides the optional WebSocket intent value for this version of the realtime API. For version 2, there is no special intent to send, so it returns nothing.
 
-**Data flow**: Returns `None`.
+**Data flow**: It takes no input and always returns `None`, meaning there is no intent string to attach. It does not read or change any state.
 
-**Call relations**: Used indirectly through `methods_common::websocket_intent` during websocket URL construction for V2 sessions.
+**Call relations**: Code that prepares a realtime WebSocket connection can call this function to ask whether this protocol version needs an extra intent marker. For this version, the answer is always absent, which lets the caller skip that part cleanly.
 
 *Call graph*: called by 1 (websocket_intent).
 
 
 ### `codex-api/src/endpoint/realtime_websocket/protocol_v1.rs`
 
-`io_transport` · `websocket event parsing`
+`io_transport` · `realtime WebSocket message handling`
 
-This file is a narrow event-decoding module for the v1 realtime websocket protocol. Its main entrypoint first delegates generic JSON parsing and message-type extraction to shared helpers, then performs a stringly-typed dispatch on the protocol's `type` field. Most branches reuse common parsers from `protocol_common` for session updates, transcript deltas, transcript completion, and error events, but several v1-specific branches manually extract fields from `serde_json::Value`.
+Realtime WebSocket messages arrive as plain text, usually JSON. The rest of the system does not want to inspect raw JSON strings every time it needs to react to audio, transcripts, errors, or conversation updates. This file acts like a translator at the border: it reads a v1 protocol message, checks what kind of message it is, pulls out the important fields, and returns a typed `RealtimeEvent` that other code can use safely.
 
-The most concrete custom decoding is for `conversation.output_audio.delta`, where the code accepts audio bytes from either `delta` or legacy `data`, requires `sample_rate` and channel count, converts them with checked `u64 -> u32/u16` casts, and emits `RealtimeEvent::AudioOut` with `item_id: None`. Transcript events intentionally support multiple synonymous v1 event names mapping onto the same internal `RealtimeEvent` variants. `conversation.item.added` forwards the raw nested `item` JSON unchanged, while `conversation.item.done` is reduced to only the item's string `id`. Handoff requests are also decoded directly from top-level fields into `RealtimeHandoffRequested`, with `active_transcript` initialized empty.
+The main function first asks shared parsing code to turn the text into JSON and identify the message type. Then it matches that type against the v1 event names. Some events are handed to shared helpers, such as transcript updates or error messages. Others are built directly here, such as outgoing audio frames, handoff requests, and conversation item notifications.
 
-A key design choice is fail-closed parsing: any missing field, wrong JSON type, or failed numeric conversion returns `None` for that event instead of partially constructing a value. Unsupported event types are only logged with `tracing::debug!` and otherwise ignored.
+If a required field is missing or has the wrong shape, the parser returns nothing instead of guessing. That matters because bad audio metadata or an incomplete handoff request could cause confusing behavior later. If the event type is unknown, the file logs a debug message and ignores it. In everyday terms, this file is the receptionist for v1 realtime messages: it opens the envelope, reads the label, and forwards only well-formed messages to the right internal desk.
 
 #### Function details
 
@@ -5343,11 +5371,11 @@ A key design choice is fail-closed parsing: any missing field, wrong JSON type, 
 fn parse_realtime_event_v1(payload: &str) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Decodes one raw websocket text payload from the v1 realtime protocol into a `RealtimeEvent`, covering session, audio, transcript, conversation-item, handoff, and error messages. It also normalizes several alternate v1 event names onto the same internal event variants.
+**Purpose**: This function turns one raw v1 realtime WebSocket payload into a `RealtimeEvent`, which is the project’s internal representation of things like audio output, transcript changes, errors, and conversation updates. It is used when the outer realtime parser has decided the incoming message belongs to protocol version 1.
 
-**Data flow**: Takes `payload: &str`, parses it through `parse_realtime_payload` to obtain a `serde_json::Value` plus message type string, then matches on that type. Depending on the branch, it either delegates to shared parsers, extracts concrete fields like `delta`, `sample_rate`, `channels`, `handoff_id`, and `item_id` from the JSON object, or clones nested `item` JSON. It returns `Some(RealtimeEvent)` on successful decoding; on malformed payloads, missing required fields, failed integer narrowing, or unsupported message types it returns `None` and only emits a debug log for unsupported types.
+**Data flow**: It receives a text payload. It asks the shared payload parser to read the JSON and extract the event type. Based on that type, it either delegates to shared helpers, pulls fields directly from the JSON, or builds a specific internal event such as an audio frame or handoff request. If the payload is malformed, lacks required fields, or names an unsupported event type, it returns no event; for unsupported types it also writes a debug log message.
 
-**Call relations**: This function is invoked by the higher-level realtime parser when protocol version 1 has been selected. It is the dispatch hub for this file: common event families are handed off to shared parsing helpers, while `conversation.item.done` is delegated to `parse_conversation_item_done_event` because that branch has its own extraction logic.
+**Call relations**: The broader realtime parser calls this function when it needs to interpret a v1 message. This function is the dispatcher for v1: it sends common event shapes to shared parsers like `parse_session_updated_event`, `parse_transcript_delta_event`, `parse_transcript_done_event`, and `parse_error_event`; it calls `parse_conversation_item_done_event` for the special conversation-item-finished shape; and it directly constructs internal events for audio, handoff requests, and item-added messages.
 
 *Call graph*: calls 6 internal fn (parse_error_event, parse_realtime_payload, parse_session_updated_event, parse_transcript_delta_event, parse_transcript_done_event, parse_conversation_item_done_event); called by 1 (parse_realtime_event); 4 external calls (new, debug!, AudioOut, HandoffRequested).
 
@@ -5358,24 +5386,24 @@ fn parse_realtime_event_v1(payload: &str) -> Option<RealtimeEvent>
 fn parse_conversation_item_done_event(parsed: &Value) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Extracts the completed conversation item's identifier from a v1 `conversation.item.done` payload and wraps it as `RealtimeEvent::ConversationItemDone`. It ignores all other item fields.
+**Purpose**: This small helper extracts the finished conversation item’s ID from a v1 JSON event and turns it into a `ConversationItemDone` event. It keeps the main parser from being cluttered with the details of this one JSON shape.
 
-**Data flow**: Receives the already-parsed JSON `Value`, looks up `item`, requires it to be an object, then reads `item.id` as a string and clones it into an owned `String`. It returns `Some(RealtimeEvent::ConversationItemDone { item_id })` when that path exists, otherwise `None`.
+**Data flow**: It receives an already-parsed JSON value. It looks for an `item` object inside it, then looks for that item’s string `id`. If both are present, it returns an internal event containing that item ID. If the expected object or ID is missing, it returns no event.
 
-**Call relations**: This helper is only reached from `parse_realtime_event_v1` when the incoming message type is `conversation.item.done`. It exists to keep the main match arm concise and to isolate the nested `item.id` extraction path.
+**Call relations**: It is called only by `parse_realtime_event_v1` when the message type says a conversation item is done. It does not call other project parsers; it simply reads the needed fields from the JSON and hands the cleaned-up result back to the main v1 parsing flow.
 
 *Call graph*: called by 1 (parse_realtime_event_v1); 1 external calls (get).
 
 
 ### `codex-api/src/endpoint/realtime_websocket/protocol_v2.rs`
 
-`io_transport` · `websocket event parsing`
+`io_transport` · `realtime WebSocket message handling`
 
-This file implements the v2 realtime websocket decoder. Like the v1 parser, it starts with shared payload parsing and then dispatches on the event type string, but it understands the newer response-oriented naming scheme and several additional event families. Shared helpers still decode session updates, transcript deltas, transcript completion, and generic errors; v2-specific helpers cover response IDs, output audio defaults, and special interpretation of completed conversation items.
+A realtime WebSocket sends many small JSON messages: audio chunks, transcript updates, response status changes, tool calls, and errors. This file is the version-2 interpreter for those messages. Without it, the rest of the app would receive raw JSON strings and would have to guess what each message means.
 
-Audio output parsing is more permissive than v1: `response.output_audio.delta` and `response.audio.delta` require only the base64 `delta` field, while `sample_rate` and channel count fall back to `DEFAULT_AUDIO_SAMPLE_RATE` (24 kHz) and mono if absent. Response lifecycle events (`response.created`, `response.cancelled`, `response.done`) all extract an ID from either `response.id` or top-level `response_id`. `input_audio_buffer.speech_started` becomes a typed `RealtimeInputAudioSpeechStarted` with optional `item_id`.
+The main function first parses the incoming text as JSON and reads its event type. It then uses that type like a sorting label. Transcript messages are sent to shared transcript parsers. Audio messages become `AudioOut` events with audio data and basic format details, using safe defaults when the server does not say the sample rate or channel count. Response lifecycle messages become simple created, cancelled, or done events.
 
-The most protocol-specific logic is in `conversation.item.done`: if the nested item is a `function_call` named `background_agent`, it is reinterpreted as `RealtimeEvent::HandoffRequested`; if named `remain_silent`, it becomes `RealtimeEvent::NoopRequested`; otherwise it falls back to a plain `ConversationItemDone`. Handoff extraction also parses the tool-call `arguments` string as JSON when possible and searches several candidate keys (`input_transcript`, `input`, `text`, `prompt`, `query`) for a non-empty transcript, falling back to the raw arguments string. As in v1, malformed or unsupported payloads quietly return `None`, with unsupported types logged at debug level.
+One important special case is finished conversation items. Most of them simply mean “this item is done,” but some are actually tool calls. A call to the `background_agent` tool becomes a handoff request, meaning another agent should take over work. A call to the `remain_silent` tool becomes a no-op request, meaning the assistant intentionally should not respond. The file also tries to pull a useful user transcript out of tool-call arguments, checking several possible field names because servers may package the same idea in slightly different ways.
 
 #### Function details
 
@@ -5385,11 +5413,11 @@ The most protocol-specific logic is in `conversation.item.done`: if the nested i
 fn parse_realtime_event_v2(payload: &str) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Decodes one raw v2 realtime websocket payload into a `RealtimeEvent`, covering session updates, audio, transcripts, speech-start markers, conversation items, response lifecycle events, and errors. It also maps multiple synonymous v2 event names onto the same internal variants.
+**Purpose**: This is the main translator for Realtime protocol version 2 messages. It takes one raw WebSocket payload and turns it into the internal event shape the rest of the system understands, or returns nothing if the message is not useful or not supported.
 
-**Data flow**: Accepts `payload: &str`, uses `parse_realtime_payload` to obtain parsed JSON and the message type, then matches on that type. It delegates transcript and session parsing to shared helpers, routes audio messages through `parse_output_audio_delta_event`, wraps optional `item_id` into `RealtimeInputAudioSpeechStarted`, clones nested `item` JSON for item-added events, derives response IDs via `parse_response_event_response_id`, and forwards `conversation.item.done` to `parse_conversation_item_done_event`. It returns `Some(RealtimeEvent)` on success, or `None` for malformed/unsupported payloads while logging unsupported types.
+**Data flow**: A JSON string comes in. The function asks the shared payload parser to decode it and find its message type. It then matches that type to the right conversion path: session updates, audio deltas, transcript changes, speech-start notices, conversation items, response status messages, or errors. The result is either a `RealtimeEvent` with the useful information copied out, or `None` if parsing fails or the event type is unknown.
 
-**Call relations**: This function is called by the version-selecting realtime parser for protocol v2. It is the top-level dispatcher for all helpers in this file: response ID extraction, output-audio decoding, and conversation-item reinterpretation all hang off specific match arms.
+**Call relations**: This function is called by the broader `parse_realtime_event` flow when a version-2 realtime message needs decoding. It delegates common message shapes to shared helpers such as the session, transcript, error, and payload parsers, and uses local helpers for version-2-specific audio, response IDs, and completed conversation items.
 
 *Call graph*: calls 8 internal fn (parse_error_event, parse_realtime_payload, parse_session_updated_event, parse_transcript_delta_event, parse_transcript_done_event, parse_conversation_item_done_event, parse_output_audio_delta_event, parse_response_event_response_id); called by 1 (parse_realtime_event); 5 external calls (debug!, InputAudioSpeechStarted, ResponseCancelled, ResponseCreated, ResponseDone).
 
@@ -5400,11 +5428,11 @@ fn parse_realtime_event_v2(payload: &str) -> Option<RealtimeEvent>
 fn parse_response_event_response_id(parsed: &Value) -> Option<String>
 ```
 
-**Purpose**: Extracts a response identifier from v2 response lifecycle payloads, supporting both nested and flat layouts. It smooths over schema variation between providers or event shapes.
+**Purpose**: This helper finds the response ID inside response-related messages. It exists because the same ID can appear in more than one place depending on how the server formats the event.
 
-**Data flow**: Takes parsed JSON `Value`, first tries `response.id` by requiring `response` to be an object and `id` to be a string, then falls back to top-level `response_id`. It returns `Option<String>` with the owned identifier or `None` if neither representation is present.
+**Data flow**: A parsed JSON value comes in. The function first looks for `response.id` inside a nested response object. If that is missing, it looks for a top-level `response_id`. If either value is a string, it returns that string; otherwise it returns no ID.
 
-**Call relations**: This helper is used by `parse_realtime_event_v2` in the `response.created`, `response.cancelled`, and `response.done` branches so those arms can construct typed events without duplicating fallback logic.
+**Call relations**: It is used by `parse_realtime_event_v2` when building response-created, response-cancelled, and response-done events. That lets the main parser keep response event creation simple while this helper deals with the two possible JSON layouts.
 
 *Call graph*: called by 1 (parse_realtime_event_v2); 1 external calls (get).
 
@@ -5415,11 +5443,11 @@ fn parse_response_event_response_id(parsed: &Value) -> Option<String>
 fn parse_output_audio_delta_event(parsed: &Value) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Builds a `RealtimeEvent::AudioOut` from a v2 output-audio delta payload, applying protocol defaults for omitted audio metadata. It preserves optional `item_id` when the server includes it.
+**Purpose**: This helper converts an outgoing audio chunk from JSON into an internal audio-frame event. It makes sure the rest of the system gets both the audio data and enough format information to play or process it.
 
-**Data flow**: Receives parsed JSON, requires `delta` as a string, then reads `sample_rate` and `channels`/`num_channels` as unsigned integers with checked narrowing. Missing or invalid audio metadata falls back to `DEFAULT_AUDIO_SAMPLE_RATE` and `DEFAULT_AUDIO_CHANNELS`; `samples_per_channel` and `item_id` remain optional. It returns `Some(RealtimeEvent::AudioOut(RealtimeAudioFrame { ... }))` or `None` if the required `delta` field is absent.
+**Data flow**: A parsed JSON object comes in. The function reads the required `delta` string, which contains the audio data. It then reads optional audio details such as sample rate, channel count, sample count, and item ID. If the sample rate or channel count is missing, it uses the file’s defaults: 24,000 samples per second and one audio channel. It returns an `AudioOut` event, or nothing if the required audio data is missing.
 
-**Call relations**: This helper is called from `parse_realtime_event_v2` for `response.output_audio.delta` and `response.audio.delta`. It isolates the v2-specific defaulting behavior so the main dispatcher stays focused on event-type routing.
+**Call relations**: It is called by `parse_realtime_event_v2` for version-2 audio delta message types. After this helper builds the audio frame, the main parser can hand a normal `RealtimeEvent` to the rest of the realtime pipeline.
 
 *Call graph*: called by 1 (parse_realtime_event_v2); 2 external calls (get, AudioOut).
 
@@ -5430,11 +5458,11 @@ fn parse_output_audio_delta_event(parsed: &Value) -> Option<RealtimeEvent>
 fn parse_conversation_item_done_event(parsed: &Value) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Interprets a completed conversation item either as a special tool-triggered control event or as an ordinary item completion. It gives handoff and silence tool calls precedence over generic completion handling.
+**Purpose**: This helper interprets a completed conversation item. It checks whether the completed item is a special tool call before treating it as an ordinary finished item.
 
-**Data flow**: Takes parsed JSON, requires `item` to be an object, then first passes that object to `parse_handoff_requested_event` and `parse_noop_requested_event`. If neither returns a specialized event, it reads `item.id` as a string and wraps it in `RealtimeEvent::ConversationItemDone`. Missing `item` or `id` yields `None`.
+**Data flow**: A parsed JSON event comes in. The function looks for its `item` object. It first asks whether the item requests a handoff to the background agent, then asks whether it requests silence. If neither special meaning applies, it reads the item’s ID and returns a normal conversation-item-done event. If the item object or ID is missing, it returns nothing.
 
-**Call relations**: This function is reached from `parse_realtime_event_v2` for `conversation.item.done`. It acts as a second-stage dispatcher for nested tool-call items, delegating to the handoff and noop parsers before falling back to the generic completion event.
+**Call relations**: It is called by `parse_realtime_event_v2` when a `conversation.item.done` message arrives. It then hands off to `parse_handoff_requested_event` and `parse_noop_requested_event` so that tool-call meanings are recognized before falling back to the ordinary completion event.
 
 *Call graph*: calls 2 internal fn (parse_handoff_requested_event, parse_noop_requested_event); called by 1 (parse_realtime_event_v2); 1 external calls (get).
 
@@ -5445,11 +5473,11 @@ fn parse_conversation_item_done_event(parsed: &Value) -> Option<RealtimeEvent>
 fn parse_handoff_requested_event(item: &JsonMap<String, Value>) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Recognizes a completed `background_agent` function call and converts it into `RealtimeEvent::HandoffRequested`. It derives both the handoff identity and a best-effort input transcript from the tool-call payload.
+**Purpose**: This helper recognizes a completed tool call that asks work to be handed to the background agent. In plain terms, it spots the assistant saying, “another worker should take this from here.”
 
-**Data flow**: Consumes an `item` JSON object, checks that `type == "function_call"` and `name == "background_agent"`, then extracts `call_id` from `call_id` or falls back to `id`. It chooses `item_id` from `id` or the call ID, reads `arguments` as a string defaulting to empty, and passes that string to `extract_input_transcript`. It returns `Some(RealtimeEvent::HandoffRequested(RealtimeHandoffRequested { handoff_id, item_id, input_transcript, active_transcript: Vec::new() }))` or `None` if the item is not the expected tool call or lacks an identifier.
+**Data flow**: A conversation item object comes in. The function checks that the item is a `function_call` named `background_agent`. If not, it returns nothing. If it is, it finds a call ID, chooses an item ID, reads the tool arguments, extracts a useful input transcript from those arguments, and returns a `HandoffRequested` event.
 
-**Call relations**: This helper is called only by `parse_conversation_item_done_event` before generic item completion handling. It exists because v2 encodes handoff requests as completed tool calls rather than as a dedicated top-level event.
+**Call relations**: It is called by `parse_conversation_item_done_event` before ordinary item completion is reported. It uses `extract_input_transcript` to turn the tool’s argument text into the user-facing input that should accompany the handoff.
 
 *Call graph*: calls 1 internal fn (extract_input_transcript); called by 1 (parse_conversation_item_done_event); 3 external calls (get, new, HandoffRequested).
 
@@ -5460,11 +5488,11 @@ fn parse_handoff_requested_event(item: &JsonMap<String, Value>) -> Option<Realti
 fn parse_noop_requested_event(item: &JsonMap<String, Value>) -> Option<RealtimeEvent>
 ```
 
-**Purpose**: Recognizes a completed `remain_silent` function call and converts it into `RealtimeEvent::NoopRequested`. It treats the tool invocation as a control signal rather than a normal conversation item.
+**Purpose**: This helper recognizes a completed tool call that means the assistant should stay silent. It turns that tool call into an explicit no-op event so later code knows the silence was intentional.
 
-**Data flow**: Accepts an `item` JSON object, verifies `type == "function_call"` and `name == "remain_silent"`, then extracts `call_id` from `call_id` or `id` and derives `item_id` from `id` or the same fallback. It returns `Some(RealtimeEvent::NoopRequested(RealtimeNoopRequested { call_id, item_id }))` when the shape matches, otherwise `None`.
+**Data flow**: A conversation item object comes in. The function checks that the item is a `function_call` named `remain_silent`. If not, it returns nothing. If it matches, it finds a call ID, chooses an item ID, and returns a `NoopRequested` event containing those IDs.
 
-**Call relations**: This helper is invoked by `parse_conversation_item_done_event` after the handoff check and before generic completion fallback. Its placement means silence requests are surfaced as explicit control events whenever the nested item matches the expected tool signature.
+**Call relations**: It is called by `parse_conversation_item_done_event` after the handoff check and before the ordinary done-event fallback. This ordering lets special tool calls become meaningful internal events instead of being treated as just another completed conversation item.
 
 *Call graph*: called by 1 (parse_conversation_item_done_event); 2 external calls (get, NoopRequested).
 
@@ -5475,24 +5503,26 @@ fn parse_noop_requested_event(item: &JsonMap<String, Value>) -> Option<RealtimeE
 fn extract_input_transcript(arguments: &str) -> String
 ```
 
-**Purpose**: Pulls a human-meaningful transcript string out of a tool-call `arguments` blob, preferring known JSON keys but falling back to the raw argument text. It is designed to tolerate both structured and unstructured argument payloads.
+**Purpose**: This helper pulls the most useful user text out of a tool-call argument string. It is tolerant of several possible field names, because similar input may be labeled differently by different message producers.
 
-**Data flow**: Takes `arguments: &str`; if empty, returns an empty `String`. Otherwise it attempts to parse the string as JSON `Value`, requires an object, then scans `TOOL_ARGUMENT_KEYS` in order for a string value whose trimmed contents are non-empty; the first such value is returned trimmed and owned. If parsing fails or no preferred key contains usable text, it returns `arguments.to_string()` unchanged.
+**Data flow**: An argument string comes in. If it is empty, the function returns an empty string. If it can be parsed as JSON, the function looks for a non-empty string under known keys such as `input_transcript`, `input`, `text`, `prompt`, or `query`, trims extra whitespace, and returns the first good value. If parsing fails or none of those fields are useful, it returns the original argument string unchanged.
 
-**Call relations**: This helper is called only from `parse_handoff_requested_event` to populate `RealtimeHandoffRequested.input_transcript`. It encapsulates the heuristic extraction logic so handoff parsing can stay focused on tool-call identification.
+**Call relations**: It is called by `parse_handoff_requested_event` when building a handoff request. That way, the handoff event carries a clean piece of input text for the background agent instead of raw, possibly messy tool-call arguments.
 
 *Call graph*: called by 1 (parse_handoff_requested_event); 1 external calls (new).
 
 
 ### `codex-api/src/endpoint/realtime_websocket/methods.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `realtime connection setup, live message exchange, and close`
 
-This file is the core websocket implementation for realtime sessions. It wraps a `tokio_tungstenite` stream in `WsStream`, which splits command submission from inbound message consumption by spawning a pump task. That task multiplexes outbound `Send`/`Close` commands with inbound websocket frames, auto-responds to pings with pongs, forwards text/close/binary/frame messages through an async channel, and terminates cleanly on errors or closure. `Drop` aborts the pump task so leaked connections do not keep background work alive.
+A WebSocket is a long-lived network connection where both sides can talk at any time, like a phone call instead of a letter. This file is the client-side phone operator for Codex realtime sessions. It builds the right WebSocket URL, adds headers, connects with TLS security, sends the initial session settings, and then exposes a simple connection object with a sending side and a receiving side.
 
-`RealtimeWebsocketConnection` exposes a high-level API composed of a `RealtimeWebsocketWriter` and `RealtimeWebsocketEvents`. The writer serializes `RealtimeOutboundMessage` values to JSON, rejects sends after closure via an `AtomicBool`, and offers typed helpers for audio frames, conversation items, function-call outputs, response creation, and session updates. The events side reads parsed websocket messages, converts text payloads with `parse_realtime_event`, and maintains `ActiveTranscriptState` so handoff events include the transcript accumulated since the previous handoff. Transcript deltas append to the last matching-role entry unless a new turn was forced by speech start, response creation, or handoff boundaries.
+The lower layer, WsStream, owns the actual socket and runs a background pump task. That task listens for outgoing commands and incoming frames at the same time, so sending audio does not get stuck just because the caller is waiting for the next server event. It also answers WebSocket pings with pongs, which keeps the connection healthy.
 
-`RealtimeWebsocketClient` builds websocket URLs from provider base URLs, normalizes `/v1/realtime` paths, merges provider/extra/default headers with HTTP-like precedence, optionally injects `x-session-id`, configures TLS with custom CA support, connects, then immediately sends `session.update`. It also supports retrying sideband websocket joins for existing WebRTC calls by appending `call_id` to the websocket URL.
+RealtimeWebsocketWriter turns higher-level actions, such as appending audio or sending a tool result, into JSON messages and sends them. RealtimeWebsocketEvents reads text frames, parses them into project-level RealtimeEvent values, and updates an active transcript as speech and response text arrive in pieces. When the server asks for a handoff, that transcript snapshot is attached so the next agent has context.
+
+Without this file, realtime voice and text sessions would not have a reliable network bridge, and callers would have to know many protocol details themselves.
 
 #### Function details
 
@@ -5504,11 +5534,11 @@ fn new(
     ) -> (Self, async_channel::Receiver<Result<Message, WsError>>)
 ```
 
-**Purpose**: Creates the internal websocket pump that decouples outbound commands from inbound frame consumption.
+**Purpose**: Creates the internal WebSocket pump that can send outgoing messages and receive incoming messages at the same time. This protects the rest of the code from directly juggling the raw socket.
 
-**Data flow**: Takes `inner: WebSocketStream<MaybeTlsStream<TcpStream>>` → creates an mpsc command channel and async-channel message queue → spawns a task that `select!`s between commands and `inner.next()` frames, sending websocket writes directly and forwarding inbound messages/errors to `tx_message` → returns `(WsStream { tx_command, pump_task }, rx_message)`.
+**Data flow**: It takes an already connected WebSocket stream. It creates a command channel for sends and closes, a message channel for received frames, starts a background task, and returns a WsStream plus the receiving side of the message channel.
 
-**Call relations**: Called when a websocket connection is successfully established in `RealtimeWebsocketClient::connect_realtime_websocket_url`. It is the concurrency boundary that allows `send_*` operations to proceed even while `next_event` is blocked waiting for inbound data.
+**Call relations**: Connection setup calls this after the WebSocket handshake succeeds. From then on, writers hand send and close requests into the pump, while event readers receive frames that the pump forwards.
 
 *Call graph*: called by 2 (connect_realtime_websocket_url, connect_websocket); 3 external calls (info!, select!, spawn).
 
@@ -5522,11 +5552,11 @@ async fn request(
     ) -> Result<(), WsError>
 ```
 
-**Purpose**: Submits a websocket command to the pump task and waits for the per-command result.
+**Purpose**: Sends one command to the WebSocket pump and waits for the result. It is the shared helper that makes both sending and closing report success or failure back to the caller.
 
-**Data flow**: Builds a oneshot channel, uses `make_command` to create a `WsCommand`, sends it over `tx_command`, then awaits the oneshot response; if the command channel is closed or the oneshot is dropped, returns `WsError::ConnectionClosed`.
+**Data flow**: It receives a small function that builds a command once a reply channel exists. It sends that command to the pump, waits on the one-time reply, and returns either the pump result or a closed-connection error.
 
-**Call relations**: Shared helper used by `WsStream::send` and `WsStream::close` so both operations follow the same command/acknowledgement path through the pump task.
+**Call relations**: WsStream::send and WsStream::close call this so they do not duplicate the command-and-reply pattern.
 
 *Call graph*: called by 2 (close, send); 2 external calls (send, channel).
 
@@ -5537,11 +5567,11 @@ async fn request(
 async fn send(&self, message: Message) -> Result<(), WsError>
 ```
 
-**Purpose**: Requests that the pump task send one websocket message.
+**Purpose**: Queues a WebSocket message to be sent on the live connection. Callers use it when they already have a WebSocket frame ready.
 
-**Data flow**: Takes `message: Message` → wraps it in `WsCommand::Send` via `request` → returns `Result<(), WsError>` from the pump task’s actual send attempt.
+**Data flow**: It takes a WebSocket message, wraps it as a Send command, passes it through WsStream::request, and returns whether the pump successfully wrote it.
 
-**Call relations**: Used by `RealtimeWebsocketWriter::send_payload` to serialize all outbound websocket traffic through the single pump task.
+**Call relations**: Higher-level send code eventually reaches this through the writer path. It relies on WsStream::request to talk to the background pump.
 
 *Call graph*: calls 1 internal fn (request); called by 1 (send_websocket_request).
 
@@ -5552,11 +5582,11 @@ async fn send(&self, message: Message) -> Result<(), WsError>
 async fn close(&self) -> Result<(), WsError>
 ```
 
-**Purpose**: Requests that the pump task send a websocket close frame and terminate.
+**Purpose**: Asks the WebSocket pump to close the connection cleanly. This gives the remote server a proper close frame instead of just dropping the socket.
 
-**Data flow**: Creates a `WsCommand::Close` through `request` and returns the resulting `Result<(), WsError>`.
+**Data flow**: It builds a Close command, sends it through WsStream::request, and returns the close result from the pump.
 
-**Call relations**: Called by `RealtimeWebsocketWriter::close` during explicit connection shutdown.
+**Call relations**: The writer's close path uses this when the public connection is closed.
 
 *Call graph*: calls 1 internal fn (request).
 
@@ -5567,11 +5597,11 @@ async fn close(&self) -> Result<(), WsError>
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures the background pump task is aborted if the wrapper is dropped unexpectedly.
+**Purpose**: Stops the background WebSocket pump if the WsStream is destroyed. This prevents a leftover task from running after nobody owns the connection anymore.
 
-**Data flow**: Mutably borrows `self` and calls `self.pump_task.abort()`; no return value.
+**Data flow**: It reads the stored task handle and aborts that task. It does not return a value; it changes the runtime state by stopping the task.
 
-**Call relations**: Runs automatically when the last `WsStream` owner is dropped, preventing orphaned background tasks.
+**Call relations**: Rust calls this automatically when WsStream is dropped. It is the final safety net behind explicit close calls.
 
 *Call graph*: 1 external calls (abort).
 
@@ -5582,11 +5612,11 @@ fn drop(&mut self)
 async fn send_audio_frame(&self, frame: RealtimeAudioFrame) -> Result<(), ApiError>
 ```
 
-**Purpose**: Convenience wrapper that forwards an audio frame to the writer half.
+**Purpose**: Sends one chunk of input audio through the connection. It is a convenient top-level method for callers that do not want to access the writer directly.
 
-**Data flow**: Takes `frame: RealtimeAudioFrame` and delegates to `self.writer.send_audio_frame(frame)` → returns `Result<(), ApiError>`.
+**Data flow**: It receives an audio frame, forwards it to the connection's writer, and returns the writer's success or API error.
 
-**Call relations**: Used by higher-level realtime flows and tests; it keeps callers from needing to access the writer directly.
+**Call relations**: Application code calls this on the full connection. The method hands the work to RealtimeWebsocketWriter::send_audio_frame.
 
 *Call graph*: calls 1 internal fn (send_audio_frame).
 
@@ -5601,11 +5631,11 @@ async fn send_conversation_item_create(
     ) -> Result<(), ApiError>
 ```
 
-**Purpose**: Convenience wrapper for sending a text conversation item with a specific role.
+**Purpose**: Adds a text conversation item to the realtime session. This is used for sending developer or user text into the same stream as audio.
 
-**Data flow**: Takes `text: String` and `role: ConversationTextRole` → delegates to `self.writer.send_conversation_item_create(text, role)`.
+**Data flow**: It takes text and a conversation role, passes both to the writer, and returns whether the JSON message was sent.
 
-**Call relations**: Part of the public connection API, forwarding to the writer’s typed message construction.
+**Call relations**: It is the connection-level wrapper around RealtimeWebsocketWriter::send_conversation_item_create.
 
 *Call graph*: calls 1 internal fn (send_conversation_item_create).
 
@@ -5620,11 +5650,11 @@ async fn send_conversation_function_call_output(
     ) -> Result<(), ApiError>
 ```
 
-**Purpose**: Convenience wrapper for sending function-call or handoff output back to the realtime server.
+**Purpose**: Sends the result of a function or background-agent call back to the realtime server. This lets the model continue after a tool-style request is fulfilled.
 
-**Data flow**: Takes `call_id` and `output_text` strings → delegates to `self.writer.send_conversation_function_call_output(...)`.
+**Data flow**: It receives a call identifier and output text, forwards them to the writer, and returns the send result.
 
-**Call relations**: Used by higher-level handoff handling and tests; it hides parser-version-specific message differences behind the writer.
+**Call relations**: It delegates to RealtimeWebsocketWriter::send_conversation_function_call_output, which formats the right protocol message.
 
 *Call graph*: calls 1 internal fn (send_conversation_function_call_output).
 
@@ -5635,11 +5665,11 @@ async fn send_conversation_function_call_output(
 async fn close(&self) -> Result<(), ApiError>
 ```
 
-**Purpose**: Closes the websocket connection through the writer half.
+**Purpose**: Closes the realtime connection from the public connection object. Callers use this when the session is finished.
 
-**Data flow**: Delegates to `self.writer.close().await` and returns its `ApiError`-wrapped result.
+**Data flow**: It asks the writer to close the underlying stream and returns either success or an API error.
 
-**Call relations**: Public shutdown entrypoint for callers holding a full connection.
+**Call relations**: This is a simple wrapper over RealtimeWebsocketWriter::close.
 
 *Call graph*: calls 1 internal fn (close).
 
@@ -5650,11 +5680,11 @@ async fn close(&self) -> Result<(), ApiError>
 async fn next_event(&self) -> Result<Option<RealtimeEvent>, ApiError>
 ```
 
-**Purpose**: Retrieves the next parsed realtime event from the events half.
+**Purpose**: Waits for the next meaningful realtime event from the server. It returns none when the stream has ended.
 
-**Data flow**: Delegates to `self.events.next_event().await` → returns `Result<Option<RealtimeEvent>, ApiError>`.
+**Data flow**: It asks the event reader for the next parsed event and passes through the result. Incoming raw WebSocket frames are not exposed here.
 
-**Call relations**: Public receive-side entrypoint used by callers and tests to consume the event stream.
+**Call relations**: Callers use this on the full connection; the method delegates to RealtimeWebsocketEvents::next_event.
 
 *Call graph*: calls 1 internal fn (next_event).
 
@@ -5665,11 +5695,11 @@ async fn next_event(&self) -> Result<Option<RealtimeEvent>, ApiError>
 fn writer(&self) -> RealtimeWebsocketWriter
 ```
 
-**Purpose**: Returns a clone of the writer half for independent outbound use.
+**Purpose**: Returns a clone of the sending half of the connection. This lets another task send messages while one task is reading events.
 
-**Data flow**: Clones `self.writer` and returns it.
+**Data flow**: It reads the stored writer, clones its shared references, and returns the clone.
 
-**Call relations**: Lets callers split send and receive responsibilities across tasks while sharing the same underlying websocket state.
+**Call relations**: Code that needs independent sending access calls this instead of owning the whole connection.
 
 *Call graph*: 1 external calls (clone).
 
@@ -5680,11 +5710,11 @@ fn writer(&self) -> RealtimeWebsocketWriter
 fn events(&self) -> RealtimeWebsocketEvents
 ```
 
-**Purpose**: Returns a clone of the events half for independent inbound use.
+**Purpose**: Returns a clone of the receiving half of the connection. This lets event-reading code hold just the part it needs.
 
-**Data flow**: Clones `self.events` and returns it.
+**Data flow**: It reads the stored events object, clones its shared references, and returns the clone.
 
-**Call relations**: Complements `writer()` for split-task usage patterns.
+**Call relations**: Code that separates reading from writing can call this and then use RealtimeWebsocketEvents::next_event.
 
 *Call graph*: 1 external calls (clone).
 
@@ -5699,11 +5729,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Builds the paired writer/events façade around a newly created `WsStream` and inbound message receiver.
+**Purpose**: Builds the public connection object from the low-level stream and receive channel. It splits the connection into writer and event-reader pieces that share close state.
 
-**Data flow**: Takes `stream`, `rx_message`, and `event_parser` → wraps `stream` in `Arc`, creates shared `AtomicBool` closed state and `ActiveTranscriptState` mutex, then returns `RealtimeWebsocketConnection { writer, events }` sharing those internals.
+**Data flow**: It receives a WsStream, a channel of incoming WebSocket messages, and an event parser choice. It wraps shared data in reference-counted pointers, creates transcript state, and returns a RealtimeWebsocketConnection.
 
-**Call relations**: Called only after a websocket handshake succeeds in `RealtimeWebsocketClient::connect_realtime_websocket_url`.
+**Call relations**: Connection setup calls this after WsStream::new. The resulting object is returned to the caller after the initial session update is sent.
 
 *Call graph*: called by 1 (connect_realtime_websocket_url); 5 external calls (clone, new, new, new, default).
 
@@ -5714,11 +5744,11 @@ fn new(
 async fn send_audio_frame(&self, frame: RealtimeAudioFrame) -> Result<(), ApiError>
 ```
 
-**Purpose**: Encodes an audio frame as `input_audio_buffer.append` and sends it.
+**Purpose**: Turns an audio frame into the protocol message that appends input audio. This is how microphone data reaches the realtime API.
 
-**Data flow**: Reads `frame.data` from `RealtimeAudioFrame` → constructs `RealtimeOutboundMessage::InputAudioBufferAppend { audio }` → passes it to `send_json`.
+**Data flow**: It takes the frame's encoded audio data, places it in an InputAudioBufferAppend message, and sends that as JSON.
 
-**Call relations**: Used by the connection wrapper and higher-level audio input flows.
+**Call relations**: The public connection wrapper and user-audio handling code call this. It hands serialization and delivery to send_json.
 
 *Call graph*: calls 1 internal fn (send_json); called by 2 (send_audio_frame, handle_user_audio_input).
 
@@ -5733,11 +5763,11 @@ async fn send_conversation_item_create(
     ) -> Result<(), ApiError>
 ```
 
-**Purpose**: Builds the parser-version-appropriate conversation item creation message and sends it.
+**Purpose**: Sends a text message into the realtime conversation using the protocol shape required by the selected parser version. This keeps callers from needing to know version-specific JSON details.
 
-**Data flow**: Takes `text` and `role`, reads `self.event_parser`, constructs a `RealtimeOutboundMessage` via `conversation_item_create_message`, then serializes and sends it with `send_json`.
+**Data flow**: It receives text and a role, asks the common helper to build the right outbound message, then sends it as JSON.
 
-**Call relations**: Called by the connection wrapper and higher-level text/handoff flows; it delegates version-specific payload shape to `methods_common`.
+**Call relations**: Connection wrappers and text or handoff handlers call this. It relies on conversation_item_create_message for protocol formatting and send_json for delivery.
 
 *Call graph*: calls 2 internal fn (send_json, conversation_item_create_message); called by 3 (send_conversation_item_create, handle_handoff_output, handle_text_input).
 
@@ -5752,11 +5782,11 @@ async fn send_conversation_handoff_append(
     ) -> Result<(), ApiError>
 ```
 
-**Purpose**: Sends a legacy `conversation.handoff.append` message with a handoff ID and output text.
+**Purpose**: Appends background-agent output to an existing handoff. This is used when a delegated task reports text back into the realtime session.
 
-**Data flow**: Takes `handoff_id` and `output_text` → wraps them in `RealtimeOutboundMessage::ConversationHandoffAppend` → sends via `send_json`.
+**Data flow**: It receives a handoff id and output text, creates a ConversationHandoffAppend message, and sends it as JSON.
 
-**Call relations**: Used by higher-level handoff output handling where the legacy v1 wire shape is needed explicitly.
+**Call relations**: Handoff output handling calls this when the server protocol expects a handoff append message.
 
 *Call graph*: calls 1 internal fn (send_json); called by 1 (handle_handoff_output).
 
@@ -5771,11 +5801,11 @@ async fn send_conversation_function_call_output(
     ) -> Result<(), ApiError>
 ```
 
-**Purpose**: Sends function-call output using the correct wire shape for the active realtime protocol version.
+**Purpose**: Sends a function-call result back to the realtime server. In newer realtime flows, handoffs are represented as function calls, so this supplies their answer.
 
-**Data flow**: Takes `call_id` and `output_text`, reads `self.event_parser`, builds a message through `conversation_function_call_output_message`, then serializes and sends it.
+**Data flow**: It takes a call id and output text, builds the version-appropriate message with a helper, and sends the JSON payload.
 
-**Call relations**: Used by the connection wrapper and higher-level handoff/server-event handlers; it centralizes the v1-vs-v2 output message difference.
+**Call relations**: The connection wrapper, handoff output handling, and realtime server event handling call this. Formatting is delegated to conversation_function_call_output_message.
 
 *Call graph*: calls 2 internal fn (send_json, conversation_function_call_output_message); called by 3 (send_conversation_function_call_output, handle_handoff_output, handle_realtime_server_event).
 
@@ -5786,11 +5816,11 @@ async fn send_conversation_function_call_output(
 async fn send_response_create(&self) -> Result<(), ApiError>
 ```
 
-**Purpose**: Sends a `response.create` command to ask the server to generate a response immediately.
+**Purpose**: Asks the realtime server to create a response now. This is useful when the client wants to trigger output explicitly.
 
-**Data flow**: Constructs `RealtimeOutboundMessage::ResponseCreate` and forwards it to `send_json`.
+**Data flow**: It creates a ResponseCreate outbound message and sends it as JSON.
 
-**Call relations**: Used by higher-level orchestration when an explicit response trigger is needed.
+**Call relations**: The send_create_now flow calls this. It uses send_json like the other writer methods.
 
 *Call graph*: calls 1 internal fn (send_json); called by 1 (send_create_now).
 
@@ -5806,11 +5836,11 @@ async fn send_session_update(
         voice: RealtimeVoice,
 ```
 
-**Purpose**: Builds and sends the initial or updated realtime session configuration.
+**Purpose**: Sends the initial or updated session settings, such as instructions, mode, output type, and voice. This tells the server what kind of realtime session to run.
 
-**Data flow**: Takes `instructions`, `session_mode`, `output_modality`, and `voice` → normalizes session mode for parser compatibility, builds `SessionUpdateSession` via `session_update_session`, wraps it in `RealtimeOutboundMessage::SessionUpdate`, and sends it with `send_json`.
+**Data flow**: It receives the desired settings, normalizes the session mode for the protocol version, builds a session object, wraps it in a SessionUpdate message, and sends it as JSON.
 
-**Call relations**: Called immediately after websocket connection establishment in `RealtimeWebsocketClient::connect_realtime_websocket_url`.
+**Call relations**: Connection setup calls this immediately after connecting. It uses common helpers for protocol-specific session shape and send_json for delivery.
 
 *Call graph*: calls 3 internal fn (send_json, normalized_session_mode, session_update_session).
 
@@ -5821,11 +5851,11 @@ async fn send_session_update(
 async fn close(&self) -> Result<(), ApiError>
 ```
 
-**Purpose**: Idempotently closes the websocket and suppresses benign already-closed conditions.
+**Purpose**: Closes the writer and marks the connection as closed. It is careful to make repeated close calls harmless.
 
-**Data flow**: Checks and sets `is_closed` with `swap(true, Ordering::SeqCst)`; if already closed returns `Ok(())`. Otherwise awaits `self.stream.close()`, converts non-benign websocket close errors into `ApiError::Stream`, and returns success for `ConnectionClosed`/`AlreadyClosed`.
+**Data flow**: It checks and sets a shared closed flag. If this is the first close, it asks the stream to close and converts unexpected WebSocket errors into API errors.
 
-**Call relations**: Invoked by `RealtimeWebsocketConnection::close`. It is the authoritative place where closed-state is latched for both send and receive halves.
+**Call relations**: RealtimeWebsocketConnection::close calls this. It uses the underlying WsStream close command to reach the pump.
 
 *Call graph*: called by 1 (close); 3 external calls (Stream, format!, matches!).
 
@@ -5836,11 +5866,11 @@ async fn close(&self) -> Result<(), ApiError>
 async fn send_json(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiError>
 ```
 
-**Purpose**: Serializes a typed outbound realtime message to JSON and forwards the raw payload.
+**Purpose**: Serializes a high-level outbound realtime message into JSON text. This is the common path for all structured messages sent to the server.
 
-**Data flow**: Takes `message: &RealtimeOutboundMessage` → serializes with `serde_json::to_string`, mapping failures to `ApiError::Stream` → logs the structured message → calls `send_payload(payload)`.
+**Data flow**: It receives a RealtimeOutboundMessage, converts it to a JSON string, logs the request at debug level, and passes the string to send_payload.
 
-**Call relations**: Shared helper behind all typed writer methods so serialization and logging behavior stay consistent.
+**Call relations**: All typed writer send methods use this. It hands the final text to RealtimeWebsocketWriter::send_payload.
 
 *Call graph*: calls 1 internal fn (send_payload); called by 6 (send_audio_frame, send_conversation_function_call_output, send_conversation_handoff_append, send_conversation_item_create, send_response_create, send_session_update); 2 external calls (debug!, to_string).
 
@@ -5851,11 +5881,11 @@ async fn send_json(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiEr
 async fn send_payload(&self, payload: String) -> Result<(), ApiError>
 ```
 
-**Purpose**: Sends a raw JSON text payload over the websocket unless the connection has already been marked closed.
+**Purpose**: Sends a raw text payload over the WebSocket. This is the lowest public writer layer before the WsStream pump.
 
-**Data flow**: Takes `payload: String`, reads `is_closed`; if closed returns `ApiError::Stream("realtime websocket connection is closed")`. Otherwise logs the wire payload, sends `Message::Text(payload.into())` through `WsStream::send`, maps websocket errors into `ApiError::Stream`, and returns `Ok(())`.
+**Data flow**: It checks whether the shared closed flag is set. If open, it wraps the string as a WebSocket text message, sends it through the stream, and returns success or an API error.
 
-**Call relations**: Called by `send_json` and by higher-level code that already has a raw payload string.
+**Call relations**: send_json calls this for normal protocol messages, and realtime event handling can call it when it already has a raw payload.
 
 *Call graph*: called by 2 (send_json, handle_realtime_server_event); 3 external calls (Stream, trace!, Text).
 
@@ -5866,11 +5896,11 @@ async fn send_payload(&self, payload: String) -> Result<(), ApiError>
 async fn next_event(&self) -> Result<Option<RealtimeEvent>, ApiError>
 ```
 
-**Purpose**: Consumes inbound websocket messages until it can return one parsed realtime event, EOF, or an error.
+**Purpose**: Reads incoming WebSocket frames until it finds a supported realtime event. It hides raw WebSocket details from the rest of the application.
 
-**Data flow**: Reads shared `is_closed`; if already closed returns `Ok(None)`. Otherwise loops on `rx_message.recv()`: transport errors mark closed and become `ApiError::Stream`; channel closure marks closed and returns `Ok(None)`. For `Message::Text`, it logs the payload, parses it with `parse_realtime_event`, updates transcript state if parsing succeeds, and returns the event; unsupported text frames are ignored. `Message::Close` marks closed and returns `Ok(None)`. `Message::Binary` is converted into `RealtimeEvent::Error("unexpected binary realtime websocket event")`. Ping/pong/frame messages are ignored.
+**Data flow**: It checks whether the connection is closed, waits for a message from the pump, parses text frames into RealtimeEvent values, updates transcript state, and returns the next event. Errors or close frames mark the connection closed.
 
-**Call relations**: Called by `RealtimeWebsocketConnection::next_event`. It is the receive-side loop that bridges raw websocket frames into typed domain events.
+**Call relations**: RealtimeWebsocketConnection::next_event calls this. It uses parse_realtime_event for protocol parsing and update_active_transcript to keep handoff context current.
 
 *Call graph*: calls 3 internal fn (update_active_transcript, parse_realtime_event, recv); called by 1 (next_event); 7 external calls (Stream, debug!, error!, format!, info!, Error, trace!).
 
@@ -5881,11 +5911,11 @@ async fn next_event(&self) -> Result<Option<RealtimeEvent>, ApiError>
 async fn update_active_transcript(&self, event: &mut RealtimeEvent)
 ```
 
-**Purpose**: Maintains rolling transcript state so handoff events can include the active transcript slice accumulated since the previous handoff.
+**Purpose**: Maintains a running transcript of the current conversation as input and output text arrives. This is especially important because handoff events need a clean slice of recent context.
 
-**Data flow**: Locks `active_transcript` and mutates its flags and `entries` based on the incoming `RealtimeEvent`: speech-start marks the next user delta as a new entry; transcript deltas append or create entries by role; transcript done events replace or create final text; handoff requests append missing user input, copy the transcript slice since `last_handoff_entry_count` into `handoff.active_transcript`, advance the handoff boundary, and force new entries for subsequent turns; response creation forces a new assistant entry. Other event variants leave transcript state unchanged.
+**Data flow**: It receives a parsed event by mutable reference, locks the transcript state, and updates entries based on transcript deltas, completed transcript text, response starts, speech starts, and handoff requests. For handoff requests, it also writes the active transcript back into the event.
 
-**Call relations**: Called only from `RealtimeWebsocketEvents::next_event` after a text payload has been parsed successfully.
+**Call relations**: next_event calls this after parsing each event. It uses small transcript helper functions to append, replace, and avoid duplicate handoff input.
 
 *Call graph*: calls 3 internal fn (append_handoff_input, append_transcript_delta, apply_transcript_done); called by 1 (next_event).
 
@@ -5901,11 +5931,11 @@ fn append_transcript_delta(
 )
 ```
 
-**Purpose**: Appends incremental transcript text to the last matching-role entry or starts a new entry when required.
+**Purpose**: Adds a small piece of transcript text to the running transcript. It joins the piece to the previous entry when it belongs to the same speaker.
 
-**Data flow**: Takes mutable `entries`, `role`, `delta`, and `force_new` → ignores empty deltas; if not forced and the last entry has the same role, appends `delta` to `last_entry.text`; otherwise pushes a new `RealtimeTranscriptEntry { role, text: delta }`.
+**Data flow**: It receives the transcript entries, a role such as user or assistant, a text delta, and a force-new flag. Empty deltas are ignored; otherwise the delta is appended to the last matching role entry or starts a new entry.
 
-**Call relations**: Used by `update_active_transcript` for both input and output transcript delta events.
+**Call relations**: update_active_transcript calls this for input and output transcript delta events.
 
 *Call graph*: called by 1 (update_active_transcript).
 
@@ -5921,11 +5951,11 @@ fn apply_transcript_done(
 )
 ```
 
-**Purpose**: Applies a finalized transcript string by replacing the last matching-role entry or creating a new one.
+**Purpose**: Applies a finished transcript line to the running transcript. This can replace earlier partial text with the final version.
 
-**Data flow**: Takes mutable `entries`, `role`, `text`, and `force_new` → ignores empty text; if not forced and the last entry has the same role, overwrites `last_entry.text`; otherwise pushes a new `RealtimeTranscriptEntry` with the full text.
+**Data flow**: It receives entries, role, final text, and a force-new flag. Empty text is ignored; otherwise it replaces the last same-role entry or appends a new entry.
 
-**Call relations**: Used by `update_active_transcript` for transcript completion events.
+**Call relations**: update_active_transcript calls this when the server reports that input or output transcription is done.
 
 *Call graph*: called by 1 (update_active_transcript).
 
@@ -5936,11 +5966,11 @@ fn apply_transcript_done(
 fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str)
 ```
 
-**Purpose**: Adds the handoff input transcript as a user entry unless it is blank or already present.
+**Purpose**: Adds the handoff input text to the transcript if it is not already present. This prevents the delegated prompt from being lost or duplicated.
 
-**Data flow**: Trims `input`, checks emptiness and duplicate presence via `contains_transcript_entry`, and if neither condition holds pushes a new user `RealtimeTranscriptEntry`.
+**Data flow**: It trims the input, checks for an existing matching user entry, and appends a new user transcript entry only when needed.
 
-**Call relations**: Called from `update_active_transcript` when processing `RealtimeEvent::HandoffRequested`.
+**Call relations**: update_active_transcript calls this when a handoff is requested. It uses contains_transcript_entry to detect duplicates.
 
 *Call graph*: calls 1 internal fn (contains_transcript_entry); called by 1 (update_active_transcript).
 
@@ -5951,11 +5981,11 @@ fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str)
 fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, text: &str) -> bool
 ```
 
-**Purpose**: Checks whether the transcript already contains an entry with the same role and trimmed text.
+**Purpose**: Checks whether the transcript already contains a specific role and text. It is a small guard against duplicate transcript entries.
 
-**Data flow**: Iterates over `entries` and returns `true` if any entry’s `role` matches and `entry.text.trim() == text.trim()`.
+**Data flow**: It receives the transcript list, a role, and text. It scans the entries, comparing roles and trimmed text, and returns true if a match is found.
 
-**Call relations**: Used only by `append_handoff_input` to avoid duplicating user transcript entries around handoff boundaries.
+**Call relations**: append_handoff_input calls this before adding handoff input.
 
 *Call graph*: called by 1 (append_handoff_input); 1 external calls (iter).
 
@@ -5966,11 +5996,11 @@ fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, te
 fn new(provider: Provider) -> Self
 ```
 
-**Purpose**: Constructs a websocket client bound to a specific provider configuration.
+**Purpose**: Creates a realtime WebSocket client tied to a provider configuration. The provider supplies the base URL, headers, retry settings, and other connection details.
 
-**Data flow**: Consumes `provider: Provider` and returns `RealtimeWebsocketClient { provider }`.
+**Data flow**: It receives a Provider and stores it in a new RealtimeWebsocketClient.
 
-**Call relations**: Used by tests and higher-level realtime orchestration before connecting.
+**Call relations**: Production setup and many tests create clients with this method before calling connect or sideband connection methods.
 
 *Call graph*: called by 12 (e2e_connect_and_exchange_events_against_mock_ws_server, realtime_v2_session_update_includes_background_agent_tool_and_handoff_output_item, send_does_not_block_while_next_event_waits_for_inbound_data, transcription_mode_session_update_omits_output_audio_and_instructions, v1_transcription_mode_is_treated_as_conversational, realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_available, realtime_ws_e2e_disconnected_emitted_once, realtime_ws_e2e_ignores_unknown_text_events, realtime_ws_e2e_realtime_v2_parser_emits_handoff_requested, realtime_ws_e2e_send_while_next_event_waits (+2 more)).
 
@@ -5986,11 +6016,11 @@ async fn connect(
     ) -> Result<RealtimeWebsocketConnection, ApiError>
 ```
 
-**Purpose**: Builds the standard realtime websocket URL from the provider base URL and session config, then connects and sends the initial session update.
+**Purpose**: Starts a normal realtime WebSocket session. It builds the correct realtime URL and then opens the connection.
 
-**Data flow**: Reads `config`, `extra_headers`, and `default_headers` plus `self.provider.base_url/query_params` → computes `ws_url` with `websocket_url_from_api_url(...)` → delegates to `connect_realtime_websocket_url(ws_url, config, extra_headers, default_headers)`.
+**Data flow**: It receives session config plus extra and default headers. It turns the provider API URL into a WebSocket URL, then calls connect_realtime_websocket_url and returns the ready connection.
 
-**Call relations**: Primary connection entrypoint for standalone realtime websocket sessions.
+**Call relations**: Application code calls this for standalone realtime sessions. URL building is handled by websocket_url_from_api_url.
 
 *Call graph*: calls 2 internal fn (connect_realtime_websocket_url, websocket_url_from_api_url).
 
@@ -6007,11 +6037,11 @@ async fn connect_webrtc_sideband(
     ) -> Result<Rea
 ```
 
-**Purpose**: Retries joining the websocket sideband for an already-created WebRTC call until success or retry exhaustion.
+**Purpose**: Joins the control WebSocket for an already existing WebRTC realtime call. It retries because the sideband socket may not be ready at the exact moment the call is created.
 
-**Data flow**: Takes `config`, `call_id`, `extra_headers`, and `default_headers` → loops from attempt 0 through `provider.retry.max_attempts`, cloning inputs each time and calling `connect_webrtc_sideband_once` → on retryable failure computes delay with `backoff`, logs a warning, sleeps, and retries; on success returns the connection; after the loop returns a stream error if somehow exhausted.
+**Data flow**: It receives session config, a call id, and headers. It repeatedly calls connect_webrtc_sideband_once, waits with backoff after retryable failures, and returns either the connection or the final error.
 
-**Call relations**: Used when the HTTP realtime call already exists and only the sideband control websocket needs to be joined. It delegates one-shot connection logic to `connect_webrtc_sideband_once`.
+**Call relations**: WebRTC sideband flows call this. Each attempt delegates the real connection work to connect_webrtc_sideband_once.
 
 *Call graph*: calls 1 internal fn (connect_webrtc_sideband_once); 6 external calls (clone, clone, Stream, backoff, sleep, warn!).
 
@@ -6028,11 +6058,11 @@ async fn connect_webrtc_sideband_once(
     ) -> Resul
 ```
 
-**Purpose**: Builds a websocket URL that joins an existing realtime call by `call_id` and performs one connection attempt.
+**Purpose**: Makes one attempt to join a WebRTC sideband WebSocket. It does not retry by itself.
 
-**Data flow**: Reads provider base URL and query params plus `config.event_parser/session_mode` and `call_id` → computes `ws_url` with `websocket_url_from_api_url_for_call` → delegates to `connect_realtime_websocket_url`.
+**Data flow**: It receives config, call id, and headers. It builds a WebSocket URL with the call_id query parameter and calls connect_realtime_websocket_url.
 
-**Call relations**: Called by the retry loop in `connect_webrtc_sideband`.
+**Call relations**: connect_webrtc_sideband calls this inside its retry loop. URL construction is handled by websocket_url_from_api_url_for_call.
 
 *Call graph*: calls 2 internal fn (connect_realtime_websocket_url, websocket_url_from_api_url_for_call); called by 1 (connect_webrtc_sideband).
 
@@ -6049,11 +6079,11 @@ async fn connect_realtime_websocket_url(
     ) -> Resul
 ```
 
-**Purpose**: Performs the actual websocket handshake, header preparation, TLS setup, stream wrapping, and initial `session.update` send.
+**Purpose**: Performs the actual WebSocket connection and sends the first session update. This is the central setup routine shared by normal and sideband connections.
 
-**Data flow**: Takes a concrete `ws_url`, `config`, `extra_headers`, and `default_headers` → ensures rustls provider is installed, converts the URL into a client request, merges provider headers with `extra_headers` plus optional `x-session-id` and `default_headers`, configures TLS connector with optional custom CA support, calls `connect_async_tls_with_config`, wraps the resulting stream with `WsStream::new`, builds a `RealtimeWebsocketConnection`, then sends `writer.send_session_update(config.instructions, config.session_mode, config.output_modality, config.voice)` before returning the connection.
+**Data flow**: It receives a WebSocket URL, session config, and headers. It prepares TLS, builds the request, merges headers, connects, wraps the socket in WsStream and RealtimeWebsocketConnection, sends session.update, and returns the ready connection.
 
-**Call relations**: Shared implementation used by both `connect` and `connect_webrtc_sideband_once`. It is the point where URL construction, header precedence, TLS policy, and initial session bootstrap come together.
+**Call relations**: connect and connect_webrtc_sideband_once both call this. It uses helpers for headers, WebSocket config, TLS setup, stream pumping, and session update sending.
 
 *Call graph*: calls 5 internal fn (new, new, merge_request_headers, websocket_config, with_session_id_header); called by 2 (connect, connect_webrtc_sideband_once); 6 external calls (as_str, maybe_build_rustls_client_config_with_custom_ca, ensure_rustls_crypto_provider, debug!, info!, connect_async_tls_with_config).
 
@@ -6068,11 +6098,11 @@ fn merge_request_headers(
 ) -> HeaderMap
 ```
 
-**Purpose**: Combines provider, extra, and default headers using precedence that mirrors normal HTTP request layering.
+**Purpose**: Combines provider, extra, and default HTTP headers with clear priority. This ensures required defaults are present without overwriting more specific caller choices.
 
-**Data flow**: Clones `provider_headers` into a new map, extends it with `extra_headers` so extras override provider values, then inserts each `default_headers` entry only if that header name is still vacant → returns the merged `HeaderMap`.
+**Data flow**: It starts with provider headers, overlays extra headers, then fills in any missing default headers. The returned map is what gets attached to the WebSocket request.
 
-**Call relations**: Used during websocket connection setup and directly unit-tested for precedence behavior.
+**Call relations**: connect_realtime_websocket_url calls this while building the request, and a test checks the priority rules.
 
 *Call graph*: called by 2 (connect_realtime_websocket_url, merge_request_headers_matches_http_precedence); 1 external calls (clone).
 
@@ -6086,11 +6116,11 @@ fn with_session_id_header(
 ) -> Result<HeaderMap, ApiError>
 ```
 
-**Purpose**: Adds `x-session-id` to a header map when a session ID is present, validating it as an HTTP header value.
+**Purpose**: Adds an x-session-id header when the session config includes a session id. This lets the server associate the WebSocket with a known conversation/session.
 
-**Data flow**: Takes mutable `headers` and `session_id: Option<&str>` → if absent returns headers unchanged; if present inserts `x-session-id` using `HeaderValue::from_str`, mapping invalid values to `ApiError::Stream` → returns the updated map.
+**Data flow**: It receives headers and an optional session id. If absent, it returns the headers unchanged; if present, it validates the value as an HTTP header and inserts it.
 
-**Call relations**: Called by `connect_realtime_websocket_url` before header merging so session IDs are transmitted during websocket handshake.
+**Call relations**: connect_realtime_websocket_url calls this before merging headers.
 
 *Call graph*: called by 1 (connect_realtime_websocket_url); 2 external calls (insert, from_str).
 
@@ -6101,11 +6131,11 @@ fn with_session_id_header(
 fn websocket_config() -> WebSocketConfig
 ```
 
-**Purpose**: Supplies the websocket configuration used for all realtime connections.
+**Purpose**: Provides the WebSocket library configuration used for realtime connections. Currently it uses the library defaults.
 
-**Data flow**: Returns `WebSocketConfig::default()`.
+**Data flow**: It creates and returns a default WebSocketConfig value.
 
-**Call relations**: Used only by `connect_realtime_websocket_url` when invoking `connect_async_tls_with_config`.
+**Call relations**: connect_realtime_websocket_url passes this config into the WebSocket connect call.
 
 *Call graph*: called by 1 (connect_realtime_websocket_url); 1 external calls (default).
 
@@ -6121,11 +6151,11 @@ fn websocket_url_from_api_url(
     _session_mode: RealtimeSession
 ```
 
-**Purpose**: Transforms a provider API base URL into the correct realtime websocket URL, normalizing scheme, path, intent, model, and extra query parameters.
+**Purpose**: Converts a provider API URL into the realtime WebSocket URL the server expects. It fixes the scheme, path, and query parameters.
 
-**Data flow**: Parses `api_url` into `Url`, normalizes its path with `normalize_realtime_path`, rewrites `http/https` to `ws/wss`, rejects unsupported schemes, computes optional intent via `websocket_intent(event_parser)`, and appends `intent`, `model`, and provider `query_params` while skipping duplicate `intent` and duplicate `model` when an explicit model argument is present → returns the final `Url` or `ApiError::Stream`.
+**Data flow**: It parses the API URL, normalizes the path to the realtime endpoint, changes http/https to ws/wss, adds intent/model/extra query parameters when needed, and returns the final URL or an API error.
 
-**Call relations**: Used by `RealtimeWebsocketClient::connect` and extensively unit-tested for path/query shaping across v1 and v2 modes.
+**Call relations**: RealtimeWebsocketClient::connect calls this, and the sideband URL helper builds on it. Several tests cover its edge cases.
 
 *Call graph*: calls 2 internal fn (normalize_realtime_path, websocket_intent); called by 10 (connect, websocket_url_from_http_base_defaults_to_ws_path, websocket_url_from_nested_v1_base_appends_realtime_path, websocket_url_from_v1_base_appends_realtime_path, websocket_url_from_ws_base_defaults_to_ws_path, websocket_url_omits_intent_for_realtime_v2_conversational_mode, websocket_url_omits_intent_for_realtime_v2_transcription_mode, websocket_url_preserves_existing_realtime_path_and_extra_query_params, websocket_url_v1_ignores_transcription_mode, websocket_url_from_api_url_for_call); 3 external calls (parse, Stream, format!).
 
@@ -6141,11 +6171,11 @@ fn websocket_url_from_api_url_for_call(
     call_id
 ```
 
-**Purpose**: Builds a realtime websocket URL that joins an existing call by appending `call_id` to the standard realtime URL.
+**Purpose**: Builds a realtime WebSocket URL that joins an existing call by call id. This is for WebRTC sideband control connections.
 
-**Data flow**: Calls `websocket_url_from_api_url` with `model` forced to `None`, then appends `call_id` as a query pair and returns the resulting `Url`.
+**Data flow**: It first builds the normal realtime WebSocket URL without a model, then appends call_id as a query parameter.
 
-**Call relations**: Used by `connect_webrtc_sideband_once` and unit-tested for sideband join URL formation.
+**Call relations**: connect_webrtc_sideband_once calls this before opening the sideband connection, and a test verifies the resulting URL.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); called by 2 (connect_webrtc_sideband_once, websocket_url_for_call_id_joins_existing_realtime_session).
 
@@ -6156,11 +6186,11 @@ fn websocket_url_from_api_url_for_call(
 fn normalize_realtime_path(url: &mut Url)
 ```
 
-**Purpose**: Normalizes provider base paths so realtime websocket URLs consistently target `/v1/realtime` or an equivalent nested path.
+**Purpose**: Adjusts a base URL path so it points at the realtime endpoint. This lets provider configuration use either a root URL or a /v1 URL.
 
-**Data flow**: Reads `url.path()` and mutates the URL path according to cases: empty or `/` becomes `/v1/realtime`; paths already ending in `/realtime` are preserved; `/realtime/` loses the trailing slash; paths ending in `/v1` or `/v1/` gain `/realtime`.
+**Data flow**: It reads the URL path and rewrites empty, root, /v1, or /v1/ paths to include /realtime. Existing realtime paths are kept, with a trailing slash removed when needed.
 
-**Call relations**: Called only by `websocket_url_from_api_url` as the path-normalization step before scheme and query handling.
+**Call relations**: websocket_url_from_api_url calls this before changing schemes and adding query parameters.
 
 *Call graph*: called by 1 (websocket_url_from_api_url); 3 external calls (path, set_path, format!).
 
@@ -6171,11 +6201,11 @@ fn normalize_realtime_path(url: &mut Url)
 fn parse_session_updated_event()
 ```
 
-**Purpose**: Verifies that a `session.updated` payload is parsed into `RealtimeEvent::SessionUpdated` for v1.
+**Purpose**: Checks that a session.updated JSON payload becomes the expected SessionUpdated event. This protects the basic session-start response parsing.
 
-**Data flow**: Builds a JSON payload string, calls `parse_realtime_event(..., RealtimeEventParser::V1)`, and asserts the exact event value.
+**Data flow**: The test builds sample JSON, parses it with the V1 parser, and compares the parsed event to the expected id and instructions.
 
-**Call relations**: Unit-tests the receive-side parser path used by `RealtimeWebsocketEvents::next_event`.
+**Call relations**: The test runner calls this. It exercises parse_realtime_event from the protocol layer.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6186,11 +6216,11 @@ fn parse_session_updated_event()
 fn parse_audio_delta_event()
 ```
 
-**Purpose**: Checks parsing of v1 output audio delta events into `RealtimeAudioFrame`.
+**Purpose**: Checks that an audio delta event is parsed into an outgoing audio frame for playback. It verifies sample rate, channel count, and audio data.
 
-**Data flow**: Creates a JSON payload with audio metadata, parses it, and asserts the resulting `RealtimeEvent::AudioOut` fields.
+**Data flow**: The test creates JSON with base64 audio and audio shape metadata, parses it, and compares the result to the expected AudioOut event.
 
-**Call relations**: Covers one of the event variants consumed by `next_event`.
+**Call relations**: The test runner calls this to validate protocol parsing used later by RealtimeWebsocketEvents::next_event.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6201,11 +6231,11 @@ fn parse_audio_delta_event()
 fn parse_conversation_item_added_event()
 ```
 
-**Purpose**: Verifies parsing of `conversation.item.added` into `RealtimeEvent::ConversationItemAdded`.
+**Purpose**: Checks that a conversation item added message is preserved as a ConversationItemAdded event. This keeps raw item details available to callers.
 
-**Data flow**: Constructs the payload, parses it with the v1 parser, and compares the resulting JSON item payload.
+**Data flow**: The test supplies JSON containing an item object, parses it, and asserts that the item JSON appears in the event.
 
-**Call relations**: Exercises parser support for conversation item creation notifications.
+**Call relations**: The test runner calls this as part of parser coverage.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6216,11 +6246,11 @@ fn parse_conversation_item_added_event()
 fn parse_conversation_item_done_event()
 ```
 
-**Purpose**: Checks parsing of `conversation.item.done` into a done event carrying the item ID.
+**Purpose**: Checks that a completed conversation item reports its item id. This lets callers know which item finished.
 
-**Data flow**: Builds a payload with an item object, parses it, and asserts `RealtimeEvent::ConversationItemDone { item_id }`.
+**Data flow**: The test builds a conversation.item.done JSON payload, parses it, and verifies the resulting ConversationItemDone item_id.
 
-**Call relations**: Covers one of the terminal item events that `next_event` can emit.
+**Call relations**: The test runner calls this to cover item completion parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6231,11 +6261,11 @@ fn parse_conversation_item_done_event()
 fn parse_handoff_requested_event()
 ```
 
-**Purpose**: Verifies parsing of a v1 handoff request event before transcript enrichment.
+**Purpose**: Checks that a handoff request event is parsed correctly. This is important because handoffs start background-agent work.
 
-**Data flow**: Creates a handoff JSON payload, parses it, and asserts the resulting `RealtimeEvent::HandoffRequested` with empty `active_transcript`.
+**Data flow**: The test builds JSON with handoff id, item id, and input transcript, parses it, and expects a HandoffRequested event with an empty active transcript before event-layer enrichment.
 
-**Call relations**: Tests the raw parser output that `update_active_transcript` later augments.
+**Call relations**: The test runner calls this. Later runtime code may add active transcript data in update_active_transcript.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6246,11 +6276,11 @@ fn parse_handoff_requested_event()
 fn parse_input_transcript_delta_event()
 ```
 
-**Purpose**: Checks parsing of v1 input transcript delta events.
+**Purpose**: Checks that an input transcript fragment is parsed as a user transcript delta. This supports live transcription while the user speaks.
 
-**Data flow**: Builds a payload with `delta`, parses it, and asserts `RealtimeEvent::InputTranscriptDelta`.
+**Data flow**: The test creates a JSON delta, parses it, and compares it to an InputTranscriptDelta event.
 
-**Call relations**: Covers one of the transcript events that drive active transcript accumulation.
+**Call relations**: The test runner calls this to cover V1 transcript delta parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6261,11 +6291,11 @@ fn parse_input_transcript_delta_event()
 fn parse_v1_input_audio_transcription_delta_event()
 ```
 
-**Purpose**: Verifies that the alternate v1 input-audio transcription delta shape maps to the same input transcript delta event.
+**Purpose**: Checks that the V1 input audio transcription delta event name is accepted. This protects compatibility with a more specific server event shape.
 
-**Data flow**: Creates the alternate payload, parses it, and asserts the normalized event.
+**Data flow**: The test supplies JSON with item metadata and a transcript delta, parses it, and expects the same InputTranscriptDelta event type.
 
-**Call relations**: Ensures parser compatibility with multiple server event spellings.
+**Call relations**: The test runner calls this as part of parser compatibility coverage.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6276,11 +6306,11 @@ fn parse_v1_input_audio_transcription_delta_event()
 fn parse_v1_input_audio_transcription_completed_event()
 ```
 
-**Purpose**: Checks parsing of completed input-audio transcription into `InputTranscriptDone`.
+**Purpose**: Checks that a completed V1 input audio transcription becomes an InputTranscriptDone event. This confirms final transcript text replaces or completes partial text.
 
-**Data flow**: Builds the payload with `transcript`, parses it, and asserts the done event.
+**Data flow**: The test builds completion JSON with a transcript field, parses it, and compares the result to the expected done event.
 
-**Call relations**: Covers transcript-finalization behavior later consumed by transcript state updates.
+**Call relations**: The test runner calls this to verify final input transcript parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6291,11 +6321,11 @@ fn parse_v1_input_audio_transcription_completed_event()
 fn parse_v1_input_transcript_turn_marked_event()
 ```
 
-**Purpose**: Verifies that v1 turn-marked input transcript events are normalized into `InputTranscriptDone`.
+**Purpose**: Checks that a V1 turn-marked transcript is treated as completed input text. This covers another server way of saying the user's turn text is finalized.
 
-**Data flow**: Creates the payload, parses it, and asserts the normalized done event.
+**Data flow**: The test builds a turn_marked JSON payload, parses it, and expects InputTranscriptDone with the transcript text.
 
-**Call relations**: Tests another alternate server event shape handled by the parser.
+**Call relations**: The test runner calls this to guard V1 event-name compatibility.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6306,11 +6336,11 @@ fn parse_v1_input_transcript_turn_marked_event()
 fn parse_output_transcript_delta_event()
 ```
 
-**Purpose**: Checks parsing of v1 output transcript deltas.
+**Purpose**: Checks that assistant transcript fragments are parsed correctly. This supports displaying or tracking the response as it streams.
 
-**Data flow**: Builds a payload with output `delta`, parses it, and asserts `RealtimeEvent::OutputTranscriptDelta`.
+**Data flow**: The test creates output transcript delta JSON, parses it, and expects OutputTranscriptDelta.
 
-**Call relations**: Covers assistant transcript accumulation input for `update_active_transcript`.
+**Call relations**: The test runner calls this to cover assistant transcript parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6321,11 +6351,11 @@ fn parse_output_transcript_delta_event()
 fn parse_v1_output_audio_transcript_delta_event()
 ```
 
-**Purpose**: Verifies that v1 output-audio transcript delta events normalize to output transcript deltas.
+**Purpose**: Checks that a V1 output audio transcript delta maps to an assistant transcript delta. This keeps audio-response captions working.
 
-**Data flow**: Creates the payload, parses it, and asserts the normalized event.
+**Data flow**: The test builds response.output_audio_transcript.delta JSON, parses it, and compares the result to OutputTranscriptDelta.
 
-**Call relations**: Ensures parser compatibility with alternate output transcript event names.
+**Call relations**: The test runner calls this as parser compatibility coverage.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6336,11 +6366,11 @@ fn parse_v1_output_audio_transcript_delta_event()
 fn parse_v1_output_audio_transcript_done_event()
 ```
 
-**Purpose**: Checks parsing of v1 output-audio transcript completion events.
+**Purpose**: Checks that a completed V1 output audio transcript maps to final assistant text. This protects final caption handling for spoken responses.
 
-**Data flow**: Builds the payload with `transcript`, parses it, and asserts `OutputTranscriptDone`.
+**Data flow**: The test creates JSON with a final transcript, parses it, and expects OutputTranscriptDone.
 
-**Call relations**: Covers assistant transcript finalization.
+**Call relations**: The test runner calls this to verify final output transcript parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6351,11 +6381,11 @@ fn parse_v1_output_audio_transcript_done_event()
 fn parse_v1_item_done_output_text_event()
 ```
 
-**Purpose**: Verifies that a v1 assistant message item completion is recognized as `ConversationItemDone`.
+**Purpose**: Checks that a completed V1 assistant message with output text is still reported as an item completion. The parser does not turn this particular payload into transcript text here.
 
-**Data flow**: Creates a payload whose item content contains multiple `output_text` fragments, parses it, and asserts the done event with the item ID.
+**Data flow**: The test supplies a message item with two output_text parts, parses it, and expects ConversationItemDone with the item id.
 
-**Call relations**: Tests parser handling of completed assistant message items.
+**Call relations**: The test runner calls this to document and protect item-done behavior.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6366,11 +6396,11 @@ fn parse_v1_item_done_output_text_event()
 fn parse_realtime_v2_handoff_tool_call_event()
 ```
 
-**Purpose**: Checks that a v2 function-call item for `background_agent` is interpreted as a handoff request.
+**Purpose**: Checks that a Realtime V2 background_agent function call becomes a handoff request. This is how newer realtime sessions ask Codex to delegate work.
 
-**Data flow**: Builds a v2 `conversation.item.done` payload with tool-call arguments, parses it with `RealtimeEventParser::RealtimeV2`, and asserts `HandoffRequested`.
+**Data flow**: The test builds a function_call item with JSON arguments containing a prompt, parses it with the RealtimeV2 parser, and expects HandoffRequested.
 
-**Call relations**: Covers v2-specific parser semantics used by `next_event`.
+**Call relations**: The test runner calls this to verify V2 tool-call parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6381,11 +6411,11 @@ fn parse_realtime_v2_handoff_tool_call_event()
 fn parse_realtime_v2_noop_tool_call_event()
 ```
 
-**Purpose**: Verifies that the v2 `remain_silent` tool call becomes `RealtimeEvent::NoopRequested`.
+**Purpose**: Checks that a Realtime V2 remain_silent function call becomes a no-op request. This lets the model explicitly choose not to speak.
 
-**Data flow**: Creates the payload, parses it with the v2 parser, and asserts the noop event.
+**Data flow**: The test builds a remain_silent function_call item, parses it, and expects NoopRequested with the call and item ids.
 
-**Call relations**: Tests another v2-specific tool-call interpretation.
+**Call relations**: The test runner calls this to cover a special V2 tool call.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6396,11 +6426,11 @@ fn parse_realtime_v2_noop_tool_call_event()
 fn parse_realtime_v2_input_audio_transcription_delta_event()
 ```
 
-**Purpose**: Checks parsing of v2 input-audio transcription deltas.
+**Purpose**: Checks that V2 input transcription deltas are parsed as input transcript deltas. This keeps live user transcription working in the V2 protocol.
 
-**Data flow**: Builds the payload, parses it, and asserts `InputTranscriptDelta`.
+**Data flow**: The test supplies V2-style transcription delta JSON, parses it, and checks for InputTranscriptDelta.
 
-**Call relations**: Covers transcript accumulation input for v2 sessions.
+**Call relations**: The test runner calls this as part of V2 parser coverage.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6411,11 +6441,11 @@ fn parse_realtime_v2_input_audio_transcription_delta_event()
 fn parse_realtime_v2_output_audio_transcript_done_event()
 ```
 
-**Purpose**: Verifies parsing of v2 output-audio transcript completion events.
+**Purpose**: Checks that a V2 completed output audio transcript becomes final assistant text. This protects spoken-response transcript completion.
 
-**Data flow**: Creates the payload, parses it, and asserts `OutputTranscriptDone`.
+**Data flow**: The test builds response.output_audio_transcript.done JSON, parses it with the V2 parser, and expects OutputTranscriptDone.
 
-**Call relations**: Tests one of the v2 transcript completion variants.
+**Call relations**: The test runner calls this to cover V2 output transcript parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6426,11 +6456,11 @@ fn parse_realtime_v2_output_audio_transcript_done_event()
 fn parse_realtime_v2_output_text_done_event()
 ```
 
-**Purpose**: Checks that v2 `response.output_text.done` is normalized into `OutputTranscriptDone`.
+**Purpose**: Checks that a V2 completed output text event becomes final assistant text. This covers text-output sessions as well as audio-caption sessions.
 
-**Data flow**: Builds the payload, parses it, and asserts the normalized event.
+**Data flow**: The test creates response.output_text.done JSON, parses it, and expects OutputTranscriptDone.
 
-**Call relations**: Ensures the parser treats text-only completion as transcript completion.
+**Call relations**: The test runner calls this to verify V2 text completion parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6441,11 +6471,11 @@ fn parse_realtime_v2_output_text_done_event()
 fn parse_realtime_v2_conversation_item_created_event()
 ```
 
-**Purpose**: Verifies parsing of v2 `conversation.item.created` into `ConversationItemAdded`.
+**Purpose**: Checks that a V2 conversation.item.created payload becomes a ConversationItemAdded event. This keeps item creation notifications available.
 
-**Data flow**: Creates the payload, parses it, and asserts the resulting JSON item payload.
+**Data flow**: The test builds JSON with a user message item, parses it, and expects the item JSON inside ConversationItemAdded.
 
-**Call relations**: Covers v2 item-added notifications.
+**Call relations**: The test runner calls this to cover V2 item creation parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6456,11 +6486,11 @@ fn parse_realtime_v2_conversation_item_created_event()
 fn parse_realtime_v2_item_done_output_text_event()
 ```
 
-**Purpose**: Checks that a completed v2 assistant message item is recognized as `ConversationItemDone`.
+**Purpose**: Checks that V2 item completion for an assistant message reports the item id. This matches the V1 behavior tested separately.
 
-**Data flow**: Builds the payload with assistant output text content, parses it, and asserts the done event.
+**Data flow**: The test builds a completed assistant message with output text parts, parses it with the V2 parser, and expects ConversationItemDone.
 
-**Call relations**: Tests v2 item completion parsing.
+**Call relations**: The test runner calls this to protect V2 item-done behavior.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6471,11 +6501,11 @@ fn parse_realtime_v2_item_done_output_text_event()
 fn parse_realtime_v2_output_audio_delta_defaults_audio_shape()
 ```
 
-**Purpose**: Verifies that v2 output audio deltas default missing audio shape fields to 24 kHz mono with unknown sample count.
+**Purpose**: Checks that a V2 audio delta without explicit audio metadata gets safe default audio settings. This prevents missing fields from breaking playback handling.
 
-**Data flow**: Creates a minimal payload, parses it, and asserts the defaulted `RealtimeAudioFrame` fields.
+**Data flow**: The test supplies JSON with only an audio delta, parses it, and expects AudioOut with 24 kHz mono defaults.
 
-**Call relations**: Covers parser defaulting behavior for sparse v2 audio events.
+**Call relations**: The test runner calls this to verify fallback behavior in audio parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6486,11 +6516,11 @@ fn parse_realtime_v2_output_audio_delta_defaults_audio_shape()
 fn parse_realtime_v2_response_audio_delta_with_item_id()
 ```
 
-**Purpose**: Checks parsing of the alternate v2 `response.audio.delta` event including `item_id`.
+**Purpose**: Checks that a V2 response audio delta keeps its item id. This lets callers associate audio chunks with the response item they belong to.
 
-**Data flow**: Builds the payload, parses it, and asserts the resulting `AudioOut` frame with `item_id` populated.
+**Data flow**: The test builds response.audio.delta JSON with an item_id, parses it, and expects AudioOut containing that item id.
 
-**Call relations**: Tests another accepted v2 audio event spelling.
+**Call relations**: The test runner calls this to cover item-linked audio parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6501,11 +6531,11 @@ fn parse_realtime_v2_response_audio_delta_with_item_id()
 fn parse_realtime_v2_speech_started_event()
 ```
 
-**Purpose**: Verifies parsing of v2 speech-start notifications.
+**Purpose**: Checks that V2 speech-start events are parsed with their optional item id. This helps the transcript state know when a new user utterance begins.
 
-**Data flow**: Creates the payload, parses it, and asserts `RealtimeEvent::InputAudioSpeechStarted`.
+**Data flow**: The test builds input_audio_buffer.speech_started JSON, parses it, and expects InputAudioSpeechStarted with the item id.
 
-**Call relations**: Covers the event that flips `new_input_entry` in transcript state.
+**Call relations**: The test runner calls this to verify speech-start parsing used by update_active_transcript.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6516,11 +6546,11 @@ fn parse_realtime_v2_speech_started_event()
 fn parse_realtime_v2_response_cancelled_event()
 ```
 
-**Purpose**: Checks parsing of v2 response cancellation events.
+**Purpose**: Checks that V2 response cancellation events include the response id when present. This lets callers identify which response stopped.
 
-**Data flow**: Builds the payload, parses it, and asserts `RealtimeEvent::ResponseCancelled`.
+**Data flow**: The test creates response.cancelled JSON, parses it, and expects RealtimeResponseCancelled with the response id.
 
-**Call relations**: Tests one of the non-transcript control events emitted by `next_event`.
+**Call relations**: The test runner calls this to cover cancellation parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6531,11 +6561,11 @@ fn parse_realtime_v2_response_cancelled_event()
 fn parse_realtime_v2_response_done_event()
 ```
 
-**Purpose**: Verifies parsing of v2 response completion events.
+**Purpose**: Checks that V2 response.done parses as a response completion event even when output contains a function call. This keeps completion signaling separate from tool-call extraction here.
 
-**Data flow**: Creates a payload with response output, parses it, and asserts `RealtimeEvent::ResponseDone`.
+**Data flow**: The test builds response.done JSON with a function_call output item, parses it, and expects ResponseDone.
 
-**Call relations**: Covers another control event variant.
+**Call relations**: The test runner calls this to document response-done parsing behavior.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6546,11 +6576,11 @@ fn parse_realtime_v2_response_done_event()
 fn parse_realtime_v2_response_created_event()
 ```
 
-**Purpose**: Checks parsing of v2 response creation events.
+**Purpose**: Checks that V2 response.created events include the response id. This helps track when a new server response begins.
 
-**Data flow**: Builds the payload, parses it, and asserts `RealtimeEvent::ResponseCreated`.
+**Data flow**: The test creates response.created JSON, parses it, and expects ResponseCreated with the id.
 
-**Call relations**: Tests the event that causes transcript state to force a new assistant entry.
+**Call relations**: The test runner calls this to cover response-created parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -6561,11 +6591,11 @@ fn parse_realtime_v2_response_created_event()
 fn merge_request_headers_matches_http_precedence()
 ```
 
-**Purpose**: Verifies that provider headers win over defaults, extra headers win over provider headers, and defaults fill only missing names.
+**Purpose**: Checks that header merging gives extra headers priority over provider headers, and provider headers priority over defaults. This prevents accidental overwrites of important request headers.
 
-**Data flow**: Constructs three header maps, calls `merge_request_headers`, and asserts the resulting values for overlapping and default-only headers.
+**Data flow**: The test builds three header maps with overlapping keys, calls merge_request_headers, and asserts the final values match the intended priority.
 
-**Call relations**: Directly unit-tests the header-merging helper used during websocket connection setup.
+**Call relations**: The test runner calls this to validate the helper used during WebSocket connection setup.
 
 *Call graph*: calls 1 internal fn (merge_request_headers); 3 external calls (new, from_static, assert_eq!).
 
@@ -6576,11 +6606,11 @@ fn merge_request_headers_matches_http_precedence()
 fn websocket_url_from_http_base_defaults_to_ws_path()
 ```
 
-**Purpose**: Checks that an HTTP base URL is converted to `ws://.../v1/realtime` with the v1 intent query.
+**Purpose**: Checks that an http base URL becomes a ws realtime URL with the default realtime path. This supports local or non-TLS test providers.
 
-**Data flow**: Calls `websocket_url_from_api_url` with an HTTP base and asserts the resulting URL string.
+**Data flow**: The test passes an http URL into websocket_url_from_api_url and compares the string result to the expected ws URL.
 
-**Call relations**: Tests URL normalization logic used by `RealtimeWebsocketClient::connect`.
+**Call relations**: The test runner calls this to protect URL-building behavior used by RealtimeWebsocketClient::connect.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6591,11 +6621,11 @@ fn websocket_url_from_http_base_defaults_to_ws_path()
 fn websocket_url_from_ws_base_defaults_to_ws_path()
 ```
 
-**Purpose**: Verifies that an existing websocket base URL keeps its scheme and gains the realtime path plus model query.
+**Purpose**: Checks that an existing wss base URL gets the realtime path and model query parameter. This supports providers that already supply a WebSocket scheme.
 
-**Data flow**: Calls `websocket_url_from_api_url` with a `wss://` base and asserts the final URL.
+**Data flow**: The test builds a URL with a model value and verifies the resulting wss realtime URL.
 
-**Call relations**: Covers scheme-preservation behavior in URL construction.
+**Call relations**: The test runner calls this to cover WebSocket-scheme inputs to websocket_url_from_api_url.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6606,11 +6636,11 @@ fn websocket_url_from_ws_base_defaults_to_ws_path()
 fn websocket_url_from_v1_base_appends_realtime_path()
 ```
 
-**Purpose**: Checks that a `/v1` API base gets `/realtime` appended.
+**Purpose**: Checks that a standard /v1 API URL becomes /v1/realtime. This lets normal OpenAI-style base URLs work without special configuration.
 
-**Data flow**: Builds the URL from `https://api.openai.com/v1` and asserts the expected `wss://.../v1/realtime?...` string.
+**Data flow**: The test passes a /v1 HTTPS URL and model, then asserts the final wss URL includes /v1/realtime and query parameters.
 
-**Call relations**: Tests one branch of `normalize_realtime_path`.
+**Call relations**: The test runner calls this to protect path normalization.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6621,11 +6651,11 @@ fn websocket_url_from_v1_base_appends_realtime_path()
 fn websocket_url_from_nested_v1_base_appends_realtime_path()
 ```
 
-**Purpose**: Verifies path normalization for nested `/openai/v1` style bases.
+**Purpose**: Checks that a nested path ending in /v1 also gets /realtime appended. This supports proxy or gateway URLs with prefixes.
 
-**Data flow**: Calls `websocket_url_from_api_url` with a nested path and asserts the resulting URL.
+**Data flow**: The test passes a nested /openai/v1 URL, builds the WebSocket URL, and checks the expected nested /realtime path.
 
-**Call relations**: Covers another `normalize_realtime_path` branch.
+**Call relations**: The test runner calls this to cover normalize_realtime_path through websocket_url_from_api_url.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6636,11 +6666,11 @@ fn websocket_url_from_nested_v1_base_appends_realtime_path()
 fn websocket_url_preserves_existing_realtime_path_and_extra_query_params()
 ```
 
-**Purpose**: Checks that an existing realtime path and existing query string are preserved while intent/model/provider query params are appended appropriately.
+**Purpose**: Checks that an already realtime URL keeps its path and existing query, while adding allowed extra query parameters. It also verifies duplicate intent values are skipped.
 
-**Data flow**: Calls `websocket_url_from_api_url` with a URL already containing `?foo=bar` and provider query params, then asserts the final URL string.
+**Data flow**: The test supplies a realtime URL with an existing query and provider query params, builds the final URL, and compares the exact result.
 
-**Call relations**: Tests query-merging behavior in URL construction.
+**Call relations**: The test runner calls this to validate query merging behavior in websocket_url_from_api_url.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 2 external calls (from, assert_eq!).
 
@@ -6651,11 +6681,11 @@ fn websocket_url_preserves_existing_realtime_path_and_extra_query_params()
 fn websocket_url_v1_ignores_transcription_mode()
 ```
 
-**Purpose**: Verifies that v1 URL shaping ignores transcription mode and still uses the quicksilver intent.
+**Purpose**: Checks that the older V1 parser still uses the V1 intent even if transcription mode is requested. This documents compatibility behavior.
 
-**Data flow**: Builds a URL with parser `V1` and session mode `Transcription`, then asserts the same URL shape as conversational mode.
+**Data flow**: The test builds a URL using V1 plus transcription mode and expects the same quicksilver intent URL as conversational mode.
 
-**Call relations**: Reflects the v1 compatibility rule encoded by `websocket_intent` and session-mode normalization.
+**Call relations**: The test runner calls this to protect V1-specific URL behavior.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6666,11 +6696,11 @@ fn websocket_url_v1_ignores_transcription_mode()
 fn websocket_url_omits_intent_for_realtime_v2_conversational_mode()
 ```
 
-**Purpose**: Checks that v2 conversational URLs omit the legacy `intent` query parameter.
+**Purpose**: Checks that Realtime V2 conversational URLs do not add the older intent query parameter. This prevents sending stale protocol hints to V2 servers.
 
-**Data flow**: Calls `websocket_url_from_api_url` with parser `RealtimeV2`, existing query params, and a model, then asserts the final URL lacks `intent`.
+**Data flow**: The test supplies a URL and extra query params, builds a V2 URL with a model, and verifies intent is omitted while other values remain.
 
-**Call relations**: Tests the v2 branch of `websocket_intent` handling.
+**Call relations**: The test runner calls this to validate websocket_intent behavior as used by websocket_url_from_api_url.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 2 external calls (from, assert_eq!).
 
@@ -6681,11 +6711,11 @@ fn websocket_url_omits_intent_for_realtime_v2_conversational_mode()
 fn websocket_url_omits_intent_for_realtime_v2_transcription_mode()
 ```
 
-**Purpose**: Verifies that v2 transcription URLs omit both intent and model when none is supplied.
+**Purpose**: Checks that Realtime V2 transcription URLs can be plain realtime URLs with no intent. This matches the newer protocol shape.
 
-**Data flow**: Builds the URL and asserts the bare `wss://.../v1/realtime` result.
+**Data flow**: The test builds a V2 transcription URL from a base HTTPS URL and verifies the final wss realtime URL has no query string.
 
-**Call relations**: Covers the minimal v2 URL case.
+**Call relations**: The test runner calls this to guard V2 transcription URL behavior.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url); 1 external calls (assert_eq!).
 
@@ -6696,11 +6726,11 @@ fn websocket_url_omits_intent_for_realtime_v2_transcription_mode()
 fn websocket_url_for_call_id_joins_existing_realtime_session()
 ```
 
-**Purpose**: Checks that sideband websocket URLs append `call_id` to join an existing realtime call.
+**Purpose**: Checks that sideband URL construction appends call_id. This is how the WebSocket joins an existing WebRTC session.
 
-**Data flow**: Calls `websocket_url_from_api_url_for_call` and asserts the resulting URL string.
+**Data flow**: The test calls websocket_url_from_api_url_for_call with a call id and compares the final URL to the expected call_id query URL.
 
-**Call relations**: Tests the helper used by `connect_webrtc_sideband_once`.
+**Call relations**: The test runner calls this to validate the helper used by connect_webrtc_sideband_once.
 
 *Call graph*: calls 1 internal fn (websocket_url_from_api_url_for_call); 1 external calls (assert_eq!).
 
@@ -6711,11 +6741,11 @@ fn websocket_url_for_call_id_joins_existing_realtime_session()
 async fn e2e_connect_and_exchange_events_against_mock_ws_server()
 ```
 
-**Purpose**: End-to-end test that validates websocket connection setup, initial `session.update`, outbound message sending, inbound event parsing, transcript accumulation, handoff transcript slicing, and clean close against a mock server.
+**Purpose**: Runs a small end-to-end test against a mock WebSocket server. It proves connection setup, initial session.update, sends, receives, and handoff transcript enrichment work together.
 
-**Data flow**: Starts a local websocket server, accepts a connection, inspects the first four client messages, sends several event payloads back, then the client connects, consumes events via `next_event`, sends audio/text/handoff output, asserts parsed events including enriched `active_transcript`, and closes.
+**Data flow**: The test starts a local server, connects a client, checks outgoing JSON messages, sends server events back, reads parsed events, and verifies the final handoff event includes recent transcript entries.
 
-**Call relations**: Exercises the full stack from `RealtimeWebsocketClient::connect` through `WsStream`, writer methods, parser dispatch, and transcript-state maintenance.
+**Call relations**: The test runner calls this. It exercises RealtimeWebsocketClient::new, connect, writer methods, next_event, transcript tracking, and close as one flow.
 
 *Call graph*: calls 1 internal fn (new); 12 external calls (from_millis, from_secs, new, new, bind, assert_eq!, format!, json!, from_str, spawn (+2 more)).
 
@@ -6726,11 +6756,11 @@ async fn e2e_connect_and_exchange_events_against_mock_ws_server()
 async fn realtime_v2_session_update_includes_background_agent_tool_and_handoff_output_item()
 ```
 
-**Purpose**: End-to-end test that verifies v2 session updates include the expected audio config and tool definitions, and that outbound text and function-call output use v2 message shapes.
+**Purpose**: Checks that Realtime V2 session setup includes the expected audio settings and tools, and that handoff output is sent as a function-call output item. This protects the V2 tool-based handoff contract.
 
-**Data flow**: Runs a mock websocket server that inspects the initial `session.update` JSON and subsequent `conversation.item.create` messages, while the client connects with `RealtimeV2`, consumes `session.updated`, sends a text item and function-call output, then closes.
+**Data flow**: The test runs a mock server, inspects the first session.update message, sends a session.updated event, then checks client-sent text and function-call output messages.
 
-**Call relations**: Covers v2-specific behavior in `send_session_update`, `send_conversation_item_create`, and `send_conversation_function_call_output`.
+**Call relations**: The test runner calls this to exercise connect, send_conversation_item_create, send_conversation_function_call_output, and close in a V2 session.
 
 *Call graph*: calls 1 internal fn (new); 12 external calls (from_millis, from_secs, new, new, bind, assert_eq!, format!, json!, from_str, spawn (+2 more)).
 
@@ -6741,11 +6771,11 @@ async fn realtime_v2_session_update_includes_background_agent_tool_and_handoff_o
 async fn transcription_mode_session_update_omits_output_audio_and_instructions()
 ```
 
-**Purpose**: End-to-end test that verifies v2 transcription mode sends a stripped-down session update without instructions, output audio, or tools.
+**Purpose**: Checks that V2 transcription mode configures input transcription only, without output audio, instructions, or tools. This prevents transcription-only sessions from behaving like full conversations.
 
-**Data flow**: Mock server inspects the first client message, sends `session.updated`, then expects an audio append. The client connects in transcription mode, asserts the parsed session-updated event, sends audio, and closes.
+**Data flow**: The test starts a mock server, connects with transcription mode, verifies the initial session.update fields, sends a session.updated event, and confirms audio append still works.
 
-**Call relations**: Exercises the transcription branch of v2 session construction and confirms the connection bootstrap still works.
+**Call relations**: The test runner calls this to cover connect and send_audio_frame behavior for transcription mode.
 
 *Call graph*: calls 1 internal fn (new); 13 external calls (from_millis, from_secs, new, new, bind, assert!, assert_eq!, format!, json!, from_str (+3 more)).
 
@@ -6756,11 +6786,11 @@ async fn transcription_mode_session_update_omits_output_audio_and_instructions()
 async fn v1_transcription_mode_is_treated_as_conversational()
 ```
 
-**Purpose**: End-to-end test that confirms v1 transcription mode is normalized to conversational/quicksilver session behavior.
+**Purpose**: Checks that V1 treats requested transcription mode as the older conversational quicksilver session. This documents the compatibility fallback.
 
-**Data flow**: Mock server inspects the initial session update for quicksilver type, instructions, and output voice, sends `session.updated`, and the client connects, consumes the event, and closes.
+**Data flow**: The test connects to a mock server using V1 plus transcription mode, inspects the session.update message, receives session.updated, and closes.
 
-**Call relations**: Validates the v1 normalization rule applied by `normalized_session_mode` and v1 session construction.
+**Call relations**: The test runner calls this to verify normalized session mode behavior through the real connection path.
 
 *Call graph*: calls 1 internal fn (new); 13 external calls (from_millis, from_secs, new, new, bind, assert!, assert_eq!, format!, json!, from_str (+3 more)).
 
@@ -6771,11 +6801,11 @@ async fn v1_transcription_mode_is_treated_as_conversational()
 async fn send_does_not_block_while_next_event_waits_for_inbound_data()
 ```
 
-**Purpose**: Regression test proving that outbound sends can complete while `next_event` is concurrently blocked waiting for inbound frames.
+**Purpose**: Checks that sending can proceed while another task is waiting for incoming data. This protects the design goal of the WebSocket pump.
 
-**Data flow**: Starts a mock server that waits for `session.update` and an audio append before sending `session.updated`. The client connects, then runs `send_audio_frame` under a timeout concurrently with `next_event` using `tokio::join!`, asserting the send completes promptly and the event is later received.
+**Data flow**: The test connects to a mock server, starts sending audio and waiting for the next event at the same time, verifies the send completes quickly, then verifies the later incoming event is parsed.
 
-**Call relations**: Specifically validates the concurrency design of `WsStream::new` and the pump-task split between send and receive paths.
+**Call relations**: The test runner calls this to exercise WsStream::new's concurrent pump behavior through the public connection API.
 
 *Call graph*: calls 1 internal fn (new); 13 external calls (from_millis, from_secs, new, new, bind, assert_eq!, format!, json!, from_str, join! (+3 more)).
 
@@ -6785,11 +6815,15 @@ These files execute live realtime conversations by bridging the websocket/WebRTC
 
 ### `core/src/realtime_conversation.rs`
 
-`orchestration` · `startup, request handling, realtime session main loop, shutdown`
+`orchestration` · `request handling and realtime session main loop`
 
-This file owns the full lifecycle of a realtime conversation inside a `Session`. The central type, `RealtimeConversationManager`, stores an optional `ConversationState` behind a `tokio::sync::Mutex`; that state contains bounded async channels for inbound microphone audio and text, a `RealtimeHandoffState` for background-agent output, task handles for the transport input loop and event fanout loop, and an `Arc<AtomicBool>` used as the session identity/liveness token. Starting a conversation first tears down any previous state, then builds a `RealtimeSessionConfig`, chooses websocket vs WebRTC sideband transport, opens the connection, and spawns the input task that multiplexes four sources with `tokio::select!`: user text, user audio, handoff output, and server events.
+This file is the control room for realtime conversations. A client may start a live session, stream microphone audio, send typed text, receive audio or transcript events back, and stop the session. Without this file, the project could still do normal request/response work, but it would not have a working live conversation path.
 
-The file also encodes version-specific behavior. `RealtimeSessionKind::V1` and `V2` differ in allowed output modality, voice set, text prefixing, handoff semantics, and whether `response.create` must be queued through `RealtimeResponseCreateQueue` to avoid racing an already-active response. For V2, assistant/background text is prefixed with `[BACKEND] ` or `[USER] ` and truncated to token budgets before being injected back into the conversation. Incoming server events update output-audio truncation state, acknowledge noop or handoff function calls, route handoff requests back into the session as XML-wrapped delegation text, and forward all realtime events to the client subscription. Error handling is intentionally defensive: transport/API failures are mapped to protocol errors, queue overflow drops audio instead of blocking, stale handoff updates are ignored, and shutdown can either abort or detach the fanout task depending on whether closure is locally requested or transport-driven.
+The main object, `RealtimeConversationManager`, keeps the current conversation state behind a mutex, which is a lock that prevents two tasks from changing the state at the same time. Starting a conversation creates bounded queues for incoming audio, text, background-agent output, and outgoing realtime events. Think of these queues like labeled inbox trays: user audio goes in one tray, typed text in another, and model events come out through another.
+
+The file supports two transports. A plain WebSocket connection sends and receives everything directly. A WebRTC start can also create a sideband WebSocket connection, which is a helper channel used alongside the media call. A background task watches all inputs at once and forwards them to the realtime API.
+
+A major feature here is “handoff”: when the realtime model asks the background Codex agent to do work, this file routes that request into the normal Codex session, then feeds the agent’s progress or final answer back into the realtime conversation. It also contains small safety rules, such as dropping audio if the input queue is full, adding clear prefixes to realtime text in v2 sessions, truncating long backend output, and avoiding overlapping realtime responses.
 
 #### Function details
 
@@ -6804,11 +6838,11 @@ async fn request_create(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Queues or immediately sends a default `response.create` request for realtime v2 sessions. It prevents overlapping default responses by deferring creation when one is already active.
+**Purpose**: Asks the realtime server to start a new model response, but only if another default response is not already active. If a response is already running, it records that a new one should be sent later.
 
-**Data flow**: Reads and mutates the queue's `active_default_response` and `pending_create` flags, plus uses the provided `RealtimeWebsocketWriter`, `Sender<RealtimeEvent>`, and human-readable `reason`. If a response is active it only marks `pending_create = true`; otherwise it forwards to `send_create_now` and returns that result.
+**Data flow**: It receives the websocket writer, the event output queue, and a short reason string for logging. If a response is already active, it flips a pending flag and returns. Otherwise it immediately sends the create request and reports any failure through the event queue.
 
-**Call relations**: Used from `handle_handoff_output` after standalone handoff completion paths and from `handle_realtime_server_event` when a handoff-steering acknowledgement should trigger a follow-up response. It is the public gate that centralizes the race-avoidance policy before delegating to `send_create_now`.
+**Call relations**: When handoff output or a server event means the model should answer again, `handle_handoff_output` or `handle_realtime_server_event` calls this. It hands the actual sending to `send_create_now` when it is safe to do so.
 
 *Call graph*: calls 1 internal fn (send_create_now); called by 2 (handle_handoff_output, handle_realtime_server_event).
 
@@ -6819,11 +6853,11 @@ async fn request_create(
 fn mark_started(&mut self)
 ```
 
-**Purpose**: Marks that the server has begun a default response so later create requests will be deferred instead of sent immediately.
+**Purpose**: Records that the realtime server has begun a response. This prevents the code from trying to start another response on top of it.
 
-**Data flow**: Takes `&mut self` and sets `active_default_response` to `true`. It returns no value and does not touch external state.
+**Data flow**: It takes the queue state and changes the active-response flag to true. It does not return data; it only updates the in-memory guardrail.
 
-**Call relations**: Called only when `handle_realtime_server_event` observes `RealtimeEvent::ResponseCreated`, so the queue's internal state tracks the server's actual response lifecycle.
+**Call relations**: `handle_realtime_server_event` calls this after it sees a response-created event from the realtime server, so later response requests can be deferred instead of sent too early.
 
 *Call graph*: called by 1 (handle_realtime_server_event).
 
@@ -6839,11 +6873,11 @@ async fn mark_finished(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Marks the active default response as finished and, if a create request was deferred, sends that deferred request immediately.
+**Purpose**: Records that the current realtime response has ended and sends one deferred response request if one was waiting. This keeps the conversation moving without violating the server’s one-active-response rule.
 
-**Data flow**: Clears `active_default_response`; if `pending_create` is false it returns `Ok(())`. Otherwise it clears `pending_create`, uses the supplied writer/events channel/reason, and invokes `send_create_now`, propagating any error.
+**Data flow**: It receives the writer, event queue, and reason. It clears the active flag; if no request is pending, it returns. If one is pending, it clears that flag and sends the response-create message now.
 
-**Call relations**: Triggered by `handle_realtime_server_event` on `ResponseCancelled` and `ResponseDone`. It closes the loop started by `request_create`, ensuring deferred work is flushed only after the previous response ends.
+**Call relations**: `handle_realtime_server_event` calls this when a response is done or cancelled. It uses `send_create_now` to release a queued response at the right moment.
 
 *Call graph*: calls 1 internal fn (send_create_now); called by 1 (handle_realtime_server_event).
 
@@ -6859,11 +6893,11 @@ async fn send_create_now(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Actually emits `response.create` to the realtime transport and translates API failures into logged warnings and outbound realtime error events.
+**Purpose**: Sends the actual `response.create` message to the realtime API. It also handles the special case where the server says a response is already active, treating that as a race and deferring instead of failing hard.
 
-**Data flow**: Uses `RealtimeWebsocketWriter::send_response_create()`. On success it sets `active_default_response = true`. On failure it maps the API error, inspects the message for the known active-response prefix, and either converts that race into `active_default_response = true` plus `pending_create = true`, or sends `RealtimeEvent::Error(error_message)` on `events_tx` and returns an error.
+**Data flow**: It sends through the websocket writer. On success, it marks a response as active. On failure, it maps the API error into the project’s error shape, may push an error event to listeners, and returns an error unless it was the known active-response race.
 
-**Call relations**: This is the low-level send path used by both `request_create` and `mark_finished`. Its special-case handling for the active-response error is what makes the higher-level queue resilient to transport/server races.
+**Call relations**: `request_create` and `mark_finished` both call this when they decide a create request should be sent immediately.
 
 *Call graph*: calls 1 internal fn (send_response_create); called by 2 (mark_finished, request_create); 4 external calls (send, map_api_error, Error, warn!).
 
@@ -6879,11 +6913,11 @@ fn new(
     ) -> Sel
 ```
 
-**Purpose**: Constructs the shared handoff state object used to coordinate background-agent output and active handoff tracking across tasks.
+**Purpose**: Builds the shared state used to track a realtime-to-Codex handoff. It remembers where to send background-agent output and what handoff, if any, is currently active.
 
-**Data flow**: Consumes the outbound sender, `codex_responses_as_items` flag, optional item prefix, and session kind; initializes `active_handoff` and `last_output_text` as fresh `Arc<Mutex<Option<String>>>` values set to `None`; returns a populated `RealtimeHandoffState`.
+**Data flow**: It takes an output queue, settings about how Codex responses should be represented, and the realtime session kind. It returns a state object with empty active-handoff and last-output slots protected by async locks.
 
-**Call relations**: Created during `RealtimeConversationManager::start_inner` and then cloned into the conversation state and input task. It packages the mutable handoff bookkeeping that later functions read and update.
+**Call relations**: `start_inner` creates this when a new realtime conversation starts, so all later handoff input and output can share the same tracking state.
 
 *Call graph*: called by 2 (start_inner, clears_active_handoff_explicitly); 2 external calls (new, new).
 
@@ -6894,11 +6928,11 @@ fn new(
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty conversation manager with no active realtime session.
+**Purpose**: Creates an empty realtime conversation manager. At this point no realtime session is running.
 
-**Data flow**: Initializes `state` to `Mutex::new(None)` and returns the manager.
+**Data flow**: It creates a manager whose internal state is `None`, wrapped in a mutex so later async tasks can safely update it. The result is ready to be stored on a session.
 
-**Call relations**: Used by session construction code to install the realtime subsystem before any conversation starts.
+**Call relations**: Session setup code calls this while building a session or test context. Later methods on the manager fill in or clear the state as conversations start and stop.
 
 *Call graph*: called by 3 (new, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx); 1 external calls (new).
 
@@ -6909,11 +6943,11 @@ fn new() -> Self
 async fn running_state(&self) -> Option<()>
 ```
 
-**Purpose**: Reports whether a conversation state exists and is still marked active.
+**Purpose**: Checks whether there is currently an active realtime conversation. It is a lightweight status check used before reporting errors to clients.
 
-**Data flow**: Locks `self.state`, reads the optional `ConversationState`, checks `realtime_active.load(Ordering::Relaxed)`, and returns `Some(())` when active or `None` otherwise.
+**Data flow**: It reads the locked manager state and checks an atomic active flag, which is a thread-safe true/false value. It returns `Some(())` when active and `None` otherwise.
 
-**Call relations**: Used by request handlers after send failures to distinguish 'already ending' from 'not running at all' without exposing internal state details.
+**Call relations**: Input handlers use this after an audio, text, or speech send fails to decide whether to report a bad request or simply note that the session was already ending.
 
 
 ##### `RealtimeConversationManager::is_running_v2`  (lines 272–280)
@@ -6922,11 +6956,11 @@ async fn running_state(&self) -> Option<()>
 async fn is_running_v2(&self) -> bool
 ```
 
-**Purpose**: Checks whether the current active conversation exists and uses realtime v2 semantics.
+**Purpose**: Checks whether the active realtime conversation is using the newer v2 event format. This lets callers choose behavior that only makes sense for v2.
 
-**Data flow**: Locks `state`, reads `realtime_active` and `session_kind`, and returns a boolean indicating active v2 state.
+**Data flow**: It reads the current state, confirms the active flag is still true, and compares the stored session kind with v2. It returns a boolean.
 
-**Call relations**: Provides a narrow capability check for callers that need to branch on v2-only behavior.
+**Call relations**: This is a public status helper on the manager. It does not start or stop anything; it answers a question about the current conversation.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -6937,11 +6971,11 @@ async fn is_running_v2(&self) -> bool
 async fn start(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput>
 ```
 
-**Purpose**: Replaces any existing realtime conversation with a newly prepared one.
+**Purpose**: Starts a new realtime conversation, stopping any previous one first. This ensures there is never more than one live realtime session owned by the manager.
 
-**Data flow**: Locks `state`, removes any previous `ConversationState`, stops it via `stop_conversation_state` with fanout abort semantics, then forwards the supplied `RealtimeStart` to `start_inner` and returns its output.
+**Data flow**: It removes any existing state from the manager. If there was one, it stops its tasks and queues, then calls `start_inner` to create the new connection and state.
 
-**Call relations**: This is the public start entry used by `handle_start_inner`. It enforces the invariant that only one realtime conversation may exist at a time.
+**Call relations**: `handle_start_inner` calls this after preparing all start settings. It delegates cleanup to `stop_conversation_state` and setup to `start_inner`.
 
 *Call graph*: calls 2 internal fn (start_inner, stop_conversation_state).
 
@@ -6952,11 +6986,11 @@ async fn start(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput>
 async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput>
 ```
 
-**Purpose**: Allocates channels, chooses transport, opens the realtime connection, spawns the input task, and stores the resulting conversation state.
+**Purpose**: Does the real work of opening the realtime connection and creating the background input task. It supports both direct WebSocket sessions and WebRTC sessions with a sideband channel.
 
-**Data flow**: Destructures `RealtimeStart`, derives `RealtimeSessionKind` from `session_config.event_parser`, creates bounded channels for audio/text/handoff/events, allocates `realtime_active`, builds `RealtimeHandoffState`, and either: for WebRTC, asks `ModelClient` to create a realtime call and spawns `spawn_webrtc_sideband_input_task`; or for websocket, connects `RealtimeWebsocketClient` directly and spawns `spawn_realtime_input_task`. It then writes a new `ConversationState` into `self.state` and returns `RealtimeStartOutput { realtime_active, events_rx, sdp }`.
+**Data flow**: It receives a prepared start package containing provider, headers, session config, transport data, and model client. It creates input/output queues, builds handoff state, opens the chosen transport, spawns the input task, stores the new conversation state, and returns the event receiver plus any WebRTC SDP answer.
 
-**Call relations**: Called only by `start`. It is the assembly point where configuration, transport setup, task spawning, and manager state installation come together.
+**Call relations**: `start` calls this after old state has been removed. It creates `RealtimeHandoffState`, then uses either `spawn_realtime_input_task` or `spawn_webrtc_sideband_input_task` depending on the transport.
 
 *Call graph*: calls 5 internal fn (new, new, spawn_realtime_input_task, spawn_webrtc_sideband_input_task, default_headers); called by 1 (start); 3 external calls (clone, new, new).
 
@@ -6971,11 +7005,11 @@ async fn register_fanout_task(
     )
 ```
 
-**Purpose**: Associates the event-fanout task with the currently active conversation, aborting the task if it belongs to an outdated session.
+**Purpose**: Attaches the task that forwards realtime events back to the client to the current conversation. If the task belongs to an old conversation, it is aborted.
 
-**Data flow**: Takes the caller's `realtime_active` token and a `JoinHandle<()>`. It locks `state`; if the stored state's token is pointer-equal, it stores the handle in `fanout_task`. Otherwise it aborts and awaits the passed task outside the lock.
+**Data flow**: It receives the active conversation marker and a spawned task. It compares the marker with the manager’s current state; on a match, it stores the task. On mismatch, it aborts and awaits the task so it does not leak.
 
-**Call relations**: Used by `handle_start_inner` immediately after spawning the fanout loop. The pointer-equality check prevents races where a newer conversation supersedes the one that created the task.
+**Call relations**: `handle_start_inner` creates the fanout task after the realtime connection starts, then calls this to tie that task to the matching conversation.
 
 *Call graph*: 3 external calls (ptr_eq, abort, take).
 
@@ -6986,11 +7020,11 @@ async fn register_fanout_task(
 async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>)
 ```
 
-**Purpose**: Stops and removes the current conversation only if the supplied liveness token still matches it.
+**Purpose**: Finishes the current conversation only if it matches the supplied active marker. This prevents an old task from accidentally shutting down a newer conversation.
 
-**Data flow**: Locks `state`, compares the stored `realtime_active` with the provided `Arc` using pointer equality, takes the state if it matches, then stops it with `RealtimeFanoutTaskStop::Detach` so the caller-owned fanout task can finish independently.
+**Data flow**: It compares the given shared active flag with the one in current state. If they are the same, it removes the state and stops it while leaving the fanout task detached; otherwise it does nothing.
 
-**Call relations**: Invoked by the fanout loop in `handle_start_inner` when the transport closes or errors. It avoids tearing down a newer conversation that may have started after the fanout task was spawned.
+**Call relations**: The fanout task created in `handle_start_inner` calls this when the realtime event stream ends, so the manager clears the exact conversation that ended.
 
 *Call graph*: calls 1 internal fn (stop_conversation_state); 1 external calls (ptr_eq).
 
@@ -7001,11 +7035,11 @@ async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>)
 async fn audio_in(&self, frame: RealtimeAudioFrame) -> CodexResult<()>
 ```
 
-**Purpose**: Accepts one microphone audio frame for the active conversation without blocking the caller on a full queue.
+**Purpose**: Accepts one captured user audio frame and queues it for sending to the realtime server. If the queue is full, it drops the frame rather than slowing everything down.
 
-**Data flow**: Locks `state` to clone `audio_tx`; if no state exists it returns `CodexErr::InvalidRequest`. It then `try_send`s the `RealtimeAudioFrame`: success returns `Ok(())`, full queue logs a warning and drops the frame, closed queue returns the same invalid-request error.
+**Data flow**: It reads the current state to get the audio sender. If no conversation is running, it returns an invalid-request error. If the queue has room, the frame is queued; if full, the frame is discarded with a warning.
 
-**Call relations**: Called by `handle_audio`. It is intentionally lossy under pressure so realtime capture does not stall upstream request handling.
+**Call relations**: `handle_audio` calls this when a client submits audio. The background input loop later receives the frame and sends it through `handle_user_audio_input`.
 
 *Call graph*: 2 external calls (InvalidRequest, warn!).
 
@@ -7016,11 +7050,11 @@ async fn audio_in(&self, frame: RealtimeAudioFrame) -> CodexResult<()>
 async fn text_in(&self, mut params: ConversationTextParams) -> CodexResult<()>
 ```
 
-**Purpose**: Queues a text message into the active realtime conversation, adding the v2 user prefix when appropriate.
+**Purpose**: Accepts typed text for the realtime conversation and queues it for sending. For v2 user text, it adds a clear `[USER]` prefix so the realtime model can distinguish user input from backend messages.
 
-**Data flow**: Locks `state` to clone `text_tx` and read `session_kind`; errors if no conversation exists. If `params.role` is `ConversationTextRole::User`, it rewrites `params.text` through `prefix_realtime_text`. It then asynchronously sends the params on the channel and maps channel closure to `CodexErr::InvalidRequest`.
+**Data flow**: It reads the text sender and session kind from current state. It may rewrite the text with `prefix_realtime_text`, then sends the text parameters into the queue. If no conversation is running or the queue is closed, it returns an invalid-request error.
 
-**Call relations**: Called by `handle_text`. The actual transport write happens later in `handle_text_input` inside the input task.
+**Call relations**: `handle_text` calls this for incoming text submissions. The input loop later receives the queued text and `handle_text_input` sends it to the realtime API.
 
 *Call graph*: calls 1 internal fn (prefix_realtime_text); 1 external calls (InvalidRequest).
 
@@ -7031,11 +7065,11 @@ async fn text_in(&self, mut params: ConversationTextParams) -> CodexResult<()>
 async fn handoff_out(&self, output_text: String) -> CodexResult<()>
 ```
 
-**Purpose**: Transforms background-agent output into the correct realtime outbound form based on active handoff state, session version, and item-vs-function-call mode.
+**Purpose**: Feeds output from the background Codex agent back into the realtime conversation. It decides whether the output belongs to an active handoff, is a standalone backend message, or should be ignored because it is empty.
 
-**Data flow**: Locks manager state to clone `RealtimeHandoffState`; errors if not running. It reads `active_handoff` and, depending on whether a handoff is active and whether the text is empty, builds one of `RealtimeOutbound::HandoffUpdate`, `Completed`-style progress item, `StandaloneHandoff`, or `ConversationItem`. It prefixes/truncates text with `realtime_backend_output`, optionally wraps it with `realtime_backend_item`, updates `last_output_text` for active handoffs, and sends the outbound message on `output_tx`.
+**Data flow**: It reads the current handoff state. If a handoff is active, it formats and stores the latest backend output, then queues either a handoff update or a developer conversation item. If no handoff is active, it queues a standalone backend message unless the text is blank.
 
-**Call relations**: Used by higher-level background-agent plumbing to feed progress/results back into realtime. The resulting `RealtimeOutbound` is consumed later by `handle_handoff_output` in the input task.
+**Call relations**: Code that receives background-agent results uses this to return them to realtime. It uses `realtime_backend_output` and sometimes `realtime_backend_item`; `handle_handoff_output` later sends the queued `RealtimeOutbound` to the server.
 
 *Call graph*: calls 2 internal fn (realtime_backend_item, realtime_backend_output); 1 external calls (InvalidRequest).
 
@@ -7046,11 +7080,11 @@ async fn handoff_out(&self, output_text: String) -> CodexResult<()>
 async fn append_speech(&self, text: String) -> CodexResult<()>
 ```
 
-**Purpose**: Injects synthesized speech text into realtime as a standalone backend output when non-empty.
+**Purpose**: Adds speech text back into the realtime conversation as backend output. This is used when speech has already been converted into text and should be visible to the realtime model.
 
-**Data flow**: Returns early for blank text. Otherwise it clones `RealtimeHandoffState` from manager state, errors if not running, converts the text with `realtime_backend_output`, wraps it as `RealtimeOutbound::StandaloneHandoff`, and sends it on `output_tx`.
+**Data flow**: It ignores blank text. Otherwise it gets the current handoff state, formats the text as backend output, and queues it as a standalone handoff-style message. If the conversation is gone, it returns an invalid-request error.
 
-**Call relations**: Called by `handle_speech`. It reuses the same outbound path as handoff output but without active-handoff bookkeeping.
+**Call relations**: `handle_speech` calls this when speech text arrives from the client. The queued message is later processed by `handle_handoff_output`.
 
 *Call graph*: calls 1 internal fn (realtime_backend_output); 1 external calls (InvalidRequest).
 
@@ -7061,11 +7095,11 @@ async fn append_speech(&self, text: String) -> CodexResult<()>
 async fn handoff_complete(&self) -> CodexResult<()>
 ```
 
-**Purpose**: Signals completion of the currently active handoff in realtime v2 sessions, using either an acknowledgement function output or a completed-handoff payload.
+**Purpose**: Tells the realtime conversation that the current background-agent handoff has completed. This matters mainly for v2 sessions, where the realtime server may need a function-call output or acknowledgement.
 
-**Data flow**: Clones `RealtimeHandoffState` if present; returns early if no conversation, if session kind is v1, if there is no active handoff id, or if no `last_output_text` was recorded. It then chooses `RealtimeOutbound::HandoffCompleteAck` when `codex_responses_as_items` is enabled, otherwise `RealtimeOutbound::CompletedHandoff { handoff_id, text }`, and sends it on `output_tx`.
+**Data flow**: It reads the handoff state. If there is no active conversation, no active handoff, no last output, or the session is v1, it returns without doing anything. Otherwise it queues either a completion acknowledgement or completed handoff output.
 
-**Call relations**: This is the explicit completion counterpart to `handoff_out`. The emitted outbound message is later interpreted by `handle_handoff_output` to finish the function call and possibly trigger a new response.
+**Call relations**: After background work finishes, callers use this to close the loop with realtime. `handle_handoff_output` later turns the queued completion into the right server message.
 
 
 ##### `RealtimeConversationManager::clear_active_handoff`  (lines 596–605)
@@ -7074,11 +7108,11 @@ async fn handoff_complete(&self) -> CodexResult<()>
 async fn clear_active_handoff(&self)
 ```
 
-**Purpose**: Resets handoff tracking so future background output is treated as standalone rather than attached to an old handoff.
+**Purpose**: Forgets the currently active handoff and the last backend output. This resets handoff tracking after work is done or intentionally abandoned.
 
-**Data flow**: If a conversation exists, clones its `RealtimeHandoffState` and sets both `active_handoff` and `last_output_text` mutex-protected values to `None`.
+**Data flow**: It reads the current handoff state, if any, and sets both shared slots to `None`. It returns no value and sends nothing to the realtime server.
 
-**Call relations**: Used by surrounding session logic when a handoff lifecycle ends outside this file's direct event loop.
+**Call relations**: This is a cleanup helper for code that needs to explicitly clear handoff state. It operates on the state created by `RealtimeHandoffState::new`.
 
 
 ##### `RealtimeConversationManager::shutdown`  (lines 607–617)
@@ -7087,11 +7121,11 @@ async fn clear_active_handoff(&self)
 async fn shutdown(&self) -> CodexResult<()>
 ```
 
-**Purpose**: Stops any active realtime conversation and clears manager state.
+**Purpose**: Stops the current realtime conversation, if one exists. It is the manager’s normal close operation.
 
-**Data flow**: Locks `state`, takes the current `ConversationState`, and if present passes it to `stop_conversation_state` with abort semantics. Returns `Ok(())` regardless of whether a state existed.
+**Data flow**: It removes the current state from the manager. If there was a conversation, it calls `stop_conversation_state` to mark it inactive and abort its background tasks.
 
-**Call relations**: Called by `end_realtime_conversation` and potentially other teardown paths. It is the manager's explicit stop API.
+**Call relations**: `end_realtime_conversation` uses this when the client asks to close. `start` also uses the same stopping path when replacing an old conversation.
 
 *Call graph*: calls 1 internal fn (stop_conversation_state).
 
@@ -7105,11 +7139,11 @@ async fn stop_conversation_state(
 )
 ```
 
-**Purpose**: Performs the actual task-level teardown for a stored conversation state.
+**Purpose**: Shuts down the tasks that belong to one conversation state. It is the common cleanup routine used when a conversation is replaced, closed, or finishes by itself.
 
-**Data flow**: Sets `realtime_active` to false, aborts and awaits `input_task`, then if a `fanout_task` exists either aborts and awaits it or leaves it detached depending on `RealtimeFanoutTaskStop`.
+**Data flow**: It marks the shared active flag false, aborts the input task, and waits for it to finish. For the fanout task, it either aborts it or leaves it detached depending on the requested stop style.
 
-**Call relations**: Shared by `start`, `shutdown`, and `finish_if_active`. The detach option is important when the fanout task itself is the caller and must not abort itself.
+**Call relations**: `start`, `shutdown`, and `finish_if_active` all call this so conversation teardown follows one consistent path.
 
 *Call graph*: called by 3 (finish_if_active, shutdown, start).
 
@@ -7124,11 +7158,11 @@ async fn handle_start(
 ) -> CodexResult<()>
 ```
 
-**Purpose**: Top-level protocol handler for a realtime conversation start request, including preparation, startup, and client-visible error reporting.
+**Purpose**: Handles a client request to start a realtime conversation. It prepares configuration first, then starts the actual conversation and reports errors back as realtime error events.
 
-**Data flow**: Receives `Session`, subscription id, and `ConversationStartParams`. It calls `prepare_realtime_start`; on failure it logs and sends a `RealtimeConversationRealtime` event carrying `RealtimeEvent::Error`. On success it calls `handle_start_inner`; if that fails it logs and sends the same error-shaped realtime event.
+**Data flow**: It receives the session, subscription id, and start parameters. It calls `prepare_realtime_start`; if preparation fails, it sends an error event to the client. If preparation succeeds, it calls `handle_start_inner` and similarly reports any start failure.
 
-**Call relations**: Invoked from the session submission loop. It separates preparation/startup failures from transport runtime failures by reporting them immediately on the subscription channel.
+**Call relations**: The session submission loop calls this for start requests. It separates user-facing error reporting from the lower-level preparation and connection work.
 
 *Call graph*: calls 2 internal fn (handle_start_inner, prepare_realtime_start); called by 1 (submission_loop); 3 external calls (error!, RealtimeConversationRealtime, Error).
 
@@ -7142,11 +7176,11 @@ async fn prepare_realtime_start(
 ) -> CodexResult<PreparedRealtimeConversationStart>
 ```
 
-**Purpose**: Resolves provider/auth/config/transport details into a validated `PreparedRealtimeConversationStart` structure.
+**Purpose**: Turns a client’s start request plus session configuration into a complete, validated start package. This includes auth headers, model settings, realtime version, transport choice, and API provider details.
 
-**Data flow**: Reads provider info, auth manager/auth, session config, requested transport/version/architecture, and optional experimental base URLs from `Session`. It validates architecture constraints, builds `RealtimeSessionConfig`, captures the requested session id, computes extra headers via `realtime_request_headers`, and for websocket transport obtains an API key via `realtime_api_key`. It returns all derived fields needed by `handle_start_inner`.
+**Data flow**: It reads the session provider, auth manager, and config, then combines them with request parameters. It validates architecture rules, builds the realtime session config, finds an API key when needed, creates headers, and returns a prepared start object.
 
-**Call relations**: Called by `handle_start` before any connection attempt. It is the configuration-and-auth normalization phase for startup.
+**Call relations**: `handle_start` calls this before opening any network connection. It relies on `build_realtime_session_config`, `validate_realtime_architecture`, `realtime_api_key`, and `realtime_request_headers`.
 
 *Call graph*: calls 4 internal fn (build_realtime_session_config, realtime_api_key, realtime_request_headers, validate_realtime_architecture); called by 1 (handle_start).
 
@@ -7162,11 +7196,11 @@ fn validate_realtime_architecture(
 ) -
 ```
 
-**Purpose**: Enforces the special constraints required by the AVAS realtime architecture.
+**Purpose**: Checks that a requested realtime architecture is allowed with the chosen version, transport, and session type. It protects users from starting combinations the backend does not support.
 
-**Data flow**: Examines the requested architecture, websocket version, transport, and configured session type. Non-AVAS passes through; AVAS requires v1, WebRTC transport, and conversational mode, otherwise it returns `CodexErr::InvalidRequest` with a specific message.
+**Data flow**: It receives the architecture, realtime version, transport, and configured session mode. If the architecture is not AVAS, it accepts it. If it is AVAS, it requires v1, WebRTC, and conversational mode; otherwise it returns a clear invalid-request error.
 
-**Call relations**: Used during `prepare_realtime_start` to reject incompatible combinations before transport setup begins.
+**Call relations**: `prepare_realtime_start` calls this before building the final start package, so bad combinations fail early.
 
 *Call graph*: called by 1 (prepare_realtime_start); 2 external calls (matches!, InvalidRequest).
 
@@ -7181,11 +7215,11 @@ async fn build_realtime_session_config(
 ) -> CodexResult<RealtimeSessionConfig>
 ```
 
-**Purpose**: Builds the API-facing realtime session configuration from request parameters plus session configuration defaults.
+**Purpose**: Builds the configuration sent to the realtime API for one session. This includes instructions, startup context, model, session id, parser version, output type, mode, and voice.
 
-**Data flow**: Reads config from `Session`, merges prompt text with optional startup context from either config or `build_realtime_startup_context`, chooses model from params/config/default, maps `RealtimeWsVersion` to `RealtimeEventParser`, rejects text-only output on v1, maps configured session mode to `RealtimeSessionMode`, chooses a voice from params/config/default via `default_realtime_voice`, validates it with `validate_realtime_voice`, and returns a `RealtimeSessionConfig` containing instructions, model, session id, parser, mode, output modality, and voice.
+**Data flow**: It reads project config and request parameters. It prepares the backend prompt, optionally adds startup context, chooses a model and event parser, validates output modality and voice, and returns a `RealtimeSessionConfig`.
 
-**Call relations**: Called by `prepare_realtime_start`. It encapsulates all request/config merging and version-specific validation for the realtime API session object.
+**Call relations**: `prepare_realtime_start` calls this as the central session-config builder. It uses prompt/context helpers and `validate_realtime_voice` to keep the API request valid.
 
 *Call graph*: calls 3 internal fn (build_realtime_startup_context, validate_realtime_voice, prepare_realtime_backend_prompt); called by 1 (prepare_realtime_start); 4 external calls (new, format!, matches!, InvalidRequest).
 
@@ -7196,11 +7230,11 @@ async fn build_realtime_session_config(
 fn default_realtime_voice(version: RealtimeWsVersion) -> RealtimeVoice
 ```
 
-**Purpose**: Selects the built-in default voice appropriate for the requested realtime protocol version.
+**Purpose**: Chooses the default voice for a realtime version. Different realtime versions can have different supported default voices.
 
-**Data flow**: Reads `RealtimeVoicesList::builtin()` and returns either `default_v1` or `default_v2` based on `RealtimeWsVersion`.
+**Data flow**: It reads the built-in voice list and returns the v1 or v2 default based on the requested version.
 
-**Call relations**: Used by `build_realtime_session_config` when neither request params nor config specify a voice.
+**Call relations**: `build_realtime_session_config` uses this when neither the request nor the config specifies a voice.
 
 *Call graph*: calls 1 internal fn (builtin).
 
@@ -7211,11 +7245,11 @@ fn default_realtime_voice(version: RealtimeWsVersion) -> RealtimeVoice
 fn prefix_realtime_text(text: String, prefix: &str, session_kind: RealtimeSessionKind) -> String
 ```
 
-**Purpose**: Adds a textual prefix such as `[USER] ` or `[BACKEND] ` only for realtime v2 and only when the text is non-empty and not already prefixed.
+**Purpose**: Adds a label such as `[USER]` or `[BACKEND]` to v2 realtime text when needed. The prefix helps the model understand where a message came from.
 
-**Data flow**: Consumes a `String`, prefix string, and session kind. It returns the original text unchanged unless the session is v2, the text is non-empty, and it does not already start with the prefix; in that case it returns a newly formatted string.
+**Data flow**: It receives text, a prefix, and the session kind. For non-v2 sessions, empty text, or already-prefixed text, it returns the original text. Otherwise it returns a new string with the prefix added.
 
-**Call relations**: Used by `RealtimeConversationManager::text_in` for user messages and by `realtime_backend_output` for backend-originated text.
+**Call relations**: `text_in` uses this for user text, and `realtime_backend_output` uses it for backend output.
 
 *Call graph*: called by 2 (text_in, realtime_backend_output); 1 external calls (format!).
 
@@ -7226,11 +7260,11 @@ fn prefix_realtime_text(text: String, prefix: &str, session_kind: RealtimeSessio
 fn realtime_backend_output(output_text: String, session_kind: RealtimeSessionKind) -> String
 ```
 
-**Purpose**: Normalizes backend output text for reinjection into realtime by applying the backend prefix and enforcing the assistant output token budget.
+**Purpose**: Formats background-agent output before sending it into the realtime conversation. It adds the backend label for v2 and trims the text to a safe token budget.
 
-**Data flow**: Takes raw output text and session kind, runs `prefix_realtime_text` with `REALTIME_BACKEND_TEXT_PREFIX`, then truncates the result with `truncate_realtime_text_to_token_budget` using `REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET`, returning the final string.
+**Data flow**: It receives raw backend output and the session kind. It prefixes the text if needed, truncates it to the assistant-output budget, and returns the formatted text.
 
-**Call relations**: Used by `handoff_out` and `append_speech` before those paths enqueue outbound background text.
+**Call relations**: `handoff_out` and `append_speech` call this before queueing backend text for the realtime server.
 
 *Call graph*: calls 2 internal fn (truncate_realtime_text_to_token_budget, prefix_realtime_text); called by 2 (append_speech, handoff_out).
 
@@ -7241,11 +7275,11 @@ fn realtime_backend_output(output_text: String, session_kind: RealtimeSessionKin
 fn realtime_backend_item(text: String, prefix: Option<&str>) -> String
 ```
 
-**Purpose**: Builds a developer conversation item payload from backend text, optionally prepending a configured item prefix, then truncates it to the assistant token budget.
+**Purpose**: Formats backend output as a developer conversation item, optionally adding a caller-supplied heading. It also trims long text before it is sent.
 
-**Data flow**: Consumes text and an optional prefix. If the prefix exists and is non-empty it formats `"{prefix}\n\n{text}"`; otherwise it keeps the text unchanged. It then truncates the result and returns it.
+**Data flow**: It receives text and an optional prefix. If the prefix is present and non-empty, it prepends it with spacing, then truncates the result to the configured token budget.
 
-**Call relations**: Used by `handoff_out` when `codex_responses_as_items` is enabled so backend output is injected as a conversation item instead of function-call output.
+**Call relations**: `handoff_out` calls this when Codex responses should be inserted as conversation items instead of handoff function outputs.
 
 *Call graph*: calls 1 internal fn (truncate_realtime_text_to_token_budget); called by 1 (handoff_out); 1 external calls (format!).
 
@@ -7256,11 +7290,11 @@ fn realtime_backend_item(text: String, prefix: Option<&str>) -> String
 fn validate_realtime_voice(version: RealtimeWsVersion, voice: RealtimeVoice) -> CodexResult<()>
 ```
 
-**Purpose**: Checks that the requested voice belongs to the built-in allowed set for the selected realtime version.
+**Purpose**: Checks that the requested voice is supported by the chosen realtime API version. It returns a useful error listing allowed voices when the choice is invalid.
 
-**Data flow**: Loads `RealtimeVoicesList::builtin()`, selects the allowed list for v1 or v2, and returns `Ok(())` if the voice is present. Otherwise it formats an invalid-request error listing the supported wire names.
+**Data flow**: It reads the built-in voice list, selects the allowed voices for v1 or v2, and checks whether the requested voice is present. It returns success or an invalid-request error message.
 
-**Call relations**: Called by `build_realtime_session_config` after voice selection to reject unsupported version/voice combinations early.
+**Call relations**: `build_realtime_session_config` calls this before returning the final session config.
 
 *Call graph*: calls 1 internal fn (builtin); called by 1 (build_realtime_session_config); 2 external calls (format!, InvalidRequest).
 
@@ -7275,11 +7309,11 @@ async fn handle_start_inner(
 ) -> CodexResult<()>
 ```
 
-**Purpose**: Starts the conversation manager, emits started/SDP events to the client, and spawns the fanout loop that forwards realtime events back through the session subscription.
+**Purpose**: Starts the prepared realtime conversation and begins forwarding realtime events back to the client. It also routes handoff requests into the normal Codex text flow.
 
-**Data flow**: Consumes `PreparedRealtimeConversationStart`, derives optional SDP from transport, builds `RealtimeStart`, and calls `sess.conversation.start`. It sends `RealtimeConversationStarted`, optionally `RealtimeConversationSdp`, then spawns a task that reads `events_rx`, logs non-audio events, marks end reason on errors, converts `HandoffRequested` events into routed XML text via `realtime_delegation_from_handoff`, forwards every event as `RealtimeConversationRealtime`, and on termination calls `finish_if_active` plus `send_realtime_conversation_closed`.
+**Data flow**: It receives the prepared start package, converts transport data into a `RealtimeStart`, and starts the manager. It sends a started event, sends a WebRTC SDP answer if present, spawns a fanout task that reads realtime events, forwards them to the client, and routes handoff text into the session.
 
-**Call relations**: Called by `handle_start` after preparation succeeds. It is the handoff point from startup into the long-lived event fanout path, and it registers that fanout task back into the manager.
+**Call relations**: `handle_start` calls this after preparation succeeds. It calls `realtime_delegation_from_handoff` when realtime asks for Codex help, registers the fanout task with the manager, and later uses `send_realtime_conversation_closed` when the stream ends.
 
 *Call graph*: calls 2 internal fn (realtime_delegation_from_handoff, send_realtime_conversation_closed); called by 1 (handle_start); 7 external calls (clone, debug!, info!, RealtimeConversationRealtime, RealtimeConversationSdp, RealtimeConversationStarted, spawn).
 
@@ -7294,11 +7328,11 @@ async fn handle_audio(
 )
 ```
 
-**Purpose**: Protocol handler for incoming audio frames from the client side of the session.
+**Purpose**: Handles one client audio-input message for a realtime conversation. It reports a user-facing error only when the conversation is not already shutting down.
 
-**Data flow**: Passes `params.frame` to `sess.conversation.audio_in()`. On error it logs; if the conversation still appears active it only warns that shutdown may be in progress, otherwise it sends a protocol `ErrorEvent` with `CodexErrorInfo::BadRequest` via `send_conversation_error`.
+**Data flow**: It takes the audio frame from the request and passes it to `audio_in`. On failure, it checks whether a conversation is still running; if not, it sends a bad-request error event to the client.
 
-**Call relations**: Called by the submission loop for audio append requests. It is a thin adapter around `RealtimeConversationManager::audio_in` with user-facing error shaping.
+**Call relations**: The submission loop calls this for audio messages. It is the outer error-handling layer around `RealtimeConversationManager::audio_in`.
 
 *Call graph*: calls 1 internal fn (send_conversation_error); called by 1 (submission_loop); 2 external calls (error!, warn!).
 
@@ -7309,11 +7343,11 @@ async fn handle_audio(
 fn realtime_transcript_delta_from_handoff(handoff: &RealtimeHandoffRequested) -> Option<String>
 ```
 
-**Purpose**: Formats the active transcript entries from a handoff request into a newline-separated `role: text` block.
+**Purpose**: Builds a readable transcript snippet from the active transcript entries included in a handoff request. This gives the background agent extra context about what was just said.
 
-**Data flow**: Reads `handoff.active_transcript`, maps each entry to `"{role}: {text}"`, joins them with newlines, and returns `Some(string)` only if the result is non-empty.
+**Data flow**: It reads the handoff’s active transcript entries, formats each as `role: text`, joins them with new lines, and returns the result only if it is non-empty.
 
-**Call relations**: Used by `realtime_delegation_from_handoff` both as a fallback input source and as optional transcript delta metadata.
+**Call relations**: `realtime_delegation_from_handoff` calls this when preparing text to route from realtime into the Codex session.
 
 *Call graph*: called by 1 (realtime_delegation_from_handoff).
 
@@ -7324,11 +7358,11 @@ fn realtime_transcript_delta_from_handoff(handoff: &RealtimeHandoffRequested) ->
 fn realtime_text_from_handoff_request(handoff: &RealtimeHandoffRequested) -> Option<String>
 ```
 
-**Purpose**: Extracts the most useful textual input from a handoff request, preferring the explicit input transcript and falling back to the active transcript delta.
+**Purpose**: Chooses the best text to send to the background Codex agent from a realtime handoff request. It prefers the full input transcript and falls back to the active transcript delta.
 
-**Data flow**: Checks `handoff.input_transcript`; if non-empty returns its clone, otherwise calls `realtime_transcript_delta_from_handoff` and returns that optional string.
+**Data flow**: It reads `input_transcript` from the handoff. If that is non-empty, it returns a copy. Otherwise it asks `realtime_transcript_delta_from_handoff` for a transcript snippet.
 
-**Call relations**: Called by `realtime_delegation_from_handoff` to decide what text should be routed back into the session.
+**Call relations**: `realtime_delegation_from_handoff` uses this as the first step in turning a handoff request into routed Codex input.
 
 *Call graph*: called by 1 (realtime_delegation_from_handoff).
 
@@ -7339,11 +7373,11 @@ fn realtime_text_from_handoff_request(handoff: &RealtimeHandoffRequested) -> Opt
 fn realtime_delegation_from_handoff(handoff: &RealtimeHandoffRequested) -> Option<String>
 ```
 
-**Purpose**: Converts a realtime handoff request into the XML-wrapped delegation text that the session routes into its normal text-input path.
+**Purpose**: Converts a realtime handoff request into the special text payload sent into the background Codex agent. If there is no useful text, it returns nothing.
 
-**Data flow**: Calls `realtime_text_from_handoff_request`; if it yields no text, returns `None`. Otherwise it also computes an optional transcript delta and passes both to `wrap_realtime_delegation_input`, returning the wrapped string.
+**Data flow**: It extracts the main input text, optionally extracts a transcript delta, wraps both in a small XML-like structure, and returns that string.
 
-**Call relations**: Used by the fanout loop in `handle_start_inner` when a `RealtimeEvent::HandoffRequested` arrives, so handoff requests can be reintroduced into the broader session workflow.
+**Call relations**: The fanout task inside `handle_start_inner` calls this when it sees a `HandoffRequested` realtime event, then routes the resulting text into the session.
 
 *Call graph*: calls 3 internal fn (realtime_text_from_handoff_request, realtime_transcript_delta_from_handoff, wrap_realtime_delegation_input); called by 1 (handle_start_inner).
 
@@ -7354,11 +7388,11 @@ fn realtime_delegation_from_handoff(handoff: &RealtimeHandoffRequested) -> Optio
 fn wrap_realtime_delegation_input(input: &str, transcript_delta: Option<&str>) -> String
 ```
 
-**Purpose**: Builds the exact XML envelope used for routed realtime delegation input, escaping user-visible text fields first.
+**Purpose**: Packages realtime handoff input in a simple XML-like envelope. The envelope makes it clear to the background agent what is the user input and what is transcript context.
 
-**Data flow**: Escapes `input` with `escape_xml_text`. If `transcript_delta` exists and is non-empty, escapes it too and returns a `<realtime_delegation>` block containing both `<input>` and `<transcript_delta>` elements; otherwise returns a block with only `<input>`.
+**Data flow**: It escapes special XML characters in the input and optional transcript delta, then returns a string with `<realtime_delegation>`, `<input>`, and optionally `<transcript_delta>` tags.
 
-**Call relations**: Called only by `realtime_delegation_from_handoff`. It defines the wire format expected by downstream routing logic.
+**Call relations**: `realtime_delegation_from_handoff` calls this after choosing the text that should be delegated.
 
 *Call graph*: calls 1 internal fn (escape_xml_text); called by 1 (realtime_delegation_from_handoff); 1 external calls (format!).
 
@@ -7369,11 +7403,11 @@ fn wrap_realtime_delegation_input(input: &str, transcript_delta: Option<&str>) -
 fn escape_xml_text(input: &str) -> String
 ```
 
-**Purpose**: Performs minimal XML escaping for delegation payload text.
+**Purpose**: Makes text safe to place inside the XML-like handoff wrapper. It prevents characters such as `<` and `&` from being mistaken for markup.
 
-**Data flow**: Takes `&str` and returns a new `String` with `&`, `<`, and `>` replaced by `&amp;`, `&lt;`, and `&gt;` respectively.
+**Data flow**: It receives a string slice and replaces ampersands, less-than signs, and greater-than signs with their escaped forms. It returns the escaped string.
 
-**Call relations**: Used by `wrap_realtime_delegation_input` to keep routed delegation XML well-formed.
+**Call relations**: `wrap_realtime_delegation_input` calls this for both the main input and transcript delta.
 
 *Call graph*: called by 1 (wrap_realtime_delegation_input).
 
@@ -7384,11 +7418,11 @@ fn escape_xml_text(input: &str) -> String
 fn realtime_api_key(auth: Option<&CodexAuth>, provider: &ModelProviderInfo) -> CodexResult<String>
 ```
 
-**Purpose**: Finds an API credential suitable for realtime websocket authentication, including temporary fallbacks for OpenAI sessions.
+**Purpose**: Finds an API key or bearer token suitable for realtime WebSocket authentication. It checks several places so different login modes can still work.
 
-**Data flow**: Checks provider-specific API key, then provider bearer token, then authenticated `CodexAuth` API key, then for OpenAI providers falls back to `read_openai_api_key_from_env()`. If none are available it returns `CodexErr::InvalidRequest`.
+**Data flow**: It first asks the model provider for an API key, then checks an experimental bearer token, then the current Codex auth object, and finally the OpenAI API key environment variable for OpenAI providers. If none is found, it returns an invalid-request error.
 
-**Call relations**: Called by `prepare_realtime_start` for websocket transport, where the realtime request headers must include bearer authorization.
+**Call relations**: `prepare_realtime_start` calls this when starting a WebSocket realtime session that needs an Authorization header.
 
 *Call graph*: calls 2 internal fn (api_key, is_openai); called by 1 (prepare_realtime_start); 2 external calls (read_openai_api_key_from_env, InvalidRequest).
 
@@ -7403,11 +7437,11 @@ fn realtime_request_headers(
 ) -> CodexResult<Option<HeaderMap>>
 ```
 
-**Purpose**: Constructs optional HTTP headers for realtime connection setup, including version marker, session id, and authorization.
+**Purpose**: Builds the HTTP headers needed to start a realtime connection. These may include version flags, a session id, and an Authorization bearer token.
 
-**Data flow**: Creates a `HeaderMap`, inserts `openai-alpha: quicksilver=v1` for v1, inserts `x-session-id` if the provided session id parses as a header value, and inserts `Authorization: Bearer ...` if an API key is supplied. It returns `Ok(Some(headers))` or an invalid-request error if the auth header value is malformed.
+**Data flow**: It creates an empty header map, adds the v1 alpha header when needed, adds `x-session-id` if the session id is valid, and adds `Authorization: Bearer ...` if an API key is provided. It returns the header map wrapped in `Some`.
 
-**Call relations**: Used by `prepare_realtime_start` for both websocket and WebRTC sideband startup, with API key omitted for WebRTC call creation flows.
+**Call relations**: `prepare_realtime_start` calls this after deciding the transport and authentication needs.
 
 *Call graph*: called by 1 (prepare_realtime_start); 4 external calls (new, from_static, from_str, format!).
 
@@ -7422,11 +7456,11 @@ async fn handle_text(
 )
 ```
 
-**Purpose**: Protocol handler for incoming text appended to the realtime conversation.
+**Purpose**: Handles one client text-input message for a realtime conversation. It logs the text path and reports a bad-request error if the conversation is not available.
 
-**Data flow**: Logs the text, calls `sess.conversation.text_in(params)`, and on error either warns if shutdown is already underway or sends a `BadRequest` `ErrorEvent` through `send_conversation_error`.
+**Data flow**: It passes the text parameters to `text_in`. If that fails, it checks whether the conversation is still running; if not, it sends an error event to the client.
 
-**Call relations**: Invoked by the submission loop for text append requests. It is the session-facing wrapper around `RealtimeConversationManager::text_in`.
+**Call relations**: The submission loop calls this for realtime text messages. It wraps `RealtimeConversationManager::text_in` with client-facing error handling.
 
 *Call graph*: calls 1 internal fn (send_conversation_error); called by 1 (submission_loop); 3 external calls (debug!, error!, warn!).
 
@@ -7441,11 +7475,11 @@ async fn handle_speech(
 )
 ```
 
-**Purpose**: Protocol handler for speech text that should be appended into realtime as backend output.
+**Purpose**: Handles speech text that should be appended to the realtime conversation. This is separate from raw audio frames because the input has already become text.
 
-**Data flow**: Logs the text, calls `sess.conversation.append_speech(params.text)`, and on failure follows the same warn-vs-error-event pattern as `handle_text` and `handle_audio`.
+**Data flow**: It sends the speech text to `append_speech`. On failure, it checks whether the realtime session is still active and sends a bad-request error only if appropriate.
 
-**Call relations**: Called by the submission loop for speech append requests. It adapts protocol input to the manager's standalone backend-output path.
+**Call relations**: The submission loop calls this for speech messages. It wraps `RealtimeConversationManager::append_speech` with logging and error reporting.
 
 *Call graph*: calls 1 internal fn (send_conversation_error); called by 1 (submission_loop); 3 external calls (debug!, error!, warn!).
 
@@ -7456,11 +7490,11 @@ async fn handle_speech(
 async fn handle_close(sess: &Arc<Session>, sub_id: String)
 ```
 
-**Purpose**: Protocol handler for an explicit client request to close the realtime conversation.
+**Purpose**: Handles a client request to close the realtime conversation. It marks the close reason as requested by the user.
 
-**Data flow**: Passes the session and subscription id to `end_realtime_conversation` with `RealtimeConversationEnd::Requested`.
+**Data flow**: It receives the session and subscription id, then calls `end_realtime_conversation` with the requested-close reason. It returns after shutdown and close notification are scheduled by that helper.
 
-**Call relations**: Invoked by the submission loop when the client closes the subscription.
+**Call relations**: The submission loop calls this for close messages. It delegates the real shutdown and closed event to `end_realtime_conversation`.
 
 *Call graph*: calls 1 internal fn (end_realtime_conversation); called by 1 (submission_loop).
 
@@ -7471,11 +7505,11 @@ async fn handle_close(sess: &Arc<Session>, sub_id: String)
 fn spawn_realtime_input_task(input: RealtimeInputTask) -> JoinHandle<()>
 ```
 
-**Purpose**: Starts the websocket input loop on a Tokio task.
+**Purpose**: Starts the background task that drives a direct WebSocket realtime connection. This task watches user inputs, backend outputs, and server events at the same time.
 
-**Data flow**: Consumes a `RealtimeInputTask`, wraps `run_realtime_input_task(input)` in `tokio::spawn`, and returns the `JoinHandle<()>`.
+**Data flow**: It receives all inputs needed by `run_realtime_input_task`, spawns it on Tokio, which is Rust’s async task runtime, and returns the task handle.
 
-**Call relations**: Used by `RealtimeConversationManager::start_inner` for direct websocket sessions.
+**Call relations**: `start_inner` calls this for normal WebSocket sessions. The spawned task then runs `run_realtime_input_task`.
 
 *Call graph*: calls 1 internal fn (run_realtime_input_task); called by 1 (start_inner); 1 external calls (spawn).
 
@@ -7486,11 +7520,11 @@ fn spawn_realtime_input_task(input: RealtimeInputTask) -> JoinHandle<()>
 fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> JoinHandle<()>
 ```
 
-**Purpose**: Starts a Tokio task that first connects the WebRTC sideband websocket and then runs the normal realtime input loop over that connection.
+**Purpose**: Starts the background sideband WebSocket task for a WebRTC realtime session. The sideband carries control messages and events alongside the WebRTC media connection.
 
-**Data flow**: Destructures `RealtimeWebrtcSidebandInputTask`, checks `realtime_active`, calls `RealtimeWebsocketClient::connect_webrtc_sideband` with session config, call id, sideband headers, and default headers, maps connection errors into `RealtimeEvent::Error` on `events_tx`, and on success constructs a `RealtimeInputTask` and awaits `run_realtime_input_task`.
+**Data flow**: It receives the client, call id, headers, channels, handoff state, parser settings, and active flag. The spawned task connects the sideband; if connection fails while active, it sends an error event. On success, it runs the same input loop used by direct WebSocket sessions.
 
-**Call relations**: Used by `RealtimeConversationManager::start_inner` when startup includes SDP/WebRTC transport. It is the transport-specific wrapper that normalizes WebRTC sideband into the same input loop used by websocket sessions.
+**Call relations**: `start_inner` calls this when the start request includes WebRTC SDP. After connecting, it hands off to `run_realtime_input_task`.
 
 *Call graph*: calls 2 internal fn (run_realtime_input_task, default_headers); called by 1 (start_inner); 4 external calls (map_api_error, Error, spawn, warn!).
 
@@ -7501,11 +7535,11 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
 async fn run_realtime_input_task(input: RealtimeInputTask)
 ```
 
-**Purpose**: Runs the core multiplexing loop that drives realtime transport I/O for one active conversation.
+**Purpose**: Runs the main realtime input loop. It waits for whichever happens next: user text, background-agent output, a server event, or user audio.
 
-**Data flow**: Owns the writer, server event stream, inbound text/audio/handoff receivers, event sender, handoff state, session kind, and parser. It initializes `output_audio_state` and a default `RealtimeResponseCreateQueue`, then repeatedly `tokio::select!`s among text input, handoff output, server events, and user audio, delegating each branch to `handle_text_input`, `handle_handoff_output`, `handle_realtime_server_event`, or `handle_user_audio_input`. Any branch error breaks the loop and ends the task.
+**Data flow**: It takes the writer, server event stream, input queues, event output queue, handoff state, session kind, and parser. In a loop, it selects the next available input and calls the matching handler. If any handler returns an error, the loop stops.
 
-**Call relations**: Spawned by both `spawn_realtime_input_task` and `spawn_webrtc_sideband_input_task`. It is the central runtime loop for transport-side conversation processing.
+**Call relations**: Both `spawn_realtime_input_task` and `spawn_webrtc_sideband_input_task` run this. It dispatches work to `handle_text_input`, `handle_handoff_output`, `handle_realtime_server_event`, and `handle_user_audio_input`.
 
 *Call graph*: called by 2 (spawn_realtime_input_task, spawn_webrtc_sideband_input_task); 2 external calls (default, select!).
 
@@ -7520,11 +7554,11 @@ async fn handle_text_input(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Consumes one queued text input item and sends it to the realtime server as a conversation item.
+**Purpose**: Sends one queued text message into the realtime API as a conversation item. If sending fails, it reports the error through the realtime event stream.
 
-**Data flow**: Receives `Result<ConversationTextParams, RecvError>`, converts channel closure into an error with context, then calls `writer.send_conversation_item_create(params.text, params.role)`. On API failure it maps/logs the error, sends `RealtimeEvent::Error` on `events_tx`, and returns an error.
+**Data flow**: It receives a queued text result. If the queue is closed, it errors. Otherwise it sends the text and role through the websocket writer; on API failure, it maps the error, sends a realtime error event, and returns failure.
 
-**Call relations**: Called from `run_realtime_input_task` when the text input channel wins the select. It is the final transport write step for `RealtimeConversationManager::text_in`.
+**Call relations**: `run_realtime_input_task` calls this when the text input queue produces a message.
 
 *Call graph*: calls 1 internal fn (send_conversation_item_create); 4 external calls (send, map_api_error, Error, warn!).
 
@@ -7539,11 +7573,11 @@ async fn handle_handoff_output(
     handoff_state: &RealtimeHandof
 ```
 
-**Purpose**: Translates queued background-agent output into the correct realtime API calls, with distinct behavior for v1 versus v2 and for item-based versus function-call-based codex responses.
+**Purpose**: Sends background-agent output back to the realtime API in the right format for the realtime version. It handles standalone backend messages, progress updates, completed handoffs, conversation items, and acknowledgements.
 
-**Data flow**: Consumes `Result<RealtimeOutbound, RecvError>`, errors on closed channel, then matches on `event_parser` and outbound variant. V1 sends standalone handoffs via `send_conversation_handoff_append`, handoff updates/completions via `send_conversation_function_call_output`, and conversation items as developer items. V2 sends standalone handoffs as user items followed by `response_create_queue.request_create`, drops stale handoff updates if `handoff_id` no longer matches `active_handoff`, acknowledges completed handoffs with either a canned completion string or empty output, and may trigger deferred response creation. Any API failure is mapped, logged, emitted as `RealtimeEvent::Error`, and returned.
+**Data flow**: It receives a queued `RealtimeOutbound` value. It chooses the correct websocket writer method based on v1 versus v2 and the outbound kind. For some v2 messages, it also asks `RealtimeResponseCreateQueue` to start a new model response. On failure it sends a realtime error event.
 
-**Call relations**: Called from `run_realtime_input_task` when background-agent output arrives from `RealtimeConversationManager::handoff_out`, `append_speech`, or `handoff_complete`. It is where abstract outbound intents become concrete realtime protocol writes.
+**Call relations**: `run_realtime_input_task` calls this when background-agent output arrives. It may call `request_create` so the realtime model responds after new backend information is inserted.
 
 *Call graph*: calls 4 internal fn (send_conversation_function_call_output, send_conversation_handoff_append, send_conversation_item_create, request_create); 6 external calls (send, new, map_api_error, debug!, Error, warn!).
 
@@ -7558,11 +7592,11 @@ async fn handle_realtime_server_event(
     handoff_state: &RealtimeHand
 ```
 
-**Purpose**: Processes one event from the realtime server, updates local conversation bookkeeping, emits follow-up API calls when needed, and forwards the event to the fanout channel.
+**Purpose**: Processes one event received from the realtime server. It updates local bookkeeping, sends required acknowledgements, forwards the event to listeners, and stops the loop on stream-ending errors.
 
-**Data flow**: Consumes `Result<Option<RealtimeEvent>, ApiError>`, converting stream end or API error into failure and sending `RealtimeEvent::Error` when possible. For `AudioOut` it updates `output_audio_state` in v2. For `InputAudioSpeechStarted` it may send a raw `conversation.item.truncate` payload using the accumulated audio duration. `ResponseCreated`, `ResponseCancelled`, and `ResponseDone` update the `RealtimeResponseCreateQueue`. `HandoffRequested` updates `active_handoff`, or in v2 sends steering acknowledgements and requests a new response when another handoff is already active. `NoopRequested` sends empty function output in v2. `SessionUpdated` is logged. Most events are forwarded on `events_tx`; `RealtimeEvent::Error` sets `should_stop`, causing the function to bail after forwarding.
+**Data flow**: It receives a server event result. It converts transport errors into realtime error events, updates output-audio tracking for v2, truncates playing audio when the user interrupts, tracks response lifecycle, records handoff ids, acknowledges noop or handoff calls, and finally sends the event to the output queue.
 
-**Call relations**: Called from `run_realtime_input_task` whenever the server event stream yields an item. It is the main state machine for interpreting realtime protocol events and coordinating local side effects.
+**Call relations**: `run_realtime_input_task` calls this whenever the realtime server produces an event. It uses `update_output_audio_state` for audio timing and the response-create queue methods to avoid overlapping responses.
 
 *Call graph*: calls 6 internal fn (send_conversation_function_call_output, send_payload, mark_finished, mark_started, request_create, update_output_audio_state); 9 external calls (send, new, bail!, map_api_error, error!, info!, json!, Error, warn!).
 
@@ -7577,11 +7611,11 @@ async fn handle_user_audio_input(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Consumes one queued microphone frame and writes it to the realtime transport.
+**Purpose**: Sends one queued microphone audio frame to the realtime API. It turns send failures into realtime error events.
 
-**Data flow**: Receives `Result<RealtimeAudioFrame, RecvError>`, turns channel closure into an error with context, then calls `writer.send_audio_frame(frame)`. On failure it maps/logs the error, sends `RealtimeEvent::Error` on `events_tx`, and returns an error.
+**Data flow**: It receives an audio frame from the queue. If the queue is closed, it errors. Otherwise it sends the frame through the writer; on API failure, it maps the error, emits a realtime error event, and returns failure.
 
-**Call relations**: Called from `run_realtime_input_task` when the audio input channel wins the select. It is the final transport write step for `RealtimeConversationManager::audio_in`.
+**Call relations**: `run_realtime_input_task` calls this when the audio input queue produces a frame.
 
 *Call graph*: calls 1 internal fn (send_audio_frame); 4 external calls (send, map_api_error, error!, Error).
 
@@ -7595,11 +7629,11 @@ fn update_output_audio_state(
 )
 ```
 
-**Purpose**: Tracks the cumulative played duration for the current output audio item so speech-start interruptions can truncate it accurately.
+**Purpose**: Tracks how much audio the realtime model has already produced for the current output item. This is needed so v2 sessions can truncate model audio correctly when the user interrupts.
 
-**Data flow**: Reads `frame.item_id`; if absent it returns. It computes `audio_end_ms` via `audio_duration_ms`; if zero it returns. If `output_audio_state` already exists for the same item id it saturating-adds the duration, otherwise it replaces the state with a new `OutputAudioState { item_id, audio_end_ms }`.
+**Data flow**: It reads the audio frame’s item id and duration. If the frame belongs to the current item, it adds to the stored duration. If it belongs to a new item, it replaces the stored state with that item and duration.
 
-**Call relations**: Used by `handle_realtime_server_event` on `AudioOut` events in v2. The stored state is later consumed when `InputAudioSpeechStarted` arrives.
+**Call relations**: `handle_realtime_server_event` calls this for v2 audio-output events before possible later interruption handling.
 
 *Call graph*: calls 1 internal fn (audio_duration_ms); called by 1 (handle_realtime_server_event).
 
@@ -7610,11 +7644,11 @@ fn update_output_audio_state(
 fn audio_duration_ms(frame: &RealtimeAudioFrame) -> u32
 ```
 
-**Purpose**: Computes the duration in milliseconds represented by one realtime audio frame.
+**Purpose**: Computes the length of an audio frame in milliseconds. It uses explicit sample metadata when available and otherwise estimates from the encoded audio data.
 
-**Data flow**: Reads `samples_per_channel` from the frame, falling back to `decoded_samples_per_channel(frame)` if absent. If no sample count is available it returns 0. Otherwise it divides samples by `sample_rate` (with a minimum of 1) and converts to milliseconds as `u32`.
+**Data flow**: It reads sample count or asks `decoded_samples_per_channel` to infer it, then divides by the sample rate to get milliseconds. If it cannot determine a sample count, it returns zero.
 
-**Call relations**: Called by `update_output_audio_state` to derive truncation timing from outgoing audio frames.
+**Call relations**: `update_output_audio_state` calls this to know how far into an output item the audio has played.
 
 *Call graph*: calls 1 internal fn (decoded_samples_per_channel); called by 1 (update_output_audio_state); 1 external calls (from).
 
@@ -7625,11 +7659,11 @@ fn audio_duration_ms(frame: &RealtimeAudioFrame) -> u32
 fn decoded_samples_per_channel(frame: &RealtimeAudioFrame) -> Option<u32>
 ```
 
-**Purpose**: Infers the sample count per channel by base64-decoding PCM audio data and dividing by sample width and channel count.
+**Purpose**: Infers the number of audio samples per channel from a base64-encoded audio frame. Base64 is a text form of binary data used for transport.
 
-**Data flow**: Base64-decodes `frame.data`, treats samples as 16-bit (`/ 2`), divides by `num_channels.max(1)`, and converts the result to `u32`. Any decode, division, or conversion failure yields `None`.
+**Data flow**: It decodes the frame’s data string into bytes, divides by two bytes per sample and by the number of channels, then converts the result to a 32-bit number. If any step fails, it returns nothing.
 
-**Call relations**: Used only by `audio_duration_ms` when the frame does not already carry `samples_per_channel`.
+**Call relations**: `audio_duration_ms` calls this when the frame does not already state its sample count.
 
 *Call graph*: called by 1 (audio_duration_ms); 2 external calls (try_from, from).
 
@@ -7645,11 +7679,11 @@ async fn send_conversation_error(
 )
 ```
 
-**Purpose**: Sends a protocol-level `ErrorEvent` for a realtime conversation request.
+**Purpose**: Sends a standard error event back to the client for realtime conversation input failures. It includes optional structured error information.
 
-**Data flow**: Builds `Event { id: sub_id, msg: EventMsg::Error(ErrorEvent { message, codex_error_info: Some(...) }) }` and sends it through `sess.send_event_raw().await`.
+**Data flow**: It receives the session, subscription id, message, and error category. It builds an `Error` event and sends it through the session’s raw event channel.
 
-**Call relations**: Used by `handle_audio`, `handle_text`, and `handle_speech` when request processing fails before or outside the realtime event stream.
+**Call relations**: `handle_audio`, `handle_text`, and `handle_speech` call this when user input fails and the conversation is not merely shutting down.
 
 *Call graph*: called by 3 (handle_audio, handle_speech, handle_text); 1 external calls (Error).
 
@@ -7664,11 +7698,11 @@ async fn end_realtime_conversation(
 )
 ```
 
-**Purpose**: Performs explicit conversation shutdown and then notifies the client that the realtime conversation closed.
+**Purpose**: Stops the realtime conversation and then notifies the client that it closed. It is the shared close path for requested shutdowns.
 
-**Data flow**: Calls `sess.conversation.shutdown().await`, ignores its result, then calls `send_realtime_conversation_closed(sess, sub_id, end).await`.
+**Data flow**: It calls the manager’s shutdown method and ignores its result, then sends a closed event with the supplied close reason.
 
-**Call relations**: Called by `handle_close` for user-requested shutdown. It is the explicit close path, distinct from transport-driven closure in the fanout loop.
+**Call relations**: `handle_close` calls this when the client asks to end the realtime conversation. It delegates the final notification to `send_realtime_conversation_closed`.
 
 *Call graph*: calls 1 internal fn (send_realtime_conversation_closed); called by 1 (handle_close).
 
@@ -7683,24 +7717,26 @@ async fn send_realtime_conversation_closed(
 )
 ```
 
-**Purpose**: Emits the terminal `RealtimeConversationClosed` event with a normalized reason string.
+**Purpose**: Sends the client a realtime-conversation-closed event with a simple reason string. This is how callers learn that the live session is no longer active.
 
-**Data flow**: Maps `RealtimeConversationEnd::{Requested, TransportClosed, Error}` to `"requested"`, `"transport_closed"`, or `"error"`, wraps that in `RealtimeConversationClosedEvent`, and sends it via `sess.send_event_raw().await`.
+**Data flow**: It converts the internal close reason into `requested`, `transport_closed`, or `error`, builds a closed event, and sends it through the session.
 
-**Call relations**: Used by both `end_realtime_conversation` and the fanout loop in `handle_start_inner` so all shutdown paths produce the same client-visible closure event.
+**Call relations**: `end_realtime_conversation` calls this for explicit closes, and the fanout task in `handle_start_inner` calls it when the transport ends or an error stops the conversation.
 
 *Call graph*: called by 2 (end_realtime_conversation, handle_start_inner); 1 external calls (RealtimeConversationClosed).
 
 
 ### `realtime-webrtc/src/lib.rs`
 
-`io_transport` · `realtime conversation`
+`io_transport` · `session setup and live connection`
 
-This crate is a narrow transport adapter around a native realtime WebRTC implementation. The public API consists of a startup result (`StartedRealtimeWebrtcSession`) containing the local offer SDP, a session handle, and an `mpsc::Receiver` of `RealtimeWebrtcEvent`s; a `RealtimeWebrtcSessionHandle` for applying the remote answer SDP, closing the session, and reading a shared local-audio peak meter; and a `RealtimeWebrtcSession::start()` entrypoint.
+WebRTC is a way for two programs to open a live media connection, often for audio or video. This file defines the small set of things the rest of the app needs: how to start a session, how to finish the connection handshake, how to close it, and how to listen for connection events.
 
-The implementation is intentionally split by platform. On macOS, the handle wraps `native::SessionHandle` and `RealtimeWebrtcSession::start()` delegates to `native::start()`, then wraps the returned native handle and event receiver while initializing `local_audio_peak` to `Arc<AtomicU16>::new(0)`. On non-macOS targets, startup and SDP application return `RealtimeWebrtcError::UnsupportedPlatform`, and `close()` becomes a no-op. This keeps the API available everywhere without pretending the feature works cross-platform.
+The important idea is that WebRTC setup happens in two halves. First, this code creates an “offer SDP”, which is a text description of what this side can do and how to reach it. That offer must be sent to the other side. The other side replies with an “answer SDP”, and `apply_answer_sdp` feeds that answer back into the session so the connection can finish opening.
 
-The custom `Debug` impl for `RealtimeWebrtcSessionHandle` deliberately hides internal fields by using `finish_non_exhaustive()`, which avoids exposing native handle details in logs. The event enum is small and transport-oriented: connected, local audio level updates, closed, and failed-with-message.
+The file also defines events such as connected, closed, failed, and local audio level updates. These events travel through a channel, which is like a small mailbox that one part of the program can read while another part sends updates.
+
+A key behavior is platform support. On macOS, the work is handed to the `native` module. On every other operating system, starting or applying an answer returns an “unsupported platform” error. Without this file, callers would need to know platform details and native WebRTC setup rules themselves.
 
 #### Function details
 
@@ -7710,11 +7746,11 @@ The custom `Debug` impl for `RealtimeWebrtcSessionHandle` deliberately hides int
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats the session handle for debugging without exposing internal implementation details.
+**Purpose**: This gives the session handle a safe debug-print form for logs or developer tools. It deliberately avoids exposing internal details, because the handle contains platform-specific pieces that are not useful or safe to print directly.
 
-**Data flow**: Takes `&self` and a formatter → creates a debug struct named `RealtimeWebrtcSessionHandle` and finishes it as non-exhaustive → returns the formatting result.
+**Data flow**: It receives a formatting target from Rust’s debug-print system. It writes a short label saying this is a `RealtimeWebrtcSessionHandle`, marks the output as not showing every internal field, and returns whether formatting succeeded.
 
-**Call relations**: Used implicitly by debug logging or test output. It intentionally does not reveal the native handle or shared audio-peak state.
+**Call relations**: When some other code tries to print the handle with debug formatting, Rust calls this function. It hands the actual text-building work to the standard debug-structure formatter.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -7725,11 +7761,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn apply_answer_sdp(&self, answer_sdp: String) -> Result<()>
 ```
 
-**Purpose**: Applies the remote answer SDP to an already-started WebRTC session. This is only supported on macOS.
+**Purpose**: This function completes the WebRTC handshake by accepting the other side’s answer description. A caller uses it after sending out this session’s offer and receiving the remote reply.
 
-**Data flow**: Takes `answer_sdp: String` → on macOS forwards it to `self.inner.apply_answer_sdp(answer_sdp)` and returns that `Result<()>`; on non-macOS drops the string and returns `Err(RealtimeWebrtcError::UnsupportedPlatform)`.
+**Data flow**: It takes an answer SDP string, which is the remote side’s connection description. On macOS, it passes that string into the native session handle so the WebRTC connection can continue. On unsupported platforms, it discards the string and returns an unsupported-platform error.
 
-**Call relations**: Called after `RealtimeWebrtcSession::start()` when the remote peer returns an answer SDP. It delegates to the native session handle only on supported platforms.
+**Call relations**: This is called after `RealtimeWebrtcSession::start` has produced an offer and the remote side has answered it. On macOS it delegates the real work to the native handle’s `apply_answer_sdp`; otherwise it stops the flow with a clear error.
 
 *Call graph*: 1 external calls (apply_answer_sdp).
 
@@ -7740,11 +7776,11 @@ fn apply_answer_sdp(&self, answer_sdp: String) -> Result<()>
 fn close(&self)
 ```
 
-**Purpose**: Closes the underlying realtime WebRTC session if the platform supports it.
+**Purpose**: This asks the live WebRTC session to shut down. It is the cleanup button for callers that are done with the realtime connection.
 
-**Data flow**: Takes `&self` → on macOS calls `self.inner.close()`; on non-macOS performs no action → returns unit.
+**Data flow**: It takes the existing session handle. On macOS, it tells the native handle to close the underlying connection. On other platforms, there is no native session to close, so it does nothing.
 
-**Call relations**: Used during teardown or explicit realtime-session shutdown. It is a best-effort no-op on unsupported platforms.
+**Call relations**: This is used near the end of a session, for example when the user hangs up or the app is tearing down. On macOS it forwards the close request to the native implementation.
 
 *Call graph*: 1 external calls (close).
 
@@ -7755,11 +7791,11 @@ fn close(&self)
 fn local_audio_peak(&self) -> Arc<AtomicU16>
 ```
 
-**Purpose**: Returns a clone of the shared atomic local-audio peak meter for the session.
+**Purpose**: This returns a shared number representing the current local audio peak level. Callers can use it to inspect or display how loud the local audio input is.
 
-**Data flow**: Reads `self.local_audio_peak` → clones the `Arc<AtomicU16>` → returns the clone.
+**Data flow**: It reads the handle’s shared audio-level storage and returns another shared pointer to the same atomic number. “Atomic” means the number can be read or changed safely by different threads without them stepping on each other.
 
-**Call relations**: Used by callers that want to observe or publish local audio level state without taking ownership of the handle.
+**Call relations**: Code that wants to show or monitor local audio level calls this on the session handle. The function does not compute the level itself; it only gives access to the shared place where that value is stored.
 
 
 ##### `RealtimeWebrtcSession::start`  (lines 72–89)
@@ -7768,24 +7804,26 @@ fn local_audio_peak(&self) -> Arc<AtomicU16>
 fn start() -> Result<StartedRealtimeWebrtcSession>
 ```
 
-**Purpose**: Starts a new realtime WebRTC session and returns the local offer SDP, a handle, and an event receiver. This is only implemented on macOS.
+**Purpose**: This starts a new realtime WebRTC session and gives the caller everything needed to continue setup. The result includes the local offer text, a handle for controlling the session, and a mailbox of events.
 
-**Data flow**: On macOS, calls `native::start()?`, then constructs `StartedRealtimeWebrtcSession { offer_sdp: started.offer_sdp, handle: RealtimeWebrtcSessionHandle { inner: started.handle, local_audio_peak: Arc::new(AtomicU16::new(0)) }, events: started.events }` and returns `Ok(...)`; on non-macOS returns `Err(RealtimeWebrtcError::UnsupportedPlatform)`.
+**Data flow**: It takes no input from the caller. On macOS, it asks the native implementation to start, then wraps the native handle in the public handle type, creates a shared audio-peak value initialized to zero, and returns the offer SDP plus the event receiver. On unsupported platforms, it returns an unsupported-platform error instead.
 
-**Call relations**: This is the crate’s main entrypoint for realtime WebRTC transport setup. It delegates all actual session creation to the platform-native module and wraps the result in the cross-platform API surface.
+**Call relations**: This is the first call in the session flow. It calls the native `start` function on macOS, then builds the public objects that the rest of the app will use. After this returns successfully, the caller sends the offer SDP to the remote side, waits for an answer, and then calls `RealtimeWebrtcSessionHandle::apply_answer_sdp`.
 
 *Call graph*: calls 1 internal fn (start); 2 external calls (new, new).
 
 
 ### `realtime-webrtc/src/native.rs`
 
-`io_transport` · `session startup, answer application, live connection monitoring, shutdown`
+`io_transport` · `session startup, connection negotiation, live audio monitoring, teardown`
 
-This file is the native WebRTC backend for a realtime session. Its core design is a thread boundary: `start` creates three standard-library MPSC channels, spawns a named worker thread, waits synchronously for the worker to produce an SDP offer, and returns a `StartedSession` containing that offer, a `SessionHandle`, and an event receiver. `SessionHandle` is intentionally tiny; it only sends `Command` messages (`ApplyAnswer` with a reply channel, or `Close`) into the worker.
+This file is the bridge between the rest of the project and the native WebRTC library. WebRTC is the technology used for live audio communication. The rest of the app should not have to know all the steps needed to create a WebRTC connection, attach the microphone, exchange setup text, or poll audio statistics, so this file hides those details behind a small session API.
 
-Inside `worker_main`, the worker first builds a dedicated Tokio runtime. Startup failures are reported in two places: the initial offer channel gets an error so `start` fails immediately, and the event channel gets `RealtimeWebrtcEvent::Failed` for observers. On success, the worker asynchronously creates a `PeerConnection`, adds a send/receive audio transceiver with stream id `realtime`, creates a local audio source/track named `realtime-mic`, attaches it to the sender, creates an offer, and sets that offer as the local description before returning the SDP string.
+The main flow starts with `start`. It creates channels, which are message pipes between threads, then launches a dedicated worker thread for WebRTC work. That worker creates its own Tokio runtime, which is an engine for running asynchronous tasks. Inside that runtime it builds a peer connection, adds a send-and-receive audio track, creates a WebRTC offer, and sends the offer text back to the caller.
 
-After startup, the worker processes commands serially. Applying an answer parses SDP as `SdpType::Answer`, sets the remote description, replies to the caller, and only on success emits `Connected` and starts a periodic Tokio task that polls `get_stats()` every 200 ms. That task extracts the first audio `RtcStats::MediaSource` entry, converts its normalized `audio_level` into a `u16` peak scaled to `i16::MAX`, and emits `LocalAudioLevel`. Both explicit `Close` and channel shutdown close the peer connection and emit `Closed`. Error wrapping is standardized through `message_error`, so all libwebrtc failures become `RealtimeWebrtcError::Message` with operation-specific prefixes.
+After startup, the caller uses `SessionHandle` like a remote control. It can apply the remote side's answer SDP, which is the text description that completes the WebRTC negotiation, or it can close the session. Once the answer is accepted, the file reports a connected event and starts a repeating task that checks WebRTC stats every 200 milliseconds. If it finds a local audio level, it converts that 0-to-1 value into a simple peak number and sends it as an event.
+
+Without this file, the app would have no native WebRTC audio session: no offer creation, no answer application, no microphone track, and no ongoing audio-level feedback.
 
 #### Function details
 
@@ -7795,11 +7833,11 @@ After startup, the worker processes commands serially. Applying an answer parses
 fn apply_answer_sdp(&self, answer_sdp: String) -> Result<()>
 ```
 
-**Purpose**: Synchronously asks the worker thread to apply a remote answer SDP and waits for the result. It turns worker disappearance into a user-facing `RealtimeWebrtcError::Message`.
+**Purpose**: Sends the remote WebRTC answer text to the worker thread and waits to hear whether it was accepted. This is the step that completes the connection setup after the local offer has been sent elsewhere.
 
-**Data flow**: Takes `&self` and an owned `answer_sdp: String`. It creates a one-shot reply channel, sends `Command::ApplyAnswer { answer_sdp, reply }` through `command_tx`, then blocks on `reply_rx.recv()`; the returned `Result<()>` comes from the worker, while send/receive failures are converted into a "realtime WebRTC worker stopped" error.
+**Data flow**: It receives an SDP answer string, creates a temporary reply channel, and sends an `ApplyAnswer` command to the worker. The worker later sends back success or an error through that reply channel. If the worker has stopped or cannot reply, this function turns that into a clear `realtime WebRTC worker stopped` error.
 
-**Call relations**: This is the caller-facing control path into `worker_main` for remote SDP completion. The worker receives the command, invokes `apply_answer`, and if that succeeds continues by emitting `Connected` and launching `start_local_audio_level_task` before replying.
+**Call relations**: Code holding a `SessionHandle` calls this after it has received the remote side's answer. The function does not apply the answer itself; it passes the work to `worker_main`, which then calls `apply_answer` inside the WebRTC runtime and sends the result back.
 
 *Call graph*: 2 external calls (send, channel).
 
@@ -7810,11 +7848,11 @@ fn apply_answer_sdp(&self, answer_sdp: String) -> Result<()>
 fn close(&self)
 ```
 
-**Purpose**: Requests orderly shutdown of the worker-owned peer connection without waiting for confirmation. It deliberately ignores send failures because a stopped worker is already effectively closed.
+**Purpose**: Asks the WebRTC worker to close the session. It is a best-effort shutdown signal, so it does not report an error if the worker is already gone.
 
-**Data flow**: Reads `self.command_tx` and sends `Command::Close`. It returns `()` and does not mutate local state beyond attempting the channel send.
+**Data flow**: It takes no session data from the caller beyond the handle itself. It sends a `Close` command through the command channel. The actual peer connection is closed later by the worker thread.
 
-**Call relations**: This is the explicit shutdown trigger consumed by `worker_main`. When the worker sees `Close`, it closes the `PeerConnection`, emits `RealtimeWebrtcEvent::Closed`, and exits.
+**Call relations**: Callers use this when they are done with the real-time audio session. `worker_main` receives the close command, closes the peer connection, sends a closed event, and exits.
 
 *Call graph*: 1 external calls (send).
 
@@ -7825,11 +7863,11 @@ fn close(&self)
 fn start() -> Result<StartedSession>
 ```
 
-**Purpose**: Bootstraps a new native WebRTC session and blocks until the worker has either produced an SDP offer or failed during initialization. It packages the resulting channels into `StartedSession`.
+**Purpose**: Starts a new native WebRTC session and returns the initial offer, a handle for later commands, and a stream of events. This is the main entry point for this file's functionality.
 
-**Data flow**: Creates command, event, and offer channels; spawns a named OS thread running `worker_main(command_rx, events_tx, offer_tx)`; then waits on `offer_rx.recv()`. On success it returns `StartedSession { offer_sdp, handle: SessionHandle { command_tx }, events: events_rx }`; thread-spawn or startup-channel failures become `RealtimeWebrtcError::Message`.
+**Data flow**: It creates three channels: one for commands going to the worker, one for events coming back, and one for the initial offer result. It spawns a named worker thread, waits for that worker to produce either an offer SDP string or an error, and then returns a `StartedSession` containing the offer, the command handle, and the event receiver.
 
-**Call relations**: This is the file’s top-level constructor, invoked by the crate-level startup path. It delegates all real WebRTC setup to `worker_main` and only returns once that worker has completed `create_peer_connection_and_offer`.
+**Call relations**: This is called by the higher-level realtime WebRTC startup code. It hands long-running work to `worker_main` on a separate thread, then packages the returned pieces so the rest of the app can continue the negotiation and listen for connection events.
 
 *Call graph*: called by 1 (start); 2 external calls (channel, new).
 
@@ -7844,11 +7882,11 @@ fn worker_main(
 )
 ```
 
-**Purpose**: Owns the Tokio runtime and `PeerConnection`, performs startup negotiation, then serially executes commands from the control channel. It is the central coordinator for session lifecycle and event emission.
+**Purpose**: Runs the WebRTC session on its own thread. It creates the asynchronous runtime, builds the peer connection, listens for commands, and sends events back to the rest of the app.
 
-**Data flow**: Consumes `command_rx`, `events_tx`, and `offer_tx`. It builds a multi-thread Tokio runtime; on failure it sends an error to `offer_tx` and a `Failed` event. It then `block_on`s `create_peer_connection_and_offer`; on success it sends the offer SDP back, on failure it reports through both channels and returns. In the command loop, `ApplyAnswer` runs `apply_answer`; successful application emits `Connected` and starts `start_local_audio_level_task`, then replies with the result. `Close` closes the peer connection, emits `Closed`, and exits. If the command channel closes naturally, it also closes the connection and emits `Closed`.
+**Data flow**: It receives a command channel, an event sender, and an offer-result sender. First it builds a Tokio runtime. Then it uses that runtime to create the WebRTC peer connection and offer. After that, it loops over incoming commands: an answer command is applied to the connection, and a close command shuts everything down. It sends back events such as failed, connected, local audio level, and closed.
 
-**Call relations**: Spawned only by `start`, this function drives every other helper in the file. It delegates startup to `create_peer_connection_and_offer`, answer installation to `apply_answer`, and post-connect telemetry to `start_local_audio_level_task`.
+**Call relations**: `start` launches this function in a separate thread. During setup it calls `create_peer_connection_and_offer`. When an answer arrives, it calls `apply_answer`; on success it starts `start_local_audio_level_task` so audio-level events can be reported while the connection stays alive.
 
 *Call graph*: calls 3 internal fn (apply_answer, create_peer_connection_and_offer, start_local_audio_level_task); 6 external calls (clone, send, format!, Message, Failed, new_multi_thread).
 
@@ -7859,11 +7897,11 @@ fn worker_main(
 async fn create_peer_connection_and_offer() -> Result<(PeerConnection, String)>
 ```
 
-**Purpose**: Constructs the libwebrtc peer connection, attaches a local audio track, creates an SDP offer, and installs that offer as the local description. It returns both the live `PeerConnection` and the serialized offer SDP.
+**Purpose**: Creates the local WebRTC peer connection and produces the offer text that must be sent to the remote side. It also attaches the local microphone audio track so the session can send audio.
 
-**Data flow**: Creates a `PeerConnectionFactory` via `with_platform_adm`, then a `PeerConnection` with default `RtcConfiguration`. It adds an audio transceiver configured `SendRecv` with stream id `realtime`, creates an audio source and track named `realtime-mic`, attaches the track to the transceiver sender, asynchronously creates an offer with audio receive enabled and video disabled, sets that offer as the local description, and returns `(peer_connection, offer.to_string())`. Any libwebrtc error is wrapped by `message_error` into `RealtimeWebrtcError::Message`.
+**Data flow**: It builds a WebRTC peer connection factory with the platform audio system, creates a peer connection with default settings, adds an audio transceiver for sending and receiving audio, creates a local microphone track, attaches that track, creates an offer, sets that offer as the local description, and returns both the peer connection and the offer SDP string.
 
-**Call relations**: Called during worker startup from `worker_main`. Its successful completion is the prerequisite for `start` to return a usable session and for later `apply_answer` commands to make sense.
+**Call relations**: `worker_main` calls this during session startup. If any WebRTC setup step fails, this function uses `message_error` to turn the library error into the project's error type, and `worker_main` reports that failure to the caller and event stream.
 
 *Call graph*: called by 1 (worker_main); 4 external calls (with_platform_adm, default, new, vec!).
 
@@ -7874,11 +7912,11 @@ async fn create_peer_connection_and_offer() -> Result<(PeerConnection, String)>
 async fn apply_answer(peer_connection: &PeerConnection, answer_sdp: String) -> Result<()>
 ```
 
-**Purpose**: Parses the remote answer SDP and installs it as the peer connection’s remote description. It is the final negotiation step after the local offer has been created.
+**Purpose**: Applies the remote side's WebRTC answer to the existing peer connection. This completes the offer-answer handshake, which is like both sides agreeing on how they will talk.
 
-**Data flow**: Takes a borrowed `PeerConnection` and owned `answer_sdp: String`. It parses the string into a `SessionDescription` with `SdpType::Answer`, awaits `set_remote_description(answer)`, and returns `Ok(())` on success; parse or set failures are converted with `message_error`.
+**Data flow**: It receives a peer connection and an SDP answer string. It parses the string as a WebRTC answer, then sets it as the remote description on the peer connection. It returns success if the connection accepts it, or a readable error if parsing or applying fails.
 
-**Call relations**: Invoked by `worker_main` when it receives `Command::ApplyAnswer`. A successful return is what causes the worker to emit `Connected` and begin periodic local audio-level polling.
+**Call relations**: `worker_main` calls this when it receives an `ApplyAnswer` command from `SessionHandle::apply_answer_sdp`. If this succeeds, `worker_main` announces that the session is connected and starts the local audio level reporting task.
 
 *Call graph*: called by 1 (worker_main); 2 external calls (set_remote_description, parse).
 
@@ -7889,11 +7927,11 @@ async fn apply_answer(peer_connection: &PeerConnection, answer_sdp: String) -> R
 fn message_error(prefix: &str, err: impl Display) -> RealtimeWebrtcError
 ```
 
-**Purpose**: Normalizes lower-level errors into the crate’s message-style WebRTC error variant with an operation-specific prefix. It keeps all user-visible failures consistently formatted.
+**Purpose**: Turns a lower-level error into this crate's standard WebRTC error message. It adds a short explanation of which step failed, so failures are easier to understand.
 
-**Data flow**: Takes a `prefix: &str` and any `Display` error, formats `"{prefix}: {err}"`, and returns `RealtimeWebrtcError::Message(...)`.
+**Data flow**: It takes a prefix such as `failed to create WebRTC offer` and an error value from another library. It combines them into one human-readable string and wraps that string in `RealtimeWebrtcError::Message`.
 
-**Call relations**: Used as the common error adapter by `create_peer_connection_and_offer` and `apply_answer`, so startup and negotiation failures surface with concrete context instead of raw libwebrtc errors.
+**Call relations**: Setup and negotiation helpers use this whenever a WebRTC library call fails. It keeps error wording consistent for `create_peer_connection_and_offer` and `apply_answer`.
 
 *Call graph*: 2 external calls (format!, Message).
 
@@ -7908,11 +7946,11 @@ fn start_local_audio_level_task(
 )
 ```
 
-**Purpose**: Launches a background Tokio task that periodically samples local audio stats and emits `LocalAudioLevel` events while the connection remains alive. It stops automatically once the peer connection is closed or failed.
+**Purpose**: Starts a background task that periodically measures the local microphone audio level and sends it as an event. This gives the rest of the app simple feedback such as whether the user is speaking.
 
-**Data flow**: Takes a Tokio `Runtime`, a cloned `PeerConnection`, and an event sender. It spawns an async loop with a 200 ms interval; each tick checks `peer_connection.connection_state()`, returns if the state is `Closed` or `Failed`, otherwise awaits `local_audio_level(&peer_connection)` and, when it yields `Some(peak)`, sends `RealtimeWebrtcEvent::LocalAudioLevel(peak)`.
+**Data flow**: It receives the Tokio runtime, a peer connection, and an event sender. It spawns an asynchronous loop that wakes every 200 milliseconds. Each time, it stops if the connection is closed or failed; otherwise it asks `local_audio_level` for the current level and sends a `LocalAudioLevel` event when a value is available.
 
-**Call relations**: Started by `worker_main` only after `apply_answer` succeeds. It delegates stat extraction to `local_audio_level` and acts as the long-running telemetry sidecar for an established session.
+**Call relations**: `worker_main` starts this task after `apply_answer` succeeds, because audio statistics are useful once the session is connected. The task repeatedly calls `local_audio_level` and forwards the converted result through the same event channel used for connection events.
 
 *Call graph*: calls 1 internal fn (local_audio_level); called by 1 (worker_main); 6 external calls (spawn, send, matches!, LocalAudioLevel, from_millis, interval).
 
@@ -7923,11 +7961,11 @@ fn start_local_audio_level_task(
 async fn local_audio_level(peer_connection: &PeerConnection) -> Option<u16>
 ```
 
-**Purpose**: Extracts the current local audio level from WebRTC stats, if an audio media-source stat is available. It converts the normalized floating-point level into the integer peak format used by events.
+**Purpose**: Reads WebRTC statistics and extracts the local audio source level if one is available. It turns a large stats report into just the one value the app needs.
 
-**Data flow**: Borrows a `PeerConnection`, awaits `get_stats()`, and returns `None` if stats retrieval fails. It iterates through the resulting `RtcStats` values, finds the first `RtcStats::MediaSource` whose `source.kind` is `"audio"`, maps its `stats.audio.audio_level` through `audio_level_to_peak`, and returns `Some(u16)`; otherwise it returns `None`.
+**Data flow**: It asks the peer connection for its current stats. From those stats, it searches for a media source whose kind is audio. If it finds one, it takes the audio level, converts it to a peak number with `audio_level_to_peak`, and returns it. If stats cannot be read or no audio source is found, it returns nothing.
 
-**Call relations**: Called from the loop inside `start_local_audio_level_task`. It is intentionally best-effort: missing stats or non-audio stats simply suppress an event for that tick.
+**Call relations**: `start_local_audio_level_task` calls this on every timer tick. This function does the focused stats lookup, while the caller decides when to repeat it and where to send the resulting event.
 
 *Call graph*: called by 1 (start_local_audio_level_task); 1 external calls (get_stats).
 
@@ -7938,8 +7976,8 @@ async fn local_audio_level(peer_connection: &PeerConnection) -> Option<u16>
 fn audio_level_to_peak(audio_level: f64) -> u16
 ```
 
-**Purpose**: Converts libwebrtc’s normalized audio level into a 16-bit peak-like integer scale suitable for UI/event consumers. It clamps out-of-range inputs before scaling.
+**Purpose**: Converts WebRTC's audio level scale into a simple peak value. WebRTC gives a floating-point number from 0.0 to 1.0, while the app reports a whole-number peak value.
 
-**Data flow**: Takes `audio_level: f64`, clamps it to `[0.0, 1.0]`, multiplies by `i16::MAX as f64`, rounds, and casts to `u16`.
+**Data flow**: It receives an audio level, clamps it into the safe 0.0-to-1.0 range, multiplies it by the maximum signed 16-bit audio sample value, rounds it, and returns the result as an unsigned 16-bit number.
 
-**Call relations**: Used only by `local_audio_level` as the final numeric transformation before `RealtimeWebrtcEvent::LocalAudioLevel` is emitted.
+**Call relations**: `local_audio_level` uses this after it finds an audio level in the WebRTC stats. It is the final translation step before `start_local_audio_level_task` sends a `LocalAudioLevel` event.

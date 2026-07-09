@@ -1,12 +1,14 @@
 # Shutdown, cleanup, and teardown  `stage-17`
 
-This stage runs at the end of a connection, session, or process and provides the system’s bounded graceful-shutdown path. Its job is to stop admitting new work, let in-flight work finish where possible, and then tear down remaining runtime state without losing important persisted metadata.
+This stage covers the “put everything away safely” part of the system. It happens when a connection, session, agent, or daemon is ending, and its job is to stop new work, let safe in-progress work finish, and release anything the system was holding.
 
-In the server, connection_rpc_gate.rs is the first line of shutdown coordination for each connection: it flips a per-connection acceptance flag so no new initialized RPC handlers can start, while tracking already-running handlers with task tokens until they drain. connection_cleanup.rs complements that gate by managing the cleanup tasks spawned for a connection; it can collect completions incrementally, wait for all cleanup work, or abort stragglers if shutdown deadlines require it.
+The connection RPC gate is like a door monitor for one client connection. RPC means “remote procedure call”: a request sent over the connection asking the server to do something. During shutdown, the gate blocks new request handlers from starting, but allows ones already running to complete.
 
-At the domain layer, core/src/agent/control/legacy.rs closes existing agent threads and recursively shuts down live descendants, while also persisting closed spawn-edge information so the stored thread tree remains consistent with in-memory teardown.
+The connection cleanup tracker manages jobs that continue briefly after a connection ends. It starts these cleanup tasks, records whether they succeed or fail, and can cancel them if the whole server is shutting down.
 
-At the process level, app-server-daemon/src/update_loop.rs governs the daemon’s Unix updater lifecycle, periodically refreshing the managed installer and performing restart or re-exec when binaries change, ensuring teardown and replacement happen in a controlled way.
+The legacy agent control code handles older paths for stopping agents. It asks live agents to shut down cleanly, flushes their saved work, and removes their stored parent-child relationship.
+
+The daemon update loop is also part of teardown in practice: after downloading updates, it detects changed binaries and restarts the daemon in a controlled way.
 
 ## Files in this stage
 
@@ -15,13 +17,13 @@ Handles the updater-driven daemon lifecycle, including periodic refresh checks a
 
 ### `app-server-daemon/src/update_loop.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `background updater loop`
 
-This module is the long-running updater driver for Unix platforms. `run` installs a SIGTERM handler, captures the identity of the currently running updater executable, waits an initial five-minute delay, and then enters an hourly loop. Each iteration calls `update_once`; errors are intentionally swallowed so the loop keeps trying on the next interval, while an explicit stop signal exits cleanly. On non-Unix builds, `run` immediately fails because the PID-managed updater model is unsupported there.
+This file is the daemon’s self-update loop. Its job is to keep the installed Codex command fresh without interrupting work more than necessary. Think of it like a night-shift maintenance worker: it waits a bit after startup, checks for updates on a schedule, and only restarts the running service when the update means the service should be refreshed.
 
-The core work happens in `update_once`. It first downloads and executes the latest standalone install script via `install_latest_standalone`, then reconstructs daemon context from environment variables, resolves the managed Codex binary path, and computes executable identities for both the running updater and managed binary. `update_modes_for_identities` decides whether the daemon restart can be version-conditional or must be unconditional with updater re-exec support: identical binaries mean `IfVersionChanged`/`None`, differing binaries mean `Always`/`ReexecIfManagedBinaryChanged`.
+On Unix systems, the loop first installs a shutdown listener for the terminate signal, which is the operating system’s polite way of asking a process to stop. It records the identity of the updater executable that is currently running, waits five minutes, then repeatedly performs one update pass every hour. Each pass downloads and runs the standalone installer script from chatgpt.com. After that, it finds the managed Codex binary, compares its executable identity with the updater that is already running, and chooses how aggressively to restart or refresh.
 
-After that, `update_once` repeatedly calls `daemon.try_restart_if_running(...)`. A `Busy` outcome triggers a short 50 ms retry sleep; any other outcome ends the iteration. Termination is checked both before each retry and during sleeps so shutdown is responsive. `reexec_managed_updater` performs the actual `exec()` replacement into the managed binary, preserving the updater subcommand arguments. `install_latest_standalone` is deliberately quiet: it fetches `https://chatgpt.com/codex/install.sh`, pipes it into `/bin/sh -s`, suppresses stdout/stderr, and fails if the shell exits nonzero.
+If the daemon is busy, the loop retries very quickly, but it keeps listening for shutdown so it can stop cleanly. If the managed binary has changed, the updater may replace its own process with the managed binary so future update checks run from the freshly installed version. On non-Unix platforms, this pid-managed updater loop is not supported and reports an error instead.
 
 #### Function details
 
@@ -31,11 +33,11 @@ After that, `update_once` repeatedly calls `daemon.try_restart_if_running(...)`.
 async fn run() -> Result<()>
 ```
 
-**Purpose**: Starts the periodic updater loop, wiring together signal handling, initial delay, repeated update attempts, and graceful termination. On unsupported platforms it returns an immediate error instead of entering a loop.
+**Purpose**: Starts and drives the updater loop. On Unix, it waits for shutdown signals, delays the first update, runs update checks forever, and exits cleanly when asked to terminate. On non-Unix systems, it reports that this updater style is unsupported.
 
-**Data flow**: On Unix, creates a SIGTERM `Signal`, computes the current updater executable identity, waits `INITIAL_UPDATE_DELAY`, then repeatedly invokes `update_once` and sleeps `UPDATE_INTERVAL` between iterations. It returns `Ok(())` on clean termination or propagates setup failures such as inability to install the signal handler or inspect the current executable.
+**Data flow**: It begins with no caller-provided input, then creates a listener for the operating system terminate signal and reads the identity of the currently running updater executable. It waits for the initial delay unless a shutdown arrives first. After that, it repeatedly asks `update_once` to perform a single update pass, waits for the regular update interval, and returns success when the loop is told to stop. On unsupported platforms, it immediately returns an error.
 
-**Call relations**: This function is called by `run_pid_update_loop`, making it the top-level driver for this subsystem. It delegates one-shot work to `current_updater_identity`, uses `sleep_or_terminate` for interruptible waits, and hands each cycle to `update_once`; its match logic intentionally ignores `Err(_)` from `update_once` so transient update failures do not kill the daemon.
+**Call relations**: This is called by `run_pid_update_loop` when the daemon wants to start the pid-managed updater. It calls `current_updater_identity` once at startup, uses `sleep_or_terminate` between work cycles, and calls `update_once` for each actual update attempt. It also installs the terminate signal listener so the rest of the loop can stop promptly.
 
 *Call graph*: calls 3 internal fn (current_updater_identity, sleep_or_terminate, update_once); called by 1 (run_pid_update_loop); 3 external calls (terminate, bail!, signal).
 
@@ -46,11 +48,11 @@ async fn run() -> Result<()>
 async fn sleep_or_terminate(duration: Duration, terminate: &mut Signal) -> bool
 ```
 
-**Purpose**: Performs an interruptible sleep that can be cut short by SIGTERM. It centralizes the updater loop’s shutdown-aware waiting behavior.
+**Purpose**: Waits for either a timer to finish or a shutdown request to arrive. It lets the updater pause without becoming deaf to termination.
 
-**Data flow**: Takes a `Duration` and mutable access to the installed Unix `Signal` stream → races `tokio::time::sleep(duration)` against `terminate.recv()` with `tokio::select!`. Returns `false` if the timer elapsed first and `true` if a termination signal arrived first.
+**Data flow**: It receives a duration and a mutable terminate-signal listener. It waits on both at the same time: the timer and the next terminate signal. It returns `false` if the timer completed normally, or `true` if a terminate signal arrived first.
 
-**Call relations**: Both `run` and `update_once` use this helper whenever they need to wait without becoming unresponsive to shutdown. It does not delegate to internal helpers beyond Tokio’s select machinery.
+**Call relations**: `run` uses this during the initial delay and between hourly update passes. `update_once` uses it when the daemon is busy and the updater needs to retry soon. It is the small helper that keeps long waits responsive to shutdown.
 
 *Call graph*: called by 2 (run, update_once); 1 external calls (select!).
 
@@ -64,11 +66,11 @@ async fn update_once(
 ) -> Result<UpdateLoopControl>
 ```
 
-**Purpose**: Executes one updater cycle: refresh the standalone install, inspect the managed binary, choose restart behavior, and retry daemon restart while the daemon reports itself busy. It is the unit of work repeated by the outer loop.
+**Purpose**: Performs one full update attempt: install the latest standalone Codex, inspect the managed binary, choose the right restart behavior, and try to restart the daemon if appropriate.
 
-**Data flow**: Consumes `running_updater_identity: &ExecutableIdentity` and mutable `terminate: &mut Signal` → runs `install_latest_standalone`, builds a `Daemon` from environment, resolves the managed Codex binary path, computes its `ExecutableIdentity`, derives `(RestartMode, UpdaterRefreshMode)`, then loops calling `daemon.try_restart_if_running(...)`. Returns `UpdateLoopControl::Continue` after any non-busy restart outcome, `UpdateLoopControl::Stop` if termination is observed, or an error if install/environment/path/identity/restart operations fail.
+**Data flow**: It receives the identity of the updater executable that was running when the loop started, plus the terminate-signal listener. First it runs `install_latest_standalone`. Then it reads daemon settings from the environment, resolves the path to the managed Codex binary, and computes that binary’s identity. It compares the two identities to choose restart and updater-refresh modes. It then tries to restart the daemon if it is running. If the daemon is busy, it waits briefly and retries unless a terminate signal arrives. It returns `Continue` when the update pass is complete, or `Stop` when shutdown should end the whole loop.
 
-**Call relations**: This is invoked by `run` once per update interval. It delegates environment reconstruction to `Daemon::from_environment`, binary resolution and hashing/identity work to `resolved_managed_codex_bin` and `executable_identity`, policy selection to `update_modes_for_identities`, and uses `sleep_or_terminate` to back off when `try_restart_if_running` reports `RestartIfRunningOutcome::Busy`.
+**Call relations**: `run` calls this once per update cycle. Inside the cycle it hands off installation to `install_latest_standalone`, identity checking to `executable_identity` and `resolved_managed_codex_bin`, policy selection to `update_modes_for_identities`, and restart work to the daemon’s `try_restart_if_running`. Its retry path uses `sleep_or_terminate` so shutdown still wins over retrying.
 
 *Call graph*: calls 6 internal fn (from_environment, executable_identity, resolved_managed_codex_bin, install_latest_standalone, sleep_or_terminate, update_modes_for_identities); called by 1 (run); 1 external calls (recv).
 
@@ -79,11 +81,11 @@ async fn update_once(
 async fn current_updater_identity() -> Result<ExecutableIdentity>
 ```
 
-**Purpose**: Determines the executable identity of the updater process currently running this code. That identity is later compared against the managed binary to decide whether a re-exec is necessary.
+**Purpose**: Figures out exactly which updater executable is currently running. This matters because the loop later compares it with the managed Codex binary to decide whether the updater itself should be refreshed.
 
-**Data flow**: Reads the current process executable path via `std::env::current_exe()` → passes that path to `executable_identity` → returns the resulting `ExecutableIdentity`. It writes no state and only propagates contextualized errors.
+**Data flow**: It reads the current process’s executable path from the operating system. It then passes that path to `executable_identity`, which produces an identity value for the file. The result is returned to the caller, or an error is returned if the path or identity cannot be read.
 
-**Call relations**: Called once by `run` during startup before the initial delay. It exists to isolate the current-process inspection step from the rest of the loop logic.
+**Call relations**: `run` calls this once before the first update delay. The identity it returns is carried into every `update_once` call, where it is compared with the managed binary’s identity.
 
 *Call graph*: calls 1 internal fn (executable_identity); called by 1 (run); 1 external calls (current_exe).
 
@@ -97,11 +99,11 @@ fn update_modes_for_identities(
 ) -> (RestartMode, UpdaterRefreshMode)
 ```
 
-**Purpose**: Maps the relationship between the running updater binary and the managed binary into concrete restart and updater-refresh policies. Equality means a lighter restart policy; inequality forces a restart and possible updater replacement.
+**Purpose**: Chooses the restart policy by comparing the updater that is currently running with the managed Codex binary. In plain terms, it answers: are we already running the managed version, or should we switch to it?
 
-**Data flow**: Takes references to two `ExecutableIdentity` values → compares them for equality → returns either `(RestartMode::IfVersionChanged, UpdaterRefreshMode::None)` or `(RestartMode::Always, UpdaterRefreshMode::ReexecIfManagedBinaryChanged)`. It is pure and has no side effects.
+**Data flow**: It receives two executable identities: one for the running updater and one for the managed Codex binary. If they match, it returns a conservative mode: restart only if the version changed, and do not refresh the updater process. If they differ, it returns a stronger mode: always restart and re-execute the updater if the managed binary changed.
 
-**Call relations**: This helper is called by `update_once` after both identities have been computed. Its output directly controls the arguments passed into `daemon.try_restart_if_running`, and its behavior is covered by the dedicated tests in `update_loop_tests.rs`.
+**Call relations**: `update_once` calls this after it has identified both executables. The returned modes are passed into the daemon restart attempt, which uses them to decide whether to restart the service and whether to replace the updater process.
 
 *Call graph*: called by 1 (update_once).
 
@@ -112,11 +114,11 @@ fn update_modes_for_identities(
 fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Result<()>
 ```
 
-**Purpose**: Replaces the current updater process image with the managed Codex binary running the updater-loop subcommand. It is the low-level process handoff used when the updater itself must be refreshed.
+**Purpose**: Replaces the currently running updater process with the managed Codex binary. This is how the updater stops running from an old or standalone executable and continues from the installed managed one.
 
-**Data flow**: Takes `managed_codex_bin: &Path` → constructs a `std::process::Command` targeting that binary with args `app-server daemon pid-update-loop` → calls Unix `exec()` to replace the current process. Because successful `exec` never returns, the function only returns `Err(...)` containing contextualized failure information.
+**Data flow**: It receives the path to the managed Codex binary. It starts an operating-system `exec`, which means the current process is replaced in place rather than launching a separate child process. The new process is invoked with arguments that tell it to run the app-server daemon pid update loop. If replacement fails, the function returns an error explaining which binary could not be used.
 
-**Call relations**: This function is called by `try_restart_if_running` when updater refresh mode requires re-exec into the managed binary. It does not perform policy decisions itself; it is the terminal action once higher-level restart logic has decided replacement is needed.
+**Call relations**: This is called by `try_restart_if_running` when the restart logic decides the updater should refresh itself. Unlike ordinary helper calls, a successful `exec` does not return to the old code at all; the process has become the managed updater.
 
 *Call graph*: called by 1 (try_restart_if_running); 1 external calls (new).
 
@@ -127,11 +129,11 @@ fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Result<()>
 async fn install_latest_standalone() -> Result<()>
 ```
 
-**Purpose**: Fetches the latest standalone Codex installer shell script and executes it non-interactively through `/bin/sh`. This keeps the standalone updater installation current before daemon restart decisions are made.
+**Purpose**: Downloads and runs the standalone Codex installer script. This is the step that actually brings the local Codex installation up to date before the daemon restart decision is made.
 
-**Data flow**: Performs an HTTP GET to the fixed install URL, validates the response status, reads the body bytes, spawns `/bin/sh -s` with piped stdin and null stdout/stderr, writes the script bytes into the child’s stdin, closes stdin, waits for exit, and returns `Ok(())` only if the shell exits successfully. It mutates external system state through network I/O and whatever the installer script changes on disk.
+**Data flow**: It fetches `https://chatgpt.com/codex/install.sh`, checks that the web request succeeded, and reads the script bytes. It then starts `/bin/sh -s` with standard input connected, sends the downloaded script into that shell, hides the script’s output by sending stdout and stderr to null, and waits for the shell to finish. It returns success if the installer exits successfully, or an error if fetching, starting, writing, waiting, or the installer itself fails.
 
-**Call relations**: Called at the start of each `update_once` cycle so the updater refresh happens before managed-binary comparison and restart attempts. It delegates transport to `reqwest`, process spawning to `tokio::process::Command`, and shell input streaming to Tokio async I/O.
+**Call relations**: `update_once` calls this at the start of every update pass. Once this installer has run, `update_once` can inspect the managed Codex binary and decide whether the daemon and updater need to restart.
 
 *Call graph*: called by 1 (update_once); 5 external calls (null, piped, bail!, new, get).
 
@@ -143,11 +145,13 @@ Stops new per-connection RPC work from starting and then manages the remaining c
 
 `orchestration` · `request handling and connection shutdown`
 
-This file defines `ConnectionRpcGate`, a small concurrency primitive used to coordinate connection shutdown with in-flight RPC handler execution. The gate has two pieces of state: `accepting: Mutex<bool>`, which decides whether new handler bodies may start, and `tasks: TaskTracker`, which counts active handlers via tokens. The design is intentionally asymmetric: closing the gate prevents future work from acquiring a token, but does not cancel work that already started.
+An RPC, or remote procedure call, is a request sent over a connection asking the server to run some handler code. This file protects the awkward moment when a connection is closing. Without it, a handler could start after shutdown had begun, or shutdown could finish while earlier handler work was still running.
 
-`run` is the core operation. It locks `accepting`, returns immediately if the gate is closed, otherwise acquires a `TaskTracker` token while still under the lock, then drops the lock and awaits the supplied future. The token is dropped only after the future completes, so `TaskTracker::wait()` can reliably observe in-flight work. `close` flips `accepting` to `false` and closes the tracker so no new tokens can be issued. `shutdown` composes those steps and then waits for all tracked work to finish.
+The main type is `ConnectionRpcGate`. Think of it like a door with a guest list counter. While the door is open, a handler can enter and receives a temporary “token” showing it is inside. When the door closes, no new handlers are allowed in, but anyone already inside is allowed to leave normally.
 
-The embedded tests pin down subtle ordering guarantees: a closed gate must drop late futures without polling them, `close` must return even while work is still running, `shutdown` must block until started work completes, and in-flight counting must become visible before the handler body proceeds. `Default` simply delegates to `new`.
+It uses a mutex, which is a lock that stops two async tasks from changing the same flag at the same time, to store whether the gate is still accepting work. It also uses a `TaskTracker`, a helper that counts active pieces of work and can wait until they are all done.
+
+The important behavior is graceful shutdown. `close` flips the gate to closed and prevents future work. `shutdown` does that and then waits until all handlers that already got through the gate have finished. The tests check that open gates run work, closed gates do not even begin polling late work, and shutdown waits only for work that had already started.
 
 #### Function details
 
@@ -157,11 +161,11 @@ The embedded tests pin down subtle ordering guarantees: a closed gate must drop 
 fn new() -> Self
 ```
 
-**Purpose**: Creates an open gate with no in-flight handlers. New `run` calls will be accepted until `close` or `shutdown` is invoked.
+**Purpose**: Creates a fresh gate that is open and ready to let RPC handler work start. It also creates an empty tracker so active work can be counted from the beginning.
 
-**Data flow**: Initializes `accepting` to `true`, constructs a fresh `TaskTracker`, and returns `ConnectionRpcGate { accepting: Mutex<bool>, tasks }`.
+**Data flow**: Nothing is passed in. The function sets the internal accepting flag to true and creates a new task tracker with no active tokens. It returns a `ConnectionRpcGate` ready for use on a connection.
 
-**Call relations**: Used by production connection setup and by all tests in this module as the initial gate state.
+**Call relations**: This is the starting point for the gate. Tests create gates with it before checking open, closed, and shutdown behavior, and the `Default` implementation also uses it so callers can create the same open gate through Rust’s standard default pattern.
 
 *Call graph*: called by 8 (close_returns_while_started_run_remains_active, run_drops_future_without_polling_after_close, run_executes_while_open, run_is_counted_before_handler_body_continues, shutdown_drops_late_runs_while_waiting_for_inflight_work, shutdown_waits_for_started_run_to_finish, new, gate); 2 external calls (new, new).
 
@@ -172,11 +176,11 @@ fn new() -> Self
 async fn run(&self, future: F)
 ```
 
-**Purpose**: Conditionally executes a handler future only if the gate is still open, while counting that handler as in-flight for shutdown coordination. If the gate is closed, it returns without polling the future.
+**Purpose**: Runs one RPC handler only if the connection is still accepting work. If the gate has already been closed, it returns without starting the handler at all.
 
-**Data flow**: Takes `&self` and a future `F`. It locks `accepting`, reads the boolean, and if false returns immediately. If true, it acquires a `TaskTracker` token, releases the lock, awaits the future, then drops the token so the tracker count decreases. It returns `()`.
+**Data flow**: It receives a future, which is async work that has not necessarily run yet. It first locks the accepting flag. If the flag is false, it drops the future untouched and returns. If the flag is true, it takes a tracker token, releases the lock, awaits the future until it finishes, and then drops the token so the active-work count goes down.
 
-**Call relations**: This is the main entry used by connection RPC dispatch. Its token acquisition is what allows `shutdown` to wait for already-started handlers while rejecting late arrivals after `close`.
+**Call relations**: This is the gate’s main doorway for handler execution. Connection code would wrap each initialized RPC handler in this method. It asks the task tracker for a token before letting the handler body continue, so `shutdown` later has something reliable to wait on.
 
 *Call graph*: 1 external calls (token).
 
@@ -187,11 +191,11 @@ async fn run(&self, future: F)
 async fn close(&self)
 ```
 
-**Purpose**: Stops the gate from accepting any new handler executions and closes the task tracker to future token issuance. It does not wait for current handlers to finish.
+**Purpose**: Closes the gate so no later RPC handlers can start. It does not wait for already-started handlers to finish.
 
-**Data flow**: Locks `accepting`, sets it to `false`, calls `self.tasks.close()`, and returns `()`. Existing tokens remain valid until dropped by running handlers.
+**Data flow**: It reads and changes the internal accepting flag under the mutex. The flag changes from true, or remains false if already closed, to false. It also closes the task tracker so no new tracked work should be accepted. It returns once the gate is closed, even if some work is still active.
 
-**Call relations**: Called directly by shutdown logic and indirectly by `ConnectionRpcGate::shutdown`; tests verify that it returns promptly even with in-flight work.
+**Call relations**: `shutdown` calls this as its first step. Tests also call it directly to prove that closing blocks later `run` calls while leaving already-started work alone.
 
 *Call graph*: called by 1 (shutdown); 1 external calls (close).
 
@@ -202,11 +206,11 @@ async fn close(&self)
 async fn shutdown(&self)
 ```
 
-**Purpose**: Performs graceful gate shutdown by first preventing new runs and then waiting for all already-started runs to complete. It is the high-level shutdown API for the gate.
+**Purpose**: Performs a graceful shutdown of the gate. It stops new RPC handlers from starting, then waits until all handlers that already started have finished.
 
-**Data flow**: Calls `self.close().await`, then awaits `self.tasks.wait()`, and returns `()`. It reads and synchronizes on both gate state and tracker state.
+**Data flow**: It takes the existing gate state. First it calls `close`, which turns off new entries. Then it waits on the task tracker until every active token has been dropped. It returns only after there is no tracked in-flight work left.
 
-**Call relations**: Used by connection teardown paths that need graceful completion semantics; it composes `close` with the tracker’s wait operation.
+**Call relations**: This is the full shutdown path for connection cleanup. It builds directly on `close`, then hands off to the tracker’s waiting mechanism so callers can safely know that handler work has drained.
 
 *Call graph*: calls 1 internal fn (close); 1 external calls (wait).
 
@@ -217,11 +221,11 @@ async fn shutdown(&self)
 async fn is_accepting(&self) -> bool
 ```
 
-**Purpose**: Test-only helper that reports whether the gate is still open to new work. It exposes the mutex-protected acceptance flag for assertions.
+**Purpose**: Reports whether the gate is currently open to new work. This helper exists only for tests.
 
-**Data flow**: Locks `accepting`, dereferences the boolean, and returns it.
+**Data flow**: It locks the accepting flag, copies out the boolean value, and returns it. It does not change the gate.
 
-**Call relations**: Used only by tests to confirm that `close` and `shutdown` transition the gate into the non-accepting state.
+**Call relations**: The tests use this to check the visible effect of calling `close` or `shutdown`. Production code does not use it because it is compiled only during testing.
 
 
 ##### `ConnectionRpcGate::inflight_count`  (lines 58–60)
@@ -230,11 +234,11 @@ async fn is_accepting(&self) -> bool
 fn inflight_count(&self) -> usize
 ```
 
-**Purpose**: Test-only helper that returns the number of currently tracked in-flight runs. It exposes `TaskTracker` length for assertions about ordering and shutdown behavior.
+**Purpose**: Reports how many RPC handlers are currently tracked as in progress. This helper exists only for tests.
 
-**Data flow**: Reads `self.tasks.len()` and returns the resulting `usize`.
+**Data flow**: It asks the task tracker for its current length and returns that number. It does not start, stop, or change any work.
 
-**Call relations**: Used only by tests to verify that tokens are acquired before handler progress and released after completion.
+**Call relations**: The tests use this to prove that `run` adds work to the tracker before the handler body continues, and that the count returns to zero after the handler finishes.
 
 *Call graph*: 1 external calls (len).
 
@@ -245,11 +249,11 @@ fn inflight_count(&self) -> usize
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default open gate by delegating to `new`. It exists so the type can be constructed through generic default-based code paths.
+**Purpose**: Provides Rust’s standard default construction behavior for this gate. A default gate is the same as a newly created open gate.
 
-**Data flow**: Calls `Self::new()` and returns the resulting `ConnectionRpcGate`.
+**Data flow**: Nothing is passed in. It delegates to `ConnectionRpcGate::new` and returns the resulting open gate.
 
-**Call relations**: Supports generic construction; behavior is identical to `ConnectionRpcGate::new`.
+**Call relations**: This fits the gate into Rust APIs that expect a `Default` value. Rather than keeping separate setup logic, it relies on `new` so both construction paths stay identical.
 
 *Call graph*: 1 external calls (new).
 
@@ -260,11 +264,11 @@ fn default() -> Self
 async fn run_executes_while_open()
 ```
 
-**Purpose**: Verifies that `run` actually polls and completes the supplied future when the gate is open. It is the baseline acceptance test for normal operation.
+**Purpose**: Checks that an open gate actually runs the async work passed to `run`. This protects the normal successful path.
 
-**Data flow**: Creates a new gate and an `Arc<AtomicBool>`, runs a future that stores `true`, then asserts the atomic flag was set.
+**Data flow**: The test starts with a new open gate and an atomic boolean set to false. It passes async work that flips the boolean to true. After `run` finishes, the test reads the boolean and expects it to be true.
 
-**Call relations**: Exercises the happy path of `ConnectionRpcGate::run` with no shutdown interaction.
+**Call relations**: This test exercises the basic relationship between `new` and `run`: a freshly created gate should accept work. It uses shared atomic state so the test can see whether the handler body ran.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (clone, new, new, assert!).
 
@@ -275,11 +279,11 @@ async fn run_executes_while_open()
 async fn run_drops_future_without_polling_after_close()
 ```
 
-**Purpose**: Checks that once the gate is closed, `run` returns without polling the provided future at all. This is important because late handlers must not start side effects during shutdown.
+**Purpose**: Checks that once the gate is closed, later work does not start at all. This matters because merely creating async work is different from polling it, which is what actually begins running it.
 
-**Data flow**: Creates a gate, closes it, prepares an `AtomicBool` that would be set if the future ran, calls `run`, then asserts the flag is still false and `is_accepting()` is false.
+**Data flow**: The test creates a gate, closes it, and prepares async work that would flip an atomic boolean if it ran. It calls `run` with that work. The expected result is that the boolean stays false and the gate reports that it is not accepting.
 
-**Call relations**: Exercises the early-return branch in `ConnectionRpcGate::run` after `close`.
+**Call relations**: This test connects `close`, `run`, and `is_accepting`. It proves that closing the gate affects future `run` calls immediately, instead of letting a late handler sneak through.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (clone, new, new, assert!).
 
@@ -290,11 +294,11 @@ async fn run_drops_future_without_polling_after_close()
 async fn close_returns_while_started_run_remains_active()
 ```
 
-**Purpose**: Verifies that `close` does not wait for already-started work and that such work remains counted as in-flight until it finishes. This distinguishes `close` from `shutdown`.
+**Purpose**: Checks that `close` stops new work but does not wait for or cancel work that already started. This confirms the difference between closing the door and waiting for everyone to leave.
 
-**Data flow**: Spawns a task that enters `run` and blocks on a oneshot receiver after signaling start, waits for that signal, calls `close`, asserts non-accepting state and inflight count of 1, then releases the blocked future and waits for completion.
+**Data flow**: The test starts a handler that signals when it has begun, then waits on a one-shot message before finishing. After the handler has started, the test calls `close`. It expects the gate to be closed and the in-flight count to still be one. Then it sends the finish message, waits for the run task to complete, and shuts the gate down cleanly.
 
-**Call relations**: Exercises the interaction between `run`, token tracking, and `close`, proving that closing is immediate but non-cancelling.
+**Call relations**: This test uses `new`, `run`, `close`, `inflight_count`, and `shutdown` together. It shows that `close` is a non-blocking step, while the later cleanup can still wait for the active task.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (clone, new, assert!, assert_eq!, channel, spawn).
 
@@ -305,11 +309,11 @@ async fn close_returns_while_started_run_remains_active()
 async fn shutdown_waits_for_started_run_to_finish()
 ```
 
-**Purpose**: Checks that `shutdown` blocks while a started handler is still running and only completes after that handler finishes. This is the core graceful-shutdown guarantee.
+**Purpose**: Checks that `shutdown` waits for already-started work instead of returning too early. This protects graceful connection cleanup.
 
-**Data flow**: Starts a blocking `run` future using oneshot channels, confirms inflight count is 1, spawns `shutdown`, uses a short timeout to assert shutdown has not completed yet, then releases the handler, waits for completion, and finally asserts inflight count returns to 0.
+**Data flow**: The test starts a handler that signals it has begun and then waits for permission to finish. It starts shutdown in another task and uses a short timeout to confirm shutdown does not complete while the handler is still waiting. After sending the finish signal, it waits for the running task and confirms the in-flight count can reach zero.
 
-**Call relations**: Exercises `ConnectionRpcGate::shutdown` end to end, including its internal `close` and `TaskTracker::wait()` behavior.
+**Call relations**: This test focuses on the relationship between `run` and `shutdown`. Because `shutdown` calls `close` and then waits on the tracker, the test verifies that the tracker token held by `run` really keeps shutdown pending.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (clone, new, from_millis, assert_eq!, channel, spawn, timeout).
 
@@ -320,11 +324,11 @@ async fn shutdown_waits_for_started_run_to_finish()
 async fn shutdown_drops_late_runs_while_waiting_for_inflight_work()
 ```
 
-**Purpose**: Verifies that once shutdown has begun, new `run` calls are rejected even though shutdown is still waiting for earlier work to finish. This protects against races where late requests sneak in during graceful drain.
+**Purpose**: Checks the tricky case where shutdown has begun but one earlier handler is still running. Late work should be rejected during that waiting period.
 
-**Data flow**: Starts one blocking `run`, spawns `shutdown` and confirms it is waiting via timeout, then calls `run` with a future that would set an atomic flag, asserts that flag remains false, releases the original run, and confirms inflight count reaches 0 afterward.
+**Data flow**: The test starts one handler and holds it open. It starts shutdown and confirms with a timeout that shutdown is waiting. While shutdown is waiting, it calls `run` with new async work that would flip a boolean if it ran. The boolean must stay false. Then the original handler is allowed to finish, and the final in-flight count should be zero.
 
-**Call relations**: Exercises the combined semantics of `shutdown`: immediate closure to new work plus waiting for existing work.
+**Call relations**: This test ties together `run`, `shutdown`, and the closed accepting flag. It proves that once shutdown has closed the gate, the system both waits for old work and rejects new work at the same time.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (clone, new, new, from_millis, assert!, assert_eq!, channel, spawn, timeout).
 
@@ -335,24 +339,24 @@ async fn shutdown_drops_late_runs_while_waiting_for_inflight_work()
 async fn run_is_counted_before_handler_body_continues()
 ```
 
-**Purpose**: Checks the ordering guarantee that a handler is counted as in-flight before its body is allowed to continue. This prevents shutdown races where work starts but is not yet visible to the tracker.
+**Purpose**: Checks that a handler is counted as in flight before its body proceeds far enough to signal entry. This avoids a race where shutdown might miss work that has just started.
 
-**Data flow**: Spawns a `run` future that signals entry and then waits on a oneshot, waits for the entry signal, asserts inflight count is already 1, then releases the future and asserts the count returns to 0 after completion.
+**Data flow**: The test starts a handler that sends an entered signal and then waits. After receiving the entered signal, the test checks the in-flight count and expects it to be one. It then lets the handler continue, waits for it to finish, and expects the count to return to zero.
 
-**Call relations**: Targets the token-acquisition timing inside `ConnectionRpcGate::run`.
+**Call relations**: This test examines the ordering inside `run`: the tracker token must be acquired before the handler body continues. That ordering is what makes `shutdown` reliable when work starts near the same time as closing.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (clone, new, assert_eq!, channel, spawn).
 
 
 ### `app-server/src/connection_cleanup.rs`
 
-`orchestration` · `connection teardown and background cleanup tracking`
+`orchestration` · `connection cleanup and shutdown`
 
-This file wraps `JoinSet<()>` in a narrowly scoped `ConnectionCleanupTasks` helper used by connection lifecycle code. The abstraction is intentionally tiny: it creates an empty task set, accepts spawned cleanup futures, and centralizes result logging so callers do not need to repeat `JoinError` handling.
+When a network connection ends, there may still be small pieces of work to do, such as closing resources or finishing cleanup steps. This file provides a simple holder for those background jobs so they do not get lost. Think of it like a clipboard for janitorial tasks: each finished connection can add a cleanup job, and the server can later check the clipboard, wait for jobs, or cancel everything when it is time to stop.
 
-The key behavioral distinction is between `reap_next` and `drain`. `reap_next` is designed for a main loop that wants to wait for one cleanup completion at a time; if there are currently no tasks, it awaits `pending()` forever instead of returning immediately, which makes it suitable as a branch in a `select!` without causing a busy loop. `drain` is the shutdown-oriented variant that repeatedly joins until the set is empty. `abort` requests cancellation of all tracked tasks, after which `drain` or `reap_next` can observe their completion.
+The main type, `ConnectionCleanupTasks`, wraps Tokio's `JoinSet`, which is a collection of asynchronous tasks that can run at the same time. An asynchronous task is work that can pause while waiting and let other work continue. The file offers methods to create the collection, add a cleanup task, wait for one task to finish, wait for all tasks to finish, and abort all remaining tasks.
 
-`log_cleanup_result` suppresses warnings for cancelled tasks but emits a `tracing::warn!` for any other join failure, such as a panic inside a cleanup future. The file does not define cleanup semantics itself; it only tracks task completion and error visibility.
+A small helper, `log_cleanup_result`, makes cleanup failures visible. If a task fails unexpectedly, it writes a warning. If the task was cancelled on purpose, it stays quiet, because cancellation during shutdown is normal. One important detail is that `reap_next` waits forever when there are no tasks. That makes it useful in a larger `select`-style event loop: it will only wake the loop when there is actually cleanup work to collect.
 
 #### Function details
 
@@ -362,11 +366,11 @@ The key behavioral distinction is between `reap_next` and `drain`. `reap_next` i
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty cleanup-task tracker backed by a fresh `JoinSet<()>`. It is the starting state for a new connection’s cleanup bookkeeping.
+**Purpose**: Creates an empty tracker for connection cleanup tasks. The server uses this when it starts the main run flow so it has one place to collect later cleanup jobs.
 
-**Data flow**: Allocates `JoinSet::new()` and returns `ConnectionCleanupTasks { tasks }` with no external side effects.
+**Data flow**: Nothing is passed in. The function creates a fresh empty task collection and wraps it in `ConnectionCleanupTasks`. The result is a ready-to-use cleanup tracker with no jobs inside yet.
 
-**Call relations**: Called when connection orchestration initializes per-connection state, notably from `run_main_with_transport_options`.
+**Call relations**: The main server setup, `run_main_with_transport_options`, calls this when preparing to run. After that, other parts of the server can add cleanup jobs to the tracker and wait for them through its other methods.
 
 *Call graph*: called by 1 (run_main_with_transport_options); 1 external calls (new).
 
@@ -377,11 +381,11 @@ fn new() -> Self
 fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static)
 ```
 
-**Purpose**: Registers and starts a new cleanup future under the connection’s task set. The future must be `Send + 'static` because `JoinSet` owns and runs it independently.
+**Purpose**: Adds a new cleanup job to the background task collection. Someone uses this when cleanup should happen without blocking the main server work.
 
-**Data flow**: Takes `&mut self` and a future producing `()`, forwards it to `self.tasks.spawn(future)`, and returns nothing.
+**Data flow**: It receives a future, which is a piece of asynchronous work that will eventually finish. It gives that future to Tokio's task system, which starts running it in the background, and stores it in the internal collection so the server can later observe or cancel it. It returns nothing directly.
 
-**Call relations**: Used by connection-management code whenever some asynchronous cleanup action should outlive the immediate caller but still be tracked for shutdown/reaping.
+**Call relations**: This is the entry point for putting cleanup work under this file's supervision. Once a job has been spawned here, `reap_next` or `drain` can later collect its result, and `abort` can cancel it if shutdown happens first.
 
 *Call graph*: 1 external calls (spawn).
 
@@ -392,11 +396,11 @@ fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static)
 async fn reap_next(&mut self)
 ```
 
-**Purpose**: Waits for the next cleanup task to finish and logs any non-cancellation join failure. If there are no tasks at all, it waits forever instead of returning immediately.
+**Purpose**: Waits for one cleanup task to finish and records whether it ended normally or failed. It is designed for a main loop that wants to periodically collect completed cleanup work without draining everything at once.
 
-**Data flow**: Reads `self.tasks.is_empty()`. If empty, awaits `pending::<()>()`; otherwise awaits `self.tasks.join_next()`. When a result arrives, passes it to `log_cleanup_result` and returns `()`. It mutates the underlying `JoinSet` by consuming one completed task.
+**Data flow**: It reads the internal task collection. If there are no tasks, it waits forever, which means it produces no event until some other branch of the surrounding program does something. If there is at least one task, it waits until one finishes, then passes that task's result to `log_cleanup_result`. It does not return a value, but it removes the finished task from the collection.
 
-**Call relations**: Intended for incremental cleanup supervision in a connection event loop; it delegates all join-result interpretation to `log_cleanup_result`.
+**Call relations**: This method calls `log_cleanup_result` after Tokio reports that a cleanup task has completed. In the bigger flow, it acts like the server's broom: each time the run loop is ready to collect one finished cleanup job, this method picks it up and hands the outcome to the logging helper.
 
 *Call graph*: calls 1 internal fn (log_cleanup_result); 2 external calls (is_empty, join_next).
 
@@ -407,11 +411,11 @@ async fn reap_next(&mut self)
 async fn drain(&mut self)
 ```
 
-**Purpose**: Joins every remaining cleanup task until none are left, logging any non-cancelled failures along the way. This is the full shutdown path for tracked cleanup work.
+**Purpose**: Waits for every remaining cleanup task to finish. This is useful during orderly shutdown, when the server wants to give cleanup work a chance to complete before exiting.
 
-**Data flow**: Repeatedly awaits `self.tasks.join_next()` in a `while let Some(...)` loop, forwarding each result to `log_cleanup_result`. It empties the `JoinSet` before returning.
+**Data flow**: It repeatedly asks the internal task collection for the next finished task. Each result is sent to `log_cleanup_result` so failures are not hidden. The loop ends when no cleanup tasks remain. It returns nothing, but the collection is empty afterward.
 
-**Call relations**: Used during connection teardown after no more cleanup tasks should be added; it shares the same logging helper as `reap_next`.
+**Call relations**: This method uses `log_cleanup_result` for each completed task, just like `reap_next`, but keeps going until the collection is empty. It is the finishing step when the server wants to clear all outstanding cleanup jobs rather than collect just one.
 
 *Call graph*: calls 1 internal fn (log_cleanup_result); 1 external calls (join_next).
 
@@ -422,11 +426,11 @@ async fn drain(&mut self)
 fn abort(&mut self)
 ```
 
-**Purpose**: Requests cancellation of all tracked cleanup tasks immediately. It does not wait for them to finish joining.
+**Purpose**: Cancels all cleanup tasks that are still running. This is used when the server needs to stop quickly and should not wait for background cleanup to finish.
 
-**Data flow**: Calls `self.tasks.abort_all()` and returns `()`, mutating the task set’s cancellation state.
+**Data flow**: It reads the internal task collection and tells Tokio to abort every task in it. The tasks are marked for cancellation. The function returns nothing; later, if those cancelled tasks are collected, their cancellation is treated as expected rather than as a warning.
 
-**Call relations**: Typically invoked during forced shutdown before a later `drain` or other join path observes task completion.
+**Call relations**: This method is the emergency stop for the cleanup tracker. After tasks have been added with `spawn`, shutdown code can call `abort` to cancel them all, and `log_cleanup_result` will avoid warning about those intentional cancellations when their results are later observed.
 
 *Call graph*: 1 external calls (abort_all).
 
@@ -437,11 +441,11 @@ fn abort(&mut self)
 fn log_cleanup_result(result: Result<(), JoinError>)
 ```
 
-**Purpose**: Logs unexpected cleanup task termination while ignoring normal cancellation. This keeps shutdown noise low but still surfaces panics or runtime join failures.
+**Purpose**: Decides whether a finished cleanup task needs a warning in the logs. It keeps normal completions and intentional cancellations quiet, but reports unexpected task failures.
 
-**Data flow**: Consumes `Result<(), JoinError>`; if it is `Err(err)` and `!err.is_cancelled()`, emits `warn!(...)`. Otherwise it produces no output and returns `()`. No state is stored.
+**Data flow**: It receives the result of a background cleanup task. If the result is successful, it does nothing. If the task ended with an error, it checks whether that error was just cancellation; cancelled tasks are ignored, while other errors are written as warnings. It returns nothing.
 
-**Call relations**: Called by both `ConnectionCleanupTasks::reap_next` and `ConnectionCleanupTasks::drain` so all cleanup-task result handling is centralized.
+**Call relations**: `reap_next` and `drain` call this after receiving completed task results from Tokio. It is the shared checkpoint that turns raw task outcomes into useful server logs, so the rest of the cleanup code does not repeat the same error-checking rules.
 
 *Call graph*: called by 2 (drain, reap_next); 1 external calls (warn!).
 
@@ -451,13 +455,13 @@ Shuts down legacy agent threads and persists the resulting closed thread-tree st
 
 ### `core/src/agent/control/legacy.rs`
 
-`domain_logic` · `teardown`
+`domain_logic` · `request handling and teardown`
 
-This file contains the older agent lifecycle controls that tear down threads and thread subtrees. `shutdown_live_agent` is the primitive operation: it upgrades `AgentControl` to the live manager state, tries to load the thread, materializes and flushes rollout data before shutdown, avoids re-sending `Op::Shutdown` if the thread is already in `AgentStatus::Shutdown`, waits for termination, then removes the thread from the manager and registry. If the thread is already absent from memory, it still attempts `state.send_op(agent_id, Op::Shutdown {})`, allowing shutdown to reach any still-running backend process.
+An agent here is a running worker thread with its own session and status. This file answers a practical question: when someone says “stop that agent,” what exactly has to happen so the worker does not keep running, lose saved progress, or remain listed as alive?
 
-`close_agent` adds persistence semantics. Before shutting anything down, it marks the thread’s spawn-edge status as `DirectionalThreadSpawnEdgeStatus::Closed` in the state DB when possible. If the thread is missing from memory but known in registry metadata, it still tries to persist the closed edge through the manager-level DB handle; failure in that stale-thread case is escalated to `CodexErr::Fatal`, because the explicit close marker is the point of the operation. Other inspection failures are only logged with `warn!`.
+There are two related ideas. “Shutdown” means asking a live agent to stop. “Close” means recording, in saved state, that this agent’s spawn link is explicitly closed, so it should not be treated as still open later. The file also supports shutting down an agent’s live descendants, which are agents that were spawned under it in the in-memory tree.
 
-Finally, `shutdown_agent_tree` gathers live descendants from the in-memory spawn tree, shuts down the requested agent first, then iterates descendants and tolerates `ThreadNotFound` and `InternalAgentDied` for children. A subtle consequence is that `close_agent` treats missing/dead known agents as success after attempting recursive shutdown, preserving idempotent close behavior for already-gone threads.
+The flow is careful. Before stopping a live agent, it materializes and flushes its rollout, meaning it makes sure pending session progress is written out. If the agent is already shut down, it avoids sending a duplicate shutdown request. Either way, it waits until the thread has actually terminated, then removes it from in-memory tracking and releases related residency/spawn bookkeeping. Closing adds one more step: it tries to persist the “closed” status first, even for a known agent that is no longer live. This matters because without that saved mark, a future run could misunderstand the old spawn edge as still active.
 
 #### Function details
 
@@ -467,11 +471,11 @@ Finally, `shutdown_agent_tree` gathers live descendants from the in-memory spawn
 async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String>
 ```
 
-**Purpose**: Shuts down one live agent thread without marking its persisted spawn edge as explicitly closed. It also removes the thread from in-memory tracking regardless of whether the shutdown path went through a loaded thread or a direct op send.
+**Purpose**: Stops one live agent without marking its saved spawn relationship as closed. It is used when the system needs the worker gone now, while leaving the separate “was this explicitly closed?” record unchanged.
 
-**Data flow**: Takes `agent_id: ThreadId`, upgrades to manager state, and tries `state.get_thread(agent_id).await`. If the thread is loaded, it materializes and flushes rollout, checks `thread.agent_status().await`, either returns `Ok(String::new())` for already-shutdown threads or sends `Op::Shutdown {}` through `state.send_op`, then waits for termination. If the thread is not loaded, it still sends `Op::Shutdown {}` through the manager. After either branch it calls `state.remove_thread(&agent_id).await`, `self.forget_v2_residency(agent_id)`, and `self.state.release_spawned_thread(agent_id)`, then returns the shutdown submission result.
+**Data flow**: It receives an agent thread id. It first upgrades the control handle into live shared state; if that fails, the error is returned. If the thread is found, it makes sure the session’s pending rollout data exists and is flushed to storage, checks whether the agent is already shut down, and otherwise sends it a shutdown operation. It then waits for the thread to finish. If the thread was not found, it still tries to send a shutdown operation by id. At the end it removes the thread from tracking, forgets related residency information, releases spawned-thread bookkeeping, and returns either the shutdown result string or an error.
 
-**Call relations**: This is the primitive used by `AgentControl::shutdown_agent_tree` for both the root of a subtree and each descendant. It does not delegate to other file-local functions, but it is the core teardown step that higher-level close logic builds on.
+**Call relations**: This is the basic single-agent stop action. AgentControl::shutdown_agent_tree calls it first for the requested agent and then for each descendant, so the tree-level shutdown can reuse the same careful cleanup path for every live worker.
 
 *Call graph*: called by 1 (shutdown_agent_tree); 2 external calls (new, matches!).
 
@@ -482,11 +486,11 @@ async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String>
 async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<String>
 ```
 
-**Purpose**: Marks an agent as explicitly closed in persisted spawn-edge state and then shuts down that agent plus any live descendants. It is the durable, user-visible close operation rather than a transient live shutdown.
+**Purpose**: Marks an agent as explicitly closed in saved state, then shuts down that agent and any live descendants beneath it. This is the stronger form of stopping: it records the user’s intent, not just the fact that the process should stop.
 
-**Data flow**: Accepts `agent_id`, upgrades to manager state, and checks whether registry metadata exists for the thread. It then inspects the live thread: if loaded and a thread-level DB context exists, it writes `DirectionalThreadSpawnEdgeStatus::Closed`; if the thread is missing but metadata says it is known, it tries the manager-level DB context and returns `CodexErr::Fatal` if that stale-edge persistence fails; other lookup errors are logged. After persistence handling it awaits `Box::pin(self.shutdown_agent_tree(agent_id))`. If that returns `ThreadNotFound` or `InternalAgentDied` for a known agent, it converts the outcome to `Ok(String::new())`; otherwise it returns the shutdown result unchanged.
+**Data flow**: It receives an agent thread id. It checks whether the system already knows metadata for that agent, then tries to inspect the live thread. If the thread is live and has access to the state database, it writes the spawn-edge status as Closed. If the thread is gone but the agent is still known, it tries to write the same Closed mark through the broader state database; failure there becomes a fatal error because the saved close decision would be lost. Other inspection failures are logged as warnings. After this persistence step, it calls the tree shutdown path. If a known stale agent is already missing or internally dead, it treats that as a harmless successful close.
 
-**Call relations**: This is the higher-level close path that invokes `shutdown_agent_tree` after attempting to persist the closed edge. It uses warnings for non-fatal inspection problems and only escalates persistence failure in the stale-known-agent case where durable closure is the operation’s main contract.
+**Call relations**: This is the higher-level close operation. It does the persistent “closed” bookkeeping itself, logs or returns errors when that bookkeeping cannot be trusted, and then hands the actual stopping work to AgentControl::shutdown_agent_tree.
 
 *Call graph*: calls 1 internal fn (shutdown_agent_tree); 5 external calls (pin, new, format!, Fatal, warn!).
 
@@ -497,31 +501,30 @@ async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<String>
 async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String>
 ```
 
-**Purpose**: Shuts down an agent and every currently live descendant reachable from the in-memory spawn tree. It preserves the root agent’s shutdown result while best-effort cleaning up descendants.
+**Purpose**: Stops one agent plus any live child agents that can be reached from the current in-memory spawn tree. It is useful when stopping a parent should also clean up workers that were started under it.
 
-**Data flow**: Takes `agent_id`, asynchronously collects `descendant_ids` via `self.live_thread_spawn_descendants(agent_id).await?`, then calls `self.shutdown_live_agent(agent_id).await` and stores that result. It iterates each descendant ID and calls `shutdown_live_agent` on it; `Ok(_)`, `ThreadNotFound`, and `InternalAgentDied` are ignored, while any other error aborts and is returned immediately. If descendant cleanup does not fail, it returns the original root shutdown result.
+**Data flow**: It receives the root agent thread id. It asks for the list of live descendant thread ids, then shuts down the root agent and saves that result. After that it walks through each descendant and shuts it down too. Missing or already-dead descendants are ignored, because they no longer need stopping. Any other descendant shutdown error stops the process and is returned. If descendant cleanup succeeds, the function returns the original root agent’s shutdown result.
 
-**Call relations**: This function is called by `AgentControl::close_agent` after persistence work. It delegates all actual per-thread teardown to `shutdown_live_agent`, first for the requested node and then for each descendant.
+**Call relations**: AgentControl::close_agent calls this after it has recorded the close status. This function coordinates the multi-agent shutdown, while AgentControl::shutdown_live_agent performs the actual per-agent flush, stop request, wait, and cleanup.
 
 *Call graph*: calls 1 internal fn (shutdown_live_agent); called by 1 (close_agent).
 
 ## 📊 State Registers Touched
 
-- `reg-codex-home-install-context` — The discovered installation layout, CODEX_HOME location, bundled assets, helper binaries, and machine-local installation facts shared across startup and maintenance flows.
-- `reg-rollout-and-thread-store` — The durable rollout transcript and thread-store persistence layer used for resume, reconstruction, metadata sync, archive, and repair.
-- `reg-thread-metadata-index` — The structured thread metadata, reconciliation, spawn-edge, and listing state maintained in SQLite for thread ownership and browsing.
-- `reg-update-metadata` — The cached release/update availability state used by doctor, TUI startup, and daemon-managed updater flows.
-- `reg-app-server-connections` — The live app-server transport/listener/connection registry and per-connection routing state that all RPC handling depends on.
-- `reg-remote-control-state` — The persisted and live remote-control desired state, pairing/enrollment records, and reconnecting remote-session state.
-- `reg-live-thread-registry` — The in-memory registry of active threads and reconstructed thread runtimes that stabilizes ownership across resumes, forks, and UI switching.
-- `reg-unified-exec-processes` — The tracked process-execution state and exit/failure snapshots for spawned commands and related unified-exec handles.
-- `reg-agent-registry` — The in-memory registry of active agents, spawn reservations, path/nickname allocation, and concurrency/residency limits for multi-agent work.
-- `reg-connection-shutdown-gates` — The per-connection shutdown acceptance flags, running-handler tracking, and cleanup-task registries used for graceful drain and teardown.
-- `reg-observability-context` — The global tracing/logging/metrics context and stable session-turn-auth-model-tool tags attached to emitted telemetry throughout runtime.
-- `reg-daemon-update-loop-state` — The daemon’s long-lived updater loop state, including periodic check scheduling, managed-installer refresh progress, and pending restart/re-exec decisions.
-- `reg-daemon-process-registry` — The persisted and live daemon/app-server process-discovery state, including PID files, readiness probes, and launched detached server instances reused across client attach and restart flows.
-- `reg-connection-pending-initialization` — Per-connection initialization/handshake state that gates which RPC methods are allowed before a transport session is fully initialized.
-- `reg-listener-subscriptions` — The per-thread and per-connection listener/subscription registry that tracks who is watching which thread or process streams for ordered notifications.
-- `reg-tool-runtime-concurrency` — The live concurrency, cancellation, and in-flight execution coordination state for parallel tool calls and other dispatched runtime tasks.
-- `reg-background-watchers-and-timers` — Long-lived watcher/timer task state such as code-mode timers and other runtime background loops that persist across requests until shutdown.
-- `reg-agent-graph-store` — The durable graph of thread spawn relationships and lifecycle edges exposed independently of live thread metadata for agent-tree queries and teardown consistency.
+- `reg-state-databases` — The opened local SQLite stores and migration state that hold structured runtime data for threads, agents, goals, jobs, and summaries.
+- `reg-rollout-thread-store` — The durable conversation log and searchable thread index used to resume, rebuild, archive, restore, and display sessions.
+- `reg-app-server-runtime` — The live app-server or daemon state, including open transports, connected clients, request routing, and server lifecycle status.
+- `reg-remote-control-relay` — The remote-control, relay, socket, WebSocket, and encrypted connection state used to connect clients and helper processes.
+- `reg-process-registry` — The shared record of running or tracked external processes, their identifiers, input/output streams, terminal sizes, and completion state.
+- `reg-live-session-services` — The toolbox attached to one running session, such as model access, auth, telemetry, approvals, tools, extensions, networking, and MCP connections.
+- `reg-thread-session-state` — The live state of a conversation thread, including its identity, workspace, selected model, history, permissions, listeners, and lifecycle status.
+- `reg-agent-registry-graph` — The live and persisted map of parent agents, child agents, thread names, statuses, and which helper agents are still open.
+- `reg-background-work-queues` — The shared set of background tasks such as cloud refreshes, cleanup jobs, memory jobs, skill watchers, agent jobs, update checks, and session maintenance.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.
+- `reg-update-check-state` — Cached update notices, downloaded-or-pending update metadata, and daemon restart/update status produced by update checks and consumed by UI or teardown restart logic.
+- `reg-code-mode-runtime-state` — The live code-mode execution sessions, V8 isolates, loaded modules, pending calls, timers, and shutdown state for JavaScript/code-cell execution.
+- `reg-realtime-stream-state` — Active realtime conversation state, including audio/text stream sessions, WebSocket transport state, buffers, and stop/cancel lifecycle data.
+- `reg-request-serialization-gates` — The in-flight RPC/session request admission gates, per-resource serialization queues, and shutdown blockers that control when handlers may start or must drain.
+- `reg-terminal-runtime-state` — Live terminal control state such as raw mode, alternate screen ownership, resize/suspend handling, input streams, and restoration obligations.
+- `reg-process-hardening-state` — Process-wide hardening status and OS security settings applied at bootstrap, such as dump/inspection/tamper restrictions that affect the rest of the run.
+- `reg-outgoing-transport-buffers` — Queued outbound protocol messages, write buffers, and backpressure state for app-server, daemon, exec-server, and remote transports.

@@ -1,8 +1,8 @@
 # Code-mode protocol contract types  `stage-18.4.1`
 
-This stage is the cross-cutting contract layer for code mode: it does not execute tools itself, but defines the public types and traits that both the runtime implementation and its callers must share from startup through the main request/response loop. It is the schema boundary that keeps tool discovery, execution, waiting, and session management speaking the same language.
+This stage is shared behind-the-scenes support. It does not run code itself. Instead, it defines the public “contract” that other parts of the system agree to use when they talk about code mode. Think of it like the standard set of forms and labels used by everyone in an office.
 
-At the crate root, lib.rs assembles the protocol into one public API and publishes the canonical tool names used to address code-mode operations consistently. description.rs defines how tools are described to users and hosts, including rich declarations for exec and wait, nested tool structures, TypeScript rendering from JSON Schema, and parsing the optional // @exec: pragma embedded in JavaScript source. runtime.rs supplies the concrete payload types for execution requests, wait requests, responses, pending states, and nested tool calls. response.rs defines the serializable content blocks exchanged by those payloads, especially text and image data plus image fidelity hints. session.rs provides the higher-level session contract—cell IDs, started-cell wrappers, async aliases, and provider/session/host traits—so runtimes and orchestrators can coordinate long-lived code execution.
+The crate front door, lib.rs, gathers the important names from the internal files and re-exports them so other code can import them from one simple place. description.rs explains the available code-mode tools in human-readable text, including TypeScript-style examples, and reads small settings placed at the top of JavaScript input. response.rs defines common result content, such as text and images, and keeps their JSON shape consistent. runtime.rs defines the request and response messages exchanged with the runtime, the worker that actually executes code cells and reports progress or final results. session.rs defines the longer-lived session contract: how to start code, wait for answers, call tools, send updates, and shut everything down cleanly.
 
 ## Files in this stage
 
@@ -11,11 +11,13 @@ The crate root establishes the public API and canonical tool names that organize
 
 ### `code-mode-protocol/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting public API surface`
 
-This file is a pure module-and-export hub for the code-mode protocol crate. It declares four internal modules—`description`, `response`, `runtime`, and `session`—and then selectively re-exports the protocol types and helper functions that downstream crates are expected to use. The exported surface spans three distinct concerns: tool description generation (`ToolDefinition`, `ToolNamespaceDescription`, schema rendering helpers, identifier normalization, nested-tool detection), runtime request/response types for execution and waiting (`ExecuteRequest`, `WaitRequest`, `RuntimeResponse`, pending outcomes, default yield/output constants), and session abstractions (`CodeModeSession`, delegate/provider traits and futures, cell identifiers, started-cell metadata). It also re-exports response payload types for multimodal function-call content, including image detail selection.
+This file does not contain the detailed code-mode behavior itself. Instead, it works like the reception desk of a small office: it knows which internal room has which service, and it makes the useful services easy for outsiders to find. The crate is split into internal modules for tool descriptions, tool responses, runtime requests and outcomes, and session-related types. Without this file, users of the crate would need to know those internal module names and import items from many places, which would make the crate harder to use and easier to accidentally depend on internal layout.
 
-The only concrete values defined locally are `PUBLIC_TOOL_NAME` and `WAIT_TOOL_NAME`, fixed to `"exec"` and `"wait"`. Those constants establish the stable external names for the two primary code-mode tools and act as invariants for any caller constructing or matching tool invocations. Because this file contains no executable logic, its importance is architectural: it is the crate’s compatibility boundary, controlling which internal module items become part of the supported public protocol surface and keeping consumers insulated from internal module layout.
+The `mod` lines declare the crate’s internal parts: `description`, `response`, `runtime`, and `session`. The many `pub use` lines then re-export selected items from those parts. “Re-export” means the item is defined somewhere else, but made available here as if it lived at the crate root. For example, callers can import `CodeModeSession` or `ExecuteRequest` directly from this crate instead of digging into submodules.
+
+At the end, it defines two public tool-name constants: `PUBLIC_TOOL_NAME` is `"exec"`, and `WAIT_TOOL_NAME` is `"wait"`. These give the rest of the system shared spellings for the code execution and waiting tools, avoiding fragile repeated string literals.
 
 
 ### Tool descriptions
@@ -23,13 +25,15 @@ These definitions describe the code-mode tools themselves, including human-reada
 
 ### `code-mode-protocol/src/description.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `tool description generation and exec input parsing`
 
-This file is the descriptive core of the code-mode protocol. It defines the public data structures used to describe tools (`CodeModeToolKind`, `ToolDefinition`, `ToolNamespaceDescription`, `EnabledToolMetadata`, `ParsedExecSource`) and a large set of string templates for `exec`, `wait`, deferred-tool guidance, and shared MCP TypeScript types. `parse_exec_source` is the input-side parser: it accepts raw JavaScript, optionally strips and validates a first-line JSON pragma after `// @exec:`, rejects empty input, unsupported keys, missing body code, and values larger than JavaScript’s safe integer range, then returns the remaining code plus parsed execution hints.
+This part of the file is like the label maker and instruction writer for code mode. Code mode lets JavaScript call tools through a `tools` object, so the system needs clear descriptions such as “call this tool with these arguments and expect this result.” Without this, tools would still exist, but users or models would have to guess their names, argument shapes, and return shapes.
 
-The output-side logic generates tool descriptions suitable for model consumption. `build_exec_tool_description` starts from the fixed `EXEC_DESCRIPTION_TEMPLATE`, optionally adds deferred-tool guidance, and in code-mode-only mode appends grouped nested-tool sections. Namespace descriptions are emitted once per namespace transition, tool names are normalized into JavaScript identifiers, and MCP-aware tools trigger a single shared TypeScript preamble. Individual tool descriptions are produced by `render_code_mode_sample_for_definition`, which chooses argument naming by tool kind, renders input/output schemas into TypeScript, and wraps them in a `declare const tools: { ... }` snippet.
+The file also reads an optional first-line instruction, called a pragma, from exec source text. That pragma is a small JSON object in a comment, used to set limits such as how long execution may yield and how much output may be returned.
 
-The schema renderer is recursive and pragmatic rather than exhaustive. It supports booleans, `const`, `enum`, `anyOf`/`oneOf`, `allOf`, typed arrays, objects with required/optional properties, `additionalProperties`, tuple-like `prefixItems`, and quoted property names when identifiers are not JavaScript-safe. Property descriptions become `//` comments in multiline object renderings. The embedded tests focus on pragma parsing, identifier normalization, declaration generation, namespace grouping, MCP type preamble deduplication, and deferred-tool guidance.
+A large part of the code translates JSON Schema, a machine-readable way to describe data, into TypeScript-looking types that are easier for JavaScript authors to understand. For example, an object schema with a required `city` string becomes something like `{ city: string; }`. It also treats MCP tool results specially, so shared result wrapper types are shown only once.
+
+The tests at the end check the important promises: pragmas are parsed safely, tool names are made JavaScript-safe, descriptions include useful type declarations, namespace guidance is not repeated, and MCP helper types are not duplicated.
 
 #### Function details
 
@@ -39,11 +43,11 @@ The schema renderer is recursive and pragmatic rather than exhaustive. It suppor
 fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String>
 ```
 
-**Purpose**: Parses raw `exec` input, optionally extracting a first-line JSON pragma and validating its supported fields. It returns the executable JavaScript body plus parsed execution hints or a user-facing error string.
+**Purpose**: Reads the JavaScript source passed to the exec tool and optionally extracts settings from a special first-line comment. This lets a caller write code normally, while still asking for limits such as a yield timeout or maximum output size.
 
-**Data flow**: Reads `input: &str`; rejects all-whitespace input; initializes `ParsedExecSource` with the original code and empty options; splits the input into first line and remainder; if the trimmed first line lacks `CODE_MODE_PRAGMA_PREFIX`, returns the default struct unchanged. Otherwise it requires non-empty remaining code, parses the directive as JSON, rejects non-object values and unknown keys, deserializes into `CodeModeExecPragma`, enforces JavaScript safe-integer bounds for `yield_time_ms` and `max_output_tokens`, then returns `ParsedExecSource { code: rest, yield_time_ms, max_output_tokens }`.
+**Data flow**: It receives raw text. If the text is empty, it returns an error. It looks only at the first line for a `// @exec:` directive; if there is none, it returns the original code with no extra settings. If the directive exists, it parses the JSON after it, checks that only supported fields are present and that their numbers are safe, then returns the remaining lines as the actual JavaScript code plus the parsed settings.
 
-**Call relations**: This is the parser used when `exec` receives freeform source text. It performs all validation locally and does not delegate to other file-local helpers beyond serde parsing and constant checks.
+**Call relations**: This is a public parser used before exec code is run. Internally it relies on JSON parsing and conversion helpers to turn the pragma text into structured values, and the tests call it to confirm both plain source and pragma-bearing source behave correctly.
 
 *Call graph*: 3 external calls (format!, from_str, from_value).
 
@@ -54,11 +58,11 @@ fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String>
 fn is_code_mode_nested_tool(tool_name: &str) -> bool
 ```
 
-**Purpose**: Determines whether a tool name should be treated as a nested tool rather than one of the public top-level code-mode tools. It excludes the public `exec` tool and the wait tool by exact name.
+**Purpose**: Decides whether a tool should be treated as a nested tool inside code mode rather than one of the public top-level code mode tools. This keeps the special exec and wait tools separate from tools that JavaScript code may call through the nested `tools` interface.
 
-**Data flow**: Takes `tool_name: &str`, compares it against `crate::PUBLIC_TOOL_NAME` and `crate::WAIT_TOOL_NAME`, and returns `true` only when it matches neither.
+**Data flow**: It receives a tool name as text. It compares that name with the public exec tool name and the wait tool name. It returns `true` for everything else and `false` for those two reserved tools.
 
-**Call relations**: This is a simple classification helper for callers deciding which tools belong in nested-tool metadata or descriptions.
+**Call relations**: Other code can use this small check while building or filtering the list of tools available inside code mode. It depends only on the crate’s public tool-name constants.
 
 
 ##### `build_exec_tool_description`  (lines 251–318)
@@ -71,11 +75,11 @@ fn build_exec_tool_description(
     deferred_tools_available: b
 ```
 
-**Purpose**: Constructs the full textual description for the `exec` tool, optionally including deferred-tool guidance, shared MCP types, namespace guidance, and per-tool nested declarations. It is the main description assembler for code mode.
+**Purpose**: Builds the full description shown for the exec tool. In code-mode-only situations, it also includes a reference section that lists the nested tools JavaScript can call.
 
-**Data flow**: Consumes `enabled_tools`, `namespace_descriptions`, `code_mode_only`, and `deferred_tools_available`. It starts a `sections` vector with `EXEC_DESCRIPTION_TEMPLATE`, optionally appends deferred guidance, and returns early if `code_mode_only` is false. Otherwise it scans enabled tools in order, detects whether any output schema looks like an MCP `CallToolResult`, emits namespace headings only when the namespace changes and the namespace description is non-empty, normalizes each tool name, renders each tool’s declaration text via `render_code_mode_sample_for_definition`, optionally prepends the shared MCP TypeScript preamble once, joins nested sections with blank lines, and returns the final combined string.
+**Data flow**: It receives the enabled tool definitions, optional namespace descriptions, a flag saying whether only code mode tools should be described, and a flag saying whether deferred tools exist. It starts with the standard exec instructions, optionally adds guidance about deferred nested tools, and, when code-mode-only output is requested, adds headings and TypeScript-like call examples for each enabled nested tool. It returns one combined text block.
 
-**Call relations**: Used by tests and by higher-level code that needs the model-facing `exec` description. It delegates identifier normalization, per-tool sample generation, and heading formatting to dedicated helpers.
+**Call relations**: This is the main description builder used by tests that verify nested tools, namespace grouping, timeout text, deferred-tool guidance, and shared MCP type rendering. It calls the name normalizer, tool-sample renderer, heading renderer, and MCP schema recognizer so the final text is readable and not repetitive.
 
 *Call graph*: calls 3 internal fn (normalize_code_mode_identifier, render_code_mode_sample_for_definition, render_tool_heading); called by 6 (code_mode_only_description_groups_namespace_instructions_once, code_mode_only_description_includes_nested_tools, code_mode_only_description_omits_empty_namespace_sections, code_mode_only_description_renders_shared_mcp_types_once, exec_description_mentions_deferred_nested_tools_when_available, exec_description_mentions_timeout_helpers); 6 external calls (new, with_capacity, is_empty, iter, len, format!).
 
@@ -86,11 +90,11 @@ fn build_exec_tool_description(
 fn build_wait_tool_description() -> &'static str
 ```
 
-**Purpose**: Returns the fixed descriptive text for the `wait` tool. There is no dynamic content or formatting logic.
+**Purpose**: Returns the fixed description text for the wait tool. The wait tool has static instructions, so no custom assembly is needed.
 
-**Data flow**: Takes no arguments and returns the static `WAIT_DESCRIPTION_TEMPLATE` string slice.
+**Data flow**: It takes no input. It returns the built-in wait description template exactly as a static string.
 
-**Call relations**: This is the companion to `build_exec_tool_description` for the wait/resume side of code mode.
+**Call relations**: This is the simple counterpart to the exec description builder. Callers use it when registering or describing the wait tool.
 
 
 ##### `normalize_code_mode_identifier`  (lines 324–346)
@@ -99,11 +103,11 @@ fn build_wait_tool_description() -> &'static str
 fn normalize_code_mode_identifier(tool_key: &str) -> String
 ```
 
-**Purpose**: Converts an arbitrary tool key into a JavaScript-safe identifier by preserving valid identifier characters and replacing everything else with underscores. It also guarantees a non-empty result.
+**Purpose**: Turns any tool name into something safe to use as a JavaScript identifier. For example, a name with dashes is rewritten so it can be used as `tools.some_name(...)` style code.
 
-**Data flow**: Iterates `tool_key.chars()` with indices, allowing only `_`, `$`, and ASCII letters in the first position and `_`, `$`, and ASCII alphanumerics afterward; invalid characters become `_`. Returns the accumulated identifier or `_` if the input produced an empty string.
+**Data flow**: It receives a tool key as text. It walks through each character and keeps letters, numbers in non-first positions, underscores, and dollar signs where JavaScript allows them. Invalid characters become underscores. If nothing usable remains, it returns `_`.
 
-**Call relations**: This normalization is reused across description generation, enabled-tool metadata, tool declarations, and schema property-name rendering so JavaScript-facing names stay consistent.
+**Call relations**: This helper is used wherever a raw tool or property name must become code-like text: exec descriptions, enabled tool metadata, tool declarations, and JSON Schema property rendering. Tests check that invalid characters are rewritten predictably.
 
 *Call graph*: called by 4 (build_exec_tool_description, enabled_tool_metadata, render_code_mode_tool_declaration, render_json_schema_property_name); 1 external calls (new).
 
@@ -114,11 +118,11 @@ fn normalize_code_mode_identifier(tool_key: &str) -> String
 fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
 ```
 
-**Purpose**: Rewrites a tool definition’s description to include a code-mode declaration sample for nested tools, while leaving the public tool’s description untouched. It enriches metadata before exposure to code mode.
+**Purpose**: Adds a code-mode call example to a tool definition’s description. This makes a plain tool description more useful when shown inside code mode.
 
-**Data flow**: Takes ownership of a `ToolDefinition`, checks whether `definition.name != PUBLIC_TOOL_NAME`, and if so replaces `definition.description` with `render_code_mode_sample_for_definition(&definition)`. Returns the possibly modified definition.
+**Data flow**: It receives a tool definition. If the tool is not the public exec tool, it replaces the description with a rendered sample that includes the original description and a TypeScript-style declaration. It returns the updated tool definition.
 
-**Call relations**: Used by tests and likely by higher-level metadata preparation before tool definitions are surfaced to code mode. It delegates the actual sample rendering to `render_code_mode_sample_for_definition`.
+**Call relations**: Tests call this to confirm typed declarations and property comments are added. It hands the detailed rendering work to `render_code_mode_sample_for_definition`.
 
 *Call graph*: calls 1 internal fn (render_code_mode_sample_for_definition); called by 3 (augment_tool_definition_appends_typed_declaration, augment_tool_definition_includes_property_descriptions_as_comments, code_mode_only_description_renders_shared_mcp_types_once).
 
@@ -129,11 +133,11 @@ fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
 fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
 ```
 
-**Purpose**: Projects a full `ToolDefinition` into the smaller metadata shape exposed for enabled nested tools. It computes the normalized global JavaScript name alongside the original protocol name and description.
+**Purpose**: Creates a compact metadata record for an enabled tool. This gives later code the original tool identity, a JavaScript-safe global name, its description, and its kind.
 
-**Data flow**: Reads a `ToolDefinition`, clones its `tool_name` and `description`, copies `kind`, computes `global_name` with `normalize_code_mode_identifier(&definition.name)`, and returns an `EnabledToolMetadata` struct.
+**Data flow**: It receives a full tool definition. It copies the tool name, normalizes the public name into a safe global name, copies the description, and keeps the tool kind. It returns an `EnabledToolMetadata` value.
 
-**Call relations**: Used when callers need lightweight nested-tool metadata rather than full schemas. It depends on the same identifier normalization used in generated descriptions.
+**Call relations**: This is a small adapter between full tool definitions and whatever code only needs display or lookup metadata. It uses the same name normalization as the description renderer so names stay consistent.
 
 *Call graph*: calls 1 internal fn (normalize_code_mode_identifier).
 
@@ -150,11 +154,11 @@ fn render_code_mode_sample(
 ) -> String
 ```
 
-**Purpose**: Wraps a plain tool description with a TypeScript declaration snippet showing how the tool appears on the global `tools` object. It is the generic formatter used once input and output types are already known.
+**Purpose**: Builds the text snippet that shows how a specific tool can be called from code mode. It combines the tool’s description with a TypeScript-style declaration.
 
-**Data flow**: Takes `description`, `tool_name`, `input_name`, `input_type`, and `output_type`; builds a declaration string using `render_code_mode_tool_declaration`, then returns a formatted string containing the original description followed by an `exec tool declaration` fenced TypeScript block.
+**Data flow**: It receives descriptive text, the tool name, the argument name, the rendered input type, and the rendered output type. It formats those into a `declare const tools: ...` block and returns the original description followed by that declaration.
 
-**Call relations**: Called by `render_code_mode_sample_for_definition` after that helper derives argument naming and schema-rendered types from a concrete `ToolDefinition`.
+**Call relations**: This is called by `render_code_mode_sample_for_definition` after that function has figured out the correct input and output types. It delegates the one-line function signature to `render_code_mode_tool_declaration`.
 
 *Call graph*: called by 1 (render_code_mode_sample_for_definition); 1 external calls (format!).
 
@@ -165,11 +169,11 @@ fn render_code_mode_sample(
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
 ```
 
-**Purpose**: Generates the full description-plus-declaration text for one tool definition, deriving argument names and TypeScript types from tool kind and JSON schemas. It also recognizes MCP-style output schemas and wraps them as `CallToolResult<T>` when possible.
+**Purpose**: Turns a full tool definition into a friendly code-mode example. It decides what the tool’s argument should be called and what TypeScript-like input and output types to show.
 
-**Data flow**: Reads a `ToolDefinition`; chooses `args` for `Function` tools and `input` for `Freeform`; renders function input schema to TypeScript or uses `string` for freeform input; inspects `output_schema` with `mcp_structured_content_schema`, rendering either `CallToolResult<structured>`/`CallToolResult` or a direct schema type/`unknown`; then passes the original description and derived pieces to `render_code_mode_sample`. Returns the resulting string.
+**Data flow**: It receives a tool definition. For function tools it uses an `args` parameter and renders the input schema; for freeform tools it uses an `input` string. For outputs, it detects MCP call-tool results and wraps their structured content in `CallToolResult` when appropriate. It returns a combined description and declaration sample.
 
-**Call relations**: This helper is the per-tool worker used by both `augment_tool_definition` and `build_exec_tool_description`. It delegates schema rendering and MCP detection to specialized helpers.
+**Call relations**: This is the main rendering helper behind both `augment_tool_definition` and `build_exec_tool_description`. It calls the JSON Schema renderer and MCP result recognizer, then hands the final pieces to `render_code_mode_sample`.
 
 *Call graph*: calls 3 internal fn (mcp_structured_content_schema, render_code_mode_sample, render_json_schema_to_typescript); called by 2 (augment_tool_definition, build_exec_tool_description); 1 external calls (format!).
 
@@ -185,11 +189,11 @@ fn render_code_mode_tool_declaration(
 ) -> String
 ```
 
-**Purpose**: Formats a single TypeScript method signature for a nested tool on the global `tools` object. It normalizes the exposed method name before embedding it in the declaration.
+**Purpose**: Creates the TypeScript-style function signature for one tool. This is the compact line that says what arguments the tool accepts and what promise it returns.
 
-**Data flow**: Takes `tool_name`, `input_name`, `input_type`, and `output_type`, normalizes the tool name with `normalize_code_mode_identifier`, and returns a string like `name(arg: Type): Promise<Out>;`.
+**Data flow**: It receives the raw tool name, the parameter name, and already-rendered input and output type strings. It normalizes the tool name into a JavaScript-safe identifier and returns a string such as `tool(args: Type): Promise<Result>;`.
 
-**Call relations**: Used by `render_code_mode_sample` to build the declaration snippet shown in generated tool descriptions.
+**Call relations**: This is used inside `render_code_mode_sample`. It depends on `normalize_code_mode_identifier` so generated examples do not contain invalid JavaScript names.
 
 *Call graph*: calls 1 internal fn (normalize_code_mode_identifier); 1 external calls (format!).
 
@@ -200,11 +204,11 @@ fn render_code_mode_tool_declaration(
 fn render_tool_heading(global_name: &str, raw_name: &str) -> String
 ```
 
-**Purpose**: Builds the markdown heading for one nested tool section, optionally showing both the normalized JavaScript name and the raw protocol name when they differ. This makes rewritten identifiers traceable.
+**Purpose**: Creates a markdown heading for a nested tool in the exec description. If the JavaScript-safe name differs from the real tool name, it shows both so readers can connect them.
 
-**Data flow**: Compares `global_name` and `raw_name`; returns either ``### `global_name``` or ``### `global_name` (`raw_name`)`` as a `String`.
+**Data flow**: It receives the safe global name and the raw tool name. If they match, it returns a heading with one name. If they differ, it returns a heading with the safe name followed by the raw name in parentheses.
 
-**Call relations**: Called by `build_exec_tool_description` when assembling the nested-tool reference section.
+**Call relations**: The exec description builder calls this for every nested tool section. It keeps the description clear when names were normalized.
 
 *Call graph*: called by 1 (build_exec_tool_description); 1 external calls (format!).
 
@@ -215,11 +219,11 @@ fn render_tool_heading(global_name: &str, raw_name: &str) -> String
 fn render_json_schema_to_typescript(schema: &JsonValue) -> String
 ```
 
-**Purpose**: Public entry point for converting a JSON Schema fragment into a TypeScript type string. It simply forwards to the recursive internal renderer.
+**Purpose**: Converts a JSON Schema value into a TypeScript-like type string. This makes machine-readable schemas understandable to people writing JavaScript tool calls.
 
-**Data flow**: Takes `schema: &JsonValue`, calls `render_json_schema_to_typescript_inner(schema)`, and returns the resulting string.
+**Data flow**: It receives a JSON value representing a schema. It passes that schema to the inner renderer and returns the rendered type text.
 
-**Call relations**: Used by tool-sample generation whenever input or output schemas need to be shown as TypeScript.
+**Call relations**: This is the public wrapper used by tool-sample rendering. The real decision tree lives in `render_json_schema_to_typescript_inner`.
 
 *Call graph*: calls 1 internal fn (render_json_schema_to_typescript_inner); called by 1 (render_code_mode_sample_for_definition).
 
@@ -230,11 +234,11 @@ fn render_json_schema_to_typescript(schema: &JsonValue) -> String
 fn mcp_structured_content_schema(output_schema: Option<&JsonValue>) -> Option<&JsonValue>
 ```
 
-**Purpose**: Detects whether an output schema matches the shape of an MCP `CallToolResult` and, if so, extracts the schema for `structuredContent`. This lets descriptions render `CallToolResult<T>` instead of a generic object.
+**Purpose**: Recognizes the standard shape of an MCP call-tool result and extracts its `structuredContent` schema. MCP, or Model Context Protocol, wraps tool results in a common object, and this function finds the useful typed payload inside it.
 
-**Data flow**: Accepts `Option<&JsonValue>`; returns `None` unless the schema is an object with `properties.content` as an array of objects, `properties.isError` as boolean, and `properties._meta` as object. When those checks pass, it returns `properties.structuredContent` if present or a synthetic `JsonValue::Bool(true)` reference to represent unknown structured content.
+**Data flow**: It receives an optional output schema. It checks for an object with `content` as an array of objects, `isError` as a boolean, and `_meta` as an object. If that shape matches, it returns the `structuredContent` schema, or a permissive schema when that field is absent. If the shape does not match, it returns nothing.
 
-**Call relations**: Called by `render_code_mode_sample_for_definition` to decide whether a tool’s output should be described as an MCP call result wrapper.
+**Call relations**: The tool sample renderer uses this to decide when to show `CallToolResult<...>` instead of rendering the whole wrapper object. The exec description builder also uses the same idea to decide whether shared MCP TypeScript helper types are needed.
 
 *Call graph*: called by 1 (render_code_mode_sample_for_definition); 1 external calls (Bool).
 
@@ -245,11 +249,11 @@ fn mcp_structured_content_schema(output_schema: Option<&JsonValue>) -> Option<&J
 fn render_json_schema_to_typescript_inner(schema: &JsonValue) -> String
 ```
 
-**Purpose**: Recursively converts a JSON Schema value into a TypeScript type expression, covering literals, unions, intersections, arrays, objects, and primitive keywords. It is the core schema renderer.
+**Purpose**: Does the main work of translating JSON Schema into TypeScript-like text. It understands common schema features such as constants, enums, unions, intersections, arrays, objects, and simple primitive types.
 
-**Data flow**: Matches on the `JsonValue`: `true` becomes `unknown`, `false` becomes `never`, objects are inspected for `const`, `enum`, `anyOf`/`oneOf`, `allOf`, `type`, object-shape keys, and array-shape keys in that order, delegating to `render_json_schema_literal`, `render_json_schema_type_keyword`, `render_json_schema_object`, or `render_json_schema_array` as needed. Non-object non-boolean values fall back to `unknown`.
+**Data flow**: It receives one schema value. Boolean `true` becomes `unknown`, boolean `false` becomes `never`, object schemas are inspected for `const`, `enum`, `anyOf`, `oneOf`, `allOf`, `type`, object-like fields, or array-like fields. It returns the best matching TypeScript-style type, falling back to `unknown` when the schema cannot be expressed simply.
 
-**Call relations**: This internal recursive worker underpins all schema-to-TypeScript rendering. Other helpers call it for nested item types, property types, and additional-properties types.
+**Call relations**: This is called by the public schema renderer and recursively by array, object, and property rendering helpers. It hands specific cases to literal, array, object, and type-keyword renderers.
 
 *Call graph*: calls 4 internal fn (render_json_schema_array, render_json_schema_literal, render_json_schema_object, render_json_schema_type_keyword); called by 4 (append_additional_properties_line, render_json_schema_array, render_json_schema_object_property, render_json_schema_to_typescript).
 
@@ -263,11 +267,11 @@ fn render_json_schema_type_keyword(
 ) -> String
 ```
 
-**Purpose**: Maps a JSON Schema `type` keyword to the corresponding TypeScript representation, delegating complex container types to object/array renderers. Unknown schema types degrade to `unknown`.
+**Purpose**: Converts a JSON Schema `type` keyword into the matching TypeScript-like type. It covers the common primitive types and delegates arrays and objects to their specialized renderers.
 
-**Data flow**: Takes the containing schema map and a `schema_type` string; returns primitive TypeScript keywords for `string`, `number`/`integer`, `boolean`, and `null`, or delegates to `render_json_schema_array`/`render_json_schema_object` for `array` and `object`.
+**Data flow**: It receives the surrounding schema map and the type name as text. It maps `string`, `number`, `integer`, `boolean`, and `null` directly, calls array or object renderers for those shapes, and returns `unknown` for unrecognized types.
 
-**Call relations**: Used by `render_json_schema_to_typescript_inner` when a schema declares a `type` field.
+**Call relations**: The inner schema renderer calls this whenever it sees a `type` field. This keeps the type keyword mapping separate from the larger schema decision tree.
 
 *Call graph*: calls 2 internal fn (render_json_schema_array, render_json_schema_object); called by 1 (render_json_schema_to_typescript_inner).
 
@@ -278,11 +282,11 @@ fn render_json_schema_type_keyword(
 fn render_json_schema_array(map: &serde_json::Map<String, JsonValue>) -> String
 ```
 
-**Purpose**: Renders array-like schemas as either homogeneous `Array<T>` or tuple-like `[A, B, ...]` TypeScript types. It falls back to `unknown[]` when item typing is absent.
+**Purpose**: Renders a JSON Schema array as a TypeScript-like array or tuple. A tuple is a fixed-position list, like `[string, number]`.
 
-**Data flow**: Reads a schema map; if `items` exists, recursively renders that schema and returns `Array<item_type>`. Otherwise, if `prefixItems` is an array, recursively renders each entry and returns a tuple string when non-empty. If neither path yields a type, returns `unknown[]`.
+**Data flow**: It receives an object schema map. If there is an `items` schema, it renders that as `Array<ItemType>`. If there are `prefixItems`, it renders each one and returns a tuple-like type. If neither gives enough information, it returns `unknown[]`.
 
-**Call relations**: Called from both `render_json_schema_to_typescript_inner` and `render_json_schema_type_keyword` whenever array semantics are needed.
+**Call relations**: This is called by the inner schema renderer and by the type-keyword renderer when a schema is known to be an array. It recursively calls the inner renderer for item types.
 
 *Call graph*: calls 1 internal fn (render_json_schema_to_typescript_inner); called by 2 (render_json_schema_to_typescript_inner, render_json_schema_type_keyword); 2 external calls (get, format!).
 
@@ -298,11 +302,11 @@ fn append_additional_properties_line(
 )
 ```
 
-**Purpose**: Appends an index-signature line for object schemas based on `additionalProperties`, or a default unknown index signature for empty property sets. It centralizes the object-tail behavior shared by multiline and single-line object rendering.
+**Purpose**: Adds the TypeScript-style line that describes extra object fields not explicitly named in a schema. In TypeScript this looks like `[key: string]: Type;`.
 
-**Data flow**: Mutates the provided `lines: &mut Vec<String>` after inspecting `map` and `properties`. If `additionalProperties` is `true`, it appends `[key: string]: unknown;`; if `false`, it appends nothing; if it is a schema value, it recursively renders that type and appends it. When `additionalProperties` is absent and `properties` is empty, it appends a default unknown index signature.
+**Data flow**: It receives the lines already being built, the full object schema, the known properties, and a prefix for indentation. If `additionalProperties` is true, it adds an unknown-value index line; if it is false, it adds nothing; if it is another schema, it renders that schema as the value type. If no properties are listed and no rule is given, it allows unknown extra keys.
 
-**Call relations**: Used only by `render_json_schema_object` so object rendering handles open-ended maps consistently.
+**Call relations**: The object renderer calls this after rendering named properties. It uses the inner schema renderer when extra properties have their own schema.
 
 *Call graph*: calls 1 internal fn (render_json_schema_to_typescript_inner); called by 1 (render_json_schema_object); 3 external calls (get, is_empty, format!).
 
@@ -313,11 +317,11 @@ fn append_additional_properties_line(
 fn has_property_description(value: &JsonValue) -> bool
 ```
 
-**Purpose**: Checks whether a property schema contains a non-empty `description` string. This determines whether object rendering should switch to multiline commented formatting.
+**Purpose**: Checks whether a schema property has non-empty descriptive text. This matters because properties with descriptions are rendered in a multi-line style with comments.
 
-**Data flow**: Reads `value.get("description")`, converts it to `&str`, tests for non-empty content, and returns a boolean.
+**Data flow**: It receives one JSON schema value. It looks for a string `description` field and checks that it is not empty. It returns true or false.
 
-**Call relations**: Called by `render_json_schema_object` before choosing between compact single-line output and multiline output with comment lines.
+**Call relations**: The object renderer uses this as a quick scan before choosing between compact one-line output and expanded commented output.
 
 *Call graph*: 1 external calls (get).
 
@@ -328,11 +332,11 @@ fn has_property_description(value: &JsonValue) -> bool
 fn render_json_schema_object_property(name: &str, value: &JsonValue, required: &[&str]) -> String
 ```
 
-**Purpose**: Formats one object property declaration, including optional-marker logic and safe property-name quoting. It is the per-property renderer for object schemas.
+**Purpose**: Renders one named object property as a TypeScript-like field. It also marks the field optional when the schema does not list it as required.
 
-**Data flow**: Takes a property `name`, its schema `value`, and the list of required property names; determines whether the property is optional, renders the property name via `render_json_schema_property_name`, renders the property type recursively, and returns a string like `name?: Type;` or `"bad-name": Type;`.
+**Data flow**: It receives the property name, the property schema, and the list of required property names. It decides whether to add `?`, renders the property name safely, renders the property type, and returns a field line such as `city: string;` or `city?: string;`.
 
-**Call relations**: Used by `render_json_schema_object` for both compact and multiline object layouts.
+**Call relations**: The object renderer calls this for each property. It relies on the property-name renderer and the inner schema renderer.
 
 *Call graph*: calls 2 internal fn (render_json_schema_property_name, render_json_schema_to_typescript_inner); 1 external calls (format!).
 
@@ -343,11 +347,11 @@ fn render_json_schema_object_property(name: &str, value: &JsonValue, required: &
 fn render_json_schema_object(map: &serde_json::Map<String, JsonValue>) -> String
 ```
 
-**Purpose**: Renders object schemas into TypeScript object literals, preserving required/optional fields, sorted property order, optional inline comments from property descriptions, and index signatures for additional properties. It chooses multiline formatting when any property has a description.
+**Purpose**: Renders a JSON Schema object as a TypeScript-like object type. It can produce a compact one-line object or a readable multi-line object with comments from property descriptions.
 
-**Data flow**: Reads `required`, clones `properties`, sorts properties by name, and checks whether any property has a description via `has_property_description`. In multiline mode it emits `{`, optional `//` comment lines from each property description, indented property declarations from `render_json_schema_object_property`, appends any additional-properties line, and closes with `}` joined by newlines. In compact mode it collects property declarations into a vector, appends any additional-properties line, returns `{}` when empty, or joins declarations inside `{ ... }`.
+**Data flow**: It receives an object schema map. It reads the required list and properties map, sorts properties by name for stable output, and checks whether any property has descriptions. If descriptions exist, it builds a multi-line block with `//` comments. Otherwise it builds a compact type. It also adds an index line for additional properties when appropriate.
 
-**Call relations**: Called by the recursive schema renderer whenever an object schema or object-like shape is encountered. It delegates property formatting and additional-properties handling to dedicated helpers.
+**Call relations**: This is called by the inner schema renderer and by the type-keyword renderer. It calls helpers for description detection, individual property rendering, and additional-property rendering.
 
 *Call graph*: calls 1 internal fn (append_additional_properties_line); called by 2 (render_json_schema_to_typescript_inner, render_json_schema_type_keyword); 3 external calls (get, format!, vec!).
 
@@ -358,11 +362,11 @@ fn render_json_schema_object(map: &serde_json::Map<String, JsonValue>) -> String
 fn render_json_schema_property_name(name: &str) -> String
 ```
 
-**Purpose**: Produces a TypeScript-safe property name, leaving valid identifiers bare and quoting invalid ones as JSON strings. This preserves exact schema keys without generating invalid syntax.
+**Purpose**: Formats an object property name so it is safe in TypeScript-like output. Normal identifier names are left plain; unusual names are quoted.
 
-**Data flow**: Takes `name: &str`, compares it to `normalize_code_mode_identifier(name)`, and returns either the original name or a JSON-quoted string produced by `serde_json::to_string`, with a manual escaped fallback if serialization somehow fails.
+**Data flow**: It receives a property name. It normalizes the name and compares it with the original. If the original is already identifier-safe, it returns it unchanged. Otherwise it JSON-quotes the name, falling back to a simple escaped quote form if needed.
 
-**Call relations**: Used by `render_json_schema_object_property` so object property declarations remain syntactically valid in generated TypeScript.
+**Call relations**: Object property rendering calls this before writing each field. It shares normalization rules with tool-name rendering, so generated code stays consistent.
 
 *Call graph*: calls 1 internal fn (normalize_code_mode_identifier); called by 1 (render_json_schema_object_property); 1 external calls (to_string).
 
@@ -373,11 +377,11 @@ fn render_json_schema_property_name(name: &str) -> String
 fn render_json_schema_literal(value: &JsonValue) -> String
 ```
 
-**Purpose**: Serializes a JSON literal value into its TypeScript literal representation. It is used for `const` and `enum` members.
+**Purpose**: Renders a JSON value as a TypeScript literal type. This is used for schema `const` values and `enum` choices.
 
-**Data flow**: Takes `value: &JsonValue`, serializes it with `serde_json::to_string`, and falls back to `unknown` if serialization fails. Returns the resulting string.
+**Data flow**: It receives a JSON value. It serializes it to JSON text, such as a quoted string or number. If serialization somehow fails, it returns `unknown`.
 
-**Call relations**: Called by the recursive schema renderer when handling `const` and `enum` schema forms.
+**Call relations**: The inner schema renderer calls this when it sees `const` or `enum`. It lets literal choices appear directly in generated type strings.
 
 *Call graph*: called by 1 (render_json_schema_to_typescript_inner); 1 external calls (to_string).
 
@@ -388,11 +392,11 @@ fn render_json_schema_literal(value: &JsonValue) -> String
 fn mcp_call_tool_result_schema(structured_content_schema: JsonValue) -> JsonValue
 ```
 
-**Purpose**: Builds a reusable JSON fixture representing an MCP-style `CallToolResult` schema with caller-supplied `structuredContent`. It reduces duplication across tests that need MCP output schemas.
+**Purpose**: Builds a test-only MCP call-tool result schema around a chosen structured content schema. It saves the tests from repeating the same wrapper object over and over.
 
-**Data flow**: Takes `structured_content_schema: JsonValue` and returns a `json!` object containing `content`, `structuredContent`, `isError`, `_meta`, required `content`, and `additionalProperties: false`.
+**Data flow**: It receives a JSON schema for `structuredContent`. It inserts that schema into a standard object with `content`, `isError`, `_meta`, and `additionalProperties: false`, then returns the JSON value.
 
-**Call relations**: Used by multiple tests that verify MCP-aware description rendering and namespace grouping.
+**Call relations**: Several tests call this helper before passing tool definitions to `build_exec_tool_description`. It creates schemas that exercise the MCP-specific rendering path.
 
 *Call graph*: 1 external calls (json!).
 
@@ -403,11 +407,11 @@ fn mcp_call_tool_result_schema(structured_content_schema: JsonValue) -> JsonValu
 fn parse_exec_source_without_pragma()
 ```
 
-**Purpose**: Asserts that plain JavaScript input without a pragma is returned unchanged with no execution hints. It verifies the parser’s non-pragma fast path.
+**Purpose**: Checks that ordinary exec source without a pragma is accepted unchanged. This protects the common path where the user simply provides JavaScript.
 
-**Data flow**: Calls `parse_exec_source("text('hi')")`, unwraps the result, and compares it to an expected `ParsedExecSource` with `None` options using `assert_eq!`.
+**Data flow**: It passes `text('hi')` into the parser. It expects the returned code to be the same string and both optional settings to be absent.
 
-**Call relations**: Executed by the test harness to validate `parse_exec_source` behavior for the simplest accepted input.
+**Call relations**: This test calls `parse_exec_source` directly. It verifies that the parser does not require special comments.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -418,11 +422,11 @@ fn parse_exec_source_without_pragma()
 fn parse_exec_source_with_pragma()
 ```
 
-**Purpose**: Checks that a valid first-line pragma is parsed and stripped from the returned code body. It verifies extraction of `yield_time_ms`.
+**Purpose**: Checks that a first-line exec pragma is parsed and removed from the JavaScript code. This protects the feature that lets callers set exec options inline.
 
-**Data flow**: Calls `parse_exec_source` with a pragma line plus body code, unwraps the result, and asserts equality with a `ParsedExecSource` containing `code: "text('hi')"` and `yield_time_ms: Some(10)`.
+**Data flow**: It sends source text whose first line contains JSON with `yield_time_ms`. It expects the parser to return only the later JavaScript line as code, with `yield_time_ms` set and `max_output_tokens` absent.
 
-**Call relations**: This test exercises the pragma-aware branch of `parse_exec_source`.
+**Call relations**: This test calls `parse_exec_source` directly. It confirms the parser’s pragma path works for a valid directive.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -433,11 +437,11 @@ fn parse_exec_source_with_pragma()
 fn normalize_identifier_rewrites_invalid_characters()
 ```
 
-**Purpose**: Verifies that already valid identifiers are preserved and invalid characters such as hyphens are rewritten to underscores. It anchors the normalization rules used throughout description generation.
+**Purpose**: Checks that JavaScript-safe names are preserved and unsafe characters are replaced. This protects generated examples from containing invalid function names.
 
-**Data flow**: Calls `normalize_code_mode_identifier` on two sample names and compares the outputs to expected strings with `assert_eq!`.
+**Data flow**: It passes one already-safe name and one dashed name into the normalizer. It expects the safe name to stay the same and the dashed name to use underscores.
 
-**Call relations**: Run by the test harness to protect the identifier normalization contract used by nested tool declarations.
+**Call relations**: This test calls `normalize_code_mode_identifier`, which is used by description and declaration rendering.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -448,11 +452,11 @@ fn normalize_identifier_rewrites_invalid_characters()
 fn augment_tool_definition_appends_typed_declaration()
 ```
 
-**Purpose**: Ensures that augmenting a function-style tool definition appends a typed `declare const tools` declaration to its description. It checks both presence and exact rendered signature shape.
+**Purpose**: Checks that augmenting a tool definition adds a usable TypeScript-style declaration. This ensures users can see the expected argument and result shape.
 
-**Data flow**: Constructs a `ToolDefinition` with object input/output schemas, passes it to `augment_tool_definition`, extracts the resulting description, and asserts that it contains the declaration scaffold and the expected typed method signature.
+**Data flow**: It builds a function tool with an input schema requiring a `city` string and an output schema requiring an `ok` boolean. It augments the definition and checks that the description now contains `declare const tools` and the expected function signature.
 
-**Call relations**: This test validates the integration of `augment_tool_definition`, schema rendering, and declaration formatting.
+**Call relations**: This test calls `augment_tool_definition`, which in turn relies on the sample and schema renderers.
 
 *Call graph*: calls 2 internal fn (augment_tool_definition, plain); 2 external calls (assert!, json!).
 
@@ -463,11 +467,11 @@ fn augment_tool_definition_appends_typed_declaration()
 fn augment_tool_definition_includes_property_descriptions_as_comments()
 ```
 
-**Purpose**: Checks that property descriptions in JSON Schema become `//` comments in generated multiline TypeScript object types. It verifies the richer object-rendering path.
+**Purpose**: Checks that schema descriptions become comments in generated TypeScript-style declarations. This makes complex tool arguments easier to understand.
 
-**Data flow**: Builds a `ToolDefinition` whose input and output schemas include property descriptions, augments it, and asserts that the resulting description contains a declaration snippet with embedded comment lines and correctly rendered nested types.
+**Data flow**: It builds a weather tool whose input and output properties include descriptions. After augmentation, it checks that those descriptions appear as `//` comments next to the rendered fields.
 
-**Call relations**: Exercises `augment_tool_definition` together with multiline object rendering and comment emission in `render_json_schema_object`.
+**Call relations**: This test exercises `augment_tool_definition` and, through it, the object schema rendering path that switches to multi-line commented output.
 
 *Call graph*: calls 2 internal fn (augment_tool_definition, plain); 2 external calls (assert!, json!).
 
@@ -478,11 +482,11 @@ fn augment_tool_definition_includes_property_descriptions_as_comments()
 fn code_mode_only_description_includes_nested_tools()
 ```
 
-**Purpose**: Verifies that code-mode-only exec descriptions include nested tool sections and do not include unrelated legacy guidance. It checks the basic nested-tool assembly path.
+**Purpose**: Checks that the exec description lists nested tools when code-mode-only descriptions are requested. This ensures available nested tools are actually visible to code-mode users.
 
-**Data flow**: Calls `build_exec_tool_description` with one enabled tool, an empty namespace map, `code_mode_only = true`, and no deferred tools, then asserts that the output contains the expected heading/body text and omits an unwanted phrase.
+**Data flow**: It builds a single simple tool and asks for a code-mode-only exec description. It checks that the nested tool heading and description appear, and that unrelated warning text is absent.
 
-**Call relations**: This test targets the nested-tool branch of `build_exec_tool_description`.
+**Call relations**: This test calls `build_exec_tool_description`. It verifies the branch that appends nested tool reference sections.
 
 *Call graph*: calls 2 internal fn (build_exec_tool_description, plain); 2 external calls (new, assert!).
 
@@ -493,11 +497,11 @@ fn code_mode_only_description_includes_nested_tools()
 fn exec_description_mentions_timeout_helpers()
 ```
 
-**Purpose**: Ensures the base exec description mentions the `setTimeout` and `clearTimeout` helpers. It protects important runtime guidance embedded in the static template.
+**Purpose**: Checks that the regular exec description mentions JavaScript timeout helper functions. This helps users know that timeout-style helpers are available.
 
-**Data flow**: Calls `build_exec_tool_description` with no tools and `code_mode_only = false`, then asserts that the returned description contains both helper signatures.
+**Data flow**: It builds an exec description with no nested tools and not in code-mode-only mode. It then checks that `setTimeout` and `clearTimeout` are mentioned.
 
-**Call relations**: This test validates the static `EXEC_DESCRIPTION_TEMPLATE` content as surfaced by `build_exec_tool_description`.
+**Call relations**: This test calls `build_exec_tool_description` and verifies text from the base exec description template.
 
 *Call graph*: calls 1 internal fn (build_exec_tool_description); 2 external calls (new, assert!).
 
@@ -508,11 +512,11 @@ fn exec_description_mentions_timeout_helpers()
 fn code_mode_only_description_groups_namespace_instructions_once()
 ```
 
-**Purpose**: Checks that namespace guidance is emitted once per namespace even when multiple tools share it, and that MCP-aware declarations are rendered for each tool. It verifies namespace transition logic and MCP type wrapping.
+**Purpose**: Checks that tools in the same namespace share one namespace guidance section. This prevents repeated instructions from cluttering the generated description.
 
-**Data flow**: Builds a namespace description map and two namespaced tool definitions with MCP-style output schemas, calls `build_exec_tool_description`, then asserts that the namespace heading appears exactly once and that both tool declarations use `Promise<CallToolResult<{}>>`.
+**Data flow**: It creates two namespaced tools and one namespace description. It builds a code-mode-only exec description, then checks that the namespace heading appears exactly once, that its guidance text appears, and that both tools have MCP-wrapped typed declarations.
 
-**Call relations**: This test exercises the namespace-grouping branch inside `build_exec_tool_description` and the MCP detection path in `render_code_mode_sample_for_definition`.
+**Call relations**: This test calls `build_exec_tool_description` and uses the MCP schema helper. It exercises namespace grouping, nested tool rendering, and MCP result type rendering together.
 
 *Call graph*: calls 2 internal fn (build_exec_tool_description, namespaced); 5 external calls (from, assert!, assert_eq!, mcp_call_tool_result_schema, json!).
 
@@ -523,11 +527,11 @@ fn code_mode_only_description_groups_namespace_instructions_once()
 fn code_mode_only_description_omits_empty_namespace_sections()
 ```
 
-**Purpose**: Verifies that namespace headings are skipped when the namespace description text is empty, even if tools belong to that namespace. It protects against noisy empty sections.
+**Purpose**: Checks that an empty namespace description does not produce a blank namespace heading. This keeps generated documentation clean.
 
-**Data flow**: Creates a namespace map with an empty description and one namespaced tool, calls `build_exec_tool_description`, and asserts that no namespace heading is present while the tool heading still is.
+**Data flow**: It creates a namespaced tool and a namespace entry with an empty description. It builds the exec description and verifies that the namespace heading is missing while the tool heading is still present.
 
-**Call relations**: This test targets the conditional namespace-heading emission logic in `build_exec_tool_description`.
+**Call relations**: This test calls `build_exec_tool_description` and uses the MCP schema helper. It focuses on the namespace-heading branch of the builder.
 
 *Call graph*: calls 2 internal fn (build_exec_tool_description, namespaced); 5 external calls (from, new, assert!, mcp_call_tool_result_schema, json!).
 
@@ -538,11 +542,11 @@ fn code_mode_only_description_omits_empty_namespace_sections()
 fn code_mode_only_description_renders_shared_mcp_types_once()
 ```
 
-**Purpose**: Ensures that when multiple MCP-style tools are present, the shared TypeScript preamble is included exactly once. It prevents duplicated boilerplate in generated descriptions.
+**Purpose**: Checks that shared MCP TypeScript helper types are included only once, even when multiple tools need them. This avoids duplicate type blocks in the exec description.
 
-**Data flow**: Builds two MCP-style tool definitions, first augmenting them to reuse realistic schemas, then calls `build_exec_tool_description` and counts occurrences of the `CallToolResult` type alias and `Shared MCP Types:` heading with `assert_eq!`.
+**Data flow**: It builds two MCP-style tools, augments them, then asks for a code-mode-only exec description. It counts the shared `CallToolResult` type text and the `Shared MCP Types:` heading, expecting each to appear once.
 
-**Call relations**: This test validates the `has_mcp_tools` branch and one-time preamble insertion in `build_exec_tool_description`.
+**Call relations**: This test calls both `augment_tool_definition` and `build_exec_tool_description`. It protects the coordination between MCP result detection and shared preamble insertion.
 
 *Call graph*: calls 3 internal fn (augment_tool_definition, build_exec_tool_description, namespaced); 3 external calls (new, assert_eq!, json!).
 
@@ -553,11 +557,11 @@ fn code_mode_only_description_renders_shared_mcp_types_once()
 fn exec_description_mentions_deferred_nested_tools_when_available()
 ```
 
-**Purpose**: Checks that deferred nested-tool guidance is appended when the corresponding flag is enabled. It also ensures unrelated wording is absent.
+**Purpose**: Checks that the exec description warns about deferred nested tools when that feature is available. Deferred tools may not all be shown immediately, so the guidance tells readers how to discover or filter them.
 
-**Data flow**: Calls `build_exec_tool_description` with no tools, `code_mode_only = false`, and `deferred_tools_available = true`, then asserts presence of the deferred-tools guidance text and absence of an unwanted phrase.
+**Data flow**: It builds an exec description with deferred tools marked as available. It checks that the expected guidance about omitted deferred tools and filtering `ALL_TOOLS` appears, and that a specific warning about printing the full array does not appear.
 
-**Call relations**: This test covers the optional deferred-guidance branch in `build_exec_tool_description`.
+**Call relations**: This test calls `build_exec_tool_description`. It verifies the optional deferred-tool guidance branch.
 
 *Call graph*: calls 1 internal fn (build_exec_tool_description); 2 external calls (new, assert!).
 
@@ -567,22 +571,28 @@ These data models define what code-mode tools send and receive at execution time
 
 ### `code-mode-protocol/src/response.rs`
 
-`data_model` · `request handling`
+`data_model` · `cross-cutting protocol serialization`
 
-This file contains the small data model used to represent multimodal content items associated with function-call output. `ImageDetail` is a serde-backed enum with lowercase wire values `auto`, `low`, `high`, and `original`; it is `Copy`, `Eq`, and `Deserialize`/`Serialize`, so it can be cheaply propagated through request/response structures and round-tripped over JSON without custom code. `DEFAULT_IMAGE_DETAIL` fixes the crate’s default image fidelity to `ImageDetail::High`, making the preferred behavior explicit rather than implicit.
+This file is part of the protocol layer: the agreed-upon language that different parts of the system use to talk to each other. Its main job is to define what a function-call output item can look like. An item can be plain text, or it can be an image URL with an optional image detail setting.
 
-The main payload type is `FunctionCallOutputContentItem`, a tagged enum serialized with a `type` discriminator in `snake_case`. It has two variants: `InputText { text: String }` for plain textual content and `InputImage { image_url: String, detail: Option<ImageDetail> }` for image references. The `detail` field is optional and omitted entirely when `None`, which preserves compact JSON and lets callers rely on server defaults unless they need to override fidelity. The design is intentionally narrow: this file does not define transport behavior or validation logic, only the exact JSON shape and Rust types that other protocol layers consume. The serde attributes are the critical implementation detail, because they lock down the external wire contract.
+The `ImageDetail` enum gives names to the allowed image quality/detail choices: automatic, low, high, or original. The default used by this protocol is `High`, which means that if the system needs a normal choice, it prefers a detailed image rather than a low-quality one.
+
+The `FunctionCallOutputContentItem` enum is the main content wrapper. It is tagged by a `type` field when converted to JSON, so a receiver can tell whether it is looking at text or an image. This is like putting a clear label on each package before shipping it: one label says “input_text” and another says “input_image.”
+
+The file uses Serde, a Rust library for serialization, meaning it can automatically convert these Rust values to formats like JSON and back again. That matters because protocol data usually crosses boundaries between programs, processes, or machines. Without these shared definitions, different parts of the system could disagree about the names, fields, or allowed values for response content.
 
 
 ### `code-mode-protocol/src/runtime.rs`
 
 `data_model` · `request handling`
 
-This file is almost entirely declarative. It establishes the serialized protocol types exchanged with a code-mode runtime: `ExecuteRequest` carries the tool call ID, enabled nested tools, source code, and optional execution limits; `WaitRequest` and `WaitToPendingRequest` identify a running cell to resume or transition; `ExecuteToPendingOutcome`, `WaitOutcome`, and `WaitToPendingOutcome` model the different ways execution can yield, complete, remain live, or refer to a missing cell. `RuntimeResponse` is the core terminal/yielding payload, with `Yielded`, `Terminated`, and `Result` variants that all carry a `CellId` and emitted `FunctionCallOutputContentItem`s, with `Result` optionally including `error_text`.
+This file is mostly a set of plain data shapes for the code execution part of the protocol. Think of it like a stack of standardized forms: one form says “please run this code,” another says “please wait for this running cell,” and others describe what came back.
 
-The file also defines `CodeModeNestedToolCall`, the payload used when a running cell invokes another tool: it records the originating cell, a runtime-local tool call ID, the protocol `ToolName`, the nested tool kind, and optional JSON input. Constants provide default yield times and output-token budgets for exec/wait behavior.
+The runtime can reply in a few important ways. It can say the code yielded, meaning it produced some output but is still alive. It can say the code terminated, meaning execution stopped. Or it can return a final result, possibly with an error message. These replies include a cell ID, which is the label used to keep track of one running piece of code, and content items, which are the visible outputs produced by execution.
 
-Behavior is intentionally minimal: the only implementation is `From<WaitOutcome> for RuntimeResponse`, which discards whether the response came from a live or missing cell and extracts the embedded `RuntimeResponse`. That conversion is useful when callers only care about the payload shape, not the provenance.
+The file also covers “pending” situations. Some code can trigger nested tool calls, so execution may pause while those tools finish. The outcome types describe whether a cell is still live, missing, completed, or waiting on pending work.
+
+All these types can be serialized and deserialized, meaning they can be turned into data for transport, such as JSON, and then rebuilt on the other side. Without this file, the runtime and its caller would not have a reliable shared contract for what requests and responses mean.
 
 #### Function details
 
@@ -592,11 +602,11 @@ Behavior is intentionally minimal: the only implementation is `From<WaitOutcome>
 fn from(outcome: WaitOutcome) -> Self
 ```
 
-**Purpose**: Converts a `WaitOutcome` into its contained `RuntimeResponse`, ignoring whether the source cell was live or missing. It is a convenience adapter between two protocol layers.
+**Purpose**: This converts a wait outcome into the runtime response inside it. It is useful when later code does not care whether the response came from a live cell or a missing cell and only needs the actual runtime message.
 
-**Data flow**: Takes ownership of a `WaitOutcome`, pattern-matches both `LiveCell(response)` and `MissingCell(response)`, and returns the inner `RuntimeResponse` unchanged.
+**Data flow**: It receives a WaitOutcome, which is either a LiveCell response or a MissingCell response. It opens that wrapper, takes out the RuntimeResponse stored inside, and returns that response unchanged. It does not create new output or change any shared state.
 
-**Call relations**: Used by callers that receive a `WaitOutcome` but want to continue processing only the common response payload without branching on cell existence.
+**Call relations**: This is the standard Rust conversion path for turning WaitOutcome into RuntimeResponse, so other code can use the usual conversion style when it wants to flatten the wrapper. It does not hand work off to other functions; it simply unwraps the two possible cases in the same way.
 
 
 ### Session contracts
@@ -604,13 +614,17 @@ These abstractions define the longer-lived session boundary between callers and 
 
 ### `code-mode-protocol/src/session.rs`
 
-`data_model` · `request handling`
+`data_model` · `cross-cutting during code-mode session creation and cell execution`
 
-This file establishes the asynchronous interface for executing and managing code-mode cells. It begins with boxed-future type aliases that standardize return shapes for session operations, nested tool invocations, and notifications. `CellId` is a thin newtype around `String` with serde support plus convenience methods and trait impls (`AsRef<str>`, `Display`) so it can move cleanly through protocol, logging, and map-key contexts.
+This file is like the rulebook for a shared workspace where code cells are run. A “session” is the workspace: code cells in the same session can share stored values, while different sessions must stay separate. Without this file, the parts of the system that ask for code to run and the parts that actually run it would not have a common language.
 
-`StartedCell` represents a newly launched cell whose first runtime response may arrive later. Instead of exposing the raw `oneshot::Receiver`, it stores a boxed future named `initial_response`. Two constructors cover the two receiver shapes used by implementations: one where the channel carries a plain `RuntimeResponse`, and one where it carries `Result<RuntimeResponse, String>`. Both normalize channel-closure into the same user-facing error string, `"exec runtime ended unexpectedly"`. The `initial_response(self)` method then awaits and returns that normalized result.
+The file first defines a few reusable future types. A future is a value that represents work that will finish later, such as waiting for code execution. These aliases make every session implementation return results in the same shape: either the requested value or a plain error message.
 
-The rest of the file is trait definitions. `CodeModeSessionDelegate` is the callback surface a runtime uses to invoke nested tools, emit notifications, and release per-cell delegate state after terminal completion. `CodeModeSession` defines liveness checks plus async `execute`, `wait`, `terminate`, and `shutdown` operations for a durable session whose cells share stored values. `CodeModeSessionProvider` creates sessions for Codex threads, potentially sharing an underlying remote host across sessions. The file is therefore the protocol-facing boundary for all session implementations.
+It then defines `CellId`, a small wrapper around a string. This gives each running code cell a clear identity instead of passing raw strings everywhere.
+
+`StartedCell` represents a cell that has been accepted for execution. It contains the cell’s id and a delayed first response from the runtime. This first response may arrive later, so it is stored as asynchronous work.
+
+Finally, the file defines three traits, which are shared interfaces. `CodeModeSessionDelegate` describes callbacks from the runtime back to the host, such as invoking a nested tool or sending a notification. `CodeModeSession` describes what any session must be able to do: execute, wait, terminate, and shut down. `CodeModeSessionProvider` describes something that can create new sessions.
 
 #### Function details
 
@@ -620,11 +634,11 @@ The rest of the file is trait definitions. `CodeModeSessionDelegate` is the call
 fn new(value: String) -> Self
 ```
 
-**Purpose**: Constructs a new cell identifier from an owned string. It is the canonical constructor for the `CellId` newtype.
+**Purpose**: Creates a `CellId` from a plain string. This is used when the system has received or generated a cell identifier and wants to treat it as a typed cell id instead of an ordinary piece of text.
 
-**Data flow**: Takes `value: String`, wraps it in `CellId(value)`, and returns the new struct without side effects.
+**Data flow**: A string goes in. The function wraps that string inside a `CellId` without changing its contents. A new `CellId` comes out, ready to be passed around wherever a cell identity is needed.
 
-**Call relations**: Used wherever a fresh cell ID is allocated or reconstructed from protocol data before being passed through session APIs.
+**Call relations**: This is the entry point for turning raw cell-id text into the stronger `CellId` type. It is used by code that allocates ids, builds ids in tests, and handles incoming calls that refer to a cell.
 
 *Call graph*: called by 5 (started_cell_preserves_remote_initial_response_errors, allocate_cell_id, cell_id, cell_id, handle_call).
 
@@ -635,11 +649,11 @@ fn new(value: String) -> Self
 fn as_str(&self) -> &str
 ```
 
-**Purpose**: Returns the underlying cell ID as a string slice. It provides borrowed access without exposing the inner field directly.
+**Purpose**: Gives read-only access to the text inside a `CellId`. This is useful when something needs the actual id string, for example to compare it, log it, or send it over a protocol.
 
-**Data flow**: Reads `self.0` and returns `&str` referencing the inner `String`.
+**Data flow**: A `CellId` is already present. The function borrows the inner string as `&str`, which means callers can read it without taking ownership or making a copy. The `CellId` itself is unchanged.
 
-**Call relations**: This is the shared accessor used by both the `AsRef<str>` and `Display` implementations.
+**Call relations**: This is the common doorway from the typed `CellId` back to plain text. The `AsRef` implementation and display formatting both use it so there is only one simple way to expose the inner string.
 
 *Call graph*: called by 2 (as_ref, fmt).
 
@@ -650,11 +664,11 @@ fn as_str(&self) -> &str
 fn as_ref(&self) -> &str
 ```
 
-**Purpose**: Implements `AsRef<str>` for `CellId` by forwarding to `as_str`. This lets `CellId` be passed to APIs expecting a generic string reference.
+**Purpose**: Lets a `CellId` be used in places that expect something that can be viewed as a string. This is a Rust convenience hook that avoids callers needing to manually unwrap the id text.
 
-**Data flow**: Takes `&self`, calls `self.as_str()`, and returns the borrowed `&str`.
+**Data flow**: A borrowed `CellId` goes in. The function asks `CellId::as_str` for the inner text and returns that borrowed string slice. Nothing is copied or changed.
 
-**Call relations**: Invoked implicitly by generic code using `AsRef<str>`. It delegates all logic to `CellId::as_str`.
+**Call relations**: This function is called automatically by Rust code that works with the `AsRef<str>` pattern. Internally it delegates to `CellId::as_str`, keeping all string access consistent.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -665,11 +679,11 @@ fn as_ref(&self) -> &str
 fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Implements `Display` for `CellId` by writing the raw identifier string. It makes cell IDs printable in logs and messages.
+**Purpose**: Controls how a `CellId` is printed as normal text. This lets logs, error messages, and formatted strings show the actual cell id rather than a debug-looking wrapper.
 
-**Data flow**: Reads `self.as_str()` and writes it into the provided formatter with `write_str`, returning the resulting `fmt::Result`.
+**Data flow**: A `CellId` and a formatter go in. The function gets the inner string through `CellId::as_str` and writes that text into the formatter. The output is the formatter’s success or failure result.
 
-**Call relations**: Used implicitly whenever a `CellId` is formatted with `{}`. It delegates string access to `CellId::as_str`.
+**Call relations**: This is used whenever code formats a `CellId` with normal display formatting. It relies on `CellId::as_str` for the actual text and hands that text to Rust’s formatter-writing machinery.
 
 *Call graph*: calls 1 internal fn (as_str); 1 external calls (write_str).
 
@@ -680,11 +694,11 @@ fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(cell_id: CellId, initial_response_rx: oneshot::Receiver<RuntimeResponse>) -> Self
 ```
 
-**Purpose**: Creates a `StartedCell` from a oneshot receiver that will eventually yield a plain `RuntimeResponse`. It wraps the receiver in a boxed future and normalizes channel closure into a stable error message.
+**Purpose**: Builds a `StartedCell` when the first runtime response will arrive through a one-time message channel. This is for the simple case where that channel sends a successful `RuntimeResponse` value directly.
 
-**Data flow**: Takes a `cell_id` and `oneshot::Receiver<RuntimeResponse>`, stores the ID, and builds `initial_response` as a pinned async block that awaits the receiver and maps `RecvError` to `Err("exec runtime ended unexpectedly")`. Returns the assembled `StartedCell`.
+**Data flow**: A `CellId` and a one-shot receiver go in. The receiver is wrapped in an asynchronous future, like putting a note in a mailbox and promising to check it later. If the sender disappears before sending, the future turns that into the error message `exec runtime ended unexpectedly`. The result is a `StartedCell` holding the id and the delayed first response.
 
-**Call relations**: Used by session implementations that can guarantee the initial response channel carries only successful runtime responses. Callers later consume the future through `StartedCell::initial_response`.
+**Call relations**: Session implementations can use this when they have just started a cell and need to return immediately while the runtime prepares the first response. It packages the receiver so later code can call `StartedCell::initial_response` to wait for that first response.
 
 *Call graph*: 1 external calls (pin).
 
@@ -698,11 +712,11 @@ fn from_result_receiver(
     ) -> Self
 ```
 
-**Purpose**: Creates a `StartedCell` from a oneshot receiver whose payload is already a `Result<RuntimeResponse, String>`. It preserves runtime-reported errors while still normalizing channel closure.
+**Purpose**: Builds a `StartedCell` when the first runtime response channel may contain either a response or an error message. This preserves errors reported by a remote or background runtime instead of replacing them with a generic failure.
 
-**Data flow**: Takes a `cell_id` and `oneshot::Receiver<Result<RuntimeResponse, String>>`, stores the ID, and builds `initial_response` as a pinned async block that awaits the receiver, maps channel closure to `"exec runtime ended unexpectedly"`, and then propagates the inner `Result`. Returns the new `StartedCell`.
+**Data flow**: A `CellId` and a one-shot receiver of `Result<RuntimeResponse, String>` go in. The function wraps the receiver in a future. If the channel closes early, it produces `exec runtime ended unexpectedly`; if the channel delivers an error, that original error is kept; if it delivers a response, that response comes out. The result is a `StartedCell` with delayed first-response work attached.
 
-**Call relations**: Used by implementations whose startup path can fail asynchronously after cell allocation. It is called by runtime/session code and covered by tests that verify remote initial-response errors are preserved.
+**Call relations**: This is used by execution paths that need to pass through richer startup failures from the runtime. After it creates the `StartedCell`, callers can return it to higher-level code, which later awaits `StartedCell::initial_response`.
 
 *Call graph*: called by 2 (started_cell_preserves_remote_initial_response_errors, execute); 1 external calls (pin).
 
@@ -713,8 +727,8 @@ fn from_result_receiver(
 async fn initial_response(self) -> Result<RuntimeResponse, String>
 ```
 
-**Purpose**: Awaits and returns the first runtime response for a started cell. It consumes the `StartedCell`, ensuring the one-time initial response cannot be awaited twice.
+**Purpose**: Waits for and returns the first response from a started cell. This is the point where the caller finally learns whether the runtime produced an initial response or failed before doing so.
 
-**Data flow**: Takes ownership of `self`, awaits the boxed `initial_response` future, and returns `Result<RuntimeResponse, String>`.
+**Data flow**: A `StartedCell` goes in and is consumed, meaning this first response can only be awaited once. The stored future is awaited until it finishes. The function returns either the `RuntimeResponse` or an error string, and the `StartedCell` is no longer available afterward.
 
-**Call relations**: Called by code that has just executed a cell and needs the first yielded/completed response before proceeding with later waits.
+**Call relations**: This is called after some session implementation has returned a `StartedCell` from an execute request. It completes the story started by `StartedCell::new` or `StartedCell::from_result_receiver` by actually waiting on the delayed runtime reply.

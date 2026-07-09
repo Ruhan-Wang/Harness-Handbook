@@ -1,10 +1,6 @@
 # Extension and hook interface contracts  `stage-18.4.3`
 
-This stage is cross-cutting infrastructure: it does not run the main workflow itself, but defines the stable contracts that hosts, extensions, plugins, and hook engines rely on during startup and throughout execution. The extension API crate is the primary surface. Its facade in lib.rs and capabilities/mod.rs exposes host-provided capabilities for spawning subagents, emitting events, and injecting response items, with agent.rs, events.rs, and response_items.rs supplying the concrete traits and safe fallback implementations when a host does not support a feature.
-
-contributors.rs defines the extension callback interfaces used across prompt assembly, lifecycle observation, approval, config, and post-processing, while the contributor payload files specify the exact data delivered for MCP overlays, thread/turn/tool lifecycle events, and turn input snapshots. state.rs provides typed shared storage for host-seeded and extension-owned data, and user_instructions.rs standardizes loading startup instructions.
-
-Adjacent contracts build on that surface: ext/goal/events.rs adapts goal updates into host protocol events, ext/memories/backend.rs fixes the storage backend boundary, and tui/src/ide_context.rs defines the IDE-context schema. The hooks crate complements this by declaring hook identities, event names, execution/result types, and JSON wire schemas, with schema_loader.rs bundling those schemas for runtime validation and interoperability.
+This stage is shared behind-the-scenes support for people who add plugins, extensions, or hooks. It defines the stable “contracts” they can rely on, so outside code does not need to know the host’s private machinery. The extension API front doors gather and re-export the public pieces. Capability files describe powers the host may give an extension: starting a subagent, sending events, or adding extra items to the model’s current turn, with safe no-op versions when unsupported. Contributor files define the callback data for MCP server changes, thread and turn lifecycle moments, tool calls, and turn input. The main contributors file lists the plug-in points themselves. State gives extensions a safe typed storage box, and user instructions define how startup instruction text is reported. Goal events package goal changes in the standard event form. The memories backend defines a storage contract, while IDE context describes editor-provided file and selection data for the terminal UI. The hooks files define declared hook handlers, event modules, shared hook types, JSON wire formats, schema generation, and schema loading, making hook commands predictable and checkable.
 
 ## Files in this stage
 
@@ -13,11 +9,15 @@ These files define the top-level public surface of the extension API crate and i
 
 ### `ext/extension-api/src/capabilities/agent.rs`
 
-`util` · `extension setup and capability invocation`
+`data_model` · `cross-cutting; used when extensions are constructed and whenever they request a subagent`
 
-This file is a small capability adapter around subagent creation. `AgentSpawnFuture<'a, T, E>` standardizes the async return type as a boxed, pinned, sendable future yielding `Result<T, E>`. The `AgentSpawner<R>` trait then describes the host-provided capability: given a `ThreadId` identifying the thread being forked from and an extension-defined request payload `R`, produce an async result containing either a spawned handle or an error.
+This file is part of the extension API: the boundary between extension code and the main host program. Its job is to describe one capability the host can give to an extension: spawning a subagent, meaning starting another agent thread or worker that branches off from an existing conversation thread.
 
-The key implementation detail is the blanket `impl<R, S, E, F> AgentSpawner<R> for F` for any closure or function object `F` with signature `Fn(ThreadId, R) -> AgentSpawnFuture<'static, S, E> + Send + Sync`. That means hosts can satisfy the capability simply by passing a closure, rather than defining a dedicated struct type. The implementation forwards the trait call directly to the closure and relies on covariance of the boxed future type to return it as `AgentSpawnFuture<'a, S, E>`. This file contains no spawning logic itself; it is purely the type-level contract and ergonomic adapter that extension constructors can depend on.
+The key idea is dependency injection: instead of an extension directly creating subagents itself, the host hands it an object that knows how to do that. This is like giving a guest a front-desk phone rather than keys to every room. The guest can request help, but the building still controls how the work is done.
+
+The file defines `AgentSpawnFuture`, which is the promised result of an asynchronous spawn request. A future is a value representing work that will finish later. It also defines the `AgentSpawner<R>` trait, where `R` is the request shape chosen by the extension. The trait says: given the thread being forked from and a request, return either a spawned subagent handle or an error.
+
+Finally, the file includes a convenience implementation so a plain function or closure can act as an `AgentSpawner`. That means the host does not need to build a full custom struct just to provide this capability; it can pass a callable helper directly.
 
 #### Function details
 
@@ -31,20 +31,22 @@ fn spawn_subagent(
     ) -> AgentSpawnFuture<'a, Self::Spawned, Self::Error>
 ```
 
-**Purpose**: Implements `AgentSpawner` for any compatible closure by forwarding the spawn request directly to that closure. It turns plain functions or closures into trait objects or generic capability providers.
+**Purpose**: This lets an ordinary function or closure satisfy the `AgentSpawner` interface. Someone uses it when the host wants to provide subagent-spawning behavior without writing a separate named type.
 
-**Data flow**: It takes `&self` as the closure, a `forked_from_thread_id: ThreadId`, and a request `R`, invokes `self(forked_from_thread_id, request)`, and returns the resulting boxed future yielding `Result<Self::Spawned, Self::Error>`.
+**Data flow**: It receives the original thread ID and the extension's spawn request. It passes both values straight into the stored function or closure. The result is a future, meaning an asynchronous operation that will later produce either the spawned subagent value or an error.
 
-**Call relations**: This method is called wherever code is generic over `AgentSpawner<R>`. Its only role in the call flow is adaptation: it delegates all real work to the injected closure supplied by the host.
+**Call relations**: Extension-facing code calls this through the `AgentSpawner` trait when it needs a subagent. In this implementation, the trait method simply hands the work off to the injected function or closure, so the real spawning behavior remains supplied by the host.
 
 
 ### `ext/extension-api/src/capabilities/events.rs`
 
-`util` · `cross-cutting`
+`data_model` · `cross-cutting`
 
-This file contains a single capability trait and its inert fallback implementation. `ExtensionEventSink` is the contract extensions use when they want to emit protocol `Event` values back to the host in a fire-and-forget manner. The trait deliberately says nothing about persistence, ordering, fanout, retries, or transport; those concerns remain host-owned. Extensions are expected to construct protocol events with the correct correlation identifiers for the callback they are handling and then hand them off through `emit`.
+Extensions sometimes need to report something back to the main program, such as progress, a warning, or the result of a callback. This file defines a small contract for that: an `ExtensionEventSink`, which is like a mailbox the host gives to an extension. The extension drops an `Event` into it, and the host decides what happens next, such as saving it, ordering it with other events, sending it over a connection, or logging it.
 
-`NoopExtensionEventSink` is a tiny default implementation for hosts that choose not to support extension event emission. It derives `Debug`, `Default`, `Clone`, and `Copy`, making it easy to embed in capability bundles without allocation or state management. Its `emit` method intentionally discards the provided `Event` immediately. That design lets extension code depend on an event sink uniformly, while hosts can opt out by wiring in this no-op sink instead of adding conditional logic throughout the extension stack.
+The important idea is separation of responsibility. Extensions create the event, including the right correlation id so the host can connect it to the request or callback that caused it. But extensions do not decide how events are delivered. That keeps extensions simpler and lets different hosts choose different delivery behavior.
+
+The file also defines `NoopExtensionEventSink`, a safe fallback mailbox that silently throws events away. This is useful when event emission is not available. Instead of forcing every extension to check whether event support exists, the host can provide this no-op sink. It is like giving someone a suggestion box that is not connected to anything: putting a note inside does not break the program, but nothing is delivered either.
 
 #### Function details
 
@@ -54,20 +56,24 @@ This file contains a single capability trait and its inert fallback implementati
 fn emit(&self, _event: Event)
 ```
 
-**Purpose**: Implements an inert event sink that silently drops every emitted event. It provides a capability-compatible placeholder when the host does not support extension event delivery.
+**Purpose**: This is the do-nothing implementation of event sending. It lets code call `emit` safely even when the host has not provided a real event delivery path.
 
-**Data flow**: It takes `&self` and an `Event`, ignores the event value entirely, performs no side effects, and returns `()`.
+**Data flow**: An `Event` is passed in, but the function deliberately ignores it. Nothing is stored, sent, logged, or returned, and no outside state changes.
 
-**Call relations**: Used wherever code is parameterized over `ExtensionEventSink` but the host has chosen not to wire a real sink. It terminates the event flow instead of delegating further.
+**Call relations**: This function is used when a `NoopExtensionEventSink` is standing in for a real `ExtensionEventSink`. In the larger flow, extension-facing code can still try to emit an event, but this implementation stops the story there and hands the event off to no one.
 
 
 ### `ext/extension-api/src/capabilities/response_items.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `during an active model turn when an extension asks to add model-visible input`
 
-This file is a small capability boundary between extensions and the host runtime. Its central type alias, `ResponseItemInjectionFuture<'a>`, standardizes the async contract for same-turn input steering: implementations resolve to `Ok(())` when the host accepted and injected the supplied `Vec<ResponseInputItem>`, or `Err(Vec<ResponseInputItem>)` when injection is unavailable and ownership of the untouched items is returned to the caller. That error shape is deliberate: it avoids dropping or partially consuming model-visible input when the host cannot honor same-turn injection.
+Some extensions may want to steer what the model sees while a conversation turn is still active. For example, an extension might discover useful context and ask the host to feed it into the model immediately, rather than waiting for a later turn. This file describes that capability in a small, host-facing interface.
 
-The `ResponseItemInjector` trait is the host-provided capability object extensions depend on when they want to add `ResponseInputItem` values to the active model turn. The trait is `Send + Sync`, so hosts can share one injector across async tasks safely. The file’s concrete implementation, `NoopResponseItemInjector`, is the compatibility/default path for hosts that do not support this steering feature. Rather than silently succeeding or discarding data, it immediately returns a ready future containing `Err(items)`. That preserves a strong invariant: unsupported injection never mutates runtime state and never loses caller-supplied items. The implementation is intentionally allocation-light beyond boxing the future and has no internal state, which is why the struct derives `Debug`, `Default`, `Clone`, and `Copy`.
+The main idea is the `ResponseItemInjector` trait. A trait is like a promise: any host that implements it agrees to provide a method for trying to inject response input items into the active model turn. The input items are `ResponseInputItem` values, which are pieces of model-visible conversation input from the shared protocol.
+
+Because the injection may happen asynchronously, the method returns a future, which is a value representing work that will finish later. If injection succeeds, the future finishes with `Ok(())`. If the host cannot inject the items, it returns `Err(items)`, giving the unchanged items back to the caller so they are not silently lost.
+
+The file also defines `NoopResponseItemInjector`, a fallback injector. “Noop” means “no operation”: it never injects anything. It immediately returns the original items as an error. This is useful for hosts that want to expose the API shape without claiming they can steer the current model turn.
 
 #### Function details
 
@@ -80,31 +86,37 @@ fn inject_response_items(
     ) -> ResponseItemInjectionFuture<'a>
 ```
 
-**Purpose**: Implements the unsupported-injection path by rejecting same-turn response-item injection and returning the original `ResponseInputItem` vector unchanged. It gives callers a uniform async interface even though the result is immediately known.
+**Purpose**: This is the fallback implementation used when same-turn model input injection is not available. It deliberately does not change or consume the supplied items; it gives them back to the caller.
 
-**Data flow**: It takes `&self` and ownership of `items: Vec<ResponseInputItem>`. It performs no inspection or mutation of the vector, wraps `std::future::ready(Err(items))` in `Box::pin`, and returns a `ResponseItemInjectionFuture<'a>` whose output is the unchanged items in the `Err` branch. It reads no external state and writes no host state.
+**Data flow**: It receives a list of `ResponseInputItem` values from an extension. Instead of injecting them into the active model turn, it immediately packages those same items into an error result. The caller gets a future that is already ready, and when awaited it returns `Err(items)` with the original list intact.
 
-**Call relations**: This method is invoked wherever a host installs `NoopResponseItemInjector` as its `ResponseItemInjector` implementation, specifically when extensions attempt same-turn steering on a host that does not expose that capability. It delegates only to `ready` and `pin` to satisfy the trait’s boxed-future signature while preserving the original payload for the caller.
+**Call relations**: This method fulfills the `ResponseItemInjector` contract for hosts that do not support this capability. Internally it creates an immediately completed future and pins it into the boxed future shape required by the trait, so callers can treat it the same way as a real asynchronous injector.
 
 *Call graph*: 2 external calls (pin, ready).
 
 
 ### `ext/extension-api/src/capabilities/mod.rs`
 
-`orchestration` · `API import and type wiring`
+`other` · `cross-cutting`
 
-This module is a façade over the extension capability subsystem. It declares three internal submodules—`agent`, `events`, and `response_items`—and then selectively re-exports the host/extension interaction types they define. Consumers of the extension API can therefore import capability contracts from `capabilities` without needing to know the internal file layout.
+This file does not contain business logic itself. Its job is organization. In a larger project, useful pieces are often split into separate files so each file stays focused. Here, the actual capability definitions live in three sibling modules: one for agent spawning, one for extension events, and one for response item injection.
 
-The re-export set reveals the capability categories this API exposes. From `agent`, it surfaces `AgentSpawner` and its associated `AgentSpawnFuture`, indicating an asynchronous hook for launching or provisioning agents. From `events`, it exposes `ExtensionEventSink` plus `NoopExtensionEventSink`, suggesting a pluggable event-reporting channel with a built-in inert implementation for callers that do not care about events. From `response_items`, it exports `ResponseItemInjector`, `ResponseItemInjectionFuture`, and `NoopResponseItemInjector`, which together define an asynchronous mechanism for injecting response items and a no-op fallback implementation.
+Think of this file like the front desk of a building. The rooms are elsewhere, but visitors do not need to know every hallway. They can come to this one place and ask for the public items they need.
 
-There is no logic in this file; its significance is API shaping. By centralizing these `pub use` statements, the crate can preserve a stable public namespace even if the underlying modules evolve. This is a common design choice for library ergonomics and semver resilience: downstream code depends on the façade, not the internal module paths.
+The `mod` lines tell Rust to include the three internal modules. The `pub use` lines then make selected types available to the outside world through `capabilities`. For example, outside code can refer to `AgentSpawner` or `ExtensionEventSink` without knowing that they are defined in `agent` or `events`.
+
+This matters because it keeps the extension API easier to use and more stable. If the project later reorganizes the internal files, callers may not have to change as long as this public doorway keeps exporting the same names.
 
 
 ### `ext/extension-api/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting API import surface`
 
-This file is the crate root for the extension API and is intentionally almost entirely declarative: it defines the module structure (`capabilities`, `contributors`, `registry`, `state`, and `user_instructions`) and then re-exports the pieces that extension authors are expected to use. The result is a single import surface for extension integration points. The exported items cover several distinct concerns: capability hooks such as agent spawning and response-item injection; contributor traits for prompt fragments, tool lifecycle, turn lifecycle, thread lifecycle, MCP server contributions, approval review, token usage, and configuration; registry construction via `ExtensionRegistry`, `ExtensionRegistryBuilder`, and `empty_extension_registry`; extension-scoped state via `ExtensionData` and `ExtensionDataInit`; and host-provided instruction loading via `UserInstructionsProvider` and related types. It also forwards core protocol and tooling types from sibling crates, including `ResponseItem`, conversation history, tool execution abstractions, tool schemas, and turn-item emission interfaces. A notable design choice is that this root file contains no behavior of its own: it centralizes API curation and shields downstream users from the internal module layout, making the crate act as a compatibility boundary for extension authors.
+This file does not implement extension behavior itself. Instead, it acts like a reception desk for the extension system: callers do not need to know which back room contains capability types, contributor traits, registry builders, shared state, or user-instruction loading. They can come to this single crate root and import the public building blocks they need.
+
+The file declares several internal modules, such as capabilities, contributors, registry, state, and user_instructions. Then it publicly re-exports selected names from those modules and from related crates like codex_tools and codex_protocol. These exported names describe the main ways an extension can participate in the system: adding tools, contributing prompt text, reacting to thread or turn lifecycle events, injecting response items, registering extension data, loading user instructions, and providing tool execution pieces.
+
+Why this matters: without this file, users of the extension API would have to know the internal module layout and import many pieces from many places. That would make the API harder to learn and easier to break if files are reorganized. By keeping a stable public surface here, the project can change internal structure while giving extension authors a simpler, more dependable set of names to use.
 
 
 ### Contributor contracts
@@ -112,13 +124,13 @@ These files describe the contributor interfaces and the lifecycle payloads exten
 
 ### `ext/extension-api/src/contributors/mcp.rs`
 
-`data_model` · `config load`
+`data_model` · `runtime configuration resolution`
 
-This file packages the data model for MCP server contribution resolution. `McpServerContributionContext<'a, C>` is a lightweight borrowed view over host configuration and, optionally, the frozen `ExtensionDataInit` used to seed a running thread. The context intentionally stores references rather than owned values so contributors can inspect host state during resolution without retaining mutable runtime objects. Its `Clone` and `Copy` implementations make it cheap to pass through layered resolution code.
+This file is a contract between the host application and extensions for MCP server contributions. MCP means Model Context Protocol, a way for the app to connect to outside capabilities through named servers. Without these types, extensions would not have a clear, shared language for saying, “add this server,” “remove that server,” or “use the server from this selected plugin.”
 
-Two constructors encode the important scope distinction. `global` creates a context with only `config` and no thread inputs, while `for_thread` includes both `config` and `thread_init`. Accessors expose those fields explicitly, reinforcing that thread-scoped resolution may inspect host-seeded initial attachments but global resolution must not imply any local fallback.
+The main context type, `McpServerContributionContext`, is like a sealed envelope handed to extension code while it is deciding what MCP servers to contribute. It contains the host configuration and, when the decision is happening for one running thread, the fixed starting data for that thread. The context only borrows this information, so extensions can read it during contribution but should not keep it afterward.
 
-The `McpServerContribution` enum is the actual overlay language contributors return. `Set` adds or replaces a named server with a boxed `McpServerConfig`. `SelectedPlugin` records a plugin-provided server chosen for a thread and carries provenance fields (`plugin_id`, `plugin_display_name`, `selection_order`) in addition to the server config. `Remove` deletes a named server. The enum’s shape mirrors the documented merge semantics from the trait definitions in `contributors.rs`: contributions are ordered, later entries can replace earlier ones by name, and plugin-selected servers must preserve package provenance.
+The second main type, `McpServerContribution`, describes the actual requested change. An extension can set a named server, register a server that came from a selected plugin, or remove a named server. The `SelectedPlugin` case also records plugin identity and ordering, which helps the runtime know where that server came from and how it should fit with other selected plugins.
 
 #### Function details
 
@@ -128,11 +140,11 @@ The `McpServerContribution` enum is the actual overlay language contributors ret
 fn clone(&self) -> Self
 ```
 
-**Purpose**: Clones the borrowed MCP contribution context by copying its internal references. Because the struct is effectively a pair of references, cloning is a trivial by-value copy.
+**Purpose**: Makes another copy of the context value. This is cheap because the context only contains references to existing data, not owned copies of the configuration itself.
 
-**Data flow**: It takes `&self` and returns `Self` by dereferencing `*self`. No allocation occurs, no referenced data is duplicated, and no state is mutated.
+**Data flow**: It starts with an existing context that points to host configuration and maybe thread-start data. It copies those references into a new context value. The underlying configuration and thread data are not changed or duplicated.
 
-**Call relations**: This method supports callers that need to pass the same borrowed resolution context through multiple contribution paths. It does not delegate to other project code and exists mainly to make the context ergonomic in orchestration code.
+**Call relations**: This supports the context being passed around easily during MCP contribution resolution. Because the type is also copyable, cloning is just a convenient way to hand the same read-only view to another piece of code.
 
 
 ##### `McpServerContributionContext::global`  (lines 27–32)
@@ -141,11 +153,11 @@ fn clone(&self) -> Self
 fn global(config: &'a C) -> Self
 ```
 
-**Purpose**: Constructs an MCP resolution context for non-thread-scoped resolution. It explicitly records that no thread initialization data is available.
+**Purpose**: Creates a contribution context for work that is not tied to a specific running thread. Use this when MCP server choices only need the general host configuration.
 
-**Data flow**: It takes `config: &'a C`, stores that reference in the returned `McpServerContributionContext`, and sets `thread_init` to `None`. It writes no external state.
+**Data flow**: It receives a reference to the host configuration. It stores that reference and records that there is no thread-specific initial data. The result is a context that can be given to extension contribution code.
 
-**Call relations**: It is used by runtime configuration assembly paths when resolving MCP overlays outside a running thread. Those callers use it to ensure contributors see host config but cannot inspect thread-seeded inputs.
+**Call relations**: It is called by `runtime_config_with_context` when the runtime is building MCP configuration in a global situation. Later contribution code can read the configuration through the context, but it will see no thread initialization data.
 
 *Call graph*: called by 1 (runtime_config_with_context).
 
@@ -156,11 +168,11 @@ fn global(config: &'a C) -> Self
 fn for_thread(config: &'a C, thread_init: &'a ExtensionDataInit) -> Self
 ```
 
-**Purpose**: Constructs an MCP resolution context for one active thread runtime. It exposes both host config and the frozen thread initialization attachments.
+**Purpose**: Creates a contribution context for one active thread runtime. Use this when extension decisions may depend on the thread's fixed starting inputs.
 
-**Data flow**: It accepts `config: &'a C` and `thread_init: &'a ExtensionDataInit`, then returns a context containing the config reference and `Some(thread_init)`. It performs no mutation or copying of the underlying data.
+**Data flow**: It receives the host configuration and the thread's initial data. It stores references to both, wrapping the thread data as present. The result is a context that tells extension code both the general settings and the thread-specific starting state.
 
-**Call relations**: Thread-aware runtime configuration code and selected-plugin contribution flows call this constructor when contributors are allowed to inspect thread-scoped initial inputs. It packages those references for later access through the context accessors.
+**Call relations**: It is called by `runtime_config_with_context` and `selected_plugin_contributions` when MCP configuration is being resolved for a particular thread. The resulting context is then passed along so contributors can inspect both host settings and thread inputs before producing server changes.
 
 *Call graph*: called by 2 (runtime_config_with_context, selected_plugin_contributions).
 
@@ -171,11 +183,11 @@ fn for_thread(config: &'a C, thread_init: &'a ExtensionDataInit) -> Self
 fn config(&self) -> &'a C
 ```
 
-**Purpose**: Returns the host configuration reference visible during MCP resolution. It is the primary accessor contributors use to inspect effective config.
+**Purpose**: Returns the host configuration visible to the contribution process. Extension code uses this to make choices based on the app's current settings.
 
-**Data flow**: It takes `&self` and returns the stored `&'a C` reference directly. No transformation, allocation, or mutation occurs.
+**Data flow**: It takes the context as input and reads the stored configuration reference. It returns that same configuration reference without changing anything.
 
-**Call relations**: Contributor implementations call this accessor while deciding which MCP server overlays to emit. It serves as the read-only bridge from orchestration code into extension logic.
+**Call relations**: It is called by `contribute` implementations while they decide what MCP server contributions to return. In the larger flow, the host builds a context first, then contribution code asks this function for the configuration it is allowed to see.
 
 *Call graph*: called by 2 (contribute, contribute).
 
@@ -186,68 +198,74 @@ fn config(&self) -> &'a C
 fn thread_init(&self) -> Option<&'a ExtensionDataInit>
 ```
 
-**Purpose**: Returns the optional frozen thread initialization attachments for thread-scoped MCP resolution. It lets contributors inspect host-seeded inputs only when such inputs are actually in scope.
+**Purpose**: Returns the thread's frozen initial inputs, if this contribution is being resolved for a running thread. If the context is global, it returns nothing.
 
-**Data flow**: It takes `&self` and returns the stored `Option<&'a ExtensionDataInit>` unchanged. It does not clone or mutate the initializer.
+**Data flow**: It takes the context as input and checks whether thread-start data was stored inside it. It returns that optional reference exactly as-is. It does not create, change, or consume the thread data.
 
-**Call relations**: Thread-scoped contributor implementations call this accessor when they need to derive server overlays from initial thread attachments. In global resolution flows it yields `None`, enforcing the scope distinction established by the constructors.
+**Call relations**: It is called by `contribute` when an extension needs to know whether thread-specific inputs are available. This lets the same contribution code work in both global and thread-scoped situations: it can use the thread data when present and fall back when absent.
 
 *Call graph*: called by 1 (contribute).
 
 
 ### `ext/extension-api/src/contributors/thread_lifecycle.rs`
 
-`data_model` · `thread startup, resume, idle, and shutdown callbacks`
+`data_model` · `thread lifecycle`
 
-This file models the host-to-extension data contract for thread lifecycle events. It contains four input structs—`ThreadStartInput`, `ThreadResumeInput`, `ThreadIdleInput`, and `ThreadStopInput`—each borrowing host-owned state for the duration of a callback rather than cloning or owning it. The shared pattern across all structs is exposure of scoped `ExtensionData` stores: a session-wide store and a thread-local store, allowing contributors to read or mutate extension state at the appropriate lifetime boundary.
+This file is a set of simple input shapes for thread lifecycle events. A “thread” here means a running unit of work inside the host session, and a “runtime” is the environment where extension code for that thread runs. When the host reaches an important moment in that thread’s life, it needs to tell extensions what is happening and what data they may use.
 
-`ThreadStartInput` is the richest payload because thread startup is where the host establishes context. In addition to the stores, it includes a generic borrowed configuration object `&C`, the `SessionSource` that created the session, a boolean indicating whether persistent thread-scoped state is available, and the selected execution environments as a borrowed slice of `TurnEnvironmentSelection`. The generic parameter lets the host expose its own configuration type without coupling the extension API to a concrete config schema.
+The main idea is separation of scope. Each input includes access to a session store, which is data shared for the whole host session, and a thread store, which is data private to this thread runtime. This is like having one notebook for the whole meeting and another notebook just for one agenda item.
 
-The remaining structs intentionally narrow the visible data to what is meaningful at each phase: resume, idle, and stop only carry the session and thread stores. This design keeps lifecycle callbacks explicit and phase-specific, preventing contributors from assuming startup-only facts are always available. The file is purely declarative but important because it fixes the shape and borrowing semantics of thread lifecycle integration points.
+ThreadStartInput carries the richest context because a new thread needs more setup information: the host configuration, where the session came from, whether saved thread state is available, and which execution environments were chosen. The resume, idle, and stop inputs are smaller because they mainly need access to the session and thread stores.
+
+Without these definitions, extension lifecycle hooks would not have a clear, typed contract for what information they can see at each stage. That would make extension behavior harder to write safely and harder for the host to call consistently.
 
 
 ### `ext/extension-api/src/contributors/tool_lifecycle.rs`
 
-`data_model` · `tool call dispatch and completion callbacks`
+`data_model` · `tool execution`
 
-This file specifies the extension-facing model for tool lifecycle notifications. It starts with `ToolLifecycleFuture<'a>`, a boxed, pinned, `Send` future returning `()`, which standardizes the async shape expected from tool lifecycle callbacks without exposing a concrete future type. The rest of the file defines the data those callbacks receive.
+This file is part of the extension API: the public surface that outside add-ons use to cooperate with the host application. Its job is to describe tool lifecycle events, meaning the moments when the host begins running a tool call and when that tool call ends.
 
-`ToolCallSource` distinguishes whether a tool invocation came directly from the model or indirectly from code mode. The `CodeMode` variant carries both a `cell_id` and a `runtime_tool_call_id`, preserving the nested execution context needed for attribution or telemetry. `ToolCallOutcome` captures the host’s terminal observation of a tool call with four explicit cases: normal completion with a `success` flag from the tool output, policy blocking before handler execution, failure with a `handler_executed` marker to distinguish dispatch failures from handler failures, and abortion where cancellation may occur before a start callback ever happened.
+A “tool call” is when the model asks the system to do something outside plain text, such as run a command, read data, or call a special capability. Extensions may want to notice these events for logging, metrics, policy checks, or custom bookkeeping. This file defines the small data packets they receive.
 
-The two input structs mirror the start/finish phases. `ToolStartInput` includes borrowed references to session-, thread-, and turn-scoped `ExtensionData`, plus `turn_id`, `call_id`, `tool_name`, and the `ToolCallSource`. `ToolFinishInput` repeats the same identifying context and adds `outcome`. Repeating the full context in both structs avoids forcing contributors to correlate finish events with retained start-state just to know what completed. The design is careful about lifecycle edge cases, especially cancellation races and nested code-mode provenance.
+It separates three main ideas. First, `ToolCallSource` says where the tool request came from: either directly from the model, or from code mode while running a nested runtime cell. Second, `ToolCallOutcome` describes how the call ended: completed, blocked, failed, or aborted. This matters because not every tool call reaches the actual tool handler; some can be stopped by policy or cancellation first. Third, `ToolStartInput` and `ToolFinishInput` collect the context extensions need, such as session, thread, and turn stores, the turn id, the call id, the tool name, and the source.
+
+The future type, `ToolLifecycleFuture`, lets lifecycle callbacks run asynchronously. In everyday terms, it lets an extension say, “I will finish my reaction later,” without freezing the rest of the system.
 
 
 ### `ext/extension-api/src/contributors/turn_input.rs`
 
-`data_model` · `turn input preparation`
+`data_model` · `request handling`
 
-This file contains two simple but important data structures that describe the user submission and execution environments visible at the beginning of turn input processing. `TurnInputEnvironment` summarizes one resolved environment with three concrete fields: a stable host `environment_id` used for routing executor-scoped capabilities, the effective working directory `cwd` as a `PathBuf`, and an `is_primary` flag identifying the main environment for the turn. The struct derives `Debug` and `Clone`, making it easy for contributors to inspect or retain copies.
+This file is a small data-shape file: it does not run logic itself, but it defines the packages of information passed to turn-input contributors. A “turn” means one round of interaction, such as a user sending a message and the system preparing what the model should receive. Extensions may want to add extra model input based on that turn, but they need context to do that safely and consistently.
 
-`TurnInputContext` packages the full pre-recording snapshot for a turn. It includes the stable `turn_id`, the submitted `user_input` as a `Vec<UserInput>`, and the resolved `environments` as a `Vec<TurnInputEnvironment>` in host priority order. The ordering guarantee matters because contributors can infer fallback or precedence behavior from the sequence rather than only from the `is_primary` marker.
+The file defines two structs, which are simple named bundles of data. `TurnInputEnvironment` describes one execution environment owned by the host. It includes a stable environment ID, the working directory for that environment, and whether it is the primary one for the turn. This is like giving an assistant a label for each workspace, where it is located, and which workspace is the main desk.
 
-The file is intentionally declarative and host-centric: these are facts supplied by the host before model input items are persisted or transformed. By separating this context into dedicated structs, the API gives contributors a stable schema for inspecting turn setup without exposing broader runtime internals. There is no behavior here, but the field choices encode important semantics around environment routing, working-directory resolution, and the exact user input payload entering a turn.
+`TurnInputContext` describes the turn as a whole. It includes the stable turn ID, the user input submitted for that turn, and the list of resolved environments in priority order. Together, these types form the contract between the host and extensions: the host provides these facts before it records turn-local model input items, and extensions can use them without needing direct access to the host’s internal state.
 
 
 ### `ext/extension-api/src/contributors/turn_lifecycle.rs`
 
-`data_model` · `turn start, completion, abort, and error callbacks`
+`data_model` · `turn lifecycle`
 
-This file models the host-to-extension contract around turn execution lifecycle. It provides four borrowed input structs, each tailored to a specific phase so contributors receive only the context that is meaningful at that moment. Across all of them, the host exposes three scoped `ExtensionData` stores—session, thread, and turn—making extension state available at the same granularity as the runtime itself.
+A “turn” is one round of work in the host system, such as a user request and the assistant’s response to it. This file does not run any behavior by itself. Instead, it defines the shapes of the information passed into extension hooks at important moments in that turn’s life.
 
-`TurnStartInput` is the most detailed because it captures the initial turn facts: the stable `turn_id`, the effective `CollaborationMode`, and a snapshot of cumulative `TokenUsage` at the moment the turn began. That token snapshot lets contributors compute deltas later without needing hidden host state. `TurnStopInput` is intentionally minimal, carrying only the scoped stores because a normal completion needs no extra metadata. `TurnAbortInput` adds a `TurnAbortReason`, allowing contributors to distinguish user cancellation, host interruption, or other abort paths. `TurnErrorInput` carries both the `turn_id` and a concrete `CodexErrorInfo`, representing an error surfaced by the host for that turn.
+Each struct is like a labeled envelope handed to an extension. `TurnStartInput` includes the host’s stable turn ID, the active collaboration mode, a snapshot of token usage at the start, and three data stores. These stores let extensions read or write state at different lifetimes: the whole session, the current thread, or just this one turn. `TurnStopInput` is simpler because a normal completion mainly needs access to those same stores. `TurnAbortInput` adds the reason the turn was stopped early. `TurnErrorInput` includes both the turn ID and the error information surfaced by the host.
 
-The design separates abort and error rather than collapsing them into one terminal event, which preserves an important semantic distinction: a turn can end abnormally because it was intentionally aborted or because the host observed an error condition. The file itself contains no executable logic, but it fixes the lifecycle event schema that extension implementations rely on.
+This matters because extensions need a predictable contract. Without these input types, each lifecycle event could pass different or unclear data, making extensions harder to write safely and consistently.
 
 
 ### `ext/extension-api/src/contributors.rs`
 
-`domain_logic` · `cross-cutting`
+`other` · `cross-cutting`
 
-This file is the core API surface for extension integration. It introduces the shared async return type `ExtensionFuture<'a, T>` and then groups the extension system into narrowly scoped traits. Some traits are pure contribution points that must be implemented fully, such as `McpServerContributor`, `ContextContributor`, `TurnInputContributor`, `ToolContributor`, `ApprovalReviewContributor`, and `TurnItemContributor`. Others represent host-owned lifecycle gates—thread, turn, token usage, config, and tool execution—where the file provides default implementations so extensions can opt into only the callbacks they need.
+This file is part of the extension API. Its job is to describe how outside features can safely take part in the host’s work without reaching directly into the host’s private internals. In plain terms, it gives extensions a set of agreed-upon doors they may enter through.
 
-The generic parameter `C` on several traits carries host-defined configuration snapshots without exposing core runtime internals. The callback inputs are intentionally typed wrappers re-exported from submodules, such as `ThreadStartInput`, `TurnStopInput`, or `ToolFinishInput`, so extensions receive stable, limited views of runtime state. The default async methods all follow the same pattern: capture arguments into an `async move` block or a ready future, then do nothing. That preserves trait object usability while making hooks optional.
+The file defines several Rust traits, which are shared promises about behavior. For example, one trait lets an extension add extra prompt text, another lets it provide tools, another lets it react when a conversation thread starts or stops, and another lets it observe when a tool starts or finishes. The host can call these traits at the right moments, and each extension can choose which ones it wants to implement.
 
-A notable design choice is the separation between ownership and observation. For example, `ToolContributor` owns native tool implementations, while `ToolLifecycleContributor` observes accepted/completed tool calls without rewriting payloads. Similarly, `TurnInputContributor` adds model-visible fragments for one turn, while `TurnItemContributor` mutates parsed `TurnItem` values after parsing but before emission. The comments encode ordering and authority invariants: contributors run in registration order, MCP overlays replace earlier entries by name, approval review can claim prompts, and extensions should keep expensive dependencies on host-installed extension values rather than callback inputs.
+A central idea here is controlled access. Instead of handing extensions the whole running system, the host gives them small input objects and extension-owned data stores. That keeps boundaries clear: extensions can keep their own state, but they do not freely mutate core runtime objects.
+
+Many lifecycle methods have default implementations that do nothing. This matters because an extension can implement only the callbacks it cares about. The asynchronous callbacks return a boxed future, meaning “work that may finish later,” so extensions can perform non-blocking setup, cleanup, or observation when needed.
 
 #### Function details
 
@@ -257,11 +275,11 @@ A notable design choice is the separation between ownership and observation. For
 fn on_thread_start(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for thread startup after the host has initialized thread-scoped extension storage. It exists so implementers can override startup seeding behavior only when needed.
+**Purpose**: This callback gives an extension a chance to do setup after a thread-level data store has been created. A “thread” here means a longer-lived conversation runtime, not necessarily an operating-system thread.
 
-**Data flow**: It receives `&self` and `ThreadStartInput<'a, C>`, binds both into an `async move` block to satisfy lifetimes, and returns a boxed future resolving to `()`. The default body ignores the values and performs no reads or writes to extension stores or host state.
+**Data flow**: The host provides a thread-start input object, which contains the limited information the extension is allowed to see. The default version ignores both the extension object and the input, then returns an already boxed asynchronous task that completes with no result. Nothing is changed unless an extension overrides this method.
 
-**Call relations**: The host invokes this callback during thread startup for each registered `ThreadLifecycleContributor`. When an extension does not override it, control stops here and no further work is delegated beyond boxing the async block with `pin`.
+**Call relations**: The host is expected to call this after it has prepared thread-scoped extension storage. The default method only wraps an empty async block using pinning, which keeps the future safely in place while the async runtime polls it.
 
 *Call graph*: 1 external calls (pin).
 
@@ -272,11 +290,11 @@ fn on_thread_start(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<
 fn on_thread_resume(&'a self, input: ThreadResumeInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for reconstructing extension-private thread state after the host resumes a runtime from persisted history. It lets extensions opt into rehydration logic without forcing every implementation to define it.
+**Purpose**: This callback lets an extension restore or refresh its thread-related state when the host rebuilds a runtime from saved history. The default behavior is to do nothing.
 
-**Data flow**: It takes `&self` and `ThreadResumeInput<'a>`, captures them in an `async move` block, and returns `ExtensionFuture<'a, ()>`. The default implementation does not inspect the input, mutate stores, or emit side effects.
+**Data flow**: The host passes in resume information. The default implementation receives that input, deliberately ignores it, and returns a boxed asynchronous task that finishes immediately with no output. No store or runtime state is changed by the default.
 
-**Call relations**: This method is called by host resume flows for each registered thread lifecycle contributor. In the default path it delegates only to future boxing via `pin`, acting as a harmless placeholder in the lifecycle sequence.
+**Call relations**: This fits into the thread lifecycle after the host has reconstructed a thread from persisted history. Its only internal handoff is to pin the empty async work so it matches the extension callback shape.
 
 *Call graph*: 1 external calls (pin).
 
@@ -287,11 +305,11 @@ fn on_thread_resume(&'a self, input: ThreadResumeInput<'a>) -> ExtensionFuture<'
 fn on_thread_idle(&'a self, input: ThreadIdleInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook that runs after the host drains immediately pending thread work. Extensions can override it to enqueue follow-up input or perform idle-time bookkeeping.
+**Purpose**: This callback lets an extension react after the host has finished the thread work that was immediately pending. An extension might use an override to request follow-up input, while the host still decides what to do with that request.
 
-**Data flow**: It accepts `&self` and `ThreadIdleInput<'a>`, captures them into an async block, and returns a boxed future resolving to unit. The default implementation neither reads from the input nor writes any state.
+**Data flow**: The host supplies idle-time input. The default implementation takes that input, does not inspect it, and returns a boxed asynchronous task that completes without producing anything. By default, no follow-up work is submitted.
 
-**Call relations**: The host invokes this after a thread becomes idle and pending work has been drained. If not overridden, it simply completes immediately after `pin`, leaving all scheduling decisions to the host.
+**Call relations**: The host calls this when a thread reaches an idle point. The default implementation simply pins an empty async block, so extensions that do not care about idle moments do not need to provide their own code.
 
 *Call graph*: 1 external calls (pin).
 
@@ -302,11 +320,11 @@ fn on_thread_idle(&'a self, input: ThreadIdleInput<'a>) -> ExtensionFuture<'a, (
 fn on_thread_stop(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook that runs before the host drops the thread runtime and thread-scoped store. It is the extension’s optional place to flush or clear thread-private state.
+**Purpose**: This callback gives an extension a chance to clean up before the host drops the thread runtime and thread-scoped extension data. The default behavior is no cleanup.
 
-**Data flow**: It takes `&self` and `ThreadStopInput<'a>`, moves them into a boxed async block, and returns `ExtensionFuture<'a, ()>`. No state is read or modified in the default implementation.
+**Data flow**: The host gives the extension stop-time input. The default implementation ignores the input and returns a boxed asynchronous task that finishes with no result. Nothing is flushed, saved, or modified unless an extension overrides it.
 
-**Call relations**: The host calls this during thread teardown for each registered contributor. In the default case it performs no cleanup logic and delegates only to `pin` to produce the required future.
+**Call relations**: This belongs at the end of the thread lifecycle, just before thread resources disappear. Internally, the default path only pins an empty async block to satisfy the expected future-returning API.
 
 *Call graph*: 1 external calls (pin).
 
@@ -317,11 +335,11 @@ fn on_thread_stop(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, (
 fn on_turn_start(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for the moment after turn-scoped extension stores are created but before the turn task begins running. Extensions override it to seed or observe turn-local state.
+**Purpose**: This callback lets an extension prepare state for one turn before that turn begins running. A “turn” is one submitted interaction within a larger conversation thread.
 
-**Data flow**: It receives `&self` and `TurnStartInput<'a>`, captures them in an async block, and returns a boxed future resolving to `()`. The default body ignores all inputs and leaves stores untouched.
+**Data flow**: The host passes turn-start input after creating turn-scoped extension stores. The default implementation ignores the input and returns a boxed asynchronous task that immediately completes. No turn state is added by default.
 
-**Call relations**: The host invokes this at turn startup for each registered turn lifecycle contributor. Without an override, the callback contributes nothing beyond satisfying the async trait-object contract through `pin`.
+**Call relations**: The host calls this before the task for a turn starts. The default method hands back a pinned no-op future, so extensions only need to override it when they need turn setup.
 
 *Call graph*: 1 external calls (pin).
 
@@ -332,11 +350,11 @@ fn on_turn_start(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()>
 fn on_turn_stop(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for completed-turn teardown before the host drops the turn runtime and turn store. It is intended for optional cleanup or final observation.
+**Purpose**: This callback lets an extension observe or clean up after a turn completes, before the host drops that turn’s runtime and store. The default version does nothing.
 
-**Data flow**: It takes `&self` and `TurnStopInput<'a>`, wraps them in an `async move` block, and returns `ExtensionFuture<'a, ()>`. The default implementation performs no reads, writes, or side effects.
+**Data flow**: The host provides stop information for the finished turn. The default implementation receives it, ignores it, and returns a boxed asynchronous task with no output. No stored data changes unless an extension supplies its own behavior.
 
-**Call relations**: This callback is part of the host’s normal turn completion flow. If an extension does not override it, the host still awaits the returned future, which immediately resolves after being boxed with `pin`.
+**Call relations**: This is called near the end of a turn’s life. Its default work is only to pin an empty async block, keeping the method compatible with asynchronous extension implementations.
 
 *Call graph*: 1 external calls (pin).
 
@@ -347,11 +365,11 @@ fn on_turn_stop(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()>
 fn on_turn_abort(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for aborted turns. Extensions can override it to clear turn-local state or record abort-specific telemetry.
+**Purpose**: This callback lets an extension react when the host aborts a running turn. It is useful for extensions that need to cancel or clear turn-specific work, though the default does nothing.
 
-**Data flow**: It accepts `&self` and `TurnAbortInput<'a>`, captures them into a boxed async block, and returns unit on completion. The default body does not inspect the abort input or mutate any state.
+**Data flow**: The host passes abort information. The default method ignores the extension object and input, then returns a boxed asynchronous task that completes without a value. It does not cancel anything itself.
 
-**Call relations**: The host invokes this only when a running turn is aborted. In the default implementation there is no downstream delegation besides `pin`, so the abort lifecycle continues without extension-specific work.
+**Call relations**: The host calls this after aborting a turn. The default implementation only creates a pinned no-op future, leaving real abort reactions to extensions that override it.
 
 *Call graph*: 1 external calls (pin).
 
@@ -362,11 +380,11 @@ fn on_turn_abort(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()>
 fn on_turn_error(&'a self, input: TurnErrorInput<'a>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Provides the default no-op hook for errors observed on a running turn. It gives extensions an optional observation point for failure handling.
+**Purpose**: This callback lets an extension observe an error that happened during a turn. The default behavior is to ignore the error information.
 
-**Data flow**: It takes `&self` and `TurnErrorInput<'a>`, captures them in an async block, and returns a boxed future resolving to `()`. The default implementation ignores the error input and writes nothing.
+**Data flow**: The host provides turn-error input. The default method accepts it, does not inspect it, and returns a boxed asynchronous task that finishes with no result. It records no diagnostics and changes no state by itself.
 
-**Call relations**: The host calls this when it observes a turn error and iterates registered turn lifecycle contributors. If not overridden, the callback simply resolves immediately after `pin`.
+**Call relations**: The host calls this when it sees an error for a running turn. The only internal call is pinning the empty async work so the method has the same shape as real asynchronous handlers.
 
 *Call graph*: 1 external calls (pin).
 
@@ -383,11 +401,11 @@ fn on_config_changed(
     )
 ```
 
-**Purpose**: Provides the default synchronous no-op hook for committed thread-configuration changes. Extensions override it when they need to compare previous and new effective config snapshots and update extension-private state.
+**Purpose**: This callback lets an extension respond after the host has committed a new thread configuration. The default implementation ignores the change.
 
-**Data flow**: It receives references to the session store, thread store, previous config, and new config. The default implementation ignores all four arguments, returns `()`, and performs no state changes.
+**Data flow**: The host passes the session store, thread store, previous configuration, and new configuration. The default method takes those values by reference and does nothing with them. It returns immediately and does not modify any state.
 
-**Call relations**: The host invokes this after committing a changed thread configuration for each registered config contributor. Because the default body is empty, there is no delegated work unless an implementation overrides it.
+**Call relations**: The host calls this after a configuration change is already committed, so extensions see before-and-after snapshots rather than controlling the change. Unlike many other callbacks in this file, the default method is synchronous and does not create a future.
 
 
 ##### `TokenUsageContributor::on_token_usage`  (lines 196–207)
@@ -401,11 +419,11 @@ fn on_token_usage(
         _token_usage: &'a TokenUsageIn
 ```
 
-**Purpose**: Provides the default no-op async hook for token-usage checkpoints reported by the model provider. It exists so extensions can observe token accounting without requiring every contributor to implement the callback.
+**Purpose**: This callback lets an extension observe token usage reported by the model provider. Tokens are the chunks of text a language model counts for cost and context length.
 
-**Data flow**: It takes `&self`, references to session/thread/turn `ExtensionData`, and a `&TokenUsageInfo`. The default implementation groups those references into a tuple inside an `async move` block solely to mark them as used, then returns a boxed future resolving to `()`. It does not mutate stores or emit notifications.
+**Data flow**: The host provides session, thread, and turn stores, plus the token-usage record. The default implementation bundles those references only to mark them as intentionally unused, then returns a boxed asynchronous task that completes with no result. It does not store or report anything by default.
 
-**Call relations**: The host calls this after updating cached token usage and before sending client token-count notifications. In the default path it delegates only to `pin`, acting as a cheap placeholder in the token-reporting flow.
+**Call relations**: The host calls this after updating its cached token usage and before notifying the client about token counts. The default implementation pins a no-op async block, so extensions can ignore token accounting unless they opt in.
 
 *Call graph*: 1 external calls (pin).
 
@@ -416,11 +434,11 @@ fn on_token_usage(
 fn on_tool_start(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Provides the default no-op hook for accepted tool calls just before or as execution begins. It lets extensions observe tool execution starts without owning the tool implementation.
+**Purpose**: This callback lets an extension observe that the host has accepted a tool call for execution. It is for observation or policy around the lifecycle, not for owning the tool itself.
 
-**Data flow**: It receives `&self` and `ToolStartInput<'a>`, ignores the input, and returns `ToolLifecycleFuture<'a>` by boxing `std::future::ready(())`. No tool payloads are rewritten and no state is modified.
+**Data flow**: The host passes information about the tool start. The default implementation ignores that input and returns a ready-made future that is already complete. Nothing is inspected or changed.
 
-**Call relations**: The host invokes this once it has accepted a tool call for execution and is notifying registered tool lifecycle contributors. The implementation delegates only to `ready` and `pin` to produce an immediately completed future.
+**Call relations**: The host calls this once a tool call has been accepted. The default path creates an immediately ready no-op future and pins it, so the host can await it the same way it would await a real extension hook.
 
 *Call graph*: 2 external calls (pin, ready).
 
@@ -431,11 +449,11 @@ fn on_tool_start(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a
 fn on_tool_finish(&'a self, _input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Provides the default no-op hook for tool completion outcomes, including success, block, failure, or cancellation. Extensions override it to observe results or update extension-private bookkeeping.
+**Purpose**: This callback lets an extension observe the end of a tool call, whether it succeeded, failed, was blocked, or was cancelled. The default behavior is to do nothing.
 
-**Data flow**: It takes `&self` and `ToolFinishInput<'a>`, ignores the input, and returns a boxed ready future resolving to unit. It reads no external state and writes nothing.
+**Data flow**: The host provides information about the finished tool call. The default implementation ignores the input and returns a pinned future that is already complete. It produces no result and changes no state.
 
-**Call relations**: The host calls this after a tool call finishes in any terminal state. In the default implementation there is no downstream work beyond wrapping `ready(())` with `pin`.
+**Call relations**: The host calls this after a tool call reaches an outcome. The method hands back an immediately ready no-op future, so extensions that do not need tool-finish observation can rely on the default.
 
 *Call graph*: 2 external calls (pin, ready).
 
@@ -445,13 +463,15 @@ These files provide stable supporting contracts for extension state, host-suppli
 
 ### `ext/extension-api/src/state.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `cross-cutting extension state access`
 
-This file is the extension API’s generic state container layer. `ExtensionDataInit` is the pre-runtime initializer: a clonable `HashMap<TypeId, ErasedData>` used by hosts to seed typed attachments before an `ExtensionData` scope exists. Because values are stored as `Arc<dyn Any + Send + Sync>`, cloning the initializer freezes the key set while sharing underlying values, which is important for thread initialization snapshots.
+Extensions often need a place to remember extra information about something the main program owns, such as a session, level, thread, or other scoped object. This file supplies that place. Think of it like a labeled drawer attached to each host object: each kind of value gets one drawer, and code asks for it by its Rust type rather than by a string name.
 
-`ExtensionData` is the mutable runtime store attached to a host-owned scope such as a session, thread, or turn. It carries a human-readable `level_id: String` plus a `Mutex<HashMap<TypeId, ErasedData>>`. All typed operations (`get`, `get_or_init`, `insert`, `remove`) key by `TypeId::of::<T>()` and convert erased values back to `Arc<T>` through the private `downcast_data` helper. `get_or_init` is the main lazy-initialization path: it locks the map, inserts `Arc::new(init())` only if absent, and returns a typed `Arc<T>`. The comments note an important invariant here: the initializer closure runs while the mutex is held, so expensive work should be deferred into the stored value itself.
+There are two main pieces. `ExtensionDataInit` is a pre-filled set of values prepared before the real extension data scope exists. It is useful when the host wants to seed the scope with known inputs. `ExtensionData` is the live storage attached to one host object. It records the host object's identity as `level_id`, and it keeps a map from each value's type to the stored value.
 
-Poisoned mutexes are intentionally tolerated. The private `entries()` helper uses `unwrap_or_else(PoisonError::into_inner)` so extension state remains accessible even after a panic while holding the lock. The `downcast_data` helper treats type mismatches as unreachable, reflecting the invariant that values are always stored and retrieved under the same `TypeId`.
+Stored values are wrapped in `Arc`, which is a shared ownership pointer, so callers can keep using a value even after retrieving it. The live map is protected by a `Mutex`, a lock that stops two tasks from changing the map at the same time. If a previous holder panicked while holding the lock, the code still recovers the stored map instead of giving up.
+
+The important safety idea is that callers only get back the type they asked for. Internally the file stores values in an erased form, meaning the exact type is hidden, and then restores the type when reading it back.
 
 #### Function details
 
@@ -461,11 +481,11 @@ Poisoned mutexes are intentionally tolerated. The private `entries()` helper use
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty initializer for host-supplied typed attachments. It is the standard constructor for building a seed map before runtime state exists.
+**Purpose**: Creates an empty starter pack of extension data. A host uses this when it wants to prepare initial values before creating the live `ExtensionData` scope.
 
-**Data flow**: It takes no arguments, calls `Self::default()`, and returns an `ExtensionDataInit` with an empty `entries` map. No external state is read or written.
+**Data flow**: Nothing goes in. The function makes a default, empty `ExtensionDataInit` with no stored attachments. The result is a blank initializer that other code can fill with typed values.
 
-**Call relations**: Host setup code calls this before inserting initial attachments for a thread or other scope. It delegates entirely to the derived `Default` implementation.
+**Call relations**: This is called when code starts building extension state, such as during thread startup or plugin contribution selection. It delegates to the type's default constructor, so the larger flow gets a clean container without needing to know how the container is built.
 
 *Call graph*: called by 2 (thread_start_task, selected_plugin_contributions); 1 external calls (default).
 
@@ -476,11 +496,11 @@ fn new() -> Self
 fn insert(&mut self, value: T) -> Option<Arc<T>>
 ```
 
-**Purpose**: Stores one host-supplied initial attachment keyed by its concrete type and returns any previous value of the same type. It is the typed write path for the initializer map.
+**Purpose**: Adds one initial value to an `ExtensionDataInit`, keyed by the value's Rust type. If a value of the same type was already present, it returns the old one.
 
-**Data flow**: It takes `&mut self` and `value: T` where `T: Any + Send + Sync`, computes `TypeId::of::<T>()`, wraps the value in `Arc::new`, inserts it into `self.entries`, and if a previous erased value existed, converts it back to `Option<Arc<T>>` via `downcast_data`. It mutates the initializer map in place.
+**Data flow**: A typed value goes in. The function wraps it in an `Arc`, which allows shared ownership, then stores it under that value's type identity. The initializer is changed, and the previous value of that same type comes out if there was one.
 
-**Call relations**: Host seeding code invokes this while preparing initial thread attachments. It delegates to `HashMap::insert`, `Arc::new`, and `downcast_data` to maintain typed semantics over erased storage.
+**Call relations**: This is used when seeding thread state before the live extension data exists. It uses `Arc::new` to prepare the stored value in the same shared form that the rest of this file expects.
 
 *Call graph*: called by 1 (seed_thread_state); 1 external calls (new).
 
@@ -491,11 +511,11 @@ fn insert(&mut self, value: T) -> Option<Arc<T>>
 fn get(&self) -> Option<Arc<T>>
 ```
 
-**Purpose**: Retrieves a host-supplied initial attachment by concrete type without creating a mutable runtime scope. It is the typed read path for the initializer map.
+**Purpose**: Reads a host-supplied initial value without creating or touching a live mutable extension scope. This is useful when setup code needs to inspect the seeded data directly.
 
-**Data flow**: It takes `&self`, looks up `TypeId::of::<T>()` in `self.entries`, clones the stored `Arc<dyn Any + Send + Sync>` if present, downcasts it with `downcast_data`, and returns `Option<Arc<T>>`. The map is not mutated.
+**Data flow**: The caller asks for a particular type. The function looks in the initializer's map for that type, clones the shared `Arc` pointer if found, and converts the erased stored value back into the requested type. The output is either the shared typed value or nothing.
 
-**Call relations**: Code that needs to inspect frozen initial attachments calls this accessor, including thread-scoped MCP resolution. It delegates to `downcast_data` after cloning the erased `Arc`.
+**Call relations**: This is a direct read path for initial data. It hands the erased stored value to `downcast_data`, which performs the final step of turning the hidden value back into the requested concrete type.
 
 *Call graph*: calls 1 internal fn (downcast_data).
 
@@ -506,11 +526,11 @@ fn get(&self) -> Option<Arc<T>>
 fn new(level_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Creates an empty runtime attachment store for one host-owned scope identified by `level_id`. It is the common constructor for session, thread, and turn stores with no initial attachments.
+**Purpose**: Creates an empty live extension data store for one host object. Callers use it when there is no pre-seeded data to carry in.
 
-**Data flow**: It takes `level_id: impl Into<String>`, creates a default empty `ExtensionDataInit`, forwards both into `Self::new_with_init`, and returns the resulting `ExtensionData`. It does not mutate external state.
+**Data flow**: A host identity, called `level_id`, goes in. The function creates a default empty `ExtensionDataInit`, then passes both the identity and the empty initializer into `ExtensionData::new_with_init`. The result is a live `ExtensionData` with an empty attachment map.
 
-**Call relations**: Many runtime and test paths call this when creating fresh extension stores. It delegates to `new_with_init` and the initializer’s default constructor.
+**Call relations**: This is the common entry point used throughout the project when sessions, threads, test contexts, or other host-owned scopes need extension storage. It keeps the simple case small by reusing `ExtensionData::new_with_init` for the actual construction.
 
 *Call graph*: called by 38 (spawn_review_thread, new, handle_output_item_done_records_image_save_history_message, handle_output_item_done_skips_image_save_message_when_save_fails, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, tool_calls_reopen_mailbox_delivery_for_current_turn, make_turn_context, plan_mode_uses_contributed_turn_item_for_last_agent_message, finalized_turn_item_defers_mailbox_for_contributed_visible_text (+15 more)); 2 external calls (new_with_init, default).
 
@@ -521,11 +541,11 @@ fn new(level_id: impl Into<String>) -> Self
 fn new_with_init(level_id: impl Into<String>, init: ExtensionDataInit) -> Self
 ```
 
-**Purpose**: Creates a runtime attachment store seeded with a previously prepared initializer. It bridges immutable host-seeded inputs into the mutable runtime map.
+**Purpose**: Creates a live extension data store and fills it with initial host-supplied values. This is the bridge from setup-time data to runtime extension state.
 
-**Data flow**: It takes `level_id: impl Into<String>` and `init: ExtensionDataInit`, converts `level_id` into a `String`, moves `init.entries` into a new `Mutex<HashMap<...>>`, and returns `ExtensionData { level_id, entries }`. Ownership of the initializer’s map is transferred into the runtime store.
+**Data flow**: A host identity and an `ExtensionDataInit` go in. The identity is converted into a `String`, and the initializer's stored entries are moved into a mutex-protected map. The output is an `ExtensionData` ready for concurrent reads and writes.
 
-**Call relations**: This constructor is used when a scope should start with host-provided attachments already installed. `ExtensionData::new` delegates to it for the empty case.
+**Call relations**: This function is called by `ExtensionData::new` and is the central constructor for live storage. It takes the prepared initializer and turns it into the locked map used by later `get`, `insert`, `remove`, and `get_or_init` calls.
 
 *Call graph*: called by 1 (new); 2 external calls (into, new).
 
@@ -536,11 +556,11 @@ fn new_with_init(level_id: impl Into<String>, init: ExtensionDataInit) -> Self
 fn level_id(&self) -> &str
 ```
 
-**Purpose**: Returns the host-defined identity string for the scope this attachment store belongs to. It gives contributors a stable label without exposing core runtime objects.
+**Purpose**: Returns the host identity for the object this extension data is attached to. Extensions can use this to know which scope they are contributing to.
 
-**Data flow**: It takes `&self` and returns `&str` referencing `self.level_id`. No allocation or mutation occurs.
+**Data flow**: The function reads the `level_id` string stored inside `ExtensionData`. It does not change anything. It returns a borrowed string slice pointing to that identity.
 
-**Call relations**: Contributor implementations and tests call this accessor when recording which session or thread a callback observed. It is a simple leaf accessor.
+**Call relations**: This is called during extension contribution and token usage flows when extension code needs the host object's identity. It is a simple read-only accessor and does not touch the attachment map.
 
 *Call graph*: called by 3 (contribute, on_token_usage, contribute).
 
@@ -551,11 +571,11 @@ fn level_id(&self) -> &str
 fn get(&self) -> Option<Arc<T>>
 ```
 
-**Purpose**: Retrieves the attached runtime value of a given concrete type, if present. It is the typed read path for the mutable store.
+**Purpose**: Looks up the attached value for a requested type. It lets extension code retrieve its saved state without knowing about other extensions' stored values.
 
-**Data flow**: It takes `&self`, acquires the mutex through `self.entries()`, looks up `TypeId::of::<T>()`, clones the stored erased `Arc` if found, downcasts it with `downcast_data`, and returns `Option<Arc<T>>`. The map contents are not modified.
+**Data flow**: The caller asks for type `T`. The function locks the entries map, searches for the type identity for `T`, clones the shared pointer if found, and converts the erased value back to `Arc<T>`. The result is either that typed shared value or nothing.
 
-**Call relations**: Extension logic calls this when it needs previously attached state. It delegates to the private `entries()` lock helper and then to `downcast_data` for typed recovery.
+**Call relations**: This is one of the main runtime read paths. It uses `ExtensionData::entries` to safely lock the map, then uses `downcast_data` to restore the hidden stored value to the requested type.
 
 *Call graph*: calls 2 internal fn (entries, downcast_data).
 
@@ -566,11 +586,11 @@ fn get(&self) -> Option<Arc<T>>
 fn get_or_init(&self, init: impl FnOnce() -> T) -> Arc<T>
 ```
 
-**Purpose**: Returns the attached value of type `T`, lazily inserting one produced by a closure if absent. It is the main convenience API for per-scope extension state initialization.
+**Purpose**: Gets an attached value if it already exists, or creates and stores it if it does not. This is useful for lazy setup, where an extension only pays to create state when it first needs it.
 
-**Data flow**: It takes `&self` and `init: impl FnOnce() -> T`, locks the map via `entries()`, looks up the `TypeId` entry, inserts `Arc::new(init())` only when missing, clones the resulting erased `Arc`, downcasts it with `downcast_data`, and returns `Arc<T>`. It may mutate the map by adding a new typed attachment.
+**Data flow**: The caller provides a small initializer function that can make a value of type `T`. The function locks the map, checks whether a value of that type already exists, and if not runs the initializer and stores the new value in an `Arc`. It returns the shared typed value either way.
 
-**Call relations**: Extension code uses this when it wants one-time initialization tied to a scope. It delegates to `entries()` for locking, `HashMap::entry().or_insert_with(...)` for lazy insertion, `Arc::clone`, and `downcast_data` for typed output.
+**Call relations**: This function combines the read and create paths into one locked operation, so two callers do not accidentally create two separate values for the same type at the same time. It uses `ExtensionData::entries` for locking and `downcast_data` before returning the typed value.
 
 *Call graph*: calls 2 internal fn (entries, downcast_data); 1 external calls (clone).
 
@@ -581,11 +601,11 @@ fn get_or_init(&self, init: impl FnOnce() -> T) -> Arc<T>
 fn insert(&self, value: T) -> Option<Arc<T>>
 ```
 
-**Purpose**: Stores a runtime attachment of type `T`, replacing any previous value of the same type and returning that previous value if present. It is the typed overwrite path for extension-owned state.
+**Purpose**: Stores or replaces the attached value for a particular type in live extension data. It returns the previous value of that type if one was already stored.
 
-**Data flow**: It takes `&self` and `value: T`, locks the map with `entries()`, inserts `Arc::new(value)` under `TypeId::of::<T>()`, and maps any replaced erased value through `downcast_data` to `Option<Arc<T>>`. It mutates the runtime map.
+**Data flow**: A typed value goes in. The function locks the entries map, wraps the new value in an `Arc`, and stores it under its type identity. The map is changed, and any old value for the same type is returned after being converted back to the requested type.
 
-**Call relations**: Contributor implementations call this when updating extension-private state in session, thread, or turn stores. It delegates to `entries()`, `Arc::new`, `HashMap::insert`, and `downcast_data`.
+**Call relations**: This is used by extension contribution and configuration-change paths to place new state into the live scope. It relies on `ExtensionData::entries` to safely access the shared map and `Arc::new` to store the value in shareable form.
 
 *Call graph*: calls 1 internal fn (entries); called by 8 (contribute, contribute, on_config_changed, on_config_changed, on_config_changed, contribute, on_config_changed, on_config_changed); 1 external calls (new).
 
@@ -596,11 +616,11 @@ fn insert(&self, value: T) -> Option<Arc<T>>
 fn remove(&self) -> Option<Arc<T>>
 ```
 
-**Purpose**: Removes and returns the attached runtime value of a given type, if one exists. It is the typed delete path for the store.
+**Purpose**: Deletes the attached value for a requested type and returns it if it existed. This gives callers a way to take state out of the extension data store.
 
-**Data flow**: It takes `&self`, locks the map via `entries()`, removes the entry for `TypeId::of::<T>()`, and downcasts any removed erased value to `Option<Arc<T>>`. It mutates the map by deleting the entry when present.
+**Data flow**: The caller asks to remove type `T`. The function locks the map and removes the entry keyed by that type identity. The map loses that attachment, and the removed shared value is returned if there was one.
 
-**Call relations**: Extension logic uses this during cleanup or state transitions when a typed attachment should no longer be retained. It delegates to `entries()` and `downcast_data`.
+**Call relations**: This is the cleanup or take-back path that pairs with insertion. It uses `ExtensionData::entries` to lock the map before changing it, but unlike reads it does not call `downcast_data` directly in the listed call graph.
 
 *Call graph*: calls 1 internal fn (entries).
 
@@ -611,11 +631,11 @@ fn remove(&self) -> Option<Arc<T>>
 fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TypeId, ErasedData>>
 ```
 
-**Purpose**: Acquires the mutex guarding the runtime attachment map and returns the guard, recovering even from poisoned locks. It centralizes the store’s locking policy.
+**Purpose**: Safely opens the internal attachment map for reading or writing. It hides the locking detail from the public methods.
 
-**Data flow**: It takes `&self`, calls `self.entries.lock()`, and on success returns the `MutexGuard<HashMap<TypeId, ErasedData>>`; on poison it recovers the inner guard with `PoisonError::into_inner`. It does not itself mutate the map, though callers may do so through the returned guard.
+**Data flow**: The function reads the mutex inside `ExtensionData` and tries to lock it. If the lock is normal, it returns access to the map. If the lock was poisoned because another thread panicked while holding it, it still takes back the inner map and returns access.
 
-**Call relations**: All runtime typed accessors (`get`, `get_or_init`, `insert`, `remove`) call this helper before touching the map. Its poison-recovery behavior ensures those higher-level operations continue to function after a panic in another holder.
+**Call relations**: This private helper is used by `get`, `get_or_init`, `insert`, and `remove` whenever they need the map. It centralizes the lock behavior so all map operations recover from a poisoned mutex in the same way.
 
 *Call graph*: called by 4 (get, get_or_init, insert, remove).
 
@@ -626,11 +646,11 @@ fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TypeId, ErasedData>>
 fn downcast_data(value: ErasedData) -> Arc<T>
 ```
 
-**Purpose**: Converts an erased `Arc<dyn Any + Send + Sync>` back into `Arc<T>` for the expected concrete type. It enforces the invariant that values are always retrieved under the same type they were stored with.
+**Purpose**: Turns a stored, type-erased value back into the concrete type the caller asked for. It is the final step that makes the typed storage feel type-safe to callers.
 
-**Data flow**: It takes ownership of `value: ErasedData`, attempts `value.downcast::<T>()`, and returns the typed `Arc<T>` on success. If downcasting fails, it triggers `unreachable!` with a message indicating incompatible typed extension data. It reads no external state and writes no recoverable output on failure.
+**Data flow**: An `Arc` holding a hidden `Any` value goes in. The function attempts to convert it into `Arc<T>`, where `T` is the requested type. If the map was used correctly, the conversion succeeds and the typed shared value comes out; if not, the code marks that situation as unreachable because it would mean the internal type map was corrupted.
 
-**Call relations**: Both initializer and runtime typed accessors delegate to this helper after looking up erased values. It is the final type-restoration step that makes the `TypeId`-indexed storage API safe under its internal invariants.
+**Call relations**: This helper is called by read paths in `ExtensionDataInit::get`, `ExtensionData::get`, and `ExtensionData::get_or_init`. Those functions find the value by type identity first, then hand it here to restore the concrete type before giving it to the caller.
 
 *Call graph*: called by 3 (get, get_or_init, get); 1 external calls (unreachable!).
 
@@ -639,16 +659,24 @@ fn downcast_data(value: ErasedData) -> Arc<T>
 
 `data_model` · `startup`
 
-This file contributes the user-instructions portion of the extension API. `UserInstructions` is the concrete payload exposed to the runtime: model-visible instruction `text` paired with a `source` of type `AbsolutePathBuf`. The source is deliberately constrained to an absolute filesystem path because the current app-server `instructionSources` API reports sources in that form; the inline TODO documents that this is a temporary attribution mechanism rather than a general source abstraction. `LoadedUserInstructions` wraps the outcome of a load attempt and separates usable content from non-fatal problems: `instructions` is optional so providers can explicitly report “no applicable instructions,” while `warnings` carries recoverable startup issues that should still be surfaced. `LoadUserInstructionsFuture<'a>` standardizes the async return type as a boxed, pinned, `Send` future yielding `LoadedUserInstructions`, allowing trait objects and heterogeneous implementations. The `UserInstructionsProvider` trait is the behavioral contract: implementations are expected to produce the snapshot used when a new root runtime starts, and to prefer returning fallback instructions plus warnings over failing hard. The key invariant in this file is attribution fidelity: when instructions exist, their source path must be absolute so downstream reporting remains consistent.
+This file is like a small agreement between the host application and the runtime. The runtime may need extra user-provided instruction text before it starts working, but it should not need to know exactly where that text came from or how it was loaded. This file defines the pieces used for that handoff.
+
+`UserInstructions` holds the actual instruction text that the model can see, plus the filesystem path it came from. That path must be absolute, meaning it starts from the root of the filesystem, so other parts of the app can clearly report the instruction source without guessing.
+
+`LoadedUserInstructions` wraps the result of trying to load those instructions. Sometimes there are instructions, and sometimes there are none. It also carries warnings for recoverable problems, such as a source being missing or partly unreadable, so startup can continue while still telling the user what went wrong.
+
+The file also defines `UserInstructionsProvider`, a trait, which is Rust’s way of saying “anything that implements this promises to provide this behavior.” In this case, the behavior is loading a snapshot of user instructions asynchronously, meaning the work may finish later rather than immediately. Without this file, different parts of the system would not have a shared, reliable way to ask for host-provided instructions at startup.
 
 
 ### `ext/goal/src/events.rs`
 
-`io_transport` · `whenever goal updates are emitted to the extension host`
+`io_transport` · `request handling`
 
-This file is the event-transport adapter for the goal subsystem. `GoalEventEmitter` holds an `Arc<dyn ExtensionEventSink>`, allowing runtime and tool code to emit host-visible events without depending on the sink trait directly. The only event currently modeled here is `thread_goal_updated`, which packages a `ThreadGoal` plus optional turn attribution into the protocol’s `ThreadGoalUpdatedEvent` and then wraps that in the generic `Event` envelope with a caller-supplied event ID.
+When the goal for a conversation thread changes, other parts of the system need to hear about it. This file is the messenger for that job. It defines `GoalEventEmitter`, a lightweight object that holds an event sink, which is the place where outgoing extension events are sent.
 
-The design keeps event construction centralized so all goal-update emissions use the same message shape: the thread ID is taken from the `ThreadGoal`, the optional `turn_id` is passed through unchanged, and the full goal payload is included. This file contains no business logic about when updates should be emitted; it is purely the formatting and dispatch layer used by runtime accounting and tool-triggered goal mutations.
+The important idea is separation: the goal logic can decide that a goal changed, but it should not need to know the exact protocol wrapper used to publish that news. `GoalEventEmitter` hides that packaging step. Callers give it an event id, an optional turn id, and the updated `ThreadGoal`. The emitter builds a protocol `Event` whose message says, in effect, “this thread goal was updated,” then sends it through the shared sink.
+
+The sink is stored in an `Arc`, which is a thread-safe shared pointer. In plain terms, it lets multiple parts of the program hold the same outgoing event channel without copying or owning it exclusively. Without this file, goal-related code would have to repeat the event-building details itself, making it easier to send inconsistent or malformed goal update messages.
 
 #### Function details
 
@@ -658,11 +686,11 @@ The design keeps event construction centralized so all goal-update emissions use
 fn new(sink: Arc<dyn ExtensionEventSink>) -> Self
 ```
 
-**Purpose**: Constructs the goal event emitter around a shared extension event sink. It is the dependency-injection point for outbound goal events.
+**Purpose**: Creates a `GoalEventEmitter` from an existing event sink. This gives goal-related code a simple object it can use later to publish goal update events.
 
-**Data flow**: Takes `Arc<dyn ExtensionEventSink>`, stores it in `GoalEventEmitter { sink }`, and returns the wrapper. No events are emitted here.
+**Data flow**: It receives a shared event sink as input. It stores that sink inside a new `GoalEventEmitter`. The result is an emitter object that can be cloned and used to send events through the same underlying sink.
 
-**Call relations**: Called during extension initialization so runtime and tool code can emit goal events through a focused helper.
+**Call relations**: This is called by `new_with_host_capabilities` during setup, when the extension is being wired to the host system. It does not send anything itself; it prepares the messenger that later goal code will use.
 
 *Call graph*: called by 1 (new_with_host_capabilities).
 
@@ -678,11 +706,11 @@ fn thread_goal_updated(
     )
 ```
 
-**Purpose**: Emits a `ThreadGoalUpdated` protocol event for a goal change, optionally attributed to a turn. It is the subsystem’s standard outbound notification for goal state changes.
+**Purpose**: Publishes a “thread goal updated” event. Callers use it when they have a new or changed goal and need the rest of the extension system to be notified in the standard protocol format.
 
-**Data flow**: Accepts an event ID convertible to `String`, an `Option<String>` turn ID, and a `ThreadGoal`. It converts the event ID, constructs `EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent { thread_id: goal.thread_id, turn_id, goal })`, wraps it in `Event { id, msg }`, and sends it through `self.sink.emit(...)`.
+**Data flow**: It receives an event id, an optional turn id, and the updated `ThreadGoal`. It converts the event id into a string, takes the thread id from the goal, wraps all of this into a `ThreadGoalUpdatedEvent`, then wraps that into a general protocol `Event`. Finally, it sends the event to the stored sink. Nothing is returned; the visible effect is that an event is emitted.
 
-**Call relations**: Called by runtime accounting and tool-call flows after goal state changes have been persisted. It does not decide whether an update is meaningful; it only serializes and dispatches the event.
+**Call relations**: This is called when goal progress is updated by `account_active_goal_progress` or when a tool call produces a goal update through `emit_goal_updated_from_tool_call`. It hands the finished protocol event to the event sink, which is responsible for delivering it onward to the host or other listeners.
 
 *Call graph*: called by 2 (account_active_goal_progress, emit_goal_updated_from_tool_call); 2 external calls (into, ThreadGoalUpdated).
 
@@ -692,13 +720,13 @@ These files define other stable extension-consumed boundaries for memories stora
 
 ### `ext/memories/src/backend.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `request handling`
 
-This module is the schema layer for memory operations. The `MemoriesBackend` trait declares four asynchronous capabilities—adding an ad-hoc note, listing entries, reading file content, and searching content—while requiring implementations to be `Clone + Send + Sync + 'static` so they can be safely shared through async extension infrastructure. The trait methods exchange strongly typed request and response structs rather than raw maps, which makes pagination, truncation, and path scoping explicit.
+This file is like a service counter form set for the memories feature. It does not itself read files or search text. Instead, it says exactly what any memory storage backend must be able to do: add a quick note, list stored memory items, read a memory file, and search through memories. That common interface is the `MemoriesBackend` trait. A local filesystem backend can implement it now, and a future remote backend can implement the same promises without forcing callers to change.
 
-The request/response types encode the subsystem’s semantics: listing and searching both support `cursor` pagination and `max_results`; reading is line-oriented with a 1-indexed `line_offset`, optional `max_lines`, and token-based truncation; searching carries multiple queries, a `SearchMatchMode`, optional path scoping, context line count, and normalization/case-sensitivity flags. `MemoryEntry`, `MemoryEntryType`, and `MemorySearchMatch` define the serialized shapes returned to callers. Most response types derive `Serialize` and `JsonSchema`, and several use `#[schemars(deny_unknown_fields)]`, signaling that these payloads are intended for external tool schemas and should remain strict.
+The rest of the file defines the plain data that moves across this boundary. Request structs describe what the caller wants, such as which path to read, how many lines to return, or what search queries to use. Response structs describe what comes back, such as directory entries, file content, search matches, pagination cursors, and whether the result was cut short. These response types are serializable, meaning they can be turned into formats like JSON for tool or API output.
 
-`MemoriesBackendError` centralizes validation and I/O failures. Its variants distinguish malformed filenames, paths, cursors, empty notes/queries, invalid line windows, missing files, wrong file kinds, and raw I/O errors. The helper constructors standardize creation of the three formatted validation errors so callers can attach the original offending string plus a concrete reason.
+It also defines `MemoriesBackendError`, the shared list of things that can go wrong: bad filenames, unsafe paths, invalid cursors, missing files, empty searches, and input/output failures. Having one clear error language matters because callers can give useful feedback instead of guessing what failed.
 
 #### Function details
 
@@ -708,11 +736,11 @@ The request/response types encode the subsystem’s semantics: listing and searc
 fn invalid_filename(filename: impl Into<String>, reason: impl Into<String>) -> Self
 ```
 
-**Purpose**: Builds the `InvalidFilename` error variant with owned `filename` and `reason` strings. It gives filename validators a uniform way to report exactly which name failed and why.
+**Purpose**: This is a small convenience function for creating a clear “invalid filename” error. Code that checks a proposed note filename uses it when the name is not allowed and needs to explain why.
 
-**Data flow**: Accepts `filename` and `reason` as any `Into<String>` inputs, converts both into owned `String` values, and returns `MemoriesBackendError::InvalidFilename { filename, reason }`. It does not read or mutate external state.
+**Data flow**: It receives a filename and a reason, accepting values that can be converted into strings. It turns both into owned text and packages them into the `InvalidFilename` error variant. The result is an error value that can be returned to the caller with both the bad filename and the human-readable reason included.
 
-**Call relations**: This helper is used by filename validation logic when ad-hoc note names violate length, suffix, timestamp, or slug rules. It exists so `validate_filename` can emit consistent structured errors without repeating variant construction.
+**Call relations**: Filename validation code calls this after deciding that a filename is unsafe or unacceptable. This function does not do the validation itself; it standardizes the error that validation returns, so the rest of the memories feature reports filename problems in one consistent shape.
 
 *Call graph*: called by 1 (validate_filename); 1 external calls (into).
 
@@ -723,11 +751,11 @@ fn invalid_filename(filename: impl Into<String>, reason: impl Into<String>) -> S
 fn invalid_path(path: impl Into<String>, reason: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs the `InvalidPath` variant for path validation failures such as traversal, symlink rejection, or non-directory components. It preserves both the user-visible path string and a backend-specific explanation.
+**Purpose**: This creates a clear “invalid path” error when a memory path is not acceptable. It is used for path problems such as paths outside the allowed memory store, paths that are not directories when they should be, or unsafe symbolic links.
 
-**Data flow**: Takes `path` and `reason`, converts them into owned strings, and returns `MemoriesBackendError::InvalidPath { path, reason }`. No side effects occur.
+**Data flow**: It receives a path and a reason, converts both into strings, and builds the `InvalidPath` error variant. The output is an error value carrying the exact path that was rejected and the explanation for rejecting it.
 
-**Call relations**: Path-resolution and filesystem-guard code call this when a requested path escapes the memory root, crosses a non-directory, points at a symlink, or violates directory expectations. It is the common error constructor behind `resolve_scoped_path`, `ensure_directory`, and `reject_symlink`.
+**Call relations**: Path-related checks call this while resolving scoped paths, confirming directories, or rejecting symbolic links. In the larger flow, those checks protect the memory store boundary before any file listing, reading, or searching continues.
 
 *Call graph*: called by 3 (resolve_scoped_path, ensure_directory, reject_symlink); 1 external calls (into).
 
@@ -738,11 +766,11 @@ fn invalid_path(path: impl Into<String>, reason: impl Into<String>) -> Self
 fn invalid_cursor(cursor: impl Into<String>, reason: impl Into<String>) -> Self
 ```
 
-**Purpose**: Creates the `InvalidCursor` variant used by paginated list and search operations. It standardizes reporting for malformed or out-of-range cursor values.
+**Purpose**: This creates a clear error for a bad pagination cursor. A cursor is a marker used to continue a long list or search from where the previous response stopped.
 
-**Data flow**: Consumes `cursor` and `reason` via `Into<String>`, stores them as owned strings, and returns `MemoriesBackendError::InvalidCursor { cursor, reason }`. It does not touch any shared state.
+**Data flow**: It takes the cursor text and a reason, converts them into strings, and returns the `InvalidCursor` error variant. The caller receives an error that says which cursor was rejected and why it could not be used.
 
-**Call relations**: Pagination code invokes this when a cursor cannot be parsed as a non-negative integer or when the parsed index exceeds the available result count. It is the shared constructor used by both `list` and `search`.
+**Call relations**: The list and search flows call this when a supplied cursor cannot be understood or trusted. That keeps paginated results safe and predictable: instead of continuing from a broken marker, the backend stops and reports the cursor problem directly.
 
 *Call graph*: called by 2 (list, search); 1 external calls (into).
 
@@ -751,7 +779,11 @@ fn invalid_cursor(cursor: impl Into<String>, reason: impl Into<String>) -> Self
 
 `data_model` · `request handling`
 
-This file is primarily a data-model module for IDE context exchanged with the desktop/extension side. It declares `IdeContext`, which contains an optional `active_file` and a list of `open_tabs`, all deserialized with `serde` using camelCase field names. `ActiveFile` embeds a flattened `FileDescriptor` so fields like `label` and `path` deserialize directly alongside selection metadata; it also stores the primary `selection`, optional `active_selection_content`, and possibly multiple `selections`. `FileDescriptor` keeps only the label and path fields the TUI actually uses, intentionally ignoring extra JSON such as `fsPath`, `startLine`, `endLine`, or `processEnv`. `Range` and `Position` model zero-based line/character coordinates. The module publicly re-exports `fetch_ide_context` from `ipc` and prompt-related helpers from `prompt`, making this file the stable entry point for IDE-context consumers while hiding transport details and platform-specific pipe/socket code. Its single test confirms backward-compatible deserialization from the existing IDE payload shape, including ignored extra fields and flattened active-file descriptors. That test is important because the TUI depends on partial schema compatibility rather than strict mirroring of the extension’s full payload.
+This file is the front door for TUI support for `/ide`, where the terminal app can use information from a connected code editor. In human terms, it lets the TUI ask, “What file is the user looking at, what tabs are open, and what text is selected?” Without this shared shape, the app and the editor could disagree about what the incoming data means, and `/ide` prompts would be unreliable.
+
+The main type is `IdeContext`. It can contain one active file and a list of open tabs. The active file includes a simple file description, the current selection range, the selected text, and any extra selections. A range is made from two positions, and each position is just a line and character number. This is like a bookmark system: the editor sends bookmarks and labels, and the TUI turns them into useful context for the user’s request.
+
+The file also re-exports helper functions from nearby modules. Those helpers do the practical work: fetching the IDE context, detecting whether a prompt asks for IDE context, extracting prompt details, and applying IDE context to user input. The data structures here are deliberately tolerant of extra fields from the editor, so the test confirms that real-world editor data can include more information than the TUI needs without breaking parsing.
 
 #### Function details
 
@@ -761,11 +793,11 @@ This file is primarily a data-model module for IDE context exchanged with the de
 fn deserializes_existing_ide_context_shape()
 ```
 
-**Purpose**: Verifies that the current `IdeContext` structs deserialize the existing IDE payload shape while ignoring unrelated extra fields.
+**Purpose**: This test checks that the TUI can read the existing IDE context format sent by an editor. It protects against accidental changes that would make real editor data stop loading correctly.
 
-**Data flow**: Builds a representative JSON value containing `activeFile`, `openTabs`, and extra fields like `fsPath` and `processEnv`; deserializes it with `serde_json::from_value` into `IdeContext`; and asserts the resulting nested structs contain only the expected retained fields.
+**Data flow**: It starts with a sample JSON object that looks like editor-provided context, including an active file, open tabs, and extra fields the TUI does not use. It feeds that JSON into Serde, Rust’s data-conversion library, to build an `IdeContext`. It then compares the parsed result with the exact simplified structure the TUI expects, proving that needed fields are kept and irrelevant extra fields are safely ignored.
 
-**Call relations**: This test guards the schema boundary for both IPC fetching and prompt rendering. It ensures downstream code can rely on partial deserialization even if the IDE payload includes additional fields.
+**Call relations**: During the test run, this function builds sample data with `json!`, asks `from_value` to convert that data into the file’s `IdeContext` model, and then uses `assert_eq!` to verify the result. It is not part of the normal TUI flow; it acts as a safety check for the data contract used by the `/ide` feature.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -775,13 +807,13 @@ These files establish the public hook subsystem surface, including execution abs
 
 ### `hooks/src/declarations.rs`
 
-`domain_logic` · `plugin hook enumeration / metadata listing`
+`domain_logic` · `plugin load / hook discovery`
 
-This file defines the lightweight declaration model used to enumerate bundled plugin hook handlers. `PluginHookDeclaration` stores only the durable hook `key` and its `HookEventName`, intentionally omitting runtime state such as enablement, trust, or command details. The main function, `plugin_hook_declarations`, walks a slice of `PluginHookSource` values and expands each source’s `HookEventsToml` into concrete handler declarations.
+Plugins can bundle hook handlers: small pieces of behavior that run when certain events happen, such as before a tool is used or when a session starts. This file provides a lightweight catalog of those handlers. It does not execute hooks, check match rules, or inspect live runtime state. Instead, it reads the hook definitions that came from plugin bundles and produces one plain record per declared handler.
 
-The key-generation scheme mirrors runtime discovery. For each plugin source, it first builds a `key_source` string by concatenating the plugin ID key and the source-relative path with `plugin_hook_key_source`, producing values like `demo@test:hooks/hooks.json`. It then iterates every event, matcher group index, and handler index from `into_matcher_groups()`, and for each concrete handler computes the final persisted key with `crate::hook_key(&key_source, event_name, group_index, handler_index)`. That means declaration keys remain aligned with the keys used later for persisted hook state and trust decisions.
+The main record is `PluginHookDeclaration`. It stores two things: a `key`, which is a stable text identifier for one specific handler, and an `event_name`, which says which kind of event that handler belongs to. The key is built from the plugin id, the hook file path inside the plugin, the event name, the matcher group number, and the handler number. In everyday terms, it is like a shelf label in a warehouse: it lets the system point to one exact hook even if many hooks live in the same plugin file.
 
-The included test demonstrates that multiple handlers in one matcher group and handlers across different events all receive distinct, position-based keys in declaration order.
+The important behavior is that this file preserves the same key format used elsewhere. That matters because saved state, logs, or user-facing references may rely on these keys staying consistent. Without this file, the system would have no simple way to list plugin-provided hook handlers before actually using them.
 
 #### Function details
 
@@ -791,11 +823,11 @@ The included test demonstrates that multiple handlers in one matcher group and h
 fn plugin_hook_declarations(hook_sources: &[PluginHookSource]) -> Vec<PluginHookDeclaration>
 ```
 
-**Purpose**: Expands plugin hook source definitions into one declaration per concrete handler. It computes the same persisted hook keys used elsewhere for state lookup.
+**Purpose**: Builds a flat list of hook declarations from plugin hook sources. Someone would use this when they need to know which hook handlers a set of plugins provides, without running those handlers.
 
-**Data flow**: It takes a slice of `PluginHookSource`, allocates an output `Vec<PluginHookDeclaration>`, and for each source derives a `key_source` from plugin ID and relative path. It clones the source’s hook events, iterates event names, matcher groups, and handler positions, and pushes a `PluginHookDeclaration { key, event_name }` for each handler. It returns the accumulated vector.
+**Data flow**: It receives a list of `PluginHookSource` values, where each source describes one plugin hook file and the hooks declared inside it. For each source, it first builds a base key from the plugin id and the hook file's path inside the plugin. Then it walks through each event, each matcher group under that event, and each handler in the group. For every handler it creates a `PluginHookDeclaration` containing a stable key and the event name. The output is a vector, meaning an ordered list, of these declarations; the input hook sources are only read.
 
-**Call relations**: This function is exercised by the file’s test and conceptually parallels runtime discovery. It delegates key-source formatting to `plugin_hook_key_source` and final key assembly to `crate::hook_key` so declaration keys stay consistent with discovery.
+**Call relations**: This function calls `plugin_hook_key_source` to create the plugin-and-file part of each key, then passes that into the wider `hook_key` helper to make the final per-handler key. In this file it is exercised by the test `tests::lists_declared_plugin_handlers_with_persisted_hook_keys`, which checks that the produced keys match the expected persisted format.
 
 *Call graph*: calls 1 internal fn (plugin_hook_key_source); called by 1 (lists_declared_plugin_handlers_with_persisted_hook_keys); 2 external calls (new, hook_key).
 
@@ -806,11 +838,11 @@ fn plugin_hook_declarations(hook_sources: &[PluginHookSource]) -> Vec<PluginHook
 fn plugin_hook_key_source(plugin_id: &str, source_relative_path: &str) -> String
 ```
 
-**Purpose**: Builds the stable prefix used for plugin hook keys from a plugin identifier and source-relative path. The result becomes the left-hand portion of persisted hook keys.
+**Purpose**: Combines a plugin id and a hook file path into the shared starting text used for plugin hook keys. This keeps key construction consistent wherever plugin hook sources need to be named.
 
-**Data flow**: It accepts `plugin_id` and `source_relative_path` string slices, formats them as `"{plugin_id}:{source_relative_path}"`, and returns the resulting `String`.
+**Data flow**: It receives two pieces of text: the plugin id and the hook file path relative to that plugin. It joins them with a colon between them. The result is a single string such as `demo@test:hooks/hooks.json`, which can then be extended with event and handler details.
 
-**Call relations**: This helper is called both by `plugin_hook_declarations` and by discovery code when plugin hooks are turned into runtime handlers. Its role is to keep plugin key prefixes identical across declaration and execution paths.
+**Call relations**: It is called by `plugin_hook_declarations` when listing plugin hook declarations. It is also called by `append_plugin_hook_sources` elsewhere in the system, which means this small formatting rule is shared between hook discovery and other plugin hook setup work.
 
 *Call graph*: called by 2 (plugin_hook_declarations, append_plugin_hook_sources); 1 external calls (format!).
 
@@ -821,33 +853,35 @@ fn plugin_hook_key_source(plugin_id: &str, source_relative_path: &str) -> String
 fn lists_declared_plugin_handlers_with_persisted_hook_keys()
 ```
 
-**Purpose**: Verifies that plugin hook declarations enumerate every concrete handler and assign the expected persisted keys. It covers multiple events and multiple handlers within one matcher group.
+**Purpose**: Checks that plugin hook declarations are listed in the expected order and with the expected stable keys. This protects the key format from accidental changes.
 
-**Data flow**: It constructs a synthetic `PluginHookSource` with `pre_tool_use` and `session_start` hooks, calls `plugin_hook_declarations`, and asserts that the returned vector exactly matches the expected `PluginHookDeclaration` list and key strings.
+**Data flow**: The test builds a fake plugin root path and a fake plugin hook source. That source declares two handlers for the `pre_tool_use` event and one handler for the `session_start` event. It sends this source into `plugin_hook_declarations`, then compares the returned list against the exact declarations it expects. If the keys or event names differ, the test fails.
 
-**Call relations**: This test directly drives `plugin_hook_declarations`. It depends on the production key-generation logic to prove compatibility with persisted hook-state keys.
+**Call relations**: This test calls `plugin_hook_declarations` as a user of the file would. It also uses helper constructors such as plugin id parsing, default hook configuration values, test path creation, and an equality assertion to set up the example and verify the result.
 
 *Call graph*: calls 2 internal fn (plugin_hook_declarations, parse); 4 external calls (default, assert_eq!, test_path_buf, vec!).
 
 
 ### `hooks/src/events/mod.rs`
 
-`orchestration` · `cross-cutting / hook event definition and dispatch setup`
+`other` · `cross-cutting`
 
-This module file declares the set of event-oriented submodules used by the hooks subsystem. `common` is kept `pub(crate)`, indicating it contains shared internal machinery or helper definitions intended only for use within the hooks crate. The remaining modules—`compact`, `permission_request`, `post_tool_use`, `pre_tool_use`, `session_start`, `stop`, and `user_prompt_submit`—are public, which makes them part of the crate’s outward-facing event model.
+This file does not contain event behavior itself. Instead, it organizes the different kinds of events that the hooks system understands, such as a session starting, a user submitting a prompt, a tool being used, or the system stopping. Think of it like the index page at the front of a folder: it points to the real sections without rewriting their contents.
 
-The structure communicates the event taxonomy directly: there are lifecycle events (`session_start`, `stop`), tool invocation boundary events (`pre_tool_use`, `post_tool_use`), user interaction events (`user_prompt_submit`), permission workflow events (`permission_request`), and a likely alternate or reduced representation in `compact`. This file itself contains no behavior, but it is important because it defines visibility boundaries and the canonical paths by which other code imports event definitions. The split between `pub(crate)` and `pub` is the key design detail: shared internals remain encapsulated while concrete event modules are exposed for serialization, dispatch, or hook consumer integration elsewhere in the system.
+The line `pub(crate) mod common` makes shared event code available inside this crate only. In plain terms, that means other files in the same Rust package can use it, but outside packages cannot. The other `pub mod ...` lines expose specific event modules more broadly, so code outside this module can refer to them.
+
+Without this file, Rust would not know to include these event files as part of the `events` module. Other code would either fail to compile or would have no clean place to find the definitions for hook events. Its main importance is structure: it gives the event system a clear, named layout.
 
 
 ### `hooks/src/types.rs`
 
-`data_model` · `hook dispatch and hook payload serialization`
+`data_model` · `cross-cutting during hook registration, hook execution, and hook payload serialization`
 
-This file provides the runtime types for invoking hooks rather than the schema-generation layer. `HookFn` is an `Arc`-wrapped async callback trait object taking `&HookPayload` and returning a boxed future of `HookResult`, which lets the rest of the system store heterogeneous hook implementations behind a uniform interface. `HookResult` distinguishes three outcomes: `Success`, `FailedContinue(error)` for non-fatal hook failures that should not stop later hooks or the main operation, and `FailedAbort(error)` for failures that should terminate the operation. `HookResponse` pairs the hook name with its result so callers can report which hook produced which outcome.
+A hook is a small piece of code that runs at a specific moment, like a notification bell that rings after the agent finishes a turn. This file gives the rest of the project a common vocabulary for that system. It defines a hook function as an asynchronous function, meaning it may do work that finishes later, such as calling another service or writing to disk. It defines the possible outcomes too: the hook can succeed, fail but let the main operation continue, or fail and ask the main operation to stop.
 
-`Hook` itself is a small executable wrapper containing a display name and the callback. Its `Default` implementation creates a no-op hook named `default` that always resolves to `HookResult::Success`, which is useful as a placeholder. `execute` clones the hook name and awaits the stored callback.
+The file also defines the package of information sent to a hook. That package includes the session ID, the current working directory, an optional client name, the time the hook was triggered, and the specific event that happened. Right now the event type shown here is “after agent,” which includes details such as the thread ID, turn ID, user input messages, and the last assistant message.
 
-The payload side is intentionally serializable and stable. `HookPayload` includes `session_id`, absolute `cwd`, optional `client`, a custom-formatted UTC timestamp, and a tagged `HookEvent`. Currently the only event variant is `AfterAgent`, which flattens `HookEventAfterAgent` fields (`thread_id`, `turn_id`, `input_messages`, `last_assistant_message`) under `hook_event` with `event_type: "after_agent"`. The custom `serialize_triggered_at` function forces RFC3339 seconds precision with a trailing `Z`, and the test locks down the exact JSON wire shape.
+One important detail is serialization, which means turning Rust data into a stable JSON shape. The custom timestamp serializer writes times in a predictable format like `2025-01-01T00:00:00Z`. The test at the bottom protects that public shape so outside tools depending on this hook data do not break unexpectedly.
 
 #### Function details
 
@@ -857,11 +891,11 @@ The payload side is intentionally serializable and stable. `HookPayload` include
 fn should_abort_operation(&self) -> bool
 ```
 
-**Purpose**: Reports whether a hook result should stop the enclosing operation.
+**Purpose**: This answers the simple question: did this hook failure mean the main operation should stop? It is used to distinguish a serious hook failure from one that can be reported while continuing.
 
-**Data flow**: Reads `self` → returns `true` only for `HookResult::FailedAbort(_)`, otherwise `false`.
+**Data flow**: It reads one `HookResult` value. If that value is the aborting failure variant, it returns `true`; for success or a non-aborting failure, it returns `false`. It does not change anything.
 
-**Call relations**: Used by higher-level hook orchestration code to decide whether to continue running subsequent hooks or abort immediately after a failure.
+**Call relations**: After a hook has run and produced a result, surrounding hook-running code can call this method to decide whether to keep going or stop the larger operation. Internally it only checks which kind of result it was given.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -872,11 +906,11 @@ fn should_abort_operation(&self) -> bool
 fn default() -> Self
 ```
 
-**Purpose**: Creates a placeholder hook that succeeds without doing any work.
+**Purpose**: This creates a safe fallback hook. The default hook is named `default` and always succeeds without doing any real work.
 
-**Data flow**: Constructs a `Hook` with `name = "default"` and `func = Arc::new(|_| Box::pin(async { HookResult::Success }))` → returns that hook value.
+**Data flow**: It takes no input. It builds a new `Hook` with a default name and a shared function pointer wrapped in `Arc`, which is Rust’s thread-safe shared ownership container. The function ignores its payload and returns `HookResult::Success`.
 
-**Call relations**: Serves as the `Default` implementation for `Hook`, allowing callers to initialize hook slots before real callbacks are installed.
+**Call relations**: This is used when code needs a placeholder hook value. It creates the hook function using a shared wrapper so the hook can be cloned and used safely wherever hook definitions are passed around.
 
 *Call graph*: 1 external calls (new).
 
@@ -887,11 +921,11 @@ fn default() -> Self
 async fn execute(&self, payload: &HookPayload) -> HookResponse
 ```
 
-**Purpose**: Runs the stored async hook callback and packages the result with the hook's name.
+**Purpose**: This runs one hook with a given payload and wraps the outcome together with the hook’s name. That makes later reporting easier because the caller can tell which hook produced which result.
 
-**Data flow**: Takes `&self` and `&HookPayload` → clones `self.name`, invokes `(self.func)(payload)`, awaits the future, and returns `HookResponse { hook_name, result }`.
+**Data flow**: It receives a `Hook` and a `HookPayload`. It calls the hook’s stored asynchronous function with that payload and waits for it to finish. It returns a `HookResponse` containing the hook name and the success or failure result.
 
-**Call relations**: Called by hook execution orchestration whenever an installed hook should be run against a concrete payload.
+**Call relations**: Hook-running code calls this when it is time to fire a registered hook. This method hands the payload to the hook function, waits for the hook’s answer, and packages that answer for the caller to inspect or log.
 
 
 ##### `serialize_triggered_at`  (lines 83–88)
@@ -900,11 +934,11 @@ async fn execute(&self, payload: &HookPayload) -> HookResponse
 fn serialize_triggered_at(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes hook timestamps in a stable RFC3339 UTC format with second precision.
+**Purpose**: This writes the hook trigger time into JSON in a stable, human-readable format. It avoids small formatting differences that could confuse tools reading hook events.
 
-**Data flow**: Takes `&DateTime<Utc>` and a serde serializer → formats the timestamp with `to_rfc3339_opts(SecondsFormat::Secs, true)` → writes it as a string through `serializer.serialize_str`.
+**Data flow**: It receives a UTC timestamp and a serializer, which is the helper responsible for writing data into the output format. It converts the timestamp to an RFC 3339 string with whole seconds, such as `2025-01-01T00:00:00Z`, then asks the serializer to write that string. The result is either successful serialized output or a serialization error.
 
-**Call relations**: Referenced by `HookPayload.triggered_at` via `#[serde(serialize_with = ...)]` so all payload JSON uses the same timestamp representation.
+**Call relations**: Serde, the Rust serialization library, calls this automatically when `HookPayload` is turned into JSON because the `triggered_at` field points to it. It relies on the time library to format the date and on the serializer to write the final string.
 
 *Call graph*: 2 external calls (to_rfc3339_opts, serialize_str).
 
@@ -915,24 +949,26 @@ fn serialize_triggered_at(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok,
 fn hook_payload_serializes_stable_wire_shape()
 ```
 
-**Purpose**: Locks down the exact JSON representation of `HookPayload` and the `AfterAgent` event variant.
+**Purpose**: This test makes sure a hook payload turns into the exact JSON shape expected by outside consumers. It protects the hook interface from accidental breaking changes.
 
-**Data flow**: Builds a sample payload with generated `ThreadId`s, a test absolute path, a fixed UTC timestamp, and an `AfterAgent` event → serializes it with `serde_json::to_value` → compares against an explicit JSON object containing snake_case field names, omitted `client`, formatted timestamp, and flattened event fields.
+**Data flow**: It creates sample IDs, a sample `/tmp` working directory, a fixed timestamp, and an `AfterAgent` hook event. It serializes that payload into JSON, builds the JSON it expects by hand, and compares the two. If the actual JSON differs, the test fails.
 
-**Call relations**: Regression test for serde attributes, custom timestamp formatting, and the tagged/flattened event encoding.
+**Call relations**: This test exercises the serialization rules defined in this file, including the custom timestamp formatting and the event tagging. It calls helper constructors for IDs and paths, uses JSON-building helpers to describe the expected output, and finishes by asserting that the real and expected values match.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (assert_eq!, test_path_buf, json!, to_value, vec!).
 
 
 ### `hooks/src/lib.rs`
 
-`orchestration` · `cross-cutting API surface and config-state key generation`
+`other` · `cross-cutting`
 
-This crate root wires together the hooks subsystem by declaring internal modules and selectively re-exporting the types and functions that callers use. Most of the file is API curation: it exposes hook declaration helpers, event request/outcome structs, registry entry points, schema fixture generation, legacy notify helpers, and the core hook types (`Hook`, `HookEvent`, `HookPayload`, `HookResponse`, `HookResult`).
+Hooks are user- or plugin-defined actions that Codex can run at important moments, such as before a tool is used, after compaction, when a session starts, or when the agent stops. This file acts like the library’s reception desk: it does not contain most of the hook machinery itself, but it points callers to the right pieces and exposes the names they are meant to use.
 
-Two constants define the canonical event names accepted in hooks JSON and config files. `HOOK_EVENT_NAMES` lists all ten supported event labels, while `HOOK_EVENT_NAMES_WITH_MATCHERS` narrows that set to the eight events whose matcher fields are meaningful during dispatch. The comments make an important design distinction: some events may appear in configuration with matcher fields, but Codex intentionally ignores those matchers because dispatch for those events is not keyed by tool name, compaction trigger, or start source.
+At the top, it declares the internal modules that make up the hook system, such as event definitions, configuration rules, the execution engine, and the registry of configured hooks. It then re-exports the main public items from those modules. Re-exporting means other code can import these items from this one file’s crate path instead of reaching into each internal module directly.
 
-The only executable logic here is the persisted-key naming scheme. `hook_event_key_label` maps each `HookEventName` enum variant to the snake_case label used in stored hook-state keys, and `hook_key` combines a caller-provided source identifier with that label plus group and handler indexes. This centralizes the stable key format so config-state persistence and discovery code can agree on exact identifiers.
+The two event-name lists are important for configuration and validation. One list names every hook event that can appear in hook JSON or config files. The second list names only the events where a matcher field is meaningful. A matcher is a rule used to decide whether a hook applies to a particular tool, compaction trigger, or session-start source.
+
+Finally, the file provides small helpers for building stable stored keys for hook state. Those keys need consistent event labels, because changing them would make saved hook state hard to find later.
 
 #### Function details
 
@@ -942,11 +978,11 @@ The only executable logic here is the persisted-key naming scheme. `hook_event_k
 fn hook_event_key_label(event_name: HookEventName) -> &'static str
 ```
 
-**Purpose**: Maps each protocol hook event enum to the stable snake_case label used in persisted hook-state keys.
+**Purpose**: Converts a hook event name into the exact lowercase label used when saving hook state. This keeps stored keys stable and consistent, instead of letting each caller invent its own spelling.
 
-**Data flow**: Reads a `HookEventName` and returns one of ten static strings such as `pre_tool_use`, `session_start`, or `subagent_stop`. It performs no allocation and mutates no state.
+**Data flow**: It receives a HookEventName value, such as PreToolUse or SessionStart. It matches that value to a fixed text label like "pre_tool_use" or "session_start". It returns that label as static text and does not change anything else.
 
-**Call relations**: Used by `hook_key` to ensure persisted keys use a single canonical event-label mapping.
+**Call relations**: This helper is used when code needs the storage-friendly name for a hook event. In this file, hook_key relies on it so the full saved-state key always uses the same event label format.
 
 
 ##### `hook_key`  (lines 100–110)
@@ -960,11 +996,11 @@ fn hook_key(
 ) -> String
 ```
 
-**Purpose**: Builds the full persisted config-state key for one discovered hook handler.
+**Purpose**: Builds the full saved-state key for one discovered hook handler. The key combines where the hook came from, which event it belongs to, and its position in the hook configuration.
 
-**Data flow**: Accepts a `key_source` string, `HookEventName`, `group_index`, and `handler_index`, calls `hook_event_key_label(event_name)`, and formats them into `"{key_source}:{event_label}:{group_index}:{handler_index}"`. Returns the allocated `String`.
+**Data flow**: It receives a source label, a hook event name, a group number, and a handler number. It asks hook_event_key_label to turn the event into its stored label, then formats all the pieces into one string shaped like source:event:group:handler. It returns that string and does not modify outside state.
 
-**Call relations**: Acts as the public helper for any code that needs to derive stable per-handler persistence keys from discovery metadata.
+**Call relations**: This function sits just above hook_event_key_label: callers use hook_key when they need the complete persisted key, and hook_key delegates the event-name part to hook_event_key_label. Its only external work is string formatting.
 
 *Call graph*: 1 external calls (format!).
 
@@ -974,11 +1010,13 @@ These files define the serialized hook command shapes and the loader that expose
 
 ### `hooks/src/schema.rs`
 
-`data_model` · `build/test time for schema generation; runtime whenever hook payloads are serialized or parsed`
+`data_model` · `schema generation, hook input/output validation, and tests`
 
-This file is the canonical schema layer for hook I/O. It declares the serialized input structs for each hook event (`PreToolUseCommandInput`, `PermissionRequestCommandInput`, `PostToolUseCommandInput`, compact/session/subagent/user/stop variants) and the deserializable output structs that hooks return (`*CommandOutputWire`, plus hook-specific nested output payloads). Most types derive `Serialize`, `Deserialize`, and `JsonSchema`, with `deny_unknown_fields` used on wire structs so unexpected fields are rejected. Several fields intentionally use custom schema functions rather than unconstrained strings: hook event names are emitted as string constants, permission mode/source/trigger fields are emitted as string enums, and `NullableString` overrides schemars so optional strings become `type: ["string", "null"]` instead of an `anyOf`-style option schema.
+Hooks are small outside commands that can be run at important moments, such as before a tool is used, after a tool finishes, when a session starts, or when a subagent stops. This file acts like the printed form for those conversations: it names every field, says which values are allowed, and marks which fields may be missing or null. Without it, hook inputs and outputs could drift apart, and a hook might send data the rest of the system does not understand.
 
-The file also encodes Codex-specific contract details that are easy to miss: many turn-scoped hook inputs include a required `turn_id`; hooks that may run inside subagents expose optional flat `agent_id`/`agent_type`; and some semantic constraints are documented but enforced elsewhere rather than in JSON Schema (for example, `reason` required when a stop decision blocks, or reserved PermissionRequest rewrite fields that currently fail closed during parsing). Schema fixture generation is deterministic: `schema_for_type` uses draft-07 with `option_add_null_type = false`, `canonicalize_json` recursively sorts object keys, and `write_schema_fixtures` rewrites a fresh `generated/` directory with one schema file per hook input/output pair. The test module verifies fixture parity and several intentional schema divergences from upstream Claude docs.
+Most of the file is made of Rust structs and enums that also know how to become JSON and JSON Schema. JSON Schema is a machine-readable description of JSON, like a checklist that says “this must be a string” or “this field can only be one of these words.” The file includes shared output fields, event-specific input and output types, allowed event names, permission decisions, and subagent context.
+
+The second job of the file is schema generation. `write_schema_fixtures` creates a clean generated schema folder and writes one schema file per hook input or output. Helper functions force stable ordering in the generated JSON so tests and version control do not change just because map keys came out in a different order. The tests then compare generated schemas against checked-in fixtures and verify important contract details, such as required turn IDs and optional subagent fields.
 
 #### Function details
 
@@ -988,11 +1026,11 @@ The file also encodes Codex-specific contract details that are easy to miss: man
 fn from_path(path: Option<PathBuf>) -> Self
 ```
 
-**Purpose**: Builds the transparent nullable-string wrapper from an optional filesystem path by rendering the path for wire serialization.
+**Purpose**: Turns an optional file path into a `NullableString`, which serializes as either a path string or JSON null. This is useful for hook fields such as transcript paths, where the path may not always exist.
 
-**Data flow**: Takes `Option<PathBuf>` → maps `Some(path)` to `path.display().to_string()` and leaves `None` unchanged → returns `NullableString(Option<String>)` with no side effects.
+**Data flow**: It receives either a path or no path. If a path is present, it converts the path to the text a user would normally see; if not, it keeps the value empty. The result is a wrapper that later becomes a JSON string or null.
 
-**Call relations**: Used by hook input builders and runners whenever transcript paths or similar optional path fields must be flattened into JSON-friendly strings before serialization.
+**Call relations**: Hook input builders call this when preparing command JSON for hooks. `SessionStartCommandInput::new` also uses it so session-start hook input always has the same nullable path format as the other hook inputs.
 
 *Call graph*: called by 10 (post_command_input_json, pre_command_input_json, build_command_input, command_input_json, command_input_json, run, run, run, new, subagent_context_fields_serialize_flat_and_omit_when_absent).
 
@@ -1003,11 +1041,11 @@ fn from_path(path: Option<PathBuf>) -> Self
 fn from_string(value: Option<String>) -> Self
 ```
 
-**Purpose**: Wraps an already prepared optional string in the `NullableString` newtype.
+**Purpose**: Wraps an optional plain string so it can be sent as either a string or JSON null. It is used when the original value is already text rather than a file path.
 
-**Data flow**: Consumes `Option<String>` directly → stores it unchanged inside `NullableString` → returns the wrapper without touching external state.
+**Data flow**: It receives either some text or nothing. It stores that value unchanged inside `NullableString`, which later controls how the value is written to JSON.
 
-**Call relations**: Invoked in runtime hook construction paths where the source value is already textual rather than path-based.
+**Call relations**: Runtime hook code calls this when building inputs that contain optional text, such as an assistant message that may or may not be available.
 
 *Call graph*: called by 1 (run).
 
@@ -1018,11 +1056,11 @@ fn from_string(value: Option<String>) -> Self
 fn schema_name() -> String
 ```
 
-**Purpose**: Supplies the stable schemars type name for the custom nullable string schema.
+**Purpose**: Gives the schema generator a clear name for the custom nullable string type. This makes generated schemas easier to read and refer to.
 
-**Data flow**: Reads no inputs or state → returns the literal schema name `"NullableString"`.
+**Data flow**: It takes no runtime input. It returns the fixed name `NullableString` for use in generated schema definitions.
 
-**Call relations**: Called by schemars during schema generation so references and definitions use a predictable custom type name.
+**Call relations**: This is part of the `JsonSchema` implementation for `NullableString`, so the schema generation library calls it when describing fields that use this type.
 
 
 ##### `NullableString::json_schema`  (lines 58–63)
@@ -1031,11 +1069,11 @@ fn schema_name() -> String
 fn json_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Overrides schemars output so nullable strings are represented as a single schema object with `string|null` instance types.
+**Purpose**: Describes `NullableString` to the JSON Schema generator as a value that may be either a string or null. This keeps generated hook schemas honest about fields that can be absent in meaning but still present as null.
 
-**Data flow**: Ignores the generator argument → constructs a `Schema::Object(SchemaObject)` with `instance_type` set to both `String` and `Null` → returns that schema object.
+**Data flow**: It receives a schema generator object, though it does not need to read anything from it. It builds and returns a schema object whose allowed JSON types are string and null.
 
-**Call relations**: Used automatically by schemars whenever a field of type `NullableString` appears in one of the hook input/output schemas.
+**Call relations**: The schema generation library calls this while building schemas for hook inputs. It relies on the local `default_continue` only indirectly through shared defaults elsewhere, and here it creates the schema object directly.
 
 *Call graph*: 3 external calls (default, Object, vec!).
 
@@ -1046,11 +1084,11 @@ fn json_schema(_gen: &mut SchemaGenerator) -> Schema
 fn from(value: Option<&SubagentHookContext>) -> Self
 ```
 
-**Purpose**: Extracts optional flat subagent identity fields from an optional `SubagentHookContext`.
+**Purpose**: Extracts optional subagent identity fields from a subagent context. It lets hooks know when they are running inside a subagent, while keeping those fields absent for normal top-level hooks.
 
-**Data flow**: Takes `Option<&SubagentHookContext>` → on `Some`, clones `agent_id` and `agent_type` into `Some(...)`; on `None`, returns `SubagentCommandInputFields::default()` with both fields absent → returns the helper struct.
+**Data flow**: It receives either a subagent context or no context. With a context, it copies the agent ID and type; without one, it returns default empty optional fields. The output is a small struct ready to be copied into hook input JSON.
 
-**Call relations**: Called by hook input assembly code to splice subagent context into otherwise shared hook input payloads; tests also use it to verify omission behavior when no subagent is active.
+**Call relations**: Hook input builders call this before creating inputs for tool, permission, compaction, and prompt hooks. The test `tests::subagent_context_fields_serialize_flat_and_omit_when_absent` also calls it to prove the fields appear only when a subagent is present.
 
 *Call graph*: called by 7 (post_command_input_json, pre_command_input_json, build_command_input, command_input_json, command_input_json, run, subagent_context_fields_serialize_flat_and_omit_when_absent); 1 external calls (default).
 
@@ -1066,11 +1104,11 @@ fn new(
         permission_mode: impl Into<String>,
 ```
 
-**Purpose**: Constructs a complete session-start hook input with the fixed event name and normalized nullable transcript path.
+**Purpose**: Builds the input object sent to a session-start hook. It fills in the fixed event name and converts caller-provided values into the exact form expected by the hook contract.
 
-**Data flow**: Accepts session id, optional transcript path, cwd, model, permission mode, and source as `Into<String>`/`Option<PathBuf>` inputs → converts each into owned strings, sets `hook_event_name` to `"SessionStart"`, and wraps the transcript path via `NullableString::from_path` → returns a populated `SessionStartCommandInput`.
+**Data flow**: It receives a session ID, optional transcript path, current working directory, model name, permission mode, and session-start source. It converts those values into strings where needed, wraps the transcript path as nullable, sets `hook_event_name` to `SessionStart`, and returns a complete `SessionStartCommandInput`.
 
-**Call relations**: Used by session-start runtime code so callers do not manually duplicate the event-name constant or nullable-path conversion.
+**Call relations**: Runtime session-start hook code calls this when a session begins or resumes. It hands path conversion to `NullableString::from_path` so this input uses the same null-or-string behavior as other hook inputs.
 
 *Call graph*: calls 1 internal fn (from_path); called by 1 (run); 1 external calls (into).
 
@@ -1081,11 +1119,11 @@ fn new(
 fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Regenerates the full set of checked-in JSON Schema fixture files for every supported hook command input and output type.
+**Purpose**: Generates all hook JSON Schema files into a fresh `generated` directory. This is used to refresh or verify the checked-in schema fixtures that document the hook contract.
 
-**Data flow**: Takes a schema root path → creates/clears `<root>/generated` via `ensure_empty_dir` → for each fixture constant, computes pretty canonical schema bytes with `schema_json::<T>()` and writes them with `write_schema` → returns `Ok(())` or propagates filesystem/serialization errors.
+**Data flow**: It receives a root schema directory. It creates an empty generated subdirectory, generates schema JSON for every hook input and output type, writes each one to its named file, and returns success or an error if any filesystem or serialization step fails.
 
-**Call relations**: This is the top-level schema generation driver, exercised by tests to ensure generated schemas match the repository fixtures.
+**Call relations**: The schema fixture test calls this in a temporary directory. Inside the generation flow, it delegates cleanup to `ensure_empty_dir` and file writing to `write_schema`, so the top-level function reads like a checklist of all schema files that must exist.
 
 *Call graph*: calls 2 internal fn (ensure_empty_dir, write_schema); called by 1 (generated_hook_schemas_match_fixtures); 1 external calls (join).
 
@@ -1096,11 +1134,11 @@ fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()>
 fn write_schema(path: &Path, json: Vec<u8>) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes one generated schema blob to disk.
+**Purpose**: Writes one generated schema file to disk. It is a small wrapper that gives schema generation one consistent place to perform the write.
 
-**Data flow**: Accepts a destination `&Path` and serialized JSON bytes → calls `std::fs::write` → returns `Ok(())` on success or the propagated I/O error wrapped in `anyhow::Result`.
+**Data flow**: It receives a target file path and a byte array containing formatted JSON. It writes those bytes to the file and returns success, or passes back the filesystem error if writing fails.
 
-**Call relations**: Only called from `write_schema_fixtures` as the final persistence step for each schema file.
+**Call relations**: `write_schema_fixtures` calls this repeatedly, once for each hook input or output schema. It is the final handoff from in-memory schema data to files on disk.
 
 *Call graph*: called by 1 (write_schema_fixtures); 1 external calls (write).
 
@@ -1111,11 +1149,11 @@ fn write_schema(path: &Path, json: Vec<u8>) -> anyhow::Result<()>
 fn ensure_empty_dir(dir: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Recreates a directory from scratch so schema generation starts from a clean output tree.
+**Purpose**: Makes sure a directory exists and has no old files in it. This prevents stale generated schemas from being mistaken for current ones.
 
-**Data flow**: Takes a directory path → if it exists, removes it recursively; then creates it with all parents → returns `Ok(())` or propagates filesystem errors.
+**Data flow**: It receives a directory path. If the directory already exists, it deletes it and everything inside; then it recreates the directory. The result is an empty folder or an error if the filesystem operation fails.
 
-**Call relations**: Called once by `write_schema_fixtures` before any individual schema files are emitted.
+**Call relations**: `write_schema_fixtures` calls this before writing any schema files. It acts like clearing a workbench before laying out fresh documents.
 
 *Call graph*: called by 1 (write_schema_fixtures); 3 external calls (exists, create_dir_all, remove_dir_all).
 
@@ -1126,11 +1164,11 @@ fn ensure_empty_dir(dir: &Path) -> anyhow::Result<()>
 fn schema_json() -> anyhow::Result<Vec<u8>>
 ```
 
-**Purpose**: Generates deterministic pretty-printed JSON bytes for a schemars type.
+**Purpose**: Turns a Rust type that has a JSON Schema description into pretty, stable JSON bytes. This is the bridge from typed hook structs to schema files that tools and humans can read.
 
-**Data flow**: Generic over `T: JsonSchema` → builds a `RootSchema` with `schema_for_type::<T>()`, converts it to `serde_json::Value`, recursively sorts object keys with `canonicalize_json`, then pretty-serializes to `Vec<u8>` → returns the bytes or serialization errors.
+**Data flow**: It starts with a type parameter rather than a normal value. It asks `schema_for_type` for that type’s schema, converts the schema to generic JSON, passes it through `canonicalize_json` to sort object keys, and returns nicely formatted JSON bytes.
 
-**Call relations**: Used by fixture generation and tests that inspect generated schemas as JSON values.
+**Call relations**: Schema generation and tests use this whenever they need the schema for a hook input or output type. It hands the raw schema-building step to `schema_for_type` and the stable-ordering step to `canonicalize_json`.
 
 *Call graph*: calls 1 internal fn (canonicalize_json); 2 external calls (to_value, to_vec_pretty).
 
@@ -1141,11 +1179,11 @@ fn schema_json() -> anyhow::Result<Vec<u8>>
 fn schema_for_type() -> RootSchema
 ```
 
-**Purpose**: Creates the root draft-07 schema for a Rust type using project-specific schemars settings.
+**Purpose**: Creates the root JSON Schema for one Rust type using draft-07 rules. Draft-07 is a widely supported version of the JSON Schema standard.
 
-**Data flow**: Generic over `T: JsonSchema` → starts from `SchemaSettings::draft07()`, mutates settings so options do not automatically add null types, then generates `RootSchema` for `T` → returns that schema.
+**Data flow**: It receives a type that implements `JsonSchema`. It configures the schema generator, including a setting that avoids automatically adding null to optional fields, and returns the full root schema for that type.
 
-**Call relations**: Called by `schema_json` to centralize the schema-generation configuration shared by all hook types.
+**Call relations**: `schema_json` calls this as its first step. The returned schema is then converted to JSON and cleaned up for stable output.
 
 *Call graph*: 1 external calls (draft07).
 
@@ -1156,11 +1194,11 @@ fn schema_for_type() -> RootSchema
 fn canonicalize_json(value: &Value) -> Value
 ```
 
-**Purpose**: Recursively sorts JSON object keys so generated schema files are stable across runs.
+**Purpose**: Sorts every object’s keys inside a JSON value so the output is stable from run to run. This makes generated schema files easy to compare in tests and code reviews.
 
-**Data flow**: Takes a `&Value` → for arrays, canonicalizes each element in order; for objects, sorts entries by key and rebuilds a `Map`; for scalars, clones the value unchanged → returns a new canonicalized `Value`.
+**Data flow**: It receives any JSON value. Arrays are processed item by item, objects are rebuilt with keys in sorted order, and simple values like strings or booleans are copied unchanged. It returns a new JSON value with the same meaning but predictable ordering.
 
-**Call relations**: Used only by `schema_json` after schemars output and before pretty-printing.
+**Call relations**: `schema_json` calls this before formatting generated schemas. It does not change the contract, only the layout, like alphabetizing sections in a manual.
 
 *Call graph*: called by 1 (schema_json); 4 external calls (with_capacity, Array, Object, clone).
 
@@ -1171,11 +1209,11 @@ fn canonicalize_json(value: &Value) -> Value
 fn session_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field that must equal `SessionStart`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `SessionStart`. This prevents a session-start input or output from claiming to be a different event.
 
-**Data flow**: Ignores the generator argument → delegates to `string_const_schema("SessionStart")` → returns that schema.
+**Data flow**: It ignores the generator input and passes the fixed string `SessionStart` to `string_const_schema`. The output is a schema that allows only that one string.
 
-**Call relations**: Referenced by `#[schemars(schema_with = ...)]` on session-start wire fields.
+**Call relations**: Schemars calls this because the session-start types mark their event-name field with it. It delegates the actual schema construction to `string_const_schema`.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1186,11 +1224,11 @@ fn session_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `PostToolUse`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `PostToolUse`. This ties post-tool-use schemas to the correct hook event.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("PostToolUse")`.
+**Data flow**: It receives the schema generator but does not need to read it. It returns the fixed-string schema produced by `string_const_schema`.
 
-**Call relations**: Used by post-tool-use input and hook-specific output schema annotations.
+**Call relations**: Post-tool-use input and output schema generation uses this function for the event-name field. It keeps that field event-specific instead of accepting any string.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1201,11 +1239,11 @@ fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn pre_compact_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `PreCompact`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `PreCompact`. This protects the pre-compaction hook contract from being mixed with other hook events.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("PreCompact")`.
+**Data flow**: It ignores the generator input, asks `string_const_schema` for a constant-string schema, and returns that schema.
 
-**Call relations**: Used by pre-compact input schema annotations.
+**Call relations**: The pre-compact input schema uses this when describing its hook event name. The shared constant-string helper does the real construction.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1216,11 +1254,11 @@ fn pre_compact_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn post_compact_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `PostCompact`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `PostCompact`. This makes the generated schema precise for post-compaction hooks.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("PostCompact")`.
+**Data flow**: It receives a schema generator value but does not use it. It returns a schema that only permits the string `PostCompact`.
 
-**Call relations**: Used by post-compact input schema annotations.
+**Call relations**: The post-compact input schema calls on this through its schema annotation. It hands the fixed value to `string_const_schema`.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1231,11 +1269,11 @@ fn post_compact_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn pre_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `PreToolUse`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `PreToolUse`. This is important because pre-tool hooks can affect permission or tool input decisions.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("PreToolUse")`.
+**Data flow**: It ignores the generator input and returns a constant-string schema for `PreToolUse`.
 
-**Call relations**: Used by pre-tool-use input and hook-specific output schema annotations.
+**Call relations**: Pre-tool-use input and output schema generation uses this for event-name fields. Like the other event-name helpers, it delegates to `string_const_schema`.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1246,11 +1284,11 @@ fn pre_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn permission_request_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `PermissionRequest`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `PermissionRequest`. This keeps permission-request output from masquerading as another hook response.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("PermissionRequest")`.
+**Data flow**: It receives but does not inspect the schema generator. It returns a schema object that accepts only the `PermissionRequest` string.
 
-**Call relations**: Used by permission-request input and hook-specific output schema annotations.
+**Call relations**: Permission-request input and hook-specific output schemas use this function. It relies on `string_const_schema` for the shared constant-value logic.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1261,11 +1299,11 @@ fn permission_request_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Sche
 fn user_prompt_submit_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `UserPromptSubmit`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `UserPromptSubmit`. This makes user-prompt hook schemas specific and self-checking.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("UserPromptSubmit")`.
+**Data flow**: It takes the unused generator input, sends the fixed event name to `string_const_schema`, and returns the resulting schema.
 
-**Call relations**: Used by user-prompt-submit input and hook-specific output schema annotations.
+**Call relations**: User-prompt-submit input and output schema generation uses this for the event-name field. Tests also check that these event-specific output rules remain correct.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1276,11 +1314,11 @@ fn user_prompt_submit_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Sche
 fn subagent_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `SubagentStart`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `SubagentStart`. This identifies the schema as belonging to the start of a subagent run.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("SubagentStart")`.
+**Data flow**: It ignores its generator argument and returns the constant-string schema for `SubagentStart`.
 
-**Call relations**: Used by subagent-start input and hook-specific output schema annotations.
+**Call relations**: Subagent-start input and output schema generation uses this through field annotations. It shares construction with the other event-name helpers through `string_const_schema`.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1291,11 +1329,11 @@ fn subagent_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn subagent_stop_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `SubagentStop`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `SubagentStop`. This identifies hook input for the end of a subagent run.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("SubagentStop")`.
+**Data flow**: It receives an unused generator and produces a schema that permits only the `SubagentStop` string.
 
-**Call relations**: Used by subagent-stop input schema annotations.
+**Call relations**: Subagent-stop input schema generation calls this through its annotation. The actual constant-string object comes from `string_const_schema`.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1306,11 +1344,11 @@ fn subagent_stop_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn stop_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Produces the schema for a `hook_event_name` field fixed to `Stop`.
+**Purpose**: Creates a schema rule saying the hook event name must be exactly `Stop`. This keeps the final stop hook’s input clearly separated from other hook types.
 
-**Data flow**: Ignores the generator → returns `string_const_schema("Stop")`.
+**Data flow**: It ignores the generator input and returns a constant-string schema for `Stop`.
 
-**Call relations**: Used by stop input schema annotations.
+**Call relations**: The stop input schema uses this for its event-name field. It delegates to `string_const_schema`, like all event-name schema helpers.
 
 *Call graph*: calls 1 internal fn (string_const_schema).
 
@@ -1321,11 +1359,11 @@ fn stop_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema
 fn permission_mode_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Constrains permission mode fields to the supported wire enum values.
+**Purpose**: Creates the list of allowed permission-mode strings for hook inputs. This prevents hook schemas from accepting arbitrary permission mode names.
 
-**Data flow**: Ignores the generator → passes the fixed string slice `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` to `string_enum_schema` → returns the resulting schema.
+**Data flow**: It receives an unused schema generator. It passes the allowed permission mode words to `string_enum_schema`, which returns a schema allowing only those values.
 
-**Call relations**: Referenced by many hook input structs so their `permission_mode` field is schema-enforced rather than free-form.
+**Call relations**: Hook input types use this annotation on their `permission_mode` field. It relies on `string_enum_schema` to build the reusable “one of these strings” schema.
 
 *Call graph*: calls 1 internal fn (string_enum_schema).
 
@@ -1336,11 +1374,11 @@ fn permission_mode_schema(_gen: &mut SchemaGenerator) -> Schema
 fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Constrains session-start `source` to the supported startup/resume lifecycle values.
+**Purpose**: Creates the list of allowed reasons a session-start hook may be running, such as startup or resume. This makes the source field predictable for hook authors.
 
-**Data flow**: Ignores the generator → returns `string_enum_schema(&["startup", "resume", "clear", "compact"])`.
+**Data flow**: It ignores the generator input and passes the allowed source strings to `string_enum_schema`. The output is a schema that only accepts those source values.
 
-**Call relations**: Used only by `SessionStartCommandInput`.
+**Call relations**: The session-start input schema uses this for its `source` field. It shares the enum-building helper with permission modes and compaction triggers.
 
 *Call graph*: calls 1 internal fn (string_enum_schema).
 
@@ -1351,11 +1389,11 @@ fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema
 fn compaction_trigger_schema(_gen: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Constrains compact hook `trigger` fields to `manual` or `auto`.
+**Purpose**: Creates the list of allowed compaction trigger strings. Compaction means shortening or summarizing context, and this field says whether that happened manually or automatically.
 
-**Data flow**: Ignores the generator → returns `string_enum_schema(&["manual", "auto"])`.
+**Data flow**: It receives an unused generator and passes `manual` and `auto` to `string_enum_schema`. The result is a schema that accepts only those two strings.
 
-**Call relations**: Used by both pre-compact and post-compact input schemas.
+**Call relations**: Pre-compact and post-compact input schemas use this for their `trigger` field. It delegates the common string-enum work to `string_enum_schema`.
 
 *Call graph*: calls 1 internal fn (string_enum_schema).
 
@@ -1366,11 +1404,11 @@ fn compaction_trigger_schema(_gen: &mut SchemaGenerator) -> Schema
 fn string_const_schema(value: &str) -> Schema
 ```
 
-**Purpose**: Builds a JSON Schema object for a string field with one exact allowed value.
+**Purpose**: Builds a JSON Schema object for a string field that may have only one exact value. It is the shared helper behind all event-name schema rules.
 
-**Data flow**: Takes a `&str` constant → creates a `SchemaObject` with `instance_type = String` and `const_value = Value::String(value)` → wraps it as `Schema::Object` and returns it.
+**Data flow**: It receives the one allowed string. It creates a schema object whose type is string and whose constant value is that string, then returns it.
 
-**Call relations**: Shared helper behind all event-name schema functions.
+**Call relations**: All hook-event-name schema helpers call this. That keeps every event-specific field built the same way instead of duplicating schema construction many times.
 
 *Call graph*: called by 10 (permission_request_hook_event_name_schema, post_compact_hook_event_name_schema, post_tool_use_hook_event_name_schema, pre_compact_hook_event_name_schema, pre_tool_use_hook_event_name_schema, session_start_hook_event_name_schema, stop_hook_event_name_schema, subagent_start_hook_event_name_schema, subagent_stop_hook_event_name_schema, user_prompt_submit_hook_event_name_schema); 3 external calls (default, Object, String).
 
@@ -1381,11 +1419,11 @@ fn string_const_schema(value: &str) -> Schema
 fn string_enum_schema(values: &[&str]) -> Schema
 ```
 
-**Purpose**: Builds a JSON Schema object for a string field restricted to a finite set of values.
+**Purpose**: Builds a JSON Schema object for a string field that may be one of several fixed values. It is used when a field has a small menu of legal choices.
 
-**Data flow**: Takes a slice of string literals → creates a `SchemaObject` with `instance_type = String` and `enum_values` populated from those literals → returns `Schema::Object`.
+**Data flow**: It receives a slice of allowed string values. It turns each one into a JSON string value, stores them as the schema’s enum values, and returns a string schema object.
 
-**Call relations**: Shared helper behind permission mode, session source, and compaction trigger schema functions.
+**Call relations**: `permission_mode_schema`, `session_start_source_schema`, and `compaction_trigger_schema` call this. It provides the common “choose from this list” behavior for those fields.
 
 *Call graph*: called by 3 (compaction_trigger_schema, permission_mode_schema, session_start_source_schema); 2 external calls (default, Object).
 
@@ -1396,11 +1434,11 @@ fn string_enum_schema(values: &[&str]) -> Schema
 fn default_continue() -> bool
 ```
 
-**Purpose**: Provides the serde default for hook outputs' `continue` flag.
+**Purpose**: Provides the default value for the shared hook output field `continue`. If a hook output omits that field, the system treats it as true.
 
-**Data flow**: Reads no inputs or state → returns `true`.
+**Data flow**: It takes no input and always returns `true`. During deserialization, serde uses that value when the JSON does not include `continue`.
 
-**Call relations**: Referenced by `HookUniversalOutputWire` so omitted `continue` fields default to continuing execution.
+**Call relations**: The shared output type references this as its default function. That means every hook output gets the same default behavior unless it explicitly says otherwise.
 
 
 ##### `tests::expected_fixture`  (lines 869–933)
@@ -1409,11 +1447,11 @@ fn default_continue() -> bool
 fn expected_fixture(name: &str) -> &'static str
 ```
 
-**Purpose**: Maps a fixture filename constant to the corresponding checked-in schema file contents embedded at compile time.
+**Purpose**: Returns the checked-in expected schema text for a fixture filename. It lets tests compare freshly generated schemas with the project’s committed schema files.
 
-**Data flow**: Takes a fixture name string → matches it against all known fixture constants and returns the `include_str!` contents for that generated schema file; panics on an unexpected name.
+**Data flow**: It receives a fixture filename. For known names, it returns the matching embedded file contents; for an unexpected name, it stops the test with an error.
 
-**Call relations**: Used by the fixture parity test to compare regenerated schemas against repository snapshots.
+**Call relations**: `tests::generated_hook_schemas_match_fixtures` calls this while looping over every schema fixture. It is the test-side lookup table for expected output.
 
 *Call graph*: 2 external calls (include_str!, panic!).
 
@@ -1424,11 +1462,11 @@ fn expected_fixture(name: &str) -> &'static str
 fn normalize_newlines(value: &str) -> String
 ```
 
-**Purpose**: Normalizes CRLF to LF so fixture comparisons are platform-independent.
+**Purpose**: Makes text comparisons ignore Windows versus Unix line ending differences. This keeps schema tests focused on content, not the operating system that read the file.
 
-**Data flow**: Takes `&str` → replaces `"\r\n"` with `"\n"` → returns the normalized `String`.
+**Data flow**: It receives a string and replaces carriage-return-plus-newline sequences with plain newline characters. It returns the normalized string.
 
-**Call relations**: Applied to both expected and actual schema text in the fixture comparison test.
+**Call relations**: `tests::generated_hook_schemas_match_fixtures` uses this on both expected and actual schema text before comparing them.
 
 
 ##### `tests::assert_output_hook_event_name_const`  (lines 939–951)
@@ -1437,11 +1475,11 @@ fn normalize_newlines(value: &str) -> String
 fn assert_output_hook_event_name_const(definition: &str, expected: &str)
 ```
 
-**Purpose**: Asserts that a generated output schema definition pins `hookEventName` to the expected event-specific constant.
+**Purpose**: Checks that a generated output schema says its hook-specific `hookEventName` field is one exact event name. This guards against accidentally making output schemas too loose.
 
-**Data flow**: Generic over `T: JsonSchema`; takes a definition name and expected string → generates schema JSON bytes with `schema_json::<T>()`, parses them to `Value`, and compares the nested `definitions[definition].properties.hookEventName` object against the expected `{const,type}` JSON.
+**Data flow**: It receives the schema definition name and the expected event name. It generates and parses the schema for the chosen output type, looks up that definition’s `hookEventName` property, and asserts that it contains the expected `const` string rule.
 
-**Call relations**: Called by the output-schema event-name test for each hook-specific output type.
+**Call relations**: `tests::hook_specific_output_event_names_are_event_specific_in_output_schemas` calls this for each output type that has hook-specific output. It uses `schema_json` to inspect the generated contract rather than hand-written expectations.
 
 *Call graph*: 2 external calls (assert_eq!, from_slice).
 
@@ -1452,11 +1490,11 @@ fn assert_output_hook_event_name_const(definition: &str, expected: &str)
 fn generated_hook_schemas_match_fixtures()
 ```
 
-**Purpose**: Verifies that regenerating all hook schemas produces exactly the checked-in fixture files.
+**Purpose**: Verifies that regenerated hook schemas exactly match the checked-in fixture files. This catches accidental contract changes.
 
-**Data flow**: Creates a temporary schema root → runs `write_schema_fixtures` → iterates over every fixture constant, loads expected embedded text and actual generated file text, normalizes newlines, and asserts equality.
+**Data flow**: It creates a temporary schema directory, calls `write_schema_fixtures` to generate all schema files there, then loops through every expected fixture. For each one, it reads the generated file, normalizes line endings on both sides, and asserts that the text matches.
 
-**Call relations**: This is the broad regression test guarding accidental schema drift.
+**Call relations**: This is the main regression test for schema generation. It drives the same generation path used to refresh fixtures and relies on `expected_fixture` and `normalize_newlines` for comparison.
 
 *Call graph*: calls 1 internal fn (write_schema_fixtures); 5 external calls (new, assert_eq!, expected_fixture, normalize_newlines, read_to_string).
 
@@ -1467,11 +1505,11 @@ fn generated_hook_schemas_match_fixtures()
 fn hook_specific_output_event_names_are_event_specific_in_output_schemas()
 ```
 
-**Purpose**: Checks that each hook-specific output payload schema uses its own event-name constant rather than the broader enum.
+**Purpose**: Checks that each hook-specific output schema names the correct hook event. This prevents broad output schemas where, for example, a post-tool-use response could claim to be a pre-tool-use response.
 
-**Data flow**: Calls `assert_output_hook_event_name_const` for permission-request, post-tool-use, pre-tool-use, session-start, subagent-start, and user-prompt-submit output schemas.
+**Data flow**: It has no external input. It calls the event-name assertion helper with each relevant output type, schema definition name, and expected event string, and the test passes only if all generated schemas contain the right constants.
 
-**Call relations**: Focused regression test for the custom `schema_with` annotations on nested output structs.
+**Call relations**: This test is a coordinator for `tests::assert_output_hook_event_name_const`. It covers permission request, tool-use, session-start, subagent-start, and user-prompt-submit output schemas.
 
 
 ##### `tests::turn_scoped_hook_inputs_include_codex_turn_id_extension`  (lines 1018–1082)
@@ -1480,11 +1518,11 @@ fn hook_specific_output_event_names_are_event_specific_in_output_schemas()
 fn turn_scoped_hook_inputs_include_codex_turn_id_extension()
 ```
 
-**Purpose**: Confirms that all turn-scoped hook input schemas include a required string `turn_id` field.
+**Purpose**: Verifies that hook inputs which happen during a turn include a required `turn_id` field. A turn is one round of user-and-assistant interaction, and this ID lets internal hooks connect work to that round.
 
-**Data flow**: Generates and parses schema JSON for each relevant input type → inspects `properties.turn_id.type` and the `required` array → asserts that `turn_id` is present and required in every schema.
+**Data flow**: It generates schemas for all turn-scoped hook input types, parses each schema as JSON, and checks that `turn_id` is a string and appears in the required-fields list.
 
-**Call relations**: Protects the intentional Codex extension that diverges from public Claude hook docs.
+**Call relations**: This test directly inspects schemas produced by `schema_json`. It protects a Codex-specific extension that intentionally goes beyond Claude’s public hook documentation.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_slice).
 
@@ -1495,11 +1533,11 @@ fn turn_scoped_hook_inputs_include_codex_turn_id_extension()
 fn subagent_context_fields_are_optional_for_hooks_that_run_inside_subagents()
 ```
 
-**Purpose**: Verifies that `agent_id` and `agent_type` appear as optional flat string fields on hook inputs that may execute inside subagents.
+**Purpose**: Verifies that `agent_id` and `agent_type` are available in relevant hook schemas but are not required. This allows the same hook shape to work both inside and outside subagents.
 
-**Data flow**: Generates schemas for the affected input types → parses each to `Value` → asserts both properties have type `string` and are absent from the `required` list.
+**Data flow**: It generates schemas for hooks that may run inside subagents, parses each schema, checks that the subagent fields are strings, and confirms they are not listed as required fields.
 
-**Call relations**: Regression test for the optional subagent context contract encoded in several input structs.
+**Call relations**: This test uses `schema_json` to inspect the generated input contracts. It supports the behavior implemented by `SubagentCommandInputFields::from`, where absent subagent context should simply omit those fields.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_slice).
 
@@ -1510,24 +1548,26 @@ fn subagent_context_fields_are_optional_for_hooks_that_run_inside_subagents()
 fn subagent_context_fields_serialize_flat_and_omit_when_absent()
 ```
 
-**Purpose**: Checks the runtime JSON shape of subagent context fields when present and when absent.
+**Purpose**: Checks the actual JSON produced for hook inputs with and without subagent context. It proves the subagent fields appear as normal top-level fields when present and disappear when absent.
 
-**Data flow**: Builds `SubagentCommandInputFields` from a concrete `SubagentHookContext`, inserts those values into a `PreToolUseCommandInput`, serializes to JSON, and asserts flat `agent_id`/`agent_type` keys are present; then serializes a root-level input with both fields `None` and asserts those keys are omitted.
+**Data flow**: It first builds subagent fields from a sample subagent context, creates a pre-tool-use input, serializes it to JSON, and compares it with the expected object. Then it creates a similar input with no subagent fields and asserts that `agent_id` and `agent_type` are missing.
 
-**Call relations**: Uses both `SubagentCommandInputFields::from` and `NullableString::from_path` to validate the intended serialization behavior of shared hook input construction.
+**Call relations**: This test calls `SubagentCommandInputFields::from` and `NullableString::from_path` while building realistic input objects. It confirms the serialization behavior that runtime hook input builders depend on.
 
 *Call graph*: calls 2 internal fn (from_path, from); 3 external calls (assert_eq!, json!, to_value).
 
 
 ### `hooks/src/engine/schema_loader.rs`
 
-`generated` · `startup or first schema access`
+`data_model` · `first use during hook engine setup or validation; then reused cross-cutting`
 
-This file is a small schema registry around a `GeneratedHookSchemas` struct whose fields hold `serde_json::Value` documents for every generated hook schema pair: pre/post tool use, permission request, pre/post compact, session start, subagent start/stop, user prompt submit, and stop. The schemas are embedded at compile time with `include_str!` from `schema/generated/*.schema.json`, so runtime access does not depend on filesystem reads.
+Hooks are small pieces of outside code that run at certain moments, such as before a tool is used or when a session starts. For those hooks to work safely, the system needs clear rules for what each hook may receive as input and return as output. Those rules live as generated JSON Schema files, which are machine-readable descriptions of valid JSON data.
 
-`generated_hook_schemas` uses a `OnceLock<GeneratedHookSchemas>` to parse the embedded JSON exactly once and then return a shared `'static` reference on subsequent calls. Each field is initialized by `parse_json_schema`, which deserializes the schema text and panics with a schema-specific message if any generated file is invalid. That panic is deliberate: malformed generated schemas are treated as a build/package defect, not a recoverable runtime condition.
+This file is like a binder full of official forms. Each field in `GeneratedHookSchemas` holds one form: the input or output schema for a particular hook command. The schemas are included directly in the compiled program with `include_str!`, so the program does not need to find separate schema files at runtime.
 
-The test module simply asserts that every loaded schema has top-level `"type": "object"`, which acts as a smoke test that all embedded files are present, parseable, and wired into the registry.
+The main function, `generated_hook_schemas`, uses `OnceLock`, which is a one-time storage cell. The first time someone asks for the schemas, it parses all the embedded JSON strings into `serde_json::Value` objects. After that, it returns the same already-parsed copy every time. This avoids repeated parsing and ensures every caller sees the same schema set.
+
+If any generated schema is not valid JSON, `parse_json_schema` stops the program with a clear panic message naming the broken schema. The test at the bottom checks that every loaded schema looks like a JSON object, catching missing or malformed generated schema files early.
 
 #### Function details
 
@@ -1537,11 +1577,11 @@ The test module simply asserts that every loaded schema has top-level `"type": "
 fn generated_hook_schemas() -> &'static GeneratedHookSchemas
 ```
 
-**Purpose**: Returns the singleton bundle of parsed generated hook schemas. On first use it parses every embedded schema file and stores the resulting `GeneratedHookSchemas` in a `OnceLock`.
+**Purpose**: Provides the complete set of generated hook command schemas as one shared, read-only collection. Code uses it when it needs to validate or understand the expected input and output shape for hook commands.
 
-**Data flow**: Reads the static `SCHEMAS` cell → if uninitialized, constructs `GeneratedHookSchemas` by calling `parse_json_schema` on each `include_str!` JSON schema payload → stores the struct in `OnceLock` → returns a shared reference to the cached bundle.
+**Data flow**: Nothing is passed in. On the first call, it reads the schema text embedded in the program, parses each JSON schema into a general JSON value, and stores the full collection in a one-time global cell. It returns a shared reference to that collection; later calls skip the parsing and return the same stored reference.
 
-**Call relations**: Called by engine initialization code that needs schema access and by the unit test that validates the embedded registry.
+**Call relations**: This is the public doorway for this file. A higher-level `new` constructor calls it when building something that needs hook schemas, and the test `tests::loads_generated_hook_schemas` calls it to prove the schemas load correctly. Inside, it relies on one-time initialization so callers do not each rebuild the same schema set.
 
 *Call graph*: called by 2 (new, loads_generated_hook_schemas); 1 external calls (new).
 
@@ -1552,11 +1592,11 @@ fn generated_hook_schemas() -> &'static GeneratedHookSchemas
 fn parse_json_schema(name: &str, schema: &str) -> Value
 ```
 
-**Purpose**: Parses one embedded schema string into `serde_json::Value` and panics with context if parsing fails. It is the low-level loader used for every schema field.
+**Purpose**: Turns one embedded schema file from raw text into a JSON value the program can inspect. It also gives a clear failure message if a generated schema is broken.
 
-**Data flow**: Takes a schema name and raw JSON string → calls `serde_json::from_str` → returns the parsed `Value` on success, or panics with `invalid generated hooks schema {name}: {err}` on failure.
+**Data flow**: It receives a human-readable schema name and the schema text. It asks `serde_json` to parse the text as JSON. If parsing succeeds, it returns the parsed JSON value; if parsing fails, it stops with an error message that includes the schema name and the parsing problem.
 
-**Call relations**: Used only during `generated_hook_schemas` initialization so each field gets a parsed JSON document.
+**Call relations**: This is the small checker used while building the full schema collection in `generated_hook_schemas`. It hands the actual JSON parsing work to `serde_json::from_str`, then either returns the parsed value or reports that the generated schema is invalid.
 
 *Call graph*: 1 external calls (from_str).
 
@@ -1567,10 +1607,10 @@ fn parse_json_schema(name: &str, schema: &str) -> Value
 fn loads_generated_hook_schemas()
 ```
 
-**Purpose**: Smoke-tests that all embedded generated schemas load and look like object schemas. It verifies the registry wiring rather than schema semantics.
+**Purpose**: Checks that every generated hook schema can be loaded and has the expected top-level JSON Schema shape. This helps catch broken generated schema files during testing instead of at runtime.
 
-**Data flow**: Calls `generated_hook_schemas()` → indexes each schema field at `["type"]` → asserts each equals `"object"`.
+**Data flow**: The test asks `generated_hook_schemas` for the shared schema collection. It then looks at the `type` field of each schema and compares it with the string `object`. The result is no returned value; the test passes if all comparisons match and fails if any schema is missing, malformed, or not shaped as expected.
 
-**Call relations**: Exercises the lazy initialization path and confirms every embedded schema file is reachable through the registry.
+**Call relations**: This test exercises the same loading path used by production code. It calls `generated_hook_schemas`, which triggers parsing if needed, and then uses assertions to verify each loaded schema. In that way, it guards the schema loader against bad generated files.
 
 *Call graph*: calls 1 internal fn (generated_hook_schemas); 1 external calls (assert_eq!).

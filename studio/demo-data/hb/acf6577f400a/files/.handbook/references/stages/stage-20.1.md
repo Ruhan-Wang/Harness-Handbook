@@ -1,8 +1,10 @@
 # Analytics event modeling, reduction, and emitters  `stage-20.1`
 
-This stage is the analytics subsystem’s runtime backbone: a cross-cutting service used throughout execution to turn low-level observations into outbound telemetry. At its core, facts.rs defines the in-memory observation model—turn lifecycle facts, plugin/app/hook inputs, and normalized failures—while events.rs defines the wire-format event schemas and the conversions from facts into serialized payloads, including guardian-review timing/session context. accepted_lines.rs covers a specialized analytics path for diff ingestion, parsing accepted lines from unified diffs, hashing paths and added content, and deriving repository attribution without exposing raw remotes.
+This stage is shared behind-the-scenes support for understanding how Codex is used. It does not do the main user work itself. Instead, it watches important moments, turns them into safe structured records, combines related pieces, and sends them out without slowing the app.
 
-The reducer in reducer.rs is the central coordinator. It consumes protocol and custom facts over time, correlates related notifications and requests, and emits finalized TrackEventRequest records only when enough context has been assembled. client.rs exposes that machinery to the rest of the system: callers record facts, the client reduces them on a background queue, deduplicates per-turn app/plugin usage, and delivers batches via HTTP or a debug file. app-server/src/analytics_utils.rs wires this client into app-server startup from auth/config, and ext/goal/src/analytics.rs adds goal-specific emitters for creation, usage, status, and clearing events.
+The process starts with facts.rs, which defines “facts”: small records such as an error, a tool run, a setting, or a turn result. events.rs defines the final analytics “vocabulary,” meaning the event shapes that can be sent. lib.rs is the public doorway that other code imports, with a few shared helpers.
+
+accepted_lines.rs measures accepted code changes as line counts, and hashes repository identity so raw remote URLs are not exposed. reducer.rs acts like an assembler: it remembers context across requests, responses, turns, tools, reviews, and threads, then reduces scattered facts into meaningful events. client.rs sends those events in the background. app-server/src/analytics_utils.rs wires the client to the server’s login and configuration. ext/goal/src/analytics.rs adapts goal activity into the same event system.
 
 ## Files in this stage
 
@@ -11,13 +13,15 @@ These files define the analytics crate surface along with the internal facts and
 
 ### `analytics/src/facts.rs`
 
-`data_model` · `cross-cutting; facts are created throughout request handling and consumed during analytics reduction`
+`data_model` · `cross-cutting analytics event creation`
 
-This file collects the raw and semi-normalized inputs consumed by the analytics reducer. `AnalyticsFact` is the top-level envelope spanning protocol-surface observations (`Initialize`, client/server requests and responses, notifications) and `CustomAnalyticsFact` values for analytics-only signals such as compaction, guardian review, turn config resolution, token usage, skill invocation, and plugin state changes. Supporting structs like `TrackEventsContext`, `TurnResolvedConfigFact`, `TurnTokenUsageFact`, `TurnProfileFact`, `CodexCompactionEvent`, and `CodexGoalEvent` preserve the exact identifiers and counters later needed to build final event payloads.
+This file is like a set of standardized forms for the analytics pipeline. Instead of every part of the program inventing its own way to describe an event, this file defines shared shapes for important facts: how a turn was configured, how many tokens it used, whether it failed, what kind of error happened, whether a user steering request was accepted, which skill or plugin was used, and so on.
 
-The file also defines several enums that intentionally narrow broader protocol/core concepts into analytics-safe categories. `CodexErrKind` collapses the large `CodexErr` space into a serializable taxonomy while preserving optional HTTP status separately in `TurnCodexError`. `TurnSteerRejectionReason` similarly unifies request-level and input-level steer failures through `From` conversions from `TurnSteerRequestError` and `InputError`.
+Most of the file is data definitions. A “fact” here means a compact record of something that happened. For example, a turn may produce a configuration fact, a token-usage fact, a timing profile fact, and possibly an error fact. These facts carry stable labels, such as `snake_case` names, so analytics output stays predictable even if the internal Rust type names change.
 
-Most behavior here is conversion-oriented. `build_track_events_context` packages model/thread/turn IDs for repeated use by app/plugin/hook event helpers. `TurnCodexErrorFact::from_codex_err` and `TurnCodexError::from_codex_err` snapshot a `CodexErr` into analytics-friendly fields at the time of failure, avoiding later dependence on richer error internals. The rest of the file is intentionally data-heavy and behavior-light so the reducer can accumulate facts without needing protocol-specific logic scattered across the codebase.
+The file also includes a few small conversion helpers. These translate detailed internal errors into simpler analytics categories. That matters because analytics usually needs counts and trends, not full private error details. For example, many different error values are reduced to a `CodexErrKind`, with an optional HTTP status code kept when available.
+
+Without this file, analytics events would be scattered, inconsistent, and harder to compare across clients, turns, and sessions.
 
 #### Function details
 
@@ -31,11 +35,11 @@ fn build_track_events_context(
 ) -> TrackEventsContext
 ```
 
-**Purpose**: Packages the current model, thread, and turn identifiers into the reusable context object used by several analytics helpers.
+**Purpose**: Creates a small tracking bundle that identifies the model, thread, and turn connected to an analytics event. Other code uses this bundle so skill, app, hook, and plugin events can be tied back to the right conversation moment.
 
-**Data flow**: Consumes three `String` arguments (`model_slug`, `thread_id`, `turn_id`) and returns a `TrackEventsContext` containing those values unchanged.
+**Data flow**: It receives three strings: the model name, the thread ID, and the turn ID. It places those values unchanged into a new `TrackEventsContext` record. The result is returned to the caller; nothing else is changed.
 
-**Call relations**: Called by upstream analytics producers before emitting app, hook, plugin, or skill facts. It is a simple constructor with no downstream delegation.
+**Call relations**: This is a convenience constructor for code that is about to record analytics. It does not call other project logic. Its output is later embedded in event inputs such as skill invocations, app mentions, hook runs, and plugin usage records.
 
 
 ##### `TurnCodexErrorFact::from_codex_err`  (lines 129–135)
@@ -44,11 +48,11 @@ fn build_track_events_context(
 fn from_codex_err(thread_id: String, turn_id: String, error: &CodexErr) -> Self
 ```
 
-**Purpose**: Builds a turn-scoped analytics error fact from a richer `CodexErr` value.
+**Purpose**: Builds an analytics-friendly error fact for a failed turn. It keeps the thread and turn identifiers, then converts the detailed internal Codex error into the simpler error shape used for reporting.
 
-**Data flow**: Consumes `thread_id`, `turn_id`, and a borrowed `CodexErr`. It delegates error normalization to `TurnCodexError::from_codex_err`, stores the resulting simplified error alongside the identifiers, and returns a `TurnCodexErrorFact`.
+**Data flow**: It takes a thread ID, a turn ID, and a reference to a `CodexErr`, which is the program’s internal error type. It copies the IDs into a new `TurnCodexErrorFact` and asks `TurnCodexError::from_codex_err` to simplify the error. The returned fact can then be sent through analytics.
 
-**Call relations**: Used when turn failures are recorded for analytics, including explicit turn error tracking and failure-event tests. It is the public constructor that bridges core errors into reducer-consumable facts.
+**Call relations**: This is called when turn failure information is being recorded, including by `turn_lifecycle_emits_failed_turn_event` and `track_turn_codex_error`. It hands the actual error conversion to `TurnCodexError::from_codex_err`, keeping this function focused on wrapping the converted error with turn and thread context.
 
 *Call graph*: calls 1 internal fn (from_codex_err); called by 2 (turn_lifecycle_emits_failed_turn_event, track_turn_codex_error).
 
@@ -59,11 +63,11 @@ fn from_codex_err(thread_id: String, turn_id: String, error: &CodexErr) -> Self
 fn from_codex_err(error: &CodexErr) -> Self
 ```
 
-**Purpose**: Extracts the analytics-relevant pieces of a `CodexErr`: its normalized kind and optional HTTP status code.
+**Purpose**: Converts a detailed Codex error into the compact error information analytics needs: a broad error kind and, when relevant, an HTTP status code. This avoids sending overly detailed internal error data while still preserving useful troubleshooting signals.
 
-**Data flow**: Reads a borrowed `CodexErr`, converts it into `CodexErrKind` via `Into`, reads `http_status_code_value()`, and returns a `TurnCodexError` containing those two fields.
+**Data flow**: It receives a `CodexErr`. First it converts that error into a `CodexErrKind`, a simpler category such as timeout, quota exceeded, or invalid request. Then it reads any HTTP status code attached to the error. It returns a `TurnCodexError` containing those two pieces of information.
 
-**Call relations**: Called only by `TurnCodexErrorFact::from_codex_err` so callers do not need to know the normalization details.
+**Call relations**: This function is used by `TurnCodexErrorFact::from_codex_err` whenever a failed turn is turned into an analytics fact. It relies on the `CodexErrKind::from` conversion for the category and on the error’s `http_status_code_value` method for the optional status code.
 
 *Call graph*: calls 1 internal fn (http_status_code_value); called by 1 (from_codex_err); 1 external calls (into).
 
@@ -74,11 +78,11 @@ fn from_codex_err(error: &CodexErr) -> Self
 fn from(error: &CodexErr) -> Self
 ```
 
-**Purpose**: Maps each supported `CodexErr` variant into the analytics error taxonomy.
+**Purpose**: Maps each detailed `CodexErr` variant to a stable analytics category. This gives dashboards and reports a consistent vocabulary for error types, even though the original error may carry extra details.
 
-**Data flow**: Consumes a borrowed `CodexErr`, pattern-matches every variant, and returns the corresponding `CodexErrKind`. Linux-only Landlock variants are conditionally compiled to preserve platform-specific fidelity.
+**Data flow**: It receives a reference to a `CodexErr`. It checks which kind of error it is and returns the matching `CodexErrKind`, ignoring extra fields like messages, paths, or nested error details. On Linux builds, it also includes Linux-specific sandbox error categories.
 
-**Call relations**: Used indirectly through `TurnCodexError::from_codex_err` whenever a turn error is captured for analytics.
+**Call relations**: This conversion is used when `TurnCodexError::from_codex_err` simplifies a turn error for analytics. It sits at the boundary between detailed runtime failure information and the cleaner labels that analytics consumers can group and count.
 
 
 ##### `TurnSteerRejectionReason::from`  (lines 309–314)
@@ -87,22 +91,24 @@ fn from(error: &CodexErr) -> Self
 fn from(error: InputError) -> Self
 ```
 
-**Purpose**: Converts a `TurnSteerRequestError` into the serialized analytics rejection reason for turn-steer failures.
+**Purpose**: Converts a failed turn-steering request into the analytics reason that explains why it was rejected. A turn-steering request is an attempt to guide or modify an active turn while it is running.
 
-**Data flow**: Consumes a `TurnSteerRequestError`, matches its variant, and returns the corresponding `TurnSteerRejectionReason`.
+**Data flow**: It receives a `TurnSteerRequestError`, such as there being no active turn or the expected turn not matching. It returns the corresponding `TurnSteerRejectionReason` with the same plain meaning. No outside state is read or changed.
 
-**Call relations**: Used by reducer error handling through `rejection_reason_from_error_type` when a turn-steer request fails before acceptance.
+**Call relations**: This conversion is used when code records a steering attempt that was rejected. It translates the request-layer error into the analytics-layer reason so the final `CodexTurnSteerEvent` can report both the rejection result and why it happened.
 
 
 ### `analytics/src/events.rs`
 
-`data_model` · `cross-cutting; whenever analytics events are constructed for emission`
+`data_model` · `cross-cutting analytics event creation`
 
-This file is the schema layer for analytics emission. Nearly every analytics event shape is represented as a `#[derive(Serialize)]` struct or enum, including thread initialization, turn lifecycle, compaction, goals, hook runs, app/plugin usage, tool-item events, guardian reviews, and accepted-line fingerprints. `TrackEventRequest` is the central untagged enum that wraps all outbound event variants; its `should_send_in_isolated_request` special-cases accepted-line fingerprint uploads so they can be sent separately from normal batches.
+This file is mostly a catalog of analytics messages. When Codex wants to report something that happened, such as a thread starting, a plugin being used, a command running, or a guardian review approving or denying an action, the data must be packaged in a predictable format. These structs and enums are that format. They are marked for serialization, meaning they can be converted into data such as JSON for an analytics service.
 
-A notable cluster of types models guardian review telemetry in detail: `GuardianReviewedAction` captures the reviewed operation shape, `GuardianReviewTrackContext` stores immutable identifiers plus a wall-clock start timestamp and `Instant`, and `GuardianReviewAnalyticsResult` carries the eventual decision/session outcome. `GuardianReviewTrackContext::event_params` merges those two sources, converts millisecond timestamps to seconds for `started_at`/`completed_at`, computes `completion_latency_ms` from elapsed monotonic time, and extracts token counts from optional `TokenUsage`.
+The file also includes a few translator functions. Internal code often records events in project-specific types, like hook names, plugin metadata, or compaction facts. The helpers here copy the useful fields, add common context such as thread ID, turn ID, product client ID, runtime operating system, and Codex version, and produce the final analytics event parameters.
 
-The helper functions are concrete mappers from internal facts to event payloads. They preserve thread/turn/model context from `TrackEventsContext`, normalize hook names/sources/statuses into analytics-friendly strings, derive plugin metadata including remote-plugin overrides and connector IDs, and build compaction/goal payloads by copying all fact fields plus session/runtime/client metadata. `current_runtime_metadata` snapshots package version and OS details, while `subagent_thread_started_event_request` synthesizes a full `codex_thread_initialized` event for in-process subagent threads with `rpc_transport` fixed to `InProcess` and `thread_source` fixed to `Subagent`.
+A useful analogy is a set of pre-printed forms. Each kind of event has its own form with required boxes. Other parts of the system fill in the facts, and this file makes sure the boxes have the right names and values before the form is sent.
+
+One important behavior is that accepted line fingerprint events are marked to be sent alone, not batched with other events. Guardian review tracking also records both wall-clock timestamps and elapsed time, so analytics can later answer how long reviews took and what result they reached.
 
 #### Function details
 
@@ -112,11 +118,11 @@ The helper functions are concrete mappers from internal facts to event payloads.
 fn should_send_in_isolated_request(&self) -> bool
 ```
 
-**Purpose**: Identifies event variants that must be transmitted outside the normal batch flow. At present only `AcceptedLineFingerprints` is treated this way.
+**Purpose**: This function tells the sender whether a particular analytics event should be sent by itself instead of grouped with other events. Currently, accepted line fingerprint events get this special treatment.
 
-**Data flow**: Reads `self` by reference, pattern-matches its enum variant, and returns a `bool` indicating whether the event should be isolated. It does not mutate any state.
+**Data flow**: It receives one event request, checks which event variant it is, and returns true only when it is an accepted line fingerprints event. It does not change the event.
 
-**Call relations**: Used by the analytics sending path after reducer/event construction to decide batching behavior; it is a leaf classification helper and delegates only to the pattern match.
+**Call relations**: When analytics code is preparing events to send, this method acts like a sorting rule. It uses Rust’s pattern matching to recognize the one event type that needs an isolated request.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -133,11 +139,11 @@ fn new(
         r
 ```
 
-**Purpose**: Creates the immutable tracking context for a single guardian review attempt, capturing identifiers, reviewed action metadata, timeout, and both wall-clock and monotonic start times.
+**Purpose**: This creates a small tracking record at the moment a guardian review starts. The guardian review is the safety or approval check that decides whether an action can proceed.
 
-**Data flow**: Consumes thread/turn/review identifiers, optional target item ID, approval source, reviewed action, and timeout. It reads the current time via `now_unix_millis()` and `Instant::now()`, stores those values into a new `GuardianReviewTrackContext`, and returns it.
+**Data flow**: It takes identifiers for the thread, turn, review, optional target item, the source of the approval request, the action being reviewed, and the timeout. It stores those values and adds two start-time measurements: a Unix timestamp in milliseconds and an in-process timer for measuring elapsed time later.
 
-**Call relations**: Called when guardian review execution begins so later analytics can compute latency and reuse the same identifiers. It does not call into analytics emission directly; later code passes the resulting context to `GuardianReviewTrackContext::event_params`.
+**Call relations**: The guardian review runner calls this when a review begins. Later, the completed review uses this saved context to build a full analytics event with both the original review details and the final result.
 
 *Call graph*: called by 1 (run_guardian_review); 2 external calls (now, now_unix_millis).
 
@@ -152,11 +158,11 @@ fn event_params(
     ) -> GuardianReviewEventParams
 ```
 
-**Purpose**: Builds the final `GuardianReviewEventParams` payload by combining the stored review context with the eventual analytics result and completion timestamp.
+**Purpose**: This turns the saved guardian review context plus the final review result into the full set of analytics fields for a guardian review event.
 
-**Data flow**: Reads `self` fields, clones owned identifiers/action data, consumes a `GuardianReviewAnalyticsResult`, and takes `completed_at_ms`. It computes `completion_latency_ms` from `started_instant.elapsed()`, converts stored and completed millisecond timestamps to seconds for `started_at` and `completed_at`, maps optional `TokenUsage` into individual token counters, and returns a fully populated `GuardianReviewEventParams`.
+**Data flow**: It reads the review IDs, action, request source, timeout, and start time stored in the context. It combines them with the result, such as decision, status, failure reason, risk level, model details, token usage, and first-token timing. It outputs a GuardianReviewEventParams value ready to be serialized and sent.
 
-**Call relations**: Invoked by guardian-review tracking code once a review finishes. It is the bridge between runtime review execution and the reducer’s later `CustomAnalyticsFact::GuardianReview` ingestion.
+**Call relations**: After a guardian review finishes, the tracking layer calls this to create the event payload. It also measures elapsed time from the stored timer so the analytics event includes completion latency.
 
 *Call graph*: called by 1 (track_guardian_review); 2 external calls (elapsed, clone).
 
@@ -167,11 +173,11 @@ fn event_params(
 fn without_session() -> Self
 ```
 
-**Purpose**: Constructs the default fail-closed guardian review analytics result for cases where no guardian session metadata exists.
+**Purpose**: This creates a default guardian review result for cases where no guardian review session was successfully available. It represents a safe failure: deny the action and mark the review as failed closed.
 
-**Data flow**: Takes no inputs and returns a `GuardianReviewAnalyticsResult` with `decision` set to `Denied`, `terminal_status` to `FailedClosed`, `attempt_count` to 1, and all session/model/token-related fields set to `None` or false-like defaults.
+**Data flow**: It takes no input. It returns a GuardianReviewAnalyticsResult filled with conservative defaults: denied decision, failed-closed status, one attempt, no model/session details, no token usage, and no timing details.
 
-**Call relations**: Used by multiple guardian-review execution paths and tests as the baseline result before session-specific fields are known. `GuardianReviewAnalyticsResult::from_session` builds on top of this default.
+**Call relations**: Many guardian review paths use this as the baseline result, especially error, timeout, cancellation, or test scenarios. Other code can then overwrite specific fields if more information becomes available.
 
 *Call graph*: called by 11 (guardian_review_metrics_record_counts_durations_and_token_usage, run_guardian_review, run_guardian_review_session_before_deadline, run_ephemeral_review, run_review, wait_for_guardian_review_cancel_drains_expected_turn_after_stale_terminal_event, wait_for_guardian_review_ignores_prior_turn_aborts, wait_for_guardian_review_ignores_prior_turn_completion, wait_for_guardian_review_ignores_prior_turn_errors, wait_for_guardian_review_preserves_structured_session_error (+1 more)).
 
@@ -182,11 +188,11 @@ fn without_session() -> Self
 fn from_session(params: GuardianReviewSessionAnalyticsParams) -> Self
 ```
 
-**Purpose**: Creates a guardian review analytics result pre-populated with session/model metadata while inheriting the default fail-closed outcome fields.
+**Purpose**: This creates a guardian review analytics result when a real guardian session exists. It starts from the safe default result, then fills in the session-specific details.
 
-**Data flow**: Consumes `GuardianReviewSessionAnalyticsParams`, copies its guardian-thread/session/model/catalog fields into a new `GuardianReviewAnalyticsResult`, fills `had_prior_review_context`, and uses `without_session()` for the remaining default decision/status/token fields.
+**Data flow**: It receives session analytics details such as guardian thread ID, model, model provider, review model settings, and whether prior context existed. It returns a GuardianReviewAnalyticsResult that includes those details while keeping the default denied and failed-closed values until later code updates the actual outcome.
 
-**Call relations**: Called when a guardian review runs on an actual guardian session. It delegates to `without_session` so callers can later overwrite decision/outcome fields without re-specifying session metadata.
+**Call relations**: The review-on-session path calls this after a guardian session is chosen or created. Internally it reuses GuardianReviewAnalyticsResult::without_session so all default fields stay consistent.
 
 *Call graph*: called by 1 (run_review_on_session); 1 external calls (without_session).
 
@@ -197,11 +203,11 @@ fn from_session(params: GuardianReviewSessionAnalyticsParams) -> Self
 fn plugin_state_event_type(state: PluginState) -> &'static str
 ```
 
-**Purpose**: Maps a `PluginState` enum to the exact analytics event type string used for plugin lifecycle events.
+**Purpose**: This chooses the analytics event name for a plugin state change. For example, it maps an installed plugin to the string used for a plugin-installed event.
 
-**Data flow**: Consumes a `PluginState` value and returns a static string such as `codex_plugin_installed` or `codex_plugin_disabled`.
+**Data flow**: It receives a PluginState value, checks whether the plugin was installed, uninstalled, enabled, or disabled, and returns the matching static event type string.
 
-**Call relations**: Used by reducer plugin-state ingestion when wrapping plugin metadata into the correct `TrackEventRequest` variant and event type.
+**Call relations**: When plugin state changes are ingested, that code calls this function to pick the correct event name before packaging the plugin metadata.
 
 *Call graph*: called by 1 (ingest_plugin_state_changed).
 
@@ -215,11 +221,11 @@ fn codex_app_metadata(
 ) -> CodexAppMetadata
 ```
 
-**Purpose**: Builds the shared app invocation metadata payload for app-mentioned and app-used analytics events.
+**Purpose**: This builds the common analytics metadata for an app that was mentioned or used during a Codex turn.
 
-**Data flow**: Reads `TrackEventsContext` for `thread_id`, `turn_id`, and `model_slug`, consumes an `AppInvocation` for connector/app/invocation fields, reads the current product client ID from `originator()`, and returns a `CodexAppMetadata` struct.
+**Data flow**: It receives the current tracking context and an app invocation record. It copies the connector ID, app name, invocation type, thread ID, turn ID, and model slug, and adds the product client ID from the login originator. It returns a CodexAppMetadata value.
 
-**Call relations**: Called by reducer paths for app mention/use events and by serialization tests. It is a pure mapper with no side effects beyond reading the originator identity.
+**Call relations**: The app-used ingestion path and serialization tests call this to produce the event parameters for app mention and app use events.
 
 *Call graph*: calls 1 internal fn (originator); called by 3 (app_mentioned_event_serializes_expected_shape, app_used_event_serializes_expected_shape, ingest_app_used).
 
@@ -230,11 +236,11 @@ fn codex_app_metadata(
 fn codex_plugin_metadata(plugin: PluginTelemetryMetadata) -> CodexPluginMetadata
 ```
 
-**Purpose**: Converts `PluginTelemetryMetadata` into the normalized plugin analytics payload, including capability-derived counts and connector IDs.
+**Purpose**: This builds the basic analytics metadata for a plugin, including its identity and the capabilities it exposes.
 
-**Data flow**: Consumes `PluginTelemetryMetadata`, destructures `plugin_id`, optional `remote_plugin_id`, and optional `capability_summary`, chooses the remote ID override when present, reads `originator().value` for `product_client_id`, maps capability summary into `has_skills`, `mcp_server_count`, and a vector of connector ID strings, and returns `CodexPluginMetadata`.
+**Data flow**: It receives PluginTelemetryMetadata. It chooses a plugin ID, preferring a remote plugin ID when present and otherwise using the local plugin key. It copies the plugin name, marketplace name, skill availability, MCP server count, connector IDs, and product client ID into a CodexPluginMetadata result.
 
-**Call relations**: Used for plugin management events directly and as a sub-step of `codex_plugin_used_metadata`. Reducer plugin-state ingestion relies on it before selecting installed/uninstalled/enabled/disabled variants.
+**Call relations**: Plugin install, uninstall, enable, disable, and plugin-used events rely on this helper so plugin identity is reported the same way everywhere. The plugin-used helper calls it as its first step.
 
 *Call graph*: calls 1 internal fn (originator); called by 4 (plugin_management_event_can_use_remote_plugin_id_override, plugin_management_event_serializes_expected_shape, codex_plugin_used_metadata, ingest_plugin_state_changed).
 
@@ -250,11 +256,11 @@ fn codex_compaction_event_params(
     thread_source: Op
 ```
 
-**Purpose**: Copies a `CodexCompactionEvent` fact plus thread/session/client/runtime context into the serialized compaction event payload.
+**Purpose**: This converts an internal compaction fact into analytics event parameters. Compaction is the process of reducing or summarizing conversation context so the system can keep working within token limits.
 
-**Data flow**: Consumes the compaction fact and contextual arguments (`session_id`, `CodexAppServerClientMetadata`, `CodexRuntimeMetadata`, optional thread/subagent/parent metadata). It transfers all compaction fields unchanged into `CodexCompactionEventParams` and returns that struct.
+**Data flow**: It receives a CodexCompactionEvent plus shared context such as session ID, app server client metadata, runtime metadata, thread source, subagent source, and parent thread ID. It copies trigger, reason, implementation, phase, strategy, status, error details, token counts, image counts, timestamps, and duration into a CodexCompactionEventParams result.
 
-**Call relations**: Called by reducer compaction ingestion after thread context lookup succeeds. It is a pure assembly step before wrapping the payload in `TrackEventRequest::Compaction`.
+**Call relations**: The compaction ingestion path calls this when it needs to report a compaction event. Tests also use it to verify the serialized event shape.
 
 *Call graph*: called by 2 (compaction_event_serializes_expected_shape, ingest_compaction).
 
@@ -270,11 +276,11 @@ fn codex_goal_event_params(
     thread_source: Option<ThreadS
 ```
 
-**Purpose**: Copies a `CodexGoalEvent` fact plus session/client/runtime/thread context into the serialized goal event payload.
+**Purpose**: This converts an internal goal event into analytics event parameters. Goals describe tracked pieces of work for a thread, including progress and budget accounting.
 
-**Data flow**: Consumes the goal fact and contextual metadata, moves all goal identifiers/status/accounting fields into `CodexGoalEventParams`, and returns the assembled struct.
+**Data flow**: It receives a CodexGoalEvent plus session, client, runtime, and thread-lineage context. It copies the goal ID, event kind, goal status, token budget flag, and cumulative token or time accounting into a CodexGoalEventParams value.
 
-**Call relations**: Used by reducer goal ingestion once thread context is available. It parallels `codex_compaction_event_params` for goal analytics.
+**Call relations**: The goal ingestion path calls this before sending a goal analytics event. It provides the bridge between internal goal tracking and the analytics event schema.
 
 *Call graph*: called by 1 (ingest_goal).
 
@@ -288,11 +294,11 @@ fn codex_plugin_used_metadata(
 ) -> CodexPluginUsedMetadata
 ```
 
-**Purpose**: Builds the richer plugin-used payload that combines generic plugin metadata with MCP server names and current tracking context.
+**Purpose**: This builds the analytics metadata for a plugin-use event, which needs both plugin identity and the thread or turn where it was used.
 
-**Data flow**: Reads `TrackEventsContext` for thread/turn/model, consumes `PluginTelemetryMetadata`, extracts `mcp_server_names` from its capability summary if present, delegates to `codex_plugin_metadata` for the flattened plugin block, and returns `CodexPluginUsedMetadata`.
+**Data flow**: It receives the current tracking context and plugin telemetry metadata. It extracts MCP server names if available, builds the embedded plugin metadata with codex_plugin_metadata, and adds thread ID, turn ID, and model slug from the tracking context. It returns CodexPluginUsedMetadata.
 
-**Call relations**: Called by reducer plugin-used ingestion and tests. It layers usage context on top of the generic plugin metadata helper.
+**Call relations**: The plugin-used ingestion path calls this when a plugin is used during a turn. It delegates the shared plugin identity work to codex_plugin_metadata so plugin-use events match plugin-management events.
 
 *Call graph*: calls 1 internal fn (codex_plugin_metadata); called by 2 (plugin_used_event_serializes_expected_shape, ingest_plugin_used).
 
@@ -306,11 +312,11 @@ fn codex_hook_run_metadata(
 ) -> CodexHookRunMetadata
 ```
 
-**Purpose**: Transforms a `HookRunFact` and current tracking context into the serialized hook-run analytics payload.
+**Purpose**: This builds analytics metadata for a hook run. A hook is a user, project, system, or plugin-provided action that runs at certain points, such as before tool use or after compaction.
 
-**Data flow**: Reads `TrackEventsContext` for thread/turn/model, consumes `HookRunFact`, converts hook event name, source, and status through analytics-specific normalization helpers, and returns `CodexHookRunMetadata` with all fields wrapped in `Some(...)`.
+**Data flow**: It receives the current tracking context and a hook run fact. It adds thread ID, turn ID, model slug, a readable hook event name, a readable hook source, and a normalized hook status. It returns CodexHookRunMetadata.
 
-**Call relations**: Used by reducer hook-run ingestion. It delegates to `analytics_hook_event_name`, `analytics_hook_source`, and `analytics_hook_status` to keep normalization rules centralized.
+**Call relations**: The hook-run ingestion path calls this before sending hook analytics. It relies on three small mapper functions to translate hook event names, sources, and statuses into analytics-friendly values.
 
 *Call graph*: calls 3 internal fn (analytics_hook_event_name, analytics_hook_source, analytics_hook_status); called by 4 (hook_run_event_serializes_expected_shape, hook_run_metadata_maps_sources_and_statuses, hook_run_metadata_maps_stopped_status, ingest_hook_run).
 
@@ -321,11 +327,11 @@ fn codex_hook_run_metadata(
 fn analytics_hook_event_name(event_name: HookEventName) -> &'static str
 ```
 
-**Purpose**: Maps protocol-level `HookEventName` variants to the exact analytics string names expected downstream.
+**Purpose**: This translates a hook event enum into the exact text label expected in analytics.
 
-**Data flow**: Consumes a `HookEventName` and returns a static string such as `PreToolUse`, `SessionStart`, or `SubagentStop`.
+**Data flow**: It receives a HookEventName, checks which lifecycle point it represents, and returns a static string such as PreToolUse, PermissionRequest, or SessionStart.
 
-**Call relations**: Only called from `codex_hook_run_metadata` as part of hook event serialization.
+**Call relations**: codex_hook_run_metadata calls this while building a hook run event. Keeping the mapping here prevents each caller from inventing its own spelling.
 
 *Call graph*: called by 1 (codex_hook_run_metadata).
 
@@ -336,11 +342,11 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str
 fn analytics_hook_source(source: HookSource) -> &'static str
 ```
 
-**Purpose**: Maps protocol-level `HookSource` variants to analytics source strings.
+**Purpose**: This translates where a hook came from into the string used in analytics. Sources include system, user, project, plugin, managed configuration, and unknown.
 
-**Data flow**: Consumes a `HookSource` and returns a static lowercase identifier like `system`, `plugin`, `cloud_managed_config`, or `unknown`.
+**Data flow**: It receives a HookSource enum value and returns the matching lowercase analytics string, such as user, project, session_flags, or cloud_managed_config.
 
-**Call relations**: Only called from `codex_hook_run_metadata` to normalize hook provenance.
+**Call relations**: codex_hook_run_metadata calls this so hook-source reporting is consistent across all hook run events.
 
 *Call graph*: called by 1 (codex_hook_run_metadata).
 
@@ -351,11 +357,11 @@ fn analytics_hook_source(source: HookSource) -> &'static str
 fn current_runtime_metadata() -> CodexRuntimeMetadata
 ```
 
-**Purpose**: Captures runtime environment details for inclusion in analytics events.
+**Purpose**: This captures basic information about the Codex runtime environment for analytics events. It records what version of Codex is running and what operating system and CPU architecture it is running on.
 
-**Data flow**: Reads compile-time package version via `env!("CARGO_PKG_VERSION")`, runtime OS and architecture from `std::env::consts`, and OS version from `os_info::get()`. It returns a populated `CodexRuntimeMetadata`.
+**Data flow**: It reads the package version built into the program, the operating system and architecture constants from Rust, and the operating system version from the os_info library. It returns a CodexRuntimeMetadata struct.
 
-**Call relations**: Used when thread initialization events are emitted, including both normal initialization and synthetic subagent-thread initialization.
+**Call relations**: Thread initialization tracking and subagent thread-start event creation call this so those events include the environment where they happened.
 
 *Call graph*: called by 2 (track_initialize, subagent_thread_started_event_request); 2 external calls (env!, get).
 
@@ -368,11 +374,11 @@ fn subagent_thread_started_event_request(
 ) -> ThreadInitializedEvent
 ```
 
-**Purpose**: Synthesizes a full `codex_thread_initialized` analytics event for a subagent thread started internally rather than through the external app-server protocol.
+**Purpose**: This creates a thread-initialized analytics event for a subagent thread. A subagent is a delegated worker thread created by Codex to help with a task.
 
-**Data flow**: Consumes `SubAgentThreadStartedInput`, builds `ThreadInitializedEventParams` with `rpc_transport` fixed to `InProcess`, `thread_source` fixed to `Some(ThreadSource::Subagent)`, `initialization_mode` fixed to `New`, runtime metadata from `current_runtime_metadata()`, and subagent source text from `subagent_source_name()`. It returns a `ThreadInitializedEvent` wrapper with event type `codex_thread_initialized`.
+**Data flow**: It receives a SubAgentThreadStartedInput containing IDs, client information, model, lineage, source, and creation time. It builds app server client metadata, adds current runtime metadata, marks the thread source as subagent, records the subagent source name, and returns a ThreadInitializedEvent with event type codex_thread_initialized.
 
-**Call relations**: Called by reducer subagent-thread ingestion and serialization tests. It packages internal subagent lifecycle facts into the same event shape used for externally initialized threads.
+**Call relations**: The subagent-thread-started ingestion path calls this when a new subagent thread begins. It calls current_runtime_metadata for environment details and subagent_source_name to turn the subagent source into a stable text value.
 
 *Call graph*: calls 2 internal fn (current_runtime_metadata, subagent_source_name); called by 6 (subagent_thread_started_memory_consolidation_serializes_expected_shape, subagent_thread_started_other_serializes_expected_shape, subagent_thread_started_other_serializes_explicit_parent_thread_id, subagent_thread_started_review_serializes_expected_shape, subagent_thread_started_thread_spawn_serializes_thread_lineage, ingest_subagent_thread_started).
 
@@ -383,11 +389,11 @@ fn subagent_thread_started_event_request(
 fn subagent_source_name(subagent_source: &SubAgentSource) -> String
 ```
 
-**Purpose**: Converts a `SubAgentSource` into the string stored in analytics metadata.
+**Purpose**: This returns the name of the kind of subagent source, such as the category of reason the subagent was created.
 
-**Data flow**: Reads the source kind via `subagent_source.kind()`, converts it to string, and returns that `String`.
+**Data flow**: It receives a SubAgentSource reference, asks it for its kind, converts that kind to text, and returns the resulting String.
 
-**Call relations**: Used both here and in reducer thread metadata construction so subagent source naming stays consistent across thread initialization and later turn/tool events.
+**Call relations**: subagent_thread_started_event_request uses this when creating subagent thread initialization analytics. Other thread metadata conversion code also calls it to keep the same naming.
 
 *Call graph*: calls 1 internal fn (kind); called by 2 (subagent_thread_started_event_request, from_thread_metadata).
 
@@ -398,24 +404,24 @@ fn subagent_source_name(subagent_source: &SubAgentSource) -> String
 fn analytics_hook_status(status: HookRunStatus) -> HookRunStatus
 ```
 
-**Purpose**: Normalizes hook run status for analytics, defensively collapsing unexpected `Running` into `Failed`.
+**Purpose**: This normalizes hook run status before analytics reporting. It defensively converts an unexpected Running status into Failed.
 
-**Data flow**: Consumes a `HookRunStatus`; if it is `Running`, returns `HookRunStatus::Failed`, otherwise returns the original status unchanged.
+**Data flow**: It receives a HookRunStatus. If the status is Running, it returns Failed; otherwise it returns the original status unchanged.
 
-**Call relations**: Only called from `codex_hook_run_metadata` to ensure emitted hook analytics never report an in-progress terminal state.
+**Call relations**: codex_hook_run_metadata calls this while building hook run metadata. This protects analytics from receiving a still-running status in a place where completed hook results are expected.
 
 *Call graph*: called by 1 (codex_hook_run_metadata).
 
 
 ### `analytics/src/lib.rs`
 
-`util` · `cross-cutting; imported wherever analytics helpers or types are needed`
+`other` · `cross-cutting`
 
-This crate root is mostly composition and utility. It declares the analytics submodules (`accepted_lines`, `client`, `events`, `facts`, `reducer`), re-exports the types that other crates use to produce analytics facts or consume analytics helpers, and defines a handful of generic conversion/time helpers shared across the reducer and event-building code.
+This file is the crate root, which means it decides what the outside world can import from the analytics package. Most of its job is to gather useful pieces from smaller internal files, such as event definitions, facts, the analytics client, and accepted-line fingerprinting, and re-export them from one place. That keeps callers from needing to know the crate’s internal folder layout.
 
-`now_unix_seconds` and `now_unix_millis` snapshot wall-clock time relative to `UNIX_EPOCH`, defaulting to zero duration if the system clock is earlier than the epoch. The millisecond variant additionally performs a checked conversion from `u128` to `u64`, saturating to `u64::MAX` on overflow. `serialize_enum_as_string` is a small serde-based helper used when analytics wants the textual representation of an enum rather than its structured JSON form; it serializes to a `serde_json::Value` and extracts a string only if the serialized value is actually a JSON string. `usize_to_u64` and `option_i64_to_u64` centralize checked integer widening used throughout reducer code when converting counts and protocol timestamps into analytics payload fields.
+Think of it like a reception desk: the real work happens in different rooms, but callers can ask at one central desk instead of wandering the building. Without this file, other parts of the system would have to import analytics pieces from many separate modules, and public names would be harder to keep stable.
 
-Because this file re-exports nearly all externally relevant analytics types, it is the stable import point for callers while the implementation details remain split across the submodules.
+The file also defines a handful of small helper functions. Two return the current Unix time, which is the number of seconds or milliseconds since January 1, 1970, commonly used for timestamps. The others safely convert values into forms suitable for analytics data, such as turning an enum into its string form or converting signed and platform-sized numbers into unsigned 64-bit numbers. These helpers are deliberately forgiving: if time or numeric conversion fails, they use safe fallback behavior instead of crashing.
 
 #### Function details
 
@@ -425,11 +431,11 @@ Because this file re-exports nearly all externally relevant analytics types, it 
 fn now_unix_seconds() -> u64
 ```
 
-**Purpose**: Returns the current Unix timestamp in whole seconds.
+**Purpose**: Returns the current time as Unix seconds, meaning seconds since January 1, 1970. Analytics events can use this as a simple timestamp.
 
-**Data flow**: Reads `SystemTime::now()`, computes duration since `UNIX_EPOCH`, substitutes a default zero duration on error, extracts seconds, and returns a `u64`.
+**Data flow**: It reads the system clock, compares it with the Unix starting point, and takes the number of whole seconds. If the clock comparison fails for some unusual reason, it falls back to zero seconds rather than stopping the program.
 
-**Call relations**: Used by analytics code that needs coarse wall-clock timestamps, such as accepted-line fingerprint events and turn-steer request capture.
+**Call relations**: When analytics code needs a timestamp in seconds, it can call this helper instead of repeating the clock logic. Inside, it relies on the standard system time function to get the current moment.
 
 *Call graph*: 1 external calls (now).
 
@@ -440,11 +446,11 @@ fn now_unix_seconds() -> u64
 fn now_unix_millis() -> u64
 ```
 
-**Purpose**: Returns the current Unix timestamp in milliseconds with checked narrowing to `u64`.
+**Purpose**: Returns the current time as Unix milliseconds, which is useful when analytics needs a more precise timestamp than whole seconds.
 
-**Data flow**: Reads `SystemTime::now()`, computes duration since `UNIX_EPOCH`, substitutes zero duration on error, extracts milliseconds as `u128`, attempts `u64::try_from`, and returns either the converted value or `u64::MAX` on overflow.
+**Data flow**: It reads the system clock, measures how many milliseconds have passed since the Unix starting point, and converts that value into a 64-bit unsigned number. If the clock comparison fails, it uses zero; if the millisecond value is too large to fit, it uses the largest possible 64-bit unsigned number.
 
-**Call relations**: Used where analytics payloads need millisecond precision, notably guardian review tracking context creation.
+**Call relations**: Analytics code can call this when it needs millisecond precision. The function asks the standard clock for the current time and uses a standard numeric conversion so the result has the expected type.
 
 *Call graph*: 2 external calls (now, try_from).
 
@@ -455,11 +461,11 @@ fn now_unix_millis() -> u64
 fn serialize_enum_as_string(value: &T) -> Option<String>
 ```
 
-**Purpose**: Attempts to serialize a value and recover it as a plain string if its serde representation is a JSON string.
+**Purpose**: Tries to turn a serializable value, usually an enum, into the string that would appear in JSON. This helps analytics store clean text labels rather than Rust-specific values.
 
-**Data flow**: Takes a borrowed serializable value, runs `serde_json::to_value`, ignores serialization errors, checks whether the resulting JSON value is a string, and returns `Option<String>`.
+**Data flow**: It takes a value that can be serialized, converts it into a JSON value, and then checks whether that JSON value is a string. If it is a string, it returns that text; if serialization fails or the JSON value is not a string, it returns nothing.
 
-**Call relations**: Used by reducer code for fields like reasoning effort where analytics wants the enum’s serialized string form rather than nested JSON.
+**Call relations**: Internal analytics code can use this helper when preparing event fields. It hands the actual conversion to the JSON serialization library, then keeps only the simple string result that analytics records expect.
 
 *Call graph*: 1 external calls (to_value).
 
@@ -470,11 +476,11 @@ fn serialize_enum_as_string(value: &T) -> Option<String>
 fn usize_to_u64(value: usize) -> u64
 ```
 
-**Purpose**: Performs a checked conversion from `usize` to `u64` with saturation on overflow.
+**Purpose**: Safely converts a `usize` into a `u64`. A `usize` is a number sized for the current machine, while a `u64` is a fixed-size unsigned number often better for stored analytics data.
 
-**Data flow**: Consumes a `usize`, attempts `u64::try_from`, and returns the converted value or `u64::MAX` if conversion fails.
+**Data flow**: It receives a machine-sized unsigned number and tries to convert it into a 64-bit unsigned number. If the value does not fit, it returns the largest possible 64-bit unsigned number instead of failing.
 
-**Call relations**: Widely used by reducer counting helpers when populating analytics payload counters.
+**Call relations**: Internal analytics code can use this when counts or sizes need to be written into analytics facts with a stable numeric type. It relies on the standard checked conversion function to avoid unsafe assumptions about number size.
 
 *Call graph*: 1 external calls (try_from).
 
@@ -485,11 +491,11 @@ fn usize_to_u64(value: usize) -> u64
 fn option_i64_to_u64(value: Option<i64>) -> Option<u64>
 ```
 
-**Purpose**: Converts an optional signed integer into an optional nonnegative `u64`, dropping negative or overflowing values.
+**Purpose**: Converts an optional signed 64-bit number into an optional unsigned 64-bit number, but only when the value is present and non-negative. This is useful for analytics fields where negative numbers would not make sense.
 
-**Data flow**: Consumes `Option<i64>`, and for `Some(value)` attempts `u64::try_from(value)`. It returns `Some(u64)` only for successful nonnegative conversions; otherwise `None`.
+**Data flow**: It receives either no value or a signed number. If there is no value, it returns no value. If there is a value, it tries to convert it to an unsigned number; negative or otherwise invalid values become no value.
 
-**Call relations**: Used throughout reducer ingestion to sanitize protocol timestamps and durations before analytics emission.
+**Call relations**: Internal analytics code can use this when cleaning up optional numeric inputs before recording them. Unlike the other conversion helper, it does not clamp invalid values; it drops them by returning nothing.
 
 
 ### Event reduction pipeline
@@ -497,13 +503,13 @@ These files implement the core transformation from raw observations and accepted
 
 ### `analytics/src/accepted_lines.rs`
 
-`domain_logic` · `turn completion / analytics aggregation`
+`domain_logic` · `turn completion / analytics reporting`
 
-This file implements the accepted-line analytics feature at the diff-parsing layer. The main output type, `AcceptedLineFingerprintSummary`, records total added and deleted line counts plus a vector of `AcceptedLineFingerprint` values. Parsing is done by `accepted_line_fingerprints_from_unified_diff`, which walks the diff line-by-line while tracking two pieces of state: the current file path from `+++` headers and whether the parser is inside a hunk after seeing `@@`.
+When a user accepts generated code, the system wants to know basic facts such as “how many lines were accepted?” and, internally, which added lines were meaningful enough to fingerprint. A fingerprint is a one-way hash: like a label made from the content, but not the content itself. This file reads a unified diff, which is the common text format Git uses to show added and removed lines, and counts accepted additions and deletions.
 
-The parser deliberately ignores file metadata outside hunks except for `+++` path headers, resets state on each `diff --git`, and treats hunk lines beginning with `+` or `-` as actual additions/deletions even if their contents resemble file headers. Added lines increment `accepted_added_lines`; deleted lines increment `accepted_deleted_lines`. Fingerprints are only emitted for added lines when a normalized path exists and `normalize_effective_line` decides the content is meaningful. That normalization collapses whitespace, rejects very short strings (length ≤ 3), and rejects lines with no alphanumeric or underscore characters, which filters out braces-only and punctuation-only additions.
+The main parser walks through the diff line by line. It notices file headers, remembers the current file path, enters each changed section, counts lines that start with plus signs as additions, and counts lines that start with minus signs as deletions. For added lines, it filters out very short or symbol-only lines before hashing the file path and normalized line text. This avoids treating things like a lone brace as meaningful code.
 
-`fingerprint_hash` namespaces hashes with a fixed `file-line-v1\0` prefix plus a domain (`path`, `line`, or `repo`) before SHA-1 hex encoding, preventing collisions across semantic categories. Event construction intentionally strips fingerprints from uploaded payloads: `accepted_line_fingerprint_event_requests` preserves aggregate counts but sends `line_fingerprints: Vec::new()`, leaving local fingerprint computation available for tests and future attribution. `accepted_line_repo_hash_for_cwd` asynchronously reads Git remotes, prefers `origin`, canonicalizes the chosen URL when possible, and hashes it instead of exposing the raw remote.
+The file also builds the analytics event request sent later by the analytics pipeline. Importantly, although it still computes line fingerprints for tests and possible future use, the event payload deliberately sends an empty fingerprint list. That means the uploaded event contains counts and repository hash information, but not per-line hashes. Finally, it can inspect the current Git repository, find a remote URL, canonicalize it, and hash it so the raw repository address is not sent.
 
 #### Function details
 
@@ -515,11 +521,11 @@ fn accepted_line_fingerprints_from_unified_diff(
 ) -> AcceptedLineFingerprintSummary
 ```
 
-**Purpose**: Parses a unified diff into aggregate added/deleted counts and fingerprints for meaningful added lines tied to normalized file paths.
+**Purpose**: Reads a Git-style unified diff and summarizes the accepted code change. It counts added and deleted lines, and creates hashes for meaningful added lines so they can be recognized without storing the raw text.
 
-**Data flow**: Consumes a diff string, iterates over `lines()`, maintains `current_path: Option<String>` and `in_hunk: bool`, updates those on `diff --git`, `@@`, `+++`, and `---` markers, increments counters for `+` and `-` lines, normalizes added-line content with `normalize_effective_line`, hashes path and line content with `fingerprint_hash`, and returns `AcceptedLineFingerprintSummary`.
+**Data flow**: It takes the diff as plain text. As it scans each line, it tracks the current file path, whether it is inside an actual changed section, and whether each line is an addition or deletion. Added lines are cleaned up and filtered; useful ones are turned into path and line hashes. It returns an AcceptedLineFingerprintSummary containing the total added lines, total deleted lines, and the collected fingerprints.
 
-**Call relations**: Called by analytics code when a turn diff must be summarized and by the file’s tests. It delegates path normalization, line normalization, and hashing to helpers while owning the diff-state machine.
+**Call relations**: This is the central parser in the file. It calls normalize_diff_path to clean file names, normalize_effective_line to decide whether an added line is worth fingerprinting, and fingerprint_hash to produce the privacy-preserving labels. It is used by accepted_line_event_input in the wider analytics flow and by the tests that check tricky diff cases.
 
 *Call graph*: calls 3 internal fn (fingerprint_hash, normalize_diff_path, normalize_effective_line); called by 4 (parses_counts_and_effective_added_fingerprints, parses_hunk_lines_that_look_like_file_headers, skips_added_file_metadata_headers, accepted_line_event_input); 1 external calls (new).
 
@@ -530,11 +536,11 @@ fn accepted_line_fingerprints_from_unified_diff(
 fn fingerprint_hash(domain: &str, value: &str) -> String
 ```
 
-**Purpose**: Computes a namespaced SHA-1 hex digest for a path, line, or repo value used in accepted-line analytics.
+**Purpose**: Creates a stable one-way hash for a value, such as a file path, line of code, or repository URL. The domain label keeps different kinds of data from accidentally sharing the same hash space.
 
-**Data flow**: Takes a `domain` string and `value` string, feeds `file-line-v1\0`, the domain, a separator null byte, and the value bytes into a `sha1::Sha1` hasher, finalizes it, and formats the digest as lowercase hexadecimal.
+**Data flow**: It receives a domain name and a value. It feeds a fixed version marker, the domain, and the value into SHA-1, a hashing algorithm that turns text into a fixed-looking string. It returns the hash as lowercase hexadecimal text.
 
-**Call relations**: Used by diff parsing for path and line fingerprints and by repo hashing for canonical remote URLs. The domain parameter is what keeps hashes for different semantic categories distinct.
+**Call relations**: The diff parser uses this to hash paths and added lines. The repository hash function also uses the same idea for repository remotes. This helper is the privacy boundary: callers get a repeatable identifier without keeping the original text.
 
 *Call graph*: called by 1 (accepted_line_fingerprints_from_unified_diff); 2 external calls (format!, new).
 
@@ -547,11 +553,11 @@ fn accepted_line_fingerprint_event_requests(
 ) -> Vec<TrackEventRequest>
 ```
 
-**Purpose**: Builds the analytics event request for accepted-line summaries while intentionally omitting raw path/line fingerprints from the uploaded payload.
+**Purpose**: Builds the analytics event object that reports accepted-line statistics. It packages counts, turn information, model information, timing, and repository hash into the format expected by the event tracking system.
 
-**Data flow**: Consumes `AcceptedLineFingerprintEventInput`, destructures all fields, ignores the incoming `line_fingerprints` binding, constructs one `TrackEventRequest::AcceptedLineFingerprints` containing `CodexAcceptedLineFingerprintsEventRequest` and `CodexAcceptedLineFingerprintsEventParams`, and sets `line_fingerprints` in the payload to an empty vector.
+**Data flow**: It takes an AcceptedLineFingerprintEventInput containing metadata and line-count results. It copies those fields into a CodexAcceptedLineFingerprintsEventRequest wrapped inside a TrackEventRequest. Although the input may contain line fingerprints, the output intentionally replaces them with an empty list before upload.
 
-**Call relations**: Called by higher-level analytics emission code when a turn completes. Its key design choice is to preserve aggregate counts but suppress fingerprint upload despite local computation.
+**Call relations**: maybe_emit_turn_event calls this when it is ready to send analytics for a completed turn. This function does not parse diffs itself; it receives already prepared data and turns it into the transport shape used by the analytics event pipeline.
 
 *Call graph*: called by 1 (maybe_emit_turn_event); 1 external calls (vec!).
 
@@ -562,11 +568,11 @@ fn accepted_line_fingerprint_event_requests(
 async fn accepted_line_repo_hash_for_cwd(cwd: &Path) -> Option<String>
 ```
 
-**Purpose**: Derives a privacy-preserving repository identifier for the current working directory from Git remotes.
+**Purpose**: Finds a repository remote for the current working directory and returns a hashed version of it. This lets analytics associate events with the same repository without sending the repository URL itself.
 
-**Data flow**: Accepts a `&Path`, asynchronously fetches remote URLs with `get_git_remote_urls_assume_git_repo`, selects `origin` if present or otherwise the first remote, canonicalizes the chosen URL with `canonicalize_git_remote_url` when possible, hashes the canonical or original URL with `fingerprint_hash("repo", ...)`, and returns `Option<String>`.
+**Data flow**: It receives a filesystem path that is assumed to be inside a Git repository. It asks Git utilities for the repository’s remote URLs, prefers the remote named origin, otherwise uses the first available remote, canonicalizes the URL when possible, and hashes the result. It returns the hash, or nothing if no remote information is available.
 
-**Call relations**: Invoked by analytics orchestration before emitting accepted-line events. It depends on Git utility functions for remote discovery and normalization, then reuses the same hashing scheme as line/path fingerprints.
+**Call relations**: maybe_emit_turn_event calls this while preparing the accepted-line analytics event. It relies on external Git utility functions to read and normalize remotes, then uses this file’s hash helper to produce the final privacy-preserving repository identifier.
 
 *Call graph*: called by 1 (maybe_emit_turn_event); 1 external calls (get_git_remote_urls_assume_git_repo).
 
@@ -577,11 +583,11 @@ async fn accepted_line_repo_hash_for_cwd(cwd: &Path) -> Option<String>
 fn normalize_diff_path(path: &str) -> Option<String>
 ```
 
-**Purpose**: Converts a diff header path into the logical repository-relative path used for fingerprinting, or drops deleted-file null paths.
+**Purpose**: Turns a file path from a diff header into the real project path used for hashing. It also recognizes /dev/null, which Git uses to mean a file did not exist on one side of the change.
 
-**Data flow**: Trims the input path string, returns `None` for `/dev/null`, otherwise strips a leading `b/` or `a/` prefix if present and returns the remaining path as `Some(String)`.
+**Data flow**: It receives a path string from a diff line such as +++ b/src/lib.rs. It trims whitespace, returns nothing for /dev/null, and removes common Git prefixes like a/ or b/. It returns the cleaned path when there is one.
 
-**Call relations**: Used only by `accepted_line_fingerprints_from_unified_diff` when processing `+++` file headers outside hunks.
+**Call relations**: accepted_line_fingerprints_from_unified_diff calls this before hashing added lines. This keeps path fingerprints stable, so the same file is not treated differently just because the diff used Git’s a/ and b/ prefixes.
 
 *Call graph*: called by 1 (accepted_line_fingerprints_from_unified_diff).
 
@@ -592,11 +598,11 @@ fn normalize_diff_path(path: &str) -> Option<String>
 fn normalize_effective_line(line: &str) -> Option<String>
 ```
 
-**Purpose**: Filters and normalizes added-line content so only meaningful code/text lines are fingerprinted.
+**Purpose**: Decides whether an added line is meaningful enough to fingerprint and normalizes its spacing. This avoids recording fingerprints for tiny or non-informative lines such as a lone brace.
 
-**Data flow**: Splits the input line on whitespace, rejoins tokens with single spaces, rejects the result if its length is 3 or less or if it contains no alphanumeric character and no underscore, and otherwise returns `Some(normalized)`.
+**Data flow**: It receives the text of an added line without the leading plus sign. It collapses all whitespace into single spaces, rejects lines that are three characters or shorter, and rejects lines with no letters, numbers, or underscores. It returns the cleaned line text only if it passes those checks.
 
-**Call relations**: Called by `accepted_line_fingerprints_from_unified_diff` before hashing added lines. It is the main heuristic that excludes trivial additions like braces or punctuation-only lines.
+**Call relations**: accepted_line_fingerprints_from_unified_diff calls this for every added line inside a diff hunk. Only lines accepted by this filter are handed to fingerprint_hash, so this function controls which additions become line fingerprints.
 
 *Call graph*: called by 1 (accepted_line_fingerprints_from_unified_diff).
 
@@ -607,11 +613,11 @@ fn normalize_effective_line(line: &str) -> Option<String>
 fn parses_counts_and_effective_added_fingerprints()
 ```
 
-**Purpose**: Verifies that diff parsing counts additions/deletions correctly and fingerprints only meaningful added lines after normalization.
+**Purpose**: Checks the normal case: a diff with one deleted line and several added lines, where only meaningful added lines should be fingerprinted.
 
-**Data flow**: Builds a small diff containing one deletion and three additions, calls `accepted_line_fingerprints_from_unified_diff`, and asserts the returned summary contains the expected counts and exactly two fingerprints for `fn useful() {` and `return user.id;`.
+**Data flow**: It builds a sample diff string, sends it to accepted_line_fingerprints_from_unified_diff, and compares the returned summary with the expected counts and hashes. The expected result includes three added lines and one deleted line, but only two line fingerprints because a short brace-only line is ignored.
 
-**Call relations**: This test exercises the main parser path, including path extraction, line normalization, and fingerprint generation.
+**Call relations**: This test protects the main parser’s intended behavior. It calls accepted_line_fingerprints_from_unified_diff and uses fingerprint_hash in the expected value so the test matches the same hashing scheme as production code.
 
 *Call graph*: calls 1 internal fn (accepted_line_fingerprints_from_unified_diff); 1 external calls (assert_eq!).
 
@@ -622,11 +628,11 @@ fn parses_counts_and_effective_added_fingerprints()
 fn skips_added_file_metadata_headers()
 ```
 
-**Purpose**: Checks that file metadata headers for newly added files are not mistaken for added content lines outside hunks.
+**Purpose**: Checks that the parser does not confuse diff metadata for real added code when a new file is created.
 
-**Data flow**: Constructs a diff for a new file with `--- /dev/null`, `+++ b/new.py`, and one hunk addition, parses it, and asserts one added line, zero deleted lines, and one fingerprint.
+**Data flow**: It builds a diff for a newly added file, including the /dev/null marker and file header lines. It passes that diff to the parser and verifies that only the actual code line is counted as added, with no deleted lines and one fingerprint.
 
-**Call relations**: This test covers the parser’s outside-hunk header handling and the `/dev/null` path normalization case.
+**Call relations**: This test exercises accepted_line_fingerprints_from_unified_diff on a common Git edge case. It confirms that normalize_diff_path and the parser’s hunk tracking work together so file headers are not counted as accepted code.
 
 *Call graph*: calls 1 internal fn (accepted_line_fingerprints_from_unified_diff); 1 external calls (assert_eq!).
 
@@ -637,24 +643,24 @@ fn skips_added_file_metadata_headers()
 fn parses_hunk_lines_that_look_like_file_headers()
 ```
 
-**Purpose**: Ensures that lines inside hunks beginning with `---` or `+++` are treated as actual diff content, not metadata headers.
+**Purpose**: Checks a subtle case where real changed lines look like diff header lines. This matters because code or text can begin with --- or +++, and the parser must still count it correctly inside a changed section.
 
-**Data flow**: Creates a diff whose hunk contains `--- old value` and `+++ new value`, parses it, and asserts one deletion plus one fingerprinted addition whose normalized content is `++ new value`.
+**Data flow**: It creates a diff where the actual removed line starts with --- and the actual added line starts with +++. It runs the parser and verifies one deletion, one addition, and a fingerprint for the added content after the leading diff plus sign is removed.
 
-**Call relations**: This test validates the `in_hunk` state guard in the parser, proving that header-like text inside hunks is still counted as content.
+**Call relations**: This test calls accepted_line_fingerprints_from_unified_diff to make sure its hunk-state logic is correct. It guards against a bug where the parser might treat changed content as file metadata just because it resembles a diff header.
 
 *Call graph*: calls 1 internal fn (accepted_line_fingerprints_from_unified_diff); 1 external calls (assert_eq!).
 
 
 ### `analytics/src/reducer.rs`
 
-`orchestration` · `request handling and event stream reduction throughout a session`
+`domain_logic` · `cross-cutting during request handling and turn completion`
 
-This file is the heart of analytics assembly. `AnalyticsReducer` maintains multiple correlated state maps: pending client requests keyed by `(connection_id, RequestId)`, per-turn accumulation in `turns`, connection metadata in `connections`, per-thread metadata in `threads`, started timestamps for tool items, pending approval reviews, and per-item review summaries. The reducer ingests both protocol-surface facts and custom analytics facts, updating these maps until enough information exists to emit a concrete analytics event.
+The analytics reducer is like a clerk who watches a busy service desk and writes clean summary cards after each task is done. Incoming facts often arrive in pieces: a turn starts in one message, gets configuration in another, uses tools in notifications, receives token counts later, and finally completes. This file stores those pieces in small in-memory maps until it has enough information to emit one analytics event.
 
-The main control flow starts in `AnalyticsReducer::ingest`, which dispatches each `AnalyticsFact` to specialized handlers. Request/response handlers track turn starts and turn-steer attempts; notification handlers observe item starts/completions, guardian review completions, turn lifecycle notifications, and diffs; custom handlers inject resolved config, token usage, profiles, compaction, goals, plugin/app/hook usage, and guardian review payloads. Emission is intentionally delayed for turn events until `thread_id`, input-image count, resolved config, profile, and completion state are all present. At that point `maybe_emit_turn_event` builds a `codex_turn_event`, optionally derives accepted-line fingerprints from the latest unified diff, and then removes the turn state.
+It also enriches events with context. A thread event needs client and runtime details. A tool event needs its start and finish times, whether a review approved it, and what kind of tool it was. A review event needs to know what was reviewed and how the user or guardian system answered. If required context is missing, the reducer drops that analytics event and logs a warning rather than sending misleading data.
 
-Tool-item analytics are similarly synthesized only on `ItemCompleted`, using `tool_item_event` to inspect the concrete `ThreadItem` variant and derive counts, terminal status, failure kind, execution duration, and review summary fields. Review flows are tracked separately: server approval requests create `PendingReviewState`, later responses/aborts resolve them into `codex_review_event` records and update `item_review_summaries` so the eventual tool-item event can report review counts and final approval outcome. Missing thread/connection metadata never panics; instead helper methods log a structured warning via `AnalyticsDropSite` and drop the event. The file also contains many small normalization helpers for statuses, policy modes, path hashing inputs, and protocol-to-analytics enum mappings.
+The file covers several families of analytics: thread initialization, turn completion, turn steering, tool calls, command execution, file changes, web search, image generation, reviews, skills, apps, hooks, plugins, goals, compaction, and accepted-line fingerprints from diffs. Without this file, analytics would lose the story of how a user session unfolded, making product metrics, debugging, safety auditing, and feature usage reporting much less reliable.
 
 #### Function details
 
@@ -664,11 +670,11 @@ Tool-item analytics are similarly synthesized only on `ItemCompleted`, using `to
 fn guardian(input: &'a GuardianReviewEventParams) -> Self
 ```
 
-**Purpose**: Builds a structured drop-site descriptor for guardian review events so missing-context warnings include the relevant thread, turn, and review identifiers.
+**Purpose**: Builds a small label describing where a guardian review analytics event came from. This label is used only for useful warning messages if required context is missing.
 
-**Data flow**: Reads a borrowed `GuardianReviewEventParams` and returns an `AnalyticsDropSite` with `event_name` set to `guardian`, `thread_id` and `turn_id` borrowed from the payload, `review_id` set, and `item_id` left `None`.
+**Data flow**: It reads the guardian review's thread, turn, and review identifiers → packages them with the event name "guardian" → returns an AnalyticsDropSite value.
 
-**Call relations**: Called immediately before thread-context lookup in guardian review ingestion so any dropped event can be logged with precise identifiers.
+**Call relations**: When ingest_guardian_review is ready to emit a guardian event, it asks this helper for a drop-site label before checking thread context.
 
 *Call graph*: called by 1 (ingest_guardian_review).
 
@@ -679,11 +685,11 @@ fn guardian(input: &'a GuardianReviewEventParams) -> Self
 fn review(input: &'a PendingReviewState) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for user or guardian review events derived from pending review state.
+**Purpose**: Creates a warning label for a pending review event. It captures the thread, turn, review, and optional tool item being reviewed.
 
-**Data flow**: Reads a borrowed `PendingReviewState` and returns an `AnalyticsDropSite` containing the review’s thread, turn, review ID, and optional item ID.
+**Data flow**: It reads a PendingReviewState → copies references to its identifying fields → returns an AnalyticsDropSite marked as a "review" event.
 
-**Call relations**: Used by `emit_review_event` before context lookup and warning emission.
+**Call relations**: emit_review_event uses this before looking up connection and thread metadata, so any dropped review event can be explained clearly in logs.
 
 *Call graph*: called by 1 (emit_review_event).
 
@@ -694,11 +700,11 @@ fn review(input: &'a PendingReviewState) -> Self
 fn compaction(input: &'a CodexCompactionEvent) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for compaction analytics events.
+**Purpose**: Creates a warning label for a compaction analytics event. Compaction means the conversation context was condensed to save space.
 
-**Data flow**: Reads a borrowed `CodexCompactionEvent` and returns an `AnalyticsDropSite` with event name `compaction`, thread ID, and turn ID populated.
+**Data flow**: It reads a compaction fact's thread and turn IDs → wraps them with the event name "compaction" → returns the label.
 
-**Call relations**: Used by compaction ingestion when thread/session metadata may be missing.
+**Call relations**: ingest_compaction uses it while fetching the thread context needed to build the final compaction event.
 
 *Call graph*: called by 1 (ingest_compaction).
 
@@ -709,11 +715,11 @@ fn compaction(input: &'a CodexCompactionEvent) -> Self
 fn goal(input: &'a CodexGoalEvent) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for goal analytics events.
+**Purpose**: Creates a warning label for a goal analytics event. A goal event records work related to a user or agent goal.
 
-**Data flow**: Reads a borrowed `CodexGoalEvent` and returns an `AnalyticsDropSite` with event name `goal`, thread ID, and optional turn ID.
+**Data flow**: It reads the goal fact's thread ID and optional turn ID → packages them with the event name "goal" → returns the label.
 
-**Call relations**: Used by goal ingestion before thread-context lookup.
+**Call relations**: ingest_goal uses this label when it checks whether the thread has the connection and metadata needed for analytics.
 
 *Call graph*: called by 1 (ingest_goal).
 
@@ -727,11 +733,11 @@ fn tool_item(
     ) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for tool-item completion analytics.
+**Purpose**: Creates a warning label for an individual tool item event, such as a command, file change, or web search.
 
-**Data flow**: Reads an `ItemCompletedNotification` and the resolved tracked `item_id`, then returns an `AnalyticsDropSite` containing thread, turn, and item identifiers with event name `tool item`.
+**Data flow**: It reads the item completion notification and the tool item ID → takes the thread and turn IDs from the notification → returns an AnalyticsDropSite for a "tool item".
 
-**Call relations**: Used in notification handling before attempting to emit a tool-item event.
+**Call relations**: ingest_notification uses it after a tool completes and before building the detailed tool analytics event.
 
 *Call graph*: called by 1 (ingest_notification).
 
@@ -742,11 +748,11 @@ fn tool_item(
 fn turn_steer(thread_id: &'a str) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for turn-steer analytics events.
+**Purpose**: Creates a warning label for a turn-steer event. Turn steering means sending extra input that changes or guides an existing turn.
 
-**Data flow**: Takes a thread ID string slice and returns an `AnalyticsDropSite` with event name `turn steer` and only the thread ID populated.
+**Data flow**: It receives a thread ID → records no turn, review, or item ID because the event may not have a final accepted turn → returns the label.
 
-**Call relations**: Used by `emit_turn_steer_event` when thread metadata may be absent.
+**Call relations**: emit_turn_steer_event uses it when checking whether thread metadata exists.
 
 *Call graph*: called by 1 (emit_turn_steer_event).
 
@@ -757,11 +763,11 @@ fn turn_steer(thread_id: &'a str) -> Self
 fn turn(thread_id: &'a str, turn_id: &'a str) -> Self
 ```
 
-**Purpose**: Builds the warning context descriptor for turn lifecycle analytics events.
+**Purpose**: Creates a warning label for a completed turn analytics event.
 
-**Data flow**: Takes thread and turn ID string slices and returns an `AnalyticsDropSite` with event name `turn` and those identifiers populated.
+**Data flow**: It receives a thread ID and turn ID → stores them with the event name "turn" → returns the label.
 
-**Call relations**: Used by `maybe_emit_turn_event` when connection or thread metadata lookup fails.
+**Call relations**: maybe_emit_turn_event uses it when deciding whether it has enough context to safely emit the turn event.
 
 *Call graph*: called by 1 (maybe_emit_turn_event).
 
@@ -777,11 +783,11 @@ fn from_thread_metadata(
         initializati
 ```
 
-**Purpose**: Normalizes thread/session metadata from app-server thread information into the reducer’s compact per-thread state.
+**Purpose**: Turns raw thread information into the smaller metadata bundle analytics needs. It also detects whether the thread was created by a sub-agent.
 
-**Data flow**: Consumes `session_id`, a borrowed `SessionSource`, optional `ThreadSource`, optional parent thread ID, and initialization mode. It derives `subagent_source` only when the session source is `SessionSource::SubAgent`, using `subagent_source_name`, and returns a `ThreadMetadataState`.
+**Data flow**: It receives session and thread source details, parent thread information, and initialization mode → derives a human-readable sub-agent source when applicable → returns ThreadMetadataState.
 
-**Call relations**: Called when a thread is initialized through normal app-server responses. Later turn, tool, compaction, and review events read this stored metadata.
+**Call relations**: emit_thread_initialized calls this while creating the thread-initialized event and storing metadata for later turn, tool, and review events.
 
 *Call graph*: calls 1 internal fn (subagent_source_name); called by 1 (emit_thread_initialized).
 
@@ -792,11 +798,11 @@ fn from_thread_metadata(
 fn record(&mut self, item: &ThreadItem)
 ```
 
-**Purpose**: Updates per-turn tool counters based on a completed `ThreadItem` variant.
+**Purpose**: Adds one completed tool-like thread item to the turn's counters. These counters later summarize how much tool work happened during the turn.
 
-**Data flow**: Mutably reads `self` and inspects a borrowed `ThreadItem`. For tracked tool variants it increments the corresponding category counter and `total`; for non-tool transcript/reasoning/compaction items it returns without changing counts.
+**Data flow**: It receives a ThreadItem → identifies whether it is a command, file change, MCP tool, dynamic tool, sub-agent tool, web search, or image generation → increments the matching count and the total count; non-tool items are ignored.
 
-**Call relations**: Called from notification handling on item completion, including a special path for `SubAgentActivity` where only counts are updated and no tool-item event is emitted.
+**Call relations**: ingest_notification updates the current turn with this whenever relevant item completion notifications arrive.
 
 
 ##### `AnalyticsReducer::ingest`  (lines 397–516)
@@ -805,11 +811,11 @@ fn record(&mut self, item: &ThreadItem)
 async fn ingest(&mut self, input: AnalyticsFact, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Top-level dispatcher that accepts any analytics fact, updates reducer state, and appends zero or more finished analytics events to the output buffer.
+**Purpose**: This is the main intake door for analytics facts. It routes each incoming fact to the specific reducer logic that knows how to store it or emit an event.
 
-**Data flow**: Consumes an `AnalyticsFact`, mutably updates the reducer’s maps, and mutably appends `TrackEventRequest` values into `out`. Depending on the fact variant it delegates to specialized ingestion methods, some async, and may emit events immediately or defer until more state arrives.
+**Data flow**: It receives one AnalyticsFact and the output event list → matches the fact type → updates reducer state or appends TrackEventRequest values to the output list.
 
-**Call relations**: This is the reducer entrypoint used by higher-level analytics collection code. It fans out to all other ingestion methods based on fact type.
+**Call relations**: Tests and the rest of the analytics pipeline call this as facts arrive; it delegates to specialized ingest_* methods for initialization, requests, responses, notifications, reviews, turns, plugins, skills, apps, and other custom facts.
 
 *Call graph*: calls 23 internal fn (ingest_app_mentioned, ingest_app_used, ingest_compaction, ingest_effective_permissions_approval_response, ingest_error_response, ingest_goal, ingest_guardian_review, ingest_hook_run, ingest_initialize, ingest_notification (+13 more)); called by 6 (ingest_complete_child_turn, ingest_completed_command_execution_item, ingest_initialize, ingest_rejected_turn_steer, ingest_review_prerequisites, ingest_turn_prerequisites).
 
@@ -826,11 +832,11 @@ fn ingest_initialize(
         rpc_transport:
 ```
 
-**Purpose**: Stores connection-scoped client/runtime metadata from the initialize handshake.
+**Purpose**: Stores information about a newly connected client. Later events need this client and runtime context to say where the activity came from.
 
-**Data flow**: Consumes connection ID, initialize params, product client ID, runtime metadata, and RPC transport. It inserts a `ConnectionState` into `self.connections`, building `CodexAppServerClientMetadata` from client info and optional experimental API capability.
+**Data flow**: It receives a connection ID, initialize parameters, product client ID, runtime metadata, and transport type → builds ConnectionState → saves it by connection ID.
 
-**Call relations**: Called from `ingest` on `AnalyticsFact::Initialize`; later thread, turn, review, and tool-item events depend on this stored connection metadata.
+**Call relations**: AnalyticsReducer::ingest calls this for Initialize facts; many later event emitters look up the saved connection state.
 
 *Call graph*: called by 1 (ingest).
 
@@ -845,11 +851,11 @@ fn ingest_subagent_thread_started(
     )
 ```
 
-**Purpose**: Registers metadata for an internally started subagent thread and emits its synthetic thread-initialized analytics event.
+**Purpose**: Records and emits analytics for a thread started by a sub-agent. A sub-agent is another agent working under a parent thread.
 
-**Data flow**: Consumes `SubAgentThreadStartedInput`, looks up the parent thread’s connection ID if available, inserts or fills `ThreadAnalyticsState` for the new thread with subagent metadata, inherits the parent connection when missing, and pushes a `TrackEventRequest::ThreadInitialized` built by `subagent_thread_started_event_request`.
+**Data flow**: It receives sub-agent thread input → copies parent connection if known, stores thread metadata, and appends a thread-initialized event to the output.
 
-**Call relations**: Triggered by custom subagent-start facts. It both seeds future context lookups for the subagent thread and emits the immediate initialization event.
+**Call relations**: AnalyticsReducer::ingest calls this for custom sub-agent facts; it uses the normal thread state map so later events for that child thread have context.
 
 *Call graph*: calls 1 internal fn (subagent_thread_started_event_request); called by 1 (ingest); 1 external calls (ThreadInitialized).
 
@@ -864,11 +870,11 @@ fn ingest_guardian_review(
     )
 ```
 
-**Purpose**: Wraps a completed guardian review payload with session/client/runtime metadata and emits the final guardian review analytics event.
+**Purpose**: Emits an analytics event for a guardian review fact. The guardian is an automated approval or safety reviewer.
 
-**Data flow**: Consumes `GuardianReviewEventParams`, looks up connection and thread metadata via `thread_context_or_warn`, and if found pushes `TrackEventRequest::GuardianReview` containing `GuardianReviewEventPayload` with session ID, app-server client metadata, runtime metadata, and the supplied review payload.
+**Data flow**: It receives guardian review parameters → looks up connection and thread metadata → if found, wraps everything in a GuardianReview event and appends it to output.
 
-**Call relations**: Called from `ingest` for custom guardian review facts. If thread context is missing, it drops the event after logging via the `AnalyticsDropSite::guardian` path.
+**Call relations**: AnalyticsReducer::ingest calls this for custom guardian review facts; it uses AnalyticsDropSite::guardian and thread_context_or_warn to avoid sending incomplete events.
 
 *Call graph*: calls 2 internal fn (guardian, thread_context_or_warn); called by 1 (ingest); 2 external calls (new, GuardianReview).
 
@@ -884,11 +890,11 @@ fn ingest_request(
     )
 ```
 
-**Purpose**: Captures client request state needed to correlate later responses, specifically turn starts and turn-steer attempts.
+**Purpose**: Remembers client requests whose later responses are needed to complete analytics. This is mainly for turn starts and turn steering.
 
-**Data flow**: Consumes connection ID, request ID, and `ClientRequest`. For `TurnStart`, it stores `PendingTurnStartState` with thread ID and image count. For `TurnSteer`, it stores `PendingTurnSteerState` with thread ID, expected turn ID, image count, and current Unix-seconds creation time. Other requests are ignored.
+**Data flow**: It receives a connection ID, request ID, and client request → if the request starts or steers a turn, stores thread ID, expected turn ID, image count, and creation time as pending state.
 
-**Call relations**: Called from `ingest` on client requests. Later `ingest_response` or `ingest_error_response` removes these pending entries to emit turn or turn-steer analytics.
+**Call relations**: AnalyticsReducer::ingest calls this for client requests; ingest_response or ingest_error_response later removes the pending request and finishes the analytics story.
 
 *Call graph*: calls 1 internal fn (num_input_images); called by 1 (ingest); 3 external calls (TurnStart, TurnSteer, now_unix_seconds).
 
@@ -903,11 +909,11 @@ async fn ingest_turn_resolved_config(
     )
 ```
 
-**Purpose**: Adds resolved configuration data to a turn’s accumulated state and attempts turn-event emission if all prerequisites are now present.
+**Purpose**: Stores the final configuration chosen for a turn, such as model and permissions. A turn event cannot be emitted until this is known.
 
-**Data flow**: Consumes `TurnResolvedConfigFact`, ensures a `TurnState` exists for its turn ID, stores thread ID, input-image count, and the full resolved config, then calls `maybe_emit_turn_event`.
+**Data flow**: It receives a resolved-config fact → updates or creates the turn state with thread ID, input image count, and config → asks maybe_emit_turn_event whether the turn is now complete enough to send.
 
-**Call relations**: Triggered by custom turn-config facts. It is one of several partial-state updates that converge in `maybe_emit_turn_event`.
+**Call relations**: AnalyticsReducer::ingest calls this for custom turn config facts; maybe_emit_turn_event coordinates it with profile and completion facts.
 
 *Call graph*: calls 1 internal fn (maybe_emit_turn_event); called by 1 (ingest).
 
@@ -922,11 +928,11 @@ async fn ingest_turn_token_usage(
     )
 ```
 
-**Purpose**: Adds token usage data to a turn’s accumulated state and re-checks whether the turn event can now be emitted.
+**Purpose**: Stores token usage for a turn. Tokens are the chunks of text the model reads and writes.
 
-**Data flow**: Consumes `TurnTokenUsageFact`, ensures a `TurnState`, stores thread ID and token usage, then calls `maybe_emit_turn_event`.
+**Data flow**: It receives token usage with thread and turn IDs → saves the usage in the turn state → asks maybe_emit_turn_event whether all required turn pieces have arrived.
 
-**Call relations**: Called from `ingest` for token-usage facts; complements resolved config, profile, and completion notifications.
+**Call relations**: AnalyticsReducer::ingest calls this for token usage facts; the final turn event includes these counts if present.
 
 *Call graph*: calls 1 internal fn (maybe_emit_turn_event); called by 1 (ingest).
 
@@ -941,11 +947,11 @@ async fn ingest_turn_profile(
     )
 ```
 
-**Purpose**: Adds timing/profile metrics to a turn’s accumulated state and re-checks turn-event readiness.
+**Purpose**: Stores timing profile information for a turn, such as sampling time and tool waiting time.
 
-**Data flow**: Consumes `TurnProfileFact`, ensures a `TurnState`, stores the profile, and calls `maybe_emit_turn_event`.
+**Data flow**: It receives a turn profile fact → saves the profile under the turn ID → asks maybe_emit_turn_event whether the full turn event can now be emitted.
 
-**Call relations**: Another partial-state contributor to eventual turn-event emission.
+**Call relations**: AnalyticsReducer::ingest calls this for profile facts; maybe_emit_turn_event combines it with config, completion, and context.
 
 *Call graph*: calls 1 internal fn (maybe_emit_turn_event); called by 1 (ingest).
 
@@ -956,11 +962,11 @@ async fn ingest_turn_profile(
 fn ingest_turn_codex_error(&mut self, input: TurnCodexErrorFact)
 ```
 
-**Purpose**: Stores normalized Codex error information for a turn so it can be included in the eventual turn event.
+**Purpose**: Records a Codex-specific error associated with a turn. This lets the final turn event include richer error details.
 
-**Data flow**: Consumes `TurnCodexErrorFact`, ensures a `TurnState`, fills in thread ID if absent, and stores the simplified `TurnCodexError`.
+**Data flow**: It receives turn ID, thread ID, and error → ensures a turn state exists → stores the thread ID if missing and saves the error.
 
-**Call relations**: Called from `ingest` for custom turn-error facts. Unlike config/profile/token updates, it does not itself trigger emission because turn completion prerequisites may still be missing.
+**Call relations**: AnalyticsReducer::ingest calls this for custom turn error facts; codex_turn_event_params later reads the saved error when building the turn event.
 
 *Call graph*: called by 1 (ingest).
 
@@ -975,11 +981,11 @@ async fn ingest_skill_invoked(
     )
 ```
 
-**Purpose**: Emits one skill-invocation analytics event per invoked skill, enriching each with repo URL and a stable hashed skill ID.
+**Purpose**: Emits analytics for skill invocations. A skill is a reusable capability or script the system can call.
 
-**Data flow**: Consumes `SkillInvokedInput`, iterates its `invocations`, maps `SkillScope` to a string, discovers repo root with `get_git_repo_root`, optionally fetches git metadata via `collect_git_info`, computes a stable skill ID with `skill_id_for_local_skill`, reads `originator().value`, and pushes a `TrackEventRequest::SkillInvocation` for each invocation.
+**Data flow**: It receives tracking data and a list of invocations → for each skill, finds repository information when possible, builds a stable skill ID, and appends a SkillInvocation event.
 
-**Call relations**: Called from `ingest` for custom skill-invoked facts. It is an immediate-emission path rather than a state accumulator.
+**Call relations**: AnalyticsReducer::ingest calls this for skill facts; it uses git helpers and skill_id_for_local_skill to identify local skills consistently.
 
 *Call graph*: calls 2 internal fn (skill_id_for_local_skill, originator); called by 1 (ingest); 3 external calls (SkillInvocation, collect_git_info, get_git_repo_root).
 
@@ -990,11 +996,11 @@ async fn ingest_skill_invoked(
 fn ingest_app_mentioned(&mut self, input: AppMentionedInput, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits analytics events for each app mention observed in a turn.
+**Purpose**: Emits one analytics event for each app mentioned during a turn.
 
-**Data flow**: Consumes `AppMentionedInput`, iterates the `mentions` vector, converts each `AppInvocation` with `codex_app_metadata`, wraps it in `CodexAppMentionedEventRequest`, and extends the output vector.
+**Data flow**: It receives tracking data and mention records → converts each mention into app metadata → extends the output list with app-mentioned events.
 
-**Call relations**: Called from `ingest` for custom app-mentioned facts. It is a straightforward mapping path.
+**Call relations**: AnalyticsReducer::ingest calls this for app mention facts.
 
 *Call graph*: called by 1 (ingest).
 
@@ -1005,11 +1011,11 @@ fn ingest_app_mentioned(&mut self, input: AppMentionedInput, out: &mut Vec<Track
 fn ingest_app_used(&mut self, input: AppUsedInput, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits the analytics event for a concrete app use within the current tracking context.
+**Purpose**: Emits analytics when an app is actually used, not just mentioned.
 
-**Data flow**: Consumes `AppUsedInput`, converts its `AppInvocation` with `codex_app_metadata`, wraps it in `CodexAppUsedEventRequest`, and pushes `TrackEventRequest::AppUsed`.
+**Data flow**: It receives tracking data and an app record → builds app metadata → appends a CodexAppUsed event.
 
-**Call relations**: Called from `ingest` for custom app-used facts.
+**Call relations**: AnalyticsReducer::ingest calls this for app-used facts; it relies on codex_app_metadata to shape the event fields.
 
 *Call graph*: calls 1 internal fn (codex_app_metadata); called by 1 (ingest); 1 external calls (AppUsed).
 
@@ -1020,11 +1026,11 @@ fn ingest_app_used(&mut self, input: AppUsedInput, out: &mut Vec<TrackEventReque
 fn ingest_hook_run(&mut self, input: HookRunInput, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits a hook-run analytics event from a hook fact and current tracking context.
+**Purpose**: Emits analytics for a hook run. A hook is custom code that runs at a defined point in the workflow.
 
-**Data flow**: Consumes `HookRunInput`, converts the hook fact with `codex_hook_run_metadata`, wraps it in `CodexHookRunEventRequest`, and pushes `TrackEventRequest::HookRun`.
+**Data flow**: It receives tracking data and hook details → converts them into hook metadata → appends a HookRun event.
 
-**Call relations**: Called from `ingest` for custom hook-run facts.
+**Call relations**: AnalyticsReducer::ingest calls this for hook facts.
 
 *Call graph*: calls 1 internal fn (codex_hook_run_metadata); called by 1 (ingest); 1 external calls (HookRun).
 
@@ -1035,11 +1041,11 @@ fn ingest_hook_run(&mut self, input: HookRunInput, out: &mut Vec<TrackEventReque
 fn ingest_plugin_used(&mut self, input: PluginUsedInput, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits a plugin-used analytics event enriched with plugin metadata and current thread/turn/model context.
+**Purpose**: Emits analytics when a plugin is used.
 
-**Data flow**: Consumes `PluginUsedInput`, converts it with `codex_plugin_used_metadata`, wraps it in `CodexPluginUsedEventRequest`, and pushes `TrackEventRequest::PluginUsed`.
+**Data flow**: It receives tracking data and plugin details → builds plugin-used metadata → appends a PluginUsed event.
 
-**Call relations**: Called from `ingest` for custom plugin-used facts.
+**Call relations**: AnalyticsReducer::ingest calls this for plugin-used facts.
 
 *Call graph*: calls 1 internal fn (codex_plugin_used_metadata); called by 1 (ingest); 1 external calls (PluginUsed).
 
@@ -1054,11 +1060,11 @@ fn ingest_plugin_state_changed(
     )
 ```
 
-**Purpose**: Emits the appropriate plugin lifecycle analytics event for install/uninstall/enable/disable transitions.
+**Purpose**: Emits analytics when a plugin is installed, uninstalled, enabled, or disabled.
 
-**Data flow**: Consumes `PluginStateChangedInput`, builds a `CodexPluginEventRequest` using `plugin_state_event_type` and `codex_plugin_metadata`, then matches the state to push the corresponding `TrackEventRequest` variant.
+**Data flow**: It receives plugin information and the new state → chooses the correct event type and event wrapper → appends it to output.
 
-**Call relations**: Called from `ingest` for custom plugin-state facts. It centralizes the mapping from plugin state to both event type string and wrapper variant.
+**Call relations**: AnalyticsReducer::ingest calls this for plugin state facts; it uses helper functions from the events module to name and fill the event.
 
 *Call graph*: calls 2 internal fn (codex_plugin_metadata, plugin_state_event_type); called by 1 (ingest); 4 external calls (PluginDisabled, PluginEnabled, PluginInstalled, PluginUninstalled).
 
@@ -1074,11 +1080,11 @@ async fn ingest_response(
     )
 ```
 
-**Purpose**: Processes client responses, correlating them with pending requests to emit thread initialization, turn-start, or turn-steer analytics.
+**Purpose**: Processes successful client responses and connects them back to earlier client requests. This is where new threads are announced and turn starts become known turn IDs.
 
-**Data flow**: Consumes connection ID and `ClientResponse`. Thread start/resume/fork responses call `emit_thread_initialized`. Turn-start responses remove the matching pending request, populate turn state with connection/thread/image data, and call `maybe_emit_turn_event`. Turn-steer responses delegate to `ingest_turn_steer_response`.
+**Data flow**: It receives a connection ID, client response, and output list → emits thread initialization events for thread responses, updates turn state for turn starts, or handles turn-steer responses.
 
-**Call relations**: Called from `ingest` on client responses after protocol decoding. It is the response-side counterpart to `ingest_request`.
+**Call relations**: AnalyticsReducer::ingest calls this after converting a raw response; it calls emit_thread_initialized, ingest_turn_steer_response, and maybe_emit_turn_event as needed.
 
 *Call graph*: calls 3 internal fn (emit_thread_initialized, ingest_turn_steer_response, maybe_emit_turn_event); called by 1 (ingest).
 
@@ -1089,11 +1095,11 @@ async fn ingest_response(
 fn ingest_server_request(&mut self, _connection_id: u64, request: ServerRequest)
 ```
 
-**Purpose**: Tracks pending approval/review requests initiated by the server so later responses can emit review analytics and annotate tool-item summaries.
+**Purpose**: Stores pending approval requests sent from the server to the client. These become review analytics only after the user or client responds.
 
-**Data flow**: Consumes a `ServerRequest`, and for command execution, file change, or permissions approval requests computes trigger type, requested-permission flags, converts `started_at_ms` with `option_i64_to_u64`, synthesizes a user review ID via `user_review_id`, and inserts a `PendingReviewState` keyed by request ID. Unsupported server requests are ignored.
+**Data flow**: It receives a server request → if it asks for command, file-change, or permission approval, derives what is being reviewed and why → stores PendingReviewState by request ID.
 
-**Call relations**: Called from `ingest` on server requests. Later server responses, effective-permissions responses, or aborts remove these pending entries and call `emit_review_event`.
+**Call relations**: AnalyticsReducer::ingest calls this for server requests; ingest_server_response, ingest_effective_permissions_approval_response, or ingest_server_request_aborted later complete the review.
 
 *Call graph*: calls 1 internal fn (user_review_id); called by 1 (ingest); 1 external calls (option_i64_to_u64).
 
@@ -1109,11 +1115,11 @@ fn ingest_server_response(
     )
 ```
 
-**Purpose**: Resolves pending user approval reviews from server responses and emits the corresponding review analytics events.
+**Purpose**: Completes user review analytics for normal server approval responses.
 
-**Data flow**: Consumes completion time and `ServerResponse`. For command execution and file change approval responses it removes the matching `PendingReviewState`, maps the decision to `(ReviewStatus, ReviewResolution)` via helper functions, and calls `emit_review_event`.
+**Data flow**: It receives completion time and a server response → removes the matching pending review → converts the user's decision into analytics status and resolution → emits the review event.
 
-**Call relations**: Called from `ingest` on server responses. It completes the review lifecycle started by `ingest_server_request`.
+**Call relations**: AnalyticsReducer::ingest calls this for server responses; it uses command_execution_review_result or file_change_review_result before calling emit_review_event.
 
 *Call graph*: calls 3 internal fn (emit_review_event, command_execution_review_result, file_change_review_result); called by 1 (ingest).
 
@@ -1129,11 +1135,11 @@ fn ingest_effective_permissions_approval_response(
         out: &mut V
 ```
 
-**Purpose**: Resolves pending permissions reviews using the effective granted permissions response and emits the resulting review event.
+**Purpose**: Completes analytics for a permissions approval response that comes from the core permission system.
 
-**Data flow**: Consumes completion time, request ID, and `CoreRequestPermissionsResponse`, removes the matching pending review, derives status/resolution with `effective_permissions_review_result`, and calls `emit_review_event`.
+**Data flow**: It receives completion time, request ID, and permission response → removes the pending review → maps the granted permissions to approved or denied → emits the review event.
 
-**Call relations**: Called from `ingest` for the special effective-permissions response fact path.
+**Call relations**: AnalyticsReducer::ingest calls this for effective permission responses; it delegates the final event creation to emit_review_event.
 
 *Call graph*: calls 2 internal fn (emit_review_event, effective_permissions_review_result); called by 1 (ingest).
 
@@ -1149,11 +1155,11 @@ fn ingest_server_request_aborted(
     )
 ```
 
-**Purpose**: Marks a pending user review as aborted when the server request is cancelled before a normal response arrives.
+**Purpose**: Records that a pending user review ended without a normal decision.
 
-**Data flow**: Consumes completion time and request ID, removes the matching `PendingReviewState`, and emits a review event with `ReviewStatus::Aborted` and `ReviewResolution::None`.
+**Data flow**: It receives completion time and request ID → removes the pending review if present → emits an aborted review event with no resolution.
 
-**Call relations**: Called from `ingest` on server-request-aborted facts.
+**Call relations**: AnalyticsReducer::ingest calls this when the server says a request was aborted; emit_review_event builds the shared review payload.
 
 *Call graph*: calls 1 internal fn (emit_review_event); called by 1 (ingest).
 
@@ -1169,11 +1175,11 @@ fn ingest_error_response(
         out: &mut Vec<TrackEventRequest>,
 ```
 
-**Purpose**: Handles JSON-RPC error responses by removing the pending request and routing it to request-specific error handling.
+**Purpose**: Handles error responses for client requests that were being tracked. This matters most for rejected turn-steer attempts.
 
-**Data flow**: Consumes connection ID, request ID, optional `AnalyticsJsonRpcError`, removes the matching `RequestState` from `self.requests`, and delegates to `ingest_request_error_response` if one existed.
+**Data flow**: It receives connection ID, request ID, optional error type, and output list → removes the pending request → passes it to request-specific error handling.
 
-**Call relations**: Called from `ingest` on error responses. It is the generic error-side counterpart to `ingest_response`.
+**Call relations**: AnalyticsReducer::ingest calls this for JSON-RPC error responses; it forwards to ingest_request_error_response.
 
 *Call graph*: calls 1 internal fn (ingest_request_error_response); called by 1 (ingest).
 
@@ -1189,11 +1195,11 @@ fn ingest_request_error_response(
         out: &mut Vec<TrackEventReque
 ```
 
-**Purpose**: Dispatches a failed pending request to the appropriate request-type-specific error handler.
+**Purpose**: Chooses how to treat a failed tracked request. Turn-start errors are ignored for analytics here, while turn-steer errors become rejection events.
 
-**Data flow**: Consumes connection ID, a `RequestState`, optional analytics error type, and output buffer. It ignores failed `TurnStart` requests and routes failed `TurnSteer` requests to `ingest_turn_steer_error_response`.
+**Data flow**: It receives the connection, pending request state, error type, and output list → matches the stored request kind → for turn steering, emits a rejected steer event.
 
-**Call relations**: Only called from `ingest_error_response` after the pending request has been removed.
+**Call relations**: ingest_error_response calls this after finding the pending request; it delegates turn-steer failures to ingest_turn_steer_error_response.
 
 *Call graph*: calls 1 internal fn (ingest_turn_steer_error_response); called by 1 (ingest_error_response).
 
@@ -1209,11 +1215,11 @@ fn ingest_turn_steer_error_response(
         out: &mut
 ```
 
-**Purpose**: Emits a rejected turn-steer analytics event from a failed pending turn-steer request.
+**Purpose**: Turns a failed turn-steer request into a rejected turn-steer analytics event.
 
-**Data flow**: Consumes connection ID, `PendingTurnSteerState`, optional analytics error type, derives an optional rejection reason with `rejection_reason_from_error_type`, and calls `emit_turn_steer_event` with `accepted_turn_id` set to `None` and result `Rejected`.
+**Data flow**: It receives the connection, pending steer request, optional error type, and output list → converts the error into a rejection reason → emits the turn-steer event with no accepted turn ID.
 
-**Call relations**: Reached only for failed turn-steer requests via `ingest_request_error_response`.
+**Call relations**: ingest_request_error_response calls this for turn-steer errors; it uses emit_turn_steer_event for the shared event shape.
 
 *Call graph*: calls 2 internal fn (emit_turn_steer_event, rejection_reason_from_error_type); called by 1 (ingest_request_error_response).
 
@@ -1228,11 +1234,11 @@ async fn ingest_notification(
     )
 ```
 
-**Purpose**: Processes server notifications that contribute to analytics state or directly trigger event emission, including item lifecycle, guardian review completion, turn lifecycle, and diff updates.
+**Purpose**: Processes server notifications, which are the stream of live updates during a turn. It records tool timings, tool counts, diffs, turn start and completion, and guardian review completions.
 
-**Data flow**: Consumes a `ServerNotification` and mutates reducer state. `ItemStarted` records start timestamps for tracked tool items. `ItemCompleted` updates turn tool counts, looks up start/completion times and thread context, builds a tool-item event via `tool_item_event`, and clears any stored review summary. Guardian review completion delegates to `ingest_guardian_review_completed`. `TurnStarted`, `TurnDiffUpdated`, and `TurnCompleted` update turn state and may trigger `maybe_emit_turn_event`.
+**Data flow**: It receives one notification → depending on its kind, stores start times, emits completed tool events, updates turn state, saves latest diffs, or triggers final turn emission.
 
-**Call relations**: Called from `ingest` on notifications. It is the main bridge from streaming server notifications into accumulated analytics state.
+**Call relations**: AnalyticsReducer::ingest calls this for notifications; it uses helpers such as tracked_tool_item_id, tool_item_event, ingest_guardian_review_completed, analytics_turn_status, and maybe_emit_turn_event.
 
 *Call graph*: calls 7 internal fn (tool_item, ingest_guardian_review_completed, maybe_emit_turn_event, thread_context_or_warn, analytics_turn_status, tool_item_event, tracked_tool_item_id); called by 1 (ingest); 3 external calls (option_i64_to_u64, matches!, warn!).
 
@@ -1248,11 +1254,11 @@ fn emit_thread_initialized(
         initialization_mode: ThreadInitializationMo
 ```
 
-**Purpose**: Registers thread metadata from a successful thread start/resume/fork response and emits the corresponding thread-initialized analytics event.
+**Purpose**: Stores thread metadata and emits the event that says a thread has been created, resumed, or forked.
 
-**Data flow**: Consumes connection ID, protocol `Thread`, model string, initialization mode, and output buffer. It converts protocol session source into `SessionSource`, derives `ThreadMetadataState` with `from_thread_metadata`, stores it in `self.threads`, and pushes a `ThreadInitializedEvent` populated from connection metadata and thread fields.
+**Data flow**: It receives connection ID, thread data, model, initialization mode, and output list → looks up connection context, derives thread metadata, stores it, and appends a ThreadInitialized event.
 
-**Call relations**: Called from `ingest_response` for thread lifecycle responses. It seeds thread context required by many later analytics events.
+**Call relations**: ingest_response calls this for thread-start, resume, and fork responses; later turn and tool events depend on the stored thread metadata.
 
 *Call graph*: calls 1 internal fn (from_thread_metadata); called by 1 (ingest_response); 2 external calls (ThreadInitialized, try_from).
 
@@ -1263,11 +1269,11 @@ fn emit_thread_initialized(
 fn ingest_compaction(&mut self, input: CodexCompactionEvent, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits a compaction analytics event once thread/session/client/runtime context is available.
+**Purpose**: Emits analytics when a conversation context is compacted.
 
-**Data flow**: Consumes `CodexCompactionEvent`, looks up connection and thread metadata with `thread_context_or_warn`, builds event params via `codex_compaction_event_params`, wraps them in `CodexCompactionEventRequest`, and pushes `TrackEventRequest::Compaction`.
+**Data flow**: It receives a compaction fact → looks up connection and thread metadata → builds compaction event parameters and appends the event.
 
-**Call relations**: Called from `ingest` for custom compaction facts. Missing context causes a warning and drop.
+**Call relations**: AnalyticsReducer::ingest calls this for custom compaction facts; it uses AnalyticsDropSite::compaction and thread_context_or_warn.
 
 *Call graph*: calls 3 internal fn (codex_compaction_event_params, compaction, thread_context_or_warn); called by 1 (ingest); 2 external calls (new, Compaction).
 
@@ -1278,11 +1284,11 @@ fn ingest_compaction(&mut self, input: CodexCompactionEvent, out: &mut Vec<Track
 fn ingest_goal(&mut self, input: CodexGoalEvent, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Emits a goal analytics event once thread/session/client/runtime context is available.
+**Purpose**: Emits analytics for goal-related activity.
 
-**Data flow**: Consumes `CodexGoalEvent`, looks up connection and thread metadata, builds params with `codex_goal_event_params`, wraps them in `CodexGoalEventRequest`, and pushes `TrackEventRequest::Goal`.
+**Data flow**: It receives a goal fact → looks up thread and connection context → builds goal event parameters and appends the event.
 
-**Call relations**: Called from `ingest` for custom goal facts.
+**Call relations**: AnalyticsReducer::ingest calls this for custom goal facts; it follows the same context-checking pattern as compaction.
 
 *Call graph*: calls 3 internal fn (codex_goal_event_params, goal, thread_context_or_warn); called by 1 (ingest); 2 external calls (new, Goal).
 
@@ -1296,11 +1302,11 @@ fn ingest_guardian_review_completed(
         out: &mut Vec<TrackEventRequest>,
 ```
 
-**Purpose**: Converts a guardian approval review completion notification into a generic review analytics event and updates per-item review summary state.
+**Purpose**: Turns a completed guardian approval notification into a standard review event.
 
-**Data flow**: Consumes `ItemGuardianApprovalReviewCompletedNotification`, maps guardian status with `guardian_review_result`, derives subject metadata with `guardian_review_subject_metadata`, converts start/completion timestamps with `option_i64_to_u64`, computes requested-permission flags from the action, constructs a `PendingReviewState`, and passes it to `emit_review_event` with reviewer `Guardian`.
+**Data flow**: It receives a guardian review completion notification → maps the guardian status, subject, trigger, and permission flags → creates PendingReviewState-like data → emits a review event marked as reviewed by Guardian.
 
-**Call relations**: Called from notification handling when guardian review completion notifications arrive. It reuses the same review-event emission path as user approvals.
+**Call relations**: ingest_notification calls this for guardian review completion notifications; it then hands the normalized review to emit_review_event.
 
 *Call graph*: calls 5 internal fn (emit_review_event, guardian_review_requested_additional_permissions, guardian_review_requested_network_access, guardian_review_result, guardian_review_subject_metadata); called by 1 (ingest_notification); 1 external calls (option_i64_to_u64).
 
@@ -1317,11 +1323,11 @@ fn ingest_turn_steer_response(
     )
 ```
 
-**Purpose**: Completes a successful turn-steer request by incrementing the accepted turn’s steer count and emitting an accepted turn-steer analytics event.
+**Purpose**: Handles a successful turn-steer response and emits the accepted steer event.
 
-**Data flow**: Consumes connection ID, request ID, `TurnSteerResponse`, and output buffer. It removes the matching pending turn-steer request, increments `steer_count` on the accepted turn if that turn state exists, and calls `emit_turn_steer_event` with the accepted turn ID and result `Accepted`.
+**Data flow**: It receives connection ID, request ID, response, and output list → removes the pending steer request → increments the target turn's steer count if known → emits a successful turn-steer event.
 
-**Call relations**: Called from `ingest_response` for successful turn-steer responses.
+**Call relations**: ingest_response calls this for TurnSteer responses; it shares emission logic with the error path through emit_turn_steer_event.
 
 *Call graph*: calls 1 internal fn (emit_turn_steer_event); called by 1 (ingest_response).
 
@@ -1337,11 +1343,11 @@ fn emit_turn_steer_event(
         result: TurnSteerResult,
 ```
 
-**Purpose**: Builds and emits the serialized turn-steer analytics event using connection and thread metadata.
+**Purpose**: Builds and appends the analytics event for accepted or rejected turn steering.
 
-**Data flow**: Consumes connection ID, pending turn-steer state, optional accepted turn ID, result, optional rejection reason, and output buffer. It looks up connection metadata and thread metadata, warns and returns if missing, then pushes `TrackEventRequest::TurnSteer` with a populated `CodexTurnSteerEventRequest`.
+**Data flow**: It receives connection ID, pending steer data, optional accepted turn ID, result, rejection reason, and output list → looks up client and thread metadata → appends a TurnSteer event if context exists.
 
-**Call relations**: Shared by both successful and failed turn-steer paths. It depends on prior thread initialization having populated `self.threads`.
+**Call relations**: ingest_turn_steer_response calls it for accepted steering, and ingest_turn_steer_error_response calls it for rejected steering.
 
 *Call graph*: calls 2 internal fn (turn_steer, warn_missing_analytics_context); called by 2 (ingest_turn_steer_error_response, ingest_turn_steer_response); 1 external calls (TurnSteer).
 
@@ -1358,11 +1364,11 @@ fn emit_review_event(
         completed_a
 ```
 
-**Purpose**: Emits a generic review analytics event and, when applicable, updates the per-tool-item review summary used by later tool-item analytics.
+**Purpose**: Builds and appends a review analytics event. It also records a short review summary for the related tool item, if there is one.
 
-**Data flow**: Consumes `PendingReviewState`, reviewer, status, resolution, completion time, and output buffer. It derives an optional `ToolItemKey` with `item_review_summary_key`, updates summary state via `record_item_review_summary`, looks up connection/thread metadata, computes observed duration with `observed_duration_ms`, and pushes `TrackEventRequest::ReviewEvent`.
+**Data flow**: It receives pending review details, reviewer, status, resolution, completion time, and output list → updates per-item review summary → looks up context → appends a ReviewEvent with timing and outcome fields.
 
-**Call relations**: Called by user approval responses, guardian review completion, and aborted review paths. It is the central review-event emission routine.
+**Call relations**: Review completion paths call this from server responses, permission responses, aborted requests, and guardian completions.
 
 *Call graph*: calls 5 internal fn (review, record_item_review_summary, thread_context_or_warn, item_review_summary_key, observed_duration_ms); called by 4 (ingest_effective_permissions_approval_response, ingest_guardian_review_completed, ingest_server_request_aborted, ingest_server_response); 1 external calls (ReviewEvent).
 
@@ -1379,11 +1385,11 @@ fn record_item_review_summary(
         pending_review:
 ```
 
-**Purpose**: Accumulates review counts and final approval outcome for a tool item so the eventual tool-item event can report aggregate review information.
+**Purpose**: Accumulates review facts that should later be attached to a tool item event.
 
-**Data flow**: Consumes a `ToolItemKey`, reviewer, status, resolution, and borrowed `PendingReviewState`. It mutably updates or creates `ItemReviewSummary`, increments total and reviewer-specific counts, overwrites `final_approval_outcome` using `final_approval_outcome`, and ORs in requested-permission flags.
+**Data flow**: It receives an item key, reviewer, status, resolution, and pending review → increments total, guardian, or user review counts → stores final approval outcome and permission-request flags.
 
-**Call relations**: Called only from `emit_review_event` when the review subject corresponds to a concrete tool item.
+**Call relations**: emit_review_event calls this before emitting the review; ingest_notification later reads the summary when the tool item completes.
 
 *Call graph*: calls 1 internal fn (final_approval_outcome); called by 1 (emit_review_event).
 
@@ -1394,11 +1400,11 @@ fn record_item_review_summary(
 async fn maybe_emit_turn_event(&mut self, turn_id: &str, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Checks whether a turn has accumulated all required state and, if so, emits the turn analytics event plus any accepted-line fingerprint events.
+**Purpose**: Checks whether a turn has all required pieces and, if so, emits the final turn analytics event. It is the gatekeeper that prevents partial turn events.
 
-**Data flow**: Reads the `TurnState` for `turn_id`; if thread ID, image count, resolved config, profile, or completion are missing, it returns early. Otherwise it resolves connection and thread metadata, builds `CodexTurnEventParams` with `codex_turn_event_params`, pushes `TrackEventRequest::TurnEvent`, optionally derives accepted-line input with `accepted_line_event_input`, asynchronously fills `repo_hash` via `accepted_line_repo_hash_for_cwd`, extends output with `accepted_line_fingerprint_event_requests`, and finally removes the turn state from `self.turns`.
+**Data flow**: It receives a turn ID and output list → verifies thread ID, image count, resolved config, profile, completion, connection, and metadata are present → appends the turn event, optionally appends accepted-line fingerprint events, and removes the completed turn state.
 
-**Call relations**: Called after each partial turn-state update and on turn completion. It is the convergence point for turn analytics emission.
+**Call relations**: Turn-related ingest methods call this whenever they add another piece of turn data, including config, profile, token usage, start response, and completion notification.
 
 *Call graph*: calls 6 internal fn (accepted_line_fingerprint_event_requests, accepted_line_repo_hash_for_cwd, turn, accepted_line_event_input, codex_turn_event_params, warn_missing_analytics_context); called by 5 (ingest_notification, ingest_response, ingest_turn_profile, ingest_turn_resolved_config, ingest_turn_token_usage); 2 external calls (new, TurnEvent).
 
@@ -1412,11 +1418,11 @@ fn thread_connection_or_warn(
     ) -> Option<&ConnectionState>
 ```
 
-**Purpose**: Looks up the connection metadata associated with a thread, logging a structured warning if the thread or connection mapping is missing.
+**Purpose**: Finds the connection metadata for a thread or logs why it cannot.
 
-**Data flow**: Reads `self.threads` and `self.connections` using the thread ID from `AnalyticsDropSite`. It returns `Some(&ConnectionState)` on success or logs via `warn_missing_analytics_context` and returns `None` on failure.
+**Data flow**: It receives a drop-site label → looks up the thread, then its connection ID, then the connection state → returns the connection state or None after warning.
 
-**Call relations**: Used by `thread_context_or_warn` as the first half of full thread-context resolution.
+**Call relations**: thread_context_or_warn calls this as the first half of fetching full analytics context.
 
 *Call graph*: calls 1 internal fn (warn_missing_analytics_context); called by 1 (thread_context_or_warn).
 
@@ -1430,11 +1436,11 @@ fn thread_context_or_warn(
     ) -> Option<(&ConnectionState, &ThreadMetadataState)>
 ```
 
-**Purpose**: Looks up both connection metadata and thread metadata for a given drop site, warning and returning `None` if either is absent.
+**Purpose**: Finds both connection and thread metadata needed for most analytics events.
 
-**Data flow**: Consumes an `AnalyticsDropSite`, delegates to `thread_connection_or_warn`, then reads `self.threads` for metadata. It returns a tuple of borrowed `ConnectionState` and `ThreadMetadataState` or logs and returns `None`.
+**Data flow**: It receives a drop-site label → gets connection state through thread_connection_or_warn → looks up thread metadata → returns both pieces or warns and returns None.
 
-**Call relations**: Used by compaction, goal, guardian review, review-event, and tool-item emission paths to guard against incomplete reducer context.
+**Call relations**: Review, guardian, compaction, goal, and tool-item paths call this before emitting events that need full context.
 
 *Call graph*: calls 2 internal fn (thread_connection_or_warn, warn_missing_analytics_context); called by 5 (emit_review_event, ingest_compaction, ingest_goal, ingest_guardian_review, ingest_notification).
 
@@ -1448,11 +1454,11 @@ fn warn_missing_analytics_context(
 )
 ```
 
-**Purpose**: Emits a structured warning describing which analytics event was dropped and which piece of context was missing.
+**Purpose**: Writes a structured warning when an analytics event must be dropped because required context is missing.
 
-**Data flow**: Reads an `AnalyticsDropSite` and `MissingAnalyticsContext`, derives a string label and optional connection ID, and logs a `tracing::warn!` with thread/turn/review/item identifiers.
+**Data flow**: It receives a drop-site label and the kind of missing context → formats the missing context name and optional connection ID → sends a tracing warning.
 
-**Call relations**: Called by context lookup helpers and turn-steer/turn emission paths whenever analytics cannot be emitted safely.
+**Call relations**: Context lookup and event emission helpers call this instead of silently losing analytics events.
 
 *Call graph*: called by 4 (emit_turn_steer_event, maybe_emit_turn_event, thread_connection_or_warn, thread_context_or_warn); 1 external calls (warn!).
 
@@ -1463,11 +1469,11 @@ fn warn_missing_analytics_context(
 fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str>
 ```
 
-**Purpose**: Extracts the stable item ID for tool-item variants that should participate in tool analytics tracking.
+**Purpose**: Decides whether a thread item is a tool item that should get detailed analytics, and returns its item ID if so.
 
-**Data flow**: Reads a borrowed `ThreadItem`, returns `Some(&str)` for command execution, file change, MCP, dynamic tool, collab agent, web search, and image generation items, and `None` for transcript/reasoning/non-tool variants.
+**Data flow**: It receives a ThreadItem → returns the ID for command, file change, MCP, dynamic, collaboration agent, web search, and image generation items → returns None for messages and other non-tool items.
 
-**Call relations**: Used by notification handling to decide whether an item should have start/completion timestamps tracked and whether a tool-item analytics event can be emitted.
+**Call relations**: ingest_notification uses this for item-started and item-completed notifications.
 
 *Call graph*: called by 1 (ingest_notification).
 
@@ -1478,11 +1484,11 @@ fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str>
 fn item_review_summary_key(pending_review: &PendingReviewState) -> Option<ToolItemKey>
 ```
 
-**Purpose**: Determines whether a pending review should contribute to a concrete tool item’s review summary and, if so, constructs the key.
+**Purpose**: Builds the lookup key used to attach review summaries to later tool item events.
 
-**Data flow**: Reads a borrowed `PendingReviewState`. For command execution, file change, and MCP tool call subjects it clones thread ID, turn ID, and item ID into a `ToolItemKey`; for permissions and network-access reviews it returns `None`.
+**Data flow**: It receives a pending review → if the review is tied to a command, file change, or MCP tool call, combines thread ID, turn ID, and item ID into a ToolItemKey → otherwise returns None.
 
-**Call relations**: Called by `emit_review_event` before updating `item_review_summaries`.
+**Call relations**: emit_review_event calls this before recording per-item review information.
 
 *Call graph*: called by 1 (emit_review_event).
 
@@ -1493,11 +1499,11 @@ fn item_review_summary_key(pending_review: &PendingReviewState) -> Option<ToolIt
 fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest>
 ```
 
-**Purpose**: Builds the concrete analytics event for a completed tool item by inspecting the `ThreadItem` variant and deriving variant-specific counters and outcome fields.
+**Purpose**: Builds the correct analytics event for a completed tool item. Different tool kinds need different details, but they all share a common base.
 
-**Data flow**: Consumes `ToolItemEventInput`, pattern-matches the borrowed `ThreadItem`, derives terminal status/failure kind via helper functions, computes counts such as command actions, file changes, dynamic content, receiver threads, or web-search query counts, builds a shared `CodexToolItemEventBase` with `tool_item_base`, and returns the appropriate `TrackEventRequest` variant or `None` for unsupported/in-progress items.
+**Data flow**: It receives tool item input with IDs, timings, context, and optional review summary → matches the item kind → computes outcome and counts → returns the matching TrackEventRequest, or None for untracked/in-progress items.
 
-**Call relations**: Called from notification handling on `ItemCompleted` after timestamps and thread context are available. It delegates heavily to outcome/count/name helpers to keep per-variant logic localized.
+**Call relations**: ingest_notification calls this after a tracked tool completes; it delegates to many small helpers for names, outcomes, counts, and common base fields.
 
 *Call graph*: calls 12 internal fn (collab_agent_tool_name, collab_tool_call_outcome, command_action_counts, command_execution_outcome, command_execution_tool_name, dynamic_tool_call_outcome, file_change_counts, image_generation_outcome, mcp_tool_call_outcome, patch_apply_outcome (+2 more)); called by 1 (ingest_notification); 9 external calls (CollabAgentToolCall, CommandExecution, DynamicToolCall, FileChange, ImageGeneration, McpToolCall, WebSearch, option_i64_to_u64, usize_to_u64).
 
@@ -1508,11 +1514,11 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest>
 fn command_action_counts(command_actions: &[CommandAction]) -> CommandActionCounts
 ```
 
-**Purpose**: Counts command action categories within a command execution item.
+**Purpose**: Counts what kinds of actions a command performed, such as reading files or searching.
 
-**Data flow**: Reads a slice of `CommandAction`, initializes totals from length, iterates actions, increments `read`, `list_files`, `search`, or `unknown`, and returns `CommandActionCounts`.
+**Data flow**: It receives a list of command actions → starts with the total length → increments read, list-files, search, or unknown counters → returns the counts.
 
-**Call relations**: Used only by `tool_item_event` when building command execution analytics.
+**Call relations**: tool_item_event uses this when building command execution analytics.
 
 *Call graph*: called by 1 (tool_item_event); 3 external calls (default, len, usize_to_u64).
 
@@ -1530,11 +1536,11 @@ fn tool_item_base(
 ) -> CodexToolItemEventBase
 ```
 
-**Purpose**: Constructs the shared base payload embedded in all tool-item analytics events.
+**Purpose**: Creates the common fields shared by all tool item analytics events.
 
-**Data flow**: Consumes thread/turn/item identifiers, tool name, `ToolItemOutcome`, and `ToolItemContext`. It clones connection and thread metadata, computes observed duration with `observed_duration_ms`, folds in optional review summary data or defaults, and returns `CodexToolItemEventBase`.
+**Data flow**: It receives thread and turn IDs, item ID, tool name, outcome, timing, connection context, thread metadata, and review summary → combines them into CodexToolItemEventBase.
 
-**Call relations**: Called by each tool-item branch inside `tool_item_event` to avoid duplicating common payload assembly.
+**Call relations**: tool_item_event calls this for every tracked tool kind so command, file, MCP, dynamic, agent, web, and image events have consistent fields.
 
 *Call graph*: calls 1 internal fn (observed_duration_ms); called by 1 (tool_item_event).
 
@@ -1545,11 +1551,11 @@ fn tool_item_base(
 fn observed_duration_ms(started_at_ms: u64, completed_at_ms: u64) -> Option<u64>
 ```
 
-**Purpose**: Computes a nonnegative observed duration from start and completion timestamps.
+**Purpose**: Safely calculates elapsed time in milliseconds.
 
-**Data flow**: Consumes `started_at_ms` and `completed_at_ms`, performs `checked_sub`, and returns `Some(duration)` or `None` if completion precedes start.
+**Data flow**: It receives start and completion times → subtracts start from completion only if completion is not earlier → returns the duration or None.
 
-**Call relations**: Used by both review-event and tool-item base construction.
+**Call relations**: emit_review_event and tool_item_base use it to fill duration fields without underflowing if timestamps are unusual.
 
 *Call graph*: called by 2 (emit_review_event, tool_item_base).
 
@@ -1560,11 +1566,11 @@ fn observed_duration_ms(started_at_ms: u64, completed_at_ms: u64) -> Option<u64>
 fn user_review_id(request_id: &RequestId) -> String
 ```
 
-**Purpose**: Synthesizes a stable analytics review ID for user approval requests from the underlying JSON-RPC request ID.
+**Purpose**: Creates a stable analytics review ID for a user approval request.
 
-**Data flow**: Reads a borrowed `RequestId`, formats it as `user:{request_id}`, and returns the resulting `String`.
+**Data flow**: It receives a request ID → prefixes it with "user:" → returns the resulting string.
 
-**Call relations**: Used when pending user reviews are first recorded in `ingest_server_request`.
+**Call relations**: ingest_server_request uses this when storing pending user reviews.
 
 *Call graph*: called by 1 (ingest_server_request); 1 external calls (format!).
 
@@ -1577,11 +1583,11 @@ fn command_execution_review_result(
 ) -> (ReviewStatus, ReviewResolution)
 ```
 
-**Purpose**: Maps a command execution approval decision into analytics review status and resolution.
+**Purpose**: Translates a command approval decision into analytics status and resolution.
 
-**Data flow**: Consumes `CommandExecutionApprovalDecision`, pattern-matches all variants, and returns a `(ReviewStatus, ReviewResolution)` pair that distinguishes plain approval, session approval, exec-policy amendment, network-policy amendment, denial, and cancellation.
+**Data flow**: It receives the user's command decision → maps accept, session accept, policy amendments, decline, and cancel into ReviewStatus and ReviewResolution values.
 
-**Call relations**: Used by `ingest_server_response` for command execution approval responses.
+**Call relations**: ingest_server_response uses this before emitting command review analytics.
 
 *Call graph*: called by 1 (ingest_server_response).
 
@@ -1594,11 +1600,11 @@ fn file_change_review_result(
 ) -> (ReviewStatus, ReviewResolution)
 ```
 
-**Purpose**: Maps a file-change approval decision into analytics review status and resolution.
+**Purpose**: Translates a file-change approval decision into analytics status and resolution.
 
-**Data flow**: Consumes `FileChangeApprovalDecision` and returns the corresponding `(ReviewStatus, ReviewResolution)` pair.
+**Data flow**: It receives the user's file-change decision → maps it to approved, denied, or aborted, with session approval when applicable → returns the pair.
 
-**Call relations**: Used by `ingest_server_response` for file-change approval responses.
+**Call relations**: ingest_server_response uses this before emitting file-change review analytics.
 
 *Call graph*: called by 1 (ingest_server_response).
 
@@ -1611,11 +1617,11 @@ fn effective_permissions_review_result(
 ) -> (ReviewStatus, ReviewResolution)
 ```
 
-**Purpose**: Interprets the effective granted permissions response as an approval or denial plus scope resolution.
+**Purpose**: Translates a permissions response into analytics status and resolution.
 
-**Data flow**: Reads a borrowed `CoreRequestPermissionsResponse`. If no permissions were granted it returns denied/none; otherwise it maps grant scope `Turn` to approved/none and `Session` to approved/session approval.
+**Data flow**: It receives a permission response → treats an empty permission set as denied → otherwise marks it approved for the turn or session depending on the grant scope.
 
-**Call relations**: Used by `ingest_effective_permissions_approval_response`.
+**Call relations**: ingest_effective_permissions_approval_response uses this before emitting a review event.
 
 *Call graph*: called by 1 (ingest_effective_permissions_approval_response).
 
@@ -1628,11 +1634,11 @@ fn guardian_review_result(
 ) -> Option<(ReviewStatus, ReviewResolution)>
 ```
 
-**Purpose**: Maps guardian approval review status into analytics review status, omitting in-progress notifications.
+**Purpose**: Translates a guardian review status into analytics status and resolution, ignoring reviews still in progress.
 
-**Data flow**: Consumes `GuardianApprovalReviewStatus` and returns `None` for `InProgress` or `Some((ReviewStatus, ReviewResolution::None))` for terminal statuses approved, denied, timed out, or aborted.
+**Data flow**: It receives a guardian status → returns None for in-progress → returns approved, denied, timed out, or aborted with no extra resolution for terminal statuses.
 
-**Call relations**: Used by `ingest_guardian_review_completed` to ignore nonterminal notifications and normalize terminal ones.
+**Call relations**: ingest_guardian_review_completed uses this to decide whether a guardian completion should produce a review event.
 
 *Call graph*: called by 1 (ingest_guardian_review_completed).
 
@@ -1645,11 +1651,11 @@ fn guardian_review_subject_metadata(
 ) -> (ReviewSubjectKind, String, ReviewTrigger)
 ```
 
-**Purpose**: Derives analytics subject kind, subject name, and trigger from the reviewed guardian action.
+**Purpose**: Describes what a guardian reviewed and why the review was triggered.
 
-**Data flow**: Reads a borrowed `GuardianApprovalReviewAction`, pattern-matches its variant, and returns a tuple describing the review subject and trigger. `RequestPermissions` inspects nested network/file-system permissions to distinguish initial, sandbox-denial, and network-policy-denial triggers.
+**Data flow**: It receives a guardian review action → maps it to a subject kind, subject name, and trigger such as initial review, sandbox denial, network denial, or exec interception.
 
-**Call relations**: Used by `ingest_guardian_review_completed` when converting guardian review notifications into generic review events.
+**Call relations**: ingest_guardian_review_completed calls this while converting guardian notifications into standard review events.
 
 *Call graph*: called by 1 (ingest_guardian_review_completed).
 
@@ -1660,11 +1666,11 @@ fn guardian_review_subject_metadata(
 fn guardian_review_requested_additional_permissions(action: &GuardianApprovalReviewAction) -> bool
 ```
 
-**Purpose**: Determines whether a guardian-reviewed action requested any additional permissions for analytics summary purposes.
+**Purpose**: Answers whether a guardian-reviewed action asked for extra permissions beyond the current sandbox.
 
-**Data flow**: Reads a borrowed `GuardianApprovalReviewAction`. It returns true for apply-patch and network-access actions, inspects `RequestPermissions` via `guardian_review_request_permissions_network_enabled` and file-system presence, and returns false for command/execve/MCP actions.
+**Data flow**: It receives a guardian action → checks action kind and permission request details → returns true for patch, network, or explicit permission expansion cases.
 
-**Call relations**: Used by `ingest_guardian_review_completed` to populate pending review summary flags.
+**Call relations**: ingest_guardian_review_completed uses this flag so review and tool analytics can show whether extra permissions were involved.
 
 *Call graph*: calls 1 internal fn (guardian_review_request_permissions_network_enabled); called by 1 (ingest_guardian_review_completed).
 
@@ -1675,11 +1681,11 @@ fn guardian_review_requested_additional_permissions(action: &GuardianApprovalRev
 fn guardian_review_requested_network_access(action: &GuardianApprovalReviewAction) -> bool
 ```
 
-**Purpose**: Determines whether a guardian-reviewed action requested network access.
+**Purpose**: Answers whether a guardian-reviewed action asked for network access.
 
-**Data flow**: Reads a borrowed `GuardianApprovalReviewAction`, returns true for explicit network-access actions, inspects `RequestPermissions` network settings via `guardian_review_request_permissions_network_enabled`, and returns false otherwise.
+**Data flow**: It receives a guardian action → checks network actions and permission profiles → returns true only when network access was requested.
 
-**Call relations**: Used by `ingest_guardian_review_completed` alongside the additional-permissions helper.
+**Call relations**: ingest_guardian_review_completed stores this on the pending review; record_item_review_summary may later attach it to a tool event.
 
 *Call graph*: calls 1 internal fn (guardian_review_request_permissions_network_enabled); called by 1 (ingest_guardian_review_completed).
 
@@ -1692,11 +1698,11 @@ fn guardian_review_request_permissions_network_enabled(
 ) -> bool
 ```
 
-**Purpose**: Extracts the boolean network-enabled flag from a request-permissions profile.
+**Purpose**: Checks whether a permission profile explicitly enables network access.
 
-**Data flow**: Reads a borrowed `RequestPermissionProfile`, traverses optional `network.enabled`, defaults missing values to false, and returns the resulting `bool`.
+**Data flow**: It receives a request permission profile → looks for the optional network section and its enabled flag → returns false if either is missing.
 
-**Call relations**: Shared helper for the two guardian review permission-flag functions.
+**Call relations**: The two guardian permission helpers use this to avoid duplicating the network-checking logic.
 
 *Call graph*: called by 2 (guardian_review_requested_additional_permissions, guardian_review_requested_network_access).
 
@@ -1711,11 +1717,11 @@ fn final_approval_outcome(
 ) -> FinalApprovalOutcome
 ```
 
-**Purpose**: Collapses reviewer, review status, and resolution into the single final approval outcome enum stored on tool-item analytics.
+**Purpose**: Condenses reviewer, status, and resolution into one final approval outcome label for a tool item.
 
-**Data flow**: Consumes `Reviewer`, `ReviewStatus`, and `ReviewResolution`, pattern-matches the tuple, and returns a `FinalApprovalOutcome` such as `GuardianApproved`, `UserApprovedForSession`, or `UserAborted`.
+**Data flow**: It receives who reviewed, whether they approved or denied, and any resolution → returns labels such as guardian approved, user denied, or user approved for session.
 
-**Call relations**: Used by `record_item_review_summary` whenever a review affecting a tool item completes.
+**Call relations**: record_item_review_summary calls this when updating the review summary attached to later tool analytics.
 
 *Call graph*: called by 1 (record_item_review_summary).
 
@@ -1726,11 +1732,11 @@ fn final_approval_outcome(
 fn command_execution_tool_name(source: CommandExecutionSource) -> &'static str
 ```
 
-**Purpose**: Maps command execution source to the analytics tool name string.
+**Purpose**: Normalizes different command execution sources into analytics tool names.
 
-**Data flow**: Consumes `CommandExecutionSource` and returns `unified_exec`, `user_shell`, or `shell`.
+**Data flow**: It receives a command execution source → returns names such as "unified_exec", "user_shell", or "shell".
 
-**Call relations**: Used by `tool_item_event` when building command execution analytics.
+**Call relations**: tool_item_event uses this when building command execution events.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1743,11 +1749,11 @@ fn command_execution_outcome(
 ) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>
 ```
 
-**Purpose**: Maps command execution status into tool terminal status and failure kind, skipping in-progress items.
+**Purpose**: Maps command execution status into a final tool outcome. In-progress commands do not produce final tool analytics yet.
 
-**Data flow**: Reads a borrowed `CommandExecutionStatus` and returns `None` for `InProgress` or `Some((ToolItemTerminalStatus, Option<ToolItemFailureKind>))` for completed, failed, or declined outcomes.
+**Data flow**: It receives a command status → returns None for in progress → otherwise returns completed, failed, or rejected plus a failure reason when needed.
 
-**Call relations**: Used by `tool_item_event` to decide whether a command execution item is ready for analytics emission.
+**Call relations**: tool_item_event uses this before emitting command execution analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1760,11 +1766,11 @@ fn patch_apply_outcome(
 ) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>
 ```
 
-**Purpose**: Maps patch/file-change status into tool terminal status and failure kind, skipping in-progress items.
+**Purpose**: Maps file patch status into a final tool outcome.
 
-**Data flow**: Reads a borrowed `PatchApplyStatus` and returns `None` for `InProgress` or the corresponding completed/failed/rejected tuple.
+**Data flow**: It receives patch status → returns None for in progress → otherwise returns completed, failed, or rejected with the appropriate failure kind.
 
-**Call relations**: Used by `tool_item_event` for file-change analytics.
+**Call relations**: tool_item_event uses this when building file change analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1777,11 +1783,11 @@ fn mcp_tool_call_outcome(
 ) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>
 ```
 
-**Purpose**: Maps MCP tool call status into tool terminal status and failure kind, skipping in-progress items.
+**Purpose**: Maps MCP tool call status into a final tool outcome. MCP means Model Context Protocol, a way for the model to call external tools.
 
-**Data flow**: Reads a borrowed `McpToolCallStatus` and returns `None` for `InProgress` or the corresponding completed/failed tuple.
+**Data flow**: It receives MCP tool status → returns None for in progress → otherwise returns completed or failed.
 
-**Call relations**: Used by `tool_item_event` for MCP tool call analytics.
+**Call relations**: tool_item_event uses this when building MCP tool call analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1794,11 +1800,11 @@ fn dynamic_tool_call_outcome(
 ) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>
 ```
 
-**Purpose**: Maps dynamic tool call status into tool terminal status and failure kind, skipping in-progress items.
+**Purpose**: Maps dynamic tool call status into a final tool outcome.
 
-**Data flow**: Reads a borrowed `DynamicToolCallStatus` and returns `None` for `InProgress` or the corresponding completed/failed tuple.
+**Data flow**: It receives dynamic tool status → returns None for in progress → otherwise returns completed or failed with a tool-error failure kind when failed.
 
-**Call relations**: Used by `tool_item_event` for dynamic tool call analytics.
+**Call relations**: tool_item_event uses this when building dynamic tool call analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1811,11 +1817,11 @@ fn collab_tool_call_outcome(
 ) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>
 ```
 
-**Purpose**: Maps collaborative agent tool call status into tool terminal status and failure kind, skipping in-progress items.
+**Purpose**: Maps collaborative agent tool call status into a final tool outcome.
 
-**Data flow**: Reads a borrowed `CollabAgentToolCallStatus` and returns `None` for `InProgress` or the corresponding completed/failed tuple.
+**Data flow**: It receives collaboration tool status → returns None for in progress → otherwise returns completed or failed.
 
-**Call relations**: Used by `tool_item_event` for collab-agent tool analytics.
+**Call relations**: tool_item_event uses this when building collaborative agent tool call analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1826,11 +1832,11 @@ fn collab_tool_call_outcome(
 fn image_generation_outcome(status: &str) -> (ToolItemTerminalStatus, Option<ToolItemFailureKind>)
 ```
 
-**Purpose**: Normalizes image generation status strings into analytics terminal status and failure kind.
+**Purpose**: Maps an image generation status string into a final analytics outcome.
 
-**Data flow**: Reads a status string slice; `failed` and `error` map to failed/tool-error, while all other strings map to completed/no failure.
+**Data flow**: It receives the raw status text → treats "failed" and "error" as failed tool errors → treats other statuses as completed.
 
-**Call relations**: Used by `tool_item_event` for image generation analytics because that protocol surface exposes a string status rather than a typed enum.
+**Call relations**: tool_item_event uses this when building image generation analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1841,11 +1847,11 @@ fn image_generation_outcome(status: &str) -> (ToolItemTerminalStatus, Option<Too
 fn collab_agent_tool_name(tool: &CollabAgentTool) -> &'static str
 ```
 
-**Purpose**: Maps collaborative agent tool enum variants to analytics tool name strings.
+**Purpose**: Converts a collaborative agent tool enum into a stable analytics name.
 
-**Data flow**: Consumes a borrowed `CollabAgentTool` and returns one of `spawn_agent`, `send_input`, `resume_agent`, `wait_agent`, or `close_agent`.
+**Data flow**: It receives a collaboration tool type → returns names such as "spawn_agent", "send_input", or "wait_agent".
 
-**Call relations**: Used by `tool_item_event` when building collab-agent tool call analytics.
+**Call relations**: tool_item_event uses this when building collaborative agent tool call events.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1856,11 +1862,11 @@ fn collab_agent_tool_name(tool: &CollabAgentTool) -> &'static str
 fn file_change_counts(changes: &[codex_app_server_protocol::FileUpdateChange]) -> FileChangeCounts
 ```
 
-**Purpose**: Counts add/update/delete/move operations within a file-change item.
+**Purpose**: Counts the kinds of file changes in a patch.
 
-**Data flow**: Reads a slice of `FileUpdateChange`, initializes `FileChangeCounts::default()`, iterates changes, increments counters based on `PatchChangeKind`, and returns the counts.
+**Data flow**: It receives a list of file update changes → counts adds, deletes, updates, and moves → returns the counts.
 
-**Call relations**: Used by `tool_item_event` for file-change analytics.
+**Call relations**: tool_item_event uses this to add file-change breakdowns to file change analytics.
 
 *Call graph*: called by 1 (tool_item_event); 1 external calls (default).
 
@@ -1871,11 +1877,11 @@ fn file_change_counts(changes: &[codex_app_server_protocol::FileUpdateChange]) -
 fn dynamic_content_counts(items: &[DynamicToolCallOutputContentItem]) -> DynamicContentCounts
 ```
 
-**Purpose**: Counts total, text, and image output content items from a dynamic tool call.
+**Purpose**: Counts text and image output items from a dynamic tool call.
 
-**Data flow**: Reads a slice of `DynamicToolCallOutputContentItem`, iterates items to count text vs image variants, computes total from length, and returns `DynamicContentCounts`.
+**Data flow**: It receives output content items → counts total items, text items, and image items → returns the totals.
 
-**Call relations**: Used by `tool_item_event` when a dynamic tool call reports output content items.
+**Call relations**: tool_item_event uses this when dynamic tool output content is present.
 
 *Call graph*: 2 external calls (len, usize_to_u64).
 
@@ -1886,11 +1892,11 @@ fn dynamic_content_counts(items: &[DynamicToolCallOutputContentItem]) -> Dynamic
 fn web_search_action_kind(action: &WebSearchAction) -> WebSearchActionKind
 ```
 
-**Purpose**: Maps protocol web-search action variants into the analytics `WebSearchActionKind` enum.
+**Purpose**: Normalizes a web search action into a simple analytics category.
 
-**Data flow**: Consumes a borrowed `WebSearchAction` and returns `Search`, `OpenPage`, `FindInPage`, or `Other`.
+**Data flow**: It receives a web search action → returns Search, OpenPage, FindInPage, or Other.
 
-**Call relations**: Used by `tool_item_event` for web-search analytics.
+**Call relations**: tool_item_event uses this when building web search analytics.
 
 
 ##### `web_search_query_count`  (lines 2400–2411)
@@ -1899,11 +1905,11 @@ fn web_search_action_kind(action: &WebSearchAction) -> WebSearchActionKind
 fn web_search_query_count(query: &str, action: Option<&WebSearchAction>) -> Option<u64>
 ```
 
-**Purpose**: Derives how many search queries were represented by a web-search item, when that concept applies.
+**Purpose**: Counts how many search queries are represented by a web search event when that count is meaningful.
 
-**Data flow**: Reads the raw query string and optional `WebSearchAction`. For `Search`, it prefers the explicit `queries` list length, otherwise counts a single nonempty query. For open-page/find-in-page/other actions it returns `None`. With no action, it returns `Some(1)` only if the raw query is nonblank.
+**Data flow**: It receives the legacy query string and optional structured action → returns a count for search actions or non-empty legacy queries, and None for page-open or find-in-page actions.
 
-**Call relations**: Used by `tool_item_event` to populate `query_count` on web-search analytics.
+**Call relations**: tool_item_event uses this to fill the query count in web search analytics.
 
 *Call graph*: called by 1 (tool_item_event).
 
@@ -1917,11 +1923,11 @@ fn accepted_line_event_input(
 ) -> Option<(AcceptedLineFingerprintEventInput, PathBuf)>
 ```
 
-**Purpose**: Builds the intermediate input for accepted-line fingerprint analytics from a completed turn’s latest diff and resolved config.
+**Purpose**: Prepares accepted-line fingerprint analytics from the latest turn diff. These fingerprints summarize code lines added or removed without sending the raw code.
 
-**Data flow**: Reads `turn_id` and borrowed `TurnState`, extracts `latest_diff`, computes accepted-line summary via `accepted_line_fingerprints_from_unified_diff`, returns `None` if both added and deleted accepted counts are zero, otherwise clones thread ID and resolved config, stamps `completed_at` with `now_unix_seconds()`, and returns `(AcceptedLineFingerprintEventInput, permission_profile_cwd)`.
+**Data flow**: It receives a turn ID and turn state → parses the latest unified diff into line fingerprints → if there are accepted additions or deletions, returns event input plus the working directory for repo hashing.
 
-**Call relations**: Called by `maybe_emit_turn_event` after the main turn event is emitted so accepted-line analytics can be generated opportunistically.
+**Call relations**: maybe_emit_turn_event calls this after emitting a turn event; if it returns data, repository hashing and accepted-line event requests are produced.
 
 *Call graph*: calls 1 internal fn (accepted_line_fingerprints_from_unified_diff); called by 1 (maybe_emit_turn_event); 1 external calls (now_unix_seconds).
 
@@ -1937,11 +1943,11 @@ fn codex_turn_event_params(
     thread_metadata: &ThreadMetadat
 ```
 
-**Purpose**: Assembles the full turn analytics payload from accumulated turn state plus connection and thread metadata.
+**Purpose**: Builds the full payload for a completed turn analytics event.
 
-**Data flow**: Consumes app-server client metadata, runtime metadata, turn ID, borrowed `TurnState`, and borrowed `ThreadMetadataState`. It requires populated thread ID, image count, resolved config, profile, and completion state, destructures those values, derives sandbox policy, collaboration mode, reasoning summary, and personality strings via helper functions, copies token usage and tool counts, and returns `CodexTurnEventParams`.
+**Data flow**: It receives client metadata, runtime metadata, turn ID, completed turn state, and thread metadata → extracts model, permissions, timing, token, tool count, status, and error fields → returns CodexTurnEventParams.
 
-**Call relations**: Called only by `maybe_emit_turn_event` once all prerequisites are satisfied. It is the final turn-payload assembler.
+**Call relations**: maybe_emit_turn_event calls this only after checking the turn state is fully populated.
 
 *Call graph*: calls 4 internal fn (collaboration_mode_mode, personality_mode, reasoning_summary_mode, sandbox_policy_mode); called by 1 (maybe_emit_turn_event); 1 external calls (unreachable!).
 
@@ -1952,11 +1958,11 @@ fn codex_turn_event_params(
 fn sandbox_policy_mode(permission_profile: &PermissionProfile, cwd: &Path) -> &'static str
 ```
 
-**Purpose**: Classifies a permission profile and cwd into the analytics sandbox policy mode string.
+**Purpose**: Turns a detailed permission profile into a simple sandbox label for analytics.
 
-**Data flow**: Reads a borrowed `PermissionProfile` and cwd path. Disabled profiles map to `full_access`, external profiles to `external_sandbox`, and managed profiles inspect file-system and network sandbox policies to distinguish `full_access`, `external_sandbox`, `read_only`, and `workspace_write`.
+**Data flow**: It receives a permission profile and current working directory → inspects file-system and network restrictions → returns labels such as "full_access", "external_sandbox", "read_only", or "workspace_write".
 
-**Call relations**: Used by `codex_turn_event_params` to populate the turn’s `sandbox_policy` field.
+**Call relations**: codex_turn_event_params uses this to summarize sandbox behavior in the turn event.
 
 *Call graph*: calls 2 internal fn (file_system_sandbox_policy, network_sandbox_policy); called by 1 (codex_turn_event_params).
 
@@ -1967,11 +1973,11 @@ fn sandbox_policy_mode(permission_profile: &PermissionProfile, cwd: &Path) -> &'
 fn collaboration_mode_mode(mode: ModeKind) -> &'static str
 ```
 
-**Purpose**: Normalizes collaboration mode into the analytics string vocabulary.
+**Purpose**: Normalizes collaboration mode into a simple analytics string.
 
-**Data flow**: Consumes `ModeKind` and returns `plan` for `Plan`, otherwise `default` for `Default`, `PairProgramming`, and `Execute`.
+**Data flow**: It receives a mode → returns "plan" for plan mode and "default" for default, pair-programming, or execute modes.
 
-**Call relations**: Used by `codex_turn_event_params`.
+**Call relations**: codex_turn_event_params uses this while building turn event fields.
 
 *Call graph*: called by 1 (codex_turn_event_params).
 
@@ -1982,11 +1988,11 @@ fn collaboration_mode_mode(mode: ModeKind) -> &'static str
 fn reasoning_summary_mode(summary: Option<ReasoningSummary>) -> Option<String>
 ```
 
-**Purpose**: Converts optional reasoning summary configuration into the analytics string field, suppressing explicit `None`.
+**Purpose**: Converts optional reasoning-summary settings into analytics text, omitting the explicit "none" case.
 
-**Data flow**: Consumes `Option<ReasoningSummary>` and returns `None` for absent or `ReasoningSummary::None`, otherwise `Some(summary.to_string())`.
+**Data flow**: It receives an optional ReasoningSummary → returns None for missing or None → otherwise returns the setting as a string.
 
-**Call relations**: Used by `codex_turn_event_params`.
+**Call relations**: codex_turn_event_params uses this for the turn event's reasoning summary field.
 
 *Call graph*: called by 1 (codex_turn_event_params).
 
@@ -1997,11 +2003,11 @@ fn reasoning_summary_mode(summary: Option<ReasoningSummary>) -> Option<String>
 fn personality_mode(personality: Option<Personality>) -> Option<String>
 ```
 
-**Purpose**: Converts optional personality configuration into the analytics string field, suppressing explicit `None`.
+**Purpose**: Converts optional personality settings into analytics text, omitting the explicit "none" case.
 
-**Data flow**: Consumes `Option<Personality>` and returns `None` for absent or `Personality::None`, otherwise `Some(personality.to_string())`.
+**Data flow**: It receives an optional Personality → returns None for missing or None → otherwise returns the personality as a string.
 
-**Call relations**: Used by `codex_turn_event_params`.
+**Call relations**: codex_turn_event_params uses this for the turn event's personality field.
 
 *Call graph*: called by 1 (codex_turn_event_params).
 
@@ -2012,11 +2018,11 @@ fn personality_mode(personality: Option<Personality>) -> Option<String>
 fn analytics_turn_status(status: codex_app_server_protocol::TurnStatus) -> Option<TurnStatus>
 ```
 
-**Purpose**: Maps protocol turn status into analytics turn status, omitting in-progress turns.
+**Purpose**: Maps app-server turn status into analytics turn status, ignoring turns still in progress.
 
-**Data flow**: Consumes protocol `TurnStatus` and returns `Some(Completed|Failed|Interrupted)` or `None` for `InProgress`.
+**Data flow**: It receives a protocol turn status → returns completed, failed, interrupted, or None for in-progress.
 
-**Call relations**: Used by notification handling when storing completed turn state.
+**Call relations**: ingest_notification uses this when a TurnCompleted notification arrives.
 
 *Call graph*: called by 1 (ingest_notification).
 
@@ -2027,11 +2033,11 @@ fn analytics_turn_status(status: codex_app_server_protocol::TurnStatus) -> Optio
 fn num_input_images(input: &[UserInput]) -> usize
 ```
 
-**Purpose**: Counts image inputs in a turn-start or turn-steer request payload.
+**Purpose**: Counts how many image inputs the user sent with a request.
 
-**Data flow**: Reads a slice of `UserInput`, filters for `Image` and `LocalImage` variants, counts them, and returns the `usize` total.
+**Data flow**: It receives user input items → counts normal image and local image entries → returns the count.
 
-**Call relations**: Used by `ingest_request` when recording pending turn-start and turn-steer requests.
+**Call relations**: ingest_request uses this when remembering pending turn-start and turn-steer requests.
 
 *Call graph*: called by 1 (ingest_request); 1 external calls (iter).
 
@@ -2044,11 +2050,11 @@ fn rejection_reason_from_error_type(
 ) -> Option<TurnSteerRejectionReason>
 ```
 
-**Purpose**: Converts an optional analytics JSON-RPC error classification into an optional turn-steer rejection reason.
+**Purpose**: Converts a tracked JSON-RPC error into a turn-steer rejection reason when possible. JSON-RPC is the request/response protocol used here.
 
-**Data flow**: Consumes `Option<AnalyticsJsonRpcError>`, returns `None` if absent, otherwise maps `TurnSteer` and `Input` variants through their respective `Into<TurnSteerRejectionReason>` conversions.
+**Data flow**: It receives an optional analytics error → if present and relevant, converts turn-steer or input errors into a TurnSteerRejectionReason → otherwise returns None.
 
-**Call relations**: Used by `ingest_turn_steer_error_response`.
+**Call relations**: ingest_turn_steer_error_response uses this before emitting a rejected turn-steer event.
 
 *Call graph*: called by 1 (ingest_turn_steer_error_response).
 
@@ -2064,11 +2070,11 @@ fn skill_id_for_local_skill(
 ) -> String
 ```
 
-**Purpose**: Computes a stable SHA-1 skill identifier from repo context, normalized path, and skill name.
+**Purpose**: Builds a stable, privacy-safer identifier for a local skill. It hashes the repository or personal prefix, path, and skill name.
 
-**Data flow**: Consumes optional repo URL, optional repo root, skill path, and skill name. It normalizes the path with `normalize_path_for_skill_id`, prefixes with `repo_{url}` or `personal`, concatenates prefix/path/name into a raw ID string, hashes it with `sha1`, and returns the lowercase hex digest.
+**Data flow**: It receives optional repo URL, optional repo root, skill path, and skill name → normalizes the path → builds a raw ID string → SHA-1 hashes it and returns the hex digest.
 
-**Call relations**: Used by skill invocation ingestion and tests to ensure local skills have stable anonymized IDs.
+**Call relations**: ingest_skill_invoked uses this for skill invocation analytics; tests also exercise it through the public helper behavior.
 
 *Call graph*: calls 1 internal fn (normalize_path_for_skill_id); called by 2 (reducer_ingests_skill_invoked_fact, ingest_skill_invoked); 3 external calls (format!, update, new).
 
@@ -2083,11 +2089,11 @@ fn normalize_path_for_skill_id(
 ) -> String
 ```
 
-**Purpose**: Normalizes a skill path for skill-ID construction, using repo-relative paths when possible and absolute canonical paths otherwise.
+**Purpose**: Normalizes a skill path before it is used in a skill ID. Repository skills use a path relative to the repo; personal or admin skills use an absolute path.
 
-**Data flow**: Consumes optional repo URL, optional repo root, and skill path. It canonicalizes the skill path, and if both repo URL and repo root are present it canonicalizes the root and strips it as a prefix when possible; otherwise it uses the absolute path. In all cases it converts separators to `/` and returns a `String`.
+**Data flow**: It receives optional repo URL, optional repo root, and skill path → canonicalizes paths when possible → strips the repo root for repo-scoped skills → returns a slash-normalized string.
 
-**Call relations**: Called by `skill_id_for_local_skill` and exercised directly by tests covering repo-scoped and user/admin-scoped skills.
+**Call relations**: skill_id_for_local_skill calls this, and path-normalization tests call it directly.
 
 *Call graph*: called by 5 (normalize_path_for_skill_id_admin_scoped_uses_absolute_path, normalize_path_for_skill_id_repo_root_not_in_skill_path_uses_absolute_path, normalize_path_for_skill_id_repo_scoped_uses_relative_path, normalize_path_for_skill_id_user_scoped_uses_absolute_path, skill_id_for_local_skill); 1 external calls (canonicalize).
 
@@ -2098,11 +2104,11 @@ fn normalize_path_for_skill_id(
 fn managed_full_disk_with_restricted_network_reports_external_sandbox()
 ```
 
-**Purpose**: Verifies that managed full-disk access combined with restricted network is classified as `external_sandbox` rather than `full_access`.
+**Purpose**: Checks that a managed sandbox with full disk access but restricted network is reported as an external sandbox.
 
-**Data flow**: Builds a managed `PermissionProfile` from runtime permissions and asserts the result of `sandbox_policy_mode`.
+**Data flow**: It builds a permission profile with unrestricted files and restricted network → calls sandbox_policy_mode → asserts the result is "external_sandbox".
 
-**Call relations**: Unit test for the sandbox policy classification helper.
+**Call relations**: This test protects the analytics label used by codex_turn_event_params.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions_with_enforcement, unrestricted); 1 external calls (assert_eq!).
 
@@ -2113,11 +2119,11 @@ fn managed_full_disk_with_restricted_network_reports_external_sandbox()
 fn guardian_review_result_maps_terminal_statuses()
 ```
 
-**Purpose**: Checks that guardian review status normalization drops in-progress states and preserves timed-out terminal states.
+**Purpose**: Checks that guardian review statuses are mapped correctly for analytics.
 
-**Data flow**: Calls `guardian_review_result` with representative statuses and asserts on the returned `Option`/tuple values.
+**Data flow**: It calls guardian_review_result for in-progress and timed-out statuses → asserts in-progress produces no event result and timed-out maps to the timed-out review status.
 
-**Call relations**: Unit test for guardian review status mapping.
+**Call relations**: This test protects the mapping used by ingest_guardian_review_completed.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2127,13 +2133,13 @@ These files expose the runtime client that queues, reduces, deduplicates, and de
 
 ### `analytics/src/client.rs`
 
-`orchestration` · `cross-cutting analytics collection and delivery`
+`io_transport` · `cross-cutting background event delivery`
 
-This file is the orchestration layer between raw runtime facts and outbound analytics delivery. `AnalyticsEventsClient` is the public-facing handle; internally it optionally owns an `AnalyticsEventsQueue`, allowing analytics to be globally disabled by setting `queue: None`. The queue contains a Tokio `mpsc::Sender<AnalyticsFact>` plus two mutex-protected `HashSet`s used to deduplicate app-used and plugin-used events by `(turn_id, connector_id)` and `(turn_id, plugin_id)` respectively. To bound memory, each dedupe set is cleared once it reaches `ANALYTICS_EVENT_DEDUPE_MAX_KEYS`.
+This file solves a practical problem: many parts of the app want to report useful product and runtime events, but those reports should not slow down the user’s work. It provides an AnalyticsEventsClient with small methods like tracking a turn, a plugin change, a server request, or an error. Each method wraps the raw information into an AnalyticsFact, which is a structured note about something that happened.
 
-`AnalyticsEventsQueue::new` spawns a background task that receives `AnalyticsFact`s, feeds them into `AnalyticsReducer`, collects any emitted `TrackEventRequest`s, and passes them to `send_track_events`. The client’s many `track_*` methods are mostly typed adapters that filter irrelevant protocol traffic, wrap inputs into the appropriate `AnalyticsFact` or `CustomAnalyticsFact`, and enqueue them via `record_fact`. Notably, `track_request`, `track_response`, and `track_notification` only forward a curated subset of protocol messages relevant to analytics state transitions.
+When analytics is enabled, the client owns an AnalyticsEventsQueue. The queue is like a mailbox: callers drop facts into it, and a background task reads them later. That background task feeds facts into an AnalyticsReducer, which turns low-level facts into final TrackEventRequest records. Those records are then sent to the Codex backend over HTTP, but only if the user is authenticated with a backend that supports this kind of reporting.
 
-Delivery is controlled by `AnalyticsEventsDestination`. In normal mode it trims the configured base URL and appends `/codex/analytics-events/events`. In debug builds, an environment variable can switch delivery to a capture file; initialization failures are logged, and capture mode disables network delivery. `send_track_events` first drops empty batches, then requires an authenticated `CodexAuth` that uses the Codex backend. `track_event_request_batches` isolates any event whose `should_send_in_isolated_request()` returns true—currently important for accepted-line fingerprint events—so those events are sent in their own requests. `send_track_events_request` serializes `TrackEventsRequest`, optionally captures it to disk in debug mode, otherwise posts JSON with auth headers and a 10-second timeout, logging non-success statuses or transport failures without retrying.
+The file also avoids duplicate “app used” and “plugin used” reports within the same turn by remembering recently emitted keys. If the queue fills up, events are dropped instead of blocking the app. In debug builds, developers can redirect analytics into a capture file instead of the network, which is useful for testing what would have been sent.
 
 #### Function details
 
@@ -2143,11 +2149,11 @@ Delivery is controlled by `AnalyticsEventsDestination`. In normal mode it trims 
 fn from_base_url(base_url: String) -> Self
 ```
 
-**Purpose**: Constructs the analytics destination from a base URL, consulting the debug capture-file environment variable first.
+**Purpose**: Builds the place analytics should be sent, starting from the backend base URL. In debug builds, it also checks whether an environment variable asks to capture events into a local file instead of sending them over the network.
 
-**Data flow**: Accepts a base URL string, reads an optional capture path via `analytics_capture_file_from_env`, forwards both values to `from_base_url_and_capture_file`, and returns the resulting `AnalyticsEventsDestination`.
+**Data flow**: It takes a base URL as input. It reads the optional capture-file setting from the environment, then passes both pieces of information to the destination builder. The result is either an HTTP endpoint or, in debug builds, a file destination.
 
-**Call relations**: Called by `AnalyticsEventsClient::new` during client construction. It centralizes the environment-sensitive destination selection.
+**Call relations**: AnalyticsEventsClient::new calls this during client setup. This function delegates the real choice to AnalyticsEventsDestination::from_base_url_and_capture_file after asking analytics_capture_file_from_env whether a debug capture file was requested.
 
 *Call graph*: calls 1 internal fn (analytics_capture_file_from_env); called by 1 (new); 1 external calls (from_base_url_and_capture_file).
 
@@ -2158,11 +2164,11 @@ fn from_base_url(base_url: String) -> Self
 fn from_base_url_and_capture_file(base_url: String, capture_file: Option<PathBuf>) -> Self
 ```
 
-**Purpose**: Chooses between HTTP delivery and debug capture-file delivery, initializing the capture file when requested.
+**Purpose**: Chooses between normal network delivery and debug-only file capture. This is the decision point that says where analytics payloads will actually go.
 
-**Data flow**: Takes a base URL and optional `PathBuf`. In debug builds, if a capture path is present it tries `crate::analytics_capture::initialize(&path)`, logs initialization errors, logs that capture mode disables network delivery, and returns `CaptureFile { path }`. Otherwise it trims trailing slashes from the base URL and returns `Http { url: format!("{base_url}/codex/analytics-events/events") }`.
+**Data flow**: It receives a backend base URL and an optional file path. In debug builds, if a path is present, it tries to prepare that capture file and returns a file destination. Otherwise, it trims the URL and appends the analytics endpoint path, returning an HTTP destination.
 
-**Call relations**: Used by `from_base_url` and directly by tests. It is the only place where capture mode can override network delivery.
+**Call relations**: The production setup path reaches this through AnalyticsEventsDestination::from_base_url. Tests call it directly to check both the HTTP and capture-file choices, including the release-build behavior that ignores capture files.
 
 *Call graph*: calls 1 internal fn (initialize); called by 3 (analytics_destination_ignores_capture_file_in_release, analytics_destination_uses_explicit_capture_file, analytics_destination_uses_http_without_capture_file); 3 external calls (format!, error!, warn!).
 
@@ -2173,11 +2179,11 @@ fn from_base_url_and_capture_file(base_url: String, capture_file: Option<PathBuf
 fn analytics_capture_file_from_env() -> Option<PathBuf>
 ```
 
-**Purpose**: Reads the debug-only analytics capture file path from the configured environment variable.
+**Purpose**: Looks for the debug-only environment variable that tells the app to write analytics events to a file. This gives developers a safe way to inspect analytics without contacting the server.
 
-**Data flow**: In debug builds, reads `ANALYTICS_EVENTS_CAPTURE_FILE_ENV_VAR` with `std::env::var_os`, filters out empty values, converts the result into `PathBuf`, and returns `Option<PathBuf>`. In non-debug builds it always returns `None`.
+**Data flow**: It reads one environment variable. If the variable exists and is not empty in a debug build, it converts the value into a file path. In non-debug builds, it always returns nothing.
 
-**Call relations**: Called only by `AnalyticsEventsDestination::from_base_url` to decide whether capture mode should be enabled.
+**Call relations**: AnalyticsEventsDestination::from_base_url calls this before choosing a destination. Its output is handed to AnalyticsEventsDestination::from_base_url_and_capture_file.
 
 *Call graph*: called by 1 (from_base_url); 1 external calls (var_os).
 
@@ -2188,11 +2194,11 @@ fn analytics_capture_file_from_env() -> Option<PathBuf>
 fn new(auth_manager: Arc<AuthManager>, destination: AnalyticsEventsDestination) -> Self
 ```
 
-**Purpose**: Creates the bounded analytics fact queue, initializes dedupe state, and spawns the background reducer-and-delivery task.
+**Purpose**: Creates the background analytics pipeline. It gives callers a sender they can use immediately, while a spawned task receives facts, reduces them into events, and sends them out.
 
-**Data flow**: Accepts shared `AuthManager` and an `AnalyticsEventsDestination`, creates an `mpsc` channel of size 256, spawns an async task that owns a default `AnalyticsReducer` and loops over received `AnalyticsFact`s, reducing each into a temporary `Vec<TrackEventRequest>` and passing that vector to `send_track_events`, then returns `AnalyticsEventsQueue` with the sender and empty dedupe `HashSet`s wrapped in `Arc<Mutex<_>>`.
+**Data flow**: It takes an authentication manager and a destination. It creates a bounded channel, starts a background task, and initializes two shared sets used for duplicate suppression. The returned queue can accept analytics facts without making callers wait for delivery.
 
-**Call relations**: Constructed by `AnalyticsEventsClient::new` when analytics are enabled. It is the core runtime driver that connects fact ingestion to event delivery.
+**Call relations**: AnalyticsEventsClient::new calls this when analytics is enabled. Inside the spawned task, incoming facts are passed through AnalyticsReducer and then handed to send_track_events for authenticated delivery.
 
 *Call graph*: calls 1 internal fn (send_track_events); 7 external calls (new, new, new, new, default, channel, spawn).
 
@@ -2203,11 +2209,11 @@ fn new(auth_manager: Arc<AuthManager>, destination: AnalyticsEventsDestination) 
 fn try_send(&self, input: AnalyticsFact)
 ```
 
-**Purpose**: Attempts to enqueue one analytics fact without blocking and drops it with a warning if the queue is full.
+**Purpose**: Attempts to put one analytics fact into the queue without waiting. If the queue is full, it drops the fact and logs a warning so analytics never blocks normal app work.
 
-**Data flow**: Takes an `AnalyticsFact`, calls `self.sender.try_send(input)`, and if that returns an error logs a warning that analytics events are being dropped.
+**Data flow**: It receives one AnalyticsFact. It tries to send it through the queue’s channel. On success, the background task will process it later; on failure, nothing is delivered and a warning is written.
 
-**Call relations**: Used exclusively by `AnalyticsEventsClient::record_fact`. It is the queue backpressure boundary for the whole analytics subsystem.
+**Call relations**: AnalyticsEventsClient::record_fact uses this as the final enqueue step for nearly all tracking methods. The receiving side was created by AnalyticsEventsQueue::new.
 
 *Call graph*: 2 external calls (try_send, warn!).
 
@@ -2222,11 +2228,11 @@ fn should_enqueue_app_used(
     ) -> bool
 ```
 
-**Purpose**: Implements per-turn deduplication for app-used analytics keyed by connector id.
+**Purpose**: Decides whether an “app used” event is new enough to send. It prevents repeated reports for the same app connector within the same turn.
 
-**Data flow**: Accepts tracking context and `AppInvocation`. If `app.connector_id` is `None`, returns `true` immediately. Otherwise it locks `app_used_emitted_keys`, clears the set if it has reached 4096 entries, inserts `(tracking.turn_id.clone(), connector_id.clone())`, and returns whether the insert was new.
+**Data flow**: It reads the current tracking context and app invocation. If the app has no connector id, it allows the event. Otherwise, it stores the pair of turn id and connector id in a shared set; the event is allowed only if that pair was not already present.
 
-**Call relations**: Called by `AnalyticsEventsClient::track_app_used` before enqueuing a custom app-used fact. It prevents duplicate app-used events within the same turn for the same connector.
+**Call relations**: AnalyticsEventsClient::track_app_used calls this before recording an app-used fact. It protects the downstream queue and analytics reducer from duplicate app usage reports.
 
 
 ##### `AnalyticsEventsQueue::should_enqueue_plugin_used`  (lines 161–174)
@@ -2239,11 +2245,11 @@ fn should_enqueue_plugin_used(
     ) -> bool
 ```
 
-**Purpose**: Implements per-turn deduplication for plugin-used analytics keyed by plugin id.
+**Purpose**: Decides whether a “plugin used” event should be sent for this turn. It keeps repeated plugin-use reports from being emitted over and over.
 
-**Data flow**: Locks `plugin_used_emitted_keys`, clears it if it has reached 4096 entries, inserts `(tracking.turn_id.clone(), plugin.plugin_id.as_key())`, and returns whether the insert was new.
+**Data flow**: It receives the tracking context and plugin metadata. It stores the pair of turn id and plugin id in a shared set, clearing the set if it has grown too large. It returns true only when this is the first time that pair has been seen recently.
 
-**Call relations**: Called by `AnalyticsEventsClient::track_plugin_used` before enqueuing a plugin-used fact.
+**Call relations**: AnalyticsEventsClient::track_plugin_used calls this before recording a plugin-used fact. If it returns false, no fact is sent to the queue.
 
 
 ##### `AnalyticsEventsClient::new`  (lines 178–188)
@@ -2256,11 +2262,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs an analytics client that is either enabled with a background queue or disabled based on configuration.
+**Purpose**: Creates a normal analytics client for the app. It turns configuration choices into either an active background queue or a disabled client.
 
-**Data flow**: Accepts shared `AuthManager`, base URL, and optional `analytics_enabled` flag; builds a destination with `AnalyticsEventsDestination::from_base_url`; if `analytics_enabled != Some(false)` creates an `AnalyticsEventsQueue` with the auth manager and destination; stores the resulting `Option<AnalyticsEventsQueue>` in `AnalyticsEventsClient`.
+**Data flow**: It receives authentication, a backend URL, and an optional enabled flag. It builds the destination from the URL, and if analytics was not explicitly disabled, it creates an AnalyticsEventsQueue. The output is a client that other code can clone and use.
 
-**Call relations**: This is the main constructor used by application code. It wires together destination selection and queue startup.
+**Call relations**: Startup and session-building code call this when constructing application services. It calls AnalyticsEventsDestination::from_base_url and, when enabled, AnalyticsEventsQueue::new.
 
 *Call graph*: calls 1 internal fn (from_base_url); called by 4 (analytics_events_client_from_config, emit_subagent_session_started_includes_fork_lineage_from_session_configuration, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx).
 
@@ -2271,11 +2277,11 @@ fn new(
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a client that silently drops all analytics by having no queue.
+**Purpose**: Creates an analytics client that intentionally does nothing. This is useful in tests or modes where analytics should never be sent.
 
-**Data flow**: Returns `AnalyticsEventsClient { queue: None }`.
+**Data flow**: It takes no input. It returns a client with no queue. Later tracking calls will quietly skip recording because there is nowhere to send facts.
 
-**Call relations**: Used by many tests and by callers that want a no-op analytics client.
+**Call relations**: Many tests and helper flows call this when they need an AnalyticsEventsClient but do not want background analytics behavior.
 
 *Call graph*: called by 33 (command_execution_started_helper_emits_once, complete_command_execution_item_emits_declined_once_for_pending_command, guardian_command_execution_notifications_wrap_review_lifecycle, interrupted_subagent_activity_removes_missing_thread_watch, test_handle_token_count_event_emits_usage_and_rate_limits, test_handle_token_count_event_without_usage_info, test_handle_turn_complete_emits_completed_without_error, test_handle_turn_complete_emits_error_multiple_turns, test_handle_turn_complete_emits_failed_with_error, test_handle_turn_diff_emits_v2_notification (+15 more)).
 
@@ -2290,11 +2296,11 @@ fn track_skill_invocations(
     )
 ```
 
-**Purpose**: Records a batch of skill invocation facts if the batch is non-empty.
+**Purpose**: Records that one or more skills were invoked during a tracked context. It skips empty input because there is nothing meaningful to report.
 
-**Data flow**: Accepts `TrackEventsContext` and `Vec<SkillInvocation>`, returns early if the vector is empty, otherwise wraps them in `CustomAnalyticsFact::SkillInvoked(SkillInvokedInput { ... })` inside `AnalyticsFact::Custom` and passes that fact to `record_fact`.
+**Data flow**: It receives tracking information and a list of skill invocations. If the list is non-empty, it packages them into a SkillInvoked analytics fact and sends that fact to record_fact.
 
-**Call relations**: Called by higher-level skill injection/build logic. It is a thin adapter from typed inputs to reducer facts.
+**Call relations**: build_skill_injections calls this after deciding which skills are being used. It hands the finished fact to AnalyticsEventsClient::record_fact for queueing.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (build_skill_injections); 2 external calls (Custom, SkillInvoked).
 
@@ -2311,11 +2317,11 @@ fn track_initialize(
     )
 ```
 
-**Purpose**: Records an initialize fact for a client connection, attaching current runtime metadata at the moment of tracking.
+**Purpose**: Records that a client connection was initialized. This helps analytics understand what kind of client connected, how it connected, and what runtime environment it used.
 
-**Data flow**: Accepts connection id, `InitializeParams`, product client id, and RPC transport; calls `current_runtime_metadata()`; wraps everything in `AnalyticsFact::Initialize`; enqueues it via `record_fact`.
+**Data flow**: It receives a connection id, initialization parameters, a product client id, and the RPC transport type. It adds current runtime metadata, wraps everything in an Initialize fact, and passes it to record_fact.
 
-**Call relations**: Called when a client connection initializes. It seeds reducer state used later to enrich thread, turn, and review events.
+**Call relations**: The initialize flow calls this when a new app-server connection starts. It calls current_runtime_metadata to enrich the event before queueing it.
 
 *Call graph*: calls 2 internal fn (record_fact, current_runtime_metadata); called by 1 (initialize).
 
@@ -2326,11 +2332,11 @@ fn track_initialize(
 fn track_subagent_thread_started(&self, input: SubAgentThreadStartedInput)
 ```
 
-**Purpose**: Records a custom fact announcing that a subagent thread has started.
+**Purpose**: Records that a subagent thread has started. This gives analytics visibility into delegated or nested work sessions.
 
-**Data flow**: Accepts `SubAgentThreadStartedInput`, wraps it in `CustomAnalyticsFact::SubAgentThreadStarted`, and forwards it to `record_fact`.
+**Data flow**: It takes a SubAgentThreadStartedInput value. It wraps that input as a custom analytics fact and sends it to record_fact.
 
-**Call relations**: Called by subagent session-start logic so the reducer can emit thread initialization analytics even without a normal initialize/request/response sequence.
+**Call relations**: emit_subagent_session_started calls this when the subagent session event is produced. The actual delivery is handled later by record_fact and the queue.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (emit_subagent_session_started); 2 external calls (Custom, SubAgentThreadStarted).
 
@@ -2346,11 +2352,11 @@ fn track_guardian_review(
     )
 ```
 
-**Purpose**: Records a guardian review analytics fact derived from a tracking context and review result.
+**Purpose**: Records the result of a Guardian review, including when it completed. Guardian review appears to be an approval or safety-review step, and this method captures its outcome for analytics.
 
-**Data flow**: Accepts `GuardianReviewTrackContext`, `GuardianReviewAnalyticsResult`, and completion timestamp, computes event params by calling `tracking.event_params(result, completed_at_ms)`, boxes them inside `CustomAnalyticsFact::GuardianReview`, and enqueues the fact.
+**Data flow**: It receives review tracking context, the review result, and a completion timestamp in milliseconds. It asks the context to build event parameters, wraps them in a GuardianReview fact, and records it.
 
-**Call relations**: Used by guardian review code paths to emit custom review analytics without going through app-server notifications.
+**Call relations**: No direct caller is shown in the graph, but when review code uses it, this method converts review-specific data into the common analytics fact stream through record_fact.
 
 *Call graph*: calls 2 internal fn (record_fact, event_params); 3 external calls (new, Custom, GuardianReview).
 
@@ -2361,11 +2367,11 @@ fn track_guardian_review(
 fn track_app_mentioned(&self, tracking: TrackEventsContext, mentions: Vec<AppInvocation>)
 ```
 
-**Purpose**: Records app-mentioned analytics only when there is at least one mention.
+**Purpose**: Records that one or more apps were mentioned. It skips empty mention lists so analytics does not receive meaningless events.
 
-**Data flow**: Accepts tracking context and `Vec<AppInvocation>`, returns early if the vector is empty, otherwise wraps it in `CustomAnalyticsFact::AppMentioned(AppMentionedInput { ... })` and enqueues it.
+**Data flow**: It receives tracking context and app invocation records. If there are mentions, it wraps them into an AppMentionedInput and records a custom AppMentioned fact.
 
-**Call relations**: Called by code that detects app mentions in a turn.
+**Call relations**: No specific caller is shown in the graph, but this is the client API for app-mention reporting. It hands the final fact to record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (Custom, AppMentioned).
 
@@ -2381,11 +2387,11 @@ fn track_request(
     )
 ```
 
-**Purpose**: Filters client requests down to analytics-relevant request types and records only turn-start and turn-steer requests.
+**Purpose**: Records selected client requests that matter for turn analytics. It deliberately ignores most request types to avoid noisy or irrelevant reporting.
 
-**Data flow**: Accepts connection id, request id, and borrowed `ClientRequest`; if the request is not `TurnStart` or `TurnSteer`, returns immediately. Otherwise clones the request, boxes it inside `AnalyticsFact::ClientRequest`, and enqueues it.
+**Data flow**: It receives a connection id, request id, and a client request. If the request is a turn start or turn steer request, it clones the request, wraps it in a ClientRequest fact, and records it. Otherwise it returns without doing anything.
 
-**Call relations**: Called by request-tracking code. Its filtering ensures the reducer only sees request types that affect analytics state.
+**Call relations**: track_initialized_request calls this while following client request traffic. The method filters the request before passing useful ones to record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (track_initialized_request); 3 external calls (new, clone, matches!).
 
@@ -2396,11 +2402,11 @@ fn track_request(
 fn track_app_used(&self, tracking: TrackEventsContext, app: AppInvocation)
 ```
 
-**Purpose**: Records an app-used fact if analytics are enabled and the `(turn, connector)` pair has not already been emitted.
+**Purpose**: Records that an app was actually used, while avoiding duplicate reports for the same app in the same turn. This keeps usage analytics cleaner.
 
-**Data flow**: Accepts tracking context and `AppInvocation`, returns early if `queue` is `None`, then calls `queue.should_enqueue_app_used(&tracking, &app)` and returns if that is false. On success it wraps the inputs in `CustomAnalyticsFact::AppUsed(AppUsedInput { ... })` and enqueues the fact.
+**Data flow**: It receives tracking context and one app invocation. If analytics is disabled, it stops. If the queue says this app-use pair was already emitted, it stops. Otherwise it wraps the data in an AppUsed fact and records it.
 
-**Call relations**: Called by app-usage tracking code. It combines enablement checking, dedupe, and fact creation.
+**Call relations**: Callers use this when app usage is detected. It consults AnalyticsEventsQueue::should_enqueue_app_used before handing the fact to record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (Custom, AppUsed).
 
@@ -2411,11 +2417,11 @@ fn track_app_used(&self, tracking: TrackEventsContext, app: AppInvocation)
 fn track_hook_run(&self, tracking: TrackEventsContext, hook: HookRunFact)
 ```
 
-**Purpose**: Records a hook-run custom analytics fact.
+**Purpose**: Records that a hook ran. A hook is an extra bit of behavior triggered at a certain point in the app, and this captures its analytics details.
 
-**Data flow**: Accepts tracking context and `HookRunFact`, wraps them in `HookRunInput` inside `CustomAnalyticsFact::HookRun`, and enqueues the fact.
+**Data flow**: It receives tracking context and a hook-run fact. It combines them into HookRunInput, wraps that as a custom analytics fact, and sends it to record_fact.
 
-**Call relations**: Used by hook execution code paths.
+**Call relations**: No specific caller is shown in the graph, but hook-related code can use this method to enter the common analytics pipeline.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (Custom, HookRun).
 
@@ -2426,11 +2432,11 @@ fn track_hook_run(&self, tracking: TrackEventsContext, hook: HookRunFact)
 fn track_plugin_used(&self, tracking: TrackEventsContext, plugin: PluginTelemetryMetadata)
 ```
 
-**Purpose**: Records a plugin-used fact if analytics are enabled and the `(turn, plugin)` pair has not already been emitted.
+**Purpose**: Records that a plugin was used, while suppressing repeated plugin-use events for the same turn. This prevents one active plugin from flooding analytics.
 
-**Data flow**: Accepts tracking context and `PluginTelemetryMetadata`, returns early if disabled, checks `queue.should_enqueue_plugin_used`, and if true wraps the inputs in `CustomAnalyticsFact::PluginUsed` and enqueues the fact.
+**Data flow**: It receives tracking context and plugin telemetry metadata. If there is no queue, it stops. If this plugin was already recorded for the turn, it stops. Otherwise it wraps the data in a PluginUsed fact and records it.
 
-**Call relations**: Parallel to `track_app_used`, but keyed by plugin id.
+**Call relations**: Plugin usage reporting code calls this client API. It relies on AnalyticsEventsQueue::should_enqueue_plugin_used before sending the fact to record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (Custom, PluginUsed).
 
@@ -2441,11 +2447,11 @@ fn track_plugin_used(&self, tracking: TrackEventsContext, plugin: PluginTelemetr
 fn track_compaction(&self, event: crate::facts::CodexCompactionEvent)
 ```
 
-**Purpose**: Records a custom compaction analytics fact.
+**Purpose**: Records a compaction event. Compaction usually means shrinking or summarizing stored conversation context, and this captures that activity for analytics.
 
-**Data flow**: Accepts a `CodexCompactionEvent`, boxes it inside `CustomAnalyticsFact::Compaction`, and enqueues it.
+**Data flow**: It receives a compaction event, boxes it to store it behind a pointer, wraps it as a custom Compaction fact, and records it.
 
-**Call relations**: Called by compaction logic when a compaction attempt completes or fails.
+**Call relations**: No specific caller is shown in the graph. When compaction code reports an event, this method forwards it into record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Custom, Compaction).
 
@@ -2456,11 +2462,11 @@ fn track_compaction(&self, event: crate::facts::CodexCompactionEvent)
 fn track_goal_event(&self, event: CodexGoalEvent)
 ```
 
-**Purpose**: Records a custom goal analytics fact.
+**Purpose**: Records progress or outcome information for a Codex goal. This lets higher-level goal tracking enter the analytics stream.
 
-**Data flow**: Accepts `CodexGoalEvent`, boxes it inside `CustomAnalyticsFact::Goal`, and enqueues it.
+**Data flow**: It receives a CodexGoalEvent, wraps it in a custom Goal fact, and passes it to record_fact.
 
-**Call relations**: Called by higher-level goal tracking code.
+**Call relations**: The track function calls this when a goal event is ready. This method does only the conversion into the common analytics fact format.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (track); 3 external calls (new, Custom, Goal).
 
@@ -2471,11 +2477,11 @@ fn track_goal_event(&self, event: CodexGoalEvent)
 fn track_turn_resolved_config(&self, fact: TurnResolvedConfigFact)
 ```
 
-**Purpose**: Records the resolved configuration fact for a turn.
+**Purpose**: Records the resolved configuration for a turn. This helps analytics connect behavior with the actual settings that were used.
 
-**Data flow**: Accepts `TurnResolvedConfigFact`, boxes it inside `CustomAnalyticsFact::TurnResolvedConfig`, and enqueues it.
+**Data flow**: It receives a TurnResolvedConfigFact, boxes it, wraps it in a custom TurnResolvedConfig fact, and records it.
 
-**Call relations**: Called when turn configuration becomes known so the reducer can later emit a complete turn event.
+**Call relations**: No direct caller is shown in the graph, but turn setup code can use this to report the final configuration through record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Custom, TurnResolvedConfig).
 
@@ -2486,11 +2492,11 @@ fn track_turn_resolved_config(&self, fact: TurnResolvedConfigFact)
 fn track_turn_token_usage(&self, fact: TurnTokenUsageFact)
 ```
 
-**Purpose**: Records token usage for a turn.
+**Purpose**: Records token usage for a turn. Tokens are chunks of text counted by language models, so this helps measure how much model input and output a turn consumed.
 
-**Data flow**: Accepts `TurnTokenUsageFact`, boxes it inside `CustomAnalyticsFact::TurnTokenUsage`, and enqueues it.
+**Data flow**: It receives a TurnTokenUsageFact, boxes it, wraps it as a TurnTokenUsage analytics fact, and sends it to record_fact.
 
-**Call relations**: Used by token accounting code to enrich later turn events.
+**Call relations**: No direct caller is shown in the graph, but token accounting code can call this to feed usage data into the analytics queue.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Custom, TurnTokenUsage).
 
@@ -2501,11 +2507,11 @@ fn track_turn_token_usage(&self, fact: TurnTokenUsageFact)
 fn track_turn_profile(&self, fact: TurnProfileFact)
 ```
 
-**Purpose**: Records timing/profile metrics for a turn.
+**Purpose**: Records profiling information for a turn. Profiling information describes timing or performance characteristics, useful for understanding where time is spent.
 
-**Data flow**: Accepts `TurnProfileFact`, boxes it inside `CustomAnalyticsFact::TurnProfile`, and enqueues it.
+**Data flow**: It receives a TurnProfileFact, boxes it, wraps it in a custom TurnProfile fact, and records it.
 
-**Call relations**: Used by profiling code to enrich later turn events.
+**Call relations**: No specific caller is shown in the graph. Performance-measurement code can use this method to send turn profile facts through record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Custom, TurnProfile).
 
@@ -2516,11 +2522,11 @@ fn track_turn_profile(&self, fact: TurnProfileFact)
 fn track_turn_codex_error(&self, fact: TurnCodexErrorFact)
 ```
 
-**Purpose**: Records a classified Codex error fact for a turn.
+**Purpose**: Records a Codex error that happened during a turn. This gives analytics a structured way to count and understand turn failures.
 
-**Data flow**: Accepts `TurnCodexErrorFact`, boxes it inside `CustomAnalyticsFact::TurnCodexError`, and enqueues it.
+**Data flow**: It receives a TurnCodexErrorFact, boxes it, wraps it in a custom TurnCodexError fact, and records it.
 
-**Call relations**: Used when a turn encounters a Codex-layer error that should be reflected in analytics.
+**Call relations**: No specific caller is shown in the graph. Error-reporting code can use this method to enter the common analytics path.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Custom, TurnCodexError).
 
@@ -2531,11 +2537,11 @@ fn track_turn_codex_error(&self, fact: TurnCodexErrorFact)
 fn track_plugin_installed(&self, plugin: PluginTelemetryMetadata)
 ```
 
-**Purpose**: Records a plugin state-change fact marking a plugin as installed.
+**Purpose**: Records that a plugin was installed. This tracks a plugin state change from the user or system perspective.
 
-**Data flow**: Accepts `PluginTelemetryMetadata`, wraps it with `PluginState::Installed` inside `PluginStateChangedInput`, then inside `CustomAnalyticsFact::PluginStateChanged`, and enqueues it.
+**Data flow**: It receives plugin telemetry metadata. It combines the metadata with the Installed state, wraps that as a PluginStateChanged fact, and records it.
 
-**Call relations**: Called by plugin installation flows.
+**Call relations**: remote_plugin_install_response calls this after a plugin install response. The method turns that result into a state-change fact for record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (remote_plugin_install_response); 2 external calls (Custom, PluginStateChanged).
 
@@ -2546,11 +2552,11 @@ fn track_plugin_installed(&self, plugin: PluginTelemetryMetadata)
 fn track_plugin_uninstalled(&self, plugin: PluginTelemetryMetadata)
 ```
 
-**Purpose**: Records a plugin state-change fact marking a plugin as uninstalled.
+**Purpose**: Records that a plugin was uninstalled. This keeps analytics aware of plugin lifecycle changes.
 
-**Data flow**: Accepts plugin metadata, wraps it with `PluginState::Uninstalled`, and enqueues the resulting custom fact.
+**Data flow**: It receives plugin telemetry metadata. It marks the plugin state as Uninstalled, wraps that in a PluginStateChanged fact, and records it.
 
-**Call relations**: Used by plugin removal flows.
+**Call relations**: No specific caller is shown in the graph, but plugin removal code can call this when uninstalling is complete.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (Custom, PluginStateChanged).
 
@@ -2561,11 +2567,11 @@ fn track_plugin_uninstalled(&self, plugin: PluginTelemetryMetadata)
 fn track_plugin_enabled(&self, plugin: PluginTelemetryMetadata)
 ```
 
-**Purpose**: Records a plugin state-change fact marking a plugin as enabled.
+**Purpose**: Records that a plugin was enabled. This is different from installing: the plugin may already exist but has just been turned on.
 
-**Data flow**: Accepts plugin metadata, wraps it with `PluginState::Enabled`, and enqueues the resulting custom fact.
+**Data flow**: It receives plugin telemetry metadata. It pairs that metadata with the Enabled state, wraps it in a PluginStateChanged fact, and records it.
 
-**Call relations**: Called by plugin toggle logic when enabling a plugin.
+**Call relations**: emit_plugin_toggle_events calls this when a plugin toggle turns on. It then passes the fact through record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (emit_plugin_toggle_events); 2 external calls (Custom, PluginStateChanged).
 
@@ -2576,11 +2582,11 @@ fn track_plugin_enabled(&self, plugin: PluginTelemetryMetadata)
 fn track_plugin_disabled(&self, plugin: PluginTelemetryMetadata)
 ```
 
-**Purpose**: Records a plugin state-change fact marking a plugin as disabled.
+**Purpose**: Records that a plugin was disabled. This reports that an installed plugin has been turned off.
 
-**Data flow**: Accepts plugin metadata, wraps it with `PluginState::Disabled`, and enqueues the resulting custom fact.
+**Data flow**: It receives plugin telemetry metadata. It pairs it with the Disabled state, wraps it in a PluginStateChanged fact, and records it.
 
-**Call relations**: Called by plugin toggle logic when disabling a plugin.
+**Call relations**: emit_plugin_toggle_events calls this when a plugin toggle turns off. The fact then enters the normal queue through record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (emit_plugin_toggle_events); 2 external calls (Custom, PluginStateChanged).
 
@@ -2591,11 +2597,11 @@ fn track_plugin_disabled(&self, plugin: PluginTelemetryMetadata)
 fn record_fact(&self, input: AnalyticsFact)
 ```
 
-**Purpose**: Internal helper that enqueues an analytics fact only when the client is enabled.
+**Purpose**: Is the shared final step for putting an analytics fact into the queue. If analytics is disabled, it quietly does nothing.
 
-**Data flow**: Accepts an `AnalyticsFact`, checks whether `self.queue` is `Some`, and if so forwards the fact to `queue.try_send(input)`; otherwise it does nothing.
+**Data flow**: It receives one AnalyticsFact. If the client has an active queue, it asks the queue to try sending it. If there is no queue, the fact is discarded locally.
 
-**Call relations**: This is the common sink used by nearly every `track_*` method in the client.
+**Call relations**: Almost every tracking method in this file calls record_fact after building the right fact. It hands the fact to AnalyticsEventsQueue::try_send, which starts the background delivery path.
 
 *Call graph*: called by 26 (track_app_mentioned, track_app_used, track_compaction, track_effective_permissions_approval_response, track_error_response, track_goal_event, track_guardian_review, track_hook_run, track_initialize, track_notification (+15 more)).
 
@@ -2611,11 +2617,11 @@ fn track_response(
     )
 ```
 
-**Purpose**: Filters client responses down to analytics-relevant response types and records only thread lifecycle and turn lifecycle responses.
+**Purpose**: Records selected client responses that are important for thread and turn analytics. It filters out less relevant response types.
 
-**Data flow**: Accepts connection id, request id, and owned `ClientResponsePayload`; returns early unless the response is `ThreadStart`, `ThreadResume`, `ThreadFork`, `TurnStart`, or `TurnSteer`. For allowed variants it boxes the response inside `AnalyticsFact::ClientResponse` and enqueues it.
+**Data flow**: It receives a connection id, request id, and response payload. If the response is one of the tracked thread or turn response types, it boxes the payload, wraps it in a ClientResponse fact, and records it. Otherwise it does nothing.
 
-**Call relations**: Called by response-tracking code. Its filtering mirrors the reducer’s interest in only a subset of protocol responses.
+**Call relations**: No specific caller is shown in the graph. Response-tracking code can call this as traffic passes through, and this method keeps only the analytics-relevant responses.
 
 *Call graph*: calls 1 internal fn (record_fact); 2 external calls (new, matches!).
 
@@ -2632,11 +2638,11 @@ fn track_error_response(
     )
 ```
 
-**Purpose**: Records an error response fact for a client request, including optional analytics-specific error classification.
+**Purpose**: Records an error response for a client request. It can include both the raw JSON-RPC error and a more analytics-friendly error category.
 
-**Data flow**: Accepts connection id, request id, `JSONRPCErrorError`, and optional `AnalyticsJsonRpcError`, wraps them in `AnalyticsFact::ErrorResponse`, and enqueues the fact.
+**Data flow**: It receives a connection id, request id, JSON-RPC error, and optional analytics error type. It wraps these values in an ErrorResponse fact and records it.
 
-**Call relations**: Used when client requests fail, especially for turn-steer rejection analytics and pending-request cleanup.
+**Call relations**: A function also named track_error_response in another part of the system calls this when an error response is produced. This method forwards the structured error into record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (track_error_response).
 
@@ -2647,11 +2653,11 @@ fn track_error_response(
 fn track_server_request(&self, connection_id: u64, request: ServerRequest)
 ```
 
-**Purpose**: Records a server request fact for reducer processing.
+**Purpose**: Records a request sent from the server side. This helps connect server-driven work with later responses, cancellations, or outcomes.
 
-**Data flow**: Accepts connection id and owned `ServerRequest`, boxes the request inside `AnalyticsFact::ServerRequest`, and enqueues it.
+**Data flow**: It receives a connection id and server request. It boxes the request, wraps it in a ServerRequest fact, and records it.
 
-**Call relations**: Used by server-request plumbing so the reducer can track approval requests and similar server-initiated interactions.
+**Call relations**: send_request_to_connections calls this when server requests are sent to clients. The method converts the request into an analytics fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (send_request_to_connections); 1 external calls (new).
 
@@ -2662,11 +2668,11 @@ fn track_server_request(&self, connection_id: u64, request: ServerRequest)
 fn track_server_response(&self, completed_at_ms: u64, response: ServerResponse)
 ```
 
-**Purpose**: Records a server response fact with its completion timestamp.
+**Purpose**: Records a server response along with when it completed. This provides timing and result visibility for server-side request handling.
 
-**Data flow**: Accepts `completed_at_ms` and owned `ServerResponse`, boxes the response inside `AnalyticsFact::ServerResponse`, and enqueues it.
+**Data flow**: It receives a completion timestamp and a server response. It boxes the response, wraps it in a ServerResponse fact, and records it.
 
-**Call relations**: Used to complete pending server-request analytics such as user approvals.
+**Call relations**: notify_client_response calls this when a response is ready to notify the client. This method sends the response information into record_fact.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 1 (notify_client_response); 1 external calls (new).
 
@@ -2682,11 +2688,11 @@ fn track_effective_permissions_approval_response(
     )
 ```
 
-**Purpose**: Records the effective permissions response that results from a permissions approval flow.
+**Purpose**: Records the response to an effective-permissions approval request. In plain terms, it captures what happened when permission was requested and answered.
 
-**Data flow**: Accepts completion timestamp, request id, and `RequestPermissionsResponse`, boxes the response inside `AnalyticsFact::EffectivePermissionsApprovalResponse`, and enqueues it.
+**Data flow**: It receives a completion timestamp, request id, and permissions response. It boxes the response, wraps everything in an EffectivePermissionsApprovalResponse fact, and records it.
 
-**Call relations**: Used by permissions approval handling so the reducer can emit the correct review event.
+**Call relations**: No specific caller is shown in the graph. Permission approval code can use this to report the final response through the analytics pipeline.
 
 *Call graph*: calls 1 internal fn (record_fact); 1 external calls (new).
 
@@ -2697,11 +2703,11 @@ fn track_effective_permissions_approval_response(
 fn track_server_request_aborted(&self, completed_at_ms: u64, request_id: RequestId)
 ```
 
-**Purpose**: Records that a pending server request was aborted at a given time.
+**Purpose**: Records that a server request was aborted rather than completed normally. This helps distinguish cancellations from successful or failed responses.
 
-**Data flow**: Accepts completion timestamp and request id, wraps them in `AnalyticsFact::ServerRequestAborted`, and enqueues the fact.
+**Data flow**: It receives a completion timestamp and request id. It wraps them in a ServerRequestAborted fact and records it.
 
-**Call relations**: Used by request-cancellation paths so the reducer can emit aborted review analytics and clear pending state.
+**Call relations**: Cancellation and error paths call this, including cancel_all_requests, cancel_request, cancel_requests_for_thread, and notify_client_error. It provides the analytics record for those abort paths.
 
 *Call graph*: calls 1 internal fn (record_fact); called by 4 (cancel_all_requests, cancel_request, cancel_requests_for_thread, notify_client_error).
 
@@ -2712,11 +2718,11 @@ fn track_server_request_aborted(&self, completed_at_ms: u64, request_id: Request
 fn track_notification(&self, notification: ServerNotification)
 ```
 
-**Purpose**: Filters server notifications down to analytics-relevant lifecycle notifications and records only those.
+**Purpose**: Records selected server notifications related to turns, items, diffs, and Guardian review. It filters out notifications that are not useful for this analytics stream.
 
-**Data flow**: Accepts owned `ServerNotification`, returns early unless it is one of `TurnStarted`, `TurnCompleted`, `TurnDiffUpdated`, `ItemStarted`, `ItemCompleted`, `ItemGuardianApprovalReviewStarted`, or `ItemGuardianApprovalReviewCompleted`. Allowed notifications are boxed inside `AnalyticsFact::Notification` and enqueued.
+**Data flow**: It receives one server notification. If it matches one of the tracked notification types, it boxes it, wraps it in a Notification fact, and records it. Otherwise it returns without recording anything.
 
-**Call relations**: Called by notification plumbing. It is the notification-side counterpart to `track_request` and `track_response` filtering.
+**Call relations**: No specific caller is shown in the graph. Notification-forwarding code can call this for every notification, and this method keeps only the important ones.
 
 *Call graph*: calls 1 internal fn (record_fact); 3 external calls (new, Notification, matches!).
 
@@ -2731,11 +2737,11 @@ async fn send_track_events(
 )
 ```
 
-**Purpose**: Performs the top-level delivery workflow for a reducer-emitted batch of analytics events, including auth gating and isolated-request batching.
+**Purpose**: Sends already-reduced analytics events, but only when there is something to send and the current authentication allows backend delivery.
 
-**Data flow**: Accepts `&AuthManager`, destination, and `Vec<TrackEventRequest>`. Returns immediately if the vector is empty. Otherwise awaits `auth_manager.auth()`, returns if no auth or if the auth does not use the Codex backend, splits events with `track_event_request_batches`, and awaits `send_track_events_request` for each batch.
+**Data flow**: It receives the authentication manager, destination, and a list of event requests. It stops on an empty list, missing authentication, or an auth type that does not use the Codex backend. Otherwise it splits events into batches and sends each batch.
 
-**Call relations**: Called by the background task spawned in `AnalyticsEventsQueue::new` after each fact is reduced. It is the main bridge from reducer output to actual delivery.
+**Call relations**: The background task created by AnalyticsEventsQueue::new calls this after AnalyticsReducer produces TrackEventRequest values. It uses track_event_request_batches and then hands each batch to send_track_events_request.
 
 *Call graph*: calls 3 internal fn (send_track_events_request, track_event_request_batches, auth); called by 1 (new).
 
@@ -2746,11 +2752,11 @@ async fn send_track_events(
 fn track_event_request_batches(events: Vec<TrackEventRequest>) -> Vec<Vec<TrackEventRequest>>
 ```
 
-**Purpose**: Splits a sequence of analytics events into request batches, isolating events that must be sent alone.
+**Purpose**: Splits analytics events into request-sized groups. Some events require their own isolated request, and this function keeps that rule intact.
 
-**Data flow**: Consumes a vector of `TrackEventRequest`, iterates in order, accumulates non-isolated events into `current_batch`, flushes that batch before any event whose `should_send_in_isolated_request()` is true, emits isolated events as one-element batches, and returns `Vec<Vec<TrackEventRequest>>`.
+**Data flow**: It receives a list of TrackEventRequest values. It walks through them in order, collecting ordinary events together while placing isolated events into one-event batches. It returns a list of batches to send.
 
-**Call relations**: Used only by `send_track_events`. It preserves event order while enforcing per-event isolation rules.
+**Call relations**: send_track_events calls this just before network delivery. The resulting batches are sent one by one with send_track_events_request.
 
 *Call graph*: called by 1 (send_track_events); 2 external calls (new, vec!).
 
@@ -2765,11 +2771,11 @@ async fn send_track_events_request(
 )
 ```
 
-**Purpose**: Sends one analytics request batch either to the debug capture file or over HTTP with auth headers.
+**Purpose**: Sends one batch of analytics events to its destination. For normal runs this means an authenticated HTTP POST; in debug capture mode it writes to a file instead.
 
-**Data flow**: Accepts `&CodexAuth`, destination, and a vector of events; returns early if empty; wraps events in `TrackEventsRequest`; in debug builds, returns immediately if `capture_track_events_request(destination, &payload)` handled it. Otherwise matches the destination to obtain the HTTP URL, builds a client with `create_client()`, POSTs JSON with a 10-second timeout, auth headers from `auth_provider_from_auth(auth)`, and `Content-Type: application/json`, awaits the response, and logs warnings for non-success statuses or transport errors.
+**Data flow**: It receives authentication, a destination, and a non-empty batch of events. It wraps the batch in a TrackEventsRequest. In debug capture mode it may append the payload to a file and stop. Otherwise it builds an HTTP request with auth headers and JSON content, sends it with a timeout, and logs failures.
 
-**Call relations**: Called by `send_track_events` for each batch. It is the final delivery step and the only function that performs network I/O.
+**Call relations**: send_track_events calls this for each batch. In debug builds it may call capture_track_events_request; otherwise it uses create_client and auth headers to reach the analytics HTTP endpoint.
 
 *Call graph*: calls 2 internal fn (capture_track_events_request, create_client); called by 1 (send_track_events); 2 external calls (auth_provider_from_auth, warn!).
 
@@ -2783,22 +2789,24 @@ fn capture_track_events_request(
 ) -> bool
 ```
 
-**Purpose**: Implements debug-only capture-file delivery by appending the serialized analytics request and suppressing network sending.
+**Purpose**: Writes an analytics payload to a debug capture file instead of sending it to the network. It returns whether capture mode was used.
 
-**Data flow**: Accepts destination and payload, pattern-matches for `AnalyticsEventsDestination::CaptureFile { path }`, returns `false` for non-capture destinations, otherwise calls `crate::analytics_capture::append_payload(path, payload)`, logs any append error, and returns `true` regardless so network delivery remains disabled.
+**Data flow**: It receives a destination and payload. If the destination is not a capture file, it returns false. If it is a capture file, it tries to append the payload, logs any write error, and returns true.
 
-**Call relations**: Called only from `send_track_events_request` in debug builds. It is the switch that diverts delivery away from HTTP when capture mode is active.
+**Call relations**: send_track_events_request calls this in debug builds before attempting HTTP delivery. A true result tells the caller that the payload was captured locally and network delivery should not happen.
 
 *Call graph*: calls 1 internal fn (append_payload); called by 1 (send_track_events_request); 1 external calls (error!).
 
 
 ### `app-server/src/analytics_utils.rs`
 
-`util` · `startup and test setup when analytics client is created`
+`util` · `startup and test setup`
 
-This file contains a single helper, `analytics_events_client_from_config`, used by app-server startup paths and tests to build `AnalyticsEventsClient` consistently. The function extracts the ChatGPT base URL from `Config`, trims any trailing slash so downstream URL composition is stable, and passes through the `analytics_enabled` feature flag unchanged. It also forwards the shared `Arc<AuthManager>` so analytics requests can authenticate using the same login state as the rest of the server.
+This file solves a simple setup problem: the app needs an analytics client, but creating one requires a few pieces that live elsewhere. It needs the login/authentication manager, the base ChatGPT server address, and a setting that says whether analytics are enabled.
 
-Although small, the helper captures an important normalization detail: `chatgpt_base_url.trim_end_matches('/')` prevents accidental double slashes when the analytics client appends its own paths. By keeping this logic in one place, startup code does not need to remember which config fields analytics depends on or how to normalize them.
+The helper in this file acts like a prepared recipe. Other startup code hands it the shared authentication manager and the loaded configuration. It then creates an `AnalyticsEventsClient`, which is the object responsible for sending analytics events. Before passing along the base URL, it removes any trailing slash from the configured address. That small cleanup matters because URLs can otherwise end up with doubled slashes when paths are added later, like `https://example.com//event`.
+
+The file does not decide what events to send, and it does not send anything itself. Its job is narrower: make sure the analytics client is built consistently from the same app settings every time. Without this helper, several parts of the app would need to know the exact construction details, which makes mistakes and drift more likely.
 
 #### Function details
 
@@ -2811,11 +2819,11 @@ fn analytics_events_client_from_config(
 ) -> AnalyticsEventsClient
 ```
 
-**Purpose**: Constructs an `AnalyticsEventsClient` from shared auth state and app configuration, normalizing the base URL first.
+**Purpose**: Builds an analytics event client using the app’s authentication manager and configuration. It is used when the server or tests need a ready-to-use object for sending analytics events.
 
-**Data flow**: Takes `Arc<AuthManager>` and `&Config`, trims trailing `/` characters from `config.chatgpt_base_url`, converts the result to `String`, reads `config.analytics_enabled`, and passes all three values into `AnalyticsEventsClient::new`, returning the client.
+**Data flow**: It receives a shared `AuthManager`, which holds login/authentication state, and a `Config`, which contains settings such as the ChatGPT base URL and whether analytics are enabled. It trims any trailing slash from the base URL, combines that cleaned URL with the authentication manager and analytics-enabled flag, and returns a new `AnalyticsEventsClient`. It does not change the configuration or authentication manager.
 
-**Call relations**: Called by multiple startup and test-construction paths so analytics initialization uses the same auth manager and normalized base URL everywhere.
+**Call relations**: During server startup and test setup, callers such as `start_uninitialized`, `build_test_processor`, and `run_main_with_transport_options` call this helper when they need analytics wiring. This function then hands the prepared inputs to `AnalyticsEventsClient::new`, which creates the actual client used later to report analytics events.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (start_uninitialized, build_test_processor, run_main_with_transport_options).
 
@@ -2825,11 +2833,13 @@ This file adds goal-specific helpers that translate goal lifecycle changes into 
 
 ### `ext/goal/src/analytics.rs`
 
-`orchestration` · `whenever goal lifecycle events are emitted`
+`domain_logic` · `cross-cutting during goal operations`
 
-This file is a thin analytics adapter around `AnalyticsEventsClient`. `GoalAnalytics` stores the client and exposes semantic methods corresponding to lifecycle moments in the goal subsystem: `created`, `usage_accounted`, `status_changed`, and `cleared`. The small `GoalEventAttribution` enum captures whether an event should be attributed to a specific turn ID or to no turn at all, which lets runtime code distinguish active-turn accounting from idle or external mutations.
+A “goal” here is a tracked objective attached to a thread, with information such as its status, budget, tokens used, and time used. This file exists so the rest of the goal system does not have to know the exact details of analytics events. Other parts of the code can simply say “this goal was created” or “this goal changed status,” and this wrapper builds the right event.
 
-The real shaping logic lives in the private `track` method. It decides whether cumulative usage fields should be included based on `GoalEventKind`: only `UsageAccounted` events carry `goal.tokens_used` and `goal.time_used_seconds`; creation, status-change, and clear events intentionally omit those totals. It then constructs a `CodexGoalEvent` by copying the thread ID, optional turn ID, goal ID, current status, and whether a token budget exists. This keeps analytics payload construction consistent across all call sites and avoids duplicating event-kind-specific field rules in runtime or tool code.
+The central type is `GoalAnalytics`, which holds an `AnalyticsEventsClient`. Think of it like a mailing clerk: the goal system hands it a real-world happening, and it fills out the correct analytics form before sending it away.
+
+Most public methods are named after the event they report: `created`, `usage_accounted`, `status_changed`, and `cleared`. They all funnel into the private `track` method. `track` copies the important fields from the goal, adds optional turn information when the event belongs to a specific turn, and includes usage totals only for usage-accounting events. One important detail is that `status_changed` only reports an event if there really was a previous status and it differs from the current one. That prevents noisy analytics records when nothing actually changed.
 
 #### Function details
 
@@ -2839,11 +2849,11 @@ The real shaping logic lives in the private `track` method. It decides whether c
 fn new(client: AnalyticsEventsClient) -> Self
 ```
 
-**Purpose**: Constructs the analytics wrapper around an `AnalyticsEventsClient`. It is the dependency-injection point for goal analytics.
+**Purpose**: Creates a `GoalAnalytics` helper around an analytics client. Code uses this when it wants a simple goal-focused way to report analytics events.
 
-**Data flow**: Takes an `AnalyticsEventsClient`, stores it in `GoalAnalytics { client }`, and returns the wrapper. No external side effects occur.
+**Data flow**: It receives an `AnalyticsEventsClient`, stores it inside a new `GoalAnalytics` value, and returns that value. Nothing is sent yet; this only prepares the reporting tool for later use.
 
-**Call relations**: Called during extension construction so runtime and tool code can emit goal analytics through a focused interface instead of using the raw client directly.
+**Call relations**: During setup, `new_with_host_capabilities` calls this to attach analytics reporting to the goal subsystem. After that, the returned helper is used by goal-handling code whenever goal events need to be recorded.
 
 *Call graph*: called by 1 (new_with_host_capabilities).
 
@@ -2858,11 +2868,11 @@ fn created(
     )
 ```
 
-**Purpose**: Emits a goal-created analytics event for a specific goal and attribution context. It is the semantic entry point for creation tracking.
+**Purpose**: Reports that a goal has just been created. It lets the analytics system count new goals and connect them to the thread or turn that produced them.
 
-**Data flow**: Accepts a `codex_state::ThreadGoal` reference and `GoalEventAttribution`, then forwards them unchanged to `track` with `GoalEventKind::Created`. It returns nothing and writes only through the analytics client.
+**Data flow**: It receives the goal and attribution information saying whether the event belongs to a specific turn. It labels the event as `Created` and passes everything to `track`, which builds and sends the final analytics event.
 
-**Call relations**: Invoked by goal creation flows such as tool-driven creation handlers. It delegates payload assembly and client emission to `track`.
+**Call relations**: When `handle_create` finishes creating a goal, it calls this method. This method does not send the event directly; it hands the common work to `track` so all goal analytics events are shaped consistently.
 
 *Call graph*: calls 1 internal fn (track); called by 1 (handle_create).
 
@@ -2877,11 +2887,11 @@ fn usage_accounted(
     )
 ```
 
-**Purpose**: Emits an analytics event after goal usage has been persisted. This variant includes cumulative token and time totals.
+**Purpose**: Reports that the system has counted resource usage against a goal. This is how analytics learns the cumulative token and time cost associated with that goal.
 
-**Data flow**: Takes a goal reference and attribution, then calls `track` with `GoalEventKind::UsageAccounted`. The downstream payload includes `goal.tokens_used` and `goal.time_used_seconds`.
+**Data flow**: It receives the current goal and attribution information. It marks the event as `UsageAccounted` and passes it to `track`; because of that event kind, `track` includes the goal’s accumulated token count and elapsed time in seconds.
 
-**Call relations**: Called from runtime accounting after successful active-turn or idle usage updates. It relies on `track` to encode the event-kind-specific cumulative fields.
+**Call relations**: When `account_active_goal_progress` updates progress and usage for the active goal, it calls this method. The method then delegates to `track`, which sends the completed analytics record through the analytics client.
 
 *Call graph*: calls 1 internal fn (track); called by 1 (account_active_goal_progress).
 
@@ -2897,11 +2907,11 @@ fn status_changed(
     )
 ```
 
-**Purpose**: Conditionally emits a status-change analytics event only when the previous status exists and differs from the goal’s current status. It suppresses no-op updates.
+**Purpose**: Reports a goal status change, but only when the status actually changed. This avoids creating misleading analytics events for updates that leave the status the same.
 
-**Data flow**: Receives a goal reference, an `Option<ThreadGoalStatus>` previous status, and attribution. It checks `previous_status.is_some_and(|status| status != goal.status)` and only then calls `track` with `GoalEventKind::StatusChanged`.
+**Data flow**: It receives the goal’s current state, an optional previous status, and attribution information. If there is a previous status and it is different from the goal’s current status, it passes a `StatusChanged` event to `track`; otherwise, it does nothing.
 
-**Call relations**: Used by runtime accounting and update flows after reading prior state. The guard prevents duplicate analytics when a write leaves status unchanged.
+**Call relations**: `account_active_goal_progress` and `handle_update` call this after goal state may have changed. This function acts as a guard before handing off to `track`, so the analytics client only sees real status transitions.
 
 *Call graph*: calls 1 internal fn (track); called by 2 (account_active_goal_progress, handle_update).
 
@@ -2912,11 +2922,11 @@ fn status_changed(
 fn cleared(&self, goal: &codex_state::ThreadGoal)
 ```
 
-**Purpose**: Emits a goal-cleared analytics event without turn attribution. Clearing is always treated as a non-turn-specific event.
+**Purpose**: Reports that a goal has been cleared. A cleared event is not tied to a particular turn, so it is sent without turn attribution.
 
-**Data flow**: Takes a goal reference and calls `track` with `GoalEventAttribution::NoTurn` and `GoalEventKind::Cleared`. It returns nothing.
+**Data flow**: It receives the goal being cleared, sets the attribution to `NoTurn`, labels the event as `Cleared`, and passes those details to `track`. The result is an analytics event with no turn id attached.
 
-**Call relations**: Called when an external clear succeeds. It delegates all payload construction to `track`.
+**Call relations**: This is the goal-analytics entry point for clear operations. Like the other event-specific methods, it relies on `track` to build the standard event record and send it through the analytics client.
 
 *Call graph*: calls 1 internal fn (track).
 
@@ -2932,10 +2942,10 @@ fn track(
     )
 ```
 
-**Purpose**: Builds and submits the concrete `CodexGoalEvent` payload for a goal analytics event. It centralizes event-kind-specific field population and turn attribution formatting.
+**Purpose**: Builds the actual analytics event from a goal and sends it. This is the shared path that keeps all goal analytics records consistent.
 
-**Data flow**: Accepts a goal reference, attribution enum, and `GoalEventKind`. It derives `(cumulative_tokens_accounted, cumulative_time_accounted_seconds)` as `Some(...)` only for `UsageAccounted`, converts thread and optional turn IDs to owned strings, clones `goal.goal_id`, copies status and budget-presence flags, constructs `CodexGoalEvent`, and sends it via `self.client.track_goal_event(...)`.
+**Data flow**: It receives a goal, optional turn attribution, and the kind of event being reported. It copies out the thread id, goal id, current status, whether there is a token budget, and possibly the turn id. If the event is `UsageAccounted`, it also includes cumulative tokens and time; for other event kinds those usage fields are left empty. It then calls the analytics client to record the completed event.
 
-**Call relations**: This private helper is the sink for all public analytics methods. Those methods choose the semantic event kind; `track` performs the final translation into the analytics transport payload.
+**Call relations**: `created`, `usage_accounted`, `status_changed`, and `cleared` all call this after deciding what kind of goal event happened. `track` is the final local step before handing the event to `track_goal_event`, which belongs to the analytics client and performs the actual reporting.
 
 *Call graph*: calls 1 internal fn (track_goal_event); called by 4 (cleared, created, status_changed, usage_accounted).

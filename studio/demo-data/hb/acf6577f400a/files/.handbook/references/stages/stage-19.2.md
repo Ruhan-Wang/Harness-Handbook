@@ -1,10 +1,12 @@
 # App-server, exec-server, and relay transport channels  `stage-19.2`
 
-This stage is cross-cutting transport infrastructure shared by app-server and exec-server whenever data must cross process, socket, HTTP, websocket, or relay boundaries. It sits beneath higher-level request handling and command execution, turning local messages, streamed bodies, files, and encrypted relay traffic into consistent channel abstractions.
+This stage is shared behind-the-scenes plumbing. It is the set of “pipes” that lets different parts of the system talk to each other, whether they are on the same machine, behind an app server, or reached through a remote exec server.
 
-At the app-server side, transport/mod.rs is the hub: it selects and parses transport types, defines connection and event models, forwards inbound messages, applies overload behavior, and serializes outbound traffic for stdio, Unix socket, websocket, and remote-control paths. The remote-control websocket is specialized by segment.rs, which reassembles chunked inbound messages and splits oversized outbound ones, while clients.rs talks to the backend management API to list or revoke enrolled remote-control clients.
+The app-server transport module defines the common events for connections: a client opens a link, sends a message, or receives a reply. Remote-control segmenting acts like cutting a large parcel into numbered boxes, then rebuilding it safely while rejecting bad pieces. The remote-control clients code uses authenticated HTTP calls to list connected devices and revoke them.
 
-For exec-server, http_client.rs exposes one client surface for both direct HTTP and RPC-forwarded requests, and http_response_body_stream.rs makes response bodies stream the same way whether bytes come from reqwest or remote body-delta notifications. remote_file_stream.rs does the same for remote file reads. For relay operation, noise_channel.rs provides authenticated encryption, ordered_ciphertext.rs restores bounded record order before decryption, message_framing.rs preserves JSON-RPC message boundaries, and relay.rs carries those frames over websocket-based relay connections with keepalive and backpressure handling.
+On the exec-server side, the HTTP client module gathers the ways to make requests, while the response-body stream reads replies a chunk at a time and matches remote chunks to the right request. The remote file stream does the same for files, reading safe-sized pieces and closing the remote file afterward.
+
+The relay pieces carry messages over WebSockets. Noise channels encrypt and authenticate them. Framing splits large JSON-RPC messages into allowed record sizes, and ordered ciphertext makes sure encrypted records arrive in the exact order needed.
 
 ## Files in this stage
 
@@ -13,11 +15,15 @@ These modules define the shared app-server transport layer and the remote-contro
 
 ### `app-server-transport/src/transport/mod.rs`
 
-`orchestration` · `startup transport selection and cross-cutting message forwarding`
+`io_transport` · `startup and request handling`
 
-This module defines the common transport vocabulary and helper logic used across all connection types. It exposes path helpers for the default unix control socket and startup lock under `CODEX_HOME`, and defines `AppServerTransport`, which can be `Stdio`, `UnixSocket`, `WebSocket`, or `Off`. `from_listen_url` parses the CLI `--listen` value, supporting `stdio://`, `unix://` with either an explicit path or the default control-socket location, `ws://IP:PORT`, and `off`; parse failures are represented by `AppServerTransportParseError` with user-facing `Display` messages.
+This file ties together the different ways the app server can talk to the outside world: standard input/output, Unix sockets, WebSockets, remote control, or no listener at all. A transport is like a front desk for the server. It accepts visitors through different doors, gives each visitor an ID, and passes their messages to the rest of the application in a consistent form.
 
-For live connections, the file defines `TransportEvent` variants for connection open/close and inbound JSON-RPC messages, plus `ConnectionOrigin` to distinguish stdio, in-process, websocket, and remote-control sources. `next_connection_id` allocates stable ids from a global `AtomicU64`. The inbound forwarding path is intentionally nuanced: `forward_incoming_message` deserializes raw JSON text into `JSONRPCMessage`, logging and dropping malformed payloads without tearing down the connection. `enqueue_incoming_message` first tries a non-blocking send into the transport-event queue; if the queue is full and the message is a JSON-RPC request, it immediately attempts to enqueue an overload error response (`code -32001`) back to the same connection instead of blocking. Non-request messages, or requests when the queue-full pattern does not match, fall back to an awaited send so responses and notifications are preserved. `serialize_outgoing_message` converts `OutgoingMessage` to JSON via `serde_json::to_value` then `to_string`, logging serialization failures and returning `None` rather than panicking. The tests focus on overload semantics and queue-backpressure behavior.
+It defines the listening choices in AppServerTransport and parses strings such as `stdio://`, `unix://`, `ws://IP:PORT`, and `off`. For Unix sockets, it also knows the default control socket and startup lock file names under the Codex home directory. These paths matter because they let another process find and safely start or contact the app server.
+
+The file also defines TransportEvent, the shared event format used by lower-level connection code to tell the main server what happened: a connection opened, a connection closed, or a JSON-RPC message arrived. JSON-RPC is a simple request/response message format encoded as JSON.
+
+A key detail is overload protection. Incoming messages go through a bounded queue, meaning it can only hold a fixed number of items. If a new request arrives while the queue is full, the server sends back a clear “Server overloaded; retry later” error instead of silently blocking forever. Responses and notifications are treated differently: some are allowed to wait so important protocol flow is not lost.
 
 #### Function details
 
@@ -27,11 +33,11 @@ For live connections, the file defines `TransportEvent` variants for connection 
 fn app_server_control_socket_path(codex_home: &Path) -> std::io::Result<AbsolutePathBuf>
 ```
 
-**Purpose**: Builds the default absolute unix-socket path used for app-server control connections under the Codex home directory. It centralizes the directory and filename convention.
+**Purpose**: Builds the default filesystem path for the app server’s Unix control socket. This is the socket file other local processes can use to connect to the running server.
 
-**Data flow**: Takes `&Path` for `codex_home`, appends `app-server-control/app-server-control.sock`, converts the result to `AbsolutePathBuf`, and returns it or an `io::Error` if the path is not absolute/valid.
+**Data flow**: It receives the Codex home directory path. It appends the app-server control directory name and socket filename, then checks that the result is an absolute path wrapper the rest of the code can trust. It returns that validated absolute path or an I/O-style error if the path cannot be accepted.
 
-**Call relations**: Called by `AppServerTransport::from_listen_url` when parsing `unix://` with no explicit socket path.
+**Call relations**: When AppServerTransport::from_listen_url sees `unix://` with no explicit path, it calls this function to fill in the standard socket location. This keeps the default Unix socket path in one place instead of scattering the directory and filename rules around the codebase.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 1 (from_listen_url); 1 external calls (join).
 
@@ -42,11 +48,11 @@ fn app_server_control_socket_path(codex_home: &Path) -> std::io::Result<Absolute
 fn app_server_startup_lock_path(codex_home: &Path) -> std::io::Result<AbsolutePathBuf>
 ```
 
-**Purpose**: Builds the absolute path of the startup lock file used to coordinate app-server startup. It mirrors the control-socket directory layout.
+**Purpose**: Builds the default filesystem path for the startup lock file used when starting the app server. The lock file helps stop two server instances from racing to start at the same time.
 
-**Data flow**: Accepts `&Path` for `codex_home`, appends `app-server-control/app-server-startup.lock`, converts to `AbsolutePathBuf`, and returns the result.
+**Data flow**: It receives the Codex home directory path. It appends the app-server control directory name and the startup lock filename, then returns a validated absolute path or an error if that validation fails.
 
-**Call relations**: Used during startup orchestration outside this file when transport options require a startup lock.
+**Call relations**: The main startup path, represented in the call graph by run_main_with_transport_options, uses this function when it needs the lock file location. It is the companion to the control socket path: one file is for talking to the server, the other is for coordinating startup safely.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 1 (run_main_with_transport_options); 1 external calls (join).
 
@@ -57,11 +63,11 @@ fn app_server_startup_lock_path(codex_home: &Path) -> std::io::Result<AbsolutePa
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats transport parse errors into user-facing CLI messages that explain the accepted `--listen` forms. Each variant includes the offending input and, for unix paths, the underlying resolution message.
+**Purpose**: Turns transport parsing errors into clear human-readable messages. This is what a user or log reader sees when a `--listen` value is wrong.
 
-**Data flow**: Borrows the parse error and formatter, matches on the enum variant, writes the corresponding explanatory string, and returns the formatting result.
+**Data flow**: It receives a specific parse error, such as an unsupported URL or a bad socket path. It writes a sentence explaining what was wrong and, when useful, what formats are accepted. The result is formatted text, not a changed program state.
 
-**Call relations**: Used implicitly when transport parsing errors are surfaced to users or tests.
+**Call relations**: This function is used automatically by Rust’s display machinery when the error needs to be printed. It sits on the boundary between internal error types and the person trying to understand why startup failed.
 
 *Call graph*: 1 external calls (write!).
 
@@ -72,11 +78,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn from_listen_url(listen_url: &str) -> Result<Self, AppServerTransportParseError>
 ```
 
-**Purpose**: Parses the `--listen` URL string into a concrete transport configuration. It supports defaults, derived unix-socket paths, explicit websocket bind addresses, and disabling transport entirely.
+**Purpose**: Converts a user-facing listen setting into the server’s internal transport choice. Someone uses this when turning command-line or configuration text into a real connection mode.
 
-**Data flow**: Takes a listen URL string, returns `Stdio` for `stdio://`, handles `unix://` by either resolving the default socket path from `find_codex_home` and `app_server_control_socket_path` or converting an explicit path relative to the current directory, returns `Off` for `off`, parses `ws://IP:PORT` into `SocketAddr` for `WebSocket`, and otherwise returns `UnsupportedListenUrl` or a more specific parse error.
+**Data flow**: It receives a string such as `stdio://`, `unix://`, `unix:///tmp/server.sock`, `ws://127.0.0.1:9000`, or `off`. It checks the prefix, resolves paths when needed, parses WebSocket addresses, and returns the matching AppServerTransport value. If the text is invalid, it returns a precise parse error explaining the problem.
 
-**Call relations**: Called by CLI/config parsing to decide which transport subsystem to start. It delegates path resolution to helper functions and `AbsolutePathBuf` constructors.
+**Call relations**: This is the main parser for transport selection. It calls app_server_control_socket_path when a default Unix socket path is needed, asks find_codex_home where the Codex home directory is, and uses path/address parsing helpers for the formats that need them. Tests and remote-control startup flows rely on it to reject or accept listen settings consistently.
 
 *Call graph*: calls 3 internal fn (app_server_control_socket_path, find_codex_home, relative_to_current_dir); called by 1 (explicit_remote_control_startup_fails_when_disabled_by_requirements); 1 external calls (UnsupportedListenUrl).
 
@@ -87,11 +93,11 @@ fn from_listen_url(listen_url: &str) -> Result<Self, AppServerTransportParseErro
 fn from_str(s: &str) -> Result<Self, Self::Err>
 ```
 
-**Purpose**: Implements `FromStr` by delegating directly to `from_listen_url`. This allows transport parsing through generic string-parsing APIs.
+**Purpose**: Lets AppServerTransport be parsed through Rust’s standard string-parsing pattern. This makes the transport type easier to use with generic configuration or command-line parsing code.
 
-**Data flow**: Accepts a string slice and returns the result of `Self::from_listen_url(s)`.
+**Data flow**: It receives a string slice. It passes that string directly to AppServerTransport::from_listen_url and returns the same success or error result.
 
-**Call relations**: Used implicitly by argument parsing or tests that rely on `FromStr` rather than calling `from_listen_url` directly.
+**Call relations**: This is a thin adapter around from_listen_url. Its role is not to add new behavior, but to let other code say “parse this string as an AppServerTransport” using the usual FromStr interface.
 
 *Call graph*: 1 external calls (from_listen_url).
 
@@ -102,11 +108,11 @@ fn from_str(s: &str) -> Result<Self, Self::Err>
 fn next_connection_id() -> ConnectionId
 ```
 
-**Purpose**: Allocates a new stable connection identifier from a global atomic counter. It provides unique ids across all transport origins.
+**Purpose**: Creates a fresh numeric ID for a new connection. These IDs let the server tell different clients apart after their messages enter shared queues.
 
-**Data flow**: Fetches and increments `CONNECTION_ID_COUNTER` with relaxed ordering, wraps the previous value in `ConnectionId`, and returns it.
+**Data flow**: It reads and increments a process-wide atomic counter. Atomic means it is safe for multiple asynchronous tasks or threads to ask for IDs without accidentally getting the same one. It returns the old counter value wrapped as a ConnectionId.
 
-**Call relations**: Used by transport implementations and remote-control client tracking whenever a new logical connection is opened.
+**Call relations**: Connection-opening code in the transport modules uses this helper when a new client arrives. The ID it returns later appears in TransportEvent values and outgoing-message routing, so replies can go back to the right connection.
 
 *Call graph*: 1 external calls (new).
 
@@ -122,11 +128,11 @@ async fn forward_incoming_message(
 ) -> boo
 ```
 
-**Purpose**: Deserializes a raw inbound JSON string into a `JSONRPCMessage` and forwards it into the transport event pipeline. Malformed payloads are logged and ignored without disconnecting the sender.
+**Purpose**: Takes raw text received from a connection, tries to understand it as a JSON-RPC message, and forwards it into the server’s event queue. It is the bridge between bytes from the outside world and typed messages inside the app.
 
-**Data flow**: Takes the transport-event sender, writer sender, connection id, and raw payload string. It attempts `serde_json::from_str::<JSONRPCMessage>`; on success it awaits `enqueue_incoming_message`, and on parse failure it logs an error and returns `true` to indicate the connection should remain alive.
+**Data flow**: It receives the main transport event sender, the connection’s outgoing writer queue, the connection ID, and a text payload. It tries to parse the payload as JSON-RPC. If parsing succeeds, it hands the typed message to enqueue_incoming_message. If parsing fails, it logs the problem and keeps the connection alive by returning true.
 
-**Call relations**: Called by concrete transport readers after they receive a text frame or line. It delegates queue/backpressure handling to `enqueue_incoming_message`.
+**Call relations**: Lower-level transport code calls this when a line or frame of input arrives. It delegates the queueing policy to enqueue_incoming_message so all transports share the same overload behavior.
 
 *Call graph*: calls 1 internal fn (enqueue_incoming_message); 1 external calls (error!).
 
@@ -141,11 +147,11 @@ async fn enqueue_incoming_message(
     message: JSONRPCMessage
 ```
 
-**Purpose**: Forwards an already parsed inbound JSON-RPC message into the central transport-event queue, with special overload handling for requests when the queue is full. It is the key backpressure policy point for inbound traffic.
+**Purpose**: Places a parsed incoming message onto the main server event queue, while protecting the server from overload. If the server is too busy to accept a new request, it tries to send the client a polite retry-later error.
 
-**Data flow**: Accepts the transport-event sender, writer sender, connection id, and `JSONRPCMessage`. It wraps the message in `TransportEvent::IncomingMessage` and first tries `try_send`. If the queue is closed it returns `false`. If the queue is full specifically with an incoming request, it constructs an `OutgoingMessage::Error` carrying code `-32001` and the original request id, then tries to enqueue that overload response to the writer without blocking; if the writer is also full it logs a warning and still returns `true`. For all other full-queue cases it awaits `transport_event_tx.send(event)` and returns whether that succeeds.
+**Data flow**: It receives the event queue, the connection’s outgoing writer queue, the connection ID, and a parsed JSON-RPC message. It wraps the message in a TransportEvent and tries to send it without waiting. If the queue is closed, it returns false to signal that processing should stop. If the queue is full and the message is a request, it builds an overload error using that request’s ID and tries to send it back through the writer queue. If the full queue contains another kind of event, it waits until it can send it. It returns true as long as the connection can continue.
 
-**Call relations**: Called by `forward_incoming_message` and directly by tests. It uses `QueuedOutgoingMessage::new` to package overload responses.
+**Call relations**: forward_incoming_message calls this for normal incoming traffic. The tests call it directly to prove the overload rules: requests get an immediate error when the main queue is full, responses wait instead of being dropped, and a full outgoing writer queue does not make the server block while trying to report overload.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (forward_incoming_message, enqueue_incoming_request_does_not_block_when_writer_queue_is_full, enqueue_incoming_response_waits_instead_of_dropping_when_queue_is_full); 4 external calls (send, try_send, Error, warn!).
 
@@ -156,11 +162,11 @@ async fn enqueue_incoming_message(
 fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<String>
 ```
 
-**Purpose**: Serializes an `OutgoingMessage` into a JSON string suitable for transport writers. It logs and suppresses serialization failures instead of propagating panics.
+**Purpose**: Turns an internal outgoing message into a JSON string ready to write to a connection. This is the last translation step before data leaves the server.
 
-**Data flow**: Consumes an `OutgoingMessage`, converts it to a `serde_json::Value` with `to_value`, then to a string with `to_string`, returning `Some(json)` on success or `None` after logging any conversion/serialization error.
+**Data flow**: It receives an OutgoingMessage. It first converts it into a general JSON value, then converts that value into a compact JSON text string. If either conversion fails, it logs the error and returns nothing; otherwise it returns the serialized string.
 
-**Call relations**: Used by concrete transport writers before sending outbound messages over stdio, sockets, or websockets.
+**Call relations**: Transport writer code uses this kind of function when sending replies, notifications, or errors back to clients. It keeps serialization failure handling in one shared place, so individual transports do not each need to decide how to log those failures.
 
 *Call graph*: 3 external calls (error!, to_string, to_value).
 
@@ -171,11 +177,11 @@ fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<Strin
 fn listen_off_parses_as_off_transport()
 ```
 
-**Purpose**: Verifies that the special `off` listen URL parses to `AppServerTransport::Off`. It protects the transport-disable CLI behavior.
+**Purpose**: Checks that the special listen value `off` really disables the transport listener. This protects a small but important startup option from being broken by future parser changes.
 
-**Data flow**: Calls `AppServerTransport::from_listen_url("off")` and asserts equality with `Ok(AppServerTransport::Off)`.
+**Data flow**: It calls the listen URL parser with `off`. It compares the result with the expected AppServerTransport::Off value. The test passes if the parser returns Off and fails otherwise.
 
-**Call relations**: Exercises the `from_listen_url` parser directly.
+**Call relations**: This test exercises AppServerTransport::from_listen_url through one of its simplest branches. It documents that `off` is an intentional supported value, not just an unsupported URL.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -186,11 +192,11 @@ fn listen_off_parses_as_off_transport()
 async fn enqueue_incoming_request_returns_overload_error_when_queue_is_full()
 ```
 
-**Purpose**: Checks that when the inbound transport-event queue is full, a JSON-RPC request receives an immediate overload error response instead of blocking. It validates the request-specific backpressure policy.
+**Purpose**: Checks that an incoming request receives a clear overload error when the main transport queue is already full. This matters because requests expect replies, and dropping them would leave clients waiting.
 
-**Data flow**: Creates one-slot transport and writer channels, pre-fills the transport queue with a notification event, constructs a request message, calls `enqueue_incoming_message`, then drains the original queued event and inspects the writer queue to assert that it contains the expected overload error JSON with code `-32001` and the original request id.
+**Data flow**: It creates a tiny event queue and fills it with one notification. Then it tries to enqueue a request. Because the queue is full, the function under test should not add the request; instead it should place an overload error into the outgoing writer queue. The test reads both queues and confirms the original event stayed queued and the outgoing error has the right request ID and message.
 
-**Call relations**: Directly tests the queue-full request branch in `enqueue_incoming_message`.
+**Call relations**: This test calls enqueue_incoming_message directly to exercise the full-queue request path. It proves the overload branch builds an OutgoingMessage error instead of blocking or silently losing the request.
 
 *Call graph*: 10 external calls (Notification, Request, Integer, new, assert!, assert_eq!, json!, channel, panic!, to_value).
 
@@ -201,11 +207,11 @@ async fn enqueue_incoming_request_returns_overload_error_when_queue_is_full()
 async fn enqueue_incoming_response_waits_instead_of_dropping_when_queue_is_full()
 ```
 
-**Purpose**: Verifies that non-request messages, specifically responses, are not dropped or converted to overload errors when the transport queue is full. Instead they wait until capacity becomes available.
+**Purpose**: Checks that responses are not replaced with overload errors when the main queue is full. Responses are part of an existing conversation, so the server should wait for room rather than discard them.
 
-**Data flow**: Creates one-slot channels, pre-fills the transport queue, spawns a task that calls `enqueue_incoming_message` with a response, drains the first queued event to free capacity, awaits the enqueue task, and then asserts that the response was forwarded as a normal `TransportEvent::IncomingMessage`.
+**Data flow**: It fills a one-item event queue, then starts enqueue_incoming_message with a response in a separate asynchronous task. After the test removes the first queued event, space becomes available. The enqueue operation should finish successfully, and the test then confirms the response appears in the event queue unchanged.
 
-**Call relations**: Exercises the fallback awaited-send branch in `enqueue_incoming_message` for non-request messages.
+**Call relations**: This test calls enqueue_incoming_message directly and focuses on the non-request full-queue behavior. It complements the request overload test by showing that different JSON-RPC message kinds are treated differently on purpose.
 
 *Call graph*: calls 1 internal fn (enqueue_incoming_message); 10 external calls (Notification, Response, Integer, new, assert!, assert_eq!, json!, channel, panic!, spawn).
 
@@ -216,24 +222,24 @@ async fn enqueue_incoming_response_waits_instead_of_dropping_when_queue_is_full(
 async fn enqueue_incoming_request_does_not_block_when_writer_queue_is_full()
 ```
 
-**Purpose**: Ensures that request overload handling remains non-blocking even if the outbound writer queue is already full. The original queued outbound message must remain intact.
+**Purpose**: Checks that overload reporting does not get stuck if the outgoing writer queue is also full. This prevents a busy or stalled client from freezing the input side of the server.
 
-**Data flow**: Creates one-slot transport and writer channels, pre-fills both queues, calls `enqueue_incoming_message` with a request under a short timeout, asserts the call completes promptly, then drains the writer queue and verifies it still contains the original notification rather than a blocked or replaced overload response.
+**Data flow**: It fills the main event queue and also fills the outgoing writer queue with an existing notification. Then it tries to enqueue a new request while both queues are full, with a short timeout around the operation. The expected result is that enqueue_incoming_message returns quickly and leaves the original outgoing message in place, even though it could not send the overload error.
 
-**Call relations**: Tests the nested queue-full path in `enqueue_incoming_message` where both inbound and outbound queues are saturated.
+**Call relations**: This test calls enqueue_incoming_message directly to cover the worst-case overload path. It verifies the warning-and-drop behavior for the overload response, which keeps the transport task responsive under pressure.
 
 *Call graph*: calls 2 internal fn (new, enqueue_incoming_message); 13 external calls (from_millis, ConfigWarning, Notification, Request, Integer, new, AppServerNotification, assert!, assert_eq!, json! (+3 more)).
 
 
 ### `app-server-transport/src/transport/remote_control/segment.rs`
 
-`domain_logic` · `request handling and websocket send/receive paths for large messages`
+`io_transport` · `message handling`
 
-This file enforces the remote-control transport’s message size limits by converting between whole JSON-RPC messages and segmented wire envelopes. On the inbound side, `ClientSegmentReassembler` tracks at most one in-progress assembly per `ClientId` in a `HashMap`. Each `ClientSegmentAssembly` records the active `StreamId`, expected metadata (`seq_id`, `segment_count`, `message_size_bytes`), accumulated raw bytes, the next expected segment index, and the timestamp of the last chunk for LRU eviction.
+Remote-control messages travel inside envelopes. Most envelopes can be sent as they are, but some JSON-RPC messages can be too large for the transport to carry safely in one piece. This file acts like a postal clerk for oversized packages: it cuts a big package into numbered boxes, labels each box, and later checks the labels before putting the package back together.
 
-`observe` is the core state machine. Non-chunk envelopes pass straight through. Chunk envelopes must include both `seq_id` and `stream_id`; otherwise they are dropped with warnings. The method ignores stale chunks that are older than the current assembly, resets assembly state when the stream changes, rejects invalid counts/sizes/base64, enforces in-order delivery, and only emits a reconstructed `ClientMessage` once all chunks decode successfully and the final byte length matches `message_size_bytes`. Any malformed or out-of-order current chunk drops the assembly for that client/stream; stale duplicates are dropped without disturbing the newer assembly.
+On the incoming client side, `ClientSegmentReassembler` watches for chunked client messages. It keeps one unfinished assembly per client, checks that chunks arrive in the expected order, decodes each chunk from base64 (a text-safe way to carry raw bytes), and finally parses the rebuilt bytes as a JSON-RPC message. If anything looks unsafe or inconsistent, such as missing IDs, too many chunks, a changed stream, bad base64, or a wrong final size, it drops the partial message instead of forwarding corrupted data.
 
-On the outbound side, `split_server_envelope_for_transport` leaves non-message events untouched and only segments `ServerMessage` envelopes whose serialized size exceeds `REMOTE_CONTROL_SEGMENT_MAX_BYTES`. It serializes the inner `OutgoingMessage`, rejects payloads above `REMOTE_CONTROL_REASSEMBLED_MAX_BYTES`, checks that even a one-byte chunk can fit within the envelope limit, then searches for a chunk size/segment count where every encoded chunk envelope stays under the wire-size cap. Chunk envelopes carry base64 payload plus original message size and segment count. `CountingWriter` and `serialized_len` let the code measure JSON size without allocating a full serialized string.
+On the outgoing server side, `split_server_envelope_for_transport` measures a server envelope. If it is small enough, it leaves it alone. If it is too large, it serializes the message, slices it into chunks, wraps each chunk in a new envelope, and makes sure every resulting envelope stays under the size limit. The file also has small helpers for measuring serialized JSON without storing it and for building chunk envelopes consistently.
 
 #### Function details
 
@@ -243,11 +249,11 @@ On the outbound side, `split_server_envelope_for_transport` leaves non-message e
 fn observe(&mut self, envelope: ClientEnvelope) -> ClientSegmentObservation
 ```
 
-**Purpose**: Consumes one inbound client envelope and either forwards it unchanged, buffers it as part of an in-progress chunk assembly, drops it, or emits a fully reassembled `ClientMessage` envelope.
+**Purpose**: This is the main incoming-message checkpoint for segmented client messages. It either forwards normal messages unchanged, stores a valid chunk while waiting for the rest, rebuilds a complete message, or drops unsafe or invalid chunks.
 
-**Data flow**: Takes ownership of a `ClientEnvelope`. If `event` is not `ClientMessageChunk`, it returns `ClientSegmentObservation::Forward(Box::new(envelope))`. For chunk events it extracts segment metadata, requires `seq_id` and `stream_id`, checks `should_ignore_chunk` for stale duplicates, validates segment counts, message size, and non-empty base64, creates or resets a `ClientSegmentAssembly` as needed, and then updates the assembly in place. It decodes the base64 chunk into the assembly buffer, advances `next_segment_id`, and when the final chunk arrives verifies total size and deserializes `JSONRPCMessage`. Depending on the outcome it returns `Pending`, `Dropped`, or `Forward` with a synthesized `ClientEvent::ClientMessage` envelope. It also removes assemblies on fatal errors or completion.
+**Data flow**: It receives a `ClientEnvelope`. If the envelope is not a chunk, it comes out unchanged as something to forward. If it is a chunk, the function reads its client ID, stream ID, sequence ID, chunk number, total chunk count, expected final size, and base64 text. It validates those details, adds the decoded bytes to the current assembly for that client, and when the last chunk arrives it turns the rebuilt bytes into a `JSONRPCMessage`. The result is one of three outcomes: forward a full envelope, report that the message is still pending, or say the data was dropped.
 
-**Call relations**: Called by websocket client-message observation logic. It is the sole reassembly state machine for inbound segmented traffic and delegates stale checks, metadata extraction, eviction, and assembly removal to helpers.
+**Call relations**: This is called by `observe_client_message` when client traffic is being inspected. It asks `ClientSegmentMetadata::from_envelope` to extract the labels needed for reassembly, uses `should_ignore_chunk` to reject stale repeats early, may call `evict_assemblies_if_full` before starting a new partial message, and uses `remove_assembly` when a stream is finished or must be abandoned.
 
 *Call graph*: calls 4 internal fn (from_envelope, evict_assemblies_if_full, remove_assembly, should_ignore_chunk); called by 1 (observe_client_message); 8 external calls (new, now, new, Complete, Forward, decoded_len_estimate, min, warn!).
 
@@ -258,11 +264,11 @@ fn observe(&mut self, envelope: ClientEnvelope) -> ClientSegmentObservation
 fn invalidate_stream(&mut self, client_id: &ClientId, stream_id: &StreamId)
 ```
 
-**Purpose**: Drops any in-progress assembly for a specific client and stream.
+**Purpose**: This clears any unfinished chunk assembly for a particular client stream. It is used when that stream should no longer accept old partial data.
 
-**Data flow**: Takes borrowed `ClientId` and `StreamId`, calls `remove_assembly`, and returns unit.
+**Data flow**: It receives a client ID and a stream ID. It checks whether the stored partial assembly for that client belongs to that exact stream. If it does, the partial bytes and progress are removed; if not, nothing changes.
 
-**Call relations**: Used when stream lifecycle events indicate that partial chunks for that stream should no longer be accepted.
+**Call relations**: This is called by `observe_client_message` when the surrounding message flow knows a stream has become invalid or ended. It delegates the actual conditional removal to `remove_assembly`, so stream-specific cleanup follows the same rule used inside `observe`.
 
 *Call graph*: calls 1 internal fn (remove_assembly); called by 1 (observe_client_message).
 
@@ -273,11 +279,11 @@ fn invalidate_stream(&mut self, client_id: &ClientId, stream_id: &StreamId)
 fn invalidate_client(&mut self, client_id: &ClientId)
 ```
 
-**Purpose**: Drops any in-progress assembly for an entire client regardless of stream.
+**Purpose**: This forgets all unfinished segmented message state for one client. It is useful when a client disconnects or must be reset.
 
-**Data flow**: Removes the `client_id` entry from `assemblies` and returns unit.
+**Data flow**: It receives a client ID and removes that client's entry from the map of in-progress assemblies. Any partially collected chunks for that client are discarded, and there is no returned value.
 
-**Call relations**: Used when a client disconnects or is otherwise invalidated wholesale.
+**Call relations**: This is a direct cleanup hook for higher-level code. Unlike `invalidate_stream`, it does not check a stream ID; it removes the whole client assembly at once.
 
 
 ##### `ClientSegmentReassembler::should_ignore_chunk`  (lines 234–247)
@@ -292,11 +298,11 @@ fn should_ignore_chunk(
     ) -> bool
 ```
 
-**Purpose**: Determines whether a chunk is stale relative to the currently tracked assembly for the same client and stream.
+**Purpose**: This answers whether an incoming chunk is old news and should be ignored. It prevents duplicate or older chunks from disturbing an assembly that has already moved forward.
 
-**Data flow**: Reads the current assembly for `client_id` and returns `true` when the stream matches and either the incoming `seq_id` is older than the assembly’s `seq_id` or it is the same `seq_id` with a `segment_id` lower than `next_segment_id`.
+**Data flow**: It receives a client ID, stream ID, sequence ID, and chunk number. It looks up the current partial assembly for that client. If the assembly is for the same stream and the incoming chunk belongs to an older message, or to an already-accepted earlier chunk of the same message, it returns `true`; otherwise it returns `false`.
 
-**Call relations**: Consulted before validation and also by higher-level message observation logic so stale duplicates do not tear down a newer assembly.
+**Call relations**: `observe` calls this near the start so stale data can be dropped before doing more work. `observe_client_message` also calls it to make the same early decision in the wider client-message flow.
 
 *Call graph*: called by 2 (observe, observe_client_message).
 
@@ -307,11 +313,11 @@ fn should_ignore_chunk(
 fn remove_assembly(&mut self, client_id: &ClientId, stream_id: &StreamId)
 ```
 
-**Purpose**: Conditionally removes the tracked assembly for a client only if it belongs to the specified stream.
+**Purpose**: This removes a partial message only if it belongs to the stream being cleaned up. That avoids accidentally deleting a newer assembly from another stream for the same client.
 
-**Data flow**: Looks up `client_id` in `assemblies`, compares the stored `stream_id` to the provided one, and removes the map entry only on match.
+**Data flow**: It receives a client ID and stream ID. It checks the stored assembly for that client. If the stored stream matches the given stream, it deletes the assembly; otherwise the stored data is left alone.
 
-**Call relations**: Used by `observe` and `invalidate_stream` to avoid deleting a replacement assembly that may already exist for a different stream.
+**Call relations**: This is the shared cleanup helper used by `observe` after errors or successful completion, and by `invalidate_stream` during explicit stream cleanup.
 
 *Call graph*: called by 2 (invalidate_stream, observe).
 
@@ -322,11 +328,11 @@ fn remove_assembly(&mut self, client_id: &ClientId, stream_id: &StreamId)
 fn evict_assemblies_if_full(&mut self)
 ```
 
-**Purpose**: Enforces the maximum number of concurrent in-progress assemblies by evicting the least recently updated ones.
+**Purpose**: This keeps the reassembler from holding too many unfinished messages at once. If the storage is full, it discards the least recently updated assemblies until there is room.
 
-**Data flow**: While `assemblies.len()` is at or above `REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT`, it finds the entry with the minimum `last_chunk_seen_at` and removes it.
+**Data flow**: It reads the map of in-progress client assemblies. While the map is at or above its allowed capacity, it finds the assembly with the oldest `last_chunk_seen_at` timestamp and removes it. It returns nothing; the effect is freeing memory and space for new chunked messages.
 
-**Call relations**: Called when a new assembly must be inserted and the map is already full.
+**Call relations**: `observe` calls this before creating a new assembly for a client. That way a flood of incomplete segmented messages cannot grow the in-memory tracking table without limit.
 
 *Call graph*: called by 1 (observe).
 
@@ -337,11 +343,11 @@ fn evict_assemblies_if_full(&mut self)
 fn from_envelope(envelope: &ClientEnvelope) -> Option<Self>
 ```
 
-**Purpose**: Extracts the metadata needed to identify and validate a chunk assembly from a chunk envelope.
+**Purpose**: This extracts the identifying information that says which segmented message a chunk belongs to. Without this metadata, the reassembler cannot safely know how to combine chunks.
 
-**Data flow**: Pattern-matches `ClientEnvelope.event` as `ClientMessageChunk`, reads `segment_count` and `message_size_bytes`, pulls `seq_id` from `envelope.seq_id`, and returns `Some(ClientSegmentMetadata)` or `None` if the envelope is not a chunk or lacks `seq_id`.
+**Data flow**: It receives a client envelope. If the envelope contains a client message chunk and has a sequence ID, it returns a small metadata value containing the sequence ID, total segment count, and expected final byte size. If the envelope is not a chunk or lacks the needed sequence ID, it returns nothing.
 
-**Call relations**: Used only by `observe` as the canonical metadata extractor for inbound chunk handling.
+**Call relations**: `observe` calls this when it sees a chunk. The returned metadata is then compared with any existing assembly to make sure all chunks are from the same logical message.
 
 *Call graph*: called by 1 (observe).
 
@@ -354,11 +360,11 @@ fn split_server_envelope_for_transport(
 ) -> io::Result<Vec<ServerEnvelope>>
 ```
 
-**Purpose**: Splits an oversized outbound `ServerMessage` envelope into multiple `ServerMessageChunk` envelopes that each fit within the wire-size limit.
+**Purpose**: This prepares outgoing server envelopes for the transport size limits. Small messages pass through unchanged; large server messages are split into numbered base64 chunks.
 
-**Data flow**: Consumes a `ServerEnvelope`. If the event is not `ServerMessage`, it returns a one-element vector containing the original envelope. Otherwise it measures the serialized envelope size with `serialized_len`; if already within `REMOTE_CONTROL_SEGMENT_MAX_BYTES`, it returns the original envelope unchanged. For oversized messages it serializes the inner `OutgoingMessage` to bytes, rejects payloads above `REMOTE_CONTROL_REASSEMBLED_MAX_BYTES`, verifies that even the smallest possible chunk envelope can fit, then iteratively chooses a `segment_count`/`chunk_size` pair and checks every chunk with `serialized_chunk_len`. Once all chunks fit, it maps each raw chunk through `build_chunk_envelope` and returns the vector. If no valid segmentation exists, it logs a warning and returns an empty vector.
+**Data flow**: It receives a `ServerEnvelope`. If the envelope is not a server message, or if its serialized JSON size is already small enough, it returns a one-item list containing the original envelope. For a large server message, it serializes the inner message to bytes, checks the total size limit, chooses a chunk size, verifies that every chunk envelope will fit, and returns a list of chunk envelopes. If the message cannot be safely split within the limits, it returns an empty list rather than sending invalid oversized data.
 
-**Call relations**: Called by the server-writer path before websocket transmission. It is the outbound counterpart to the inbound reassembler.
+**Call relations**: This is used by `run_server_writer_inner` during outgoing transport writing, and by tests such as `splits_large_server_messages_into_wire_chunks`. It relies on `serialized_len` to measure JSON size, `serialized_chunk_len` to test proposed chunks, and ultimately `build_chunk_envelope` to create each wire-ready chunk.
 
 *Call graph*: calls 2 internal fn (serialized_chunk_len, serialized_len); called by 2 (splits_large_server_messages_into_wire_chunks, run_server_writer_inner); 8 external calls (new, matches!, to_vec, unreachable!, max, min, vec!, warn!).
 
@@ -375,11 +381,11 @@ fn serialized_chunk_len(
 ) -> io::Result<usize>
 ```
 
-**Purpose**: Measures the serialized JSON size of a hypothetical chunk envelope.
+**Purpose**: This measures how large one proposed chunk envelope would be after JSON serialization. It helps the splitter choose chunks that fit the transport limit.
 
-**Data flow**: Builds a chunk envelope from the provided parameters via `build_chunk_envelope`, then passes it to `serialized_len` and returns the resulting byte count.
+**Data flow**: It receives the original server envelope, a chunk number, the total chunk count, the full message size, and the chunk bytes. It first builds the chunk envelope, then measures the serialized length of that envelope. It returns the byte count or an I/O-style error if the chunk envelope cannot be built or serialized.
 
-**Call relations**: Used internally by `split_server_envelope_for_transport` while searching for a chunking strategy that satisfies the wire-size cap.
+**Call relations**: `split_server_envelope_for_transport` calls this repeatedly while searching for a safe chunk size. It uses `build_chunk_envelope` for the proposed wrapper and `serialized_len` for the actual measurement.
 
 *Call graph*: calls 2 internal fn (build_chunk_envelope, serialized_len); called by 1 (split_server_envelope_for_transport).
 
@@ -390,11 +396,11 @@ fn serialized_chunk_len(
 fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 ```
 
-**Purpose**: Implements `Write` by counting bytes instead of storing them.
+**Purpose**: This pretends to write bytes but only counts them. It is a lightweight way to measure serialized output without saving the output itself.
 
-**Data flow**: Adds `buf.len()` to `self.len` and returns that length as if all bytes were written successfully.
+**Data flow**: It receives a byte slice from a serializer. Instead of storing or sending those bytes, it adds their length to its internal counter and reports that all bytes were accepted.
 
-**Call relations**: Used by `serialized_len` to measure JSON serialization output without allocating a buffer.
+**Call relations**: This method is used indirectly by `serialized_len` when `serde_json` writes JSON into a `CountingWriter`. The serializer thinks it is writing normally, while this writer simply keeps score.
 
 
 ##### `CountingWriter::flush`  (lines 414–416)
@@ -403,11 +409,11 @@ fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 fn flush(&mut self) -> io::Result<()>
 ```
 
-**Purpose**: Implements a no-op flush for the counting writer.
+**Purpose**: This satisfies the standard writer interface for `CountingWriter`. Since nothing is actually buffered or sent, flushing has no real work to do.
 
-**Data flow**: Returns `Ok(())` without changing state.
+**Data flow**: It receives a request to flush pending output. Because `CountingWriter` only counts bytes and holds no pending data, it immediately returns success and changes nothing.
 
-**Call relations**: Required by the `Write` trait so `serde_json::to_writer` can serialize into `CountingWriter`.
+**Call relations**: This is part of the writer behavior needed by `serde_json::to_writer` inside `serialized_len`. It exists so `CountingWriter` can be used wherever a normal writer is expected.
 
 
 ##### `serialized_len`  (lines 419–423)
@@ -416,11 +422,11 @@ fn flush(&mut self) -> io::Result<()>
 fn serialized_len(value: &impl serde::Serialize) -> io::Result<usize>
 ```
 
-**Purpose**: Computes the JSON-serialized byte length of any serializable value.
+**Purpose**: This calculates how many bytes a value would take if written as JSON. It avoids creating a temporary JSON string just to measure its length.
 
-**Data flow**: Creates a default `CountingWriter`, serializes `value` into it with `serde_json::to_writer`, maps serialization errors to `io::Error::other`, and returns the accumulated `len`.
+**Data flow**: It receives any value that can be serialized. It creates a fresh `CountingWriter`, asks `serde_json` to write the value into it, and then returns the number of bytes the writer counted. If serialization fails, the error is converted into an I/O-style error.
 
-**Call relations**: Shared helper for measuring whole envelopes and candidate chunk envelopes during outbound segmentation.
+**Call relations**: `split_server_envelope_for_transport` uses this to decide whether an envelope is too large. `serialized_chunk_len` also uses it to test each possible chunk envelope.
 
 *Call graph*: called by 2 (serialized_chunk_len, split_server_envelope_for_transport); 2 external calls (default, to_writer).
 
@@ -437,22 +443,26 @@ fn build_chunk_envelope(
 ) -> io::Result<ServerEnvelope>
 ```
 
-**Purpose**: Constructs one `ServerMessageChunk` envelope carrying a base64-encoded slice of the original message.
+**Purpose**: This creates a server envelope that carries one piece of a larger message. It preserves the original routing details while replacing the event with a numbered base64 chunk.
 
-**Data flow**: Takes the original `ServerEnvelope` metadata plus `segment_id`, `segment_count`, `message_size_bytes`, and raw chunk bytes. It rejects `segment_count` values above `REMOTE_CONTROL_SEGMENT_COUNT_MAX`, base64-encodes the chunk, and returns a new `ServerEnvelope` preserving `client_id`, `stream_id`, and `seq_id` while replacing the event with `ServerEvent::ServerMessageChunk`.
+**Data flow**: It receives the original server envelope, the chunk number, total chunk count, full message size, and raw chunk bytes. It checks that the total chunk count is not above the allowed maximum, encodes the chunk bytes as base64 text, and returns a new `ServerEnvelope` with the same client ID, stream ID, and sequence ID as the original. If the chunk count is too high, it returns an error.
 
-**Call relations**: Used by both `serialized_chunk_len` and the final chunk-construction phase of `split_server_envelope_for_transport`.
+**Call relations**: `serialized_chunk_len` calls this when measuring candidate chunks. In the main splitting path, `split_server_envelope_for_transport` creates final chunk envelopes using the same construction logic so every segment has consistent labels.
 
 *Call graph*: called by 1 (serialized_chunk_len); 1 external calls (new).
 
 
 ### `app-server-transport/src/transport/remote_control/clients.rs`
 
-`io_transport` · `remote-control management request handling`
+`io_transport` · `request handling`
 
-This file wraps the remote-control management HTTP endpoints behind typed async functions. It defines internal response models for the list endpoint, a small request enum distinguishing list versus revoke operations, and a `ClientManagementResponse` carrying raw HTTP status, headers, and body bytes. `list_remote_control_clients` validates that `environment_id` is present and that `limit`, if supplied, is between 1 and 100, then builds the environment-specific clients URL, sends the request, checks for HTTP success, decodes the JSON body, and converts each `RemoteControlClientResponse` into the protocol `RemoteControlClient`. `revoke_remote_control_client` similarly validates `environment_id` and `client_id`, appends the client id to the same base URL, sends a DELETE, and only needs to verify success.
+This file is the bridge between the app server and the remote-control client management API. In human terms, it lets the app ask, “Which devices are allowed to control this environment?” and “Remove this device’s access.” Without it, the higher-level commands for listing and revoking remote-control clients would have no safe, consistent way to contact the remote service.
 
-The request path is split into `send_client_management_request`, which handles auth loading and a single unauthorized-recovery retry, and `send_client_management_request_once`, which builds a reqwest client, adds auth headers from `RemoteControlConnectionAuth`, includes the remote-control account-id header, applies a 30-second timeout, and captures the full response body for later error reporting. `ensure_success_response` maps HTTP status codes into meaningful `io::ErrorKind`s (`InvalidInput`, `PermissionDenied`, `NotFound`, or `Other`) and includes formatted headers plus a preview of the response body in the error text. URL construction goes through `normalize_remote_control_base_url` and appends `wham/remote/control/environments/<environment_id>/clients`. The `TryFrom` implementation for `RemoteControlClient` preserves optional metadata fields and parses `last_seen_at` from RFC3339 into a unix timestamp, surfacing invalid timestamps as `InvalidData`.
+The file first validates the caller’s request. For example, listing clients must include an environment ID, and the requested page size must be reasonable. It then builds the correct web address for that environment’s client list. For listing it sends an HTTP GET request; for revoking it sends an HTTP DELETE request. HTTP is the standard request/response protocol used on the web.
+
+Authentication is important here. The request includes saved remote-control credentials and an account ID header. If the server replies “401 Unauthorized,” the file asks the authentication system to recover or refresh credentials, then retries once. This is like trying a locked door, realizing the key is stale, getting a fresh key, and trying one more time.
+
+After a response comes back, the file checks whether the status means success. If not, it creates a useful error that includes the HTTP status, response headers, and a short preview of the body. For successful list responses, it decodes the returned JSON and converts timestamps into Unix time, which is a simple number of seconds since 1970.
 
 #### Function details
 
@@ -466,11 +476,11 @@ async fn list_remote_control_clients(
 ) -> io::Result<RemoteControlClientsListResponse>
 ```
 
-**Purpose**: Lists enrolled remote-control clients for a specific environment, with optional pagination and ordering. It validates inputs, performs the authenticated HTTP request, and decodes the typed response.
+**Purpose**: Lists the remote-control clients registered for one environment. A caller uses this when it needs to show or inspect the devices or apps that can connect to that environment.
 
-**Data flow**: Takes the remote-control base URL, shared `AuthManager`, and `RemoteControlClientsListParams`. It rejects empty `environment_id` and out-of-range `limit`, builds the endpoint URL with `environment_clients_url`, sends the request through `send_client_management_request`, previews the body, checks HTTP success with `ensure_success_response`, deserializes `ListRemoteControlClientsResponse` from the body, converts each item via `RemoteControlClient::try_from`, and returns `RemoteControlClientsListResponse { data, next_cursor }`.
+**Data flow**: It receives a base remote-control URL, an authentication manager, and list options such as environment ID, cursor, limit, and sort order. It first rejects missing or invalid inputs, builds the environment-specific clients URL, sends an authenticated list request, checks that the HTTP response succeeded, then decodes the JSON body. It returns a local list response containing clean `RemoteControlClient` records and an optional cursor for the next page.
 
-**Call relations**: Called by higher-level remote-control command handling for client listing. It delegates auth/retry behavior to `send_client_management_request` and response validation to `ensure_success_response`.
+**Call relations**: Higher-level code such as `list_clients` calls this when a user or API request asks for the client list. Inside, it relies on `environment_clients_url` to form the endpoint, `send_client_management_request` to perform the authenticated network call, `preview_remote_control_response_body` to make error messages readable, and `ensure_success_response` to turn failed HTTP statuses into meaningful local errors. Tests call it to verify parsing errors keep useful context and that authentication recovery is retried correctly.
 
 *Call graph*: calls 4 internal fn (ensure_success_response, environment_clients_url, send_client_management_request, preview_remote_control_response_body); called by 4 (list_clients, list_remote_control_clients_preserves_decode_error_context, list_remote_control_clients_recovers_auth_after_unauthorized, list_remote_control_clients_retries_unauthorized_only_once); 1 external calls (new).
 
@@ -485,11 +495,11 @@ async fn revoke_remote_control_client(
 ) -> io::Result<RemoteControlClientsRevokeRespon
 ```
 
-**Purpose**: Revokes a specific enrolled remote-control client from an environment. It validates required identifiers, performs the authenticated DELETE request, and checks for HTTP success.
+**Purpose**: Revokes one remote-control client’s access to an environment. A caller uses this when a device or app should no longer be allowed to connect.
 
-**Data flow**: Accepts the remote-control base URL, shared `AuthManager`, and `RemoteControlClientsRevokeParams`. It rejects empty `environment_id` or `client_id`, builds the environment clients URL then appends the client id path segment, sends the request via `send_client_management_request`, previews the body, validates success with `ensure_success_response`, and returns an empty `RemoteControlClientsRevokeResponse` on success.
+**Data flow**: It receives the base remote-control URL, the authentication manager, and revoke parameters containing the environment ID and client ID. It rejects missing IDs, builds the clients URL for the environment, appends the specific client ID, sends an authenticated delete request, and checks that the service accepted it. On success it returns an empty revoke response, meaning there is no extra data to report.
 
-**Call relations**: Called by higher-level remote-control revoke commands. It shares the same auth/retry and error-reporting helpers as the list path.
+**Call relations**: Higher-level code such as `revoke_client` calls this when access should be removed. It shares the same helper path as listing: `environment_clients_url` builds the base endpoint, `send_client_management_request` sends the authenticated HTTP request, `preview_remote_control_response_body` prepares readable failure details, and `ensure_success_response` decides whether the server reply counts as success. A test checks that forbidden responses are not treated like recoverable unauthorized responses.
 
 *Call graph*: calls 4 internal fn (ensure_success_response, environment_clients_url, send_client_management_request, preview_remote_control_response_body); called by 2 (revoke_client, revoke_remote_control_client_does_not_retry_forbidden); 1 external calls (new).
 
@@ -504,11 +514,11 @@ async fn send_client_management_request(
 ) -> io::Result<ClientManagementResponse>
 ```
 
-**Purpose**: Performs a client-management HTTP request with one optional auth-recovery retry after an unauthorized response. It centralizes the retry policy for list and revoke operations.
+**Purpose**: Sends one client-management request with authentication, and retries once if the server says the credentials are unauthorized and recovery succeeds. This keeps list and revoke operations from each having to duplicate the same login-recovery logic.
 
-**Data flow**: Takes the shared `AuthManager`, a `ClientManagementRequest`, and an action label. It creates an `UnauthorizedRecovery` and auth-change receiver from the auth manager, loads current remote-control auth with `load_remote_control_auth`, sends the request once with `send_client_management_request_once`, and if the response status is 401 and `recover_remote_control_auth` succeeds, reloads auth and retries exactly once. It returns the final `ClientManagementResponse`.
+**Data flow**: It receives the authentication manager, a description of the request to send, and a short action name for error messages. It loads the current remote-control authentication, sends the request once, and examines the HTTP status. If the status is not 401, or if authentication recovery cannot happen, it returns that first response. If recovery succeeds, it reloads authentication and sends the same request one more time, returning the second response.
 
-**Call relations**: Called by both `list_remote_control_clients` and `revoke_remote_control_client`. It delegates actual HTTP I/O to `send_client_management_request_once` and auth handling to the auth helpers in the sibling module.
+**Call relations**: `list_remote_control_clients` and `revoke_remote_control_client` both call this before they inspect the server response. This function delegates the actual HTTP work to `send_client_management_request_once`, and delegates credential loading and recovery to `load_remote_control_auth` and `recover_remote_control_auth`. It is the small coordinator that makes authentication retry behavior consistent for both operations.
 
 *Call graph*: calls 3 internal fn (load_remote_control_auth, recover_remote_control_auth, send_client_management_request_once); called by 2 (list_remote_control_clients, revoke_remote_control_client).
 
@@ -523,11 +533,11 @@ async fn send_client_management_request_once(
 ) -> io::Result<ClientManagementResponse>
 ```
 
-**Purpose**: Builds and sends a single authenticated HTTP request to the remote-control management API and captures the raw response. It handles query construction, headers, timeout, and body collection.
+**Purpose**: Performs a single HTTP request to the remote-control service using the supplied authentication. It does not decide whether to retry; it only sends once and collects the raw response.
 
-**Data flow**: Accepts `&RemoteControlConnectionAuth`, a borrowed `ClientManagementRequest`, and an action label. It creates a reqwest client, populates a `HeaderMap` with auth headers from `auth.auth_provider`, builds either a GET request with optional `cursor`, `limit`, and `order` query parameters or a DELETE request, applies the fixed timeout, adds the auth headers and `REMOTE_CONTROL_ACCOUNT_ID_HEADER`, sends the request, clones response headers and status, reads the body bytes into a `Vec<u8>`, and returns `ClientManagementResponse` or an `io::Error` with action-specific context.
+**Data flow**: It receives authenticated connection information, either a list or revoke request, and an action label for error text. It builds an HTTP client, asks the authentication provider to add its headers, adds the remote-control account ID header, and creates either a GET request with query parameters or a DELETE request. It applies a 30-second timeout, sends the request, reads the status, headers, and body bytes, then returns them together in a simple response struct.
 
-**Call relations**: Called by `send_client_management_request` for both the initial attempt and the single retry after auth recovery.
+**Call relations**: `send_client_management_request` calls this for the first attempt and, if needed, for the one retry after authentication recovery. It uses `build_reqwest_client` to create the network client and the request library’s timeout feature so a stuck remote service does not hang the caller forever.
 
 *Call graph*: calls 1 internal fn (build_reqwest_client); called by 1 (send_client_management_request); 3 external calls (new, new, timeout).
 
@@ -544,11 +554,11 @@ fn ensure_success_response(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Converts non-success HTTP responses from the remote-control management API into `io::Error`s with meaningful kinds and detailed context. It standardizes error mapping for both list and revoke operations.
+**Purpose**: Checks whether an HTTP response status means success, and turns failures into local errors with helpful categories and details. This gives callers clear reasons such as invalid input, permission denied, or not found.
 
-**Data flow**: Takes the HTTP status, response headers, request URL, body preview string, and a response-kind label. If `status.is_success()` it returns `Ok(())`; otherwise it maps status codes 400, 401/403, 404, and all others to `InvalidInput`, `PermissionDenied`, `NotFound`, and `Other` respectively, then returns an `io::Error` containing the URL, status, formatted headers, and body preview.
+**Data flow**: It receives the HTTP status, response headers, URL, a short preview of the body, and a label describing what kind of response was expected. If the status is successful, it returns nothing and lets the caller continue. If not, it maps common HTTP codes to suitable `io::ErrorKind` values and returns an error message that includes the URL, status, formatted headers, and body preview.
 
-**Call relations**: Called by both public operations after receiving a raw `ClientManagementResponse` and before attempting to decode or accept the body.
+**Call relations**: Both `list_remote_control_clients` and `revoke_remote_control_client` call this after the network request returns. It is the shared gatekeeper before list results are decoded or revoke success is reported, ensuring failed server replies do not accidentally look like successful operations.
 
 *Call graph*: called by 2 (list_remote_control_clients, revoke_remote_control_client); 4 external calls (as_u16, is_success, new, format!).
 
@@ -559,11 +569,11 @@ fn ensure_success_response(
 fn environment_clients_url(remote_control_url: &str, environment_id: &str) -> io::Result<Url>
 ```
 
-**Purpose**: Constructs the base URL for remote-control client-management operations within a specific environment. It normalizes the configured base URL and appends the fixed API path segments.
+**Purpose**: Builds the exact remote-control API URL for the clients belonging to one environment. It keeps URL construction in one place so list and revoke requests use the same path shape.
 
-**Data flow**: Accepts the remote-control base URL string and environment id, normalizes the base with `normalize_remote_control_base_url`, joins `wham/remote/control/environments`, mutates path segments to append `<environment_id>/clients`, and returns the resulting `Url` or an `io::Error` if the base URL cannot accept path segments.
+**Data flow**: It receives the remote-control base URL as text and an environment ID. It normalizes the base URL, joins it with the fixed remote-control environments path, then appends the environment ID and `clients` path segment. It returns the completed URL or an input error if the base URL cannot be used that way.
 
-**Call relations**: Used by both `list_remote_control_clients` and `revoke_remote_control_client` before the latter appends an additional client-id segment.
+**Call relations**: `list_remote_control_clients` calls this to get the collection URL for listing clients. `revoke_remote_control_client` calls it too, then appends one client ID to target a single client. It relies on `normalize_remote_control_base_url` so callers can pass a base URL in a consistent, forgiving way.
 
 *Call graph*: calls 1 internal fn (normalize_remote_control_base_url); called by 2 (list_remote_control_clients, revoke_remote_control_client).
 
@@ -574,11 +584,11 @@ fn environment_clients_url(remote_control_url: &str, environment_id: &str) -> io
 fn try_from(client: RemoteControlClientResponse) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Converts the wire-format remote-control client record into the protocol type exposed to callers, including timestamp parsing. It preserves optional metadata while normalizing `last_seen_at` to a unix timestamp.
+**Purpose**: Converts the raw client record received from the remote-control service into the app’s public client record type. It also validates and translates the optional last-seen timestamp into a simpler numeric form.
 
-**Data flow**: Consumes `RemoteControlClientResponse`, moves across all optional string fields, and for `last_seen_at` optionally parses the RFC3339 string with `OffsetDateTime::parse`, converts it to `unix_timestamp`, and returns `RemoteControlClient` or an `io::ErrorKind::InvalidData` if parsing fails.
+**Data flow**: It receives a decoded `RemoteControlClientResponse`, which mirrors the JSON fields from the service. It copies over identifiers and optional device details such as display name, platform, model, and app version. If `last_seen_at` is present, it parses the RFC 3339 timestamp format, which is a standard date-time text format, and converts it to a Unix timestamp. It returns a `RemoteControlClient`, or an invalid-data error if the timestamp cannot be parsed.
 
-**Call relations**: Called by `list_remote_control_clients` when decoding the list response body into the final protocol response.
+**Call relations**: `list_remote_control_clients` uses this conversion for every item returned by the service before handing the list back to its caller. This keeps the rest of the app from depending on the remote service’s raw JSON shape and catches bad timestamp data at the boundary.
 
 
 ### Exec HTTP and file streams
@@ -586,24 +596,24 @@ These files expose exec-server client-side transport facades for HTTP responses 
 
 ### `exec-server/src/client/http_client.rs`
 
-`orchestration` · `request handling and client capability setup`
+`io_transport` · `request handling and cross-cutting client setup`
 
-This module is a thin orchestration layer over three implementation files. Through `#[path = ...]` declarations it binds `reqwest_http_client.rs`, `http_response_body_stream.rs`, and `rpc_http_client.rs` into a single client-facing namespace. The module-level documentation explains the architectural split: an orchestrator process owns an `Arc<dyn HttpClient>` capability and can either execute HTTP requests locally with `reqwest` or forward them over JSON-RPC to a remote runtime, which then performs the actual request.
+This file does not contain the HTTP logic itself. Instead, it acts like a signpost and reception desk for the HTTP client parts of the system. The project can run HTTP requests in two different ways: directly in the current process using `reqwest` (a Rust library for making web requests), or indirectly by sending a JSON-RPC message to a remote execution server. JSON-RPC is a simple request-and-response message format often used between processes.
 
-The exports reflect that split. `ReqwestHttpClient` is the concrete local implementation for direct HTTP execution. `ReqwestHttpRequestRunner` and `PendingReqwestHttpBodyStream` are kept crate-visible for internal coordination around request execution and body streaming. `HttpResponseBodyStream` is publicly re-exported as the common byte-stream API presented to callers regardless of transport. The remote RPC-backed client implementation is intentionally not re-exported here as a public type, reinforcing that callers should depend on the higher-level `HttpClient` capability rather than transport-specific details.
+The file pulls in three nearby source files. One contains the direct `reqwest`-based client. One contains the RPC-based client that forwards HTTP work elsewhere. One contains `HttpResponseBodyStream`, which gives callers one consistent way to read response bytes whether the body was already buffered locally or arrives piece by piece from a remote server.
 
-There is no executable logic in this file; its value is in API shaping. It centralizes the HTTP capability surface, hides file layout details, and documents the invariant that local buffered bodies and remote streamed body deltas must look identical to downstream consumers.
+That consistency is the main reason this facade matters. Code elsewhere should not need to care whether an HTTP request is local or remote. It can ask for an HTTP client and read the response stream in the same shape either way. Without this file, other parts of the codebase would have to know the internal file layout and choose between implementation details themselves, making the local-versus-remote split harder to keep clean.
 
 
 ### `exec-server/src/client/http_response_body_stream.rs`
 
-`io_transport` · `streamed HTTP request handling and transport disconnect cleanup`
+`io_transport` · `request handling`
 
-This module defines the byte-stream type exposed by the `HttpClient` abstraction. `HttpResponseBodyStream` is an enum-backed wrapper with two modes: `Local`, which directly wraps `reqwest::Response::bytes_stream()`, and `Remote`, which reconstructs a body from `HttpRequestBodyDeltaNotification` messages delivered over the exec-server’s shared JSON-RPC connection. The remote variant tracks `request_id`, the next expected sequence number, an `mpsc::Receiver` for queued deltas, a `pending_eof` flag used when a terminal delta carries a final non-empty chunk, and a `closed` flag to avoid double cleanup.
+An HTTP response body can be large, so this code does not require the whole body to arrive at once. Instead, it treats the body like water coming through a pipe: callers ask for the next chunk until the stream ends. For local HTTP requests, it wraps reqwest’s normal byte stream. For remote requests, the first response only gives status and headers, while the actual body arrives later as `http/request/bodyDelta` notifications. A notification is a small message saying “here are the next bytes for request X.”
 
-`recv` is the core consumer API. For local streams it simply forwards chunks or converts `reqwest` errors into `ExecServerError::HttpRequest`. For remote streams it enforces strict in-order delivery, converts terminal `error` fields into protocol errors, handles EOF whether it arrives as an empty terminal delta or after a final payload chunk, and removes the request route when the stream finishes or fails.
+The central type, `HttpResponseBodyStream`, hides that difference from the caller. Its `recv` method returns the next chunk, reports end-of-file, and turns broken ordering or stream errors into clear protocol errors. Remote chunks are checked with sequence numbers so missing or out-of-order messages are caught instead of silently corrupting the body.
 
-`HttpBodyStreamRegistration` is a cancellation guard used while the initial `http/request` RPC is still in flight: if the future is dropped before headers return, its `Drop` removes the route. The module also provides `send_body_delta` for producers and several `Inner` methods that maintain the request-id routing table and a side map of stream failures. Backpressure is treated as fatal: if the per-request channel is full, the stream is failed, removed, and future `recv` calls surface a protocol error instead of hanging.
+The file also maintains a routing table inside `Inner`: request id to a channel sender. Think of it like a mailroom sorting incoming envelopes by request id. Registrations and drop cleanup remove routes when a stream finishes, fails, or is abandoned, so stale request ids do not pile up and future notifications do not go to the wrong place.
 
 #### Function details
 
@@ -613,11 +623,11 @@ This module defines the byte-stream type exposed by the `HttpClient` abstraction
 fn local(response: Response) -> Self
 ```
 
-**Purpose**: Constructs a streamed HTTP body wrapper around a local `reqwest::Response`. This is the local-runtime implementation of the shared body-stream API.
+**Purpose**: Creates a response-body stream for an HTTP request that was performed in this process. It lets the rest of the client read the body chunk by chunk without caring that the source is local.
 
-**Data flow**: It takes a `reqwest::Response`, calls `response.bytes_stream()`, boxes and pins that stream, stores it in `HttpResponseBodyStreamInner::Local`, and returns `HttpResponseBodyStream`.
+**Data flow**: It receives a `reqwest::Response`, takes that response’s built-in byte stream, pins it so it can be safely polled while async work is in progress, and stores it inside a `HttpResponseBodyStream`. The result is a stream object ready for callers to read with `recv`.
 
-**Call relations**: Called by the `reqwest`-backed `http_request_stream` implementation after the initial response headers have been received. It is the local counterpart to `HttpResponseBodyStream::remote`.
+**Call relations**: The HTTP request path calls this after a local streaming request returns its headers. Later, body collection code reads from the returned stream rather than reading directly from the underlying HTTP library.
 
 *Call graph*: called by 1 (http_request_stream); 2 external calls (pin, bytes_stream).
 
@@ -632,11 +642,11 @@ fn remote(
     ) -> Self
 ```
 
-**Purpose**: Constructs a streamed HTTP body wrapper backed by remote body-delta notifications. It initializes the per-request sequencing and cleanup state.
+**Purpose**: Creates a response-body stream for an HTTP request whose body will arrive through remote notifications. It ties one request id to a receiver channel where body chunks will be delivered.
 
-**Data flow**: It takes `Arc<Inner>`, a `request_id`, and an `mpsc::Receiver<HttpRequestBodyDeltaNotification>`, then returns `HttpResponseBodyStream` with `next_seq: 1`, `pending_eof: false`, and `closed: false` in the `Remote` variant.
+**Data flow**: It receives shared client state, a request id, and a channel receiver. It stores those along with bookkeeping: the next expected sequence number starts at 1, and the stream is marked not finished and not closed. The output is a stream object that can turn remote notifications into ordinary body chunks.
 
-**Call relations**: Called by the RPC-backed `ExecServerClient::http_request_stream` after the request id has been registered and the initial `http/request` response has succeeded. It depends on `Inner` methods for later route removal and failure lookup.
+**Call relations**: The HTTP request path calls this after setting up a remote streamed request. Incoming notifications are routed into the channel elsewhere, and `recv` later pulls them out in order.
 
 *Call graph*: called by 1 (http_request_stream).
 
@@ -647,11 +657,11 @@ fn remote(
 async fn recv(&mut self) -> Result<Option<Vec<u8>>, ExecServerError>
 ```
 
-**Purpose**: Receives the next body chunk from either a local `reqwest` stream or a remote notification-backed stream. It is the main consumer-facing API for streamed HTTP bodies.
+**Purpose**: Returns the next chunk of response-body bytes, or says that the body is finished. It also protects callers from bad remote streams by reporting missing, out-of-order, or failed chunks as errors.
 
-**Data flow**: For `Local`, it awaits `body.next()`: successful bytes become `Ok(Some(Vec<u8>))`, stream end becomes `Ok(None)`, and `reqwest` errors become `ExecServerError::HttpRequest`. For `Remote`, it first checks `pending_eof` and, if set, clears it, finishes the stream route, and returns `Ok(None)`. Otherwise it awaits `rx.recv()`: channel closure triggers route cleanup and, if a stored failure exists in `Inner`, returns `ExecServerError::Protocol`; absent a stored failure it returns EOF. If a delta arrives with the wrong `seq`, it cleans up and returns a protocol error. Matching deltas advance `next_seq`; a non-`None` `error` field becomes a protocol error after cleanup; `done` triggers cleanup immediately, returning EOF if the chunk is empty or setting `pending_eof` so the final payload chunk is returned once before EOF on the next call.
+**Data flow**: For a local stream, it waits for the next bytes from the HTTP library and converts them into a plain `Vec<u8>`. For a remote stream, it waits for the next routed notification, checks that its sequence number is exactly the one expected, extracts the bytes, and watches for `done` or `error` flags. It returns `Ok(Some(bytes))` for a chunk, `Ok(None)` at end-of-file, or an `ExecServerError` if the stream breaks.
 
-**Call relations**: Called by higher-level body collectors such as `collect_body`. It delegates remote cleanup to `finish_remote_stream` and remote failure retrieval to `Inner::take_http_body_stream_failure`, and it is the point where backpressure or protocol-ordering problems become visible to consumers.
+**Call relations**: Body collection code calls this repeatedly until it receives end-of-file or an error. When a remote stream ends or becomes invalid, this function hands cleanup to `finish_remote_stream` so the request id is removed from the routing table.
 
 *Call graph*: calls 1 internal fn (finish_remote_stream); called by 1 (collect_body); 3 external calls (HttpRequest, Protocol, format!).
 
@@ -662,11 +672,11 @@ async fn recv(&mut self) -> Result<Option<Vec<u8>>, ExecServerError>
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures that dropping a remote body stream before EOF eventually removes its request-id route. This prevents abandoned streams from leaking routing-table entries.
+**Purpose**: Cleans up a remote stream if the caller stops using it before reading to the end. This prevents the client from keeping a dead request route around.
 
-**Data flow**: On drop, if the stream is `Remote` and not already marked `closed`, it sets `closed = true` and calls `spawn_remove_http_body_stream(Arc::clone(inner), request_id.clone())`. Local streams require no special cleanup.
+**Data flow**: When the stream object is destroyed, it checks whether it represents a remote stream and whether cleanup has already happened. If not, it marks the stream closed and schedules removal of that request id from the shared routing table.
 
-**Call relations**: Runs automatically when callers abandon a streamed HTTP response. It complements `recv`’s explicit EOF/error cleanup and uses `spawn_remove_http_body_stream` because `Drop` cannot await.
+**Call relations**: Rust calls this automatically when a `HttpResponseBodyStream` goes out of scope. It uses `spawn_remove_http_body_stream` because dropping an object is synchronous, while route removal needs async work.
 
 *Call graph*: calls 1 internal fn (spawn_remove_http_body_stream); 1 external calls (clone).
 
@@ -677,11 +687,11 @@ fn drop(&mut self)
 fn new(inner: Arc<Inner>, request_id: String) -> Self
 ```
 
-**Purpose**: Creates a cancellation guard for a just-registered remote HTTP body stream route. The guard assumes the route is active until explicitly disarmed.
+**Purpose**: Creates a temporary guard for a remote body-stream registration. The guard exists so that if request setup is cancelled halfway through, the route can still be removed.
 
-**Data flow**: It takes `Arc<Inner>` and a `request_id`, stores them with `active: true`, and returns `HttpBodyStreamRegistration`.
+**Data flow**: It receives shared client state and a request id, stores them, and marks the registration as active. The returned guard will clean up the route unless it is later disarmed.
 
-**Call relations**: Used by the RPC-backed `http_request_stream` path immediately after inserting the request-id route and before awaiting the initial `http/request` RPC. If that future is cancelled or errors before disarming, the guard’s `Drop` removes the route.
+**Call relations**: The streaming HTTP request setup path calls this before issuing a request. It acts like a safety tag attached during setup, making sure unfinished setup does not leave stale routing entries behind.
 
 *Call graph*: called by 1 (http_request_stream).
 
@@ -692,11 +702,11 @@ fn new(inner: Arc<Inner>, request_id: String) -> Self
 fn disarm(&mut self)
 ```
 
-**Purpose**: Marks the registration guard as inactive so dropping it will no longer remove the route. This is called once ownership of the route has been successfully transferred to a live body stream or explicitly cleaned up elsewhere.
+**Purpose**: Turns off the registration guard once setup has succeeded and ownership has moved elsewhere. After this, dropping the guard will not remove the stream route.
 
-**Data flow**: It mutably sets `self.active = false`. No other state is touched.
+**Data flow**: It changes the guard’s `active` flag from true to false. Nothing is returned, but the guard’s later drop behavior changes.
 
-**Call relations**: Called by the RPC-backed `http_request_stream` implementation after either successful response receipt or explicit error cleanup. It prevents the guard’s `Drop` from racing with normal route ownership.
+**Call relations**: This is meant to be called by the request setup flow after the response stream is safely established. From that point on, cleanup belongs to `HttpResponseBodyStream::recv` or `HttpResponseBodyStream::drop`.
 
 
 ##### `HttpBodyStreamRegistration::drop`  (lines 183–187)
@@ -705,11 +715,11 @@ fn disarm(&mut self)
 fn drop(&mut self)
 ```
 
-**Purpose**: Removes the request-id route if the stream setup future is cancelled before headers are returned. It is the cancellation-safety mechanism for remote streamed HTTP requests.
+**Purpose**: Removes a stream route if setup is abandoned before the response stream takes over. This avoids leaving a channel registered for a request that will never be read.
 
-**Data flow**: On drop, if `self.active` is still true, it clones `inner` and `request_id` and passes them to `spawn_remove_http_body_stream`. If disarmed, it does nothing.
+**Data flow**: When the guard is destroyed, it checks whether it is still active. If so, it schedules removal of its request id from the shared routing table.
 
-**Call relations**: Runs automatically when the registration guard falls out of scope. It complements `HttpBodyStreamRegistration::new` and `disarm` in the remote stream setup flow.
+**Call relations**: Rust calls this automatically when the registration guard goes away. It uses `spawn_remove_http_body_stream` for the async cleanup, just like the response stream’s drop path.
 
 *Call graph*: calls 1 internal fn (spawn_remove_http_body_stream); 1 external calls (clone).
 
@@ -720,11 +730,11 @@ fn drop(&mut self)
 async fn finish_remote_stream(inner: &Arc<Inner>, request_id: &str, closed: &mut bool)
 ```
 
-**Purpose**: Performs one-time async cleanup for a remote body stream by removing its route if it has not already been closed. It centralizes the `closed` flag check used by `recv`.
+**Purpose**: Performs final cleanup for a remote body stream. It removes the request id from the routing table exactly once.
 
-**Data flow**: It takes `&Arc<Inner>`, a `request_id`, and `&mut bool closed`; if `closed` is already true it returns immediately, otherwise it sets `*closed = true` and awaits `inner.remove_http_body_stream(request_id)`.
+**Data flow**: It receives shared client state, a request id, and the stream’s `closed` flag. If cleanup already happened, it does nothing. Otherwise it marks the stream closed and asks `Inner` to remove the route.
 
-**Call relations**: Called from `HttpResponseBodyStream::recv` on EOF, protocol error, or terminal delta handling. It is the awaited cleanup path, whereas `spawn_remove_http_body_stream` is used from synchronous drop contexts.
+**Call relations**: `HttpResponseBodyStream::recv` calls this whenever a remote stream reaches end-of-file, reports an error, loses its channel, or receives an invalid sequence. It centralizes the “close this stream route” step so the caller does not repeat it in every branch.
 
 *Call graph*: called by 1 (recv).
 
@@ -735,11 +745,11 @@ async fn finish_remote_stream(inner: &Arc<Inner>, request_id: &str, closed: &mut
 fn spawn_remove_http_body_stream(inner: Arc<Inner>, request_id: String)
 ```
 
-**Purpose**: Schedules asynchronous route removal from contexts that cannot await, such as `Drop`. If no Tokio runtime is active, it silently does nothing.
+**Purpose**: Starts async route removal from places that cannot directly `await`, such as destructors. It is a bridge between synchronous cleanup and asynchronous shared-state updates.
 
-**Data flow**: It attempts `Handle::try_current()`, and on success spawns an async task that awaits `inner.remove_http_body_stream(&request_id)`. It consumes the cloned `Arc<Inner>` and `String` request id.
+**Data flow**: It receives shared client state and a request id. If there is a current Tokio runtime handle, it spawns a small async task that removes that request id from the routing table. It does not return the removed route to the caller.
 
-**Call relations**: Used by both `HttpResponseBodyStream::drop` and `HttpBodyStreamRegistration::drop`. It is the non-blocking cleanup bridge for synchronous destructors.
+**Call relations**: Both stream-related drop functions call this when an object is abandoned. It lets cleanup still happen even though Rust destructors cannot pause and wait for async work.
 
 *Call graph*: called by 2 (drop, drop); 1 external calls (try_current).
 
@@ -753,11 +763,11 @@ async fn send_body_delta(
 ) -> bool
 ```
 
-**Purpose**: Sends one `http/request/bodyDelta` notification to a remote consumer and reports whether delivery to the JSON-RPC layer succeeded. It is the producer-side helper used by streaming HTTP implementations.
+**Purpose**: Sends one response-body chunk notification to the other side of the RPC connection. It reports only whether the send succeeded.
 
-**Data flow**: It takes an `RpcNotificationSender` and a `HttpRequestBodyDeltaNotification`, calls `notifications.notify(HTTP_REQUEST_BODY_DELTA_METHOD, &delta).await`, and returns `true` on success or `false` on error.
+**Data flow**: It receives an RPC notification sender and a body-delta notification. It sends the notification using the HTTP body-delta method name and returns `true` if that send worked, or `false` if it failed.
 
-**Call relations**: Called by the `reqwest` streaming producer in `ReqwestHttpRequestRunner::stream_body`. The boolean return lets producers stop work early if the shared transport is already gone.
+**Call relations**: This is the outgoing counterpart to the incoming routing code. Code that is streaming an HTTP response body over RPC can call this for each chunk so the remote client can rebuild the body stream.
 
 *Call graph*: calls 1 internal fn (notify).
 
@@ -771,11 +781,11 @@ async fn handle_http_body_delta_notification(
     ) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Routes one incoming remote body-delta notification into the request-local channel for that streamed HTTP response. It also handles terminal cleanup and backpressure failures.
+**Purpose**: Receives an incoming remote body-delta message and delivers it to the waiting stream for the matching request id. It is the mailroom sorter for streamed HTTP response chunks.
 
-**Data flow**: It deserializes `params` into `HttpRequestBodyDeltaNotification`, looks up the sender for `params.request_id` in `http_body_streams`, and if found computes whether the delta is terminal (`done` or `error.is_some()`). It then `try_send`s the delta: on success, terminal deltas trigger `remove_http_body_stream`; on `Closed`, it removes the route and logs that the receiver was dropped; on `Full`, it records a failure message with `record_http_body_stream_failure`, removes the route, and logs a backpressure warning. Unknown request ids are ignored.
+**Data flow**: It receives optional JSON parameters, decodes them into a body-delta notification, and looks up the request id in the stream routing table. If a matching channel exists, it tries to send the notification into that channel. Terminal messages remove the route, closed channels are cleaned up, and full channels are treated as stream failure so the reader will not wait forever.
 
-**Call relations**: Called from the main client notification dispatcher when `HTTP_REQUEST_BODY_DELTA_METHOD` arrives. It depends on the routing/failure helpers on `Inner` and is the bridge from connection-global notifications to per-request streams.
+**Call relations**: The RPC notification layer calls this when an `http/request/bodyDelta` notification arrives. It may call `remove_http_body_stream` after final or undeliverable messages, and it calls `record_http_body_stream_failure` when backpressure means the chunk could not be delivered.
 
 *Call graph*: calls 2 internal fn (record_http_body_stream_failure, remove_http_body_stream); 2 external calls (debug!, from_value).
 
@@ -786,11 +796,11 @@ async fn handle_http_body_delta_notification(
 async fn fail_all_http_body_streams(&self, message: String)
 ```
 
-**Purpose**: Fails every active remote HTTP body stream when the shared transport dies or notification handling aborts. This prevents consumers from waiting forever on channels that will never receive more deltas.
+**Purpose**: Fails every active streamed HTTP response, usually after a transport disconnect or serious notification error. This makes waiting readers wake up with an error instead of hanging forever.
 
-**Data flow**: It acquires `http_body_streams_write_lock`, clones and clears the entire `http_body_streams` map, then iterates each `(request_id, tx)`. For each stream it tries to send a synthetic terminal `HttpRequestBodyDeltaNotification` with `seq: 1`, empty delta, `done: true`, and `error: Some(message.clone())`; if that send fails, it records the failure message in `http_body_stream_failures` so a later `recv` can surface it after channel closure.
+**Data flow**: It locks the stream table, copies all active routes, replaces the table with an empty one, and then tries to send each stream a final notification containing the failure message. If a channel cannot receive that message, it stores the failure in a separate failure map so the stream can still discover it later.
 
-**Call relations**: Called by `fail_all_in_flight_work` during transport teardown. It is the HTTP-stream analogue of `fail_all_sessions`.
+**Call relations**: This is used when the connection as a whole can no longer be trusted. It feeds failure messages into the same per-request channels that normal body notifications use, so `recv` can surface the problem to callers.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -801,11 +811,11 @@ async fn fail_all_http_body_streams(&self, message: String)
 fn next_http_body_stream_request_id(&self) -> String
 ```
 
-**Purpose**: Allocates a unique connection-local request id for a streamed HTTP response. This prevents late body deltas from one abandoned request being mistaken for another.
+**Purpose**: Creates a new request id for a streamed HTTP response body on this connection. The id lets later body notifications be matched back to the right request.
 
-**Data flow**: It atomically increments `http_body_stream_next_id` with relaxed ordering, formats the previous value as `http-<id>`, and returns that string.
+**Data flow**: It increments an atomic counter, which is a number safe to update from multiple tasks at once, and formats the number as a string like `http-123`. The returned string becomes the stream’s request id.
 
-**Call relations**: Used by the RPC-backed `ExecServerClient::http_request_stream` before registering a new route. It is the source of request ids for remote streamed HTTP calls.
+**Call relations**: The streaming HTTP request setup code uses this before registering a route and sending the request. Later, both incoming and outgoing body-delta messages rely on this id to identify the stream.
 
 *Call graph*: 1 external calls (format!).
 
@@ -820,11 +830,11 @@ async fn insert_http_body_stream(
     ) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Registers a request id and sender channel before issuing a remote streaming HTTP request. It also clears any stale recorded failure for the same id.
+**Purpose**: Registers a new request id and channel before starting a remote streamed HTTP request. This gives incoming body notifications somewhere to go.
 
-**Data flow**: It acquires `http_body_streams_write_lock`, loads the current streams map, rejects duplicate request ids with `ExecServerError::Protocol`, clones and updates the map with the new sender, and stores it back. It then checks `http_body_stream_failures`; if a stale failure exists for that request id, it clones the failure map, removes the entry, and stores the cleaned map.
+**Data flow**: It locks the stream table, checks that the request id is not already present, clones the current table, adds the new sender, and swaps the updated table into shared state. It also clears any old stored failure for the same id. It returns success or a protocol error if the id was already registered.
 
-**Call relations**: Called by the RPC-backed `http_request_stream` path before the initial `http/request` RPC is sent. It pairs with `remove_http_body_stream` for normal cleanup and with `HttpBodyStreamRegistration` for cancellation safety.
+**Call relations**: The HTTP request setup flow calls this before the remote request is issued. Later, `Inner::handle_http_body_delta_notification` reads this table to deliver chunks, and cleanup functions remove the entry when the stream ends.
 
 *Call graph*: 3 external calls (new, Protocol, format!).
 
@@ -838,11 +848,11 @@ async fn remove_http_body_stream(
     ) -> Option<mpsc::Sender<HttpRequestBodyDeltaNotification>>
 ```
 
-**Purpose**: Removes a request-id route from the active HTTP body stream table and returns the sender if one existed. It is the normal cleanup path after EOF, terminal error, or abandoned setup.
+**Purpose**: Unregisters a streamed HTTP response body after it finishes, fails, or is abandoned. This stops future notifications for that request id from being routed to an old channel.
 
-**Data flow**: It acquires `http_body_streams_write_lock`, loads the current streams map, clones the sender for `request_id` if present, returns `None` early if absent, otherwise clones the map, removes the entry, stores the new map, and returns the removed sender.
+**Data flow**: It locks the stream table, looks for the request id, and if found, creates a new table without that id and stores it. It returns the removed channel sender if there was one, or `None` if nothing was registered.
 
-**Call relations**: Called by `finish_remote_stream`, `Inner::handle_http_body_delta_notification`, and the remote `http_request_stream` error path. It is the central route-removal primitive used throughout the module.
+**Call relations**: `Inner::handle_http_body_delta_notification` calls this when a terminal or undeliverable notification arrives. It is also used by stream cleanup paths, including `finish_remote_stream` and spawned drop cleanup.
 
 *Call graph*: called by 1 (handle_http_body_delta_notification); 1 external calls (new).
 
@@ -853,11 +863,11 @@ async fn remove_http_body_stream(
 async fn record_http_body_stream_failure(&self, request_id: &str, message: String)
 ```
 
-**Purpose**: Stores a terminal failure message for a request id after the active route has been removed. This lets a consumer learn why its channel closed instead of seeing a silent EOF.
+**Purpose**: Stores a failure message for a request id when the normal channel delivery path cannot report it directly. This preserves the reason the stream was closed.
 
-**Data flow**: It acquires `http_body_streams_write_lock`, clones the current `http_body_stream_failures` map, inserts `request_id -> message`, and stores the updated map.
+**Data flow**: It locks the shared stream state, clones the current failure map, inserts the request id and message, and swaps the updated map back into shared state. It does not return anything.
 
-**Call relations**: Called by `Inner::handle_http_body_delta_notification` when backpressure fills the per-request channel. The stored message is later consumed by `take_http_body_stream_failure` during `recv`.
+**Call relations**: `Inner::handle_http_body_delta_notification` calls this when a body-delta channel is full and the notification cannot be delivered. Later, the stream reader can retrieve the stored message through `Inner::take_http_body_stream_failure`.
 
 *Call graph*: called by 1 (handle_http_body_delta_notification); 1 external calls (new).
 
@@ -868,11 +878,11 @@ async fn record_http_body_stream_failure(&self, request_id: &str, message: Strin
 async fn take_http_body_stream_failure(&self, request_id: &str) -> Option<String>
 ```
 
-**Purpose**: Retrieves and removes any recorded failure message for a request id. It is the one-shot read path for deferred stream failures.
+**Purpose**: Retrieves and removes a stored failure message for a request id. It is used so a stream reader can report the real reason a remote body stream ended unexpectedly.
 
-**Data flow**: It acquires `http_body_streams_write_lock`, loads the failure map, clones the message for `request_id` if present, returns `None` early if absent, otherwise clones the map, removes the entry, stores the updated map, and returns the message.
+**Data flow**: It locks the shared state, looks up the request id in the failure map, and if a message exists, clones the map without that entry and stores the updated version. It returns the message if one was found, otherwise `None`.
 
-**Call relations**: Called by `HttpResponseBodyStream::recv` when the remote channel closes unexpectedly. It turns previously recorded routing/backpressure failures into a surfaced `ExecServerError::Protocol`.
+**Call relations**: `HttpResponseBodyStream::recv` uses this after a remote channel closes without a normal final chunk. That lets `recv` turn a previously recorded delivery problem into a clear protocol error for the caller.
 
 *Call graph*: 1 external calls (new).
 
@@ -881,11 +891,13 @@ async fn take_http_body_stream_failure(&self, request_id: &str) -> Option<String
 
 `io_transport` · `request handling`
 
-This file turns the exec-server’s open/readBlock/close RPC trio into a `FileSystemReadStream`. The internal `FileReadRegistration` stores the `ExecServerClient`, a generated `handle_id`, an optional Tokio runtime handle captured at creation time, and an `active` flag indicating whether the remote handle still needs cleanup.
+This file solves a simple but important problem: the client needs to read file contents from another process or machine without loading the whole file at once. It does that by turning remote file-reading protocol calls into a stream of byte chunks. Think of it like checking out a library book by ID, reading a few pages at a time, then returning the book when finished.
 
-The exported `open` function creates a fresh registration with a UUID-based handle id and immediately sends `fs_open` using `FsOpenParams { handle_id, path, sandbox }`. On success it returns `FileSystemReadStream::new(...)` wrapping a `futures::stream::try_unfold` state machine whose state is `Option<(FileReadRegistration, u64)>`, where the `u64` is the current byte offset. Each iteration calls `fs_read_block` with the current offset and `FILE_READ_CHUNK_SIZE`, converts the returned chunk into `bytes::Bytes`, and enforces several protocol invariants: the chunk must not exceed the requested maximum, non-EOF responses must not be empty, and advancing the offset must not overflow `u64`. When `response.eof` is true, it attempts `fs_close`; if that succeeds it marks the registration inactive so drop will not issue a second close. EOF with an empty chunk ends the stream, while EOF with trailing bytes yields one final chunk and then terminates.
+The main entry point, `open`, first creates a unique handle ID. That handle ID is like a claim ticket for the remote file. It then asks the exec server to open the requested path, optionally inside a sandbox context, which means a restricted file-system view. If the open succeeds, it returns a `FileSystemReadStream` that repeatedly asks the server for the next block of bytes.
 
-`Drop` on `FileReadRegistration` is a cleanup backstop. If the handle is still active, it clones the client and handle id, finds a runtime handle either from the stored one or the current context, and spawns an async `fs_close` call. If no runtime is available, cleanup is skipped rather than blocking synchronously. This design favors nonblocking teardown and leak prevention without making stream consumers explicitly close handles.
+Each read block is checked carefully. The server must not send more than the agreed chunk size. If it says the file is not finished, it must send at least one byte, otherwise the stream could loop forever. The code also checks that the byte offset does not overflow.
+
+A small guard object, `FileReadRegistration`, remembers whether the remote file is still open. If the stream reaches end-of-file, it closes the remote handle normally. If the stream is dropped early, its `Drop` method tries to close the handle in the background, preventing leaked remote file handles.
 
 #### Function details
 
@@ -899,11 +911,11 @@ async fn open(
 ) -> FileSystemResult<FileSystemReadStream>
 ```
 
-**Purpose**: Opens a remote file for streaming reads and returns a `FileSystemReadStream` that fetches fixed-size blocks over RPC until EOF.
+**Purpose**: Opens a remote file for reading and returns a stream that produces its contents piece by piece. Someone would use this when they want file bytes from the exec server without downloading the whole file into memory at once.
 
-**Data flow**: It takes an `ExecServerClient`, `PathUri`, and optional `FileSystemSandboxContext`, creates a `FileReadRegistration` with a UUID-derived `handle_id`, captures `tokio::runtime::Handle::try_current()`, and sends `fs_open`. It then builds a `try_unfold` stream whose state carries the registration and current offset. Each poll issues `fs_read_block`, converts the returned chunk to `Bytes`, validates chunk size and EOF semantics, optionally sends `fs_close` on EOF, updates `registration.active`, computes the next offset with checked addition, and yields either the next chunk plus updated state or stream termination. RPC errors are mapped through `map_remote_error`, while protocol violations become `io::ErrorKind::InvalidData`.
+**Data flow**: It receives an exec-server client, a file path, and an optional sandbox description. It creates a fresh handle ID, asks the server to open that path under that handle, then builds a stream. Each time the stream is polled, it asks the server for the next block of bytes, checks that the response is valid, advances the offset, and yields the bytes. When the server reports end-of-file, it closes the remote handle and ends the stream.
 
-**Call relations**: It is called by `RemoteFileSystem::read_file_stream` after the remote client has been acquired and sandbox support checked. Its internal state machine relies on `FileReadRegistration::drop` as a fallback cleanup path if the stream is abandoned before EOF.
+**Call relations**: This function starts the remote-read story. It creates the `FileReadRegistration` guard, then uses the client’s remote file operations to open, read, and eventually close the file. The stream machinery calls its inner read step repeatedly until there is no more data or an error occurs. If normal closing does not happen because the stream is abandoned, `FileReadRegistration::drop` is the backup cleanup path.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new_v4, try_unfold, try_current).
 
@@ -914,11 +926,11 @@ async fn open(
 fn drop(&mut self)
 ```
 
-**Purpose**: Performs best-effort asynchronous remote handle cleanup when a streaming read registration is dropped before it has been explicitly closed.
+**Purpose**: Acts as a safety net for remote file handles. If a read stream is dropped before it has cleanly closed the remote file, this function tries to close it in the background.
 
-**Data flow**: On drop it first checks `self.active`; if false it returns immediately. Otherwise it clones the client and handle id, obtains a Tokio runtime handle from the stored `runtime` or `Handle::try_current()`, and if one is available spawns an async task that calls `client.fs_close(FsCloseParams { handle_id })`, ignoring the result.
+**Data flow**: It looks at the registration object as it is being destroyed. If the remote handle is already marked inactive, it does nothing. If the handle is still active, it copies the client and handle ID, finds a Tokio runtime handle if one is available, and schedules an asynchronous close request. It does not return useful data; its effect is the attempted cleanup of the remote server resource.
 
-**Call relations**: This runs automatically when the stream state is dropped, especially if a consumer stops reading before EOF. It complements the explicit EOF close path inside `open` by covering early cancellation and abandonment.
+**Call relations**: This function is called automatically by Rust when a `FileReadRegistration` is destroyed. It supports the stream created by `open`: normal end-of-file closes the handle directly and marks it inactive, but early cancellation or errors may leave it active. In that case, this drop hook hands off a close request to the async runtime so the remote server is not left holding an unused file handle.
 
 *Call graph*: 1 external calls (clone).
 
@@ -928,13 +940,13 @@ These modules provide the authenticated channel, ciphertext ordering, and decryp
 
 ### `exec-server/src/noise_channel.rs`
 
-`domain_logic` · `connection setup and encrypted transport`
+`io_transport` · `connection setup and relay message transport`
 
-This file wraps the `clatter` Noise implementation in exec-server-specific types and validation. `NoiseChannelPublicKey` is the serialized registry-facing public key format: it carries a `suite` tag plus base64-encoded X25519 and ML-KEM-768 public keys. The suite string is mandatory, preventing accidental acceptance of similarly shaped keys from another protocol. `NoiseChannelIdentity` holds the long-lived static DH and KEM keypairs for one process and can generate fresh identities or export the public half.
+This file is the lock, key check, and sealed pipe for exec-server relay traffic. Before any normal messages are sent, the harness and executor run a two-message Noise handshake. Noise is a standard way to set up encrypted connections; here it is "hybrid", meaning it combines a traditional X25519 key exchange with ML-KEM-768, a newer post-quantum key exchange method. The goal is that both today’s attackers and future quantum-capable attackers have a harder time reading the traffic.
 
-Handshake state is split by role. `InitiatorHandshake::start` pins the responder’s expected static key, binds the transcript to a caller-supplied prologue, checks that the first encrypted payload fits within `MAX_MESSAGE_LEN`, and emits the first IK message plus resumable initiator state. `InitiatorHandshake::finish` consumes the responder’s second message, requires that it carry no application payload, and finalizes into `NoiseTransport`. On the executor side, `PendingResponderHandshake::read_request` parses the first message, authenticates and extracts the initiator static key, and returns both that key and the decrypted payload so external authorization can happen before `complete` sends the empty second handshake message and enters transport mode.
+The harness starts by using the executor public key it got from the registry. That key is "pinned", meaning the harness refuses to continue if the responder key does not exactly match what was expected. The executor reads the first handshake message, learns the authenticated harness public key, and pauses so another part of the system can ask the registry whether that harness is allowed. Only after that authorization does the executor finish the handshake.
 
-`NoiseTransport` enforces frame-size limits before calling Clatter’s `send_vec`/`receive_vec`; decryption also rejects ciphertext shorter than the AES-GCM tag. `noise_channel_prologue` length-prefixes a fixed domain plus environment, registration, and stream identifiers so transcript binding is stable and unambiguous. Errors are normalized into `NoiseChannelError`, with `From` conversions preserving handshake versus transport failure categories.
+Both sides also build a shared "prologue", which is extra context mixed into the handshake. It includes the environment, executor registration, and stream identifiers, so a valid handshake for one stream cannot be silently reused as if it belonged to another. Once the handshake is complete, NoiseTransport encrypts and decrypts ordered records. The ordering matters because the encryption state advances with each record, like a ticket book where each ticket can be used only once.
 
 #### Function details
 
@@ -944,11 +956,11 @@ Handshake state is split by role. `InitiatorHandshake::start` pins the responder
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Implements a redacted `Debug` view for public key material. It exposes the suite string but hides the actual encoded key bytes.
+**Purpose**: This defines how a public key is shown in debug output. It keeps the suite name visible but hides the actual key strings, so logs can be useful without casually exposing sensitive key material.
 
-**Data flow**: It writes a `debug_struct("NoiseChannelPublicKey")` containing `suite` and placeholder strings `"<redacted>"` for both key fields, then finishes the formatter.
+**Data flow**: It receives a formatter that is building a debug string. It writes a structured view named NoiseChannelPublicKey, includes the suite value, replaces both public-key fields with "<redacted>", and returns the formatter result.
 
-**Call relations**: This is used implicitly by Rust formatting and logging paths so diagnostics can mention the key object without leaking raw public-key strings.
+**Call relations**: This is used automatically when Rust debug-printing asks how to display a NoiseChannelPublicKey. It delegates to the standard debug_struct helper to build the redacted output.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -959,11 +971,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn decode(&self) -> Result<(<X25519 as Dh>::PubKey, MlKem768PublicKey), NoiseChannelError>
 ```
 
-**Purpose**: Validates and decodes registry-provided public key material into the concrete Clatter key types needed for handshake setup. It enforces both suite identity and component lengths.
+**Purpose**: This checks that a registry-provided public key belongs to this exact Noise channel design, then turns its base64 text fields into the binary key objects the cryptography library needs. It prevents keys from a different protocol, or malformed keys, from being accepted by accident.
 
-**Data flow**: It checks `self.suite` against `NOISE_CHANNEL_SUITE`, base64-decodes `x25519_public_key` and converts it into `<X25519 as Dh>::PubKey`, base64-decodes `mlkem768_public_key`, verifies its length equals `MlKem768PublicKey::LENGTH`, converts it with `MlKem768PublicKey::from_slice`, and returns the `(dh, kem)` pair or `NoiseChannelError::InvalidPublicKey(...)`.
+**Data flow**: It starts with a NoiseChannelPublicKey containing a suite string and two base64-encoded keys. It first checks the suite name, then decodes the X25519 and ML-KEM-768 public keys and verifies their lengths. On success it returns the two usable public keys; on failure it returns a clear invalid-public-key error.
 
-**Call relations**: Only `InitiatorHandshake::start` calls this, so responder key validation happens before any handshake bytes are emitted.
+**Call relations**: InitiatorHandshake::start calls this before the harness begins a handshake. That means the expected executor key is validated and converted before being pinned into the cryptographic setup.
 
 *Call graph*: called by 1 (start); 2 external calls (from_slice, InvalidPublicKey).
 
@@ -974,11 +986,11 @@ fn decode(&self) -> Result<(<X25519 as Dh>::PubKey, MlKem768PublicKey), NoiseCha
 fn generate() -> Result<Self, NoiseChannelError>
 ```
 
-**Purpose**: Generates a fresh static Noise identity containing both X25519 and ML-KEM-768 keypairs. It is the constructor for executor and harness identities.
+**Purpose**: This creates a fresh long-lived Noise identity for a harness or executor process. The identity contains both kinds of private key material needed for the hybrid handshake.
 
-**Data flow**: It calls `X25519::genkey()` and `MlKem768::genkey()`, maps any generation failure into `NoiseChannelError::KeyGeneration(error.to_string())`, and returns `NoiseChannelIdentity { dh, kem }`.
+**Data flow**: It takes no input. It asks the cryptography library to generate an X25519 key pair and an ML-KEM-768 key pair. If both succeed, it returns a NoiseChannelIdentity holding them; if either fails, it returns a key-generation error with the underlying message.
 
-**Call relations**: Used by production setup and many tests to create endpoint identities before exporting public keys or starting handshakes.
+**Call relations**: Startup and tests call this when they need a new secure identity. For example, environment registration code uses it before publishing the public half, and handshake tests use it to create both endpoints.
 
 *Call graph*: called by 22 (upsert_noise_environment, hybrid_ik_roundtrip_authenticates_both_endpoints, initiator_rejects_oversized_handshake_payload, initiator_rejects_wrong_responder_key, public_key_serializes_with_expected_suite, public_key_validation_rejects_unknown_suite, responder_rejects_mismatched_prologue, transport_rejects_replayed_ciphertext, transport_rejects_tampered_ciphertext, processor_exit_reports_closed_virtual_stream (+12 more)); 2 external calls (genkey, genkey).
 
@@ -989,11 +1001,11 @@ fn generate() -> Result<Self, NoiseChannelError>
 fn public_key(&self) -> NoiseChannelPublicKey
 ```
 
-**Purpose**: Exports the public half of a static identity in the serialized registry format. It tags the key with the exact supported suite string.
+**Purpose**: This extracts the shareable public part of a Noise identity. It packages the public keys with the suite label so another party can later verify they are for the right protocol.
 
-**Data flow**: It reads `self.dh.public` and `self.kem.public`, base64-encodes them, constructs `NoiseChannelPublicKey { suite: NOISE_CHANNEL_SUITE.to_string(), ... }`, and returns it.
+**Data flow**: It reads the identity’s X25519 and ML-KEM public keys. It base64-encodes them into text and returns a NoiseChannelPublicKey containing those strings plus the fixed suite name. It does not expose the private keys.
 
-**Call relations**: Callers use this when publishing or pinning an endpoint’s static key. The initiator later validates this structure with `NoiseChannelPublicKey::decode`.
+**Call relations**: Other parts of the system use this when registering or comparing endpoint keys. The returned value is the form that can safely travel through registry data or JSON.
 
 
 ##### `InitiatorHandshake::start`  (lines 126–151)
@@ -1007,11 +1019,11 @@ fn start(
     ) -> Result<(Self, Vec<u8>), NoiseChannelE
 ```
 
-**Purpose**: Begins the harness-side hybrid IK handshake, pins the responder’s expected static key, and emits the first encrypted handshake message carrying an authorization payload. It also returns resumable initiator state needed to finish the handshake on the same stream.
+**Purpose**: This begins the harness side of the secure handshake. It creates the first encrypted handshake message and locks the conversation to the expected executor public key.
 
-**Data flow**: It decodes the responder public key with `decode()`, builds `HybridHandshakeParams::new(noise_hybrid_ik(), true)` with the supplied `prologue`, initiator static DH/KEM keys, and responder static DH/KEM keys, constructs `Handshake::new(params)`, queries `get_next_message_overhead()`, rejects oversized payloads relative to `MAX_MESSAGE_LEN`, writes the first message into a fixed `[u8; MAX_MESSAGE_LEN]` buffer with `write_message(payload, &mut output)`, and returns `(InitiatorHandshake { handshake }, output[..output_len].to_vec())`.
+**Data flow**: It receives the harness identity, the executor public key expected from the registry, a prologue tying the handshake to this stream, and a small payload such as temporary authorization data. It decodes and validates the executor key, configures the hybrid IK handshake as the initiator, checks that the payload will fit, writes the first handshake message, and returns both the saved handshake state and the bytes to send to the executor.
 
-**Call relations**: Called by harness-side connection setup and tests. It delegates responder-key validation to `NoiseChannelPublicKey::decode` and leaves finalization to `InitiatorHandshake::finish`.
+**Call relations**: Connection code and tests call this when the harness opens a Noise-protected relay stream. It calls NoiseChannelPublicKey::decode first, then hands the prepared settings to the Clatter Noise library to produce the outbound request.
 
 *Call graph*: calls 1 internal fn (decode); called by 13 (hybrid_ik_roundtrip_authenticates_both_endpoints, initiator_rejects_oversized_handshake_payload, initiator_rejects_wrong_responder_key, responder_rejects_mismatched_prologue, transport_rejects_replayed_ciphertext, transport_rejects_tampered_ciphertext, processor_exit_reports_closed_virtual_stream, noise_harness_connection_from_websocket, duplicate_handshakes_exhaust_failure_budget, oversized_harness_authorization_is_rejected_before_validation (+3 more)); 4 external calls (new, new, noise_hybrid_ik, InvalidMessage).
 
@@ -1022,11 +1034,11 @@ fn start(
 fn finish(mut self, response: &[u8]) -> Result<NoiseTransport, NoiseChannelError>
 ```
 
-**Purpose**: Consumes the responder’s second handshake message and transitions the initiator into transport mode. It requires the v1 responder message to carry no application payload.
+**Purpose**: This completes the harness side after the executor sends its handshake response. If the response is valid and empty as expected, it turns the temporary handshake state into a usable encrypted transport.
 
-**Data flow**: It checks `response.len()` with `ensure_noise_frame_len`, allocates a `[u8; MAX_MESSAGE_LEN]` payload buffer, calls `self.handshake.read_message(response, &mut payload)`, returns `InvalidMessage` if the decrypted payload length is nonzero, finalizes the handshake with `self.handshake.finalize()`, and wraps the result in `NoiseTransport`.
+**Data flow**: It consumes the saved InitiatorHandshake and receives the executor response bytes. It checks the response size, asks the handshake object to decrypt and verify the response, rejects it if it contains unexpected application payload, finalizes the handshake, and returns a NoiseTransport ready to encrypt and decrypt records.
 
-**Call relations**: Called after `InitiatorHandshake::start` once the responder’s handshake frame arrives. It is the final initiator-side step before encrypted transport records can be sent.
+**Call relations**: This is the second half of the harness connection setup. It uses ensure_noise_frame_len before processing, then calls into the Noise library to read the response and finalize the session keys.
 
 *Call graph*: calls 1 internal fn (ensure_noise_frame_len); 3 external calls (finalize, read_message, InvalidMessage).
 
@@ -1041,11 +1053,11 @@ fn read_request(
     ) -> Result<Self, NoiseChannelError>
 ```
 
-**Purpose**: Parses the initiator’s first IK message on the executor side, authenticates the initiator static key, and exposes both that key and the decrypted payload for external authorization. It intentionally stops short of entering transport mode.
+**Purpose**: This reads the executor side of the first handshake message. It authenticates enough of the request to recover the harness public key, but deliberately stops before creating a usable transport so the registry can decide whether that harness is allowed.
 
-**Data flow**: It validates `request.len()` with `ensure_noise_frame_len`, builds responder-side `HybridHandshakeParams::new(noise_hybrid_ik(), false)` with the supplied `prologue` and local static DH/KEM keys, constructs `Handshake::new(params)`, reads the request into a fixed payload buffer with `read_message`, fetches the authenticated remote static key via `get_remote_static()`, errors if absent, serializes that remote key into `NoiseChannelPublicKey` using base64 encoding, copies the decrypted payload bytes into a `Vec<u8>`, and returns `PendingResponderHandshake { handshake, initiator_public_key, payload }`.
+**Data flow**: It receives the executor identity, the shared prologue, and the first handshake message from the harness. It checks the message size, builds the responder-side hybrid IK handshake, reads and verifies the request, extracts the authenticated remote static key, encodes that key into NoiseChannelPublicKey form, saves any payload from the request, and returns a PendingResponderHandshake.
 
-**Call relations**: Executor-side relay code calls this when a handshake request frame arrives. Authorization logic is expected to inspect `initiator_public_key` and `payload` before calling `complete`.
+**Call relations**: The relay server calls this when a harness begins a connection, including in run_multiplexed_environment. After this function returns, the caller is expected to validate initiator_public_key with the registry before calling PendingResponderHandshake::complete.
 
 *Call graph*: calls 1 internal fn (ensure_noise_frame_len); called by 5 (hybrid_ik_roundtrip_authenticates_both_endpoints, transport_rejects_replayed_ciphertext, transport_rejects_tampered_ciphertext, processor_exit_reports_closed_virtual_stream, run_multiplexed_environment); 4 external calls (new, new, noise_hybrid_ik, InvalidMessage).
 
@@ -1056,11 +1068,11 @@ fn read_request(
 fn complete(mut self) -> Result<(NoiseTransport, Vec<u8>), NoiseChannelError>
 ```
 
-**Purpose**: Finishes the responder side of the handshake after the initiator key has been authorized. It emits the second handshake message and returns an established transport.
+**Purpose**: This finishes the executor side of the handshake after the harness key has been authorized. It produces the executor’s response message and the encrypted transport state for future records.
 
-**Data flow**: It writes an empty payload handshake response into a fixed buffer with `self.handshake.write_message(&[], &mut response)`, finalizes the handshake with `self.handshake.finalize()`, wraps the transport in `NoiseTransport`, and returns `(transport, response[..response_len].to_vec())`.
+**Data flow**: It consumes the pending responder handshake. It writes an empty second handshake message into a buffer, finalizes the cryptographic state, and returns both the new NoiseTransport and the response bytes that must be sent back to the harness.
 
-**Call relations**: Called only after `read_request` and external authorization. It is the responder-side transition from pending authorization state to usable encrypted transport.
+**Call relations**: This is called only after the caller has accepted the authenticated harness public key. It hands off to the Noise library to write the response and finalize the session, completing the bridge from authorization to encrypted traffic.
 
 *Call graph*: 2 external calls (finalize, write_message).
 
@@ -1071,11 +1083,11 @@ fn complete(mut self) -> Result<(NoiseTransport, Vec<u8>), NoiseChannelError>
 fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseChannelError>
 ```
 
-**Purpose**: Encrypts one ordered transport record using the next implicit send nonce. It enforces the Noise maximum frame size before handing bytes to Clatter.
+**Purpose**: This encrypts one outgoing transport record after the handshake is complete. It also checks that the plaintext plus the authentication tag will fit inside the Noise maximum message size.
 
-**Data flow**: It computes `frame_len = plaintext.len() + AesGcm::tag_len()` with checked addition, returns `InvalidMessage` on overflow or if the resulting frame exceeds `MAX_MESSAGE_LEN` via `ensure_noise_frame_len`, then calls `self.transport.send_vec(plaintext)` and returns the ciphertext `Vec<u8>`.
+**Data flow**: It receives plaintext bytes. It adds the expected AES-GCM tag length to know how large the encrypted record will be, rejects data that is too large, then asks the transport state to encrypt the plaintext. It returns ciphertext bytes and advances the send side of the transport state.
 
-**Call relations**: Used by relay stream writers after the handshake completes. Because Noise transport nonces are implicit, callers must not retry encryption of the same logical record.
+**Call relations**: spawn_noise_virtual_stream calls this when it needs to send data over the protected virtual stream. It relies on ensure_noise_frame_len for size safety and on the underlying Noise transport for the actual encryption.
 
 *Call graph*: calls 1 internal fn (ensure_noise_frame_len); called by 1 (spawn_noise_virtual_stream); 3 external calls (tag_len, send_vec, InvalidMessage).
 
@@ -1086,11 +1098,11 @@ fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseChannelError>
 fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, NoiseChannelError>
 ```
 
-**Purpose**: Decrypts one ordered transport record using the next implicit receive nonce. It rejects obviously invalid ciphertext lengths before invoking Clatter.
+**Purpose**: This decrypts one incoming ordered transport record. It rejects records that are too short or too large before asking the cryptographic state to verify and open them.
 
-**Data flow**: It checks that `ciphertext.len()` is at least `AesGcm::tag_len()`, validates the total frame length with `ensure_noise_frame_len`, calls `self.transport.receive_vec(ciphertext)`, and returns the plaintext `Vec<u8>` or a `NoiseChannelError`.
+**Data flow**: It receives ciphertext bytes. It first checks that there is at least room for the AES-GCM authentication tag, then checks the overall Noise frame limit. If those checks pass, it decrypts and verifies the record, returning plaintext bytes and advancing the receive side of the transport state.
 
-**Call relations**: Called by relay receive paths after ciphertext frames have been ordered. Replay or out-of-order delivery is expected to fail here because the transport state advances nonces implicitly.
+**Call relations**: receive_data calls this when encrypted relay data arrives. Because the Noise transport state advances each time, callers must feed records in order and must not replay old ciphertext.
 
 *Call graph*: calls 1 internal fn (ensure_noise_frame_len); called by 1 (receive_data); 3 external calls (tag_len, receive_vec, InvalidMessage).
 
@@ -1105,11 +1117,11 @@ fn noise_channel_prologue(
 ) -> Vec<u8>
 ```
 
-**Purpose**: Builds the transcript-binding prologue shared by both peers for one environment registration and relay stream. It ensures the handshake is tied to the intended environment, executor registration, and stream ID.
+**Purpose**: This builds the shared context string that both sides mix into the handshake before any messages are processed. It binds the secure channel to one environment, one executor registration, and one relay stream.
 
-**Data flow**: It creates an empty `Vec<u8>`, appends the fixed `PROLOGUE_DOMAIN`, `environment_id`, `executor_registration_id`, and `stream_id` using `append_prologue_part`, and returns the resulting byte vector.
+**Data flow**: It receives three identifier strings: environment ID, executor registration ID, and stream ID. It creates a byte vector, appends a fixed protocol domain marker, then appends each identifier with a length prefix. It returns the finished prologue bytes.
 
-**Call relations**: Harness and executor relay code call this before starting or reading a handshake. The resulting bytes are fed into `InitiatorHandshake::start` and `PendingResponderHandshake::read_request`.
+**Call relations**: Harness and executor connection setup both call this before starting or reading a handshake. It calls append_prologue_part for each component so both peers compute exactly the same unambiguous context.
 
 *Call graph*: calls 1 internal fn (append_prologue_part); called by 7 (noise_harness_connection_from_websocket, run_multiplexed_environment, duplicate_handshakes_exhaust_failure_budget, oversized_harness_authorization_is_rejected_before_validation, pending_harness_key_validation_does_not_block_new_handshakes, repeated_early_data_during_validation_closes_the_physical_relay, repeated_malformed_handshakes_close_the_physical_relay); 1 external calls (new).
 
@@ -1120,11 +1132,11 @@ fn noise_channel_prologue(
 fn append_prologue_part(prologue: &mut Vec<u8>, part: &[u8])
 ```
 
-**Purpose**: Appends one length-prefixed component to the Noise prologue. The length prefix prevents ambiguous concatenation of adjacent identifiers.
+**Purpose**: This appends one piece of data to a prologue in a way that cannot be confused with neighboring pieces. The length prefix acts like a label saying where this piece ends.
 
-**Data flow**: It computes `part.len() as u64`, appends its big-endian bytes to `prologue`, then appends the raw `part` bytes.
+**Data flow**: It receives a mutable prologue byte vector and one byte slice to add. It writes the part length as an eight-byte big-endian number, then writes the part itself. It changes the provided vector in place and returns nothing.
 
-**Call relations**: Used only by `noise_channel_prologue` to encode each prologue component in a stable, unambiguous format.
+**Call relations**: noise_channel_prologue calls this repeatedly while building the full handshake context. Its small job is important because raw concatenation could let different identifier combinations produce the same final bytes.
 
 *Call graph*: called by 1 (noise_channel_prologue).
 
@@ -1138,11 +1150,11 @@ fn ensure_noise_frame_len(
 ) -> Result<(), NoiseChannelError>
 ```
 
-**Purpose**: Rejects handshake or transport frames larger than Clatter’s `MAX_MESSAGE_LEN`. It centralizes the size check and error shape.
+**Purpose**: This enforces the maximum message size allowed by the Noise library. It gives callers a single simple check before they pass data into handshake or transport code.
 
-**Data flow**: It compares `frame_len` to `MAX_MESSAGE_LEN`; if too large it returns `NoiseChannelError::InvalidMessage(message)`, otherwise `Ok(())`.
+**Data flow**: It receives a frame length and an error message to use if the frame is too large. If the length is within MAX_MESSAGE_LEN, it returns success. If it is too large, it returns an invalid-message error using the supplied message.
 
-**Call relations**: Called by initiator finish, responder request parsing, and transport encrypt/decrypt so all inbound and outbound frame-size checks share the same limit and error category.
+**Call relations**: Handshake finishing, responder request reading, encryption, and decryption all call this before processing frames. It is the shared guardrail that keeps oversized data away from the lower-level cryptographic routines.
 
 *Call graph*: called by 4 (finish, decrypt, encrypt, read_request); 1 external calls (InvalidMessage).
 
@@ -1153,24 +1165,24 @@ fn ensure_noise_frame_len(
 fn from(error: clatter::error::TransportError) -> Self
 ```
 
-**Purpose**: Converts Clatter handshake or transport errors into the exec-server-specific `NoiseChannelError` enum. It preserves whether the failure happened during handshake or transport.
+**Purpose**: This converts errors from the Clatter cryptography library into this file’s own error type. That lets the rest of the exec-server code talk about Noise channel failures in one consistent vocabulary.
 
-**Data flow**: It takes a Clatter error, converts it to string with `to_string()`, wraps it in either `NoiseChannelError::Handshake(...)` or `NoiseChannelError::Transport(...)`, and returns the new error value.
+**Data flow**: It receives either a Clatter handshake error or a Clatter transport error. It turns the original error into text and wraps it as either a NoiseChannelError::Handshake or NoiseChannelError::Transport value. The result is returned to the caller through normal Rust error propagation.
 
-**Call relations**: These `From` impls are used implicitly by `?` throughout the handshake and transport methods so Clatter failures surface in the module’s public error type.
+**Call relations**: The handshake and transport functions use the question-mark error shortcut when calling Clatter. These conversion functions are what make that shortcut produce NoiseChannelError values instead of leaking library-specific error types outward.
 
 *Call graph*: 4 external calls (Handshake, Transport, to_string, to_string).
 
 
 ### `exec-server/src/noise_relay/ordered_ciphertext.rs`
 
-`domain_logic` · `request handling`
+`io_transport` · `relay data receive`
 
-This file protects the Noise receive path from out-of-order websocket delivery by restoring strict sequence order ahead of decryption. `OrderedCiphertextFrames` tracks three pieces of state: `next_seq`, the next expected relay sequence number; `pending`, a `BTreeMap<u32, Vec<u8>>` of future records keyed by sequence; and `pending_bytes`, the total buffered payload size. The design keeps the first payload seen for each sequence and ignores later duplicates, so replayed or duplicated transport frames cannot replace already-buffered ciphertext.
+Noise is an encryption protocol that expects incoming encrypted messages to be opened in the same sequence they were sent, because each message uses an implicit counter called a nonce. If message 5 is decrypted before message 4, decryption can fail or the connection state can become wrong. This file solves that by acting like a small waiting room for encrypted relay records.
 
-Its main `push` method has three branches. If the incoming `seq` is older than `next_seq` or already present in `pending`, it is treated as a duplicate and yields no output. If `seq` is ahead of `next_seq`, the method checks two bounds before buffering: the gap may not exceed `MAX_REORDER_DISTANCE` (64), and total buffered bytes may not exceed `MAX_PENDING_BYTES` (1 MiB). If either bound is exceeded, it returns `ExecServerError::Protocol`.
+`OrderedCiphertextFrames` tracks the next sequence number it expects. If the next expected record arrives, it releases it immediately, then also releases any later records that had been waiting and now form an unbroken run. If a future record arrives early, it is stored in a sorted map until the gap is filled. If the same record arrives twice, it is ignored so each sequence number is released at most once.
 
-When the incoming record matches `next_seq`, the method emits that payload immediately, advances the expected sequence, and then repeatedly drains any now-contiguous buffered records from the `BTreeMap`. `advance` uses checked arithmetic, so sequence exhaustion is surfaced as a protocol error rather than wrapping. The result is a deterministic, bounded release of ciphertext in nonce order.
+The waiting room is deliberately small. It rejects records that are too far ahead, and it also limits the total bytes being held. This matters because otherwise a peer could send many future messages and make the server spend too much memory. It is like letting people queue for numbered tickets, but refusing tickets that are far beyond the current line or would overcrowd the room.
 
 #### Function details
 
@@ -1184,11 +1196,11 @@ fn push(
     ) -> Result<Vec<Vec<u8>>, ExecServerError>
 ```
 
-**Purpose**: Accepts one ciphertext frame tagged with a relay sequence number and returns the newly contiguous run of ciphertext payloads that can now be processed in order. It also deduplicates repeats and enforces bounded reordering distance and memory use.
+**Purpose**: Accepts one encrypted relay record with its sequence number and returns any records that are now safe to decrypt in order. It ignores duplicates, buffers records that arrived too early, and rejects records that would make the reorder buffer unsafe or too large.
 
-**Data flow**: It takes `&mut self`, a `u32` sequence number, and an owned `Vec<u8>` payload. If the sequence is older than `self.next_seq` or already buffered, it returns an empty vector. If the sequence is ahead, it checks the gap against `MAX_REORDER_DISTANCE`, computes prospective buffered bytes against `MAX_PENDING_BYTES`, inserts the payload into `self.pending`, updates `self.pending_bytes`, and returns empty. If the sequence equals `self.next_seq`, it starts a `ready` vector with the payload, advances `self.next_seq`, repeatedly removes any buffered payload at the new `next_seq`, subtracts each removed payload’s length from `pending_bytes`, appends it to `ready`, advances again, and finally returns `ready`.
+**Data flow**: A sequence number and ciphertext bytes go in. The function compares the sequence number with the next one it is waiting for: old or already stored records produce no output; future records may be saved for later; the exact next record is released and may unlock more saved records after it. The result is either a list of ready ciphertext payloads in correct order, an empty list if nothing can be released yet, or a protocol error if the input is too far ahead, too large in total, or the sequence counter runs out.
 
-**Call relations**: Receive-side relay handlers call this from `receive_data` before decrypting records, because Noise requires ciphertexts to be consumed in nonce order. It delegates sequence advancement to `advance`; its returned contiguous payload list is then suitable for downstream decryption.
+**Call relations**: During relay receiving, `receive_data` calls this before ciphertext reaches the Noise decryption state. When `push` can release a record, it calls `OrderedCiphertextFrames::advance` to move the expected sequence number forward, repeating that as long as buffered records continue the sequence.
 
 *Call graph*: calls 1 internal fn (advance); called by 2 (receive_data, receive_data); 3 external calls (new, Protocol, vec!).
 
@@ -1199,22 +1211,26 @@ fn push(
 fn advance(&mut self) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Moves the expected sequence number forward by one while forbidding wraparound. It isolates the overflow check used whenever a record is accepted into the contiguous stream.
+**Purpose**: Moves the expected sequence number forward by one after a record has been accepted for release. It also detects the impossible edge case where the 32-bit sequence number has no next value left.
 
-**Data flow**: It takes `&mut self`, performs `checked_add(1)` on `self.next_seq`, writes the incremented value back on success, and returns `()`. On overflow it returns `ExecServerError::Protocol("Noise relay sequence number exhausted")`.
+**Data flow**: It reads the current `next_seq`, tries to add one, and writes the new value back. If adding one would overflow, it returns a protocol error instead of silently wrapping back to zero.
 
-**Call relations**: This helper is only called internally by `OrderedCiphertextFrames::push` after releasing an expected record. Its sole role is to keep the sequence progression logic and exhaustion error consistent.
+**Call relations**: `OrderedCiphertextFrames::push` uses this each time it releases a ciphertext frame. This keeps the reorder logic honest: every released record advances the single shared expectation for what sequence number must come next.
 
 *Call graph*: called by 1 (push).
 
 
 ### `exec-server/src/noise_relay/message_framing.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `message send and receive over the Noise relay`
 
-This file implements the relay’s plaintext framing layer that sits between JSON serialization and Noise record chunking. `frame_jsonrpc_message` serializes a `codex_app_server_protocol::JSONRPCMessage` directly into a `Vec<u8>` that begins with four reserved bytes, then backfills those bytes with the serialized JSON payload length encoded as big-endian `u32`. The function enforces a hard maximum message size of 64 MiB and rejects anything larger with `ExecServerError::Protocol`, preventing peers from emitting arbitrarily large authenticated messages.
+The Noise relay sends data in encrypted chunks called records. A JSON-RPC message, which is a structured request or response encoded as JSON, does not naturally say where one message ends and the next begins once it has been turned into raw bytes. This file adds that missing boundary marker.
 
-On the receive side, `JsonRpcMessageDecoder` owns a persistent `buffered: Vec<u8>` reassembly buffer. Its `push` method accepts one decrypted Noise plaintext record at a time, first rejecting any record larger than `NOISE_RECORD_PLAINTEXT_LEN` (60 KiB), then appending it to the buffer. It repeatedly parses complete framed messages only when both the 4-byte prefix and the full declared payload are present. A single record may therefore complete multiple messages, and a single message may span many records. Declared lengths of zero or above the 64 MiB cap are rejected immediately, before waiting for payload bytes. After extracting each complete message with `serde_json::from_slice`, the consumed bytes are drained from the front of the buffer. Even when no full message is available yet, the file preserves a strict memory invariant by rejecting any reassembly buffer larger than prefix plus maximum payload.
+When sending, it writes four bytes at the front of each JSON-RPC message. Those four bytes say how long the JSON part is. Think of it like putting a label on a parcel that says how many pages are inside. After that, another part of the relay can split the bytes into safe-sized Noise records without losing the original message boundary.
+
+When receiving, `JsonRpcMessageDecoder` keeps a small waiting area for bytes that have arrived but do not yet make a full message. Each new decrypted record is appended there. The decoder reads the length label, waits until the full message has arrived, parses the JSON, and returns any complete messages it found.
+
+The file also protects the server from bad or broken peers. It rejects records and messages that are too large, and it rejects zero-length messages. Without these checks, a peer could make the server wait forever or grow memory without limit.
 
 #### Function details
 
@@ -1224,11 +1240,11 @@ On the receive side, `JsonRpcMessageDecoder` owns a persistent `buffered: Vec<u8
 fn frame_jsonrpc_message(message: &JSONRPCMessage) -> Result<Vec<u8>, ExecServerError>
 ```
 
-**Purpose**: Serializes one `JSONRPCMessage` into the relay framing format: a 4-byte big-endian payload length followed by the JSON bytes. It also enforces the relay’s maximum authenticated JSON-RPC message size before returning the framed byte stream.
+**Purpose**: This function prepares one JSON-RPC message for encrypted transport. It converts the message to JSON bytes and prefixes it with a four-byte length, so the receiver can later know exactly where that message ends.
 
-**Data flow**: It takes `&JSONRPCMessage`, allocates a `Vec<u8>` prefilled with four zero bytes, and streams JSON into that vector with `serde_json::to_writer`. It computes the payload length as total length minus the reserved prefix, rejects lengths above `MAX_NOISE_JSONRPC_MESSAGE_LEN` with `ExecServerError::Protocol`, writes the big-endian `u32` length into the first four bytes, and returns the completed `Vec<u8>`.
+**Data flow**: It receives a `JSONRPCMessage`. It first reserves four bytes for the length, writes the JSON form of the message after those bytes, checks that the JSON is not larger than the allowed maximum, then fills in the reserved bytes with the message length. It returns the complete framed byte buffer, or an error if the message is too large or cannot be serialized.
 
-**Call relations**: This function is used by relay send paths such as `spawn_noise_virtual_stream` and `processor_exit_reports_closed_virtual_stream` when they need to turn a logical JSON-RPC message into bytes that can then be split across Noise records. It delegates serialization to `serde_json::to_writer`; callers are responsible for subsequent record chunking and encryption.
+**Call relations**: When code such as `spawn_noise_virtual_stream` or `processor_exit_reports_closed_virtual_stream` needs to send a JSON-RPC message through the Noise relay, it calls this function first. The result is not yet the final encrypted network data; it is the clean byte stream that later code can split into Noise-sized records and encrypt.
 
 *Call graph*: called by 2 (spawn_noise_virtual_stream, processor_exit_reports_closed_virtual_stream); 3 external calls (Protocol, to_writer, vec!).
 
@@ -1242,11 +1258,11 @@ fn push(
     ) -> Result<Vec<JSONRPCMessage>, ExecServerError>
 ```
 
-**Purpose**: Consumes one decrypted plaintext record, appends it to the decoder’s reassembly buffer, and emits every complete framed `JSONRPCMessage` now available. It is the boundary-restoration step that turns arbitrary record fragmentation back into exact message objects.
+**Purpose**: This method feeds newly decrypted Noise record bytes into a decoder and returns every complete JSON-RPC message that can now be reconstructed. It is designed for streaming data, where one record may contain part of a message, one whole message, or several messages.
 
-**Data flow**: It takes `&mut self` plus a plaintext byte slice. It first validates the record length against `NOISE_RECORD_PLAINTEXT_LEN`, then extends `self.buffered` with the new bytes. In a loop, it reads the first four buffered bytes as a big-endian length, rejects zero or oversized declared lengths, checks whether the full frame is present, deserializes the payload slice with `serde_json::from_slice` when complete, pushes each decoded message into a result vector, and drains consumed bytes from `self.buffered`. Before returning, it verifies the remaining buffered bytes do not exceed prefix plus maximum payload size, then returns `Vec<JSONRPCMessage>`.
+**Data flow**: It receives one plaintext record, meaning bytes that have already been decrypted. It rejects the record if it is too large, appends it to the decoder's internal buffer, then repeatedly checks whether the buffer starts with a complete framed message. For each complete message, it reads the four-byte length, parses the following JSON bytes into a `JSONRPCMessage`, removes those bytes from the buffer, and adds the message to the output list. If only part of a message has arrived, it keeps those bytes for the next call. It returns the list of completed messages, or an error if the length is invalid, parsing fails, or the waiting buffer grows too large.
 
-**Call relations**: Receive-side relay logic invokes this from `receive_data` after ciphertext has been reordered and decrypted into plaintext records. It delegates JSON parsing to `serde_json::from_slice`; its output feeds higher-level JSON-RPC processing, while protocol violations abort the relay path early.
+**Call relations**: `receive_data` calls this method when decrypted bytes arrive from the Noise relay. The method acts like the receiver's reassembly station: it turns a stream of record-sized pieces back into whole JSON-RPC messages, then hands those messages back to the receiving flow for normal processing.
 
 *Call graph*: called by 2 (receive_data, receive_data); 4 external calls (new, Protocol, from_slice, from_be_bytes).
 
@@ -1256,13 +1272,13 @@ This module assembles the lower-level relay pieces into websocket-based relay tr
 
 ### `exec-server/src/relay.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `websocket connection handling`
 
-This file defines the relay protocol boundary between websocket frames and internal JSON-RPC streams. `RelayMessageFrame` gets convenience constructors for `Data`, `Resume`, `Handshake`, and `Reset` bodies, plus validation and typed extraction helpers that enforce protocol invariants: version must equal `1`, `stream_id` must be nonblank, data frames must be single-segment and nonempty, reset reasons must be present, and handshake payloads cannot be empty. Encoding and decoding are thin prost wrappers, while `jsonrpc_payload` serializes `JSONRPCMessage` values to bytes.
+This file solves a transport problem: the exec server needs to talk to remote harnesses through WebSockets, but the rest of the server wants ordinary JSON-RPC messages. The relay wraps each message in a small protobuf envelope, called a relay message frame, so every packet says which logical stream it belongs to and what kind of packet it is: data, handshake, reset, and so on.
 
-Two transport modes live here. `harness_connection_from_websocket` wraps one websocket as one `JsonRpcConnection`: it sends an initial resume frame with a generated UUID stream id, forwards outgoing JSON-RPC messages as relay data frames with incrementing wrapping sequence numbers, emits websocket pings on a fixed keepalive interval, and converts inbound binary relay frames back into `JsonRpcConnectionEvent`s. `send_event_with_keepalive` is the key backpressure helper: while waiting for a full incoming channel to accept an event, it continues sending websocket pings so the peer does not time out.
+For the simpler path, `harness_connection_from_websocket` turns one WebSocket into one `JsonRpcConnection`. It sends an initial “resume” frame, converts outgoing JSON-RPC messages into binary relay frames, reads incoming relay frames back into JSON-RPC messages, reports malformed input, and sends ping frames as keepalives so idle connections do not silently die.
 
-The larger `run_multiplexed_environment` function serves many virtual Noise streams over one executor websocket. It splits the websocket into reader/writer halves, runs a dedicated writer task fed by an mpsc queue, tracks active streams and pending responder handshakes by `stream_id`, and runs harness-key authorization checks in a `JoinSet` so slow registry calls do not block frame processing. A `validation_id` guards against stale authorization results completing a reused stream id. The loop enforces hard limits on active streams, pending validations, authorization payload size, and total failed handshakes; repeated malformed, duplicate, or early-data attempts eventually close the physical relay. Successful handshakes are the only path that completes Noise IK and spawns a `NoiseVirtualStream` via `spawn_noise_virtual_stream`. Resets are sent best-effort with a generic reason and unauthenticated reset text is never trusted for logging. The embedded tests exercise keepalive timing, malformed frame reporting, close handling, and a controllable fake websocket that simulates sink backpressure.
+For the more advanced path, `run_multiplexed_environment` lets one physical executor WebSocket carry many separate encrypted virtual streams. A new stream starts with a Noise handshake, which is a cryptographic greeting that proves the harness key. The file then asks a validator whether that key is authorized before exposing the stream to normal request processing. It also limits active streams, pending validations, and repeated bad handshakes, so one bad peer cannot consume unlimited work. Without this file, the server would not be able to safely translate relay WebSocket traffic into the JSON-RPC conversations used by the rest of the system.
 
 #### Function details
 
@@ -1272,11 +1288,11 @@ The larger `run_multiplexed_environment` function serves many virtual Noise stre
 fn data(stream_id: String, seq: u32, payload: Vec<u8>) -> Self
 ```
 
-**Purpose**: Builds a relay protobuf frame carrying one JSON-RPC payload segment for a specific virtual stream and sequence number. It always emits the protocol’s single-segment form.
+**Purpose**: Builds a relay frame that carries real JSON-RPC bytes for one logical stream. Code uses this when it needs to send application data through the relay.
 
-**Data flow**: Consumes a `stream_id: String`, `seq: u32`, and raw `payload: Vec<u8>`, and returns a `RelayMessageFrame` with version `1`, zeroed ack fields, and a `Body::Data(RelayData)` containing `segment_index = 0`, `segment_count = 1`, and the payload bytes.
+**Data flow**: It receives a stream id, a sequence number, and a byte payload. It puts those values into a versioned relay frame with a data body, marking it as one complete segment, and returns the finished frame.
 
-**Call relations**: It is used wherever outbound relay data frames are created, including the plain harness websocket path and tests. It does not delegate further logic beyond constructing the protobuf body variant.
+**Call relations**: This is one of the frame constructors used by the relay sender side. `harness_connection_from_websocket` creates these frames when normal JSON-RPC messages need to leave over the WebSocket, and tests use it to simulate incoming relay data.
 
 *Call graph*: 1 external calls (Data).
 
@@ -1287,11 +1303,11 @@ fn data(stream_id: String, seq: u32, payload: Vec<u8>) -> Self
 fn resume(stream_id: String) -> Self
 ```
 
-**Purpose**: Builds the initial resume/control frame announcing a stream id on the plain relay transport. The frame carries a zero `next_seq` placeholder.
+**Purpose**: Builds a relay frame that announces or resumes a relay stream. The plain harness connection sends this first so the other side knows which stream id to use.
 
-**Data flow**: Consumes a `stream_id: String` and returns a `RelayMessageFrame` with version `1`, zeroed ack fields, and a `Body::Resume(RelayResume { next_seq: 0 })`.
+**Data flow**: It receives a stream id. It creates a versioned relay frame with a resume body and an initial next-sequence value, then returns that frame.
 
-**Call relations**: It is used by `harness_connection_from_websocket` immediately after connection setup so the peer learns the generated stream id. It is a pure constructor with no side effects.
+**Call relations**: This is used at the start of `harness_connection_from_websocket`. That connection sends the resume frame before exchanging JSON-RPC data frames.
 
 *Call graph*: 1 external calls (Resume).
 
@@ -1302,11 +1318,11 @@ fn resume(stream_id: String) -> Self
 fn handshake(stream_id: String, payload: Vec<u8>) -> Self
 ```
 
-**Purpose**: Builds a relay frame containing a Noise handshake payload for a given virtual stream. It is used for both incoming initiator requests and outgoing responder replies.
+**Purpose**: Builds a relay frame that carries Noise handshake bytes. This is used when starting an encrypted virtual stream inside a multiplexed WebSocket.
 
-**Data flow**: Consumes a `stream_id: String` and handshake `payload: Vec<u8>`, and returns a versioned `RelayMessageFrame` whose body is `Body::Handshake(RelayHandshake { payload })` with ack fields cleared.
+**Data flow**: It receives a stream id and handshake bytes. It wraps those bytes in a versioned relay frame with a handshake body and returns it.
 
-**Call relations**: It participates in the multiplexed Noise handshake flow: harnesses send these frames to `run_multiplexed_environment`, and successful responder completion sends one back. Tests also use it to synthesize handshake traffic.
+**Call relations**: The multiplexed relay uses this when replying to an accepted Noise handshake. It is also part of the wider handshake flow started and checked inside `run_multiplexed_environment`.
 
 *Call graph*: 1 external calls (Handshake).
 
@@ -1317,11 +1333,11 @@ fn handshake(stream_id: String, payload: Vec<u8>) -> Self
 fn reset(stream_id: String, reason: String) -> Self
 ```
 
-**Purpose**: Builds a relay reset frame carrying a textual reason string. The reason is control metadata, not trusted application text.
+**Purpose**: Builds a relay frame that tells the other side a stream should be closed or rejected. It is the relay equivalent of saying, “stop using this stream.”
 
-**Data flow**: Consumes `stream_id: String` and `reason: String`, and returns a versioned `RelayMessageFrame` with zeroed ack fields and `Body::Reset(RelayReset { reason })`.
+**Data flow**: It receives a stream id and a text reason. It places them into a versioned reset frame and returns that frame.
 
-**Call relations**: It is used by `send_reset` and tests to terminate or reject streams. The broader relay logic treats the reason conservatively and does not rely on it for authenticated semantics.
+**Call relations**: `send_reset` uses this helper whenever `run_multiplexed_environment` needs to reject a bad handshake, close an unknown stream, or signal that a virtual stream cannot continue.
 
 *Call graph*: 1 external calls (Reset).
 
@@ -1332,11 +1348,11 @@ fn reset(stream_id: String, reason: String) -> Self
 fn validate(&self) -> Result<RelayFrameBodyKind, ExecServerError>
 ```
 
-**Purpose**: Checks that a decoded relay frame is structurally valid and identifies which body kind it contains. It centralizes protocol invariants before any typed extraction occurs.
+**Purpose**: Checks that a relay frame is well formed before the server trusts it. It catches wrong versions, missing stream ids, empty payloads, and incomplete reset or handshake frames.
 
-**Data flow**: Reads `self.version`, `self.stream_id`, and `self.body`. It returns `Ok(RelayFrameBodyKind)` for valid frames or `ExecServerError::Protocol` with a specific message when the version is unsupported, the stream id is blank, required fields are missing, or the body is absent.
+**Data flow**: It reads the frame’s version, stream id, and body fields. If anything required is missing or invalid, it returns a protocol error; otherwise it returns the kind of frame body it found.
 
-**Call relations**: It is called by typed accessors such as `into_data` and `into_handshake_payload`, and also by the websocket processing loops before dispatching on frame kind. Its result drives later control flow by distinguishing data, reset, handshake, and ignorable control frames.
+**Call relations**: Extraction helpers such as `into_data` and `into_handshake_payload` call this before taking bytes out of a frame. The main relay loops also use this check before deciding how to route an incoming frame.
 
 *Call graph*: called by 2 (into_data, into_handshake_payload); 2 external calls (Protocol, format!).
 
@@ -1347,11 +1363,11 @@ fn validate(&self) -> Result<RelayFrameBodyKind, ExecServerError>
 fn into_data(self) -> Result<RelayData, ExecServerError>
 ```
 
-**Purpose**: Consumes a frame and extracts its `RelayData` payload, failing if the frame is not a valid data frame. It combines validation with body downcasting.
+**Purpose**: Turns a validated relay frame into its data body. It is used when the caller expects actual application bytes, not a handshake or reset.
 
-**Data flow**: Takes ownership of `self`, first runs `validate`, then checks that the returned kind is `Data`. If so it matches `self.body` and returns the contained `RelayData`; otherwise it returns `ExecServerError::Protocol("expected relay data message frame")`.
+**Data flow**: It takes ownership of a relay frame, validates it, checks that the body kind is data, and then returns the contained `RelayData`. If the frame is not data, it returns a protocol error.
 
-**Call relations**: It is used by `into_jsonrpc_message` and by the multiplexed environment when processing inbound data. It depends on `validate` to reject malformed frames before extraction.
+**Call relations**: `into_jsonrpc_message` calls this before decoding JSON-RPC. The multiplexed relay also uses it before passing encrypted data into a virtual Noise stream.
 
 *Call graph*: calls 1 internal fn (validate); called by 1 (into_jsonrpc_message); 1 external calls (Protocol).
 
@@ -1362,11 +1378,11 @@ fn into_data(self) -> Result<RelayData, ExecServerError>
 fn into_jsonrpc_message(self) -> Result<JSONRPCMessage, ExecServerError>
 ```
 
-**Purpose**: Converts a relay data frame directly into a parsed `JSONRPCMessage`. It is the bridge from protobuf relay framing to JSON-RPC semantics.
+**Purpose**: Extracts a JSON-RPC message from a data relay frame. JSON-RPC is the request-and-response message format used by the server above the transport layer.
 
-**Data flow**: Consumes `self`, delegates to `into_data` to obtain the payload bytes, then deserializes those bytes with `serde_json::from_slice`. It returns either the parsed `JSONRPCMessage` or an `ExecServerError` wrapping protocol or JSON parsing failure.
+**Data flow**: It takes a relay frame, pulls out its data payload, and parses those bytes as JSON. The result is a `JSONRPCMessage`, or an error if the frame or JSON is invalid.
 
-**Call relations**: It is used in `harness_connection_from_websocket` when inbound relay data should become `JsonRpcConnectionEvent::Message`. Its only delegation is to `into_data` and JSON decoding.
+**Call relations**: The plain WebSocket connection path uses this when a binary relay frame arrives and needs to become a normal incoming server message.
 
 *Call graph*: calls 1 internal fn (into_data); 1 external calls (from_slice).
 
@@ -1377,11 +1393,11 @@ fn into_jsonrpc_message(self) -> Result<JSONRPCMessage, ExecServerError>
 fn into_handshake_payload(self) -> Result<Vec<u8>, ExecServerError>
 ```
 
-**Purpose**: Consumes a frame and extracts the raw Noise handshake bytes, failing unless the frame is a valid handshake frame. This keeps handshake parsing separate from generic frame validation.
+**Purpose**: Extracts the raw bytes from a handshake frame. The Noise code needs these bytes to continue or complete the encrypted-channel setup.
 
-**Data flow**: Takes ownership of `self`, runs `validate`, requires the resulting kind to be `Handshake`, and then returns the `handshake.payload` bytes from the body. Any mismatch or malformed frame becomes `ExecServerError::Protocol`.
+**Data flow**: It takes ownership of a relay frame, validates it, checks that it is a handshake frame, and returns the handshake payload bytes. If the frame is the wrong kind, it returns a protocol error.
 
-**Call relations**: It is used by `run_multiplexed_environment` before calling `PendingResponderHandshake::read_request`. It relies on `validate` to enforce nonempty payloads and other shared frame checks.
+**Call relations**: `run_multiplexed_environment` uses this when a harness asks to open a new encrypted virtual stream.
 
 *Call graph*: calls 1 internal fn (validate); 1 external calls (Protocol).
 
@@ -1392,11 +1408,11 @@ fn into_handshake_payload(self) -> Result<Vec<u8>, ExecServerError>
 fn into_reset_reason(self) -> Option<String>
 ```
 
-**Purpose**: Extracts a nonempty reset reason string if the frame body is a reset. It is intentionally permissive and returns `None` for anything else.
+**Purpose**: Pulls out the reason text from a reset frame, if one is present. This lets the plain connection report why the peer disconnected.
 
-**Data flow**: Consumes `self`, pattern-matches `self.body`, and returns `Some(reset.reason)` only when the body is `Reset` and the reason is nonempty; otherwise it returns `None`.
+**Data flow**: It takes a relay frame and looks only for a non-empty reset body. If found, it returns the reason string; otherwise it returns nothing.
 
-**Call relations**: It is used by the plain harness websocket path when converting an inbound reset frame into a `Disconnected` event. Unlike the stricter typed extractors, it does not call `validate` because callers already know they are handling a reset branch.
+**Call relations**: The plain relay reader uses this after receiving a reset frame so it can send a `Disconnected` event with an optional reason.
 
 
 ##### `encode_relay_message_frame`  (lines 203–205)
@@ -1405,11 +1421,11 @@ fn into_reset_reason(self) -> Option<String>
 fn encode_relay_message_frame(frame: &RelayMessageFrame) -> Vec<u8>
 ```
 
-**Purpose**: Serializes a relay protobuf frame into bytes suitable for a websocket binary message. It is the canonical outbound encoder for this transport.
+**Purpose**: Serializes a relay frame into bytes ready to send over a WebSocket. Serialization means turning structured data into a compact binary form.
 
-**Data flow**: Takes `&RelayMessageFrame`, calls prost’s `encode_to_vec`, and returns the resulting `Vec<u8>`.
+**Data flow**: It receives a `RelayMessageFrame`, encodes it using protobuf, and returns the byte vector that can be placed inside a WebSocket binary message.
 
-**Call relations**: It is used throughout relay sending paths: plain harness transport, multiplexed Noise streams, reset emission, and tests that synthesize frames. It is a leaf serialization helper with no branching logic.
+**Call relations**: Both the plain connection and the multiplexed Noise relay use this whenever they send resume, data, handshake, or reset frames. Tests also use it to create realistic frames.
 
 *Call graph*: called by 10 (spawn_noise_virtual_stream, noise_harness_connection_from_websocket, harness_connection_from_websocket, send_reset, harness_connection_sends_keepalive_and_receives_relay_data, duplicate_handshakes_exhaust_failure_budget, oversized_harness_authorization_is_rejected_before_validation, pending_harness_key_validation_does_not_block_new_handshakes, repeated_early_data_during_validation_closes_the_physical_relay, repeated_malformed_handshakes_close_the_physical_relay); 1 external calls (encode_to_vec).
 
@@ -1422,11 +1438,11 @@ fn decode_relay_message_frame(
 ) -> Result<RelayMessageFrame, ExecServerError>
 ```
 
-**Purpose**: Parses websocket binary payload bytes into a `RelayMessageFrame` and normalizes decode failures into protocol errors. It is the canonical inbound decoder.
+**Purpose**: Parses bytes from a WebSocket binary message back into a relay frame. It is the receive-side partner of `encode_relay_message_frame`.
 
-**Data flow**: Takes `&[u8]`, invokes prost `RelayMessageFrame::decode`, and returns either the decoded frame or `ExecServerError::Protocol` with an `invalid relay message frame` message containing the decode error text.
+**Data flow**: It receives raw bytes. It asks the protobuf decoder to read them as a `RelayMessageFrame`; decoding failures become protocol errors with a clear message.
 
-**Call relations**: It is used by websocket readers in both relay modes and by tests that inspect emitted frames. Callers typically follow it with `validate` before acting on the frame contents.
+**Call relations**: Incoming WebSocket frames in both relay modes pass through this before validation and routing. Tests use it to inspect what the relay sent.
 
 *Call graph*: called by 5 (noise_harness_connection_from_websocket, harness_connection_keeps_outbound_frame_while_send_is_backpressured, read_resume_stream_id, duplicate_handshakes_exhaust_failure_budget, oversized_harness_authorization_is_rejected_before_validation); 1 external calls (decode).
 
@@ -1437,11 +1453,11 @@ fn decode_relay_message_frame(
 fn jsonrpc_payload(message: &JSONRPCMessage) -> Result<Vec<u8>, ExecServerError>
 ```
 
-**Purpose**: Serializes a `JSONRPCMessage` into raw bytes for embedding in a relay data frame. It isolates JSON encoding errors behind the server’s error type.
+**Purpose**: Turns a JSON-RPC message into bytes that can be carried inside a relay data frame. This keeps JSON formatting details out of the relay loops.
 
-**Data flow**: Takes `&JSONRPCMessage`, calls `serde_json::to_vec`, and returns either the encoded bytes or `ExecServerError::Json`.
+**Data flow**: It receives a `JSONRPCMessage`, serializes it as JSON bytes, and returns those bytes or a JSON error.
 
-**Call relations**: It is used when the plain harness websocket path turns outgoing JSON-RPC messages into relay data frames, and in tests that construct expected payloads. It is a simple serialization helper.
+**Call relations**: The plain harness connection uses this before wrapping outgoing JSON-RPC messages in relay data frames. Tests also use it to build valid incoming data frames.
 
 *Call graph*: called by 1 (harness_connection_sends_keepalive_and_receives_relay_data); 1 external calls (to_vec).
 
@@ -1457,11 +1473,11 @@ async fn send_event_with_keepalive(
 ) -> Re
 ```
 
-**Purpose**: Attempts to enqueue an inbound `JsonRpcConnectionEvent` while continuing to send websocket pings if the receiver channel is backpressured. This prevents idle timeouts during slow consumer periods.
+**Purpose**: Sends an event into the server’s incoming-message queue while still keeping the WebSocket alive. This matters when the queue is full and sending has to wait.
 
-**Data flow**: Receives a mutable websocket sink, mutable keepalive interval, an `mpsc::Sender<JsonRpcConnectionEvent>`, and the event to send. It pins the send future and loops in `tokio::select!`, returning `Ok(())` when the channel send completes, `IncomingClosed` if the receiver is gone, or `WebSocketClosed` if a keepalive ping fails.
+**Data flow**: It receives a WebSocket writer, a keepalive timer, an incoming-event channel, and the event to send. While waiting for the event channel to accept the event, it sends WebSocket ping messages on each keepalive tick. It returns success, or tells the caller whether the incoming queue or WebSocket closed.
 
-**Call relations**: It is called from `harness_connection_from_websocket` specifically when forwarding an inbound JSON-RPC message to the connection’s incoming queue. The helper exists because that path must not stop pinging the websocket while waiting for channel capacity.
+**Call relations**: The plain relay reader calls this before handing a decoded JSON-RPC message to the rest of the server. The dedicated test proves that keepalive pings continue even while the incoming queue is backed up.
 
 *Call graph*: called by 1 (send_event_with_keepalive_pings_while_incoming_queue_is_full); 3 external calls (send, pin!, select!).
 
@@ -1475,11 +1491,11 @@ fn harness_connection_from_websocket(
 ) -> JsonRpcConnection
 ```
 
-**Purpose**: Wraps a websocket carrying relay protobuf frames as a `JsonRpcConnection` for a single logical stream. It owns the task that translates between websocket messages and internal JSON-RPC events.
+**Purpose**: Converts one WebSocket into one plain `JsonRpcConnection`. It hides relay framing so the rest of the server can send and receive JSON-RPC events normally.
 
-**Data flow**: Takes a generic websocket-like `stream` and a `connection_label`. It generates a UUID `stream_id`, creates outgoing/incoming/disconnected channels, and spawns a task that sends an initial resume frame, then loops over three sources: outgoing JSON-RPC messages, keepalive ticks, and inbound websocket frames. Outgoing messages are JSON-serialized, wrapped in `RelayMessageFrame::data`, sequence-numbered with wrapping `u32`, encoded, and sent as binary websocket frames. Inbound binary frames are decoded, filtered to the generated stream id, validated, and converted into `JsonRpcConnectionEvent::Message`, `MalformedMessage`, or `Disconnected`; close/error conditions update the watch channel and terminate the task. The function returns a populated `JsonRpcConnection` with the spawned task handle and `JsonRpcTransport::Plain`.
+**Data flow**: It receives a WebSocket-like stream and a label for logs and errors. It creates outgoing and incoming channels, chooses a fresh stream id, sends a resume frame, then runs a background task that translates outgoing JSON-RPC messages into relay data frames and incoming relay data frames back into JSON-RPC events. It returns a `JsonRpcConnection` connected to that task.
 
-**Call relations**: It is called by higher-level websocket connection setup such as `connect_websocket`, and by several tests. Internally it delegates framing to `encode_relay_message_frame`, `decode_relay_message_frame`, `jsonrpc_payload`, and `send_event_with_keepalive`, and it is the plain non-Noise counterpart to `run_multiplexed_environment`.
+**Call relations**: Higher-level connection setup calls this after accepting or opening a relay WebSocket. Inside its loop it uses frame encoding, decoding, JSON serialization, validation, and `send_event_with_keepalive` to bridge WebSocket traffic to the server’s normal connection interface.
 
 *Call graph*: calls 1 internal fn (encode_relay_message_frame); called by 5 (connect_websocket, harness_connection_keeps_outbound_frame_while_send_is_backpressured, harness_connection_reports_server_close, harness_connection_reports_text_frames_as_malformed, harness_connection_sends_keepalive_and_receives_relay_data); 10 external calls (new_v4, resume, channel, select!, spawn, now, interval_at, vec!, channel, Binary).
 
@@ -1495,11 +1511,11 @@ async fn run_multiplexed_environment(
     identity: NoiseChannelId
 ```
 
-**Purpose**: Runs the executor side of the multiplexed Noise relay over one websocket, authorizing harness keys and spawning per-stream virtual JSON-RPC transports. It is the core server loop for remote environments.
+**Purpose**: Runs the encrypted, multi-stream relay for one executor WebSocket. It lets many authenticated harness connections share one physical WebSocket safely.
 
-**Data flow**: It takes a `WebSocketStream`, a `ConnectionProcessor`, environment and registration identifiers, the executor `NoiseChannelIdentity`, and a `HarnessKeyValidator`. It splits the websocket, starts a dedicated writer task fed by `physical_outgoing_tx`, and maintains mutable state: active `streams`, `pending_handshakes`, a `JoinSet` of authorization tasks, a failed-handshake counter, and a monotonically increasing `validation_id`. In its main `select!` loop it reacts to writer failure, closed virtual streams, completed validation tasks, and inbound websocket frames. Handshake frames are parsed with a stream-specific Noise prologue, converted into `PendingResponderHandshake`, checked for UTF-8 and size-bounded authorization payloads, stored in `pending_handshakes`, and validated asynchronously with a timeout. Successful validation completes the responder handshake, queues a handshake reply, and inserts a spawned `NoiseVirtualStream`; failures send generic resets and may consume the physical relay’s failure budget. Data frames are routed only to existing active streams; early data or malformed data resets the stream and may count against the budget if it canceled a pending handshake. Reset frames clear pending state and disconnect active streams. On exit it disconnects all remaining streams and aborts the writer task if still running.
+**Data flow**: It receives the WebSocket, the connection processor, environment and registration ids, the executor’s Noise identity, and a key validator. It splits the WebSocket into reader and writer halves, sends outgoing frames through a shared writer task, tracks active virtual streams and pending handshakes, validates harness keys with timeouts, starts virtual streams only after authorization succeeds, routes data frames to the right stream, and sends resets for bad or rejected streams. When the WebSocket ends, it disconnects all remaining streams and aborts unfinished validation work.
 
-**Call relations**: It is invoked by `run_remote_environment` in production and by relay tests. Within its flow it delegates to Noise handshake parsing/completion, `send_reset` for best-effort rejection, `failed_handshake_budget_exhausted` for connection-wide abuse control, and `spawn_noise_virtual_stream` to hand successful streams off to the JSON-RPC processor.
+**Call relations**: `run_remote_environment` calls this to serve a remote environment over the relay. It coordinates with Noise handshake code, `spawn_noise_virtual_stream` for per-stream JSON-RPC processing, the validator for authorization, and helpers such as `send_reset` and `failed_handshake_budget_exhausted` for protection against repeated bad attempts.
 
 *Call graph*: calls 4 internal fn (read_request, noise_channel_prologue, failed_handshake_budget_exhausted, send_reset); called by 2 (multiplexed_environment_sends_keepalive, run_remote_environment); 16 external calls (new, new, from_utf8, clone, validate_harness_key, disconnect, receive_data, split, Protocol, take (+6 more)).
 
@@ -1510,11 +1526,11 @@ async fn run_multiplexed_environment(
 fn failed_handshake_budget_exhausted(failed_handshakes: &mut usize) -> bool
 ```
 
-**Purpose**: Charges one failed authenticated-channel attempt against the physical relay and reports whether the fixed failure budget has been reached. It is the abuse-throttling primitive for repeated bad handshakes.
+**Purpose**: Counts failed Noise handshake attempts and decides when the relay should give up on the whole WebSocket. This prevents an unauthorized peer from forcing unlimited cryptographic or registry work.
 
-**Data flow**: Takes `&mut usize`, increments the counter in place, and returns `true` once the updated count is greater than or equal to `MAX_FAILED_NOISE_HANDSHAKES`.
+**Data flow**: It receives a mutable failure counter, increments it by one, and returns true once the fixed failure limit has been reached.
 
-**Call relations**: It is called from multiple failure branches inside `run_multiplexed_environment`, including duplicate handshakes, malformed Noise requests, authorization failures, and early data during validation. Its boolean result determines whether the outer relay loop should break and close the physical websocket.
+**Call relations**: `run_multiplexed_environment` calls this after duplicate, malformed, failed, or unauthorized handshake attempts. When it returns true, the main relay loop closes the physical relay.
 
 *Call graph*: called by 1 (run_multiplexed_environment).
 
@@ -1525,11 +1541,11 @@ fn failed_handshake_budget_exhausted(failed_handshakes: &mut usize) -> bool
 fn send_reset(physical_outgoing_tx: &mpsc::Sender<Vec<u8>>, stream_id: String)
 ```
 
-**Purpose**: Queues a reset frame for a stream without blocking the shared websocket loop. It intentionally treats reset delivery as best effort.
+**Purpose**: Queues a reset frame for a stream without waiting. It is a best-effort way to tell the peer that a virtual stream has been rejected or closed.
 
-**Data flow**: Takes a sender for encoded physical websocket payloads and a `stream_id`. It constructs a reset frame using the constant `NOISE_RELAY_RESET_REASON`, encodes it, and attempts `try_send`; any queue-full or closed-channel error is ignored.
+**Data flow**: It receives the shared outgoing-byte channel and a stream id. It builds a reset frame with the standard relay reset reason, encodes it, and tries to place it on the outgoing queue; if the queue cannot accept it immediately, it silently drops the reset.
 
-**Call relations**: It is used throughout `run_multiplexed_environment` whenever a stream or handshake must be rejected or torn down quickly. It delegates frame construction to `RelayMessageFrame::reset` and serialization to `encode_relay_message_frame`.
+**Call relations**: `run_multiplexed_environment` calls this in many rejection paths: bad handshakes, too many streams, unknown data streams, and stream processing errors.
 
 *Call graph*: calls 1 internal fn (encode_relay_message_frame); called by 1 (run_multiplexed_environment); 2 external calls (try_send, reset).
 
@@ -1540,11 +1556,11 @@ fn send_reset(physical_outgoing_tx: &mpsc::Sender<Vec<u8>>, stream_id: String)
 async fn harness_connection_sends_keepalive_and_receives_relay_data() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that the plain harness relay sends an initial resume frame, emits keepalive pings, and converts an inbound relay data frame into a JSON-RPC message event.
+**Purpose**: Tests that a plain harness connection sends keepalive pings and can receive a relay data frame as a JSON-RPC message.
 
-**Data flow**: The test creates a client/server websocket pair, wraps the client side with `harness_connection_from_websocket`, reads the generated stream id from the server side, waits for a ping, sends a pong, then sends a binary relay data frame containing a serialized test JSON-RPC message. It asserts that `incoming_rx` yields `JsonRpcConnectionEvent::Message` with the expected payload.
+**Data flow**: It creates a client/server WebSocket pair, wraps the client with `harness_connection_from_websocket`, reads the initial stream id and keepalive ping from the server side, sends a valid relay data frame back, and checks that the connection produces the expected JSON-RPC event.
 
-**Call relations**: It exercises the normal happy-path control flow of `harness_connection_from_websocket`, relying on helper functions like `read_resume_stream_id`, `read_keepalive_ping`, and `test_jsonrpc_message` to inspect the transport.
+**Call relations**: This test exercises the normal receive path through frame encoding, JSON payload creation, WebSocket reading, relay decoding, and JSON-RPC delivery.
 
 *Call graph*: calls 3 internal fn (encode_relay_message_frame, harness_connection_from_websocket, jsonrpc_payload); 8 external calls (assert!, data, read_keepalive_ping, read_resume_stream_id, test_jsonrpc_message, websocket_pair, Binary, Pong).
 
@@ -1555,11 +1571,11 @@ async fn harness_connection_sends_keepalive_and_receives_relay_data() -> anyhow:
 async fn multiplexed_environment_sends_keepalive() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that the multiplexed Noise environment emits websocket keepalive pings even before any virtual streams are established.
+**Purpose**: Tests that the multiplexed Noise environment sends WebSocket keepalive pings even before any virtual stream is active.
 
-**Data flow**: The test creates a websocket pair, constructs runtime paths, a `ConnectionProcessor`, and a generated `NoiseChannelIdentity`, then spawns `run_multiplexed_environment`. It waits for a ping on the server websocket and then aborts the environment task.
+**Data flow**: It creates a WebSocket pair, starts `run_multiplexed_environment` with a test validator and generated Noise identity, waits for a ping on the server side, then aborts the task.
 
-**Call relations**: It validates the dedicated writer task behavior inside `run_multiplexed_environment`, specifically the branch that sends `Message::Ping` when no outbound relay payload is queued.
+**Call relations**: This test checks the writer task inside `run_multiplexed_environment`, especially the keepalive behavior that protects idle executor WebSockets.
 
 *Call graph*: calls 4 internal fn (generate, run_multiplexed_environment, new, new); 4 external calls (read_keepalive_ping, websocket_pair, current_exe, spawn).
 
@@ -1574,11 +1590,11 @@ async fn validate_harness_key(
         ) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Implements a test validator that authorizes every harness key immediately. It removes registry behavior from tests that only care about relay mechanics.
+**Purpose**: Provides a test validator that always authorizes the harness key. It lets tests focus on relay behavior instead of registry authorization rules.
 
-**Data flow**: It accepts a harness public key and authorization string but ignores both, returning `Ok(())` asynchronously without mutating any state.
+**Data flow**: It receives a harness public key and authorization string but does not inspect them. It immediately returns success.
 
-**Call relations**: This validator is passed into `run_multiplexed_environment` by tests that need successful authorization without external dependencies. It stands in for production `HarnessKeyValidator` implementations.
+**Call relations**: `tests::multiplexed_environment_sends_keepalive` passes this validator into `run_multiplexed_environment` so the environment can be constructed with a valid validator implementation.
 
 
 ##### `tests::send_event_with_keepalive_pings_while_incoming_queue_is_full`  (lines 939–983)
@@ -1587,11 +1603,11 @@ async fn validate_harness_key(
 async fn send_event_with_keepalive_pings_while_incoming_queue_is_full() -> anyhow::Result<()>
 ```
 
-**Purpose**: Proves that `send_event_with_keepalive` continues sending websocket pings while blocked on a full incoming event channel, then completes once capacity is freed.
+**Purpose**: Tests that `send_event_with_keepalive` keeps pinging the WebSocket while it waits for room in a full incoming-event queue.
 
-**Data flow**: The test builds a `ControlledWebSocket`, fills a one-slot `incoming_tx` channel with a first event, starts `send_event_with_keepalive` in a task for a second event, observes an outbound ping, drains the first queued event, waits for the send task to finish, and finally asserts that the second event arrives.
+**Data flow**: It creates a controlled fake WebSocket and a one-slot incoming channel, fills the channel, starts `send_event_with_keepalive`, observes a ping, frees the queue slot, and checks that the intended JSON-RPC event is finally delivered.
 
-**Call relations**: It directly targets the helper’s select-loop behavior under backpressure, using the controllable fake websocket to make ping traffic observable.
+**Call relations**: This test directly exercises the helper used by the plain relay receive loop when backpressure, meaning a temporarily full queue, delays event delivery.
 
 *Call graph*: calls 1 internal fn (send_event_with_keepalive); 8 external calls (assert!, new, Message, test_jsonrpc_message, channel, spawn, now, interval_at).
 
@@ -1602,11 +1618,11 @@ async fn send_event_with_keepalive_pings_while_incoming_queue_is_full() -> anyho
 async fn harness_connection_reports_text_frames_as_malformed() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that text websocket frames are rejected on the relay transport and surfaced as malformed-message events rather than being silently ignored or parsed.
+**Purpose**: Tests that the plain relay rejects text WebSocket frames. The relay protocol expects binary protobuf frames, not human-readable WebSocket text.
 
-**Data flow**: The test creates a websocket pair, starts `harness_connection_from_websocket`, consumes the initial resume frame, sends a `Message::Text("nope")` from the server side, and asserts that the connection’s incoming channel yields `JsonRpcConnectionEvent::MalformedMessage` with the expected reason string.
+**Data flow**: It starts a harness connection, waits for the initial resume frame, sends a text frame from the server side, and checks that the connection reports a malformed-message event with the expected reason.
 
-**Call relations**: It exercises the text-frame branch in the websocket reader inside `harness_connection_from_websocket`.
+**Call relations**: This test covers an error branch inside `harness_connection_from_websocket` and confirms that bad frame types are reported instead of silently accepted.
 
 *Call graph*: calls 1 internal fn (harness_connection_from_websocket); 4 external calls (assert!, read_resume_stream_id, websocket_pair, Text).
 
@@ -1617,11 +1633,11 @@ async fn harness_connection_reports_text_frames_as_malformed() -> anyhow::Result
 async fn harness_connection_reports_server_close() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a websocket close from the peer becomes a disconnected event on the plain harness connection.
+**Purpose**: Tests that the plain relay reports a clean peer close as a disconnection. This is important so callers can stop waiting for more messages.
 
-**Data flow**: The test creates a websocket pair, wraps the client side, reads the initial resume frame, closes the server websocket, and asserts that `incoming_rx` receives `JsonRpcConnectionEvent::Disconnected { reason: None }`.
+**Data flow**: It creates a harness connection, reads the initial resume frame, closes the server WebSocket, and checks that the incoming event stream receives a disconnected event with no reason.
 
-**Call relations**: It covers the close/EOF branch in `harness_connection_from_websocket` where the task marks the connection disconnected and exits.
+**Call relations**: This test exercises the WebSocket close handling inside `harness_connection_from_websocket`.
 
 *Call graph*: calls 1 internal fn (harness_connection_from_websocket); 3 external calls (assert!, read_resume_stream_id, websocket_pair).
 
@@ -1632,11 +1648,11 @@ async fn harness_connection_reports_server_close() -> anyhow::Result<()>
 async fn harness_connection_keeps_outbound_frame_while_send_is_backpressured() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an outbound relay data frame is not lost when websocket writes are temporarily blocked. The queued JSON-RPC message should be sent once the sink becomes writable again.
+**Purpose**: Tests that an outgoing JSON-RPC message is not lost when the WebSocket writer is temporarily unable to send. Backpressure here means the socket says, “not ready yet.”
 
-**Data flow**: Using `ControlledWebSocket`, the test captures the initial resume frame and stream id, blocks writes, sends a JSON-RPC message through `connection.outgoing_tx`, waits until the sink reports blocked, injects an inbound pong, confirms no spurious incoming event appears, then re-enables writes and inspects the next outbound binary frame to ensure it contains the original message for the same stream id.
+**Data flow**: It uses a controlled fake WebSocket, blocks writes, queues an outgoing JSON-RPC message, proves no incoming event appears just because writing is blocked, then unblocks writing and checks that the correct relay data frame is sent with the original message.
 
-**Call relations**: It exercises the outgoing-message branch of `harness_connection_from_websocket` under sink backpressure, with `ControlledWebSocket` providing deterministic readiness transitions.
+**Call relations**: This test covers the outgoing side of `harness_connection_from_websocket` and uses `decode_relay_message_frame` to inspect the binary frame that was eventually written.
 
 *Call graph*: calls 2 internal fn (decode_relay_message_frame, harness_connection_from_websocket); 8 external calls (from_secs, bail!, assert!, assert_eq!, new, test_jsonrpc_message, timeout, Pong).
 
@@ -1650,11 +1666,11 @@ async fn websocket_pair() -> anyhow::Result<(
     )>
 ```
 
-**Purpose**: Creates a connected client/server websocket pair bound to a temporary localhost listener for integration-style relay tests.
+**Purpose**: Creates a connected pair of real WebSockets for tests. One side acts like the client and the other like the server.
 
-**Data flow**: It binds a `TcpListener` on `127.0.0.1:0`, formats a websocket URL from the chosen port, spawns a server accept-and-upgrade task with `accept_async`, connects the client with `connect_async`, awaits the server task, and returns both websocket streams.
+**Data flow**: It binds a local TCP listener, starts a task to accept and upgrade one connection to WebSocket, connects to that listener, and returns both WebSocket endpoints.
 
-**Call relations**: It is a shared test helper used by multiple relay tests that need a real websocket transport rather than the synthetic `ControlledWebSocket`.
+**Call relations**: Several relay tests call this helper so they can exercise real WebSocket behavior without needing an external server.
 
 *Call graph*: 5 external calls (bind, format!, spawn, accept_async, connect_async).
 
@@ -1667,11 +1683,11 @@ async fn read_resume_stream_id(
     ) -> anyhow::Result<String>
 ```
 
-**Purpose**: Reads the next websocket message and asserts that it is a relay resume frame, returning the embedded stream id for later test traffic.
+**Purpose**: Reads the first resume frame from a test WebSocket and returns its stream id. Tests need this id to send frames that the relay will accept.
 
-**Data flow**: It waits up to one second for `websocket.next()`, requires a binary frame, decodes it with `decode_relay_message_frame`, validates that the body kind is `Resume`, and returns `frame.stream_id`.
+**Data flow**: It waits for the next WebSocket message, requires it to be binary, decodes it as a relay frame, checks that it is a resume frame, and returns the frame’s stream id.
 
-**Call relations**: It is used by tests that need to know the generated stream id emitted by `harness_connection_from_websocket` before sending matching relay frames back.
+**Call relations**: Plain harness connection tests call this right after creating `harness_connection_from_websocket`, because that connection sends a resume frame before normal data exchange.
 
 *Call graph*: calls 1 internal fn (decode_relay_message_frame); 5 external calls (from_secs, next, bail!, assert_eq!, timeout).
 
@@ -1684,11 +1700,11 @@ async fn read_keepalive_ping(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Consumes websocket traffic until it observes a ping frame or fails if the socket closes first. It abstracts away unrelated frames during keepalive assertions.
+**Purpose**: Waits until a test WebSocket receives a ping frame. It ignores unrelated non-close messages while looking for the keepalive.
 
-**Data flow**: It loops with a one-second timeout around `websocket.next()`, ignoring binary, text, pong, and raw frame variants, returning `Ok(())` on `Message::Ping(_)`, and failing if the websocket closes before a ping arrives.
+**Data flow**: It repeatedly waits for the next WebSocket message with a timeout. If it sees a ping, it returns success; if the socket closes or no ping arrives in time, it fails the test.
 
-**Call relations**: It is used by tests for both plain and multiplexed relay modes to assert that keepalive behavior is active.
+**Call relations**: Keepalive-related tests use this helper to confirm that both plain and multiplexed relay paths keep the WebSocket alive during idle periods.
 
 *Call graph*: 4 external calls (from_secs, next, bail!, timeout).
 
@@ -1699,11 +1715,11 @@ async fn read_keepalive_ping(
 fn test_jsonrpc_message() -> JSONRPCMessage
 ```
 
-**Purpose**: Constructs a stable sample JSON-RPC request used across relay tests.
+**Purpose**: Builds a small sample JSON-RPC request for tests. It gives tests a consistent message to send through the relay.
 
-**Data flow**: It returns `JSONRPCMessage::Request(JSONRPCRequest { id: RequestId::Integer(1), method: "test", params: None, trace: None })` with no inputs or side effects.
+**Data flow**: It creates a JSON-RPC request with integer id `1`, method name `test`, and no parameters or trace data, then wraps it as a `JSONRPCMessage`.
 
-**Call relations**: It is a pure fixture helper used by tests that need a known message to serialize, send, and compare.
+**Call relations**: Several tests use this helper when they need a valid JSON-RPC payload for relay data frames or outgoing connection messages.
 
 *Call graph*: 2 external calls (Request, Integer).
 
@@ -1720,11 +1736,11 @@ fn new(
         )
 ```
 
-**Purpose**: Builds a synthetic websocket-like object with externally controlled write readiness and observable outbound traffic for deterministic transport tests.
+**Purpose**: Creates a fake WebSocket whose read and write readiness can be controlled by a test. This makes it possible to test backpressure and keepalive timing reliably.
 
-**Data flow**: It creates unbounded inbound and outbound futures channels, shared atomic flags for write readiness and blocked state, and atomic wakers for coordination. It returns a `ControlledWebSocket`, a `ControlledWebSocketHandle` sharing the control state, and the outbound receiver used by tests to inspect sent messages.
+**Data flow**: It receives an initial write-ready flag. It builds inbound and outbound message channels plus shared atomic flags and wakers, then returns the fake WebSocket, a handle for controlling it, and a receiver for messages written by the relay.
 
-**Call relations**: It underpins tests for `send_event_with_keepalive` and `harness_connection_from_websocket` where real websocket timing would be hard to control.
+**Call relations**: Tests use this instead of a real socket when they need precise control over whether writes are ready or blocked, especially around `send_event_with_keepalive` and outgoing relay frames.
 
 *Call graph*: 5 external calls (clone, new, new, new, unbounded).
 
@@ -1735,11 +1751,11 @@ fn new(
 fn send_inbound(&self, message: Message) -> anyhow::Result<()>
 ```
 
-**Purpose**: Injects an inbound websocket message into the controlled test transport.
+**Purpose**: Injects an incoming WebSocket message into the controlled fake socket. From the relay’s point of view, this looks like the peer sent a message.
 
-**Data flow**: It takes a `Message`, wraps it as `Ok(message)`, sends it through the shared unbounded inbound sender, and returns an `anyhow::Result<()>` reflecting whether the receiver is still present.
+**Data flow**: It receives a WebSocket message, wraps it as a successful inbound item, and pushes it into the fake socket’s inbound channel. It returns success or a send error.
 
-**Call relations**: Tests call it to simulate peer traffic arriving at code under test that is reading from `ControlledWebSocket` as a `Stream`.
+**Call relations**: Backpressure tests use this handle method to send pongs or other peer messages while the relay task is using the fake WebSocket.
 
 *Call graph*: 1 external calls (unbounded_send).
 
@@ -1750,11 +1766,11 @@ fn send_inbound(&self, message: Message) -> anyhow::Result<()>
 fn set_write_blocked(&self)
 ```
 
-**Purpose**: Forces the controlled websocket sink into a non-ready state so future sends will block in `poll_ready`.
+**Purpose**: Marks the fake WebSocket as not ready to write. This simulates a real socket applying backpressure.
 
-**Data flow**: It writes `false` into the shared `write_ready` atomic flag and returns no value.
+**Data flow**: It changes the shared write-ready flag to false. Future write readiness checks will pause instead of accepting a message.
 
-**Call relations**: Tests use it before sending outbound messages to create backpressure scenarios for relay code.
+**Call relations**: The outbound backpressure test calls this before queueing a message, so it can prove the relay keeps the message until writing becomes possible.
 
 
 ##### `tests::ControlledWebSocketHandle::set_write_ready`  (lines 1175–1178)
@@ -1763,11 +1779,11 @@ fn set_write_blocked(&self)
 fn set_write_ready(&self)
 ```
 
-**Purpose**: Marks the controlled websocket sink writable again and wakes any task waiting for readiness.
+**Purpose**: Marks the fake WebSocket as ready to write again and wakes any task waiting on it.
 
-**Data flow**: It stores `true` into the shared `write_ready` flag and calls the stored write waker so pending sink operations can resume.
+**Data flow**: It changes the shared write-ready flag to true and wakes the stored writer task. After this, pending sends can continue.
 
-**Call relations**: It is used by backpressure tests to release a blocked send and observe that queued relay output is eventually emitted.
+**Call relations**: Backpressure tests call this after confirming a write is blocked, allowing the relay send path to finish and emit the expected frame.
 
 
 ##### `tests::ControlledWebSocketHandle::wait_for_blocked_write`  (lines 1180–1194)
@@ -1776,11 +1792,11 @@ fn set_write_ready(&self)
 async fn wait_for_blocked_write(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Waits until the controlled websocket has actually attempted a blocked write, rather than merely being configured as non-ready.
+**Purpose**: Waits until the fake WebSocket has actually observed a blocked write attempt. This avoids races in tests.
 
-**Data flow**: It polls a future that checks the shared `write_blocked` atomic, registering the blocked-write waker when not yet set, and wraps that poll loop in a one-second timeout. It returns `Ok(())` once a blocked write has been observed.
+**Data flow**: It polls a shared flag until the fake socket reports that a writer tried to send while writes were blocked, with a timeout to prevent hanging forever.
 
-**Call relations**: Tests call it after queueing outbound work to ensure the code under test has reached the sink backpressure point before proceeding.
+**Call relations**: The outbound backpressure test uses this after disabling writes, so it knows the relay task is truly waiting before it changes other conditions.
 
 *Call graph*: 3 external calls (from_secs, poll_fn, timeout).
 
@@ -1791,11 +1807,11 @@ async fn wait_for_blocked_write(&self) -> anyhow::Result<()>
 fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>
 ```
 
-**Purpose**: Implements sink readiness for the controlled websocket, exposing deterministic writable and blocked states to tests.
+**Purpose**: Implements the fake socket’s write-readiness check for the `Sink` interface. A sink is an asynchronous place where code can send messages.
 
-**Data flow**: When polled, it reads the shared `write_ready` flag. If true it returns `Poll::Ready(Ok(()))`; otherwise it marks `write_blocked = true`, wakes any waiter interested in that fact, registers the caller’s waker for future readiness, and returns `Poll::Pending`.
+**Data flow**: It reads the shared write-ready flag. If writing is allowed, it reports ready; otherwise it records that a write is blocked, wakes anyone waiting for that fact, stores the current task’s waker, and reports pending.
 
-**Call relations**: This method is exercised indirectly by relay code using `SinkExt::send` on `ControlledWebSocket`, enabling tests to observe and manipulate send backpressure.
+**Call relations**: The relay’s normal WebSocket send code calls this indirectly when using the fake socket in tests. The control handle changes the flags that determine this function’s answer.
 
 *Call graph*: 2 external calls (waker, Ready).
 
@@ -1806,11 +1822,11 @@ fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Sel
 fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error>
 ```
 
-**Purpose**: Records an outbound websocket message emitted by code under test.
+**Purpose**: Records a message that the relay wrote to the fake WebSocket. Tests can then inspect the outbound channel to see what would have gone over the network.
 
-**Data flow**: It takes the `Message` item passed by the sink machinery, forwards it into the unbounded outbound sender, and returns `Ok(())`, panicking only if the test receiver has been dropped unexpectedly.
+**Data flow**: It receives a WebSocket message and pushes it into the fake socket’s outbound channel. It returns success if the test receiver is still present.
 
-**Call relations**: It is the sink-side observation point used by tests to inspect pings, resume frames, and data frames sent by relay logic.
+**Call relations**: This is called by the relay send path after `poll_ready` says writing is possible. Tests read from the paired outbound receiver to assert on pings and binary relay frames.
 
 *Call graph*: 1 external calls (unbounded_send).
 
@@ -1824,11 +1840,11 @@ fn poll_flush(
         ) -> Poll<Result<(), Self::Error>>
 ```
 
-**Purpose**: Implements a no-op flush for the controlled websocket sink.
+**Purpose**: Reports that the fake socket has flushed all written data. For these tests, flushing is immediate.
 
-**Data flow**: It ignores the context and immediately returns `Poll::Ready(Ok(()))` without mutating state.
+**Data flow**: It ignores the polling context and returns ready success without changing state.
 
-**Call relations**: Relay code reaches this through `SinkExt::send`; the trivial implementation keeps tests focused on readiness and message capture rather than buffering semantics.
+**Call relations**: The generic WebSocket sending code may call this as part of the `Sink` contract. The fake implementation keeps it simple because outbound messages are stored immediately.
 
 *Call graph*: 1 external calls (Ready).
 
@@ -1842,11 +1858,11 @@ fn poll_close(
         ) -> Poll<Result<(), Self::Error>>
 ```
 
-**Purpose**: Implements a no-op close for the controlled websocket sink.
+**Purpose**: Reports that the fake socket can close immediately. The tests do not need a detailed close handshake.
 
-**Data flow**: It ignores the context and immediately returns `Poll::Ready(Ok(()))`.
+**Data flow**: It ignores the polling context and returns ready success without changing state.
 
-**Call relations**: It satisfies the `Sink<Message>` contract for the test transport; relay tests do not rely on any special close behavior here.
+**Call relations**: This completes the fake socket’s `Sink` implementation so it can be used anywhere the relay expects a WebSocket-like writer.
 
 *Call graph*: 1 external calls (Ready).
 
@@ -1857,10 +1873,10 @@ fn poll_close(
 fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>
 ```
 
-**Purpose**: Implements stream polling for inbound test messages injected through the paired handle.
+**Purpose**: Implements the fake socket’s receive side. It lets relay code read messages that the test injected.
 
-**Data flow**: It delegates polling to the internal unbounded inbound receiver and returns the next `Result<Message, Infallible>` item or end-of-stream.
+**Data flow**: It polls the inbound channel for the next injected message and returns that message, pending, or end-of-stream depending on the channel state.
 
-**Call relations**: Relay code under test reads from `ControlledWebSocket` as a `Stream`, and tests feed it via `ControlledWebSocketHandle::send_inbound`.
+**Call relations**: The relay’s normal WebSocket read loop calls this indirectly during tests. `ControlledWebSocketHandle::send_inbound` feeds the channel that this function reads.
 
 *Call graph*: 1 external calls (new).

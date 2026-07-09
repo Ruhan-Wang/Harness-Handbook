@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Handbook Studio Instructions</title>
+    <meta
+      name="description"
+      content="A practical guide to exploring handbooks and replaying code-evolution workflows in Handbook Studio."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #09070f;
+        --surface: #100d18;
+        --surface-2: #171222;
+        --line: #2b2438;
+        --text: #f3f0f8;
+        --soft: #c0b8cc;
+        --muted: #8e859e;
+        --accent: #a78bfa;
+        --accent-strong: #8b5cf6;
+        --accent-wash: rgba(139, 92, 246, 0.12);
+        --code: #0d0a13;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, system-ui, sans-serif;
+        font-size: 15px;
+        line-height: 1.7;
+      }
+      a { color: inherit; }
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid var(--line);
+        background: color-mix(in srgb, var(--bg) 88%, transparent);
+        backdrop-filter: blur(14px);
+      }
+      .topbar__inner {
+        width: min(960px, calc(100% - 36px));
+        min-height: 58px;
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 650;
+        text-decoration: none;
+      }
+      .brand img { width: 30px; height: 30px; object-fit: cover; }
+      .back {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 11px;
+        color: var(--soft);
+        font-size: 13px;
+        text-decoration: none;
+        transition: .16s ease;
+      }
+      .back:hover { border-color: var(--accent); color: var(--text); background: var(--accent-wash); }
+      .topbar__actions { display: flex; align-items: center; gap: 8px; }
+      .language {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 10px;
+        background: transparent;
+        color: var(--soft);
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+        transition: .16s ease;
+      }
+      .language:hover { border-color: var(--accent); color: var(--text); background: var(--accent-wash); }
+      [data-page-lang][hidden] { display: none; }
+      main { width: min(760px, calc(100% - 36px)); margin: 0 auto; padding: 68px 0 90px; }
+      .eyebrow {
+        margin: 0 0 12px;
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: .13em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(34px, 7vw, 54px);
+        line-height: 1.08;
+        letter-spacing: -.035em;
+      }
+      .lede {
+        max-width: 650px;
+        margin: 20px 0 0;
+        color: var(--soft);
+        font-size: 17px;
+      }
+      .quick-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 9px;
+        margin-top: 28px;
+      }
+      .quick-links a {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 12px;
+        color: var(--soft);
+        font-size: 12px;
+        text-decoration: none;
+      }
+      .quick-links a:hover { border-color: var(--accent); color: var(--text); }
+      section { padding-top: 66px; scroll-margin-top: 54px; }
+      h2 {
+        margin: 0 0 20px;
+        font-size: 25px;
+        line-height: 1.25;
+        letter-spacing: -.02em;
+      }
+      h3 { margin: 0 0 7px; font-size: 16px; }
+      p { margin: 0; color: var(--soft); }
+      .steps { display: grid; gap: 12px; counter-reset: step; }
+      .step {
+        position: relative;
+        padding: 20px 20px 20px 60px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+        counter-increment: step;
+      }
+      .step::before {
+        content: counter(step);
+        position: absolute;
+        left: 20px;
+        top: 20px;
+        width: 25px;
+        height: 25px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: var(--accent-wash);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .card {
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+      }
+      .card__label {
+        margin-bottom: 8px;
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .flow {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 8px;
+        margin: 24px 0 18px;
+      }
+      .flow__item {
+        padding: 12px 8px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--surface-2);
+        text-align: center;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .flow__item span { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; font-weight: 400; }
+      .notice {
+        margin-top: 20px;
+        padding: 16px 18px;
+        border-left: 2px solid var(--accent-strong);
+        background: var(--accent-wash);
+        color: var(--soft);
+      }
+      code {
+        padding: 2px 5px;
+        border-radius: 5px;
+        background: var(--code);
+        color: #d8b4fe;
+        font-family: "JetBrains Mono", monospace;
+        font-size: .88em;
+      }
+      ul { margin: 12px 0 0; padding-left: 20px; color: var(--soft); }
+      li + li { margin-top: 8px; }
+      footer {
+        margin-top: 72px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          color-scheme: light;
+          --bg: #fbfafc;
+          --surface: #ffffff;
+          --surface-2: #f7f4fb;
+          --line: #e4deeb;
+          --text: #24202c;
+          --soft: #5e566a;
+          --muted: #83798f;
+          --accent: #6d4cc7;
+          --accent-strong: #7c3aed;
+          --accent-wash: rgba(124, 58, 237, 0.08);
+          --code: #f3eff8;
+        }
+      }
+      @media (max-width: 640px) {
+        main { padding-top: 48px; }
+        .topbar__inner { width: min(100% - 24px, 960px); }
+        .grid { grid-template-columns: 1fr; }
+        .flow { grid-template-columns: 1fr; }
+        .flow__item { text-align: left; padding-left: 14px; }
+        .step { padding-left: 52px; }
+        .step::before { left: 15px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__inner">
+        <a class="brand" href="./">
+          <img src="./light_logo.png" alt="" />
+          <span>Handbook Studio</span>
+        </a>
+        <div class="topbar__actions">
+          <button class="language" id="language-toggle" type="button">中文</button>
+          <a class="back" href="./"><span aria-hidden="true">←</span> <span id="back-label">Back to Studio</span></a>
+        </div>
+      </div>
+    </header>
+
+    <main data-page-lang="en">
+      <p class="eyebrow">Usage guide</p>
+      <h1>Handbook Studio Instructions</h1>
+      <p class="lede">
+        Handbook Studio turns a large codebase into navigable behavioral knowledge, then connects every explanation
+        back to implementation evidence. Use this guide to explore a handbook and understand the code-evolution workflow.
+      </p>
+      <div class="notice">
+        <b>Demo notice:</b> This is a static demo. It only supports browsing the handbooks we have already generated
+        and replaying saved Co-Edit history. It does not generate new handbooks or run live edits.
+      </div>
+      <nav class="quick-links" aria-label="Instructions sections">
+        <a href="#start-en">Quick start</a>
+        <a href="#views-en">Core views</a>
+        <a href="#co-edit-en">Co-Edit workflow</a>
+        <a href="#demo-en">Demo limitations</a>
+      </nav>
+
+      <section id="start-en">
+        <p class="eyebrow">01 · Quick start</p>
+        <h2>Explore a generated handbook</h2>
+        <div class="steps">
+          <article class="step">
+            <h3>Open an example repository</h3>
+            <p>Select <b>Codex</b> or <b>terminus_2</b> from Recent Repositories in the left sidebar.</p>
+          </article>
+          <article class="step">
+            <h3>Build a system-level view</h3>
+            <p>Start with the Handbook overview, then move through stages and shared state before opening individual functions.</p>
+          </article>
+          <article class="step">
+            <h3>Follow evidence into the code</h3>
+            <p>Use <b>Handbook ⇄ Code</b> to keep behavioral explanations and their source locations visible together.</p>
+          </article>
+          <article class="step">
+            <h3>Replay a change</h3>
+            <p>Open <b>Evolution History</b> or <b>Co-Edit</b> to inspect how a request becomes a plan, patch, and synchronized handbook update.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="views-en">
+        <p class="eyebrow">02 · Core views</p>
+        <h2>Choose the view that matches your goal</h2>
+        <div class="grid">
+          <article class="card">
+            <div class="card__label">Handbook</div>
+            <h3>Understand behavior first</h3>
+            <p>Read the system overview, behavioral stages, and state registers without starting from the file tree.</p>
+          </article>
+          <article class="card">
+            <div class="card__label">Handbook ⇄ Code</div>
+            <h3>Verify implementation evidence</h3>
+            <p>Move between natural-language explanations and the exact files, functions, and line ranges that support them.</p>
+          </article>
+          <article class="card">
+            <div class="card__label">Call graph</div>
+            <h3>Inspect code relationships</h3>
+            <p>Trace how functions connect when a behavior spans multiple modules or execution paths.</p>
+          </article>
+          <article class="card">
+            <div class="card__label">Evolution History</div>
+            <h3>Review previous changes</h3>
+            <p>Reopen saved sessions to compare the request, plan, code patch, and handbook synchronization result.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="co-edit-en">
+        <p class="eyebrow">03 · Co-Edit</p>
+        <h2>From behavioral request to synchronized knowledge</h2>
+        <div class="flow" aria-label="Co-Edit workflow">
+          <div class="flow__item">Request<span>Describe the change</span></div>
+          <div class="flow__item">Handbook<span>Locate behavior</span></div>
+          <div class="flow__item">Plan<span>Identify code sites</span></div>
+          <div class="flow__item">Patch<span>Review changes</span></div>
+          <div class="flow__item">Sync<span>Refresh knowledge</span></div>
+        </div>
+        <p>
+          Begin with a behavioral intent rather than a guessed filename. Handbook Studio uses the handbook to identify
+          relevant behavior units and implementation evidence, presents a focused plan, then keeps the handbook aligned
+          with the resulting code change.
+        </p>
+        <div class="notice">
+          Review the proposed plan and diff before applying a change. The handbook narrows the search space, but human
+          judgment remains important for permissions, safety boundaries, and behavior that spans multiple paths.
+        </div>
+      </section>
+
+      <section id="demo-en">
+        <p class="eyebrow">04 · Static demo</p>
+        <h2>What is available in this deployment</h2>
+        <ul>
+          <li>The bundled Codex and terminus_2 handbooks are fully browsable.</li>
+          <li>Saved Co-Edit sessions can be replayed from Evolution History.</li>
+          <li>Live repository generation, code execution, and model-driven editing require the local Handbook Studio application.</li>
+          <li>Changes made while browsing the static demo are not written back to a repository.</li>
+        </ul>
+      </section>
+
+      <footer>
+        Handbook Studio · From code to understanding, from request to evolution.
+      </footer>
+    </main>
+
+    <main data-page-lang="zh" hidden>
+      <p class="eyebrow">使用指南</p>
+      <h1>Handbook Studio 使用说明</h1>
+      <p class="lede">
+        Handbook Studio 将大型代码库转化为可导航的行为知识，并把每一项说明连接回实现证据。
+        本指南将帮助你探索 Handbook，并理解从修改需求到代码演进的完整流程。
+      </p>
+      <div class="notice">
+        <b>演示说明：</b>当前展示的是静态 Demo，仅支持查看我们已经生成的 Handbook，以及回放已保存的
+        Co-Edit 历史记录；暂不支持生成新的 Handbook 或执行实时代码修改。
+      </div>
+      <nav class="quick-links" aria-label="使用说明章节">
+        <a href="#start-zh">快速开始</a>
+        <a href="#views-zh">核心视图</a>
+        <a href="#co-edit-zh">协同编辑流程</a>
+        <a href="#demo-zh">演示版限制</a>
+      </nav>
+
+      <section id="start-zh">
+        <p class="eyebrow">01 · 快速开始</p>
+        <h2>探索已生成的 Handbook</h2>
+        <div class="steps">
+          <article class="step">
+            <h3>打开示例代码库</h3>
+            <p>从左侧“最近代码库”中选择 <b>Codex</b> 或 <b>terminus_2</b>。</p>
+          </article>
+          <article class="step">
+            <h3>先建立系统级理解</h3>
+            <p>从 Handbook 概览开始，再依次查看行为阶段和共享状态，最后进入具体函数。</p>
+          </article>
+          <article class="step">
+            <h3>沿着证据进入代码</h3>
+            <p>使用 <b>Handbook ⇄ 代码</b>，同时查看行为说明及其对应的源码位置。</p>
+          </article>
+          <article class="step">
+            <h3>回放一次修改</h3>
+            <p>打开<b>演进历史</b>或<b>协同编辑</b>，查看一项需求如何转化为计划、补丁和同步后的 Handbook。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="views-zh">
+        <p class="eyebrow">02 · 核心视图</p>
+        <h2>根据目标选择视图</h2>
+        <div class="grid">
+          <article class="card">
+            <div class="card__label">Handbook</div>
+            <h3>先理解系统行为</h3>
+            <p>从系统概览、行为阶段和状态寄存器入手，而不是直接进入文件目录。</p>
+          </article>
+          <article class="card">
+            <div class="card__label">Handbook ⇄ 代码</div>
+            <h3>核对实现证据</h3>
+            <p>在自然语言说明与支撑它的文件、函数和代码行之间快速切换。</p>
+          </article>
+          <article class="card">
+            <div class="card__label">调用关系图</div>
+            <h3>查看代码关系</h3>
+            <p>当一个行为跨越多个模块或执行路径时，追踪相关函数如何连接。</p>
+          </article>
+          <article class="card">
+            <div class="card__label">演进历史</div>
+            <h3>复查历史修改</h3>
+            <p>重新打开已保存的会话，对照修改需求、计划、代码补丁与 Handbook 同步结果。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="co-edit-zh">
+        <p class="eyebrow">03 · 协同编辑</p>
+        <h2>从行为需求到知识同步</h2>
+        <div class="flow" aria-label="协同编辑流程">
+          <div class="flow__item">需求<span>描述修改目标</span></div>
+          <div class="flow__item">Handbook<span>定位相关行为</span></div>
+          <div class="flow__item">计划<span>确定代码位置</span></div>
+          <div class="flow__item">补丁<span>审查代码变更</span></div>
+          <div class="flow__item">同步<span>更新知识</span></div>
+        </div>
+        <p>
+          从行为意图出发，而不是猜测文件名。Handbook Studio 根据 Handbook 定位相关行为单元与实现证据，
+          生成聚焦的修改计划，并在代码变化后保持 Handbook 与实现同步。
+        </p>
+        <div class="notice">
+          应用修改前，请审查计划与代码差异。Handbook 可以缩小搜索范围，但权限、安全边界以及跨路径行为仍需要人工判断。
+        </div>
+      </section>
+
+      <section id="demo-zh">
+        <p class="eyebrow">04 · 静态演示</p>
+        <h2>当前部署支持的功能</h2>
+        <ul>
+          <li>可以完整浏览内置的 Codex 和 terminus_2 Handbook。</li>
+          <li>可以从演进历史中回放已保存的协同编辑会话。</li>
+          <li>实时生成代码库 Handbook、执行代码和模型驱动编辑，需要在本地运行完整的 Handbook Studio。</li>
+          <li>在静态演示中进行的浏览操作不会写回代码库。</li>
+        </ul>
+      </section>
+
+      <footer>
+        Handbook Studio · 从代码到理解，从需求到演进。
+      </footer>
+    </main>
+
+    <script>
+      (() => {
+        const storageKey = 'hs-language';
+        const toggle = document.getElementById('language-toggle');
+        const backLabel = document.getElementById('back-label');
+        const pages = [...document.querySelectorAll('[data-page-lang]')];
+
+        const applyLanguage = (language) => {
+          const next = language === 'zh' ? 'zh' : 'en';
+          localStorage.setItem(storageKey, next);
+          document.documentElement.lang = next === 'zh' ? 'zh-CN' : 'en';
+          document.title = next === 'zh' ? 'Handbook Studio 使用说明' : 'Handbook Studio Instructions';
+          pages.forEach((page) => {
+            page.hidden = page.dataset.pageLang !== next;
+          });
+          toggle.textContent = next === 'zh' ? 'EN' : '中文';
+          toggle.setAttribute('aria-label', next === 'zh' ? '切换为英文' : 'Switch to Chinese');
+          backLabel.textContent = next === 'zh' ? '返回 Studio' : 'Back to Studio';
+        };
+
+        let language = localStorage.getItem(storageKey) === 'zh' ? 'zh' : 'en';
+        applyLanguage(language);
+        toggle.addEventListener('click', () => {
+          language = language === 'en' ? 'zh' : 'en';
+          applyLanguage(language);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -1,10 +1,6 @@
 # OpenTelemetry runtime, provider, and metrics foundations  `stage-20.2`
 
-This stage is the observability foundation that comes up during startup and then remains active as cross-cutting infrastructure for the rest of the process. It turns user TOML into safe runtime telemetry settings, installs the global OpenTelemetry providers, and exposes the APIs and conventions other crates use to emit traces, logs, and metrics.
-
-Configuration begins in core/src/config/otel.rs and otel/src/config.rs, which sanitize exporter settings, validate span attributes, and prefer warnings over aborting startup for malformed metadata. core/src/otel_init.rs bridges those resolved settings into otel/src/provider.rs, where tracing, logging, and metrics providers are constructed, exporters selected, resources attached, globals installed, and shutdown behavior defined. otel/src/otlp.rs supplies the shared HTTP/TLS transport pieces those exporters need.
-
-The metrics subsystem is built from metrics/config.rs, client.rs, validation.rs, error.rs, names.rs, tags.rs, timer.rs, process.rs, runtime_metrics.rs, and mod.rs: together they validate names and tags, define canonical metric schemas, manage the global client, record counters and durations, emit one-time startup metrics, and summarize runtime snapshots. trace_context.rs handles W3C propagation. events/shared.rs standardizes session event emission. targets.rs classifies trace-vs-log targets, while the codex-client and codex-api telemetry traits let transport layers report request-attempt telemetry into this infrastructure.
+This stage is shared behind-the-scenes support, used mostly during startup and then throughout the main work loop. It sets up observability: traces, metrics, and logs that help operators see what the program is doing. The core OpenTelemetry config cleans user settings, adds safe defaults, and rejects bad trace labels. The init code then turns those settings into a running setup. The otel crate config decides whether telemetry is enabled and where it goes, while its lib file exposes the pieces. The provider builds the real exporters, filters, global hooks, and shutdown path. The OTLP transport prepares HTTP or gRPC clients, certificates, headers, and timeouts. Targets decide which events may become logs or traces, and trace context carries a work ID across services. Metrics files define errors, names, config, safe tags, validation, the shared client, timers, one-time process-start reporting, and readable runtime summaries. Event helpers add consistent details like time, version, model, and session. Finally, Codex client and API telemetry hooks measure request attempts, retries, streaming, and WebSocket activity without mixing that reporting code into the networking logic.
 
 ## Files in this stage
 
@@ -13,13 +9,15 @@ These files sanitize user-facing OTEL settings and translate them into the concr
 
 ### `core/src/config/otel.rs`
 
-`config` · `startup/config load`
+`config` · `config load and startup`
 
-This module is a small config-normalization layer for OTEL settings. Its top-level `resolve_config` function converts `OtelConfigToml` into the runtime `OtelConfig`, filling defaults for `log_user_prompt`, `environment`, exporter kinds, and metrics exporter, while treating trace metadata specially because OTEL provider initialization installs process-global state.
+OpenTelemetry is a standard way for software to report logs, traces, and metrics so operators can understand what the program is doing. This file sits between the raw configuration a user can edit and the stricter runtime setup code that installs OpenTelemetry for the whole process. That matters because a small typo in tracing metadata should not stop the program from starting.
 
-The key design choice is that invalid span attributes or tracestate entries do not abort startup. `resolve_span_attributes` iterates each configured key/value pair, validates each singleton attribute map with `codex_otel::validate_span_attributes`, and drops only the invalid entries while recording a warning. `resolve_tracestate_member_fields` performs similar per-field filtering for each tracestate member, and `resolve_tracestate` then validates both each member and the final combined tracestate map. If the combined tracestate is invalid even after per-entry filtering, the entire tracestate is discarded and replaced with an empty map.
+The main flow starts with `resolve_config`. It reads optional settings from the TOML config, chooses safe defaults when settings are missing, and builds an `OtelConfig` value for the rest of the system. Some fields are simple switches, such as whether to log the user prompt. Others choose where logs, traces, or metrics should be exported.
 
-Warnings are centralized through `push_invalid_config_warning`, which logs via `tracing::warn!` and appends a human-readable message to the mutable `startup_warnings` vector supplied by the caller. This makes OTEL config resilient: malformed metadata is surfaced to the user but cannot poison global telemetry initialization.
+The careful part is validation. User-provided span attributes and tracestate entries are checked before they reach OpenTelemetry initialization. A span attribute is extra label data attached to a trace span. A tracestate is standardized trace-routing metadata passed between services. Think of this file as a customs checkpoint: valid items pass through, invalid ones are left behind with a warning.
+
+Instead of failing startup, invalid pieces are ignored. The warning is both written to the log and saved in the startup warnings list, so the user can be told what was wrong.
 
 #### Function details
 
@@ -32,11 +30,11 @@ fn resolve_config(
 ) -> OtelConfig
 ```
 
-**Purpose**: Builds the runtime OTEL config from TOML, applying defaults and sanitizing user-provided trace metadata.
+**Purpose**: Builds the final OpenTelemetry configuration from the user-editable TOML settings. It chooses defaults for missing values and makes sure user-provided trace metadata is safe before the global telemetry system is initialized.
 
-**Data flow**: It reads fields from `OtelConfigToml`, defaulting `log_user_prompt`, `environment`, `exporter`, `trace_exporter`, and `metrics_exporter`, then calls `resolve_span_attributes` and `resolve_tracestate` with the mutable warning vector. It returns a populated `OtelConfig`.
+**Data flow**: It receives an `OtelConfigToml` object and a mutable list of startup warnings. It reads each optional setting, substitutes defaults where needed, sends span attributes and tracestate data through validation helpers, and returns an `OtelConfig` containing only the settings the program should actually use. The warning list may gain messages about ignored invalid config.
 
-**Call relations**: The main config loader calls this near the end of `Config::load_config_with_layer_stack` so telemetry config is ready for provider initialization.
+**Call relations**: This is called during the broader configuration load by `load_config_with_layer_stack`. As part of building the final config, it asks `resolve_span_attributes` and `resolve_tracestate` to clean the user-supplied tracing metadata before handing the finished `OtelConfig` back to startup code.
 
 *Call graph*: calls 2 internal fn (resolve_span_attributes, resolve_tracestate); called by 1 (load_config_with_layer_stack).
 
@@ -50,11 +48,11 @@ fn resolve_span_attributes(
 ) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Filters configured OTEL span attributes down to only those that pass validation.
+**Purpose**: Filters the user’s OpenTelemetry span attributes so only valid labels are kept. This prevents malformed labels from breaking telemetry initialization.
 
-**Data flow**: It takes an optional `BTreeMap<String, String>` and mutable warnings. `None` returns an empty map. Otherwise it validates each single-entry attribute map with `codex_otel::validate_span_attributes`; valid entries are inserted into a new map, invalid ones trigger `push_invalid_config_warning` and are skipped.
+**Data flow**: It receives an optional map of span attribute names to values and the startup warning list. If no attributes were configured, it returns an empty map. If attributes exist, it checks each key-value pair with the OpenTelemetry validation code, keeps the valid pairs, and records a warning for each invalid one. The result is a cleaned map of attributes.
 
-**Call relations**: This helper is called only by `resolve_config`.
+**Call relations**: It is called by `resolve_config` while building the final telemetry settings. When it finds bad input, it delegates warning creation to `push_invalid_config_warning`; otherwise, valid attributes flow back into the returned `OtelConfig`.
 
 *Call graph*: calls 1 internal fn (push_invalid_config_warning); called by 1 (resolve_config); 3 external calls (from, new, validate_span_attributes).
 
@@ -68,11 +66,11 @@ fn resolve_tracestate(
 ) -> BTreeMap<String, BTreeMap<String, String>>
 ```
 
-**Purpose**: Filters and validates the configured OTEL tracestate structure at both member and whole-header levels.
+**Purpose**: Cleans and validates the configured tracestate, which is trace metadata shared across systems using the W3C tracing standard. It protects startup from bad tracestate settings by dropping invalid parts and warning the user.
 
-**Data flow**: It takes an optional nested `BTreeMap` and mutable warnings. `None` returns an empty map. Otherwise it iterates each member, filters its fields through `resolve_tracestate_member_fields`, skips empty members, validates each remaining member with `validate_tracestate_member`, inserts valid members into a new map, then validates the combined map with `validate_tracestate_entries`. If the combined validation fails, it warns and returns an empty map.
+**Data flow**: It receives an optional nested map: each tracestate member has a member key and a set of field key-value pairs. If none is configured, it returns an empty map. For each member, it first cleans that member’s fields, skips members left with no valid fields, validates each remaining member, then validates the combined tracestate as a whole. If the combined result is invalid, it warns and returns an empty map; otherwise it returns the cleaned tracestate.
 
-**Call relations**: This helper is called only by `resolve_config` and encapsulates the stricter multi-stage tracestate validation logic.
+**Call relations**: It is called by `resolve_config` as part of preparing final OpenTelemetry settings. It relies on `resolve_tracestate_member_fields` to clean each member’s inner fields, and uses `push_invalid_config_warning` whenever a member or the final combined tracestate cannot be accepted.
 
 *Call graph*: calls 2 internal fn (push_invalid_config_warning, resolve_tracestate_member_fields); called by 1 (resolve_config); 3 external calls (new, validate_tracestate_entries, validate_tracestate_member).
 
@@ -87,11 +85,11 @@ fn resolve_tracestate_member_fields(
 ) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Filters a single tracestate member’s fields down to those that are individually valid for that member key.
+**Purpose**: Checks the individual fields inside one tracestate member and keeps only the valid ones. This lets one bad field be ignored without automatically throwing away the whole member.
 
-**Data flow**: It iterates the provided field map, validates each singleton field map with `validate_tracestate_member(member_key, &field)`, inserts valid fields into a new map, and warns-and-skips invalid ones.
+**Data flow**: It receives the tracestate member key, that member’s field map, and the startup warning list. It tests each field by temporarily validating it as part of that member. Valid fields are copied into a new map; invalid fields are skipped and produce warning messages. It returns the cleaned field map for that member.
 
-**Call relations**: It is used by `resolve_tracestate` before whole-member and whole-tracestate validation.
+**Call relations**: It is called by `resolve_tracestate` while walking through each configured tracestate member. When it detects an invalid field, it calls `push_invalid_config_warning`; the cleaned fields are then passed back so `resolve_tracestate` can decide whether the member and the whole tracestate are valid.
 
 *Call graph*: calls 1 internal fn (push_invalid_config_warning); called by 1 (resolve_tracestate); 3 external calls (from, new, validate_tracestate_member).
 
@@ -106,22 +104,26 @@ fn push_invalid_config_warning(
 )
 ```
 
-**Purpose**: Records a standardized warning message for invalid OTEL config and emits it to tracing logs.
+**Purpose**: Creates a clear warning message for invalid OpenTelemetry configuration and records it in two places. It logs the warning immediately and also stores it so startup reporting can show it later.
 
-**Data flow**: It formats `Ignoring invalid `{config_key}` config: {err}`, logs that message with `tracing::warn!`, and pushes the same string into the mutable `startup_warnings` vector.
+**Data flow**: It receives the config key that was invalid, the validation error, and the startup warning list. It formats those into a message like “Ignoring invalid `...` config: ...”, writes that message through the tracing log system, and appends the same text to the warning list. It does not return a value; its effect is the recorded warning.
 
-**Call relations**: All OTEL validation helpers delegate warning emission here so startup diagnostics are consistent.
+**Call relations**: This helper is used by all validation paths in this file: span attributes, tracestate members, tracestate fields, and the final combined tracestate. It keeps warning behavior consistent, so each caller can focus on deciding what is invalid while this function handles how the user is told.
 
 *Call graph*: called by 3 (resolve_span_attributes, resolve_tracestate, resolve_tracestate_member_fields); 2 external calls (format!, warn!).
 
 
 ### `core/src/otel_init.rs`
 
-`orchestration` · `startup`
+`orchestration` · `startup and telemetry setup`
 
-This file converts `crate::config::Config` into a `codex_otel::OtelSettings` value and asks `OtelProvider::from` to construct the actual telemetry provider. The main work is in `build_provider`, which translates `codex_config::types::OtelExporterKind` variants into `codex_otel::OtelExporter` variants, including protocol conversion from `OtelHttpProtocol` config enums and cloning endpoint/header/TLS certificate material into the OTEL runtime types. It computes three exporters separately: a general exporter, a trace exporter, and a metrics exporter; metrics are forcibly disabled by returning `OtelExporter::None` when `analytics_enabled` resolves false, even if a metrics exporter is configured. The function also derives the service name from either an explicit override or the login-originator identity, and enables runtime metrics only when the `Feature::RuntimeMetrics` feature flag is on.
+This file is the bridge between Codex's own configuration format and the telemetry library that actually records and exports data. Without it, the app might still run, but it would not know where to send monitoring data, which signals to send, or whether telemetry should be disabled.
 
-The remaining helpers are intentionally defensive: both `record_process_start` and `install_sqlite_telemetry` first extract the metrics handle from an optional provider and become no-ops when metrics are unavailable. `codex_export_filter` is a narrow tracing predicate that only allows events whose target begins with `codex_otel`, preventing unrelated tracing events from being exported through this path.
+The main job is to read the user's config and build an OtelProvider, which is the object other parts of the app use to produce telemetry. It translates config choices like "send nothing," "send to Statsig," "send over OTLP HTTP," or "send over OTLP gRPC" into the matching telemetry exporter. OTLP means OpenTelemetry Protocol, a standard way to send telemetry data. For HTTP exporters, it also converts the selected body format, either JSON text or binary data.
+
+The file also respects privacy and feature choices. Metrics are only enabled if analytics are allowed, and runtime metrics are only enabled when the matching feature flag is on. It sets a service name, version, environment, span attributes, and trace state so exported data can be identified later.
+
+Finally, it contains small helper functions that record process-start metrics and connect SQLite database telemetry. These helpers quietly do nothing when telemetry metrics are unavailable, which keeps the rest of the app from needing repeated safety checks.
 
 #### Function details
 
@@ -136,11 +138,11 @@ fn build_provider(
 ) -> Result<Option<OtelProvider>, Box<dyn Error>>
 ```
 
-**Purpose**: Constructs an `Option<OtelProvider>` from application config, translating exporter, protocol, TLS, feature-flag, and service identity settings into `codex_otel::OtelSettings`. It also enforces the product rule that metrics export is disabled when analytics are off.
+**Purpose**: This function builds the app's OpenTelemetry provider from the main configuration. It decides whether telemetry is off, where telemetry should be sent, what service name to use, and whether metrics are allowed.
 
-**Data flow**: Inputs are `&Config`, `service_version`, optional `service_name_override`, and a `default_analytics_enabled` fallback. It reads `config.otel.*`, `config.analytics_enabled`, `config.features`, and `config.codex_home`; maps config exporter enums into `OtelExporter` values by cloning endpoints, headers, and TLS certificate paths/bytes; derives the service name from the override or `originator().value`; then packages everything into `OtelSettings` and passes that to `OtelProvider::from`. It returns either `Ok(Some(provider))`, `Ok(None)` if OTEL is disabled by the provider constructor, or an error boxed as `Box<dyn Error>`.
+**Data flow**: It receives the app config, the service version, an optional replacement service name, and the default analytics setting. It reads the telemetry exporter settings, trace exporter settings, metric exporter settings, TLS certificate settings, feature flags, home directory, environment, span attributes, and trace state. It converts those config values into OtelSettings and asks the telemetry library to create an OtelProvider. The result is either a ready-to-use provider, no provider when exporting is disabled, or an error if setup fails.
 
-**Call relations**: This is invoked during application/server initialization paths and OTEL-focused tests. Those callers use it before the main runtime begins so later startup code can record process metrics and install DB telemetry. Internally it delegates only to the login-originator helper for default naming and to `OtelProvider::from` for the actual provider creation.
+**Call relations**: Startup paths such as initialize, run_main_with_transport_options, and run_main call this when the program is preparing telemetry. Tests also call it to check default analytics behavior and provider construction. Inside, it asks originator for the default service identity, then hands the completed settings to OtelProvider::from, which performs the actual provider creation.
 
 *Call graph*: calls 2 internal fn (originator, from); called by 6 (initialize, run_main_with_transport_options, app_server_default_analytics_disabled_without_flag, app_server_default_analytics_enabled_with_flag, run_main, mcp_server_builds_otel_provider_with_logs_traces_and_metrics).
 
@@ -151,11 +153,11 @@ fn build_provider(
 fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool
 ```
 
-**Purpose**: Implements a tracing metadata predicate that keeps only Codex-owned OTEL events. It is a simple target-prefix filter rather than a broader severity or module tree policy.
+**Purpose**: This function answers a simple question: should this tracing event be exported through Codex's OpenTelemetry path? It keeps only events whose source name starts with codex_otel, so unrelated internal events are not sent through this filter.
 
-**Data flow**: It takes `&tracing::Metadata<'_>`, reads `meta.target()`, checks whether the target string starts with `"codex_otel"`, and returns that boolean. It does not mutate any state or emit side effects.
+**Data flow**: It receives tracing metadata, which is descriptive information attached to a log or tracing event. It reads the event target, meaning the named source of the event, and checks whether that target begins with codex_otel. It returns true for matching events and false for everything else.
 
-**Call relations**: This function is used wherever a tracing subscriber or exporter needs a filter callback for OTEL-bound events. It does not delegate beyond reading the metadata target.
+**Call relations**: This is meant to be used as a filter when telemetry exporting is installed. It calls the metadata target accessor to inspect the event source, then returns the yes-or-no decision to the tracing system.
 
 *Call graph*: 1 external calls (target).
 
@@ -166,11 +168,11 @@ fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool
 fn record_process_start(otel: Option<&OtelProvider>, originator: &str)
 ```
 
-**Purpose**: Records a one-time process-start metric when a metrics-capable OTEL provider is available. It intentionally exits silently when telemetry is absent or metrics export is disabled.
+**Purpose**: This function records a one-time metric saying that the process has started. It is safe to call even when telemetry is disabled, because it simply returns without doing anything if metrics are unavailable.
 
-**Data flow**: Inputs are `Option<&OtelProvider>` and an `originator` string. It reads the provider's metrics handle via `OtelProvider::metrics`; if absent it returns immediately, otherwise it passes the metrics handle and originator to `codex_otel::record_process_start_once` and ignores that call's result.
+**Data flow**: It receives an optional telemetry provider and an originator string that identifies which Codex-originated program or mode is starting. It tries to get the metrics component from the provider. If metrics exist, it asks the telemetry library to record the process-start metric once. If there is no provider or no metrics support, nothing changes.
 
-**Call relations**: Startup entrypoints call this after OTEL initialization so process lifecycle metrics are emitted early. Its only downstream work is the external one-shot recorder, which encapsulates deduplication and metric emission.
+**Call relations**: Main startup flows such as run_main_with_transport_options and run_main call this after telemetry has been built. It hands the actual recording work to codex_otel::record_process_start_once so this file stays focused on wiring startup telemetry together.
 
 *Call graph*: called by 3 (run_main_with_transport_options, run_main, run_main); 1 external calls (record_process_start_once).
 
@@ -181,11 +183,11 @@ fn record_process_start(otel: Option<&OtelProvider>, originator: &str)
 fn install_sqlite_telemetry(otel: Option<&OtelProvider>, originator: &str)
 ```
 
-**Purpose**: Installs a SQLite/process DB telemetry recorder backed by the OTEL metrics pipeline. Like the process-start helper, it is a no-op when metrics are unavailable.
+**Purpose**: This function connects SQLite database activity to the app's telemetry metrics. SQLite is the embedded database used by the app, and this hook lets database behavior be reported through the same monitoring pipeline.
 
-**Data flow**: It accepts `Option<&OtelProvider>` and an `originator` string, extracts the metrics handle if present, clones that handle into `codex_rollout::sqlite_telemetry_recorder`, then passes the resulting recorder into `codex_state::install_process_db_telemetry`. It returns `()` and discards installation errors.
+**Data flow**: It receives an optional telemetry provider and an originator string. It looks for the provider's metrics component. If metrics are present, it creates a SQLite telemetry recorder tied to those metrics and the originator, then installs that recorder into the process database layer. If metrics are missing, it exits without changing anything.
 
-**Call relations**: Main startup flows call this after provider creation so later SQLite/state DB activity can emit metrics. It delegates first to rollout code to build the recorder object and then to state-layer installation code to register it process-wide.
+**Call relations**: Startup flows such as run_main_with_transport_options and run_main call this when setting up process-wide telemetry. It asks codex_rollout to build the SQLite telemetry recorder, then passes that recorder to codex_state so the database layer can use it during later database operations.
 
 *Call graph*: called by 3 (run_main_with_transport_options, run_main, run_main); 2 external calls (sqlite_telemetry_recorder, install_process_db_telemetry).
 
@@ -195,11 +197,15 @@ These files define the OTEL crate’s public integration boundary and construct 
 
 ### `otel/src/config.rs`
 
-`config` · `configuration resolution and validation`
+`config` · `config load and telemetry setup`
 
-This configuration module holds both constants and data structures for OTEL setup. At the top are the built-in Statsig OTLP HTTP endpoint and API-key header/value constants. `resolve_exporter` is the main policy function: when given `OtelExporter::Statsig`, it expands that symbolic choice into a concrete `OtelExporter::OtlpHttp` using the built-in endpoint, a one-entry `HashMap` containing the Statsig API key header, JSON protocol, and no TLS configuration. However, in debug builds it intentionally resolves `Statsig` to `OtelExporter::None` so local development and tests do not emit best-effort telemetry unless explicitly configured. Any other exporter variant is cloned through unchanged.
+This file is the configuration vocabulary for the project's OpenTelemetry support. OpenTelemetry is a standard way to collect traces and metrics, which are records of what the program is doing and how it is performing. Without this file, the rest of the telemetry code would not have a shared, clear way to describe exporters, service names, runtime metric choices, extra span labels, or secure connection settings.
 
-`validate_span_attributes` performs the only explicit validation in this file, rejecting any configured span-attribute map whose keys contain the empty string with `io::ErrorKind::InvalidInput`. The rest of the file is mostly data model: `OtelSettings` aggregates resolved runtime settings such as environment, service identity, exporter choices, runtime metrics flag, span attributes, and tracestate; `StatsigMetricsSettings` is a serializable subset intended for recreating built-in metrics exporter configuration in another process; `OtelHttpProtocol` distinguishes binary protobuf vs JSON OTLP/HTTP; `OtelTlsConfig` carries optional certificate/key paths; and `OtelExporter` enumerates `None`, symbolic `Statsig`, and concrete OTLP gRPC/HTTP exporters. The test asserts the debug-build suppression policy for `Statsig`.
+The main idea is simple: other parts of the system ask, “Given these telemetry settings, where should we send data?” The `OtelExporter` enum answers that with choices such as sending nothing, using a built-in Statsig metrics destination, sending over OTLP gRPC, or sending over OTLP HTTP. OTLP means “OpenTelemetry Protocol,” the standard wire format for telemetry data.
+
+A special detail is the built-in Statsig exporter. In release builds it expands into a concrete HTTP exporter with a fixed endpoint, API key header, and JSON protocol. In debug builds, it becomes `None`, like unplugging the phone line during local work, so tests and everyday development do not quietly emit telemetry traffic.
+
+The file also defines `OtelSettings`, the larger bundle of telemetry options, `OtelTlsConfig` for certificate-based secure connections, and a small validation step that rejects empty span attribute keys before they are attached to exported spans.
 
 #### Function details
 
@@ -209,11 +215,11 @@ This configuration module holds both constants and data structures for OTEL setu
 fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter
 ```
 
-**Purpose**: Resolves symbolic exporter choices into concrete exporter settings, with special handling for the built-in Statsig metrics exporter. In debug builds it disables that default entirely.
+**Purpose**: This function turns a high-level exporter choice into the concrete exporter configuration the telemetry system should actually use. Its most important job is resolving the built-in Statsig option, while leaving other exporter choices unchanged.
 
-**Data flow**: Takes `exporter: &OtelExporter` and pattern-matches it. For `OtelExporter::Statsig`, it checks `cfg!(debug_assertions)`; if true it returns `OtelExporter::None`, otherwise it constructs and returns `OtelExporter::OtlpHttp { endpoint: STATSIG_OTLP_HTTP_ENDPOINT.to_string(), headers: HashMap::from([(STATSIG_API_KEY_HEADER.to_string(), STATSIG_API_KEY.to_string())]), protocol: OtelHttpProtocol::Json, tls: None }`. For all other variants it returns `exporter.clone()`.
+**Data flow**: It receives an `OtelExporter` value. If that value is `Statsig`, it checks whether this is a debug build; in debug builds it returns `None`, and in non-debug builds it returns an OTLP HTTP exporter filled with the built-in Statsig endpoint, API key header, JSON protocol, and no custom TLS settings. For any other exporter, it returns a clone of the original choice.
 
-**Call relations**: This resolver is called by exporter-building code such as `build_otlp_metric_exporter`, `build_logger`, `build_tracer_provider`, and configuration conversion logic. It centralizes the only place where the symbolic `Statsig` variant becomes concrete transport settings.
+**Call relations**: Telemetry setup code calls this when building metric exporters, loggers, and tracer providers, and also when converting broader configuration into OpenTelemetry settings. It acts as the translation point between a convenient named option, like `Statsig`, and the lower-level exporter details that the rest of the telemetry pipeline needs.
 
 *Call graph*: called by 4 (build_otlp_metric_exporter, from, build_logger, build_tracer_provider); 3 external calls (from, cfg!, clone).
 
@@ -224,11 +230,11 @@ fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter
 fn validate_span_attributes(attributes: &BTreeMap<String, String>) -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that configured span-attribute keys are non-empty before those attributes are attached to exported spans. It enforces a minimal but important input invariant.
+**Purpose**: This function checks user-configured span attributes before they are used. A span is one recorded unit of work in a trace, and attributes are key-value labels attached to it; this function makes sure none of the label names are empty.
 
-**Data flow**: Consumes `attributes: &BTreeMap<String, String>`, scans `attributes.keys()` for any empty string via `String::is_empty`, and if found returns `Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "configured span attribute key must not be empty"))`; otherwise it returns `Ok(())`.
+**Data flow**: It receives a sorted map of attribute names to attribute values. It looks through the keys, and if any key is an empty string, it returns an input error explaining the problem. If every key has a name, it returns success and does not change the map.
 
-**Call relations**: It is called during configuration construction (`from`) before OTEL settings are accepted. The function is intentionally narrow and leaves all other semantic validation to higher layers or downstream exporters.
+**Call relations**: Configuration conversion code calls this before accepting span attributes into the telemetry settings. It is a small guardrail near the configuration boundary, so invalid labels are rejected early instead of reaching the exporter and causing confusing behavior later.
 
 *Call graph*: called by 1 (from); 1 external calls (new).
 
@@ -239,22 +245,24 @@ fn validate_span_attributes(attributes: &BTreeMap<String, String>) -> std::io::R
 fn statsig_default_metrics_exporter_is_disabled_in_debug_builds()
 ```
 
-**Purpose**: Asserts the debug-build policy that the symbolic Statsig exporter resolves to `None` instead of a live OTLP endpoint. This prevents accidental telemetry emission during local development.
+**Purpose**: This test confirms that the built-in Statsig exporter does not send telemetry during debug builds. It protects the local-development safety behavior from being accidentally changed.
 
-**Data flow**: Calls `resolve_exporter(&OtelExporter::Statsig)` and asserts the returned variant matches `OtelExporter::None`.
+**Data flow**: It creates the `Statsig` exporter choice, passes it through `resolve_exporter`, and checks that the result is `None`. The output is not a value used elsewhere; the test either passes or fails.
 
-**Call relations**: This test directly targets the special-case branch in `resolve_exporter` and documents the intended debug-only behavior.
+**Call relations**: The test exercises `resolve_exporter` directly. It documents and verifies the expectation that debug builds disable the built-in Statsig default, which matters because several telemetry builders rely on `resolve_exporter` when deciding what to activate.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `otel/src/lib.rs`
 
-`orchestration` · `startup and cross-cutting import surface used throughout the process`
+`other` · `cross-cutting`
 
-This crate root wires together the telemetry package's modules and exposes the stable API consumed by the rest of the application. Most of the file is re-exports: exporter/config types, `SessionTelemetry` and its metadata structs, runtime metrics summaries, timers, the metrics API, the `OtelProvider`, trace-context helpers, and the shared `sanitize_metric_tag_value` utility. It also defines two small enums used across telemetry boundaries. `ToolDecisionSource` is a serializable/displayable source label for tool approval decisions. `TelemetryAuthMode` is a reduced auth-mode enum intentionally decoupled from `codex-core`; its `From<codex_app_server_protocol::AuthMode>` implementation collapses several upstream auth variants into either `ApiKey` or `Chatgpt` to avoid a circular dependency while preserving telemetry semantics.
+Telemetry is the project’s way of recording what happened: timings, counters, trace IDs, session facts, and exporter settings. This file acts like a reception desk for that telemetry system. It declares the internal modules, then re-exports the useful public items so other crates can import them from one predictable place.
 
-The two free functions are convenience accessors over global metrics state. `start_global_timer` starts a `Timer` using the globally installed metrics client and returns `ExporterDisabled` if no global client exists. `global_statsig_metrics_settings` exposes the resolved Statsig metrics settings only when the active global exporter is Statsig. Overall, this file is mostly API shaping and dependency-boundary management rather than feature logic.
+It also defines two small shared enums. `ToolDecisionSource` records where a tool-related decision came from, such as a user, configuration, or automated reviewer. `TelemetryAuthMode` is a simplified authentication label used by telemetry. It deliberately maps several detailed app authentication modes into just two telemetry categories, `ApiKey` and `Chatgpt`, so this crate does not need to depend on the deeper core authentication code. That avoids a circular dependency, where two parts of the program would need to build on each other at the same time.
+
+Finally, this file provides convenience functions for global metrics. One starts a timer using the metrics client that has already been installed for the process. The other asks whether the current global metrics exporter is Statsig and, if so, returns its resolved settings. If telemetry is not enabled, timer creation returns an error instead of silently pretending to measure something.
 
 #### Function details
 
@@ -264,11 +272,11 @@ The two free functions are convenience accessors over global metrics state. `sta
 fn from(mode: codex_app_server_protocol::AuthMode) -> Self
 ```
 
-**Purpose**: Converts the broader app-server auth-mode enum into the telemetry crate's reduced two-variant representation. It groups multiple upstream modes into the telemetry categories `ApiKey` and `Chatgpt`.
+**Purpose**: This converts the app server’s detailed authentication modes into the simpler categories used in telemetry. It lets telemetry talk about login style without importing the full core authentication layer.
 
-**Data flow**: Consumes a `codex_app_server_protocol::AuthMode`, pattern-matches it, maps `ApiKey` and `BedrockApiKey` to `TelemetryAuthMode::ApiKey`, maps `Chatgpt`, `ChatgptAuthTokens`, `AgentIdentity`, and `PersonalAccessToken` to `TelemetryAuthMode::Chatgpt`, and returns the chosen enum variant.
+**Data flow**: It receives an `AuthMode` value from the app server protocol. It checks which kind it is, groups API-key-like modes as `ApiKey`, and groups ChatGPT, token, agent identity, and personal access token modes as `Chatgpt`. It returns the matching `TelemetryAuthMode` and does not change anything else.
 
-**Call relations**: This adapter is used when constructing session telemetry so auth mode can be recorded without importing the upstream protocol type everywhere.
+**Call relations**: This is used whenever telemetry needs an authentication label based on the app server protocol’s auth mode. It stands between the detailed protocol type and the telemetry type, keeping the telemetry crate independent from heavier core code.
 
 
 ##### `start_global_timer`  (lines 68–73)
@@ -277,11 +285,11 @@ fn from(mode: codex_app_server_protocol::AuthMode) -> Self
 fn start_global_timer(name: &str, tags: &[(&str, &str)]) -> MetricsResult<Timer>
 ```
 
-**Purpose**: Starts a metrics timer using the globally installed metrics client. It provides a crate-level shortcut for code that does not already hold a `SessionTelemetry` or `MetricsClient`.
+**Purpose**: This starts a named metrics timer using the process-wide metrics client. A caller uses it when they want to measure how long some work takes without manually passing a metrics client around.
 
-**Data flow**: Reads `crate::metrics::global()`. If no global client is installed, returns `Err(MetricsError::ExporterDisabled)`; otherwise forwards `name` and `tags` to `metrics.start_timer` and returns the resulting `Timer`.
+**Data flow**: It receives a timer name and a list of tag key-value pairs, which are extra labels attached to the measurement. It asks the metrics module for the globally installed metrics client. If there is no global client, it returns an `ExporterDisabled` error; otherwise, it asks that client to start the timer and returns the resulting `Timer`.
 
-**Call relations**: It is a convenience wrapper over the global metrics singleton, used by callers that want scoped timing without threading a metrics client through their APIs.
+**Call relations**: This function is a convenience wrapper around the metrics system’s `global` lookup. Callers come here when they want timing to be tied to the already configured global telemetry setup, and this function hands the actual timer creation to the global metrics client.
 
 *Call graph*: calls 1 internal fn (global).
 
@@ -292,24 +300,24 @@ fn start_global_timer(name: &str, tags: &[(&str, &str)]) -> MetricsResult<Timer>
 fn global_statsig_metrics_settings() -> Option<StatsigMetricsSettings>
 ```
 
-**Purpose**: Returns the globally installed Statsig metrics settings when the active metrics exporter is Statsig. It exposes resolved exporter-specific configuration to external callers.
+**Purpose**: This reports the active Statsig metrics settings, but only when the global metrics exporter is actually Statsig. It gives callers a safe way to inspect the resolved Statsig configuration without assuming that Statsig is in use.
 
-**Data flow**: Calls `crate::metrics::global_statsig_settings()` and returns its `Option<StatsigMetricsSettings>` unchanged.
+**Data flow**: It takes no input. It asks the metrics module for the global Statsig settings. If the current global metrics setup uses Statsig, it returns those settings; otherwise, it returns nothing.
 
-**Call relations**: This is the public accessor layered over the internal global settings store in `metrics/mod.rs`.
+**Call relations**: This function is a small public shortcut to `global_statsig_settings`. Callers use it after telemetry has been configured, and it delegates the real check to the metrics module that knows which exporter is active.
 
 *Call graph*: calls 1 internal fn (global_statsig_settings).
 
 
 ### `otel/src/provider.rs`
 
-`orchestration` · `startup, global telemetry installation, and teardown`
+`orchestration` · `startup, cross-cutting telemetry export, and teardown`
 
-This file is the top-level OTEL orchestration layer. `OtelProvider` bundles optional logger, tracer provider, tracer, and metrics client handles so the rest of the application can install subscriber layers and later flush/shutdown exporters. The central `OtelProvider::from` method interprets `OtelSettings`, resolves exporter aliases, validates trace-related configuration before mutating any process-global state, and short-circuits to `Ok(None)` when logs, traces, and metrics are all disabled. When enabled, it builds metrics via `MetricsConfig::otlp`, optionally enabling runtime metrics, creates separate `Resource` values for logs and traces, constructs the logger and tracer provider, derives a named tracer, installs configured tracestate globally, and registers global tracer/propagator and metrics handles.
+OpenTelemetry is a standard way for software to report what it is doing: logs for events, traces for request journeys, and metrics for counts and timings. This file acts like the control panel for that reporting. Given the user's telemetry settings, it decides which parts are enabled, validates sensitive trace-related metadata before changing any process-wide state, builds the right exporters, and installs global hooks so the rest of the program can record telemetry without knowing where it will be sent.
 
-Resource construction is intentionally split: `make_resource` always includes service name, service version, and environment, but `resource_attributes` only adds `host.name` for log resources and only when a trimmed hostname is non-empty. Trace providers can also attach configured span attributes through `SpanAttributesProcessor`, which injects each configured key/value pair in `on_start` and otherwise acts as a no-op processor.
+The main type, OtelProvider, holds the live logger provider, tracer provider, tracer, and metrics client. If nothing is enabled, it clears trace-state settings and returns no provider. If telemetry is enabled, it creates resources that label the service with its name, version, environment, and, for logs, the host name. It then builds log and trace exporters for OTLP, the OpenTelemetry wire protocol, over either gRPC or HTTP. Metrics are built through the project's MetricsClient.
 
-Exporter setup is protocol-aware. `build_logger` and `build_tracer_provider` branch across `None`, OTLP gRPC, and OTLP HTTP, wiring headers, TLS, protocol selection, and either blocking or async HTTP clients. Trace HTTP export has an extra runtime-sensitive path: on a multi-thread Tokio runtime it uses `build_async_http_client` and `TokioBatchSpanProcessor`; otherwise it falls back to blocking HTTP plus the standard batch processor. Both explicit `shutdown` and `Drop` flush and shut down tracer, metrics, and logger in that order, making cleanup best-effort and idempotent from the caller’s perspective.
+The file also protects against accidental data leakage. Log export and trace export use separate filters, so only approved tracing targets go into traces. Finally, it flushes and shuts down telemetry clients both when asked explicitly and when the provider is dropped, so queued telemetry is not silently lost at exit.
 
 #### Function details
 
@@ -319,11 +327,11 @@ Exporter setup is protocol-aware. `build_logger` and `build_tracer_provider` bra
 fn shutdown(&self)
 ```
 
-**Purpose**: Flushes and shuts down any active tracer provider, metrics client, and logger provider owned by the `OtelProvider`. It ignores individual shutdown errors so teardown remains best-effort.
+**Purpose**: Flushes and closes any telemetry pieces owned by the provider. This is used when the program wants to end cleanly and give queued logs, traces, and metrics a chance to be sent.
 
-**Data flow**: Reads `self.tracer_provider`, `self.metrics`, and `self.logger` → if present, calls tracer `force_flush()` then `shutdown()`, metrics `shutdown()`, and logger `shutdown()` → discards all returned errors and returns `()`.
+**Data flow**: It reads the provider's optional tracer, metrics, and logger fields. For each one that exists, it asks it to flush or shut down, ignoring individual shutdown errors. Nothing is returned; the main change is that the telemetry backends are told to finish their work.
 
-**Call relations**: Callers use this for explicit teardown before process exit. Its logic mirrors the `Drop` implementation so cleanup happens whether shutdown is invoked manually or implicitly.
+**Call relations**: This is the explicit cleanup path for the objects created by OtelProvider::from. It mirrors the automatic cleanup in OtelProvider::drop, so callers can choose to shut telemetry down at a known point instead of waiting for Rust to drop the provider.
 
 
 ##### `OtelProvider::from`  (lines 77–154)
@@ -332,11 +340,11 @@ fn shutdown(&self)
 fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>>
 ```
 
-**Purpose**: Builds an `OtelProvider` from configuration, including metrics, log exporter, trace exporter, global propagator state, and optional Statsig metrics settings. It is the main entry point for enabling telemetry in the process.
+**Purpose**: Creates an OtelProvider from the program's telemetry settings. It decides whether logs, traces, and metrics are enabled, builds the needed clients, and installs global OpenTelemetry state used by the rest of the process.
 
-**Data flow**: Consumes `&OtelSettings` → computes whether logs, traces, and metrics are enabled by resolving exporter settings → if all disabled, clears global tracestate entries and returns `Ok(None)` → otherwise validates configured span attributes when traces are enabled and validates tracestate entries unconditionally → optionally builds a `MetricsClient` from `MetricsConfig::otlp`, adding a runtime reader when requested → builds log and trace `Resource`s via `make_resource` → conditionally builds logger and tracer provider, derives a tracer from the provider, installs tracestate entries globally, installs the global tracer provider and `TraceContextPropagator` when tracing is enabled, installs global metrics and optional Statsig settings when metrics are enabled → returns `Ok(Some(OtelProvider { ... }))` or the first setup error.
+**Data flow**: It takes OtelSettings as input. It reads exporter choices, service identity, environment, span attributes, trace-state entries, and runtime metrics settings. If all telemetry is disabled, it clears configured trace-state entries and returns None. Otherwise it validates trace metadata, builds metrics if requested, creates log and trace resources, builds logger and tracer providers, installs global tracing and metrics hooks when present, and returns a populated OtelProvider.
 
-**Call relations**: Higher-level provider/bootstrap code and integration tests call this to initialize telemetry. It delegates concrete resource creation to `make_resource`, exporter construction to `build_logger` and `build_tracer_provider`, metrics creation to `MetricsClient::new`, and global state updates to the metrics and trace-context modules.
+**Call relations**: Higher-level setup code such as build_provider and test flows call this when they need telemetry. Inside, it hands off to make_resource for service labels, build_logger for log export, build_tracer_provider for trace export, MetricsClient::new for metrics, and trace-context helpers for global trace-state propagation.
 
 *Call graph*: calls 9 internal fn (resolve_exporter, validate_span_attributes, new, otlp, install_global, install_global_statsig_settings, make_resource, set_tracestate_entries, validate_tracestate_entries); called by 6 (build_provider, otel_provider_rejects_header_unsafe_configured_tracestate, otlp_http_exporter_sends_logs_to_collector, otlp_http_exporter_sends_traces_to_collector, otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime, build_wfp_metrics_provider); 6 external calls (new, new, debug!, set_text_map_propagator, set_tracer_provider, matches!).
 
@@ -347,11 +355,11 @@ fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>>
 fn logger_layer(&self) -> Option<impl Layer<S> + Send + Sync>
 ```
 
-**Purpose**: Builds a tracing-subscriber layer that forwards tracing events into the OTEL logger provider. The layer is only returned when logging is enabled.
+**Purpose**: Creates a tracing-subscriber layer that forwards approved Rust tracing events as OpenTelemetry logs. A layer is like an add-on plugged into the logging system.
 
-**Data flow**: Reads `self.logger` → if present, wraps it in `OpenTelemetryTracingBridge::new(logger)` and applies a filter function using `OtelProvider::log_export_filter` → returns `Some(layer)`; otherwise returns `None`.
+**Data flow**: It reads the provider's logger field. If there is no logger, it returns None. If a logger exists, it wraps it in an OpenTelemetry bridge and attaches a filter so only log-safe targets are exported.
 
-**Call relations**: Subscriber setup code calls this after `OtelProvider::from` to attach OTEL log export to the tracing registry. It depends on `log_export_filter` to exclude targets that should not be exported as logs.
+**Call relations**: This is used after OtelProvider::from has built a logger provider. It relies on OtelProvider::log_export_filter to decide which events should leave the process as logs.
 
 
 ##### `OtelProvider::tracing_layer`  (lines 167–178)
@@ -360,11 +368,11 @@ fn logger_layer(&self) -> Option<impl Layer<S> + Send + Sync>
 fn tracing_layer(&self) -> Option<impl Layer<S> + Send + Sync>
 ```
 
-**Purpose**: Builds a tracing-subscriber layer that exports tracing spans through the configured OTEL tracer. The layer is only returned when tracing is enabled.
+**Purpose**: Creates a tracing-subscriber layer that forwards approved spans and events as OpenTelemetry traces. A trace records how work moves through the program over time.
 
-**Data flow**: Reads `self.tracer` → if present, creates `tracing_opentelemetry::layer()`, clones the tracer into it, and applies a filter function using `OtelProvider::trace_export_filter` → returns `Some(layer)`; otherwise `None`.
+**Data flow**: It reads the provider's tracer field. If there is no tracer, it returns None. If a tracer exists, it builds a tracing-opentelemetry layer with that tracer and attaches a filter that allows spans and trace-safe targets.
 
-**Call relations**: Subscriber setup code uses this alongside `logger_layer` to export spans. It relies on `trace_export_filter` so only spans and explicitly trace-safe event targets are sent to tracing exporters.
+**Call relations**: This is used by logging/tracing setup after OtelProvider::from has created a tracer. It depends on OtelProvider::trace_export_filter to keep trace export limited to safe data.
 
 
 ##### `OtelProvider::codex_export_filter`  (lines 180–182)
@@ -373,11 +381,11 @@ fn tracing_layer(&self) -> Option<impl Layer<S> + Send + Sync>
 fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool
 ```
 
-**Purpose**: Provides a compatibility alias for the log export filter. It currently forwards directly to `log_export_filter`.
+**Purpose**: Provides a compatibility filter for deciding whether a tracing event should be exported as a Codex/OpenTelemetry log. It simply follows the same rule as the normal log export filter.
 
-**Data flow**: Accepts tracing metadata → passes it unchanged to `Self::log_export_filter` → returns that boolean result.
+**Data flow**: It receives tracing metadata, which includes details like the event's target. It passes that metadata to the log export filter and returns the resulting true-or-false decision.
 
-**Call relations**: This function exists as a thin wrapper for callers that refer to a codex-specific export filter name. It delegates all actual filtering logic to `log_export_filter`.
+**Call relations**: This is a small wrapper around OtelProvider::log_export_filter. It exists so other parts of the system can use a named Codex export filter while sharing the same underlying log decision.
 
 *Call graph*: 1 external calls (log_export_filter).
 
@@ -388,11 +396,11 @@ fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool
 fn log_export_filter(meta: &tracing::Metadata<'_>) -> bool
 ```
 
-**Purpose**: Determines whether a tracing event target should be exported as a log. It accepts only OTEL-prefixed targets that are not marked trace-safe.
+**Purpose**: Decides whether a tracing event is allowed to be exported as a log. This helps avoid sending trace-only or sensitive targets through the log exporter.
 
-**Data flow**: Reads `meta.target()` from tracing metadata → passes the target string to `is_log_export_target` → returns the resulting boolean.
+**Data flow**: It receives tracing metadata, reads the target name from it, and asks is_log_export_target whether that target is log-safe. It returns true for export and false for exclusion.
 
-**Call relations**: Used by `logger_layer` and indirectly by `codex_export_filter`. It delegates target-prefix policy to `targets.rs` so filtering rules stay centralized.
+**Call relations**: OtelProvider::logger_layer uses this as the gate in front of the OpenTelemetry log bridge. OtelProvider::codex_export_filter also delegates to it.
 
 *Call graph*: calls 1 internal fn (is_log_export_target); 1 external calls (target).
 
@@ -403,11 +411,11 @@ fn log_export_filter(meta: &tracing::Metadata<'_>) -> bool
 fn trace_export_filter(meta: &tracing::Metadata<'_>) -> bool
 ```
 
-**Purpose**: Determines whether tracing metadata should be exported through the trace pipeline. All spans are allowed, and non-span events are allowed only for trace-safe targets.
+**Purpose**: Decides whether tracing metadata is allowed into exported traces. It always allows spans themselves, and only allows events from targets marked as trace-safe.
 
-**Data flow**: Reads `meta.is_span()` and `meta.target()` → returns `true` if the metadata describes a span or if `is_trace_safe_target(meta.target())` is true; otherwise returns `false`.
+**Data flow**: It receives tracing metadata. It checks whether the metadata represents a span; if so, it allows it. Otherwise it reads the target name and asks is_trace_safe_target whether that event is safe for trace export. It returns a true-or-false decision.
 
-**Call relations**: This filter is attached by `tracing_layer`. It combines tracing’s intrinsic span classification with the target-prefix policy from `targets.rs`.
+**Call relations**: OtelProvider::tracing_layer installs this filter on the trace export path. It uses the target rules from the targets module to reduce the chance that unsafe log events are attached to traces.
 
 *Call graph*: calls 1 internal fn (is_trace_safe_target); 2 external calls (is_span, target).
 
@@ -418,11 +426,11 @@ fn trace_export_filter(meta: &tracing::Metadata<'_>) -> bool
 fn metrics(&self) -> Option<&MetricsClient>
 ```
 
-**Purpose**: Exposes the optional metrics client owned by the provider. It lets callers access metrics only when metrics export was configured.
+**Purpose**: Gives callers access to the metrics client if metrics were enabled. This lets other parts of the system record measurements without owning the provider internals.
 
-**Data flow**: Reads `self.metrics` and returns `self.metrics.as_ref()`, yielding `Option<&MetricsClient>`.
+**Data flow**: It reads the provider's optional metrics field and returns a borrowed reference when one exists. It does not create, change, or shut down anything.
 
-**Call relations**: Higher-level code that wants to emit metrics through the provider calls this accessor. It is a simple read-only view over state initialized by `OtelProvider::from`.
+**Call relations**: The with_provider_metrics flow calls this when it wants to use the provider's metrics client. The client itself is created earlier by OtelProvider::from.
 
 *Call graph*: called by 1 (with_provider_metrics).
 
@@ -433,11 +441,11 @@ fn metrics(&self) -> Option<&MetricsClient>
 fn drop(&mut self)
 ```
 
-**Purpose**: Performs best-effort flush and shutdown of telemetry components when the provider is dropped. It mirrors explicit shutdown so resources are cleaned up even without a manual call.
+**Purpose**: Automatically flushes and shuts down telemetry when the OtelProvider is destroyed. This is a safety net so telemetry clients are not left running or holding unsent data.
 
-**Data flow**: On drop, reads the optional tracer provider, metrics client, and logger provider → calls tracer `force_flush()` and `shutdown()`, metrics `shutdown()`, and logger `shutdown()` if present → ignores all errors.
+**Data flow**: When Rust drops the provider, this method checks for a tracer provider, metrics client, and logger provider. For each present piece, it asks it to flush or shut down and ignores individual errors. It returns nothing because it is part of object cleanup.
 
-**Call relations**: Rust invokes this automatically when an `OtelProvider` goes out of scope. It duplicates `shutdown` rather than delegating, ensuring cleanup still occurs during implicit destruction.
+**Call relations**: This cleanup path covers the same resources that OtelProvider::from created. It complements OtelProvider::shutdown, which lets callers perform the same kind of cleanup explicitly.
 
 
 ##### `make_resource`  (lines 212–221)
@@ -446,11 +454,11 @@ fn drop(&mut self)
 fn make_resource(settings: &OtelSettings, kind: ResourceKind) -> Resource
 ```
 
-**Purpose**: Builds an OpenTelemetry `Resource` for either logs or traces from shared settings plus optional detected host metadata. It centralizes the common resource-builder sequence.
+**Purpose**: Builds the OpenTelemetry resource that labels telemetry with service information. A resource is like the return address on every log or trace, saying which service produced it.
 
-**Data flow**: Takes `&OtelSettings` and `ResourceKind` → starts `Resource::builder()`, sets the service name from settings, computes attributes by calling `resource_attributes(settings, detected_host_name().as_deref(), kind)`, and builds the final `Resource`.
+**Data flow**: It receives OtelSettings and whether the resource is for logs or traces. It detects the host name, asks resource_attributes to create the label list, combines those labels with the service name, and returns a Resource object.
 
-**Call relations**: Called by `OtelProvider::from` to create separate resources for logs and traces. It delegates hostname lookup to `detected_host_name` and attribute selection to `resource_attributes`.
+**Call relations**: OtelProvider::from calls this once for logs and once for traces. It hands work to detected_host_name and resource_attributes so build_logger and build_tracer_provider can receive already-labeled resources.
 
 *Call graph*: calls 2 internal fn (detected_host_name, resource_attributes); called by 1 (from); 1 external calls (builder).
 
@@ -465,11 +473,11 @@ fn resource_attributes(
 ) -> Vec<KeyValue>
 ```
 
-**Purpose**: Computes the `KeyValue` list attached to a resource, always including service version and environment and conditionally including host name for logs. It encodes the policy difference between log and trace resources.
+**Purpose**: Creates the list of labels attached to a telemetry resource. These labels include the service version and environment, and for logs only, a valid host name when available.
 
-**Data flow**: Accepts settings, optional host name, and `ResourceKind` → initializes a vector with `service.version` and `env` attributes → if `kind == Logs` and `host_name.and_then(normalize_host_name)` yields a non-empty normalized name, pushes `host.name` → returns the vector.
+**Data flow**: It receives settings, an optional host name, and whether the labels are for logs or traces. It always creates service version and environment labels. If the kind is logs and the host name is present and not blank, it adds a host.name label. It returns the completed list of key-value labels.
 
-**Call relations**: Used by `make_resource` and directly by tests. It delegates host-name cleanup to `normalize_host_name` and otherwise performs straightforward attribute assembly.
+**Call relations**: make_resource calls this during provider setup. The tests call it directly to check that host names are included only in the intended cases.
 
 *Call graph*: called by 3 (make_resource, resource_attributes_include_host_name_when_present, resource_attributes_omit_host_name_when_missing_or_empty); 2 external calls (new, vec!).
 
@@ -480,11 +488,11 @@ fn resource_attributes(
 fn detected_host_name() -> Option<String>
 ```
 
-**Purpose**: Reads the machine hostname and normalizes it into an optional non-empty string. It hides the platform-specific hostname retrieval behind a simple `Option<String>` API.
+**Purpose**: Reads the machine's host name and turns it into a clean optional string. This lets log telemetry say which computer produced it when that information is available.
 
-**Data flow**: Calls `gethostname()` → converts the OS string lossily to `&str` → passes it to `normalize_host_name` → returns `Some(String)` for a non-empty trimmed hostname or `None` otherwise.
+**Data flow**: It asks the operating system for the host name, converts it into text, and passes the text to normalize_host_name. It returns Some(name) for a non-empty name or None if the result is blank.
 
-**Call relations**: This helper is only used by `make_resource` when constructing resource attributes. It delegates the trimming/emptiness rule to `normalize_host_name`.
+**Call relations**: make_resource calls this before building resource attributes. It delegates the cleanup rule to normalize_host_name so blank names are handled consistently.
 
 *Call graph*: calls 1 internal fn (normalize_host_name); called by 1 (make_resource); 1 external calls (gethostname).
 
@@ -495,11 +503,11 @@ fn detected_host_name() -> Option<String>
 fn normalize_host_name(host_name: &str) -> Option<String>
 ```
 
-**Purpose**: Trims a hostname string and rejects empty results. It prevents blank or whitespace-only host names from being exported.
+**Purpose**: Cleans up a host name and rejects empty values. This prevents telemetry from carrying meaningless host.name labels like spaces.
 
-**Data flow**: Takes `host_name: &str` → trims whitespace → returns `Some(trimmed.to_owned())` if non-empty, else `None`.
+**Data flow**: It receives a host name string, trims whitespace from both ends, and checks whether anything remains. It returns the cleaned name when non-empty, or None when the input is empty after trimming.
 
-**Call relations**: Called by both `detected_host_name` and `resource_attributes` so explicit and detected host names follow the same normalization rule.
+**Call relations**: detected_host_name uses this after reading the operating system host name, and resource_attributes uses the same logic for host names passed in tests or by callers.
 
 *Call graph*: called by 1 (detected_host_name).
 
@@ -513,11 +521,11 @@ fn tracer_provider_builder(
 ) -> TracerProviderBuilder
 ```
 
-**Purpose**: Creates a base `SdkTracerProvider` builder with the given resource and optionally installs a span processor that injects configured span attributes. It keeps span-attribute wiring separate from exporter wiring.
+**Purpose**: Starts building a trace provider and optionally adds a processor that stamps configured attributes onto every span. A span is one timed unit of work inside a trace.
 
-**Data flow**: Accepts `&Resource` and a `BTreeMap<String, String>` of span attributes → starts `SdkTracerProvider::builder().with_resource(resource.clone())` → if the map is empty, returns the builder unchanged; otherwise adds a `SpanAttributesProcessor { attributes: span_attributes }` via `with_span_processor` and returns the augmented builder.
+**Data flow**: It receives a resource and a map of span attributes. It creates a tracer provider builder with the resource. If the attribute map is empty, it returns the plain builder. If attributes exist, it adds a SpanAttributesProcessor so future spans receive those labels.
 
-**Call relations**: This helper is called by `build_tracer_provider` in both the no-exporter and exporter-enabled paths. It encapsulates the decision of whether configured span attributes require an extra processor.
+**Call relations**: build_tracer_provider uses this after choosing the trace exporter and batch processor. It connects global service labels from the resource with per-span labels configured by the user.
 
 *Call graph*: called by 1 (build_tracer_provider); 2 external calls (builder, clone).
 
@@ -528,11 +536,11 @@ fn tracer_provider_builder(
 fn on_start(&self, span: &mut Span, _cx: &Context)
 ```
 
-**Purpose**: Injects configured key/value attributes into every span as soon as it starts. This turns static configuration into per-span metadata rather than resource metadata.
+**Purpose**: Adds configured labels to each span when the span begins. This makes sure every exported span carries the user-requested extra metadata.
 
-**Data flow**: Reads `self.attributes` and receives a mutable `Span` plus context → iterates over each `(key, value)` pair, cloning both strings into `KeyValue::new(key.clone(), value.clone())`, and calls `span.set_attribute(...)` for each → returns `()`.
+**Data flow**: It receives a mutable span and reads the processor's stored attribute map. For each key and value, it creates an OpenTelemetry key-value pair and sets it on the span. It does not return a value; it changes the span before export.
 
-**Call relations**: OpenTelemetry invokes this callback for each span when `SpanAttributesProcessor` has been installed by `tracer_provider_builder`. It is the only non-no-op method in that processor.
+**Call relations**: This method is called by the OpenTelemetry tracing SDK because tracer_provider_builder registers SpanAttributesProcessor as a span processor. It runs at span start, before the span later reaches the exporter built by build_tracer_provider.
 
 *Call graph*: 2 external calls (new, set_attribute).
 
@@ -543,11 +551,11 @@ fn on_start(&self, span: &mut Span, _cx: &Context)
 fn on_end(&self, _span: SpanData)
 ```
 
-**Purpose**: Implements the required span-processor callback for span completion but intentionally performs no work. Configured attributes are only applied at span start.
+**Purpose**: Does nothing when a span ends. The processor only needs to add attributes at span start, so no end-of-span work is required.
 
-**Data flow**: Receives completed `SpanData` and ignores it, returning `()`.
+**Data flow**: It receives completed span data and ignores it. No data is changed and nothing is returned.
 
-**Call relations**: This method is called by the OpenTelemetry SDK as part of the `SpanProcessor` trait, but this processor has no end-of-span behavior.
+**Call relations**: The OpenTelemetry SDK calls this as part of the SpanProcessor interface. It is intentionally empty because SpanAttributesProcessor's useful work happens in SpanAttributesProcessor::on_start.
 
 
 ##### `SpanAttributesProcessor::force_flush`  (lines 285–287)
@@ -556,11 +564,11 @@ fn on_end(&self, _span: SpanData)
 fn force_flush(&self) -> OTelSdkResult
 ```
 
-**Purpose**: Reports that there is nothing buffered to flush for this processor. It satisfies the `SpanProcessor` trait with a no-op success result.
+**Purpose**: Reports that this processor has nothing buffered to flush. It exists because every span processor must provide a flush method.
 
-**Data flow**: Takes no meaningful input and returns `Ok(())` as `OTelSdkResult`.
+**Data flow**: It receives no extra input beyond the processor itself. Since the processor stores only static attributes and no queued spans, it immediately returns success.
 
-**Call relations**: The SDK may call this during provider flush/shutdown. Because the processor only mutates spans in memory at start time, it has no exporter state to flush.
+**Call relations**: The OpenTelemetry SDK may call this when the tracer provider is flushed, such as during OtelProvider::shutdown or OtelProvider::drop. It does not hand off work because there is no internal queue.
 
 
 ##### `SpanAttributesProcessor::shutdown_with_timeout`  (lines 289–291)
@@ -569,11 +577,11 @@ fn force_flush(&self) -> OTelSdkResult
 fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult
 ```
 
-**Purpose**: Reports successful shutdown for the attribute-injection processor without doing any work. The processor owns no background tasks or buffers.
+**Purpose**: Reports that this processor shuts down immediately. It has no background worker or network connection of its own.
 
-**Data flow**: Accepts a timeout `Duration`, ignores it, and returns `Ok(())` as `OTelSdkResult`.
+**Data flow**: It receives a timeout value but does not need it. It returns success without changing data, because there is nothing to close.
 
-**Call relations**: The SDK invokes this during tracer-provider shutdown when the processor is installed. It is intentionally a no-op because all useful work happened in `on_start`.
+**Call relations**: The OpenTelemetry SDK may call this during tracer shutdown. Real exporting work is handled by the batch processors created in build_tracer_provider, not by this attribute-stamping processor.
 
 
 ##### `build_logger`  (lines 294–361)
@@ -585,11 +593,11 @@ fn build_logger(
 ) -> Result<SdkLoggerProvider, Box<dyn Error>>
 ```
 
-**Purpose**: Constructs an `SdkLoggerProvider` configured for the selected exporter protocol and TLS settings. It supports no-op, OTLP gRPC, and OTLP HTTP logging backends.
+**Purpose**: Builds the OpenTelemetry logger provider for the configured log exporter. It translates the project's exporter settings into an SDK logger that can send logs over OTLP gRPC or OTLP HTTP.
 
-**Data flow**: Takes a `Resource` and exporter config → starts `SdkLoggerProvider::builder().with_resource(resource.clone())` → resolves exporter aliases → for `None`, returns the built provider immediately; for OTLP gRPC, logs the endpoint, builds a header map, creates a base tonic TLS config, optionally augments it with `build_grpc_tls_config`, builds a `LogExporter` with tonic endpoint/metadata/TLS, and attaches it as a batch exporter; for OTLP HTTP, logs the endpoint, maps `OtelHttpProtocol` to OTLP `Protocol`, builds an HTTP exporter with endpoint/protocol/headers, optionally injects a blocking HTTP client from `build_http_client`, then attaches the built exporter → finally builds and returns the logger provider.
+**Data flow**: It receives a resource and an exporter setting. It starts a logger provider builder with the resource labels. If exporting is disabled, it returns a provider without an exporter. For gRPC, it builds headers, TLS settings, and a gRPC log exporter. For HTTP, it chooses binary or JSON protocol, applies headers, optionally builds a TLS-aware HTTP client, and creates an HTTP log exporter. It returns the finished logger provider or an error.
 
-**Call relations**: Called from `OtelProvider::from` when log export is enabled. It delegates transport-specific pieces to `crate::otlp` helpers and keeps only the exporter-selection and provider-wiring logic locally.
+**Call relations**: OtelProvider::from calls this when log export is enabled. It relies on configuration helpers to resolve exporter choices and on otlp helpers to build headers, TLS settings, and HTTP clients.
 
 *Call graph*: calls 4 internal fn (resolve_exporter, build_grpc_tls_config, build_header_map, build_http_client); 7 external calls (new, builder, from_headers, builder, debug!, clone, unreachable!).
 
@@ -604,11 +612,11 @@ fn build_tracer_provider(
 ) -> Result<SdkTracerProvider, Box<dyn Error>>
 ```
 
-**Purpose**: Constructs an `SdkTracerProvider` for the selected trace exporter, including runtime-sensitive HTTP exporter handling and optional configured span attributes. It supports no-op, OTLP gRPC, and OTLP HTTP tracing backends.
+**Purpose**: Builds the OpenTelemetry tracer provider for the configured trace exporter. It chooses the right trace exporter and batch processor, then combines them with resource labels and optional per-span attributes.
 
-**Data flow**: Accepts a `Resource`, exporter config, and span-attribute map → resolves exporter aliases → for `None`, returns `tracer_provider_builder(resource, span_attributes).build()`; for OTLP gRPC, logs the endpoint, builds headers and tonic TLS config, and builds a `SpanExporter` with tonic transport; for OTLP HTTP, logs the endpoint and branches again: if `current_tokio_runtime_is_multi_thread()` is true, maps protocol, builds an HTTP exporter builder, injects an async client from `build_async_http_client`, wraps the exporter in `TokioBatchSpanProcessor`, and returns a tracer provider built from `tracer_provider_builder(...).with_span_processor(processor)` immediately; otherwise maps protocol, builds an HTTP exporter builder, optionally injects a blocking client from `build_http_client`, and builds the exporter → for non-early-return paths, wraps the exporter in a standard `BatchSpanProcessor`, adds it to `tracer_provider_builder`, and builds the provider.
+**Data flow**: It receives a resource, exporter setting, and span attributes. If trace exporting is disabled, it returns a provider with no exporter but still applies the resource and span-attribute processor. For gRPC, it builds headers, TLS settings, and a gRPC span exporter. For HTTP, it chooses binary or JSON protocol, applies headers, builds an HTTP client when needed, and creates a span exporter. On a multi-threaded Tokio runtime, it uses an async batch processor; otherwise it uses the standard batch processor. It returns the finished tracer provider or an error.
 
-**Call relations**: This function is called by `OtelProvider::from` when tracing is enabled. It delegates resource-plus-span-attribute setup to `tracer_provider_builder` and transport/client details to the OTLP helper module, while owning the key control-flow decision between async Tokio batch processing and the standard blocking exporter path.
+**Call relations**: OtelProvider::from calls this when traces are enabled. It delegates provider construction to tracer_provider_builder, uses otlp helpers for connection details, and installs a batch processor so spans are sent in groups instead of one network call at a time.
 
 *Call graph*: calls 7 internal fn (resolve_exporter, build_async_http_client, build_grpc_tls_config, build_header_map, build_http_client, current_tokio_runtime_is_multi_thread, tracer_provider_builder); 7 external calls (builder, new, from_headers, builder, builder, debug!, unreachable!).
 
@@ -619,11 +627,11 @@ fn build_tracer_provider(
 fn resource_attributes_include_host_name_when_present()
 ```
 
-**Purpose**: Verifies that log resources include a `host.name` attribute when a non-empty hostname is supplied. It protects the conditional host-name export behavior.
+**Purpose**: Checks that log resource attributes include host.name when a valid host name is provided. This protects the expected log-labeling behavior.
 
-**Data flow**: Builds test settings, calls `resource_attributes(..., Some("opentelemetry-test"), ResourceKind::Logs)`, searches the returned attributes for `HOST_NAME_ATTRIBUTE`, converts the found value to `String`, and asserts it equals `Some("opentelemetry-test".to_string())`.
+**Data flow**: It creates test settings, calls resource_attributes with a sample host name and log kind, searches the returned labels for host.name, and asserts that the value matches the sample name.
 
-**Call relations**: This test directly exercises `resource_attributes` with the positive host-name case. It complements the omission test for missing/empty host names and trace resources.
+**Call relations**: This test calls resource_attributes directly instead of going through make_resource, so it can focus on the host-name rule. It uses tests::test_otel_settings to provide a simple settings object.
 
 *Call graph*: calls 1 internal fn (resource_attributes); 2 external calls (assert_eq!, test_otel_settings).
 
@@ -634,11 +642,11 @@ fn resource_attributes_include_host_name_when_present()
 fn resource_attributes_omit_host_name_when_missing_or_empty()
 ```
 
-**Purpose**: Verifies that `host.name` is omitted when no hostname is available, when the hostname is whitespace-only, and for trace resources even when a hostname exists. It locks down the resource-kind-specific policy.
+**Purpose**: Checks that host.name is not added when the host name is missing, blank, or when attributes are for traces. This confirms that host labeling is limited to meaningful log resources.
 
-**Data flow**: Calls `resource_attributes` three times: with `None` hostname for logs, with whitespace hostname for logs, and with a real hostname for traces → checks each returned attribute list with `.any(...)` and asserts that none contain `HOST_NAME_ATTRIBUTE`.
+**Data flow**: It creates test settings and calls resource_attributes three times: with no host name, with a whitespace-only host name, and with a trace resource. It then asserts that none of the returned label lists contain host.name.
 
-**Call relations**: This test covers the negative branches in `resource_attributes`, including the `normalize_host_name` rejection path and the `ResourceKind::Traces` exclusion rule.
+**Call relations**: This test exercises the same resource_attributes helper used by make_resource during provider setup. It guards both the blank-host cleanup rule and the logs-only host-name rule.
 
 *Call graph*: calls 1 internal fn (resource_attributes); 2 external calls (assert!, test_otel_settings).
 
@@ -649,11 +657,11 @@ fn resource_attributes_omit_host_name_when_missing_or_empty()
 fn log_export_target_excludes_trace_safe_events()
 ```
 
-**Purpose**: Verifies the target-prefix policy for log export: log-only and general OTEL targets are included, but trace-safe targets are excluded from log export. It protects the separation between log and trace pipelines.
+**Purpose**: Checks the log export target rules used by this provider. It confirms that log-only and network-proxy targets are allowed as logs, while trace-safe targets are not treated as log export targets.
 
-**Data flow**: Calls `is_log_export_target` with several target strings and asserts the expected true/false outcomes.
+**Data flow**: It passes several target strings into the target-filtering functions and asserts the expected true-or-false results. No program state is changed.
 
-**Call relations**: This test validates the filtering behavior consumed by `OtelProvider::log_export_filter` and therefore by `logger_layer`.
+**Call relations**: This test protects the behavior depended on by OtelProvider::log_export_filter and OtelProvider::logger_layer. The actual target decision comes from the targets module.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -664,11 +672,11 @@ fn log_export_target_excludes_trace_safe_events()
 fn trace_export_target_only_includes_trace_safe_prefix()
 ```
 
-**Purpose**: Verifies that only the trace-safe target prefix is accepted for non-span trace export. It ensures unrelated OTEL targets do not leak into trace exporters.
+**Purpose**: Checks that only trace-safe target names are accepted for trace events. This helps prevent ordinary log-only targets from being attached to exported traces.
 
-**Data flow**: Calls `is_trace_safe_target` with trace-safe and non-trace-safe target strings and asserts the expected results.
+**Data flow**: It passes trace-safe and non-trace-safe target strings into the target-filtering functions and asserts the expected results. It returns nothing and changes no state.
 
-**Call relations**: This test validates the target policy used by `OtelProvider::trace_export_filter` for non-span events.
+**Call relations**: This test protects the behavior used by OtelProvider::trace_export_filter and OtelProvider::tracing_layer. The target-matching logic itself lives in the targets module.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -679,11 +687,11 @@ fn trace_export_target_only_includes_trace_safe_prefix()
 fn test_otel_settings() -> OtelSettings
 ```
 
-**Purpose**: Creates a minimal `OtelSettings` fixture used by provider tests. It disables all exporters and initializes empty span/tracestate maps.
+**Purpose**: Builds a small, reusable OtelSettings value for tests in this file. It keeps the tests focused on resource and filter behavior rather than setup details.
 
-**Data flow**: Constructs and returns an `OtelSettings` value with fixed strings for environment/service metadata, `PathBuf::from(".")` for `codex_home`, all exporters set to `OtelExporter::None`, `runtime_metrics` false, and empty `BTreeMap`s for span attributes and tracestate.
+**Data flow**: It creates an OtelSettings object with test service identity, local codex home, all exporters disabled, runtime metrics off, and empty span and trace-state maps. It returns that settings object to the test that asked for it.
 
-**Call relations**: This helper is called by the resource-attribute tests to avoid repeating boilerplate configuration setup.
+**Call relations**: The resource attribute tests call this helper before calling resource_attributes. It is test-only support code and is not part of runtime telemetry setup.
 
 *Call graph*: 2 external calls (new, from).
 
@@ -695,18 +703,26 @@ These files establish the metrics subsystem’s shared types, validation rules, 
 
 `data_model` · `cross-cutting`
 
-This file establishes a crate-local `Result<T>` alias bound to `MetricsError` and defines the `MetricsError` enum with `thiserror::Error` for human-readable formatting and source chaining. The variants are grouped around the metrics pipeline’s failure modes. Several variants enforce input validation before metrics are emitted: empty or invalid metric names, empty tag components, invalid tag component values, and negative counter increments. Others represent runtime configuration and exporter lifecycle problems: `ExporterDisabled` signals metrics are intentionally off, `InvalidConfig` captures semantic configuration errors, and `ExporterBuild` wraps `opentelemetry_otlp::ExporterBuildError` when OTLP exporter construction fails. Shutdown and runtime-inspection paths are also modeled explicitly: `ProviderShutdown` wraps `opentelemetry_sdk::error::OTelSdkError`, `RuntimeSnapshotUnavailable` indicates the snapshot reader was never enabled, and `RuntimeSnapshotCollect` wraps collection failures from the SDK. The design is intentionally specific rather than using generic strings, which lets callers distinguish user/input mistakes from infrastructure failures and decide whether to retry, disable metrics, or surface configuration guidance. Because the enum derives `Debug` and `Error`, it integrates cleanly with Rust error propagation while preserving underlying source errors where available.
+This file is the shared vocabulary for things that can go wrong in the metrics system. Metrics are measurements such as counters, timings, or runtime statistics. Without a central error type, each part of the metrics code would have to invent its own failure messages, making problems harder to report and harder to fix.
+
+The main piece is `MetricsError`, an enum, which means a value that can be one of several named cases. Each case describes a specific kind of failure: an empty metric name, invalid characters in a metric or tag, a disabled exporter, a negative counter increase, a bad OpenTelemetry Protocol configuration, or a failure while flushing collected data. OpenTelemetry is the observability toolkit used here to send metrics to external monitoring systems.
+
+The file also defines `Result<T>` as shorthand for “either a successful value of type `T`, or a `MetricsError`.” This keeps function signatures in the metrics code shorter and more consistent.
+
+Some error cases wrap lower-level errors from OpenTelemetry libraries. That preserves the original cause while still presenting the project’s own clearer error category. In everyday terms, this file is like a checklist of possible warning lights on a dashboard: each light has a precise meaning, and some also keep the mechanic’s detailed diagnostic code underneath.
 
 
 ### `otel/src/metrics/validation.rs`
 
-`util` · `metric and tag construction time`
+`domain_logic` · `metric creation and tag building`
 
-This file is the validation core for metric identifiers before they are accepted into counters, gauges, histograms, or tag collections. It distinguishes metric names from tag components because the allowed character sets differ slightly: metric names may contain ASCII alphanumerics plus `.`, `_`, and `-`, while tag keys and values additionally allow `/`. Empty strings are rejected for both categories.
+Metrics are measurements the program reports, such as counts, timings, or gauges. Tags are extra labels attached to those measurements, like a route name or status code. This file is the gatekeeper for those names and labels.
 
-`validate_tags` walks a `BTreeMap<String, String>` and validates every key/value pair, propagating the first failure. `validate_metric_name` performs two explicit checks in order: empty names produce `MetricsError::EmptyMetricName`, and names containing any disallowed character produce `MetricsError::InvalidMetricName { name }`. Tag validation is split into `validate_tag_key` and `validate_tag_value`, but both delegate to the shared `validate_tag_component`, which emits either `MetricsError::EmptyTagComponent { label }` or `MetricsError::InvalidTagComponent { label, value }`. The `label` argument preserves whether the failure came from a key or a value, which improves diagnostics.
+The rules are deliberately simple. A metric name must not be empty, and it may contain only letters, numbers, dots, underscores, and hyphens. A tag key or tag value must also not be empty, and it allows the same characters plus forward slashes. If something breaks these rules, the file returns a clear MetricsError instead of letting the invalid data travel farther through the system.
 
-The low-level predicates `is_metric_char` and `is_tag_char` encode the exact grammar and are used through `.chars().all(...)`, so validation is Unicode-aware at the `char` level but intentionally restricted to ASCII-compatible characters. This module is reused by tag builders and metric constructors to keep all acceptance rules consistent.
+An everyday analogy is labeling boxes in a warehouse. If labels can contain anything, scanners and lookup systems may fail. This file makes sure every label follows the agreed format before the box enters the warehouse.
+
+The public-to-this-crate functions validate whole tag maps, single metric names, and individual tag keys or values. The small helper functions at the bottom define what characters are allowed. This keeps the rest of the metrics code focused on recording measurements, while this file provides one shared place for the naming rules.
 
 #### Function details
 
@@ -716,11 +732,11 @@ The low-level predicates `is_metric_char` and `is_tag_char` encode the exact gra
 fn validate_tags(tags: &BTreeMap<String, String>) -> Result<()>
 ```
 
-**Purpose**: Validates every key and value in a tag map before the map is accepted into metrics configuration or emission. It stops at the first invalid entry.
+**Purpose**: Checks a whole set of metric tags at once. Someone uses this when they already have a map of tag names to tag values and need to make sure every pair is acceptable before creating or recording a metric.
 
-**Data flow**: Takes `&BTreeMap<String, String>` → iterates over each `(key, value)` pair → runs `validate_tag_key(key)` and `validate_tag_value(value)` for each → returns `Ok(())` if all pass or propagates the first `MetricsError`.
+**Data flow**: It receives a sorted map of tag keys and tag values. For each pair, it checks the key first and then the value. If all pairs pass, it returns success; if any key or value is empty or contains a forbidden character, it stops and returns the matching metrics error.
 
-**Call relations**: This function is used during metrics configuration creation when a whole default-tag map must be checked at once. It delegates per-component syntax rules to `validate_tag_key` and `validate_tag_value`.
+**Call relations**: This is called by new when a metrics object or tag collection is being created. It delegates the actual checks to validate_tag_key and validate_tag_value so the same rules are used whether tags arrive as a batch or one at a time.
 
 *Call graph*: calls 2 internal fn (validate_tag_key, validate_tag_value); called by 1 (new).
 
@@ -731,11 +747,11 @@ fn validate_tags(tags: &BTreeMap<String, String>) -> Result<()>
 fn validate_metric_name(name: &str) -> Result<()>
 ```
 
-**Purpose**: Checks that a metric name is non-empty and contains only the allowed metric-name characters. It produces metric-specific error variants so callers can distinguish naming failures from tag failures.
+**Purpose**: Checks whether a metric name is allowed. It prevents empty names and names with characters that the metrics system does not accept.
 
-**Data flow**: Accepts `name: &str` → returns `Err(MetricsError::EmptyMetricName)` if empty → otherwise scans `name.chars()` with `is_metric_char` → returns `Err(MetricsError::InvalidMetricName { name: name.to_string() })` on any invalid character, else `Ok(())`.
+**Data flow**: It receives a name as text. It first rejects an empty string, then looks at every character and asks whether each one is an allowed metric-name character. It returns success when the name is valid, or a MetricsError that includes the bad name when it is not.
 
-**Call relations**: Metric constructors such as counters, gauges, histograms, and duration histograms call this before registering instruments. It is a leaf validator and does not delegate beyond the character predicate.
+**Call relations**: This is called when code creates different kinds of metrics: counter, gauge, histogram, and duration_histogram. It acts as the common checkpoint before those metric builders continue.
 
 *Call graph*: called by 4 (counter, duration_histogram, gauge, histogram).
 
@@ -746,11 +762,11 @@ fn validate_metric_name(name: &str) -> Result<()>
 fn validate_tag_key(key: &str) -> Result<()>
 ```
 
-**Purpose**: Validates one tag key using the shared tag-component grammar while labeling failures specifically as key errors. It exists mainly to preserve clearer error messages.
+**Purpose**: Checks whether a tag key, meaning the label name, is valid. For example, it would validate the key part of a tag like service.name=checkout.
 
-**Data flow**: Takes `key: &str` → calls `validate_tag_component(key, "tag key")` → converts its success into `Ok(())` and propagates any `MetricsError` unchanged.
+**Data flow**: It receives the tag key text and passes it to the shared tag component checker with the label "tag key". The result is either success or a clear error saying the tag key was empty or invalid.
 
-**Call relations**: This helper is called from attribute builders, tag-adding APIs, session tag assembly, and whole-map validation. It delegates all actual checks to `validate_tag_component` so key and value validation stay structurally identical.
+**Call relations**: This is used anywhere tag keys are accepted: attributes, with_tag, push_optional_tag, and validate_tags. It hands the real checking to validate_tag_component so tag keys and tag values follow the same basic rules while still producing errors with the right wording.
 
 *Call graph*: calls 1 internal fn (validate_tag_component); called by 4 (attributes, with_tag, push_optional_tag, validate_tags).
 
@@ -761,11 +777,11 @@ fn validate_tag_key(key: &str) -> Result<()>
 fn validate_tag_value(value: &str) -> Result<()>
 ```
 
-**Purpose**: Validates one tag value using the shared tag-component grammar while labeling failures specifically as value errors.
+**Purpose**: Checks whether a tag value, meaning the label's content, is valid. It makes sure tag values are not blank and contain only allowed characters.
 
-**Data flow**: Takes `value: &str` → calls `validate_tag_component(value, "tag value")` → returns its `Result<()>` directly.
+**Data flow**: It receives the tag value text and sends it to the shared tag component checker with the label "tag value". It returns success if the value is usable, or a MetricsError that explains what is wrong.
 
-**Call relations**: This helper is used anywhere a tag value enters the metrics system, including attribute builders, tag APIs, session tag assembly, and map validation. Like `validate_tag_key`, it is a thin wrapper over `validate_tag_component`.
+**Call relations**: This is called by attributes, with_tag, push_optional_tag, and validate_tags whenever tag values are supplied. Like validate_tag_key, it relies on validate_tag_component so the tag rules stay consistent in one place.
 
 *Call graph*: calls 1 internal fn (validate_tag_component); called by 4 (attributes, with_tag, push_optional_tag, validate_tags).
 
@@ -776,11 +792,11 @@ fn validate_tag_value(value: &str) -> Result<()>
 fn validate_tag_component(value: &str, label: &str) -> Result<()>
 ```
 
-**Purpose**: Implements the common validation logic for both tag keys and tag values. It rejects empty strings and any character outside the tag grammar.
+**Purpose**: Applies the shared validation rules for one tag piece, whether that piece is a key or a value. The label argument lets it produce an error message that says which kind of tag part failed.
 
-**Data flow**: Receives `value: &str` and a descriptive `label: &str` → if `value` is empty, returns `MetricsError::EmptyTagComponent { label: label.to_string() }` → otherwise checks `value.chars().all(is_tag_char)` and returns `MetricsError::InvalidTagComponent { label: label.to_string(), value: value.to_string() }` on failure → otherwise returns `Ok(())`.
+**Data flow**: It receives the text to check and a human-readable label such as "tag key" or "tag value". It rejects empty text, then checks every character against the allowed tag-character rule. It returns success if the text passes, or a MetricsError that includes the label and, when useful, the invalid value.
 
-**Call relations**: This is the shared implementation behind `validate_tag_key` and `validate_tag_value`. It is not called directly by higher-level code; wrappers provide the correct label for diagnostics.
+**Call relations**: This is the common worker called by validate_tag_key and validate_tag_value. By putting the shared checks here, the file avoids having two slightly different versions of the same tag rule.
 
 *Call graph*: called by 2 (validate_tag_key, validate_tag_value).
 
@@ -791,11 +807,11 @@ fn validate_tag_component(value: &str, label: &str) -> Result<()>
 fn is_metric_char(c: char) -> bool
 ```
 
-**Purpose**: Defines the exact per-character allowlist for metric names. It is the low-level predicate used by `validate_metric_name`.
+**Purpose**: Answers one small question: is this character allowed inside a metric name? It is the character-level rule used by metric name validation.
 
-**Data flow**: Accepts a single `char` → returns `true` for ASCII alphanumerics or `.`, `_`, `-`; otherwise `false`.
+**Data flow**: It receives one character. It returns true if the character is an ASCII letter, ASCII number, dot, underscore, or hyphen; otherwise it returns false. It does not change anything else.
 
-**Call relations**: This predicate is only used inside `validate_metric_name` to keep the grammar definition isolated and easy to audit.
+**Call relations**: validate_metric_name uses this while scanning a metric name character by character. The matches! macro is used internally as a compact way to compare the character against the allowed punctuation marks.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -806,31 +822,37 @@ fn is_metric_char(c: char) -> bool
 fn is_tag_char(c: char) -> bool
 ```
 
-**Purpose**: Defines the exact per-character allowlist for tag keys and values. It extends the metric-name grammar by permitting `/`.
+**Purpose**: Answers whether one character is allowed inside a tag key or tag value. It is similar to the metric-name rule, but also permits forward slashes.
 
-**Data flow**: Accepts a single `char` → returns `true` for ASCII alphanumerics or `.`, `_`, `-`, `/`; otherwise `false`.
+**Data flow**: It receives one character. It returns true for ASCII letters, ASCII numbers, dots, underscores, hyphens, and forward slashes; otherwise it returns false. It has no side effects.
 
-**Call relations**: This predicate is only used by `validate_tag_component`, which in turn powers both key and value validation.
+**Call relations**: validate_tag_component uses this while checking each character of a tag key or value. The matches! macro is used internally to test the small set of allowed punctuation characters.
 
 *Call graph*: 1 external calls (matches!).
 
 
 ### `otel/src/metrics/names.rs`
 
-`data_model` · `cross-cutting`
+`config` · `cross-cutting`
 
-This file is the authoritative registry of metric-name strings for the OpenTelemetry metrics layer. Each `pub const` binds a semantic event or measurement to a stable dotted identifier such as `codex.tool.call`, `codex.api_request.duration_ms`, or `codex.goal.completed`. The constants span multiple domains: tool execution, API and SSE/WebSocket traffic, Responses API timing breakdowns, turn-level latency and resource usage, guardian review activity, goal lifecycle and token accounting, plugin installation/startup sync, hook execution, startup phase and prewarm timing, and thread/skills instrumentation. Several names encode units directly in the suffix (`duration_ms`, `duration_s`), which is an important convention for dashboards and downstream aggregation. The inline comments on startup metrics document intended tagging semantics and interpretation, clarifying that some metrics represent coarse phase durations while others measure prewarm lifetime or age at first turn. Centralizing names here prevents drift between emitters, tests, and dashboards, and it reduces the risk of accidental cardinality or naming inconsistencies caused by ad hoc string literals. This file contains no behavior, but it is foundational for telemetry stability because metric identity is effectively part of the system’s observability contract.
+This file solves a simple but important coordination problem: many parts of the system want to record measurements, such as tool calls, API requests, startup timing, token use, plugin activity, hooks, and thread skill counts. If each part typed metric names by hand, small spelling differences would split the data into separate buckets and make dashboards or alerts unreliable. This file avoids that by defining one shared constant for each metric name.
+
+A metric is a named measurement sent to an observability system, which is software used to understand how a program behaves while it runs. Think of these constants like labels on jars in a pantry: everyone uses the same label, so sugar does not accidentally get stored under three different names.
+
+The constants cover counts, durations, token usage, startup prewarming, goal lifecycle events, guardian reviews, WebSocket and server-sent event activity, and plugin or hook events. Some names include units such as `duration_ms` or `duration_s`, which makes it clear whether a value is measured in milliseconds or seconds.
+
+There are no functions here. The value of the file is consistency. Other code imports these names when it records telemetry, and external monitoring tools can rely on the names staying predictable.
 
 
 ### `otel/src/metrics/config.rs`
 
-`config` · `metrics configuration assembly before metrics client initialization`
+`config` · `startup / test setup / metrics configuration`
 
-This file is the metrics configuration model. `MetricsExporter` abstracts over two concrete export paths: `Otlp(OtelExporter)` for real exporters and `InMemory(InMemoryMetricExporter)` for tests. `MetricsConfig` then packages the environment name, service name, service version, exporter, optional periodic export interval, a `runtime_reader` flag, and a `BTreeMap` of default tags that should be attached to every metric.
+Metrics are small measurements, such as counts, timings, or gauges, that help people see how a running service is behaving. This file is the setup form for that metrics pipeline. Without it, the rest of the metrics code would not know the service name, environment, version, exporter destination, or shared tags to attach to every measurement.
 
-The implementation is intentionally lightweight and builder-oriented. `MetricsConfig::otlp` and `MetricsConfig::in_memory` are convenience constructors that populate the common identity fields, wrap the chosen exporter variant, and initialize `export_interval` to `None`, `runtime_reader` to `false`, and `default_tags` to an empty map. `with_export_interval` and `with_runtime_reader` toggle optional behavior by mutating and returning `self`. `with_tag` is the only method with validation logic: it converts the key and value into owned strings, validates them with the shared metric-tag validators, inserts them into the `default_tags` map, and returns the updated config or a validation error.
+The main type is `MetricsConfig`, which is like a shipping label plus delivery instructions for metrics. It records basic identity information, such as the environment and service version. It also chooses a metrics exporter, meaning the place where metrics go. There are two choices: `Otlp`, which sends metrics through OpenTelemetry Protocol, a standard telemetry format, and `InMemory`, which keeps metrics inside the process for tests.
 
-Because `default_tags` is a `BTreeMap`, insertion order is normalized and duplicate keys are overwritten by the latest call. The file itself does not build exporters or providers; it only shapes the data consumed later by `MetricsClient::new`.
+The file also provides small builder-style methods. A caller starts with either an OTLP config or an in-memory config, then optionally adds an export interval, enables a runtime reader for on-demand snapshots, or adds default tags. Tags are key-value labels, such as `region=us-east`, that make metrics easier to filter later. Before a tag is accepted, its key and value are checked by validation helpers so bad labels do not enter the metrics system.
 
 #### Function details
 
@@ -845,11 +867,11 @@ fn otlp(
     ) -> Self
 ```
 
-**Purpose**: Constructs a metrics configuration targeting an OTLP exporter. It fills in the required identity fields and leaves optional behaviors disabled by default.
+**Purpose**: Creates a metrics configuration that sends measurements to an OpenTelemetry exporter. Use this when the service should report metrics to an external collector or observability system.
 
-**Data flow**: Consumes `environment`, `service_name`, `service_version`, and an `OtelExporter`, converts the first three with `Into<String>`, wraps the exporter in `MetricsExporter::Otlp`, initializes `export_interval` to `None`, `runtime_reader` to `false`, `default_tags` to an empty `BTreeMap`, and returns the new `MetricsConfig`.
+**Data flow**: The caller provides the environment, service name, service version, and an OTLP exporter. The text-like inputs are converted into owned strings, the exporter is wrapped as the OTLP choice, and a new config comes out with no custom export interval, no runtime reader, and no default tags yet.
 
-**Call relations**: It is used by setup code and tests as the standard starting point for real exporter configurations before optional builder methods are applied.
+**Call relations**: This is the normal starting point for production-style metrics setup. It is called by higher-level configuration conversion code and by an integration test that checks metrics can be sent to a collector; after this function creates the base config, callers can further customize it with methods such as adding tags or changing the export interval.
 
 *Call graph*: called by 2 (from, otlp_http_exporter_sends_metrics_to_collector); 3 external calls (new, into, Otlp).
 
@@ -865,11 +887,11 @@ fn in_memory(
     ) -> Self
 ```
 
-**Purpose**: Constructs a metrics configuration backed by an in-memory exporter, primarily for tests and local inspection. It mirrors the OTLP constructor but swaps in the in-memory exporter variant.
+**Purpose**: Creates a metrics configuration that stores exported metrics in memory instead of sending them over the network. This is mainly useful for tests, where code needs to inspect what would have been reported.
 
-**Data flow**: Consumes `environment`, `service_name`, `service_version`, and an `InMemoryMetricExporter`, converts the identity fields into owned strings, wraps the exporter in `MetricsExporter::InMemory`, initializes optional fields to defaults, and returns the config.
+**Data flow**: The caller provides the environment, service name, service version, and an in-memory exporter. The identity fields are converted into strings, the exporter is wrapped as the in-memory choice, and the returned config starts with default timing behavior, no runtime reader, and an empty set of default tags.
 
-**Call relations**: It is the common constructor used by tests and harnesses that need metrics collection without external transport.
+**Call relations**: Test helpers and telemetry tests call this when they need a safe, local metrics setup. It lets those tests run the same metrics-producing code as the real system, but collect the results inside the test process instead of relying on an external metrics collector.
 
 *Call graph*: called by 10 (test_session_telemetry, test_session_telemetry_without_metadata, test_session_telemetry, websocket_harness_with_provider_options, build_metrics_with_defaults, runtime_metrics_summary_collects_tool_api_and_streaming_metrics, manager_snapshot_metrics_collects_without_shutdown, snapshot_collects_metrics_without_shutdown, build_in_memory_client, invalid_tag_component_is_rejected); 3 external calls (new, into, InMemory).
 
@@ -880,11 +902,11 @@ fn in_memory(
 fn with_export_interval(mut self, interval: Duration) -> Self
 ```
 
-**Purpose**: Overrides the periodic export interval for the metrics provider. It is a simple builder mutator.
+**Purpose**: Sets how often metrics should be exported periodically. This lets callers shorten the interval for fast tests or adjust reporting frequency for a particular runtime setup.
 
-**Data flow**: Consumes `self`, stores `Some(interval)` into `self.export_interval`, and returns the updated config.
+**Data flow**: The function receives an existing config and a time duration. It stores that duration as the chosen export interval and returns the updated config, leaving the other settings unchanged.
 
-**Call relations**: Callers apply this after constructing a base config when they need non-default export cadence.
+**Call relations**: This is a builder step used after a base config has been created. It does not start exporting by itself; it simply records the timing choice so the later metrics setup code can use it when building the actual exporter pipeline.
 
 
 ##### `MetricsConfig::with_runtime_reader`  (lines 69–72)
@@ -893,11 +915,11 @@ fn with_export_interval(mut self, interval: Duration) -> Self
 fn with_runtime_reader(mut self) -> Self
 ```
 
-**Purpose**: Enables the optional manual runtime reader used for on-demand snapshots. This is required for runtime summaries and reset-by-snapshot behavior.
+**Purpose**: Turns on a manual reader that can take on-demand snapshots of runtime metrics. This is useful when code needs to collect current metrics immediately instead of waiting for the periodic exporter.
 
-**Data flow**: Consumes `self`, sets `self.runtime_reader = true`, and returns the updated config.
+**Data flow**: The function receives an existing config, flips the runtime-reader flag to true, and returns the updated config. No other settings are changed.
 
-**Call relations**: It is applied during configuration assembly before `MetricsClient::new` so the client installs a `ManualReader`.
+**Call relations**: This is another builder step used during metrics setup. Later code that builds the metrics provider can see this flag and install the extra reader needed for snapshot-style collection.
 
 
 ##### `MetricsConfig::with_tag`  (lines 75–82)
@@ -906,22 +928,24 @@ fn with_runtime_reader(mut self) -> Self
 fn with_tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self>
 ```
 
-**Purpose**: Adds a validated default tag that will be attached to every metric emitted by the resulting client. It rejects invalid tag keys or values before mutating the config.
+**Purpose**: Adds a default tag that will be attached to every metric created under this configuration. Tags help people group and filter metrics later, for example by deployment, region, or feature.
 
-**Data flow**: Consumes `self`, converts `key` and `value` into owned `String`s, validates them with `validate_tag_key` and `validate_tag_value`, inserts them into `self.default_tags`, and returns `Result<Self>`.
+**Data flow**: The caller provides a tag key and value. The function turns both into strings, checks the key and value with validation helpers, and, if both are acceptable, stores them in the config's default tag map. It returns the updated config on success, or an error if the tag is invalid.
 
-**Call relations**: This is used during config assembly to establish global/default metric dimensions before the client is built.
+**Call relations**: This builder step protects the rest of the metrics system from bad labels. It calls the tag validation functions before changing the config, so later exporter setup and metric creation can assume the default tags have already passed the project’s rules.
 
 *Call graph*: calls 2 internal fn (validate_tag_key, validate_tag_value); 1 external calls (into).
 
 
 ### `otel/src/metrics/tags.rs`
 
-`domain_logic` · `metric emission setup for session/process events`
+`domain_logic` · `cross-cutting during metrics recording`
 
-This file is the small normalization and validation layer for metric tags attached to session/process metrics. It declares the exported tag-key constants (`app.version`, `auth_mode`, `model`, `originator`, `service_name`, `session_source`) so callers use one spelling everywhere. The `bounded_originator_tag_value` helper specifically protects cardinality for the `originator` tag: it sanitizes the raw input with `sanitize_metric_tag_value`, compares the sanitized string against a fixed list of known originators, and collapses everything else to the literal `other`.
+Metrics are much more useful when they carry a few labels, such as which model was used, where the session came from, or what app version was running. But labels can also cause problems if they contain unsafe text or too many unique values. A metrics system can become slow or expensive if every run creates a new label value. This file acts like a small checklist for session metric labels.
 
-The main data structure is `SessionMetricTagValues<'a>`, a borrowed bundle of six session metadata fields, two of which are optional (`auth_mode`, `service_name`). Its `into_tags` method builds a `Vec<(&'static str, &'a str)>` in a deliberate, stable order matching the field list. Each candidate tag is routed through `push_optional_tag`, which skips absent optionals, validates the key via `validate_tag_key`, validates the value via `validate_tag_value`, and only then appends the pair. That means invalid tag syntax aborts the whole conversion before partially malformed output escapes. The tests lock down both the exact ordering and the omission behavior for missing optional tags, which matters because downstream metrics code may preserve tag order when exporting or asserting on payloads.
+It names the allowed tag keys, such as `model`, `app.version`, and `originator`. It also keeps a short list of known originator values. If an originator is not on that list, it is grouped under `other`, which keeps the metric data easy to aggregate.
+
+The main type, `SessionMetricTagValues`, is a small bundle of possible session tag values. Some values are required, such as the model and app version. Others are optional, such as authentication mode or service name. Its `into_tags` method turns that bundle into an ordered list of key-value pairs. Before adding each tag, it checks that the key and value are valid. In everyday terms, this file is the label maker for session metrics: it prints only approved labels, skips blanks, and keeps unusual sources from flooding the reporting system.
 
 #### Function details
 
@@ -931,11 +955,11 @@ The main data structure is `SessionMetricTagValues<'a>`, a borrowed bundle of si
 fn bounded_originator_tag_value(originator: &str) -> &'static str
 ```
 
-**Purpose**: Maps an arbitrary originator string onto a low-cardinality exported value. It preserves only known sanitized originator identifiers and returns the fallback `other` for everything else.
+**Purpose**: This function turns a raw originator name into a safe, known metric value. If the originator is not one of the approved names, it returns `other` so metrics stay grouped and readable instead of being split across endless unique labels.
 
-**Data flow**: Takes `originator: &str` → sanitizes it with `sanitize_metric_tag_value` → scans the static `KNOWN_ORIGINATOR_TAG_VALUES` slice for an exact match against the sanitized text → returns the matched `&'static str` from the allowlist or `OTHER_ORIGINATOR_TAG_VALUE`.
+**Data flow**: It receives an originator string from elsewhere in the program. It first sanitizes that text into a form suitable for metric tags, then compares it with the built-in list of known originators. The result is either the matching known originator value or the fallback value `other`.
 
-**Call relations**: This helper is used when process-start metrics are recorded and the caller needs a bounded `originator` tag. It delegates sanitization first so matching is done against the same normalized form metrics exporters expect, then performs the allowlist collapse locally.
+**Call relations**: When process-start metrics are recorded, `record_process_start_once` calls this function to prepare the originator tag. This function delegates the cleanup step to `sanitize_metric_tag_value`, then hands back a bounded value that the caller can safely attach to telemetry.
 
 *Call graph*: called by 1 (record_process_start_once); 1 external calls (sanitize_metric_tag_value).
 
@@ -946,11 +970,11 @@ fn bounded_originator_tag_value(originator: &str) -> &'static str
 fn into_tags(self) -> Result<Vec<(&'static str, &'a str)>>
 ```
 
-**Purpose**: Converts a `SessionMetricTagValues` bundle into the concrete tag list sent with metrics. It preserves a fixed tag order and omits only the optional fields that are `None`.
+**Purpose**: This method converts a `SessionMetricTagValues` bundle into the actual ordered list of metric tags. Someone would use it right before recording a session metric, so the metric receives the expected labels in a consistent order.
 
-**Data flow**: Consumes `self` containing borrowed session fields → allocates a vector with capacity 6 → invokes `Self::push_optional_tag` for each tag key/value pair in the order auth mode, session source, originator, service name, model, app version → returns `Ok(Vec<(&'static str, &'a str)>)` or the first validation error.
+**Data flow**: It takes ownership of the session tag bundle. It starts with an empty list sized for up to six tags, then tries to add authentication mode, session source, originator, service name, model, and app version. Optional missing values are skipped. If every included tag passes validation, it returns the completed list; if any key or value is invalid, it returns an error instead.
 
-**Call relations**: This is the public assembly point for callers that have collected session metadata and need validated tags. Its only internal delegation is to `push_optional_tag`, which centralizes skip-and-validate behavior so every field follows the same rules.
+**Call relations**: This is the public conversion step for the `SessionMetricTagValues` struct. For each possible tag, it calls `SessionMetricTagValues::push_optional_tag`, which performs the skip-if-missing and validation work before adding the tag to the list.
 
 *Call graph*: 2 external calls (push_optional_tag, with_capacity).
 
@@ -965,11 +989,11 @@ fn push_optional_tag(
     ) -> Result<()>
 ```
 
-**Purpose**: Adds one tag pair to the output vector if a value is present and syntactically valid. It is the shared validation gate used by `into_tags` for both required and optional fields.
+**Purpose**: This helper adds one tag to the growing tag list, but only if a value is present and valid. It keeps the repeated safety checks in one place so every session metric tag follows the same rules.
 
-**Data flow**: Receives a mutable tag vector, a static key, and `Option<&str>` value → returns early with `Ok(())` when the value is `None` → validates the key and value strings → pushes `(key, value)` into the vector → returns success or propagates a validation error.
+**Data flow**: It receives the tag list being built, a fixed tag key, and an optional value. If the value is missing, it leaves the list unchanged and succeeds. If the value is present, it validates the key and the value, then appends the key-value pair to the list. If validation fails, it returns an error and does not add the bad tag.
 
-**Call relations**: This function is called repeatedly by `SessionMetricTagValues::into_tags` as it walks the session fields. It delegates actual syntax checks to `validate_tag_key` and `validate_tag_value` so tag construction stays aligned with the rest of the metrics subsystem.
+**Call relations**: `SessionMetricTagValues::into_tags` calls this helper once for each possible session tag. This helper passes the actual checking work to `validate_tag_key` and `validate_tag_value`, then gives the updated list back to the conversion flow.
 
 *Call graph*: calls 2 internal fn (validate_tag_key, validate_tag_value).
 
@@ -980,11 +1004,11 @@ fn push_optional_tag(
 fn session_metric_tags_include_expected_tags_in_order()
 ```
 
-**Purpose**: Verifies that a fully populated `SessionMetricTagValues` instance produces all six tags in the exact expected order. The test guards against accidental reordering or omission of required fields.
+**Purpose**: This test confirms that a complete set of session tag values becomes the exact tag list expected by the metrics code. It also checks that the order is stable, which can matter for predictable output and easy comparison.
 
-**Data flow**: Builds a `SessionMetricTagValues` with all fields present → calls `into_tags()` and unwraps the result → compares the returned vector against a literal ordered `vec![(key, value), ...]` using `assert_eq!`.
+**Data flow**: It creates a `SessionMetricTagValues` value where all optional and required fields are present. It converts that bundle into tags, then compares the result with the exact expected list of key-value pairs. The test passes only if all tags are included in the intended order.
 
-**Call relations**: This test exercises the normal path through `into_tags`, indirectly covering repeated calls to `push_optional_tag`. It exists to pin down the externally visible tag sequence expected by downstream metrics assertions.
+**Call relations**: This test exercises `SessionMetricTagValues::into_tags` as a caller would use it. It uses `assert_eq!` to compare the produced tags with the expected result, guarding against accidental changes to tag names, inclusion rules, or ordering.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -995,24 +1019,24 @@ fn session_metric_tags_include_expected_tags_in_order()
 fn session_metric_tags_skip_missing_optional_tags()
 ```
 
-**Purpose**: Verifies that absent optional fields are omitted rather than emitted as empty tags or placeholders. It specifically checks the reduced output shape when `auth_mode` and `service_name` are missing.
+**Purpose**: This test confirms that missing optional tags are simply left out rather than producing empty or invalid metric labels. That keeps metrics clean when information such as authentication mode or service name is unavailable.
 
-**Data flow**: Builds a `SessionMetricTagValues` with `auth_mode: None` and `service_name: None` → calls `into_tags()` → asserts that the resulting vector contains only session source, originator, model, and app version in order.
+**Data flow**: It creates a `SessionMetricTagValues` value with `auth_mode` and `service_name` set to missing. It converts the bundle into tags, then checks that the result contains only the required tags and the optional tags that had values. The output is compared with the expected shorter list.
 
-**Call relations**: This test covers the `None` early-return branch inside `push_optional_tag` as reached from `into_tags`. It complements the full-population test by locking down omission semantics for optional metadata.
+**Call relations**: This test calls `SessionMetricTagValues::into_tags` to verify the optional-tag path. It relies on `assert_eq!` to make sure `SessionMetricTagValues::push_optional_tag` correctly skips missing values while still adding the rest.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `otel/src/metrics/mod.rs`
 
-`orchestration` · `startup installation of globals and cross-cutting access during runtime`
+`orchestration` · `startup and cross-cutting metrics use`
 
-This module file primarily organizes and re-exports the metrics subsystem. It declares the internal submodules (`client`, `config`, `error`, `names`, `process`, `runtime_metrics`, `tags`, `timer`, `validation`) and then re-exports the main public pieces: `MetricsClient`, `MetricsConfig`, `MetricsExporter`, `MetricsError`, the crate-local `Result` alias, process-start recording, all metric-name constants, the originator tag constant, `SessionMetricTagValues`, and the bounded-originator helper.
+Metrics are the numbers the system records so operators can understand what is happening, such as timings, counts, and process information. This file does not do the measuring itself. Instead, it gathers the metrics pieces into one module and provides a safe shared place to store the project-wide metrics client.
 
-Its only real state is two `OnceLock` singletons: `GLOBAL_METRICS` for the process-wide `MetricsClient` and `GLOBAL_STATSIG_METRICS_SETTINGS` for resolved Statsig exporter settings. The four functions are thin wrappers around those locks. Installation functions attempt a one-time set and intentionally ignore subsequent attempts by discarding the `set` result. Accessor functions clone the stored values out so callers receive owned copies rather than references tied to the singleton.
+The important idea here is “set once, read many times.” The file uses `OnceLock`, which is a one-time storage cell: after a value is put in, later code can read it, but it cannot be replaced. That is useful for global metrics because many parts of the program need to record measurements, but the actual metrics setup should happen only once during initialization. It is like putting the official thermometer in a shared hallway: everyone can look at it, but nobody swaps it out midway through the day.
 
-This design makes global metrics optional and immutable after first installation, which simplifies use from session telemetry and crate-level helpers. The file itself contains no metric-recording logic; it is the registry and export hub for the rest of the metrics subsystem.
+This file also re-exports names from its child modules, such as `MetricsClient`, configuration types, error types, metric names, and tag helpers. That means other code can import them from the metrics module without needing to know which smaller file they live in. Without this file, the rest of the system would have no simple, consistent way to find the metrics client or the common metrics definitions.
 
 #### Function details
 
@@ -1022,11 +1046,11 @@ This design makes global metrics optional and immutable after first installation
 fn install_global(metrics: MetricsClient)
 ```
 
-**Purpose**: Installs the process-wide global metrics client the first time it is called. Later calls are ignored because the underlying `OnceLock` can only be set once.
+**Purpose**: Stores the main metrics client in a shared global slot so other parts of the program can record metrics later. It is meant to be called during setup, before normal metric recording begins.
 
-**Data flow**: Consumes a `MetricsClient`, calls `GLOBAL_METRICS.set(metrics)`, discards the `Result`, and returns `()`. If the singleton was already initialized, the passed client is simply dropped.
+**Data flow**: A `MetricsClient` goes in. The function tries to place it into the one-time global storage cell. Nothing is returned; after this succeeds, later callers can ask for the global metrics client. If something was already installed, the new value is ignored.
 
-**Call relations**: It is called during provider/setup initialization so later code can retrieve the global client via `global()`.
+**Call relations**: This is called from setup-style conversion code named `from`, where configuration is being turned into usable runtime pieces. After that setup step, functions such as `global` can hand copies of the installed client to code that needs to record measurements.
 
 *Call graph*: called by 1 (from).
 
@@ -1037,11 +1061,11 @@ fn install_global(metrics: MetricsClient)
 fn global() -> Option<MetricsClient>
 ```
 
-**Purpose**: Returns a clone of the globally installed metrics client, if one has been installed. It is the main read accessor for process-wide metrics state.
+**Purpose**: Returns the shared metrics client if one has been installed. Code uses this when it wants to record a metric without carrying a metrics client through every function call.
 
-**Data flow**: Reads `GLOBAL_METRICS.get()`, clones the stored `MetricsClient` when present, and returns `Option<MetricsClient>`.
+**Data flow**: It reads the one-time global metrics storage. If a client is present, it returns a cloned copy wrapped in `Some`; if setup has not installed one yet, it returns `None`. It does not change the stored client.
 
-**Call relations**: It is used by session telemetry construction and by the crate-level `start_global_timer` helper.
+**Call relations**: This is used when new metrics-related objects are created and when a global timer is started. In those moments, the calling code asks this function whether metrics are available, then either records through the returned client or continues without one.
 
 *Call graph*: called by 2 (new, start_global_timer).
 
@@ -1052,11 +1076,11 @@ fn global() -> Option<MetricsClient>
 fn install_global_statsig_settings(settings: StatsigMetricsSettings)
 ```
 
-**Purpose**: Stores the resolved Statsig metrics settings in a process-wide singleton. Like the global metrics client, it only takes effect on the first call.
+**Purpose**: Stores Statsig-specific metrics settings in a shared global slot. These settings describe how Statsig metrics should be shaped or labeled elsewhere in the system.
 
-**Data flow**: Consumes `StatsigMetricsSettings`, calls `GLOBAL_STATSIG_METRICS_SETTINGS.set(settings)`, ignores the result, and returns `()`. Repeated installation attempts are dropped.
+**Data flow**: A `StatsigMetricsSettings` value goes in. The function tries to put it into one-time global storage. It returns nothing; after installation, other code can read a cloned copy of those settings. If settings were already installed, this call leaves the original value in place.
 
-**Call relations**: It is invoked during provider/setup initialization when Statsig-backed metrics are configured.
+**Call relations**: This is called from setup-style conversion code named `from`, alongside other initialization work. Once installed, the settings become available through `global_statsig_settings`, which is used by the code that needs Statsig metrics configuration.
 
 *Call graph*: called by 1 (from).
 
@@ -1067,11 +1091,11 @@ fn install_global_statsig_settings(settings: StatsigMetricsSettings)
 fn global_statsig_settings() -> Option<StatsigMetricsSettings>
 ```
 
-**Purpose**: Returns a clone of the globally stored Statsig metrics settings, if any. It is the internal accessor behind the crate's public Statsig-settings helper.
+**Purpose**: Returns the shared Statsig metrics settings if they were installed during startup. This lets metrics code find those settings without each caller passing them around manually.
 
-**Data flow**: Reads `GLOBAL_STATSIG_METRICS_SETTINGS.get()`, clones the stored settings when present, and returns `Option<StatsigMetricsSettings>`.
+**Data flow**: It reads the one-time global settings storage. If settings exist, it returns a cloned copy wrapped in `Some`; if not, it returns `None`. It only reads; it does not modify the stored settings.
 
-**Call relations**: It is called by `otel::global_statsig_metrics_settings` to expose the singleton to external callers.
+**Call relations**: This is called by `global_statsig_metrics_settings`, which acts as the higher-level access point for Statsig metrics configuration. In that flow, this function supplies the raw shared settings value when it is available.
 
 *Call graph*: called by 1 (global_statsig_metrics_settings).
 
@@ -1081,13 +1105,15 @@ These files implement OTLP transport setup and the concrete metrics client featu
 
 ### `otel/src/otlp.rs`
 
-`io_transport` · `provider/exporter initialization`
+`io_transport` · `telemetry exporter setup`
 
-This file is the transport-plumbing layer for OTLP exporters. It converts user configuration into concrete `reqwest` and tonic transport objects while normalizing errors into boxed `io::Error`s with actionable messages. `build_header_map` filters a plain `HashMap<String, String>` into an HTTP `HeaderMap`, silently dropping invalid header names or values instead of failing exporter setup.
+OpenTelemetry is the system used to report what the program is doing, for example timing information, logs, and metrics. OTLP is the protocol used to send that information to a collector service. This file is the adapter that makes those outgoing connections safe and configurable.
 
-TLS setup is split by protocol stack. `build_grpc_tls_config` parses the endpoint as an `http::Uri`, extracts the host for SNI/domain validation, optionally loads a CA PEM into `TonicCertificate`, and optionally loads a client cert/key pair into `TonicIdentity`; supplying only one half of the mTLS pair is rejected. `build_http_client_inner` and `build_async_http_client` perform the analogous work for blocking and async `reqwest` clients, including disabling built-in roots when a custom CA is provided and concatenating cert+key PEM bytes before creating a `ReqwestIdentity`.
+Its job is much like packing a delivery truck before sending reports away: it adds the right address, security documents, custom labels, and deadline. It builds HTTP header maps from plain key-value settings. It builds TLS configuration for gRPC, where TLS is the encrypted connection layer used by HTTPS-like systems. It also builds blocking and asynchronous HTTP clients for exporters that send telemetry over HTTP.
 
-`build_http_client` is the notable control-flow wrapper: on a multi-thread Tokio runtime it uses `block_in_place`, on a current-thread runtime it spawns a dedicated OS thread to avoid blocking the runtime, and outside Tokio it calls the inner builder directly. Timeout selection is centralized in `resolve_otlp_timeout`, which prefers a signal-specific env var, then the generic OTLP timeout, then the OpenTelemetry default. `read_bytes` preserves the original path in success and wraps read failures with the path in the error text. Tests specifically verify runtime-flavor detection and that blocking client construction works inside a current-thread runtime.
+A major part of the file is certificate handling. It can load a custom certificate authority, which tells the client which server certificates to trust. It can also load a client certificate and private key for mutual TLS, often called mTLS, where both sides prove their identity. The file deliberately rejects half-configured mTLS: a certificate without its matching private key, or the reverse, is treated as a configuration error.
+
+It also reads timeout values from environment variables, falling back to OpenTelemetry defaults when nothing valid is set. One subtle piece is the blocking HTTP client builder: because blocking work can interfere with Tokio, the asynchronous runtime used by Rust programs, it chooses a safe way to build the client depending on what kind of runtime is currently active.
 
 #### Function details
 
@@ -1097,11 +1123,11 @@ TLS setup is split by protocol stack. `build_grpc_tls_config` parses the endpoin
 fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap
 ```
 
-**Purpose**: Converts configured string headers into a `reqwest::header::HeaderMap` suitable for OTLP exporters. Invalid header names or values are ignored rather than aborting setup.
+**Purpose**: This function turns ordinary string headers from configuration into the typed header format expected by the HTTP client. It quietly skips any header name or value that is not valid HTTP.
 
-**Data flow**: Takes `&HashMap<String, String>` → creates an empty `HeaderMap` → iterates each `(key, value)` and attempts `HeaderName::from_bytes(key.as_bytes())` plus `HeaderValue::from_str(value)` → inserts only pairs where both conversions succeed → returns the populated `HeaderMap`.
+**Data flow**: It receives a map of text keys and text values. For each pair, it tries to convert the key into an HTTP header name and the value into an HTTP header value. Valid pairs are inserted into a new header map, and the finished map is returned.
 
-**Call relations**: Exporter builders for metrics, logs, and traces call this before constructing OTLP clients. It is a leaf conversion helper and does not propagate parse failures upward, intentionally making header handling permissive.
+**Call relations**: Telemetry builders for metrics, logs, and traces call this when they need to attach custom HTTP headers to OTLP export requests. It does not send anything itself; it prepares the labels that later network clients will use.
 
 *Call graph*: called by 3 (build_otlp_metric_exporter, build_logger, build_tracer_provider); 3 external calls (new, from_bytes, from_str).
 
@@ -1116,11 +1142,11 @@ fn build_grpc_tls_config(
 ) -> Result<ClientTlsConfig, Box<dyn Error>>
 ```
 
-**Purpose**: Builds a tonic `ClientTlsConfig` for OTLP gRPC exporters, including endpoint-derived domain name, optional custom CA, and optional client identity for mTLS.
+**Purpose**: This function prepares TLS security settings for OTLP over gRPC. gRPC is a network protocol often used for service-to-service calls, and TLS is the encryption and identity-checking layer.
 
-**Data flow**: Accepts `endpoint: &str`, a base `ClientTlsConfig`, and `&OtelTlsConfig` → parses the endpoint into `Uri`, extracts the host or returns a configuration error if absent, sets that host as the TLS domain name, optionally reads CA PEM bytes and installs a `TonicCertificate`, then matches on `(client_certificate, client_private_key)` to either load both PEM files into a `TonicIdentity`, reject partial mTLS configuration, or leave identity unset → returns the finalized `ClientTlsConfig`.
+**Data flow**: It receives an endpoint address, an existing gRPC TLS configuration, and the project's TLS settings. It extracts the host name from the endpoint, sets that as the expected server name, optionally reads a custom certificate authority file, and optionally reads a client certificate plus private key for mTLS. It returns an updated TLS configuration or a clear configuration error.
 
-**Call relations**: This helper is invoked by OTLP metric, log, and trace gRPC exporter setup paths whenever TLS settings are present. It delegates file I/O to `read_bytes` and error shaping to `config_error` so the exporter builders stay focused on protocol selection.
+**Call relations**: The metric, log, and trace exporter builders call this when they are configured to send OTLP data over gRPC. It relies on read_bytes to load certificate files and config_error to report invalid settings in a consistent way.
 
 *Call graph*: calls 2 internal fn (config_error, read_bytes); called by 3 (build_otlp_metric_exporter, build_logger, build_tracer_provider); 3 external calls (domain_name, from_pem, from_pem).
 
@@ -1134,11 +1160,11 @@ fn build_http_client(
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>>
 ```
 
-**Purpose**: Constructs a blocking `reqwest` client for OTLP HTTP exporters while avoiding illegal blocking behavior inside Tokio runtimes. It chooses a runtime-aware execution strategy before delegating to the actual builder.
+**Purpose**: This function builds a blocking HTTP client for OTLP exporters. It is careful about where that blocking work happens so it does not accidentally stall an async runtime.
 
-**Data flow**: Takes `&OtelTlsConfig` and a timeout env-var name → checks `current_tokio_runtime_is_multi_thread()`; if true, runs `build_http_client_inner` inside `tokio::task::block_in_place`; else if any Tokio runtime exists, clones inputs, spawns a dedicated thread, joins it, and maps thread/join/string errors into boxed config errors; otherwise calls `build_http_client_inner` directly → returns `reqwest::blocking::Client` or boxed error.
+**Data flow**: It receives TLS settings and the name of the timeout environment variable to honor. It checks whether the code is currently inside a Tokio runtime, and if so what kind. In a multi-thread runtime it uses Tokio's safe blocking escape hatch; in a single-thread runtime it moves the work to a separate operating-system thread; outside Tokio it builds directly. The result is a ready blocking HTTP client or an error.
 
-**Call relations**: HTTP exporter setup for metrics, logs, and traces calls this when a blocking client is needed. It delegates actual client assembly to `build_http_client_inner`; its main role is selecting the safe execution path based on runtime context.
+**Call relations**: Metric, log, and trace exporter setup call this when they need an HTTP client that works in blocking OpenTelemetry exporter threads. It delegates the actual certificate and timeout setup to build_http_client_inner, and uses current_tokio_runtime_is_multi_thread to choose the safe execution path.
 
 *Call graph*: calls 2 internal fn (build_http_client_inner, current_tokio_runtime_is_multi_thread); called by 4 (build_otlp_metric_exporter, build_http_client_works_in_current_thread_runtime, build_logger, build_tracer_provider); 4 external calls (clone, spawn, try_current, block_in_place).
 
@@ -1149,11 +1175,11 @@ fn build_http_client(
 fn current_tokio_runtime_is_multi_thread() -> bool
 ```
 
-**Purpose**: Detects whether the current execution context is inside a Tokio multi-thread runtime. This is used to decide whether `block_in_place` is legal.
+**Purpose**: This function answers one narrow question: is the current code running inside a multi-threaded Tokio runtime? Tokio is the async task runner used by many Rust programs.
 
-**Data flow**: Calls `tokio::runtime::Handle::try_current()` → if a handle exists, compares `runtime_flavor()` to `RuntimeFlavor::MultiThread`; if no runtime exists, returns `false`.
+**Data flow**: It tries to get the current Tokio runtime handle. If there is no runtime, it returns false. If there is one, it checks whether its flavor is multi-threaded and returns true or false.
 
-**Call relations**: This predicate is consulted by `build_http_client` and trace-provider setup to choose between blocking and async exporter/client strategies. Tests exercise it under no runtime, current-thread runtime, and multi-thread runtime conditions.
+**Call relations**: build_http_client uses this to decide whether blocking work can be wrapped with Tokio's block-in-place support. The trace provider setup also uses it when deciding how to build telemetry plumbing safely.
 
 *Call graph*: called by 2 (build_http_client, build_tracer_provider); 1 external calls (try_current).
 
@@ -1167,11 +1193,11 @@ fn build_http_client_inner(
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>>
 ```
 
-**Purpose**: Performs the actual blocking `reqwest` client construction for OTLP HTTP exporters, including timeout and TLS/mTLS configuration. It assumes the caller has already chosen a safe context for blocking work.
+**Purpose**: This function does the actual work of creating a blocking HTTP client with timeout and TLS settings. It is separated from build_http_client so the outer function can choose a safe place to run it.
 
-**Data flow**: Accepts `&OtelTlsConfig` and timeout env-var name → starts a `reqwest::blocking::Client::builder()` with timeout from `resolve_otlp_timeout` → if a CA path exists, reads PEM bytes, parses a `ReqwestCertificate`, disables built-in roots, and adds the custom root → matches on client cert/key paths to either read both files, concatenate PEM bytes, parse a `ReqwestIdentity`, and enforce `https_only(true)`; reject partial mTLS config; or do nothing → builds and returns the client, boxing any reqwest build error.
+**Data flow**: It receives TLS settings and a timeout environment variable name. It starts a blocking reqwest HTTP client builder with the resolved timeout. If a custom certificate authority is configured, it reads and installs it as the trusted root. If client certificate and private key are both configured, it reads them, combines them into a client identity, and forces HTTPS-only use. If only one half of the client identity is present, it returns a configuration error. Finally it builds and returns the client.
 
-**Call relations**: Only `build_http_client` calls this function. It delegates timeout lookup to `resolve_otlp_timeout`, file loading to `read_bytes`, and human-readable configuration failures to `config_error`.
+**Call relations**: Only build_http_client calls this. It uses resolve_otlp_timeout to decide the request deadline, read_bytes to load certificate material, and config_error to turn bad TLS setup into readable errors.
 
 *Call graph*: calls 3 internal fn (config_error, read_bytes, resolve_otlp_timeout); called by 1 (build_http_client); 3 external calls (from_pem, from_pem, builder).
 
@@ -1185,11 +1211,11 @@ fn build_async_http_client(
 ) -> Result<reqwest::Client, Box<dyn Error>>
 ```
 
-**Purpose**: Builds an async `reqwest::Client` for OTLP HTTP exporters, mirroring the blocking builder’s timeout and TLS behavior. It supports optional TLS configuration because some callers may not need custom certificates.
+**Purpose**: This function builds the non-blocking HTTP client used when telemetry sending can happen asynchronously. It applies the same timeout and TLS rules as the blocking client path.
 
-**Data flow**: Takes `Option<&OtelTlsConfig>` and timeout env-var name → creates a `reqwest::Client::builder()` with timeout from `resolve_otlp_timeout` → if TLS config is present, optionally loads and installs a custom CA, optionally loads and concatenates client cert/key PEM into a `ReqwestIdentity` with `https_only(true)`, or rejects partial mTLS configuration → builds and returns the async client.
+**Data flow**: It receives optional TLS settings and a timeout environment variable name. It creates an async reqwest client builder with the resolved timeout. If TLS settings are present, it may load a custom certificate authority and may load a client certificate plus private key for mTLS. It rejects incomplete mTLS settings. It returns the finished async HTTP client or an error.
 
-**Call relations**: The trace-provider setup uses this path when running under a multi-thread Tokio runtime so trace exporting can stay async. It shares the same helper dependencies as the blocking builder: `resolve_otlp_timeout`, `read_bytes`, and `config_error`.
+**Call relations**: The trace provider setup calls this when it needs an async HTTP client for OTLP export. It shares the helper functions used by the blocking client path: resolve_otlp_timeout for deadlines, read_bytes for files, and config_error for clear setup failures.
 
 *Call graph*: calls 3 internal fn (config_error, read_bytes, resolve_otlp_timeout); called by 1 (build_tracer_provider); 3 external calls (from_pem, from_pem, builder).
 
@@ -1200,11 +1226,11 @@ fn build_async_http_client(
 fn resolve_otlp_timeout(signal_var: &str) -> Duration
 ```
 
-**Purpose**: Resolves the effective OTLP timeout from environment variables with signal-specific precedence. It falls back to the OpenTelemetry crate default when no valid override is present.
+**Purpose**: This function decides how long OTLP export requests are allowed to take before timing out. It follows OpenTelemetry's priority order: a signal-specific timeout first, then the general OTLP timeout, then the default.
 
-**Data flow**: Accepts `signal_var: &str` → tries `read_timeout_env(signal_var)` first → if absent/invalid, tries `read_timeout_env(OTEL_EXPORTER_OTLP_TIMEOUT)` → if still absent, returns `OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT`.
+**Data flow**: It receives the name of a signal-specific environment variable, such as one for traces or metrics. It first asks read_timeout_env for that variable. If it is missing or invalid, it tries the general OTLP timeout variable. If that is also missing or invalid, it returns the OpenTelemetry default timeout duration.
 
-**Call relations**: Both HTTP client builders call this so logs, traces, and other OTLP signals honor the same timeout precedence rules. It delegates parsing and validation of individual env vars to `read_timeout_env`.
+**Call relations**: Both the blocking and async HTTP client builders call this before creating their clients. It delegates individual environment-variable parsing to read_timeout_env.
 
 *Call graph*: calls 1 internal fn (read_timeout_env); called by 2 (build_async_http_client, build_http_client_inner).
 
@@ -1215,11 +1241,11 @@ fn resolve_otlp_timeout(signal_var: &str) -> Duration
 fn read_timeout_env(var: &str) -> Option<Duration>
 ```
 
-**Purpose**: Parses one timeout environment variable as a non-negative millisecond duration. Invalid, missing, or negative values are treated as unset.
+**Purpose**: This function reads one timeout environment variable and turns it into a duration. It treats missing, non-number, or negative values as unusable.
 
-**Data flow**: Takes `var: &str` → reads `env::var(var)` and returns `None` if missing → parses the string as `i64`, returning `None` on parse failure → rejects negative values with `None` → converts non-negative milliseconds to `Duration::from_millis(parsed as u64)` and returns `Some(duration)`.
+**Data flow**: It receives an environment variable name. It reads the variable from the process environment, parses the value as a number of milliseconds, rejects negative values, and returns a duration when everything is valid. Otherwise it returns nothing.
 
-**Call relations**: This is a private helper used only by `resolve_otlp_timeout` to keep env parsing logic isolated from precedence logic.
+**Call relations**: resolve_otlp_timeout calls this while checking timeout settings in priority order. This helper keeps the parsing rules in one small place.
 
 *Call graph*: called by 1 (resolve_otlp_timeout); 2 external calls (from_millis, var).
 
@@ -1230,11 +1256,11 @@ fn read_timeout_env(var: &str) -> Option<Duration>
 fn read_bytes(path: &AbsolutePathBuf) -> Result<(Vec<u8>, PathBuf), Box<dyn Error>>
 ```
 
-**Purpose**: Reads a configured certificate/key file and preserves the resolved path alongside the bytes for later error reporting. It wraps filesystem errors with path-aware messages.
+**Purpose**: This function reads a configured certificate or key file from disk and adds helpful context if the read fails.
 
-**Data flow**: Accepts `&AbsolutePathBuf` → calls `fs::read(path)` → on success returns `(Vec<u8>, path.to_path_buf())` → on failure constructs a new boxed `io::Error` with the original error kind and a message including `path.display()`.
+**Data flow**: It receives an absolute path. It tries to read all bytes from that file. On success it returns both the file contents and the path as a normal path buffer. On failure it returns an error message that includes the file path, so the user can tell which configured file caused the problem.
 
-**Call relations**: TLS builders for both gRPC and HTTP call this whenever they need CA, client certificate, or private key contents. It centralizes path-rich I/O errors so higher-level builders can focus on PEM parsing and protocol configuration.
+**Call relations**: The gRPC TLS builder and both HTTP client builders call this whenever they need certificate or private-key bytes. It does no parsing itself; it simply supplies the raw file contents to the certificate-parsing code.
 
 *Call graph*: calls 1 internal fn (to_path_buf); called by 3 (build_async_http_client, build_grpc_tls_config, build_http_client_inner); 4 external calls (new, new, format!, read).
 
@@ -1245,11 +1271,11 @@ fn read_bytes(path: &AbsolutePathBuf) -> Result<(Vec<u8>, PathBuf), Box<dyn Erro
 fn config_error(message: impl Into<String>) -> Box<dyn Error>
 ```
 
-**Purpose**: Creates a boxed invalid-data `io::Error` from a configuration message. It standardizes the error type returned by this module’s validation branches.
+**Purpose**: This function creates a standard configuration error from a plain message. It is used when the user's OTLP settings are inconsistent or invalid.
 
-**Data flow**: Takes any `message` convertible into `String` → converts it, wraps it in `io::Error::new(ErrorKind::InvalidData, ...)`, boxes the error, and returns `Box<dyn Error>`.
+**Data flow**: It receives a message, turns it into a string, wraps it in an input-data error, and returns it as a general error value that callers can pass upward.
 
-**Call relations**: This helper is used by the TLS and HTTP client builders whenever they need to reject malformed endpoint/TLS configuration or remap parsing failures into clearer configuration errors.
+**Call relations**: The TLS and HTTP client builders call this for problems like missing endpoint hosts, incomplete mTLS pairs, or certificate parsing failures. It keeps those errors consistent across the file.
 
 *Call graph*: called by 3 (build_async_http_client, build_grpc_tls_config, build_http_client_inner); 3 external calls (new, into, new).
 
@@ -1260,11 +1286,11 @@ fn config_error(message: impl Into<String>) -> Box<dyn Error>
 fn current_tokio_runtime_is_multi_thread_detects_runtime_flavor()
 ```
 
-**Purpose**: Verifies that runtime-flavor detection distinguishes no runtime, current-thread runtime, and multi-thread runtime correctly. It protects the branching logic used by blocking HTTP client construction.
+**Purpose**: This test checks that current_tokio_runtime_is_multi_thread correctly recognizes whether it is outside Tokio, inside a single-thread Tokio runtime, or inside a multi-thread Tokio runtime.
 
-**Data flow**: Calls `current_tokio_runtime_is_multi_thread()` outside any runtime and asserts false → builds a current-thread runtime and asserts the function returns false inside it → builds a multi-thread runtime and asserts the function returns true inside it.
+**Data flow**: It first calls the function with no Tokio runtime and expects false. Then it creates a current-thread runtime and expects false inside it. Finally it creates a multi-thread runtime and expects true inside it.
 
-**Call relations**: This test directly exercises `current_tokio_runtime_is_multi_thread`, which is later consumed by `build_http_client` and trace exporter setup. It exists to prevent regressions in runtime-sensitive branching.
+**Call relations**: This test directly protects the runtime-detection helper that build_http_client relies on. If this behavior changed, the blocking HTTP client might be built in an unsafe or inefficient place.
 
 *Call graph*: 4 external calls (new_current_thread, new_multi_thread, assert!, assert_eq!).
 
@@ -1275,24 +1301,26 @@ fn current_tokio_runtime_is_multi_thread_detects_runtime_flavor()
 fn build_http_client_works_in_current_thread_runtime()
 ```
 
-**Purpose**: Verifies that `build_http_client` succeeds even when called from a Tokio current-thread runtime. This covers the dedicated-thread fallback path that avoids blocking the runtime.
+**Purpose**: This test confirms that the blocking HTTP client can still be built while running inside a single-thread Tokio runtime. That is the tricky case where blocking work must be moved away from the runtime thread.
 
-**Data flow**: Builds a current-thread Tokio runtime → runs `build_http_client(&OtelTlsConfig::default(), OTEL_EXPORTER_OTLP_TIMEOUT)` inside it → asserts that the returned `Result` is `Ok`.
+**Data flow**: It creates a current-thread Tokio runtime, then calls build_http_client with default TLS settings inside that runtime. It checks that the result is successful.
 
-**Call relations**: This test targets the non-multi-thread branch of `build_http_client`, ensuring the wrapper’s thread-spawn strategy correctly delegates to `build_http_client_inner` without runtime panics.
+**Call relations**: This test exercises the special path in build_http_client that spawns a separate thread when a single-thread Tokio runtime is active. It helps prevent regressions that would break telemetry setup in async contexts.
 
 *Call graph*: calls 1 internal fn (build_http_client); 3 external calls (new_current_thread, assert!, default).
 
 
 ### `otel/src/metrics/client.rs`
 
-`io_transport` · `metrics initialization, metric emission during runtime, runtime snapshot collection, and shutdown`
+`domain_logic` · `startup, cross-cutting runtime metrics recording, snapshot collection, teardown`
 
-This file contains the full metrics implementation. At the bottom is `MetricsClient`, a cheap cloneable wrapper around `Arc<MetricsClientInner>`. The inner struct owns the `SdkMeterProvider`, a `Meter`, mutex-protected caches for counters, gauges, generic histograms, and duration histograms, an optional `ManualReader` for runtime snapshots, and a `BTreeMap` of default tags. Instrument caches are keyed by `InstrumentKey`, which includes metric name plus optional unit and description so repeated recordings reuse the same OTEL instrument instead of rebuilding it.
+This file is the main doorway into Codex metrics. Metrics are small measurements, such as “this event happened 3 times” or “this operation took 42 milliseconds.” The file turns a user-facing configuration into an OpenTelemetry meter provider, which is the library component that stores and exports those measurements.
 
-`MetricsClientInner` provides the actual recording methods. Each validates metric names, merges default tags with per-call tags via `attributes`, validates tag keys/values, lazily creates the appropriate OTEL instrument under a mutex, and records the sample. Counters reject negative increments explicitly. Duration recording uses dedicated histogram builders with fixed units, descriptions, and bucket boundaries for milliseconds or seconds.
+At startup, `MetricsClient::new` validates default tags, describes the running service with resource information like service name, version, environment, and operating system, then chooses where metrics should go. They can go to an in-memory exporter, useful for tests and local inspection, or to an OTLP exporter, which is OpenTelemetry’s common network format for sending telemetry to collectors.
 
-`MetricsClient::new` translates `MetricsConfig` into an OTEL `Resource`, adding service version, environment, and sanitized OS attributes. It optionally creates a delta-temporality `ManualReader` for runtime snapshots, then builds either an in-memory or OTLP exporter pipeline. `build_provider` wires a periodic reader plus the optional shared manual reader into an `SdkMeterProvider`. `build_otlp_metric_exporter` handles exporter selection, Statsig indirection, gRPC vs HTTP protocol setup, headers, and TLS customization. Shutdown flushes then stops the provider; snapshot collection reads from the manual reader without shutting anything down.
+During runtime, callers use simple methods such as `counter`, `gauge`, `histogram`, and `record_duration`. The inner client validates names and tags, merges caller tags with default tags, creates OpenTelemetry instruments only once, then reuses them. The instrument caches are protected by mutexes, which are locks that stop two tasks from changing the same cache at the same time.
+
+The file also supports snapshots through a manual reader, like asking the metrics system for a photo of its current state without shutting it down. Finally, `shutdown` flushes pending measurements and stops the provider cleanly so data is not lost.
 
 #### Function details
 
@@ -1302,11 +1330,11 @@ This file contains the full metrics implementation. At the bottom is `MetricsCli
 fn new(inner: Arc<ManualReader>) -> Self
 ```
 
-**Purpose**: Wraps an `Arc<ManualReader>` in a small adapter type that itself implements `MetricReader`. This allows the same manual reader to be installed into the provider while still being retained for direct snapshot collection.
+**Purpose**: Wraps a manual OpenTelemetry metrics reader so it can be shared safely with the metrics provider. This is used when Codex wants to collect a metrics snapshot on demand.
 
-**Data flow**: Consumes an `Arc<ManualReader>`, stores it in `SharedManualReader { inner }`, and returns the wrapper.
+**Data flow**: It receives a shared pointer to a `ManualReader` → stores that pointer inside a small wrapper object → returns the wrapper so the provider can own a reader-like object while other code can still keep access to the same reader.
 
-**Call relations**: It is used by `build_provider` when runtime snapshots are enabled so the provider can own a reader implementation while `MetricsClientInner` keeps the original `Arc`.
+**Call relations**: When `build_provider` is setting up the meter provider and runtime snapshots are enabled, it calls this constructor to attach the manual reader. After that, OpenTelemetry treats the wrapper as a normal metric reader.
 
 *Call graph*: called by 1 (build_provider).
 
@@ -1317,11 +1345,11 @@ fn new(inner: Arc<ManualReader>) -> Self
 fn register_pipeline(&self, pipeline: Weak<Pipeline>)
 ```
 
-**Purpose**: Forwards pipeline registration to the wrapped manual reader. It exists solely to satisfy the `MetricReader` trait.
+**Purpose**: Passes OpenTelemetry pipeline registration through to the real manual reader. A pipeline is the internal route that connects instruments to collection and export.
 
-**Data flow**: Reads the `Weak<Pipeline>` argument and passes it unchanged to `self.inner.register_pipeline(pipeline)`.
+**Data flow**: It receives a weak reference to the OpenTelemetry pipeline → forwards that reference to the wrapped manual reader → changes the wrapped reader’s internal connection to the pipeline.
 
-**Call relations**: This method is called by the OTEL SDK after the reader is attached to a provider.
+**Call relations**: OpenTelemetry calls this as part of provider setup. The wrapper does not make decisions itself; it simply hands the registration to the shared manual reader that `build_provider` attached.
 
 
 ##### `SharedManualReader::collect`  (lines 80–82)
@@ -1330,11 +1358,11 @@ fn register_pipeline(&self, pipeline: Weak<Pipeline>)
 fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::error::OTelSdkResult
 ```
 
-**Purpose**: Delegates metric collection into a `ResourceMetrics` buffer to the wrapped manual reader. It preserves the manual reader's collection behavior exactly.
+**Purpose**: Collects the current metrics into a provided snapshot container by delegating to the real manual reader.
 
-**Data flow**: Takes a mutable `ResourceMetrics` reference, forwards it to `self.inner.collect(rm)`, and returns the OTEL SDK result.
+**Data flow**: It receives an empty or reusable `ResourceMetrics` container → asks the wrapped manual reader to fill it with current measurements → returns success or an OpenTelemetry error.
 
-**Call relations**: The OTEL SDK invokes this through the `MetricReader` trait, and `MetricsClient::snapshot` ultimately relies on the same underlying reader.
+**Call relations**: This is called by OpenTelemetry’s reader flow. It supports the same underlying manual reader that `MetricsClient::snapshot` uses, so runtime code can ask for a snapshot without stopping the provider.
 
 
 ##### `SharedManualReader::force_flush`  (lines 84–86)
@@ -1343,11 +1371,11 @@ fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::error::OTelSdk
 fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult
 ```
 
-**Purpose**: Forwards force-flush requests to the wrapped manual reader. This is trait plumbing rather than custom logic.
+**Purpose**: Forces the wrapped manual reader to flush any pending metrics work. Flushing means pushing out buffered data instead of waiting.
 
-**Data flow**: Calls `self.inner.force_flush()` and returns its result.
+**Data flow**: It receives no extra data → calls `force_flush` on the wrapped reader → returns whatever success or error the reader reports.
 
-**Call relations**: It participates in provider lifecycle operations when the SDK flushes readers.
+**Call relations**: OpenTelemetry may call this during provider flushing. The wrapper exists only to forward the request to the shared manual reader.
 
 
 ##### `SharedManualReader::shutdown_with_timeout`  (lines 88–90)
@@ -1356,11 +1384,11 @@ fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult
 fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult
 ```
 
-**Purpose**: Forwards timed shutdown requests to the wrapped manual reader. It ensures the wrapper behaves identically to the underlying reader during teardown.
+**Purpose**: Shuts down the wrapped manual reader, respecting a maximum amount of time to wait.
 
-**Data flow**: Receives a `Duration` timeout, passes it to `self.inner.shutdown_with_timeout(timeout)`, and returns the OTEL SDK result.
+**Data flow**: It receives a timeout duration → passes that timeout to the wrapped reader’s shutdown method → returns success or an OpenTelemetry shutdown error.
 
-**Call relations**: This is used by the OTEL SDK when the provider is shutting down.
+**Call relations**: OpenTelemetry uses this during shutdown. It lets the provider clean up the manual snapshot reader that was attached by `build_provider`.
 
 
 ##### `SharedManualReader::temporality`  (lines 92–94)
@@ -1369,11 +1397,11 @@ fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::
 fn temporality(&self, kind: InstrumentKind) -> Temporality
 ```
 
-**Purpose**: Returns the aggregation temporality chosen by the wrapped manual reader for a given instrument kind. It preserves the manual reader's delta configuration.
+**Purpose**: Reports how the wrapped reader wants metrics values to be expressed. Temporality means whether exported values are totals since the beginning or changes since the last collection.
 
-**Data flow**: Reads the `InstrumentKind`, forwards it to `self.inner.temporality(kind)`, and returns the resulting `Temporality`.
+**Data flow**: It receives the kind of metric instrument being queried → asks the wrapped manual reader for its temporality choice → returns that choice unchanged.
 
-**Call relations**: The OTEL SDK queries this through the `MetricReader` trait while configuring pipelines.
+**Call relations**: OpenTelemetry calls this when deciding how to collect different instrument kinds. The wrapper keeps the behavior of the underlying manual reader intact.
 
 
 ##### `MetricsClientInner::counter`  (lines 110–144)
@@ -1388,11 +1416,11 @@ fn counter(
     ) -> Result<()>
 ```
 
-**Purpose**: Validates and records a counter increment, lazily creating and caching the OTEL counter instrument keyed by name and optional description. It rejects negative increments before touching OTEL state.
+**Purpose**: Records that something happened a certain number of times. It rejects negative increments because counters are meant to only go up.
 
-**Data flow**: Reads `name`, optional `description`, `inc`, and `tags`; validates the metric name; returns `NegativeCounterIncrement` if `inc < 0`; builds OTEL attributes via `attributes(tags)`; locks the `counters` map; constructs an `InstrumentKey`; inserts or reuses a `Counter<u64>` built from `self.meter`; adds `inc as u64` with the attributes; returns `Result<()>`.
+**Data flow**: It receives a metric name, optional description, increment amount, and tags → validates the name and checks the increment is not negative → merges tags with defaults → finds or creates a cached OpenTelemetry counter → adds the increment with the merged attributes → returns success or a metrics error.
 
-**Call relations**: This is the internal implementation behind the public `MetricsClient::counter` and `counter_with_description` methods.
+**Call relations**: Public methods such as `MetricsClient::counter` and `MetricsClient::counter_with_description` delegate here. Before recording, it uses `MetricsClientInner::attributes` to turn tags into OpenTelemetry attributes.
 
 *Call graph*: calls 2 internal fn (attributes, validate_metric_name).
 
@@ -1403,11 +1431,11 @@ fn counter(
 fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()>
 ```
 
-**Purpose**: Validates and records an integer histogram sample, lazily creating a generic `f64` histogram instrument per metric name. It is used for non-duration histogram metrics.
+**Purpose**: Records one numeric sample in a histogram. A histogram groups many samples into ranges, which is useful for understanding distributions such as sizes or counts.
 
-**Data flow**: Validates `name`, converts tags to OTEL attributes with `attributes`, locks the `histograms` cache, inserts or reuses `self.meter.f64_histogram(name).build()`, records `value as f64`, and returns `Result<()>`.
+**Data flow**: It receives a metric name, integer value, and tags → validates the name → builds merged attributes → finds or creates a cached floating-point histogram for that name → records the value as a sample → returns success or an error.
 
-**Call relations**: It backs the public `MetricsClient::histogram` method.
+**Call relations**: `MetricsClient::histogram` is the public wrapper that calls this. It relies on `MetricsClientInner::attributes` to check and combine tags before the sample is recorded.
 
 *Call graph*: calls 2 internal fn (attributes, validate_metric_name).
 
@@ -1424,11 +1452,11 @@ fn gauge(
     ) -> Result<()>
 ```
 
-**Purpose**: Validates and records a gauge measurement, caching the OTEL gauge instrument by name and optional description. It supports both described and undescribed gauges.
+**Purpose**: Records a current value, such as memory in use or the number of active items. Unlike a counter, a gauge can go up or down.
 
-**Data flow**: Validates the metric name, computes attributes, locks the `gauges` map, builds an `InstrumentKey`, inserts or reuses an `i64` gauge from `self.meter`, records the provided `value`, and returns `Result<()>`.
+**Data flow**: It receives a name, optional description, value, and tags → validates the name → merges and validates tags → finds or creates a cached OpenTelemetry gauge → records the current value with those attributes → returns success or a metrics error.
 
-**Call relations**: It is the shared implementation behind `MetricsClient::gauge` and `gauge_with_description`.
+**Call relations**: The public `MetricsClient::gauge` and `MetricsClient::gauge_with_description` methods call this. It uses `MetricsClientInner::attributes` before recording so every gauge measurement carries consistent labels.
 
 *Call graph*: calls 2 internal fn (attributes, validate_metric_name).
 
@@ -1446,11 +1474,11 @@ fn duration_histogram(
         tags: &[(&str, &str)],
 ```
 
-**Purpose**: Records a duration-like floating-point sample into a histogram instrument configured with an explicit unit, description, and bucket boundaries. It caches instruments by name, unit, and description so millisecond and second histograms remain distinct.
+**Purpose**: Records an elapsed time into a histogram with a clear unit and preset bucket boundaries. This lets dashboards show how fast or slow operations usually are.
 
-**Data flow**: Validates `name`, computes attributes, locks `duration_histograms`, constructs an `InstrumentKey` containing `name`, `unit`, and `description`, inserts or reuses a histogram builder configured with `with_unit`, `with_description`, and `with_boundaries`, records `value`, and returns `Result<()>`.
+**Data flow**: It receives a metric name, duration value, unit, description, bucket boundaries, and tags → validates the name → merges tags into attributes → finds or creates a cached histogram keyed by name, unit, and description → records the duration value → returns success or an error.
 
-**Call relations**: This is the internal primitive used by the public duration-recording methods.
+**Call relations**: `MetricsClient::record_duration` and `MetricsClient::record_duration_seconds_with_description` call this after converting a `Duration` into milliseconds or seconds. It uses `MetricsClientInner::attributes` to prepare the labels attached to the timing sample.
 
 *Call graph*: calls 2 internal fn (attributes, validate_metric_name).
 
@@ -1461,11 +1489,11 @@ fn duration_histogram(
 fn attributes(&self, tags: &[(&str, &str)]) -> Result<Vec<KeyValue>>
 ```
 
-**Purpose**: Builds the final OTEL attribute list by merging default tags with per-call tags and validating all caller-supplied keys and values. It ensures every metric emission uses a consistent attribute-construction path.
+**Purpose**: Combines default tags with per-measurement tags and turns them into OpenTelemetry attributes. Tags are labels like environment, feature name, or status that make metrics searchable and filterable.
 
-**Data flow**: If `tags` is empty, clones `default_tags` directly into `Vec<KeyValue>`. Otherwise it clones `default_tags` into a mutable `BTreeMap`, validates each incoming key and value, inserts them so per-call tags override defaults on duplicate keys, then converts the merged map into `Vec<KeyValue>`.
+**Data flow**: It receives a slice of tag key/value pairs → if no tags are provided, it converts only the default tags → otherwise it copies the defaults, validates each supplied key and value, lets supplied tags override matching defaults, and converts the result into OpenTelemetry `KeyValue` attributes → returns the attribute list or a validation error.
 
-**Call relations**: All recording methods call this before touching OTEL instruments, so tag validation and default-tag merging happen uniformly.
+**Call relations**: All inner recording methods call this before sending data to OpenTelemetry. It centralizes tag validation so counters, gauges, histograms, and duration histograms all follow the same labeling rules.
 
 *Call graph*: calls 2 internal fn (validate_tag_key, validate_tag_value); called by 4 (counter, duration_histogram, gauge, histogram).
 
@@ -1476,11 +1504,11 @@ fn attributes(&self, tags: &[(&str, &str)]) -> Result<Vec<KeyValue>>
 fn shutdown(&self) -> Result<()>
 ```
 
-**Purpose**: Flushes pending metrics and shuts down the underlying OTEL meter provider. It wraps OTEL SDK errors in crate-specific `MetricsError` values.
+**Purpose**: Flushes queued metrics and then shuts down the OpenTelemetry meter provider. This is important because telemetry exporters may buffer data before sending it.
 
-**Data flow**: Logs a debug message, calls `self.meter_provider.force_flush()`, maps any failure to `MetricsError::ProviderShutdown`, then calls `self.meter_provider.shutdown()` with the same error mapping, and returns `Ok(())` on success.
+**Data flow**: It receives no input beyond the existing client state → logs that metrics are being flushed → asks the provider to flush pending measurements → asks the provider to shut down → returns success or wraps provider errors as metrics errors.
 
-**Call relations**: This is the implementation behind the public `MetricsClient::shutdown` method and is used during teardown.
+**Call relations**: `MetricsClient::shutdown` calls this public-facing cleanup path. It hands off to OpenTelemetry’s `force_flush` and `shutdown` operations so the backend has the best chance to receive final metrics.
 
 *Call graph*: 3 external calls (force_flush, shutdown, debug!).
 
@@ -1491,11 +1519,11 @@ fn shutdown(&self) -> Result<()>
 fn new(config: MetricsConfig) -> Result<Self>
 ```
 
-**Purpose**: Constructs a fully configured metrics client from `MetricsConfig`, including resource attributes, exporter selection, provider creation, instrument caches, and optional runtime snapshot support. It is the main initialization entry point for metrics.
+**Purpose**: Creates a ready-to-use metrics client from configuration. It validates labels, describes the service, chooses an exporter, and builds the OpenTelemetry provider and meter.
 
-**Data flow**: Destructures `MetricsConfig`, validates `default_tags`, builds resource attributes for service version, environment, and sanitized OS info from `os_resource_attributes`, creates an OTEL `Resource`, optionally creates a delta `ManualReader` when `runtime_reader` is true, chooses between in-memory and OTLP exporters, builds the provider and meter via `build_provider`, initializes empty mutex-protected caches and stores the optional runtime reader and default tags inside `MetricsClientInner`, then returns `MetricsClient(Arc::new(...))`.
+**Data flow**: It receives a `MetricsConfig` → checks default tags → builds resource attributes such as service version, environment, and operating system → optionally creates a manual reader for snapshots → chooses either an in-memory exporter or an OTLP network exporter → builds the provider and meter → stores instrument caches, runtime reader, and default tags in a shared inner client → returns the client or a configuration/exporter error.
 
-**Call relations**: It is called by session telemetry setup, provider setup, and tests; internally it delegates exporter-specific work to `build_otlp_metric_exporter` and provider wiring to `build_provider`.
+**Call relations**: This is the setup point used by tests and higher-level application builders. It calls `os_resource_attributes` for host details, `build_otlp_metric_exporter` when network export is configured, and `build_provider` to assemble the OpenTelemetry provider.
 
 *Call graph*: calls 4 internal fn (build_otlp_metric_exporter, build_provider, os_resource_attributes, validate_tags); called by 12 (test_session_telemetry, test_session_telemetry_without_metadata, test_session_telemetry, websocket_harness_with_provider_options, with_metrics_config, from, build_metrics_with_defaults, otlp_http_exporter_sends_metrics_to_collector, runtime_metrics_summary_collects_tool_api_and_streaming_metrics, manager_snapshot_metrics_collects_without_shutdown (+2 more)); 6 external calls (new, new, new, with_capacity, builder, new).
 
@@ -1506,11 +1534,11 @@ fn new(config: MetricsConfig) -> Result<Self>
 fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) -> Result<()>
 ```
 
-**Purpose**: Public convenience method for recording a counter increment without an instrument description. It simply forwards to the inner implementation.
+**Purpose**: Public helper for recording a counter increment without an instrument description. Use it when code wants to say “this event happened N more times.”
 
-**Data flow**: Reads `name`, `inc`, and `tags`, calls `self.0.counter(name, None, inc, tags)`, and returns the resulting `Result<()>`.
+**Data flow**: It receives a metric name, increment amount, and tags → passes them to the inner counter recorder with no description → returns the same success or error result.
 
-**Call relations**: This is the standard counter API used by session telemetry and process-start recording.
+**Call relations**: Runtime telemetry helpers call this for event counts such as process start tracking. It is a thin public wrapper over `MetricsClientInner::counter`.
 
 *Call graph*: called by 2 (record_process_start_once, counter).
 
@@ -1527,11 +1555,11 @@ fn counter_with_description(
     ) -> Result<()>
 ```
 
-**Purpose**: Public counter API that also sets an OTEL instrument description on first use. It is useful for metrics that need richer schema metadata.
+**Purpose**: Public helper for recording a counter increment while also giving the metric a human-readable description. The description helps people understand the metric in dashboards and collectors.
 
-**Data flow**: Forwards `name`, `description`, `inc`, and `tags` to `self.0.counter(name, Some(description), inc, tags)` and returns the result.
+**Data flow**: It receives a metric name, description, increment amount, and tags → forwards them to the inner counter recorder → returns success or the validation/export error from the inner layer.
 
-**Call relations**: It is an alternate public entry point over the same inner counter logic.
+**Call relations**: This is used when callers want richer metric metadata. It follows the same path as `MetricsClient::counter`, but includes the description when the OpenTelemetry counter is first created.
 
 
 ##### `MetricsClient::histogram`  (lines 337–339)
@@ -1540,11 +1568,11 @@ fn counter_with_description(
 fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()>
 ```
 
-**Purpose**: Public API for recording a generic integer histogram sample. It delegates all validation and instrument caching to the inner client.
+**Purpose**: Public helper for recording one sample in a histogram. Use it for values where the spread matters, not just the latest value.
 
-**Data flow**: Passes `name`, `value`, and `tags` to `self.0.histogram` and returns the resulting `Result<()>`.
+**Data flow**: It receives a metric name, integer sample value, and tags → forwards them to the inner histogram recorder → returns success or a metrics error.
 
-**Call relations**: This is used when callers need histogram aggregation but not the duration-specific helpers.
+**Call relations**: This is the simple public entry point for histogram samples. It delegates to `MetricsClientInner::histogram`, which validates the name, prepares attributes, and records the sample.
 
 
 ##### `MetricsClient::gauge`  (lines 342–344)
@@ -1553,11 +1581,11 @@ fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()>
 fn gauge(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()>
 ```
 
-**Purpose**: Public API for recording a gauge measurement without an instrument description. It is the simple gauge entry point.
+**Purpose**: Public helper for recording a current numeric value without a description. Use it for measurements that can rise and fall.
 
-**Data flow**: Forwards `name`, `value`, and `tags` to `self.0.gauge(name, None, value, tags)` and returns the result.
+**Data flow**: It receives a metric name, current value, and tags → passes them to the inner gauge recorder with no description → returns success or an error.
 
-**Call relations**: It is the standard gauge wrapper over the inner implementation.
+**Call relations**: Application code calls this when it has a point-in-time value to report. The actual OpenTelemetry work happens in `MetricsClientInner::gauge`.
 
 
 ##### `MetricsClient::gauge_with_description`  (lines 347–355)
@@ -1572,11 +1600,11 @@ fn gauge_with_description(
     ) -> Result<()>
 ```
 
-**Purpose**: Public gauge API that associates a description with the instrument. It allows richer metric metadata while reusing the same recording path.
+**Purpose**: Public helper for recording a current numeric value with a human-readable description. This improves clarity for anyone inspecting the metric later.
 
-**Data flow**: Calls `self.0.gauge(name, Some(description), value, tags)` and returns the resulting `Result<()>`.
+**Data flow**: It receives a metric name, description, value, and tags → forwards them to the inner gauge recorder → returns the inner result.
 
-**Call relations**: This is the described variant of the public gauge API.
+**Call relations**: This mirrors `MetricsClient::gauge` but includes metadata when the gauge instrument is created. It delegates to `MetricsClientInner::gauge`.
 
 
 ##### `MetricsClient::record_duration`  (lines 358–372)
@@ -1590,11 +1618,11 @@ fn record_duration(
     ) -> Result<()>
 ```
 
-**Purpose**: Records a duration in milliseconds using a histogram configured with millisecond units and predefined bucket boundaries. It is the primary duration metric API used by session telemetry.
+**Purpose**: Records how long something took, measured in milliseconds. It uses a histogram so many timings can be summarized into fast, typical, and slow ranges.
 
-**Data flow**: Converts the input `Duration` to milliseconds, clamps it to `i64::MAX` before casting to `f64`, and forwards the sample plus fixed unit/description/boundaries to `self.0.duration_histogram`.
+**Data flow**: It receives a metric name, a `Duration`, and tags → converts the duration to milliseconds, capping it so it fits safely into the expected numeric range → sends it to the inner duration histogram with millisecond units, a standard description, and millisecond bucket boundaries → returns success or an error.
 
-**Call relations**: This is called by higher-level telemetry code whenever a latency should be aggregated in milliseconds.
+**Call relations**: Timer-related code and duration helpers call this after an operation finishes. It hands the converted value to `MetricsClientInner::duration_histogram` for validation, tagging, caching, and recording.
 
 *Call graph*: called by 2 (record, record_duration); 1 external calls (as_millis).
 
@@ -1611,11 +1639,11 @@ fn record_duration_seconds_with_description(
     ) -> Result<()>
 ```
 
-**Purpose**: Records a duration in seconds using a histogram with caller-provided description text and second-based bucket boundaries. It supports metrics whose natural unit is seconds rather than milliseconds.
+**Purpose**: Records how long something took, measured in seconds, with a custom description. This is useful when a metric should use seconds as its unit in telemetry systems.
 
-**Data flow**: Converts the input `Duration` to `as_secs_f64()`, then forwards the sample, `"s"` unit, caller description, and fixed second boundaries to `self.0.duration_histogram`.
+**Data flow**: It receives a metric name, description, `Duration`, and tags → converts the duration to a floating-point number of seconds → sends it to the inner duration histogram with second units and second-based bucket boundaries → returns success or an error.
 
-**Call relations**: It is the alternate duration API for second-scale metrics with explicit descriptions.
+**Call relations**: Callers use this when they need descriptive, seconds-based timing metrics. It delegates the actual recording to `MetricsClientInner::duration_histogram`.
 
 *Call graph*: 1 external calls (as_secs_f64).
 
@@ -1630,11 +1658,11 @@ fn start_timer(
     ) -> std::result::Result<Timer, MetricsError>
 ```
 
-**Purpose**: Creates a `Timer` object bound to this metrics client, metric name, and tag set. The timer can later record elapsed duration automatically.
+**Purpose**: Starts a timer object that can later record elapsed time for a named metric. This is a convenience for measuring a block of work without manually calculating the duration.
 
-**Data flow**: Constructs `Timer::new(name, tags, self)` and wraps it in `Ok(...)`, returning `std::result::Result<Timer, MetricsError>`.
+**Data flow**: It receives a metric name and tags → creates a `Timer` tied to this metrics client → returns the timer or a metrics error.
 
-**Call relations**: This is used by session telemetry and other callers that prefer scoped timing over manually measuring durations.
+**Call relations**: Code that wants scoped timing calls this before doing work. It hands control to `Timer::new`, and the timer later uses this client to record the measured duration.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -1645,11 +1673,11 @@ fn start_timer(
 fn snapshot(&self) -> Result<ResourceMetrics>
 ```
 
-**Purpose**: Collects a runtime metrics snapshot from the optional manual reader without shutting down the provider. It is intended for debug/runtime summaries and delta resets.
+**Purpose**: Collects a current snapshot of runtime metrics without shutting down the metrics provider. This is useful for tests, diagnostics, or live inspection.
 
-**Data flow**: Reads `self.0.runtime_reader`; if absent, returns `MetricsError::RuntimeSnapshotUnavailable`. Otherwise it creates `ResourceMetrics::default()`, calls `reader.collect(&mut snapshot)`, maps collection failures to `MetricsError::RuntimeSnapshotCollect`, and returns the populated snapshot.
+**Data flow**: It checks whether a runtime manual reader was configured → if not, returns a “snapshot unavailable” error → otherwise creates an empty `ResourceMetrics` snapshot → asks the manual reader to collect into it → returns the filled snapshot or a collection error.
 
-**Call relations**: This powers session-level runtime summaries and reset behavior when runtime-reader support was enabled at client construction.
+**Call relations**: This depends on the manual reader created in `MetricsClient::new` and attached in `build_provider`. It does not export or shut down metrics; it only asks the existing reader for the current state.
 
 *Call graph*: 1 external calls (default).
 
@@ -1660,11 +1688,11 @@ fn snapshot(&self) -> Result<ResourceMetrics>
 fn shutdown(&self) -> Result<()>
 ```
 
-**Purpose**: Public shutdown API that flushes and stops the underlying OTEL provider. It delegates directly to the inner shutdown logic.
+**Purpose**: Public cleanup method for flushing and stopping the metrics system. Call it when the application is ending or the client is no longer needed.
 
-**Data flow**: Calls `self.0.shutdown()` and returns its `Result<()>`.
+**Data flow**: It receives no extra input → delegates to the inner shutdown method → returns success or the shutdown error from the provider.
 
-**Call relations**: This is used during process or provider teardown.
+**Call relations**: This is the public face of `MetricsClientInner::shutdown`. It lets higher-level code perform a clean teardown without knowing OpenTelemetry details.
 
 
 ##### `os_resource_attributes`  (lines 418–432)
@@ -1673,11 +1701,11 @@ fn shutdown(&self) -> Result<()>
 fn os_resource_attributes() -> Vec<KeyValue>
 ```
 
-**Purpose**: Builds sanitized OS-related resource attributes for the OTEL resource. It omits attributes whose sanitized value becomes `"unspecified"`.
+**Purpose**: Builds metric resource attributes that describe the operating system. These labels help operators group or filter metrics by platform.
 
-**Data flow**: Calls `os_info::get()`, converts OS type and version to strings, sanitizes both with `sanitize_metric_tag_value`, conditionally pushes `KeyValue::new("os", ...)` and `KeyValue::new("os_version", ...)` into a vector when they are not `"unspecified"`, and returns the vector.
+**Data flow**: It reads the current operating system type and version → sanitizes both values so they are safe as metric tag values → skips values reported as `unspecified` → returns a list of OpenTelemetry key/value attributes such as `os` and `os_version`.
 
-**Call relations**: It is called during `MetricsClient::new` so every metrics provider resource carries normalized OS metadata.
+**Call relations**: `MetricsClient::new` calls this while building the service resource. The returned attributes are attached to all metrics from this client as background context.
 
 *Call graph*: called by 1 (new); 4 external calls (new, new, sanitize_metric_tag_value, get).
 
@@ -1693,11 +1721,11 @@ fn build_provider(
 ) -> (SdkMeterProvider, Meter)
 ```
 
-**Purpose**: Constructs the OTEL meter provider and meter from a resource, push exporter, optional export interval, and optional runtime manual reader. It wires together the periodic export pipeline and the optional snapshot pipeline.
+**Purpose**: Assembles the OpenTelemetry meter provider and meter around a chosen metrics exporter. Think of it as wiring the measuring tools to the delivery pipe.
 
-**Data flow**: Builds a `PeriodicReader` from the exporter, optionally applies `with_interval`, creates an `SdkMeterProvider::builder()` with the resource, optionally adds a `SharedManualReader` wrapping the provided `ManualReader`, adds the periodic reader, builds the provider, obtains `provider.meter(METER_NAME)`, and returns `(SdkMeterProvider, Meter)`.
+**Data flow**: It receives resource information, an exporter, an optional export interval, and an optional manual snapshot reader → builds a periodic reader that exports metrics on a schedule → optionally attaches the shared manual reader for snapshots → builds the SDK meter provider → asks the provider for Codex’s meter → returns both provider and meter.
 
-**Call relations**: It is called by `MetricsClient::new` after exporter selection to produce the concrete provider used for all metric recording.
+**Call relations**: `MetricsClient::new` calls this after deciding which exporter to use. If snapshots are enabled, it calls `SharedManualReader::new` so the provider and client can share access to the same manual reader.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (new); 2 external calls (builder, builder).
 
@@ -1711,22 +1739,26 @@ fn build_otlp_metric_exporter(
 ) -> Result<opentelemetry_otlp::MetricExporter>
 ```
 
-**Purpose**: Builds an OTLP metric exporter from the crate's exporter configuration, handling disabled exporters, Statsig indirection, gRPC vs HTTP transport, headers, protocol selection, and TLS customization. It translates configuration errors into `MetricsError` values.
+**Purpose**: Creates a network exporter that sends metrics using OTLP, the OpenTelemetry protocol for telemetry data. It supports both gRPC and HTTP transport, with headers and optional TLS security settings.
 
-**Data flow**: Pattern-matches `OtelExporter`. `None` returns `ExporterDisabled`. `Statsig` resolves to a concrete exporter via `crate::config::resolve_exporter` and recurses. `OtlpGrpc` logs the endpoint, builds a header map, creates a base `ClientTlsConfig`, optionally customizes it with `crate::otlp::build_grpc_tls_config`, then builds a tonic-based exporter with endpoint, temporality, metadata, and TLS. `OtlpHttp` logs the endpoint, maps `OtelHttpProtocol` to OTLP `Protocol`, builds an HTTP exporter with endpoint, temporality, protocol, and headers, optionally injects a custom HTTP client from `crate::otlp::build_http_client`, then builds the exporter. Build failures are mapped to `MetricsError::ExporterBuild`; TLS/config failures become `InvalidConfig`.
+**Data flow**: It receives an exporter configuration and a temporality setting → rejects disabled export → resolves special exporter aliases when needed → for gRPC, builds headers and TLS configuration, then creates a tonic-based exporter → for HTTP, chooses binary or JSON protocol, adds headers and optional TLS HTTP client, then creates an HTTP exporter → returns the exporter or a clear metrics configuration/build error.
 
-**Call relations**: It is called only by `MetricsClient::new` when the selected exporter is OTLP-based.
+**Call relations**: `MetricsClient::new` calls this when metrics are configured to leave the process through OTLP. It uses shared OTLP helper functions for headers, TLS, and HTTP clients, then hands the finished exporter back to `build_provider`.
 
 *Call graph*: calls 4 internal fn (resolve_exporter, build_grpc_tls_config, build_header_map, build_http_client); called by 1 (new); 4 external calls (new, from_headers, debug!, builder).
 
 
 ### `otel/src/metrics/timer.rs`
 
-`domain_logic` · `around timed operations and scope exit`
+`domain_logic` · `cross-cutting`
 
-This file provides the `Timer` type used by the metrics subsystem to capture durations without requiring callers to manually compute elapsed time. A timer stores four pieces of state: the metric name as an owned `String`, a cloned owned copy of the base tags as `Vec<(String, String)>`, a cloned `MetricsClient`, and the `Instant` captured at creation. Owning the name and tags lets the timer outlive the borrowed inputs passed to `new`, and cloning the client makes the timer self-contained.
+This file provides `Timer`, a helper for measuring elapsed time and sending that measurement to the metrics system. Think of it like starting a kitchen timer when you begin a task, then writing down the result when the task is done.
 
-The design is intentionally RAII-based. `Timer::new` snapshots `Instant::now()` and copies the provided tags into owned strings. `Timer::record` computes elapsed time from `start_time`, prepends any `additional_tags` supplied at call time, then appends the timer’s stored base tags and forwards the duration to `MetricsClient::record_duration`. The ordering means ad hoc tags appear before the timer’s default tags in the exported slice. The `Drop` implementation calls `record(&[])` automatically, ensuring a duration is emitted even if the caller forgets to record manually. Errors during drop cannot be returned, so they are logged with `tracing::error!` instead of panicking. That makes timer cleanup best-effort and non-fatal during unwinding or scope exit.
+A `Timer` stores four things: the metric name, a set of labels called tags, a metrics client that knows how to report the measurement, and the moment the timer started. Tags are extra pieces of context, such as which operation or route was being measured, so later dashboards can group and filter the numbers.
+
+The important behavior is that the timer records itself automatically when it is dropped. In Rust, `drop` runs when a value goes out of scope, similar to cleaning up when leaving a room. That means code can start a timer and then mostly forget about it; when the timer’s lifetime ends, it sends the elapsed duration. If sending the metric fails during this automatic cleanup, the file logs an error instead of crashing the program.
+
+Callers can also record explicitly with extra tags. Those extra tags are combined with the timer’s original tags, and the metrics client receives the elapsed time since creation.
 
 #### Function details
 
@@ -1736,11 +1768,11 @@ The design is intentionally RAII-based. `Timer::new` snapshots `Instant::now()` 
 fn drop(&mut self)
 ```
 
-**Purpose**: Automatically records the timer’s duration when the timer leaves scope. It converts any recording failure into an error log instead of surfacing it to the caller.
+**Purpose**: Automatically records the timer when the `Timer` value is being cleaned up. This makes timing easy and safer, because callers do not have to remember to manually submit the measurement in every path.
 
-**Data flow**: Reads the timer’s stored name, tags, client, and start time through `self.record(&[])` → if recording returns `Err`, formats and emits a tracing error message → returns no value and does not mutate externally visible state beyond the metric/log side effects.
+**Data flow**: When the timer is about to disappear, it calls `record` with no extra tags. If recording succeeds, nothing else happens. If recording fails, the error is written to the application logs so the failure is visible without interrupting cleanup.
 
-**Call relations**: This is invoked implicitly by Rust’s drop semantics whenever a `Timer` is destroyed. It delegates to `Timer::record` with no extra tags so the normal recording path is reused, and only adds logging for the error-only drop context.
+**Call relations**: This is called by Rust automatically when a `Timer` goes out of scope. It hands off the real work to `Timer::record`, and only adds the fallback behavior of logging an error if the metrics client could not accept the duration.
 
 *Call graph*: calls 1 internal fn (record); 1 external calls (error!).
 
@@ -1751,11 +1783,11 @@ fn drop(&mut self)
 fn new(name: &str, tags: &[(&str, &str)], client: &MetricsClient) -> Self
 ```
 
-**Purpose**: Constructs a self-contained timer from a metric name, borrowed tag slice, and metrics client. It snapshots the start instant immediately so later recordings measure elapsed time from creation.
+**Purpose**: Creates a new timer and starts measuring immediately. It is used when some other part of the metrics system wants to begin timing an operation.
 
-**Data flow**: Takes `name: &str`, `tags: &[(&str, &str)]`, and `client: &MetricsClient` → clones the metric name into a `String`, maps each borrowed tag pair into owned `(String, String)` entries, clones the client handle, captures `Instant::now()`, and returns a populated `Timer`.
+**Data flow**: It receives a metric name, a list of tags, and a metrics client. It copies the name and tags into owned strings, clones the client so the timer can keep using it, records the current instant as the start time, and returns the ready-to-use `Timer`.
 
-**Call relations**: This constructor is called by the higher-level `start_timer` API in the metrics client layer. It performs all ownership conversion up front so later `record` and `drop` calls can run without borrowing the original inputs.
+**Call relations**: This function is called by `start_timer`, which is the higher-level entry point for beginning a timed measurement. `Timer::new` prepares the timer’s stored data and uses the system clock’s current instant as the starting line.
 
 *Call graph*: called by 1 (start_timer); 2 external calls (now, clone).
 
@@ -1766,24 +1798,24 @@ fn new(name: &str, tags: &[(&str, &str)], client: &MetricsClient) -> Self
 fn record(&self, additional_tags: &[(&str, &str)]) -> Result<()>
 ```
 
-**Purpose**: Records the elapsed duration since timer creation, optionally augmenting the metric with extra tags supplied at record time. It is the shared implementation used by both explicit recording and drop-based recording.
+**Purpose**: Sends the elapsed time for this timer to the metrics client. Callers use it when they want to record the duration now, optionally adding more context tags for this specific recording.
 
-**Data flow**: Accepts `additional_tags: &[(&str, &str)]` and reads `self.tags`, `self.name`, `self.client`, and `self.start_time` → allocates a combined tag vector sized for both tag sets, extends it first with `additional_tags` and then with borrowed views of the stored owned tags, computes `self.start_time.elapsed()`, and passes name, duration, and tags to `MetricsClient::record_duration` → returns that `Result<()>`.
+**Data flow**: It receives extra tags from the caller and reads the timer’s stored tags, name, client, and start time. It builds one combined tag list, measures how much time has passed since the timer started, and asks the metrics client to record that duration. The result is either success or an error from the metrics client.
 
-**Call relations**: This method is called directly by `Timer::drop` and may also be used by callers that want to record before scope exit. It delegates the actual metric emission to `MetricsClient::record_duration`, keeping this type focused on elapsed-time calculation and tag assembly.
+**Call relations**: This is the central recording step used by `Timer::drop` during automatic cleanup. After combining tags and calculating elapsed time, it hands the final metric name, duration, and tags to the metrics client’s `record_duration` function.
 
 *Call graph*: calls 1 internal fn (record_duration); called by 1 (drop); 2 external calls (elapsed, with_capacity).
 
 
 ### `otel/src/metrics/process.rs`
 
-`domain_logic` · `startup / first metrics initialization in a process`
+`domain_logic` · `startup`
 
-This file contains a single helper for emitting the `PROCESS_START_METRIC` at most once. The module-level `PROCESS_START_RECORDED: AtomicBool` starts as `false` and acts as a lock-free guard across the entire process. `record_process_start_once` uses `compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)` to claim the right to emit the metric; if another caller has already done so, the function returns `Ok(false)` without touching the metrics client.
+This file solves a small but important counting problem. A service may have many setup steps, background tasks, or libraries that all know the process has started. If each one reported a startup metric, the monitoring system would think many processes started when only one did. This file acts like a turnstile that lets the first report through and politely blocks the rest.
 
-On the first successful call, it records a counter increment of 1 using the provided `MetricsClient`. The metric includes a single originator tag built from `ORIGINATOR_TAG` and `bounded_originator_tag_value(originator)`, ensuring the originator dimension is normalized and bounded before being sent. The function then returns `Ok(true)` to indicate that this invocation actually emitted the metric.
+It keeps a single shared flag, `PROCESS_START_RECORDED`, using an atomic boolean. “Atomic” means it can be safely checked and changed even if multiple threads try at the same time. The public function, `record_process_start_once`, checks that flag. If nobody has recorded the process start yet, it flips the flag and sends one counter increment through the metrics client. If the flag was already set, it returns `false` and sends nothing.
 
-The design is intentionally minimal: there is no reset path, and relaxed atomics are sufficient because the only invariant is one-time emission, not synchronization of additional state. Any metrics-layer failure is propagated to the caller rather than swallowed.
+The metric also includes an `originator` tag, which says which part of the system is claiming the start event. Before sending, the originator value is bounded, meaning it is made safe or limited so metrics do not explode with too many unique label values. Without this file, dashboards and alerts based on process starts could be inflated or misleading.
 
 #### Function details
 
@@ -1793,24 +1825,26 @@ The design is intentionally minimal: there is no reset path, and relaxed atomics
 fn record_process_start_once(metrics: &MetricsClient, originator: &str) -> Result<bool>
 ```
 
-**Purpose**: Records the process-start counter exactly once for the lifetime of the process and reports whether this call performed the emission. It prevents duplicate startup counts across repeated initialization paths.
+**Purpose**: Records the process-start counter one time for the current running process. It returns whether this call was the one that actually sent the metric, so callers can tell the difference between a real first record and a skipped duplicate.
 
-**Data flow**: Reads and updates the static `PROCESS_START_RECORDED` atomic with `compare_exchange`; if the exchange fails, returns `Ok(false)`. On success, computes a bounded originator tag with `bounded_originator_tag_value(originator)`, calls `metrics.counter(PROCESS_START_METRIC, 1, &[(ORIGINATOR_TAG, ...)])`, propagates any metrics error, and returns `Ok(true)`.
+**Data flow**: It receives a metrics client, which is the object used to send metrics, and an originator string, which names where the report came from. It first checks and updates the shared `PROCESS_START_RECORDED` flag in one safe step. If another caller already recorded the start, it returns `Ok(false)` and changes nothing else. If this is the first caller, it cleans up or limits the originator tag value, sends a counter increment of 1 for the process-start metric, and returns `Ok(true)` if sending succeeds. If sending the metric fails, that error is returned.
 
-**Call relations**: It is called by startup/setup code after a metrics client exists, using the metrics client's standard counter API for the actual emission.
+**Call relations**: When some startup code wants to announce that the process has begun, it calls this function instead of sending the metric directly. The function calls `bounded_originator_tag_value` to make the originator tag safe for metrics, then calls the metrics client's `counter` method to send the actual count. The atomic flag sits in front of those calls so only the first attempt reaches the metrics system.
 
 *Call graph*: calls 2 internal fn (counter, bounded_originator_tag_value).
 
 
 ### `otel/src/metrics/runtime_metrics.rs`
 
-`domain_logic` · `runtime snapshot inspection and post-hoc telemetry summarization`
+`domain_logic` · `cross-cutting metric collection and logging`
 
-This file is the read-side summarizer for runtime metrics snapshots. `RuntimeMetricTotals` is a tiny pair of `count` and `duration_ms` with helpers for emptiness checks and saturating merges. `RuntimeMetricsSummary` then groups those totals into higher-level categories—tool calls, API calls, SSE streaming events, websocket requests, websocket events—and also stores standalone duration totals for Responses API overhead/inference/engine timing plus turn TTFT and TTFM.
+OpenTelemetry is a common toolkit for collecting measurements from running software. Its raw metric snapshots are detailed and nested, a bit like a warehouse full of labeled boxes. This file acts like a clerk who walks through those boxes, finds the labels this project cares about, adds the numbers, and writes a short receipt.
 
-The summary logic is intentionally asymmetric. `is_empty` requires every grouped total and standalone duration to be zero. `merge` saturating-adds the grouped totals but treats the standalone timing fields as last-nonzero wins: if the incoming summary has a positive value, it replaces the current one. `responses_api_summary` returns a copy containing only the Responses API timing fields and zero/default values elsewhere.
+The main receipt is `RuntimeMetricsSummary`. It groups related measurements: tool calls, API calls, server-sent streaming events, websocket requests and events, and several response-timing fields such as overhead time, inference time, and “time to first token” style timings. For groups that have both a count and a duration, it uses `RuntimeMetricTotals`.
 
-`from_snapshot` is the main extractor. It reads a `ResourceMetrics` snapshot and computes each field by summing either counters or histogram sums for specific metric-name constants. The helper functions traverse all scope metrics in the snapshot, filter by metric name, and then inspect the aggregated metric data. Counter extraction only accepts `AggregatedMetrics::U64(MetricData::Sum(_))`; histogram extraction only accepts `AggregatedMetrics::F64(MetricData::Histogram(_))`. Histogram sums are converted to `u64` with `f64_to_u64`, which rejects non-finite and non-positive values and clamps huge values before rounding.
+The file also knows how to merge summaries. Counts and durations are added safely, while one-off timing fields are replaced only when the newer value is non-zero. That means a later real measurement can fill in a blank, but an empty value does not erase useful data.
+
+At the bottom are small helper functions that search a `ResourceMetrics` snapshot for a metric name, then sum either counter values or histogram duration totals. Histogram sums arrive as floating-point numbers, so the file carefully converts them into whole milliseconds, treating invalid, negative, or infinite values as zero.
 
 #### Function details
 
@@ -1820,11 +1854,11 @@ The summary logic is intentionally asymmetric. `is_empty` requires every grouped
 fn is_empty(self) -> bool
 ```
 
-**Purpose**: Checks whether both the count and duration components are zero. It is the basic emptiness predicate for grouped runtime totals.
+**Purpose**: Checks whether a count-and-duration pair contains no useful information. This is used to tell whether a category such as API calls or tool calls has recorded anything at all.
 
-**Data flow**: Reads `self.count` and `self.duration_ms`, compares both to zero, and returns a `bool`.
+**Data flow**: It receives one `RuntimeMetricTotals` value. It looks at the `count` and `duration_ms` fields. It returns `true` only when both are zero; otherwise it returns `false`.
 
-**Call relations**: It is used by `RuntimeMetricsSummary::is_empty` to determine whether grouped categories contain any data.
+**Call relations**: When `RuntimeMetricsSummary::is_empty` checks the whole summary, it asks each `RuntimeMetricTotals` section to answer this smaller question for itself.
 
 *Call graph*: called by 1 (is_empty).
 
@@ -1835,11 +1869,11 @@ fn is_empty(self) -> bool
 fn merge(&mut self, other: Self)
 ```
 
-**Purpose**: Adds another totals struct into this one using saturating arithmetic. It prevents overflow while combining counts and durations from multiple summaries.
+**Purpose**: Adds another count-and-duration pair into the current one. It is used when measurements from more than one snapshot need to be combined.
 
-**Data flow**: Reads `other.count` and `other.duration_ms`, updates `self.count` and `self.duration_ms` with `saturating_add`, and returns `()`.
+**Data flow**: It receives a mutable current total and another total. It adds the other count to the current count, and the other duration to the current duration. The current object is changed in place. The additions are saturating, meaning they stop at the largest possible number instead of overflowing into a wrong value.
 
-**Call relations**: It is called by `RuntimeMetricsSummary::merge` for each grouped category.
+**Call relations**: When `RuntimeMetricsSummary::merge` combines two full summaries, it delegates each count-and-duration category to this function so the small total knows how to add itself correctly.
 
 *Call graph*: called by 1 (merge).
 
@@ -1850,11 +1884,11 @@ fn merge(&mut self, other: Self)
 fn is_empty(self) -> bool
 ```
 
-**Purpose**: Checks whether the entire summary contains no recorded activity or timing data. Every grouped total must be empty and every standalone timing field must be zero.
+**Purpose**: Checks whether the entire runtime summary has no recorded measurements. This is useful before logging or reporting, so the system can avoid printing an empty metrics report.
 
-**Data flow**: Calls `is_empty()` on `tool_calls`, `api_calls`, `streaming_events`, `websocket_calls`, and `websocket_events`, directly compares each standalone timing field to zero, and returns the combined boolean result.
+**Data flow**: It receives a `RuntimeMetricsSummary`. It asks each grouped total whether it is empty, then checks every standalone timing field for zero. It returns `true` only if every part of the summary is blank.
 
-**Call relations**: It is used by session telemetry to suppress returning an all-zero runtime summary.
+**Call relations**: This is the top-level emptiness check. It relies on `RuntimeMetricTotals::is_empty` for the grouped categories, then directly checks the single timing fields itself.
 
 *Call graph*: calls 1 internal fn (is_empty).
 
@@ -1865,11 +1899,11 @@ fn is_empty(self) -> bool
 fn merge(&mut self, other: Self)
 ```
 
-**Purpose**: Combines another summary into this one, summing grouped totals and replacing standalone timing fields when the incoming value is positive. This supports incremental aggregation while preserving the latest nonzero timing breakdowns.
+**Purpose**: Combines another runtime summary into the current one. This lets the system build one useful summary out of multiple metric snapshots or partial summaries.
 
-**Data flow**: Calls `merge` on each `RuntimeMetricTotals` field, then for each standalone timing field checks `if other.<field> > 0` and overwrites `self.<field>` when true. It mutates `self` in place and returns `()`.
+**Data flow**: It receives a mutable current summary and another summary. For categories with counts and durations, it adds the numbers. For single timing fields, it copies the incoming value only if that value is greater than zero. The current summary is updated in place.
 
-**Call relations**: It is used when multiple runtime summaries need to be folded together, with grouped activity accumulated and timing breakdowns treated as overwrite-on-presence.
+**Call relations**: This function is the summary-level combiner. It calls `RuntimeMetricTotals::merge` for grouped totals, while it handles the standalone response and turn timing fields directly.
 
 *Call graph*: calls 1 internal fn (merge).
 
@@ -1880,11 +1914,11 @@ fn merge(&mut self, other: Self)
 fn responses_api_summary(&self) -> RuntimeMetricsSummary
 ```
 
-**Purpose**: Returns a summary containing only the Responses API timing breakdown fields, with all other categories reset to defaults. It is a projection helper for callers interested only in websocket timing metrics.
+**Purpose**: Builds a smaller summary containing only the Responses API timing fields. This is useful when a caller wants to log or display just that subset instead of the full runtime picture.
 
-**Data flow**: Constructs a new `RuntimeMetricsSummary` copying the six Responses API timing fields from `self` and filling the remaining fields from `RuntimeMetricsSummary::default()`.
+**Data flow**: It reads the current summary. It copies only the Responses API timing values into a new `RuntimeMetricsSummary`, and fills every unrelated field with its default empty value. It returns that new trimmed-down summary.
 
-**Call relations**: It is used by higher-level logging/reporting code that wants just the Responses API timing subset.
+**Call relations**: This helper is used when websocket timing totals are logged. In that flow, the logger asks for the Responses API slice of the larger summary so it can focus on those specific timing measurements.
 
 *Call graph*: called by 1 (log_websocket_timing_totals); 1 external calls (default).
 
@@ -1895,11 +1929,11 @@ fn responses_api_summary(&self) -> RuntimeMetricsSummary
 fn from_snapshot(snapshot: &ResourceMetrics) -> Self
 ```
 
-**Purpose**: Builds a runtime summary by extracting named counters and histogram sums from an OTEL `ResourceMetrics` snapshot. It is the main translation from raw OTEL data to compact application-level totals.
+**Purpose**: Creates a friendly runtime summary from a raw OpenTelemetry metric snapshot. This is the main translation step from detailed telemetry data into the compact shape used by the rest of the project.
 
-**Data flow**: For each grouped category, calls `sum_counter` on the corresponding count metric and `sum_histogram_ms` on the corresponding duration metric to build `RuntimeMetricTotals`. For standalone timing fields, calls `sum_histogram_ms` on each dedicated metric constant. It then returns a populated `RuntimeMetricsSummary`.
+**Data flow**: It receives a `ResourceMetrics` snapshot, which contains many named metric streams. For each metric name this project cares about, it asks helper functions to total either counter values or histogram duration sums. It then puts those totals into a new `RuntimeMetricsSummary` and returns it.
 
-**Call relations**: It is called by `SessionTelemetry::runtime_metrics_summary` after a snapshot has been collected.
+**Call relations**: This function is called by `runtime_metrics_summary`, which wants a clean summary from the current telemetry snapshot. During that conversion, it repeatedly calls `sum_counter` for count metrics and `sum_histogram_ms` for duration metrics.
 
 *Call graph*: calls 2 internal fn (sum_counter, sum_histogram_ms); called by 1 (runtime_metrics_summary).
 
@@ -1910,11 +1944,11 @@ fn from_snapshot(snapshot: &ResourceMetrics) -> Self
 fn sum_counter(snapshot: &ResourceMetrics, name: &str) -> u64
 ```
 
-**Purpose**: Sums all matching counter metrics with a given name across every scope in a snapshot. It abstracts the traversal over OTEL scope metrics.
+**Purpose**: Finds all counter metrics with a given name in a snapshot and adds their values. A counter is a measurement that only goes up, such as “number of API calls.”
 
-**Data flow**: Iterates `snapshot.scope_metrics()`, flattens each scope's metrics, filters metrics whose `name()` equals the requested `name`, maps each through `sum_counter_metric`, sums the resulting `u64` values, and returns the total.
+**Data flow**: It receives a metrics snapshot and the name of the counter to look for. It walks through all metric groups in the snapshot, keeps only metrics with the matching name, totals their counter data, and returns one combined whole number.
 
-**Call relations**: It is used by `RuntimeMetricsSummary::from_snapshot` for all count-based fields.
+**Call relations**: `RuntimeMetricsSummary::from_snapshot` uses this whenever it needs a count, such as tool call count or websocket request count. This helper does the searching so the summary-building code can stay easy to read.
 
 *Call graph*: called by 1 (from_snapshot); 1 external calls (scope_metrics).
 
@@ -1925,11 +1959,11 @@ fn sum_counter(snapshot: &ResourceMetrics, name: &str) -> u64
 fn sum_counter_metric(metric: &Metric) -> u64
 ```
 
-**Purpose**: Extracts the total value from a single OTEL counter metric when it has the expected aggregated shape. Unexpected metric data types contribute zero.
+**Purpose**: Extracts the total value from one counter metric. It protects callers from accidentally treating a non-counter metric as a counter.
 
-**Data flow**: Matches `metric.data()`. If it is `AggregatedMetrics::U64(MetricData::Sum(sum))`, it iterates the sum's data points, reads each point's `value`, sums them, and returns the total; otherwise it returns `0`.
+**Data flow**: It receives one OpenTelemetry `Metric`. It checks whether the metric data is an unsigned integer sum, which is the expected counter form. If it is, it adds all of that metric’s data-point values and returns the total. If it is not the right kind of metric, it returns zero.
 
-**Call relations**: It is the per-metric helper used by `sum_counter`.
+**Call relations**: This is the per-metric worker used by the counter-summing path. `sum_counter` finds the matching named metrics, and this function knows how to read each matching counter safely.
 
 *Call graph*: 1 external calls (data).
 
@@ -1940,11 +1974,11 @@ fn sum_counter_metric(metric: &Metric) -> u64
 fn sum_histogram_ms(snapshot: &ResourceMetrics, name: &str) -> u64
 ```
 
-**Purpose**: Sums the histogram `sum()` values for all matching histogram metrics with a given name across every scope in a snapshot. It is used for duration totals expressed in milliseconds.
+**Purpose**: Finds all duration histogram metrics with a given name in a snapshot and adds their total time. A histogram records many observed timings, and this function cares about the sum of those timings.
 
-**Data flow**: Iterates `snapshot.scope_metrics()`, flattens metrics, filters by metric name, maps each metric through `sum_histogram_metric_ms`, sums the resulting `u64` values, and returns the total.
+**Data flow**: It receives a metrics snapshot and the duration metric name to look for. It walks through the metric groups, keeps only metrics with the matching name, extracts each histogram’s summed duration, and returns the combined result as whole milliseconds.
 
-**Call relations**: It is used by `RuntimeMetricsSummary::from_snapshot` for all duration-based fields.
+**Call relations**: `RuntimeMetricsSummary::from_snapshot` uses this for every duration field, such as API call duration, streaming event duration, and response timing values. This helper hides the nested OpenTelemetry structure from the summary-building code.
 
 *Call graph*: called by 1 (from_snapshot); 1 external calls (scope_metrics).
 
@@ -1955,11 +1989,11 @@ fn sum_histogram_ms(snapshot: &ResourceMetrics, name: &str) -> u64
 fn sum_histogram_metric_ms(metric: &Metric) -> u64
 ```
 
-**Purpose**: Extracts the summed histogram total from a single OTEL histogram metric when it has the expected floating-point histogram shape. Non-histogram or differently typed metrics contribute zero.
+**Purpose**: Extracts the summed duration from one histogram metric and expresses it as whole milliseconds. It ignores metrics that are not floating-point histograms.
 
-**Data flow**: Matches `metric.data()`. If it is `AggregatedMetrics::F64(MetricData::Histogram(histogram))`, it iterates the histogram's data points, converts each point's `sum()` with `f64_to_u64`, sums the converted values, and returns the total; otherwise it returns `0`.
+**Data flow**: It receives one OpenTelemetry `Metric`. It checks whether the metric contains floating-point histogram data. If so, it reads the sum from each histogram data point, converts each sum to a safe whole number with `f64_to_u64`, adds them, and returns the total. If the metric is the wrong shape, it returns zero.
 
-**Call relations**: It is the per-metric helper used by `sum_histogram_ms`.
+**Call relations**: This is the per-metric worker used by `sum_histogram_ms`. The outer function finds matching duration metrics by name, and this function reads each one safely.
 
 *Call graph*: 1 external calls (data).
 
@@ -1970,11 +2004,11 @@ fn sum_histogram_metric_ms(metric: &Metric) -> u64
 fn f64_to_u64(value: f64) -> u64
 ```
 
-**Purpose**: Safely converts a floating-point aggregate value into a nonnegative `u64` by rejecting invalid values and clamping large ones. It is used when reading histogram sums from OTEL snapshots.
+**Purpose**: Converts a floating-point measurement into a safe whole-number millisecond value. It prevents bad telemetry values from turning into misleading huge or invalid numbers.
 
-**Data flow**: Reads `value: f64`, returns `0` if it is non-finite or `<= 0.0`, otherwise clamps it to `u64::MAX as f64`, rounds it, casts to `u64`, and returns the result.
+**Data flow**: It receives a floating-point number. If the number is not finite, is zero, or is negative, it returns zero. Otherwise it caps the value at the largest possible `u64`, rounds it to the nearest whole number, and returns that integer.
 
-**Call relations**: It is called by `sum_histogram_metric_ms` to normalize histogram sums before accumulation.
+**Call relations**: `sum_histogram_metric_ms` uses this when turning histogram duration sums into whole milliseconds. It is the safety gate between raw floating-point telemetry and the integer totals stored in `RuntimeMetricsSummary`.
 
 
 ### Trace and event plumbing
@@ -1982,11 +2016,13 @@ These files provide trace-context propagation plus the shared event-target and e
 
 ### `otel/src/targets.rs`
 
-`util` · `cross-cutting during tracing/log filtering`
+`domain_logic` · `cross-cutting`
 
-This file contains the string constants and predicates that partition tracing targets into log-exportable and trace-safe categories. The constants establish a naming convention rooted at `codex_otel`, with `codex_otel.log_only` representing log-only traffic and `codex_otel.trace_safe` representing targets safe to emit through trace exporters.
+This file helps keep different kinds of observability data separate. OpenTelemetry is a common system for collecting logs, traces, and metrics from a running program. A trace follows work as it moves through the system, while a log is more like a written note about something that happened.
 
-The logic is intentionally minimal but important because provider filters depend on it. `is_trace_safe_target` is a pure prefix check against `OTEL_TRACE_SAFE_TARGET`, so any nested target such as `codex_otel.trace_safe.summary` is considered trace-safe. `is_log_export_target` first requires the broader `OTEL_TARGET_PREFIX`, then explicitly excludes anything classified as trace-safe. That means trace-safe targets are not duplicated into the log pipeline, while other `codex_otel.*` targets remain eligible for log export. By keeping these checks in one file, the provider’s log and trace filters can share the same target taxonomy without duplicating string rules.
+The code uses target names as labels. Any target beginning with `codex_otel` belongs to this telemetry area. A more specific prefix, `codex_otel.trace_safe`, marks events that are safe to send to trace export. Everything under the general telemetry prefix, except those trace-safe events, is treated as log-only export data.
+
+This distinction matters because trace data may travel through different tools or be shown in different places than logs. Some telemetry may be useful for logs but not appropriate, useful, or safe inside traces. The file is therefore a small gatekeeper: it looks at a target string and answers, “Is this for log export?” or “Is this safe for trace export?” Without this central rule, different parts of the telemetry pipeline might disagree about where the same event belongs.
 
 #### Function details
 
@@ -1996,11 +2032,11 @@ The logic is intentionally minimal but important because provider filters depend
 fn is_log_export_target(target: &str) -> bool
 ```
 
-**Purpose**: Determines whether a tracing target should be exported as a log target. It accepts OTEL-prefixed targets except those reserved as trace-safe.
+**Purpose**: This function decides whether a telemetry target should be exported as a log. It returns true for targets that start with the general OpenTelemetry prefix, unless they are specifically marked as trace-safe.
 
-**Data flow**: Takes `target: &str` → checks `target.starts_with(OTEL_TARGET_PREFIX)` and `!is_trace_safe_target(target)` → returns the combined boolean.
+**Data flow**: It receives a target name as text. It checks whether the text begins with the telemetry prefix, then asks `is_trace_safe_target` whether the same target belongs to the trace-safe group. The result is a yes-or-no answer: true means this target should go through log export, false means it should not.
 
-**Call relations**: This predicate is called by `OtelProvider::log_export_filter`. It delegates the exclusion rule to `is_trace_safe_target` so the trace-safe prefix definition stays single-sourced.
+**Call relations**: The log export filtering code calls this function when deciding whether to keep or reject a telemetry event for log output. Inside that decision, this function relies on `is_trace_safe_target` so that trace-safe events are not accidentally treated as log-only events.
 
 *Call graph*: calls 1 internal fn (is_trace_safe_target); called by 1 (log_export_filter).
 
@@ -2011,24 +2047,24 @@ fn is_log_export_target(target: &str) -> bool
 fn is_trace_safe_target(target: &str) -> bool
 ```
 
-**Purpose**: Determines whether a tracing target belongs to the trace-safe namespace. It is a simple prefix classifier.
+**Purpose**: This function decides whether a telemetry target is explicitly marked as safe for trace export. It does this by checking for the `codex_otel.trace_safe` prefix.
 
-**Data flow**: Takes `target: &str` → returns `target.starts_with(OTEL_TRACE_SAFE_TARGET)`.
+**Data flow**: It receives a target name as text. It compares the beginning of that text with the trace-safe prefix. It returns true if the target starts with that prefix, and false otherwise; it does not change anything else.
 
-**Call relations**: This predicate is used directly by `OtelProvider::trace_export_filter` and indirectly by `is_log_export_target` to keep trace-safe events out of the log pipeline.
+**Call relations**: The trace export filter calls this function when deciding what can be included in traces. `is_log_export_target` also calls it as a safeguard, so anything marked trace-safe is excluded from the log-export-only group.
 
 *Call graph*: called by 2 (trace_export_filter, is_log_export_target).
 
 
 ### `otel/src/trace_context.rs`
 
-`domain_logic` · `request/span propagation and provider configuration`
+`io_transport` · `cross-cutting`
 
-This file is the trace-context utility layer that sits beside the global tracer provider. It can read the current tracing span and emit a `W3cTraceContext`, parse incoming `traceparent`/`tracestate` headers into an OpenTelemetry `Context`, set a span’s parent from that context, and lazily bootstrap a parent context from `TRACEPARENT`/`TRACESTATE` environment variables. `TRACEPARENT_CONTEXT` caches the env-derived context in a `OnceLock<Option<Context>>`, while configured tracestate entries live in a process-global `OnceLock<RwLock<BTreeMap<String, BTreeMap<String, String>>>>` so they can be updated when provider settings change.
+Modern tracing gives each request or task an ID, like a parcel tracking number. When work moves from one process to another, that ID must travel with it. This file translates between the program’s internal tracing spans and the standard W3C headers called traceparent and tracestate. The traceparent value carries the main trace and span IDs. The tracestate value carries extra vendor-specific details.
 
-The most nuanced logic is tracestate handling. `span_w3c_trace_context` injects the current span context into a temporary header map using `TraceContextPropagator`, then merges any propagated tracestate with configured entries from the global map. `merge_tracestate_entries` parses existing tracestate if possible, warns and ignores invalid incoming values, then upserts configured members in reverse map order because `TraceState::insert` prepends members. Within each member, `merge_tracestate_member_fields` treats the opaque member value as semicolon-separated `key:value` fields so configured fields can replace matching existing fields without discarding unrelated ones.
+The file can read trace context from the current tracing span, turn it into a W3cTraceContext object for sending elsewhere, and read a W3cTraceContext back into an OpenTelemetry context so a new span can continue the same trace. It can also read TRACEPARENT and TRACESTATE from environment variables, which lets a child process continue a parent process’s trace.
 
-Validation is strict before installation: `validate_tracestate_entries` and `validate_tracestate_member` encode configured field maps into member values, verify field-key and field-value grammar, ensure the final member value is header-safe, and finally ask `TraceState::from_key_value` to validate the resulting W3C structure. Invalid configuration becomes `InvalidInput` I/O errors with explicit messages. Tests cover valid parsing, invalid/missing traceparent rejection, and extraction of the current span’s hex trace ID.
+A second job in this file is safely adding configured tracestate entries. Because these values end up in headers that other tools must parse, the code validates keys and values before installing them. It also merges configured fields into existing tracestate instead of blindly replacing everything. Without this file, traces would often stop at process boundaries, and bad tracestate configuration could produce telemetry headers that downstream systems reject.
 
 #### Function details
 
@@ -2038,11 +2074,11 @@ Validation is strict before installation: `validate_tracestate_entries` and `val
 fn current_span_w3c_trace_context() -> Option<W3cTraceContext>
 ```
 
-**Purpose**: Extracts W3C trace context from the currently active tracing span. It is the convenience entry point for callers that do not already hold a `Span` handle.
+**Purpose**: This gets the W3C trace context for whatever tracing span is currently active. It is useful when the program is about to send work somewhere else and needs to pass along the current trace ID.
 
-**Data flow**: Calls `Span::current()` to obtain the active span → passes that span reference to `span_w3c_trace_context` → returns `Option<W3cTraceContext>`.
+**Data flow**: It reads the current tracing span from the tracing system, then passes that span to span_w3c_trace_context. If the current span has a valid trace, the result is a W3cTraceContext containing traceparent and possibly tracestate; otherwise the result is nothing.
 
-**Call relations**: This is a thin wrapper over `span_w3c_trace_context`, used when callers want the current span’s outbound trace headers without manually fetching the span first.
+**Call relations**: This is the simple public doorway for callers that do not already have a span object. It asks the tracing library for the current span, then delegates the real extraction work to span_w3c_trace_context.
 
 *Call graph*: calls 1 internal fn (span_w3c_trace_context); 1 external calls (current).
 
@@ -2053,11 +2089,11 @@ fn current_span_w3c_trace_context() -> Option<W3cTraceContext>
 fn span_w3c_trace_context(span: &Span) -> Option<W3cTraceContext>
 ```
 
-**Purpose**: Builds a `W3cTraceContext` from a specific tracing span, including merged configured tracestate entries. It returns `None` when the span has no valid OpenTelemetry span context.
+**Purpose**: This converts a specific tracing span into the standard W3C trace context values that can be sent to another process or service. It also folds in any configured tracestate additions.
 
-**Data flow**: Accepts `&Span` → gets the OpenTelemetry `Context` via `span.context()` → checks `context.span().span_context().is_valid()` and returns `None` if invalid → injects the context into a temporary `HashMap` using `TraceContextPropagator`, removes any `tracestate`, reads the configured tracestate map from the global `RwLock`, merges propagated and configured tracestate via `merge_tracestate_entries`, and returns `Some(W3cTraceContext { traceparent, tracestate })`.
+**Data flow**: It receives a span, reads its OpenTelemetry context, and first checks whether the span context is valid. If it is valid, it asks OpenTelemetry’s trace context propagator to write trace headers into a temporary map, reads the process-wide configured tracestate entries, merges them with any existing tracestate, and returns a W3cTraceContext. If the span has no valid trace, it returns nothing.
 
-**Call relations**: Called by `current_span_w3c_trace_context`. It depends on `tracestate_entries` for global configured state and `merge_tracestate_entries` for the nontrivial tracestate upsert behavior.
+**Call relations**: current_span_w3c_trace_context calls this after finding the active span. During its work, it uses tracestate_entries to read configured additions and merge_tracestate_entries to combine those additions with the span’s existing propagated tracestate.
 
 *Call graph*: calls 2 internal fn (merge_tracestate_entries, tracestate_entries); called by 1 (current_span_w3c_trace_context); 3 external calls (new, context, new).
 
@@ -2070,11 +2106,11 @@ fn set_tracestate_entries(
 ) -> Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Installs the process-global configured tracestate entries after validating them. It replaces the entire stored map atomically under a write lock.
+**Purpose**: This installs the process-wide tracestate entries that should be added to outgoing trace context. It validates them first so the program does not start sending malformed tracing headers.
 
-**Data flow**: Takes a `BTreeMap<String, BTreeMap<String, String>>` → validates it with `validate_tracestate_entries` → acquires a write lock from `tracestate_entries()`, recovering from poisoning if necessary → overwrites the stored map with the new entries → returns `Ok(())` or the validation error.
+**Data flow**: It receives a nested map: each top-level key is a tracestate member, and each inner map holds field names and values. It validates the whole structure, then takes a write lock and replaces the stored global tracestate configuration. On success it returns Ok; on invalid input it returns an error.
 
-**Call relations**: Provider initialization calls this after configuration has been accepted, and also uses it to clear tracestate when telemetry is disabled. It delegates syntax checking to `validate_tracestate_entries` before mutating global state.
+**Call relations**: Configuration-loading code reaches this through a from path. It relies on validate_tracestate_entries before writing to the shared storage returned by tracestate_entries, so later calls to span_w3c_trace_context only see safe values.
 
 *Call graph*: calls 2 internal fn (tracestate_entries, validate_tracestate_entries); called by 1 (from).
 
@@ -2085,11 +2121,11 @@ fn set_tracestate_entries(
 fn current_span_trace_id() -> Option<String>
 ```
 
-**Purpose**: Returns the current tracing span’s trace ID as a lowercase hex string when a valid span context exists. It is a lightweight helper for diagnostics and correlation.
+**Purpose**: This returns just the trace ID for the currently active span. It is a compact way to attach the current trace identifier to logs, diagnostics, or other output.
 
-**Data flow**: Gets `Span::current().context()`, then the current span and span context → if the span context is invalid, returns `None`; otherwise converts `trace_id()` to string and returns `Some(String)`.
+**Data flow**: It reads the current span from the tracing system, gets its span context, and checks that the context is valid. If valid, it converts the trace ID to a string and returns it; if not, it returns nothing.
 
-**Call relations**: Tests call this inside an instrumented span to verify trace IDs are exposed correctly. It is independent of the richer W3C header-building path.
+**Call relations**: The test current_span_trace_id_returns_hex_trace_id calls this to prove it returns a real 32-character hexadecimal trace ID when OpenTelemetry tracing is active.
 
 *Call graph*: called by 1 (current_span_trace_id_returns_hex_trace_id); 1 external calls (current).
 
@@ -2100,11 +2136,11 @@ fn current_span_trace_id() -> Option<String>
 fn context_from_w3c_trace_context(trace: &W3cTraceContext) -> Option<Context>
 ```
 
-**Purpose**: Parses the project’s `W3cTraceContext` struct into an OpenTelemetry `Context`. It is the inverse of the outbound header-building helpers.
+**Purpose**: This turns a W3cTraceContext object into an OpenTelemetry Context that the tracing system can use. It is the receiving-side counterpart to exporting trace context.
 
-**Data flow**: Accepts `&W3cTraceContext` → passes `trace.traceparent.as_deref()` and `trace.tracestate.as_deref()` to `context_from_trace_headers` → returns the resulting `Option<Context>`.
+**Data flow**: It receives a W3cTraceContext with optional traceparent and tracestate strings. It passes those optional strings to context_from_trace_headers, which parses them and either returns a valid OpenTelemetry context or nothing.
 
-**Call relations**: This helper is used by `set_parent_from_w3c_trace_context` and by tests that validate parsing behavior. It delegates all actual extraction logic to `context_from_trace_headers`.
+**Call relations**: set_parent_from_w3c_trace_context uses this when attaching an incoming parent trace to a span. The parses_valid_w3c_trace_context test also calls it to check that valid W3C data becomes the expected trace and span IDs.
 
 *Call graph*: calls 1 internal fn (context_from_trace_headers); called by 2 (set_parent_from_w3c_trace_context, parses_valid_w3c_trace_context).
 
@@ -2115,11 +2151,11 @@ fn context_from_w3c_trace_context(trace: &W3cTraceContext) -> Option<Context>
 fn set_parent_from_w3c_trace_context(span: &Span, trace: &W3cTraceContext) -> bool
 ```
 
-**Purpose**: Attempts to parse a W3C trace context and set it as the parent of a tracing span. It reports success as a boolean instead of surfacing parsing details.
+**Purpose**: This makes a span continue an incoming trace described by a W3cTraceContext. It answers whether the incoming trace data was usable.
 
-**Data flow**: Takes `&Span` and `&W3cTraceContext` → calls `context_from_w3c_trace_context(trace)` → if parsing succeeds, passes the resulting `Context` to `set_parent_from_context(span, context)` and returns `true`; otherwise returns `false`.
+**Data flow**: It receives a span and a W3cTraceContext. It tries to parse the trace context into an OpenTelemetry Context; if that works, it sets that context as the span’s parent and returns true. If parsing fails, it leaves the span unchanged and returns false.
 
-**Call relations**: Callers use this when they receive inbound trace headers and want to continue the trace on a span. It composes parsing and parent-setting by delegating to `context_from_w3c_trace_context` and `set_parent_from_context`.
+**Call relations**: This function connects two smaller steps: context_from_w3c_trace_context parses the incoming trace, then set_parent_from_context attaches it to the span. It is meant for code that receives trace context from outside and wants the next span to join that trace.
 
 *Call graph*: calls 2 internal fn (context_from_w3c_trace_context, set_parent_from_context).
 
@@ -2130,11 +2166,11 @@ fn set_parent_from_w3c_trace_context(span: &Span, trace: &W3cTraceContext) -> bo
 fn set_parent_from_context(span: &Span, context: Context)
 ```
 
-**Purpose**: Sets an OpenTelemetry parent context on a tracing span. It intentionally ignores the return value from the underlying tracing extension method.
+**Purpose**: This attaches an already-parsed OpenTelemetry Context as the parent of a tracing span. That makes the span part of an existing trace tree.
 
-**Data flow**: Accepts `&Span` and `Context` → calls `span.set_parent(context)` and discards the result → returns `()`.
+**Data flow**: It receives a span and a context. It asks the tracing/OpenTelemetry integration to set the context as the span’s parent. It does not return useful data; the change is on the span relationship.
 
-**Call relations**: This is the low-level parent-assignment helper used by `set_parent_from_w3c_trace_context` once parsing has succeeded.
+**Call relations**: set_parent_from_w3c_trace_context calls this after it has successfully parsed W3C trace context. This function is the final handoff from parsed trace data to the live tracing span.
 
 *Call graph*: called by 1 (set_parent_from_w3c_trace_context); 1 external calls (set_parent).
 
@@ -2145,11 +2181,11 @@ fn set_parent_from_context(span: &Span, context: Context)
 fn traceparent_context_from_env() -> Option<Context>
 ```
 
-**Purpose**: Lazily loads and caches a parent trace context from `TRACEPARENT` and optional `TRACESTATE` environment variables. Subsequent calls reuse the cached `Option<Context>`.
+**Purpose**: This reads trace context from environment variables once and returns it as an OpenTelemetry Context. It lets a process continue a trace that was passed in by its parent process.
 
-**Data flow**: Accesses the `TRACEPARENT_CONTEXT` `OnceLock` → initializes it with `load_traceparent_context` on first use → clones and returns the cached `Option<Context>`.
+**Data flow**: It checks a process-wide cache. On the first call, the cache is filled by loading and parsing TRACEPARENT and optional TRACESTATE from the environment; later calls reuse the stored result. It returns a cloned context if the environment had valid trace data, or nothing otherwise.
 
-**Call relations**: This function is the public entry point for env-based trace continuation. It delegates one-time parsing and logging behavior to `load_traceparent_context`.
+**Call relations**: This function is a standalone entry point for environment-based propagation. It hides the one-time loading behavior so callers can ask for the parent context without repeatedly reading environment variables.
 
 
 ##### `context_from_trace_headers`  (lines 97–113)
@@ -2161,11 +2197,11 @@ fn context_from_trace_headers(
 ) -> Option<Context>
 ```
 
-**Purpose**: Extracts an OpenTelemetry `Context` from raw `traceparent` and optional `tracestate` header values. It rejects missing or invalid `traceparent` values.
+**Purpose**: This parses raw W3C trace header strings into an OpenTelemetry Context. It is the low-level parser shared by object-based and environment-based trace loading.
 
-**Data flow**: Accepts `traceparent: Option<&str>` and `tracestate: Option<&str>` → returns `None` immediately if `traceparent` is absent → builds a temporary `HashMap` containing `traceparent` and optional `tracestate` strings → uses `TraceContextPropagator::new().extract(&headers)` to build a `Context` → returns `None` if the extracted span context is invalid, else `Some(context)`.
+**Data flow**: It receives optional traceparent and tracestate strings. If traceparent is missing, it returns nothing. Otherwise it puts the provided values into a temporary header map, asks the OpenTelemetry trace context propagator to extract a context, checks that the extracted span context is valid, and returns the context only if it is valid.
 
-**Call relations**: This parser underpins both `context_from_w3c_trace_context` and `load_traceparent_context`. It is the central inbound extraction path for W3C trace headers.
+**Call relations**: context_from_w3c_trace_context calls this for W3cTraceContext objects, and load_traceparent_context calls it for environment variables. It is the common gate that rejects malformed or incomplete incoming trace headers.
 
 *Call graph*: called by 2 (context_from_w3c_trace_context, load_traceparent_context); 2 external calls (new, new).
 
@@ -2176,11 +2212,11 @@ fn context_from_trace_headers(
 fn load_traceparent_context() -> Option<Context>
 ```
 
-**Purpose**: Reads trace context from environment variables once and logs whether continuation succeeded or failed. It is the initializer used by the cached env-context accessor.
+**Purpose**: This loads TRACEPARENT and TRACESTATE from the process environment and tries to turn them into a tracing context. It logs whether the environment trace data was accepted or ignored.
 
-**Data flow**: Reads `TRACEPARENT` from the environment, returning `None` if absent; reads optional `TRACESTATE`; calls `context_from_trace_headers(Some(&traceparent), tracestate.as_deref())` → on success logs a debug message and returns `Some(context)`; on failure logs a warning and returns `None`.
+**Data flow**: It reads TRACEPARENT from the environment and stops if it is absent. It also reads optional TRACESTATE. Then it calls context_from_trace_headers; if parsing succeeds, it returns the context and writes a debug message. If parsing fails, it writes a warning and returns nothing.
 
-**Call relations**: This function is only invoked through `traceparent_context_from_env`’s `OnceLock` initialization. It delegates parsing to `context_from_trace_headers` and adds the one-time logging side effects.
+**Call relations**: traceparent_context_from_env uses this as the one-time loader behind its cache. This keeps environment parsing centralized and ensures invalid inherited trace data is ignored safely.
 
 *Call graph*: calls 1 internal fn (context_from_trace_headers); 3 external calls (debug!, var, warn!).
 
@@ -2191,11 +2227,11 @@ fn load_traceparent_context() -> Option<Context>
 fn tracestate_entries() -> &'static RwLock<BTreeMap<String, BTreeMap<String, String>>>
 ```
 
-**Purpose**: Returns the process-global lock protecting configured tracestate entries, initializing it on first use. It hides the `OnceLock<RwLock<...>>` plumbing behind a simple accessor.
+**Purpose**: This gives access to the shared store of configured tracestate entries. The store is protected by a read-write lock, which is a lock that allows many readers or one writer at a time.
 
-**Data flow**: Accesses `TRACESTATE_ENTRIES` and, if uninitialized, installs `RwLock::new(BTreeMap::new())` → returns a shared reference to the `RwLock`.
+**Data flow**: It checks whether the global store has already been created. If not, it creates an empty map inside a read-write lock. It returns a reference to that shared locked map.
 
-**Call relations**: Both `set_tracestate_entries` and `span_w3c_trace_context` call this to mutate or read the configured tracestate map.
+**Call relations**: set_tracestate_entries calls this to replace the configured entries, while span_w3c_trace_context calls it to read those entries when building outgoing trace context.
 
 *Call graph*: called by 2 (set_tracestate_entries, span_w3c_trace_context).
 
@@ -2209,11 +2245,11 @@ fn merge_tracestate_entries(
 ) -> Option<String>
 ```
 
-**Purpose**: Merges propagated tracestate with configured tracestate members and returns the resulting header string. It preserves existing members where possible while upserting configured fields.
+**Purpose**: This combines an existing tracestate header with the configured tracestate entries for this process. It preserves usable incoming data while adding or updating configured fields.
 
-**Data flow**: Accepts optional incoming `tracestate` string and a configured member map → attempts to parse the incoming string with `TraceState::from_str`, warning and falling back to empty state on parse failure → iterates configured members in reverse key order, computes each merged member value with `merge_tracestate_member_fields(trace_state.get(key), fields)`, and inserts it into the `TraceState`; if insertion fails, warns and stops applying further configured members → serializes the final state with `.header()` and returns `Some(header)` unless the header is empty, in which case `None`.
+**Data flow**: It receives an optional existing tracestate string and the configured entry map. It first parses the existing string, ignoring it with a warning if it is invalid. Then it walks through the configured entries in a deterministic order, merges each member’s fields, and inserts the result into the OpenTelemetry TraceState. It returns a finished tracestate header string, or nothing if the final header is empty.
 
-**Call relations**: This function is called by `span_w3c_trace_context` when exporting the current span’s W3C context. It delegates per-member field merging to `merge_tracestate_member_fields` and owns the warning-and-continue behavior for malformed incoming or configured state.
+**Call relations**: span_w3c_trace_context calls this while preparing outgoing W3C context. For each configured member, this function delegates field-level merging to merge_tracestate_member_fields and warns if OpenTelemetry rejects the resulting tracestate.
 
 *Call graph*: calls 1 internal fn (merge_tracestate_member_fields); called by 1 (span_w3c_trace_context); 1 external calls (warn!).
 
@@ -2226,11 +2262,11 @@ fn validate_tracestate_entries(
 ) -> Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Validates the full configured tracestate map before it is installed globally or used for propagation. It checks both the custom field grammar and the final W3C `TraceState` structure.
+**Purpose**: This checks a full configured tracestate map before it is installed. The goal is to catch bad configuration early, before the program sends trace headers that other systems cannot read.
 
-**Data flow**: Takes `&BTreeMap<String, BTreeMap<String, String>>` → maps each member through `encode_tracestate_member_fields`, collecting encoded `(key, value)` pairs or returning the first error → passes the encoded pairs to `TraceState::from_key_value(...)` to validate W3C member keys and list structure → on SDK validation failure, wraps the message in an `InvalidInput` `io::Error`; otherwise returns `Ok(())`.
+**Data flow**: It receives all configured tracestate members and their fields. It encodes each member’s fields into the single string format used inside a tracestate header, then asks OpenTelemetry to validate the resulting key-value pairs. It returns Ok if everything is acceptable, or an InvalidInput-style error if not.
 
-**Call relations**: Provider setup and `set_tracestate_entries` call this before mutating global tracestate configuration. It delegates member encoding and field-level checks to `encode_tracestate_member_fields`.
+**Call relations**: set_tracestate_entries calls this before writing the configuration into the global store. A configuration conversion path also calls it, so invalid tracestate can be rejected while configuration is being built.
 
 *Call graph*: called by 2 (from, set_tracestate_entries); 1 external calls (from_key_value).
 
@@ -2244,11 +2280,11 @@ fn validate_tracestate_member(
 ) -> Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Validates one configured tracestate member and its field map in isolation. It is useful for per-member config checks or diagnostics.
+**Purpose**: This checks one configured tracestate member and its fields. It is useful when validating a single member separately from the whole configuration.
 
-**Data flow**: Accepts `member_key: &str` and `&BTreeMap<String, String>` → encodes them with `encode_tracestate_member_fields` → validates the resulting single `(key, value)` pair with `TraceState::from_key_value([(key.as_str(), value.as_str())])` → returns `Ok(())` or an `InvalidInput` boxed error.
+**Data flow**: It receives a member key and its field map. It encodes the fields into the member’s header value, then asks OpenTelemetry to validate that one key-value pair. It returns Ok for a valid member or an InvalidInput-style error for a bad one.
 
-**Call relations**: This function is a narrower sibling of `validate_tracestate_entries`. It reuses the same encoding logic and final W3C validation path but for a single member.
+**Call relations**: This function uses encode_tracestate_member_fields to apply this file’s stricter field rules before handing the result to OpenTelemetry’s TraceState validation.
 
 *Call graph*: calls 1 internal fn (encode_tracestate_member_fields); 1 external calls (from_key_value).
 
@@ -2262,11 +2298,11 @@ fn encode_tracestate_member_fields(
 ) -> Result<(String, String), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Encodes a configured tracestate member’s field map into the opaque semicolon-separated member value used in the outgoing header. It enforces the project’s stricter field grammar before W3C validation.
+**Purpose**: This turns the project’s structured tracestate fields into the single string value required by the W3C tracestate header. It also rejects characters that would make the header unsafe or ambiguous.
 
-**Data flow**: Takes `member_key: &str` and `&BTreeMap<String, String>` → allocates a vector sized to the number of fields → for each `(field_key, value)`, checks `is_configured_tracestate_field_key(field_key)` and `is_configured_tracestate_field_value(value)`, returning `invalid_tracestate_config(...)` on failure; otherwise pushes `format!("{field_key}:{value}")` → joins encoded fields with `;` into one member value → checks `is_header_safe_tracestate_member_value(&value)` and errors if unsafe → returns `(member_key.to_string(), value)`.
+**Data flow**: It receives a member key and an ordered map of field keys to values. For each field, it checks that the field key and value use allowed characters, then formats the pair as key:value. It joins all field pairs with semicolons, checks that the final member value is safe for a header, and returns the member key plus encoded value. If anything is invalid, it returns an error built by invalid_tracestate_config.
 
-**Call relations**: This helper is called by `validate_tracestate_member` and indirectly by full-map validation. It delegates the low-level grammar checks to the `is_*` predicates and error construction to `invalid_tracestate_config`.
+**Call relations**: validate_tracestate_member calls this before OpenTelemetry validation. Inside, it relies on is_configured_tracestate_field_key, is_configured_tracestate_field_value, and is_header_safe_tracestate_member_value to make the character rules clear and reusable.
 
 *Call graph*: calls 4 internal fn (invalid_tracestate_config, is_configured_tracestate_field_key, is_configured_tracestate_field_value, is_header_safe_tracestate_member_value); called by 1 (validate_tracestate_member); 2 external calls (with_capacity, format!).
 
@@ -2277,11 +2313,11 @@ fn encode_tracestate_member_fields(
 fn is_configured_tracestate_field_key(field_key: &str) -> bool
 ```
 
-**Purpose**: Checks whether a configured tracestate field key uses only printable non-reserved bytes and is non-empty. It excludes separators that would break the custom `key:value;...` encoding.
+**Purpose**: This checks whether one configured tracestate field name is allowed. Field names must be non-empty and must avoid separator characters that would confuse later parsing.
 
-**Data flow**: Accepts `field_key: &str` → returns `true` only if it is non-empty and every byte is in `!` through `~` excluding `:`, `;`, `,`, and `=`.
+**Data flow**: It receives a field key string. It returns true only if every byte is a visible ASCII character and none of the bytes are colon, semicolon, comma, or equals sign. Otherwise it returns false.
 
-**Call relations**: Used exclusively by `encode_tracestate_member_fields` during validation of configured tracestate fields.
+**Call relations**: encode_tracestate_member_fields calls this for every configured field key. A false result causes encoding to stop with a configuration error.
 
 *Call graph*: called by 1 (encode_tracestate_member_fields).
 
@@ -2292,11 +2328,11 @@ fn is_configured_tracestate_field_key(field_key: &str) -> bool
 fn is_configured_tracestate_field_value(value: &str) -> bool
 ```
 
-**Purpose**: Checks whether a configured tracestate field value is compatible with the custom semicolon-separated member encoding. It allows normal tracestate member bytes except semicolons.
+**Purpose**: This checks whether one configured tracestate field value can safely appear inside the project’s semicolon-separated field format.
 
-**Data flow**: Accepts `value: &str` → returns `true` only if every byte satisfies `is_tracestate_member_value_byte(byte)` and is not `b';'`.
+**Data flow**: It receives a value string. It returns true only if every byte is allowed in a tracestate member value and no byte is a semicolon, because semicolon is used here to separate fields.
 
-**Call relations**: Used only by `encode_tracestate_member_fields` to validate configured field values before joining them into one member string.
+**Call relations**: encode_tracestate_member_fields calls this for every configured field value. It helps prevent one value from accidentally breaking the structure of the encoded member.
 
 *Call graph*: called by 1 (encode_tracestate_member_fields).
 
@@ -2307,11 +2343,11 @@ fn is_configured_tracestate_field_value(value: &str) -> bool
 fn is_header_safe_tracestate_member_value(value: &str) -> bool
 ```
 
-**Purpose**: Checks whether a fully encoded tracestate member value is safe to place in the outgoing header. It allows empty values and otherwise enforces valid bytes with no trailing space.
+**Purpose**: This checks the final encoded tracestate member value before it is sent as part of a header. It makes sure the value obeys the broader W3C header safety rules.
 
-**Data flow**: Accepts `value: &str` → returns `true` if the string is empty, or if all bytes satisfy `is_tracestate_member_value_byte` and the last byte is not a space; otherwise returns `false`.
+**Data flow**: It receives the complete encoded member value. It accepts an empty value, or a value whose bytes are all valid tracestate member value bytes and whose final byte is not a space. It returns true or false.
 
-**Call relations**: This predicate is used by `encode_tracestate_member_fields` after field encoding to validate the final opaque member value as a whole.
+**Call relations**: encode_tracestate_member_fields calls this after joining all fields. This final check catches problems that might not be visible when looking at individual fields alone.
 
 *Call graph*: called by 1 (encode_tracestate_member_fields).
 
@@ -2322,11 +2358,11 @@ fn is_header_safe_tracestate_member_value(value: &str) -> bool
 fn is_tracestate_member_value_byte(byte: u8) -> bool
 ```
 
-**Purpose**: Defines the allowed byte range for tracestate member values. It excludes commas and equals signs from otherwise printable ASCII.
+**Purpose**: This is the basic byte-level rule for characters allowed in a tracestate member value. It keeps commas and equals signs out because those characters have special meaning in the tracestate header format.
 
-**Data flow**: Accepts `byte: u8` → returns `true` when the byte is in `b' '..=b'~'` and not `b','` or `b'='`; otherwise `false`.
+**Data flow**: It receives one byte. It returns true if the byte is in the printable ASCII range from space through tilde and is not comma or equals sign; otherwise it returns false.
 
-**Call relations**: This low-level predicate is used by both `is_configured_tracestate_field_value` and `is_header_safe_tracestate_member_value`.
+**Call relations**: The value-checking helpers use this rule to decide whether configured tracestate values are safe for headers. It is the small shared test underneath those higher-level checks.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -2337,11 +2373,11 @@ fn is_tracestate_member_value_byte(byte: u8) -> bool
 fn invalid_tracestate_config(message: String) -> Box<dyn std::error::Error>
 ```
 
-**Purpose**: Constructs a boxed `InvalidInput` I/O error for malformed configured tracestate. It standardizes the error type returned by validation helpers.
+**Purpose**: This builds a standard error for bad tracestate configuration. It gives callers a consistent InvalidInput error when validation fails.
 
-**Data flow**: Takes a `String` message → wraps it in `std::io::Error::new(std::io::ErrorKind::InvalidInput, message)` → boxes and returns it as `Box<dyn Error>`.
+**Data flow**: It receives an error message string. It wraps that message in an input-validation I/O error and boxes it as a general error object. The returned error can travel through functions that use a broad error type.
 
-**Call relations**: This helper is used by `encode_tracestate_member_fields` whenever a field key, field value, or final encoded member value violates the custom configuration grammar.
+**Call relations**: encode_tracestate_member_fields calls this whenever it finds an invalid field key, field value, or final encoded value.
 
 *Call graph*: called by 1 (encode_tracestate_member_fields); 2 external calls (new, new).
 
@@ -2355,11 +2391,11 @@ fn merge_tracestate_member_fields(
 ) -> String
 ```
 
-**Purpose**: Merges configured `key:value` fields into one existing tracestate member value without discarding unrelated existing fields. It preserves existing field order where possible and appends new configured fields at the end.
+**Purpose**: This merges configured fields into one tracestate member value without throwing away unrelated existing fields. It is like updating selected entries in a note while leaving the rest of the note intact.
 
-**Data flow**: Accepts `existing: Option<&str>` and configured field map → initializes an output `Vec<String>` and `BTreeSet` of seen field keys → if an existing member value is present, splits it on `;`, skips empty segments, and for each segment either replaces it with a configured `field_key:value` when the segment contains a known `field_key` and that key has not yet been seen, or preserves the original segment; tracks seen keys as it goes → extends the output with any configured fields whose keys were not seen in the existing value → joins the segments with `;` and returns the merged string.
+**Data flow**: It receives an optional existing member value and a map of configured fields. It splits the existing value on semicolons, replaces any matching key:value fields with configured values, remembers which field keys were already seen, keeps unrelated fields as they were, then appends configured fields that were missing. It returns the merged member value as a semicolon-separated string.
 
-**Call relations**: This helper is called by `merge_tracestate_entries` for each configured member. It implements the project-specific field-level upsert semantics inside otherwise opaque W3C tracestate member values.
+**Call relations**: merge_tracestate_entries calls this for each configured tracestate member. This function performs the fine-grained field update that lets the outer merge preserve existing tracestate data.
 
 *Call graph*: called by 1 (merge_tracestate_entries); 3 external calls (new, new, format!).
 
@@ -2370,11 +2406,11 @@ fn merge_tracestate_member_fields(
 fn parses_valid_w3c_trace_context()
 ```
 
-**Purpose**: Verifies that a valid `traceparent` string is parsed into a remote OpenTelemetry span context with the expected trace and span IDs. It confirms the inbound extraction path preserves exact identifiers.
+**Purpose**: This test proves that a valid W3C traceparent string is parsed into the expected OpenTelemetry trace ID and span ID. It also checks that the parsed context is marked as remote, meaning it came from outside this process.
 
-**Data flow**: Builds a `W3cTraceContext` with formatted `traceparent` and no `tracestate` → calls `context_from_w3c_trace_context` and unwraps the result → extracts the span context and asserts the parsed trace ID and span ID equal the expected hex values and that the context is marked remote.
+**Data flow**: It builds a W3cTraceContext with known trace and span IDs, calls context_from_w3c_trace_context, and inspects the resulting span context. The expected output is a context whose trace ID and span ID match the input strings.
 
-**Call relations**: This test directly exercises `context_from_w3c_trace_context`, which delegates to `context_from_trace_headers`. It validates the successful parse branch.
+**Call relations**: This test exercises context_from_w3c_trace_context as the public object-based parsing path. It confirms that valid incoming trace data survives the conversion accurately.
 
 *Call graph*: calls 1 internal fn (context_from_w3c_trace_context); 3 external calls (assert!, assert_eq!, format!).
 
@@ -2385,11 +2421,11 @@ fn parses_valid_w3c_trace_context()
 fn invalid_traceparent_returns_none()
 ```
 
-**Purpose**: Verifies that malformed `traceparent` input is rejected. It ensures invalid inbound headers do not produce a usable parent context.
+**Purpose**: This test proves that malformed traceparent text is rejected. That matters because accepting bad trace IDs could corrupt trace relationships.
 
-**Data flow**: Calls `context_from_trace_headers(Some("not-a-traceparent"), None)` and asserts that the result is `None`.
+**Data flow**: It passes the string not-a-traceparent as the traceparent input and no tracestate. The expected result is None, meaning no context is produced.
 
-**Call relations**: This test targets the invalid extraction branch inside `context_from_trace_headers`.
+**Call relations**: The test checks the same low-level parsing behavior used by context_from_trace_headers. It protects the rule that invalid incoming headers must not become parent trace contexts.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2400,11 +2436,11 @@ fn invalid_traceparent_returns_none()
 fn missing_traceparent_returns_none()
 ```
 
-**Purpose**: Verifies that `tracestate` alone is insufficient to create a parent context. A missing `traceparent` must always yield `None`.
+**Purpose**: This test proves that tracestate alone is not enough to create a trace context. The traceparent value is required because it carries the main trace identity.
 
-**Data flow**: Builds a `W3cTraceContext` with `traceparent: None` and a sample `tracestate` → calls `context_from_w3c_trace_context` → asserts the result is `None`.
+**Data flow**: It builds a W3cTraceContext with no traceparent and a sample tracestate value, then asks for a context. The expected result is None.
 
-**Call relations**: This test covers the early-return branch in `context_from_trace_headers` as reached through `context_from_w3c_trace_context`.
+**Call relations**: This test exercises context_from_w3c_trace_context and, through it, the lower-level header parsing rule that traceparent must be present.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2415,29 +2451,31 @@ fn missing_traceparent_returns_none()
 fn current_span_trace_id_returns_hex_trace_id()
 ```
 
-**Purpose**: Verifies that `current_span_trace_id` returns a nonzero 32-character hexadecimal trace ID when called inside an instrumented span. It confirms integration with tracing-opentelemetry span context propagation.
+**Purpose**: This test proves that current_span_trace_id returns a real trace ID when tracing is properly set up. It checks both the shape and non-zero content of the ID.
 
-**Data flow**: Builds an `SdkTracerProvider` and tracer, installs a tracing subscriber with an OpenTelemetry layer, creates and enters a `trace_span!`, calls `current_span_trace_id()`, unwraps the result, and asserts length 32, all characters hex digits, and value not equal to all zeros.
+**Data flow**: It creates an OpenTelemetry tracer provider, connects it to the tracing subscriber, enters a test span, and calls current_span_trace_id. The expected output is a 32-character hexadecimal string that is not all zeroes.
 
-**Call relations**: This test exercises `current_span_trace_id` in a realistic tracing setup where a current span has a valid OpenTelemetry context.
+**Call relations**: This test calls current_span_trace_id in a live tracing setup. It confirms that the helper works with the tracing/OpenTelemetry integration rather than only with hand-built data.
 
 *Call graph*: calls 1 internal fn (current_span_trace_id); 7 external calls (builder, assert!, assert_eq!, assert_ne!, trace_span!, layer, registry).
 
 
 ### `otel/src/events/mod.rs`
 
-`orchestration` · `cross-cutting`
+`orchestration` · `compile-time module wiring`
 
-This file is the root of the `otel::events` module tree. It declares two crate-visible submodules, `session_telemetry` and `shared`, without reexporting them publicly. That visibility choice indicates event emission is intended to be orchestrated internally by the telemetry crate rather than consumed directly as a broad public API. The split also reveals the internal organization: `session_telemetry` likely contains event definitions or emitters tied to session lifecycle and user interactions, while `shared` holds common event-building utilities, schemas, or helper logic reused across event producers. Although there is no executable code here, this module boundary matters because it determines how event code is compiled, namespaced, and accessed by sibling modules. In practice, this file is active whenever telemetry event functionality is referenced elsewhere in the crate, serving as the structural entry point that binds specialized event logic into the larger OpenTelemetry subsystem.
+This is a small module index file. In Rust, a `mod.rs` file often works like a table of contents for a folder: it does not contain the event logic itself, but it names the files that make up this part of the system. Here, it includes two internal modules: `session_telemetry`, which likely contains event code tied to recording or reporting session activity, and `shared`, which likely holds common event pieces used by more than one event module. The `pub(crate)` wording means these modules are visible inside this crate, but not exposed as part of the public API to outside users. Without this file, Rust would not know to compile and connect these event modules under `otel::events`, so other internal code would not be able to refer to them through that path. Its job is simple but important: it keeps the event subsystem organized and gives the rest of the crate a stable place to find event-related building blocks.
 
 
 ### `otel/src/events/shared.rs`
 
-`util` · `cross-cutting whenever any telemetry event is emitted`
+`util` · `cross-cutting telemetry emission`
 
-This file is the common formatting layer for telemetry events. Its three macros—`log_event!`, `trace_event!`, and `log_and_trace_event!`—wrap `tracing::event!` and append a consistent envelope of metadata derived from a `SessionTelemetry`-like `self` value. Both log and trace variants add `event.timestamp`, `conversation.id`, `app.version`, `auth_mode`, `originator`, `terminal.type`, `model`, and `slug`; the log-only variant additionally includes potentially more sensitive account fields (`user.account_id`, `user.email`) and targets `OTEL_LOG_ONLY_TARGET`, while the trace-safe variant targets `OTEL_TRACE_SAFE_TARGET` and omits those user identifiers. `log_and_trace_event!` simply expands to both macros with a shared `common` field block plus separate `log` and `trace` additions.
+This file is like a standard form used whenever the system writes an event for observability. Observability means recording what the program is doing so people can debug problems, audit behavior, or understand usage later.
 
-The only function, `timestamp`, generates the RFC 3339 UTC timestamp string used by the macros. The design keeps timestamp formatting and metadata injection centralized, which prevents drift across dozens of event call sites and enforces the distinction between log-only and trace-safe payloads. Because the macros read fields directly from `$self.metadata`, callers must provide a telemetry object with the expected metadata layout.
+The main pieces are three macros: `log_event!`, `trace_event!`, and `log_and_trace_event!`. A macro is code that writes other code at compile time, which lets the project avoid repeating the same long list of event fields everywhere. `log_event!` sends an event to a log-only target and includes user account and email fields. `trace_event!` sends a similar event to a trace-safe target, but leaves out the more sensitive user identity fields. `log_and_trace_event!` writes both versions at once: shared fields go to both, while log-only and trace-only fields can be kept separate.
+
+Each event gets a timestamp from this file’s `timestamp` function. It also pulls common metadata from `$self.metadata`, such as the conversation, app version, authentication mode, originator, terminal type, model, and slug. Without this file, every event writer would have to remember to attach these fields by hand, which would make telemetry inconsistent and easier to get wrong.
 
 #### Function details
 
@@ -2447,11 +2485,11 @@ The only function, `timestamp`, generates the RFC 3339 UTC timestamp string used
 fn timestamp() -> String
 ```
 
-**Purpose**: Returns the current UTC time formatted as an RFC 3339 string with millisecond precision and a `Z` suffix. This is the canonical event timestamp used by the telemetry macros.
+**Purpose**: Creates the current time as a text string in a standard internet-friendly format. Event-writing code uses it so every telemetry record can say exactly when it happened.
 
-**Data flow**: Calls `Utc::now()`, formats the result with `to_rfc3339_opts(SecondsFormat::Millis, true)`, and returns the resulting `String`.
+**Data flow**: It takes no input from the caller. It reads the current UTC time from the system clock, formats it as an RFC 3339 timestamp with millisecond precision, and returns that formatted string.
 
-**Call relations**: It is invoked implicitly by every expansion of `log_event!` and `trace_event!`, so all emitted telemetry events share the same timestamp format.
+**Call relations**: When the event macros in this file build a log or trace record, they ask `timestamp` for the event time. `timestamp` delegates the actual clock reading to Chrono’s `Utc::now`, then hands the formatted time back so it can be attached to the event.
 
 *Call graph*: 1 external calls (now).
 
@@ -2461,20 +2499,26 @@ These files define the callback traits and wrappers that let client and API tran
 
 ### `codex-client/src/telemetry.rs`
 
-`util` · `request handling`
+`data_model` · `cross-cutting request reporting`
 
-This file defines a single trait, `RequestTelemetry`, which is the extension point for instrumentation around outbound HTTP requests. The trait is constrained by `Send + Sync`, signaling that implementations may be shared across threads and invoked from concurrent request paths. Its sole method, `on_request`, receives the attempt number, an optional `StatusCode`, an optional borrowed `TransportError`, and the elapsed `Duration`. That signature captures both successful and failed attempts in one callback: a caller can report a completed HTTP exchange with a status, a transport-level failure with an error, or combinations that reflect partial outcomes. By taking `&self` and borrowing the error, the interface avoids transferring ownership or forcing allocation in the hot path. This file intentionally contains no concrete telemetry backend; instead it defines the contract that retry loops and transport implementations use when emitting metrics, logs, or traces. The result is a low-level observability seam that keeps instrumentation policy outside the core request execution logic.
+This file is a contract, not a full working component by itself. It defines `RequestTelemetry`, a trait, which is Rust’s way of saying “anything that follows this shape can be used here.” The rest of the client can call this trait after an API request attempt and pass along what happened: which attempt number it was, whether an HTTP status code came back, whether there was a transport error, and how long the attempt took.
+
+In plain terms, this is like a delivery driver filling out a short trip note after each delivery try: “first attempt, got a 500 response, no network error, took two seconds.” Different parts of the system can then decide what to do with that note. One implementation might log it to a file. Another might send it to a metrics system. Another might ignore it.
+
+The important design choice is separation. The network code does not need to know where telemetry goes or how it is stored. It only needs to call `on_request` with the facts. The trait is marked `Send + Sync`, meaning implementations must be safe to share across threads or tasks, which matters because API clients often make requests from asynchronous or concurrent code.
 
 
 ### `codex-api/src/telemetry.rs`
 
-`util` · `cross-cutting request execution and streaming instrumentation`
+`io_transport` · `request handling and cross-cutting telemetry`
 
-This file is about instrumentation rather than request semantics. It declares two public traits: `SseTelemetry`, which receives the result and elapsed duration of each SSE poll, and `WebsocketTelemetry`, which records both request-level connection attempts and per-event WebSocket reads. The trait signatures expose the raw result types, including nested transport and timeout errors, so telemetry implementations can distinguish clean EOF, parser failures, network failures, and idle timeouts.
+This file is about observability: helping the rest of the system know what happened during API communication, how long it took, and whether it failed. Without it, requests could still be sent, but the program would lose useful timing and error information, especially when a request is retried.
 
-To support generic request telemetry across both unary and streaming HTTP calls, the file introduces a small internal trait `WithStatus` implemented for `codex_client::Response` and `codex_client::StreamResponse`. That lets `run_with_request_telemetry` treat both response types uniformly when extracting an HTTP status code.
+It defines small telemetry interfaces for two streaming styles. Server-sent events, or SSE, are a way for a server to keep sending events over one HTTP connection. WebSockets are a two-way live connection, more like a phone call than a mailed letter. The traits in this file let another part of the program plug in code that records when those streams are polled, when WebSocket requests finish, and when WebSocket messages arrive.
 
-`http_status` is a focused helper that pulls a `StatusCode` out of `TransportError::Http` and returns `None` for build/network/other transport failures. `run_with_request_telemetry` then wraps `codex_client::run_with_retry`: for each retry attempt it clones the optional `RequestTelemetry` sink and the send closure, records `Instant::now()`, awaits the actual send, derives `(status, err)` from the result, and invokes `t.on_request(attempt, status, err, elapsed)` if telemetry is configured. The wrapper returns the original transport result unchanged, so it adds observability without altering retry behavior or error semantics.
+For normal HTTP responses, the file introduces a tiny shared idea: anything that has an HTTP status code can expose it through `WithStatus`. Both regular responses and streaming responses use this. That lets the main wrapper, `run_with_request_telemetry`, treat them the same way.
+
+The main flow is: make a request, send it through the existing retry helper, measure each attempt with a clock, then report the attempt number, status code if there is one, error if any, and elapsed time. It is like putting a stopwatch and note card beside every delivery attempt.
 
 #### Function details
 
@@ -2484,11 +2528,11 @@ To support generic request telemetry across both unary and streaming HTTP calls,
 fn http_status(err: &TransportError) -> Option<StatusCode>
 ```
 
-**Purpose**: Extracts an HTTP status code from a transport error when the failure came from an HTTP response. Non-HTTP transport failures intentionally produce no status.
+**Purpose**: This helper tries to pull an HTTP status code out of a transport error. It is used when a request failed but the server still gave a meaningful HTTP response code, such as 429 or 500.
 
-**Data flow**: Pattern-matches the borrowed `TransportError`; for `TransportError::Http { status, .. }` it returns `Some(*status)`, otherwise `None`.
+**Data flow**: It receives a `TransportError`, which represents something that went wrong while communicating with the API. If the error is specifically an HTTP error, it takes out the status code and returns it. For non-HTTP failures, such as connection-level problems, it returns nothing.
 
-**Call relations**: This helper is used inside `run_with_request_telemetry` so telemetry callbacks can still receive a status code on HTTP error responses.
+**Call relations**: During `run_with_request_telemetry`, a failed request attempt is inspected before telemetry is reported. This helper supplies the status code when one exists, so the telemetry record can say not just that the attempt failed, but also what the server answered with.
 
 
 ##### `Response::status`  (lines 57–59)
@@ -2497,11 +2541,11 @@ fn http_status(err: &TransportError) -> Option<StatusCode>
 fn status(&self) -> StatusCode
 ```
 
-**Purpose**: Implements the internal `WithStatus` trait for unary HTTP responses by returning the response's stored status code. It provides a uniform interface for telemetry code.
+**Purpose**: This gives a regular API response a common way to reveal its HTTP status code. It lets generic telemetry code read the status without needing to know the exact response type.
 
-**Data flow**: Reads `self.status` from `codex_client::Response` and returns it by value.
+**Data flow**: It reads the `status` field already stored inside the `Response` and returns that HTTP status code unchanged. It does not modify the response.
 
-**Call relations**: This trait method allows `run_with_request_telemetry` to work generically over unary responses.
+**Call relations**: When `run_with_request_telemetry` receives a successful regular response, it calls this shared `status` behavior through the `WithStatus` trait. That lets the telemetry wrapper report the status code for successful attempts.
 
 
 ##### `StreamResponse::status`  (lines 63–65)
@@ -2510,11 +2554,11 @@ fn status(&self) -> StatusCode
 fn status(&self) -> StatusCode
 ```
 
-**Purpose**: Implements the internal `WithStatus` trait for streaming HTTP responses by returning the stream response's status code. This keeps streaming and unary telemetry paths aligned.
+**Purpose**: This gives a streaming API response the same status-code access as a regular response. It allows the telemetry wrapper to treat streaming and non-streaming HTTP calls uniformly.
 
-**Data flow**: Reads `self.status` from `codex_client::StreamResponse` and returns it by value.
+**Data flow**: It reads the `status` field from the `StreamResponse` and returns it as the HTTP status code. The streaming response itself is not changed.
 
-**Call relations**: This trait method is what lets `run_with_request_telemetry` instrument streaming request attempts as well as unary ones.
+**Call relations**: When `run_with_request_telemetry` is used for a streaming call, a successful `StreamResponse` can still be measured and reported just like a regular response. This is important because `run_with_request_telemetry` is called by both ordinary execution code and streaming JSON code.
 
 
 ##### `run_with_request_telemetry`  (lines 68–98)
@@ -2528,10 +2572,10 @@ async fn run_with_request_telemetry(
 ) -> Result<T, TransportError>
 ```
 
-**Purpose**: Wraps `codex_client::run_with_retry` so each request attempt reports timing, status, and transport error information to an optional telemetry sink. It preserves the original retry policy and send behavior while adding observability.
+**Purpose**: This function sends an API request with retry support while recording timing and result details for every attempt. It is the bridge between the retry system and the telemetry system.
 
-**Data flow**: Consumes a `RetryPolicy`, optional `Arc<dyn RequestTelemetry>`, a `make_request` closure, and a clonable async `send` function. It passes them into `run_with_retry`, but replaces the send callback with an async closure that records `Instant::now()`, awaits `send(req)`, derives `(status, err)` from either the successful response's `WithStatus::status()` or `http_status(err)`, calls `t.on_request(attempt, status, err, elapsed)` when telemetry exists, and returns the original `Result<T, TransportError>`. The outer function awaits `run_with_retry` and returns its final result unchanged.
+**Data flow**: It receives a retry policy, optional telemetry recorder, a way to build a fresh request, and a function that actually sends the request. For each attempt, it starts a timer, sends the request, checks whether the result was a successful response or an error, extracts the HTTP status when possible, reports the attempt to telemetry if telemetry is enabled, and finally returns the same success or failure result produced by the retry process.
 
-**Call relations**: Higher-level execution paths such as `execute_with` and `stream_encoded_json_with` call this wrapper instead of invoking `run_with_retry` directly, so all retry attempts are instrumented consistently.
+**Call relations**: Higher-level request paths such as `execute_with` and `stream_encoded_json_with` call this when they need to perform an API call. Inside, it hands the retry work to `run_with_retry`, but wraps each send attempt with measurement and reporting. It uses `Response::status` or `StreamResponse::status` for successful calls, and `http_status` for failed HTTP calls, so the telemetry recorder gets a clear account of each attempt.
 
 *Call graph*: called by 2 (execute_with, stream_encoded_json_with); 1 external calls (run_with_retry).

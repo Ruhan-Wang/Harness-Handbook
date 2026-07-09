@@ -1,8 +1,8 @@
 # Core src tools and unified-exec tests  `stage-23.2.2`
 
-This stage is a cross-cutting verification layer for the core tooling and unified-exec infrastructure that sits beneath model-facing execution, approvals, and runtime dispatch. Its files do not implement the main loop themselves; instead, they lock down the contracts that startup registration, live tool routing, command execution, and teardown/reporting all depend on.
+This stage is a broad safety check for Codex’s tool system, the behind-the-scenes machinery that lets the model edit files, run commands, ask the user, call external MCP tools, manage sub-agents, and use hosted features like web search or image generation. Most files here are tests that protect the public “tool contract”: the exact names, descriptions, inputs, and outputs the model or outside clients depend on. That includes specs for shell, patching, MCP resources, multi-agent tools, user input, plugin installs, hosted tools, and agent jobs.
 
-One group fixes the public and internal tool surfaces: schema and behavior tests for test_sync, agent jobs, apply_patch, MCP resource/search, multi-agent tools, plugin install, request_user_input, shell tools, hosted tools, and unified_exec helpers ensure each handler exposes the right parameters, descriptions, and outputs. Another group validates orchestration around those handlers: context, registry, router, spec-plan, and tool-dispatch-trace tests verify visibility planning, namespacing, extension dispatch, result shaping, and trace capture. Approval and sandbox semantics are covered by command canonicalization, network approval, sandboxing, MCP tool-call, and apply-patch/runtime tests, which confirm permission derivation and policy enforcement. Finally, exec, user-shell, runtime, and unified-exec subsystem tests verify environment preparation, shell snapshot replay, process management, buffering, streaming, cancellation, and failure handling so higher-level tools execute predictably.
+Other tests check the moving parts that execute those tools. The registry finds and runs tools. The router sends each requested call to the right local, MCP, dynamic, or extension handler. Context and trace tests make sure results and history are recorded clearly. Approval, sandboxing, network, command-canonicalization, and runtime tests guard the rules for when commands or file edits are allowed. The test synchronization tool helps timing-sensitive tests coordinate reliably. Finally, the unified-exec tests cover the newer command runner: streaming output, long-running processes, remote exec servers, timeouts, cleanup, and safe shutdown.
 
 ## Files in this stage
 
@@ -11,11 +11,13 @@ These tests lock down the published tool schemas and the focused handler behavio
 
 ### `core/src/tools/handlers/test_sync_spec.rs`
 
-`config` · `tool registration / test schema publication`
+`config` · `test tool registration`
 
-This file is the schema companion to the runtime in `test_sync.rs`. Its single constructor builds a `ToolSpec::Function` named `test_sync_tool` with a concise description marking it as an internal synchronization helper for integration tests. The parameter object is intentionally permissive in requiredness—none of the top-level fields are mandatory—so tests can request only the synchronization behavior they need.
+This file is like the label and instruction card for a testing tool, not the tool’s working engine. The tool exists so Codex integration tests can coordinate several tool calls at once. For example, a test may need two concurrent calls to reach the same point before either one continues. That is what a “barrier” does: it is like a meeting point where everyone waits until the expected number of people arrive.
 
-The schema has three top-level properties. `sleep_before_ms` and `sleep_after_ms` are numeric delays that default to no delay when omitted. `barrier` is itself a nested object schema with `id`, `participants`, and `timeout_ms`; only `id` and `participants` are required, while `timeout_ms` is optional and documented as defaulting to 1000 ms. Both the nested barrier object and the top-level parameter object set `additionalProperties: false`, which keeps test payloads tightly constrained and catches misspelled fields early. The use of `BTreeMap` gives deterministic property ordering, which is useful for exact-equality tests in the companion test file.
+The file builds a schema, meaning a machine-readable description of allowed input. The tool can accept an optional delay before doing anything, an optional delay after finishing, and an optional barrier object. The barrier has an `id`, so different groups of calls do not get mixed together, a `participants` count, which says how many calls must arrive, and a `timeout_ms`, which prevents a test from waiting forever if something goes wrong.
+
+The result is wrapped as a `ToolSpec`, which is the project’s standard way to describe a callable tool. Without this file, tests could still have synchronization logic somewhere else, but the tool would not be advertised with clear parameters for the system to call correctly.
 
 #### Function details
 
@@ -25,22 +27,24 @@ The schema has three top-level properties. `sleep_before_ms` and `sleep_after_ms
 fn create_test_sync_tool() -> ToolSpec
 ```
 
-**Purpose**: Constructs the full tool specification for the internal synchronization helper used in tests. It describes optional delays and an optional barrier rendezvous block with strict field validation.
+**Purpose**: Creates the formal specification for the internal `test_sync_tool`. Someone uses it when registering available tools for tests, so the system knows the tool’s name, description, and accepted input fields.
 
-**Data flow**: It first builds `barrier_properties` containing string/number schemas for `id`, `participants`, and `timeout_ms`, then embeds that object schema under the top-level `barrier` property alongside `sleep_before_ms` and `sleep_after_ms`. It wraps the resulting property map in a `ResponsesApiTool` named `test_sync_tool`, with no required top-level fields, `additionalProperties: false`, and no output schema, and returns the `ToolSpec`.
+**Data flow**: It starts with no caller-provided input. It builds small schema pieces for each accepted field, groups the barrier fields into a nested object, then groups all top-level fields into the final parameter schema. It returns a `ToolSpec` describing a function-style tool named `test_sync_tool`; it does not run the tool or wait on any barrier itself.
 
-**Call relations**: This constructor is called by `TestSyncHandler::spec`, and its exact output is locked down by the companion test in `test_sync_spec_tests.rs`.
+**Call relations**: When the broader tool specification setup asks for this test synchronization tool, it calls `create_test_sync_tool`. This function hands back the completed tool description, using schema-building helpers for strings, numbers, and objects so the rest of the system can validate or present the tool consistently.
 
 *Call graph*: calls 3 internal fn (number, object, string); called by 1 (spec); 3 external calls (from, Function, vec!).
 
 
 ### `core/src/tools/handlers/test_sync.rs`
 
-`test` · `test execution / concurrent tool-call coordination`
+`test` · `request handling during test runs`
 
-This file provides the runtime half of `test_sync_tool`, a helper used only in tests. The handler supports parallel tool calls explicitly and accepts a flexible JSON payload deserialized into `TestSyncArgs`: optional `sleep_before_ms`, optional `sleep_after_ms`, and an optional nested `BarrierArgs` block. `BarrierArgs` includes a shared barrier ID, participant count, and a timeout that defaults through `default_timeout_ms`.
+This file is a small coordination aid for tests. Imagine several runners reaching a meeting point before anyone is allowed to continue; that meeting point is called a barrier. The `test_sync_tool` lets a test ask a tool call to sleep before it starts, wait at a named barrier until enough other calls arrive, sleep again afterward, and then return `ok`.
 
-Barrier state is stored globally in a `OnceLock<tokio::sync::Mutex<HashMap<String, BarrierState>>>`, keyed by barrier ID. Each `BarrierState` holds an `Arc<Barrier>` plus the participant count used to create it. `handle_call` parses function arguments, performs any requested pre-delay, optionally waits on a barrier, performs any post-delay, and returns a simple `ok` text output. The barrier logic in `wait_on_barrier` enforces two invariants up front: participants and timeout must both be greater than zero. It then either reuses an existing barrier with the same participant count or creates and registers a new one; mismatched participant counts for an existing ID are rejected with a model-facing error. Waiting is wrapped in `tokio::time::timeout`, and when the barrier opens, the leader removes the barrier from the global map only if the stored `Arc` still matches, preventing accidental deletion of a newer barrier with the same ID. The result is a compact but careful synchronization primitive for concurrent test scenarios.
+The file registers `TestSyncHandler` as a tool executor. It gives the tool its name and specification, says it is safe to run in parallel, and turns each incoming tool request into an asynchronous operation. The request must be a function-style payload with JSON arguments. Those arguments can include optional delays and an optional barrier with an ID, a participant count, and a timeout.
+
+The barrier state is kept in one shared global map protected by an asynchronous mutex, which is a lock that prevents two tasks from editing the map at the same time. If two calls use the same barrier ID, they must agree on the same participant count. Once all participants arrive, they are released. One released call cleans the barrier out of the map so later tests do not reuse stale state. If the barrier is misconfigured or not enough calls arrive before the timeout, the tool returns an error message instead of hanging forever.
 
 #### Function details
 
@@ -50,11 +54,11 @@ Barrier state is stored globally in a `OnceLock<tokio::sync::Mutex<HashMap<Strin
 fn default_timeout_ms() -> u64
 ```
 
-**Purpose**: Provides the serde default for barrier timeouts in test-sync arguments. It centralizes the default value so deserialization and code stay aligned.
+**Purpose**: Provides the fallback barrier timeout when the caller does not specify one. This keeps a test from waiting forever by default.
 
-**Data flow**: It takes no inputs and returns the `DEFAULT_TIMEOUT_MS` constant as `u64`. No state is read beyond that constant.
+**Data flow**: It takes no input. It reads the file’s default timeout constant and returns that number of milliseconds.
 
-**Call relations**: Serde uses this function when deserializing `BarrierArgs` if `timeout_ms` is omitted from the incoming JSON.
+**Call relations**: This is used by the argument deserializer for `BarrierArgs` when incoming JSON leaves out `timeout_ms`. It quietly supplies the safety limit before `handle_call` later sends the parsed arguments to `wait_on_barrier`.
 
 
 ##### `barrier_map`  (lines 56–58)
@@ -63,11 +67,11 @@ fn default_timeout_ms() -> u64
 fn barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, BarrierState>>
 ```
 
-**Purpose**: Returns the lazily initialized global barrier registry used to coordinate concurrent test-sync calls. It hides the `OnceLock` initialization details from the barrier logic.
+**Purpose**: Gives access to the shared table of named barriers. The table lets separate tool calls find the same meeting point by ID.
 
-**Data flow**: It takes no arguments and returns a shared reference to a `tokio::sync::Mutex<HashMap<String, BarrierState>>`, initializing `BARRIERS` with an empty map on first use.
+**Data flow**: It takes no input. It checks whether the global barrier table already exists; if not, it creates an empty hash map wrapped in an asynchronous mutex. It returns a reference to that shared locked map.
 
-**Call relations**: Only `wait_on_barrier` calls this helper, using it both to look up/create barriers and to remove them after the leader passes.
+**Call relations**: `wait_on_barrier` calls this whenever it needs to look up, create, or remove a barrier. This keeps all barrier storage in one place instead of passing it through every tool call.
 
 *Call graph*: called by 1 (wait_on_barrier).
 
@@ -78,11 +82,11 @@ fn barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, BarrierState>>
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registry name for the internal synchronization tool. This name must match the schema produced by the companion spec file.
+**Purpose**: Reports the public name of this tool: `test_sync_tool`. The registry uses this name so callers can request the right handler.
 
-**Data flow**: It ignores handler state and returns `ToolName::plain("test_sync_tool")`.
+**Data flow**: It takes the handler as input and constructs a plain tool name from the fixed string `test_sync_tool`. It returns that tool name.
 
-**Call relations**: The tool registry uses this method to dispatch calls to this handler; it complements `TestSyncHandler::spec`.
+**Call relations**: The tool registry calls this when identifying available tools. It delegates the actual name construction to `ToolName::plain`.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -93,11 +97,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Supplies the published schema for the test synchronization tool. It delegates schema construction to the dedicated spec module.
+**Purpose**: Returns the formal description of the tool’s inputs and behavior. This tells the rest of the system how the tool may be called.
 
-**Data flow**: It takes `&self`, calls `create_test_sync_tool()`, and returns the resulting `ToolSpec`.
+**Data flow**: It takes the handler as input and calls `create_test_sync_tool`, which builds the tool specification. It returns that specification.
 
-**Call relations**: This method is invoked during tool registration or schema enumeration and relies on `test_sync_spec.rs` for the actual schema definition.
+**Call relations**: The registry or model-facing tool setup calls this when advertising the tool. The details are supplied by `create_test_sync_tool`, keeping the handler focused on execution.
 
 *Call graph*: calls 1 internal fn (create_test_sync_tool).
 
@@ -108,11 +112,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Declares that this handler is safe and intended to run concurrently. That capability is essential because the barrier feature only makes sense when multiple calls can overlap.
+**Purpose**: Declares that this tool is allowed to run at the same time as other tool calls. That is essential because its barrier feature only works when multiple calls can wait together.
 
-**Data flow**: It takes `&self` and returns the constant boolean `true`.
+**Data flow**: It takes the handler as input and returns `true`. It does not read or change any state.
 
-**Call relations**: The runtime consults this trait method when deciding whether multiple invocations of the tool may execute in parallel.
+**Call relations**: The tool runtime checks this capability before scheduling calls in parallel. For this specific tool, parallel execution is not just safe; it is the main reason the tool exists.
 
 
 ##### `TestSyncHandler::handle`  (lines 73–75)
@@ -121,11 +125,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation method into the boxed future shape required by the `ToolExecutor` trait. It contains no business logic beyond forwarding.
+**Purpose**: Starts processing one invocation of the tool and returns it as an asynchronous task. This is the adapter between the generic tool runtime and this handler’s real work.
 
-**Data flow**: It consumes a `ToolInvocation`, calls `self.handle_call(invocation)`, boxes and pins the resulting future, and returns it as `ToolExecutorFuture`.
+**Data flow**: It receives a `ToolInvocation`, wraps a call to `handle_call` in a pinned future, and returns that future to the runtime. The actual result will be produced later when the future runs.
 
-**Call relations**: The tool runtime invokes this trait method for execution; it immediately delegates all substantive work to `TestSyncHandler::handle_call`.
+**Call relations**: The tool runtime calls `handle` when `test_sync_tool` is invoked. `handle` immediately hands the invocation to `handle_call`, which performs the sleeps, barrier wait, and final response.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -139,11 +143,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes a single test-sync request by optionally sleeping, waiting on a named barrier, and sleeping again. It returns a simple success marker when all requested synchronization steps complete.
+**Purpose**: Carries out one `test_sync_tool` request. It reads the caller’s requested delays and optional barrier, waits as instructed, and returns a simple successful output.
 
-**Data flow**: It takes a `ToolInvocation`, extracts `payload`, rejects non-function payloads with `FunctionCallError::RespondToModel`, and parses the JSON arguments into `TestSyncArgs`. If `sleep_before_ms` is present and positive it awaits `tokio::time::sleep`; if a `barrier` block is present it awaits `wait_on_barrier`; if `sleep_after_ms` is present and positive it sleeps again. Finally it creates `FunctionToolOutput::from_text("ok", Some(true))`, boxes it, and returns it.
+**Data flow**: It receives a tool invocation and first checks that the payload is a function call with arguments. It parses those arguments into `TestSyncArgs`. If `sleep_before_ms` is present and greater than zero, it pauses for that long. If a barrier is present, it calls `wait_on_barrier` and waits until enough matching calls arrive or an error occurs. If `sleep_after_ms` is present and greater than zero, it pauses again. On success it returns a boxed tool output containing the text `ok`; on unsupported payloads, bad arguments, or barrier failure, it returns an error for the model.
 
-**Call relations**: This method is called only by `TestSyncHandler::handle`. It delegates barrier coordination to `wait_on_barrier` and uses `parse_arguments` for strict JSON decoding.
+**Call relations**: `handle` calls this for each tool invocation. This function is the main execution path: it uses `parse_arguments` to understand input, uses async sleep for timing, calls `wait_on_barrier` for synchronization, and uses `FunctionToolOutput::from_text` plus `boxed_tool_output` to send the final response back through the tool system.
 
 *Call graph*: calls 4 internal fn (from_text, boxed_tool_output, parse_arguments, wait_on_barrier); called by 1 (handle); 3 external calls (from_millis, sleep, RespondToModel).
 
@@ -154,22 +158,24 @@ async fn handle_call(
 async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Coordinates rendezvous on a named barrier shared across concurrent test-sync calls, with validation, timeout handling, and cleanup by the barrier leader. It is the core synchronization primitive behind the tool.
+**Purpose**: Makes one tool call wait at a named barrier until the required number of participants have arrived. It protects tests from deadlock by rejecting invalid settings and timing out if the group never completes.
 
-**Data flow**: It consumes `BarrierArgs`, first rejecting `participants == 0` and `timeout_ms == 0` with model-facing errors. It clones the barrier ID, locks the global map from `barrier_map()`, and either reuses an existing `Arc<Barrier>` with matching participant count or inserts a new `BarrierState`; a participant-count mismatch for an existing ID becomes an error. It then waits on `barrier.wait()` under `tokio::time::timeout(Duration::from_millis(args.timeout_ms))`. If the wait times out it returns an error; if the current waiter is the barrier leader, it re-locks the map and removes the entry only when `Arc::ptr_eq` confirms the stored barrier is the same instance. On success it returns `Ok(())`.
+**Data flow**: It receives barrier arguments: an ID, participant count, and timeout. It rejects a participant count of zero and a timeout of zero. It locks the shared barrier map, then either finds the existing barrier for that ID or creates a new one. If the same ID is already registered with a different participant count, it returns an error. Then it waits on the barrier, but only up to the requested timeout. When all participants arrive, they are released. The leader among the released waiters locks the map again and removes the barrier if it is still the same one. On success it returns nothing; on invalid input or timeout it returns an error message.
 
-**Call relations**: This helper is invoked from `TestSyncHandler::handle_call` whenever the parsed arguments include a barrier section. It encapsulates all shared-state access and cleanup so the handler method can remain linear.
+**Call relations**: `handle_call` calls this when the request includes a barrier. It uses `barrier_map` to share named barriers across concurrent calls, `tokio::time::timeout` to avoid waiting forever, and Tokio’s `Barrier` to release all participants together once the expected group has arrived.
 
 *Call graph*: calls 1 internal fn (barrier_map); called by 1 (handle_call); 7 external calls (new, ptr_eq, new, from_millis, format!, timeout, RespondToModel).
 
 
 ### `core/src/tools/handlers/test_sync_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This file contains a single exact-equality test for the `test_sync_tool` schema. Rather than probing a few fields, it reconstructs the entire expected `ToolSpec::Function(ResponsesApiTool)` inline, including the nested `barrier` object, required fields inside that nested object, descriptions for every property, and `additionalProperties: false` at both levels.
+This is a small test file, but it guards an important contract. The project has a special tool used only by Codex integration tests to coordinate multiple tool calls, a bit like asking several runners to meet at the same starting line before anyone continues. That tool is described by a formal specification: its name, its human-readable description, and the JSON-shaped inputs it accepts.
 
-Because the runtime behavior in `test_sync.rs` depends on optional delays and barrier configuration, this test acts as a contract check that the model-facing schema still exposes those knobs with the intended names and defaults. It also implicitly verifies deterministic property ordering by comparing `BTreeMap`-backed schemas directly. Any change to wording, requiredness, or nesting will fail the test and force an intentional update.
+The test builds the real tool specification with `create_test_sync_tool()` and compares it to the expected specification written out in the test. The expected input shape includes a `barrier` object, which names a rendezvous point, says how many participants must arrive, and optionally sets a timeout. It also includes optional delays before and after the barrier.
+
+The value of this file is not in running the synchronization itself. Its job is to catch drift. If someone changes the tool schema, removes a required field, renames an input, or changes whether extra fields are allowed, this test fails. That failure tells maintainers that either the change was accidental, or the documented expectation must be updated deliberately.
 
 #### Function details
 
@@ -179,22 +185,24 @@ Because the runtime behavior in `test_sync.rs` depends on optional delays and ba
 fn test_sync_tool_matches_expected_spec()
 ```
 
-**Purpose**: Asserts that `create_test_sync_tool()` returns the exact expected schema for the internal synchronization helper. It protects the full nested parameter contract from accidental drift.
+**Purpose**: This test verifies that `create_test_sync_tool()` returns the exact tool specification expected by the integration-test infrastructure. It is used to catch accidental changes to the tool’s public shape before they affect tests that rely on it.
 
-**Data flow**: The test calls `create_test_sync_tool()`, constructs an inline expected `ToolSpec::Function(ResponsesApiTool)` with the full top-level and nested `barrier` schemas, and compares the two values using `assert_eq!`.
+**Data flow**: The test starts with no external input. It asks the code under test to create the synchronization tool specification, then builds the expected specification inline, including the tool name, description, accepted input fields, required fields, and whether extra fields are allowed. It compares the two values; if they match, the test passes, and if anything differs, the test fails with a readable comparison.
 
-**Call relations**: It directly validates the sole constructor in `test_sync_spec.rs`, serving as the regression test for that file’s published schema.
+**Call relations**: During the automated test run, the Rust test runner calls this function. Inside it, the comparison is handed to `assert_eq!`, which checks the generated tool specification against the expected one and reports any mismatch.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/handlers/agent_jobs_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file locks down the exact `ToolSpec` values produced by `agent_jobs_spec.rs`. The helper `described_object` creates an empty `JsonSchema::object` and attaches a description string, mirroring how the production code builds the `output_schema` and `result` object placeholders. The two tests then compare the entire returned `ToolSpec::Function(ResponsesApiTool { ... })` structures with `assert_eq!`, rather than checking only selected fields.
+This is a test file for the tool definitions related to agent jobs. In plain terms, these tools let a main agent start many worker agents from rows in a CSV file, and let each worker report back its result. The file does not run jobs itself. Instead, it verifies the “menu card” for each tool: what the tool is called, what it says it does, which inputs are allowed, and which inputs are required.
 
-`spawn_agents_on_csv_tool_requires_csv_and_instruction` confirms the spawn tool's name, long-form description, property set, per-property descriptions, required list (`csv_path` and `instruction`), and `additional_properties: false`. `report_agent_job_result_tool_requires_result_payload` does the same for the worker reporting tool, ensuring `job_id`, `item_id`, and `result` are required and that the optional `stop` flag carries the cancellation semantics text. Because these tests compare full values, they serve as regression guards for accidental wording changes, property ordering changes, or schema loosenings/tightenings that would alter model-visible behavior.
+That matters because these tool descriptions are part of the interface seen by agents or API clients. If a required field such as the CSV path or result payload were accidentally removed, a caller might send incomplete requests and fail later in a confusing way. These tests catch that kind of breakage early.
+
+The helper `described_object` builds a small JSON Schema object with a description. A JSON Schema is a machine-readable description of what shape some JSON data should have. The two tests then compare the actual tool specifications produced by the code against the exact expected specifications. They use a strict equality check, so even wording, required fields, and whether extra fields are allowed are guarded.
 
 #### Function details
 
@@ -204,11 +212,11 @@ This test file locks down the exact `ToolSpec` values produced by `agent_jobs_sp
 fn described_object(description: &str) -> JsonSchema
 ```
 
-**Purpose**: Creates a minimal object `JsonSchema` with a caller-provided description for use in expected test values.
+**Purpose**: This helper creates a simple JSON object schema with a human-readable description attached. The tests use it to avoid repeating the same setup for fields that accept an object, such as a worker result or an output schema.
 
-**Data flow**: It takes a `&str`, constructs an empty object schema with no required fields and no explicit additional-properties setting, mutates its `description` field to `Some(description.to_string())`, and returns the schema.
+**Data flow**: It receives a description string. It starts with an empty object-shaped JSON Schema, adds the description text to it, and returns the finished schema. Nothing outside the returned value is changed.
 
-**Call relations**: Used by both tests to avoid duplicating the object-schema setup embedded in the expected `ToolSpec` literals.
+**Call relations**: The test code uses this as a small building block while writing the expected tool specifications. Inside, it asks the JSON Schema object builder to make the empty object shape, using an empty map for its properties, then fills in the description before handing it back to the test.
 
 *Call graph*: calls 1 internal fn (object); 1 external calls (new).
 
@@ -219,11 +227,11 @@ fn described_object(description: &str) -> JsonSchema
 fn spawn_agents_on_csv_tool_requires_csv_and_instruction()
 ```
 
-**Purpose**: Asserts that the spawn-tool spec exactly matches the intended schema and descriptive text.
+**Purpose**: This test proves that the `spawn_agents_on_csv` tool requires the two essential inputs: the CSV file path and the instruction template. It also checks the rest of the advertised fields, such as optional output path, concurrency limits, timeout, and result schema.
 
-**Data flow**: It calls `create_spawn_agents_on_csv_tool()`, compares the returned `ToolSpec` against a fully inlined expected `ResponsesApiTool`, and fails the test if any field differs.
+**Data flow**: When the test runs, it builds the real tool specification and separately writes out the exact specification it expects. It then compares the two. If the name, description, allowed parameters, required parameters, or schema details differ, the test fails.
 
-**Call relations**: This test exercises the production spec factory directly and acts as a snapshot-style guard for model-facing API changes.
+**Call relations**: The Rust test runner calls this during the test suite. The function relies on the equality assertion macro to compare the actual tool definition with the expected one, so this test acts like a guardrail around the public shape of the CSV agent-spawning tool.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -234,22 +242,24 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction()
 fn report_agent_job_result_tool_requires_result_payload()
 ```
 
-**Purpose**: Asserts that the worker result-reporting tool spec exactly matches the intended required fields and descriptions.
+**Purpose**: This test proves that the `report_agent_job_result` tool requires a worker to send a job id, an item id, and a result object. It also checks the optional stop flag, which lets a worker cancel remaining work after reporting.
 
-**Data flow**: It calls `create_report_agent_job_result_tool()`, builds the expected `ToolSpec::Function` literal, and uses equality comparison to validate every field.
+**Data flow**: When the test runs, it creates the real reporting-tool specification and an expected specification written directly in the test. It compares them exactly. If the required result payload or any other part of the schema changes unexpectedly, the test fails.
 
-**Call relations**: Like the spawn-tool test, it validates the production schema factory end-to-end and catches any drift in the worker callback contract.
+**Call relations**: The Rust test runner calls this as part of the automated tests. Like the CSV-spawning test, it uses the equality assertion macro as the final judge, making sure the worker-only reporting tool keeps the contract that job workers depend on.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/handlers/agent_jobs_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file contains focused unit tests for lower-level helpers from the surrounding agent-jobs module. The tests are intentionally concrete and data-driven. `parse_csv_supports_quotes_and_commas` proves that CSV parsing preserves header order and correctly treats quoted commas as part of a field value. `csv_escape_quotes_when_needed` checks the inverse formatting behavior for plain strings, comma-containing strings, and strings containing literal quotes, ensuring the escaping logic doubles embedded quotes and wraps fields only when necessary.
+Agent jobs appear to use CSV rows as input and turn those rows into instructions for an agent. That means small text rules matter a lot: a comma inside a quoted CSV field should not split the field, duplicate column names should be rejected, and template placeholders should be replaced without accidentally changing literal braces. This file is a set of focused tests for those rules.
 
-Two tests cover prompt templating. `render_instruction_template_expands_placeholders_and_escapes_braces` passes a JSON row object with keys including a space (`file path`) and verifies that `{column}` placeholders are replaced while doubled braces `{{...}}` collapse to literal braces. `render_instruction_template_leaves_unknown_placeholders` confirms that missing keys are not erased or replaced with empty strings; the original placeholder text remains in the rendered instruction. Finally, `ensure_unique_headers_rejects_duplicates` validates that duplicate CSV headers are rejected with the exact `FunctionCallError::RespondToModel` message expected by higher-level code. Together these tests pin down edge cases that directly affect row-to-prompt rendering and CSV import correctness.
+Each test gives the helper code a small example and checks the exact result. One test proves the CSV reader understands normal CSV quoting, like `"alpha, beta"` being one value rather than two. Another checks that writing CSV values adds quotes only when needed, and doubles quote marks inside a value, which is the standard CSV way to keep quotes safe. Two tests cover instruction templates: known placeholders are filled from a JSON row, doubled braces become literal braces, and unknown placeholders are left alone instead of being erased. The last test checks that repeated CSV headers are reported as a clear error.
+
+Without these tests, a future change could quietly break job creation: rows might be misread, generated CSV could become invalid, or agent instructions could lose important file paths.
 
 #### Function details
 
@@ -259,11 +269,11 @@ Two tests cover prompt templating. `render_instruction_template_expands_placehol
 fn parse_csv_supports_quotes_and_commas()
 ```
 
-**Purpose**: Verifies that CSV parsing handles quoted fields containing commas without splitting them into extra columns.
+**Purpose**: This test proves that the CSV parser understands quoted fields that contain commas. Someone would rely on this behavior when a CSV cell contains natural text, such as a name or description, that includes punctuation.
 
-**Data flow**: It defines a small CSV string, passes it to `parse_csv`, destructures the returned headers and rows, and compares both against expected vectors of strings.
+**Data flow**: It starts with a short CSV string containing two headers and two rows. One row has a quoted value with a comma inside it. The test sends that text into the CSV parser, then compares the returned headers and rows with the expected clean values.
 
-**Call relations**: This test targets the parser helper used by the CSV job creation path, specifically the row-shape correctness that `handle` depends on.
+**Call relations**: During the test run, this function exercises the CSV parsing path and uses an equality check to confirm the parsed result is exactly right. If the parser split `alpha, beta` into two cells, this test would fail immediately.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -274,11 +284,11 @@ fn parse_csv_supports_quotes_and_commas()
 fn csv_escape_quotes_when_needed()
 ```
 
-**Purpose**: Checks that CSV field escaping leaves simple text untouched and correctly quotes/escapes problematic values.
+**Purpose**: This test checks the rules for turning a single value into safe CSV text. It makes sure plain values stay plain, values with commas get wrapped in quotes, and quotes inside values are escaped correctly.
 
-**Data flow**: It feeds three representative strings into `csv_escape` and compares each returned string to the expected CSV-safe representation.
+**Data flow**: It gives the CSV escaping helper three small strings: a simple word, a string with a comma, and a string containing a quote mark. Each input is transformed into CSV-safe text, and the test compares that output with the expected spelling.
 
-**Call relations**: This test validates formatting behavior likely used during CSV export, complementing the parser-side tests.
+**Call relations**: This test runs as a guard around the CSV-writing helper. Its equality checks catch changes that would produce CSV text other tools could misread.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -289,11 +299,11 @@ fn csv_escape_quotes_when_needed()
 fn render_instruction_template_expands_placeholders_and_escapes_braces()
 ```
 
-**Purpose**: Confirms that instruction templates substitute row values by column name and preserve literal braces via doubled-brace escaping.
+**Purpose**: This test proves that an instruction template can be filled from row data, including column names with spaces, while still allowing literal braces in the final instruction. This matters because agent jobs often need to turn table rows into readable task prompts.
 
-**Data flow**: It builds a JSON row object, calls `render_instruction_template` with a template containing multiple placeholders and `{{literal}}`, and asserts on the final rendered string.
+**Data flow**: It builds a small JSON object with values such as a file path and an area name. It then gives that object and a template string to the renderer. The renderer replaces known placeholders like `{path}` and `{file path}`, turns `{{literal}}` into `{literal}`, and returns the finished sentence, which the test checks exactly.
 
-**Call relations**: This test covers the prompt-generation semantics that worker jobs rely on when turning CSV rows into per-item instructions.
+**Call relations**: This test uses a JSON-building helper to create row-like input, then checks the rendered instruction with an equality assertion. It protects the path from raw row data to final agent-facing text.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -304,11 +314,11 @@ fn render_instruction_template_expands_placeholders_and_escapes_braces()
 fn render_instruction_template_leaves_unknown_placeholders()
 ```
 
-**Purpose**: Ensures that placeholders with no matching row field remain visible in the rendered instruction.
+**Purpose**: This test checks that missing template values are not silently removed. Leaving an unknown placeholder visible is safer because it shows the user what could not be filled.
 
-**Data flow**: It creates a JSON row with only one key, renders a template containing one known and one missing placeholder, and compares the output string to the expected partially substituted result.
+**Data flow**: It creates row data that contains only `path`, then renders a template containing both `{path}` and `{missing}`. The known placeholder is replaced, while the unknown one remains as `{missing}` in the final string.
 
-**Call relations**: This guards against silent data loss in template rendering and documents the fallback behavior used by the agent-job subsystem.
+**Call relations**: In the test suite, this function covers the renderer’s fallback behavior. Its equality check confirms the renderer does not guess, blank out, or error on an unknown placeholder in this case.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -319,22 +329,24 @@ fn render_instruction_template_leaves_unknown_placeholders()
 fn ensure_unique_headers_rejects_duplicates()
 ```
 
-**Purpose**: Verifies that duplicate CSV header names are rejected with the exact user-facing error variant and message.
+**Purpose**: This test verifies that CSV headers must be unique. Duplicate column names would make row data ambiguous, because `{path}` could refer to more than one column.
 
-**Data flow**: It constructs a duplicate-header vector, calls `ensure_unique_headers`, pattern-matches the error case, and compares the resulting `FunctionCallError` to the expected `RespondToModel` value.
+**Data flow**: It starts with a header list containing `path` twice. It passes that list to the header-checking helper and expects an error. The test then compares the error message with the exact user-facing message that should be returned; if no error appears, the test deliberately fails.
 
-**Call relations**: This test covers a validation branch that the top-level CSV job handler depends on before constructing row JSON objects keyed by header name.
+**Call relations**: This test covers the validation step before CSV data is used for jobs. It uses a failure check to ensure duplicates are rejected, then an equality assertion to ensure the reported problem is clear and stable.
 
 *Call graph*: 3 external calls (assert_eq!, panic!, vec!).
 
 
 ### `core/src/tools/handlers/apply_patch_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file validates the exact `ToolSpec` emitted by `apply_patch_spec.rs`. The first test, `create_apply_patch_freeform_tool_matches_expected_spec`, compares the entire returned `ToolSpec::Freeform(FreeformTool { ... })` for the default single-environment case, ensuring the tool name, description, format type, syntax, and grammar definition string all match the embedded `APPLY_PATCH_LARK_GRAMMAR` exactly.
+The `apply_patch` tool is the way an agent asks the system to change files. This test file makes sure the tool’s public description stays stable and understandable to the agent using it. Think of it like checking the printed instructions on a form: if the wording or required layout changes by accident, people may fill it out wrong.
 
-The second test exercises the conditional grammar rewrite used for multi-environment turns. It destructures the returned `ToolSpec` to confirm it is still freeform, then asserts that the generated grammar definition contains both the optional `environment_id?` marker in the start rule and the literal production line for `"*** Environment ID: " filename LF`. Together these tests guard the model-visible syntax contract for patch input and ensure that enabling environment selection changes only the intended grammar fragments.
+There are two checks here. The first confirms that the normal tool specification is exactly what the code promises: a freeform tool named `apply_patch`, with a description telling the agent not to wrap the patch in JSON, and a grammar definition written in Lark, which is a formal way to describe accepted text shapes. The second confirms an optional variant: when the caller asks for an environment ID, the patch grammar must include a place for that ID and the exact header text that introduces it.
+
+Without these tests, a small change to the tool spec could quietly break communication between the agent and the patch parser. These tests run during the automated test phase, not during normal product use.
 
 #### Function details
 
@@ -344,11 +356,11 @@ The second test exercises the conditional grammar rewrite used for multi-environ
 fn create_apply_patch_freeform_tool_matches_expected_spec()
 ```
 
-**Purpose**: Asserts that the default `apply_patch` freeform spec exactly matches the expected name, description, and embedded grammar.
+**Purpose**: This test verifies the standard `apply_patch` tool description when no environment ID is requested. It makes sure the tool name, user-facing instructions, format type, grammar syntax, and grammar text all match the expected specification.
 
-**Data flow**: It calls `create_apply_patch_freeform_tool(false)`, constructs the expected `ToolSpec::Freeform` literal using `APPLY_PATCH_LARK_GRAMMAR.to_string()`, and compares the two values with `assert_eq!`.
+**Data flow**: It starts by asking `create_apply_patch_freeform_tool` for the tool spec with environment IDs turned off. It then compares the returned value with a fully written-out expected value. If anything differs, the assertion reports the mismatch and the test fails.
 
-**Call relations**: This is a snapshot-style regression test for the single-environment spec factory output.
+**Call relations**: During the test suite, the Rust test runner calls this function. Inside the test, it uses `assert_eq!` to compare the generated tool spec against the expected one, so accidental changes to the public contract are caught immediately.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -359,22 +371,22 @@ fn create_apply_patch_freeform_tool_matches_expected_spec()
 fn create_apply_patch_freeform_tool_includes_environment_id_when_requested()
 ```
 
-**Purpose**: Checks that enabling environment-id support injects the expected grammar fragments into the freeform tool definition.
+**Purpose**: This test verifies the special `apply_patch` tool description used when patches need to name an environment. It checks that the grammar includes both the optional environment ID rule and the exact text header that introduces it.
 
-**Data flow**: It calls `create_apply_patch_freeform_tool(true)`, pattern-matches the result as `ToolSpec::Freeform`, then asserts that the grammar definition string contains the optional environment-id rule references.
+**Data flow**: It asks `create_apply_patch_freeform_tool` for the tool spec with environment IDs turned on. It expects the result to be a freeform tool; if it is not, the test stops with a panic. It then looks inside the grammar text and confirms that the environment ID pieces are present.
 
-**Call relations**: This test specifically covers the conditional branch in the spec factory that rewrites the grammar for multi-environment turns.
+**Call relations**: The Rust test runner calls this function as part of automated testing. The test first uses pattern matching to unwrap the freeform tool, calls `panic!` if the wrong kind of tool comes back, and then uses `assert!` checks to confirm the needed grammar fragments were included.
 
 *Call graph*: 2 external calls (assert!, panic!).
 
 
 ### `core/src/tools/handlers/apply_patch_tests.rs`
 
-`test` · `test execution`
+`test` · `test`
 
-This test module exercises several distinct behaviors from `apply_patch.rs`. Two small helpers reduce setup cost: `sample_patch` returns a minimal add-file patch string, and `invocation_for_payload` builds a realistic `ToolInvocation` with a session, turn context, cancellation token, diff tracker, fixed call id, and tool name. The first async tests verify hook integration: `pre_tool_use_payload_uses_freeform_patch_input` and `post_tool_use_payload_uses_patch_input_and_tool_output` confirm that the handler preserves the raw patch text as `{ "command": ... }` and pairs it with the serialized tool response.
+The apply_patch tool lets the system change files by receiving a patch, a text recipe that says which files to add, edit, move, or delete. This test file checks the small but important promises around that flow. Without these tests, the tool might still edit files, but surrounding systems could receive the wrong hook payload, miss a moved file during approval, or show stale progress while a patch is streaming in.
 
-Three tests focus on `ApplyPatchArgumentDiffConsumer`. They show that partial patch text yields no event until enough structure is parsed, that add-file progress initially reports empty content and later flushes full content on completion, that an optional `*** Environment ID:` header is tolerated, and that the 500ms buffering logic suppresses intermediate updates until the interval elapses. Additional tests cover policy helpers: `reconcile_environment_id_requires_selection_when_enabled` checks the exact error when environment selection is disallowed; `approval_keys_include_move_destination` proves rename destinations are included in approval path accounting; and the two `write_permissions_for_paths_*` tests verify that extra write permissions are omitted for workspace-writable directories but retained for paths outside the workspace root. These tests collectively pin down subtle behavior around streaming UX, sandbox permissions, and hook payload fidelity.
+The tests cover several angles. First, they verify that pre-tool and post-tool hooks see the original free-form patch text in the shape they expect. Hooks are outside callbacks that can inspect or react to tool use, so they need stable data. Second, they test the streaming diff consumer. That consumer reads patch text as it arrives in chunks and sends partial file-change updates, like giving someone a preview while a document is still being typed. It must also understand optional environment headers and avoid sending updates too often unless enough time has passed. Third, the file checks safety behavior: selecting a remote environment must only be allowed when the turn permits it, moved files must include both old and new paths for approval, and sandbox write permissions should only be expanded for paths outside the already-writable workspace.
 
 #### Function details
 
@@ -384,11 +396,11 @@ Three tests focus on `ApplyPatchArgumentDiffConsumer`. They show that partial pa
 fn sample_patch() -> &'static str
 ```
 
-**Purpose**: Returns a minimal valid apply-patch string used across tests.
+**Purpose**: Provides a tiny example patch used by the hook-payload tests. It keeps those tests focused on behavior instead of repeating patch text in multiple places.
 
-**Data flow**: It takes no inputs and returns a static string literal representing a patch that adds `hello.txt` with one line of content.
+**Data flow**: It takes no input. It returns a fixed patch string that says to add a file named hello.txt containing the word hello.
 
-**Call relations**: Used by the pre- and post-tool hook payload tests to avoid duplicating patch text.
+**Call relations**: The pre-tool and post-tool hook tests call this helper when they need a known patch body. It gives both tests the same input, so any difference in results comes from the hook logic being tested rather than from different patch text.
 
 *Call graph*: called by 2 (post_tool_use_payload_uses_patch_input_and_tool_output, pre_tool_use_payload_uses_freeform_patch_input).
 
@@ -399,11 +411,11 @@ fn sample_patch() -> &'static str
 async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation
 ```
 
-**Purpose**: Builds a realistic `ToolInvocation` test fixture around an arbitrary payload.
+**Purpose**: Builds a realistic apply_patch tool invocation around a chosen payload. Tests use it when they need to ask the handler what it would send to hooks.
 
-**Data flow**: It asynchronously creates a session and turn via `make_session_and_context`, then constructs a `ToolInvocation` populated with those values, a fresh cancellation token, a new `TurnDiffTracker` wrapped in `Arc<Mutex<_>>`, a fixed call id, the plain tool name `apply_patch`, direct call source, and the caller-provided payload. It returns the assembled invocation.
+**Data flow**: It receives a ToolPayload, creates a test session and turn, adds a cancellation token, a diff tracker, a fixed call id, the apply_patch tool name, and marks the call as direct. It returns a ToolInvocation that looks like a real tool call but is safe for tests.
 
-**Call relations**: Called by the hook payload tests so they can exercise handler methods with production-shaped invocation data.
+**Call relations**: The hook-payload tests call this helper before asking ApplyPatchHandler for pre-use or post-use data. Internally it relies on the session test helper and creates the small pieces a normal tool run would already have, so the tests do not need to hand-build that context.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, new, plain); called by 2 (post_tool_use_payload_uses_patch_input_and_tool_output, pre_tool_use_payload_uses_freeform_patch_input); 3 external calls (new, new, new).
 
@@ -414,11 +426,11 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation
 async fn pre_tool_use_payload_uses_freeform_patch_input()
 ```
 
-**Purpose**: Verifies that the handler's pre-tool hook payload contains the raw freeform patch text under the `command` key.
+**Purpose**: Checks that the pre-tool hook receives the raw patch text when apply_patch is called with free-form input. This matters because hooks may inspect the exact command before the tool is allowed to run.
 
-**Data flow**: It gets the sample patch, wraps it in `ToolPayload::Custom`, builds an invocation fixture, constructs a default handler, and compares `pre_tool_use_payload` output to the expected `PreToolUsePayload` JSON structure.
+**Data flow**: It starts with the sample patch, wraps it as a custom tool payload, builds a tool invocation, and asks the default apply_patch handler for its pre-tool payload. It expects a payload whose tool name is apply_patch and whose input JSON contains the patch under the command field.
 
-**Call relations**: Exercises `ApplyPatchHandler::pre_tool_use_payload` end-to-end using the shared invocation fixture.
+**Call relations**: The test runner calls this async test. The test uses sample_patch and invocation_for_payload to set up the scene, then calls the handler method under test and compares the result with the exact hook payload that downstream hook code should receive.
 
 *Call graph*: calls 2 internal fn (invocation_for_payload, sample_patch); 2 external calls (assert_eq!, default).
 
@@ -429,11 +441,11 @@ async fn pre_tool_use_payload_uses_freeform_patch_input()
 async fn post_tool_use_payload_uses_patch_input_and_tool_output()
 ```
 
-**Purpose**: Verifies that the handler's post-tool hook payload includes both the original patch command and the serialized textual tool response.
+**Purpose**: Checks that the post-tool hook receives both the original patch text and the final tool output. This lets hooks record or react to what was requested and what happened.
 
-**Data flow**: It creates a custom-payload invocation from the sample patch, constructs an `ApplyPatchToolOutput` from success text, invokes `post_tool_use_payload`, and compares the result to the expected `PostToolUsePayload`.
+**Data flow**: It creates the sample patch, wraps it in a custom payload, builds a tool invocation, and creates a successful apply_patch output message. It asks the handler for the post-tool payload and expects it to include the call id, patch command, and response text.
 
-**Call relations**: Exercises `ApplyPatchHandler::post_tool_use_payload`, complementing the pre-hook test.
+**Call relations**: The test runner calls this async test. It uses the same setup helper as the pre-tool test, then passes both the invocation and output into the handler so it can verify the data handed off after the tool finishes.
 
 *Call graph*: calls 3 internal fn (from_text, invocation_for_payload, sample_patch); 2 external calls (assert_eq!, default).
 
@@ -444,11 +456,11 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output()
 fn diff_consumer_streams_apply_patch_changes()
 ```
 
-**Purpose**: Checks that the streaming diff consumer emits add-file progress only after enough patch structure is parsed and flushes final content on completion.
+**Purpose**: Checks that the diff consumer can read a patch arriving in pieces and report useful progress before the full patch is complete. This supports live UI updates while the model is still streaming tool arguments.
 
-**Data flow**: It creates a default consumer, pushes several patch fragments in sequence, asserts `None` for incomplete states, captures emitted events when available, and compares their `call_id` and `changes` maps to expected `FileChange::Add` values before and after finalization.
+**Data flow**: It creates a fresh ApplyPatchArgumentDiffConsumer, feeds it patch fragments one by one, and watches when progress events appear. Early header text produces no event; once the added file is recognized, it reports hello.txt as being added with empty content; after the patch finishes, it reports the complete added content hello and world.
 
-**Call relations**: Directly exercises `ApplyPatchArgumentDiffConsumer::push_delta` and `finish_update_on_complete` behavior without going through the full tool framework.
+**Call relations**: The test runner calls this test. The test talks directly to the consumer through push_delta and finish_update_on_complete, exercising the same incremental path used when a tool argument is streamed rather than delivered all at once.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, default).
 
@@ -459,11 +471,11 @@ fn diff_consumer_streams_apply_patch_changes()
 fn diff_consumer_streams_apply_patch_changes_with_environment_header()
 ```
 
-**Purpose**: Ensures the streaming diff consumer tolerates an environment-id header before the first file hunk.
+**Purpose**: Checks that an optional environment header in the patch does not stop streaming diff detection. This is important because some patches may name a target environment before listing file edits.
 
-**Data flow**: It pushes a begin-patch fragment containing `*** Environment ID: remote`, confirms no event yet, then pushes an add-file fragment and asserts that the resulting change map contains the expected add-file entry.
+**Data flow**: It creates a diff consumer, sends a patch start plus an Environment ID header, then sends the beginning of an added-file patch. The expected output is still a progress event showing hello.txt as an added file.
 
-**Call relations**: Covers the grammar extension path relevant when multi-environment patch syntax is enabled.
+**Call relations**: The test runner calls this test. It feeds data directly into the diff consumer to confirm that environment-selection metadata is skipped over cleanly and the file-change parser still starts at the right place.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, default).
 
@@ -474,11 +486,11 @@ fn diff_consumer_streams_apply_patch_changes_with_environment_header()
 fn diff_consumer_sends_next_update_after_buffer_interval()
 ```
 
-**Purpose**: Verifies that throttled progress updates resume once the configured buffer interval has elapsed.
+**Purpose**: Checks that the diff consumer sends another progress update after its buffer interval has passed. This prevents the interface from being flooded with updates while still keeping long-running streams fresh.
 
-**Data flow**: It creates a consumer, emits an initial event from early patch fragments, manually rewinds `last_sent_at` to simulate elapsed time, pushes another fragment, and asserts that a second progress event is produced with the expected partial file content.
+**Data flow**: It feeds the consumer enough patch text to trigger a first progress event. Then it manually moves the consumer's last-sent time into the past and sends more content. The result is a second progress event that includes the content known before the newest partial line.
 
-**Call relations**: Targets the time-based branch inside `ApplyPatchArgumentDiffConsumer::push_delta`.
+**Call relations**: The test runner calls this test. It directly adjusts the consumer's timing state to simulate time passing, then uses push_delta to verify the rate-limiting behavior that normal streaming code depends on.
 
 *Call graph*: 3 external calls (assert_eq!, default, now).
 
@@ -489,11 +501,11 @@ fn diff_consumer_sends_next_update_after_buffer_interval()
 fn reconcile_environment_id_requires_selection_when_enabled()
 ```
 
-**Purpose**: Checks the exact behavior of environment-id validation for both disallowed and absent environment selections.
+**Purpose**: Checks the rule for environment selection in apply_patch input. A patch may name an environment only when the current turn allows that feature.
 
-**Data flow**: It calls `require_environment_id` with a present id and `allow_environment_id = false`, then with no id and `allow_environment_id = true`, and compares both results to expected `Result` values.
+**Data flow**: It calls require_environment_id with a parsed environment id while environment selection is disallowed and expects an error message to the model. It also calls it with no parsed id while selection is allowed and expects success with no selected environment.
 
-**Call relations**: Unit-tests the policy helper used by the direct apply-patch handler before environment resolution.
+**Call relations**: The test runner calls this test. It exercises the environment-id validation function directly, confirming the gate that protects turns where remote or alternate environment selection should not be available.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -504,11 +516,11 @@ fn reconcile_environment_id_requires_selection_when_enabled()
 async fn approval_keys_include_move_destination()
 ```
 
-**Purpose**: Verifies that path accounting for a rename/update patch includes both the original file path and the move destination.
+**Purpose**: Checks that approval tracking includes the destination path when a patch moves a file. This matters because a move writes to a new location, not just the old one.
 
-**Data flow**: It creates a temporary directory tree and source file, defines a patch that updates and moves the file, parses/verifies that patch into an action, passes the action to `file_paths_for_action`, and asserts that two approval keys are returned.
+**Data flow**: It creates a temporary workspace with an old file and a destination directory, builds a patch that updates and moves the file, and asks the apply-patch parser to verify it. From the parsed action, it collects the file paths used for approval and expects two paths: the source and the move destination.
 
-**Call relations**: Exercises the helper used by `effective_patch_permissions` to ensure rename destinations are considered for approvals and permissions.
+**Call relations**: The test runner calls this async test. It uses the real apply-patch parser rather than a mock, then passes the parsed action to file_paths_for_action to confirm approval checks will see every path that needs attention.
 
 *Call graph*: 7 external calls (new, assert_eq!, maybe_parse_apply_patch_verified, panic!, create_dir_all, write, vec!).
 
@@ -519,11 +531,11 @@ async fn approval_keys_include_move_destination()
 fn write_permissions_for_paths_skip_dirs_already_writable_under_workspace_root()
 ```
 
-**Purpose**: Ensures no extra permission profile is requested when the touched file already lies under a workspace-writable directory.
+**Purpose**: Checks that the system does not request extra write permission for files already inside the writable workspace. This keeps sandbox permissions minimal and avoids unnecessary approval prompts.
 
-**Data flow**: It creates a temporary workspace and nested file path, builds a workspace-write sandbox policy, calls `write_permissions_for_paths` with that file, and asserts that the result is `None`.
+**Data flow**: It creates a temporary workspace with a nested directory, builds an absolute path to a file inside it, and uses a workspace-write sandbox policy. When it asks for extra write permissions for that path, the expected result is None because the workspace already covers it.
 
-**Call relations**: Tests the filtering branch in permission derivation that avoids redundant write grants.
+**Call relations**: The test runner calls this test. It exercises write_permissions_for_paths directly with a path under the current workspace, confirming that normal in-workspace edits do not create redundant sandbox permission entries.
 
 *Call graph*: calls 2 internal fn (workspace_write, try_from); 3 external calls (new, assert_eq!, create_dir_all).
 
@@ -534,24 +546,24 @@ fn write_permissions_for_paths_skip_dirs_already_writable_under_workspace_root()
 fn write_permissions_for_paths_keep_dirs_outside_workspace_root()
 ```
 
-**Purpose**: Ensures extra write permissions are retained for touched paths outside the workspace root.
+**Purpose**: Checks that paths outside the workspace are still included when extra write permissions are needed. This protects the sandbox rule that only known writable locations may be changed.
 
-**Data flow**: It creates separate workspace and outside directories, constructs an absolute file path under the outside directory, builds a workspace-write sandbox policy, calls `write_permissions_for_paths`, extracts the resulting write roots from the returned permission profile, and compares them to the canonicalized outside directory path.
+**Data flow**: It creates a temporary workspace directory and a separate outside directory, then builds an absolute file path in the outside directory. With a workspace-write sandbox policy, it asks for permissions and expects the outside directory to appear as an added writable root.
 
-**Call relations**: Tests the positive branch of permission derivation used when patches target locations not already writable by the sandbox.
+**Call relations**: The test runner calls this test. It exercises write_permissions_for_paths with an out-of-workspace target, then inspects the resulting sandbox profile to make sure the permission request names the correct outside directory.
 
 *Call graph*: calls 2 internal fn (workspace_write, try_from); 4 external calls (new, assert_eq!, simplified, create_dir_all).
 
 
 ### `core/src/tools/handlers/mcp_resource_spec_tests.rs`
 
-`test` · `test`
+`test` · `test suite`
 
-This test file exercises the pure spec-construction functions in `mcp_resource_spec.rs` by comparing each returned `ToolSpec` against a fully inlined expected value. The tests use `pretty_assertions::assert_eq` so any mismatch in nested schema structure is easy to inspect.
+This is a test file for three tool definitions related to MCP, the Model Context Protocol, which lets external servers offer useful context such as files, schemas, or other application data. The tools tested here are not run against real servers. Instead, the tests check the “menu card” for each tool: what it is called, how it describes itself, and what inputs it says it accepts.
 
-Each test reconstructs the exact `ToolSpec::Function(ResponsesApiTool { ... })` expected from the corresponding builder. For the list tools, the expected schema is an object with `server` and `cursor` string properties, no required fields, and `additionalProperties` disabled. For the read tool, the expected schema requires both `server` and `uri`. The descriptions are asserted verbatim, which means these tests also guard the model-facing wording and not just the structural schema.
+That matters because language models and API clients use these tool specifications to decide when and how to call a tool. If a field name changes by accident, or a required input is marked optional, the model may call the tool incorrectly. These tests act like a ruler held against the expected shape.
 
-Because the expected values are written out in full rather than partially matched, these tests serve as snapshot-style contract checks for tool registration. Any accidental change to a tool name, parameter description, required-field list, or schema strictness will fail immediately. The file contains no helper logic or runtime behavior; its value is in preserving the exact external interface promised by the MCP resource handlers.
+Each test builds the actual tool specification using the production helper from the surrounding module, then compares it with a hand-written expected `ToolSpec`. The expected values include the JSON schema, which is a machine-readable description of the tool’s input fields. Two list tools accept optional `server` and `cursor` fields for filtering and paging. The read tool requires both `server` and `uri`, because reading one resource needs an exact server and resource address.
 
 #### Function details
 
@@ -561,11 +573,11 @@ Because the expected values are written out in full rather than partially matche
 fn list_mcp_resources_tool_matches_expected_spec()
 ```
 
-**Purpose**: Asserts that `create_list_mcp_resources_tool()` returns the exact expected function-tool specification.
+**Purpose**: This test makes sure the `list_mcp_resources` tool is described correctly. It checks that the tool is named properly, explains that it lists MCP server resources, and accepts optional `server` and `cursor` inputs.
 
-**Data flow**: It calls the builder, constructs an inline expected `ToolSpec::Function(ResponsesApiTool { ... })` with the full parameter schema, and compares actual versus expected with `assert_eq!`. It produces no outputs beyond test pass/fail.
+**Data flow**: The test starts with the tool specification produced by the real creation function. It builds a separate expected specification in the test, including the human-readable description and the JSON schema for inputs. It then compares the two; if anything differs, the test fails and shows the mismatch.
 
-**Call relations**: Executed by the test runner. It directly validates the list-resources spec builder and does not delegate to any helper beyond the assertion macro.
+**Call relations**: During the test run, the Rust test runner calls this function. The function uses `assert_eq!` to compare the production tool definition against the expected one, so accidental changes to the public tool contract are caught immediately.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -576,11 +588,11 @@ fn list_mcp_resources_tool_matches_expected_spec()
 fn list_mcp_resource_templates_tool_matches_expected_spec()
 ```
 
-**Purpose**: Checks that the resource-template listing tool spec matches the intended name, description, and optional-parameter schema exactly.
+**Purpose**: This test checks the advertised shape of the `list_mcp_resource_templates` tool. Resource templates are parameterized resources, so the test confirms the description and optional paging/filtering inputs match the intended contract.
 
-**Data flow**: It obtains the actual spec from `create_list_mcp_resource_templates_tool()`, builds the expected nested `ToolSpec` value inline, and compares them with `assert_eq!`. The only side effect is a failing test if they differ.
+**Data flow**: The test gets the actual resource-template listing tool specification from the production code. It creates the expected version inline, with optional `server` and `cursor` string parameters. The comparison produces no output when the values match, but fails the test if any name, description, or parameter schema has drifted.
 
-**Call relations**: Run by the test harness to guard the contract exposed by the resource-template spec builder.
+**Call relations**: The test runner invokes this function as part of the automated test suite. Inside it, `assert_eq!` is the checkpoint that decides whether the generated tool specification still matches the documented expectation.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -591,24 +603,24 @@ fn list_mcp_resource_templates_tool_matches_expected_spec()
 fn read_mcp_resource_tool_matches_expected_spec()
 ```
 
-**Purpose**: Verifies that the read-resource tool spec requires `server` and `uri` and otherwise matches the expected metadata exactly.
+**Purpose**: This test verifies the `read_mcp_resource` tool specification. It confirms that reading a resource requires both the MCP server name and the resource URI, which prevents callers from trying to read an unspecified resource.
 
-**Data flow**: It calls `create_read_mcp_resource_tool()`, constructs the expected `ToolSpec` including the required-field vector, and asserts equality. No persistent state is modified.
+**Data flow**: The test asks the production code for the actual read-resource tool specification. It then builds the expected specification, including two required string inputs: `server` and `uri`. The assertion compares the full structures and fails if the tool’s public contract changes unexpectedly.
 
-**Call relations**: This test is invoked by the test runner and serves as a contract check for the read-resource schema builder.
+**Call relations**: The automated test runner calls this function during tests. The function relies on `assert_eq!` to compare the actual and expected tool specifications, helping ensure callers and language models receive stable instructions for reading MCP resources.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/handlers/mcp_resource_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This file is a focused test suite for the `mcp_resource` module’s data-shaping helpers rather than the networked handlers themselves. Two small fixtures, `resource` and `template`, construct minimal `rmcp` resource values by filling `RawResource` and `RawResourceTemplate` with only the identifying fields and then stripping annotations via `no_annotation()`.
+This is a test file. It checks the small but important promises made by the MCP resource handler code. MCP, or Model Context Protocol, is the protocol shape this project uses to talk about resources such as files, memos, or templates exposed by a server. These tests make sure that when the code adds a server name to a resource, turns results into JSON, parses user-provided arguments, or trims very large output, the result still looks exactly as expected.
 
-The tests validate several important invariants. `ResourceWithServer::new` and `ResourceTemplateWithServer::new` must serialize a top-level `server` field alongside the original MCP identifiers. `ListResourcesPayload::from_single_server` must preserve `next_cursor` and annotate each returned resource with the originating server. `ListResourcesPayload::from_all_servers` must flatten a `HashMap<String, Vec<Resource>>` into a deterministic, sorted serialized order, preventing unstable output from map iteration.
+The file uses two helper builders, `resource` and `template`, to create simple fake resources without extra optional fields. The tests then exercise the real wrapping and serialization code. For example, they check that a resource gains a `server` field, that a paged resource list keeps its `nextCursor`, and that resources from multiple servers come out in a stable sorted order. That sorting matters because unstable output can make tools, snapshots, and users see surprising changes.
 
-The suite also checks utility behavior around tool outputs: `call_tool_result_from_content` should mark successful calls with `is_error = Some(false)`, `parse_arguments` should treat blank input and JSON `null` as absent arguments while still parsing valid objects, and `serialize_function_output` should leave small payloads untouched but truncate oversized `ReadResourcePayload` text according to the configured `TruncationPolicy`. The large-payload test computes the expected truncated JSON using `truncate_text`, confirming that truncation happens on the serialized representation rather than on individual resource fields.
+The last tests focus on tool output size. Small payloads should pass through unchanged. Very large resource reads should be cut down according to a truncation policy, like shortening an overlong receipt so it still fits in a message window. Without these tests, small changes in JSON field names, ordering, success flags, or truncation behavior could silently break clients that depend on this format.
 
 #### Function details
 
@@ -618,11 +630,11 @@ The suite also checks utility behavior around tool outputs: `call_tool_result_fr
 fn resource(uri: &str, name: &str) -> Resource
 ```
 
-**Purpose**: Creates a minimal unannotated MCP `Resource` fixture with a URI and name for use in tests.
+**Purpose**: Creates a simple test resource with just a URI and a name. The tests use it as a clean sample object so they can focus on wrapping and serialization behavior instead of filling in many optional fields.
 
-**Data flow**: It takes `uri` and `name` string slices, fills a `rmcp::model::RawResource` with those values and `None` for all optional metadata fields, calls `.no_annotation()`, and returns the resulting `Resource`.
+**Data flow**: It receives a URI string and a name string. It builds a raw MCP resource with those values, leaves all optional details empty, removes annotations, and returns the finished `Resource` test value.
 
-**Call relations**: Used by tests that need concrete resource values, notably `resource_with_server_serializes_server_field`. It isolates fixture construction so assertions can focus on serialization behavior.
+**Call relations**: In the recorded test flow, `resource_with_server_serializes_server_field` calls this helper when it needs a small sample resource. The helper hands back that sample so the test can pass it into the resource-with-server wrapper.
 
 *Call graph*: called by 1 (resource_with_server_serializes_server_field).
 
@@ -633,11 +645,11 @@ fn resource(uri: &str, name: &str) -> Resource
 fn template(uri_template: &str, name: &str) -> ResourceTemplate
 ```
 
-**Purpose**: Creates a minimal unannotated MCP `ResourceTemplate` fixture with a URI template and name.
+**Purpose**: Creates a simple test resource template with just a URI pattern and a name. This gives the template serialization test a plain, predictable input.
 
-**Data flow**: It accepts `uri_template` and `name`, constructs `rmcp::model::RawResourceTemplate` with those fields and `None` for optional metadata, calls `.no_annotation()`, and returns the resulting `ResourceTemplate`.
+**Data flow**: It receives a URI template string, such as one containing `{id}`, and a name string. It builds a raw MCP resource template, leaves optional display and media fields empty, removes annotations, and returns the finished `ResourceTemplate` value.
 
-**Call relations**: Called by `template_with_server_serializes_server_field` to provide a simple template fixture for serialization checks.
+**Call relations**: `template_with_server_serializes_server_field` calls this helper to get a minimal template. The returned template is then wrapped with a server name and checked as JSON.
 
 *Call graph*: called by 1 (template_with_server_serializes_server_field).
 
@@ -648,11 +660,11 @@ fn template(uri_template: &str, name: &str) -> ResourceTemplate
 fn resource_with_server_serializes_server_field()
 ```
 
-**Purpose**: Verifies that wrapping a resource with `ResourceWithServer::new` adds the server name into the serialized JSON alongside the resource fields.
+**Purpose**: Tests that a resource wrapped with its server name serializes to JSON with the expected `server`, `uri`, and `name` fields. This matters because clients need to know which server a listed resource came from.
 
-**Data flow**: It builds a fixture resource via `resource`, wraps it with server `test`, serializes the wrapper to `serde_json::Value`, and asserts the `server`, `uri`, and `name` fields match expected JSON values.
+**Data flow**: The test starts by making a sample resource and wrapping it with the server name `test`. It converts that wrapper into JSON, then checks that the JSON contains the server name, the resource URI, and the resource name exactly as expected.
 
-**Call relations**: Run by the test harness. It depends on the local `resource` helper and the production `ResourceWithServer::new` constructor.
+**Call relations**: During the test run, Rust's test runner invokes this test. The test calls `resource` to make the sample input, calls the wrapper constructor `new`, then hands the wrapper to JSON serialization and compares the resulting fields with expected values.
 
 *Call graph*: calls 2 internal fn (new, resource); 2 external calls (assert_eq!, to_value).
 
@@ -663,11 +675,11 @@ fn resource_with_server_serializes_server_field()
 fn list_resources_payload_from_single_server_copies_next_cursor()
 ```
 
-**Purpose**: Checks that `ListResourcesPayload::from_single_server` preserves pagination state and annotates nested resources with the server name.
+**Purpose**: Tests that a resource-list response from one server keeps its pagination cursor and marks each resource with the server name. A pagination cursor is a bookmark clients use to ask for the next page of results.
 
-**Data flow**: It constructs a `ListResourcesResult` with `next_cursor` and one resource, converts it into a payload with `from_single_server`, serializes to JSON, and asserts the top-level `server`, `nextCursor`, resource count, and nested resource `server` field.
+**Data flow**: The test builds a fake list result containing one resource and a `next_cursor` value. It converts that result into a single-server payload, serializes it to JSON, then checks that the top-level server and cursor are present and that the resource entry also carries the same server name.
 
-**Call relations**: Executed by the test runner to validate the single-server payload constructor used by the list-resources handler.
+**Call relations**: The test runner calls this test as part of the suite. The test calls `from_single_server` to transform the raw server result into the project’s outgoing payload, then uses JSON serialization and assertions to verify the result.
 
 *Call graph*: calls 1 internal fn (from_single_server); 3 external calls (assert_eq!, to_value, vec!).
 
@@ -678,11 +690,11 @@ fn list_resources_payload_from_single_server_copies_next_cursor()
 fn list_resources_payload_from_all_servers_is_sorted()
 ```
 
-**Purpose**: Ensures that aggregating resources from multiple servers yields a deterministic sorted order in the serialized payload.
+**Purpose**: Tests that resources collected from multiple servers are output in a predictable sorted order. Predictable order keeps clients and tests from seeing random-looking changes when the same data is returned.
 
-**Data flow**: It builds a `HashMap` with resources under `beta` and `alpha`, converts it with `ListResourcesPayload::from_all_servers`, serializes to JSON, extracts the `uri` values from the `resources` array, and asserts they appear in sorted server/resource order.
+**Data flow**: The test creates a map with two server names and several resources. It asks the payload builder to combine all servers, serializes the combined payload to JSON, extracts the resource URIs, and checks that they appear in the expected alpha-before-beta order.
 
-**Call relations**: This test guards the aggregate constructor used when no server is specified. It specifically checks behavior that would otherwise be unstable due to hash-map iteration order.
+**Call relations**: The test runner invokes this test. Inside it, the map is filled with sample resources, `from_all_servers` does the combining and ordering work, and the test inspects the serialized JSON to confirm the order.
 
 *Call graph*: calls 1 internal fn (from_all_servers); 4 external calls (new, assert_eq!, to_value, vec!).
 
@@ -693,11 +705,11 @@ fn list_resources_payload_from_all_servers_is_sorted()
 fn call_tool_result_from_content_marks_success()
 ```
 
-**Purpose**: Confirms that converting successful textual tool output into a call result marks it as non-error.
+**Purpose**: Tests that tool output created from content is marked as successful when the success flag says so. This protects the meaning of the `is_error` field, which tells clients whether the tool call failed.
 
-**Data flow**: It calls `call_tool_result_from_content("{}", Some(true))`, then asserts `is_error` is `Some(false)` and that one content item was produced.
+**Data flow**: The test passes a small content string and a success value into the result-building function. It then checks that the produced result has `is_error` set to `false` and contains exactly one content item.
 
-**Call relations**: Run by the test harness to validate the helper used by MCP handlers when emitting end-of-call telemetry.
+**Call relations**: The test runner calls this test. The test exercises `call_tool_result_from_content` and then uses assertions to confirm that the result’s success/error signal and content count match the intended behavior.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -708,11 +720,11 @@ fn call_tool_result_from_content_marks_success()
 fn parse_arguments_handles_empty_and_json()
 ```
 
-**Purpose**: Verifies that argument parsing treats blank input and JSON `null` as no arguments while still parsing valid JSON objects.
+**Purpose**: Tests how tool argument text is interpreted. Empty text and JSON `null` should mean “no arguments,” while a JSON object should become usable structured data.
 
-**Data flow**: It calls `parse_arguments` on whitespace and on `null`, asserting both return `None`, then parses a JSON object string and asserts the resulting value contains the expected `server` field.
+**Data flow**: The test first sends whitespace-only text into the parser and expects no value. It then sends the text `null` and again expects no value. Finally it sends a JSON object containing a server name and checks that the parsed value includes that server.
 
-**Call relations**: This test covers the parsing helper used by the MCP resource handlers before typed deserialization.
+**Call relations**: The test runner invokes this test. The test calls `parse_arguments` with three representative inputs, then uses assertions to confirm that missing arguments and real JSON arguments are distinguished correctly.
 
 *Call graph*: 2 external calls (assert!, assert_eq!).
 
@@ -723,11 +735,11 @@ fn parse_arguments_handles_empty_and_json()
 fn template_with_server_serializes_server_field()
 ```
 
-**Purpose**: Checks that `ResourceTemplateWithServer::new` serializes the server name together with the template URI and name.
+**Purpose**: Tests that a resource template wrapped with a server name serializes to the expected compact JSON shape. This lets clients know which server owns a template for resources that can be filled in later.
 
-**Data flow**: It creates a template fixture via `template`, wraps it with server `srv`, serializes to JSON, and asserts the entire JSON object matches the expected structure.
+**Data flow**: The test creates a simple template, wraps it with the server name `srv`, serializes the wrapper to JSON, and compares the whole JSON object with the exact expected object containing `server`, `uriTemplate`, and `name`.
 
-**Call relations**: Executed by the test runner to validate the template wrapper used in resource-template payloads.
+**Call relations**: The test runner calls this test. It uses the `template` helper to make input data, calls the wrapper constructor `new`, serializes the result, and checks the final JSON with an equality assertion.
 
 *Call graph*: calls 2 internal fn (new, template); 2 external calls (assert_eq!, to_value).
 
@@ -738,11 +750,11 @@ fn template_with_server_serializes_server_field()
 fn serialize_function_output_preserves_small_payload()
 ```
 
-**Purpose**: Ensures that serialization under a generous truncation policy leaves a small payload unchanged.
+**Purpose**: Tests that normal-sized function output is serialized without being changed. Small responses should not be shortened or reformatted unexpectedly.
 
-**Data flow**: It builds a small JSON payload, serializes it to the expected string with `serde_json::to_string`, passes the payload through `serialize_function_output` with `TruncationPolicy::Bytes(1_024)`, converts the result to text, and asserts exact equality with the original serialized string.
+**Data flow**: The test builds a small JSON payload and separately creates the exact JSON string expected from it. It then serializes the payload through `serialize_function_output` with a generous byte limit and checks that the returned text matches the ordinary JSON string.
 
-**Call relations**: This test validates the normal non-truncating path of the output serializer used by MCP handlers.
+**Call relations**: The test runner invokes this test. The test creates a payload with the JSON helper, sets a byte-based truncation policy, sends both into the output serializer, and compares the text result with standard JSON serialization.
 
 *Call graph*: 4 external calls (assert_eq!, json!, Bytes, to_string).
 
@@ -753,24 +765,24 @@ fn serialize_function_output_preserves_small_payload()
 fn serialize_function_output_caps_read_resource_payload()
 ```
 
-**Purpose**: Verifies that large read-resource payloads are truncated according to the byte policy instead of being returned in full.
+**Purpose**: Tests that very large resource-read output is shortened according to the configured size limit. This prevents oversized resource contents from flooding a tool response.
 
-**Data flow**: It constructs a `ReadResourcePayload` containing a `ReadResourceResult` with one very large `TextResourceContents`, serializes the full payload to JSON, computes the expected truncated string with `truncate_text`, serializes through `serialize_function_output` under `TruncationPolicy::Bytes(8_000)`, converts to text, and asserts the output differs from the full serialization but equals the expected truncated form.
+**Data flow**: The test builds a read-resource payload containing a long text resource. It serializes that full payload, computes the expected shortened text using the same truncation rule, then sends the payload through `serialize_function_output`. The final checks confirm the output is not the full original text and is exactly the expected shortened version.
 
-**Call relations**: Run by the test harness to guard the bounded-output behavior relied on by `ReadMcpResourceHandler` when resource contents are large.
+**Call relations**: The test runner calls this test. The test constructs a large `ReadResourcePayload`, uses standard JSON serialization to know the full size, uses the truncation helper to calculate the expected capped output, and then verifies that `serialize_function_output` applies that cap.
 
 *Call graph*: 6 external calls (new, assert_eq!, assert_ne!, Bytes, to_string, vec!).
 
 
 ### `core/src/tools/handlers/mcp_search_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This file validates the search-index-facing metadata produced for MCP tools. Rather than exercising execution, it constructs a representative `ToolInfo` and asks `McpHandler::new(...).search_info()` to synthesize the searchable representation used elsewhere in the system.
+This is a test file for the MCP tool handler. MCP here means “Model Context Protocol,” a way for outside tool servers to describe tools that the system can call. The practical problem is search: if a calendar tool exists, the system needs useful searchable text so a user or model can discover it by typing things like “calendar,” “event,” “attendees,” or the tool’s own name.
 
-The shared `tool_info` fixture builds a realistic MCP tool definition: server name `codex-apps`, callable namespace `mcp__calendar__`, callable name `_create_event`, connector name `Calendar`, plugin display names with surrounding whitespace, and an `rmcp::model::Tool` whose JSON schema exposes `start_time` and `attendees` parameters. The tool also has a title (`Create event`) and description (`Create a calendar event.`).
+The tests build a small fake calendar tool using `tool_info()`. That fake tool includes a server name, a callable name, a namespace, a title, a description, two parameter names, a connector name, and plugin display names. The tests then create an `McpHandler`, ask it for `search_info()`, and compare the result against the exact expected output.
 
-The first test asserts that `search_info.entry.search_text` concatenates multiple metadata sources into one normalized search string: namespace-qualified name, callable aliases, server name, connector name, title, description, namespace description, plugin display names, and parameter names. It also checks that `source_info` is populated from connector metadata. The second test removes `namespace_description` to verify the fallback path: the namespace output description should become `Tools for working with Calendar.` and `source_info` should still carry the connector name but no description. Together these tests ensure MCP tools remain discoverable even when some optional metadata is absent.
+One test checks that the search text is rich: it should include the generated tool name, original MCP tool name, server name, title, description, namespace description, plugin name, and parameter names. Another test checks the fallback behavior when the namespace description is missing. In that case, the visible namespace description should be built from the connector name, like “Tools for working with Calendar.” Without these tests, search could silently become worse or misleading when MCP metadata changes.
 
 #### Function details
 
@@ -780,11 +792,11 @@ The first test asserts that `search_info.entry.search_text` concatenates multipl
 fn search_info_uses_mcp_tool_metadata_and_parameter_names()
 ```
 
-**Purpose**: Checks that MCP search metadata includes the expected combined search text and source attribution when full tool metadata is present.
+**Purpose**: This test proves that MCP tool metadata is gathered into the search entry. It checks that the handler includes both human-friendly labels and technical names, plus the tool’s parameter names, so the tool can be found through many search terms.
 
-**Data flow**: It builds a `ToolInfo` via `tool_info`, constructs an `McpHandler` from it, calls `search_info()`, and asserts the resulting `entry.search_text` and `source_info` exactly match the expected values.
+**Data flow**: It starts by asking `tool_info` for a sample calendar tool description. It gives that description to `McpHandler::new`, then asks the handler for its search information. The test compares the produced search text and source details against exact expected values, so any missing or extra search wording causes the test to fail.
 
-**Call relations**: Executed by the test runner. It depends on the local `tool_info` fixture and the production `McpHandler::new`/`search_info` path.
+**Call relations**: This test calls `tool_info` to get a realistic fake MCP tool, then calls the handler constructor to build the object under test. It is focused on the normal case where the MCP tool has a namespace description, and it uses assertions to lock down the search output format.
 
 *Call graph*: calls 2 internal fn (new, tool_info); 1 external calls (assert_eq!).
 
@@ -795,11 +807,11 @@ fn search_info_uses_mcp_tool_metadata_and_parameter_names()
 fn search_info_uses_connector_name_for_output_namespace_description()
 ```
 
-**Purpose**: Verifies the fallback behavior when `namespace_description` is absent: the namespace output description should be synthesized from the connector name.
+**Purpose**: This test checks the fallback wording used when an MCP tool does not provide its own namespace description. It makes sure the system still gives the namespace a useful description based on the connector name.
 
-**Data flow**: It starts from `tool_info()`, sets `namespace_description` to `None`, builds an `McpHandler`, obtains `search_info`, pattern-matches the output as `LoadableToolSpec::Namespace`, and asserts the namespace description and `source_info` contents. If the output is not a namespace, it panics.
+**Data flow**: It first builds the sample calendar tool description, then removes its namespace description. After creating an `McpHandler` and asking for search information, it looks at the namespace output and verifies that its description became “Tools for working with Calendar.” It also checks that the source information keeps the connector name but has no source description.
 
-**Call relations**: Run by the test harness to validate a specific fallback branch in MCP search metadata generation.
+**Call relations**: This test reuses `tool_info` but deliberately changes one field to simulate incomplete metadata. It then builds the handler, inspects the search output, and fails immediately if the output is not a namespace, because the rest of the check only makes sense for namespace search results.
 
 *Call graph*: calls 2 internal fn (new, tool_info); 2 external calls (assert_eq!, panic!).
 
@@ -810,22 +822,24 @@ fn search_info_uses_connector_name_for_output_namespace_description()
 fn tool_info() -> ToolInfo
 ```
 
-**Purpose**: Constructs a representative `ToolInfo` fixture with realistic MCP metadata, schema properties, connector naming, and plugin display names.
+**Purpose**: This helper builds a complete sample MCP calendar tool for the tests. It keeps the test setup in one place so both tests use the same realistic tool description.
 
-**Data flow**: It creates and returns a `ToolInfo` struct populated with fixed strings and an `rmcp::model::Tool` built from a JSON object schema containing `start_time` and `attendees` properties. No external state is read or modified.
+**Data flow**: It creates and returns a `ToolInfo` value filled with calendar-related metadata: server and callable names, namespace text, an MCP tool called `createEvent`, a title, a description, a JSON-shaped parameter schema with `start_time` and `attendees`, a connector name, and plugin display names. It does not read outside state or change anything elsewhere.
 
-**Call relations**: Called by both tests in this file to centralize fixture setup and ensure they exercise the same baseline MCP tool definition.
+**Call relations**: Both tests call this helper before constructing an `McpHandler`. The helper supplies the shared input data, while each test decides what behavior to check; one uses it unchanged, and the other removes the namespace description to test fallback behavior.
 
 *Call graph*: called by 2 (search_info_uses_connector_name_for_output_namespace_description, search_info_uses_mcp_tool_metadata_and_parameter_names); 5 external calls (new, json!, new, object, vec!).
 
 
 ### `core/src/tools/handlers/multi_agents_spec_tests.rs`
 
-`test` · `test-time spec validation`
+`test` · `test run`
 
-This test file exercises the spec-construction layer rather than runtime behavior. Each test builds a tool spec through helpers from the parent module and destructures the resulting `ToolSpec` into either a `ResponsesApiTool` function tool or a legacy namespace wrapper for v1. The assertions are concrete: `spawn_agent` v2 must expose an object schema with `task_name` and encrypted `message`, omit legacy `items` and `fork_context`, include `fork_turns`, and advertise only models whose `ModelPreset.show_in_picker` flag is true. The tests also pin the exact descriptive guidance strings for inherited model behavior, model override descriptions, and service-tier override descriptions.
+This is a test file, not production logic. Its job is to protect the “contract” between the system and the language model for multi-agent tools. That contract is mostly written as tool descriptions and JSON schemas. A JSON schema is a machine-readable checklist that says which fields a tool accepts, which ones are required, and what kind of data each field should contain.
 
-A small `model_preset` helper fabricates realistic `ModelPreset` values with one reasoning effort and one service tier so description rendering can be checked deterministically. Edge cases covered include truncating the visible model summary list to five entries, truncating oversized custom reasoning-effort labels to `MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION`, and suppressing all model/service-tier metadata when `hide_agent_type_model_reasoning` is enabled. Separate tests confirm that `send_message` and `followup_task` require encrypted `message` fields and produce no output schema, that `wait_agent` v2 accepts only timeout configuration and returns a summary-only output schema, and that `list_agents` includes path-prefix filtering plus the expanded status enum containing `interrupted`.
+The tests create tool specifications and then inspect them like a careful proofreader. For example, they check that the newer spawn-agent tool requires both a task name and a message, hides models that should not be shown, encrypts message fields, and returns only the expected output fields. They also check backward compatibility: the older spawn-agent version must still expose the legacy `fork_context` field instead of the newer `fork_turns` field.
+
+Other tests cover helper tools used after agents exist. They verify that sending messages and follow-up tasks require encrypted message text, that waiting for agents returns only a summary instead of full content, and that listing agents includes useful fields such as status and last task message. Without these tests, a small schema or wording change could silently break how models use multi-agent features, much like changing labels on a control panel without telling the operator.
 
 #### Function details
 
@@ -835,11 +849,11 @@ A small `model_preset` helper fabricates realistic `ModelPreset` values with one
 fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset
 ```
 
-**Purpose**: Builds a synthetic `ModelPreset` with predictable IDs, display text, one medium reasoning-effort preset, and one `priority` service tier for use in spec-description tests.
+**Purpose**: Creates a small sample model entry for the tests. It lets the tests quickly make visible or hidden model presets without repeating the same setup data each time.
 
-**Data flow**: Takes an `id` string and `show_in_picker` flag, derives `model`, `display_name`, and `description` strings from `id`, fills the remaining `ModelPreset` fields with fixed defaults, and returns the assembled struct without mutating external state.
+**Data flow**: It takes a short model id and a true-or-false flag saying whether the model should be shown in the picker. It builds a complete `ModelPreset` value from that, filling in names, descriptions, reasoning settings, service tier information, and visibility. The result is a ready-made fake model preset used by the tests.
 
-**Call relations**: Used by tests that need concrete model metadata, especially the reasoning-effort truncation case, so the surrounding assertions can inspect exactly how spawn-agent descriptions summarize visible models.
+**Call relations**: This helper is called when a test needs a realistic model preset, especially in the reasoning-effort length test. It uses standard string creation and list-building tools to assemble the preset before handing it back to the test.
 
 *Call graph*: called by 1 (spawn_agent_tool_caps_reasoning_effort_value_length); 3 external calls (new, format!, vec!).
 
@@ -850,11 +864,11 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset
 fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models()
 ```
 
-**Purpose**: Checks the v2 `spawn_agent` tool spec for required fields, encrypted message handling, output schema shape, and visible-only model summary text.
+**Purpose**: Checks that the newer spawn-agent tool has the right required inputs and only advertises models that are meant to be visible. It also confirms that sensitive message text is marked for encryption.
 
-**Data flow**: Constructs `SpawnAgentToolOptions` with one visible and one hidden model, creates the tool, destructures the function spec, then reads description text, parameter schema type, property map, required list, and output schema JSON to assert exact inclusions and exclusions.
+**Data flow**: The test starts with two fake model presets: one visible and one hidden. It creates the version 2 spawn-agent tool, opens its description, input schema, and output schema, then compares them with the expected contract. The result is either a passing test or a failure showing exactly which part of the tool contract changed.
 
-**Call relations**: Acts as the main contract test for the v2 spawn spec, validating the output of `create_spawn_agent_tool_v2` under normal metadata-rich configuration.
+**Call relations**: During the test run, this function exercises the spawn-agent tool builder and then uses assertions to check the returned specification. If the builder returns the wrong kind of tool, the test stops with a panic because the rest of the checks would not make sense.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, panic!, vec!).
 
@@ -865,11 +879,11 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models()
 fn spawn_agent_tool_v1_keeps_legacy_fork_context_field()
 ```
 
-**Purpose**: Confirms the legacy v1 `spawn_agent` namespace tool still exposes `fork_context` and the older unencrypted message semantics.
+**Purpose**: Protects backward compatibility for the older spawn-agent tool. It verifies that version 1 still uses the old `fork_context` field and does not switch to the newer `fork_turns` field.
 
-**Data flow**: Builds a v1 tool with empty model options, unwraps the namespace and first nested function tool, then inspects the object-parameter properties to verify `fork_context` exists, `fork_turns` does not, and `message.encrypted` remains unset.
+**Data flow**: The test creates a version 1 spawn-agent tool with no available models. It unwraps the namespace-style tool shape, reads the function’s parameters, and checks for the legacy field names, message encryption behavior, and model override descriptions. The output is a pass if the old contract is preserved, or a test failure if it has drifted.
 
-**Call relations**: Guards backward compatibility for the v1 surface produced by `create_spawn_agent_tool_v1`, contrasting it with the stricter v2 schema.
+**Call relations**: This test is part of the compatibility safety net. It calls into the version 1 tool creation path and then relies on assertions to prove that callers expecting the older namespace tool will still see the fields they know how to use.
 
 *Call graph*: 4 external calls (new, assert!, assert_eq!, panic!).
 
@@ -880,11 +894,11 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field()
 fn spawn_agent_tool_caps_visible_model_summaries()
 ```
 
-**Purpose**: Verifies that the spawn-agent description includes at most five visible model summaries even when more are available.
+**Purpose**: Checks that the spawn-agent description does not grow too long when many models are available. It makes sure only the first five visible model summaries are included.
 
-**Data flow**: Creates six visible `ModelPreset`s, builds the v2 tool, extracts the description string, and checks that the first five model slugs appear while the sixth does not.
+**Data flow**: The test builds six visible fake models and creates the version 2 spawn-agent tool. It reads the generated description and checks that the first five model names appear while the sixth does not. The result is a pass if the description is capped as intended.
 
-**Call relations**: Exercises the description-rendering cap in the spawn-agent spec builder so prompt text stays bounded.
+**Call relations**: This test exercises the description-building behavior of the spawn-agent tool. It uses assertions to catch accidental changes that would make the model-facing instructions too long or noisy.
 
 *Call graph*: 3 external calls (assert!, panic!, vec!).
 
@@ -895,11 +909,11 @@ fn spawn_agent_tool_caps_visible_model_summaries()
 fn spawn_agent_tool_caps_reasoning_effort_value_length()
 ```
 
-**Purpose**: Ensures custom reasoning-effort labels are truncated before being embedded in the spawn-agent model summary text.
+**Purpose**: Checks that very long custom reasoning-effort names are shortened before being placed in the spawn-agent description. This prevents unusually long model metadata from bloating the tool instructions.
 
-**Data flow**: Starts from a synthetic visible model, replaces its default and supported reasoning effort with an oversized `ReasoningEffort::Custom` string, passes the single-model slice into `spawn_agent_models_description`, and compares the returned description against the expected truncated string.
+**Data flow**: The test starts with a fake visible model, then replaces its reasoning-effort setting with a custom value that is one character too long. It asks for the model description text and compares it with the expected shortened version. The output is a pass if the text is trimmed to the allowed length.
 
-**Call relations**: Targets the formatting helper directly to pin the exact truncation behavior used by spawn-agent spec descriptions.
+**Call relations**: This is the only listed test that directly calls `model_preset` to make its starting model. It then creates a custom reasoning effort and uses equality checks to confirm that the description helper applies the length limit correctly.
 
 *Call graph*: calls 1 internal fn (model_preset); 3 external calls (assert_eq!, Custom, vec!).
 
@@ -910,11 +924,11 @@ fn spawn_agent_tool_caps_reasoning_effort_value_length()
 fn spawn_agent_tool_hides_service_tier_with_spawn_metadata()
 ```
 
-**Purpose**: Checks that spawn-agent metadata fields and descriptive guidance disappear when agent-type/model reasoning details are intentionally hidden.
+**Purpose**: Checks that certain spawn-agent metadata fields can be hidden when requested. This is important when the system wants to keep agent type, model, reasoning effort, and service tier choices out of the tool interface.
 
-**Data flow**: Builds a v2 spawn tool with `hide_agent_type_model_reasoning` enabled, extracts description and parameter properties, and asserts that `agent_type`, `model`, `reasoning_effort`, and `service_tier` are absent and that inherited-model guidance text is omitted.
+**Data flow**: The test creates a version 2 spawn-agent tool with the option to hide agent type, model, and reasoning metadata. It then inspects the parameter list and description. The expected result is that those fields and their guidance text are absent.
 
-**Call relations**: Validates the alternate spec path used when the runtime wants a minimal spawn surface without model-selection hints.
+**Call relations**: This test drives the spawn-agent tool builder with a privacy-or-simplification option turned on. Assertions confirm that the builder follows that option instead of exposing extra controls to the model.
 
 *Call graph*: 3 external calls (assert!, panic!, vec!).
 
@@ -925,11 +939,11 @@ fn spawn_agent_tool_hides_service_tier_with_spawn_metadata()
 fn send_message_tool_requires_message_and_has_no_output_schema()
 ```
 
-**Purpose**: Pins the `send_message` tool schema to an object with required `target` and encrypted `message`, and no output schema.
+**Purpose**: Checks the tool used to send a message to an existing agent. It verifies that both the target agent and the message are required, and that the tool does not promise a structured output.
 
-**Data flow**: Creates the tool, unwraps the function spec, reads parameter schema type, property descriptions, encrypted flags, required list, and `output_schema`, then asserts the exact expected values and omitted legacy fields.
+**Data flow**: The test creates the send-message tool, reads its parameter schema, and checks for the `target` and `message` fields. It confirms the message is marked encrypted, older or unrelated fields are absent, the target description is clear, and there is no output schema. The result is a pass if the tool contract matches these expectations.
 
-**Call relations**: Serves as the schema contract test for `create_send_message_tool`.
+**Call relations**: This test focuses on the send-message tool creation path. It uses assertions after unpacking the returned function tool, and it panics if the created tool has an unexpected shape.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, panic!).
 
@@ -940,11 +954,11 @@ fn send_message_tool_requires_message_and_has_no_output_schema()
 fn followup_task_tool_requires_message_and_has_no_output_schema()
 ```
 
-**Purpose**: Verifies the `followup_task` tool name, exact description text, required encrypted message parameters, and lack of output schema.
+**Purpose**: Checks the tool used to send a follow-up task to an existing non-root agent. It makes sure the tool name, description, required fields, encryption marker, and lack of output schema all match the intended contract.
 
-**Data flow**: Builds the tool, destructures the function spec, and inspects `name`, `description`, parameter object properties, encrypted flag on `message`, required fields, and `output_schema`.
+**Data flow**: The test creates the follow-up-task tool and inspects its name, description, parameters, and output schema. It expects a target and encrypted message to be required, and it expects no unrelated `items` field and no structured output. The output is simply a passing or failing test.
 
-**Call relations**: Locks down the public spec emitted by `create_followup_task_tool`, including its longer behavioral description.
+**Call relations**: This test exercises the follow-up-task tool builder during the test suite. It uses equality and presence checks to catch any accidental change in the tool instructions or schema.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, panic!).
 
@@ -955,11 +969,11 @@ fn followup_task_tool_requires_message_and_has_no_output_schema()
 fn wait_agent_tool_v2_uses_timeout_only_summary_output()
 ```
 
-**Purpose**: Checks that the v2 wait tool accepts only timeout configuration and advertises summary-only output rather than returning child content.
+**Purpose**: Checks the newer wait-agent tool contract. It verifies that waiting is controlled by an optional timeout and that the tool returns only a brief summary, not the agent’s full content.
 
-**Data flow**: Creates the tool with explicit timeout bounds, unwraps the function spec, inspects description text, parameter properties, timeout description, required list, and output-schema JSON for the `message` field description.
+**Data flow**: The test creates the version 2 wait-agent tool with default, minimum, and maximum timeout values. It inspects the input schema to confirm there is a `timeout_ms` field and no `targets` field, then checks the description and output schema for summary-only wording. The result is a pass if the wait tool stays focused on polling for updates rather than returning detailed content.
 
-**Call relations**: Validates the MultiAgentV2 wait-tool contract generated by `create_wait_agent_tool_v2`.
+**Call relations**: This test drives the wait-agent tool builder with explicit timeout settings. Assertions connect those settings to the generated human-facing description and machine-readable schema.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, panic!).
 
@@ -970,11 +984,11 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output()
 fn list_agents_tool_includes_path_prefix_and_agent_fields()
 ```
 
-**Purpose**: Confirms the list-agents tool exposes an optional `path_prefix` filter and returns agent objects with the expected required fields.
+**Purpose**: Checks that the list-agents tool supports filtering by task path and returns the key fields needed to understand each live agent. This helps callers ask for a subset of agents and read useful status information back.
 
-**Data flow**: Creates the tool, unwraps the function spec, reads the parameter property map and output-schema JSON, and asserts the `path_prefix` description plus the required fields on each returned agent item.
+**Data flow**: The test creates the list-agents tool, reads its input schema, and looks for the `path_prefix` filter with the expected explanation. It then inspects the output schema and checks that each listed agent requires `agent_name`, `agent_status`, and `last_task_message`. The result is a pass if both input filtering and output shape are correct.
 
-**Call relations**: Tests the schema emitted by `create_list_agents_tool` for filtering and result-shape completeness.
+**Call relations**: This test exercises the list-agents tool creation path. It uses assertions to make sure the schema remains useful for consumers that need to display or reason about active agents.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, panic!).
 
@@ -985,24 +999,24 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields()
 fn list_agents_tool_status_schema_includes_interrupted()
 ```
 
-**Purpose**: Pins the list-agents output schema so the status enum includes the `interrupted` state alongside other lifecycle states.
+**Purpose**: Checks that `interrupted` is included as a possible agent status in the list-agents output. This matters because callers need to distinguish an interrupted agent from one that is running, shut down, missing, or still starting.
 
-**Data flow**: Builds the list-agents tool, extracts its output schema JSON, navigates to the nested enum under `agent_status`, and compares it to the expected ordered list of status strings.
+**Data flow**: The test creates the list-agents tool, opens the nested output schema for an agent’s status field, and compares the allowed status values with the expected list. The result is a pass if `interrupted` is part of the official schema.
 
-**Call relations**: Complements the broader list-agents schema test by focusing on the expanded status vocabulary exposed to callers.
+**Call relations**: This test is a narrow guard around the status enum in the list-agents schema. It panics if the tool is not returned as the expected function shape, then uses an equality check to protect the exact set of advertised statuses.
 
 *Call graph*: 2 external calls (assert_eq!, panic!).
 
 
 ### `core/src/tools/handlers/multi_agents_tests.rs`
 
-`test` · `test-time handler and integration validation`
+`test` · `test`
 
-This is the main behavioral test suite for multi-agent tooling. It defines reusable helpers to build `ToolInvocation` values with a fresh `CancellationToken` and `TurnDiffTracker`, serialize JSON arguments into `ToolPayload::Function`, parse `ThreadId`s, create a test `ThreadManager`, install temporary role TOML files, update a `TurnContext` after feature toggles, and normalize any `ToolOutput` into plain text plus success metadata. Small deserialization structs (`ListAgentsResult`, `ListedAgentResult`, `InterruptAgentResult`) let tests inspect JSON responses structurally.
+This is a large test file for Codex's "agents talking to agents" tools. Think of a main agent as a team lead and spawned agents as helpers. These tests check the rules for hiring helpers, giving them tasks, waiting for replies, stopping them, and bringing them back later.
 
-The tests cover both legacy handlers (`SpawnAgentHandler`, `SendInputHandler`, `ResumeAgentHandler`, `WaitAgentHandler`, `CloseAgentHandler`) and v2 handlers (`SpawnAgentHandlerV2`, `SendMessageHandlerV2`, `FollowupTaskHandlerV2`, `WaitAgentHandlerV2`, `ListAgentsHandlerV2`, `InterruptAgentHandler`). They verify argument parsing failures, empty-message rejection, mutual exclusion of `message` and `items`, depth-limit enforcement, manager-unavailable errors, and exact model-facing error strings. More involved scenarios assert inheritance and validation of model provider, reasoning effort, service tier, approval policy, sandbox and permission profiles, plus role-config overrides and fallback behavior.
+The file builds fake sessions, fake thread managers, and fake tool calls so each handler can be exercised without a real user conversation. It checks many edge cases that would be painful in production: empty messages, malformed agent IDs, missing managers, invalid task names, depth limits, service-tier compatibility, sandbox permissions, and whether old v1 fields are rejected in v2. It also verifies that v2 agents are addressed by stable paths such as `/root/worker`, not just raw thread IDs.
 
-For MultiAgentV2, the suite checks task-name requirements, path-based addressing, relative-path resolution, root/self-target restrictions, mailbox-driven wait semantics, summary-only wait outputs that never leak child content, list-agents filtering and status reporting, and interrupt behavior for resident and unloaded agents. It also exercises persistence-aware close/resume cascades across parent-child-grandchild subtrees and validates helper functions that derive child configs from `TurnContext`, ensuring runtime overrides are preserved while resume clears inherited base instructions.
+A recurring concern is inheritance. When a child agent is spawned, it must inherit the right model, approval policy, sandbox restrictions, and runtime permission profile unless the rules allow an override. Another concern is lifecycle: closed agents should disappear from lists, interrupted agents may remain resident, and explicitly closed subtrees must stay closed when a parent is resumed. Without these tests, small changes to multi-agent plumbing could quietly let agents escape restrictions, lose messages, or report confusing status to the model.
 
 #### Function details
 
@@ -1017,11 +1031,11 @@ fn invocation(
 ) -> ToolInvocation
 ```
 
-**Purpose**: Builds a fully populated `ToolInvocation` fixture for tests, including cancellation and diff-tracking state.
+**Purpose**: Builds a fake tool call object for tests. It lets each test call a handler as if the model had invoked a real tool.
 
-**Data flow**: Consumes a session `Arc`, turn `Arc`, tool name string, and `ToolPayload`; wraps them into a `ToolInvocation` with a new `CancellationToken`, a fresh `Arc<Mutex<TurnDiffTracker>>`, fixed `call_id` `call-1`, plain tool name, and direct call source; returns the assembled invocation.
+**Data flow**: It receives a session, a turn context, a tool name, and a payload. It wraps them with a fresh cancellation token, diff tracker, call ID, and direct-call source, then returns a complete ToolInvocation.
 
-**Call relations**: Used throughout the suite whenever a handler is invoked, so each test can focus on payload and session setup rather than boilerplate invocation construction.
+**Call relations**: Most tests use this helper right before calling a handler. It hides the repetitive setup so the test can focus on the handler behavior being checked.
 
 *Call graph*: calls 2 internal fn (default, plain); called by 76 (close_agent_submits_shutdown_and_returns_previous_status, handler_rejects_non_function_payloads, multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn, multi_agent_v2_followup_task_rejects_legacy_items_field, multi_agent_v2_followup_task_rejects_root_target_from_child, multi_agent_v2_full_history_fork_accepts_explicit_service_tier, multi_agent_v2_interrupt_agent_accepts_task_name_target, multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target, multi_agent_v2_interrupt_agent_rejects_root_target_and_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_id (+15 more)); 3 external calls (new, new, new).
 
@@ -1032,11 +1046,11 @@ fn invocation(
 fn function_payload(args: serde_json::Value) -> ToolPayload
 ```
 
-**Purpose**: Converts a JSON value into the stringly typed function-call payload format expected by tool handlers.
+**Purpose**: Turns JSON test arguments into the function-call payload shape expected by tool handlers.
 
-**Data flow**: Takes a `serde_json::Value`, serializes it with `to_string`, and returns `ToolPayload::Function { arguments }`.
+**Data flow**: It receives a JSON value, converts it to a string, and returns a ToolPayload::Function containing that string.
 
-**Call relations**: Paired with `invocation` in nearly every handler test to feed parsed function arguments into the tool runtime.
+**Call relations**: Tests pass its result into invocation whenever they want to simulate a normal structured tool call from the model.
 
 *Call graph*: called by 75 (close_agent_submits_shutdown_and_returns_previous_status, multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn, multi_agent_v2_followup_task_rejects_legacy_items_field, multi_agent_v2_followup_task_rejects_root_target_from_child, multi_agent_v2_full_history_fork_accepts_explicit_service_tier, multi_agent_v2_interrupt_agent_accepts_task_name_target, multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target, multi_agent_v2_interrupt_agent_rejects_root_target_and_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name (+15 more)); 1 external calls (to_string).
 
@@ -1047,11 +1061,11 @@ fn function_payload(args: serde_json::Value) -> ToolPayload
 fn parse_agent_id(id: &str) -> ThreadId
 ```
 
-**Purpose**: Parses a thread identifier string into a `ThreadId` and fails the test immediately if the string is invalid.
+**Purpose**: Converts an agent ID string returned by a handler back into a ThreadId used by the test manager.
 
-**Data flow**: Reads an `&str`, calls `ThreadId::from_string`, unwraps with `expect`, and returns the parsed `ThreadId`.
+**Data flow**: It receives text, parses it as a ThreadId, and fails the test immediately if the text is not valid.
 
-**Call relations**: Used after spawn-tool responses are decoded from JSON so tests can inspect the spawned thread's config snapshot or status.
+**Call relations**: Spawn-related tests use it after reading JSON output, then query the thread manager for the spawned child thread.
 
 *Call graph*: calls 1 internal fn (from_string); called by 7 (spawn_agent_full_history_fork_accepts_explicit_service_tier, spawn_agent_reapplies_runtime_sandbox_after_role_config, spawn_agent_role_service_tier_falls_back_to_supported_parent_tier, spawn_agent_service_tier_inheritance_preserves_supported_or_configured_tiers, spawn_agent_service_tier_override_validates_the_effective_child_model, spawn_agent_uses_explorer_role_and_preserves_approval_policy, tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed).
 
@@ -1062,11 +1076,11 @@ fn parse_agent_id(id: &str) -> ThreadId
 fn thread_manager() -> ThreadManager
 ```
 
-**Purpose**: Creates a test `ThreadManager` wired to dummy auth and the built-in OpenAI provider.
+**Purpose**: Creates a test thread manager with dummy authentication and the built-in OpenAI provider. This gives tests a controllable place to start and inspect agent threads.
 
-**Data flow**: Constructs `CodexAuth` from a dummy API key, looks up the `openai` provider from `built_in_model_providers`, and returns `ThreadManager::with_models_provider_for_tests(...)`.
+**Data flow**: It reads built-in provider information, combines it with a dummy API key, and returns a ThreadManager configured for tests.
 
-**Call relations**: Supplies the in-memory agent-control backend for most integration tests that need to spawn, interrupt, list, or wait on threads.
+**Call relations**: Most tests that need live agent control call this before assigning the manager's agent_control handle to the fake session.
 
 *Call graph*: calls 2 internal fn (with_models_provider_for_tests, from_api_key); called by 56 (close_agent_submits_shutdown_and_returns_previous_status, multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn, multi_agent_v2_followup_task_rejects_legacy_items_field, multi_agent_v2_followup_task_rejects_root_target_from_child, multi_agent_v2_full_history_fork_accepts_explicit_service_tier, multi_agent_v2_interrupt_agent_accepts_task_name_target, multi_agent_v2_interrupt_agent_rejects_root_target_and_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name, multi_agent_v2_interrupted_turn_does_not_notify_parent (+15 more)); 1 external calls (built_in_model_providers).
 
@@ -1077,11 +1091,11 @@ fn thread_manager() -> ThreadManager
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String
 ```
 
-**Purpose**: Writes a temporary role config file that overrides model, provider, and reasoning effort, then registers that role in the turn config.
+**Purpose**: Adds a temporary agent role whose config file overrides the child model, provider, and reasoning effort. Tests use it to prove which spawn modes allow or reject role-based overrides.
 
-**Data flow**: Mutably borrows `TurnContext`, creates the codex home directory, writes `fork-context-role.toml` containing `model`, `model_provider`, and `model_reasoning_effort`, clones and updates `turn.config.agent_roles`, stores the new config back into `turn.config`, and returns the role name string.
+**Data flow**: It writes a role TOML file under the test Codex home, inserts a matching AgentRoleConfig into the turn config, updates the turn, and returns the role name.
 
-**Call relations**: Called by tests that need a concrete role override to verify forking rules and partial-fork behavior around inherited versus overridden model settings.
+**Call relations**: Forking tests call this before spawning agents with an agent_type. The spawned handler then reads the role config through normal production paths.
 
 *Call graph*: called by 3 (multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override, multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override, spawn_agent_fork_context_rejects_agent_type_override); 3 external calls (new, create_dir_all, write).
 
@@ -1092,11 +1106,11 @@ async fn install_role_with_model_override(turn: &mut TurnContext) -> String
 fn set_turn_config(turn: &mut TurnContext, config: crate::config::Config)
 ```
 
-**Purpose**: Replaces the turn's config and recomputes its multi-agent version from enabled features.
+**Purpose**: Replaces a turn's config while also refreshing the derived multi-agent version. This keeps tests from accidentally enabling a feature flag without updating the turn state that handlers read.
 
-**Data flow**: Takes a mutable `TurnContext` and a new `Config`, computes `multi_agent_version_from_features`, assigns that version to `turn.multi_agent_version`, wraps the config in `Arc`, and stores it on the turn.
+**Data flow**: It receives a mutable turn and a config, computes the multi-agent version from the config's features, stores both on the turn, and returns nothing.
 
-**Call relations**: Used whenever tests toggle `Feature::MultiAgentV2` or adjust wait-timeout settings so the turn reflects the updated configuration.
+**Call relations**: MultiAgentV2 tests use this after enabling the feature flag so v2 handlers see a consistent turn context.
 
 *Call graph*: called by 39 (multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn, multi_agent_v2_followup_task_rejects_legacy_items_field, multi_agent_v2_followup_task_rejects_root_target_from_child, multi_agent_v2_full_history_fork_accepts_explicit_service_tier, multi_agent_v2_interrupt_agent_accepts_task_name_target, multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target, multi_agent_v2_interrupt_agent_rejects_root_target_and_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_id, multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name, multi_agent_v2_interrupted_turn_does_not_notify_parent (+15 more)); 2 external calls (new, multi_agent_version_from_features).
 
@@ -1107,11 +1121,11 @@ fn set_turn_config(turn: &mut TurnContext, config: crate::config::Config)
 fn expect_text_output(output: T) -> (String, Option<bool>)
 ```
 
-**Purpose**: Normalizes any `ToolOutput` into plain text and optional success metadata for assertions.
+**Purpose**: Extracts the text and success flag from a handler's tool output. It gives tests a simple way to inspect JSON returned to the model.
 
-**Data flow**: Accepts a generic `T: ToolOutput`, converts it to a `ResponseInputItem` using a dummy function payload, matches function/custom tool outputs, extracts either direct text or flattens content items via `function_call_output_content_items_to_text`, and returns `(content, output.success)`; panics if the response item is not a tool output.
+**Data flow**: It converts a ToolOutput into a response item, accepts either normal or custom function-call output, turns text or content items into plain text, and returns that text plus the optional success value.
 
-**Call relations**: Used after successful handler calls across the suite so tests can deserialize JSON result bodies or inspect empty-text acknowledgements uniformly.
+**Call relations**: Successful handler tests call this after handle returns, then deserialize the text or compare it directly. If the output is not a function result, it fails the test.
 
 *Call graph*: calls 1 internal fn (function_call_output_content_items_to_text); called by 35 (close_agent_submits_shutdown_and_returns_previous_status, multi_agent_v2_full_history_fork_accepts_explicit_service_tier, multi_agent_v2_interrupt_agent_accepts_task_name_target, multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target, multi_agent_v2_list_agents_filters_by_relative_path_prefix, multi_agent_v2_list_agents_keeps_interrupted_resident_agents, multi_agent_v2_list_agents_omits_closed_agents, multi_agent_v2_list_agents_returns_completed_status_without_encrypted_spawn_preview, multi_agent_v2_spawn_agent_ignores_configured_max_depth, multi_agent_v2_spawn_omits_agent_id_when_named (+15 more)); 2 external calls (to_response_item, panic!).
 
@@ -1122,11 +1136,11 @@ fn expect_text_output(output: T) -> (String, Option<bool>)
 async fn handler_rejects_non_function_payloads()
 ```
 
-**Purpose**: Verifies that the spawn-agent handler rejects non-function tool payloads with a model-facing error.
+**Purpose**: Checks that the spawn handler refuses payloads that are not normal function-call arguments. This prevents the tool from accepting unsupported input shapes.
 
-**Data flow**: Creates a session and turn, builds an invocation carrying `ToolPayload::Custom`, awaits `SpawnAgentHandler::handle`, and asserts the returned `FunctionCallError::RespondToModel` string.
+**Data flow**: It creates a session and a custom text payload, sends it to SpawnAgentHandler, and expects a model-facing error saying the payload is unsupported.
 
-**Call relations**: Exercises the earliest payload-kind validation path in the legacy spawn handler.
+**Call relations**: It uses the common invocation helper and directly exercises the legacy spawn handler's input validation path.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, invocation); 4 external calls (new, default, assert_eq!, panic!).
 
@@ -1137,11 +1151,11 @@ async fn handler_rejects_non_function_payloads()
 async fn spawn_agent_rejects_empty_message()
 ```
 
-**Purpose**: Checks that whitespace-only spawn messages are rejected.
+**Purpose**: Checks that an agent cannot be spawned with only blank text as its task. A child agent needs a real instruction.
 
-**Data flow**: Builds a spawn invocation whose JSON arguments contain only a blank `message`, runs the handler, and compares the resulting error to the exact empty-message string.
+**Data flow**: It passes a whitespace message to spawn_agent and expects the handler to return an error about empty messages.
 
-**Call relations**: Covers shared message validation on the legacy spawn path.
+**Call relations**: This test drives SpawnAgentHandler through the same function-payload path used by normal tool calls.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1152,11 +1166,11 @@ async fn spawn_agent_rejects_empty_message()
 async fn spawn_agent_rejects_when_message_and_items_are_both_set()
 ```
 
-**Purpose**: Ensures legacy spawn rejects requests that provide both plain text and structured items.
+**Purpose**: Checks that legacy spawn_agent rejects requests that provide both plain message text and structured items. This avoids ambiguous instructions.
 
-**Data flow**: Creates a spawn invocation with both `message` and `items` in the JSON payload, executes the handler, and asserts the mutual-exclusion error text.
+**Data flow**: It sends both a message and an items array to the handler, then expects an error telling the caller to choose one format.
 
-**Call relations**: Pins argument validation for the older spawn surface that still accepts structured items.
+**Call relations**: It covers a shared validation rule also tested for send_input.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1167,11 +1181,11 @@ async fn spawn_agent_rejects_when_message_and_items_are_both_set()
 async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy()
 ```
 
-**Purpose**: Tests that spawning with the `explorer` role applies the configured provider while preserving the caller's approval policy.
+**Purpose**: Verifies that spawning an explorer agent applies the requested role while keeping the parent's approval policy. Approval policy controls when user permission is required.
 
-**Data flow**: Creates session/turn state, swaps in a test `ThreadManager`, changes config and turn approval policy to `AskForApproval::OnRequest`, switches provider info to `ollama`, invokes legacy spawn with `agent_type: explorer`, parses the JSON result, resolves the child thread, reads its config snapshot, and asserts approval policy and provider ID.
+**Data flow**: It sets up a manager, configures the parent to use the Ollama provider and on-request approvals, spawns an explorer, parses the returned agent ID, and checks the child snapshot.
 
-**Call relations**: Exercises a successful spawn path where role selection and runtime approval settings must both survive into the child thread.
+**Call relations**: The test calls SpawnAgentHandler and then asks the test thread manager what configuration the child actually received.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, thread_manager); 8 external calls (new, default, assert!, assert_eq!, create_model_provider, built_in_model_providers, json!, from_str).
 
@@ -1182,11 +1196,11 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy()
 async fn spawn_agent_fork_context_rejects_agent_type_override()
 ```
 
-**Purpose**: Confirms full-history legacy forks reject explicit `agent_type` overrides.
+**Purpose**: Ensures a full-history fork cannot also change the agent type. A full-history fork is meant to continue the same context, not become a different role.
 
-**Data flow**: Installs a role override, starts a root thread, points the session at that root, invokes legacy spawn with `fork_context: true` plus `agent_type`, and asserts the exact inheritance error message.
+**Data flow**: It installs a role with model overrides, starts a root thread, asks spawn_agent for fork_context plus agent_type, and expects a clear rejection.
 
-**Call relations**: Tests the legacy full-fork rule that child role/model/reasoning must be inherited from the parent.
+**Call relations**: It tests legacy spawn behavior and uses the role-install helper to make the forbidden override meaningful.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, install_role_with_model_override, invocation, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1197,11 +1211,11 @@ async fn spawn_agent_fork_context_rejects_agent_type_override()
 async fn spawn_agent_fork_context_rejects_child_model_overrides()
 ```
 
-**Purpose**: Checks that full-history legacy forks also reject explicit child `model` and `reasoning_effort` overrides.
+**Purpose**: Ensures a full-history fork cannot override the model or reasoning effort. The child must inherit these from the parent in that mode.
 
-**Data flow**: Starts a root thread, invokes legacy spawn with `fork_context: true`, `model`, and `reasoning_effort`, and asserts the same inheritance error returned to the model.
+**Data flow**: It starts a root thread, sends spawn_agent a fork_context request with explicit model and reasoning_effort, and checks for the inherited-settings error.
 
-**Call relations**: Complements the previous test by covering direct model-setting overrides instead of role-based overrides.
+**Call relations**: It complements the agent_type fork test by covering direct model override fields.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1212,11 +1226,11 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides()
 async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override()
 ```
 
-**Purpose**: Verifies that MultiAgentV2 treats `fork_turns: all` as a full-history fork and rejects `agent_type` overrides.
+**Purpose**: Checks that MultiAgentV2 treats fork_turns="all" like a full-history fork and rejects agent type overrides.
 
-**Data flow**: Enables `Feature::MultiAgentV2`, installs a role override, starts a root thread, invokes `SpawnAgentHandlerV2` with `task_name`, `fork_turns: all`, and `agent_type`, then asserts the inheritance error string.
+**Data flow**: It enables MultiAgentV2, installs an overriding role, sends a spawn request with fork_turns all and agent_type, and expects the same inheritance error.
 
-**Call relations**: Covers the v2 equivalent of legacy `fork_context` validation.
+**Call relations**: This is the v2 version of the legacy full-history fork rule.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, install_role_with_model_override, invocation, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1227,11 +1241,11 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override()
 async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_overrides()
 ```
 
-**Purpose**: Checks that omitting `fork_turns` in v2 defaults to full-history behavior and therefore rejects child model overrides.
+**Purpose**: Checks that MultiAgentV2's default spawn is a full fork and therefore rejects child model overrides unless a partial or no fork is requested.
 
-**Data flow**: Enables v2 on the turn, starts a root thread, invokes v2 spawn with `task_name`, `model`, and `reasoning_effort` but no `fork_turns`, and asserts the inheritance error.
+**Data flow**: It enables v2, starts a root thread, calls spawn_agent with model and reasoning_effort but no fork_turns, and expects the inherited-settings error.
 
-**Call relations**: Pins the default-fork semantics of v2 spawn.
+**Call relations**: It confirms v2 default behavior through SpawnAgentHandlerV2.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1242,11 +1256,11 @@ async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_over
 async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
 ```
 
-**Purpose**: Tests service-tier validation against the final child model, including acceptance of supported tiers and rejection of unsupported or unknown tiers.
+**Purpose**: Checks that requested service tiers are validated against the model the child will actually use. A service tier is a provider option such as priority access.
 
-**Data flow**: Runs three subcases: successful spawn with explicit `model` and supported `service_tier`, then two failing spawns with an unknown tier and with a tier unsupported by the chosen model; successful output is parsed to a child `ThreadId` and its snapshot is inspected for persisted `service_tier`.
+**Data flow**: It runs three spawn cases: a supported tier succeeds and is stored, an unknown tier fails, and a tier unsupported by the chosen child model fails.
 
-**Call relations**: Exercises spawn-time service-tier validation logic on the legacy handler, including model-specific support checks.
+**Call relations**: It calls the legacy spawn handler and then inspects child config snapshots for successful cases.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1257,11 +1271,11 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
 async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_tiers()
 ```
 
-**Purpose**: Verifies inherited or role-configured service tiers are preserved when supported and cleared when incompatible with the effective child model.
+**Purpose**: Checks how service tier values move from parent config, explicit child model choices, and role files into spawned agents.
 
-**Data flow**: Runs three scenarios: inheriting a supported parent tier, clearing an inherited tier when the child model changes to one without support, and preserving a role-configured child tier from a TOML role file; each successful spawn is parsed and the child snapshot inspected.
+**Data flow**: It creates several parent and role configurations, spawns children, and inspects snapshots to see whether the tier is preserved or cleared when incompatible.
 
-**Call relations**: Covers the precedence and compatibility rules for service-tier inheritance during spawn.
+**Call relations**: It exercises SpawnAgentHandler with inherited settings, explicit model overrides, and role config overrides.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, thread_manager); 7 external calls (new, default, assert_eq!, json!, from_str, create_dir_all, write).
 
@@ -1272,11 +1286,11 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
 async fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier()
 ```
 
-**Purpose**: Checks that an unsupported role-configured child tier falls back to a supported parent tier instead of failing the spawn.
+**Purpose**: Verifies that an unsupported service tier in a role file does not poison the spawn if the parent has a supported tier to use instead.
 
-**Data flow**: Creates a role file with `service_tier = "turbo"`, configures the parent with `priority`, spawns using that role, parses the child ID, and asserts the child snapshot kept the parent's supported tier.
+**Data flow**: It writes a role config with an invalid child tier, gives the parent a valid tier, spawns the role, and checks that the child uses the parent's supported tier.
 
-**Call relations**: Tests fallback behavior when role config is invalid but the parent already has a usable tier.
+**Call relations**: It focuses on the role-config path inside SpawnAgentHandler.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, thread_manager); 7 external calls (new, default, assert_eq!, json!, from_str, create_dir_all, write).
 
@@ -1287,11 +1301,11 @@ async fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier()
 async fn spawn_agent_role_service_tier_does_not_hide_invalid_spawn_request()
 ```
 
-**Purpose**: Ensures an explicitly invalid spawn request still fails even if the selected role itself has a valid service tier.
+**Purpose**: Ensures an invalid service tier explicitly requested in the spawn call is still rejected, even if the role file contains a valid tier.
 
-**Data flow**: Writes a role file with supported `priority`, registers the role, invokes spawn with that role plus explicit `service_tier: turbo`, and asserts the request is rejected with the unsupported-tier error.
+**Data flow**: It creates a role with a supported tier, calls spawn_agent with service_tier="turbo", and expects the unsupported-tier error.
 
-**Call relations**: Guards against role defaults masking caller-supplied invalid overrides.
+**Call relations**: This guards priority order: user request validation must not be hidden by role defaults.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 6 external calls (new, default, assert_eq!, json!, create_dir_all, write).
 
@@ -1302,11 +1316,11 @@ async fn spawn_agent_role_service_tier_does_not_hide_invalid_spawn_request()
 async fn spawn_agent_full_history_fork_accepts_explicit_service_tier()
 ```
 
-**Purpose**: Confirms that full-history legacy forks may still accept an explicit service-tier override.
+**Purpose**: Checks that full-history fork restrictions still allow an explicit service tier when that tier is valid for the inherited model.
 
-**Data flow**: Starts a root thread under model `gpt-5.4`, invokes legacy spawn with `fork_context: true` and `service_tier: priority`, parses the child ID, and asserts the child snapshot persisted that tier.
+**Data flow**: It sets the parent model to one that supports the fast tier, spawns with fork_context and service_tier, then checks the child snapshot.
 
-**Call relations**: Shows that full-fork inheritance restrictions apply to role/model/reasoning, not to service tier.
+**Call relations**: It narrows the full-history fork rule tested earlier: model and role overrides are forbidden, but service tier can be supplied.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1317,11 +1331,11 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier()
 async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier()
 ```
 
-**Purpose**: Checks the same explicit service-tier acceptance on the MultiAgentV2 full-fork path.
+**Purpose**: Checks the same valid service-tier exception for MultiAgentV2 full-history forks.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `task_name` and `service_tier`, parses the returned task path, resolves it back to a child thread ID through agent-control, and asserts the child snapshot's tier.
+**Data flow**: It enables v2, spawns a named task with a supported service tier, resolves the task name to a child thread, and checks the child config.
 
-**Call relations**: Provides the v2 counterpart to the legacy full-fork service-tier test.
+**Call relations**: It proves SpawnAgentHandlerV2 follows the same service-tier rule as the legacy handler.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1332,11 +1346,11 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier()
 async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override()
 ```
 
-**Purpose**: Verifies that a partial v2 fork (`fork_turns: "1"`) allows role/model overrides that full forks reject.
+**Purpose**: Verifies that a partial v2 fork may use a different agent role. Partial forks do not inherit the entire parent history, so role changes are allowed.
 
-**Data flow**: Enables v2, installs a role override, starts a root thread, invokes v2 spawn with `task_name`, `agent_type`, and `fork_turns: "1"`, parses the JSON result, identifies the spawned child from captured ops, and inspects its snapshot for overridden model, provider, and reasoning effort.
+**Data flow**: It enables v2, installs a role with model overrides, spawns with fork_turns="1", and checks the child model, provider, and reasoning effort.
 
-**Call relations**: Contrasts partial-fork semantics with full-fork inheritance restrictions.
+**Call relations**: It contrasts with the v2 full-fork rejection tests.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, install_role_with_model_override, invocation, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1347,11 +1361,11 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override()
 async fn spawn_agent_returns_agent_id_without_task_name()
 ```
 
-**Purpose**: Checks that legacy spawn returns an `agent_id` and nickname but no `task_name`.
+**Purpose**: Checks the legacy spawn response shape. In v1, an unnamed child should return a raw agent_id and nickname, not a task path.
 
-**Data flow**: Creates a manager-backed session, invokes legacy spawn with only a message, converts the output to text, parses the JSON, and asserts presence/absence of `agent_id`, `task_name`, `nickname`, and success metadata.
+**Data flow**: It spawns an agent, extracts the output JSON, and asserts agent_id exists, task_name does not, nickname exists, and success is true.
 
-**Call relations**: Pins the legacy response shape for unnamed spawned agents.
+**Call relations**: It protects backwards compatibility for callers of the legacy SpawnAgentHandler.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 6 external calls (new, default, assert!, assert_eq!, json!, from_str).
 
@@ -1362,11 +1376,11 @@ async fn spawn_agent_returns_agent_id_without_task_name()
 async fn multi_agent_v2_spawn_requires_task_name()
 ```
 
-**Purpose**: Ensures v2 spawn rejects requests that omit `task_name`.
+**Purpose**: Checks that v2 spawn requests must name the task. V2 uses task paths as stable addresses.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with only `message`, captures the parse error, and asserts the model-facing message mentions missing `task_name`.
+**Data flow**: It enables v2, calls spawn_agent without task_name, and expects a parse error mentioning the missing field.
 
-**Call relations**: Covers strict argument parsing for the v2 spawn schema.
+**Call relations**: It drives SpawnAgentHandlerV2's argument parsing rules.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1377,11 +1391,11 @@ async fn multi_agent_v2_spawn_requires_task_name()
 async fn multi_agent_v2_spawn_rejects_legacy_items_field()
 ```
 
-**Purpose**: Checks that v2 spawn rejects the legacy `items` field entirely.
+**Purpose**: Ensures v2 spawn rejects the old structured items field. V2 expects a simpler encrypted message field shape.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `message`, `task_name`, and `items`, then asserts the parse error reports `unknown field `items``.
+**Data flow**: It enables v2, sends message plus items plus task_name, and expects an unknown-field error for items.
 
-**Call relations**: Confirms the v2 parser is intentionally narrower than the legacy spawn surface.
+**Call relations**: It is one of several v2 tests that keep legacy fields out of the new protocol.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1392,11 +1406,11 @@ async fn multi_agent_v2_spawn_rejects_legacy_items_field()
 async fn spawn_agent_errors_when_manager_dropped()
 ```
 
-**Purpose**: Verifies spawn fails cleanly when no collaboration manager is available in session services.
+**Purpose**: Checks that spawning fails cleanly when no agent manager is available. Without the manager, there is nowhere to create the child thread.
 
-**Data flow**: Creates a plain session/turn without installing agent-control, invokes legacy spawn, and asserts the returned error is `collab manager unavailable`.
+**Data flow**: It builds a normal session without installing agent_control, calls spawn_agent, and expects a "collab manager unavailable" error.
 
-**Call relations**: Exercises the dependency-availability failure path before any thread work begins.
+**Call relations**: It tests the handler's dependency check before any real spawn work happens.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1407,11 +1421,11 @@ async fn spawn_agent_errors_when_manager_dropped()
 async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_path()
 ```
 
-**Purpose**: Tests that v2 spawn returns a canonical task path and that subsequent `send_message` can target the child by relative path.
+**Purpose**: Verifies that v2 spawn returns an absolute task path and that send_message can later address that child by a relative path.
 
-**Data flow**: Enables v2, starts a root thread, spawns a child with encrypted message and `task_name`, parses the returned `/root/...` path, resolves the child thread ID, inspects its session source, checks captured `Op::InterAgentCommunication` for the encrypted spawn message with `trigger_turn = true`, then sends another message to relative target `test_process` and asserts a second queued communication with `trigger_turn = false`.
+**Data flow**: It spawns `/root/test_process`, checks the child's metadata and captured communication, then sends another message to `test_process` and checks the delivered operation.
 
-**Call relations**: Exercises the happy path across two v2 tools—spawn and send_message—and validates path resolution plus encrypted mailbox delivery.
+**Call relations**: It connects SpawnAgentHandlerV2 and SendMessageHandlerV2 in one end-to-end path-addressing scenario.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 6 external calls (new, default, assert!, assert_eq!, json!, from_str).
 
@@ -1422,11 +1436,11 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
 async fn multi_agent_v2_spawn_rejects_legacy_fork_context()
 ```
 
-**Purpose**: Ensures v2 spawn rejects the old `fork_context` parameter and directs callers to `fork_turns`.
+**Purpose**: Checks that v2 does not accept the old fork_context flag. Callers must use fork_turns instead.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `task_name` and `fork_context: true`, and asserts the exact replacement-guidance error string.
+**Data flow**: It enables v2, sends a spawn request containing fork_context, and expects a specific error pointing to fork_turns.
 
-**Call relations**: Pins migration behavior from the legacy fork flag to the v2 fork-turns model.
+**Call relations**: It enforces the v2 API boundary in SpawnAgentHandlerV2.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1437,11 +1451,11 @@ async fn multi_agent_v2_spawn_rejects_legacy_fork_context()
 async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string()
 ```
 
-**Purpose**: Checks that malformed `fork_turns` values are rejected.
+**Purpose**: Checks that v2 fork_turns only accepts known words or a positive integer string.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `fork_turns: "banana"`, and asserts the validation error describing the accepted forms.
+**Data flow**: It sends fork_turns="banana" and expects an error explaining the allowed values.
 
-**Call relations**: Covers string parsing for the v2 fork-turns parameter.
+**Call relations**: It tests parsing and validation before any child thread is created.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1452,11 +1466,11 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string()
 async fn multi_agent_v2_spawn_rejects_zero_fork_turns()
 ```
 
-**Purpose**: Ensures `fork_turns: "0"` is rejected as invalid.
+**Purpose**: Checks that fork_turns="0" is rejected. Zero turns must be written as the explicit word "none" instead.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with zero fork turns, and asserts the same positive-integer-or-keyword validation error.
+**Data flow**: It sends a v2 spawn request with fork_turns set to zero and expects the allowed-values error.
 
-**Call relations**: Complements the malformed-string test with the numeric edge case.
+**Call relations**: It covers a boundary case in SpawnAgentHandlerV2's fork-turn parser.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 4 external calls (new, default, assert_eq!, json!).
 
@@ -1467,11 +1481,11 @@ async fn multi_agent_v2_spawn_rejects_zero_fork_turns()
 async fn multi_agent_v2_send_message_accepts_root_target_from_child()
 ```
 
-**Purpose**: Verifies a child agent may use v2 `send_message` to queue an encrypted message to `/root`.
+**Purpose**: Verifies that a child agent can send a normal message back to the root agent in v2.
 
-**Data flow**: Enables v2, starts a root thread, manually spawns a child with `SessionSource::SubAgent`, switches the session and turn to that child context, invokes `SendMessageHandlerV2` targeting `/root`, and inspects captured ops on the root thread for an encrypted `InterAgentCommunication` authored by the child path with `trigger_turn = false`.
+**Data flow**: It manually creates a child session source, calls send_message with target `/root`, and checks that the root thread receives an inter-agent communication from the child path.
 
-**Call relations**: Exercises path resolution and author attribution for child-to-root queued messaging.
+**Call relations**: It exercises SendMessageHandlerV2 from a sub-agent context.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager, try_from); 6 external calls (new, SubAgent, assert!, default, json!, vec!).
 
@@ -1482,11 +1496,11 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child()
 async fn multi_agent_v2_followup_task_rejects_root_target_from_child()
 ```
 
-**Purpose**: Checks that a child agent cannot use `followup_task` to target the root agent.
+**Purpose**: Checks that a child cannot create a follow-up task targeting the root agent. Follow-up tasks are for continuing spawned agents, not commanding the root.
 
-**Data flow**: Sets up a child session context under v2, invokes `FollowupTaskHandlerV2` with target `/root`, asserts the model-facing rejection string, then confirms no interrupt or communication ops were submitted to the root thread.
+**Data flow**: It creates a child context, calls followup_task with target `/root`, expects a rejection, and verifies no root interrupt or message operation was submitted.
 
-**Call relations**: Covers the special root-target prohibition enforced only for trigger-turn follow-up tasks.
+**Call relations**: It tests FollowupTaskHandlerV2's extra safety rule compared with send_message.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager, try_from); 8 external calls (new, SubAgent, assert!, assert_eq!, default, json!, panic!, vec!).
 
@@ -1497,11 +1511,11 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child()
 async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_spawn_preview()
 ```
 
-**Purpose**: Verifies list-agents reports completed child status using completion events and does not expose the encrypted spawn message as `last_task_message`.
+**Purpose**: Checks that v2 list_agents reports completed agents clearly without leaking the encrypted spawn message as a preview.
 
-**Data flow**: Enables v2, spawns a worker, resolves its thread, emits a `TurnCompleteEvent` with `last_agent_message = "done"`, invokes `ListAgentsHandlerV2`, parses the JSON result, and asserts the root and worker entries, including worker `agent_status = {"completed":"done"}` and `last_task_message = null`.
+**Data flow**: It spawns a worker, injects a completed event with the message "done", lists agents, and checks root and worker entries.
 
-**Call relations**: Exercises list-agents aggregation over live thread state and completion-event history.
+**Call relations**: It combines SpawnAgentHandlerV2, session event recording, and ListAgentsHandlerV2 output formatting.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 6 external calls (new, default, assert_eq!, json!, TurnComplete, from_str).
 
@@ -1512,11 +1526,11 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
 async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix()
 ```
 
-**Purpose**: Checks that list-agents can filter descendants by a relative path prefix from the caller's current agent path.
+**Purpose**: Verifies that v2 list_agents can filter descendants using a relative path prefix from the caller's current agent path.
 
-**Data flow**: Enables v2, starts a root thread, manually spawns `/root/researcher` and `/root/researcher/worker`, changes the turn's session source to the researcher, invokes list-agents with `path_prefix: "worker"`, parses the result, and asserts only the nested worker is returned with its original task message.
+**Data flow**: It creates `/root/researcher` and `/root/researcher/worker`, makes the caller the researcher, lists with prefix `worker`, and expects only the worker.
 
-**Call relations**: Tests path-prefix filtering semantics relative to the caller's subtree.
+**Call relations**: It exercises ListAgentsHandlerV2's path resolution and filtering behavior.
 
 *Call graph*: calls 7 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, from_string); 7 external calls (new, SubAgent, assert_eq!, default, json!, from_str, vec!).
 
@@ -1527,11 +1541,11 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix()
 async fn multi_agent_v2_list_agents_omits_closed_agents()
 ```
 
-**Purpose**: Ensures closed agents are not returned by list-agents.
+**Purpose**: Checks that closed v2 agents disappear from list_agents results.
 
-**Data flow**: Enables v2, spawns a worker, resolves its thread ID, closes it through agent-control, invokes list-agents, parses the result, and asserts only `/root` remains.
+**Data flow**: It spawns a worker, closes it through agent_control, lists agents, and expects only `/root` to remain.
 
-**Call relations**: Covers the interaction between agent lifecycle state and list-agents visibility.
+**Call relations**: It confirms list_agents respects lifecycle state maintained by the manager.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1542,11 +1556,11 @@ async fn multi_agent_v2_list_agents_omits_closed_agents()
 async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents()
 ```
 
-**Purpose**: Checks that interrupted but still resident agents remain visible in list-agents output.
+**Purpose**: Checks that interrupted but still resident agents remain visible in list_agents. Interrupted is not the same as closed.
 
-**Data flow**: Enables v2, spawns a worker, resolves its path, interrupts it through `InterruptAgentHandler`, then invokes list-agents and asserts both root and worker are still listed.
+**Data flow**: It spawns a worker, interrupts it through the v2 interrupt handler, lists agents, and expects both root and worker entries.
 
-**Call relations**: Distinguishes interrupted agents from closed agents in list-agents behavior.
+**Call relations**: It links InterruptAgentHandler behavior with ListAgentsHandlerV2 visibility rules.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1557,11 +1571,11 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents()
 async fn multi_agent_v2_send_message_rejects_legacy_items_field()
 ```
 
-**Purpose**: Verifies v2 `send_message` rejects the old structured `items` argument.
+**Purpose**: Ensures v2 send_message rejects the old items field.
 
-**Data flow**: Enables v2, spawns a worker, resolves its ID, invokes `SendMessageHandlerV2` with `items` instead of `message`, and asserts the parse error mentions `unknown field `items``.
+**Data flow**: It spawns a worker, calls send_message with items instead of message, and expects an unknown-field parse error.
 
-**Call relations**: Pins the strict v2 parser for queued messaging.
+**Call relations**: It mirrors the v2 spawn legacy-field rejection for the send-message handler.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1572,11 +1586,11 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field()
 async fn multi_agent_v2_send_message_rejects_interrupt_parameter()
 ```
 
-**Purpose**: Checks that v2 `send_message` rejects the legacy `interrupt` parameter and performs no side effects.
+**Purpose**: Checks that v2 send_message cannot also request an interrupt. Interrupting is a separate tool action.
 
-**Data flow**: Enables v2, spawns a worker, invokes `SendMessageHandlerV2` with `message` plus `interrupt: true`, asserts the parse error prefix, then inspects captured ops to confirm neither `Op::Interrupt` nor the queued communication was submitted.
+**Data flow**: It spawns a worker, calls send_message with interrupt=true, expects a parse error, and confirms neither interrupt nor message operations were sent.
 
-**Call relations**: Guards against accidental compatibility with the older send-input semantics.
+**Call relations**: It protects SendMessageHandlerV2 from silently accepting a removed or dangerous option.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1587,11 +1601,11 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter()
 async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
 ```
 
-**Purpose**: Verifies that after a follow-up task is sent, each subsequent completed child turn generates exactly one completion notification back to the parent.
+**Purpose**: Verifies that a parent is notified each time a child completes a turn, including after a follow-up task.
 
-**Data flow**: Enables v2, starts a root thread and initializes a parent turn runtime, spawns a worker, emits one `TurnCompleteEvent`, sends a follow-up task, emits a second completion event, renders the expected notification strings with `format_inter_agent_completion_message`, then polls captured ops until exactly one matching root-directed communication exists for each completion.
+**Data flow**: It spawns a worker, injects one completed turn, sends a follow-up task, injects a second completed turn, then waits until exactly one parent notification for each appears.
 
-**Call relations**: Exercises the interaction between follow-up task delivery and the child-to-parent completion notification mechanism.
+**Call relations**: It connects SpawnAgentHandlerV2, FollowupTaskHandlerV2, event handling, and inter-agent completion-message formatting.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, format_inter_agent_completion_message, function_payload, invocation, set_turn_config, thread_manager, root, try_from); 10 external calls (new, from_millis, from_secs, default, assert_eq!, json!, Completed, TurnComplete, sleep, timeout).
 
@@ -1602,11 +1616,11 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
 async fn multi_agent_v2_followup_task_rejects_legacy_items_field()
 ```
 
-**Purpose**: Ensures v2 `followup_task` rejects the legacy `items` field.
+**Purpose**: Ensures v2 followup_task rejects the old items field.
 
-**Data flow**: Enables v2, spawns a worker, resolves its ID, invokes `FollowupTaskHandlerV2` with `items`, and asserts the parse error mentions `unknown field `items``.
+**Data flow**: It spawns a worker, calls followup_task with items, and expects an unknown-field parse error.
 
-**Call relations**: Mirrors the send-message parser test for the trigger-turn follow-up tool.
+**Call relations**: It is the follow-up-task version of the v2 legacy input-shape tests.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1617,11 +1631,11 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field()
 async fn multi_agent_v2_interrupted_turn_does_not_notify_parent()
 ```
 
-**Purpose**: Checks that an interrupted child turn does not emit a completion-style notification to the parent.
+**Purpose**: Checks that an interrupted child turn does not produce a completion notification to the parent.
 
-**Data flow**: Enables v2, spawns a worker, emits a `TurnAbortedEvent` with `TurnAbortReason::Interrupted`, collects root-directed communications from captured ops, and asserts the list is empty.
+**Data flow**: It spawns a worker, sends a TurnAborted event with reason Interrupted, then checks that no parent communication from the worker was captured.
 
-**Call relations**: Covers the negative case for parent notifications: only completed turns should notify.
+**Call relations**: It tests the event-to-notification path used by MultiAgentV2 child turns.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert_eq!, json!, TurnAborted).
 
@@ -1632,11 +1646,11 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent()
 async fn multi_agent_v2_spawn_omits_agent_id_when_named()
 ```
 
-**Purpose**: Verifies that named v2 spawns return only `task_name` and omit `agent_id` and nickname.
+**Purpose**: Checks the v2 spawn response shape. Named v2 agents should be returned by task path, not raw internal thread ID.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `task_name`, parses the JSON output, and asserts `agent_id` is absent, `task_name` is canonicalized, `nickname` is absent, and success is true.
+**Data flow**: It spawns a named task, reads the JSON output, and asserts task_name exists while agent_id and nickname do not.
 
-**Call relations**: Pins the response shape difference between legacy unnamed spawn and v2 named spawn.
+**Call relations**: It protects the public response contract of SpawnAgentHandlerV2.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 6 external calls (new, default, assert!, assert_eq!, json!, from_str).
 
@@ -1647,11 +1661,11 @@ async fn multi_agent_v2_spawn_omits_agent_id_when_named()
 async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors()
 ```
 
-**Purpose**: Checks that invalid task names are rejected with the underlying validation message.
+**Purpose**: Checks that invalid v2 task names produce a clear model-facing error.
 
-**Data flow**: Enables v2, starts a root thread, invokes v2 spawn with `task_name: "BadName"`, and asserts the exact lowercase/digits/underscore validation error.
+**Data flow**: It sends task_name="BadName" and expects the lowercase/digit/underscore validation message.
 
-**Call relations**: Exercises task-name validation on the v2 spawn path.
+**Call relations**: It exercises the path-name validation used before v2 agents are created.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1662,11 +1676,11 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors()
 async fn spawn_agent_reapplies_runtime_sandbox_after_role_config()
 ```
 
-**Purpose**: Verifies that runtime sandbox, approval, reviewer, and permission-profile overrides are re-applied after role config is merged during spawn.
+**Purpose**: Verifies that role config loading does not erase runtime sandbox and permission settings. Sandbox settings limit what files, network, and commands a child can use.
 
-**Data flow**: Builds an expected runtime sandbox and permission profile from the turn, mutates the turn to use those runtime overrides and `AskForApproval::OnRequest`, invokes legacy spawn with `agent_type: explorer`, parses the child ID, inspects the child config snapshot and a fresh child turn, and asserts sandbox policy, approval policy, reviewer, file-system/network sandbox policies, and permission profile all match the runtime values rather than the base config.
+**Data flow**: It builds a runtime permission profile different from the base config, spawns an explorer role, then checks the child config and first turn policies match the runtime values.
 
-**Call relations**: Covers a subtle config-merging invariant: role config must not erase runtime execution constraints.
+**Call relations**: It tests SpawnAgentHandler's interaction with config overlays, approval settings, and turn-level permission profiles.
 
 *Call graph*: calls 11 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, parse_agent_id, set_turn_config, thread_manager, from_runtime_permissions_with_enforcement, from_legacy_sandbox_policy, from_legacy_sandbox_policy_for_cwd (+1 more)); 7 external calls (new, default, assert!, assert_eq!, assert_ne!, json!, from_str).
 
@@ -1677,11 +1691,11 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config()
 async fn spawn_agent_rejects_when_depth_limit_exceeded()
 ```
 
-**Purpose**: Checks that legacy spawn refuses to create a child when the caller is already at the configured maximum depth.
+**Purpose**: Checks that legacy agents cannot keep spawning children past the configured depth limit.
 
-**Data flow**: Creates a manager-backed session, sets `turn.session_source` to a `SubAgent` at `depth = agent_max_depth`, invokes legacy spawn, and asserts the depth-limit error string.
+**Data flow**: It marks the current turn as already at max depth, calls spawn_agent, and expects the "solve the task yourself" error.
 
-**Call relations**: Exercises depth enforcement on the legacy spawn path.
+**Call relations**: It exercises the legacy depth guard in SpawnAgentHandler.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 6 external calls (new, default, SubAgent, assert_eq!, json!, panic!).
 
@@ -1692,11 +1706,11 @@ async fn spawn_agent_rejects_when_depth_limit_exceeded()
 async fn spawn_agent_allows_depth_up_to_configured_max_depth()
 ```
 
-**Purpose**: Verifies legacy spawn succeeds when the configured max depth is raised above the caller's current depth.
+**Purpose**: Checks that the depth limit is configurable and allows spawning when the parent is still below the new maximum.
 
-**Data flow**: Increases `config.agent_max_depth`, sets the turn as a sub-agent at the previous default max depth, invokes legacy spawn, parses the JSON result, and asserts a non-empty `agent_id`, non-empty nickname, and success flag.
+**Data flow**: It raises agent_max_depth, marks the current agent at the default depth, spawns a child, and checks that a valid ID and nickname are returned.
 
-**Call relations**: Complements the previous test by showing the depth check is configuration-driven.
+**Call relations**: It complements the depth-limit rejection test.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 7 external calls (new, default, SubAgent, assert!, assert_eq!, json!, from_str).
 
@@ -1707,11 +1721,11 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth()
 async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth()
 ```
 
-**Purpose**: Checks that MultiAgentV2 spawn ignores the legacy max-depth limit when using task-path semantics.
+**Purpose**: Verifies that MultiAgentV2 does not use the legacy max-depth rule. V2 path nesting is governed differently.
 
-**Data flow**: Sets `agent_max_depth = 1`, enables v2, starts a root thread, marks the caller as `/root/parent` at depth 1, invokes v2 spawn with `task_name: child` and `fork_turns: none`, parses the result, and asserts the returned path is `/root/parent/child` with success.
+**Data flow**: It sets max depth to one, makes the caller a child agent, spawns another named child with fork_turns none, and expects `/root/parent/child` to be created.
 
-**Call relations**: Documents the intentional behavioral divergence between legacy and v2 spawning.
+**Call relations**: It proves SpawnAgentHandlerV2 intentionally differs from legacy SpawnAgentHandler on depth.
 
 *Call graph*: calls 7 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, try_from); 6 external calls (new, default, SubAgent, assert_eq!, json!, from_str).
 
@@ -1722,11 +1736,11 @@ async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth()
 async fn send_input_rejects_empty_message()
 ```
 
-**Purpose**: Ensures the legacy `send_input` tool rejects empty messages.
+**Purpose**: Checks that send_input refuses an empty message. A resumed or existing agent should not be prompted with nothing.
 
-**Data flow**: Builds a `send_input` invocation with an empty `message`, runs `SendInputHandler`, and asserts the empty-message error.
+**Data flow**: It sends an empty message to a random target ID and expects the empty-message error before target lookup matters.
 
-**Call relations**: Covers shared message validation on the legacy direct-input tool.
+**Call relations**: It exercises SendInputHandler's input validation.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 4 external calls (new, assert_eq!, json!, panic!).
 
@@ -1737,11 +1751,11 @@ async fn send_input_rejects_empty_message()
 async fn send_input_rejects_when_message_and_items_are_both_set()
 ```
 
-**Purpose**: Checks that legacy `send_input` rejects simultaneous `message` and `items` arguments.
+**Purpose**: Checks that send_input rejects ambiguous requests containing both message and structured items.
 
-**Data flow**: Invokes `SendInputHandler` with both fields present and asserts the mutual-exclusion error string.
+**Data flow**: It passes both fields and expects the handler to tell the caller to choose one.
 
-**Call relations**: Mirrors the same validation tested for legacy spawn.
+**Call relations**: It covers the same message-vs-items rule as legacy spawn.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 4 external calls (new, assert_eq!, json!, panic!).
 
@@ -1752,11 +1766,11 @@ async fn send_input_rejects_when_message_and_items_are_both_set()
 async fn send_input_rejects_invalid_id()
 ```
 
-**Purpose**: Verifies `send_input` reports malformed target IDs as model-facing parse errors.
+**Purpose**: Checks that send_input reports malformed agent IDs clearly.
 
-**Data flow**: Invokes `SendInputHandler` with `target: not-a-uuid`, captures the error, and asserts the message starts with `invalid agent id not-a-uuid:`.
+**Data flow**: It passes target="not-a-uuid" and expects a model-facing invalid-agent-id error.
 
-**Call relations**: Exercises target-ID parsing before any agent lookup occurs.
+**Call relations**: It tests parsing before SendInputHandler tries to contact the manager.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 4 external calls (new, assert!, json!, panic!).
 
@@ -1767,11 +1781,11 @@ async fn send_input_rejects_invalid_id()
 async fn send_input_reports_missing_agent()
 ```
 
-**Purpose**: Checks that `send_input` reports a valid-but-unknown target thread ID as missing.
+**Purpose**: Checks that send_input reports a well-formed but nonexistent agent ID.
 
-**Data flow**: Installs agent-control, generates a fresh `ThreadId` not present in the manager, invokes `SendInputHandler`, and asserts the `agent with id ... not found` error.
+**Data flow**: It installs a test manager, chooses a new ThreadId that has no thread, sends input, and expects an agent-not-found error.
 
-**Call relations**: Covers the lookup failure path after successful ID parsing.
+**Call relations**: It exercises SendInputHandler's lookup path through agent_control.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, thread_manager, new); 4 external calls (new, assert_eq!, json!, panic!).
 
@@ -1782,11 +1796,11 @@ async fn send_input_reports_missing_agent()
 async fn send_input_interrupts_before_prompt()
 ```
 
-**Purpose**: Verifies legacy `send_input` with `interrupt: true` submits an interrupt op before the user-input op.
+**Purpose**: Verifies that send_input sends an interrupt before the new prompt when requested.
 
-**Data flow**: Starts a thread, invokes `SendInputHandler` with target ID, message, and `interrupt: true`, then inspects captured ops for that agent and asserts there are exactly two in order: `Op::Interrupt` then `Op::UserInput`; finally shuts the thread down.
+**Data flow**: It starts a thread, calls send_input with interrupt=true, then inspects captured operations to confirm Interrupt comes before UserInput.
 
-**Call relations**: Pins the side-effect ordering of the legacy interrupt-and-send behavior.
+**Call relations**: It tests operation ordering in SendInputHandler.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 4 external calls (new, assert!, assert_eq!, json!).
 
@@ -1797,11 +1811,11 @@ async fn send_input_interrupts_before_prompt()
 async fn send_input_accepts_structured_items()
 ```
 
-**Purpose**: Checks that legacy `send_input` accepts structured mention/text items and forwards them as `Op::UserInput`.
+**Purpose**: Checks that legacy send_input can send structured input items such as mentions plus text.
 
-**Data flow**: Starts a thread, invokes `SendInputHandler` with an `items` array, constructs the expected `Op::UserInput` containing `UserInput::Mention` and `UserInput::Text`, and asserts that exact op was captured for the target thread; then shuts the thread down.
+**Data flow**: It starts a thread, sends an items array, builds the expected UserInput operation, and confirms the manager captured it.
 
-**Call relations**: Exercises the structured-input path that v2 intentionally removed.
+**Call relations**: It verifies SendInputHandler's conversion from JSON items into protocol-level user input.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 5 external calls (new, default, assert_eq!, json!, vec!).
 
@@ -1812,11 +1826,11 @@ async fn send_input_accepts_structured_items()
 async fn resume_agent_rejects_invalid_id()
 ```
 
-**Purpose**: Verifies `resume_agent` rejects malformed thread IDs.
+**Purpose**: Checks that resume_agent rejects malformed IDs.
 
-**Data flow**: Invokes `ResumeAgentHandler` with `id: not-a-uuid`, captures the error, and asserts the message prefix.
+**Data flow**: It calls resume_agent with id="not-a-uuid" and expects an invalid-agent-id message.
 
-**Call relations**: Covers resume-target parsing before any persistence or thread restoration logic.
+**Call relations**: It tests ResumeAgentHandler's parsing guard.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 4 external calls (new, assert!, json!, panic!).
 
@@ -1827,11 +1841,11 @@ async fn resume_agent_rejects_invalid_id()
 async fn resume_agent_reports_missing_agent()
 ```
 
-**Purpose**: Checks that `resume_agent` reports a valid-but-unknown thread ID as missing.
+**Purpose**: Checks that resume_agent reports a missing but well-formed agent ID.
 
-**Data flow**: Installs agent-control, generates a fresh absent `ThreadId`, invokes `ResumeAgentHandler`, and asserts the `agent with id ... not found` error.
+**Data flow**: It installs a test manager, creates a fresh ThreadId with no stored agent, calls resume_agent, and expects an agent-not-found error.
 
-**Call relations**: Exercises the missing-agent branch of resume handling.
+**Call relations**: It exercises ResumeAgentHandler's lookup path.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, thread_manager, new); 4 external calls (new, assert_eq!, json!, panic!).
 
@@ -1842,11 +1856,11 @@ async fn resume_agent_reports_missing_agent()
 async fn resume_agent_noops_for_active_agent()
 ```
 
-**Purpose**: Verifies resuming an already active agent returns its current status without creating duplicate threads.
+**Purpose**: Verifies that resuming an already active agent does not create a duplicate thread.
 
-**Data flow**: Starts a thread, records its status, invokes `ResumeAgentHandler` on that same ID, parses the JSON result into `resume_agent::ResumeAgentResult`, asserts the status matches the preexisting one and success is true, then checks the manager still has only that one thread.
+**Data flow**: It starts an agent, records its status, calls resume_agent, checks the returned status, and confirms the manager still has exactly one thread ID.
 
-**Call relations**: Covers the idempotent fast path of resume handling.
+**Call relations**: It tests the harmless no-op path of ResumeAgentHandler.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 4 external calls (new, assert_eq!, json!, from_str).
 
@@ -1857,11 +1871,11 @@ async fn resume_agent_noops_for_active_agent()
 async fn resume_agent_restores_closed_agent_and_accepts_send_input()
 ```
 
-**Purpose**: Tests that a previously materialized but shut-down agent can be resumed and then accepts new input.
+**Purpose**: Checks that a closed agent with saved history can be resumed and then receive input.
 
-**Data flow**: Creates a thread with forked history, shuts it down through agent-control so status becomes `NotFound`, invokes `ResumeAgentHandler`, parses and checks the resumed status, then invokes `SendInputHandler` against the same ID and asserts the returned JSON contains a non-empty `submission_id`; finally shuts the resumed agent down again.
+**Data flow**: It creates a thread from forked history, shuts it down, resumes it, confirms it is no longer NotFound, then sends input and checks a submission ID is returned.
 
-**Call relations**: Exercises persistence-backed restoration followed by normal post-resume interaction.
+**Call relations**: It combines ResumeAgentHandler and SendInputHandler to prove restored agents are usable.
 
 *Call graph*: calls 7 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager, from_auth_for_testing, from_api_key); 8 external calls (new, assert!, assert_eq!, assert_ne!, json!, Forked, from_str, vec!).
 
@@ -1872,11 +1886,11 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input()
 async fn resume_agent_rejects_when_depth_limit_exceeded()
 ```
 
-**Purpose**: Checks that resume is blocked when the caller is already at the configured maximum agent depth.
+**Purpose**: Checks that legacy resume_agent also respects the agent depth limit.
 
-**Data flow**: Sets the turn's session source to a sub-agent at `depth = agent_max_depth`, invokes `ResumeAgentHandler`, and asserts the same depth-limit error used by spawn.
+**Data flow**: It marks the current turn as already at max depth, calls resume_agent, and expects the depth-limit error.
 
-**Call relations**: Shows depth enforcement applies to resume as well as spawn on the legacy surface.
+**Call relations**: It mirrors the spawn depth-limit test for ResumeAgentHandler.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 5 external calls (new, SubAgent, assert_eq!, json!, panic!).
 
@@ -1887,11 +1901,11 @@ async fn resume_agent_rejects_when_depth_limit_exceeded()
 async fn wait_agent_rejects_non_positive_timeout()
 ```
 
-**Purpose**: Ensures legacy `wait_agent` rejects `timeout_ms <= 0`.
+**Purpose**: Checks that legacy wait_agent rejects timeout_ms values of zero or below.
 
-**Data flow**: Invokes `WaitAgentHandler` with one target ID and `timeout_ms: 0`, then asserts the exact validation error.
+**Data flow**: It calls wait_agent with one target and timeout_ms 0, then expects a greater-than-zero error.
 
-**Call relations**: Covers timeout validation before any waiting begins.
+**Call relations**: It tests argument validation in the legacy WaitAgentHandler.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1902,11 +1916,11 @@ async fn wait_agent_rejects_non_positive_timeout()
 async fn wait_agent_rejects_invalid_target()
 ```
 
-**Purpose**: Checks that legacy `wait_agent` rejects malformed target IDs.
+**Purpose**: Checks that legacy wait_agent rejects malformed target IDs.
 
-**Data flow**: Invokes `WaitAgentHandler` with `targets: ["invalid"]`, captures the error, and asserts the message prefix.
+**Data flow**: It passes targets=["invalid"] and expects an invalid-agent-id error.
 
-**Call relations**: Exercises target parsing on the legacy wait path.
+**Call relations**: It exercises WaitAgentHandler's target parsing.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert!, json!, panic!).
 
@@ -1917,11 +1931,11 @@ async fn wait_agent_rejects_invalid_target()
 async fn wait_agent_rejects_empty_targets()
 ```
 
-**Purpose**: Verifies legacy `wait_agent` requires a non-empty target list.
+**Purpose**: Checks that legacy wait_agent requires at least one target.
 
-**Data flow**: Invokes `WaitAgentHandler` with `targets: []` and asserts the `agent ids must be non-empty` error.
+**Data flow**: It passes an empty target list and expects an "agent ids must be non-empty" error.
 
-**Call relations**: Pins the legacy wait API contract that differs from v2's timeout-only mode.
+**Call relations**: It covers a basic guard before waiting starts.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, function_payload, invocation); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1932,11 +1946,11 @@ async fn wait_agent_rejects_empty_targets()
 async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument()
 ```
 
-**Purpose**: Checks that v2 `wait_agent` accepts a payload containing only `timeout_ms` and wakes on mailbox activity.
+**Purpose**: Verifies that v2 wait_agent can wait without explicit targets, using mailbox activity instead.
 
-**Data flow**: Enables v2, starts a root thread, spawns a worker, resolves its path, launches `WaitAgentHandlerV2` in a task with only `timeout_ms`, enqueues a mailbox communication from the worker to root, awaits the wait result, parses `wait::WaitAgentResult`, and asserts `message = "Wait completed."`, `timed_out = false`, and no success flag.
+**Data flow**: It spawns a worker, starts wait_agent with only timeout_ms, enqueues a worker-to-root mailbox message, and expects wait to complete without timing out.
 
-**Call relations**: Exercises the core v2 wait behavior driven by mailbox notifications rather than explicit target statuses.
+**Call relations**: It tests the mailbox-based waiting style of WaitAgentHandlerV2.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, root, new); 9 external calls (new, default, new, default, assert_eq!, json!, from_str, spawn, yield_now).
 
@@ -1947,11 +1961,11 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument()
 async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min()
 ```
 
-**Purpose**: Verifies v2 wait enforces the configured minimum timeout.
+**Purpose**: Checks that v2 wait_agent honors the configured minimum timeout.
 
-**Data flow**: Enables v2, sets min/max/default wait timeouts on config, invokes `WaitAgentHandlerV2` with `timeout_ms` below the minimum, and asserts the exact lower-bound error.
+**Data flow**: It sets min timeout to 50 ms, calls wait_agent with timeout_ms 1, and expects an at-least-50 error.
 
-**Call relations**: Covers configurable timeout validation on the v2 wait path.
+**Call relations**: It tests WaitAgentHandlerV2 against configurable limits.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, set_turn_config); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -1962,11 +1976,11 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min()
 async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min()
 ```
 
-**Purpose**: Checks that v2 wait accepts a timeout exactly equal to the configured minimum and returns a timeout result when nothing happens.
+**Purpose**: Checks that the v2 minimum timeout is inclusive.
 
-**Data flow**: Configures min/max/default values, invokes `WaitAgentHandlerV2` with `timeout_ms` equal to the minimum, parses the JSON result, and asserts `Wait timed out.` with `timed_out = true` and no success flag.
+**Data flow**: It sets min timeout to 1 ms, calls wait_agent with 1 ms, and expects a successful timed-out result.
 
-**Call relations**: Complements the lower-bound rejection test with the inclusive boundary case.
+**Call relations**: It complements the below-minimum rejection test.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -1977,11 +1991,11 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min()
 async fn multi_agent_v2_wait_agent_uses_configured_default_timeout()
 ```
 
-**Purpose**: Verifies that omitting `timeout_ms` causes v2 wait to use the configured default duration.
+**Purpose**: Verifies that v2 wait_agent uses the configured default timeout when none is supplied.
 
-**Data flow**: Configures a 50 ms default timeout, first wraps a wait call in a 20 ms outer timeout to prove it does not return early, then awaits another call within 1 second, parses the result, and asserts a timeout outcome.
+**Data flow**: It sets the default to 50 ms, confirms an early 20 ms wrapper times out, then waits long enough and expects wait_agent's own timed-out result.
 
-**Call relations**: Tests default-timeout selection rather than explicit timeout parsing.
+**Call relations**: It checks the default timeout path in WaitAgentHandlerV2.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config); 9 external calls (new, from_millis, from_secs, default, assert!, assert_eq!, json!, from_str, timeout).
 
@@ -1992,11 +2006,11 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout()
 async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout()
 ```
 
-**Purpose**: Checks that a configuration with zero min/max/default timeout is allowed and causes immediate timeout completion.
+**Purpose**: Checks that v2 can be configured to allow an immediate zero-timeout wait.
 
-**Data flow**: Sets all v2 wait timeout config values to zero, invokes `WaitAgentHandlerV2` under an outer 1-second timeout, parses the result, and asserts immediate `Wait timed out.` with `timed_out = true`.
+**Data flow**: It sets min, max, and default wait timeouts to zero, calls wait_agent with no arguments, and expects an immediate timed-out result.
 
-**Call relations**: Covers the edge case where zero is legal because it comes from configuration rather than user input.
+**Call relations**: It covers a special configuration boundary in WaitAgentHandlerV2.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config); 7 external calls (new, from_secs, default, assert_eq!, json!, from_str, timeout).
 
@@ -2007,11 +2021,11 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout()
 async fn multi_agent_v2_wait_agent_rejects_timeout_above_configured_max()
 ```
 
-**Purpose**: Ensures v2 wait rejects explicit timeouts above the configured maximum.
+**Purpose**: Checks that v2 wait_agent honors the configured maximum timeout.
 
-**Data flow**: Configures min/max/default values, invokes `WaitAgentHandlerV2` with `timeout_ms` above max, and asserts the upper-bound error string.
+**Data flow**: It sets max timeout to 50 ms, calls wait_agent with 500 ms, and expects an at-most-50 error.
 
-**Call relations**: Completes the configurable timeout validation matrix for v2 wait.
+**Call relations**: It tests the upper bound paired with the minimum-bound tests.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, set_turn_config); 5 external calls (new, default, assert_eq!, json!, panic!).
 
@@ -2022,11 +2036,11 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_above_configured_max()
 async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max()
 ```
 
-**Purpose**: Checks that v2 wait accepts a timeout exactly equal to the configured maximum.
+**Purpose**: Checks that the v2 maximum timeout is inclusive.
 
-**Data flow**: Sets min=max=default=1, invokes `WaitAgentHandlerV2` with `timeout_ms: 1`, parses the result, and asserts a normal timeout response.
+**Data flow**: It sets min, max, and default to 1 ms, calls wait_agent with 1 ms, and expects a successful timed-out result.
 
-**Call relations**: Provides the inclusive upper-bound case for v2 wait validation.
+**Call relations**: It complements the above-maximum rejection test.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -2037,11 +2051,11 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max()
 async fn wait_agent_returns_not_found_for_missing_agents()
 ```
 
-**Purpose**: Verifies legacy wait returns `NotFound` statuses for missing target agents instead of timing out.
+**Purpose**: Checks that legacy wait_agent returns NotFound status for missing agents instead of failing.
 
-**Data flow**: Installs agent-control, generates two absent `ThreadId`s, invokes `WaitAgentHandler` with both IDs and a long timeout, parses `wait::WaitAgentResult`, and asserts the `status` map contains both IDs mapped to `AgentStatus::NotFound` with `timed_out = false`.
+**Data flow**: It installs a manager, waits on two new ThreadIds that do not exist, and expects a status map marking both NotFound with no timeout.
 
-**Call relations**: Exercises the immediate-final-status path for nonexistent agents on the legacy wait tool.
+**Call relations**: It tests WaitAgentHandler's final-status reporting for absent agents.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager, new); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -2052,11 +2066,11 @@ async fn wait_agent_returns_not_found_for_missing_agents()
 async fn wait_agent_times_out_when_status_is_not_final()
 ```
 
-**Purpose**: Checks that legacy wait times out when the target agent remains in a non-final state.
+**Purpose**: Checks that legacy wait_agent times out if an agent remains active and does not reach a final status.
 
-**Data flow**: Starts a live thread, invokes `WaitAgentHandler` with the minimum timeout, parses the result, and asserts an empty status map with `timed_out = true`; then shuts the thread down.
+**Data flow**: It starts a thread, waits on it for the minimum timeout, and expects an empty status map with timed_out true.
 
-**Call relations**: Covers the polling/waiting path where no final status arrives before timeout.
+**Call relations**: It exercises the normal waiting loop in WaitAgentHandler.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 5 external calls (new, default, assert_eq!, json!, from_str).
 
@@ -2067,11 +2081,11 @@ async fn wait_agent_times_out_when_status_is_not_final()
 async fn wait_agent_clamps_short_timeouts_to_minimum()
 ```
 
-**Purpose**: Verifies legacy wait clamps too-short explicit timeouts up to the minimum rather than returning immediately.
+**Purpose**: Verifies that legacy wait_agent silently raises very short positive timeouts to the minimum wait time.
 
-**Data flow**: Starts a live thread, invokes `WaitAgentHandler` with `timeout_ms: 10`, wraps the call in a 50 ms outer timeout, and asserts the outer timeout fires because the handler should still be waiting at the minimum duration; then shuts the thread down.
+**Data flow**: It asks for 10 ms but wraps the handler in a 50 ms timeout, expecting the wrapper to expire because the handler is still waiting.
 
-**Call relations**: Pins the minimum-timeout clamping behavior of the legacy wait implementation.
+**Call relations**: It tests legacy timeout clamping rather than rejection.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, function_payload, invocation, thread_manager); 6 external calls (new, from_millis, default, assert!, json!, timeout).
 
@@ -2082,11 +2096,11 @@ async fn wait_agent_clamps_short_timeouts_to_minimum()
 async fn wait_agent_returns_final_status_without_timeout()
 ```
 
-**Purpose**: Checks that legacy wait returns immediately with a final status once the target has already transitioned to shutdown.
+**Purpose**: Checks that legacy wait_agent returns promptly when the target has already reached a final status.
 
-**Data flow**: Starts a thread, subscribes to its status, submits `Op::Shutdown`, waits for the status change, invokes `WaitAgentHandler`, parses the result, and asserts the status map contains `Shutdown` with `timed_out = false`.
+**Data flow**: It starts and shuts down a thread, waits for the status update, then calls wait_agent and expects Shutdown with timed_out false.
 
-**Call relations**: Exercises the successful final-status path after an observed lifecycle transition.
+**Call relations**: It tests WaitAgentHandler's fast path for completed agents.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 7 external calls (new, from_secs, default, assert_eq!, json!, from_str, timeout).
 
@@ -2097,11 +2111,11 @@ async fn wait_agent_returns_final_status_without_timeout()
 async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity()
 ```
 
-**Purpose**: Verifies v2 wait returns a generic completion summary when mailbox activity occurs.
+**Purpose**: Checks that v2 wait_agent reports a generic completion summary when mailbox mail arrives.
 
-**Data flow**: Enables v2, spawns a worker, resolves its path, starts a wait task, enqueues a root-directed mailbox communication from the worker, awaits the result, parses `wait::WaitAgentResult`, and asserts the generic completion message and `timed_out = false`.
+**Data flow**: It spawns a task, starts wait_agent, enqueues a mailbox message to root, and expects "Wait completed" without exposing message details.
 
-**Call relations**: Confirms that mailbox activity, not child content, is the wake-up signal for v2 wait.
+**Call relations**: It exercises WaitAgentHandlerV2's mailbox notification path.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, root, new); 9 external calls (new, default, new, default, assert_eq!, json!, from_str, spawn, yield_now).
 
@@ -2112,11 +2126,11 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity()
 async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail()
 ```
 
-**Purpose**: Checks that v2 wait returns immediately if relevant mailbox communication is already queued before the wait starts.
+**Purpose**: Verifies that v2 wait_agent returns immediately when relevant mailbox mail is already queued.
 
-**Data flow**: Enables v2, spawns a worker, resolves its path, enqueues mailbox communication first, then invokes `WaitAgentHandlerV2` under a short outer timeout and asserts it completes quickly with the standard completion summary.
+**Data flow**: It spawns a worker, queues a worker-to-root message before calling wait_agent, and expects completion within a short wrapper timeout.
 
-**Call relations**: Covers the preexisting-mail fast path of the v2 wait implementation.
+**Call relations**: It tests WaitAgentHandlerV2's check-before-wait behavior.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, root, new); 9 external calls (new, from_millis, default, new, default, assert_eq!, json!, from_str, timeout).
 
@@ -2127,11 +2141,11 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail()
 async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification()
 ```
 
-**Purpose**: Verifies that any mailbox notification from any child in the session subtree wakes v2 wait.
+**Purpose**: Checks that v2 wait_agent wakes when any child sends mailbox mail, not only a particular target.
 
-**Data flow**: Enables v2, spawns `worker_a` and `worker_b`, resolves `worker_b`'s path, starts a wait task, enqueues a mailbox communication from `worker_b`, then parses and asserts the standard completion summary.
+**Data flow**: It spawns two workers, starts wait_agent, sends mail from worker_b, and expects the wait to complete.
 
-**Call relations**: Shows v2 wait is session-wide rather than tied to a specific target list.
+**Call relations**: It verifies targetless mailbox waiting across multiple spawned agents.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, root, new); 9 external calls (new, default, new, default, assert_eq!, json!, from_str, spawn, yield_now).
 
@@ -2142,11 +2156,11 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification()
 async fn multi_agent_v2_wait_agent_does_not_return_completed_content()
 ```
 
-**Purpose**: Ensures v2 wait never includes the child agent's actual mailbox content in its returned summary.
+**Purpose**: Ensures v2 wait_agent does not leak child output content in its result. The wait tool only reports that something happened.
 
-**Data flow**: Enables v2, spawns a worker, starts a wait task, enqueues mailbox communication containing `sensitive child output`, awaits the result, parses the summary JSON, and asserts the returned content does not contain the sensitive string.
+**Data flow**: It sends mailbox content containing sensitive text, waits, and asserts the result says "Wait completed" while the sensitive text is absent.
 
-**Call relations**: Pins the privacy-preserving design of v2 wait responses.
+**Call relations**: It protects the output contract of WaitAgentHandlerV2.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager, root, new); 10 external calls (new, default, new, default, assert!, assert_eq!, json!, from_str, spawn, yield_now).
 
@@ -2157,11 +2171,11 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content()
 async fn multi_agent_v2_interrupt_agent_accepts_task_name_target()
 ```
 
-**Purpose**: Checks that v2 interrupt accepts a task-name target, interrupts only that agent, and leaves descendants resident.
+**Purpose**: Verifies that v2 interrupt_agent can target a spawned agent by task name and interrupts only that agent.
 
-**Data flow**: Enables v2, spawns `/root/worker`, then from the worker session spawns `/root/worker/child`, resolves both IDs, invokes `InterruptAgentHandler` targeting `worker`, parses `InterruptAgentResult`, verifies the worker path still resolves and both threads remain loaded, and inspects captured ops to confirm only the worker received `Op::Interrupt` and neither thread received `Op::Shutdown`.
+**Data flow**: It spawns `/root/worker`, spawns a child under it, interrupts `worker`, checks the previous status, confirms both agents remain resident, and verifies only the worker got Interrupt.
 
-**Call relations**: Exercises path-based target resolution and non-destructive interrupt semantics in v2.
+**Call relations**: It exercises InterruptAgentHandler's path resolution and non-cascading interrupt behavior.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, set_turn_config, thread_manager); 7 external calls (new, default, assert!, assert_eq!, assert_ne!, json!, from_str).
 
@@ -2172,11 +2186,11 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target()
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target()
 ```
 
-**Purpose**: Verifies v2 interrupt accepts a task-name target even when the child thread is unloaded, and that list-agents then omits that unloaded child.
+**Purpose**: Checks that v2 interrupt_agent accepts a task-name target even when that agent is no longer loaded in memory.
 
-**Data flow**: Builds a sqlite-backed manager with limited concurrency, enables v2 and sqlite, spawns a worker, removes its live thread from memory and shuts it down, invokes `InterruptAgentHandler` targeting `worker`, parses the result and checks `previous_status = NotFound`, queries the state DB to confirm the spawn edge remains open, then invokes list-agents and asserts only `/root` is listed.
+**Data flow**: It uses a SQLite-backed manager, spawns a worker, removes and shuts down the live thread, calls interrupt_agent by task name, then checks database edges and list_agents output.
 
-**Call relations**: Covers the persistence-aware interrupt path for unloaded agents and its interaction with list-agents visibility.
+**Call relations**: It tests InterruptAgentHandler with persisted metadata rather than only resident threads.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, with_models_provider_home_and_state_for_tests, expect_text_output, function_payload, invocation, set_turn_config, default_for_tests, from_api_key); 6 external calls (new, default, assert_eq!, init_state_db, json!, from_str).
 
@@ -2187,11 +2201,11 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target()
 async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id()
 ```
 
-**Purpose**: Checks that v2 interrupt rejects both `/root` and the root thread ID as invalid targets.
+**Purpose**: Ensures v2 interrupt_agent cannot target the root agent, whether by `/root` path or by root thread ID.
 
-**Data flow**: Enables v2, starts a root thread, invokes `InterruptAgentHandler` twice—once with target `/root`, once with the root thread ID string—and asserts both return `root is not a spawned agent`.
+**Data flow**: It enables v2, calls interrupt_agent twice against root, and expects "root is not a spawned agent" both times.
 
-**Call relations**: Exercises the explicit root-target guard in interrupt handling.
+**Call relations**: It enforces a core safety rule in InterruptAgentHandler.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager); 3 external calls (new, assert_eq!, json!).
 
@@ -2202,11 +2216,11 @@ async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id()
 async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id()
 ```
 
-**Purpose**: Verifies a child agent cannot interrupt itself by thread ID.
+**Purpose**: Checks that an agent cannot interrupt itself by using its own thread ID.
 
-**Data flow**: Enables v2, manually spawns a child worker, switches session/turn context to that child, invokes `InterruptAgentHandler` with the child's own thread ID, and asserts the self-target rejection message.
+**Data flow**: It creates a child context, calls interrupt_agent targeting that child's ID, and expects a message telling the agent to return its result instead.
 
-**Call relations**: Covers one branch of the self-interrupt protection logic.
+**Call relations**: It tests InterruptAgentHandler's self-target guard for ID addressing.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager, try_from); 6 external calls (new, SubAgent, assert_eq!, default, json!, vec!).
 
@@ -2217,11 +2231,11 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id()
 async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name()
 ```
 
-**Purpose**: Checks that a child agent also cannot interrupt itself by task path.
+**Purpose**: Checks that an agent cannot interrupt itself by using its own task path.
 
-**Data flow**: Enables v2, manually spawns a child worker, switches into the child context, invokes `InterruptAgentHandler` with the child's own path string, and asserts the same self-target rejection message.
+**Data flow**: It creates a child context, calls interrupt_agent targeting that child's path, and expects the same self-interrupt rejection.
 
-**Call relations**: Complements the self-target-by-ID test with path-based resolution.
+**Call relations**: It tests InterruptAgentHandler's self-target guard for path addressing.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, function_payload, invocation, set_turn_config, thread_manager, try_from); 6 external calls (new, SubAgent, assert_eq!, default, json!, vec!).
 
@@ -2232,11 +2246,11 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name()
 async fn close_agent_submits_shutdown_and_returns_previous_status()
 ```
 
-**Purpose**: Verifies `close_agent` submits a shutdown op, returns the prior status, and leaves the agent as `NotFound` afterward.
+**Purpose**: Verifies that close_agent shuts down a live agent and reports what its status was before closing.
 
-**Data flow**: Starts a thread, records its status, invokes `CloseAgentHandler`, parses `close_agent::CloseAgentResult`, asserts the previous status and success flag, inspects captured ops for `Op::Shutdown`, and then checks agent-control now reports `NotFound`.
+**Data flow**: It starts a thread, records its status, calls close_agent, parses the result, checks success, confirms a Shutdown operation was submitted, and verifies the status is now NotFound.
 
-**Call relations**: Exercises the basic close-agent lifecycle transition.
+**Call relations**: It directly exercises CloseAgentHandler against the test thread manager.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, expect_text_output, function_payload, invocation, thread_manager); 4 external calls (new, assert_eq!, json!, from_str).
 
@@ -2247,11 +2261,11 @@ async fn close_agent_submits_shutdown_and_returns_previous_status()
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed()
 ```
 
-**Purpose**: Tests close/resume behavior across a persisted parent-child-grandchild tree, ensuring subtree closes cascade and explicitly closed descendants stay closed when an ancestor is later resumed.
+**Purpose**: Tests a larger lifecycle story: closing a child closes its descendants, resuming the child brings that subtree back, and later resuming the parent does not reopen a subtree explicitly closed by the user.
 
-**Data flow**: Creates a sqlite-backed `ThreadManager`, starts a parent thread, spawns a child and grandchild through the spawn handler, closes the child subtree and verifies both child and grandchild become `NotFound`, resumes the child and verifies both reopen, closes the child subtree again, then separately shuts down the parent and resumes it from another operator thread; after parent resume it asserts the parent is live again while the explicitly closed child and grandchild remain `NotFound`, then performs bounded shutdown of all threads.
+**Data flow**: It builds a SQLite-backed manager, spawns parent-child-grandchild threads through handlers, closes and resumes the child subtree, closes it again, shuts down the parent, resumes the parent from another thread, and checks which agents are live.
 
-**Call relations**: This is the broadest persistence/integration test in the file, combining spawn, close, resume, subtree state propagation, and final manager shutdown.
+**Call relations**: It ties together SpawnAgentHandler, CloseAgentHandler, ResumeAgentHandler, persistent thread-store state, and final manager shutdown.
 
 *Call graph*: calls 10 internal fn (make_session_and_context, new, thread_store_from_config, expect_text_output, function_payload, invocation, parse_agent_id, default_for_tests, from_auth_for_testing, from_api_key); 9 external calls (new, from_secs, default, assert_eq!, assert_ne!, empty_extension_registry, init_state_db, json!, from_str).
 
@@ -2262,11 +2276,11 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
 async fn build_agent_spawn_config_uses_turn_context_values()
 ```
 
-**Purpose**: Verifies `build_agent_spawn_config` copies runtime values from `TurnContext` into the child config, including model, instructions, cwd, sandbox executable, approval policy, and permission profile.
+**Purpose**: Checks that the helper which builds a child spawn config copies the live turn context, not just the base config.
 
-**Data flow**: Defines a local helper to choose an alternate allowed sandbox policy, mutates a test turn with base instructions, developer instructions, compact prompt, shell environment policy, temp cwd, sandbox executable, runtime permission profile, and approval policy, calls `build_agent_spawn_config`, constructs an expected `Config` by cloning and patching `turn.config`, and asserts equality.
+**Data flow**: It customizes base instructions, developer instructions, compact prompt, shell policy, cwd, sandbox executable, permission profile, and approval policy on a turn, builds the spawn config, and compares it to an expected config.
 
-**Call relations**: Tests the config-building helper directly rather than through a handler, documenting exactly which turn-time overrides are propagated into spawned agents.
+**Call relations**: It verifies build_agent_spawn_config, which SpawnAgentHandler relies on before creating child threads.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, default, from_runtime_permissions_with_enforcement, from_legacy_sandbox_policy, from_legacy_sandbox_policy_for_cwd, from); 3 external calls (from, assert_eq!, tempdir).
 
@@ -2277,24 +2291,24 @@ async fn build_agent_spawn_config_uses_turn_context_values()
 async fn build_agent_resume_config_clears_base_instructions()
 ```
 
-**Purpose**: Checks that `build_agent_resume_config` preserves runtime turn settings but clears `base_instructions` when preparing a config for loading an existing agent.
+**Purpose**: Checks that the helper for resuming an agent clears caller base instructions while preserving live runtime settings.
 
-**Data flow**: Starts from a turn whose base config already has `base_instructions`, sets approval policy, calls `build_agent_resume_config`, constructs the expected config by cloning the turn config, clearing `base_instructions`, and copying runtime model/provider/instruction/sandbox fields plus permission profile, then asserts equality.
+**Data flow**: It sets base instructions on the turn config, calls build_agent_resume_config, builds the expected config with base_instructions set to none and runtime values copied, and compares them.
 
-**Call relations**: Complements the spawn-config test by pinning the one key difference for resume: inherited base instructions are intentionally removed.
+**Call relations**: It verifies build_agent_resume_config, which ResumeAgentHandler uses when restoring agents.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 2 external calls (new, assert_eq!).
 
 
 ### `core/src/tools/handlers/request_plugin_install_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This file is a focused test suite around the request-plugin-install flow implemented elsewhere in the handlers module. The tests create temporary Codex home directories, populate curated marketplace fixtures, and exercise both plugin-manager state and persisted configuration. One group of tests checks completion semantics: a curated plugin suggestion such as `sample@openai-curated` is not considered completed until `PluginsManager::install_plugin` has actually installed it, while IDs ending in `@openai-curated-remote` are treated specially and skip local-installed verification. Another test group validates how elicitation responses are interpreted: only a `Decline` action paired with metadata `{ persist: "always" }` triggers persistent disable behavior.
+This is a test file for the code that asks a user whether Codex may install a suggested plugin or connector. A plugin is an add-on that gives Codex extra abilities, and a connector is a link to an outside service such as a calendar. The tests create temporary Codex home folders, like disposable fake user profiles, so they can safely write plugin and configuration files without touching a real machine.
 
-The persistence tests inspect the resulting `config.toml` on disk after calling `persist_disabled_install_request`. They verify that connector suggestions become `ToolSuggestDisabledTool::connector(...)`, plugin suggestions become `ToolSuggestDisabledTool::plugin(...)`, and preexisting disabled entries are normalized and deduplicated by trimmed ID while preserving unrelated discoverables and plugin disables. The helper `connector_tool` constructs a realistic `DiscoverableTool::Connector(Box<AppInfo>)` with the minimum fields needed by these tests.
+The file checks three main ideas. First, a curated plugin install is not considered complete just because the marketplace lists it; the plugin must actually be installed. Second, remote plugin suggestions are treated differently: they should not go through the same local-installed check as normal curated plugins. Third, when a user declines an install request, Codex should only remember that choice permanently if the response says both “decline” and “always.”
 
-Overall, this file documents the edge cases that matter operationally: curated-vs-remote plugin IDs, persistent opt-out semantics, and idempotent config rewriting.
+The remaining tests focus on persistence. “Persistence” means saving a choice to disk so it survives future runs. These tests confirm that declining a connector or plugin writes the right entry into `config.toml`, and that messy existing entries are cleaned up: duplicates are removed, whitespace is trimmed, blank disabled tools are ignored, and unrelated discoverable tools are kept. The helper at the end builds a realistic connector object for those tests.
 
 #### Function details
 
@@ -2304,11 +2318,11 @@ Overall, this file documents the edge cases that matter operationally: curated-v
 async fn verified_plugin_install_completed_requires_installed_plugin()
 ```
 
-**Purpose**: Checks that curated plugin suggestions are only marked complete after the plugin is actually installed. It proves that marketplace presence alone is insufficient.
+**Purpose**: This test proves that Codex only treats a curated plugin install as complete after the plugin has actually been installed. It guards against a false success state where the plugin appears in the marketplace but is not yet available to use.
 
-**Data flow**: The test creates a temporary home directory, derives the curated repo path, writes curated marketplace and feature-config fixtures, loads plugin config, and constructs a `PluginsManager`. It first calls `verified_plugin_install_completed("sample@openai-curated", ...)` expecting `false`, then installs `sample` using a `PluginInstallRequest` pointing at the generated marketplace JSON, reloads config, and expects the verification call to return `true`.
+**Data flow**: It starts with a temporary Codex home folder, writes fake curated marketplace data for a plugin named `sample`, and loads the plugin configuration. Before installation, it asks whether `sample@openai-curated` is complete and expects `false`. Then it installs the plugin through `PluginsManager`, reloads the configuration, asks the same question again, and expects `true`.
 
-**Call relations**: This test drives the production verification logic under realistic filesystem and plugin-manager conditions. It depends on fixture helpers to create the curated marketplace state and on `PluginsManager::install_plugin` to transition the system into the installed state that the verifier should recognize.
+**Call relations**: The async test runner calls this test. Inside the test, setup helpers create a curated marketplace and feature config, `PluginsManager::new` creates the plugin installer, and `install_plugin` performs the install. The assertions frame the important story: marketplace presence alone is not enough, but installation plus refreshed config is enough.
 
 *Call graph*: calls 5 internal fn (new, curated_plugins_repo_path, write_curated_plugin_sha, write_plugins_feature_config, try_from); 4 external calls (assert!, load_plugins_config, write_openai_curated_marketplace, tempdir).
 
@@ -2319,11 +2333,11 @@ async fn verified_plugin_install_completed_requires_installed_plugin()
 fn remote_plugin_install_suggestions_skip_core_installed_verification()
 ```
 
-**Purpose**: Verifies the naming convention used to identify remote curated plugin suggestions. It ensures only the remote suffix triggers the bypass behavior.
+**Purpose**: This test checks how Codex recognizes remote plugin install suggestions. Remote plugins are not installed locally in the same way as core curated plugins, so they should skip the normal local installation verification.
 
-**Data flow**: It passes three string IDs into `is_remote_plugin_install_suggestion`: one remote curated ID, one non-remote curated ID, and one unrelated identifier. The assertions expect `true` only for the `@openai-curated-remote` form.
+**Data flow**: It feeds several plugin-like identifiers into the remote-suggestion checker. An identifier ending in `@openai-curated-remote` should return `true`, while a normal curated plugin and a plain plugin name should return `false`.
 
-**Call relations**: This test isolates the classification helper used by the install-request flow so that remote suggestions can avoid the stricter local-install completion checks.
+**Call relations**: The test runner calls this small unit test. It directly exercises the remote plugin detection helper and uses assertions to lock in the naming rule that later install-request code relies on.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2334,11 +2348,11 @@ fn remote_plugin_install_suggestions_skip_core_installed_verification()
 fn request_plugin_install_response_persists_only_decline_always_mode()
 ```
 
-**Purpose**: Confirms that persistent disabling is requested only for a specific elicitation outcome: decline plus `persist=always`. Other actions or metadata values must not persist.
+**Purpose**: This test makes sure Codex only saves a permanent “do not suggest this again” choice when the user both declines and chooses the “always” option. It prevents accidental permanent disabling from other responses.
 
-**Data flow**: It constructs several `ElicitationResponse` values with different `action` and `meta` combinations, including `Decline`/`Accept`, `always`/`session`, and `None`. Each is passed to `request_plugin_install_response_requests_persistent_disable`, and the test asserts that only the decline-with-always case returns `true`.
+**Data flow**: It builds several fake user responses. The first response is a decline with metadata saying `always`, and the checker should return `true`. The other responses change one important detail: accepting instead of declining, choosing `session` instead of `always`, or omitting metadata. Each of those should return `false`.
 
-**Call relations**: This test documents the exact gate used before writing a permanent disable entry to config, preventing broader persistence than the UI metadata explicitly requested.
+**Call relations**: The test runner calls this test, and the test calls the response-checking helper with carefully chosen `ElicitationResponse` values. The assertions document the contract for the higher-level request flow: only a very specific response should be written permanently.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2349,11 +2363,11 @@ fn request_plugin_install_response_persists_only_decline_always_mode()
 async fn persist_disabled_install_request_writes_connector_config()
 ```
 
-**Purpose**: Checks that declining a connector install suggestion writes the expected connector disable entry into `config.toml`. It validates the on-disk TOML shape, not just in-memory values.
+**Purpose**: This test confirms that when a user permanently declines a connector install suggestion, Codex writes that connector into the disabled-tools section of the config file. This is what stops the same connector suggestion from coming back later.
 
-**Data flow**: The test creates a temp home, builds a connector `DiscoverableTool` via `connector_tool`, calls `persist_disabled_install_request`, then reads `CONFIG_TOML_FILE` from disk and parses it as `ConfigToml`. It asserts that `tool_suggest` contains no discoverables and exactly one disabled connector entry for `connector_calendar`.
+**Data flow**: It creates a temporary Codex home folder and uses `connector_tool` to make a fake Google Calendar connector. It passes that connector to the persistence function, then reads `config.toml` back from disk, parses it, and compares it with the expected config: no discoverable tools and one disabled connector with the connector id.
 
-**Call relations**: This test exercises the persistence path end-to-end: helper-created tool input goes into the production writer, and the resulting file is reparsed to verify compatibility with the config model.
+**Call relations**: The async test runner calls this test. The test uses `connector_tool` to build realistic input, then hands it to `persist_disabled_install_request`, which is the behavior under test. Finally it reads and parses the written file to verify the disk output, not just an in-memory result.
 
 *Call graph*: calls 1 internal fn (connector_tool); 4 external calls (assert_eq!, read_to_string, tempdir, from_str).
 
@@ -2364,11 +2378,11 @@ async fn persist_disabled_install_request_writes_connector_config()
 async fn persist_disabled_install_request_writes_plugin_config()
 ```
 
-**Purpose**: Checks that declining a plugin install suggestion writes the expected plugin disable entry into `config.toml`. It mirrors the connector case for plugin IDs.
+**Purpose**: This test confirms that permanently declining a plugin install suggestion is saved as a disabled plugin in the user config. It protects the plugin path of the same “do not suggest this again” behavior tested for connectors.
 
-**Data flow**: It creates a temp home, constructs `DiscoverableTool::Plugin(Box<DiscoverablePluginInfo>)` for `slack@openai-curated`, invokes `persist_disabled_install_request`, reads the generated config file, parses it into `ConfigToml`, and asserts that `tool_suggest.disabled_tools` contains exactly `ToolSuggestDisabledTool::plugin("slack@openai-curated")`.
+**Data flow**: It creates a temporary Codex home folder and builds a fake discoverable plugin called `slack@openai-curated`. It asks the persistence function to save the decline, then reads and parses `config.toml`. The expected result is a tool suggestion config with one disabled plugin entry and no discoverable entries.
 
-**Call relations**: This test covers the plugin branch of the persistence logic and ensures the writer chooses the correct disabled-tool variant based on the discoverable tool type.
+**Call relations**: The async test runner calls this test. The test constructs a `DiscoverableTool::Plugin`, passes it to `persist_disabled_install_request`, and then checks the file that function wrote. This complements the connector test by proving both supported tool kinds are saved correctly.
 
 *Call graph*: 7 external calls (new, new, assert_eq!, read_to_string, tempdir, from_str, Plugin).
 
@@ -2379,11 +2393,11 @@ async fn persist_disabled_install_request_writes_plugin_config()
 async fn persist_disabled_install_request_dedupes_existing_disabled_tools()
 ```
 
-**Purpose**: Verifies that persisting a disabled install request normalizes and deduplicates existing disabled-tool entries instead of appending duplicates. It also confirms unrelated discoverables are preserved.
+**Purpose**: This test checks that saving a disabled tool cleans up the disabled-tools list instead of blindly adding another entry. It matters because real config files can contain duplicates, extra spaces, or broken blank entries.
 
-**Data flow**: The test writes a handcrafted TOML config containing one discoverable plugin plus multiple connector disabled entries with whitespace variants, an empty ID, and an unrelated plugin disable. After calling `persist_disabled_install_request` for the same connector, it rereads and parses the file, then asserts that the final config keeps the discoverable, collapses the connector disables to one normalized `connector_calendar`, drops the blank entry, and preserves the plugin disable.
+**Data flow**: It creates a temporary config file that already contains one discoverable plugin, duplicate disabled connector entries, a blank connector entry, and a disabled plugin. Then it saves a permanent decline for the same connector. After reading and parsing the config, it expects a tidy result: the discoverable plugin is preserved, the connector appears only once with clean spacing, the blank entry is gone, and the existing disabled plugin remains.
 
-**Call relations**: This test targets the config-rewrite behavior of the persistence function under messy real-world input, proving that the writer performs cleanup rather than blindly extending the list.
+**Call relations**: The async test runner calls this test. It uses `connector_tool` to create the input tool, writes a deliberately messy config file, and then calls `persist_disabled_install_request`. The final assertion shows the cleanup rules that the persistence code must follow when it updates existing user configuration.
 
 *Call graph*: calls 1 internal fn (connector_tool); 5 external calls (assert_eq!, read_to_string, write, tempdir, from_str).
 
@@ -2394,24 +2408,24 @@ async fn persist_disabled_install_request_dedupes_existing_disabled_tools()
 fn connector_tool(id: &str, name: &str) -> DiscoverableTool
 ```
 
-**Purpose**: Builds a minimal connector-shaped `DiscoverableTool` for tests. It fills required `AppInfo` fields while leaving optional metadata absent.
+**Purpose**: This helper builds a realistic connector-shaped test object from a simple id and display name. It keeps the connector tests focused on the behavior they care about instead of repeating a long `AppInfo` setup block.
 
-**Data flow**: It takes `id` and `name` string slices, converts them to owned `String`s, constructs an `AppInfo` with `description`, logos, branding, metadata, labels, and install URL set to `None`, `is_accessible: false`, `is_enabled: true`, and empty plugin-display-name lists, then wraps it in `DiscoverableTool::Connector(Box<_>)`.
+**Data flow**: It receives an id and name as text. It copies those into an `AppInfo` structure, fills the optional details with empty values, sets accessibility and enabled flags to fixed test values, wraps the result as a `DiscoverableTool::Connector`, and returns it.
 
-**Call relations**: This helper is called by the connector persistence tests to avoid repeating verbose `AppInfo` construction. It supplies the exact tool shape expected by `persist_disabled_install_request`.
+**Call relations**: This helper is called by the connector persistence tests: `persist_disabled_install_request_writes_connector_config` and `persist_disabled_install_request_dedupes_existing_disabled_tools`. Those tests need a valid connector object before they can call the persistence function, and this helper supplies that object in a consistent way.
 
 *Call graph*: called by 2 (persist_disabled_install_request_dedupes_existing_disabled_tools, persist_disabled_install_request_writes_connector_config); 3 external calls (new, new, Connector).
 
 
 ### `core/src/tools/handlers/request_user_input_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file exercises the companion spec module for `request_user_input`. Two small helpers derive the allowed-mode lists from `codex_features::Features`: one uses defaults only, and the other explicitly enables `Feature::DefaultModeRequestUserInput` before calling `request_user_input_available_modes`. The remaining tests lock down three categories of behavior.
+This is a test file for a tool that lets the system pause and ask the user one to three short questions. That matters because this tool is exposed through a schema, which is like a form describing exactly what information the tool accepts. If that form changes by accident, clients may send the wrong data or show the wrong user interface.
 
-First, `request_user_input_tool_includes_questions_schema` compares the entire generated `ToolSpec` against an inline expected value, including nested `JsonSchema` objects, required fields, descriptions, and the optional `autoResolutionMs` field. Second, the normalization tests verify that `normalize_request_user_input_args` always flips `is_other` to `true`, clamps out-of-range auto-resolution values to the configured min/max, and leaves boundary values unchanged. Third, the mode-policy tests confirm that `request_user_input_unavailable_message` respects the default-mode feature flag and that `request_user_input_tool_description` renders the allowed modes correctly in the final sentence.
+The tests check three main things. First, they verify that `create_request_user_input_tool` produces the expected tool definition, including fields such as question id, header, prompt text, answer options, and the optional `autoResolutionMs` timeout. Second, they check that timeout values are made safe: values below the allowed minimum are raised to the minimum, values above the maximum are lowered to the maximum, and exact boundary values are accepted. The tests also confirm that each question is marked so the client can add a free-form “Other” answer automatically.
 
-Because these assertions compare exact strings and full schema trees, the file protects not just semantics but also the precise model-facing contract and user-visible wording.
+Finally, the file checks mode rules. A feature flag can make the tool available in Default mode as well as Plan mode. These tests make sure the unavailable-message text and the user-facing tool description match that feature setting. In short, this file acts like a guardrail: it catches accidental changes to how the tool is described, when it can be used, and how its input is cleaned up.
 
 #### Function details
 
@@ -2421,11 +2435,11 @@ Because these assertions compare exact strings and full schema trees, the file p
 fn default_mode_enabled_available_modes() -> Vec<ModeKind>
 ```
 
-**Purpose**: Builds the allowed-mode list for tests when the default-mode feature flag is enabled. It provides a reusable fixture for assertions about feature-gated availability.
+**Purpose**: Builds the list of modes where `request_user_input` is available when the special Default-mode feature is turned on. Tests use it as a small setup helper so they do not repeat the same feature-flag code.
 
-**Data flow**: It creates a mutable `Features` with `Features::with_defaults()`, enables `Feature::DefaultModeRequestUserInput`, passes the resulting feature set to `request_user_input_available_modes`, and returns the produced `Vec<ModeKind>`.
+**Data flow**: It starts with the normal default feature set, turns on the `DefaultModeRequestUserInput` feature, then asks the shared availability logic for the resulting allowed modes. The output is a list of `ModeKind` values, such as Default and Plan.
 
-**Call relations**: This helper is used by tests that compare availability messages and description text under the feature-enabled configuration.
+**Call relations**: This helper calls the feature system’s default setup and then hands those features to `request_user_input_available_modes`. The mode-related tests use its result to compare behavior with the feature flag enabled.
 
 *Call graph*: calls 1 internal fn (with_defaults); 1 external calls (request_user_input_available_modes).
 
@@ -2436,11 +2450,11 @@ fn default_mode_enabled_available_modes() -> Vec<ModeKind>
 fn default_available_modes() -> Vec<ModeKind>
 ```
 
-**Purpose**: Builds the allowed-mode list for tests using only default feature settings. It serves as the baseline fixture for mode-availability assertions.
+**Purpose**: Builds the normal list of modes where `request_user_input` is available without extra feature flags. Tests use it as the baseline case.
 
-**Data flow**: It creates a default `Features` value with `Features::with_defaults()`, passes it to `request_user_input_available_modes`, and returns the resulting `Vec<ModeKind>`.
+**Data flow**: It creates the default feature set and passes it to the shared availability function. The output is the list of modes allowed under ordinary settings.
 
-**Call relations**: This helper is paired with `default_mode_enabled_available_modes` so tests can compare baseline and feature-enabled behavior without duplicating setup.
+**Call relations**: This helper calls the same availability function as the feature-enabled helper, but without changing any features first. Later tests use it when checking default unavailable messages and default description text.
 
 *Call graph*: calls 1 internal fn (with_defaults); 1 external calls (request_user_input_available_modes).
 
@@ -2451,11 +2465,11 @@ fn default_available_modes() -> Vec<ModeKind>
 fn request_user_input_tool_includes_questions_schema()
 ```
 
-**Purpose**: Verifies the exact nested JSON schema emitted for the `request_user_input` tool. It ensures the model sees the intended field names, descriptions, required lists, and strictness settings.
+**Purpose**: Checks that the tool definition for `request_user_input` contains the exact input schema expected by clients. This protects the contract between the tool and anything that calls or displays it.
 
-**Data flow**: It calls `create_request_user_input_tool("Ask the user to choose.".to_string())`, constructs the full expected `ToolSpec::Function(ResponsesApiTool { ... })` inline with nested `JsonSchema` values, and compares them using `assert_eq!`.
+**Data flow**: The test creates the tool specification with a simple description, then compares the whole result with a hand-written expected structure. The expected structure says the tool accepts a required `questions` array and an optional `autoResolutionMs` number, and describes the nested question and option fields.
 
-**Call relations**: This test directly exercises the schema builder and acts as a snapshot-style regression test for any changes to the tool's wire contract.
+**Call relations**: During the test run, Rust’s test runner calls this function. It uses `assert_eq!` to compare the produced tool specification with the expected one, so a mismatch immediately fails the test.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2466,11 +2480,11 @@ fn request_user_input_tool_includes_questions_schema()
 fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms()
 ```
 
-**Purpose**: Checks that normalization clamps auto-resolution values outside the supported range and still enables the implicit “Other” option. It covers both below-minimum and above-maximum inputs.
+**Purpose**: Checks that too-small or too-large auto-resolution timeouts are corrected into the allowed range. This prevents callers from accidentally asking for an unreasonable wait time.
 
-**Data flow**: It constructs a `RequestUserInputArgs` with one question and `auto_resolution_ms` below `MIN_AUTO_RESOLUTION_MS`, calls `normalize_request_user_input_args`, and asserts the result contains `is_other: true` and the minimum value. It repeats the assertion with a cloned args value whose `auto_resolution_ms` is above `MAX_AUTO_RESOLUTION_MS`, expecting the maximum value.
+**Data flow**: The test builds sample request arguments with one question and a timeout just below the minimum. It expects normalization to raise that timeout to the minimum and mark the question as allowing an automatic “Other” option. Then it repeats the same idea with a timeout just above the maximum and expects it to be lowered to the maximum.
 
-**Call relations**: This test targets the clamping branch of the normalization helper and documents the exact transformed output expected by the handler before session dispatch.
+**Call relations**: The test runner calls this function as part of the suite. Inside, it uses vector construction for sample questions and `assert_eq!` to check that the normalization result is exactly what the tool promises.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -2481,11 +2495,11 @@ fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms()
 fn normalize_request_user_input_args_accepts_auto_resolution_boundaries()
 ```
 
-**Purpose**: Verifies that normalization preserves auto-resolution values exactly at the configured minimum and maximum. It confirms the clamp is inclusive rather than shifting boundary values.
+**Purpose**: Checks that the minimum and maximum allowed timeout values are accepted as-is. This makes sure the safety limits are inclusive, not accidentally too strict.
 
-**Data flow**: It builds a `RequestUserInputArgs` with one question and `auto_resolution_ms` equal to `MIN_AUTO_RESOLUTION_MS`, normalizes it, and asserts the same boundary value is retained while `is_other` becomes `true`. It repeats the check with `MAX_AUTO_RESOLUTION_MS`.
+**Data flow**: The test creates request arguments with the timeout set to the minimum allowed value and expects normalization to keep that value. It then creates another version with the maximum allowed value and expects that value to stay unchanged too, while also confirming the question is marked for the client-added “Other” option.
 
-**Call relations**: This complements the out-of-range clamping test by covering the non-clamping boundary cases of the same helper.
+**Call relations**: The test runner calls this function during testing. It builds sample input data and relies on `assert_eq!` to prove that boundary values pass through normalization without being changed.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -2496,11 +2510,11 @@ fn normalize_request_user_input_args_accepts_auto_resolution_boundaries()
 fn request_user_input_unavailable_messages_respect_default_mode_feature_flag()
 ```
 
-**Purpose**: Checks that mode-availability messages change correctly when the default-mode feature flag is toggled. It verifies both allowed and disallowed modes by exact string.
+**Purpose**: Checks that the message explaining why `request_user_input` is unavailable matches the current mode and feature settings. This keeps user-facing error text honest.
 
-**Data flow**: It calls `request_user_input_unavailable_message` with several `ModeKind` values and either `default_available_modes()` or `default_mode_enabled_available_modes()`. The assertions expect `None` for allowed modes and exact `Some(String)` values for disallowed ones such as Default, Execute, and Pair Programming under the baseline configuration.
+**Data flow**: The test asks for unavailable messages in several modes. With default settings, Plan mode returns no message because it is allowed, while Default, Execute, and Pair Programming return clear unavailable messages. With the Default-mode feature enabled, Default mode also returns no message.
 
-**Call relations**: This test exercises the availability helper against realistic feature-derived mode lists, ensuring the handler will reject or allow calls consistently with feature flags.
+**Call relations**: The test runner invokes this function, and the function uses the two local mode-list helpers to set up the feature-off and feature-on cases. Each expected result is checked with `assert_eq!`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2511,22 +2525,24 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag()
 fn request_user_input_tool_description_mentions_available_modes()
 ```
 
-**Purpose**: Verifies the exact description text generated for the tool under different allowed-mode sets. It ensures the final sentence names the modes in the intended human-readable form.
+**Purpose**: Checks that the tool’s description tells callers which modes can use it. This matters because the description is guidance shown to the model or client before the tool is called.
 
-**Data flow**: It calls `request_user_input_tool_description` with the baseline and feature-enabled mode lists and compares each returned string against the full expected sentence using `assert_eq!`.
+**Data flow**: The test first generates the description using the normal available-mode list and expects text saying the tool is only available in Plan mode. Then it generates the description with the Default-mode feature enabled and expects text saying it is available in Default or Plan mode.
 
-**Call relations**: This test covers the interaction between `request_user_input_tool_description` and `format_allowed_modes`, protecting the model-facing wording from accidental drift.
+**Call relations**: The Rust test runner calls this function. It depends on the two helper functions that produce available-mode lists, then uses `assert_eq!` to lock down the exact wording.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/handlers/request_user_input_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file has a single async test focused on one important invariant in the `RequestUserInputHandler`: only the root thread may ask the user for input. The test uses `make_session_and_context()` to obtain a realistic session and turn, then mutates `turn.session_source` to `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { ... })` with a fresh parent thread ID and depth 1. It constructs a `ToolInvocation` that looks like a normal function-tool call, including a valid `request_user_input` payload with one question and two options, a cancellation token, a shared `TurnDiffTracker`, and the correct tool name.
+This test protects an important boundary in the multi-agent system. In this project, a main conversation can spawn sub-agents, which are helper threads that work under the root thread. The `request_user_input` tool is the mechanism that asks the human a question, such as choosing between options. Without this check, a background helper could unexpectedly prompt the user, which would be confusing and could break the intended flow of control.
 
-The handler is instantiated with `available_modes: Vec::new()`, but the mode list is irrelevant because the sub-agent rejection happens earlier in control flow. After awaiting `.handle(...)`, the test asserts that the result is an error and specifically matches `FunctionCallError::RespondToModel("request_user_input can only be used by the root thread")`. This confirms the handler rejects sub-agent invocations before attempting mode checks, argument parsing, or session-side user prompting.
+The test builds a normal fake session and turn, then changes the turn so it looks like it came from a sub-agent rather than the root thread. It then calls `RequestUserInputHandler` with a realistic payload: one question with two choices. The important part is not the question itself, but who is asking it.
+
+After running the handler, the test expects failure. More specifically, it expects an error that is meant to be sent back to the model, saying that `request_user_input` can only be used by the root thread. This confirms that the handler refuses sub-agent requests before they can reach the user. In everyday terms, this is like making sure only the lead operator can press the intercom button, not every assistant working in the back room.
 
 #### Function details
 
@@ -2536,22 +2552,24 @@ The handler is instantiated with `available_modes: Vec::new()`, but the mode lis
 async fn multi_agent_v2_request_user_input_rejects_subagent_threads()
 ```
 
-**Purpose**: Verifies that the handler rejects `request_user_input` calls originating from a spawned sub-agent thread. It protects the root-thread-only invariant for user prompting.
+**Purpose**: This test checks that a sub-agent thread is not allowed to use `request_user_input`. It proves the handler returns a clear error instead of opening a user prompt from a non-root thread.
 
-**Data flow**: The test obtains a session and turn from `make_session_and_context().await`, mutates the turn's `session_source` to a `SubAgentSource::ThreadSpawn`, then builds a `ToolInvocation` containing a valid JSON function payload for `request_user_input`. It invokes `RequestUserInputHandler { available_modes: Vec::new() }.handle(...).await`, pattern-matches the result as `Err`, and asserts the exact `FunctionCallError::RespondToModel` value.
+**Data flow**: The test starts with a fake session and turn, then rewrites the turn’s source so it represents a spawned sub-agent. It builds a tool invocation containing a sample multiple-choice question and passes it into `RequestUserInputHandler`. The expected result is not an answer from the user, but an error saying the tool can only be used by the root thread.
 
-**Call relations**: This test drives `RequestUserInputHandler::handle`/`handle_call` through the early sub-agent guard path. It intentionally supplies otherwise valid input so the failure can only come from the thread-origin check.
+**Call relations**: The test uses `make_session_and_context` to create the starting session state, then constructs supporting objects such as a thread ID, cancellation token, diff tracker, tool name, and JSON payload. It calls the handler’s `handle` method as the real code would during a tool call, then checks the returned error with `assert_eq` to lock in the intended behavior.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, default, new, plain); 8 external calls (new, new, new, SubAgent, assert_eq!, json!, panic!, new).
 
 
 ### `core/src/tools/handlers/shell_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file exercises the schema constructors in `shell_spec.rs` by rebuilding the expected `ToolSpec::Function(ResponsesApiTool)` values inline and comparing them for exact equality. The tests are intentionally concrete: they reconstruct the full `BTreeMap` of parameter schemas, required-field lists, descriptions, and output schemas rather than checking only a few fields. That makes changes to wording, optionality, or `additionalProperties` behavior visible immediately.
+This is a test file, not production code. Its job is to make sure several tool definitions stay stable: `exec_command`, `write_stdin`, `request_permissions`, and `shell_command`. These tools are how the system tells an AI model or API client, “Here is a command you may call, here are the fields you can send, and here is what you will get back.” If these definitions drift by accident, callers could send the wrong field, miss a required field, or misunderstand what the tool does.
 
-Two small helpers support the assertions. `windows_shell_guidance_description` mirrors the production formatting that prefixes the Windows safety block with two newlines, and `has_parameter` serializes a `ToolSpec` to JSON and probes `/parameters/properties/<name>` so tests can verify conditional omission of fields like `shell`. The exec-command tests cover both the default public wrapper and the internal variant that can hide the shell parameter. Additional tests validate the `write_stdin`, `request_permissions`, and `shell_command` specs, including the platform-specific shell-command description branch. Together these tests serve as regression protection for the exact API surface presented to the model and clients.
+The tests build each tool using the real factory functions from the shell handler code. Then they build the expected tool description by hand, including each parameter’s plain-English description, which fields are required, whether extra fields are allowed, and whether an output schema is present. Finally, they compare the real and expected versions exactly.
+
+A small amount of behavior depends on the operating system. On Windows, descriptions include PowerShell-specific guidance; on other systems, they use shorter Unix-like shell wording. One test also checks that the `shell` parameter can be hidden when requested. In everyday terms, this file is a checklist that makes sure the public “instruction card” for each shell tool says exactly what the rest of the system promises it says.
 
 #### Function details
 
@@ -2561,11 +2579,11 @@ Two small helpers support the assertions. `windows_shell_guidance_description` m
 fn windows_shell_guidance_description() -> String
 ```
 
-**Purpose**: Builds the expected formatting wrapper used around the Windows safety guidance in test assertions. It ensures tests compare against the same newline-prefixed block shape used by production descriptions.
+**Purpose**: Builds the Windows-specific extra guidance text used in expected tool descriptions. It wraps the shared Windows shell guidance with blank lines so the final description matches the production formatting.
 
-**Data flow**: It takes no arguments, calls `windows_shell_guidance()`, prefixes the returned text with `\n\n` via `format!`, and returns the resulting `String`.
+**Data flow**: It takes no input directly. It reads the shared Windows shell guidance text from the surrounding module, prefixes it with two newline characters, and returns the combined string.
 
-**Call relations**: This helper is used by `shell_command_tool_matches_expected_spec` to assemble the expected Windows description text without duplicating the formatting logic inline.
+**Call relations**: The Windows branch of `shell_command_tool_matches_expected_spec` calls this helper when it needs to construct the exact expected description for the PowerShell command tool. The helper delegates the actual guidance content to `windows_shell_guidance` and only adds the formatting around it.
 
 *Call graph*: called by 1 (shell_command_tool_matches_expected_spec); 1 external calls (format!).
 
@@ -2576,11 +2594,11 @@ fn windows_shell_guidance_description() -> String
 fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool
 ```
 
-**Purpose**: Checks whether a serialized tool spec contains a named parameter under `parameters.properties`. It is used to verify conditional schema branches without reconstructing the entire expected spec.
+**Purpose**: Checks whether a generated tool specification includes a named input parameter. This lets tests ask a simple yes-or-no question without manually digging through the nested schema structure.
 
-**Data flow**: It accepts a `&ToolSpec` and a parameter name, serializes the tool to `serde_json::Value`, computes a JSON Pointer for `/parameters/properties/<parameter_name>`, and returns `true` if that pointer resolves to a value. It panics if serialization fails.
+**Data flow**: It receives a `ToolSpec` and a parameter name. It converts the whole tool specification into JSON, looks under `parameters.properties.<parameter name>`, and returns `true` if that entry exists or `false` if it does not.
 
-**Call relations**: The helper is used by `exec_command_tool_can_hide_shell_parameter` to confirm that the internal exec-command builder can omit `shell` while still retaining required fields like `cmd`.
+**Call relations**: This is a small test helper for checking the shape of a tool specification. It uses JSON serialization as a convenient way to inspect the nested parameter map, then hands back a boolean result that assertions can use.
 
 *Call graph*: 2 external calls (format!, to_value).
 
@@ -2591,11 +2609,11 @@ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool
 fn exec_command_tool_matches_expected_spec()
 ```
 
-**Purpose**: Asserts that the default `exec_command` spec exactly matches the expected schema, description, and output shape. It covers platform-specific description text and approval-parameter inclusion.
+**Purpose**: Verifies that the `exec_command` tool is advertised exactly as expected. This matters because `exec_command` is the lower-level command runner, including options for working directory, shell choice, terminal behavior, output limits, and login-shell behavior.
 
-**Data flow**: The test constructs a tool via `create_exec_command_tool`, computes the expected description based on `cfg!(windows)`, builds the expected property map including `cmd`, `workdir`, `shell`, `tty`, `yield_time_ms`, `max_output_tokens`, and `login`, extends it with `create_approval_parameters(false)`, and compares the full `ToolSpec` with `assert_eq!`.
+**Data flow**: The test asks the real code to create an `exec_command` tool with login shells allowed and permission approvals disabled. It then builds the expected description, parameter schema, required fields, and output schema by hand. The final assertion compares the real tool and expected tool, and the test fails if any part differs.
 
-**Call relations**: It directly exercises the public wrapper constructor and indirectly validates the behavior delegated to the internal exec-command builder, approval-parameter helper, and unified output-schema helper.
+**Call relations**: During the test run, this function exercises the production tool-building path for `exec_command`. It uses schema helpers such as string, number, and boolean schema builders, adds approval-related parameters, accounts for Windows-specific description text with a platform check, and then uses an exact equality assertion as the contract check.
 
 *Call graph*: calls 3 internal fn (boolean, number, string); 4 external calls (from, assert_eq!, cfg!, format!).
 
@@ -2606,11 +2624,11 @@ fn exec_command_tool_matches_expected_spec()
 fn exec_command_tool_can_hide_shell_parameter()
 ```
 
-**Purpose**: Verifies the internal exec-command builder’s ability to suppress the `shell` parameter while keeping the rest of the schema intact. This protects a non-default configuration path used by callers that do not want shell selection exposed.
+**Purpose**: Checks that the `exec_command` tool can be created without exposing the `shell` input parameter. This is useful when the system wants callers to run commands but not choose the shell binary themselves.
 
-**Data flow**: It calls `create_exec_command_tool_with_environment_id` with `include_shell_parameter = false`, then uses `has_parameter` to assert that `shell` is absent and `cmd` is still present. The test returns no value and fails on assertion failure.
+**Data flow**: The test creates an `exec_command` tool with environment IDs and the shell parameter both excluded. It then inspects the resulting tool schema: `shell` should be absent, while the basic `cmd` parameter should still be present.
 
-**Call relations**: This test targets the configurable internal constructor rather than the public wrapper, specifically checking the branch controlled by the `include_shell_parameter` argument.
+**Call relations**: This test focuses on one configurable part of the `exec_command` tool factory. After creating the tool with the relevant flags, it relies on boolean assertions to confirm that hiding `shell` does not remove the core command input.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2621,11 +2639,11 @@ fn exec_command_tool_can_hide_shell_parameter()
 fn write_stdin_tool_matches_expected_spec()
 ```
 
-**Purpose**: Checks that the `write_stdin` tool spec exposes the exact continuation-session parameters and shared output schema expected by clients. It guards against accidental drift in polling/write semantics.
+**Purpose**: Verifies that the `write_stdin` tool has the exact expected public shape. This tool is used to send text into an already-running command session and then read back recent output.
 
-**Data flow**: The test creates the tool with `create_write_stdin_tool`, reconstructs the expected property map for `session_id`, `chars`, `yield_time_ms`, and `max_output_tokens`, and compares the full `ToolSpec` against an inline expected `ResponsesApiTool` using `assert_eq!`.
+**Data flow**: The test creates the real `write_stdin` tool. It separately builds the expected parameter schema, including the required session identifier plus optional characters to write, wait time, and output budget. It compares the real and expected tool specifications exactly.
 
-**Call relations**: It directly validates the `create_write_stdin_tool` builder and indirectly confirms reuse of `unified_exec_output_schema`.
+**Call relations**: This test runs as part of the tool contract suite. It uses schema-building helpers to describe each allowed input, then passes the completed expected schema into an equality assertion against the production result.
 
 *Call graph*: calls 2 internal fn (number, string); 2 external calls (from, assert_eq!).
 
@@ -2636,11 +2654,11 @@ fn write_stdin_tool_matches_expected_spec()
 fn request_permissions_tool_includes_full_permission_schema()
 ```
 
-**Purpose**: Ensures that the permission-request tool embeds the complete nested permission profile schema rather than a simplified placeholder. This protects the contract for filesystem and network permission requests.
+**Purpose**: Confirms that the `request_permissions` tool includes the complete permission request schema. This matters because callers need a reliable way to ask for extra rights, such as broader file or command access, during a turn.
 
-**Data flow**: It invokes `create_request_permissions_tool` with a custom description string, builds the expected property map containing `reason`, `environment_id`, and `permissions: permission_profile_schema()`, and compares the resulting `ToolSpec` for exact equality.
+**Data flow**: The test creates the real permission-request tool with a chosen description. It builds the expected schema with an optional reason, an optional environment identifier, and the required permissions object. It then checks that the generated tool exactly matches that expected structure and has no output schema.
 
-**Call relations**: The test exercises the request-permissions spec builder and indirectly validates that it reuses `permission_profile_schema` unchanged.
+**Call relations**: This test exercises the production permission-tool builder. It pulls in the shared permission profile schema for the important `permissions` field, then uses an exact equality assertion to make sure the full permission shape is exposed.
 
 *Call graph*: calls 1 internal fn (string); 2 external calls (from, assert_eq!).
 
@@ -2651,22 +2669,22 @@ fn request_permissions_tool_includes_full_permission_schema()
 fn shell_command_tool_matches_expected_spec()
 ```
 
-**Purpose**: Asserts that the `shell_command` tool spec matches the expected parameter schema and platform-specific description text. It covers both the Unix guidance and the Windows PowerShell example block plus safety appendix.
+**Purpose**: Verifies that the higher-level `shell_command` tool is described exactly as expected. This tool runs a shell command and returns its output, so its public instructions must be especially clear about command text, working directory, timeout, and login-shell behavior.
 
-**Data flow**: It creates a tool with `create_shell_command_tool`, computes the expected description using either a raw multiline PowerShell example string plus `windows_shell_guidance_description()` or the non-Windows guidance string, builds the expected property map including `command`, `workdir`, `timeout_ms`, and `login`, extends it with `create_approval_parameters(false)`, and compares the full spec with `assert_eq!`.
+**Data flow**: The test creates the real `shell_command` tool with login shells allowed and permission approvals disabled. It builds the expected description differently depending on the operating system: Windows gets PowerShell examples and extra guidance, while other systems get a shorter shell-command description. It then constructs the expected parameter schema and compares the whole tool specification with the real one.
 
-**Call relations**: This test directly targets the shell-command spec builder and uses `windows_shell_guidance_description` to mirror the production Windows-description composition path.
+**Call relations**: This test is part of the same contract-checking suite as the other tool spec tests. On Windows it calls `windows_shell_guidance_description` to include the shared extra guidance. It also uses schema helpers and approval-parameter helpers before handing the completed expected object to an exact equality assertion.
 
 *Call graph*: calls 4 internal fn (windows_shell_guidance_description, boolean, number, string); 3 external calls (from, assert_eq!, cfg!).
 
 
 ### `core/src/tools/handlers/shell_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This file tests the operational side of shell-command handling rather than schema generation. One group of tests verifies that commands produced by `ShellCommandHandler` remain recognizable by `codex_shell_command::is_known_safe_command`, which matters because safety heuristics inspect the final argv form, not just the original user command. The test covers Bash and Zsh unconditionally and PowerShell/Pwsh only when executables are discoverable on the host.
+This is a test file, not production code. Its job is to protect the shell-command pathway from subtle mistakes. When the system is asked to run a command like `echo hello`, it does not run that text directly. It first chooses the user’s shell, builds the right command-line arguments, chooses a working folder, prepares environment variables, applies sandbox permissions, and may also notify hook code before or after the command runs. A small mismatch in any of that could make commands run in the wrong place, with the wrong permissions, or in a form that safety checks no longer recognize.
 
-The async parameter-conversion tests build a real session and turn context via `make_session_and_context`, then compare `ShellCommandHandler::to_exec_params` output against values derived from session state: the user shell’s `derive_exec_args`, turn-context path resolution, environment creation through `create_env`, inherited network policy, timeout, sandbox permissions, and justification. Separate tests pin down login-shell policy: explicit `true` is honored when allowed, omitted login defaults to non-login when disallowed, and explicit login is rejected with a user-facing error when config forbids it. The final tests validate hook integration by checking that pre-tool and post-tool payloads preserve the raw `command` argument and use the wire-format `post_tool_use_response` from `FunctionToolOutput`. Together these tests document the exact translation boundary between model-facing shell calls and internal execution/hook machinery.
+The tests here act like a checklist. They verify that commands produced for Bash, Zsh, and PowerShell still look safe to the command-safety detector when the original command is safe. They check that `ShellCommandHandler` uses the current session and turn context, which are the pieces of state that say what shell to use, where relative paths point, what network access is allowed, and what environment variables should exist. They also test the rule for login shells: a login shell is a shell started as if the user just logged in, which can load extra startup files. That is allowed only when configuration permits it. Finally, the file checks that pre-use and post-use hook messages contain the raw command and the intended output value, so outside hook systems see the same clean information the user requested.
 
 #### Function details
 
@@ -2676,11 +2694,11 @@ The async parameter-conversion tests build a real session and turn context via `
 fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command()
 ```
 
-**Purpose**: Checks that shell-command argv vectors generated for supported shells still satisfy the external safe-command heuristic when the original command is benign. This prevents the handler’s wrapping logic from accidentally making safe commands look unsafe.
+**Purpose**: This test makes sure the command strings built for different shells can still be recognized by the safety checker when the original command is harmless. It matters because the handler wraps commands in shell-specific ways, and that wrapping must not confuse the safety logic.
 
-**Data flow**: The test constructs `Shell` values for Bash and Zsh with fixed paths, conditionally discovers PowerShell and Pwsh executables, and for each available shell passes a sample command into `assert_safe`. It produces no return value and fails if any generated argv is not recognized as safe.
+**Data flow**: It starts with a few shell descriptions, such as Bash and Zsh, and uses PowerShell variants too if they are installed on the machine running the test. For each available shell, it sends a simple directory-listing command into the helper check. The result is not a returned value, but a set of assertions that must pass: both login-shell and non-login-shell forms must be considered known safe.
 
-**Call relations**: It is the top-level safety-regression test in this file and delegates the actual dual-login/non-login assertions to `assert_safe`. It also depends on executable discovery helpers to decide whether PowerShell variants can be tested on the current machine.
+**Call relations**: This is the top-level test for safe-command recognition. It calls `assert_safe` to do the repeated check for each shell, and it asks the PowerShell lookup helpers whether PowerShell executables are available before testing those cases.
 
 *Call graph*: calls 3 internal fn (assert_safe, try_find_powershell_executable_blocking, try_find_pwsh_executable_blocking); 1 external calls (from).
 
@@ -2691,11 +2709,11 @@ fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_c
 fn assert_safe(shell: &Shell, command: &str)
 ```
 
-**Purpose**: Asserts that a given shell produces safe-recognized exec arguments for both login-shell and non-login-shell modes. It is a compact helper to avoid duplicating the same two assertions across shell variants.
+**Purpose**: This helper avoids repeating the same safety check for every shell. Given a shell and a command, it confirms that the shell-wrapped version is still accepted by the known-safe-command detector.
 
-**Data flow**: It takes a `&Shell` and a command string, calls `shell.derive_exec_args(command, true)` and `shell.derive_exec_args(command, false)`, feeds both argv vectors into `is_known_safe_command`, and asserts that both results are true.
+**Data flow**: It receives a shell description and a raw command string. It asks the shell to turn that command into executable arguments twice: once as a login shell and once as a non-login shell. Each argument list is then fed into the safety checker, and the function succeeds only if both checks pass.
 
-**Call relations**: This helper is only called by `commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command`, where it encapsulates the repeated safety check for each shell under test.
+**Call relations**: It is called by `commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command` whenever that test wants to validate another shell. It sits between shell command construction and the safety-checking function, making sure those two parts agree.
 
 *Call graph*: called by 1 (commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command); 1 external calls (assert!).
 
@@ -2706,11 +2724,11 @@ fn assert_safe(shell: &Shell, command: &str)
 async fn shell_command_handler_to_exec_params_uses_session_shell_and_turn_context()
 ```
 
-**Purpose**: Verifies that `ShellCommandHandler::to_exec_params` derives execution settings from the active session shell and turn context rather than from ad hoc defaults. It checks the full translation from tool-call parameters into internal exec parameters.
+**Purpose**: This test checks that a shell command request is translated into execution settings using the current session and turn context. In plain terms, it verifies that the handler uses the right shell, folder, environment, timeout, network setting, sandbox permission, and justification.
 
-**Data flow**: The test asynchronously obtains a session and turn context, prepares a `ShellCommandToolCallParams` with command, relative workdir, timeout, escalation mode, and justification, computes expected command argv via `session.user_shell().derive_exec_args`, expected cwd via turn-context path resolution, and expected environment via `create_env`. It then calls `to_exec_params` and compares individual fields such as `command`, `cwd`, `env`, `network`, timeout, sandbox permissions, justification, and `arg0`.
+**Data flow**: It creates a fake session and turn context, then builds a shell command request with a command, relative working directory, timeout, sandbox setting, and justification text. It independently calculates what the command arguments, working directory, and environment should be. Then it asks `ShellCommandHandler::to_exec_params` to build the real execution parameters and compares each important field to the expected value.
 
-**Call relations**: This test directly exercises `ShellCommandHandler::to_exec_params` and uses session/turn fixtures plus `create_env` to derive the expected values from the same contextual sources the handler should use.
+**Call relations**: This test uses `make_session_and_context` to get realistic test state, `create_env` to compute the expected environment, and `ShellCommandHandler::to_exec_params` as the behavior under test. It proves that the handler correctly combines user input with session-level and turn-level settings before a command would be run.
 
 *Call graph*: calls 3 internal fn (create_env, make_session_and_context, to_exec_params); 1 external calls (assert_eq!).
 
@@ -2721,11 +2739,11 @@ async fn shell_command_handler_to_exec_params_uses_session_shell_and_turn_contex
 fn shell_command_handler_respects_explicit_login_flag()
 ```
 
-**Purpose**: Confirms that the handler’s base-command generation honors an explicit login-shell choice in both directions. It protects against regressions where the handler might silently force one mode.
+**Purpose**: This test verifies that when code explicitly asks for a login shell or a non-login shell, the handler follows that choice. This matters because login shells can load extra user startup configuration, so the distinction is intentional.
 
-**Data flow**: It constructs a Bash `Shell`, calls `ShellCommandHandler::base_command` once with `use_login_shell = true` and once with `false`, and compares each result to `shell.derive_exec_args` with the same flag using `assert_eq!`.
+**Data flow**: It creates a Bash shell description and asks `ShellCommandHandler::base_command` to build one command with login-shell mode enabled and another with it disabled. For each case, it compares the handler’s result to the shell’s own expected argument-building method. The output is a pair of passing assertions showing that the requested mode was preserved.
 
-**Call relations**: This test targets the lower-level command-building helper `base_command`, isolating login-flag behavior from the broader `to_exec_params` path.
+**Call relations**: This test focuses on `ShellCommandHandler::base_command`. It compares that function against the shell’s lower-level command-building behavior, so it confirms the handler is not silently changing the caller’s login-shell choice.
 
 *Call graph*: calls 1 internal fn (base_command); 2 external calls (from, assert_eq!).
 
@@ -2736,11 +2754,11 @@ fn shell_command_handler_respects_explicit_login_flag()
 async fn shell_command_handler_defaults_to_non_login_when_disallowed()
 ```
 
-**Purpose**: Checks that omitted login preference falls back to non-login execution when configuration disallows login shells. This documents the handler’s defaulting behavior under restrictive policy.
+**Purpose**: This test checks the safe default when login shells are disabled by configuration. If the request does not explicitly ask for a login shell, the handler should still run the command, but as a non-login shell.
 
-**Data flow**: It creates a session and turn context, builds `ShellCommandToolCallParams` with `login: None`, calls `ShellCommandHandler::to_exec_params` with `allow_login_shell = false`, and asserts that the resulting `command` field matches `session.user_shell().derive_exec_args("echo hello", false)`.
+**Data flow**: It creates a test session and turn context, then builds a command request with no explicit login preference. It calls `ShellCommandHandler::to_exec_params` while telling it login shells are not allowed. The resulting executable command is compared with the session shell’s non-login form of the same raw command.
 
-**Call relations**: This test exercises the policy branch inside `to_exec_params` where login shells are disabled but the caller did not explicitly request one.
+**Call relations**: This test uses `make_session_and_context` to supply realistic state and then exercises `ShellCommandHandler::to_exec_params`. It complements the rejection test by showing that disabling login shells does not block ordinary shell commands.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, to_exec_params); 1 external calls (assert_eq!).
 
@@ -2751,11 +2769,11 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed()
 fn shell_command_handler_rejects_login_when_disallowed()
 ```
 
-**Purpose**: Verifies that an explicit request for a login shell is rejected when configuration forbids login-shell execution. The test also checks that the resulting error message is user-facing and descriptive.
+**Purpose**: This test makes sure the handler refuses an explicit request for a login shell when configuration has disabled login shells. It protects the configuration rule from being bypassed.
 
-**Data flow**: It calls `ShellCommandHandler::resolve_use_login_shell(Some(true), false)`, expects an error, converts that error to a string, and asserts that the message contains `login shell is disabled by config`.
+**Data flow**: It calls `ShellCommandHandler::resolve_use_login_shell` with an explicit request for login-shell mode while login shells are not allowed. Instead of a normal result, it expects an error. The test then checks that the error message explains that login shells are disabled by configuration.
 
-**Call relations**: This is a focused unit test for the login-resolution helper, covering the explicit-error path separately from the broader exec-parameter conversion tests.
+**Call relations**: This test goes directly to the decision function, `ShellCommandHandler::resolve_use_login_shell`, rather than building full execution parameters. It verifies the rule at the point where the handler decides whether login-shell mode may be used.
 
 *Call graph*: calls 1 internal fn (resolve_use_login_shell); 1 external calls (assert!).
 
@@ -2766,11 +2784,11 @@ fn shell_command_handler_rejects_login_when_disallowed()
 async fn shell_command_pre_tool_use_payload_uses_raw_command()
 ```
 
-**Purpose**: Ensures that the pre-tool-use hook payload for `shell_command` contains the original raw command string from the tool arguments. This matters for hook consumers that want the exact user-requested command, not a transformed argv.
+**Purpose**: This test checks the message sent to pre-use hooks before a shell command runs. It makes sure the hook receives the raw command text the user requested, not a shell-wrapped version.
 
-**Data flow**: The test builds a `ToolPayload::Function` containing JSON arguments with `command`, creates a session and turn fixture, constructs a classic `ShellCommandHandler`, wraps everything in a `ToolInvocation`, and compares `handler.pre_tool_use_payload(...)` to an expected payload with `tool_name: HookToolName::bash()` and `tool_input` equal to the parsed command JSON.
+**Data flow**: It builds a tool payload containing a command string, creates a test session and turn context, and constructs a shell command handler. It then creates a tool invocation and asks the handler for its pre-tool-use payload. The expected result is a hook payload named like the Bash hook, with JSON input containing exactly the original command.
 
-**Call relations**: It exercises the handler’s hook-export path before execution, validating how invocation payloads are translated into registry hook payloads.
+**Call relations**: This test uses `make_session_and_context` to build the invocation context and `ShellCommandHandler::from` to create the handler. It then exercises the handler’s pre-use hook payload method, confirming that hook systems get clear user-facing command input before execution.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, from); 2 external calls (assert_eq!, json!).
 
@@ -2781,26 +2799,24 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command()
 async fn build_post_tool_use_payload_uses_tool_output_wire_value()
 ```
 
-**Purpose**: Checks that the post-tool-use hook payload uses the tool output’s wire-format response value rather than reconstructing output from text bodies. This preserves the exact response intended for downstream hook consumers.
+**Purpose**: This test checks the message sent to post-use hooks after a shell command finishes. It verifies that the hook receives the tool output value meant for the wire format, which is the serialized value other parts of the system expect to see.
 
-**Data flow**: The test creates a function payload with a shell command, a `FunctionToolOutput` whose `post_tool_use_response` is `json!("shell output")`, a classic handler, and a full `ToolInvocation`. It then asserts that `post_tool_use_payload` returns a payload containing the hook tool name, the invocation call ID, the original command JSON as `tool_input`, and the wire response JSON as `tool_response`.
+**Data flow**: It builds a command payload and a fake successful tool output whose post-use response is the JSON string `shell output`. It then creates a handler, session, turn context, and tool invocation. When it asks for the post-tool-use payload, it expects a payload containing the hook name, the original call ID, the raw command as input, and the chosen output value as the response.
 
-**Call relations**: This test covers the handler’s post-execution hook path and complements the pre-tool-use payload test by validating output propagation.
+**Call relations**: This test sets up a full `ToolInvocation` and calls the handler’s post-use hook payload method. It shows how the shell command handler connects the original tool call with the final output value so hook code can observe what happened after execution.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, from, new, plain); 6 external calls (new, new, assert_eq!, json!, new, vec!).
 
 
 ### `core/src/tools/handlers/unified_exec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is a concentrated regression suite for the unified exec support code. It defines a reusable async helper, `invocation_for_payload`, that creates a realistic `ToolInvocation` with a fresh session/turn pair, cancellation token, diff tracker, tool name, source, and arbitrary payload. The tests then cover three broad areas.
+This is a test file, not production code. Its job is to prove that the unified exec handler behaves correctly in common and risky situations. The exec tool is the part of the system that turns a requested command, such as `echo hello`, into the actual shell invocation that will run on the machine. These tests check that it uses the user’s default shell when no shell is named, respects explicit shells like Bash, PowerShell, or Windows `cmd`, and refuses options that are not allowed by configuration, such as a login shell when login shells are disabled.
 
-First, command resolution: `get_command` is checked for default-shell behavior, explicit bash/powershell/cmd shell selection, rejection of `login: true` when login shells are disabled, and rejection of explicit `shell` in local `UnifiedExecShellMode::ZshFork`. The powershell test creates a temporary executable path so shell detection follows the same path-based logic as production.
+The file also tests a special local execution mode called `zsh-fork`, where commands must go through a controlled zsh-based path. In that mode, asking for a different shell is rejected. Remote environments are treated differently: even if local execution would use `zsh-fork`, remote execution falls back to direct mode.
 
-Second, environment shell-mode policy: `shell_mode_for_environment` must preserve the configured mode for local environments but force `UnifiedExecShellMode::Direct` for remote ones created with a websocket URL.
-
-Third, hook payload semantics: `ExecCommandHandler::pre_tool_use_payload` must expose the raw command as Bash input, `WriteStdinHandler::pre_tool_use_payload` must stay silent, and post-hook generation must emit only on terminal completion. The tests distinguish one-shot completion, interactive completion, still-running sessions (`process_id: Some(_)` yields `None`), and `write_stdin` completion where the output's original exec call id and command must be preserved even when multiple parallel sessions complete out of order.
+The second half checks hook payloads. A hook is a callback-like notification that lets other parts of the system see what command is about to run or what result came back. These tests make sure hooks receive the raw command before execution, receive completed output afterward, skip still-running interactive sessions, and keep parallel session metadata separate so one command’s output is not mistaken for another’s.
 
 #### Function details
 
@@ -2814,11 +2830,11 @@ async fn invocation_for_payload(
 ) -> ToolInvocation
 ```
 
-**Purpose**: Builds a realistic `ToolInvocation` fixture for a named tool, call id, and payload using a fresh test session and turn context.
+**Purpose**: This helper builds a realistic tool invocation for tests. It saves the tests from repeating all the session, turn, cancellation, tracking, tool name, and payload setup every time they need to call a handler.
 
-**Data flow**: It takes `tool_name`, `call_id`, and a `ToolPayload`, awaits `make_session_and_context()`, and returns a `ToolInvocation` populated with `session`, `turn`, a new cancellation token, a new `TurnDiffTracker` wrapped in `Arc<Mutex<_>>`, the provided ids, `ToolCallSource::Direct`, and the supplied payload.
+**Data flow**: It takes a tool name, a call id, and a tool payload. It creates a fresh test session and turn, adds a new cancellation token, a new diff tracker protected by a mutex (a lock that prevents overlapping access), and wraps the tool name in the project’s tool-name type. It returns a complete `ToolInvocation` that looks like one the real system would pass to a tool handler.
 
-**Call relations**: Several post-hook tests call this helper to avoid repeating session/turn setup. It is purely test scaffolding and does not participate in production execution.
+**Call relations**: Several post-tool-use tests call this helper before asking `ExecCommandHandler` or `WriteStdinHandler` to build hook output. It relies on `make_session_and_context` to supply a valid test session and uses small constructors such as `plain` and `new` to fill in the invocation fields.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, new, plain); called by 5 (exec_command_post_tool_use_payload_skips_running_sessions, exec_command_post_tool_use_payload_uses_output_for_interactive_completion, exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_shot_commands, write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separate, write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_command_on_completion); 3 external calls (new, new, new).
 
@@ -2829,11 +2845,11 @@ async fn invocation_for_payload(
 fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `get_command` falls back to the session's default user shell when no explicit `shell` argument is present.
+**Purpose**: This test proves that a command without a `shell` field still gets wrapped in a usable shell command. Without this behavior, a simple request like `echo hello` might not run consistently.
 
-**Data flow**: The test parses JSON containing only `cmd`, asserts `args.shell` is `None`, calls `get_command` with `default_user_shell()` and direct mode, then inspects the returned argv to confirm it has three elements and places the command string in the final slot.
+**Data flow**: It starts with JSON containing only `cmd`. After parsing, it checks that no explicit shell was supplied. It then resolves the command using the default user shell and direct execution mode, and confirms that the final command array contains the original text `echo hello` in the expected shell-command position.
 
-**Call relations**: This test directly exercises the `UnifiedExecShellMode::Direct` branch of `get_command` with no model-provided shell override.
+**Call relations**: During the test run, this function calls `default_user_shell` and creates shared shell data before checking the result with assertions. It exercises the command-building path used when callers leave shell choice to the system.
 
 *Call graph*: calls 1 internal fn (default_user_shell); 3 external calls (new, assert!, assert_eq!).
 
@@ -2844,11 +2860,11 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
 fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an explicit `/bin/bash` shell path is honored when resolving the command.
+**Purpose**: This test checks that when the caller asks for Bash explicitly, the command builder honors that request. It also guards against accidentally dropping the user’s command while adding shell-specific flags.
 
-**Data flow**: It parses JSON with `cmd` and `shell`, asserts the parsed shell string, calls `get_command`, and checks that the final argv element is the command. It also conditionally verifies PowerShell-style flags if the resolved argv contains `-Command`, covering platform-specific shell derivation behavior.
+**Data flow**: It feeds in JSON with `cmd` and `shell` set to `/bin/bash`. After parsing, it verifies that the shell value survived parsing, resolves the command, and checks that the final command still ends with `echo hello`. If the produced command looks like a PowerShell command, it also checks that the no-profile flag is present.
 
-**Call relations**: This test targets the explicit-shell path inside `get_command` and ensures model-provided shell selection overrides the session shell when direct mode allows it.
+**Call relations**: This test uses the default shell only as background context while focusing on an explicit shell request. Its assertions confirm that the command-building logic keeps the caller’s requested shell and command aligned.
 
 *Call graph*: calls 1 internal fn (default_user_shell); 3 external calls (new, assert!, assert_eq!).
 
@@ -2859,11 +2875,11 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()>
 fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()>
 ```
 
-**Purpose**: Confirms that a path resembling a PowerShell executable resolves to `ShellType::PowerShell` and produces the expected argv layout.
+**Purpose**: This test makes sure an explicit PowerShell executable is recognized as PowerShell, even when it is given as a path. That matters because PowerShell needs different command-line wrapping than Unix-style shells.
 
-**Data flow**: It creates a temporary directory and empty powershell executable file, serializes that path into JSON, parses `ExecCommandArgs`, calls `get_command`, then asserts the command string lands at index 2 and the returned `shell_type` is `ShellType::PowerShell`.
+**Data flow**: It creates a temporary fake PowerShell file, using a platform-appropriate name, then places that path into the JSON arguments. After parsing and command resolution, it checks that the shell path was preserved, the command text appears in the shell invocation, and the detected shell type is `PowerShell`.
 
-**Call relations**: This test exercises shell detection based on a model-provided executable path, validating the path-to-shell mapping used by `get_command`.
+**Call relations**: The test uses temporary file creation to make shell detection realistic without depending on a real system PowerShell location. It calls the same command-resolution path as production code, then uses assertions to verify the shell classification.
 
 *Call graph*: calls 1 internal fn (default_user_shell); 6 external calls (new, assert_eq!, cfg!, json!, write, tempdir).
 
@@ -2874,11 +2890,11 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()>
 fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that the literal `cmd` shell override is accepted and still places the command string in the expected argv position.
+**Purpose**: This test checks support for Windows `cmd` as an explicitly requested shell. It protects the command builder from treating `cmd` like an unknown or unsupported shell name.
 
-**Data flow**: It parses JSON with `shell: "cmd"`, asserts the parsed shell value, calls `get_command` in direct mode, and verifies `command[2] == "echo hello"`.
+**Data flow**: It parses JSON containing `cmd` and `shell: cmd`, verifies that the parsed shell is exactly `cmd`, resolves the command, and confirms that the requested command text appears in the resulting shell command array.
 
-**Call relations**: This covers another explicit-shell variant in `get_command`, ensuring Windows-style shell naming is accepted.
+**Call relations**: The test supplies the default user shell as context but expects the explicit `cmd` choice to take priority. Its assertions pin down the behavior for callers who request the Windows command shell by name.
 
 *Call graph*: calls 1 internal fn (default_user_shell); 2 external calls (new, assert_eq!).
 
@@ -2889,11 +2905,11 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()>
 fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures `get_command` rejects `login: true` when configuration forbids login shells.
+**Purpose**: This test confirms that the command builder refuses a login shell request when configuration says login shells are disabled. A login shell can load extra startup files, so allowing it accidentally could change behavior or bypass policy.
 
-**Data flow**: It parses JSON with `cmd` and `login: true`, calls `get_command` with `allow_login_shell` set to false, captures the error, and asserts the message mentions that login shells are disabled by config.
+**Data flow**: It parses JSON where `login` is set to true, then asks for command resolution with `allow_login_shell` set to false. Instead of a command, it expects an error message saying that login shells are disabled by config.
 
-**Call relations**: This test covers the early policy-validation branch in `get_command` before any shell resolution occurs.
+**Call relations**: This function exercises the failure branch of command resolution. It uses the default shell setup, then checks with an assertion that the rejection is clear and specific.
 
 *Call graph*: calls 1 internal fn (default_user_shell); 2 external calls (new, assert!).
 
@@ -2904,11 +2920,11 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
 fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that local zsh-fork mode forbids the model from specifying an explicit shell override.
+**Purpose**: This test makes sure callers cannot choose their own shell when local execution is configured for `zsh-fork` mode. In that mode, the system needs to use its controlled zsh path, so an explicit shell would conflict with the execution design.
 
-**Data flow**: It parses JSON with both `cmd` and `shell`, constructs a `UnifiedExecShellMode::ZshFork` using absolute test paths, calls `get_command`, expects an error, and asserts the message explains that `shell` is unsupported for local zsh-fork exec.
+**Data flow**: It parses a command that asks for `/bin/bash`, builds a `zsh-fork` shell-mode configuration with absolute paths for zsh and the exec wrapper, and tries to resolve the command. The expected output is an error explaining that `shell` is not supported for local zsh-fork execution.
 
-**Call relations**: This test targets the zsh-fork branch of `get_command`, specifically the guard that rejects `args.shell.is_some()`.
+**Call relations**: The test constructs the special shell mode using absolute-path helpers and the `ZshFork` configuration. It then verifies that command resolution rejects the incompatible explicit shell instead of silently ignoring or honoring it.
 
 *Call graph*: calls 2 internal fn (default_user_shell, from_absolute_path); 4 external calls (new, assert!, cfg!, ZshFork).
 
@@ -2919,11 +2935,11 @@ fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<
 async fn shell_mode_for_environment_uses_direct_mode_for_remote_environments() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that remote environments force direct shell mode while local environments preserve the configured mode.
+**Purpose**: This test checks that `zsh-fork` mode is used only for local environments, while remote environments use direct execution mode. That avoids trying to apply a local shell-wrapper setup to a remote exec server that may not have it.
 
-**Data flow**: It constructs a zsh-fork shell mode, creates both a local test environment and a remote one with a websocket URL, then asserts `shell_mode_for_environment` returns the original zsh-fork mode for local and `UnifiedExecShellMode::Direct` for remote.
+**Data flow**: It builds a `zsh-fork` shell-mode configuration, then creates one local test environment and one remote test environment with a remote exec server URL. It asks which shell mode should apply to each environment. The local environment keeps `zsh-fork`; the remote environment becomes `Direct`.
 
-**Call relations**: This test directly validates the environment-policy shim used by `ExecCommandHandler::handle_call` before command resolution.
+**Call relations**: This async test uses environment test constructors and absolute-path helpers, then compares the selected shell modes with assertions. It documents the handoff point where environment type changes execution strategy.
 
 *Call graph*: calls 3 internal fn (create_for_tests, default_for_tests, from_absolute_path); 3 external calls (assert_eq!, cfg!, ZshFork).
 
@@ -2934,11 +2950,11 @@ async fn shell_mode_for_environment_uses_direct_mode_for_remote_environments() -
 async fn exec_command_pre_tool_use_payload_uses_raw_command()
 ```
 
-**Purpose**: Verifies that `ExecCommandHandler` emits a Bash pre-hook payload containing the raw `cmd` string.
+**Purpose**: This test proves that before an exec command runs, the hook payload contains the user’s raw command text. That lets hook consumers inspect the actual requested command, not a rewritten shell wrapper.
 
-**Data flow**: It builds a function payload with `cmd`, creates a test session and turn, instantiates `ExecCommandHandler::default()`, and asserts that `pre_tool_use_payload` returns `Some(PreToolUsePayload)` with `tool_name: HookToolName::bash()` and `tool_input: {"command": ...}`.
+**Data flow**: It creates a function-style tool payload with `cmd: printf exec command`, builds a test session and turn, and asks the default exec command handler for its pre-tool-use payload. The expected result is a Bash-named hook payload whose input is `{ "command": "printf exec command" }`.
 
-**Call relations**: This test exercises the hook-facing `CoreToolRuntime` implementation for `exec_command`, specifically the pre-hook path.
+**Call relations**: The test builds the invocation inline using `make_session_and_context`, then calls `ExecCommandHandler`’s pre-hook method. The assertion shows what information is handed to the hook system before command execution begins.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, default); 2 external calls (assert_eq!, json!).
 
@@ -2949,11 +2965,11 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command()
 async fn exec_command_pre_tool_use_payload_skips_write_stdin()
 ```
 
-**Purpose**: Confirms that `WriteStdinHandler` does not emit a pre-hook payload.
+**Purpose**: This test confirms that `write_stdin` does not produce a pre-use hook payload. Writing characters into an already-running process is not the same as starting a new shell command, so there is no new raw command to announce.
 
-**Data flow**: It builds a `write_stdin`-style function payload, creates a test session and turn, instantiates `WriteStdinHandler`, and asserts `pre_tool_use_payload` returns `None`.
+**Data flow**: It creates a payload containing `chars`, builds a `write_stdin` invocation, and asks `WriteStdinHandler` for a pre-tool-use payload. The expected result is `None`, meaning no hook notification is produced before the write.
 
-**Call relations**: This test documents the design choice that stdin writes are transport for an existing exec session rather than a new Bash tool invocation.
+**Call relations**: The test uses `make_session_and_context` to form a realistic invocation, then checks that the write-stdin handler stays quiet at the pre-hook stage. This keeps hook behavior focused on command starts rather than every input write.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 2 external calls (assert_eq!, json!).
 
@@ -2964,11 +2980,11 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin()
 async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_shot_commands()
 ```
 
-**Purpose**: Checks that a completed noninteractive exec emits a Bash post-hook payload using the output's command and text.
+**Purpose**: This test checks that a completed non-interactive command produces a post-use hook payload containing its output. A one-shot command is expected to finish immediately, so its result can be reported to hook consumers.
 
-**Data flow**: It constructs an `exec_command` payload with `tty: false`, an `ExecCommandToolOutput` representing completed output (`process_id: None`, `exit_code: Some(0)`, `hook_command: Some(...)`), builds an invocation fixture, and asserts `post_tool_use_payload` returns a `PostToolUsePayload` keyed by the original call id with response text `"three"`.
+**Data flow**: It creates an exec payload for `echo three` with `tty` set to false, then creates a fake completed output object with raw bytes `three`, exit code 0, and the original hook command. After building a realistic invocation, it asks the exec handler for a post-tool-use payload. The result includes the original command and the text output `three`.
 
-**Call relations**: This test exercises `ExecCommandHandler::post_tool_use_payload` through the shared `post_unified_exec_tool_use_payload` helper on a terminal one-shot command.
+**Call relations**: This test calls `invocation_for_payload` to prepare the invocation, then hands both invocation and output to `ExecCommandHandler`. The assertion confirms that completed command output flows into the hook response.
 
 *Call graph*: calls 2 internal fn (default, invocation_for_payload); 3 external calls (assert_eq!, json!, from_millis).
 
@@ -2979,11 +2995,11 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
 async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completion()
 ```
 
-**Purpose**: Verifies that an interactive exec still emits a post-hook payload once the session has completed.
+**Purpose**: This test verifies that an interactive command also produces a post-use hook payload once it has completed. Interactive mode may keep a process open, but when there is an exit code and no running process id, the result should be reportable.
 
-**Data flow**: It mirrors the previous test but uses `tty: true` in the payload. The completed `ExecCommandToolOutput` again has `process_id: None`, and the assertion expects the same Bash post-hook structure keyed by the exec call id.
+**Data flow**: It builds an exec payload for `echo three` with `tty` set to true, then supplies fake output showing the command has finished: raw bytes `three`, exit code 0, and no process id. The handler turns that into a hook payload with the command and output text.
 
-**Call relations**: This covers the completion case for interactive sessions, showing that tty mode affects runtime behavior but not final post-hook emission once the process ends.
+**Call relations**: Like the non-interactive test, it uses `invocation_for_payload` and the default exec handler. It covers the completion path for interactive commands, proving that interactivity alone does not suppress hook reporting.
 
 *Call graph*: calls 2 internal fn (default, invocation_for_payload); 3 external calls (assert_eq!, json!, from_millis).
 
@@ -2994,11 +3010,11 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
 async fn exec_command_post_tool_use_payload_skips_running_sessions()
 ```
 
-**Purpose**: Ensures no post-hook payload is emitted while an exec session is still live.
+**Purpose**: This test makes sure the exec handler does not send a final post-use hook payload while an interactive session is still running. Reporting too early would make partial output look like the command’s final result.
 
-**Data flow**: It creates an `exec_command` payload and an `ExecCommandToolOutput` with `process_id: Some(45)` and no exit code, builds an invocation fixture, and asserts `post_tool_use_payload` returns `None`.
+**Data flow**: It creates an exec payload and a fake output object where `process_id` is present and `exit_code` is missing. That combination means the process is still alive. When passed to the handler, the result is `None`, so no completion hook is emitted.
 
-**Call relations**: This test validates the output-side completion check inside the shared post-hook helper path used by `ExecCommandHandler`.
+**Call relations**: The test gets a realistic invocation from `invocation_for_payload`, then checks the default exec handler’s decision. It protects the larger flow from confusing in-progress session output with completed command output.
 
 *Call graph*: calls 2 internal fn (default, invocation_for_payload); 3 external calls (assert_eq!, json!, from_millis).
 
@@ -3009,11 +3025,11 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions()
 async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_command_on_completion()
 ```
 
-**Purpose**: Checks that a final `write_stdin` poll emits the Bash post-hook for the original exec session rather than the `write_stdin` call itself.
+**Purpose**: This test checks that when `write_stdin` causes or observes an interactive command finishing, the post-use hook is tied back to the original exec command, not to the later stdin-write call. This keeps hook records attached to the command that actually ran.
 
-**Data flow**: It builds a `write_stdin` payload with empty `chars`, an `ExecCommandToolOutput` whose `event_call_id` and `hook_command` refer to the original exec, creates an invocation fixture for `write_stdin`, and asserts the resulting `PostToolUsePayload` uses `tool_use_id: "exec-call-45"`, the original command, and the final output text.
+**Data flow**: It builds a `write_stdin` payload for a session, then supplies completed output whose event call id is `exec-call-45` and whose hook command is `sleep 1; echo finished`. The write-stdin handler returns a post-use payload using that original exec call id, the original command, and the finished output text.
 
-**Call relations**: This test exercises `WriteStdinHandler::post_tool_use_payload` and demonstrates why it delegates to the shared unified-exec helper instead of using the current invocation metadata.
+**Call relations**: The test uses `invocation_for_payload` to represent the stdin write, then calls `WriteStdinHandler`’s post-hook method. It confirms that completion information is handed off under the original exec call identity.
 
 *Call graph*: calls 1 internal fn (invocation_for_payload); 3 external calls (assert_eq!, json!, from_millis).
 
@@ -3024,22 +3040,24 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
 async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separate()
 ```
 
-**Purpose**: Verifies that post-hook payload generation for concurrent `write_stdin` completions preserves each session's own exec metadata independently.
+**Purpose**: This test protects against mixing up metadata from two parallel interactive sessions. If two commands finish around the same time, each hook payload must keep its own command, call id, and output.
 
-**Data flow**: It creates one shared `write_stdin` payload, two distinct completed `ExecCommandToolOutput` values (`output_a` and `output_b`) with different `event_call_id`, `chunk_id`, output text, and `hook_command`, then builds separate invocation fixtures and collects the two `post_tool_use_payload` results. The final assertion checks that each payload carries the matching original exec call id and command rather than leaking metadata across sessions.
+**Data flow**: It creates one shared write-stdin-style payload and two separate completed outputs: one for an `alpha` command and one for a `beta` command. It builds separate invocations and asks the handler for post-use payloads in beta-then-alpha order. The returned payloads preserve each output’s own exec call id, command text, and response text.
 
-**Call relations**: This test guards against accidental cross-session state reuse in the shared post-hook helper path used by `WriteStdinHandler`.
+**Call relations**: This test calls `invocation_for_payload` twice and then uses `WriteStdinHandler` for both outputs. The final assertion shows that the handler follows the metadata carried by each output rather than relying on shared or stale session state.
 
 *Call graph*: calls 1 internal fn (invocation_for_payload); 3 external calls (assert_eq!, json!, from_millis).
 
 
 ### `core/src/tools/hosted_spec_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module exercises the conversion logic in `hosted_spec.rs` with concrete protocol values and exact equality assertions. It imports the production helpers through `super::*` and constructs realistic `WebSearchConfig` payloads using protocol-layer types such as `WebSearchFilters`, `WebSearchUserLocation`, `WebSearchUserLocationType`, and `WebSearchContextSize`. The expected outputs are compared against `codex_tools` response-facing structs like `ResponsesApiWebSearchFilters` and `ResponsesApiWebSearchUserLocation`, ensuring the `Into` conversions in production code preserve field values exactly.
+This is a test file. Its job is to make sure the code that creates tool specifications keeps producing the exact shapes the rest of the system expects. A tool specification is a structured description of a capability, such as “generate an image as PNG” or “search the web with these limits.” If these descriptions are wrong, the external service receiving them may misunderstand what the app wants, ignore important settings, or enable a tool that should be off.
 
-The first test confirms that image generation simply wraps the requested format string into `ToolSpec::ImageGeneration`. The second is the most comprehensive: it uses `WebSearchMode::Live`, a full config object, and `WebSearchToolType::TextAndImage`, then asserts that the resulting `ToolSpec::WebSearch` contains `external_web_access: Some(true)`, cloned filter and location data, the configured low context size, and the two-element content-type vector. The final test checks the important absence invariant: when mode is `Disabled`, `create_web_search_tool` must return `None` rather than a partially populated tool spec. Together these tests document the intended distinction between “configured search tool” and “no search tool exposed.”
+The tests cover three important promises. First, when the project asks for an image generation tool with a given output format, that format is preserved. Second, when web search is enabled with detailed options, those options are carried through: allowed domains, approximate user location, search context size, and whether the search should include text and images. Third, when web search is disabled, no web search tool is produced at all.
+
+You can think of these tests like checking a shipping label before a package leaves the warehouse. The package may contain complex instructions, but the test only cares that the label says exactly what it should say.
 
 #### Function details
 
@@ -3049,11 +3067,11 @@ The first test confirms that image generation simply wraps the requested format 
 fn image_generation_tool_matches_expected_spec()
 ```
 
-**Purpose**: Checks that image-generation spec creation preserves the requested output format exactly. It serves as a regression test for the simplest hosted-spec constructor.
+**Purpose**: This test makes sure that creating an image generation tool keeps the requested image format. It protects against accidentally changing the tool description sent for image generation.
 
-**Data flow**: Calls `create_image_generation_tool("png")` → compares the returned `ToolSpec` against a literal `ToolSpec::ImageGeneration { output_format: "png".to_string() }` using `assert_eq!` → produces no return value beyond test success/failure.
+**Data flow**: It starts with the input format "png". The test asks the tool-building code to create an image generation specification, then compares the result with the expected specification that contains the same "png" format. Nothing is changed outside the test; it either passes or fails.
 
-**Call relations**: This test directly exercises the production helper in isolation. Its only downstream action is the equality assertion that fails the test if the constructor changes shape or ownership semantics.
+**Call relations**: During the test run, the test framework calls this function. Inside it, the generated tool specification is checked with an equality assertion so any mismatch is reported immediately.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3064,11 +3082,11 @@ fn image_generation_tool_matches_expected_spec()
 fn web_search_tool_preserves_configured_options()
 ```
 
-**Purpose**: Verifies that live web-search mode plus a populated `WebSearchConfig` becomes a `ToolSpec::WebSearch` with all fields preserved and converted correctly. It specifically covers filters, user location, context size, and text-plus-image content types.
+**Purpose**: This test makes sure that web search settings are not lost or altered when the web search tool specification is created. It verifies the enabled mode, allowed domain filter, user location, context size, and requested content types.
 
-**Data flow**: Constructs `WebSearchToolOptions` with `web_search_mode: Some(WebSearchMode::Live)`, a borrowed `WebSearchConfig`, and `WebSearchToolType::TextAndImage` → calls `create_web_search_tool(...)` → compares the `Option<ToolSpec>` result to `Some(ToolSpec::WebSearch { ... })` containing the expected converted nested structs and content-type vector.
+**Data flow**: It builds a set of web search options: live search is enabled, only example.com is allowed, the user location is approximately in the US with a Los Angeles time zone, the search context size is low, and both text and image search are requested. The tool-building code turns those options into a web search specification. The test compares that output with the exact expected structure.
 
-**Call relations**: This test drives the main branch of the production web-search builder where the tool is emitted. It validates the full translation path, including the nested `Into` conversions that the production function performs before returning.
+**Call relations**: The test framework calls this during the test suite. The function relies on an equality assertion to confirm that the tool builder passes configuration through to the final API-facing shape without dropping or rewriting important fields.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3079,11 +3097,11 @@ fn web_search_tool_preserves_configured_options()
 fn web_search_tool_is_absent_when_disabled()
 ```
 
-**Purpose**: Confirms that disabled web-search mode suppresses the tool entirely. This protects the early-return behavior that distinguishes disabled search from an enabled tool with empty options.
+**Purpose**: This test confirms that disabling web search really removes the web search tool. It prevents a serious mistake where web access could remain available even after configuration says it should be off.
 
-**Data flow**: Builds `WebSearchToolOptions` with `web_search_mode: Some(WebSearchMode::Disabled)`, no config, and `WebSearchToolType::Text` → calls `create_web_search_tool(...)` → asserts that the result is `None`.
+**Data flow**: It starts with web search options where the mode is set to disabled and no extra web search configuration is supplied. The tool-building code is asked to create a web search tool. The expected result is no tool at all, represented by `None`, and the test checks for that result.
 
-**Call relations**: This test covers the short-circuit branch in the production function. It ensures callers that assemble hosted tool lists can rely on `None` to mean “do not advertise web search.”
+**Call relations**: The test framework runs this function as part of the test suite. It uses an equality assertion to verify that the disabled setting stops the web search tool from being produced.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3093,13 +3111,13 @@ This group moves from tool result shaping into registry dispatch, router behavio
 
 ### `core/src/tools/context_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This test file validates the behavior implemented in `context.rs`. Several tests focus on `FunctionToolOutput` and `function_tool_response`: custom payloads must round-trip as `ResponseInputItem::CustomToolCallOutput`, ordinary function payloads must remain `FunctionCallOutput`, and structured content items must preserve images while still deriving plain text from text segments. `ToolSearchOutput` is similarly checked to ensure it serializes as a `ToolSearchOutput` item with `status = "completed"` and `execution = "client"`.
+This is a test file for the tool-output layer. In this project, tools can be ordinary function calls, custom tools, command execution, MCP tools (tools reached through the Model Context Protocol, a standard way for models to call outside tools), or tool-search results. Each of those produces output in a slightly different shape, and that output must be converted back into response items the model can read.
 
-A second cluster of tests covers `McpToolOutput`. They verify that code-mode serialization returns the raw `CallToolResult`, while model-facing response items prepend a wall-time header, preserve content items for image outputs, sanitize image detail defaults, and truncate large structured content instead of leaking oversized payloads. This distinction between raw code-mode JSON and truncated model-facing payloads is one of the file's key invariants.
+The tests act like a checklist at the border between internal tool code and the outside conversation format. They create small fake outputs, convert them into response items, and then check that the result has the right kind, call id, success flag, text body, images, JSON content, and truncation notice. This matters because a small formatting mistake could make the model see the wrong result, lose an image, miss an error, or receive an output that is too large.
 
-The remaining tests cover utility behavior: `telemetry_preview` must return short content unchanged, truncate by bytes and by lines with the standard notice, and `ExecCommandToolOutput` must format a response containing chunk id, wall time, exit code, original token count, and a truncation marker when token-limited. Together these tests act as regression coverage for many protocol-shaping edge cases that are easy to break silently.
+A recurring theme is choosing the right representation. Plain text should stay plain text. Content items, such as text plus images, should not be flattened in a way that loses the image. MCP results should include useful timing information for normal conversation mode, but code-mode results should stay as raw structured JSON. Large outputs are shortened with a clear notice, like a receipt that says some pages were omitted.
 
 #### Function details
 
@@ -3109,11 +3127,11 @@ The remaining tests cover utility behavior: `telemetry_preview` must return shor
 fn custom_tool_calls_should_roundtrip_as_custom_outputs()
 ```
 
-**Purpose**: Verifies that a `FunctionToolOutput` generated from a custom payload becomes `ResponseInputItem::CustomToolCallOutput` rather than a normal function output. It also checks that a single text item is collapsed into plain text body form.
+**Purpose**: This test makes sure a result from a custom tool comes back as a custom-tool output, not as an ordinary function output. It protects the distinction between different tool families.
 
-**Data flow**: Builds `ToolPayload::Custom { input: "patch" }` and `FunctionToolOutput::from_text("patched", Some(true))` → calls `to_response_item("call-42", &payload)` → pattern matches the response and asserts `call_id`, absence of content items, text body, and success flag.
+**Data flow**: It starts with a custom-tool payload and a text result saying "patched" with success set to true. The result is converted into a response item. The test then checks that the response still has the same call id, carries the text body, has no separate content items, and keeps the success value.
 
-**Call relations**: This test exercises `FunctionToolOutput::from_text` and the downstream response conversion path in `context.rs`. It specifically validates the custom-payload branch inside `function_tool_response`.
+**Call relations**: During the test run, the Rust test harness calls this test. The test uses the normal text-output constructor and then exercises the response conversion path, with assertions acting as the guardrails for the expected shape.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (assert_eq!, panic!).
 
@@ -3124,11 +3142,11 @@ fn custom_tool_calls_should_roundtrip_as_custom_outputs()
 fn function_payloads_remain_function_outputs()
 ```
 
-**Purpose**: Checks that ordinary function payloads are serialized as `FunctionCallOutput`, not custom outputs. It confirms the payload kind controls the protocol wrapper.
+**Purpose**: This test confirms that ordinary function-call payloads are returned as ordinary function-call outputs. It prevents custom-tool behavior from accidentally leaking into the function-call path.
 
-**Data flow**: Creates `ToolPayload::Function { arguments: "{}" }` and a text `FunctionToolOutput` → converts it with `to_response_item("fn-1", &payload)` → matches `ResponseInputItem::FunctionCallOutput` and asserts call id, text body, no content items, and success.
+**Data flow**: It builds a function payload with empty JSON arguments and a simple text output of "ok". After conversion to a response item, it checks that the output is tied to the same call id, contains the same text, has no extra content-item list, and is marked successful.
 
-**Call relations**: This test complements the custom-output test by covering the non-custom branch of `function_tool_response`. It uses `FunctionToolOutput::from_text` as the input constructor.
+**Call relations**: The test harness runs this as part of the tool context tests. It follows the same conversion route real function tool results use before they are sent back to the model.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (assert_eq!, panic!).
 
@@ -3139,11 +3157,11 @@ fn function_payloads_remain_function_outputs()
 fn mcp_code_mode_result_serializes_full_call_tool_result()
 ```
 
-**Purpose**: Ensures MCP code-mode serialization returns the full raw `CallToolResult` structure, including structured content and metadata fields. It guards against accidental reuse of the model-facing truncated/textual payload path.
+**Purpose**: This test verifies that an MCP tool result used in code mode keeps the full raw tool result as JSON. Code mode needs the structured data, not just a simplified text summary.
 
-**Data flow**: Constructs a `CallToolResult` with `content`, `structured_content`, `is_error`, and `meta` → calls `output.code_mode_result(&ToolPayload::Function { ... })` → asserts exact JSON equality with the expected serialized object.
+**Data flow**: It creates a fake MCP result with text content, structured content, an error flag, and metadata. It asks for the code-mode result and checks that the output JSON includes all of those pieces under the expected field names.
 
-**Call relations**: This test targets `McpToolOutput::code_mode_result` behavior from `context.rs`. It verifies that code mode sees raw serialized MCP data rather than `response_payload()` output.
+**Call relations**: The test is run by the test harness and focuses on the code-mode serialization path for MCP results. It makes sure the conversion hands forward the complete MCP result instead of trimming it down for display.
 
 *Call graph*: 3 external calls (assert_eq!, json!, vec!).
 
@@ -3154,11 +3172,11 @@ fn mcp_code_mode_result_serializes_full_call_tool_result()
 fn mcp_tool_output_response_item_includes_wall_time()
 ```
 
-**Purpose**: Checks that model-facing MCP response items prepend a wall-time header and serialize content into the output body text. It confirms the visible payload format expected by the model/history layer.
+**Purpose**: This test checks that normal MCP tool output includes how long the tool took. That timing header gives the model and logs useful context about the tool call.
 
-**Data flow**: Builds an `McpToolOutput` with a simple text `CallToolResult`, empty tool input, 1250 ms wall time, and byte truncation policy → calls `to_response_item("mcp-call-1", &ToolPayload::Function { ... })` → matches `FunctionCallOutput`, extracts body text, strips the expected wall-time prefix, parses the remainder as JSON, and asserts the serialized content array.
+**Data flow**: It builds an MCP output with one text content item, a 1.25 second wall time, and a byte limit. After converting it into a response item, it checks the call id and success flag, then reads the text body and confirms it starts with a wall-time header followed by JSON output.
 
-**Call relations**: This test exercises `McpToolOutput::to_response_item` and, indirectly, `response_payload`. It validates the wall-time header insertion path for text bodies.
+**Call relations**: The test harness calls this test to exercise the normal response-item path for MCP tool output. The path formats timing information, serializes the MCP content, and hands that formatted text into a function-call output.
 
 *Call graph*: 7 external calls (assert_eq!, json!, panic!, Bytes, from_str, from_millis, vec!).
 
@@ -3169,11 +3187,11 @@ fn mcp_tool_output_response_item_includes_wall_time()
 fn mcp_tool_output_response_item_truncates_large_structured_content()
 ```
 
-**Purpose**: Verifies that large MCP structured content is truncated in the model-facing response item and that fallback text content is not used when structured content is present. It protects the truncation and content-selection behavior of MCP formatting.
+**Purpose**: This test makes sure very large structured MCP output is shortened before it is put into a normal response item. That prevents oversized tool results from flooding the model context.
 
-**Data flow**: Creates an `McpToolOutput` whose `CallToolResult` has large `structured_content`, ignored text content, and a small byte truncation policy → converts it to a response item → extracts body text and asserts it starts with the wall-time header, contains a truncation marker, and does not contain the ignored text string.
+**Data flow**: It creates an MCP result with large structured content and a small byte limit. After conversion, it checks that the text starts with the wall-time header, includes a clear truncation notice, and does not include the fallback plain content that should be ignored when structured content exists.
 
-**Call relations**: This test targets `McpToolOutput::response_payload` via `to_response_item`. It specifically covers the truncation path after payload construction.
+**Call relations**: The test harness runs this against the MCP formatting path used for normal conversation responses. It verifies that the truncation policy is applied before the result is handed back as a function-call output.
 
 *Call graph*: 8 external calls (assert!, assert_eq!, json!, panic!, Bytes, json!, from_millis, vec!).
 
@@ -3184,11 +3202,11 @@ fn mcp_tool_output_response_item_truncates_large_structured_content()
 fn mcp_tool_output_response_item_preserves_content_items()
 ```
 
-**Purpose**: Ensures that MCP image outputs remain structured content items in the response payload instead of being flattened into JSON text. It also checks that missing image detail is defaulted.
+**Purpose**: This test confirms that MCP output containing an image stays as content items instead of being reduced to plain text. This matters because flattening the result would lose the image.
 
-**Data flow**: Builds an `McpToolOutput` with image content, 500 ms wall time, and no original-image-detail support → converts it to a response item → matches `FunctionCallOutput` and asserts `output.content_items()` equals a header text item followed by an `InputImage` item with `detail: Some(DEFAULT_IMAGE_DETAIL)`; also asserts `body.to_text()` only contains the header text.
+**Data flow**: It creates an MCP result whose content is an image encoded as data. Conversion produces a response item with a text timing header plus an image item. The test checks both the structured content-item list and the plain text body derived from the text part.
 
-**Call relations**: This test exercises the content-item branch of `McpToolOutput::response_payload`, including image-detail sanitization/defaulting behavior from the protocol conversion path.
+**Call relations**: The test harness calls this when checking MCP response formatting. It exercises the branch that turns MCP media content into model-readable content items, while still keeping a text header for preview or fallback use.
 
 *Call graph*: 6 external calls (assert_eq!, json!, panic!, Bytes, from_millis, vec!).
 
@@ -3199,11 +3217,11 @@ fn mcp_tool_output_response_item_preserves_content_items()
 fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result()
 ```
 
-**Purpose**: Confirms that code-mode MCP results are not truncated even when the model-facing truncation policy is very small. It separates machine-readable runtime output from conversation-history formatting.
+**Purpose**: This test ensures that code-mode MCP output is not shortened or reformatted into the normal chat-style response. Code mode should receive the raw structured result even when it is large.
 
-**Data flow**: Creates an `McpToolOutput` with large structured content and a tiny byte truncation policy → calls `code_mode_result` → asserts the returned JSON still contains the full large structured content.
+**Data flow**: It builds an MCP result with large structured content and a very small truncation limit. Instead of converting it to a response item, it asks for the code-mode result and checks that the full original structured content is still present.
 
-**Call relations**: This test directly validates `McpToolOutput::code_mode_result`. It complements the truncation test for `to_response_item` by proving the two paths intentionally diverge.
+**Call relations**: The test harness runs this to protect the separate code-mode path. It shows that truncation used for normal responses does not affect the raw JSON handed to code-mode consumers.
 
 *Call graph*: 6 external calls (assert_eq!, json!, Bytes, json!, from_millis, vec!).
 
@@ -3214,11 +3232,11 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result()
 fn custom_tool_calls_can_derive_text_from_content_items()
 ```
 
-**Purpose**: Checks that custom tool outputs built from mixed content items preserve those items while still deriving plain text from text segments. It validates both structured and textual views of the same payload.
+**Purpose**: This test checks that a custom-tool output made from content items can still provide useful plain text. Text parts are combined, while non-text parts such as images are preserved separately.
 
-**Data flow**: Creates a custom payload and a `FunctionToolOutput::from_content(...)` containing text-image-text items → converts to a response item → matches `CustomToolCallOutput` and asserts call id, exact content items, derived `body.to_text()` of `"line 1\nline 2"`, and success.
+**Data flow**: It creates content containing text, an image, and more text, then converts it as a custom-tool output. The test checks that the response keeps the full content-item list, derives the plain text as "line 1\nline 2", keeps the call id, and preserves success.
 
-**Call relations**: This test exercises `FunctionToolOutput::from_content` and the custom-output branch of `function_tool_response`. It specifically covers mixed content-item handling.
+**Call relations**: The test harness calls this to exercise content-based output construction. It connects the content-item storage path with the response conversion path, proving that both rich content and plain-text fallback survive.
 
 *Call graph*: calls 1 internal fn (from_content); 3 external calls (assert_eq!, panic!, vec!).
 
@@ -3229,11 +3247,11 @@ fn custom_tool_calls_can_derive_text_from_content_items()
 fn tool_search_payloads_roundtrip_as_tool_search_outputs()
 ```
 
-**Purpose**: Verifies that tool-search payloads serialize into the dedicated `ToolSearchOutput` protocol item with the expected metadata and serialized tool list. It protects the non-function response path.
+**Purpose**: This test verifies that a tool-search request produces a tool-search response, including the found tool descriptions. Tool search is how the system can tell the model what tools are available to load or use.
 
-**Data flow**: Builds `ToolPayload::ToolSearch` with `SearchToolCallParams`, constructs a `ToolSearchOutput` containing one `LoadableToolSpec::Function`, converts it with `to_response_item("search-1", &payload)`, and asserts the resulting `ToolSearchOutput` fields and serialized tool JSON.
+**Data flow**: It starts with a search payload asking for calendar tools and a fake search result containing one function tool named "create_event". After conversion, it checks that the response has the right call id, completed status, client execution label, and serialized tool definition.
 
-**Call relations**: This test targets `ToolSearchOutput::to_response_item` in `context.rs`. It ensures tool-search results do not accidentally flow through function-output formatting.
+**Call relations**: The test harness runs this to cover the tool-search conversion path. It makes sure search results are handed back in the special search-output format rather than being mistaken for ordinary function output.
 
 *Call graph*: 3 external calls (assert_eq!, panic!, vec!).
 
@@ -3244,11 +3262,11 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs()
 fn log_preview_uses_content_items_when_plain_text_is_missing()
 ```
 
-**Purpose**: Checks that `FunctionToolOutput::log_preview` derives preview text from content items rather than requiring a plain-text body variant. It guards the preview path for structured outputs.
+**Purpose**: This test checks that logs can still show a readable preview when an output was built from content items instead of plain text. It keeps logs useful even for richer output formats.
 
-**Data flow**: Creates a `FunctionToolOutput::from_content` with one text content item → calls `log_preview()` and `function_call_output_content_items_to_text(&output.body)` → asserts both yield `"preview"`.
+**Data flow**: It creates a content-based output containing one text item. The test asks for the log preview and also directly converts the content items to text, confirming both produce "preview".
 
-**Call relations**: This test exercises `FunctionToolOutput::from_content` and `FunctionToolOutput::log_preview`. It confirms the preview path uses content-item text extraction.
+**Call relations**: The test harness calls this to cover the preview path used for logging or telemetry. It ties the content-item representation to the helper that extracts readable text from it.
 
 *Call graph*: calls 1 internal fn (from_content); 2 external calls (assert_eq!, vec!).
 
@@ -3259,11 +3277,11 @@ fn log_preview_uses_content_items_when_plain_text_is_missing()
 fn telemetry_preview_returns_original_within_limits()
 ```
 
-**Purpose**: Verifies that short content is returned unchanged by `telemetry_preview`. It covers the no-truncation fast path.
+**Purpose**: This test confirms that short telemetry previews are left unchanged. Telemetry here means small diagnostic data recorded for observing system behavior.
 
-**Data flow**: Defines `content = "short output"` → calls `telemetry_preview(content)` → asserts equality with the original string.
+**Data flow**: It passes a short string into the preview function. Because the string is already within the allowed size, the same string comes back.
 
-**Call relations**: This test directly targets the utility function `telemetry_preview` in `context.rs`. It validates the branch where neither byte nor line limits are exceeded.
+**Call relations**: The test harness runs this as the simplest case for telemetry previewing. It protects the rule that truncation should only happen when it is actually needed.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3274,11 +3292,11 @@ fn telemetry_preview_returns_original_within_limits()
 fn telemetry_preview_truncates_by_bytes()
 ```
 
-**Purpose**: Checks that `telemetry_preview` truncates oversized content by byte limit and appends the standard truncation notice. It protects the UTF-8-safe byte-boundary truncation behavior.
+**Purpose**: This test makes sure telemetry previews are shortened when they exceed the byte limit. A byte is a unit of stored text size, so this protects logs from growing too large.
 
-**Data flow**: Creates a string longer than `TELEMETRY_PREVIEW_MAX_BYTES` → calls `telemetry_preview(&content)` → asserts the preview contains `TELEMETRY_PREVIEW_TRUNCATION_NOTICE` and does not exceed the expected bounded length envelope.
+**Data flow**: It creates a string longer than the maximum preview byte count and sends it through the preview function. The returned preview must contain a truncation notice and stay within the expected maximum size plus that notice.
 
-**Call relations**: This test directly exercises the byte-truncation branch of `telemetry_preview`.
+**Call relations**: The test harness calls this to check the byte-size limit in the telemetry preview helper. It verifies that oversized data is reduced before it would be recorded.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3289,11 +3307,11 @@ fn telemetry_preview_truncates_by_bytes()
 fn telemetry_preview_truncates_by_lines()
 ```
 
-**Purpose**: Checks that `telemetry_preview` truncates after the configured maximum number of lines and appends the truncation notice as the final line. It covers the line-count truncation branch independently of byte limits.
+**Purpose**: This test checks that telemetry previews are also shortened when they have too many lines. This keeps multi-line output from taking over diagnostics.
 
-**Data flow**: Builds a multi-line string with more than `TELEMETRY_PREVIEW_MAX_LINES` lines → calls `telemetry_preview(&content)` → splits the preview into lines and asserts the line count is bounded and the last line is the truncation notice.
+**Data flow**: It builds text with more lines than allowed and passes it to the preview function. The result must have no more than the allowed number of content lines plus a final truncation notice.
 
-**Call relations**: This test directly targets the line-truncation logic in `telemetry_preview`.
+**Call relations**: The test harness runs this alongside the byte-limit test. Together they prove the preview helper controls both width by size and height by line count.
 
 *Call graph*: 2 external calls (assert!, assert_eq!).
 
@@ -3304,24 +3322,24 @@ fn telemetry_preview_truncates_by_lines()
 fn exec_command_tool_output_formats_truncated_response()
 ```
 
-**Purpose**: Verifies that exec-command outputs format a structured text response containing metadata and a truncation marker when `max_output_tokens` is small. It protects the human-readable exec summary contract.
+**Purpose**: This test verifies the user-facing format for command execution output when the output has been shortened. It checks that important command details are still shown.
 
-**Data flow**: Constructs an `ExecCommandToolOutput` with chunk id, wall time, raw output bytes, token truncation policy, `max_output_tokens = Some(4)`, exit code, and original token count → converts it to a response item → extracts body text and asserts it matches a regex containing chunk id, wall time, exit code, original token count, `Output:`, and a `tokens truncated` marker.
+**Data flow**: It builds a fake command result with a chunk id, wall time, exit code, original token count, raw output, and a maximum output-token limit. After conversion, it checks that the response is successful and that the text includes the chunk id, timing, exit code, original token count, output section, and a truncation message.
 
-**Call relations**: This test exercises `ExecCommandToolOutput::to_response_item` and, indirectly, `response_text`, `model_output_max_tokens`, and `truncated_output` from `context.rs`.
+**Call relations**: The test harness calls this to exercise the command-output response path. The conversion formats process details and truncated output into the function-call response that the model would read after running a command.
 
 *Call graph*: 5 external calls (assert_eq!, assert_regex_match, panic!, Tokens, from_millis).
 
 
 ### `core/src/tools/registry_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is a focused test module for the core tool registry and related tool-runtime defaults. It defines two minimal executor implementations: `TestHandler`, which always returns a successful `FunctionToolOutput` containing text `"ok"`, and `LifecycleTestHandler`, which can either return a success payload with a configurable `success` flag or fail with `FunctionCallError::RespondToModel("handler failed")`. Both implement `CoreToolRuntime`, allowing the tests to exercise the same trait-default behavior used by production handlers.
+The tool registry is like a front desk for tools. When the model asks to use a tool, the registry must find the right tool, pass it the request, shape the information sent to hooks, and report whether the tool started and finished successfully. If this went wrong, a namespaced tool could be confused with another tool, hooks could see the wrong input, or extensions would miss important lifecycle events.
 
-A shared `test_spec` helper constructs a `codex_tools::ToolSpec::Function` with a default JSON schema, so tests can register synthetic tools without unrelated setup. For lifecycle assertions, the file introduces `RecordedToolLifecycle` and `ToolLifecycleRecorder`, which capture `Start` and `Finish` events into an `Arc<Mutex<Vec<_>>>`, explicitly tolerating poisoned mutexes by recovering the inner value.
+This test file builds simple stand-in tool handlers. `TestHandler` always returns an "ok" result. `LifecycleTestHandler` can either return success-like output or fail on purpose. `ToolLifecycleRecorder` records start and finish notifications into a shared list, so tests can later check the exact order and content of those notifications.
 
-The tests cover several distinct invariants: registry lookup must distinguish plain and namespaced aliases exactly; default hook payload generation for function tools must parse JSON arguments, normalize empty argument strings to `{}`, and rewrite namespaced `functions.` names into hook-facing names like `functions.echo`; special tools such as `spawn_agent`, code-mode wait, and write-stdin intentionally suppress or normalize default hook payloads; `PostToolUseFeedbackOutput` must preserve typed code-mode results while exposing model-visible text to response conversion; and registry dispatch must notify extension lifecycle contributors on both success and failure, with the finish outcome reflecting either `Completed { success }` or `Failed { handler_executed: true }`. The `test_invocation` helper centralizes construction of realistic `ToolInvocation` values with session, turn, cancellation token, and diff tracker state.
+The tests cover several important edge cases. They verify that plain tool names and namespaced tool names are looked up separately. They check that function-style tools expose sensible default payloads to pre-use and post-use hooks, including rewritten hook input. They make sure special tools such as code-mode waiting and writing to standard input do not expose default hook payloads when they should not. They also confirm that post-hook feedback can be shown to the model while preserving the original typed result for code mode. Finally, they test that lifecycle contributors are notified when a tool starts and when it finishes, including failures.
 
 #### Function details
 
@@ -3331,11 +3349,11 @@ The tests cover several distinct invariants: registry lookup must distinguish pl
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the configured `codex_tools::ToolName` for the synthetic test executor. It gives the registry and hook-default logic a stable identity to inspect.
+**Purpose**: Returns the fake tool's name. Tests use this so the fake handler behaves like a real tool that can tell the registry what it is called.
 
-**Data flow**: Reads `self.tool_name` and clones it, producing an owned `ToolName` return value. It does not mutate handler state or any external state.
+**Data flow**: It reads the stored tool name from the `TestHandler`, makes a copy of it, and returns that copy. Nothing else is changed.
 
-**Call relations**: This trait method is invoked wherever the runtime needs the handler’s declared name, including tests that build invocations from a handler-derived tool name and registry logic that compares registered names.
+**Call relations**: This is part of the `ToolExecutor` interface used by registry code and tests. When a test or registry path needs the handler's identity, this method supplies the name without exposing the handler's internal storage.
 
 *Call graph*: 1 external calls (clone).
 
@@ -3346,11 +3364,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Builds the test tool’s function specification from the handler’s name. The returned spec is intentionally minimal but structurally valid for registry use.
+**Purpose**: Builds a basic tool description for the fake tool. A tool description tells the surrounding system what the tool is called and what kind of input shape it accepts.
 
-**Data flow**: Reads `self.tool_name` by reference and passes it to `test_spec`, which constructs a `ToolSpec::Function` with description, non-strict mode, default parameters schema, and no output schema. Returns that spec without side effects.
+**Data flow**: It reads the handler's stored tool name, passes it to `test_spec`, and returns the simple tool specification that helper creates.
 
-**Call relations**: Used through the `ToolExecutor` trait when the registry or surrounding tool infrastructure asks the handler for its advertised schema; it delegates all construction details to `test_spec`.
+**Call relations**: This method lets `TestHandler` satisfy the same interface as real tools. It hands off the actual construction work to `test_spec` so all fake tools in this file share the same simple specification format.
 
 *Call graph*: calls 1 internal fn (test_spec).
 
@@ -3361,11 +3379,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Implements a trivial successful tool execution for tests. Regardless of invocation contents, it returns a boxed `FunctionToolOutput` containing text `"ok"` and `success = Some(true)`.
+**Purpose**: Pretends to run a tool and always produces a successful text result of `ok`. This gives tests a dependable tool result without doing any real work.
 
-**Data flow**: Accepts a `ToolInvocation` but ignores it. It creates an async future that constructs `FunctionToolOutput::from_text("ok", Some(true))`, boxes it as `Box<dyn ToolOutput>`, wraps it in `Ok`, and returns the pinned future.
+**Data flow**: It receives a tool invocation but ignores its contents. It creates an asynchronous result containing a text output marked as successful, boxes it behind the common tool-output interface, and returns it as a future.
 
-**Call relations**: This is the execution path used when tests dispatch a `TestHandler` through the registry or inspect generic runtime defaults around function tools. It is the simplest concrete executor in the file and does not delegate further.
+**Call relations**: Registry dispatch can call this just like it would call a real tool handler. The returned output is then used by tests that care about hook payloads, response conversion, or dispatch behavior rather than the tool's actual job.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (new, pin).
 
@@ -3376,11 +3394,11 @@ fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the configured tool name for the lifecycle-focused test executor. It allows lifecycle records to include the exact tool identity under test.
+**Purpose**: Returns the name of the lifecycle test tool. This lets the registry identify which fake lifecycle handler is being run.
 
-**Data flow**: Clones `self.tool_name` and returns the clone. No mutation or external output occurs.
+**Data flow**: It reads the stored tool name, clones it, and returns the clone. The handler itself is not changed.
 
-**Call relations**: Called by registry/runtime code that needs the executor’s declared name while dispatching lifecycle test tools.
+**Call relations**: This is the lifecycle-focused version of the normal tool-name method. Registry and test setup code can treat this fake handler as a normal tool because it provides the expected identity method.
 
 *Call graph*: 1 external calls (clone).
 
@@ -3391,11 +3409,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Produces the same minimal function-tool spec shape used by the simpler test handler. This keeps lifecycle tests focused on dispatch outcomes rather than schema differences.
+**Purpose**: Builds a simple tool description for a lifecycle test handler. The description is only detailed enough for registry tests.
 
-**Data flow**: Borrows `self.tool_name`, forwards it to `test_spec`, and returns the resulting `ToolSpec`. It does not read or alter `self.result`.
+**Data flow**: It takes the handler's stored tool name, sends it to `test_spec`, and returns the resulting generic function-tool specification.
 
-**Call relations**: Invoked through the `ToolExecutor` trait when the lifecycle test handlers are registered or inspected; it delegates spec construction to the shared helper.
+**Call relations**: Like `TestHandler::spec`, this keeps test tool setup consistent. It relies on `test_spec` so lifecycle tests do not need to repeat the same specification-building code.
 
 *Call graph*: calls 1 internal fn (test_spec).
 
@@ -3406,11 +3424,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Bridges the trait-required async execution entrypoint to the handler’s explicit `handle_call` helper. It exists so tests can vary success and failure behavior while still returning the trait’s boxed future type.
+**Purpose**: Starts the fake lifecycle handler's asynchronous work. It exists so the handler can be called through the same tool interface as real tools.
 
-**Data flow**: Accepts a `ToolInvocation` but ignores it, then creates and pins the future returned by `self.handle_call()`. The eventual output is either a boxed `ToolOutput` or a `FunctionCallError`.
+**Data flow**: It receives a tool invocation but does not inspect it directly. It wraps `handle_call` in an asynchronous future and returns that future to the caller.
 
-**Call relations**: This method is the trait entrypoint used by registry dispatch in `dispatch_notifies_tool_lifecycle_contributors`; it immediately delegates the actual branching logic to `LifecycleTestHandler::handle_call`.
+**Call relations**: Registry dispatch calls this method when running the fake lifecycle tools. The real success-or-failure decision is delegated to `LifecycleTestHandler::handle_call`, which keeps this interface method small.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3423,11 +3441,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Implements the lifecycle test handler’s configurable success-or-error behavior. It lets tests verify how dispatch reports both completed and failed tool calls to lifecycle contributors.
+**Purpose**: Produces the configured result for a lifecycle test tool: either an `ok` output with a chosen success flag, or a deliberate error. This lets tests check how the registry reports both completed and failed tool calls.
 
-**Data flow**: Reads and clones `self.result`, then matches it. For `Ok { success }`, it constructs `FunctionToolOutput::from_text("ok", Some(success))`, boxes it as `dyn ToolOutput`, and returns `Ok(...)`. For `Err`, it returns `Err(FunctionCallError::RespondToModel("handler failed".to_string()))`. No internal state is mutated.
+**Data flow**: It reads the handler's stored `result` setting. If the setting is `Ok`, it creates a text output saying `ok` and attaches the configured success value. If the setting is `Err`, it returns an error message saying the handler failed.
 
-**Call relations**: Called only by `LifecycleTestHandler::handle`. Its two branches are what drive the expected `ToolCallOutcome::Completed { success: false }` and `ToolCallOutcome::Failed { handler_executed: true }` assertions in the lifecycle dispatch test.
+**Call relations**: It is called by `LifecycleTestHandler::handle` during dispatch. Its output or error is what drives the lifecycle notification test, because the registry turns those outcomes into finished-tool events.
 
 *Call graph*: calls 1 internal fn (from_text); called by 1 (handle); 3 external calls (new, clone, RespondToModel).
 
@@ -3438,11 +3456,11 @@ async fn handle_call(
 fn test_spec(tool_name: &codex_tools::ToolName) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Creates a reusable synthetic function-tool specification for test handlers. It standardizes the schema shape so tests can focus on registry and runtime behavior.
+**Purpose**: Creates a minimal function-tool specification for a named test tool. It avoids repeating the same boilerplate in each fake handler.
 
-**Data flow**: Consumes a borrowed `ToolName`, copies its `.name` field into a `codex_tools::ResponsesApiTool`, fills fixed values for description, `strict`, `defer_loading`, and `output_schema`, uses `JsonSchema::default()` for parameters, and wraps the result in `ToolSpec::Function`.
+**Data flow**: It receives a tool name, copies the display name into a simple function-tool description, uses a default empty JSON schema for parameters, and returns the completed tool specification.
 
-**Call relations**: This helper is called by both `TestHandler::spec` and `LifecycleTestHandler::spec`, ensuring all in-file handlers advertise the same kind of tool definition.
+**Call relations**: Both `TestHandler::spec` and `LifecycleTestHandler::spec` call this helper. It acts as the shared recipe for making fake tools look enough like real tools for registry tests.
 
 *Call graph*: called by 2 (spec, spec); 2 external calls (default, Function).
 
@@ -3456,11 +3474,11 @@ fn on_tool_start(
     ) -> codex_extension_api::ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Records a tool-start lifecycle event into shared test state. It captures the call ID and tool name exactly as provided by the extension API input.
+**Purpose**: Records that a tool call has started. This gives tests a simple way to verify that lifecycle extensions are notified at the right time.
 
-**Data flow**: Reads `input.call_id` and `input.tool_name`, clones the recorder’s `Arc<Mutex<Vec<RecordedToolLifecycle>>>`, constructs `RecordedToolLifecycle::Start`, and returns a pinned async block that locks the mutex and pushes the record. If the mutex is poisoned, it recovers via `PoisonError::into_inner` before pushing.
+**Data flow**: It receives a start-event input containing the call id and tool name. It copies those values into a `Start` record, locks the shared record list, and appends the new record.
 
-**Call relations**: Invoked by extension/lifecycle dispatch during tool execution when a start event is emitted. In this file it participates in `dispatch_notifies_tool_lifecycle_contributors`, where the accumulated records are later drained and compared.
+**Call relations**: The extension lifecycle system calls this when registry dispatch begins a tool call. Later, the lifecycle test reads the shared list to check that this start event appeared before the matching finish event.
 
 *Call graph*: 2 external calls (clone, pin).
 
@@ -3474,11 +3492,11 @@ fn on_tool_finish(
     ) -> codex_extension_api::ToolLifecycleFuture<'a>
 ```
 
-**Purpose**: Records a tool-finish lifecycle event, including the final `ToolCallOutcome`. It lets the test assert that both successful and failing dispatches emit finish notifications with the correct outcome payload.
+**Purpose**: Records that a tool call has finished, including whether it completed or failed. This lets tests confirm the registry reports final outcomes correctly.
 
-**Data flow**: Reads `input.call_id`, `input.tool_name`, and `input.outcome`, clones the shared `Arc<Mutex<Vec<_>>>`, constructs `RecordedToolLifecycle::Finish`, and returns a pinned async block that locks the vector and appends the record, again recovering from poisoned mutexes.
+**Data flow**: It receives finish-event input with the call id, tool name, and outcome. It copies those into a `Finish` record, locks the shared record list, and appends the record.
 
-**Call relations**: Called by lifecycle dispatch after a tool completes or fails. In the lifecycle test, its output is paired with `on_tool_start` records to verify exact event ordering and outcome classification.
+**Call relations**: The extension lifecycle system calls this after registry dispatch finishes a tool call. The dispatch lifecycle test compares these recorded finish events with the expected outcomes from successful and failing fake handlers.
 
 *Call graph*: 2 external calls (clone, pin).
 
@@ -3489,11 +3507,11 @@ fn on_tool_finish(
 fn handler_looks_up_namespaced_aliases_explicitly()
 ```
 
-**Purpose**: Verifies that `ToolRegistry` treats plain and namespaced tool names as distinct explicit keys. It ensures a missing namespace does not silently fall back to a plain-name handler.
+**Purpose**: Checks that the registry treats a plain tool name and a namespaced tool name as different entries. This prevents one tool from accidentally shadowing another tool with the same short name.
 
-**Data flow**: Builds a plain `ToolName` and a namespaced `ToolName`, wraps separate `TestHandler` instances in `Arc<dyn CoreToolRuntime>`, inserts both into a `HashMap`, and constructs a `ToolRegistry`. It queries the registry for the plain name, the exact namespaced name, and a different namespace, then asserts presence/absence and pointer identity with `Arc::ptr_eq`.
+**Data flow**: The test creates one plain name, one namespaced name, and a second missing namespaced name. It registers separate fake handlers for the first two names, asks the registry for each name, and checks that the correct handlers are returned while the missing namespace returns nothing.
 
-**Call relations**: This standalone unit test directly exercises `ToolRegistry::new` and `ToolRegistry::tool`. It does not dispatch tools; instead it validates lookup semantics before execution ever occurs.
+**Call relations**: The Rust test runner calls this test. Inside the test, `ToolRegistry::new` is used to build the registry, and registry lookup is exercised directly to prove name matching is exact.
 
 *Call graph*: calls 3 internal fn (new, namespaced, plain); 5 external calls (clone, new, from, assert!, assert_eq!).
 
@@ -3504,11 +3522,11 @@ fn handler_looks_up_namespaced_aliases_explicitly()
 async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks the default hook payload behavior for function tools, including hook-facing tool-name rewriting and argument rewriting. It confirms both pre-tool and post-tool payloads are derived from JSON arguments and model-visible output text.
+**Purpose**: Verifies the default hook data for ordinary function tools and checks that hook input rewriting updates the function arguments. Hooks are extension points that can inspect or change tool input before or after a tool runs.
 
-**Data flow**: Creates a session/turn test context, a namespaced `functions.` tool name, a `TestHandler`, and a `ToolInvocation` whose payload contains JSON arguments `{ "message": "hello" }`. It constructs a `FunctionToolOutput` with text `"echoed"`, asserts that `pre_tool_use_payload` yields `HookToolName("functions.echo")` plus parsed JSON input, and that `post_tool_use_payload` includes the call ID and JSON string response `"echoed"`. It then calls `with_updated_hook_input` with rewritten JSON, destructures the returned invocation’s `ToolPayload::Function { arguments }`, parses the string back to JSON, and asserts the rewritten object is preserved.
+**Data flow**: The test builds a session, a function-style invocation with JSON arguments, and a fake text output. It checks the pre-use hook payload, the post-use hook payload, then asks the handler to replace the hook input and confirms the invocation still has function-shaped JSON arguments with the new value.
 
-**Call relations**: This async test drives trait-default methods on `TestHandler` rather than custom handler logic. It uses `test_invocation` to supply realistic invocation state and validates the runtime’s default hook serialization and rewrite path.
+**Call relations**: The asynchronous test runner calls this test. It uses `test_invocation` to make a realistic invocation, then exercises the default hook methods on `TestHandler` and checks the rewritten payload.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, from_text, test_invocation, namespaced); 4 external calls (new, assert_eq!, panic!, json!).
 
@@ -3519,11 +3537,11 @@ async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::R
 async fn function_hook_input_defaults_empty_arguments_to_object()
 ```
 
-**Purpose**: Verifies that blank function argument strings are normalized to an empty JSON object for hook payload generation. This prevents whitespace-only arguments from surfacing as invalid or absent hook input.
+**Purpose**: Checks that blank function arguments are treated as an empty JSON object for hook input. This avoids hooks receiving invalid or surprising data when a function call has no real arguments.
 
-**Data flow**: Creates a session/turn context, a plain `echo` tool name, a `TestHandler`, and a `ToolInvocation` whose function arguments are the whitespace string `"  "`. It calls `pre_tool_use_payload` and asserts the result is `Some(PreToolUsePayload { tool_name: HookToolName("echo"), tool_input: {} })`.
+**Data flow**: The test creates a function invocation whose arguments are only whitespace. It asks the handler for the pre-use hook payload and expects the tool input to be `{}`.
 
-**Call relations**: This test uses `test_invocation` and the default hook-input logic on `CoreToolRuntime` implementations. It isolates the empty-arguments edge case from the richer rewrite test above.
+**Call relations**: The asynchronous test runner calls this test. It relies on `test_invocation` for the common invocation setup and focuses only on the argument-parsing default.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, test_invocation, plain); 2 external calls (new, assert_eq!).
 
@@ -3534,11 +3552,11 @@ async fn function_hook_input_defaults_empty_arguments_to_object()
 async fn spawn_agent_function_tools_use_agent_matcher_alias()
 ```
 
-**Purpose**: Ensures both plain and namespaced `spawn_agent` function tools map to the same hook matcher alias. This keeps hook matching stable across alternate tool naming schemes.
+**Purpose**: Confirms that both the plain `spawn_agent` tool and its namespaced version appear to hooks under the same special hook name. This lets hook rules match agent-spawning consistently, no matter which alias was used.
 
-**Data flow**: Builds a shared session/turn context, then iterates over two tool names: plain `spawn_agent` and namespaced `MULTI_AGENT_V1_NAMESPACE::spawn_agent`. For each, it creates a `TestHandler`, constructs a `ToolInvocation` with JSON arguments `{ "message": "inspect this repo" }`, calls `pre_tool_use_payload`, collects the results, and asserts both payloads use `HookToolName::spawn_agent()` with identical JSON input.
+**Data flow**: The test builds two invocations with the same JSON message: one for the plain tool name and one for the multi-agent namespace. It asks each handler for its pre-use hook payload and compares both results to the shared `spawn_agent` hook name.
 
-**Call relations**: This async test exercises the default pre-hook naming logic for a special-case tool alias. It does not dispatch execution; it validates the hook-facing name normalization path.
+**Call relations**: The asynchronous test runner calls this test. It uses shared session and turn objects for both invocations, then checks the hook-facing names produced by the handlers.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, namespaced, plain); 2 external calls (new, assert_eq!).
 
@@ -3549,11 +3567,11 @@ async fn spawn_agent_function_tools_use_agent_matcher_alias()
 async fn code_mode_wait_does_not_expose_default_hook_payloads()
 ```
 
-**Purpose**: Confirms that the code-mode wait handler opts out of the generic default hook payload behavior. Both pre-tool and post-tool hook payloads must be absent for this special tool.
+**Purpose**: Ensures the code-mode wait tool does not produce the normal pre-use or post-use hook payloads. Waiting is a control action, not a regular model-facing function call, so exposing it like a normal tool would be misleading.
 
-**Data flow**: Creates a session/turn context and a sample `FunctionToolOutput` with text `"ok"`. It instantiates `CodeModeWaitHandler`, builds a `ToolInvocation` using the handler’s own tool name, then asserts `pre_tool_use_payload` and `post_tool_use_payload` both return `None`.
+**Data flow**: The test creates a wait-tool invocation and a simple output. It asks the wait handler for pre-use and post-use hook payloads and expects both answers to be `None`.
 
-**Call relations**: This test targets a production handler type from `crate::tools::handlers`, using `test_invocation` only to supply invocation scaffolding. It verifies that special-case handler overrides suppress the trait defaults.
+**Call relations**: The asynchronous test runner calls this test. It uses `test_invocation` to create the call, then checks the specialized behavior of `CodeModeWaitHandler` instead of the generic defaults.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, from_text, test_invocation); 2 external calls (new, assert_eq!).
 
@@ -3564,11 +3582,11 @@ async fn code_mode_wait_does_not_expose_default_hook_payloads()
 async fn write_stdin_does_not_expose_default_pre_tool_use_payload()
 ```
 
-**Purpose**: Checks that the write-stdin handler suppresses the default pre-tool hook payload. This prevents internal terminal-input plumbing from being exposed through generic hook metadata.
+**Purpose**: Checks that the tool for writing to standard input does not expose a default pre-use hook payload. Standard input is the stream of text sent into a running process, and treating this as an ordinary tool input could reveal or route data incorrectly.
 
-**Data flow**: Creates a session/turn context, instantiates `WriteStdinHandler`, builds a `ToolInvocation` with that handler’s tool name, and asserts `pre_tool_use_payload` returns `None`.
+**Data flow**: The test creates an invocation for the write-stdin handler. It asks for the pre-use hook payload and expects no payload to be produced.
 
-**Call relations**: Like the code-mode wait test, this one exercises a concrete production handler’s override behavior using the shared invocation helper, but only for the pre-hook path.
+**Call relations**: The asynchronous test runner calls this test. It uses `test_invocation` for setup and then verifies the special-case hook behavior of `WriteStdinHandler`.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, test_invocation); 2 external calls (new, assert_eq!).
 
@@ -3579,11 +3597,11 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload()
 fn post_tool_use_feedback_output_keeps_code_mode_result_typed()
 ```
 
-**Purpose**: Verifies the dual-view behavior of `PostToolUseFeedbackOutput`: model-visible response conversion should use the feedback text, while code-mode result extraction should preserve the original typed JSON output. This guards against losing structured tool results when hook feedback wraps them.
+**Purpose**: Checks that post-tool feedback can change what the model sees without losing the original typed result used by code mode. A typed result is structured data, such as JSON, rather than just plain text.
 
-**Data flow**: Constructs an `AnyToolResult` with `call_id`, function payload, and a boxed `PostToolUseFeedbackOutput` whose `original` is a `JsonToolOutput` containing `{ "typed": true }` and whose `model_visible` is a `FunctionToolOutput` containing text `"hook feedback"`. It first calls `into_response()` and asserts the returned `ResponseInputItem::FunctionCallOutput` contains text payload `"hook feedback"`. It then constructs an equivalent `AnyToolResult` again, calls `code_mode_result()`, and asserts the returned JSON is the original typed object.
+**Data flow**: The test builds a tool result whose original output is JSON and whose model-visible output is text feedback from a hook. It first converts the result into a model response and checks that the feedback text is used. Then it builds the same result again and checks that the code-mode result is still the original JSON.
 
-**Call relations**: This unit test directly exercises result-conversion behavior rather than registry dispatch. It validates that wrapper outputs preserve separate representations for model-facing and code-mode consumers.
+**Call relations**: The Rust test runner calls this test. It exercises `AnyToolResult` conversion paths to ensure two consumers get the right view: the model gets feedback text, while code mode keeps structured data.
 
 *Call graph*: calls 2 internal fn (from_text, new); 3 external calls (new, assert_eq!, json!).
 
@@ -3594,11 +3612,11 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed()
 async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()>
 ```
 
-**Purpose**: Tests end-to-end lifecycle notification during registry dispatch for both successful and failing handlers. It proves that extension contributors receive ordered start/finish events and that finish outcomes encode the handler result correctly.
+**Purpose**: Tests that tool lifecycle extensions are told when each tool starts and finishes, including both completed and failed calls. This is important for logging, monitoring, or extensions that react to tool activity.
 
-**Data flow**: Creates a mutable session/turn context, allocates a shared `Arc<Mutex<Vec<RecordedToolLifecycle>>>`, registers a `ToolLifecycleRecorder` in an `ExtensionRegistryBuilder`, and installs the built extension registry into `session.services.extensions`. It creates two tool names and corresponding `LifecycleTestHandler` instances: one returning `Ok { success: false }`, one returning `Err`. After building a `ToolRegistry`, it dispatches an invocation for the successful tool and awaits success, then dispatches the failing tool and captures the returned error, asserting its string is `"handler failed"`. Finally it builds the expected start/finish record sequence, drains the recorder vector under the mutex, and asserts exact equality.
+**Data flow**: The test creates a session with a lifecycle recorder extension, registers one fake tool that returns output and one fake tool that returns an error, then dispatches both through the registry. It checks the failing call's error message and then drains the recorder's shared list to compare the exact start and finish records.
 
-**Call relations**: This async test is the file’s most integrated scenario: it uses `test_invocation` to create realistic calls, drives `ToolRegistry::dispatch_any`, and indirectly triggers `ToolLifecycleRecorder::on_tool_start` and `ToolLifecycleRecorder::on_tool_finish` through the extension system.
+**Call relations**: The asynchronous test runner calls this test. It builds a `ToolRegistry`, uses `test_invocation` to create realistic calls, dispatches them through the normal registry path, and relies on `ToolLifecycleRecorder` to capture the lifecycle events.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, new, test_invocation, plain); 9 external calls (clone, new, from, new, assert_eq!, new, panic!, new, vec!).
 
@@ -3614,22 +3632,24 @@ fn test_invocation(
 ) -> ToolInvo
 ```
 
-**Purpose**: Constructs a realistic `ToolInvocation` for tests with all required runtime context populated. It centralizes boilerplate so individual tests can focus on the behavior under inspection.
+**Purpose**: Creates a standard fake tool invocation for tests. This keeps each test from repeating the same session, turn, call id, cancellation, tracking, source, and empty function-argument setup.
 
-**Data flow**: Accepts `Arc<Session>`, `Arc<TurnContext>`, a `call_id`, and a `ToolName`. It creates a fresh `CancellationToken`, a new `TurnDiffTracker` wrapped in `tokio::sync::Mutex` and `Arc`, sets `source` to `ToolCallSource::Direct`, and initializes the payload as `ToolPayload::Function { arguments: "{}" }`. It returns the assembled `ToolInvocation`.
+**Data flow**: It receives a session, a turn context, a call id, and a tool name. It combines them with a fresh cancellation token, a fresh change tracker, a direct-call source, and default `{}` function arguments, then returns a complete `ToolInvocation`.
 
-**Call relations**: This helper is called by multiple async tests that need a valid invocation object, including hook-payload tests and lifecycle dispatch tests. It does not perform assertions itself; it supplies consistent setup for callers.
+**Call relations**: Several tests call this helper when they need a realistic invocation object. The helper gives them a consistent starting point so each test can change only the part it cares about, such as arguments, tool name, or expected hook behavior.
 
 *Call graph*: calls 1 internal fn (new); called by 5 (code_mode_wait_does_not_expose_default_hook_payloads, dispatch_notifies_tool_lifecycle_contributors, function_hook_input_defaults_empty_arguments_to_object, function_tools_expose_default_hook_payloads_and_rewrites, write_stdin_does_not_expose_default_pre_tool_use_payload); 3 external calls (new, new, new).
 
 
 ### `core/src/tools/router_tests.rs`
 
-`test` · `request handling tests`
+`test` · `test run`
 
-This file is a focused async test module for the tool-routing layer. It builds realistic `ToolRouter` instances from a session/turn created by `make_session_and_context`, then probes how the router interprets tool names, exposes specs to the model, and dispatches calls. Two small test-only types, `ExtensionEchoContributor` and `ExtensionEchoExecutor`, implement the extension API so the tests can register an `extension/echo` tool with a concrete `ToolSpec::Namespace` and a deterministic JSON response. That response includes parsed arguments, the tool call id, and the stored conversation history, which lets the test verify that extension dispatch receives the expected context.
+The tool router is like a reception desk for tool calls. The model asks for a tool by name, sometimes with a namespace that says where the tool comes from, and the router must send that request to exactly the right place. These tests check that the desk does not confuse similar names, does not promise parallel execution unless a tool actually supports it, hides tools that should only appear after discovery, and can expose and run tools supplied by extensions.
 
-The tests cover several subtle invariants. A plain local tool name that supports parallel execution must not accidentally match an MCP-style namespaced name. Conversely, MCP parallel support is keyed by handler metadata including callable namespace, so two servers exposing the same callable name can differ. Dynamic tools marked `defer_loading: true` are intentionally filtered out of `model_visible_specs`, while non-deferred siblings remain visible. `ToolRouter::build_tool_call` is also checked to ensure `ResponseItem::FunctionCall.namespace` is preserved in the resulting `ToolName`, preventing registry lookup collisions. Helper functions construct synthetic MCP `ToolInfo` records and extract function names from namespace specs for concise assertions.
+The file includes a tiny fake extension tool called `extension/echo`. It reports back the arguments it received, the call id, and the conversation history. That gives the tests a simple way to prove that extension tools are visible to the model and executable through the same router path as built-in tools.
+
+Several tests build a session and turn context, create a `ToolRouter`, then ask it questions: “Is this tool safe to run in parallel?”, “What tool specs are visible to the model?”, or “Can this response item become a correctly namespaced tool call?” The file matters because a wrong routing decision could call the wrong server’s tool, expose hidden tools too early, or run unsafe tools at the same time.
 
 #### Function details
 
@@ -3643,11 +3663,11 @@ fn tools(
     ) -> Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>
 ```
 
-**Purpose**: Supplies the test extension registry with a single executor instance, `ExtensionEchoExecutor`. It is the contributor hook that makes the synthetic extension tool discoverable during router construction.
+**Purpose**: Supplies the fake extension tool used by this test file. It pretends to be an extension that contributes one executable tool, the echo tool.
 
-**Data flow**: It receives session and thread `ExtensionData` references but ignores both stores. It constructs a one-element `Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>` containing `ExtensionEchoExecutor` and returns it without mutating external state.
+**Data flow**: It receives extension data stores for the session and thread, but this test contributor does not need to read them. It creates an `ExtensionEchoExecutor`, wraps it so it can be shared, and returns it in a list of available extension tool executors.
 
-**Call relations**: This method is invoked by the extension registry machinery after `extension_tool_test_registry` registers the contributor. Its only downstream role is to provide the executor that later contributes specs and handles dispatched extension calls in `extension_tool_executors_are_model_visible_and_dispatchable`.
+**Call relations**: The test registry uses this contributor when building a fake extension environment. Later, the router asks the registry for extension tools, and this contributor is the source of the echo executor that becomes visible and dispatchable.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3658,11 +3678,11 @@ fn tools(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Declares the executor's canonical routed name as the namespaced tool `extension/::echo`. This is the identity the router uses to match function calls to the executor.
+**Purpose**: Gives the fake extension tool its full routed name. The namespace `extension/` keeps it separate from built-in or MCP tools that might also be called `echo`.
 
-**Data flow**: It takes no inputs beyond `self`, creates a `ToolName` via the namespaced constructor using namespace `extension/` and function `echo`, and returns that value. No state is read or written.
+**Data flow**: It takes no outside input beyond the executor itself. It builds and returns a namespaced tool name made from `extension/` and `echo`.
 
-**Call relations**: The extension execution infrastructure queries this when assembling available extension executors. The returned name must align with the namespace and function emitted by `spec` and with the `ResponseItem::FunctionCall` built in the dispatch test.
+**Call relations**: The router and extension machinery use this name to identify which executor should receive a matching tool call. It supports the extension dispatch test by making the fake tool addressable as `extension/echo`.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -3673,11 +3693,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the model-visible schema for the test extension tool as a namespace containing one strict function, `echo`, with a required string `message` parameter. This lets the router expose the extension tool exactly like production tools.
+**Purpose**: Describes the fake extension tool in the format the model can see. The spec says there is an `extension/` namespace with an `echo` function that requires a string field called `message`.
 
-**Data flow**: It reads no mutable state. It constructs a `ToolSpec::Namespace` wrapping a `ResponsesApiNamespace` named `extension/`, fills its description with `default_namespace_description`, defines one `ResponsesApiTool` named `echo`, parses an inline JSON Schema for `{ message: string }`, and returns the completed `ToolSpec`.
+**Data flow**: It builds a tool description from fixed test data: namespace name, human-readable descriptions, and a JSON input schema. It returns a `ToolSpec` that can be included in the router’s model-visible tool list.
 
-**Call relations**: The router consumes this spec when `extension_tool_executors_are_model_visible_and_dispatchable` builds a `ToolRouter` with extension executors. The test later inspects `router.model_visible_specs()` to confirm this exact namespace/function pair is surfaced to the model.
+**Call relations**: When the router collects tool descriptions, this method lets the fake extension advertise itself. The extension visibility test checks that this spec appears among the tools offered to the model.
 
 *Call graph*: 3 external calls (default_namespace_description, Namespace, vec!).
 
@@ -3688,11 +3708,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the executor's async implementation into the boxed future shape required by the `ToolExecutor` trait. It is the trait entrypoint for executing the extension tool.
+**Purpose**: Starts execution of the fake extension tool in the async form expected by the tool system. Async means the work returns later without blocking the whole program while it runs.
 
-**Data flow**: It accepts an `ExtensionToolCall`, forwards it to `handle_call`, boxes and pins the resulting future, and returns that future. It does not itself inspect or modify the call contents.
+**Data flow**: It receives an extension tool call, passes that call into `handle_call`, and wraps the resulting future so the generic tool executor interface can await it. It returns that future to the caller.
 
-**Call relations**: The extension dispatch path invokes this trait method when the router routes a matching extension tool call. It immediately delegates all substantive work to `ExtensionEchoExecutor::handle_call`.
+**Call relations**: The router calls this through the generic tool executor interface when it dispatches the extension echo call. This method is a small adapter between the trait’s required shape and the real test implementation in `handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3706,11 +3726,11 @@ async fn handle_call(
     ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError>
 ```
 
-**Purpose**: Implements the test tool's behavior by echoing back parsed arguments, the call id, and the conversation history as JSON. This gives the test a concrete payload to validate router-to-extension data propagation.
+**Purpose**: Runs the fake echo tool and creates a predictable JSON result for assertions. It proves that arguments, call identity, and conversation history reach an extension tool correctly.
 
-**Data flow**: It takes an `ExtensionToolCall`, reads its serialized arguments through `function_arguments()`, parses them into `serde_json::Value`, reads `call.call_id`, and reads `call.conversation_history.items()`. It packages those fields plus `ok: true` into a `codex_tools::JsonToolOutput`, boxes it as `Box<dyn ToolOutput>`, and returns it as `Ok`; malformed test arguments would panic during JSON parsing.
+**Data flow**: It reads the tool call’s function arguments as JSON text, parses them into structured JSON, and combines them with the call id and conversation history. It returns a JSON tool output containing those values plus `ok: true`; it does not change external state.
 
-**Call relations**: This async helper is called only by `ExtensionEchoExecutor::handle`. In the end-to-end extension test, the router dispatches the built tool call into this function, and the returned JSON is later converted into a `ResponseInputItem::FunctionCallOutput` for assertion.
+**Call relations**: It is called by `ExtensionEchoExecutor::handle` during extension tool dispatch. The main extension test inspects this output to confirm the router delivered the right call and context to the extension executor.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (handle); 4 external calls (new, function_arguments, json!, from_str).
 
@@ -3721,11 +3741,11 @@ async fn handle_call(
 fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>>
 ```
 
-**Purpose**: Creates a minimal extension registry containing the single echo contributor used by this test module. It isolates extension setup so the main integration test can swap the session's extension registry easily.
+**Purpose**: Builds a small extension registry containing only the fake echo contributor. This gives the tests a controlled extension setup instead of depending on real installed extensions.
 
-**Data flow**: It allocates an `ExtensionRegistryBuilder`, registers an `Arc<ExtensionEchoContributor>` with `tool_contributor`, builds the registry, wraps it in `Arc`, and returns it. No external state is touched.
+**Data flow**: It creates a new registry builder, registers `ExtensionEchoContributor`, builds the registry, and returns it wrapped for shared ownership. The result can be installed into a test session’s services.
 
-**Call relations**: This helper is called by `extension_tool_executors_are_model_visible_and_dispatchable` before constructing the router. The resulting registry is assigned into `session.services.extensions`, enabling `extension_tool_executors(&session)` to discover the test executor.
+**Call relations**: The extension dispatch test calls this before creating the router. That makes the fake extension tools available when `extension_tool_executors` gathers executors from the session.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (extension_tool_executors_are_model_visible_and_dispatchable); 1 external calls (new).
 
@@ -3736,11 +3756,11 @@ fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>>
 async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that parallel-execution support for a plain local shell-like tool does not bleed over to an MCP-style namespaced tool with the same leaf name. The test guards against false-positive parallel eligibility caused by name-only matching.
+**Purpose**: Checks that a built-in local tool’s parallel-execution permission does not accidentally apply to a namespaced tool with the same final name. This prevents the router from treating `mcp__server__shell_command` as if it were the local `shell_command`.
 
-**Data flow**: It creates a session and turn, loads all MCP tools from the session's MCP connection manager, and builds a `ToolRouter` from the turn context. It searches the candidate plain names `exec_command` and `shell_command` for one that `router.tool_supports_parallel` reports as parallel-capable, then asserts that a `ToolCall` using the same leaf name under namespace `mcp__server__` is not parallel-capable; it returns `Ok(())` on success.
+**Data flow**: It creates a test session and router, finds a local shell-like tool that supports parallel calls, then builds a second call with the same tool name inside an MCP-style namespace. It asserts that the local call is recognized as parallel-safe but the namespaced lookalike is not.
 
-**Call relations**: This is a standalone async test invoked by the test runner. It exercises `ToolRouter::from_turn_context` and `tool_supports_parallel` under realistic session state, but does not delegate to local helpers beyond session setup.
+**Call relations**: This test drives `ToolRouter::from_turn_context` and then asks the router’s parallel-support check about carefully chosen tool calls. It protects the routing rule that full names, including namespaces, matter.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, from_turn_context); 3 external calls (default, new, assert!).
 
@@ -3751,11 +3771,11 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
 async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `ToolRouter::build_tool_call` preserves the `namespace` field from a `ResponseItem::FunctionCall` when constructing the routed `ToolName`. This prevents collisions between same-named tools from different registries.
+**Purpose**: Checks that a model function call with a namespace becomes a tool call whose name includes that namespace. Without this, two tools with the same short name from different places could be confused.
 
-**Data flow**: It constructs a `ResponseItem::FunctionCall` with name `create_event`, namespace `mcp__codex_apps__calendar`, empty JSON arguments, and call id `call-namespace`. It passes that item into `ToolRouter::build_tool_call`, unwraps the produced `ToolCall`, then asserts the resulting `tool_name`, `call_id`, and `ToolPayload::Function.arguments` match the source data before returning `Ok(())`.
+**Data flow**: It starts with a response item naming `create_event` and giving the namespace `mcp__codex_apps__calendar`. It asks the router to build a `ToolCall`, then verifies the output has the combined namespaced name, the original call id, and the original function arguments.
 
-**Call relations**: This standalone test directly targets the static conversion logic in `ToolRouter::build_tool_call`. It does not involve router dispatch; instead it validates the shape of the intermediate `ToolCall` consumed by later routing stages.
+**Call relations**: This test exercises `ToolRouter::build_tool_call`, which is used when model responses are converted into executable tool requests. It confirms that namespacing is preserved before dispatch ever happens.
 
 *Call graph*: calls 1 internal fn (build_tool_call); 2 external calls (assert_eq!, panic!).
 
@@ -3766,11 +3786,11 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
 async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()>
 ```
 
-**Purpose**: Confirms that MCP parallel support is determined from handler metadata tied to both namespace and callable name, not just the callable name alone. Two servers exposing `query_with_delay` are intentionally distinguished.
+**Purpose**: Checks that parallel-execution support for MCP tools comes from the exact MCP tool’s metadata. MCP means Model Context Protocol, a way for external servers to provide tools to the model.
 
-**Data flow**: It creates a turn, synthesizes two `codex_mcp::ToolInfo` entries via `mcp_tool_info`—one parallel-capable under namespace `mcp__echo__`, one not under `mcp__hello_echo__`—and builds a router with those MCP tools. It then constructs two namespaced `ToolCall` values and asserts that only the call matching the parallel-capable handler returns true from `tool_supports_parallel`; it returns `Ok(())`.
+**Data flow**: It creates two fake MCP tool records with the same callable name but different namespaces and different parallel-support flags. It builds a router from those records, then verifies that only the tool from the server marked parallel-safe is treated as parallel-safe.
 
-**Call relations**: The test runner invokes this test directly. It relies on `mcp_tool_info` to fabricate precise handler metadata and then probes `ToolRouter::from_turn_context`/`tool_supports_parallel` to ensure the router keys off the full handler identity.
+**Call relations**: This test feeds fake MCP tool info into `ToolRouter::from_turn_context` and queries the router with namespaced tool calls. It depends on `mcp_tool_info` to create the test tool records.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, from_turn_context, namespaced); 4 external calls (default, new, assert!, vec!).
 
@@ -3781,11 +3801,11 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()>
 async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures the router defaults to non-parallel behavior when no handler metadata is available for a tool. This protects against optimistic assumptions for built-in or unresolved tools.
+**Purpose**: Checks the safe default: if the router has no handler information for a tool, it must not assume the tool can run in parallel. This avoids racing tools whose behavior is unknown.
 
-**Data flow**: It creates a turn, builds a `ToolRouter` with `mcp_tools: None`, constructs a plain `ToolCall` for `web_search` with empty JSON arguments, and asserts `tool_supports_parallel` returns false. It produces `Ok(())` if the invariant holds.
+**Data flow**: It creates a router with no MCP tools, no extension executors, and no discoverable tools. It then asks whether a `web_search` call supports parallel execution and asserts the answer is false.
 
-**Call relations**: This standalone test covers the negative path of the same parallel-support query exercised elsewhere. Unlike the MCP-specific tests, it intentionally omits handler data to validate the router's fallback behavior.
+**Call relations**: This test exercises the router’s fallback behavior after `ToolRouter::from_turn_context` builds a minimal router. It protects against accidental optimistic parallelism when no concrete tool handler is registered.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, from_turn_context); 3 external calls (default, new, assert!).
 
@@ -3796,11 +3816,11 @@ async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()>
 async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that dynamic tools marked for deferred loading are omitted from the model-visible tool specs, while non-deferred tools in the same namespace remain visible. This checks the router's filtering of discovery-only tools.
+**Purpose**: Checks that dynamic tools marked as deferred are hidden from the model until later discovery. Deferred here means “do not show this tool immediately.”
 
-**Data flow**: It creates a turn, defines a `Vec<DynamicToolSpec>` containing one namespace `codex_app` with two function specs: `hidden_dynamic_tool` (`defer_loading: true`) and `visible_dynamic_tool` (`defer_loading: false`). After building a router with those dynamic tools, it extracts visible function names for `codex_app` using `namespace_function_names` and asserts the result contains only the visible tool, then returns `Ok(())`.
+**Data flow**: It creates a dynamic namespace with two tools: one hidden because `defer_loading` is true, and one visible because it is false. After building the router, it asks for model-visible specs and confirms that only the visible tool name appears.
 
-**Call relations**: The test runner invokes this directly. It drives `ToolRouter::from_turn_context` and `model_visible_specs`, then delegates the assertion-friendly extraction step to `namespace_function_names`.
+**Call relations**: This test uses `ToolRouter::from_turn_context` with custom dynamic tool specs and uses `namespace_function_names` to read the resulting visible tool names. It protects the feature that keeps undiscovered tools out of the model’s initial menu.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, from_turn_context); 4 external calls (default, new, assert_eq!, vec!).
 
@@ -3816,11 +3836,11 @@ fn mcp_tool_info(
 ) -> codex_mcp::ToolInfo
 ```
 
-**Purpose**: Constructs synthetic `codex_mcp::ToolInfo` records for tests that need precise MCP handler metadata. It centralizes the boilerplate for namespace, callable name, and parallel-support flags.
+**Purpose**: Creates a fake MCP tool record for tests. It packages the server name, namespace, tool name, and parallel-support flag into the same shape the router receives from real MCP connections.
 
-**Data flow**: It accepts `server_name`, `supports_parallel_tool_calls`, `callable_namespace`, and `tool_name` strings/flags. It returns a fully populated `codex_mcp::ToolInfo` with those fields copied into owned strings, a simple RMCP tool schema of `{ "type": "object" }`, and all optional connector/origin metadata left as `None` or empty vectors.
+**Data flow**: It receives simple strings and a boolean, then fills out a `ToolInfo` structure with those values plus harmless defaults for fields the tests do not care about. It also creates a minimal JSON schema saying the tool accepts an object.
 
-**Call relations**: This helper is called by `mcp_parallel_support_uses_handler_data` to fabricate MCP tool descriptors without needing a live MCP server. The router then consumes the returned `ToolInfo` values as if they came from discovery.
+**Call relations**: The MCP parallel-support test calls this helper to build two similar tools from different servers. That lets the test focus on router behavior instead of the many details needed to construct `ToolInfo` by hand.
 
 *Call graph*: 5 external calls (new, new, json!, new, object).
 
@@ -3831,11 +3851,11 @@ fn mcp_tool_info(
 async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs an end-to-end integration test proving that extension-provided executors become visible in router specs and can be dispatched successfully with conversation history attached. It is the most comprehensive test in the file.
+**Purpose**: Checks the full extension tool path: an extension tool appears in the model-visible tool list, can be called by namespace, and receives the correct conversation history and arguments.
 
-**Data flow**: It creates a mutable session and turn, replaces `session.services.extensions` with the registry from `extension_tool_test_registry`, builds a user `ResponseItem::Message`, and records that item into the conversation history for the turn. It then builds a router using `extension_tool_executors(&session)`, asserts `model_visible_specs()` contains namespace `extension/` with function `echo`, constructs a namespaced `ResponseItem::FunctionCall`, converts it with `ToolRouter::build_tool_call`, and dispatches it with session, turn, a fresh `CancellationToken`, and a `TurnDiffTracker` mutex. Finally it converts the result into a `ResponseInputItem`, asserts the `call_id`, parses the text output as JSON, and checks that the echoed arguments, call id, stored history item, and `ok: true` are all present.
+**Data flow**: It creates a test session, installs the fake extension registry, records a user message into conversation history, and builds a router with extension executors. It verifies the echo tool’s spec is visible, builds a namespaced call to `extension/echo`, dispatches it, then parses the returned function-call output and compares it to the expected JSON.
 
-**Call relations**: This test is invoked by the test runner and ties together nearly every local helper: it calls `extension_tool_test_registry`, uses `extension_tool_executors(&session)` to obtain executors, and depends on the executor methods (`tool_name`, `spec`, `handle`/`handle_call`) indirectly through router visibility and dispatch. It also exercises `ToolRouter::from_turn_context`, `build_tool_call`, and `dispatch_tool_call_with_code_mode_result` in sequence.
+**Call relations**: This is the main end-to-end test in the file. It uses `extension_tool_test_registry` to install the fake extension, `ToolRouter::build_tool_call` to convert a model response into a call, and the router’s dispatch method to run the call through `ExtensionEchoExecutor`.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, build_tool_call, from_turn_context, extension_tool_test_registry, new); 12 external calls (new, new, default, assert!, assert_eq!, json!, panic!, from_str, from_ref, extension_tool_executors (+2 more)).
 
@@ -3846,24 +3866,24 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
 fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<String>
 ```
 
-**Purpose**: Extracts the function names from a specific namespace within a slice of `ToolSpec` values. It is a small assertion helper for tests that care only about visible function names.
+**Purpose**: Extracts the function names inside one namespace from a list of tool specs. It is a small test helper that makes visibility assertions easier to read.
 
-**Data flow**: It takes a borrowed slice of `ToolSpec` and a target namespace name. It iterates through the specs, selects the first `ToolSpec::Namespace` whose `name` matches, maps each contained `ResponsesApiNamespaceTool::Function` to its `name.clone()`, collects those names into a `Vec<String>`, and returns that vector; if no matching namespace exists, it returns an empty vector.
+**Data flow**: It receives a list of tool specs and a namespace name. It searches for a matching namespace, collects the names of function tools inside it, and returns those names; if the namespace is missing, it returns an empty list.
 
-**Call relations**: This helper is called by `specs_filter_deferred_dynamic_tools` to reduce the router's full spec structure to a simple list suitable for equality assertions. It does not participate in production routing logic.
+**Call relations**: The deferred dynamic tools test uses this helper after asking the router for model-visible specs. It turns the larger tool-spec structure into a simple list of names that can be compared directly in an assertion.
 
 *Call graph*: 1 external calls (iter).
 
 
 ### `core/src/tools/spec_plan_tests.rs`
 
-`test` · `test execution; validates tool planning during router construction`
+`test` · `test run`
 
-This test file builds synthetic `TurnContext` instances and feeds them into `ToolRouter::from_turn_context` to inspect the resulting tool plan without executing tools. The central helper types are `ToolPlanInputs`, which packages optional MCP tools, deferred MCP tools, discoverable plugins, extension executors, and dynamic tools, and `ToolPlanProbe`, which snapshots router state into concrete assertions: `visible_specs`, flattened `visible_names`, namespace-to-function listings, registered runtime names, and per-tool `ToolExposure`. The probe extracts namespace contents only from `ToolSpec::Namespace`, intentionally ignoring plain functions, tool search, image generation, web search, and freeform tools.
+Codex can offer the model many different tools: shell execution, web search, image generation, plugin installation, multi-agent tools, MCP tools, and more. The hard part is deciding which ones should be visible in a given session. This file acts like a checklist for that decision-making. It builds fake turns, changes settings on them, asks the ToolRouter to produce a tool plan, and then checks the result.
 
-The setup helpers mutate `TurnContext` in realistic ways: toggling `Feature` flags in both `turn.features` and cloned config, recomputing `multi_agent_version` and `tool_mode`, swapping auth/provider state, changing web-search mode, duplicating environments, and constructing placeholder Zsh-fork config so schema planning can exercise shell-mode branches without packaged binaries. Additional factories create valid and invalid `ToolInfo`, dynamic tool specs, and discoverable plugin entries.
+A useful way to picture this file is as a test kitchen. Each test changes the ingredients: turn on a feature flag, switch to a Bedrock provider, add a remote environment, add deferred tools, or pretend the model supports tool search. Then it inspects the final menu shown to the model and the hidden tools registered for runtime use.
 
-The tests focus on subtle planning invariants: hidden-but-registered legacy shell tools, deferred tools surfacing only through `tool_search`, environment-count-dependent parameters like `environment_id`, code-mode-only suppression of nested tools, provider-specific namespace support, multi-agent v1 versus v2 family selection, encrypted message schemas, cache invalidation for deferred tool search descriptions, and hosted tool gating by auth, provider, model capabilities, and config. Many assertions inspect serialized schemas or freeform descriptions to verify exact planner output rather than just presence.
+The helper type ToolPlanProbe makes those inspections easy. It records visible tool names, namespaced functions, registered tool names, and each tool's exposure level. The rest of the file uses small setup helpers to create fake MCP tools, dynamic tools, plugin candidates, authentication modes, and extension tools. The tests are important because tool visibility is safety- and behavior-critical: exposing the wrong tool could confuse the model or give it powers it should not have; hiding the wrong tool could break expected workflows.
 
 #### Function details
 
@@ -3873,11 +3893,11 @@ The tests focus on subtle planning invariants: hidden-but-registered legacy shel
 fn from_router(router: ToolRouter) -> Self
 ```
 
-**Purpose**: Builds a stable inspection snapshot from a `ToolRouter` for assertions. It captures both model-visible tool specs and the broader registered runtime set, including exposure metadata.
+**Purpose**: Builds a compact test-friendly snapshot from a ToolRouter. It lets tests inspect what the model can see, what tools are registered, and how each registered tool is exposed.
 
-**Data flow**: Consumes a `ToolRouter` by value. It reads `model_visible_specs()` to collect `ToolSpec` values, derives `visible_names` from each spec name, extracts namespace member function names from `ToolSpec::Namespace`, reads `registered_tool_names_for_test()`, and queries each registered tool's exposure via `tool_exposure_for_test`. It returns a populated `ToolPlanProbe` containing these derived collections.
+**Data flow**: It receives a completed ToolRouter. It reads the router's visible tool specs and registered test-only tool names, extracts plain names and namespaced function lists, looks up exposure settings, and returns a ToolPlanProbe containing those summaries.
 
-**Call relations**: Used by `probe_with` for nearly all tests and directly in `tool_search_cache_rebuilds_when_deferred_sources_change` when the test constructs routers manually. It is the bridge between router internals and the assertion helpers in this file.
+**Call relations**: The probe helpers call this after ToolRouter::from_turn_context has built a plan. The cache-specific test also uses it directly so it can compare two router plans made from the same cache.
 
 *Call graph*: calls 2 internal fn (model_visible_specs, registered_tool_names_for_test); called by 2 (probe_with, tool_search_cache_rebuilds_when_deferred_sources_change).
 
@@ -3888,11 +3908,11 @@ fn from_router(router: ToolRouter) -> Self
 fn assert_visible_contains(&self, expected: &[&str])
 ```
 
-**Purpose**: Asserts that every expected tool name appears in the model-visible tool list. It produces failure messages that include the actual visible names for debugging planner regressions.
+**Purpose**: Checks that certain tools are visible to the model. Tests use it when a setting should make tools appear in the public tool list.
 
-**Data flow**: Reads `self.visible_names` and iterates over the `expected` slice of `&str`. For each name it checks membership with `iter().any(...)`; on failure it panics with a message showing the current visible set. It returns no value.
+**Data flow**: It receives expected tool names and compares each one with the probe's visible_names list. If any name is missing, the test fails with a message showing what was visible.
 
-**Call relations**: Called throughout the tests after a probe is built to verify positive visibility cases such as hosted tools, shell tools, multi-agent tools, and plugin-install tools.
+**Call relations**: Individual tests call this after creating a probe, usually to prove that enabling a feature or capability exposes the expected tool.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3903,11 +3923,11 @@ fn assert_visible_contains(&self, expected: &[&str])
 fn assert_visible_lacks(&self, expected_absent: &[&str])
 ```
 
-**Purpose**: Asserts that specified tool names are absent from the model-visible tool list. This is used to verify hidden, deferred, or gated tools stay out of the model-facing plan.
+**Purpose**: Checks that certain tools are not visible to the model. This is used to confirm that gates, provider limits, or code-mode hiding rules are working.
 
-**Data flow**: Reads `self.visible_names` and iterates over `expected_absent`. For each name it checks that no visible entry matches; if one does, it panics with the full visible list. It returns no value.
+**Data flow**: It receives names that should be absent and searches the probe's visible_names list. If any forbidden name is present, the test fails.
 
-**Call relations**: Used in negative-path tests where features, provider capabilities, environment count, or code-mode-only behavior should suppress visibility while tools may still be registered.
+**Call relations**: Tests call it alongside assert_visible_contains to describe both sides of a tool-planning rule: what appears and what stays hidden.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3918,11 +3938,11 @@ fn assert_visible_lacks(&self, expected_absent: &[&str])
 fn assert_registered_contains(&self, expected: &[&str])
 ```
 
-**Purpose**: Checks that runtime registration includes each expected tool name, regardless of whether the tool is visible to the model. This distinguishes hidden/deferred registration from visibility.
+**Purpose**: Checks that tools are registered for execution even if they may not be visible to the model. This matters for hidden or deferred tools that can still be called through another path.
 
-**Data flow**: Reads `self.registered_names` and scans for each string in `expected`. It panics with the registered set if any expected name is missing. It returns no value.
+**Data flow**: It receives expected registered names and compares them with registered_names. Missing names cause the test to fail with a helpful message.
 
-**Call relations**: Frequently paired with visibility assertions to prove planner behavior such as hidden legacy shell runtimes or deferred extension tools that remain callable through search.
+**Call relations**: Tests use this after probing a router to verify the runtime side of planning, especially for legacy shell tools, deferred tools, and namespaced tools.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3933,11 +3953,11 @@ fn assert_registered_contains(&self, expected: &[&str])
 fn assert_registered_lacks(&self, expected_absent: &[&str])
 ```
 
-**Purpose**: Checks that certain tool runtimes were not registered at all. This catches invalid schemas or fully disabled tool families.
+**Purpose**: Checks that tools are not registered at all. This is stronger than being invisible: it means the runtime should not know about that tool in this plan.
 
-**Data flow**: Reads `self.registered_names`, iterates over `expected_absent`, and asserts no registered entry matches each name. It returns no value and panics on mismatch.
+**Data flow**: It receives names that should be absent and scans registered_names. If any are found, the test fails.
 
-**Call relations**: Used where planner should omit runtimes entirely, such as invalid MCP tools or environment-backed tools when no environments exist.
+**Call relations**: Tests call it when a feature is disabled, a schema is invalid, or no environment exists, proving the tool is not merely hidden but unavailable.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3948,11 +3968,11 @@ fn assert_registered_lacks(&self, expected_absent: &[&str])
 fn namespace_function_names(&self, namespace: &str) -> &[String]
 ```
 
-**Purpose**: Returns the visible function names inside a visible namespace tool. Missing namespaces are treated as empty rather than panicking.
+**Purpose**: Returns the function names inside a visible namespace tool. A namespace is a grouped tool surface, like a folder containing several related functions.
 
-**Data flow**: Takes a namespace string, looks it up in `self.namespace_functions`, and returns either the stored `Vec<String>` as a slice or an empty slice literal. It does not mutate state.
+**Data flow**: It receives a namespace name, looks it up in the probe's namespace_functions map, and returns the stored list. If the namespace is missing, it returns an empty slice.
 
-**Call relations**: Used by tests that inspect namespaced tool families such as MCP namespaces, dynamic tools, and multi-agent namespaces.
+**Call relations**: Tests use it to check which functions appear inside MCP, multi-agent, dynamic, or configured namespaces.
 
 
 ##### `ToolPlanProbe::visible_spec`  (lines 158–163)
@@ -3961,11 +3981,11 @@ fn namespace_function_names(&self, namespace: &str) -> &[String]
 fn visible_spec(&self, name: &str) -> &ToolSpec
 ```
 
-**Purpose**: Fetches the exact visible `ToolSpec` by tool name for schema-level assertions. It panics if the named tool is not visible.
+**Purpose**: Finds the full visible tool specification for one tool name. Tests use it when checking details beyond simple visibility, such as parameters or descriptions.
 
-**Data flow**: Searches `self.visible_specs` for a spec whose `name()` matches the provided string. On success it returns a shared reference to that `ToolSpec`; on failure it panics with the visible-name list.
+**Data flow**: It receives a tool name, searches visible_specs for a matching spec name, and returns that spec. If it cannot find the tool, it fails the test.
 
-**Call relations**: Used when tests need to inspect parameters, descriptions, freeform definitions, or exact `ToolSpec::WebSearch` contents rather than just presence.
+**Call relations**: Many tests first confirm a tool exists, then call this to inspect its schema, description, or special type.
 
 
 ##### `ToolPlanProbe::exposure`  (lines 165–170)
@@ -3974,11 +3994,11 @@ fn visible_spec(&self, name: &str) -> &ToolSpec
 fn exposure(&self, name: &str) -> ToolExposure
 ```
 
-**Purpose**: Returns the recorded `ToolExposure` for a registered tool. It is used to verify direct-only, hidden, or deferred exposure semantics.
+**Purpose**: Returns how a registered tool is exposed, such as direct, hidden, or deferred. Exposure describes whether the model sees the tool directly or reaches it through another mechanism.
 
-**Data flow**: Looks up the provided tool name in `self.exposures` and dereferences the stored `ToolExposure` copy. If absent, it panics because the caller expected a registered tool.
+**Data flow**: It receives a registered tool name, looks it up in the probe's exposure map, and returns the ToolExposure value. If the name is not registered, the test fails.
 
-**Call relations**: Called by tests that distinguish visibility from exposure, such as direct-model-only `request_user_input`, hidden `shell_command`, and deferred extension or multi-agent tools.
+**Call relations**: Tests use it to verify subtle planning decisions, such as hiding legacy shell tools or making request_user_input direct-model-only.
 
 
 ##### `probe_with`  (lines 173–191)
@@ -3990,11 +4010,11 @@ async fn probe_with(
 ) -> ToolPlanProbe
 ```
 
-**Purpose**: Creates a fresh test session/turn, applies caller-provided turn mutations, constructs a `ToolRouter` with supplied synthetic tool inputs, and returns a `ToolPlanProbe` snapshot.
+**Purpose**: Creates a fake session turn, applies custom setup, feeds extra tool inputs into the ToolRouter, and returns a ToolPlanProbe. It is the main test harness for scenarios that need custom tool sources.
 
-**Data flow**: Starts from `make_session_and_context().await`, mutably passes the `TurnContext` to `configure_turn`, then builds `ToolRouterParams` from `ToolPlanInputs` fields and calls `ToolRouter::from_turn_context` with a default handler cache. The resulting router is converted by `ToolPlanProbe::from_router` and returned.
+**Data flow**: It takes a function that mutates the TurnContext and a ToolPlanInputs bundle. It creates a session and turn, applies the mutation, builds a ToolRouter with MCP, deferred, discoverable, extension, and dynamic tools, then turns that router into a probe.
 
-**Call relations**: This is the main test harness for cases that need injected MCP tools, extension executors, discoverable plugins, or dynamic tools. Many tests call it directly; `probe` wraps it for the common no-extra-input case.
+**Call relations**: Most tests use this directly when they need more than default settings. The simpler probe helper also calls it with empty inputs.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, from_turn_context, from_router); called by 10 (code_mode_only_exposes_code_executor_and_hides_nested_tools, deferred_extension_tools_are_discoverable_with_tool_search, excluded_deferred_namespaces_do_not_enable_nested_tool_guidance, hosted_tools_follow_provider_auth_model_and_config_gates, install_suggestion_tools_stay_visible_without_tool_search, invalid_mcp_tools_are_not_registered, mcp_and_tool_search_follow_direct_and_deferred_tool_exposure, probe, request_plugin_install_description_defers_inventory_to_list_tool, request_plugin_install_requires_all_discovery_features_and_discoverable_tools); 1 external calls (default).
 
@@ -4005,11 +4025,11 @@ async fn probe_with(
 async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe
 ```
 
-**Purpose**: Convenience wrapper around `probe_with` for tests that only need to mutate the turn context and do not inject extra tool sources.
+**Purpose**: A shorter version of probe_with for tests that only need to change the turn context. It keeps simple tests easy to read.
 
-**Data flow**: Accepts a `configure_turn` closure, passes it to `probe_with` together with `ToolPlanInputs::default()`, awaits the result, and returns the resulting `ToolPlanProbe`.
+**Data flow**: It receives a turn-configuration function, supplies default empty ToolPlanInputs, waits for probe_with, and returns the resulting ToolPlanProbe.
 
-**Call relations**: Used by most tests in this file. It keeps the common path concise while still exercising the same router-construction flow as `probe_with`.
+**Call relations**: Many tests call this when they only need to flip feature flags, provider settings, or model capabilities.
 
 *Call graph*: calls 1 internal fn (probe_with); called by 19 (code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools, environment_count_controls_environment_backed_tools, host_context_gates_agent_job_tools, hosted_tools_follow_provider_auth_model_and_config_gates, mcp_and_tool_search_follow_direct_and_deferred_tool_exposure, multi_agent_feature_selects_one_agent_tool_family, multi_agent_v2_can_use_configured_tool_namespace, multi_agent_v2_message_schemas_are_encrypted, multi_agent_v2_namespace_is_supported_by_bedrock_provider, request_plugin_install_requires_all_discovery_features_and_discoverable_tools (+9 more)); 1 external calls (default).
 
@@ -4020,11 +4040,11 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool)
 ```
 
-**Purpose**: Synchronizes a feature toggle across both the live `TurnContext` feature set and its cloned config, then recomputes dependent planner state such as multi-agent version and tool mode.
+**Purpose**: Turns one feature flag on or off in both the live turn and its copied config. This keeps the test context internally consistent.
 
-**Data flow**: Takes a mutable `TurnContext`, a `Feature`, and a boolean. It enables or disables the feature on `turn.features`, clones `turn.config`, applies the same change to `config.features`, recomputes `turn.multi_agent_version`, replaces `turn.config` with a new `Arc`, and recalculates `turn.tool_mode` from `model_info.tool_mode` or feature-derived defaults.
+**Data flow**: It receives a mutable turn, a feature, and whether it should be enabled. It updates the turn's feature set, clones and updates the config, recalculates multi-agent version and tool mode, and stores the updated config back on the turn.
 
-**Call relations**: Called by `set_features` and directly by some tests through closures. It encapsulates the otherwise easy-to-miss invariant that planner decisions depend on both runtime feature flags and config-derived state.
+**Call relations**: set_features calls it repeatedly. Tests rely on it so ToolRouter sees the same feature state through both TurnContext fields and config fields.
 
 *Call graph*: called by 1 (set_features); 1 external calls (new).
 
@@ -4035,11 +4055,11 @@ fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool)
 fn set_features(turn: &mut TurnContext, features: &[Feature])
 ```
 
-**Purpose**: Enables a list of features on a turn by repeatedly applying `set_feature`. It is a small helper for concise test setup.
+**Purpose**: Enables several feature flags at once. It is a convenience helper for tests that need a bundle of capabilities.
 
-**Data flow**: Iterates over the provided slice of `Feature` values and calls `set_feature(turn, *feature, true)` for each. It mutates the supplied `TurnContext` in place and returns nothing.
+**Data flow**: It receives a mutable turn and a list of features. For each feature, it calls set_feature with enabled set to true.
 
-**Call relations**: Used in many tests to establish feature combinations such as code mode, unified exec, plugin discovery, or multi-agent v2.
+**Call relations**: Tests call it to prepare combinations like code mode plus code-mode-only, or all plugin-discovery features.
 
 *Call graph*: calls 1 internal fn (set_feature).
 
@@ -4050,11 +4070,11 @@ fn set_features(turn: &mut TurnContext, features: &[Feature])
 fn zsh_fork_config_for_spec_plan_tests() -> codex_tools::ZshForkConfig
 ```
 
-**Purpose**: Constructs a placeholder `codex_tools::ZshForkConfig` suitable for planner tests that only inspect shell mode selection and never execute the binaries.
+**Purpose**: Creates a safe placeholder Zsh-fork shell configuration for tests. The paths only need to look valid because these tests inspect tool specs and never actually launch the shell.
 
-**Data flow**: Reads `std::env::current_exe()`, converts it to an absolute path buffer, clones it, and uses the same stable absolute path for both `shell_zsh_path` and `main_execve_wrapper_exe`. It returns the assembled `ZshForkConfig`.
+**Data flow**: It reads the current test executable path, checks that it is absolute, and uses it as both required executable paths in a ZshForkConfig.
 
-**Call relations**: Used by Zsh-fork unified-exec tests to force the planner down the Zsh-fork branch without depending on packaged artifacts or executable correctness.
+**Call relations**: Zsh-fork unified-exec tests call this when they need the turn to appear configured for ZshFork mode without depending on packaged shell artifacts.
 
 *Call graph*: calls 1 internal fn (try_from); 1 external calls (current_exe).
 
@@ -4065,11 +4085,11 @@ fn zsh_fork_config_for_spec_plan_tests() -> codex_tools::ZshForkConfig
 fn update_config(turn: &mut TurnContext, update: impl FnOnce(&mut crate::config::Config))
 ```
 
-**Purpose**: Applies an arbitrary mutation to a cloned `crate::config::Config` and writes it back into the turn. It centralizes the clone-and-replace pattern for `Arc<Config>`.
+**Purpose**: Safely edits the turn's shared config for a test. Because the config is stored behind an Arc, it clones the config, changes it, and replaces the shared value.
 
-**Data flow**: Clones `*turn.config`, passes the mutable clone to the caller-provided closure, then wraps the updated config in a new `Arc` and stores it back into `turn.config`. It returns nothing.
+**Data flow**: It receives a mutable turn and an update function. It clones the current config, lets the caller mutate the clone, wraps the result in a new Arc, and assigns it back to the turn.
 
-**Call relations**: Used by `set_web_search_mode`, `use_bedrock_provider`, and many inline test closures to tweak planner-relevant config fields.
+**Call relations**: Other setup helpers use this for web search mode and provider changes. Tests also use it directly for one-off config tweaks.
 
 *Call graph*: called by 2 (set_web_search_mode, use_bedrock_provider); 1 external calls (new).
 
@@ -4080,11 +4100,11 @@ fn update_config(turn: &mut TurnContext, update: impl FnOnce(&mut crate::config:
 fn set_web_search_mode(turn: &mut TurnContext, mode: WebSearchMode)
 ```
 
-**Purpose**: Sets the configured `WebSearchMode` on the turn's config for planner tests. It ensures the mode is accepted and persisted through `update_config`.
+**Purpose**: Sets the test turn's web search mode, such as live search. This isolates the config-writing details from the tests.
 
-**Data flow**: Receives a mutable `TurnContext` and a `WebSearchMode`, clones and mutates the config via `update_config`, and calls `config.web_search_mode.set(mode)` inside the closure. It returns nothing.
+**Data flow**: It receives a mutable turn and a WebSearchMode. It calls update_config and writes the mode through the config's validated setter.
 
-**Call relations**: Used in hosted-tool tests to switch between disabled and live web-search planning paths.
+**Call relations**: Hosted-tool tests call this before checking whether web_search should be visible.
 
 *Call graph*: calls 1 internal fn (update_config).
 
@@ -4095,11 +4115,11 @@ fn set_web_search_mode(turn: &mut TurnContext, mode: WebSearchMode)
 fn use_chatgpt_auth(turn: &mut TurnContext)
 ```
 
-**Purpose**: Configures the turn to use dummy ChatGPT auth and rebuilds the model provider from that auth. This enables planner branches that require authenticated hosted tools.
+**Purpose**: Makes a test turn look like it is authenticated with ChatGPT. Some hosted tools are only available with this kind of authentication.
 
-**Data flow**: Creates a testing `CodexAuth`, wraps it in an `AuthManager`, stores it in `turn.auth_manager`, then rebuilds `turn.provider` using `create_model_provider` with the existing configured provider info and the new auth manager. It returns nothing.
+**Data flow**: It creates dummy ChatGPT authentication, stores it in the turn's auth manager, rebuilds the model provider using that auth, and writes the provider back to the turn.
 
-**Call relations**: Used by hosted-tool tests to satisfy auth requirements for tools like image generation.
+**Call relations**: Hosted-tool tests call it before expecting image generation to appear.
 
 *Call graph*: calls 2 internal fn (from_auth_for_testing, create_dummy_chatgpt_auth_for_testing); 1 external calls (create_model_provider).
 
@@ -4110,11 +4130,11 @@ fn use_chatgpt_auth(turn: &mut TurnContext)
 fn use_bedrock_provider(turn: &mut TurnContext)
 ```
 
-**Purpose**: Switches the turn to the Amazon Bedrock provider and rebuilds the provider instance. Tests use this to verify provider-specific namespace and hosted-tool behavior.
+**Purpose**: Switches a test turn to the Amazon Bedrock provider. Tests use this to check provider-specific tool support.
 
-**Data flow**: Creates a `ModelProviderInfo` for Bedrock, updates config fields `model_provider_id` and `model_provider`, then rebuilds `turn.provider` from that provider info and the current auth manager. It mutates the turn in place.
+**Data flow**: It creates Bedrock provider info, updates the config's provider id and provider object, then rebuilds the turn's provider with the existing authentication.
 
-**Call relations**: Used in tests that verify Bedrock-specific support for namespaced deferred tools and lack of support for hosted web search.
+**Call relations**: Tool-search, multi-agent namespace, and hosted web-search tests call this to verify behavior under Bedrock.
 
 *Call graph*: calls 2 internal fn (update_config, create_amazon_bedrock_provider); 1 external calls (create_model_provider).
 
@@ -4125,11 +4145,11 @@ fn use_bedrock_provider(turn: &mut TurnContext)
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Declares the extension runtime name as the namespaced tool `web.run`. This lets tests simulate an extension-provided standalone web-search replacement.
+**Purpose**: Names the fake extension tool as web.run. This lets tests simulate an extension that provides standalone web execution.
 
-**Data flow**: Reads no state and returns `ToolName::namespaced("web", "run")`.
+**Data flow**: It has no input besides the tool object. It returns a namespaced ToolName with namespace web and function run.
 
-**Call relations**: Consumed by the router when the test injects this executor through `ToolPlanInputs::extension_tool_executors`.
+**Call relations**: ToolRouter calls this through the ToolExecutor trait when extension executors are supplied to probe_with.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -4140,11 +4160,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Exposes the extension as a namespace spec named `web` containing a single function `run`. The schema is intentionally minimal because tests only care about planner visibility.
+**Purpose**: Describes the fake web.run extension tool as a namespace containing one function. The spec is what the planner would inspect when deciding visible tools.
 
-**Data flow**: Constructs and returns `ToolSpec::Namespace` with description text, one `ResponsesApiNamespaceTool::Function`, default JSON schema parameters, and no output schema.
+**Data flow**: It builds a ToolSpec namespace named web with a single run function, a test description, empty JSON parameters, and no output schema.
 
-**Call relations**: Used by the router during planning to detect that a `web.run` extension exists, which suppresses standalone hosted `web_search` in one test.
+**Call relations**: ToolRouter asks the extension executor for this spec while building a plan in the standalone web-search test.
 
 *Call graph*: 2 external calls (Namespace, vec!).
 
@@ -4155,11 +4175,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Implements a no-op successful executor for completeness, returning an empty JSON object. Planner tests should not need to invoke it.
+**Purpose**: Provides a dummy implementation for the fake web.run tool. It returns an empty JSON output if ever called.
 
-**Data flow**: Ignores the incoming `ExtensionToolCall`, returns a boxed future, and resolves to `Ok(Box<dyn ToolOutput>)` containing `JsonToolOutput` with `{}`.
+**Data flow**: It ignores the incoming tool call, creates an async future, and returns an empty JSON object wrapped as tool output.
 
-**Call relations**: Present because `ToolExecutor` requires execution behavior, though this file's tests focus on planning rather than dispatch.
+**Call relations**: The tests only need planning, not execution, so this exists to satisfy the ToolExecutor trait.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, pin, json!).
 
@@ -4170,11 +4190,11 @@ fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Declares a plain extension tool named `extension_echo`. Tests use it to verify deferred extension registration and discoverability through tool search.
+**Purpose**: Names the fake deferred extension tool as extension_echo. Tests use that name to check registration and visibility.
 
-**Data flow**: Returns `ToolName::plain("extension_echo")` with no side effects.
+**Data flow**: It has no input besides the tool object and returns a plain, non-namespaced ToolName.
 
-**Call relations**: Used when injected into `probe_with` as a deferred extension executor.
+**Call relations**: ToolRouter calls this through the ToolExecutor trait when the deferred extension executor is included in probe_with.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4185,11 +4205,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Defines a strict function tool schema for `extension_echo` with one required string parameter `message`. The schema is concrete enough for planner registration and search indexing.
+**Purpose**: Describes a fake extension tool that echoes a message. The spec includes a required message parameter so it looks like a real callable function.
 
-**Data flow**: Builds and returns `ToolSpec::Function(ResponsesApiTool)` with strict mode enabled, an object schema containing `message: string`, required list `["message"]`, and `additionalProperties: false`.
+**Data flow**: It builds a function ToolSpec named extension_echo with a strict object schema containing a required string field called message.
 
-**Call relations**: Consumed by the router to register the tool and include it in deferred-searchable inventory.
+**Call relations**: The deferred-extension test supplies this executor so ToolRouter can register it and make it discoverable through tool_search rather than directly visible.
 
 *Call graph*: calls 2 internal fn (object, string); 3 external calls (from, Function, vec!).
 
@@ -4200,11 +4220,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> ToolExposure
 ```
 
-**Purpose**: Marks the extension tool as `ToolExposure::Deferred`, meaning it should be registered but not directly visible unless surfaced through search.
+**Purpose**: Marks the fake extension tool as deferred. Deferred means the model should not see the tool directly, but it may discover or call it through another tool-search flow.
 
-**Data flow**: Returns the enum value `ToolExposure::Deferred` without reading or mutating state.
+**Data flow**: It returns the ToolExposure::Deferred value without reading other state.
 
-**Call relations**: This exposure is what the corresponding test verifies after router planning.
+**Call relations**: ToolRouter uses this trait method while planning extension tools, and the related test checks that the exposure is preserved.
 
 
 ##### `DeferredExtensionTool::handle`  (lines 346–348)
@@ -4213,11 +4233,11 @@ fn exposure(&self) -> ToolExposure
 fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Panics if execution is attempted, enforcing the test assumption that spec planning must not run extension code.
+**Purpose**: Intentionally fails if the fake deferred tool is executed. These tests are about planning only, so execution would mean something unexpected happened.
 
-**Data flow**: Ignores the call, returns a boxed future, and that future panics immediately when polled.
+**Data flow**: It ignores the call and returns an async future that panics when polled.
 
-**Call relations**: Acts as a guardrail in case planner tests accidentally cross into execution.
+**Call relations**: The deferred-extension planning test should never trigger this; it exists only to complete the ToolExecutor implementation.
 
 *Call graph*: 2 external calls (pin, panic!).
 
@@ -4228,11 +4248,11 @@ fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_
 fn duplicate_primary_environment(turn: &mut TurnContext)
 ```
 
-**Purpose**: Adds a second environment to the turn by cloning the primary one and renaming its `environment_id` to `secondary`. This triggers planner branches for multi-environment parameterization.
+**Purpose**: Adds a second environment to a test turn by copying the primary one and giving it a new id. This lets tests check behavior when multiple execution targets exist.
 
-**Data flow**: Clones `turn.environments.turn_environments[0]`, mutates the clone's `environment_id`, and pushes it back into `turn.environments.turn_environments`. It returns nothing.
+**Data flow**: It reads the first environment, clones it, changes its environment_id to secondary, and pushes it into the turn's environment list.
 
-**Call relations**: Used by environment-count tests to verify `environment_id` parameters appear when multiple environments are available.
+**Call relations**: The environment-count test calls it before checking that tools include an environment_id parameter.
 
 
 ##### `mcp_tool`  (lines 357–378)
@@ -4241,11 +4261,11 @@ fn duplicate_primary_environment(turn: &mut TurnContext)
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo
 ```
 
-**Purpose**: Constructs a valid synthetic `ToolInfo` representing an MCP tool in a namespace on a named server. Tests use it to simulate direct and deferred MCP inventories.
+**Purpose**: Builds a valid fake MCP tool for tests. MCP is a protocol that lets outside servers provide tools to the model.
 
-**Data flow**: Takes server, namespace, and callable name strings and returns a `ToolInfo` with namespace description, a JSON-object input schema with no properties and `additionalProperties: false`, and default connector/plugin metadata.
+**Data flow**: It receives server, namespace, and tool names. It creates a ToolInfo with a simple object input schema, namespace description, server metadata, and no connector information.
 
-**Call relations**: Used directly in MCP-related tests and as the base constructor for `invalid_mcp_tool`.
+**Call relations**: MCP-related tests use it directly, and invalid_mcp_tool starts from it before corrupting the schema.
 
 *Call graph*: called by 1 (invalid_mcp_tool); 6 external calls (new, new, format!, json!, new, object).
 
@@ -4256,11 +4276,11 @@ fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo
 fn invalid_mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo
 ```
 
-**Purpose**: Creates an MCP tool whose input schema is intentionally invalid for planner registration. This verifies that malformed MCP tools are filtered out.
+**Purpose**: Builds a fake MCP tool with an invalid input schema. Tests use it to prove bad external tool definitions are rejected.
 
-**Data flow**: Starts from `mcp_tool(...)`, then replaces `tool.tool.input_schema` with a schema object of type `null`. It returns the modified `ToolInfo`.
+**Data flow**: It creates a normal fake MCP tool, replaces its input schema with a schema whose type is null, and returns the modified ToolInfo.
 
-**Call relations**: Used only by `invalid_mcp_tools_are_not_registered` to exercise schema validation failure.
+**Call relations**: The invalid-MCP test passes this into probe_with and checks that ToolRouter does not register or expose it.
 
 *Call graph*: calls 1 internal fn (mcp_tool); 3 external calls (new, json!, object).
 
@@ -4271,11 +4291,11 @@ fn invalid_mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo
 fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> DynamicToolSpec
 ```
 
-**Purpose**: Builds either a plain or namespaced `DynamicToolSpec` with a configurable `defer_loading` flag. Tests use it to model nested dynamic tools and deferred namespaces.
+**Purpose**: Creates a fake dynamic tool spec, either as a standalone function or inside a namespace. Dynamic tools are tool definitions supplied at runtime rather than compiled in.
 
-**Data flow**: Creates a `DynamicToolFunctionSpec` with generated description and empty-object input schema, then wraps it either in `DynamicToolSpec::Namespace` with one function or `DynamicToolSpec::Function` depending on whether `namespace` is `Some` or `None`.
+**Data flow**: It receives an optional namespace, a tool name, and whether loading should be deferred. It builds a simple object input schema and returns either a function spec or a namespace spec containing that function.
 
-**Call relations**: Injected through `ToolPlanInputs::dynamic_tools` in code-mode and deferred-namespace tests.
+**Call relations**: Code-mode tests use it to check how nested dynamic tools are shown, hidden, or registered under different tool modes.
 
 *Call graph*: 5 external calls (format!, json!, Function, Namespace, vec!).
 
@@ -4286,11 +4306,11 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
 fn discoverable_plugin(id: &str, name: &str) -> DiscoverableTool
 ```
 
-**Purpose**: Creates a synthetic discoverable plugin entry from plugin metadata. This feeds planner logic for install-suggestion tools.
+**Purpose**: Creates a fake plugin candidate that could be suggested for installation. Tests use it as inventory for plugin-discovery tools.
 
-**Data flow**: Builds `DiscoverablePluginInfo` with id, name, generated description, and empty MCP/app connector lists, then converts it into `DiscoverableTool` via `.into()`.
+**Data flow**: It receives an id and display name, builds DiscoverablePluginInfo with a description and empty connector/server lists, and converts it into a DiscoverableTool.
 
-**Call relations**: Used by plugin-install tests to provide candidate inventory.
+**Call relations**: Plugin-installation tests pass these fake candidates into probe_with to decide whether list and request install tools should appear.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -4301,11 +4321,11 @@ fn discoverable_plugin(id: &str, name: &str) -> DiscoverableTool
 fn has_parameter(spec: &ToolSpec, parameter_name: &str) -> bool
 ```
 
-**Purpose**: Checks whether a serialized `ToolSpec` exposes a named parameter under `/parameters/properties`. It avoids hand-matching every `ToolSpec` variant.
+**Purpose**: Checks whether a visible tool spec declares a particular input parameter. This helps tests inspect schemas without depending on all schema details.
 
-**Data flow**: Serializes the `ToolSpec` to `serde_json::Value`, constructs a JSON Pointer for the parameter name, and returns `true` if that pointer resolves to a value. It does not mutate state.
+**Data flow**: It serializes the ToolSpec to JSON, follows the /parameters/properties/<name> path, and returns true if that JSON location exists.
 
-**Call relations**: Used in shell, exec, and image-view tests to verify planner-added parameters like `shell` and `environment_id`.
+**Call relations**: Shell, environment, and view-image tests use it after visible_spec to confirm that parameters such as shell or environment_id are present or absent.
 
 *Call graph*: 2 external calls (format!, to_value).
 
@@ -4316,11 +4336,11 @@ fn has_parameter(spec: &ToolSpec, parameter_name: &str) -> bool
 fn apply_patch_accepts_environment_id(spec: &ToolSpec) -> bool
 ```
 
-**Purpose**: Detects whether the visible freeform `apply_patch` tool mentions `Environment ID` in its format definition. This is how the test verifies multi-environment support for freeform patching.
+**Purpose**: Checks whether the freeform apply_patch tool description mentions Environment ID. Freeform tools do not expose ordinary JSON parameters, so the test inspects the text definition.
 
-**Data flow**: Pattern-matches the provided `ToolSpec`; if it is `ToolSpec::Freeform` named `apply_patch`, it searches the format definition string for `Environment ID` and returns that boolean, otherwise returns `false`.
+**Data flow**: It receives a ToolSpec. If it is a freeform apply_patch tool, it searches the tool's format definition text for Environment ID; otherwise it returns false.
 
-**Call relations**: Used only by the environment-count test to inspect freeform planner output.
+**Call relations**: The environment-count test uses this to confirm apply_patch adapts when more than one environment is available.
 
 
 ##### `request_user_input_tool_respects_experimental_config_gate`  (lines 443–460)
@@ -4329,11 +4349,11 @@ fn apply_patch_accepts_environment_id(spec: &ToolSpec) -> bool
 async fn request_user_input_tool_respects_experimental_config_gate()
 ```
 
-**Purpose**: Verifies that `request_user_input` is visible and registered by default, but disappears entirely when `experimental_request_user_input_enabled` is disabled in config.
+**Purpose**: Tests that request_user_input appears only when its experimental config switch allows it. This protects an interactive user-prompting tool from appearing unexpectedly.
 
-**Data flow**: Builds one default probe and one probe with config mutation, then asserts visibility, registration, and `ToolExposure::DirectModelOnly` for the enabled case and absence for the disabled case.
+**Data flow**: It first probes the default config and checks the tool is visible, registered, and direct-model-only. Then it disables the experimental config setting, probes again, and checks the tool is absent from both visible and registered lists.
 
-**Call relations**: Exercises the planner path for the user-input tool under config gating.
+**Call relations**: The test relies on probe for setup and uses ToolPlanProbe assertions to compare enabled versus disabled plans.
 
 *Call graph*: calls 1 internal fn (probe); 1 external calls (assert_eq!).
 
@@ -4344,11 +4364,11 @@ async fn request_user_input_tool_respects_experimental_config_gate()
 async fn request_user_input_stays_direct_in_code_mode_only()
 ```
 
-**Purpose**: Checks that code-mode-only planning still exposes `request_user_input` directly alongside code-mode entrypoints, and that the code executor description does not absorb that tool's semantics.
+**Purpose**: Tests that request_user_input remains a direct model tool even when code-mode-only is active. It also ensures the code executor description does not advertise that nested tool.
 
-**Data flow**: Enables `CodeMode` and `CodeModeOnly`, probes the router, asserts visible names and direct-model-only exposure, then inspects the freeform code exec spec description to ensure it does not mention `request_user_input`.
+**Data flow**: It enables code mode and code-mode-only, builds a plan, checks request_user_input plus code-mode entry tools are visible, verifies exposure, then inspects the exec tool description.
 
-**Call relations**: Validates coexistence of code-mode wrappers with a separately visible direct tool.
+**Call relations**: It uses set_features inside probe and then calls visible_spec for the code-mode exec tool.
 
 *Call graph*: calls 1 internal fn (probe); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -4359,11 +4379,11 @@ async fn request_user_input_stays_direct_in_code_mode_only()
 async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell()
 ```
 
-**Purpose**: Verifies that with shell tooling and unified exec enabled, the planner exposes `exec_command` and `write_stdin` while keeping legacy `shell_command` registered but hidden.
+**Purpose**: Tests the shell-tool family when unified exec is enabled. The new exec_command and write_stdin tools should be visible, while the old shell_command remains registered but hidden.
 
-**Data flow**: Mutates features and shell type, probes, then asserts visible and registered sets, checks `shell_command` exposure is `Hidden`, and confirms `exec_command` includes a `shell` parameter.
+**Data flow**: It enables shell and unified exec features, disables ZshFork, sets the model shell type, and probes. It checks visible names, registered names, hidden exposure for shell_command, and the shell parameter on exec_command.
 
-**Call relations**: Covers the planner's shell-family composition and backward-compatibility registration behavior.
+**Call relations**: This test uses probe plus helper assertions to verify both the public tool surface and the hidden compatibility runtime.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert!, assert_eq!).
 
@@ -4374,11 +4394,11 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell()
 async fn shell_zsh_fork_stays_standalone_until_unified_exec_composition_is_enabled()
 ```
 
-**Purpose**: Tests the split behavior for Zsh-fork shell mode: standalone `shell_command` until unified-exec composition is enabled, then conditional composition depending on PTY support.
+**Purpose**: Tests that ZshFork shell mode does not automatically use unified exec unless the specific composition feature is enabled. It also accounts for platforms where terminal support is unavailable.
 
-**Data flow**: Builds one probe with `ShellZshFork` enabled but `UnifiedExecZshFork` disabled and another with both enabled. It asserts different visible/registered sets, branching on `codex_utils_pty::conpty_supported()` for the composed case.
+**Data flow**: It builds one plan with ZshFork enabled but unified-exec composition disabled and expects shell_command only. Then it builds a second plan with composition enabled and checks either unified exec or standalone behavior depending on terminal support.
 
-**Call relations**: Exercises planner logic that depends on both feature flags and platform PTY capability.
+**Call relations**: It uses probe for both scenarios and the platform support check to avoid expecting unified terminal behavior where it cannot work.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert_eq!, conpty_supported).
 
@@ -4389,11 +4409,11 @@ async fn shell_zsh_fork_stays_standalone_until_unified_exec_composition_is_enabl
 async fn zsh_fork_unified_exec_hides_shell_parameter()
 ```
 
-**Purpose**: Ensures that when unified exec is explicitly configured for Zsh-fork on a PTY-capable platform, `exec_command` no longer exposes a `shell` parameter.
+**Purpose**: Tests that unified exec hides the shell selector when ZshFork is the only local shell mode. This prevents the model from choosing a shell it cannot actually vary.
 
-**Data flow**: Early-returns if PTY support is absent. Otherwise it enables the relevant features, sets `turn.unified_exec_shell_mode` to `UnifiedExecShellMode::ZshFork(...)`, probes, and asserts `exec_command` lacks the `shell` parameter.
+**Data flow**: If the platform lacks terminal support, it exits early. Otherwise it enables the needed shell features, sets ZshFork mode with a placeholder config, probes, and verifies exec_command lacks the shell parameter.
 
-**Call relations**: Checks a schema-level planner refinement specific to local Zsh-fork execution.
+**Call relations**: It uses the ZshFork config helper and has_parameter to inspect the final exec_command schema.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert!, conpty_supported).
 
@@ -4404,11 +4424,11 @@ async fn zsh_fork_unified_exec_hides_shell_parameter()
 async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_available()
 ```
 
-**Purpose**: Verifies that adding a remote environment reintroduces `shell` and `environment_id` parameters on `exec_command` even under Zsh-fork unified exec.
+**Purpose**: Tests that the shell selector comes back when a remote environment is available. A remote target may support different shell behavior, so the model needs a shell choice again.
 
-**Data flow**: Skips on unsupported PTY platforms, otherwise configures Zsh-fork unified exec, appends a remote `TurnEnvironment` backed by a test exec-server URL, probes, and asserts both parameters are present.
+**Data flow**: After a platform support check, it enables ZshFork unified exec, adds a remote test environment, probes, and checks exec_command includes both shell and environment_id parameters.
 
-**Call relations**: Covers the planner branch where remote execution options require explicit environment and shell selection.
+**Call relations**: It constructs an extra TurnEnvironment inside probe and then uses has_parameter to confirm the router noticed the multi-environment situation.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert!, conpty_supported).
 
@@ -4419,11 +4439,11 @@ async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_ava
 async fn environment_count_controls_environment_backed_tools()
 ```
 
-**Purpose**: Checks that environment-backed tools disappear when there are no environments and gain `environment_id` support when multiple environments exist.
+**Purpose**: Tests that tools requiring an execution environment disappear when no environment exists, and gain environment selection when multiple environments exist.
 
-**Data flow**: Creates one probe with `turn.environments.turn_environments` cleared and another with a duplicated environment plus shell/unified-exec/apply-patch setup. It asserts absence in the first case and visibility plus parameter/format changes in the second.
+**Data flow**: It first clears all environments, enables shell/apply_patch settings, and checks shell, exec, apply_patch, and view_image are absent. Then it duplicates the primary environment, enables relevant features, and checks visible tools include environment_id support.
 
-**Call relations**: Validates planner dependence on environment inventory, not just feature flags.
+**Call relations**: It uses duplicate_primary_environment, has_parameter, and apply_patch_accepts_environment_id to inspect how the tool plan changes with environment count.
 
 *Call graph*: calls 1 internal fn (probe); 1 external calls (assert!).
 
@@ -4434,11 +4454,11 @@ async fn environment_count_controls_environment_backed_tools()
 async fn host_context_gates_agent_job_tools()
 ```
 
-**Purpose**: Verifies that `report_agent_job_result` is only exposed when the session source identifies a worker subagent for an agent job, while `spawn_agents_on_csv` remains available in both contexts.
+**Purpose**: Tests that agent-job reporting tools only appear when the current session is a worker agent job. Normal sessions should be able to spawn CSV agents but not report job results.
 
-**Data flow**: Builds a normal probe and a probe whose `session_source` is `SubAgent(Other("agent_job:42"))`, then compares visible tool sets.
+**Data flow**: It probes once with SpawnCsv enabled in a normal session and checks only spawn_agents_on_csv appears. It probes again after marking the session source as a subagent job and checks report_agent_job_result appears too.
 
-**Call relations**: Exercises planner gating based on host/session context rather than config alone.
+**Call relations**: The test changes session_source inside probe so ToolRouter can gate tools based on where the session came from.
 
 *Call graph*: calls 1 internal fn (probe).
 
@@ -4449,11 +4469,11 @@ async fn host_context_gates_agent_job_tools()
 async fn sleep_tool_follows_feature_gate()
 ```
 
-**Purpose**: Confirms that the `sleep` tool is purely feature-gated. Disabled feature means no visible tool; enabled feature means visible tool.
+**Purpose**: Tests that the sleep tool follows its feature flag. This keeps a simple timing tool from appearing unless explicitly enabled.
 
-**Data flow**: Builds one probe with `Feature::SleepTool` disabled and one with it enabled, then asserts visibility accordingly.
+**Data flow**: It probes with SleepTool disabled and checks sleep is absent, then probes with SleepTool enabled and checks sleep is visible.
 
-**Call relations**: A straightforward feature-gate regression test.
+**Call relations**: It uses set_feature inside probe for the two opposite states.
 
 *Call graph*: calls 1 internal fn (probe).
 
@@ -4464,11 +4484,11 @@ async fn sleep_tool_follows_feature_gate()
 async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure()
 ```
 
-**Purpose**: Tests direct MCP visibility, deferred MCP discoverability through `tool_search`, and the additional gating imposed by model capability, feature state, and provider namespace support.
+**Purpose**: Tests how MCP tools interact with direct visibility and deferred tool search. It confirms direct MCP tools are shown as namespaces, while deferred MCP tools require model support for tool_search.
 
-**Data flow**: Constructs several probes with combinations of direct MCP tools, deferred MCP tools, `supports_search_tool`, disabled collaboration, and Bedrock provider selection. It asserts visible namespaces, resource helper tools, `tool_search` presence or absence, and registration of deferred namespaced runtimes.
+**Data flow**: It builds several plans: direct MCP, deferred MCP without model search support, no deferred tools, Bedrock with namespace capability, and fully enabled search. It checks visible resource helpers, tool_search visibility, and registered deferred tool names.
 
-**Call relations**: This is the main integration-style test for MCP planning and deferred-search behavior.
+**Call relations**: The test combines probe_with, mcp_tool, provider setup, and ToolName construction to cover direct and searchable MCP paths.
 
 *Call graph*: calls 3 internal fn (probe, probe_with, namespaced); 3 external calls (assert_eq!, default, vec!).
 
@@ -4479,11 +4499,11 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure()
 async fn deferred_extension_tools_are_discoverable_with_tool_search()
 ```
 
-**Purpose**: Verifies that a deferred extension executor is registered and searchable but not directly visible when the model supports tool search.
+**Purpose**: Tests that a deferred extension tool is registered but not directly visible, and that tool_search is shown so the model can discover it.
 
-**Data flow**: Injects `DeferredExtensionTool` through `probe_with`, enables `supports_search_tool`, then asserts visible `tool_search`, hidden `extension_echo`, registered runtime presence, and `ToolExposure::Deferred`.
+**Data flow**: It enables model support for search, supplies the fake DeferredExtensionTool executor, probes, and checks tool_search is visible, extension_echo is hidden from visible tools, and extension_echo is registered with deferred exposure.
 
-**Call relations**: Complements the deferred MCP test with the extension-tool source path.
+**Call relations**: It uses probe_with because the scenario needs an extension executor in addition to turn configuration.
 
 *Call graph*: calls 1 internal fn (probe_with); 3 external calls (assert_eq!, default, vec!).
 
@@ -4494,11 +4514,11 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search()
 async fn tool_search_cache_rebuilds_when_deferred_sources_change()
 ```
 
-**Purpose**: Ensures `ToolSearchHandlerCache` does not stale-cache deferred inventory descriptions across turns with different deferred MCP sources.
+**Purpose**: Tests that the tool-search handler cache does not reuse stale descriptions when the set of deferred tools changes. This prevents the model from seeing an old tool inventory.
 
-**Data flow**: Creates a shared cache, builds two separate sessions/turns with different deferred MCP namespaces, constructs routers manually, converts them to probes, extracts the `ToolSpec::ToolSearch` descriptions, and asserts each description mentions only its own server inventory.
+**Data flow**: It creates one shared cache, builds a first router with a deferred MCP server named first, then builds a second router with a deferred MCP server named second. It inspects each tool_search description and confirms each mentions only its own source.
 
-**Call relations**: Directly exercises router construction with a reused cache to verify cache invalidation/rebuild semantics.
+**Call relations**: Unlike most tests, it calls make_session_and_context and ToolRouter::from_turn_context directly so both routers share the same cache.
 
 *Call graph*: calls 3 internal fn (make_session_and_context, from_turn_context, from_router); 5 external calls (new, assert!, default, panic!, vec!).
 
@@ -4509,11 +4529,11 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change()
 async fn invalid_mcp_tools_are_not_registered()
 ```
 
-**Purpose**: Checks that MCP tools with invalid input schemas are filtered out before registration and visibility.
+**Purpose**: Tests that MCP tools with invalid schemas are rejected. This protects the model and runtime from malformed external tool definitions.
 
-**Data flow**: Injects one `invalid_mcp_tool` via `probe_with`, then asserts the namespace is not visible and the namespaced runtime name is absent from registration.
+**Data flow**: It supplies one invalid fake MCP tool, probes, and checks neither the namespace nor the namespaced callable is visible or registered.
 
-**Call relations**: Targets planner validation of MCP schemas.
+**Call relations**: It uses invalid_mcp_tool and probe_with to feed bad external input into the normal router path.
 
 *Call graph*: calls 2 internal fn (probe_with, namespaced); 2 external calls (default, vec!).
 
@@ -4524,11 +4544,11 @@ async fn invalid_mcp_tools_are_not_registered()
 async fn request_plugin_install_requires_all_discovery_features_and_discoverable_tools()
 ```
 
-**Purpose**: Verifies that plugin-install suggestion tools appear only when all three discovery features are enabled and there is at least one discoverable tool candidate.
+**Purpose**: Tests that plugin-installation suggestion tools only appear when all required discovery features are enabled and there is at least one installable candidate.
 
-**Data flow**: Loops over each feature to disable it in turn while keeping the others enabled, probing each case and asserting absence. It then probes with no candidates and finally with candidates plus all features enabled, asserting visibility only in the final case.
+**Data flow**: It loops over each required feature, disables that one while enabling the others, and checks install tools are absent. It also checks no candidates means absent, then supplies a fake plugin and confirms both list and request tools are visible.
 
-**Call relations**: Covers the conjunction of feature gates and inventory presence for plugin-install tooling.
+**Call relations**: It uses discoverable_plugin plus probe_with for candidate inventory, and probe for the no-candidate case.
 
 *Call graph*: calls 2 internal fn (probe, probe_with); 2 external calls (default, vec!).
 
@@ -4539,11 +4559,11 @@ async fn request_plugin_install_requires_all_discovery_features_and_discoverable
 async fn install_suggestion_tools_stay_visible_without_tool_search()
 ```
 
-**Purpose**: Confirms that plugin-install suggestion tools do not depend on `tool_search` support. They remain visible even when the model cannot use search.
+**Purpose**: Tests that plugin installation suggestion tools do not depend on the model's tool_search capability. They should still be directly visible when discovery is enabled.
 
-**Data flow**: Builds a probe with `supports_search_tool = false`, discovery features enabled, and a discoverable plugin candidate, then asserts install tools are visible while `tool_search` is absent.
+**Data flow**: It disables model search support, enables the required plugin-discovery features, supplies a fake plugin candidate, probes, and checks install tools appear while tool_search does not.
 
-**Call relations**: Separates install-suggestion planning from deferred-search planning.
+**Call relations**: This complements the broader plugin gate test by isolating the relationship between plugin suggestions and tool_search.
 
 *Call graph*: calls 1 internal fn (probe_with); 2 external calls (default, vec!).
 
@@ -4554,11 +4574,11 @@ async fn install_suggestion_tools_stay_visible_without_tool_search()
 async fn request_plugin_install_description_defers_inventory_to_list_tool()
 ```
 
-**Purpose**: Checks the exact descriptions of the plugin-install tools so that inventory is delegated to the list tool and the request tool does not inline candidate names.
+**Purpose**: Tests that request_plugin_install's description does not contain a hardcoded plugin inventory. Instead, the model should first call the list tool and then request an exact match.
 
-**Data flow**: Builds a probe with discovery features and a GitHub plugin candidate, extracts the visible `ResponsesApiTool` descriptions for `list_available_plugins_to_install` and `request_plugin_install`, and asserts required guidance text is present while the concrete plugin name is absent from the request description.
+**Data flow**: It enables plugin discovery, supplies a fake GitHub plugin, probes, then inspects the descriptions of list_available_plugins_to_install and request_plugin_install. It checks the list tool describes returning candidates and the request tool points to the list tool without naming github.
 
-**Call relations**: Validates user-facing planner copy, not just tool presence.
+**Call relations**: It uses visible_spec to inspect exact function descriptions rather than only checking tool presence.
 
 *Call graph*: calls 1 internal fn (probe_with); 4 external calls (assert!, default, panic!, vec!).
 
@@ -4569,11 +4589,11 @@ async fn request_plugin_install_description_defers_inventory_to_list_tool()
 async fn code_mode_only_exposes_code_executor_and_hides_nested_tools()
 ```
 
-**Purpose**: Verifies that code-mode-only planning replaces visible nested dynamic namespace tools with the code executor/wait entrypoints, while the same dynamic namespace is visible in plain mode.
+**Purpose**: Tests that code-mode-only changes the visible surface from nested dynamic tools to the code executor entrypoints. The model should use the code-mode wrapper rather than directly seeing nested tools.
 
-**Data flow**: Creates one probe with a namespaced dynamic tool and no code-mode features, then another with `CodeMode` and `CodeModeOnly` enabled. It compares namespace contents and visible code-mode tool names across the two cases.
+**Data flow**: It first supplies a dynamic namespaced tool without code mode and checks the namespace function is visible. Then it enables code mode and code-mode-only with the same dynamic tool, checks exec and wait are visible, and confirms the original namespace no longer exposes the function.
 
-**Call relations**: Exercises the planner's code-mode-only abstraction layer over nested tools.
+**Call relations**: It uses dynamic_tool and probe_with to compare the same runtime tool under two different tool modes.
 
 *Call graph*: calls 1 internal fn (probe_with); 3 external calls (assert_eq!, default, vec!).
 
@@ -4584,11 +4604,11 @@ async fn code_mode_only_exposes_code_executor_and_hides_nested_tools()
 async fn excluded_deferred_namespaces_do_not_enable_nested_tool_guidance()
 ```
 
-**Purpose**: Checks that deferred nested tools from namespaces explicitly excluded in config do not trigger extra guidance text in the code-mode executor description, even though the deferred tools remain registered and searchable.
+**Purpose**: Tests that deferred tools in excluded namespaces do not cause code-mode guidance text about omitted nested tools. Excluded namespaces should not affect that user-facing explanation.
 
-**Data flow**: Configures code-mode-only, disables collaboration, enables search support, sets `config.code_mode.excluded_tool_namespaces = ["excluded"]`, injects a deferred dynamic namespace tool, then inspects the code exec description and registration state.
+**Data flow**: It enables code-mode-only, disables collaboration, enables model search support, configures an excluded namespace, and supplies a deferred dynamic tool in that namespace. It checks the code exec description lacks the deferred-tool guidance and that the tool plus tool_search are registered.
 
-**Call relations**: Targets a subtle UX rule in code-mode planner messaging for excluded deferred namespaces.
+**Call relations**: It combines dynamic_tool, config updates, and visible_spec to inspect a subtle code-mode description rule.
 
 *Call graph*: calls 2 internal fn (probe_with, namespaced); 4 external calls (assert!, default, panic!, vec!).
 
@@ -4599,11 +4619,11 @@ async fn excluded_deferred_namespaces_do_not_enable_nested_tool_guidance()
 async fn multi_agent_feature_selects_one_agent_tool_family()
 ```
 
-**Purpose**: Verifies that planner output selects either multi-agent v1 or v2 tool families, not both, and that v2 can be forced to direct-model-only exposure in code-mode-only configurations.
+**Purpose**: Tests that the planner chooses exactly one multi-agent tool family: older v1 namespaced tools or newer v2 tools. It also verifies selected schema and exposure details.
 
-**Data flow**: Builds three probes: v1 with `Collab` enabled and `MultiAgentV2` disabled, v2 with `MultiAgentV2` enabled and custom concurrency config, and a code-mode-only v2 case with `non_code_mode_only = true`. It asserts visible sets, namespace contents, schema properties, description text, and exposure values.
+**Data flow**: It probes with collaboration enabled and MultiAgentV2 disabled, expecting the v1 namespace and its functions. Then it probes with v2 enabled, expecting v2 standalone tools and specific description content. Finally it tests code-mode-only with non-code-mode-only v2 settings and checks direct-model-only exposure.
 
-**Call relations**: This is the main family-selection test for multi-agent planning.
+**Call relations**: This test uses feature setup and config updates to compare the major multi-agent planning branches.
 
 *Call graph*: calls 1 internal fn (probe); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -4614,11 +4634,11 @@ async fn multi_agent_feature_selects_one_agent_tool_family()
 async fn multi_agent_v2_message_schemas_are_encrypted()
 ```
 
-**Purpose**: Ensures that the `message` parameter in key multi-agent v2 tools is marked encrypted in the visible JSON schema.
+**Purpose**: Tests that message fields in v2 multi-agent tools are marked encrypted. This is important because those messages may contain user or task context that should be protected.
 
-**Data flow**: Enables `MultiAgentV2`, probes, iterates over `spawn_agent`, `send_message`, and `followup_task`, extracts each function tool's parameter schema, and asserts `properties["message"].encrypted == Some(true)`.
+**Data flow**: It enables MultiAgentV2, probes, then inspects spawn_agent, send_message, and followup_task parameter schemas. For each one it checks the message property has encrypted set to true.
 
-**Call relations**: Checks a schema security invariant in planner output.
+**Call relations**: It uses visible_spec to inspect schema metadata that simple visibility checks would miss.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert_eq!, panic!).
 
@@ -4629,11 +4649,11 @@ async fn multi_agent_v2_message_schemas_are_encrypted()
 async fn tool_mode_selector_overrides_feature_flags()
 ```
 
-**Purpose**: Verifies that an explicit `model_info.tool_mode = Direct` suppresses code-mode-only entrypoints even if code-mode features are enabled.
+**Purpose**: Tests that an explicit model tool-mode setting wins over feature flags. Even if code-mode features are enabled, ToolMode::Direct should prevent code-mode entry tools from appearing.
 
-**Data flow**: Enables code-mode features, manually sets both `turn.model_info.tool_mode` and `turn.tool_mode` to `ToolMode::Direct`, probes, and asserts the code-mode public and wait tools are absent.
+**Data flow**: It enables code-mode flags, sets the model and turn tool mode to Direct, probes, and checks the code-mode exec and wait tools are absent.
 
-**Call relations**: Covers precedence between explicit model tool-mode selection and feature-derived defaults.
+**Call relations**: This test checks the interaction between set_feature's default tool-mode recalculation and an explicit override set afterward.
 
 *Call graph*: calls 1 internal fn (probe).
 
@@ -4644,11 +4664,11 @@ async fn tool_mode_selector_overrides_feature_flags()
 async fn v1_multi_agent_tools_defer_when_tool_search_available()
 ```
 
-**Purpose**: Checks that when tool search is available, multi-agent v1 tools are hidden from direct visibility and instead registered as deferred namespaced runtimes discoverable through `tool_search`.
+**Purpose**: Tests that v1 multi-agent tools become deferred when tool_search is available. Instead of showing the whole namespace directly, the model sees tool_search and can discover those tools.
 
-**Data flow**: Enables search support and v1 multi-agent features, probes, asserts visible `tool_search` and absence of plain multi-agent tools, then for each v1 function verifies the namespaced runtime is registered, the plain runtime is not, and exposure is `Deferred`. It also inspects the tool-search description text.
+**Data flow**: It enables model search support, turns on collaboration, disables v2, probes, and checks tool_search is visible while v1 function names are not directly visible. It then verifies namespaced runtimes are registered with deferred exposure and the search description mentions multi-agent tools.
 
-**Call relations**: Exercises the planner's deferred-search representation for the v1 multi-agent family.
+**Call relations**: It uses ToolName::namespaced to check the runtime names that should exist when v1 tools are deferred.
 
 *Call graph*: calls 2 internal fn (probe, namespaced); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -4659,11 +4679,11 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available()
 async fn multi_agent_v2_can_use_configured_tool_namespace()
 ```
 
-**Purpose**: Verifies that multi-agent v2 tools can be exposed under a configured namespace instead of as plain top-level functions, and that unsupported legacy names like `assign_task` stay absent.
+**Purpose**: Tests that v2 multi-agent tools can be grouped under a configured namespace. It also confirms removed or unsupported tools, such as assign_task, do not sneak into that namespace.
 
-**Data flow**: Enables `MultiAgentV2`, sets `config.multi_agent_v2.tool_namespace = Some("agents")`, probes, then asserts visible namespace presence, absence of plain tool names, registration of namespaced runtimes only, and namespace membership for each supported function.
+**Data flow**: It enables MultiAgentV2, sets the namespace to agents, probes, and checks the visible surface is the agents namespace rather than standalone tool names. It verifies expected functions are registered and present inside the namespace, while assign_task is absent.
 
-**Call relations**: Covers configurable namespacing for v2 planner output.
+**Call relations**: This covers the configured namespace branch of multi-agent v2 planning.
 
 *Call graph*: calls 1 internal fn (probe); 1 external calls (assert!).
 
@@ -4674,11 +4694,11 @@ async fn multi_agent_v2_can_use_configured_tool_namespace()
 async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider()
 ```
 
-**Purpose**: Checks that Bedrock provider planning still supports namespaced multi-agent v2 tools when a namespace is configured.
+**Purpose**: Tests that a namespaced v2 multi-agent tool surface works with the Bedrock provider. Provider differences should not remove the configured agents namespace.
 
-**Data flow**: Enables `MultiAgentV2`, configures namespace `agents`, switches to Bedrock provider, probes, and asserts the namespace is visible while plain top-level v2 tools are absent and namespaced runtimes are registered.
+**Data flow**: It enables MultiAgentV2, configures the agents namespace, switches the provider to Bedrock, probes, and checks the namespace is visible while plain standalone names are not registered.
 
-**Call relations**: Complements the previous namespace test with provider-specific capability coverage.
+**Call relations**: It combines use_bedrock_provider with the namespace configuration to verify provider-specific compatibility.
 
 *Call graph*: calls 1 internal fn (probe); 1 external calls (assert!).
 
@@ -4689,11 +4709,11 @@ async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider()
 async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools()
 ```
 
-**Purpose**: Verifies the combined planner output for code-mode-only plus namespaced multi-agent v2, including exact visible tool ordering and namespace contents.
+**Purpose**: Tests a code-mode-only setup where namespaced multi-agent v2 tools are still exposed as normal direct tools. This is a special case controlled by config.
 
-**Data flow**: Enables `CodeMode`, `CodeModeOnly`, and `MultiAgentV2`, configures `non_code_mode_only = true` and namespace `agents`, probes, then asserts the exact `visible_names` vector and checks that supported v2 functions appear inside the `agents` namespace while `assign_task` does not.
+**Data flow**: It enables code mode, code-mode-only, and MultiAgentV2, sets non_code_mode_only and the agents namespace, then probes. It checks the exact visible tool order and confirms the agents namespace contains expected functions but not assign_task.
 
-**Call relations**: Exercises a combined configuration where code-mode wrappers and namespaced v2 tools coexist.
+**Call relations**: This test ties together code-mode visibility, multi-agent v2 namespace configuration, and hosted web-search ordering.
 
 *Call graph*: calls 1 internal fn (probe); 2 external calls (assert!, assert_eq!).
 
@@ -4704,24 +4724,24 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools()
 async fn hosted_tools_follow_provider_auth_model_and_config_gates()
 ```
 
-**Purpose**: Tests hosted Responses tools such as image generation and web search across auth modes, provider selection, model capabilities, code-mode-only composition, standalone web-search feature gating, and extension overrides.
+**Purpose**: Tests the rules for hosted Responses API tools such as image generation and web search. These tools depend on authentication, provider support, model capabilities, feature flags, and extension-tool conflicts.
 
-**Data flow**: Builds multiple probes covering API-key auth versus ChatGPT auth, image-generation features, web-search mode and tool type, code-mode-only plus multi-agent v2, standalone web search with and without `WebRunExtensionTool`, and Bedrock provider. It asserts visible sets and exact `ToolSpec::WebSearch` contents where relevant.
+**Data flow**: It checks image generation is hidden with API-key auth but visible with ChatGPT auth and image-capable model settings. It checks web_search specs under live mode, hosted tools in code-mode-only ordering, standalone web-search behavior with and without a web.run extension, and hiding web_search on an unsupported provider.
 
-**Call relations**: This is the broadest hosted-tool planner regression test, tying together provider, auth, model, feature, and extension inputs.
+**Call relations**: This is a broad integration-style planner test that uses probe, probe_with, authentication helpers, provider helpers, and web-search config helpers.
 
 *Call graph*: calls 2 internal fn (probe, probe_with); 3 external calls (default, assert_eq!, vec!).
 
 
 ### `core/src/tools/tool_dispatch_trace_tests.rs`
 
-`test` · `test execution; validates rollout-trace emission during tool dispatch`
+`test` · `test`
 
-This file constructs real `ToolRegistry` dispatches against a temporary rollout-trace root and then replays the emitted bundle to assert trace contents. `TestHandler` is a minimal `ToolExecutor<ToolInvocation>` and `CoreToolRuntime` implementation that exposes a plain function tool and always returns `FunctionToolOutput::from_text("ok", Some(true))`. The tests use `make_session_and_context` to obtain a realistic `Session` and `TurnContext`, then replace `session.services.rollout_thread_trace` with a test trace context created by `attach_test_trace`.
+When the system asks a tool to run, it also needs to leave a clear paper trail: who asked for the tool, what payload was sent, whether it succeeded, and what result came back. This file is a set of automated tests for that paper trail. The “rollout trace” is like a flight recorder for an agent session; if it misses or mislabels tool calls, later replay and debugging would give a false story.
 
-The helper `test_invocation_with_payload` builds a full `ToolInvocation`, including a fresh `CancellationToken` and a new `TurnDiffTracker` wrapped in `Arc<tokio::sync::Mutex<_>>`, so dispatch runs through the same shape as production. `test_invocation` is a convenience wrapper for function-call payloads. `single_bundle_dir` asserts that exactly one trace bundle directory was produced and returns its path for replay.
+The file builds small fake sessions in temporary folders, attaches a test trace recorder to them, and then sends tool invocations through the normal ToolRegistry dispatch path. A tiny TestHandler stands in for a real tool: it advertises one test tool and always returns the text “ok”. The tests then replay the saved trace from disk and inspect what was recorded.
 
-The tests cover four important cases: direct versus code-mode requester attribution, unsupported-tool failures from an empty registry, incompatible payload failures when a function tool receives `ToolPayload::Custom`, and the special case where dispatching the code-mode wait tool should not fabricate code-cell traces if none were started. Assertions inspect replayed `tool_calls` entries for requester type, model-visible call id, code-mode runtime tool id, execution status, and presence of raw invocation/result payload ids, proving that both success and failure paths preserve enough trace data for later analysis.
+The important cases are: a normal model-requested tool call, a code-mode tool call coming from a code cell, an unsupported tool name, a tool called with the wrong kind of payload, and a code-mode wait call when no matching code cell trace exists. Together these tests protect the boundary between tool execution and trace recording, making sure both success and failure leave enough information for later inspection.
 
 #### Function details
 
@@ -4731,11 +4751,11 @@ The tests cover four important cases: direct versus code-mode requester attribut
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the configured tool name for the test handler. This lets each test register a handler under a predictable runtime name.
+**Purpose**: Returns the name of the fake tool used by these tests. The registry uses this name to decide which handler should receive a tool call.
 
-**Data flow**: Reads `self.tool_name` and returns a clone of it. No state is mutated.
+**Data flow**: It reads the tool name stored inside the TestHandler, makes a copy of it, and gives that copy back. Nothing else is changed.
 
-**Call relations**: Used by `ToolRegistry::with_handler_for_test` when the registry introspects the handler during test setup.
+**Call relations**: This is part of the ToolExecutor behavior implemented by TestHandler. When the test registry is built with this handler, the registry can ask for the handler’s name so it can route matching invocations to it.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4746,11 +4766,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Provides a minimal function-tool spec for the registered test handler. The schema is intentionally empty because dispatch tracing tests care about execution and tracing, not validation richness.
+**Purpose**: Builds the public description of the fake test tool. This description says the tool is a function-style tool named like the handler’s tool name, with a simple placeholder description and default input schema.
 
-**Data flow**: Builds and returns `codex_tools::ToolSpec::Function` containing a `ResponsesApiTool` whose name comes from `self.tool_name.name`, with a fixed description, `strict = false`, default parameters, and no output schema.
+**Data flow**: It reads the stored tool name, fills out a tool specification object with that name and basic metadata, and returns the specification. It does not run the tool or inspect any invocation.
 
-**Call relations**: Consumed by the registry during handler registration so dispatch can resolve the tool.
+**Call relations**: This supports the same ToolExecutor interface as the real tools. The registry can use it when it needs to know what tools are available, although in these tests the main focus is dispatching and tracing rather than the schema itself.
 
 *Call graph*: 2 external calls (default, Function).
 
@@ -4761,11 +4781,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Implements a successful test execution path that always returns the text output `ok` marked successful for logging.
+**Purpose**: Pretends to run a tool and always succeeds with the text result “ok”. This gives the tests a predictable successful tool execution without depending on any real tool behavior.
 
-**Data flow**: Ignores the incoming `ToolInvocation`, returns a boxed future, and resolves to `Ok(Box<dyn ToolOutput>)` containing `FunctionToolOutput::from_text("ok", Some(true))`.
+**Data flow**: It receives a tool invocation but ignores its contents. It creates a successful FunctionToolOutput containing “ok”, wraps it in the asynchronous return shape expected by the tool system, and returns it.
 
-**Call relations**: Invoked by registry dispatch in the success-path tracing test.
+**Call relations**: The ToolRegistry calls this when a test invocation names the fake tool. Its simple success result lets the surrounding tests check whether dispatch tracing records the invocation and result payloads correctly.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (new, pin).
 
@@ -4776,11 +4796,11 @@ fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture
 async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that replayed rollout traces distinguish direct model calls from code-mode calls and preserve both invocation and result payload references.
+**Purpose**: Checks that the trace records who requested a tool call correctly: either the model directly, or a code cell running in code mode. It also checks that the trace keeps the raw invocation and result payloads needed for replay.
 
-**Data flow**: Creates a temp trace root, session, and turn; attaches tracing; starts a code-cell trace; registers `TestHandler`; dispatches one direct and one code-mode invocation; replays the single emitted bundle; and asserts requester fields, model-visible call id presence/absence, code-mode runtime tool id, and raw payload ids.
+**Data flow**: The test creates a temporary trace folder, makes a fake session and turn, attaches tracing, and starts a code-cell trace. It dispatches one direct tool call and one code-mode tool call through a registry containing TestHandler. Then it reloads the saved trace from disk and verifies that the direct call is marked as model-requested while the code-mode call is linked to the right code cell and runtime tool id.
 
-**Call relations**: Exercises the full dispatch-to-trace pipeline for both requester variants using the helper constructors in this file.
+**Call relations**: This is one of the main end-to-end tests in the file. It uses attach_test_trace to install the recorder, test_invocation to build dispatch inputs, TestHandler through ToolRegistry to produce successful outputs, and single_bundle_dir to find the saved trace before replaying it.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, with_handler_for_test, attach_test_trace, single_bundle_dir, test_invocation, plain); 6 external calls (clone, new, new, assert!, assert_eq!, replay_bundle).
 
@@ -4791,11 +4811,11 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
 async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that dispatching an unknown tool from an empty registry records a failed tool-call trace with a result payload.
+**Purpose**: Checks that asking for a tool that is not registered is still written to the trace as a failed tool call. This matters because failures are part of the real session history and must not disappear.
 
-**Data flow**: Creates traced session state, uses `ToolRegistry::empty_for_test`, dispatches a direct invocation for `missing_tool`, asserts the returned error matches `FunctionCallError::RespondToModel`, replays the bundle, and checks failed execution status plus presence of `raw_result_payload_id`.
+**Data flow**: The test creates a traced fake session, but uses an empty tool registry. It dispatches a call for a missing tool, expects an error that can be reported back to the model, then reloads the trace and confirms the tool call is marked failed and has a recorded result payload.
 
-**Call relations**: Covers an early registry failure path to ensure `ToolDispatchTrace::record_failed` is wired correctly.
+**Call relations**: This test exercises the registry’s failure path instead of TestHandler. It still uses the shared helpers attach_test_trace, test_invocation, and single_bundle_dir so the setup matches the successful dispatch tests.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, empty_for_test, attach_test_trace, single_bundle_dir, test_invocation); 5 external calls (new, new, assert!, assert_eq!, replay_bundle).
 
@@ -4806,11 +4826,11 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
 async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a payload-shape mismatch for a registered function tool is traced as a failed execution with a result payload.
+**Purpose**: Checks that a tool call with the wrong kind of payload is recorded as a failure. This protects trace completeness when dispatch breaks before the tool can run normally.
 
-**Data flow**: Creates traced session state, registers `TestHandler`, dispatches an invocation whose payload is `ToolPayload::Custom` instead of function arguments, asserts the error is `FunctionCallError::Fatal`, replays the bundle, and checks failed status and result payload presence.
+**Data flow**: The test sets up tracing and registers TestHandler for the expected tool name. Instead of sending a normal function payload, it sends a custom payload that the dispatch path cannot use for this tool. It expects a fatal error, then replays the trace and verifies that the call was saved as failed with a result payload.
 
-**Call relations**: Exercises a different failure path than unsupported-tool lookup: the tool exists, but the invocation payload is incompatible.
+**Call relations**: This test uses test_invocation_with_payload directly because it needs to build an unusual payload. It relies on the normal registry dispatch path to reject the mismatch and on attach_test_trace and single_bundle_dir to inspect the resulting trace.
 
 *Call graph*: calls 6 internal fn (make_session_and_context, with_handler_for_test, attach_test_trace, single_bundle_dir, test_invocation_with_payload, plain); 5 external calls (new, new, assert!, assert_eq!, replay_bundle).
 
@@ -4821,11 +4841,11 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
 async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that dispatching the code-mode wait tool without a preexisting code-cell trace records only the tool call and does not create synthetic code-cell trace entries.
+**Purpose**: Checks a special code-mode wait tool case: if there is no matching code-cell trace, the system should still record the wait tool call, but should not invent a code cell. This avoids misleading trace data.
 
-**Data flow**: Creates traced session state, registers `CodeModeWaitHandler`, dispatches a direct wait-tool invocation with JSON arguments, replays the bundle, and asserts `replayed.code_cells.len() == 0` while the wait tool call still has a result payload id.
+**Data flow**: The test creates a traced fake session and registers the CodeModeWaitHandler. It dispatches a wait-tool invocation referring to a non-existent cell id. After replaying the saved trace, it confirms there are no recorded code cells, while the wait tool call still has a saved result payload.
 
-**Call relations**: Targets a special-case interaction between code-mode tooling and rollout tracing.
+**Call relations**: This test uses a real wait-tool handler rather than TestHandler. Like the other tests, it builds the invocation with test_invocation, attaches tracing with attach_test_trace, and reads the single saved bundle with single_bundle_dir.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, with_handler_for_test, attach_test_trace, single_bundle_dir, test_invocation); 5 external calls (new, new, assert!, assert_eq!, replay_bundle).
 
@@ -4843,11 +4863,11 @@ fn test_invocation(
 ) -> ToolInvocation
 ```
 
-**Purpose**: Convenience constructor for a `ToolInvocation` carrying a plain function-call payload string.
+**Purpose**: Builds a normal function-style ToolInvocation for tests. It is a convenience wrapper so each test does not have to repeat the same setup details.
 
-**Data flow**: Accepts session, turn, call id, plain tool name string, source, and arguments string; converts the tool name with `ToolName::plain`, wraps the arguments in `ToolPayload::Function`, and delegates to `test_invocation_with_payload`.
+**Data flow**: It receives a session, turn, call id, tool name, source, and argument text. It turns the plain tool-name string into a ToolName, wraps the argument text as a function payload, and passes everything to test_invocation_with_payload. The result is a ready-to-dispatch ToolInvocation.
 
-**Call relations**: Used by the direct/code-mode requester test, unsupported-tool failure test, and wait-tool test.
+**Call relations**: The main tests call this whenever they need an ordinary tool call. It delegates the common object construction to test_invocation_with_payload, keeping the tests focused on what behavior they are checking.
 
 *Call graph*: calls 2 internal fn (test_invocation_with_payload, plain); called by 3 (dispatch_lifecycle_trace_records_direct_and_code_mode_requesters, dispatch_lifecycle_trace_records_unsupported_tool_failures, missing_code_mode_wait_traces_only_the_wait_tool_call).
 
@@ -4865,11 +4885,11 @@ fn test_invocation_with_payload(
 )
 ```
 
-**Purpose**: Builds a fully populated `ToolInvocation` for tests, including cancellation and diff-tracking state.
+**Purpose**: Builds a ToolInvocation with a caller-supplied payload. Tests use it when they need full control over the payload, including deliberately invalid payloads.
 
-**Data flow**: Takes session and turn `Arc`s, call id, `ToolName`, `ToolCallSource`, and `ToolPayload`, then returns a `ToolInvocation` with a fresh `CancellationToken`, a new `TurnDiffTracker` inside `Arc<tokio::sync::Mutex<_>>`, and cloned/captured identifiers.
+**Data flow**: It receives the shared session and turn, cancellation setup information is created fresh, a new turn-diff tracker is made, and the call id, tool name, source, and payload are placed into a ToolInvocation. The completed invocation is returned for dispatch.
 
-**Call relations**: Used directly by the incompatible-payload test and indirectly by `test_invocation` for the common function-call case.
+**Call relations**: test_invocation calls this for normal function payloads, and the incompatible-payload test calls it directly to create a bad input. The ToolRegistry then consumes the returned invocation during dispatch.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (dispatch_lifecycle_trace_records_incompatible_payload_failures, test_invocation); 3 external calls (new, new, new).
 
@@ -4880,11 +4900,11 @@ fn test_invocation_with_payload(
 fn attach_test_trace(session: &mut Session, turn: &TurnContext, root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Installs a test rollout-thread trace context onto a session and marks the current turn as started so subsequent dispatches emit trace files under a temporary root.
+**Purpose**: Connects a fake session to a fresh rollout trace stored under a temporary test directory. Without this, dispatch would run but the tests would have no trace file to replay and inspect.
 
-**Data flow**: Reads `session.thread_id`, creates a `ThreadTraceContext` rooted at `root` with fixed metadata such as agent path, session source, cwd, model, provider, approval policy, and sandbox policy, records the current turn start using `turn.sub_id`, stores the trace context into `session.services.rollout_thread_trace`, and returns `Ok(())` or an error.
+**Data flow**: It reads the session’s thread id and receives the current turn and root directory. It starts a test trace with fixed metadata such as model name, provider name, working directory, approval policy, and sandbox policy. It records that the turn has started, then replaces the session’s trace recorder with this new test recorder.
 
-**Call relations**: Called by every test before dispatch so replayable trace bundles are produced.
+**Call relations**: Every test calls this before dispatching tools. It prepares the shared tracing environment that the registry and tool dispatch code write into, and single_bundle_dir later finds the trace bundle it created.
 
 *Call graph*: calls 1 internal fn (start_root_in_root_for_test); called by 4 (dispatch_lifecycle_trace_records_direct_and_code_mode_requesters, dispatch_lifecycle_trace_records_incompatible_payload_failures, dispatch_lifecycle_trace_records_unsupported_tool_failures, missing_code_mode_wait_traces_only_the_wait_tool_call); 1 external calls (from).
 
@@ -4895,11 +4915,11 @@ fn attach_test_trace(session: &mut Session, turn: &TurnContext, root: &Path) -> 
 fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf>
 ```
 
-**Purpose**: Finds the sole emitted trace bundle directory under a temporary root and asserts there is exactly one.
+**Purpose**: Finds the one trace bundle directory created inside a temporary test root. It also checks that exactly one bundle exists, so the tests do not accidentally read the wrong trace.
 
-**Data flow**: Reads directory entries from `root`, maps them to paths, collects and sorts them, asserts the count is one, removes and returns the only path as `Ok(PathBuf)`.
+**Data flow**: It reads the entries in the given root directory, converts them into paths, sorts them for stable behavior, and asserts that there is exactly one. It removes and returns that single path.
 
-**Call relations**: Used by all replay-based tests before calling `codex_rollout_trace::replay_bundle`.
+**Call relations**: After each test dispatches tool calls, it calls this helper before replaying the trace. This bridges the filesystem output from attach_test_trace and the replay step that verifies the recorded data.
 
 *Call graph*: called by 4 (dispatch_lifecycle_trace_records_direct_and_code_mode_requesters, dispatch_lifecycle_trace_records_incompatible_payload_failures, dispatch_lifecycle_trace_records_unsupported_tool_failures, missing_code_mode_wait_traces_only_the_wait_tool_call); 2 external calls (assert_eq!, read_dir).
 
@@ -4909,11 +4929,15 @@ These files cover approval normalization, sandbox policy helpers, and the runtim
 
 ### `core/src/apply_patch_tests.rs`
 
-`test` · `test-time validation of patch-to-protocol conversion`
+`test` · `test run`
 
-This small test module exercises the pure adapter in `apply_patch.rs`. It creates a temporary directory, derives an absolute path for `a.txt`, and uses the test-only constructor `ApplyPatchAction::new_add_for_test` to build an action containing exactly one add-file change with content `"hello"`. The test then calls `convert_apply_patch_to_protocol` and asserts that the returned `HashMap<PathBuf, FileChange>` contains an entry for the exact absolute path whose value is `FileChange::Add { content: "hello".to_string() }`.
+This is a focused test file. It verifies that when the core code is asked to convert an apply-patch action into the protocol format, a newly added file stays marked as an added file and keeps its text content.
 
-Although narrow, this test is valuable because `convert_apply_patch_to_protocol` is the boundary between the internal patch representation (`ApplyPatchAction` / `ApplyPatchFileChange`) and the protocol representation consumed elsewhere. By checking the add variant explicitly, it guards against regressions in path ownership, map keying, and content cloning for the simplest and most common patch case.
+The test creates a temporary folder so it can use a real-looking file path without touching the user’s actual files. Inside that folder, it builds an apply-patch action that says: “add this file, with the content hello.” It then passes that action into `convert_apply_patch_to_protocol`, which is the code being checked.
+
+The expected result is a map-like collection where looking up that file path gives back a `FileChange::Add` value containing the same text, `hello`. If the conversion accidentally used the wrong change type, lost the file path, or changed the content, the assertion would fail.
+
+In everyday terms, this test is like checking that a shipping label is copied correctly from one form to another: the package is still marked as “new delivery,” and the contents listed on the label are still the same.
 
 #### Function details
 
@@ -4923,22 +4947,24 @@ Although narrow, this test is valuable because `convert_apply_patch_to_protocol`
 fn convert_apply_patch_maps_add_variant()
 ```
 
-**Purpose**: Verifies that an internal add-file patch action becomes a protocol `FileChange::Add` keyed by the same absolute path.
+**Purpose**: This test proves that an apply-patch action for adding a file becomes a protocol `FileChange::Add` with the same content. It exists to catch mistakes in the conversion between the internal patch representation and the protocol representation used elsewhere.
 
-**Data flow**: Creates a temp directory, builds an absolute file path, constructs an `ApplyPatchAction` with one add change via `new_add_for_test`, passes it to `convert_apply_patch_to_protocol`, and asserts the resulting map entry equals `Some(&FileChange::Add { content: "hello".to_string() })`.
+**Data flow**: It starts by making a temporary directory, then builds an absolute path for `a.txt` inside it. That path and the text `hello` go into `new_add_for_test`, which creates an add-file patch action. The test sends that action into `convert_apply_patch_to_protocol`, then checks that looking up the same path in the converted result returns an add-file change containing `hello`.
 
-**Call relations**: This standalone unit test directly targets `convert_apply_patch_to_protocol` and does not involve approval or runtime delegation logic.
+**Call relations**: During the test, this function calls the test helper `new_add_for_test` to create a simple add-file action, uses `tempdir` to avoid depending on real project files, and finishes with `assert_eq!` to compare the converted output with the expected protocol value.
 
 *Call graph*: calls 1 internal fn (new_add_for_test); 2 external calls (assert_eq!, tempdir).
 
 
 ### `core/src/command_canonicalization_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test file exercises `canonicalize_command_for_approval` with four focused scenarios. The first verifies that simple `bash -lc` wrappers around a single plain command are reduced to the inner token sequence, and that wrapper path differences (`/bin/bash` vs `bash`) and extra shell whitespace do not affect the canonical result. The second covers complex shell scripts that cannot be safely tokenized, using a heredoc example; instead of flattening the script, the canonical form becomes a synthetic `__codex_shell_script__` key plus the shell mode and exact script text, again proving wrapper-path stability. The third does the same for PowerShell wrappers, asserting that both `powershell.exe` and `powershell` normalize to the same `__codex_powershell_script__` key with the original script body. The final test confirms that non-shell commands are left untouched.
+When a tool asks whether a command is allowed to run, it needs a stable way to recognize that command. The same real command can be wrapped in different shells, use a full path like `/bin/bash` or a short name like `bash`, or contain extra spacing. Without normalization, the approval system could treat these as different commands and ask again unnecessarily, or fail to match a previous approval.
 
-Together these tests document the intended contract: normalize aggressively only when parsing is unambiguous, otherwise preserve script text exactly and only abstract over the wrapper executable.
+This test file checks `canonicalize_command_for_approval`, the function that turns a raw command into a cleaner approval key. Think of it like writing addresses in a standard format before comparing them: “Main St.” and “Main Street” should not look unrelated if they point to the same place.
+
+The tests cover four important cases. Simple shell commands such as `bash -lc "cargo test ..."` are reduced to the inner command words. More complex shell scripts, such as heredoc scripts, are not split apart; instead they receive a special stable marker so they can still be recognized safely. PowerShell command wrappers are treated similarly, ignoring wrapper differences like `powershell.exe` versus `powershell`. Finally, commands that are not shell wrappers, such as `cargo fmt`, are preserved exactly.
 
 #### Function details
 
@@ -4948,11 +4974,11 @@ Together these tests document the intended contract: normalize aggressively only
 fn canonicalizes_word_only_shell_scripts_to_inner_command()
 ```
 
-**Purpose**: Verifies that a simple `bash -lc` command containing one plain shell command canonicalizes to the inner argv tokens. It also checks that wrapper path and whitespace differences collapse to the same result.
+**Purpose**: This test checks that simple shell-wrapped commands are reduced to the actual command inside the shell. It also verifies that harmless differences, such as `/bin/bash` versus `bash` and extra spaces, do not change the approval key.
 
-**Data flow**: Builds two command vectors with different shell executable spellings and spacing → calls `canonicalize_command_for_approval` on both → asserts the first equals the expected `cargo test -p codex-core` token vector and that both canonical forms are identical.
+**Data flow**: It builds two command lists that both mean “run `cargo test -p codex-core` through bash.” It sends each list into the command canonicalization function, then compares the result with the expected clean list of words. The expected output is `cargo`, `test`, `-p`, and `codex-core`, with shell wrapper details removed.
 
-**Call relations**: This test exercises the parser-first branch of the canonicalization helper, specifically the path where `parse_shell_lc_plain_commands` succeeds with exactly one command.
+**Call relations**: During the test run, the test framework calls this function. Inside it, the test uses assertion checks to prove that the canonicalization result matches the expected form, and that two differently written shell commands produce the same approval key.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -4963,11 +4989,11 @@ fn canonicalizes_word_only_shell_scripts_to_inner_command()
 fn canonicalizes_heredoc_scripts_to_stable_script_key()
 ```
 
-**Purpose**: Verifies that complex shell scripts such as heredocs are not tokenized but instead mapped to a stable synthetic shell-script key. It confirms wrapper executable differences do not affect the canonical form.
+**Purpose**: This test checks that shell scripts written as heredocs are not treated like simple word-only commands. A heredoc is a way to place a multi-line script directly inside a shell command, so the system gives it a stable script marker instead of trying to split it into ordinary words.
 
-**Data flow**: Constructs two `zsh -lc` command vectors around the same heredoc script → canonicalizes both → asserts the result is `["__codex_shell_script__", "-lc", script]` and equal across both wrappers.
+**Data flow**: It creates a small Python heredoc script and wraps it once with `/bin/zsh` and once with `zsh`. Each command is passed to the canonicalization function. The output should begin with the special marker `__codex_shell_script__`, keep the shell option `-lc`, and keep the full script text, making both wrapper forms compare the same.
 
-**Call relations**: This test covers the fallback bash-like extraction branch used when plain-command parsing is unsafe or impossible.
+**Call relations**: The test framework runs this as part of the test suite. The function then uses assertion checks to confirm that heredoc commands get a special shell-script approval key, and that the path-style shell name and short shell name are treated alike.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -4978,11 +5004,11 @@ fn canonicalizes_heredoc_scripts_to_stable_script_key()
 fn canonicalizes_powershell_wrappers_to_stable_script_key()
 ```
 
-**Purpose**: Verifies that PowerShell command wrappers normalize to a synthetic PowerShell script key carrying the exact script text. It ensures executable spelling and extra wrapper flags do not change the approval key.
+**Purpose**: This test checks that PowerShell-wrapped commands are turned into a consistent approval key. It ensures that wrapper differences like `powershell.exe`, `powershell`, and optional flags do not make the same script look like different commands.
 
-**Data flow**: Builds two PowerShell argv vectors with different executable names and flags → canonicalizes both → asserts the result is `["__codex_powershell_script__", script]` and equal across both inputs.
+**Data flow**: It creates two PowerShell command lists that both run the script `Write-Host hi`. One includes `powershell.exe` and `-NoProfile`; the other uses `powershell` with fewer wrapper arguments. Both are sent through canonicalization, and the expected result is a special PowerShell script marker plus the script text.
 
-**Call relations**: This test exercises the PowerShell extraction branch of the canonicalization helper.
+**Call relations**: The test framework calls this function during testing. The function relies on assertion checks to show that the canonicalization logic ignores non-essential PowerShell wrapper details and produces the same approval key for equivalent scripts.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -4993,24 +5019,24 @@ fn canonicalizes_powershell_wrappers_to_stable_script_key()
 fn preserves_non_shell_commands()
 ```
 
-**Purpose**: Verifies that commands not recognized as shell wrappers are returned unchanged. This protects ordinary argv commands from accidental rewriting.
+**Purpose**: This test checks that ordinary commands are not changed when they are not shell or PowerShell wrappers. This protects normal commands from being over-simplified by the approval-key logic.
 
-**Data flow**: Creates a plain `cargo fmt` vector → canonicalizes it → asserts the output equals the original vector.
+**Data flow**: It creates the command list `cargo fmt`, sends it through the canonicalization function, and compares the result with the original command list. The before and after should be identical.
 
-**Call relations**: This test covers the final fallback branch where no shell-specific recognizer matches.
+**Call relations**: The test framework runs this function with the other canonicalization tests. Its assertion confirms the boundary of the feature: shell wrappers may be normalized, but plain commands should pass through unchanged.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `core/src/tasks/user_shell_tests.rs`
 
-`test` · `unit test execution`
+`test` · `test run`
 
-This test module focuses on the subtle PATH-handling behavior in `prepare_user_shell_exec_command_with_path_prepend`. The helper `shell_with_snapshot` constructs a `Shell` value from a `ShellType`, shell path, and snapshot path, returning both the shell and the absolute snapshot path for convenience.
+This is a small test file for shell command setup. In this project, a command may be rewritten before it is run so that it first loads a saved shell “snapshot” file. That snapshot can contain environment settings, such as a PATH value. PATH is the list of folders the operating system searches when you type a command name.
 
-The single test creates a temporary directory, writes a synthetic shell snapshot file that exports `PATH='/snapshot/bin'`, and constructs a Bash shell plus absolute snapshot path. It then prepares a simple command vector equivalent to `bash -lc "printf '%s' \"$PATH\""`, seeds the execution environment with `PATH=/worktree/bin`, and calls `prepare_user_shell_exec_command_with_path_prepend` with a closure that prepends a runtime-owned `codex-path` directory into both the live environment and the `RuntimePathPrepends` tracker.
+The important behavior tested here is ordering. The system may need to add a package-specific directory to the front of PATH so tools from that package are found first. At the same time, it may load a shell snapshot that also sets PATH. Without care, the snapshot could wipe out or move the package directory, causing the wrong program version to run.
 
-Instead of mocking the wrapper, the test executes the rewritten command with `std::process::Command`, passing the mutated PATH from the environment map. The assertion checks that the command succeeds and that stdout equals `<package_path_dir>:/snapshot/bin`. That exact output proves the runtime prepend was preserved ahead of the snapshot-restored PATH, which is the invariant the production code needs when replaying shell snapshots on Unix.
+The test creates a temporary snapshot file that sets PATH to `/snapshot/bin`. It starts with an existing PATH of `/worktree/bin`, asks the command-preparation code to prepend a temporary package path, then actually runs the rewritten shell command and prints PATH. The expected result is that the package path appears first, followed by the snapshot path. This proves the rewrite logic preserves the package path prepend even when the snapshot changes PATH.
 
 #### Function details
 
@@ -5024,11 +5050,11 @@ fn shell_with_snapshot(
 ) -> (Shell, AbsolutePathBuf)
 ```
 
-**Purpose**: Builds a `Shell` configured with the requested shell type/path and pairs it with the provided snapshot path.
+**Purpose**: This helper builds the two pieces of test data that represent a user shell and its saved snapshot file. It keeps the main test shorter and easier to read.
 
-**Data flow**: Consumes `shell_type`, `shell_path`, and `snapshot_path`. It converts `shell_path` into a `PathBuf`, constructs `Shell { shell_type, shell_path }`, and returns `(Shell, AbsolutePathBuf)`.
+**Data flow**: It receives a shell type, a shell executable path as text, and an absolute path to a snapshot file. It turns the shell path into a path object, puts the shell type and path into a `Shell` value, and returns that together with the snapshot path unchanged.
 
-**Call relations**: The PATH-preservation test uses this helper to create the shell/snapshot pair passed into command rewriting.
+**Call relations**: The main test calls this helper after creating a temporary snapshot file. The returned shell description and snapshot path are then passed into the command-preparation code so the test can simulate running through a real user shell setup.
 
 *Call graph*: called by 1 (user_shell_snapshot_preserves_package_path_prepend); 1 external calls (from).
 
@@ -5039,24 +5065,24 @@ fn shell_with_snapshot(
 fn user_shell_snapshot_preserves_package_path_prepend()
 ```
 
-**Purpose**: Verifies that Unix shell snapshot wrapping preserves runtime PATH prepends ahead of the snapshot's PATH value.
+**Purpose**: This test checks that adding a package directory to the front of PATH still wins after a shell snapshot is loaded. It exists to catch regressions where the snapshot would accidentally erase or outrank the runtime package path.
 
-**Data flow**: Creates a temp directory and snapshot file, writes a snapshot script exporting `/snapshot/bin`, constructs a Bash shell and absolute snapshot path, defines a `bash -lc` command that prints `$PATH`, seeds an env map with `/worktree/bin`, and calls `prepare_user_shell_exec_command_with_path_prepend` with a closure that prepends a runtime package path. It then executes the rewritten command via `std::process::Command`, passing the mutated PATH, and asserts success plus exact stdout equal to `<package_path_dir>:/snapshot/bin`.
+**Data flow**: It creates a temporary directory, writes a snapshot script that sets PATH to `/snapshot/bin`, and builds a bash command that prints PATH. It starts with an environment containing `/worktree/bin`, asks the command-preparation function to rewrite the command while prepending a temporary package path, then runs the rewritten command with the resulting PATH. Finally, it checks that the command succeeded and that the printed PATH is `package-path:/snapshot/bin`.
 
-**Call relations**: This is a direct regression test for the Unix-only helper used by production shell execution. It exercises the real rewritten command rather than inspecting intermediate strings only.
+**Call relations**: During the test, it calls `shell_with_snapshot` to build the shell-and-snapshot inputs. It then exercises `prepare_user_shell_exec_command_with_path_prepend`, the production code being tested, and uses the operating system process runner to execute the rewritten command. The final assertions confirm that the rewrite did the right thing from the user's point of view.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (from, new, assert!, assert_eq!, new, write, tempdir, vec!).
 
 
 ### `core/src/tools/network_approval_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module probes the nontrivial concurrency and state invariants in `network_approval.rs`. It constructs `NetworkApprovalService` instances directly and, because the tests live in the same module tree, inspects private helpers and fields such as `HostApprovalKey`, `PendingHostApproval`, `session_approved_hosts`, and `take_call_outcome`. Several tests verify host-key scoping: approvals are deduplicated only when host, protocol, and port all match, and session-approved hosts preserve that same granularity when copied between services.
+The network approval system is a gatekeeper. When a tool command, such as a shell command running curl, tries to reach the internet, the system may need to ask for permission, remember an approval for the session, or reject the command if policy says network access is not allowed. This test file makes sure that gatekeeper behaves like a careful receptionist: it should not ask the same question twice for the same host, protocol, and port, but it should treat different ports or protocols as separate destinations.
 
-The module also validates the synchronization primitive behind deduplication. `pending_waiters_receive_owner_decision` spawns a waiter on `PendingHostApproval::wait_for_decision` and confirms that `set_decision` wakes it with the exact stored enum value. Policy-gating helpers are pinned down too: only `AskForApproval::Never` disables approval flow, and only managed permission profiles permit it.
+The tests also cover how approvals are shared within a session, how waiting tasks hear about the final decision, and how high-level settings decide whether the approval flow is even available. Another important part is linking a blocked network request back to the tool call that caused it. If there is exactly one active call, the service can mark that call as denied and cancel it. If there are multiple active calls and the blocked request cannot be clearly attributed, the service avoids guessing.
 
-For active-call attribution, helper functions build realistic `BlockedRequest` values and register calls with a concrete `GuardianNetworkAccessTrigger` representing a shell command. Tests then confirm that blocked requests record `DeniedByPolicy`, cancel the owning token, do not override an existing `DeniedByUser`, and are ignored when attribution is ambiguous because multiple calls are active. Finish-path tests verify that `finish_call` both returns the denial and unregisters the call, while deferred finish memoizes the first denial result through `OnceCell`. Together these tests document the service’s most subtle guarantees: precise host scoping, safe attribution, and stable denial propagation.
+Several tests focus on cleanup. When a call finishes, any stored denial result should be returned once, the active call should be removed, and deferred finish logic should still give later consumers the same result. Without these checks, users could see duplicate prompts, stale approvals, wrong denials, or commands left running after network access was blocked.
 
 #### Function details
 
@@ -5066,11 +5092,11 @@ For active-call attribution, helper functions build realistic `BlockedRequest` v
 async fn pending_approvals_are_deduped_per_host_protocol_and_port()
 ```
 
-**Purpose**: Checks that two requests for the exact same host/protocol/port share one pending approval object and only the first caller is marked as owner.
+**Purpose**: This test checks that two approval requests for the same host, protocol, and port share one pending approval instead of creating two separate prompts. This matters because the user should not be asked the same network question twice at the same time.
 
-**Data flow**: Creates a default `NetworkApprovalService` and a `HostApprovalKey` → calls `get_or_create_pending_approval` twice with the same key → asserts first owner flag is true, second is false, and both returned `Arc<PendingHostApproval>` values point to the same allocation.
+**Data flow**: It starts with a fresh NetworkApprovalService and builds one key for example.com over http on port 443. It asks the service for a pending approval twice with the same key. The first request should become the owner of the approval, the second should reuse the same pending approval object, and the test confirms both references point to the same shared item.
 
-**Call relations**: This test directly exercises the service’s deduplication helper. It validates the ownership contract that drives owner/waiter branching in inline policy handling.
+**Call relations**: The test creates the service with its default setup, then exercises the service method that creates or reuses pending approvals. It uses assertions to prove the first caller owns the decision and later callers wait on that same decision instead of starting a duplicate flow.
 
 *Call graph*: calls 1 internal fn (default); 1 external calls (assert!).
 
@@ -5081,11 +5107,11 @@ async fn pending_approvals_are_deduped_per_host_protocol_and_port()
 async fn pending_approvals_do_not_dedupe_across_ports()
 ```
 
-**Purpose**: Verifies that pending approvals are scoped by port as well as host and protocol. Requests to the same host over different ports must not share approval state.
+**Purpose**: This test checks that network approval requests are not merged when only the port differs. A port is like a numbered door on the same building, so access to one door should not automatically cover another.
 
-**Data flow**: Creates a service and two `HostApprovalKey` values differing only by port → calls `get_or_create_pending_approval` for each → asserts both callers are owners and the returned `Arc`s are distinct.
+**Data flow**: It creates a fresh service and two approval keys for the same host and protocol but different ports: 443 and 8443. It asks for a pending approval for each key. Both requests should be treated as separate owner requests, and the two pending approval objects should be different.
 
-**Call relations**: This test complements the exact-match deduplication test by proving the key granularity includes port. It protects against accidental over-sharing of approvals.
+**Call relations**: The test relies on the service's default state and then calls the pending-approval lookup twice with different keys. Its assertions protect the rule that deduplication is scoped to host, protocol, and port together.
 
 *Call graph*: calls 1 internal fn (default); 1 external calls (assert!).
 
@@ -5096,11 +5122,11 @@ async fn pending_approvals_do_not_dedupe_across_ports()
 async fn session_approved_hosts_preserve_protocol_and_port_scope()
 ```
 
-**Purpose**: Confirms that copying session-approved hosts preserves separate entries for different protocols and ports on the same hostname.
+**Purpose**: This test checks that session-wide approved hosts keep their exact protocol and port information when copied to another service. It prevents a broad, unsafe interpretation such as treating all example.com access as approved.
 
-**Data flow**: Seeds one service’s `session_approved_hosts` set with three `HostApprovalKey` values, creates a second service, calls `sync_session_approved_hosts_to`, then reads, clones, sorts, and compares the target set contents against the expected three-key vector.
+**Data flow**: It creates a source service and manually fills its session-approved set with three entries for the same host but different protocol or port combinations. It then creates another service and copies the session approvals into it. Finally, it reads back and sorts the copied entries, confirming all three distinct approvals are still present exactly as entered.
 
-**Call relations**: This test exercises the approval-cache synchronization helper and documents that approval scope is not collapsed during copying.
+**Call relations**: The test uses the service's default setup, directly prepares the approved-host set, and then exercises sync_session_approved_hosts_to. The final equality check confirms that syncing keeps the approval boundaries intact.
 
 *Call graph*: calls 1 internal fn (default); 1 external calls (assert_eq!).
 
@@ -5111,11 +5137,11 @@ async fn session_approved_hosts_preserve_protocol_and_port_scope()
 async fn sync_session_approved_hosts_to_replaces_existing_target_hosts()
 ```
 
-**Purpose**: Checks that syncing approved hosts overwrites the target cache instead of merging with stale entries. The target should contain only the source’s approvals afterward.
+**Purpose**: This test checks that copying session-approved hosts into another service replaces the target's old approvals instead of mixing old and new ones. This avoids stale permissions carrying over by accident.
 
-**Data flow**: Seeds source and target services with different approved-host entries → calls `sync_session_approved_hosts_to(&target)` → reads the target set and asserts it equals a single-entry vector containing only the source host.
+**Data flow**: It creates a source service with one approved host and a target service with a different, stale approved host. After syncing from source to target, it reads the target's approvals. The result should contain only the source approval, with the stale target approval gone.
 
-**Call relations**: This test verifies the replacement semantics of cache synchronization, which matter when cloning or reseeding session state.
+**Call relations**: The test sets up both services from defaults, mutates their stored approved-host sets, and calls the sync method. Its assertion verifies the sync behaves like replacing a list, not appending to it.
 
 *Call graph*: calls 1 internal fn (default); 1 external calls (assert_eq!).
 
@@ -5126,11 +5152,11 @@ async fn sync_session_approved_hosts_to_replaces_existing_target_hosts()
 async fn pending_waiters_receive_owner_decision()
 ```
 
-**Purpose**: Validates the waiter-notification mechanism used for deduplicated approvals. A waiting task should unblock and observe the exact decision set by the owner.
+**Purpose**: This test checks that tasks waiting on a pending approval receive the decision made by the owner of that approval. It verifies the basic handoff between the person or task deciding and the tasks waiting for that decision.
 
-**Data flow**: Creates `Arc<PendingHostApproval>`, spawns a task awaiting `wait_for_decision()`, calls `set_decision(PendingApprovalDecision::AllowOnce)`, awaits the spawned task, and asserts the returned decision equals `AllowOnce`.
+**Data flow**: It creates a shared PendingHostApproval, starts a background task that waits for a decision, and then sets the decision to AllowOnce. The waiting task completes and returns that same AllowOnce decision.
 
-**Call relations**: This test isolates the synchronization behavior of `PendingHostApproval`. It underpins the correctness of non-owner request handling in the service.
+**Call relations**: The test creates the pending approval with new, shares it through a clone of the shared pointer, and uses a spawned asynchronous task to behave like a waiter. After set_decision runs, the final assertion confirms wait_for_decision receives the chosen value.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (clone, new, assert_eq!, spawn).
 
@@ -5141,11 +5167,11 @@ async fn pending_waiters_receive_owner_decision()
 fn allow_once_and_allow_for_session_both_allow_network()
 ```
 
-**Purpose**: Ensures both positive pending-approval decisions map to `NetworkDecision::Allow`. Only explicit deny should produce a proxy denial.
+**Purpose**: This test checks that both temporary approval and session-long approval translate into the same immediate network result: allow the request. The difference is how long the approval is remembered, not whether the current request may proceed.
 
-**Data flow**: Calls `PendingApprovalDecision::to_network_decision()` for `AllowOnce` and `AllowForSession` → compares both results to `NetworkDecision::Allow` with `assert_eq!`.
+**Data flow**: It takes two pending approval decisions, AllowOnce and AllowForSession, and converts each into the lower-level network decision. Both conversions should produce NetworkDecision::Allow.
 
-**Call relations**: This test pins down the enum-to-proxy translation used when pending approval owners wake waiting requests.
+**Call relations**: This is a small conversion test. It does not set up a service; it directly checks the mapping from user-facing approval choices to the network decision used by the enforcement path.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5156,11 +5182,11 @@ fn allow_once_and_allow_for_session_both_allow_network()
 fn only_never_policy_disables_network_approval_flow()
 ```
 
-**Purpose**: Checks the approval-policy gate for network approval flow. It documents that every policy except `Never` still permits prompting.
+**Purpose**: This test checks which user approval settings allow the network approval flow to run. Only the setting that says never ask for approval should disable it.
 
-**Data flow**: Calls `allows_network_approval_flow` with `Never`, `OnRequest`, `OnFailure`, and `UnlessTrusted` → asserts the first is false and the others are true.
+**Data flow**: It passes several AskForApproval settings into the approval-flow check. The Never setting should return false, while OnRequest, OnFailure, and UnlessTrusted should return true.
 
-**Call relations**: This test covers the small policy helper that `handle_inline_policy_request` uses before attempting approval flow.
+**Call relations**: The test directly exercises allows_network_approval_flow. Its assertions define the expected behavior for higher-level configuration before the network approval service is used.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5171,11 +5197,11 @@ fn only_never_policy_disables_network_approval_flow()
 fn network_approval_flow_is_limited_to_restricted_sandbox_modes()
 ```
 
-**Purpose**: Verifies that network approval flow is allowed only for managed permission profiles and not for disabled or external profiles.
+**Purpose**: This test checks that network approval prompts are available only in the sandbox modes where they make sense. A sandbox is a safety boundary around a command, and this approval flow is meant for restricted built-in modes, not every permission setup.
 
-**Data flow**: Calls `permission_profile_allows_network_approval_flow` with `PermissionProfile::read_only()`, `workspace_write()`, `Disabled`, and `External { network: Restricted }` → asserts true for the managed profiles and false for the others.
+**Data flow**: It passes several PermissionProfile values into the permission-profile check. Read-only and workspace-write profiles should allow the approval flow, while fully disabled permissions and an external restricted network policy should not.
 
-**Call relations**: This test documents the permission-profile gate that blocks approval prompts outside managed sandbox modes.
+**Call relations**: The test directly exercises permission_profile_allows_network_approval_flow. It ties the network approval feature to the broader permission profile rules used before commands run.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -5186,11 +5212,11 @@ fn network_approval_flow_is_limited_to_restricted_sandbox_modes()
 fn denied_blocked_request(host: &str) -> BlockedRequest
 ```
 
-**Purpose**: Builds a representative denied `BlockedRequest` for tests that simulate proxy-level network policy failures. It standardizes the host, protocol, reason, and port fields used across multiple assertions.
+**Purpose**: This helper builds a sample blocked network request that represents a denied attempt to reach a host. It gives several tests a consistent fake request to feed into the service.
 
-**Data flow**: Reads `host: &str` → constructs `BlockedRequestArgs` with `reason: "not_allowed"`, protocol `"http"`, decision `"deny"`, source `"decider"`, and port `80` → returns `BlockedRequest::new(...)`.
+**Data flow**: It receives a host name as text. It builds BlockedRequestArgs with that host, a denial decision, http protocol, port 80, and other fixed details, then turns those arguments into a BlockedRequest. The returned request says, in effect, that this host was blocked by policy.
 
-**Call relations**: Several blocked-request tests call this helper to avoid repeating request construction. It feeds directly into `record_blocked_request` scenarios.
+**Call relations**: Several tests call this helper before record_blocked_request is exercised. It keeps those tests focused on the service behavior instead of repeating the same blocked-request construction.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (blocked_request_policy_does_not_override_user_denial_outcome, record_blocked_request_ignores_ambiguous_unattributed_blocked_requests, record_blocked_request_sets_policy_outcome_for_owner_call).
 
@@ -5204,11 +5230,11 @@ async fn register_call_with_default_shell_trigger(
 ) -> CancellationToken
 ```
 
-**Purpose**: Registers a test active call with a realistic shell-command trigger and returns its cancellation token. This helper sets up service state for attribution and finish-path tests.
+**Purpose**: This helper registers a fake active shell command that would trigger network access. It gives tests a realistic active call to attach approvals or denials to.
 
-**Data flow**: Creates a new `CancellationToken` → calls `service.register_call(...)` with the supplied registration ID, fixed turn ID, a `GuardianNetworkAccessTrigger` describing `curl https://example.com`, a matching command string, and a clone of the token → returns the original token.
+**Data flow**: It receives a NetworkApprovalService and a registration id. It creates a cancellation token, then registers a call for a curl command against example.com with a default sandbox permission setup and a test working directory. It returns the cancellation token so the test can later check whether the service cancelled the call.
 
-**Call relations**: Multiple tests use this helper before recording outcomes or blocked requests. It centralizes the active-call setup needed for service methods that require a registered owner.
+**Call relations**: Many tests use this helper before recording blocked requests or call outcomes. It hands off to the service's register_call method and supplies the common trigger context that those tests need.
 
 *Call graph*: calls 1 internal fn (register_call); called by 6 (blocked_request_policy_does_not_override_user_denial_outcome, deferred_finish_reuses_denial_result_after_first_consumer, finish_call_returns_denial_and_unregisters_active_call, record_blocked_request_ignores_ambiguous_unattributed_blocked_requests, record_blocked_request_sets_policy_outcome_for_owner_call, record_call_outcome_ignores_inactive_call); 3 external calls (new, test_path_buf, vec!).
 
@@ -5219,11 +5245,11 @@ async fn register_call_with_default_shell_trigger(
 async fn active_call_preserves_triggering_command_context()
 ```
 
-**Purpose**: Checks that `register_call` stores the exact trigger metadata and command string supplied by the caller. This ensures approval prompts can later reflect the original command context.
+**Purpose**: This test checks that when a call is registered, the service keeps the exact command context that caused the possible network request. That context is what the user or policy code needs to understand what is asking for access.
 
-**Data flow**: Creates a service and an expected `GuardianNetworkAccessTrigger`, registers a call with that trigger and command string, resolves the single active call, and asserts the stored `trigger` and `command` match the expected values.
+**Data flow**: It builds an expected GuardianNetworkAccessTrigger containing the call id, tool name, command arguments, working directory, sandbox permissions, and justification. It registers that call with a command string, then asks the service to resolve the single active call. The returned call should contain the same trigger and command text.
 
-**Call relations**: This test exercises the registration and single-call resolution path, documenting what metadata survives into active-call state.
+**Call relations**: The test creates a default service, registers one call, and then uses resolve_single_active_call to read it back. Its assertions protect the connection between the active call record and the original command details.
 
 *Call graph*: calls 1 internal fn (default); 4 external calls (new, assert_eq!, test_path_buf, vec!).
 
@@ -5234,11 +5260,11 @@ async fn active_call_preserves_triggering_command_context()
 async fn record_blocked_request_sets_policy_outcome_for_owner_call()
 ```
 
-**Purpose**: Verifies that a blocked proxy request records a `DeniedByPolicy` outcome for the sole active call and cancels its token.
+**Purpose**: This test checks that when there is one active call and a denied network request appears, the service marks that call as denied by policy and cancels it. This prevents the command from continuing after network access has been blocked.
 
-**Data flow**: Creates a service, registers one active call via the helper, calls `record_blocked_request(denied_blocked_request("example.com"))`, asserts the cancellation token is cancelled, and asserts `take_call_outcome` returns the expected `DeniedByPolicy` message.
+**Data flow**: It creates a service, registers one fake shell call, and keeps the returned cancellation token. It then records a blocked request for example.com. After that, the cancellation token should be cancelled, and taking the call outcome should return a policy-denial message explaining that the domain is not on the allowlist for the current sandbox mode.
 
-**Call relations**: This test covers the normal blocked-request attribution path through `record_blocked_request` and `record_outcome_for_single_active_call`.
+**Call relations**: The test uses register_call_with_default_shell_trigger to create the active call and denied_blocked_request to create the blocked event. It then drives record_blocked_request and checks both visible effects: cancellation and stored denial outcome.
 
 *Call graph*: calls 3 internal fn (default, denied_blocked_request, register_call_with_default_shell_trigger); 2 external calls (assert!, assert_eq!).
 
@@ -5249,11 +5275,11 @@ async fn record_blocked_request_sets_policy_outcome_for_owner_call()
 async fn blocked_request_policy_does_not_override_user_denial_outcome()
 ```
 
-**Purpose**: Ensures a later policy denial cannot overwrite an earlier explicit user denial for the same call. `DeniedByUser` must remain authoritative.
+**Purpose**: This test checks that a user's denial is not overwritten by a later policy-denial record. The user's explicit choice should remain the final reason shown for the call.
 
-**Data flow**: Creates a service, registers a call, records `DeniedByUser` with `record_call_outcome`, then feeds a denied blocked request into `record_blocked_request` → asserts `take_call_outcome` still returns `Some(NetworkApprovalOutcome::DeniedByUser)`.
+**Data flow**: It creates a service, registers one active call, and records that the call was denied by the user. It then records a blocked request for the same general situation. When the outcome is taken, it should still be DeniedByUser, not replaced by a policy denial.
 
-**Call relations**: This test targets the overwrite guard inside `record_call_outcome`, which preserves user-denial semantics against subsequent policy events.
+**Call relations**: The test sets up the active call through the shared helper, then calls record_call_outcome before record_blocked_request. It confirms that the blocked-request path respects an outcome that was already recorded.
 
 *Call graph*: calls 3 internal fn (default, denied_blocked_request, register_call_with_default_shell_trigger); 1 external calls (assert_eq!).
 
@@ -5264,11 +5290,11 @@ async fn blocked_request_policy_does_not_override_user_denial_outcome()
 async fn finish_call_returns_denial_and_unregisters_active_call()
 ```
 
-**Purpose**: Checks that finishing a call returns the stored denial as `ToolError::Rejected`, removes the active registration, and clears the stored outcome.
+**Purpose**: This test checks that finishing a call with a stored denial returns an error to the caller and removes the call from the active-call list. It also checks that the stored outcome is consumed so it does not linger.
 
-**Data flow**: Creates a service, registers a call, records `DeniedByPolicy("network denied")`, calls `finish_call("registration-1")` expecting an error, then asserts the error message, that `resolve_single_active_call()` is `None`, and that `take_call_outcome` returns `None`.
+**Data flow**: It creates a service, registers one active call, and records a policy denial with the message "network denied". It then finishes the call. The result should be a rejected tool error with that message, there should be no single active call left, and taking the outcome afterward should return nothing.
 
-**Call relations**: This test exercises the immediate finish path that production orchestration uses after a tool attempt completes.
+**Call relations**: The test uses the registration helper, stores a DeniedByPolicy outcome, and then exercises finish_call. The assertions connect three cleanup steps: reporting the denial, unregistering the call, and clearing the saved outcome.
 
 *Call graph*: calls 2 internal fn (default, register_call_with_default_shell_trigger); 3 external calls (assert!, assert_eq!, DeniedByPolicy).
 
@@ -5279,11 +5305,11 @@ async fn finish_call_returns_denial_and_unregisters_active_call()
 async fn deferred_finish_reuses_denial_result_after_first_consumer()
 ```
 
-**Purpose**: Verifies that deferred finish memoizes the first fetched denial outcome so later consumers see the same rejection even after service state has been consumed.
+**Purpose**: This test checks that deferred finish logic gives the same denial result to more than one consumer. This is important when different parts of the system may ask for the result after the network approval path has already finished once.
 
-**Data flow**: Creates a service, registers a call, constructs a `DeferredNetworkApproval` with a fresh `OnceCell`, records `DeniedByPolicy("network denied")`, calls `deferred.finish(&service)` twice, and asserts both returned errors carry the same message.
+**Data flow**: It registers one call, builds a DeferredNetworkApproval with the call's registration id, cancellation token, and an empty one-time result cell. It records a policy denial, then calls finish on the deferred object twice. Both calls should return the same rejected tool error with the same denial message.
 
-**Call relations**: This test covers the `DeferredNetworkApproval::finish` memoization behavior that protects deferred consumers from one-shot state removal.
+**Call relations**: The test uses register_call_with_default_shell_trigger to create the call, then constructs DeferredNetworkApproval directly. It checks that DeferredNetworkApproval::finish caches the finish result instead of losing it after the first caller.
 
 *Call graph*: calls 2 internal fn (default, register_call_with_default_shell_trigger); 4 external calls (new, new, assert!, DeniedByPolicy).
 
@@ -5294,11 +5320,11 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer()
 async fn record_call_outcome_ignores_inactive_call()
 ```
 
-**Purpose**: Ensures outcomes are not recorded for calls that have already been unregistered. Inactive calls should neither be cancelled nor accumulate stale denial state.
+**Purpose**: This test checks that the service does not record or act on an outcome for a call that has already been unregistered. This avoids cancelling or reporting errors for work that is no longer active.
 
-**Data flow**: Creates a service, registers a call and keeps its token, unregisters the call, attempts to record `DeniedByPolicy("network denied")`, then asserts the token is not cancelled and `take_call_outcome` returns `None`.
+**Data flow**: It creates a service, registers one call, and then unregisters that call. Afterward it tries to record a policy denial for the same registration id. The cancellation token should not be cancelled, and there should be no stored outcome to take.
 
-**Call relations**: This test validates the early-return branch in `record_call_outcome` when the registration ID is no longer active.
+**Call relations**: The test prepares a normal active call through the helper, removes it with unregister_call, and then calls record_call_outcome. Its assertions prove that inactive registrations are ignored.
 
 *Call graph*: calls 2 internal fn (default, register_call_with_default_shell_trigger); 3 external calls (assert!, assert_eq!, DeniedByPolicy).
 
@@ -5309,22 +5335,26 @@ async fn record_call_outcome_ignores_inactive_call()
 async fn record_blocked_request_ignores_ambiguous_unattributed_blocked_requests()
 ```
 
-**Purpose**: Checks that blocked requests are ignored when more than one active call exists and ownership cannot be determined safely.
+**Purpose**: This test checks that when multiple calls are active and a blocked request cannot be tied to one specific call, the service does not guess. Guessing could blame or cancel the wrong command.
 
-**Data flow**: Creates a service, registers two active calls, records a denied blocked request, then asserts `take_call_outcome` returns `None` for both registrations.
+**Data flow**: It creates a service and registers two active shell calls. It then records one denied blocked request for example.com without any clear attribution to either call. When it checks both registrations, neither should have a stored outcome.
 
-**Call relations**: This test documents the service’s deliberate refusal to guess attribution under concurrency, covering the `resolve_single_active_call` safeguard.
+**Call relations**: The test uses the shared registration helper twice and denied_blocked_request once. It then drives record_blocked_request and confirms the service only assigns a blocked request when ownership is unambiguous.
 
 *Call graph*: calls 3 internal fn (default, denied_blocked_request, register_call_with_default_shell_trigger); 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/sandboxing_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module covers the generic helpers in `tools/sandboxing.rs`. The first two tests validate `PermissionRequestPayload::bash`, ensuring the generated hook payload always includes `command` and only includes `description` when one is provided. The next group checks `default_exec_approval_requirement`: unrestricted/external sandboxes skip approval under `OnRequest`, restricted sandboxes require approval, and granular approval policies that disable sandbox approval convert what would have been a prompt into an immediate `Forbidden` requirement.
+This file is a set of safety checks for the code that runs shell commands and decides how much access they should get. A sandbox is a restricted area for running commands, like letting someone work at a desk where only certain drawers are unlocked. The tests make sure the system asks for permission when it should, skips asking when it is safe to do so, and never drops important filesystem protections by accident.
 
-The remaining tests focus on first-attempt sandbox override and deny-read preservation. They verify that explicit exec-policy bypass (`Skip { bypass_sandbox: true }`) and explicit `RequireEscalated` requests both trigger `SandboxOverride::BypassSandboxFirstAttempt` under ordinary restricted policies. The final test constructs a filesystem policy with a deny-read glob and proves the key invariant of this module: deny-read restrictions make `unsandboxed_execution_allowed` false, force `sandbox_override_for_first_attempt` back to `NoOverride`, and rewrite `RequireEscalated` to `UseDefault` via `sandbox_permissions_preserving_denied_reads`. It also confirms that `WithAdditionalPermissions` remains sandboxed rather than being collapsed, preserving bounded permission expansion without dropping deny-read enforcement.
+The first tests focus on the permission request message for a bash command. They confirm that the message includes the command, and only includes a human-readable description when one was actually provided. This matters because approval prompts should be clear but not filled with misleading empty fields.
+
+The rest of the file checks execution approval and sandbox override rules. It compares different approval policies, such as “ask when requested” and “granular approval,” where individual approval features can be turned on or off. It also checks how filesystem sandbox policies affect whether a command can bypass restrictions.
+
+The most important safety case is denied reads, such as blocking access to `*.env` files. These tests confirm that if a policy says certain files must not be read, the system will not bypass the sandbox in a way that would silently remove that protection.
 
 #### Function details
 
@@ -5334,11 +5364,11 @@ The remaining tests focus on first-attempt sandbox override and deny-read preser
 fn bash_permission_request_payload_omits_missing_description()
 ```
 
-**Purpose**: Verifies that `PermissionRequestPayload::bash` omits the `description` field when no description is supplied. This keeps hook payloads minimal and semantically accurate.
+**Purpose**: This test checks that a bash permission request does not include a description field when no description was provided. That keeps the request payload clean and avoids pretending there is extra context when there is none.
 
-**Data flow**: Calls `PermissionRequestPayload::bash("echo hi", None)` and asserts equality with a payload containing only `tool_name: HookToolName::bash()` and `tool_input: {"command": "echo hi"}`.
+**Data flow**: It starts with a bash command, `echo hi`, and no description. It builds the expected permission request by hand, containing the bash tool name and only the command in the input data. The test then compares the real payload against that expected shape; if an unwanted description appears, the test fails.
 
-**Call relations**: This directly tests the payload constructor used by shell and unified-exec approval hooks.
+**Call relations**: During the test suite, this test exercises `PermissionRequestPayload::bash` through a direct comparison. It relies on the assertion helper to catch any change in the payload format, so later code that displays or sends permission requests can depend on this exact behavior.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5349,11 +5379,11 @@ fn bash_permission_request_payload_omits_missing_description()
 fn bash_permission_request_payload_includes_description_when_present()
 ```
 
-**Purpose**: Verifies that `PermissionRequestPayload::bash` includes the `description` field when one is provided. This ensures hook consumers receive optional explanatory context.
+**Purpose**: This test checks that a bash permission request includes the description when one is supplied. The description gives a reviewer extra context, such as why a command may need network access.
 
-**Data flow**: Calls `PermissionRequestPayload::bash("echo hi", Some("network-access example.com"))` and asserts equality with a payload whose JSON includes both `command` and `description`.
+**Data flow**: It starts with the command `echo hi` and a description string. It expects the resulting request to name the bash tool and include both the command and the description in the input data. The output is not returned to other code here; the test passes only if the built payload exactly matches the expected one.
 
-**Call relations**: This complements the previous payload-format test.
+**Call relations**: This test is the companion to the missing-description test. Together they define when `PermissionRequestPayload::bash` should and should not add optional context before a permission prompt is shown or transmitted elsewhere.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5364,11 +5394,11 @@ fn bash_permission_request_payload_includes_description_when_present()
 fn external_sandbox_skips_exec_approval_on_request()
 ```
 
-**Purpose**: Checks that `AskForApproval::OnRequest` does not require exec approval when the filesystem sandbox is external/unrestricted. Approval is only needed for restricted filesystem sandboxes.
+**Purpose**: This test checks that an external sandbox does not require an extra execution approval under the “ask on request” policy. In plain terms, if another sandboxing system is already responsible for protection, this path should not unnecessarily stop the command for approval.
 
-**Data flow**: Calls `default_exec_approval_requirement(AskForApproval::OnRequest, &FileSystemSandboxPolicy::external_sandbox())` and asserts the result is `ExecApprovalRequirement::Skip { bypass_sandbox: false, proposed_execpolicy_amendment: None }`.
+**Data flow**: It provides an approval policy of `OnRequest` and an external filesystem sandbox policy. It asks the approval-decision function what should happen. The expected result is to skip approval, without bypassing the sandbox and without suggesting any policy change.
 
-**Call relations**: This tests one branch of the default approval derivation helper.
+**Call relations**: This test calls into the default execution approval decision logic and verifies one special case. It protects the flow where the broader tool-running code asks, “Do I need to prompt the user before running this command?”
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5379,11 +5409,11 @@ fn external_sandbox_skips_exec_approval_on_request()
 fn restricted_sandbox_requires_exec_approval_on_request()
 ```
 
-**Purpose**: Checks that `AskForApproval::OnRequest` requires exec approval when the filesystem sandbox is restricted. This is the baseline prompting behavior for sandboxed execution.
+**Purpose**: This test checks that the normal restricted sandbox still requires approval when the policy says approvals should happen on request. It makes sure restricted execution does not accidentally become automatic.
 
-**Data flow**: Calls `default_exec_approval_requirement(AskForApproval::OnRequest, &FileSystemSandboxPolicy::default())` and asserts the result is `ExecApprovalRequirement::NeedsApproval { ... }`.
+**Data flow**: It provides the `OnRequest` approval policy and the default filesystem sandbox policy. The approval logic produces a decision. The expected decision says approval is needed, with no extra reason text and no suggested policy amendment.
 
-**Call relations**: This covers the restricted-sandbox branch of default approval derivation.
+**Call relations**: This test covers the ordinary restricted-sandbox path used by the command execution system. It pairs with the external-sandbox test to show that the same approval policy can lead to different outcomes depending on what kind of sandbox is active.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5394,11 +5424,11 @@ fn restricted_sandbox_requires_exec_approval_on_request()
 fn default_exec_approval_requirement_rejects_sandbox_prompt_when_granular_disables_it()
 ```
 
-**Purpose**: Verifies that granular approval settings can turn a would-be sandbox approval prompt into an immediate forbidden result. This enforces policy at requirement-derivation time rather than later in prompting.
+**Purpose**: This test checks that granular approval settings can forbid a sandbox approval prompt. Granular approval means separate switches control separate kinds of permission prompts, instead of one all-or-nothing setting.
 
-**Data flow**: Builds `AskForApproval::Granular` with `sandbox_approval: false`, calls `default_exec_approval_requirement` with the default restricted filesystem policy, and asserts the result is `ExecApprovalRequirement::Forbidden` with the fixed rejection reason.
+**Data flow**: It builds a granular approval configuration where sandbox approval is turned off while several other approval features remain on. It passes that policy and the default sandbox policy into the approval-decision function. The expected result is a forbidden decision with a clear reason saying sandbox approval prompts are disallowed.
 
-**Call relations**: This tests the granular-policy rejection branch in the shared helper.
+**Call relations**: This test exercises the branch where `AskForApproval::Granular` is used. It confirms that the execution approval logic respects the specific `sandbox_approval` switch instead of assuming all granular configurations allow sandbox prompts.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (Granular, assert_eq!).
 
@@ -5409,11 +5439,11 @@ fn default_exec_approval_requirement_rejects_sandbox_prompt_when_granular_disabl
 fn default_exec_approval_requirement_keeps_prompt_when_granular_allows_sandbox_approval()
 ```
 
-**Purpose**: Checks that granular approval still yields `NeedsApproval` when sandbox approval is enabled, even if other granular flags are disabled. Only the sandbox-approval flag matters for this helper.
+**Purpose**: This test checks the opposite granular-approval case: when sandbox approval is allowed, the system should still ask for approval under the default sandbox policy. It prevents a configuration mix-up where allowing prompts might accidentally skip them.
 
-**Data flow**: Builds `AskForApproval::Granular` with `sandbox_approval: true`, calls `default_exec_approval_requirement` with the default restricted filesystem policy, and asserts the result is `NeedsApproval`.
+**Data flow**: It builds a granular approval configuration with sandbox approval turned on. It sends that policy and the default filesystem sandbox policy into the approval-decision function. The expected result says approval is needed, with no special reason and no proposed policy amendment.
 
-**Call relations**: This complements the previous granular-policy test.
+**Call relations**: This test works alongside the granular-disabled test. Together they show that the approval decision follows the sandbox-approval flag precisely: off means forbidden, on means a normal approval prompt can be requested.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (Granular, assert_eq!).
 
@@ -5424,11 +5454,11 @@ fn default_exec_approval_requirement_keeps_prompt_when_granular_allows_sandbox_a
 fn additional_permissions_allow_bypass_sandbox_first_attempt_when_execpolicy_skips()
 ```
 
-**Purpose**: Verifies that a trusted exec-policy skip with `bypass_sandbox: true` can bypass the sandbox on the first attempt even when the request shape is `WithAdditionalPermissions`. Trusted policy allow takes precedence when deny-read restrictions are absent.
+**Purpose**: This test checks that when extra permissions are requested and the execution policy already says approval can be skipped with sandbox bypass, the first attempt is allowed to bypass the sandbox. It verifies the fast path for commands that are already permitted to run with more access.
 
-**Data flow**: Calls `sandbox_override_for_first_attempt` with `SandboxPermissions::WithAdditionalPermissions`, `ExecApprovalRequirement::Skip { bypass_sandbox: true, ... }`, and the default filesystem policy, then asserts the result is `SandboxOverride::BypassSandboxFirstAttempt`.
+**Data flow**: It starts with sandbox permissions set to `WithAdditionalPermissions`, an execution approval result that skips approval and allows sandbox bypass, and the default filesystem sandbox policy. It asks the sandbox override logic what to do for the first command attempt. The expected answer is to bypass the sandbox on that first attempt.
 
-**Call relations**: This tests the exec-policy-bypass branch of first-attempt sandbox override.
+**Call relations**: This test exercises `sandbox_override_for_first_attempt`, the decision point that turns approval results and requested sandbox permissions into an actual execution mode. It confirms that the tool runner can honor an already-approved bypass when no extra filesystem denial blocks it.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5439,11 +5469,11 @@ fn additional_permissions_allow_bypass_sandbox_first_attempt_when_execpolicy_ski
 fn guardian_bypasses_sandbox_for_explicit_escalation_on_first_attempt()
 ```
 
-**Purpose**: Checks that an explicit `RequireEscalated` request bypasses the sandbox on the first attempt under ordinary restricted policies. This is the direct escalation path absent deny-read constraints.
+**Purpose**: This test checks that an explicit escalation request can bypass the sandbox on the first attempt, even when the skip decision itself did not ask to bypass. Escalation here means the command is marked as needing higher access than the default sandbox allows.
 
-**Data flow**: Calls `sandbox_override_for_first_attempt` with `SandboxPermissions::RequireEscalated`, a non-bypassing `Skip` requirement, and the default filesystem policy, then asserts the result is `BypassSandboxFirstAttempt`.
+**Data flow**: It provides `RequireEscalated` sandbox permissions, an execution approval result that skips approval but does not set its own bypass flag, and the default filesystem sandbox policy. The sandbox override logic combines those inputs. The expected result is still to bypass the sandbox for the first attempt.
 
-**Call relations**: This covers the explicit-escalation branch of first-attempt sandbox override.
+**Call relations**: This test covers another path through `sandbox_override_for_first_attempt`. It shows that an explicit elevated-permission request can drive the execution mode, not only the bypass flag inside the approval requirement.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5454,22 +5484,24 @@ fn guardian_bypasses_sandbox_for_explicit_escalation_on_first_attempt()
 fn deny_read_blocks_explicit_escalation_and_policy_bypass()
 ```
 
-**Purpose**: Verifies the central deny-read invariant: when the filesystem policy contains deny-read restrictions, neither explicit escalation nor trusted policy bypass may skip the sandbox. It also checks the corresponding permission normalization behavior.
+**Purpose**: This test checks a critical safety rule: if the sandbox policy denies reading certain files, the system must not bypass the sandbox in a way that removes that deny rule. It uses `*.env` files as the example, because those often contain secrets.
 
-**Data flow**: Builds a restricted filesystem policy with a deny glob for `**/*.env`, then calls `sandbox_override_for_first_attempt`, `unsandboxed_execution_allowed`, and `sandbox_permissions_preserving_denied_reads` with several permission/approval combinations. It asserts that bypass is blocked, unsandboxed execution is disallowed, `RequireEscalated` is rewritten to `UseDefault`, `WithAdditionalPermissions` is preserved, and the default policy still leaves `RequireEscalated` unchanged.
+**Data flow**: It first builds a restricted filesystem policy with a deny rule for paths matching `**/*.env`. It then tries several decisions against that policy: explicit escalation, unsandboxed execution checks, permission preservation, and an execution-policy bypass. Each expected result keeps the command sandboxed or downgrades the requested sandbox permissions so the denied-read rule stays in force. It also compares the same preservation helper against the default policy to confirm escalation is only blocked when denied reads are present.
 
-**Call relations**: This test exercises the interaction among the three shared helpers that preserve deny-read enforcement across orchestration.
+**Call relations**: This test ties together several safety helpers: `sandbox_override_for_first_attempt`, `unsandboxed_execution_allowed`, and `sandbox_permissions_preserving_denied_reads`. It tells the story of a command that might otherwise receive broader access, and verifies that denied-read filesystem rules have the final say.
 
 *Call graph*: calls 1 internal fn (restricted); 3 external calls (assert!, assert_eq!, vec!).
 
 
 ### `core/src/tools/runtimes/apply_patch_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This is a focused test module for the apply-patch tool runtime. It imports the runtime implementation from the parent module and constructs concrete `ApplyPatchRequest` instances using temporary absolute paths, synthetic patch actions from `ApplyPatchAction::new_add_for_test`, and a helper `TurnEnvironment` rooted in `Environment::default_for_tests()`. The tests cover several distinct integration points. Approval behavior is checked first: `wants_no_sandbox_approval` must treat `AskForApproval::OnRequest` as requiring sandbox approval bypass, while `AskForApproval::Granular` is driven specifically by the `sandbox_approval` flag rather than the other granular booleans. Request-shaping tests then verify that guardian review requests include the patch action’s `cwd`, the exact patch text, and the file list; permission request payloads must identify the tool as `apply_patch`, expose matcher aliases `Write` and `Edit`, and serialize the patch under `{ "command": ... }`; and approval keys must include the turn environment’s `environment_id` alongside each path so approvals are scoped per environment.
+The apply-patch tool changes files, so it sits at a sensitive point in the system: it can create or edit real files on disk. This test file checks that the surrounding safety machinery behaves correctly before that happens. In plain terms, it verifies that the tool asks for approval when it should, describes the patch accurately to reviewers, builds permission requests in the format other parts of the system expect, and carries the correct environment and sandbox information along with each request.
 
-The sandbox-oriented tests are more detailed. One confirms `sandbox_cwd` is taken directly from `req.action.cwd`. Another constructs a full `SandboxAttempt` with `SandboxType::MacosSeatbelt`, a base `PermissionProfile`, additional file-system permissions, and Windows/Linux sandbox flags, then checks that `file_system_sandbox_context_for_attempt` merges runtime permissions through `effective_file_system_sandbox_policy` and `effective_network_sandbox_policy`, preserves the attempt’s cwd and platform-specific sandbox settings, and returns a native permission profile equivalent to the expected merged policy. The final test asserts the invariant that `SandboxType::None` yields no file-system sandbox context at all.
+A sandbox is a restricted area where code can run with limited access, like letting someone work only at a specific desk instead of giving them keys to the whole building. These tests check both sides: when a real sandbox attempt exists, the apply-patch runtime should report the correct file-system permissions and working folder; when there is no sandbox, it should not pretend there is one.
+
+Most tests build a small fake patch request against a temporary file. They then call one narrow runtime method and compare the result with the expected value. This matters because approval keys, aliases, working directories, and sandbox details are small pieces of data, but if any are wrong the system might skip a needed approval, ask the wrong reviewer question, or apply a patch under the wrong security rules.
 
 #### Function details
 
@@ -5479,11 +5511,11 @@ The sandbox-oriented tests are more detailed. One confirms `sandbox_cwd` is take
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment
 ```
 
-**Purpose**: Builds a deterministic `TurnEnvironment` for tests from a supplied environment ID, using the default test exec environment and the process temp directory as an absolute `PathUri` root.
+**Purpose**: This helper builds a simple fake turn environment for tests. A turn environment is the context for one interaction, including which execution environment is being used and what base path represents it.
 
-**Data flow**: It takes `environment_id: &str`, clones it into an owned `String`, creates a test `codex_exec_server::Environment` wrapped in `Arc`, converts `std::env::temp_dir().abs()` into a `PathUri`, and passes those values with `shell` set to `None` into `crate::session::turn_context::TurnEnvironment::new`. It returns the fully constructed `TurnEnvironment` without mutating external state.
+**Data flow**: It takes an environment id as text. It creates a default test execution environment, points it at the system temporary directory, leaves the shell unset, and returns a ready-to-use TurnEnvironment for the test request.
 
-**Call relations**: This helper is invoked by nearly every async test in the file whenever an `ApplyPatchRequest` needs a realistic turn context. It centralizes setup so the approval-key, guardian-review, permission-payload, sandbox-cwd, and sandbox-context tests all exercise runtime code with the same style of environment object.
+**Call relations**: The individual tests call this helper whenever they need to build an ApplyPatchRequest. It keeps those tests focused on what they are checking instead of repeating the setup for a fake local or remote environment each time.
 
 *Call graph*: calls 3 internal fn (new, default_for_tests, from_abs_path); called by 6 (approval_keys_include_environment_id, file_system_sandbox_context_uses_active_attempt, guardian_review_request_includes_patch_context, no_sandbox_attempt_has_no_file_system_context, permission_request_payload_uses_apply_patch_hook_name_and_aliases, sandbox_cwd_uses_patch_action_cwd); 2 external calls (temp_dir, new).
 
@@ -5494,11 +5526,11 @@ fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::
 fn wants_no_sandbox_approval_granular_respects_sandbox_flag()
 ```
 
-**Purpose**: Verifies that `ApplyPatchRuntime::wants_no_sandbox_approval` keys off the sandbox-specific approval setting rather than unrelated granular approval toggles.
+**Purpose**: This test checks that the runtime correctly decides whether sandbox approval is wanted when approval settings are more detailed. It protects the rule that the specific sandbox-approval flag must be respected.
 
-**Data flow**: The test creates a fresh `ApplyPatchRuntime`, then evaluates `wants_no_sandbox_approval` against three inputs: `AskForApproval::OnRequest`, a `GranularApprovalConfig` with `sandbox_approval: false`, and another with `sandbox_approval: true`. It asserts the returned booleans match the expected policy decisions and produces no side effects beyond test assertions.
+**Data flow**: It creates an ApplyPatchRuntime, then feeds it different approval modes. It expects normal on-request approval to require sandbox approval, expects granular settings with sandbox approval turned off to say no, and expects granular settings with sandbox approval turned on to say yes.
 
-**Call relations**: This is a direct unit test of the runtime’s approval decision helper. Nothing in this file calls it; instead, the test invokes the runtime method itself to pin down the branch behavior for the two approval enum variants and the critical `sandbox_approval` field.
+**Call relations**: This test calls directly into the runtime decision method. It does not hand work off elsewhere; its role is to lock down the approval decision that later patch execution relies on.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert!).
 
@@ -5509,11 +5541,11 @@ fn wants_no_sandbox_approval_granular_respects_sandbox_flag()
 async fn guardian_review_request_includes_patch_context()
 ```
 
-**Purpose**: Checks that the guardian approval request generated for an apply-patch operation carries the patch action’s working directory, exact patch text, and target file list.
+**Purpose**: This test makes sure a request sent to the guardian approval system contains the actual patch details. The guardian is the review step that needs enough context to approve or reject a file change.
 
-**Data flow**: It creates an absolute temp-file path, builds an add-file `ApplyPatchAction`, captures `action.cwd` and `action.patch` as expected values, and assembles an `ApplyPatchRequest` containing a `FileChange::Add` entry and an `ExecApprovalRequirement::NeedsApproval`. That request is passed with call ID `"call-1"` into `ApplyPatchRuntime::build_guardian_review_request`, and the returned `GuardianApprovalRequest::ApplyPatch` is compared structurally against the expected object.
+**Data flow**: It creates a fake patch that adds text to a temporary file, wraps that in an ApplyPatchRequest, and asks the runtime to build a guardian review request. The output is checked to ensure it includes the call id, working directory, affected files, and patch text.
 
-**Call relations**: The test uses `test_turn_environment` to supply the request context, then exercises the runtime’s guardian-review conversion path. Its role is to validate that when higher-level approval orchestration asks the runtime for a guardian payload, no patch-specific context is dropped or recomputed incorrectly.
+**Call relations**: The test uses the shared turn-environment helper to build a realistic request, then calls the runtime method that formats the guardian request. It verifies that the approval layer receives the same patch context that the apply-patch action was built with.
 
 *Call graph*: calls 3 internal fn (new_add_for_test, build_guardian_review_request, test_turn_environment); 4 external calls (from, assert_eq!, temp_dir, vec!).
 
@@ -5524,11 +5556,11 @@ async fn guardian_review_request_includes_patch_context()
 async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases()
 ```
 
-**Purpose**: Ensures the runtime’s permission-request payload identifies the tool with the apply-patch hook name, exposes the expected matcher aliases, and serializes the patch command in the request body.
+**Purpose**: This test checks the permission-request message produced for apply-patch. It ensures the message names the tool as apply_patch and also includes aliases like Write and Edit, so permission rules that refer to those names can still match.
 
-**Data flow**: The test constructs a runtime, an absolute temp path, and an add-file `ApplyPatchAction`, then embeds that action in an `ApplyPatchRequest` with empty `changes` and a `NeedsApproval` exec requirement. It calls `runtime.permission_request_payload(&req)`, unwraps the `Option`/result with `expect`, and asserts that the returned payload contains tool name `apply_patch`, aliases `["Write", "Edit"]`, and JSON input `{ "command": expected_patch }`.
+**Data flow**: It creates a fake add-file patch, puts it into an ApplyPatchRequest, and asks the runtime for the permission request payload. It then checks that the payload has the expected tool name, expected matcher aliases, and a JSON input containing the patch command.
 
-**Call relations**: This test drives the runtime method used when approval infrastructure asks a tool to describe itself for permission prompting. It depends on `test_turn_environment` for request setup and validates the exact outward-facing payload shape consumed by approval matching logic.
+**Call relations**: The test calls the runtime method that prepares permission-request data. That data is meant for the broader approval and permission system, so this test protects the contract between apply-patch and that system.
 
 *Call graph*: calls 3 internal fn (new_add_for_test, new, test_turn_environment); 4 external calls (new, assert_eq!, temp_dir, vec!).
 
@@ -5539,11 +5571,11 @@ async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases()
 async fn approval_keys_include_environment_id()
 ```
 
-**Purpose**: Verifies that approval keys generated for apply-patch requests are environment-scoped, not just path-scoped.
+**Purpose**: This test confirms that approval keys include not only the file path but also the environment id. That matters because the same path may mean different things in different environments, such as local and remote machines.
 
-**Data flow**: It creates a runtime and a temp-file request whose `turn_environment` uses the explicit environment ID `"remote"`, with `ExecApprovalRequirement::Skip`. The test calls `runtime.approval_keys(&req)`, serializes the resulting key collection with `serde_json::to_value`, and asserts it equals a JSON array containing one object with both `environment_id: "remote"` and the file `path`.
+**Data flow**: It creates an ApplyPatchRequest using a fake environment id of remote and a temporary file path. It asks the runtime for approval keys and checks that the serialized result contains both the remote environment id and the path.
 
-**Call relations**: The test uses `test_turn_environment` with a non-local ID specifically to prove that the runtime threads environment identity into approval-key generation. This guards the call path used by approval caching or deduplication so approvals from one environment cannot silently apply to another.
+**Call relations**: The test builds its request with the shared helper, then calls the runtime’s approval-key builder. The resulting key is used by approval caching or matching, so this test makes sure approvals are scoped to the right environment.
 
 *Call graph*: calls 3 internal fn (new_add_for_test, new, test_turn_environment); 4 external calls (new, assert_eq!, temp_dir, vec!).
 
@@ -5554,11 +5586,11 @@ async fn approval_keys_include_environment_id()
 async fn sandbox_cwd_uses_patch_action_cwd()
 ```
 
-**Purpose**: Confirms that the runtime reports the sandbox working directory directly from the patch action embedded in the request.
+**Purpose**: This test checks that the sandbox working directory comes from the patch action itself. The working directory is the folder context the sandbox should use when applying the patch.
 
-**Data flow**: It builds a runtime and an `ApplyPatchRequest` around a temp-file add action, then calls `runtime.sandbox_cwd(&req)`. The returned `Option<&PathUri>` is asserted to equal `Some(&req.action.cwd)`, with no additional state changes.
+**Data flow**: It creates a fake patch request for a temporary file, then asks the runtime for the sandbox current working directory. The returned value is expected to be the same directory stored on the ApplyPatchAction.
 
-**Call relations**: This is a narrow unit test of the runtime helper consulted when sandbox setup needs a cwd. By constructing a normal request and comparing against the action field itself, it verifies that no alternate cwd source is used in the runtime’s sandbox preparation flow.
+**Call relations**: The test calls the runtime method that supplies sandbox setup information. This connects the patch action to the sandbox runner, ensuring the sandbox starts from the same location the patch was prepared for.
 
 *Call graph*: calls 3 internal fn (new_add_for_test, new, test_turn_environment); 4 external calls (new, assert_eq!, temp_dir, vec!).
 
@@ -5569,11 +5601,11 @@ async fn sandbox_cwd_uses_patch_action_cwd()
 async fn file_system_sandbox_context_uses_active_attempt()
 ```
 
-**Purpose**: Tests that file-system sandbox context generation for apply-patch uses the active `SandboxAttempt` settings and merges additional permissions into the effective runtime permission profile.
+**Purpose**: This test verifies that when a real sandbox attempt is active, the runtime builds a file-system sandbox context from that attempt. It checks that extra file permissions and platform-specific sandbox settings are preserved.
 
-**Data flow**: The test creates a temp path and an `AdditionalPermissionProfile` whose file-system permissions grant that path as a read-write root. It builds an `ApplyPatchRequest` carrying those additional permissions, defines a base `FileSystemSandboxPolicy::default()` and restricted network policy, converts them into a base `PermissionProfile`, and constructs a `SandboxAttempt` with `SandboxType::MacosSeatbelt`, a `SandboxManager`, cwd/path roots, and explicit Windows/Linux sandbox flags. It then calls `ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)`, unwraps the returned context, recomputes the expected effective file-system and network policies via `effective_file_system_sandbox_policy` and `effective_network_sandbox_policy`, converts the context’s permissions back into a native `PermissionProfile`, and asserts equality on permissions, cwd, Windows sandbox level, private desktop flag, and legacy landlock flag.
+**Data flow**: It creates a patch request with additional read-write permission for a temporary path, builds a sandbox attempt using a macOS-style sandbox type, and asks the runtime for a sandbox context. It then calculates the expected effective permissions and compares them with the returned context, along with the sandbox working directory and Windows/Linux-related settings carried through the attempt.
 
-**Call relations**: This test exercises the runtime path used after sandbox selection has already produced a concrete `SandboxAttempt`. It validates that the runtime does not merely echo request permissions; instead it derives context from the active attempt and policy-transform helpers, preserving platform-specific sandbox knobs needed by downstream sandbox execution.
+**Call relations**: This test combines several pieces: the request, the additional permission profile, and the active SandboxAttempt. It calls the runtime conversion method and verifies that the result is suitable for downstream file-system sandbox reporting or execution.
 
 *Call graph*: calls 10 internal fn (new_add_for_test, file_system_sandbox_context_for_attempt, test_turn_environment, from_read_write_roots, from_runtime_permissions, default, new, effective_file_system_sandbox_policy, effective_network_sandbox_policy, from_abs_path); 6 external calls (new, new, assert_eq!, temp_dir, from_ref, vec!).
 
@@ -5584,24 +5616,20 @@ async fn file_system_sandbox_context_uses_active_attempt()
 async fn no_sandbox_attempt_has_no_file_system_context()
 ```
 
-**Purpose**: Asserts that when the active sandbox attempt is `SandboxType::None`, the runtime declines to produce any file-system sandbox context.
+**Purpose**: This test checks the opposite case from the sandbox-context test: if the chosen sandbox type is none, the runtime should return no file-system sandbox context. This avoids reporting restrictions that are not actually in force.
 
-**Data flow**: It builds an `ApplyPatchRequest` for a temp-file add action, creates a disabled `PermissionProfile`, a `SandboxManager`, and a `SandboxAttempt` whose `sandbox` is `SandboxType::None` and whose platform flags are all disabled. The test passes request and attempt into `ApplyPatchRuntime::file_system_sandbox_context_for_attempt` and asserts the return value is exactly `None`.
+**Data flow**: It creates a patch request and a sandbox attempt whose sandbox type is None and whose permissions are disabled. It asks the runtime for a file-system sandbox context and expects the answer to be None.
 
-**Call relations**: This is the negative counterpart to the previous sandbox-context test. It verifies the branch taken when orchestration has chosen no sandbox at all, ensuring the runtime does not fabricate file-system context for unsandboxed execution.
+**Call relations**: The test uses the same request-building pattern as the other sandbox tests, then calls the same runtime conversion method. It confirms that the runtime only produces sandbox context when there is a real sandbox attempt to describe.
 
 *Call graph*: calls 4 internal fn (new_add_for_test, test_turn_environment, new, from_abs_path); 5 external calls (new, assert_eq!, temp_dir, from_ref, vec!).
 
 
 ### `core/src/tools/runtimes/mod_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is a test module for the runtime tooling layer, with most cases validating how commands and environments are rewritten before execution. It defines a tiny `StaticReloader` test double implementing `codex_network_proxy::ConfigReloader`; the reloader never produces updated config and intentionally errors on forced reload, allowing `test_network_proxy` to construct a stable `NetworkProxy` instance without external config churn. The tests then probe two broad areas.
-
-First, sandbox/escalation preparation: `explicit_escalation_prepares_exec_without_managed_network` builds a sandbox command, wraps it in a `SandboxAttempt`, and verifies that `RequireEscalated` permissions suppress managed-network injection and scrub Codex-owned proxy/CA variables while preserving unrelated user variables. Companion tests verify that user-provided CA and proxy variables survive when they are not Codex-marked.
-
-Second, shell snapshot replay: many tests create a temporary `snapshot.sh`, build a `(Shell, AbsolutePathBuf)` pair with `shell_with_snapshot`, call `maybe_wrap_shell_lc_with_snapshot`, and inspect either the rewritten argv or the actual subprocess output from running it. These cases pin down bootstrap-shell selection (`zsh`, `bash`, `sh`), shell quoting, preservation of trailing args, precedence of explicit env overrides over snapshot exports, restoration of live `CODEX_THREAD_ID`, nuanced proxy-variable refresh behavior, and replay of runtime PATH prepends. Unix-only tests also verify `RuntimePathPrepends` normalization and zsh-fork PATH insertion semantics, including deduplication and removal of empty PATH entries to avoid current-directory lookup.
+When Codex runs a command for a user, it may need to run it inside a sandbox, reuse the user's shell setup, add package helper paths, and avoid leaking stale network proxy settings. This test file checks those details from the outside, like rehearsing many tricky launch situations before trusting the real command runner. It creates small fake shells, temporary snapshot files, and test environments, then asks the runtime code to rewrite commands or prepare execution requests. The tests verify that explicit user choices win over saved shell snapshots, that secrets are not copied into command-line arguments, that proxy variables are removed or restored at the right time, and that PATH entries are kept in a safe order without empty entries that could accidentally mean “run something from the current folder.” It also checks sandbox escalation behavior: when a command is explicitly allowed to run outside the sandbox, Codex should not keep its own managed proxy environment attached. A small fake config reloader and test network proxy stand in for the real network proxy system so these tests can run without depending on live configuration reloads.
 
 #### Function details
 
@@ -5611,11 +5639,11 @@ Second, shell snapshot replay: many tests create a temporary `snapshot.sh`, buil
 fn source_label(&self) -> String
 ```
 
-**Purpose**: Returns a fixed human-readable label for the test config source used by the proxy state. The label makes the synthetic reloader identifiable without depending on any real configuration backend.
+**Purpose**: Gives the fake proxy configuration reloader a human-readable name. This helps the test proxy satisfy the same interface as the real reloader without doing real configuration work.
 
-**Data flow**: Reads no inputs beyond `self` and no external state. Produces the constant string `"test config state"` and writes nothing.
+**Data flow**: It takes no outside data beyond the fake reloader itself and returns the fixed text “test config state.” Nothing else is changed.
 
-**Call relations**: Used indirectly by proxy-state machinery after `test_network_proxy` installs `StaticReloader` into `NetworkProxyState`; it exists only to satisfy the `ConfigReloader` trait contract for tests.
+**Call relations**: The test network proxy builds a proxy state using StaticReloader. When the proxy system asks where its configuration came from, this method supplies a simple test label.
 
 
 ##### `StaticReloader::maybe_reload`  (lines 42–44)
@@ -5624,11 +5652,11 @@ fn source_label(&self) -> String
 fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>>
 ```
 
-**Purpose**: Implements the non-forced reload path for the test reloader by always reporting that no new config is available. This keeps proxy state stable across tests.
+**Purpose**: Pretends to check whether proxy configuration has changed, but always says there is no new configuration. This keeps tests stable and avoids background config changes.
 
-**Data flow**: Consumes `self` by shared reference and returns a boxed async future resolving to `Ok(None)`. It reads no mutable state and performs no side effects.
+**Data flow**: It receives the fake reloader, creates an asynchronous result, and returns success with no replacement configuration. No state is updated.
 
-**Call relations**: Reached only through the `ConfigReloader` interface after `test_network_proxy` wires the reloader into `NetworkProxyState`; it deliberately stops reload-driven behavior from affecting assertions.
+**Call relations**: The proxy state can call this through the ConfigReloader interface during proxy setup or use. In these tests it deliberately hands back “nothing changed” so command-preparation behavior is the only thing being tested.
 
 *Call graph*: 1 external calls (pin).
 
@@ -5639,11 +5667,11 @@ fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>>
 fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState>
 ```
 
-**Purpose**: Implements forced reload for the test reloader by failing immediately. The explicit error prevents tests from accidentally depending on unsupported live reload behavior.
+**Purpose**: Rejects forced proxy configuration reloads in tests. A forced reload is outside what this fake object is meant to simulate.
 
-**Data flow**: Takes `&self`, returns a boxed async future, and resolves to an `anyhow` error with the message that force reload is unsupported in tests. It reads and writes no other state.
+**Data flow**: It receives the fake reloader, creates an asynchronous result, and returns an error explaining that forced reload is not supported. It does not change any proxy state.
 
-**Call relations**: Like `maybe_reload`, this is only exercised through the proxy reloader abstraction installed by `test_network_proxy`; its role is to make unsupported paths fail loudly if invoked.
+**Call relations**: This exists because the real ConfigReloader interface requires it. If production-like code asks the fake reloader to force a reload, the test fails clearly instead of silently doing something misleading.
 
 *Call graph*: 2 external calls (pin, anyhow!).
 
@@ -5658,11 +5686,11 @@ fn shell_with_snapshot(
 ) -> (Shell, AbsolutePathBuf)
 ```
 
-**Purpose**: Builds the exact `(Shell, AbsolutePathBuf)` pair expected by snapshot-related tests. It packages a `ShellType`, shell executable path, and snapshot file path into a reusable fixture.
+**Purpose**: Builds a small pair of test objects: a shell description and the path to a saved shell snapshot. Tests use this to avoid repeating the same setup.
 
-**Data flow**: Accepts a `ShellType`, a shell path string, and an `AbsolutePathBuf` snapshot path. It converts the shell path into a `PathBuf`, constructs a `Shell { shell_type, shell_path }`, and returns that shell alongside the unchanged snapshot path.
+**Data flow**: It receives a shell kind, a shell executable path as text, and a snapshot file path. It converts the shell path into a path object and returns both the Shell object and the snapshot path.
 
-**Call relations**: This helper is the common setup step for nearly every `maybe_wrap_shell_lc_with_snapshot_*` test and for the PATH probe helper, reducing duplication while keeping each test focused on rewrite behavior.
+**Call relations**: Many snapshot-wrapping tests call this before asking maybe_wrap_shell_lc_with_snapshot to rewrite a command. It gives those tests a consistent “user shell plus saved setup file” starting point.
 
 *Call graph*: called by 19 (maybe_wrap_shell_lc_with_snapshot_applies_explicit_path_override, maybe_wrap_shell_lc_with_snapshot_bootstraps_in_user_shell, maybe_wrap_shell_lc_with_snapshot_clears_stale_codex_git_ssh_command_without_live_command, maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv, maybe_wrap_shell_lc_with_snapshot_escapes_single_quotes, maybe_wrap_shell_lc_with_snapshot_keeps_snapshot_path_without_override, maybe_wrap_shell_lc_with_snapshot_keeps_user_proxy_env_when_proxy_inactive, maybe_wrap_shell_lc_with_snapshot_preserves_trailing_args, maybe_wrap_shell_lc_with_snapshot_preserves_unset_override_variables, maybe_wrap_shell_lc_with_snapshot_preserves_zsh_fork_path_prepend (+9 more)); 1 external calls (from).
 
@@ -5673,11 +5701,11 @@ fn shell_with_snapshot(
 async fn test_network_proxy() -> anyhow::Result<NetworkProxy>
 ```
 
-**Purpose**: Constructs a deterministic `NetworkProxy` instance for tests with fixed loopback HTTP and SOCKS addresses and a static config state. It avoids external configuration and marks the proxy as not managed by Codex.
+**Purpose**: Creates a lightweight network proxy object for tests. It gives sandbox-preparation tests a realistic proxy shape without depending on real proxy configuration reloads.
 
-**Data flow**: Builds a default `NetworkProxyConfig` and `NetworkProxyConstraints`, converts them into a `ConfigState`, wraps that in `NetworkProxyState::with_reloader` using `Arc<StaticReloader>`, then feeds the state and fixed socket addresses into `NetworkProxy::builder()`. Returns the asynchronously built `NetworkProxy` or an error.
+**Data flow**: It starts from default proxy configuration and default constraints, wraps them in proxy state with StaticReloader, assigns fixed local HTTP and SOCKS addresses, and asynchronously builds a NetworkProxy. The result is a proxy object ready to apply environment variables in a test.
 
-**Call relations**: Called only by `explicit_escalation_prepares_exec_without_managed_network` to supply a realistic proxy object whose environment variables can be applied and then verified as stripped during escalated execution preparation.
+**Call relations**: The explicit sandbox-escalation test calls this first. The proxy it returns is then used to mark an environment as proxy-enabled so the test can confirm those Codex proxy settings are later stripped when escalation disables managed networking.
 
 *Call graph*: calls 2 internal fn (builder, with_reloader); called by 1 (explicit_escalation_prepares_exec_without_managed_network); 4 external calls (new, build_config_state, default, default).
 
@@ -5688,11 +5716,11 @@ async fn test_network_proxy() -> anyhow::Result<NetworkProxy>
 async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an explicitly escalated sandbox execution request does not carry managed-network settings or Codex proxy variables into the final exec environment. It also checks that ordinary user environment entries survive unchanged.
+**Purpose**: Checks that an explicitly escalated command is prepared without Codex-managed network proxy settings. This matters because a command allowed to run outside the sandbox should not accidentally inherit Codex’s internal proxy wiring.
 
-**Data flow**: Creates a temp workspace, a test proxy, and an env map seeded with `CUSTOM_ENV`; applies proxy vars into that env; builds a sandbox command for `/bin/echo ok`; constructs `ExecOptions`, `PermissionProfile::Disabled`, `SandboxManager`, and a `SandboxAttempt` configured with `SandboxType::None` and `enforce_managed_network: false`; then calls `attempt.env_for(...)`. It asserts the returned exec request preserves cwd values, sets `network` to `None`, removes all `PROXY_ENV_KEYS` and `CUSTOM_CA_ENV_KEYS` (plus the macOS git-ssh proxy var), and retains `CUSTOM_ENV`.
+**Data flow**: The test creates a fake proxy, a temporary working directory, an environment with both custom and proxy variables, and a simple echo command. It builds a sandbox command, prepares an execution request through SandboxAttempt, and then checks that paths are converted back correctly, managed network information is absent, proxy and custom certificate variables are gone, and the unrelated custom environment variable remains.
 
-**Call relations**: This is a top-level async test. It depends on `test_network_proxy` for a populated proxy env and on runtime helpers such as `build_sandbox_command`, `exec_env_for_sandbox_permissions`, and `managed_network_for_sandbox_permissions` to drive the exact escalation path under test.
+**Call relations**: The test runner calls this asynchronous test. It uses test_network_proxy, build_sandbox_command, exec_env_for_sandbox_permissions, managed_network_for_sandbox_permissions, and SandboxAttempt::env_for as a complete rehearsal of preparing an escalated tool command.
 
 *Call graph*: calls 4 internal fn (test_network_proxy, managed_network_for_sandbox_permissions, new, from_abs_path); 5 external calls (from, assert_eq!, from_ref, tempdir, vec!).
 
@@ -5703,11 +5731,11 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
 fn explicit_escalation_preserves_user_ca_env()
 ```
 
-**Purpose**: Checks that explicit escalation does not erase a user-supplied CA bundle path merely because proxy-related state is present. The test distinguishes user CA configuration from Codex-managed proxy CA injection.
+**Purpose**: Checks that a user-provided certificate setting is not removed just because a Codex proxy marker is present. Certificate settings tell programs which trusted certificate file to use.
 
-**Data flow**: Builds an env map containing `PROXY_ACTIVE_ENV_KEY=1` and `SSL_CERT_FILE=/tmp/custom-ca.pem`, passes it through `exec_env_for_sandbox_permissions` with `SandboxPermissions::RequireEscalated`, and asserts the resulting map still contains the same `SSL_CERT_FILE` value.
+**Data flow**: The test starts with an environment containing the proxy-active marker and SSL_CERT_FILE pointing at a custom file. It runs the environment through the sandbox-permission filter and verifies that SSL_CERT_FILE still has the same value.
 
-**Call relations**: This standalone regression test targets the env-filtering helper directly rather than the full sandbox request path, narrowing the assertion to CA-variable preservation.
+**Call relations**: The test runner calls this as a focused check of exec_env_for_sandbox_permissions. It complements the larger escalation test by proving user certificate choices survive the filtering step.
 
 *Call graph*: 2 external calls (from, assert_eq!).
 
@@ -5718,11 +5746,11 @@ fn explicit_escalation_preserves_user_ca_env()
 fn runtime_path_prepends_records_runtime_path_prepend()
 ```
 
-**Purpose**: Verifies that prepending a runtime path updates both the live `PATH` variable and the replay metadata stored in `RuntimePathPrepends`. It confirms the prepend is visible immediately and can later be reproduced from a snapshot.
+**Purpose**: Checks that adding a runtime helper directory to PATH updates both the live environment and the replay record. The replay record is needed later when a shell snapshot resets PATH.
 
-**Data flow**: Starts with `PATH=/usr/bin:/bin` and a default `RuntimePathPrepends`, calls `prepend` with `/package/codex-path`, then asserts the env now has `/package/codex-path:/usr/bin:/bin` and `entries` contains exactly that directory once.
+**Data flow**: The test starts with PATH set to /usr/bin:/bin and an empty RuntimePathPrepends record. It prepends /package/codex-path, then verifies PATH begins with that directory and the same directory is recorded once.
 
-**Call relations**: This direct unit test exercises `RuntimePathPrepends::prepend` behavior in isolation, establishing the baseline later relied on by snapshot replay tests.
+**Call relations**: The test runner calls this to exercise RuntimePathPrepends::prepend. Later snapshot-wrapping tests depend on this behavior so runtime-added paths are restored after loading a snapshot.
 
 *Call graph*: 4 external calls (from, from, assert_eq!, default).
 
@@ -5733,11 +5761,11 @@ fn runtime_path_prepends_records_runtime_path_prepend()
 fn runtime_path_prepends_drops_empty_path_entries()
 ```
 
-**Purpose**: Checks that runtime PATH prepending normalizes away empty path segments instead of preserving implicit current-directory lookups. It also verifies duplicate prepends are collapsed in the recorded replay list.
+**Purpose**: Checks that PATH cleanup removes empty entries while adding a runtime helper path. Empty PATH entries can mean “search the current directory,” which is usually unsafe.
 
-**Data flow**: Initializes `PATH` with leading, trailing, and repeated empty segments plus an existing `/package/codex-path`, calls `prepend` with the same directory, and asserts the resulting `PATH` is normalized to `/package/codex-path:/usr/bin:/bin` while `entries` records the prepend only once.
+**Data flow**: The test starts with a PATH that contains leading, repeated, and trailing empty sections plus an existing copy of the helper directory. After prepending, it expects a clean PATH with the helper directory first and no empty entries, and it expects the helper path to be recorded once.
 
-**Call relations**: This is another focused unit test of `RuntimePathPrepends::prepend`, covering the edge case where malformed or unsafe PATH contents must be sanitized.
+**Call relations**: The test runner calls this as a safety check for RuntimePathPrepends::prepend. It proves the helper does not preserve risky current-directory lookups while reshaping PATH.
 
 *Call graph*: 4 external calls (from, from, assert_eq!, default).
 
@@ -5748,11 +5776,11 @@ fn runtime_path_prepends_drops_empty_path_entries()
 fn runtime_path_prepends_ignores_empty_path_entry()
 ```
 
-**Purpose**: Ensures that attempting to prepend an empty filesystem path is treated as a no-op. This prevents corrupting `PATH` or recording meaningless replay metadata.
+**Purpose**: Checks that asking to prepend an empty path does nothing. This prevents accidental blank PATH components from being recorded or added.
 
-**Data flow**: Creates an env with `PATH=/usr/bin:/bin`, a default `RuntimePathPrepends`, and calls `prepend` with `PathBuf::new().as_path()`. It asserts `PATH` remains unchanged and the prepend tracker stays equal to its default empty state.
+**Data flow**: The test starts with a normal PATH and an empty RuntimePathPrepends record. It passes an empty path to prepend, then verifies PATH and the record are unchanged.
 
-**Call relations**: This isolated test covers the guard path in runtime PATH handling where the candidate prepend has no usable string representation.
+**Call relations**: The test runner calls this to cover the no-op case for RuntimePathPrepends::prepend. It guards against later snapshot replay adding meaningless or unsafe entries.
 
 *Call graph*: 4 external calls (from, new, assert_eq!, default).
 
@@ -5763,11 +5791,11 @@ fn runtime_path_prepends_ignores_empty_path_entry()
 fn prepend_zsh_fork_bin_to_path_ignores_empty_parent()
 ```
 
-**Purpose**: Verifies that the zsh-fork PATH helper declines to modify `PATH` when the provided shell path has no parent directory. That avoids inventing an invalid prepend from a bare executable name.
+**Purpose**: Checks that the zsh helper does not modify PATH when the shell path has no usable parent directory. The zsh helper only makes sense when Codex can find the directory that contains the shell executable.
 
-**Data flow**: Starts with a normal `PATH`, passes `PathBuf::from("zsh")` to `prepend_zsh_fork_bin_to_path`, and asserts the function returns `None` and leaves `PATH` untouched.
+**Data flow**: The test starts with PATH set and passes the relative path zsh, whose parent directory is empty. The helper returns no update and leaves PATH exactly as it was.
 
-**Call relations**: This unit test targets the lower-level zsh PATH helper directly, covering the failure-to-derive-parent branch that `apply_zsh_fork_path_prepend` depends on.
+**Call relations**: The test runner calls this to exercise prepend_zsh_fork_bin_to_path. It protects apply_zsh_fork_path_prepend from recording bogus path additions when the shell path is incomplete.
 
 *Call graph*: 3 external calls (from, from, assert_eq!).
 
@@ -5778,11 +5806,11 @@ fn prepend_zsh_fork_bin_to_path_ignores_empty_parent()
 fn apply_zsh_fork_path_prepend_uses_shell_parent()
 ```
 
-**Purpose**: Checks that zsh fork setup prepends the parent directory of the zsh executable to `PATH` and records that directory for snapshot replay. It validates the intended happy path for packaged zsh resources.
+**Purpose**: Checks that when Codex uses its bundled zsh fork, the directory containing that zsh binary is placed at the front of PATH and recorded for replay.
 
-**Data flow**: Creates `PATH=/usr/bin:/bin` and an empty `RuntimePathPrepends`, calls `apply_zsh_fork_path_prepend` with `/package/codex-resources/zsh/bin/zsh`, then asserts `PATH` becomes `/package/codex-resources/zsh/bin:/usr/bin:/bin` and `entries` contains that bin directory.
+**Data flow**: The test starts with a normal PATH and an empty runtime prepend record. It passes a full zsh executable path, then verifies PATH begins with that executable’s parent directory and the parent directory is stored in RuntimePathPrepends.
 
-**Call relations**: This test exercises the higher-level helper that combines parent extraction with runtime prepend recording, behavior later reused by snapshot replay tests.
+**Call relations**: The test runner calls this to exercise apply_zsh_fork_path_prepend. Snapshot-wrapping code later uses the recorded prepend so the bundled zsh directory stays available even after loading saved shell state.
 
 *Call graph*: 4 external calls (from, from, assert_eq!, default).
 
@@ -5793,11 +5821,11 @@ fn apply_zsh_fork_path_prepend_uses_shell_parent()
 fn apply_zsh_fork_path_prepend_moves_existing_shell_parent_to_front()
 ```
 
-**Purpose**: Verifies that applying the zsh fork prepend deduplicates an already-present shell bin directory and moves it to the front of `PATH`. This preserves precedence without leaving repeated entries behind.
+**Purpose**: Checks that the zsh binary directory is moved to the front of PATH if it is already present. This avoids duplicate PATH entries while still giving the bundled zsh tools priority.
 
-**Data flow**: Begins with a `PATH` containing `/package/codex-resources/zsh/bin` twice in non-leading positions, applies the zsh fork prepend for the matching zsh path, and asserts the final `PATH` is `/package/codex-resources/zsh/bin:/usr/bin:/bin` with a single recorded prepend entry.
+**Data flow**: The test starts with PATH containing the zsh directory twice in the middle and at the end. After applying the prepend, it expects one clean copy at the front, followed by the other real directories, and one replay record.
 
-**Call relations**: This complements the previous zsh prepend test by covering the deduplication/reordering branch rather than simple insertion.
+**Call relations**: The test runner calls this as a deduplication check for apply_zsh_fork_path_prepend. It supports the broader PATH behavior tested later during snapshot replay.
 
 *Call graph*: 4 external calls (from, from, assert_eq!, default).
 
@@ -5808,11 +5836,11 @@ fn apply_zsh_fork_path_prepend_moves_existing_shell_parent_to_front()
 fn explicit_escalation_keeps_user_proxy_env_without_codex_marker()
 ```
 
-**Purpose**: Confirms that explicit escalation preserves ordinary user proxy settings when they are not marked as Codex-managed. The test prevents over-aggressive stripping of all proxy variables.
+**Purpose**: Checks that a user’s own proxy setting is preserved when it is not marked as Codex-managed. A normal HTTP_PROXY might be part of the user’s workplace network setup.
 
-**Data flow**: Creates an env containing `HTTP_PROXY=http://user.proxy:8080` and `CUSTOM_ENV=kept`, passes it through `exec_env_for_sandbox_permissions` with `RequireEscalated`, and asserts both values remain present in the returned env map.
+**Data flow**: The test starts with HTTP_PROXY and another custom variable. It filters the environment for an escalated command and verifies both values remain unchanged.
 
-**Call relations**: This direct helper-level test complements the broader exec-request test by isolating the distinction between Codex-owned and user-owned proxy variables.
+**Call relations**: The test runner calls this to pin down the difference between Codex proxy variables and user proxy variables. It exercises exec_env_for_sandbox_permissions in a case where proxy removal would be wrong.
 
 *Call graph*: 2 external calls (from, assert_eq!).
 
@@ -5823,11 +5851,11 @@ fn explicit_escalation_keeps_user_proxy_env_without_codex_marker()
 fn maybe_wrap_shell_lc_with_snapshot_bootstraps_in_user_shell()
 ```
 
-**Purpose**: Verifies that a `-lc` shell command is rewritten to bootstrap through the session shell and source the snapshot before executing the original command. It specifically checks zsh-based bootstrapping of a bash command.
+**Purpose**: Checks that a shell command is wrapped so it first loads the user’s saved shell snapshot using the user’s session shell. This lets commands run with the same setup the user normally has.
 
-**Data flow**: Creates a temp snapshot file, builds a `ShellType::Zsh` session shell fixture, defines a command `['/bin/bash','-lc','echo hello']`, and passes empty override/env maps plus default runtime prepends into `maybe_wrap_shell_lc_with_snapshot`. It asserts the rewritten argv starts with `/bin/zsh -c` and that the generated script sources the snapshot and `exec`s `/bin/bash -c 'echo hello'`.
+**Data flow**: The test writes a snapshot file, describes the session shell as zsh, and supplies a bash -lc command. The wrapper returns a new command that starts /bin/zsh with -c, sources the snapshot, and then executes the original bash command.
 
-**Call relations**: This is a top-level snapshot rewrite test using `shell_with_snapshot` for setup. It exercises the main wrapping path and inspects argv text rather than subprocess output.
+**Call relations**: The test runner calls this as a basic behavior check for maybe_wrap_shell_lc_with_snapshot. It uses shell_with_snapshot for setup and then inspects the rewritten command text.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 7 external calls (new, assert!, assert_eq!, default, write, tempdir, vec!).
 
@@ -5838,11 +5866,11 @@ fn maybe_wrap_shell_lc_with_snapshot_bootstraps_in_user_shell()
 fn maybe_wrap_shell_lc_with_snapshot_escapes_single_quotes()
 ```
 
-**Purpose**: Checks that the wrapper script correctly shell-quotes embedded single quotes from the original command string. This prevents malformed bootstrap scripts when replaying commands containing apostrophes.
+**Purpose**: Checks that commands containing single quotes are safely embedded in the wrapper command. Without this, a command like echo 'hello' could be broken or interpreted incorrectly by the shell.
 
-**Data flow**: Builds a zsh session shell and snapshot, rewrites `['/bin/bash','-lc',"echo 'hello'"]`, and asserts the generated script contains the expected shell-escaped sequence for `echo 'hello'` inside the nested `exec` command.
+**Data flow**: The test creates a snapshot and a command whose script contains single quotes. After wrapping, it checks that the generated shell text uses the standard safe quote-breaking pattern so the original script survives intact.
 
-**Call relations**: This test narrows in on quoting logic within `maybe_wrap_shell_lc_with_snapshot`, complementing the broader bootstrap-shell selection tests.
+**Call relations**: The test runner calls this to verify the quoting behavior inside maybe_wrap_shell_lc_with_snapshot. It protects all later wrapped shell commands that include quoted text.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 6 external calls (new, assert!, default, write, tempdir, vec!).
 
@@ -5853,11 +5881,11 @@ fn maybe_wrap_shell_lc_with_snapshot_escapes_single_quotes()
 fn maybe_wrap_shell_lc_with_snapshot_uses_bash_bootstrap_shell()
 ```
 
-**Purpose**: Verifies that when the session shell is bash, the wrapper uses `/bin/bash -c` as the bootstrap shell regardless of the original command shell. It confirms bootstrap-shell choice follows session context.
+**Purpose**: Checks that when the user’s session shell is bash, the snapshot wrapper uses bash to load the snapshot. The bootstrap shell should match the user environment being restored.
 
-**Data flow**: Creates a bash session shell fixture and snapshot, rewrites a zsh `-lc` command, and asserts the rewritten argv begins with `/bin/bash -c` while the generated script still `exec`s the original `/bin/zsh -c 'echo hello'` payload after sourcing the snapshot.
+**Data flow**: The test creates a bash session shell and an original zsh command. The rewritten command starts /bin/bash with -c, sources the snapshot, and then executes the original zsh command.
 
-**Call relations**: This test is one of several shell-selection cases for `maybe_wrap_shell_lc_with_snapshot`, differing only in the session shell fixture.
+**Call relations**: The test runner calls this to cover one supported shell type in maybe_wrap_shell_lc_with_snapshot. Together with the zsh and sh tests, it verifies shell selection.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 7 external calls (new, assert!, assert_eq!, default, write, tempdir, vec!).
 
@@ -5868,11 +5896,11 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_bash_bootstrap_shell()
 fn maybe_wrap_shell_lc_with_snapshot_uses_sh_bootstrap_shell()
 ```
 
-**Purpose**: Checks that a session configured as plain `sh` causes snapshot bootstrapping to run under `/bin/sh -c`. It ensures the wrapper honors the exact shell family selected for the session.
+**Purpose**: Checks that the wrapper can use plain sh as the bootstrap shell when that is the user’s session shell. This matters for systems or users that do not use bash or zsh.
 
-**Data flow**: Creates an `sh` session shell and snapshot, rewrites a bash `-lc` command, and asserts the rewritten argv starts with `/bin/sh -c` and contains snapshot sourcing plus `exec '/bin/bash' -c 'echo hello'`.
+**Data flow**: The test creates an sh session shell and a bash -lc command. The wrapper returns a command that starts /bin/sh with -c, loads the snapshot, and then runs the original bash command.
 
-**Call relations**: This is the third bootstrap-shell selection test, covering the `ShellType::Sh` branch of `maybe_wrap_shell_lc_with_snapshot`.
+**Call relations**: The test runner calls this to cover the sh path in maybe_wrap_shell_lc_with_snapshot. It confirms the wrapper does not assume only bash or zsh exist.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 7 external calls (new, assert!, assert_eq!, default, write, tempdir, vec!).
 
@@ -5883,11 +5911,11 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_sh_bootstrap_shell()
 fn maybe_wrap_shell_lc_with_snapshot_preserves_trailing_args()
 ```
 
-**Purpose**: Verifies that arguments following the `-c` script are preserved when the command is wrapped through the snapshot bootstrap. This matters because shells use those trailing argv entries as `$0`, `$1`, and so on.
+**Purpose**: Checks that extra arguments after the shell script are preserved when a command is wrapped. Shell commands sometimes use these trailing values as $0, $1, and so on.
 
-**Data flow**: Creates a zsh session shell and snapshot, rewrites a bash command whose script prints `$0` and `$1` and whose argv includes `arg0` and `arg1`, then asserts the generated nested `exec` command includes both trailing arguments with proper quoting.
+**Data flow**: The test builds a bash -lc command with a script plus two extra arguments. After wrapping, it checks that the generated exec command includes the original script and both trailing arguments with safe quoting.
 
-**Call relations**: This test exercises the argv reconstruction branch of `maybe_wrap_shell_lc_with_snapshot`, ensuring wrapping does not truncate shell positional parameters.
+**Call relations**: The test runner calls this to exercise maybe_wrap_shell_lc_with_snapshot on a command shape with more than the usual three arguments. It ensures the wrapper does not silently drop data.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 6 external calls (new, assert!, default, write, tempdir, vec!).
 
@@ -5898,11 +5926,11 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_trailing_args()
 fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence()
 ```
 
-**Purpose**: Checks that explicit environment overrides supplied by the caller take precedence over values exported by the snapshot, while unrelated snapshot-only variables remain available. It validates the wrapper’s post-source restoration logic.
+**Purpose**: Checks that explicit environment overrides win over values loaded from a shell snapshot. If Codex intentionally sets a value for a worktree command, the saved user shell should not overwrite it.
 
-**Data flow**: Writes a snapshot exporting `TEST_ENV_SNAPSHOT=global` and `SNAPSHOT_ONLY=from_snapshot`, rewrites a bash command that prints both variables, passes `TEST_ENV_SNAPSHOT=worktree` in both explicit overrides and live env maps, then executes the rewritten command with that env set. It asserts stdout is `worktree|from_snapshot`.
+**Data flow**: The test writes a snapshot that sets TEST_ENV_SNAPSHOT and SNAPSHOT_ONLY. It wraps a command, runs it with TEST_ENV_SNAPSHOT set to the worktree value, and verifies the output uses the worktree value for the overridden variable while still receiving SNAPSHOT_ONLY from the snapshot.
 
-**Call relations**: Unlike argv-inspection tests, this one runs the rewritten command to verify actual shell semantics after `maybe_wrap_shell_lc_with_snapshot` restores selected live variables.
+**Call relations**: The test runner calls this and actually executes the rewritten command. It proves maybe_wrap_shell_lc_with_snapshot restores selected live environment values after sourcing the snapshot.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (from, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -5913,11 +5941,11 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence()
 fn maybe_wrap_shell_lc_with_snapshot_restores_codex_thread_id_from_env()
 ```
 
-**Purpose**: Ensures that `CODEX_THREAD_ID` from the live process environment overrides any stale value captured in the snapshot. This preserves nested execution context instead of reverting to the parent snapshot’s thread identity.
+**Purpose**: Checks that CODEX_THREAD_ID from the live command environment is restored after loading a snapshot. This keeps nested or current Codex session identity from being replaced by an older saved value.
 
-**Data flow**: Creates a snapshot exporting `CODEX_THREAD_ID=parent-thread`, rewrites a command that prints `CODEX_THREAD_ID`, passes a live env map containing `nested-thread`, executes the rewritten command with `CODEX_THREAD_ID=nested-thread`, and asserts stdout is `nested-thread`.
+**Data flow**: The test writes a snapshot with CODEX_THREAD_ID set to a parent value, wraps a command that prints it, then runs the command with CODEX_THREAD_ID set to a nested value. The output must be the nested value.
 
-**Call relations**: This is a concrete precedence test for one special variable whose live value must survive snapshot sourcing; it validates the restoration branch inside `maybe_wrap_shell_lc_with_snapshot`.
+**Call relations**: The test runner calls this as a focused environment-restoration check for maybe_wrap_shell_lc_with_snapshot. It shows that important Codex bookkeeping variables are protected from stale snapshots.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (from, new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -5928,11 +5956,11 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_codex_thread_id_from_env()
 fn maybe_wrap_shell_lc_with_snapshot_restores_proxy_env_from_process_env()
 ```
 
-**Purpose**: Verifies that when proxying is active, live proxy variables from the process environment replace stale snapshot proxy values, while unrelated variables like plain `GIT_SSH_COMMAND` remain as exported by the snapshot. It captures the nuanced distinction between managed proxy vars and ordinary shell state.
+**Purpose**: Checks that live proxy variables are restored after a snapshot loads stale proxy values. This prevents commands from using old proxy ports saved in a previous shell snapshot.
 
-**Data flow**: Writes a snapshot exporting stale `PIP_PROXY`, `HTTP_PROXY`, `http_proxy`, and `GIT_SSH_COMMAND`; rewrites a command that prints all four; executes it with `PROXY_ACTIVE_ENV_KEY=1` and fresh live values for the proxy vars plus `GIT_SSH_COMMAND`; then asserts the three proxy vars come from the live env while `GIT_SSH_COMMAND` remains the snapshot value.
+**Data flow**: The test writes a snapshot with stale PIP_PROXY, HTTP_PROXY, http_proxy, and GIT_SSH_COMMAND values. It wraps a print command and runs it with fresh proxy values in the process environment. The proxy URL variables print the fresh values, while the generic GIT_SSH_COMMAND remains the snapshot value on non-macOS behavior covered here.
 
-**Call relations**: This subprocess-backed test exercises the proxy-refresh logic embedded in `maybe_wrap_shell_lc_with_snapshot`, specifically the branch activated by `PROXY_ACTIVE_ENV_KEY`.
+**Call relations**: The test runner calls this and executes the rewritten shell command. It verifies maybe_wrap_shell_lc_with_snapshot can repair proxy-related environment after sourcing a snapshot.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -5943,11 +5971,11 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_proxy_env_from_process_env()
 fn maybe_wrap_shell_lc_with_snapshot_refreshes_codex_proxy_git_ssh_command()
 ```
 
-**Purpose**: On macOS, verifies that a stale Codex-managed git SSH proxy command captured in the snapshot is replaced by the live Codex-managed command. This keeps the proxy port/current command synchronized across snapshot replay.
+**Purpose**: On macOS, checks that a Codex-managed Git SSH proxy command is refreshed from the live environment instead of keeping a stale snapshot value. Git SSH proxy commands tell git how to connect through a proxy.
 
-**Data flow**: Builds stale and fresh command strings prefixed with `CODEX_PROXY_GIT_SSH_COMMAND_MARKER`, writes the stale one into the snapshot under `PROXY_GIT_SSH_COMMAND_ENV_KEY`, rewrites a command that prints that variable, executes it with the fresh command in the live env, and asserts stdout equals the fresh command.
+**Data flow**: The test writes a snapshot containing an old Codex-marked Git SSH command and runs a wrapped command with a fresh Codex-marked command in the environment. The printed value must be the fresh command.
 
-**Call relations**: This macOS-only regression test targets the special-case refresh path in `maybe_wrap_shell_lc_with_snapshot` for Codex-owned git SSH proxy commands.
+**Call relations**: The macOS test runner calls this to cover a platform-specific branch of maybe_wrap_shell_lc_with_snapshot. It uses shell_with_snapshot and shell quoting helpers to simulate stale and fresh proxy commands.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (new, assert!, assert_eq!, new, default, format!, write, tempdir, vec!).
 
@@ -5958,11 +5986,11 @@ fn maybe_wrap_shell_lc_with_snapshot_refreshes_codex_proxy_git_ssh_command()
 fn maybe_wrap_shell_lc_with_snapshot_restores_custom_git_ssh_command()
 ```
 
-**Purpose**: On macOS, checks that a user-provided custom git SSH command from the live environment overrides a stale Codex-managed snapshot command. It prevents Codex-specific snapshot state from clobbering user customization.
+**Purpose**: On macOS, checks that a user’s custom Git SSH command replaces a stale Codex-managed one from the snapshot. User-supplied SSH routing should not be overwritten by old Codex proxy data.
 
-**Data flow**: Writes a stale marker-prefixed proxy command into the snapshot, rewrites a command that prints `PROXY_GIT_SSH_COMMAND_ENV_KEY`, executes it with a custom non-marker command in the live env, and asserts stdout equals the custom command.
+**Data flow**: The test writes a snapshot with a Codex-marked stale command, then runs the wrapped command with a custom, unmarked GIT SSH command in the environment. The output must be the custom command.
 
-**Call relations**: This complements the previous macOS test by covering the branch where the live value is not a Codex-generated proxy command but should still win over stale snapshot state.
+**Call relations**: The macOS test runner calls this as another Git SSH environment restoration case for maybe_wrap_shell_lc_with_snapshot. It confirms the wrapper respects user-provided live settings.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (new, assert!, assert_eq!, new, default, format!, write, tempdir, vec!).
 
@@ -5973,11 +6001,11 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_custom_git_ssh_command()
 fn maybe_wrap_shell_lc_with_snapshot_clears_stale_codex_git_ssh_command_without_live_command()
 ```
 
-**Purpose**: On macOS, verifies that if the snapshot contains a stale Codex-managed git SSH command and the live environment has no replacement, the wrapper unsets the variable entirely. This avoids replaying dead proxy wiring.
+**Purpose**: On macOS, checks that a stale Codex-managed Git SSH command from a snapshot is removed when there is no live replacement. This prevents commands from trying to use a proxy that no longer exists.
 
-**Data flow**: Writes a stale marker-prefixed command into the snapshot, rewrites a shell script that prints whether `PROXY_GIT_SSH_COMMAND_ENV_KEY` is set, executes it with that variable removed from the live env, and asserts stdout is `unset`.
+**Data flow**: The test writes a snapshot with a Codex-marked Git SSH command, wraps a command that reports whether the variable is set, and runs it with that variable removed from the live environment. The command reports that the variable is unset.
 
-**Call relations**: This is the cleanup counterpart to the two macOS git-ssh restoration tests, exercising the branch where stale Codex proxy state must be discarded rather than refreshed.
+**Call relations**: The macOS test runner calls this to exercise the cleanup path in maybe_wrap_shell_lc_with_snapshot. It complements the tests that refresh or replace the same variable.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (new, assert!, assert_eq!, new, default, format!, write, tempdir, vec!).
 
@@ -5988,11 +6016,11 @@ fn maybe_wrap_shell_lc_with_snapshot_clears_stale_codex_git_ssh_command_without_
 fn maybe_wrap_shell_lc_with_snapshot_keeps_user_proxy_env_when_proxy_inactive()
 ```
 
-**Purpose**: Checks that snapshot proxy variables are left alone when proxying is not active in the live environment. The wrapper should not rewrite user proxy settings unless the Codex proxy marker indicates active management.
+**Purpose**: Checks that a proxy value saved in the snapshot is kept when Codex’s proxy is not active. A user’s normal proxy setting should not be deleted just because its name looks proxy-related.
 
-**Data flow**: Writes a snapshot exporting `HTTP_PROXY=http://user.proxy:8080`, rewrites a command that prints `HTTP_PROXY`, executes it after removing all `PROXY_ENV_KEYS` from the subprocess environment, and asserts stdout remains `http://user.proxy:8080`.
+**Data flow**: The test writes a snapshot setting HTTP_PROXY to a user proxy, wraps a command that prints HTTP_PROXY, and runs it after removing Codex proxy environment keys. The output remains the user proxy URL from the snapshot.
 
-**Call relations**: This test covers the inactive-proxy branch of `maybe_wrap_shell_lc_with_snapshot`, contrasting with tests where `PROXY_ACTIVE_ENV_KEY` triggers restoration from live env.
+**Call relations**: The test runner calls this to make sure maybe_wrap_shell_lc_with_snapshot only repairs proxy variables when Codex proxy state says repair is needed. It protects ordinary user proxy setups.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -6003,11 +6031,11 @@ fn maybe_wrap_shell_lc_with_snapshot_keeps_user_proxy_env_when_proxy_inactive()
 fn maybe_wrap_shell_lc_with_snapshot_restores_live_env_when_snapshot_proxy_active()
 ```
 
-**Purpose**: Verifies that if the snapshot itself says proxying was active, but the current process environment does not, the wrapper restores the live non-proxy state by unsetting stale proxy-only variables and preserving explicit live overrides. It prevents stale snapshot proxy activation from leaking into later commands.
+**Purpose**: Checks that if a snapshot says Codex proxy was active, the wrapper restores the current live environment instead of keeping the snapshot’s proxy state. This avoids resurrecting old proxy variables.
 
-**Data flow**: Writes a snapshot exporting `PROXY_ACTIVE_ENV_KEY=1`, `PIP_PROXY`, and `HTTP_PROXY`; rewrites a command that reports whether `PIP_PROXY` and `PROXY_ACTIVE_ENV_KEY` are set and prints `HTTP_PROXY`; passes explicit/live env with only `HTTP_PROXY=http://user.proxy:8080`; executes with `HTTP_PROXY` set and the other proxy vars removed; and asserts output shows `PIP_PROXY` unset, `HTTP_PROXY` from live env, and `PROXY_ACTIVE_ENV_KEY` unset.
+**Data flow**: The test writes a snapshot with the proxy-active marker, PIP_PROXY, and HTTP_PROXY. It runs the wrapped command with only a live user HTTP_PROXY and no PIP_PROXY or proxy-active marker. The output shows PIP_PROXY and the active marker are unset, while HTTP_PROXY has the live user value.
 
-**Call relations**: This subprocess test exercises the inverse proxy-reconciliation path in `maybe_wrap_shell_lc_with_snapshot`: stale snapshot proxy state must yield to the current process environment.
+**Call relations**: The test runner calls this and executes the wrapped command. It tests the part of maybe_wrap_shell_lc_with_snapshot that compares snapshot proxy state with the live environment and restores the live version.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 10 external calls (from, new, assert!, assert_eq!, new, default, format!, write, tempdir, vec!).
 
@@ -6018,11 +6046,11 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_live_env_when_snapshot_proxy_activ
 fn maybe_wrap_shell_lc_with_snapshot_keeps_snapshot_path_without_override()
 ```
 
-**Purpose**: Checks the baseline PATH behavior: if there is no explicit PATH override, the snapshot’s exported PATH remains in effect after wrapping. This confirms the wrapper does not unnecessarily replace snapshot PATH state.
+**Purpose**: Checks that PATH from the shell snapshot is used when there is no explicit PATH override. This lets the command see the user’s normal shell search path.
 
-**Data flow**: Writes a snapshot exporting `PATH=/snapshot/bin`, rewrites a command that prints `PATH`, executes it without supplying a PATH override, and asserts stdout is `/snapshot/bin`.
+**Data flow**: The test writes a snapshot that exports PATH=/snapshot/bin, wraps a command that prints PATH, runs it, and verifies the printed value is /snapshot/bin.
 
-**Call relations**: This is the control case for later PATH precedence tests around explicit overrides and runtime prepends in `maybe_wrap_shell_lc_with_snapshot`.
+**Call relations**: The test runner calls this as the baseline PATH behavior for maybe_wrap_shell_lc_with_snapshot. Later tests add explicit overrides and runtime prepends on top of this baseline.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -6033,11 +6061,11 @@ fn maybe_wrap_shell_lc_with_snapshot_keeps_snapshot_path_without_override()
 fn maybe_wrap_shell_lc_with_snapshot_applies_explicit_path_override()
 ```
 
-**Purpose**: Verifies that an explicit PATH override from the caller suppresses the snapshot’s PATH export. This ensures worktree/runtime-selected PATH wins over captured shell state.
+**Purpose**: Checks that an explicit PATH override wins over the PATH saved in a snapshot. This matters when Codex needs to run a command with a worktree-specific tool path.
 
-**Data flow**: Writes a snapshot exporting `PATH=/snapshot/bin`, rewrites a command that prints `PATH`, passes explicit/live env maps containing `PATH=/worktree/bin`, executes with that PATH in the subprocess environment, and asserts stdout is `/worktree/bin`.
+**Data flow**: The test writes a snapshot PATH of /snapshot/bin, provides an explicit override PATH of /worktree/bin, runs the wrapped command with that live PATH, and verifies the output is /worktree/bin.
 
-**Call relations**: This test covers the PATH-specific override branch of `maybe_wrap_shell_lc_with_snapshot`, complementing the no-override baseline.
+**Call relations**: The test runner calls this to exercise PATH precedence in maybe_wrap_shell_lc_with_snapshot. It is the PATH-specific version of the broader explicit override test.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (from, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -6048,11 +6076,11 @@ fn maybe_wrap_shell_lc_with_snapshot_applies_explicit_path_override()
 fn maybe_wrap_shell_lc_with_snapshot_preserves_package_path_prepend() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a runtime package PATH prepend recorded outside the snapshot is replayed ahead of the snapshot PATH when the wrapped command runs. This preserves runtime tool discoverability across snapshot restoration.
+**Purpose**: Checks that a runtime-added package helper path is replayed before the snapshot PATH. This keeps Codex-provided helper binaries discoverable even after the snapshot resets PATH.
 
-**Data flow**: Calls `run_snapshot_path_probe_with_runtime_path_prepend` with no explicit overrides, receives the command stdout and the generated package path directory, and asserts stdout equals `<package_path_dir>:/snapshot/bin`.
+**Data flow**: The test delegates setup and execution to run_snapshot_path_probe_with_runtime_path_prepend with no explicit PATH override. It receives the command output and helper directory, then verifies the output is helper-directory followed by /snapshot/bin.
 
-**Call relations**: This is a thin assertion wrapper around the shared probe helper, validating the default replay ordering of runtime prepends relative to snapshot PATH.
+**Call relations**: The test runner calls this focused assertion, while run_snapshot_path_probe_with_runtime_path_prepend performs the shared command-building and execution work.
 
 *Call graph*: calls 1 internal fn (run_snapshot_path_probe_with_runtime_path_prepend); 2 external calls (new, assert_eq!).
 
@@ -6063,11 +6091,11 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_package_path_prepend() -> anyhow:
 fn maybe_wrap_shell_lc_with_snapshot_applies_runtime_path_prepend_after_explicit_path_override() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that even when an explicit PATH override replaces the snapshot PATH, recorded runtime prepends are still replayed in front of that explicit PATH. This preserves package/tool injection without reintroducing snapshot PATH contents.
+**Purpose**: Checks that runtime PATH prepends still apply even when an explicit PATH override replaces the snapshot PATH. The helper path should remain first, but the base PATH should be the override.
 
-**Data flow**: Invokes `run_snapshot_path_probe_with_runtime_path_prepend` with `PATH=/worktree/bin` in the explicit override map, receives stdout and the package path directory, and asserts stdout equals `<package_path_dir>:/worktree/bin`.
+**Data flow**: The test calls run_snapshot_path_probe_with_runtime_path_prepend with PATH explicitly set to /worktree/bin. It verifies the final printed PATH is helper-directory followed by /worktree/bin.
 
-**Call relations**: This test reuses the shared probe helper to cover the combined case of explicit PATH override plus runtime prepend replay.
+**Call relations**: The test runner calls this as the override version of the package-path replay check. It relies on the shared helper to build the snapshot, add the runtime prepend, wrap the command, and run it.
 
 *Call graph*: calls 1 internal fn (run_snapshot_path_probe_with_runtime_path_prepend); 2 external calls (from, assert_eq!).
 
@@ -6080,11 +6108,11 @@ fn run_snapshot_path_probe_with_runtime_path_prepend(
 ) -> anyhow::Result<(String, PathBuf)>
 ```
 
-**Purpose**: Provides a reusable subprocess probe for PATH replay behavior under snapshot wrapping. It sets up a snapshot PATH, applies a runtime prepend to the live env, runs the wrapped command, and returns the observed PATH plus the prepend directory used.
+**Purpose**: Sets up and runs a reusable PATH probe for tests that involve shell snapshots plus runtime PATH prepends. It avoids duplicating the same temporary snapshot and command execution code.
 
-**Data flow**: Creates a temp dir and snapshot exporting `PATH=/snapshot/bin`; builds a bash session shell fixture; defines a command that prints `PATH`; creates `package_path_dir`; initializes live env with `PATH=/worktree/bin`; records a runtime prepend into both env and `RuntimePathPrepends`; rewrites the command with the supplied explicit overrides; executes it with the live PATH; asserts success; and returns `(stdout_string, package_path_dir)`.
+**Data flow**: It receives any explicit environment overrides, creates a temporary snapshot that sets PATH, records a runtime prepend directory, wraps a command that prints PATH, runs the rewritten command with the live PATH, and returns the printed PATH plus the helper directory path.
 
-**Call relations**: Called by the two PATH replay tests above. It centralizes the setup needed to verify how `maybe_wrap_shell_lc_with_snapshot` merges snapshot PATH, explicit overrides, and runtime prepend metadata.
+**Call relations**: Two PATH tests call this helper: one without an explicit override and one with an explicit override. It calls shell_with_snapshot and maybe_wrap_shell_lc_with_snapshot to exercise the real wrapping behavior.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); called by 2 (maybe_wrap_shell_lc_with_snapshot_applies_runtime_path_prepend_after_explicit_path_override, maybe_wrap_shell_lc_with_snapshot_preserves_package_path_prepend); 8 external calls (from, from_utf8_lossy, assert!, new, default, write, tempdir, vec!).
 
@@ -6095,11 +6123,11 @@ fn run_snapshot_path_probe_with_runtime_path_prepend(
 fn maybe_wrap_shell_lc_with_snapshot_preserves_zsh_fork_path_prepend()
 ```
 
-**Purpose**: Checks that a zsh-fork PATH prepend recorded in runtime metadata is replayed ahead of the snapshot PATH. This ensures packaged zsh binaries remain discoverable after snapshot restoration.
+**Purpose**: Checks that the PATH prepend for Codex’s bundled zsh fork is replayed before the snapshot PATH. This keeps the zsh fork’s helper directory available after loading a saved shell environment.
 
-**Data flow**: Creates a snapshot exporting `PATH=/snapshot/bin`, constructs a synthetic packaged zsh path under the temp dir, initializes live env with `/worktree/bin`, applies `apply_zsh_fork_path_prepend` to update env and `RuntimePathPrepends`, rewrites a command that prints `PATH`, executes it with the live PATH, and asserts stdout equals `<zsh_bin_dir>:/snapshot/bin`.
+**Data flow**: The test creates a snapshot PATH, builds a fake bundled zsh path, applies the zsh fork PATH prepend to the live environment and replay record, wraps a command that prints PATH, runs it, and verifies the zsh bin directory appears before /snapshot/bin.
 
-**Call relations**: This test combines the zsh-specific prepend helper with `maybe_wrap_shell_lc_with_snapshot`, proving that the generic runtime prepend replay mechanism also preserves zsh fork setup.
+**Call relations**: The test runner calls this to connect apply_zsh_fork_path_prepend with maybe_wrap_shell_lc_with_snapshot. It proves that PATH changes recorded earlier are honored during snapshot wrapping.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (from, new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -6110,11 +6138,11 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_zsh_fork_path_prepend()
 fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv()
 ```
 
-**Purpose**: Verifies that sensitive explicit override values are not interpolated into the generated shell script argv, even though they still take effect at runtime through the environment. This avoids leaking secrets via process listings.
+**Purpose**: Checks that secret override values are not written into the generated command-line text. Command-line arguments can be visible to process listings or logs, so secrets should stay in environment variables.
 
-**Data flow**: Writes a snapshot exporting `OPENAI_API_KEY=snapshot-value`, rewrites a command that prints `OPENAI_API_KEY`, passes explicit/live env maps containing `super-secret-value`, asserts the generated script text does not contain that secret, then executes the command with the env set and asserts stdout is `super-secret-value`.
+**Data flow**: The test writes a snapshot with an API key, provides a secret explicit override, and wraps a command that prints the key. It first verifies the secret text is not inside the rewritten shell argument, then runs the command with the secret in the environment and verifies the command still sees it.
 
-**Call relations**: This subprocess-backed security regression test targets `maybe_wrap_shell_lc_with_snapshot`’s strategy for restoring overrides by variable reference rather than literal embedding.
+**Call relations**: The test runner calls this to validate a security property of maybe_wrap_shell_lc_with_snapshot. It shows that the wrapper restores override variables by name from the environment, not by embedding their values in argv.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 8 external calls (from, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
@@ -6125,24 +6153,24 @@ fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv()
 fn maybe_wrap_shell_lc_with_snapshot_preserves_unset_override_variables()
 ```
 
-**Purpose**: Checks that if a variable appears in the explicit override set but is absent from the live process environment, the wrapper preserves that absence instead of resurrecting the snapshot value. This distinguishes 'explicitly managed but currently unset' from 'inherit snapshot export'.
+**Purpose**: Checks that an explicit override variable can remain unset if it is absent from the live environment, even when the snapshot sets it. This prevents a saved snapshot from recreating a value Codex intentionally left out.
 
-**Data flow**: Writes a snapshot exporting `CODEX_TEST_UNSET_OVERRIDE=snapshot-value`, rewrites a command that reports whether the variable is set, passes an explicit override map naming the variable but supplies an empty live env map, executes the command with the variable removed from the subprocess environment, and asserts stdout is `unset`.
+**Data flow**: The test writes a snapshot setting CODEX_TEST_UNSET_OVERRIDE, marks that variable as an explicit override, but provides no live value. It runs the wrapped command with the variable removed and verifies the command sees it as unset.
 
-**Call relations**: This test covers an important edge case in `maybe_wrap_shell_lc_with_snapshot`: override restoration must respect unset live variables, not just overwrite with snapshot or explicit-map contents.
+**Call relations**: The test runner calls this to cover the “override by absence” case in maybe_wrap_shell_lc_with_snapshot. It complements tests where live override variables have actual values.
 
 *Call graph*: calls 1 internal fn (shell_with_snapshot); 9 external calls (from, new, assert!, assert_eq!, new, default, write, tempdir, vec!).
 
 
 ### `core/src/tools/runtimes/shell/unix_escalation_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module targets the Unix escalation implementation in detail. It includes small helpers for building platform-correct absolute paths, escaping strings for Starlark policy snippets, constructing read-only and deny-read filesystem sandbox policies, and producing a stable sandbox cwd. The tests then cover several distinct areas.
+This is a test file, not production code. It builds small fake situations and checks that the shell command safety machinery makes the right choice. The main concern is escalation: when a command needs more power than the normal sandbox gives it, the system must decide whether to run it, ask the user, grant a specific permission set, run without the sandbox, or refuse it. Think of it like testing a building security desk: some visitors have badges, some need approval, some are blocked, and the desk must not be fooled by disguises.
 
-Parsing tests verify that `extract_shell_script` recognizes both `-c` and `-lc`, preserves the login-shell flag, tolerates wrapper prefixes such as `/usr/bin/env` or `sandbox-exec`, and rejects unsupported invocation shapes. `join_program_and_argv` is checked to ensure it replaces `argv[0]` with the resolved executable path. Policy-evaluation tests verify both modes of intercepted shell-wrapper parsing, host executable mapping behavior, and the distinction between rule-driven matches and heuristic fallback. They also confirm that preapproved additional permissions are treated like default sandbox permissions during approval-time policy evaluation.
+The tests cover several risky edges. They check that shell commands wrapped by tools like `/usr/bin/env` or `sandbox-exec` are still understood, that command policy rules can match either the wrapper or the real inner command, and that known host executable paths are trusted only when they match the configured mapping. They also check that preapproved extra permissions are treated differently from a fresh permission request, and that denied file reads do not accidentally force unnecessary approval.
 
-Escalation-behavior tests validate `shell_request_escalation_execution`, ensure unsandboxed intercepted exec strips managed-network proxy environment variables, and confirm that preapproved additional permissions still escalate through the resolved permission profile. Approval-flow tests verify that granular approval flags reject the correct prompt classes and that permission-request hooks can short-circuit execve prompting entirely. Finally, denied-read tests ensure explicit escalation and prefix-rule allow decisions do not silently discard deny-read filesystem restrictions.
+A few helpers build portable test paths, escaped policy strings, and sandbox policies. The asynchronous tests create realistic session objects, fake hooks, and command providers so the same decision code used at runtime can be exercised. Without these tests, changes to shell execution could silently weaken sandbox boundaries or annoy users with incorrect prompts.
 
 #### Function details
 
@@ -6152,11 +6180,11 @@ Escalation-behavior tests validate `shell_request_escalation_execution`, ensure 
 fn host_absolute_path(segments: &[&str]) -> String
 ```
 
-**Purpose**: Builds a platform-appropriate absolute path string from path segments for use in cross-platform tests. It abstracts away the root prefix difference between Windows and Unix.
+**Purpose**: Builds an absolute path string that works on the current operating system. Tests use it so the same scenario can run on Unix-like systems and Windows without hard-coding the wrong root path.
 
-**Data flow**: Takes a slice of path segments, starts from `C:\` on Windows or `/` otherwise, pushes each segment into a `PathBuf`, converts the result to a lossy string, and returns the owned `String`.
+**Data flow**: It receives a list of path pieces, starts with `/` on Unix-like systems or `C:\` on Windows, appends each piece, and returns the finished path as a string.
 
-**Call relations**: Many tests call this helper to construct absolute executable and workspace paths without hardcoding platform-specific roots.
+**Call relations**: Many policy and sandbox tests call this helper before building an executable path or workspace path. It hides the platform difference so those tests can focus on command-policy behavior rather than path syntax.
 
 *Call graph*: called by 9 (commands_for_intercepted_exec_policy_parses_plain_shell_wrappers, denied_reads_keep_granular_sandbox_rejection_for_escalation, denied_reads_keep_prefix_rule_allow_inside_sandbox, evaluate_intercepted_exec_policy_matches_inner_shell_commands_when_enabled, evaluate_intercepted_exec_policy_uses_wrapper_command_when_shell_wrapper_parsing_disabled, intercepted_exec_policy_rejects_disallowed_host_executable_mapping, intercepted_exec_policy_treats_preapproved_additional_permissions_as_default, intercepted_exec_policy_uses_host_executable_mappings, test_sandbox_cwd); 2 external calls (from, cfg!).
 
@@ -6167,11 +6195,11 @@ fn host_absolute_path(segments: &[&str]) -> String
 fn starlark_string(value: &str) -> String
 ```
 
-**Purpose**: Escapes backslashes and double quotes so host paths can be embedded safely inside inline Starlark policy source strings. This keeps policy parser tests robust across platforms.
+**Purpose**: Escapes a string so it can be safely placed inside a Starlark policy file string literal. Starlark is the small configuration language used here for execution policy rules.
 
-**Data flow**: Takes an input `&str`, replaces `\` with `\\` and `"` with `\"`, and returns the escaped `String`.
+**Data flow**: It receives plain text, doubles backslashes, escapes double quotes, and returns the cleaned-up version for embedding in policy source text.
 
-**Call relations**: Policy-source-building tests use it before interpolating absolute paths into `prefix_rule` and `host_executable` declarations.
+**Call relations**: Tests that generate policy text with real host paths call this helper before formatting those paths into rules. That prevents path characters from accidentally changing the meaning of the policy.
 
 *Call graph*: called by 3 (denied_reads_keep_prefix_rule_allow_inside_sandbox, intercepted_exec_policy_rejects_disallowed_host_executable_mapping, intercepted_exec_policy_uses_host_executable_mappings).
 
@@ -6182,11 +6210,11 @@ fn starlark_string(value: &str) -> String
 fn read_only_file_system_sandbox_policy() -> FileSystemSandboxPolicy
 ```
 
-**Purpose**: Constructs a restricted filesystem sandbox policy that grants read access to the root tree. It serves as a simple baseline policy for tests that need a sandboxed-but-readable environment.
+**Purpose**: Creates a sandbox policy where the whole file system is readable but not writable. Tests use it as a simple baseline for restricted command execution.
 
-**Data flow**: Creates a single `FileSystemSandboxEntry` for `FileSystemSpecialPath::Root` with `Read` access, wraps it in `FileSystemSandboxPolicy::restricted`, and returns the policy.
+**Data flow**: It takes no input, builds one sandbox entry for the root of the file system with read access, and returns a restricted file-system policy containing that entry.
 
-**Call relations**: Several tests use this helper when they need a policy that still allows unsandboxed execution semantics or baseline permission-profile construction.
+**Call relations**: Escalation tests call this helper when they need a predictable, limited sandbox. The returned policy is then fed into command providers or permission profiles.
 
 *Call graph*: calls 1 internal fn (restricted); called by 4 (execve_permission_request_hook_short_circuits_prompt, preapproved_additional_permissions_escalate_intercepted_exec, shell_request_escalation_execution_is_explicit, unsandboxed_intercepted_exec_strips_managed_network_env); 1 external calls (vec!).
 
@@ -6197,11 +6225,11 @@ fn read_only_file_system_sandbox_policy() -> FileSystemSandboxPolicy
 fn denied_read_file_system_sandbox_policy() -> FileSystemSandboxPolicy
 ```
 
-**Purpose**: Constructs a restricted filesystem policy that includes an explicit deny-read glob for `**/*.env`. It is used to verify that denied reads prevent unsafe sandbox bypass.
+**Purpose**: Creates a sandbox policy that mostly allows reads but specifically denies reading `.env` files. This lets tests cover the subtle case where read access has exceptions.
 
-**Data flow**: Builds two `FileSystemSandboxEntry` values: root read access and a deny rule for the glob `**/*.env`, wraps them in `FileSystemSandboxPolicy::restricted`, and returns the policy.
+**Data flow**: It takes no input, creates one rule allowing root reads and another rule denying files that match `**/*.env`, then returns the combined restricted policy.
 
-**Call relations**: Denied-read-specific tests use this helper to confirm that escalation logic preserves deny-read restrictions.
+**Call relations**: Tests about denied reads call this helper to make sure command approval logic does not treat every read-restricted sandbox in the same way. The policy is converted into permission profiles for escalation decisions.
 
 *Call graph*: calls 1 internal fn (restricted); called by 2 (denied_reads_keep_granular_sandbox_rejection_for_escalation, denied_reads_keep_prefix_rule_allow_inside_sandbox); 1 external calls (vec!).
 
@@ -6212,11 +6240,11 @@ fn denied_read_file_system_sandbox_policy() -> FileSystemSandboxPolicy
 fn test_sandbox_cwd() -> AbsolutePathBuf
 ```
 
-**Purpose**: Produces a stable absolute workspace path for sandbox-related tests. It avoids repeating path construction boilerplate in async tests.
+**Purpose**: Returns the fake current working directory used by sandbox-related tests. It gives those tests a stable workspace path.
 
-**Data flow**: Calls `host_absolute_path(["workspace"])`, converts the resulting string into `AbsolutePathBuf` with `try_from`, unwraps success, and returns it.
+**Data flow**: It asks `host_absolute_path` for a platform-correct `/workspace`-style path, converts it into an absolute path type, and returns it.
 
-**Call relations**: Used by tests that need a cwd for `CoreShellCommandExecutor` or `CoreShellActionProvider` setup.
+**Call relations**: Several asynchronous escalation tests call this when constructing executors or providers. It supplies the working directory that later decision code uses when judging command execution.
 
 *Call graph*: calls 2 internal fn (host_absolute_path, try_from); called by 4 (denied_reads_keep_granular_sandbox_rejection_for_escalation, denied_reads_keep_prefix_rule_allow_inside_sandbox, preapproved_additional_permissions_escalate_intercepted_exec, unsandboxed_intercepted_exec_strips_managed_network_env).
 
@@ -6227,11 +6255,11 @@ fn test_sandbox_cwd() -> AbsolutePathBuf
 fn execve_prompt_rejection_keeps_prefix_rules_on_rules_flag()
 ```
 
-**Purpose**: Verifies that prompt decisions caused by explicit prefix rules are rejected when granular approval disables rule approvals. This protects the distinction between rule prompts and sandbox prompts.
+**Purpose**: Checks that prompts caused by explicit policy rules are rejected when granular approval has disabled rule-based approvals. This prevents a command from asking for approval through a channel the configuration turned off.
 
-**Data flow**: Constructs a granular `AskForApproval` with `rules: false`, calls `execve_prompt_is_rejected_by_policy` with `DecisionSource::PrefixRule`, and asserts the returned rejection reason string.
+**Data flow**: The test builds a granular approval setting where `rules` is false, passes a prefix-rule decision source into the rejection checker, and expects a specific rejection message.
 
-**Call relations**: This test directly targets the policy-gating helper used by `CoreShellActionProvider::process_decision`.
+**Call relations**: The Rust test runner invokes this test. It directly exercises the prompt-rejection helper in the shell module and verifies that policy-rule prompts respect the `rules` switch.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6242,11 +6270,11 @@ fn execve_prompt_rejection_keeps_prefix_rules_on_rules_flag()
 fn execve_prompt_rejection_keeps_unmatched_commands_on_sandbox_flag()
 ```
 
-**Purpose**: Verifies that prompt decisions caused by unmatched-command fallback are rejected when granular approval disables sandbox approvals. It confirms the fallback path uses the sandbox-specific granular flag.
+**Purpose**: Checks that prompts caused by the sandbox fallback are rejected when granular approval has disabled sandbox approvals. This keeps unmatched commands from bypassing a user’s approval configuration.
 
-**Data flow**: Builds a granular `AskForApproval` with `sandbox_approval: false`, calls `execve_prompt_is_rejected_by_policy` with `DecisionSource::UnmatchedCommandFallback`, and asserts the expected rejection reason.
+**Data flow**: The test builds a granular approval setting where `sandbox_approval` is false, marks the decision source as an unmatched-command fallback, and expects the matching rejection message.
 
-**Call relations**: This complements the previous test by covering the other branch in the prompt-rejection helper.
+**Call relations**: The Rust test runner invokes this test. It directly checks the shell module’s prompt-rejection helper for the fallback path used when no command rule matched.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6257,11 +6285,11 @@ fn execve_prompt_rejection_keeps_unmatched_commands_on_sandbox_flag()
 fn approval_sandbox_permissions_only_downgrades_preapproved_additional_permissions()
 ```
 
-**Purpose**: Checks that approval-time sandbox permission downgrading happens only for preapproved additional-permission requests and leaves other permission modes untouched. This preserves execution semantics while suppressing redundant prompts.
+**Purpose**: Verifies that preapproved extra permissions are treated as already settled, while other escalation modes remain unchanged. This matters because a command should not ask again for permissions the turn already has.
 
-**Data flow**: Calls `approval_sandbox_permissions` with combinations of `WithAdditionalPermissions`, `RequireEscalated`, and the preapproved flag, then asserts the returned `SandboxPermissions` values.
+**Data flow**: The test tries combinations of sandbox-permission mode and a preapproved flag, then compares the returned mode with the expected safer or unchanged mode.
 
-**Call relations**: It validates the helper used when constructing `CoreShellActionProvider` in both shell and unified-exec zsh-fork flows.
+**Call relations**: The Rust test runner invokes this test. It checks the shell module helper that later policy evaluation uses when deciding whether intercepted commands should prompt.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6272,11 +6300,11 @@ fn approval_sandbox_permissions_only_downgrades_preapproved_additional_permissio
 fn extract_shell_script_preserves_login_flag()
 ```
 
-**Purpose**: Ensures shell-script extraction distinguishes `-lc` from `-c` and records the login-shell bit correctly. This matters because zsh-fork passes the login flag into `ExecParams`.
+**Purpose**: Checks that shell parsing keeps track of whether a shell was started as a login shell. A login shell can load different startup files, so losing this flag would change command behavior.
 
-**Data flow**: Calls `extract_shell_script` on simple `/bin/zsh -lc ...` and `/bin/zsh -c ...` vectors, unwraps the results, and asserts exact `ParsedShellCommand` equality.
+**Data flow**: The test passes shell argument lists using `-lc` and `-c`, asks the parser to extract the script, and expects the same program and script with the correct login boolean.
 
-**Call relations**: This test covers the happy-path parser behavior used by both zsh-fork execution and unified-exec preparation.
+**Call relations**: The Rust test runner invokes this test. It exercises `extract_shell_script`, which is used by the shell runtime when it needs to understand a shell-wrapped command.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6287,11 +6315,11 @@ fn extract_shell_script_preserves_login_flag()
 fn extract_shell_script_supports_wrapped_command_prefixes()
 ```
 
-**Purpose**: Verifies that shell-script extraction can find the inner shell invocation even when wrapper arguments precede it. This matches the production parser’s sliding-window search behavior.
+**Purpose**: Checks that the parser can see through common wrappers before the real shell command. This prevents policy checks from being fooled by a command being launched through `env` or `sandbox-exec`.
 
-**Data flow**: Builds wrapped command vectors using `/usr/bin/env` and `sandbox-exec`, calls `extract_shell_script`, unwraps, and asserts the parsed program/script/login fields.
+**Data flow**: The test supplies wrapped command arrays, asks for the shell script extraction, and expects the real shell program, inner script, and login-shell flag.
 
-**Call relations**: It protects the parser behavior relied on when sandbox or env wrappers are inserted before the shell command.
+**Call relations**: The Rust test runner invokes this test. It validates the parser used before intercepted execution policy is applied to shell-launched commands.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6302,11 +6330,11 @@ fn extract_shell_script_supports_wrapped_command_prefixes()
 fn extract_shell_script_rejects_unsupported_shell_invocation()
 ```
 
-**Purpose**: Confirms that unsupported shell invocation shapes are rejected with the expected `ToolError::Rejected` message. This prevents zsh-fork from silently misinterpreting malformed commands.
+**Purpose**: Checks that an unexpected shell command shape is rejected instead of guessed at. This is important because guessing wrong could run or approve a different command than the user intended.
 
-**Data flow**: Calls `extract_shell_script` on an unsupported `-fc` form, captures the error, asserts that it matches `ToolError::Rejected`, and checks the exact rejection string.
+**Data flow**: The test passes an unsupported `sandbox-exec`-style argument list, receives an error, confirms it is a rejection, and checks the exact rejection reason.
 
-**Call relations**: This covers the parser’s failure path used by both `try_run_zsh_fork` and `prepare_unified_exec_zsh_fork` to decide whether to fall back.
+**Call relations**: The Rust test runner invokes this test. It calls `extract_shell_script` directly and verifies the failure path used when shell command parsing cannot be trusted.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, extract_shell_script).
 
@@ -6317,11 +6345,11 @@ fn extract_shell_script_rejects_unsupported_shell_invocation()
 fn join_program_and_argv_replaces_original_argv_zero()
 ```
 
-**Purpose**: Checks that command normalization replaces the original `argv[0]` with the resolved absolute program path instead of duplicating it. This keeps policy matching and approval display accurate.
+**Purpose**: Checks that a resolved executable path replaces the original first argument. The first argument, often called `argv[0]`, may be relative or misleading, so policy code needs the real program path.
 
-**Data flow**: Calls `join_program_and_argv` with an absolute `/tmp/tool` path and argv vectors containing `./tool`, then asserts the resulting vectors.
+**Data flow**: The test passes an absolute tool path plus an argument list, then expects a new list where the first item is the absolute path and the remaining arguments are preserved.
 
-**Call relations**: It validates the normalization helper used in prompt display and escalated exec preparation.
+**Call relations**: The Rust test runner invokes this test. It verifies a helper used when rebuilding a command line for execution or policy evaluation.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6332,11 +6360,11 @@ fn join_program_and_argv_replaces_original_argv_zero()
 fn commands_for_intercepted_exec_policy_parses_plain_shell_wrappers()
 ```
 
-**Purpose**: Verifies that plain shell-wrapper parsing splits a `bash -lc` script containing `&&` into multiple candidate commands for policy evaluation. This enables prefix rules to match inner commands rather than only the shell wrapper.
+**Purpose**: Checks that shell wrapper parsing can split a simple shell script into the commands policy rules should inspect. This lets rules see `git status` and `pwd` rather than only seeing `bash -lc ...`.
 
-**Data flow**: Builds an absolute bash path, calls `commands_for_intercepted_exec_policy` with `-lc 'git status && pwd'`, and asserts both the parsed command list and `used_complex_parsing == false`.
+**Data flow**: The test builds a fake bash path and shell arguments, asks for candidate policy commands, and expects two parsed commands with a flag showing simple parsing was enough.
 
-**Call relations**: This test targets the candidate-command extraction helper used by `evaluate_intercepted_exec_policy` when shell-wrapper parsing is enabled.
+**Call relations**: The Rust test runner invokes this test. It uses `host_absolute_path` to build the program path, then calls `commands_for_intercepted_exec_policy`, the helper that feeds command candidates into policy evaluation.
 
 *Call graph*: calls 2 internal fn (host_absolute_path, try_from); 3 external calls (assert!, assert_eq!, commands_for_intercepted_exec_policy).
 
@@ -6347,11 +6375,11 @@ fn commands_for_intercepted_exec_policy_parses_plain_shell_wrappers()
 fn map_exec_result_preserves_stdout_and_stderr()
 ```
 
-**Purpose**: Ensures successful result mapping preserves stdout, stderr, and aggregated output text exactly. It checks the non-error branch of zsh-fork result conversion.
+**Purpose**: Checks that command output is copied into the runtime’s result object without mixing up standard output, standard error, or combined output. This protects what users and higher-level code see after a command runs.
 
-**Data flow**: Constructs an `ExecResult` with distinct output fields, calls `map_exec_result` with `SandboxType::None`, unwraps the output, and asserts the three text fields.
+**Data flow**: The test creates an execution result with separate `stdout`, `stderr`, and aggregate text, maps it into the shell tool output format, and confirms each text field is preserved.
 
-**Call relations**: This covers the success path of the mapper used at the end of `try_run_zsh_fork`.
+**Call relations**: The Rust test runner invokes this test. It calls `map_exec_result`, which sits after command execution and converts low-level execution data into the shell tool’s output format.
 
 *Call graph*: 3 external calls (from_millis, assert_eq!, map_exec_result).
 
@@ -6362,11 +6390,11 @@ fn map_exec_result_preserves_stdout_and_stderr()
 fn shell_request_escalation_execution_is_explicit()
 ```
 
-**Purpose**: Checks the mapping from shell-request sandbox permissions to `EscalationExecution`, including unsandboxed execution, turn-default fallback, and resolved permission-profile escalation for additional permissions. It documents the intended semantics of shell-request escalation.
+**Purpose**: Checks that shell permission requests choose the right execution style: normal turn defaults, fully unsandboxed execution, or a resolved permission profile. This makes escalation behavior explicit instead of accidental.
 
-**Data flow**: Builds requested additional permissions, filesystem/network policies, and a `PermissionProfile`, then calls `CoreShellActionProvider::shell_request_escalation_execution` with several permission-mode combinations and asserts the exact `EscalationExecution` results.
+**Data flow**: The test builds requested extra file permissions, a current sandbox policy, a permission profile, and a read-only policy. It calls the shell provider’s escalation-selection function with different sandbox-permission modes and compares each result with the expected execution choice.
 
-**Call relations**: This test targets the helper used by `CoreShellActionProvider::determine_action` for unmatched-command fallback decisions.
+**Call relations**: The Rust test runner invokes this test. It uses the read-only policy helper and production permission-profile builders, then checks `CoreShellActionProvider::shell_request_escalation_execution`, which is used when a shell command asks for more access.
 
 *Call graph*: calls 4 internal fn (read_only_file_system_sandbox_policy, from_read_write_roots, from_runtime_permissions, restricted); 3 external calls (default, assert_eq!, vec!).
 
@@ -6377,11 +6405,11 @@ fn shell_request_escalation_execution_is_explicit()
 async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that preparing an unsandboxed intercepted exec removes managed-network proxy environment variables. This prevents proxy-only sandbox plumbing from leaking into unsandboxed execution.
+**Purpose**: Checks that an unsandboxed intercepted command does not keep environment variables for the managed network proxy. If the command is no longer in the managed network sandbox, keeping those variables would give a false or broken network setup.
 
-**Data flow**: Builds a `CoreShellCommandExecutor` with no network proxy, constructs an env map containing `PROXY_ACTIVE_ENV_KEY` and all `PROXY_ENV_KEYS`, calls `prepare_escalated_exec` with `EscalationExecution::Unsandboxed`, and asserts that the resulting `PreparedExec.env` omits those keys.
+**Data flow**: The test creates a command executor, fills an environment map with proxy marker variables, prepares an unsandboxed escalated execution, and verifies all managed-network proxy variables were removed from the prepared environment.
 
-**Call relations**: It exercises the unsandboxed branch of `CoreShellCommandExecutor::prepare_escalated_exec`, specifically the env filtering performed by `exec_env_for_sandbox_permissions`.
+**Call relations**: The async test runner invokes this test. It builds a `CoreShellCommandExecutor` using helper sandbox data, then calls `prepare_escalated_exec`, the runtime path that prepares an intercepted command for escalated execution.
 
 *Call graph*: calls 4 internal fn (read_only_file_system_sandbox_policy, test_sandbox_cwd, workspace_write, from_absolute_path); 5 external calls (new, new, assert!, format!, vec!).
 
@@ -6392,11 +6420,11 @@ async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Re
 async fn preapproved_additional_permissions_escalate_intercepted_exec() -> anyhow::Result<()>
 ```
 
-**Purpose**: Confirms that when additional permissions were preapproved, intercepted exec policy still chooses escalation through the resolved permission profile rather than treating the command as plain unsandboxed execution. Approval-time downgrading should not erase execution-time permissions.
+**Purpose**: Checks that when extra permissions were already approved, an intercepted command escalates using the resolved permission profile instead of asking again. This keeps approved permission requests useful for later command execution.
 
-**Data flow**: Creates a session and turn context, builds requested additional permissions and an effective merged permission profile, constructs a `CoreShellActionProvider` with `sandbox_permissions: WithAdditionalPermissions` but `approval_sandbox_permissions: UseDefault`, calls the `EscalationPolicy::determine_action` trait method for `/usr/bin/printf`, and asserts the exact `EscalationDecision::Escalate(ResolvedPermissionProfile(...))`.
+**Data flow**: The test creates a session, requested file permissions, an effective permission profile, and a shell action provider marked as using additional permissions. It asks the escalation policy for an action and expects an escalation with the resolved permission profile.
 
-**Call relations**: This test covers the interaction between `approval_sandbox_permissions`, policy fallback evaluation, and `shell_request_escalation_execution` inside `determine_action`.
+**Call relations**: The async test runner invokes this test. It uses session-test fixtures, sandbox-policy helpers, and `effective_permission_profile`, then calls `EscalationPolicy::determine_action`, which drives the same decision flow used for real intercepted commands.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, read_only_file_system_sandbox_policy, test_sandbox_cwd, from_read_write_roots, workspace_write, effective_permission_profile, new, from_absolute_path); 11 external calls (new, default, from_secs, new, assert_eq!, empty, ResolvedPermissionProfile, Escalate, Permissions, determine_action (+1 more)).
 
@@ -6407,11 +6435,11 @@ async fn preapproved_additional_permissions_escalate_intercepted_exec() -> anyho
 async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a trusted permission-request hook can approve an intercepted execve request before Guardian or user prompting occurs. It also checks that the hook receives the expected bash-style command payload.
+**Purpose**: Checks that a trusted permission-request hook can allow an escalated command without showing the normal approval prompt. Hooks are user-configured scripts that can automate decisions, so this test verifies both the decision and the data sent to the hook.
 
-**Data flow**: Creates a session and mutable turn context, writes a temporary hook script and `hooks.json`, marks the hook trusted in config, installs the resulting `Hooks` into session services, configures approval policy and permission profile, builds a `CoreShellActionProvider`, and calls `EscalationPolicy::determine_action` under a timeout for `/usr/bin/touch`. It asserts the returned action is unsandboxed escalation, then reads the hook log JSONL file and asserts the logged `tool_input.command` and `description` fields.
+**Data flow**: The test creates a temporary hook script and hook configuration, marks the hook as trusted, installs it into the session, builds a provider for a `touch` command that needs escalation, and asks the escalation policy for a decision. It then reads the hook log and confirms the hook received the expected command and no description.
 
-**Call relations**: This test exercises the hook-first branch inside `CoreShellActionProvider::prompt`, proving that `run_permission_request_hooks` can short-circuit the rest of the approval pipeline.
+**Call relations**: The async test runner invokes this test. It wires together session fixtures, hook configuration, shell command formatting, and `EscalationPolicy::determine_action`; the hook result is expected to short-circuit the usual user prompt and return unsandboxed escalation.
 
 *Call graph*: calls 10 internal fn (allow_any, make_session_and_context, read_only_file_system_sandbox_policy, new, from_runtime_permissions, read_only, shlex_join, new, from_absolute_path, try_from); 22 external calls (new, from_secs, new, assert!, assert_eq!, list_hooks, empty, format!, default, from_value (+12 more)).
 
@@ -6422,11 +6450,11 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
 fn evaluate_intercepted_exec_policy_uses_wrapper_command_when_shell_wrapper_parsing_disabled()
 ```
 
-**Purpose**: Checks that when shell-wrapper parsing is disabled, policy evaluation treats the whole wrapper command as the candidate command and therefore falls back to heuristics for `/bin/zsh -lc ...`. This preserves the intended default of relying on later execve interception rather than weak shell-script parsing.
+**Purpose**: Checks that when shell-wrapper parsing is turned off, policy evaluation looks at the wrapper command line rather than the inner shell script. This preserves the configured behavior for users who do not want shell parsing in this policy path.
 
-**Data flow**: Builds a policy with `prefix_rule(["npm", "publish"], prompt)`, constructs an absolute zsh path, calls `evaluate_intercepted_exec_policy` with parsing disabled and argv `zsh -lc 'npm publish'`, and asserts that the result is a heuristics allow match against the wrapper command.
+**Data flow**: The test builds a policy that would prompt for `npm publish`, passes a `zsh -lc 'npm publish'` command with wrapper parsing disabled, and verifies the result is an allow-style heuristic match for the wrapper command.
 
-**Call relations**: It targets the disabled-parsing branch of `evaluate_intercepted_exec_policy` and documents why wrapper parsing is off by default.
+**Call relations**: The Rust test runner invokes this test. It creates a policy with `PolicyParser`, builds a platform-correct shell path, and calls `evaluate_intercepted_exec_policy` with parsing disabled.
 
 *Call graph*: calls 4 internal fn (host_absolute_path, new, read_only, try_from); 2 external calls (assert!, evaluate_intercepted_exec_policy).
 
@@ -6437,11 +6465,11 @@ fn evaluate_intercepted_exec_policy_uses_wrapper_command_when_shell_wrapper_pars
 fn evaluate_intercepted_exec_policy_matches_inner_shell_commands_when_enabled()
 ```
 
-**Purpose**: Verifies that enabling shell-wrapper parsing lets exec policy match the inner command inside `bash -lc 'npm publish'`. This demonstrates the alternate parsing mode used only when explicitly enabled.
+**Purpose**: Checks that when shell-wrapper parsing is enabled, policy evaluation can match the real command inside the shell script. This is what lets a rule for `npm publish` apply even when it is launched through `bash -lc`.
 
-**Data flow**: Builds the same prompting policy, constructs an absolute bash path, calls `evaluate_intercepted_exec_policy` with parsing enabled, and asserts the returned `Evaluation` contains a `PrefixRuleMatch` for `npm publish` with `Decision::Prompt`.
+**Data flow**: The test builds a prompt rule for `npm publish`, passes a bash wrapper command with parsing enabled, and expects a prompt decision with a prefix-rule match for the inner command.
 
-**Call relations**: This complements the previous test by covering the enabled-parsing branch of policy evaluation.
+**Call relations**: The Rust test runner invokes this test. It uses `PolicyParser` to build the policy and then calls `evaluate_intercepted_exec_policy`, confirming the enabled parsing path feeds inner commands into the policy engine.
 
 *Call graph*: calls 4 internal fn (host_absolute_path, new, read_only, try_from); 2 external calls (assert_eq!, evaluate_intercepted_exec_policy).
 
@@ -6452,11 +6480,11 @@ fn evaluate_intercepted_exec_policy_matches_inner_shell_commands_when_enabled()
 fn intercepted_exec_policy_uses_host_executable_mappings()
 ```
 
-**Purpose**: Checks that host executable mappings allow a rule written for `git` to match an intercepted absolute `/usr/bin/git` path. It also verifies that such a match counts as policy-driven rather than heuristic fallback.
+**Purpose**: Checks that policy rules can match a known command name to an allowed absolute executable path on the host machine. This lets a rule for `git status` still work when interception sees `/usr/bin/git`.
 
-**Data flow**: Builds a policy containing both a `prefix_rule` and `host_executable` mapping for git, constructs the absolute git path, calls `evaluate_intercepted_exec_policy`, asserts the exact `Evaluation` with `resolved_program: Some(program)`, and then asserts `CoreShellActionProvider::decision_driven_by_policy(...)` is true.
+**Data flow**: The test builds a real-looking git path, escapes it for policy text, defines both a prefix rule and a host executable mapping, evaluates `git status`, and expects a prompt decision tied to the resolved program path.
 
-**Call relations**: This test covers host executable resolution inside `evaluate_intercepted_exec_policy` and the downstream classification helper used by `determine_action`.
+**Call relations**: The Rust test runner invokes this test. It uses the path and escaping helpers, builds the policy, calls `evaluate_intercepted_exec_policy`, and then checks that `CoreShellActionProvider::decision_driven_by_policy` recognizes the match as policy-driven.
 
 *Call graph*: calls 5 internal fn (host_absolute_path, starlark_string, new, read_only, try_from); 4 external calls (assert!, assert_eq!, format!, evaluate_intercepted_exec_policy).
 
@@ -6467,11 +6495,11 @@ fn intercepted_exec_policy_uses_host_executable_mappings()
 async fn denied_reads_keep_prefix_rule_allow_inside_sandbox() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that even when a prefix rule explicitly allows a command, denied-read filesystem restrictions keep execution inside the sandbox rather than escalating unsandboxed. This prevents policy allow rules from silently dropping deny-read enforcement.
+**Purpose**: Checks that a command explicitly allowed by a prefix rule still runs inside the sandbox even when the file-system policy contains denied read patterns. This avoids unnecessary escalation just because the sandbox has some read exclusions.
 
-**Data flow**: Builds a policy allowing the absolute `cat` path, creates session/turn context and a deny-read filesystem policy, constructs a `CoreShellActionProvider` with `SandboxPermissions::UseDefault`, calls `EscalationPolicy::determine_action` for `cat /tmp/visible.txt`, and asserts the result is `EscalationDecision::Run`.
+**Data flow**: The test builds an allow rule for a `cat` executable path, creates a sandbox policy that denies `.env` reads, builds a provider with default sandbox permissions, and asks the escalation policy what to do. It expects the command to run normally.
 
-**Call relations**: It exercises `determine_action`’s `unsandboxed_execution_allowed` check and the prefix-rule escalation-selection logic.
+**Call relations**: The async test runner invokes this test. It combines policy parsing, the denied-read sandbox helper, session fixtures, and `EscalationPolicy::determine_action` to verify the run decision.
 
 *Call graph*: calls 9 internal fn (make_session_and_context, denied_read_file_system_sandbox_policy, host_absolute_path, starlark_string, test_sandbox_cwd, new, from_runtime_permissions, new, try_from); 6 external calls (new, from_secs, new, assert_eq!, format!, determine_action).
 
@@ -6482,11 +6510,11 @@ async fn denied_reads_keep_prefix_rule_allow_inside_sandbox() -> anyhow::Result<
 async fn denied_reads_keep_granular_sandbox_rejection_for_escalation() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that when denied reads are active and granular policy disables sandbox approval, an unmatched command requiring escalation is denied rather than prompted or unsandboxed. This preserves the sandbox-approval gate even under deny-read constraints.
+**Purpose**: Checks that a command needing escalation is still denied when granular approval has disabled sandbox approvals, even if the sandbox’s read restrictions include deny rules. This keeps approval settings authoritative.
 
-**Data flow**: Creates session/turn context, a deny-read filesystem policy, and a `CoreShellActionProvider` with `SandboxPermissions::RequireEscalated` and granular approval disabling sandbox approval, then calls `EscalationPolicy::determine_action` for `/usr/bin/printf` and asserts the result is `EscalationDecision::Deny { reason: Some("Execution forbidden by policy") }`.
+**Data flow**: The test creates a denied-read sandbox policy, a granular approval policy with sandbox approval turned off, and a provider requiring escalation. It asks for the command decision and expects a denial with the policy-forbidden reason.
 
-**Call relations**: This test covers the interaction between denied-read preservation, unmatched-command fallback, and `execve_prompt_is_rejected_by_policy` inside `process_decision`.
+**Call relations**: The async test runner invokes this test. It uses session fixtures and the denied-read policy helper, then drives the real escalation decision function to confirm the rejection path.
 
 *Call graph*: calls 8 internal fn (make_session_and_context, denied_read_file_system_sandbox_policy, host_absolute_path, test_sandbox_cwd, new, from_runtime_permissions, new, try_from); 6 external calls (new, from_secs, new, Granular, assert_eq!, determine_action).
 
@@ -6497,11 +6525,11 @@ async fn denied_reads_keep_granular_sandbox_rejection_for_escalation() -> anyhow
 fn intercepted_exec_policy_treats_preapproved_additional_permissions_as_default()
 ```
 
-**Purpose**: Verifies that approval-time policy evaluation treats preapproved additional-permission requests like default sandbox permissions, while fresh additional-permission requests still prompt. This is the core semantic of `approval_sandbox_permissions`.
+**Purpose**: Checks that already-approved additional permissions are evaluated like the default sandbox mode, while a fresh request for additional permissions still prompts. This distinction prevents repeated prompts but still protects new permission requests.
 
-**Data flow**: Builds an empty policy, an absolute printf path, and a workspace-write permission profile. It evaluates the same command twice with `evaluate_intercepted_exec_policy`: once using `approval_sandbox_permissions(WithAdditionalPermissions, true)` and once using raw `WithAdditionalPermissions`. It asserts the first decision is `Allow` and the second is `Prompt`.
+**Data flow**: The test evaluates the same `printf hello` command twice: once after converting preapproved additional permissions through the approval helper, and once as a fresh additional-permissions request. It expects allow for the preapproved case and prompt for the fresh request.
 
-**Call relations**: This directly validates the approval-time permission normalization used when constructing `CoreShellActionProvider`.
+**Call relations**: The Rust test runner invokes this test. It calls `approval_sandbox_permissions` to model preapproval, then passes both contexts to `evaluate_intercepted_exec_policy` and compares the decisions.
 
 *Call graph*: calls 4 internal fn (host_absolute_path, new, workspace_write, try_from); 3 external calls (assert_eq!, approval_sandbox_permissions, evaluate_intercepted_exec_policy).
 
@@ -6512,11 +6540,11 @@ fn intercepted_exec_policy_treats_preapproved_additional_permissions_as_default(
 fn intercepted_exec_policy_rejects_disallowed_host_executable_mapping()
 ```
 
-**Purpose**: Checks that a host executable mapping does not match an intercepted executable path outside the allowed mapped paths. In that case evaluation should fall back to heuristics rather than treating the command as policy-matched.
+**Purpose**: Checks that a host executable mapping only applies to the exact allowed paths. If another `git` binary appears elsewhere, the policy must not pretend it is the trusted mapped executable.
 
-**Data flow**: Builds a policy mapping `git` only to one absolute path, constructs a different absolute git path, calls `evaluate_intercepted_exec_policy`, asserts the matched rule is a heuristics rule against the actual path, and asserts `decision_driven_by_policy` is false.
+**Data flow**: The test builds one allowed git path and one different git path, defines a policy mapping only the allowed path, evaluates a command using the other path, and confirms the result is only a heuristic match rather than a policy-driven match.
 
-**Call relations**: This covers the negative case for host executable resolution inside policy evaluation.
+**Call relations**: The Rust test runner invokes this test. It uses `host_absolute_path` and `starlark_string` to build policy input, then calls `evaluate_intercepted_exec_policy` and checks `CoreShellActionProvider::decision_driven_by_policy` to make sure the disallowed path did not satisfy the mapping.
 
 *Call graph*: calls 5 internal fn (host_absolute_path, starlark_string, new, read_only, try_from); 3 external calls (assert!, format!, evaluate_intercepted_exec_policy).
 
@@ -6526,13 +6554,9 @@ This final group exercises end-to-end command execution, MCP tool-call dispatch,
 
 ### `core/src/exec_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module covers the runtime behavior of process execution rather than policy evaluation. A small helper, `make_exec_output`, constructs `ExecToolCallOutput` values for sandbox-denial heuristics. The first group of tests checks `is_likely_sandbox_denied`, ensuring it only triggers in actual sandbox modes, ignores common quick-reject exit codes and network-policy marker text in non-sandbox contexts, and can inspect aggregated output or Unix `SIGSYS`-derived exit codes.
-
-A second group validates output capture. Tests drive `read_output` with `tokio::io::duplex` pipes to confirm shell-tool capture enforces `EXEC_OUTPUT_MAX_BYTES`, while full-buffer capture retains all bytes. `aggregate_output` is checked for its stdout/stderr budgeting policy: preserve ordering, prefer stderr under contention, and rebalance when one stream is small. Additional tests verify `ExecCapturePolicy::FullBuffer` disables expiration-based termination but still honors the I/O drain timeout when descendants keep pipes open.
-
-The file also exercises end-to-end `exec` and `process_exec_tool_call`, including preservation of full-buffer capture, cancellation-token handling, Unix process-group cleanup on timeout, and graceful SIGTERM cleanup before hard kill. Finally, a substantial Windows-focused section validates helper functions that decide whether restricted-token or elevated sandbox backends can enforce a given `PermissionProfile`, including nuanced filesystem carveout cases and generated `WindowsSandboxFilesystemOverrides`.
+Running commands is risky: commands can print huge output, hang forever, spawn child processes, or be blocked by a sandbox. This test file makes sure the execution layer responds in predictable ways. It creates fake command results to test sandbox-denial detection, then runs real short commands to check output capture and timeout behavior. A sandbox is a restricted environment that limits what a command can read, write, or access on the network; these tests make sure Codex recognizes common “blocked by sandbox” signs without mistaking ordinary failures for sandbox failures. The file also checks how stdout and stderr are combined when there is too much output, including the special “full buffer” mode that keeps everything instead of trimming it. A large part of the file focuses on Windows sandbox rules. It verifies which permission profiles can be enforced by the restricted-token backend and when Codex must reject a setup rather than quietly running unsandboxed. Finally, Unix-only tests check that timeouts and cancellations kill whole process groups, including grandchildren, while still giving processes a chance to clean up after a soft termination signal.
 
 #### Function details
 
@@ -6547,11 +6571,11 @@ fn make_exec_output(
 ) -> ExecToolCallOutput
 ```
 
-**Purpose**: Builds a synthetic `ExecToolCallOutput` for tests that need to probe sandbox-denial heuristics without spawning a process.
+**Purpose**: Builds a small fake command result for tests. It lets many sandbox-detection tests describe only the exit code and output text they care about.
 
-**Data flow**: Reads `exit_code`, `stdout`, `stderr`, and `aggregated`, wraps each text string in `StreamOutput::new`, sets a fixed `duration` of 1 ms and `timed_out: false`, and returns the assembled `ExecToolCallOutput`.
+**Data flow**: It receives an exit code plus stdout, stderr, and combined-output text. It wraps those strings in StreamOutput values, adds a tiny duration, marks the command as not timed out, and returns an ExecToolCallOutput.
 
-**Call relations**: Used by the sandbox-detection tests as a compact fixture constructor.
+**Call relations**: This is a shared test helper. The sandbox-detection tests call it first, then pass the result into the real sandbox-denial detector.
 
 *Call graph*: calls 1 internal fn (new); called by 8 (sandbox_detection_flags_sigsys_exit_code, sandbox_detection_identifies_keyword_in_stderr, sandbox_detection_ignores_network_policy_text_in_non_sandbox_mode, sandbox_detection_ignores_network_policy_text_with_zero_exit_code, sandbox_detection_ignores_non_sandbox_mode, sandbox_detection_requires_keywords, sandbox_detection_respects_quick_reject_exit_codes, sandbox_detection_uses_aggregated_output); 1 external calls (from_millis).
 
@@ -6562,11 +6586,11 @@ fn make_exec_output(
 fn sandbox_detection_requires_keywords()
 ```
 
-**Purpose**: Verifies sandbox-denial detection does not trigger solely from a nonzero exit code.
+**Purpose**: Checks that a failing command is not called a sandbox denial unless its output contains a known sandbox-related clue.
 
-**Data flow**: Creates an output with exit code 1 and empty streams via `make_exec_output`, calls `is_likely_sandbox_denied` for `LinuxSeccomp`, and asserts false.
+**Data flow**: It creates a fake Linux sandbox command result with exit code 1 and no output. It asks the detector about it and expects a false answer.
 
-**Call relations**: Exercises the negative baseline for sandbox-denial heuristics.
+**Call relations**: The Rust test runner calls this test. It uses make_exec_output to prepare the case, then exercises the sandbox-denial detection logic directly.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6577,11 +6601,11 @@ fn sandbox_detection_requires_keywords()
 fn sandbox_detection_identifies_keyword_in_stderr()
 ```
 
-**Purpose**: Checks that known sandbox-denial wording in stderr is recognized.
+**Purpose**: Checks that the detector recognizes a common permission error message as likely sandbox blocking.
 
-**Data flow**: Builds output with stderr `Operation not permitted`, calls `is_likely_sandbox_denied` for `LinuxSeccomp`, and asserts true.
+**Data flow**: It creates a fake command result whose stderr says “Operation not permitted.” It passes that result to the Linux sandbox detector and expects true.
 
-**Call relations**: Targets keyword-based detection in stderr.
+**Call relations**: The test runner calls this test. It relies on make_exec_output to build the fake output before checking the detector.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6592,11 +6616,11 @@ fn sandbox_detection_identifies_keyword_in_stderr()
 fn sandbox_detection_respects_quick_reject_exit_codes()
 ```
 
-**Purpose**: Verifies common quick-failure exit codes like command-not-found do not get misclassified as sandbox denials.
+**Purpose**: Makes sure obvious non-sandbox failures, such as “command not found,” are not mislabeled as sandbox denials.
 
-**Data flow**: Builds output with exit code 127 and stderr `command not found`, calls `is_likely_sandbox_denied`, and asserts false.
+**Data flow**: It creates a fake result with exit code 127 and stderr saying the command was not found. The detector is expected to reject it as a sandbox-denial candidate.
 
-**Call relations**: Exercises the quick-reject exclusion branch in sandbox-denial detection.
+**Call relations**: The test runner calls this test. It sets up the fake result with make_exec_output and then checks the sandbox-denial filter.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6607,11 +6631,11 @@ fn sandbox_detection_respects_quick_reject_exit_codes()
 fn sandbox_detection_ignores_non_sandbox_mode()
 ```
 
-**Purpose**: Checks that sandbox-denial heuristics are disabled entirely when no sandbox is in use.
+**Purpose**: Confirms that sandbox-denial detection is disabled when no sandbox is being used.
 
-**Data flow**: Builds output containing sandbox-like stderr text, calls `is_likely_sandbox_denied` with `SandboxType::None`, and asserts false.
+**Data flow**: It creates output that would look suspicious in a sandbox, then labels the sandbox type as None. The expected result is false.
 
-**Call relations**: Covers the top-level non-sandbox guard.
+**Call relations**: The test runner calls this test. It proves the detector pays attention to the current sandbox mode, not just output text.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6622,11 +6646,11 @@ fn sandbox_detection_ignores_non_sandbox_mode()
 fn sandbox_detection_ignores_network_policy_text_in_non_sandbox_mode()
 ```
 
-**Purpose**: Verifies network-policy marker text in aggregated output does not count as sandbox denial when no sandbox is active.
+**Purpose**: Ensures network policy log text is not treated as a sandbox denial when sandboxing is off.
 
-**Data flow**: Builds output whose aggregated text contains a `CODEX_NETWORK_POLICY_DECISION` JSON line, calls `is_likely_sandbox_denied` with `SandboxType::None`, and asserts false.
+**Data flow**: It creates a successful fake result whose combined output contains a network-policy decision marker. Because the sandbox type is None, the detector should return false.
 
-**Call relations**: Exercises a false-positive avoidance case for non-sandbox execution.
+**Call relations**: The test runner calls this test. It uses make_exec_output to isolate this one false-positive case.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6637,11 +6661,11 @@ fn sandbox_detection_ignores_network_policy_text_in_non_sandbox_mode()
 fn sandbox_detection_uses_aggregated_output()
 ```
 
-**Purpose**: Checks that sandbox-denial detection can inspect aggregated output, not just stderr.
+**Purpose**: Checks that sandbox-denial detection looks at the combined output, not only stdout or stderr separately.
 
-**Data flow**: Builds output with aggregated text mentioning `Read-only file system`, calls `is_likely_sandbox_denied` for `MacosSeatbelt`, and asserts true.
+**Data flow**: It creates a fake macOS sandbox result where only the combined output mentions a read-only file system. The detector should treat that as likely sandbox blocking.
 
-**Call relations**: Targets the aggregated-output branch of the heuristic.
+**Call relations**: The test runner calls this test. It prepares the fake result with make_exec_output and then tests the detector’s combined-output path.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6652,11 +6676,11 @@ fn sandbox_detection_uses_aggregated_output()
 fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code()
 ```
 
-**Purpose**: Verifies network-policy marker text alone does not imply sandbox denial when the command succeeded.
+**Purpose**: Makes sure a successful command is not marked as sandbox-denied just because it printed network policy text.
 
-**Data flow**: Builds output with exit code 0 and aggregated network-policy marker text, calls `is_likely_sandbox_denied` for `LinuxSeccomp`, and asserts false.
+**Data flow**: It creates a fake result with exit code 0 and a network-policy marker in combined output. The detector should return false.
 
-**Call relations**: Covers another false-positive avoidance path.
+**Call relations**: The test runner calls this test. It protects against false alarms in normal successful command runs.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -6667,11 +6691,11 @@ fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code()
 async fn read_output_limits_retained_bytes_for_shell_capture()
 ```
 
-**Purpose**: Checks that shell-tool output capture truncates retained bytes to `EXEC_OUTPUT_MAX_BYTES`.
+**Purpose**: Checks that normal shell-tool output capture keeps only the configured maximum number of bytes.
 
-**Data flow**: Creates a duplex pipe, spawns a writer that sends more than the max byte count, awaits `read_output` with `Some(EXEC_OUTPUT_MAX_BYTES)`, and asserts the returned `StreamOutput.text.len()` equals the cap.
+**Data flow**: It writes more bytes than the limit into an in-memory pipe. It reads through the output reader with a byte cap and expects the retained text length to equal the cap.
 
-**Call relations**: Exercises low-level stream reading under capped capture mode.
+**Call relations**: The async test runner calls this test. It simulates a noisy command by spawning a writer task, then exercises the real output-reading code.
 
 *Call graph*: 4 external calls (assert_eq!, duplex, spawn, vec!).
 
@@ -6682,11 +6706,11 @@ async fn read_output_limits_retained_bytes_for_shell_capture()
 fn aggregate_output_prefers_stderr_on_contention()
 ```
 
-**Purpose**: Verifies aggregated output reserves more capacity for stderr when both streams are at the cap.
+**Purpose**: Verifies that when stdout and stderr are both too large, stderr gets most of the limited combined-output space.
 
-**Data flow**: Constructs max-sized stdout and stderr `StreamOutput`s, calls `aggregate_output` with the cap, computes expected stdout/stderr shares, and asserts the aggregated bytes contain the expected prefix of `a`s followed by `b`s.
+**Data flow**: It creates full-size stdout and stderr buffers. The aggregator is expected to keep a smaller slice of stdout first and use the rest for stderr.
 
-**Call relations**: Tests the contention budgeting policy in output aggregation.
+**Call relations**: The test runner calls this test. It checks the output-combining rule used after command execution finishes.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -6697,11 +6721,11 @@ fn aggregate_output_prefers_stderr_on_contention()
 fn aggregate_output_fills_remaining_capacity_with_stderr()
 ```
 
-**Purpose**: Checks that when stdout is small, stderr uses the remaining aggregation capacity.
+**Purpose**: Checks that stderr fills whatever combined-output space is left after a small stdout.
 
-**Data flow**: Builds a small stdout and max-sized stderr, aggregates with the cap, and asserts the result contains all stdout bytes followed by as many stderr bytes as fit.
+**Data flow**: It creates short stdout and very large stderr. The aggregator should keep all stdout and then as much stderr as fits.
 
-**Call relations**: Exercises the reallocation logic when one stream underuses its nominal budget.
+**Call relations**: The test runner calls this test. It exercises the same aggregation policy as real command results.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -6712,11 +6736,11 @@ fn aggregate_output_fills_remaining_capacity_with_stderr()
 fn aggregate_output_rebalances_when_stderr_is_small()
 ```
 
-**Purpose**: Verifies aggregation gives unused stderr capacity back to stdout when stderr is tiny.
+**Purpose**: Ensures stdout can use almost all combined-output space when stderr is tiny.
 
-**Data flow**: Builds max-sized stdout and one-byte stderr, aggregates with the cap, and asserts the result contains almost all stdout plus the single stderr byte.
+**Data flow**: It creates a huge stdout and a one-byte stderr. The combined output should keep all but one byte for stdout, then append the stderr byte.
 
-**Call relations**: Covers the opposite rebalance case from the previous test.
+**Call relations**: The test runner calls this test. It checks that the aggregation rule is flexible rather than using a fixed split every time.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -6727,11 +6751,11 @@ fn aggregate_output_rebalances_when_stderr_is_small()
 fn aggregate_output_keeps_stdout_then_stderr_when_under_cap()
 ```
 
-**Purpose**: Checks that when total output is below the cap, aggregation preserves full stdout followed by full stderr without truncation metadata.
+**Purpose**: Checks the simple case where combined stdout and stderr fit under the output limit.
 
-**Data flow**: Builds small stdout and stderr outputs, aggregates with the cap, constructs the expected concatenated byte vector, and asserts both bytes and `truncated_after_lines` match expectations.
+**Data flow**: It creates small stdout and stderr buffers. The aggregator should return stdout followed by stderr with no truncation marker.
 
-**Call relations**: Exercises the simple under-cap aggregation path.
+**Call relations**: The test runner calls this test. It verifies the normal no-pressure path of output aggregation.
 
 *Call graph*: 3 external calls (new, assert_eq!, vec!).
 
@@ -6742,11 +6766,11 @@ fn aggregate_output_keeps_stdout_then_stderr_when_under_cap()
 async fn read_output_retains_all_bytes_for_full_buffer_capture()
 ```
 
-**Purpose**: Verifies uncapped full-buffer capture retains every byte read from the stream.
+**Purpose**: Confirms that full-buffer capture keeps all command output instead of trimming it.
 
-**Data flow**: Creates a duplex pipe, spawns a writer sending more than `EXEC_OUTPUT_MAX_BYTES`, awaits `read_output` with `max_bytes: None`, and asserts the returned text length equals the full written length.
+**Data flow**: It writes more than the normal maximum into an in-memory pipe. It reads with no byte limit and expects the returned text length to match everything written.
 
-**Call relations**: Complements the capped `read_output` test for full-buffer mode.
+**Call relations**: The async test runner calls this test. It uses a spawned writer so the small pipe does not block while the reader drains it.
 
 *Call graph*: 4 external calls (assert_eq!, duplex, spawn, vec!).
 
@@ -6757,11 +6781,11 @@ async fn read_output_retains_all_bytes_for_full_buffer_capture()
 fn aggregate_output_keeps_all_bytes_when_uncapped()
 ```
 
-**Purpose**: Checks that uncapped aggregation concatenates complete stdout and stderr without truncation.
+**Purpose**: Checks that output aggregation keeps both stdout and stderr completely when no maximum is set.
 
-**Data flow**: Builds max-sized stdout and stderr outputs, calls `aggregate_output` with `None`, and asserts the result length is the sum of both and the byte ranges match the original streams.
+**Data flow**: It creates large stdout and stderr buffers. The aggregator should return their full concatenation: all stdout, then all stderr.
 
-**Call relations**: Exercises the uncapped aggregation branch.
+**Call relations**: The test runner calls this test. It protects the full-buffer mode used by higher-level execution tests.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -6772,11 +6796,11 @@ fn aggregate_output_keeps_all_bytes_when_uncapped()
 fn full_buffer_capture_policy_disables_caps_and_exec_expiration()
 ```
 
-**Purpose**: Verifies the `FullBuffer` capture policy reports no retained-byte cap, keeps the standard I/O drain timeout, and disables expiration-based process timeout behavior.
+**Purpose**: Verifies the settings attached to full-buffer capture mode.
 
-**Data flow**: Reads `ExecCapturePolicy::FullBuffer`, calls `retained_bytes_cap()`, `io_drain_timeout()`, and `uses_expiration()`, and asserts the expected values.
+**Data flow**: It asks the FullBuffer capture policy for its byte cap, I/O drain timeout, and expiration behavior. It expects no byte cap, a normal drain timeout, and no execution expiration.
 
-**Call relations**: Directly tests policy metadata used by execution code.
+**Call relations**: The test runner calls this test. It checks the policy object before other tests run commands using that policy.
 
 *Call graph*: 2 external calls (assert!, assert_eq!).
 
@@ -6787,11 +6811,11 @@ fn full_buffer_capture_policy_disables_caps_and_exec_expiration()
 async fn exec_full_buffer_capture_ignores_expiration() -> Result<()>
 ```
 
-**Purpose**: Checks that end-to-end execution in full-buffer mode is not terminated by a short expiration timeout if the process completes normally.
+**Purpose**: Makes sure full-buffer command execution is not stopped by the normal expiration timer.
 
-**Data flow**: Builds a short-lived shell or PowerShell command that sleeps briefly then prints `hello`, constructs `ExecParams` with `capture_policy: FullBuffer` and `expiration: 1.into()`, calls `exec`, and asserts stdout contains `hello` and `timed_out` is false.
+**Data flow**: It builds a short command that sleeps briefly and prints “hello,” while setting an unrealistically tiny expiration. Because capture policy is FullBuffer, the command should finish and return hello without timing out.
 
-**Call relations**: Exercises the interaction between `exec` and `ExecCapturePolicy::FullBuffer`.
+**Call relations**: The async test runner calls this test. It exercises the real exec path with platform-specific shell commands.
 
 *Call graph*: calls 1 internal fn (current_dir); 4 external calls (assert!, assert_eq!, vars, vec!).
 
@@ -6802,11 +6826,11 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()>
 async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_pipe_open() -> Result<()>
 ```
 
-**Purpose**: Verifies full-buffer mode still uses the I/O drain timeout to return when a descendant process keeps stdout/stderr pipes open after the main command exits.
+**Purpose**: Checks that full-buffer mode still returns if a child process leaves an output pipe open.
 
-**Data flow**: On Unix, wraps an `exec(...)` call in `tokio::time::timeout`, runs a shell command that prints `hello` and backgrounds `sleep 30`, and asserts the exec returns before the outer timeout and is not marked timed out.
+**Data flow**: On Unix, it runs a shell command that prints hello and starts a background sleep process. The test wraps execution in a larger timeout and expects exec to return once its I/O drain guard fires.
 
-**Call relations**: Exercises the drain-guard behavior in end-to-end execution.
+**Call relations**: The async test runner calls this Unix-only test. It verifies exec’s cleanup behavior when descendants outlive the main command.
 
 *Call graph*: calls 1 internal fn (current_dir); 5 external calls (from_millis, assert!, vars, timeout, vec!).
 
@@ -6817,11 +6841,11 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
 async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result<()>
 ```
 
-**Purpose**: Checks that the higher-level `process_exec_tool_call` path preserves full-buffer capture semantics and does not truncate large stdout.
+**Purpose**: Confirms that the higher-level tool-call path does not accidentally convert full-buffer capture into capped shell capture.
 
-**Data flow**: Builds a command that emits more than `EXEC_OUTPUT_MAX_BYTES`, constructs `ExecParams` with `capture_policy: FullBuffer`, calls `process_exec_tool_call`, and asserts `timed_out` is false and `output.stdout.text.len()` equals the full byte count.
+**Data flow**: It runs a command that prints more than the normal output limit using FullBuffer policy. The result should not time out, and stdout should contain every byte.
 
-**Call relations**: Exercises the orchestration layer above `exec` to ensure capture policy is forwarded intact.
+**Call relations**: The async test runner calls this test. It goes through process_exec_tool_call, which is the higher-level route used by tool execution.
 
 *Call graph*: calls 1 internal fn (current_dir); 5 external calls (assert!, assert_eq!, vars, from_ref, vec!).
 
@@ -6832,11 +6856,11 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
 fn windows_restricted_token_skips_external_sandbox_policies()
 ```
 
-**Purpose**: Verifies external permission profiles are not considered compatible with the Windows restricted-token sandbox backend.
+**Purpose**: Checks that Windows restricted-token support is not claimed for externally managed sandbox policies.
 
-**Data flow**: Constructs `PermissionProfile::External { network: Restricted }`, calls `permission_profile_supports_windows_restricted_token_sandbox`, and asserts false.
+**Data flow**: It creates an external permission profile with restricted network access. The support check should return false.
 
-**Call relations**: Directly tests a Windows sandbox compatibility helper.
+**Call relations**: The test runner calls this test. It verifies a guard used before choosing the Windows restricted-token sandbox backend.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -6847,11 +6871,11 @@ fn windows_restricted_token_skips_external_sandbox_policies()
 fn windows_restricted_token_supports_read_only_profiles()
 ```
 
-**Purpose**: Checks that read-only permission profiles are compatible with the restricted-token backend.
+**Purpose**: Checks that a read-only permission profile is compatible with the Windows restricted-token sandbox.
 
-**Data flow**: Builds `PermissionProfile::read_only()`, calls the compatibility helper, and asserts true.
+**Data flow**: It creates a read-only profile and asks whether restricted-token sandboxing supports it. The expected answer is true.
 
-**Call relations**: Covers the positive compatibility case.
+**Call relations**: The test runner calls this test. It covers one of the safe profile shapes that Windows sandbox selection may allow.
 
 *Call graph*: calls 1 internal fn (read_only); 1 external calls (assert!).
 
@@ -6862,11 +6886,11 @@ fn windows_restricted_token_supports_read_only_profiles()
 fn windows_proxy_enforcement_uses_elevated_backend()
 ```
 
-**Purpose**: Verifies proxy-enforced network restrictions force use of the elevated Windows sandbox backend even when the configured level is restricted-token.
+**Purpose**: Verifies when Windows sandboxing must use the elevated backend, especially when proxy-based network enforcement is active.
 
-**Data flow**: Calls `windows_sandbox_uses_elevated_backend` with different `(level, proxy_enforced)` combinations and asserts the expected booleans.
+**Data flow**: It asks the backend-selection helper about restricted-token and elevated levels with proxy enforcement on or off. It expects proxy enforcement to force the elevated path for restricted-token mode.
 
-**Call relations**: Directly tests backend-selection logic.
+**Call relations**: The test runner calls this test. It checks a decision that affects how Windows sandbox requests are built.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -6877,11 +6901,11 @@ fn windows_proxy_enforcement_uses_elevated_backend()
 fn windows_restricted_token_rejects_network_only_restrictions()
 ```
 
-**Purpose**: Checks that the restricted-token backend refuses profiles with unrestricted filesystem access but restricted network, because it cannot enforce that shape safely.
+**Purpose**: Ensures the Windows restricted-token backend refuses a policy that restricts only the network while leaving the file system unrestricted.
 
-**Data flow**: Builds a managed profile from unrestricted filesystem plus restricted network, gets the current directory, calls `unsupported_windows_restricted_token_sandbox_reason`, and asserts the returned `Some(String)` matches the expected refusal message.
+**Data flow**: It builds a managed profile with unrestricted files and restricted network. The unsupported-reason helper should return a clear refusal message.
 
-**Call relations**: Exercises one unsupported-profile branch in Windows sandbox validation.
+**Call relations**: The test runner calls this test. It protects against silently running without the intended network enforcement.
 
 *Call graph*: calls 3 internal fn (from_runtime_permissions, unrestricted, current_dir); 1 external calls (assert_eq!).
 
@@ -6892,11 +6916,11 @@ fn windows_restricted_token_rejects_network_only_restrictions()
 fn windows_restricted_token_rejects_managed_root_write_profiles()
 ```
 
-**Purpose**: Verifies restricted-token sandboxing rejects managed profiles that effectively grant root write access.
+**Purpose**: Checks that a managed policy allowing writes at the filesystem root is rejected for the restricted-token backend.
 
-**Data flow**: Builds a restricted filesystem policy with root write, converts it to a `PermissionProfile`, gets the current directory, calls `unsupported_windows_restricted_token_sandbox_reason`, and asserts the expected refusal string.
+**Data flow**: It builds a restricted filesystem policy that grants write access to root, combines it with restricted network access, and expects a refusal reason.
 
-**Call relations**: Covers another unsupported-profile branch.
+**Call relations**: The test runner calls this test. It exercises the Windows compatibility checker for unsafe or unenforceable filesystem rules.
 
 *Call graph*: calls 3 internal fn (from_runtime_permissions, restricted, current_dir); 2 external calls (assert_eq!, vec!).
 
@@ -6907,11 +6931,11 @@ fn windows_restricted_token_rejects_managed_root_write_profiles()
 fn windows_restricted_token_allows_read_only_profiles()
 ```
 
-**Purpose**: Checks that read-only profiles produce no unsupported-sandbox reason under restricted-token mode.
+**Purpose**: Confirms that read-only profiles produce no unsupported-reason message for restricted-token sandboxing.
 
-**Data flow**: Builds `PermissionProfile::read_only()`, gets the current directory, calls `unsupported_windows_restricted_token_sandbox_reason`, and asserts `None`.
+**Data flow**: It creates a read-only profile and current working directory. The unsupported-reason helper should return None.
 
-**Call relations**: Covers the supported read-only branch.
+**Call relations**: The test runner calls this test. It is the positive counterpart to rejection tests around Windows sandbox support.
 
 *Call graph*: calls 2 internal fn (read_only, current_dir); 1 external calls (assert_eq!).
 
@@ -6922,11 +6946,11 @@ fn windows_restricted_token_allows_read_only_profiles()
 fn windows_restricted_token_allows_workspace_write_profiles()
 ```
 
-**Purpose**: Verifies workspace-write profiles are accepted by the restricted-token backend.
+**Purpose**: Checks that workspace-write profiles are accepted by the Windows restricted-token sandbox.
 
-**Data flow**: Builds a workspace-write profile with restricted network, gets the current directory, calls `unsupported_windows_restricted_token_sandbox_reason`, and asserts `None`.
+**Data flow**: It builds a profile that can write in workspace roots but has restricted network access. The unsupported-reason helper should return None.
 
-**Call relations**: Covers another supported-profile branch.
+**Call relations**: The test runner calls this test. It verifies that common project-editing permissions are considered enforceable.
 
 *Call graph*: calls 2 internal fn (workspace_write_with, current_dir); 1 external calls (assert_eq!).
 
@@ -6937,11 +6961,11 @@ fn windows_restricted_token_allows_workspace_write_profiles()
 fn windows_elevated_allows_split_restricted_read_policies()
 ```
 
-**Purpose**: Checks that the elevated backend can support split restricted read-root policies that the unelevated backend cannot.
+**Purpose**: Checks that the elevated Windows backend can allow a policy with a specific read-only root.
 
-**Data flow**: Creates a temp docs directory, builds a restricted filesystem policy granting read access only to that path, converts it to a `PermissionProfile`, calls `unsupported_windows_restricted_token_sandbox_reason` with `WindowsSandboxLevel::Elevated`, and asserts `None`.
+**Data flow**: It creates a temporary docs directory and a policy that allows reading only that path. The compatibility check in elevated mode should accept it.
 
-**Call relations**: Exercises elevated-backend support for split read roots.
+**Call relations**: The test runner calls this test. It shows that the elevated backend can support more detailed filesystem shapes than the unelevated one.
 
 *Call graph*: calls 3 internal fn (from_runtime_permissions, restricted, from_absolute_path); 4 external calls (assert_eq!, create_dir_all, new, vec!).
 
@@ -6952,11 +6976,11 @@ fn windows_elevated_allows_split_restricted_read_policies()
 fn windows_restricted_token_rejects_split_only_filesystem_policies()
 ```
 
-**Purpose**: Verifies the unelevated restricted-token backend rejects split filesystem policies with writable project roots plus separate read-only carveouts.
+**Purpose**: Ensures the unelevated restricted-token backend rejects split filesystem read restrictions it cannot directly enforce.
 
-**Data flow**: Creates temp directories, builds the split restricted policy, converts it to a `PermissionProfile`, calls `unsupported_windows_restricted_token_sandbox_reason`, and asserts the expected refusal message.
+**Data flow**: It builds a policy with writable project roots plus a separate read-only docs path. The helper should return a refusal message about split filesystem read restrictions.
 
-**Call relations**: Targets a nuanced unsupported carveout shape for the restricted-token backend.
+**Call relations**: The test runner calls this test. It guards the rule that unsupported Windows policies must fail closed rather than run unsandboxed.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 4 external calls (assert_eq!, create_dir_all, new, vec!).
 
@@ -6967,11 +6991,11 @@ fn windows_restricted_token_rejects_split_only_filesystem_policies()
 fn windows_restricted_token_rejects_root_write_read_only_carveouts()
 ```
 
-**Purpose**: Checks that restricted-token sandboxing rejects profiles combining writable root access with separate read-only carveouts.
+**Purpose**: Checks that an unelevated Windows sandbox rejects a writable-root policy with read-only exceptions.
 
-**Data flow**: Creates temp directories, builds a restricted policy with root write plus a read-only docs carveout, converts it to a `PermissionProfile`, calls the unsupported-reason helper, and asserts the expected refusal string.
+**Data flow**: It creates a policy that grants root write access but carves out a read-only docs path. The helper should return a refusal message about split writable root sets.
 
-**Call relations**: Exercises another unsupported carveout combination.
+**Call relations**: The test runner calls this test. It covers another unsupported filesystem shape for the restricted-token backend.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 4 external calls (assert_eq!, create_dir_all, new, vec!).
 
@@ -6982,11 +7006,11 @@ fn windows_restricted_token_rejects_root_write_read_only_carveouts()
 fn windows_restricted_token_supports_full_read_split_write_read_carveouts()
 ```
 
-**Purpose**: Verifies restricted-token mode can project a full-read plus split-write/read policy into concrete filesystem overrides.
+**Purpose**: Verifies a supported restricted-token case: full read access, workspace write access, and an extra read-only carveout.
 
-**Data flow**: Creates a canonicalized temp workspace and docs directory, builds a restricted policy with root read, project-root write, and docs read carveout, converts it to a `PermissionProfile`, calls `resolve_windows_restricted_token_filesystem_overrides`, and asserts the returned `WindowsSandboxFilesystemOverrides` deny writes to the docs path.
+**Data flow**: It creates a temporary workspace and docs folder, builds a policy with root read, project-root write, and docs read-only access. The resolver should return overrides that deny writes to the docs path.
 
-**Call relations**: Exercises successful override synthesis for a supported restricted-token carveout shape.
+**Call relations**: The test runner calls this test. It checks that compatible Windows filesystem rules are translated into concrete sandbox override lists.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, canonicalize, create_dir_all, new, vec!).
 
@@ -6997,11 +7021,11 @@ fn windows_restricted_token_supports_full_read_split_write_read_carveouts()
 fn windows_restricted_token_rejects_unreadable_split_carveouts()
 ```
 
-**Purpose**: Checks that restricted-token mode rejects deny-read carveouts it cannot enforce directly.
+**Purpose**: Ensures the unelevated restricted-token backend rejects deny-read carveouts it cannot enforce.
 
-**Data flow**: Creates a canonicalized temp workspace and blocked directory, builds a restricted policy with root read, project-root write, and blocked-path deny access, converts it to a `PermissionProfile`, calls `resolve_windows_restricted_token_filesystem_overrides`, and asserts it returns the expected error string.
+**Data flow**: It builds a policy with root read, project-root write, and a denied blocked path. The restricted-token override resolver should return an error explaining that deny-read restrictions are unsupported.
 
-**Call relations**: Exercises an error path in restricted-token override resolution.
+**Call relations**: The test runner calls this test. It verifies the restricted-token resolver fails safely when asked for unreadable exceptions.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, canonicalize, create_dir_all, new, vec!).
 
@@ -7012,11 +7036,11 @@ fn windows_restricted_token_rejects_unreadable_split_carveouts()
 fn windows_elevated_supports_split_restricted_read_roots()
 ```
 
-**Purpose**: Verifies the elevated backend can synthesize explicit read-root overrides for split restricted read policies.
+**Purpose**: Checks that the elevated Windows backend can turn a specific read-root policy into sandbox overrides.
 
-**Data flow**: Creates a temp docs directory, canonicalizes it, builds a restricted read-only policy for that path, converts it to a `PermissionProfile`, calls `resolve_windows_elevated_filesystem_overrides`, and asserts the returned overrides set `read_roots_override` to the canonical docs path.
+**Data flow**: It creates a docs folder, builds a policy that allows reading that folder, and expects the resolver to set that canonical path as the read-roots override.
 
-**Call relations**: Exercises successful elevated-backend override synthesis.
+**Call relations**: The test runner calls this test. It exercises the elevated override resolver, which is more capable than the restricted-token-only resolver.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, canonicalize, create_dir_all, new, vec!).
 
@@ -7027,11 +7051,11 @@ fn windows_elevated_supports_split_restricted_read_roots()
 fn windows_elevated_supports_split_write_read_carveouts()
 ```
 
-**Purpose**: Checks that the elevated backend can represent split write/read carveouts by denying writes to read-only carveout paths.
+**Purpose**: Checks that the elevated Windows backend supports read-only carveouts inside writable workspace-style policies.
 
-**Data flow**: Creates a temp docs directory, canonicalizes it, builds a policy with root read, project-root write, and docs read carveout, converts it to a `PermissionProfile`, calls `resolve_windows_elevated_filesystem_overrides`, and asserts the returned overrides deny writes to docs.
+**Data flow**: It creates a docs folder and builds root-read, project-write, docs-read policy entries. The resolver should add the docs path to the deny-write list.
 
-**Call relations**: Covers another successful elevated-backend projection case.
+**Call relations**: The test runner calls this test. It confirms the elevated resolver can express “read this, but do not write it” as concrete overrides.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, canonicalize, create_dir_all, new, vec!).
 
@@ -7042,11 +7066,11 @@ fn windows_elevated_supports_split_write_read_carveouts()
 fn windows_elevated_supports_unreadable_split_carveouts()
 ```
 
-**Purpose**: Verifies the elevated backend can represent unreadable carveouts by denying both read and write to the blocked path.
+**Purpose**: Verifies that the elevated Windows backend supports paths that should be neither readable nor writable.
 
-**Data flow**: Creates a temp blocked directory, canonicalizes it, builds a policy with root read, project-root write, and blocked-path deny access, converts it to a `PermissionProfile`, calls `resolve_windows_elevated_filesystem_overrides`, and asserts the returned overrides deny both read and write for the blocked path.
+**Data flow**: It creates a blocked folder and builds a policy denying access to it. The resolver should add that path to both deny-read and deny-write override lists.
 
-**Call relations**: Exercises deny-path projection for the elevated backend.
+**Call relations**: The test runner calls this test. It covers deny carveouts that the elevated backend can enforce but the unelevated backend cannot.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, canonicalize, create_dir_all, new, vec!).
 
@@ -7057,11 +7081,11 @@ fn windows_elevated_supports_unreadable_split_carveouts()
 fn windows_elevated_supports_unreadable_globs()
 ```
 
-**Purpose**: Checks that unreadable glob patterns can be expanded into concrete deny-read paths under the elevated backend.
+**Purpose**: Checks that the elevated Windows backend can expand a deny glob pattern, such as all .env files, into concrete paths.
 
-**Data flow**: Creates a temp `.env` file under a nested directory, builds a policy with root read, project-root write, and deny glob `**/*.env`, converts it to a `PermissionProfile`, calls `resolve_windows_elevated_filesystem_overrides`, and asserts the returned overrides deny read for the concrete `.env` path.
+**Data flow**: It creates a secret .env file and a policy denying the glob pattern **/*.env. The resolver should find that file and include it in deny-read paths.
 
-**Call relations**: Exercises glob expansion and deny-path synthesis for elevated sandboxing.
+**Call relations**: The test runner calls this test. It verifies that pattern-based deny rules become explicit sandbox override paths.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 5 external calls (assert_eq!, create_dir_all, write, new, vec!).
 
@@ -7072,11 +7096,11 @@ fn windows_elevated_supports_unreadable_globs()
 fn windows_elevated_rejects_reopened_writable_descendants()
 ```
 
-**Purpose**: Verifies the elevated backend rejects policies that would require reopening writable descendants under read-only carveouts.
+**Purpose**: Ensures the elevated Windows backend rejects a policy that makes a child path writable inside a read-only carveout.
 
-**Data flow**: Creates nested temp directories, builds a policy with root read, project-root write, docs read carveout, and nested write carveout under docs, converts it to a `PermissionProfile`, calls `unsupported_windows_restricted_token_sandbox_reason` with elevated level, and asserts the expected refusal message.
+**Data flow**: It creates docs and nested folders, marks docs read-only, then marks nested writable. The compatibility helper should return a refusal message because reopening write access under a read-only area is unsupported.
 
-**Call relations**: Exercises a subtle unsupported elevated-backend case.
+**Call relations**: The test runner calls this test. It checks a tricky conflict in filesystem rules before sandbox execution is attempted.
 
 *Call graph*: calls 2 internal fn (from_runtime_permissions, restricted); 4 external calls (assert_eq!, create_dir_all, new, vec!).
 
@@ -7087,11 +7111,11 @@ fn windows_elevated_rejects_reopened_writable_descendants()
 fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions()
 ```
 
-**Purpose**: Checks that network-only restrictions select the platform sandbox type rather than forcing `None`.
+**Purpose**: Checks sandbox selection when only network access is restricted.
 
-**Data flow**: Computes the expected platform sandbox via `codex_sandboxing::get_platform_sandbox(false).unwrap_or(SandboxType::None)`, calls `select_process_exec_tool_sandbox_type` with unrestricted filesystem and restricted network, and asserts equality.
+**Data flow**: It asks the platform what sandbox is normally available, then asks the process-exec sandbox selector for an unrestricted-files, restricted-network policy. The selected sandbox should match the platform default.
 
-**Call relations**: Directly tests sandbox-type selection logic for network-only restrictions.
+**Call relations**: The test runner calls this test. It verifies the decision used before process_exec_tool_call builds and runs an execution request.
 
 *Call graph*: 2 external calls (assert_eq!, get_platform_sandbox).
 
@@ -7102,11 +7126,11 @@ fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions()
 fn build_exec_request_preserves_windows_workspace_roots() -> Result<()>
 ```
 
-**Purpose**: Verifies `build_exec_request` carries through the full list of Windows workspace roots unchanged.
+**Purpose**: Ensures Windows workspace roots are copied into the execution request without being lost or narrowed.
 
-**Data flow**: Creates a temp cwd and additional root, builds `ExecParams`, calls `build_exec_request`, and asserts `exec_request.windows_sandbox_workspace_roots` equals the original `workspace_roots` vector.
+**Data flow**: It creates a temporary current directory and an additional workspace root, then builds an exec request. The request should contain exactly those workspace roots.
 
-**Call relations**: Exercises request-building logic for Windows sandbox metadata.
+**Call relations**: The test runner calls this test. It exercises build_exec_request, the step that packages command settings before execution.
 
 *Call graph*: 4 external calls (new, assert_eq!, new, vec!).
 
@@ -7117,11 +7141,11 @@ fn build_exec_request_preserves_windows_workspace_roots() -> Result<()>
 fn sandbox_detection_flags_sigsys_exit_code()
 ```
 
-**Purpose**: Checks that Unix `SIGSYS`-derived exit codes are recognized as likely sandbox denials.
+**Purpose**: On Unix, checks that a SIGSYS signal exit code is treated as likely sandbox blocking.
 
-**Data flow**: Computes `EXIT_CODE_SIGNAL_BASE + libc::SIGSYS`, builds synthetic output with `make_exec_output`, calls `is_likely_sandbox_denied` for `LinuxSeccomp`, and asserts true.
+**Data flow**: It builds a fake result whose exit code represents termination by SIGSYS, a signal often caused by blocked system calls. The Linux sandbox detector should return true.
 
-**Call relations**: Covers the Unix signal-based detection branch.
+**Call relations**: The Unix test runner calls this test. It uses make_exec_output and then checks sandbox-denial detection for a signal-based failure.
 
 *Call graph*: calls 1 internal fn (make_exec_output); 1 external calls (assert!).
 
@@ -7132,11 +7156,11 @@ fn sandbox_detection_flags_sigsys_exit_code()
 async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()>
 ```
 
-**Purpose**: Verifies timeout handling kills the entire Unix process group, including grandchildren spawned by the shell command.
+**Purpose**: On Unix, verifies that a timed-out command kills not only the shell but also background grandchildren.
 
-**Data flow**: Builds a shell command that backgrounds `sleep 60`, prints its PID, and then sleeps; runs `exec` with a short expiration; asserts `timed_out`; parses the grandchild PID from stdout; polls `libc::kill(pid, 0)` until the process disappears; and asserts the grandchild was killed.
+**Data flow**: It runs a shell command that starts a long sleep in the background and prints that process id. After exec times out, the test repeatedly checks the printed process id until the process is gone.
 
-**Call relations**: Exercises end-to-end timeout cleanup and process-group termination behavior in `exec`.
+**Call relations**: The async Unix test runner calls this test. It exercises the real exec timeout path and then uses the operating system kill check to confirm cleanup.
 
 *Call graph*: calls 1 internal fn (current_dir); 7 external calls (from_millis, assert!, last_os_error, kill, vars, sleep, vec!).
 
@@ -7147,11 +7171,11 @@ async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()>
 async fn process_exec_tool_call_respects_cancellation_token() -> Result<()>
 ```
 
-**Purpose**: Checks that cancellation tokens stop running processes promptly and return a non-timeout failure result.
+**Purpose**: Checks that higher-level command execution stops promptly when a cancellation token is triggered.
 
-**Data flow**: Builds a long-running command via `long_running_command`, creates a `CancellationToken`, spawns a task that cancels it after 1 second, wraps `process_exec_tool_call` in a 5-second timeout, awaits the result, and asserts the output is not timed out and has a nonzero, non-timeout exit code.
+**Data flow**: It starts a long-running platform-specific command with cancellation-based expiration. A spawned task cancels after one second; the result should return quickly, not be marked as a timeout, and have a nonzero non-timeout exit code.
 
-**Call relations**: Exercises cancellation-aware execution through the higher-level process orchestration path.
+**Call relations**: The async test runner calls this test. It uses long_running_command to create the command, then runs through process_exec_tool_call to test normal tool cancellation.
 
 *Call graph*: calls 2 internal fn (long_running_command, current_dir); 11 external calls (new, from_millis, from_secs, assert!, assert_ne!, Cancellation, vars, from_ref, spawn, sleep (+1 more)).
 
@@ -7162,11 +7186,11 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()>
 async fn process_exec_tool_call_cancellation_allows_sigterm_cleanup() -> Result<()>
 ```
 
-**Purpose**: Verifies Unix cancellation first allows SIGTERM cleanup handlers to run before escalating to kill surviving descendants.
+**Purpose**: On Unix, checks that cancellation first gives the process a soft termination signal so cleanup code can run, then still kills stubborn descendants.
 
-**Data flow**: Creates temp marker files, builds a shell script whose parent traps `TERM` to write a cleanup marker while a child ignores `TERM`, injects marker paths via environment variables, cancels once the ready marker appears, runs `process_exec_tool_call` under timeout, asserts the cleanup marker contains `cleaned`, reads the descendant PID, polls until it exits, force-kills it if necessary, and asserts it was ultimately terminated.
+**Data flow**: It runs a shell script that writes a ready marker, traps TERM to write a cleanup marker, and starts a child that ignores TERM. After cancellation, the test expects the cleanup marker to exist and then confirms the TERM-ignoring child is dead.
 
-**Call relations**: Exercises graceful cancellation, SIGTERM cleanup, and fallback hard-kill behavior for descendant processes.
+**Call relations**: The async Unix test runner calls this test. It goes through process_exec_tool_call and validates both graceful shutdown and final process-group cleanup.
 
 *Call graph*: calls 1 internal fn (current_dir); 15 external calls (new, from_millis, from_secs, assert!, assert_eq!, last_os_error, kill, vars, read_to_string, from_ref (+5 more)).
 
@@ -7177,22 +7201,20 @@ async fn process_exec_tool_call_cancellation_allows_sigterm_cleanup() -> Result<
 fn long_running_command() -> Vec<String>
 ```
 
-**Purpose**: Returns a platform-appropriate command vector that sleeps long enough to be cancelled in tests.
+**Purpose**: Returns a simple command that sleeps for a long time on the current platform. Tests use it when they need a process that will still be running when cancellation happens.
 
-**Data flow**: On Unix returns `['/bin/sh', '-c', 'sleep 30']`; on Windows returns a PowerShell `Start-Sleep -Seconds 30` command vector.
+**Data flow**: It takes no input. On Unix it returns a shell sleep command; on Windows it returns a PowerShell sleep command.
 
-**Call relations**: Used by the cancellation-token test as a reusable long-running process fixture.
+**Call relations**: process_exec_tool_call_respects_cancellation_token calls this helper to avoid duplicating platform-specific command setup.
 
 *Call graph*: called by 1 (process_exec_tool_call_respects_cancellation_token); 1 external calls (vec!).
 
 
 ### `core/src/mcp_tool_call_tests.rs`
 
-`test` · `cross-cutting test coverage for MCP request handling, approval flow, telemetry, and config persistence`
+`test` · `test runs`
 
-This file is the regression suite for the MCP tool-call subsystem. It builds realistic `Session` and `TurnContext` fixtures, then verifies how MCP invocations are traced, exposed to approval systems, serialized into events, and persisted back into config. The helper functions construct concrete `ToolAnnotations`, `McpToolApprovalMetadata`, `McpTurnMetadataContext`, prompt-option structs, plugin MCP manifests, rollout trace bundles, and on-disk permission-request hooks. Those helpers let tests drive the real code paths rather than stubs.
-
-The tests cover several distinct concerns. One group validates approval semantics: when annotations imply approval is required, how `AppToolApproval::{Auto,Prompt,Approve}` changes behavior, how remembered approvals and persistent approvals are keyed, and how elicitation responses map back into `McpToolApprovalDecision`. Another group checks request shaping: approval questions, elicitation metadata, guardian review requests, MCP request metadata headers, plugin IDs, Codex Apps metadata, and thread IDs. Telemetry-focused tests assert exact tracing fields on MCP call spans and allowlisted result metadata promotion. Result-shaping tests verify image redaction for models without image input and byte-bounded truncation for event payloads. Persistence tests write actual `config.toml` files for app tools, custom MCP servers, plugin MCP servers, and trusted project-local config, then reload session config and confirm remembered state. Finally, auth-elicitation tests simulate Codex Apps connector auth failures and verify that elicitation is only requested when feature flags, host-owned server state, and approval policy all permit it.
+MCP means Model Context Protocol: a way for Codex to call tools exposed by external servers or apps. This test file checks that those tool calls behave safely and predictably. It covers when a tool call needs approval, what the user sees in approval prompts, how approvals can be remembered for a session or written into config, and how special Codex Apps metadata is passed along. It also checks telemetry, trace replay data, plugin-owned MCP servers, permission hooks, Guardian review decisions, and authentication prompts for connectors that need re-login. Think of it like a safety inspection checklist for a power tool: the tests do not build the tool, but they make sure guards, warning labels, logs, and permission switches all work. Without these tests, changes to MCP tool execution could silently skip approval, leak oversized results into events, lose trace data, write approvals to the wrong config file, or show confusing prompts to users.
 
 #### Function details
 
@@ -7206,11 +7228,11 @@ fn annotations(
 ) -> ToolAnnotations
 ```
 
-**Purpose**: Builds a `ToolAnnotations` test value from optional read-only, destructive, and open-world hints. It centralizes the exact `ToolAnnotations::from_raw` call shape used throughout approval-related tests.
+**Purpose**: Builds a small test object describing whether an MCP tool is read-only, destructive, or open-world. Tests use it to simulate the safety hints that real MCP tools can provide.
 
-**Data flow**: Takes three `Option<bool>` flags and passes them into `ToolAnnotations::from_raw` with `title` and `idempotent_hint` forced to `None`. Returns the resulting `ToolAnnotations` without mutating external state.
+**Data flow**: It receives three optional yes/no hints, passes them into the tool-annotation constructor, and returns a ToolAnnotations value ready for approval tests.
 
-**Call relations**: Used by many approval and guardian tests to create concrete annotation combinations that drive production approval logic, especially the branches that distinguish safe read-only tools from destructive or open-world tools.
+**Call relations**: Many approval and Guardian tests call this helper so they can focus on expected behavior instead of repeating annotation setup.
 
 *Call graph*: called by 13 (approval_not_required_when_read_only_and_other_hints_are_absent, approval_required_when_destructive_even_if_read_only_true, approval_required_when_read_only_false_and_destructive, approval_required_when_read_only_false_and_open_world, approve_mode_skips_guardian_in_every_permission_mode, approve_mode_skips_when_annotations_do_not_require_approval, full_access_mode_skips_mcp_tool_approval_for_all_approval_modes, guardian_mcp_review_request_includes_annotations_when_present, guardian_mode_mcp_denial_returns_rationale_message, guardian_mode_skips_auto_when_annotations_do_not_require_approval (+3 more)); 1 external calls (from_raw).
 
@@ -7227,11 +7249,11 @@ fn approval_metadata(
 ) ->
 ```
 
-**Purpose**: Constructs a minimal `McpToolApprovalMetadata` fixture with selected connector and tool descriptive fields populated. It leaves unrelated metadata channels unset so tests can focus on specific request/meta behavior.
+**Purpose**: Creates test metadata for an MCP tool approval prompt. This lets tests describe a connector, app, and tool in the same shape production code expects.
 
-**Data flow**: Accepts optional string slices for connector identity and tool labeling, converts present values into owned `String`s, and returns an `McpToolApprovalMetadata` with `annotations`, `plugin_id`, `mcp_app_resource_uri`, `codex_apps_meta`, and `openai_file_input_params` set to `None`.
+**Data flow**: It takes optional strings such as connector id, connector name, and tool title, converts present values into owned strings, fills unrelated fields with none, and returns McpToolApprovalMetadata.
 
-**Call relations**: Called by tests that need realistic metadata for approval elicitation payloads, persistent-approval key derivation, guardian review requests, plugin request metadata, and Codex Apps auth-failure scenarios.
+**Call relations**: Approval prompt, Codex Apps, plugin, and Guardian tests call this helper when they need realistic metadata without building every field manually.
 
 *Call graph*: called by 5 (approval_elicitation_request_uses_message_override_and_preserves_tool_params_keys, codex_apps_auth_failure_metadata, codex_apps_connectors_support_persistent_approval, guardian_mcp_review_request_includes_invocation_metadata, plugin_mcp_tool_call_request_meta_includes_plugin_id).
 
@@ -7242,11 +7264,11 @@ fn approval_metadata(
 fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataContext<'_>
 ```
 
-**Purpose**: Extracts the subset of turn context needed to compute MCP turn metadata headers. It packages the model slug and effective reasoning effort into `McpTurnMetadataContext`.
+**Purpose**: Extracts the small piece of turn information that MCP request metadata needs: the model name and reasoning effort. This mirrors what production requests send to MCP servers.
 
-**Data flow**: Reads `turn_context.model_info.slug` and `turn_context.effective_reasoning_effort()`, then returns a borrowed `McpTurnMetadataContext<'_>` referencing the model string and carrying the optional reasoning effort.
+**Data flow**: It reads the model slug and effective reasoning effort from a TurnContext and returns an McpTurnMetadataContext borrowing those values.
 
-**Call relations**: Used by request-metadata tests to compute the expected turn metadata independently, then compare it against what `build_mcp_tool_call_request_meta` emits for custom servers, plugins, and Codex Apps.
+**Call relations**: Request-metadata tests use it to compute the expected metadata before comparing it with what production code builds.
 
 *Call graph*: calls 1 internal fn (effective_reasoning_effort); called by 4 (codex_apps_tool_call_request_meta_includes_call_id_without_existing_codex_apps_meta, codex_apps_tool_call_request_meta_includes_turn_metadata_and_codex_apps_meta, mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server, plugin_mcp_tool_call_request_meta_includes_plugin_id).
 
@@ -7257,11 +7279,11 @@ fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataConte
 fn write_sample_plugin_mcp(codex_home: &std::path::Path)
 ```
 
-**Purpose**: Creates a synthetic plugin installation on disk with both a plugin manifest and `.mcp.json` server definition. It gives plugin-policy tests a real filesystem layout to load from.
+**Purpose**: Creates a fake plugin on disk with a minimal MCP server configuration. Tests use this as a stand-in for a real installed plugin.
 
-**Data flow**: Takes a `codex_home` path, creates `plugins/cache/test/sample/local/.codex-plugin`, writes `.codex-plugin/plugin.json` containing `{ "name": "sample" }`, and writes `.mcp.json` defining an HTTP MCP server named `sample` at `https://sample.example/mcp`.
+**Data flow**: It receives a Codex home directory, creates plugin folders, writes a plugin manifest, writes an MCP config file, and leaves those files for config-loading tests to discover.
 
-**Call relations**: Invoked by plugin approval-mode and persistence tests before loading config, so the plugin manager can discover a concrete plugin-backed MCP server and apply plugin-scoped tool policy.
+**Call relations**: Plugin approval-mode and persistence tests call this before loading config so the plugin manager has something concrete to read.
 
 *Call graph*: called by 3 (custom_mcp_tool_approval_mode_uses_plugin_mcp_policy, custom_mcp_tool_approval_mode_uses_updated_plugin_mcp_policy_after_cache_warm, maybe_persist_mcp_tool_approval_writes_plugin_mcp_policy); 3 external calls (join, create_dir_all, write).
 
@@ -7275,11 +7297,11 @@ fn prompt_options(
 ) -> McpToolApprovalPromptOptions
 ```
 
-**Purpose**: Builds `McpToolApprovalPromptOptions` fixtures for approval-question and elicitation tests. It makes the allowed remember scopes explicit in each scenario.
+**Purpose**: Builds the options that decide whether an approval prompt may offer “remember for this session” or “always remember.” It keeps prompt tests short and readable.
 
-**Data flow**: Accepts two booleans and returns `McpToolApprovalPromptOptions { allow_session_remember, allow_persistent_approval }` with no side effects.
+**Data flow**: It receives two booleans and returns an McpToolApprovalPromptOptions value with those exact settings.
 
-**Call relations**: Used by tests that verify approval-question option ordering, omission of persistent remember in prompt-only cases, and elicitation metadata persistence flags.
+**Call relations**: Prompt-building tests call it to describe which remember choices should appear in the approval UI.
 
 *Call graph*: called by 5 (approval_elicitation_request_uses_message_override_and_preserves_tool_params_keys, codex_apps_tool_question_uses_fallback_app_label, custom_mcp_tool_question_mentions_server_name, custom_mcp_tool_question_offers_session_remember_and_always_allow, trusted_codex_apps_tool_question_offers_always_allow).
 
@@ -7290,11 +7312,11 @@ fn prompt_options(
 async fn execute_mcp_tool_call_records_replayable_correlation() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that the real MCP execution path emits a replay-bundle correlation ID linking the model-visible tool call to the underlying MCP call, even when execution itself fails due to a missing backend.
+**Purpose**: Checks that the real MCP execution path records a replayable correlation id for a tool call. This matters because trace replay needs to connect the model-visible call to the backend MCP call.
 
-**Data flow**: Creates a temp rollout root and synthetic session/turn, attaches a rollout trace bundle, starts a tool-dispatch trace with a concrete `ToolDispatchInvocation`, then calls `execute_mcp_tool_call` for server `docs` tool `search` with JSON arguments. It expects an error, replays the sole emitted bundle from disk, and asserts that `replayed.tool_calls["mcp-call"].mcp_call_id` is populated.
+**Data flow**: It creates a temporary trace bundle, starts a fake session and dispatch trace, tries an MCP tool call that is expected to fail because no backend exists, then replays the trace files and verifies the correlation id was still written.
 
-**Call relations**: This is an end-to-end trace-emission test: it sets up the trace context first, then drives the production MCP execution path specifically to validate reducer-visible replay metadata rather than successful tool execution.
+**Call relations**: This test uses the trace helpers in this file and exercises production MCP execution far enough to prove trace emission happens even when the synthetic backend is missing.
 
 *Call graph*: calls 3 internal fn (attach_trace_bundle, single_bundle_dir, make_session_and_context); 4 external calls (assert!, replay_bundle, json!, tempdir).
 
@@ -7310,11 +7332,11 @@ fn install_mcp_permission_request_hook(
 ) -> std::path::PathBuf
 ```
 
-**Purpose**: Installs a real command hook for `PermissionRequest` events under the test `codex_home`, logging hook input and returning a caller-specified JSON decision. It prepares sessions for tests that exercise hook-based MCP approval.
+**Purpose**: Installs a temporary command hook that records permission-request input and returns a chosen decision. Tests use it to verify how MCP tool approvals interact with user hooks.
 
-**Data flow**: Given a mutable `Session`, `TurnContext`, matcher regex, and JSON hook output, it writes a Python script that reads stdin JSON, appends it to `mcp_permission_request_hook_log.jsonl`, and prints the configured output. It writes `hooks.json`, loads hooks via `codex_hooks::list_hooks`, wraps them in a trusted config layer stack, stores a new `Hooks` instance into `session.services.hooks`, and returns the log file path.
+**Data flow**: It writes a Python script and hooks.json into the test Codex home, loads and trusts that hook config, stores a Hooks service in the session, and returns the path where hook inputs will be logged.
 
-**Call relations**: Called by the permission-request hook tests before invoking `maybe_request_mcp_tool_approval`. Those tests then inspect the log file to confirm the exact payload sent to the hook and whether remembered approvals bypass hook execution.
+**Call relations**: Permission-hook tests call this setup helper before asking production approval code to evaluate an MCP tool call.
 
 *Call graph*: calls 2 internal fn (trusted_config_layer_stack, new); called by 3 (permission_request_hook_allows_mcp_tool_call, permission_request_hook_runs_after_remembered_mcp_approval, permission_request_hook_uses_hook_tool_name_without_metadata); 12 external calls (new, to_string, new, assert_eq!, cfg!, list_hooks, format!, default, json!, create_dir_all (+2 more)).
 
@@ -7329,11 +7351,11 @@ fn attach_trace_bundle(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Attaches a replayable rollout trace context to a synthetic session under test. It gives later MCP dispatches a real trace sink rooted in a temporary directory.
+**Purpose**: Attaches a test rollout trace bundle to a synthetic session. This gives trace-related tests a real place to write replay data.
 
-**Data flow**: Takes mutable `Session`, `TurnContext`, and a root path; starts `ThreadTraceContext::start_root_in_root_for_test` with concrete `ThreadStartedTraceMetadata` including thread ID, session source, cwd, model, provider, approval policy, and sandbox policy; records the current Codex turn start; then stores the trace context into `session.services.rollout_thread_trace`.
+**Data flow**: It receives a session, turn context, and root directory, starts a trace context with fixed test metadata, records that the turn started, and stores the trace context on the session.
 
-**Call relations**: Used only by the replay-correlation test as setup before `execute_mcp_tool_call`, ensuring the execution path has an active rollout trace to write into.
+**Call relations**: The trace-correlation test calls this before invoking MCP execution so the production code emits files into the temporary bundle.
 
 *Call graph*: calls 1 internal fn (start_root_in_root_for_test); called by 1 (execute_mcp_tool_call_records_replayable_correlation); 1 external calls (from).
 
@@ -7344,11 +7366,11 @@ fn attach_trace_bundle(
 fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf>
 ```
 
-**Purpose**: Finds the only rollout bundle directory emitted under a temporary trace root. It enforces the test invariant that exactly one bundle was produced.
+**Purpose**: Finds the one trace bundle directory produced during a test. It makes the trace test fail loudly if zero or multiple bundles were written.
 
-**Data flow**: Reads directory entries under `root`, collects their paths into a vector, sorts them, asserts the vector length is exactly one, and returns that sole path.
+**Data flow**: It reads the entries under a root directory, sorts them, asserts there is exactly one, and returns that path.
 
-**Call relations**: Called after MCP execution in the replay-correlation test to locate the bundle directory passed into `replay_bundle`.
+**Call relations**: The trace-correlation test calls this just before replaying the emitted bundle.
 
 *Call graph*: called by 1 (execute_mcp_tool_call_records_replayable_correlation); 2 external calls (assert_eq!, read_dir).
 
@@ -7359,11 +7381,11 @@ fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf>
 fn mcp_app_resource_uri_reads_known_tool_meta_keys()
 ```
 
-**Purpose**: Checks that MCP app resource URI extraction recognizes all supported metadata key layouts. It guards compatibility with nested UI metadata and flat OpenAI-style keys.
+**Purpose**: Verifies that app resource URIs are recognized from the supported metadata key formats. This protects compatibility with different MCP tool metadata styles.
 
-**Data flow**: Builds three JSON metadata objects—nested `ui.resourceUri`, flat `ui/resourceUri`, and `openai/outputTemplate`—passes each object map into `get_mcp_app_resource_uri`, and asserts the expected URI string is returned.
+**Data flow**: It builds sample metadata objects using nested, flat, and output-template keys, passes each into the URI extractor, and checks the expected URI comes out.
 
-**Call relations**: Standalone unit test for metadata parsing behavior used when enriching MCP tool-call items and approval metadata.
+**Call relations**: This standalone test exercises the production metadata reader directly.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -7374,11 +7396,11 @@ fn mcp_app_resource_uri_reads_known_tool_meta_keys()
 fn openai_file_params_are_only_honored_for_codex_apps()
 ```
 
-**Purpose**: Verifies that `openai/fileParams` metadata is accepted only for the Codex Apps MCP server and ignored for ordinary custom servers.
+**Purpose**: Checks that OpenAI file-input metadata is trusted only for the special Codex Apps MCP server. This avoids applying app-specific file behavior to arbitrary servers.
 
-**Data flow**: Creates a metadata object containing `openai/fileParams: ["file"]`, then calls `openai_file_input_params_for_server` once with `CODEX_APPS_MCP_SERVER_NAME` and once with `minimaltest`, asserting `Some(vec!["file"])` for the former and `None` for the latter.
+**Data flow**: It builds metadata containing file parameters, asks the production helper for Codex Apps and for a normal server, and verifies only Codex Apps gets the file list.
 
-**Call relations**: Standalone unit test for server-specific metadata gating in the MCP approval/request pipeline.
+**Call relations**: This test directly protects the server-name gate in the metadata extraction logic.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -7389,11 +7411,11 @@ fn openai_file_params_are_only_honored_for_codex_apps()
 fn approval_required_when_read_only_false_and_destructive()
 ```
 
-**Purpose**: Confirms that a tool marked non-read-only and destructive always requires approval.
+**Purpose**: Confirms that a tool marked not read-only and destructive requires approval. This is one of the core safety rules.
 
-**Data flow**: Builds annotations with `read_only=false` and `destructive=true`, passes them to `requires_mcp_tool_approval`, and asserts the result is `true`.
+**Data flow**: It creates annotations with read-only false and destructive true, passes them to the approval-required helper, and expects true.
 
-**Call relations**: One of several focused truth-table tests covering the approval requirement predicate.
+**Call relations**: It uses the annotations helper and checks the production approval decision rule.
 
 *Call graph*: calls 1 internal fn (annotations); 1 external calls (assert_eq!).
 
@@ -7404,11 +7426,11 @@ fn approval_required_when_read_only_false_and_destructive()
 fn approval_required_when_read_only_false_and_open_world()
 ```
 
-**Purpose**: Confirms that a non-read-only tool with open-world access requires approval.
+**Purpose**: Confirms that a not-read-only tool that can affect the outside world requires approval. “Open world” means the tool may touch things beyond local safe context.
 
-**Data flow**: Creates annotations with `read_only=false` and `open_world=true`, evaluates `requires_mcp_tool_approval`, and asserts `true`.
+**Data flow**: It creates annotations with read-only false and open-world true, runs the approval-required helper, and expects true.
 
-**Call relations**: Complements the destructive-hint test to cover the open-world branch of approval requirement logic.
+**Call relations**: It covers another branch of the production approval decision rule.
 
 *Call graph*: calls 1 internal fn (annotations); 1 external calls (assert_eq!).
 
@@ -7419,11 +7441,11 @@ fn approval_required_when_read_only_false_and_open_world()
 fn approval_required_when_destructive_even_if_read_only_true()
 ```
 
-**Purpose**: Verifies that a destructive hint overrides a read-only hint and still forces approval.
+**Purpose**: Checks that a destructive hint wins even if a tool also claims to be read-only. This prevents contradictory metadata from making a dangerous tool look safe.
 
-**Data flow**: Creates annotations with `read_only=true`, `destructive=true`, and `open_world=true`, then asserts `requires_mcp_tool_approval` returns `true`.
+**Data flow**: It creates annotations with read-only true plus destructive and open-world true, evaluates approval need, and expects true.
 
-**Call relations**: Protects the invariant that destructive tools are never auto-treated as safe solely because `read_only_hint` is present.
+**Call relations**: It tests that production logic treats destructive hints as important safety signals.
 
 *Call graph*: calls 1 internal fn (annotations); 1 external calls (assert_eq!).
 
@@ -7434,11 +7456,11 @@ fn approval_required_when_destructive_even_if_read_only_true()
 fn approval_required_when_annotations_are_absent()
 ```
 
-**Purpose**: Checks the conservative default: missing annotations mean approval is required.
+**Purpose**: Checks the conservative default: if a tool gives no safety hints, approval is required. Unknown safety should not be treated as safe.
 
-**Data flow**: Calls `requires_mcp_tool_approval(None)` and asserts `true`.
+**Data flow**: It passes no annotations into the approval-required helper and verifies the answer is true.
 
-**Call relations**: Covers the no-metadata fallback branch of approval requirement logic.
+**Call relations**: This standalone test protects the fallback behavior of the approval rule.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7449,11 +7471,11 @@ fn approval_required_when_annotations_are_absent()
 fn approval_not_required_when_read_only_and_other_hints_are_absent()
 ```
 
-**Purpose**: Verifies the only clearly safe case in the predicate: explicitly read-only with no destructive or open-world hints.
+**Purpose**: Confirms that a clearly read-only tool does not require approval when no risky hints are present. This keeps harmless read operations from interrupting the user.
 
-**Data flow**: Builds annotations with `read_only=true` and other hints absent, evaluates `requires_mcp_tool_approval`, and asserts `false`.
+**Data flow**: It creates read-only annotations with no destructive or open-world hints, evaluates approval need, and expects false.
 
-**Call relations**: Completes the approval predicate truth-table tests by covering the non-approval path.
+**Call relations**: It balances the stricter approval tests by checking the safe path.
 
 *Call graph*: calls 1 internal fn (annotations); 1 external calls (assert_eq!).
 
@@ -7464,11 +7486,11 @@ fn approval_not_required_when_read_only_and_other_hints_are_absent()
 fn prompt_mode_does_not_allow_persistent_remember()
 ```
 
-**Purpose**: Ensures prompt-mode normalization strips session and persistent remember decisions down to a one-shot accept.
+**Purpose**: Ensures prompt-only approval mode does not preserve session or permanent remember choices. In this mode, “remember” choices are normalized down to a one-time accept.
 
-**Data flow**: Calls `normalize_approval_decision_for_mode` with `AcceptForSession` and `AcceptAndRemember` under `AppToolApproval::Prompt`, asserting both normalize to `McpToolApprovalDecision::Accept`.
+**Data flow**: It feeds session and persistent accept decisions into the normalizer with Prompt mode and checks both become plain Accept.
 
-**Call relations**: Unit test for the decision-normalization step used after approval responses are parsed.
+**Call relations**: This protects the production rule that Prompt mode asks each time rather than saving approval.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7479,11 +7501,11 @@ fn prompt_mode_does_not_allow_persistent_remember()
 async fn mcp_tool_call_span_records_expected_fields()
 ```
 
-**Purpose**: Asserts that the MCP tool-call tracing span emits the expected OpenTelemetry-style fields, including RPC metadata, server origin parsing, connector identity, and conversation/session/turn IDs.
+**Purpose**: Checks that MCP tool-call tracing spans include useful observability fields. These fields help operators understand which server, connector, and tool were called.
 
-**Data flow**: Installs a tracing subscriber backed by a leaked in-memory buffer, creates a synthetic session and turn context, instruments an empty async block with `mcp_tool_call_span` using concrete span fields, awaits it, converts the captured bytes to UTF-8, and asserts the log output contains all expected key-value pairs.
+**Data flow**: It installs a test tracing subscriber, creates a session, runs an empty async block inside an MCP span, reads the captured logs, and checks for expected field names and values.
 
-**Call relations**: Directly exercises span construction and field recording without needing a real MCP call, serving as a telemetry contract test.
+**Call relations**: This test exercises the production span builder and verifies the emitted trace data is complete.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 9 external calls (leak, new, new, from_utf8, new, assert!, new, set_default, fmt).
 
@@ -7494,11 +7516,11 @@ async fn mcp_tool_call_span_records_expected_fields()
 async fn mcp_result_telemetry_span_logs(meta: Option<serde_json::Value>) -> String
 ```
 
-**Purpose**: Helper that records MCP result telemetry into a tracing span and returns the captured logs as a string. It isolates the tracing setup shared by multiple result-telemetry tests.
+**Purpose**: Captures trace logs produced when MCP result metadata is recorded onto a span. Other tests use it to check which result metadata becomes telemetry.
 
-**Data flow**: Creates an in-memory tracing subscriber, builds a synthetic session/turn and a `CallToolResult` with caller-provided `meta`, opens an `mcp_tool_call_span`, invokes `record_mcp_result_span_telemetry(&Span::current(), Some(&result))` inside that span, then returns the captured log buffer as UTF-8 text.
+**Data flow**: It sets up an in-memory tracing subscriber, builds a test tool result with optional metadata, records telemetry inside an MCP span, and returns the captured log text.
 
-**Call relations**: Called by the allowlist, invalid-value, and truncation tests to inspect exactly which result metadata keys are promoted into span fields.
+**Call relations**: Telemetry tests call this helper with valid, invalid, missing, and oversized metadata.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); called by 3 (mcp_result_telemetry_ignores_invalid_and_missing_values, mcp_result_telemetry_records_allowlisted_span_fields, mcp_result_telemetry_truncates_long_target_id); 9 external calls (leak, new, new, current, from_utf8, new, new, set_default, fmt).
 
@@ -7509,11 +7531,11 @@ async fn mcp_result_telemetry_span_logs(meta: Option<serde_json::Value>) -> Stri
 async fn mcp_result_telemetry_records_allowlisted_span_fields()
 ```
 
-**Purpose**: Verifies that only allowlisted MCP result telemetry keys are promoted into tracing fields.
+**Purpose**: Verifies that only approved MCP result telemetry fields are promoted into tracing. This prevents arbitrary server metadata from becoming logs.
 
-**Data flow**: Passes metadata containing `codex/telemetry.span.target_id`, `did_trigger_server_user_flow`, and an unknown sentinel key into `mcp_result_telemetry_span_logs`, then asserts the logs contain the promoted allowlisted fields and omit the unknown key/value.
+**Data flow**: It sends metadata with allowed fields and an extra sentinel field through the telemetry helper, then checks allowed fields appear and the sentinel does not.
 
-**Call relations**: Builds on the shared log-capture helper to validate the positive allowlist path and the ignore-unknown-keys invariant.
+**Call relations**: It relies on mcp_result_telemetry_span_logs to capture production span output.
 
 *Call graph*: calls 1 internal fn (mcp_result_telemetry_span_logs); 2 external calls (assert!, json!).
 
@@ -7524,11 +7546,11 @@ async fn mcp_result_telemetry_records_allowlisted_span_fields()
 async fn mcp_result_telemetry_ignores_invalid_and_missing_values()
 ```
 
-**Purpose**: Checks that malformed telemetry values, missing span objects, and absent metadata produce no promoted span fields.
+**Purpose**: Checks that malformed or absent telemetry metadata is ignored. Bad metadata should not create misleading trace fields.
 
-**Data flow**: Calls `mcp_result_telemetry_span_logs` three times: once with wrong-typed values, once with an empty `codex/telemetry` object, and once with `None`. It asserts each resulting log string lacks the promoted telemetry field names.
+**Data flow**: It captures logs for invalid types, missing span data, and no metadata, then verifies none of the telemetry fields were recorded.
 
-**Call relations**: Covers defensive parsing branches in result telemetry extraction.
+**Call relations**: It uses the shared telemetry-log helper to exercise the production recorder under negative cases.
 
 *Call graph*: calls 1 internal fn (mcp_result_telemetry_span_logs); 2 external calls (assert!, json!).
 
@@ -7539,11 +7561,11 @@ async fn mcp_result_telemetry_ignores_invalid_and_missing_values()
 async fn mcp_result_telemetry_truncates_long_target_id()
 ```
 
-**Purpose**: Ensures long `target_id` values are truncated to the configured character limit before being recorded in telemetry.
+**Purpose**: Ensures long telemetry target ids are shortened before logging. This keeps traces bounded and avoids huge field values.
 
-**Data flow**: Builds a `target_id` longer than `MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS`, captures logs via `mcp_result_telemetry_span_logs`, and asserts the logs contain only the truncated prefix and not the trailing suffix.
+**Data flow**: It builds a target id longer than the allowed character count, records it through the telemetry helper, and checks only the truncated prefix appears.
 
-**Call relations**: Validates the length-bounding branch of result telemetry promotion.
+**Call relations**: It covers the production truncation path used by MCP result telemetry.
 
 *Call graph*: calls 1 internal fn (mcp_result_telemetry_span_logs); 3 external calls (assert!, format!, json!).
 
@@ -7554,11 +7576,11 @@ async fn mcp_result_telemetry_truncates_long_target_id()
 fn truncates_strings_on_char_boundaries()
 ```
 
-**Purpose**: Tests the string truncation helper with multibyte characters to ensure it never splits a UTF-8 codepoint.
+**Purpose**: Checks that string truncation does not split a multi-byte character. This matters because invalid UTF-8 would break text handling.
 
-**Data flow**: Constructs a string of repeated `á` characters plus a suffix, truncates it with `truncate_str_to_char_boundary`, and asserts the result equals the full multibyte prefix. It also checks that short ASCII strings are returned unchanged.
+**Data flow**: It builds a long string using accented characters, truncates it by character count, and verifies the result ends cleanly and short strings are unchanged.
 
-**Call relations**: Supports the telemetry truncation tests by validating the lower-level truncation invariant.
+**Call relations**: This directly tests the low-level helper used by telemetry truncation.
 
 *Call graph*: 2 external calls (assert_eq!, format!).
 
@@ -7569,11 +7591,11 @@ fn truncates_strings_on_char_boundaries()
 async fn approval_elicitation_request_uses_message_override_and_preserves_tool_params_keys()
 ```
 
-**Purpose**: Verifies the exact `McpServerElicitationRequestParams` built for MCP tool approval, including message override, persistence options, connector metadata, and unmodified tool parameter keys.
+**Purpose**: Verifies that an MCP approval elicitation request can use a custom message while preserving the exact tool parameter keys. An elicitation is a structured prompt sent through MCP to ask the user for input.
 
-**Data flow**: Creates a session/turn, builds an approval question and a rich `McpToolApprovalElicitationRequest` containing metadata, raw tool params, rendered display params, and a message override, then calls `build_mcp_tool_approval_elicitation_request` and asserts deep equality with the expected request struct and nested JSON meta.
+**Data flow**: It builds a session, approval question, metadata, raw tool parameters, and display-friendly parameter labels, then checks the generated request matches the expected form and metadata.
 
-**Call relations**: End-to-end unit test for approval elicitation request construction, especially the metadata schema consumed by MCP servers.
+**Call relations**: It exercises the production request builder using approval_metadata and prompt_options helpers.
 
 *Call graph*: calls 3 internal fn (approval_metadata, prompt_options, make_session_and_context); 2 external calls (assert_eq!, json!).
 
@@ -7584,11 +7606,11 @@ async fn approval_elicitation_request_uses_message_override_and_preserves_tool_p
 fn custom_mcp_tool_question_mentions_server_name()
 ```
 
-**Purpose**: Checks that approval questions for non-Codex-Apps servers mention the MCP server name and omit persistent remember when not allowed.
+**Purpose**: Checks the wording for approval prompts for ordinary custom MCP servers. The prompt should clearly name the server and tool.
 
-**Data flow**: Builds a question for server `custom_server` and tool `run_action` with both remember flags disabled, then asserts the header text, question text, and option labels match expectations and exclude `AcceptAndRemember`.
+**Data flow**: It builds a question for a custom server with no remember options, then checks the header, question text, and absence of the permanent remember option.
 
-**Call relations**: One of several tests covering user-facing approval question wording and option sets.
+**Call relations**: It tests the production approval-question builder with simple prompt options.
 
 *Call graph*: calls 1 internal fn (prompt_options); 2 external calls (assert!, assert_eq!).
 
@@ -7599,11 +7621,11 @@ fn custom_mcp_tool_question_mentions_server_name()
 fn codex_apps_tool_question_uses_fallback_app_label()
 ```
 
-**Purpose**: Verifies that Codex Apps approval questions fall back to the generic phrase “this app” when no connector name is available.
+**Purpose**: Checks that Codex Apps prompts say “this app” when no connector name is available. This avoids showing an empty or awkward connector label.
 
-**Data flow**: Builds a question for `CODEX_APPS_MCP_SERVER_NAME` without a connector name and asserts the generated question string uses the fallback label.
+**Data flow**: It builds a Codex Apps question without connector metadata and verifies the fallback wording.
 
-**Call relations**: Covers the Codex Apps-specific wording branch in approval question generation.
+**Call relations**: It exercises the Codex Apps branch of the approval-question builder.
 
 *Call graph*: calls 1 internal fn (prompt_options); 1 external calls (assert_eq!).
 
@@ -7614,11 +7636,11 @@ fn codex_apps_tool_question_uses_fallback_app_label()
 fn trusted_codex_apps_tool_question_offers_always_allow()
 ```
 
-**Purpose**: Ensures a trusted Codex Apps connector approval question offers both session-scoped and persistent remember options, in the expected order and with the expected descriptions.
+**Purpose**: Verifies that trusted Codex Apps prompts can offer both session and future remember choices. This confirms the full option list is shown when allowed.
 
-**Data flow**: Builds a question for the `Calendar` connector with both remember flags enabled, extracts the options, and asserts the presence and descriptions of `AcceptForSession` and `AcceptAndRemember`, plus the full ordered label list.
+**Data flow**: It builds a question with connector name and both remember options enabled, then checks the option labels and descriptions.
 
-**Call relations**: Tests the richest approval-question variant where all remember scopes are available.
+**Call relations**: It tests how prompt_options influences the production question builder.
 
 *Call graph*: calls 1 internal fn (prompt_options); 2 external calls (assert!, assert_eq!).
 
@@ -7629,11 +7651,11 @@ fn trusted_codex_apps_tool_question_offers_always_allow()
 fn codex_apps_tool_question_without_elicitation_omits_always_allow()
 ```
 
-**Purpose**: Checks that persistent remember is suppressed when MCP elicitation support is disabled, even if session and persistent approval keys exist.
+**Purpose**: Checks that the permanent “always allow” option is hidden when MCP tool-call elicitation is disabled. This prevents offering a choice that cannot be handled safely.
 
-**Data flow**: Constructs matching session and persistent `McpToolApprovalKey`s, derives prompt options via `mcp_tool_approval_prompt_options(..., tool_call_mcp_elicitation_enabled=false)`, builds the question, and asserts the option labels include only accept, session remember, and cancel.
+**Data flow**: It builds approval keys, asks production code for prompt options with elicitation disabled, builds the question, and verifies only accept, session remember, and cancel remain.
 
-**Call relations**: Covers the interaction between approval-key availability and the feature gate for persistent elicitation.
+**Call relations**: It connects prompt-option calculation with the approval-question builder.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7644,11 +7666,11 @@ fn codex_apps_tool_question_without_elicitation_omits_always_allow()
 fn custom_mcp_tool_question_offers_session_remember_and_always_allow()
 ```
 
-**Purpose**: Verifies that custom MCP servers can expose both session and persistent remember options when allowed.
+**Purpose**: Confirms custom MCP servers can show both remember choices when those choices are enabled. This keeps custom servers aligned with Codex Apps behavior where appropriate.
 
-**Data flow**: Builds a question for `custom_server` with both remember flags enabled and asserts the option labels are exactly accept, accept-for-session, accept-and-remember, and cancel.
+**Data flow**: It builds a custom-server question with session and persistent remembering allowed and checks the option order.
 
-**Call relations**: Complements the Codex Apps question tests by covering the custom-server branch.
+**Call relations**: It exercises the generic server branch of the approval-question builder.
 
 *Call graph*: calls 1 internal fn (prompt_options); 1 external calls (assert_eq!).
 
@@ -7659,11 +7681,11 @@ fn custom_mcp_tool_question_offers_session_remember_and_always_allow()
 fn custom_servers_support_session_and_persistent_approval()
 ```
 
-**Purpose**: Checks that custom MCP invocations derive both session and persistent approval keys from server name and tool name alone.
+**Purpose**: Checks that custom MCP tools can produce both session and persistent approval keys. These keys are how Codex remembers that a user approved a specific tool.
 
-**Data flow**: Creates a `McpInvocation` for `custom_server/run_action`, constructs the expected `McpToolApprovalKey`, and asserts both `session_mcp_tool_approval_key` and `persistent_mcp_tool_approval_key` return it under `AppToolApproval::Auto`.
+**Data flow**: It creates a custom-server invocation, builds the expected key, and compares it with both session and persistent key builders.
 
-**Call relations**: Unit test for approval-key derivation logic outside the Codex Apps connector path.
+**Call relations**: It directly tests the approval-key functions used before remembering or persisting approvals.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7674,11 +7696,11 @@ fn custom_servers_support_session_and_persistent_approval()
 fn codex_apps_connectors_support_persistent_approval()
 ```
 
-**Purpose**: Verifies that Codex Apps invocations derive approval keys that include the connector ID from metadata.
+**Purpose**: Checks that Codex Apps connector tools can be remembered using connector-aware keys. The connector id keeps approvals scoped to the right app connector.
 
-**Data flow**: Creates a Codex Apps invocation and matching metadata with connector ID `calendar`, then asserts both session and persistent key builders return a key containing server name, connector ID, and tool name.
+**Data flow**: It creates a Codex Apps invocation and connector metadata, builds the expected key, and verifies session and persistent key builders match it.
 
-**Call relations**: Covers the connector-aware key derivation branch used for remembered approvals on Codex Apps tools.
+**Call relations**: It uses approval_metadata and tests the Codex Apps path in approval-key creation.
 
 *Call graph*: calls 1 internal fn (approval_metadata); 1 external calls (assert_eq!).
 
@@ -7689,11 +7711,11 @@ fn codex_apps_connectors_support_persistent_approval()
 fn sanitize_mcp_tool_result_for_model_rewrites_image_content()
 ```
 
-**Purpose**: Ensures MCP tool results are rewritten before being shown to models that do not support image input.
+**Purpose**: Ensures image results are replaced with text when the model cannot accept images. This prevents sending unsupported content to the model.
 
-**Data flow**: Builds a successful `CallToolResult` containing one image content item and one text item, passes it through `sanitize_mcp_tool_result_for_model(false, ...)`, unwraps the success, and asserts the image item became a text placeholder while the text item remained unchanged.
+**Data flow**: It builds a result containing image and text content, sanitizes it with image support disabled, and checks the image became an explanatory text item while text stayed unchanged.
 
-**Call relations**: Tests the model-compatibility sanitization path for MCP results.
+**Call relations**: It directly tests the production result sanitizer.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -7704,11 +7726,11 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content()
 fn sanitize_mcp_tool_result_for_model_preserves_image_when_supported()
 ```
 
-**Purpose**: Checks that result sanitization is a no-op when the model supports image input.
+**Purpose**: Confirms image results are left untouched when the model supports image input. This avoids throwing away useful data unnecessarily.
 
-**Data flow**: Creates a `CallToolResult` with image content, structured content, error flag, and metadata, passes it through `sanitize_mcp_tool_result_for_model(true, Ok(original))`, and asserts the returned result equals the original struct.
+**Data flow**: It builds a result with image content, structured content, error status, and metadata, sanitizes with image support enabled, and expects the original result back.
 
-**Call relations**: Complements the previous test by covering the pass-through branch.
+**Call relations**: It covers the positive path of the production result sanitizer.
 
 *Call graph*: 3 external calls (assert_eq!, json!, vec!).
 
@@ -7719,11 +7741,11 @@ fn sanitize_mcp_tool_result_for_model_preserves_image_when_supported()
 fn truncate_mcp_tool_result_for_event_preserves_small_result()
 ```
 
-**Purpose**: Verifies that small successful MCP results are emitted into events unchanged.
+**Purpose**: Checks that small MCP results are not modified before being emitted as events. Normal-sized data should remain faithful.
 
-**Data flow**: Builds a compact `CallToolResult`, passes `&Ok(original.clone())` into `truncate_mcp_tool_result_for_event`, unwraps the success, and asserts exact equality with the original result.
+**Data flow**: It builds a compact successful result, passes it to the event truncator, and verifies the output equals the original.
 
-**Call relations**: Baseline test for event-result truncation logic.
+**Call relations**: It protects the no-truncation path in event-result formatting.
 
 *Call graph*: 3 external calls (assert_eq!, json!, vec!).
 
@@ -7734,11 +7756,11 @@ fn truncate_mcp_tool_result_for_event_preserves_small_result()
 fn truncate_mcp_tool_result_for_event_bounds_large_result()
 ```
 
-**Purpose**: Checks that oversized successful results are reduced to a bounded preview, with structured content and metadata dropped.
+**Purpose**: Ensures very large successful MCP results are reduced before event emission. This keeps event messages from becoming enormous.
 
-**Data flow**: Creates a huge `CallToolResult` with very large text, structured content, and meta fields, truncates it for event emission, serializes the truncated result to JSON, and asserts the serialized size stays under a bounded threshold, `structured_content` and `meta` are `None`, `is_error` is preserved, and the preview text contains a truncation marker.
+**Data flow**: It builds a result with huge text, structured content, and metadata, truncates it, serializes it, and checks it is bounded, drops extra fields, and includes a truncation marker.
 
-**Call relations**: Exercises the large-success branch of event truncation, including byte-budget enforcement.
+**Call relations**: It tests the production size guard for successful MCP tool-call events.
 
 *Call graph*: 5 external calls (assert!, assert_eq!, json!, to_string, vec!).
 
@@ -7749,11 +7771,11 @@ fn truncate_mcp_tool_result_for_event_bounds_large_result()
 fn truncate_mcp_tool_result_for_event_bounds_large_error()
 ```
 
-**Purpose**: Ensures oversized error strings are also truncated to a bounded size while remaining errors.
+**Purpose**: Ensures very large MCP error strings are also shortened. Error events need the same size protection as successful results.
 
-**Data flow**: Passes a huge `Err(String)` into `truncate_mcp_tool_result_for_event`, unwraps the resulting error string, and asserts its length is bounded and it contains a truncation marker.
+**Data flow**: It passes a huge error string to the event truncator and checks the returned error is bounded and marked as truncated.
 
-**Call relations**: Covers the large-error branch parallel to the large-success truncation test.
+**Call relations**: It covers the error branch of the production event truncation helper.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -7764,11 +7786,11 @@ fn truncate_mcp_tool_result_for_event_bounds_large_error()
 async fn mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server()
 ```
 
-**Purpose**: Verifies that custom MCP tool calls include the computed turn metadata header with model and reasoning effort.
+**Purpose**: Checks that custom MCP tool requests include current turn metadata. This lets servers know context such as model and reasoning effort.
 
-**Data flow**: Creates a turn context, computes the expected turn metadata via `turn_metadata_state.current_meta_value_for_mcp_request(mcp_turn_metadata_context(...))`, calls `build_mcp_tool_call_request_meta` for a custom server, extracts the header object, and asserts both individual fields and the full JSON object match expectations.
+**Data flow**: It creates a test turn, computes expected turn metadata, builds request metadata for a custom server, and compares the embedded values and full object.
 
-**Call relations**: Tests the base request-metadata path used for non-Codex-Apps servers.
+**Call relations**: It uses mcp_turn_metadata_context to verify the production request-meta builder.
 
 *Call graph*: calls 2 internal fn (mcp_turn_metadata_context, make_session_and_context); 1 external calls (assert_eq!).
 
@@ -7779,11 +7801,11 @@ async fn mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server()
 async fn mcp_tool_call_request_meta_includes_turn_started_at_unix_ms()
 ```
 
-**Purpose**: Checks that turn-start timestamps are propagated into MCP request metadata when present in turn metadata state.
+**Purpose**: Verifies that request metadata includes the turn start time when it is known. This timestamp can help servers and logs line up events.
 
-**Data flow**: Creates a turn context, sets `turn_started_at_unix_ms` on `turn_metadata_state`, builds request metadata for a custom server, extracts the turn metadata header, and asserts the timestamp field equals the injected millisecond value.
+**Data flow**: It sets a fixed turn-start time on the turn metadata state, builds MCP request metadata, and checks the timestamp is present.
 
-**Call relations**: Extends the custom-server metadata test to cover optional timing fields.
+**Call relations**: It directly tests the production metadata builder’s time-field behavior.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 1 external calls (assert_eq!).
 
@@ -7794,11 +7816,11 @@ async fn mcp_tool_call_request_meta_includes_turn_started_at_unix_ms()
 async fn plugin_mcp_tool_call_request_meta_includes_plugin_id()
 ```
 
-**Purpose**: Verifies that plugin-backed MCP tool calls include both turn metadata and the plugin ID in request metadata.
+**Purpose**: Checks that MCP requests from plugin-backed servers include the plugin id. This keeps downstream code aware of which plugin owns the server.
 
-**Data flow**: Creates a turn context, computes expected turn metadata, builds approval metadata with `plugin_id = Some("sample@test")`, calls `build_mcp_tool_call_request_meta`, and asserts the returned JSON contains both the turn metadata header and `MCP_TOOL_PLUGIN_ID_META_KEY`.
+**Data flow**: It creates metadata with a plugin id, builds request metadata, and verifies both turn metadata and plugin id are present.
 
-**Call relations**: Covers the plugin-specific metadata enrichment branch.
+**Call relations**: It combines approval_metadata, mcp_turn_metadata_context, and the production request-meta builder.
 
 *Call graph*: calls 3 internal fn (approval_metadata, mcp_turn_metadata_context, make_session_and_context); 1 external calls (assert_eq!).
 
@@ -7809,11 +7831,11 @@ async fn plugin_mcp_tool_call_request_meta_includes_plugin_id()
 async fn mcp_tool_call_item_includes_plugin_id()
 ```
 
-**Purpose**: Checks that the event emitted when an MCP tool call starts carries the plugin ID through to the `TurnItem::McpToolCall` payload.
+**Purpose**: Ensures the user-visible tool-call item records the plugin id when a plugin tool starts. This preserves plugin provenance in session events.
 
-**Data flow**: Creates a session/turn with an event receiver, calls `notify_mcp_tool_call_started` with `McpToolCallItemMetadata { plugin_id: Some("sample@test"), ... }`, waits for the next event with a timeout, pattern-matches it to `EventMsg::ItemStarted` and `TurnItem::McpToolCall`, and asserts `item.plugin_id` is set.
+**Data flow**: It starts a session with an event receiver, sends a tool-call-start notification with plugin metadata, receives the event, and checks the item contains the plugin id.
 
-**Call relations**: Exercises the event-notification path rather than request metadata, ensuring plugin provenance is visible in the transcript/event stream.
+**Call relations**: It exercises the production event notification path and inspects the emitted event.
 
 *Call graph*: calls 1 internal fn (make_session_and_context_with_rx); 4 external calls (assert_eq!, panic!, from_secs, timeout).
 
@@ -7824,11 +7846,11 @@ async fn mcp_tool_call_item_includes_plugin_id()
 async fn codex_apps_tool_call_request_meta_includes_turn_metadata_and_codex_apps_meta()
 ```
 
-**Purpose**: Verifies that Codex Apps requests include turn metadata plus a merged `_codex_apps` metadata object containing the call ID and existing connector/resource fields.
+**Purpose**: Checks that Codex Apps tool requests include both turn metadata and app-specific metadata. The app metadata includes the call id and connector details used by the app server.
 
-**Data flow**: Creates a turn context, computes expected turn metadata, builds `McpToolApprovalMetadata` with a populated `codex_apps_meta` object, calls `build_mcp_tool_call_request_meta` for `CODEX_APPS_MCP_SERVER_NAME`, and asserts the returned JSON contains the turn metadata header and `MCP_TOOL_CODEX_APPS_META_KEY` with merged `call_id`, `resource_uri`, `contains_mcp_source`, and `connector_id`.
+**Data flow**: It builds Codex Apps metadata with connector and resource values, builds request metadata, and compares it with the expected JSON object.
 
-**Call relations**: Covers the Codex Apps-specific request metadata branch when upstream metadata already exists.
+**Call relations**: It tests the Codex Apps branch of the production request-meta builder.
 
 *Call graph*: calls 2 internal fn (mcp_turn_metadata_context, make_session_and_context); 2 external calls (assert_eq!, json!).
 
@@ -7839,11 +7861,11 @@ async fn codex_apps_tool_call_request_meta_includes_turn_metadata_and_codex_apps
 async fn codex_apps_tool_call_request_meta_includes_call_id_without_existing_codex_apps_meta()
 ```
 
-**Purpose**: Checks that Codex Apps requests still include a `_codex_apps.call_id` object even when no existing Codex Apps metadata is available.
+**Purpose**: Verifies Codex Apps requests still include a call id even when no prior Codex Apps metadata exists. The call id is needed to correlate the tool call.
 
-**Data flow**: Creates a turn context, computes expected turn metadata, calls `build_mcp_tool_call_request_meta` for Codex Apps with `metadata=None`, and asserts the returned JSON contains the turn metadata header plus `_codex_apps: { call_id: ... }`.
+**Data flow**: It builds request metadata for Codex Apps without metadata and checks the output contains turn metadata plus a Codex Apps object with the call id.
 
-**Call relations**: Complements the previous test by covering the metadata-bootstrap branch.
+**Call relations**: It covers the fallback path of the production request-meta builder.
 
 *Call graph*: calls 2 internal fn (mcp_turn_metadata_context, make_session_and_context); 1 external calls (assert_eq!).
 
@@ -7854,11 +7876,11 @@ async fn codex_apps_tool_call_request_meta_includes_call_id_without_existing_cod
 fn codex_apps_auth_failure_result() -> CallToolResult
 ```
 
-**Purpose**: Builds a canonical `CallToolResult` representing a Codex Apps connector authentication failure. It packages the exact nested metadata shape consumed by auth-elicitation logic.
+**Purpose**: Builds a fake MCP result representing a Codex Apps connector authentication failure. Tests use it to simulate a tool response that requires reauthentication.
 
-**Data flow**: Returns a `CallToolResult` with one text content item, `is_error = Some(true)`, and `meta` containing `MCP_TOOL_CODEX_APPS_META_KEY.connector_auth_failure` fields such as `is_auth_failure`, `auth_reason`, connector identity, link ID, HTTP status, and action.
+**Data flow**: It returns a CallToolResult with error text and metadata describing an auth failure, connector id, connector name, link id, and error details.
 
-**Call relations**: Used by all Codex Apps auth-elicitation tests as the input result that may or may not trigger a follow-up elicitation request.
+**Call relations**: Authentication-elicitation tests call this helper before asking production code whether to prompt the user.
 
 *Call graph*: called by 5 (codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result, codex_apps_auth_elicitation_feature_disabled_returns_original_result, codex_apps_auth_elicitation_feature_enabled_requests_elicitation, codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result, codex_apps_auth_elicitation_non_host_owned_server_returns_original_result); 2 external calls (json!, vec!).
 
@@ -7869,11 +7891,11 @@ fn codex_apps_auth_failure_result() -> CallToolResult
 fn codex_apps_auth_failure_metadata() -> McpToolApprovalMetadata
 ```
 
-**Purpose**: Builds matching approval metadata for the synthetic Codex Apps auth-failure scenarios.
+**Purpose**: Builds trusted approval metadata for the fake auth-failing connector. It supplies the human-friendly connector name used in user messages.
 
-**Data flow**: Delegates to `approval_metadata` with connector ID `connector_calendar`, connector name `Google Calendar`, and descriptive tool text, returning the resulting `McpToolApprovalMetadata`.
+**Data flow**: It delegates to approval_metadata with connector and tool labels and returns the resulting metadata object.
 
-**Call relations**: Paired with `codex_apps_auth_failure_result` in auth-elicitation tests so the production code has connector metadata available.
+**Call relations**: Authentication-elicitation tests pair this metadata with codex_apps_auth_failure_result.
 
 *Call graph*: calls 1 internal fn (approval_metadata); called by 5 (codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result, codex_apps_auth_elicitation_feature_disabled_returns_original_result, codex_apps_auth_elicitation_feature_enabled_requests_elicitation, codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result, codex_apps_auth_elicitation_non_host_owned_server_returns_original_result).
 
@@ -7884,11 +7906,11 @@ fn codex_apps_auth_failure_metadata() -> McpToolApprovalMetadata
 async fn install_host_owned_codex_apps_manager(session: &Session, turn_context: &TurnContext)
 ```
 
-**Purpose**: Installs a real `codex_mcp::McpConnectionManager` configured as host-owned Codex Apps support for the current session. This enables auth-elicitation code paths that depend on manager state.
+**Purpose**: Installs a test MCP connection manager configured as host-owned for Codex Apps. Host-owned means Codex itself owns the app server connection and can issue special auth prompts.
 
-**Data flow**: Reads auth from `session.services.auth_manager`, constructs `McpConnectionManager::new` with empty server maps, approval policy, turn ID, event sender, cancellation token, permission profile, runtime context, `codex_home`, a Codex Apps cache key derived from auth, `host_owned_codex_apps_enabled = true`, MCP naming/elici­tation settings, and auth references; then stores the resulting manager into `session.services.mcp_connection_manager`.
+**Data flow**: It reads auth from the session, constructs an McpConnectionManager with test runtime context and host-owned Codex Apps enabled, and stores it on the session services.
 
-**Call relations**: Called by auth-elicitation tests that need the production code to recognize Codex Apps as host-owned and therefore eligible for auth recovery prompts.
+**Call relations**: Auth-elicitation tests call this setup helper when they need production code to treat Codex Apps as host-owned.
 
 *Call graph*: calls 3 internal fn (new, new, permission_profile); called by 4 (codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result, codex_apps_auth_elicitation_feature_disabled_returns_original_result, codex_apps_auth_elicitation_feature_enabled_requests_elicitation, codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result); 7 external calls (new, new, new, default, codex_apps_tools_cache_key, get_tx_event, default).
 
@@ -7899,11 +7921,11 @@ async fn install_host_owned_codex_apps_manager(session: &Session, turn_context: 
 async fn codex_apps_auth_elicitation_feature_disabled_returns_original_result()
 ```
 
-**Purpose**: Verifies that auth-elicitation is skipped entirely when the feature flag is disabled, even if the session has a host-owned Codex Apps manager and the tool result indicates auth failure.
+**Purpose**: Checks that auth elicitation does nothing when the feature flag is off. A feature flag is a switch used to enable or disable behavior.
 
-**Data flow**: Creates a session/turn with event receiver, installs the host-owned manager, builds the auth-failure result and metadata, calls `maybe_request_codex_apps_auth_elicitation`, and asserts the returned result equals the original and no event was emitted.
+**Data flow**: It installs a host-owned manager, builds an auth-failure result, calls the auth-elicitation helper, and verifies the original result is returned and no event is sent.
 
-**Call relations**: Covers the earliest feature-gate exit in the auth-elicitation flow.
+**Call relations**: It uses the auth-failure and manager helpers to test the disabled-feature path.
 
 *Call graph*: calls 4 internal fn (codex_apps_auth_failure_metadata, codex_apps_auth_failure_result, install_host_owned_codex_apps_manager, make_session_and_context_with_rx); 2 external calls (assert!, assert_eq!).
 
@@ -7914,11 +7936,11 @@ async fn codex_apps_auth_elicitation_feature_disabled_returns_original_result()
 async fn codex_apps_auth_elicitation_non_host_owned_server_returns_original_result()
 ```
 
-**Purpose**: Checks that enabling the feature alone is insufficient; auth elicitation is skipped when the session is not configured with a host-owned Codex Apps manager.
+**Purpose**: Checks that auth elicitation is skipped unless the Codex Apps server is host-owned. This prevents special auth behavior for ordinary servers.
 
-**Data flow**: Creates a session/turn with receiver, enables `Feature::AuthElicitation` in `turn_context.features`, builds the auth-failure result and metadata, calls `maybe_request_codex_apps_auth_elicitation`, and asserts the original result is returned with no emitted event.
+**Data flow**: It enables the feature but does not install a host-owned manager, calls production auth-elicitation logic, and verifies no prompt is emitted and the result is unchanged.
 
-**Call relations**: Covers the host-owned-server precondition branch.
+**Call relations**: It tests one guard condition before auth prompts are allowed.
 
 *Call graph*: calls 5 internal fn (from, codex_apps_auth_failure_metadata, codex_apps_auth_failure_result, make_session_and_context_with_rx, with_defaults); 3 external calls (get_mut, assert!, assert_eq!).
 
@@ -7929,11 +7951,11 @@ async fn codex_apps_auth_elicitation_non_host_owned_server_returns_original_resu
 async fn codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result()
 ```
 
-**Purpose**: Verifies that auth elicitation is suppressed when approval policy is `AskForApproval::Never`, even with feature flag and host-owned manager enabled.
+**Purpose**: Checks that auth elicitation respects the approval policy when prompts are disallowed. If the policy says never ask, the original result stays unchanged.
 
-**Data flow**: Creates a session/turn with receiver, installs the host-owned manager, enables `Feature::AuthElicitation`, mutates `approval_policy` to `Never`, invokes `maybe_request_codex_apps_auth_elicitation`, and asserts the original result is returned and no event is queued.
+**Data flow**: It enables the feature, installs a host-owned manager, sets approval policy to Never, calls the helper, and verifies no event and no result change.
 
-**Call relations**: Tests policy-based gating in the auth-elicitation path.
+**Call relations**: It tests the policy gate in production auth-elicitation behavior.
 
 *Call graph*: calls 6 internal fn (from, codex_apps_auth_failure_metadata, codex_apps_auth_failure_result, install_host_owned_codex_apps_manager, make_session_and_context_with_rx, with_defaults); 3 external calls (get_mut, assert!, assert_eq!).
 
@@ -7944,11 +7966,11 @@ async fn codex_apps_auth_elicitation_disallowed_by_policy_returns_original_resul
 async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result()
 ```
 
-**Purpose**: Checks that granular approval policy disables auth elicitation when `mcp_elicitations` is false.
+**Purpose**: Checks that granular approval settings can specifically disable MCP elicitations. Granular means different prompt types can be allowed or blocked separately.
 
-**Data flow**: Creates a session/turn with receiver, installs the host-owned manager, enables `Feature::AuthElicitation`, sets `approval_policy` to a `GranularApprovalConfig` with `mcp_elicitations=false`, invokes `maybe_request_codex_apps_auth_elicitation`, and asserts the original result is returned with no event.
+**Data flow**: It enables the feature, installs a host-owned manager, configures granular approvals with MCP elicitations disabled, calls the helper, and expects the original result with no event.
 
-**Call relations**: Covers the granular-policy branch distinct from the blanket `Never` policy.
+**Call relations**: It covers the granular-policy branch of production auth-elicitation logic.
 
 *Call graph*: calls 6 internal fn (from, codex_apps_auth_failure_metadata, codex_apps_auth_failure_result, install_host_owned_codex_apps_manager, make_session_and_context_with_rx, with_defaults); 4 external calls (get_mut, Granular, assert!, assert_eq!).
 
@@ -7959,11 +7981,11 @@ async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_resu
 async fn codex_apps_auth_elicitation_feature_enabled_requests_elicitation()
 ```
 
-**Purpose**: End-to-end test proving that a host-owned Codex Apps auth failure triggers an elicitation request when the feature and policy allow it, and that accepting the elicitation rewrites the tool result into a retry instruction.
+**Purpose**: Verifies the full auth-elicitation path when all gates allow it. The user should receive a URL-style prompt, and accepting it should change the tool result into a retry message.
 
-**Data flow**: Creates a session/turn with receiver, installs the host-owned manager, marks an active turn, enables `Feature::AuthElicitation`, spawns `maybe_request_codex_apps_auth_elicitation` in a task, loops on received events until it finds `EventMsg::ElicitationRequest`, asserts the request server name, request ID, and URL request shape, resolves the elicitation through `session.resolve_elicitation(...)` with `ElicitationAction::Accept`, awaits the task, and asserts the returned `CallToolResult.content` contains the acceptance/retry message for Google Calendar.
+**Data flow**: It enables the feature, installs a host-owned manager, starts an active turn, calls auth-elicitation in a task, waits for an elicitation event, resolves it as accepted, and checks the returned result tells the model to retry.
 
-**Call relations**: This is the positive-path integration test for auth elicitation, covering event emission, request identity, response resolution, and final result rewriting.
+**Call relations**: It is the positive counterpart to the auth-elicitation guard tests and exercises event sending plus response handling.
 
 *Call graph*: calls 7 internal fn (from, codex_apps_auth_failure_metadata, codex_apps_auth_failure_result, install_host_owned_codex_apps_manager, make_session_and_context_with_rx, default, with_defaults); 8 external calls (clone, get_mut, String, assert!, assert_eq!, from_secs, spawn, timeout).
 
@@ -7974,11 +7996,11 @@ async fn codex_apps_auth_elicitation_feature_enabled_requests_elicitation()
 fn mcp_tool_call_thread_id_meta_is_added_to_request_meta()
 ```
 
-**Purpose**: Verifies that helper logic injects or overwrites `threadId` in request metadata objects while leaving non-object metadata untouched.
+**Purpose**: Checks that a live thread id is inserted into MCP request metadata. If a stale thread id exists, it should be replaced.
 
-**Data flow**: Calls `with_mcp_tool_call_thread_id_meta` with an object containing a stale `threadId`, with `None`, and with a non-object JSON string, asserting respectively that the thread ID is replaced, a new object is created, and invalid metadata is returned unchanged.
+**Data flow**: It tries metadata with an old thread id, no metadata, and invalid non-object metadata, then verifies object metadata gets the live thread id while invalid metadata is preserved.
 
-**Call relations**: Standalone unit test for request-meta augmentation used before MCP dispatch.
+**Call relations**: It directly tests the production helper that adds thread identity to outgoing MCP metadata.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7989,11 +8011,11 @@ fn mcp_tool_call_thread_id_meta_is_added_to_request_meta()
 fn accepted_elicitation_content_converts_to_request_user_input_response()
 ```
 
-**Purpose**: Checks conversion from accepted elicitation JSON content into the synthetic `RequestUserInputResponse` shape used by shared approval parsing code.
+**Purpose**: Checks that accepted elicitation content can be converted into the older request-user-input response shape. This keeps two approval-response paths compatible.
 
-**Data flow**: Passes JSON content `{ "approval": MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER }` into `request_user_input_response_from_elicitation_content` and asserts it returns a `RequestUserInputResponse` whose `answers` map contains the expected single answer vector.
+**Data flow**: It supplies JSON content containing an approval choice and verifies the converted response has the same choice under the expected answer key.
 
-**Call relations**: Covers the bridge between MCP elicitation responses and the generic request-user-input approval parser.
+**Call relations**: It tests the adapter used when MCP elicitation responses need to feed existing approval parsing.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -8004,11 +8026,11 @@ fn accepted_elicitation_content_converts_to_request_user_input_response()
 fn approval_elicitation_meta_marks_tool_approvals()
 ```
 
-**Purpose**: Verifies the minimal approval elicitation metadata object contains the MCP tool approval kind marker.
+**Purpose**: Verifies that approval elicitation metadata always marks the request as an MCP tool-call approval. This lets clients know what kind of prompt they are showing.
 
-**Data flow**: Calls `build_mcp_tool_approval_elicitation_meta` for a custom server with no metadata, params, or persistence options, and asserts the returned JSON is `{ MCP_TOOL_APPROVAL_KIND_KEY: MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL }`.
+**Data flow**: It builds approval metadata with no connector or tool parameters and checks the output contains the approval kind marker.
 
-**Call relations**: Baseline test for elicitation metadata generation.
+**Call relations**: It directly tests the production metadata builder for the simplest case.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8019,11 +8041,11 @@ fn approval_elicitation_meta_marks_tool_approvals()
 fn approval_elicitation_meta_merges_session_and_always_persist_for_custom_servers()
 ```
 
-**Purpose**: Checks that custom-server approval elicitation metadata includes persistence options, tool title/description, and raw tool params.
+**Purpose**: Checks that custom-server approval metadata includes both remember scopes when both are allowed. It also verifies tool title, description, and parameters are copied.
 
-**Data flow**: Builds metadata with tool title and description plus JSON params `{ id: 1 }`, calls `build_mcp_tool_approval_elicitation_meta` with both remember flags enabled, and asserts the returned JSON contains the kind marker, both persistence values, tool descriptive fields, and `MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY`.
+**Data flow**: It builds metadata and parameters for a custom server, enables both remember options, and compares the produced JSON with the expected object.
 
-**Call relations**: Covers the richer custom-server metadata branch used when approval choices can be remembered.
+**Call relations**: It exercises the generic-server branch of the production approval-elicitation metadata builder.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8034,11 +8056,11 @@ fn approval_elicitation_meta_merges_session_and_always_persist_for_custom_server
 fn guardian_mcp_review_request_includes_invocation_metadata()
 ```
 
-**Purpose**: Verifies that guardian review requests for MCP tool calls include invocation arguments and connector/tool descriptive metadata.
+**Purpose**: Verifies that a Guardian review request includes the MCP invocation and connector/tool metadata. Guardian is an automated reviewer that can approve or deny risky actions.
 
-**Data flow**: Creates a Codex Apps `McpInvocation` with URL arguments and approval metadata for the Playwright connector, calls `build_guardian_mcp_tool_review_request`, and asserts deep equality with the expected `GuardianApprovalRequest::McpToolCall` including IDs, arguments, connector fields, tool fields, and `annotations: None`.
+**Data flow**: It builds an invocation with arguments and metadata, asks production code to build a Guardian request, and checks every expected field is present.
 
-**Call relations**: Tests the request-shaping path used when MCP approvals are delegated to guardian review.
+**Call relations**: It tests the request shape sent to Guardian before an MCP tool call is reviewed.
 
 *Call graph*: calls 1 internal fn (approval_metadata); 2 external calls (assert_eq!, json!).
 
@@ -8049,11 +8071,11 @@ fn guardian_mcp_review_request_includes_invocation_metadata()
 fn guardian_mcp_review_request_includes_annotations_when_present()
 ```
 
-**Purpose**: Checks that guardian review requests translate MCP tool annotations into `GuardianMcpAnnotations` when metadata includes them.
+**Purpose**: Checks that Guardian review requests include MCP safety annotations when available. This helps Guardian judge risk using read-only, destructive, and open-world hints.
 
-**Data flow**: Creates a custom-server invocation and metadata containing `ToolAnnotations`, builds the guardian review request, and asserts the resulting `GuardianApprovalRequest::McpToolCall` includes `annotations` with the expected destructive, open-world, and read-only hints.
+**Data flow**: It builds metadata containing annotations, creates a Guardian request, and compares it with the expected annotated request.
 
-**Call relations**: Complements the previous guardian request test by covering annotation propagation.
+**Call relations**: It uses the annotations helper and exercises the annotation-mapping branch of the Guardian request builder.
 
 *Call graph*: calls 1 internal fn (annotations); 1 external calls (assert_eq!).
 
@@ -8064,11 +8086,11 @@ fn guardian_mcp_review_request_includes_annotations_when_present()
 async fn guardian_review_decision_maps_to_mcp_tool_decision()
 ```
 
-**Purpose**: Verifies how guardian review outcomes are converted into MCP approval decisions, including rationale lookup for denials and timeout wording.
+**Purpose**: Checks how Guardian decisions become MCP approval decisions. Approved becomes accept, while denied or timed out becomes a decline with the right message.
 
-**Data flow**: Creates a session, calls `mcp_tool_approval_decision_from_guardian` for `Approved` and asserts `Accept`; inserts a `GuardianRejection` with rationale into `session.services.guardian_rejections`, calls the mapper for `Denied` and pattern-matches a decline message containing the rationale and anti-circumvention warning; calls it again for `TimedOut` and asserts the timeout message wording; finally asserts `Abort` maps to `Decline { message: None }`.
+**Data flow**: It creates a session, maps approved, denied, timed-out, and abort decisions, stores a rejection rationale for the denied case, and checks the resulting approval decisions.
 
-**Call relations**: Unit test for the final translation layer after guardian review completes.
+**Call relations**: It directly tests the bridge between Guardian review results and MCP approval flow.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 4 external calls (new, assert!, assert_eq!, panic!).
 
@@ -8079,11 +8101,11 @@ async fn guardian_review_decision_maps_to_mcp_tool_decision()
 fn approval_elicitation_meta_includes_connector_source_for_codex_apps()
 ```
 
-**Purpose**: Checks that Codex Apps approval elicitation metadata marks the source as a connector and includes connector descriptive fields.
+**Purpose**: Verifies that Codex Apps approval metadata identifies connector-based requests. This lets clients show connector name, description, and tool details.
 
-**Data flow**: Builds connector metadata and tool params for the `calendar` connector, calls `build_mcp_tool_approval_elicitation_meta` with no remember flags, and asserts the returned JSON contains the kind marker, connector source marker, connector ID/name/description, tool title/description, and raw params.
+**Data flow**: It builds Codex Apps connector metadata and tool parameters, generates approval metadata, and checks connector source fields are present.
 
-**Call relations**: Covers the Codex Apps-specific metadata branch distinct from custom servers.
+**Call relations**: It exercises the Codex Apps connector branch of the approval-elicitation metadata builder.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8094,11 +8116,11 @@ fn approval_elicitation_meta_includes_connector_source_for_codex_apps()
 fn approval_elicitation_meta_merges_session_and_always_persist_with_connector_source()
 ```
 
-**Purpose**: Verifies that Codex Apps elicitation metadata can combine connector-source fields with both session and persistent remember options.
+**Purpose**: Checks that Codex Apps connector metadata includes both remember choices when allowed. It combines connector identity with session and permanent persistence markers.
 
-**Data flow**: Builds the same connector metadata and params as the previous test but enables both remember flags, then asserts the returned JSON includes the persistence array alongside the connector and tool fields.
+**Data flow**: It builds connector metadata and parameters, enables both remember options, and verifies the produced JSON includes all connector and persistence fields.
 
-**Call relations**: Complements the previous test by covering the remembered-approval variant.
+**Call relations**: It extends the connector metadata test to cover the remember-options branch.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8109,11 +8131,11 @@ fn approval_elicitation_meta_merges_session_and_always_persist_with_connector_so
 fn declined_elicitation_response_stays_decline()
 ```
 
-**Purpose**: Ensures an explicit elicitation decline remains a decline even if the content payload contains an accept label.
+**Purpose**: Ensures a declined elicitation action remains a decline even if its content says accept. The explicit user action must win over conflicting content.
 
-**Data flow**: Builds an `ElicitationResponse` with `action = Decline` and content `{ approval: ACCEPT }`, passes it to `parse_mcp_tool_approval_elicitation_response`, and asserts the result is `McpToolApprovalDecision::Decline { message: None }`.
+**Data flow**: It builds an elicitation response with Decline action and accept-like content, parses it, and expects a decline decision.
 
-**Call relations**: Tests precedence rules in elicitation response parsing.
+**Call relations**: It tests the production parser’s priority rules for elicitation responses.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -8124,11 +8146,11 @@ fn declined_elicitation_response_stays_decline()
 fn synthetic_decline_request_user_input_response_stays_decline()
 ```
 
-**Purpose**: Checks that the synthetic decline sentinel in a generic request-user-input response maps to a decline decision.
+**Purpose**: Checks that a synthetic decline value in a request-user-input response parses as a decline. This supports internal cancellation paths.
 
-**Data flow**: Constructs a `RequestUserInputResponse` whose `approval` answer vector contains `MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC`, passes it to `parse_mcp_tool_approval_response`, and asserts the result is `Decline { message: None }`.
+**Data flow**: It builds a response containing the synthetic decline token, parses it, and verifies the decision is decline with no message.
 
-**Call relations**: Covers the generic approval-response parser used for non-MCP elicitation flows.
+**Call relations**: It directly tests the legacy approval-response parser.
 
 *Call graph*: 3 external calls (from, assert_eq!, vec!).
 
@@ -8139,11 +8161,11 @@ fn synthetic_decline_request_user_input_response_stays_decline()
 fn accepted_elicitation_response_uses_always_persist_meta()
 ```
 
-**Purpose**: Verifies that accepted elicitation responses can encode persistent remember via response metadata alone.
+**Purpose**: Verifies that accepted elicitation responses can request permanent remembering through metadata. This turns a plain accept action into AcceptAndRemember.
 
-**Data flow**: Builds an `ElicitationResponse` with `action = Accept`, no content, and meta `{ MCP_TOOL_APPROVAL_PERSIST_KEY: MCP_TOOL_APPROVAL_PERSIST_ALWAYS }`, parses it, and asserts the decision is `AcceptAndRemember`.
+**Data flow**: It builds an accepted elicitation response with persist-always metadata, parses it, and expects AcceptAndRemember.
 
-**Call relations**: Tests one accepted-response parsing branch keyed off response metadata.
+**Call relations**: It tests the production parser’s handling of persistence metadata.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -8154,11 +8176,11 @@ fn accepted_elicitation_response_uses_always_persist_meta()
 fn accepted_elicitation_response_uses_session_persist_meta()
 ```
 
-**Purpose**: Verifies that accepted elicitation responses can encode session-scoped remember via response metadata.
+**Purpose**: Verifies that accepted elicitation responses can request session-only remembering through metadata. This turns a plain accept action into AcceptForSession.
 
-**Data flow**: Builds an accepted `ElicitationResponse` with meta `{ MCP_TOOL_APPROVAL_PERSIST_KEY: MCP_TOOL_APPROVAL_PERSIST_SESSION }`, parses it, and asserts the decision is `AcceptForSession`.
+**Data flow**: It builds an accepted elicitation response with persist-session metadata, parses it, and expects AcceptForSession.
 
-**Call relations**: Parallel to the persistent-remember parsing test.
+**Call relations**: It covers the session-persistence branch of the elicitation-response parser.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -8169,11 +8191,11 @@ fn accepted_elicitation_response_uses_session_persist_meta()
 fn accepted_elicitation_without_content_defaults_to_accept()
 ```
 
-**Purpose**: Checks the default accepted-response behavior when no content or persistence metadata is present.
+**Purpose**: Checks that an accepted elicitation with no content or metadata becomes a simple accept. This is the safe default for positive responses.
 
-**Data flow**: Builds an accepted `ElicitationResponse` with `content=None` and `meta=None`, parses it, and asserts the decision is plain `Accept`.
+**Data flow**: It parses an accepted response with no content and no metadata and verifies the result is Accept.
 
-**Call relations**: Covers the fallback branch of accepted elicitation parsing.
+**Call relations**: It covers the default accept path in the production elicitation parser.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8184,11 +8206,11 @@ fn accepted_elicitation_without_content_defaults_to_accept()
 async fn persist_codex_app_tool_approval_writes_tool_override()
 ```
 
-**Purpose**: Verifies that persisting approval for a Codex App tool writes the expected `[apps.<connector>.tools.<tool>]` override into `config.toml`.
+**Purpose**: Checks that permanently approving a Codex App tool writes the correct app-tool override to config.toml. This is how “always allow” survives future sessions.
 
-**Data flow**: Creates a temp codex home, builds a `Config`, calls `persist_codex_app_tool_approval(&config, "calendar", "calendar/list_events")`, reads and parses the resulting `CONFIG_TOML_FILE` as `ConfigToml`, and asserts the `apps` section contains an enabled `calendar` app with a tool override whose `approval_mode` is `Approve`. It also checks the raw TOML contains the expected table header.
+**Data flow**: It creates a temporary config, persists approval for a calendar tool, reads the TOML file back, parses it, and checks the app tool approval mode is Approve.
 
-**Call relations**: Tests the file-writing persistence helper for Codex Apps approvals.
+**Call relations**: It directly tests the production config-writing function for Codex Apps.
 
 *Call graph*: 6 external calls (assert!, assert_eq!, default, read_to_string, tempdir, from_str).
 
@@ -8199,11 +8221,11 @@ async fn persist_codex_app_tool_approval_writes_tool_override()
 async fn persist_custom_mcp_tool_approval_writes_tool_override()
 ```
 
-**Purpose**: Checks that persisting approval for a custom MCP server writes the expected tool override under `[mcp_servers.<server>.tools.<tool>]`.
+**Purpose**: Checks that permanently approving a custom MCP tool writes the correct server-tool override to config.toml.
 
-**Data flow**: Seeds a temp `config.toml` with `[mcp_servers.docs]`, builds a `Config`, calls `persist_custom_mcp_tool_approval(&config, "docs", "search")`, reads and parses the file, extracts `docs/search`, and asserts it equals `McpServerToolConfig { approval_mode: Some(AppToolApproval::Approve) }`. It also checks the raw TOML table header.
+**Data flow**: It seeds a temporary MCP server config, persists approval for one tool, reads and parses the file, and verifies the server tool has approval mode Approve.
 
-**Call relations**: Parallel to the Codex Apps persistence test, but for custom MCP server config.
+**Call relations**: It tests the custom-server config writer used by persistent approvals.
 
 *Call graph*: 7 external calls (assert!, assert_eq!, default, read_to_string, write, tempdir, from_str).
 
@@ -8214,11 +8236,11 @@ async fn persist_custom_mcp_tool_approval_writes_tool_override()
 async fn custom_mcp_tool_approval_mode_uses_server_default_with_tool_override()
 ```
 
-**Purpose**: Verifies resolution of custom MCP tool approval mode from server defaults and per-tool overrides in config.
+**Purpose**: Verifies custom MCP approval mode lookup uses a server default unless a specific tool override exists. Unknown servers fall back to Auto.
 
-**Data flow**: Seeds a temp config with `mcp_servers.docs.default_tools_approval_mode = "approve"` and a `search` tool override of `prompt`, builds config, injects it into a synthetic turn context, then calls `custom_mcp_tool_approval_mode` for `docs/read`, `docs/search`, and `unknown/search`, asserting `Approve`, `Prompt`, and `Auto` respectively.
+**Data flow**: It writes config with a default mode and one tool override, loads it into a turn context, and checks lookup results for a normal tool, overridden tool, and unknown server.
 
-**Call relations**: Tests config lookup precedence for custom MCP approval mode resolution.
+**Call relations**: It tests the production approval-mode resolver for plain custom MCP servers.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 5 external calls (new, assert_eq!, default, write, tempdir).
 
@@ -8229,11 +8251,11 @@ async fn custom_mcp_tool_approval_mode_uses_server_default_with_tool_override()
 async fn custom_mcp_tool_approval_mode_uses_plugin_mcp_policy()
 ```
 
-**Purpose**: Checks that plugin-scoped MCP server policy is consulted when resolving approval mode for plugin-provided servers.
+**Purpose**: Checks that plugin-provided MCP servers use approval policies from plugin config. Plugin defaults and tool overrides should both apply.
 
-**Data flow**: Creates a synthetic plugin on disk, seeds config enabling plugins and defining plugin MCP approval policy with a server default of `prompt` and a `search` override of `approve`, rebuilds config, clears the plugin manager cache, and asserts `custom_mcp_tool_approval_mode` returns `Prompt` for `read` and `Approve` for `search` on server `sample`.
+**Data flow**: It creates a sample plugin, writes plugin config with a default and one tool override, reloads config, clears plugin cache, and checks approval-mode lookup results.
 
-**Call relations**: Exercises the plugin-aware branch of approval-mode resolution.
+**Call relations**: It uses write_sample_plugin_mcp and tests plugin-aware approval-mode resolution.
 
 *Call graph*: calls 2 internal fn (write_sample_plugin_mcp, make_session_and_context); 4 external calls (new, assert_eq!, default, write).
 
@@ -8244,11 +8266,11 @@ async fn custom_mcp_tool_approval_mode_uses_plugin_mcp_policy()
 async fn custom_mcp_tool_approval_mode_uses_updated_plugin_mcp_policy_after_cache_warm()
 ```
 
-**Purpose**: Verifies that plugin MCP approval policy reflects updated config even after the plugin cache has already been warmed.
+**Purpose**: Ensures plugin MCP approval lookup sees updated config even after the plugin cache has been warmed. This prevents stale approval rules.
 
-**Data flow**: Creates a plugin and initial config enabling it, loads initial config and warms `plugins_manager.plugins_for_config(...)`, rewrites `config.toml` to add a `search` approval override, rebuilds config, injects it into the turn context, and asserts `custom_mcp_tool_approval_mode` now returns `Approve` for `sample/search`.
+**Data flow**: It creates a plugin, loads initial config to warm the cache, rewrites config with a tool approval override, reloads config, and verifies the new override is used.
 
-**Call relations**: Regression test against stale plugin-cache behavior during policy lookup.
+**Call relations**: It tests the interaction between plugin caching and approval-mode lookup.
 
 *Call graph*: calls 2 internal fn (write_sample_plugin_mcp, make_session_and_context); 4 external calls (new, assert_eq!, default, write).
 
@@ -8259,11 +8281,11 @@ async fn custom_mcp_tool_approval_mode_uses_updated_plugin_mcp_policy_after_cach
 async fn maybe_persist_mcp_tool_approval_reloads_session_config()
 ```
 
-**Purpose**: Checks that persisting a remembered Codex Apps approval updates on-disk config and reloads the session’s effective config immediately.
+**Purpose**: Checks that persisting a Codex Apps approval also reloads the session config. The running session should immediately know the approval is remembered.
 
-**Data flow**: Creates a session/turn, ensures `codex_home` exists, builds an `McpToolApprovalKey` for `calendar/list_events`, calls `maybe_persist_mcp_tool_approval`, then fetches `session.get_config()`, extracts the effective `apps` table, deserializes it into `AppsConfigToml`, and asserts the tool override exists with `approval_mode = Approve`. It also asserts `mcp_tool_approval_is_remembered` returns `true`.
+**Data flow**: It creates a session, persists a connector tool approval key, reads the session’s reloaded config, verifies the tool override exists, and checks the approval is remembered.
 
-**Call relations**: End-to-end persistence test covering both file mutation and in-memory session config refresh.
+**Call relations**: It exercises the higher-level persistence flow rather than just the file writer.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); 3 external calls (assert_eq!, deserialize, create_dir_all).
 
@@ -8274,11 +8296,11 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config()
 async fn maybe_persist_mcp_tool_approval_reloads_session_config_for_custom_server()
 ```
 
-**Purpose**: Verifies the same reload behavior for remembered approvals on custom MCP servers.
+**Purpose**: Checks the same persistence-and-reload behavior for a custom MCP server. The remembered approval should be visible in the active session.
 
-**Data flow**: Creates a session/turn, seeds `config.toml` with `[mcp_servers.docs]`, builds config without managed config, injects it into the turn context, constructs a `docs/search` approval key, calls `maybe_persist_mcp_tool_approval`, then reads `session.get_config()`, extracts and deserializes the effective `mcp_servers` table, and asserts the `search` tool override exists with `approval_mode = Approve`. It also checks remembered state.
+**Data flow**: It seeds custom MCP config, loads it into the turn context, persists a tool approval key, then verifies the session config contains the new server-tool override and remembers the key.
 
-**Call relations**: Parallel to the previous test for the custom-server persistence path.
+**Call relations**: It tests the custom-server path through the high-level persistence helper.
 
 *Call graph*: calls 2 internal fn (without_managed_config_for_tests, make_session_and_context); 5 external calls (new, deserialize, assert_eq!, create_dir_all, write).
 
@@ -8289,11 +8311,11 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config_for_custom_serve
 async fn maybe_persist_mcp_tool_approval_writes_plugin_mcp_policy()
 ```
 
-**Purpose**: Checks that remembered approvals for plugin-provided MCP servers are written into the plugin section of `config.toml` and reflected in remembered state.
+**Purpose**: Checks that persisting approval for a plugin MCP tool writes the policy under that plugin’s config section. This keeps plugin approvals scoped correctly.
 
-**Data flow**: Creates a plugin on disk, seeds config enabling it, rebuilds config, clears plugin cache, constructs a `sample/search` approval key, calls `maybe_persist_mcp_tool_approval`, reads and parses `config.toml`, extracts the plugin MCP server tool config, and asserts `approval_mode = Approve`, the raw TOML contains the plugin-scoped table header, and `mcp_tool_approval_is_remembered` is `true`.
+**Data flow**: It creates a sample plugin and config, persists approval for a plugin tool, reads config.toml, verifies the plugin tool override exists, and checks the session remembers it.
 
-**Call relations**: Covers the plugin-specific persistence branch.
+**Call relations**: It combines plugin setup with the high-level approval persistence flow.
 
 *Call graph*: calls 2 internal fn (write_sample_plugin_mcp, make_session_and_context); 7 external calls (new, assert!, assert_eq!, default, read_to_string, write, from_str).
 
@@ -8304,11 +8326,11 @@ async fn maybe_persist_mcp_tool_approval_writes_plugin_mcp_policy()
 async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_server()
 ```
 
-**Purpose**: Verifies that remembered approvals for project-scoped MCP servers are written into the trusted project’s `.codex/config.toml` rather than global config.
+**Purpose**: Verifies that approvals for project-defined MCP servers are written to the project’s config file, not the global one. This keeps project-specific trust local to the project.
 
-**Data flow**: Creates a session/turn, a temporary project directory with `.git` and `.codex/config.toml`, marks the project trusted via `ConfigEditsBuilder`, builds config with that project as fallback cwd, injects it into the turn context, constructs a `docs/search` approval key, calls `maybe_persist_mcp_tool_approval`, then reads and parses the project-local config file and asserts the tool override exists with `approval_mode = Approve`. It also checks the raw table header and remembered state.
+**Data flow**: It creates a fake trusted project with its own .codex config, loads config from that project, persists a tool approval, reads the project config, and checks the override and remembered state.
 
-**Call relations**: Tests config-target selection logic for project-local persistence.
+**Call relations**: It tests config-layer selection inside the high-level persistence helper.
 
 *Call graph*: calls 2 internal fn (new, make_session_and_context); 9 external calls (new, assert!, assert_eq!, default, create_dir_all, read_to_string, write, tempdir, from_str).
 
@@ -8319,11 +8341,11 @@ async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_serve
 async fn approve_mode_skips_when_annotations_do_not_require_approval()
 ```
 
-**Purpose**: Checks that `AppToolApproval::Approve` does not force an approval interaction for clearly safe read-only tools.
+**Purpose**: Checks that Approve mode does not prompt for a tool whose annotations show it is safe. Approve mode should only intervene when approval is actually required.
 
-**Data flow**: Creates a session and turn, wraps them in `Arc`, builds a read-only custom-server invocation and metadata, calls `maybe_request_mcp_tool_approval` with `AppToolApproval::Approve`, and asserts the returned decision is `None`.
+**Data flow**: It creates a read-only invocation and metadata, calls the production approval request helper in Approve mode, and expects no decision because no prompt was needed.
 
-**Call relations**: Covers the optimization where safe tools bypass approval even under approve mode.
+**Call relations**: It tests approval skipping based on annotations.
 
 *Call graph*: calls 3 internal fn (annotations, make_session_and_context, new); 2 external calls (new, assert_eq!).
 
@@ -8334,11 +8356,11 @@ async fn approve_mode_skips_when_annotations_do_not_require_approval()
 async fn guardian_mode_skips_auto_when_annotations_do_not_require_approval()
 ```
 
-**Purpose**: Verifies that auto-review/guardian mode is not consulted for clearly safe read-only tools, avoiding unnecessary model calls.
+**Purpose**: Checks that AutoReview Guardian mode also skips review for clearly safe read-only tools. The test ensures no model-review HTTP request is made.
 
-**Data flow**: Starts a mock server expecting zero `/v1/responses` requests, creates a session/turn configured with `AskForApproval::OnRequest`, `ApprovalsReviewer::AutoReview`, and a model provider pointing at the mock server, then calls `maybe_request_mcp_tool_approval` for a read-only tool under `AppToolApproval::Auto` and asserts the decision is `None`.
+**Data flow**: It starts a mock server expecting zero review calls, configures auto review, creates read-only metadata, asks for approval in Auto mode, and expects no decision.
 
-**Call relations**: Regression test ensuring the guardian path is skipped before any external review request is attempted.
+**Call relations**: It tests that annotation-based skipping happens before Guardian review dispatch.
 
 *Call graph*: calls 5 internal fn (annotations, make_session_and_context, models_manager_with_provider, new, start_mock_server); 7 external calls (clone, new, given, new, assert_eq!, create_model_provider, format!).
 
@@ -8349,11 +8371,11 @@ async fn guardian_mode_skips_auto_when_annotations_do_not_require_approval()
 async fn permission_request_hook_allows_mcp_tool_call()
 ```
 
-**Purpose**: End-to-end test showing that a `PermissionRequest` hook can allow an MCP tool call and receives the expected hook payload.
+**Purpose**: Verifies that a PermissionRequest hook can allow an MCP tool call. Hooks are user-configured commands that can inspect and decide on tool permissions.
 
-**Data flow**: Creates a session/turn, installs a hook matching `mcp__memory__.*` that returns an allow decision, wraps session/turn in `Arc`, builds a destructive `memory/create_entities` invocation and metadata, calls `maybe_request_mcp_tool_approval` under `AppToolApproval::Auto`, asserts it returns `Some(Accept)`, then reads the hook log file, parses each JSON line, and asserts the single logged payload contains session ID, turn ID, cwd, model, permission mode, hook event name, tool name, and exact tool input.
+**Data flow**: It installs a hook that returns allow, builds a risky MCP invocation, asks production approval logic for a decision, then reads the hook log and verifies the hook received the expected input.
 
-**Call relations**: Exercises the hook-based approval path before any user prompt or guardian review.
+**Call relations**: It uses install_mcp_permission_request_hook and tests hook integration in the approval flow.
 
 *Call graph*: calls 4 internal fn (annotations, install_mcp_permission_request_hook, make_session_and_context, new); 4 external calls (new, assert_eq!, json!, read_to_string).
 
@@ -8364,11 +8386,11 @@ async fn permission_request_hook_allows_mcp_tool_call()
 async fn permission_request_hook_uses_hook_tool_name_without_metadata()
 ```
 
-**Purpose**: Checks that hook payload generation does not depend on approval metadata and still uses the provided `HookToolName`.
+**Purpose**: Checks that PermissionRequest hooks still receive the correct hook tool name when MCP metadata is absent. Missing metadata should not prevent hook matching.
 
-**Data flow**: Installs the same allow hook as the previous test, builds a `memory/create_entities` invocation without metadata, calls `maybe_request_mcp_tool_approval`, asserts `Some(Accept)`, then reads and parses the hook log and asserts the payload still contains the expected `tool_name` and `tool_input` fields.
+**Data flow**: It installs an allow hook, builds an invocation without metadata, runs approval logic, and checks the logged hook input includes the expected tool name and arguments.
 
-**Call relations**: Covers the no-metadata branch of hook payload construction.
+**Call relations**: It tests a metadata-missing branch of hook integration.
 
 *Call graph*: calls 3 internal fn (install_mcp_permission_request_hook, make_session_and_context, new); 4 external calls (new, assert_eq!, json!, read_to_string).
 
@@ -8379,11 +8401,11 @@ async fn permission_request_hook_uses_hook_tool_name_without_metadata()
 async fn permission_request_hook_runs_after_remembered_mcp_approval()
 ```
 
-**Purpose**: Verifies that remembered session approvals short-circuit hook execution entirely.
+**Purpose**: Despite its name, this test verifies a remembered MCP approval skips the PermissionRequest hook. A previously remembered approval should short-circuit later checks.
 
-**Data flow**: Creates a session/turn, installs a deny hook, builds a destructive memory invocation and metadata, derives a session approval key with `session_mcp_tool_approval_key`, stores it via `remember_mcp_tool_approval`, wraps session/turn in `Arc`, calls `maybe_request_mcp_tool_approval`, asserts `Some(Accept)`, and finally asserts the hook log path does not exist.
+**Data flow**: It installs a denying hook, remembers approval for a risky invocation, runs approval logic, expects accept, and confirms the hook log file was never created.
 
-**Call relations**: Tests precedence between remembered approvals and hook-based permission requests.
+**Call relations**: It tests the ordering of remembered approvals versus hook execution.
 
 *Call graph*: calls 4 internal fn (annotations, install_mcp_permission_request_hook, make_session_and_context, new); 4 external calls (new, assert!, assert_eq!, json!).
 
@@ -8394,11 +8416,11 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval()
 async fn guardian_mode_mcp_denial_returns_rationale_message()
 ```
 
-**Purpose**: End-to-end test showing that guardian auto-review can deny an MCP tool call and that the returned decline message includes the guardian rationale plus anti-circumvention guidance.
+**Purpose**: Checks that when Guardian denies an MCP tool call, the returned decline message includes the reviewer’s rationale and anti-circumvention warning. This gives the model a clear reason not to retry the same outcome.
 
-**Data flow**: Starts a mock SSE server that emits a completed assistant response containing JSON with `outcome: deny` and a rationale, configures a session/turn for `AskForApproval::OnRequest` and `ApprovalsReviewer::AutoReview` against that server, builds a destructive custom-server invocation and metadata, calls `maybe_request_mcp_tool_approval`, pattern-matches a decline with message, and asserts the message contains the rationale and policy-circumvention wording. It also asserts the guardian request hit `/v1/responses`.
+**Data flow**: It mocks a Guardian response that denies with a rationale, configures auto review, builds a risky invocation, runs approval logic, and checks the decline message and review request.
 
-**Call relations**: Positive-path integration test for the guardian denial branch, including external review request and message synthesis.
+**Call relations**: It exercises the full Guardian review path through MCP approval logic.
 
 *Call graph*: calls 7 internal fn (annotations, make_session_and_context, models_manager_with_provider, new, mount_sse_once, sse, start_mock_server); 9 external calls (clone, new, assert!, assert_eq!, create_model_provider, format!, panic!, json!, vec!).
 
@@ -8409,11 +8431,11 @@ async fn guardian_mode_mcp_denial_returns_rationale_message()
 async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval()
 ```
 
-**Purpose**: Checks that explicit prompt mode still waits for user approval even for read-only tools that auto/approve modes would skip.
+**Purpose**: Confirms Prompt mode still waits for user approval even for read-only tools. Prompt mode means the user explicitly asked to be prompted.
 
-**Data flow**: Creates a session/turn with event receiver, marks an active turn, builds a read-only invocation and metadata, spawns `maybe_request_mcp_tool_approval` under `AppToolApproval::Prompt`, then asserts a short timeout expires without the task completing and aborts the task.
+**Data flow**: It starts an active turn, launches approval logic for a read-only tool in a background task, waits briefly, and verifies the task has not completed automatically.
 
-**Call relations**: Covers the distinction between prompt mode and auto/approve shortcuts for safe tools.
+**Call relations**: It tests that Prompt mode overrides the annotation-based auto-skip behavior.
 
 *Call graph*: calls 4 internal fn (annotations, make_session_and_context_with_rx, default, new); 3 external calls (clone, assert!, spawn).
 
@@ -8424,11 +8446,11 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
 async fn full_access_mode_skips_mcp_tool_approval_for_all_approval_modes()
 ```
 
-**Purpose**: Verifies that full-access permission mode disables MCP approval checks entirely regardless of per-tool approval mode.
+**Purpose**: Checks that when the permission profile disables restrictions and approval policy is Never, MCP approval is skipped for Auto, Prompt, and Approve modes. This represents full-access operation.
 
-**Data flow**: Creates a session/turn, sets `approval_policy` to `Never` and `permission_profile` to `PermissionProfile::Disabled`, wraps them in `Arc`, builds a destructive Codex Apps invocation and metadata, iterates over `AppToolApproval::{Auto,Prompt,Approve}`, calls `maybe_request_mcp_tool_approval` for each, and asserts every result is `None`.
+**Data flow**: It configures a session for no approvals and disabled permission restrictions, builds a risky Codex Apps invocation, runs approval logic in each mode, and expects no decision each time.
 
-**Call relations**: Regression test for the top-level bypass when sandbox/permission restrictions are disabled.
+**Call relations**: It tests the top-level full-access bypass in production approval logic.
 
 *Call graph*: calls 3 internal fn (annotations, make_session_and_context, new); 3 external calls (new, assert_eq!, json!).
 
@@ -8439,20 +8461,22 @@ async fn full_access_mode_skips_mcp_tool_approval_for_all_approval_modes()
 async fn approve_mode_skips_guardian_in_every_permission_mode()
 ```
 
-**Purpose**: Ensures `AppToolApproval::Approve` never triggers guardian/user review, across all approval-policy variants.
+**Purpose**: Verifies that Approve mode does not call Guardian, regardless of the broader approval policy. Approve mode should directly allow approved tools without automated review.
 
-**Data flow**: Starts a mock server expecting zero review requests, defines a destructive Codex Apps invocation and metadata, then loops over several `AskForApproval` policies. For each, it creates a session/turn with auth, configures reviewer `User` and model/chat endpoints to the mock server, calls `maybe_request_mcp_tool_approval` under `AppToolApproval::Approve`, and asserts the result is `None`.
+**Data flow**: It starts a mock review server expecting no calls, loops through several approval policies, configures each session, runs MCP approval logic in Approve mode, and expects no decision.
 
-**Call relations**: Broad regression test proving approve mode short-circuits review logic independently of the surrounding approval policy.
+**Call relations**: It tests that Guardian dispatch is bypassed before any external review request is made.
 
 *Call graph*: calls 7 internal fn (annotations, make_session_and_context, auth_manager_from_auth, models_manager_with_provider, new, start_mock_server, create_dummy_chatgpt_auth_for_testing); 9 external calls (clone, new, given, new, Granular, assert_eq!, create_model_provider, format!, json!).
 
 
 ### `core/src/unified_exec/async_watcher_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file contains narrow unit tests for `split_valid_utf8_prefix_with_max`, the helper that slices raw process output into event-sized chunks without breaking UTF-8 boundaries. The first test uses plain ASCII bytes and confirms that the helper emits exactly `max_bytes` when possible, draining the consumed prefix from the original buffer and leaving the remainder for subsequent calls. The second test uses repeated `é` characters, which occupy two bytes each in UTF-8, to prove that a three-byte limit does not split a codepoint: only one full character is emitted and the remaining bytes stay buffered. The final test feeds an invalid leading byte followed by valid ASCII and checks the fallback behavior: when no valid UTF-8 prefix exists within the limit, the function emits a single raw byte so the stream can continue making progress instead of stalling forever. Together these tests document the contract relied on by the async watcher when converting arbitrary PTY bytes into downstream `ExecCommandOutputDelta` payloads.
+This is a small test file for `split_valid_utf8_prefix_with_max`, a helper that takes bytes from the front of a buffer. The real-world problem is that command output or watched process output often arrives as raw bytes, not neat lines of text. The system may need to emit only a limited number of bytes at a time, but it must avoid breaking valid UTF-8 text in the middle of a character. UTF-8 is the common text encoding where some characters, like `é`, take more than one byte.
+
+The tests cover three important cases. First, plain ASCII text is simple: each character is one byte, so the helper should split exactly at the requested byte limit. Second, multi-byte characters need care: if the limit falls in the middle of a character, the helper should stop earlier rather than produce broken text. Third, not all input is valid UTF-8. If the buffer starts with an invalid byte, the helper should still remove something and make progress, instead of getting stuck forever. Think of it like cutting a ribbon into short pieces: cut at the mark when safe, move the cut slightly earlier if it would slice through a symbol, and still snip off a bad knot so the process can continue.
 
 #### Function details
 
@@ -8462,11 +8486,11 @@ This file contains narrow unit tests for `split_valid_utf8_prefix_with_max`, the
 fn split_valid_utf8_prefix_respects_max_bytes_for_ascii()
 ```
 
-**Purpose**: Checks that ASCII data is split strictly at the configured byte limit and that consumed bytes are removed from the source buffer. It demonstrates repeated incremental extraction.
+**Purpose**: This test checks the easy case: ordinary ASCII text, where every character is one byte. It proves that the splitter takes no more than the requested byte count and leaves the rest of the buffer behind for later.
 
-**Data flow**: Initializes `buf` with `b"hello word!"`, calls `split_valid_utf8_prefix_with_max(&mut buf, 5)` twice, and asserts the returned prefixes are `b"hello"` and `b" word"` while `buf` shrinks first to `b" word!"` and then to `b"!"`.
+**Data flow**: It starts with the byte buffer for `hello word!`. It asks `split_valid_utf8_prefix_with_max` for up to 5 bytes, then checks that `hello` comes out and the buffer now starts with ` word!`. It asks again with the same limit, checks that ` word` comes out, and confirms only `!` remains.
 
-**Call relations**: This is a direct unit test run by the test harness against the helper in `async_watcher.rs`. It covers the common fast path where all bytes are valid single-byte UTF-8.
+**Call relations**: During the test run, the Rust test framework calls this function. The function calls `split_valid_utf8_prefix_with_max` to exercise the real splitter, then uses `assert_eq!` to compare the actual output and leftover buffer with the expected values.
 
 *Call graph*: 2 external calls (assert_eq!, split_valid_utf8_prefix_with_max).
 
@@ -8477,11 +8501,11 @@ fn split_valid_utf8_prefix_respects_max_bytes_for_ascii()
 fn split_valid_utf8_prefix_avoids_splitting_utf8_codepoints()
 ```
 
-**Purpose**: Verifies that the splitter backs off rather than cutting through a multibyte UTF-8 character. It protects streamed output from producing invalid text fragments.
+**Purpose**: This test checks that the splitter does not cut through a multi-byte UTF-8 character. That matters because a half character would not be valid text and could confuse later text processing.
 
-**Data flow**: Creates a buffer from `"ééé".as_bytes()`, calls `split_valid_utf8_prefix_with_max(&mut buf, 3)`, converts the returned bytes back to UTF-8, and asserts the prefix is exactly one `é` while the remaining buffer still contains two `é` characters.
+**Data flow**: It starts with the UTF-8 bytes for `ééé`, where each `é` takes 2 bytes. It asks for up to 3 bytes, which is enough for one full `é` but not two. The test checks that the returned bytes decode to exactly one `é`, and that the buffer still contains the remaining two `é` characters.
 
-**Call relations**: This test is invoked by the harness to validate the backward-scan logic inside the splitter. It specifically exercises the branch where `max_bytes` lands in the middle of a codepoint.
+**Call relations**: The Rust test framework runs this test as part of the suite. The test sends a multi-byte text buffer into `split_valid_utf8_prefix_with_max`, then uses `assert_eq!` to verify that the helper chose a safe character boundary rather than blindly using the byte limit.
 
 *Call graph*: 2 external calls (assert_eq!, split_valid_utf8_prefix_with_max).
 
@@ -8492,22 +8516,24 @@ fn split_valid_utf8_prefix_avoids_splitting_utf8_codepoints()
 fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8()
 ```
 
-**Purpose**: Confirms that malformed input does not block output processing forever. The helper must emit at least one byte even when no valid UTF-8 prefix exists.
+**Purpose**: This test checks a failure-resistant behavior: even if the buffer begins with an invalid UTF-8 byte, the splitter should still consume something. Without this, a stream reader could get stuck seeing the same bad byte over and over.
 
-**Data flow**: Starts with `buf = vec![0xff, b'a', b'b']`, calls `split_valid_utf8_prefix_with_max(&mut buf, 2)`, and asserts the returned prefix is the single invalid byte `0xff` while the remaining buffer becomes `b"ab"`.
+**Data flow**: It starts with a buffer containing an invalid byte `0xff`, followed by the valid ASCII bytes `a` and `b`. It asks for up to 2 bytes. The expected result is that the invalid byte is returned by itself, and the buffer is shortened to just `ab`.
 
-**Call relations**: This harness-driven test targets the splitter’s final fallback branch. It documents the progress guarantee relied on by `process_chunk` when PTY output contains invalid byte sequences.
+**Call relations**: The test framework calls this function during testing. The function builds a deliberately mixed valid-and-invalid byte buffer, passes it to `split_valid_utf8_prefix_with_max`, and uses `assert_eq!` to confirm that the helper made forward progress while preserving the remaining bytes for future processing.
 
 *Call graph*: 3 external calls (assert_eq!, split_valid_utf8_prefix_with_max, vec!).
 
 
 ### `core/src/unified_exec/head_tail_buffer_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file exercises `HeadTailBuffer` as the retention mechanism for unified-exec transcripts. The tests cover both normal and edge-case capacities. Over-budget behavior is checked by filling a ten-byte buffer and then appending more data: the rendered output must keep the earliest prefix and latest suffix while `omitted_bytes` increases to reflect dropped middle bytes. A zero-capacity buffer must retain nothing, count all bytes as omitted, and report empty snapshots and flattened output. The one-byte-capacity case verifies the asymmetric split when `head_budget` becomes zero and only the final tail byte survives.
+`HeadTailBuffer` is a bounded byte buffer: it remembers a fixed-size sample of data by keeping the “head” at the start and the “tail” at the end. That is useful for long command output or logs, where the first few bytes explain what started and the last few bytes show how it ended, but the middle may be too large to keep. This test file acts like a safety checklist for that behavior.
 
-State-reset behavior is covered by draining a populated buffer and asserting that retained bytes, omitted bytes, and rendered output all return to empty defaults. Another test targets the special path where a single incoming chunk is larger than the entire tail budget: the old tail should be replaced and only the last tail-budget bytes of the new chunk should remain. Finally, a multi-chunk test demonstrates the intended fill order—head first across multiple pushes, then tail—and shows that once the tail is full, each additional byte evicts the oldest tail byte. Together these tests make the retention policy concrete and guard the invariants relied on by final transcript aggregation.
+The tests feed small byte chunks into the buffer and then ask simple questions: How many bytes are still retained? How many were omitted? What bytes would be returned to a caller? They cover normal overflow, a zero-size buffer, a one-byte buffer, draining the buffer back to empty, a single chunk that is larger than the tail space, and filling the head and tail gradually across several chunks.
+
+An everyday analogy is a notebook with only ten spaces: you copy the first five words and the last five words of a long message, and count how many words you skipped. These tests make sure the notebook never silently keeps the wrong words, forgets to count skipped data, or fails to reset after its contents are taken out.
 
 #### Function details
 
@@ -8517,11 +8543,11 @@ State-reset behavior is covered by draining a populated buffer and asserting tha
 fn keeps_prefix_and_suffix_when_over_budget()
 ```
 
-**Purpose**: Verifies that once the buffer exceeds its capacity, it preserves the earliest prefix and latest suffix while dropping the middle. It also checks that omitted-byte accounting stays zero until overflow actually occurs.
+**Purpose**: This test proves that when more bytes arrive than the buffer is allowed to keep, it preserves useful bytes from both the start and the end. It checks the core promise of `HeadTailBuffer`: drop the middle, not the edges.
 
-**Data flow**: Creates `HeadTailBuffer::new(10)`, pushes `"0123456789"`, asserts `omitted_bytes() == 0`, then pushes `"ab"`, asserts omitted bytes increased, renders `to_bytes()` through `String::from_utf8_lossy`, and checks the string starts with `"01234"` and ends with `"89ab"`.
+**Data flow**: It starts with a new buffer limited to 10 bytes, then pushes ten bytes followed by two more. Before the extra bytes, nothing is omitted; after them, some bytes must be omitted. The test turns the saved bytes into readable text and verifies that the result still begins with `01234` and ends with `89ab`.
 
-**Call relations**: This unit test is run by the harness against `HeadTailBuffer` and exercises the common overflow path where head and tail are both populated.
+**Call relations**: During the test run, Rust’s test runner calls this function. The function creates a buffer with `HeadTailBuffer::new`, feeds it data, uses UTF-8 conversion so the retained bytes can be checked as text, and relies on assertions to fail the test if the prefix or suffix rule is broken.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (from_utf8_lossy, assert!, assert_eq!).
 
@@ -8532,11 +8558,11 @@ fn keeps_prefix_and_suffix_when_over_budget()
 fn max_bytes_zero_drops_everything()
 ```
 
-**Purpose**: Checks the degenerate zero-capacity case where all input must be discarded. It ensures every readout API reflects an empty retained transcript.
+**Purpose**: This test checks the edge case where the buffer is allowed to keep zero bytes. In that situation, every incoming byte should be counted as omitted and nothing should be returned.
 
-**Data flow**: Constructs `HeadTailBuffer::new(0)`, pushes `"abc"`, then asserts `retained_bytes() == 0`, `omitted_bytes() == 3`, `to_bytes()` is empty, and `snapshot_chunks()` returns an empty `Vec<Vec<u8>>`.
+**Data flow**: It creates a buffer with a maximum size of 0 and pushes `abc` into it. After that, retained bytes are 0, omitted bytes are 3, converting the buffer to bytes returns an empty list, and asking for chunk snapshots also returns no chunks.
 
-**Call relations**: This test targets the early-return branch in `push_chunk` for `max_bytes == 0`. It documents the expected behavior for a fully disabled retention budget.
+**Call relations**: The test runner calls this function as one of the buffer checks. It uses `HeadTailBuffer::new` to create the zero-capacity case and assertion checks to confirm that all public views of the buffer agree that nothing was retained.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -8547,11 +8573,11 @@ fn max_bytes_zero_drops_everything()
 fn head_budget_zero_keeps_only_last_byte_in_tail()
 ```
 
-**Purpose**: Validates the smallest nonzero capacity, where the head budget is zero and only the tail can retain data. It confirms that only the newest byte survives.
+**Purpose**: This test checks the smallest non-empty buffer size. With room for only one byte, the buffer should keep the newest final byte and omit everything before it.
 
-**Data flow**: Creates `HeadTailBuffer::new(1)`, pushes `"abc"`, and asserts one retained byte, two omitted bytes, and flattened output equal to `"c"`.
+**Data flow**: It creates a buffer with a 1-byte limit and pushes `abc`. The buffer ends with 1 retained byte, 2 omitted bytes, and its saved output is just `c`.
 
-**Call relations**: This harness-driven test exercises the path where all retention happens in the tail because integer division gives a zero-byte head.
+**Call relations**: The test runner calls this function to cover a tight boundary case. It creates the buffer through `HeadTailBuffer::new` and uses equality assertions to confirm that the buffer behaves like a one-slot tail, keeping only the latest byte.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -8562,11 +8588,11 @@ fn head_budget_zero_keeps_only_last_byte_in_tail()
 fn draining_resets_state()
 ```
 
-**Purpose**: Ensures that draining a populated buffer returns retained chunks and fully resets counters and content. It guards against stale transcript state leaking across uses.
+**Purpose**: This test makes sure that taking the saved chunks out of the buffer also clears its internal counters and stored bytes. Without this, later use could be polluted by old output.
 
-**Data flow**: Builds `HeadTailBuffer::new(10)`, pushes `"0123456789"` and `"ab"`, calls `drain_chunks()`, asserts the drained result is non-empty, then checks `retained_bytes()` and `omitted_bytes()` are zero and `to_bytes()` is empty.
+**Data flow**: It creates a 10-byte buffer, pushes enough data to exceed the limit, and then drains the saved chunks out. The drained result must contain something, and afterward the buffer reports 0 retained bytes, 0 omitted bytes, and no saved byte output.
 
-**Call relations**: This test directly validates the destructive reset semantics of `drain_chunks`. It complements the non-destructive snapshot and flattening tests.
+**Call relations**: The test runner calls this function to check cleanup behavior. The test creates a buffer, fills it, calls the buffer’s draining operation, and then uses assertions to verify that the buffer has returned to a fresh empty state.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert!, assert_eq!).
 
@@ -8577,11 +8603,11 @@ fn draining_resets_state()
 fn chunk_larger_than_tail_budget_keeps_only_tail_end()
 ```
 
-**Purpose**: Checks the special-case optimization for a chunk larger than the entire tail budget. The buffer should replace the old tail and keep only the newest tail-budget suffix of that chunk.
+**Purpose**: This test checks what happens when a single incoming chunk is bigger than the space reserved for the tail. The buffer should keep only the end of that large chunk for the tail, because those are the most recent bytes.
 
-**Data flow**: Creates `HeadTailBuffer::new(10)`, pushes `"0123456789"`, then pushes `"ABCDEFGHIJK"`, renders `to_bytes()` as text, and asserts the output starts with `"01234"`, ends with `"GHIJK"`, and has positive omitted-byte count.
+**Data flow**: It creates a 10-byte buffer and fills it with `0123456789`. Then it pushes `ABCDEFGHIJK`, which is too large to fit in the tail area. The final saved bytes should still start with `01234`, end with `GHIJK`, and report that some bytes were omitted.
 
-**Call relations**: This test targets the `chunk.len() >= tail_budget` branch in `push_to_tail`. It verifies that oversized chunks do not get appended and trimmed incrementally but instead replace the tail wholesale.
+**Call relations**: The test runner calls this function as a stress case for chunk replacement. It uses `HeadTailBuffer::new`, converts the output to readable text for prefix and suffix checks, and uses assertions to confirm that an oversized chunk does not crowd out the saved head.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (from_utf8_lossy, assert!).
 
@@ -8592,24 +8618,24 @@ fn chunk_larger_than_tail_budget_keeps_only_tail_end()
 fn fills_head_then_tail_across_multiple_chunks()
 ```
 
-**Purpose**: Demonstrates the intended fill order across multiple pushes: complete the head budget first, then accumulate the tail, then evict oldest tail bytes on further writes. It serves as a step-by-step behavioral example.
+**Purpose**: This test proves the buffer behaves correctly when data arrives in several small pieces instead of one big piece. It checks that the head fills first, then the tail fills, and only then does the oldest tail byte get dropped.
 
-**Data flow**: Creates `HeadTailBuffer::new(10)`, pushes `"01"` and `"234"` and asserts `to_bytes()` is `"01234"`; then pushes `"567"` and `"89"` and asserts full output `"0123456789"` with zero omitted bytes; finally pushes `"a"` and asserts output becomes `"012346789a"` with one omitted byte.
+**Data flow**: It creates a 10-byte buffer. It pushes `01` and `234`, which together fill the 5-byte head, then pushes `567` and `89`, filling the remaining space without omitting anything. When it pushes one more byte, `a`, the buffer keeps the head `01234`, updates the tail to `6789a`, and reports 1 omitted byte.
 
-**Call relations**: This test is run by the harness to validate the interaction between `push_chunk`, `push_to_tail`, and `trim_tail_to_budget` over several incremental writes.
+**Call relations**: The test runner calls this function to check the normal streaming path, where bytes arrive over time. It creates the buffer with `HeadTailBuffer::new`, pushes several chunks in order, and uses equality assertions after each phase to catch mistakes in how the head and tail are filled.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
 
 ### `core/src/unified_exec/process_manager_tests.rs`
 
-`test` · `test-time validation of process-manager helpers and policies`
+`test` · `test suite`
 
-This test file validates the nontrivial helper behavior in `process_manager.rs`. Several unit tests focus on environment construction: `apply_unified_exec_env` must inject the fixed locale/pager/terminal defaults and override conflicting values, while `env_overlay_for_exec_server` must strip variables whose values already match the local policy environment so only runtime differences are sent remotely. `exec_server_params_use_path_uri_and_env_policy_overlay_contract` checks the full remote-launch contract: numeric process IDs become strings, cwd is converted with `PathUri::from_abs_path`, env policy is preserved, and only the overlay env is transmitted.
+The unified execution system is the part of the project that starts shell commands and tracks them while they run. These tests act like a checklist for the promises that system must keep. They verify that commands get a controlled environment, for example by disabling color and pagers so output is easier for machines to read. They also check how environment changes are sent to an external exec server: only the values that changed at runtime should be sent, not the whole client environment.
 
-Platform-specific yield-time behavior is covered with separate Windows and non-Windows tests for `clamp_yield_time`. Async tests cover network-denial helpers: the fallback denial message when no session exists, and the late-denial grace period that should still observe cancellation shortly after exit. Another async test verifies `emit_failed_initial_exec_end_if_unstored` emits a failed `ExecCommandEnd` event with the fallback output text plus failure message when a process dies before being stored.
+The file also tests small but important edge cases. It confirms process IDs are represented the same way across the local manager and exec server. It checks how long the system initially waits before yielding output back, including a Windows-specific minimum wait. It verifies that network denial messages clearly name the sandbox network proxy, which is the component blocking network access.
 
-The final group of tests targets pruning policy directly through `UnifiedExecProcessManager::process_id_to_prune_from_meta`, asserting that pruning prefers exited processes outside the protected recent set, falls back to plain LRU when none are exited, and does not prune recently used processes even if they have already exited.
+A larger async test simulates a command that fails before it has been fully stored as a running process. In that case, the system still needs to emit a proper “command ended” event with useful fallback output, rather than leaving the caller waiting. Finally, the pruning tests check which old process record should be removed when the manager has too many: it prefers exited processes that are not among the most recently used, and otherwise falls back to the oldest record.
 
 #### Function details
 
@@ -8619,11 +8645,11 @@ The final group of tests targets pruning policy directly through `UnifiedExecPro
 fn unified_exec_env_injects_defaults()
 ```
 
-**Purpose**: Verifies that applying the unified-exec environment to an empty map produces exactly the expected fixed defaults.
+**Purpose**: This test confirms that an empty environment is filled with the standard variables the execution system wants every command to have. These defaults make command output plain, predictable, and suitable for automated reading.
 
-**Data flow**: Creates an empty `HashMap`, passes it to `apply_unified_exec_env`, constructs an expected map containing the 10 default variables, and asserts equality.
+**Data flow**: It starts with an empty map of environment variables. It passes that map through the environment-defaulting logic, then compares the result with the exact expected set, such as disabling color, using a simple terminal type, setting UTF-8 locale values, and forcing pagers to behave like plain output.
 
-**Call relations**: Directly exercises the environment-default injection helper to lock down the baseline process environment contract.
+**Call relations**: The test runner calls this test during the normal test suite. The test exercises the environment-building helper and uses equality checking to make sure the helper’s contract has not drifted.
 
 *Call graph*: 4 external calls (from, new, new, assert_eq!).
 
@@ -8634,11 +8660,11 @@ fn unified_exec_env_injects_defaults()
 fn unified_exec_env_overrides_existing_values()
 ```
 
-**Purpose**: Checks that unified-exec defaults overwrite conflicting keys while preserving unrelated environment entries.
+**Purpose**: This test checks that the unified execution defaults are strong enough to replace conflicting values, while leaving unrelated values alone. For example, it must force color off without destroying a useful PATH.
 
-**Data flow**: Builds a base map with `NO_COLOR=0` and `PATH=/usr/bin`, applies `apply_unified_exec_env`, then asserts that `NO_COLOR` became `1` while `PATH` remained unchanged.
+**Data flow**: It begins with a small environment containing an existing NO_COLOR value and a PATH. After applying the unified execution environment rules, it checks that NO_COLOR was changed to the required value and PATH stayed the same.
 
-**Call relations**: Complements the previous test by covering merge semantics rather than just the empty-input case.
+**Call relations**: The test runner invokes it as part of the suite. It backs up the same environment helper tested by the default-injection case, but focuses on what happens when caller-provided values already exist.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -8649,11 +8675,11 @@ fn unified_exec_env_overrides_existing_values()
 fn env_overlay_for_exec_server_keeps_runtime_changes_only()
 ```
 
-**Purpose**: Ensures the exec-server overlay contains only variables whose values differ from the local policy environment.
+**Purpose**: This test verifies that the environment overlay sent to the exec server contains only runtime differences. That matters because the server already knows the policy-based environment, so sending unchanged values would be noisy and could hide real changes.
 
-**Data flow**: Constructs `local_policy_env` and `request_env` maps with overlapping and differing values, calls `env_overlay_for_exec_server`, and asserts that the result contains only changed or newly introduced keys.
+**Data flow**: It creates one environment representing the local policy baseline and another representing the actual request. The request changes PATH and adds runtime-only values like a thread ID and a network-disabled flag. The test expects the overlay to contain only those changed or newly added values.
 
-**Call relations**: Validates the optimization/contract used before remote exec-server launch so redundant environment values are not resent.
+**Call relations**: The test runner calls this test to protect the contract between the client-side process manager and the exec server. It exercises the overlay helper that is also indirectly important when exec-server parameters are built.
 
 *Call graph*: 2 external calls (from, assert_eq!).
 
@@ -8664,11 +8690,11 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only()
 fn exec_server_params_use_path_uri_and_env_policy_overlay_contract()
 ```
 
-**Purpose**: Tests that exec-server launch parameters preserve process ID, cwd conversion, env policy, and overlay-only environment transmission.
+**Purpose**: This test checks that a local execution request is translated into exec-server parameters in the agreed format. It specifically protects the process ID, working-directory path format, environment policy, and reduced environment overlay.
 
-**Data flow**: Builds an `ExecRequest` with cwd, command, env, and `ExecServerEnvConfig`, calls `exec_server_params_for_request(123, &request, true)`, then asserts the string process ID, `PathUri` cwd, presence of env policy, and exact overlay env contents.
+**Data flow**: It builds a realistic execution request with a command, current working directory, sandbox and permission settings, an environment, and exec-server environment policy information. It then converts that request into exec-server parameters and checks that the process ID becomes a string, the working directory becomes a path URI, the environment policy is present, and the environment contains only the overlay values the server needs.
 
-**Call relations**: Exercises the composed helper path from request/environment config into final remote `ExecParams`.
+**Call relations**: The test runner invokes this test to guard the handoff from the local unified execution manager to the external exec server. It uses current directory information, sandbox policy construction, and request-to-parameter conversion, then checks the important parts of the resulting server request.
 
 *Call graph*: calls 1 internal fn (unrestricted); 7 external calls (from, new, new, assert!, assert_eq!, current_dir, vec!).
 
@@ -8679,11 +8705,11 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract()
 fn exec_server_process_id_matches_unified_exec_process_id()
 ```
 
-**Purpose**: Confirms that exec-server process IDs are just the decimal string form of unified-exec numeric IDs.
+**Purpose**: This test confirms that the process ID used by the exec server is the same plain string form as the unified execution process ID. Consistent IDs make it possible to connect events, logs, and follow-up requests to the same running command.
 
-**Data flow**: Calls `exec_server_process_id(4321)` and asserts the returned string equals `"4321"`.
+**Data flow**: It provides a numeric process ID and asks the conversion helper for the exec-server form. The expected result is the same number rendered as text.
 
-**Call relations**: Pins down the ID-mapping convention used by remote execution.
+**Call relations**: The test runner calls this small contract test. It supports the larger exec-server parameter tests by checking the ID conversion rule on its own.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8694,11 +8720,11 @@ fn exec_server_process_id_matches_unified_exec_process_id()
 fn initial_exec_yield_time_uses_windows_floor()
 ```
 
-**Purpose**: On Windows, verifies that initial exec yield time is clamped to the platform floor and maximum.
+**Purpose**: This Windows-only test checks that the initial output wait time is not allowed to be too short on Windows. The floor gives commands enough time to start producing useful output before the system yields back.
 
-**Data flow**: Computes a value above the configured max, calls `clamp_yield_time` with representative low, normal, and too-high values, and asserts the expected floor/max behavior.
+**Data flow**: It feeds several requested yield times into the clamping helper. Very small values are raised to the Windows-specific minimum, normal values are left alone, and values above the maximum are lowered to the maximum.
 
-**Call relations**: Platform-gated test for the Windows-specific startup polling policy.
+**Call relations**: On Windows, the test runner includes this test. It protects platform-specific timing behavior used when unified execution decides how long to wait before returning initial command output.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8709,11 +8735,11 @@ fn initial_exec_yield_time_uses_windows_floor()
 fn initial_exec_yield_time_has_no_platform_floor()
 ```
 
-**Purpose**: On non-Windows platforms, verifies that initial exec yield time only respects the generic minimum and does not apply the Windows floor.
+**Purpose**: This non-Windows test checks that other platforms do not use the Windows-specific initial wait floor. They still obey the general minimum, but do not get raised to the larger Windows value.
 
-**Data flow**: Calls `clamp_yield_time` with a normal value and a too-small value, then asserts the unchanged normal result and clamped minimum result.
+**Data flow**: It sends ordinary and very small requested yield times through the clamping helper. The ordinary value stays unchanged, while an extremely small value is raised only to the general minimum.
 
-**Call relations**: Complements the Windows-only test to document cross-platform yield-time differences.
+**Call relations**: On non-Windows systems, the test runner includes this test instead of the Windows-specific one. Together, the two tests make the platform split explicit and prevent accidental timing changes.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8724,11 +8750,11 @@ fn initial_exec_yield_time_has_no_platform_floor()
 async fn network_denial_fallback_message_names_sandbox_network_proxy()
 ```
 
-**Purpose**: Checks the fallback denial message returned when no session/deferred approval context is available.
+**Purpose**: This async test verifies the fallback message shown when network access is denied and no more specific session information is available. The message should clearly say that the Codex sandbox network proxy blocked the access.
 
-**Data flow**: Awaits `network_denial_message_for_session(None, None)` and asserts the exact fixed string naming the Codex sandbox network proxy.
+**Data flow**: It calls the network-denial message builder without a session or deferred detail source. The result should be a clear, fixed sentence naming the sandbox network proxy.
 
-**Call relations**: Validates the user-facing fallback text used in network-denial failure paths.
+**Call relations**: The async test runner calls this test. It protects the user-facing error text used by the unified execution flow when a command tries to reach the network but sandbox policy blocks it.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -8739,11 +8765,11 @@ async fn network_denial_fallback_message_names_sandbox_network_proxy()
 async fn late_network_denial_grace_observes_cancellation_after_exit()
 ```
 
-**Purpose**: Verifies that the late-network-denial grace helper still reports denial when cancellation arrives shortly after waiting begins.
+**Purpose**: This async test checks a race-like situation: a command has exited, but a late network-denial signal may still arrive briefly afterward. The system should notice cancellation during that short grace period.
 
-**Data flow**: Creates a `CancellationToken`, spawns a task that sleeps 10 ms then cancels it, awaits `wait_for_late_network_denial(Some(cancellation))`, and asserts the result is true.
+**Data flow**: It creates a cancellation token, starts a background task that waits briefly and then cancels it, and then waits for the late-network-denial grace logic. The expected result is true, meaning the cancellation was observed.
 
-**Call relations**: Exercises the grace-period timing logic used after process exit before finalizing network approval.
+**Call relations**: The async test runner invokes this test. It exercises the grace-wait helper and uses a spawned task plus a short sleep to mimic a network denial arriving just after process exit.
 
 *Call graph*: 5 external calls (new, from_millis, assert!, spawn, sleep).
 
@@ -8754,11 +8780,11 @@ async fn late_network_denial_grace_observes_cancellation_after_exit()
 async fn failed_initial_end_for_unstored_process_uses_fallback_output()
 ```
 
-**Purpose**: Ensures that a process which fails before being stored still emits a failed end event using the provided fallback output plus failure message.
+**Purpose**: This async test makes sure callers still receive a proper command-ended event if an execution fails before the process was fully recorded. Without this, the user interface or caller could wait forever or show missing output.
 
-**Data flow**: Creates a test session/turn/event receiver, builds a `UnifiedExecContext` and `ExecCommandRequest`, seeds a transcript buffer with partial output, calls `emit_failed_initial_exec_end_if_unstored(false, ...)`, then receives the emitted event and asserts its type, failed status, exit code, process ID, and aggregated output string.
+**Data flow**: It creates a test session and execution context, builds a command request, and places partial transcript text into a shared buffer. It then asks the failure-emission helper to report a failed initial execution using a pre-denial marker and denial message. The test reads the next event from the session channel and checks that it is a failed command-end event with the expected call ID, exit code, process ID, and fallback combined output.
 
-**Call relations**: Covers the startup-failure event path that bypasses normal stored-process exit watching.
+**Call relations**: The async test runner calls this scenario test. It relies on the session test helper to create a realistic event channel, then exercises the failure-reporting path that runs when a process dies before the process manager has stored it.
 
 *Call graph*: calls 3 internal fn (make_session_and_context_with_rx, new, default); 9 external calls (clone, new, from_millis, from_secs, assert_eq!, panic!, new, timeout, vec!).
 
@@ -8769,11 +8795,11 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output()
 fn pruning_prefers_exited_processes_outside_recently_used()
 ```
 
-**Purpose**: Checks that pruning chooses an exited process when one exists outside the protected recent set.
+**Purpose**: This test checks the cleanup rule for too many tracked processes: if there is an exited process outside the protected recent set, remove that one first. This keeps active or recently touched processes safer.
 
-**Data flow**: Builds synthetic `(process_id, last_used, exited)` metadata with one old exited process outside the newest eight, calls `UnifiedExecProcessManager::process_id_to_prune_from_meta`, and asserts the exited process ID is selected.
+**Data flow**: It builds sample process metadata with timestamps and one exited process that is not among the most recent entries. It asks the pruning selector which process ID should be removed and expects the exited older candidate.
 
-**Call relations**: Directly validates the first branch of the pruning policy.
+**Call relations**: The test runner calls this test to protect the process manager’s pruning policy. It directly exercises the metadata-based selection helper used when the manager needs to free space.
 
 *Call graph*: 4 external calls (now, assert_eq!, process_id_to_prune_from_meta, vec!).
 
@@ -8784,11 +8810,11 @@ fn pruning_prefers_exited_processes_outside_recently_used()
 fn pruning_falls_back_to_lru_when_no_exited()
 ```
 
-**Purpose**: Checks that pruning falls back to the least recently used unprotected process when no exited candidates exist.
+**Purpose**: This test confirms the fallback cleanup rule: if no suitable exited process exists, remove the least recently used process. “Least recently used” means the one that has gone the longest without being touched.
 
-**Data flow**: Builds metadata where all processes are still running, calls `process_id_to_prune_from_meta`, and asserts the oldest process ID is returned.
+**Data flow**: It creates process metadata where every process is still considered not exited. The pruning selector is asked for a candidate, and the expected answer is the oldest timestamped process.
 
-**Call relations**: Validates the pruning policy’s fallback branch.
+**Call relations**: The test runner invokes this as another direct check of the pruning selector. It covers the path used when there is no obviously safe exited process to discard.
 
 *Call graph*: 4 external calls (now, assert_eq!, process_id_to_prune_from_meta, vec!).
 
@@ -8799,22 +8825,24 @@ fn pruning_falls_back_to_lru_when_no_exited()
 fn pruning_protects_recent_processes_even_if_exited()
 ```
 
-**Purpose**: Ensures recently used processes remain protected from pruning even if they have already exited.
+**Purpose**: This test ensures that recently used processes are protected even if they have exited. The idea is that recent records may still be useful for follow-up reads, status checks, or user-visible history.
 
-**Data flow**: Builds metadata where one exited process is among the newest eight and another old process is outside that protected set, calls `process_id_to_prune_from_meta`, and asserts the old unprotected process is chosen instead of the recent exited one.
+**Data flow**: It builds metadata where some exited processes are among the most recent entries. The selector should not choose those protected recent exited processes; instead, it chooses the oldest process outside that recent set.
 
-**Call relations**: Tests the interaction between recency protection and exited-process preference in the pruning algorithm.
+**Call relations**: The test runner calls this test to lock down a subtle part of the pruning policy. It complements the other pruning tests by showing that “exited” alone is not enough reason to remove a process if it is still recent.
 
 *Call graph*: 4 external calls (now, assert_eq!, process_id_to_prune_from_meta, vec!).
 
 
 ### `core/src/unified_exec/process_tests.rs`
 
-`test` · `test-time validation of remote unified-exec process behavior`
+`test` · `test run`
 
-This file builds a focused mock of the `codex_exec_server::ExecProcess` trait to exercise the remote-process branch of `UnifiedExecProcess`. `MockExecProcess` stores a fixed `ProcessId`, a canned `WriteResponse`, a queue of `ReadResponse` values behind a `tokio::sync::Mutex<VecDeque<_>>`, an optional termination error string, and a `watch::Sender<u64>` used to implement the wake subscription expected by the remote output task. Its trait implementation returns empty event streams, boxed futures for read/write/signal/terminate, and either dequeued read responses or a default empty non-exited response.
+This file is a safety net for code that talks to a remote process. In the real system, `UnifiedExecProcess` can represent a command running somewhere else, through an execution server. That kind of setup can fail in awkward ways: the process may disappear, standard input may close, termination may fail, or the process may exit before the caller has fully settled in. These tests make sure those cases leave `UnifiedExecProcess` in a clear and honest state.
 
-The helper `remote_process` wraps this mock in `StartedExecProcess` and constructs a `UnifiedExecProcess` through `from_exec_server_started`, giving tests a realistic remote-process wrapper without a real exec server. The tests then verify several subtle state transitions: remote writes returning `UnknownProcess` or `StdinClosed` must surface `WriteToStdin` and mark the process exited; repeated `fail_and_terminate` calls must preserve the first failure message; `terminate_confirmed` must not mark the process exited if remote termination itself fails, but must do so on success; and `from_exec_server_started` must observe an early exit delivered through the output polling/wake mechanism within the grace period, including the correct exit code.
+The file builds a `MockExecProcess`, which is a fake version of the remote process interface. Think of it like a practice actor in a fire drill: it can pretend that writes succeed or fail, that reads report an exit, or that termination returns an error. The helper `remote_process` wraps this fake process in the real `UnifiedExecProcess` constructor, so the tests exercise the same path production code uses.
+
+The important behavior being checked is state consistency. If writing fails because the remote process is unknown or its input is closed, the unified process should be marked as exited. If termination fails, it should not pretend the process exited. If a failure is recorded twice, the first message should be preserved. And if the remote process reports that it already exited, startup should notice that.
 
 #### Function details
 
@@ -8824,11 +8852,11 @@ The helper `remote_process` wraps this mock in `StartedExecProcess` and construc
 fn process_id(&self) -> &ProcessId
 ```
 
-**Purpose**: Returns the mock process ID required by the `ExecProcess` trait.
+**Purpose**: This returns the fake process identifier used by the mock remote process. It lets the real `UnifiedExecProcess` code treat the mock like a normal server-backed process.
 
-**Data flow**: Reads `self.process_id` by reference and returns `&ProcessId`.
+**Data flow**: It reads the stored `process_id` field from the mock and gives back a reference to it. Nothing is changed.
 
-**Call relations**: Used implicitly by any code interacting with the mock through the exec-server trait, though these tests focus more on read/write/terminate behavior.
+**Call relations**: When `UnifiedExecProcess` talks to the mock through the `ExecProcess` interface, this method supplies the identity that a real execution server process would normally provide.
 
 
 ##### `MockExecProcess::subscribe_wake`  (lines 59–61)
@@ -8837,11 +8865,11 @@ fn process_id(&self) -> &ProcessId
 fn subscribe_wake(&self) -> watch::Receiver<u64>
 ```
 
-**Purpose**: Creates a wake-channel receiver for the mock remote process.
+**Purpose**: This gives callers a way to be notified when the fake process has new information to read. The notification uses a watch channel, which is like a small shared notice board that subscribers can watch for updates.
 
-**Data flow**: Reads `self.wake_tx`, calls `subscribe()`, and returns a `watch::Receiver<u64>`.
+**Data flow**: It reads the mock's stored wake sender and creates a new receiver subscribed to that sender. The caller gets the receiver; the mock keeps the sender.
 
-**Call relations**: Consumed by `UnifiedExecProcess::spawn_exec_server_output_task`, which waits on wake notifications between remote `read` polls.
+**Call relations**: The startup path for `UnifiedExecProcess` can subscribe to wake notices so it knows when to read from the remote process. In the early-exit test, the test sends a wake signal so the process wrapper notices the queued exit response.
 
 *Call graph*: 1 external calls (subscribe).
 
@@ -8852,11 +8880,11 @@ fn subscribe_wake(&self) -> watch::Receiver<u64>
 fn subscribe_events(&self) -> ExecProcessEventReceiver
 ```
 
-**Purpose**: Returns an empty exec-process event receiver because these tests do not use the event-stream API.
+**Purpose**: This returns an empty event stream for the fake process. The tests in this file do not need separate process events, so the mock deliberately says there are none.
 
-**Data flow**: Constructs and returns `ExecProcessEventReceiver::empty()`.
+**Data flow**: It takes no useful input and returns an empty `ExecProcessEventReceiver`. No stored state changes.
 
-**Call relations**: Satisfies the `ExecProcess` trait for the mock; the tested code path does not depend on these events.
+**Call relations**: When the real wrapper asks the mock for process events, this method keeps that part quiet so each test can focus on reads, writes, and termination.
 
 *Call graph*: calls 1 internal fn (empty).
 
@@ -8872,11 +8900,11 @@ fn read(
     ) -> ExecProcessFuture<'_, ReadResponse>
 ```
 
-**Purpose**: Implements the trait-level remote read call by delegating to the mock’s async read helper.
+**Purpose**: This supplies the next fake read result to code that is polling the remote process. It is how tests make the remote process appear to have output, to have exited, or to have nothing new.
 
-**Data flow**: Ignores the trait arguments, boxes the future returned by `MockExecProcess::read(self)`, and returns it as `ExecProcessFuture<'_, ReadResponse>`.
+**Data flow**: The caller may provide read-position and size hints, but this mock ignores them. It calls the mock's asynchronous read routine, which removes the next queued `ReadResponse`; if none is queued, it returns a default response saying there is no output and the process has not exited.
 
-**Call relations**: Called by the remote output task inside `UnifiedExecProcess` when polling the mock process for output and exit state.
+**Call relations**: The `UnifiedExecProcess` startup and polling logic call this through the `ExecProcess` interface. In the early-exit test, this is the path that delivers the preloaded response with exit code `17`.
 
 *Call graph*: 2 external calls (pin, new).
 
@@ -8887,11 +8915,11 @@ fn read(
 fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 ```
 
-**Purpose**: Implements the trait-level remote write call by returning the mock’s preconfigured write response.
+**Purpose**: This pretends to write bytes to the fake process's standard input. Instead of really sending data anywhere, it returns the preconfigured write result chosen by the test.
 
-**Data flow**: Ignores the input chunk, clones `self.write_response`, wraps it in an async `Ok(...)`, boxes that future, and returns it.
+**Data flow**: It receives a byte chunk but ignores its contents. It clones the stored `WriteResponse` and returns it asynchronously, leaving the mock unchanged.
 
-**Call relations**: Exercised by tests that verify how `UnifiedExecProcess::write` reacts to different remote `WriteStatus` values.
+**Call relations**: The write-failure tests call `UnifiedExecProcess.write`, which reaches this mock method underneath. By returning `UnknownProcess` or `StdinClosed`, the mock lets those tests check that the wrapper marks the process as exited.
 
 *Call graph*: 2 external calls (pin, clone).
 
@@ -8902,11 +8930,11 @@ fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Implements remote signaling as an unconditional success for test purposes.
+**Purpose**: This accepts a pretend signal, such as a request to interrupt a process, and always reports success. The tests here do not focus on signal behavior.
 
-**Data flow**: Ignores the requested `ProcessSignal`, returns a boxed async future resolving to `Ok(())`.
+**Data flow**: It receives a `ProcessSignal`, ignores it, and returns a successful asynchronous result. No state changes.
 
-**Call relations**: Present to satisfy the trait; these tests do not directly assert signal behavior.
+**Call relations**: This fills out the `ExecProcess` interface so the mock can stand in for a real remote process. It is available if the wrapper sends a signal, but these tests do not rely on signal effects.
 
 *Call graph*: 1 external calls (pin).
 
@@ -8917,11 +8945,11 @@ fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 fn terminate(&self) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Implements trait-level remote termination by delegating to the mock helper that may succeed or return a protocol error.
+**Purpose**: This pretends to terminate the fake remote process. It can either succeed or return a configured error, depending on what the test wants to prove.
 
-**Data flow**: Boxes the future from `MockExecProcess::terminate(self)` and returns it as `ExecProcessFuture<'_, ()>`.
+**Data flow**: It reads the mock's `terminate_error` field. If there is an error message, it returns a protocol error containing that message; otherwise it returns success. The method itself does not change the mock.
 
-**Call relations**: Used by `UnifiedExecProcess::terminate_confirmed` in tests that distinguish successful from failed remote termination.
+**Call relations**: The termination test calls `UnifiedExecProcess.terminate_confirmed`, which delegates to this mock method. The test uses both outcomes to confirm that the wrapper only marks the process exited after termination really succeeds.
 
 *Call graph*: 2 external calls (pin, Protocol).
 
@@ -8935,11 +8963,11 @@ async fn remote_process(
 ) -> UnifiedExecProcess
 ```
 
-**Purpose**: Creates a `UnifiedExecProcess` backed by a mock exec-server process with configurable write status and termination behavior.
+**Purpose**: This helper builds a `UnifiedExecProcess` around a fake remote process. Tests use it to quickly create a process with a chosen write result and optional termination error.
 
-**Data flow**: Takes a `WriteStatus` and optional terminate-error string, creates a wake watch channel, constructs `StartedExecProcess` containing `Arc<MockExecProcess>` with empty queued reads, then awaits `UnifiedExecProcess::from_exec_server_started(..., SandboxType::None)` and returns the resulting process.
+**Data flow**: It receives the write status the mock should return and an optional termination error message. It creates a wake channel, builds a `MockExecProcess`, wraps it in `StartedExecProcess`, and passes that into `UnifiedExecProcess::from_exec_server_started`. The result is a ready-to-test unified process.
 
-**Call relations**: Shared helper used by multiple tests to avoid repeating mock setup for common remote-process scenarios.
+**Call relations**: Several tests call this helper before exercising one behavior. It keeps each test short while still going through the real remote-process construction path.
 
 *Call graph*: calls 1 internal fn (from_exec_server_started); called by 4 (fail_and_terminate_preserves_failure_message, remote_terminate_confirmed_updates_state_on_success_only, remote_write_closed_stdin_marks_process_exited, remote_write_unknown_process_marks_process_exited); 4 external calls (new, new, new, channel).
 
@@ -8950,11 +8978,11 @@ async fn remote_process(
 async fn remote_write_unknown_process_marks_process_exited()
 ```
 
-**Purpose**: Verifies that a remote write returning `UnknownProcess` becomes a stdin-write error and marks the process exited.
+**Purpose**: This test proves that if the server says the process is unknown during a write, the unified process treats it as gone. That prevents later code from believing it can still talk to a missing process.
 
-**Data flow**: Builds a mock remote process with `WriteStatus::UnknownProcess`, awaits `process.write(b"hello")`, expects an error, then asserts the error matches `UnifiedExecError::WriteToStdin` and `process.has_exited()` is true.
+**Data flow**: It creates a remote process whose writes return `UnknownProcess`, then tries to write `hello`. The write returns a `WriteToStdin` error, and the process state changes to exited.
 
-**Call relations**: Exercises the remote branch of `UnifiedExecProcess::write` for the case where the exec server no longer recognizes the process.
+**Call relations**: The test uses `remote_process` to set up the fake server response, then calls the real `write` path on `UnifiedExecProcess`. The mock's write result drives the wrapper into the failure state being checked.
 
 *Call graph*: calls 1 internal fn (remote_process); 1 external calls (assert!).
 
@@ -8965,11 +8993,11 @@ async fn remote_write_unknown_process_marks_process_exited()
 async fn remote_write_closed_stdin_marks_process_exited()
 ```
 
-**Purpose**: Verifies that a remote write returning `StdinClosed` becomes a stdin-write error and marks the process exited.
+**Purpose**: This test proves that if the remote process says standard input is already closed, the unified process is marked as exited. In plain terms, if you can no longer feed the command input, this wrapper treats that as a finished or unusable process.
 
-**Data flow**: Builds a mock remote process with `WriteStatus::StdinClosed`, awaits `process.write(b"hello")`, expects an error, then asserts `WriteToStdin` and exited state.
+**Data flow**: It creates a remote process whose writes return `StdinClosed`, then attempts to write `hello`. The write fails with `WriteToStdin`, and the process records that it has exited.
 
-**Call relations**: Covers the sibling remote-write failure path where the process exists but stdin is no longer writable.
+**Call relations**: The test uses `remote_process` for setup and then exercises `UnifiedExecProcess.write`. The fake write response lets the test confirm the wrapper's state update after this specific remote-server answer.
 
 *Call graph*: calls 1 internal fn (remote_process); 1 external calls (assert!).
 
@@ -8980,11 +9008,11 @@ async fn remote_write_closed_stdin_marks_process_exited()
 async fn fail_and_terminate_preserves_failure_message()
 ```
 
-**Purpose**: Checks that the first failure message recorded on a process is retained even if `fail_and_terminate` is called again with a different message.
+**Purpose**: This test checks that the first failure reason is kept even if another failure is reported later. That matters because the first error is usually the clearest explanation of what really went wrong.
 
-**Data flow**: Creates a mock remote process, calls `fail_and_terminate("network denied")` and then `fail_and_terminate("second failure")`, then asserts the process has exited and `failure_message()` still returns the first string.
+**Data flow**: It creates a normally writable remote process, calls `fail_and_terminate` with `network denied`, then calls it again with `second failure`. The process ends up marked exited, and its stored failure message remains `network denied`.
 
-**Call relations**: Validates the one-time failure-message semantics implemented in `UnifiedExecProcess::fail_and_terminate`.
+**Call relations**: The test uses `remote_process` to get a real `UnifiedExecProcess` backed by the mock. It then calls the wrapper's failure path directly and checks that repeated failure handling does not overwrite the original message.
 
 *Call graph*: calls 1 internal fn (remote_process); 2 external calls (assert!, assert_eq!).
 
@@ -8995,11 +9023,11 @@ async fn fail_and_terminate_preserves_failure_message()
 async fn remote_terminate_confirmed_updates_state_on_success_only()
 ```
 
-**Purpose**: Ensures `terminate_confirmed` leaves process state unchanged when remote termination fails, but marks the process exited when termination succeeds.
+**Purpose**: This test makes sure confirmed termination changes the process state only when the remote termination actually succeeds. It guards against falsely reporting that a process is dead when the server failed to terminate it.
 
-**Data flow**: First creates a mock process whose terminate call returns an error, awaits `terminate_confirmed()`, expects `UnifiedExecError::ProcessFailed`, and asserts `has_exited()` is false. Then creates a second mock process with successful termination, awaits `terminate_confirmed()`, and asserts `has_exited()` is true.
+**Data flow**: First it creates a process whose terminate call returns an error, calls `terminate_confirmed`, and checks that an error comes back and the process is not marked exited. Then it creates a process whose terminate call succeeds, calls the same method, and checks that the process is marked exited.
 
-**Call relations**: Exercises the success/failure split in `UnifiedExecProcess::terminate_confirmed` for exec-server-backed processes.
+**Call relations**: Both halves use `remote_process` to build the wrapper with different mock termination behavior. The real `terminate_confirmed` method delegates to the mock's terminate path, and the test checks how the wrapper updates its own state afterward.
 
 *Call graph*: calls 1 internal fn (remote_process); 1 external calls (assert!).
 
@@ -9010,24 +9038,24 @@ async fn remote_terminate_confirmed_updates_state_on_success_only()
 async fn remote_process_waits_for_early_exit_event()
 ```
 
-**Purpose**: Verifies that `from_exec_server_started` observes an early remote exit delivered through the read/wake loop before returning.
+**Purpose**: This test checks that startup notices a remote process that exits very early. Without this, the wrapper might start in a stale state and miss the fact that the command has already finished.
 
-**Data flow**: Constructs a mock `StartedExecProcess` whose queued `ReadResponse` reports `exited: true`, `exit_code: Some(17)`, and `closed: true`; spawns a task that sends a wake notification after 10 ms; awaits `UnifiedExecProcess::from_exec_server_started`, then asserts the returned process has exited and reports exit code 17.
+**Data flow**: It builds a mock process with one queued read response saying the process exited with code `17`. A background task waits briefly and sends a wake notification. The unified process constructor receives that wake, reads the queued exit response, and returns a process already marked exited with exit code `17`.
 
-**Call relations**: Covers the constructor’s early-exit grace-period logic for remote processes, ensuring startup can synchronously surface short-lived failures.
+**Call relations**: Unlike the simpler tests, this one builds the mock inline so it can preload a specific read response and control the wake channel. It then calls `UnifiedExecProcess::from_exec_server_started`, which subscribes to wake notifications and reads from the mock before the assertions run.
 
 *Call graph*: calls 1 internal fn (from_exec_server_started); 10 external calls (new, from_millis, new, new, from, assert!, assert_eq!, spawn, sleep, channel).
 
 
 ### `core/src/unified_exec/mod_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is the main behavioral test suite for unified exec. It starts with helper functions that build a session/turn pair, collect environment variables, construct `ExecRequest` values, open commands with or without TTY, and write to stdin through `UnifiedExecProcessManager`. The central helper, `exec_command_with_tty`, mirrors real startup flow: allocate a process id, build a bash command and request, open the process, optionally store a `ProcessEntry` if the process remains alive, collect output until a deadline, and return an `ExecCommandToolOutput` with wall time, raw output, exit code, token count, and optional persistent `process_id`.
+The unified exec system is like a terminal clerk: it starts a command, watches its output for a while, decides whether the command is finished or should remain as a background terminal, and later lets the user type more into that same process. This test file checks that the clerk behaves correctly in normal and awkward situations.
 
-The file also defines two test doubles. `TestSpawnLifecycle` exposes inherited file descriptors to validate remote exec-server rejection. `BlockingTerminateExecProcess` implements the `ExecProcess` trait with controllable termination via `watch` and `Notify`, allowing race-condition tests around process removal and in-flight stdin polling.
+The tests create lightweight sessions and run bash commands through the same manager used by the real application. They verify that an interactive shell keeps its state across later writes, while a short one-shot command does not accidentally share that state. They also check timeout behavior: if output is not ready before the requested wait time, the process can keep running and later output can still be collected.
 
-The tests themselves span several layers: `HeadTailBuffer` default-capacity behavior; persistence of interactive shells across requests; isolation between separate sessions; timeout and pause semantics for output collection; stale-process handling after exit; synchronization when terminating during the initial exec response or during a later stdin poll; preservation of exit codes for completed non-TTY commands; successful use of a configured remote exec server; and explicit rejection of inherited-FD launches in remote mode. Several tests are sandbox-skipped or ignored where environment sensitivity would make them flaky. Overall, this file documents the subsystem’s expected end-to-end behavior under both normal and adversarial timing conditions.
+Several tests focus on cleanup and race conditions, which are bugs that happen when two async tasks act at nearly the same time. A fake process called BlockingTerminateExecProcess lets a test pause termination halfway through, like holding a door open, so the code can prove it removes processes only when it is safe. The file also tests output buffering, exit-code preservation, remote execution support, and the rule that remote exec servers cannot launch processes with inherited file descriptors.
 
 #### Function details
 
@@ -9037,11 +9065,11 @@ The tests themselves span several layers: `HeadTailBuffer` default-capacity beha
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>)
 ```
 
-**Purpose**: Creates a fresh session and turn context wrapped in `Arc`s for use across async unified-exec tests. It standardizes test setup.
+**Purpose**: Creates a fresh test session and turn context, then wraps both in shared pointers so async test code can pass them around safely. A session represents the larger conversation state, while a turn context represents one user request within it.
 
-**Data flow**: Awaits `make_session_and_context()`, receives owned `session` and `turn`, wraps each in `Arc`, and returns the pair.
+**Data flow**: It starts with no inputs. It asks the shared test helper to build a session and turn, then wraps each value in an Arc, which is a thread-safe shared reference. It returns both wrapped objects for tests that need to run commands through the real unified exec manager.
 
-**Call relations**: It is a shared helper invoked by many async tests before they open commands or manipulate process state. Those tests depend on it for isolated session fixtures.
+**Call relations**: Many integration-style tests call this first, including the persistence, timeout, pause, termination, and reuse tests. It delegates the actual setup to make_session_and_context, keeping each test focused on behavior instead of boilerplate setup.
 
 *Call graph*: calls 1 internal fn (make_session_and_context); called by 9 (completed_commands_do_not_persist_sessions, multi_unified_exec_sessions, requests_with_large_timeout_are_capped, reusing_completed_process_returns_unknown_process, terminating_during_stdin_poll_returns_exited_response, terminating_initial_exec_command_rechecks_initial_response_state, unified_exec_pause_blocks_yield_timeout, unified_exec_persists_across_requests, unified_exec_timeouts); 1 external calls (new).
 
@@ -9058,11 +9086,11 @@ async fn exec_command(
 ) -> Result<ExecCommandToolOutput, UnifiedExecError
 ```
 
-**Purpose**: Convenience wrapper that runs a command with TTY enabled using the common test helper path. It reduces duplication in tests that do not care about the TTY flag.
+**Purpose**: Runs a shell command in the test environment using the default terminal-like mode. Tests use it when they want the same behavior as an interactive command invocation.
 
-**Data flow**: Accepts session/turn references, command string, yield timeout, and optional working directory, forwards them to `exec_command_with_tty(..., true)`, and returns the resulting `Result<ExecCommandToolOutput, UnifiedExecError>`.
+**Data flow**: It receives a session, turn context, command text, wait time, and optional working directory. It forwards all of that to exec_command_with_tty and forces the tty flag to true. The result is an ExecCommandToolOutput containing collected output, timing, exit information, and possibly a background process id.
 
-**Call relations**: Many integration tests call this helper instead of `exec_command_with_tty` directly. It delegates all real work to the lower-level helper.
+**Call relations**: This is the convenient wrapper used by most tests. It hands the real work to exec_command_with_tty so tests do not need to repeat the terminal-mode argument.
 
 *Call graph*: calls 1 internal fn (exec_command_with_tty); called by 7 (completed_commands_do_not_persist_sessions, multi_unified_exec_sessions, requests_with_large_timeout_are_capped, reusing_completed_process_returns_unknown_process, unified_exec_pause_blocks_yield_timeout, unified_exec_persists_across_requests, unified_exec_timeouts).
 
@@ -9073,11 +9101,11 @@ async fn exec_command(
 fn shell_env() -> HashMap<String, String>
 ```
 
-**Purpose**: Captures the current process environment into a `HashMap` for constructing exec requests in tests. It ensures spawned commands inherit a realistic environment.
+**Purpose**: Captures the current process environment variables for use when launching test commands. This makes test shells inherit the same basic environment as the test runner.
 
-**Data flow**: Reads `std::env::vars()`, collects the iterator into `HashMap<String, String>`, and returns it.
+**Data flow**: It reads all environment variables from the operating system and collects them into a map from variable name to value. It returns that map to be placed into an ExecRequest.
 
-**Call relations**: It is used by `test_exec_request` callers such as `exec_command_with_tty` and remote-exec tests. The helper isolates environment collection from request construction.
+**Call relations**: Command-building helpers and remote-exec tests call this before constructing an execution request. It is a small bridge between the host test process and the shell process being launched.
 
 *Call graph*: called by 4 (completed_pipe_commands_preserve_exit_code, exec_command_with_tty, remote_exec_server_rejects_inherited_fd_launches, unified_exec_uses_remote_exec_server_when_configured); 1 external calls (vars).
 
@@ -9093,11 +9121,11 @@ fn test_exec_request(
 ) -> ExecRequest
 ```
 
-**Purpose**: Builds a concrete `ExecRequest` suitable for unified-exec tests with sandboxing disabled and shell-tool capture policy. It fills in the turn-derived permission and workspace metadata expected by process startup.
+**Purpose**: Builds an ExecRequest, which is the package of instructions needed to start a command. It chooses test-friendly defaults such as no sandbox and the standard shell capture policy.
 
-**Data flow**: Takes a `TurnContext`, command vector, cwd, and environment map; derives `permission_profile` from `turn.permission_profile()`, sets fixed values like `SandboxType::None`, `ExecExpiration::DefaultTimeout`, `ExecCapturePolicy::ShellTool`, and `windows_sandbox_private_desktop = false`, then returns `ExecRequest::new(...)`.
+**Data flow**: It receives the turn context, command arguments, working directory, and environment map. It reads permission and workspace settings from the turn, combines them with timeout, capture, sandbox, and network defaults, and returns a complete request object ready for the exec manager.
 
-**Call relations**: It is called by `exec_command_with_tty` and several direct process-opening tests. Those callers use it to avoid repeating the full `ExecRequest` parameter list.
+**Call relations**: exec_command_with_tty and several lower-level tests call this before opening a process. It centralizes request setup so all tests exercise the same launch configuration unless a test deliberately changes something else.
 
 *Call graph*: calls 2 internal fn (new, permission_profile); called by 4 (completed_pipe_commands_preserve_exit_code, exec_command_with_tty, remote_exec_server_rejects_inherited_fd_launches, unified_exec_uses_remote_exec_server_when_configured).
 
@@ -9115,11 +9143,11 @@ async fn exec_command_with_tty(
 ) -> Result<ExecCommandTool
 ```
 
-**Purpose**: Imitates the real unified-exec startup path inside tests, including process-id allocation, process opening, optional persistence, output collection, and response assembly. It is the core helper behind most end-to-end tests in this file.
+**Purpose**: Starts a command through the unified exec manager, waits for output until a deadline, and returns the same kind of result the real command tool would return. It can launch either with or without terminal behavior depending on the tty flag.
 
-**Data flow**: Accepts session/turn references, command text, yield timeout, optional workdir, and `tty`. It allocates a process id from the manager, resolves cwd relative to the turn, builds a bash command vector and `ExecRequest`, opens the process with `open_session_with_exec_env`, constructs `UnifiedExecContext`, records `started_at`, and if the process is still alive inserts a `ProcessEntry` into `process_store`. It then reads `OutputHandles`, computes a deadline, awaits `UnifiedExecProcessManager::collect_output_until_deadline`, derives wall time, text, exit state, and whether to return a persistent `process_id`, possibly releases the id if the process already exited, clears `initial_exec_command_active` when appropriate, and returns an `ExecCommandToolOutput` populated with chunk id, raw output, truncation policy, token count, hook command, and exit metadata.
+**Data flow**: It receives the session, turn, command text, yield wait time, optional working directory, and terminal flag. It allocates a process id, builds a bash command and ExecRequest, opens the process, stores it if it is still alive, then collects output until the deadline or process completion. It returns an ExecCommandToolOutput with raw output, token count estimate, elapsed time, exit code, and a process id only if the command is still running in the background.
 
-**Call relations**: This helper is called by `exec_command` and underpins most integration tests. It exercises real manager and process code while manually performing some storage and response bookkeeping to keep tests explicit.
+**Call relations**: exec_command calls this as the main command runner for tests. Inside, it uses shell_env and test_exec_request for launch setup, then relies on UnifiedExecProcessManager output collection so the tests exercise the production path.
 
 *Call graph*: calls 3 internal fn (new, shell_env, test_exec_request); called by 1 (exec_command); 11 external calls (clone, downgrade, new, new, from_millis, now, from_utf8_lossy, approx_token_count, collect_output_until_deadline, new (+1 more)).
 
@@ -9130,11 +9158,11 @@ async fn exec_command_with_tty(
 fn inherited_fds(&self) -> Vec<i32>
 ```
 
-**Purpose**: Returns the configured inherited file descriptors for the test spawn lifecycle. It lets tests simulate launches that request FD inheritance.
+**Purpose**: Reports a test-controlled list of inherited file descriptors. A file descriptor is a small operating-system number that points to an open file, pipe, or socket.
 
-**Data flow**: Reads `self.inherited_fds`, clones the vector, and returns it.
+**Data flow**: It reads the inherited_fds field from the test struct, clones the list, and returns it. It does not change any state.
 
-**Call relations**: This trait method is consumed by process-opening code during remote exec-server tests. In this file it supports the case that verifies inherited FDs are rejected remotely.
+**Call relations**: The remote inherited-file-descriptor rejection test passes this lifecycle object into process launch. The exec manager asks this method what descriptors should be inherited, which lets the test prove remote launching rejects that unsupported feature.
 
 
 ##### `BlockingTerminateExecProcess::process_id`  (lines 246–248)
@@ -9143,11 +9171,11 @@ fn inherited_fds(&self) -> Vec<i32>
 fn process_id(&self) -> &ProcessId
 ```
 
-**Purpose**: Implements the `ExecProcess` trait accessor for the mock blocking process’s id. It exposes the stored `ProcessId` by reference.
+**Purpose**: Returns the fake process's id. This lets the fake object satisfy the same interface as a real exec-server process.
 
-**Data flow**: Returns `&self.process_id` without mutation.
+**Data flow**: It reads the process_id stored in the fake process and returns a reference to it. Nothing is created or changed.
 
-**Call relations**: This trait method is used by `UnifiedExecProcess::from_exec_server_started` and any code interacting with the mock through the `ExecProcess` interface.
+**Call relations**: The unified process wrapper calls this through the ExecProcess interface whenever it needs to identify the fake process. It is part of making the blocking fake look like a real process to the code under test.
 
 
 ##### `BlockingTerminateExecProcess::subscribe_wake`  (lines 250–252)
@@ -9156,11 +9184,11 @@ fn process_id(&self) -> &ProcessId
 fn subscribe_wake(&self) -> watch::Receiver<u64>
 ```
 
-**Purpose**: Provides a watch receiver for wake notifications from the mock process. It satisfies the `ExecProcess` trait contract.
+**Purpose**: Lets callers subscribe to wake-up notifications from the fake process. Wake notifications are used to tell the output collector that there may be new data to read.
 
-**Data flow**: Calls `self.wake_tx.subscribe()` and returns the new `watch::Receiver<u64>`.
+**Data flow**: It takes the fake process's watch channel sender and creates a new receiver subscribed to it. The returned receiver can observe future wake values.
 
-**Call relations**: This method is invoked by code that wraps or polls the mock process through the exec-server abstraction. It supports the blocking-termination race tests.
+**Call relations**: The unified exec wrapper uses this method through the ExecProcess interface. In these tests the fake process does not produce real output, but the subscription is still needed to satisfy the normal process contract.
 
 *Call graph*: 1 external calls (subscribe).
 
@@ -9171,11 +9199,11 @@ fn subscribe_wake(&self) -> watch::Receiver<u64>
 fn subscribe_events(&self) -> ExecProcessEventReceiver
 ```
 
-**Purpose**: Returns an empty event receiver for the mock process. The mock does not emit exec-server events beyond the explicit methods under test.
+**Purpose**: Returns an empty stream of process events for the fake process. This says, in effect, that the fake process has no extra lifecycle messages to report.
 
-**Data flow**: Constructs and returns `ExecProcessEventReceiver::empty()`.
+**Data flow**: It does not read meaningful input state. It creates and returns an empty event receiver.
 
-**Call relations**: It fulfills the `ExecProcess` trait for the mock used in termination tests. No other helper in this file depends on emitted events from this receiver.
+**Call relations**: The unified process wrapper calls this while adapting the fake exec-server process. Returning an empty receiver keeps the test focused on termination timing rather than event delivery.
 
 *Call graph*: calls 1 internal fn (empty).
 
@@ -9191,11 +9219,11 @@ fn read(
     ) -> ExecProcessFuture<'_, ReadResponse>
 ```
 
-**Purpose**: Implements the trait-level async read entrypoint for the mock process by boxing the internal async `read` future. It always reports no output and no exit.
+**Purpose**: Pretends to read from the fake process and always reports no output and no exit. This keeps the fake process alive from the point of view of the output collector.
 
-**Data flow**: Ignores the trait arguments `_after_seq`, `_max_bytes`, and `_wait_ms`, creates `Box::pin(BlockingTerminateExecProcess::read(self))`, and returns the boxed future.
+**Data flow**: It ignores read parameters, builds a ReadResponse with no chunks, no exit code, and closed set to false, then returns it successfully.
 
-**Call relations**: This trait adapter is used when the unified-exec wrapper interacts with the mock process through `ExecProcess`. It delegates to the inherent async `read` method defined earlier in the impl block.
+**Call relations**: The ExecProcess trait method boxes this async helper so the production wrapper can call it like any real process read. The termination race tests depend on this predictable never-exited response.
 
 *Call graph*: 2 external calls (pin, new).
 
@@ -9206,11 +9234,11 @@ fn read(
 fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 ```
 
-**Purpose**: Implements the trait-level async write entrypoint for the mock process by boxing the internal async `write` future. The mock always accepts writes.
+**Purpose**: Pretends to accept input sent to the fake process. It does not store or interpret the input; it only reports success.
 
-**Data flow**: Ignores the provided `_chunk`, returns `Box::pin(BlockingTerminateExecProcess::write(self))`, and ultimately yields a `WriteResponse { status: WriteStatus::Accepted }`.
+**Data flow**: It ignores the written bytes and returns a WriteResponse with status Accepted. No state changes occur.
 
-**Call relations**: This adapter is part of the mock `ExecProcess` implementation used by termination-race tests. It delegates to the inherent async `write` helper.
+**Call relations**: The ExecProcess trait method wraps this helper for callers that write to a process. It exists so the fake process can be used wherever a real process is expected.
 
 *Call graph*: 1 external calls (pin).
 
@@ -9221,11 +9249,11 @@ fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Implements process signaling for the mock by returning an immediately successful future. Signals are not modeled in these tests.
+**Purpose**: Pretends to send a signal to the fake process and always succeeds. A signal is an operating-system-style instruction such as interrupt or terminate.
 
-**Data flow**: Ignores `_signal`, returns a boxed async block that resolves to `Ok(())`.
+**Data flow**: It ignores the requested signal and returns success from a small async block. It changes no state.
 
-**Call relations**: This trait method exists only to satisfy the `ExecProcess` interface for the mock process used in termination tests.
+**Call relations**: This is part of the ExecProcess interface implementation. The tests in this file focus on terminate, not signal behavior, so this method provides a harmless placeholder.
 
 *Call graph*: 1 external calls (pin).
 
@@ -9236,11 +9264,11 @@ fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 fn terminate(&self) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait-level terminate entrypoint by boxing the internal async termination routine. The routine blocks until the test explicitly allows termination to proceed.
+**Purpose**: Starts fake termination, announces that termination has begun, and then waits until the test explicitly allows it to finish. This gives tests control over a race that would otherwise be hard to reproduce.
 
-**Data flow**: Returns `Box::pin(BlockingTerminateExecProcess::terminate(self))`; the underlying async method sends `true` on `terminate_started`, waits on `allow_terminate`, and then resolves successfully.
+**Data flow**: It sends true on a watch channel to notify the test that termination reached the waiting point. Then it waits on a Notify object. Once the test wakes it, it returns success.
 
-**Call relations**: This adapter is central to the race-condition tests that need termination to pause mid-flight. It delegates to the inherent async terminate method so tests can observe and control progress.
+**Call relations**: Termination-focused tests use this through the ExecProcess interface. By blocking in the middle, it lets those tests change process-store state before termination completes and verify the manager reacts safely.
 
 *Call graph*: 2 external calls (pin, send).
 
@@ -9255,11 +9283,11 @@ async fn blocking_terminate_unified_process(
 ) -> anyhow::Result<Arc<UnifiedExecProcess>>
 ```
 
-**Purpose**: Builds a `UnifiedExecProcess` backed by the blocking mock exec-server process. It gives tests a controllable process whose termination can be delayed.
+**Purpose**: Builds a UnifiedExecProcess around the fake BlockingTerminateExecProcess. This lets tests plug a controlled fake process into the same manager storage used for real processes.
 
-**Data flow**: Accepts a numeric `process_id`, a `watch::Sender<bool>` for termination-start notification, and an `Arc<Notify>` gate. It creates a wake watch channel, constructs `StartedExecProcess` containing an `Arc<BlockingTerminateExecProcess>` with those controls, awaits `UnifiedExecProcess::from_exec_server_started(..., SandboxType::None)`, wraps the result in `Arc`, and returns it inside `anyhow::Result`.
+**Data flow**: It receives a numeric process id, a sender used to announce termination start, and a notification used to release termination. It creates a wake channel, constructs the fake exec-server process, wraps it as a started process, converts it into a UnifiedExecProcess, and returns it in a shared Arc.
 
-**Call relations**: It is called by the two termination-race tests to seed `process_store` with a controllable process. Those tests then interact with the resulting `UnifiedExecProcess` through normal manager/session APIs.
+**Call relations**: The two termination race tests call this when they need a process whose termination can be paused. It hands the fake to UnifiedExecProcess::from_exec_server_started so the rest of the code sees a normal unified process.
 
 *Call graph*: calls 1 internal fn (from_exec_server_started); called by 2 (terminating_during_stdin_poll_returns_exited_response, terminating_initial_exec_command_rechecks_initial_response_state); 2 external calls (new, channel).
 
@@ -9275,11 +9303,11 @@ async fn write_stdin(
 ) -> Result<ExecCommandToolOutput, UnifiedExecError>
 ```
 
-**Purpose**: Convenience helper that sends input to an existing unified-exec process using a fixed token truncation policy. It mirrors the public write-stdin API used by production code.
+**Purpose**: Sends input text to an already-running background process and asks the unified exec manager to collect output for a short time afterward.
 
-**Data flow**: Accepts session reference, `process_id`, input string, and yield timeout; constructs `WriteStdinRequest { process_id, input, yield_time_ms, max_output_tokens: None, truncation_policy: TruncationPolicy::Tokens(10_000) }`; awaits `session.services.unified_exec_manager.write_stdin(...)`; and returns the resulting tool output or error.
+**Data flow**: It receives a session, process id, input string, and wait time. It builds a WriteStdinRequest with a generous token truncation setting, passes it to the session's unified exec manager, and returns the resulting command-style output or an error.
 
-**Call relations**: Many tests call this helper after opening a persistent shell. It delegates directly to the manager’s `write_stdin` implementation.
+**Call relations**: Interactive-shell tests call this after exec_command has left a process running. It is the test helper for exercising the production write_stdin path.
 
 *Call graph*: called by 5 (multi_unified_exec_sessions, reusing_completed_process_returns_unknown_process, terminating_during_stdin_poll_returns_exited_response, unified_exec_persists_across_requests, unified_exec_timeouts); 1 external calls (Tokens).
 
@@ -9290,11 +9318,11 @@ async fn write_stdin(
 fn push_chunk_preserves_prefix_and_suffix()
 ```
 
-**Purpose**: Checks that the default-capacity head/tail buffer retains the earliest bytes and newest appended chunks when overfilled. It validates chunk-level snapshot ordering under the production byte cap.
+**Purpose**: Checks that the head-tail output buffer keeps both the beginning and the newest end of oversized output. This matters because users need early context and the latest output when output is too large to keep fully.
 
-**Data flow**: Creates `HeadTailBuffer::default()`, pushes a full-capacity chunk of `b'a'`, then single-byte `b'b'` and `b'c'`, asserts retained bytes equal `UNIFIED_EXEC_OUTPUT_MAX_BYTES`, snapshots chunks, and checks the first retained byte is `a`, some chunk equals `b`, and the last chunk equals `c`.
+**Data flow**: It creates a default HeadTailBuffer, pushes a full-sized chunk of 'a' bytes, then pushes small 'b' and 'c' chunks. It snapshots the retained chunks and asserts that the first byte from the prefix, the middle small chunk, and the final suffix chunk are all still represented.
 
-**Call relations**: This unit test is run by the harness and complements the dedicated head-tail buffer test file by exercising the default-capacity constructor used in production.
+**Call relations**: This standalone unit test directly exercises HeadTailBuffer behavior. It does not go through the exec manager; it verifies the buffer foundation that command output collection relies on.
 
 *Call graph*: calls 1 internal fn (default); 3 external calls (assert!, assert_eq!, vec!).
 
@@ -9305,11 +9333,11 @@ fn push_chunk_preserves_prefix_and_suffix()
 fn head_tail_buffer_default_preserves_prefix_and_suffix()
 ```
 
-**Purpose**: Verifies the rendered output of the default-capacity buffer after overflow, ensuring the first byte of the original prefix and the latest suffix bytes are both retained. It is a simpler flattened-output counterpart to the snapshot test.
+**Purpose**: Checks the simpler rendered form of the head-tail buffer: even after more data than the limit arrives, the final byte stream should still begin with the original prefix and end with the latest suffix.
 
-**Data flow**: Creates `HeadTailBuffer::default()`, pushes a full-capacity `a` chunk and then `"bc"`, calls `to_bytes()`, and asserts the first byte is `a` and the output ends with `"bc"`.
+**Data flow**: It creates a buffer, pushes a maximum-sized block of 'a' bytes, then pushes 'bc'. It renders the buffer to bytes and asserts that the first byte is 'a' and the output ends with 'bc'.
 
-**Call relations**: This harness-driven test documents the default retention policy in terms of flattened bytes rather than chunk boundaries.
+**Call relations**: Like the other buffer test, this runs directly against HeadTailBuffer. It protects the behavior used when unified exec turns collected chunks back into output text.
 
 *Call graph*: calls 1 internal fn (default); 3 external calls (assert!, assert_eq!, vec!).
 
@@ -9320,11 +9348,11 @@ fn head_tail_buffer_default_preserves_prefix_and_suffix()
 async fn unified_exec_persists_across_requests() -> anyhow::Result<()>
 ```
 
-**Purpose**: Tests that an interactive shell remains alive across multiple requests, preserves environment state, appears in background-terminal listings, and can be terminated exactly once. It is the core persistence scenario for unified exec.
+**Purpose**: Proves that an interactive shell stays alive across separate writes and preserves state, such as exported environment variables. It also checks that background terminals can be listed and terminated.
 
-**Data flow**: Skips under sandbox, creates a session/turn, opens `bash -i` via `exec_command`, extracts the returned `process_id`, asserts `session.list_background_terminals()` contains one matching `BackgroundTerminalInfo`, writes an export command with `write_stdin`, writes an echo command and asserts the resulting truncated output contains `codex`, then calls `terminate_background_terminal` twice and checks the first returns true, the second false, and the terminal list becomes empty.
+**Data flow**: It creates a test session, starts bash interactively, gets its process id, and checks that the session reports it as a background terminal. It writes an environment variable into the shell, later echoes it, verifies the value appears, then terminates the terminal and confirms it is gone.
 
-**Call relations**: This integration test uses `test_session_and_turn`, `exec_command`, and `write_stdin` to exercise the full manager/session path for persistent interactive processes.
+**Call relations**: The test uses test_session_and_turn, exec_command, and write_stdin to drive the production manager. It also calls session-level listing and termination methods to verify the user-visible background terminal flow.
 
 *Call graph*: calls 3 internal fn (exec_command, test_session_and_turn, write_stdin); 3 external calls (assert!, assert_eq!, skip_if_sandbox!).
 
@@ -9335,11 +9363,11 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()>
 async fn multi_unified_exec_sessions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a persistent interactive shell keeps its own state while a separate one-shot command runs in a fresh shell without inheriting that state. It checks isolation between sessions and persistence within a session.
+**Purpose**: Checks that a persistent interactive shell does not leak its state into a separate short command. In plain terms, one terminal's private notes should not appear in a fresh terminal.
 
-**Data flow**: Skips under sandbox, creates a session/turn, opens `bash -i`, stores its `process_id`, exports an environment variable into that shell, runs a separate `exec_command("echo $CODEX_INTERACTIVE_SHELL_VAR")`, sleeps two seconds, asserts the short command returned no `process_id` and its output does not contain `codex`, then writes an echo command back to the original shell and asserts that output does contain `codex`.
+**Data flow**: It starts an interactive shell, writes an environment variable into it, then runs a separate one-shot echo command. It confirms the short command does not show the variable and does not remain as a background process, then writes back to the original shell and confirms the variable is still there.
 
-**Call relations**: This test builds on the same helpers as the persistence test but contrasts persistent-shell state with fresh-command isolation. It exercises both startup and stdin-write paths.
+**Call relations**: This test uses exec_command for both persistent and one-shot commands, plus write_stdin for the existing shell. It demonstrates the difference between reusing a stored process and launching a fresh command.
 
 *Call graph*: calls 3 internal fn (exec_command, test_session_and_turn, write_stdin); 4 external calls (from_secs, assert!, skip_if_sandbox!, sleep).
 
@@ -9350,11 +9378,11 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()>
 async fn unified_exec_timeouts() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that short yield timeouts can return incomplete output from a long-running command and that a later poll retrieves the delayed output. It validates incremental polling semantics for persistent shells.
+**Purpose**: Verifies that a short wait time does not kill a still-running interactive command. Output that arrives later should be retrievable in a later poll.
 
-**Data flow**: Skips under sandbox, creates a session/turn, opens `bash -i`, exports a known variable, writes `sleep 5 && echo ...` with a 10ms yield timeout and asserts the immediate output does not contain the variable value, sleeps seven seconds, then polls the shell with an empty `write_stdin` and asserts the later output now contains the value.
+**Data flow**: It opens an interactive shell, sets an environment variable, then sends a command that sleeps before echoing the variable while asking for only a tiny wait. It confirms the first response does not include the delayed output, waits long enough for the command to finish, polls again with empty input, and confirms the delayed output appears.
 
-**Call relations**: This integration test uses `exec_command` and `write_stdin` to exercise timeout behavior in the manager’s output collection logic for persistent processes.
+**Call relations**: The test is built from test_session_and_turn, exec_command, and write_stdin. It exercises the output collection deadline without treating deadline expiry as process failure.
 
 *Call graph*: calls 3 internal fn (exec_command, test_session_and_turn, write_stdin); 5 external calls (from_secs, assert!, format!, skip_if_sandbox!, sleep).
 
@@ -9365,11 +9393,11 @@ async fn unified_exec_timeouts() -> anyhow::Result<()>
 async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that the out-of-band elicitation pause state suspends the yield-time countdown, causing exec collection to wait until the pause is lifted before timing out. It ensures pauses do not silently consume the caller’s output window.
+**Purpose**: Checks that an out-of-band pause stops the yield timer from expiring too early. This matters when the system temporarily pauses for another interaction and should not unfairly cut off command output collection.
 
-**Data flow**: Skips under sandbox, creates a session/turn, sets the session pause state to true, spawns a task that sleeps two seconds and clears the pause, records `started = Instant::now()`, runs `exec_command("sleep 1 && echo unified-exec-done", 250ms)`, then asserts elapsed time is at least two seconds, output contains `unified-exec-done`, and no persistent `process_id` is returned.
+**Data flow**: It creates a session, marks it paused, and spawns a task that unpauses it after two seconds. It runs a command with a much shorter nominal wait time, then verifies the call lasted at least as long as the pause, collected the command output, and did not leave a background process.
 
-**Call relations**: This test drives the pause-aware output collection path indirectly through `exec_command`. It relies on session pause state and a spawned unpause task to create the timing condition.
+**Call relations**: The test uses test_session_and_turn to set up state and exec_command to run the command. The output collector receives the session's pause state through the normal helper path, so the test checks real production timing behavior.
 
 *Call graph*: calls 2 internal fn (exec_command, test_session_and_turn); 7 external calls (clone, from_secs, assert!, skip_if_sandbox!, spawn, now, sleep).
 
@@ -9380,11 +9408,11 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()>
 async fn requests_with_large_timeout_are_capped() -> anyhow::Result<()>
 ```
 
-**Purpose**: Intended to verify that excessively large requested yield timeouts are capped by subsystem policy. The test is currently ignored pending a better validation strategy.
+**Purpose**: Documents the expected behavior that very large requested wait times should be capped. The test is currently ignored, meaning it is not run automatically while a better testing approach is planned.
 
-**Data flow**: Creates a session/turn, runs `exec_command("echo codex", 120_000ms)`, and asserts a process id is present and output contains `codex`.
+**Data flow**: It creates a session, runs a simple echo command with a very large requested wait time, then checks that output contains the expected text and that a process id is reported according to the behavior being documented.
 
-**Call relations**: Although ignored, this test targets the timeout normalization behavior used by exec startup. It uses the standard helper path rather than calling `clamp_yield_time` directly.
+**Call relations**: It uses the same test_session_and_turn and exec_command helpers as the active command tests. Because it is ignored, it serves more as a pending specification than an active guardrail.
 
 *Call graph*: calls 2 internal fn (exec_command, test_session_and_turn); 1 external calls (assert!).
 
@@ -9395,11 +9423,11 @@ async fn requests_with_large_timeout_are_capped() -> anyhow::Result<()>
 async fn completed_commands_do_not_persist_sessions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Intended to assert that commands which finish promptly do not remain stored as background sessions. It is currently ignored.
+**Purpose**: Documents the expectation that completed commands should not remain in the background process store. This test is currently ignored while the project looks for a better way to check it.
 
-**Data flow**: Creates a session/turn, runs `exec_command("echo codex", 2_500ms)`, asserts a process id is present and output contains `codex`, then inspects `process_store` and asserts `processes` is empty.
+**Data flow**: It creates a session, runs a simple echo command, verifies the output, then inspects the manager's process store and expects it to be empty after completion.
 
-**Call relations**: This ignored test probes the cleanup behavior after command completion. It uses the same helper path as active integration tests but checks manager internals afterward.
+**Call relations**: It drives the normal exec_command helper and then looks directly at the unified exec manager's internal store. As an ignored test, it records desired cleanup behavior without running in normal test passes.
 
 *Call graph*: calls 2 internal fn (exec_command, test_session_and_turn); 1 external calls (assert!).
 
@@ -9410,11 +9438,11 @@ async fn completed_commands_do_not_persist_sessions() -> anyhow::Result<()>
 async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that once a persistent shell exits and is cleaned up, later stdin writes against its old process id fail with `UnknownProcessId`. It also checks that the reported id matches the requested one.
+**Purpose**: Verifies that once a background process has exited and been cleaned up, later attempts to write to that old process id fail with a clear unknown-process error.
 
-**Data flow**: Skips under sandbox, creates a session/turn, opens `bash -i`, captures `process_id`, writes `exit\n`, sleeps 200ms, then calls `write_stdin` with empty input and expects an error. It pattern-matches the error as `UnifiedExecError::UnknownProcessId { process_id: err_id }`, asserts `err_id == process_id`, and finally asserts the manager’s `process_store.processes` map is empty.
+**Data flow**: It opens an interactive shell, sends exit to it, waits briefly for cleanup, then tries to write again using the same process id. It expects an UnknownProcessId error containing that id and confirms the process store is empty.
 
-**Call relations**: This integration test uses `exec_command` and `write_stdin` to exercise process cleanup and stale-id error propagation after shell exit.
+**Call relations**: The test starts with exec_command, uses write_stdin to exit and then retry, and checks the specific UnifiedExecError variant. It protects users from silently writing to a dead or reused terminal.
 
 *Call graph*: calls 3 internal fn (exec_command, test_session_and_turn, write_stdin); 6 external calls (from_millis, assert!, assert_eq!, panic!, skip_if_sandbox!, sleep).
 
@@ -9425,11 +9453,11 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
 async fn terminating_initial_exec_command_rechecks_initial_response_state() -> anyhow::Result<()>
 ```
 
-**Purpose**: Tests a race where termination begins while the initial exec response is still considered active, and verifies that once that flag is cleared the process can be removed cleanly. It guards synchronization between termination and initial-response bookkeeping.
+**Purpose**: Checks a delicate race during termination of a process whose first command response is still being prepared. The manager must re-check whether that first response is still active before deciding how to remove the process.
 
-**Data flow**: Creates a session/turn and manager, allocates a process id, builds a blocking mock process with watch/notify controls, inserts a `ProcessEntry` with `initial_exec_command_active = true` into `process_store`, spawns `session.terminate_background_terminal(process_id)`, waits until termination has started, then manually flips `initial_exec_command_active` to false inside the store, notifies the terminate gate, awaits the terminate task, asserts it returned true, and confirms the process entry is gone.
+**Data flow**: It creates a fake process whose terminate call blocks, inserts it into the process store marked as still in its initial response, and starts termination in another task. After termination has begun, the test flips the initial-response flag to false, releases the fake terminate call, and confirms termination succeeds and removes the process from the store.
 
-**Call relations**: This test uses `blocking_terminate_unified_process` plus direct `process_store` manipulation to simulate a precise race that ordinary command helpers cannot create. It exercises session termination logic against manager state transitions.
+**Call relations**: This test uses test_session_and_turn for setup and blocking_terminate_unified_process for the controllable fake. It calls the session's terminate_background_terminal method while manually adjusting stored process state to reproduce the timing window.
 
 *Call graph*: calls 2 internal fn (blocking_terminate_unified_process, test_session_and_turn); 11 external calls (clone, downgrade, new, from_secs, now, new, assert!, new, spawn, timeout (+1 more)).
 
@@ -9440,11 +9468,11 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
 async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that if a process is terminated while a long stdin poll is in progress, the poll completes with a non-persistent exited response rather than hanging or returning a stale process id. It checks coordination between polling and process release.
+**Purpose**: Checks that if a process is terminated while a write-stdin poll is waiting for output, the waiting call finishes cleanly instead of hanging. The response should say there is no continuing background process.
 
-**Data flow**: Creates a session/turn and manager, allocates a process id, builds a blocking mock process, inserts a `ProcessEntry` with `initial_exec_command_active = false` and an old `last_used`, spawns a long-timeout empty `write_stdin`, waits until `last_used` changes to confirm polling has started, releases the process id, notifies termination, awaits `process.terminate_confirmed()`, then awaits the poll task and asserts `output.process_id == None` and the store is empty.
+**Data flow**: It inserts a fake blocking-terminate process into the store, starts a long write_stdin poll in another task, waits until that poll has begun, then releases the process id and allows termination to complete. It waits for the poll result, checks that no process id is returned, and confirms the store is empty.
 
-**Call relations**: This race-condition test combines `blocking_terminate_unified_process` with the `write_stdin` helper to exercise manager behavior when termination overlaps an in-flight poll.
+**Call relations**: The test combines blocking_terminate_unified_process with the normal write_stdin helper. It intentionally overlaps polling and termination to prove the manager wakes or resolves callers correctly when a process disappears.
 
 *Call graph*: calls 3 internal fn (blocking_terminate_unified_process, test_session_and_turn, write_stdin); 14 external calls (clone, downgrade, new, from_millis, from_secs, now, new, assert!, assert_eq!, new (+4 more)).
 
@@ -9455,11 +9483,11 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
 async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a non-interactive command run without TTY preserves its actual exit code after completion. It validates exit-code propagation through the unified-exec process wrapper.
+**Purpose**: Verifies that a non-terminal command that exits quickly still records its real exit code. This is important because command failure or success often depends entirely on that number.
 
-**Data flow**: Creates a turn via `make_session_and_context`, builds an `ExecRequest` for `bash -lc 'exit 17'`, opens it with `UnifiedExecProcessManager::default().open_session_with_exec_env(..., tty = false, ...)`, waits for cancellation if the process has not yet exited, then asserts `process.has_exited()` and `process.exit_code() == Some(17)`.
+**Data flow**: It creates a request for bash to exit with code 17, opens it without terminal behavior, waits for the process to report exit if needed, then asserts that the process is exited and its exit code is Some(17).
 
-**Call relations**: This integration test bypasses the higher-level command helper and talks directly to process startup to focus on exit-code behavior for completed pipe commands.
+**Call relations**: This test uses make_session_and_context, shell_env, and test_exec_request for setup, then calls UnifiedExecProcessManager::open_session_with_exec_env directly. It bypasses the higher-level exec_command helper to inspect the process object itself.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, default, shell_env, test_exec_request, default_for_tests); 4 external calls (new, assert!, assert_eq!, vec!).
 
@@ -9470,11 +9498,11 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()>
 async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that unified exec can launch and interact with a remote exec server when the test environment provides one. It confirms output can be written and collected through the remote-backed process.
+**Purpose**: Checks that unified exec can launch and communicate with a remote exec server when a remote test environment is configured. A remote exec server means the shell process runs somewhere other than the local test process.
 
-**Data flow**: Skips under sandbox and returns early if no remote env is configured, obtains the remote test environment, builds a turn and `ExecRequest` for interactive bash in the remote cwd, opens the process with `UnifiedExecProcessManager::default().open_session_with_exec_env(..., tty = true, remote environment)`, writes `printf 'remote-unified-exec\n'` to the process, sleeps briefly, collects output via `collect_output_until_deadline` using the process’s `OutputHandles`, and asserts the collected bytes contain `remote-unified-exec`.
+**Data flow**: It skips when remote testing is unavailable, builds a request for an interactive bash in the remote environment, opens the process through the manager, writes a printf command, waits briefly, collects output from the process handles, and verifies the remote text appears.
 
-**Call relations**: This test directly exercises remote-process startup and output collection rather than the higher-level helper path. It validates integration between unified exec and the remote exec-server backend.
+**Call relations**: The test uses shell_env and test_exec_request for launch setup and calls the manager directly with the remote environment. It then uses the same collect_output_until_deadline path used by normal unified exec output collection.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, default, shell_env, test_exec_request, test_env); 9 external calls (new, from_millis, now, assert!, collect_output_until_deadline, get_remote_test_env, skip_if_sandbox!, sleep, vec!).
 
@@ -9485,10 +9513,10 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
 async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that remote exec-server launches fail when the spawn lifecycle requests inherited file descriptors, which the remote backend does not support. It checks the exact surfaced error message.
+**Purpose**: Verifies that remote exec refuses launches that ask to inherit local file descriptors. This prevents pretending a remote machine can use open local files or sockets that only exist in the caller's process.
 
-**Data flow**: Skips under sandbox and returns early if no remote env is configured, obtains the remote environment, mutates the turn’s primary environment to use it, builds a local cwd `ExecRequest`, creates a default manager, calls `open_session_with_exec_env` with `TestSpawnLifecycle { inherited_fds: vec![42] }`, expects an error, and asserts `err.to_string()` equals the specific create-process failure message about unsupported inherited file descriptors.
+**Data flow**: It prepares a remote turn environment, builds a command request, and calls the manager with a TestSpawnLifecycle that reports one inherited descriptor. It expects launch to fail and checks the error message says remote exec-server does not support inherited file descriptors.
 
-**Call relations**: This test uses `TestSpawnLifecycle::inherited_fds` to force the unsupported condition and then exercises direct process opening. It validates startup-time rejection and error wrapping for remote mode.
+**Call relations**: This test uses TestSpawnLifecycle::inherited_fds through the spawn lifecycle interface. It calls the same open_session_with_exec_env launch path as real execution, proving the rejection happens at the manager boundary before a remote process is started.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, default, shell_env, test_exec_request, test_env); 6 external calls (new, new, assert_eq!, get_remote_test_env, skip_if_sandbox!, vec!).

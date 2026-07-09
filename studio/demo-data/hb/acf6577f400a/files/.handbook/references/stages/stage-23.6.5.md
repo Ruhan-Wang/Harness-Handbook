@@ -1,8 +1,12 @@
 # Memories, rollout, state, and persistence tests  `stage-23.6.5`
 
-This stage is a cross-cutting test layer that protects the system’s long-lived execution artifacts: traces produced during the main loop, runtime state persisted across runs, and filesystem data used for recovery and history. It verifies that what the system records at startup and during execution can later be replayed, reduced, indexed, and restored correctly.
+This stage is the project’s safety net for saved history and recovery. It is not the main user-facing work loop. Instead, it checks the behind-the-scenes machinery that records conversations, rebuilds them later, and keeps stored state usable after mistakes or damage.
 
-The rollout-trace tests cover reducer behavior in detail: shared fixtures in test_support.rs build minimal bundles, while code-cell, conversation, inference, agent-tool, terminal, protocol-event, and thread tests validate how raw events become stable reduced graphs and replayable thread bundles. Runtime-state tests in state/src/runtime check helper setup, external-agent config import persistence, and SQLite corruption recovery. The memories tests span prompt rendering, citation parsing, startup orchestration, storage naming/sync, workspace diffing, and pruning of stale extension resources. Message-history and thread-store fixtures validate durable message and thread-file semantics. External-agent-sessions ledger tests pin down import bookkeeping. Finally, rollout tests exercise compression, metadata extraction, session indexing, state-DB integration, recorder behavior, and end-to-end filesystem scanning so trace files and database views stay consistent under normal operation and repair paths.
+The rollout trace tests feed fake event logs into the trace “reducer,” which is the part that turns noisy raw events into a clean replay of a session. They cover conversations, model calls, cancellations, code cells, terminal commands, child agents, protocol events, and thread tracing. The rollout storage tests then check the files and indexes that keep past sessions searchable, compressible, repairable, and linked to saved metadata.
+
+The state and external-agent tests check the small databases and ledgers that remember threads, imported agent sessions, and completed configuration imports. Recovery tests make sure broken database files are moved aside safely.
+
+The memories tests cover startup, prompt text, citations, file naming, cleanup, and workspace diffs. Message-history and thread-store helpers check that saved messages and fake local thread data can be read, appended, trimmed, and reused reliably in tests.
 
 ## Files in this stage
 
@@ -11,11 +15,13 @@ Shared reducer fixtures come first, followed by focused replay and reduction tes
 
 ### `rollout-trace/src/reducer/test_support.rs`
 
-`test` · `test setup and assertions`
+`test` · `test setup and test assertions`
 
-This module is a compact test helper layer around `TraceWriter` and `replay_bundle`. It defines canonical root thread ids for ordinary and agent-root traces, plus small constructors for common JSON fragments such as a model message item and a generic `ToolCallSummary`. The writer helpers create a temporary trace bundle with stable ids (`trace-1`, `rollout-1`), append the initial `ThreadStarted` event, and optionally target either the normal root thread or the agent-root thread used by multi-agent tests.
+The reducer is tested by feeding it trace data, which is a record of things that happened during an agent run: a thread starts, a turn starts, a model request is made, a response arrives, and so on. Writing all of that by hand in every test would be noisy and easy to get wrong. This file is the test workshop bench: it provides ready-made helpers for creating a temporary trace writer, starting standard root or agent threads, starting turns, attaching the right thread-and-turn context, and adding inference, meaning model-call, request and completion events.
 
-The rest of the helpers encode common raw event sequences with as little ceremony as possible: starting turns, building `RawTraceEventContext` values with thread and turn ids, appending inference starts/completions, and writing request/response payload files before appending the corresponding events. `append_completed_inference` is especially useful because it emits both the request payload and the completion event with the correct contextual envelope. The module deliberately avoids hiding scenario-specific ordering; tests still append the interesting events themselves. `expect_replay_error` is the negative-path assertion helper: it runs `replay_bundle`, requires failure, and checks that the resulting error string contains an expected substring, making reducer invariant tests concise and readable.
+The helpers deliberately only create shared scaffolding. They do not hide the interesting event sequences inside a test, because those sequences are usually what the test is about. For example, a test can call `create_started_writer`, then `start_turn`, then add exactly the inference events it wants to examine.
+
+Two built-in thread IDs represent common cases: a normal root thread and an agent-style root thread. The file also includes small conveniences for making message-shaped JSON and generic tool summaries. At the end, `expect_replay_error` runs the replay step and checks that a specific failure message appears, which helps tests prove that bad trace data is rejected for the right reason.
 
 #### Function details
 
@@ -25,11 +31,11 @@ The rest of the helpers encode common raw event sequences with as little ceremon
 fn message(role: &str, text: &str) -> serde_json::Value
 ```
 
-**Purpose**: Builds a canonical JSON conversation message item with a role and single text content part. Tests use it to populate inference request and response payloads without repeating the raw schema shape.
+**Purpose**: Builds a simple JSON message object with a role, such as user or assistant, and plain text content. Tests use it when they need realistic conversation input without spelling out the full JSON structure every time.
 
-**Data flow**: Takes `role` and `text` string slices, constructs a `serde_json::Value` object with `type: "message"`, the provided role, and one `input_text` content entry, and returns that JSON value. It does not touch external state.
+**Data flow**: It receives a role string and a text string. It places them into a standard message-shaped JSON value, with the text stored as an input text content item. It returns that JSON value and does not change anything else.
 
-**Call relations**: Scenario tests call this helper when assembling inference payload bodies, especially transcript and compaction tests. It is a leaf fixture function and delegates only to the `json!` macro.
+**Call relations**: Tests that exercise request compaction, encrypted reasoning, and similar model-input behavior call this helper when they need conversation messages. The helper hands back JSON that those tests can place into inference requests.
 
 *Call graph*: called by 5 (compaction_boundary_repeats_prefix_and_reuses_replacement_items, context_compaction_boundary_repeats_prefix_and_reuses_replacement_items, encrypted_reasoning_reuses_response_item_in_later_request, encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body, same_encrypted_reasoning_with_different_text_reuses_first_readable_body); 1 external calls (json!).
 
@@ -40,11 +46,11 @@ fn message(role: &str, text: &str) -> serde_json::Value
 fn generic_summary(label: &str) -> ToolCallSummary
 ```
 
-**Purpose**: Creates a `ToolCallSummary::Generic` with a label and no previews. It gives tests a concise way to populate tool-start events when terminal or agent-specific summaries are not under test.
+**Purpose**: Creates a plain tool-call summary with only a human-readable label. Tests use it when they need a tool summary but the exact input or output preview is not important.
 
-**Data flow**: Takes a label string slice, converts it to `String`, wraps it in `ToolCallSummary::Generic { label, input_preview: None, output_preview: None }`, and returns the summary value. No state is read or written.
+**Data flow**: It receives a label string. It copies that label into a `ToolCallSummary::Generic` value and leaves the optional input and output previews empty. The result is returned to the test.
 
-**Call relations**: Tool and terminal tests use this helper when appending `ToolCallStarted` events. It is a pure constructor with no downstream delegation.
+**Call relations**: Tests about terminal operations and write-stdin behavior call this helper to create expected summaries. It supplies a simple expected value that those tests compare against reducer output.
 
 *Call graph*: called by 4 (code_mode_write_stdin_result_projects_structured_exec_fields, dispatch_write_stdin_payload_reduces_to_terminal_operation, exec_tool_reduces_to_terminal_operation_and_session, write_stdin_operation_reuses_existing_terminal_session).
 
@@ -55,11 +61,11 @@ fn generic_summary(label: &str) -> ToolCallSummary
 fn create_started_writer(temp: &TempDir) -> anyhow::Result<TraceWriter>
 ```
 
-**Purpose**: Creates a temporary trace writer already initialized with the standard root thread. It is the default setup path for most reducer tests.
+**Purpose**: Creates a trace writer in a temporary directory and immediately records that the normal root thread has started. It saves tests from repeating the standard first step of a trace.
 
-**Data flow**: Takes a `&TempDir`, forwards to `create_started_writer_for_thread` with `ROOT_THREAD_ID` and `/root`, and returns the resulting `TraceWriter`. It writes the initial bundle files and thread-start event indirectly through the delegated helper.
+**Data flow**: It receives a temporary directory. It uses the default root thread ID and root agent path, asks `create_started_writer_for_thread` to create and initialize the writer, and returns that ready-to-use writer or an error.
 
-**Call relations**: Many reducer tests call this as their first setup step. It is a thin wrapper over `create_started_writer_for_thread` that fixes the common root-thread identity.
+**Call relations**: Many reducer tests begin by calling this function. It delegates the real work to `create_started_writer_for_thread`, so tests can start from a valid trace without knowing the writer creation details.
 
 *Call graph*: calls 1 internal fn (create_started_writer_for_thread); called by 29 (cancelled_turn_terminates_unfinished_code_cell, code_cell_lifecycle_links_nested_tools_waits_and_outputs, fast_code_cell_lifecycle_waits_for_source_item, runtime_code_cell_ids_can_repeat_across_threads, agent_messages_preserve_routing_and_content, compaction_boundary_repeats_prefix_and_reuses_replacement_items, context_compaction_boundary_repeats_prefix_and_reuses_replacement_items, encrypted_reasoning_reuses_response_item_in_later_request, encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body, full_request_snapshot_can_reorder_existing_items_and_insert_summary (+15 more)).
 
@@ -70,11 +76,11 @@ fn create_started_writer(temp: &TempDir) -> anyhow::Result<TraceWriter>
 fn create_started_agent_writer(temp: &TempDir) -> anyhow::Result<TraceWriter>
 ```
 
-**Purpose**: Creates a temporary trace writer initialized with the canonical multi-agent root thread id. It standardizes setup for agent-edge tests.
+**Purpose**: Creates a trace writer for tests that use the agent-style root thread and immediately records that this thread has started. This is the agent-thread version of the standard writer setup.
 
-**Data flow**: Takes a `&TempDir`, forwards to `create_started_writer_for_thread` with `AGENT_ROOT_THREAD_ID` and `/root`, and returns the initialized `TraceWriter`. The actual bundle creation and thread-start append happen in the delegated helper.
+**Data flow**: It receives a temporary directory. It supplies the built-in agent root thread ID and root agent path to `create_started_writer_for_thread`, then returns the initialized writer or an error.
 
-**Call relations**: Multi-agent tests invoke this instead of `create_started_writer` so edge ids and thread identities match expected fixtures. It is a convenience wrapper around `create_started_writer_for_thread`.
+**Call relations**: Agent-routing tests call this when they need their trace to begin as an agent thread. It relies on `create_started_writer_for_thread` for the shared setup, keeping the agent and non-agent setup paths consistent.
 
 *Call graph*: calls 1 internal fn (create_started_writer_for_thread); called by 9 (agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, close_agent_runtime_payload_targets_thread, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge).
 
@@ -89,11 +95,11 @@ fn create_started_writer_for_thread(
 ) -> anyhow::Result<TraceWriter>
 ```
 
-**Purpose**: Creates a `TraceWriter` bundle with fixed trace/rollout ids and immediately appends a `ThreadStarted` event for the requested thread. It is the shared implementation behind the root and agent-root setup helpers.
+**Purpose**: Creates a new trace writer for a specific thread and records that the thread has started. Use this when a test needs control over the thread ID or agent path.
 
-**Data flow**: Takes a temp directory, thread id, and agent path; calls `TraceWriter::create` with the temp path and fixed ids, then calls `start_thread` to append the initial thread-start event, and returns the writer. It writes bundle files and mutates the trace log through `TraceWriter`.
+**Data flow**: It receives a temporary directory, a thread ID, and an agent path. It creates a `TraceWriter` with fixed test trace and rollout IDs, then calls `start_thread` to write the thread-start event. It returns the initialized writer if both steps succeed.
 
-**Call relations**: This helper is called by both `create_started_writer` and `create_started_agent_writer`. It delegates the actual event append to `start_thread` so tests can also reuse that lower-level helper directly.
+**Call relations**: `create_started_writer` and `create_started_agent_writer` both call this shared helper. It hands the newly created writer to `start_thread` so the trace begins in a valid state before tests append more events.
 
 *Call graph*: calls 2 internal fn (start_thread, create); called by 2 (create_started_agent_writer, create_started_writer); 1 external calls (path).
 
@@ -108,11 +114,11 @@ fn start_thread(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a `ThreadStarted` raw event for a given thread id and agent path. It is the minimal fixture for introducing a thread into the trace.
+**Purpose**: Writes a thread-start event into a trace. This tells the reducer, in test data, that a conversation or agent thread exists before later events refer to it.
 
-**Data flow**: Takes a `&TraceWriter`, thread id, and agent path, constructs `RawTraceEventPayload::ThreadStarted` with `metadata_payload: None`, appends it to the writer, and returns `Ok(())`. It mutates the on-disk event log via the writer.
+**Data flow**: It receives a trace writer, a thread ID, and an agent path. It builds a `ThreadStarted` event with those values and no extra metadata, appends it to the trace, and returns success or the append error.
 
-**Call relations**: Called by `create_started_writer_for_thread` and by tests that need to introduce additional child threads. It delegates only to `TraceWriter::append`.
+**Call relations**: Writer setup helpers call this automatically, and some agent tests call it directly when they need extra child threads. It hands the event to the trace writer, which stores it in the test trace.
 
 *Call graph*: calls 1 internal fn (append); called by 10 (create_started_writer_for_thread, agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, close_agent_runtime_payload_targets_thread, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge).
 
@@ -123,11 +129,11 @@ fn start_thread(
 fn start_turn(writer: &TraceWriter, turn_id: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a `CodexTurnStarted` event for the standard root thread. It is the common turn-start fixture for non-agent tests.
+**Purpose**: Writes a turn-start event for the normal root thread. A turn is one round of work in a thread, so later model calls and tool activity can be tied to that round.
 
-**Data flow**: Takes a writer and turn id, forwards to `start_turn_for_thread` with `ROOT_THREAD_ID`, and returns that result. The actual event append occurs in the delegated helper.
+**Data flow**: It receives a writer and a turn ID. It combines that turn ID with the default root thread ID and calls `start_turn_for_thread`. The result is success or an error from writing the event.
 
-**Call relations**: Many tests call this before appending inference or tool events. It is a convenience wrapper over `start_turn_for_thread`.
+**Call relations**: Many reducer tests call this after creating a started writer. It is a convenience wrapper around `start_turn_for_thread`, used when the test is about the normal root thread.
 
 *Call graph*: calls 1 internal fn (start_turn_for_thread); called by 27 (cancelled_turn_terminates_unfinished_code_cell, code_cell_lifecycle_links_nested_tools_waits_and_outputs, fast_code_cell_lifecycle_waits_for_source_item, agent_messages_preserve_routing_and_content, compaction_boundary_repeats_prefix_and_reuses_replacement_items, context_compaction_boundary_repeats_prefix_and_reuses_replacement_items, encrypted_reasoning_reuses_response_item_in_later_request, encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body, full_request_snapshot_can_reorder_existing_items_and_insert_summary, incremental_request_carries_prior_request_and_response_items_forward (+15 more)).
 
@@ -138,11 +144,11 @@ fn start_turn(writer: &TraceWriter, turn_id: &str) -> anyhow::Result<()>
 fn start_agent_turn(writer: &TraceWriter, turn_id: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a `CodexTurnStarted` event for the canonical agent-root thread. It standardizes turn setup in multi-agent tests.
+**Purpose**: Writes a turn-start event for the built-in agent root thread. Tests use it when they are checking agent routing or child-agent behavior.
 
-**Data flow**: Takes a writer and turn id, forwards to `start_turn_for_thread` with `AGENT_ROOT_THREAD_ID`, and returns the result. It does not itself build the event payload.
+**Data flow**: It receives a writer and a turn ID. It pairs the turn ID with the built-in agent root thread ID and asks `start_turn_for_thread` to append the event. It returns success or any write error.
 
-**Call relations**: Agent-edge tests call this before appending tool runtime events. It is a thin wrapper around `start_turn_for_thread`.
+**Call relations**: Agent-focused tests call this after creating an agent writer. It keeps those tests from repeating the special agent thread ID and relies on `start_turn_for_thread` for the actual event writing.
 
 *Call graph*: calls 1 internal fn (start_turn_for_thread); called by 9 (agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, close_agent_runtime_payload_targets_thread, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge).
 
@@ -157,11 +163,11 @@ fn start_turn_for_thread(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a `CodexTurnStarted` event for an explicit thread id. It is the shared implementation behind root and agent-root turn helpers.
+**Purpose**: Writes a turn-start event for whichever thread the test names. This is the flexible version used when tests involve multiple threads or custom thread IDs.
 
-**Data flow**: Takes a writer, thread id, and turn id, constructs `RawTraceEventPayload::CodexTurnStarted` with owned strings, appends it to the writer, and returns `Ok(())`. It mutates the trace log.
+**Data flow**: It receives a writer, a thread ID, and a turn ID. It builds a `CodexTurnStarted` event containing those IDs, appends it to the trace, and returns success or an error.
 
-**Call relations**: Called by `start_turn`, `start_agent_turn`, and tests that need child-thread turns. It delegates only to `TraceWriter::append`.
+**Call relations**: The simpler `start_turn` and `start_agent_turn` helpers call this, and some multi-thread tests call it directly. It is the common point where turn-start events are turned into trace records.
 
 *Call graph*: calls 1 internal fn (append); called by 10 (runtime_code_cell_ids_can_repeat_across_threads, start_agent_turn, start_turn, agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge).
 
@@ -172,11 +178,11 @@ fn start_turn_for_thread(
 fn trace_context(turn_id: &str) -> RawTraceEventContext
 ```
 
-**Purpose**: Builds a `RawTraceEventContext` for the standard root thread and a given turn. Tests use it when appending context-bearing events.
+**Purpose**: Builds a context object for events that belong to the normal root thread and a specific turn. Context is the label that tells the reducer where an event happened.
 
-**Data flow**: Takes a turn id and forwards to `trace_context_for_thread` with `ROOT_THREAD_ID`, returning the resulting context struct. No external state is touched.
+**Data flow**: It receives a turn ID. It combines that turn ID with the default root thread ID by calling `trace_context_for_thread`, then returns the resulting context object.
 
-**Call relations**: Used by many tests when calling `append_with_context`. It is a convenience wrapper over `trace_context_for_thread`.
+**Call relations**: Tests use this when appending events that need explicit context, such as tool activity or model completion details. It delegates to `trace_context_for_thread` so all context objects have the same shape.
 
 *Call graph*: calls 1 internal fn (trace_context_for_thread); called by 10 (cancelled_turn_terminates_unfinished_code_cell, code_cell_lifecycle_links_nested_tools_waits_and_outputs, fast_code_cell_lifecycle_waits_for_source_item, compaction_boundary_repeats_prefix_and_reuses_replacement_items, context_compaction_boundary_repeats_prefix_and_reuses_replacement_items, tool_call_links_model_call_and_followup_output_items, code_mode_write_stdin_result_projects_structured_exec_fields, dispatch_write_stdin_payload_reduces_to_terminal_operation, exec_tool_reduces_to_terminal_operation_and_session, write_stdin_operation_reuses_existing_terminal_session).
 
@@ -187,11 +193,11 @@ fn trace_context(turn_id: &str) -> RawTraceEventContext
 fn trace_context_for_agent(turn_id: &str) -> RawTraceEventContext
 ```
 
-**Purpose**: Builds a `RawTraceEventContext` for the canonical agent-root thread and a given turn. It avoids repeating the agent-root thread id in tests.
+**Purpose**: Builds a context object for events that belong to the built-in agent root thread and a specific turn. It is the agent-thread shortcut for contextual event writing.
 
-**Data flow**: Takes a turn id and forwards to `trace_context_for_thread` with `AGENT_ROOT_THREAD_ID`, returning the context. It is pure and does not mutate state.
+**Data flow**: It receives a turn ID. It combines that turn ID with the agent root thread ID through `trace_context_for_thread`, then returns the context object.
 
-**Call relations**: Agent tests use this when appending tool lifecycle events with explicit context. It is a wrapper over `trace_context_for_thread`.
+**Call relations**: Agent tests call this when appending runtime or activity events that should be attached to the agent root thread. Like `trace_context`, it uses the shared context builder underneath.
 
 *Call graph*: calls 1 internal fn (trace_context_for_thread); called by 6 (append_spawn_agent_tool_lifecycle, close_agent_runtime_payload_targets_thread, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge).
 
@@ -202,11 +208,11 @@ fn trace_context_for_agent(turn_id: &str) -> RawTraceEventContext
 fn trace_context_for_thread(thread_id: &str, turn_id: &str) -> RawTraceEventContext
 ```
 
-**Purpose**: Constructs a `RawTraceEventContext` with explicit thread and turn ids. It is the base context helper used by all higher-level wrappers.
+**Purpose**: Builds a context object for any named thread and turn. Tests use it when they need exact control over where a trace event is attached.
 
-**Data flow**: Takes thread id and turn id string slices, allocates owned `String`s, and returns `RawTraceEventContext { thread_id: Some(...), codex_turn_id: Some(...) }`. It has no side effects.
+**Data flow**: It receives a thread ID and a turn ID. It copies both into a `RawTraceEventContext`, with both fields present. It returns that context and does not write anything to disk.
 
-**Call relations**: Called by the root and agent context helpers and by tests that need child-thread contexts. It is a pure constructor.
+**Call relations**: The root and agent context helpers call this, and tests with repeated IDs across threads or custom thread setups call it directly. Other helpers, such as `append_completed_inference`, use it before writing context-aware events.
 
 *Call graph*: called by 6 (runtime_code_cell_ids_can_repeat_across_threads, append_completed_inference, trace_context, trace_context_for_agent, agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification).
 
@@ -222,11 +228,11 @@ fn append_inference_start(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends an `InferenceStarted` event for the standard root thread. It is the common fixture for tests that want to control the request payload explicitly.
+**Purpose**: Writes the start of a model call for the normal root thread. Tests use it when they already have a saved request payload and want to mark that inference as started.
 
-**Data flow**: Takes a writer, inference call id, turn id, and `RawPayloadRef` for the request payload, then forwards to `append_inference_start_for_thread` with `ROOT_THREAD_ID`. It writes the event indirectly through the delegated helper.
+**Data flow**: It receives a writer, an inference call ID, a turn ID, and a reference to the request payload. It adds the default root thread ID and passes everything to `append_inference_start_for_thread`. It returns success or an error from appending.
 
-**Call relations**: Transcript and inference tests call this when they have already written a request payload file. It is a wrapper over `append_inference_start_for_thread`.
+**Call relations**: Many reducer tests call this to create model-call start events. It is a root-thread shortcut that hands the real event construction to `append_inference_start_for_thread`.
 
 *Call graph*: calls 1 internal fn (append_inference_start_for_thread); called by 21 (agent_messages_preserve_routing_and_content, compaction_boundary_repeats_prefix_and_reuses_replacement_items, context_compaction_boundary_repeats_prefix_and_reuses_replacement_items, encrypted_reasoning_reuses_response_item_in_later_request, encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body, full_request_snapshot_can_reorder_existing_items_and_insert_summary, incremental_request_carries_prior_request_and_response_items_forward, inference_start_rejects_unknown_codex_turn, later_full_request_reuses_prior_json_tool_call_by_position, missing_request_input_is_reducer_error (+11 more)).
 
@@ -243,11 +249,11 @@ fn append_inference_start_for_thread(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends an `InferenceStarted` event for an explicit thread and turn using a provided request payload ref. It fills in fixed test model/provider names.
+**Purpose**: Writes the start of a model call for a specific thread and turn. This gives tests a realistic inference-start event with fixed test model and provider names.
 
-**Data flow**: Takes a writer, thread id, turn id, inference id, and request payload ref; constructs `RawTraceEventPayload::InferenceStarted` with `model: "gpt-test"` and `provider_name: "test-provider"`; appends it; and returns `Ok(())`. It mutates the trace log.
+**Data flow**: It receives a writer, thread ID, turn ID, inference call ID, and request payload reference. It builds an `InferenceStarted` event with those values plus the test model name `gpt-test` and provider `test-provider`, appends it, and returns success or an error.
 
-**Call relations**: Called by `append_inference_start` and `append_inference_request`. It centralizes the exact event shape used across tests.
+**Call relations**: `append_inference_start` and `append_inference_request` both call this helper. It is the shared place where test inference-start records are actually written to the trace.
 
 *Call graph*: calls 1 internal fn (append); called by 2 (append_inference_request, append_inference_start).
 
@@ -263,11 +269,11 @@ fn append_inference_completion(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends an `InferenceCompleted` event with a supplied response payload and response id. It is the minimal completion helper when the request event has already been written separately.
+**Purpose**: Writes a model-call completion event. Tests use it after an inference start when they want the reducer to see that a response came back.
 
-**Data flow**: Takes a writer, inference call id, response id, and response payload ref, constructs `RawTraceEventPayload::InferenceCompleted` with `upstream_request_id: None`, appends it, and returns `Ok(())`. It writes only the completion event, not the payload file.
+**Data flow**: It receives a writer, an inference call ID, a response ID, and a response payload reference. It builds an `InferenceCompleted` event with that response ID, no upstream request ID, and the payload reference, then appends it to the trace.
 
-**Call relations**: Used by tests that want explicit control over request and response ordering. It delegates only to `TraceWriter::append`.
+**Call relations**: Tests about response output, reasoning, encrypted content, and tool-call linking call this after creating or referencing a response payload. It writes the completion directly through the trace writer.
 
 *Call graph*: calls 1 internal fn (append); called by 7 (encrypted_reasoning_reuses_response_item_in_later_request, incremental_request_carries_prior_request_and_response_items_forward, later_full_request_reuses_prior_json_tool_call_by_position, reasoning_body_preserves_text_summary_and_encoded_content, response_outputs_enter_thread_conversation_on_completion, same_encrypted_reasoning_with_different_text_reuses_first_readable_body, tool_call_links_model_call_and_followup_output_items).
 
@@ -284,11 +290,11 @@ fn append_inference_request(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes an inference request payload containing the provided input items and appends the matching `InferenceStarted` event. It is the common one-call fixture for request-side transcript setup.
+**Purpose**: Writes a model request payload and then records that a model call has started for that request. This bundles two common test steps into one helper.
 
-**Data flow**: Takes a writer, thread id, turn id, inference id, and vector of JSON input items; writes a `RawPayloadKind::InferenceRequest` payload with `{ "input": input }`; then passes the resulting `RawPayloadRef` to `append_inference_start_for_thread`; and returns `Ok(())`. It mutates both payload storage and the event log.
+**Data flow**: It receives a writer, thread ID, turn ID, inference ID, and a list of JSON input items. It saves a JSON payload shaped like `{ "input": ... }` as an inference request, then calls `append_inference_start_for_thread` with the saved payload reference. It returns success or any error from saving or appending.
 
-**Call relations**: Called directly by many tests and by `append_completed_inference`. It delegates payload creation to `TraceWriter::write_json_payload` and event append to `append_inference_start_for_thread`.
+**Call relations**: Agent and messaging tests call this when they need a started model call with concrete input. `append_completed_inference` also uses it as the first half of a full request-and-response sequence.
 
 *Call graph*: calls 2 internal fn (append_inference_start_for_thread, write_json_payload); called by 8 (append_completed_inference, agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge); 1 external calls (json!).
 
@@ -306,11 +312,11 @@ fn append_completed_inference(
 )
 ```
 
-**Purpose**: Writes both sides of a completed inference: the request payload/start event and the response payload/completion event with matching ids. It is the highest-level inference fixture in this module.
+**Purpose**: Writes a complete model-call sequence: request payload, inference-start event, response payload, and inference-completed event. It is useful when a test needs a finished model call without focusing on each low-level trace record.
 
-**Data flow**: Takes a writer, thread id, turn id, inference id, request input items, and response output items. It first calls `append_inference_request`, then writes an `InferenceResponse` payload containing `response_id: resp-{inference_id}` and `output_items`, then appends an `InferenceCompleted` event with explicit thread/turn context, and returns `Ok(())`.
+**Data flow**: It receives a writer, thread ID, turn ID, inference ID, input JSON items, and output JSON items. First it writes the request and start event through `append_inference_request`. Then it saves a response payload containing a generated response ID and the output items. Finally, it appends a context-aware completion event tied to the same thread and turn. It returns success or the first error encountered.
 
-**Call relations**: Used by tests that need a fully materialized inference exchange with minimal boilerplate. It composes `append_inference_request`, `trace_context_for_thread`, `TraceWriter::write_json_payload`, and `TraceWriter::append_with_context`.
+**Call relations**: Tests that need a child or agent inference to be fully complete call this helper. It uses `trace_context_for_thread` so the final completion is clearly attached to the right thread and turn before handing it to the writer.
 
 *Call graph*: calls 4 internal fn (append_inference_request, trace_context_for_thread, append_with_context, write_json_payload); called by 1 (agent_result_edge_links_child_result_to_parent_notification); 2 external calls (format!, json!).
 
@@ -321,22 +327,24 @@ fn append_completed_inference(
 fn expect_replay_error(temp: &TempDir, expected: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Asserts that replaying the temporary bundle fails and that the error message contains a specific substring. It is the shared negative-path assertion helper for reducer invariant tests.
+**Purpose**: Checks that replaying a test trace fails and that the error message contains expected text. Tests use it to prove the reducer rejects bad trace data for the intended reason.
 
-**Data flow**: Takes a temp directory and expected substring, calls `replay_bundle(temp.path())`, panics if replay succeeds, converts the error to a string, asserts substring containment, and returns `Ok(())`. It reads the bundle from disk but does not mutate it.
+**Data flow**: It receives a temporary directory containing a trace bundle and a piece of expected error text. It runs `replay_bundle` on the directory. If replay succeeds, it panics because the test expected failure. If replay fails, it turns the error into text and asserts that the text includes the expected phrase. It returns success when the expected failure is seen.
 
-**Call relations**: Reducer error tests call this after constructing an invalid event sequence. It directly drives `replay_bundle` and performs the assertion logic locally.
+**Call relations**: Reducer error-case tests call this after deliberately writing invalid or unsupported trace data. It hands the temporary trace directory to the replay function and converts the resulting error into a clear test assertion.
 
 *Call graph*: called by 5 (inference_start_rejects_unknown_codex_turn, missing_request_input_is_reducer_error, model_visible_call_id_reuse_with_different_content_is_reducer_error, unknown_previous_response_id_is_reducer_error, unsupported_model_item_is_reducer_error); 4 external calls (path, assert!, replay_bundle, panic!).
 
 
 ### `rollout-trace/src/reducer/code_cell_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module builds temporary trace bundles with `create_started_writer`, appends raw inference, code-cell, tool-call, and turn events, then replays them through `replay_bundle` to inspect the reduced rollout. The scenarios are intentionally shaped around the tricky invariants in `code_cell.rs`: runtime `CodeCellStarted` can precede the inference completion that introduces the model-visible `custom_tool_call`; initial-response and end events can arrive before the source item exists; nested tool calls should attach to the parent code cell; `wait` calls should be linked by parsing `cell_id` from invocation arguments; and later model-visible `custom_tool_call_output` items should gain `ProducerRef::CodeCell`.
+A “code cell” here is a chunk of code the model asked the system to run, similar to a notebook cell. The reducer’s job is to read a stream of low-level trace events and rebuild a useful story: which model message requested the code, what thread it belonged to, whether it finished or failed, which tools it called while running, and which later messages contained its output.
 
-The tests also cover lifecycle cleanup at turn end, asserting that a cancelled turn converts a still-running code cell into `CodeCellRuntimeStatus::Terminated` and `ExecutionStatus::Cancelled`. Another scenario proves that runtime cell ids are only unique within a thread by creating root and child threads that both use runtime cell id `1` and confirming they reduce to distinct code cells. A small helper, `test_reduced_code_cell_id`, mirrors the production id format so assertions can address `rollout.code_cells` directly.
+These tests create small fake trace bundles in a temporary folder, replay them, and then inspect the reduced result. This matters because real traces do not always arrive in the neat order a person would expect. For example, the runtime may report that a code cell started before the model response that requested it has been reduced. A cell may yield, wait for a later model turn, call nested tools, fail very quickly, or be left unfinished when a turn is cancelled.
+
+The tests act like safety rails. They make sure the reducer links all those pieces into one coherent code-cell record instead of losing relationships or mixing up cells. One especially important check is that runtime cell IDs, like “1”, are only unique within a thread; two different threads can both have a runtime cell “1” without being confused.
 
 #### Function details
 
@@ -346,11 +354,11 @@ The tests also cover lifecycle cleanup at turn end, asserting that a cancelled t
 fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<()>
 ```
 
-**Purpose**: Builds a multi-turn trace where a code cell starts before inference completion, later yields, spawns a nested tool call, is waited on by a model-visible `wait` tool, and finally produces a follow-up output item. It asserts that all reverse links and statuses are present on the reduced `CodeCell` and conversation item.
+**Purpose**: This test checks the full happy-path story for a code cell that starts, yields, calls a nested tool, is later waited on by the model, and then completes. It proves that the reducer connects the source model tool call, nested runtime tools, wait tools, and output conversation items into one code-cell record.
 
-**Data flow**: Creates a temp bundle, writes inference request/response payloads plus `CodeCellStarted`, `CodeCellInitialResponse`, nested `ToolCallStarted/Ended`, second-turn `wait` invocation payload, and `CodeCellEnded`. After `replay_bundle`, it derives the reduced id with `test_reduced_code_cell_id`, reads the resulting `CodeCell`, locates the follow-up output item id from the second inference request, and asserts thread id, runtime/execution status, runtime cell id, nested tool ids, wait tool ids, output item ids, producer refs, and source item kind.
+**Data flow**: The test starts with an empty temporary trace bundle, writes fake events for two turns, and includes JSON payloads that look like model requests and responses. It then replays the bundle into the reduced rollout view. The final checks confirm that the code cell has the right thread, completed status, runtime ID, nested tool ID, wait tool ID, output item link, and source conversation item kind.
 
-**Call relations**: This test drives the full happy-path call flow through code-cell start queueing, lifecycle replay, nested-tool requester reduction, wait linking from request payload parsing, and late output-item attachment.
+**Call relations**: During the test, helper routines create the writer, start turns, and attach turn context to events. After the raw events are written, the test calls the replay step to run the reducer, then uses test_reduced_code_cell_id to look up the expected reduced code-cell record and compare the important fields.
 
 *Call graph*: calls 4 internal fn (test_reduced_code_cell_id, create_started_writer, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -361,11 +369,11 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
 fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a code cell can start, fail on initial response, and end before the inference response containing its source `custom_tool_call` item is reduced. The reducer should queue all lifecycle events and replay them once the source item appears.
+**Purpose**: This test checks a race-like situation where a code cell starts, fails, and ends before the model response that created its source conversation item has been recorded. It makes sure the reducer waits long enough, conceptually, to connect the finished cell back to the model’s custom tool call.
 
-**Data flow**: Writes a trace where `CodeCellStarted`, `CodeCellInitialResponse(Failed)`, and `CodeCellEnded(Failed)` all occur before `InferenceCompleted` with the matching `custom_tool_call`. After replay it computes the reduced id with `test_reduced_code_cell_id`, reads the reduced cell, and asserts thread id, failed runtime/execution status, runtime cell id, and source item kind.
+**Data flow**: The test writes a model inference start, then writes code-cell start, initial failure, and end events, and only afterward writes the model inference completion containing the custom tool call. Replaying the bundle turns those out-of-order events into a reduced rollout. The assertions confirm that the failed cell still has the right thread, failed execution status, runtime ID, and source item type.
 
-**Call relations**: This test specifically exercises the pending-start and pending-lifecycle-event paths, proving that `flush_pending_code_cell_starts` and lifecycle replay preserve failure state for very fast cells.
+**Call relations**: The setup helpers create a temporary trace and a turn context, while the replay step exercises the reducer. The test uses test_reduced_code_cell_id to find the cell by the model-visible call ID, showing that the reducer can link the runtime event to the later-discovered source item.
 
 *Call graph*: calls 4 internal fn (test_reduced_code_cell_id, create_started_writer, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -376,11 +384,11 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()>
 fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that turn-end cleanup closes a still-running code cell when the owning turn is cancelled. The reduced cell should not remain live after replay.
+**Purpose**: This test checks what happens when a turn is cancelled while a code cell is still running. It ensures the reducer does not leave the cell looking active forever, but marks it as terminated and cancelled.
 
-**Data flow**: Creates a trace with an inference request/response that introduces an `exec` call, then emits `CodeCellStarted` followed by `CodexTurnEnded { status: Cancelled }` without a code-cell end event. After replay it resolves the reduced id via `test_reduced_code_cell_id`, reads the cell, and asserts `runtime_status == Terminated`, `execution.status == Cancelled`, and `execution.ended_seq` equals the turn-end event sequence.
+**Data flow**: The test writes a model request and response that ask for code execution, then records that the code cell started. Instead of writing a code-cell end event, it writes a turn-ended event with a cancelled status. After replay, the reduced code cell is expected to have a terminated runtime status, a cancelled execution status, and an end sequence number matching the cancellation event.
 
-**Call relations**: This test targets the turn-end cleanup path that calls `terminate_running_code_cells_for_turn_end` and then `end_code_cell` with a synthesized terminal status.
+**Call relations**: The test builds the trace with the same writer and context helpers used by the other reducer tests. Once replay_bundle has reduced the trace, test_reduced_code_cell_id gives the lookup key for the expected cell, and the assertions verify that turn cancellation was propagated to the unfinished code cell.
 
 *Call graph*: calls 4 internal fn (test_reduced_code_cell_id, create_started_writer, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -391,11 +399,11 @@ fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()>
 fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()>
 ```
 
-**Purpose**: Proves that runtime `cell_id` values are scoped by thread rather than globally unique. Two threads can both use runtime cell id `1` and still reduce to separate code cells.
+**Purpose**: This test confirms that runtime cell IDs are not treated as globally unique. Two different threads can both have a runtime cell ID like “1”, and the reducer must keep them separate by thread and model-visible call ID.
 
-**Data flow**: Creates root and child threads, starts turns in both, then for each thread writes an inference request, `CodeCellStarted` with runtime cell id `1`, inference completion with a distinct model-visible call id, and `CodeCellEnded`. After replay it computes both reduced ids with `test_reduced_code_cell_id` and asserts each reduced cell has the correct thread id and the same runtime cell id string.
+**Data flow**: The test creates a root thread and a child thread, starts one turn in each, and writes similar inference and code-cell events for both. Both code cells use the same runtime_cell_id value, but different thread IDs and model-visible call IDs. After replay, the test checks that each reduced cell belongs to the correct thread while preserving its runtime ID.
 
-**Call relations**: This test exercises the `(thread_id, runtime_cell_id)` mapping logic used by runtime-id recording and lookup, ensuring cross-thread collisions do not merge cells.
+**Call relations**: This test uses thread-aware setup helpers to write events into two separate thread contexts. After replay_bundle reduces all events, test_reduced_code_cell_id is called twice to look up the two distinct reduced cells, proving the reducer did not merge them just because their runtime IDs matched.
 
 *Call graph*: calls 4 internal fn (test_reduced_code_cell_id, create_started_writer, start_turn_for_thread, trace_context_for_thread); 5 external calls (new, assert_eq!, replay_bundle, format!, json!).
 
@@ -406,22 +414,26 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()>
 fn test_reduced_code_cell_id(model_visible_call_id: &str) -> String
 ```
 
-**Purpose**: Constructs the expected reduced code-cell id string used in assertions. It mirrors the production `code_cell:{model_visible_call_id}` format.
+**Purpose**: This small helper builds the reduced code-cell ID used by these tests. It keeps the expected ID format in one place so the tests do not repeat the same string-building logic.
 
-**Data flow**: Takes a model-visible call id string and returns `format!("code_cell:{model_visible_call_id}")`. It has no side effects.
+**Data flow**: It receives the model-visible call ID, such as “call-code”, and returns a string in the form “code_cell:<call id>”. It does not read or change any shared state.
 
-**Call relations**: All tests in this file use it to address entries in `rollout.code_cells` without duplicating the id-formatting literal inline.
+**Call relations**: Each test calls this helper after replaying a bundle, when it needs to look up the reduced code-cell record in the rollout. The helper mirrors the reducer’s expected naming convention so the assertions can focus on behavior rather than string formatting.
 
 *Call graph*: called by 4 (cancelled_turn_terminates_unfinished_code_cell, code_cell_lifecycle_links_nested_tools_waits_and_outputs, fast_code_cell_lifecycle_waits_for_source_item, runtime_code_cell_ids_can_repeat_across_threads); 1 external calls (format!).
 
 
 ### `rollout-trace/src/reducer/conversation_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module constructs temporary traces and replays them to assert the exact shape of reduced conversation state. The scenarios cover both positive and negative behavior. Positive cases verify that full request snapshots reuse prior items by content and position without deduping newly inserted identical items, response outputs are appended to thread conversation immediately, agent messages preserve routing metadata and encoded content, incremental requests reconstruct omitted prefixes from `previous_response_id`, and full snapshots may reorder existing items or insert new summary items. Several tests focus on reasoning items, proving that encrypted reasoning can reuse prior ids across request/response boundaries, merge complementary text and summary evidence, and refuse to overwrite the first readable body with conflicting later text.
+The reducer is the part of the system that replays a recorded trace and rebuilds the conversation from it. These tests create tiny fake traces in temporary folders, replay them, and check the resulting rollout. A rollout is the reconstructed story: turns, inference calls, conversation items, tool calls, compactions, and their links.
 
-The file also exercises compaction semantics: checkpoint installation inserts a structural `CompactionMarker`, replacement history gets fresh ids with `ProducerRef::Compaction`, and the next full request reconciles against replacement items rather than pre-compaction history. Tool-linking behavior is checked by asserting that a model-visible function call item and a later function-call output item both attach to the same reduced tool call with reciprocal producer refs. Negative tests ensure replay fails on unsupported model item types, missing request input, unknown `previous_response_id`, reused `call_id` with different content, and inference starts that reference unknown turns.
+The file focuses on identity and continuity. For example, if a later request repeats an earlier user message, the reducer should reuse the old conversation item. But if the same text appears again as a new message, it should not blindly deduplicate it. The tests also check that assistant responses are added to the thread only after completion, that agent-to-agent messages keep their author and recipient, and that function calls and tool outputs are connected by their model-visible call IDs.
+
+Several tests cover reasoning content, especially encrypted reasoning. Think of encrypted content like a sealed envelope with a label: the reducer can recognize the same envelope later, and may add readable notes if they are complementary, but should not overwrite earlier readable text with conflicting text.
+
+The last group checks failure cases. Missing inputs, unknown previous responses, unsupported model item types, reused call IDs with different content, and inference starts tied to missing turns must produce clear reducer errors instead of silently creating a wrong history.
 
 #### Function details
 
@@ -431,11 +443,11 @@ The file also exercises compaction semantics: checkpoint installation inserts a 
 fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a later full request snapshot reuses an earlier identical item at the same logical history position but still creates a fresh id for a newly inserted identical item later in the snapshot. This captures the reducer's 'reuse at most once per snapshot' rule.
+**Purpose**: Checks that a later full request can reuse old conversation items while still treating a repeated identical-looking message as a new item when it appears in a new position. This prevents the reducer from over-deduplicating the conversation just because two messages have the same text.
 
-**Data flow**: Builds two turns with inference requests: first `[user ok]`, then `[user ok, assistant ack, user ok]`. After replay it reads both inference calls' `request_item_ids` and asserts the first item id is reused, the third item id is distinct from the first, the total conversation item count is three, and the thread's conversation list equals the second request snapshot.
+**Data flow**: It writes a first inference request with one user message, then writes a second request whose input contains that same message, an assistant message, and another identical user message. After replaying the trace, it compares the item IDs: the first item in the second request must reuse the old ID, while the later identical user message must get a different ID. The final thread history should match the second request snapshot.
 
-**Call relations**: This test exercises full-snapshot reconciliation and `find_matching_snapshot_item` behavior without involving responses or tools.
+**Call relations**: The test builds its trace through create_started_writer, start_turn, and append_inference_start, then asks replay_bundle to reduce the trace. Its assertions check the reducer's snapshot matching behavior after those helper functions have written the raw events.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 5 external calls (new, assert_eq!, assert_ne!, replay_bundle, json!).
 
@@ -446,11 +458,11 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
 fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that inference response output items become part of the thread conversation as soon as the response is reduced, not only when a later request echoes them back. It validates immediate append semantics for model-produced output.
+**Purpose**: Checks that model response output becomes part of the thread conversation only when the inference completion event is replayed. This matters because a request alone should not imply that an assistant response already exists.
 
-**Data flow**: Creates one inference request and one response containing an assistant message, replays the bundle, reads the inference call, concatenates its request and response item ids, and asserts the thread's `conversation_item_ids` exactly match that combined sequence.
+**Data flow**: It writes a request containing a user message, then writes a completed response containing one assistant message. After replay, it takes the request item IDs and response item IDs from the inference call, joins them together, and expects the thread's conversation list to contain that combined sequence.
 
-**Call relations**: This test targets `reduce_inference_response` and the append-to-thread behavior after response reconciliation.
+**Call relations**: The test uses append_inference_start to record the request and append_inference_completion to record the response. replay_bundle then reconstructs the rollout, and the test verifies that completion is the moment response items enter the thread.
 
 *Call graph*: calls 4 internal fn (append_inference_completion, append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -461,11 +473,11 @@ fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<
 fn agent_messages_preserve_routing_and_content() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures `agent_message` items normalize into conversation items that retain author/recipient routing metadata and convert content into the expected text or encoded parts. It validates the protocol-model parsing path.
+**Purpose**: Checks that special agent-to-agent messages keep both their routing information and their body content. Routing means who sent the message and who it was meant for.
 
-**Data flow**: Writes an inference request containing two `agent_message` items, one with input text and one with encrypted content. After replay it maps the resulting request item ids to tuples of role, channel, kind, agent metadata, and body, then asserts those tuples equal the expected `ConversationRole::Assistant`, `ConversationChannel::Analysis`, `ConversationItemKind::Message`, `AgentMessageMetadata`, and `ConversationBody` values.
+**Data flow**: It writes an inference request containing two agent messages: one with plain input text and one with encrypted content. After replay, it looks up the created conversation items and checks their role, channel, kind, author, recipient, and body parts. The expected result is assistant analysis messages with the original sender, receiver, and content preserved.
 
-**Call relations**: This test specifically exercises normalization through `normalize_agent_message_item` and subsequent conversation-item creation.
+**Call relations**: The test records a request through append_inference_start and then calls replay_bundle. It verifies the model conversion path that turns raw JSON agent message items into the structured ConversationItem fields used by the rest of the rollout.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -476,11 +488,11 @@ fn agent_messages_preserve_routing_and_content() -> anyhow::Result<()>
 fn later_full_request_reuses_prior_json_tool_call_by_position() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a function-call item produced in one response is reused when a later full request snapshot includes the same call content and `call_id`. It confirms that response-produced conversation items can become part of later request snapshots.
+**Purpose**: Checks that a later full request can recognize and reuse a function call item that previously came from a model response. This keeps the conversation from duplicating the same model-visible tool call.
 
-**Data flow**: Creates an initial request, a response containing a `function_call`, then a second-turn full request containing the original user message plus the same function call. After replay it reads both inference calls and asserts the second request item ids equal the first request item id followed by the first response item id, and that only two conversation items exist overall.
+**Data flow**: It writes a first request, completes it with a function_call response item, then starts a second turn whose full request includes the original user message and the same function call. After replay, the second request item IDs must point to the first request's user item and the first response's function-call item. The total conversation item count should stay at two.
 
-**Call relations**: This test exercises full-snapshot reuse across request/response boundaries and call-id/content matching for JSON-backed function calls.
+**Call relations**: The test records request and response events using the inference helpers, then replay_bundle rebuilds the conversation. The assertions focus on the reducer's ability to match a repeated full-request item back to an earlier response item.
 
 *Call graph*: calls 4 internal fn (append_inference_completion, append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -491,11 +503,11 @@ fn later_full_request_reuses_prior_json_tool_call_by_position() -> anyhow::Resul
 fn incremental_request_carries_prior_request_and_response_items_forward() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that an incremental request with `previous_response_id` reconstructs the omitted prefix from the previous request and response before appending its delta item. It also verifies token usage extraction from the earlier response.
+**Purpose**: Checks how incremental requests work when they reference a previous response. An incremental request only supplies new input, so the reducer must carry forward the earlier request and response items before adding the new follow-up item.
 
-**Data flow**: Builds an initial request and response with token usage and a `function_call`, then a second-turn incremental request containing only a `function_call_output` and `previous_response_id`. After replay it reads both inference calls and asserts the second request item ids equal prior request item + prior response item + new output item, the thread conversation equals that reconstructed sequence, and the first inference's usage contains `input_tokens == 10`.
+**Data flow**: It creates a first inference with a user message and a function-call response, including token usage. Then it creates a second request with previous_response_id and a function_call_output. After replay, the second request's item list must contain the old user item, the old function-call item, and the new tool-output item. It also checks that token usage from the first response was stored.
 
-**Call relations**: This test targets the incremental-request branch in `reduce_inference_request` and the usage parsing path in `reduce_inference_response`.
+**Call relations**: The test uses append_inference_completion to establish a known response ID, then append_inference_start for the incremental follow-up. replay_bundle must resolve previous_response_id and assemble the full conversation context.
 
 *Call graph*: calls 4 internal fn (append_inference_completion, append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -506,11 +518,11 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
 fn full_request_snapshot_can_reorder_existing_items_and_insert_summary() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a full request snapshot may reorder previously seen items and insert a new summary item while still reusing matching existing items by content. It demonstrates that full snapshots are not strictly positional.
+**Purpose**: Checks that a later full request snapshot may reorder existing history items and insert a new summary item. This supports cases where the model context has been reshaped rather than simply appended to.
 
-**Data flow**: Creates a first request `[developer, user]` and a second-turn full request `[user, summary, developer]`. After replay it compares the two request item-id vectors and asserts the reordered user and developer items reuse prior ids, the inserted summary gets a fresh id distinct from both originals, and the total conversation item count is three.
+**Data flow**: It writes an initial request with a developer instruction followed by a user message. The next request contains the old user message first, then a new summary-like user message, then the old developer instruction. After replay, the matching old items must keep their IDs in their new positions, while the inserted summary gets a new ID.
 
-**Call relations**: This test exercises `ReconcileMode::FullSnapshot` and content-based reuse via `find_matching_snapshot_item`.
+**Call relations**: The test creates two turns with append_inference_start and asks replay_bundle to reconstruct them. It checks the reducer's full-snapshot matching logic rather than simple append-only history growth.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 5 external calls (new, assert_eq!, assert_ne!, replay_bundle, json!).
 
@@ -521,11 +533,11 @@ fn full_request_snapshot_can_reorder_existing_items_and_insert_summary() -> anyh
 fn reasoning_body_preserves_text_summary_and_encoded_content() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a reasoning response item preserves all three supported body forms—readable text, summary text, and encrypted content—in the stored conversation item. It validates the normalization layout for reasoning bodies.
+**Purpose**: Checks that reasoning output keeps all three kinds of information the model may provide: raw reasoning text, a summary, and encrypted content. This is important because each part tells a different piece of the story.
 
-**Data flow**: Creates an inference response containing one `reasoning` item with content, summary, and `encrypted_content`. After replay it reads the response item id and asserts the stored `body.parts` equal `[Text("raw reasoning"), Summary("brief summary"), Encoded("encrypted_content", "encoded-reasoning")]`.
+**Data flow**: It writes a request, then completes it with a reasoning output item containing reasoning text, summary text, and encrypted content. After replay, it finds the response conversation item and expects its body parts to contain text, summary, and encoded content in order.
 
-**Call relations**: This test focuses on `normalize_reasoning_item` and the exact ordering of reasoning parts in the reduced conversation item.
+**Call relations**: The test uses append_inference_completion to add a response with a reasoning item. replay_bundle converts that raw response into ConversationPart values, and the assertion checks that no part was dropped.
 
 *Call graph*: calls 4 internal fn (append_inference_completion, append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -536,11 +548,11 @@ fn reasoning_body_preserves_text_summary_and_encoded_content() -> anyhow::Result
 fn encrypted_reasoning_reuses_response_item_in_later_request() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a later request carrying only encrypted reasoning can reuse a prior response reasoning item that had readable text, as long as the encrypted identity matches. It also checks that the original readable body is preserved.
+**Purpose**: Checks that encrypted reasoning seen in a later request is recognized as the same item that appeared earlier in a response. This lets the reducer keep a single identity for a sealed reasoning block even when the later request only repeats the encrypted form.
 
-**Data flow**: Builds a first request with a user message, a response with readable reasoning plus a function call, then a second-turn full request containing the same user message, encrypted-only reasoning with the same `encrypted_content`, the same function call, and a function-call output. After replay it asserts the second request item ids reuse the first request item, first response reasoning item, and first response function-call item, with a fresh output item appended; it also asserts the reused reasoning item's body still contains the original readable text plus encoded content and that the thread conversation equals the second request snapshot.
+**Data flow**: It creates a first response with readable reasoning plus encrypted content and a function call. A later request repeats the user message, the encrypted reasoning, the function call, and adds a function_call_output. After replay, the later request must reuse the earlier user, reasoning, and function-call item IDs, then add one new output item. The reasoning item should still include the readable text from the first sighting plus the encrypted content.
 
-**Call relations**: This test exercises reasoning-specific equality via encrypted identity and reuse across response-to-request reconciliation.
+**Call relations**: The test combines message creation, inference start/completion helpers, and replay_bundle. It exercises the reducer path that matches later request items back to earlier response items using encrypted reasoning identity and function-call identity.
 
 *Call graph*: calls 5 internal fn (append_inference_completion, append_inference_start, create_started_writer, message, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -551,11 +563,11 @@ fn encrypted_reasoning_reuses_response_item_in_later_request() -> anyhow::Result
 fn encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that two sightings of the same encrypted reasoning item can merge complementary readable evidence, such as text from one sighting and summary from another. The reducer should keep one item id and enrich its body.
+**Purpose**: Checks that two sightings of the same encrypted reasoning can be merged when each provides different readable evidence. In plain terms, if one sighting has the detailed text and another has the summary, the reducer should keep both.
 
-**Data flow**: Creates two turns: the first request contains user + text-only reasoning, the second request contains user + summary-only reasoning with the same `encrypted_content`. After replay it reads both inference calls, asserts the second request reused the first reasoning item id, and checks that the stored body now contains text, summary, and encoded parts in order while the total conversation item count remains two.
+**Data flow**: It writes one request containing a user message and encrypted reasoning with readable text. A later request repeats the same user message and the same encrypted reasoning, but this time with only a summary. After replay, both requests should refer to the same reasoning item, and that item's body should contain the text, the summary, and the encrypted content.
 
-**Call relations**: This test targets `merge_reasoning_body` through repeated sightings during full-snapshot reconciliation.
+**Call relations**: The test records two inference starts and then calls replay_bundle. It checks that the reducer treats matching encrypted content as one item and safely enriches that item when the new readable part does not conflict with the old one.
 
 *Call graph*: calls 4 internal fn (append_inference_start, create_started_writer, message, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -566,11 +578,11 @@ fn encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body() -> 
 fn same_encrypted_reasoning_with_different_text_reuses_first_readable_body() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that conflicting later readable text for the same encrypted reasoning identity does not overwrite the first readable body. The item id is reused, but the original readable evidence wins.
+**Purpose**: Checks that when the same encrypted reasoning appears later with conflicting readable text, the reducer reuses the existing item but does not overwrite the earlier readable text. This avoids replacing trusted earlier evidence with a contradictory later version.
 
-**Data flow**: Creates a first request with a user message, a response with reasoning text `first text` and `encrypted_content`, then a second-turn request with the same user message and reasoning text `different text` but the same encrypted content. After replay it asserts the second request reused the first response reasoning item id and that the stored body still contains only the original text plus encoded content, with no replacement by the conflicting later text.
+**Data flow**: It writes a response containing encrypted reasoning with the text 'first text'. A later request repeats the same encrypted content but supplies different text. After replay, the second request must reuse the original reasoning item ID, and that item's body must still contain the first text and the encrypted content only.
 
-**Call relations**: This test exercises the conservative branch of `merge_reasoning_body`, where encrypted identity matches but readable text is not a safe upgrade.
+**Call relations**: The test first establishes the reasoning item through append_inference_completion, then records a conflicting later request. replay_bundle must match the encrypted identity while refusing an unsafe content upgrade.
 
 *Call graph*: calls 5 internal fn (append_inference_completion, append_inference_start, create_started_writer, message, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -581,11 +593,11 @@ fn same_encrypted_reasoning_with_different_text_reuses_first_readable_body() -> 
 fn model_visible_call_id_reuse_with_different_content_is_reducer_error() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures replay fails when the same model-visible `call_id` is reused for a function call with different content in the same thread. This protects stable linkage between transcript items and reduced tool/code-cell nodes.
+**Purpose**: Checks that the reducer rejects a model-visible function call ID if it is reused for different call content. A call ID is supposed to identify one specific tool request, so changing the command under the same ID would corrupt later linking.
 
-**Data flow**: Writes two turns whose requests both contain `function_call` items with `call_id: call-1` but different JSON arguments, then invokes `expect_replay_error` and asserts the error message mentions reused call id with different content.
+**Data flow**: It writes one request with call_id 'call-1' for a cargo test command, then another request with the same call_id but a cargo check command. Instead of producing a rollout, replay is expected to fail with an error explaining that the call ID was reused with different content.
 
-**Call relations**: This negative test targets `ensure_call_id_consistency` during request reconciliation.
+**Call relations**: The test uses append_inference_start to create the conflicting events and expect_replay_error to verify the reducer fails. It protects the identity checks used later to connect model calls to tool outputs.
 
 *Call graph*: calls 4 internal fn (append_inference_start, create_started_writer, expect_replay_error, start_turn); 2 external calls (new, json!).
 
@@ -596,11 +608,11 @@ fn model_visible_call_id_reuse_with_different_content_is_reducer_error() -> anyh
 fn unsupported_model_item_is_reducer_error() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that unknown model item types are rejected rather than silently skipped. This keeps normalization exhaustive and replay failures explicit when the wire schema evolves.
+**Purpose**: Checks that an unknown model item type is treated as an error rather than silently ignored. This makes format changes visible and prevents missing conversation data.
 
-**Data flow**: Creates an inference request containing one item with `type: new_unhandled_model_item`, then calls `expect_replay_error` and asserts the message mentions the unsupported model item type.
+**Data flow**: It writes a request whose input contains a made-up item type. When replay is attempted, the expected result is an error message naming that unsupported type, not a partial rollout.
 
-**Call relations**: This test exercises the default error branch in `normalize_model_item`.
+**Call relations**: The test records the bad request with append_inference_start and delegates the expected failure check to expect_replay_error. It guards the reducer's parser against quietly skipping data it does not understand.
 
 *Call graph*: calls 4 internal fn (append_inference_start, create_started_writer, expect_replay_error, start_turn); 2 external calls (new, json!).
 
@@ -611,11 +623,11 @@ fn unsupported_model_item_is_reducer_error() -> anyhow::Result<()>
 fn missing_request_input_is_reducer_error() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an inference request payload without an `input` field fails replay. The reducer requires request snapshots to be explicit model-visible transcript evidence.
+**Purpose**: Checks that an inference request without an input field is rejected. The reducer cannot reconstruct a conversation request if the actual input history is missing.
 
-**Data flow**: Writes an inference request payload containing only `model`, starts inference, and then calls `expect_replay_error` expecting a message that the payload did not contain input.
+**Data flow**: It writes a request payload that includes a model name but no input. Replay is expected to fail with a message saying the request did not contain input.
 
-**Call relations**: This negative test targets the early validation in `reduce_inference_request`.
+**Call relations**: The test uses append_inference_start to attach the malformed payload to an inference and expect_replay_error to confirm the reducer reports the problem.
 
 *Call graph*: calls 4 internal fn (append_inference_start, create_started_writer, expect_replay_error, start_turn); 2 external calls (new, json!).
 
@@ -626,11 +638,11 @@ fn missing_request_input_is_reducer_error() -> anyhow::Result<()>
 fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that incremental requests referencing a nonexistent `previous_response_id` fail replay. The reducer must be able to reconstruct the omitted prefix exactly.
+**Purpose**: Checks that an incremental request cannot point to a previous response ID the reducer has never seen. Without that prior response, the reducer cannot know what history to carry forward.
 
-**Data flow**: Creates a request with `previous_response_id: resp-missing` and one user input item, starts inference, and then calls `expect_replay_error` expecting an unknown previous-response-id message.
+**Data flow**: It writes a request with previous_response_id set to a missing response and includes a normal user input. Replay should stop with an error naming the unknown previous response ID.
 
-**Call relations**: This test exercises the incremental-request lookup branch in `reduce_inference_request`.
+**Call relations**: The test records the bad incremental request through append_inference_start and uses expect_replay_error. It protects the path where replay_bundle resolves previous_response_id references.
 
 *Call graph*: calls 4 internal fn (append_inference_start, create_started_writer, expect_replay_error, start_turn); 2 external calls (new, json!).
 
@@ -641,11 +653,11 @@ fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()>
 fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()>
 ```
 
-**Purpose**: Validates the full compaction install flow: input history is recorded, a structural marker is inserted, replacement items get compaction producer refs and fresh ids, and the next full request reconciles against replacement history rather than pre-compaction items. It also checks the encoded compaction summary item shape.
+**Purpose**: Checks how a normal compaction checkpoint affects conversation identity. Compaction means older history is replaced by a shorter summary or replacement history, like swapping a stack of papers for a digest plus a marker.
 
-**Data flow**: Creates an initial request with developer and user items, emits a `CompactionInstalled` event with checkpoint payload containing `input_history` and `replacement_history`, then starts a second turn with a full request that repeats developer plus the replacement history. After replay it reads the first and second inference calls and the installed `Compaction`, asserting input ids match the first request, the second request reuses replacement item ids after the repeated developer prefix, the marker item has kind `CompactionMarker`, empty body, and `ProducerRef::Compaction`, the repeated developer gets a fresh post-compaction id, replacement items have compaction producer refs, and the compaction summary item is a summary-channel message with one encoded part.
+**Data flow**: It writes an initial request with developer and user messages, then records a compaction checkpoint with the original input history and replacement history. A later request repeats the developer prefix and then uses the replacement history. After replay, the compaction should remember the original input item IDs, create replacement items produced by the compaction, create a compaction marker item, and have the later request reuse those replacement items after the prefix.
 
-**Call relations**: This test exercises `reduce_compaction_checkpoint`, `reduce_compaction_installed_event`, pending replacement snapshot handling, and post-compaction full-request reconciliation.
+**Call relations**: The test uses append_inference_start for inference events and append_with_context with a CompactionInstalled event for the checkpoint. replay_bundle must stitch these together so compaction-produced items and later request items line up correctly.
 
 *Call graph*: calls 5 internal fn (append_inference_start, create_started_writer, message, start_turn, trace_context); 5 external calls (new, assert_eq!, assert_ne!, replay_bundle, json!).
 
@@ -656,11 +668,11 @@ fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::
 fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `context_compaction` items normalize the same way as `compaction` items inside replacement history. It focuses on the summary-channel encoded-body representation.
+**Purpose**: Checks the same replacement-history behavior for context compaction items. It specifically verifies that the compacted encrypted summary is represented as a summary-channel message.
 
-**Data flow**: Builds the same compaction scenario as the previous test but uses `type: context_compaction` in replacement history. After replay it reads the installed `Compaction` and asserts the third replacement item has channel `Summary`, kind `Message`, and an encoded `encrypted_content` body part.
+**Data flow**: It writes an initial request, installs a compaction checkpoint whose replacement history includes a context_compaction item with encrypted content, and then writes a later request containing that replacement history. After replay, the compacted summary item should have the Summary channel, Message kind, and an encoded body part carrying the encrypted summary.
 
-**Call relations**: This test targets the alternate compaction item-type branch in normalization while still relying on compaction checkpoint installation.
+**Call relations**: The test records inference and compaction events with the same helper pattern as the normal compaction test. replay_bundle converts the raw context_compaction item into the structured conversation item that the assertions inspect.
 
 *Call graph*: calls 5 internal fn (append_inference_start, create_started_writer, message, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -671,11 +683,11 @@ fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> 
 fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a reduced tool call links to both the model-visible function-call item that started it and the later function-call-output item that carries its result back into conversation history. It also checks the reciprocal producer ref on the output item.
+**Purpose**: Checks that the reducer connects three views of the same tool use: the model's function call, the system's tool-call event, and the later function_call_output sent back to the model. This makes it possible to follow a tool call from request to execution to result.
 
-**Data flow**: Creates an inference request and response containing a `function_call`, emits `ToolCallStarted` and `ToolCallEnded`, then starts a second turn with an incremental request carrying the matching `function_call_output`. After replay it reads both inference calls, the reduced tool call, and the follow-up output item id, then asserts the first inference recorded the started tool call id, the tool call's `model_visible_call_item_ids` equal the first response item ids, the tool call's `model_visible_output_item_ids` contain the follow-up output item id, and the conversation item's `produced_by` is `ProducerRef::Tool { tool_call_id: "tool-1" }`.
+**Data flow**: It writes a first inference whose response asks for an exec_command tool call with call_id 'call-1'. It then records ToolCallStarted and ToolCallEnded events for a real tool call tied to that model-visible ID. A later incremental request sends the function_call_output for the same call ID. After replay, the first inference should list the tool call it started, the tool call should point to the model call item and output item, and the output conversation item should be marked as produced by that tool.
 
-**Call relations**: This test exercises the conversation-to-tool linking hooks that run during item reconciliation and later output-item attachment.
+**Call relations**: The test uses append_inference_completion for the model call, append_with_context for tool lifecycle events, and append_inference_start for the follow-up output. replay_bundle is expected to use the shared model-visible call ID to link all those pieces.
 
 *Call graph*: calls 5 internal fn (append_inference_completion, append_inference_start, create_started_writer, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -686,22 +698,24 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()>
 fn inference_start_rejects_unknown_codex_turn() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures inference start fails when it references a Codex turn that has not been created. This protects thread/turn consistency before request reduction begins.
+**Purpose**: Checks that an inference cannot be attached to a turn that was never started. A turn is the surrounding unit of work, so accepting an unknown turn would leave the inference floating without context.
 
-**Data flow**: Writes an inference request payload, starts inference against `turn-missing`, and then calls `expect_replay_error` expecting an error about an unknown codex turn.
+**Data flow**: It creates a writer but does not start the referenced turn. It writes an inference start that names 'turn-missing'. Replay is expected to fail with an error saying the codex turn is unknown.
 
-**Call relations**: This negative test targets the validation in `TraceReducer::start_inference_call` before `reduce_inference_request` is invoked.
+**Call relations**: The test intentionally skips start_turn, then records the inference with append_inference_start. expect_replay_error confirms that replay_bundle enforces the requirement that each inference belongs to a known turn.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, expect_replay_error); 2 external calls (new, json!).
 
 
 ### `rollout-trace/src/reducer/inference_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module focuses on the interaction between inference terminal events and turn-end cleanup. Each test writes a temporary trace bundle, replays it, and inspects the reduced `InferenceCall` plus any conversation items created from response payloads. The first scenario confirms that `InferenceCancelled` with a partial response payload still reduces that payload into conversation items, marks the inference as cancelled, stores the upstream request id, and tags the response item with `ProducerRef::Inference`. The second scenario covers the cleanup path where a turn ends cancelled before any inference terminal event arrives; the reducer should close the still-running inference using the turn-end sequence.
+This file is a set of safety checks for the reducer, the part of the system that replays raw trace events and turns them into a structured rollout record. In everyday terms, it checks the project’s “flight recorder” after interrupted model calls: if an assistant answer was only partly produced, the final record should still show what was produced and why the call stopped.
 
-The final test exercises the subtle race where turn-end cleanup marks an inference failed, and only afterward does a late `InferenceCancelled` event arrive with a partial response payload and upstream request id. The reducer must preserve the earlier failed execution status and end sequence while still recording the late raw response payload id, upstream request id, and reduced partial response item. Together these tests document the intended precedence rules between turn lifecycle and asynchronous stream-mapper observations.
+Each test creates a temporary trace bundle, starts a turn, records an inference request, and then appends events that represent cancellation or turn ending. After that, it replays the bundle and inspects the resulting rollout model.
+
+The important behavior is about timing. If an inference is directly cancelled and includes a partial response, the reducer should mark that inference as cancelled and create conversation items from the partial response. If the whole turn is cancelled while an inference is still running, the inference should be closed too. But if the turn has already ended as failed, and a cancellation notice arrives later, the reducer should keep the earlier failed status while still saving useful late information such as the partial response payload and upstream request id. This prevents the final trace from telling a misleading story about what happened.
 
 #### Function details
 
@@ -711,11 +725,11 @@ The final test exercises the subtle race where turn-end cleanup marks an inferen
 fn cancelled_inference_reduces_partial_response_items() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a cancelled inference can still contribute partial response items to the reduced conversation. It also checks that cancellation metadata is preserved on the `InferenceCall`.
+**Purpose**: This test checks that a cancelled inference can still contribute a partial assistant message to the final conversation record. It protects against losing useful output just because the model call was interrupted.
 
-**Data flow**: Creates a turn and inference start, writes a partial inference-response payload containing one assistant message, emits `InferenceCancelled` with `upstream_request_id` and that payload, replays the bundle, then reads the reduced inference and its first response item id. It asserts cancelled execution status, stored upstream request id, one response item, the response item's kind, and its `ProducerRef::Inference`.
+**Data flow**: The test starts with an empty temporary trace folder, writes a turn start, writes an inference request, then records an inference cancellation that includes a partial response payload. It replays those raw events into a rollout and checks the result: the inference is marked cancelled, the upstream request id is stored, one response item exists, and that item is recorded as an assistant message produced by this inference.
 
-**Call relations**: This test exercises `complete_inference_call` on the cancelled-event branch together with `reduce_inference_response` for partial payloads.
+**Call relations**: The test uses the shared test helpers to create a writer, start a turn, and append the inference start event. It then relies on replay_bundle to run the reducer over the temporary trace, and uses assertions to verify that the reducer turned the cancellation event and partial response into the expected model objects.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -726,11 +740,11 @@ fn cancelled_inference_reduces_partial_response_items() -> anyhow::Result<()>
 fn cancelled_turn_closes_running_inference_call() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that turn-end cleanup closes an inference call that never emitted its own terminal event. The reduced inference should inherit the turn-end cancellation and sequence.
+**Purpose**: This test checks that when a whole turn is cancelled, any inference still running inside that turn is also treated as cancelled. Without this, the final rollout could show a model call as still open even though its parent turn has ended.
 
-**Data flow**: Creates a turn and inference start, emits `CodexTurnEnded { status: Cancelled }`, replays the bundle, reads the reduced inference, and asserts `execution.status == Cancelled` and `execution.ended_seq` equals the turn-end event sequence.
+**Data flow**: The test creates a temporary trace, starts one turn, records one inference request, and starts that inference. Instead of cancelling the inference directly, it appends a turn-ended event with a cancelled status. After replay, it reads the inference from the rollout and checks that its execution status is cancelled and that its end sequence matches the turn-ending event.
 
-**Call relations**: This test targets `close_running_inference_calls_for_turn_end` independently of `complete_inference_call`.
+**Call relations**: The setup is built through the same test-support helpers used by the other reducer tests. The key handoff is to replay_bundle, which interprets the turn cancellation and applies it to the still-running inference. The assertions confirm that this parent-to-child closing behavior happened.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -741,22 +755,24 @@ fn cancelled_turn_closes_running_inference_call() -> anyhow::Result<()>
 fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a late cancelled inference event with partial response evidence does not overwrite a terminal status already set by turn-end cleanup. It should still record the late payload and upstream request id.
+**Purpose**: This test checks a subtle ordering case: a turn has already ended as failed, and only afterward a cancellation event arrives for an inference in that turn. The reducer should keep the original failed status, while still saving useful details from the late cancellation.
 
-**Data flow**: Creates a turn and inference start, emits `CodexTurnEnded { status: Failed }`, then emits `InferenceCancelled` with `upstream_request_id` and a partial response payload containing one assistant message. After replay it reads the reduced inference and response item id, asserting the execution status remains `Failed`, the ended sequence remains the turn-end sequence, `raw_response_payload_id` equals the late payload id, `upstream_request_id` is stored, one response item exists, and that item's body contains the late partial text.
+**Data flow**: The test writes a turn, starts an inference, then ends the turn with a failed status. After that, it writes a partial inference response and appends a cancellation event that points to that partial response. When the trace is replayed, the inference still has the failed status and the original end sequence from the turn end, but it also stores the late partial response payload id, the upstream request id, and a response item containing the text from the partial response.
 
-**Call relations**: This test exercises the precedence logic inside `complete_inference_call` that preserves non-running execution status while still accepting late response evidence.
+**Call relations**: This test models an event stream where cancellation is noticed after the turn has already been closed. It uses the helper functions to build the trace, then replay_bundle runs the reducer. The assertions check that the reducer does not let the later cancellation rewrite the earlier turn-end status, but does still pass along the partial response data into the final rollout.
 
 *Call graph*: calls 3 internal fn (append_inference_start, create_started_writer, start_turn); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
 
 ### `rollout-trace/src/reducer/tool/agents_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module builds realistic multi-agent traces with `TraceWriter` and then replays them to assert on reduced `interaction_edges`, thread origins, and carried payload evidence. The scenarios cover both older protocol payloads and newer sub-agent activity payloads. Several tests validate the reducer's deferred-resolution design: sender-side tool runtime events are written first, then the child or parent thread later receives a model-visible mailbox message through an inference request, and replay must target that exact `ConversationItem` rather than a coarse thread anchor. Complementary fallback tests omit the recipient transcript item and assert that spawn edges fall back to the child thread while preserving raw payload ids, or that agent-result edges fall back to the child thread as source when the child produced no final assistant message.
+This is a test file for the part of the system that replays raw trace events into a clearer story of what happened. In this project, an agent can start another agent, send it work, follow up, close it, or receive a final result. The reducer must turn those scattered raw events into “interaction edges”: links that say, for example, “this tool call in the parent caused this message to appear in the child.” Without these tests, the trace could show separate threads and tool calls but fail to explain how they are connected.
 
-The module also verifies metadata-only child thread identity: thread-start metadata can mark a thread as `AgentOrigin::Spawned` without creating a delivery edge until a recipient-side message exists. Helper functions at the bottom keep repetitive fixture construction localized: `append_spawn_agent_tool_lifecycle` emits a full spawn tool lifecycle with invocation, runtime begin/end, and result payloads; `inter_agent_message` serializes the older mailbox transport JSON; `target_conversation_item_id` and `text_body` unwrap expected anchor/body shapes for assertions. Together these tests document the reducer's exact matching rules for author, recipient, content, and fallback behavior.
+Each test builds a small fake trace in a temporary folder using a TraceWriter. It writes events such as “thread started,” “tool call started,” “runtime event ended,” and “model saw this message.” Then it replays the bundle and checks the reduced model. The important checks are about where an edge starts, where it points, what conversation item it carries, and which raw payloads remain attached as proof.
+
+A recurring idea is fallback behavior. If the reducer can find the exact delivered conversation message, it links to that precise item. If not, it falls back to the thread itself rather than inventing a false message link. That is like labeling a package delivery: best case, you point to the signed receipt; if there is no receipt, you at least point to the destination house.
 
 #### Function details
 
@@ -766,11 +782,11 @@ The module also verifies metadata-only child thread identity: thread-start metad
 fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that thread-start metadata alone is enough to mark a child thread as `AgentOrigin::Spawned`, including nickname, default model, task name, and spawn edge id, but does not itself create an interaction edge. It checks the distinction between identity metadata and actual delivery evidence.
+**Purpose**: This test checks that metadata on a newly started child thread is enough to mark it as spawned by a parent thread, but not enough to create a delivered-message edge. It makes sure the reducer does not claim a message was delivered before it has seen the child-side conversation item.
 
-**Data flow**: Creates a temp bundle and writer, writes a session-metadata payload containing nested `session_source.subagent.thread_spawn`, appends a `ThreadStarted` event referencing that payload, replays the bundle, and asserts on the resulting thread fields and absence of the corresponding spawn edge in `interaction_edges`.
+**Data flow**: It creates a temporary trace folder, writes session metadata describing a subagent spawn, then writes a thread-start event that points to that metadata. After replaying the trace, it reads the child thread and confirms its nickname, model, and spawn origin were filled in. It also confirms there is no interaction edge yet, because no actual delivered conversation item exists.
 
-**Call relations**: This test directly drives `replay_bundle` after constructing only thread-start metadata, without any child-side transcript item. It validates the behavior implemented in thread reduction and the agent-edge module's decision to wait for recipient evidence before materializing a delivery edge.
+**Call relations**: The test builds the trace directly with TraceWriter::create and JSON payload writing, then hands the folder to replay_bundle. It relies on replay_bundle to run the reducer, and the assertions verify that the reducer separates identity metadata from real message delivery.
 
 *Call graph*: calls 1 internal fn (create); 5 external calls (new, assert!, assert_eq!, replay_bundle, json!).
 
@@ -781,11 +797,11 @@ fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow:
 fn spawn_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a spawn tool lifecycle resolves to the child thread's delivered task message when that mailbox item later appears in the child transcript. It confirms the preferred target is the exact child-side `ConversationItem`.
+**Purpose**: This test checks the normal spawn-agent path where a parent tool call creates a child thread and the child receives a model-visible task message. It expects the final interaction edge to point to that exact child conversation item.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, appends a full spawn tool lifecycle via `append_spawn_agent_tool_lifecycle`, then starts the child thread and turn, appends an inference request containing the delivered inter-agent message, replays the bundle, and asserts that the spawn edge targets a conversation item in the child thread and carries all invocation/runtime/result payload ids.
+**Data flow**: It starts a parent agent turn, appends a full spawn-agent tool lifecycle, starts the child thread and turn, then writes an inference request containing the inter-agent task message. After replay, it reads the spawn edge and checks that the source is the parent tool call, the target is the child conversation item, and the raw payload IDs from the tool lifecycle are carried on the edge.
 
-**Call relations**: The test composes shared writer helpers plus the local spawn-lifecycle helper, then inspects the reduced edge after `replay_bundle`. It specifically exercises deferred edge resolution from pending sender-side state to a later transcript item.
+**Call relations**: This test calls append_spawn_agent_tool_lifecycle to avoid repeating the parent-side spawn setup, uses inter_agent_message to build the delivered child message, and uses target_conversation_item_id to inspect the edge target. It then depends on replay_bundle to connect those pieces into one SpawnAgent interaction edge.
 
 *Call graph*: calls 8 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, append_spawn_agent_tool_lifecycle, inter_agent_message, target_conversation_item_id); 4 external calls (new, assert_eq!, replay_bundle, vec!).
 
@@ -796,11 +812,11 @@ fn spawn_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()>
 fn spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that when a spawned child thread exists but never receives a model-visible task message, the pending spawn edge is finalized to the child thread itself. It confirms the replay-end fallback path.
+**Purpose**: This test checks what happens when a spawn-agent tool call starts a child thread, but the child never records the delivered task message. It confirms the reducer still creates a useful spawn edge, but points it only at the child thread.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, appends the spawn tool lifecycle, starts the child thread without any child inference request, replays the bundle, and asserts that the spawn edge targets `TraceAnchor::Thread`, carries no item ids, and still preserves all raw payload ids.
+**Data flow**: It writes the parent spawn tool lifecycle and starts the child thread, but deliberately skips the child inference request that would contain the task message. After replay, it checks that the edge source is the spawn tool call, the target is the child thread, no conversation item IDs are carried, and the raw tool payloads are still attached.
 
-**Call relations**: This test relies on `replay_bundle` invoking the final spawn-fallback resolution pass after all events are processed. It complements the previous test by omitting the transcript evidence needed for exact item targeting.
+**Call relations**: The setup is shared through append_spawn_agent_tool_lifecycle. Unlike the delivered-message test, this one stops before calling append_inference_request for the child. replay_bundle must therefore use its fallback behavior rather than target a precise conversation item.
 
 *Call graph*: calls 4 internal fn (create_started_agent_writer, start_agent_turn, start_thread, append_spawn_agent_tool_lifecycle); 4 external calls (new, assert!, assert_eq!, replay_bundle).
 
@@ -811,11 +827,11 @@ fn spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item() -> a
 fn sub_agent_started_activity_creates_spawn_edge() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a newer sub-agent activity payload with kind `started` can create the same spawn interaction edge as classic spawn runtime payloads. It validates the v2 activity-based path.
+**Purpose**: This test covers a newer style of runtime payload where a spawn is reported as a sub-agent activity event. It verifies that this activity still produces a proper spawn edge to the child’s delivered task message.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, writes a spawn-agent invocation payload and `ToolCallStarted`, writes a runtime-end activity payload containing `agent_thread_id` and `kind: started`, appends it, then starts the child thread and turn and appends a child inference request containing a structured agent-message item. After replay it asserts that the spawn edge targets the child conversation item and carries the invocation and activity payload ids.
+**Data flow**: It writes a spawn_agent tool invocation, then writes a runtime-ended activity payload that names the child thread and path. It starts the child thread, adds the child’s task message, replays the trace, and checks that the spawn edge links the parent tool call to the child conversation item. It also checks that the edge carries the invocation and activity payload IDs as evidence.
 
-**Call relations**: This test drives the `end_sub_agent_activity` path rather than classic spawn-end parsing. It uses `trace_context_for_agent` and transcript helpers to create the exact ordering where the edge must be queued first and resolved later.
+**Call relations**: The test writes events with trace_context_for_agent so they belong to the parent turn, then uses append_inference_request to place the delivered message in the child timeline. target_conversation_item_id is used after replay_bundle to confirm that the reducer chose the message, not just the thread.
 
 *Call graph*: calls 7 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_agent, target_conversation_item_id); 6 external calls (new, assert_eq!, replay_bundle, format!, json!, vec!).
 
@@ -826,11 +842,11 @@ fn sub_agent_started_activity_creates_spawn_edge() -> anyhow::Result<()>
 fn send_message_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that classic send-message runtime begin/end payloads produce a `SendMessage` interaction edge targeting the delivered child mailbox item. It also checks that the edge records an end timestamp.
+**Purpose**: This test checks that a send_message tool call is linked to the exact message that appears in the receiving child agent’s conversation. It protects the trace from showing a send action without its visible delivery point.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, writes a send-message invocation payload and tool start, writes runtime begin and runtime end payloads with sender/receiver/prompt, starts the child thread and turn, appends a child inference request containing the delivered mailbox message, replays the bundle, and asserts on edge kind, source, target item thread, carried item ids, and presence of `ended_at_unix_ms`.
+**Data flow**: It writes a send_message tool call, runtime start and end payloads naming the sender and receiver threads, then starts the receiver thread and records the delivered inter-agent message. After replay, it checks that the edge is a SendMessage edge, starts at the tool call, points to the child conversation item, belongs to the receiver thread, and has an end time.
 
-**Call relations**: This test exercises both `start_agent_interaction_from_runtime` and `end_agent_interaction_from_runtime` for classic message payloads, with transcript resolution happening afterward during replay.
+**Call relations**: The test uses trace_context_for_agent to attach tool events to the parent turn, inter_agent_message to create the delivered mailbox content, and append_inference_request to put that content into the child turn. replay_bundle is responsible for matching the runtime payload to that delivered item.
 
 *Call graph*: calls 8 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_agent, inter_agent_message, target_conversation_item_id); 6 external calls (new, assert!, assert_eq!, replay_bundle, json!, vec!).
 
@@ -841,11 +857,11 @@ fn send_message_runtime_payload_targets_delivered_child_message() -> anyhow::Res
 fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a newer sub-agent activity payload with kind `interacted` for a send-message tool resolves to the delivered child mailbox item. It validates the activity-based send-message path.
+**Purpose**: This test checks the activity-event form of send_message, where the runtime payload reports that the parent interacted with a child agent. It confirms that the reducer still finds the delivered child-side message.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, writes a send-message invocation payload and tool start, writes a runtime-end activity payload naming the child thread and `kind: interacted`, starts the child thread and turn, appends a child inference request containing the delivered mailbox message, replays the bundle, and asserts that the resulting edge targets the child conversation item and carries the invocation and activity payload ids.
+**Data flow**: It writes a send_message invocation, writes an activity-style runtime-ended payload naming the child thread and path, then records the child’s received message. After replay, it checks that the SendMessage edge targets the child conversation item and carries both the invocation payload and activity payload.
 
-**Call relations**: This test specifically drives `end_sub_agent_activity` for `ToolCallKind::SendMessage`. It complements the classic runtime-payload test by proving both transport shapes reduce to the same edge semantics.
+**Call relations**: This is parallel to the runtime-payload send_message test, but uses a different payload shape. inter_agent_message and append_inference_request create the child-side evidence, while replay_bundle must interpret the activity payload and attach it to the same delivered item.
 
 *Call graph*: calls 8 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_agent, inter_agent_message, target_conversation_item_id); 5 external calls (new, assert_eq!, replay_bundle, json!, vec!).
 
@@ -856,11 +872,11 @@ fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()>
 fn followup_activity_targets_delivered_child_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an `AssignAgentTask` tool paired with a sub-agent activity payload of kind `interacted` produces an `AssignAgentTask` interaction edge targeting the delivered child message. It covers follow-up task delivery semantics.
+**Purpose**: This test checks that a follow-up task sent to an existing child agent is linked to the child message that delivers that follow-up. It verifies the reducer treats follow-up assignment as its own kind of agent interaction.
 
-**Data flow**: Creates an agent-root writer, starts a parent turn, writes a follow-up-task invocation payload and tool start, writes a runtime-end activity payload naming the child thread and `kind: interacted`, starts the child thread and turn, appends a child inference request containing the delivered mailbox message, replays the bundle, and asserts on edge kind, target item thread, carried item ids, and carried raw payload ids.
+**Data flow**: It writes a followup_task tool invocation using the AssignAgentTask kind, records an activity payload naming the child, starts the child turn, and adds the delivered follow-up message. After replay, it checks that the edge kind is AssignAgentTask, that it targets the child conversation item, and that it carries the raw invocation and activity payload IDs.
 
-**Call relations**: This test exercises the `AssignAgentTask` branch of `end_sub_agent_activity`. It mirrors the send-message activity test but validates the distinct interaction-edge kind.
+**Call relations**: The test follows the same pattern as the send-message activity test, but changes the tool kind and message meaning. replay_bundle must turn those raw events into an AssignAgentTask edge rather than a generic send.
 
 *Call graph*: calls 8 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_agent, inter_agent_message, target_conversation_item_id); 5 external calls (new, assert_eq!, replay_bundle, json!, vec!).
 
@@ -871,11 +887,11 @@ fn followup_activity_targets_delivered_child_message() -> anyhow::Result<()>
 fn close_agent_runtime_payload_targets_thread() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that close-agent runtime payloads create a `CloseAgent` interaction edge targeting the child thread directly, not a conversation item, and that child thread shutdown does not imply rollout completion. It validates close semantics and status separation.
+**Purpose**: This test checks that closing an agent points to the agent thread itself, not to a conversation message. Closing is an action on the child agent’s lifecycle, so the thread is the right target.
 
-**Data flow**: Creates an agent-root writer, starts the child thread, starts a parent turn, writes close-agent invocation, runtime begin, runtime end, and result payloads plus matching tool lifecycle events, appends a `ThreadEnded` for the child, replays the bundle, and asserts on edge kind/source/thread target, empty carried item ids, full carried raw payload ids, child thread execution status, and unchanged rollout status.
+**Data flow**: It starts a child thread, writes a close_agent tool call from the parent, records runtime start and end payloads naming the receiver thread, writes the tool result, and then ends the child thread. After replay, it checks that the CloseAgent edge starts at the tool call, targets the child thread, carries no conversation item IDs, carries all relevant raw payload IDs, and marks the child thread execution as completed.
 
-**Call relations**: This test drives both agent-edge reduction and thread-end reduction in one scenario. It confirms that `upsert_close_agent_interaction` targets threads directly and that `end_thread` does not propagate child completion to rollout completion.
+**Call relations**: The test uses trace_context_for_agent to place the close tool events in the parent turn, then relies on replay_bundle to connect those payloads to the already-started child thread. It also checks that ending the child thread does not incorrectly complete the whole rollout.
 
 *Call graph*: calls 4 internal fn (create_started_agent_writer, start_agent_turn, start_thread, trace_context_for_agent); 5 external calls (new, assert!, assert_eq!, replay_bundle, json!).
 
@@ -886,11 +902,11 @@ fn close_agent_runtime_payload_targets_thread() -> anyhow::Result<()>
 fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a child-result notification edge uses the child's final assistant message as source and the parent's delivered notification mailbox item as target when both transcript items exist. It checks the most precise source and target anchoring.
+**Purpose**: This test checks the happy path for a child agent reporting a result to its parent. It verifies the edge starts at the child’s actual result message and points to the parent’s notification message.
 
-**Data flow**: Creates an agent-root writer, starts a child thread and turn, appends a completed child inference whose output contains an assistant message `done`, writes an `AgentResult` payload and `AgentResultObserved` event, starts a parent turn, appends a parent inference request containing the delivered notification mailbox message, replays the bundle, and asserts that the edge kind is `AgentResult`, the source anchor is the child's result conversation item with text `done`, the target is a parent conversation item, and the carried raw payload ids contain the agent-result payload.
+**Data flow**: It starts a child thread and records a completed child inference whose output text is “done.” It then writes an AgentResultObserved event with a raw payload and later records the parent receiving a notification message. After replay, it checks that the AgentResult edge source is the child result conversation item, the target is the parent notification conversation item, and the raw result payload is carried.
 
-**Call relations**: This test exercises `queue_agent_result_interaction_edge` plus later target resolution from transcript reduction. It also validates `latest_assistant_message_item_for_turn` by expecting the child result item, not the inbound task message, as the source.
+**Call relations**: append_completed_inference creates the child output that can become the edge source. inter_agent_message and append_inference_request create the parent-side notification target. replay_bundle must match both sides so the edge tells the full story from child result to parent notice.
 
 *Call graph*: calls 9 internal fn (append_completed_inference, append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_thread, inter_agent_message, target_conversation_item_id); 6 external calls (new, assert_eq!, replay_bundle, json!, panic!, vec!).
 
@@ -901,11 +917,11 @@ fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Resu
 fn agent_result_edge_falls_back_to_child_thread_without_result_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that when a child task produces no final assistant message, the agent-result edge falls back to the child thread as source while still targeting the exact parent-side notification mailbox item. It validates asymmetric fallback behavior.
+**Purpose**: This test checks a failure case where the child agent sends a status notification but never produced an assistant result message. It makes sure the reducer does not mistake the child’s inbound task message for the child’s result.
 
-**Data flow**: Creates an agent-root writer, starts a child thread and turn, appends only a child inference request containing the inbound task mailbox item, writes an `AgentResult` payload and `AgentResultObserved` event for a failed status, starts a parent turn, appends a parent inference request containing the delivered failure notification mailbox message, replays the bundle, and asserts that the edge source is `TraceAnchor::Thread`, the target is a parent conversation item, and the carried raw payload ids contain the agent-result payload.
+**Data flow**: It starts a child thread and records only the child’s incoming task message, then writes an AgentResultObserved failure notification. It also records the parent receiving that failure notification. After replay, it checks that the edge source falls back to the child thread, the target is still the precise parent conversation item, and the raw agent-result payload is carried.
 
-**Call relations**: This test drives the fallback branch in `queue_agent_result_interaction_edge` where `latest_assistant_message_item_for_turn` returns none. It complements the previous test by proving the reducer does not mistake the inbound child task message for the child's result.
+**Call relations**: The test uses trace_context_for_thread to attach the observed result to the child turn, then uses inter_agent_message and append_inference_request for the parent-side delivery. replay_bundle must be careful: it may target the parent notification, but must not invent a child result item.
 
 *Call graph*: calls 8 internal fn (append_inference_request, create_started_agent_writer, start_agent_turn, start_thread, start_turn_for_thread, trace_context_for_thread, inter_agent_message, target_conversation_item_id); 5 external calls (new, assert_eq!, replay_bundle, json!, vec!).
 
@@ -919,11 +935,11 @@ fn append_spawn_agent_tool_lifecycle(
 ) -> anyhow::Result<SpawnAgentToolPayloads>
 ```
 
-**Purpose**: Writes a complete parent-side spawn-agent tool lifecycle fixture and returns the four payload refs used by the scenario. It centralizes repetitive spawn setup for the spawn-edge tests.
+**Purpose**: This helper writes the standard parent-side sequence for a spawn_agent tool call. It lets the spawn tests focus on what happens on the child side instead of repeating the same setup.
 
-**Data flow**: Takes a writer and parent turn id, writes a tool invocation payload for `spawn_agent`, appends `ToolCallStarted`, writes runtime begin and runtime end payloads and appends matching runtime events, writes a tool result payload and appends `ToolCallEnded`, then returns `SpawnAgentToolPayloads { invocation, begin, end, result }`.
+**Data flow**: It receives a TraceWriter and a parent turn ID. It writes four raw payloads: the tool invocation, the runtime-start event, the runtime-end event that names the new child thread, and the final tool result. It appends matching trace events for each payload and returns the payload references so the tests can later check that the reducer preserved them on the edge.
 
-**Call relations**: Called by the two classic spawn tests to keep them focused on child-side delivery behavior. It delegates context creation to `trace_context_for_agent` and all payload/event writes to `TraceWriter` methods.
+**Call relations**: It is called by the two spawn runtime payload tests. Internally it uses trace_context_for_agent so each appended event belongs to the right parent turn, and it hands back a SpawnAgentToolPayloads bundle for later assertions after replay_bundle runs.
 
 *Call graph*: calls 3 internal fn (trace_context_for_agent, append_with_context, write_json_payload); called by 2 (spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item, spawn_runtime_payload_targets_delivered_child_message); 1 external calls (json!).
 
@@ -934,11 +950,11 @@ fn append_spawn_agent_tool_lifecycle(
 fn inter_agent_message(author: &str, recipient: &str, content: &str, trigger_turn: bool) -> String
 ```
 
-**Purpose**: Serializes an older-style inter-agent mailbox message transport object into a JSON string. Tests use it to populate assistant message bodies that the reducer should recognize as delivered agent messages.
+**Purpose**: This helper builds the JSON text used to represent a message from one agent to another. Tests use it to create realistic delivered mailbox messages without rewriting the same JSON shape each time.
 
-**Data flow**: Takes author, recipient, content, and `trigger_turn`, constructs a JSON object with those fields plus `other_recipients: []`, converts it to a string with `.to_string()`, and returns it. It is pure.
+**Data flow**: It takes an author path, a recipient path, message content, and a flag saying whether the message should trigger a turn. It packages those values into a JSON object with no other recipients, converts it to a string, and returns that string for insertion into a test inference request.
 
-**Call relations**: Used by multiple tests when building mailbox messages for inference requests. It mirrors the legacy transport shape parsed by `inter_agent_message_fields` in the reducer.
+**Call relations**: It is used by the spawn, send-message, follow-up, and agent-result tests whenever they need a child or parent conversation item that represents an inter-agent delivery. The returned string is usually passed into message and then append_inference_request.
 
 *Call graph*: called by 6 (agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_targets_delivered_child_message); 1 external calls (json!).
 
@@ -949,11 +965,11 @@ fn inter_agent_message(author: &str, recipient: &str, content: &str, trigger_tur
 fn target_conversation_item_id(anchor: &TraceAnchor) -> &String
 ```
 
-**Purpose**: Extracts the conversation item id from a `TraceAnchor` expected to be `ConversationItem`. It is an assertion helper for tests that expect exact item targeting.
+**Purpose**: This helper extracts the conversation item ID from a trace anchor when a test expects an edge to point at a specific message. It fails loudly if the edge points somewhere else, such as a thread.
 
-**Data flow**: Takes a `&TraceAnchor`, pattern-matches it as `TraceAnchor::ConversationItem { item_id }`, returns `&String` on success, and panics otherwise. It does not mutate state.
+**Data flow**: It receives a TraceAnchor. If the anchor is a ConversationItem, it returns the contained item ID by reference. If not, it stops the test with a panic, making the mismatch obvious.
 
-**Call relations**: Called by tests after replay when they expect an interaction edge target to be a conversation item. It keeps anchor-shape assertions concise.
+**Call relations**: Many tests call this after replay_bundle to inspect an edge target. It turns the general anchor value into the exact ID needed to look up the conversation item and check which thread it belongs to.
 
 *Call graph*: called by 7 (agent_result_edge_falls_back_to_child_thread_without_result_message, agent_result_edge_links_child_result_to_parent_notification, followup_activity_targets_delivered_child_message, send_message_activity_targets_delivered_child_message, send_message_runtime_payload_targets_delivered_child_message, spawn_runtime_payload_targets_delivered_child_message, sub_agent_started_activity_creates_spawn_edge); 1 external calls (panic!).
 
@@ -964,22 +980,24 @@ fn target_conversation_item_id(anchor: &TraceAnchor) -> &String
 fn text_body(item: &crate::model::ConversationItem) -> &str
 ```
 
-**Purpose**: Extracts the text from a conversation item body expected to contain exactly one `ConversationPart::Text`. It is a narrow assertion helper for result-message tests.
+**Purpose**: This helper reads the plain text from a conversation item when the test expects that item to contain exactly one text part. It is used to confirm that the chosen source message really is the child’s result text.
 
-**Data flow**: Takes a `&crate::model::ConversationItem`, pattern-matches `item.body.parts` as a single text part, returns `&str` for that text, and panics if the body shape differs. It is pure.
+**Data flow**: It receives a ConversationItem, looks inside its body, and returns the text if there is exactly one text part. If the item has a different shape, it panics so the test fails rather than silently reading the wrong content.
 
-**Call relations**: Used by the child-result test to assert that the source conversation item contains the expected assistant output text.
+**Call relations**: It is used in the agent result linking test after replay_bundle has selected a child conversation item as the edge source. The helper lets the test confirm that the source item says “done,” proving the reducer chose the child output rather than another message.
 
 *Call graph*: 1 external calls (panic!).
 
 
 ### `rollout-trace/src/reducer/tool/terminal_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module constructs focused traces around terminal-capable tools and verifies the resulting reduced terminal graph in detail. The main exec test covers the full happy path: an inference response emits a model-visible function call, a tool start/runtime start/runtime end/result sequence follows, and a later inference request carries the tool output back to the model. Replay must produce a `ToolCall` summarized as `ToolCallSummary::Terminal`, a `TerminalOperation` with runtime-derived request/result fields and raw payload ids, a `TerminalSession` keyed by process id, and a `TerminalModelObservation` linking the terminal row back to the model-visible call and output items.
+This is a test file for the trace reducer, the part of the system that takes low-level recorded events and turns them into a more useful story of what happened. The raw trace contains separate facts such as “a tool started,” “a runtime event arrived,” “a tool ended,” and “the model saw this output.” This file verifies that those scattered facts are stitched into terminal operations and terminal sessions.
 
-The remaining tests probe edge cases and alternate payload sources. One verifies that a `WriteStdin` runtime start on an existing process reuses the already-created terminal session rather than creating a second session. Another shows that dispatch-only `write_stdin` invocation/result payloads are sufficient to create and complete a terminal operation even without runtime begin/end protocol events, including numeric `session_id` normalization. The code-mode test confirms that a structured `code_mode_response` result is projected into terminal-specific fields like `chunk_id`, `exit_code`, and `original_token_count`. Two local helpers append the inference request/response scaffolding needed to create model-visible tool call and output items for the exec scenario.
+A terminal operation is one action, such as running `cargo test` or sending text into an existing shell. A terminal session is the longer-lived terminal process that those actions belong to, like one open terminal tab that may receive several commands over time. Without these tests, the reducer could accidentally lose the link between a tool call and the terminal it created, attach stdin to the wrong session, miss raw payload references, or flatten structured command results into incomplete output.
+
+Each test creates a temporary trace, writes a small sequence of fake raw events into it, replays the bundle, and compares the reduced result with the exact expected model. Two helper functions add realistic model inference events: one where the model asks to run a command, and another where the next model request includes the tool output. Together, the tests make sure the reducer preserves both the machine-facing details and the model-facing conversation context.
 
 #### Function details
 
@@ -989,11 +1007,11 @@ The remaining tests probe edge cases and alternate payload sources. One verifies
 fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies the full exec-command reduction path from model-visible tool call through runtime begin/end and later model-visible tool output. It asserts the exact `ToolCall`, `TerminalOperation`, `TerminalSession`, and terminal model-observation contents.
+**Purpose**: This test proves that a normal command execution, such as running `cargo test`, becomes both a terminal operation and a terminal session after replay. It also checks that the reducer keeps the links back to the original raw payloads and to what the model saw.
 
-**Data flow**: Creates a temp bundle and started writer, starts turn 1, appends an inference whose response contains a function call, writes tool invocation/runtime/result payloads and matching tool events, starts turn 2, appends a follow-up inference request containing the tool output, replays the bundle, and asserts on terminal operation id assignment, raw payload ids, terminal summary replacement, operation execution/request/result fields, model observation item ids, and session contents.
+**Data flow**: It starts with an empty temporary trace, then writes a turn, a model request that asks for an `exec_command`, a tool start event, runtime start and end events, a tool result, and a later model request containing the tool output. After replaying the trace, it expects one terminal operation for the command and one terminal session for the created terminal. The output is not a returned value from the test; instead, the test passes only if the reduced rollout exactly matches the expected command, timing, status, stdout, payload IDs, session ID, and model observation links.
 
-**Call relations**: This test composes the local helpers `append_inference_with_tool_call` and `append_followup_with_tool_output` with shared writer fixtures, then validates the combined behavior of generic tool reduction and terminal-specific reduction after `replay_bundle`.
+**Call relations**: This is the broad end-to-end test in the file. It uses the shared test setup helpers to create the writer, start turns, and add standard inference events through `append_inference_with_tool_call` and `append_followup_with_tool_output`. It then calls the replay step and uses assertions to confirm that the reducer connected all the pieces into the final terminal records.
 
 *Call graph*: calls 6 internal fn (create_started_writer, generic_summary, start_turn, trace_context, append_followup_with_tool_output, append_inference_with_tool_call); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -1004,11 +1022,11 @@ fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()>
 fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a `WriteStdin` terminal operation started from runtime payloads joins an existing terminal session when both operations share the same process id. It validates session reuse rather than session duplication.
+**Purpose**: This test checks that sending input to an already-running terminal does not create a separate, unrelated session. It verifies the everyday case where a shell is started first, and later text like `echo hi` is typed into that same shell.
 
-**Data flow**: Creates a started writer, starts a turn, writes an exec-command runtime-start payload for `tool-start` and appends matching tool start/runtime start events, writes a write-stdin runtime-start payload for `tool-stdin` and appends matching tool start/runtime start events, replays the bundle, and asserts that the single terminal session `pty-1` contains both operation ids and that the second operation has the expected running `WriteStdin` request fields and raw payload ids.
+**Data flow**: It writes a trace where one tool starts a terminal process with process ID `pty-1`, then another tool call writes stdin into that same process. When the trace is replayed, the existing terminal session should contain both operations in order. The stdin operation should point at `pty-1`, contain the typed text, remain running because no end event was written, and keep the raw payload ID that described the stdin event.
 
-**Call relations**: This test drives only runtime-start terminal creation, without terminal end events. It specifically validates `ensure_terminal_session` behavior when multiple operations share one terminal id.
+**Call relations**: This test builds directly on the reducer’s session-linking behavior. It uses the common writer and turn helpers, writes the startup and stdin runtime events, then calls the replay step. The assertions focus on whether the second operation was added to the first session instead of being treated as a brand-new terminal.
 
 *Call graph*: calls 4 internal fn (create_started_writer, generic_summary, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -1019,11 +1037,11 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
 fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that dispatch-style `write_stdin` invocation and result payloads alone can create and complete a terminal operation and session. It covers the non-protocol fallback path.
+**Purpose**: This test checks a different path for stdin writes: when the request details come from the tool invocation payload rather than from a runtime event. It makes sure the reducer can still create a complete terminal operation from that dispatched tool-call data.
 
-**Data flow**: Creates a started writer, starts a turn, writes a `ToolInvocation` payload for `write_stdin` with serialized function arguments including numeric `session_id`, appends `ToolCallStarted`, writes a direct-response `ToolResult` payload, appends `ToolCallEnded`, replays the bundle, and asserts on the tool's terminal summary, the terminal operation's request/result/execution/raw-payload fields, and the terminal session keyed by stringified `session_id`.
+**Data flow**: It creates a trace with a `write_stdin` tool invocation containing a session ID, characters to send, and output limits. It then writes a tool completion event with a direct response containing `hi`. After replay, the expected result is a completed stdin terminal operation tied to terminal session `123`, with the input text, timing, output, and raw payload IDs all preserved. It also expects the tool call summary to point to the new terminal operation.
 
-**Call relations**: This test exercises `start_terminal_operation_from_invocation` and dispatch response parsing rather than runtime protocol parsing. It validates that generic tool reduction can still produce terminal rows without runtime observations.
+**Call relations**: This test covers the path where the tool start and end events themselves provide enough information to form the terminal operation. It uses the usual trace setup helpers, then hands the saved trace to replay. The assertions show that the reducer can build both the operation and its session even without separate runtime start and runtime end events.
 
 *Call graph*: calls 4 internal fn (create_started_writer, generic_summary, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -1034,11 +1052,11 @@ fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Resul
 fn code_mode_write_stdin_result_projects_structured_exec_fields() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a code-mode `write_stdin` result payload is projected into structured terminal result fields such as `chunk_id`, `exit_code`, and `original_token_count`. It validates the code-mode response parsing branch.
+**Purpose**: This test makes sure that a stdin write made from code mode keeps structured result fields, not just plain text output. Code mode here means a code cell calls the tool, and the tool result comes back with fields such as exit code, token count, and chunk ID.
 
-**Data flow**: Creates a started writer, starts a turn, writes a dispatch-style write-stdin invocation payload and a `code_mode_response` tool result payload, appends a `CodeCellStarted` event, appends `ToolCallStarted` for a code-cell-requested write-stdin tool, appends `ToolCallEnded`, replays the bundle, and asserts that `terminal_operation:1` has the expected structured `TerminalResult`.
+**Data flow**: It writes a trace with a code cell start event, a `write_stdin` tool call tied to that code cell, and a code-mode result payload containing output plus structured metadata. After replay, it checks that the terminal operation result includes the exit code, stdout text, formatted output, original token count, and chunk ID. The test succeeds only if those fields survive the reduction step.
 
-**Call relations**: This test combines code-cell context with terminal reduction to ensure the terminal parser handles code-mode result payloads correctly. It primarily exercises `parse_code_mode_exec_result` through the dispatch response path.
+**Call relations**: This test focuses on the special code-cell route into terminal tools. It sets up the trace, records the code cell and tool events, then replays the bundle. Its assertion is narrow on purpose: it verifies that the reducer hands structured code-mode response fields into the terminal result instead of reducing them to only a string.
 
 *Call graph*: calls 4 internal fn (create_started_writer, generic_summary, start_turn, trace_context); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -1049,11 +1067,11 @@ fn code_mode_write_stdin_result_projects_structured_exec_fields() -> anyhow::Res
 fn append_inference_with_tool_call(writer: &TraceWriter) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a minimal inference exchange whose response contains a model-visible `function_call` item for `exec_command`. It provides the transcript scaffolding needed for terminal model-observation assertions.
+**Purpose**: This helper writes a realistic model inference that asks to run an `exec_command`. It exists so the main command-execution test can include the model-facing side of the story without repeating bulky setup code.
 
-**Data flow**: Takes a writer, writes an `InferenceRequest` payload containing a user message, appends `InferenceStarted` for `inference-1`, writes an `InferenceResponse` payload containing one `function_call` output item with `call_id: call-1`, appends `InferenceCompleted`, and returns `Ok(())`.
+**Data flow**: It receives a trace writer. It writes an inference request payload containing a user message, appends an inference-started event, then writes an inference response payload containing a function call for `exec_command` with the command `cargo test`. Finally, it appends an inference-completed event. The trace is changed by adding those payloads and events; the function returns success or an error if writing fails.
 
-**Call relations**: Called only by `exec_tool_reduces_to_terminal_operation_and_session`. It sets up the response-side call item that generic tool reduction later links to the terminal-backed tool call.
+**Call relations**: This helper is called by `exec_tool_reduces_to_terminal_operation_and_session` before the raw tool-call events are written. It supplies the model response item that later gets linked to the terminal operation as something the model requested.
 
 *Call graph*: calls 2 internal fn (append, write_json_payload); called by 1 (exec_tool_reduces_to_terminal_operation_and_session); 1 external calls (json!).
 
@@ -1064,11 +1082,11 @@ fn append_inference_with_tool_call(writer: &TraceWriter) -> anyhow::Result<()>
 fn append_followup_with_tool_output(writer: &TraceWriter) -> anyhow::Result<()>
 ```
 
-**Purpose**: Appends a follow-up inference request that carries a model-visible `function_call_output` item for the earlier exec tool call. It provides the transcript-side output item used in terminal model observations.
+**Purpose**: This helper writes the later model inference request that includes the output from the tool call. It lets the main test check that the reducer connects terminal output back to what the model received next.
 
-**Data flow**: Takes a writer, writes an `InferenceRequest` payload containing `previous_response_id: "resp-1"` and one `function_call_output` input item for `call-1`, appends `InferenceStarted` for `inference-2`, and returns `Ok(())`. It writes the payload file and event log entry.
+**Data flow**: It receives a trace writer. It writes an inference request payload that refers to the previous response and includes a `function_call_output` item for call ID `call-1` with output `ok`. It then appends an inference-started event for the second turn. The trace gains that payload and event, and the function returns success or a writing error.
 
-**Call relations**: Called only by `exec_tool_reduces_to_terminal_operation_and_session` after the tool lifecycle has been appended. It creates the later transcript evidence that generic tool reduction mirrors onto the terminal operation.
+**Call relations**: This helper is called near the end of `exec_tool_reduces_to_terminal_operation_and_session`, after the command has run and produced output. Its event gives the reducer a follow-up model input item, which the test expects to appear as a model observation on the terminal operation.
 
 *Call graph*: calls 2 internal fn (append, write_json_payload); called by 1 (exec_tool_reduces_to_terminal_operation_and_session); 1 external calls (json!).
 
@@ -1078,13 +1096,13 @@ These tests validate protocol-event mapping and then exercise the thread-scoped 
 
 ### `rollout-trace/src/protocol_event_tests.rs`
 
-`test` · `test-only`
+`test` · `test run`
 
-This test module exercises one subtle mapping decision from `protocol_event.rs`: `EventMsg::SubAgentActivity` does not have a separate begin/end pair, but rollout tracing treats it as an `Ended` tool runtime event. The test constructs a realistic `SubAgentActivityEvent` with a generated `ThreadId`, a parsed `AgentPath` of `/root/reviewer`, a fixed `event_id`, timestamp, and `SubAgentActivityKind::Started`, then wraps it in `EventMsg::SubAgentActivity`.
+This is a small test file focused on one important promise: when the system hears that a sub-agent did something, that message should appear in the tool runtime trace as a finished event. A sub-agent is a helper agent working under the main agent, like a reviewer or specialist. The trace is the record of what happened, similar to a receipt after a task is run.
 
-It calls `tool_runtime_trace_event` and pattern-matches the result to require `Some(ToolRuntimeTraceEvent::Ended { ... })`; any other outcome triggers a panic. The assertions then check three things: the emitted `tool_call_id` is the original `event_id`, the derived status is `ExecutionStatus::Completed`, and serializing the borrowed `payload` reproduces the original protocol JSON shape with `event_id`, `occurred_at_ms`, `agent_thread_id`, `agent_path`, and `kind` fields.
+The test builds a realistic protocol event saying that a sub-agent at `/root/reviewer` has started. It includes an event id, a timestamp, the sub-agent thread id, the path that identifies the agent, and the activity kind. Then it passes that event into `tool_runtime_trace_event`, the conversion function from the surrounding rollout trace code.
 
-Because this is a narrow regression test, its value is in documenting a non-obvious policy choice: sub-agent activity is represented as a terminal runtime event even when the activity kind itself is `Started`.
+The important behavior being checked is slightly surprising: a `Started` sub-agent activity becomes a terminal, or finished, tool runtime event with `ExecutionStatus::Completed`. The test also checks that the payload keeps the original event details and serializes them with the expected field names and values. Without this test, a future change could accidentally drop fields, change naming, or stop treating sub-agent activity as a completed trace event, making rollout traces misleading or harder to inspect.
 
 #### Function details
 
@@ -1094,24 +1112,24 @@ Because this is a narrow regression test, its value is in documenting a non-obvi
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that `SubAgentActivity` protocol events map to `ToolRuntimeTraceEvent::Ended` with completed status and exact payload serialization. It guards a specific trace-policy decision that could be easy to regress.
+**Purpose**: This test proves that a `SubAgentActivity` protocol message is converted into a completed tool runtime trace event. It also checks that the converted event keeps the expected id, status, and JSON payload.
 
-**Data flow**: Creates a new `ThreadId`, parses an `AgentPath`, builds `EventMsg::SubAgentActivity(SubAgentActivityEvent { ... })`, passes it to `tool_runtime_trace_event`, destructures the returned `Ended` event, and asserts the tool call id, status, and `serde_json::to_value(payload)` output match expected values. It returns `anyhow::Result<()>` so path parsing and payload serialization can use `?`.
+**Data flow**: The test starts by creating a fresh thread id and a protocol event for a sub-agent at `/root/reviewer`. It feeds that event into `tool_runtime_trace_event`. The expected result is an `Ended` trace event with tool call id `call-spawn`, status `Completed`, and a payload that matches the original sub-agent activity data when turned into JSON. If the conversion does not produce that shape, the test fails.
 
-**Call relations**: This test directly exercises `tool_runtime_trace_event` from the production module and validates the `ToolRuntimePayload::serialize` behavior indirectly through JSON serialization of the returned payload.
+**Call relations**: During the test, helper constructors create the thread id and agent path, then the protocol event is wrapped as a `SubAgentActivity`. The test calls `tool_runtime_trace_event` because that is the production conversion path it wants to verify. After conversion, assertion helpers compare the returned fields and serialized payload against the expected values; if the conversion is not terminal as expected, the test immediately panics to make the failure clear.
 
 *Call graph*: calls 2 internal fn (try_from, new); 4 external calls (assert_eq!, panic!, SubAgentActivity, tool_runtime_trace_event).
 
 
 ### `rollout-trace/src/thread_tests.rs`
 
-`test` · `test-time validation of trace bundle creation and thread trace behavior`
+`test` · `test suite`
 
-This test module builds temporary trace bundles and inspects either replayed reduced state or raw `trace.jsonl` contents. The tests validate several important invariants from `thread.rs`: root startup writes a replayable lifecycle (`RolloutStarted`, `ThreadStarted`, `ThreadEnded`, `RolloutEnded`), child threads append into the same root bundle rather than creating a second bundle directory, and disabled contexts accept every tracing call without touching disk or forcing lazy tool-dispatch payload construction.
+This is a test file for the rollout tracing feature. A rollout trace is a written record of what happened during an agent run, similar to a flight recorder: it lets the system later replay or inspect the run. These tests create temporary folders, start fake root and child thread traces, write events, then read the trace bundle back to make sure the recorded story is correct.
 
-The helper `minimal_metadata` produces a compact but valid `ThreadStartedTraceMetadata` for most tests, while `single_bundle_dir` asserts that exactly one bundle directory exists under a temporary root and returns its path. The tests intentionally cover both reduced replay semantics and raw event presence. For example, `protocol_wrapper_records_selected_events_as_raw_payloads` parses each JSONL line back into `RawTraceEvent` and checks for `ProtocolEventObserved { event_type: "shutdown_complete", .. }`, proving that the wrapper emits the expected breadcrumb.
+The tests cover four important promises. First, starting and ending a root thread should create a replayable bundle with the correct thread ID, agent path, status, and raw event payloads. Second, when a child thread is spawned, its trace should be appended to the same root bundle rather than creating a separate unrelated bundle. Third, a disabled trace context should accept all the same tracing calls without writing files or running unnecessary setup work. This matters because callers should not need special-case checks everywhere just because tracing is off. Fourth, selected protocol events, such as shutdown completion, should be captured as raw payloads in the trace log.
 
-Several tests also verify subtle behavior: child completion should not mark the rollout complete, disabled tracing should not evaluate the lazy dispatch invocation closure, and startup metadata should be persisted as raw payloads so replay sees the expected payload count.
+The helper functions keep the tests readable: one builds a small default metadata object for a thread start, and one finds the single bundle directory created during a test.
 
 #### Function details
 
@@ -1121,11 +1139,11 @@ Several tests also verify subtle behavior: child completion should not mark the 
 fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that starting and ending a root thread trace produces a bundle that the reducer can replay into a completed rollout with the expected root thread metadata. It checks both reduced state and raw payload count.
+**Purpose**: This test checks the basic root-thread tracing path. It proves that starting a root trace, ending it, and replaying the saved bundle produces the expected lifecycle information.
 
-**Data flow**: Creates a `TempDir`, generates a `ThreadId`, constructs full `ThreadStartedTraceMetadata`, starts tracing with `ThreadTraceContext::start_root_in_root_for_test`, records `RolloutStatus::Completed`, locates the single bundle directory, and replays it with `replay_bundle`. It asserts rollout status, root thread id, root agent path, and that exactly one raw payload was written.
+**Data flow**: It starts with a fresh temporary folder and a new thread ID. It creates a root trace with full startup metadata, records that the rollout completed, finds the one bundle directory that was written, and replays it. The result should say the rollout completed, should point to the same root thread ID and agent path, and should contain the expected raw payload.
 
-**Call relations**: This test drives the root-start path through `start_root_in_root_for_test` and the shutdown path through `record_ended`, then validates the resulting bundle via the reducer.
+**Call relations**: This test uses ThreadTraceContext::start_root_in_root_for_test to create the trace bundle, then uses single_bundle_dir to locate the bundle and replay_bundle to read it back. The assertions compare the replayed view against the original inputs, tying the write side and replay side together.
 
 *Call graph*: calls 3 internal fn (new, start_root_in_root_for_test, single_bundle_dir); 5 external calls (from, new, assert_eq!, replay_bundle, format!).
 
@@ -1136,11 +1154,11 @@ fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()>
 fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a spawned child thread writes into the existing root bundle and updates only the child thread's execution state, not the rollout's terminal status. It also verifies child metadata capture.
+**Purpose**: This test checks that a spawned child thread becomes part of the existing root trace bundle. It guards against a bug where child work might be written into a separate bundle and become disconnected from the main rollout story.
 
-**Data flow**: Creates temp storage, root and child `ThreadId`s, starts a root trace using `minimal_metadata`, then starts a child trace with explicit `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { ... })` metadata. After recording child completion, it replays the single bundle and asserts there is only one bundle directory, two threads in reduced state, the child's agent path and completed execution status are present, rollout status remains `Running`, and two raw payloads exist.
+**Data flow**: It creates a temporary folder, a root thread ID, and a child thread ID. It starts a root trace using minimal metadata, then starts a child trace with details such as its agent path, nickname, role, parent thread ID, and working directory. After marking the child completed, it replays the single bundle and checks that there is still only one bundle on disk, that both threads appear in it, and that the child thread has the right path and completed execution status.
 
-**Call relations**: This test exercises `start_child_thread_trace_or_disabled` and `record_ended` on a child context, proving the shared-writer multi-thread bundle behavior described in `thread.rs`.
+**Call relations**: The test calls minimal_metadata to avoid repeating root-thread setup details, then calls start_root_in_root_for_test for the parent and start_child_thread_trace_or_disabled for the child. It uses single_bundle_dir and replay_bundle to inspect what was written, showing that child thread tracing joins the parent bundle instead of branching into a new file tree.
 
 *Call graph*: calls 5 internal fn (try_from, new, start_root_in_root_for_test, minimal_metadata, single_bundle_dir); 6 external calls (from, new, SubAgent, assert_eq!, replay_bundle, format!).
 
@@ -1151,11 +1169,11 @@ fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()>
 fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures the disabled thread context safely accepts the full surface area of trace calls without creating files or evaluating lazy dispatch payload construction. It validates the no-op contract.
+**Purpose**: This test checks that a disabled trace context is safe to use like a normal trace context. Code can call tracing methods without first asking whether tracing is enabled, and nothing should be written.
 
-**Data flow**: Creates a temp directory and a disabled `ThreadTraceContext`, then invokes thread-end, protocol, turn, tool-runtime, and agent-result recording methods. It also creates disabled inference and compaction contexts, starts attempts, records success/failure events on them, and calls `start_tool_dispatch_trace` with a closure that would set a `Cell<bool>` if executed. The test asserts the closure was not run, the returned dispatch trace is disabled, and the temp directory remains empty.
+**Data flow**: It creates a temporary folder and a disabled ThreadTraceContext. It sends many kinds of trace calls into it: rollout end, protocol event, turn event, tool call event, agent result, inference attempt, compaction attempt, and tool dispatch setup. The disabled context absorbs those calls, avoids invoking the lazy dispatch-building closure, reports that dispatch tracing is disabled, and leaves the temporary folder empty.
 
-**Call relations**: This test covers the disabled fast paths across multiple tracing subsystems reachable from `ThreadTraceContext`, especially the lazy invocation behavior of `start_tool_dispatch_trace`.
+**Call relations**: This test exercises many tracing entry points in their disabled mode. It does not hand off to replay_bundle because there should be no bundle to replay. Its main relationship to the rest of the tracing system is to prove that callers can use the same API in enabled and disabled cases without littering the code with checks.
 
 *Call graph*: calls 2 internal fn (new, disabled); 6 external calls (new, new, assert!, assert_eq!, Completed, json!).
 
@@ -1166,11 +1184,11 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
 fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<()>
 ```
 
-**Purpose**: Confirms that selected protocol events are wrapped into raw trace breadcrumbs with the expected event type string. It inspects the raw event log directly rather than replayed reduced state.
+**Purpose**: This test checks that selected protocol events are copied into the raw trace log. In this case, it verifies that a shutdown-complete event is visible as a raw payload.
 
-**Data flow**: Creates a temp bundle, starts a root trace with `minimal_metadata`, records `EventMsg::ShutdownComplete` via `record_protocol_event`, reads `trace.jsonl` from the bundle directory, deserializes each line into `crate::RawTraceEvent`, and checks that at least one line contains `RawTraceEventPayload::ProtocolEventObserved` with `event_type == "shutdown_complete"`.
+**Data flow**: It creates a temporary folder and a new thread ID, starts a root trace with minimal metadata, and records a ShutdownComplete protocol event. Then it reads the trace.jsonl file from the created bundle, parses each line as a raw trace event, and looks for a protocol-event payload whose event type is shutdown_complete. The test passes only if that payload is found.
 
-**Call relations**: This test specifically targets the protocol-wrapper path in `ThreadTraceContext::record_protocol_event`, validating the event-type filtering and raw breadcrumb append.
+**Call relations**: This test uses minimal_metadata to start the root trace and single_bundle_dir to locate the written bundle. Unlike the replay-focused tests, it reads the trace log file directly so it can verify the exact raw event payload that was written.
 
 *Call graph*: calls 4 internal fn (new, start_root_in_root_for_test, minimal_metadata, single_bundle_dir); 3 external calls (new, assert!, read_to_string).
 
@@ -1181,11 +1199,11 @@ fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<
 fn minimal_metadata(thread_id: ThreadId) -> ThreadStartedTraceMetadata
 ```
 
-**Purpose**: Builds a compact, reusable `ThreadStartedTraceMetadata` fixture for tests that only need a valid root-thread startup payload. It standardizes common fields across multiple tests.
+**Purpose**: This helper builds a small, standard ThreadStartedTraceMetadata value for tests that do not care about every startup detail. It keeps the test cases focused on the behavior being checked rather than repeating setup fields.
 
-**Data flow**: Accepts a `ThreadId`, converts it to string, and returns `ThreadStartedTraceMetadata` with `/root` agent path, `SessionSource::Exec`, `/workspace` cwd, no rollout path, and fixed model/provider/policy strings.
+**Data flow**: It takes a ThreadId as input and turns it into the string form used in trace metadata. It fills in a root agent path, default working directory, test model and provider names, approval and sandbox settings, and leaves optional fields such as task name, nickname, role, and rollout path empty. The output is a ready-to-use metadata object for starting a root trace.
 
-**Call relations**: Used by tests that do not care about custom startup metadata details, reducing duplication while still exercising the real startup path.
+**Call relations**: spawned_thread_start_appends_to_root_bundle and protocol_wrapper_records_selected_events_as_raw_payloads call this helper before starting their root traces. It feeds ThreadTraceContext::start_root_in_root_for_test with consistent default data so those tests can concentrate on child-thread appending and protocol-event recording.
 
 *Call graph*: called by 2 (protocol_wrapper_records_selected_events_as_raw_payloads, spawned_thread_start_appends_to_root_bundle); 2 external calls (from, to_string).
 
@@ -1196,11 +1214,11 @@ fn minimal_metadata(thread_id: ThreadId) -> ThreadStartedTraceMetadata
 fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf>
 ```
 
-**Purpose**: Finds and returns the only bundle directory under a temporary trace root, asserting that exactly one exists. It simplifies tests that expect a single root bundle.
+**Purpose**: This helper finds the one trace bundle directory that a test expects to have been created. It also checks that there is exactly one, which catches accidental extra bundle creation.
 
-**Data flow**: Reads the directory entries under `root`, maps them to paths, collects them into a `Vec<PathBuf>`, sorts the vector, asserts its length is 1, removes and returns the sole path.
+**Data flow**: It receives the temporary root folder path. It reads all entries in that folder, converts them to paths, sorts them for stable behavior, and asserts that there is exactly one entry. It then returns that single path as the bundle directory.
 
-**Call relations**: Used by tests that need to inspect the generated bundle after root or child trace operations. Its assertion encodes the expectation that child traces append to the root bundle instead of creating siblings.
+**Call relations**: The replay and file-reading tests call this helper after tracing has written output. It hands the bundle path to replay_bundle in the lifecycle tests and to direct file reading in the protocol-event test, making it the bridge between temporary test storage and trace inspection.
 
 *Call graph*: called by 3 (create_in_root_writes_replayable_lifecycle_events, protocol_wrapper_records_selected_events_as_raw_payloads, spawned_thread_start_appends_to_root_bundle); 2 external calls (assert_eq!, read_dir).
 
@@ -1210,11 +1228,15 @@ Runtime-state helpers underpin tests for external-agent config import persistenc
 
 ### `state/src/runtime/test_support.rs`
 
-`test` · `test fixture setup across runtime state tests`
+`test` · `test setup`
 
-This file is compiled only for tests and exists to centralize common fixture-building logic used throughout the runtime state test suite. `unique_temp_dir` creates a path under the system temp directory whose name combines the current UNIX-epoch nanoseconds with a random UUID. It does not create the directory itself; callers decide whether and when to materialize it, which lets tests control setup order and failure modes.
+Tests often need two things: a place to write temporary files without colliding with other tests, and realistic sample data that does not change from run to run. This file supplies both.
 
-`test_thread_metadata` constructs a fully populated `ThreadMetadata` instance with stable, deterministic values suitable for insertion into the runtime database. It fixes both `created_at` and `updated_at` to the same known UTC timestamp, derives `rollout_path` from the supplied `codex_home` and `thread_id`, and fills in representative protocol-derived fields such as `ReasoningEffort::Medium`, a read-only sandbox policy, and `AskForApproval::OnRequest`. It also sets common defaults used by thread-listing and rollout tests: source `cli`, provider `test-provider`, model `gpt-5`, preview and first user message `hello`, zero tokens, and all archive/git fields unset. By keeping these defaults in one place, tests can override only the fields relevant to the behavior under examination while still producing realistic rows.
+The first helper, `unique_temp_dir`, builds a path inside the operating system's temporary directory. It mixes the current time with a random identifier, so two tests are very unlikely to choose the same folder. It is like giving each test its own labeled scratch pad instead of making many tests write on the same sheet of paper.
+
+The second helper, `test_thread_metadata`, creates a complete `ThreadMetadata` value. In this project, thread metadata is the saved summary information about a conversation or work thread: its id, where its rollout log lives, when it was created, what model it used, its working directory, approval and sandbox settings, and other searchable details. The function fills these fields with stable test values, including a fixed timestamp, so tests can compare results reliably.
+
+Everything in this file is guarded with `#[cfg(test)]`, which means it is compiled only when running tests. It is not part of the normal application build.
 
 #### Function details
 
@@ -1224,11 +1246,11 @@ This file is compiled only for tests and exists to centralize common fixture-bui
 fn unique_temp_dir() -> PathBuf
 ```
 
-**Purpose**: Builds a likely-unique temporary directory path for tests without touching the filesystem. The name includes both wall-clock nanoseconds and a UUID to avoid collisions across concurrent test runs.
+**Purpose**: Creates a unique-looking temporary directory path for a test to use. This helps tests avoid stepping on each other's files when they run at the same time or leave data behind.
 
-**Data flow**: It reads `SystemTime::now()`, computes nanoseconds since `UNIX_EPOCH` with a fallback of `0` on clock errors, reads the process temp directory from `std::env::temp_dir()`, formats a directory name containing the timestamp and `Uuid::new_v4()`, and returns the resulting `PathBuf`.
+**Data flow**: It reads the current system time and generates a new random UUID, which is a long random identifier. It combines those pieces into a folder name under the system temporary directory, then returns that path. It does not create the directory itself; it only chooses the path.
 
-**Call relations**: Many runtime tests call this helper first to isolate their SQLite homes and fixture files. It is purely preparatory and delegates actual directory creation to the caller.
+**Call relations**: Many runtime tests call this at the start when they need an isolated place to store test state, rollout files, or database data. Those tests then use the returned path as their private workspace while checking behavior such as backfill progress, history reading, job completion, and import recording.
 
 *Call graph*: called by 98 (report_agent_job_item_result_completes_item_atomically, report_agent_job_item_result_rejects_late_reports, backfill_claim_is_singleton_until_stale_and_blocked_when_complete, backfill_state_persists_progress_and_completion, get_backfill_state_repairs_a_missing_singleton_row, get_backfill_state_succeeds_while_another_connection_holds_writer_slot, reads_all_history_records, records_completion_by_import_id, test_runtime, init_configures_logs_db_with_incremental_auto_vacuum (+15 more)); 3 external calls (now, format!, temp_dir).
 
@@ -1243,24 +1265,24 @@ fn test_thread_metadata(
 ) -> ThreadMetadata
 ```
 
-**Purpose**: Creates a deterministic `ThreadMetadata` fixture populated with realistic defaults for runtime database tests. It saves callers from repeating the full struct initialization and ensures cross-test consistency.
+**Purpose**: Builds a complete, realistic `ThreadMetadata` record for tests. It saves each test from manually filling many fields and keeps the sample thread data consistent.
 
-**Data flow**: Inputs are `codex_home`, a `ThreadId`, and a working-directory `PathBuf`. The function computes a fixed UTC timestamp, derives `rollout_path` from `codex_home` and `thread_id`, converts protocol enums for sandbox and approval settings into stored strings, and returns a fully initialized `ThreadMetadata` with preset provider/model/preview fields and unset optional archive/git fields.
+**Data flow**: It receives the test Codex home path, a thread id, and the thread's current working directory. It creates a fixed timestamp, builds a rollout log path from the home path and thread id, fills in model, sandbox, approval, preview, and other metadata fields, and returns the finished `ThreadMetadata` value. Nothing is written to disk by this function; it only constructs the data in memory.
 
-**Call relations**: Thread-related tests across the runtime module call this helper before inserting or mutating thread rows. It feeds directly into methods like `upsert_thread` and related listing, cleanup, and rollout-application paths.
+**Call relations**: Tests call this when they need to insert or compare thread metadata in the state runtime. Inside the helper, sandbox and approval enum values are converted into their stored string form, so the returned record looks like data the real system would save. This supports tests for job claiming, thread deletion, memory cleanup, startup scanning, and related state behavior.
 
 *Call graph*: calls 1 internal fn (enum_to_string); called by 50 (upsert_test_thread, claim_stage1_jobs_bounds_state_scan_before_memory_probes, claim_stage1_jobs_enforces_global_running_cap, claim_stage1_jobs_filters_by_age_idle_and_current_thread, claim_stage1_jobs_processes_two_full_batches_across_startup_passes, claim_stage1_jobs_skips_threads_with_disabled_memory_mode, clear_memory_data_clears_rows_and_preserves_thread_memory_modes, delete_thread_removes_stage1_output_and_enqueues_phase2_when_selected, get_phase2_input_selection_excludes_polluted_previous_selection, get_phase2_input_selection_excludes_stale_used_memories_but_keeps_fresh_never_used (+15 more)); 5 external calls (from_timestamp, join, new, new_read_only_policy, format!).
 
 
 ### `state/src/runtime/external_agent_config_imports_tests.rs`
 
-`test` · `test-time verification of import result persistence`
+`test` · `test run`
 
-This file contains focused integration-style tests for the import-history methods implemented in `external_agent_config_imports.rs`. Each test initializes a fresh `StateRuntime` in a unique temporary directory so the SQLite tables start empty and isolated.
+This is a test file for the part of the system that records configuration imported from an outside agent or tool. Think of it like checking a receipt book: when an import finishes, the runtime should write down what succeeded, what failed, and when it happened. Later, the system should be able to find the receipt for one specific import or list all receipts.
 
-`records_completion_by_import_id` verifies the overwrite semantics of `record_external_agent_config_import_completed`: it writes one import result for `import-1`, writes a second result with the same `import_id` but expanded success and failure lists, then checks that `external_agent_config_import_details_record("import-1")` returns only the newer payload. It also queries `external_agent_config_import_history_records`, maps the returned records down to `(import_id, successes, failures, completed_at_ms > 0)`, and asserts there is exactly one history row with the updated content and a positive completion timestamp.
+Each test creates a fresh temporary runtime storage area, so it starts with a clean slate and does not depend on files left behind by other tests. The first test records the same import ID twice. The important behavior is that the later completion record replaces or updates the stored details for that same ID, rather than leaving two conflicting versions. It then checks that the details and history contain the final expected successes, failures, and a real completion timestamp.
 
-`reads_all_history_records` verifies that distinct import ids produce multiple history rows. It records empty completions for `import-1` and `import-2`, fetches all history records, sorts them by `import_id` to avoid depending on timestamp ordering in the assertion, and confirms both ids are present. Together these tests pin down the two key behaviors of the module: conflict-upsert replacement for a single import id and complete retrieval across multiple imports.
+The second test records two different import IDs and confirms that the history reader returns both of them. Together, these tests protect the bookkeeping behavior that other parts of the application rely on when showing users what configuration imports have already happened.
 
 #### Function details
 
@@ -1270,11 +1292,11 @@ This file contains focused integration-style tests for the import-history method
 async fn records_completion_by_import_id() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that recording completion twice for the same `import_id` replaces the stored payload instead of creating duplicates. It also verifies that the history API returns the updated record with a nonzero completion timestamp.
+**Purpose**: This test proves that a completed external-agent configuration import is stored under its import ID, and that recording the same ID again leaves the runtime with the final expected details. It also checks that the import appears in the history list with a completion time.
 
-**Data flow**: Creates a fresh runtime, writes two completion records for `import-1` with different success/failure arrays, then reads back both the detail record and the history list and compares them against expected typed values using `assert_eq!`.
+**Data flow**: It starts by creating a fresh temporary state runtime. It writes one completion record for import-1, then writes another completion record for the same import ID with a larger set of successes and one failure. It then reads the stored details and the history back out, comparing them with the expected records; the result is success if the runtime returns the final details and a nonzero completion timestamp, or a test failure if it does not.
 
-**Call relations**: This test drives the write API first and then validates both read APIs, proving the `ON CONFLICT(import_id)` behavior exposed by the runtime module.
+**Call relations**: During the test, it asks the runtime initializer to create an isolated runtime using a temporary directory from the test helper. After exercising the runtime's import-recording and reading methods, it uses equality assertions to confirm the runtime saved and returned the information exactly as expected.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 1 external calls (assert_eq!).
 
@@ -1285,22 +1307,24 @@ async fn records_completion_by_import_id() -> anyhow::Result<()>
 async fn reads_all_history_records() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that separate import ids are all returned by the history query. It focuses on presence of multiple rows rather than overwrite semantics.
+**Purpose**: This test proves that the runtime can return more than one completed import record from its history. It is focused on making sure separate import IDs are both preserved.
 
-**Data flow**: Initializes a runtime, records empty completions for `import-1` and `import-2`, fetches the history vector, sorts it by `import_id`, and asserts the resulting id list contains both imports.
+**Data flow**: It creates a new temporary runtime, records two completed imports named import-1 and import-2, then asks for the full import history. Because history order may not be meaningful, it sorts the records by import ID before comparing only the IDs with the expected two-item list. The test passes if both IDs are present.
 
-**Call relations**: This complements the first test by covering the non-conflicting multi-row case of `external_agent_config_import_history_records`.
+**Call relations**: Like the other test in this file, it begins by creating isolated runtime storage through the runtime initializer and temporary-directory helper. It then calls the runtime's history-reading path and finishes by using an equality assertion to verify that both recorded imports came back.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 1 external calls (assert_eq!).
 
 
 ### `state/src/runtime/recovery_tests.rs`
 
-`test` · `test-time validation of startup recovery and corruption handling`
+`test` · `test run`
 
-This test module targets the runtime recovery helpers in the surrounding module, especially the logic that reacts to SQLite initialization failures by identifying a corrupt database and moving its files into a backup directory before a fresh start. The tests build temporary sqlite homes with realistic sidecar files by iterating the runtime database path set and expanding each database path through `sqlite_paths`, then writing marker contents into each file so the backup operation can be validated concretely. One scenario confirms that `backup_runtime_db_for_fresh_start` only relocates files belonging to the failed database returned by `logs_db_path`, leaving all other runtime databases untouched. Another covers the edge case where the configured sqlite home path is itself a blocking regular file; recovery is expected to replace that file with a directory and still emit a backup path rooted under a renamed backup location.
+This is a test file for the part of the system that recovers from SQLite database trouble. SQLite is a small database stored in ordinary files. If one of those files is corrupt, locked, or blocked by a wrongly placed file, the runtime needs to avoid crashing forever and needs to preserve the bad files for later inspection.
 
-The remaining tests focus on error classification. They pin the string heuristics that distinguish corruption messages from lock/busy conditions, then force `StateRuntime::init` to open a malformed state database and verify that `runtime_db_path_for_corruption_error` extracts the exact failed database path from the wrapped initialization error. A final regression test ensures this path extraction does not produce false positives merely because the filesystem path contains the word `corrupt`.
+The tests create temporary folders, write fake database files, and then call the recovery helpers as if startup had found a problem. They check that only the files belonging to the failed database are moved into a backup folder, while unrelated runtime database files stay where they are. They also check a tricky case where the expected SQLite home path is not a folder at all but a normal file; the recovery code should move that obstacle aside and create the folder it needs.
+
+The rest of the file checks error interpretation. It verifies that familiar SQLite messages such as “file is not a database” are treated as corruption, while “database is locked” and “database is busy” are treated as lock problems. Finally, it confirms that the system can find the actual failed database path from a real initialization error, and that it does not get fooled just because a folder name contains the word “corrupt.”
 
 #### Function details
 
@@ -1310,11 +1334,11 @@ The remaining tests focus on error classification. They pin the string heuristic
 async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std::io::Result<()>
 ```
 
-**Purpose**: Builds a temporary runtime sqlite layout, invokes backup on one failed database, and proves that only that database's SQLite files are moved into the backup area. It also checks that backup destinations are created under the configured backup directory.
+**Purpose**: This test proves that recovery backs up only the SQLite files for the database that failed. It protects against accidentally moving healthy database files when only one database needs a fresh start.
 
-**Data flow**: The test creates a unique temp directory, derives all runtime database paths from it, expands each database into its SQLite-related file set via `sqlite_paths`, and writes each file with its own path string as contents. It separately computes the failed logs database path and its sidecar files, calls `backup_runtime_db_for_fresh_start` with that failed path, then asserts on the returned backup records, filesystem existence of original files, and backup path prefixes.
+**Data flow**: It starts with a new temporary SQLite folder, creates all expected runtime database sidecar files, and then chooses the logs database as the simulated failed database. After calling the backup helper, it checks three outcomes: the failed database files are gone from their old location, other database files are still present, and every reported backup file exists inside the backup folder.
 
-**Call relations**: This is a top-level async test invoked by the test runner. It prepares realistic input state using `unique_temp_dir`, `runtime_db_paths`, and `logs_db_path`, then drives the recovery helper under the condition of a simulated failed logs DB and validates the helper's selective file movement behavior.
+**Call relations**: During the test, it asks the test support code for a unique temporary directory, uses the runtime path helpers to discover the database file names, writes placeholder files to disk, and then exercises the recovery backup flow. The assertions tell the story of what the backup helper must guarantee before startup can safely continue.
 
 *Call graph*: calls 1 internal fn (unique_temp_dir); 7 external calls (new, assert!, assert_eq!, logs_db_path, runtime_db_paths, create_dir_all, write).
 
@@ -1325,11 +1349,11 @@ async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std:
 async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies recovery when the expected sqlite home path is a regular file instead of a directory. The test ensures backup logic renames or replaces the blocking file and proceeds with backup creation.
+**Purpose**: This test checks recovery when the place that should be the SQLite directory is blocked by a regular file. The system must move that file out of the way and create the needed directory instead.
 
-**Data flow**: It creates a temp directory, writes a regular file at `sqlite-home`, derives the state database path beneath that would-be directory, and passes that path into `backup_runtime_db_for_fresh_start`. After the call it checks that exactly one backup record was returned, that `sqlite-home` now resolves to a directory, and that the backup path lives under a sibling path suffixed with the backup directory name.
+**Data flow**: It creates a temporary parent folder, writes a plain file where the SQLite home directory should be, and then asks recovery to prepare a fresh start for the state database under that path. The result should be one backup record, the old blocking file should now be saved under a backup-style name, and the original SQLite home path should have become a real directory.
 
-**Call relations**: This async test is entered directly by the test harness. It sets up the specific precondition of a non-directory sqlite home and then exercises the backup path creation branch that must recover from that obstruction before normal runtime initialization can continue.
+**Call relations**: The test uses the temporary-directory helper and the state database path helper to build a realistic startup path. It then calls the backup recovery helper and verifies that recovery can repair this filesystem shape before normal database initialization tries to use it.
 
 *Call graph*: calls 1 internal fn (unique_temp_dir); 5 external calls (assert!, assert_eq!, state_db_path, create_dir_all, write).
 
@@ -1340,11 +1364,11 @@ async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()>
 fn sqlite_error_detail_classifies_corruption_and_lock_errors()
 ```
 
-**Purpose**: Pins the string-matching rules used to classify SQLite error details as corruption versus lock contention. It covers both plain and wrapped corruption messages and distinguishes them from lock/busy text.
+**Purpose**: This test checks the small pieces of logic that read SQLite error text and decide what kind of problem it describes. That classification matters because corruption and locking need different recovery behavior.
 
-**Data flow**: The test feeds fixed string literals into `sqlite_error_detail_is_corruption` and `sqlite_error_detail_is_lock`, then asserts the expected booleans. No external state is read or written.
+**Data flow**: It feeds several human-readable error messages into the corruption and lock classifiers. Messages like “file is not a database” and “database disk image is malformed” should come out as corruption, while “database is locked” and “database is busy” should come out as lock-related trouble.
 
-**Call relations**: This synchronous unit test is called only by the test runner. It validates the low-level predicates that upstream recovery code relies on when deciding whether to back up a database or treat the failure as transient locking.
+**Call relations**: This test directly exercises the error-classification helpers. It does not set up files or start the runtime; it focuses on the decision point that later recovery code relies on when choosing what to do after SQLite reports a failure.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1355,11 +1379,11 @@ fn sqlite_error_detail_classifies_corruption_and_lock_errors()
 async fn runtime_db_path_for_corruption_error_returns_failed_database_path() -> std::io::Result<()>
 ```
 
-**Purpose**: Forces runtime initialization to fail on a malformed SQLite file and checks that the recovery helper can recover the exact database path from the resulting error chain. This confirms that corruption-triggered backup targets the right file.
+**Purpose**: This test confirms that when startup fails because a database file is actually malformed, the recovery code can identify which database file caused the failure. That path is needed so only the right files are backed up.
 
-**Data flow**: The test creates a temp sqlite home, computes the state DB path, writes invalid bytes to that file, and calls `StateRuntime::init`. It captures the expected error from the failed initialization and passes it to `runtime_db_path_for_corruption_error`, asserting that the returned `Option<PathBuf>` equals the malformed state DB path.
+**Data flow**: It creates a temporary SQLite home, writes invalid bytes into the state database file, and then tries to initialize the runtime. Initialization should fail; the test passes that error into the path-finding helper and expects to get back the exact state database path that was corrupted.
 
-**Call relations**: The test runner invokes this async test. It deliberately drives `StateRuntime::init` down its failure path, then hands the produced error into the corruption-path extractor to verify the integration between initialization errors and recovery targeting.
+**Call relations**: This test goes through the real runtime initialization path rather than only testing a small helper in isolation. It creates the bad file using the state database path helper, calls `StateRuntime::init`, captures the resulting error, and then verifies that the recovery path extractor can read the failure correctly.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 5 external calls (assert_eq!, panic!, state_db_path, create_dir_all, write).
 
@@ -1370,11 +1394,11 @@ async fn runtime_db_path_for_corruption_error_returns_failed_database_path() -> 
 fn runtime_db_path_for_corruption_error_ignores_corrupt_word_in_path()
 ```
 
-**Purpose**: Guards against false-positive corruption detection based solely on path text. It confirms that an unrelated permission error on a path containing `corrupt` does not get treated as a corruption-backed database path.
+**Purpose**: This test guards against a false alarm: a path containing the word “corrupt” should not by itself be treated as a corruption error. Only the actual database error details should drive recovery.
 
-**Data flow**: The test constructs a `PathBuf` whose directory name includes `sqlite_corrupt`, wraps a permission-denied `anyhow` error inside a `RuntimeDbInitError::new`, and passes the resulting `anyhow::Error` to `runtime_db_path_for_corruption_error`. It asserts that the function returns `None`.
+**Data flow**: It builds an artificial runtime database initialization error for a path like `/tmp/sqlite_corrupt/state_5.sqlite`, but the underlying cause is “permission denied,” not database corruption. When the error is inspected, the result should be no failed database path.
 
-**Call relations**: This synchronous regression test is entered by the test harness. It bypasses actual database I/O and directly fabricates the wrapped initialization error shape that the extractor inspects, specifically to validate its text parsing boundaries.
+**Call relations**: The test constructs a `RuntimeDbInitError` by hand and wraps it in a general error value. It then calls the corruption-path detector to make sure that detector reads the real error cause instead of guessing from words in the file path.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from, anyhow!, assert_eq!, new).
 
@@ -1384,11 +1408,13 @@ These files cover memory prompt rendering, citation parsing, startup orchestrati
 
 ### `ext/memories/src/prompts_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file exercises the happy-path behavior of `build_memory_tool_developer_instructions` against a temporary on-disk memories directory. Rather than mocking I/O, it creates an actual temp directory, wraps it in `AbsolutePathBuf`, creates the `memories` subdirectory, and writes a small `memory_summary.md`. That setup mirrors the production path layout expected by the prompt builder.
+This is a focused automated test for the memory prompt builder. The memory feature keeps a short written summary in a file called `memory_summary.md`, then builds instructions that can be given to the model. Those instructions need to do two things at once: include the summary text directly, and clearly say that this file has already been provided so it should not be opened again.
 
-The single async test then awaits the prompt-building function and asserts several concrete properties of the rendered output: it must mention the exact `memory_summary.md` path under the temp memories directory, it must include the summary text verbatim, and it must contain the `========= MEMORY_SUMMARY BEGINS =========` delimiter exactly once. Those assertions collectively prove that the embedded template was parsed and rendered, that the runtime substitutions were wired correctly, and that the summary content is inserted in the intended section rather than duplicated. Because the test uses the real filesystem and the real template, it acts as a regression check for both path formatting and template content changes.
+The test creates a temporary fake Codex home folder, like setting up a small pretend workspace in a disposable box. Inside it, it creates a `memories` folder and writes a sample `memory_summary.md` file. It then calls the real prompt-building function, `build_memory_tool_developer_instructions`, and checks the resulting text.
+
+The checks look for three important promises: the instructions name the summary file path, they say the file is already provided and should not be opened again, and they contain the actual summary text. The test also confirms that the marker showing where the embedded memory summary begins appears exactly once. Without this test, a prompt template change could quietly break memory injection, duplicate the summary block, or cause the model to waste time reading a file it already has.
 
 #### Function details
 
@@ -1398,22 +1424,24 @@ The single async test then awaits the prompt-building function and asserts sever
 async fn build_memory_tool_developer_instructions_renders_embedded_template()
 ```
 
-**Purpose**: Creates a temporary memories tree, writes a summary file, invokes the prompt builder, and checks that the rendered instructions contain the expected path, content, and single summary marker.
+**Purpose**: This test proves that the memory instruction builder correctly renders its embedded template when a memory summary file exists. It checks both the human-facing text and the included summary content.
 
-**Data flow**: It allocates a temp directory, converts its path into `AbsolutePathBuf`, creates `<temp>/memories`, writes `memory_summary.md`, then awaits `build_memory_tool_developer_instructions`. From the returned string it derives boolean and count assertions about included substrings and marker occurrences; it writes only the temporary test files as side effects.
+**Data flow**: It starts with an empty temporary folder, turns that folder into an absolute Codex home path, then creates a `memories/memory_summary.md` file containing test text. It passes the fake Codex home path into `build_memory_tool_developer_instructions`, receives the generated instruction string, and verifies that the string contains the expected file note, the saved summary, and exactly one start marker for the embedded summary block.
 
-**Call relations**: This is a standalone Tokio test entrypoint, not called by production code. It drives the real prompt-building function through its normal filesystem path to validate the integration between file reading and template rendering.
+**Call relations**: During the test, it uses temporary-directory and file-writing helpers to build a safe throwaway environment. Once that setup is ready, it calls the real instruction-building code under test. The assertions at the end act like a checklist, confirming that the generated prompt has the pieces other parts of the memory system rely on.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 5 external calls (assert!, assert_eq!, tempdir, create_dir_all, write).
 
 
 ### `memories/read/src/citations_tests.rs`
 
-`test` · `unit test execution`
+`test` · `test run`
 
-This test module validates the parsing behavior implemented in `citations.rs` using concrete markup strings. Each test constructs one citation blob with embedded XML-like sections, invokes `parse_memory_citation`, and asserts on either the recovered `ThreadId` values or the exact parsed entry fields.
+Memory citations are small text blocks that point back to memory files, line ranges, notes, and conversation identifiers. This test file checks that the parser understands the shapes of citation text that the system may encounter in real use. That matters because memory citations are evidence trails: if they are parsed incorrectly, the system may lose track of where a remembered fact came from or which conversation produced it.
 
-The first test covers backward compatibility with legacy `<thread_ids>` markup. It generates two fresh `ThreadId` values, inserts an invalid `not-a-uuid` line between them, and confirms that `thread_ids_from_memory_citation` returns only the valid IDs in order. The second test exercises the preferred `<rollout_ids>` tag and verifies that a single valid ID is recovered. The third test combines `<citation_entries>` and `<rollout_ids>` in one string, including a duplicate rollout ID, then asserts that entry parsing preserves path, line range, and note text for two entries while rollout IDs are deduplicated to first occurrence order. Together these tests document the parser’s tolerant behavior: malformed IDs are dropped, duplicate IDs are collapsed, and mixed entry/ID content is merged into one `MemoryCitation`.
+The tests build example citation strings by hand, like filling out sample forms. They then pass those strings to `parse_memory_citation`, which is the parser being tested. After parsing, the tests compare the result with what should have been found.
+
+There are three main cases. One checks an older format that used a `<thread_ids>` section and confirms that valid thread IDs are kept while invalid text is ignored. Another checks the newer `<rollout_ids>` section. The last checks a fuller citation containing file references, line numbers, notes, and repeated rollout IDs; it confirms entries are extracted cleanly and duplicate rollout IDs are removed. Together, these tests make sure old citation data keeps working while newer citation data is also supported.
 
 #### Function details
 
@@ -1423,11 +1451,11 @@ The first test covers backward compatibility with legacy `<thread_ids>` markup. 
 fn parse_memory_citation_supports_legacy_thread_ids()
 ```
 
-**Purpose**: Verifies that the parser still recognizes legacy `<thread_ids>` blocks and that invalid IDs are ignored during typed conversion. It checks ordering of the surviving valid IDs.
+**Purpose**: This test makes sure the parser still understands the older citation format that stores conversation identifiers inside a `<thread_ids>` section. It also checks that bad identifier text does not sneak into the final result.
 
-**Data flow**: Creates two fresh `ThreadId` values, embeds them plus an invalid line into a citation string inside a one-element vector, parses it with `parse_memory_citation`, converts the result with `thread_ids_from_memory_citation`, and asserts the returned vector equals `[first, second]`.
+**Data flow**: The test starts by creating two valid `ThreadId` values, which are unique conversation identifiers. It builds one citation string containing those two valid IDs plus the invalid text `not-a-uuid`, sends that string into `parse_memory_citation`, and then asks `thread_ids_from_memory_citation` for the IDs found in the parsed result. The expected output is only the two valid IDs, in order.
 
-**Call relations**: This unit test directly exercises `parse_memory_citation` and `thread_ids_from_memory_citation` together to validate backward compatibility behavior.
+**Call relations**: During the test, fresh IDs are made with `ThreadId::new`, then the citation text is handed to the real parser through `parse_memory_citation`. The final assertion compares the parser's cleaned-up result with the expected list, so this test acts as a safety check for backward compatibility with legacy memory citations.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, parse_memory_citation, vec!).
 
@@ -1438,11 +1466,11 @@ fn parse_memory_citation_supports_legacy_thread_ids()
 fn parse_memory_citation_supports_rollout_ids()
 ```
 
-**Purpose**: Verifies that the parser recognizes the current `<rollout_ids>` tag and converts its contents into typed thread IDs. It is the minimal happy-path case for the modern format.
+**Purpose**: This test checks that the parser recognizes the newer citation format that stores conversation identifiers under `<rollout_ids>`. It confirms that a rollout ID can be recovered as a normal thread ID when later code asks for thread IDs.
 
-**Data flow**: Generates one `ThreadId`, embeds it in a `<rollout_ids>` block, parses the citation vector, converts rollout IDs to typed IDs, and asserts the result is exactly a one-element vector containing that thread ID.
+**Data flow**: The test creates one valid `ThreadId`, places it inside a citation string with a `<rollout_ids>` section, and parses that string. It then extracts thread IDs from the parsed citation and expects to get back exactly the one ID it put in.
 
-**Call relations**: This test isolates the modern ID-tag path of `parse_memory_citation`, complementing the legacy-tag coverage in the previous test.
+**Call relations**: This test uses `ThreadId::new` to make realistic input, calls `parse_memory_citation` to exercise the parser, and uses an equality assertion to verify the parser's output. It connects the newer rollout-ID storage format to the helper that other code uses when it wants conversation IDs from a citation.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, parse_memory_citation, vec!).
 
@@ -1453,24 +1481,26 @@ fn parse_memory_citation_supports_rollout_ids()
 fn parse_memory_citation_extracts_entries_and_rollout_ids()
 ```
 
-**Purpose**: Verifies that citation entries and rollout IDs are both extracted from the same citation string and that duplicate rollout IDs are removed. It also checks exact field parsing for multiple entry lines.
+**Purpose**: This test checks the parser's full behavior on a citation that contains both file references and rollout IDs. It verifies that citation entries are split into path, line range, and note, and that repeated rollout IDs are not kept twice.
 
-**Data flow**: Creates two `ThreadId` values, builds a citation string containing two `<citation_entries>` lines and a `<rollout_ids>` block with a duplicate of the first ID, parses it, maps the parsed entries into tuples of `(path, line_start, line_end, note)` for comparison, and asserts both the entry tuple vector and the deduplicated `rollout_ids` vector match the expected values.
+**Data flow**: The test creates two valid thread IDs and builds a citation string with two file entries plus three rollout ID lines, where the first ID appears twice. After parsing, it reads the parsed entries and turns them into simple tuples containing path, start line, end line, and note. It expects two clean citation entries and a rollout ID list containing only the first ID and second ID once each.
 
-**Call relations**: This test exercises the combined parsing path in `parse_memory_citation`, documenting how entry extraction and rollout-ID deduplication interact in one input.
+**Call relations**: This is the broadest test in the file. It creates sample IDs with `ThreadId::new`, sends a realistic mixed citation block through `parse_memory_citation`, and then uses assertions to check both halves of the result: the human-readable file citations and the conversation identifiers used for tracing memory back to its source.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, parse_memory_citation, vec!).
 
 
 ### `memories/write/src/extensions/prune_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module validates the pruning logic with concrete filesystem fixtures. The async pruning test constructs a temporary memories tree, creates an extension named `chronicle` with both `resources/` and `instructions.md`, and then writes four markdown files: one older than the retention window, one exactly at the cutoff, one recent, and one with an invalid timestamp prefix. It also creates a separate `ignored` extension-like directory that has `resources/` but no `instructions.md`, containing an old file that should not be touched.
+This is a test file for the memory extension cleanup feature. The feature it checks is like cleaning out an old filing cabinet: remove papers that are too old, but only from drawers that are officially part of the system, and do not throw away papers whose dates cannot be understood.
 
-To make the cutoff deterministic, the test builds a fixed `DateTime<Utc>` by parsing a timestamp string with the same filename format constant used in production. After invoking `prune_old_extension_resources_with_now`, it asserts that the old and exact-cutoff files under `chronicle` are gone, while the recent file, invalidly named file, and old file under `ignored` still exist. This captures several subtle rules: pruning is inclusive at the cutoff, malformed names are preserved, and only directories marked by `instructions.md` count as managed extensions.
+The main test builds a temporary fake memory folder on disk. Inside it, it creates one extension called "chronicle" with an instructions file and a resources folder. That instructions file matters because it marks the folder as a real extension that should be considered for cleanup. The test then writes several resource files with dates in their names: one older than the allowed age, one exactly at the cutoff, one newer than the cutoff, and one with no usable timestamp. It also creates a second extension-like folder without instructions, to prove that cleanup ignores it.
 
-The second test isolates `resource_timestamp`, confirming that a valid timestamp-prefixed filename parses to the expected Unix timestamp and that a malformed filename returns `None`.
+After running the pruning function with a fixed pretend current time, the test checks the results. The old and cutoff files are gone. The recent file remains. The badly named file remains because its age cannot be known. The file in the ignored folder remains because that folder is not treated as an active extension.
+
+A second smaller test checks that the timestamp-reading helper correctly pulls a date from the start of a resource filename and rejects filenames that do not start with a valid timestamp.
 
 #### Function details
 
@@ -1480,11 +1510,11 @@ The second test isolates `resource_timestamp`, confirming that a valid timestamp
 async fn prunes_only_old_resources_from_extensions_with_instructions()
 ```
 
-**Purpose**: Builds a representative extension directory tree and verifies that pruning deletes only expired timestamped markdown files from recognized extensions. It also checks that cutoff-equal files are removed and unmanaged directories are ignored.
+**Purpose**: This asynchronous test proves that extension resource pruning deletes only the files it is supposed to delete. It checks the important safety rule that cleanup should not remove recent files, unparseable files, or files from folders that are not valid instructed extensions.
 
-**Data flow**: Creates a temporary memories root, derives `extensions_root`, creates `chronicle/resources`, writes `chronicle/instructions.md`, constructs a fixed `now` timestamp from the configured filename format, writes old/cutoff/recent/invalid resource files, creates an `ignored/resources` directory without instructions and writes an old file there, runs `prune_old_extension_resources_with_now(&memory_root, now)`, then checks file existence with `try_exists` assertions.
+**Data flow**: The test starts with an empty temporary directory. It builds a fake memory-extension folder structure, writes instruction and resource files into it, and chooses a fixed current time so the age calculation is predictable. It then runs the pruning operation. Afterward, it reads the filesystem state and confirms that only the old and exactly-at-cutoff resource files in the instructed extension were removed, while the recent, invalid-name, and ignored-extension files still exist.
 
-**Call relations**: This is a direct async test driver for the internal pruning helper rather than the public wrapper, so it can control time precisely. It exercises the production traversal rules around `memory_extensions_root`, extension recognition via `instructions.md`, and timestamp-based deletion.
+**Call relations**: The async test runner calls this function during the test suite. Inside the test, it uses temporary-directory creation, path-building for the extensions root, asynchronous folder and file writes, and timestamp parsing to set up a realistic on-disk scenario. It then exercises the pruning behavior and uses assertions to verify the cleanup result.
 
 *Call graph*: 7 external calls (from_naive_utc_and_offset, parse_from_str, new, assert!, memory_extensions_root, create_dir_all, write).
 
@@ -1495,24 +1525,24 @@ async fn prunes_only_old_resources_from_extensions_with_instructions()
 fn parses_timestamp_prefix_from_resource_file_name()
 ```
 
-**Purpose**: Confirms that the filename parser extracts the leading timestamp correctly and rejects malformed names. It serves as a focused unit test for the parser used by pruning.
+**Purpose**: This test checks the small rule that resource filenames begin with a timestamp that can be read back as a date and time. It also confirms that a filename without a valid timestamp is safely rejected instead of being treated as dated.
 
-**Data flow**: Calls `resource_timestamp` with a valid timestamp-prefixed markdown filename, unwraps the result, compares its Unix timestamp to a known integer, then calls `resource_timestamp` with `not-a-timestamp.md` and asserts that the result is `None`.
+**Data flow**: The test gives the timestamp parser a filename that starts with a valid date-time string. It receives a parsed time and compares its numeric Unix timestamp to the expected value. Then it gives the parser a bad filename and checks that the parser returns no timestamp at all.
 
-**Call relations**: This standalone unit test targets `resource_timestamp` directly, complementing the broader filesystem pruning test by validating the parser's success and failure cases in isolation.
+**Call relations**: The regular test runner calls this function during the test suite. It focuses on the filename-parsing helper that the pruning logic depends on, and uses equality and truth assertions to lock down the expected parsing behavior.
 
 *Call graph*: 2 external calls (assert!, assert_eq!).
 
 
 ### `memories/write/src/startup_tests.rs`
 
-`test` · `test`
+`test` · `automated test runs for memory startup behavior`
 
-This file is the main test harness for the memories startup subsystem. The top-level async tests exercise realistic startup flows against a mock SSE model server and temporary homes/state DBs. They verify that startup creates the memories root, that phase 2 rewrites the git-backed workspace and resets its baseline across runs, that old extension resource files are pruned both with and without stage-1 inputs, that phase-1 requests inherit live thread service-tier overrides and detached memory metadata, and that provider defaults or explicit config overrides control the model names used for phase 1 and phase 2 requests.
+The memory startup flow is meant to run quietly when Codex starts. It prepares a memory workspace on disk, looks for past conversations that should become memories, asks the model to summarize or consolidate them, and keeps the workspace clean. This test file proves that those steps happen safely and predictably.
 
-To support those scenarios, the file provides a large set of helpers: builders for `TestCodex` instances with memory features enabled, state-DB initialization, startup triggering, context construction with injected providers, request polling with timeouts, workspace-reset waiting via git diff checks, and seed functions for both stage-1 candidates and completed stage-1 outputs. The seeding helpers populate thread metadata including cwd, rollout path, provider, and git branch so downstream storage and prompt logic see realistic inputs.
+The tests build small throwaway Codex sessions in temporary home folders. A mock response server stands in for the model API, like a practice cashier used to test a shop checkout without charging a real card. The file seeds fake thread history into the state database, starts the memory startup task, waits for background work to finish, and then checks files, prompts, request metadata, model choices, and cleanup behavior.
 
-`MockMemoryModelProvider` wraps a real provider but overrides only `memory_extraction_preferred_model` and `memory_consolidation_preferred_model`, allowing tests to prove that provider defaults are consulted when config overrides are absent. Overall, this file validates both control flow and many subtle invariants around metadata propagation, DB transitions, and workspace hygiene.
+A few helper functions create test Codex instances, add fake stage-one memory results, wait for files or requests to appear, and shut the test session down cleanly. The mock model provider is important because it lets the tests verify which model name the memory code chooses by default, while still delegating normal provider behavior to the real provider implementation.
 
 #### Function details
 
@@ -1522,11 +1552,11 @@ To support those scenarios, the file provides a large set of helpers: builders f
 async fn memories_startup_creates_memory_root() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that triggering the startup pipeline creates the `memories` directory under the configured home. It is the simplest end-to-end startup smoke test.
+**Purpose**: Checks that starting the memory startup task creates the main memories folder. Without this, later memory files would have nowhere reliable to live.
 
-**Data flow**: Starts a mock server, creates a temporary home, builds a test Codex instance, asserts the memory root does not exist, triggers startup, waits for the directory to appear, then shuts the test Codex down. It returns `anyhow::Result<()>`.
+**Data flow**: It creates a fake model server and a temporary home folder, confirms the memories folder does not exist, starts memory startup, then waits until that folder appears. It finishes by shutting down the test Codex session.
 
-**Call relations**: This test drives the public startup entrypoint through `trigger_memories_startup` and uses `wait_for_dir` to observe the asynchronous side effect.
+**Call relations**: The test runner calls this test. It builds a test Codex instance, uses trigger_memories_startup to launch the background memory task, uses wait_for_dir to observe the expected folder, and uses shutdown_test_codex for cleanup.
 
 *Call graph*: calls 5 internal fn (start_mock_server, build_test_codex, shutdown_test_codex, trigger_memories_startup, wait_for_dir); 3 external calls (new, new, assert!).
 
@@ -1537,11 +1567,11 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()>
 async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that phase 2 detects workspace changes relative to the git baseline, sends a prompt mentioning the diff file, rewrites retained memory files, and resets the workspace baseline afterward. It specifically validates replacement of older retained memories by newer selected ones.
+**Purpose**: Verifies that phase two consolidation notices changes in the memory workspace across runs and only keeps the newer memory output. This protects against stale summaries being carried forward forever.
 
-**Data flow**: Creates a temp home and initialized state DB, seeds one stage-1 output, manually writes matching workspace files and resets the git repo, seeds a newer stage-1 output, mounts a mock phase-2 SSE response, builds a test Codex, triggers startup, captures the outgoing request, inspects the prompt text, waits for workspace reset, reads `raw_memories.md` and rollout summary files, and asserts only the newer memory remains. It then shuts down the test Codex.
+**Data flow**: It creates an old stage-one memory result, writes matching memory files, records a clean git baseline, then adds a newer stage-one result. After startup runs phase two, it reads the model prompt and memory files to confirm the workspace diff was included and the old raw memory and summary were replaced by the newer ones.
 
-**Call relations**: This integration test exercises startup orchestration, phase-2 input selection, storage sync, prompt generation, agent execution, and baseline reset together.
+**Call relations**: The test runner calls this test. It relies on init_state_db and seed_stage1_output to prepare database state, trigger_memories_startup to run the real startup path, phase2_prompt_text to inspect the outgoing model prompt, wait_for_phase2_workspace_reset to wait for cleanup, and read_rollout_summary_bodies to verify the final summaries.
 
 *Call graph*: calls 12 internal fn (mount_sse_once, sse, start_mock_server, build_test_codex, init_state_db, phase2_prompt_text, read_rollout_summary_bodies, seed_stage1_output, shutdown_test_codex, trigger_memories_startup (+2 more)); 11 external calls (new, new, assert!, assert_eq!, hours, now, reset_git_repository, create_dir_all, read_to_string, write (+1 more)).
 
@@ -1552,11 +1582,11 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
 async fn memories_startup_phase2_prunes_old_extension_resources() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that phase 2 removes stale extension resource files while retaining recent ones during workspace sync. It also confirms the consolidation prompt still references the workspace diff file.
+**Purpose**: Checks that phase two deletes extension resource files that are too old while keeping recent ones. This prevents the memories area from accumulating outdated helper material.
 
-**Data flow**: Initializes a temp home and DB, seeds one stage-1 output, creates extension instruction and resource files with old and recent timestamps encoded in filenames, mounts a mock phase-2 response, triggers startup, captures the request prompt, waits for workspace reset and old-file removal, then asserts the old file is gone and the recent file still exists before shutdown.
+**Data flow**: It seeds a memory job, creates one old extension resource file and one recent file, then runs startup with a fake model response. After phase two finishes, it confirms the prompt mentioned the workspace diff, the old file disappeared, and the recent file still exists.
 
-**Call relations**: This test covers the `sync_phase2_workspace_inputs` path, especially `prune_old_extension_resources`, within a full startup run.
+**Call relations**: The test runner calls this test. It uses init_state_db and seed_stage1_output to make consolidation work available, trigger_memories_startup to start the flow, phase2_prompt_text to inspect the model request, wait_for_file_removed and wait_for_phase2_workspace_reset to wait for asynchronous cleanup, and shutdown_test_codex at the end.
 
 *Call graph*: calls 12 internal fn (mount_sse_once, sse, start_mock_server, build_test_codex, init_state_db, phase2_prompt_text, seed_stage1_output, shutdown_test_codex, trigger_memories_startup, wait_for_file_removed (+2 more)); 9 external calls (new, new, assert!, hours, now, format!, create_dir_all, write, vec!).
 
@@ -1567,11 +1597,11 @@ async fn memories_startup_phase2_prunes_old_extension_resources() -> anyhow::Res
 async fn memories_startup_phase2_prunes_old_extension_resources_without_stage1_input() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures stale extension resources are pruned even when phase 2 runs without any selected stage-1 outputs, as long as a global consolidation job is enqueued. This protects the cleanup path from depending on raw-memory input presence.
+**Purpose**: Verifies that old extension resources are pruned even when there are no fresh stage-one memory results to consolidate. Cleanup should not depend on new memories being present.
 
-**Data flow**: Creates a temp home and DB, enqueues a global consolidation job directly, creates an old extension resource file, mounts a mock phase-2 response, triggers startup, captures the prompt, waits for file removal and workspace reset, and shuts down the test Codex.
+**Data flow**: It initializes the database, enqueues a global consolidation job directly, creates an old extension resource, and starts memory startup. It checks that phase two still sends a prompt with the workspace diff and removes the old file.
 
-**Call relations**: This test targets the branch where phase 2 still runs due to a queued global job even though there are no stage-1 inputs to sync.
+**Call relations**: The test runner calls this test. It prepares state with init_state_db, starts the normal task through trigger_memories_startup, inspects the request with wait_for_single_request and phase2_prompt_text, then waits for file removal and workspace reset before calling shutdown_test_codex.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, start_mock_server, build_test_codex, init_state_db, phase2_prompt_text, shutdown_test_codex, trigger_memories_startup, wait_for_file_removed, wait_for_phase2_workspace_reset (+1 more)); 8 external calls (new, new, assert!, now, format!, create_dir_all, write, vec!).
 
@@ -1582,11 +1612,11 @@ async fn memories_startup_phase2_prunes_old_extension_resources_without_stage1_i
 async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies two subtle runtime invariants for phase 1: the request context uses the live thread service tier rather than stale config, and detached memory requests include workspace metadata without normal session/thread identifiers. It is a focused integration test of runtime request construction.
+**Purpose**: Checks that phase one uses the current thread's service tier setting and sends memory requests with detached metadata. Detached metadata means the request describes the workspace but does not pretend to be a normal chat turn.
 
-**Data flow**: Builds a test Codex, resets the git repo, submits thread settings overriding service tier to Fast, waits until the live config snapshot reflects that tier, constructs a `MemoryStartupContext`, builds a stage-one request context, asserts the service tier was captured, mounts a mock phase-1 SSE response, calls `stream_stage_one_prompt` with a default prompt, captures the outgoing request, parses the `x-codex-turn-metadata` header as JSON, and asserts request-kind/workspace metadata presence and session/thread/window ID absence. It then shuts down the test Codex.
+**Data flow**: It starts a test Codex session, changes the thread setting to a fast service tier, waits until the live config snapshot reflects that change, builds a memory startup request context, and sends a phase-one prompt. It then reads the captured request headers to confirm the service tier was used and chat-specific IDs were omitted from the metadata.
 
-**Call relations**: This test directly exercises `MemoryStartupContext::stage_one_request_context` and `MemoryStartupContext::stream_stage_one_prompt` rather than the full startup pipeline.
+**Call relations**: The test runner calls this test. It builds the test session with build_test_codex, waits through wait_for_service_tier, directly constructs a MemoryStartupContext, sends the stage-one prompt, captures the request with wait_for_single_request, and cleans up through shutdown_test_codex.
 
 *Call graph*: calls 9 internal fn (default, mount_sse_once, sse, start_mock_server, new, build_test_codex, shutdown_test_codex, wait_for_service_tier, wait_for_single_request); 10 external calls (clone, new, default, new, assert!, assert_eq!, reset_git_repository, submit_thread_settings, from_str, vec!).
 
@@ -1597,11 +1627,11 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
 async fn memories_startup_phase1_provider_default_drives_request_model() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that phase 1 uses the model provider’s memory-extraction preferred model when no explicit extraction-model override is configured. It validates provider-default model selection.
+**Purpose**: Verifies that phase one uses the model provider's preferred memory extraction model when the user has not set an override. This makes the default model choice come from the provider rather than a hard-coded test assumption.
 
-**Data flow**: Starts a mock server, creates a temp home, runs the helper that executes a phase-1 request with a mock provider and default memories config, then asserts the captured request JSON `model` field equals `MOCK_PROVIDER_PHASE_ONE_MODEL`.
+**Data flow**: It creates a mock server and temporary home, runs the shared phase-one model request helper with default memory settings, then checks that the outgoing request body contains the mock provider's phase-one model name.
 
-**Call relations**: This test delegates setup and execution to `run_memory_phase_one_model_request_test`, which injects `MockMemoryModelProvider`.
+**Call relations**: The test runner calls this test. It delegates almost all setup and execution to run_memory_phase_one_model_request_test, using startup_test_memories_config to supply the default memory configuration.
 
 *Call graph*: calls 3 internal fn (start_mock_server, run_memory_phase_one_model_request_test, startup_test_memories_config); 3 external calls (new, new, assert_eq!).
 
@@ -1612,11 +1642,11 @@ async fn memories_startup_phase1_provider_default_drives_request_model() -> anyh
 async fn memories_startup_phase2_provider_default_drives_request_model() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that phase 2 uses the model provider’s memory-consolidation preferred model when no explicit consolidation-model override is configured. It validates provider-default model selection for the spawned agent.
+**Purpose**: Verifies that phase two uses the model provider's preferred memory consolidation model when no override is configured.
 
-**Data flow**: Starts a mock server, creates a temp home, runs the helper that executes a phase-2 request with a mock provider and default memories config, and asserts the captured request JSON `model` field equals `MOCK_PROVIDER_PHASE_TWO_MODEL`.
+**Data flow**: It creates a mock server and temporary home, runs the shared phase-two model request helper with default memory settings, then checks that the captured request body uses the mock provider's phase-two model name.
 
-**Call relations**: This test relies on `run_memory_phase_two_model_request_test` and the injected mock provider.
+**Call relations**: The test runner calls this test. It relies on run_memory_phase_two_model_request_test to seed input, run phase two, and return the captured request.
 
 *Call graph*: calls 3 internal fn (start_mock_server, run_memory_phase_two_model_request_test, startup_test_memories_config); 3 external calls (new, new, assert_eq!).
 
@@ -1627,11 +1657,11 @@ async fn memories_startup_phase2_provider_default_drives_request_model() -> anyh
 async fn memories_startup_phase1_explicit_model_override_drives_request_model() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an explicit `memories.extract_model` override takes precedence over the provider default for phase 1. It protects config override semantics.
+**Purpose**: Checks that a configured phase-one model override wins over the provider default. This lets users or configuration choose a specific extraction model.
 
-**Data flow**: Builds a memories config from defaults, sets `extract_model`, runs the phase-1 request helper, and asserts the outgoing request model equals the override string.
+**Data flow**: It starts from the standard memory test config, sets the extraction model to an override string, runs the phase-one helper, and verifies that the model request used that override.
 
-**Call relations**: This test is the override-path counterpart to the provider-default phase-1 model test.
+**Call relations**: The test runner calls this test. It uses startup_test_memories_config for the base settings and run_memory_phase_one_model_request_test for the actual memory extraction request.
 
 *Call graph*: calls 3 internal fn (start_mock_server, run_memory_phase_one_model_request_test, startup_test_memories_config); 3 external calls (new, new, assert_eq!).
 
@@ -1642,11 +1672,11 @@ async fn memories_startup_phase1_explicit_model_override_drives_request_model() 
 async fn memories_startup_phase2_explicit_model_override_drives_request_model() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an explicit `memories.consolidation_model` override takes precedence over the provider default for phase 2. It protects config override semantics for the consolidation agent.
+**Purpose**: Checks that a configured phase-two consolidation model override wins over the provider default.
 
-**Data flow**: Builds a memories config from defaults, sets `consolidation_model`, runs the phase-2 request helper, and asserts the outgoing request model equals the override string.
+**Data flow**: It builds the standard memory config, changes the consolidation model field, runs the phase-two helper, and confirms the outgoing request body names the override model.
 
-**Call relations**: This test is the override-path counterpart to the provider-default phase-2 model test.
+**Call relations**: The test runner calls this test. It uses startup_test_memories_config for setup and run_memory_phase_two_model_request_test to exercise phase two.
 
 *Call graph*: calls 3 internal fn (start_mock_server, run_memory_phase_two_model_request_test, startup_test_memories_config); 3 external calls (new, new, assert_eq!).
 
@@ -1661,11 +1691,11 @@ async fn run_memory_phase_one_model_request_test(
 ) -> anyhow::Result<ResponsesRequest>
 ```
 
-**Purpose**: Shared helper that executes a real phase-1 run against a mock SSE server and returns the captured model request. It sets up a seeded stage-1 candidate and injects a mock provider so tests can inspect model selection.
+**Purpose**: Runs a reusable mini-scenario that produces one phase-one memory extraction request and returns it for inspection. Other tests use it to check which model name phase one sends.
 
-**Data flow**: Builds a test Codex with the supplied memories config, constructs `MockMemoryModelProvider`, obtains the state DB, seeds a stage-1 candidate rollout, mounts a mock SSE response containing valid phase-1 JSON output, builds a startup context/config with the injected provider, runs `phase1::run`, waits for the single request, shuts down the test Codex, and returns the captured `ResponsesRequest`.
+**Data flow**: It builds a test Codex session with a supplied memory config, wraps the provider in MockMemoryModelProvider, seeds a candidate thread that should be extracted into memory, mounts a fake streaming model response, runs phase one, captures the single request, shuts down Codex, and returns that request.
 
-**Call relations**: Called by the phase-1 provider-default and explicit-override tests. It drives the actual production `phase1::run` path.
+**Call relations**: It is called by the phase-one provider-default and explicit-override tests. Inside, it uses build_test_codex_with_memories_config, seed_stage1_candidate, memory_startup_context_with_provider, the phase-one runner, wait_for_single_request, and shutdown_test_codex.
 
 *Call graph*: calls 8 internal fn (mount_sse_once, sse, new, build_test_codex_with_memories_config, memory_startup_context_with_provider, seed_stage1_candidate, shutdown_test_codex, wait_for_single_request); called by 2 (memories_startup_phase1_explicit_model_override_drives_request_model, memories_startup_phase1_provider_default_drives_request_model); 6 external calls (clone, new, hours, now, run, vec!).
 
@@ -1680,11 +1710,11 @@ async fn run_memory_phase_two_model_request_test(
 ) -> anyhow::Result<ResponsesRequest>
 ```
 
-**Purpose**: Shared helper that executes a real phase-2 run against a mock SSE server and returns the captured consolidation request. It seeds one completed stage-1 output and prepares the memory root so the consolidation agent can run.
+**Purpose**: Runs a reusable mini-scenario that produces one phase-two memory consolidation request and returns it for inspection. Other tests use it to check the model selected for consolidation.
 
-**Data flow**: Builds a test Codex with the supplied memories config, constructs `MockMemoryModelProvider`, obtains the state DB, seeds a stage-1 output, mounts a mock phase-2 SSE response, builds a startup context/config with the injected provider, creates the memory root, seeds extension instructions, runs `phase2::run`, waits for the single request and workspace reset, shuts down the test Codex, and returns the captured request.
+**Data flow**: It builds a test Codex session, creates a mock provider, seeds a completed stage-one memory result, mounts a fake model response, prepares the memory root and extension instructions, runs phase two, captures the request, waits for the workspace to become clean again, shuts down Codex, and returns the request.
 
-**Call relations**: Called by the phase-2 provider-default and explicit-override tests. It exercises the production `phase2::run` path with controlled inputs.
+**Call relations**: It is called by the phase-two provider-default and explicit-override tests. It hands off setup to build_test_codex_with_memories_config, seed_stage1_output, memory_startup_context_with_provider, seed_extension_instructions, the phase-two runner, wait_for_single_request, and wait_for_phase2_workspace_reset.
 
 *Call graph*: calls 11 internal fn (mount_sse_once, sse, seed_extension_instructions, run, new, build_test_codex_with_memories_config, memory_startup_context_with_provider, seed_stage1_output, shutdown_test_codex, wait_for_phase2_workspace_reset (+1 more)); called by 2 (memories_startup_phase2_explicit_model_override_drives_request_model, memories_startup_phase2_provider_default_drives_request_model); 5 external calls (new, now, memory_root, create_dir_all, vec!).
 
@@ -1695,11 +1725,11 @@ async fn run_memory_phase_two_model_request_test(
 fn startup_test_memories_config() -> MemoriesConfig
 ```
 
-**Purpose**: Builds the baseline memories configuration used by startup tests. It keeps consolidation input selection small and allows immediate rollout eligibility.
+**Purpose**: Provides a small memory configuration suited to fast tests. It lowers thresholds so the startup flow does useful work immediately.
 
-**Data flow**: Starts from `MemoriesConfig::default()`, overrides `max_raw_memories_for_consolidation` to 1 and `min_rollout_idle_hours` to 0, and returns the resulting struct.
+**Data flow**: It starts with the default MemoriesConfig, changes the maximum raw memories for consolidation and the minimum idle time, and returns the adjusted config.
 
-**Call relations**: Used by multiple test builders and model-selection tests as the common default memories config.
+**Call relations**: It is used by build_test_codex and by the model-selection tests as the base memory settings before any test-specific override is applied.
 
 *Call graph*: calls 1 internal fn (default); called by 5 (build_test_codex, memories_startup_phase1_explicit_model_override_drives_request_model, memories_startup_phase1_provider_default_drives_request_model, memories_startup_phase2_explicit_model_override_drives_request_model, memories_startup_phase2_provider_default_drives_request_model).
 
@@ -1713,11 +1743,11 @@ async fn build_test_codex(
 ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Convenience wrapper that builds a `TestCodex` using the standard startup-test memories configuration. It reduces duplication in tests that do not need custom memory settings.
+**Purpose**: Builds a standard test Codex session using the startup memory test configuration. This keeps the common setup in one place.
 
-**Data flow**: Accepts the mock server and temp home, calls `startup_test_memories_config`, forwards both into `build_test_codex_with_memories_config`, and returns the resulting `TestCodex`.
+**Data flow**: It receives a mock server and temporary home folder, gets the standard memory config, and passes everything to the more flexible builder. The result is a ready-to-use TestCodex instance.
 
-**Call relations**: Used by several top-level startup integration tests.
+**Call relations**: It is called by tests that do not need custom memory settings. It delegates to startup_test_memories_config and build_test_codex_with_memories_config.
 
 *Call graph*: calls 2 internal fn (build_test_codex_with_memories_config, startup_test_memories_config); called by 5 (memories_startup_creates_memory_root, memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata, memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs).
 
@@ -1732,11 +1762,11 @@ async fn build_test_codex_with_memories_config(
 ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Constructs a `TestCodex` configured for memories startup testing with SQLite enabled and a caller-supplied memories config. It is the common environment builder for this file.
+**Purpose**: Builds a test Codex session with a caller-supplied memory configuration and SQLite state enabled. SQLite is the local database feature used here to store thread and memory job state.
 
-**Data flow**: Starts from `test_codex()`, sets the home directory, mutates the config in a closure to enable `Feature::Sqlite` and assign `config.memories = memories`, then builds against the mock server and returns the async result.
+**Data flow**: It starts a TestCodex builder, attaches the temporary home, edits the config to enable the SQLite feature and install the given memory config, then builds against the mock server.
 
-**Call relations**: Called by `build_test_codex` and the phase-1/phase-2 request helper functions.
+**Call relations**: It is the shared builder underneath build_test_codex and the two model-request helper scenarios.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 3 (build_test_codex, run_memory_phase_one_model_request_test, run_memory_phase_two_model_request_test).
 
@@ -1747,11 +1777,11 @@ async fn build_test_codex_with_memories_config(
 async fn init_state_db(home: &Arc<TempDir>) -> anyhow::Result<Arc<codex_state::StateRuntime>>
 ```
 
-**Purpose**: Initializes a standalone state DB for tests that need to seed memory rows before constructing a full `TestCodex`. It also marks backfill complete so startup logic can proceed normally.
+**Purpose**: Creates and prepares the state database used by the tests. It marks old backfill work as complete so tests focus only on the memory startup behavior they set up.
 
-**Data flow**: Takes the temp home, calls `StateRuntime::init` with the home path and a test provider name, awaits `mark_backfill_complete(None)`, and returns the `Arc<StateRuntime>`.
+**Data flow**: It receives a temporary home folder, initializes a StateRuntime database in that location for a test provider, marks backfill complete, wraps the database in Arc so it can be shared, and returns it.
 
-**Call relations**: Used by phase-2 integration tests that seed DB state directly before startup.
+**Call relations**: It is called by tests that seed memory jobs directly before starting Codex or memory startup.
 
 *Call graph*: calls 1 internal fn (init); called by 3 (memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs).
 
@@ -1762,11 +1792,11 @@ async fn init_state_db(home: &Arc<TempDir>) -> anyhow::Result<Arc<codex_state::S
 async fn trigger_memories_startup(test: &TestCodex)
 ```
 
-**Purpose**: Enables the memory feature in a cloned config snapshot and invokes the public startup entrypoint for a test thread. It is the standard way tests kick off the asynchronous startup pipeline.
+**Purpose**: Starts the real memory startup background task inside a test Codex session. It also enables the MemoryTool feature flag so the tested path is active.
 
-**Data flow**: Reads the live config snapshot from the test Codex, clones the base config, enables `Feature::MemoryTool`, wraps the config in `Arc`, and calls `start_memories_startup_task` with the thread manager, auth manager, configured thread ID, thread handle, config, and session source. It returns no value.
+**Data flow**: It reads the current config snapshot, clones the test config, turns on the memory feature, and calls start_memories_startup_task with the thread manager, auth manager, thread ID, Codex handle, config, and session source. It does not return a result because the task runs in the background.
 
-**Call relations**: Used by the end-to-end startup tests to invoke the same entrypoint production code uses.
+**Call relations**: It is called by several integration-style tests after they prepare files and database state. It hands control to the production startup task being tested.
 
 *Call graph*: called by 4 (memories_startup_creates_memory_root, memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs); 3 external calls (clone, new, start_memories_startup_task).
 
@@ -1780,11 +1810,11 @@ async fn memory_startup_context_with_provider(
 ) -> (Arc<MemoryStartupContext>, Arc<codex_core::config::Config>)
 ```
 
-**Purpose**: Builds a `MemoryStartupContext` and shared config for tests that need to call phase functions directly with an injected provider. It mirrors production startup-context creation while allowing provider substitution.
+**Purpose**: Builds a memory startup context for tests that need to inject a custom model provider. This is how the model-selection tests replace provider defaults without changing the rest of the system.
 
-**Data flow**: Reads the live config snapshot, clones the base config, enables `Feature::MemoryTool`, wraps the config in `Arc`, constructs `MemoryStartupContext::new_for_testing` with the supplied provider and current thread/session data, wraps that in `Arc`, and returns `(context, config)`.
+**Data flow**: It reads the current config snapshot, clones and updates the config to enable the memory feature, creates a testing MemoryStartupContext with the supplied provider, and returns both the context and shared config.
 
-**Call relations**: Used by the phase-1 and phase-2 model-request helper functions.
+**Call relations**: It is called by the reusable phase-one and phase-two model request helpers. Those helpers then pass the returned context into the actual phase runners.
 
 *Call graph*: calls 1 internal fn (new_for_testing); called by 2 (run_memory_phase_one_model_request_test, run_memory_phase_two_model_request_test); 2 external calls (clone, new).
 
@@ -1795,11 +1825,11 @@ async fn memory_startup_context_with_provider(
 fn new(info: ModelProviderInfo, auth_manager: Option<Arc<AuthManager>>) -> Self
 ```
 
-**Purpose**: Creates the mock provider wrapper around a real provider implementation. The wrapper delegates most behavior unchanged while overriding memory-specific preferred-model methods.
+**Purpose**: Creates a mock memory model provider that overrides only the preferred memory models while delegating normal provider behavior elsewhere.
 
-**Data flow**: Takes `ModelProviderInfo` and optional `AuthManager`, creates the delegate with `create_model_provider`, stores it in `MockMemoryModelProvider`, and returns the wrapper.
+**Data flow**: It receives provider information and an optional authentication manager, creates the real provider delegate from them, stores that delegate, and returns the mock wrapper.
 
-**Call relations**: Called by both model-request helper functions before constructing a startup context with injected provider behavior.
+**Call relations**: It is called by both model request helpers before they build a memory startup context with an injected provider.
 
 *Call graph*: called by 2 (run_memory_phase_one_model_request_test, run_memory_phase_two_model_request_test); 1 external calls (create_model_provider).
 
@@ -1810,11 +1840,11 @@ fn new(info: ModelProviderInfo, auth_manager: Option<Arc<AuthManager>>) -> Self
 fn info(&self) -> &ModelProviderInfo
 ```
 
-**Purpose**: Delegates provider metadata access to the wrapped real provider. It preserves all non-memory-specific provider identity behavior.
+**Purpose**: Returns the provider information from the underlying real provider. This keeps the mock looking like the actual provider for everything except memory model defaults.
 
-**Data flow**: Returns `self.delegate.info()`. No state changes occur.
+**Data flow**: It reads the delegate provider's info and returns a borrowed reference to it. No state is changed.
 
-**Call relations**: Part of the `ModelProvider` trait implementation used implicitly by runtime code when interacting with the injected provider.
+**Call relations**: The model provider interface calls this when code needs provider metadata. This mock simply passes the request through to its delegate.
 
 *Call graph*: 1 external calls (info).
 
@@ -1825,11 +1855,11 @@ fn info(&self) -> &ModelProviderInfo
 fn memory_extraction_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Overrides the provider’s preferred phase-1 extraction model with a fixed test constant. This lets tests prove provider defaults are consulted.
+**Purpose**: Supplies the fake provider default model for phase-one memory extraction. Tests use this fixed value to prove phase one consults the provider default.
 
-**Data flow**: Reads no inputs beyond `self` and returns the static string `MOCK_PROVIDER_PHASE_ONE_MODEL`.
+**Data flow**: It takes no outside data beyond the provider object and returns the constant phase-one mock model name. Nothing is changed.
 
-**Call relations**: Consumed indirectly by phase-1 `build_request_context` when no explicit extraction-model override is configured.
+**Call relations**: The phase-one runner asks the provider for this value when no explicit extraction model override is configured.
 
 
 ##### `MockMemoryModelProvider::memory_consolidation_preferred_model`  (lines 610–612)
@@ -1838,11 +1868,11 @@ fn memory_extraction_preferred_model(&self) -> &'static str
 fn memory_consolidation_preferred_model(&self) -> &'static str
 ```
 
-**Purpose**: Overrides the provider’s preferred phase-2 consolidation model with a fixed test constant. This lets tests prove provider defaults are consulted.
+**Purpose**: Supplies the fake provider default model for phase-two memory consolidation. Tests use this fixed value to prove phase two consults the provider default.
 
-**Data flow**: Reads no mutable state and returns the static string `MOCK_PROVIDER_PHASE_TWO_MODEL`.
+**Data flow**: It returns the constant phase-two mock model name and does not read or change other state.
 
-**Call relations**: Consumed indirectly by phase-2 `agent::get_config` when no explicit consolidation-model override is configured.
+**Call relations**: The phase-two runner asks the provider for this value when no explicit consolidation model override is configured.
 
 
 ##### `MockMemoryModelProvider::auth_manager`  (lines 614–616)
@@ -1851,11 +1881,11 @@ fn memory_consolidation_preferred_model(&self) -> &'static str
 fn auth_manager(&self) -> Option<Arc<AuthManager>>
 ```
 
-**Purpose**: Delegates auth-manager access to the wrapped provider. It keeps authentication behavior realistic in tests.
+**Purpose**: Returns the authentication manager from the underlying provider. This keeps authentication behavior realistic in tests.
 
-**Data flow**: Returns `self.delegate.auth_manager()`. No mutation occurs.
+**Data flow**: It asks the delegate provider for its auth manager and returns that optional shared object. It does not modify anything.
 
-**Call relations**: Part of the trait implementation used by runtime/model-client setup when the mock provider is injected.
+**Call relations**: The model provider interface calls this when request code needs access to authentication support; the mock forwards the call to the real provider.
 
 *Call graph*: 1 external calls (auth_manager).
 
@@ -1866,11 +1896,11 @@ fn auth_manager(&self) -> Option<Arc<AuthManager>>
 fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 ```
 
-**Purpose**: Delegates asynchronous auth lookup to the wrapped provider. It preserves real auth behavior while still allowing memory-model overrides.
+**Purpose**: Returns the current authentication information by forwarding to the real provider asynchronously. Asynchronous means the answer may arrive later without blocking the whole task.
 
-**Data flow**: Clones the delegate `Arc`, returns a boxed pinned future, and inside that future awaits `delegate.auth()`. It yields `Option<CodexAuth>`.
+**Data flow**: It clones the delegate provider, creates a future, awaits the delegate's auth result inside that future, and returns the eventual optional CodexAuth value.
 
-**Call relations**: Used implicitly through the `ModelProvider` trait by runtime code that may need provider auth.
+**Call relations**: Request-building code can call this through the ModelProvider trait. The mock does not invent credentials; it hands the work to the delegate.
 
 *Call graph*: 2 external calls (clone, pin).
 
@@ -1881,11 +1911,11 @@ fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>
 fn account_state(&self) -> ProviderAccountResult
 ```
 
-**Purpose**: Delegates provider account-state reporting to the wrapped provider. This avoids test-specific divergence in account readiness behavior.
+**Purpose**: Reports account state using the underlying provider. This avoids making the mock responsible for account logic.
 
-**Data flow**: Returns `self.delegate.account_state()`. No side effects.
+**Data flow**: It calls the delegate provider's account_state method and returns that result unchanged.
 
-**Call relations**: Part of the trait implementation; not memory-specific but required for a complete provider wrapper.
+**Call relations**: Any code checking account availability through the provider interface can use this mock safely because it forwards to the real provider.
 
 *Call graph*: 1 external calls (account_state).
 
@@ -1900,11 +1930,11 @@ fn models_manager(
     ) -> codex_models_manager::manager::SharedModelsManager
 ```
 
-**Purpose**: Delegates models-manager construction to the wrapped provider. This keeps model metadata resolution realistic while only overriding preferred-model names.
+**Purpose**: Creates or returns the models manager from the underlying provider. The models manager is the component that knows about available model names and model catalog data.
 
-**Data flow**: Accepts `codex_home` and optional model catalog, forwards them to `self.delegate.models_manager`, and returns the shared models manager.
+**Data flow**: It receives the Codex home path and optional configured model catalog, passes both to the delegate provider, and returns the shared models manager produced there.
 
-**Call relations**: Used indirectly by runtime model-info lookup when tests build stage-one request contexts.
+**Call relations**: Model-related code can call this through the provider interface. The mock forwards the work because these tests only need to override memory preferred model names.
 
 *Call graph*: 1 external calls (models_manager).
 
@@ -1921,11 +1951,11 @@ async fn seed_stage1_output(
     rollout_slug
 ```
 
-**Purpose**: Seeds a completed stage-1 output row for a newly created thread with realistic metadata such as rollout path, cwd, provider, and git branch. It is the main helper for phase-2 input setup.
+**Purpose**: Adds a fake completed phase-one memory result for a new thread. This lets phase-two tests start from known memory extraction output.
 
-**Data flow**: Creates a new `ThreadId`, builds thread metadata with rollout path, updated timestamp, CLI session source, cwd, provider, and git branch, upserts that metadata into the DB, then calls `seed_stage1_output_for_existing_thread` with the generated thread ID and supplied raw memory/summary/slug. It returns the seeded thread ID.
+**Data flow**: It creates a new thread ID, builds thread metadata with rollout path, workspace path, provider, and git branch, writes that metadata into the state database, then calls seed_stage1_output_for_existing_thread to mark the memory extraction job as succeeded. It returns the new thread ID.
 
-**Call relations**: Used by several phase-2 tests and by the phase-2 model-request helper to create DB-backed consolidation inputs.
+**Call relations**: It is called by phase-two tests and the phase-two model helper. It prepares the database records that phase two later reads during consolidation.
 
 *Call graph*: calls 3 internal fn (seed_stage1_output_for_existing_thread, new, new); called by 3 (memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_tracks_workspace_diff_across_runs, run_memory_phase_two_model_request_test); 4 external calls (timestamp, join, format!, upsert_thread).
 
@@ -1941,11 +1971,11 @@ async fn seed_stage1_candidate(
 ) -> anyhow::Result<ThreadId>
 ```
 
-**Purpose**: Seeds an eligible phase-1 candidate thread by writing a rollout JSONL file and corresponding thread metadata, then enabling memory mode for that thread. It is the main helper for phase-1 input setup.
+**Purpose**: Adds a fake thread that is eligible for phase-one extraction but has not yet been extracted. This gives phase one something to process in tests.
 
-**Data flow**: Creates a new thread ID and rollout path, builds one `RolloutLine` containing a user message, serializes it to JSONL and writes it to disk, constructs thread metadata with cwd/provider/git branch and preview fields, upserts the metadata, enables thread memory mode in the DB, and returns the thread ID.
+**Data flow**: It creates a thread ID and a rollout JSONL file containing one user message, builds matching thread metadata, stores preview text, writes the thread into the database, enables memory mode for that thread, and returns the thread ID.
 
-**Call relations**: Used by `run_memory_phase_one_model_request_test` to create a claimable rollout for phase 1.
+**Call relations**: It is called by run_memory_phase_one_model_request_test before phase one runs. Phase one then sees this seeded thread as work to extract.
 
 *Call graph*: calls 2 internal fn (new, new); called by 1 (run_memory_phase_one_model_request_test); 9 external calls (to_rfc3339, join, format!, ResponseItem, to_string, set_thread_memory_mode, upsert_thread, write, vec!).
 
@@ -1956,11 +1986,11 @@ async fn seed_stage1_candidate(
 async fn wait_for_single_request(mock: &ResponseMock) -> ResponsesRequest
 ```
 
-**Purpose**: Waits until a mock server has received at least one request and returns the first captured request. It is a convenience wrapper for tests expecting exactly one model call.
+**Purpose**: Waits until a mock response endpoint has received one request and returns it. This is a convenience wrapper for tests that expect exactly one model call.
 
-**Data flow**: Calls `wait_for_request(mock, 1)`, removes index 0 from the returned vector, and returns that `ResponsesRequest`.
+**Data flow**: It calls wait_for_request with an expected count of one, removes the first request from the returned list, and gives that request back to the caller.
 
-**Call relations**: Used by multiple tests and helper functions after triggering phase-1 or phase-2 model activity.
+**Call relations**: It is used by tests and helper scenarios after mounting a mock model response, so they can inspect the request sent by the memory code.
 
 *Call graph*: calls 1 internal fn (wait_for_request); called by 6 (memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata, memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs, run_memory_phase_one_model_request_test, run_memory_phase_two_model_request_test).
 
@@ -1971,11 +2001,11 @@ async fn wait_for_single_request(mock: &ResponseMock) -> ResponsesRequest
 async fn wait_for_file_removed(path: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Polls until a file no longer exists or times out. It is used to observe asynchronous cleanup effects such as diff-file deletion or stale-resource pruning.
+**Purpose**: Waits for a file to disappear, failing the test if it stays too long. This is needed because cleanup happens asynchronously, meaning in the background.
 
-**Data flow**: Computes a deadline 10 seconds in the future, loops checking `tokio::fs::try_exists(path)`, returns `Ok(())` once the file is absent, otherwise asserts the deadline has not passed and sleeps 50 ms before retrying.
+**Data flow**: It repeatedly checks whether the path still exists until either it is gone or a ten-second deadline passes. On success it returns normally; on timeout it fails with a clear message.
 
-**Call relations**: Used directly by extension-pruning tests and by `wait_for_phase2_workspace_reset`.
+**Call relations**: It is called by pruning tests and by wait_for_phase2_workspace_reset to observe cleanup results after phase two runs.
 
 *Call graph*: called by 3 (memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, wait_for_phase2_workspace_reset); 6 external calls (from_millis, from_secs, now, assert!, try_exists, sleep).
 
@@ -1986,11 +2016,11 @@ async fn wait_for_file_removed(path: &Path) -> anyhow::Result<()>
 async fn wait_for_dir(path: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Polls until a directory exists and is actually a directory, or times out. It is used to observe asynchronous creation of the memories root.
+**Purpose**: Waits for a directory to be created, failing the test if it does not appear soon enough.
 
-**Data flow**: Computes a 10-second deadline, loops checking `try_exists(path)` and `path.is_dir()`, returns success once both are true, otherwise asserts the deadline has not passed and sleeps 50 ms between checks.
+**Data flow**: It repeatedly checks whether the path exists and is a directory until it succeeds or a ten-second deadline passes. It returns success when the directory appears.
 
-**Call relations**: Used by `memories_startup_creates_memory_root`.
+**Call relations**: It is used by memories_startup_creates_memory_root after the startup task is triggered.
 
 *Call graph*: called by 1 (memories_startup_creates_memory_root); 7 external calls (from_millis, from_secs, now, is_dir, assert!, try_exists, sleep).
 
@@ -2001,11 +2031,11 @@ async fn wait_for_dir(path: &Path) -> anyhow::Result<()>
 async fn wait_for_request(mock: &ResponseMock, expected_count: usize) -> Vec<ResponsesRequest>
 ```
 
-**Purpose**: Polls a `ResponseMock` until it has captured at least the expected number of requests. It provides a generic asynchronous wait primitive for request assertions.
+**Purpose**: Waits until a mock response endpoint has received at least a chosen number of requests. This gives background network work time to complete during tests.
 
-**Data flow**: Computes a 10-second deadline, repeatedly reads `mock.requests()`, returns the vector once its length reaches `expected_count`, otherwise asserts the deadline has not passed and sleeps 50 ms.
+**Data flow**: It repeatedly reads the mock's recorded requests, compares the count with the expected count, and either returns the requests or fails after the deadline.
 
-**Call relations**: Used by `wait_for_single_request`, which is then used throughout the test file.
+**Call relations**: It is the lower-level polling helper used by wait_for_single_request.
 
 *Call graph*: calls 1 internal fn (requests); called by 1 (wait_for_single_request); 5 external calls (from_millis, from_secs, now, assert!, sleep).
 
@@ -2019,11 +2049,11 @@ async fn wait_for_service_tier(
 ) -> anyhow::Result<codex_core::ThreadConfigSnapshot>
 ```
 
-**Purpose**: Polls the live thread config snapshot until the expected service tier appears. It is used to ensure runtime state has caught up before constructing a phase-1 request context.
+**Purpose**: Waits until the live Codex thread configuration shows the expected service tier. A service tier is a request priority or speed class, such as a fast tier.
 
-**Data flow**: Computes a deadline, repeatedly awaits `test.codex.config_snapshot()`, compares `service_tier` to the expected value, returns the snapshot on match, otherwise uses `anyhow::ensure!` to fail on timeout and sleeps 50 ms between polls.
+**Data flow**: It repeatedly asks Codex for a config snapshot, checks the service_tier field, and returns the snapshot once it matches. If the setting never changes before the deadline, it returns an error.
 
-**Call relations**: Used only by the service-tier/detached-metadata integration test.
+**Call relations**: It is used by the phase-one metadata test after submitting thread settings, before building the memory request context.
 
 *Call graph*: called by 1 (memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata); 5 external calls (from_millis, from_secs, now, ensure!, sleep).
 
@@ -2034,11 +2064,11 @@ async fn wait_for_service_tier(
 fn phase2_prompt_text(request: &ResponsesRequest) -> String
 ```
 
-**Purpose**: Extracts the user prompt text from a captured phase-2 request by finding the message that mentions the workspace diff heading. It simplifies prompt-content assertions in tests.
+**Purpose**: Extracts the user prompt text from a captured phase-two model request. Tests use it to confirm the prompt included the memory workspace diff.
 
-**Data flow**: Reads all user-role input texts from the `ResponsesRequest`, finds the first containing `Memory workspace diff:`, and returns it as a `String`, panicking if none is found.
+**Data flow**: It reads all user message input texts from the request, finds the one containing the phrase 'Memory workspace diff:', and returns that text. If none is found, the test fails.
 
-**Call relations**: Used by several phase-2 tests to inspect the generated consolidation prompt.
+**Call relations**: It is called by phase-two tests right after wait_for_single_request returns the captured model request.
 
 *Call graph*: calls 1 internal fn (message_input_texts); called by 3 (memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs).
 
@@ -2049,11 +2079,11 @@ fn phase2_prompt_text(request: &ResponsesRequest) -> String
 async fn wait_for_phase2_workspace_reset(memory_root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Waits until phase 2 has both removed the workspace diff file and restored the git workspace to a clean baseline. It is the main synchronization point for asynchronous consolidation completion in tests.
+**Purpose**: Waits until phase two has removed its temporary diff file and the memory workspace has a clean git baseline. In plain terms, it checks that phase two put its workbench back in order.
 
-**Data flow**: First awaits `wait_for_file_removed(memory_root.join("phase2_workspace_diff.md"))`, then polls `diff_since_latest_init(memory_root)` until it succeeds and reports no changes, with a 10-second timeout and 50 ms sleeps. It returns `Ok(())` on success.
+**Data flow**: It first waits for phase2_workspace_diff.md to be removed. Then it repeatedly asks for the git diff since the latest initialization point and returns only when there are no remaining changes.
 
-**Call relations**: Used by multiple phase-2 tests and the phase-2 model-request helper after triggering consolidation.
+**Call relations**: It is called after phase-two tests and helpers run consolidation. It uses wait_for_file_removed first, then diff_since_latest_init to verify the workspace is clean.
 
 *Call graph*: calls 1 internal fn (wait_for_file_removed); called by 4 (memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs, run_memory_phase_two_model_request_test); 7 external calls (from_millis, from_secs, now, join, assert!, diff_since_latest_init, sleep).
 
@@ -2070,11 +2100,11 @@ async fn seed_stage1_output_for_existing_thread(
     rollout_slug: Op
 ```
 
-**Purpose**: Marks an already-existing thread as having a successful stage-1 output by first claiming the stage-1 job and then completing it. It asserts that the success transition enqueues global consolidation.
+**Purpose**: Marks a specific existing thread's phase-one memory job as successfully completed. This is the lower-level helper that writes the fake raw memory and rollout summary into the state database.
 
-**Data flow**: Creates a new owner thread ID, calls `try_claim_stage1_job` for the target thread and timestamp, extracts the ownership token from the claimed outcome or panics otherwise, then calls `mark_stage1_job_succeeded` with the supplied raw memory, summary, and optional slug and asserts the returned boolean is true. It returns `anyhow::Result<()>`.
+**Data flow**: It creates a temporary owner ID, asks the database to claim the stage-one job for the thread, extracts the ownership token from a successful claim, then marks the job as succeeded with raw memory, rollout summary, and optional rollout slug. It asserts that this success enqueues global consolidation.
 
-**Call relations**: Used by `seed_stage1_output` to populate completed phase-1 rows in the DB.
+**Call relations**: It is called only by seed_stage1_output after that function creates and stores thread metadata.
 
 *Call graph*: calls 2 internal fn (new, memories); called by 1 (seed_stage1_output); 2 external calls (assert!, panic!).
 
@@ -2085,11 +2115,11 @@ async fn seed_stage1_output_for_existing_thread(
 async fn read_rollout_summary_bodies(memory_root: &Path) -> anyhow::Result<Vec<String>>
 ```
 
-**Purpose**: Reads all rollout summary files from the memory workspace and returns their contents sorted. It is a helper for asserting phase-2 storage output.
+**Purpose**: Reads all rollout summary files from the memory workspace and returns their text. This lets tests check the final consolidated summaries without caring about exact file order.
 
-**Data flow**: Opens the `rollout_summaries` directory under the memory root, iterates entries asynchronously, reads each file to string, pushes contents into a vector, sorts the vector, and returns it.
+**Data flow**: It opens the rollout_summaries directory, reads each file's contents into a list, sorts the list, and returns it.
 
-**Call relations**: Used by the workspace-diff tracking test to verify which summaries remain after consolidation input sync.
+**Call relations**: It is used by the workspace-diff phase-two test after consolidation, so the test can verify old summaries were removed and the new one remains.
 
 *Call graph*: called by 1 (memories_startup_phase2_tracks_workspace_diff_across_runs); 4 external calls (join, new, read_dir, read_to_string).
 
@@ -2100,22 +2130,24 @@ async fn read_rollout_summary_bodies(memory_root: &Path) -> anyhow::Result<Vec<S
 async fn shutdown_test_codex(test: &TestCodex) -> anyhow::Result<()>
 ```
 
-**Purpose**: Gracefully shuts down a `TestCodex` instance and waits for the shutdown-complete event. It ensures background tasks and threads are cleaned up between tests.
+**Purpose**: Shuts down a test Codex session and waits until shutdown is confirmed. This prevents background tasks from leaking into later tests.
 
-**Data flow**: Submits `Op::Shutdown {}` to the test Codex thread, waits for an event matching `EventMsg::ShutdownComplete`, and returns `Ok(())`.
+**Data flow**: It submits a shutdown operation to Codex, waits for a ShutdownComplete event, and then returns success.
 
-**Call relations**: Called at the end of most integration tests and helper flows to cleanly tear down the test runtime.
+**Call relations**: Most tests and reusable helpers call this at the end of their scenario to cleanly stop the Codex instance they created.
 
 *Call graph*: called by 7 (memories_startup_creates_memory_root, memories_startup_phase1_uses_live_thread_service_tier_and_detached_metadata, memories_startup_phase2_prunes_old_extension_resources, memories_startup_phase2_prunes_old_extension_resources_without_stage1_input, memories_startup_phase2_tracks_workspace_diff_across_runs, run_memory_phase_one_model_request_test, run_memory_phase_two_model_request_test); 1 external calls (wait_for_event).
 
 
 ### `memories/write/src/storage_tests.rs`
 
-`test` · `test execution for memory storage naming and sync behavior`
+`test` · `test run`
 
-This test module exercises the storage-layer conventions used by the memory writer. Two small helpers construct stable `Stage1Output` fixtures: `stage1_output_with_slug` fills every field with fixed timestamps, paths, and text while varying only `thread_id` and `rollout_slug`, and `fixed_thread_id` supplies a UUID-like `ThreadId` whose embedded timestamp/hash produce a predictable filename stem. The first three tests focus on `rollout_summary_file_stem`, asserting that when `rollout_slug` is absent or empty the stem falls back to the fixed UUID/timestamp/hash prefix, and when a slug is present it is lowercased, sanitized into underscore-separated safe characters, and truncated to exactly 60 characters after the prefix.
+This is a test file for the memory-writing storage layer. The project stores two related things: short rollout summary files, and a larger raw memories file that records the original memory text plus metadata. These tests check that the two stay in sync, like making sure an index card in a filing cabinet points to the file that actually exists.
 
-The async integration test builds a temporary memory root with `ensure_layout`, manually seeds stale rollout-summary files named only by thread id, then supplies a single current `Stage1Output`. It runs `sync_rollout_summaries_from_memories` and `rebuild_raw_memories_file_from_memories`, then confirms both stale files are deleted, exactly one canonical summary file remains in `rollout_summaries_dir`, and the regenerated raw memories file contains the expected serialized fields: raw memory text, thread id, cwd, rollout path, and the canonical rollout summary filename. The key invariant captured here is that storage is keyed by the current canonical naming scheme, not legacy thread-id-only filenames, and that the raw memories file must reference the actual summary artifact chosen during sync.
+The first group of tests focuses on filename stems for rollout summaries. A rollout may have a human-friendly slug, but filenames must be safe for normal filesystems. So the tests check that missing or empty slugs fall back to a stable stem based on the thread id, timestamp, and hash, while unsafe slugs are lowercased, cleaned of awkward characters, and cut to a fixed length.
+
+The larger async test creates a temporary memory directory, writes old-style summary files named only by thread id, then asks the storage code to sync summaries and rebuild the raw memories file from a single current memory. It verifies that stale summary files are deleted, a new canonical summary file remains, and the raw memories file mentions the memory text, thread id, working directory, rollout path, and the exact summary filename. Without tests like these, the system could leave behind old memory files or write references to files that no longer exist.
 
 #### Function details
 
@@ -2125,11 +2157,11 @@ The async integration test builds a temporary memory root with `ensure_layout`, 
 fn stage1_output_with_slug(thread_id: ThreadId, rollout_slug: Option<&str>) -> Stage1Output
 ```
 
-**Purpose**: Builds a deterministic `Stage1Output` fixture with fixed timestamps, text payloads, and filesystem paths, varying only the supplied `ThreadId` and optional rollout slug. The helper makes filename-stem tests stable by keeping all other inputs constant.
+**Purpose**: Builds a sample memory record for tests, with a chosen thread id and optional rollout slug. This keeps the filename tests focused on the slug behavior instead of repeating all the fields needed to create a memory.
 
-**Data flow**: It takes a `ThreadId` and `Option<&str>` slug, constructs a `Stage1Output` with `source_updated_at` at Unix second 123 and `generated_at` at 124, fixed `raw_memory`/`rollout_summary` strings, `/tmp/rollout.jsonl` as `rollout_path`, `/tmp/workspace` as `cwd`, and `git_branch: None`. It converts the optional slug into `Option<String>` and returns the populated struct without mutating external state.
+**Data flow**: It takes a thread id and either a slug string or no slug. It fills in fixed timestamps, fixed text, and fixed paths, then returns a complete Stage1Output test value. The only parts that vary are the thread id and the optional slug.
 
-**Call relations**: This helper is invoked by the three filename-stem tests to feed controlled inputs into `rollout_summary_file_stem`; it exists solely to isolate those tests from unrelated `Stage1Output` fields.
+**Call relations**: The filename tests call this helper when they need a realistic memory object to pass into the storage naming code. It does not drive behavior by itself; it supplies consistent test data so the assertions can compare exact expected filenames.
 
 *Call graph*: called by 3 (rollout_summary_file_stem_sanitizes_and_truncates_slug, rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_is_empty, rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_missing); 1 external calls (from).
 
@@ -2140,11 +2172,11 @@ fn stage1_output_with_slug(thread_id: ThreadId, rollout_slug: Option<&str>) -> S
 fn fixed_thread_id() -> ThreadId
 ```
 
-**Purpose**: Creates a known-valid `ThreadId` from a hard-coded string so tests can assert an exact derived filename prefix. Its value is chosen to make the stem output reproducible.
+**Purpose**: Returns one known thread id for tests that need deterministic output. Using the same id every time makes the expected filename stem stable.
 
-**Data flow**: It reads no external state, parses the literal `0194f5a6-89ab-7cde-8123-456789abcdef` via `ThreadId::try_from`, and returns the resulting `ThreadId`, panicking if parsing unexpectedly fails.
+**Data flow**: It starts with a hard-coded thread id string, converts it into the ThreadId type, and returns it. If the string were invalid, the test would fail immediately, but the string is intentionally valid.
 
-**Call relations**: The filename-stem tests call this before constructing their `Stage1Output` fixtures, ensuring all of them share the same deterministic thread identifier.
+**Call relations**: The rollout filename tests call this before building sample Stage1Output values. It feeds stable input into stage1_output_with_slug, which then feeds the filename stem checks.
 
 *Call graph*: calls 1 internal fn (try_from); called by 3 (rollout_summary_file_stem_sanitizes_and_truncates_slug, rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_is_empty, rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_missing).
 
@@ -2155,11 +2187,11 @@ fn fixed_thread_id() -> ThreadId
 fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_missing()
 ```
 
-**Purpose**: Verifies that a memory with no `rollout_slug` produces only the UUID/timestamp/hash-based stem, with no slug suffix appended.
+**Purpose**: Checks that a memory with no rollout slug still gets a predictable summary filename stem. This protects the fallback naming path used when there is no human-friendly name available.
 
-**Data flow**: It obtains the fixed thread id, builds a `Stage1Output` with `rollout_slug: None`, passes that fixture to `rollout_summary_file_stem`, and compares the returned stem string against the constant `FIXED_PREFIX`.
+**Data flow**: It gets the fixed test thread id, builds a sample memory with no slug, asks the production filename-stem function for the result, and compares that result with the known expected prefix.
 
-**Call relations**: This is a direct unit test of the fallback branch in stem generation, using the two local fixture helpers and asserting the exact output expected from the production naming function.
+**Call relations**: This test uses fixed_thread_id and stage1_output_with_slug to create controlled input. It then exercises rollout_summary_file_stem from the storage code and verifies the fallback behavior directly.
 
 *Call graph*: calls 2 internal fn (fixed_thread_id, stage1_output_with_slug); 1 external calls (assert_eq!).
 
@@ -2170,11 +2202,11 @@ fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_missing()
 fn rollout_summary_file_stem_sanitizes_and_truncates_slug()
 ```
 
-**Purpose**: Checks that a non-empty slug is normalized into a safe filename suffix and cut to the configured maximum length. It validates both the presence of the suffix and its exact sanitized content.
+**Purpose**: Checks that a messy, long rollout slug is turned into a safe filename suffix. This matters because user- or system-generated names may contain spaces, symbols, slashes, or too much text for a clean filename.
 
-**Data flow**: It creates a fixed-thread fixture whose slug contains spaces, punctuation, slash characters, mixed case, and an overlong tail. After calling `rollout_summary_file_stem`, it strips the known prefix plus hyphen, asserts the remaining slug suffix length is 60, and compares it to the expected lowercase underscore-normalized truncated string.
+**Data flow**: It builds a sample memory with an unsafe and extra-long slug. It asks the production naming function for the stem, removes the known fixed prefix, then checks that the remaining slug part is exactly 60 characters and has the expected cleaned-up text.
 
-**Call relations**: This test drives the slug-processing branch of `rollout_summary_file_stem`, confirming the production function’s sanitization and truncation rules rather than just checking that some suffix exists.
+**Call relations**: This test starts with fixed_thread_id and stage1_output_with_slug, then hands the sample memory to rollout_summary_file_stem. It verifies the part of the storage code that cleans and shortens slugs before they become filenames.
 
 *Call graph*: calls 2 internal fn (fixed_thread_id, stage1_output_with_slug); 3 external calls (assert_eq!, format!, rollout_summary_file_stem).
 
@@ -2185,11 +2217,11 @@ fn rollout_summary_file_stem_sanitizes_and_truncates_slug()
 fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_is_empty()
 ```
 
-**Purpose**: Verifies that an explicitly empty slug is treated the same as a missing slug and does not contribute a suffix to the filename stem.
+**Purpose**: Checks that an empty slug is treated the same as a missing slug. This avoids creating odd filenames with a dangling separator or blank human-readable part.
 
-**Data flow**: It builds a deterministic `Stage1Output` with `rollout_slug: Some("")`, calls `rollout_summary_file_stem`, and asserts the result equals `FIXED_PREFIX`.
+**Data flow**: It creates a sample memory whose slug field exists but is an empty string. It asks the filename-stem function for the result and confirms that the result is the same stable fallback prefix used when no slug is provided.
 
-**Call relations**: Like the missing-slug test, this targets the fallback path in stem generation, but specifically covers the edge case where the slug field exists yet contains no usable content.
+**Call relations**: This test uses the same helpers as the other naming tests, then exercises rollout_summary_file_stem through the empty-slug case. It complements the missing-slug test by covering a subtly different input.
 
 *Call graph*: calls 2 internal fn (fixed_thread_id, stage1_output_with_slug); 1 external calls (assert_eq!).
 
@@ -2200,22 +2232,24 @@ fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_is_empty()
 async fn sync_rollout_summaries_and_raw_memories_file_keeps_latest_memories_only()
 ```
 
-**Purpose**: Exercises the end-to-end storage refresh path to ensure stale rollout summary files are pruned and the raw memories file is rebuilt to reference only current memories and their canonical summary filenames.
+**Purpose**: Tests that syncing memory storage removes stale rollout summary files and rebuilds the raw memories file so it points to the current canonical summary file. This guards against disk state drifting away from the latest memory list.
 
-**Data flow**: It creates a temporary root, initializes the expected directory layout, writes two preexisting `.md` files under `rollout_summaries_dir` named from `keep_id` and `drop_id`, then constructs a one-element `Vec<Stage1Output>` for only the keep thread. It invokes `sync_rollout_summaries_from_memories` and `rebuild_raw_memories_file_from_memories`, checks via `try_exists` that both old files are gone, enumerates the summaries directory to capture the single surviving canonical filename, reads `raw_memories_file`, and asserts that file text includes the memory body, keep thread id, cwd, rollout path, and `rollout_summary_file: <canonical name>` line.
+**Data flow**: It creates a temporary memory directory, sets up the expected folder layout, and writes two old summary files. It then prepares one current memory record, runs the summary-sync step, and rebuilds the raw memories file. After that, it checks that both old thread-id-named files are gone, exactly one summary file remains, and the raw memories text contains the current memory details and the new summary filename.
 
-**Call relations**: This async integration test drives the production sync/rebuild functions under realistic filesystem conditions: after layout setup and stale-file seeding, it validates that sync removes legacy and dropped artifacts and that rebuild emits metadata consistent with the summary file chosen by sync.
+**Call relations**: This is the integration-style test in the file. It calls the real layout, sync, path, and rebuild functions from the storage module, using temporary disk files as the proving ground. The test confirms that the summary directory and raw memories file are updated together rather than leaving stale files or stale references behind.
 
 *Call graph*: calls 1 internal fn (default); 14 external calls (new, assert!, assert_eq!, ensure_layout, raw_memories_file, rebuild_raw_memories_file_from_memories, rollout_summaries_dir, sync_rollout_summaries_from_memories, format!, tempdir (+4 more)).
 
 
 ### `memories/write/src/workspace_tests.rs`
 
-`test` · `test execution for workspace diff formatting and git-baseline behavior`
+`test` · `test run`
 
-This test module imports the workspace implementation directly and validates both pure formatting helpers and filesystem-backed git-baseline behavior. `render_workspace_diff_file_bounds_large_diff` constructs a `GitBaselineDiff` with one modified file and a `unified_diff` larger than `crate::workspace_diff::MAX_BYTES`; it confirms the rendered markdown includes the status line, the explicit truncation notice with the configured byte count, and a properly closed fenced diff block. The two async tests exercise the real workspace lifecycle in a temporary directory. `reset_memory_workspace_baseline_removes_generated_diff` prepares a workspace, writes a memory file and a generated diff artifact, resets the baseline, then asserts the generated file is gone and a subsequent `memory_workspace_diff` reports no changes. `prepare_memory_workspace_recovers_unusable_git_dir` seeds an empty `.git` directory to simulate unusable metadata and verifies preparation repairs the workspace enough that the diff is empty.
+This is a test file. It does not provide the memory workspace feature itself; instead, it protects that feature from breaking. The memory workspace appears to be a small file area, backed by Git, where memory files such as `MEMORY.md` can be edited and compared against a saved baseline. A baseline is the known starting point, like a “before” photo used to see what changed later.
 
-The final unit test targets `previous_char_boundary` with the multibyte string `"aé"`, proving truncation at byte index 2 backs up to byte 1 rather than splitting the `é`. Together these tests document the module’s key invariants: generated diff files are ephemeral, baseline reset leaves a clean diff state, preparation can recover from stale git metadata, and truncation logic is UTF-8 aware.
+The tests cover a few important safety cases. One test builds an intentionally huge diff, meaning a text report of file changes, and checks that the rendering code cuts it off at the configured size instead of producing an unlimited block of text. Another creates a temporary workspace, writes a generated diff file, resets the baseline, and confirms that the generated diff file disappears and no changes remain. A third test simulates a bad `.git` directory, like finding a broken filing cabinet where Git metadata should be, and checks that preparing the workspace recovers cleanly. The final test checks that byte-based trimming does not split a multi-byte character, which matters for non-English text and symbols.
+
+Together, these tests make sure the workspace behaves predictably around size limits, cleanup, Git setup, and Unicode text.
 
 #### Function details
 
@@ -2225,11 +2259,11 @@ The final unit test targets `previous_char_boundary` with the multibyte string `
 fn render_workspace_diff_file_bounds_large_diff()
 ```
 
-**Purpose**: Verifies that rendering a diff larger than the configured byte cap produces a truncated markdown artifact with the expected status line and closing fence.
+**Purpose**: This test checks that rendering a very large workspace diff keeps the useful file summary but cuts off the oversized diff body. It prevents the system from producing an enormous memory-diff report that could waste space or overwhelm a reader.
 
-**Data flow**: It constructs a `GitBaselineDiff` containing one `GitBaselineChange` marked `Modified` for `MEMORY.md` and a `unified_diff` string of `MAX_BYTES + 128` repeated `a` characters. It passes that diff to `render_workspace_diff_file` and asserts the returned string contains `- M MEMORY.md`, the truncation marker, and ends with "```\n".
+**Data flow**: It starts with a fake diff that says `MEMORY.md` was modified and gives it more text than the allowed maximum. It sends that diff into the rendering function. The result is inspected to make sure it includes the modified-file line, includes a clear truncation message, and still ends as a properly closed code block.
 
-**Call relations**: This is a pure unit test of `render_workspace_diff_file`, indirectly exercising `append_bounded_diff` and the truncation path without touching the filesystem.
+**Call relations**: The Rust test runner calls this during the test suite. Inside the test, the workspace diff rendering code is treated like the part under inspection, while assertions act as the checklist that confirms the rendered output is both shortened and still well-formed.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -2240,11 +2274,11 @@ fn render_workspace_diff_file_bounds_large_diff()
 async fn reset_memory_workspace_baseline_removes_generated_diff()
 ```
 
-**Purpose**: Checks that resetting the workspace baseline deletes the generated diff artifact and leaves the workspace in a no-changes state.
+**Purpose**: This test checks that resetting the memory workspace baseline removes the generated workspace diff file and leaves the workspace with no reported changes. It protects the cleanup path, so old generated reports do not linger after a reset.
 
-**Data flow**: It creates a temporary root, calls `prepare_memory_workspace`, writes `MEMORY.md`, writes a generated workspace diff file via `write_workspace_diff` using an `Added` change and `+memory\n` unified diff, then calls `reset_memory_workspace_baseline`. Afterward it asserts the diff artifact path no longer exists, calls `memory_workspace_diff`, and asserts the returned `changes` vector is empty.
+**Data flow**: It creates a temporary directory, prepares a memory workspace inside it, writes a `MEMORY.md` file, and writes a generated diff that says the file was added. Then it resets the baseline. After that, it checks two outcomes: the generated diff file is gone, and asking for the workspace diff returns an empty list of changes.
 
-**Call relations**: This async integration test drives the normal prepare → write diff → reset baseline → diff again sequence, validating the interaction among the public workspace functions.
+**Call relations**: The asynchronous test runner calls this test because it uses async workspace operations. The test sets up a realistic small workspace, asks the diff-writing code to create generated state, then hands control to the baseline-reset code and verifies the diff-reading code sees a clean result afterward.
 
 *Call graph*: 5 external calls (new, assert!, assert_eq!, write, vec!).
 
@@ -2255,11 +2289,11 @@ async fn reset_memory_workspace_baseline_removes_generated_diff()
 async fn prepare_memory_workspace_recovers_unusable_git_dir()
 ```
 
-**Purpose**: Ensures workspace preparation can recover when a `.git` directory exists but is unusable or incomplete.
+**Purpose**: This test checks that preparing a memory workspace can recover when a `.git` directory already exists but is not usable as a real Git repository. It matters because a half-created or corrupted Git directory should not permanently break memory storage.
 
-**Data flow**: It creates a temporary workspace root, manually creates `root/.git`, writes `MEMORY.md`, invokes `prepare_memory_workspace`, then calls `memory_workspace_diff` and asserts the resulting `changes` vector is empty.
+**Data flow**: It creates a temporary memory folder, manually puts an empty `.git` directory there, and writes a `MEMORY.md` file. It then asks the workspace preparation code to set things up. Finally, it reads the workspace diff and expects no changes, showing that preparation repaired or replaced the unusable Git setup well enough to establish a clean baseline.
 
-**Call relations**: This test targets the recovery behavior delegated by `prepare_memory_workspace` to `ensure_git_baseline_repository`, confirming callers can rely on preparation to normalize stale git metadata before diffing.
+**Call relations**: The asynchronous test runner calls this during tests. The test deliberately creates a bad starting state, then passes that state to the workspace preparation code and uses the diff-reading path afterward as proof that the workspace is usable again.
 
 *Call graph*: 4 external calls (new, assert_eq!, create_dir_all, write).
 
@@ -2270,11 +2304,11 @@ async fn prepare_memory_workspace_recovers_unusable_git_dir()
 fn previous_char_boundary_handles_multibyte_text()
 ```
 
-**Purpose**: Confirms that UTF-8 truncation logic backs up to a valid character boundary when the requested byte index lands inside a multibyte character.
+**Purpose**: This test checks that the helper for finding a safe text cut point does not split a multi-byte character. That matters because some characters, such as `é`, take more than one byte, and cutting through the middle would create invalid text.
 
-**Data flow**: It defines `text` as `"aé"`, calls `previous_char_boundary(text, 2)`, and asserts the returned index is `1`, the boundary before the two-byte `é`.
+**Data flow**: It starts with the text `aé` and asks for the previous safe character boundary before or at byte position 2. Since byte position 2 falls inside `é`, the helper should move back to position 1, right after `a`. The test confirms that exact result.
 
-**Call relations**: This is a focused unit test of the low-level helper used by `append_bounded_diff` to keep truncated diff output valid UTF-8.
+**Call relations**: The normal test runner calls this test. It focuses on the small boundary-finding helper that larger truncation code depends on, especially when shortening text that may contain accented letters, symbols, or other non-ASCII characters.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2284,11 +2318,13 @@ Persistence tests for message history are paired with reusable local thread-stor
 
 ### `message-history/src/tests.rs`
 
-`test` · `test execution for history file lookup and trimming semantics`
+`test` · `test suite`
 
-This test module exercises the internal file-oriented helpers directly as well as the public append path. The first three async tests focus on read-side correctness. `lookup_reads_history_entries` writes two serialized `HistoryEntry` lines to a temporary `history.jsonl`, obtains `(log_id, count)` from `history_metadata_for_file`, and confirms `lookup_history_entry` returns the second parsed record at offset 1. `history_metadata_counts_newlines_across_read_boundaries` writes a byte vector larger than three read buffers with newline bytes placed at exact buffer edges and verifies the newline count matches all inserted offsets, proving chunked scanning with `memchr_iter` does not miss boundary cases. `lookup_uses_stable_log_id_after_appends` confirms that appending to the same file preserves the original `log_id` and allows lookup of the newly appended line.
+The message history feature stores past messages in a file where each line is one JSON record. This test file acts like a safety checklist for that storage format. It creates temporary folders and history files, writes sample entries, then asks the real history code to read metadata, find entries, append new ones, and shrink the file when it gets too large.
 
-The final two tests drive `append_entry` with a temporary `HistoryConfig`. `append_entry_trims_history_when_beyond_max_bytes` sets `max_bytes` just above the first entry’s serialized length, appends a second entry, and verifies the first line is evicted so only the newest remains within the hard cap. `append_entry_trims_history_to_soft_cap` constructs a scenario where dropping only the oldest line would satisfy the hard cap but still exceed the 80% soft cap; after a third append it confirms the file is pruned more aggressively down to a single newest long entry. These tests document the crate’s whole-line retention policy and its preference for trimming to a soft target rather than merely under the hard limit.
+The tests focus on a few important promises. First, a history file with two saved entries should report the right count, and a lookup by position should return the expected entry. Second, counting entries must still work when newline characters fall exactly around internal read-buffer edges. That catches a common file-reading bug where data split across chunks is counted incorrectly. Third, the file’s “log id” must stay useful even after new entries are appended, so callers can keep using an earlier snapshot marker to fetch later records.
+
+The last two tests cover size limits. They configure a maximum history size, append entries, and verify that old entries are removed when needed. One test checks the hard limit: the file must not exceed the configured byte count. The other checks a softer cleanup target, meaning the code trims more aggressively than the bare minimum so it does not immediately need trimming again. Like testing a notebook with tear-out pages, these tests make sure old pages are removed without damaging the newest useful page.
 
 #### Function details
 
@@ -2298,11 +2334,11 @@ The final two tests drive `append_entry` with a temporary `HistoryConfig`. `appe
 async fn lookup_reads_history_entries()
 ```
 
-**Purpose**: Verifies that metadata counting and offset-based lookup work together on a normal JSONL history file.
+**Purpose**: This test proves that saved history entries can be counted and then retrieved by their position in the file. It uses two simple sample entries and checks that looking up the second one returns exactly what was written.
 
-**Data flow**: It creates a temporary history file, builds two `HistoryEntry` values, serializes and writes each as one line, then awaits `history_metadata_for_file` to obtain `(log_id, count)`. It asserts `count` equals the number of entries, calls `lookup_history_entry(&history_path, log_id, 1)`, and asserts the returned entry equals the second fixture.
+**Data flow**: The test starts with a new temporary folder, builds a history file path, and writes two JSON-formatted history records into that file. It then asks the history code for the file’s metadata, receiving a log id and an entry count. Using that log id and an offset of 1, it looks up the second entry and confirms that the returned record matches the second record originally written.
 
-**Call relations**: This test exercises the read-side pairing of `history_metadata_for_file` and `lookup_history_entry`, showing how callers can count entries and then dereference a specific offset.
+**Call relations**: During the test run, this function sets up the file itself using temporary-file and file-writing helpers, then calls into the history module through `history_metadata_for_file` and `lookup_history_entry`. The metadata result feeds directly into the lookup step, mirroring how real code first learns what is in a history log and then fetches one entry from it.
 
 *Call graph*: 5 external calls (create, new, assert_eq!, vec!, writeln!).
 
@@ -2313,11 +2349,11 @@ async fn lookup_reads_history_entries()
 async fn history_metadata_counts_newlines_across_read_boundaries()
 ```
 
-**Purpose**: Checks that newline counting remains correct when newline bytes fall exactly at or across internal read-buffer boundaries.
+**Purpose**: This test checks that entry counting works even when newline characters appear at awkward places in the file. Since each newline marks the end of one history entry, counting them accurately is essential for reporting how many entries exist.
 
-**Data flow**: It allocates a byte vector of length `3 * HISTORY_READ_BUFFER_SIZE + 1`, overwrites selected offsets with `b'\n'` including positions at `buffer_size - 1`, `buffer_size`, and `2 * buffer_size`, writes the bytes to the history file, then awaits `history_metadata_for_file` and asserts the returned count equals the number of inserted newline offsets.
+**Data flow**: The test creates a temporary history file filled mostly with placeholder bytes. It then places newline bytes at several positions, including positions right before, right at, and after the history reader’s buffer boundaries. After writing those bytes to disk, it asks `history_metadata_for_file` to count the entries and checks that the count equals the number of newline positions it inserted.
 
-**Call relations**: This is a focused regression-style test for the chunked scanning logic inside `history_metadata_for_file`, specifically its use of `memchr_iter` over repeated reads.
+**Call relations**: This function exercises the metadata-reading path under a boundary-condition case. It does not care about valid JSON entries here; it is specifically checking the lower-level counting behavior used by `history_metadata_for_file` when the file is read in chunks.
 
 *Call graph*: 4 external calls (new, assert_eq!, write, vec!).
 
@@ -2328,11 +2364,11 @@ async fn history_metadata_counts_newlines_across_read_boundaries()
 async fn lookup_uses_stable_log_id_after_appends()
 ```
 
-**Purpose**: Ensures that appending to an existing history file does not invalidate the file identity used for later offset lookups.
+**Purpose**: This test proves that a log id returned before an append can still be used after the file grows. That matters because callers may ask for metadata, then new history may be written before they look up an entry.
 
-**Data flow**: It writes one initial serialized `HistoryEntry`, obtains `(log_id, count)` from `history_metadata_for_file`, asserts the count is 1, reopens the same file in append mode, writes a second serialized entry, then calls `lookup_history_entry(&history_path, log_id, 1)` and asserts the fetched entry equals the appended one.
+**Data flow**: The test creates a history file with one entry and asks for metadata, receiving a log id and a count of one. It then opens the same file in append mode and writes a second entry. Finally, it uses the original log id with an offset pointing to the appended entry, and checks that the lookup returns the newly added record.
 
-**Call relations**: This test demonstrates the intended contract of `log_id`: appends preserve identity, so offsets obtained against the same file remain meaningful as new lines are added.
+**Call relations**: This test tells a small story that resembles real use: metadata is read first, the file changes, and then lookup happens. It relies on the history module’s `history_metadata_for_file` to produce a stable identifier, and on `lookup_history_entry` to interpret that identifier correctly after later appends.
 
 *Call graph*: 5 external calls (create, new, assert_eq!, new, writeln!).
 
@@ -2343,11 +2379,11 @@ async fn lookup_uses_stable_log_id_after_appends()
 async fn append_entry_trims_history_when_beyond_max_bytes()
 ```
 
-**Purpose**: Verifies that when a second append pushes the file over `max_bytes`, the oldest entry is evicted and the newest entry is retained.
+**Purpose**: This test checks that appending a new history entry respects a configured maximum file size. If the file would become too large, the older entry should be removed so the newer entry can remain.
 
-**Data flow**: It creates a temporary Codex home, starts from `History::default()`, builds a `HistoryConfig`, appends a 200-character first entry, reads the resulting file length, sets `history.max_bytes` to `first_len + 10`, rebuilds the config, and appends a second 200-character entry. It then reads the file contents, parses each line back into `HistoryEntry`, asserts only one entry remains and its `text` is the second entry, and checks the file length is at most the configured limit.
+**Data flow**: The test creates a temporary Codex home folder and a default history configuration. It writes a first large entry, measures the file size, then sets the maximum allowed size to only a little more than that first-entry size. After appending a second large entry, it reads the history file back, parses each line as a history entry, and confirms that only the second entry remains. It also checks the final file size is at or below the configured limit.
 
-**Call relations**: This async test drives the public `append_entry` API through the trimming path, validating the behavior implemented by `enforce_history_limit` under a simple hard-cap overflow.
+**Call relations**: This function drives the real append path by calling `append_entry` with a `HistoryConfig`. It also rebuilds the configuration after changing `history.max_bytes`, so the append code sees the new size limit. The test then verifies the result from the outside, by reading the file from disk rather than inspecting internal state.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (new, assert!, assert_eq!, default, metadata, read_to_string, try_from).
 
@@ -2358,11 +2394,11 @@ async fn append_entry_trims_history_when_beyond_max_bytes()
 async fn append_entry_trims_history_to_soft_cap()
 ```
 
-**Purpose**: Checks that trimming uses the soft-cap target rather than merely dropping enough old data to get under the hard cap.
+**Purpose**: This test checks that history trimming aims below a soft cleanup target, not merely below the absolute maximum size. That helps avoid repeated tiny cleanups every time one more entry is appended.
 
-**Data flow**: It appends a short entry and then a long entry to measure their serialized lengths, computes a `max_bytes` value where keeping both long entries would fit under the hard cap after dropping the first short entry but still exceed the soft cap, rebuilds `HistoryConfig`, and appends a third long entry. It parses the resulting file, asserts only one entry remains and it is the newest long entry, verifies the final file length is within `max_bytes`, computes the soft-cap byte target, and asserts the retained length equals the single long-entry length and is within `soft_cap.max(long_entry_len)`.
+**Data flow**: The test writes a shorter entry and then a longer entry, measuring how much file space each entry uses. It then sets a maximum size where dropping only the first entry would satisfy the hard limit, but would still be above the softer target. After appending another long entry, it reads and parses the file and confirms that only the latest long entry remains. It also calculates the soft cap and checks the final file length matches the expected more-aggressive trimming behavior.
 
-**Call relations**: This test specifically targets the `trim_target_bytes` policy used by `enforce_history_limit`, proving the implementation trims more aggressively than the hard cap alone when necessary.
+**Call relations**: This function uses `append_entry` several times to build up realistic file contents, then changes `HistoryConfig` to introduce a size limit. It is connected to the trimming logic more deeply than the previous size test: instead of only checking that the file is small enough, it confirms that the append path prunes enough old entries to satisfy the intended soft-cap policy.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (new, assert!, assert_eq!, default, metadata, read_to_string, try_from).
 
@@ -2371,11 +2407,11 @@ async fn append_entry_trims_history_to_soft_cap()
 
 `test` · `test setup`
 
-This file is a compact test-fixture library used across the local thread-store test modules. `test_config` constructs a `LocalThreadStoreConfig` rooted entirely under a temporary directory, using the same path for `codex_home` and `sqlite_home` and a fixed default provider ID of `test-provider`. The remaining helpers create rollout files with the on-disk shape that production code expects.
+The local thread store appears to read conversation history from files on disk, including normal sessions and archived sessions. Tests need sample files that look real enough for the production reader to understand them. This file is the test workshop that builds those samples.
 
-`write_session_file` and `write_archived_session_file` are convenience wrappers that choose standard active and archived directories respectively, then delegate to `write_session_file_with`. `write_session_file_with` adds control over the first user message and optional model provider while still using the common file-writing implementation. The lowest-level helper, `write_session_file_with_fork`, creates the target directory, names the file `rollout-<timestamp>-<uuid>.jsonl`, and writes two JSON lines: a `session_meta` record containing thread ID, optional `forked_from_id`, timestamp, cwd, originator, CLI version, source, model provider, and nested git metadata; followed by an `event_msg` user-message record with the supplied message.
+It has one helper for making a `LocalThreadStoreConfig`, which is the set of paths and defaults the store needs before it can run. The rest of the file writes JSON Lines session files. “JSON Lines” means each line is its own JSON record, like a logbook where every entry is separate. The helper creates a directory, chooses a filename using a timestamp and session ID, then writes two records: session metadata and the first user message.
 
-Because many tests rely on rollout parsing, provider fallback, git extraction, fork ancestry, archived detection, and legacy session-meta compatibility, these helpers intentionally produce concrete payloads that exercise those code paths rather than minimal placeholder files.
+There are convenience wrappers for common test cases: an active session, an archived session, a custom session, and a forked session. A forked session records that it came from another session, like a copy of a document that started from an earlier version. Without these helpers, many tests would need to hand-build the same directory layout and JSON records, making the tests harder to read and easier to break when the file format changes.
 
 #### Function details
 
@@ -2385,11 +2421,11 @@ Because many tests rely on rollout parsing, provider fallback, git extraction, f
 fn test_config(codex_home: &Path) -> LocalThreadStoreConfig
 ```
 
-**Purpose**: Builds a standard `LocalThreadStoreConfig` for tests rooted at a temporary directory with a fixed default provider.
+**Purpose**: Builds a simple local thread-store configuration for tests. It points both main storage locations at the same temporary test home and uses a fixed fake model provider.
 
-**Data flow**: Takes `codex_home: &Path`, clones it into both `codex_home` and `sqlite_home` `PathBuf`s, sets `default_model_provider_id` to `"test-provider"`, and returns the config.
+**Data flow**: It receives a path for the fake Codex home directory. It copies that path into the configuration as both the Codex home and SQLite home, adds the provider name `test-provider`, and returns the finished `LocalThreadStoreConfig`. It does not write anything to disk.
 
-**Call relations**: Used broadly by tests across local-store modules to create isolated stores with predictable configuration.
+**Call relations**: Many thread-store tests call this first so they can create a store with predictable paths and defaults. It relies only on converting the incoming path into owned path values, then hands the completed configuration back to the test.
 
 *Call graph*: called by 65 (archive_thread_moves_rollout_to_archived_collection, archive_thread_updates_sqlite_metadata_when_present, delete_rollout_file_treats_vanished_path_as_already_deleted, delete_thread_removes_active_and_archived_rollouts, delete_thread_reports_missing_thread, list_threads_preserves_sqlite_title_search_results, list_threads_rejects_invalid_cursor, list_threads_returns_local_rollout_summary, list_threads_selects_active_or_archived_collection, list_threads_uses_default_provider_when_rollout_omits_provider (+15 more)); 1 external calls (to_path_buf).
 
@@ -2400,11 +2436,11 @@ fn test_config(codex_home: &Path) -> LocalThreadStoreConfig
 fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<PathBuf>
 ```
 
-**Purpose**: Writes a standard active session rollout file under `sessions/2025/01/03` with the default test message and provider.
+**Purpose**: Creates a normal, active test session file with a standard first user message and provider. Tests use it when they need a realistic conversation file in the usual sessions folder.
 
-**Data flow**: Accepts a root path, timestamp string, and `Uuid`; computes the day directory under `root.join("sessions/2025/01/03")`, delegates to `write_session_file_with`, and returns the created file path.
+**Data flow**: It receives the test root directory, a timestamp string, and a session UUID. It chooses the active-session date folder under `sessions/2025/01/03`, fills in the default message `Hello from user` and provider `test-provider`, and returns the path to the file that was written. If creating directories or writing the file fails, it returns the I/O error.
 
-**Call relations**: Used by many tests that need a normal active rollout fixture without customizing message/provider details.
+**Call relations**: This is a convenience wrapper used by many tests that do not care about custom message text or provider details. It hands the real work to `write_session_file_with`, which then delegates to the lower-level writer.
 
 *Call graph*: calls 1 internal fn (write_session_file_with); called by 34 (archive_thread_moves_rollout_to_archived_collection, archive_thread_updates_sqlite_metadata_when_present, delete_rollout_file_treats_vanished_path_as_already_deleted, delete_thread_removes_active_and_archived_rollouts, list_threads_returns_local_rollout_summary, list_threads_selects_active_or_archived_collection, read_thread_accepts_legacy_sandbox_policy_metadata, read_thread_applies_sqlite_thread_name, read_thread_by_rollout_path_prefers_sqlite_git_info, read_thread_falls_back_to_rollout_search_when_sqlite_path_is_stale (+15 more)); 1 external calls (join).
 
@@ -2419,11 +2455,11 @@ fn write_archived_session_file(
 ) -> std::io::Result<PathBuf>
 ```
 
-**Purpose**: Writes a standard archived session rollout file under the archived sessions subdirectory with the archived test message and default provider.
+**Purpose**: Creates a test session file in the archived-session area instead of the active-session area. Tests use it to check archive, unarchive, delete, and read behavior.
 
-**Data flow**: Accepts a root path, timestamp string, and `Uuid`; computes the archived directory under `root.join(ARCHIVED_SESSIONS_SUBDIR)`, delegates to `write_session_file_with`, and returns the created file path.
+**Data flow**: It receives the test root directory, timestamp, and session UUID. It chooses the archive directory, uses the message `Archived user message` and provider `test-provider`, then returns the path to the archived file it created. Disk failures are passed back as I/O errors.
 
-**Call relations**: Used by tests that need archived rollout fixtures for read/list/archive/delete behavior.
+**Call relations**: Tests call this when they need the store to find a session as archived. Like the active-session helper, it delegates the actual file writing to `write_session_file_with` so archived and active files share the same JSON shape.
 
 *Call graph*: calls 1 internal fn (write_session_file_with); called by 11 (delete_thread_removes_active_and_archived_rollouts, list_threads_selects_active_or_archived_collection, read_thread_prefers_active_rollout_over_archived, read_thread_returns_archived_rollout_when_requested, read_thread_sqlite_fallback_loads_archived_history, load_history_uses_live_writer_rollout_path_for_archived_source, unarchive_thread_restores_rollout_and_returns_updated_thread, unarchive_thread_updates_sqlite_metadata_when_present, update_thread_metadata_keeps_archived_thread_archived_in_sqlite, update_thread_metadata_keeps_live_archived_thread_archived_in_sqlite (+1 more)); 1 external calls (join).
 
@@ -2441,11 +2477,11 @@ fn write_session_file_with(
 ) -> std::io::Result<PathBuf>
 ```
 
-**Purpose**: Writes a session rollout file with a caller-specified first user message and optional model provider, but no fork ancestry.
+**Purpose**: Creates a test session file with caller-chosen location, first message, and optional model provider. It is useful for tests that need to vary the contents without dealing with fork metadata.
 
-**Data flow**: Accepts root path, target day directory, timestamp, UUID, first-user-message string, and optional provider; forwards all of that plus `forked_from_id: None` to `write_session_file_with_fork` and returns the resulting path.
+**Data flow**: It receives the root directory, exact day/archive directory, timestamp, UUID, first user message, and optional provider name. It passes all of that onward and explicitly says there is no `forked_from_id`. The result is the path to the created file, or an I/O error if setup or writing fails.
 
-**Call relations**: Intermediate convenience helper used by both active/archived wrappers and tests that need custom message/provider values.
+**Call relations**: The simpler active and archived helpers call this after choosing their standard folders and defaults. This function then calls `write_session_file_with_fork`, which is the one place that actually creates the directory and writes the JSON records.
 
 *Call graph*: calls 1 internal fn (write_session_file_with_fork); called by 3 (list_threads_uses_default_provider_when_rollout_omits_provider, write_archived_session_file, write_session_file).
 
@@ -2463,11 +2499,11 @@ fn write_session_file_with_fork(
     forked_from_id: Option<Uuid>,
 ```
 
-**Purpose**: Creates a concrete rollout JSONL fixture containing a `session_meta` line and a user-message event, optionally including `forked_from_id`. It is the most flexible rollout writer in the test suite.
+**Purpose**: Writes the actual fake session file, including optional information that the session was forked from another one. This is the core helper behind all the session-file test setup in this file.
 
-**Data flow**: Consumes the root path, target directory, timestamp, UUID, first-user-message, optional provider, and optional fork UUID. It creates the directory tree, constructs the rollout filename, opens the file, writes a JSON `session_meta` object with cwd/root, source, CLI version, provider, fork info, and git metadata, then writes a JSON `event_msg` user-message line, and returns the file path.
+**Data flow**: It receives the root path, destination directory, timestamp, session UUID, first user message, optional provider, and optional parent-session UUID. It creates the destination directory, builds a filename like `rollout-<timestamp>-<uuid>.jsonl`, opens the file, writes a session metadata JSON line, then writes a user-message JSON line. It returns the new file path, or an I/O error if any disk operation fails.
 
-**Call relations**: Used directly by fork-related tests and indirectly by all other rollout-writing helpers.
+**Call relations**: Higher-level helpers call this after deciding which defaults to use. Tests that specifically need fork information call it through the custom helper path, so the resulting file can be read by production code as a forked conversation during read-thread tests.
 
 *Call graph*: called by 2 (read_thread_returns_forked_from_id, write_session_file_with); 6 external calls (join, format!, create, create_dir_all, json!, writeln!).
 
@@ -2477,11 +2513,13 @@ This focused group verifies ledger behavior for missing files, completed imports
 
 ### `external-agent-sessions/src/ledger_tests.rs`
 
-`test` · `test-time regression coverage`
+`test` · `test run`
 
-This companion test file exercises edge cases that are easy to miss in the ledger implementation. The first test proves that `ImportedExternalAgentSessionLedger::contains_current_source` short-circuits when the ledger is empty, so checking a missing path does not attempt canonicalization or hashing and simply returns `false`. The second test covers the write path for completed imports when the source file no longer exists: it writes a file, canonicalizes the path, deletes the file, then records a `CompletedExternalAgentSessionImport` using a precomputed SHA-256. The assertion confirms that the ledger still stores the record and leaves `source_modified_at` as `None` rather than failing.
+The import ledger is like a receipt book for session imports. When the system imports a session file from an outside agent, it records where that file came from, what its contents looked like using a SHA-256 hash (a compact fingerprint of the bytes), and which Codex thread was created from it. These tests check important safety behavior around that receipt book.
 
-The final test verifies replacement semantics for duplicate imports of the same source path and content hash. Recording the same session twice with different `ThreadId`s should not create duplicate ledger entries; instead, the existing record is replaced with the newer thread ID and refreshed metadata, including a populated `source_modified_at` when the file is still present. Together these tests document an important design boundary: the ledger can be updated from already-known import results without needing to reopen or rehash the source file, except where the API explicitly computes those values itself.
+The main concern is that once an import is complete, the system should not need the original session file to still exist. A user might delete or move that file after importing it. If the ledger tried to read the source file every time it checked history, old imports could break just because the original file disappeared.
+
+The tests use temporary folders so they do not touch real user data. They create fake session files, compute content fingerprints, record completed imports, reload the ledger from the fake Codex home directory, and verify the stored records. One test also checks that importing the same source again refreshes the existing ledger entry instead of creating a duplicate. Together, these tests protect the ledger’s promise: it should be durable, self-contained evidence of completed imports.
 
 #### Function details
 
@@ -2491,11 +2529,11 @@ The final test verifies replacement semantics for duplicate imports of the same 
 fn empty_ledger_does_not_read_source()
 ```
 
-**Purpose**: Verifies that checking a missing source against an empty ledger returns `false` without trying to read the file.
+**Purpose**: This test proves that a brand-new, empty ledger does not try to inspect a source file when asked whether it contains that source. That matters because an empty ledger should be able to answer “no” even if the file path points to something that does not exist.
 
-**Data flow**: It creates a temporary directory, constructs a nonexistent session path, calls `ImportedExternalAgentSessionLedger::default().contains_current_source(&missing_source)`, unwraps the result, and asserts the boolean is false.
+**Data flow**: It starts by creating a temporary folder and then invents a path to a missing session file inside it. It asks the default empty ledger whether it contains the current version of that missing source. The expected result is false, and the test also confirms the check succeeds without failing because the file is absent.
 
-**Call relations**: This test directly targets the early-return branch in `ImportedExternalAgentSessionLedger::contains_current_source`.
+**Call relations**: This is a focused guard test for ImportedExternalAgentSessionLedger::contains_current_source. It sets up the simplest possible case, calls that ledger check directly, and uses an assertion to confirm the ledger answers from its own records rather than relying on the missing file.
 
 *Call graph*: 2 external calls (new, assert!).
 
@@ -2506,11 +2544,11 @@ fn empty_ledger_does_not_read_source()
 fn completed_imports_do_not_read_source_files()
 ```
 
-**Purpose**: Checks that completed imports can be recorded even after the source file has been deleted, as long as the caller supplies the canonical path and content hash.
+**Purpose**: This test checks that recording a completed import saves enough information that the ledger can later be loaded even after the original source file has been deleted. It protects the user-facing behavior that imported sessions remain remembered without depending on old external files.
 
-**Data flow**: It writes a source file, canonicalizes its path, deletes it, computes the expected SHA-256 from the original bytes, calls `record_completed_session_imports` with one `CompletedExternalAgentSessionImport`, reloads the ledger, and asserts that exactly one record exists with the expected path, thread ID, and `source_modified_at == None`.
+**Data flow**: It creates a temporary Codex home folder and a fake session file, writes sample contents to that file, turns the source path into its full canonical path, then deletes the file. It records a completed import using the known source path, the SHA-256 content fingerprint, and a newly created thread id. After loading the ledger back from disk, it expects exactly one record with the same source path and thread id, and with no stored modification time because the file was already gone when the completed import was recorded.
 
-**Call relations**: This test exercises `record_completed_session_imports` and then `load_import_ledger` to validate the ledger's no-source-read behavior for already completed imports.
+**Call relations**: This test exercises the real recording path by calling record_completed_session_imports and then load_import_ledger. It tells the story of a source file that existed during import but disappeared before ledger recording finished, and it verifies the ledger still contains the completed import record without trying to reopen the deleted file.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, assert_eq!, canonicalize, remove_file, write, load_import_ledger, record_completed_session_imports, vec!).
 
@@ -2521,11 +2559,11 @@ fn completed_imports_do_not_read_source_files()
 fn completed_import_refreshes_existing_record_metadata()
 ```
 
-**Purpose**: Ensures that recording the same source path and content hash twice updates the existing ledger record instead of appending a duplicate.
+**Purpose**: This test confirms that recording the same imported source again updates the existing ledger entry rather than adding a duplicate. It also checks that when the source file still exists, the ledger captures current file metadata such as its modification time.
 
-**Data flow**: It writes a source file, canonicalizes the path, computes its SHA-256, records one completed import with a first thread ID, records a second completed import with the same path/hash but a different thread ID, reloads the ledger, and asserts there is still one record whose thread ID is the second one and whose `source_modified_at` is populated.
+**Data flow**: It creates a temporary source file, writes sample contents, canonicalizes the path, and computes the content fingerprint. It records one completed import with a first thread id, then records another completed import for the same source and same content with a second thread id. After reloading the ledger, the test expects there to be only one record, expects that record to point to the source path, expects the thread id to be the second one, and expects a modification time to be present because the source file was still available.
 
-**Call relations**: This test validates the replacement branch inside `record_completed_session_imports`, including metadata refresh on an existing record.
+**Call relations**: This test drives record_completed_session_imports twice and then checks the result through load_import_ledger. It verifies the replacement behavior in the larger import flow: a later completed import for the same source refreshes the ledger’s saved details instead of leaving stale or duplicated history behind.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (new, assert!, assert_eq!, format!, canonicalize, write, load_import_ledger, record_completed_session_imports, vec!).
 
@@ -2535,13 +2573,13 @@ The rollout subsystem is tested from low-level compression and indexing through 
 
 ### `rollout/src/compression_tests.rs`
 
-`test` · `test-time validation of rollout compression, materialization, and worker maintenance behavior`
+`test` · `test suite`
 
-This test module constructs realistic rollout files containing `SessionMeta` and `UserMessage` lines, then exercises the compression subsystem through public APIs such as `RolloutRecorder::load_rollout_items`, `append_rollout_item_to_path`, `search_rollout_matches`, `RolloutRecorder::new(...resume...)`, and the worker entrypoint `worker::run`. The tests verify that compressed rollouts remain readable, appending to a compressed rollout first materializes it back to plain form, and search/id lookup continue to use the logical plain path even when the physical file is compressed.
+A rollout is a saved session transcript, stored as one JSON object per line in a `.jsonl` file. This test file checks the compressed form of those transcripts, which uses `.zst` files to save disk space. The tests create temporary fake Codex home folders, write small sample rollout files, compress them, and then ask the real rollout code to load, append to, search, resume, or locate those files.
 
-Several tests focus on worker behavior: old active and archived rollouts are compressed, fresh rollouts are skipped, stale temp files are cleaned up while fresh temp files remain, existing compressed siblings are not recompressed, and a fresh run marker suppresses another worker pass. Unix-only tests assert that both compression and append-time materialization preserve restrictive permissions and modified times, including read-only files.
+The main idea is that compression should be invisible to users most of the time. If a transcript is compressed, loading it should still work. If the program needs to append new lines, the compressed file should be expanded back into a normal `.jsonl` file first. If both a plain and compressed copy exist, the plain one should win, so the system does not show duplicates. The worker tests check the background cleaner that compresses old rollouts, skips fresh ones, and removes stale temporary files.
 
-The helper functions build deterministic rollout paths, write minimal valid JSONL transcripts, compress them immediately with zstd, and age files by setting old mtimes. Together these tests document the intended representation-switch semantics: plain files win over compressed siblings, temp files must not resolve as real rollouts, and materialization/install paths must be no-clobber and metadata-preserving.
+The file also pays attention to safety details. It checks that completed temporary files do not overwrite existing destination files, that run markers stop the compression worker from running too often, and, on Unix systems, that file permissions and modification times survive compression and expansion. The helper functions at the bottom act like a small test workshop: they build rollout paths, write sample transcripts, compress them immediately, and make files look old.
 
 #### Function details
 
@@ -2551,11 +2589,11 @@ The helper functions build deterministic rollout paths, write minimal valid JSON
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that rollout loading transparently reads a compressed `.jsonl.zst` file and returns the expected items and thread id. It also confirms the plain file has been replaced by the compressed sibling.
+**Purpose**: This test proves that the rollout loader can read a transcript after it has been compressed. It also checks that loading the compressed file does not recreate the plain file by accident.
 
-**Data flow**: Creates a temp home, deterministic UUID/thread id, writes a rollout with `write_rollout`, compresses it with `compress_now`, then calls `RolloutRecorder::load_rollout_items(&rollout_path).await`. It asserts the loaded thread id, zero parse errors, item count of 2, absence of the plain path, and presence of the compressed path.
+**Data flow**: It creates a temporary home folder, builds a rollout path, writes a two-line sample transcript, and compresses it. Then it asks `RolloutRecorder::load_rollout_items` to read from the original logical path. The result should be the original thread id, no parse errors, two loaded items, no plain file left on disk, and a compressed file still present.
 
-**Call relations**: Exercises the read path through compression-aware rollout loading, relying on helpers that create and compress a valid transcript.
+**Call relations**: This test uses the local helpers `rollout_path`, `write_rollout`, and `compress_now` to set up the situation. It then calls the production loader, which is the behavior under test: compressed storage should still read like a normal rollout.
 
 *Call graph*: calls 5 internal fn (from_string, compress_now, rollout_path, write_rollout, load_rollout_items); 4 external calls (new, from_u128, assert!, assert_eq!).
 
@@ -2566,11 +2604,11 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()>
 fn rollout_file_from_path_normalizes_compressed_file_names() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `RolloutFile::from_path` accepts a compressed filename and stores the canonical plain `.jsonl` filename alongside the physical compressed path. This validates filename normalization.
+**Purpose**: This test checks that a compressed rollout filename is treated as the same rollout as its plain `.jsonl` name. That matters because user-facing lists should not expose compression details as if they were different sessions.
 
-**Data flow**: Builds a compressed rollout path from a deterministic UUID and asserts that `RolloutFile::from_path(compressed_path.clone())` returns `Some(RolloutFile { path: compressed_path, plain_file_name: ...jsonl })`.
+**Data flow**: It builds a normal rollout path, derives its compressed sibling path, and feeds that compressed path into `RolloutFile::from_path`. The expected output keeps the real compressed path but reports the plain filename without the `.zst` suffix.
 
-**Call relations**: Targets the normalization logic in `RolloutFile::from_path` without needing actual file contents.
+**Call relations**: The test uses `rollout_path` to create a realistic filename and then checks the path-normalizing behavior of `RolloutFile::from_path`, which is used when discovering rollout files.
 
 *Call graph*: calls 1 internal fn (rollout_path); 3 external calls (new, from_u128, assert_eq!).
 
@@ -2581,11 +2619,11 @@ fn rollout_file_from_path_normalizes_compressed_file_names() -> anyhow::Result<(
 fn rollout_file_from_path_hides_compressed_sibling_when_plain_exists() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a compressed sibling is ignored when the plain rollout file exists. This enforces the plain-file precedence rule used by discovery code.
+**Purpose**: This test makes sure the system does not show a compressed copy when a plain rollout file already exists beside it. The plain file is treated as the active, authoritative version.
 
-**Data flow**: Creates a plain rollout file with `write_rollout`, computes its compressed sibling path, and asserts `RolloutFile::from_path(compressed_rollout_path(&rollout_path)) == None`.
+**Data flow**: It writes a sample plain rollout, then asks `RolloutFile::from_path` about the compressed path that would sit next to it. Because the plain file exists, the function should return nothing for the compressed sibling.
 
-**Call relations**: Exercises the sibling-hiding branch in `RolloutFile::from_path` and `path::should_skip_compressed_sibling`.
+**Call relations**: The test sets up its file with `rollout_path` and `write_rollout`. It then checks the file-discovery rule that prevents duplicate entries when both compressed and uncompressed names could match.
 
 *Call graph*: calls 3 internal fn (from_string, rollout_path, write_rollout); 3 external calls (new, from_u128, assert_eq!).
 
@@ -2596,11 +2634,11 @@ fn rollout_file_from_path_hides_compressed_sibling_when_plain_exists() -> anyhow
 async fn append_rollout_item_materializes_compressed_rollout() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that appending to a compressed rollout first materializes it back to plain form, then appends successfully. It validates the append-path representation switch.
+**Purpose**: This test checks that appending to a compressed transcript first turns it back into a normal writable file. Without this, new session events could not be added safely to old compressed logs.
 
-**Data flow**: Creates and compresses a rollout, calls `append_rollout_item_to_path` with a new `UserMessage` event, then asserts the plain path exists, the compressed sibling is gone, and `RolloutRecorder::load_rollout_items` returns the original thread id, zero parse errors, and three items.
+**Data flow**: It writes and compresses a rollout, then appends a new user-message item to the logical rollout path. After that, the plain `.jsonl` file should exist, the `.zst` file should be gone, and loading the rollout should return the original two items plus the new one.
 
-**Call relations**: Exercises `materialize_rollout_for_append` indirectly through the append API and then reuses the normal load path to verify the resulting transcript.
+**Call relations**: The setup uses `rollout_path`, `write_rollout`, and `compress_now`. The test then calls `append_rollout_item_to_path`, and finally uses `RolloutRecorder::load_rollout_items` to prove the append and materialization worked together.
 
 *Call graph*: calls 5 internal fn (from_string, compress_now, rollout_path, write_rollout, load_rollout_items); 8 external calls (default, new, from_u128, assert!, assert_eq!, append_rollout_item_to_path, UserMessage, EventMsg).
 
@@ -2611,11 +2649,11 @@ async fn append_rollout_item_materializes_compressed_rollout() -> anyhow::Result
 async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that rollout search reports matches keyed by the logical plain rollout path even when the physical file is compressed. This keeps higher-level APIs representation-agnostic.
+**Purpose**: This test verifies that searching compressed rollouts reports matches under the normal rollout path, not the storage-specific compressed path. That keeps search results understandable to the rest of the program.
 
-**Data flow**: Creates and compresses a rollout containing a target phrase, runs `search_rollout_matches` against the temp home, and asserts the returned map contains the plain `rollout_path` key with the expected snippet.
+**Data flow**: It writes a rollout containing a target phrase, compresses it, and runs `search_rollout_matches` for part of that phrase. The returned map should contain the plain logical rollout path as the key and the matching text as the value.
 
-**Call relations**: Exercises compression-aware path normalization in the search stack rather than direct compression APIs.
+**Call relations**: The test creates its compressed sample with `rollout_path`, `write_rollout`, and `compress_now`. It then exercises the production search function, checking that compressed files are searched but presented as normal rollout files.
 
 *Call graph*: calls 4 internal fn (from_string, compress_now, rollout_path, write_rollout); 5 external calls (new, from_u128, assert_eq!, search_rollout_matches, new).
 
@@ -2626,11 +2664,11 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
 async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<()>
 ```
 
-**Purpose**: Validates the worker's main behavior across active, archived, fresh, and temp files. It confirms old rollouts are compressed, fresh ones are skipped, stale temps are removed, fresh temps remain, and the run marker persists.
+**Purpose**: This test checks the background compression worker. It should compress old rollout files in both active and archived locations, leave fresh files alone, and clean up stale temporary compression files.
 
-**Data flow**: Creates old active and archived rollouts, a fresh active rollout, a stale temp file, and a fresh temp file; ages the old files with `set_old_mtime`; runs `worker::run(home.path().to_path_buf()).await`; then asserts old plain files are gone and compressed siblings exist, the fresh plain file remains uncompressed, the stale temp is removed, the fresh temp remains, and `.tmp/rollout-compression.lock` exists.
+**Data flow**: It creates old active and archived rollouts, a fresh active rollout, an old temporary `.tmp` file, and a fresh temporary `.tmp` file. After `worker::run` finishes, the old rollouts should be replaced by compressed files, the fresh rollout should remain plain, the stale temp should be deleted, the fresh temp should remain, and a run marker should exist.
 
-**Call relations**: Drives the full worker orchestration path, including stale-temp cleanup, recursive scanning, compression eligibility, and marker persistence.
+**Call relations**: The test relies on `rollout_path`, `archived_rollout_path`, `write_rollout`, and `set_old_mtime` to build realistic files with different ages. It then calls the worker, which is responsible for deciding what to compress, skip, or clean.
 
 *Call graph*: calls 5 internal fn (from_string, archived_rollout_path, rollout_path, set_old_mtime, write_rollout); 5 external calls (new, from_u128, assert!, write, run).
 
@@ -2641,11 +2679,11 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
 async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that resuming from a compressed rollout path loads history correctly and materializes the rollout back to its plain path for continued recording. It validates resume-time representation switching.
+**Purpose**: This test proves that resuming a compressed session turns the transcript back into a normal file and continues writing there. It protects the user flow where an old compressed session is reopened and receives new messages.
 
-**Data flow**: Creates a `RolloutConfig`, writes and compresses a rollout, loads history via `RolloutRecorder::get_rollout_history(compressed_path.as_path()).await` and asserts it returns `InitialHistory::Resumed` with the plain rollout path, then constructs `RolloutRecorder::new(... RolloutRecorderParams::resume(compressed_path.clone()))`, asserts the recorder now points at the plain path and that the compressed file is gone, records another user message, flushes and shuts down, and finally reloads items to assert thread id, zero parse errors, and three items.
+**Data flow**: It creates and compresses a rollout, then asks for its initial history from the compressed path. The history should point back to the plain logical path. It then creates a `RolloutRecorder` in resume mode, checks that the recorder uses the plain path, writes one new item, flushes and shuts down, and finally reloads the file to confirm all three items are present.
 
-**Call relations**: Exercises both history loading and recorder resume paths that depend on compression materialization.
+**Call relations**: This test uses `rollout_path`, `write_rollout`, and `compress_now` for setup. It connects several production pieces: `get_rollout_history` reads the compressed file, `RolloutRecorder::new` with resume parameters materializes it, and recorder writing proves the resumed session can continue normally.
 
 *Call graph*: calls 8 internal fn (from_string, compress_now, rollout_path, write_rollout, get_rollout_history, load_rollout_items, new, resume); 8 external calls (default, new, from_u128, assert!, assert_eq!, panic!, UserMessage, EventMsg).
 
@@ -2656,11 +2694,11 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()>
 async fn compression_preserves_rollout_permissions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that worker compression preserves restrictive Unix permissions from the source rollout file onto the compressed output. This protects transcript confidentiality across representation changes.
+**Purpose**: On Unix systems, this test checks that compressing a restricted rollout keeps its file permissions. That matters because transcripts may contain private conversation content.
 
-**Data flow**: On Unix, writes an archived rollout, sets permissions to `0o600`, ages it, runs `worker::run`, then asserts the plain file is gone and the compressed file's mode bits equal `0o600`.
+**Data flow**: It writes an archived rollout, changes its permissions to owner-read/write only, marks it old, and runs the compression worker. The plain file should be gone, and the compressed file should still have the same restricted permission bits.
 
-**Call relations**: Targets the metadata-preservation path in worker compression, especially `set_file_metadata` and temp-file persistence.
+**Call relations**: The test uses `archived_rollout_path`, `write_rollout`, and `set_old_mtime` to create an old archived file. It then calls the worker and inspects the compressed file metadata to ensure compression did not loosen access.
 
 *Call graph*: calls 4 internal fn (from_string, archived_rollout_path, set_old_mtime, write_rollout); 7 external calls (new, from_u128, assert!, assert_eq!, from_mode, set_permissions, run).
 
@@ -2671,11 +2709,11 @@ async fn compression_preserves_rollout_permissions() -> anyhow::Result<()>
 async fn append_materialization_preserves_compressed_rollout_permissions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that append-time materialization preserves the compressed file's restrictive permissions on the newly created plain file. This mirrors the worker permission-preservation guarantee in the reverse direction.
+**Purpose**: On Unix systems, this test checks that expanding a compressed rollout before appending keeps the compressed file's restrictive permissions. It prevents a private transcript from becoming more widely readable just because it was reopened.
 
-**Data flow**: On Unix, writes and compresses a rollout, sets the compressed file's permissions to `0o600`, appends a user message via `append_rollout_item_to_path`, then asserts the plain file exists, the compressed file is gone, and the plain file's mode bits equal `0o600`.
+**Data flow**: It writes and compresses a rollout, sets the compressed file to owner-read/write only, and appends a new message through the normal append path. The result should be a plain rollout file with the same restrictive permission bits, and the compressed file should be removed.
 
-**Call relations**: Exercises `materialize_rollout_for_append_blocking` indirectly through the append API, focusing on `create_file_with_permissions` and install semantics.
+**Call relations**: The test prepares the compressed input with `rollout_path`, `write_rollout`, and `compress_now`. It then exercises `append_rollout_item_to_path`, checking that materialization and permission copying happen as one safe operation.
 
 *Call graph*: calls 4 internal fn (from_string, compress_now, rollout_path, write_rollout); 10 external calls (default, new, from_u128, assert!, assert_eq!, from_mode, append_rollout_item_to_path, set_permissions, UserMessage, EventMsg).
 
@@ -2686,11 +2724,11 @@ async fn append_materialization_preserves_compressed_rollout_permissions() -> an
 fn persist_temp_file_noclobber_installs_completed_temp() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that `persist_temp_file_noclobber` installs a completed temp file when the destination does not yet exist. It validates the happy path of no-clobber persistence.
+**Purpose**: This test checks the safe move step used for completed temporary files. If the destination does not already exist, the temporary file should become the real file.
 
-**Data flow**: Creates a temp file and destination path in a temp directory, writes content to the temp file, calls `persist_temp_file_noclobber`, then asserts the temp file is gone and the destination contains the temp content.
+**Data flow**: It writes a temporary file and chooses an empty destination path. After `persist_temp_file_noclobber` runs, the temp path should be gone and the destination should contain the temp file's text.
 
-**Call relations**: Directly tests the helper used by materialization when hard-link installation is unavailable.
+**Call relations**: This test directly exercises `persist_temp_file_noclobber`, a safety helper used when a temporary output is ready to be installed without risking unwanted overwrite.
 
 *Call graph*: 4 external calls (new, assert!, assert_eq!, write).
 
@@ -2701,11 +2739,11 @@ fn persist_temp_file_noclobber_installs_completed_temp() -> anyhow::Result<()>
 fn persist_temp_file_noclobber_does_not_replace_existing_destination() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that `persist_temp_file_noclobber` does not overwrite an existing destination file. This protects the winner in races between concurrent materializers.
+**Purpose**: This test checks that the safe move step never overwrites a file that is already there. That avoids losing a real rollout if another process or earlier step already created it.
 
-**Data flow**: Creates both temp and destination files with different contents, calls `persist_temp_file_noclobber`, then asserts the temp file is gone and the destination still contains its original content.
+**Data flow**: It writes both a candidate temporary file and an existing destination file. After `persist_temp_file_noclobber` runs, the temp file should be removed and the destination should still contain its original text.
 
-**Call relations**: Directly tests the helper's `AlreadyExists` branch, which is important for race-safe materialization.
+**Call relations**: Like the companion test, this directly calls `persist_temp_file_noclobber`. It covers the conflict case, where the helper must clean up the temp file but leave the existing destination untouched.
 
 *Call graph*: 4 external calls (new, assert!, assert_eq!, write).
 
@@ -2716,11 +2754,11 @@ fn persist_temp_file_noclobber_does_not_replace_existing_destination() -> anyhow
 async fn compression_preserves_read_only_rollout_permissions() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that worker compression preserves both read-only permissions and the original modified time. This is a stricter metadata-preservation test than the writable-permissions case.
+**Purpose**: On Unix systems, this test checks that compressing a read-only rollout keeps both its read-only permissions and its modification time. This is important for preserving the meaning and history of archived files.
 
-**Data flow**: On Unix, writes an archived rollout, ages it, sets permissions to `0o400`, captures the source modified time, runs `worker::run`, then asserts the plain file is gone, the compressed file has mode `0o400`, and its modified time equals the source modified time.
+**Data flow**: It writes an old archived rollout, records its modified time, makes it owner-read-only, and runs the compression worker. The compressed file should replace the plain one, keep the same permission bits, and keep the same modified timestamp.
 
-**Call relations**: Exercises the same metadata-preservation path as other worker tests but with a read-only source and explicit mtime verification.
+**Call relations**: The test uses `archived_rollout_path`, `write_rollout`, and `set_old_mtime` for setup, then calls the worker. It verifies that the worker's compression step preserves metadata, not just file contents.
 
 *Call graph*: calls 4 internal fn (from_string, archived_rollout_path, set_old_mtime, write_rollout); 8 external calls (new, from_u128, assert!, assert_eq!, from_mode, metadata, set_permissions, run).
 
@@ -2731,11 +2769,11 @@ async fn compression_preserves_read_only_rollout_permissions() -> anyhow::Result
 async fn worker_skips_existing_compressed_archived_rollouts() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that the worker does not recompress an archived rollout when the compressed sibling already exists. The compressed file should remain readable and the plain file should stay absent.
+**Purpose**: This test makes sure the compression worker does not damage or duplicate an archived rollout that is already compressed. It should recognize that there is nothing more to do.
 
-**Data flow**: Writes and compresses an archived rollout, ages the compressed file, runs `worker::run`, then asserts the plain file is absent, the compressed file still exists, and `RolloutRecorder::load_rollout_items(&rollout_path)` still returns the expected thread id, zero parse errors, and two items.
+**Data flow**: It writes an archived rollout, compresses it immediately, marks the compressed file old, and runs the worker. The compressed file should remain, the plain file should stay absent, and loading through the logical rollout path should still return the expected two items.
 
-**Call relations**: Targets the `SkippedAlreadyCompressed` path in worker compression while also validating that the logical rollout remains readable.
+**Call relations**: The test uses `archived_rollout_path`, `write_rollout`, `compress_now`, and `set_old_mtime` to build an already-compressed archived rollout. It then calls the worker and the rollout loader to confirm both skipping and later reading still work.
 
 *Call graph*: calls 6 internal fn (from_string, archived_rollout_path, compress_now, set_old_mtime, write_rollout, load_rollout_items); 5 external calls (new, from_u128, assert!, assert_eq!, run).
 
@@ -2746,11 +2784,11 @@ async fn worker_skips_existing_compressed_archived_rollouts() -> anyhow::Result<
 async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that a fresh run marker suppresses a worker pass. This prevents overlapping or too-frequent compression runs.
+**Purpose**: This test checks the throttling guard for the compression worker. If a recent run marker exists, the worker should skip work instead of scanning and compressing again too soon.
 
-**Data flow**: Writes and ages an archived rollout, manually creates `.tmp/rollout-compression.lock`, runs `worker::run`, and asserts the plain rollout still exists and no compressed sibling was created.
+**Data flow**: It creates an old archived rollout that would normally qualify for compression, then writes a fresh marker file in the temporary directory. After the worker runs, the rollout should still be plain and no compressed copy should exist.
 
-**Call relations**: Exercises the `CompressionRunMarker::try_claim` freshness check through the full worker entrypoint.
+**Call relations**: The test prepares the old file with `archived_rollout_path`, `write_rollout`, and `set_old_mtime`, then creates the marker that the worker checks. The worker should see the marker and exit without touching eligible files.
 
 *Call graph*: calls 4 internal fn (from_string, archived_rollout_path, set_old_mtime, write_rollout); 6 external calls (new, from_u128, assert!, create_dir_all, write, run).
 
@@ -2761,11 +2799,11 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()>
 fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies the lock-file lifecycle of `CompressionRunMarker`: dropped unpersisted markers remove their file, while persisted markers leave it behind and block new claims. This documents the worker's lock semantics.
+**Purpose**: This test checks the lifecycle of the compression worker's run marker. A marker should disappear automatically unless the code explicitly chooses to keep it.
 
-**Data flow**: Creates a temp home and marker path, claims a marker inside a scope and lets it drop, asserts the marker file is gone, then claims again, persists the marker, asserts the file exists, and asserts a subsequent `try_claim` returns `None`.
+**Data flow**: It first claims a marker inside a short scope and lets it drop; the marker file should be removed. It then claims another marker, calls `persist`, and confirms the marker remains on disk and prevents a later claim.
 
-**Call relations**: Directly tests `CompressionRunMarker::try_claim`, `Drop`, and `persist` without running the full worker.
+**Call relations**: The test directly exercises `worker::CompressionRunMarker::try_claim` and the marker's `persist` behavior. This supports the worker tests by proving the small locking-and-throttling object cleans up correctly.
 
 *Call graph*: 4 external calls (new, assert!, panic!, try_claim).
 
@@ -2776,11 +2814,11 @@ fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()>
 async fn find_thread_path_by_id_handles_compressed_rollout_filenames() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that thread-id lookup can resolve a rollout whose physical file is compressed and whose UUID appears only in the compressed filename. It also verifies invalid UUID strings return `None`.
+**Purpose**: This test confirms that looking up a thread by id can find a compressed rollout file. It also checks that invalid ids do not accidentally match anything.
 
-**Data flow**: Writes and compresses a rollout, computes the compressed path, calls `crate::find_thread_path_by_id_str(home.path(), &uuid.to_string(), None).await` and asserts it returns `Some(compressed_path)`, then calls the same function with `"not-a-uuid"` and asserts `None`.
+**Data flow**: It writes and compresses a rollout whose filename contains a known UUID. A lookup by that UUID string should return the compressed path. A lookup using a non-UUID string should return no path.
 
-**Call relations**: Exercises the filename-based lookup path in listing/discovery code against compressed rollout names.
+**Call relations**: The test sets up the file with `rollout_path`, `write_rollout`, and `compress_now`, then calls `find_thread_path_by_id_str`. It verifies that the thread lookup code understands `.jsonl.zst` rollout names.
 
 *Call graph*: calls 4 internal fn (from_string, compress_now, rollout_path, write_rollout); 3 external calls (new, from_u128, assert_eq!).
 
@@ -2791,11 +2829,11 @@ async fn find_thread_path_by_id_handles_compressed_rollout_filenames() -> anyhow
 async fn find_thread_path_by_id_ignores_compression_temp_matches() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that compression temp filenames containing a valid UUID are not mistaken for real rollout files during thread-id lookup. This prevents transient temp artifacts from polluting discovery.
+**Purpose**: This test makes sure thread lookup ignores temporary files created during compression. A half-finished temp file should never be treated as a real session transcript.
 
-**Data flow**: Creates a temp file whose name looks like `rollout-...jsonl.zst.compress...tmp`, writes rollout contents into it, then calls `crate::find_thread_path_by_id_str` with the embedded UUID and asserts the result is `None`.
+**Data flow**: It builds a filename that looks like a rollout for a known UUID but ends with a compression temporary suffix, writes sample rollout content there, and searches by the UUID. The lookup should return nothing.
 
-**Call relations**: Targets the filename validation and `RolloutFile::from_path` filtering used by id lookup.
+**Call relations**: The test uses `rollout_path` only as a base for making a realistic temporary filename, then writes content with `write_rollout`. It calls `find_thread_path_by_id_str` to confirm discovery filters out compression work files.
 
 *Call graph*: calls 3 internal fn (from_string, rollout_path, write_rollout); 4 external calls (new, from_u128, assert_eq!, format!).
 
@@ -2806,11 +2844,11 @@ async fn find_thread_path_by_id_ignores_compression_temp_matches() -> anyhow::Re
 fn rollout_path(home: &std::path::Path, ts: &str, uuid: Uuid) -> std::path::PathBuf
 ```
 
-**Purpose**: Builds a standard active-session rollout path under `sessions/YYYY/MM/DD`. It gives tests deterministic filenames that encode timestamp and UUID.
+**Purpose**: This helper builds the normal active-session rollout path used by the tests. It keeps the test filenames consistent with the real directory shape.
 
-**Data flow**: Accepts a home path, timestamp string, and `Uuid`, then joins `sessions/2025/01/03` and formats `rollout-{ts}-{uuid}.jsonl`.
+**Data flow**: It receives a temporary home directory, a timestamp string, and a UUID. It combines them into a path under `sessions/2025/01/03` with a filename like `rollout-<timestamp>-<uuid>.jsonl`.
 
-**Call relations**: Used throughout the test module to create active rollout paths for writing, compression, and lookup assertions.
+**Call relations**: Many tests call this helper before writing, compressing, appending, loading, searching, or looking up an active rollout. It is the common path factory for non-archived test transcripts.
 
 *Call graph*: called by 10 (append_materialization_preserves_compressed_rollout_permissions, append_rollout_item_materializes_compressed_rollout, find_thread_path_by_id_handles_compressed_rollout_filenames, find_thread_path_by_id_ignores_compression_temp_matches, load_rollout_items_reads_compressed_rollout, resume_materializes_compressed_rollout_path, rollout_file_from_path_hides_compressed_sibling_when_plain_exists, rollout_file_from_path_normalizes_compressed_file_names, search_rollout_matches_uses_logical_path_for_compressed_rollout, worker_compresses_old_active_and_archived_rollouts); 2 external calls (join, format!).
 
@@ -2821,11 +2859,11 @@ fn rollout_path(home: &std::path::Path, ts: &str, uuid: Uuid) -> std::path::Path
 fn archived_rollout_path(home: &std::path::Path, ts: &str, uuid: Uuid) -> std::path::PathBuf
 ```
 
-**Purpose**: Builds a standard archived rollout path under `archived_sessions`. It mirrors `rollout_path` for archived-file tests.
+**Purpose**: This helper builds the archived-session rollout path used by tests. It lets tests create files in the location where older saved sessions are expected to live.
 
-**Data flow**: Accepts a home path, timestamp string, and `Uuid`, then joins `archived_sessions` and formats `rollout-{ts}-{uuid}.jsonl`.
+**Data flow**: It receives a temporary home directory, timestamp string, and UUID. It returns a path under `archived_sessions` with the standard rollout filename ending in `.jsonl`.
 
-**Call relations**: Used by tests that specifically exercise archived rollout compression and lookup behavior.
+**Call relations**: Worker and permission tests call this helper when they need archived rollouts. Those tests then pass the path to `write_rollout`, `set_old_mtime`, compression code, or the worker.
 
 *Call graph*: called by 5 (compression_preserves_read_only_rollout_permissions, compression_preserves_rollout_permissions, worker_compresses_old_active_and_archived_rollouts, worker_skips_existing_compressed_archived_rollouts, worker_skips_when_fresh_run_marker_exists); 2 external calls (join, format!).
 
@@ -2836,11 +2874,11 @@ fn archived_rollout_path(home: &std::path::Path, ts: &str, uuid: Uuid) -> std::p
 fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes a minimal valid rollout transcript containing a `SessionMeta` line and one `UserMessage` line. It is the core fixture generator for compression tests.
+**Purpose**: This helper writes a small but realistic rollout transcript for tests. It creates the parent directory, writes session metadata, and writes one user message.
 
-**Data flow**: Accepts a target path, `ThreadId`, and message string. It creates parent directories, constructs a `SessionMetaLine` with fixed metadata and `SessionSource::Cli`, builds two `RolloutLine` values (session meta and user message), serializes them to JSON strings joined by newlines, writes the final JSONL text with a trailing newline, and returns `Ok(())`.
+**Data flow**: It receives a path, a thread id, and a message string. It builds two rollout lines: one describing the session and one containing the user message. It turns those lines into JSON Lines text, writes them to disk, and returns success or an error.
 
-**Call relations**: Used by nearly every test in the module to create realistic rollout files before compression, materialization, search, or lookup operations.
+**Call relations**: Most tests use this helper to create input files before exercising compression, loading, appending, searching, or lookup behavior. It provides valid rollout content so the production reader can parse the files normally.
 
 *Call graph*: called by 13 (append_materialization_preserves_compressed_rollout_permissions, append_rollout_item_materializes_compressed_rollout, compression_preserves_read_only_rollout_permissions, compression_preserves_rollout_permissions, find_thread_path_by_id_handles_compressed_rollout_filenames, find_thread_path_by_id_ignores_compression_temp_matches, load_rollout_items_reads_compressed_rollout, resume_materializes_compressed_rollout_path, rollout_file_from_path_hides_compressed_sibling_when_plain_exists, search_rollout_matches_uses_logical_path_for_compressed_rollout (+3 more)); 8 external calls (default, parent, format!, create_dir_all, write, UserMessage, EventMsg, SessionMeta).
 
@@ -2851,11 +2889,11 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
 fn compress_now(path: &std::path::Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Immediately compresses a rollout file into its `.zst` sibling for test setup. It is a simple synchronous helper that bypasses the worker.
+**Purpose**: This helper immediately compresses a rollout file for test setup. It simulates what the background compression worker would eventually do.
 
-**Data flow**: Accepts a rollout path, computes the compressed sibling path, opens the input file and output file, wraps the output in a zstd encoder at level 3, copies bytes from a buffered input reader into the encoder, finishes the encoder, removes the original plain file, and returns `Ok(())`.
+**Data flow**: It receives a plain rollout path, opens that file, creates the matching compressed path, copies the file contents through a Zstandard compressor, finishes the compressed output, and removes the original plain file.
 
-**Call relations**: Used by tests that need a compressed rollout without waiting for worker eligibility or orchestration.
+**Call relations**: Tests call this helper when they need to start from a compressed rollout without running the full worker. The production code under test then loads, appends to, searches, resumes, or locates the compressed file.
 
 *Call graph*: called by 7 (append_materialization_preserves_compressed_rollout_permissions, append_rollout_item_materializes_compressed_rollout, find_thread_path_by_id_handles_compressed_rollout_filenames, load_rollout_items_reads_compressed_rollout, resume_materializes_compressed_rollout_path, search_rollout_matches_uses_logical_path_for_compressed_rollout, worker_skips_existing_compressed_archived_rollouts); 6 external calls (create, open, remove_file, new, copy, new).
 
@@ -2866,22 +2904,26 @@ fn compress_now(path: &std::path::Path) -> anyhow::Result<()>
 fn set_old_mtime(path: &std::path::Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Ages a file by setting its modified time to more than eight days in the past. This makes it eligible for worker compression and stale-temp cleanup.
+**Purpose**: This helper makes a file look old by changing its modification time to about eight days ago. Tests use it because the compression worker only compresses files old enough to qualify.
 
-**Data flow**: Accepts a path, computes `old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60)`, builds `FileTimes::new().set_modified(old)`, opens the file for writing, applies the times with `set_times`, and returns `Ok(())`.
+**Data flow**: It receives a path, computes a timestamp eight days before the current time, opens the file for writing metadata, and sets the file's modified time to that old timestamp.
 
-**Call relations**: Used by worker tests to force files and temp artifacts into the 'cold' or 'stale' categories.
+**Call relations**: Worker and permission tests call this helper before running `worker::run`. It creates the age condition that tells the worker a rollout or temporary file is stale enough to compress or clean up.
 
 *Call graph*: called by 5 (compression_preserves_read_only_rollout_permissions, compression_preserves_rollout_permissions, worker_compresses_old_active_and_archived_rollouts, worker_skips_existing_compressed_archived_rollouts, worker_skips_when_fresh_run_marker_exists); 4 external calls (from_secs, new, now, new).
 
 
 ### `rollout/src/metadata_tests.rs`
 
-`test` · `test-time validation of extraction and backfill`
+`test` · `test run`
 
-This test module validates the concrete behaviors implemented in `metadata.rs` by constructing small rollout files on disk and comparing extracted or backfilled metadata against expected values. The extraction tests verify that `extract_metadata_from_rollout` prefers embedded `SessionMeta` over filename-derived reconstruction, replays rollout items into the builder, sets `updated_at` from file mtime, and returns the newest `memory_mode` when multiple `SessionMeta` lines appear. A dedicated fallback test covers the no-session-meta case by creating a rollout containing only a `Compacted` item and asserting that `builder_from_items` reconstructs `ThreadId`, creation time, and default `SessionSource` from the filename.
+A rollout file is a line-by-line JSON record of a Codex session. This test file creates tiny fake rollout files in temporary folders, then checks that the rollout metadata code reads them the way the rest of the system depends on. Without these tests, a change could silently break thread history: sessions might get the wrong creation time, lose Git information, skip files during backfill, or store messy working-directory paths.
 
-The backfill tests initialize a real `codex_state::StateRuntime` under a temp `codex_home`, write rollout files into `sessions`, and then run `backfill_sessions`. They verify resume-after-watermark behavior by pre-marking backfill running, checkpointing the first file, waiting for the lease to expire, and asserting only later files are imported and the final state is `BackfillStatus::Complete`. Other tests prove that backfill merges rollout git data with existing SQLite rows using the “prefer existing branch/title, fill missing fields” policy, and that cwd values are normalized through `normalize_cwd_for_state_db` before persistence. Helper writers centralize creation of minimal valid rollout JSONL files with configurable timestamps, cwd, and optional `GitInfo`.
+The tests cover two main jobs. First, they check metadata extraction from one rollout file. If the file contains a session metadata line, that line should be trusted. If it does not, the code should still recover basic facts from the filename, like the thread id and timestamp. The tests also check that the latest memory mode is returned when more than one metadata line appears.
+
+Second, they check backfilling. Backfilling means scanning old rollout files and inserting their thread records into the state database, like a librarian cataloging books that were already on the shelf. These tests confirm that backfill resumes after a saved checkpoint, marks itself complete, fills in missing Git fields from rollout data, keeps an existing Git branch if the database already has one, and normalizes the current working directory before saving.
+
+Two helper functions at the bottom write realistic one-line rollout files so each test can focus on the behavior being checked.
 
 #### Function details
 
@@ -2891,11 +2933,11 @@ The backfill tests initialize a real `codex_state::StateRuntime` under a temp `c
 async fn extract_metadata_from_rollout_uses_session_meta()
 ```
 
-**Purpose**: Verifies that extraction builds metadata from the embedded `SessionMetaLine`, replays the rollout item, and stamps `updated_at` from the file’s modification time. It checks the full extracted metadata object against a manually built expected value.
+**Purpose**: This test proves that when a rollout file contains an explicit session metadata record, the extractor uses that record as the source of truth. It also checks that the file modification time becomes the metadata update time and that no parse errors are reported.
 
-**Data flow**: Creates a temp rollout file containing one serialized `RolloutLine::SessionMeta`; calls `extract_metadata_from_rollout`; separately rebuilds expected metadata via `builder_from_session_meta`, `build`, and `apply_rollout_item`, then sets expected `updated_at` from `file_modified_time_utc`; asserts equality plus `memory_mode == None` and zero parse errors.
+**Data flow**: The test starts with a temporary folder, a new thread id, and a synthetic rollout filename. It writes one JSON line containing session metadata into that file. Then it asks the metadata extractor to read the file, builds the expected metadata from the same session record, applies the rollout item updates, adds the file's modification time, and compares expected versus actual output. The result should include matching metadata, no memory mode, and zero parse errors.
 
-**Call relations**: This test drives the main extraction path and indirectly exercises `builder_from_session_meta`, `extract_metadata_from_rollout`, and `file_modified_time_utc` under the simplest valid rollout shape.
+**Call relations**: The async test runner calls this test. Inside the test, temporary-file and JSON helpers create the input, then the rollout metadata extraction path is exercised. The result is checked against metadata built through the same builder path used by the production code, so this test ties together session metadata parsing, rollout item application, and timestamp handling.
 
 *Call graph*: calls 1 internal fn (from_string); 9 external calls (create, new_v4, default, assert_eq!, format!, SessionMeta, to_string, tempdir, writeln!).
 
@@ -2906,11 +2948,11 @@ async fn extract_metadata_from_rollout_uses_session_meta()
 async fn extract_metadata_from_rollout_returns_latest_memory_mode()
 ```
 
-**Purpose**: Checks that extraction reports the most recent `memory_mode` found in the rollout rather than the first one. The test uses two `SessionMeta` lines with different memory-mode values.
+**Purpose**: This test checks that if a rollout contains more than one session metadata line, the extractor reports the most recent memory mode it sees. This matters because session settings can change over time, and callers need the latest value.
 
-**Data flow**: Writes two serialized `RolloutLine::SessionMeta` entries to a temp file, where the second line sets `memory_mode` to `"polluted"`; runs `extract_metadata_from_rollout`; asserts that `outcome.memory_mode` resolves to the later value.
+**Data flow**: The test creates a rollout file with two JSON lines. The first line has no memory mode, while the second line has a memory mode value of "polluted" and a later timestamp. It runs metadata extraction on the file and inspects only the returned memory mode. The expected output is the later value, not the earlier empty value.
 
-**Call relations**: It targets the reverse scan inside `extract_metadata_from_rollout` that searches from the end of the item list for the newest `SessionMeta.memory_mode`.
+**Call relations**: The async test runner invokes this test as part of the metadata test suite. It builds its own rollout file directly, then hands that file to the extraction routine. The assertion confirms that extraction reads through the whole file and lets later session metadata update the separate memory-mode result.
 
 *Call graph*: calls 1 internal fn (from_string); 8 external calls (create, new_v4, default, assert_eq!, format!, tempdir, vec!, writeln!).
 
@@ -2921,11 +2963,11 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode()
 fn builder_from_items_falls_back_to_filename()
 ```
 
-**Purpose**: Confirms that when no `SessionMeta` item exists, metadata initialization falls back to parsing the rollout filename. The expected builder is reconstructed explicitly from the UUID and timestamp embedded in the filename.
+**Purpose**: This test verifies the fallback path used when a rollout file does not contain a session metadata line. In that case, the system should still recover the thread id and creation time from the rollout filename.
 
-**Data flow**: Creates a temp path named like a rollout file and an item list containing only `RolloutItem::Compacted`; calls `builder_from_items`; independently parses the timestamp string into `DateTime<Utc>` and constructs an expected `ThreadMetadataBuilder::new`; asserts the builders are equal.
+**Data flow**: The test creates a rollout-style path whose filename includes a timestamp and UUID. It supplies rollout items that do not contain session metadata. The builder function receives those items and the path, then should produce a thread metadata builder based on the filename. The test independently parses the same timestamp and UUID, builds the expected builder, and compares the two.
 
-**Call relations**: This test isolates the fallback branch in `builder_from_items`, proving that non-metadata rollouts remain indexable from filename structure alone.
+**Call relations**: The normal Rust test runner calls this synchronous test. It exercises the builder fallback directly, without going through file reading. This isolates the behavior that protects older or incomplete rollout files from becoming unusable.
 
 *Call graph*: calls 2 internal fn (from_string, new); 8 external calls (from_naive_utc_and_offset, parse_from_str, new_v4, default, assert_eq!, format!, tempdir, vec!).
 
@@ -2936,11 +2978,11 @@ fn builder_from_items_falls_back_to_filename()
 async fn backfill_sessions_resumes_from_watermark_and_marks_complete()
 ```
 
-**Purpose**: Verifies that backfill resumes strictly after the stored watermark and marks the backfill state complete when finished. It also checks lease expiration behavior by waiting longer than the test lease.
+**Purpose**: This test checks that session backfill can resume after a saved checkpoint, called a watermark, and then mark the backfill as complete. A watermark is like a bookmark in a long scan: files before it should not be processed again.
 
-**Data flow**: Writes two rollout files, initializes `StateRuntime`, computes the first file’s watermark, marks backfill running and checkpoints that watermark, sleeps past `BACKFILL_LEASE_SECONDS`, runs `backfill_sessions`, then queries both thread IDs and the final backfill state to assert only the second thread was imported and completion metadata was recorded.
+**Data flow**: The test creates two rollout files under a temporary Codex home directory. It initializes a state runtime, marks backfill as running, and saves a checkpoint pointing at the first file. After waiting long enough for the previous backfill lease to expire, it runs backfill. The expected result is that the first thread is still absent, the second thread is inserted, and the saved backfill state says the job is complete with the second file as the latest watermark.
 
-**Call relations**: This test exercises the lease-claim, watermark filtering, checkpointing, and completion branches of `backfill_sessions`/`backfill_sessions_with_lease`.
+**Call relations**: The async test runner calls this test. The test uses the local helper write_rollout_in_sessions to create realistic rollout inputs, then uses the state runtime and backfill functions together. It checks the full flow from checkpoint recovery, through scanning, to final persisted backfill status.
 
 *Call graph*: calls 3 internal fn (from_string, write_rollout_in_sessions, init); 6 external calls (new_v4, assert!, assert_eq!, from_secs, tempdir, sleep).
 
@@ -2951,11 +2993,11 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete()
 async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_fields()
 ```
 
-**Purpose**: Checks the merge policy used when backfill encounters an already-existing thread row with partial git metadata. Existing branch data should win, while missing SHA and origin URL should be filled from the rollout.
+**Purpose**: This test makes sure backfill merges Git information carefully when a thread already exists in the state database. It should fill missing Git fields from the rollout file, but not overwrite an existing branch stored in the database.
 
-**Data flow**: Writes a rollout with full `GitInfo`, extracts its metadata, mutates that metadata to remove SHA/origin and replace branch with a SQLite-only value, upserts it into the runtime, runs `backfill_sessions`, then reloads the thread and asserts SHA/origin came from the rollout while branch stayed as the preexisting DB value.
+**Data flow**: The test writes a rollout file containing a Git commit, branch, and repository URL. It extracts metadata from that rollout, deliberately removes the commit and repository URL, and changes the branch to a database-specific value. That partial record is inserted into the state database. After backfill runs, the stored thread should have the rollout commit and repository URL filled in, while keeping the original database branch.
 
-**Call relations**: It targets the `prefer_existing_git_info` logic invoked inside `backfill_sessions_with_lease` after fetching existing metadata from the runtime.
+**Call relations**: The async test runner invokes this test. It relies on write_rollout_in_sessions to create the file, uses extraction to create an initial realistic record, stores that record through the state runtime, then runs backfill. The final checks show how backfill cooperates with existing database data instead of blindly replacing it.
 
 *Call graph*: calls 4 internal fn (new, from_string, write_rollout_in_sessions, init); 3 external calls (new_v4, assert_eq!, tempdir).
 
@@ -2966,11 +3008,11 @@ async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_f
 async fn backfill_sessions_normalizes_cwd_before_upsert()
 ```
 
-**Purpose**: Ensures that backfill normalizes session cwd paths before storing them in the state DB. The test uses a cwd containing `.` to prove normalization occurs.
+**Purpose**: This test confirms that backfill cleans up the session working-directory path before saving it. Normalizing a path means turning equivalent forms, such as a directory ending in '.', into one consistent stored form.
 
-**Data flow**: Writes a rollout whose `SessionMeta.cwd` is `codex_home.join(".")`, initializes the runtime, runs `backfill_sessions`, fetches the stored thread, and asserts the persisted `cwd` equals `normalize_cwd_for_state_db(&session_cwd)` while the rollout path remains unchanged.
+**Data flow**: The test creates a rollout whose session current working directory is the Codex home path with an extra '.' component. It initializes the state runtime and runs backfill. Then it loads the saved thread and compares the stored rollout path and working directory. The rollout path should match the created file, and the working directory should match the normalized version of the input path.
 
-**Call relations**: This test covers the explicit cwd normalization step in `backfill_sessions_with_lease` before `upsert_thread`.
+**Call relations**: The async test runner calls this test. It uses write_rollout_in_sessions_with_cwd because this case needs a custom working directory. After backfill writes the thread into the state database, the test checks that the same path-normalization helper used by production code describes the stored result.
 
 *Call graph*: calls 3 internal fn (from_string, write_rollout_in_sessions_with_cwd, init); 3 external calls (new_v4, assert_eq!, tempdir).
 
@@ -2987,11 +3029,11 @@ fn write_rollout_in_sessions(
 ) -> PathBuf
 ```
 
-**Purpose**: Convenience helper that writes a minimal rollout file under the `sessions` directory using `codex_home` itself as the session cwd. It reduces duplication across backfill tests.
+**Purpose**: This helper writes a simple rollout file into a temporary sessions directory using the Codex home directory as the session working directory. Tests use it to avoid repeating the same setup code.
 
-**Data flow**: Accepts `codex_home`, filename timestamp, event timestamp, thread UUID, and optional `GitInfo`; forwards those values plus `codex_home.to_path_buf()` as cwd to `write_rollout_in_sessions_with_cwd`; returns the created rollout path.
+**Data flow**: The helper receives a Codex home path, a timestamp for the filename, a timestamp for the event inside the file, a thread UUID, and optional Git information. It passes those values along to the more flexible helper, using the Codex home itself as the current working directory. The output is the path of the rollout file that was created.
 
-**Call relations**: Used by tests that do not care about custom cwd values, notably the watermark-resume and git-preservation scenarios.
+**Call relations**: Backfill tests call this helper when they do not need a special working directory. It immediately hands off the real work to write_rollout_in_sessions_with_cwd, keeping the common case short and readable.
 
 *Call graph*: calls 1 internal fn (write_rollout_in_sessions_with_cwd); called by 2 (backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_fields, backfill_sessions_resumes_from_watermark_and_marks_complete); 1 external calls (to_path_buf).
 
@@ -3009,24 +3051,24 @@ fn write_rollout_in_sessions_with_cwd(
 ) -> PathBuf
 ```
 
-**Purpose**: Creates a one-line rollout JSONL file containing a `SessionMeta` item with configurable cwd and optional git metadata. It is the shared fixture builder for metadata/backfill tests.
+**Purpose**: This helper creates a realistic one-line rollout file for tests, with a chosen current working directory and optional Git information. It acts like a tiny factory for session log files.
 
-**Data flow**: Builds a `ThreadId` from the UUID, creates `sessions/`, constructs the rollout filename, fills a `SessionMeta` and `SessionMetaLine`, wraps them in `RolloutLine`, serializes to JSON, writes one line to disk, and returns the resulting `PathBuf`.
+**Data flow**: The helper receives the temporary Codex home, filename timestamp, event timestamp, thread UUID, working directory, and optional Git data. It creates a sessions folder, builds a rollout filename, constructs a session metadata object, wraps it in a rollout line, serializes that line as JSON, writes it to disk, and returns the new file path.
 
-**Call relations**: Called directly by the cwd-normalization test and indirectly by `write_rollout_in_sessions`; it supplies the on-disk inputs consumed by extraction and backfill code.
+**Call relations**: This is the lower-level test helper used directly by the working-directory normalization test and indirectly by write_rollout_in_sessions. The rollout files it creates become the input that metadata extraction and backfill read during the tests.
 
 *Call graph*: calls 1 internal fn (from_string); called by 2 (backfill_sessions_normalizes_cwd_before_upsert, write_rollout_in_sessions); 9 external calls (create, join, to_string, default, format!, SessionMeta, to_string, create_dir_all, writeln!).
 
 
 ### `rollout/src/session_index_tests.rs`
 
-`test` · `test-time validation of session index lookup semantics`
+`test` · `test run`
 
-This test module validates the sidecar `session_index.jsonl` logic independently of the main rollout recorder. Two helpers build fixtures: `write_index` writes a sequence of `SessionIndexEntry` values as JSONL, and `write_rollout_with_metadata` creates a minimal rollout file containing a `SessionMeta` line for a given `ThreadId`. The tests then exercise both low-level reverse scanning and higher-level name-to-rollout resolution.
+The session index is like a notebook that records conversation thread IDs, their human-readable names, and when each record was added. Because the notebook is append-only, the same thread or name can appear more than once. These tests check that lookups read the notebook from the back, so the most recent record wins.
 
-Several tests pin down the core invariant that append order, not `updated_at`, defines recency. `find_thread_id_by_name_prefers_latest_entry`, `find_thread_name_by_id_prefers_latest_entry`, and `scan_index_finds_latest_match_among_mixed_entries` all write multiple entries and assert that reverse scans return the last appended matching row. `scan_index_returns_none_when_entry_missing` confirms absent names and IDs produce `None` rather than errors.
+The file builds small temporary fake session folders instead of touching a real user’s data. The helper `write_index` writes index entries as one JSON object per line. The helper `write_rollout_with_metadata` writes a tiny rollout file, which is the saved conversation file, containing just enough metadata to prove a thread really exists.
 
-The more interesting async tests cover `find_thread_meta_by_name_str`. They show that the newest matching name entry is not enough by itself: if that thread never materialized a rollout, or its rollout file exists but is empty/partial, the lookup must continue to older matching entries until it finds a readable rollout header. Another test verifies rename semantics: once a thread has a newer entry with a different name, its older historical name must no longer count as current, so a search by the old name should resolve to another thread whose latest name still matches. Finally, `find_thread_names_by_ids_prefers_latest_entry` confirms the bulk forward scan returns the latest name per requested ID.
+The tests cover normal cases and awkward edge cases. They check that looking up a name returns the newest matching thread ID, that looking up an ID returns its latest name, and that missing lookups return nothing. They also check safer behavior: if the newest index entry points to a rollout file that does not exist, or to an empty partial file, the lookup should skip it and fall back to an older valid saved session. One test also protects rename behavior, so an old name does not keep matching a thread after that same thread has been renamed.
 
 #### Function details
 
@@ -3036,11 +3078,11 @@ The more interesting async tests cover `find_thread_meta_by_name_str`. They show
 fn write_index(path: &Path, lines: &[SessionIndexEntry]) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a complete `session_index.jsonl` fixture from an ordered slice of `SessionIndexEntry` values. It preserves append order exactly as provided.
+**Purpose**: This helper creates a fake session index file for the tests. It turns each `SessionIndexEntry` into a JSON line, matching the real index format closely enough for lookup code to read it.
 
-**Data flow**: Builds a `String`, serializes each entry to JSON, appends a newline after each, writes the final string to the target path, and returns the write result.
+**Data flow**: It receives a file path and a list of index entries. It builds one text string by converting each entry to JSON and adding a newline after it, then writes that text to disk. The result is either success or an input/output error if the file cannot be written.
 
-**Call relations**: Used by nearly every test in this module to seed the index file with controlled append histories.
+**Call relations**: Most tests call this after creating temporary thread IDs and names. It prepares the index file that the lookup functions under test will later scan, so each test can control exactly what history the lookup sees.
 
 *Call graph*: called by 8 (find_thread_id_by_name_prefers_latest_entry, find_thread_meta_by_name_str_ignores_historical_name_after_rename, find_thread_meta_by_name_str_skips_newest_entry_without_rollout, find_thread_meta_by_name_str_skips_partial_rollout, find_thread_name_by_id_prefers_latest_entry, find_thread_names_by_ids_prefers_latest_entry, scan_index_finds_latest_match_among_mixed_entries, scan_index_returns_none_when_entry_missing); 3 external calls (new, to_string, write).
 
@@ -3051,11 +3093,11 @@ fn write_index(path: &Path, lines: &[SessionIndexEntry]) -> std::io::Result<()>
 fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Result<()>
 ```
 
-**Purpose**: Creates a minimal rollout file containing one `SessionMeta` line for a given thread ID. It provides a readable rollout target for `find_thread_meta_by_name_str` tests.
+**Purpose**: This helper creates a minimal saved rollout file for a thread. A rollout file is the stored record of a session, and this helper writes just enough session metadata for the lookup code to recognize it as valid.
 
-**Data flow**: Constructs a `RolloutLine` wrapping `RolloutItem::SessionMeta(SessionMetaLine { ... })`, serializes it to JSON, appends a newline, writes it to the given path, and returns the I/O result.
+**Data flow**: It receives a path and a thread ID. It builds a `RolloutLine` containing `SessionMeta`, serializes that line to JSON, and writes it as a single newline-terminated line to the target file. The output is success or an input/output error.
 
-**Call relations**: Used by tests that need some indexed thread IDs to resolve to valid rollout headers.
+**Call relations**: The tests that check name-to-session lookup call this helper before writing the index. It gives the lookup code a real saved file to find, especially when comparing a valid older rollout against a newer missing or partial one.
 
 *Call graph*: called by 3 (find_thread_meta_by_name_str_ignores_historical_name_after_rename, find_thread_meta_by_name_str_skips_newest_entry_without_rollout, find_thread_meta_by_name_str_skips_partial_rollout); 4 external calls (format!, SessionMeta, to_string, write).
 
@@ -3066,11 +3108,11 @@ fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Res
 fn find_thread_id_by_name_prefers_latest_entry() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that reverse scanning by name returns the last appended matching entry. Two different thread IDs share the same name, and the newer one should win.
+**Purpose**: This test proves that when two index entries have the same thread name, the lookup returns the one that was appended last. In plain terms, the newest note in the notebook wins.
 
-**Data flow**: Creates a temp index with two `SessionIndexEntry` rows named `same`, calls `scan_index_from_end` with a predicate on `thread_name`, and asserts the returned entry ID is the second one.
+**Data flow**: It creates a temporary index with two different thread IDs using the same name. After writing those entries, it scans the index from the end for that name and checks that the returned ID is the second one. Nothing permanent is changed outside the temporary directory.
 
-**Call relations**: Directly exercises the low-level reverse-scan helper rather than the async public API.
+**Call relations**: It uses `write_index` to set up the fake index, then exercises the index-scanning behavior directly. The assertion confirms that callers relying on name lookup get the latest matching entry rather than the first historical one.
 
 *Call graph*: calls 2 internal fn (new, write_index); 3 external calls (new, assert_eq!, vec!).
 
@@ -3081,11 +3123,11 @@ fn find_thread_id_by_name_prefers_latest_entry() -> std::io::Result<()>
 async fn find_thread_meta_by_name_str_skips_newest_entry_without_rollout() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that a newer name entry without any materialized rollout does not shadow an older persisted session with the same name. Lookup should continue until it finds a readable rollout.
+**Purpose**: This test checks a safety rule: a newer name entry should not hide an older saved session if the newer thread has no rollout file. This matters because an index entry alone is not enough proof that a session can actually be resumed.
 
-**Data flow**: Writes one valid rollout for `saved_id`, writes index entries for `saved_id` and a newer `unsaved_id` with the same name, calls `find_thread_meta_by_name_str`, and asserts the result resolves to the saved rollout path and ID.
+**Data flow**: It creates two thread IDs with the same name. The older ID gets a real rollout file with metadata, while the newer ID is only placed in the index. The name lookup runs and should return the older rollout path and metadata, skipping the newer entry because its saved file is missing.
 
-**Call relations**: Exercises the candidate-streaming loop in `find_thread_meta_by_name_str`, especially its willingness to skip unresolved IDs.
+**Call relations**: It calls `write_rollout_with_metadata` to create the valid saved session and `write_index` to create the competing index entries. It then calls the higher-level name-to-metadata lookup and verifies that lookup falls back to the usable rollout.
 
 *Call graph*: calls 3 internal fn (new, write_index, write_rollout_with_metadata); 5 external calls (new, assert_eq!, format!, create_dir_all, vec!).
 
@@ -3096,11 +3138,11 @@ async fn find_thread_meta_by_name_str_skips_newest_entry_without_rollout() -> st
 async fn find_thread_meta_by_name_str_skips_partial_rollout() -> std::io::Result<()>
 ```
 
-**Purpose**: Ensures that a newer matching thread whose rollout file exists but is empty/partial is skipped in favor of an older thread with a readable header. This protects lookup from incomplete persisted state.
+**Purpose**: This test checks that an empty or incomplete rollout file is treated as unusable. It protects against crashes or interrupted writes leaving behind files that should not be chosen for resume.
 
-**Data flow**: Creates one valid rollout and one empty rollout file, writes index entries naming both threads identically with the partial one newer, calls `find_thread_meta_by_name_str`, and asserts the valid older rollout path is returned.
+**Data flow**: It creates an older valid rollout file and a newer empty rollout file, both referenced by same-name index entries. The lookup by name reads the index and tries to find usable metadata. The expected result is the older valid rollout path, not the newer partial file.
 
-**Call relations**: Targets the branch where rollout-path resolution succeeds but `read_session_meta_line` fails, so the search must continue.
+**Call relations**: It uses `write_rollout_with_metadata` for the good file, a direct file write for the empty partial file, and `write_index` for the lookup history. The test then checks that the higher-level metadata lookup skips invalid saved data.
 
 *Call graph*: calls 3 internal fn (new, write_index, write_rollout_with_metadata); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -3111,11 +3153,11 @@ async fn find_thread_meta_by_name_str_skips_partial_rollout() -> std::io::Result
 async fn find_thread_meta_by_name_str_ignores_historical_name_after_rename() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that historical names for a renamed thread are ignored once a newer entry for that same ID records a different current name. Searching by the old name should not return the renamed thread.
+**Purpose**: This test protects rename behavior. If a thread used to have a name but was later renamed, searching for the old name should not return that renamed thread.
 
-**Data flow**: Creates a valid rollout for `current_id`, writes index entries where `renamed_id` first had name `same` but later changed to `different`, while `current_id` currently has `same`, calls `find_thread_meta_by_name_str("same")`, and asserts the current thread’s rollout path is returned.
+**Data flow**: It writes three index entries: one thread once had the name being searched for, another current thread has that name, and then the first thread is renamed to a different name. Only the current thread has a valid rollout for the searched name. The lookup returns the current thread’s rollout, showing that the renamed thread’s old name is ignored.
 
-**Call relations**: Exercises the `seen`-ID suppression logic in `stream_thread_ids_from_end_by_name`.
+**Call relations**: It prepares the valid rollout with `write_rollout_with_metadata` and the name history with `write_index`. The higher-level lookup must combine index order with rename awareness so callers do not accidentally resume the wrong thread.
 
 *Call graph*: calls 3 internal fn (new, write_index, write_rollout_with_metadata); 5 external calls (new, assert_eq!, format!, create_dir_all, vec!).
 
@@ -3126,11 +3168,11 @@ async fn find_thread_meta_by_name_str_ignores_historical_name_after_rename() -> 
 fn find_thread_name_by_id_prefers_latest_entry() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that reverse scanning by thread ID returns the latest appended name for that ID. Older names should be ignored.
+**Purpose**: This test proves that looking up a thread ID returns its latest recorded name. That is important when a conversation has been renamed.
 
-**Data flow**: Writes two index entries for the same ID with names `first` and `second`, calls `scan_index_from_end_by_id`, and asserts the returned entry’s `thread_name` is `second`.
+**Data flow**: It creates one thread ID with two index entries: first name `first`, then name `second`. After writing the index, it scans by ID and checks that the returned name is `second`. The temporary index is the only file it writes.
 
-**Call relations**: Directly validates the ID-specialized reverse lookup helper.
+**Call relations**: It uses `write_index` to create the rename history, then calls the by-ID scanning path. The assertion confirms that features displaying a thread name will show the current name rather than an older one.
 
 *Call graph*: calls 2 internal fn (new, write_index); 3 external calls (new, assert_eq!, vec!).
 
@@ -3141,11 +3183,11 @@ fn find_thread_name_by_id_prefers_latest_entry() -> std::io::Result<()>
 fn scan_index_returns_none_when_entry_missing() -> std::io::Result<()>
 ```
 
-**Purpose**: Confirms that reverse scans cleanly return `None` when no matching name or ID exists. Missing lookups should not produce false positives or errors.
+**Purpose**: This test confirms that missing lookups return no result instead of inventing one or returning the wrong entry. It checks both missing name and missing ID cases.
 
-**Data flow**: Writes one index entry, calls `scan_index_from_end` with a missing-name predicate and `scan_index_from_end_by_id` with a fresh ID, and asserts both results are `None`.
+**Data flow**: It writes an index containing one known thread. It then searches for a different name and a different thread ID. Both searches should come back as `None`, meaning no matching entry was found.
 
-**Call relations**: Covers the no-match behavior of the reverse scanning helpers.
+**Call relations**: It sets up the single-entry index through `write_index`, then exercises the direct scan helpers. This gives the rest of the system a clear contract: absence is reported cleanly.
 
 *Call graph*: calls 2 internal fn (new, write_index); 3 external calls (new, assert_eq!, vec!).
 
@@ -3156,11 +3198,11 @@ fn scan_index_returns_none_when_entry_missing() -> std::io::Result<()>
 async fn find_thread_names_by_ids_prefers_latest_entry() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that the bulk forward scan returns the latest name for each requested thread ID. Later entries should overwrite earlier ones in the result map.
+**Purpose**: This test checks bulk lookup of names for several thread IDs. It makes sure each ID gets its own latest name, even when one of the IDs has been renamed.
 
-**Data flow**: Writes three index entries where one ID appears twice with different names, builds a `HashSet` of the two target IDs, calls `find_thread_names_by_ids`, and asserts the returned `HashMap` contains the latest name for the repeated ID and the only name for the other.
+**Data flow**: It writes an index where one thread ID appears twice with an older and newer name, and another ID appears once. It asks for names for both IDs as a set. The result should be a map from each ID to the correct latest name.
 
-**Call relations**: Exercises the async bulk lookup path used by rollout title filtering.
+**Call relations**: It uses `write_index` to create the test history, then calls the asynchronous multi-ID lookup. The assertion shows that batch callers get the same latest-entry behavior as single-ID lookup.
 
 *Call graph*: calls 2 internal fn (new, write_index); 5 external calls (new, new, new, assert_eq!, vec!).
 
@@ -3171,24 +3213,26 @@ async fn find_thread_names_by_ids_prefers_latest_entry() -> std::io::Result<()>
 fn scan_index_finds_latest_match_among_mixed_entries() -> std::io::Result<()>
 ```
 
-**Purpose**: Tests reverse scanning across mixed IDs and names, reinforcing that append order determines the latest match. It checks both name-based and ID-based lookups in one fixture.
+**Purpose**: This test checks that scanning from the end works even when the index contains a mix of matching and non-matching entries. It also documents that append order, not the timestamp text, decides what is latest.
 
-**Data flow**: Writes several index entries with interleaved target and non-target rows, calls `scan_index_from_end` for name `target` and `scan_index_from_end_by_id` for two IDs, and asserts each lookup returns the expected last appended matching entry.
+**Data flow**: It writes several entries: older and newer matches for a target name, another thread with the same name, and an unrelated final entry. It then scans by name and by two different IDs. Each scan should return the last appended entry that matches its own condition.
 
-**Call relations**: Provides broad coverage of the generic and ID-specific reverse scanners over a more realistic mixed-entry file.
+**Call relations**: It relies on `write_index` for the mixed fake index, then calls the direct scan helpers. The test anchors the basic rule used by higher-level lookups: walk backward through the file and stop at the first relevant entry.
 
 *Call graph*: calls 2 internal fn (new, write_index); 3 external calls (new, assert_eq!, vec!).
 
 
 ### `rollout/src/state_db_tests.rs`
 
-`test` · `test execution`
+`test` · `test suite`
 
-This test module targets the behavior implemented in `state_db.rs`, especially the pieces that are easy to regress because they sit between rollout files and SQLite state. The tests use `TempDir` and direct `codex_state::StateRuntime` initialization to create isolated databases, then invoke the internal helpers under realistic conditions.
+A rollout is a saved conversation log, written as one JSON object per line. The state database turns those logs into a faster, queryable record of threads and their metadata. This test file checks a few edge cases where that process could go wrong.
 
-`cursor_to_anchor_normalizes_timestamp_format` verifies that a parsed cursor with second precision is converted into a `codex_state::Anchor` timestamp normalized to whole seconds, matching the millisecond-based conversion logic in production. Two async tests cover startup backfill gating: one claims a backfill lease, completes it from a spawned task after a short delay, and confirms `try_init_with_roots_and_backfill_lease` waits and then succeeds; the other leaves the lease incomplete and asserts initialization times out instead of hanging forever.
+First, it verifies that cursor timestamps are normalized into the same time format the database expects. That matters because cursors are used like bookmarks; if two timestamp formats mean the same moment but compare differently, listing or resuming history could skip or duplicate entries.
 
-The reconciliation test writes a minimal JSONL rollout containing `SessionMeta` and a user message, extracts metadata, manually overwrites the persisted title in SQLite, then calls `reconcile_rollout` and confirms the explicit title remains while `first_user_message` still reflects the rollout contents. The local helper `write_rollout_with_user_message` constructs those JSONL files with concrete protocol types (`RolloutLine`, `RolloutItem`, `SessionMetaLine`, `EventMsg::UserMessage`) so the tests exercise the same parsing paths as real rollout files.
+Second, it tests startup backfill behavior. A backfill is the catch-up job that scans old rollout files and loads them into the state database. These tests make sure a second startup waits if another process is already doing that work, but does not wait forever if the first process gets stuck. An everyday analogy is two librarians updating the same catalog: the second should wait for the first to finish, but not stand there forever if the first walks away.
+
+Finally, it checks that reconciling a rollout does not overwrite a title the user or system explicitly set earlier. It may discover the first user message from the log, but it must not replace an already chosen title with an automatically inferred one.
 
 #### Function details
 
@@ -3198,11 +3242,11 @@ The reconciliation test writes a minimal JSONL rollout containing `SessionMeta` 
 fn cursor_to_anchor_normalizes_timestamp_format()
 ```
 
-**Purpose**: Verifies that `cursor_to_anchor` converts a parsed cursor timestamp into the expected normalized UTC `DateTime` without stray subsecond precision.
+**Purpose**: This test checks that a cursor timestamp written with dashes between the time parts is converted into the database's normal timestamp form. It protects code that uses cursors as stable bookmarks in chronological lists.
 
-**Data flow**: Builds a cursor string, parses it with `parse_cursor`, passes it into `cursor_to_anchor`, independently parses the same string into a `NaiveDateTime`, converts that to `DateTime<Utc>` with zero nanoseconds, and asserts equality with the anchor's `ts` field. It writes no external state.
+**Data flow**: It starts with the text timestamp `2026-01-27T12-34-56`. The test parses that text into a cursor, converts the cursor into an anchor, separately builds the expected UTC time value, and then compares the two. The expected outcome is that the anchor timestamp is the same moment, with nanoseconds cleared to zero.
 
-**Call relations**: This unit test directly exercises the timestamp-conversion helper in `state_db.rs`. It does not delegate beyond parsing and chrono conversion needed to build the expected value.
+**Call relations**: The test runner calls this function during the test suite. Inside it, the flow goes through `parse_cursor` and then the state code's cursor-to-anchor conversion; it also uses date parsing helpers to independently build the expected answer before comparing the result.
 
 *Call graph*: calls 1 internal fn (parse_cursor); 3 external calls (from_naive_utc_and_offset, parse_from_str, assert_eq!).
 
@@ -3213,11 +3257,11 @@ fn cursor_to_anchor_normalizes_timestamp_format()
 async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that initialization waits for another actor's in-progress startup backfill to complete instead of failing immediately.
+**Purpose**: This asynchronous test checks that state database startup behaves politely when another startup has already claimed the backfill job. It should wait until that existing backfill finishes, then continue successfully.
 
-**Data flow**: Creates a temporary home directory and initializes a `StateRuntime`, claims a backfill lease, clones the runtime, and spawns a task that sleeps briefly then marks backfill complete. It then calls `try_init_with_roots_and_backfill_lease`, awaits the spawned completion task, reads the initialized runtime's backfill state, and asserts the status is `Complete`.
+**Data flow**: It creates a temporary home directory, initializes a state runtime there, and claims the backfill lease to simulate another process already doing the catch-up scan. A background task waits briefly and then marks the backfill complete. Meanwhile, the test calls the normal initialization path. The result should be an initialized runtime whose backfill status is complete.
 
-**Call relations**: This test drives the lease-aware startup path through `try_init_with_roots_and_backfill_lease`, which in turn exercises `wait_for_backfill_gate`'s polling and retry logic under concurrent completion.
+**Call relations**: The async test runner drives this function. It calls the state runtime initializer, uses a spawned background task with a short sleep to mimic a concurrent startup finishing its work, and then exercises the higher-level initialization path that must notice and wait for that completion.
 
 *Call graph*: calls 1 internal fn (init); 6 external calls (new, assert!, assert_eq!, from_millis, spawn, sleep).
 
@@ -3228,11 +3272,11 @@ async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()>
 async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures startup initialization eventually returns an error when a claimed backfill lease never completes.
+**Purpose**: This asynchronous test checks the failure case for startup backfill coordination. If another process has claimed the backfill job but never finishes, initialization must eventually give up instead of hanging forever.
 
-**Data flow**: Creates a temporary runtime, claims a backfill lease, then calls `try_init_with_roots_and_backfill_lease` without ever marking completion. It matches the result to extract the error, asserts success would be a panic, and checks the error string contains the timeout message.
+**Data flow**: It creates a temporary home directory, initializes the state runtime, and claims the backfill lease without ever marking it complete. Then it tries to initialize through the normal startup path. The expected output is an error, and the test checks that the error message says startup timed out waiting for the state database backfill.
 
-**Call relations**: This test covers the timeout branch of `wait_for_backfill_gate` via the same lease-aware initialization helper used in the success case.
+**Call relations**: The async test runner calls this test. It uses the same initialization path as real startup, but deliberately leaves the simulated backfill incomplete so the timeout branch is exercised. If initialization returned success, the test would panic because that would mean stuck startup work was not detected.
 
 *Call graph*: calls 1 internal fn (init); 3 external calls (new, assert!, panic!).
 
@@ -3243,11 +3287,11 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
 async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that full-file reconciliation updates metadata from rollout contents without overwriting a title that was explicitly set in SQLite.
+**Purpose**: This asynchronous test makes sure reconciling a rollout file does not overwrite a thread title that was already explicitly saved. It protects user-visible thread names from being replaced by an automatic title based on the first message.
 
-**Data flow**: Creates a temp home and thread id, writes a rollout file with a user message, initializes a runtime, extracts metadata from the rollout, asserts the extracted title and first user message, mutates the metadata title to `"math"`, upserts it, then calls `reconcile_rollout`. Finally it reloads the thread from SQLite and asserts the title stayed `"math"` while `first_user_message` remained `"Hey"`.
+**Data flow**: It creates a temporary rollout file containing session metadata and one user message, then extracts metadata from that file. The extracted title and first user message are initially both `Hey`. The test changes the title to `math`, saves that thread to the state database, and then runs reconciliation on the same rollout file. Afterward, it reads the thread back and expects the title to still be `math`, while the first user message remains `Hey`.
 
-**Call relations**: This test exercises the full extraction branch of `reconcile_rollout`, specifically the logic that calls `prefer_existing_explicit_title` before upserting rebuilt metadata.
+**Call relations**: The async test runner starts this scenario. The helper `write_rollout_with_user_message` builds the small rollout file used as input. The test then calls metadata extraction, state runtime initialization, thread upsert, and rollout reconciliation, finally reading the persisted thread to confirm reconciliation preserved the explicit title.
 
 *Call graph*: calls 4 internal fn (new, extract_metadata_from_rollout, write_rollout_with_user_message, init); 2 external calls (new, assert_eq!).
 
@@ -3262,24 +3306,22 @@ fn write_rollout_with_user_message(
 ) -> anyhow::Result<std::path::PathBuf>
 ```
 
-**Purpose**: Creates a minimal rollout JSONL file containing session metadata and one user message event for use in reconciliation tests.
+**Purpose**: This helper creates a tiny realistic rollout file for tests: one session metadata line followed by one user message line. It gives the reconciliation test an on-disk conversation log to read, instead of relying on mocked data.
 
-**Data flow**: Accepts a home path, thread id, and message text. It creates a dated `sessions/YYYY/MM/DD` directory, constructs a rollout filename embedding the timestamp and thread id, builds two `RolloutLine` values—one `RolloutItem::SessionMeta` with a populated `SessionMeta`, one `RolloutItem::EventMsg(EventMsg::UserMessage(...))`—serializes them to JSON lines, writes the file with a trailing newline, and returns the resulting `PathBuf`.
+**Data flow**: It receives a home directory, a thread id, and message text. It creates the expected dated `sessions/...` folder, builds a rollout filename that includes the timestamp and thread id, constructs two rollout records, serializes them as JSON lines, writes them to disk, and returns the path to the file it created.
 
-**Call relations**: This helper is called by `reconcile_rollout_preserves_existing_explicit_title` to generate realistic rollout input for metadata extraction and reconciliation.
+**Call relations**: This helper is called by `reconcile_rollout_preserves_existing_explicit_title` when that test needs a real rollout file. It hands back the file path, which the test then passes into metadata extraction and reconciliation so those parts read data in the same shape they would see in normal use.
 
 *Call graph*: called by 1 (reconcile_rollout_preserves_existing_explicit_title); 9 external calls (default, join, to_path_buf, format!, UserMessage, EventMsg, SessionMeta, create_dir_all, write).
 
 
 ### `rollout/src/recorder_tests.rs`
 
-`test` · `test-time validation of recorder, loader, and listing behavior`
+`test` · `test suite`
 
-This test module exercises the large orchestration surface in `recorder.rs`. It starts with helpers: `test_config` builds a minimal `RolloutConfig` rooted at a temp directory, and `write_session_file` creates simple rollout JSONL files under `sessions/YYYY/MM/DD` containing a `session_meta` line and a user event. The tests then cover several subsystems.
+A rollout is a saved log of a session, stored as a JSON Lines file, meaning one JSON record per line. This test file builds small fake session histories in temporary folders and checks that the recorder can read, write, list, and repair them correctly. It matters because users rely on these saved sessions to resume work, search past conversations, and see accurate thread lists. If this behavior broke, sessions could disappear from listings, stale database entries could point to missing files, or buffered conversation events could be lost.
 
-Writer-path tests verify deferred materialization and retry semantics. `recorder_materializes_on_flush_with_pending_items` proves that a newly created recorder does not create a file until buffered items are flushed, that session metadata is written before later items, and that `persist()` is idempotent after materialization. `persist_reports_filesystem_error_and_retries_buffered_items` blocks the `sessions` directory with a file to force a persist failure, then removes the blocker and confirms a later flush writes the originally buffered item. `writer_state_retries_write_error_before_reporting_flush_success` injects a read-only file handle into `RolloutWriterState` and confirms the reopen-and-retry path succeeds.
-
-Loader tests pin down legacy compatibility: ghost-snapshot response items are skipped entirely, ghost snapshots inside compaction replacement history are pruned, and legacy guardian-assessment events are preserved. Listing tests compare DB-only and scan-and-repair modes, showing that filesystem scans repair stale rollout paths, drop missing ones, override stale cwd/title filter matches, and overlay richer git metadata from SQLite onto filesystem results. The final resume test confirms cwd matching prefers the latest `TurnContext.cwd` over stale cached cwd metadata.
+The tests cover two storage views working together: the rollout files on disk and a state database, which is a faster index of session metadata. Some tests check that startup backfills the database from existing files before reporting ready. Others check that listing sessions still works when the database is off, or that stale database paths are repaired or removed when files disagree. The file also tests compatibility with older rollout records, such as legacy “ghost snapshot” entries that should be ignored, while preserving older guardian assessment records. Several tests focus on write safety: the recorder may delay creating a file until there is something real to save, and it must retry cleanly after file-system errors. Overall, this is a safety net for session history durability and discoverability.
 
 #### Function details
 
@@ -3289,11 +3331,11 @@ Loader tests pin down legacy compatibility: ghost-snapshot response items are sk
 fn test_config(codex_home: &Path) -> RolloutConfig
 ```
 
-**Purpose**: Builds a minimal `RolloutConfig` rooted at a temporary codex home for recorder/listing tests. It keeps cwd and sqlite home aligned with the temp directory and enables memories.
+**Purpose**: Builds a small test-only rollout configuration rooted in a temporary folder. Tests use it so they can exercise real file and database code without touching a user's real home directory.
 
-**Data flow**: Takes `codex_home: &Path`, clones it into `codex_home`, `sqlite_home`, and `cwd`, sets `model_provider_id` to `"test-provider"` and `generate_memories` to `true`, and returns the config struct.
+**Data flow**: It receives a path for the fake Codex home directory. It copies that path into the configuration fields for session storage, SQLite storage, and current working directory, adds a fixed test model provider name, and returns the completed RolloutConfig.
 
-**Call relations**: Used by most tests in this module as the shared configuration fixture for recorder creation and state DB initialization.
+**Call relations**: Many tests call this helper before creating a RolloutRecorder or listing threads. It supplies the shared setup needed by database backfill, pagination, stale-path repair, filtering, and write-retry tests.
 
 *Call graph*: called by 10 (list_threads_db_disabled_does_not_skip_paginated_items, list_threads_db_enabled_drops_missing_rollout_paths, list_threads_db_enabled_repairs_stale_rollout_paths, list_threads_default_filter_returns_filesystem_scan_results, list_threads_metadata_filter_overlays_state_db_list_metadata, list_threads_search_repairs_stale_state_db_hits_before_returning, list_threads_state_db_only_skips_jsonl_repair_scan, persist_reports_filesystem_error_and_retries_buffered_items, recorder_materializes_on_flush_with_pending_items, state_db_init_backfills_before_returning); 1 external calls (to_path_buf).
 
@@ -3304,11 +3346,11 @@ fn test_config(codex_home: &Path) -> RolloutConfig
 fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<PathBuf>
 ```
 
-**Purpose**: Creates a simple rollout JSONL file under the dated `sessions` tree with a session-meta line and one user event. It is the common on-disk fixture for listing and resume tests.
+**Purpose**: Creates a minimal fake rollout file on disk for tests that need an existing saved session. It writes just enough data for the recorder to recognize a session and its first user message.
 
-**Data flow**: Builds `sessions/2025/01/03`, creates the directory, constructs a rollout filename from the provided timestamp and UUID, writes one JSON object representing `session_meta` and one representing a `user_message`, and returns the created path.
+**Data flow**: It receives a root folder, timestamp text, and UUID. It creates the expected dated sessions directory, writes a JSON Lines file containing a session metadata record and a user message record, and returns the file path it created.
 
-**Call relations**: Used by listing tests and the cwd-resume test to seed realistic filesystem rollouts.
+**Call relations**: Thread-listing and resume tests call this helper to seed the file system with known sessions. Those tests then ask the recorder or resume-matching logic to find, repair, filter, or inspect the file.
 
 *Call graph*: called by 6 (list_threads_db_disabled_does_not_skip_paginated_items, list_threads_db_enabled_repairs_stale_rollout_paths, list_threads_default_filter_returns_filesystem_scan_results, list_threads_metadata_filter_overlays_state_db_list_metadata, list_threads_search_repairs_stale_state_db_hits_before_returning, resume_candidate_matches_cwd_reads_latest_turn_context); 6 external calls (create, join, format!, create_dir_all, json!, writeln!).
 
@@ -3319,11 +3361,11 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
 async fn state_db_init_backfills_before_returning() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that state DB initialization performs rollout backfill synchronously enough that newly written sessions are queryable before `init` returns. It also checks that backfill state is marked complete.
+**Purpose**: Checks that state database initialization does not finish until existing rollout files have been indexed. This protects callers from seeing an empty database immediately after startup when session files already exist.
 
-**Data flow**: Writes a rollout file with `SessionMeta` and a user event under a temp home, initializes the state DB via `crate::state_db::init(&test_config(...))`, fetches the thread metadata by ID, and asserts the rollout path matches and backfill status is `Complete`.
+**Data flow**: The test creates a temporary rollout file with session metadata and a user message, then calls the state database initialization using a test config. It reads the thread metadata back from the database and verifies that the rollout path is present and the backfill status is complete.
 
-**Call relations**: This test spans `state_db::init`, metadata extraction, and backfill orchestration to prove startup gating behavior.
+**Call relations**: The Rust async test runner invokes this test. Inside it, the test builds a thread id, uses test_config, calls crate::state_db::init, and then queries the returned runtime to confirm the startup backfill happened before control returned.
 
 *Call graph*: calls 3 internal fn (from_string, test_config, init); 11 external calls (default, new, new_v4, new, assert_eq!, format!, create_dir_all, write, UserMessage, EventMsg (+1 more)).
 
@@ -3334,11 +3376,11 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()>
 async fn load_rollout_items_skips_legacy_ghost_snapshot_lines() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that `RolloutRecorder::load_rollout_items` drops legacy `ghost_snapshot` response-item lines while preserving surrounding valid items. The resulting item list should contain only session metadata and the normal message.
+**Purpose**: Verifies that old rollout files containing legacy ghost snapshot response items can still be loaded. The important behavior is that those obsolete entries are silently skipped rather than causing a parse failure.
 
-**Data flow**: Writes a rollout file containing `session_meta`, a legacy `ghost_snapshot` response item, and a normal assistant message; loads items with `RolloutRecorder::load_rollout_items`; asserts thread ID extraction, zero parse errors, item count of two, and expected item variants.
+**Data flow**: The test writes a rollout file with session metadata, a legacy ghost snapshot response item, and a normal assistant message. It then loads the file and checks that the thread id was found, there were no parse errors, and only the metadata plus normal message remain.
 
-**Call relations**: Targets the raw-JSON cleanup path through `strip_legacy_ghost_snapshot_rollout_line` inside the loader.
+**Call relations**: The test runner calls this test, which directly exercises RolloutRecorder::load_rollout_items. It creates the file by hand so the loader is tested against the old JSON shape exactly.
 
 *Call graph*: calls 2 internal fn (new, load_rollout_items); 5 external calls (create, new, assert!, assert_eq!, writeln!).
 
@@ -3349,11 +3391,11 @@ async fn load_rollout_items_skips_legacy_ghost_snapshot_lines() -> std::io::Resu
 async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std::io::Result<()>
 ```
 
-**Purpose**: Ensures that legacy guardian-assessment event lines still deserialize and survive loading. This guards against over-aggressive legacy filtering.
+**Purpose**: Checks that another older record type, guardian assessment events, is still accepted and preserved. This prevents backward compatibility code from being too aggressive and deleting useful historical data.
 
-**Data flow**: Writes a rollout file with `session_meta` and an `event_msg` payload of type `guardian_assessment`; loads items; asserts thread ID, zero parse errors, item count, and concrete guardian-assessment fields such as `id`, `turn_id`, and defaulted `started_at_ms`.
+**Data flow**: The test writes session metadata and a guardian assessment event in the old JSON format. It loads the rollout, confirms there are no parse errors, then inspects the second item to make sure the assessment id and turn id survived and missing newer timing data defaults safely.
 
-**Call relations**: Exercises the normal deserialization path in `load_rollout_items` for a legacy-but-supported event variant.
+**Call relations**: The async test runner invokes it. It calls RolloutRecorder::load_rollout_items and focuses on the loader's legacy-event conversion path.
 
 *Call graph*: calls 2 internal fn (new, load_rollout_items); 5 external calls (create, new, assert_eq!, panic!, writeln!).
 
@@ -3364,11 +3406,11 @@ async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std:
 async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_history() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that ghost snapshots embedded inside a compacted item’s `replacement_history` are removed rather than causing the whole compacted line to be dropped. The remaining replacement history should keep valid items.
+**Purpose**: Makes sure legacy ghost snapshot records are removed even when they are buried inside a compacted history record. Compaction means older conversation history has been summarized, with a replacement list kept for context.
 
-**Data flow**: Writes a rollout file with `session_meta` and a `compacted` payload whose replacement history contains one normal message and one ghost snapshot; loads items; asserts the compacted item remains and its replacement history length is one with the message variant preserved.
+**Data flow**: The test writes a rollout containing session metadata and a compacted record whose replacement history includes one normal assistant message and one obsolete ghost snapshot. After loading, it checks that the compacted item remains but its replacement history contains only the valid assistant message.
 
-**Call relations**: Targets the in-place pruning branch of `strip_legacy_ghost_snapshot_rollout_line`.
+**Call relations**: The test runner calls this test, which exercises RolloutRecorder::load_rollout_items. It complements the top-level ghost snapshot test by covering nested history cleanup.
 
 *Call graph*: calls 2 internal fn (new, load_rollout_items); 6 external calls (create, new, assert!, assert_eq!, panic!, writeln!).
 
@@ -3379,11 +3421,11 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()>
 ```
 
-**Purpose**: Proves that a new recorder stays deferred until there are pending items and a flush occurs, then writes session metadata and buffered items in order. It also checks that repeated `persist()` calls are harmless after materialization.
+**Purpose**: Checks that a recorder can delay creating its rollout file until there is real content to write, then create it during flush. It also verifies that buffered events keep their order and that persisting twice is safe.
 
-**Data flow**: Creates a recorder in `Create` mode, confirms the rollout path does not exist, queues an agent-message event, flushes and asserts the file now exists, queues a user-message event, flushes again, calls `persist()` twice, reads the file text, and asserts session metadata is present, buffered-event ordering is preserved, and the second persist does not change file contents.
+**Data flow**: The test creates a recorder in a temporary home and confirms the target file does not yet exist. It records an agent event, flushes, records a user event, flushes again, calls persist twice, then reads the file to verify metadata exists, messages are in the expected order, and the second persist did not change the file.
 
-**Call relations**: Exercises `RolloutRecorder::new`, `record_canonical_items`, `flush`, `persist`, and `shutdown`, plus the deferred writer-state path.
+**Call relations**: The async test runner invokes it. It uses test_config, constructs RolloutRecorderParams and RolloutRecorder, then calls record_canonical_items, flush, persist, and shutdown to test the writer's normal lifecycle.
 
 *Call graph*: calls 5 internal fn (default, new, new, new, test_config); 9 external calls (default, new, new, assert!, assert_eq!, AgentMessage, UserMessage, EventMsg, read_to_string).
 
@@ -3394,11 +3436,11 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
 async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that a persist failure caused by an invalid filesystem state reports an error without losing buffered items, and that a later flush retries successfully. It validates the writer’s recovery semantics across barriers.
+**Purpose**: Ensures that a failed attempt to create the rollout file reports a real file-system error and does not lose pending conversation items. This is important when directories are temporarily blocked or unavailable.
 
-**Data flow**: Creates a deferred recorder, queues one agent-message item, creates a file at `sessions` to block directory creation, calls `persist()` and expects an error, removes the blocker, calls `flush()`, reads the rollout file, and asserts the originally buffered message was eventually written.
+**Data flow**: The test records an event, then deliberately creates a file where the sessions directory should be, making persistence fail. After confirming the rollout file was not created, it removes the blocker, flushes again, and checks that the originally buffered event was written.
 
-**Call relations**: Targets `RolloutWriterState::write_pending_with_recovery` and deferred materialization failure handling through the public recorder API.
+**Call relations**: The test runner calls it. It uses test_config and RolloutRecorder to drive the same persist and flush path the application uses, but injects a file-system obstacle between recording and persistence.
 
 *Call graph*: calls 5 internal fn (default, new, new, new, test_config); 9 external calls (create, new, new, assert!, assert_ne!, remove_file, AgentMessage, EventMsg, read_to_string).
 
@@ -3409,11 +3451,11 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
 async fn writer_state_retries_write_error_before_reporting_flush_success() -> std::io::Result<()>
 ```
 
-**Purpose**: Directly verifies that `RolloutWriterState::flush` retries after a write error by reopening the file and then succeeds. It bypasses the recorder task to isolate state-level recovery logic.
+**Purpose**: Tests the lower-level writer state's recovery from a write failure. It proves flush can reopen the rollout file and write queued items before claiming success.
 
-**Data flow**: Creates a real file, opens it read-only, constructs `RolloutWriterState` with that unusable writer, queues one agent-message item, calls `flush()`, then reads the file and asserts the queued message appears after the retry path reopened the file correctly.
+**Data flow**: The test creates a rollout path, opens it read-only, and gives that unsuitable file handle to RolloutWriterState. It queues an event, calls flush, then reads the file and checks that the queued message was written after the retry.
 
-**Call relations**: Exercises `RolloutWriterState::new`, `add_items`, and `flush` without involving channels or the spawned task.
+**Call relations**: The async test runner invokes it. Unlike the higher-level recorder tests, this one talks directly to RolloutWriterState::new, add_items, and flush to isolate write-retry behavior.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (create, new, assert!, new, read_to_string, from_std, vec!).
 
@@ -3424,11 +3466,11 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()>
 ```
 
-**Purpose**: Ensures pure-filesystem listing paginates correctly when the state DB is unavailable. The second page should return the next rollout rather than skipping over it.
+**Purpose**: Checks that listing sessions from files still paginates correctly when the state database is not used. Pagination means returning results in pages, like page 1 and page 2 of search results.
 
-**Data flow**: Writes three session files with descending timestamps, calls `RolloutRecorder::list_threads` with `state_db_ctx: None`, `page_size: 1`, and descending created-at sort to fetch page 1 and its cursor, then fetches page 2 with that cursor and asserts the expected middle path is returned.
+**Data flow**: The test writes three session files with known dates. It asks RolloutRecorder::list_threads for one newest item, saves the returned cursor, then asks for the next page and verifies it gets the middle item rather than skipping it.
 
-**Call relations**: Targets the filesystem fallback path in `list_threads_with_db_fallback`, especially `page_from_filesystem_scan` and cursor handling.
+**Call relations**: The test runner calls it. It uses test_config and write_session_file to create input data, then calls RolloutRecorder::list_threads with no state database context to exercise the file-system listing path.
 
 *Call graph*: calls 3 internal fn (list_threads, test_config, write_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3439,11 +3481,11 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that scan-and-repair listing removes stale SQLite rows whose rollout paths no longer exist on disk. The stale row should disappear from results and from the DB’s rollout-path lookup.
+**Purpose**: Verifies that a database entry pointing to a missing rollout file is not shown to the user. It also checks that the stale database pointer is removed.
 
-**Data flow**: Initializes a runtime, marks backfill complete, inserts thread metadata pointing at a nonexistent rollout path, calls `RolloutRecorder::list_threads`, asserts the returned page is empty, then queries `find_rollout_path_by_id` and asserts the stale path was cleared.
+**Data flow**: The test inserts thread metadata into the state database with a rollout path that does not exist on disk. It lists threads with the database enabled, expects no returned items, and then asks the database for that thread path to confirm it was cleared.
 
-**Call relations**: Exercises the DB-repair behavior in `list_threads_with_db_fallback` when filesystem scans find no corresponding rollout.
+**Call relations**: The async test runner invokes it. It uses test_config, initializes codex_state::StateRuntime, inserts metadata, and then calls RolloutRecorder::list_threads to trigger stale-path cleanup.
 
 *Call graph*: calls 5 internal fn (from_string, list_threads, test_config, new, init); 4 external calls (new, from_u128, assert_eq!, format!).
 
@@ -3454,11 +3496,11 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
 async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that scan-and-repair listing updates a stale SQLite rollout path to the real on-disk path when the thread ID matches an existing rollout. The repaired path should be returned and persisted.
+**Purpose**: Checks that if the database points to the wrong path but a real rollout file for the same thread exists, listing repairs the database instead of hiding the session. This keeps old or moved records usable.
 
-**Data flow**: Writes a real rollout file, inserts DB metadata for the same thread ID but with a stale path, runs `RolloutRecorder::list_threads`, asserts the page contains the real path, then checks `find_rollout_path_by_id` to confirm the DB row was repaired.
+**Data flow**: The test creates a real session file, inserts database metadata for the same thread id but with a fake stale path, and lists threads. It expects the returned item to use the real file path, then confirms the database now stores that repaired path.
 
-**Call relations**: Targets the lightweight path-repair branch in `list_threads_with_db_fallback`.
+**Call relations**: The test runner calls it. It combines write_session_file, a manually seeded StateRuntime entry, and RolloutRecorder::list_threads to test the repair bridge between disk and database.
 
 *Call graph*: calls 6 internal fn (from_string, list_threads, test_config, write_session_file, new, init); 4 external calls (new, from_u128, assert_eq!, format!).
 
@@ -3469,11 +3511,11 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
 async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result<()>
 ```
 
-**Purpose**: Shows the difference between DB-only listing and scan-and-repair listing: DB-only initially misses a rollout absent from SQLite, while the scan path repairs/imports it so later DB-only queries can see it. This proves the repair scan is not implicit in the DB-only API.
+**Purpose**: Shows the difference between listing only from the state database and doing the full listing that can scan JSON Lines files. A database-only query should be fast and should not repair missing index entries by reading disk.
 
-**Data flow**: Initializes an empty runtime, writes a rollout file directly to disk, queries `list_threads_from_state_db` with a cwd filter and gets zero items, queries `list_threads` and gets one repaired item, then queries `list_threads_from_state_db` again and now gets one item.
+**Data flow**: The test creates a rollout file on disk but does not insert it into the database. A state-database-only listing returns no items. A normal listing then scans the file system and returns the item. After that repair, a database-only listing also returns it.
 
-**Call relations**: Exercises both public listing entry points and the reconciliation side effects of the scan-and-repair path.
+**Call relations**: The async test runner invokes it. It calls both RolloutRecorder::list_threads_from_state_db and RolloutRecorder::list_threads to prove that only the full listing path performs the JSONL repair scan.
 
 *Call graph*: calls 4 internal fn (list_threads, list_threads_from_state_db, test_config, init); 8 external calls (create, new, from_u128, assert_eq!, format!, create_dir_all, json!, writeln!).
 
@@ -3484,11 +3526,11 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
 async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that when metadata filters are applied, the scan-and-repair listing returns filesystem-validated results rather than stale SQLite matches. A stale cwd filter match in SQLite should be excluded after scanning the rollout file.
+**Purpose**: Checks that the default listing path trusts the current file contents over stale database metadata when filters are involved. This avoids showing a session under an old working-directory filter after the file tells a different story.
 
-**Data flow**: Writes a real rollout file, inserts DB metadata for the same thread with a stale cwd, queries `list_threads_from_state_db` with that cwd filter and sees one stale match, queries `list_threads` with the same filter and sees zero items, then re-queries DB-only and confirms the stale row has been repaired away.
+**Data flow**: The test writes a real session file, then inserts database metadata for it with a stale current working directory. A database-only listing with that stale directory filter finds the item. A normal listing scans the file and returns none for that stale filter, then the database-only result also becomes empty after repair.
 
-**Call relations**: Targets the metadata-filter branch in `list_threads_with_db_fallback` where filesystem results are authoritative and DB-only hits may be reconciled.
+**Call relations**: The test runner calls it. It uses write_session_file and StateRuntime setup, compares list_threads_from_state_db with list_threads, and confirms the full listing path repairs stale metadata.
 
 *Call graph*: calls 7 internal fn (from_string, list_threads, list_threads_from_state_db, test_config, write_session_file, new, init); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3499,11 +3541,11 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
 async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that metadata-filtered filesystem results are enriched with richer state-DB metadata, especially git fields. The returned `ThreadItem` should keep the filesystem path but expose SQLite git values.
+**Purpose**: Verifies that when a listed thread has extra metadata in the state database, that metadata is copied onto the item returned from listing. In this test, the important fields are Git details such as branch, commit hash, and origin URL.
 
-**Data flow**: Writes a rollout file, inserts matching DB metadata with git branch/SHA/origin values, calls `RolloutRecorder::list_threads` with a source filter, and asserts the returned item contains the expected git metadata from SQLite.
+**Data flow**: The test creates a session file and database metadata for the same thread, including Git fields. It lists threads filtered by session source and checks that the returned item includes the Git values from the database.
 
-**Call relations**: Exercises `fill_missing_thread_item_metadata_from_state_db` and `fill_missing_thread_item_metadata` through the metadata-filter listing path.
+**Call relations**: The async test runner invokes it. It uses write_session_file to provide the disk record, StateRuntime to store richer metadata, and RolloutRecorder::list_threads to verify the two sources are merged.
 
 *Call graph*: calls 6 internal fn (from_string, list_threads, test_config, write_session_file, new, init); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3514,11 +3556,11 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
 fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fields()
 ```
 
-**Purpose**: Unit-tests the field-level merge helper used to overlay state metadata onto filesystem items. It proves path/thread identity stay filesystem-derived while git fields prefer state values.
+**Purpose**: Tests the metadata merge rule for a listed thread item. The merge should not change the item's identity, but it should fill missing details and prefer fresher Git fields from the state database.
 
-**Data flow**: Constructs one filesystem `ThreadItem` and one state-style `ThreadItem` with differing path, thread ID, and metadata; calls `fill_missing_thread_item_metadata(&mut item, state_item)`; asserts path and thread ID remain unchanged, existing message/preview remain, missing fields are filled, and git fields are overwritten by state values.
+**Data flow**: The test builds one ThreadItem as if it came from the file system and another as if it came from the database. It calls fill_missing_thread_item_metadata, then checks that path, thread id, first user message, and preview stayed from the file-system item, while missing fields and Git values were filled from the database item.
 
-**Call relations**: Directly targets the merge semantics used by listing fallback enrichment.
+**Call relations**: This synchronous unit test is called by the test runner. It directly exercises fill_missing_thread_item_metadata, the helper used by thread-listing code when combining file-system and database views.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (from, assert_eq!).
 
@@ -3529,11 +3571,11 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
 async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that title-search listing reconciles stale SQLite hits before returning results. A stale DB title match should disappear after the scan-and-repair path runs.
+**Purpose**: Checks that search results from stale database metadata are verified against the actual rollout file before being returned. This prevents a search term from matching old indexed text that no longer appears in the real session summary.
 
-**Data flow**: Writes a rollout file, inserts DB metadata whose title/preview contains `needle` even though the rollout does not, queries `list_threads_from_state_db` with search term `needle` and sees one stale hit, queries `list_threads` with the same search and sees zero items, then re-queries DB-only and confirms the stale hit is gone.
+**Data flow**: The test creates a rollout file, then stores database metadata whose title contains the search word “needle.” A database-only search finds it. A normal listing with the same search scans and repairs the mismatch, returns no items, and afterward the database-only search also returns none.
 
-**Call relations**: Targets the search-specific reconciliation branch in `list_threads_with_db_fallback`, where full `reconcile_rollout` is used instead of lightweight path repair.
+**Call relations**: The async test runner invokes it. It compares RolloutRecorder::list_threads_from_state_db with RolloutRecorder::list_threads to show that the full listing path repairs stale search hits.
 
 *Call graph*: calls 7 internal fn (from_string, list_threads, list_threads_from_state_db, test_config, write_session_file, new, init); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3544,24 +3586,24 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
 async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that cwd-based resume matching prefers the latest `TurnContext.cwd` from the rollout over stale cached cwd metadata. This allows resumed sessions to follow cwd changes recorded during the conversation.
+**Purpose**: Verifies that resume matching uses the latest turn context in a rollout file, not only the older session metadata. A turn context is a saved snapshot of a conversation turn's working directory and execution settings.
 
-**Data flow**: Creates a rollout file with stale session cwd metadata, appends a serialized `RolloutLine::TurnContext` whose cwd is a different directory, calls `resume_candidate_matches_cwd` with the stale cached cwd and the latest cwd as target, and asserts the function returns true.
+**Data flow**: The test creates a session file, appends a later turn context with a newer current working directory, and then asks resume_candidate_matches_cwd whether the file matches that newer directory even when an older stale directory is provided. It expects the match to succeed.
 
-**Call relations**: Exercises the middle branch of `resume_candidate_matches_cwd`, where it loads rollout items and scans backward for the newest `TurnContext` before falling back to full metadata extraction.
+**Call relations**: The async test runner calls this test. It uses write_session_file for the base rollout, appends a RolloutLine::TurnContext record, and then calls resume_candidate_matches_cwd to check resume-selection behavior.
 
 *Call graph*: calls 1 internal fn (write_session_file); 8 external calls (new, from_u128, new_read_only_policy, assert!, create_dir_all, TurnContext, new, writeln!).
 
 
 ### `rollout/src/tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This large test module validates the rollout subsystem from the perspective of callers that list threads, read summaries, and resolve rollout paths. It mixes pure filesystem scenarios with DB-assisted ones to ensure the fallback logic behaves consistently.
+A rollout session is stored as a JSON-lines file: one JSON object per line, like a notebook where each page records one event. This test file creates small temporary versions of those notebooks and asks the real rollout listing and lookup code to read them. The tests protect important user-facing behavior: newest conversations appear first, pagination does not repeat items, filters for source and model provider work, previews come from the right message or goal, and updated times come from the file’s last modified time.
 
-Several helpers generate deterministic test data. `provider_vec` and `thread_id_from_uuid` normalize common inputs. `write_session_file`, `write_session_file_with_provider`, `write_goal_started_session_file`, `write_session_file_with_delayed_user_event`, and `write_session_file_with_meta_payload` create JSONL rollout files under `sessions/YYYY/MM/DD`, populate `SessionMeta` and event records, and set file mtimes so sorting code can be tested. `insert_state_db_thread` seeds a `codex_state::StateRuntime` with thread metadata, including archived state and preview fields, while `assert_state_db_rollout_path` reopens the DB to verify repairs persisted.
+The file also checks the relationship between the filesystem and the state database. The database can remember where a thread’s rollout file lives, but that memory can be stale or missing. These tests make sure lookup falls back to scanning files when needed and then repairs the database, like checking a shelf when the catalog card points to the wrong book.
 
-The tests cover stale or incorrect DB rollout paths being repaired after filesystem fallback, acceptance of non-canonical but existing DB paths, extraction of date components from rollout filenames, latest-first ordering, cursor pagination semantics, scanning past many metadata lines to find the first user event, using thread-goal objectives as previews, preserving later user messages, preserving or defaulting `base_instructions`, and using file mtime as `updated_at` for both created-at and updated-at sorts. They also document a known filesystem-only limitation: timestamp-only cursors cannot disambiguate multiple files created in the same second, unlike the SQLite path. Source filtering and model-provider filtering are tested explicitly, including the rule that sessions with no provider are included when the requested provider matches the default provider argument.
+Several helper functions write realistic session files with different shapes: normal sessions, goal-first sessions, delayed user messages, missing optional metadata, and custom model providers. That keeps the tests close to real data without depending on existing user files.
 
 #### Function details
 
@@ -3571,11 +3613,11 @@ The tests cover stale or incorrect DB rollout paths being repaired after filesys
 fn provider_vec(providers: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts a slice of provider string slices into owned `Vec<String>` values for test filter arguments.
+**Purpose**: This small helper turns a list of provider names into owned strings, in the exact shape expected by the thread-listing API. Tests use it so their provider filters are easy to read.
 
-**Data flow**: Reads `&[&str]`, maps each element through `ToString::to_string`, collects into `Vec<String>`, and returns it. It has no side effects.
+**Data flow**: It receives a slice of text references such as "openai" or "test-provider". It copies each name into a new String and returns them as a vector, leaving the original list unchanged.
 
-**Call relations**: Many listing tests call this helper before invoking `get_threads` so they can pass owned provider filters in the same shape production code expects.
+**Call relations**: Many listing tests call this just before calling get_threads, because get_threads expects provider filters as string values. It does not call any project logic; it simply prepares test input.
 
 *Call graph*: called by 13 (test_base_instructions_missing_in_meta_defaults_to_null, test_base_instructions_present_in_meta_is_preserved, test_created_at_sort_uses_file_mtime_for_updated_at, test_get_thread_contents, test_goal_first_thread_reads_later_user_message, test_list_conversations_latest_first, test_list_threads_scans_past_head_for_user_event, test_list_threads_uses_goal_objective_as_preview, test_model_provider_filter_selects_only_matching_sessions, test_pagination_cursor (+3 more)).
 
@@ -3586,11 +3628,11 @@ fn provider_vec(providers: &[&str]) -> Vec<String>
 fn thread_id_from_uuid(uuid: Uuid) -> ThreadId
 ```
 
-**Purpose**: Builds a `ThreadId` from a `Uuid` using the same string parsing path as production code.
+**Purpose**: This helper converts a UUID into the project’s ThreadId type. Tests use it when they need to compare a session file’s UUID with the thread identifier returned by rollout code.
 
-**Data flow**: Takes a `Uuid`, converts it to a string, parses it with `ThreadId::from_string`, and returns the resulting `ThreadId`, panicking if parsing fails.
+**Data flow**: It receives a UUID, turns it into normal UUID text, asks ThreadId to parse that text, and returns the resulting ThreadId. If parsing failed, the test would stop, because the UUID should always be valid.
 
-**Call relations**: This helper is used when tests need a protocol-level thread id, notably while constructing goal-update events in synthetic rollout files.
+**Call relations**: write_goal_started_session_file uses this when creating a fake goal update event. That lets the generated event carry the same thread identity that the listing code will later read.
 
 *Call graph*: calls 1 internal fn (from_string); called by 1 (write_goal_started_session_file); 1 external calls (to_string).
 
@@ -3606,11 +3648,11 @@ async fn insert_state_db_thread(
 ) -> crate::state_db::StateDbHandle
 ```
 
-**Purpose**: Seeds a temporary SQLite state DB with one thread metadata row pointing at a chosen rollout path.
+**Purpose**: This helper creates a state-database record for a fake thread. It is used to test what happens when the database knows about a thread, including cases where its stored rollout path is wrong.
 
-**Data flow**: Accepts a home path, thread id, rollout path, and archived flag. It initializes a `StateRuntime`, marks backfill complete, constructs a fixed `created_at` timestamp, builds a `ThreadMetadataBuilder` with source `SessionSource::Cli`, fills in provider and cwd, optionally sets `archived_at`, builds metadata, sets `first_user_message` and `preview`, upserts the thread, and returns the runtime handle.
+**Data flow**: It receives a temporary home directory, a thread id, a rollout file path, and an archived flag. It initializes the state database, marks its backfill as complete, builds thread metadata with a known provider and first user message, writes that metadata into the database, and returns the database runtime handle.
 
-**Call relations**: DB fallback tests call this helper to create stale, wrong, or custom-path metadata before invoking higher-level path lookup logic.
+**Call relations**: The thread-path lookup tests call this to set up the database before asking find_thread_path_by_id_str to locate a file. It hands back a runtime so those tests can exercise the database-first lookup path.
 
 *Call graph*: calls 2 internal fn (new, init); called by 3 (find_thread_path_accepts_existing_state_db_path_without_canonical_filename, find_thread_path_falls_back_when_db_path_is_stale, find_thread_path_falls_back_when_db_path_points_to_another_thread); 1 external calls (to_path_buf).
 
@@ -3621,11 +3663,11 @@ async fn insert_state_db_thread(
 async fn find_thread_path_falls_back_when_db_path_is_stale()
 ```
 
-**Purpose**: Tests that thread-path lookup ignores a nonexistent DB rollout path, finds the real file on disk, and repairs SQLite to point at it.
+**Purpose**: This test proves that lookup still finds a session file when the database points to a path that no longer exists. It also checks that the database is repaired afterward.
 
-**Data flow**: Creates a temp home, deterministic UUID/thread id, writes a real rollout file, constructs a stale future-dated DB path, inserts that stale path into SQLite with `insert_state_db_thread`, calls `find_thread_path_by_id_str`, asserts the returned path is the filesystem path, and then verifies the DB row was repaired with `assert_state_db_rollout_path`.
+**Data flow**: It creates a temporary home, writes a real session file, inserts a database row pointing to a fake future path, then asks for the thread path by id. The expected result is the real file path from disk, and the database should now store that corrected path.
 
-**Call relations**: This test exercises the DB-first then filesystem-fallback path lookup flow, including the read-repair behavior after a stale path is detected.
+**Call relations**: The test uses write_session_file and insert_state_db_thread to create the mismatch, calls find_thread_path_by_id_str as the behavior under test, and then calls assert_state_db_rollout_path to confirm the repair.
 
 *Call graph*: calls 4 internal fn (from_string, assert_state_db_rollout_path, insert_state_db_thread, write_session_file); 5 external calls (new, from_u128, assert_eq!, find_thread_path_by_id_str, format!).
 
@@ -3636,11 +3678,11 @@ async fn find_thread_path_falls_back_when_db_path_is_stale()
 async fn find_thread_path_falls_back_when_db_path_points_to_another_thread()
 ```
 
-**Purpose**: Tests that lookup rejects a DB path that exists but belongs to a different thread and repairs the DB using filesystem discovery.
+**Purpose**: This test checks a more dangerous stale-database case: the stored path exists, but belongs to a different thread. Lookup must not return the wrong person’s conversation.
 
-**Data flow**: Creates two rollout files for different UUIDs, inserts metadata for the first thread that incorrectly points at the second thread's file, calls `find_thread_path_by_id_str` for the first thread, asserts the correct filesystem path is returned, and confirms SQLite now stores that repaired path.
+**Data flow**: It writes one session file for the target thread and another for a different thread, then inserts a database row for the target that points at the other file. Lookup should reject that bad database path, scan the filesystem, return the correct target file, and update the database.
 
-**Call relations**: This covers a stricter fallback case than a missing file: the DB path exists but is semantically wrong. It validates that higher-level lookup does not trust the DB blindly.
+**Call relations**: The test sets up files with write_session_file, sets up the bad database row with insert_state_db_thread, calls find_thread_path_by_id_str, and verifies the database correction with assert_state_db_rollout_path.
 
 *Call graph*: calls 4 internal fn (from_string, assert_state_db_rollout_path, insert_state_db_thread, write_session_file); 5 external calls (new, from_u128, assert_eq!, find_thread_path_by_id_str, format!).
 
@@ -3651,11 +3693,11 @@ async fn find_thread_path_falls_back_when_db_path_points_to_another_thread()
 async fn find_thread_path_repairs_missing_db_row_after_filesystem_fallback()
 ```
 
-**Purpose**: Ensures filesystem fallback can repopulate SQLite when the DB exists but contains no metadata row for the requested thread.
+**Purpose**: This test makes sure a missing database record can be recreated from the rollout file on disk. That matters when old sessions exist before the database has learned about them.
 
-**Data flow**: Creates a rollout file and an otherwise empty initialized runtime with backfill marked complete, calls `find_thread_path_by_id_str`, asserts the filesystem path is found, and then checks that the DB now contains the repaired rollout path for the thread.
+**Data flow**: It writes a session file and initializes an empty state database whose backfill is marked complete. When lookup by id runs, it should scan files, find the matching rollout, return its path, and insert the missing path into the database.
 
-**Call relations**: This test drives the slow-path repair behavior where lookup starts with a valid DB handle but no matching row, forcing metadata reconstruction from the rollout file.
+**Call relations**: This test directly initializes the state runtime, calls find_thread_path_by_id_str to exercise fallback scanning, and then uses assert_state_db_rollout_path to prove the fallback also repaired state.
 
 *Call graph*: calls 4 internal fn (from_string, assert_state_db_rollout_path, write_session_file, init); 5 external calls (new, from_u128, assert_eq!, find_thread_path_by_id_str, format!).
 
@@ -3666,11 +3708,11 @@ async fn find_thread_path_repairs_missing_db_row_after_filesystem_fallback()
 async fn find_thread_path_accepts_existing_state_db_path_without_canonical_filename()
 ```
 
-**Purpose**: Verifies that an existing rollout path stored in SQLite is accepted even if its filename does not follow the canonical `rollout-...` naming pattern.
+**Purpose**: This test confirms that a valid database path is accepted even if the file name does not follow the normal rollout naming pattern. The database is allowed to be the source of truth when its file exists and matches the thread.
 
-**Data flow**: Creates a temp home, thread id, and a custom-named JSONL file under the sessions tree, inserts that exact path into SQLite, calls `find_thread_path_by_id_str`, and asserts the returned path matches the custom DB path.
+**Data flow**: It creates an empty custom-named JSON-lines file, inserts a database thread record pointing at that custom path, and asks lookup for the thread. The result should be exactly the database path, not a reconstructed canonical file name.
 
-**Call relations**: This test documents that path lookup trusts an existing DB path when it points to a real file, rather than forcing canonical filename reconstruction.
+**Call relations**: The test uses insert_state_db_thread to populate the database and then calls find_thread_path_by_id_str. Unlike the stale-path tests, it does not expect a filesystem search to replace the database answer.
 
 *Call graph*: calls 2 internal fn (from_string, insert_state_db_thread); 6 external calls (new, from_u128, assert_eq!, find_thread_path_by_id_str, create_dir_all, write).
 
@@ -3681,11 +3723,11 @@ async fn find_thread_path_accepts_existing_state_db_path_without_canonical_filen
 fn rollout_date_parts_extracts_directory_components()
 ```
 
-**Purpose**: Checks that the filename parser extracts year, month, and day components from a canonical rollout filename.
+**Purpose**: This test checks that a rollout file name can be parsed into year, month, and day directory pieces. That supports placing and finding files in the expected date-based folder layout.
 
-**Data flow**: Builds an `OsStr` filename, passes it to `rollout_date_parts`, and asserts the returned tuple of strings matches the expected directory components.
+**Data flow**: It supplies a sample rollout file name, calls rollout_date_parts, and expects the returned pieces to be "2025", "03", and "01". Nothing is written to disk.
 
-**Call relations**: This is a focused unit test for the filename parsing helper used by rollout path logic.
+**Call relations**: This is a direct unit test of rollout_date_parts. It does not use the larger listing flow; it checks one small parsing rule in isolation.
 
 *Call graph*: 3 external calls (new, assert_eq!, rollout_date_parts).
 
@@ -3700,11 +3742,11 @@ async fn assert_state_db_rollout_path(
 )
 ```
 
-**Purpose**: Reopens the SQLite state DB and asserts that a thread's stored rollout path matches an expected value.
+**Purpose**: This helper checks what rollout path the state database currently stores for a given thread. Tests use it after fallback lookup to prove the database was repaired, not just that lookup returned the right answer once.
 
-**Data flow**: Accepts a home path, thread id, and optional expected path. It initializes a fresh `StateRuntime` for that home, queries `find_rollout_path_by_id(thread_id, Some(false))`, and asserts the returned optional path equals `expected_path`.
+**Data flow**: It receives a home directory, a thread id, and the path expected in the database. It opens the state database, looks up the rollout path for that thread, and asserts that the stored path matches the expected value.
 
-**Call relations**: The DB repair tests call this helper after higher-level lookup to verify that read-repair persisted the corrected path.
+**Call relations**: The fallback-and-repair tests call this after find_thread_path_by_id_str. It serves as the final inspection step for database state.
 
 *Call graph*: calls 1 internal fn (init); called by 3 (find_thread_path_falls_back_when_db_path_is_stale, find_thread_path_falls_back_when_db_path_points_to_another_thread, find_thread_path_repairs_missing_db_row_after_filesystem_fallback); 2 external calls (to_path_buf, assert_eq!).
 
@@ -3721,11 +3763,11 @@ fn write_session_file(
 ) -> std::io::Result<(OffsetDateTime, Uuid)>
 ```
 
-**Purpose**: Convenience wrapper that writes a synthetic rollout file using the default test provider.
+**Purpose**: This convenience helper writes a normal fake session file using the default test model provider. Most tests use it when they need a realistic rollout file without customizing provider metadata.
 
-**Data flow**: Accepts root path, timestamp string, UUID, record count, and optional source, then forwards those values plus `Some("test-provider")` into `write_session_file_with_provider`. It returns that helper's `(OffsetDateTime, Uuid)` result.
+**Data flow**: It receives a root directory, timestamp text, UUID, record count, and optional source. It forwards those values to write_session_file_with_provider with the default provider, and returns the timestamp and UUID from that lower-level helper.
 
-**Call relations**: Most filesystem-based tests use this wrapper instead of the more configurable provider-aware helper.
+**Call relations**: Many tests call this before calling get_threads or find_thread_path_by_id_str. It keeps test setup short while delegating the actual file creation to write_session_file_with_provider.
 
 *Call graph*: calls 1 internal fn (write_session_file_with_provider); called by 9 (find_thread_path_falls_back_when_db_path_is_stale, find_thread_path_falls_back_when_db_path_points_to_another_thread, find_thread_path_repairs_missing_db_row_after_filesystem_fallback, test_created_at_sort_uses_file_mtime_for_updated_at, test_get_thread_contents, test_list_conversations_latest_first, test_pagination_cursor, test_source_filter_excludes_non_matching_sessions, test_timestamp_only_cursor_skips_same_second_filesystem_ties).
 
@@ -3743,11 +3785,11 @@ fn write_session_file_with_provider(
 ) -> std::io::Resul
 ```
 
-**Purpose**: Creates a canonical rollout JSONL file with session metadata, a user message, optional provider/source fields, arbitrary extra response records, and a controlled file mtime.
+**Purpose**: This helper writes a realistic JSON-lines session file, optionally including a specific model provider. It is the main test factory for normal rollout files.
 
-**Data flow**: Parses the timestamp string into a UTC `PrimitiveDateTime`, creates the dated sessions directory, opens the rollout file, builds a JSON session-meta payload with id, timestamp, cwd, originator, cli version, optional source, and optional model provider, writes that line, writes a user-message event line, writes `num_records` synthetic response records, sets the file's modified time to the parsed timestamp, and returns the parsed datetime plus UUID.
+**Data flow**: It parses the timestamp, creates the matching sessions/year/month/day directory, writes a session metadata line, writes a first user-message event, writes the requested number of extra response records, sets the file’s modified time to the session time, and returns the parsed time and UUID.
 
-**Call relations**: This helper underpins many listing and filtering tests by generating realistic rollout files in the exact directory layout the scanner expects.
+**Call relations**: write_session_file calls this with the standard test provider. The model-provider filtering test calls it directly to create sessions from different providers, including one with no provider field.
 
 *Call graph*: called by 2 (test_model_provider_filter_selects_only_matching_sessions, write_session_file); 11 external calls (create, new, join, parse, format!, format_description!, create_dir_all, String, json!, to_value (+1 more)).
 
@@ -3764,11 +3806,11 @@ fn write_goal_started_session_file(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Creates a rollout file whose first meaningful event is a thread-goal update, optionally followed by a later user message.
+**Purpose**: This helper writes a fake session whose first meaningful event is a thread goal, not a user message. It lets tests verify that goal-based sessions still get useful previews.
 
-**Data flow**: Parses the timestamp, creates the dated directory and file, writes a `session_meta` JSON object with source `vscode` and provider `test-provider`, constructs a `ThreadGoalUpdatedEvent` using `thread_id_from_uuid`, writes it as an `event_msg`, optionally writes a later user-message event, sets file mtime, and returns `std::io::Result<()>`.
+**Data flow**: It receives a root directory, timestamp, UUID, goal objective, and optional later user message. It creates the rollout file, writes session metadata, writes a thread-goal-updated event with the objective, optionally writes a later user message, and sets the file’s modified time.
 
-**Call relations**: Preview-related tests call this helper to verify that listing logic can derive preview text from goal events and still capture a later first user message.
+**Call relations**: The goal preview tests call this before get_threads. It uses thread_id_from_uuid so the goal event and the file metadata describe the same thread.
 
 *Call graph*: calls 1 internal fn (thread_id_from_uuid); called by 2 (test_goal_first_thread_reads_later_user_message, test_list_threads_uses_goal_objective_as_preview); 10 external calls (create, new, join, parse, format!, format_description!, create_dir_all, ThreadGoalUpdated, json!, writeln!).
 
@@ -3784,11 +3826,11 @@ fn write_session_file_with_delayed_user_event(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Creates a rollout file where many metadata-like lines appear before the first user message, to test scanner depth behavior.
+**Purpose**: This helper creates a session where the first user message appears only after several metadata lines. It tests that summary-reading code looks far enough into a file to find the user’s first message.
 
-**Data flow**: Parses the timestamp, creates the dated directory and file, writes `meta_lines_before_user` `session_meta` records—using the target UUID for the first and synthetic UUIDs for later ones—then writes a user-message event and sets file mtime.
+**Data flow**: It receives a root directory, timestamp, UUID, and number of metadata lines to write before the user event. It creates the dated rollout file, writes that many metadata lines, then writes one user-message event and sets the modified time.
 
-**Call relations**: The delayed-user-event listing test uses this helper to ensure summary extraction scans beyond the initial head when necessary.
+**Call relations**: test_list_threads_scans_past_head_for_user_event uses this to set up a file with a delayed user event, then calls get_threads to make sure the listing still includes and identifies the thread.
 
 *Call graph*: called by 1 (test_list_threads_scans_past_head_for_user_event); 10 external calls (create, new, join, parse, from_u128, format!, format_description!, create_dir_all, json!, writeln!).
 
@@ -3804,11 +3846,11 @@ fn write_session_file_with_meta_payload(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a rollout file using an arbitrary caller-supplied session-meta payload plus a standard user message.
+**Purpose**: This helper writes a session file using an exact metadata payload chosen by the test. It is useful for checking how optional metadata fields are preserved or defaulted.
 
-**Data flow**: Parses the timestamp, creates the dated directory and file, wraps the provided JSON payload in a `session_meta` line, writes it, writes a standard user-message event line, sets file mtime, and returns `std::io::Result<()>`.
+**Data flow**: It receives a root directory, timestamp, UUID, and JSON payload. It creates the dated rollout file, writes that payload as the session metadata line, adds a simple user-message event, sets the modified time, and returns success or an I/O error.
 
-**Call relations**: The base-instructions tests use this helper to control exactly which metadata fields are present or omitted in the session meta payload.
+**Call relations**: The base-instructions tests call this to create metadata with and without the base_instructions field, then use get_threads and read_head_for_summary to inspect how the summary reader sees it.
 
 *Call graph*: called by 2 (test_base_instructions_missing_in_meta_defaults_to_null, test_base_instructions_present_in_meta_is_preserved); 9 external calls (create, new, join, parse, format!, format_description!, create_dir_all, json!, writeln!).
 
@@ -3819,11 +3861,11 @@ fn write_session_file_with_meta_payload(
 async fn test_list_conversations_latest_first()
 ```
 
-**Purpose**: Verifies that filesystem thread listing returns sessions in descending created-at order with the expected metadata fields populated.
+**Purpose**: This test verifies that conversation listing returns sessions newest first when sorting by creation time. It also checks that each listed item contains the expected summary fields.
 
-**Data flow**: Creates three rollout files on consecutive days, builds a provider filter, calls `get_threads` with `ThreadSortKey::CreatedAt`, constructs expected `ThreadItem` paths and metadata, reuses the runtime-produced `updated_at` values for comparison, and asserts the full `ThreadsPage` matches.
+**Data flow**: It writes three sessions on three different dates, asks get_threads for a large enough page, and compares the returned ThreadsPage to an expected page ordered January 3, January 2, January 1. The comparison includes paths, thread ids, preview text, source, provider, and timestamps.
 
-**Call relations**: This is a broad integration test for the filesystem listing path, covering ordering, metadata extraction, and page accounting.
+**Call relations**: The test uses write_session_file to create input files and provider_vec to prepare the provider filter, then calls get_threads as the system behavior under test.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 5 external calls (new, from_u128, assert_eq!, format!, vec!).
 
@@ -3834,11 +3876,11 @@ async fn test_list_conversations_latest_first()
 async fn test_pagination_cursor()
 ```
 
-**Purpose**: Checks cursor-based pagination across multiple pages, including next-cursor values and scanned-file counts.
+**Purpose**: This test checks that conversation listing can be split across pages using a cursor, which is a bookmark saying where the previous page ended. It protects against missing or repeating conversations while paging.
 
-**Data flow**: Creates five rollout files ordered by day, lists page 1 with size 2, asserts the returned items and cursor, then lists page 2 using `page1.next_cursor` and page 3 using `page2.next_cursor`, constructing expected `ThreadsPage` values for each and comparing them.
+**Data flow**: It writes five sessions from oldest to newest. It requests two items at a time, verifies page one contains the two newest sessions and a cursor, page two contains the next two, and page three contains the last one with no further cursor.
 
-**Call relations**: This test exercises the listing layer's cursor semantics end to end, including the scanner's peek-ahead behavior reflected in `num_scanned_files`.
+**Call relations**: The test repeatedly calls get_threads, passing the previous page’s cursor into the next call. It uses write_session_file for setup and provider_vec for the model-provider filter.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 6 external calls (new, from_u128, assert_eq!, format!, from_str, vec!).
 
@@ -3849,11 +3891,11 @@ async fn test_pagination_cursor()
 async fn test_list_threads_scans_past_head_for_user_event()
 ```
 
-**Purpose**: Ensures listing logic scans beyond an initial block of metadata lines to find the first user message needed for thread inclusion and summary fields.
+**Purpose**: This test ensures the listing code does not give up too early when a session’s first user message is not near the top of the file. Without this, valid sessions could be skipped or summarized poorly.
 
-**Data flow**: Creates a rollout file with 12 metadata lines before the first user event, builds a provider filter, calls `get_threads`, and asserts exactly one item is returned with the expected thread id.
+**Data flow**: It writes one session with many metadata lines before the user event, asks get_threads for sessions, and expects exactly one item whose thread id matches the file’s UUID.
 
-**Call relations**: This test targets the summary-reading behavior used during filesystem listing when the first user event is not near the top of the file.
+**Call relations**: The test relies on write_session_file_with_delayed_user_event to create the unusual file shape, then calls get_threads to verify the real summary-scanning behavior.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file_with_delayed_user_event); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3864,11 +3906,11 @@ async fn test_list_threads_scans_past_head_for_user_event()
 async fn test_list_threads_uses_goal_objective_as_preview()
 ```
 
-**Purpose**: Verifies that when a thread starts with a goal-update event and no user message, the goal objective becomes the preview text.
+**Purpose**: This test checks that a goal-first thread uses the goal objective as its preview text when there is no user message. That gives users a meaningful label for automated or goal-driven sessions.
 
-**Data flow**: Writes a goal-started rollout file without a later user message, lists threads with `get_threads`, asserts one item is returned, and checks that `preview` equals the goal objective while `first_user_message` is `None`.
+**Data flow**: It writes a session containing a thread goal objective and no later user message. After listing threads, it expects one item with the correct thread id, preview set to the objective, and no first_user_message.
 
-**Call relations**: This test covers a nonstandard preview derivation path in the listing logic, using the helper that emits `ThreadGoalUpdatedEvent` records.
+**Call relations**: The test uses write_goal_started_session_file for setup, provider_vec for filtering input, and get_threads to read the summary.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_goal_started_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3879,11 +3921,11 @@ async fn test_list_threads_uses_goal_objective_as_preview()
 async fn test_goal_first_thread_reads_later_user_message()
 ```
 
-**Purpose**: Checks that a goal-first thread still records a later user message as `first_user_message` while keeping the goal objective as preview.
+**Purpose**: This test verifies that a goal-first thread can still record a later user message separately from its preview. The preview should remain the goal, while first_user_message should reflect what the user later said.
 
-**Data flow**: Writes a goal-started rollout file with an additional later user message, lists threads, and asserts the returned item has the expected thread id, preview from the goal objective, and `first_user_message` from the later event.
+**Data flow**: It writes a session with a goal objective followed by a user message. Listing should return one item whose preview is the goal objective and whose first_user_message is the later message.
 
-**Call relations**: This complements the previous preview test by validating that the scanner tracks both preview and first-user-message independently.
+**Call relations**: The test creates the mixed goal-and-message file with write_goal_started_session_file, then calls get_threads to confirm both summary fields are populated correctly.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_goal_started_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -3894,11 +3936,11 @@ async fn test_goal_first_thread_reads_later_user_message()
 async fn test_get_thread_contents()
 ```
 
-**Purpose**: Validates both the listed metadata for a single thread and the exact on-disk JSONL contents written by the test helper.
+**Purpose**: This test checks both that a listed thread points to the correct rollout file and that the file contents are exactly what the helper wrote. It connects summary listing with the raw session file on disk.
 
-**Data flow**: Creates one rollout file, lists it with `get_threads`, reads the file contents with `tokio::fs::read_to_string`, constructs an expected single-item `ThreadsPage`, constructs the exact expected JSONL string for the file, and asserts both page equality and content equality.
+**Data flow**: It writes a session with two response records, lists one thread, reads the returned file path, and compares both the ThreadsPage and the full file text against expected JSON-lines content.
 
-**Call relations**: This test ties together file generation and listing behavior, ensuring the helpers produce the exact shape the scanner expects.
+**Call relations**: The test uses write_session_file to create the rollout, provider_vec and get_threads to find it, then tokio file reading to inspect the path returned by the listing code.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 7 external calls (new, new_v4, assert_eq!, format!, json!, read_to_string, vec!).
 
@@ -3909,11 +3951,11 @@ async fn test_get_thread_contents()
 async fn test_base_instructions_missing_in_meta_defaults_to_null()
 ```
 
-**Purpose**: Ensures summary-reading logic treats a missing `base_instructions` field in session metadata as explicit JSON null.
+**Purpose**: This test checks backward compatibility for old metadata that lacks base_instructions. The summary reader should present that missing field as JSON null instead of leaving it absent.
 
-**Data flow**: Writes a rollout file whose meta payload omits `base_instructions`, lists threads to obtain the path, reads the head with `read_head_for_summary`, extracts the first JSON object, and asserts `base_instructions` is present as `serde_json::Value::Null`.
+**Data flow**: It writes a session metadata payload without base_instructions, lists the thread, reads the head summary from the file, and asserts that the first summary object contains base_instructions set to null.
 
-**Call relations**: This test targets metadata normalization in the summary-reading path rather than listing order or filtering.
+**Call relations**: The test uses write_session_file_with_meta_payload to create the exact metadata shape, get_threads to locate the file, and read_head_for_summary to inspect the normalized summary data.
 
 *Call graph*: calls 4 internal fn (get_threads, read_head_for_summary, provider_vec, write_session_file_with_meta_payload); 4 external calls (new, from_u128, assert_eq!, json!).
 
@@ -3924,11 +3966,11 @@ async fn test_base_instructions_missing_in_meta_defaults_to_null()
 async fn test_base_instructions_present_in_meta_is_preserved()
 ```
 
-**Purpose**: Checks that when `base_instructions` is present in session metadata, summary-reading preserves its nested content.
+**Purpose**: This test makes sure existing base_instructions metadata is not erased or replaced. If a session recorded custom instructions, summary reading should keep them intact.
 
-**Data flow**: Writes a rollout file with a `base_instructions` object containing text, lists threads, reads the head summary, drills into `base_instructions.text`, and asserts the extracted string matches the original.
+**Data flow**: It writes metadata containing base_instructions with a text value, lists the thread, reads the head summary, extracts that text, and checks it matches the original custom instructions.
 
-**Call relations**: This complements the missing-field test by covering the preservation branch of the same summary normalization logic.
+**Call relations**: Like the missing-field test, it uses write_session_file_with_meta_payload for setup, then get_threads and read_head_for_summary to verify what the rollout summary code returns.
 
 *Call graph*: calls 4 internal fn (get_threads, read_head_for_summary, provider_vec, write_session_file_with_meta_payload); 4 external calls (new, from_u128, assert_eq!, json!).
 
@@ -3939,11 +3981,11 @@ async fn test_base_instructions_present_in_meta_is_preserved()
 async fn test_created_at_sort_uses_file_mtime_for_updated_at() -> Result<()>
 ```
 
-**Purpose**: Verifies that even when sorting by created-at, the listed `updated_at` field comes from the file's modification time.
+**Purpose**: This test proves that even when sessions are sorted by creation time, the updated_at field comes from the file’s modified time. Creation time and last update time are different ideas and should not be mixed.
 
-**Data flow**: Creates a rollout file, parses its created timestamp, computes a later `updated` time, rewrites the file mtime using `FileTimes`, lists threads sorted by `CreatedAt`, and asserts the returned item's `created_at` matches the filename timestamp while `updated_at` matches the RFC3339-formatted mtime.
+**Data flow**: It writes a session, changes the file’s modified time to two hours after creation, lists by CreatedAt, and checks that created_at stays at the original timestamp while updated_at matches the modified time in RFC3339 format.
 
-**Call relations**: This test documents the separation between ordering key and displayed `updated_at` value in filesystem listings.
+**Call relations**: The test uses write_session_file for the file, manually changes its modification time, then calls get_threads to inspect the item returned by the listing code.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 9 external calls (hours, new, parse, new, from_u128, assert_eq!, format!, format_description!, new).
 
@@ -3954,11 +3996,11 @@ async fn test_created_at_sort_uses_file_mtime_for_updated_at() -> Result<()>
 async fn test_updated_at_uses_file_mtime() -> Result<()>
 ```
 
-**Purpose**: Checks that updated-at sorting and metadata extraction use the file modification time rather than timestamps embedded in rollout records.
+**Purpose**: This test checks updated-time behavior when sorting by updated time. It makes sure updated_at reflects the file’s actual last modified time rather than timestamps inside later rollout lines.
 
-**Data flow**: Manually creates a rollout file with session meta, a user message, and many response items, then lists threads sorted by `UpdatedAt`. It parses the returned `updated_at` as RFC3339, converts it to UTC, compares it to `Utc::now()`, and asserts the age is within 30 seconds, reflecting the file's recent mtime.
+**Data flow**: It manually writes a rollout file with metadata, a user message, and many assistant response lines. After listing by UpdatedAt, it verifies created_at is the session timestamp and updated_at is close to the current file modified time.
 
-**Call relations**: This test exercises the updated-at sort path with a hand-built rollout file to ensure mtime, not record timestamps, drives the reported update time.
+**Call relations**: This test constructs RolloutLine values directly instead of using the simpler helpers, then calls get_threads with ThreadSortKey::UpdatedAt to test the updated-time path.
 
 *Call graph*: calls 3 internal fn (from_string, get_threads, provider_vec); 16 external calls (default, create, new, from_u128, new, assert!, assert_eq!, now, format!, create_dir_all (+6 more)).
 
@@ -3969,11 +4011,11 @@ async fn test_updated_at_uses_file_mtime() -> Result<()>
 async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties()
 ```
 
-**Purpose**: Documents the filesystem fallback limitation where a cursor with only second precision cannot paginate through multiple files sharing the same timestamp second.
+**Purpose**: This test documents a limitation of filesystem fallback pagination: if several files have the same second-level timestamp, a timestamp-only cursor skips the remaining ties on the next page. The test locks in that known behavior.
 
-**Data flow**: Creates three rollout files with identical timestamp strings, lists the first page of size 2 and asserts it contains the lexically later two files plus a cursor equal to that timestamp, then requests page 2 with that cursor and asserts it is empty with no next cursor.
+**Data flow**: It writes three sessions with the exact same timestamp, requests two items, and gets a cursor equal to that timestamp. When it requests the next page with that cursor, it expects no items because the filesystem cursor cannot distinguish the same-second files.
 
-**Call relations**: This test captures a known behavior of the filesystem-only listing path and contrasts it in comments with the SQLite-backed path, which uses unique millisecond timestamps.
+**Call relations**: The test uses write_session_file to create tied files and get_threads twice to show how cursor paging behaves in the filesystem-backed path.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 7 external calls (new, from_u128, new, assert_eq!, format!, from_str, vec!).
 
@@ -3984,11 +4026,11 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties()
 async fn test_source_filter_excludes_non_matching_sessions()
 ```
 
-**Purpose**: Verifies that source filtering includes only matching interactive sessions while an empty source filter returns all sessions.
+**Purpose**: This test confirms that source filtering works. Interactive listings should include interactive sessions, such as CLI sessions, and exclude non-interactive sessions, such as exec sessions.
 
-**Data flow**: Creates one CLI rollout and one Exec rollout, builds a provider filter, calls `get_threads` once with `INTERACTIVE_SESSION_SOURCES` and once with `NO_SOURCE_FILTER`, collects returned paths, and asserts the interactive-only result contains just the CLI file while the unfiltered result contains both files.
+**Data flow**: It writes one CLI session and one Exec session. A call with the interactive source filter should return only the CLI file; a call with no source filter should return both files.
 
-**Call relations**: This test exercises source-based filtering in the filesystem listing path using concrete session source values.
+**Call relations**: The test sets up files with write_session_file, prepares provider input with provider_vec, and calls get_threads once with INTERACTIVE_SESSION_SOURCES and once with NO_SOURCE_FILTER.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file); 4 external calls (new, from_u128, assert!, assert_eq!).
 
@@ -3999,10 +4041,10 @@ async fn test_source_filter_excludes_non_matching_sessions()
 async fn test_model_provider_filter_selects_only_matching_sessions() -> Result<()>
 ```
 
-**Purpose**: Checks provider filtering semantics, including inclusion of sessions with no explicit provider when the requested provider matches the default provider argument.
+**Purpose**: This test verifies filtering by model provider. It also checks the special fallback rule that sessions with no provider can be included when filtering for the current default provider.
 
-**Data flow**: Creates three rollout files: one with provider `openai`, one with `beta`, and one with no provider. It then lists with an `openai` filter and default provider `openai`, asserting two sessions are returned (`openai` plus missing-provider); lists with a `beta` filter and asserts only the beta session is returned; lists with an unknown filter and asserts no sessions; and finally lists without provider filtering and asserts all three sessions are present.
+**Data flow**: It writes three sessions: one from openai, one from beta, and one with no provider. Filtering for openai should return the openai session plus the provider-less session; filtering for beta should return only beta; filtering for an unknown provider should return none; no provider filter should return all three.
 
-**Call relations**: This test covers the provider-filter branch of listing logic and the fallback-to-default-provider rule for sessions whose metadata omits `model_provider`.
+**Call relations**: The test calls write_session_file_with_provider directly to create different provider cases, uses provider_vec to build filter inputs, and calls get_threads repeatedly to verify each filtering scenario.
 
 *Call graph*: calls 3 internal fn (get_threads, provider_vec, write_session_file_with_provider); 4 external calls (new, from_u128, assert!, assert_eq!).

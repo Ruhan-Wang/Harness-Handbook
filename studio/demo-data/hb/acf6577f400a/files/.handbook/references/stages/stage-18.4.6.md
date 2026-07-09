@@ -1,10 +1,12 @@
 # Shared extension backends and rollout trace models  `stage-18.4.6`
 
-This stage provides shared, contract-oriented data models that sit alongside the main protocol crates and are consumed across startup, steady-state execution, and post-run inspection. Its job is not to drive control flow directly, but to give multiple parts of the system a stable vocabulary for describing extension-owned backend state and compact rollout traces.
+This stage provides shared behind-the-scenes data models rather than main work-loop behavior. It defines the common “forms” that other parts of the system fill in when they record or read rollout traces. A rollout trace is a saved history of what an agent did, useful for debugging, review, or replay.
 
-The rollout-trace session model establishes the top-level structure of a traced run: session status, participating agent threads, execution windows, and Codex turn activations. It defines who owns what and when major conversation phases occurred. The runtime model fills in the execution-side detail beneath that structure, representing code execution, compaction, tool invocations, terminal activity, and edges between threads so the system can explain how transcript events and side effects were produced. The payload reference model keeps those reduced traces lightweight by storing only identifiers and references to large request, response, and runtime blobs saved elsewhere in the trace bundle.
+The session model describes the overall run. It records whether a rollout is still active or finished, which agent threads joined in, and the start and end times of pieces of runtime work. This is like the cover sheet and timeline for a job.
 
-Together, these models let producers emit compact, navigable traces and let downstream tooling reconstruct behavior without duplicating heavyweight payload data.
+The runtime model describes the events inside that job: code cells, tool calls, terminal commands, checkpoints where context was compacted, and links between trace objects. It gives the trace system a shared vocabulary for the moving parts of execution.
+
+The payload model keeps the trace lightweight. Instead of putting large raw logs or request and response bodies directly into the main records, it stores small references that point to those larger payloads elsewhere in the rollout bundle.
 
 ## Files in this stage
 
@@ -13,28 +15,28 @@ These models establish the top-level rollout trace lifecycle and then define the
 
 ### `rollout-trace/src/model/session.rs`
 
-`data_model` · `trace replay and viewer projection`
+`data_model` · `cross-cutting trace data representation`
 
-This file supplies the coarse-grained session model that the rest of the reduced trace hangs from. `RolloutStatus` records whether the overall rollout is still running, completed normally, failed, or was aborted before normal completion. At the thread level, `AgentThread` represents one participating Codex thread or agent, including the root interactive session. It stores stable identity (`AgentThreadId`), routing identity (`AgentPath`), optional nickname for presentation, provenance via `AgentOrigin`, a thread-scoped `ExecutionWindow`, an optional default model hint, and the ordered list of conversation items first observed in that thread.
+This file is a set of model definitions. In plain terms, it describes the “who, when, and status” of a traced Codex rollout. A rollout can involve one main interactive session plus spawned child agents, and each of those agents has its own thread, identity, display name, origin, lifecycle, and transcript order.
 
-`AgentOrigin` distinguishes the root thread from spawned children. Spawned threads retain the parent thread ID, the `EdgeId` of the spawn interaction, the selected task name, and the chosen agent role. That preserves multi-agent lineage without overloading display names as identity.
+The central idea is that a trace should not only say what messages appeared, but also which running agent they belonged to and whether that agent was still active, completed, failed, or stopped early. `AgentThread` is the record for one such participant. It stores a stable `agent_path` for routing and search, while `nickname` is only a display hint and is not safe as an identity because names can repeat.
 
-`ExecutionWindow` is a reusable lifecycle envelope shared by threads, turns, and runtime objects elsewhere in the model. It combines wall-clock timestamps with causal `RawEventSeq` sequence numbers for start and optional end, plus an `ExecutionStatus` enum that distinguishes running, completed, failed, cancelled, and aborted states. The comments emphasize an important invariant: sequence numbers, not timestamps, are the authoritative ordering primitive.
+`AgentOrigin` explains where a thread came from: either the root session or a spawned child created by another thread. `ExecutionWindow` records a runtime interval, like a stopwatch with a start time, optional end time, and status. It also stores event sequence numbers, which are more reliable than wall-clock time when ordering events that happen very close together.
 
-Finally, `CodexTurn` models one activation of the Codex runtime for a thread. It groups protocol/runtime work under a stable `CodexTurnId`, points back to the owning thread, carries its own execution window, and optionally lists the conversation items that triggered the activation.
+`CodexTurn` represents one activation of the Codex runtime for a thread. Importantly, it is not the same as a conversation message pair; it is a unit of runtime work that may have been triggered by known conversation items.
 
 
 ### `rollout-trace/src/model/runtime.rs`
 
-`data_model` · `trace replay and viewer projection`
+`data_model` · `cross-cutting runtime trace recording and inspection`
 
-This file models the non-transcript runtime graph reconstructed from raw trace events. `CodeCell` captures one model-authored `exec` cell, tying a reducer-owned `CodeCellId` to the model-visible call ID, owning thread and turn, source and output conversation items, optional runtime cell ID, execution window, runtime status, key event timestamps/sequences, original JavaScript source, and nested or wait tool-call IDs. `CodeCellRuntimeStatus` distinguishes accepted, running, yielded, completed, failed, and terminated states.
+This file is mostly a set of data definitions. It does not perform actions itself; instead, it describes the pieces of runtime history that other code can fill in, serialize, and inspect later. Think of it like the printed forms used in a control room: one form for a code cell, one for a tool call, one for a terminal command, and so on. Without these shared forms, different parts of the trace system would not agree on what information exists or how to connect it.
 
-Compaction is split into two layers: `Compaction` records the installed checkpoint where live history changed, including marker item, contributing request IDs, input items, and replacement items; `CompactionRequest` records each upstream remote request with execution timing, model/provider, and raw request/response payload IDs. This separation preserves both the semantic boundary and the operational attempts that produced it.
+The central idea is that a conversation transcript alone is not enough to explain what happened. A model may ask to run JavaScript, that JavaScript may call tools, those tools may start terminal processes, and some work may continue in the background. These structs capture those runtime boundaries and relationships explicitly.
 
-`ToolCall` is the main runtime operation object. It links optional MCP, model-visible, and code-mode runtime identifiers to thread, starting turn, execution window, requester, kind, model-visible call/output items, optional terminal operation, summary, canonical invocation/result payloads, and auxiliary runtime payloads. Supporting enums classify requester, tool kind, and bounded summaries. Terminal activity is modeled explicitly through `TerminalSession`, `TerminalOperation`, `TerminalRequest`, `TerminalResult`, and `TerminalModelObservation`, keeping runtime bytes separate from proof of model visibility.
+`CodeCell` records one model-authored JavaScript execution and its lifecycle. `ToolCall` records a runtime operation, whether requested directly by the model or indirectly by code. Terminal-related types separate a reusable terminal session from each command or stdin write performed against it. Compaction types record when old conversation history was replaced by a shorter summary. `InteractionEdge` and `TraceAnchor` describe directed links between trace objects, such as one agent spawning or messaging another.
 
-Finally, `InteractionEdge`, `InteractionEdgeKind`, and `TraceAnchor` represent directed information flow between threads, tool calls, and conversation items, including carried item and payload IDs. The overall design keeps semantic transcript state and operational causality linked but distinct.
+Most types derive serialization support through Serde, a Rust library for turning data into formats like JSON and back. That matters because these records are meant to be stored, transported, and inspected outside the running program.
 
 
 ### Payload references
@@ -42,10 +44,12 @@ This module provides the lightweight identifiers used by the reduced trace model
 
 ### `rollout-trace/src/payload.rs`
 
-`data_model` · `trace writing, replay, and details loading`
+`data_model` · `trace writing and trace reading`
 
-This file is the payload-reference layer of the rollout-trace schema. It introduces `RawPayloadId` as a stable string identifier for one raw payload within a bundle, then wraps that identifier in `RawPayloadRef`, which also records the payload’s coarse role and its bundle-local relative path. The path is intentionally just a plain string relative to the bundle root; the comments note that the writer always materializes payloads as local files, so the schema does not expose alternate storage backends or transport abstractions.
+A rollout trace is meant to show a useful timeline of what happened, but some parts of that history can be very large: full model requests, full model responses, terminal output, tool runtime events, and similar raw records. If all of that were copied directly into the main trace graph, the trace would become slow and heavy to load, especially in a browser.
 
-`RawPayloadRef` exists to keep the reduced `RolloutTrace` compact. Conversation timelines, cards, and summaries can carry references to large upstream requests, responses, terminal logs, or protocol events without forcing replay output or browser consumers to inline every byte. UI code can inspect `kind` first to choose labels or syntax highlighting before opening the file.
+This file solves that by defining a reference system. Instead of storing the whole payload inline, the trace stores a `RawPayloadRef`: a small record that says, in effect, “the full data is in this bundle file, under this stable ID, and it is this kind of payload.” It is like putting a label and shelf location in a catalog instead of placing the entire book inside the catalog entry.
 
-The `RawPayloadKind` enum enumerates the payload categories the writer and reducer understand: inference request/response, compaction request/checkpoint/response, tool invocation/result/runtime event, terminal runtime event, protocol event, session metadata, and child-agent result payloads. It derives ordering traits in addition to serialization traits, which makes these kinds usable in sorted collections or deterministic presentation. Overall, this file is a small but important schema boundary between the semantic reduced graph and the raw artifacts captured in the trace bundle.
+`RawPayloadId` is just a stable text identifier for one raw payload. `RawPayloadRef` combines that ID with a relative file path and a `RawPayloadKind`. The kind tells the user interface what sort of content it is before opening the file, so it can choose useful labels or syntax highlighting.
+
+The enum `RawPayloadKind` lists the broad categories of raw payloads the trace system knows about, such as inference requests, tool results, terminal events, protocol events, session metadata, and child-agent results. The types can be serialized and deserialized, meaning they can be written to and read from trace bundle files.

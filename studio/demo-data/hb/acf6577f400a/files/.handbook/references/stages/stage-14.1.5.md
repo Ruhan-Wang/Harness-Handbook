@@ -1,8 +1,8 @@
 # Approval-mediated tool orchestration and approval UI  `stage-14.1.5`
 
-This stage sits at the boundary between runtime tool execution and the user-facing approval experience. Its core job is to ensure every consequential tool call runs through policy checks, sandbox and network decisions, and any required user confirmation before execution proceeds. The central coordinator is core/src/tools/orchestrator.rs, which drives approval, sandbox selection, first execution, telemetry, and retry with escalated permissions when allowed. For MCP-backed tools, core/src/mcp_tool_approval_templates.rs supplies the exact approval wording and readable parameter labels shown to users.
+This stage sits in the main work loop, whenever the assistant wants to do something that may affect the user’s machine or data. The core orchestrator is the traffic controller: it checks whether a tool needs permission, chooses a safety sandbox, runs the tool, and may ask again with broader access if the sandbox blocks it. MCP tool approval templates turn external tool-server requests into plain questions instead of raw names and JSON.
 
-On the TUI side, tui/src/approval_events.rs normalizes server approval payloads into renderable request models, and tui/src/chatwidget/tool_requests.rs turns those requests into overlays, footer status, notifications, and transcript entries. tui/src/bottom_pane/approval_overlay.rs presents concrete approval choices for exec, patch, permission, and elicitation requests, while tui/src/bottom_pane/request_user_input/mod.rs manages richer structured questionnaires and queued prompts. Permission selection flows live in tui/src/chatwidget/permission_popups.rs and tui/src/chatwidget/permissions_menu.rs, with Windows-specific sandbox guidance in tui/src/chatwidget/windows_sandbox_prompts.rs. Cross-thread visibility comes from tui/src/bottom_pane/pending_thread_approvals.rs, recent guardian denials are summarized by tui/src/auto_review_denials.rs, and tui/src/hooks_rpc.rs supports hook-review trust decisions.
+The terminal UI then makes those decisions visible. Approval events store requests in a safe displayable form, while the approval overlay shows the actual pop-up and sends back approve or deny. Tool requests puts these decisions into the chat screen. Permission popups and the permissions menu let users choose or change how much freedom the assistant has, including reviewing automatic denials. Auto-review denials keeps a recent list of blocked actions with readable labels. Pending thread approvals warns when background agent threads are waiting. Request user input handles structured questions and typed answers. Windows sandbox prompts guide Windows users through safe setup. Hooks RPC checks server-side hooks and records the user’s trust choices.
 
 ## Files in this stage
 
@@ -11,11 +11,13 @@ These files define the approval prompt content and drive the end-to-end runtime 
 
 ### `core/src/mcp_tool_approval_templates.rs`
 
-`domain_logic` · `approval prompt rendering`
+`domain_logic` · `request handling, with lazy template loading on first use`
 
-This module turns a bundled JSON template file into richer approval prompts for MCP tool calls, especially Codex Apps connector actions. The static `CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES` is a `LazyLock<Option<Vec<...>>>`, so parsing happens once on first use. `load_consequential_tool_message_templates` deserializes `consequential_tool_message_templates.json`, verifies the schema version against `CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES_SCHEMA_VERSION`, and disables templating entirely if parsing or version validation fails, logging a warning instead of panicking.
+Some MCP tools can do things that matter, like creating a calendar event or posting a comment. Before allowing that, the system may need to ask the user a clear permission question. This file is the small “message writer” for that approval step.
 
-Rendering is intentionally strict. `render_mcp_tool_approval_template` simply forwards to `render_mcp_tool_approval_template_from_templates` using the bundled templates. The renderer requires an exact triple match on `server_name`, `connector_id`, and trimmed `tool_title`; partial matches are ignored. The question text is produced by `render_question_template`, which trims whitespace, rejects empty templates, and only substitutes `{connector_name}` when a non-empty connector name is available. Tool parameters are rendered by `render_tool_params`, which preserves the original object as `tool_params` while producing an ordered display list. Template-declared params appear first with human-friendly labels, remaining params are appended sorted by key, and any display-name collision or blank label causes the whole render to fail with `None`. Tests cover exact matches, missing matches, label collisions, bundled-template loading, literal templates without connector substitution, and failure when a connector placeholder lacks a value.
+It loads a bundled JSON file of templates, checks that the file is in the expected format version, and keeps the templates ready for later use. When an approval is needed, it looks for an exact match by server name, connector id, and tool title. If it finds one, it fills in the template text. For example, it can replace `{connector_name}` with a readable name like “Calendar”.
+
+It also prepares the tool parameters for display. Some parameters can be renamed with friendly labels, such as showing `calendar_id` as “Calendar”. Any leftover parameters are still shown, using their original names, so the user can see what the tool is about to do. The code is deliberately cautious: if the template is empty, the connector name is missing when needed, the parameters are not an object, or two displayed labels would collide, it returns no rendered template. That avoids showing confusing or misleading approval prompts.
 
 #### Function details
 
@@ -31,11 +33,11 @@ fn render_mcp_tool_approval_template(
 ) -> Optio
 ```
 
-**Purpose**: Renders an approval template from the bundled template set for a specific server, connector, tool title, and optional parameter object. It is the public entrypoint used by approval prompting code.
+**Purpose**: This is the main entry point for producing an approval prompt from the bundled template list. A caller uses it when an MCP tool request needs a readable permission question for the user.
 
-**Data flow**: Accepts `server_name`, optional `connector_id`, optional `connector_name`, optional `tool_title`, and optional `tool_params`. It reads the lazily loaded bundled templates from `CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES`; if unavailable it returns `None`. Otherwise it forwards all inputs to `render_mcp_tool_approval_template_from_templates` and returns that `Option<RenderedMcpToolApprovalTemplate>`.
+**Data flow**: It receives the server name, optional connector id and connector name, optional tool title, and optional tool parameters. It first reads the lazily loaded template list; if loading failed earlier, it stops and returns nothing. Otherwise, it passes all the request details and the loaded templates to the more detailed rendering function, then returns whatever rendered prompt that function produces.
 
-**Call relations**: Called by MCP tool approval flow when building user-facing prompts. It delegates all matching and rendering logic to `render_mcp_tool_approval_template_from_templates`.
+**Call relations**: During the approval flow, `maybe_request_mcp_tool_approval` calls this function to ask, “Can we make a nice approval message for this tool call?” This function does not build the message itself; it hands the work to `render_mcp_tool_approval_template_from_templates` after making sure the shared bundled templates are available.
 
 *Call graph*: calls 1 internal fn (render_mcp_tool_approval_template_from_templates); called by 1 (maybe_request_mcp_tool_approval).
 
@@ -46,11 +48,11 @@ fn render_mcp_tool_approval_template(
 fn load_consequential_tool_message_templates() -> Option<Vec<ConsequentialToolMessageTemplate>>
 ```
 
-**Purpose**: Parses the bundled JSON template file and validates its schema version before exposing the templates. Failures are downgraded to warnings and disable templating.
+**Purpose**: This function loads the built-in approval-message template file and checks that it matches the schema version this code understands. It protects the rest of the system from using malformed or outdated template data.
 
-**Data flow**: Reads the embedded JSON string via `include_str!`, attempts `serde_json::from_str::<ConsequentialToolMessageTemplatesFile>`, logs and returns `None` on parse failure, compares `schema_version` to `CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES_SCHEMA_VERSION`, logs and returns `None` on mismatch, and otherwise returns `Some(templates.templates)`.
+**Data flow**: It reads the bundled JSON file that is compiled into the program, tries to parse it into template records, and checks its schema version number. If parsing fails or the version is not the expected one, it logs a warning and returns nothing. If everything looks right, it returns the list of templates ready for rendering.
 
-**Call relations**: Used only as the initializer for the `LazyLock` static. All runtime rendering depends on this one-time load succeeding.
+**Call relations**: This function is used by the lazy static template holder, so it runs only when the templates are first needed. It relies on the compile-time file inclusion helper to get the JSON contents and on warning logging to report bad template data without crashing the program.
 
 *Call graph*: 2 external calls (include_str!, warn!).
 
@@ -66,11 +68,11 @@ fn render_mcp_tool_approval_template_from_templates(
     to
 ```
 
-**Purpose**: Finds an exact matching template and renders both the approval question text and display-friendly parameter list. It enforces strict matching and rejects malformed inputs.
+**Purpose**: This function does the real work of choosing the right approval template and turning it into a finished prompt. It is useful both in production, where it receives the bundled templates, and in tests, where small custom template lists are supplied.
 
-**Data flow**: Takes a template slice plus `server_name`, optional `connector_id`, optional `connector_name`, optional `tool_title`, and optional `tool_params`. It requires non-`None` `connector_id` and non-empty trimmed `tool_title`, finds the first template whose `server_name`, `connector_id`, and `tool_title` all match exactly, renders the question via `render_question_template`, and then either renders object parameters with `render_tool_params`, rejects non-object `tool_params`, or uses `(None, Vec::new())` when params are absent. On success it returns `Some(RenderedMcpToolApprovalTemplate { question, elicitation_message, tool_params, tool_params_display })`.
+**Data flow**: It receives a list of templates plus the details of one tool request. It requires a connector id and a non-empty tool title, then searches for a template whose server name, connector id, and tool title all match exactly. After finding one, it renders the question text and, if tool parameters are present, formats them for display. It returns a completed `RenderedMcpToolApprovalTemplate`, or returns nothing if any required piece is missing or unsafe to display.
 
-**Call relations**: This is the implementation behind the public renderer and is also exercised directly by tests. It delegates text substitution to `render_question_template` and parameter shaping to `render_tool_params`.
+**Call relations**: `render_mcp_tool_approval_template` calls this function after loading the shared templates. The rendering tests call it directly with hand-made templates so they can check exact behavior. Inside, it delegates text substitution to `render_question_template` and parameter display preparation to `render_tool_params`.
 
 *Call graph*: calls 2 internal fn (render_question_template, render_tool_params); called by 3 (render_mcp_tool_approval_template, renders_exact_match_with_readable_param_labels, renders_literal_template_without_connector_substitution); 2 external calls (new, iter).
 
@@ -81,11 +83,11 @@ fn render_mcp_tool_approval_template_from_templates(
 fn render_question_template(template: &str, connector_name: Option<&str>) -> Option<String>
 ```
 
-**Purpose**: Produces the final approval question string from a template, optionally substituting the connector name placeholder. It rejects empty templates and unresolved connector placeholders.
+**Purpose**: This function turns a template sentence into the actual question text shown to the user. It supports one special placeholder, `{connector_name}`, for inserting a friendly connector name.
 
-**Data flow**: Accepts `template: &str` and optional `connector_name`. It trims the template and returns `None` if empty. If the template contains `{connector_name}`, it requires a non-empty trimmed connector name and returns `template.replace(...)`; otherwise it returns `Some(template.to_string())`.
+**Data flow**: It receives a template string and an optional connector name. It trims extra whitespace from the template and rejects it if it becomes empty. If the template contains `{connector_name}`, it also requires a non-empty connector name and replaces the placeholder with that name. If no replacement is needed, it returns the trimmed template as-is.
 
-**Call relations**: Called only by `render_mcp_tool_approval_template_from_templates` as the text-rendering step before parameter rendering.
+**Call relations**: `render_mcp_tool_approval_template_from_templates` calls this after it has selected the matching template. The result becomes both the approval question and the elicitation message in the rendered output.
 
 *Call graph*: called by 1 (render_mcp_tool_approval_template_from_templates).
 
@@ -99,11 +101,11 @@ fn render_tool_params(
 ) -> Option<(Option<Value>, Vec<RenderedMcpToolApprovalParam>)>
 ```
 
-**Purpose**: Builds the ordered parameter display list for an approval prompt while preserving the original parameter object. Template-labeled parameters come first, and unlabeled leftovers are appended in sorted order.
+**Purpose**: This function prepares the tool’s input parameters for display in the approval prompt. It gives selected parameters friendly labels while preserving all parameters so the user can review what will be sent.
 
-**Data flow**: Inputs are `tool_params: &Map<String, Value>` and `template_params`. It initializes `display_params`, `display_names`, and `handled_names`. For each template param it trims the label, rejects blank labels, looks up the named value in `tool_params`, skips missing values, rejects duplicate display labels, pushes a `RenderedMcpToolApprovalParam` with the friendly label, and marks the param handled. It then collects remaining unhandled params, sorts them by key, rejects any display-name collision with existing labels, appends them using their raw names as display names, and returns `Some((Some(Value::Object(tool_params.clone())), display_params))`.
+**Data flow**: It receives the raw tool parameters as a JSON object and the template’s list of preferred parameter labels. It first walks through the preferred labels, adding matching parameters with their readable display names. It rejects empty labels and duplicate display names, because those could confuse the user. Then it adds any remaining parameters in sorted name order, using their original names as labels. It returns both the original parameter object and the ordered display list, or nothing if the display names would be ambiguous.
 
-**Call relations**: Used by `render_mcp_tool_approval_template_from_templates` to produce the structured parameter display metadata consumed by approval UIs. Its collision checks are what cause some template renders to fail with `None`.
+**Call relations**: `render_mcp_tool_approval_template_from_templates` calls this only when the incoming tool parameters are a JSON object. This function is the part that turns raw machine-facing parameter names into a safer, more readable checklist for the approval UI.
 
 *Call graph*: called by 1 (render_mcp_tool_approval_template_from_templates); 6 external calls (new, clone, get, iter, Object, new).
 
@@ -114,11 +116,11 @@ fn render_tool_params(
 fn renders_exact_match_with_readable_param_labels()
 ```
 
-**Purpose**: Verifies successful rendering for an exact template match, including connector-name substitution and ordered readable parameter labels. It also checks that unspecified parameters are preserved and appended.
+**Purpose**: This test proves the happy path: an exact template match produces a readable question and a display list with friendly parameter labels. It also checks that parameters not named in the template are still shown.
 
-**Data flow**: Builds an in-memory template vector for a calendar `create_event` tool, calls `render_mcp_tool_approval_template_from_templates` with matching server/connector/tool and a JSON object containing labeled and unlabeled params, and asserts the returned `RenderedMcpToolApprovalTemplate` exactly matches the expected question text, original `tool_params`, and ordered `tool_params_display` entries.
+**Data flow**: It builds a small calendar template and a sample tool request with title, calendar id, and timezone. It sends that data into `render_mcp_tool_approval_template_from_templates`. The expected result is a completed approval template with “Calendar” and “Title” labels first, followed by the leftover `timezone` parameter.
 
-**Call relations**: Directly exercises the internal renderer rather than the bundled-template wrapper. It validates the happy path across both `render_question_template` and `render_tool_params`.
+**Call relations**: The test calls the lower-level rendering function directly instead of using the bundled file. That keeps the test focused on rendering behavior, while assertion and JSON helper macros provide the comparison data.
 
 *Call graph*: calls 1 internal fn (render_mcp_tool_approval_template_from_templates); 3 external calls (assert_eq!, json!, vec!).
 
@@ -129,11 +131,11 @@ fn renders_exact_match_with_readable_param_labels()
 fn returns_none_when_no_exact_match_exists()
 ```
 
-**Purpose**: Checks that rendering fails when the tool title does not exactly match any template. This confirms the renderer does not fall back to fuzzy or partial matching.
+**Purpose**: This test checks that the renderer refuses to use the wrong template. A similar template should not be used if the tool title does not match exactly.
 
-**Data flow**: Creates a single template for `create_event`, calls `render_mcp_tool_approval_template_from_templates` with `delete_event`, and asserts the result is `None`.
+**Data flow**: It creates a template for one calendar action, then asks for a different action. The expected before-to-after result is simple: the renderer is given mismatched input and should return nothing rather than a misleading approval prompt.
 
-**Call relations**: Targets the exact-match lookup behavior inside `render_mcp_tool_approval_template_from_templates`.
+**Call relations**: This test exercises the exact-match rule used by the template selection flow. It uses assertions to confirm that a non-matching tool request does not produce a rendered message.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -144,11 +146,11 @@ fn returns_none_when_no_exact_match_exists()
 fn returns_none_when_relabeling_would_collide()
 ```
 
-**Purpose**: Ensures rendering fails if a template-assigned display label would collide with another parameter’s display name. This protects the approval UI from ambiguous parameter labels.
+**Purpose**: This test checks a safety rule for parameter display names. If a friendly label would duplicate another parameter’s visible name, the renderer should reject the template instead of showing two confusing rows with the same label.
 
-**Data flow**: Creates a template that relabels `calendar_id` to `timezone`, then renders against params containing both `calendar_id` and `timezone`. It asserts the renderer returns `None` because `render_tool_params` detects the duplicate display name.
+**Data flow**: It creates a template that renames `calendar_id` to `timezone`, while the actual tool parameters also contain a real `timezone` field. The renderer is expected to detect that the displayed names would collide and return nothing.
 
-**Call relations**: Exercises the collision-detection branch in `render_tool_params` through the internal renderer.
+**Call relations**: This test is aimed at the duplicate-name protection inside `render_tool_params`, reached through the normal template-rendering path. The assertion confirms that ambiguous approval displays are not allowed.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -159,11 +161,11 @@ fn returns_none_when_relabeling_would_collide()
 fn bundled_templates_load()
 ```
 
-**Purpose**: Sanity-checks that the bundled template file parses and passes schema validation in the test environment. It guards against broken embedded JSON or version drift.
+**Purpose**: This test checks that the real bundled template file can be loaded successfully. It guards against shipping a broken JSON template file or one with the wrong schema version.
 
-**Data flow**: Reads the lazily initialized `CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES` static and asserts `is_some()` is `true`.
+**Data flow**: It reads the shared lazy template holder and checks that it contains some loaded template data rather than failure. If the bundled file cannot be parsed or has the wrong version, this test would fail.
 
-**Call relations**: Indirectly validates `load_consequential_tool_message_templates`, since the static initializer runs that function.
+**Call relations**: This test indirectly exercises `load_consequential_tool_message_templates` through the lazy static template storage. It matters because production rendering depends on that bundled data being available.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -174,11 +176,11 @@ fn bundled_templates_load()
 fn renders_literal_template_without_connector_substitution()
 ```
 
-**Purpose**: Verifies that templates without the `{connector_name}` placeholder render successfully even when no connector name is supplied. It distinguishes literal templates from substitution-required templates.
+**Purpose**: This test proves that templates without `{connector_name}` do not require a connector name. A fully written question like “Allow GitHub...” can be rendered as plain text.
 
-**Data flow**: Creates a template whose text already names GitHub literally, calls `render_mcp_tool_approval_template_from_templates` with `connector_name` set to `None` and empty params, and asserts the returned rendered template contains the literal question text and empty display params.
+**Data flow**: It builds a GitHub template whose text contains no placeholder and passes no connector name. The renderer should still return a completed approval prompt, with the literal question text and an empty parameter display list.
 
-**Call relations**: Exercises the non-substitution branch of `render_question_template` through the internal renderer.
+**Call relations**: The test calls `render_mcp_tool_approval_template_from_templates` directly to verify the branch handled by `render_question_template` where no substitution is needed. Assertions and JSON helpers check the exact rendered result.
 
 *Call graph*: calls 1 internal fn (render_mcp_tool_approval_template_from_templates); 3 external calls (assert_eq!, json!, vec!).
 
@@ -189,26 +191,24 @@ fn renders_literal_template_without_connector_substitution()
 fn returns_none_when_connector_placeholder_has_no_value()
 ```
 
-**Purpose**: Ensures rendering fails when a template requires `{connector_name}` substitution but no connector name is available. This prevents prompts with unresolved placeholders.
+**Purpose**: This test checks that a template containing `{connector_name}` is not rendered unless a real connector name is available. That prevents showing the user a broken question with an unreplaced placeholder.
 
-**Data flow**: Creates a template containing `{connector_name}`, calls `render_mcp_tool_approval_template_from_templates` with `connector_name` set to `None`, and asserts the result is `None`.
+**Data flow**: It creates a calendar template that needs `{connector_name}` but passes no connector name. The expected output is nothing, because the renderer cannot safely complete the sentence.
 
-**Call relations**: Targets the placeholder-resolution requirement enforced by `render_question_template`.
+**Call relations**: This test covers the failure path in `render_question_template`, reached through the normal template rendering flow. The assertion confirms that incomplete approval wording is rejected instead of displayed.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `core/src/tools/orchestrator.rs`
 
-`orchestration` · `tool execution path around each tool call`
+`orchestration` · `tool execution / request handling`
 
-This module is the high-level execution controller for tools. `ToolOrchestrator` owns a `SandboxManager`, and `OrchestratorRunResult<Out>` bundles the tool’s output with any `DeferredNetworkApproval` that must be finalized later. The orchestrator’s job is not to implement tool behavior itself, but to sequence policy checks and retries around arbitrary `ToolRuntime` implementations.
+Tools in this project can do powerful things, such as running commands, changing files, or reaching the network. This file makes sure those actions happen only under the right safety rules. Without it, each tool would need to invent its own approval and sandbox behavior, which would make the system harder to trust and easier to get wrong.
 
-`run` begins by deriving telemetry labels from `flat_tool_name`, checking strict auto-review mode, and computing the tool’s `ExecApprovalRequirement` either from the tool or from default policy. It handles three approval cases: skip, forbidden, or explicit approval required. Approval requests may first consult permission-request hooks; otherwise they go through guardian or user approval via `request_approval`. `reject_if_not_approved` converts review outcomes into `ToolError::Rejected`, including guardian-specific rejection and timeout messages.
+The main type, ToolOrchestrator, works like a careful supervisor. First it checks whether the requested tool action is allowed, forbidden, or needs approval from a user, an automated reviewer called the guardian, or configured permission hooks. Then it picks a sandbox, which is a restricted environment that limits what the tool can touch. It also sets up network approval if the tool may try to connect outside the machine.
 
-After approval, `run` selects the initial sandbox using `sandbox_override_for_first_attempt` and `SandboxManager::select_initial`, builds a `SandboxAttempt` with filesystem/network policy, workspace roots, cwd, platform-specific sandbox flags, and managed-network enforcement, then delegates actual execution to `run_attempt`. That helper wraps the tool run with `begin_network_approval` and either immediate or deferred network-approval finalization depending on `NetworkApprovalMode`.
-
-If the first attempt succeeds, the orchestrator returns immediately. If it fails with `SandboxErr::Denied`, `run` decides whether retry is allowed: it inspects any embedded network-policy decision, whether the tool escalates on failure, whether unsandboxed execution is permitted, and whether approval policy allows a no-sandbox retry. For retries it builds a concise reason string—either a network-specific denial or the stable fallback `"command failed; retry without sandbox?"`—requests fresh approval when needed, constructs a second `SandboxAttempt` (often unsandboxed), and runs the tool again. Throughout, it emits telemetry decisions and sandbox outcomes, distinguishing initial denial, escalation success, timeout, and signal cases.
+After that, it runs the tool once. If the tool succeeds, the result is returned. If the sandbox denies the action, the orchestrator decides whether a retry is allowed. For example, it may ask for fresh approval, explain that network access was blocked, and then retry with no sandbox or with an adjusted sandbox. It records telemetry, meaning diagnostic information about decisions and outcomes, so the system can later explain what happened.
 
 #### Function details
 
@@ -218,11 +218,11 @@ If the first attempt succeeds, the orchestrator returns immediately. If it fails
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a new orchestrator with its own `SandboxManager`. This is the standard entry point for code that needs to run tools under approval and sandbox policy.
+**Purpose**: Creates a new ToolOrchestrator with its own SandboxManager, the component that knows how to choose and run sandbox types. Callers use this when they are about to run a tool through the shared approval-and-sandbox flow.
 
-**Data flow**: Allocates `SandboxManager::new()` → stores it in `ToolOrchestrator { sandbox }` → returns the new orchestrator.
+**Data flow**: It takes no input. It creates a fresh sandbox manager and stores it inside a new ToolOrchestrator. The output is a ready-to-use orchestrator object.
 
-**Call relations**: Session and tool-handling setup code instantiate the orchestrator before dispatching tool runs. It does not perform execution itself; it prepares the reusable sandbox-selection component.
+**Call relations**: Higher-level tool paths create this before running tool work, such as normal tool calls, exec-like commands, apply-patch interception, session setup with sandboxing, and tests around full-access behavior. After construction, the caller usually hands the orchestrator a tool request through ToolOrchestrator::run.
 
 *Call graph*: calls 1 internal fn (new); called by 5 (danger_full_access_tool_attempts_do_not_enforce_managed_network, handle_call, intercept_apply_patch, run_exec_like, open_session_with_sandbox).
 
@@ -239,11 +239,11 @@ async fn run_attempt(
     ) -> (Result<Out, ToolError>,
 ```
 
-**Purpose**: Executes one concrete tool attempt under a specific `SandboxAttempt`, wrapping the run with network-approval registration and finalization. It returns both the tool result and any deferred network-approval handle that survives the attempt.
+**Purpose**: Runs one single attempt of a tool under a specific sandbox setup. It also wraps that attempt with network approval tracking, so network access can be allowed, denied, cancelled, or finalized cleanly.
 
-**Data flow**: Reads mutable `tool`, request `req`, `tool_ctx`, chosen `attempt`, and `managed_network_active` → calls `begin_network_approval` using the tool’s `network_approval_spec(req, tool_ctx)` → clones session/turn/call metadata into a fresh `ToolCtx`, copies the sandbox attempt while injecting `network_denial_cancellation_token` from the active approval, and awaits `tool.run(req, &attempt_with_network_approval, &attempt_tool_ctx)` → if no network approval was started, returns the run result with `None`; otherwise branches on `network_approval.mode()`: immediate mode calls `finish_immediate_network_approval` and may replace the tool result with an error, while deferred mode converts to `DeferredNetworkApproval`, eagerly finishes it only when the tool run itself failed, and otherwise returns the deferred handle alongside the run result.
+**Data flow**: It receives the tool, the tool request, the current tool context, the chosen sandbox attempt, and whether managed network control is active. It asks the tool what kind of network approval it may need, starts that approval process, adds any network cancellation token into the sandbox attempt, and then calls the tool’s own run method. After the run, it finalizes immediate network approvals right away, or returns a deferred network approval if the successful result still needs later completion. The output is the tool result plus an optional deferred network approval.
 
-**Call relations**: The main `run` method calls this for both the initial and retry attempts. It delegates actual tool execution to the `ToolRuntime`, and delegates network-approval lifecycle work to `begin_network_approval`, `finish_immediate_network_approval`, and `finish_deferred_network_approval`.
+**Call relations**: ToolOrchestrator::run calls this for the first sandboxed attempt and, if needed, again for an escalated retry. This function hands off the actual work to the tool’s run implementation, while using the network approval helpers to begin and finish approval bookkeeping around that work.
 
 *Call graph*: calls 3 internal fn (begin_network_approval, finish_deferred_network_approval, finish_immediate_network_approval); 2 external calls (network_approval_spec, run).
 
@@ -260,13 +260,11 @@ async fn run(
         approval_policy: AskForApprov
 ```
 
-**Purpose**: Drives the full tool-execution lifecycle: approval, sandbox selection, first attempt, sandbox-denial analysis, optional re-approval, and retry. It is the orchestrator’s main policy engine.
+**Purpose**: Runs the full safe-tool workflow from beginning to end: approval, sandbox selection, first attempt, possible retry, and telemetry. This is the main entry for code that wants a tool executed under the project’s safety rules.
 
-**Data flow**: Consumes mutable `tool`, request `req`, `tool_ctx`, `turn_ctx`, and `approval_policy` → derives telemetry labels and strict-auto-review state, computes filesystem/network sandbox policies and the tool’s `ExecApprovalRequirement`, and may request approval through `request_approval` followed by `reject_if_not_approved` → selects the initial sandbox using `sandbox_override_for_first_attempt` and `SandboxManager::select_initial`, builds an initial `SandboxAttempt`, times it, and calls `run_attempt`.
+**Data flow**: It receives a mutable tool, the tool request, tool and turn context, and the approval policy for the session. It reads sandbox policies, network policy, permission settings, feature flags, workspace roots, and telemetry from the turn context. It decides whether approval is required, asks hooks, the guardian, or the user if needed, builds the first sandbox attempt, and runs it. If the first attempt succeeds, it returns the tool output and any deferred network approval. If the sandbox denies the attempt, it decides whether retrying is allowed, may request approval again, builds a retry attempt with broader permissions or a different sandbox, and runs the tool again. It returns success with output or a ToolError explaining rejection, sandbox denial, timeout, or another failure.
 
-If the first attempt succeeds, returns `OrchestratorRunResult { output, deferred_network_approval }`. If it fails with `SandboxErr::Denied`, it extracts any network approval context from the denial payload, checks whether retry/escalation is allowed by tool policy, approval policy, and unsandboxed-execution rules, and may return the original denial unchanged. Otherwise it builds a retry reason, optionally requests fresh approval (especially for strict auto-review or network-related retries), constructs a retry `SandboxAttempt`—often with `SandboxType::None` when unsandboxed execution is allowed—times and runs it, emits telemetry for denied/escalated/timed-out/signal outcomes, and returns either the retry result or the retry error. Non-sandbox errors skip retry and only contribute telemetry when they map to a sandbox outcome.
-
-**Call relations**: Higher-level tool handlers call this as the single entry point for executing a `ToolRuntime`. Internally it coordinates nearly every helper in the file plus sandboxing and network-approval helpers from other modules.
+**Call relations**: This is the central story that brings together most of the file. Callers use it when a tool call must be executed. It calls ToolOrchestrator::request_approval to ask permission, ToolOrchestrator::reject_if_not_approved to turn non-approval into a clear error, ToolOrchestrator::run_attempt to do each actual execution attempt, and the two small helper functions to report sandbox outcomes and build a retry reason.
 
 *Call graph*: calls 9 internal fn (file_system_sandbox_policy, network_sandbox_policy, flat_tool_name, build_denial_reason_from_output, sandbox_outcome_from_tool_error, sandbox_override_for_first_attempt, unsandboxed_execution_allowed, select_initial, from_abs_path); 18 external calls (now, reject_if_not_approved, request_approval, run_attempt, escalate_on_failure, exec_approval_requirement, sandbox_cwd, sandbox_permissions, sandbox_preference, should_bypass_approval (+8 more)).
 
@@ -283,11 +281,11 @@ async fn request_approval(
         evaluate_permissi
 ```
 
-**Purpose**: Obtains an approval decision for a tool action, giving permission-request hooks first chance to answer before falling back to the tool’s normal async approval path. It also records the decision source in telemetry.
+**Purpose**: Asks for permission to run or retry a tool action. It gives configured permission hooks the first chance to answer, then falls back to the normal user or guardian approval path.
 
-**Data flow**: Reads mutable `tool`, request `req`, `permission_request_run_id`, `approval_ctx`, `tool_ctx`, `evaluate_permission_request_hooks`, and telemetry handle `otel` → if hook evaluation is enabled and `tool.permission_request_payload(req)` returns a payload, calls `run_permission_request_hooks`; hook allow returns `ReviewDecision::Approved` and logs a config-sourced telemetry decision, hook deny logs `Denied` and returns `Err(ToolError::Rejected(message))`, and no hook decision falls through → otherwise determines telemetry source from presence of `guardian_review_id`, awaits `tool.start_approval_async(req, approval_ctx)`, logs the resulting `ReviewDecision`, and returns it.
+**Data flow**: It receives the tool, the request, an identifier for this permission request, approval context, tool context, a flag saying whether hooks should be checked, and telemetry. If hooks are enabled and the tool can describe its permission request, it runs those hooks. A hook can allow the action, deny it with a message, or stay silent. If no hook decides, the function asks the tool to start its normal approval flow. It records where the decision came from, then returns the review decision or a rejection error.
 
-**Call relations**: The main `run` method calls this for initial approvals and retry approvals. It delegates to permission hooks when configured, otherwise to the tool runtime’s own approval implementation, and always feeds the result into telemetry.
+**Call relations**: ToolOrchestrator::run calls this before the first attempt when approval is required, and again before an escalated retry when needed. It hands off to run_permission_request_hooks for configured automatic decisions, or to the tool’s start_approval_async method for the usual guardian or user prompt.
 
 *Call graph*: calls 3 internal fn (run_permission_request_hooks, flat_tool_name, tool_decision); 3 external calls (permission_request_payload, start_approval_async, Rejected).
 
@@ -302,11 +300,11 @@ async fn reject_if_not_approved(
     ) -> Result<(), ToolError>
 ```
 
-**Purpose**: Converts a `ReviewDecision` into either success or a concrete rejection error. It centralizes guardian-specific rejection and timeout messaging.
+**Purpose**: Turns an approval decision into either permission to continue or a clear rejection error. It centralizes how denied, aborted, timed-out, and network-policy decisions are interpreted.
 
-**Data flow**: Reads `tool_ctx`, optional `guardian_review_id`, and `decision` → matches the decision: `Denied`/`Abort` become `Err(ToolError::Rejected(...))` using `guardian_rejection_message` when a guardian review ID exists or a generic user-rejection string otherwise; `TimedOut` becomes `Err(ToolError::Rejected(guardian_timeout_message()))`; approved variants return `Ok(())`; `NetworkPolicyAmendment` returns `Ok(())` for allow amendments and a generic rejection for deny amendments.
+**Data flow**: It receives the tool context, an optional guardian review id, and the review decision. If the decision means approval, it returns success. If the decision means denial or abort, it builds a human-readable reason, using a guardian-specific rejection message when the guardian was involved or a simple user rejection message otherwise. If the decision timed out, it returns the standard guardian timeout message. For network policy changes, it allows an allow amendment and rejects a deny amendment.
 
-**Call relations**: After every approval request, `run` calls this to enforce the decision before proceeding. It delegates guardian-specific message generation to guardian helpers and keeps approval-result interpretation consistent across initial and retry flows.
+**Call relations**: ToolOrchestrator::run calls this immediately after asking for approval. This keeps the main run flow simple: request a decision, then use this function to stop the tool unless the decision is good enough to continue.
 
 *Call graph*: 3 external calls (Rejected, guardian_rejection_message, guardian_timeout_message).
 
@@ -317,11 +315,11 @@ async fn reject_if_not_approved(
 fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str>
 ```
 
-**Purpose**: Maps sandbox-related `ToolError` variants to the short outcome labels used in telemetry. Non-sandbox rejections and generic codex errors intentionally produce no label.
+**Purpose**: Converts certain sandbox-related errors into short outcome labels for telemetry. These labels help the system record whether the sandbox denied, timed out, or was interrupted by a signal.
 
-**Data flow**: Reads `err: &ToolError` → matches nested `CodexErr::Sandbox` variants to `Some("denied")`, `Some("timed_out")`, or `Some("signal")`; returns `None` for `ToolError::Rejected(_)` and other codex errors.
+**Data flow**: It receives a ToolError. If the error is a sandbox denial, timeout, or signal, it returns a matching text label. If the error is a user rejection or another kind of Codex error, it returns nothing because there is no sandbox outcome to record.
 
-**Call relations**: The main `run` method calls this after failed attempts to decide whether to emit a sandbox outcome metric. It is a pure classification helper.
+**Call relations**: ToolOrchestrator::run calls this when an attempt fails. If it gets a label back, it passes that label into telemetry so later diagnostics can show how the sandbox behaved.
 
 *Call graph*: called by 1 (run).
 
@@ -332,11 +330,11 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str>
 fn build_denial_reason_from_output(_output: &ExecToolCallOutput) -> String
 ```
 
-**Purpose**: Produces the stable human-facing retry reason used when a sandboxed command fails and the orchestrator wants approval to retry without sandboxing. It currently ignores the actual output content by design.
+**Purpose**: Builds the short message used when asking whether to retry after a sandbox denial. Today it deliberately returns a simple stable phrase rather than trying to explain every detail of the failed command output.
 
-**Data flow**: Reads `_output: &ExecToolCallOutput` but does not inspect it → returns the fixed string `"command failed; retry without sandbox?"`.
+**Data flow**: It receives the failed command output, but does not inspect it yet. It returns the fixed message: "command failed; retry without sandbox?" This keeps user-facing wording predictable while leaving room for smarter reasoning later.
 
-**Call relations**: The retry branch in `run` calls this when there is no network-specific denial context. The helper exists so heuristics can evolve later without changing call sites.
+**Call relations**: ToolOrchestrator::run calls this when the first sandboxed attempt is denied for a non-network reason and the system is preparing an approval prompt for a retry. The returned text becomes the retry reason shown through the approval path.
 
 *Call graph*: called by 1 (run).
 
@@ -348,11 +346,13 @@ These files normalize incoming approval-related signals and maintain compact sum
 
 `data_model` · `request handling`
 
-This file contains the local structs the TUI keeps while approval prompts are queued or rendered. `ExecApprovalRequestEvent` mirrors execution-approval data from the app server but adds convenience behavior around missing ids and decision lists. Its fields preserve command argv, cwd, optional reason, proposed exec/network policy amendments, optional network approval context, optional additional permissions, and any explicitly supplied available decisions. `ApplyPatchApprovalRequestEvent` is the patch-approval counterpart, storing a `HashMap<PathBuf, FileChange>` display model rather than raw protocol changes so the UI can render diffs directly.
+When the assistant wants to run a command or apply a patch, the TUI may need to pause and ask the user for permission. That question can arrive while other output is still streaming, so the TUI needs a stable, self-contained record of what is being requested. This file provides those records.
 
-The main logic lives on `ExecApprovalRequestEvent`. `effective_approval_id` falls back from `approval_id` to `call_id`, which is important because older or alternate payloads may omit a dedicated approval id. `effective_available_decisions` either clones the server-provided decision list or synthesizes one with `default_available_decisions`. That synthesis is context-sensitive: network approvals offer accept, accept-for-session, optionally an `ApplyNetworkPolicyAmendment` decision for the first allow amendment, then cancel; approvals carrying `additional_permissions` are intentionally restricted to accept/cancel; ordinary exec approvals offer accept, optionally accept-with-execpolicy-amendment, then cancel.
+`ExecApprovalRequestEvent` describes a request to run a command. It stores the command, the working directory, the reason, optional permission changes, and the choices the user may be offered. If the server does not explicitly provide the choices, this file can infer sensible defaults. For example, a network-related request may offer “allow once,” “allow for this session,” or “add a network rule,” while a normal command may offer “accept,” “accept with a command policy change,” or “cancel.”
 
-The design preserves app-server decision enums intact instead of inventing TUI-specific variants, minimizing translation work when the user eventually submits a decision back to the server.
+`ApplyPatchApprovalRequestEvent` describes a request to apply file changes. Besides the request identifiers and reason, it carries a map of paths to `FileChange` display data, so the TUI can show the user what would change before asking for approval.
+
+In short, this file is like a form template for permission prompts: it gathers the fields the TUI needs, fills in missing defaults, and keeps the prompt understandable even if it is shown later.
 
 #### Function details
 
@@ -362,11 +362,11 @@ The design preserves app-server decision enums intact instead of inventing TUI-s
 fn effective_approval_id(&self) -> String
 ```
 
-**Purpose**: Returns the stable approval identifier the TUI should use for this execution approval, falling back to the call id when no explicit approval id is present.
+**Purpose**: This gives the TUI one reliable identifier to use for an execution approval. If the newer explicit approval ID is present, it uses that; otherwise it falls back to the older command call ID.
 
-**Data flow**: It reads `self.approval_id`; if `Some`, it clones and returns that string. Otherwise it clones and returns `self.call_id`.
+**Data flow**: It reads the approval request's optional `approval_id` and required `call_id`. If `approval_id` has a value, it returns a copy of it. If not, it returns a copy of `call_id`, so callers always get a usable string.
 
-**Call relations**: This helper is used by approval-handling code that needs a single identifier regardless of whether the upstream payload carried a dedicated `approval_id`.
+**Call relations**: Other TUI code can call this when it needs to track, queue, or answer an approval request without caring which identifier style the app server used. It does not hand work off to another helper; it simply chooses the best available ID.
 
 
 ##### `ExecApprovalRequestEvent::effective_available_decisions`  (lines 51–61)
@@ -375,11 +375,11 @@ fn effective_approval_id(&self) -> String
 fn effective_available_decisions(&self) -> Vec<CommandExecutionApprovalDecision>
 ```
 
-**Purpose**: Returns the list of decisions the UI should present for this approval, preferring an explicit server-provided list and otherwise synthesizing defaults from the approval context.
+**Purpose**: This returns the list of approval choices the user should be shown for a command request. It respects choices sent by the server, but can also build a default list when the server leaves them out.
 
-**Data flow**: It reads `self.available_decisions`. If present, it clones and returns that vector. If absent, it passes `self.network_approval_context`, `self.proposed_execpolicy_amendment`, `self.proposed_network_policy_amendments`, and `self.additional_permissions` into `Self::default_available_decisions` and returns the generated vector.
+**Data flow**: It looks at the request's `available_decisions`. If that field already contains choices, it returns a copy of them. If it is missing, it gathers the request's network context, proposed command policy change, proposed network policy changes, and extra permission profile, then passes those pieces to `default_available_decisions`; the result is returned as the final choice list.
 
-**Call relations**: Approval rendering code calls this to populate buttons or menu choices. It delegates fallback synthesis to `default_available_decisions` so the context-sensitive rules live in one place.
+**Call relations**: This is the convenient entry point for code that renders or processes an execution approval prompt. It delegates the fallback rules to `ExecApprovalRequestEvent::default_available_decisions`, keeping callers from having to repeat the decision-building logic.
 
 *Call graph*: 1 external calls (default_available_decisions).
 
@@ -393,11 +393,11 @@ fn default_available_decisions(
         proposed_network_policy_
 ```
 
-**Purpose**: Synthesizes the default execution-approval decision list from network context, proposed policy amendments, and additional-permissions requests.
+**Purpose**: This builds a sensible default set of approval choices based on what kind of permission is being requested. It prevents the TUI from showing an empty or inappropriate prompt when the server did not send an explicit choice list.
 
-**Data flow**: It takes optional references to network approval context, execpolicy amendment, network policy amendments slice, and additional permissions. If network context exists, it builds `[Accept, AcceptForSession]`, optionally appends `ApplyNetworkPolicyAmendment` for the first amendment whose action is `Allow`, then appends `Cancel`. If additional permissions exist without network context, it returns `[Accept, Cancel]`. Otherwise it starts with `[Accept]`, optionally appends `AcceptWithExecpolicyAmendment { ... }`, then appends `Cancel`.
+**Data flow**: It receives optional context about network access, command policy changes, network policy changes, and additional permissions. If network approval is involved, it starts with temporary approval choices, adds a network-policy-amendment choice when there is an allow-rule amendment available, and ends with cancel. If additional permissions are involved, it offers only accept or cancel. Otherwise, it offers accept, optionally adds an accept-with-command-policy-change choice, and then adds cancel. The output is a vector of approval decision values.
 
-**Call relations**: This is the fallback logic used by `effective_available_decisions` when the server did not explicitly enumerate allowed decisions. It encodes the TUI's default approval UX policy for different approval categories.
+**Call relations**: This helper is called by `ExecApprovalRequestEvent::effective_available_decisions` when an approval request does not already include its own choices. It is the central place where the TUI's fallback approval menu is assembled.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -406,11 +406,11 @@ fn default_available_decisions(
 
 `domain_logic` · `request handling`
 
-This file provides a small in-memory model for the TUI's recent auto-review denial UX. `RecentAutoReviewDenials` wraps a `VecDeque<GuardianAssessmentEvent>` and keeps only the most recent denied events, capped by `MAX_RECENT_DENIALS` at 10. The `push` method enforces two invariants: only events whose `status` is `GuardianAssessmentStatus::Denied` are stored, and entries are deduplicated by `event.id` before the newest copy is pushed to the front. After insertion, the deque is truncated to the fixed maximum, so the structure behaves like a recency-ordered bounded cache.
+When the system automatically reviews an action and decides it should not be allowed, the terminal interface needs a simple way to remember and display that denial. This file is that small memory box. It stores only denied review events, keeps the newest ones first, removes older duplicates with the same review ID, and limits the list to ten items so the UI does not grow cluttered or waste memory. Think of it like a “recently blocked” shelf that always puts the newest item at the front and throws away anything beyond the tenth slot.
 
-The remaining methods are simple accessors: `is_empty` checks whether any denials are stored, `entries` exposes an iterator over the deque in newest-first order, and `take` removes and returns a denial by id if present. This supports UI flows where the user selects a recent denial for retry approval and the item should disappear from the list once consumed.
+The main type, `RecentAutoReviewDenials`, wraps a queue, which is a list designed for adding and removing items efficiently at either end. Its methods let the UI add a new denial, ask whether there are any denials, look through the current list, or remove one specific denial once it has been dealt with.
 
-The standalone `action_summary` function turns a `GuardianAssessmentAction` into a short display string. It preserves shell commands directly, shell-quotes `Execve` argv with `shlex::try_join` and falls back to space-joining on quoting failure, summarizes patch actions by file count, formats network targets and MCP tool calls with readable labels, and uses the optional reason for permission requests when available. The included test verifies the bounded newest-first retention behavior.
+The file also includes `action_summary`, which converts different kinds of reviewed actions into short text. For example, a shell command becomes the command text, a patch becomes a note about touched files, and network access becomes a phrase naming the target. This keeps UI messages compact and understandable.
 
 #### Function details
 
@@ -420,11 +420,11 @@ The standalone `action_summary` function turns a `GuardianAssessmentAction` into
 fn push(&mut self, event: GuardianAssessmentEvent)
 ```
 
-**Purpose**: Adds a denied guardian assessment to the recent-denials list, deduplicating by id and enforcing the fixed maximum size.
+**Purpose**: Adds a newly reported review event to the recent-denials list, but only if the event was actually denied. It also keeps the list clean by removing any older entry with the same ID and keeping only the ten newest denials.
 
-**Data flow**: It takes a `GuardianAssessmentEvent` by value. If `event.status` is not `Denied`, it returns immediately without mutation. Otherwise it removes any existing entries whose `id` matches `event.id`, pushes the new event to the front of `self.entries`, truncates the deque to `MAX_RECENT_DENIALS`, and returns `()`.
+**Data flow**: It receives one review event. If the event is not marked as denied, nothing changes. If it is denied, the existing list is first filtered to remove any event with the same ID, then the new event is placed at the front, and finally anything beyond the ten most recent entries is dropped.
 
-**Call relations**: This method is called when new guardian assessment events arrive and the TUI wants to maintain a short retryable history. It performs all recency ordering and deduplication locally.
+**Call relations**: This is the entry point for feeding review results into this small store. Internally it relies on standard list operations to remove duplicates, put the newest denial first, and trim the list to its fixed size.
 
 *Call graph*: 3 external calls (push_front, retain, truncate).
 
@@ -435,11 +435,11 @@ fn push(&mut self, event: GuardianAssessmentEvent)
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether there are any stored recent denial events.
+**Purpose**: Answers whether there are currently any recent denied review events. A caller can use this to decide whether there is anything worth showing in the UI.
 
-**Data flow**: It reads `self.entries.is_empty()` and returns the resulting boolean.
+**Data flow**: It reads the stored queue of denial events and returns a true-or-false answer: true if there are no entries, false if at least one denial is stored. It does not change the list.
 
-**Call relations**: UI code uses this to decide whether to show recent-denial affordances or empty-state behavior.
+**Call relations**: This is a small helper for code that wants to check the store before displaying or processing it. It delegates the actual check to the underlying queue.
 
 *Call graph*: 1 external calls (is_empty).
 
@@ -450,11 +450,11 @@ fn is_empty(&self) -> bool
 fn entries(&self) -> impl Iterator<Item = &GuardianAssessmentEvent>
 ```
 
-**Purpose**: Returns an iterator over stored denial events in newest-first order.
+**Purpose**: Lets other code read through the current denial events in order, without taking ownership of them or changing the list. The newest denial appears first because of how `push` stores entries.
 
-**Data flow**: It borrows `self.entries` and returns `self.entries.iter()`, yielding `&GuardianAssessmentEvent` items.
+**Data flow**: It reads the internal queue and returns an iterator, which is a step-by-step reader over the stored events. The caller receives references to the events, while the original list stays unchanged.
 
-**Call relations**: Rendering code uses this to list recent denials without taking ownership of the stored events.
+**Call relations**: UI code can call this when it needs to render the recent denials. It hands out a safe view over the queue by using the queue’s built-in iteration behavior.
 
 *Call graph*: 1 external calls (iter).
 
@@ -465,11 +465,11 @@ fn entries(&self) -> impl Iterator<Item = &GuardianAssessmentEvent>
 fn take(&mut self, id: &str) -> Option<GuardianAssessmentEvent>
 ```
 
-**Purpose**: Removes and returns a stored denial event by id.
+**Purpose**: Finds and removes one stored denial by its ID. This is useful when a specific denial has been acknowledged, selected, or otherwise no longer needs to stay in the recent list.
 
-**Data flow**: It takes `&str` id, searches `self.entries.iter().position(...)` for a matching `entry.id`, returns `None` if not found, otherwise removes that index from the deque and returns the owned `GuardianAssessmentEvent`.
+**Data flow**: It receives an ID string. It searches the stored events for the first entry whose ID matches. If it finds one, it removes that event from the queue and returns it; if not, it returns nothing and leaves the list unchanged.
 
-**Call relations**: Selection/approval flows call this when the user chooses a recent denial to act on, so the consumed item no longer appears in the recent list.
+**Call relations**: This function is the counterpart to `entries`: after code has identified a particular denial, it can call `take` to pull that exact event out of the store. It uses the queue’s iterator to find the position and the queue’s remove operation to extract it.
 
 *Call graph*: 2 external calls (iter, remove).
 
@@ -480,11 +480,11 @@ fn take(&mut self, id: &str) -> Option<GuardianAssessmentEvent>
 fn action_summary(action: &GuardianAssessmentAction) -> String
 ```
 
-**Purpose**: Formats a concise human-readable summary string for a guardian assessment action.
+**Purpose**: Turns a reviewed action into a short label that a person can quickly understand. It is used to describe what the automated reviewer denied, such as a command, a patch, network access, or a permission request.
 
-**Data flow**: It pattern-matches `&GuardianAssessmentAction`. `Command` returns the command string clone. `Execve` uses `argv` if non-empty or `[program]` otherwise, then tries `shlex::try_join` and falls back to `join(" ")`. `ApplyPatch` formats either a single touched path or a file count. `NetworkAccess` formats the target. `McpToolCall` uses `connector_name` when present, otherwise `server`, and formats `MCP <tool> on <label>`. `RequestPermissions` uses the optional reason when present, otherwise a generic label. It returns the resulting `String`.
+**Data flow**: It receives a `GuardianAssessmentAction`, which represents the kind of action that was reviewed. It checks which kind of action it is and builds a plain text summary from the important fields, such as the command text, program arguments, file count, network target, tool name, or permission reason. It returns that summary as a string.
 
-**Call relations**: This helper is used wherever the TUI needs a short label for a denied action, such as recent-denial menus or status text.
+**Call relations**: This function sits between detailed protocol data and the terminal display. For executable actions it tries to quote command arguments safely using shell-style joining, and if that fails it falls back to simply joining the words with spaces. Other action types are formatted directly into concise UI text.
 
 *Call graph*: 3 external calls (format!, try_join, vec!).
 
@@ -495,11 +495,11 @@ fn action_summary(action: &GuardianAssessmentAction) -> String
 fn denied_event(id: usize) -> GuardianAssessmentEvent
 ```
 
-**Purpose**: Builds a synthetic denied guardian assessment event fixture for tests.
+**Purpose**: Builds a sample denied review event for tests. It gives each sample a predictable ID, rationale, and command so tests can check ordering and storage behavior clearly.
 
-**Data flow**: It takes a numeric id, formats strings for `id`, `rationale`, and command text, constructs a `GuardianAssessmentEvent` with `status: Denied` and a `GuardianAssessmentAction::Command` rooted at `/tmp`, and returns it.
+**Data flow**: It receives a number and uses it to create fields like `review-3`, `rationale 3`, and a matching shell command. It fills in the rest of the review event with fixed test values and returns a complete denied event object.
 
-**Call relations**: The retention test uses this helper to generate a sequence of distinct denial events without repeating fixture boilerplate.
+**Call relations**: The test `tests::keeps_only_ten_most_recent_denials` calls this helper repeatedly to create realistic denial events. The helper keeps the test focused on the behavior being checked instead of repeating event-building details.
 
 *Call graph*: 2 external calls (test_path_buf, format!).
 
@@ -510,11 +510,11 @@ fn denied_event(id: usize) -> GuardianAssessmentEvent
 fn keeps_only_ten_most_recent_denials()
 ```
 
-**Purpose**: Verifies that the recent-denials structure retains only the ten newest denied events in newest-first order.
+**Purpose**: Checks that the recent-denials store keeps exactly the ten newest denied events and orders them from newest to oldest. This protects the main behavior of the file from accidental changes.
 
-**Data flow**: It creates a default `RecentAutoReviewDenials`, pushes twelve generated denied events into it, iterates over `entries()` to collect ids, and asserts that only `review-11` through `review-2` remain in descending recency order.
+**Data flow**: It starts with an empty `RecentAutoReviewDenials` store, creates twelve denied events, and pushes them in order. It then reads back the stored IDs and compares them with the expected list, which should contain only reviews 11 through 2 in descending order.
 
-**Call relations**: This test documents the bounded-cache behavior implemented by `RecentAutoReviewDenials::push`.
+**Call relations**: This test exercises `RecentAutoReviewDenials::push` and `RecentAutoReviewDenials::entries` through the public behavior of the type. It uses `tests::denied_event` to create the inputs and an assertion to confirm the final stored order.
 
 *Call graph*: 3 external calls (assert_eq!, default, denied_event).
 
@@ -524,13 +524,13 @@ These bottom-pane components present the main interactive approval and structure
 
 ### `tui/src/bottom_pane/approval_overlay.rs`
 
-`orchestration` · `request handling while waiting for user approval`
+`domain_logic` · `request handling`
 
-This module is the approval-specific orchestration layer for bottom-pane modals. `ApprovalRequest` models four request families: command execution, permission grants, file changes, and MCP elicitation. `ApprovalOverlay` owns the currently displayed request, a queue of pending requests, a `ListSelectionView` for rendering and navigation, the derived `ApprovalOption` list, and keymaps for both generic list movement and approval-specific shortcuts.
+This file is the safety checkpoint for high-risk actions in the terminal interface. When the agent asks to run a command, change files, grant extra permissions, or answer an MCP elicitation request (a request from an external tool/server for user input), this overlay shows a small list of options like “Yes, proceed” or “No, cancel.” Without it, the app would either have no clear way to ask the user or might lose important decisions.
 
-The core flow is: construct the overlay with one request, derive a request-specific header and option set, render them through `ListSelectionView`, and on selection emit the corresponding app event. `build_options` chooses labels and shortcuts based on request type; for exec requests it adapts wording for network approvals and additional permissions, while MCP elicitation gets a special invariant: `Esc` must always mean `Cancel`, even if user keybindings overlap with decline. `apply_selection` dispatches to request-type-specific handlers, which in turn emit thread-scoped approval ops and, for some local-thread cases, insert history cells describing the user's decision.
+The main type, ApprovalOverlay, is like a ticket counter. It shows one approval request at a time, keeps later requests in a queue, and moves to the next ticket after the current one is answered or dismissed. It also listens for keyboard shortcuts, including custom key bindings, and routes the answer to the app through AppEventSender.
 
-The overlay also supports queueing multiple requests, dismissing stale requests resolved elsewhere, opening a fullscreen approval view, and jumping to the source thread for cross-thread approvals. Cancellation is explicit and type-aware: exec becomes `Cancel`, permissions become deny/empty grant, patch becomes `Cancel`, and elicitation becomes `Cancel`. Rendering itself is delegated almost entirely to the embedded `ListSelectionView`; this file's main responsibility is decision semantics, option construction, and shortcut policy.
+The file also carefully formats what the user sees. It can show the command, the reason for the request, the source thread, permission rules, or the server message. It records some decisions in the chat history so the user can see what they approved or denied. One important rule is that pressing Escape always cancels MCP elicitation prompts; it must never accidentally mean “continue without the requested information.”
 
 #### Function details
 
@@ -540,11 +540,11 @@ The overlay also supports queueing multiple requests, dismissing stale requests 
 fn thread_id(&self) -> ThreadId
 ```
 
-**Purpose**: Returns the `ThreadId` associated with any approval request variant.
+**Purpose**: Returns the conversation thread that owns this approval request. This lets the overlay send the final decision back to the right agent thread.
 
-**Data flow**: Pattern-matches `self` across all `ApprovalRequest` variants and copies out the stored `thread_id`.
+**Data flow**: It reads the stored thread identifier from whichever kind of approval request it is. It returns that identifier unchanged.
 
-**Call relations**: Used by decision handlers and thread-opening shortcuts so the overlay can route responses and navigation back to the originating thread without duplicating variant-specific extraction logic.
+**Call relations**: Other overlay code uses this when it needs to send a decision or open the source thread. It is the common way to avoid duplicating thread lookup logic for every request type.
 
 
 ##### `ApprovalRequest::thread_label`  (lines 118–125)
@@ -553,11 +553,11 @@ fn thread_id(&self) -> ThreadId
 fn thread_label(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the optional human-readable source thread label for cross-thread approvals.
+**Purpose**: Returns the optional human-readable label for the thread that produced the request. This is used when a request comes from a different visible thread and the UI should say where it came from.
 
-**Data flow**: Pattern-matches `self` across all variants and returns `thread_label.as_deref()`.
+**Data flow**: It looks inside the request, finds the optional label, and returns it as borrowed text if present. It does not change the request.
 
-**Call relations**: Used when building footer hints and deciding whether the open-thread shortcut should be available.
+**Call relations**: The footer hint uses this to decide whether to show an “open thread” shortcut. Other decision-handling code also uses it to decide whether to write a decision into the current history.
 
 *Call graph*: called by 1 (approval_footer_hint).
 
@@ -568,11 +568,11 @@ fn thread_label(&self) -> Option<&str>
 fn matches_resolved_request(&self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Checks whether an externally resolved app-server request corresponds to this approval request.
+**Purpose**: Checks whether an approval request is the same one as a request that the app server says has already been resolved. This prevents stale pop-ups from staying on screen.
 
-**Data flow**: Matches `(self, request)` across compatible variant pairs and compares the relevant identifiers: exec id, permissions call id, patch id, or MCP server name plus request id → returns true only for an exact match.
+**Data flow**: It compares the identifying fields for matching request kinds: command id, permission call id, file-change id, or MCP server/request id. It returns true only when both the kind and identity match.
 
-**Call relations**: Called by `ApprovalOverlay::dismiss_resolved_request` to remove queued requests or close the current overlay when another client already answered the request.
+**Call relations**: The overlay uses this while dismissing resolved requests from either the current prompt or the queue. It is the matching rule that lets external resolution close the right prompt without sending a new denial.
 
 
 ##### `ApprovalOverlay::new`  (lines 172–193)
@@ -587,11 +587,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs an approval overlay around an initial request and immediately derives its current option list and list view.
+**Purpose**: Creates a new approval overlay for the first request. It prepares the list view, key maps, feature flags, and initial set of choices.
 
-**Data flow**: Takes an initial `ApprovalRequest`, `AppEventSender`, feature flags, and keymaps → initializes empty current/queue state plus a default `ListSelectionView` → stores cloned sender and keymaps → calls `set_current(request)` to build the real header/options/list state → returns the overlay.
+**Data flow**: It receives the request, event sender, feature settings, and keyboard mappings. It builds an empty overlay shell, then installs the request as the current prompt and returns the ready-to-render overlay.
 
-**Call relations**: This is the main constructor used when the app first surfaces an approval request. It delegates request-specific setup to `set_current` so queue advancement can reuse the same path.
+**Call relations**: Higher-level app code calls this when an approval prompt needs to appear. It immediately delegates to the current-request setup path so construction and later queue advancement use the same display-building logic.
 
 *Call graph*: calls 1 internal fn (new); called by 4 (maybe_show_delayed_approval_requests_at, push_approval_request, apply_patch_prompt_with_thread_label_omits_command_line, make_overlay_with_keymap); 4 external calls (default, new, clone, clone).
 
@@ -602,11 +602,11 @@ fn new(
 fn enqueue_request(&mut self, req: ApprovalRequest)
 ```
 
-**Purpose**: Adds another approval request to the overlay's pending queue.
+**Purpose**: Adds another approval request behind the one currently being shown. This lets several risky actions wait their turn instead of replacing each other.
 
-**Data flow**: Takes an `ApprovalRequest` and pushes it onto `self.queue`.
+**Data flow**: It receives a request and pushes it into the overlay's queue. Nothing is sent to the app yet, and the current prompt stays unchanged.
 
-**Call relations**: Used when a new approval arrives while another is already being shown; `try_consume_approval_request` delegates directly here.
+**Call relations**: The bottom-pane integration calls this through try_consume_approval_request when a prompt is already open. The queued request will be displayed later by the queue advancement path.
 
 *Call graph*: called by 1 (try_consume_approval_request).
 
@@ -617,11 +617,11 @@ fn enqueue_request(&mut self, req: ApprovalRequest)
 fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Removes or completes requests that were resolved elsewhere, either from the queue or from the currently displayed request.
+**Purpose**: Removes a request that was resolved somewhere else, such as by the server or another part of the app. This avoids showing a question that no longer needs an answer.
 
-**Data flow**: Records the original queue length → retains only queued requests that do not match the resolved request → if the current request matches, marks `current_complete = true`, advances the queue, and returns true → otherwise returns whether the queue length changed.
+**Data flow**: It receives a resolved-request identity, removes matching queued requests, and checks whether the current request also matches. If the current one matches, it marks it complete and moves on; it returns whether anything was removed.
 
-**Call relations**: Called by the `BottomPaneView` dismissal hook. It relies on `ApprovalRequest::matches_resolved_request` and may delegate to `advance_queue` when the active request becomes stale.
+**Call relations**: The BottomPaneView method dismiss_app_server_request calls this. If it dismisses the active prompt, it uses advance_queue to either show the next pending request or close the overlay.
 
 *Call graph*: calls 1 internal fn (advance_queue); called by 1 (dismiss_app_server_request).
 
@@ -632,11 +632,11 @@ fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bo
 fn set_current(&mut self, request: ApprovalRequest)
 ```
 
-**Purpose**: Replaces the active request and rebuilds the header, options, and list-selection view for it.
+**Purpose**: Makes a request the active prompt and rebuilds everything the user sees for it. This is used both for the first request and for queued follow-up requests.
 
-**Data flow**: Takes an `ApprovalRequest` → resets `current_complete` → builds a header with `build_header` → calls `build_options` to derive `ApprovalOption`s and `SelectionViewParams` → stores the request and options → constructs a fresh `ListSelectionView` with the new params and cloned sender/keymap.
+**Data flow**: It takes an approval request, builds its header text, builds the available options and list parameters, stores the request and options, and replaces the list selection view.
 
-**Call relations**: Used during initial construction and queue advancement. It is the central reconfiguration step whenever the overlay switches to a different request.
+**Call relations**: Creation and queue advancement both rely on this function. It hands off formatting to build_header and choice construction to build_options so each request type gets the right UI.
 
 *Call graph*: calls 2 internal fn (build_header, new); called by 1 (advance_queue); 3 external calls (build_options, clone, clone).
 
@@ -652,11 +652,11 @@ fn build_options(
         list_keymap: &ListKeymap,
 ```
 
-**Purpose**: Converts an `ApprovalRequest` into a title, header, option list, and `SelectionViewParams` suitable for `ListSelectionView`.
+**Purpose**: Turns a request into the selectable rows and title shown in the approval modal. It decides which choices make sense for commands, permissions, file edits, and MCP elicitation.
 
-**Data flow**: Takes a request, prebuilt header renderable, features, and keymaps → matches the request type to choose option builders (`exec_options`, `permissions_options`, `patch_options`, `elicitation_options`) and a title string → wraps the title and header into a `ColumnRenderable` → maps each `ApprovalOption` into a `SelectionItem` with label and first shortcut → builds `SelectionViewParams` with a footer hint from `approval_footer_hint` and returns both the raw options and params.
+**Data flow**: It reads the request type, current key bindings, and header. It creates approval options, wraps the title and header into a renderable block, builds list items with shortcuts, and returns both the internal options and list-view settings.
 
-**Call relations**: Called only from `set_current`. It delegates request-specific option semantics to helper functions while standardizing how those options are presented in the generic list-selection UI.
+**Call relations**: set_current calls this whenever a prompt is shown. It delegates to specialized option builders, then packages their results for ListSelectionView.
 
 *Call graph*: calls 6 internal fn (approval_footer_hint, elicitation_options, exec_options, patch_options, permissions_options, with); 4 external calls (new, default, from, format!).
 
@@ -667,11 +667,11 @@ fn build_options(
 fn apply_selection(&mut self, actual_idx: usize)
 ```
 
-**Purpose**: Applies the selected approval option to the current request, emits the corresponding decision, and advances or finishes the queue.
+**Purpose**: Applies the option the user picked from the list or by shortcut. This is where a highlighted choice becomes an actual approval, denial, or cancel message.
 
-**Data flow**: Takes an option index → returns early if the current request is already complete or the index is out of range → reads the current request and selected `ApprovalOption` → matches request type against option decision type and dispatches to `handle_exec_decision`, `handle_permissions_decision`, `handle_patch_decision`, or `handle_elicitation_decision` → marks `current_complete = true` and calls `advance_queue`.
+**Data flow**: It receives an option index, ignores it if the prompt is already finished or invalid, matches the option's decision to the current request type, sends the corresponding response, marks the request complete, and advances the queue.
 
-**Call relations**: Reached from keyboard shortcuts and from `ListSelectionView` selection results. It is the main bridge from UI choice to request-type-specific decision handling.
+**Call relations**: Keyboard handling and shortcut handling both call this after the user chooses something. It routes to the specific decision sender for command, permission, patch, or MCP requests.
 
 *Call graph*: calls 5 internal fn (advance_queue, handle_elicitation_decision, handle_exec_decision, handle_patch_decision, handle_permissions_decision); called by 2 (handle_key_event, try_handle_shortcut).
 
@@ -687,11 +687,11 @@ fn handle_exec_decision(
     )
 ```
 
-**Purpose**: Emits a command-execution approval decision and, for local-thread requests, records a human-readable history cell describing the user's choice.
+**Purpose**: Sends the user's decision about running a command. It may also add a history note so the user can later see what they approved or denied.
 
-**Data flow**: Takes the request id, command argv, and a `CommandExecutionApprovalDecision` → reads the current request to determine thread label and possible network context → if the request is not cross-thread, derives a `history_cell::ApprovalDecisionSubject` from either structured network context, a `network-access` command target, or the raw command, converts the decision to a `ReviewDecision`, builds a history cell, and sends `AppEvent::InsertHistoryCell` → finally sends the thread-scoped exec approval via `app_event_tx.exec_approval`.
+**Data flow**: It reads the current request, command, id, and chosen command decision. It builds a history entry when appropriate, then sends an exec approval response for the correct thread.
 
-**Call relations**: Called from `apply_selection` and `cancel_current_request` for exec requests. It delegates subject formatting to `network_approval_target`, `network_approval_command_target`, and `command_decision_to_review_decision`.
+**Call relations**: apply_selection calls this for command choices, and cancel_current_request calls it when a command prompt is aborted. It uses helper functions to describe network approvals and translate decisions into history wording.
 
 *Call graph*: calls 5 internal fn (exec_approval, send, command_decision_to_review_decision, network_approval_command_target, network_approval_target); called by 2 (apply_selection, cancel_current_request); 3 external calls (InsertHistoryCell, new_approval_decision_cell, Command).
 
@@ -707,11 +707,11 @@ fn handle_permissions_decision(
     )
 ```
 
-**Purpose**: Converts a permissions choice into a `RequestPermissionsResponse`, optionally records a local history message, and emits the response event.
+**Purpose**: Sends the user's answer to a request for extra permissions. It converts friendly choices like “this turn” or “this session” into the permission response the agent protocol expects.
 
-**Data flow**: Takes the call id, requested `RequestPermissionProfile`, and a `PermissionsDecision` → derives granted permissions (`clone` for grant cases, default empty for deny), grant scope (`Turn` or `Session`), and `strict_auto_review` flag → if the request is not cross-thread, sends a plain history cell summarizing what was granted or denied → emits `request_permissions_response` with the constructed response.
+**Data flow**: It receives the call id, requested permission profile, and chosen permission decision. It either clones the requested permissions or replaces them with empty permissions, decides the scope and strict-review flag, optionally writes a history note, and sends the response.
 
-**Call relations**: Called from `apply_selection` and `cancel_current_request` for permission requests. It encapsulates the mapping from UI choices to protocol-level permission responses.
+**Call relations**: apply_selection calls this for permission choices, and cancel_current_request calls it as a denial. It is the bridge between UI labels and the protocol-level permission response.
 
 *Call graph*: calls 3 internal fn (request_permissions_response, send, new); called by 2 (apply_selection, cancel_current_request); 6 external calls (new, default, clone, InsertHistoryCell, matches!, vec!).
 
@@ -722,11 +722,11 @@ fn handle_permissions_decision(
 fn handle_patch_decision(&self, id: &str, decision: FileChangeApprovalDecision)
 ```
 
-**Purpose**: Emits a file-change approval decision for the current patch request.
+**Purpose**: Sends the user's decision about applying file changes. This tells the agent whether it may proceed with the proposed edits.
 
-**Data flow**: Takes the patch id and a `FileChangeApprovalDecision` → extracts the current request's `thread_id` if present → sends `patch_approval(thread_id, id.to_string(), decision)`.
+**Data flow**: It reads the current request's thread id, combines it with the file-change request id and chosen decision, and sends a patch approval response. It changes no local display state itself.
 
-**Call relations**: Used by `apply_selection` and `cancel_current_request` for apply-patch requests. It is intentionally minimal because patch approvals do not need local history-cell synthesis here.
+**Call relations**: apply_selection calls this when the user chooses a patch option. cancel_current_request calls it with a cancel decision if the prompt is aborted.
 
 *Call graph*: calls 1 internal fn (patch_approval); called by 2 (apply_selection, cancel_current_request).
 
@@ -742,11 +742,11 @@ fn handle_elicitation_decision(
     )
 ```
 
-**Purpose**: Emits an MCP elicitation resolution for the current request.
+**Purpose**: Sends the user's answer to an MCP elicitation prompt. MCP elicitation is when an external server asks the app to get approval or information from the user.
 
-**Data flow**: Takes `server_name`, `request_id`, and a `McpServerElicitationAction` → extracts the current request's `thread_id` if present → calls `app_event_tx.resolve_elicitation` with cloned server/request identifiers and `None` content/meta.
+**Data flow**: It reads the current thread id and receives the server name, request id, and chosen action. It sends a resolve-elicitation event with no extra content or metadata.
 
-**Call relations**: Called from `apply_selection` and `cancel_current_request` for MCP elicitation requests. It is the approval-overlay counterpart to app-link-view elicitation resolution.
+**Call relations**: apply_selection calls this for MCP choices, and cancel_current_request calls it with Cancel. The special Escape behavior eventually reaches this path as a cancel decision.
 
 *Call graph*: calls 1 internal fn (resolve_elicitation); called by 2 (apply_selection, cancel_current_request); 1 external calls (clone).
 
@@ -757,11 +757,11 @@ fn handle_elicitation_decision(
 fn advance_queue(&mut self)
 ```
 
-**Purpose**: Moves the overlay to the next queued request or marks the overlay done if none remain.
+**Purpose**: Moves from the just-finished request to the next waiting request. If nothing is waiting, it marks the overlay as done.
 
-**Data flow**: Pops one request from `self.queue` → if present, passes it to `set_current`; otherwise sets `done = true`.
+**Data flow**: It pops one request from the queue if available. If there is one, it becomes the new current prompt; otherwise the overlay's done flag becomes true.
 
-**Call relations**: Called after a selection is applied and when the current request is dismissed as already resolved. It is the queue progression mechanism for the overlay.
+**Call relations**: Selection and external dismissal both call this after a request is finished. It reuses set_current so each queued prompt is rebuilt the same way as the first prompt.
 
 *Call graph*: calls 1 internal fn (set_current); called by 2 (apply_selection, dismiss_resolved_request).
 
@@ -772,11 +772,11 @@ fn advance_queue(&mut self)
 fn cancel_current_request(&mut self)
 ```
 
-**Purpose**: Cancels the active request using request-type-specific cancel semantics, clears the queue, and finishes the overlay.
+**Purpose**: Cancels the active request and closes the whole overlay. This is used for Ctrl-C and cancel shortcuts.
 
-**Data flow**: Returns immediately if `done` is already true → if the current request is not yet complete, matches its variant and dispatches a cancel-equivalent decision: exec `Cancel`, permissions `Deny`, patch `Cancel`, or elicitation `Cancel` → clears `queue` and sets `done = true`.
+**Data flow**: It checks whether the overlay is already done. If not, and the current request has not been answered, it sends the safest negative response for that request type, clears all queued requests, and marks the overlay done.
 
-**Call relations**: Invoked by Ctrl-C and by the configured list-cancel shortcut. It reuses the same per-request decision handlers as normal selection paths so cancellation emits explicit protocol events.
+**Call relations**: Shortcut handling and Ctrl-C handling call this. It routes cancellation through the same decision-sending helpers used by normal selections, so the app still receives an explicit answer.
 
 *Call graph*: calls 4 internal fn (handle_elicitation_decision, handle_exec_decision, handle_patch_decision, handle_permissions_decision); called by 2 (on_ctrl_c, try_handle_shortcut).
 
@@ -787,11 +787,11 @@ fn cancel_current_request(&mut self)
 fn try_handle_shortcut(&mut self, key_event: &KeyEvent) -> bool
 ```
 
-**Purpose**: Processes approval-specific shortcuts before generic list navigation, including fullscreen, open-thread, cancel, and direct decision shortcuts.
+**Purpose**: Handles approval-specific keyboard shortcuts before normal list navigation. This catches actions such as opening fullscreen, opening the source thread, canceling, or choosing a row by shortcut key.
 
-**Data flow**: Examines the incoming `KeyEvent` → on key press, if it matches `open_fullscreen`, sends `AppEvent::FullScreenApprovalRequest(current_request.clone())` → if it matches `open_thread` and the request has a thread label, sends `AppEvent::SelectAgentThread(thread_id)` → if it matches the list cancel binding, calls `cancel_current_request()` → otherwise searches `self.options` for a shortcut match and, if found, calls `apply_selection(idx)` → returns whether any shortcut was consumed.
+**Data flow**: It receives a key event, checks it against approval and list key maps, sends UI events for fullscreen or thread switching when needed, cancels if the cancel binding is pressed, or applies the matching option. It returns whether it consumed the key.
 
-**Call relations**: Called first from `handle_key_event`. It ensures approval semantics and global shortcuts take precedence over generic list movement.
+**Call relations**: handle_key_event calls this first. If it returns false, the key is passed to the generic list view for navigation or Enter selection.
 
 *Call graph*: calls 3 internal fn (send, apply_selection, cancel_current_request); called by 1 (handle_key_event); 2 external calls (FullScreenApprovalRequest, SelectAgentThread).
 
@@ -802,11 +802,11 @@ fn try_handle_shortcut(&mut self, key_event: &KeyEvent) -> bool
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Routes keyboard input through approval shortcuts first, then through the embedded list-selection view.
+**Purpose**: Processes one key press while the approval overlay is active. It decides whether the key is a special approval shortcut or ordinary list navigation.
 
-**Data flow**: Takes a `KeyEvent` → if `try_handle_shortcut` returns true, stops → otherwise forwards the event to `self.list.handle_key_event` → if the list reports a selected index via `take_last_selected_index`, calls `apply_selection(idx)`.
+**Data flow**: It receives a key event. First it gives shortcuts a chance to act; if none do, it forwards the key to the list view, then checks whether the list produced a selected index and applies that selection.
 
-**Call relations**: This is the `BottomPaneView` input entrypoint. It composes approval-specific shortcut handling with the generic list-selection component.
+**Call relations**: The terminal UI calls this through the BottomPaneView interface. It ties together shortcut handling, list behavior, and final decision routing.
 
 *Call graph*: calls 4 internal fn (apply_selection, try_handle_shortcut, handle_key_event, take_last_selected_index).
 
@@ -817,11 +817,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn on_ctrl_c(&mut self) -> CancellationEvent
 ```
 
-**Purpose**: Cancels the current approval request and reports that Ctrl-C was handled.
+**Purpose**: Handles Ctrl-C while an approval prompt is open. It treats Ctrl-C as an explicit cancellation rather than letting the request hang.
 
-**Data flow**: Calls `cancel_current_request()` and returns `CancellationEvent::Handled`.
+**Data flow**: It cancels the current request and returns a value saying the cancellation was handled. The overlay state becomes complete and queued requests are cleared.
 
-**Call relations**: Used by the bottom-pane host for cancellation. It shares the same explicit-cancel semantics as the list cancel shortcut.
+**Call relations**: The bottom-pane framework calls this for Ctrl-C. It delegates the actual work to cancel_current_request so all cancel paths behave consistently.
 
 *Call graph*: calls 1 internal fn (cancel_current_request).
 
@@ -832,11 +832,11 @@ fn on_ctrl_c(&mut self) -> CancellationEvent
 fn is_complete(&self) -> bool
 ```
 
-**Purpose**: Reports whether the overlay has no more active or queued requests.
+**Purpose**: Reports whether the overlay is finished and can be removed from the bottom pane.
 
-**Data flow**: Returns the `done` boolean.
+**Data flow**: It reads the overlay's done flag and returns it as a boolean. It does not change state.
 
-**Call relations**: Queried by the bottom-pane host to know when to remove the overlay.
+**Call relations**: The surrounding UI uses this to know when to stop showing the approval modal after a selection, cancellation, or external dismissal.
 
 
 ##### `ApprovalOverlay::try_consume_approval_request`  (lines 589–595)
@@ -848,11 +848,11 @@ fn try_consume_approval_request(
     ) -> Option<ApprovalRequest>
 ```
 
-**Purpose**: Consumes additional approval requests by queueing them into the existing overlay.
+**Purpose**: Accepts a new approval request while this overlay is already open. Instead of opening a second modal, it queues the request.
 
-**Data flow**: Takes an `ApprovalRequest`, enqueues it with `enqueue_request`, and returns `None` to indicate the request was consumed.
+**Data flow**: It receives a request, appends it to the queue, and returns None to signal that the request was consumed by this overlay.
 
-**Call relations**: Implements the `BottomPaneView` extension point that lets an existing approval overlay absorb later approval requests instead of spawning a second modal.
+**Call relations**: The bottom-pane system calls this when another approval arrives. It delegates to enqueue_request and lets advance_queue show it later.
 
 *Call graph*: calls 1 internal fn (enqueue_request).
 
@@ -863,11 +863,11 @@ fn try_consume_approval_request(
 fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Delegates external request dismissal to the overlay's resolved-request logic.
+**Purpose**: Lets the app dismiss a prompt when the server reports that the request has already been resolved. This keeps the UI in sync with external state.
 
-**Data flow**: Passes the `ResolvedAppServerRequest` reference to `dismiss_resolved_request` and returns its boolean result.
+**Data flow**: It receives a resolved request description and passes it to the overlay's dismissal logic. It returns whether the overlay or its queue changed.
 
-**Call relations**: This is the `BottomPaneView` hook used by the host when app-server requests are resolved elsewhere.
+**Call relations**: This is the BottomPaneView-facing wrapper around dismiss_resolved_request. It exists so the general bottom-pane machinery can use the overlay's request-matching behavior.
 
 *Call graph*: calls 1 internal fn (dismiss_resolved_request).
 
@@ -878,11 +878,11 @@ fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> 
 fn terminal_title_requires_action(&self) -> bool
 ```
 
-**Purpose**: Always marks the approval overlay as requiring user action for terminal-title purposes.
+**Purpose**: Tells the terminal title system that this overlay represents something waiting for the user's action. This can help draw attention to the terminal.
 
-**Data flow**: Returns `true` unconditionally.
+**Data flow**: It always returns true. It reads no request details and changes no state.
 
-**Call relations**: Used by the surrounding UI to surface an 'Action Required' title whenever this overlay is active.
+**Call relations**: The UI framework calls this through BottomPaneView while the overlay is active. It marks approval prompts as attention-worthy.
 
 
 ##### `ApprovalOverlay::desired_height`  (lines 607–609)
@@ -891,11 +891,11 @@ fn terminal_title_requires_action(&self) -> bool
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Delegates height calculation to the embedded `ListSelectionView`.
+**Purpose**: Asks how much vertical space the overlay wants to draw itself. This lets the bottom pane size the modal correctly.
 
-**Data flow**: Passes the width through to `self.list.desired_height(width)` and returns the result.
+**Data flow**: It receives the available width and forwards that width to the internal list view. It returns the list view's desired height.
 
-**Call relations**: Implements the `Renderable` sizing hook by reusing the generic list view's layout logic.
+**Call relations**: Rendering helpers and the UI layout call this before drawing. The overlay delegates sizing to ListSelectionView because that view owns the actual rows and header layout.
 
 *Call graph*: calls 1 internal fn (desired_height); called by 1 (render_overlay_lines).
 
@@ -906,11 +906,11 @@ fn desired_height(&self, width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Delegates rendering to the embedded `ListSelectionView`.
+**Purpose**: Draws the approval overlay into the terminal buffer. It shows the title, header, choices, and footer hint prepared earlier.
 
-**Data flow**: Calls `self.list.render(area, buf)` with the provided area and buffer.
+**Data flow**: It receives a screen area and buffer, then asks the internal list view to render into that space. It does not decide new approval logic while drawing.
 
-**Call relations**: The overlay's visual structure is entirely produced by the list-selection component configured in `set_current`.
+**Call relations**: The UI renderer and tests call this when the overlay needs to appear. It delegates drawing to ListSelectionView.
 
 *Call graph*: calls 1 internal fn (render); called by 1 (render_overlay_lines).
 
@@ -921,11 +921,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Delegates cursor-position reporting to the embedded `ListSelectionView`.
+**Purpose**: Reports where the cursor should appear, if the overlay needs one. This keeps cursor behavior aligned with the internal list view.
 
-**Data flow**: Calls `self.list.cursor_pos(area)` and returns the result.
+**Data flow**: It receives the drawing area, asks the list view for a cursor position, and returns that optional position.
 
-**Call relations**: Part of the `Renderable` implementation; it keeps cursor behavior consistent with the underlying list widget.
+**Call relations**: The rendering framework calls this through the Renderable interface. The overlay does not calculate cursor placement itself.
 
 *Call graph*: 1 external calls (cursor_pos).
 
@@ -940,11 +940,11 @@ fn approval_footer_hint(
 ) -> Line<'static>
 ```
 
-**Purpose**: Builds the footer hint line for approval prompts, including confirm/cancel bindings and an optional open-thread shortcut.
+**Purpose**: Builds the small instruction line at the bottom of the approval modal. It explains which keys confirm, cancel, and sometimes open the source thread.
 
-**Data flow**: Starts from `accept_cancel_hint_line` using the primary accept/cancel bindings from the list keymap → if the request has a thread label and the approval keymap has an open-thread binding, appends `or <binding> to open thread` spans → returns the assembled `Line<'static>`.
+**Data flow**: It reads the request and key maps, starts with the standard confirm/cancel hint, and adds an open-thread hint if the request has a thread label. It returns a line of styled text.
 
-**Call relations**: Called from `ApprovalOverlay::build_options` so every request type gets a consistent footer hint, with cross-thread prompts advertising the extra navigation shortcut.
+**Call relations**: build_options calls this while preparing the list view. It uses ApprovalRequest::thread_label to decide whether the extra thread hint belongs.
 
 *Call graph*: calls 3 internal fn (thread_label, accept_cancel_hint_line, primary_binding); called by 1 (build_options); 1 external calls (from).
 
@@ -958,11 +958,11 @@ fn network_approval_target(
 ) -> String
 ```
 
-**Purpose**: Formats the human-readable network target for history cells and approval summaries.
+**Purpose**: Creates a human-readable target for a network approval history entry. It prefers the exact target encoded in a command when present, otherwise it builds one from protocol and host.
 
-**Data flow**: Takes a structured `NetworkApprovalContext` and the original command argv → first tries `network_approval_command_target(command)` and returns that if present → otherwise maps the protocol enum to a scheme string and formats `scheme://host`.
+**Data flow**: It receives network context and the command. It checks for a special network-access command format, and if none is found, combines protocol and host into text such as an HTTPS URL.
 
-**Call relations**: Used by `handle_exec_decision` when building history-cell subjects for network approvals.
+**Call relations**: handle_exec_decision uses this when recording a structured network approval. It relies on network_approval_command_target for the special command shortcut.
 
 *Call graph*: calls 1 internal fn (network_approval_command_target); called by 1 (handle_exec_decision); 1 external calls (format!).
 
@@ -973,11 +973,11 @@ fn network_approval_target(
 fn network_approval_command_target(command: &[String]) -> Option<&str>
 ```
 
-**Purpose**: Extracts a target string from synthetic `network-access` commands when present.
+**Purpose**: Detects whether a command is really a network-access request and extracts its target. This helps the history say “network access to X” instead of showing an internal command.
 
-**Data flow**: Matches the command argv either as `["network-access", target]` or as a single string starting with `"network-access "` → returns `Some(&str)` for a non-empty target, otherwise `None`.
+**Data flow**: It examines the command arguments. If they match either a two-part network-access command or one combined string, it returns the target text; otherwise it returns nothing.
 
-**Call relations**: Used both directly by `handle_exec_decision` and indirectly by `network_approval_target` to prefer command-encoded targets over reconstructed protocol/host strings.
+**Call relations**: handle_exec_decision and network_approval_target call this before deciding how to describe an approval. It keeps the special parsing in one place.
 
 *Call graph*: called by 2 (handle_exec_decision, network_approval_target).
 
@@ -988,11 +988,11 @@ fn network_approval_command_target(command: &[String]) -> Option<&str>
 fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds the request-specific descriptive header shown above the approval options.
+**Purpose**: Builds the explanatory content shown above the approval choices. It tells the user what is being requested and why.
 
-**Data flow**: Matches the `ApprovalRequest` variant → for exec, assembles optional thread label, reason, additional-permission rule, and highlighted shell command unless it is a network approval; for permissions, assembles thread/environment/reason plus requested-permission rule; for apply-patch, assembles thread label and wrapped reason; for MCP elicitation, assembles thread label, server name, and message → returns a boxed `Renderable`.
+**Data flow**: It reads the request type and fields such as thread label, reason, command, permissions, and server message. It formats those into renderable terminal text, including syntax-highlighted command text when appropriate.
 
-**Call relations**: Called from `set_current` before `build_options`. It delegates permission-rule formatting and command highlighting to helper functions so the overlay can present rich context without embedding that logic inline.
+**Call relations**: set_current calls this before building options. It delegates permission-rule wording to formatting helpers and command display to shell-formatting/highlighting helpers.
 
 *Call graph*: calls 5 internal fn (format_additional_permissions_rule, format_requested_permissions_rule, strip_bash_lc_and_escape, highlight_bash_to_lines, with); called by 1 (set_current); 7 external calls (new, from, from_iter, new, from, new, vec!).
 
@@ -1005,11 +1005,11 @@ fn command_decision_to_review_decision(
 ) -> ReviewDecision
 ```
 
-**Purpose**: Maps protocol-level command approval decisions into the `ReviewDecision` enum used by history cells.
+**Purpose**: Translates command approval decisions into the wording category used by history cells. This keeps protocol decisions and user-facing history labels connected.
 
-**Data flow**: Matches a `CommandExecutionApprovalDecision` and converts each variant to the corresponding `ReviewDecision`, cloning embedded amendment payloads into core forms where needed.
+**Data flow**: It receives a command decision and maps it to a review decision such as approved, approved for session, denied, or aborted. Some decisions carry policy amendments through into the history form.
 
-**Call relations**: Used only by `handle_exec_decision` when synthesizing a local history cell for the user's choice.
+**Call relations**: handle_exec_decision calls this when creating a history entry. It is not responsible for sending the actual approval response.
 
 *Call graph*: called by 1 (handle_exec_decision).
 
@@ -1023,11 +1023,11 @@ fn exec_options(
     additional_permissions: Option<&AdditionalPermissionPr
 ```
 
-**Purpose**: Builds the selectable options for command-execution approvals, adapting labels and shortcut bindings to the available decisions and context.
+**Purpose**: Builds the list of choices for a command execution request. The labels change depending on whether the request is about normal execution, network access, session approval, or policy changes.
 
-**Data flow**: Iterates the provided `available_decisions` → for each supported decision variant, constructs an `ApprovalOption` with a context-sensitive label, the corresponding `ApprovalDecision::Command`, and the appropriate shortcut list from the approval keymap → filters out exec-policy amendment options whose rendered prefix contains newlines → returns the collected options.
+**Data flow**: It receives the allowed protocol decisions, optional network context, optional extra permissions, and key map. It filters and converts each allowed decision into a label, internal decision value, and shortcut list.
 
-**Call relations**: Called from `ApprovalOverlay::build_options` for exec requests. It encodes most of the nuanced wording differences for generic exec, network approvals, and additional-permission prompts.
+**Call relations**: build_options calls this for command approvals. Several tests call it directly to lock down the exact labels and hidden-option behavior.
 
 *Call graph*: called by 4 (build_options, additional_permissions_exec_options_hide_execpolicy_amendment, generic_exec_options_can_offer_allow_for_session, network_exec_options_use_expected_labels_and_hide_execpolicy_amendment); 1 external calls (iter).
 
@@ -1040,11 +1040,11 @@ fn format_additional_permissions_rule(
 ) -> Option<String>
 ```
 
-**Purpose**: Formats an `AdditionalPermissionProfile` into a compact semicolon-separated rule summary for display.
+**Purpose**: Turns an additional-permissions profile into a short readable rule line. This helps users understand what extra access they are about to grant.
 
-**Data flow**: Inspects network enablement and file-system entries → accumulates textual parts like `network`, `read ...`, `write ...`, and `deny read ...` using `format_file_system_entry_paths` for each access class → returns `None` if no parts were produced, otherwise `Some(parts.join("; "))`.
+**Data flow**: It reads network and file-system permission entries, groups them into phrases like network, read paths, write paths, and deny read paths, then joins those phrases. It returns nothing if there is no meaningful permission to show.
 
-**Call relations**: Used by `build_header` for exec requests and by `format_requested_permissions_rule` after converting requested permissions into the same profile shape.
+**Call relations**: build_header uses this for command requests with extra permissions. format_requested_permissions_rule also calls it after converting a request-style permission profile.
 
 *Call graph*: calls 1 internal fn (format_file_system_entry_paths); called by 2 (build_header, format_requested_permissions_rule); 2 external calls (new, format!).
 
@@ -1057,11 +1057,11 @@ fn format_requested_permissions_rule(
 ) -> Option<String>
 ```
 
-**Purpose**: Formats a requested permission profile using the same display rules as additional permissions.
+**Purpose**: Formats a permission request into the same readable rule style used for additional permissions. It first converts the request format into a grant format.
 
-**Data flow**: Clones the `RequestPermissionProfile`, converts it through `granted_permission_profile_from_request`, wraps the result into an `AdditionalPermissionProfile`, and delegates to `format_additional_permissions_rule`.
+**Data flow**: It receives a requested permission profile, converts it into a granted-permission profile, wraps it as additional permissions, and passes it to the shared formatter. It returns an optional text rule.
 
-**Call relations**: Called from `build_header` for permission requests so both request types share one formatting policy.
+**Call relations**: build_header calls this for standalone permission prompts. It reuses format_additional_permissions_rule so both prompt types describe permissions consistently.
 
 *Call graph*: calls 2 internal fn (granted_permission_profile_from_request, format_additional_permissions_rule); called by 1 (build_header); 1 external calls (clone).
 
@@ -1074,11 +1074,11 @@ fn format_file_system_entry_paths(
 ) -> String
 ```
 
-**Purpose**: Formats file-system sandbox entries into a comma-separated list of path labels.
+**Purpose**: Formats file-system sandbox entries into readable path labels. It supports normal paths, glob patterns, and special built-in locations.
 
-**Data flow**: Maps each `FileSystemSandboxEntry` to a string based on its `FileSystemPath` variant: backticked literal path, `glob` pattern, or special-path label from `special_path_label` → joins the strings with `, ` and returns the result.
+**Data flow**: It receives an iterator of file-system entries, converts each entry's path into display text, and joins the pieces with commas. It returns one string.
 
-**Call relations**: Used by `format_additional_permissions_rule` to render read/write/deny path lists.
+**Call relations**: format_additional_permissions_rule calls this separately for read, write, and denied-read entries. It uses special_path_label for non-normal paths.
 
 *Call graph*: called by 1 (format_additional_permissions_rule); 1 external calls (map).
 
@@ -1089,11 +1089,11 @@ fn format_file_system_entry_paths(
 fn special_path_label(value: &FileSystemSpecialPath) -> String
 ```
 
-**Purpose**: Converts `FileSystemSpecialPath` values into user-facing labels.
+**Purpose**: Turns a special file-system location into a label that users can recognize. Examples include workspace roots, temporary directories, and root access.
 
-**Data flow**: Matches the special-path enum and returns labels like `:root`, `:minimal`, `/tmp`, or a base-plus-subpath string via `path_label`.
+**Data flow**: It receives a special-path enum value and returns a text label. For values with subpaths, it uses path_label to append the subpath cleanly.
 
-**Call relations**: Used by `format_file_system_entry_paths` when sandbox entries refer to special path categories instead of literal paths.
+**Call relations**: format_file_system_entry_paths uses this when an entry is not a literal path or glob. It keeps special sandbox names from leaking as raw protocol details.
 
 *Call graph*: calls 1 internal fn (path_label).
 
@@ -1104,11 +1104,11 @@ fn special_path_label(value: &FileSystemSpecialPath) -> String
 fn path_label(base: &str, subpath: &Option<PathBuf>) -> String
 ```
 
-**Purpose**: Formats a base special-path label with an optional subpath suffix.
+**Purpose**: Combines a base special-path label with an optional subpath. This avoids duplicated string-building for labels like workspace roots plus “.git”.
 
-**Data flow**: Takes a base string and `Option<PathBuf>` → if a subpath exists, formats `base/subpath.display()`, otherwise returns the base unchanged.
+**Data flow**: It receives a base string and optional path. If a subpath exists, it appends it with a slash; otherwise it returns the base alone.
 
-**Call relations**: Used by `special_path_label` for project-root and unknown special-path variants.
+**Call relations**: special_path_label calls this for special paths that may include a subpath. It is a small formatting helper.
 
 *Call graph*: called by 1 (special_path_label); 1 external calls (format!).
 
@@ -1119,11 +1119,11 @@ fn path_label(base: &str, subpath: &Option<PathBuf>) -> String
 fn patch_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 ```
 
-**Purpose**: Builds the fixed option set for apply-patch approvals.
+**Purpose**: Builds the choices for approving proposed file edits. The choices allow one-time approval, session approval for those files, or cancellation.
 
-**Data flow**: Returns a three-element `Vec<ApprovalOption>` for accept, accept-for-session, and cancel, each with the corresponding `FileChangeApprovalDecision` and approval-keymap shortcut list.
+**Data flow**: It receives the approval key map and returns a fixed list of ApprovalOption values with labels, file-change decisions, and shortcuts.
 
-**Call relations**: Called from `ApprovalOverlay::build_options` for patch requests.
+**Call relations**: build_options calls this for ApplyPatch requests. The resulting choices are later interpreted by apply_selection and sent through handle_patch_decision.
 
 *Call graph*: called by 1 (build_options); 1 external calls (vec!).
 
@@ -1134,11 +1134,11 @@ fn patch_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 fn permissions_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 ```
 
-**Purpose**: Builds the fixed option set for permission requests, including a strict-auto-review grant path.
+**Purpose**: Builds the choices for granting or denying extra permissions. It includes turn-only, turn with strict auto review, session-wide, and denial choices.
 
-**Data flow**: Derives deny shortcuts from the approval keymap while filtering out plain Esc → returns options for grant-for-turn, grant-for-turn-with-strict-auto-review, grant-for-session, and deny, each with the corresponding `PermissionsDecision` and shortcut list.
+**Data flow**: It receives the approval key map, removes plain Escape from the deny shortcuts, and returns the permission options with their labels and shortcut bindings.
 
-**Call relations**: Called from `ApprovalOverlay::build_options` for permission requests. The Esc filtering preserves cancellation semantics distinct from deny.
+**Call relations**: build_options calls this for permission requests, and tests call it directly to verify labels. The Escape filtering helps keep cancel behavior separate from “deny and continue.”
 
 *Call graph*: called by 2 (build_options, permissions_options_use_expected_labels); 1 external calls (vec!).
 
@@ -1149,11 +1149,11 @@ fn permissions_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 fn elicitation_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 ```
 
-**Purpose**: Builds MCP elicitation options while enforcing the invariant that Esc always means cancel.
+**Purpose**: Builds the choices for MCP elicitation prompts while preserving a strict safety rule: Escape always means cancel. This prevents accidental continuation when the user meant to dismiss.
 
-**Data flow**: Starts `cancel_shortcuts` with plain Esc, then appends any configured cancel bindings not already present → derives `decline_shortcuts` by removing any overlap with cancel shortcuts from the configured decline bindings → returns options for accept, decline, and cancel with the resulting shortcut sets.
+**Data flow**: It receives the approval key map, starts cancel shortcuts with Escape, adds configured cancel shortcuts, removes any overlap from decline shortcuts, and returns accept, decline, and cancel options.
 
-**Call relations**: Called from `ApprovalOverlay::build_options` for MCP elicitation requests. This helper is where the module's documented Esc-cancel contract is enforced.
+**Call relations**: build_options calls this for MCP elicitation requests. Shortcut handling later uses these options so Escape reliably routes to handle_elicitation_decision with Cancel.
 
 *Call graph*: called by 1 (build_options); 1 external calls (vec!).
 
@@ -1164,11 +1164,11 @@ fn elicitation_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption>
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Creates an `AbsolutePathBuf` from a string literal for tests.
+**Purpose**: Creates an absolute path value for tests. It keeps test setup short and ensures invalid relative paths fail immediately.
 
-**Data flow**: Calls `AbsolutePathBuf::from_absolute_path(path)` and unwraps the result with `expect`.
+**Data flow**: It receives a path string, parses it as an absolute path, and returns the typed absolute path. If the test passes a non-absolute path, it panics.
 
-**Call relations**: Used by tests that need stable absolute paths in permission and patch fixtures.
+**Call relations**: Many tests and snapshot helpers use this when building permission or patch requests. It is test-only setup support.
 
 *Call graph*: calls 1 internal fn (from_absolute_path).
 
@@ -1179,11 +1179,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn render_overlay_lines(view: &ApprovalOverlay, width: u16) -> String
 ```
 
-**Purpose**: Renders an `ApprovalOverlay` into a newline-joined plain-text string for snapshot assertions.
+**Purpose**: Renders an approval overlay into plain text lines for snapshot tests. This lets tests compare what the user would see.
 
-**Data flow**: Computes the overlay height, renders into an empty `Buffer`, converts each row's symbols into a trimmed string, and joins rows with newlines.
+**Data flow**: It receives an overlay and width, asks the overlay for its height, renders it into a fake terminal buffer, trims line endings, and returns one newline-separated string.
 
-**Call relations**: Shared by multiple snapshot tests to compare rendered approval prompts.
+**Call relations**: Snapshot tests call this to verify prompt layout. It exercises the same desired_height and render methods used by the real UI.
 
 *Call graph*: calls 2 internal fn (desired_height, render); 2 external calls (empty, new).
 
@@ -1197,11 +1197,11 @@ fn render_history_cell_lines(
     ) -> Vec<String>
 ```
 
-**Purpose**: Converts a history cell into plain strings for assertion-friendly comparison.
+**Purpose**: Converts a history cell into plain strings for assertions. This makes history rendering easy to compare in tests.
 
-**Data flow**: Calls `display_lines(width)` on the history cell, then concatenates each line's span contents into a `Vec<String>`.
+**Data flow**: It receives a history cell and width, asks the cell for display lines, joins each line's spans into plain text, and returns a vector of strings.
 
-**Call relations**: Used by tests that verify the exact wording of approval-decision history cells.
+**Call relations**: History-focused tests use this to check approval decision messages. It sits between rich terminal text and simple test assertions.
 
 *Call graph*: 1 external calls (display_lines).
 
@@ -1212,11 +1212,11 @@ fn render_history_cell_lines(
 fn normalize_snapshot_paths(rendered: String) -> String
 ```
 
-**Purpose**: Replaces machine-specific absolute paths in rendered snapshots with stable normalized strings.
+**Purpose**: Replaces machine-specific absolute path display text with stable test strings. This keeps snapshots from changing across systems.
 
-**Data flow**: Builds a small list of `(absolute_path, normalized)` replacements and folds over the rendered string, replacing each absolute path display string with its normalized form.
+**Data flow**: It receives rendered text, replaces known absolute-path renderings with fixed path strings, and returns the normalized text.
 
-**Call relations**: Used by snapshot tests so path rendering remains stable across environments.
+**Call relations**: Snapshot tests for permission prompts use this after rendering. It depends on absolute_path to construct the path values being normalized.
 
 *Call graph*: 1 external calls (absolute_path).
 
@@ -1231,11 +1231,11 @@ fn make_overlay(
     ) -> ApprovalOverlay
 ```
 
-**Purpose**: Constructs an `ApprovalOverlay` with default runtime keymaps for tests.
+**Purpose**: Builds an approval overlay for tests using the default runtime key map. This avoids repeating setup in every test.
 
-**Data flow**: Fetches `RuntimeKeymap::defaults()` and delegates to `make_overlay_with_keymap` with its approval and list keymaps.
+**Data flow**: It receives a request, event sender, and feature flags, fetches default key maps, and returns an overlay built through the keymap-aware helper.
 
-**Call relations**: Convenience helper used by most tests that do not need custom key bindings.
+**Call relations**: Most overlay tests call this. It delegates to make_overlay_with_keymap so tests that need custom shortcuts can share the same construction path.
 
 *Call graph*: calls 1 internal fn (defaults); 1 external calls (make_overlay_with_keymap).
 
@@ -1251,11 +1251,11 @@ fn make_overlay_with_keymap(
         list_keymap: ListKeyma
 ```
 
-**Purpose**: Constructs an `ApprovalOverlay` with explicit keymaps for tests.
+**Purpose**: Builds an approval overlay for tests with custom approval and list key maps. This is used when a test needs to change shortcuts.
 
-**Data flow**: Passes the request, sender, features, approval keymap, and list keymap directly to `ApprovalOverlay::new` and returns the result.
+**Data flow**: It receives the request, event sender, feature flags, and key maps, then calls ApprovalOverlay::new and returns the result.
 
-**Call relations**: Used by tests that need to verify remapped shortcut behavior.
+**Call relations**: Shortcut-customization tests call this directly, while make_overlay calls it with defaults. It is the test bridge to the real constructor.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -1266,11 +1266,11 @@ fn make_overlay_with_keymap(
 fn make_exec_request() -> ApprovalRequest
 ```
 
-**Purpose**: Builds a representative exec approval request fixture.
+**Purpose**: Creates a standard command approval request for tests. It gives tests a simple reusable request with an echo command and approve/cancel choices.
 
-**Data flow**: Creates an `ApprovalRequest::Exec` with a fresh thread id, fixed id, `echo hi` command, a reason, and accept/cancel decisions.
+**Data flow**: It creates a new thread id and fills an Exec approval request with fixed ids, command text, reason, and decisions. It returns the request.
 
-**Call relations**: Shared by many tests covering generic exec approval behavior.
+**Call relations**: Many tests use this as their baseline prompt. Tests that need special command behavior build custom requests instead.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (vec!).
 
@@ -1281,11 +1281,11 @@ fn make_exec_request() -> ApprovalRequest
 fn make_permissions_request() -> ApprovalRequest
 ```
 
-**Purpose**: Builds a representative permissions approval request fixture with network and file-system access.
+**Purpose**: Creates a standard permissions request for tests. It asks for network access plus read and write file-system roots.
 
-**Data flow**: Creates an `ApprovalRequest::Permissions` with a fresh thread id, fixed call id, reason text, and a `RequestPermissionProfile` granting network plus read/write roots.
+**Data flow**: It creates a new thread id, builds a permission profile with test paths, and returns a Permissions approval request with a reason.
 
-**Call relations**: Shared by tests covering permission prompt rendering and decision routing.
+**Call relations**: Permission behavior tests use this helper so they can focus on shortcut and response behavior rather than setup details.
 
 *Call graph*: calls 2 internal fn (from_read_write_roots, new); 1 external calls (vec!).
 
@@ -1296,11 +1296,11 @@ fn make_permissions_request() -> ApprovalRequest
 fn make_elicitation_request() -> ApprovalRequest
 ```
 
-**Purpose**: Builds a representative MCP elicitation approval request fixture.
+**Purpose**: Creates a standard MCP elicitation request for tests. It represents a test server asking for more information.
 
-**Data flow**: Creates an `ApprovalRequest::McpElicitation` with a fresh thread id, fixed server name, request id, and message.
+**Data flow**: It creates a new thread id and returns an MCP elicitation request with fixed server name, request id, and message.
 
-**Call relations**: Shared by tests covering elicitation-specific cancel/decline semantics.
+**Call relations**: MCP cancellation and shortcut tests use this request. It keeps those tests focused on Escape and decline/cancel behavior.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (String).
 
@@ -1311,11 +1311,11 @@ fn make_elicitation_request() -> ApprovalRequest
 fn ctrl_c_aborts_and_clears_queue()
 ```
 
-**Purpose**: Verifies that Ctrl-C cancels the current request, clears queued requests, and completes the overlay.
+**Purpose**: Checks that Ctrl-C cancels the active approval and removes queued approvals. This protects against leaving hidden pending requests after an abort.
 
-**Data flow**: Creates an overlay, enqueues a second request, calls `on_ctrl_c`, and asserts the cancellation event is handled, the queue is empty, and the overlay is complete.
+**Data flow**: It creates an overlay, queues another request, triggers Ctrl-C behavior, and asserts the queue is empty and the overlay is complete.
 
-**Call relations**: Covers the overlay-wide cancellation path through `cancel_current_request`.
+**Call relations**: The test runner calls this. It exercises on_ctrl_c, which delegates to cancel_current_request.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 4 external calls (assert!, assert_eq!, make_exec_request, make_overlay).
 
@@ -1326,11 +1326,11 @@ fn ctrl_c_aborts_and_clears_queue()
 fn configured_list_cancel_aborts_exec_approval()
 ```
 
-**Purpose**: Checks that a remapped list-cancel key triggers exec cancellation.
+**Purpose**: Verifies that a custom list cancel key cancels a command approval. This ensures user-configured cancel bindings still send an explicit abort.
 
-**Data flow**: Builds a custom keymap with `q` as list cancel, sends that key to the overlay, then scans emitted events for an exec approval op with decision `Cancel`.
+**Data flow**: It sets the cancel key to q, opens an exec prompt, sends q, then reads emitted events and checks that the command decision was Cancel.
 
-**Call relations**: Exercises `try_handle_shortcut`'s list-cancel branch for exec requests.
+**Call relations**: The test runner calls this. It drives handle_key_event through try_handle_shortcut and then checks the app event output.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, defaults); 7 external calls (Char, new, assert!, assert_eq!, make_exec_request, make_overlay_with_keymap, vec!).
 
@@ -1341,11 +1341,11 @@ fn configured_list_cancel_aborts_exec_approval()
 fn configured_list_cancel_cancels_mcp_elicitation()
 ```
 
-**Purpose**: Checks that a remapped list-cancel key triggers MCP elicitation cancellation.
+**Purpose**: Verifies that a custom list cancel key cancels an MCP elicitation request. This keeps elicitation dismissal safe under custom key bindings.
 
-**Data flow**: Builds a custom keymap with `q` as list cancel, sends it to an elicitation overlay, and scans emitted events for a resolve-elicitation op with decision `Cancel`.
+**Data flow**: It sets the list cancel key to q, opens an MCP prompt, sends q, and checks that the emitted resolve-elicitation decision is Cancel.
 
-**Call relations**: Confirms cancellation semantics are request-type-specific even when triggered through the generic list cancel binding.
+**Call relations**: The test runner calls this. It covers the cancel path from key handling to handle_elicitation_decision.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, defaults); 7 external calls (Char, new, assert!, assert_eq!, make_elicitation_request, make_overlay_with_keymap, vec!).
 
@@ -1356,11 +1356,11 @@ fn configured_list_cancel_cancels_mcp_elicitation()
 fn shortcut_triggers_selection()
 ```
 
-**Purpose**: Verifies that an approval shortcut key directly applies a selection and emits an approval op.
+**Purpose**: Checks that an approval shortcut chooses an option and emits an approval operation. This confirms shortcut selection works without pressing Enter.
 
-**Data flow**: Creates an exec overlay, sends the default approve shortcut, and scans the event queue for any `SubmitThreadOp`.
+**Data flow**: It opens a standard exec prompt, sends the y key, drains events, and asserts that a thread operation was emitted.
 
-**Call relations**: Covers the direct option-shortcut path in `try_handle_shortcut`.
+**Call relations**: The test runner calls this. It exercises try_handle_shortcut and apply_selection.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 6 external calls (Char, new, assert!, matches!, make_exec_request, make_overlay).
 
@@ -1371,11 +1371,11 @@ fn shortcut_triggers_selection()
 fn deny_shortcut_submits_denied_exec_decision()
 ```
 
-**Purpose**: Ensures the deny shortcut maps to `Decline` for exec approvals when that decision is available.
+**Purpose**: Checks that the deny shortcut submits a decline decision for command execution. This protects the meaning of the deny key.
 
-**Data flow**: Creates an exec request with accept and decline options, sends the deny shortcut, and asserts the emitted exec approval decision is `Decline`.
+**Data flow**: It builds an exec prompt with accept and decline choices, sends the deny key, and asserts the emitted exec approval decision is Decline.
 
-**Call relations**: Exercises `exec_options` label/shortcut generation and `apply_selection` routing for decline.
+**Call relations**: The test runner calls this. It verifies the option produced by exec_options is correctly routed by apply_selection.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 6 external calls (Char, new, assert!, assert_eq!, make_overlay, vec!).
 
@@ -1386,11 +1386,11 @@ fn deny_shortcut_submits_denied_exec_decision()
 fn network_deny_shortcut_submits_policy_deny_decision()
 ```
 
-**Purpose**: Ensures the deny shortcut maps to a network-policy deny amendment when that is the available deny-like option.
+**Purpose**: Checks that a network policy deny option can be selected by the deny shortcut. This confirms “block this host in the future” is wired correctly.
 
-**Data flow**: Creates a network approval request whose available decisions include `ApplyNetworkPolicyAmendment { action: Deny }`, sends the deny shortcut, and asserts the emitted exec approval decision is that amendment.
+**Data flow**: It builds a network approval request with a deny policy amendment, sends the deny key, and checks the emitted command decision contains that amendment.
 
-**Call relations**: Covers the network-specific branch of `exec_options`.
+**Call relations**: The test runner calls this. It covers exec_options label/shortcut construction and handle_exec_decision routing.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 6 external calls (Char, new, assert!, assert_eq!, make_overlay, vec!).
 
@@ -1401,11 +1401,11 @@ fn network_deny_shortcut_submits_policy_deny_decision()
 fn resolved_request_dismisses_overlay_without_emitting_abort()
 ```
 
-**Purpose**: Verifies that externally dismissing a matching request closes the overlay without sending a cancel decision.
+**Purpose**: Verifies that externally resolved requests close the overlay without sending a new cancel or denial. This avoids double-answering a request.
 
-**Data flow**: Creates an exec overlay, calls `dismiss_app_server_request` with a matching resolved request, asserts the overlay completes, and checks that no event was emitted.
+**Data flow**: It opens an exec prompt, dismisses it with a matching resolved request, checks the overlay is complete, and checks no approval event was emitted.
 
-**Call relations**: Covers the stale-request dismissal path distinct from user cancellation.
+**Call relations**: The test runner calls this. It exercises dismiss_app_server_request and the matching logic in dismiss_resolved_request.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 3 external calls (assert!, make_exec_request, make_overlay).
 
@@ -1416,11 +1416,11 @@ fn resolved_request_dismisses_overlay_without_emitting_abort()
 fn o_opens_source_thread_for_cross_thread_approval()
 ```
 
-**Purpose**: Checks that the default open-thread shortcut selects the source thread for cross-thread approvals.
+**Purpose**: Checks that the open-thread shortcut selects the thread that created a cross-thread approval. This helps users inspect the context before deciding.
 
-**Data flow**: Creates a cross-thread exec request with a thread label, sends `o`, and asserts the emitted event is `SelectAgentThread(thread_id)`.
+**Data flow**: It creates a labeled request, sends the open-thread key, and asserts that a SelectAgentThread event with the right thread id was emitted.
 
-**Call relations**: Exercises the open-thread branch of `try_handle_shortcut`.
+**Call relations**: The test runner calls this. It exercises the open-thread branch in try_handle_shortcut.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 5 external calls (Char, new, assert_eq!, make_overlay, vec!).
 
@@ -1431,11 +1431,11 @@ fn o_opens_source_thread_for_cross_thread_approval()
 fn configured_open_thread_shortcut_opens_source_thread()
 ```
 
-**Purpose**: Verifies that the open-thread shortcut is fully remappable.
+**Purpose**: Verifies that a customized open-thread shortcut is honored and the old default key no longer works. This protects user keymap customization.
 
-**Data flow**: Builds a custom approval keymap with `x` as open-thread, confirms `o` no longer works, then sends `x` and asserts a `SelectAgentThread` event is emitted.
+**Data flow**: It changes the open-thread key to x, sends the old key and expects no event, then sends x and expects a thread-selection event.
 
-**Call relations**: Covers runtime keymap override behavior for cross-thread navigation.
+**Call relations**: The test runner calls this. It uses make_overlay_with_keymap to test try_handle_shortcut with custom bindings.
 
 *Call graph*: calls 4 internal fn (with_defaults, new, new, defaults); 5 external calls (Char, new, assert!, make_overlay_with_keymap, vec!).
 
@@ -1446,11 +1446,11 @@ fn configured_open_thread_shortcut_opens_source_thread()
 fn cross_thread_footer_hint_mentions_o_shortcut()
 ```
 
-**Purpose**: Captures the rendered footer hint for a cross-thread approval prompt, including the open-thread shortcut text.
+**Purpose**: Checks that a cross-thread approval shows the open-thread hint in the footer. This makes the shortcut discoverable to users.
 
-**Data flow**: Creates a cross-thread exec overlay, renders it to text with `render_overlay_lines`, and snapshot-compares the result.
+**Data flow**: It creates a labeled exec request, renders the overlay, and compares the output to a stored snapshot.
 
-**Call relations**: Documents the footer-hint augmentation performed by `approval_footer_hint`.
+**Call relations**: The test runner calls this. It indirectly exercises approval_footer_hint through build_options and rendering.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 3 external calls (assert_snapshot!, make_overlay, vec!).
 
@@ -1461,11 +1461,11 @@ fn cross_thread_footer_hint_mentions_o_shortcut()
 fn exec_prefix_option_emits_execpolicy_amendment()
 ```
 
-**Purpose**: Ensures the prefix-approval shortcut emits an exec-policy amendment decision.
+**Purpose**: Checks that selecting the command-prefix approval option sends the expected execution-policy amendment. This supports “do not ask again for commands starting with this.”
 
-**Data flow**: Creates an exec request whose available decisions include `AcceptWithExecpolicyAmendment`, sends the prefix shortcut, and asserts the emitted exec approval decision matches the amendment.
+**Data flow**: It builds an exec request with an amendment option, sends its shortcut, and asserts the emitted exec approval contains the same amendment.
 
-**Call relations**: Covers the exec-policy amendment branch of `exec_options` and selection routing.
+**Call relations**: The test runner calls this. It covers exec_options construction and apply_selection routing.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 6 external calls (Char, new, assert!, assert_eq!, make_overlay, vec!).
 
@@ -1476,11 +1476,11 @@ fn exec_prefix_option_emits_execpolicy_amendment()
 fn network_deny_forever_shortcut_is_not_bound()
 ```
 
-**Purpose**: Verifies that hidden network-policy allow options do not accidentally bind the deny shortcut when no deny decision exists.
+**Purpose**: Checks that the deny shortcut is not accidentally active when the network prompt only offers allow-style options and cancel. This prevents hidden choices from firing.
 
-**Data flow**: Creates a network approval request with accept, accept-for-session, allow-forever, and cancel options, sends the deny shortcut, and asserts no event is emitted.
+**Data flow**: It builds a network approval without a deny amendment, sends the deny key, and asserts no approval event was emitted.
 
-**Call relations**: Protects against misleading shortcut exposure in `exec_options`.
+**Call relations**: The test runner calls this. It guards the shortcut assignment produced by exec_options.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 5 external calls (Char, new, assert!, make_overlay, vec!).
 
@@ -1491,11 +1491,11 @@ fn network_deny_forever_shortcut_is_not_bound()
 fn header_includes_command_snippet()
 ```
 
-**Purpose**: Checks that non-network exec approval headers include the command text.
+**Purpose**: Verifies that normal command approvals show the command in the prompt header. Users need to see what they are approving.
 
-**Data flow**: Creates an exec overlay, renders it into a buffer, converts rows to strings, and asserts one line contains `echo hello world`.
+**Data flow**: It builds an exec request, renders the overlay, converts the buffer to strings, and checks for the command text.
 
-**Call relations**: Covers the command-rendering branch of `build_header`.
+**Call relations**: The test runner calls this. It exercises build_header and render.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 5 external calls (empty, new, assert!, make_overlay, vec!).
 
@@ -1506,11 +1506,11 @@ fn header_includes_command_snippet()
 fn network_exec_options_use_expected_labels_and_hide_execpolicy_amendment()
 ```
 
-**Purpose**: Verifies the exact labels produced for network approval options and confirms exec-policy wording is not used there.
+**Purpose**: Checks the labels for network approval choices and ensures command-prefix policy wording is not shown there. Network prompts should talk about hosts, not shell command prefixes.
 
-**Data flow**: Calls `exec_options` with a network context and several decisions, collects labels, and compares them to the expected list.
+**Data flow**: It calls exec_options with a network context and compares the produced labels to the expected list.
 
-**Call relations**: Directly tests the network-specific label logic in `exec_options`.
+**Call relations**: The test runner calls this. It directly verifies exec_options behavior.
 
 *Call graph*: calls 2 internal fn (exec_options, defaults); 1 external calls (assert_eq!).
 
@@ -1521,11 +1521,11 @@ fn network_exec_options_use_expected_labels_and_hide_execpolicy_amendment()
 fn generic_exec_options_can_offer_allow_for_session()
 ```
 
-**Purpose**: Verifies the generic exec option labels when session approval is available.
+**Purpose**: Checks that normal command approvals can offer a session-wide approval choice. This confirms the generic command wording is correct.
 
-**Data flow**: Calls `exec_options` without network or additional-permission context, collects labels, and compares them to the expected generic wording.
+**Data flow**: It calls exec_options without network or extra-permission context and compares the labels to expected generic command labels.
 
-**Call relations**: Covers the non-network, non-permission branch of `exec_options`.
+**Call relations**: The test runner calls this. It directly protects exec_options label text.
 
 *Call graph*: calls 2 internal fn (exec_options, defaults); 1 external calls (assert_eq!).
 
@@ -1536,11 +1536,11 @@ fn generic_exec_options_can_offer_allow_for_session()
 fn additional_permissions_exec_options_hide_execpolicy_amendment()
 ```
 
-**Purpose**: Checks that additional-permission exec prompts use simple proceed/cancel wording and do not expose exec-policy amendment options.
+**Purpose**: Checks the command prompt labels when extra permissions are involved. It ensures the options stay focused on proceeding or canceling for that request shape.
 
-**Data flow**: Calls `exec_options` with additional permissions and basic decisions, collects labels, and compares them to the expected two-option list.
+**Data flow**: It builds an additional-permissions profile, calls exec_options, and compares the labels to the expected output.
 
-**Call relations**: Covers the additional-permissions wording branch in `exec_options`.
+**Call relations**: The test runner calls this. It directly verifies exec_options for permission-related command prompts.
 
 *Call graph*: calls 3 internal fn (from_read_write_roots, exec_options, defaults); 2 external calls (assert_eq!, vec!).
 
@@ -1551,11 +1551,11 @@ fn additional_permissions_exec_options_hide_execpolicy_amendment()
 fn permissions_options_use_expected_labels()
 ```
 
-**Purpose**: Verifies the exact labels for permission-request options.
+**Purpose**: Checks the visible labels for permission approval choices. This guards wording that users depend on to understand scope.
 
-**Data flow**: Calls `permissions_options`, collects labels, and compares them to the expected four strings.
+**Data flow**: It builds permission options from the default key map, extracts labels, and compares them to the expected list.
 
-**Call relations**: Directly tests the fixed option set for permission approvals.
+**Call relations**: The test runner calls this. It directly verifies permissions_options.
 
 *Call graph*: calls 2 internal fn (permissions_options, defaults); 1 external calls (assert_eq!).
 
@@ -1566,11 +1566,11 @@ fn permissions_options_use_expected_labels()
 fn additional_permissions_rule_shows_non_path_file_system_entries()
 ```
 
-**Purpose**: Ensures permission-rule formatting handles special paths and glob patterns.
+**Purpose**: Checks that permission-rule formatting handles special paths and glob patterns. This ensures non-standard sandbox entries are still understandable.
 
-**Data flow**: Builds an `AdditionalPermissionProfile` with a special root write and glob deny entry, calls `format_additional_permissions_rule`, and asserts the formatted string matches expectations.
+**Data flow**: It creates additional file-system permissions with root and glob entries, formats them, and compares the result to expected text.
 
-**Call relations**: Covers `format_file_system_entry_paths` and `special_path_label` behavior.
+**Call relations**: The test runner calls this. It covers format_additional_permissions_rule and the path-formatting helpers.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1581,11 +1581,11 @@ fn additional_permissions_rule_shows_non_path_file_system_entries()
 fn additional_permissions_rule_uses_workspace_roots_label()
 ```
 
-**Purpose**: Ensures project-root special paths render with the `:workspace_roots` label and subpath suffix.
+**Purpose**: Checks that workspace-root special paths are labeled clearly, including subpaths. This avoids exposing confusing internal names.
 
-**Data flow**: Builds an additional-permissions profile with a `ProjectRoots { subpath: .git }` read entry, formats it, and compares the result.
+**Data flow**: It creates a permission entry for workspace roots plus .git, formats it, and compares the output to the expected label.
 
-**Call relations**: Tests the `ProjectRoots` branch of `special_path_label` and `path_label`.
+**Call relations**: The test runner calls this. It covers special_path_label and path_label through the permission formatter.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1596,11 +1596,11 @@ fn additional_permissions_rule_uses_workspace_roots_label()
 fn permissions_session_shortcut_submits_session_scope()
 ```
 
-**Purpose**: Checks that the session-grant shortcut emits a session-scoped permission response.
+**Purpose**: Verifies that the session approval shortcut sends a session-scoped permission response. This protects the difference between one-turn and whole-session grants.
 
-**Data flow**: Creates a permissions overlay, sends the session shortcut, scans emitted events for a permission response op, and asserts `scope == Session`.
+**Data flow**: It opens a permission prompt, sends the session shortcut, reads emitted events, and checks the response scope is Session.
 
-**Call relations**: Exercises `handle_permissions_decision` for the session-grant path.
+**Call relations**: The test runner calls this. It exercises permissions_options, apply_selection, and handle_permissions_decision.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 6 external calls (Char, new, assert!, assert_eq!, make_overlay, make_permissions_request).
 
@@ -1611,11 +1611,11 @@ fn permissions_session_shortcut_submits_session_scope()
 fn permissions_deny_shortcut_uses_deny_keymap()
 ```
 
-**Purpose**: Verifies that permission denial uses the configured deny keymap and emits an empty permission response.
+**Purpose**: Checks that permission denial uses the configured deny shortcut and sends empty permissions. This confirms custom deny bindings are respected.
 
-**Data flow**: Builds a custom keymap with `x` as deny, sends it to a permissions overlay, and asserts the emitted response has empty permissions, turn scope, and no strict auto review.
+**Data flow**: It changes the deny shortcut to x, opens a permission prompt, sends x, and checks the emitted response has no permissions, turn scope, and no strict review.
 
-**Call relations**: Covers the deny-shortcut filtering and routing in `permissions_options` and `handle_permissions_decision`.
+**Call relations**: The test runner calls this. It verifies permissions_options shortcut filtering and handle_permissions_decision denial behavior.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, defaults); 8 external calls (Char, new, new, assert!, assert_eq!, make_overlay_with_keymap, make_permissions_request, vec!).
 
@@ -1626,11 +1626,11 @@ fn permissions_deny_shortcut_uses_deny_keymap()
 fn permissions_strict_auto_review_shortcut_submits_turn_scope_with_strict_review()
 ```
 
-**Purpose**: Checks that the strict-auto-review shortcut emits a turn-scoped response with the strict flag set.
+**Purpose**: Checks that the strict auto review option sends a turn-scoped grant with the strict flag set. This protects a more cautious approval mode.
 
-**Data flow**: Creates a permissions overlay, sends `r`, scans emitted events for a permission response op, and asserts turn scope plus `strict_auto_review == true`.
+**Data flow**: It opens a permission prompt, sends r, reads the emitted response, and asserts the scope is Turn and strict auto review is true.
 
-**Call relations**: Exercises the special strict-review option in `permissions_options`.
+**Call relations**: The test runner calls this. It exercises the special permission option built by permissions_options.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 6 external calls (Char, new, assert!, assert_eq!, make_overlay, make_permissions_request).
 
@@ -1641,11 +1641,11 @@ fn permissions_strict_auto_review_shortcut_submits_turn_scope_with_strict_review
 fn additional_permissions_prompt_shows_permission_rule_line()
 ```
 
-**Purpose**: Verifies that exec prompts with additional permissions render a permission-rule line in the header.
+**Purpose**: Verifies that command prompts requesting extra permissions show a permission-rule line. This makes extra access visible before approval.
 
-**Data flow**: Creates an exec overlay with network and file-system additional permissions, renders it, and asserts the output contains `Permission rule:` and `network;` text.
+**Data flow**: It builds an exec request with network and file-system permissions, renders it, and checks the output contains the permission rule and network text.
 
-**Call relations**: Covers the additional-permission header branch in `build_header`.
+**Call relations**: The test runner calls this. It exercises build_header and format_additional_permissions_rule.
 
 *Call graph*: calls 4 internal fn (with_defaults, from_read_write_roots, new, new); 5 external calls (empty, new, assert!, make_overlay, vec!).
 
@@ -1656,11 +1656,11 @@ fn additional_permissions_prompt_shows_permission_rule_line()
 fn additional_permissions_prompt_snapshot()
 ```
 
-**Purpose**: Captures a snapshot of an exec approval prompt that includes additional permissions.
+**Purpose**: Snapshot-tests the full prompt for a command that asks for extra permissions. This catches accidental layout or wording changes.
 
-**Data flow**: Builds the overlay, renders it to normalized text, and snapshot-compares the result.
+**Data flow**: It builds an extra-permissions exec request, renders the overlay, normalizes paths, and compares against a snapshot.
 
-**Call relations**: Documents the combined reason/permission-rule/command presentation.
+**Call relations**: The test runner calls this. It covers the combined path through make_overlay, build_header, option building, and rendering.
 
 *Call graph*: calls 4 internal fn (with_defaults, from_read_write_roots, new, new); 3 external calls (assert_snapshot!, make_overlay, vec!).
 
@@ -1671,11 +1671,11 @@ fn additional_permissions_prompt_snapshot()
 fn permissions_prompt_snapshot()
 ```
 
-**Purpose**: Captures a snapshot of a permissions approval prompt.
+**Purpose**: Snapshot-tests the standalone permissions prompt. This protects the visual layout and wording of permission requests.
 
-**Data flow**: Builds a permissions overlay, renders it to normalized text, and snapshot-compares the result.
+**Data flow**: It builds a standard permissions request, renders the overlay with stable paths, and compares the result to a snapshot.
 
-**Call relations**: Documents the permissions-specific header and option layout.
+**Call relations**: The test runner calls this. It uses make_permissions_request and render_overlay_lines.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 3 external calls (assert_snapshot!, make_overlay, make_permissions_request).
 
@@ -1686,11 +1686,11 @@ fn permissions_prompt_snapshot()
 fn apply_patch_prompt_with_thread_label_omits_command_line()
 ```
 
-**Purpose**: Verifies that apply-patch prompts with a thread label show thread context and open-thread hint but not a shell command line.
+**Purpose**: Checks that apply-patch prompts with a source thread show the thread label and do not show a fake command line. This keeps file-edit prompts focused on edits, not internal mechanics.
 
-**Data flow**: Builds an apply-patch overlay with a thread label, renders it to text, and asserts the output contains the thread label and open-thread hint but not `$ apply_patch`.
+**Data flow**: It builds a patch request with a thread label, renders the overlay, and asserts the thread hint is present while an apply_patch command line is absent.
 
-**Call relations**: Covers the apply-patch branch of `build_header` and `approval_footer_hint`.
+**Call relations**: The test runner calls this. It directly constructs ApprovalOverlay and exercises build_header and approval_footer_hint for patch requests.
 
 *Call graph*: calls 5 internal fn (with_defaults, new, new, new, defaults); 5 external calls (new, from, assert!, absolute_path, render_overlay_lines).
 
@@ -1701,11 +1701,11 @@ fn apply_patch_prompt_with_thread_label_omits_command_line()
 fn network_exec_prompt_title_includes_host()
 ```
 
-**Purpose**: Checks that network approval prompts title the host explicitly and omit command-line and execpolicy wording.
+**Purpose**: Verifies that network approval prompts name the host and hide the underlying command line. Users are approving network access, not a generic shell command.
 
-**Data flow**: Builds a network exec overlay, renders it, snapshot-compares the raw buffer, and asserts the rendered text includes the host-specific title while excluding `$ curl` and `don't ask again` wording.
+**Data flow**: It builds a network exec request, renders the overlay, snapshots the buffer, and checks for the host title while checking command and command-policy wording are absent.
 
-**Call relations**: Covers the network-specific title and header behavior in `build_options` and `build_header`.
+**Call relations**: The test runner calls this. It exercises build_options title selection, build_header's network behavior, and rendering.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 6 external calls (empty, new, assert!, assert_snapshot!, make_overlay, vec!).
 
@@ -1716,11 +1716,11 @@ fn network_exec_prompt_title_includes_host()
 fn ctrl_shift_a_opens_fullscreen()
 ```
 
-**Purpose**: Verifies that the fullscreen shortcut emits a `FullScreenApprovalRequest` event.
+**Purpose**: Checks that the fullscreen approval shortcut emits the fullscreen request event. This lets users inspect a request in more space.
 
-**Data flow**: Creates an overlay, sends Ctrl-Shift-A, and scans emitted events for `AppEvent::FullScreenApprovalRequest`.
+**Data flow**: It opens a standard exec prompt, sends Ctrl-Shift-A, drains events, and asserts a FullScreenApprovalRequest event appeared.
 
-**Call relations**: Exercises the fullscreen branch of `try_handle_shortcut`.
+**Call relations**: The test runner calls this. It exercises the fullscreen branch in try_handle_shortcut.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 6 external calls (Char, new, assert!, matches!, make_exec_request, make_overlay).
 
@@ -1731,11 +1731,11 @@ fn ctrl_shift_a_opens_fullscreen()
 fn exec_history_cell_wraps_with_two_space_indent()
 ```
 
-**Purpose**: Checks the wrapped formatting of command-approval history cells.
+**Purpose**: Checks that long command approval history messages wrap with a readable indent. This keeps history entries tidy in narrow terminals.
 
-**Data flow**: Builds a history cell for an approved long command, renders it at narrow width, converts lines to strings, and compares them to the expected wrapped output.
+**Data flow**: It creates an approval decision history cell for a long command, renders it at a narrow width, and compares the resulting lines to expected text.
 
-**Call relations**: Indirectly validates the history-cell subject and review-decision mapping used by `handle_exec_decision`.
+**Call relations**: The test runner calls this. It tests history rendering used by handle_exec_decision, even though the history cell implementation lives elsewhere.
 
 *Call graph*: 4 external calls (assert_eq!, new_approval_decision_cell, Command, vec!).
 
@@ -1746,11 +1746,11 @@ fn exec_history_cell_wraps_with_two_space_indent()
 fn exec_history_cell_does_not_render_blank_action_for_empty_command()
 ```
 
-**Purpose**: Ensures history cells for empty command subjects still render sensible approval text.
+**Purpose**: Checks that history messages for empty commands still read naturally. This avoids awkward blank command text in approval history.
 
-**Data flow**: Builds approval history cells for empty command vectors with two review decisions and compares their rendered lines to expected strings.
+**Data flow**: It creates approved and approved-for-session history cells with an empty command, renders them, and compares the plain text lines to expected generic messages.
 
-**Call relations**: Protects the history-cell rendering assumptions used when command subjects are absent.
+**Call relations**: The test runner calls this. It protects history output that handle_exec_decision may insert.
 
 *Call graph*: 4 external calls (new, assert_eq!, new_approval_decision_cell, Command).
 
@@ -1761,11 +1761,11 @@ fn exec_history_cell_does_not_render_blank_action_for_empty_command()
 fn network_access_command_history_uses_target_without_structured_context()
 ```
 
-**Purpose**: Verifies that `network-access` commands produce network-target history text even without structured network context.
+**Purpose**: Verifies that a special network-access command is recorded in history as network access to its target. This makes history clearer even without structured network context.
 
-**Data flow**: Creates an exec overlay for a `network-access` command, approves it, extracts the inserted history cell, renders it, and compares the line to the expected network-access wording.
+**Data flow**: It builds an exec request whose command encodes a network target, approves it, captures the inserted history cell, and checks the rendered text.
 
-**Call relations**: Covers the fallback `network_approval_command_target` path in `handle_exec_decision`.
+**Call relations**: The test runner calls this. It exercises handle_exec_decision and network_approval_command_target.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, new); 5 external calls (Char, new, assert_eq!, make_overlay, vec!).
 
@@ -1776,11 +1776,11 @@ fn network_access_command_history_uses_target_without_structured_context()
 fn esc_cancels_mcp_elicitation()
 ```
 
-**Purpose**: Ensures plain Esc cancels MCP elicitation requests.
+**Purpose**: Checks the key safety rule that Escape cancels MCP elicitation. This prevents Escape from meaning a softer decline.
 
-**Data flow**: Creates an elicitation overlay, sends Esc, scans emitted events for a resolve-elicitation op, and asserts the decision is `Cancel`.
+**Data flow**: It opens an MCP elicitation prompt, sends Escape, reads emitted events, and asserts the decision is Cancel.
 
-**Call relations**: Directly tests the Esc-cancel contract for elicitation prompts.
+**Call relations**: The test runner calls this. It verifies elicitation_options and shortcut routing through handle_key_event.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 4 external calls (new, assert_eq!, make_elicitation_request, make_overlay).
 
@@ -1791,11 +1791,11 @@ fn esc_cancels_mcp_elicitation()
 fn esc_still_cancels_elicitation_with_custom_overlap()
 ```
 
-**Purpose**: Verifies that Esc remains cancel even when custom decline and cancel bindings overlap, while non-Esc decline bindings still decline.
+**Purpose**: Checks that Escape still cancels MCP elicitation even if custom key bindings overlap with decline. It also confirms the remaining decline shortcut still declines.
 
-**Data flow**: Builds a custom keymap where decline includes Esc and `n`, cancel includes `x`, sends Esc in one overlay and `n` in another, and asserts the first emits `Cancel` while the second emits `Decline`.
+**Data flow**: It customizes decline to include Escape and n, opens an MCP prompt, sends Escape and expects Cancel; then opens another prompt, sends n, and expects Decline.
 
-**Call relations**: Covers the overlap-removal logic in `elicitation_options`.
+**Call relations**: The test runner calls this. It directly protects the overlap-removal logic in elicitation_options.
 
 *Call graph*: calls 3 internal fn (with_defaults, new, defaults); 6 external calls (Char, new, assert_eq!, make_elicitation_request, make_overlay_with_keymap, vec!).
 
@@ -1806,24 +1806,28 @@ fn esc_still_cancels_elicitation_with_custom_overlap()
 fn enter_sets_last_selected_index_without_dismissing()
 ```
 
-**Purpose**: Checks that pressing Enter on the list applies the selected option and completes the overlay without relying on list auto-dismissal.
+**Purpose**: Checks that pressing Enter selects the highlighted approval option and completes the prompt through the overlay's own decision flow. The list view should not silently dismiss without sending a response.
 
-**Data flow**: Creates an exec overlay, sends Enter, asserts the overlay completes, and scans emitted events for an exec approval decision of `Accept`.
+**Data flow**: It opens a standard exec prompt, sends Enter, asserts the overlay is complete, then checks the emitted command decision is Accept.
 
-**Call relations**: Exercises the path where `ListSelectionView` reports a selected index and `ApprovalOverlay::apply_selection` performs the actual completion.
+**Call relations**: The test runner calls this. It exercises handle_key_event's handoff to the list view and then apply_selection.
 
 *Call graph*: calls 2 internal fn (with_defaults, new); 5 external calls (new, assert!, assert_eq!, make_exec_request, make_overlay).
 
 
 ### `tui/src/bottom_pane/request_user_input/mod.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling and terminal redraw loop`
 
-This is the core implementation of the request-user-input overlay shown when a tool asks the user one or more questions. The main state lives in `RequestUserInputOverlay`: the active `ToolRequestUserInputParams`, a FIFO queue of later requests, a reused `ChatComposer` for notes/freeform answers, per-question `AnswerState` entries, current question index and focus (`Options` or `Notes`), unanswered-confirmation popup state, and auto-resolution timing fields. `ComposerDraft` snapshots composer text, text elements, local image paths, and pending paste placeholders so drafts survive question switches and submission/back-navigation. `FooterTip` models footer hint fragments with optional highlighting.
+This file is the control center for a request-user-input overlay in the terminal interface. Think of it like a small questionnaire window that appears during a conversation: it can show one or more questions, offer numbered choices, and provide a text box for notes or free-form answers. Without it, the app could ask for clarification but the terminal UI would not know how to display the questions, remember draft answers, or send the final response back.
 
-Construction happens in `new_with_keymap`, which creates a plain-text composer, applies runtime key bindings, suppresses the composer's own footer, initializes overlay state, then calls `reset_for_request`, `ensure_focus_available`, and `restore_current_draft`. The overlay distinguishes option questions from freeform-only questions, supports an extra synthetic `None of the above` option when `is_other` is enabled, and treats notes as an optional appended `user_note: ...` answer. Drafts are saved whenever the current question changes or submission is attempted; committed answers are invalidated if the draft later changes.
+The overlay keeps track of the current request, any queued requests waiting behind it, the current question number, selected options, typed notes, and whether the user has really committed an answer. It also owns a reusable composer widget, which is the text-entry box. Because users may jump between questions, the file saves and restores drafts so text is not lost.
 
-`handle_key_event` is the central control-flow hub. It first snoozes auto-resolution, routes unanswered-confirmation keys when that popup is open, handles Esc-clearing of notes for option questions, supports interrupt bindings, gives composer submit bindings priority in notes mode, then processes question navigation keys. Within `Focus::Options`, arrows/j-k move the highlighted option, space commits the current selection, Backspace/Delete clears it, Tab opens notes, Enter commits and advances, and digit keys select-and-submit directly. Within `Focus::Notes`, Tab or Esc can clear notes back to options, empty Backspace can close notes, Up/Down still move option selection, and all other editing is delegated to the composer; submitted composer results are converted into committed drafts and either advance or trigger unanswered confirmation. Submission builds a `HashMap<String, ToolRequestUserInputAnswer>`, emits both `user_input_answer` and a history cell event, then advances to the next queued request or marks the overlay done. Auto-resolution is modeled as hidden grace, visible countdown, and due states, with rendering support elsewhere using the timing helpers in this file.
+It also guides the user with footer hints, wraps long question and option text to fit the terminal width, and handles keyboard shortcuts. If the user tries to submit with unanswered questions, it opens a small confirmation menu. Some requests can auto-resolve: after a hidden grace period, the UI shows a countdown and then submits an empty answer unless the user interacts. The test helpers at the end build sample questions and snapshots to check this behavior. This chunk is the test coverage for the user-input request overlay. The overlay is like a small form that appears in the terminal when the app needs clarification from the user. It may show multiple questions, each with selectable options or a free-text answer box. These tests check that the form behaves predictably when the user presses keys, switches between questions, adds notes, pastes large text, or leaves an auto-resolving prompt unanswered. They also check what events are sent out: a completed answer, an interrupt when the user cancels, or nothing when a stale request is simply dismissed. Several tests use snapshot rendering, which means they compare the drawn terminal screen against a stored expected picture. That protects the layout: progress text, countdown color, wrapped options, footers, and tight-height views should not accidentally change. Without these tests, small input-handling changes could silently break important user-facing behavior, such as submitting a highlighted option too early, losing pasted text, hiding the wrong footer hint, or answering an expired prompt incorrectly. The request-user-input overlay is the screen panel shown when the program needs the user to answer one or more questions. Some questions are multiple choice, some allow free text, and some may include extra notes. These tests act like a photo album for that overlay: they build sample questions, render the overlay into a fixed-size terminal area, and compare the result with stored snapshots. A snapshot test is a test that saves the expected text UI output and warns developers if it changes later.
+
+The tests cover practical cases a user would notice: a long list of choices that needs scrolling, a small terminal where some choices are hidden, a plain freeform question, changed keyboard shortcuts, moving between multiple questions, and showing a warning when not all questions have been answered. One behavior test also checks that pressing the down arrow can still move through answer options while the notes field is being edited, without accidentally marking the answer as final.
+
+Together, these tests protect the user experience. Without them, a small change in layout, shortcut labels, scrolling, or answer selection could quietly make the prompt confusing or harder to use.
 
 #### Function details
 
@@ -1833,11 +1837,11 @@ Construction happens in `new_with_keymap`, which creates a plain-text composer, 
 fn format_auto_resolution_remaining(remaining: Duration) -> String
 ```
 
-**Purpose**: Formats a remaining duration for the auto-resolution countdown as either seconds or `Xm YYs`. It rounds partial seconds up so the displayed countdown does not hit zero prematurely.
+**Purpose**: Turns a remaining countdown time into a short label such as `12s` or `1m 05s`. It rounds up partial seconds so the display does not say zero too early.
 
-**Data flow**: Takes `remaining: Duration`, reads whole seconds and nanoseconds, increments the displayed seconds if there is any fractional remainder, then returns either `"{seconds}s"` for values under a minute or `"{minutes}m {seconds:02}s"` otherwise.
+**Data flow**: It receives a duration, reads its seconds and leftover nanoseconds, rounds up if needed, then returns a formatted string in seconds or minutes-and-seconds.
 
-**Call relations**: Used by `auto_resolution_countdown_text_at` when the countdown becomes visible.
+**Call relations**: It is used when the overlay builds the visible auto-resolution countdown text, so the timer shown to the user stays compact and readable.
 
 *Call graph*: 3 external calls (as_secs, subsec_nanos, format!).
 
@@ -1848,11 +1852,11 @@ fn format_auto_resolution_remaining(remaining: Duration) -> String
 fn text_with_pending(&self) -> String
 ```
 
-**Purpose**: Returns the draft text with any pending paste placeholders expanded back into their full pasted payloads. It lets submission logic operate on the real text rather than placeholder markers.
+**Purpose**: Returns the draft text as the user would expect to submit it, including paste chunks that have not yet been fully folded into the composer text. This matters because pasted text can be buffered briefly.
 
-**Data flow**: Reads `self.text`, `self.text_elements`, and `self.pending_pastes`. If there are no pending pastes it clones and returns `self.text`. Otherwise it asserts `text_elements` is non-empty, calls `ChatComposer::expand_pending_pastes` with the stored text, cloned text elements, and pending paste metadata, and returns the expanded string portion.
+**Data flow**: It reads the draft's stored text, text elements, and pending pastes. If there are no pending pastes, it returns the stored text; otherwise it asks `ChatComposer` to expand the pending paste data and returns the expanded text.
 
-**Call relations**: Used during answer submission so notes include the actual pasted content rather than placeholder tokens.
+**Call relations**: Submission code calls this when turning saved drafts into final answers, so delayed paste content is not accidentally omitted.
 
 *Call graph*: calls 1 internal fn (expand_pending_pastes); 1 external calls (debug_assert!).
 
@@ -1863,11 +1867,11 @@ fn text_with_pending(&self) -> String
 fn new(text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a non-highlighted footer tip from arbitrary text input. It is the default footer-tip constructor.
+**Purpose**: Creates a normal footer hint, such as a keyboard shortcut reminder. It is used for hints that should not be visually emphasized.
 
-**Data flow**: Takes any `Into<String>`, converts it into a `String`, stores it in `text`, sets `highlight` to `false`, and returns the `FooterTip`.
+**Data flow**: It receives text, converts it into an owned string, marks it as not highlighted, and returns a `FooterTip` value.
 
-**Call relations**: Used by `footer_tips` for ordinary, non-emphasized hints.
+**Call relations**: The footer-building code uses this alongside `FooterTip::highlighted` when assembling the guidance shown at the bottom of the overlay.
 
 *Call graph*: 1 external calls (into).
 
@@ -1878,11 +1882,11 @@ fn new(text: impl Into<String>) -> Self
 fn highlighted(text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a highlighted footer tip. It marks especially important hints such as the primary submit action.
+**Purpose**: Creates an emphasized footer hint for an especially important action, such as submitting. Highlighting helps the user see the next likely step.
 
-**Data flow**: Takes any `Into<String>`, converts it into a `String`, stores it in `text`, sets `highlight` to `true`, and returns the `FooterTip`.
+**Data flow**: It receives text, converts it into an owned string, marks it as highlighted, and returns a `FooterTip` value.
 
-**Call relations**: Used by `footer_tips` for emphasized actions like adding notes or submitting.
+**Call relations**: The footer tip builder uses it for primary actions while mixing it with normal tips created by `FooterTip::new`.
 
 *Call graph*: 1 external calls (into).
 
@@ -1898,11 +1902,11 @@ fn new(
         disable_paste_burst: bool,
 ```
 
-**Purpose**: Convenience constructor for tests that builds the overlay with the runtime default keymap. It forwards all behavior to `new_with_keymap`.
+**Purpose**: Creates a new user-input overlay using the default keyboard shortcuts. Tests and callers use it when they do not need a custom keymap.
 
-**Data flow**: Consumes request parameters, event sender, focus and capability flags, loads `RuntimeKeymap::defaults()`, and returns the result of `new_with_keymap`.
+**Data flow**: It receives the request, event sender, focus and keyboard capability flags, and paste settings. It adds the default runtime keymap and delegates construction to `new_with_keymap`, returning a ready overlay.
 
-**Call relations**: Used heavily by tests and any callers that do not need custom keymaps.
+**Call relations**: This is the simple constructor. It is called by tests and higher-level code, while the detailed setup happens in `RequestUserInputOverlay::new_with_keymap`.
 
 *Call graph*: calls 1 internal fn (defaults); called by 65 (auto_resolution_absent_has_no_timer, auto_resolution_expiry_emits_empty_answer, auto_resolution_hides_timer_during_grace_period, auto_resolution_key_interaction_snoozes_timer, auto_resolution_paste_interaction_snoozes_timer, auto_resolution_resets_for_queued_request, auto_resolution_visible_countdown_is_red, auto_resolution_visible_countdown_snapshot, backspace_in_options_clears_selection, backspace_on_empty_notes_closes_notes_ui (+15 more)); 1 external calls (new_with_keymap).
 
@@ -1918,11 +1922,11 @@ fn new_with_keymap(
         disable_paste_burst
 ```
 
-**Purpose**: Builds a fully initialized overlay with a plain-text composer, runtime key bindings, per-question answer state, and restored draft/focus state. It is the real constructor for this subsystem.
+**Purpose**: Creates the overlay with a specific set of keyboard bindings. This is important for users who have remapped submit, interrupt, or list navigation keys.
 
-**Data flow**: Consumes the request, event sender, focus/capability flags, paste-burst flag, and a `RuntimeKeymap`. It creates a `ChatComposer` configured for plain text and the answer placeholder, applies keymap bindings, suppresses the composer's footer, initializes overlay fields including submit/interrupt/list bindings and timestamps, then mutates the new overlay by calling `reset_for_request`, `ensure_focus_available`, and `restore_current_draft` before returning it.
+**Data flow**: It receives the request, event sender, focus flags, paste setting, and keymap. It builds a plain-text composer, stores request state and key bindings, resets answers for the first request, fixes focus, restores the current draft, and returns the overlay.
 
-**Call relations**: Called by `new` and by production code that needs custom keymaps.
+**Call relations**: Higher-level request handling and keymap-focused tests call this. It prepares the composer and internal answer state used by almost every later method.
 
 *Call graph*: calls 2 internal fn (new_with_config, plain_text); called by 7 (push_user_input_request, freeform_footer_shows_configured_submit_binding, freeform_submit_binding_wins_over_question_navigation, freeform_uses_configured_composer_submit_binding, request_user_input_freeform_remapped_interrupt_snapshot, request_user_input_freeform_remapped_submit_snapshot, request_user_input_uses_remapped_interrupt_binding_while_notes_are_visible); 4 external calls (now, new, new, clone).
 
@@ -1933,11 +1937,11 @@ fn new_with_keymap(
 fn current_index(&self) -> usize
 ```
 
-**Purpose**: Returns the currently active question index. It centralizes access to `current_idx`.
+**Purpose**: Returns which question is currently being shown. Other helpers use it to avoid repeating direct access to the internal index field.
 
-**Data flow**: Reads `self.current_idx` and returns it.
+**Data flow**: It reads `current_idx` and returns that number unchanged.
 
-**Call relations**: Used by many helpers that need the active question or answer slot.
+**Call relations**: Question, answer, progress, and navigation helpers call this whenever they need to know the active question.
 
 *Call graph*: called by 8 (current_answer, current_answer_mut, current_question, footer_tips, go_next_or_submit, notes_has_content, notes_ui_visible, progress_prefix_text).
 
@@ -1948,11 +1952,11 @@ fn current_index(&self) -> usize
 fn current_question(&self) -> Option<&ToolRequestUserInputQuestion>
 ```
 
-**Purpose**: Returns the currently active question, if any. It safely indexes into the request's question list.
+**Purpose**: Returns the currently visible question, if there is one. This protects callers from asking for a question when the request has none.
 
-**Data flow**: Reads `self.request.questions` and `current_index()`, then returns `self.request.questions.get(idx)`.
+**Data flow**: It reads the current index, looks up that position in the request's question list, and returns either a reference to the question or nothing.
 
-**Call relations**: Used by option, wrapping, and placeholder helpers that depend on the active question.
+**Call relations**: Option, wrapping, and display helpers call this before reading question text or options.
 
 *Call graph*: calls 1 internal fn (current_index); called by 4 (has_options, option_rows, options_len, wrapped_question_lines).
 
@@ -1963,11 +1967,11 @@ fn current_question(&self) -> Option<&ToolRequestUserInputQuestion>
 fn current_answer_mut(&mut self) -> Option<&mut AnswerState>
 ```
 
-**Purpose**: Returns mutable access to the current question's answer state. It is the main mutation entrypoint for per-question state.
+**Purpose**: Returns editable state for the current answer. It is the safe doorway for changing selection, draft text, note visibility, or committed status.
 
-**Data flow**: Reads `current_index()`, indexes `self.answers` mutably with that index, and returns `Option<&mut AnswerState>`.
+**Data flow**: It reads the current index, looks up the matching answer state in the answers list, and returns a mutable reference if it exists.
 
-**Call relations**: Used throughout draft saving, selection changes, focus changes, and submission handling.
+**Call relations**: Most editing and navigation methods use this before changing the active answer.
 
 *Call graph*: calls 1 internal fn (current_index); called by 12 (apply_submission_draft, apply_submission_to_draft, clear_notes_and_focus_options, clear_notes_draft, clear_selection, ensure_focus_available, ensure_selected_for_notes, handle_composer_input_result, handle_key_event, handle_paste (+2 more)).
 
@@ -1978,11 +1982,11 @@ fn current_answer_mut(&mut self) -> Option<&mut AnswerState>
 fn current_answer(&self) -> Option<&AnswerState>
 ```
 
-**Purpose**: Returns shared access to the current question's answer state. It is the read-only counterpart to `current_answer_mut`.
+**Purpose**: Returns read-only state for the current answer. Display code uses it to know what is selected or saved.
 
-**Data flow**: Reads `current_index()`, indexes `self.answers`, and returns `Option<&AnswerState>`.
+**Data flow**: It reads the current index, looks up the matching answer state, and returns a shared reference if it exists.
 
-**Call relations**: Used by visibility, selection, and sizing helpers.
+**Call relations**: Rendering and draft restoration helpers call this when they need to inspect the active answer without changing it.
 
 *Call graph*: calls 1 internal fn (current_index); called by 5 (notes_ui_visible, options_preferred_height, options_required_height, restore_current_draft, selected_option_index).
 
@@ -1993,11 +1997,11 @@ fn current_answer(&self) -> Option<&AnswerState>
 fn question_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of questions in the active request. It is the shared source for navigation and progress text.
+**Purpose**: Returns how many questions are in the current request. Navigation and progress display rely on this number.
 
-**Data flow**: Reads `self.request.questions.len()` and returns it.
+**Data flow**: It reads the request's question list length and returns it.
 
-**Call relations**: Used by navigation, progress display, and focus validation.
+**Call relations**: It is used by focus checks, progress text, footer hints, and question navigation to stay within valid bounds.
 
 *Call graph*: called by 6 (ensure_focus_available, footer_tips, go_next_or_submit, jump_to_question, move_question, progress_prefix_text).
 
@@ -2008,11 +2012,11 @@ fn question_count(&self) -> usize
 fn advance_queue_or_complete_at(&mut self, now: Instant)
 ```
 
-**Purpose**: Moves from the current request to the next queued request, or marks the overlay complete if the queue is empty. It resets per-request state when advancing.
+**Purpose**: Moves from the current request to the next queued request, or marks the overlay finished if none remain. This keeps multiple incoming prompts in first-in, first-out order.
 
-**Data flow**: Takes `now`, pops the front of `self.queue`. If a next request exists, it replaces `self.request`, updates `request_started_at`, clears `auto_resolution_snoozed`, then calls `reset_for_request`, `ensure_focus_available`, and `restore_current_draft`. If no queued request exists, it sets `self.done = true`.
+**Data flow**: It receives the current time, pops the next request from the queue if present, resets all per-request state, and restores the first draft. If the queue is empty, it sets `done` to true.
 
-**Call relations**: Called after successful submission, auto-resolution submission, and dismissal of the current resolved request.
+**Call relations**: Submission, auto-resolution, and dismissal paths call this after the active request is resolved.
 
 *Call graph*: calls 3 internal fn (ensure_focus_available, reset_for_request, restore_current_draft); called by 3 (dismiss_resolved_request, submit_answers, submit_empty_auto_resolution); 1 external calls (pop_front).
 
@@ -2023,11 +2027,11 @@ fn advance_queue_or_complete_at(&mut self, now: Instant)
 fn snooze_auto_resolution(&mut self)
 ```
 
-**Purpose**: Disables auto-resolution for the current request after user interaction. It prevents the timer from firing once the user has engaged.
+**Purpose**: Stops the auto-resolution countdown once the user interacts. This prevents the UI from submitting an empty answer while the user is actively working.
 
-**Data flow**: Checks whether `self.request.auto_resolution_ms` is `Some`; if so, sets `self.auto_resolution_snoozed = true`.
+**Data flow**: It checks whether the current request has auto-resolution enabled. If so, it marks auto-resolution as snoozed.
 
-**Call relations**: Called at the start of key and paste handling so any interaction cancels the countdown.
+**Call relations**: Keyboard and paste handlers call this at the start of user interaction.
 
 *Call graph*: called by 2 (handle_key_event, handle_paste).
 
@@ -2038,11 +2042,11 @@ fn snooze_auto_resolution(&mut self)
 fn auto_resolution_timing_at(&self, now: Instant) -> AutoResolutionTiming
 ```
 
-**Purpose**: Classifies the current auto-resolution state as disabled, hidden grace, visible countdown, or due. It treats the request's `auto_resolution_ms` as an enable flag and uses fixed local timing policy.
+**Purpose**: Figures out the current auto-resolution state: off, hidden grace period, visible countdown, or due now. This is the source of truth for timer behavior.
 
-**Data flow**: Takes `now`, returns `Disabled` immediately if `auto_resolution_ms` is absent or snoozed. Otherwise it computes elapsed time since `request_started_at`, compares it against `AUTO_RESOLUTION_HIDDEN_GRACE` and `AUTO_RESOLUTION_VISIBLE_COUNTDOWN`, and returns `HiddenGrace { remaining }`, `VisibleCountdown { remaining }`, or `Due` accordingly.
+**Data flow**: It receives a time, compares it with when the request started, and returns a timing state. It disables timing if the request has no auto-resolution or the user already interacted.
 
-**Call relations**: Used by countdown text generation, frame scheduling, and pre-draw auto-resolution checks.
+**Call relations**: Countdown text, redraw scheduling, and pre-draw auto-submit checks all ask this method what stage the timer is in.
 
 *Call graph*: called by 2 (auto_resolution_countdown_text_at, auto_resolution_next_frame_delay_at); 1 external calls (saturating_duration_since).
 
@@ -2053,11 +2057,11 @@ fn auto_resolution_timing_at(&self, now: Instant) -> AutoResolutionTiming
 fn auto_resolution_next_frame_delay_at(&self, now: Instant) -> Option<Duration>
 ```
 
-**Purpose**: Computes when the UI should next wake up to update or trigger auto-resolution. It converts timing state into a scheduling hint.
+**Purpose**: Tells the terminal when it next needs to redraw because of auto-resolution timing. This avoids redrawing constantly when no timer is active.
 
-**Data flow**: Takes `now`, matches on `auto_resolution_timing_at(now)`, and returns `None` when disabled, the full remaining hidden-grace duration during grace, the smaller of remaining countdown time and one second during visible countdown, or `Some(Duration::ZERO)` when due.
+**Data flow**: It receives a time, asks for the auto-resolution timing state, and returns no delay, a grace-period delay, a countdown delay capped at one second, or zero when submission is due.
 
-**Call relations**: Used by `next_frame_delay` so the host can schedule redraws or immediate expiry handling.
+**Call relations**: The overlay's `next_frame_delay` method calls this so the main UI loop can wake up at the right time.
 
 *Call graph*: calls 1 internal fn (auto_resolution_timing_at); called by 1 (next_frame_delay); 1 external calls (from_secs).
 
@@ -2068,11 +2072,11 @@ fn auto_resolution_next_frame_delay_at(&self, now: Instant) -> Option<Duration>
 fn maybe_auto_resolve_at(&mut self, now: Instant) -> bool
 ```
 
-**Purpose**: Triggers empty-answer auto-resolution if the countdown has expired. It returns whether resolution occurred.
+**Purpose**: Submits an empty response if the auto-resolution timer has expired. It returns whether it actually did anything.
 
-**Data flow**: Takes `now`, checks whether `auto_resolution_timing_at(now)` is `Due`, returns `false` if not, otherwise calls `submit_empty_auto_resolution(now)` and returns `true`.
+**Data flow**: It receives a time, checks whether the timing state is due, and if so submits an empty auto-resolution response and returns true. Otherwise it returns false.
 
-**Call relations**: Called from `pre_draw_tick` before rendering.
+**Call relations**: The pre-draw tick calls this just before rendering, giving timed-out requests a chance to finish.
 
 *Call graph*: calls 1 internal fn (submit_empty_auto_resolution); called by 1 (pre_draw_tick); 1 external calls (matches!).
 
@@ -2083,11 +2087,11 @@ fn maybe_auto_resolve_at(&mut self, now: Instant) -> bool
 fn auto_resolution_countdown_text_at(&self, now: Instant) -> Option<String>
 ```
 
-**Purpose**: Builds the visible countdown label when the auto-resolution timer is in its visible phase. It hides text during grace and after expiry.
+**Purpose**: Builds the countdown message shown to the user during the visible countdown phase. Outside that phase, it shows nothing.
 
-**Data flow**: Takes `now`, matches on `auto_resolution_timing_at(now)`, and for `VisibleCountdown { remaining }` returns `Some(format!("auto-resolves in {}", format_auto_resolution_remaining(remaining)))`; otherwise returns `None`.
+**Data flow**: It receives a time, checks the timer state, formats the remaining time if visible, and returns either text like `auto-resolves in 10s` or no text.
 
-**Call relations**: Used by rendering code to show the countdown in the progress area.
+**Call relations**: Rendering code can call this to decide whether a countdown label belongs on screen.
 
 *Call graph*: calls 1 internal fn (auto_resolution_timing_at); 1 external calls (format!).
 
@@ -2098,11 +2102,11 @@ fn auto_resolution_countdown_text_at(&self, now: Instant) -> Option<String>
 fn progress_prefix_text(&self) -> String
 ```
 
-**Purpose**: Builds the progress label shown above the question, including unanswered-question count when nonzero. It summarizes where the user is in the questionnaire.
+**Purpose**: Creates the progress label, such as `Question 2/4 (1 unanswered)`. This helps the user understand where they are in a multi-question prompt.
 
-**Data flow**: Reads `question_count`, `current_index`, and `unanswered_count`. If there are questions, it formats `Question i/n` and appends `({unanswered} unanswered)` when needed; otherwise it returns `No questions`.
+**Data flow**: It reads the current index, total question count, and unanswered count. It returns a suitable progress string, or `No questions` if the request is empty.
 
-**Call relations**: Used by rendering code for the overlay's progress line.
+**Call relations**: Display code uses this text near the question header or footer.
 
 *Call graph*: calls 3 internal fn (current_index, question_count, unanswered_count); 1 external calls (format!).
 
@@ -2113,11 +2117,11 @@ fn progress_prefix_text(&self) -> String
 fn has_options(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current question has a non-empty options list. It drives focus rules, placeholders, and input behavior.
+**Purpose**: Checks whether the current question offers choices. The overlay behaves differently for choice questions and free-form questions.
 
-**Data flow**: Reads `current_question()`, accesses `question.options`, and returns true only when the option vector exists and is non-empty.
+**Data flow**: It reads the current question, checks whether its options list exists and is non-empty, and returns true or false.
 
-**Call relations**: Used throughout the overlay to branch between option-question and freeform-question behavior.
+**Call relations**: Focus, footer, keyboard, placeholder, and note-visibility logic all use this branch point.
 
 *Call graph*: calls 1 internal fn (current_question); called by 13 (clear_notes_and_focus_options, clear_selection, ensure_focus_available, footer_tips, handle_composer_input_result, handle_key_event, notes_placeholder, notes_ui_visible, option_index_for_digit, options_preferred_height (+3 more)).
 
@@ -2128,11 +2132,11 @@ fn has_options(&self) -> bool
 fn options_len(&self) -> usize
 ```
 
-**Purpose**: Returns the number of selectable options for the current question, including the synthetic `None of the above` entry when enabled. It is the canonical option-count helper.
+**Purpose**: Returns the number of selectable choices for the current question. This includes the synthetic `Other` choice when that is enabled.
 
-**Data flow**: Reads `current_question()`, maps it through `options_len_for_question`, and returns 0 when there is no current question.
+**Data flow**: It reads the current question and asks `options_len_for_question`; if there is no current question, it returns zero.
 
-**Call relations**: Used by selection movement, digit mapping, and option-commit logic.
+**Call relations**: Keyboard navigation, digit shortcuts, and selection clamping call this before moving or choosing an option.
 
 *Call graph*: calls 1 internal fn (current_question); called by 4 (handle_composer_input_result, handle_key_event, option_index_for_digit, select_current_option).
 
@@ -2143,11 +2147,11 @@ fn options_len(&self) -> usize
 fn option_index_for_digit(&self, ch: char) -> Option<usize>
 ```
 
-**Purpose**: Maps a numeric key press to an option index for the current question. It ignores `0` and out-of-range digits.
+**Purpose**: Turns a number key into a zero-based option index. For example, pressing `1` means the first option.
 
-**Data flow**: Takes `ch`, returns `None` if `has_options()` is false, converts the char to a base-10 digit, rejects zero, subtracts one to form a zero-based index, and returns it only if it is less than `options_len()`.
+**Data flow**: It receives a character, rejects it if there are no options, if it is not a digit, or if it is `0`. It converts valid digits to an index and returns it only if it fits the option list.
 
-**Call relations**: Used in `handle_key_event` so pressing `1`, `2`, etc. can select and submit options directly.
+**Call relations**: The key handler calls this when the user presses a character while focused on options.
 
 *Call graph*: calls 2 internal fn (has_options, options_len); called by 1 (handle_key_event).
 
@@ -2158,11 +2162,11 @@ fn option_index_for_digit(&self, ch: char) -> Option<usize>
 fn selected_option_index(&self) -> Option<usize>
 ```
 
-**Purpose**: Returns the currently highlighted option index for the active question, if options exist. It hides selection state for freeform questions.
+**Purpose**: Returns which option is currently selected, if any. It only reports a selection for questions that actually have options.
 
-**Data flow**: Returns `None` when `has_options()` is false; otherwise reads `current_answer()` and returns `answer.options_state.selected_idx`.
+**Data flow**: It checks whether options exist, then reads the selected index from the current answer state.
 
-**Call relations**: Used by placeholders, footer tips, and notes-opening logic.
+**Call relations**: Footer hints, placeholders, and key behavior use this to decide whether notes can be added or an option can be submitted.
 
 *Call graph*: calls 2 internal fn (current_answer, has_options); called by 3 (footer_tips, handle_key_event, notes_placeholder).
 
@@ -2173,11 +2177,11 @@ fn selected_option_index(&self) -> Option<usize>
 fn notes_has_content(&self, idx: usize) -> bool
 ```
 
-**Purpose**: Checks whether the notes draft for a given question contains non-whitespace content. For the current question it consults the live composer, not just the stored draft.
+**Purpose**: Checks whether a question has non-empty notes text. It knows to read live text from the composer for the current question and saved draft text for other questions.
 
-**Data flow**: Takes `idx`. If `idx == current_index()`, it reads `self.composer.current_text_with_pending()`, trims it, and returns whether it is non-empty. Otherwise it reads `self.answers[idx].draft.text`, trims it, and returns whether it is non-empty.
+**Data flow**: It receives a question index. If that index is active, it reads the composer text including pending paste data; otherwise it reads the saved draft for that answer. It trims whitespace and returns whether anything remains.
 
-**Call relations**: Used by `notes_ui_visible` to keep notes visible when content exists.
+**Call relations**: Note visibility logic uses this so notes stay visible when they contain text.
 
 *Call graph*: calls 2 internal fn (current_text_with_pending, current_index).
 
@@ -2188,11 +2192,11 @@ fn notes_has_content(&self, idx: usize) -> bool
 fn notes_ui_visible(&self) -> bool
 ```
 
-**Purpose**: Determines whether the notes editor should currently be shown. Freeform questions always show notes; option questions show notes only when explicitly opened or when content exists.
+**Purpose**: Decides whether the notes text box should be visible for the current question. Free-form questions always show it; option questions show it only when requested or when notes already exist.
 
-**Data flow**: If `has_options()` is false, returns true. Otherwise it reads the current answer and current index and returns whether `answer.notes_visible` is true or `notes_has_content(idx)` is true.
+**Data flow**: It checks whether the current question has options, reads the current answer state, and returns true if notes are visible or contain content.
 
-**Call relations**: Used by focus validation, footer-tip generation, layout, and Esc handling.
+**Call relations**: Focus handling, footer hints, and key handling call this before showing, hiding, or clearing the notes area.
 
 *Call graph*: calls 3 internal fn (current_answer, current_index, has_options); called by 3 (ensure_focus_available, footer_tips, handle_key_event).
 
@@ -2203,11 +2207,11 @@ fn notes_ui_visible(&self) -> bool
 fn wrapped_question_lines(&self, width: u16) -> Vec<String>
 ```
 
-**Purpose**: Wraps the current question text to the given width and returns owned line strings. It prepares question content for layout and rendering.
+**Purpose**: Wraps the current question text so it fits the terminal width. This prevents long questions from running off the screen.
 
-**Data flow**: Reads `current_question()`. If present, it wraps `q.question` with `textwrap::wrap(width.max(1) as usize)`, converts each wrapped line to `String`, collects them into a vector, and returns it; otherwise returns an empty vector.
+**Data flow**: It receives a width, reads the current question text, wraps it to at least one column, and returns the resulting lines. If there is no question, it returns an empty list.
 
-**Call relations**: Used by layout code to determine question height and renderable content.
+**Call relations**: Rendering code uses these lines when drawing the question area.
 
 *Call graph*: calls 1 internal fn (current_question).
 
@@ -2218,11 +2222,11 @@ fn wrapped_question_lines(&self, width: u16) -> Vec<String>
 fn focus_is_notes(&self) -> bool
 ```
 
-**Purpose**: Reports whether the overlay is currently focused on the notes composer rather than the options list. It is a small readability helper.
+**Purpose**: Reports whether keyboard input is currently going to the notes text box. This keeps focus checks readable.
 
-**Data flow**: Matches `self.focus` against `Focus::Notes` and returns the boolean result.
+**Data flow**: It reads the overlay focus field and returns true only when it is `Notes`.
 
-**Call relations**: Used by footer-tip logic, key handling, and Ctrl-C behavior.
+**Call relations**: Footer, key handling, and Ctrl-C handling call this to decide whether text-entry behavior applies.
 
 *Call graph*: called by 3 (footer_tips, handle_key_event, on_ctrl_c); 1 external calls (matches!).
 
@@ -2233,11 +2237,11 @@ fn focus_is_notes(&self) -> bool
 fn confirm_unanswered_active(&self) -> bool
 ```
 
-**Purpose**: Reports whether the unanswered-confirmation popup is currently open. It gates alternate key handling paths.
+**Purpose**: Reports whether the unanswered-question confirmation menu is open. While it is open, normal question controls should pause.
 
-**Data flow**: Returns `self.confirm_unanswered.is_some()`.
+**Data flow**: It checks whether `confirm_unanswered` contains a state value and returns true or false.
 
-**Call relations**: Checked early in `handle_key_event` and `on_ctrl_c`.
+**Call relations**: Keyboard and Ctrl-C handling call this before routing input to the confirmation menu.
 
 *Call graph*: called by 2 (handle_key_event, on_ctrl_c).
 
@@ -2248,11 +2252,11 @@ fn confirm_unanswered_active(&self) -> bool
 fn option_rows(&self) -> Vec<GenericDisplayRow>
 ```
 
-**Purpose**: Builds the renderable option rows for the current question, including numbering, selection arrow, descriptions, wrap indentation, and optional synthetic `None of the above`. It is the data source for option-list rendering and height measurement.
+**Purpose**: Builds display rows for the current question's choices. Each row includes numbering, selection marker, label, description, and wrap indentation.
 
-**Data flow**: Reads `current_question()`, current selected index from `current_answer()`, and the question's options. For each real option it formats a row name like `› 2. Label`, computes `wrap_indent` from the prefix width, and stores the option description. If `other_option_enabled_for_question(question)` is true, it appends an extra row labeled `None of the above` with `OTHER_OPTION_DESCRIPTION`. Returns an empty vector when there is no current option list.
+**Data flow**: It reads the current question and selected option, turns each option into a `GenericDisplayRow`, and adds an `Other` row when enabled. If there are no options, it returns an empty list.
 
-**Call relations**: Used by both option-height calculators and, via rendering code in another module, the visible options list.
+**Call relations**: Height calculation and rendering helpers use these rows to show the choice list consistently.
 
 *Call graph*: calls 1 internal fn (current_question); called by 2 (options_preferred_height, options_required_height).
 
@@ -2263,11 +2267,11 @@ fn option_rows(&self) -> Vec<GenericDisplayRow>
 fn options_required_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the full height needed to render all option rows for the current question. It ensures a default selection exists for measurement when none is set.
+**Purpose**: Calculates how much vertical space the options list needs at the given width. This helps the layout reserve enough room.
 
-**Data flow**: Returns 0 if `has_options()` is false. Otherwise it builds `rows` with `option_rows()`, returns 1 if rows are empty, clones the current `options_state` or default state, forces `selected_idx = Some(0)` when absent, and passes rows, state, row count, and width to `measure_rows_height`.
+**Data flow**: It receives a width, returns zero if there are no options, builds option rows, prepares selection state, and measures the wrapped row height.
 
-**Call relations**: Used by layout planning when deciding how much vertical space options could consume.
+**Call relations**: Layout code calls this when deciding how tall the options section must be.
 
 *Call graph*: calls 4 internal fn (current_answer, has_options, option_rows, measure_rows_height).
 
@@ -2278,11 +2282,11 @@ fn options_required_height(&self, width: u16) -> u16
 fn options_preferred_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the preferred option-list height for the current question. In the current implementation it matches the required height calculation.
+**Purpose**: Calculates the preferred height for the options list at the given width. In this chunk it uses the same measurement as the required height.
 
-**Data flow**: Follows the same steps as `options_required_height`: early-return 0 without options, build rows, ensure a default selected row for measurement, and call `measure_rows_height`.
+**Data flow**: It receives a width, returns zero if there are no options, builds rows, prepares selection state, and returns the measured wrapped height.
 
-**Call relations**: Used by layout planning to choose an initial options height before shrinking or growing.
+**Call relations**: Layout code can use this to choose a comfortable size for the options area.
 
 *Call graph*: calls 4 internal fn (current_answer, has_options, option_rows, measure_rows_height).
 
@@ -2293,11 +2297,11 @@ fn options_preferred_height(&self, width: u16) -> u16
 fn capture_composer_draft(&self) -> ComposerDraft
 ```
 
-**Purpose**: Snapshots the live composer state into a `ComposerDraft`. It preserves text, structured text elements, local image paths, and pending paste placeholders for later restoration.
+**Purpose**: Takes a snapshot of everything currently in the text composer. This lets the overlay preserve drafts while the user moves between questions.
 
-**Data flow**: Reads `self.composer.current_text()`, `text_elements()`, `local_images()`, and `pending_pastes()`. It maps local images to their `path` fields, packages all of that into a `ComposerDraft`, and returns it.
+**Data flow**: It reads current text, structured text elements, local image paths, and pending paste data from the composer, then packages them into a `ComposerDraft`.
 
-**Call relations**: Used before question switches and during submission handling to persist notes state.
+**Call relations**: Draft saving and submit-key handling call this before navigation or submission changes the composer.
 
 *Call graph*: calls 4 internal fn (current_text, local_images, pending_pastes, text_elements); called by 2 (handle_key_event, save_current_draft).
 
@@ -2308,11 +2312,11 @@ fn capture_composer_draft(&self) -> ComposerDraft
 fn save_current_draft(&mut self)
 ```
 
-**Purpose**: Stores the current composer's draft into the active answer slot and invalidates a previously committed answer if the draft changed. It also keeps notes visible once they contain content.
+**Purpose**: Stores the current composer contents into the active answer state. It also marks an already committed answer as uncommitted if the draft changed.
 
-**Data flow**: Captures the current draft via `capture_composer_draft`, computes whether the draft text is empty after trimming, mutably accesses the current answer, clears `answer_committed` if it had been true and the stored draft differs from the new one, replaces `answer.draft`, and sets `answer.notes_visible = true` when notes are non-empty.
+**Data flow**: It captures the composer draft, checks whether notes are empty, updates the current answer draft, clears committed status if needed, and keeps notes visible when they contain text.
 
-**Call relations**: Called before navigation and submission so per-question drafts stay synchronized with the live composer.
+**Call relations**: Navigation and submission paths call this before leaving a question or sending answers.
 
 *Call graph*: calls 2 internal fn (capture_composer_draft, current_answer_mut); called by 5 (go_next_or_submit, handle_key_event, jump_to_question, move_question, submit_answers).
 
@@ -2323,11 +2327,11 @@ fn save_current_draft(&mut self)
 fn restore_current_draft(&mut self)
 ```
 
-**Purpose**: Loads the active question's stored draft back into the shared composer and updates the placeholder accordingly. It is the inverse of `save_current_draft` when switching questions.
+**Purpose**: Loads the saved draft for the current question back into the composer. This makes moving between questions feel safe and reversible.
 
-**Data flow**: Sets the composer's placeholder from `notes_placeholder()` and clears its footer hint override. If there is no current answer, it empties the composer and moves the cursor to the end. Otherwise it clones the stored `ComposerDraft`, sets the composer's text content, pending pastes, and cursor position from that draft.
+**Data flow**: It sets the placeholder and empty footer hints, then either clears the composer if no answer exists or restores text, text elements, image paths, and pending pastes from the saved draft. It moves the cursor to the end.
 
-**Call relations**: Called after request resets and question navigation so the shared composer reflects the newly active question.
+**Call relations**: Request advancement and question navigation call this after changing which question is active.
 
 *Call graph*: calls 7 internal fn (move_cursor_to_end, set_footer_hint_override, set_pending_pastes, set_placeholder_text, set_text_content, current_answer, notes_placeholder); called by 3 (advance_queue_or_complete_at, jump_to_question, move_question); 2 external calls (new, new).
 
@@ -2338,11 +2342,11 @@ fn restore_current_draft(&mut self)
 fn notes_placeholder(&self) -> &'static str
 ```
 
-**Purpose**: Chooses the placeholder text for the notes composer based on whether the current question has options and whether an option is selected. It guides the user toward the next valid action.
+**Purpose**: Chooses the placeholder text shown in the notes composer. The wording changes depending on whether the user needs to select an option first.
 
-**Data flow**: Reads `has_options()` and `selected_option_index()`. Returns `SELECT_OPTION_PLACEHOLDER` when options exist but none is selected, `NOTES_PLACEHOLDER` when options exist and one is selected, and `ANSWER_PLACEHOLDER` for freeform questions.
+**Data flow**: It checks whether the current question has options and whether an option is selected, then returns one of the static placeholder strings.
 
-**Call relations**: Used by `restore_current_draft` and `sync_composer_placeholder`.
+**Call relations**: Draft restoration and placeholder synchronization call this whenever focus or selection changes.
 
 *Call graph*: calls 2 internal fn (has_options, selected_option_index); called by 2 (restore_current_draft, sync_composer_placeholder).
 
@@ -2353,11 +2357,11 @@ fn notes_placeholder(&self) -> &'static str
 fn sync_composer_placeholder(&mut self)
 ```
 
-**Purpose**: Refreshes the composer's placeholder text to match current selection/focus state. It centralizes placeholder updates after state changes.
+**Purpose**: Refreshes the composer placeholder so it matches the current question state. This keeps the on-screen hint accurate after selection or focus changes.
 
-**Data flow**: Computes `notes_placeholder()` and passes it to `self.composer.set_placeholder_text(...)`.
+**Data flow**: It computes the right placeholder with `notes_placeholder` and writes it into the composer.
 
-**Call relations**: Called after selection changes, focus changes, and draft-clearing operations.
+**Call relations**: Selection, clearing, focus, and note-visibility changes call this after they alter what the user can type.
 
 *Call graph*: calls 2 internal fn (set_placeholder_text, notes_placeholder); called by 7 (clear_notes_and_focus_options, clear_notes_draft, clear_selection, ensure_focus_available, ensure_selected_for_notes, handle_key_event, select_current_option).
 
@@ -2368,11 +2372,11 @@ fn sync_composer_placeholder(&mut self)
 fn clear_notes_draft(&mut self)
 ```
 
-**Purpose**: Clears the current question's notes draft while keeping the notes UI visible. It is the Ctrl-C behavior when editing notes with content.
+**Purpose**: Clears only the notes draft for the current question. It is used when the user cancels typed notes without closing the whole overlay.
 
-**Data flow**: Mutably accesses the current answer, replaces its draft with `ComposerDraft::default()`, clears `answer_committed`, forces `notes_visible = true`, clears `pending_submission_draft`, empties the composer text content, moves the cursor to the end, and refreshes the placeholder.
+**Data flow**: It resets the current answer's draft, clears committed status, keeps notes visible, clears pending submission data, empties the composer, moves the cursor to the end, and refreshes the placeholder.
 
-**Call relations**: Called from `on_ctrl_c` when notes are focused and non-empty.
+**Call relations**: Ctrl-C handling calls this when focus is in notes and there is text to clear.
 
 *Call graph*: calls 4 internal fn (move_cursor_to_end, set_text_content, current_answer_mut, sync_composer_placeholder); called by 1 (on_ctrl_c); 3 external calls (new, new, default).
 
@@ -2383,11 +2387,11 @@ fn clear_notes_draft(&mut self)
 fn footer_tips(&self) -> Vec<FooterTip>
 ```
 
-**Purpose**: Builds the logical list of footer hints appropriate for the current question, focus, and keymap. It decides which actions to advertise and which ones should be highlighted.
+**Purpose**: Builds the list of keyboard hints shown at the bottom of the overlay. These hints change with focus, selected options, question count, and configured key bindings.
 
-**Data flow**: Reads notes visibility, option selection, question count, current index, focus, configured submit bindings, and interrupt bindings. It conditionally pushes tips for adding/clearing notes, submitting the current answer or all answers, navigating between questions, and interrupting, using `FooterTip::new` or `FooterTip::highlighted` depending on emphasis. It suppresses the interrupt tip when Esc is already being advertised as `clear notes` in option-notes mode.
+**Data flow**: It reads note visibility, option state, current question position, submit bindings, interrupt bindings, and focus. It returns normal or highlighted `FooterTip` values describing useful actions.
 
-**Call relations**: Used by footer wrapping helpers and ultimately by rendering code.
+**Call relations**: Footer line wrapping methods call this before laying the tips out on screen.
 
 *Call graph*: calls 9 internal fn (highlighted, new, current_index, focus_is_notes, has_options, notes_ui_visible, question_count, selected_option_index, plain); called by 2 (footer_tip_lines, footer_tip_lines_with_prefix); 2 external calls (new, format!).
 
@@ -2398,11 +2402,11 @@ fn footer_tips(&self) -> Vec<FooterTip>
 fn footer_tip_lines(&self, width: u16) -> Vec<Vec<FooterTip>>
 ```
 
-**Purpose**: Wraps the current footer tips into one or more lines that fit the given width. It is the standard footer-line builder without a prefix tip.
+**Purpose**: Wraps the current footer hints into lines that fit a given width. This is the plain version without any extra prefix.
 
-**Data flow**: Calls `footer_tips()` to get the logical tips, then passes them to `wrap_footer_tips(width, tips)` and returns the resulting grouped lines.
+**Data flow**: It receives a width, builds footer tips, wraps them with `wrap_footer_tips`, and returns lines of tips.
 
-**Call relations**: Used by `footer_required_height` and rendering code.
+**Call relations**: Footer height calculation calls this to know how many terminal rows the hints need.
 
 *Call graph*: calls 2 internal fn (footer_tips, wrap_footer_tips); called by 1 (footer_required_height).
 
@@ -2417,11 +2421,11 @@ fn footer_tip_lines_with_prefix(
     ) -> Vec<Vec<FooterTip>>
 ```
 
-**Purpose**: Wraps footer tips with an optional leading prefix tip inserted before the standard tips. It supports render paths that need to prepend extra status text.
+**Purpose**: Wraps footer hints while optionally placing an extra tip at the front. This is useful when rendering wants to add context before normal shortcuts.
 
-**Data flow**: Takes `width` and optional `prefix`, builds a tip vector starting with the prefix when present, extends it with `footer_tips()`, then returns `wrap_footer_tips(width, tips)`.
+**Data flow**: It receives a width and optional prefix, prepends the prefix if present, appends normal footer tips, wraps the combined list, and returns lines.
 
-**Call relations**: Used by rendering code when a prefixed footer line is needed.
+**Call relations**: Rendering helpers can use this when they need footer hints plus a leading status message.
 
 *Call graph*: calls 2 internal fn (footer_tips, wrap_footer_tips); 1 external calls (new).
 
@@ -2432,11 +2436,11 @@ fn footer_tip_lines_with_prefix(
 fn wrap_footer_tips(&self, width: u16, tips: Vec<FooterTip>) -> Vec<Vec<FooterTip>>
 ```
 
-**Purpose**: Packs footer tips into width-bounded lines without splitting individual tips. It preserves the `TIP_SEPARATOR` between adjacent tips on the same line.
+**Purpose**: Splits footer tips across multiple lines so they fit the terminal width. It treats the separator between tips as part of the width budget.
 
-**Data flow**: Takes `width` and a vector of `FooterTip`. It computes `max_width` and separator width, returns a single empty line when there are no tips, then iterates through tips measuring each tip's display width, starting a new line whenever adding the next tip plus separator would exceed `max_width`. It returns a `Vec<Vec<FooterTip>>` where each inner vector is one rendered line.
+**Data flow**: It receives a width and a list of tips, measures each tip's displayed width, starts a new line when adding the next tip would overflow, and returns grouped lines.
 
-**Call relations**: Shared by both footer-line builders and indirectly by footer height calculation.
+**Call relations**: Both footer-line builders use this as their shared wrapping engine.
 
 *Call graph*: called by 2 (footer_tip_lines, footer_tip_lines_with_prefix); 3 external calls (width, new, vec!).
 
@@ -2447,11 +2451,11 @@ fn wrap_footer_tips(&self, width: u16, tips: Vec<FooterTip>) -> Vec<Vec<FooterTi
 fn footer_required_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Returns how many footer rows are needed at the given width. It is the layout-facing wrapper around footer-tip wrapping.
+**Purpose**: Reports how many terminal rows the footer needs. This helps layout reserve space for keyboard hints.
 
-**Data flow**: Calls `footer_tip_lines(width)` and returns the number of grouped lines as `u16`.
+**Data flow**: It receives a width, wraps the footer tips for that width, and returns the number of resulting lines.
 
-**Call relations**: Used by layout planning to reserve footer space.
+**Call relations**: Layout code calls this before drawing the overlay.
 
 *Call graph*: calls 1 internal fn (footer_tip_lines).
 
@@ -2462,11 +2466,11 @@ fn footer_required_height(&self, width: u16) -> u16
 fn ensure_focus_available(&mut self)
 ```
 
-**Purpose**: Normalizes focus and notes visibility so they remain valid for the current question type and state. It prevents impossible focus combinations after navigation or request resets.
+**Purpose**: Makes sure the current focus target actually exists. For example, free-form questions must focus notes, while option questions should not focus hidden notes.
 
-**Data flow**: If there are no questions it returns. If the current question has no options, it forces `self.focus = Focus::Notes` and marks the current answer's `notes_visible = true`. Otherwise, if focus is `Notes` but `notes_ui_visible()` is false, it switches focus back to `Options` and refreshes the placeholder.
+**Data flow**: It checks the question count, whether options exist, and whether notes are visible. It updates focus and note visibility as needed, and refreshes the placeholder when it moves focus away from hidden notes.
 
-**Call relations**: Called after request resets and question navigation to keep focus state coherent.
+**Call relations**: Request reset, queue advancement, and question navigation call this after the active question changes.
 
 *Call graph*: calls 5 internal fn (current_answer_mut, has_options, notes_ui_visible, question_count, sync_composer_placeholder); called by 3 (advance_queue_or_complete_at, jump_to_question, move_question); 1 external calls (matches!).
 
@@ -2477,11 +2481,11 @@ fn ensure_focus_available(&mut self)
 fn reset_for_request(&mut self)
 ```
 
-**Purpose**: Rebuilds all per-question answer state from the current request and resets overlay-local navigation/submission state. It is the per-request initialization routine.
+**Purpose**: Clears old per-question state and prepares fresh answer state for the current request. This is like resetting a form before filling it out.
 
-**Data flow**: Iterates over `self.request.questions`, creating one `AnswerState` per question with a fresh `ScrollState`, default draft, `answer_committed = false`, and `notes_visible = !has_options`. For option questions it seeds `options_state.selected_idx = Some(0)`. It then resets `current_idx` to 0, `focus` to `Options`, clears the composer text, and clears unanswered-confirmation and pending-submission state.
+**Data flow**: It reads all questions in the request, creates an `AnswerState` for each, selects the first option by default when options exist, clears composer text, resets the current index and focus, and removes confirmation or pending submission state.
 
-**Call relations**: Called during construction and whenever the overlay advances to a queued request.
+**Call relations**: New overlay setup and queued-request advancement call this before showing a request.
 
 *Call graph*: calls 1 internal fn (set_text_content); called by 1 (advance_queue_or_complete_at); 2 external calls (new, new).
 
@@ -2492,11 +2496,11 @@ fn reset_for_request(&mut self)
 fn options_len_for_question(question: &ToolRequestUserInputQuestion) -> usize
 ```
 
-**Purpose**: Computes the selectable option count for an arbitrary question, including the synthetic `None of the above` row when enabled. It is the question-scoped counterpart to `options_len`.
+**Purpose**: Counts the selectable choices for a specific question, including the extra `Other` choice when allowed.
 
-**Data flow**: Reads `question.options` length or 0, checks `other_option_enabled_for_question(question)`, and returns either the raw length or length plus one.
+**Data flow**: It receives a question, counts its option list or zero if absent, adds one if `Other` is enabled, and returns the total.
 
-**Call relations**: Used by `options_len` and other helpers that need option counts independent of current overlay state.
+**Call relations**: The current-question option count helper uses this, and label lookup uses the same `Other` rule.
 
 *Call graph*: 1 external calls (other_option_enabled_for_question).
 
@@ -2507,11 +2511,11 @@ fn options_len_for_question(question: &ToolRequestUserInputQuestion) -> usize
 fn other_option_enabled_for_question(question: &ToolRequestUserInputQuestion) -> bool
 ```
 
-**Purpose**: Reports whether a question should expose the synthetic `None of the above` option. It requires both `is_other` and a non-empty real options list.
+**Purpose**: Checks whether a question should show an extra `Other` option. The extra option only appears when the question has normal options too.
 
-**Data flow**: Reads `question.is_other` and `question.options`, returning true only when `is_other` is true and the options vector exists and is non-empty.
+**Data flow**: It receives a question and returns true when `is_other` is true and the options list exists and is not empty.
 
-**Call relations**: Used by option counting, row building, and label lookup.
+**Call relations**: Option row building, option counting, and option label lookup all use this shared rule.
 
 
 ##### `RequestUserInputOverlay::option_label_for_index`  (lines 766–778)
@@ -2523,11 +2527,11 @@ fn option_label_for_index(
     ) -> Option<String>
 ```
 
-**Purpose**: Maps an option index back to the label that should be submitted for a given question, including the synthetic `None of the above` label. It returns `None` for invalid indices.
+**Purpose**: Converts a selected option index into the label that should be submitted. It also handles the synthetic `Other` option.
 
-**Data flow**: Takes a question and index, reads `question.options`, returns the real option label when `idx < options.len()`, returns `OTHER_OPTION_LABEL` when `idx == options.len()` and the synthetic option is enabled, otherwise returns `None`.
+**Data flow**: It receives a question and index, returns the matching option label if the index is inside the real options, returns `Other` for the extra option when enabled, or returns nothing for an invalid index.
 
-**Call relations**: Used during answer submission to convert committed selection indices into answer strings.
+**Call relations**: Answer submission calls this when turning selected indexes into final answer strings.
 
 *Call graph*: 1 external calls (other_option_enabled_for_question).
 
@@ -2538,11 +2542,11 @@ fn option_label_for_index(
 fn move_question(&mut self, next: bool)
 ```
 
-**Purpose**: Moves to the next or previous question with wraparound, preserving the current draft before switching and restoring the destination draft afterward. It is the main question-navigation primitive.
+**Purpose**: Moves to the previous or next question, wrapping around at the ends. It saves and restores drafts so the user's work follows each question.
 
-**Data flow**: Reads `question_count()`, returns early when there are no questions, saves the current draft, computes an offset of `1` for next or `len - 1` for previous, updates `current_idx` modulo the question count, restores the new current draft, and normalizes focus with `ensure_focus_available()`.
+**Data flow**: It receives a direction flag, checks the question count, saves the current draft, updates the index with wraparound, restores the new question's draft, and fixes focus.
 
-**Call relations**: Called by key handling and by `go_next_or_submit` when advancing between questions.
+**Call relations**: Keyboard navigation and next-or-submit flow call this when the user changes questions.
 
 *Call graph*: calls 4 internal fn (ensure_focus_available, question_count, restore_current_draft, save_current_draft); called by 2 (go_next_or_submit, handle_key_event).
 
@@ -2553,11 +2557,11 @@ fn move_question(&mut self, next: bool)
 fn jump_to_question(&mut self, idx: usize)
 ```
 
-**Purpose**: Moves directly to a specific question index if it is in range, preserving and restoring drafts around the jump. It is used mainly by unanswered-confirmation flows.
+**Purpose**: Moves directly to a specific question index. It is used when sending the user back to the first unanswered question.
 
-**Data flow**: Takes `idx`, returns early if `idx >= question_count()`, saves the current draft, sets `current_idx = idx`, restores the destination draft, and calls `ensure_focus_available()`.
+**Data flow**: It receives an index, ignores it if out of range, saves the current draft, updates the current index, restores that draft, and fixes focus.
 
-**Call relations**: Called from unanswered-confirmation handling when the user chooses to go back to the first unanswered question.
+**Call relations**: The unanswered confirmation flow calls this when the user chooses to go back.
 
 *Call graph*: calls 4 internal fn (ensure_focus_available, question_count, restore_current_draft, save_current_draft); called by 1 (handle_confirm_unanswered_key_event).
 
@@ -2568,11 +2572,11 @@ fn jump_to_question(&mut self, idx: usize)
 fn select_current_option(&mut self, committed: bool)
 ```
 
-**Purpose**: Commits or updates the current option selection for the active question and refreshes the notes placeholder. It clamps selection to the valid option range before marking commitment.
+**Purpose**: Commits the currently highlighted option, or updates selection state without final commitment depending on the argument. It also keeps selection inside valid bounds.
 
-**Data flow**: Returns early if `has_options()` is false. Otherwise it reads `options_len()`, mutably accesses the current answer, clamps `answer.options_state` to that length, sets `answer.answer_committed = committed`, and then refreshes the composer placeholder if an answer was updated.
+**Data flow**: It receives a `committed` flag, checks that the question has options, clamps the selected index to the option count, writes the committed flag, and refreshes the placeholder.
 
-**Call relations**: Used by option-space, Enter, and digit-selection paths in `handle_key_event`.
+**Call relations**: Keyboard handling calls this for space, enter, digit shortcuts, and fallback submit behavior.
 
 *Call graph*: calls 4 internal fn (current_answer_mut, has_options, options_len, sync_composer_placeholder); called by 1 (handle_key_event).
 
@@ -2583,11 +2587,11 @@ fn select_current_option(&mut self, committed: bool)
 fn clear_selection(&mut self)
 ```
 
-**Purpose**: Clears the current option selection and associated notes draft, hiding notes for option questions. It resets the active question back to an unanswered state.
+**Purpose**: Removes the selected option and clears any notes for an option question. This gives the user a clean slate.
 
-**Data flow**: Returns early if `has_options()` is false. Otherwise it mutably accesses the current answer, resets `options_state`, replaces the draft with `ComposerDraft::default()`, clears `answer_committed` and `notes_visible`, clears `pending_submission_draft`, empties the composer text, moves the cursor to the end, and refreshes the placeholder.
+**Data flow**: It checks for options, resets the answer's option state, draft, committed flag, and note visibility, clears pending submission state, empties the composer, moves the cursor, and updates the placeholder.
 
-**Call relations**: Triggered from `handle_key_event` on Backspace/Delete while focused on options.
+**Call relations**: Keyboard handling calls this for backspace or delete while focused on options.
 
 *Call graph*: calls 5 internal fn (move_cursor_to_end, set_text_content, current_answer_mut, has_options, sync_composer_placeholder); called by 1 (handle_key_event); 3 external calls (new, new, default).
 
@@ -2598,11 +2602,11 @@ fn clear_selection(&mut self)
 fn clear_notes_and_focus_options(&mut self)
 ```
 
-**Purpose**: Drops the current notes draft, hides the notes UI, and returns focus to the options list while preserving the selected option. It is the shared path for Esc/Tab exits from notes mode on option questions.
+**Purpose**: Clears notes for an option question and returns focus to the option list. It is used when the user exits the note area.
 
-**Data flow**: Returns early if `has_options()` is false. Otherwise it mutably accesses the current answer, replaces its draft with `ComposerDraft::default()`, clears `answer_committed` and `notes_visible`, clears `pending_submission_draft`, empties the composer, moves the cursor to the end, sets `self.focus = Focus::Options`, and refreshes the placeholder.
+**Data flow**: It checks for options, resets draft and note visibility, clears pending submission state, empties the composer, moves the cursor, sets focus to options, and refreshes the placeholder.
 
-**Call relations**: Called from `handle_key_event` when Esc or Tab should close notes on option questions.
+**Call relations**: Escape, tab, and other note-exit paths in key handling call this.
 
 *Call graph*: calls 5 internal fn (move_cursor_to_end, set_text_content, current_answer_mut, has_options, sync_composer_placeholder); called by 1 (handle_key_event); 3 external calls (new, new, default).
 
@@ -2613,11 +2617,11 @@ fn clear_notes_and_focus_options(&mut self)
 fn ensure_selected_for_notes(&mut self)
 ```
 
-**Purpose**: Marks notes as visible for the current answer and refreshes the placeholder before notes editing or paste insertion. It does not itself create a selection, despite the name.
+**Purpose**: Makes the notes area visible for the current answer. This is needed before typing or pasting notes.
 
-**Data flow**: Mutably accesses the current answer and sets `answer.notes_visible = true`, then calls `sync_composer_placeholder()`.
+**Data flow**: It marks the current answer's notes as visible if there is an answer state, then refreshes the composer placeholder.
 
-**Call relations**: Used before entering notes mode, before notes submission, and before handling pasted text.
+**Call relations**: Keyboard and paste handling call this when the user enters the notes workflow.
 
 *Call graph*: calls 2 internal fn (current_answer_mut, sync_composer_placeholder); called by 2 (handle_key_event, handle_paste).
 
@@ -2628,11 +2632,11 @@ fn ensure_selected_for_notes(&mut self)
 fn go_next_or_submit(&mut self)
 ```
 
-**Purpose**: Advances to the next question or submits the whole questionnaire when already on the last question. It also opens unanswered confirmation when needed.
+**Purpose**: Performs the main forward action: move to the next question, submit all answers, or ask for confirmation if some are unanswered.
 
-**Data flow**: Checks whether `current_index() + 1 >= question_count()`. On the last question it saves the current draft and either opens unanswered confirmation when `unanswered_count() > 0` or calls `submit_answers()`. Otherwise it calls `move_question(true)`.
+**Data flow**: It checks whether the current question is the last one. If not, it moves next. If it is last, it saves the draft, counts unanswered questions, opens confirmation if needed, or submits answers.
 
-**Call relations**: Reached after committed option selection or successful composer submission.
+**Call relations**: Composer submission and option-enter paths call this after the user commits an answer.
 
 *Call graph*: calls 7 internal fn (current_index, move_question, open_unanswered_confirmation, question_count, save_current_draft, submit_answers, unanswered_count); called by 2 (handle_composer_input_result, handle_key_event).
 
@@ -2643,11 +2647,11 @@ fn go_next_or_submit(&mut self)
 fn submit_answers(&mut self)
 ```
 
-**Purpose**: Builds the final structured answer payload for all questions, emits it to the app, records a history cell, and advances to the next queued request or completion. It is the main successful completion path.
+**Purpose**: Sends the user's committed answers back to the app and records the result in history. This is the normal successful finish path.
 
-**Data flow**: Clears unanswered confirmation, saves the current draft, then iterates over all questions and corresponding `AnswerState`s. For option questions it includes the selected option label only when `answer_committed` is true; for all questions it includes notes only when committed, using `draft.text_with_pending().trim()`. It builds a `HashMap<String, ToolRequestUserInputAnswer>`, sends it through `app_event_tx.user_input_answer`, emits an `AppEvent::InsertHistoryCell` containing the questions and answers, and finally calls `advance_queue_or_complete_at(Instant::now())`.
+**Data flow**: It clears unanswered confirmation, saves the current draft, builds a map from question IDs to answer lists, includes selected labels and committed notes, sends a user-input response event, inserts a history cell, and advances to the next queued request or completes.
 
-**Call relations**: Called from `go_next_or_submit` and from unanswered-confirmation acceptance.
+**Call relations**: The next-or-submit flow and unanswered confirmation menu call this when submission is accepted.
 
 *Call graph*: calls 4 internal fn (send, user_input_answer, advance_queue_or_complete_at, save_current_draft); called by 2 (go_next_or_submit, handle_confirm_unanswered_key_event); 6 external calls (new, new, now, new, InsertHistoryCell, format!).
 
@@ -2658,11 +2662,11 @@ fn submit_answers(&mut self)
 fn submit_empty_auto_resolution(&mut self, now: Instant)
 ```
 
-**Purpose**: Submits an empty answer map when auto-resolution expires, records the corresponding history cell, and advances the request queue. It bypasses draft inspection entirely.
+**Purpose**: Submits an empty answer set when auto-resolution expires. This lets the system continue without manual input.
 
-**Data flow**: Clears unanswered confirmation, creates an empty `HashMap<String, ToolRequestUserInputAnswer>`, sends it via `user_input_answer`, emits a history cell with `interrupted: false`, and calls `advance_queue_or_complete_at(now)`.
+**Data flow**: It clears confirmation state, creates an empty answers map, sends it as the user-input response, records a non-interrupted history cell, and advances the queue or completes at the given time.
 
-**Call relations**: Called only by `maybe_auto_resolve_at` when the countdown reaches `Due`.
+**Call relations**: The auto-resolution check calls this when the timer reaches the due state.
 
 *Call graph*: calls 3 internal fn (send, user_input_answer, advance_queue_or_complete_at); called by 1 (maybe_auto_resolve_at); 3 external calls (new, new, InsertHistoryCell).
 
@@ -2673,11 +2677,11 @@ fn submit_empty_auto_resolution(&mut self, now: Instant)
 fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Removes a resolved request from either the active slot or the queued requests without emitting interrupt or answer events. It lets stale server-side resolutions close prompts quietly.
+**Purpose**: Removes a request that the app server says has already been resolved. This prevents stale prompts from staying visible or queued.
 
-**Data flow**: Takes a `ResolvedAppServerRequest`, returns `false` unless it is `UserInput { call_id }`. It records the queue length, removes queued requests whose `item_id` matches `call_id`, and if the active request's `item_id` matches it advances to the next queued request or completion at `Instant::now()` and returns `true`. Otherwise it returns whether the queue length changed.
+**Data flow**: It receives a resolved request, ignores it unless it is a user-input request, removes matching queued requests by call ID, and if the active request matches, advances to the next request. It returns whether anything changed.
 
-**Call relations**: Used by the `BottomPaneView` dismissal hook when app-server requests resolve externally.
+**Call relations**: The trait-facing dismissal method calls this when server-side resolution notifications arrive.
 
 *Call graph*: calls 1 internal fn (advance_queue_or_complete_at); called by 1 (dismiss_app_server_request); 3 external calls (now, len, retain).
 
@@ -2688,11 +2692,11 @@ fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bo
 fn open_unanswered_confirmation(&mut self)
 ```
 
-**Purpose**: Opens the two-choice confirmation popup shown when the user tries to submit with unanswered questions. It defaults selection to the submit/proceed option.
+**Purpose**: Opens the small menu that asks whether to submit despite unanswered questions or go back. It starts with the first choice selected.
 
-**Data flow**: Creates a fresh `ScrollState`, sets `selected_idx = Some(0)`, and stores it in `self.confirm_unanswered`.
+**Data flow**: It creates a new scroll state, selects index zero, and stores it as the active unanswered confirmation state.
 
-**Call relations**: Called by `go_next_or_submit` when unanswered questions remain on the last question.
+**Call relations**: The next-or-submit flow calls this when the user tries to finish while some questions are not committed.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (go_next_or_submit).
 
@@ -2703,11 +2707,11 @@ fn open_unanswered_confirmation(&mut self)
 fn close_unanswered_confirmation(&mut self)
 ```
 
-**Purpose**: Closes the unanswered-confirmation popup. It is the shared dismissal helper for multiple branches.
+**Purpose**: Closes the unanswered-question confirmation menu. Normal overlay controls can resume afterward.
 
-**Data flow**: Sets `self.confirm_unanswered = None`.
+**Data flow**: It clears the optional confirmation state.
 
-**Call relations**: Used by confirmation key handling and Ctrl-C behavior.
+**Call relations**: Confirmation key handling and Ctrl-C handling call this before continuing with submit, go-back, or interrupt actions.
 
 *Call graph*: called by 2 (handle_confirm_unanswered_key_event, on_ctrl_c).
 
@@ -2718,11 +2722,11 @@ fn close_unanswered_confirmation(&mut self)
 fn unanswered_question_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of unanswered questions. It is a naming wrapper used by confirmation-description code.
+**Purpose**: Returns the number of unanswered questions. It exists as a small wrapper for wording the confirmation message.
 
-**Data flow**: Calls `unanswered_count()` and returns the result.
+**Data flow**: It calls `unanswered_count` and returns that value.
 
-**Call relations**: Used by `unanswered_submit_description`.
+**Call relations**: The unanswered submit description calls this when building its message.
 
 *Call graph*: calls 1 internal fn (unanswered_count); called by 1 (unanswered_submit_description).
 
@@ -2733,11 +2737,11 @@ fn unanswered_question_count(&self) -> usize
 fn unanswered_submit_description(&self) -> String
 ```
 
-**Purpose**: Builds the descriptive text for the `Proceed` row in the unanswered-confirmation popup. It pluralizes `question` correctly.
+**Purpose**: Builds the description shown for the confirmation menu's submit option. It uses singular or plural wording correctly.
 
-**Data flow**: Reads `unanswered_question_count()`, chooses either the singular or plural suffix constant, formats `Submit with {count} unanswered {suffix}.`, and returns the string.
+**Data flow**: It reads the unanswered count, chooses the matching suffix, and returns a sentence explaining how many questions will remain unanswered.
 
-**Call relations**: Used by `unanswered_confirmation_rows`.
+**Call relations**: The confirmation row builder uses this text for the submit-anyway choice.
 
 *Call graph*: calls 1 internal fn (unanswered_question_count); called by 1 (unanswered_confirmation_rows); 1 external calls (format!).
 
@@ -2748,11 +2752,11 @@ fn unanswered_submit_description(&self) -> String
 fn first_unanswered_index(&self) -> Option<usize>
 ```
 
-**Purpose**: Finds the first question that would currently submit as unanswered. It is used to jump the user back from the confirmation popup.
+**Purpose**: Finds the first question that is not answered. This helps send the user directly to the place that needs attention.
 
-**Data flow**: Reads the current composer text, iterates over `self.request.questions` with indices, calls `is_question_answered(idx, &current_text)` for each, and returns the first index for which that returns false.
+**Data flow**: It reads the current composer text, scans questions in order, asks whether each is answered, and returns the first unanswered index if any.
 
-**Call relations**: Used by unanswered-confirmation cancellation and `Go back` selection handling.
+**Call relations**: Confirmation key handling calls this when the user cancels submission or chooses to go back.
 
 *Call graph*: calls 1 internal fn (current_text); called by 1 (handle_confirm_unanswered_key_event).
 
@@ -2763,11 +2767,11 @@ fn first_unanswered_index(&self) -> Option<usize>
 fn unanswered_confirmation_rows(&self) -> Vec<GenericDisplayRow>
 ```
 
-**Purpose**: Builds the two menu rows for the unanswered-confirmation popup, including selection arrow and descriptions. It is the popup's row-model generator.
+**Purpose**: Builds the two display rows for the unanswered-question confirmation menu. One row submits anyway; the other returns to unanswered questions.
 
-**Data flow**: Reads the selected row from `self.confirm_unanswered`, builds two entries (`Proceed` with dynamic description and `Go back` with fixed description), maps them into `GenericDisplayRow`s with numbered labels and a `›` prefix on the selected row, and returns the vector.
+**Data flow**: It reads the selected menu index, creates the two entries with labels and descriptions, adds numbering and a selection marker, and returns display rows.
 
-**Call relations**: Used by rendering code when the confirmation popup is active.
+**Call relations**: Rendering code uses these rows while the confirmation menu is active.
 
 *Call graph*: calls 1 internal fn (unanswered_submit_description).
 
@@ -2778,11 +2782,11 @@ fn unanswered_confirmation_rows(&self) -> Vec<GenericDisplayRow>
 fn is_question_answered(&self, idx: usize, _current_text: &str) -> bool
 ```
 
-**Purpose**: Determines whether a specific question currently counts as answered for submission and unanswered-count purposes. Option questions require a committed selection; freeform questions require a committed draft.
+**Purpose**: Decides whether a specific question counts as answered. A choice question needs a committed selection; a free-form question needs a committed draft.
 
-**Data flow**: Takes `idx` and an unused `_current_text`, fetches the question and answer state, returns false if either is missing, checks whether the question has options, and then returns `answer.options_state.selected_idx.is_some() && answer.answer_committed` for option questions or `answer.answer_committed` for freeform questions.
+**Data flow**: It receives an index and current text argument, looks up the question and answer state, checks whether the question has options, and returns the appropriate committed-status test.
 
-**Call relations**: Used by unanswered counting and first-unanswered lookup.
+**Call relations**: Unanswered counting and first-unanswered search call this for each question.
 
 
 ##### `RequestUserInputOverlay::unanswered_count`  (lines 1048–1056)
@@ -2791,11 +2795,11 @@ fn is_question_answered(&self, idx: usize, _current_text: &str) -> bool
 fn unanswered_count(&self) -> usize
 ```
 
-**Purpose**: Counts how many questions would currently submit an empty answer list. It is the core unanswered-question metric used in progress text and confirmation logic.
+**Purpose**: Counts how many questions are not yet answered. This drives progress text and submit confirmation.
 
-**Data flow**: Reads the current composer text, iterates over all questions with indices, filters those for which `is_question_answered(idx, &current_text)` is false, and returns the count.
+**Data flow**: It reads the current composer text, scans every question, filters those not answered according to `is_question_answered`, and returns the count.
 
-**Call relations**: Used by progress text, unanswered confirmation, and submission gating.
+**Call relations**: Progress display, next-or-submit flow, and confirmation wording use this count.
 
 *Call graph*: calls 1 internal fn (current_text); called by 3 (go_next_or_submit, progress_prefix_text, unanswered_question_count).
 
@@ -2806,11 +2810,11 @@ fn unanswered_count(&self) -> usize
 fn notes_input_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the preferred height of the notes composer, clamped to a small range above the minimum composer height. It prevents notes from growing unboundedly tall.
+**Purpose**: Chooses a reasonable height for the notes text box. It allows growth for multi-line text but caps it so the overlay does not take over the screen.
 
-**Data flow**: Reads `self.composer.desired_height(width.max(1))`, clamps it between `MIN_COMPOSER_HEIGHT` and `MIN_COMPOSER_HEIGHT + 5`, and returns the result.
+**Data flow**: It receives a width, asks the composer for its desired height, and clamps that height between a minimum and a small maximum above it.
 
-**Call relations**: Used by layout planning when notes are visible.
+**Call relations**: Layout code uses this when deciding how much vertical space to give the composer.
 
 *Call graph*: calls 1 internal fn (desired_height).
 
@@ -2821,11 +2825,11 @@ fn notes_input_height(&self, width: u16) -> u16
 fn apply_submission_to_draft(&mut self, text: String, text_elements: Vec<TextElement>)
 ```
 
-**Purpose**: Stores submitted composer text back into the current answer draft and reloads the composer from that committed content. It clears pending-paste placeholders because submission has materialized the text.
+**Purpose**: Stores freshly submitted composer text as the current answer draft and mirrors it back into the composer. This keeps saved state and visible text in sync after submission.
 
-**Data flow**: Takes submitted `text` and `text_elements`, collects current local image paths from the composer, writes a new `ComposerDraft` with empty `pending_pastes` into the current answer, then sets the composer's text content, moves the cursor to the end, and clears the footer hint override.
+**Data flow**: It receives submitted text and text elements, reads local image paths from the composer, writes a draft with no pending pastes into the current answer, updates composer content, moves the cursor, and clears composer footer hints.
 
-**Call relations**: Called by `handle_composer_input_result` when there is no pending submission draft override.
+**Call relations**: Composer result handling calls this when there is no saved pending-submission draft override.
 
 *Call graph*: calls 5 internal fn (local_images, move_cursor_to_end, set_footer_hint_override, set_text_content, current_answer_mut); called by 1 (handle_composer_input_result); 1 external calls (new).
 
@@ -2836,11 +2840,11 @@ fn apply_submission_to_draft(&mut self, text: String, text_elements: Vec<TextEle
 fn apply_submission_draft(&mut self, draft: ComposerDraft)
 ```
 
-**Purpose**: Restores a previously captured draft after the composer reports submission, preserving pending paste placeholders and other draft metadata. It is used when submission should commit the pre-submit draft exactly as captured.
+**Purpose**: Applies a complete saved draft after submission. This path preserves details such as pending paste data.
 
-**Data flow**: Takes a `ComposerDraft`, clones it into the current answer, sets the composer's text content and pending pastes from that draft, moves the cursor to the end, and clears the footer hint override.
+**Data flow**: It receives a `ComposerDraft`, stores a clone in the current answer, writes its text, elements, images, and pending pastes into the composer, moves the cursor, and clears composer footer hints.
 
-**Call relations**: Called by `handle_composer_input_result` when `pending_submission_draft` was captured before forwarding the submit key to the composer.
+**Call relations**: Composer result handling calls this when `handle_key_event` captured a draft before passing a submit key to the composer.
 
 *Call graph*: calls 5 internal fn (move_cursor_to_end, set_footer_hint_override, set_pending_pastes, set_text_content, current_answer_mut); called by 1 (handle_composer_input_result); 2 external calls (new, clone).
 
@@ -2851,11 +2855,11 @@ fn apply_submission_draft(&mut self, draft: ComposerDraft)
 fn handle_composer_input_result(&mut self, result: InputResult) -> bool
 ```
 
-**Purpose**: Interprets the `ChatComposer` result in overlay terms, committing answers and advancing when the composer reports submission or queueing. It bridges generic composer behavior into request-user-input semantics.
+**Purpose**: Interprets what the text composer says happened after a key press. When text was submitted or queued, it marks the answer committed and moves forward.
 
-**Data flow**: Takes an `InputResult`. For `Submitted` or `Queued`, it optionally clamps option selection when notes were entered on an option question, marks the current answer committed (or committed only when non-empty for freeform questions), applies either `pending_submission_draft` or the submitted text via `apply_submission_draft`/`apply_submission_to_draft`, calls `go_next_or_submit()`, and returns `true`. For all other results it returns `false` without advancing.
+**Data flow**: It receives an `InputResult`. For submitted or queued text, it updates option selection if notes were typed, sets committed status, applies the draft or submitted text, calls the next-or-submit flow, and returns true. Other results return false.
 
-**Call relations**: Called after delegating key events to the composer from notes mode or submit-binding handling.
+**Call relations**: The main key handler calls this after giving a key event to the composer.
 
 *Call graph*: calls 6 internal fn (apply_submission_draft, apply_submission_to_draft, current_answer_mut, go_next_or_submit, has_options, options_len); called by 1 (handle_key_event); 1 external calls (matches!).
 
@@ -2866,11 +2870,11 @@ fn handle_composer_input_result(&mut self, result: InputResult) -> bool
 fn handle_confirm_unanswered_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Processes keyboard input while the unanswered-confirmation popup is open. It supports cancel, navigation, direct numeric selection, and acceptance.
+**Purpose**: Handles keyboard input while the unanswered-question confirmation menu is open. It lets the user move between the two choices, submit anyway, or go back.
 
-**Data flow**: Takes a `KeyEvent`, ignores release events, mutably accesses `self.confirm_unanswered`, and matches on `key_event.code`. Esc/Backspace closes the popup and jumps to the first unanswered question if any; Up/k and Down/j wrap the two-row selection; Enter closes the popup and either submits answers or jumps back depending on the selected row; `1` and `2` directly set the selected row.
+**Data flow**: It receives a key event, ignores key releases or inactive state, then updates the confirmation selection, closes the menu, submits answers, or jumps to the first unanswered question depending on the key.
 
-**Call relations**: Called early from `handle_key_event` whenever `confirm_unanswered_active()` is true.
+**Call relations**: The main key handler delegates to this whenever `confirm_unanswered_active` is true.
 
 *Call graph*: calls 4 internal fn (close_unanswered_confirmation, first_unanswered_index, jump_to_question, submit_answers); called by 1 (handle_key_event); 1 external calls (matches!).
 
@@ -2881,11 +2885,11 @@ fn handle_confirm_unanswered_key_event(&mut self, key_event: KeyEvent)
 fn prefer_esc_to_handle_key_event(&self) -> bool
 ```
 
-**Purpose**: Signals that this overlay wants to receive Esc through normal key handling rather than having it intercepted generically. This is necessary because Esc has overlay-specific meanings.
+**Purpose**: Tells the broader UI that this overlay wants first chance to handle Escape. That matters because Escape can clear notes or interrupt the request.
 
-**Data flow**: Returns `true`.
+**Data flow**: It takes no extra input and always returns true.
 
-**Call relations**: Queried by the bottom-pane host before dispatching Esc.
+**Call relations**: The surrounding input-dispatch system can use this preference before routing Escape elsewhere.
 
 
 ##### `RequestUserInputOverlay::handle_key_event`  (lines 1186–1422)
@@ -2894,11 +2898,11 @@ fn prefer_esc_to_handle_key_event(&self) -> bool
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Implements the overlay's full keyboard state machine: auto-resolution snoozing, unanswered-confirmation routing, interrupt handling, question navigation, option selection, notes-mode editing, and composer submission bridging. It is the central interactive control path for this overlay.
+**Purpose**: This is the main keyboard controller for the overlay. It routes keys to confirmation menus, option navigation, notes editing, submission, question movement, and interruption.
 
-**Data flow**: Consumes a `KeyEvent`. It ignores release events, snoozes auto-resolution, routes to `handle_confirm_unanswered_key_event` when the confirmation popup is active, handles Esc as `clear notes` for option questions with visible notes, interrupts immediately on configured interrupt bindings, gives composer submit bindings priority in notes mode by capturing a draft and forwarding the key to the composer, then processes question navigation keys (`ctrl-p/n`, PageUp/PageDown, h/l, arrows, remapped horizontal list bindings). In `Focus::Options`, it mutates option selection, commitment, notes visibility, and question advancement based on arrows/j-k, space, Backspace/Delete, Tab, Enter, and digit keys. In `Focus::Notes`, it supports Tab/Esc/backspace exits back to options, Up/Down option movement while editing notes, marks answers uncommitted on text-editing keys, delegates remaining input to the composer, and uses `handle_composer_input_result` plus before/after draft comparison to update commitment state.
+**Data flow**: It receives a key event, ignores releases, snoozes auto-resolution, then checks special states first: confirmation menu, Escape clearing notes, interrupt bindings, submit bindings, and question navigation. It then applies option-list behavior or forwards notes keys into the composer, updating answer state and drafts as needed.
 
-**Call relations**: This is the main `BottomPaneView` event entrypoint; it orchestrates nearly every helper in the file depending on current focus and popup state.
+**Call relations**: The terminal input loop calls this for key presses. It delegates smaller jobs to helpers such as draft saving, selection, composer handling, unanswered confirmation, and submit flow.
 
 *Call graph*: calls 23 internal fn (interrupt, current_text_with_pending, handle_key_event, capture_composer_draft, clear_notes_and_focus_options, clear_selection, confirm_unanswered_active, current_answer_mut, ensure_selected_for_notes, focus_is_notes (+13 more)); 1 external calls (matches!).
 
@@ -2909,11 +2913,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn terminal_title_requires_action(&self) -> bool
 ```
 
-**Purpose**: Indicates that the terminal title should reflect that user action is required while this overlay is active. It is a simple capability flag for the host UI.
+**Purpose**: Reports that this overlay represents something requiring user action. The terminal title can use this to signal attention is needed.
 
-**Data flow**: Returns `true`.
+**Data flow**: It takes no extra input and always returns true.
 
-**Call relations**: Queried by the surrounding UI framework while the overlay is displayed.
+**Call relations**: The surrounding UI can query this while deciding how to label or decorate the terminal.
 
 
 ##### `RequestUserInputOverlay::on_ctrl_c`  (lines 1428–1447)
@@ -2922,11 +2926,11 @@ fn terminal_title_requires_action(&self) -> bool
 fn on_ctrl_c(&mut self) -> CancellationEvent
 ```
 
-**Purpose**: Handles Ctrl-C according to overlay state: close unanswered confirmation and interrupt, clear notes draft when editing non-empty notes, or interrupt outright otherwise. It always consumes the cancellation event.
+**Purpose**: Handles Ctrl-C while the overlay is active. It either clears typed notes, closes confirmation and interrupts, or interrupts the whole request.
 
-**Data flow**: If unanswered confirmation is active, it closes the popup, sends `interrupt` through `app_event_tx`, marks `done = true`, and returns `Handled`. Else if notes are focused and the composer has non-empty text, it clears the notes draft and returns `Handled`. Otherwise it sends `interrupt`, marks `done = true`, and returns `Handled`.
+**Data flow**: It checks whether confirmation is open, then whether notes focus has text. It may close confirmation, clear notes, or send an interrupt event and mark the overlay done. It returns that the cancellation was handled.
 
-**Call relations**: Invoked by the bottom-pane host on terminal cancellation.
+**Call relations**: The outer cancellation handling calls this when Ctrl-C is pressed.
 
 *Call graph*: calls 6 internal fn (interrupt, current_text_with_pending, clear_notes_draft, close_unanswered_confirmation, confirm_unanswered_active, focus_is_notes).
 
@@ -2937,11 +2941,11 @@ fn on_ctrl_c(&mut self) -> CancellationEvent
 fn is_complete(&self) -> bool
 ```
 
-**Purpose**: Reports whether the overlay has finished processing all requests or has been interrupted. It is the `BottomPaneView` completion flag.
+**Purpose**: Reports whether the overlay has finished and can be removed. Completion happens after submission, dismissal, auto-resolution, or interruption.
 
-**Data flow**: Reads `self.done` and returns it.
+**Data flow**: It reads the `done` flag and returns it.
 
-**Call relations**: Used by the host to know when to dismiss the overlay.
+**Call relations**: The surrounding UI uses this to know when to stop showing the overlay.
 
 
 ##### `RequestUserInputOverlay::handle_paste`  (lines 1453–1467)
@@ -2950,11 +2954,11 @@ fn is_complete(&self) -> bool
 fn handle_paste(&mut self, pasted: String) -> bool
 ```
 
-**Purpose**: Handles pasted text by snoozing auto-resolution, switching into notes mode when necessary, marking the current answer uncommitted, and delegating insertion to the shared composer. It treats paste like typing into notes.
+**Purpose**: Handles pasted text. Pasting counts as user activity, switches to notes if needed, and marks the answer as not yet committed.
 
-**Data flow**: Takes `pasted: String`, returns `false` immediately if it is empty. Otherwise it snoozes auto-resolution, switches `focus` to `Notes` when currently in `Options`, ensures notes are visible, clears `answer_committed` on the current answer, and returns the boolean result of `self.composer.handle_paste(pasted)`.
+**Data flow**: It receives pasted text, rejects empty pastes, snoozes auto-resolution, moves focus to notes if currently on options, makes notes visible, clears committed status, and forwards the paste to the composer. It returns whether the composer accepted it.
 
-**Call relations**: Called by the bottom-pane host for explicit paste events; it complements key-based notes editing.
+**Call relations**: The terminal paste handling path calls this instead of treating paste as ordinary key presses.
 
 *Call graph*: calls 4 internal fn (handle_paste, current_answer_mut, ensure_selected_for_notes, snooze_auto_resolution); 1 external calls (matches!).
 
@@ -2965,11 +2969,11 @@ fn handle_paste(&mut self, pasted: String) -> bool
 fn flush_paste_burst_if_due(&mut self) -> bool
 ```
 
-**Purpose**: Delegates pending paste-burst flushing to the shared composer. It exposes the composer's burst state machine through the overlay interface.
+**Purpose**: Asks the composer to finish a buffered paste burst if its delay has expired. Paste bursts group rapid paste chunks together.
 
-**Data flow**: Calls `self.composer.flush_paste_burst_if_due()` and returns the resulting boolean.
+**Data flow**: It calls the composer paste-burst flush method and returns whether anything was flushed.
 
-**Call relations**: Used by the host's periodic input-processing loop when this overlay is active.
+**Call relations**: The broader UI loop can call this periodically while paste buffering is active.
 
 *Call graph*: calls 1 internal fn (flush_paste_burst_if_due).
 
@@ -2980,11 +2984,11 @@ fn flush_paste_burst_if_due(&mut self) -> bool
 fn is_in_paste_burst(&self) -> bool
 ```
 
-**Purpose**: Reports whether the shared composer is currently inside a paste-burst transient state. It forwards the composer's status through the overlay.
+**Purpose**: Reports whether the composer is currently buffering a paste burst. This helps the UI know whether delayed paste work is still pending.
 
-**Data flow**: Calls `self.composer.is_in_paste_burst()` and returns the boolean result.
+**Data flow**: It asks the composer for its paste-burst state and returns that boolean.
 
-**Call relations**: Queried by the host when coordinating paste-burst behavior across views.
+**Call relations**: The surrounding event loop can query this while scheduling paste-related work.
 
 *Call graph*: calls 1 internal fn (is_in_paste_burst).
 
@@ -2995,11 +2999,11 @@ fn is_in_paste_burst(&self) -> bool
 fn pre_draw_tick(&mut self, now: Instant) -> bool
 ```
 
-**Purpose**: Runs pre-render maintenance and triggers auto-resolution when due. It lets the overlay mutate itself just before drawing.
+**Purpose**: Runs time-based work just before drawing. In this chunk, that means checking whether auto-resolution should submit now.
 
-**Data flow**: Takes `now`, calls `maybe_auto_resolve_at(now)`, and returns whether that caused a state change.
+**Data flow**: It receives the current time, calls `maybe_auto_resolve_at`, and returns whether the overlay changed.
 
-**Call relations**: Called by the host before rendering frames.
+**Call relations**: The render loop calls this before drawing a frame.
 
 *Call graph*: calls 1 internal fn (maybe_auto_resolve_at).
 
@@ -3010,11 +3014,11 @@ fn pre_draw_tick(&mut self, now: Instant) -> bool
 fn next_frame_delay(&self) -> Option<Duration>
 ```
 
-**Purpose**: Returns the next desired wake-up time for countdown updates or auto-resolution expiry. It is the runtime-facing wrapper around the timing helper.
+**Purpose**: Tells the UI loop when the next redraw is needed for timer reasons. If no auto-resolution timer is active, it returns nothing.
 
-**Data flow**: Calls `auto_resolution_next_frame_delay_at(Instant::now())` and returns the resulting `Option<Duration>`.
+**Data flow**: It reads the current time, delegates to `auto_resolution_next_frame_delay_at`, and returns the optional delay.
 
-**Call relations**: Used by the host scheduler while the overlay is active.
+**Call relations**: The outer rendering scheduler calls this to avoid waking too often or too late.
 
 *Call graph*: calls 1 internal fn (auto_resolution_next_frame_delay_at); 1 external calls (now).
 
@@ -3028,11 +3032,11 @@ fn try_consume_user_input_request(
     ) -> Option<ToolRequestUserInputParams>
 ```
 
-**Purpose**: Queues an additional user-input request behind the current one instead of replacing it immediately. It preserves FIFO processing order for multiple prompts.
+**Purpose**: Accepts another user-input request while one is already active by placing it at the back of the queue. This preserves arrival order.
 
-**Data flow**: Takes a `ToolRequestUserInputParams`, pushes it onto `self.queue`, and returns `None` to indicate the current overlay continues handling the active request.
+**Data flow**: It receives a request, pushes it into the queue, and returns `None` to show it was consumed by this overlay rather than handled elsewhere.
 
-**Call relations**: Called by the host when a new request-user-input prompt arrives while one is already active.
+**Call relations**: The app request dispatcher calls this when a new user-input request arrives during an existing one.
 
 *Call graph*: 1 external calls (push_back).
 
@@ -3043,11 +3047,11 @@ fn try_consume_user_input_request(
 fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Forwards app-server request dismissal to the overlay's internal resolved-request handler. It is the `BottomPaneView` integration point for external resolution.
+**Purpose**: Lets the app server dismiss a request from this overlay. It is the public-facing wrapper around the resolved-request dismissal logic.
 
-**Data flow**: Takes a `ResolvedAppServerRequest`, calls `dismiss_resolved_request(request)`, and returns that boolean result.
+**Data flow**: It receives a resolved server request, passes it to `dismiss_resolved_request`, and returns whether the overlay changed.
 
-**Call relations**: Invoked by the host when app-server requests resolve independently of local user action.
+**Call relations**: The surrounding app-server request handling calls this when it learns a pending request has been resolved elsewhere.
 
 *Call graph*: calls 1 internal fn (dismiss_resolved_request).
 
@@ -3061,6 +3065,12 @@ fn test_sender() -> (
     )
 ```
 
+**Purpose**: Creates a test event sender and receiver pair. Tests use it to inspect what events the overlay emits.
+
+**Data flow**: It creates an unbounded channel, wraps the sender in `AppEventSender`, and returns both sender and raw receiver.
+
+**Call relations**: Many tests call this before constructing an overlay.
+
 *Call graph*: calls 1 internal fn (new).
 
 
@@ -3069,6 +3079,12 @@ fn test_sender() -> (
 ```
 fn expect_interrupt_only(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>)
 ```
+
+**Purpose**: Checks that the overlay emitted exactly one interrupt event and nothing else. This protects interruption behavior from accidental extra events.
+
+**Data flow**: It receives a test receiver, pulls one event, verifies it is an interrupt operation, then verifies no further events are immediately available.
+
+**Call relations**: The interrupt test calls this after pressing Escape.
 
 *Call graph*: 4 external calls (try_recv, assert!, assert_eq!, panic!).
 
@@ -3079,6 +3095,12 @@ fn expect_interrupt_only(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>
 fn question_with_options(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
 
+**Purpose**: Builds a simple sample question with three choices. It keeps tests short and consistent.
+
+**Data flow**: It receives an ID and header, fills in standard question text and three option records, and returns a `ToolRequestUserInputQuestion`.
+
+**Call relations**: Many tests use this helper when they need a normal option-based question.
+
 *Call graph*: 1 external calls (vec!).
 
 
@@ -3087,6 +3109,12 @@ fn question_with_options(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
 fn question_with_options_and_other(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
+
+**Purpose**: Builds a sample option question that also allows an `Other` choice. Tests use it for behavior involving the extra synthetic option.
+
+**Data flow**: It receives an ID and header, creates a question with `is_other` set to true and three normal options, and returns it.
+
+**Call relations**: Tests that need the `Other` option can call this instead of duplicating setup.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3097,6 +3125,12 @@ fn question_with_options_and_other(id: &str, header: &str) -> ToolRequestUserInp
 fn question_with_wrapped_options(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
 
+**Purpose**: Builds a sample question whose option descriptions are long enough to wrap. This helps test layout behavior.
+
+**Data flow**: It receives an ID and header, creates a question with three descriptive options, and returns it.
+
+**Call relations**: Snapshot and layout tests use this kind of data to verify wrapped option rows.
+
 *Call graph*: 1 external calls (vec!).
 
 
@@ -3105,6 +3139,12 @@ fn question_with_wrapped_options(id: &str, header: &str) -> ToolRequestUserInput
 ```
 fn question_with_very_long_option_text(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
+
+**Purpose**: Builds a sample question with an unusually long option label and description. This stresses the interface's text wrapping.
+
+**Data flow**: It receives an ID and header, creates a two-option question with one very long label, and returns it.
+
+**Call relations**: Tests can use this helper to catch rendering problems with long single-line labels.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3115,6 +3155,12 @@ fn question_with_very_long_option_text(id: &str, header: &str) -> ToolRequestUse
 fn question_with_long_scroll_options(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
 
+**Purpose**: Builds a sample question with several very verbose option descriptions. This is useful for testing scrolling and keeping the selected row visible.
+
+**Data flow**: It receives an ID and header, creates four options with long explanatory descriptions, and returns the question.
+
+**Call relations**: Layout and scrolling tests use this to exercise constrained terminal sizes.
+
 *Call graph*: 1 external calls (vec!).
 
 
@@ -3123,6 +3169,12 @@ fn question_with_long_scroll_options(id: &str, header: &str) -> ToolRequestUserI
 ```
 fn question_without_options(id: &str, header: &str) -> ToolRequestUserInputQuestion
 ```
+
+**Purpose**: Builds a free-form sample question with no choices. Tests use it for notes-only answer behavior.
+
+**Data flow**: It receives an ID and header, creates a question with `options` set to none, and returns it.
+
+**Call relations**: Tests that need composer-only input use this helper.
 
 
 ##### `tests::request_event`  (lines 1673–1684)
@@ -3134,6 +3186,12 @@ fn request_event(
     ) -> ToolRequestUserInputParams
 ```
 
+**Purpose**: Builds a sample user-input request around a list of questions. It supplies stable thread and item IDs for tests.
+
+**Data flow**: It receives a turn ID and question list, fills in request metadata, sets auto-resolution to absent, and returns the request.
+
+**Call relations**: Most tests use this to create requests before constructing an overlay.
+
 
 ##### `tests::request_event_with_auto_resolution`  (lines 1686–1693)
 
@@ -3144,6 +3202,12 @@ fn request_event_with_auto_resolution(
     ) -> ToolRequestUserInputParams
 ```
 
+**Purpose**: Builds a sample request with auto-resolution enabled. Tests use it to check countdown and expiry behavior.
+
+**Data flow**: It receives a turn ID and questions, starts from `request_event`, sets `auto_resolution_ms` to a value, and returns the modified request.
+
+**Call relations**: Auto-resolution tests call this helper instead of hand-writing the request.
+
 *Call graph*: 1 external calls (request_event).
 
 
@@ -3152,6 +3216,12 @@ fn request_event_with_auto_resolution(
 ```
 fn snapshot_buffer(buf: &Buffer) -> String
 ```
+
+**Purpose**: Turns a terminal render buffer into plain text for snapshot assertions. This makes UI output easy to compare in tests.
+
+**Data flow**: It receives a buffer, walks every cell in row order, takes the first character from each cell's symbol, joins rows with newlines, and returns the resulting string.
+
+**Call relations**: Snapshot rendering helpers call this after drawing the overlay into a buffer.
 
 *Call graph*: 3 external calls (area, new, new).
 
@@ -3162,6 +3232,12 @@ fn snapshot_buffer(buf: &Buffer) -> String
 fn render_snapshot(overlay: &RequestUserInputOverlay, area: Rect) -> String
 ```
 
+**Purpose**: Renders the overlay at the current time and returns a text snapshot. It is the simple snapshot helper for tests that do not care about time.
+
+**Data flow**: It receives an overlay and rectangle, gets the current instant, delegates to `render_snapshot_at`, and returns the snapshot string.
+
+**Call relations**: Snapshot tests can call this when timer state is not important.
+
 *Call graph*: 2 external calls (now, render_snapshot_at).
 
 
@@ -3170,6 +3246,12 @@ fn render_snapshot(overlay: &RequestUserInputOverlay, area: Rect) -> String
 ```
 fn render_snapshot_at(overlay: &RequestUserInputOverlay, area: Rect, now: Instant) -> String
 ```
+
+**Purpose**: Renders the overlay at a chosen time and returns a text snapshot. This lets tests control countdown display.
+
+**Data flow**: It receives an overlay, drawing area, and instant, creates an empty buffer, asks the overlay to render into it at that time, and converts the buffer to text.
+
+**Call relations**: Auto-resolution and UI snapshot tests call this when they need deterministic rendering.
 
 *Call graph*: 3 external calls (empty, render_ui_at, snapshot_buffer).
 
@@ -3180,6 +3262,12 @@ fn render_snapshot_at(overlay: &RequestUserInputOverlay, area: Rect, now: Instan
 fn queued_requests_are_fifo()
 ```
 
+**Purpose**: Verifies that queued user-input requests are processed in first-in, first-out order. This matters when multiple prompts arrive before the user finishes the first one.
+
+**Data flow**: It creates an overlay, queues two more requests, submits the current request twice, and checks that the active turn IDs advance from the second to the third request.
+
+**Call relations**: This test exercises `try_consume_user_input_request`, `submit_answers`, and queue advancement together.
+
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3188,6 +3276,12 @@ fn queued_requests_are_fifo()
 ```
 fn interrupt_discards_queued_requests_and_emits_interrupt()
 ```
+
+**Purpose**: Verifies that interrupting the overlay ends it and emits only an interrupt event, even when requests are queued. This protects cancellation behavior.
+
+**Data flow**: It creates an overlay, queues two requests, sends an Escape key event, checks the overlay is done, and checks the event receiver saw only an interrupt.
+
+**Call relations**: This test drives the main key handler and then uses `expect_interrupt_only` to validate emitted events.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, expect_interrupt_only, request_event, test_sender, vec!).
 
@@ -3198,6 +3292,12 @@ fn interrupt_discards_queued_requests_and_emits_interrupt()
 fn auto_resolution_absent_has_no_timer()
 ```
 
+**Purpose**: Verifies that ordinary requests without auto-resolution do not schedule or display any timer. This prevents countdown UI from appearing by accident.
+
+**Data flow**: It creates an overlay from a normal request, checks timing is disabled, checks there is no next-frame delay, and checks there is no countdown text.
+
+**Call relations**: This test directly exercises the auto-resolution timing, scheduling, and text helpers.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (now, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3206,6 +3306,12 @@ fn auto_resolution_absent_has_no_timer()
 ```
 fn auto_resolution_hides_timer_during_grace_period()
 ```
+
+**Purpose**: Verifies that auto-resolution exists but is not shown during its initial hidden grace period. The user gets a short quiet period before the countdown appears.
+
+**Data flow**: It creates an auto-resolving overlay, sets the request start time, checks the timing state and next-frame delay, renders a snapshot, and confirms the countdown text is absent.
+
+**Call relations**: This test combines request construction, timer calculation, redraw delay, and snapshot rendering.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (now, assert!, assert_eq!, request_event_with_auto_resolution, test_sender, vec!).
 
@@ -3216,6 +3322,12 @@ fn auto_resolution_hides_timer_during_grace_period()
 fn auto_resolution_visible_countdown_snapshot()
 ```
 
+**Purpose**: Checks that an auto-resolving prompt shows the visible countdown once the hidden grace period has passed. This protects the screen text users rely on before the prompt answers itself.
+
+**Data flow**: It builds an overlay with three option questions, rewinds the request start time to the end of the hidden grace period, renders the overlay at a fixed size and time, and compares the result to a saved snapshot.
+
+**Call relations**: The test runner calls this test. The test creates the overlay through RequestUserInputOverlay::new, feeds it a request with auto-resolution, then hands the rendered view to the snapshot assertion.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (now, assert_snapshot!, request_event_with_auto_resolution, test_sender, vec!).
 
 
@@ -3224,6 +3336,12 @@ fn auto_resolution_visible_countdown_snapshot()
 ```
 fn auto_resolution_visible_countdown_is_red()
 ```
+
+**Purpose**: Verifies that the countdown warning is colored red, while normal progress text is not. This makes sure the urgent part of the prompt stands out visually.
+
+**Data flow**: It creates an auto-resolving overlay, sets its timer to the visible countdown phase, renders into a terminal buffer, finds the countdown text, and checks each countdown cell has a red foreground color while the nearby prefix does not.
+
+**Call relations**: The test runner invokes it as a rendering-style check. It uses the overlay's timed rendering path and then inspects the raw buffer instead of only comparing text.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (empty, now, new, assert_eq!, assert_ne!, request_event_with_auto_resolution, snapshot_buffer, test_sender, vec!).
 
@@ -3234,6 +3352,12 @@ fn auto_resolution_visible_countdown_is_red()
 fn auto_resolution_expiry_emits_empty_answer()
 ```
 
+**Purpose**: Confirms that when an auto-resolving prompt expires without user input, the overlay sends an empty answer and records a history item. This ensures unattended prompts still complete cleanly.
+
+**Data flow**: It creates a timed request, moves its start time back past the full timeout, runs the pre-draw tick, and reads the event channel. The output is a UserInputAnswer with the correct turn id and no answers, followed by a history-cell event.
+
+**Call relations**: The test runner calls it. The test exercises pre_draw_tick, which is the overlay's periodic check before drawing, and observes the application events emitted through the test sender.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (now, assert!, assert_eq!, panic!, request_event_with_auto_resolution, test_sender, vec!).
 
 
@@ -3242,6 +3366,12 @@ fn auto_resolution_expiry_emits_empty_answer()
 ```
 fn auto_resolution_key_interaction_snoozes_timer()
 ```
+
+**Purpose**: Checks that pressing a key disables the auto-resolution timer. This prevents the app from submitting an empty answer while the user is actively interacting.
+
+**Data flow**: It creates an auto-resolving overlay, puts it into the visible countdown phase, sends a Down key, then asks what the timer would do after the timeout. The result is that auto-resolution is disabled, no tick completes the overlay, and no event is emitted.
+
+**Call relations**: The test runner calls this input-behavior test. It drives handle_key_event and then confirms pre_draw_tick no longer submits anything.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (now, from, assert!, assert_eq!, request_event_with_auto_resolution, test_sender, vec!).
 
@@ -3252,6 +3382,12 @@ fn auto_resolution_key_interaction_snoozes_timer()
 fn auto_resolution_paste_interaction_snoozes_timer()
 ```
 
+**Purpose**: Checks that pasting text also disables the auto-resolution timer. A paste is treated as user activity, just like a key press.
+
+**Data flow**: It starts an auto-resolving overlay, simulates a paste, then checks the later timer state. The overlay reports auto-resolution disabled, the pre-draw tick does not finish it, and the event receiver stays empty.
+
+**Call relations**: The test runner invokes it. The test uses handle_paste to enter text and then verifies the timer path with auto_resolution_timing_at and pre_draw_tick.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (now, assert!, assert_eq!, request_event_with_auto_resolution, test_sender, vec!).
 
 
@@ -3260,6 +3396,12 @@ fn auto_resolution_paste_interaction_snoozes_timer()
 ```
 fn auto_resolution_resets_for_queued_request()
 ```
+
+**Purpose**: Ensures that when one timed prompt expires and another prompt is waiting, the new prompt gets a fresh timer. This avoids carrying the old prompt's expired timer into the next question.
+
+**Data flow**: It creates one timed request, queues a second, forces the first to expire, and runs the tick. The overlay advances to the second request, clears the snooze flag, starts in the hidden grace phase, remains open, and emits events for the expired first request.
+
+**Call relations**: The test runner calls it. It combines request queuing through try_consume_user_input_request with timeout processing through pre_draw_tick.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (now, assert!, assert_eq!, request_event_with_auto_resolution, test_sender, vec!).
 
@@ -3270,6 +3412,12 @@ fn auto_resolution_resets_for_queued_request()
 fn resolved_request_dismisses_overlay_without_emitting_events()
 ```
 
+**Purpose**: Checks that if the server says the current request has already been resolved, the overlay closes without sending an answer or interrupt. This prevents duplicate or stale responses.
+
+**Data flow**: It builds an overlay for a request, passes in a matching resolved-request notice, and then checks the overlay is marked done. The event channel remains empty.
+
+**Call relations**: The test runner invokes it. It exercises dismiss_app_server_request as the path for server-side cleanup.
+
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, test_sender, vec!).
 
 
@@ -3278,6 +3426,12 @@ fn resolved_request_dismisses_overlay_without_emitting_events()
 ```
 fn resolved_current_request_advances_to_next_same_turn_prompt()
 ```
+
+**Purpose**: Verifies that resolving the current prompt can reveal a newer queued prompt from the same turn. The overlay should not disappear if there is still another question waiting.
+
+**Data flow**: It creates a current request, queues a second request with the same turn id, dismisses the first by call id, and checks that the overlay now points at the second request. No event is sent.
+
+**Call relations**: The test runner calls it. It checks the interaction between queued prompts and dismiss_app_server_request.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert!, assert_eq!, test_sender, vec!).
 
@@ -3288,6 +3442,12 @@ fn resolved_current_request_advances_to_next_same_turn_prompt()
 fn resolved_queued_request_removes_only_that_prompt()
 ```
 
+**Purpose**: Checks that dismissing a queued prompt removes only that prompt, not the active one or other queued prompts. This keeps the prompt queue consistent when stale requests are resolved out of order.
+
+**Data flow**: It creates one active request and two queued requests, dismisses the middle queued one, then submits the active request. The overlay advances to the remaining queued request and emits the normal answer and history events for the submitted active request.
+
+**Call relations**: The test runner invokes it. It uses dismiss_app_server_request to remove a queued item, then uses submit_answers to prove the active flow still works.
+
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert!, assert_eq!, test_sender, vec!).
 
 
@@ -3296,6 +3456,12 @@ fn resolved_queued_request_removes_only_that_prompt()
 ```
 fn options_can_submit_empty_when_unanswered()
 ```
+
+**Purpose**: Confirms that submitting an option question without choosing an option sends an empty answer list. This defines the meaning of an unanswered option prompt at final submission.
+
+**Data flow**: It creates a one-question option overlay, calls submit_answers immediately, reads the emitted UserInputAnswer, and checks that question q1 has an empty list of answers.
+
+**Call relations**: The test runner calls it. It directly exercises the final submission path rather than key-based selection.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (assert_eq!, panic!, request_event, test_sender, vec!).
 
@@ -3306,6 +3472,12 @@ fn options_can_submit_empty_when_unanswered()
 fn enter_commits_default_selection_on_last_option_question()
 ```
 
+**Purpose**: Checks that pressing Enter on a single option question submits the default highlighted option. This makes Enter useful without requiring an extra selection key.
+
+**Data flow**: It creates one option question, sends Enter, receives the answer event, and verifies the submitted answer is Option 1.
+
+**Call relations**: The test runner invokes it. It goes through handle_key_event, which commits the current option and submits because this is the last question.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert_eq!, panic!, request_event, test_sender, vec!).
 
 
@@ -3314,6 +3486,12 @@ fn enter_commits_default_selection_on_last_option_question()
 ```
 fn enter_commits_default_selection_on_non_last_option_question()
 ```
+
+**Purpose**: Checks that pressing Enter on an earlier option question commits it and moves forward, instead of submitting the whole form too soon. The full answer is only sent after the last question is also committed.
+
+**Data flow**: It creates two option questions, presses Enter once, and sees the first answer committed while no event is emitted. After pressing Enter again, it receives a response containing Option 1 for both questions.
+
+**Call relations**: The test runner calls it. It exercises the multi-question flow through handle_key_event and event-channel output.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (new, from, assert!, assert_eq!, panic!, request_event, test_sender, vec!).
 
@@ -3324,6 +3502,12 @@ fn enter_commits_default_selection_on_non_last_option_question()
 fn number_keys_select_and_submit_options()
 ```
 
+**Purpose**: Verifies that number keys choose and submit matching options. This supports quick keyboard-only answering.
+
+**Data flow**: It creates a one-question option overlay, presses the '2' key, then reads the emitted response. The answer for q1 is Option 2.
+
+**Call relations**: The test runner invokes it. It drives the overlay through handle_key_event and checks the submitted application event.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (Char, from, assert_eq!, panic!, request_event, test_sender, vec!).
 
 
@@ -3332,6 +3516,12 @@ fn number_keys_select_and_submit_options()
 ```
 fn vim_keys_move_option_selection()
 ```
+
+**Purpose**: Checks that the Vim-style keys j and k move the highlighted option down and up. This supports users who expect those navigation keys.
+
+**Data flow**: It starts with the first option highlighted, sends 'j' and sees the second option highlighted, then sends 'k' and sees the first option highlighted again.
+
+**Call relations**: The test runner calls it. The test focuses on handle_key_event changing the current answer's option-selection state.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (Char, from, assert_eq!, request_event, test_sender, vec!).
 
@@ -3342,6 +3532,12 @@ fn vim_keys_move_option_selection()
 fn typing_in_options_does_not_open_notes()
 ```
 
+**Purpose**: Ensures ordinary letter typing while focused on options does not accidentally open the notes editor. This prevents stray key presses from changing modes or adding hidden text.
+
+**Data flow**: It creates two option questions, confirms it is on the first question with notes hidden, sends the 'x' key, and checks it is still on the same question, still focused on options, with an empty composer.
+
+**Call relations**: The test runner invokes it. It tests the option-mode branch of handle_key_event.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (Char, from, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3350,6 +3546,12 @@ fn typing_in_options_does_not_open_notes()
 ```
 fn h_l_move_between_questions_in_options()
 ```
+
+**Purpose**: Checks that h and l move between questions while the overlay is in option mode. These are Vim-style left and right navigation keys.
+
+**Data flow**: It creates two option questions, starts on the first, sends 'l' to move to the second, then sends 'h' to return to the first.
+
+**Call relations**: The test runner calls it. It verifies handle_key_event delegates these keys to question navigation.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (Char, from, assert_eq!, request_event, test_sender, vec!).
 
@@ -3360,6 +3562,12 @@ fn h_l_move_between_questions_in_options()
 fn left_right_move_between_questions_in_options()
 ```
 
+**Purpose**: Checks that the Left and Right arrow keys move between option questions. This gives users a familiar way to navigate the form.
+
+**Data flow**: It creates two option questions, sends Right to advance to the second, then Left to move back to the first.
+
+**Call relations**: The test runner invokes it. It tests the arrow-key path through handle_key_event.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (from, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3368,6 +3576,12 @@ fn left_right_move_between_questions_in_options()
 ```
 fn horizontal_list_keys_move_between_questions_in_options()
 ```
+
+**Purpose**: Verifies that Control-L and Control-H move between questions in option mode. These shortcuts match horizontal list navigation elsewhere in the terminal UI.
+
+**Data flow**: It starts on the first of two option questions, sends Control-L and sees the second question, then sends Control-H and sees the first again.
+
+**Call relations**: The test runner calls it. It checks handle_key_event with modified key events.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (Char, new, assert_eq!, request_event, test_sender, vec!).
 
@@ -3378,6 +3592,12 @@ fn horizontal_list_keys_move_between_questions_in_options()
 fn options_notes_focus_hides_question_navigation_tip()
 ```
 
+**Purpose**: Checks that the footer tips change when the user switches from option selection to notes entry. In notes mode, question-navigation hints are hidden because the text box needs the user's attention.
+
+**Data flow**: It reads the footer tips in option mode, then presses Tab to open notes and reads the tips again. The before state includes question navigation; the after state shows only notes-clearing and submit guidance.
+
+**Call relations**: The test runner invokes it. It combines handle_key_event with footer_tips, the function that prepares help text for the bottom of the overlay.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (from, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3386,6 +3606,12 @@ fn options_notes_focus_hides_question_navigation_tip()
 ```
 fn freeform_shows_ctrl_p_and_ctrl_n_question_navigation_tip()
 ```
+
+**Purpose**: Verifies that free-text questions show the correct shortcut tip for moving between questions. Control-P and Control-N are the advertised previous and next shortcuts in this mode.
+
+**Data flow**: It creates an overlay with an option question and a free-text question, moves to the free-text question, then reads footer tips. The tips include submit, Control-P/Control-N navigation, and interrupt.
+
+**Call relations**: The test runner calls it. It uses move_question to enter freeform mode and footer_tips to check the displayed guidance.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert_eq!, request_event, test_sender, vec!).
 
@@ -3396,6 +3622,12 @@ fn freeform_shows_ctrl_p_and_ctrl_n_question_navigation_tip()
 fn freeform_footer_shows_configured_submit_binding()
 ```
 
+**Purpose**: Checks that the footer shows a customized submit shortcut for free-text questions. This keeps on-screen help aligned with the user's key settings.
+
+**Data flow**: It changes the runtime keymap so composer submit is Control-J, creates a free-text overlay with that keymap, then checks the footer says 'ctrl + j to submit answer'.
+
+**Call relations**: The test runner invokes it. It uses new_with_keymap to pass custom keyboard settings into the overlay and then checks footer_tips.
+
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 4 external calls (assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3404,6 +3636,12 @@ fn freeform_footer_shows_configured_submit_binding()
 ```
 fn request_user_input_uses_remapped_interrupt_binding_while_notes_are_visible()
 ```
+
+**Purpose**: Ensures the overlay respects a customized interrupt key even while the notes editor is open. This lets users cancel reliably with their configured shortcut.
+
+**Data flow**: It sets the interrupt key to F12, opens notes for an option answer, checks the footer advertises F12, presses F12, and verifies the overlay closes with only an interrupt event.
+
+**Call relations**: The test runner calls it. It combines keymap setup, notes-mode input handling, footer help, and event output validation.
 
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 7 external calls (F, from, assert_eq!, expect_interrupt_only, request_event, test_sender, vec!).
 
@@ -3414,6 +3652,12 @@ fn request_user_input_uses_remapped_interrupt_binding_while_notes_are_visible()
 fn tab_opens_notes_when_option_selected()
 ```
 
+**Purpose**: Checks that Tab opens the notes editor after an option has been selected. This supports adding extra explanation to a chosen option.
+
+**Data flow**: It creates an option question, marks the second option selected, confirms notes are hidden, presses Tab, and then checks notes are visible and focused.
+
+**Call relations**: The test runner invokes it. It drives the mode switch through handle_key_event.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3422,6 +3666,12 @@ fn tab_opens_notes_when_option_selected()
 ```
 fn switching_to_options_resets_notes_focus_when_notes_hidden()
 ```
+
+**Purpose**: Verifies that moving from a free-text question to an option question resets focus to the option list when notes are not visible. This prevents the overlay from staying in a text-entry mode that no longer matches the question.
+
+**Data flow**: It starts on a free-text question with notes focus, moves to an option question, and checks focus is now Options and the notes UI remains hidden.
+
+**Call relations**: The test runner calls it. It exercises move_question and checks the resulting focus state.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (assert!, assert_eq!, request_event, test_sender, vec!).
 
@@ -3432,6 +3682,12 @@ fn switching_to_options_resets_notes_focus_when_notes_hidden()
 fn switching_from_freeform_with_text_resets_focus_and_keeps_last_option_empty()
 ```
 
+**Purpose**: Checks that uncommitted free-text draft text is not treated as an answer when switching to an option question. The user must explicitly commit free text before it counts.
+
+**Data flow**: It types draft text into a freeform question, moves to an option question, submits once and gets an unanswered confirmation, chooses option 1, submits, and verifies q1 is empty while q2 contains Option 1.
+
+**Call relations**: The test runner invokes it. It tests how composer draft state, question movement, confirmation, option selection, and final submission interact.
+
 *Call graph*: calls 1 internal fn (new); 9 external calls (Char, from, new, assert!, assert_eq!, panic!, request_event, test_sender, vec!).
 
 
@@ -3440,6 +3696,12 @@ fn switching_from_freeform_with_text_resets_focus_and_keeps_last_option_empty()
 ```
 fn esc_in_notes_mode_without_options_interrupts()
 ```
+
+**Purpose**: Checks that Escape cancels a plain free-text prompt. With no option list to return to, Escape means interrupt.
+
+**Data flow**: It creates a free-text-only overlay, presses Escape, then checks the overlay is done and the event channel contains only an interrupt.
+
+**Call relations**: The test runner calls it. It exercises the Escape branch of handle_key_event for freeform prompts.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert_eq!, expect_interrupt_only, request_event, test_sender, vec!).
 
@@ -3450,6 +3712,12 @@ fn esc_in_notes_mode_without_options_interrupts()
 fn esc_in_options_mode_interrupts()
 ```
 
+**Purpose**: Checks that Escape cancels an option prompt when the user is focused on the option list. This gives a consistent way to stop the request.
+
+**Data flow**: It creates an option-only overlay, presses Escape, and verifies the overlay closes with only an interrupt event.
+
+**Call relations**: The test runner invokes it. It drives handle_key_event and validates the emitted event with expect_interrupt_only.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert_eq!, expect_interrupt_only, request_event, test_sender, vec!).
 
 
@@ -3458,6 +3726,12 @@ fn esc_in_options_mode_interrupts()
 ```
 fn esc_in_notes_mode_clears_notes_and_hides_ui()
 ```
+
+**Purpose**: Checks that Escape inside option notes clears the notes area and returns to option focus instead of canceling the whole prompt. This lets the user back out of notes safely.
+
+**Data flow**: It selects and commits an option, opens notes, presses Escape, and checks the overlay is still open, notes are hidden and empty, the selected option remains, the committed flag is reset, and no event is sent.
+
+**Call relations**: The test runner calls it. It tests the notes-mode Escape behavior through handle_key_event.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, assert_eq!, request_event, test_sender, vec!).
 
@@ -3468,6 +3742,12 @@ fn esc_in_notes_mode_clears_notes_and_hides_ui()
 fn esc_in_notes_mode_with_text_clears_notes_and_hides_ui()
 ```
 
+**Purpose**: Checks the same Escape behavior when notes contain typed text. The text should be discarded and the user should return to the option list without submitting anything.
+
+**Data flow**: It selects an option, opens notes, types a character, presses Escape, and verifies the overlay stays open, notes are hidden and cleared, the option selection remains, and no event appears.
+
+**Call relations**: The test runner invokes it. It combines notes typing and Escape handling in handle_key_event.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (Char, from, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3476,6 +3756,12 @@ fn esc_in_notes_mode_with_text_clears_notes_and_hides_ui()
 ```
 fn esc_drops_committed_answers()
 ```
+
+**Purpose**: Verifies that canceling a multi-question prompt discards already committed partial answers. An interrupt should not send half-completed form data.
+
+**Data flow**: It creates an option question followed by a free-text question, presses Enter to commit the first answer, then presses Escape. The only emitted event is an interrupt.
+
+**Call relations**: The test runner calls it. It checks that handle_key_event's submit-progress path and interrupt path do not mix.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, expect_interrupt_only, request_event, test_sender, vec!).
 
@@ -3486,6 +3772,12 @@ fn esc_drops_committed_answers()
 fn backspace_in_options_clears_selection()
 ```
 
+**Purpose**: Checks that Backspace in option mode clears the current option selection. This gives users a way to return a question to unanswered.
+
+**Data flow**: It preselects the second option, presses Backspace, and verifies the selected index becomes empty, notes stay hidden, and no event is emitted.
+
+**Call relations**: The test runner invokes it. It tests the option-mode Backspace branch of handle_key_event.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3494,6 +3786,12 @@ fn backspace_in_options_clears_selection()
 ```
 fn backspace_on_empty_notes_closes_notes_ui()
 ```
+
+**Purpose**: Checks that Backspace in an empty notes box closes notes and returns to the option list. It should not clear the selected option.
+
+**Data flow**: It selects an option, opens notes, presses Backspace with no notes text, and checks focus returns to Options, notes are hidden, the option remains selected, and no event is sent.
+
+**Call relations**: The test runner calls it. It exercises notes-mode Backspace behavior through handle_key_event.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, assert!, assert_eq!, request_event, test_sender, vec!).
 
@@ -3504,6 +3802,12 @@ fn backspace_on_empty_notes_closes_notes_ui()
 fn tab_in_notes_clears_notes_and_hides_ui()
 ```
 
+**Purpose**: Verifies that pressing Tab while editing notes cancels the notes entry and hides the notes UI. This mirrors the advertised footer hint.
+
+**Data flow**: It selects an option, opens notes, inserts note text directly into the composer, presses Tab, then checks focus is back on options, notes and composer text are cleared, the option remains selected, and no event is emitted.
+
+**Call relations**: The test runner invokes it. It checks how handle_key_event syncs composer text back into answer draft state when leaving notes.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (from, new, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3512,6 +3816,12 @@ fn tab_in_notes_clears_notes_and_hides_ui()
 ```
 fn skipped_option_questions_count_as_unanswered()
 ```
+
+**Purpose**: Checks that an untouched option question counts as unanswered. This supports confirmation prompts for incomplete forms.
+
+**Data flow**: It creates one option question and immediately asks the overlay for its unanswered count. The count is one.
+
+**Call relations**: The test runner calls it. It exercises unanswered_count on a fresh overlay.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert_eq!, request_event, test_sender, vec!).
 
@@ -3522,6 +3832,12 @@ fn skipped_option_questions_count_as_unanswered()
 fn highlighted_option_questions_are_unanswered()
 ```
 
+**Purpose**: Verifies that merely highlighting an option does not count as answering it. The user must commit the selection.
+
+**Data flow**: It creates an option question, sets the highlighted selection to the first option, and checks unanswered_count still returns one.
+
+**Call relations**: The test runner invokes it. It checks the distinction between option highlight state and committed answer state.
+
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3530,6 +3846,12 @@ fn highlighted_option_questions_are_unanswered()
 ```
 fn freeform_requires_enter_with_text_to_mark_answered()
 ```
+
+**Purpose**: Checks that free-text draft content only counts as answered after the user presses Enter. This prevents unsubmitted text from being treated as final.
+
+**Data flow**: It puts draft text into the first of two free-text questions, sees both questions still unanswered, presses Enter, and then sees the first answer marked committed and only one question left unanswered.
+
+**Call relations**: The test runner calls it. It uses the composer plus handle_key_event to test freeform commit behavior.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, new, assert_eq!, request_event, test_sender, vec!).
 
@@ -3540,6 +3862,12 @@ fn freeform_requires_enter_with_text_to_mark_answered()
 fn freeform_enter_with_empty_text_is_unanswered()
 ```
 
+**Purpose**: Checks that pressing Enter on an empty free-text question does not mark it answered. Empty draft text should not become a committed response during navigation.
+
+**Data flow**: It creates two free-text questions, presses Enter without typing, and verifies the first answer is not committed and both questions remain unanswered.
+
+**Call relations**: The test runner invokes it. It tests handle_key_event for an empty composer.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (from, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3548,6 +3876,12 @@ fn freeform_enter_with_empty_text_is_unanswered()
 ```
 fn freeform_shift_enter_inserts_newline_without_advancing()
 ```
+
+**Purpose**: Verifies that Shift-Enter inserts a newline in free-text mode instead of moving to the next question. This matters for multi-line answers.
+
+**Data flow**: It types 'Draft' into a free-text question, sends Shift-Enter, and checks the current question stays the same, the composer text becomes 'Draft\n', and the answer is not committed.
+
+**Call relations**: The test runner calls it. It uses enhanced key support and handle_key_event to check the newline shortcut.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, new, assert_eq!, request_event, test_sender, vec!).
 
@@ -3558,6 +3892,12 @@ fn freeform_shift_enter_inserts_newline_without_advancing()
 fn freeform_uses_configured_composer_submit_binding()
 ```
 
+**Purpose**: Checks that a customized composer submit key commits a free-text answer. This lets user key preferences control the overlay.
+
+**Data flow**: It changes submit to Control-J, types draft text, presses Control-J, and verifies the overlay moves to the second question and the first answer is committed.
+
+**Call relations**: The test runner invokes it. It passes a custom keymap through new_with_keymap and tests handle_key_event against that keymap.
+
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 7 external calls (Char, new, new, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3566,6 +3906,12 @@ fn freeform_uses_configured_composer_submit_binding()
 ```
 fn freeform_submit_binding_wins_over_question_navigation()
 ```
+
+**Purpose**: Ensures that if the configured submit key overlaps with a navigation shortcut, submit takes priority. This avoids surprising users who deliberately remapped submit.
+
+**Data flow**: It sets submit to Control-N, which could also mean next question, types draft text, presses Control-N, and verifies the first answer is committed while moving forward.
+
+**Call relations**: The test runner calls it. It checks shortcut priority inside handle_key_event.
 
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 7 external calls (Char, new, new, assert_eq!, request_event, test_sender, vec!).
 
@@ -3576,6 +3922,12 @@ fn freeform_submit_binding_wins_over_question_navigation()
 fn freeform_questions_submit_empty_when_empty()
 ```
 
+**Purpose**: Confirms that final submission of an empty free-text question sends an empty answer list. This defines the wire format for intentionally blank freeform answers.
+
+**Data flow**: It creates one free-text question, calls submit_answers, reads the answer event, and verifies q1 has no answer strings.
+
+**Call relations**: The test runner invokes it. It directly exercises submit_answers for a freeform prompt.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (assert_eq!, panic!, request_event, test_sender, vec!).
 
 
@@ -3584,6 +3936,12 @@ fn freeform_questions_submit_empty_when_empty()
 ```
 fn freeform_draft_is_not_submitted_without_enter()
 ```
+
+**Purpose**: Checks that uncommitted free-text draft text is not included in final submission. The user must press the submit/commit key for the draft to become an answer.
+
+**Data flow**: It places 'Draft text' in the composer, calls submit_answers without pressing Enter, and verifies the emitted q1 answer is empty.
+
+**Call relations**: The test runner calls it. It tests the boundary between composer draft state and committed answer state.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, assert_eq!, panic!, request_event, test_sender, vec!).
 
@@ -3594,6 +3952,12 @@ fn freeform_draft_is_not_submitted_without_enter()
 fn freeform_commit_resets_when_draft_changes()
 ```
 
+**Purpose**: Verifies that editing a previously committed free-text answer makes it uncommitted again. This prevents stale committed text from being submitted after the user changes it.
+
+**Data flow**: It commits 'Committed' on the first question, returns to it, changes the draft to 'Edited', moves away, and sees the answer is no longer committed. Final submission then sends an empty answer for q1.
+
+**Call relations**: The test runner invokes it. It uses movement between questions and submit_answers to check draft-change tracking.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (from, new, assert_eq!, panic!, request_event, test_sender, vec!).
 
 
@@ -3602,6 +3966,12 @@ fn freeform_commit_resets_when_draft_changes()
 ```
 fn notes_are_captured_for_selected_option()
 ```
+
+**Purpose**: Checks that notes attached to a selected option are included in the submitted answer. Notes are sent as a separate 'user_note' entry after the option label.
+
+**Data flow**: It selects Option 2, enters note text into the composer, captures that draft into the answer, submits, and verifies the response contains both 'Option 2' and 'user_note: Notes for option 2'.
+
+**Call relations**: The test runner calls it. It uses select_current_option, capture_composer_draft, and submit_answers to test note serialization.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, assert_eq!, panic!, request_event, test_sender, vec!).
 
@@ -3612,6 +3982,12 @@ fn notes_are_captured_for_selected_option()
 fn notes_submission_commits_selected_option()
 ```
 
+**Purpose**: Verifies that pressing Enter while writing notes commits both the notes and the selected option, then advances to the next question. This makes note submission behave like completing the current answer.
+
+**Data flow**: It moves the option highlight down, opens notes, types note text, presses Enter, and checks the overlay has advanced while the first answer has option index 1 and is committed.
+
+**Call relations**: The test runner invokes it. It exercises handle_key_event across option navigation, notes mode, and question advancement.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (from, new, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3620,6 +3996,12 @@ fn notes_submission_commits_selected_option()
 ```
 fn is_other_adds_none_of_the_above_and_submits_it()
 ```
+
+**Purpose**: Checks that questions allowing an 'other' answer get a 'None of the above' row and can submit it with custom notes. This supports users when none of the listed options fit.
+
+**Data flow**: It creates an option question with an 'other' setting, verifies the extra row text and description, selects that row, enters custom text, submits, and checks the answer contains the special label plus the user note.
+
+**Call relations**: The test runner calls it. It uses option_rows, options_len, composer draft capture, and submit_answers to validate the 'other' option flow.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, assert_eq!, panic!, request_event, test_sender, vec!).
 
@@ -3630,6 +4012,12 @@ fn is_other_adds_none_of_the_above_and_submits_it()
 fn large_paste_is_preserved_when_switching_questions()
 ```
 
+**Purpose**: Ensures a large pasted free-text draft is not lost when moving to another question. Large pastes may be stored behind placeholders, so this protects that bookkeeping.
+
+**Data flow**: It pastes a 1,500-character string into the composer on the first question, moves to the next question, and checks the first answer draft still has one pending paste, contains the placeholder, and reconstructs the original large text.
+
+**Call relations**: The test runner invokes it. It checks interaction between the composer paste path and move_question's draft-saving behavior.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (assert!, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3638,6 +4026,12 @@ fn large_paste_is_preserved_when_switching_questions()
 ```
 fn pending_paste_placeholder_survives_submission_and_back_navigation()
 ```
+
+**Purpose**: Checks that a large paste placeholder survives committing an option-with-notes answer and navigating back. This prevents large pasted notes from disappearing after submission-like movement.
+
+**Data flow**: It enters notes mode, ensures an option is selected, pastes a 1,200-character string, presses Enter to advance, then navigates back with Control-P. The first answer draft still reconstructs the original pasted text.
+
+**Call relations**: The test runner calls it. It combines notes handling, paste storage, answer commit, and backward navigation through handle_key_event.
 
 *Call graph*: calls 1 internal fn (new); 8 external calls (Char, from, new, assert!, assert_eq!, request_event, test_sender, vec!).
 
@@ -3648,6 +4042,12 @@ fn pending_paste_placeholder_survives_submission_and_back_navigation()
 fn request_user_input_options_snapshot()
 ```
 
+**Purpose**: Captures the expected terminal rendering for a basic option prompt. This guards the normal visual layout.
+
+**Data flow**: It creates an option overlay, renders it at 120 by 16 cells, and compares the text output to a stored snapshot.
+
+**Call relations**: The test runner invokes it. It uses render_snapshot as the bridge from overlay state to snapshot testing.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3656,6 +4056,12 @@ fn request_user_input_options_snapshot()
 ```
 fn request_user_input_options_notes_visible_snapshot()
 ```
+
+**Purpose**: Captures the expected rendering when notes are open for an option prompt. This protects the layout for the combined option-and-notes state.
+
+**Data flow**: It selects an option, presses Tab to open notes, renders at a fixed size, and compares the result to a saved snapshot.
+
+**Call relations**: The test runner calls it. It drives handle_key_event before handing the overlay to render_snapshot.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (from, new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3666,6 +4072,12 @@ fn request_user_input_options_notes_visible_snapshot()
 fn request_user_input_tight_height_snapshot()
 ```
 
+**Purpose**: Checks how the option prompt renders in a short vertical space. This helps ensure the overlay remains usable when the terminal area is cramped.
+
+**Data flow**: It creates a basic option overlay, renders it in a 120 by 10 rectangle, and compares the result to a stored snapshot.
+
+**Call relations**: The test runner invokes it. It tests render_snapshot with a deliberately tight area.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3674,6 +4086,12 @@ fn request_user_input_tight_height_snapshot()
 ```
 fn layout_allocates_all_wrapped_options_when_space_allows()
 ```
+
+**Purpose**: Verifies that the layout gives wrapped option text all the height it needs when enough space is available. This prevents multi-line options from being unnecessarily cut off.
+
+**Data flow**: It computes the needed question, option, footer, and spacer heights for a narrow width, builds an area with exactly that height, lays out sections, and checks the options area height matches the required options height.
+
+**Call relations**: The test runner calls it. It exercises wrapped_question_lines, options_required_height, footer_required_height, and layout_sections as a layout calculation chain.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_eq!, request_event, test_sender, vec!).
 
@@ -3684,6 +4102,12 @@ fn layout_allocates_all_wrapped_options_when_space_allows()
 fn desired_height_keeps_spacers_and_preferred_options_visible()
 ```
 
+**Purpose**: Checks that the overlay's preferred height includes both readable option space and one-line gaps between sections. This keeps the form from looking crowded.
+
+**Data flow**: It asks the overlay for its desired height at a wide width, applies the menu inset, lays out sections, and verifies the options area gets the preferred height and the spacers around it are one line each.
+
+**Call relations**: The test runner invokes it. It links desired_height, menu_surface_inset, options_preferred_height, and layout_sections.
+
 *Call graph*: calls 2 internal fn (new, menu_surface_inset); 5 external calls (new, assert_eq!, request_event, test_sender, vec!).
 
 
@@ -3692,6 +4116,12 @@ fn desired_height_keeps_spacers_and_preferred_options_visible()
 ```
 fn footer_wraps_tips_without_splitting_individual_tips()
 ```
+
+**Purpose**: Ensures footer help tips wrap onto multiple lines without breaking an individual tip across the line. This keeps shortcut help readable in narrow terminals.
+
+**Data flow**: It creates a two-question option overlay, selects an option to enable more tips, asks for footer tip lines at a narrow width, and checks each line's combined tip width fits within that width.
+
+**Call relations**: The test runner calls it. It exercises footer_tip_lines and uses Unicode display-width calculations to validate the result.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (width, assert!, request_event, test_sender, vec!).
 
@@ -3702,6 +4132,12 @@ fn footer_wraps_tips_without_splitting_individual_tips()
 fn request_user_input_wrapped_options_snapshot()
 ```
 
+**Purpose**: Captures the expected rendering for options whose labels or descriptions wrap across lines. This protects a more complex layout case.
+
+**Data flow**: It creates a prompt with wrapped options, selects the first option, calculates a height that includes question and option wrapping, renders the overlay, and compares it to a saved snapshot.
+
+**Call relations**: The test runner invokes it. It combines layout helper methods with render_snapshot for snapshot coverage.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3710,6 +4146,12 @@ fn request_user_input_wrapped_options_snapshot()
 ```
 fn request_user_input_long_option_text_snapshot()
 ```
+
+**Purpose**: Captures how very long option text is drawn. This guards against unreadable wrapping or clipping changes.
+
+**Data flow**: It creates a prompt with very long option text, renders it in a fixed 120 by 18 area, and compares the output to a stored snapshot.
+
+**Call relations**: The test runner calls it. It uses render_snapshot to verify the long-text display path.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3720,6 +4162,12 @@ fn request_user_input_long_option_text_snapshot()
 fn selected_long_wrapped_option_stays_visible()
 ```
 
+**Purpose**: Checks that a selected option with long wrapped text remains visible in the option viewport. This prevents the cursor from landing on an item the user cannot see.
+
+**Data flow**: It creates a scroll-heavy option list, marks the third option selected, renders the overlay, and checks the rendered text contains the selected third option marker.
+
+**Call relations**: The test runner invokes it. It uses render_snapshot as a simple visibility check rather than a full snapshot assertion.
+
 *Call graph*: calls 1 internal fn (new); 6 external calls (new, assert!, render_snapshot, request_event, test_sender, vec!).
 
 
@@ -3728,6 +4176,12 @@ fn selected_long_wrapped_option_stays_visible()
 ```
 fn request_user_input_footer_wrap_snapshot()
 ```
+
+**Purpose**: Captures the expected rendering when footer tips wrap in a narrower overlay. This protects the user-facing help text layout.
+
+**Data flow**: It creates a two-question option overlay, selects an option, asks the overlay for its desired height at width 52, renders that area, and compares the output to a stored snapshot.
+
+**Call relations**: The test runner calls it. It ties together selection state, desired_height, footer wrapping, and snapshot rendering.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3738,6 +4192,12 @@ fn request_user_input_footer_wrap_snapshot()
 fn request_user_input_scroll_options_snapshot()
 ```
 
+**Purpose**: This test checks how the overlay looks when a multiple-choice question has enough options to require scrolling. It makes sure the selected option and visible list are drawn correctly in a wide but short terminal area.
+
+**Data flow**: The test starts with a fake message sender and a fake request containing one question with five answer choices. It creates a RequestUserInputOverlay, manually sets the selected choice to the fourth option, renders the overlay into a 120-by-12 terminal rectangle, and sends that rendered text to the snapshot checker. The output is not returned to normal program code; it is compared against the saved expected screen image for the test.
+
+**Call relations**: During the test run, this function builds its test data with request_event and sends it into RequestUserInputOverlay::new. It then uses render_snapshot to turn the overlay into text and hands that text to insta::assert_snapshot!, which decides whether the screen output still matches the approved version.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3746,6 +4206,12 @@ fn request_user_input_scroll_options_snapshot()
 ```
 fn request_user_input_hidden_options_footer_snapshot()
 ```
+
+**Purpose**: This test checks the overlay in a smaller terminal where not all multiple-choice options fit on screen. It protects the footer or hint area that tells the user there are hidden choices.
+
+**Data flow**: The test creates a fake request with one question and five choices, then builds an overlay from it. It sets the selected choice to the fourth option, renders the overlay into an 80-by-10 terminal area, and compares the rendered result with a stored snapshot. The important before-to-after story is: many choices go in, a constrained screen size is applied, and the expected compact display comes out.
+
+**Call relations**: The test runner calls this function as a snapshot test. Inside it, request_event supplies the pretend user-input request, RequestUserInputOverlay::new creates the real overlay under test, render_snapshot captures what a user would see, and insta::assert_snapshot! checks that view.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3756,6 +4222,12 @@ fn request_user_input_hidden_options_footer_snapshot()
 fn request_user_input_freeform_snapshot()
 ```
 
+**Purpose**: This test checks how the overlay looks for a question where the user types their own answer instead of picking from options. It helps ensure the free-text prompt and input area stay clear and usable.
+
+**Data flow**: The test creates a fake request with one question that has no predefined options. It builds the overlay, renders it inside a 120-by-10 terminal rectangle, and compares that rendered screen with the saved snapshot. The input is a plain question; the output is the expected freeform-answer layout.
+
+**Call relations**: The test runner invokes this function with the other snapshot tests. It relies on question_without_options and request_event to make the sample request, passes that to RequestUserInputOverlay::new, then uses render_snapshot and insta::assert_snapshot! to verify the visual result.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3764,6 +4236,12 @@ fn request_user_input_freeform_snapshot()
 ```
 fn request_user_input_freeform_remapped_submit_snapshot()
 ```
+
+**Purpose**: This test checks that the freeform-question overlay shows the correct submit shortcut when the user’s key settings have been changed. It matters because on-screen hints should match what the keyboard actually does.
+
+**Data flow**: The test begins with the default runtime keymap, then changes the composer submit shortcut to Ctrl+J. It creates a freeform request overlay using that custom keymap, renders the overlay into a fixed terminal area, and compares the result to the expected snapshot. The changed shortcut goes in; the rendered help text should reflect that change.
+
+**Call relations**: This test uses RuntimeKeymap::defaults as a starting point, changes one shortcut, and passes the customized map into RequestUserInputOverlay::new_with_keymap. The overlay is then rendered and checked with insta::assert_snapshot!, so any mismatch between configured keys and displayed hints is caught.
 
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3774,6 +4252,12 @@ fn request_user_input_freeform_remapped_submit_snapshot()
 fn request_user_input_freeform_remapped_interrupt_snapshot()
 ```
 
+**Purpose**: This test checks that the overlay displays a changed interrupt shortcut correctly. An interrupt shortcut is the key the user can press to stop or cancel the current turn.
+
+**Data flow**: The test starts with the default key settings, changes the chat interrupt shortcut to F12, and builds a freeform question overlay with that custom setup. It renders the overlay into a 120-by-10 terminal area and compares the text UI against a stored snapshot. The custom keyboard setting is the input; the visible shortcut hint is the output being checked.
+
+**Call relations**: The test runner calls this function as part of the snapshot suite. It uses RuntimeKeymap::defaults, modifies the interrupt binding, gives the result to RequestUserInputOverlay::new_with_keymap, then sends the rendered overlay to insta::assert_snapshot! for comparison.
+
 *Call graph*: calls 2 internal fn (new_with_keymap, defaults); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3782,6 +4266,12 @@ fn request_user_input_freeform_remapped_interrupt_snapshot()
 ```
 fn request_user_input_multi_question_first_snapshot()
 ```
+
+**Purpose**: This test checks the first screen shown when the overlay contains more than one question. It makes sure the user can see that they are answering the first question and that the navigation context is clear.
+
+**Data flow**: The test creates a fake request with two questions: one multiple-choice question and one freeform question. It builds the overlay, leaves it on the first question, renders it into a 120-by-15 terminal area, and compares the result to the saved snapshot. The input is a two-question request; the output is the expected first-question view.
+
+**Call relations**: This snapshot test feeds a multi-question request_event into RequestUserInputOverlay::new. It does not move the overlay forward, so render_snapshot captures the initial question state, and insta::assert_snapshot! verifies that initial state.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3792,6 +4282,12 @@ fn request_user_input_multi_question_first_snapshot()
 fn request_user_input_multi_question_last_snapshot()
 ```
 
+**Purpose**: This test checks how the overlay looks after moving from the first question to the last question in a multi-question request. It protects the layout and navigation hints for the later-question state.
+
+**Data flow**: The test builds an overlay from a fake request containing two questions. It then calls move_question with the direction set to next, which advances the overlay to the second question. After that, it renders the overlay into a 120-by-12 area and compares the result with the saved snapshot.
+
+**Call relations**: The test starts the same way as the first multi-question snapshot, using request_event and RequestUserInputOverlay::new. It then exercises the overlay’s own move_question behavior before handing the rendered result to insta::assert_snapshot!, so the checked screen is the post-navigation view.
+
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
 
@@ -3800,6 +4296,12 @@ fn request_user_input_multi_question_last_snapshot()
 ```
 fn request_user_input_unanswered_confirmation_snapshot()
 ```
+
+**Purpose**: This test checks the confirmation screen shown when the user tries to proceed while some questions are still unanswered. It ensures the warning is visible and formatted correctly.
+
+**Data flow**: The test creates an overlay with two questions and does not fill them in. It then opens the unanswered-confirmation state, renders the overlay in an 80-by-12 terminal area, and compares that warning view to a saved snapshot. The before state is an incomplete set of answers; the after state is the confirmation prompt the user would see.
+
+**Call relations**: The test runner invokes this function to protect an important safety step in the overlay. It builds the overlay through RequestUserInputOverlay::new, switches it into confirmation mode with open_unanswered_confirmation, then uses render_snapshot and insta::assert_snapshot! to check the displayed warning.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_snapshot!, request_event, test_sender, vec!).
 
@@ -3810,16 +4312,24 @@ fn request_user_input_unanswered_confirmation_snapshot()
 fn options_scroll_while_editing_notes()
 ```
 
+**Purpose**: This test checks a real interaction rule: while the user is typing notes, pressing the down arrow can still move the selected multiple-choice option. It also verifies that simply moving the selection does not count as committing the answer.
+
+**Data flow**: The test creates a multiple-choice overlay, selects the current option without committing it, changes focus to the notes area, writes the text "Notes" into the composer, and places the cursor at the end. It then sends a Down-arrow key event into the overlay. Afterward, it reads the current answer and checks that the selected option moved to index 1 while answer_committed is still false.
+
+**Call relations**: Unlike the snapshot tests, this one checks state directly instead of comparing a rendered screen. It builds the overlay with RequestUserInputOverlay::new, prepares the notes-editing state through the composer, sends a keyboard event through handle_key_event, and finally uses assertions to confirm the overlay changed selection but did not finalize the answer.
+
 *Call graph*: calls 1 internal fn (new); 7 external calls (from, new, assert!, assert_eq!, request_event, test_sender, vec!).
 
 
 ### `tui/src/bottom_pane/pending_thread_approvals.rs`
 
-`domain_logic` · `rendering`
+`domain_logic` · `main loop rendering`
 
-This file defines `PendingThreadApprovals`, a minimal stateful widget whose only persistent data is a `Vec<String>` of thread labels. The public API is intentionally small: `new` starts empty, `set_threads` replaces the list and reports whether anything changed, `is_empty` exposes whether there is anything to render, and a test-only `threads` accessor allows assertions on stored state.
+This widget solves a visibility problem: an approval request can happen in a thread the user is not currently viewing. Without this reminder, the user might not know that another thread is blocked and waiting. The widget keeps a list of thread names that need attention, then draws a short warning for each one in the terminal interface.
 
-The actual presentation logic lives in `as_renderable`. If there are no threads or the width is too narrow, it returns an empty renderable. Otherwise it builds a list of lines for up to the first three threads. Each thread becomes wrapped text of the form `Approval needed in {thread}`, rendered through `adaptive_wrap_lines` with an initial indent containing a red bold `!` marker and a plain two-space prefix, plus a four-space subsequent indent for wrapped continuations. If more than three threads exist, the widget appends a dim italic `...` line to indicate truncation. It always ends with a dim hint line containing a bold cyan `/agent` command followed by `to switch threads`. The `Renderable` implementation simply delegates both sizing and drawing to the boxed paragraph returned by `as_renderable`, ensuring height calculations and actual rendering stay in sync.
+It is deliberately compact. If there are no waiting threads, it draws nothing. If the available space is too narrow, it also draws nothing, because the message would not be useful. Otherwise, it shows up to three lines like “Approval needed in …”, with a red exclamation mark as a visual cue. Long thread names are wrapped using the project’s adaptive wrapping helper, so the text fits the current terminal width. If more than three threads need approval, it adds a dim “...” line instead of flooding the pane. At the bottom, it shows a hint: use “/agent” to switch threads.
+
+Think of it like a dashboard warning light. It does not perform the approval itself; it simply makes sure the user sees that something elsewhere needs attention.
 
 #### Function details
 
@@ -3829,11 +4339,11 @@ The actual presentation logic lives in `as_renderable`. If there are no threads 
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty approvals widget with no tracked threads. It is the default starting state before any approval data arrives.
+**Purpose**: Creates an empty pending-approvals widget. It is used when the UI first needs a place to store and later display thread approval warnings.
 
-**Data flow**: Constructs `PendingThreadApprovals { threads: Vec::new() }` and returns it.
+**Data flow**: It takes no thread data in. It creates a new widget with an empty list of thread names. The result is a `PendingThreadApprovals` value that will draw nothing until threads are added.
 
-**Call relations**: Used by production setup and tests before thread names are injected.
+**Call relations**: This is the starting point for the widget. The rendering tests create fresh widgets with it, and the surrounding UI setup also relies on it before any approval-thread list has been supplied.
 
 *Call graph*: called by 4 (new, desired_height_empty, render_multiple_threads_snapshot, render_single_thread_snapshot); 1 external calls (new).
 
@@ -3844,11 +4354,11 @@ fn new() -> Self
 fn set_threads(&mut self, threads: Vec<String>) -> bool
 ```
 
-**Purpose**: Replaces the stored thread list and reports whether the value actually changed. This lets callers avoid unnecessary redraw work when the list is unchanged.
+**Purpose**: Replaces the widget’s current list of threads that need approval. It also tells the caller whether the list actually changed, which helps avoid unnecessary redraw work.
 
-**Data flow**: Takes a new `Vec<String>`, compares it to `self.threads`, returns `false` immediately if equal, otherwise assigns the new vector into `self.threads` and returns `true`.
+**Data flow**: It receives a new list of thread names. If that list is the same as the current one, it leaves the widget unchanged and returns `false`. If it is different, it stores the new list and returns `true`.
 
-**Call relations**: Called by higher-level state synchronization code when pending approvals are recomputed.
+**Call relations**: The wider bottom-pane code calls this when it learns which inactive threads have outstanding approval requests. After this updates the stored names, later rendering turns those names into visible warning lines.
 
 *Call graph*: called by 1 (set_pending_thread_approvals).
 
@@ -3859,11 +4369,11 @@ fn set_threads(&mut self, threads: Vec<String>) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether there are any pending approval threads to show. It is a lightweight visibility check.
+**Purpose**: Answers whether there are any pending approval threads to show. Other layout code can use this to decide whether this widget needs space at all.
 
-**Data flow**: Returns `self.threads.is_empty()`.
+**Data flow**: It reads the widget’s stored thread list. It returns `true` if the list has no names, and `false` if at least one thread is waiting for approval.
 
-**Call relations**: Used by surrounding layout code to decide whether to reserve space for this widget.
+**Call relations**: The surrounding bottom-pane layout asks this before reserving room near the composer. In the bigger flow, it helps the UI stay compact when there is nothing important to display.
 
 *Call graph*: called by 1 (as_renderable_with_composer_right_reserve).
 
@@ -3874,11 +4384,11 @@ fn is_empty(&self) -> bool
 fn threads(&self) -> &[String]
 ```
 
-**Purpose**: Exposes the stored thread slice for tests. It allows assertions without rendering.
+**Purpose**: Returns the stored thread names for test-only inspection. It exists so tests can check the widget’s internal state without changing it.
 
-**Data flow**: Returns `&self.threads`.
+**Data flow**: It reads the widget’s thread list and returns a borrowed view of it. Nothing is copied, drawn, or modified.
 
-**Call relations**: Only compiled in tests and used by test helpers or assertions.
+**Call relations**: This function is only compiled for tests. Test code that checks pending thread approvals calls it to confirm that the expected names were stored.
 
 *Call graph*: called by 1 (pending_thread_approvals).
 
@@ -3889,11 +4399,11 @@ fn threads(&self) -> &[String]
 fn as_renderable(&self, width: u16) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds the visible approval-warning paragraph or an empty renderable depending on content and width. It contains all truncation, wrapping, and styling rules for the widget.
+**Purpose**: Builds the actual drawable content for the widget at a given terminal width. It converts raw thread names into styled, wrapped terminal lines plus the “/agent” hint.
 
-**Data flow**: Reads `self.threads` and `width`. If there are no threads or width is under 4, returns `Box::new(())`. Otherwise it creates a `Vec<Line>`, iterates over at most the first three thread names, wraps `Approval needed in {thread}` with `adaptive_wrap_lines` using an initial indent of `  ! ` where `!` is red and bold and a subsequent indent of four spaces, and extends the line list with each wrapped result. If more than three threads exist, it appends a dim italic `    ...` line. Finally it appends a dim line containing bold cyan `/agent` followed by ` to switch threads`, wraps the lines in `Paragraph::new(lines).into()`, and returns it boxed.
+**Data flow**: It receives the available width and reads the stored thread names. If there is nothing to show, or the width is too small, it returns an empty drawable object. Otherwise, it creates warning text for up to three threads, wraps those lines to fit the width, adds an ellipsis if more threads exist, adds the switch-thread hint, and returns a paragraph-like drawable object.
 
-**Call relations**: Shared by `render` and `desired_height`, making it the single formatting source for the widget.
+**Call relations**: Both `render` and `desired_height` call this so they agree on exactly what content exists. It hands text to the wrapping helper before packaging the result as something that follows the project’s `Renderable` interface.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_lines); called by 2 (desired_height, render); 7 external calls (new, from, new, new, format!, once, vec!).
 
@@ -3904,11 +4414,11 @@ fn as_renderable(&self, width: u16) -> Box<dyn Renderable>
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the approvals widget into the target buffer when the area is non-empty. It delegates content generation to `as_renderable`.
+**Purpose**: Draws the pending-approval warning into the terminal buffer. This is what makes the stored thread names visible to the user.
 
-**Data flow**: Takes `area` and mutable `buf`, returns early if `area.is_empty()`, otherwise constructs `as_renderable(area.width)` and renders it into the area.
+**Data flow**: It receives a screen area and a mutable terminal buffer. If the area is empty, it does nothing. Otherwise, it builds the drawable content for the area’s width and asks that content to paint itself into the buffer.
 
-**Call relations**: Called by the UI framework and by the snapshot helper in tests.
+**Call relations**: The UI rendering pass calls this through the shared `Renderable` interface. In tests, `snapshot_rows` calls it after creating a buffer so the expected screen text can be checked.
 
 *Call graph*: calls 1 internal fn (as_renderable); called by 1 (snapshot_rows); 1 external calls (is_empty).
 
@@ -3919,11 +4429,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the widget's height by asking the generated renderable for its desired height. This keeps layout and rendering consistent.
+**Purpose**: Calculates how many terminal rows the widget wants at a given width. Layout code uses this before drawing so it can reserve the right amount of space.
 
-**Data flow**: Takes `width`, builds the boxed renderable with `as_renderable(width)`, and returns its `desired_height(width)`.
+**Data flow**: It receives a width and reads the stored thread names. It builds the same drawable content that rendering would use, then asks that content how tall it wants to be. The result is a row count.
 
-**Call relations**: Used by layout code and tests before allocating render space.
+**Call relations**: This pairs with `render`: both go through `as_renderable`, so measuring and drawing stay consistent. The test helper calls this first to make a buffer of the right height.
 
 *Call graph*: calls 1 internal fn (as_renderable); called by 1 (snapshot_rows).
 
@@ -3934,11 +4444,11 @@ fn desired_height(&self, width: u16) -> u16
 fn snapshot_rows(widget: &PendingThreadApprovals, width: u16) -> String
 ```
 
-**Purpose**: Renders the widget into a buffer and converts the visible rows into a newline-joined plain string for snapshot assertions. It is a test utility for stable textual snapshots.
+**Purpose**: Renders the widget into an in-memory terminal buffer and turns the visible characters into plain text for snapshot testing. This lets tests compare what a user would see without opening a real terminal.
 
-**Data flow**: Takes a widget reference and width, computes height via `desired_height`, renders into a fresh `Buffer`, then iterates over every cell row-by-row collecting the first character of each symbol into strings and joins those rows with `\n`.
+**Data flow**: It receives a widget and a width. It asks the widget for its desired height, creates an empty buffer of that size, renders the widget into it, then reads each cell’s first character into lines of text. The output is a newline-separated string.
 
-**Call relations**: Shared helper for the snapshot tests in this module.
+**Call relations**: The rendering snapshot tests use this as their bridge between the widget and the snapshot assertion tool. It calls `desired_height` and `render`, so it exercises the same path the real UI uses.
 
 *Call graph*: calls 2 internal fn (desired_height, render); 2 external calls (empty, new).
 
@@ -3949,11 +4459,11 @@ fn snapshot_rows(widget: &PendingThreadApprovals, width: u16) -> String
 fn desired_height_empty()
 ```
 
-**Purpose**: Verifies that an empty approvals widget takes zero height. This confirms the empty-renderable path.
+**Purpose**: Checks that an empty widget asks for no screen height. This protects the UI from wasting space when there are no pending approvals.
 
-**Data flow**: Creates a new widget and asserts `desired_height(40) == 0`.
+**Data flow**: It creates a new widget with no threads, asks for its desired height at a normal width, and compares the answer with zero.
 
-**Call relations**: Exercises `new` and `desired_height` on the no-content case.
+**Call relations**: This test starts with `PendingThreadApprovals::new` and verifies the measuring behavior that layout code depends on before any thread list has been set.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -3964,11 +4474,11 @@ fn desired_height_empty()
 fn render_single_thread_snapshot()
 ```
 
-**Purpose**: Snapshots rendering for one pending approval thread. It validates the warning marker and `/agent` hint formatting.
+**Purpose**: Checks the exact text layout when one thread needs approval. It makes sure the warning line and the “/agent” hint appear as intended.
 
-**Data flow**: Creates a widget, sets one thread, renders through `snapshot_rows`, replaces spaces with dots for readability, and snapshots the resulting string.
+**Data flow**: It creates a widget, sets one thread name, renders it through the snapshot helper at a fixed width, replaces spaces with dots for easier visual comparison, and compares the result with a saved expected snapshot.
 
-**Call relations**: Covers the single-thread branch of `as_renderable`.
+**Call relations**: This test uses the same rendering path as the real UI by going through `snapshot_rows`. It protects the single-thread display from accidental formatting changes.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_snapshot!, vec!).
 
@@ -3979,11 +4489,11 @@ fn render_single_thread_snapshot()
 fn render_multiple_threads_snapshot()
 ```
 
-**Purpose**: Snapshots rendering when more than three threads exist. It verifies truncation to three visible entries plus the trailing ellipsis and hint line.
+**Purpose**: Checks the exact text layout when several threads need approval, including the cutoff after three visible thread names. It confirms the widget stays compact while still signaling that more threads exist.
 
-**Data flow**: Creates a widget, sets four thread names, renders through `snapshot_rows` at width 44, normalizes spaces to dots, and snapshots the output.
+**Data flow**: It creates a widget, gives it four thread names, renders it at a fixed width, turns spaces into dots for readable comparison, and checks the result against the expected snapshot.
 
-**Call relations**: Exercises the truncation branch in `as_renderable`.
+**Call relations**: This test also goes through `snapshot_rows`, so it exercises `desired_height`, `render`, and the internal renderable-building logic together. It specifically protects the multi-thread and ellipsis behavior.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_snapshot!, vec!).
 
@@ -3993,15 +4503,15 @@ These chat-widget modules turn approval events into concrete popup flows, permis
 
 ### `tui/src/chatwidget/permission_popups.rs`
 
-`orchestration` · `interactive permission/approval configuration and confirmation flows`
+`orchestration` · `request handling`
 
-This file owns the generic permission-selection UI for the chat widget. `open_approvals_popup` is just an alias into `open_permissions_popup`, which branches between the legacy preset picker and the newer explicit profile picker depending on `config.explicit_permission_profile_mode`.
+This file is the chat screen’s “permissions desk.” It creates the menus and confirmation screens that decide what the model is allowed to do: read files, edit files, use the network, or act only after asking the user. Without it, users would have no clear in-chat way to change those safety settings or approve a recently blocked action.
 
-The main popup enumerates `builtin_approval_presets()` and turns them into `SelectionItem`s. It computes current state from the configured approval policy, permission profile, reviewer mode, feature flags, and—on Windows—the sandbox level. Several details are easy to miss: the read-only preset is hidden off Windows, the `auto` preset label changes when Windows is using a degraded non-admin sandbox, and disabled reasons are computed separately for approval-policy constraints and Guardian Approval feature mutability. The `auto` preset may produce two rows: normal user approvals and “Approve for me” auto-review when the feature is enabled.
+The main flow starts when the chat widget opens the permissions popup. The code looks at the current configuration, builds a list of permission presets, marks the current one, disables choices that are not allowed, and attaches actions to each menu item. Selecting an item does not directly change everything in place. Instead, it sends app events, like putting notes into a mailbox for the rest of the application to process.
 
-`permission_mode_actions` is the key dispatcher. It either returns direct preset/profile actions, redirects full-access selections into a confirmation popup when the warning has not been acknowledged, or on Windows routes Agent mode through sandbox-enablement or world-writable warnings before applying anything. `approval_preset_actions` emits the concrete `AppEvent`s that override turn context, update approval policy/profile/reviewer state, and insert a history info cell.
+Some choices need extra care. Full access gets a warning because it lets Codex edit files and run network commands without asking. On Windows, the file also accounts for sandbox state, meaning the protective “box” around commands may need setup or elevation. There is also a separate popup for recent auto-review denials, where the user can approve one denied action for a retry.
 
-The file also includes a popup for recent auto-review denials, allowing one-click approval of a denied action retry, and a dedicated full-access confirmation surface with “continue”, “continue and remember”, and cancel paths. `preset_matches_current` contains the nuanced matching logic for synthetic presets like read-only and auto, comparing filesystem/network sandbox behavior rather than only raw profile equality.
+Overall, this file turns sensitive security settings into guided, visible user choices rather than hidden switches.
 
 #### Function details
 
@@ -4011,11 +4521,11 @@ The file also includes a popup for recent auto-review denials, allowing one-clic
 fn open_approvals_popup(&mut self)
 ```
 
-**Purpose**: Provides the approvals command entrypoint by forwarding directly to the permissions popup.
+**Purpose**: This is a compatibility wrapper that opens the permissions popup when something asks for the older “approvals” popup. It keeps callers working while routing them to the newer, broader permissions flow.
 
-**Data flow**: It takes no extra input, reads no additional state beyond `self`, calls `open_permissions_popup`, and returns no value.
+**Data flow**: It receives the current chat widget state, makes no decisions of its own, and immediately forwards control to the permissions popup builder. The visible result is the same permissions selection UI that a direct permissions request would show.
 
-**Call relations**: This is a thin alias used where the UI or command vocabulary says “approvals” but the underlying flow is the permissions picker implemented by `ChatWidget::open_permissions_popup`.
+**Call relations**: When another part of the interface asks to open approvals, this function calls `open_permissions_popup` so there is one main place that builds the actual popup.
 
 *Call graph*: calls 1 internal fn (open_permissions_popup).
 
@@ -4026,11 +4536,11 @@ fn open_approvals_popup(&mut self)
 fn open_permissions_popup(&mut self)
 ```
 
-**Purpose**: Builds and shows the main permissions-mode picker, including built-in presets, optional auto-review rows, disabled reasons, and Windows-specific sandbox hints.
+**Purpose**: This builds and shows the main menu for changing model permissions. It decides which permission choices should appear, which one is currently active, and which choices should be disabled or require follow-up prompts.
 
-**Data flow**: It reads configuration fields for explicit profile mode, approval policy, permission profile, Guardian Approval enablement, reviewer mode, current cwd, feature mutability, and on Windows sandbox level. It may delegate immediately to `open_permission_profiles_popup`; otherwise it iterates `builtin_approval_presets()`, filters read-only off non-Windows, computes labels/descriptions/current-state flags with `preset_matches_current`, obtains row actions from `permission_mode_actions`, optionally adds a footer note about upgrading the Windows sandbox, and writes a `SelectionViewParams` into `self.bottom_pane`.
+**Data flow**: It reads the current configuration, such as the approval policy, permission profile, current folder, feature flags, and Windows sandbox status. It turns the built-in permission presets into selectable rows, attaches the right actions to each row, optionally adds a warning note, and sends the completed selection view to the bottom pane for display.
 
-**Call relations**: This is the main popup constructor reached from `ChatWidget::open_approvals_popup`. It delegates row behavior to `ChatWidget::permission_mode_actions` and current-state detection to `ChatWidget::preset_matches_current`.
+**Call relations**: This is the central popup builder, and `open_approvals_popup` delegates to it. While building each row, it calls `permission_mode_actions` to decide what should happen when the user selects that row, and uses `preset_matches_current` to mark the row that matches the current settings.
 
 *Call graph*: calls 3 internal fn (from, permission_mode_actions, level_from_config); called by 1 (open_approvals_popup); 7 external calls (new, default, preset_matches_current, new, cfg!, format!, matches!).
 
@@ -4041,11 +4551,11 @@ fn open_permissions_popup(&mut self)
 fn open_auto_review_denials_popup(&mut self)
 ```
 
-**Purpose**: Shows a searchable list of recent auto-review denials in the current thread so the user can approve one for a retry.
+**Purpose**: This shows a searchable popup listing recent actions that automatic review rejected. It gives the user a way to pick one denied action and approve it for a retry.
 
-**Data flow**: It reads `self.review.recent_auto_review_denials` and the current thread ID. If there are no denials it adds an info message; if the thread is unavailable it adds an error message. Otherwise it builds a header row plus one `SelectionItem` per denial using the denial’s action summary and rationale, with actions that send `AppEvent::ApproveRecentAutoReviewDenial { thread_id, id }`, then writes the searchable selection view to `self.bottom_pane` and requests redraw.
+**Data flow**: It checks the chat widget’s stored recent denials. If there are none, it shows an informational message. If the current thread is gone, it shows an error. Otherwise, it builds rows from each denial, including a plain summary and rationale, and each row sends an approval event for that specific denial when selected.
 
-**Call relations**: This popup is a side flow for reviewing Guardian auto-review outcomes. Its selection actions eventually lead to `ChatWidget::approve_recent_auto_review_denial`.
+**Call relations**: This popup is used when the user wants to inspect auto-review denials. The actions it creates send an `ApproveRecentAutoReviewDenial` event, which later leads to `approve_recent_auto_review_denial` doing the actual approval work.
 
 *Call graph*: 2 external calls (default, vec!).
 
@@ -4056,11 +4566,11 @@ fn open_auto_review_denials_popup(&mut self)
 fn approve_recent_auto_review_denial(&mut self, thread_id: ThreadId, id: String)
 ```
 
-**Purpose**: Consumes a stored auto-review denial event and submits a thread operation approving one retry of that denied action.
+**Purpose**: This records the user’s approval for one recently denied auto-review action. The approval is limited to a retry, rather than permanently changing the safety rules.
 
-**Data flow**: It takes a `ThreadId` and denial ID string, removes the matching event from `self.review.recent_auto_review_denials`, and if absent adds an error message. When present, it sends `AppEvent::SubmitThreadOp` with `AppCommand::approve_guardian_denied_action(event)` and adds an informational message explaining that the retry still passes through auto-review.
+**Data flow**: It receives a thread ID and denial ID. It removes the matching denial from the recent-denials store; if it cannot find it, it shows an error. If found, it sends a thread operation that wraps the denied action as approved for retry, then shows an informational message explaining what happened.
 
-**Call relations**: This function is the execution side of the denial popup. It is reached after the user selects a denial row created by `ChatWidget::open_auto_review_denials_popup`.
+**Call relations**: This is the follow-through for a selection made in `open_auto_review_denials_popup`. After the popup sends the approval event, this function packages the approved denial into an app command using `approve_guardian_denied_action` and sends it back into the thread flow.
 
 *Call graph*: 1 external calls (approve_guardian_denied_action).
 
@@ -4075,11 +4585,11 @@ fn approval_preset_actions(
         label: String,
 ```
 
-**Purpose**: Creates the concrete action closure that applies a built-in approval preset and records the change in history.
+**Purpose**: This creates the list of actions needed to apply a permission preset. It is used when choosing a built-in mode should immediately update the running conversation’s permission context.
 
-**Data flow**: It takes an `AskForApproval`, a `PermissionProfile`, an `ActivePermissionProfile`, a display label, and an `ApprovalsReviewer`. It returns a one-element action vector whose closure sends a `CodexOp` overriding turn context, updates the approval policy, active permission profile, and reviewer in widget/app state, and inserts an informational history cell announcing the new label.
+**Data flow**: It takes the approval rule, permission profile, active profile label, display label, and reviewer choice. It returns one selection action; when run, that action sends several app events to update the current turn context, store the new approval policy and profile, set the reviewer, and add a history message saying permissions were updated.
 
-**Call relations**: This helper is used by `ChatWidget::permission_mode_actions` and `ChatWidget::open_full_access_confirmation` when a selection should directly apply a built-in preset rather than route through profile selection.
+**Call relations**: Other popup builders call this when a menu item should apply a preset directly. `permission_mode_actions` uses it for normal preset choices, and `open_full_access_confirmation` uses it after the user confirms the risky full-access option.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4092,11 +4602,11 @@ fn permission_profile_selection_actions(
     ) -> Vec<SelectionAction>
 ```
 
-**Purpose**: Creates the action closure that selects an explicit permission profile by sending a single app event.
+**Purpose**: This creates the action for selecting a named permission profile instead of directly applying one fixed preset. It lets the rest of the application process that profile choice through the normal event path.
 
-**Data flow**: It takes a `PermissionProfileSelection`, captures it in a closure, and returns a one-element action vector that sends `AppEvent::SelectPermissionProfile(selection.clone())`.
+**Data flow**: It receives a permission profile selection and returns one action. When that action runs, it sends an app event carrying the selected profile; the function itself does not apply the profile immediately.
 
-**Call relations**: This helper is used when the UI is operating in explicit profile-selection mode, either from `ChatWidget::permission_mode_actions` or from the profile-menu helpers in the neighboring file.
+**Call relations**: This is used as an alternative to `approval_preset_actions` when a popup item represents a profile selection. `permission_mode_actions` and `open_full_access_confirmation` choose between these two action builders depending on whether a profile selection was supplied.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4112,11 +4622,11 @@ fn permission_mode_actions(
         profile_selection: Option<PermissionProfileSel
 ```
 
-**Purpose**: Chooses the correct action path for a permission preset: direct apply, explicit profile selection, full-access confirmation, or Windows-specific sandbox/world-writable warning prompts.
+**Purpose**: This decides what should happen when the user selects a permission mode. Sometimes it can apply the mode immediately; sometimes it must first show a warning or setup prompt.
 
-**Data flow**: It reads the selected `ApprovalPreset`, label, reviewer mode, optional `PermissionProfileSelection`, and `return_to_permissions` flag plus widget config such as full-access warning acknowledgment and Windows sandbox state. It either returns direct actions from `approval_preset_actions`/`permission_profile_selection_actions`, or returns closures that send `OpenFullAccessConfirmation`, `EnableWindowsSandboxForAgentMode`, `OpenWindowsSandboxEnablePrompt`, or `OpenWorldWritableWarningConfirmation` depending on the preset and platform conditions.
+**Data flow**: It receives the selected preset, display label, reviewer mode, optional profile selection, and whether the UI should return to the permissions menu afterward. It checks for special cases: full access may require a confirmation warning, and on Windows the automatic mode may require sandbox setup or a world-writable folder warning. It returns actions that either apply the choice or open the needed confirmation/setup popup first.
 
-**Call relations**: This dispatcher is called by `ChatWidget::open_permissions_popup` for each row and by the profile-menu code for built-in profile items. It centralizes all branching before a permission change is actually applied.
+**Call relations**: `open_permissions_popup` calls this for each menu row so every choice gets the correct behavior. It may hand off to `approval_preset_actions` or `permission_profile_selection_actions` for ordinary choices, or send events that open full-access, Windows sandbox, or world-writable warning prompts.
 
 *Call graph*: calls 1 internal fn (level_from_config); called by 1 (open_permissions_popup); 3 external calls (sandbox_setup_is_complete, clone, vec!).
 
@@ -4132,11 +4642,11 @@ fn preset_matches_current(
     ) -> bo
 ```
 
-**Purpose**: Determines whether a built-in approval preset should be marked as the current selection based on the active approval policy and effective sandbox behavior.
+**Purpose**: This checks whether a permission preset represents the settings currently in effect. It is used so the popup can mark the active choice for the user.
 
-**Data flow**: It takes the current `AskForApproval`, current `PermissionProfile`, current cwd, and a preset. It first compares approval policies, then for `full-access`, `read-only`, and `auto` performs specialized checks against filesystem and network sandbox policies—such as whether cwd is writable, whether full-disk write access exists, and whether writable roots are empty—falling back to direct profile equality for other presets. It returns a boolean.
+**Data flow**: It receives the current approval policy, the current permission profile, the current working folder, and a preset to compare against. It first compares the approval policy, then checks the permission profile rules in a preset-specific way, such as whether the current folder is writable for automatic mode or whether no writable roots exist for read-only mode. It returns true if the preset matches, otherwise false.
 
-**Call relations**: This helper is used by `ChatWidget::open_permissions_popup` to mark rows current. Its special-case logic is what lets synthetic presets match behaviorally equivalent managed profiles.
+**Call relations**: `open_permissions_popup` calls this while building menu items. Its answer controls the “current” marker in the popup, helping the user see which permission mode is already active.
 
 *Call graph*: calls 3 internal fn (from, file_system_sandbox_policy, network_sandbox_policy); 1 external calls (matches!).
 
@@ -4152,24 +4662,26 @@ fn open_full_access_confirmation(
     )
 ```
 
-**Purpose**: Shows a warning popup before enabling full access, with options to proceed once, proceed and remember the acknowledgment, or cancel back to the previous permissions surface.
+**Purpose**: This shows a warning screen before enabling full access. It exists because full access is powerful and risky, so the user must make an explicit choice before continuing unless they have chosen not to be warned again.
 
-**Data flow**: It takes an `ApprovalPreset`, a `return_to_permissions` flag, and an optional `PermissionProfileSelection`. It builds a rich header with a red warning paragraph, constructs accept actions either from `approval_preset_actions` or `permission_profile_selection_actions`, appends acknowledgment update/persist events, builds a cancel action that reopens either permissions or approvals, and writes the resulting `SelectionViewParams` into `self.bottom_pane`.
+**Data flow**: It receives the full-access preset, a flag saying where to return on cancel, and an optional profile selection. It builds a warning header explaining that Codex can edit files and use the network without approval. It then creates three choices: continue for this session, continue and remember the warning choice, or cancel and go back. The accept choices apply the preset or profile and mark the warning acknowledged; the remember choice also persists that preference.
 
-**Call relations**: This confirmation popup is opened by `ChatWidget::permission_mode_actions` when the user selects the `full-access` preset under normal user-review mode and the warning has not been suppressed.
+**Call relations**: `permission_mode_actions` opens this confirmation instead of applying full access directly when the warning is needed. If the user accepts, it reuses `approval_preset_actions` or `permission_profile_selection_actions`; if the user cancels, it sends an event to reopen the appropriate permissions or approvals popup.
 
 *Call graph*: calls 2 internal fn (from, with); 6 external calls (new, default, from, new, new, vec!).
 
 
 ### `tui/src/chatwidget/permissions_menu.rs`
 
-`orchestration` · `interactive permission-profile selection`
+`domain_logic` · `user interaction`
 
-This file is the profile-oriented counterpart to `permission_popups.rs`. `open_permission_profiles_popup` assembles a unified selection list containing built-in profiles mapped onto stable IDs (`:workspace`, `:danger-no-sandbox`, `:read-only`) plus any custom permission profiles from configuration. It first resolves the currently active profile ID from `config.permissions.active_permission_profile()`, then looks up the required built-in presets by ID and emits explicit error messages if any expected preset is missing—treating that as an internal consistency failure rather than silently degrading.
+This file is the chat UI’s “permissions chooser.” Its job is to show a clear menu where the user can switch between safety modes, such as read-only access, normal workspace access, or full access. Without it, the app could still have permission settings internally, but users would not have this guided way to inspect and change them from the terminal interface.
 
-Built-in rows are created through `builtin_permission_mode_selection_item`, which derives the visible label from both preset ID and reviewer mode, computes whether the row is current by comparing active profile ID, approval policy, and reviewer, and packages a `PermissionProfileSelection` that can be routed through the generic permission action machinery. Disabled reasons are computed from both approval-policy mutability and whether the target permission profile itself is allowed by config constraints.
+The main flow starts by finding the currently active permission profile, then loading the built-in approval presets. These presets are like ready-made driving modes in a car: cautious, normal, or unrestricted. The file expects three built-in presets to exist: read-only, auto, and full-access. If one is missing, it reports an internal error instead of showing a broken menu.
 
-Custom rows are simpler: `permission_profile_selection_item` creates a `PermissionProfileSelection` with no explicit approval-policy or reviewer override, marks the row current when its ID matches the active profile, and wires it to `permission_profile_selection_actions`. The resulting popup uses the standard selection-view shell and popup hint line, but leaves the header empty because the row labels and descriptions carry the important information.
+It then creates menu items for each built-in mode. If the GuardianApproval feature is enabled, it adds an extra option where approvals can be reviewed automatically. After that, it adds any custom permission profiles from configuration.
+
+Each menu row knows its label, description, whether it is the current choice, what action should happen when selected, and whether it should be disabled because the current configuration rules do not allow that change.
 
 #### Function details
 
@@ -4179,11 +4691,11 @@ Custom rows are simpler: `permission_profile_selection_item` creates a `Permissi
 fn open_permission_profiles_popup(&mut self)
 ```
 
-**Purpose**: Builds and shows the explicit permission-profile picker containing built-in workspace/full-access/read-only modes plus configured custom profiles.
+**Purpose**: Opens the popup that lets the user choose a permission profile for the model. It gathers the built-in choices, optionally adds an automatic review choice, adds configured custom profiles, and displays them as a selection menu.
 
-**Data flow**: It reads the active profile ID from config, fetches `builtin_approval_presets()`, validates that `read-only`, `auto`, and `full-access` presets exist, emits error messages and returns if any are missing, then builds a `Vec<SelectionItem>` from `builtin_permission_mode_selection_item` and `permission_profile_selection_item` for custom profiles. Finally it writes the assembled `SelectionViewParams` into `self.bottom_pane`.
+**Data flow**: It reads the chat widget’s configuration, including the active permission profile, feature flags, built-in approval presets, and custom profiles. It turns that information into a list of selection items, each with a label, description, current-state marker, and actions. The result is not returned as a value; instead, the bottom pane of the UI is changed to show the permissions selection popup, or an error message is added if required built-in presets are missing.
 
-**Call relations**: This popup is opened from `ChatWidget::open_permissions_popup` when `config.explicit_permission_profile_mode` is enabled. It delegates row construction to the two helper functions in this file.
+**Call relations**: This is the top-level menu builder for this file. As it prepares the popup, it calls `ChatWidget::builtin_permission_mode_selection_item` for the standard built-in permission modes and uses the standard construction helpers such as `from`, `vec!`, and default values. Once the items are ready, it hands them to the bottom pane so the user can pick one.
 
 *Call graph*: calls 2 internal fn (from, builtin_permission_mode_selection_item); 3 external calls (new, default, vec!).
 
@@ -4200,11 +4712,11 @@ fn builtin_permission_mode_selection_item(
         approvals_rev
 ```
 
-**Purpose**: Creates one selection row for a built-in permission mode, including current-state detection, disabled reasons, and the action payload needed to apply or confirm it.
+**Purpose**: Creates one selectable row for a built-in permission mode, such as workspace access, full access, read-only access, or automatic review. It also decides whether that row should appear as the current setting or be disabled.
 
-**Data flow**: It takes a preset, synthetic profile ID, description, approval policy, and reviewer mode. It reads the active profile ID, current approval policy, and current reviewer from config, constructs a `PermissionProfileSelection`, computes `is_current`, obtains actions from `self.permission_mode_actions(...)`, computes disabled reasons from approval-policy and permission-profile `can_set` checks, and returns a populated `SelectionItem`.
+**Data flow**: It receives a built-in preset, the profile id to use, a human-readable description, the approval policy, and who reviews approvals. It reads the current active profile, current approval policy, and current reviewer from configuration. From this, it builds a `SelectionItem` containing the visible label, description, current-choice flag, the actions to run if selected, and any disabled reason if the configuration does not allow that policy or profile.
 
-**Call relations**: This helper is called repeatedly by `ChatWidget::open_permission_profiles_popup` for the built-in workspace, auto-review, full-access, and read-only rows.
+**Call relations**: `ChatWidget::open_permission_profiles_popup` calls this while assembling the built-in part of the permissions menu. This function converts one preset into a finished menu row, and it relies on helper conversions such as `from` and `to_core` so the UI choice matches the core permission system.
 
 *Call graph*: calls 2 internal fn (from, to_core); called by 1 (open_permission_profiles_popup); 1 external calls (default).
 
@@ -4220,24 +4732,26 @@ fn permission_profile_selection_item(
     ) -> SelectionItem
 ```
 
-**Purpose**: Creates a selection row for a custom permission profile that simply selects that profile without overriding approval policy or reviewer.
+**Purpose**: Creates one selectable row for a custom permission profile defined in configuration. It is simpler than the built-in version because custom profiles already carry their own profile identity and do not override approval policy or reviewer settings here.
 
-**Data flow**: It takes a label, profile ID, description, and optional active profile ID. It builds a `PermissionProfileSelection` with `approval_policy` and `approvals_reviewer` set to `None`, marks the row current when `active_profile_id == Some(id)`, wires actions from `permission_profile_selection_actions`, and returns the resulting `SelectionItem`.
+**Data flow**: It receives the text to show, the profile id, a description, and the currently active profile id. It builds a permission profile selection from that id, marks the row as current if it matches the active profile, attaches the actions needed to select it, and returns the completed `SelectionItem`.
 
-**Call relations**: This helper is used by `ChatWidget::open_permission_profiles_popup` when appending custom profiles from `config.custom_permission_profiles`.
+**Call relations**: This function is the custom-profile counterpart to the built-in item builder. In the permissions menu flow, it turns configured profiles into rows the user can select, and it hands the resulting selection to `permission_profile_selection_actions` so choosing the row actually changes the profile.
 
 *Call graph*: 2 external calls (default, permission_profile_selection_actions).
 
 
 ### `tui/src/chatwidget/windows_sandbox_prompts.rs`
 
-`orchestration` · `interactive prompt handling and Windows sandbox setup transitions`
+`orchestration` · `startup and interactive prompt handling`
 
-This file extends `ChatWidget` with Windows sandbox UX logic guarded by `cfg(target_os = "windows")` or test builds, while providing inert no-op stubs on other platforms so the rest of the widget can call these methods unconditionally. The smallest checks are policy-oriented: `windows_sandbox_mode_allowed` asks the layered config requirements whether a requested `WindowsSandboxModeToml` can be set, and `elevated_windows_sandbox_setup_required` combines the effective sandbox level, whether the mode came from an explicit config source, and whether setup artifacts exist under `codex_home`.
+On Windows, Codex can run with a sandbox: a protective boundary that limits file writes and network access. This file is the chat UI’s “safety desk” for that feature. It decides when the user must be warned, builds the text shown in pop-up choice panels, and connects each button to the app event that should happen next.
 
-The warning path for world-writable directories computes effective workspace roots, current working directory, environment variables, and the effective permission profile, then asks `codex_windows_sandbox` to resolve permissions and run a scan. A failed scan is surfaced distinctly from a successful scan that found no issue. `open_world_writable_warning_confirmation` then constructs a `SelectionView` with explanatory `Paragraph` content, optional sample paths, and two action bundles: continue once, or continue and persist acknowledgement. A subtle invariant is that acknowledgement events are queued before permission-profile-changing actions so downstream hooks do not immediately re-open the same warning.
+The file covers three main moments. First, it checks whether a sandbox mode is allowed by configuration rules, including organization-level rules. Second, it shows prompts for setting up the stronger Administrator-based sandbox, or falling back to a non-admin sandbox if that is allowed. Third, it warns when Windows folder permissions are too loose, especially folders writable by “Everyone,” because the sandbox may not be able to protect those places reliably.
 
-The enable/fallback prompts are similar popup builders with telemetry counters and `AppEvent` closures for elevated setup, unelevated legacy setup, retry, or quit. If policy requires a choice, canceling the popup reopens it via `on_cancel`. Finally, setup status methods temporarily disable composer input, show/hide status indicators, and force redraws so the user cannot queue messages while sandbox mode is changing.
+The prompts are not just labels. Each option carries actions: start elevated setup, use the non-admin setup, apply a permission profile, remember that a warning was acknowledged, or quit. The file also temporarily disables typing while setup is in progress, so the user cannot accidentally send work that would run under the wrong safety mode.
+
+On non-Windows systems, most functions are harmless no-ops. This keeps the rest of the app able to call the same methods without constantly checking the operating system.
 
 #### Function details
 
@@ -4247,11 +4761,11 @@ The enable/fallback prompts are similar popup builders with telemetry counters a
 fn windows_sandbox_mode_allowed(&self, mode: WindowsSandboxModeToml) -> bool
 ```
 
-**Purpose**: Checks whether the current layered configuration requirements permit switching to a specific `WindowsSandboxModeToml`. It is a pure policy query used to decide whether the UI may offer the unelevated fallback path.
+**Purpose**: This checks whether the current configuration rules allow Codex to use a particular Windows sandbox mode. It matters because some users or organizations may forbid the less-protective non-admin sandbox.
 
-**Data flow**: `self` supplies `config.config_layer_stack.requirements().windows_sandbox_mode`; the `mode` argument is wrapped as `Some(mode)` and passed to `can_set`. The function converts the result into a boolean by returning `true` only when the requirement check is `Ok`.
+**Data flow**: It takes a requested sandbox mode, reads the layered configuration rules, and asks whether that mode can be set. It returns true if the rules accept the mode and false if they reject it.
 
-**Call relations**: This method is consulted while building both the initial enable prompt and the fallback prompt. Those callers use the boolean to decide whether to include a non-admin sandbox option and whether dismissing the popup should be treated as invalid because setup is mandatory.
+**Call relations**: The enable and fallback prompts call this before showing the non-admin sandbox option. If this says the mode is not allowed, those prompts hide that path and steer the user toward the required default sandbox.
 
 *Call graph*: called by 2 (open_windows_sandbox_enable_prompt, open_windows_sandbox_fallback_prompt).
 
@@ -4262,11 +4776,11 @@ fn windows_sandbox_mode_allowed(&self, mode: WindowsSandboxModeToml) -> bool
 fn elevated_windows_sandbox_setup_required(&self) -> bool
 ```
 
-**Purpose**: Determines whether the configured Windows sandbox mode specifically requires elevated setup work that has not yet been completed. It encodes the exact condition under which the UI must keep prompting for setup rather than assuming the sandbox is ready.
+**Purpose**: This decides whether the stronger Administrator-based Windows sandbox still needs setup before Codex can safely continue. It is a gatekeeper for prompts that require the user to finish sandbox preparation.
 
-**Data flow**: It reads the effective sandbox level via `crate::windows_sandbox::level_from_config(&self.config)`, checks that the requirements source for `windows_sandbox_mode` is present, and probes `crate::windows_sandbox::sandbox_setup_is_complete` using `self.config.codex_home`. It returns `true` only when the level is `WindowsSandboxLevel::Elevated`, the mode was explicitly sourced, and setup completion is currently false.
+**Data flow**: It reads the configured Windows sandbox level, checks whether that setting came from an explicit configuration source, and checks whether setup files or markers are already complete in the Codex home folder. It returns true only when elevated sandbox mode is expected and setup is not finished.
 
-**Call relations**: This predicate is reused by the enable prompt, fallback prompt, and the opportunistic `maybe_prompt_windows_sandbox_enable` gate. Those callers rely on it to distinguish a merely configured sandbox from one whose elevated installation steps still need user action.
+**Call relations**: The automatic prompt checker and both sandbox choice screens call this to decide whether a setup choice is mandatory. It relies on the Windows sandbox configuration helper to interpret the config and on the setup-complete check to inspect the local setup state.
 
 *Call graph*: calls 1 internal fn (level_from_config); called by 3 (maybe_prompt_windows_sandbox_enable, open_windows_sandbox_enable_prompt, open_windows_sandbox_fallback_prompt); 1 external calls (sandbox_setup_is_complete).
 
@@ -4277,11 +4791,11 @@ fn elevated_windows_sandbox_setup_required(&self) -> bool
 fn world_writable_warning_details(&self) -> Option<(Vec<String>, usize, bool)>
 ```
 
-**Purpose**: Computes whether the current Windows sandbox protections are undermined by world-writable paths and, if so, returns the warning payload shape expected by the confirmation popup. It also suppresses the warning entirely when the user has already chosen to hide it.
+**Purpose**: This checks whether Codex should warn that Windows folder permissions may weaken sandbox protection. A folder writable by everyone is like leaving a side door unlocked: even if the main sandbox is careful, that folder may still be risky.
 
-**Data flow**: The method first reads `self.config.notices.hide_world_writable_warning`; if set, it returns `None`. Otherwise it clones `cwd`, gathers effective workspace roots, snapshots the process environment with `std::env::vars().collect()` into a `HashMap<String, String>`, derives the effective permission profile, and attempts to build `ResolvedWindowsSandboxPermissions` for those roots. If permission resolution fails it returns `None`; if the subsequent world-writable scan succeeds it returns `None`; if the scan errors it returns `Some((Vec::new(), 0, true))`, using an empty sample list and `failed_scan = true` to indicate protections could not be verified.
+**Data flow**: It first respects the user's setting to hide this warning. If the warning is not hidden, it reads the current working folder, workspace roots, environment variables, and effective permission profile. It tries to translate those permissions into Windows sandbox permissions, then asks the Windows sandbox library to scan and apply protections. It returns no warning when everything is okay or the check is disabled, and returns warning details when protection cannot be verified. On non-Windows systems it always returns no warning.
 
-**Call relations**: This method is a data-producing precursor for the warning confirmation flow. Its output is consumed by higher-level chat widget logic that decides whether to open `open_world_writable_warning_confirmation`, and the tuple fields directly drive that popup's explanatory text and sample-path section.
+**Call relations**: This function is used by the surrounding chat flow when deciding whether to show a world-writable warning. It hands the actual Windows permission work to the sandbox library, while this UI layer only decides whether there is something the user needs to see.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots); 3 external calls (new, apply_world_writable_scan_and_denies_for_permissions, vars).
 
@@ -4296,11 +4810,11 @@ fn open_world_writable_warning_confirmation(
         _sample_paths: Vec<Stri
 ```
 
-**Purpose**: Builds and displays the popup that warns the user about world-writable folders or an incomplete scan before enabling a permission profile or approval preset. It translates the current or pending permission profile into user-facing mode labels and wires the popup buttons to acknowledgement and profile-change events.
+**Purpose**: This opens the confirmation popup that explains the world-writable-folder risk and asks whether to continue. It lets the user proceed for now or proceed and remember that choice.
 
-**Data flow**: Inputs are an optional `ApprovalPreset`, optional `PermissionProfileSelection`, a `sample_paths` list, `extra_count`, and `failed_scan`. The function extracts `AskForApproval`, pending `PermissionProfile`, and active profile from the preset when present; derives a human-readable mode label by inspecting whether the profile is `Disabled`, writable in `cwd`, or effectively read-only; then assembles `Renderable` header content with one or more `Paragraph`s. It constructs two `Vec<SelectionAction>` pipelines: one for a one-time continue, and one that first sends `UpdateWorldWritableWarningAcknowledged(true)` and `PersistWorldWritableWarningAcknowledged` before applying the same profile-selection or approval-preset actions. If a preset is being applied, it also sends `SkipNextWorldWritableScan` to suppress an immediate duplicate warning. Finally it writes the popup into `self.bottom_pane.show_selection_view(...)` with two `SelectionItem`s and a standard footer hint.
+**Data flow**: It receives the permission preset or profile being applied, sample paths to display, a count of additional paths, and whether the scan failed. It builds a readable warning message, creates button choices, and attaches actions to each choice. Choosing continue may apply the requested permissions; choosing continue and do not warn again also records and persists the acknowledgement. The visible result is a selection panel in the chat bottom pane.
 
-**Call relations**: This method is the concrete UI endpoint for the world-writable warning path. It delegates profile-changing behavior to `Self::permission_profile_selection_actions` or `Self::approval_preset_actions` depending on whether the caller is changing permissions directly or applying a preset, and it is designed so those downstream policy-change hooks do not re-trigger the same warning before acknowledgement is recorded.
+**Call relations**: This function is part of the broader permission-change flow. It uses shared action builders for permission-profile selections and approval presets, so the warning acknowledgement happens before the permission change is applied and does not immediately trigger the same warning again.
 
 *Call graph*: calls 2 internal fn (from, with); 9 external calls (new, default, from, new, approval_preset_actions, permission_profile_selection_actions, new, format!, vec!).
 
@@ -4315,11 +4829,11 @@ fn open_windows_sandbox_enable_prompt(
     )
 ```
 
-**Purpose**: Shows the primary Windows sandbox setup prompt that asks the user to configure the default elevated sandbox, optionally choose the non-admin sandbox, or quit. It also records telemetry for prompt display and each user choice.
+**Purpose**: This shows the first setup prompt for the Windows sandbox. It explains why the sandbox is needed and lets the user start Administrator setup, choose the non-admin sandbox if allowed, or quit.
 
-**Data flow**: It takes a required `ApprovalPreset` and optional `PermissionProfileSelection`, increments the `codex.windows_sandbox.elevated_prompt_shown` counter on `self.session_telemetry`, computes `allow_unelevated` and `setup_choice_is_required`, and builds a `ColumnRenderable` header with different explanatory text depending on policy. It then creates `SelectionItem`s whose closures clone telemetry and input state, emit counters for accept/legacy/quit, and send `AppEvent::BeginWindowsSandboxElevatedSetup`, `AppEvent::BeginWindowsSandboxLegacySetup`, or `AppEvent::Exit(ExitMode::ShutdownFirst)`. The popup is installed into `self.bottom_pane.show_selection_view`, and when setup is mandatory its `on_cancel` closure re-sends `AppEvent::OpenWindowsSandboxEnablePrompt` with the same preset and profile selection.
+**Data flow**: It receives the approval preset and optional permission profile selection that should be applied after setup. It records telemetry that the prompt was shown, checks whether non-admin mode is allowed, checks whether setup is required, builds the prompt text and choices, and displays them. Button actions send app events to begin elevated setup, begin legacy non-admin setup, or exit the app.
 
-**Call relations**: This prompt is opened by `maybe_prompt_windows_sandbox_enable` when startup or a policy transition determines setup must happen now. Internally it depends on `windows_sandbox_mode_allowed` and `elevated_windows_sandbox_setup_required` to decide which choices are legal and whether cancel should loop back into the same prompt.
+**Call relations**: The automatic setup checker calls this when Codex detects that Windows sandbox setup is needed. Inside the prompt, it calls the mode-allowed and elevated-setup-required helpers to decide which choices to show and whether canceling the popup should reopen it.
 
 *Call graph*: calls 3 internal fn (elevated_windows_sandbox_setup_required, windows_sandbox_mode_allowed, new); called by 1 (maybe_prompt_windows_sandbox_enable); 5 external calls (new, default, new, clone, vec!).
 
@@ -4334,11 +4848,11 @@ fn open_windows_sandbox_fallback_prompt(
     )
 ```
 
-**Purpose**: Shows the recovery prompt after elevated sandbox setup fails, offering retry, optional fallback to the non-admin sandbox, or quit. It mirrors the enable prompt but with failure-specific messaging and telemetry keys.
+**Purpose**: This shows the recovery prompt after Administrator-based sandbox setup fails. It gives the user a clear next step: try again, use the non-admin sandbox if allowed, or quit.
 
-**Data flow**: The function receives an `ApprovalPreset` and optional `PermissionProfileSelection`, recomputes `allow_unelevated` and `setup_choice_is_required`, and builds a list of `line![]` messages headed by a bold failure sentence. It wraps those lines in a `Paragraph` inside a `ColumnRenderable`, then creates selection items whose closures emit fallback-specific telemetry counters and send `BeginWindowsSandboxElevatedSetup`, `BeginWindowsSandboxLegacySetup`, or `Exit(ShutdownFirst)`. As with the enable prompt, it writes the assembled `SelectionViewParams` to `self.bottom_pane`, and if setup remains mandatory it installs an `on_cancel` closure that reopens the fallback prompt.
+**Data flow**: It receives the same preset and optional profile selection that would be used after setup. It checks whether non-admin mode is allowed and whether setup is mandatory, builds an explanation of the failure, and creates choices. The choices send events to retry elevated setup, start non-admin setup, or exit.
 
-**Call relations**: This method is used after an elevated setup attempt fails and the UI needs to keep the user in a constrained decision loop. Like the initial prompt, it relies on `windows_sandbox_mode_allowed` and `elevated_windows_sandbox_setup_required` to decide whether the legacy path is available and whether cancel should be converted into a retry prompt.
+**Call relations**: This function is used by the Windows sandbox setup flow after elevated setup does not succeed. Like the initial prompt, it depends on the mode-allowed and setup-required checks so it can avoid offering a forbidden fallback and can reopen itself if the user cancels while a required choice remains unresolved.
 
 *Call graph*: calls 3 internal fn (elevated_windows_sandbox_setup_required, windows_sandbox_mode_allowed, new); 7 external calls (new, default, new, new, line!, clone, vec!).
 
@@ -4349,11 +4863,11 @@ fn open_windows_sandbox_fallback_prompt(
 fn maybe_prompt_windows_sandbox_enable(&mut self, _show_now: bool)
 ```
 
-**Purpose**: Conditionally opens the initial sandbox enable prompt when the current configuration indicates sandboxing is disabled or elevated setup is still incomplete. It is the lightweight gate that prevents the prompt from appearing unless the caller explicitly asks to show it now.
+**Purpose**: This is the quick check that decides whether to show the Windows sandbox setup prompt right now. It prevents Codex from silently continuing when the configured sandbox is missing or incomplete.
 
-**Data flow**: It reads the effective level from `crate::windows_sandbox::level_from_config(&self.config)`, computes `setup_is_required` by comparing against `WindowsSandboxLevel::Disabled` and `self.elevated_windows_sandbox_setup_required()`, and checks the `show_now` flag. If all conditions hold, it searches `builtin_approval_presets()` for the preset whose `id` is `"auto"`; when found, it invokes `self.open_windows_sandbox_enable_prompt(preset, None)`.
+**Data flow**: It receives a flag saying whether the prompt should be shown immediately. It reads the configured Windows sandbox level, checks whether setup is required, looks up the built-in automatic approval preset, and if all conditions match, opens the sandbox enable prompt.
 
-**Call relations**: This method is the entry gate into the sandbox setup prompting flow. It delegates the actual UI construction to `open_windows_sandbox_enable_prompt` and uses `elevated_windows_sandbox_setup_required` to avoid prompting when elevated setup has already been completed.
+**Call relations**: This sits upstream of the main sandbox prompt. It calls the configuration-level helper, the elevated-setup-required helper, and then hands control to the enable prompt when user action is needed.
 
 *Call graph*: calls 3 internal fn (elevated_windows_sandbox_setup_required, open_windows_sandbox_enable_prompt, level_from_config).
 
@@ -4364,11 +4878,11 @@ fn maybe_prompt_windows_sandbox_enable(&mut self, _show_now: bool)
 fn show_windows_sandbox_setup_status(&mut self)
 ```
 
-**Purpose**: Switches the chat UI into a temporary setup-in-progress state while Windows sandbox installation runs. It prevents accidental message submission under an unexpected sandbox mode and surfaces a persistent status indicator.
+**Purpose**: This updates the chat UI while Windows sandbox setup is running. It tells the user setup may take a few minutes and prevents them from typing new work during that uncertain state.
 
-**Data flow**: The method mutates `self.bottom_pane` to disable composer input with the placeholder `Input disabled until setup completes.`, ensures a status indicator exists, and hides the interrupt hint. It then calls `self.set_status(...)` with the title `Setting up sandbox...`, a secondary line `Hang tight, this may take a few minutes`, capitalization settings, and the default max-line limit, and finally requests a redraw.
+**Data flow**: It changes the bottom pane so the message composer is disabled, shows a status indicator, hides the interrupt hint, sets a status message, and requests a redraw. The result is a visible “setting up sandbox” state and temporarily blocked input.
 
-**Call relations**: This is used during the active setup phase after the user has chosen a sandbox setup action. It does not delegate further business logic; instead it prepares the visible TUI state so asynchronous setup work elsewhere can proceed without conflicting user input.
+**Call relations**: The surrounding Windows setup flow calls this when elevated sandbox setup begins. It does not start setup itself; it only makes the interface match the setup state.
 
 
 ##### `ChatWidget::clear_windows_sandbox_setup_status`  (lines 510–510)
@@ -4377,22 +4891,24 @@ fn show_windows_sandbox_setup_status(&mut self)
 fn clear_windows_sandbox_setup_status(&mut self)
 ```
 
-**Purpose**: Restores normal chat input and removes the setup status indicator after sandbox setup finishes or aborts. It is the inverse of the setup-in-progress UI state.
+**Purpose**: This restores the chat UI after Windows sandbox setup finishes or stops. It gives typing control back to the user and removes the setup indicator.
 
-**Data flow**: It re-enables composer input on `self.bottom_pane` with no placeholder, hides the status indicator, and requests a redraw. No value is returned.
+**Data flow**: It re-enables the message composer, clears the temporary placeholder text, hides the status indicator, and requests a redraw. The interface returns from setup mode to normal chat mode.
 
-**Call relations**: This method is called when the setup flow exits and the widget should return to ordinary interaction. It complements `show_windows_sandbox_setup_status` by undoing the temporary UI restrictions that method imposed.
+**Call relations**: The surrounding setup flow calls this after setup is no longer in progress. It is the cleanup partner to the setup-status function.
 
 
 ### `tui/src/chatwidget/tool_requests.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This module is the blocking-decision side of `ChatWidget`: whenever the backend needs the user or guardian to approve, answer, or grant permissions, these methods create the corresponding bottom-pane request surface and keep transcript/status state coherent. The lightweight `on_*` entrypoints all record visible turn activity and use `defer_or_handle` so requests can be queued during replay or thread transitions and rendered later by `handle_*_now` methods.
+This module turns incoming “tool request” events into visible, interactive prompts inside `ChatWidget`, the main chat user interface. Think of it like a receptionist desk: when a request arrives, this code decides whether to put it in a waiting queue or show it immediately, then makes sure the user sees the right card, notification, and status message.
 
-`on_guardian_assessment` is the most involved path. It derives human-readable summaries from `GuardianAssessmentAction`, including shell-joined commands, patch file counts, network targets, MCP tool labels, and permission-request reasons. In-progress assessments temporarily own the footer status via `pending_guardian_review_status`, aggregating parallel reviews into one indicator and showing the interrupt hint. Terminal assessments first remove their pending footer entry, restore or downgrade the status header if needed, then append an approved, timed-out, or denied history cell. Denials are also pushed into `review.recent_auto_review_denials` for later UX flows.
+Most request types follow the same pattern. First, the widget records that something visible happened in the current conversation. Then it either defers the request, if the UI is not ready to interrupt yet, or handles it right away. Handling usually means stopping any streaming assistant text cleanly, building an approval or input request, pushing it into the bottom pane, showing a “waiting” pet notification, and asking the screen to redraw.
 
-The immediate handlers all flush streamed assistant output before presenting a blocking prompt. They construct typed `ApprovalRequest` values for exec, patch, permissions, and fallback elicitation forms; route richer elicitation requests either into app-link views or MCP-specific forms; emit desktop/ambient notifications; and set the pet notification to `Waiting`. A notable design choice is that unsupported URL elicitation requests are auto-declined through `app_event_tx.resolve_elicitation` rather than leaving an unusable prompt on screen.
+The most detailed path is guardian assessment. A guardian is an automatic reviewer that can approve, deny, or time out actions. While review is still happening, this file updates the live status footer so the user knows what is being checked. When the review ends, it removes that pending status and writes a final history entry saying whether the action was approved, denied, or timed out.
+
+This file matters because tool use is where safety and user control meet the chat interface. It makes sensitive actions explicit instead of hidden.
 
 #### Function details
 
@@ -4402,11 +4918,11 @@ The immediate handlers all flush streamed assistant output before presenting a b
 fn on_exec_approval_request(&mut self, _id: String, ev: ExecApprovalRequestEvent)
 ```
 
-**Purpose**: Receives an execution-approval request and routes it through deferred or immediate handling. It preserves the event for whichever path is taken.
+**Purpose**: Receives a request asking whether the assistant may run a command. It records that the conversation has visible activity, then either queues the request or shows it immediately.
 
-**Data flow**: Takes an unused request id and an `ExecApprovalRequestEvent`, records visible-turn activity, clones the event, then either pushes the original into the deferred queue or passes the clone to the immediate approval handler. It mutates queue or UI state and returns nothing.
+**Data flow**: A request id and an execution approval event come in. The id is not used here, but the event is cloned so one copy can be stored in a queue if needed and another can be used for immediate display. The result is not a returned value; the chat widget is changed by either adding the request to a pending queue or opening the approval prompt.
 
-**Call relations**: Called when the backend asks for command approval. If the widget is ready to render immediately it delegates to `ChatWidget::handle_exec_approval_now`; otherwise it stores the event for later replay.
+**Call relations**: This is the first stop for command approval events inside the chat UI. It prepares the event, using `clone` so the same information can safely travel down either path, and hands the actual immediate work to `ChatWidget::handle_exec_approval_now` when the widget is ready.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4421,11 +4937,11 @@ fn on_apply_patch_approval_request(
     )
 ```
 
-**Purpose**: Receives an apply-patch approval request and routes it through the same defer-or-handle path used for other blocking prompts. It ensures patch approval can be shown later if immediate rendering is unsafe.
+**Purpose**: Receives a request asking whether the assistant may apply a patch, meaning make file edits. It makes sure the edit approval is either saved for later or shown to the user now.
 
-**Data flow**: Accepts an unused id and an `ApplyPatchApprovalRequestEvent`, records visible-turn activity, clones the event, and either queues the original or immediately handles the clone. It writes queue or bottom-pane state and returns nothing.
+**Data flow**: An unused request id and an apply-patch event come in. The event is copied so it can be placed into the deferred-request queue or passed into the immediate handler. The function changes the widget state by scheduling or displaying an edit approval prompt.
 
-**Call relations**: Invoked when patch application requires approval. It delegates immediate rendering to `ChatWidget::handle_apply_patch_approval_now`.
+**Call relations**: This is the entry point for patch approval events in this file. It uses `clone` to keep the event available for both possible paths, then relies on `ChatWidget::handle_apply_patch_approval_now` to build the visible prompt when immediate handling is allowed.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4436,11 +4952,11 @@ fn on_apply_patch_approval_request(
 fn on_guardian_assessment(&mut self, ev: GuardianAssessmentEvent)
 ```
 
-**Purpose**: Processes guardian review lifecycle events, updating the live footer while review is pending and appending final approved/denied/timed-out transcript cells when the review completes. It also tracks recent automatic denials for later review UX.
+**Purpose**: Updates the UI when the automatic guardian reviewer starts, finishes, approves, denies, or times out an action. It keeps the live status footer honest while review is pending and writes a final history message when there is a decision.
 
-**Data flow**: Consumes a `GuardianAssessmentEvent`, derives helper closures to summarize actions and reconstruct command vectors, then branches on `ev.status`. For `InProgress`, it ensures a status indicator exists, shows the interrupt hint, updates `status_state.pending_guardian_review_status`, possibly calls `set_status`, requests redraw, and returns. For terminal states, it removes the pending footer entry, restores or downgrades the current status header if needed, then builds a history cell based on action type and status: command-like actions use `new_approval_decision_cell`, while patch/network/MCP/permission actions use guardian-specific approved, denied, or timed-out cell constructors. Denied events are cloned into `self.review.recent_auto_review_denials`. It appends the boxed history cell, requests redraw, and returns.
+**Data flow**: A guardian assessment event comes in with an action, a status, and an id. The function turns the action into a readable summary, such as a command line, a file patch summary, or a network target. If the status is still in progress, it updates the footer and redraws. If the status is final, it removes the pending footer entry, creates the correct history cell for approved, denied, or timed-out review, records denial details when needed, and redraws the screen.
 
-**Call relations**: This function is called directly on guardian assessment events rather than via a separate `handle_*_now` helper. It owns both the transient footer-status flow and the terminal transcript-rendering flow, delegating cell construction to the various `history_cell` constructors depending on action/status.
+**Call relations**: This function sits between the automatic review system and the visible conversation history. It calls formatting helpers such as `format!` and command joining/splitting helpers to make readable text, then calls history-cell builders like `new_approval_decision_cell`, `new_guardian_approved_action_request`, `new_guardian_denied_action_request`, `new_guardian_denied_patch_request`, `new_guardian_timed_out_action_request`, and `new_guardian_timed_out_patch_request` so the final decision appears as a normal chat history item.
 
 *Call graph*: 12 external calls (from, format!, new_approval_decision_cell, new_guardian_approved_action_request, new_guardian_denied_action_request, new_guardian_denied_patch_request, new_guardian_timed_out_action_request, new_guardian_timed_out_patch_request, clone, to_string (+2 more)).
 
@@ -4455,11 +4971,11 @@ fn on_elicitation_request(
     )
 ```
 
-**Purpose**: Receives an MCP server elicitation request and routes it through deferred or immediate handling. It preserves both the request id and params for whichever path executes.
+**Purpose**: Receives a request from an MCP server asking the user for extra information. MCP means “Model Context Protocol,” a way for external tools or services to talk with the app.
 
-**Data flow**: Takes an `AppServerRequestId` and `McpServerElicitationRequestParams`, records visible-turn activity, clones both values, and either queues the originals or immediately handles the clones. It mutates queue or prompt state and returns nothing.
+**Data flow**: A server request id and request parameters come in. Both are cloned so the request can either be queued or handled immediately. The widget then either stores the request for later or starts showing the user the right kind of elicitation UI.
 
-**Call relations**: Called when an MCP server asks the user for additional information. If immediate rendering is possible it delegates to `ChatWidget::handle_elicitation_request_now`.
+**Call relations**: This is the front door for MCP elicitation requests. It uses `clone` to preserve the incoming id and parameters across the deferred-or-immediate choice, and it hands immediate work to `ChatWidget::handle_elicitation_request_now`.
 
 *Call graph*: 2 external calls (clone, clone).
 
@@ -4470,11 +4986,11 @@ fn on_elicitation_request(
 fn on_request_user_input(&mut self, ev: ToolRequestUserInputParams)
 ```
 
-**Purpose**: Receives a generic tool-driven user-input request and routes it through deferred or immediate handling. It is the entrypoint for plan-mode question prompts and similar multi-question requests.
+**Purpose**: Receives a request for the user to answer one or more questions, such as a planning prompt. It ensures the questions are queued or displayed in the bottom pane.
 
-**Data flow**: Consumes `ToolRequestUserInputParams`, records visible-turn activity, clones the event, and either queues the original or immediately handles the clone. It writes queue or bottom-pane state and returns nothing.
+**Data flow**: A user-input request event comes in. The event is copied so one version can be queued and one can be used immediately. The widget state changes by either saving the prompt for later or opening it for the user.
 
-**Call relations**: Invoked when the backend requests explicit user answers. It delegates immediate prompt creation to `ChatWidget::handle_request_user_input_now`.
+**Call relations**: This function is the intake point for user-question prompts. It uses `clone` before the deferred-or-immediate split, and the immediate path continues in `ChatWidget::handle_request_user_input_now`.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4485,11 +5001,11 @@ fn on_request_user_input(&mut self, ev: ToolRequestUserInputParams)
 fn on_request_permissions(&mut self, ev: RequestPermissionsEvent)
 ```
 
-**Purpose**: Receives a permissions request event and routes it through deferred or immediate handling. It mirrors the approval-request entrypoints for permission grants.
+**Purpose**: Receives a request asking the user to grant extra permissions. It makes sure that permission request is either queued or shown as an approval card.
 
-**Data flow**: Takes a `RequestPermissionsEvent`, records visible-turn activity, clones it, and either queues the original or immediately handles the clone. It mutates queue or approval UI state and returns nothing.
+**Data flow**: A permissions event comes in. The event is cloned so it can safely go into the pending queue or into immediate processing. The output is a changed UI state: either a stored request or a visible permission approval prompt.
 
-**Call relations**: Called when the backend asks for environment permissions. It delegates immediate rendering to `ChatWidget::handle_request_permissions_now`.
+**Call relations**: This is the intake method for permission requests. It uses `clone` before choosing between waiting and immediate handling, and it delegates the immediate display work to `ChatWidget::handle_request_permissions_now`.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4500,11 +5016,11 @@ fn on_request_permissions(&mut self, ev: RequestPermissionsEvent)
 fn handle_exec_approval_now(&mut self, ev: ExecApprovalRequestEvent)
 ```
 
-**Purpose**: Immediately presents an execution approval request in the bottom pane and emits a notification summarizing the command. It packages the backend event into the widget’s internal `ApprovalRequest::Exec` form.
+**Purpose**: Shows the user an approval prompt for running a command. It also sends a notification so the request is noticeable outside the immediate chat text.
 
-**Data flow**: Consumes an `ExecApprovalRequestEvent`, flushes streamed answer output, shell-joins `ev.command` for notification text with a fallback plain join, notifies `ExecApprovalRequested`, computes `available_decisions` and effective approval id from the event, constructs `ApprovalRequest::Exec` using the current thread id plus reason/network/additional-permission context, pushes it into `bottom_pane`, sets the ambient pet notification to `Waiting`, requests redraw, and returns nothing.
+**Data flow**: An execution approval event comes in with the command, reason, available choices, and related permission context. The function first separates it from any streaming assistant answer, then formats the command into readable shell-style text using `try_join`. It builds an `ApprovalRequest::Exec`, pushes it into the bottom pane, marks the ambient pet as waiting, and requests a redraw.
 
-**Call relations**: Reached from `ChatWidget::on_exec_approval_request` when immediate handling is allowed. It delegates decision normalization to the event’s `effective_*` helpers and uses the bottom pane as the actual approval surface.
+**Call relations**: This is called after `ChatWidget::on_exec_approval_request` decides the request should be handled now. It asks the event for its effective approval id and available decisions through `effective_approval_id` and `effective_available_decisions`, then hands the completed approval request to the bottom pane where the user can approve or deny it.
 
 *Call graph*: calls 2 internal fn (effective_approval_id, effective_available_decisions); 1 external calls (try_join).
 
@@ -4515,11 +5031,11 @@ fn handle_exec_approval_now(&mut self, ev: ExecApprovalRequestEvent)
 fn handle_apply_patch_approval_now(&mut self, ev: ApplyPatchApprovalRequestEvent)
 ```
 
-**Purpose**: Immediately presents an apply-patch approval request and emits an edit-approval notification listing the affected files. It wraps the backend event into `ApprovalRequest::ApplyPatch` with cwd context.
+**Purpose**: Shows the user an approval prompt for proposed file edits. It also sends an edit-approval notification that includes the working folder and changed files.
 
-**Data flow**: Consumes an `ApplyPatchApprovalRequestEvent`, flushes streamed answer output, constructs `ApprovalRequest::ApplyPatch` from the current thread id, call id, reason, cloned changes map, and cloned cwd, pushes it into the bottom pane, sets the ambient pet notification to `Waiting`, requests redraw, and notifies `EditApprovalRequested` with cwd and the changed file paths collected from the map keys.
+**Data flow**: An apply-patch event comes in with a call id, reason, and proposed changes. The function stops any streaming answer cleanly, builds an `ApprovalRequest::ApplyPatch` using the current working directory, pushes it into the bottom pane, sets the waiting pet notification, redraws, and notifies about the edit request.
 
-**Call relations**: Reached from `ChatWidget::on_apply_patch_approval_request` for immediate rendering. It does not branch further; the bottom pane owns the actual approval interaction.
+**Call relations**: This is the immediate path used by `ChatWidget::on_apply_patch_approval_request`. It turns raw patch-event data into a UI approval card and hands it to the bottom pane, which is the part of the interface where users make decisions.
 
 
 ##### `ChatWidget::handle_elicitation_request_now`  (lines 338–395)
@@ -4532,11 +5048,11 @@ fn handle_elicitation_request_now(
     )
 ```
 
-**Purpose**: Immediately presents or resolves an MCP elicitation request, choosing among app-link views, MCP-specific forms, generic approval prompts, or automatic decline for unsupported URL requests. It also emits a notification naming the requesting server.
+**Purpose**: Shows the right user interface for an MCP server’s request for more information. Depending on the request, it may open an app-link view, show a form, show a simple approval-style prompt, or decline an unsupported URL request.
 
-**Data flow**: Takes a request id and `McpServerElicitationRequestParams`, flushes streamed answer output, notifies `ElicitationRequested`, derives a `ThreadId` from `params.thread_id` with fallback to the current thread id, then tries three paths in order: build `AppLinkViewParams` and open an app-link view; build an `McpServerElicitationFormRequest` and push it to the bottom pane; or fall back on the raw request variant. For `Form`, it constructs `ApprovalRequest::McpElicitation` and pushes it as an approval request. For `Url`, it immediately resolves the elicitation through `app_event_tx` with a `Decline` action and no content/meta. Finally it sets the ambient pet notification to `Waiting`, requests redraw, and returns.
+**Data flow**: A request id and MCP elicitation parameters come in. The function stops any streaming answer, notifies the user, converts the thread id string into a real thread id with `from_string`, and then tries several display options in order. It first tries to create an app-link view with `from_url_app_server_request`; if that does not fit, it tries to create a form request with `from_app_server_request`; if that also does not fit, it either creates a simpler approval request for a form message or automatically declines a URL-style request. It finishes by setting the waiting notification and redrawing.
 
-**Call relations**: This is the immediate handler used by `ChatWidget::on_elicitation_request`. It delegates request-shape detection to `AppLinkViewParams::from_url_app_server_request` and `McpServerElicitationFormRequest::from_app_server_request` before falling back to generic handling.
+**Call relations**: This is called by `ChatWidget::on_elicitation_request` when the request can be shown now. It uses `clone` when the same request id or parameters are needed in more than one conversion attempt, and it routes the final result either to an app-link view, the bottom pane’s MCP form flow, the bottom pane’s approval flow, or the app event sender for an automatic decline.
 
 *Call graph*: calls 3 internal fn (from_string, from_url_app_server_request, from_app_server_request); 2 external calls (clone, clone).
 
@@ -4547,11 +5063,11 @@ fn handle_elicitation_request_now(
 fn push_approval_request(&mut self, request: ApprovalRequest)
 ```
 
-**Purpose**: Pushes a prebuilt approval request into the bottom pane and updates waiting-state UI affordances. It is a small convenience wrapper used by other chat-widget flows.
+**Purpose**: Adds an already-built approval request to the bottom pane and makes the UI visibly wait for the user. This is a small convenience method for code that has already created the request object.
 
-**Data flow**: Accepts an `ApprovalRequest`, forwards it to `bottom_pane.push_approval_request` with feature flags, sets the ambient pet notification to `Waiting`, requests redraw, and returns nothing.
+**Data flow**: An approval request comes in. The function gives it to the bottom pane, along with feature flags from the current configuration, then sets the ambient pet notification to waiting and asks the interface to redraw. Nothing is returned; the widget display state is updated.
 
-**Call relations**: This helper is used by callers that already constructed an `ApprovalRequest` and only need the standard bottom-pane/pet/redraw side effects.
+**Call relations**: Other parts of the chat widget can use this when they already have an `ApprovalRequest` ready. It centralizes the final UI steps so approval prompts consistently appear in the bottom pane with the same waiting signal and redraw behavior.
 
 
 ##### `ChatWidget::push_mcp_server_elicitation_request`  (lines 407–418)
@@ -4563,11 +5079,11 @@ fn push_mcp_server_elicitation_request(
     )
 ```
 
-**Purpose**: Pushes a prebuilt MCP server elicitation form request into the bottom pane and applies the standard waiting-state UI updates. It parallels `push_approval_request` for the MCP-specific request type.
+**Purpose**: Adds an MCP server form request to the bottom pane and marks the UI as waiting for the user. It is the direct path for elicitation requests that have already been converted into form UI data.
 
-**Data flow**: Consumes an `McpServerElicitationFormRequest`, forwards it to `bottom_pane.push_mcp_server_elicitation_request`, sets the ambient pet notification to `Waiting`, requests redraw, and returns nothing.
+**Data flow**: An MCP elicitation form request comes in. The function pushes it into the bottom pane, sets the ambient pet notification to waiting, and requests a redraw. It returns nothing, but the user now has a visible form to answer.
 
-**Call relations**: Used by flows that already converted an app-server elicitation into the widget’s MCP form-request type and only need to surface it consistently.
+**Call relations**: This helper is used when a request is already in the bottom pane’s form-request shape. It keeps MCP form prompts consistent with other waiting prompts by using the same pet notification and redraw steps.
 
 
 ##### `ChatWidget::handle_request_user_input_now`  (lines 420–436)
@@ -4576,11 +5092,11 @@ fn push_mcp_server_elicitation_request(
 fn handle_request_user_input_now(&mut self, ev: ToolRequestUserInputParams)
 ```
 
-**Purpose**: Immediately presents a user-input questionnaire in the bottom pane and emits a plan-mode prompt notification summarizing the request. It derives a concise title from the number and content of questions.
+**Purpose**: Shows one or more questions that the assistant wants the user to answer. It also creates a clear notification title, such as a single-question summary or “3 questions requested.”
 
-**Data flow**: Consumes `ToolRequestUserInputParams`, flushes streamed answer output, counts `ev.questions`, derives an optional summary via `Notification::user_input_request_summary`, chooses a title based on question count and summary availability, notifies `PlanModePrompt { title }`, pushes the request into `bottom_pane`, sets the ambient pet notification to `Waiting`, requests redraw, and returns nothing.
+**Data flow**: A user-input request comes in with a list of questions. The function stops any streaming answer, counts the questions, asks `user_input_request_summary` for a short readable summary when possible, builds a notification title using that summary or `format!`, pushes the request into the bottom pane, sets the waiting pet notification, and redraws.
 
-**Call relations**: Reached from `ChatWidget::on_request_user_input` when immediate handling is allowed. It delegates only the summary-string derivation; the bottom pane owns the actual answer UI.
+**Call relations**: This is the immediate handler used after `ChatWidget::on_request_user_input` accepts a prompt for display. It turns raw question data into both a notification and a bottom-pane input prompt, so the user sees that an answer is needed.
 
 *Call graph*: calls 1 internal fn (user_input_request_summary); 1 external calls (format!).
 
@@ -4591,11 +5107,11 @@ fn handle_request_user_input_now(&mut self, ev: ToolRequestUserInputParams)
 fn handle_request_permissions_now(&mut self, ev: RequestPermissionsEvent)
 ```
 
-**Purpose**: Immediately presents a permissions approval request in the bottom pane. It wraps the backend event into the widget’s internal `ApprovalRequest::Permissions` form.
+**Purpose**: Shows an approval prompt for a request to grant permissions. This covers cases where the assistant or a tool needs extra access before it can continue.
 
-**Data flow**: Consumes a `RequestPermissionsEvent`, flushes streamed answer output, constructs `ApprovalRequest::Permissions` from current thread id, call id, environment id, reason, and requested permissions, pushes it into the bottom pane with feature flags, sets the ambient pet notification to `Waiting`, requests redraw, and returns nothing.
+**Data flow**: A permissions event comes in with a call id, environment id, reason, and requested permissions. The function stops any streaming answer, wraps the data into an `ApprovalRequest::Permissions`, pushes it into the bottom pane with current feature settings, marks the pet as waiting, and redraws the UI.
 
-**Call relations**: Reached from `ChatWidget::on_request_permissions` for immediate rendering. It is the terminal adapter from protocol event to bottom-pane approval surface.
+**Call relations**: This is called by `ChatWidget::on_request_permissions` when the permission request should be displayed immediately. It converts the incoming event into the shared approval-request format so the bottom pane can present it like the other user decisions.
 
 
 ### Hook review RPC
@@ -4603,9 +5119,13 @@ This helper module supports the hook-inspection approval path by fetching hook m
 
 ### `tui/src/hooks_rpc.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `startup and hook review interactions`
 
-This file is a small transport-oriented adapter between TUI code and the app-server protocol for hook review. It defines `HookTrustUpdate`, a compact value carrying the config key and current hash that should be trusted. `fetch_hooks_list` creates a unique `RequestId` using a UUID, sends a typed `ClientRequest::HooksList` through `AppServerRequestHandle`, and wraps failures with TUI-specific context. `hooks_list_entry_for_cwd` then extracts the `HooksListEntry` matching a given cwd from the server response, falling back to an empty entry with no hooks, warnings, or errors if the server omitted that cwd entirely. `hook_needs_review` centralizes the trust-state predicate used by selection and bulk-trust flows, treating only `Untrusted` and `Modified` hooks as reviewable. For writes, `write_hook_trusts` converts a batch of `HookTrustUpdate` values into a JSON object under `hooks.state`, where each key maps to `{ "trusted_hash": current_hash }`, and submits that as a `ConfigBatchWrite` edit using `MergeStrategy::Upsert` with config reload enabled. `write_hook_trust` is a single-item convenience wrapper over the batch API. The design keeps protocol details and request-id generation out of UI code while preserving typed responses and contextual error messages.
+Hooks are project-specific actions that can run as part of the tool’s workflow. Because a hook can change behavior, the TUI needs to show users when a hook is new or has changed, and let them mark it as trusted. This file keeps that server communication in one place.
+
+The flow is simple. First, `fetch_hooks_list` sends a typed request to the app server asking for the hooks that apply to a working directory. The server replies with a list grouped by directory. `hooks_list_entry_for_cwd` then picks the entry for the directory the TUI cares about, or creates an empty one if the server did not return it. That fallback keeps the rest of the interface from having to deal with a missing result.
+
+For each hook, `hook_needs_review` checks whether its trust status says it is untrusted or modified. If the user chooses to trust one or more hooks, `write_hook_trusts` turns those choices into a configuration write under `hooks.state`, storing the hook’s current hash as its trusted hash. A hash is a short fingerprint of the hook contents; trusting the hash means “I trust this exact version.” `write_hook_trust` is a convenience wrapper for saving just one hook.
 
 #### Function details
 
@@ -4618,11 +5138,11 @@ async fn fetch_hooks_list(
 ) -> Result<HooksListResponse>
 ```
 
-**Purpose**: Requests the hook inventory for one cwd from the app server and returns the typed response.
+**Purpose**: Asks the app server for the list of hooks that apply to one working directory. The TUI uses this when it needs to show hook status to the user, especially during startup review.
 
-**Data flow**: Consumes an `AppServerRequestHandle` and a `PathBuf` cwd, builds a UUID-backed `RequestId::String`, sends `ClientRequest::HooksList { params: HooksListParams { cwds: vec![cwd] } }`, awaits the typed response, and returns `Result<HooksListResponse>`. On failure it adds the message `hooks/list failed in TUI`.
+**Data flow**: It receives an app server request handle and a directory path. It creates a fresh request ID, wraps the directory in a hooks-list request, sends it through the typed server request channel, and awaits the reply. On success it returns the server’s hooks-list response; on failure it adds a clear TUI-specific error message.
 
-**Call relations**: Called by startup and interactive hook-loading flows before the UI can display hook review state. It delegates all transport work to `request_typed` and leaves response filtering to `hooks_list_entry_for_cwd`.
+**Call relations**: This is the first step when hook information is needed. `load_startup_hooks_review_entry` calls on it during startup review, and the call graph also records it as calling through the request machinery used to send the typed request to the server.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 2 (fetch_hooks_list, load_startup_hooks_review_entry); 3 external calls (String, format!, vec!).
 
@@ -4633,11 +5153,11 @@ async fn fetch_hooks_list(
 fn hooks_list_entry_for_cwd(response: HooksListResponse, cwd: &Path) -> HooksListEntry
 ```
 
-**Purpose**: Selects the `HooksListEntry` corresponding to the current working directory, or synthesizes an empty one if none exists.
+**Purpose**: Finds the hook-list result for one specific working directory. If the server did not include that directory, it returns a safe empty entry instead of making callers handle a missing value.
 
-**Data flow**: Consumes a `HooksListResponse` and borrows a `&Path`; iterates `response.data`, finds the first entry whose `cwd` matches, and returns it. If no match exists, it returns a new `HooksListEntry` with the requested cwd and empty `hooks`, `warnings`, and `errors` vectors.
+**Data flow**: It receives the full hooks-list response and the directory the TUI is interested in. It searches the response entries for a matching path. It returns the matching entry, or creates a new entry with the requested directory and empty hooks, warnings, and errors.
 
-**Call relations**: Used immediately after `fetch_hooks_list` by hook-loading code. It isolates callers from having to handle missing-cwd entries themselves.
+**Call relations**: After hook data has been fetched, `on_hooks_loaded` and `load_startup_hooks_review_entry` use this helper to narrow the larger server response down to the directory currently being reviewed or displayed.
 
 *Call graph*: called by 2 (on_hooks_loaded, load_startup_hooks_review_entry).
 
@@ -4648,11 +5168,11 @@ fn hooks_list_entry_for_cwd(response: HooksListResponse, cwd: &Path) -> HooksLis
 fn hook_needs_review(hook: &HookMetadata) -> bool
 ```
 
-**Purpose**: Determines whether a hook should appear in trust-review actions based on its trust status.
+**Purpose**: Answers the simple user-facing question: does this hook need attention before it should be trusted? It returns true for hooks that are new to the user or whose contents have changed since they were trusted.
 
-**Data flow**: Reads `hook.trust_status` from a borrowed `HookMetadata` and returns `true` only for `HookTrustStatus::Untrusted` or `HookTrustStatus::Modified`.
+**Data flow**: It receives one hook’s metadata, reads its trust status, and checks whether that status is `Untrusted` or `Modified`. It returns a boolean: true means the UI should treat the hook as needing review; false means it does not.
 
-**Call relations**: Invoked by selection and bulk-trust commands to decide which hooks are actionable. It centralizes the review predicate so UI flows stay consistent.
+**Call relations**: Selection and trust actions use this as their shared rule. `toggle_selected_hook`, `trust_selected_hook`, and `trust_all_hooks` call it so they only act on hooks that actually need review.
 
 *Call graph*: called by 3 (toggle_selected_hook, trust_all_hooks, trust_selected_hook); 1 external calls (matches!).
 
@@ -4666,11 +5186,11 @@ async fn write_hook_trusts(
 ) -> Result<ConfigWriteResponse>
 ```
 
-**Purpose**: Writes one or more trusted hook hashes into config under `hooks.state` using a batch config edit.
+**Purpose**: Saves trust decisions for one or more hooks into the user configuration. This is what makes the user’s choice persist after the TUI closes.
 
-**Data flow**: Consumes an `AppServerRequestHandle` and a vector of `HookTrustUpdate`; generates a UUID-backed request id; transforms updates into a `serde_json::Value::Object` mapping each key to `{ "trusted_hash": current_hash }`; wraps that in `ConfigBatchWriteParams` with one `ConfigEdit` targeting `hooks.state`, `MergeStrategy::Upsert`, `reload_user_config: true`; sends `ClientRequest::ConfigBatchWrite`; awaits and returns `Result<ConfigWriteResponse>` with contextual error wrapping.
+**Data flow**: It receives an app server request handle and a list of trust updates, where each update has a hook key and the hook’s current hash. It builds a JSON object mapping each hook key to its `trusted_hash`, then sends a batch config write request for `hooks.state` using an upsert strategy, meaning existing data is updated or created as needed. It returns the server’s config-write response, or an error with context if the write fails.
 
-**Call relations**: Called by bulk trust flows and by the single-item wrapper `write_hook_trust`. It is the main write path used when the TUI persists hook trust decisions.
+**Call relations**: This is the main save path for trust changes. Higher-level flows such as `trust_hooks`, `run_startup_hooks_review_app`, and the single-hook wrapper `write_hook_trust` call it when the user has approved hooks and the TUI needs to record that approval.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 3 (trust_hooks, write_hook_trust, run_startup_hooks_review_app); 4 external calls (String, format!, Object, vec!).
 
@@ -4685,10 +5205,10 @@ async fn write_hook_trust(
 ) -> Result<ConfigWriteResponse>
 ```
 
-**Purpose**: Convenience wrapper that writes trust for exactly one hook.
+**Purpose**: Saves trust for a single hook. It exists so callers with only one hook do not have to build a one-item update list themselves.
 
-**Data flow**: Consumes a request handle, one config key, and one current hash; packages them into a single `HookTrustUpdate` vector; forwards to `write_hook_trusts`; and returns the resulting `ConfigWriteResponse`.
+**Data flow**: It receives the app server request handle, one hook key, and that hook’s current hash. It wraps those two pieces of hook information into a `HookTrustUpdate`, puts it in a one-item list, and passes it to `write_hook_trusts`. It returns whatever response or error the multi-hook save function returns.
 
-**Call relations**: Used by single-hook trust actions. It exists to keep callers from manually constructing one-element batches.
+**Call relations**: `trust_hook` calls this when the user trusts one hook at a time. This function immediately hands the real work to `write_hook_trusts`, keeping single-hook and multi-hook saves on the same code path.
 
 *Call graph*: calls 1 internal fn (write_hook_trusts); called by 1 (trust_hook); 1 external calls (vec!).

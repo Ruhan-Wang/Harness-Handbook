@@ -1,8 +1,12 @@
 # Utility crate tests for path/URI and output truncation helpers  `stage-23.6.6`
 
-This stage is cross-cutting test infrastructure rather than part of startup, the main loop, or teardown: it verifies shared utility crates whose behavior must remain stable everywhere else in the system. Its role is to lock down low-level semantics that higher layers rely on for safe path handling and predictable output limiting.
+This stage is a behind-the-scenes safety check for shared utility code. It is not part of startup, the main work loop, or shutdown. Instead, it makes sure small helper libraries behave correctly before other parts of the system rely on them.
 
-utils/path-uri/src/tests.rs is the core executable specification for PathUri. It checks canonicalization, conversion to and from host-native paths, fallback URI encoding when a path cannot be represented natively, lexical path operations, serde round-trips, and the exact validation failures expected for malformed inputs. utils/path-uri/src/api_path_string_tests.rs builds on that foundation by testing LegacyAppPathString, the API-facing text wrapper over PathUri. Those tests confirm how native-looking path strings are rendered and parsed, how platform conventions are inferred, and how POSIX, Windows drive paths, UNC paths, and opaque fallback URIs behave in normal, lossy, and error cases. utils/output-truncation/src/truncate_tests.rs complements the path tests by pinning down truncation under byte and token budgets for both plain text and structured content items, ensuring user-visible output is shortened consistently without breaking format assumptions.
+The output truncation tests check the helper that shortens large results. This is like trimming a long receipt while keeping the important warning labels intact. The tests cover plain long text, mixed text and images, encrypted content, line limits, token estimates, and odd edge cases, so shortened output stays predictable and safe.
+
+The PathUri tests protect the type that represents local file paths as file:// addresses. They verify converting, saving, loading, joining, and parsing paths on Unix, Windows, and unusual inputs.
+
+The API path string tests check compatibility with an older path format. They make sure file URIs can move to and from that format, including spaces, percent-escaped characters, network shares, and invalid text. Together, these tests keep path handling and output trimming reliable across the whole project.
 
 ## Files in this stage
 
@@ -13,7 +17,11 @@ These tests verify how shared truncation helpers enforce byte and token limits f
 
 `test` · `test run`
 
-This test file documents the exact user-visible strings produced by the output-truncation helpers. The early tests focus on `formatted_truncate_text`, asserting both pass-through behavior under budget and the precise warning header plus middle-truncation marker when over budget. They also verify that the reported original line count reflects the untruncated input and that UTF-8 content is truncated safely without splitting code points. The larger structured-output tests cover both truncation strategies from the library: `truncate_function_output_items_with_policy` spends budget across multiple `InputText` items, preserves `InputImage` and `EncryptedContent` items untouched, truncates the first over-budget text item into a snippet, and appends an omission summary for later text items; `formatted_truncate_text_content_items_with_policy` instead merges all text items into one newline-separated block, emits a single warning-bearing `InputText`, and appends non-text items afterward. Several tests target subtle edge cases, such as empty leading text segments affecting merged line counts, token-budget truncation across multiple text items, and preservation of encrypted opaque payloads. The final test covers the signed byte-to-token conversion helper’s clamping behavior for negative and zero inputs. Together these tests serve as executable documentation for exact formatting, ordering, and omission semantics.
+This is a test file for the output-truncation code. That code is responsible for shortening tool or function output before it is shown or sent onward, so that very large output does not overwhelm the system. Think of it like trimming a long receipt: it keeps the beginning and end, adds a clear note about what was removed, and preserves important non-text attachments when needed.
+
+The tests cover two kinds of limits: byte limits, which are based on stored text size, and token limits, which are rough chunks of text used by language models. They check that short output is left alone, long output is shortened in the middle, and the warning message reports the original token count and number of lines. They also make sure truncation does not split multi-byte characters, such as emoji, in a broken way.
+
+The later tests focus on structured output made of separate content items. Some items are plain text, some are images, and some are encrypted opaque data. The tests confirm that text can be merged and truncated as one budget, while images and encrypted content are preserved rather than accidentally discarded or modified. Without these tests, a small change in truncation behavior could silently hide useful output, corrupt Unicode text, or drop important non-text content.
 
 #### Function details
 
@@ -23,11 +31,11 @@ This test file documents the exact user-visible strings produced by the output-t
 fn truncate_bytes_less_than_placeholder_returns_placeholder()
 ```
 
-**Purpose**: Verifies byte-budget truncation when the budget is smaller than the visible placeholder still returns the expected warning-prefixed placeholder form.
+**Purpose**: This test checks what happens when the byte limit is so tiny that even the usual kept text barely fits. It makes sure the user still gets a clear truncation warning and a placeholder showing that most of the content was removed.
 
-**Data flow**: It defines a short string, calls `formatted_truncate_text` with `TruncationPolicy::Bytes(1)`, and asserts exact equality with the expected warning header and `…13 chars truncated…t` body.
+**Data flow**: It starts with the text "example output" and asks the formatter to keep only one byte. The truncation code produces a warning plus a very small visible slice of the original text. The test compares that result with the exact expected message.
 
-**Call relations**: This test exercises the extreme low-byte-budget path of `formatted_truncate_text` and the underlying byte-based middle truncation.
+**Call relations**: During a Rust test run, the test harness calls this function. The function relies on the truncation formatter through the expression being checked, then uses the assertion macro to confirm the output matches the expected text exactly.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -38,11 +46,11 @@ fn truncate_bytes_less_than_placeholder_returns_placeholder()
 fn truncate_tokens_less_than_placeholder_returns_placeholder()
 ```
 
-**Purpose**: Verifies token-budget truncation under an extremely small token budget still produces the expected placeholder-style output.
+**Purpose**: This test checks the same tiny-limit situation as the byte test, but using a token limit. A token is a rough unit of text used for language-model budgeting, and the test confirms the warning still makes sense when the budget is smaller than the normal placeholder.
 
-**Data flow**: It passes `"example output"` to `formatted_truncate_text` with `TruncationPolicy::Tokens(1)` and asserts the exact warning-prefixed result string.
+**Data flow**: It gives the formatter "example output" with a one-token limit. The formatter returns a warning that includes the original token count and a shortened middle marker. The test compares the full returned string to the expected result.
 
-**Call relations**: This test covers the token-budget branch of `truncate_text` as surfaced through `formatted_truncate_text`.
+**Call relations**: The Rust test runner invokes this function. The test exercises the formatted truncation path and finishes by using the assertion macro to catch any change in the exact user-facing wording.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -53,11 +61,11 @@ fn truncate_tokens_less_than_placeholder_returns_placeholder()
 fn truncate_tokens_under_limit_returns_original()
 ```
 
-**Purpose**: Checks that token-budget formatting is a no-op when the content is comfortably under budget.
+**Purpose**: This test proves that text is not changed when it already fits within the token budget. That matters because truncation should only intervene when it is necessary.
 
-**Data flow**: It calls `formatted_truncate_text` on a short string with `TruncationPolicy::Tokens(10)` and asserts the returned string is exactly the original content.
+**Data flow**: It passes "example output" with a token limit large enough to contain it. The formatter should return the original string unchanged. The test checks that the before and after text are identical.
 
-**Call relations**: This test covers the early-return path in `formatted_truncate_text` where no warning header is added.
+**Call relations**: The test harness calls this function as part of the suite. It exercises the formatted truncation function in the no-op case and uses the assertion macro to verify that no warning or marker was added.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -68,11 +76,11 @@ fn truncate_tokens_under_limit_returns_original()
 fn truncate_bytes_under_limit_returns_original()
 ```
 
-**Purpose**: Checks that byte-budget formatting is a no-op when the content length is within the allowed byte budget.
+**Purpose**: This test confirms that byte-based truncation leaves short text untouched. It protects against accidentally adding warnings or changing content when the output is already small enough.
 
-**Data flow**: It calls `formatted_truncate_text` with `TruncationPolicy::Bytes(20)` on a shorter string and asserts exact equality with the original content.
+**Data flow**: It starts with "example output" and gives the formatter a byte limit larger than the text. The formatter returns the same text. The test compares the returned value with the original content.
 
-**Call relations**: This test covers the byte-budget early-return branch in `formatted_truncate_text`.
+**Call relations**: The Rust test runner calls this function. It checks the byte-limit no-op path and relies on the assertion macro to report a failure if the formatter changes the text.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -83,11 +91,11 @@ fn truncate_bytes_under_limit_returns_original()
 fn truncate_tokens_over_limit_returns_truncated()
 ```
 
-**Purpose**: Verifies the exact warning and truncation marker produced for an over-budget token-limited string.
+**Purpose**: This test checks that long text is shortened when it exceeds a token limit. It also verifies that the warning tells the reader how much was removed.
 
-**Data flow**: It formats a longer sentence with `TruncationPolicy::Tokens(5)` and asserts the exact expected warning header and token-truncated body.
+**Data flow**: It supplies a sentence that is longer than the five-token budget. The formatter keeps the beginning and end, inserts a marker saying how many tokens were removed, and adds a warning header. The test compares the whole formatted result with the expected string.
 
-**Call relations**: This test documents the visible output of token-based truncation through the formatted wrapper.
+**Call relations**: The test harness runs this function. It exercises the token-based truncation path and uses the assertion macro to make sure both the visible snippet and warning text stay stable.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -98,11 +106,11 @@ fn truncate_tokens_over_limit_returns_truncated()
 fn truncate_bytes_over_limit_returns_truncated()
 ```
 
-**Purpose**: Verifies the exact warning and truncation marker produced for an over-budget byte-limited string.
+**Purpose**: This test checks that long text is shortened when it exceeds a byte limit. It makes sure byte-based truncation reports removed characters in the user-facing marker.
 
-**Data flow**: It formats a longer sentence with `TruncationPolicy::Bytes(30)` and asserts the exact expected warning header and byte-truncated body.
+**Data flow**: It sends a long sentence through the formatter with a thirty-byte limit. The formatter keeps readable text from both ends, places a middle marker with the removed character count, and adds a warning. The test checks that exact output.
 
-**Call relations**: This test documents the visible output of byte-based truncation through the formatted wrapper.
+**Call relations**: The Rust test runner calls this function during the test suite. The function focuses on the byte-based truncation branch and uses the assertion macro to detect any change in behavior or wording.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -113,11 +121,11 @@ fn truncate_bytes_over_limit_returns_truncated()
 fn truncate_bytes_reports_original_line_count_when_truncated()
 ```
 
-**Purpose**: Checks that formatted byte truncation reports the original number of lines, not the line count of the truncated snippet.
+**Purpose**: This test makes sure a truncated multi-line output still reports how many lines the original output had. That helps a user understand the size of what was cut away.
 
-**Data flow**: It passes a two-line string to `formatted_truncate_text` with a small byte budget and asserts the warning header contains `Total output lines: 2` along with the expected truncated body.
+**Data flow**: It creates text with two lines and applies a byte limit that forces truncation. The formatter returns a warning that includes the original token count, the original line count, and the shortened text. The test verifies that the line count is reported as two.
 
-**Call relations**: This test targets the line-count bookkeeping in `formatted_truncate_text`.
+**Call relations**: The test harness invokes this function. It exercises formatted byte truncation for multi-line content and uses the assertion macro to confirm the exact warning and snippet.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -128,11 +136,11 @@ fn truncate_bytes_reports_original_line_count_when_truncated()
 fn truncate_tokens_reports_original_line_count_when_truncated()
 ```
 
-**Purpose**: Checks that formatted token truncation also reports the original line count correctly.
+**Purpose**: This test confirms that token-based truncation also reports the original number of lines. The reader should not lose that context just because the text was shortened.
 
-**Data flow**: It passes a two-line string to `formatted_truncate_text` with `TruncationPolicy::Tokens(10)` and asserts the exact warning-prefixed output string.
+**Data flow**: It starts with two-line content and applies a ten-token limit. The formatter shortens the text and adds a warning showing the original token count and total line count. The test checks the exact resulting message.
 
-**Call relations**: This test complements the byte-based line-count test for the token-budget branch.
+**Call relations**: The Rust test runner calls this test. It covers the multi-line token-limit path and uses the assertion macro to make sure the line-count reporting stays correct.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -143,11 +151,11 @@ fn truncate_tokens_reports_original_line_count_when_truncated()
 fn truncate_middle_bytes_handles_utf8_content()
 ```
 
-**Purpose**: Ensures byte-budget truncation respects UTF-8 boundaries and produces a valid string when multibyte characters are present.
+**Purpose**: This test checks that byte-based truncation handles Unicode text, such as emoji, without corrupting it. This matters because some characters take more than one byte, and cutting in the wrong place can produce invalid text.
 
-**Data flow**: It defines a string containing emoji and ASCII text, calls `truncate_text` with `TruncationPolicy::Bytes(20)`, and asserts the exact truncated output string.
+**Data flow**: It passes a string containing many emoji plus a second line into the lower-level truncation function with a twenty-byte limit. The function returns a shortened string that keeps whole emoji and normal text, with a marker in the middle. The test compares that output with the expected safe result.
 
-**Call relations**: This test directly exercises `truncate_text`’s byte branch and indirectly the UTF-8-safe behavior of `truncate_middle_chars`.
+**Call relations**: The test harness runs this function. Unlike the formatted warning tests, it calls the lower-level text truncation function directly with a byte policy, then uses the assertion macro to verify Unicode-safe behavior.
 
 *Call graph*: 3 external calls (assert_eq!, truncate_text, Bytes).
 
@@ -158,11 +166,11 @@ fn truncate_middle_bytes_handles_utf8_content()
 fn truncates_across_multiple_under_limit_texts_and_reports_omitted()
 ```
 
-**Purpose**: Verifies incremental token-budget truncation across multiple text items, preservation of images, and omission-summary generation for later text items.
+**Purpose**: This test checks truncation across a list of structured output items, not just one plain string. It makes sure several text pieces share one overall token budget, images are preserved, and omitted text items are summarized.
 
-**Data flow**: It builds several `InputText` items plus an `InputImage`, computes a token budget equal to three chunks, runs `truncate_function_output_items_with_policy`, and then inspects the output vector: first two text items unchanged, image preserved, fourth item truncated with a marker, and final summary mentioning two omitted text items.
+**Data flow**: It builds repeated text chunks, measures their approximate token cost, and creates a mixed list containing text items and an image item. It then applies a token limit that allows some early text through, forces a later text item to be shortened, and causes later text items to be omitted. The test checks that the first texts and image remain, the shortened text contains a truncation marker, and the final summary mentions the omitted text items.
 
-**Call relations**: This test exercises the main loop in `truncate_function_output_items_with_policy`, especially budget depletion, partial truncation of one item, and omission counting for subsequent text items.
+**Call relations**: The Rust test runner invokes this function. The test calls the token-count helper to size the budget, then calls the function-output item truncator. It uses assertions to verify the shape of the returned list and panics if an item appears in an unexpected form.
 
 *Call graph*: 7 external calls (assert!, assert_eq!, approx_token_count, truncate_function_output_items_with_policy, panic!, Tokens, vec!).
 
@@ -173,11 +181,11 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted()
 fn formatted_truncate_text_content_items_with_policy_returns_original_under_limit()
 ```
 
-**Purpose**: Checks that merged-text content-item formatting returns the original item list unchanged when the combined text fits the budget.
+**Purpose**: This test proves that structured text items are returned unchanged when they fit within the byte budget. It also checks that no original token count is reported when no truncation happened.
 
-**Data flow**: It constructs three `InputText` items, including an empty string, calls `formatted_truncate_text_content_items_with_policy` with a generous byte budget, and asserts the output equals the original items and the optional original token count is `None`.
+**Data flow**: It creates three text items, including an empty one, and applies a byte limit large enough for all of them. The formatting function returns the same list and no token-count metadata. The test compares both outputs with the expected unchanged values.
 
-**Call relations**: This test covers the under-budget early return in the merged-text content-item helper.
+**Call relations**: The test harness calls this function. It exercises the structured-content formatting function in the under-limit case and uses assertion checks to confirm both the content and the optional metadata.
 
 *Call graph*: 4 external calls (assert_eq!, formatted_truncate_text_content_items_with_policy, Bytes, vec!).
 
@@ -188,11 +196,11 @@ fn formatted_truncate_text_content_items_with_policy_returns_original_under_limi
 fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_text_behavior()
 ```
 
-**Purpose**: Verifies how an empty leading text item affects merged-text truncation and line counting when the combined content is over budget.
+**Purpose**: This test checks an edge case where the first text item is empty and the byte budget is zero. It makes sure the real text that follows is still counted and represented in the truncation warning.
 
-**Data flow**: It builds two text items, the first empty and the second `"abc"`, calls `formatted_truncate_text_content_items_with_policy` with zero byte budget, and asserts the output is a single warning-bearing `InputText` with the expected line count and truncation marker, plus `Some(1)` original token count.
+**Data flow**: It creates a list with an empty text item followed by "abc" and applies a zero-byte limit. The formatter merges the text for truncation, produces a warning-only text item with a marker showing three characters were removed, and reports the original token count. The test verifies both the returned item list and the token-count metadata.
 
-**Call relations**: This test targets a subtle edge case in the helper’s newline-joining behavior for multiple text segments.
+**Call relations**: The Rust test runner invokes this function. It calls the structured formatted truncation function with a byte policy and uses assertions to protect this subtle empty-leading-text behavior.
 
 *Call graph*: 4 external calls (assert_eq!, formatted_truncate_text_content_items_with_policy, Bytes, vec!).
 
@@ -203,11 +211,11 @@ fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_tex
 fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_images()
 ```
 
-**Purpose**: Checks that merged-text truncation collapses all text items into one warning-bearing text item while preserving images afterward.
+**Purpose**: This test checks that text items are combined for truncation while image items are kept afterward. It protects the rule that images should not consume the text budget or disappear when nearby text is shortened.
 
-**Data flow**: It constructs interleaved text and image items, calls `formatted_truncate_text_content_items_with_policy` with a small byte budget, and asserts the output contains one merged/truncated `InputText` followed by the two original `InputImage` items, with `Some(4)` original token count.
+**Data flow**: It builds a mixed list of text, image, text, text, and image. The formatter combines the text into one truncation candidate, shortens it to the byte budget, creates one warning text item, and then appends the original image items. The test verifies the final list and the reported original token count.
 
-**Call relations**: This test exercises the helper’s text extraction, newline joining, truncation, and non-text reattachment behavior.
+**Call relations**: The test harness calls this function. It exercises the structured formatted truncation function on mixed media content and uses assertions to check that text is merged while images survive unchanged.
 
 *Call graph*: 4 external calls (assert_eq!, formatted_truncate_text_content_items_with_policy, Bytes, vec!).
 
@@ -218,11 +226,11 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_ima
 fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content()
 ```
 
-**Purpose**: Verifies that merged-text truncation leaves encrypted content items untouched while replacing text with a single warning-bearing item.
+**Purpose**: This test makes sure encrypted content is preserved when nearby text is formatted and truncated. Encrypted content is opaque data, meaning the truncation code should not try to read or alter it.
 
-**Data flow**: It builds one `InputText` and one `EncryptedContent`, truncates with a tiny byte budget, and asserts the output contains the expected warning-bearing text item followed by the unchanged encrypted item, plus the original token count.
+**Data flow**: It creates one text item and one encrypted-content item, then applies a small byte limit. The formatter truncates the text into a warning item and leaves the encrypted item exactly as it was. The test checks the final list and confirms that the original token count is reported.
 
-**Call relations**: This test covers the branch in `formatted_truncate_text_content_items_with_policy` that preserves encrypted opaque payloads alongside truncated text.
+**Call relations**: The Rust test runner invokes this function. It calls the structured formatted truncation path and uses assertions to verify that only plain text is modified while encrypted content passes through untouched.
 
 *Call graph*: 4 external calls (assert_eq!, formatted_truncate_text_content_items_with_policy, Bytes, vec!).
 
@@ -233,11 +241,11 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
 fn truncate_function_output_items_with_policy_preserves_encrypted_content()
 ```
 
-**Purpose**: Verifies that per-item truncation preserves encrypted content items while truncating only text items.
+**Purpose**: This test checks the non-formatted structured truncation path for encrypted content. It ensures plain text may be shortened, but encrypted opaque data remains unchanged.
 
-**Data flow**: It builds one text item and one encrypted item, runs `truncate_function_output_items_with_policy` with a small byte budget, and asserts the output contains a truncated text snippet followed by the unchanged encrypted item.
+**Data flow**: It creates a text item and an encrypted-content item, then applies a small byte limit through the function-output truncator. The text item is shortened with a middle marker, while the encrypted item is copied as-is. The test compares the returned list with the expected result.
 
-**Call relations**: This test targets the non-text preservation branch in the iterative item-preserving truncation function.
+**Call relations**: The test harness calls this function. It exercises the lower-level function-output item truncator rather than the warning-formatting wrapper, then uses the assertion macro to confirm encrypted content is preserved.
 
 *Call graph*: 4 external calls (assert_eq!, truncate_function_output_items_with_policy, Bytes, vec!).
 
@@ -248,11 +256,11 @@ fn truncate_function_output_items_with_policy_preserves_encrypted_content()
 fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_budget()
 ```
 
-**Purpose**: Checks that token-budget merged-text truncation treats multiple text items as one combined text block.
+**Purpose**: This test confirms that multiple text items are treated as one combined text budget when truncating by tokens. That prevents each small piece from incorrectly escaping the overall limit.
 
-**Data flow**: It creates two text items, truncates them with `TruncationPolicy::Tokens(2)`, and asserts the output is a single warning-bearing `InputText` with the expected merged token-truncated body and `Some(5)` original token count.
+**Data flow**: It creates two separate text items and applies a two-token limit. The formatter combines their text, sees that the combined token count is too high, and returns one warning text item with a token-truncation marker. The test checks the output item and the original token count.
 
-**Call relations**: This test specifically documents token-budget behavior in `formatted_truncate_text_content_items_with_policy`, distinct from byte-budget merging.
+**Call relations**: The Rust test runner invokes this function. It calls the structured formatted truncation function with a token policy and uses assertions to verify that the token budget applies to all text together.
 
 *Call graph*: 4 external calls (assert_eq!, formatted_truncate_text_content_items_with_policy, Tokens, vec!).
 
@@ -263,11 +271,11 @@ fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_b
 fn byte_count_conversion_clamps_non_positive_values()
 ```
 
-**Purpose**: Tests the signed byte-to-token conversion helper’s clamping for negative and zero inputs and a normal positive conversion.
+**Purpose**: This test checks the helper that estimates tokens from a byte count. It makes sure negative and zero byte counts become zero tokens instead of producing a misleading or invalid estimate.
 
-**Data flow**: It calls `approx_tokens_from_byte_count_i64` with `-1`, `0`, and `5`, and asserts the results are `0`, `0`, and `2` respectively.
+**Data flow**: It calls the byte-to-token estimate helper with -1, 0, and 5 bytes. The expected results are 0, 0, and 2 tokens. The test compares each returned estimate with the expected value.
 
-**Call relations**: This test covers the guard and conversion behavior of the small numeric adapter function.
+**Call relations**: The test harness calls this function. It focuses on a small conversion helper used by truncation budgeting and uses assertion checks to guard its edge-case behavior.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -277,11 +285,9 @@ This sequence documents the core `PathUri` behavior first and then the higher-le
 
 ### `utils/path-uri/src/tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file tests `PathUri` directly, independent of the API-path-string layer. The suite covers both ordinary hierarchical `file:` URIs and the special opaque fallback namespace used when native absolute paths cannot be represented as standard file URLs. Many tests are cross-platform, while Unix- and Windows-specific cases validate behavior that depends on native path encodings or host conversion rules.
-
-The tests establish several key invariants. Canonicalization collapses spelling aliases like uppercase `FILE:` and `file://localhost/...` into one form. `PathUri::from_abs_path` and `to_abs_path` round-trip ordinary absolute paths and also round-trip fallback URIs for POSIX null-byte paths, Windows namespace prefixes, and non-Unicode Windows paths. Validation rejects unsupported schemes, queries, fragments, encoded null bytes, malformed fallback payloads, and relative native paths during both direct construction and serde deserialization. Lexical helpers are pinned down separately: `basename` decodes URI segments, `parent` follows URI hierarchy while preserving authority, and `join` normalizes relative segments without letting `..` escape the root or turning encoded filename characters into URI metadata. Several tests also verify the convention inference heuristic, especially the intentional choice to treat drive-shaped `/C:/...` URIs as Windows. Together these tests define the crate's intended behavior more concretely than the API docs alone.
+PathUri sits at a tricky border: operating systems store paths in different formats, while tools often need a portable URI string such as file:///workspace/src/lib.rs. This test file makes sure that border does not leak surprises. It checks ordinary absolute paths, Windows drive paths, Unix paths, network share paths, and paths with spaces or percent signs. It also checks what happens when a native path cannot be written as a normal URI, such as a Unix path containing a null byte or a Windows path with special namespace prefixes. In those cases the library uses a special opaque fallback form, like putting an odd-shaped item into a sealed box instead of forcing it into the wrong drawer. The tests also confirm that unsafe or ambiguous input is rejected: relative paths, unsupported URI schemes, query strings, fragments, encoded null bytes, malformed fallback data, and absolute paths passed to join. Finally, it verifies user-facing path operations such as basename, parent, join, JSON serialization, and conversion back to a validated URL. Without these tests, small path-handling mistakes could break cross-platform workspaces, corrupt non-text paths, or silently treat a file name as URI metadata.
 
 #### Function details
 
@@ -291,11 +297,11 @@ The tests establish several key invariants. Canonicalization collapses spelling 
 fn file_uri_round_trips_an_absolute_path()
 ```
 
-**Purpose**: Checks the ordinary happy path from an absolute native path to `PathUri` and back. It also verifies the serialized URI spelling contains the expected `file:` prefix and percent-encoded space.
+**Purpose**: Checks the basic promise of PathUri: an absolute native path can become a file URI and then return to the same path. It also verifies that spaces are encoded in the URI string.
 
-**Data flow**: Builds a path under the current directory, converts it with `PathUri::from_abs_path`, reads `to_string()` for textual assertions, reparses that string with `PathUri::parse`, and converts the URI back with `to_abs_path()`, comparing both results to the originals.
+**Data flow**: It starts with the current working directory and adds a path containing a space. That absolute path is converted into a PathUri, turned into text, parsed back, and converted back into a native path. The expected result is that the URI text looks like a file URI and the final path is exactly the original path.
 
-**Call relations**: Run by the test harness as the baseline round-trip test for ordinary absolute paths, exercising both conversion directions and canonical string formatting.
+**Call relations**: The Rust test runner calls this as a basic end-to-end test. It exercises the main conversion entry point, from_abs_path, then checks that parsing and native-path conversion agree with that original conversion.
 
 *Call graph*: calls 2 internal fn (current_dir, from_abs_path); 2 external calls (assert!, assert_eq!).
 
@@ -306,11 +312,11 @@ fn file_uri_round_trips_an_absolute_path()
 fn non_native_uri_io_conversion_is_invalid_input()
 ```
 
-**Purpose**: Verifies that a syntactically valid foreign-platform `file:` URI cannot be converted into a native path on the current host. The exact sample URI differs by platform to ensure it is non-native.
+**Purpose**: Verifies that a URI shaped for another operating system is accepted as a URI but rejected when asked to become a native path. This prevents the library from pretending it can safely use a path format the current host does not understand.
 
-**Data flow**: Parses a UNC URI on Unix or a POSIX-root URI on Windows, calls `to_abs_path()` expecting an error, then compares the resulting `io::ErrorKind` and message against `InvalidInput` and the formatted invalid-path text.
+**Data flow**: It builds a file URI that is valid in general but not native to the current platform. It asks PathUri to convert it into an absolute local path. The expected output is an input error whose message names the current operating system.
 
-**Call relations**: Invoked by the test harness to pin down host-dependent failure behavior of `to_abs_path` for foreign URIs.
+**Call relations**: The test runner calls this to cover the boundary between portable URI parsing and host-specific path use. It relies on parse to accept the URI first, then checks that to_abs_path refuses the non-native conversion.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -321,11 +327,11 @@ fn non_native_uri_io_conversion_is_invalid_input()
 fn file_uri_parses_a_windows_path_on_any_host()
 ```
 
-**Purpose**: Ensures a Windows drive-style `file:` URI parses successfully regardless of the host OS. It confirms that lexical inspection remains URI-based rather than host-based.
+**Purpose**: Confirms that a Windows-style file URI can be parsed even on non-Windows machines. This matters when one system needs to inspect or display paths that came from another system.
 
-**Data flow**: Parses `file:///C:/Users/Alice%20Smith/src/main.rs`, then reads `encoded_path()`, `basename()`, and `to_string()` and compares each with the expected canonical values.
+**Data flow**: It gives PathUri a file URI with a Windows drive letter and an encoded space. The parsed object keeps the encoded path, reports the decoded file name, and prints back to the same canonical URI string.
 
-**Call relations**: Called by the test harness as a cross-platform parsing test for foreign Windows URI syntax.
+**Call relations**: The test runner uses this to prove that parse is not limited to the host operating system. It then checks read-only URI operations such as encoded_path, basename, and string rendering.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -336,11 +342,11 @@ fn file_uri_parses_a_windows_path_on_any_host()
 fn infers_path_conventions_from_uri_shape()
 ```
 
-**Purpose**: Tests `PathUri::infer_path_convention` across ordinary POSIX URIs, Windows drive URIs, UNC authorities, and opaque fallback URIs. It also covers an invalid fallback payload that should infer no convention.
+**Purpose**: Checks that PathUri can guess whether a file URI looks like a Unix-style path or a Windows-style path. This guess helps callers display or reason about foreign paths without carrying extra metadata.
 
-**Data flow**: Loops over URI strings and expected `Option<PathConvention>`, parses each URI, calls `infer_path_convention()`, and compares the result.
+**Data flow**: It feeds several URI shapes into the parser, including root paths, drive letters, network shares, and fallback encoded paths. For each one, it asks for the inferred path convention and compares it with the expected Unix, Windows, or unknown answer.
 
-**Call relations**: Run by the test harness to validate the convention heuristic independently of native-path conversion.
+**Call relations**: The test runner calls this as a broad table-driven check. It depends on parse to build valid PathUri values and then focuses on infer_path_convention, which is used after parsing to interpret the path shape.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -351,11 +357,11 @@ fn infers_path_conventions_from_uri_shape()
 fn drive_shaped_posix_uri_is_intentionally_inferred_as_windows()
 ```
 
-**Purpose**: Documents the deliberate heuristic that `/C:/...` is treated as Windows even though it is also legal POSIX path text. This test protects that design choice from accidental regression.
+**Purpose**: Documents an intentional choice: a URI like file:///C:/... is treated as Windows-shaped even though it could technically be a Unix path. This favors the common case of receiving a Windows path from another machine.
 
-**Data flow**: Parses `file:///C:/actually/a/posix/path`, calls `infer_path_convention()`, and asserts it returns `Some(PathConvention::Windows)`.
+**Data flow**: It parses a URI whose path begins with a drive-letter pattern. It then asks PathUri to infer the path convention. The expected result is Windows.
 
-**Call relations**: A focused companion to the broader convention-inference test, emphasizing the crate's preference for recognizing foreign Windows paths.
+**Call relations**: The test runner calls this to lock in a design decision for infer_path_convention. It sits next to the broader inference test and explains why this ambiguous shape is not treated as Unix.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -366,11 +372,11 @@ fn drive_shaped_posix_uri_is_intentionally_inferred_as_windows()
 fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation()
 ```
 
-**Purpose**: On Windows, verifies that namespace-prefixed paths such as `\\.\COM1` and `\\?\Volume{...}` are encoded into opaque fallback URIs and can be decoded back losslessly. These paths cannot be represented as ordinary file URLs.
+**Purpose**: On Windows, checks that special namespace paths that cannot be written as normal file URIs still round-trip safely. The library uses a special fallback URI form instead of losing information.
 
-**Data flow**: For each native path string, validates it as `AbsolutePathBuf`, converts it with `PathUri::from_abs_path`, compares `to_string()` with the expected fallback URI, reparses that URI with `PathUri::parse`, converts it back with `to_abs_path()`, and compares with the original path.
+**Data flow**: It starts with Windows-only native paths such as device or volume namespace paths. Each path is validated as absolute, converted to PathUri, compared with the expected fallback URI text, parsed again, and converted back to the original native path.
 
-**Call relations**: Windows-only test run by the harness to exercise the fallback branch of `from_abs_path` and the guarded decode path in `to_abs_path`.
+**Call relations**: The Windows test runner calls this only on Windows. It exercises from_absolute_path_checked before from_abs_path, then confirms that parse and to_abs_path understand the fallback form.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 1 external calls (assert_eq!).
 
@@ -381,11 +387,11 @@ fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation()
 fn file_uri_fallback_round_trips_non_unicode_windows_paths()
 ```
 
-**Purpose**: On Windows, confirms that fallback URIs preserve absolute paths containing non-Unicode UTF-16 data. It specifically uses an unpaired surrogate to force the fallback representation.
+**Purpose**: On Windows, verifies that paths containing invalid Unicode still survive conversion through PathUri. This protects real filesystem paths that cannot be represented as ordinary text.
 
-**Data flow**: Builds a UTF-16 vector from `C:\bad\` plus `0xd800`, converts it into `PathBuf` via `OsString::from_wide`, validates it as `AbsolutePathBuf`, creates a fallback URI with `from_abs_path`, reparses the URI string, checks the URI starts with `BAD_PATH_URI_PREFIX`, and converts the reparsed URI back with `to_abs_path()` for equality with the original path.
+**Data flow**: It builds a Windows path from raw UTF-16 data containing an invalid surrogate value. That path is checked as absolute, converted to a URI, parsed again, and decoded back into a native path. The expected result is the same original path and a fallback URI prefix.
 
-**Call relations**: Windows-only test invoked by the harness to validate fallback handling for non-Unicode native paths, complementing the namespace-prefix fallback test.
+**Call relations**: The Windows test runner calls this to cover non-text path data. It feeds raw operating-system string data through from_abs_path and parse to make sure the opaque fallback path is used correctly.
 
 *Call graph*: calls 3 internal fn (from_absolute_path_checked, from_abs_path, parse); 4 external calls (from_wide, from, assert!, assert_eq!).
 
@@ -396,11 +402,11 @@ fn file_uri_fallback_round_trips_non_unicode_windows_paths()
 fn file_uri_falls_back_for_posix_paths_with_null_bytes()
 ```
 
-**Purpose**: On Unix, verifies that absolute paths containing null bytes are encoded into the reserved fallback namespace, serialize as strings, deserialize back, and decode to the original path. This covers a native path shape ordinary file URLs cannot safely represent.
+**Purpose**: On Unix, checks that a path containing bytes that cannot be put directly in a normal file URI uses the special fallback form and still round-trips. This is important for preserving exact path bytes.
 
-**Data flow**: Constructs a `PathBuf` from raw bytes `/tmp/null-\0-\xff-byte`, validates it as `AbsolutePathBuf`, converts it with `from_abs_path`, compares the URI against a parsed expected fallback URI, serializes it with serde, deserializes it back into `PathUri`, checks the exact JSON string, and converts the reparsed URI back with `to_abs_path()`.
+**Data flow**: It builds a Unix path from raw bytes, including a null byte and a non-UTF-8 byte. The path becomes a PathUri, is compared with the expected fallback URI, serialized to JSON, deserialized, and converted back to the original path.
 
-**Call relations**: Unix-only test run by the harness to exercise fallback generation, serde round-trip, and guarded fallback decoding for raw-byte POSIX paths.
+**Call relations**: The Unix test runner calls this only on Unix. It connects native byte-path construction, from_abs_path, PathUri parsing, JSON serialization, and to_abs_path into one round-trip check.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 5 external calls (from, assert_eq!, from_str, to_string, from_vec).
 
@@ -411,11 +417,11 @@ fn file_uri_falls_back_for_posix_paths_with_null_bytes()
 fn ordinary_bad_path_uri_is_not_decoded_as_a_fallback()
 ```
 
-**Purpose**: Ensures that a normal path whose text happens to resemble the base64 payload of a fallback URI is treated literally, not as an opaque fallback. This protects the reserved namespace from overmatching.
+**Purpose**: Makes sure that only the exact special fallback prefix is treated as fallback data. A normal path that merely resembles part of that fallback spelling must remain an ordinary file path.
 
-**Data flow**: Builds an absolute POSIX path `/bad/path/L3RtcC9udWxsLQAt_y1ieXRl`, converts it with `from_abs_path`, checks the resulting URI string is the ordinary `file:///bad/path/...` form, and converts it back with `to_abs_path()` to confirm literal interpretation.
+**Data flow**: It creates an absolute Unix path under /bad/path with text that looks like encoded fallback data. After conversion to PathUri, the URI remains a normal file URI, and converting it back returns the literal same path.
 
-**Call relations**: Unix-only test invoked by the harness to distinguish ordinary hierarchical paths from the reserved `%00/bad/path/` fallback namespace.
+**Call relations**: The Unix test runner calls this to guard against over-eager fallback decoding. It complements the fallback tests by proving that from_abs_path and to_abs_path do not reinterpret ordinary paths accidentally.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 1 external calls (assert_eq!).
 
@@ -426,11 +432,11 @@ fn ordinary_bad_path_uri_is_not_decoded_as_a_fallback()
 fn malformed_bad_path_uris_are_rejected()
 ```
 
-**Purpose**: Checks that malformed lookalikes of the fallback namespace are rejected during parsing rather than silently treated as valid paths. It covers empty payloads, invalid base64, padded base64, non-canonical encodings, extra segments, and wrong prefixes.
+**Purpose**: Checks that malformed fallback URIs are refused during parsing. This prevents ambiguous or corrupt opaque path data from entering the system.
 
-**Data flow**: Iterates over malformed URI strings, calls `PathUri::parse` on each, and compares the result with `Err(PathUriParseError::InvalidFileUriPath { path: uri.to_string() })`.
+**Data flow**: It tries several bad fallback-looking URI strings, including missing payloads, invalid base64 text, padded forms, extra path segments, and wrong prefixes. Each one is expected to produce an InvalidFileUriPath parse error.
 
-**Call relations**: Run by the test harness to validate the strict canonicality checks implemented by `decode_bad_path_uri` and `validate_file_url`.
+**Call relations**: The test runner calls this to exercise PathUri parsing’s validation rules for the fallback format. It stands between raw URI input and later conversion functions by ensuring only canonical fallback strings are accepted.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -441,11 +447,11 @@ fn malformed_bad_path_uris_are_rejected()
 fn structurally_valid_bad_path_uri_with_invalid_native_payload_fails_conversion()
 ```
 
-**Purpose**: Shows that a canonical fallback URI can parse successfully yet still fail native conversion if its payload does not decode to a valid absolute path. This separates URI-shape validity from native-path validity.
+**Purpose**: Shows that a fallback URI can be syntactically valid but still fail when its decoded data is not a valid absolute native path. Parsing and native conversion are deliberately separate checks.
 
-**Data flow**: Parses `file:///%00/bad/path/YQ`, calls `to_abs_path()` expecting failure, and asserts the resulting `io::ErrorKind` is `InvalidInput`.
+**Data flow**: It parses a canonical-looking fallback URI whose payload decodes to unsuitable path data. Parsing succeeds, but converting to an absolute native path returns an invalid input error.
 
-**Call relations**: Invoked by the test harness to exercise the revalidation logic inside `to_abs_path` for fallback payloads.
+**Call relations**: The test runner calls this after malformed fallback tests to cover the next layer of validation. parse accepts the URI shape, while to_abs_path rejects the decoded native path.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -456,11 +462,11 @@ fn structurally_valid_bad_path_uri_with_invalid_native_payload_fails_conversion(
 fn bad_path_uris_are_opaque_to_lexical_operations()
 ```
 
-**Purpose**: Verifies that fallback URIs do not participate in lexical path operations except for the degenerate empty join. They are intended only for native round-trip conversion.
+**Purpose**: Confirms that fallback URIs are treated like sealed data, not like normal slash-separated paths. Operations such as basename, parent, and joining children should not inspect or reshape their encoded payload.
 
-**Data flow**: Parses a fallback URI, then checks `basename()` and `parent()` both return `None`, `join("")` returns the original URI, and `join("child")` returns `InvalidFileUriPath` containing the URI string.
+**Data flow**: It parses a valid fallback URI and asks for its basename, parent, and joins. Empty join returns the same URI, while joining a real child fails because changing the fallback payload as if it were a normal path would be unsafe.
 
-**Call relations**: Run by the test harness to pin down the special opaque behavior of fallback URIs in lexical APIs.
+**Call relations**: The test runner calls this to protect lexical path operations from corrupting fallback URIs. It uses parse first, then checks basename, parent, and join behavior on the opaque value.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -471,11 +477,11 @@ fn bad_path_uris_are_opaque_to_lexical_operations()
 fn file_uri_parses_a_posix_path_on_any_host()
 ```
 
-**Purpose**: Ensures a standard POSIX `file:` URI parses and exposes expected lexical information on every host. This mirrors the Windows-path parsing test for the POSIX case.
+**Purpose**: Confirms that a Unix-style file URI can be parsed on any operating system. This keeps PathUri useful for inspecting paths from remote or different-platform environments.
 
-**Data flow**: Parses `file:///home/alice/src/main.rs`, then reads and compares `encoded_path()`, `basename()`, and `to_string()`.
+**Data flow**: It parses a Unix file URI, then checks that the encoded path is preserved, the basename is decoded to main.rs, and the URI prints back in canonical form.
 
-**Call relations**: Called by the test harness as a cross-platform parsing sanity check for ordinary POSIX URIs.
+**Call relations**: The test runner calls this as the Unix counterpart to the Windows path parsing test. It depends on parse and then verifies simple read-only PathUri accessors.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -486,11 +492,11 @@ fn file_uri_parses_a_posix_path_on_any_host()
 fn file_uri_preserves_paths_that_resemble_windows_paths()
 ```
 
-**Purpose**: Checks that URI path text like `/C:/Project` and `/C:` is preserved literally in the encoded path and survives reparse. This avoids rewriting such spellings during canonicalization.
+**Purpose**: Checks that URI text shaped like a Windows drive path is preserved exactly in the URI path. This prevents normalization from accidentally rewriting or discarding ambiguous path text.
 
-**Data flow**: For each input URI, parses it, reparses `uri.to_string()`, and compares `encoded_path()` and the reparsed `PathUri` with expected values.
+**Data flow**: It parses URIs such as file:///C:/Project and file:///C:, reads their encoded paths, serializes them back to strings, and parses those strings again. The URI remains equal to the original parsed value.
 
-**Call relations**: Run by the test harness to document that canonicalization preserves these path spellings even though convention inference may later classify them as Windows.
+**Call relations**: The test runner calls this to complement path-convention inference. Even if a path shape may be inferred as Windows, parse and to_string must still preserve the URI spelling.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -501,11 +507,11 @@ fn file_uri_preserves_paths_that_resemble_windows_paths()
 fn file_uri_accepts_non_utf8_posix_paths()
 ```
 
-**Purpose**: On Unix, verifies that non-UTF-8 absolute POSIX paths can still round-trip through `PathUri`. This covers the ordinary percent-encoded path case distinct from null-byte fallback encoding.
+**Purpose**: On Unix, verifies that a native path containing non-UTF-8 bytes can become a PathUri and return unchanged. Unix file names are bytes, not always valid text, so this protects real-world paths.
 
-**Data flow**: Constructs a raw-byte path `/tmp/non-utf8-\xff`, validates it as `AbsolutePathBuf`, converts it with `from_abs_path`, converts back with `to_abs_path()`, reparses `uri.to_string()` with `PathUri::parse`, and compares both results with the original values.
+**Data flow**: It builds a Unix path from raw bytes with a non-UTF-8 byte, validates it as absolute, converts it to PathUri, converts it back to a native path, and reparses the URI string. Both round-trips preserve the same path and URI.
 
-**Call relations**: Unix-only test run by the harness to validate lossless handling of non-UTF-8 bytes that remain representable in ordinary file URIs.
+**Call relations**: The Unix test runner calls this to cover byte-level Unix path handling. It sends raw OS string data through from_abs_path, to_abs_path, and parse.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 3 external calls (from, assert_eq!, from_vec).
 
@@ -516,11 +522,11 @@ fn file_uri_accepts_non_utf8_posix_paths()
 fn file_uri_round_trips_literal_percent_characters()
 ```
 
-**Purpose**: Ensures `%25` remains a literal percent character in filename text rather than being normalized away. It checks both canonical URI spelling and lexical basename extraction.
+**Purpose**: Checks that a literal percent character in a file name stays correctly encoded as %25 in the URI. This prevents percent signs from being mistaken for new escape sequences.
 
-**Data flow**: Parses `file:///tmp/100%25/file`, then compares `to_string()`, `encoded_path()`, and `basename()` with expected values.
+**Data flow**: It parses a URI containing 100%25, then checks the printed URI, encoded path, and decoded basename. The result keeps the encoded percent in URI text while presenting the file name normally.
 
-**Call relations**: Invoked by the test harness as one of several tests guarding encoded filename characters from being mistaken for URI syntax.
+**Call relations**: The test runner calls this to exercise percent-encoding behavior. It relies on parse and then checks that string rendering and basename decoding agree.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -531,11 +537,11 @@ fn file_uri_round_trips_literal_percent_characters()
 fn file_uri_round_trips_windows_unc_paths()
 ```
 
-**Purpose**: On Windows, verifies that absolute UNC paths convert to `PathUri` and back correctly. It also checks that the encoded path excludes the authority portion.
+**Purpose**: On Windows, verifies conversion of UNC network paths such as \\server\share\... into file URIs and back. UNC paths identify files on network shares, so their server/share parts must be preserved.
 
-**Data flow**: Validates `\\server\share\src\main.rs` as `AbsolutePathBuf`, converts it with `from_abs_path`, compares `encoded_path()` with `/share/src/main.rs`, and converts back with `to_abs_path()` for equality with the original path.
+**Data flow**: It starts with an absolute Windows UNC path, converts it to a PathUri, checks the URI path portion, and converts it back to the same native UNC path.
 
-**Call relations**: Windows-only test run by the harness to cover ordinary UNC conversion rather than fallback encoding.
+**Call relations**: The Windows test runner calls this to exercise from_abs_path and to_abs_path for network shares. It is related to the authority-retention test, which checks the URI form directly.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 1 external calls (assert_eq!).
 
@@ -546,11 +552,11 @@ fn file_uri_round_trips_windows_unc_paths()
 fn file_uri_retains_unc_authority()
 ```
 
-**Purpose**: Checks that parsing a UNC-style `file://server/...` URI preserves the authority in canonical string form. This distinguishes UNC hosts from local paths.
+**Purpose**: Checks that a file URI with a network server name keeps that server name when parsed and printed. In URI terms, the server name is the authority, meaning the host-like part after file://.
 
-**Data flow**: Parses `file://server/share/src/main.rs`, then compares `encoded_path()` and `to_string()` with expected values.
+**Data flow**: It parses file://server/share/src/main.rs, reads the encoded path, and turns the PathUri back into text. The server authority and path are both preserved.
 
-**Call relations**: Called by the test harness to validate authority preservation for UNC URIs.
+**Call relations**: The test runner calls this for URI-level UNC behavior, independent of whether the current host can convert it to a native path. It uses parse and string rendering rather than native path conversion.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -561,11 +567,11 @@ fn file_uri_retains_unc_authority()
 fn file_uri_spelling_aliases_have_one_canonical_form()
 ```
 
-**Purpose**: Verifies that multiple equivalent local URI spellings normalize to the same canonical `PathUri` string. It covers uppercase scheme, single-slash form, and localhost authority aliases.
+**Purpose**: Verifies that common equivalent spellings of local file URIs all normalize to one standard form. This avoids treating FILE:///x, file:/x, and file://localhost/x as different paths.
 
-**Data flow**: Loops over alias strings, parses each with `PathUri::parse`, and compares `to_string()` with `file:///workspace/src`.
+**Data flow**: It parses several alias spellings for the same local path. Each parsed URI is converted back to text, and the expected output is always file:///workspace/src.
 
-**Call relations**: Run by the test harness to document canonicalization behavior implemented by URL parsing plus `without_localhost_authority`.
+**Call relations**: The test runner calls this to check canonicalization inside parse. It ensures later comparisons can rely on PathUri’s normalized string form.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -576,11 +582,11 @@ fn file_uri_spelling_aliases_have_one_canonical_form()
 fn unsupported_schemes_are_rejected_at_construction()
 ```
 
-**Purpose**: Ensures `PathUri::parse` rejects non-`file` schemes and reports the offending scheme name. This keeps the type narrowly scoped to filesystem URIs.
+**Purpose**: Confirms that PathUri only accepts supported path URI schemes, currently file:// for this test set. Remote, artifact, web, and editor-specific schemes are rejected instead of being treated like local files.
 
-**Data flow**: Iterates over URI strings and expected scheme names, calls `PathUri::parse`, expects an error, and asserts it matches `PathUriParseError::UnsupportedScheme(expected_scheme)`.
+**Data flow**: It tries to parse URIs with schemes such as http, ssh, artifact, and untitled. Each parse is expected to fail with an UnsupportedScheme error containing the rejected scheme name.
 
-**Call relations**: Invoked by the test harness to validate the scheme gate in `TryFrom<Url>`.
+**Call relations**: The test runner calls this to protect the construction boundary. It exercises parse as the gatekeeper before any PathUri value can be created from outside text.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert!).
 
@@ -591,11 +597,11 @@ fn unsupported_schemes_are_rejected_at_construction()
 fn path_uri_serializes_as_a_string()
 ```
 
-**Purpose**: Pins down serde output and input for `PathUri` as a plain JSON string containing the canonical URI. It verifies exact wire representation.
+**Purpose**: Checks that PathUri is written to JSON as a simple URI string and can be read back. This keeps saved data and API payloads easy to understand and stable.
 
-**Data flow**: Parses a `PathUri` from string syntax, serializes it with `serde_json::to_string`, deserializes it back with `serde_json::from_str`, and compares both the JSON text and the resulting value.
+**Data flow**: It parses a file URI into a PathUri, serializes it with JSON, then deserializes it back. The JSON is expected to be a quoted URI string, and the final PathUri equals the original.
 
-**Call relations**: Run by the test harness as the focused serde round-trip test for canonical URI strings.
+**Call relations**: The test runner calls this to verify serde support, where serde is Rust’s common serialization framework. It uses normal string parsing first, then hands the value through JSON conversion.
 
 *Call graph*: 3 external calls (assert_eq!, from_str, to_string).
 
@@ -606,11 +612,11 @@ fn path_uri_serializes_as_a_string()
 fn path_uri_deserializes_legacy_absolute_paths()
 ```
 
-**Purpose**: Checks backward-compatible serde input from an absolute native path string rather than a `file:` URI. Deserialization should convert that path into the corresponding `PathUri`.
+**Purpose**: Checks backward compatibility with older JSON data that stored native absolute paths instead of file URIs. Existing saved state can still be read and converted into PathUri.
 
-**Data flow**: Builds an absolute path under the current directory, serializes the path itself to JSON, deserializes that JSON into `PathUri`, and compares the result with `PathUri::from_abs_path(&path)`.
+**Data flow**: It creates an absolute path under the current directory and serializes that path as JSON. Then it deserializes the JSON as PathUri. The expected result is the same URI that from_abs_path would create from the absolute path.
 
-**Call relations**: Invoked by the test harness to exercise the legacy-native-path branch of `PathUri::deserialize`.
+**Call relations**: The test runner calls this to cover migration behavior during deserialization. It compares serde’s legacy path input handling with the normal from_abs_path conversion.
 
 *Call graph*: calls 1 internal fn (current_dir); 3 external calls (assert_eq!, from_str, to_string).
 
@@ -621,11 +627,11 @@ fn path_uri_deserializes_legacy_absolute_paths()
 fn path_uri_rejects_relative_native_paths()
 ```
 
-**Purpose**: Verifies that `PathUri::from_path` rejects relative filesystem paths. This enforces the crate invariant that `PathUri` always represents an absolute location.
+**Purpose**: Verifies that PathUri cannot be created directly from a relative native path. Requiring absolute paths avoids confusion about which directory the path depends on.
 
-**Data flow**: Calls `PathUri::from_path("src/lib.rs")`, expects an error, and checks that the `io::ErrorKind` is `InvalidInput`.
+**Data flow**: It passes src/lib.rs to from_path. The expected output is an invalid input error rather than a PathUri.
 
-**Call relations**: Run by the test harness to validate the absolute-path check in `from_path`.
+**Call relations**: The test runner calls this to check the direct native-path constructor. It protects callers before parsing or serialization are involved.
 
 *Call graph*: calls 1 internal fn (from_path); 1 external calls (assert_eq!).
 
@@ -636,11 +642,11 @@ fn path_uri_rejects_relative_native_paths()
 fn path_uri_rejects_legacy_relative_paths_with_absolute_path_guard()
 ```
 
-**Purpose**: Ensures serde deserialization of a relative native path string fails even when an absolute-path guard is installed. The test checks that the error message mentions non-absolute input.
+**Purpose**: Checks that legacy JSON path input must still be absolute, even when an absolute-path guard is active. This prevents old-style relative path strings from slipping into PathUri during deserialization.
 
-**Data flow**: Captures the current directory, installs `AbsolutePathBufGuard` rooted there, attempts to deserialize `"src/lib.rs"` into `PathUri`, expects failure, and asserts the error string contains `path is not absolute`.
+**Data flow**: It records the current directory as the guarded base, then tries to deserialize the JSON string "src/lib.rs" as a PathUri. Deserialization fails, and the error message mentions that the path is not absolute.
 
-**Call relations**: Invoked by the test harness to verify that deserialization does not silently reinterpret relative legacy paths against ambient process state.
+**Call relations**: The test runner calls this to cover the legacy deserialization path with AbsolutePathBufGuard in place. It ensures the guard does not make a relative path acceptable for PathUri.
 
 *Call graph*: calls 2 internal fn (current_dir, new); 1 external calls (assert!).
 
@@ -651,11 +657,11 @@ fn path_uri_rejects_legacy_relative_paths_with_absolute_path_guard()
 fn unsupported_scheme_is_rejected_during_deserialization()
 ```
 
-**Purpose**: Checks that serde deserialization surfaces unsupported URI schemes as errors rather than treating them as native paths. This complements the direct-construction scheme test.
+**Purpose**: Verifies that JSON deserialization applies the same scheme rules as direct parsing. A saved or received JSON string with an unsupported scheme must not create a PathUri.
 
-**Data flow**: Attempts to deserialize `"artifact://store/object-1"` into `PathUri`, expects an error, and asserts the error text contains the unsupported-scheme message.
+**Data flow**: It tries to deserialize a JSON string containing artifact://store/object-1 as PathUri. The expected result is an error message saying the artifact scheme is unsupported.
 
-**Call relations**: Run by the test harness to validate the URI-first branch of `PathUri::deserialize`.
+**Call relations**: The test runner calls this as the serialization-side counterpart to unsupported_schemes_are_rejected_at_construction. It checks that serde input still goes through PathUri validation.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -666,11 +672,11 @@ fn unsupported_scheme_is_rejected_during_deserialization()
 fn known_path_uris_reject_queries_and_fragments()
 ```
 
-**Purpose**: Verifies that `file:` URIs containing query strings or fragments are rejected. These components are intentionally unsupported metadata for this type.
+**Purpose**: Checks that file URIs with query strings or fragments are rejected. In a path URI, ?version=1 or #L1 would be metadata, not part of the filesystem path, so allowing it would be ambiguous.
 
-**Data flow**: Parses one URI with `?version=1` and one with `#L1`, expects errors from both, and asserts they match `QueryNotAllowed` and `FragmentNotAllowed` respectively.
+**Data flow**: It tries to parse one URI with a query and one with a fragment. Each parse fails with the specific error for that kind of forbidden metadata.
 
-**Call relations**: Invoked by the test harness to exercise `validate_common_known_uri` through `PathUri::parse`.
+**Call relations**: The test runner calls this to validate parse rules for known path schemes. It keeps path identity separate from URI decorations such as queries and fragments.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert!).
 
@@ -681,11 +687,11 @@ fn known_path_uris_reject_queries_and_fragments()
 fn path_uris_reject_encoded_null_bytes()
 ```
 
-**Purpose**: Checks that ordinary `file:` URIs containing `%00` in the path are rejected. Only the reserved fallback namespace may contain an encoded null.
+**Purpose**: Confirms that a normal file URI cannot contain an encoded null byte. Null bytes are dangerous path contents for many native APIs, so they must not enter through ordinary URI decoding.
 
-**Data flow**: Calls `PathUri::parse("file:///tmp/%00")` and asserts the result is an error.
+**Data flow**: It tries to parse file:///tmp/%00. The expected result is any parse error rather than a valid PathUri.
 
-**Call relations**: Run by the test harness to validate the null-byte restriction enforced by `validate_file_url`.
+**Call relations**: The test runner calls this to cover a security and correctness edge case in parse. The special fallback tests cover opaque null-byte preservation separately; this test ensures normal URI paths reject it.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -696,11 +702,11 @@ fn path_uris_reject_encoded_null_bytes()
 fn encoded_filename_characters_round_trip_without_becoming_uri_metadata()
 ```
 
-**Purpose**: Ensures encoded `?`, `#`, and `%` remain filename text rather than being interpreted as URI query, fragment, or escape syntax after parsing. It also checks decoded basename output.
+**Purpose**: Checks that encoded question marks, hash signs, and percent signs inside a file name stay part of the file name. They must not turn into URI query, fragment, or escape syntax.
 
-**Data flow**: Parses `file:///tmp/a%3Fb%23c%25d`, then compares `to_string()`, `encoded_path()`, and `basename()` with expected values.
+**Data flow**: It parses a URI whose final path segment contains %3F, %23, and %25. The URI string and encoded path remain encoded, while basename returns the decoded file name a?b#c%d.
 
-**Call relations**: Called by the test harness as part of the lexical-character preservation suite.
+**Call relations**: The test runner calls this after query and fragment rejection to show the safe way to include those characters: encode them as path text. It exercises parse and basename decoding.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -711,11 +717,11 @@ fn encoded_filename_characters_round_trip_without_becoming_uri_metadata()
 fn double_encoded_separator_remains_filename_text()
 ```
 
-**Purpose**: Verifies that `%252F` survives as filename text `%2F` rather than becoming a path separator. This protects encoded separator bytes from accidental structural interpretation.
+**Purpose**: Verifies that a slash encoded twice stays as text in a file name, not as a path separator. This prevents decoding too many times and accidentally changing the directory structure.
 
-**Data flow**: Parses `file:///tmp/a%252Fb`, then compares `to_string()`, `encoded_path()`, and `basename()` with expected values.
+**Data flow**: It parses file:///tmp/a%252Fb. The encoded path and printed URI keep %252F, while basename decodes only one layer to a%2Fb.
 
-**Call relations**: Run by the test harness to pin down separator handling in canonical URI parsing and lexical basename decoding.
+**Call relations**: The test runner calls this to guard percent-decoding behavior. It checks that parse and basename do not over-decode URI segments.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -726,11 +732,11 @@ fn double_encoded_separator_remains_filename_text()
 fn basename_uses_decoded_uri_segments()
 ```
 
-**Purpose**: Checks `basename()` across roots, ordinary paths, encoded spaces, drive roots, and UNC shares. It confirms the method returns decoded segment text rather than raw percent-encoded spelling when UTF-8 decoding succeeds.
+**Purpose**: Checks how PathUri reports the last path segment, known as the basename. It should decode normal URI escapes and return no name for a bare root.
 
-**Data flow**: Loops over URI strings and expected optional basenames, parses each URI, calls `basename()`, maps expected `&str` to `String`, and compares the results.
+**Data flow**: It parses several URI shapes: root, normal files, names with spaces, Windows drive roots, and network shares. For each one, basename returns the expected decoded final segment or None.
 
-**Call relations**: Invoked by the test harness to validate lexical segment extraction independently of native-path conversion.
+**Call relations**: The test runner calls this as the focused test for basename. It uses parse to create each URI, then verifies the user-facing filename result.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -741,11 +747,11 @@ fn basename_uses_decoded_uri_segments()
 fn parent_uses_uri_hierarchy_and_preserves_authority()
 ```
 
-**Purpose**: Tests `parent()` on local paths, roots, drive roots, and UNC paths. It verifies that hierarchy is computed lexically and that authorities are preserved where applicable.
+**Purpose**: Checks that PathUri can find a URI’s parent directory using URI path hierarchy. It also makes sure network authorities such as file://server are kept when moving upward.
 
-**Data flow**: For each input URI and optional expected parent URI string, parses the input, parses the expected parent when present, calls `parent()`, and compares the result.
+**Data flow**: It parses several file URIs and asks for each parent. The expected result is another parsed PathUri for the parent, or None when already at the root.
 
-**Call relations**: Run by the test harness to exercise the URL-segment mutation logic inside `parent`.
+**Call relations**: The test runner calls this as the focused test for parent. It uses parse both for the input and for the expected parent values so comparisons stay in PathUri terms.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -756,11 +762,11 @@ fn parent_uses_uri_hierarchy_and_preserves_authority()
 fn join_normalizes_relative_uri_segments()
 ```
 
-**Purpose**: Checks that `join()` handles `..`, root clamping, Windows-drive and UNC bases, encoded filename characters, and empty relative paths correctly. It defines the lexical normalization semantics of URI joining.
+**Purpose**: Checks that joining a relative path onto a base URI works like normal directory navigation. It also verifies that special filename characters are encoded when joined.
 
-**Data flow**: For each `(base, relative, expected)` triple, parses the base and expected URIs, calls `base.join(relative)`, and compares the result with `Ok(expected)`.
+**Data flow**: It parses base URIs, joins relative strings such as ../tests/test.rs or a?b#c%d, and compares the result to an expected PathUri. Dot-dot segments are normalized without escaping above the URI root, and filename metadata characters become encoded path text.
 
-**Call relations**: Invoked by the test harness to validate the main success path of `join`, including its normalization rules.
+**Call relations**: The test runner calls this as the main positive test for join. It combines parse for the base and expected values with join as the operation under test.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -771,11 +777,11 @@ fn join_normalizes_relative_uri_segments()
 fn join_rejects_absolute_and_null_paths()
 ```
 
-**Purpose**: Verifies the two explicit rejection cases in `join`: absolute relative-path arguments and embedded null characters. These are invalid regardless of the base URI.
+**Purpose**: Verifies that join only accepts safe relative path text. Absolute paths and strings containing null bytes are rejected instead of being merged into a base URI.
 
-**Data flow**: Parses `file:///workspace` as the base, calls `join("/src")` and asserts it matches `JoinPathMustBeRelative("/src")`, then calls `join("src\0file")` and compares with `InvalidFileUriPath { path: "src\0file".to_string() }`.
+**Data flow**: It parses a base URI, then tries to join /src and a string containing a null byte. The absolute input produces a JoinPathMustBeRelative error, and the null-containing input produces an invalid file URI path error.
 
-**Call relations**: Run by the test harness as the negative-path companion to `join_normalizes_relative_uri_segments`.
+**Call relations**: The test runner calls this as the negative counterpart to join_normalizes_relative_uri_segments. It checks that join validates its input before producing a new PathUri.
 
 *Call graph*: calls 1 internal fn (parse); 2 external calls (assert!, assert_eq!).
 
@@ -786,22 +792,24 @@ fn join_rejects_absolute_and_null_paths()
 fn to_url_returns_the_validated_url()
 ```
 
-**Purpose**: Checks that `to_url()` exposes the canonical validated `Url`, including localhost normalization. It confirms callers receive the post-validation URL rather than the original input spelling.
+**Purpose**: Checks that PathUri can expose its underlying validated URL form. This is useful when other code needs a standard URL object after PathUri has already enforced path-specific rules.
 
-**Data flow**: Parses `file://localhost/workspace/a%20file.rs`, calls `to_url()`, parses the expected canonical `Url` with `Url::parse`, and compares the two.
+**Data flow**: It parses a file URI using localhost and an encoded space. Then it asks for the URL object and compares it with the canonical file URL without localhost.
 
-**Call relations**: Invoked by the test harness to validate the simple accessor after canonicalization has already occurred in `PathUri::parse`.
+**Call relations**: The test runner calls this to verify the handoff from PathUri to the general Url type. It first relies on parse for validation and normalization, then checks to_url returns that normalized URL.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
 
 ### `utils/path-uri/src/api_path_string_tests.rs`
 
-`test` · `test execution`
+`test` · `test`
 
-This test file is a specification suite for converting between canonical `file:` URIs (`PathUri`) and legacy API path strings (`LegacyAppPathString`). Its core fixture is the large `RENDER_CASES` table, built from `RenderCase` values whose `expected` field distinguishes exact round trips, lossy render-only conversions, and expected failures. The cases cover ordinary POSIX paths, Windows drive-letter paths, UNC authorities, URI aliases such as `FILE:` and `file://localhost`, percent-encoded characters, non-UTF-8 payloads, encoded separators, and the special `%00/bad/path/<base64>` opaque fallback namespace.
+This is a test file for the path conversion layer. The project has a newer file URI form, like `file:///workspace/src/lib.rs`, but some APIs still use plain path strings, like `/workspace/src/lib.rs` or `C:\workspace\src\lib.rs`. These tests make sure those two worlds agree where they can, and fail clearly where they cannot.
 
-The main test iterates over every shared case, parses the URI, computes the expected `LegacyAppPathString` or `LegacyAppPathStringError`, and compares it with `LegacyAppPathString::from_path_uri`. For successful renders it also checks `infer_absolute_path_convention`, and for exact round-trip cases it deserializes the rendered string from JSON, converts it back with `to_path_uri`, and confirms equality with the original URI. Additional tests pin down behavior for relative and otherwise non-absolute API strings: they serialize unchanged but cannot become `PathUri`s. Host-specific tests verify conversion from `AbsolutePathBuf`, including Windows-only lossy rendering of non-Unicode native paths. Overall, this file documents that API path strings preserve foreign absolute syntax textually, infer conventions heuristically, and reject conversions only when absolute/native invariants are violated.
+The file starts by defining small test-case helpers. Each case says: here is a URI, here is the path style we want to render it as, and here is what should happen. Some cases should round-trip, meaning URI → plain path → URI gives the same value back. Some cases only render in a lossy way, meaning information is lost, like a bad byte being shown as the replacement character `�`. Some cases should be rejected because the URI shape does not match the requested path convention.
+
+The large shared case table is the heart of the file. It covers POSIX paths, Windows drive paths, Windows network-share paths, encoded characters, opaque fallback paths, and invalid combinations. The rest of the tests check surrounding behavior: relative paths can be stored as API strings but cannot become file URIs, the code can guess whether a string looks like Windows or POSIX, and JSON serialization treats these API paths as plain strings. Without these tests, small changes could silently break cross-platform path handling.
 
 #### Function details
 
@@ -815,11 +823,11 @@ fn round_trips(
     ) -> Self
 ```
 
-**Purpose**: Constructs a `RenderCase` whose URI should render to a native path string and parse back to the same `PathUri`. It packages the expected rendered text as `RenderExpectation::RoundTrip`.
+**Purpose**: Builds a test case where a URI is expected to render into a native-looking path string and then convert back to the same URI. It is a compact way to write many successful conversion examples.
 
-**Data flow**: Takes a static URI string, a `PathConvention`, and the expected rendered native-path text. It builds and returns a `RenderCase` with those fields plus a `RoundTrip` expectation; it does not read or mutate external state.
+**Data flow**: It takes a URI text, a path convention, and the expected rendered path text. It wraps the expected text in a round-trip expectation and returns a complete `RenderCase` containing all three pieces.
 
-**Call relations**: Used while defining the `RENDER_CASES` constant to mark cases that must succeed in both directions, which the main shared-case test later subjects to render, convention inference, JSON deserialize, and URI reparse checks.
+**Call relations**: The shared test table uses this helper for cases that should survive both directions of conversion. Later, `renders_native_paths_from_shared_cases` reads these cases and checks both rendering and parsing back.
 
 *Call graph*: 1 external calls (RoundTrip).
 
@@ -830,11 +838,11 @@ fn round_trips(
 fn rejects(uri: &'static str, convention: PathConvention, error: ExpectedError) -> Self
 ```
 
-**Purpose**: Constructs a `RenderCase` for a URI/convention pair that should fail rendering into `LegacyAppPathString`. It records which error category is expected.
+**Purpose**: Builds a test case where conversion is expected to fail. This is used when a URI cannot honestly be shown as the requested kind of path, or when an opaque fallback is invalid.
 
-**Data flow**: Accepts a static URI string, a `PathConvention`, and an `ExpectedError`. It returns a `RenderCase` whose `expected` field is `RenderExpectation::Error(error)`.
+**Data flow**: It takes a URI text, a path convention, and the kind of expected error. It stores those values in a `RenderCase` whose expectation says an error should occur.
 
-**Call relations**: Used in `RENDER_CASES` for incompatible convention and opaque-fallback rejection scenarios; the shared-case test maps these markers into concrete `LegacyAppPathStringError` values before comparing against `from_path_uri`.
+**Call relations**: The shared test table uses this helper for deliberately incompatible or invalid examples. `renders_native_paths_from_shared_cases` later turns the stored error kind into the exact error value the conversion code should return.
 
 *Call graph*: 1 external calls (Error).
 
@@ -849,11 +857,11 @@ fn renders_lossily(
     ) -> Self
 ```
 
-**Purpose**: Constructs a `RenderCase` for URIs that can be rendered to API path text but cannot be parsed back losslessly. This captures cases where URI byte boundaries or encoded separators collapse during rendering.
+**Purpose**: Builds a test case where a URI can be displayed as a path string, but the displayed text cannot faithfully recreate the original URI. This is important for cases like invalid UTF-8 bytes or escaped path separators.
 
-**Data flow**: Takes a static URI string, a `PathConvention`, and the expected rendered text, then returns a `RenderCase` with `RenderExpectation::RenderOnly(rendered)`.
+**Data flow**: It takes a URI text, a path convention, and the expected displayed path text. It returns a `RenderCase` marked as render-only, meaning the test should check the display result but not demand a perfect parse back.
 
-**Call relations**: Used in `RENDER_CASES` for lossy conversions such as non-UTF-8 bytes becoming replacement characters or `%2F` becoming a path separator; the shared-case test validates rendering and convention inference but intentionally skips URI round-trip assertions for these entries.
+**Call relations**: The shared test table uses this helper for conversions that are acceptable for display but not safe for round-tripping. `renders_native_paths_from_shared_cases` treats these differently from full round-trip cases.
 
 *Call graph*: 1 external calls (RenderOnly).
 
@@ -864,11 +872,11 @@ fn renders_lossily(
 fn renders_native_paths_from_shared_cases()
 ```
 
-**Purpose**: Runs the table-driven compatibility suite for `LegacyAppPathString` rendering and parsing across all predefined URI/convention combinations. It is the central behavioral test for the API path string layer.
+**Purpose**: Runs the main set of URI-to-path conversion tests. It checks successful rendering, expected failures, convention inference, and full round-tripping where the case says that should be possible.
 
-**Data flow**: Iterates over `RENDER_CASES`, parses each `case.uri` into a `PathUri`, translates the case expectation into either `Ok(LegacyAppPathString(...))` or a concrete `LegacyAppPathStringError`, and compares that with `LegacyAppPathString::from_path_uri(&path, case.convention)`. For successful renders it reads `infer_absolute_path_convention()` from the produced string and checks it matches the requested convention. For `RoundTrip` cases it deserializes the rendered text from JSON into `LegacyAppPathString`, converts it back with `to_path_uri(case.convention)`, and asserts equality with the original `PathUri` and with a second render pass.
+**Data flow**: For each shared case, it parses the URI into a `PathUri`, builds the expected result, and asks `LegacyAppPathString::from_path_uri` to render it using the requested convention. If rendering succeeds, it checks that the rendered string looks like the same convention. For round-trip cases, it also deserializes the plain path from JSON, converts it back to a URI, and confirms the original URI is recovered.
 
-**Call relations**: Invoked by the test harness. It drives `PathUri::parse` first, then exercises `LegacyAppPathString::from_path_uri`; only when the case is marked `RoundTrip` does it continue into JSON deserialization and `to_path_uri`, making this test the bridge between the shared fixture table and both conversion directions.
+**Call relations**: This is the main consumer of the `RenderCase` table and its helper constructors. It drives the real conversion functions, compares their output with the expected answer, and uses JSON conversion to mimic how API path strings appear at the system boundary.
 
 *Call graph*: calls 2 internal fn (parse, from_path_uri); 2 external calls (assert_eq!, json!).
 
@@ -879,11 +887,11 @@ fn renders_native_paths_from_shared_cases()
 fn relative_api_path_serializes_and_deserializes_unchanged()
 ```
 
-**Purpose**: Verifies that relative API path strings are accepted as plain text values by serde and emitted unchanged. This preserves backward-compatible transport behavior even though such paths are not valid absolute native paths.
+**Purpose**: Checks that relative API path strings, such as `subdir/file.rs`, can still pass through JSON unchanged. They are allowed as plain API text even though they are not absolute file locations.
 
-**Data flow**: For each raw relative string (`.`, `subdir`, `subdir/file.rs`), it deserializes JSON into `LegacyAppPathString`, then serializes the value back to JSON and compares with the original string literal.
+**Data flow**: It starts with several raw relative path strings. Each string is deserialized into a `LegacyAppPathString`, then serialized back to JSON, and the result is compared with the original text.
 
-**Call relations**: Called directly by the test harness. Unlike the shared-case test, it never attempts URI conversion; it isolates serde behavior for relative strings.
+**Call relations**: This test focuses on JSON behavior rather than URI conversion. It complements the later tests that show these same kinds of relative strings are not valid inputs when building a `PathUri`.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -894,11 +902,11 @@ fn relative_api_path_serializes_and_deserializes_unchanged()
 fn relative_api_path_is_invalid_when_converted_to_a_path_uri()
 ```
 
-**Purpose**: Confirms that a relative `LegacyAppPathString` cannot be promoted into a `PathUri`. It also checks that convention inference returns `None` for such text.
+**Purpose**: Proves that a relative API path string is not enough to create a file URI. A file URI needs an absolute path, meaning a complete location from the filesystem root or drive root.
 
-**Data flow**: Deserializes the JSON string `subdir` into `LegacyAppPathString`, reads `infer_absolute_path_convention()` and expects `None`, then calls `to_path_uri(PathConvention::Posix)` and expects `LegacyAppPathStringError::InvalidNativePath` containing the original text and convention.
+**Data flow**: It deserializes the raw string `subdir` into a `LegacyAppPathString`. It confirms no absolute path convention can be inferred, then tries to convert it as a POSIX path and expects an invalid-native-path error.
 
-**Call relations**: Invoked by the test harness to pin down the boundary between permissive string deserialization and strict absolute-path conversion.
+**Call relations**: This test follows up on the serialization test: relative strings may be stored and transmitted, but conversion to `PathUri` rejects them when an absolute filesystem location is required.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -909,11 +917,11 @@ fn relative_api_path_is_invalid_when_converted_to_a_path_uri()
 fn other_non_absolute_api_paths_cannot_be_converted_to_path_uris()
 ```
 
-**Purpose**: Checks additional Windows-shaped but non-absolute API strings that should deserialize without validation yet fail URI conversion. It covers rooted-relative and drive-relative Windows syntax.
+**Purpose**: Checks Windows-looking strings that are still not absolute paths. Examples include a path with backslashes but no drive root, and `C:file.rs`, which is drive-relative rather than fully absolute.
 
-**Data flow**: Loops over `workspace\file.rs` and `C:file.rs` with `PathConvention::Windows`, deserializes each into `LegacyAppPathString`, verifies `infer_absolute_path_convention()` is `None`, then calls `to_path_uri(convention)` and expects `InvalidNativePath` with the original text.
+**Data flow**: For each raw path and convention, it deserializes the string into `LegacyAppPathString`. It verifies the string does not reveal an absolute convention, then tries converting it to a URI and expects an invalid-native-path error.
 
-**Call relations**: Run by the test harness as a companion to the relative-path test, extending invalid conversion coverage to Windows-specific non-absolute spellings.
+**Call relations**: This test broadens the relative-path rule to Windows-style edge cases. It helps ensure the conversion code does not mistake familiar-looking syntax for a complete absolute path.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -924,11 +932,11 @@ fn other_non_absolute_api_paths_cannot_be_converted_to_path_uris()
 fn infers_absolute_path_conventions_from_api_text()
 ```
 
-**Purpose**: Validates the heuristic that recognizes whether raw API path text looks like an absolute Windows path, absolute POSIX path, or neither. It covers drive letters, UNC, device prefixes, POSIX roots, and ambiguous/non-absolute forms.
+**Purpose**: Checks the code’s ability to guess whether an API path string is an absolute Windows path, an absolute POSIX path, or neither. This guess is useful before choosing how to parse or display a path.
 
-**Data flow**: For each `(raw_path, expected)` pair, it deserializes the string into `LegacyAppPathString`, calls `infer_absolute_path_convention()`, and compares the result with the expected `Option<PathConvention>`.
+**Data flow**: It deserializes each sample string into `LegacyAppPathString`, calls the convention-inference method, and compares the result with the expected answer. Inputs include Windows drive paths, Windows network paths, POSIX root paths, and non-absolute strings.
 
-**Call relations**: Executed by the test harness to verify convention inference independently of URI parsing/rendering, using only API text deserialization.
+**Call relations**: This test exercises the convention-detection part of `LegacyAppPathString`. The main rendering tests also rely on convention inference after successful rendering, but this test isolates that behavior with many direct examples.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -939,11 +947,11 @@ fn infers_absolute_path_conventions_from_api_text()
 fn foreign_absolute_syntax_deserializes_without_host_interpretation()
 ```
 
-**Purpose**: Ensures that absolute path syntax from another platform is preserved literally when deserialized as API text. The test guards against host-dependent reinterpretation during input parsing.
+**Purpose**: Checks that deserializing an API path string does not reinterpret it based on the computer running the test. A Windows-looking path should remain Windows-looking even on POSIX, and a POSIX-looking path should remain POSIX-looking even on Windows.
 
-**Data flow**: Deserializes a Windows absolute path and a POSIX absolute path from JSON strings, then checks `as_str()` returns the exact original text and `infer_absolute_path_convention()` identifies the corresponding convention.
+**Data flow**: It deserializes each raw absolute path string, then checks that the stored text is exactly the same and that the inferred convention matches the syntax of the string.
 
-**Call relations**: Called by the test harness to confirm that `LegacyAppPathString` is a textual wrapper first, not a host-native path parser.
+**Call relations**: This test protects API behavior from host operating system assumptions. It confirms that `LegacyAppPathString` treats incoming text as data from the API, not as a local filesystem path to be normalized immediately.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -954,11 +962,11 @@ fn foreign_absolute_syntax_deserializes_without_host_interpretation()
 fn renders_an_absolute_path_using_the_host_convention()
 ```
 
-**Purpose**: Checks conversion from a host-native `AbsolutePathBuf` into `LegacyAppPathString`. The expected rendered text is selected with `#[cfg(unix)]` or `#[cfg(windows)]` so the assertion matches the current platform.
+**Purpose**: Checks conversion from the project’s checked absolute path type into a legacy API path string using the current machine’s native path style. On Unix-like systems it expects a slash-rooted path; on Windows it expects a drive-rooted path.
 
-**Data flow**: Builds a platform-specific absolute path string, validates it with `AbsolutePathBuf::from_absolute_path_checked`, converts it via `LegacyAppPathString::from(path)`, and compares the result with a wrapper around the original native string.
+**Data flow**: It chooses a known absolute native path for the current platform, wraps it in `AbsolutePathBuf` after checking that it is absolute, then converts it into `LegacyAppPathString`. The output should be the same path text.
 
-**Call relations**: Invoked by the test harness to cover the `From<AbsolutePathBuf>` path into API text, separate from URI-based rendering.
+**Call relations**: This test covers the path from a real host-native absolute path into the API string type. It uses the absolute-path checker first, then verifies the `LegacyAppPathString` conversion result.
 
 *Call graph*: calls 1 internal fn (from_absolute_path_checked); 1 external calls (assert_eq!).
 
@@ -969,11 +977,11 @@ fn renders_an_absolute_path_using_the_host_convention()
 fn renders_native_non_unicode_windows_fallback_lossily()
 ```
 
-**Purpose**: On Windows, verifies that non-Unicode native paths render with replacement characters in API text and that the corresponding fallback `PathUri` can be rendered only under the Windows convention. It also confirms POSIX rendering rejects that fallback URI.
+**Purpose**: On Windows only, checks what happens when a native path contains text that is not valid Unicode. The code should still produce a readable API path string, replacing the bad character with `�`, and should reject that fallback when asked to render it as POSIX.
 
-**Data flow**: Constructs a `PathBuf` from a UTF-16 sequence containing an unpaired surrogate, validates it as `AbsolutePathBuf`, converts it with `LegacyAppPathString::from_abs_path` and expects a string ending in `�`, then creates a `PathUri` with `PathUri::from_abs_path`. It renders that URI with `LegacyAppPathString::from_path_uri` under both `PathConvention::Windows` and `PathConvention::Posix`, expecting success for Windows and `OpaqueFallback` for POSIX.
+**Data flow**: It builds a Windows path from raw UTF-16 units, including an invalid surrogate value. That path is checked as absolute, converted to a legacy string, and converted to a `PathUri`. Rendering the URI as Windows should produce the same lossy text, while rendering it as POSIX should return an opaque-fallback error.
 
-**Call relations**: Windows-only test run by the harness. It ties together native-path conversion, fallback URI generation, and convention-sensitive rendering for malformed Unicode paths.
+**Call relations**: This is a platform-specific edge-case test for Windows native paths. It connects native Windows path construction, absolute-path validation, URI conversion, and legacy string rendering to make sure non-Unicode paths fail safely and predictably across conventions.
 
 *Call graph*: calls 2 internal fn (from_absolute_path_checked, from_abs_path); 3 external calls (assert_eq!, from_wide, from).
 
@@ -984,10 +992,10 @@ fn renders_native_non_unicode_windows_fallback_lossily()
 fn serializes_and_deserializes_as_a_string()
 ```
 
-**Purpose**: Pins down serde representation for `LegacyAppPathString` as a bare JSON string. It uses a rendered POSIX path as the sample value.
+**Purpose**: Checks that a rendered legacy API path appears in JSON as a simple string, not as a structured object. This matters because external API clients expect ordinary path text.
 
-**Data flow**: Parses a `PathUri`, renders it to `LegacyAppPathString` with `from_path_uri`, serializes that value to JSON text, checks the exact JSON string, then deserializes it back and compares with the original rendered value.
+**Data flow**: It parses a file URI, renders it as a POSIX legacy path string, serializes that value to JSON, and checks the JSON text. It then deserializes the JSON string back and verifies it matches the original rendered value.
 
-**Call relations**: Invoked by the test harness as a focused serde round-trip check after obtaining a valid API path string from URI rendering.
+**Call relations**: This test ties URI rendering to the API serialization boundary. It shows that once a `LegacyAppPathString` has been created, JSON input and output preserve it as plain text.
 
 *Call graph*: calls 2 internal fn (parse, from_path_uri); 2 external calls (assert_eq!, to_string).

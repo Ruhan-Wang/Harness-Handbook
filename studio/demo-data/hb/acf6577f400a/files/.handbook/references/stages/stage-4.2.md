@@ -1,12 +1,14 @@
 # Feature flags, provider catalogs, and built-in asset installation  `stage-4.2`
 
-This startup stage assembles the catalogs, toggles, and bundled assets the rest of the system assumes already exist before any session, plugin surface, or UI is created. It begins by resolving feature state: `features` defines typed flag schemas, maps legacy keys, merges layered config with overrides, and emits warnings and telemetry, while `managed_features` applies policy pins and dependency normalization. The TUI’s experimental-features view is the interactive editor for those flags.
+This stage is startup preparation. Before Codex opens a session or draws major UI screens, it builds the “menu of available things”: enabled features, known models, skills, plugins, tools, presets, and bundled assets.
 
-It also installs and loads built-in capabilities. Skills configuration schemas and extension config determine whether bundled skills participate; `skills` installs embedded system skills, `core-skills` can clean them up, compute enable/disable rules, discover `SKILL.md` trees from all roots, and build the filtered runtime skill index. Memory extensions seed default instruction files similarly.
+The feature files define all feature flags, read them from TOML config, keep old flag names working, and enforce any flags that must stay on or off. The terminal experimental-features view lets users change some of those choices safely.
 
-For external capability catalogs, marketplace config and CLI manage plugin sources; plugin provider and load-outcome types turn discovered plugins into merged capability roots. MCP declarations are parsed, conflict-resolved in the catalog, and combined into the final server set.
+The skills files configure skills, install built-in system skills into CODEX_HOME, create default memory-extension instructions, then find, read, filter, and cache usable skill files from user, project, system, admin, plugin, and extra folders.
 
-Finally, this stage prepares static runtime catalogs: model-provider definitions, model metadata and collaboration presets, approval presets, and built-in pet assets and manifests, including downloading and validating cached spritesheets.
+The plugin and marketplace files locate installed marketplaces, manage them from the command line, recognize plugins, and turn loaded plugin features into usable lists. MCP files then combine plugin, user, built-in, extension, and login-controlled tool servers into one catalog.
+
+The model files define provider and model catalogs, apply local limits and defaults, and keep old preset keys working. Collaboration and approval preset files provide built-in working modes and permission levels. Finally, TUI files prepare model choices, update commands, and terminal pet images before the interface needs them.
 
 ## Files in this stage
 
@@ -15,11 +17,13 @@ These files define feature schemas, legacy mappings, canonical resolution, manag
 
 ### `features/src/feature_configs.rs`
 
-`config` · `config definition and load-time interpretation`
+`config` · `config load`
 
-This file is primarily a schema definition module. It declares three feature-specific config structs with `Serialize`, `Deserialize`, `JsonSchema`, and `deny_unknown_fields` so they can be loaded from TOML, emitted back out, and documented in generated schemas. `CodeModeConfigToml` carries an optional `enabled` flag plus an optional list of excluded tool namespaces. `MultiAgentV2ConfigToml` is richer, with optional concurrency, timeout, usage-hint, namespace, and visibility settings; several fields carry `schemars` constraints such as minimum thread count, bounded timeout ranges, and a regex/length restriction for `tool_namespace`. `NetworkProxyConfigToml` models proxy enablement and policy, including proxy URLs, SOCKS settings, upstream allowances, domain and Unix-socket permission maps, and a mode enum.
+This file is like a set of labeled forms for feature settings. Each struct describes what options are allowed for one feature, and each field is optional so a config file can mention only the settings it wants to override. The code uses serde, a Rust library for turning data into and out of file formats, so these settings can be loaded from or saved to TOML. It also uses JSON Schema generation, which lets tools describe or validate the allowed configuration shape.
 
-The only behavior in the file is the `FeatureConfig` trait implementation for the three public config structs. Each implementation simply exposes the optional `enabled` field and provides a setter that writes `Some(enabled)`. The rest of the types are pure data carriers: a removed internal config struct retained for compatibility, plus small enums for proxy mode and allow/deny permissions. Because the file contains almost no control flow, its main value is in the exact field set, serde behavior, and schema annotations that constrain configuration shape.
+The file covers three main public feature configs. CodeModeConfigToml can turn code mode on or off and hide selected tool namespaces from code mode. MultiAgentV2ConfigToml controls multi-agent behavior, including whether it is enabled, timeout limits, usage hint text, and the tool namespace used for agent tools. NetworkProxyConfigToml controls network proxy behavior, including proxy URLs, SOCKS5 options, domain and Unix socket allow/deny rules, and safety-related escape hatches whose names make their risk explicit.
+
+A shared FeatureConfig trait is implemented for the main feature structs. That gives higher-level code one simple way to ask, “Is this feature explicitly enabled?” or to set that enabled flag, without caring which feature it is working with. The deny_unknown_fields setting is important: if someone misspells a config key, the loader rejects it instead of silently ignoring it.
 
 #### Function details
 
@@ -29,11 +33,11 @@ The only behavior in the file is the `FeatureConfig` trait implementation for th
 fn enabled(&self) -> Option<bool>
 ```
 
-**Purpose**: Returns the optional enabled state stored in the code-mode config.
+**Purpose**: This returns the optional on/off setting for code mode. It is used when code wants to know whether the user or configuration explicitly enabled or disabled this feature.
 
-**Data flow**: It reads `self.enabled` and returns that `Option<bool>` unchanged.
+**Data flow**: It reads the CodeModeConfigToml value it is called on, looks at its enabled field, and returns that optional boolean. If the field was not set in the config, the result is empty rather than true or false.
 
-**Call relations**: This method satisfies the shared `FeatureConfig` trait contract for code-mode configuration consumers.
+**Call relations**: This is the CodeModeConfigToml version of the shared FeatureConfig interface. Higher-level feature-loading code can call enabled through that interface when it is deciding whether code mode should be active, without needing special code for this particular config type.
 
 
 ##### `CodeModeConfigToml::set_enabled`  (lines 22–24)
@@ -42,11 +46,11 @@ fn enabled(&self) -> Option<bool>
 fn set_enabled(&mut self, enabled: bool)
 ```
 
-**Purpose**: Sets the code-mode config's enabled flag to an explicit value.
+**Purpose**: This records an explicit on/off choice for code mode. It is useful when code needs to programmatically turn the feature setting into a definite value.
 
-**Data flow**: It takes a mutable reference and a `bool`, writes `Some(enabled)` into `self.enabled`, and returns unit.
+**Data flow**: It receives a boolean such as true or false, then stores it inside the config's enabled field as a present value. Before the call, the field may have been missing; after the call, it is definitely set.
 
-**Call relations**: This is the mutation half of the `FeatureConfig` trait implementation for `CodeModeConfigToml`.
+**Call relations**: This is called through the shared FeatureConfig interface when generic feature code needs to update a feature's enabled flag. It does not call out to other helpers; it simply updates the CodeModeConfigToml data.
 
 
 ##### `MultiAgentV2ConfigToml::enabled`  (lines 62–64)
@@ -55,11 +59,11 @@ fn set_enabled(&mut self, enabled: bool)
 fn enabled(&self) -> Option<bool>
 ```
 
-**Purpose**: Returns the optional enabled state stored in the multi-agent v2 config.
+**Purpose**: This returns the optional on/off setting for the multi-agent v2 feature. It lets generic feature code check whether the config explicitly says to enable or disable multi-agent behavior.
 
-**Data flow**: It reads and returns `self.enabled` as `Option<bool>`.
+**Data flow**: It reads the MultiAgentV2ConfigToml value, takes the enabled field, and returns it. A missing field stays missing, which allows defaults from elsewhere to still apply.
 
-**Call relations**: Implements the common `FeatureConfig` getter for the multi-agent v2 feature.
+**Call relations**: This function fulfills the FeatureConfig contract for MultiAgentV2ConfigToml. The broader configuration system can ask for the enabled state in the same way it does for other features, while the rest of the multi-agent settings remain specific to this struct.
 
 
 ##### `MultiAgentV2ConfigToml::set_enabled`  (lines 66–68)
@@ -68,11 +72,11 @@ fn enabled(&self) -> Option<bool>
 fn set_enabled(&mut self, enabled: bool)
 ```
 
-**Purpose**: Sets the multi-agent v2 config's enabled flag to an explicit value.
+**Purpose**: This sets the multi-agent v2 feature to explicitly enabled or disabled. It gives shared feature code a standard way to write that decision into this config object.
 
-**Data flow**: It takes `enabled: bool`, stores `Some(enabled)` in `self.enabled`, and returns unit.
+**Data flow**: It takes a boolean input and places it into the config's enabled field as a present value. The rest of the multi-agent settings, such as timeouts and hint text, are left unchanged.
 
-**Call relations**: Implements the common `FeatureConfig` setter for the multi-agent v2 feature.
+**Call relations**: This is the update side of the FeatureConfig implementation for MultiAgentV2ConfigToml. Generic code that works with many feature configs can call it without knowing about the multi-agent-specific fields.
 
 
 ##### `NetworkProxyConfigToml::enabled`  (lines 110–112)
@@ -81,11 +85,11 @@ fn set_enabled(&mut self, enabled: bool)
 fn enabled(&self) -> Option<bool>
 ```
 
-**Purpose**: Returns the optional enabled state stored in the network-proxy config.
+**Purpose**: This returns the optional on/off setting for the network proxy feature. It helps the program decide whether proxy behavior has been explicitly requested or disabled in configuration.
 
-**Data flow**: It reads `self.enabled` and returns it unchanged.
+**Data flow**: It reads the NetworkProxyConfigToml value, checks its enabled field, and returns that optional boolean. If no enabled value was supplied, it returns no value so another defaulting layer can decide.
 
-**Call relations**: Implements the `FeatureConfig` getter for network-proxy configuration handling.
+**Call relations**: This connects NetworkProxyConfigToml to the shared FeatureConfig interface. Feature-loading code can use the same enabled check for the proxy feature that it uses for code mode and multi-agent settings.
 
 
 ##### `NetworkProxyConfigToml::set_enabled`  (lines 114–116)
@@ -94,22 +98,22 @@ fn enabled(&self) -> Option<bool>
 fn set_enabled(&mut self, enabled: bool)
 ```
 
-**Purpose**: Sets the network-proxy config's enabled flag to an explicit value.
+**Purpose**: This writes an explicit enabled or disabled state into the network proxy config. It is used when code needs to force the proxy feature's on/off flag to a known value.
 
-**Data flow**: It writes `Some(enabled)` into `self.enabled` on the mutable config struct.
+**Data flow**: It receives a boolean and stores it in the enabled field as a present setting. Other proxy details, such as URLs, permission maps, and safety flags, are not changed.
 
-**Call relations**: Implements the `FeatureConfig` setter for network-proxy configuration handling.
+**Call relations**: This function is called through the FeatureConfig interface by generic feature code that toggles feature configs. It keeps the common enabled-setting behavior separate from the many network-proxy-specific options.
 
 
 ### `features/src/legacy.rs`
 
-`config` · `config normalization and feature-toggle application`
+`config` · `config load`
 
-This file is a compatibility layer for older configuration keys. It defines a private `Alias` struct and a static `ALIASES` table that maps legacy string keys such as `connectors`, `web_search`, and `experimental_use_unified_exec_tool` to current `Feature` enum variants. Two public-facing helpers expose that mapping: `legacy_feature_keys` iterates the known legacy strings, and `feature_for_key` resolves one key to a `Feature` while logging a deprecation-style message when the alias differs from the canonical feature key.
+Feature flags are switches that turn optional behavior on or off. Over time, some switches in this project were renamed or moved to a cleaner configuration format. This file is the compatibility bridge for those older names. Without it, a user with an older config file could silently lose a setting, or the program might not understand a feature they had already enabled.
 
-The second half of the file handles a small legacy toggle struct, `LegacyFeatureToggles`, currently containing `experimental_use_unified_exec_tool`. Its `apply` method pushes any populated legacy values into a mutable `Features` set through `set_if_some`. That helper centralizes the compatibility behavior: if a legacy option is present, it enables or disables the target feature, logs the alias usage, and records the legacy key through `features.record_legacy_usage`. `set_feature` is intentionally tiny and just dispatches to `features.enable` or `features.disable`.
+The file contains a small table that pairs each old name, such as `web_search` or `experimental_use_unified_exec_tool`, with the current `Feature` it now means. When the program sees one of these old names, it translates it to the modern feature. It also logs a helpful message saying, in effect, “this old name still works, but please use the new one.”
 
-A subtle design choice is that `log_alias` suppresses logging when the alias string already equals the canonical feature key, so only true legacy spellings produce the informational tracing event. This keeps compatibility support visible without spamming logs for canonical usage.
+There are two paths here. One path lists all known old keys so other code can recognize them. Another path takes a specific key and finds the matching modern feature. There is also a small `LegacyFeatureToggles` struct for older configuration fields that were read directly as booleans. Its `apply` method turns the matching feature on or off and records that a legacy setting was used. The overall job is like keeping forwarding addresses after people move: old mail still arrives, but everyone is encouraged to use the new address.
 
 #### Function details
 
@@ -119,11 +123,11 @@ A subtle design choice is that `log_alias` suppresses logging when the alias str
 fn legacy_feature_keys() -> impl Iterator<Item = &'static str>
 ```
 
-**Purpose**: Returns an iterator over all recognized legacy feature-key strings.
+**Purpose**: This function gives other code the list of old feature flag names that are still recognized. It is useful when the configuration system needs to know which legacy keys should be accepted instead of treated as unknown.
 
-**Data flow**: It iterates the static `ALIASES` slice and maps each `Alias` to its `legacy_key`, yielding `&'static str` items.
+**Data flow**: It reads the built-in alias table in this file. It takes each alias entry, extracts only the old key string, and returns an iterator that produces those strings one by one. It does not change any settings.
 
-**Call relations**: Used by feature-resolution code to know which deprecated keys should still be recognized during configuration materialization.
+**Call relations**: During feature configuration, `materialize_resolved_enabled` calls this to learn which old names exist. That caller can then include those names when turning raw configuration into the final set of enabled features.
 
 *Call graph*: called by 1 (materialize_resolved_enabled).
 
@@ -134,11 +138,11 @@ fn legacy_feature_keys() -> impl Iterator<Item = &'static str>
 fn feature_for_key(key: &str) -> Option<Feature>
 ```
 
-**Purpose**: Looks up a legacy key in the alias table and returns the corresponding canonical `Feature`.
+**Purpose**: This function translates one old feature flag name into the current `Feature` value. If the key is not a known legacy name, it returns nothing.
 
-**Data flow**: It takes a string key, scans `ALIASES` for a matching `legacy_key`, and if found logs the alias via `log_alias` before returning `Some(alias.feature)`; otherwise it returns `None`.
+**Data flow**: It receives a text key from configuration. It searches the alias table for a matching old key. If it finds one, it logs a warning-style informational message about the newer preferred name and returns the matching feature; if not, it returns `None`.
 
-**Call relations**: This resolver is called by higher-level feature lookup logic when interpreting configuration keys. On successful matches it delegates to `log_alias` so deprecated usage is surfaced.
+**Call relations**: This is used when configuration code needs to resolve a name into a real feature. The call graph records it as being called from feature-key resolution code; in that moment, it acts as the legacy lookup step before the rest of the system works with the normal `Feature` value.
 
 *Call graph*: called by 1 (feature_for_key).
 
@@ -149,11 +153,11 @@ fn feature_for_key(key: &str) -> Option<Feature>
 fn apply(self, features: &mut Features)
 ```
 
-**Purpose**: Applies populated fields from the legacy toggle struct onto the mutable `Features` collection.
+**Purpose**: This method applies legacy boolean settings that were read into `LegacyFeatureToggles` to the main `Features` collection. In plain terms, it takes an old-style on/off setting and makes the modern feature list match it.
 
-**Data flow**: It consumes `self`, takes a mutable `Features`, and forwards the `experimental_use_unified_exec_tool` option plus its target `Feature::UnifiedExec` and alias string to `set_if_some`.
+**Data flow**: It consumes the `LegacyFeatureToggles` value and receives a mutable `Features` object, meaning it is allowed to change the feature set. For each supported old field, it passes the possible boolean value, the modern feature, and the old key name to `set_if_some`. The output is the same `Features` object, but possibly with a feature enabled or disabled.
 
-**Call relations**: This is the entry point for struct-based legacy toggles; it delegates all conditional logic and side effects to `set_if_some`.
+**Call relations**: After older configuration fields have been parsed, this method is the bridge into the main feature system. It hands the actual decision to `set_if_some`, which only changes the feature set when the old field was present.
 
 *Call graph*: calls 1 internal fn (set_if_some).
 
@@ -169,11 +173,11 @@ fn set_if_some(
 )
 ```
 
-**Purpose**: Conditionally applies one legacy boolean toggle, logs the alias, and records that legacy configuration was used.
+**Purpose**: This helper changes a feature only when an old configuration value was actually provided. That matters because an absent legacy field should not accidentally override newer settings.
 
-**Data flow**: It takes mutable `Features`, a target `Feature`, an `Option<bool>`, and the alias key. If the option is `Some(enabled)`, it calls `set_feature` to enable or disable the feature, calls `log_alias` to emit the compatibility message, and then calls `features.record_legacy_usage(alias_key, feature)`. If the option is `None`, it does nothing.
+**Data flow**: It receives the feature collection to change, the specific feature, an optional boolean value, and the old key name. If the value is present, it turns the feature on or off, logs that the old name was used, and records that legacy usage in the feature collection. If the value is missing, it leaves everything alone.
 
-**Call relations**: Called by `LegacyFeatureToggles::apply`. It orchestrates the three side effects associated with honoring a legacy toggle.
+**Call relations**: `LegacyFeatureToggles::apply` calls this for each old-style field it knows about. When there is work to do, it calls `set_feature` to make the actual on/off change, calls `log_alias` to tell the user about the modern name, and calls `record_legacy_usage` so the system remembers that compatibility behavior was needed.
 
 *Call graph*: calls 3 internal fn (record_legacy_usage, log_alias, set_feature); called by 1 (apply).
 
@@ -184,11 +188,11 @@ fn set_if_some(
 fn set_feature(features: &mut Features, feature: Feature, enabled: bool)
 ```
 
-**Purpose**: Applies a boolean value to a feature by enabling or disabling it on the `Features` collection.
+**Purpose**: This helper performs the simple on/off action for one feature. It hides the small branch between enabling and disabling so the legacy code above stays easy to read.
 
-**Data flow**: It takes mutable `Features`, a `Feature`, and `enabled: bool`; if true it calls `features.enable(feature)`, otherwise `features.disable(feature)`.
+**Data flow**: It receives the mutable feature collection, a feature, and a boolean. If the boolean is true, it calls `enable` on the feature collection. If the boolean is false, it calls `disable`. It returns no separate value; the change is made directly to the provided `Features` object.
 
-**Call relations**: Used only by `set_if_some` as the low-level state mutation step.
+**Call relations**: `set_if_some` calls this after it has confirmed that a legacy setting was present. This function then delegates to the main `Features` type, which owns the real enable and disable behavior.
 
 *Call graph*: calls 2 internal fn (disable, enable); called by 1 (set_if_some).
 
@@ -199,26 +203,26 @@ fn set_feature(features: &mut Features, feature: Feature, enabled: bool)
 fn log_alias(alias: &str, feature: Feature)
 ```
 
-**Purpose**: Emits an informational tracing message when a legacy alias is used instead of the feature's canonical key.
+**Purpose**: This function writes an informational log message when someone uses an old feature name instead of the current one. It helps users and maintainers notice outdated configuration without breaking it immediately.
 
-**Data flow**: It takes the alias string and `Feature`, computes the canonical key with `feature.key()`, returns immediately if alias and canonical are identical, and otherwise logs an `info!` event containing both names and guidance to prefer `[features].{canonical}`.
+**Data flow**: It receives the old alias text and the modern feature. It asks the feature for its official key. If the old name and official name are the same, it does nothing. Otherwise, it emits a log message that includes both names and recommends the modern `[features]` setting.
 
-**Call relations**: Called from both `feature_for_key` and `set_if_some` so alias usage is visible whether it comes from key lookup or legacy toggle application.
+**Call relations**: `set_if_some` calls this after applying a legacy field, and key lookup also uses it when an old key is translated. It relies on the feature’s `key` method to find the canonical name, then sends the message through the tracing `info!` logging system.
 
 *Call graph*: calls 1 internal fn (key); called by 1 (set_if_some); 1 external calls (info!).
 
 
 ### `features/src/lib.rs`
 
-`config` · `config load and feature resolution`
+`config` · `config load and startup, with runtime checks`
 
-This file is the central feature model for the system. It declares the `Stage` lifecycle enum, the large `Feature` enum of all known toggles, and the `FEATURES` registry that binds each feature ID to its string key, rollout stage, and built-in default. `Feature::info` is the invariant-enforcing lookup: every enum variant must have a corresponding `FeatureSpec`, and missing entries are treated as unreachable.
+Feature flags are switches that let Codex turn parts of the product on or off without deleting code. This file is the switchboard. It lists every known feature in one registry, gives each one a config key, and records its lifecycle stage, such as stable, experimental, under development, deprecated, or removed.
 
-Runtime state lives in `Features`, which stores enabled flags in a `BTreeSet<Feature>` plus a sorted set of `LegacyFeatureUsage` notices. Construction starts from `Features::with_defaults`, then `Features::from_sources` layers base config, profile config, legacy toggle shims, and explicit `FeatureOverrides`, finally calling `normalize_dependencies` so dependent flags are auto-enabled (`SpawnCsv` implies `Collab`, `CodeModeOnly` implies `CodeMode`).
+At startup or config loading time, Codex builds a `Features` value. It starts from built-in defaults, then applies settings from a base config, profile config, old legacy names, and direct overrides. It also records when someone used an old name so the user can be warned with a helpful replacement. Some old flags are accepted but ignored, so older config files do not break.
 
-Config parsing is split between plain booleans and structured feature configs. `FeaturesToml` flattens arbitrary `[features]` booleans into `entries`, while selected features (`code_mode`, `multi_agent_v2`, `network_proxy`) can also be represented as `FeatureToml<T>` values carrying richer config structs. `entries()` materializes those structured `enabled` bits back into a simple map for resolution, and `materialize_resolved_enabled()` writes a fully resolved feature state back into TOML while stripping legacy aliases and removed compatibility-only fields.
+The file also supports richer TOML feature entries. Most flags are simple true-or-false values, but some features can have extra settings under their own config block. Think of this as a light switch where a few rooms also have a dimmer knob.
 
-A notable design choice is that removed/deprecated keys still parse, but many are ignored or only recorded as legacy usage. `apply_map` contains the compatibility policy in one place: some keys are no-ops, some emit deprecation notices, and unknown keys only log a warning. The file also exposes lookup helpers (`feature_for_key`, `canonical_feature_for_key`, `is_known_feature_key`) and `unstable_features_warning_event`, which inspects the effective TOML table and only warns about under-development features that are both explicitly enabled in config and actually active after resolution.
+Finally, it emits telemetry when feature states differ from defaults and can create a warning event if a user enabled under-development features. Without this file, the project would have scattered, inconsistent feature names and no single trusted way to decide what behavior should be active.
 
 #### Function details
 
@@ -228,11 +232,11 @@ A notable design choice is that removed/deprecated keys still parse, but many ar
 fn experimental_menu_name(self) -> Option<&'static str>
 ```
 
-**Purpose**: Returns the display name for a feature only when its stage is `Stage::Experimental`.
+**Purpose**: Returns the user-facing name for a feature when that feature is shown in the experimental features menu. If the feature is not experimental, it returns nothing.
 
-**Data flow**: Reads `self` and pattern-matches on the enum variant. It returns `Some(name)` for `Experimental { name, .. }` and `None` for all other stages without mutating any state.
+**Data flow**: It receives a `Stage` value. If that value is the experimental kind, it picks out the stored menu name; otherwise it produces no value.
 
-**Call relations**: Used by callers that need to surface experimental features in UI menus; it is a pure accessor over the stage metadata embedded in the registry.
+**Call relations**: Other parts of the user interface can call this when building an experimental-feature menu. This function only reads the stage label and does not change anything.
 
 
 ##### `Stage::experimental_menu_description`  (lines 56–63)
@@ -241,11 +245,11 @@ fn experimental_menu_name(self) -> Option<&'static str>
 fn experimental_menu_description(self) -> Option<&'static str>
 ```
 
-**Purpose**: Extracts the menu description text from an experimental stage definition.
+**Purpose**: Returns the short description shown beside an experimental feature in the menu. Non-experimental stages have no such description.
 
-**Data flow**: Consumes `self` by value, matches on `Stage::Experimental { menu_description, .. }`, and returns that static string wrapped in `Some`; all non-experimental stages yield `None`.
+**Data flow**: It receives a `Stage`. For an experimental stage, it extracts the stored menu description; for stable, deprecated, removed, or under-development stages, it returns nothing.
 
-**Call relations**: Supports presentation logic for experimental-feature menus by exposing only the description field when the stage actually carries one.
+**Call relations**: It is a small helper for presentation code. It lets callers ask the stage itself whether it has menu text instead of duplicating that matching logic elsewhere.
 
 
 ##### `Stage::experimental_announcement`  (lines 65–73)
@@ -254,11 +258,11 @@ fn experimental_menu_description(self) -> Option<&'static str>
 fn experimental_announcement(self) -> Option<&'static str>
 ```
 
-**Purpose**: Returns the announcement string for experimental features, but suppresses empty announcements.
+**Purpose**: Returns an announcement message for an experimental feature, if one exists. Empty announcement text is treated as no announcement.
 
-**Data flow**: Matches `self`; for `Experimental { announcement: "", .. }` it returns `None`, for non-empty experimental announcements it returns `Some(announcement)`, and for all other stages it returns `None`.
+**Data flow**: It receives a `Stage`. If it is experimental and has non-empty announcement text, that text comes out; otherwise the result is empty.
 
-**Call relations**: This accessor is used where the UI or config tooling wants optional announcement copy without treating an empty string as meaningful content.
+**Call relations**: This supports places that announce newly available experimental features. It keeps the rule about empty announcements close to the stage data.
 
 
 ##### `Feature::key`  (lines 277–279)
@@ -267,11 +271,11 @@ fn experimental_announcement(self) -> Option<&'static str>
 fn key(self) -> &'static str
 ```
 
-**Purpose**: Maps a `Feature` enum variant to its canonical string key from the registry.
+**Purpose**: Returns the config-file name for a feature, such as the string users put under `[features]`. This gives the rest of the program one canonical spelling for each feature.
 
-**Data flow**: Reads `self`, delegates to `Feature::info`, and returns the `key` field from the matched `FeatureSpec`.
+**Data flow**: It receives a `Feature`, looks up that feature’s registry entry through `Feature::info`, and returns the entry’s key string.
 
-**Call relations**: Called when generating deprecation notices and alias tracking so all outward-facing references use the registry’s canonical key rather than hard-coded strings.
+**Call relations**: Legacy-warning code and other callers use this when they need the official feature name. It relies on `Feature::info` to find the matching registry record.
 
 *Call graph*: calls 1 internal fn (info); called by 3 (record_legacy_usage, log_alias, legacy_usage_notice).
 
@@ -282,11 +286,11 @@ fn key(self) -> &'static str
 fn stage(self) -> Stage
 ```
 
-**Purpose**: Returns the rollout stage metadata for a feature.
+**Purpose**: Returns where a feature is in its lifecycle: stable, experimental, under development, deprecated, or removed.
 
-**Data flow**: Reads `self`, looks up the corresponding `FeatureSpec` via `info`, and returns its `stage` field.
+**Data flow**: It receives a `Feature`, finds its registry entry through `Feature::info`, and returns the stored stage.
 
-**Call relations**: Used by validation and tests to assert rollout policy, and by any code that needs to distinguish stable, experimental, deprecated, or removed flags.
+**Call relations**: Code that needs to display or reason about feature maturity can call this. The actual source of truth remains the central `FEATURES` list.
 
 *Call graph*: calls 1 internal fn (info).
 
@@ -297,11 +301,11 @@ fn stage(self) -> Stage
 fn default_enabled(self) -> bool
 ```
 
-**Purpose**: Reports whether a feature is enabled in the built-in default feature set.
+**Purpose**: Tells whether a feature is normally on before any user config changes it.
 
-**Data flow**: Reads `self`, resolves its `FeatureSpec` through `info`, and returns the `default_enabled` boolean.
+**Data flow**: It receives a `Feature`, uses `Feature::info` to find the registry record, and returns the record’s default true-or-false value.
 
-**Call relations**: Feeds tests, metrics comparisons, and default-set construction so the registry remains the single source of truth for defaults.
+**Call relations**: This is the public shortcut for reading defaults from the registry. It keeps callers from searching the registry themselves.
 
 *Call graph*: calls 1 internal fn (info).
 
@@ -312,11 +316,11 @@ fn default_enabled(self) -> bool
 fn info(self) -> &'static FeatureSpec
 ```
 
-**Purpose**: Finds the `FeatureSpec` entry corresponding to a `Feature` enum variant.
+**Purpose**: Finds the full registry record for a feature. This is the private lookup used by the feature convenience methods.
 
-**Data flow**: Iterates over the global `FEATURES` slice, finds the spec whose `id` equals `self`, and returns a shared reference to that spec. If no spec exists, it panics via `unreachable!`, enforcing registry completeness.
+**Data flow**: It receives a `Feature`, scans the `FEATURES` list until it finds the matching `FeatureSpec`, and returns that record. If the registry is missing an entry, the code treats that as an impossible programmer error.
 
-**Call relations**: This is the internal lookup primitive behind `key`, `stage`, and `default_enabled`; those accessors all depend on this registry search.
+**Call relations**: `Feature::key`, `Feature::stage`, and `Feature::default_enabled` all call this. It is the link between the enum value and the metadata table.
 
 *Call graph*: called by 3 (default_enabled, key, stage).
 
@@ -327,11 +331,11 @@ fn info(self) -> &'static FeatureSpec
 fn apply(self, features: &mut Features)
 ```
 
-**Purpose**: Applies ad hoc runtime overrides that are not represented directly as normal feature-table entries.
+**Purpose**: Applies direct override settings on top of the normal feature config. In this file, it specifically handles the legacy-style override for web search requests.
 
-**Data flow**: Consumes `self` and mutably borrows `Features`. If `web_search_request` is `Some(true)` it enables `Feature::WebSearchRequest`; if `Some(false)` it disables it. In either override case it records legacy usage under the alias `web_search_request`.
+**Data flow**: It receives override values and a mutable `Features` set. If a web-search override is present, it enables or disables `WebSearchRequest` and records that a legacy setting was used.
 
-**Call relations**: Invoked at the end of `Features::from_sources` after base/profile config has been applied, so explicit overrides win over config-derived state.
+**Call relations**: `Features::from_sources` calls this after base and profile config have been applied, so explicit overrides win. It uses `Features::enable`, `Features::disable`, and `Features::record_legacy_usage` to make the change and remember the warning.
 
 *Call graph*: calls 3 internal fn (disable, enable, record_legacy_usage); called by 1 (from_sources).
 
@@ -342,11 +346,11 @@ fn apply(self, features: &mut Features)
 fn with_defaults() -> Self
 ```
 
-**Purpose**: Constructs a fresh effective feature set from the registry’s built-in defaults.
+**Purpose**: Creates a fresh feature set using only the built-in defaults from the registry.
 
-**Data flow**: Creates an empty `BTreeSet`, iterates over `FEATURES`, inserts every `spec.id` whose `default_enabled` is true, and returns a `Features` with that enabled set and an empty `legacy_usages` set.
+**Data flow**: It starts with an empty sorted set, walks through every `FeatureSpec`, inserts each feature whose default is enabled, and returns a `Features` value with no legacy usage records yet.
 
-**Call relations**: This is the starting point for all feature resolution and many tests; `from_sources` builds on top of it rather than starting from an empty set.
+**Call relations**: This is the starting point for `Features::from_sources` and many tests. Later config layers edit the set it creates.
 
 *Call graph*: called by 60 (web_search_mode_defaults_to_none_if_unset, web_search_mode_disabled_overrides_legacy_request, web_search_mode_prefers_config_over_legacy_flags, codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result, codex_apps_auth_elicitation_feature_enabled_requests_elicitation, codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result, codex_apps_auth_elicitation_non_host_owned_server_returns_original_result, default_available_modes, default_mode_enabled_available_modes, elevated_flag_works_by_itself (+15 more)); 1 external calls (new).
 
@@ -357,11 +361,11 @@ fn with_defaults() -> Self
 fn enabled(&self, f: Feature) -> bool
 ```
 
-**Purpose**: Checks whether a specific feature is currently enabled in the effective set.
+**Purpose**: Answers the basic question: is this feature currently on?
 
-**Data flow**: Reads `self.enabled` and returns whether the `BTreeSet` contains the requested `Feature`.
+**Data flow**: It receives a `Feature` and checks whether that feature is present in the enabled set. It returns true or false and changes nothing.
 
-**Call relations**: This is the main query primitive used throughout the file by dependency normalization, metrics emission, auth gating, warning generation, and config materialization.
+**Call relations**: Many parts of the system call this before using optional behavior. Within this file, it is also used by dependency cleanup, metrics, auth-specific app checks, and config materialization.
 
 *Call graph*: called by 12 (validate_pinned_features_constraint, resolve_web_search_mode, from_features, apps_enabled_for_auth, emit_metrics, normalize_dependencies, use_legacy_landlock, materialize_resolved_enabled, unstable_features_warning_event, shell_command_backend_for_features (+2 more)); 1 external calls (contains).
 
@@ -372,11 +376,11 @@ fn enabled(&self, f: Feature) -> bool
 fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool
 ```
 
-**Purpose**: Determines whether apps should be considered available for auth-dependent flows.
+**Purpose**: Checks whether apps should be treated as available for the current authentication state. Apps must be enabled, and the user must have ChatGPT authentication.
 
-**Data flow**: Reads the `Apps` feature state via `enabled` and combines it with the `has_chatgpt_auth` argument using logical AND. It returns a boolean and does not mutate state.
+**Data flow**: It receives a boolean saying whether ChatGPT auth exists. It checks the `Apps` feature and combines both conditions into one true-or-false answer.
 
-**Call relations**: Used by higher-level auth logic that needs both the feature flag and a valid auth condition before exposing apps behavior.
+**Call relations**: This gives callers a single safe check instead of making them remember both requirements. It delegates the feature part to `Features::enabled`.
 
 *Call graph*: calls 1 internal fn (enabled).
 
@@ -387,11 +391,11 @@ fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool
 fn use_legacy_landlock(&self) -> bool
 ```
 
-**Purpose**: Provides a named query for the deprecated legacy Linux sandbox toggle.
+**Purpose**: Reports whether Codex should use the older Landlock Linux sandbox behavior. Landlock is a Linux security mechanism for restricting what a process can access.
 
-**Data flow**: Reads the enabled set through `enabled(Feature::UseLegacyLandlock)` and returns that boolean.
+**Data flow**: It reads the current enabled set and returns whether `UseLegacyLandlock` is present.
 
-**Call relations**: Acts as a semantic wrapper for callers deciding sandbox behavior, keeping direct feature-ID checks out of downstream code.
+**Call relations**: Sandbox setup code can call this instead of knowing the exact feature enum. Internally it is just a named wrapper around `Features::enabled`.
 
 *Call graph*: calls 1 internal fn (enabled).
 
@@ -402,11 +406,11 @@ fn use_legacy_landlock(&self) -> bool
 fn enable(&mut self, f: Feature) -> &mut Self
 ```
 
-**Purpose**: Turns on a feature in the effective set.
+**Purpose**: Turns a feature on in the current feature set.
 
-**Data flow**: Mutably borrows `self`, inserts the given `Feature` into the `enabled` `BTreeSet`, and returns `&mut Self` for chaining.
+**Data flow**: It receives a mutable `Features` value and a `Feature`. It inserts that feature into the enabled set and returns the same `Features` value so callers can chain more edits.
 
-**Call relations**: Used by override application, map application, dependency normalization, and generic setters whenever a flag must be forced on.
+**Call relations**: Config application, override application, dependency normalization, and other setters call this whenever a flag resolves to true.
 
 *Call graph*: called by 5 (apply, apply_map, normalize_dependencies, set_enabled, set_feature); 1 external calls (insert).
 
@@ -417,11 +421,11 @@ fn enable(&mut self, f: Feature) -> &mut Self
 fn disable(&mut self, f: Feature) -> &mut Self
 ```
 
-**Purpose**: Turns off a feature in the effective set.
+**Purpose**: Turns a feature off in the current feature set.
 
-**Data flow**: Mutably borrows `self`, removes the given `Feature` from the `enabled` `BTreeSet`, and returns `&mut Self` for chaining.
+**Data flow**: It receives a mutable `Features` value and a `Feature`. It removes that feature from the enabled set and returns the same `Features` value for chaining.
 
-**Call relations**: Used symmetrically with `enable` by config application and setters whenever a flag must be forced off.
+**Call relations**: Config application, override application, and generic setters call this whenever a flag resolves to false.
 
 *Call graph*: called by 4 (apply, apply_map, set_enabled, set_feature); 1 external calls (remove).
 
@@ -432,11 +436,11 @@ fn disable(&mut self, f: Feature) -> &mut Self
 fn set_enabled(&mut self, f: Feature, enabled: bool) -> &mut Self
 ```
 
-**Purpose**: Sets a feature to a requested boolean state through one unified API.
+**Purpose**: Sets a feature to a requested true-or-false state without the caller needing to choose `enable` or `disable`.
 
-**Data flow**: Takes a `Feature` and `enabled: bool`; if true it delegates to `enable`, otherwise to `disable`, returning the same mutable receiver.
+**Data flow**: It receives a feature and a boolean. If the boolean is true it enables the feature; if false it disables it, then returns the edited feature set.
 
-**Call relations**: Called by normalization code outside this file that wants to assign a computed state without branching itself.
+**Call relations**: Higher-level normalization code calls this when it has already computed the desired state. This function funnels both paths through `Features::enable` and `Features::disable`.
 
 *Call graph*: calls 2 internal fn (disable, enable); called by 1 (normalize_candidate).
 
@@ -447,11 +451,11 @@ fn set_enabled(&mut self, f: Feature, enabled: bool) -> &mut Self
 fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature)
 ```
 
-**Purpose**: Adds a deprecation/alias usage record even when the alias equals the canonical key.
+**Purpose**: Records that the user used an old or compatibility feature name and prepares a warning message for it, even if the old name matches the current key.
 
-**Data flow**: Takes an alias string and target `Feature`, computes `(summary, details)` via `legacy_usage_notice`, constructs a `LegacyFeatureUsage`, and inserts it into the sorted `legacy_usages` set.
+**Data flow**: It receives the alias string and the real `Feature`. It asks `legacy_usage_notice` for human-readable warning text, then inserts a `LegacyFeatureUsage` record into the set of notices.
 
-**Call relations**: Used by `apply_map` for compatibility keys that should always produce a notice, and by `record_legacy_usage` after it filters out canonical names.
+**Call relations**: `Features::apply_map` calls this for known deprecated config forms, and `Features::record_legacy_usage` calls it after deciding a warning is needed. The stored notices can later be shown to the user.
 
 *Call graph*: calls 1 internal fn (legacy_usage_notice); called by 2 (apply_map, record_legacy_usage); 1 external calls (insert).
 
@@ -462,11 +466,11 @@ fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature)
 fn record_legacy_usage(&mut self, alias: &str, feature: Feature)
 ```
 
-**Purpose**: Records legacy usage only when the provided alias differs from the feature’s canonical key.
+**Purpose**: Records legacy feature-name usage only when the given name is not already the canonical feature key.
 
-**Data flow**: Reads the feature’s canonical key via `Feature::key`; if `alias == canonical` it returns early, otherwise it delegates to `record_legacy_usage_force`.
+**Data flow**: It receives an alias and a feature. It compares the alias to `Feature::key`; if they match, it does nothing, otherwise it forwards to `Features::record_legacy_usage_force`.
 
-**Call relations**: Called from override and config application paths whenever a legacy alias may have been used, avoiding redundant notices for canonical config.
+**Call relations**: Override and config parsing code call this when a key may be old. It avoids noisy warnings for users who already use the right spelling.
 
 *Call graph*: calls 2 internal fn (key, record_legacy_usage_force); called by 3 (apply, apply_map, set_if_some).
 
@@ -477,11 +481,11 @@ fn record_legacy_usage(&mut self, alias: &str, feature: Feature)
 fn legacy_feature_usages(&self) -> impl Iterator<Item = &LegacyFeatureUsage> + '_
 ```
 
-**Purpose**: Exposes the accumulated legacy-usage notices as an iterator.
+**Purpose**: Provides access to the collected legacy-usage notices.
 
-**Data flow**: Borrows `self.legacy_usages` immutably and returns its iterator.
+**Data flow**: It reads the internal sorted set of `LegacyFeatureUsage` records and returns an iterator, which lets callers walk through the notices without taking ownership of them.
 
-**Call relations**: Used by callers that need to surface deprecation notices after config resolution without taking ownership of the set.
+**Call relations**: Reporting or config-validation code can call this after feature resolution to show deprecation messages. This function only exposes what earlier parsing recorded.
 
 *Call graph*: 1 external calls (iter).
 
@@ -492,11 +496,11 @@ fn legacy_feature_usages(&self) -> impl Iterator<Item = &LegacyFeatureUsage> + '
 fn emit_metrics(&self, otel: &SessionTelemetry)
 ```
 
-**Purpose**: Emits telemetry counters for features whose effective state differs from their built-in default, excluding removed flags.
+**Purpose**: Reports feature states that differ from their defaults to telemetry. Telemetry here means measurement data used to understand product behavior.
 
-**Data flow**: Iterates over `FEATURES`, skips specs whose stage is `Removed`, compares `self.enabled(spec.id)` against `spec.default_enabled`, and for each mismatch increments the `codex.feature.state` counter on the provided `SessionTelemetry` with `feature` and `value` labels.
+**Data flow**: It receives the final `Features` set and a telemetry session. For every non-removed feature, it compares the current state with the default; when they differ, it sends a counter with the feature name and current value.
 
-**Call relations**: Called after feature resolution to report non-default rollout state; it depends on `enabled` and the registry metadata to avoid emitting noise for unchanged defaults.
+**Call relations**: This is called after feature resolution when Codex wants observability about non-default settings. It uses `Features::enabled` to read the final state and the telemetry object to publish the count.
 
 *Call graph*: calls 2 internal fn (enabled, counter); 1 external calls (matches!).
 
@@ -507,11 +511,11 @@ fn emit_metrics(&self, otel: &SessionTelemetry)
 fn apply_map(&mut self, m: &BTreeMap<String, bool>)
 ```
 
-**Purpose**: Applies a flat map of feature-key booleans, including compatibility handling for legacy, deprecated, removed, and unknown keys.
+**Purpose**: Applies a plain map of feature-name strings to true-or-false values, like the contents of a `[features]` TOML table.
 
-**Data flow**: Mutably borrows `self` and iterates over `BTreeMap<String, bool>`. It first special-cases certain keys: some force legacy notices (`web_search_request`, `web_search_cached`, `use_legacy_landlock`), while many removed compatibility keys are ignored with `continue`. It then resolves each remaining key through `feature_for_key`; known keys may record alias usage if the input key differs from the canonical key, and are enabled or disabled according to the boolean value. Unknown keys trigger a tracing warning.
+**Data flow**: It receives a map from strings to booleans. For each entry, it handles special deprecated or removed names, looks up the feature with `feature_for_key`, records legacy usage when needed, and then enables or disables the resolved feature. Unknown keys are logged as warnings.
 
-**Call relations**: This is the core boolean-toggle application path, called by `apply_toml`. It centralizes backward-compatibility policy so `from_sources` can simply feed it normalized entries.
+**Call relations**: `Features::apply_toml` uses this after converting structured TOML into a flat map. This is the main place where user-written feature keys become changes to the effective `Features` set.
 
 *Call graph*: calls 5 internal fn (disable, enable, record_legacy_usage, record_legacy_usage_force, feature_for_key); called by 1 (apply_toml); 2 external calls (matches!, warn!).
 
@@ -526,11 +530,11 @@ fn from_sources(
     ) -> Self
 ```
 
-**Purpose**: Builds the final effective feature set from layered config sources plus explicit overrides.
+**Purpose**: Builds the final feature set from layered configuration sources and explicit overrides.
 
-**Data flow**: Starts from `Features::with_defaults()`. For each of the two `FeatureConfigSource` inputs (`base`, then `profile`), it applies `LegacyFeatureToggles` derived from `experimental_use_unified_exec_tool`, then if a `FeaturesToml` is present it applies that TOML via `apply_toml`. After both layers, it applies `FeatureOverrides`, normalizes dependencies, and returns the resulting `Features`.
+**Data flow**: It starts with `Features::with_defaults`. It then applies the base source, then the profile source, including legacy toggles and TOML feature tables. After that it applies overrides and normalizes feature dependencies before returning the finished set.
 
-**Call relations**: This is the main entry point used by config loading and validation code. It orchestrates all lower-level application steps and establishes precedence: defaults < base < profile < overrides < dependency normalization.
+**Call relations**: Config loading and validation code call this to get the effective flags for a session. It is the main orchestration point in this file, combining defaults, config files, legacy compatibility, overrides, and dependency rules.
 
 *Call graph*: calls 2 internal fn (apply, with_defaults); called by 12 (load_config_with_layer_stack, resolve_bootstrap_auth_keyring_backend_kind, validate_feature_requirements_in_config_toml, from_sources_applies_base_profile_and_overrides, from_sources_ignores_removed_apply_patch_freeform_feature_key, from_sources_ignores_removed_image_detail_original_feature_key, from_sources_ignores_removed_js_repl_feature_keys, from_sources_ignores_removed_plugin_hooks_feature_key, from_sources_ignores_removed_terminal_resize_reflow_feature_key, from_sources_ignores_removed_undo_feature_key (+2 more)).
 
@@ -541,11 +545,11 @@ fn from_sources(
 fn enabled_features(&self) -> Vec<Feature>
 ```
 
-**Purpose**: Returns the enabled feature set as a sorted vector.
+**Purpose**: Returns a list of all currently enabled features.
 
-**Data flow**: Iterates over the internal `BTreeSet<Feature>`, copies each feature, collects them into a `Vec<Feature>`, and returns it.
+**Data flow**: It reads the internal sorted set, copies each enabled feature into a vector, and returns that vector.
 
-**Call relations**: Used by callers that need a concrete list rather than repeated membership checks; ordering follows the set’s natural sort.
+**Call relations**: Callers use this when they need a snapshot list rather than one yes-or-no check. It does not alter the feature set.
 
 *Call graph*: 1 external calls (iter).
 
@@ -556,11 +560,11 @@ fn enabled_features(&self) -> Vec<Feature>
 fn normalize_dependencies(&mut self)
 ```
 
-**Purpose**: Enforces one-way feature dependencies after all direct config inputs have been applied.
+**Purpose**: Turns on required parent features when a dependent feature is enabled. This prevents impossible combinations.
 
-**Data flow**: Reads current feature state with `enabled`. If `SpawnCsv` is on and `Collab` is off, it enables `Collab`. If `CodeModeOnly` is on and `CodeMode` is off, it enables `CodeMode`. It mutates the enabled set in place and returns nothing.
+**Data flow**: It reads the current enabled set. If `SpawnCsv` is on without `Collab`, it enables `Collab`; if `CodeModeOnly` is on without `CodeMode`, it enables `CodeMode`.
 
-**Call relations**: Called at the end of `from_sources` and by normalization tests to ensure dependent features are present even if users only enabled the narrower child flag.
+**Call relations**: `Features::from_sources` calls this after all config layers are applied, so dependency fixes happen once at the end. Other normalization flows can also call it when adjusting candidates.
 
 *Call graph*: calls 2 internal fn (enable, enabled); called by 1 (normalize_candidate).
 
@@ -571,11 +575,11 @@ fn normalize_dependencies(&mut self)
 fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>)
 ```
 
-**Purpose**: Builds the human-readable deprecation or alias-migration message associated with a legacy feature key.
+**Purpose**: Creates the warning text shown when a user relies on a legacy, deprecated, or renamed feature setting.
 
-**Data flow**: Takes an alias string and target `Feature`, derives the canonical key via `Feature::key`, and matches on the feature. Web-search aliases get a special summary plus `web_search_details`; `UseLegacyLandlock` gets a custom deprecation/removal message; all other aliases produce a generic "use `[features].canonical` instead" summary and optional details when alias and canonical differ. It returns `(summary, Option<details>)`.
+**Data flow**: It receives the alias the user wrote and the real feature it maps to. It chooses a clear summary and optional details, with special wording for web search and legacy Landlock, and returns those strings.
 
-**Call relations**: Used exclusively by `record_legacy_usage_force` so all legacy notices are generated consistently from one policy table.
+**Call relations**: `Features::record_legacy_usage_force` calls this before storing a legacy-usage record. It uses `Feature::key` for canonical replacement names and `web_search_details` for web-search-specific instructions.
 
 *Call graph*: calls 2 internal fn (key, web_search_details); called by 1 (record_legacy_usage_force); 1 external calls (format!).
 
@@ -586,11 +590,11 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
 fn web_search_details() -> &'static str
 ```
 
-**Purpose**: Provides the fixed explanatory text for deprecated web-search feature aliases.
+**Purpose**: Returns the detailed help text for replacing old web-search feature flags.
 
-**Data flow**: Returns a static string literal describing the supported `web_search` config values.
+**Data flow**: It takes no input and returns a fixed string explaining the newer `web_search` config values: live, cached, or disabled.
 
-**Call relations**: Called only from `legacy_usage_notice` for web-search-related deprecation messages.
+**Call relations**: `legacy_usage_notice` calls this when building warnings for deprecated web-search flags. Keeping this text in one function avoids repeating the same guidance.
 
 *Call graph*: called by 1 (legacy_usage_notice).
 
@@ -601,11 +605,11 @@ fn web_search_details() -> &'static str
 fn feature_for_key(key: &str) -> Option<Feature>
 ```
 
-**Purpose**: Resolves either a canonical feature key or a legacy alias to a `Feature` enum value.
+**Purpose**: Translates a config key string into the matching `Feature`, accepting both current keys and legacy keys.
 
-**Data flow**: Scans the canonical `FEATURES` registry for an exact key match; if none is found, it delegates to `legacy::feature_for_key(key)` and returns that result.
+**Data flow**: It receives a string. It first searches the main `FEATURES` registry for an exact key match; if none is found, it asks the legacy feature-key module. It returns the matching feature or nothing.
 
-**Call relations**: This is the permissive lookup used by config application and key validation so old config names continue to parse.
+**Call relations**: `Features::apply_map` uses this to understand user config keys, and `is_known_feature_key` uses it for validation. It is the broad lookup that includes compatibility names.
 
 *Call graph*: calls 1 internal fn (feature_for_key); called by 2 (apply_map, is_known_feature_key).
 
@@ -616,11 +620,11 @@ fn feature_for_key(key: &str) -> Option<Feature>
 fn canonical_feature_for_key(key: &str) -> Option<Feature>
 ```
 
-**Purpose**: Resolves only canonical registry keys, excluding legacy aliases.
+**Purpose**: Translates only current, canonical feature keys into features. Unlike `feature_for_key`, it does not accept legacy names.
 
-**Data flow**: Searches `FEATURES` for a spec whose `key` equals the input string and maps the found spec to its `id`; otherwise returns `None`.
+**Data flow**: It receives a string, searches the main `FEATURES` registry for that exact key, and returns the matching feature if found.
 
-**Call relations**: Used where callers need to distinguish canonical names from compatibility aliases rather than accepting both.
+**Call relations**: This is useful when a caller wants to know whether a key is official rather than merely accepted for backward compatibility.
 
 
 ##### `is_known_feature_key`  (lines 608–610)
@@ -629,11 +633,11 @@ fn canonical_feature_for_key(key: &str) -> Option<Feature>
 fn is_known_feature_key(key: &str) -> bool
 ```
 
-**Purpose**: Checks whether a string is recognized as any valid feature key, canonical or legacy.
+**Purpose**: Checks whether a string is any known feature key, including legacy names.
 
-**Data flow**: Delegates to `feature_for_key` and returns whether the result is `Some(_)`.
+**Data flow**: It receives a key string, calls `feature_for_key`, and returns true if the lookup found a feature.
 
-**Call relations**: Provides a simple validation helper for config or CLI parsing paths that only need a yes/no answer.
+**Call relations**: Validation code can use this as a simple yes-or-no check. The actual matching rules live in `feature_for_key`.
 
 *Call graph*: calls 1 internal fn (feature_for_key).
 
@@ -644,11 +648,11 @@ fn is_known_feature_key(key: &str) -> bool
 fn apply_toml(&mut self, features: &FeaturesToml)
 ```
 
-**Purpose**: Applies a deserialized `FeaturesToml` table to the effective feature set.
+**Purpose**: Applies a parsed `FeaturesToml` config table to the current feature set.
 
-**Data flow**: Calls `features.entries()` to flatten structured feature configs into a `BTreeMap<String, bool>`, then passes that map to `apply_map` for actual mutation.
+**Data flow**: It receives structured TOML feature settings, asks that structure for its flattened entries map, and sends the map to `Features::apply_map`.
 
-**Call relations**: This is the bridge between TOML-specific representation and the generic map-based application logic used by `from_sources`.
+**Call relations**: `Features::from_sources` calls this for base and profile config. This function bridges rich TOML parsing and the simpler map-based feature application logic.
 
 *Call graph*: calls 2 internal fn (apply_map, entries).
 
@@ -659,11 +663,11 @@ fn apply_toml(&mut self, features: &FeaturesToml)
 fn clear_removed_compatibility_entries(&mut self)
 ```
 
-**Purpose**: Removes compatibility-only fields that should not survive into newly materialized config.
+**Purpose**: Removes config entries that are kept only so old files can still parse, but should not be written back into fresh resolved config.
 
-**Data flow**: Mutably borrows `self`, sets `removed_apps_mcp_path_override` to `None`, and removes the `apps_mcp_path_override` key from the flattened `entries` map.
+**Data flow**: It mutates a `FeaturesToml` value by clearing the removed apps MCP path override field and deleting its old boolean entry from the general map.
 
-**Call relations**: Called before writing resolved feature state back into TOML so obsolete compatibility inputs are not preserved.
+**Call relations**: `FeaturesToml::materialize_resolved_enabled` calls this before writing resolved feature states. It keeps obsolete compatibility settings from reappearing in generated config.
 
 *Call graph*: called by 1 (materialize_resolved_enabled).
 
@@ -674,11 +678,11 @@ fn clear_removed_compatibility_entries(&mut self)
 fn entries(&self) -> BTreeMap<String, bool>
 ```
 
-**Purpose**: Produces a flat key→bool view of the feature table, including `enabled` bits extracted from structured feature configs.
+**Purpose**: Produces a flat map of feature keys to true-or-false values from a TOML feature table.
 
-**Data flow**: Clones `self.entries`, then for `code_mode`, `multi_agent_v2`, and `network_proxy` checks whether the optional `FeatureToml` contains an enabled value via `FeatureToml::enabled`; when present, it inserts the canonical feature key with that boolean into the returned map.
+**Data flow**: It starts with the simple boolean entries already stored in the table. Then it looks inside richer config blocks for `code_mode`, `multi_agent_v2`, and `network_proxy`; when those blocks say enabled or disabled, it adds the corresponding canonical key to the map.
 
-**Call relations**: Used by `Features::apply_toml` and tests to normalize mixed TOML shapes into the same boolean map consumed by feature resolution.
+**Call relations**: `Features::apply_toml` calls this so all feature settings, simple and structured, can be processed by `Features::apply_map` in one common path.
 
 *Call graph*: called by 1 (apply_toml).
 
@@ -689,11 +693,11 @@ fn entries(&self) -> BTreeMap<String, bool>
 fn materialize_resolved_enabled(&mut self, features: &Features)
 ```
 
-**Purpose**: Overwrites the TOML representation so it explicitly reflects a resolved `Features` state while preserving structured config payloads.
+**Purpose**: Rewrites a TOML feature table so it explicitly reflects the final resolved enabled state of every feature.
 
-**Data flow**: Mutably borrows `self` and reads `features`. It first clears removed compatibility entries, removes all legacy alias keys from `entries`, then iterates over every `FeatureSpec` in `FEATURES`. For `CodeMode`, `MultiAgentV2`, and `NetworkProxy`, it updates or creates the corresponding structured `FeatureToml` via `materialize_resolved_feature_enabled`; for all other features it writes the canonical key and current enabled boolean into `entries`.
+**Data flow**: It receives the final `Features` set. It first removes compatibility-only entries and legacy keys. Then, for every feature in the registry, it writes the resolved true-or-false value into either the relevant structured feature block or the generic entries map.
 
-**Call relations**: Used when persisting or replaying resolved config so the serialized feature table is canonical, complete, and still retains extra structured settings for richer features.
+**Call relations**: Config-writing or normalization code can call this when it wants a concrete, up-to-date feature table. It uses `Features::enabled` to read final states and `materialize_resolved_feature_enabled` for structured feature blocks.
 
 *Call graph*: calls 4 internal fn (enabled, clear_removed_compatibility_entries, legacy_feature_keys, materialize_resolved_feature_enabled).
 
@@ -707,11 +711,11 @@ fn materialize_resolved_feature_enabled(
 )
 ```
 
-**Purpose**: Sets the `enabled` state inside an optional structured feature config, creating a simple boolean form when absent.
+**Purpose**: Sets the enabled value for a structured TOML feature entry, creating the entry if it does not already exist.
 
-**Data flow**: Takes `&mut Option<FeatureToml<T>>` and a boolean. If the option is `Some`, it mutates the contained `FeatureToml` via `set_enabled`; if `None`, it replaces it with `Some(FeatureToml::Enabled(enabled))`.
+**Data flow**: It receives an optional `FeatureToml` block and a boolean. If the block exists, it updates its enabled field; if it is missing, it creates a simple enabled-or-disabled entry.
 
-**Call relations**: Called by `FeaturesToml::materialize_resolved_enabled` for the small set of features that support richer nested config.
+**Call relations**: `FeaturesToml::materialize_resolved_enabled` uses this for features such as code mode, multi-agent v2, and network proxy that may have richer config than a plain boolean.
 
 *Call graph*: called by 1 (materialize_resolved_enabled); 1 external calls (Enabled).
 
@@ -722,11 +726,11 @@ fn materialize_resolved_feature_enabled(
 fn from(entries: BTreeMap<String, bool>) -> Self
 ```
 
-**Purpose**: Builds a `FeaturesToml` from an already-flat map of boolean entries.
+**Purpose**: Builds a `FeaturesToml` value from a plain map of feature names to booleans.
 
-**Data flow**: Consumes a `BTreeMap<String, bool>` and returns a `FeaturesToml` with that map in `entries` and all other fields filled from `Default::default()`.
+**Data flow**: It receives a `BTreeMap<String, bool>`, stores it as the table’s generic entries, and fills every other field with its default empty value.
 
-**Call relations**: Used heavily in tests and simple callers that only need boolean feature toggles without structured sub-configs.
+**Call relations**: Tests and config code use this when they already have simple feature toggles and need the structured TOML wrapper type.
 
 *Call graph*: called by 11 (resolve_bootstrap_auth_keyring_backend_kind_uses_secret_auth_storage_feature, feature_table_overrides_legacy_flags, memory_tool_makes_memories_root_readable_without_creating_or_widening_writes, responses_websocket_features_do_not_change_wire_api, resolve_windows_sandbox_mode_falls_back_to_legacy_keys, from_sources_ignores_removed_apply_patch_freeform_feature_key, from_sources_ignores_removed_image_detail_original_feature_key, from_sources_ignores_removed_js_repl_feature_keys, from_sources_ignores_removed_plugin_hooks_feature_key, from_sources_ignores_removed_terminal_resize_reflow_feature_key (+1 more)); 1 external calls (default).
 
@@ -737,11 +741,11 @@ fn from(entries: BTreeMap<String, bool>) -> Self
 fn enabled(&self) -> Option<bool>
 ```
 
-**Purpose**: Extracts the effective enabled bit from either a plain boolean feature value or a structured feature config.
+**Purpose**: Reads whether a feature TOML entry says the feature is enabled, even when that entry is a richer config object instead of a plain boolean.
 
-**Data flow**: Matches on `self`: `Enabled(bool)` returns `Some(bool)`, while `Config(T)` delegates to the config object’s `FeatureConfig::enabled()` method and returns that optional value.
+**Data flow**: It receives a `FeatureToml`. If it is the simple boolean form, it returns that boolean. If it is the config form, it asks the config object for its enabled value, which may be absent.
 
-**Call relations**: Used when flattening TOML into boolean entries so structured feature sections participate in normal feature resolution.
+**Call relations**: `FeaturesToml::entries` uses this to flatten structured feature settings into the same true-or-false map as simple settings.
 
 
 ##### `FeatureToml::set_enabled`  (lines 720–725)
@@ -750,11 +754,11 @@ fn enabled(&self) -> Option<bool>
 fn set_enabled(&mut self, enabled: bool)
 ```
 
-**Purpose**: Mutates the enabled bit regardless of whether the feature is stored as a bare boolean or a structured config object.
+**Purpose**: Updates the enabled state inside a feature TOML entry, whether that entry is a plain boolean or a richer config block.
 
-**Data flow**: Matches on `self`: for `Enabled(value)` it overwrites the bool directly; for `Config(config)` it delegates to `FeatureConfig::set_enabled(enabled)`.
+**Data flow**: It receives a mutable `FeatureToml` and a boolean. For the simple form it replaces the boolean; for the config form it calls the config object’s setter.
 
-**Call relations**: Used during config materialization to preserve structured settings while synchronizing their `enabled` field with resolved feature state.
+**Call relations**: `materialize_resolved_feature_enabled` uses this when writing final resolved states back into structured TOML entries.
 
 
 ##### `unstable_features_warning_event`  (lines 1278–1325)
@@ -768,22 +772,26 @@ fn unstable_features_warning_event(
 ) -> Option<Event>
 ```
 
-**Purpose**: Builds a protocol warning event listing under-development features that are explicitly enabled in config and active in the resolved feature set.
+**Purpose**: Creates a warning event when the user has explicitly enabled under-development features. The warning explains that these features may be incomplete or unpredictable.
 
-**Data flow**: Takes an optional TOML `Table`, a suppression flag, the resolved `Features`, and the config path. It returns early with `None` if suppression is enabled. Otherwise it scans the table entries, treating either `key = true` or `{ enabled = true }` as enabled, resolves each key against the canonical registry, filters to features that are both enabled in `features` and staged `UnderDevelopment`, sorts their keys, and if any remain constructs an `Event { msg: EventMsg::Warning(WarningEvent { message }) }` with a message mentioning the config path. If none qualify, it returns `None`.
+**Data flow**: It receives the effective TOML feature table, a suppression flag, the final feature set, and the config path. If warnings are suppressed, it returns nothing. Otherwise it finds enabled feature entries whose registry stage is `UnderDevelopment` and that are truly enabled in `Features`; if any exist, it returns a warning event listing them.
 
-**Call relations**: Called after config resolution to surface a user-facing warning. It intentionally cross-checks both raw config and resolved state so disabled or ignored entries do not produce false positives.
+**Call relations**: Startup or config reporting code can call this after feature resolution. It uses `Features::enabled` to avoid warning about entries that did not survive final resolution, then packages the message as a protocol `Event` for the rest of Codex to display.
 
 *Call graph*: calls 1 internal fn (enabled); 5 external calls (new, new, format!, matches!, Warning).
 
 
 ### `core/src/config/managed_features.rs`
 
-`config` · `config load and later feature mutation`
+`config` · `config load and feature-setting changes`
 
-This file centers on `ManagedFeatures`, a small stateful wrapper containing a `ConstrainedWithSource<Features>` and a `BTreeMap<Feature, bool>` of pinned feature requirements. The wrapper exists so feature policy is enforced both at construction time and on later mutations: every candidate `Features` value is first rewritten by `normalize_candidate`, which force-applies pinned values and then calls `Features::normalize_dependencies()` so dependent flags settle into a valid shape before validation runs. Construction accepts optional sourced `FeatureRequirementsToml`; those requirements are parsed into canonical `Feature` keys, with compatibility handling for the legacy `auto_review` key and warnings for legacy aliases or unknown entries.
+This file is a guardrail around the project's feature flags. A feature flag is a switch that turns a behavior on or off. Some environments can declare requirements, such as “this feature must be enabled” or “that feature must be disabled.” This file reads those requirements, applies them to the configured feature set, and rejects any setting that would conflict with them.
 
-Validation happens in two forms. `validate_pinned_features_constraint` produces a `ConstraintError::InvalidValue` with the original `RequirementSource` when a normalized feature set still disagrees with required pins; `validate_pinned_features` adapts that into `std::io::Error` for config-loading paths. The file also validates raw `ConfigToml` before feature synthesis: `explicit_feature_settings_in_config` extracts only user-explicit feature settings from both `[features]` and the special `experimental_use_unified_exec_tool` field, and `validate_explicit_feature_settings_in_config_toml` rejects direct config values that contradict pinned requirements. A separate helper, `validate_feature_requirements_in_config_toml`, builds `Features` via `Features::from_sources` and then reuses `ManagedFeatures` construction, ensuring the same normalization and policy checks are applied during config validation as during runtime feature management.
+The main type is `ManagedFeatures`, which wraps the normal `Features` value. Think of it like a thermostat with a locked minimum and maximum: users can still adjust the temperature, but the lock stops them from choosing values outside the allowed range. Here, “pinned” features are the locked switches.
+
+When `ManagedFeatures` is built, it parses feature requirements from TOML configuration, normalizes the requested features by forcing pinned values, then checks that feature dependencies did not make the final result violate a pin. Later changes go through the same path: normalize first, validate second, then store.
+
+The file also validates raw `ConfigToml` before startup continues. It catches direct contradictions, such as a config file explicitly disabling a feature that a requirement file says must be enabled. Unknown or older feature names are warned about rather than silently ignored when warnings are requested.
 
 #### Function details
 
@@ -793,11 +801,11 @@ Validation happens in two forms. `validate_pinned_features_constraint` produces 
 fn default() -> Self
 ```
 
-**Purpose**: Builds an unconstrained `ManagedFeatures` with default `Features` and no pinned requirements. It is the zero-policy baseline used when no feature requirements source exists.
+**Purpose**: Creates a `ManagedFeatures` value with the normal default feature flags and no forced feature requirements. This is the unrestricted starting point.
 
-**Data flow**: Reads no external state. It creates `Features::default()`, wraps it in `Constrained::allow_any`, then in `ConstrainedWithSource::new` with `source` set to `None`, and initializes `pinned_features` as an empty `BTreeMap`.
+**Data flow**: It takes no input. It builds default `Features`, wraps them in a constraint object that allows any value, records no source file, and starts with an empty map of pinned features. The result is a ready-to-use `ManagedFeatures` with no special locks.
 
-**Call relations**: This is the default constructor for the type rather than part of the policy-loading path. It delegates all constraint wrapper setup to the `codex_config` constructors so later methods can use the same `ConstrainedWithSource` API regardless of whether requirements were present.
+**Call relations**: This is used when code needs a basic feature set before any requirement file is involved. It relies on the underlying `Features` default and the constraint wrapper to create the safe container.
 
 *Call graph*: calls 2 internal fn (new, allow_any); 2 external calls (new, default).
 
@@ -811,11 +819,11 @@ fn from_configured(
     ) -> std::io::Result<Self>
 ```
 
-**Purpose**: Constructs a managed feature set from already-computed `Features` plus optional sourced requirements, without collecting startup warnings. It is the standard entry used by validation and runtime setup when warnings are not needed by the caller.
+**Purpose**: Builds managed features from already-read feature settings, optionally applying feature requirements. It is the simple constructor for callers that do not need to collect startup warnings.
 
-**Data flow**: Consumes `configured_features` and an optional `Sourced<FeatureRequirementsToml>`, forwards them with `None` for warning storage, and returns either a validated `ManagedFeatures` or an `std::io::Error` if requirements are violated.
+**Data flow**: It receives configured feature flags and optional sourced feature requirements. It passes them onward without a warnings list. The output is either a valid `ManagedFeatures` or an input/output error if the requirements cannot be satisfied.
 
-**Call relations**: It is invoked by config-validation and bootstrap-related callers that need a yes/no result. The function is only a thin wrapper over `ManagedFeatures::from_configured_with_optional_warnings`, centralizing the real parsing, normalization, and validation there.
+**Call relations**: Other startup and validation code calls this when it needs required feature pins enforced. It delegates the real work to `ManagedFeatures::from_configured_with_optional_warnings`, so all construction paths share the same rules.
 
 *Call graph*: called by 3 (resolve_bootstrap_auth_keyring_backend_kind, validate_feature_requirements_in_config_toml, guardian_review_session_config_allows_pinned_disabled_feature); 1 external calls (from_configured_with_optional_warnings).
 
@@ -830,11 +838,11 @@ fn from_configured_with_warnings(
     ) -> st
 ```
 
-**Purpose**: Constructs a managed feature set like `from_configured`, but also records non-fatal parsing warnings such as legacy or unknown requirement keys. It is used when config loading wants to surface warnings to the user.
+**Purpose**: Builds managed features while also collecting warning messages about feature requirement names. This is useful during startup, where warnings can be shown to the user.
 
-**Data flow**: Consumes `configured_features`, optional sourced requirements, and a mutable `Vec<String>` for warnings; passes the warning sink as `Some(&mut Vec<String>)` into the shared constructor and returns the same `std::io::Result<ManagedFeatures>`.
+**Data flow**: It receives configured features, optional sourced requirements, and a mutable list of startup warnings. It forwards all three to the shared constructor. The result is a valid `ManagedFeatures` or an error, and the warning list may have new messages added.
 
-**Call relations**: This path is used by the layered config loader so warnings can be accumulated during startup. It delegates all substantive work to `ManagedFeatures::from_configured_with_optional_warnings`.
+**Call relations**: The config loading flow calls this so it can keep going for non-fatal issues, such as old feature names, while still reporting them. The shared optional-warning constructor does the actual parsing and validation.
 
 *Call graph*: called by 1 (load_config_with_layer_stack); 1 external calls (from_configured_with_optional_warnings).
 
@@ -848,11 +856,11 @@ fn from_configured_with_optional_warnings(
         startup_warnings: Option<&mut Vec<Stri
 ```
 
-**Purpose**: Performs the full construction pipeline: parse requirement pins, normalize the configured feature set against those pins, validate the result, and store both the normalized value and requirement source. This is the file's main constructor.
+**Purpose**: This is the central constructor. It applies pinned feature requirements, normalizes dependencies, and refuses to create a managed feature set if the final result contradicts the required pins.
 
-**Data flow**: Takes owned `configured_features`, optional sourced `FeatureRequirementsToml`, and an optional mutable warning sink. If requirements are present, it destructures `Sourced` into `value` and `source`, parses entries into a `BTreeMap<Feature, bool>`, and preserves the source; otherwise it uses empty pins and no source. It then rewrites the candidate through `normalize_candidate`, validates pinned consistency via `validate_pinned_features`, and on success returns a `ManagedFeatures` whose `value` is `ConstrainedWithSource::new(Constrained::allow_any(normalized_features), source)` and whose `pinned_features` are the parsed pins.
+**Data flow**: It receives configured features, optional feature requirements with their source, and optionally a warnings list. If requirements exist, it parses them into a map of pinned feature switches. It then forces those pinned values into the configured feature set, normalizes feature dependencies, validates the result, and returns a `ManagedFeatures` containing the normalized features and the pins.
 
-**Call relations**: Both public constructors funnel into this method. It orchestrates the helper functions in order—parse, normalize, validate—so all callers get identical behavior and error formatting.
+**Call relations**: Both public construction helpers call this so they behave consistently. It hands requirement parsing to `parse_feature_requirements`, feature adjustment to `normalize_candidate`, and final safety checking to `validate_pinned_features`.
 
 *Call graph*: calls 5 internal fn (new, allow_any, normalize_candidate, parse_feature_requirements, validate_pinned_features); 1 external calls (new).
 
@@ -863,11 +871,11 @@ fn from_configured_with_optional_warnings(
 fn get(&self) -> &Features
 ```
 
-**Purpose**: Returns an immutable reference to the current underlying `Features` value. It is the canonical accessor used internally and by deref.
+**Purpose**: Returns the current feature flags inside `ManagedFeatures`. It lets other code inspect the active feature state without changing it.
 
-**Data flow**: Reads `self.value` and returns `self.value.get()`, exposing `&Features` without modifying any state.
+**Data flow**: It reads the wrapped constrained value and returns a shared reference to the underlying `Features`. Nothing is changed.
 
-**Call relations**: Called by `ManagedFeatures::deref` to support transparent access and by `ManagedFeatures::set_enabled` to clone the current feature set before mutation.
+**Call relations**: The dereference helper and `set_enabled` use this to access the current feature state. It is the safe read-only doorway into the wrapped feature set.
 
 *Call graph*: called by 2 (deref, set_enabled); 1 external calls (get).
 
@@ -878,11 +886,11 @@ fn get(&self) -> &Features
 fn normalize_and_validate(&self, candidate: Features) -> ConstraintResult<Features>
 ```
 
-**Purpose**: Applies the same normalization and policy checks used at construction time to a prospective replacement `Features` value. It is the shared gate for mutation APIs.
+**Purpose**: Prepares a proposed feature set for use and checks whether it is allowed. It is the shared safety step before a feature set can be accepted.
 
-**Data flow**: Consumes an owned candidate `Features`, rewrites it with `normalize_candidate` using `self.pinned_features`, asks `self.value.can_set(&normalized)` to satisfy any underlying `Constrained` rules, then checks pinned-feature consistency with `validate_pinned_features_constraint` using the stored requirement source. On success it returns the normalized `Features`; on failure it returns a `ConstraintError`.
+**Data flow**: It receives a candidate `Features` value. It forces all pinned features to their required values, normalizes dependencies, asks the underlying constraint wrapper whether the value can be set, and checks the pinned features again. It returns the normalized features if valid, or a constraint error if not.
 
-**Call relations**: This helper is called by both `ManagedFeatures::can_set` and `ManagedFeatures::set`. It centralizes mutation-time enforcement so probing and actual updates use identical normalization and validation logic.
+**Call relations**: `ManagedFeatures::can_set` uses this for a dry run, and `ManagedFeatures::set` uses it before storing a new value. It calls `normalize_candidate` first, then `validate_pinned_features_constraint` so changes cannot bypass the pin rules.
 
 *Call graph*: calls 2 internal fn (normalize_candidate, validate_pinned_features_constraint); called by 2 (can_set, set); 1 external calls (can_set).
 
@@ -893,11 +901,11 @@ fn normalize_and_validate(&self, candidate: Features) -> ConstraintResult<Featur
 fn can_set(&self, candidate: &Features) -> ConstraintResult<()>
 ```
 
-**Purpose**: Checks whether a candidate feature set would be accepted after normalization, without mutating the current state. It is the non-destructive validation API.
+**Purpose**: Checks whether a proposed feature set would be accepted, without actually changing the stored features.
 
-**Data flow**: Borrows a candidate `&Features`, clones it to obtain ownership for normalization, passes it to `normalize_and_validate`, and maps a successful normalized result to `()`. It writes no state.
+**Data flow**: It receives a reference to a candidate feature set, clones it, and sends the clone through normalization and validation. It returns success if the candidate would be allowed, or a constraint error if not. The current stored features remain unchanged.
 
-**Call relations**: This is the read-only counterpart to `ManagedFeatures::set`. It exists for callers that need to test a change path before committing, while still exercising the same normalization and pinned-feature checks.
+**Call relations**: Callers can use this as a preview before attempting a real update. It relies on `ManagedFeatures::normalize_and_validate`, which keeps the dry-run rules identical to the real set operation.
 
 *Call graph*: calls 1 internal fn (normalize_and_validate); 1 external calls (clone).
 
@@ -908,11 +916,11 @@ fn can_set(&self, candidate: &Features) -> ConstraintResult<()>
 fn set(&mut self, candidate: Features) -> ConstraintResult<()>
 ```
 
-**Purpose**: Replaces the current feature set with a normalized, validated candidate. It is the main mutation primitive for the wrapper.
+**Purpose**: Replaces the current feature flags, but only after applying required pins and checking that the final result is valid.
 
-**Data flow**: Consumes an owned candidate `Features`, transforms it through `normalize_and_validate`, and if validation succeeds writes the normalized value into `self.value.value` via the inner `Constrained::set`. It returns `ConstraintResult<()>` indicating success or the specific constraint failure.
+**Data flow**: It receives a proposed `Features` value. It normalizes and validates that value, then writes the accepted normalized version into the wrapped constraint container. It returns success or a constraint error.
 
-**Call relations**: Called by `ManagedFeatures::set_enabled` after toggling a single flag. It relies on `normalize_and_validate` so all updates preserve pinned requirements and dependency normalization.
+**Call relations**: `ManagedFeatures::set_enabled` calls this after changing one feature in a copy of the current state. This function is the commit point that prevents invalid feature states from being stored.
 
 *Call graph*: calls 1 internal fn (normalize_and_validate); called by 1 (set_enabled).
 
@@ -923,11 +931,11 @@ fn set(&mut self, candidate: Features) -> ConstraintResult<()>
 fn set_enabled(&mut self, feature: Feature, enabled: bool) -> ConstraintResult<()>
 ```
 
-**Purpose**: Toggles one specific `Feature` on a copy of the current feature set and then commits the change through full validation. It provides a convenient single-flag mutation API.
+**Purpose**: Turns one feature on or off while still respecting pinned feature requirements. It is the basic single-switch update helper.
 
-**Data flow**: Reads the current `Features` via `get()`, clones it, applies `next.set_enabled(feature, enabled)`, then passes the modified copy into `set`. Any normalization side effects or constraint failures happen in that downstream call.
+**Data flow**: It receives a feature and the desired on/off value. It clones the current feature set, changes that one switch in the clone, and sends the result through `ManagedFeatures::set`. The stored value changes only if validation succeeds.
 
-**Call relations**: This helper underpins both `ManagedFeatures::enable` and `ManagedFeatures::disable`. It keeps single-feature edits on the same code path as whole-set replacement.
+**Call relations**: `ManagedFeatures::enable` and `ManagedFeatures::disable` are small convenience wrappers around this. It reads through `ManagedFeatures::get` and commits through `ManagedFeatures::set`.
 
 *Call graph*: calls 2 internal fn (get, set); called by 2 (disable, enable).
 
@@ -938,11 +946,11 @@ fn set_enabled(&mut self, feature: Feature, enabled: bool) -> ConstraintResult<(
 fn enable(&mut self, feature: Feature) -> ConstraintResult<()>
 ```
 
-**Purpose**: Enables one feature through the managed mutation path. It is a convenience wrapper for callers that want a semantic enable operation.
+**Purpose**: Convenience method that tries to turn one feature on. It still obeys any requirement that might force the feature off.
 
-**Data flow**: Takes a `Feature`, forwards it with `enabled = true` to `set_enabled`, and returns the resulting `ConstraintResult<()>`.
+**Data flow**: It receives a feature, converts the request into `enabled = true`, and forwards it to `ManagedFeatures::set_enabled`. The result is success if the managed rules allow the change, or a constraint error otherwise.
 
-**Call relations**: This is a thin wrapper over `ManagedFeatures::set_enabled`, used when callers want to express intent directly rather than pass a boolean.
+**Call relations**: This is a human-friendly wrapper for callers that want to enable a feature without passing a boolean themselves. The real update path continues through `set_enabled`.
 
 *Call graph*: calls 1 internal fn (set_enabled).
 
@@ -953,11 +961,11 @@ fn enable(&mut self, feature: Feature) -> ConstraintResult<()>
 fn disable(&mut self, feature: Feature) -> ConstraintResult<()>
 ```
 
-**Purpose**: Disables one feature through the managed mutation path. It is the symmetric convenience wrapper to `enable`.
+**Purpose**: Convenience method that tries to turn one feature off. It still obeys any requirement that might force the feature on.
 
-**Data flow**: Takes a `Feature`, forwards it with `enabled = false` to `set_enabled`, and returns the resulting `ConstraintResult<()>`.
+**Data flow**: It receives a feature, converts the request into `enabled = false`, and forwards it to `ManagedFeatures::set_enabled`. The result is success if the managed rules allow the change, or a constraint error otherwise.
 
-**Call relations**: Like `ManagedFeatures::enable`, this delegates all real work to `ManagedFeatures::set_enabled` so disable operations still undergo normalization and pinned-feature enforcement.
+**Call relations**: This mirrors `ManagedFeatures::enable` for turning a feature off. The same validation path in `set_enabled` decides whether the change is allowed.
 
 *Call graph*: calls 1 internal fn (set_enabled).
 
@@ -968,11 +976,11 @@ fn disable(&mut self, feature: Feature) -> ConstraintResult<()>
 fn from(features: Features) -> Self
 ```
 
-**Purpose**: Provides a test-only conversion from raw `Features` into unconstrained `ManagedFeatures`. It lets tests construct the wrapper without supplying requirement metadata.
+**Purpose**: Test-only shortcut that wraps a plain `Features` value without applying requirement constraints. It exists so tests can build `ManagedFeatures` directly.
 
-**Data flow**: Consumes a `Features` value, wraps it in `Constrained::allow_any`, then `ConstrainedWithSource::new` with no source, and initializes an empty `pinned_features` map.
+**Data flow**: It receives a `Features` value, wraps it in a constraint container that allows any value, records no source, and leaves the pinned-feature map empty. The output is a `ManagedFeatures` suited for tests that do not need requirement enforcement.
 
-**Call relations**: This implementation is compiled only under `#[cfg(test)]` and is used by tests that need a `ManagedFeatures` instance but are not exercising requirement parsing or validation.
+**Call relations**: Several tests use this to create controlled feature states quickly. Because it is compiled only for tests, normal runtime construction still goes through the requirement-aware constructors.
 
 *Call graph*: calls 2 internal fn (new, allow_any); called by 4 (codex_apps_auth_elicitation_disallowed_by_policy_returns_original_result, codex_apps_auth_elicitation_feature_enabled_requests_elicitation, codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_result, codex_apps_auth_elicitation_non_host_owned_server_returns_original_result); 1 external calls (new).
 
@@ -983,11 +991,11 @@ fn from(features: Features) -> Self
 fn deref(&self) -> &Self::Target
 ```
 
-**Purpose**: Allows `ManagedFeatures` to be used as `&Features` through Rust's deref coercion. It makes the wrapper ergonomic for read-only feature access.
+**Purpose**: Lets `ManagedFeatures` be read like a plain `Features` value in places where only inspection is needed. This is a convenience for Rust code.
 
-**Data flow**: Borrows `self`, calls `get()`, and returns the resulting `&Features` as `&Self::Target`.
+**Data flow**: It receives a reference to `ManagedFeatures` and returns a reference to its inner `Features` by calling `ManagedFeatures::get`. Nothing is changed.
 
-**Call relations**: This is a convenience adapter over `ManagedFeatures::get`; it does not participate in validation logic but reduces call-site boilerplate.
+**Call relations**: Code that uses Rust's dereference behavior can read feature data without explicitly calling `get`. This helper funnels that access through the same read-only method.
 
 *Call graph*: calls 1 internal fn (get).
 
@@ -1001,11 +1009,11 @@ fn normalize_candidate(
 ) -> Features
 ```
 
-**Purpose**: Rewrites a candidate feature set so pinned requirements are applied first and feature dependency rules are then normalized. It ensures validation sees the post-normalization state rather than the raw input.
+**Purpose**: Forces pinned feature values into a proposed feature set and then fixes up feature dependencies. This makes a candidate match the project's required feature rules before validation.
 
-**Data flow**: Takes an owned mutable `Features` and a borrowed `BTreeMap<Feature, bool>`. It iterates over every pinned `(feature, enabled)` pair, calling `candidate.set_enabled(*feature, *enabled)`, then calls `candidate.normalize_dependencies()`, and returns the modified `Features`.
+**Data flow**: It receives a mutable candidate feature set and a map of pinned features. For each pin, it sets that feature to the required on/off value. Then it asks the feature set to normalize dependencies, meaning related features are adjusted so the combination makes sense. It returns the adjusted candidate.
 
-**Call relations**: Used during both initial construction and later mutation validation. By centralizing this rewrite step, the file guarantees that pinned values and dependency-derived values are computed consistently everywhere.
+**Call relations**: The constructor and update validation both call this before accepting features. It is the step that turns a user's requested settings into the actual settings allowed under the pins.
 
 *Call graph*: calls 2 internal fn (normalize_dependencies, set_enabled); called by 2 (from_configured_with_optional_warnings, normalize_and_validate).
 
@@ -1020,11 +1028,11 @@ fn validate_pinned_features_constraint(
 ) -> ConstraintResult<()>
 ```
 
-**Purpose**: Checks that a normalized feature set still matches every pinned requirement and, if not, produces a structured `ConstraintError` that includes the requirement source and allowed values display. It is the core policy-enforcement check.
+**Purpose**: Checks that the final normalized feature set still matches all pinned requirements. This catches cases where dependency normalization would conflict with a required pin.
 
-**Data flow**: Reads `normalized_features`, the pinned-feature map, and an optional `RequirementSource`. If no source is present it returns `Ok(())` immediately. Otherwise it builds an allowed-values string with `feature_requirements_display`, iterates through each pinned feature, compares `normalized_features.enabled(*feature)` to the required boolean, and returns `ConstraintError::InvalidValue` on the first mismatch; otherwise it returns success.
+**Data flow**: It receives normalized features, pinned requirements, and optionally the source of those requirements. If there is no source, it treats the value as unrestricted and succeeds. Otherwise it compares each pinned feature's actual value with its required value. On mismatch, it returns a constraint error that includes the bad value, the allowed set, and where the requirement came from.
 
-**Call relations**: Called directly from `ManagedFeatures::normalize_and_validate` for mutation-time constraint reporting and indirectly from config-loading paths through `validate_pinned_features`. It depends on the candidate already being normalized so mismatches represent true policy violations.
+**Call relations**: `ManagedFeatures::normalize_and_validate` uses this during ordinary updates, and `validate_pinned_features` uses it during construction. It calls `feature_requirements_display` to produce a clear allowed-values message.
 
 *Call graph*: calls 2 internal fn (feature_requirements_display, enabled); called by 2 (normalize_and_validate, validate_pinned_features); 1 external calls (format!).
 
@@ -1039,11 +1047,11 @@ fn validate_pinned_features(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Adapts pinned-feature validation into an `std::io::Result` suitable for config parsing and startup code. It bridges the constraint system with I/O-oriented error handling.
+**Purpose**: Runs pinned-feature validation and converts any constraint failure into an input/output error. This fits construction code that reports invalid configuration as file/data errors.
 
-**Data flow**: Borrows normalized features, pinned features, and optional source; calls `validate_pinned_features_constraint`; on error wraps the returned `ConstraintError` in `std::io::ErrorKind::InvalidData`; otherwise returns `Ok(())`.
+**Data flow**: It receives normalized features, pinned requirements, and an optional requirement source. It delegates the comparison to `validate_pinned_features_constraint`. If that returns a constraint error, this function wraps it as an `InvalidData` I/O error; otherwise it returns success.
 
-**Call relations**: Used by `ManagedFeatures::from_configured_with_optional_warnings`, where construction is part of config loading and therefore expected to report `std::io::Error` rather than `ConstraintError`.
+**Call relations**: The main constructor calls this after normalizing configured features. It is the bridge between feature-constraint logic and configuration-loading error reporting.
 
 *Call graph*: calls 1 internal fn (validate_pinned_features_constraint); called by 1 (from_configured_with_optional_warnings).
 
@@ -1054,11 +1062,11 @@ fn validate_pinned_features(
 fn feature_requirements_display(feature_requirements: &BTreeMap<Feature, bool>) -> String
 ```
 
-**Purpose**: Formats the pinned feature requirements into a stable bracketed string like `[feature_a=true, feature_b=false]` for diagnostics. It is used to populate the `allowed` field in validation errors.
+**Purpose**: Turns pinned feature requirements into a short readable string for error messages. It helps users see exactly which feature values were allowed.
 
-**Data flow**: Borrows a `BTreeMap<Feature, bool>`, iterates in map order, converts each pair into `"<feature.key()>=<bool>"`, collects them into a `Vec<String>`, joins with `, `, and returns the final bracketed `String`.
+**Data flow**: It receives a map of features to required boolean values. It formats each entry as `feature_key=true` or `feature_key=false`, joins them with commas, wraps them in brackets, and returns the resulting string.
 
-**Call relations**: This helper is called by both pinned-feature validation and explicit-config validation so all user-facing errors describe the allowed requirement set in the same format.
+**Call relations**: Both pinned-feature validation and explicit-config validation use this when they need to explain a conflict. It does no checking itself; it only prepares the human-readable allowed list.
 
 *Call graph*: called by 2 (validate_explicit_feature_settings_in_config_toml, validate_pinned_features_constraint); 1 external calls (format!).
 
@@ -1073,11 +1081,11 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool>
 ```
 
-**Purpose**: Converts `FeatureRequirementsToml` entries into canonical pinned `Feature` booleans, while preserving backward compatibility and emitting warnings for legacy or unknown keys. It is the parser for policy requirements.
+**Purpose**: Reads feature requirements from TOML data and turns them into the internal pinned-feature map. It also warns about unknown or older feature names.
 
-**Data flow**: Consumes `FeatureRequirementsToml`, borrows its `RequirementSource`, and optionally borrows a mutable warning vector. It iterates over `feature_requirements.entries`; the special key `auto_review` is mapped directly to `Feature::GuardianApproval`; canonical keys are resolved with `canonical_feature_for_key`; legacy-but-known keys are resolved with `feature_for_key` and generate a warning recommending `feature.key()`; unknown keys generate an ignore warning. Recognized entries are inserted into a `BTreeMap<Feature, bool>`, which is returned.
+**Data flow**: It receives TOML feature requirements, the source they came from, and optionally a startup warning list. For each key, it maps known canonical names to `Feature` values, handles a special old name `auto_review`, accepts legacy names with a warning, and ignores unknown names with a warning. The output is a map saying which features must be on or off.
 
-**Call relations**: Called during managed-feature construction and during explicit-config validation. It delegates warning emission to `push_feature_requirement_warning`, keeping parsing logic focused on key interpretation and map construction.
+**Call relations**: The managed-features constructor calls this to understand requirement files, and explicit config validation calls it to compare requirements against direct config settings. It sends warning messages through `push_feature_requirement_warning`.
 
 *Call graph*: calls 1 internal fn (push_feature_requirement_warning); called by 2 (from_configured_with_optional_warnings, validate_explicit_feature_settings_in_config_toml); 4 external calls (new, canonical_feature_for_key, feature_for_key, format!).
 
@@ -1091,11 +1099,11 @@ fn push_feature_requirement_warning(
 )
 ```
 
-**Purpose**: Emits a feature-requirement warning to tracing and optionally stores the same message for startup reporting. It keeps warning side effects consistent across parsing cases.
+**Purpose**: Reports a non-fatal problem found while reading feature requirements. It logs the warning and, when requested, stores it for startup reporting.
 
-**Data flow**: Takes a mutable optional warning sink and an owned message string. It logs the message with `tracing::warn!`, then, if a `Vec<String>` is present inside the option, pushes the same message into that vector.
+**Data flow**: It receives an optional warning list and a message. It writes the message to the tracing log, then appends the same message to the list if one was provided. It returns nothing.
 
-**Call relations**: Used only by `parse_feature_requirements` for legacy-key and unknown-key cases. It separates warning transport from parsing decisions so callers can choose whether to collect warnings.
+**Call relations**: `parse_feature_requirements` calls this when it sees legacy or unknown requirement keys. This keeps warning behavior consistent whether the caller wants collected startup warnings or only log output.
 
 *Call graph*: called by 1 (parse_feature_requirements); 1 external calls (warn!).
 
@@ -1106,11 +1114,11 @@ fn push_feature_requirement_warning(
 fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature, bool)>
 ```
 
-**Purpose**: Extracts only the feature values explicitly set in `ConfigToml`, along with their config paths and resolved `Feature` identities. This lets validation distinguish direct user settings from derived defaults.
+**Purpose**: Finds feature switches that were directly written in the main config file. This lets validation detect when the config explicitly fights a required feature pin.
 
-**Data flow**: Borrows `ConfigToml` and builds a `Vec<(String, Feature, bool)>`. It scans `cfg.features` if present, iterates over `features.entries()`, resolves each key with `feature_for_key`, and records tuples like `("features.<key>", feature, enabled)` for recognized keys. It also checks `cfg.experimental_use_unified_exec_tool` and, if set, records it as `("experimental_use_unified_exec_tool", Feature::UnifiedExec, enabled)`.
+**Data flow**: It receives a `ConfigToml` value. It scans the `[features]` entries and the separate `experimental_use_unified_exec_tool` setting, converts recognized keys into `Feature` values, and records each setting as a path, feature, and boolean value. It returns that list.
 
-**Call relations**: This helper feeds `validate_explicit_feature_settings_in_config_toml`. It intentionally focuses on explicit config knobs rather than normalized feature state so error messages can point to the exact conflicting field.
+**Call relations**: `validate_explicit_feature_settings_in_config_toml` calls this before comparing explicit settings with pinned requirements. It focuses only on gathering what the user directly set in the config.
 
 *Call graph*: called by 1 (validate_explicit_feature_settings_in_config_toml); 3 external calls (new, feature_for_key, format!).
 
@@ -1124,11 +1132,11 @@ fn validate_explicit_feature_settings_in_config_toml(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Rejects `ConfigToml` files that explicitly set a feature value contrary to pinned requirements, before broader feature synthesis occurs. It catches direct config contradictions with precise field-path diagnostics.
+**Purpose**: Checks whether the main config file directly contradicts feature requirements. It gives an early, clear error when a user writes a setting that a requirement file forbids.
 
-**Data flow**: Borrows `ConfigToml` and an optional sourced requirements object. If no requirements are present, it returns success. Otherwise it clones and parses the requirements into pinned features, returns early if the parsed map is empty, computes the allowed display string, then iterates over tuples from `explicit_feature_settings_in_config`. For each explicit setting, if the same feature is pinned to the opposite boolean, it returns `std::io::ErrorKind::InvalidData` containing `ConstraintError::InvalidValue` with `candidate` formatted as `<path>=<enabled>` and the cloned requirement source. If no conflicts are found, it returns `Ok(())`.
+**Data flow**: It receives the parsed config and optional sourced requirements. If there are no requirements, it succeeds. Otherwise it parses the pinned features, builds a readable allowed list, scans explicit config feature settings, and compares each one to the required value. On contradiction, it returns an `InvalidData` error describing the exact config path and requirement source.
 
-**Call relations**: Called by higher-level config validation before or alongside broader feature checks. It delegates requirement parsing and explicit-setting extraction to helpers so this function can focus on conflict detection and error construction.
+**Call relations**: Higher-level config validation calls this as part of checking a `ConfigToml`. It uses `parse_feature_requirements` for the requirement map, `explicit_feature_settings_in_config` for the user's direct settings, and `feature_requirements_display` for the error text.
 
 *Call graph*: calls 3 internal fn (explicit_feature_settings_in_config, feature_requirements_display, parse_feature_requirements); called by 1 (validate_feature_requirements_for_config_toml); 2 external calls (new, format!).
 
@@ -1142,24 +1150,26 @@ fn validate_feature_requirements_in_config_toml(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Validates that the effective feature set derived from `ConfigToml` satisfies feature requirements after normal feature-source merging and dependency normalization. It is the end-to-end config-level requirement check.
+**Purpose**: Checks whether the complete feature state derived from config can satisfy the feature requirements. This catches conflicts after all feature sources and defaults have been combined.
 
-**Data flow**: Borrows `ConfigToml` and optional sourced requirements. It constructs `configured_features` by calling `Features::from_sources` with a `FeatureConfigSource` built from `cfg.features` and `cfg.experimental_use_unified_exec_tool`, plus default secondary source and default overrides. It then clones the optional requirements and passes both into `ManagedFeatures::from_configured`; success is mapped to `()`, and any construction failure becomes the returned `std::io::Error`.
+**Data flow**: It receives the parsed config and optional sourced requirements. It builds a `Features` value from the config's feature section, the experimental unified-exec option, default secondary sources, and default overrides. Then it constructs `ManagedFeatures` from that combined value and the requirements. The output is success if the combined state is valid, or an error if the requirements cannot be met.
 
-**Call relations**: This function is invoked by higher-level config validation code. Rather than reimplementing policy logic, it routes through `ManagedFeatures::from_configured` so config validation uses the exact same normalization and pinned-feature enforcement as runtime feature management.
+**Call relations**: Higher-level config validation calls this alongside the explicit-setting check. It hands the combined feature state to `ManagedFeatures::from_configured`, so the same normalization and pinned-feature validation used at runtime is also used while checking config files.
 
 *Call graph*: calls 2 internal fn (from_configured, from_sources); called by 1 (validate_feature_requirements_for_config_toml); 2 external calls (default, default).
 
 
 ### `tui/src/bottom_pane/experimental_features_view.rs`
 
-`domain_logic` · `interactive popup handling`
+`domain_logic` · `interactive popup`
 
-This file defines two structs: `ExperimentalFeatureItem`, which pairs a concrete `Feature` enum value with display strings and an `enabled` flag, and `ExperimentalFeaturesView`, which owns the popup UI state. The view stores the feature list, a shared `ScrollState` for selection and scrolling, a `complete` flag used by the bottom-pane lifecycle, an `AppEventSender` for persistence, a prebuilt header renderable, a footer hint line, and the configured `ListKeymap`.
+This file is the user-facing switchboard for experimental features inside the terminal interface. Without it, the app could still know that experimental features exist, but users would not have this built-in screen for viewing them, moving through them, toggling them, and saving the result.
 
-Construction builds a two-line header, computes the footer hint, and initializes selection to the first row when any features exist. Rendering uses the shared popup styling (`user_message_style`), computes header and row heights with `measure_rows_height`, and delegates row drawing to `render_rows`. Each row is synthesized from the current feature state as `› [x] Name` or `  [ ] Name`, with the description shown underneath. Empty lists still render a stable popup with the fallback message "No experimental features available for now".
+The main type is `ExperimentalFeaturesView`. It owns a list of feature items, remembers which row is selected, and knows when the popup is finished. Think of it like a small checklist dialog: each row has a name, a short description, and a checkbox marker showing whether it is enabled.
 
-Keyboard handling is intentionally simple: list-navigation keys move within the bounded popup window, space toggles the currently selected feature in memory, and either accept or cancel triggers `on_ctrl_c`, which is treated as the save-and-close path. On close, the view emits a single `AppEvent::UpdateFeatureFlags { updates }` containing every feature’s current boolean state, but only if the list is non-empty. The design choice here is that there is no separate dirty tracking or explicit save keypath—closing always commits the current toggles.
+When the view is created, it builds a header explaining what the popup is for, creates a footer hint explaining the useful keys, and selects the first feature if there is one. Keyboard input then moves the selection up and down, jumps by page, jumps to the top or bottom, toggles the selected checkbox with Space, and exits with accept or cancel keys. Exiting is important: this is when the view sends an `UpdateFeatureFlags` app event containing every feature and its final enabled state.
+
+For drawing, the file converts feature items into simple display rows, measures how tall those rows need to be, and renders them inside the available terminal space with a header and footer. It also handles empty lists gracefully by showing that no experimental features are available.
 
 #### Function details
 
@@ -1173,11 +1183,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs the popup view from a prepared list of experimental features, the app event sender, and the list keymap. It also builds the static header and footer hint content and ensures the initial selection is valid.
+**Purpose**: Creates a new experimental-features popup with its feature list, event sender, and keyboard rules. It also prepares the title text, the help text at the bottom, and the starting selection.
 
-**Data flow**: Consumes `features: Vec<ExperimentalFeatureItem>`, `app_event_tx: AppEventSender`, and `keymap: ListKeymap` → creates a `ColumnRenderable` header with bold title and dim explanatory subtitle, stores all fields in `ExperimentalFeaturesView`, computes `footer_hint` via `experimental_popup_hint_line`, then calls `initialize_selection` → returns a fully initialized view with `complete = false` and `ScrollState::new()`.
+**Data flow**: It receives the available features, a way to send events back to the app, and the keymap. It builds the header and footer text, stores the list and scrolling state, calls the selection setup step, and returns a ready-to-render view.
 
-**Call relations**: This is the entry constructor used when the experimental-features popup is opened or instantiated in tests. After construction, later interaction flows through `handle_key_event`, rendering through `render`, and final persistence through `on_ctrl_c`.
+**Call relations**: This is called when the experimental-features popup is opened, including by normal UI code and snapshot or behavior tests. During construction it calls `experimental_popup_hint_line` for the footer text and then uses `ExperimentalFeaturesView::initialize_selection` to make the first row active when possible.
 
 *Call graph*: calls 3 internal fn (experimental_popup_hint_line, new, new); called by 3 (open_experimental_popup, experimental_features_popup_snapshot, experimental_features_toggle_saves_on_exit); 2 external calls (new, from).
 
@@ -1188,11 +1198,11 @@ fn new(
 fn initialize_selection(&mut self)
 ```
 
-**Purpose**: Sets the initial selected row based on whether any features are visible. It avoids overwriting an existing selection if one is already present.
+**Purpose**: Chooses the initial highlighted row. If there are no features, it leaves nothing selected; otherwise it selects the first feature when no selection already exists.
 
-**Data flow**: Reads `self.features.len()` through `visible_len` and the current `self.state.selected_idx` → if there are no rows, clears selection to `None`; otherwise, if no selection exists yet, sets it to `Some(0)` → mutates only `self.state.selected_idx`.
+**Data flow**: It reads the current feature count through `ExperimentalFeaturesView::visible_len` and checks the current selection state. It then either clears the selection or sets it to index zero, changing only the view's scroll state.
 
-**Call relations**: Called during construction to normalize selection state before the popup is first rendered. It depends on `visible_len` so the same empty/non-empty logic stays centralized.
+**Call relations**: This is part of startup for the popup and is called by `ExperimentalFeaturesView::new`. It relies on `ExperimentalFeaturesView::visible_len` so the selection matches the actual number of visible rows.
 
 *Call graph*: calls 1 internal fn (visible_len).
 
@@ -1203,11 +1213,11 @@ fn initialize_selection(&mut self)
 fn visible_len(&self) -> usize
 ```
 
-**Purpose**: Reports how many feature rows the popup currently exposes. In this view there is no filtering, so it is just the feature vector length.
+**Purpose**: Reports how many feature rows can be shown. In this view, every stored feature is visible, so it returns the length of the feature list.
 
-**Data flow**: Reads `self.features` → returns `self.features.len()` as `usize` without mutating state.
+**Data flow**: It reads `self.features`, counts its items, and returns that number. It does not change anything.
 
-**Call relations**: Used by all navigation helpers and initialization so movement and selection bounds always reflect the current feature count.
+**Call relations**: Navigation and setup functions call this before moving the selection. It gives `initialize_selection`, `move_up`, `move_down`, `page_up`, `page_down`, `jump_top`, and `jump_bottom` the list size they need to avoid invalid positions.
 
 *Call graph*: called by 7 (initialize_selection, jump_bottom, jump_top, move_down, move_up, page_down, page_up).
 
@@ -1218,11 +1228,11 @@ fn visible_len(&self) -> usize
 fn build_rows(&self) -> Vec<GenericDisplayRow>
 ```
 
-**Purpose**: Transforms the internal feature list into the generic row model expected by the shared popup row renderer. It embeds both selection state and enabled state into the row label.
+**Purpose**: Turns the internal feature list into rows that the shared popup renderer can draw. It adds the selection arrow and checkbox marker that users see on screen.
 
-**Data flow**: Reads `self.features` and `self.state.selected_idx` → iterates over each item, computes a leading selection glyph (`›` or space), a checkbox marker (`x` or space), formats the visible name string, clones the item description into `GenericDisplayRow.description`, and collects rows into a `Vec<GenericDisplayRow>` → returns the rendered row model.
+**Data flow**: It reads each feature item, the current selected index, and each item's enabled flag. For every item it creates a display row with text like a selected arrow, `[x]` or `[ ]`, the feature name, and the description, then returns the finished row list.
 
-**Call relations**: This is the bridge between domain state and generic popup rendering. Both `render` and `desired_height` call it so measurement and drawing use identical row content.
+**Call relations**: Rendering code calls this whenever it needs to draw or measure the popup. `ExperimentalFeaturesView::render` uses the rows for display, and `ExperimentalFeaturesView::desired_height` uses the same rows to estimate how much vertical space the popup wants.
 
 *Call graph*: called by 2 (desired_height, render); 3 external calls (default, with_capacity, format!).
 
@@ -1233,11 +1243,11 @@ fn build_rows(&self) -> Vec<GenericDisplayRow>
 fn move_up(&mut self)
 ```
 
-**Purpose**: Moves the selection upward with wraparound and keeps the selected row inside the visible popup window. It is a no-op when there are no features.
+**Purpose**: Moves the highlighted feature one row upward, wrapping around if needed. It also keeps the highlighted row inside the visible scroll window.
 
-**Data flow**: Reads current row count via `visible_len` → if zero, returns immediately; otherwise mutates `self.state` with `move_up_wrap(len)` and then `ensure_visible(len, MAX_POPUP_ROWS.min(len))` → returns unit.
+**Data flow**: It reads the feature count. If the list is empty, it does nothing; otherwise it updates the selected index through the scroll state and adjusts the scroll offset so the selected row remains visible.
 
-**Call relations**: Invoked from `handle_key_event` when the configured up binding is pressed. It delegates all cursor arithmetic and scroll-window maintenance to `ScrollState`.
+**Call relations**: This is triggered by `ExperimentalFeaturesView::handle_key_event` when the user presses the configured move-up key. It delegates the actual selection and scroll math to `ScrollState` methods.
 
 *Call graph*: calls 3 internal fn (visible_len, ensure_visible, move_up_wrap); called by 1 (handle_key_event).
 
@@ -1248,11 +1258,11 @@ fn move_up(&mut self)
 fn move_down(&mut self)
 ```
 
-**Purpose**: Moves the selection downward with wraparound and updates scroll position so the selected row remains visible. It ignores input when the list is empty.
+**Purpose**: Moves the highlighted feature one row downward, wrapping around if needed. It keeps the screen scrolled so the chosen row can still be seen.
 
-**Data flow**: Reads row count via `visible_len` → if zero, exits; otherwise mutates `self.state` using `move_down_wrap(len)` and `ensure_visible(len, MAX_POPUP_ROWS.min(len))` → returns unit.
+**Data flow**: It checks how many rows exist. With no rows it exits immediately; with rows it updates the selected index and then adjusts the visible window around that selection.
 
-**Call relations**: Triggered by `handle_key_event` for the down binding. It mirrors `move_up` but advances forward through the feature list.
+**Call relations**: This is called by `ExperimentalFeaturesView::handle_key_event` for the configured move-down key. Like `move_up`, it uses `ScrollState` to do the safe movement and visibility work.
 
 *Call graph*: calls 3 internal fn (visible_len, ensure_visible, move_down_wrap); called by 1 (handle_key_event).
 
@@ -1263,11 +1273,11 @@ fn move_down(&mut self)
 fn page_up(&mut self)
 ```
 
-**Purpose**: Moves selection upward by a page without wrapping, clamped to the top of the list. The page size is the smaller of the popup row cap and the current list length.
+**Purpose**: Moves the selection upward by a page of rows rather than just one row. This is useful for longer feature lists.
 
-**Data flow**: Reads `len = visible_len()` and computes `visible = MAX_POPUP_ROWS.min(len)` → mutates `self.state` via `page_up_clamped(len, visible)` → returns unit.
+**Data flow**: It reads the feature count and calculates how many rows can be considered visible, limited by the popup's maximum row count. It then asks the scroll state to move upward by that page amount without going outside the list.
 
-**Call relations**: Called from `handle_key_event` for page-up bindings. It relies on `ScrollState` for the exact clamped paging behavior.
+**Call relations**: This is called from `ExperimentalFeaturesView::handle_key_event` when the page-up key binding is pressed. It uses `ExperimentalFeaturesView::visible_len` and then hands the movement to the scroll state.
 
 *Call graph*: calls 2 internal fn (visible_len, page_up_clamped); called by 1 (handle_key_event).
 
@@ -1278,11 +1288,11 @@ fn page_up(&mut self)
 fn page_down(&mut self)
 ```
 
-**Purpose**: Moves selection downward by a page without wrapping, clamped to the bottom of the list. It uses the popup’s maximum visible row count as the page size.
+**Purpose**: Moves the selection downward by a page of rows. It helps users travel through longer lists faster than pressing down repeatedly.
 
-**Data flow**: Reads `len = visible_len()` and computes `visible = MAX_POPUP_ROWS.min(len)` → mutates `self.state` with `page_down_clamped(len, visible)` → returns unit.
+**Data flow**: It reads the list length, calculates the current page size from the maximum popup rows, and tells the scroll state to move down while staying within the list limits.
 
-**Call relations**: Reached from `handle_key_event` when the page-down binding is pressed. It is the downward counterpart to `page_up`.
+**Call relations**: This is called by `ExperimentalFeaturesView::handle_key_event` for the page-down key binding. It follows the same navigation pattern as `page_up`, but in the opposite direction.
 
 *Call graph*: calls 2 internal fn (visible_len, page_down_clamped); called by 1 (handle_key_event).
 
@@ -1293,11 +1303,11 @@ fn page_down(&mut self)
 fn jump_top(&mut self)
 ```
 
-**Purpose**: Moves selection directly to the first row and adjusts scroll state accordingly. It uses the same visible-window size as the other navigation helpers.
+**Purpose**: Moves the selection directly to the first feature in the list. It is a shortcut for quickly returning to the top.
 
-**Data flow**: Reads `len = visible_len()` and `visible = MAX_POPUP_ROWS.min(len)` → mutates `self.state` through `jump_top(len, visible)` → returns unit.
+**Data flow**: It reads how many visible rows exist and computes the visible row limit. It then updates the scroll state so the top row is selected and visible.
 
-**Call relations**: Dispatched by `handle_key_event` for the jump-to-top binding. It centralizes top-of-list behavior in `ScrollState`.
+**Call relations**: This is called from `ExperimentalFeaturesView::handle_key_event` when the jump-to-top key is pressed. The scroll state performs the actual positioning.
 
 *Call graph*: calls 2 internal fn (visible_len, jump_top); called by 1 (handle_key_event).
 
@@ -1308,11 +1318,11 @@ fn jump_top(&mut self)
 fn jump_bottom(&mut self)
 ```
 
-**Purpose**: Moves selection directly to the last row and scrolls so the bottom selection is visible. It is safe even when the list is empty because `ScrollState` handles the bounds.
+**Purpose**: Moves the selection directly to the last feature in the list. It is a shortcut for quickly reaching the end.
 
-**Data flow**: Reads `len = visible_len()` and `visible = MAX_POPUP_ROWS.min(len)` → mutates `self.state` via `jump_bottom(len, visible)` → returns unit.
+**Data flow**: It reads the visible list length, calculates the visible row limit, and asks the scroll state to select the bottom row while keeping the viewport in a sensible position.
 
-**Call relations**: Called from `handle_key_event` for the jump-to-bottom binding. It complements `jump_top`.
+**Call relations**: This is called by `ExperimentalFeaturesView::handle_key_event` when the jump-to-bottom key is pressed. It depends on the same list-size helper as the other movement functions.
 
 *Call graph*: calls 2 internal fn (visible_len, jump_bottom); called by 1 (handle_key_event).
 
@@ -1323,11 +1333,11 @@ fn jump_bottom(&mut self)
 fn toggle_selected(&mut self)
 ```
 
-**Purpose**: Flips the `enabled` flag of the currently selected experimental feature in local UI state. It does not persist immediately.
+**Purpose**: Flips the checkbox state for the currently highlighted feature. If it was enabled, it becomes disabled; if it was disabled, it becomes enabled.
 
-**Data flow**: Reads `self.state.selected_idx` → if no selection, returns; otherwise looks up the mutable `ExperimentalFeatureItem` at that index and negates `item.enabled` → mutates `self.features[selected_idx].enabled` in place.
+**Data flow**: It reads the selected row index from the scroll state. If there is no selected row or the index does not point to an item, it does nothing; otherwise it changes that feature item's `enabled` value in place.
 
-**Call relations**: Used only from `handle_key_event` when the user presses plain space. Persistence is deferred until `on_ctrl_c` sends the aggregate update event.
+**Call relations**: This is called by `ExperimentalFeaturesView::handle_key_event` when the user presses Space. The changed values stay in the view until `ExperimentalFeaturesView::on_ctrl_c` sends them back to the app.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -1338,11 +1348,11 @@ fn toggle_selected(&mut self)
 fn rows_width(total_width: u16) -> u16
 ```
 
-**Purpose**: Computes the effective width available to row rendering inside the popup content area. It reserves two columns from the total width.
+**Purpose**: Calculates how much horizontal space the feature rows should use inside the popup. It leaves a small margin so text does not press against the border area.
 
-**Data flow**: Takes `total_width: u16` → returns `total_width.saturating_sub(2)`.
+**Data flow**: It receives the total available width and subtracts two columns, using safe subtraction so very small widths do not underflow below zero. It returns the usable row width.
 
-**Call relations**: A small measurement helper used by both `render` and `desired_height` so row measurement and row drawing agree on available width.
+**Call relations**: This helper is used when the view measures or renders rows. It keeps layout calculations consistent between drawing and height estimation.
 
 
 ##### `ExperimentalFeaturesView::handle_key_event`  (lines 167–187)
@@ -1351,11 +1361,11 @@ fn rows_width(total_width: u16) -> u16
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Maps keyboard input to list navigation, toggling, and popup completion. Accept and cancel intentionally share the same save-and-close path.
+**Purpose**: Responds to keyboard input while the popup is open. It turns key presses into actions like moving the selection, toggling a feature, or finishing the popup.
 
-**Data flow**: Consumes a `KeyEvent` and reads `self.keymap` plus literal space matching → dispatches to movement helpers, `toggle_selected`, or `on_ctrl_c`; unmatched keys are ignored → mutates selection, feature flags, and possibly completion state / outbound events.
+**Data flow**: It receives one key event and compares it against the configured key bindings and the Space key. Depending on the match, it changes selection state, toggles the selected feature, saves and closes, or ignores the key.
 
-**Call relations**: This is the main interaction entrypoint required by `BottomPaneView`. It fans out to the navigation helpers for movement and to `on_ctrl_c` when the user accepts or cancels.
+**Call relations**: The surrounding bottom-pane system calls this whenever the user presses a key. This function is the dispatcher: it sends movement keys to `move_up`, `move_down`, `page_up`, `page_down`, `jump_top`, or `jump_bottom`, sends Space to `toggle_selected`, and sends accept or cancel keys to `on_ctrl_c`.
 
 *Call graph*: calls 8 internal fn (jump_bottom, jump_top, move_down, move_up, on_ctrl_c, page_down, page_up, toggle_selected).
 
@@ -1366,11 +1376,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn is_complete(&self) -> bool
 ```
 
-**Purpose**: Reports whether the popup has finished and should be removed from the bottom pane.
+**Purpose**: Tells the rest of the UI whether this popup is finished. Once it returns true, the bottom-pane system can close or replace the view.
 
-**Data flow**: Reads `self.complete` → returns it as `bool`.
+**Data flow**: It reads the `complete` flag stored in the view and returns that boolean value. It does not alter any state.
 
-**Call relations**: Queried by the surrounding bottom-pane controller after `handle_key_event` or cancellation paths update completion.
+**Call relations**: The bottom-pane framework calls this as part of its lifecycle checks. The flag becomes true when `ExperimentalFeaturesView::on_ctrl_c` finishes the popup.
 
 
 ##### `ExperimentalFeaturesView::on_ctrl_c`  (lines 193–207)
@@ -1379,11 +1389,11 @@ fn is_complete(&self) -> bool
 fn on_ctrl_c(&mut self) -> CancellationEvent
 ```
 
-**Purpose**: Commits the current feature toggle states and marks the popup complete. In this view, Ctrl+C semantics are repurposed as the generic close/save action.
+**Purpose**: Finishes the popup and saves the current feature choices. Despite the name, it is used for both cancel-style and accept-style exit keys in this view.
 
-**Data flow**: Reads `self.features` → if non-empty, maps each `ExperimentalFeatureItem` to `(item.feature, item.enabled)` and sends `AppEvent::UpdateFeatureFlags { updates }` through `self.app_event_tx`; then sets `self.complete = true` → returns `CancellationEvent::Handled`.
+**Data flow**: It reads all feature items and, if the list is not empty, converts them into pairs of feature identifier and enabled state. It sends those pairs in an `UpdateFeatureFlags` app event, marks the view complete, and returns that the cancellation or close action was handled.
 
-**Call relations**: Reached from `handle_key_event` for both accept and cancel bindings. It is the only place that emits the persistence event, so all exits converge here.
+**Call relations**: This is called by `ExperimentalFeaturesView::handle_key_event` when the user presses an accept or cancel key. It hands the final choices to the wider app through `AppEventSender::send`, which is what allows the settings to be saved outside this popup.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (handle_key_event).
 
@@ -1394,11 +1404,11 @@ fn on_ctrl_c(&mut self) -> CancellationEvent
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Draws the popup surface, header, feature rows, and footer hint into the provided buffer. It also handles empty-area and empty-list cases gracefully.
+**Purpose**: Draws the experimental-features popup into the terminal screen buffer. It lays out the header, feature rows, empty-list message, and footer hint.
 
-**Data flow**: Reads `area`, `self.header`, `self.state`, `self.features`, and `self.footer_hint` → early-returns on zero-sized areas; splits the area into content and footer, paints a styled `Block`, measures header and rows, insets the content, renders the header, renders rows via `render_rows` with an empty-list message, then renders the dimmed footer hint shifted two columns right → writes styled cells into `buf`.
+**Data flow**: It receives a screen rectangle and a mutable drawing buffer. If there is no space, it returns; otherwise it divides the area into content and footer sections, prepares rows with `build_rows`, measures their height, renders the header and rows, and finally draws the dimmed keyboard hint at the bottom.
 
-**Call relations**: Called by the TUI rendering pipeline whenever the popup is visible. It depends on `build_rows` and `measure_rows_height` so the visual layout matches `desired_height`.
+**Call relations**: The terminal rendering system calls this whenever the view needs to appear on screen. It uses shared rendering helpers such as `measure_rows_height` and `render_rows` so this popup looks and scrolls like other selection popups.
 
 *Call graph*: calls 5 internal fn (build_rows, measure_rows_height, render_rows, vh, user_message_style); 7 external calls (default, Fill, Length, Max, vertical, clone, rows_width).
 
@@ -1409,11 +1419,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes how tall the popup wants to be for a given width, including header, list rows, spacing, and footer. The result tracks wrapped row descriptions.
+**Purpose**: Estimates how tall the popup wants to be for a given width. This helps the surrounding layout choose enough space before drawing.
 
-**Data flow**: Reads `width`, builds rows with `build_rows`, computes row width via `rows_width`, measures row height with `measure_rows_height`, asks the header for its desired height, then adds fixed spacing and one footer line → returns total `u16` height using saturating arithmetic.
+**Data flow**: It receives an available width, builds the display rows, calculates the row width and row height, adds the header height plus spacing and footer space, and returns the total desired height.
 
-**Call relations**: Used by layout code before rendering. It mirrors the same row-building and measurement logic used in `render` so the allocated area is sufficient.
+**Call relations**: The layout system calls this before or during rendering decisions. It mirrors the row-building and measuring logic used by `ExperimentalFeaturesView::render`, which keeps measurement and actual drawing aligned.
 
 *Call graph*: calls 2 internal fn (build_rows, measure_rows_height); 1 external calls (rows_width).
 
@@ -1424,11 +1434,11 @@ fn desired_height(&self, width: u16) -> u16
 fn experimental_popup_hint_line() -> Line<'static>
 ```
 
-**Purpose**: Builds the static footer instruction line shown at the bottom of the experimental-features popup.
+**Purpose**: Builds the footer help text shown at the bottom of the popup. It tells the user that Space toggles a feature and Enter saves for the next conversation.
 
-**Data flow**: Constructs a `Line<'static>` from literal spans and key-hint spans for space and Enter → returns the composed line.
+**Data flow**: It creates a line made from plain text plus formatted key names for Space and Enter. It returns that line for the view to store and later draw.
 
-**Call relations**: Called only by `ExperimentalFeaturesView::new` to precompute the footer hint once instead of rebuilding it on every render.
+**Call relations**: This is called by `ExperimentalFeaturesView::new` during setup. The returned line becomes the popup's footer hint and is rendered by `ExperimentalFeaturesView::render`.
 
 *Call graph*: called by 1 (new); 2 external calls (from, vec!).
 
@@ -1438,11 +1448,13 @@ These files describe skill-related config, install bundled system skills, seed e
 
 ### `config/src/skills_config.rs`
 
-`data_model` · `config load`
+`config` · `config load`
 
-This file is a compact data-model module for skill configuration. `SkillConfig` represents one rule entry with two optional selectors — `path: Option<AbsolutePathBuf>` for path-based matching and `name: Option<String>` for name-based matching — plus a required `enabled: bool` flag. `SkillsConfig` groups the overall settings: an optional `bundled` block, an optional `include_instructions` toggle controlling whether turns receive the automatic skills instructions block, and a `config: Vec<SkillConfig>` list of explicit rules. `BundledSkillsConfig` currently contains only `enabled`, but it is modeled as its own struct so the bundled-skills subsection can evolve independently.
+This file is a small configuration blueprint for the project’s skill system. A “skill” here is something the system can select by file path or by name, then turn on or off through configuration. Without these types, different parts of the project would not have a shared, reliable way to understand the skill-related settings a user writes in a config file.
 
-All three structs derive `Serialize`, `Deserialize`, `JsonSchema`, and equality/debug traits, and use `#[schemars(deny_unknown_fields)]` so schema generation and strict deserialization reject stray keys. Serialization is intentionally sparse: optional fields are omitted when `None`, and the rule list is omitted when empty. The bundled-skills `enabled` field defaults to `true`, both through serde (`default_enabled`) and the manual `Default` impl, preserving the invariant that bundled skills are on unless explicitly disabled. The `TryFrom<toml::Value>` impl makes raw TOML values directly deserializable into `SkillsConfig`, which is the bridge used by higher-level config loading code.
+The file defines three main shapes of data. `SkillConfig` describes one selectable skill: it may point to a path, a name, and whether it is enabled. `SkillsConfig` is the larger container for all skill settings. It can include settings for bundled, built-in skills; a switch for whether automatic skill instructions are included in turns; and a list of individual skill rules. `BundledSkillsConfig` says whether the built-in skills are enabled.
+
+The code also explains how these settings are read from TOML, a common human-friendly configuration file format. It uses serialization and schema traits so the same structures can be loaded from config files, written back out, compared in tests, and described in generated JSON Schema. The important default is that bundled skills are enabled unless the user explicitly says otherwise.
 
 #### Function details
 
@@ -1452,11 +1464,11 @@ All three structs derive `Serialize`, `Deserialize`, `JsonSchema`, and equality/
 fn default_enabled() -> bool
 ```
 
-**Purpose**: Supplies the serde default for `BundledSkillsConfig.enabled`. It hard-codes bundled skills to be enabled when the field is omitted.
+**Purpose**: This tiny helper supplies the default value for a missing `enabled` setting. It makes bundled skills turn on by default unless the user clearly disables them.
 
-**Data flow**: Takes no inputs and reads no external state. It returns the boolean literal `true`, which serde uses while deserializing missing `enabled` fields.
+**Data flow**: Nothing goes in. The function always returns `true`, which is then used as the default value when a configuration file leaves out the bundled-skills `enabled` field.
 
-**Call relations**: This helper is referenced by the `#[serde(default = "default_enabled")]` attribute on `BundledSkillsConfig.enabled`; it is not part of runtime control flow beyond deserialization defaults.
+**Call relations**: This function is used by the configuration reading machinery through the `serde` default setting on `BundledSkillsConfig.enabled`. When that field is absent in the user’s TOML, the deserializer calls on this helper so the loaded configuration still has a clear yes-or-no value.
 
 
 ##### `BundledSkillsConfig::default`  (lines 46–48)
@@ -1465,11 +1477,11 @@ fn default_enabled() -> bool
 fn default() -> Self
 ```
 
-**Purpose**: Constructs the default bundled-skills subsection with `enabled` set to true. It mirrors the serde default so programmatic construction and deserialization behave the same way.
+**Purpose**: This creates the standard bundled-skills configuration. The standard behavior is that bundled skills are enabled.
 
-**Data flow**: Consumes no arguments and creates a new `BundledSkillsConfig { enabled: true }`. It writes no state and returns the struct by value.
+**Data flow**: Nothing goes in. It builds and returns a `BundledSkillsConfig` value whose `enabled` field is `true`; it does not change anything outside itself.
 
-**Call relations**: Called anywhere a default bundled-skills config is needed through Rust's `Default` trait; it exists to keep the type's default aligned with the field-level serde default.
+**Call relations**: This is the type’s default constructor, used whenever code asks for a normal `BundledSkillsConfig` without spelling out every field. It matches the same behavior used during config-file loading: built-in skills start enabled unless the user says otherwise.
 
 
 ##### `SkillsConfig::try_from`  (lines 54–56)
@@ -1478,31 +1490,31 @@ fn default() -> Self
 fn try_from(value: toml::Value) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Deserializes a raw `toml::Value` into the typed `SkillsConfig` structure. This is the entry point for converting merged or extracted TOML config into the skill-specific schema.
+**Purpose**: This converts a raw TOML configuration value into a typed `SkillsConfig`. It is the bridge between text-like configuration data and the safer Rust structure the rest of the program can use.
 
-**Data flow**: Takes ownership of a `toml::Value`, passes it into `SkillsConfig::deserialize`, and returns either a populated `SkillsConfig` or a `toml::de::Error`. It does not mutate external state.
+**Data flow**: A `toml::Value` goes in, representing parsed TOML data. The function asks the deserialization system to interpret that value as `SkillsConfig`; if the shape and field types are valid, a `SkillsConfig` comes out, and if not, a TOML decoding error comes out instead.
 
-**Call relations**: Used by higher-level config parsing when a TOML subtree needs to become a `SkillsConfig`. Its only delegation is to serde deserialization, relying on the struct annotations in this file for validation and defaults.
+**Call relations**: When some other part of the configuration system has a TOML value and needs skill settings, it can call this conversion. This function hands the real parsing work to `deserialize`, which applies the field rules, defaults, and unknown-field checks defined on the configuration structs.
 
 *Call graph*: 1 external calls (deserialize).
 
 
 ### `ext/skills/src/config.rs`
 
-`config` · `config load`
+`config` · `config load and skill discovery setup`
 
-This file contains a single configuration data model, `SkillsExtensionConfig`, derived with `Clone`, `Debug`, `Eq`, and `PartialEq` so it can be copied, logged, and compared in setup and tests. The struct has two boolean fields with distinct effects. `include_instructions` controls whether the available-skills catalog is injected into model-visible context, which affects prompt construction and discoverability from the model’s perspective. `bundled_skills_enabled` controls whether built-in or packaged skills are eligible to appear during discovery, allowing hosts to disable bundled content while still potentially using other providers. There is no parsing or validation logic here; the file’s role is to define the shape of configuration passed in from elsewhere. The design is intentionally narrow and explicit: rather than a generic map of options, the extension consumes a typed config object with stable field names, making feature gating straightforward and reducing ambiguity about which behaviors are host-controlled.
+The skills extension needs a few yes-or-no decisions from the larger application that is running it. This file gives those decisions a clear shape in one place. It defines `SkillsExtensionConfig`, a simple configuration record with two switches. The first switch, `include_instructions`, controls whether the catalog of available skills is included in the model's context. In plain terms, it decides whether the assistant is told what skills exist and how to use them. The second switch, `bundled_skills_enabled`, controls whether skills shipped with the system are allowed to appear during discovery. That is like deciding whether a toolbox should include the default tools that came in the box, or only tools supplied from somewhere else. Without this file, other parts of the skills extension would not have a shared, typed way to ask these questions. Each caller might invent its own flags or assumptions, which would make behavior harder to understand and easier to break.
 
 
 ### `skills/src/lib.rs`
 
-`domain_logic` · `startup`
+`io_transport` · `startup`
 
-This library exposes the on-disk cache location for embedded skills and the installation routine that materializes those assets under `CODEX_HOME/skills/.system`. The embedded source tree is compiled in with `include_dir!` as `SYSTEM_SKILLS_DIR`; constants define the destination directory names and the marker filename used for change detection.
+This file is the bridge between skills bundled inside the application and skills available as normal files on the user’s machine. The program includes a sample skills directory at build time, like packing a small folder into the application binary. At startup, this code makes sure that folder exists under CODEX_HOME/skills/.system so the rest of the system can read those skills from disk in the usual way.
 
-`install_system_skills` first ensures `CODEX_HOME/skills` exists, computes the destination `.system` directory, and derives an expected fingerprint from the embedded directory contents. If the destination already exists as a directory and its marker file matches the current fingerprint, installation is skipped entirely. Otherwise any existing destination tree is removed, the embedded directory is written out recursively, and a marker file containing the fingerprint plus newline is written afterward.
+The main path is simple. First it creates the top-level skills folder if needed. Then it checks a marker file inside the system skills cache. That marker contains a fingerprint, which is a compact hash value representing the embedded folder’s paths and file contents. If the marker matches the current embedded skills, the installer stops early. This is like checking a shipping label before unpacking a box again.
 
-Fingerprinting is deterministic: `collect_fingerprint_items` traverses embedded directories, recording directory paths with `None` and file paths with a content hash, and `embedded_system_skills_fingerprint` sorts those items by path before hashing a version salt plus each path/hash pair with `DefaultHasher`. This means both structure and file contents affect the marker. `write_embedded_dir` recreates directories and writes file bytes from the embedded tree, wrapping all filesystem failures in `SystemSkillsError::Io` with an action string. One subtle implementation detail is that recursive writes for subdirectories still join paths against the original destination root, relying on embedded paths being relative to the root tree.
+If the cache is missing or stale, the file removes the old .system folder, writes the embedded directory tree back to disk, and saves a new marker. Errors are wrapped in SystemSkillsError with a short action label, so callers can tell whether the failure happened while creating a folder, reading the marker, writing a file, and so on. There is also a test that makes sure fingerprinting sees files inside nested folders, not just top-level files.
 
 #### Function details
 
@@ -1512,11 +1524,11 @@ Fingerprinting is deterministic: `collect_fingerprint_items` traverses embedded 
 fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf
 ```
 
-**Purpose**: Computes the absolute destination directory where embedded system skills should live under a given CODEX_HOME. It standardizes the `skills/.system` path layout.
+**Purpose**: Builds the folder path where bundled system skills should live on disk. Given CODEX_HOME, it points to CODEX_HOME/skills/.system.
 
-**Data flow**: It takes an `&AbsolutePathBuf` for `codex_home`, appends `SKILLS_DIR_NAME` and then `SYSTEM_SKILLS_DIR_NAME` with `join`, and returns the resulting `AbsolutePathBuf`.
+**Data flow**: It receives an absolute CODEX_HOME path, appends the skills folder name, then appends the hidden .system folder name. It returns the resulting absolute path without touching the filesystem.
 
-**Call relations**: It is used by `install_system_skills` to derive the destination tree before marker checks and writes.
+**Call relations**: install_system_skills calls this when it needs to know where to check, remove, or write the cached system skills directory.
 
 *Call graph*: calls 1 internal fn (join); called by 1 (install_system_skills).
 
@@ -1527,11 +1539,11 @@ fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf
 fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError>
 ```
 
-**Purpose**: Installs the embedded system skills tree into the user cache, skipping work when an on-disk fingerprint marker already matches the embedded assets. It is the main public entry point of the crate.
+**Purpose**: Makes sure the built-in system skills are installed into the user’s CODEX_HOME folder. It skips the copy when a marker proves the existing cache already matches the bundled skills.
 
-**Data flow**: It takes `codex_home`, creates `CODEX_HOME/skills`, computes `dest_system` via `system_cache_root_dir`, builds `marker_path`, and computes `expected_fingerprint` with `embedded_system_skills_fingerprint`. If `dest_system` is already a directory and `read_marker` returns the same fingerprint, it returns `Ok(())`. Otherwise it removes any existing destination directory, recursively writes the embedded tree with `write_embedded_dir`, writes the marker file containing the fingerprint and newline, and returns success. All filesystem errors are mapped into `SystemSkillsError::Io` with action labels.
+**Data flow**: It receives CODEX_HOME. It creates CODEX_HOME/skills if needed, calculates the destination .system directory, computes the expected fingerprint of the embedded skills, and reads the existing marker if one is present. If the marker matches, it returns success immediately. Otherwise it deletes the old .system folder if it exists, writes the embedded skills to disk, writes a fresh marker file, and returns success or a detailed error.
 
-**Call relations**: This function orchestrates the whole install flow, delegating marker reading, fingerprint computation, destination-path derivation, and recursive writes to the file’s helpers.
+**Call relations**: This is the public entry point for this file’s work. It calls system_cache_root_dir to choose the cache location, embedded_system_skills_fingerprint to know what version should be present, read_marker to check the existing cache, and write_embedded_dir to unpack the bundled directory when needed.
 
 *Call graph*: calls 5 internal fn (embedded_system_skills_fingerprint, read_marker, system_cache_root_dir, write_embedded_dir, join); 4 external calls (format!, create_dir_all, remove_dir_all, write).
 
@@ -1542,11 +1554,11 @@ fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkill
 fn read_marker(path: &AbsolutePathBuf) -> Result<String, SystemSkillsError>
 ```
 
-**Purpose**: Reads and normalizes the installed fingerprint marker file. It trims trailing whitespace so the stored newline does not affect comparisons.
+**Purpose**: Reads the marker file that records which version of the embedded system skills was last installed. The marker is used to decide whether reinstalling is necessary.
 
-**Data flow**: It takes a marker `AbsolutePathBuf`, reads the file as a string with `fs::read_to_string`, maps any I/O failure into `SystemSkillsError::io("read system skills marker", ...)`, trims the resulting text, converts it back to an owned `String`, and returns it.
+**Data flow**: It receives the marker file path, reads the file as text, removes surrounding whitespace such as the trailing newline, and returns the cleaned marker string. If reading fails, it returns a SystemSkillsError that says the failure happened while reading the system skills marker.
 
-**Call relations**: It is called by `install_system_skills` only when the destination directory already exists and a marker comparison may allow skipping the reinstall.
+**Call relations**: install_system_skills calls this after computing the expected fingerprint. Its result decides whether the installer can safely skip rewriting the system skills directory.
 
 *Call graph*: calls 1 internal fn (as_path); called by 1 (install_system_skills); 1 external calls (read_to_string).
 
@@ -1557,11 +1569,11 @@ fn read_marker(path: &AbsolutePathBuf) -> Result<String, SystemSkillsError>
 fn embedded_system_skills_fingerprint() -> String
 ```
 
-**Purpose**: Computes a deterministic fingerprint of the embedded skills directory structure and file contents. The fingerprint is used to decide whether installation work can be skipped.
+**Purpose**: Creates a fingerprint for the system skills bundled inside the program. This fingerprint changes when a bundled file path, folder path, or file content changes.
 
-**Data flow**: It creates an empty `Vec<(String, Option<u64>)>`, fills it by calling `collect_fingerprint_items` on `SYSTEM_SKILLS_DIR`, sorts the items by path, initializes a `DefaultHasher`, hashes the version salt constant, then hashes each path and optional content hash into the hasher. Finally it formats the resulting `u64` digest as lowercase hexadecimal and returns it.
+**Data flow**: It starts with the embedded directory, asks collect_fingerprint_items to gather every relevant path and file-content hash, sorts those entries so the result is stable, then feeds them into a hasher along with a salt string. It returns the final hash as text.
 
-**Call relations**: This helper is called by `install_system_skills` before any filesystem mutation so the marker file can be compared or rewritten.
+**Call relations**: install_system_skills calls this before checking the marker file. It relies on collect_fingerprint_items to walk the embedded directory tree, then turns that collected list into the single value stored in the marker.
 
 *Call graph*: calls 1 internal fn (collect_fingerprint_items); called by 1 (install_system_skills); 3 external calls (new, new, format!).
 
@@ -1572,11 +1584,11 @@ fn embedded_system_skills_fingerprint() -> String
 fn collect_fingerprint_items(dir: &Dir<'_>, items: &mut Vec<(String, Option<u64>)>)
 ```
 
-**Purpose**: Traverses an embedded `include_dir::Dir` and records every directory path and file-content hash needed for fingerprinting. It captures both tree shape and file bytes.
+**Purpose**: Walks through the embedded system skills directory and records what should count toward the cache fingerprint. It includes both directories and files, and for files it also records a hash of the contents.
 
-**Data flow**: It takes a directory reference and a mutable vector accumulator. For each entry from `dir.entries()`, it pushes `(path, None)` for subdirectories and recurses into them, or computes a `DefaultHasher` over `file.contents()` and pushes `(path, Some(contents_hash))` for files.
+**Data flow**: It receives an embedded directory and a mutable list to fill. For each entry, it adds directory paths with no content hash, and for files it hashes the file bytes and adds the file path plus that content hash. For subdirectories, it calls itself again so nested files are included too.
 
-**Call relations**: It is the recursive worker behind `embedded_system_skills_fingerprint`, and tests call it directly to verify nested entries are included.
+**Call relations**: embedded_system_skills_fingerprint uses this to gather the raw material for the final fingerprint. The test tests::fingerprint_traverses_nested_entries also calls it directly to confirm that nested skill files are not missed.
 
 *Call graph*: called by 2 (embedded_system_skills_fingerprint, fingerprint_traverses_nested_entries); 2 external calls (new, entries).
 
@@ -1587,11 +1599,11 @@ fn collect_fingerprint_items(dir: &Dir<'_>, items: &mut Vec<(String, Option<u64>
 fn write_embedded_dir(dir: &Dir<'_>, dest: &AbsolutePathBuf) -> Result<(), SystemSkillsError>
 ```
 
-**Purpose**: Materializes an embedded directory tree onto disk under the destination root. It recreates directories and writes each embedded file’s bytes.
+**Purpose**: Copies the embedded skills directory tree out of the program and onto disk. It preserves the embedded folder and file layout under the chosen destination.
 
-**Data flow**: It takes an embedded `Dir` and destination `AbsolutePathBuf`, ensures the destination directory exists, then iterates `dir.entries()`. For subdirectories it computes `subdir_dest`, creates that directory, and recursively calls `write_embedded_dir` on the subdir; for files it joins the embedded file path onto `dest`, creates the parent directory if needed, and writes `file.contents()` to disk. Every filesystem error is wrapped with a specific `SystemSkillsError::io` action string.
+**Data flow**: It receives an embedded directory and a destination path. It creates the destination folder, loops through embedded entries, creates subfolders as needed, and writes each embedded file’s bytes to the matching disk path. If any filesystem step fails, it returns a SystemSkillsError describing which step failed.
 
-**Call relations**: This is the recursive write worker invoked by `install_system_skills` after any stale destination tree has been removed.
+**Call relations**: install_system_skills calls this only when the existing cache is missing or stale. It is the part that actually unpacks the built-in skill files after the installer has decided a rewrite is needed.
 
 *Call graph*: calls 2 internal fn (as_path, join); called by 1 (install_system_skills); 3 external calls (entries, create_dir_all, write).
 
@@ -1602,11 +1614,11 @@ fn write_embedded_dir(dir: &Dir<'_>, dest: &AbsolutePathBuf) -> Result<(), Syste
 fn io(action: &'static str, source: std::io::Error) -> Self
 ```
 
-**Purpose**: Constructs the crate’s structured I/O error variant with an action label. It standardizes how filesystem failures are annotated throughout installation.
+**Purpose**: Builds a consistent error value for filesystem failures. It records both the low-level input/output error and a short phrase explaining what the code was trying to do.
 
-**Data flow**: It takes a static action string and a `std::io::Error`, wraps them into `SystemSkillsError::Io { action, source }`, and returns that enum value.
+**Data flow**: It receives an action label such as “write system skill file” and the original std::io::Error from the operating system. It returns a SystemSkillsError::Io value containing both pieces of information.
 
-**Call relations**: All helper functions in this file use it when mapping raw filesystem errors into the public error type.
+**Call relations**: The filesystem-facing functions use this helper whenever they convert a raw disk error into the file’s public error type. That keeps error messages consistent across marker reading, directory creation, deletion, and file writing.
 
 
 ##### `tests::fingerprint_traverses_nested_entries`  (lines 152–168)
@@ -1615,24 +1627,24 @@ fn io(action: &'static str, source: std::io::Error) -> Self
 fn fingerprint_traverses_nested_entries()
 ```
 
-**Purpose**: Verifies that fingerprint collection descends into nested directories and records deeply nested files. It protects against regressions where only top-level entries would be hashed.
+**Purpose**: Checks that fingerprint collection sees files inside nested folders. This protects against a bug where only top-level skill files would affect the marker.
 
-**Data flow**: The test creates an empty items vector, calls `collect_fingerprint_items` on `SYSTEM_SKILLS_DIR`, extracts just the path strings, sorts them, and asserts via binary search that known nested sample files are present.
+**Data flow**: It starts with an empty list, asks collect_fingerprint_items to fill it from the embedded system skills directory, extracts and sorts the collected paths, then asserts that known nested files are present. The output is a passing or failing test result.
 
-**Call relations**: It directly exercises `collect_fingerprint_items`, validating the traversal behavior relied on by `embedded_system_skills_fingerprint`.
+**Call relations**: This test calls collect_fingerprint_items directly because that function is responsible for recursive traversal. By checking specific nested paths, it supports the reliability of embedded_system_skills_fingerprint and therefore the install-skipping logic in install_system_skills.
 
 *Call graph*: calls 1 internal fn (collect_fingerprint_items); 2 external calls (new, assert!).
 
 
 ### `core-skills/src/system.rs`
 
-`io_transport` · `setup/reset and cleanup`
+`orchestration` · `setup and teardown of cached system skills`
 
-This file is intentionally minimal. It publicly re-exports `install_system_skills` and `system_cache_root_dir` for use elsewhere in the crate, then adds one local helper, `uninstall_system_skills`, that removes the entire system-skill cache directory under a given Codex home.
+The project has a set of built-in skills that can be installed into a local cache under the Codex home folder. This file acts like a simple front desk for that system. It re-exports two helper functions from the shared skills library: one to install the system skills, and one to compute the folder where those skills are cached.
 
-The implementation computes the cache root by calling `system_cache_root_dir(codex_home)` and passes that path to `std::fs::remove_dir_all`. The result is explicitly ignored with `let _ = ...`, so uninstall is best-effort: missing directories, permission failures, or partial cleanup errors do not propagate. That design suggests this function is used in flows where cleanup should not block broader initialization or reconfiguration logic.
+It also adds one local cleanup function, `uninstall_system_skills`. Given the Codex home path, it finds the system skills cache folder and deletes that whole folder from disk. In plain terms, this is like clearing out a downloaded toolbox so the program can start fresh later.
 
-Because the file contains no additional state or validation, its main value is centralizing the exact cache-root computation and the policy that uninstall should be silent and non-fatal. Readers should note that this removes the whole system-skill cache subtree recursively rather than uninstalling individual skills.
+One important detail is that deletion errors are ignored. If the folder is already gone, or if removal fails for some reason, this function does not stop the caller with an error. That makes sense for cleanup code where “nothing to delete” is usually not a problem, but it also means callers should not rely on this function to prove that the folder was definitely removed.
 
 #### Function details
 
@@ -1642,24 +1654,24 @@ Because the file contains no additional state or validation, its main value is c
 fn uninstall_system_skills(codex_home: &AbsolutePathBuf)
 ```
 
-**Purpose**: Recursively deletes the system-skill cache directory under the provided Codex home path, ignoring any deletion error.
+**Purpose**: Removes the cached built-in system skills for a given Codex home directory. Someone would use this when they want to reset or restrict the available skills by clearing the previously installed system-skill files.
 
-**Data flow**: It takes `&AbsolutePathBuf codex_home`, derives the cache directory with `system_cache_root_dir`, calls `std::fs::remove_dir_all` on that path, and discards the `Result`. It performs filesystem deletion but does not return status to the caller.
+**Data flow**: It receives the Codex home folder as an absolute path. From that, it asks for the exact cache folder used for system skills, then tries to delete that folder and everything inside it. It returns nothing, and it deliberately ignores whether the delete attempt succeeded or failed.
 
-**Call relations**: This helper is invoked from higher-level initialization/restriction logic when system skills need to be removed without making cleanup failures fatal.
+**Call relations**: When `new_with_restriction_product` needs to create a restricted setup, it calls this cleanup step so old system-skill files do not remain in the cache. This function then hands the Codex home path to `system_cache_root_dir` to locate the right folder, and passes that folder to the filesystem removal operation.
 
 *Call graph*: called by 1 (new_with_restriction_product); 2 external calls (system_cache_root_dir, remove_dir_all).
 
 
 ### `memories/write/src/extensions/ad_hoc.rs`
 
-`io_transport` · `startup`
+`io_transport` · `startup or memory extension setup`
 
-This file defines the embedded instruction payload for the `ad_hoc` extension and the async routine that materializes it under the memories extensions tree. `INSTRUCTIONS` is compiled in from `templates/extensions/ad_hoc/instructions.md`, so startup code can write a known default file without depending on runtime template lookup.
+This file is a small setup helper for an extension called `ad_hoc`. Its job is to place a built-in instructions template into the right folder inside the memory storage area. Think of it like putting a welcome note into a new project folder: it should appear the first time the folder is prepared, but if someone has already written their own note, it must be left alone.
 
-The core flow computes `<memory_root>/extensions/ad_hoc/instructions.md` by calling `memory_extensions_root(memory_root)` and appending the extension-specific path segments. It first ensures the `ad_hoc` directory exists with `tokio::fs::create_dir_all`, then attempts to open the target file with `OpenOptions` configured for write plus `create_new(true)`. That choice is the key invariant in this file: the instructions file is only created if it does not already exist. If creation succeeds, the function writes the embedded markdown bytes and flushes the handle before returning. If the file already exists, it treats that as a successful no-op rather than overwriting local edits. Any other filesystem error is propagated to the caller.
+The file embeds the template text at compile time using `include_str!`, so the program does not need to look up the template separately while running. When asked to seed the instructions, it first finds the root folder for memory extensions, then adds an `ad_hoc` subfolder, then targets `instructions.md` inside it.
 
-Because the function is async and uses Tokio I/O throughout, it fits directly into startup seeding without blocking the runtime. The module is narrowly scoped and intentionally only exposes this one seeding operation to its parent extension orchestration code.
+It creates the folder if needed. Then it tries to create the instruction file only if it does not already exist. That “create only if new” behavior is important: it protects user edits from being silently replaced. If the file is new, the template text is written and flushed, meaning the program asks the operating system to push the data out rather than leaving it only in a temporary write buffer. If the file is already there, this helper treats that as success.
 
 #### Function details
 
@@ -1669,24 +1681,24 @@ Because the function is async and uses Tokio I/O throughout, it fits directly in
 async fn seed_instructions(memory_root: &Path) -> std::io::Result<()>
 ```
 
-**Purpose**: Creates the `ad_hoc` extension directory and writes the default `instructions.md` file exactly once. If the file is already present, it leaves the existing contents untouched.
+**Purpose**: This function prepares the default `instructions.md` file for the `ad_hoc` extension. It is used when the system is setting up extension instruction files, and it carefully avoids overwriting an existing file.
 
-**Data flow**: Takes `memory_root: &Path`, derives `extension_root` via `memory_extensions_root(memory_root).join("ad_hoc")`, then derives `instructions_path` by appending `instructions.md`. It creates the directory tree, attempts an exclusive create/open of the file, writes `INSTRUCTIONS.as_bytes()` and flushes on success, returns `Ok(())` when the file already exists, and otherwise returns the encountered `std::io::Error`.
+**Data flow**: It receives the main memory folder path. From that, it asks `memory_extensions_root` for the extensions folder, adds the `ad_hoc` folder name, and then points to `instructions.md` inside it. It creates the folder if it is missing, then tries to create a brand-new file. If creation succeeds, it writes the embedded template text and flushes it to disk. If the file already exists, it returns success without changing it. If any other disk error happens, it returns that error to the caller.
 
-**Call relations**: This function is invoked by `seed_extension_instructions` during extension startup seeding. Within its own flow it depends on the shared path helper `memory_extensions_root` to place the file under the canonical extensions root, and all remaining work is direct Tokio filesystem I/O to enforce the create-only-if-missing behavior.
+**Call relations**: This function is called by `seed_extension_instructions` when the broader setup flow is preparing instruction files for extensions. Inside its own work, it relies on `memory_extensions_root` to find the correct parent folder, uses `create_dir_all` to ensure the folder exists, and uses `OpenOptions::new` to open the file in a safe create-only mode before writing the template.
 
 *Call graph*: called by 1 (seed_extension_instructions); 3 external calls (memory_extensions_root, new, create_dir_all).
 
 
 ### `memories/write/src/extensions/mod.rs`
 
-`orchestration` · `startup and maintenance dispatch`
+`orchestration` · `startup and memory test setup`
 
-This module groups extension-related functionality into a single internal API. It declares two submodules: `ad_hoc`, which seeds built-in extension instructions, and `prune`, which removes stale extension resource files. The only function defined here, `seed_extension_instructions`, is a thin async wrapper that forwards the provided memories root to `ad_hoc::seed_instructions`. That wrapper gives the rest of the crate a stable extension-seeding entrypoint without exposing the specific built-in extension layout directly.
+This module acts like a reception desk for extension-related memory-writing work. Other parts of the program do not need to know which internal file contains which extension feature; they can come through this file instead.
 
-The module also publicly re-exports `prune::prune_old_extension_resources`, making pruning available from the crate root while keeping the implementation in its own file. This split reflects the two extension lifecycle concerns: startup-time initialization of required instruction files, and later cleanup of old resource artifacts.
+It connects two extension pieces. The `ad_hoc` extension is used to place initial instruction files under the memory root, which is the folder where this memory system stores its data. The `prune` extension provides cleanup for old extension resources, and this file re-exports that cleanup function so callers can use it without reaching into the private `prune` module directly.
 
-Although the code is minimal, its design matters: callers such as startup orchestration only need to know that extension instructions should be seeded, not which extension modules currently exist. As more built-in extensions are added, this file is the natural place to sequence multiple seeding calls or aggregate extension setup policy.
+The main function here, `seed_extension_instructions`, does not create the instructions itself. It delegates to `ad_hoc::seed_instructions`. This is important because startup code can ask for extension instructions to be seeded through one clear function, while the details stay inside the extension implementation. If this file were missing, callers would either need to know the internal module layout or duplicate that wiring themselves, making the system harder to change safely.
 
 #### Function details
 
@@ -1696,24 +1708,26 @@ Although the code is minimal, its design matters: callers such as startup orches
 async fn seed_extension_instructions(memory_root: &Path) -> std::io::Result<()>
 ```
 
-**Purpose**: Acts as the crate-internal entrypoint for seeding built-in extension instruction files. At present it delegates entirely to the `ad_hoc` extension seeder.
+**Purpose**: This function makes sure extension instruction files are seeded under the given memory root folder. It gives startup code one simple place to ask for that setup, without exposing the lower-level `ad_hoc` module.
 
-**Data flow**: Accepts `memory_root: &Path`, passes it unchanged into `ad_hoc::seed_instructions(memory_root).await`, and returns the resulting `std::io::Result<()>` directly without additional transformation.
+**Data flow**: It receives a path to the memory root folder. It passes that path to `ad_hoc::seed_instructions`, waits for the asynchronous file setup to finish, and returns either success or an input/output error if the filesystem work fails. It does not produce a separate value; its result says whether the seeding completed.
 
-**Call relations**: This function is called by startup orchestration such as `start_memories_startup_task` and by a phase-two model request test harness. It currently delegates to `seed_instructions` as the sole concrete seeding step, centralizing extension setup behind one call site.
+**Call relations**: During normal startup, `start_memories_startup_task` calls this function as part of preparing the memory system. A memory phase-two model request test also calls it so the test environment has the same extension instructions available. This function then hands the real work to `seed_instructions`, keeping callers insulated from the extension’s internal layout.
 
 *Call graph*: calls 1 internal fn (seed_instructions); called by 2 (start_memories_startup_task, run_memory_phase_two_model_request_test).
 
 
 ### `core-skills/src/config_rules.rs`
 
-`domain_logic` · `config load and skill/plugin resolution`
+`config` · `config load and skill discovery`
 
-This file turns the generic `skills` section from a `ConfigLayerStack` into a compact, ordered rule list and then applies those rules to loaded skill metadata. Its core types are `SkillConfigRuleSelector`, which identifies a skill either by `Name(String)` or canonicalized `Path(AbsolutePathBuf)`, `SkillConfigRule`, which pairs that selector with an `enabled` flag, and `SkillConfigRules`, a simple wrapper around an ordered `Vec<SkillConfigRule>`.
+Skills can be enabled or disabled in more than one place: a user config file, session flags, and possibly other config layers. This file is the place that reads those layers and turns them into one ordered list of rules. Think of it like a stack of sticky notes: later notes can cover earlier ones, and the final visible note is what matters.
 
-The first phase, `skill_config_rules_from_stack`, walks config layers in `LowestPrecedenceFirst` order while explicitly including disabled layers, but only honors layers whose source is `ConfigLayerSource::User` or `ConfigLayerSource::SessionFlags`. For each such layer it extracts `layer.config["skills"]`, deserializes it into `SkillsConfig`, warns and skips invalid payloads, then converts each `SkillConfig` entry into a selector. Invalid selectors are rejected with warnings: empty names, entries with both `path` and `name`, or entries with neither. Before appending a new rule, the function removes any earlier rule with the same selector so later layers or later entries override earlier ones while preserving overall order.
+A rule can point to a skill in two ways. It can name a skill by its name, or it can point directly to the skill file path. The file keeps these two selector types separate because they behave differently: a path affects one exact file, while a name may affect every loaded skill with that name.
 
-The second phase, `resolve_disabled_skill_paths`, interprets those ordered rules against actual `SkillMetadata` values. Path rules directly add/remove a path from a `HashSet`; name rules scan all loaded skills with that name and add/remove each matching `path_to_skills_md`. This means name-based overrides can affect multiple loaded skills and can supersede earlier path-specific decisions when they appear later in the ordered rule list.
+The main flow has two stages. First, `skill_config_rules_from_stack` reads only the config layers that are allowed to control skills here, namely user config and session flags. It ignores invalid skill config entries and logs warnings when something cannot be used. It preserves rule order so later settings can override earlier settings.
+
+Second, `resolve_disabled_skill_paths` takes the loaded skill metadata and those rules, then produces the final set of skill file paths that are disabled. This matters because later code can simply ask, “is this path disabled?” without re-reading every config layer.
 
 #### Function details
 
@@ -1723,11 +1737,11 @@ The second phase, `resolve_disabled_skill_paths`, interprets those ordered rules
 fn skill_config_rules_from_stack(config_layer_stack: &ConfigLayerStack) -> SkillConfigRules
 ```
 
-**Purpose**: Builds an ordered `SkillConfigRules` value from the layered application configuration, keeping only user/session skill overrides and collapsing repeated selectors so the last occurrence wins.
+**Purpose**: This function reads the layered configuration and extracts skill enable/disable rules from the layers that are meant to affect skills. It creates a clean ordered rule list that later code can apply to actual discovered skills.
 
-**Data flow**: It takes a borrowed `ConfigLayerStack`, reads its layers via `get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)`, filters to `ConfigLayerSource::User` and `ConfigLayerSource::SessionFlags`, then looks up the `"skills"` key in each layer's config map. That value is cloned and converted into `SkillsConfig`; deserialization failures emit `warn!` and are skipped. Each `SkillConfig` entry is passed to `skill_config_rule_selector`; valid selectors are paired with `entry.enabled`, earlier rules with the same selector are removed from the accumulating `Vec`, and the new rule is appended. It returns `SkillConfigRules { entries }` with precedence encoded by vector order.
+**Data flow**: It receives a `ConfigLayerStack`, which is a pile of configuration layers with different priority levels. It reads the layers from lowest priority to highest priority, looks for a `skills` section in user and session layers, converts that section into skill config entries, and turns each usable entry into a rule. If a later rule uses the same selector as an earlier one, it removes the older one and keeps the newer one. The output is a `SkillConfigRules` value containing the final ordered list of rules.
 
-**Call relations**: This is the entry point for deriving skill enable/disable rules before downstream loading and filtering. It is invoked by higher-level skill/plugin assembly paths such as `load_plugins_from_layer_stack`, `plugins_for_config_with_force_reload`, `read_plugin_detail_for_marketplace_plugin`, `skills_for_config`, and `skills_for_cwd`, as well as tests that verify precedence behavior. Within this file it delegates selector validation and normalization to `skill_config_rule_selector` so malformed config entries are dropped consistently.
+**Call relations**: This is called when the system is preparing skills or plugins from configuration, such as during skill loading, plugin loading, marketplace plugin detail lookup, and tests that check override behavior. During its work it calls `skill_config_rule_selector` to interpret each individual config entry, and it logs a warning instead of stopping the whole process when a skills config section is invalid.
 
 *Call graph*: calls 2 internal fn (get_layers, skill_config_rule_selector); called by 9 (load_plugins_from_layer_stack, plugins_for_config_with_force_reload, read_plugin_detail_for_marketplace_plugin, skills_for_config, skills_for_cwd, disabled_paths_for_skills_allows_name_selector_to_override_path_selector, disabled_paths_for_skills_allows_session_flags_to_disable_user_enabled_skill, disabled_paths_for_skills_allows_session_flags_to_override_user_layer, disabled_paths_for_skills_disables_matching_name_selectors); 3 external calls (new, matches!, warn!).
 
@@ -1741,11 +1755,11 @@ fn resolve_disabled_skill_paths(
 ) -> HashSet<AbsolutePathBuf>
 ```
 
-**Purpose**: Applies the ordered rule list to concrete loaded skills and returns the final set of skill markdown paths that should be treated as disabled.
+**Purpose**: This function applies the collected rules to the actual skills that were found, and returns the file paths of the skills that should be disabled. It is the point where abstract config rules become concrete paths the loader can skip or mark inactive.
 
-**Data flow**: It accepts a slice of `SkillMetadata` and a borrowed `SkillConfigRules`, initializes an empty `HashSet<AbsolutePathBuf>`, and processes `rules.entries` in order. For `SkillConfigRuleSelector::Path`, it directly inserts or removes that path depending on `enabled`. For `SkillConfigRuleSelector::Name`, it iterates the provided skills, filters those whose `skill.name` equals the configured name, maps them to `skill.path_to_skills_md.clone()`, and inserts or removes each path. The final `HashSet` is returned as the resolved disabled-path set.
+**Data flow**: It receives a list of loaded `SkillMetadata` records and a `SkillConfigRules` list. It starts with an empty set of disabled paths. Then it walks through the rules in order. A path rule directly adds or removes that path from the disabled set depending on whether the rule disables or enables it. A name rule finds every loaded skill with that name, then adds or removes each matching skill path. The result is a `HashSet` of absolute paths for disabled skills.
 
-**Call relations**: This function sits after rule extraction and after skill discovery, when actual `SkillMetadata` records are available. It is called by `load_plugin_skills` and `build_skill_outcome` to convert abstract name/path rules into concrete disabled files. It does not call back into config parsing; instead it consumes the normalized ordering produced earlier and relies on sequential set mutation so later rules override earlier ones.
+**Call relations**: This is called by skill loading and outcome-building code after rules have already been extracted from configuration. It does not read config itself; it only applies the already-prepared rules to the known skills, so callers get a simple final answer: which skill paths are disabled.
 
 *Call graph*: called by 2 (load_plugin_skills, build_skill_outcome); 2 external calls (new, iter).
 
@@ -1756,26 +1770,26 @@ fn resolve_disabled_skill_paths(
 fn skill_config_rule_selector(entry: &SkillConfig) -> Option<SkillConfigRuleSelector>
 ```
 
-**Purpose**: Validates a single `SkillConfig` selector and converts it into either a normalized path selector or a trimmed name selector, rejecting ambiguous or empty forms.
+**Purpose**: This helper interprets one skill config entry and decides what kind of selector it contains: a path selector or a name selector. It also protects the rest of the code from unclear or unusable entries.
 
-**Data flow**: It reads `entry.path` and `entry.name` from a borrowed `SkillConfig` and pattern-matches the four possible combinations. A path-only entry becomes `SkillConfigRuleSelector::Path`, using `path.canonicalize()` when possible and falling back to the original cloned path on failure. A name-only entry trims whitespace; non-empty names become `SkillConfigRuleSelector::Name(name.to_string())`, while empty names trigger `warn!` and return `None`. Entries with both selectors or neither also emit `warn!` and return `None`.
+**Data flow**: It receives one `SkillConfig` entry. If the entry has a path and no name, it turns the path into a path selector, using the canonical path when possible and falling back to the original path if that fails. If the entry has a name and no path, it trims extra spaces and returns a name selector unless the name is empty. If the entry has both path and name, or neither, it logs a warning and returns nothing. The output is either a usable selector or `None`.
 
-**Call relations**: This helper is only used from `skill_config_rules_from_stack` while that function is translating raw config entries into normalized rules. Its role is to centralize selector validation and normalization so the outer loop can simply skip `None` results and continue building precedence-ordered rules.
+**Call relations**: This function is used only by `skill_config_rules_from_stack` while that function is building the ordered rule list. It acts like a small gatekeeper: valid entries move forward as selectors, while ambiguous or empty entries are ignored with a warning so one bad config item does not break the whole skill-loading process.
 
 *Call graph*: called by 1 (skill_config_rules_from_stack); 3 external calls (Name, Path, warn!).
 
 
 ### `core-skills/src/loader.rs`
 
-`domain_logic` · `startup`
+`orchestration` · `startup / skill discovery`
 
-This file is the main skill-loading engine. It defines the on-disk parsing schema (`SkillFrontmatter`, `SkillMetadataFile`, `Interface`, `Dependencies`, `Policy`, `DependencyTool`), the `SkillRoot` input describing where and how to scan, and `SkillParseError` for user-visible parse failures. `load_skills_from_roots` orchestrates the full load: it canonicalizes each root for identity, scans it, records which filesystem serves each discovered skill, deduplicates by canonical `path_to_skills_md` while preserving first-root precedence, trims root/file-system maps to retained skills, and finally sorts skills by scope priority (`Repo`, `User`, `System`, `Admin`), then by name and path.
+A “skill” is a small package of instructions and optional metadata that Codex can discover and offer to the user or invoke later. This file is the skill loader: it answers two practical questions. First, where should the app look for skills? Second, when it finds a SKILL.md file, is it valid enough to use?
 
-Root discovery is split out. `skill_roots` and `skill_roots_with_home_dir` combine config-derived roots, plugin roots, runtime extra roots, and repo-local `.agents/skills` directories found between the project root and cwd. Project-root detection merges non-project config layers to compute root markers, then walks ancestors using the supplied executor filesystem. Root lists are deduplicated by path.
+The file starts by building a list of skill roots, meaning folders that may contain skills. Those roots can come from configuration layers, the current repository, the user’s home folder, cached system skills, plugins, or explicit extra paths. It keeps track of each root’s scope, such as repo or user, because scope affects priority and behavior.
 
-Scanning in `discover_skills_under_root` is breadth-first with explicit limits: hidden entries are skipped, traversal depth is capped at 6, and each root is capped at 2000 visited directories. Symlinked directories are followed only for repo/user/admin scopes, never for system scope; symlinked files are effectively ignored because symlink handling short-circuits before file parsing. Canonicalized visited-directory tracking prevents cycles.
+Then it walks through each root like a careful librarian searching shelves. It skips hidden names, limits scan depth and total directories so a bad folder tree cannot make loading run forever, and follows symlinks only for certain scopes. When it finds SKILL.md, it reads the YAML frontmatter at the top, cleans up names and descriptions, optionally reads an agents/openai.yaml metadata file, validates length limits, and records any user-visible errors.
 
-`parse_skill_file` reads `SKILL.md`, extracts YAML frontmatter delimited by `---`, sanitizes whitespace to single-line strings, derives a default name from the containing directory when needed, optionally namespaces plugin skills, validates character-count limits, and merges optional metadata from `agents/openai.yaml`. Metadata loading is fail-open: malformed or unreadable metadata logs warnings and yields no interface/dependencies/policy rather than rejecting the skill. Interface resolution enforces that icon paths stay under `assets/`, with a special plugin-only escape hatch allowing `..` only when the normalized result remains under the plugin’s shared `assets/` directory. Dependency and policy parsing similarly sanitize and validate fields while dropping invalid optional entries instead of failing the whole skill.
+The final result is deduplicated, sorted by priority, and linked back to the file system that supplied each skill. Without this file, the app would not reliably know what skills exist, where they came from, or whether their metadata is safe to trust.
 
 #### Function details
 
@@ -1785,11 +1799,11 @@ Scanning in `discover_skills_under_root` is breadth-first with explicit limits: 
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats parse and validation failures into human-readable error messages stored in `SkillError` entries.
+**Purpose**: Turns a skill parsing problem into a clear human-readable message. This is what makes errors like missing frontmatter or invalid YAML understandable instead of showing only raw internal error types.
 
-**Data flow**: Reads the `SkillParseError` variant and writes a descriptive string into the provided formatter, including nested error text or field-specific reasons.
+**Data flow**: It receives a specific SkillParseError value and a text formatter. It matches the error kind, writes an appropriate sentence into the formatter, and produces the normal formatting result.
 
-**Call relations**: Used implicitly whenever parse errors are converted to strings, especially in `discover_skills_under_root` when non-system skill parse failures are recorded.
+**Call relations**: It is used whenever a SkillParseError needs to be displayed as text, especially after parse_skill_file fails and the loader records an error message for the caller.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1800,11 +1814,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 async fn load_skills_from_roots(roots: I) -> SkillLoadOutcome
 ```
 
-**Purpose**: Loads all skills from a sequence of roots, tracks per-skill filesystem/root metadata, deduplicates by canonical path, and sorts the final skill list by scope and name.
+**Purpose**: Loads all skills from a supplied set of root folders and returns one clean loading result. It is the main collector that turns many possible directories into a deduplicated, sorted list of usable skills.
 
-**Data flow**: Consumes `SkillRoot` items. For each root it canonicalizes the root path, remembers the current skill count, calls `discover_skills_under_root`, then for newly added skills records the root path and filesystem in maps keyed by skill path. After scanning all roots it removes duplicate skills by `path_to_skills_md`, trims root and filesystem maps to retained skills, computes the used root list, stores these structures into `SkillLoadOutcome`, sorts `outcome.skills` by scope rank/name/path, and returns the outcome.
+**Data flow**: It receives SkillRoot entries, each with a path, scope, file system, and optional plugin information. For each root it canonicalizes the path, scans for skills, records which root and file system produced each skill, removes duplicate SKILL.md paths, sorts skills by scope and name, and returns a SkillLoadOutcome.
 
-**Call relations**: This is the loader’s top-level entry, called by the manager and tests. It delegates actual scanning to `discover_skills_under_root` and canonical identity handling to `canonicalize_for_skill_identity`.
+**Call relations**: Higher-level flows such as plugin skill loading, building a skill outcome, listing skills, and tests call this when they already know which roots to search. It delegates actual directory walking to discover_skills_under_root and path normalization to canonicalize_for_skill_identity, then packages the combined result.
 
 *Call graph*: calls 3 internal fn (canonicalize_for_skill_identity, discover_skills_under_root, new); called by 4 (load_plugin_skills, build_skill_outcome, list, skill_loading_and_reads_use_the_supplied_executor_file_system); 5 external calls (new, new, new, new, default).
 
@@ -1820,11 +1834,11 @@ async fn skill_roots(
     extra_skill_r
 ```
 
-**Purpose**: Builds the effective list of skill roots using the real home directory when available.
+**Purpose**: Builds the list of places where skills should be searched, using the real home directory when available. It is the public helper for turning configuration and the current working directory into SkillRoot entries.
 
-**Data flow**: Takes an optional repo filesystem, config stack, cwd, plugin skill roots, and extra roots. It resolves `home_dir()` into an `AbsolutePathBuf` when possible and forwards all inputs to `skill_roots_with_home_dir`, returning its result.
+**Data flow**: It receives an optional repository file system, the configuration layer stack, the current directory, plugin roots, and extra roots. It finds the user’s home directory, passes all of that to skill_roots_with_home_dir, and returns the resulting root list.
 
-**Call relations**: Called by `SkillsManager` when computing roots for config-based or cwd-based loads.
+**Call relations**: Callers such as skill_roots_for_config and skills_for_cwd use this before loading skills. It is a thin wrapper around skill_roots_with_home_dir so tests can inject a fake home directory through the lower-level helper.
 
 *Call graph*: calls 1 internal fn (skill_roots_with_home_dir); called by 2 (skill_roots_for_config, skills_for_cwd); 1 external calls (home_dir).
 
@@ -1840,11 +1854,11 @@ async fn skill_roots_with_home_dir(
     plugi
 ```
 
-**Purpose**: Combines config-derived roots, plugin roots, runtime extra roots, and repo `.agents/skills` roots into one deduplicated root list.
+**Purpose**: Combines all known sources of skill folders into one list, then removes repeated paths. It is the central root-building routine used by both production code and tests.
 
-**Data flow**: Starts with `skill_roots_from_layer_stack_inner`, extends that vector with `PluginSkillRoot` values mapped to user-scoped `SkillRoot`s on `LOCAL_FS`, extends again with extra user roots, appends repo-local roots from `repo_agents_skill_roots`, deduplicates by path, and returns the final `Vec<SkillRoot>`.
+**Data flow**: It receives configuration, current directory, optional home directory, plugin roots, and extra roots. It starts with roots from configuration layers, appends plugin and explicit roots, adds repository .agents/skills roots between the project root and current directory, deduplicates by path, and returns the final list.
 
-**Call relations**: Used by production `skill_roots` and the test-only `skill_roots_from_layer_stack`. It is the central root-composition function.
+**Call relations**: skill_roots calls it during normal operation, and skill_roots_from_layer_stack calls it in tests. It relies on skill_roots_from_layer_stack_inner for config-derived roots, repo_agents_skill_roots for repository-local roots, and dedupe_skill_roots_by_path to avoid searching the same folder twice.
 
 *Call graph*: calls 3 internal fn (dedupe_skill_roots_by_path, repo_agents_skill_roots, skill_roots_from_layer_stack_inner); called by 2 (skill_roots, skill_roots_from_layer_stack).
 
@@ -1859,11 +1873,11 @@ fn skill_roots_from_layer_stack_inner(
 ) -> Vec<SkillRoot>
 ```
 
-**Purpose**: Derives baseline skill roots from config layers, mapping layer source types to skill scopes and conventional directories.
+**Purpose**: Extracts skill search folders from the app’s configuration layers. It translates config locations into concrete skill directories with the correct scope, such as repo, user, system, or admin.
 
-**Data flow**: Iterates config layers in highest-precedence-first order, skipping layers without a config folder. Project layers contribute `<config_folder>/skills` as repo scope when a repo filesystem is available; user layers contribute deprecated `<config_folder>/skills`, `$HOME/.agents/skills` when `home_dir` exists, and the bundled system cache root under the user config folder; system layers contribute `<config_folder>/skills` as admin scope. Other layer types contribute nothing. It returns the accumulated roots.
+**Data flow**: It reads the configuration layers from highest to lowest precedence, looks at each layer’s source and folder, and creates SkillRoot records for recognized skill locations. It returns those roots without adding plugin, extra, or repository .agents paths.
 
-**Call relations**: Called by `skill_roots_with_home_dir` as the base root source before plugin, extra, and repo-agent additions.
+**Call relations**: skill_roots_with_home_dir calls this as its first source of roots. The result is later extended with plugin roots, explicit roots, and repository-local roots before deduplication.
 
 *Call graph*: calls 1 internal fn (get_layers); called by 1 (skill_roots_with_home_dir); 3 external calls (clone, new, system_cache_root_dir).
 
@@ -1878,11 +1892,11 @@ async fn repo_agents_skill_roots(
 ) -> Vec<SkillRoot>
 ```
 
-**Purpose**: Finds repo-scoped `.agents/skills` directories between the project root and the current working directory using the supplied executor filesystem.
+**Purpose**: Finds .agents/skills folders that live inside the current repository path. This lets a project provide skills close to the code they are meant to help with.
 
-**Data flow**: If no filesystem is provided, returns an empty vector. Otherwise it computes project-root markers via `project_root_markers_from_stack`, finds the project root with `find_project_root`, computes all directories from project root to cwd via `dirs_between_project_root_and_cwd`, and for each directory stats `<dir>/.agents/skills`. Existing directories become repo-scoped `SkillRoot`s using the repo filesystem; missing paths are ignored and other stat errors are warned.
+**Data flow**: It receives the repository file system, configuration, and current directory. It determines project root markers, finds the project root, walks the directories from that root down to the current directory, checks each one for a .agents/skills directory, and returns SkillRoot entries for the directories that exist.
 
-**Call relations**: Appended by `skill_roots_with_home_dir` after config/plugin/extra roots so repo-local agent skills are included.
+**Call relations**: skill_roots_with_home_dir calls this after adding configured and explicit roots. It uses project_root_markers_from_stack, find_project_root, and dirs_between_project_root_and_cwd so repository skill discovery respects project boundaries.
 
 *Call graph*: calls 4 internal fn (dirs_between_project_root_and_cwd, find_project_root, project_root_markers_from_stack, from_abs_path); called by 1 (skill_roots_with_home_dir); 3 external calls (clone, new, warn!).
 
@@ -1893,11 +1907,11 @@ async fn repo_agents_skill_roots(
 fn project_root_markers_from_stack(config_layer_stack: &ConfigLayerStack) -> Vec<String>
 ```
 
-**Purpose**: Computes the effective project-root marker list by merging non-project config layers and falling back to defaults on absence or parse errors.
+**Purpose**: Decides which filenames or folder names mark the root of a project. These markers are used to stop repository skill searching at the right top-level directory.
 
-**Data flow**: Starts with an empty TOML table, iterates config layers in lowest-precedence-first order excluding project layers, merges each layer’s config into the accumulator, then asks `project_root_markers_from_config` for markers. It returns configured markers, default markers when none are set, or default markers after logging a warning on invalid config.
+**Data flow**: It merges non-project configuration layers from lowest to highest precedence, asks the config parser for project root markers, and falls back to defaults if none are set or the setting is invalid. It returns a list of marker names.
 
-**Call relations**: Used only by `repo_agents_skill_roots` to decide how project-root discovery should walk ancestors.
+**Call relations**: repo_agents_skill_roots calls this before searching upward from the current directory. Its output guides find_project_root, much like landmarks telling the loader where the project starts.
 
 *Call graph*: calls 1 internal fn (get_layers); called by 1 (repo_agents_skill_roots); 7 external calls (Table, default_project_root_markers, merge_toml_values, project_root_markers_from_config, matches!, new, warn!).
 
@@ -1912,11 +1926,11 @@ async fn find_project_root(
 ) -> AbsolutePathBuf
 ```
 
-**Purpose**: Walks upward from cwd to find the nearest ancestor containing any configured project-root marker.
+**Purpose**: Searches upward from the current directory to find the nearest ancestor that looks like the project root. It prevents repository skill discovery from wandering too far up the filesystem.
 
-**Data flow**: If the marker list is empty, returns `cwd.clone()`. Otherwise it iterates `cwd.ancestors()`, joins each marker name onto each ancestor, stats the resulting path through the executor filesystem, and returns the first ancestor where any marker exists. Not-found errors are ignored; other stat failures are warned. If no marker is found, it returns `cwd.clone()`.
+**Data flow**: It receives a file system, the current directory, and marker names. For each ancestor directory, it checks whether any marker exists there; if it finds one, it returns that ancestor, otherwise it returns the current directory as a safe fallback.
 
-**Call relations**: Called by `repo_agents_skill_roots` before computing which `.agents/skills` directories are in scope.
+**Call relations**: repo_agents_skill_roots calls this after choosing marker names. Its answer is passed to dirs_between_project_root_and_cwd so only relevant directories are checked for .agents/skills.
 
 *Call graph*: calls 2 internal fn (ancestors, from_abs_path); called by 1 (repo_agents_skill_roots); 3 external calls (get_metadata, warn!, clone).
 
@@ -1930,11 +1944,11 @@ fn dirs_between_project_root_and_cwd(
 ) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Returns the inclusive directory chain from project root down to cwd in ascending order.
+**Purpose**: Builds the ordered path of directories from the project root to the current directory. This gives the loader every level where a repository might define nearby skills.
 
-**Data flow**: Iterates `cwd.ancestors()` with a stateful scan that stops after including `project_root`, collects the directories, reverses the vector, and returns it.
+**Data flow**: It receives the current directory and project root. It walks upward from the current directory until it reaches the project root, then reverses the list so it runs from root down to current directory.
 
-**Call relations**: Used by `repo_agents_skill_roots` to probe `.agents/skills` at each level without escaping above the project root.
+**Call relations**: repo_agents_skill_roots uses this list to check each directory for a .agents/skills folder. It supplies the route for repository-local skill discovery.
 
 *Call graph*: calls 1 internal fn (ancestors); called by 1 (repo_agents_skill_roots).
 
@@ -1945,11 +1959,11 @@ fn dirs_between_project_root_and_cwd(
 fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>)
 ```
 
-**Purpose**: Removes duplicate root entries that point at the same absolute path, keeping the first occurrence.
+**Purpose**: Removes repeated skill roots that point to the same path. This avoids scanning the same folder more than once.
 
-**Data flow**: Maintains a `HashSet<AbsolutePathBuf>` of seen paths and retains only roots whose path is newly inserted.
+**Data flow**: It receives a mutable list of SkillRoot records. It remembers paths it has already seen, keeps the first root for each path, and removes later duplicates from the list in place.
 
-**Call relations**: Applied by `skill_roots_with_home_dir` after all root sources have been combined.
+**Call relations**: skill_roots_with_home_dir calls this after combining config, plugin, extra, and repository roots. It is the final cleanup step before the root list is returned.
 
 *Call graph*: called by 1 (skill_roots_with_home_dir); 1 external calls (new).
 
@@ -1963,11 +1977,11 @@ async fn canonicalize_for_skill_identity(
 ) -> AbsolutePathBuf
 ```
 
-**Purpose**: Canonicalizes a path through the executor filesystem for identity and deduplication, falling back to the original path on failure.
+**Purpose**: Normalizes a path so the same real file or folder has one stable identity. This helps deduplication work even when paths involve symlinks or different spellings.
 
-**Data flow**: Converts the absolute path to `PathUri`, calls `fs.canonicalize`, converts the result back to `AbsolutePathBuf`, and returns that canonical path or the original clone if any step fails.
+**Data flow**: It receives a file system and an absolute path. It asks the file system to canonicalize the path; if that succeeds, it returns the resolved absolute path, and if it fails, it returns the original path.
 
-**Call relations**: Used for root identity, visited-directory tracking, plugin-root normalization, and final skill path normalization.
+**Call relations**: load_skills_from_roots uses it to identify roots, discover_skills_under_root uses it for directories and plugin roots, and parse_skill_file uses it for the final SKILL.md path. It is a safety net around path comparison.
 
 *Call graph*: calls 1 internal fn (from_abs_path); called by 3 (discover_skills_under_root, load_skills_from_roots, parse_skill_file); 1 external calls (canonicalize).
 
@@ -1984,11 +1998,11 @@ async fn discover_skills_under_root(
     out
 ```
 
-**Purpose**: Breadth-first scans one root directory for `SKILL.md` files, following allowed symlinked directories, enforcing traversal limits, and appending parsed skills or errors into the shared outcome.
+**Purpose**: Walks through one skill root folder and finds every valid SKILL.md file below it. It is the directory scanner for the loader.
 
-**Data flow**: Consumes a filesystem, root path, scope, optional plugin identifiers, and mutable `SkillLoadOutcome`. It canonicalizes the plugin root if present, stats the root and returns early unless it is an existing directory, initializes visited-directory and queue state, and repeatedly reads directories from the queue. Hidden entries are skipped. Symlink entries are followed only when the scope allows symlink traversal and only if they can be read as directories; resolved directories are canonicalized and enqueued through the local `enqueue_dir` helper, which enforces max depth and max directory count. Regular directories are likewise canonicalized and enqueued. Regular files named `SKILL.md` are parsed with `parse_skill_file`; successful parses are pushed into `outcome.skills`, while non-system parse failures become `SkillError` entries in `outcome.errors`. If the directory cap is hit, a warning is logged after traversal.
+**Data flow**: It receives a file system, root path, scope, optional plugin information, and the mutable load outcome. It verifies the root is a directory, scans breadth-first with depth and directory-count limits, skips hidden entries, follows allowed symlinked directories, parses SKILL.md files, appends successful skills, and records non-system parse errors.
 
-**Call relations**: Called by `load_skills_from_roots` once per root. It delegates file parsing to `parse_skill_file` and path identity normalization to `canonicalize_for_skill_identity`.
+**Call relations**: load_skills_from_roots calls this once per root. It hands each discovered SKILL.md to parse_skill_file, uses canonicalize_for_skill_identity to avoid duplicate directory identities, and writes successful or failed discoveries into the shared SkillLoadOutcome.
 
 *Call graph*: calls 3 internal fn (canonicalize_for_skill_identity, parse_skill_file, from_abs_path); called by 1 (load_skills_from_roots); 8 external calls (new, from, error!, get_metadata, read_directory, matches!, warn!, clone).
 
@@ -2005,11 +2019,11 @@ async fn parse_skill_file(
 ) -> Result<Skill
 ```
 
-**Purpose**: Reads and validates one `SKILL.md`, extracts frontmatter fields, loads optional metadata, applies plugin namespacing, and returns a normalized `SkillMetadata`.
+**Purpose**: Reads one SKILL.md file and turns it into structured SkillMetadata. It checks the required frontmatter, cleans text fields, attaches optional metadata, and rejects invalid core fields.
 
-**Data flow**: Reads the file text via the executor filesystem, extracts YAML frontmatter with `extract_frontmatter`, deserializes it into `SkillFrontmatter`, sanitizes and defaults the base name, computes the final possibly namespaced name via `namespaced_skill_name`, sanitizes description and optional short description, loads optional metadata from `load_skill_metadata`, validates length limits for required and optional fields, canonicalizes the skill path for identity, and returns a populated `SkillMetadata`. Any read, parse, missing-field, or validation failure becomes a `SkillParseError`.
+**Data flow**: It receives a file system, SKILL.md path, scope, plugin id, and optional plugin root. It reads the file text, extracts YAML frontmatter, parses name and description fields, chooses a default name if needed, adds a namespace when appropriate, loads optional openai.yaml metadata, validates lengths, canonicalizes the final path, and returns SkillMetadata or a SkillParseError.
 
-**Call relations**: Invoked from `discover_skills_under_root` for each candidate `SKILL.md`. It is the central parser and delegates metadata loading, namespacing, frontmatter extraction, and length validation to helpers.
+**Call relations**: discover_skills_under_root calls this whenever it finds a SKILL.md file. It delegates frontmatter splitting to extract_frontmatter, optional metadata loading to load_skill_metadata, name qualification to namespaced_skill_name, and final path identity to canonicalize_for_skill_identity.
 
 *Call graph*: calls 7 internal fn (canonicalize_for_skill_identity, extract_frontmatter, load_skill_metadata, namespaced_skill_name, validate_len, read_file_text, from_abs_path); called by 1 (discover_skills_under_root); 1 external calls (from_str).
 
@@ -2020,11 +2034,11 @@ async fn parse_skill_file(
 fn default_skill_name(path: &AbsolutePathBuf) -> String
 ```
 
-**Purpose**: Derives a fallback skill name from the containing directory name when frontmatter omits `name`.
+**Purpose**: Chooses a fallback skill name from the folder that contains SKILL.md. This lets a skill still load when the frontmatter does not provide a usable name.
 
-**Data flow**: Looks up the parent directory of the skill file, then its final path component, converts it to UTF-8, sanitizes whitespace, filters out empty results, and returns that string or the literal `skill` if no usable directory name exists.
+**Data flow**: It receives the SKILL.md path. It looks at the parent folder name, cleans it into a single line, and returns it if non-empty; otherwise it returns the generic name "skill".
 
-**Call relations**: Used by `parse_skill_file` only when the frontmatter name is absent or sanitizes to empty.
+**Call relations**: parse_skill_file uses this when the frontmatter name is missing or blank after cleanup. It keeps skill loading forgiving while later validation still enforces length and non-empty rules.
 
 *Call graph*: calls 1 internal fn (parent).
 
@@ -2039,11 +2053,11 @@ async fn namespaced_skill_name(
 ) -> String
 ```
 
-**Purpose**: Prefixes a base skill name with the plugin namespace when the skill path belongs to a plugin.
+**Purpose**: Adds a plugin namespace to a skill name when the skill belongs to a plugin. Namespacing helps avoid two plugins accidentally publishing skills with the same plain name.
 
-**Data flow**: Asks `plugin_namespace_for_skill_path(fs, path)` for an optional namespace and returns either `"{namespace}:{base_name}"` or `base_name.to_string()`.
+**Data flow**: It receives the file system, skill path, and base name. It asks plugin utilities whether the path belongs to a plugin namespace; if yes, it returns namespace:base_name, otherwise it returns the base name unchanged.
 
-**Call relations**: Called by `parse_skill_file` so plugin skills get stable qualified names without changing non-plugin skills.
+**Call relations**: parse_skill_file calls this after choosing the base name. The result becomes the public skill name that is validated and stored in SkillMetadata.
 
 *Call graph*: called by 1 (parse_skill_file); 1 external calls (plugin_namespace_for_skill_path).
 
@@ -2058,11 +2072,11 @@ async fn load_skill_metadata(
 ) -> LoadedSkillMetadata
 ```
 
-**Purpose**: Loads optional `agents/openai.yaml` metadata adjacent to a skill and resolves it into internal interface, dependency, and policy structures without failing the skill on metadata errors.
+**Purpose**: Loads optional extra metadata from agents/openai.yaml next to a skill. This file can describe interface details, tool dependencies, and policy without making SKILL.md itself more crowded.
 
-**Data flow**: Finds the skill directory, constructs `agents/openai.yaml`, stats it, and returns default metadata if it is missing, not a file, or cannot be read. If readable, it parses the YAML under an `AbsolutePathBufGuard` rooted at the skill directory, logs and returns defaults on parse failure, then resolves the parsed `interface`, `dependencies`, and `policy` sections through `resolve_interface`, `resolve_dependencies`, and `resolve_policy`, returning a `LoadedSkillMetadata` bundle.
+**Data flow**: It receives a file system, the SKILL.md path, and optional plugin root. It finds the skill directory, looks for agents/openai.yaml, reads and parses it if present, and resolves its interface, dependencies, and policy sections. If anything optional is missing or invalid, it logs a warning and returns empty metadata rather than blocking the skill.
 
-**Call relations**: Called by `parse_skill_file` after frontmatter parsing. It intentionally fails open so optional metadata never blocks loading the core skill.
+**Call relations**: parse_skill_file calls this after reading the main frontmatter. It passes parsed sections to resolve_interface, resolve_dependencies, and resolve_policy, then returns a LoadedSkillMetadata bundle.
 
 *Call graph*: calls 7 internal fn (resolve_dependencies, resolve_interface, resolve_policy, read_file_text, parent, new, from_abs_path); called by 1 (parse_skill_file); 4 external calls (default, get_metadata, from_str, warn!).
 
@@ -2077,11 +2091,11 @@ fn resolve_interface(
 ) -> Option<SkillInterface>
 ```
 
-**Purpose**: Converts optional parsed interface metadata into a validated `SkillInterface`, dropping invalid fields and returning `None` if nothing usable remains.
+**Purpose**: Turns the optional interface section from openai.yaml into safe display metadata for a skill. This includes user-facing labels, icons, colors, and a default prompt.
 
-**Data flow**: Consumes an optional parsed `Interface`, the skill directory, and optional plugin root. It resolves each field individually: strings through `resolve_str`, colors through `resolve_color_str`, and icon paths through `resolve_asset_path`. It then checks whether any resolved field is present and returns `Some(SkillInterface)` only in that case.
+**Data flow**: It receives an optional raw Interface, the skill directory, and optional plugin root. It cleans and length-checks text fields, validates icon paths and color format, then returns a SkillInterface only if at least one field survived.
 
-**Call relations**: Used by `load_skill_metadata` to transform raw metadata into the runtime interface model.
+**Call relations**: load_skill_metadata calls this after parsing openai.yaml. It relies on resolve_str for text, resolve_asset_path for icons, and resolve_color_str for brand color.
 
 *Call graph*: calls 3 internal fn (resolve_asset_path, resolve_color_str, resolve_str); called by 1 (load_skill_metadata).
 
@@ -2092,11 +2106,11 @@ fn resolve_interface(
 fn resolve_dependencies(dependencies: Option<Dependencies>) -> Option<SkillDependencies>
 ```
 
-**Purpose**: Converts parsed dependency metadata into `SkillDependencies`, dropping invalid tool entries and returning `None` when no valid tools remain.
+**Purpose**: Turns the optional dependencies section into a list of required tools for the skill. Empty or invalid dependency lists are treated as absent.
 
-**Data flow**: Consumes an optional `Dependencies`, maps each `DependencyTool` through `resolve_dependency_tool`, collects only `Some` results into a `Vec<SkillToolDependency>`, and returns `Some(SkillDependencies { tools })` if non-empty.
+**Data flow**: It receives an optional raw Dependencies value. It resolves each listed tool, drops tools missing required safe fields, and returns SkillDependencies if at least one valid tool remains.
 
-**Call relations**: Called by `load_skill_metadata` as the dependency section resolver.
+**Call relations**: load_skill_metadata calls this while building LoadedSkillMetadata. Each tool is checked by resolve_dependency_tool before it is exposed to the rest of the app.
 
 *Call graph*: called by 1 (load_skill_metadata).
 
@@ -2107,11 +2121,11 @@ fn resolve_dependencies(dependencies: Option<Dependencies>) -> Option<SkillDepen
 fn resolve_policy(policy: Option<Policy>) -> Option<SkillPolicy>
 ```
 
-**Purpose**: Maps parsed policy metadata directly into the runtime `SkillPolicy` structure.
+**Purpose**: Turns the optional policy section into the app’s SkillPolicy type. Policy says things like whether the skill can be invoked implicitly and which products it applies to.
 
-**Data flow**: Transforms `Option<Policy>` into `Option<SkillPolicy>` by copying `allow_implicit_invocation` and `products` when present.
+**Data flow**: It receives an optional raw Policy. If present, it copies the allowed implicit invocation setting and product list into SkillPolicy; if absent, it returns none.
 
-**Call relations**: Used by `load_skill_metadata`; unlike interface/dependencies, it performs no additional validation beyond deserialization.
+**Call relations**: load_skill_metadata calls this alongside interface and dependency resolution. Its output is attached to the final skill metadata created by parse_skill_file.
 
 *Call graph*: called by 1 (load_skill_metadata).
 
@@ -2122,11 +2136,11 @@ fn resolve_policy(policy: Option<Policy>) -> Option<SkillPolicy>
 fn resolve_dependency_tool(tool: DependencyTool) -> Option<SkillToolDependency>
 ```
 
-**Purpose**: Validates and converts one parsed dependency tool entry into `SkillToolDependency`.
+**Purpose**: Validates and cleans one tool dependency entry. It keeps only dependencies with the required type and value fields, while accepting optional details when they are safe.
 
-**Data flow**: Consumes a `DependencyTool`, resolves required `type` and `value` through `resolve_required_str`, resolves optional `description`, `transport`, `command`, and `url` through `resolve_str`, and returns `Some(SkillToolDependency)` only if the required fields survive validation.
+**Data flow**: It receives one raw DependencyTool. It requires and cleans the tool type and value, cleans optional description, transport, command, and URL fields, and returns a SkillToolDependency if the required fields are valid.
 
-**Call relations**: Applied by `resolve_dependencies` to each declared tool dependency.
+**Call relations**: resolve_dependencies uses this as the per-tool filter. It relies on resolve_required_str for required fields and resolve_str for optional fields.
 
 *Call graph*: calls 2 internal fn (resolve_required_str, resolve_str).
 
@@ -2142,11 +2156,11 @@ fn resolve_asset_path(
 ) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Validates interface icon paths, requiring them to be relative and under `assets/`, with controlled plugin-only support for `..` paths into shared plugin assets.
+**Purpose**: Checks that an icon path from metadata points to an allowed asset location. This prevents a skill from pointing its icon at arbitrary files elsewhere on disk.
 
-**Data flow**: Consumes the skill directory, optional plugin root, field name, and optional relative `PathBuf`. It rejects missing or empty paths and absolute paths. It then normalizes lexical components: `.` is ignored, normal components are accumulated, `..` triggers delegation to `resolve_plugin_shared_asset_path`, and other component kinds are rejected. For non-`..` paths it requires the first normalized component to be `assets`; if so it joins the normalized path onto `skill_dir` and returns the resulting absolute path.
+**Data flow**: It receives the skill directory, optional plugin root, the field name for warnings, and an optional relative path. It rejects empty or absolute paths, normalizes simple relative paths, requires normal icons to live under the skill’s assets folder, and lets plugin skills resolve certain parent-directory paths through resolve_plugin_shared_asset_path.
 
-**Call relations**: Called by `resolve_interface` for `icon_small` and `icon_large`. It delegates the special plugin shared-assets case to `resolve_plugin_shared_asset_path`.
+**Call relations**: resolve_interface calls this for small and large icon fields. If a path includes '..', it hands off to resolve_plugin_shared_asset_path to decide whether the path safely stays inside plugin shared assets.
 
 *Call graph*: calls 2 internal fn (resolve_plugin_shared_asset_path, join); called by 1 (resolve_interface); 2 external calls (new, warn!).
 
@@ -2162,11 +2176,11 @@ fn resolve_plugin_shared_asset_path(
 ) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Allows plugin skill icon paths containing `..` only when the normalized result stays within the plugin’s shared `assets/` directory.
+**Purpose**: Allows plugin skills to use shared plugin-level assets while still blocking unsafe path traversal. It is the special case for icon paths that contain '..'.
 
-**Data flow**: Requires `plugin_root`; without it, logs a warning and returns `None`. It lexically normalizes both `<plugin_root>/assets` and `skill_dir.join(path)`, checks that the resolved path starts with the plugin assets directory, then converts the normalized path into `AbsolutePathBuf`, warning and returning `None` on failure.
+**Data flow**: It receives the skill directory, optional plugin root, field name, and raw path. If there is no plugin root it rejects the path; otherwise it normalizes the plugin assets directory and the requested path, verifies the result stays under plugin assets, converts it to an absolute path, and returns it if valid.
 
-**Call relations**: Used only by `resolve_asset_path` to support plugin-level shared icons safely.
+**Call relations**: resolve_asset_path calls this only when a metadata icon path tries to move upward with '..'. It uses lexically_normalize to compare paths without needing to touch the file system.
 
 *Call graph*: calls 3 internal fn (lexically_normalize, join, try_from); called by 1 (resolve_asset_path); 1 external calls (warn!).
 
@@ -2177,11 +2191,11 @@ fn resolve_plugin_shared_asset_path(
 fn lexically_normalize(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Normalizes a path syntactically by removing `.` components and applying `..` pops without touching the filesystem.
+**Purpose**: Simplifies a path by processing '.' and '..' components in the text of the path. It is used for safe path comparison, not for checking whether files exist.
 
-**Data flow**: Iterates `path.components()`, skipping `CurDir`, popping on `ParentDir`, and pushing prefixes, roots, and normal components into a new `PathBuf`, which it returns.
+**Data flow**: It receives a path. It walks through each path component, skips current-directory markers, removes the previous component for parent-directory markers, keeps roots and normal names, and returns the cleaned PathBuf.
 
-**Call relations**: Supports plugin shared-asset validation where lexical containment matters even if paths do not exist.
+**Call relations**: resolve_plugin_shared_asset_path uses this to compare a requested plugin icon path against the plugin assets directory. This helps decide whether the request stays inside the allowed folder.
 
 *Call graph*: called by 1 (resolve_plugin_shared_asset_path); 2 external calls (components, new).
 
@@ -2192,11 +2206,11 @@ fn lexically_normalize(path: &Path) -> PathBuf
 fn sanitize_single_line(raw: &str) -> String
 ```
 
-**Purpose**: Collapses arbitrary whitespace in a string into single spaces for user-facing metadata fields.
+**Purpose**: Cleans user-provided text into one tidy line. It removes repeated whitespace and line breaks so names and descriptions are safe to show in compact UI places.
 
-**Data flow**: Splits the input on whitespace, collects the pieces, joins them with single spaces, and returns the normalized `String`.
+**Data flow**: It receives a raw string, splits it on any whitespace, joins the pieces with single spaces, and returns the cleaned string.
 
-**Call relations**: Used by frontmatter and metadata string resolvers so multiline or irregular spacing becomes stable single-line text.
+**Call relations**: resolve_str uses this for metadata strings, and parsing code also uses the same cleanup idea for skill names and descriptions. It is the common text tidying helper.
 
 *Call graph*: called by 1 (resolve_str).
 
@@ -2211,11 +2225,11 @@ fn validate_len(
 ) -> Result<(), SkillParseError>
 ```
 
-**Purpose**: Enforces non-empty and maximum character-count constraints for required frontmatter fields.
+**Purpose**: Enforces required text fields and maximum character lengths for core SKILL.md data. This prevents missing names and oversized descriptions from entering the loaded skill list.
 
-**Data flow**: Reads a string value, maximum length, and field name. It returns `MissingField` if the value is empty, `InvalidField` if `chars().count()` exceeds the limit, or `Ok(())` otherwise.
+**Data flow**: It receives a string value, a maximum length, and a field name. It returns a missing-field error if the string is empty, an invalid-field error if it is too long, or success if the value is acceptable.
 
-**Call relations**: Called by `parse_skill_file` for required frontmatter-derived fields and optional short description when present.
+**Call relations**: parse_skill_file calls this for the base name, qualified name, description, and short description. Unlike optional metadata cleanup, failure here stops that skill from loading.
 
 *Call graph*: called by 1 (parse_skill_file); 2 external calls (MissingField, format!).
 
@@ -2226,11 +2240,11 @@ fn validate_len(
 fn resolve_str(value: Option<String>, max_len: usize, field: &'static str) -> Option<String>
 ```
 
-**Purpose**: Sanitizes and validates an optional metadata string field, logging and dropping invalid values instead of failing the skill.
+**Purpose**: Cleans and validates an optional string field from optional metadata. Bad optional fields are ignored with a warning instead of failing the whole skill.
 
-**Data flow**: Consumes `Option<String>`, returns `None` immediately if absent, otherwise sanitizes with `sanitize_single_line`, rejects empty or overlong values with warnings, and returns `Some(String)` for valid values.
+**Data flow**: It receives an optional string, maximum length, and field name. If there is no value it returns none; otherwise it makes the text single-line, rejects empty or too-long values with warnings, and returns the cleaned string when valid.
 
-**Call relations**: Shared by interface and dependency metadata resolution, and reused by `resolve_required_str`.
+**Call relations**: resolve_interface and resolve_dependency_tool call this for optional text fields, and resolve_required_str builds on it for required dependency fields.
 
 *Call graph*: calls 1 internal fn (sanitize_single_line); called by 3 (resolve_dependency_tool, resolve_interface, resolve_required_str); 1 external calls (warn!).
 
@@ -2245,11 +2259,11 @@ fn resolve_required_str(
 ) -> Option<String>
 ```
 
-**Purpose**: Validates a required metadata string field while logging missing values instead of aborting the whole skill load.
+**Purpose**: Validates a required string inside optional metadata, especially dependency tool fields. Missing or invalid required values cause that item to be dropped.
 
-**Data flow**: If the input `Option<String>` is `None`, logs a warning and returns `None`; otherwise forwards the value to `resolve_str` and returns its result.
+**Data flow**: It receives an optional string, maximum length, and field name. If the value is missing it warns and returns none; otherwise it passes the value through resolve_str and returns the cleaned result if valid.
 
-**Call relations**: Used by `resolve_dependency_tool` for required dependency fields.
+**Call relations**: resolve_dependency_tool calls this for dependency type and value. It is stricter than resolve_str because those fields are needed to make a meaningful dependency.
 
 *Call graph*: calls 1 internal fn (resolve_str); called by 1 (resolve_dependency_tool); 1 external calls (warn!).
 
@@ -2260,11 +2274,11 @@ fn resolve_required_str(
 fn resolve_color_str(value: Option<String>, field: &'static str) -> Option<String>
 ```
 
-**Purpose**: Validates optional interface brand colors, accepting only `#RRGGBB` hex strings.
+**Purpose**: Validates a brand color string from metadata. It accepts only the common #RRGGBB hex color format, such as #3366FF.
 
-**Data flow**: Consumes `Option<String>`, trims whitespace, rejects empty strings, then checks for length 7, leading `#`, and all remaining ASCII hex digits. It returns the original color string on success or `None` after logging a warning on failure.
+**Data flow**: It receives an optional string and field name. It trims whitespace, rejects empty values, checks for a leading # followed by six hexadecimal characters, and returns the color string only if it matches.
 
-**Call relations**: Called by `resolve_interface` for `brand_color`.
+**Call relations**: resolve_interface calls this for interface.brand_color. Invalid colors are logged and ignored rather than preventing the skill from loading.
 
 *Call graph*: called by 1 (resolve_interface); 1 external calls (warn!).
 
@@ -2275,11 +2289,11 @@ fn resolve_color_str(value: Option<String>, field: &'static str) -> Option<Strin
 fn extract_frontmatter(contents: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts the YAML frontmatter block from a `SKILL.md` file when it is delimited by opening and closing `---` lines.
+**Purpose**: Pulls the YAML frontmatter block from the top of a SKILL.md file. Frontmatter is the metadata section between two lines containing only ---.
 
-**Data flow**: Iterates the file’s lines, requires the first trimmed line to equal `---`, collects subsequent lines until another trimmed `---`, rejects empty frontmatter or missing closing delimiter, and returns the joined frontmatter string on success.
+**Data flow**: It receives the whole SKILL.md text. It checks that the first line is an opening delimiter, collects following lines until a closing delimiter, rejects empty or unclosed blocks, and returns the frontmatter text when present.
 
-**Call relations**: Used by `parse_skill_file` before YAML deserialization.
+**Call relations**: parse_skill_file calls this immediately after reading SKILL.md. If it returns none, parse_skill_file reports a missing-frontmatter error and the skill is not loaded.
 
 *Call graph*: called by 1 (parse_skill_file); 2 external calls (new, matches!).
 
@@ -2295,26 +2309,26 @@ async fn skill_roots_from_layer_stack(
 ) -> Vec<Skill
 ```
 
-**Purpose**: Test-only wrapper that exposes `skill_roots_with_home_dir` with no plugin or extra roots.
+**Purpose**: Provides a test-only way to build skill roots with an injected file system and home directory. This makes root discovery testable without relying on the developer’s real machine.
 
-**Data flow**: Takes a filesystem, config stack, cwd, and optional home dir, forwards them to `skill_roots_with_home_dir` with empty plugin and extra root vectors, and returns the resulting roots.
+**Data flow**: It receives a file system, configuration stack, current directory, and optional home directory. It calls skill_roots_with_home_dir with no plugin roots and no extra roots, then returns the resulting list.
 
-**Call relations**: Used by loader tests to exercise root selection deterministically.
+**Call relations**: This function exists only in test builds. It routes tests through the same core logic used by skill_roots, while letting tests control inputs that are normally discovered from the environment.
 
 *Call graph*: calls 1 internal fn (skill_roots_with_home_dir); 1 external calls (new).
 
 
 ### `core-skills/src/manager.rs`
 
-`orchestration` · `config load`
+`orchestration` · `startup and skill loading`
 
-This file provides the higher-level skills service used by the rest of the application. `SkillsLoadInput` packages the cwd, effective plugin roots, config stack, and bundled-skills flag for one load request. `SkillsManager` owns the codex home path, an optional product restriction, mutable extra roots, and two caches guarded by `RwLock`: one keyed only by cwd for legacy/local-fs loads, and one keyed by effective skill-relevant config state for safer session-aware reuse.
+This file solves a practical problem: loading skills can involve checking several places, reading configuration, respecting disabled-skill rules, and installing or hiding bundled system skills. Without this manager, different parts of the program could load different skill sets, reuse stale results, or accidentally expose skills that should be disabled.
 
-Construction in `new_with_restriction_product` also manages bundled system skills on disk. If bundled skills are disabled, it best-effort removes the cached `skills/.system` directory; otherwise it installs bundled skills and logs any failure. Runtime root overrides are handled by `set_extra_roots`, which replaces the stored list and clears both caches.
+The main type is `SkillsManager`. Think of it like a librarian for skills. Given a current working directory, configuration layers, plugin roots, and optional file-system access, it first builds a list of places where skills may live. These places can include repository skills, user skills, system bundled skills, plugin skills, and extra runtime roots. It then loads the skills from those roots, filters them for the current product, applies configuration rules that disable particular skills, and builds lookup tables used later for automatic skill invocation.
 
-There are two load paths. `skills_for_config` computes roots with `skill_roots_for_config`, derives `SkillConfigRules` from the config stack, builds a `ConfigSkillsCacheKey` from root paths/scope ranks/plugin IDs plus the rules, and uses the config-aware cache so session-local overrides do not bleed across requests sharing a cwd. `skills_for_cwd` is the older path: it only uses the cwd cache when an executor filesystem is present, can be bypassed with `force_reload`, and determines bundled-skill inclusion from the effective config stack. Both paths delegate actual loading to `build_skill_outcome`.
+The file also keeps two caches. One cache is keyed by current directory for older or file-system-based loading. The other is keyed by the effective skill-related configuration, so two sessions in the same directory but with different overrides do not accidentally share results. A read-write lock is used around shared state; this is a lock that allows many readers or one writer at a time.
 
-`build_skill_outcome` runs `load_skills_from_roots`, filters by product restriction, resolves disabled skill paths from config rules, and passes the result to `finalize_skill_outcome`. Finalization stores `disabled_paths` and builds the implicit invocation indexes from `allowed_skills_for_implicit_invocation()`, ensuring disabled or policy-blocked skills are excluded from command-based implicit detection.
+A subtle but important behavior is bundled skill installation. When the manager is created, it installs bundled system skills if enabled, or tries to remove stale cached bundled skills if disabled. Even if removal fails, later root filtering still prevents disabled system skills from being selected.
 
 #### Function details
 
@@ -2329,11 +2343,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs the immutable input bundle used for one skills load request.
+**Purpose**: Creates a single bundle of information needed to load skills. Callers use it so the manager receives the current directory, plugin skill roots, configuration layers, and bundled-skill setting together.
 
-**Data flow**: Takes a cwd, plugin skill roots, config layer stack, and bundled-skills flag, stores them directly into a new `SkillsLoadInput`, and returns it.
+**Data flow**: It takes the current working directory, the effective plugin skill roots, the layered configuration, and a true-or-false bundled-skills flag. It stores those values unchanged in a `SkillsLoadInput` object and returns it.
 
-**Call relations**: Used by callers and tests to package the state consumed by `SkillsManager` load methods.
+**Call relations**: This is used by setup and test flows that need to ask the skill manager for skills. Later, methods such as `SkillsManager::skills_for_config`, `SkillsManager::skill_roots_for_config`, and `SkillsManager::skills_for_cwd` read the fields from this input.
 
 *Call graph*: called by 8 (register_thread_config, set_extra_roots_replaces_runtime_roots_and_clears_cache, skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill, skills_for_config_with_stack, skills_for_cwd_loads_repo_and_user_roots_with_local_fs, skills_for_cwd_uses_cached_result_until_force_reload, skills_for_cwd_without_fs_skips_repo_roots, skills_load_input_from_config).
 
@@ -2344,11 +2358,11 @@ fn new(
 fn new(codex_home: AbsolutePathBuf, bundled_skills_enabled: bool) -> Self
 ```
 
-**Purpose**: Creates a manager with the default product restriction of `Product::Codex`.
+**Purpose**: Creates a normal `SkillsManager` for Codex. It is the simple constructor used when the manager should restrict loaded skills to the Codex product.
 
-**Data flow**: Forwards the codex home and bundled-skills flag to `new_with_restriction_product` with `Some(Product::Codex)` and returns the resulting manager.
+**Data flow**: It receives the Codex home directory and whether bundled skills are enabled. It passes those values, plus `Product::Codex` as the product restriction, into the more general constructor and returns the resulting manager.
 
-**Call relations**: Convenience constructor used by most production code and tests.
+**Call relations**: Most callers use this shortcut instead of the more flexible constructor. Internally it hands off all real setup work to `SkillsManager::new_with_restriction_product`.
 
 *Call graph*: called by 17 (new_with_disabled_bundled_skills_removes_stale_cached_system_skills, set_extra_roots_applies_to_config_loads_and_empty_clears, set_extra_roots_replaces_runtime_roots_and_clears_cache, skills_for_config_disables_plugin_skills_by_name, skills_for_config_excludes_bundled_skills_when_disabled_in_config, skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill, skills_for_config_reuses_cache_for_same_effective_config, skills_for_cwd_loads_repo_and_user_roots_with_local_fs, skills_for_cwd_uses_cached_result_until_force_reload, skills_for_cwd_without_fs_skips_repo_roots (+7 more)); 1 external calls (new_with_restriction_product).
 
@@ -2363,11 +2377,11 @@ fn new_with_restriction_product(
     ) -> Self
 ```
 
-**Purpose**: Initializes manager state, caches, and bundled-system-skill installation policy.
+**Purpose**: Creates a `SkillsManager` with an optional product restriction. It also performs the startup work needed for bundled system skills: install them when enabled, or try to remove cached copies when disabled.
 
-**Data flow**: Stores the codex home, optional restriction product, empty extra-root vector, and empty cwd/config caches inside `RwLock`s. If bundled skills are disabled it calls `uninstall_system_skills` best-effort; otherwise it calls `install_system_skills` and logs an error if installation fails. It returns the initialized manager.
+**Data flow**: It receives the Codex home directory, the bundled-skills setting, and an optional product name to restrict skills to. It builds a manager with empty extra roots and empty caches. Then it either installs bundled system skills under the Codex home directory, or asks for old bundled system skills to be removed. The finished manager is returned.
 
-**Call relations**: Called by `new` and specialized test constructors. It is the only place that mutates bundled system skills on disk.
+**Call relations**: `SkillsManager::new` calls this for the usual Codex setup, while tests and specialized setup can call it directly. It calls `install_system_skills` or `uninstall_system_skills` during construction, and logs an error if installation fails.
 
 *Call graph*: calls 1 internal fn (uninstall_system_skills); called by 2 (new, with_models_provider_home_and_state_for_tests); 5 external calls (new, new, new, install_system_skills, error!).
 
@@ -2378,11 +2392,11 @@ fn new_with_restriction_product(
 fn set_extra_roots(&self, extra_roots: Vec<AbsolutePathBuf>)
 ```
 
-**Purpose**: Replaces the runtime-supplied extra skill roots and invalidates all cached outcomes.
+**Purpose**: Replaces the manager’s runtime-added skill directories. This is used when the program wants to add or change extra places where skills can be found.
 
-**Data flow**: Acquires the `extra_roots` write lock, overwrites the stored vector with the provided roots, releases the lock, then calls `clear_cache`.
+**Data flow**: It receives a new list of absolute directory paths. It takes a write lock, replaces the stored extra roots with the new list, then clears all cached skill-loading results so old answers do not survive after the search path changed.
 
-**Call relations**: Used when runtime configuration changes the effective root set; cache clearing ensures subsequent loads see the new roots.
+**Call relations**: After updating the roots, it calls `SkillsManager::clear_cache`. Later calls to `SkillsManager::skill_roots_for_config` or `SkillsManager::skills_for_cwd` pick up the new extra roots through `SkillsManager::extra_roots`.
 
 *Call graph*: calls 1 internal fn (clear_cache).
 
@@ -2397,11 +2411,11 @@ async fn skills_for_config(
     ) -> SkillLoadOutcome
 ```
 
-**Purpose**: Loads skills using a cache keyed by effective skill-relevant configuration rather than cwd alone.
+**Purpose**: Loads the correct skills for an already-built configuration, without re-reading configuration layers. This is the safer path when session-specific or role-specific skill overrides may differ even in the same directory.
 
-**Data flow**: Takes `SkillsLoadInput` and optional filesystem, computes roots via `skill_roots_for_config`, derives `SkillConfigRules` from the config stack, builds a `ConfigSkillsCacheKey`, checks `cached_outcome_for_config`, and if absent calls `build_skill_outcome`. It then inserts the cloned outcome into `cache_by_config` and returns it.
+**Data flow**: It receives a `SkillsLoadInput` and optional file-system access. It computes the skill roots for that exact input, extracts the skill enable/disable rules from the configuration stack, and builds a cache key from the roots plus those rules. If that key is already cached, it returns the cached result. Otherwise it loads and finalizes the skills, stores the result in the configuration-based cache, and returns it.
 
-**Call relations**: Used when the caller already has a constructed config stack and needs session-safe caching. It delegates root computation, cache-key construction, and actual loading to helpers.
+**Call relations**: This method calls `SkillsManager::skill_roots_for_config` to find search roots, `skill_config_rules_from_stack` to read skill rules, `config_skills_cache_key` to create a safe cache key, `SkillsManager::cached_outcome_for_config` to reuse prior work, and `SkillsManager::build_skill_outcome` when a fresh load is needed.
 
 *Call graph*: calls 5 internal fn (skill_config_rules_from_stack, build_skill_outcome, cached_outcome_for_config, skill_roots_for_config, config_skills_cache_key); called by 1 (skills_for_config_with_stack).
 
@@ -2416,11 +2430,11 @@ async fn skill_roots_for_config(
     ) -> Vec<SkillRoot>
 ```
 
-**Purpose**: Computes the effective root list for a config-based load and removes system roots when bundled skills are disabled in the input.
+**Purpose**: Builds the list of directories that should be searched for skills for a specific configuration. It also removes bundled system roots if the input says bundled skills are disabled.
 
-**Data flow**: Calls `skill_roots` with the provided filesystem, config stack, cwd, cloned plugin roots, and current extra roots. If `input.bundled_skills_enabled` is false, it filters out roots whose scope is `SkillScope::System`. It returns the resulting root vector.
+**Data flow**: It reads the input’s current directory, configuration stack, plugin roots, and the manager’s extra roots. It passes those into `skill_roots`, which returns candidate skill roots. If bundled skills are disabled in the input, it removes roots marked as system scope. The filtered list is returned.
 
-**Call relations**: Called by `skills_for_config` before cache-key generation so the cache reflects the actual root set.
+**Call relations**: `SkillsManager::skills_for_config` calls this before loading skills. This method calls `SkillsManager::extra_roots` to include runtime-added directories and delegates the root-discovery work to `skill_roots`.
 
 *Call graph*: calls 2 internal fn (skill_roots, extra_roots); called by 1 (skills_for_config).
 
@@ -2436,11 +2450,11 @@ async fn skills_for_cwd(
     ) -> SkillLoadOutcome
 ```
 
-**Purpose**: Loads skills for a cwd using the legacy cwd-keyed cache when possible, with optional forced reload.
+**Purpose**: Loads skills for a current working directory, with an optional directory-based cache. This supports the older flow where the directory is the main identity for cached skill results.
 
-**Data flow**: Determines whether cwd caching is allowed based on `fs.is_some()`. If caching is allowed and `force_reload` is false, it checks `cached_outcome_for_cwd` and returns a hit immediately. Otherwise it computes roots with `skill_roots`, filters out system roots when `bundled_skills_enabled_from_stack` says bundled skills are disabled, derives `SkillConfigRules`, builds the outcome via `build_skill_outcome`, stores it in `cache_by_cwd` when cwd caching is enabled, and returns it.
+**Data flow**: It receives load input, a force-reload flag, and optional file-system access. If file-system access is present, caching by current directory is allowed; if there is a cached result and reload was not forced, that result is returned. Otherwise it finds skill roots, removes bundled system roots if the effective configuration disables them, reads skill configuration rules, builds the final skill outcome, and stores it in the directory cache when that cache is being used.
 
-**Call relations**: This is the older load path used by callers keyed primarily on cwd. It shares the same loader/finalizer pipeline as `skills_for_config` but uses a coarser cache.
+**Call relations**: This method calls `SkillsManager::cached_outcome_for_cwd` to reuse old results, `skill_roots` to find possible skill locations, `SkillsManager::extra_roots` for runtime roots, `bundled_skills_enabled_from_stack` to honor configuration, `skill_config_rules_from_stack` for disable rules, and `SkillsManager::build_skill_outcome` for the actual loading and final shaping.
 
 *Call graph*: calls 6 internal fn (skill_config_rules_from_stack, skill_roots, build_skill_outcome, cached_outcome_for_cwd, extra_roots, bundled_skills_enabled_from_stack).
 
@@ -2455,11 +2469,11 @@ async fn build_skill_outcome(
     ) -> SkillLoadOutcome
 ```
 
-**Purpose**: Runs the full load/filter/finalize pipeline for a concrete root set and skill config rules.
+**Purpose**: Turns a list of skill roots into the final loaded skill result. It is where raw loaded skills are filtered, disabled paths are applied, and lookup tables are prepared.
 
-**Data flow**: Consumes roots and `SkillConfigRules`, calls `load_skills_from_roots`, filters the result through `filter_skill_load_outcome_for_product` using the manager’s restriction product, computes disabled paths with `resolve_disabled_skill_paths`, passes both into `finalize_skill_outcome`, and returns the finalized outcome.
+**Data flow**: It receives the skill roots and skill configuration rules. It loads skills from those roots, filters the loaded result for the manager’s product restriction, resolves which skill paths should be disabled, and then finalizes the result with those disabled paths. The completed `SkillLoadOutcome` is returned.
 
-**Call relations**: Shared by both public load paths so product filtering, disabled-skill resolution, and implicit-index construction happen consistently.
+**Call relations**: Both `SkillsManager::skills_for_config` and `SkillsManager::skills_for_cwd` use this when they need a fresh result. It delegates loading to `load_skills_from_roots`, product filtering to `filter_skill_load_outcome_for_product`, disabled-path calculation to `resolve_disabled_skill_paths`, and finishing work to `finalize_skill_outcome`.
 
 *Call graph*: calls 3 internal fn (resolve_disabled_skill_paths, load_skills_from_roots, finalize_skill_outcome); called by 2 (skills_for_config, skills_for_cwd); 1 external calls (filter_skill_load_outcome_for_product).
 
@@ -2470,11 +2484,11 @@ async fn build_skill_outcome(
 fn clear_cache(&self)
 ```
 
-**Purpose**: Clears both cwd-keyed and config-keyed caches and logs how many entries were removed.
+**Purpose**: Empties all stored skill-loading results. This prevents the manager from returning old skill lists after something important, such as extra roots, has changed.
 
-**Data flow**: Acquires write locks on `cache_by_cwd` and `cache_by_config`, records each map’s length, clears both maps, sums the counts, and emits an info log with the total cleared entries.
+**Data flow**: It takes write locks on both caches, counts how many entries each contains, clears them, adds the counts together, and logs how many cached entries were removed. It does not return a value.
 
-**Call relations**: Called by `set_extra_roots`; may also be useful to callers needing explicit cache invalidation.
+**Call relations**: `SkillsManager::set_extra_roots` calls this after replacing the extra roots. The log message helps operators or developers understand when cached skill data was discarded.
 
 *Call graph*: called by 1 (set_extra_roots); 1 external calls (info!).
 
@@ -2485,11 +2499,11 @@ fn clear_cache(&self)
 fn cached_outcome_for_cwd(&self, cwd: &AbsolutePathBuf) -> Option<SkillLoadOutcome>
 ```
 
-**Purpose**: Reads a cloned cached outcome for one cwd, tolerating poisoned locks.
+**Purpose**: Looks up a previously loaded skill result for a current working directory. It is a small helper that keeps cache reading in one place.
 
-**Data flow**: Attempts a read lock on `cache_by_cwd`; on success or poison recovery it looks up the cwd key, clones the stored `SkillLoadOutcome` if present, and returns `Option<SkillLoadOutcome>`.
+**Data flow**: It receives an absolute current-directory path. It takes a read lock on the directory cache, recovers even if the lock was previously poisoned by a panic, clones the cached outcome if present, and returns either that cloned outcome or nothing.
 
-**Call relations**: Used only by `skills_for_cwd` on the fast path.
+**Call relations**: `SkillsManager::skills_for_cwd` calls this before doing fresh loading. If it returns a result, the larger loading flow can stop early and avoid scanning skill roots again.
 
 *Call graph*: called by 1 (skills_for_cwd).
 
@@ -2503,11 +2517,11 @@ fn cached_outcome_for_config(
     ) -> Option<SkillLoadOutcome>
 ```
 
-**Purpose**: Reads a cloned cached outcome for one config-derived cache key, tolerating poisoned locks.
+**Purpose**: Looks up a previously loaded skill result for a specific effective skill configuration. This avoids mixing results between sessions whose settings differ.
 
-**Data flow**: Attempts a read lock on `cache_by_config`; on success or poison recovery it looks up the key, clones the stored outcome if present, and returns it.
+**Data flow**: It receives a configuration cache key. It reads the configuration cache, recovers if the lock was poisoned, clones the cached outcome if one exists for that key, and returns it. If no entry exists, it returns nothing.
 
-**Call relations**: Used only by `skills_for_config` before rebuilding outcomes.
+**Call relations**: `SkillsManager::skills_for_config` calls this after building a cache key from roots and skill rules. A successful lookup lets that method return immediately without reloading skills.
 
 *Call graph*: called by 1 (skills_for_config).
 
@@ -2518,11 +2532,11 @@ fn cached_outcome_for_config(
 fn extra_roots(&self) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Returns the current runtime extra roots, tolerating poisoned locks.
+**Purpose**: Returns a snapshot of the manager’s runtime-added skill directories. This gives loading code a safe copy without exposing the internal shared list.
 
-**Data flow**: Reads the `extra_roots` lock and clones the stored `Vec<AbsolutePathBuf>`, recovering from poison if necessary.
+**Data flow**: It takes a read lock on the stored extra roots, clones the list, and returns the clone. If the lock was poisoned, it still recovers the stored list and clones it.
 
-**Call relations**: Used by both root-computation paths so runtime overrides are included in effective roots.
+**Call relations**: `SkillsManager::skill_roots_for_config` and `SkillsManager::skills_for_cwd` call this when assembling all places to search for skills. It supplies the extra roots that may have been set by `SkillsManager::set_extra_roots`.
 
 *Call graph*: called by 2 (skill_roots_for_config, skills_for_cwd).
 
@@ -2535,11 +2549,11 @@ fn bundled_skills_enabled_from_stack(
 ) -> bool
 ```
 
-**Purpose**: Reads the effective config stack to determine whether bundled/system skills are enabled, defaulting to enabled on absence or invalid config.
+**Purpose**: Reads the effective configuration and answers whether bundled system skills are enabled. If the setting is missing or invalid, it chooses the safe default of treating bundled skills as enabled.
 
-**Data flow**: Obtains the effective config TOML value, looks up the `skills` table, attempts to deserialize it into `SkillsConfig`, logs a warning and returns `true` on deserialization failure, and otherwise returns `skills.bundled.unwrap_or_default().enabled`.
+**Data flow**: It receives a configuration layer stack and asks for the effective merged configuration. It looks for a `skills` table and tries to convert it into `SkillsConfig`. If no `skills` section exists, it returns true. If conversion fails, it logs a warning and returns true. Otherwise it returns the configured bundled-skills enabled value.
 
-**Call relations**: Used by `skills_for_cwd` and by callers/tests constructing `SkillsLoadInput`.
+**Call relations**: `SkillsManager::skills_for_cwd` calls this before deciding whether to remove system-scope roots. Other code can also call it when it needs the same answer from the configuration stack.
 
 *Call graph*: calls 1 internal fn (effective_config); called by 2 (skills_for_cwd, bundled_skills_enabled); 1 external calls (warn!).
 
@@ -2553,11 +2567,11 @@ fn config_skills_cache_key(
 ) -> ConfigSkillsCacheKey
 ```
 
-**Purpose**: Builds the cache key representing the effective skill-relevant configuration state for config-aware caching.
+**Purpose**: Builds the key used to cache skill results by effective configuration. The key captures the skill roots and the rules that enable or disable skills.
 
-**Data flow**: Consumes a root slice and `SkillConfigRules`, maps each root to `(path, scope_rank, plugin_id)` where scope rank is `Repo=0, User=1, System=2, Admin=3`, clones the rules, and returns `ConfigSkillsCacheKey { roots, skill_config_rules }`.
+**Data flow**: It receives a slice of skill roots and the skill configuration rules. For each root, it records the root path, a numeric rank for its scope, and any plugin ID. It also clones the rules. These pieces are returned as a `ConfigSkillsCacheKey`.
 
-**Call relations**: Used by `skills_for_config` so cache reuse depends on roots and enable/disable rules, not just cwd.
+**Call relations**: `SkillsManager::skills_for_config` calls this after root discovery and rule extraction. The resulting key is then passed to `SkillsManager::cached_outcome_for_config` and used for storing newly built outcomes.
 
 *Call graph*: called by 1 (skills_for_config); 2 external calls (clone, iter).
 
@@ -2571,11 +2585,11 @@ fn finalize_skill_outcome(
 ) -> SkillLoadOutcome
 ```
 
-**Purpose**: Attaches disabled-path state and builds implicit invocation indexes from the subset of skills still allowed for implicit invocation.
+**Purpose**: Adds the last pieces to a loaded skill result before it is returned to callers. In particular, it records disabled paths and builds indexes used for automatic skill selection.
 
-**Data flow**: Takes a mutable `SkillLoadOutcome` and a `HashSet<AbsolutePathBuf>` of disabled paths, stores the disabled paths into the outcome, calls `allowed_skills_for_implicit_invocation()`, builds script/doc indexes with `build_implicit_skill_path_indexes`, wraps them in `Arc`, stores them back into the outcome, and returns the updated outcome.
+**Data flow**: It receives a `SkillLoadOutcome` and a set of disabled absolute paths. It writes those disabled paths into the outcome. Then it asks the outcome which skills are still allowed for implicit invocation, meaning automatic use without a direct explicit request. From those skills it builds two lookup maps, one by scripts directory and one by documentation path, stores them in shared `Arc` pointers, and returns the updated outcome.
 
-**Call relations**: Called only by `SkillsManager::build_skill_outcome` as the final normalization step before caching or returning results.
+**Call relations**: `SkillsManager::build_skill_outcome` calls this after loading, product filtering, and disabled-path resolution. It calls `build_implicit_skill_path_indexes` so later parts of the system can quickly find skills related to a script directory or document path.
 
 *Call graph*: calls 1 internal fn (allowed_skills_for_implicit_invocation); called by 1 (build_skill_outcome); 2 external calls (new, build_implicit_skill_path_indexes).
 
@@ -2585,13 +2599,13 @@ These files resolve marketplace roots, describe plugin loading outcomes, normali
 
 ### `core-plugins/src/installed_marketplaces.rs`
 
-`config` · `config load / marketplace discovery`
+`domain_logic` · `config load and marketplace discovery`
 
-This utility module is the bridge between `[marketplaces]` user configuration and the on-disk directories scanned by marketplace listing code. `INSTALLED_MARKETPLACES_DIR` defines the default install location under CODEX_HOME. `marketplace_install_root` simply appends that directory name to the provided home path.
+A marketplace is a source of plug-ins, and the program needs a safe, predictable way to find the marketplaces a user has installed or configured. This file is the small map-reader for that job. It knows the default folder under the Codex home directory where installed marketplaces live, and it knows how to read the user's configuration to find marketplace roots.
 
-The main routine, `installed_marketplace_roots_from_layer_stack`, reads the effective user config from a `ConfigLayerStack` and looks up the `marketplaces` table. It returns an empty vector if there is no user config, no `marketplaces` key, or the key is not a TOML table; malformed structures are logged with `warn!`. For each marketplace entry it requires the value to be a table and validates the marketplace name with `validate_plugin_segment`, again warning and skipping invalid entries. It then delegates path resolution to `resolve_configured_marketplace_root`: `source_type = "local"` uses the configured non-empty `source` path directly, while all other source types fall back to `<default_install_root>/<marketplace_name>`. Only roots where `find_marketplace_manifest_path` succeeds are kept, and successful paths are converted to `AbsolutePathBuf`. The final list is sorted by path for deterministic downstream behavior.
+The main flow starts with the active user configuration. If there is no user config, no marketplace table, or the table is shaped wrong, the file returns no marketplace roots and, where useful, writes a warning. For each configured marketplace, it checks that the entry is a table, checks that the marketplace name is a safe plug-in-style path segment, decides which folder should be used, and only keeps it if a marketplace manifest can be found there. A manifest is like the label on a box: without it, the program cannot confidently say the folder is really a marketplace.
 
-A subtle design choice is that non-local marketplaces are always mapped to the standard installed-marketplace directory, regardless of their original remote source URL; this file is about where the marketplace is materialized locally, not how it was fetched.
+The file also supports local marketplace sources. If a marketplace says its source type is local, the configured source path is used directly. Otherwise, the marketplace is assumed to live under the default installed-marketplaces directory. Returned paths are converted to absolute paths and sorted so callers get stable, repeatable results.
 
 #### Function details
 
@@ -2601,11 +2615,11 @@ A subtle design choice is that non-local marketplaces are always mapped to the s
 fn marketplace_install_root(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the default directory under CODEX_HOME where installed marketplaces are stored. It is the canonical base path for non-local marketplace materialization.
+**Purpose**: Builds the standard folder path where installed marketplaces are stored under the Codex home directory. Callers use it whenever they need to write, remove, inspect, or compare installed marketplace files in the default location.
 
-**Data flow**: Takes `codex_home: &Path` → appends `INSTALLED_MARKETPLACES_DIR` with `join` → returns the resulting `PathBuf`.
+**Data flow**: It receives the Codex home path as input. It appends the fixed relative folder name `.tmp/marketplaces` to that path. It returns the resulting path and does not change the filesystem.
 
-**Call relations**: Used by marketplace-management and discovery code whenever it needs the standard installed-marketplace root, including `installed_marketplace_roots_from_layer_stack`.
+**Call relations**: This is the shared path rule used across marketplace operations. Install, remove, add-local-source, snapshot-checking, and discovery code call on it so they all agree about where default marketplace installations belong. `installed_marketplace_roots_from_layer_stack` also uses it before resolving individual configured marketplaces.
 
 *Call graph*: called by 18 (marketplace_remove_deletes_config_and_installed_root, write_installed_marketplace, configured_marketplace_sources_by_root, configured_marketplace_snapshot_issues, marketplace_add_local_directory_source, marketplace_remove_json_prints_remove_outcome, write_installed_marketplace, installed_marketplace_roots_from_layer_stack, list_marketplaces_ignores_installed_roots_missing_from_config, list_marketplaces_includes_installed_marketplace_roots (+8 more)); 1 external calls (join).
 
@@ -2619,11 +2633,11 @@ fn installed_marketplace_roots_from_layer_stack(
 ) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Extracts valid marketplace root directories from the effective user config. It filters out malformed entries and only returns roots that actually contain a marketplace manifest.
+**Purpose**: Reads the effective user configuration and returns the marketplace folders that are both configured and valid enough to use. It protects the rest of the system from bad configuration by quietly skipping unusable entries and warning about obvious mistakes.
 
-**Data flow**: Reads `config_layer_stack` and `codex_home` → obtains `effective_user_config`, reads the `marketplaces` TOML table, computes `default_install_root` via `marketplace_install_root`, iterates each configured marketplace entry, validates entry shape and marketplace name, resolves a root path with `resolve_configured_marketplace_root`, keeps only paths where `find_marketplace_manifest_path` succeeds, converts them to `AbsolutePathBuf`, sorts the vector by path, and returns it. Invalid config shapes and names are logged with `warn!` and skipped.
+**Data flow**: It takes the layered configuration and the Codex home path. First it asks for the effective user config, then looks for a `marketplaces` table. If anything important is missing or wrongly shaped, it returns an empty list or skips the bad entry. For each marketplace entry, it validates the name, resolves the folder path, checks that a marketplace manifest exists there, converts the path to an absolute path, sorts the final list, and returns it.
 
-**Call relations**: Called by higher-level marketplace root assembly in manager code; it supplies the configured marketplace roots that are merged with curated and caller-provided roots.
+**Call relations**: Marketplace discovery code calls this when it needs the current set of marketplace roots. Inside that process, it uses `marketplace_install_root` to get the default installation base, then relies on the configured marketplace root logic and manifest checking before handing back clean, stable paths to the caller.
 
 *Call graph*: calls 2 internal fn (effective_user_config, marketplace_install_root); called by 1 (marketplace_roots); 2 external calls (new, warn!).
 
@@ -2638,24 +2652,26 @@ fn resolve_configured_marketplace_root(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Maps one marketplace config entry to the local directory that should be scanned. Local sources use their explicit path; all other source types use the default installed root plus marketplace name.
+**Purpose**: Chooses the folder path for one configured marketplace. It supports two cases: a local marketplace whose path is written directly in the config, or a normal installed marketplace stored under the default install root.
 
-**Data flow**: Takes `marketplace_name`, the marketplace `toml::Value`, and `default_install_root` → reads `source_type`; if it is `"local"`, reads non-empty `source` and converts it to `PathBuf`, otherwise joins `default_install_root` with `marketplace_name` → returns `Option<PathBuf>`.
+**Data flow**: It receives the marketplace name, that marketplace's configuration value, and the default install root. If the configuration says `source_type` is `local`, it looks for a non-empty `source` string and returns that as a path. For all other source types, including missing source type, it returns the default install root joined with the marketplace name. If a local source is requested but no usable source path is present, it returns nothing.
 
-**Call relations**: Delegated to by `installed_marketplace_roots_from_layer_stack` and other marketplace-resolution helpers so path policy is centralized.
+**Call relations**: Other marketplace features call this when they need to connect a configured marketplace name to its actual folder on disk, such as checking snapshot issues, finding a marketplace by name, or deciding the installed root for a source. It is the small decision point that keeps local marketplace paths and default installed paths following the same rule everywhere.
 
 *Call graph*: called by 3 (configured_marketplace_snapshot_issues, find_marketplace_root_by_name, installed_marketplace_root_for_source); 2 external calls (join, get).
 
 
 ### `cli/src/marketplace_cmd.rs`
 
-`orchestration` · `on demand during `codex plugin marketplace ...` command handling`
+`orchestration` · `command handling`
 
-This file owns the nested `codex plugin marketplace` command tree. `MarketplaceCli` carries raw config overrides plus a `MarketplaceSubcommand`, and its `run` method parses overrides once and dispatches to add/list/upgrade/remove handlers. The add and remove paths operate directly on `CODEX_HOME` using `find_codex_home` and the marketplace add/remove request types from `codex_core_plugins`, then print either concise status lines or JSON wrappers derived from the returned outcome structs.
+A plugin marketplace is a place where Codex can find plugins. This file is the command-line front desk for those marketplaces. Without it, users would not have a simple terminal command for telling Codex where plugin marketplaces live, checking which ones are active, updating Git-based copies, or removing old entries.
 
-The list path is more involved. It loads the full `Config` with CLI overrides, constructs a `PluginsManager`, sets its auth mode using the shared plugin helper, and asks the manager to discover marketplaces for the effective plugin config. It then merges two classes of load problems: snapshot/config issues detected by `configured_marketplace_snapshot_issues`, and any additional discovery errors not already represented by path. If any issue remains, it aborts with a multi-line error enumerating marketplace name, path, and message. Successful listing deduplicates marketplaces by resolved root directory, because multiple entries can point at the same root. JSON output includes optional source metadata reconstructed from the user config by `configured_marketplace_sources_by_root`; text output prints a width-aligned `MARKETPLACE  ROOT` table.
+The file defines the shape of the command using `clap`, a command-line parsing library. It accepts subcommands such as `add`, `list`, `upgrade`, and `remove`, plus flags like `--json`. The main `MarketplaceCli::run` function reads any configuration overrides, then sends the request to the right helper.
 
-Upgrade loads config and plugin inputs, runs `upgrade_configured_marketplaces_for_config`, and then prints either JSON or human summaries. Both output modes first emit per-marketplace failures to stderr and bail if any upgrade failed, so partial failures are never silently treated as success.
+Most real marketplace work is delegated to the plugin core library. For example, adding and removing call dedicated marketplace functions, while listing and upgrading use `PluginsManager`. This file focuses on turning terminal input into those library calls, then turning the results back into useful output.
+
+It also has small JSON output structs. These are like neatly labeled receipts: they convert internal results into stable field names that other programs can read. The file is careful to report loading or upgrade problems clearly, and it refuses to claim success if any requested marketplace upgrade failed.
 
 #### Function details
 
@@ -2665,11 +2681,11 @@ Upgrade loads config and plugin inputs, runs `upgrade_configured_marketplaces_fo
 async fn run(self) -> Result<()>
 ```
 
-**Purpose**: Dispatches the parsed marketplace subcommand after converting raw CLI overrides into typed TOML overrides.
+**Purpose**: This is the dispatcher for the marketplace command. It reads the chosen subcommand and sends the work to the matching helper for add, list, upgrade, or remove.
 
-**Data flow**: Consumes `self`, parses `config_overrides` into `Vec<(String, toml::Value)>`, then matches `subcommand`: `Add` ignores the parsed overrides and calls `run_add`, while `List`, `Upgrade`, and `Remove` forward the parsed overrides or args into their respective async handlers. Returns `Ok(())` after the selected handler succeeds.
+**Data flow**: It receives the parsed command-line object, including configuration override text and the selected marketplace action. It turns the override text into structured override values, then calls the proper action function. It returns success if that action succeeds, or passes back the error if anything fails.
 
-**Call relations**: Called from the plugin branch in `cli_main` when `PluginSubcommand::Marketplace` is selected. It is the single entrypoint for this file’s command tree.
+**Call relations**: This function is the local entry point for this command group. When the wider CLI has parsed `codex plugin marketplace ...`, it calls `MarketplaceCli::run`; this function then hands off to `run_add`, `run_list`, `run_upgrade`, or `run_remove` depending on what the user asked for.
 
 *Call graph*: calls 4 internal fn (run_add, run_list, run_remove, run_upgrade).
 
@@ -2680,11 +2696,11 @@ async fn run(self) -> Result<()>
 async fn run_add(args: AddMarketplaceArgs) -> Result<()>
 ```
 
-**Purpose**: Adds a local or Git marketplace source to the user’s configured marketplace set and reports the installed root.
+**Purpose**: This adds a new marketplace source to Codex. The source can be a local folder or a Git repository, and the function reports where the marketplace was installed.
 
-**Data flow**: Consumes `AddMarketplaceArgs`, resolves `CODEX_HOME`, builds a `MarketplaceAddRequest` from `source`, `ref_name`, and `sparse_paths`, and awaits `add_marketplace`. If `json` is true it converts the `MarketplaceAddOutcome` into `JsonMarketplaceAddOutput` and prints pretty JSON; otherwise it prints whether the marketplace was newly added or already present plus the installed root path.
+**Data flow**: It takes the user's source, optional Git reference, optional sparse checkout paths, and JSON preference. It finds the Codex home directory, sends an add request to the plugin library, then prints either a plain message or a JSON receipt. The result is a configured marketplace, or an error explaining why it could not be added.
 
-**Call relations**: Invoked by `MarketplaceCli::run` for the `Add` subcommand. It delegates the actual add/install logic to `codex_core_plugins::marketplace_add::add_marketplace`.
+**Call relations**: It is called by `MarketplaceCli::run` when the user chooses `add`. It relies on `find_codex_home` to locate Codex's storage area, calls `add_marketplace` to do the actual add work, and uses `JsonMarketplaceAddOutput::from_outcome` when the user requested machine-readable output.
 
 *Call graph*: calls 3 internal fn (from_outcome, add_marketplace, find_codex_home); called by 1 (run); 1 external calls (println!).
 
@@ -2695,11 +2711,11 @@ async fn run_add(args: AddMarketplaceArgs) -> Result<()>
 fn from_outcome(outcome: MarketplaceAddOutcome) -> Self
 ```
 
-**Purpose**: Converts a marketplace add outcome into the compact JSON shape exposed by the CLI.
+**Purpose**: This turns the internal result of adding a marketplace into a simple JSON-friendly shape. It keeps only the fields that should be shown to users or scripts.
 
-**Data flow**: Consumes `MarketplaceAddOutcome` and copies out `marketplace_name`, stringifies `installed_root`, and preserves `already_added`. Returns a serializable struct.
+**Data flow**: It receives a `MarketplaceAddOutcome`, which includes the marketplace name, installed folder, and whether it was already present. It converts the folder path into display text and builds a `JsonMarketplaceAddOutput` value. Nothing else is changed.
 
-**Call relations**: Used only by `run_add` when `--json` is requested.
+**Call relations**: It is used by `run_add` only when `--json` was requested. It acts as a small translation step between the plugin library's internal result and the command-line JSON output.
 
 *Call graph*: called by 1 (run_add).
 
@@ -2710,11 +2726,11 @@ fn from_outcome(outcome: MarketplaceAddOutcome) -> Self
 async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceArgs) -> Result<()>
 ```
 
-**Purpose**: Lists the marketplaces currently in scope for plugin discovery, failing fast if configured marketplace snapshots cannot be loaded cleanly.
+**Purpose**: This lists the plugin marketplaces Codex is currently considering. It can print a readable table for people or JSON for tools.
 
-**Data flow**: Takes parsed config overrides and `ListMarketplaceArgs`, loads `Config`, constructs a `PluginsManager`, sets auth mode via `load_cli_auth_mode`, and derives `plugins_input`. It calls `discover_marketplaces_for_config`, computes snapshot/config issues with `configured_marketplace_snapshot_issues`, merges in any additional discovery errors by unique path, and bails with a formatted multi-line error if any issue exists. On success it either emits JSON using `configured_marketplace_sources_by_root` and `JsonMarketplaceListOutput::from_marketplaces`, or deduplicates marketplaces by resolved root and prints a width-aligned table.
+**Data flow**: It receives configuration overrides and the user's JSON preference. It loads the Codex configuration, creates a plugin manager, applies the CLI authentication mode, asks the manager to discover marketplaces, checks for marketplace loading problems, and then prints the results. If any marketplace snapshot cannot be loaded, it stops with a clear grouped error instead of showing a misleading partial list.
 
-**Call relations**: Invoked by `MarketplaceCli::run` for `List`. It depends on helpers from `plugin_cmd` to keep marketplace-source and snapshot-validation logic consistent with plugin listing.
+**Call relations**: It is called by `MarketplaceCli::run` for the `list` subcommand. It calls configuration and plugin-manager code to find marketplaces, asks helper functions from `plugin_cmd` to explain snapshot issues, uses `configured_marketplace_sources_by_root` to enrich JSON output with source information, and uses `JsonMarketplaceListOutput::from_marketplaces` to prepare JSON.
 
 *Call graph*: calls 6 internal fn (from_marketplaces, configured_marketplace_sources_by_root, configured_marketplace_snapshot_issues, load_cli_auth_mode, new, marketplace_root_dir); called by 1 (run); 5 external calls (new, new, load_with_cli_overrides, bail!, println!).
 
@@ -2728,11 +2744,11 @@ fn from_marketplaces(
     ) -> Self
 ```
 
-**Purpose**: Builds the JSON marketplace listing, deduplicating entries that resolve to the same root directory.
+**Purpose**: This prepares the marketplace list for JSON output. It removes duplicate roots so the same marketplace folder is not reported more than once.
 
-**Data flow**: Consumes a vector of configured marketplace structs plus a map from root path to `JsonMarketplaceSource`. It iterates marketplaces, resolves each root with `marketplace_root_dir`, skips entries whose root cannot be resolved or has already been seen, and produces `JsonMarketplaceListEntry` values containing name, root string, and optional source metadata.
+**Data flow**: It receives discovered marketplace records and a lookup table that maps marketplace root folders to their configured source information. For each marketplace, it works out the root folder, skips duplicates, attaches source details when available, and returns a JSON output object containing the cleaned list.
 
-**Call relations**: Called by `run_list` only for JSON output.
+**Call relations**: It is called by `run_list` when the user passes `--json`. It depends on marketplace root calculation and the source map built by `configured_marketplace_sources_by_root`, then hands the finished structure back to `run_list` for printing.
 
 *Call graph*: called by 1 (run_list); 1 external calls (new).
 
@@ -2746,11 +2762,11 @@ fn configured_marketplace_sources_by_root(
 ) -> HashMap<PathBuf, JsonMarketplaceSource>
 ```
 
-**Purpose**: Reconstructs marketplace source metadata keyed by resolved install root rather than marketplace name.
+**Purpose**: This builds a lookup table from installed marketplace folders to the source settings that created them. It helps JSON listing explain not just where a marketplace is, but where it came from.
 
-**Data flow**: Reads `codex_home` and `PluginsConfigInput`, first deriving name-keyed source metadata via `configured_marketplace_sources`. It then inspects the effective user config’s `[marketplaces]` table, computes the default install root, resolves each configured marketplace’s root with `resolve_configured_marketplace_root`, and returns a `HashMap<PathBuf, JsonMarketplaceSource>` keyed by that root.
+**Data flow**: It receives the Codex home path and the plugin configuration input. It reads the effective user configuration, finds the configured `marketplaces` table, works out each marketplace's install root, and pairs that root with source details such as local or Git origin. If the needed user configuration is missing, it returns an empty table.
 
-**Call relations**: Used by `run_list` so JSON output can attach source metadata even after marketplaces have been deduplicated by root.
+**Call relations**: It is called by `run_list` for JSON output. It uses `configured_marketplace_sources` to read source descriptions, `marketplace_install_root` to know the default install area, and `resolve_configured_marketplace_root` to match each configured marketplace to its actual folder.
 
 *Call graph*: calls 2 internal fn (configured_marketplace_sources, marketplace_install_root); called by 1 (run_list); 1 external calls (new).
 
@@ -2764,11 +2780,11 @@ async fn run_upgrade(
 ) -> Result<()>
 ```
 
-**Purpose**: Refreshes one configured Git marketplace or all configured Git marketplaces and prints the result in JSON or human form.
+**Purpose**: This refreshes configured Git-backed marketplaces. The user can refresh one named marketplace or all configured Git marketplaces.
 
-**Data flow**: Consumes parsed overrides and `UpgradeMarketplaceArgs`, loads `Config`, resolves `CODEX_HOME`, constructs a `PluginsManager`, derives `plugins_input`, and calls `upgrade_configured_marketplaces_for_config` with an optional marketplace name filter. It then routes the resulting `PluginMarketplaceUpgradeOutcome` to either `print_upgrade_outcome_json` or `print_upgrade_outcome`.
+**Data flow**: It receives configuration overrides plus an optional marketplace name and JSON preference. It loads configuration, finds the Codex home directory, creates a plugin manager, asks it to upgrade the selected configured marketplaces, and then sends the result to either the plain-text or JSON printer.
 
-**Call relations**: Invoked by `MarketplaceCli::run` for `Upgrade`. It delegates all formatting and failure policy to the two print helpers.
+**Call relations**: It is called by `MarketplaceCli::run` for the `upgrade` subcommand. It delegates the actual refresh work to `PluginsManager`, then calls `print_upgrade_outcome` or `print_upgrade_outcome_json` to report the result in the requested format.
 
 *Call graph*: calls 4 internal fn (print_upgrade_outcome, print_upgrade_outcome_json, new, find_codex_home); called by 1 (run); 1 external calls (load_with_cli_overrides).
 
@@ -2779,11 +2795,11 @@ async fn run_upgrade(
 async fn run_remove(args: RemoveMarketplaceArgs) -> Result<()>
 ```
 
-**Purpose**: Removes a configured marketplace source and optionally its installed root, then reports what was removed.
+**Purpose**: This removes a marketplace from the user's configured marketplace sources. If Codex also removes an installed copy, it tells the user which folder was removed.
 
-**Data flow**: Consumes `RemoveMarketplaceArgs`, resolves `CODEX_HOME`, builds a `MarketplaceRemoveRequest`, and awaits `remove_marketplace`. If `json` is set it converts the outcome into `JsonMarketplaceRemoveOutput` and prints pretty JSON; otherwise it prints the marketplace name and, when present, the removed installed root path.
+**Data flow**: It takes the marketplace name and JSON preference from the command line. It finds the Codex home directory, sends a remove request to the plugin library, then prints either plain text or JSON. The configuration is changed by the lower-level remove operation, and the function reports the final outcome.
 
-**Call relations**: Invoked by `MarketplaceCli::run` for `Remove`. It delegates the actual config/cache mutation to `codex_core_plugins::marketplace_remove::remove_marketplace`.
+**Call relations**: It is called by `MarketplaceCli::run` when the user chooses `remove`. It uses `remove_marketplace` for the real removal work and `JsonMarketplaceRemoveOutput::from_outcome` when the user requested JSON.
 
 *Call graph*: calls 3 internal fn (from_outcome, remove_marketplace, find_codex_home); called by 1 (run); 1 external calls (println!).
 
@@ -2794,11 +2810,11 @@ async fn run_remove(args: RemoveMarketplaceArgs) -> Result<()>
 fn from_outcome(outcome: MarketplaceRemoveOutcome) -> Self
 ```
 
-**Purpose**: Converts a marketplace removal outcome into the JSON shape exposed by the CLI.
+**Purpose**: This turns the internal result of removing a marketplace into a JSON-friendly response. It records the marketplace name and, when relevant, the installed folder that was removed.
 
-**Data flow**: Consumes `MarketplaceRemoveOutcome`, copies the marketplace name, and maps the optional removed root path into an optional display string.
+**Data flow**: It receives a `MarketplaceRemoveOutcome`. It copies the marketplace name, converts the optional removed folder path into display text, and returns a small serializable output object.
 
-**Call relations**: Used only by `run_remove` when `--json` is requested.
+**Call relations**: It is called by `run_remove` only for `--json` output. It is the final translation step before `run_remove` prints the removal result.
 
 *Call graph*: called by 1 (run_remove).
 
@@ -2809,11 +2825,11 @@ fn from_outcome(outcome: MarketplaceRemoveOutcome) -> Self
 fn print_upgrade_outcome_json(outcome: &PluginMarketplaceUpgradeOutcome) -> Result<()>
 ```
 
-**Purpose**: Prints upgrade results as JSON but still treats any marketplace-specific failure as an overall command failure.
+**Purpose**: This prints the result of a marketplace upgrade as JSON, but only after making sure every requested upgrade succeeded. It still writes individual failure messages to standard error so people can see what went wrong.
 
-**Data flow**: Reads a `PluginMarketplaceUpgradeOutcome`, prints each error to stderr, checks `all_succeeded()`, bails with a count-based message if any failure occurred, otherwise converts the outcome with `JsonMarketplaceUpgradeOutput::from_outcome`, prints pretty JSON, and returns success.
+**Data flow**: It receives the upgrade outcome. It prints each recorded error to standard error, checks whether all upgrades succeeded, and stops with an error if any failed. If everything succeeded, it converts the outcome into a JSON output object and prints it.
 
-**Call relations**: Called by `run_upgrade` for `--json`. It shares the same failure semantics as the human formatter while exposing structured success data.
+**Call relations**: It is called by `run_upgrade` when the user passes `--json`. It uses `JsonMarketplaceUpgradeOutput::from_outcome` to build the JSON response and uses the outcome's success check to decide whether to return success or fail the command.
 
 *Call graph*: calls 1 internal fn (from_outcome); called by 1 (run_upgrade); 4 external calls (all_succeeded, bail!, eprintln!, println!).
 
@@ -2824,11 +2840,11 @@ fn print_upgrade_outcome_json(outcome: &PluginMarketplaceUpgradeOutcome) -> Resu
 fn from_outcome(outcome: &PluginMarketplaceUpgradeOutcome) -> Self
 ```
 
-**Purpose**: Converts an upgrade outcome into a serializable JSON summary.
+**Purpose**: This converts the internal upgrade result into a JSON response for scripts and other tools. It includes what was selected, which roots were updated, and any errors recorded in the outcome.
 
-**Data flow**: Borrows `PluginMarketplaceUpgradeOutcome`, clones `selected_marketplaces`, stringifies each upgraded root path, maps each error into `JsonMarketplaceUpgradeError`, and returns the assembled struct.
+**Data flow**: It receives a borrowed upgrade outcome. It copies the selected marketplace names, converts updated root paths into strings, converts each error into a simple name-and-message object, and returns the JSON-ready structure.
 
-**Call relations**: Used only by `print_upgrade_outcome_json`.
+**Call relations**: It is called by `print_upgrade_outcome_json` after that function has checked for failures. It provides the clean data shape that `serde_json` can print.
 
 *Call graph*: called by 1 (print_upgrade_outcome_json).
 
@@ -2842,11 +2858,11 @@ fn print_upgrade_outcome(
 ) -> Result<()>
 ```
 
-**Purpose**: Formats marketplace upgrade results for humans, distinguishing no-op, already-up-to-date, single-marketplace, and multi-marketplace cases.
+**Purpose**: This prints a human-readable summary of a marketplace upgrade. It chooses wording that matches the situation, such as nothing to upgrade, already up to date, one marketplace upgraded, or several upgraded.
 
-**Data flow**: Reads the upgrade outcome and optional selected marketplace name, prints each error to stderr, bails if `all_succeeded()` is false, then chooses one of several messages: no configured Git marketplaces, already up to date, upgraded one named marketplace, or upgraded N marketplaces. In upgrade cases it also prints each installed root path.
+**Data flow**: It receives the upgrade outcome and the optional marketplace name the user selected. It prints any individual errors to standard error, fails the command if any upgrade failed, then prints a success or no-op message and any installed roots that changed.
 
-**Call relations**: Called by `run_upgrade` for non-JSON output. It is the human-facing counterpart to `print_upgrade_outcome_json`.
+**Call relations**: It is called by `run_upgrade` when JSON output was not requested. It is the plain-language counterpart to `print_upgrade_outcome_json`, using the same upgrade outcome but formatting it for a person reading the terminal.
 
 *Call graph*: called by 1 (run_upgrade); 4 external calls (all_succeeded, bail!, eprintln!, println!).
 
@@ -2857,11 +2873,11 @@ fn print_upgrade_outcome(
 fn sparse_paths_parse_before_or_after_source()
 ```
 
-**Purpose**: Verifies that repeated `--sparse` flags parse correctly whether they appear before or after the source positional.
+**Purpose**: This test checks that the `--sparse` option for adding a marketplace works whether it appears before or after the source. It also checks that repeated `--sparse` flags are collected in order.
 
-**Data flow**: Parses several `AddMarketplaceArgs` argv shapes and asserts the resulting `source` and `sparse_paths` values.
+**Data flow**: It feeds example command-line argument lists into the parser. It then compares the parsed source and sparse path list against the expected values. The output is only a passing or failing test result.
 
-**Call relations**: Parser regression test for `AddMarketplaceArgs`.
+**Call relations**: This test exercises the command-line parser for `AddMarketplaceArgs`. It does not call the add operation itself; it protects the user-facing command syntax so later changes do not accidentally break accepted argument order.
 
 *Call graph*: 2 external calls (assert_eq!, try_parse_from).
 
@@ -2872,11 +2888,11 @@ fn sparse_paths_parse_before_or_after_source()
 fn upgrade_subcommand_parses_optional_marketplace_name()
 ```
 
-**Purpose**: Checks that marketplace upgrade accepts an optional marketplace name positional.
+**Purpose**: This test checks that the upgrade command accepts either no marketplace name or one marketplace name. That matters because `upgrade` means all Git marketplaces, while `upgrade debug` means just `debug`.
 
-**Data flow**: Parses `upgrade` with and without a name and asserts `marketplace_name` is `None` or `Some("debug")` accordingly.
+**Data flow**: It parses one argument list with only `upgrade` and another with `upgrade debug`. It then checks that the first has no selected name and the second stores `debug` as the selected marketplace. The result is a test pass or failure.
 
-**Call relations**: Parser coverage for `UpgradeMarketplaceArgs`.
+**Call relations**: This test exercises `UpgradeMarketplaceArgs` parsing. It supports the behavior later used by `run_upgrade`, which relies on the optional name to decide whether to refresh all configured Git marketplaces or just one.
 
 *Call graph*: 2 external calls (assert_eq!, try_parse_from).
 
@@ -2887,24 +2903,26 @@ fn upgrade_subcommand_parses_optional_marketplace_name()
 fn remove_subcommand_parses_marketplace_name()
 ```
 
-**Purpose**: Checks that marketplace remove captures the required marketplace name positional.
+**Purpose**: This test checks that the remove command correctly reads the required marketplace name. Removing without the right name would affect the wrong user expectation or fail confusingly.
 
-**Data flow**: Parses `remove debug` and asserts the parsed `marketplace_name` string.
+**Data flow**: It parses an example `remove debug` argument list. It then checks that the parsed marketplace name is exactly `debug`. The only output is whether the test passes.
 
-**Call relations**: Parser coverage for `RemoveMarketplaceArgs`.
+**Call relations**: This test exercises `RemoveMarketplaceArgs` parsing. It protects the input shape that `run_remove` depends on before it sends the name to the actual marketplace removal code.
 
 *Call graph*: 2 external calls (assert_eq!, try_parse_from).
 
 
 ### `plugin/src/provider.rs`
 
-`orchestration` · `plugin discovery and resolution`
+`data_model` · `plugin discovery and resolution`
 
-This file models a plugin after discovery but before activation. `PluginResourceLocator` and `ResolvedPluginLocation` currently each have an `Environment` variant that pairs an `environment_id` with an absolute path, making resource ownership explicit across potentially different filesystems or execution environments. `ResolvedPlugin` then bundles four pieces of information: the opaque selected capability-root ID, the package location, the manifest resource path, and the parsed manifest whose resource fields have been rewritten to use `PluginResourceLocator` instead of raw paths.
+Plugins can come from different “authorities,” such as a particular environment with its own filesystem. This file makes sure the system remembers that authority alongside every plugin path. That matters because a path by itself is not enough: `/plugin/config.json` only makes sense if you also know which environment owns that filesystem.
 
-The key constructor is `ResolvedPlugin::from_environment`. It accepts a selected-root ID, environment ID, package root, manifest path, and a `PluginManifest<AbsolutePathBuf>`. It first validates that the manifest path lies under the package root, then uses `PluginManifest::try_map_resources` with the same root-checking conversion to rewrite every manifest resource path into an environment-owned locator. Any resource outside the package root causes `ResolvedPluginError::ResourceOutsideRoot`, preventing inconsistent descriptors that could escape the package boundary.
+The main type is `ResolvedPlugin`, an inert plugin descriptor. “Inert” means it describes the plugin package and its manifest, but does not start or execute the plugin. It stores the selected root ID, where the plugin package lives, where its manifest file came from, and the parsed manifest itself.
 
-The remaining methods are simple accessors used by later loading stages. The `PluginProvider` trait abstracts source-specific resolution: implementations perform filesystem access through the authority named by a `SelectedCapabilityRoot` and asynchronously return either `None` for non-plugin roots or a fully resolved inert descriptor.
+A key safety rule appears here: every resource mentioned by the manifest must stay inside the plugin package root. This is like checking that all files listed in a shipping box inventory are actually inside that box, not somewhere else in the warehouse. If a resource points outside the root, construction fails with `ResolvedPluginError::ResourceOutsideRoot`.
+
+The `PluginProvider` trait is the extension point. A provider is something that can inspect a selected capability root, using that root’s proper filesystem authority, and return either no plugin or a safely resolved `ResolvedPlugin`.
 
 #### Function details
 
@@ -2919,11 +2937,11 @@ fn from_environment(
         manifest: PluginManifest<AbsoluteP
 ```
 
-**Purpose**: Builds a resolved plugin descriptor for a package rooted in a specific environment and validates that every referenced resource stays inside that package root. It converts raw absolute manifest paths into authority-bound locators in one pass.
+**Purpose**: Builds a `ResolvedPlugin` for a plugin package that belongs to a specific environment. It checks that the manifest file and every resource path inside the manifest are actually under the package root before accepting them.
 
-**Data flow**: It takes owned IDs and paths plus a `PluginManifest<AbsolutePathBuf>`. It first converts `manifest_path` with `environment_resource(&environment_id, &root, manifest_path)?`, then consumes the manifest and calls `try_map_resources` with a closure that applies the same `environment_resource` check to each resource path. On success it returns `ResolvedPlugin` containing the selected root ID, `ResolvedPluginLocation::Environment { environment_id, root }`, the converted manifest path, and the converted manifest; on failure it returns `ResolvedPluginError`.
+**Data flow**: It receives a selected root ID, an environment ID, the package root path, the manifest file path, and a parsed manifest whose resource fields are plain absolute paths. It converts the manifest path and each manifest resource into an environment-bound resource locator, rejecting any path outside the package root. If all checks pass, it returns a complete `ResolvedPlugin`; if not, it returns a construction error.
 
-**Call relations**: Filesystem-backed plugin resolution code and tests call this after parsing a manifest. It delegates all per-resource validation and conversion to `environment_resource` and the manifest’s generic mapping routine so the constructor enforces package-boundary consistency uniformly.
+**Call relations**: This is the main constructor used when plugin roots are resolved, including by `resolve_plugin_root` and test helpers such as `resolved_plugin`. It calls `environment_resource` for the manifest path and uses the manifest’s `try_map_resources` step to apply the same conversion to every resource named in the manifest.
 
 *Call graph*: calls 2 internal fn (try_map_resources, environment_resource); called by 5 (host_and_executor_sources_parse_the_same_manifest, resolve_plugin_root, resolved_plugin, environment_descriptor_binds_every_manifest_resource, environment_descriptor_rejects_resources_outside_package_root).
 
@@ -2934,11 +2952,11 @@ fn from_environment(
 fn selected_root_id(&self) -> &str
 ```
 
-**Purpose**: Returns the opaque identifier of the selected capability root that produced this plugin. It preserves source-level identity for later orchestration layers.
+**Purpose**: Returns the opaque ID for the capability root that was selected for this plugin. Callers use it to connect the resolved plugin back to the root choice that produced it.
 
-**Data flow**: It borrows and returns `&self.selected_root_id` as `&str`. No allocation or mutation occurs.
+**Data flow**: It reads the stored `selected_root_id` string from the `ResolvedPlugin` and returns it as borrowed text. It does not change the plugin descriptor.
 
-**Call relations**: The file-system loading path reads this when it needs to correlate a resolved plugin back to the selected root that was scanned.
+**Call relations**: This is used by `load_from_file_system` when that later loading step needs to know which selected root the resolved plugin came from.
 
 *Call graph*: called by 1 (load_from_file_system).
 
@@ -2949,11 +2967,11 @@ fn selected_root_id(&self) -> &str
 fn location(&self) -> &ResolvedPluginLocation
 ```
 
-**Purpose**: Exposes the authority-bound package location for the resolved plugin. It lets later stages know which environment owns the plugin root.
+**Purpose**: Returns the authority-bound package location for the plugin. This tells callers both where the plugin root is and which environment owns that path.
 
-**Data flow**: It returns a shared reference to `self.location`. No transformation occurs.
+**Data flow**: It reads the stored `location` field and returns a borrowed reference to it. Nothing is copied or modified.
 
-**Call relations**: Loading code consults this accessor when it needs the package root and owning environment to continue reading plugin contents.
+**Call relations**: This is used by `load_from_file_system` so that loading code can access the plugin package through the correct environment and root path.
 
 *Call graph*: called by 1 (load_from_file_system).
 
@@ -2964,11 +2982,11 @@ fn location(&self) -> &ResolvedPluginLocation
 fn manifest_path(&self) -> &PluginResourceLocator
 ```
 
-**Purpose**: Returns the authority-bound locator for the manifest file used to resolve the package. It distinguishes the manifest resource itself from the package root and from other manifest-declared resources.
+**Purpose**: Returns the exact resource locator for the manifest file that was used to resolve the plugin. This is useful when code needs to know where the plugin description originally came from.
 
-**Data flow**: It returns `&self.manifest_path` directly. No computation or mutation occurs.
+**Data flow**: It reads the stored `manifest_path` field and returns a borrowed reference. The descriptor stays unchanged.
 
-**Call relations**: Tests inspect this accessor to verify that manifest-path binding happened correctly during construction.
+**Call relations**: This accessor is available for later code that needs the manifest’s authority-aware location, matching the same resource-location model used throughout this file.
 
 
 ##### `ResolvedPlugin::manifest`  (lines 88–90)
@@ -2977,11 +2995,11 @@ fn manifest_path(&self) -> &PluginResourceLocator
 fn manifest(&self) -> &PluginManifest<PluginResourceLocator>
 ```
 
-**Purpose**: Returns the parsed manifest whose resource fields have already been rebound to source authority. It is the main metadata accessor for downstream loading stages.
+**Purpose**: Returns the parsed plugin manifest, with all of its resource paths already tied to their owning environment. Callers use this to read the plugin’s declared metadata and files safely.
 
-**Data flow**: It returns a shared reference to `self.manifest`. No transformation occurs.
+**Data flow**: It reads the stored manifest and returns a borrowed reference to it. The manifest has already had its plain paths converted into `PluginResourceLocator` values during construction.
 
-**Call relations**: The file-system loading path reads this to inspect plugin metadata and component resource locators after resolution. Tests also compare it against expected fully-bound manifests.
+**Call relations**: This is used by `load_from_file_system` after resolution, when the system needs the plugin metadata and resource list without losing track of which environment owns those resources.
 
 *Call graph*: called by 1 (load_from_file_system).
 
@@ -2996,24 +3014,26 @@ fn environment_resource(
 ) -> Result<PluginResourceLocator, ResolvedPluginError>
 ```
 
-**Purpose**: Validates that a resource path is inside a plugin package root and wraps it in an environment-owned locator. It is the package-boundary enforcement primitive used during resolved-plugin construction.
+**Purpose**: Turns an absolute path into an environment-owned plugin resource, but only if that path stays inside the plugin package root. This is the small safety gate that prevents a plugin manifest from pointing at files outside its package.
 
-**Data flow**: It takes `environment_id`, `root`, and an owned absolute `path`. It checks `path.as_path().starts_with(root.as_path())`; if false, it returns `ResolvedPluginError::ResourceOutsideRoot { root: root.clone(), path }`. Otherwise it returns `PluginResourceLocator::Environment { environment_id: environment_id.to_string(), path }`.
+**Data flow**: It receives an environment ID, the package root, and a resource path. It compares the resource path with the root path; if the resource does not start inside the root, it returns `ResourceOutsideRoot`. If the path is valid, it returns a `PluginResourceLocator::Environment` containing the environment ID and the path.
 
-**Call relations**: Only `ResolvedPlugin::from_environment` calls this, both for the manifest path itself and indirectly for every manifest resource via `try_map_resources`. That makes it the single source of truth for package-root containment checks.
+**Call relations**: This helper is called by `ResolvedPlugin::from_environment` first for the manifest path and then, through manifest resource mapping, for each resource path declared by the manifest. It supplies the validation and wrapping step that makes the finished descriptor authority-aware.
 
 *Call graph*: calls 1 internal fn (as_path); called by 1 (from_environment); 1 external calls (clone).
 
 
 ### `plugin/src/load_outcome.rs`
 
-`domain_logic` · `plugin load and capability aggregation`
+`domain_logic` · `after plugin load, before runtime feature use`
 
-This file defines two central runtime models. `LoadedPlugin<M>` is the per-plugin record produced by loading: config and manifest names/descriptions, filesystem root, enablement state, skill roots and disabled skill paths, whether any skills remain enabled, merged MCP server configs keyed by name, declared apps, hook sources and warnings, and an optional load error. Its `is_active` invariant is strict: a plugin contributes runtime capabilities only when `enabled` is true and `error` is `None`.
+After plugins are read from disk, the system needs one clean view of what is actually usable. This file provides that view. A loaded plugin may exist on disk but still be disabled, broken, or empty. The code here separates “found” from “effective”: only enabled plugins with no load error are treated as active.
 
-`plugin_capability_summary_from_loaded` converts one active plugin into a `PluginCapabilitySummary`. It sorts MCP server names for deterministic output, normalizes descriptions through `prompt_safe_plugin_description`, and deduplicates app connectors. It deliberately suppresses summaries for inactive plugins and for active plugins that expose no skills, MCP servers, or apps, preventing empty capability entries from reaching model-facing surfaces.
+The main data type, LoadedPlugin, is a record of one plugin: its configured name, optional manifest name and description, root folder, skill folders, MCP server definitions, app declarations, hook files, warnings, and any load error. Think of it like a shipping label plus contents checklist for one package.
 
-`PluginLoadOutcome<M>` stores both the original plugin list and precomputed capability summaries. `from_plugins` is the canonical constructor; `Default` delegates to it with an empty list. The effective-* methods all filter to active plugins first, then merge data with specific precedence rules: skill roots are sorted/deduped globally; `effective_plugin_skill_roots` preserves the first plugin associated with a shared path before sorting by path; MCP servers use first-wins insertion by server name; apps are deduplicated in iteration order; hook sources and warnings are concatenated. The `EffectiveSkillRoots` trait exists so downstream code can depend on skill-root access without naming the generic MCP config type.
+PluginLoadOutcome is the combined result for all plugins. It keeps the full plugin list, but also precomputes short capability summaries for active plugins that have something useful to offer. These summaries are safe to show to the model: descriptions are cleaned up, whitespace is normalized, and very long text is cut down.
+
+The file also answers practical questions for later parts of the program: “Which skill folders should be searched?”, “Which MCP servers are available?”, “Which apps can plugins connect to?”, and “Which hooks should run?” Duplicate skill paths are removed, and duplicate MCP server names keep the first active plugin’s version. Without this file, later code would have to repeatedly re-check plugin status and might accidentally use disabled or failed plugins.
 
 #### Function details
 
@@ -3023,11 +3043,11 @@ This file defines two central runtime models. `LoadedPlugin<M>` is the per-plugi
 fn is_active(&self) -> bool
 ```
 
-**Purpose**: Determines whether a loaded plugin should contribute runtime capabilities. A plugin is active only if it is enabled and has no recorded load error.
+**Purpose**: Checks whether a plugin should count as usable. A plugin is active only when it is enabled and did not record a load error.
 
-**Data flow**: It reads `self.enabled` and `self.error`, computes `self.enabled && self.error.is_none()`, and returns that boolean. It does not mutate any state.
+**Data flow**: It reads the plugin’s enabled flag and error field. If enabled is true and error is empty, it returns true; otherwise it returns false. It does not change the plugin.
 
-**Call relations**: Capability-summary derivation calls this as the gate before exposing any plugin metadata. Other effective aggregation methods inline the same active-plugin filtering logic conceptually, so this method captures the file’s core activation rule.
+**Call relations**: When building a capability summary, plugin_capability_summary_from_loaded asks this first. If the answer is no, the plugin is ignored for model-facing capabilities.
 
 *Call graph*: called by 1 (plugin_capability_summary_from_loaded).
 
@@ -3038,11 +3058,11 @@ fn is_active(&self) -> bool
 fn display_name(&self) -> &str
 ```
 
-**Purpose**: Returns the human-facing plugin name, preferring the manifest-provided name when present. It falls back to the configuration name when no manifest name exists.
+**Purpose**: Chooses the human-friendly name to show for a plugin. It prefers the name from the plugin manifest, and falls back to the configured name if the manifest did not provide one.
 
-**Data flow**: It reads `self.manifest_name`, converts the `Option<String>` to `Option<&str>` with `as_deref`, and returns either that borrowed manifest name or `&self.config_name`. No allocation or mutation occurs.
+**Data flow**: It reads manifest_name and config_name. If manifest_name exists, it returns that text; otherwise it returns config_name. Nothing is copied or changed.
 
-**Call relations**: The capability-summary builder uses this to populate `PluginCapabilitySummary.display_name`, ensuring summaries reflect manifest branding when available.
+**Call relations**: plugin_capability_summary_from_loaded uses this when creating the name that appears in a plugin capability summary.
 
 *Call graph*: called by 1 (plugin_capability_summary_from_loaded).
 
@@ -3055,11 +3075,11 @@ fn plugin_capability_summary_from_loaded(
 ) -> Option<PluginCapabilitySummary>
 ```
 
-**Purpose**: Builds a model-facing capability summary from one loaded plugin, but only when the plugin is active and actually contributes at least one capability. It is the filtering and normalization step behind `PluginLoadOutcome`’s precomputed summaries.
+**Purpose**: Builds a short, safe summary of what one loaded plugin can do, but only if the plugin is active and has at least one visible capability. This is the bridge from a detailed loaded plugin record to the compact information shown to the model or other capability readers.
 
-**Data flow**: It takes `&LoadedPlugin<M>`, first checks `plugin.is_active()` and returns `None` early for inactive plugins. For active plugins it clones and sorts MCP server names from `plugin.mcp_servers.keys()`, derives a display name via `plugin.display_name()`, sanitizes `plugin.manifest_description` with `prompt_safe_plugin_description`, and deduplicates app connectors from `plugin.apps` via `app_connector_ids_from_declarations`. It constructs a `PluginCapabilitySummary` and returns `Some(summary)` only if `has_skills` is true or either capability list is non-empty; otherwise it returns `None`.
+**Data flow**: It receives one LoadedPlugin. It first checks whether the plugin is active. If not, it returns nothing. For an active plugin, it sorts MCP server names, cleans the manifest description, collects app connector IDs from app declarations, and records whether the plugin has enabled skills. If the plugin has no skills, no MCP servers, and no app connectors, it returns nothing; otherwise it returns a PluginCapabilitySummary.
 
-**Call relations**: This helper is used exclusively during `PluginLoadOutcome::from_plugins` construction to precompute summaries once. It delegates to the plugin activation/name helpers and to description/app normalization helpers so the constructor can remain a simple iterator pipeline.
+**Call relations**: PluginLoadOutcome::from_plugins uses this while constructing the overall result. Inside, it relies on LoadedPlugin::is_active, LoadedPlugin::display_name, prompt_safe_plugin_description, and app_connector_ids_from_declarations to turn detailed plugin data into a concise summary.
 
 *Call graph*: calls 3 internal fn (display_name, is_active, prompt_safe_plugin_description); 1 external calls (app_connector_ids_from_declarations).
 
@@ -3070,11 +3090,11 @@ fn plugin_capability_summary_from_loaded(
 fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String>
 ```
 
-**Purpose**: Normalizes a plugin description for inclusion in capability summaries that may be shown to or consumed by models. It strips formatting-like whitespace variation and enforces a maximum length.
+**Purpose**: Cleans a plugin description so it is safe and tidy to include in a model-facing capability summary. It removes odd spacing and limits the text length.
 
-**Data flow**: It accepts `Option<&str>`. `None` returns immediately. For `Some`, it splits on whitespace, rejoins tokens with single spaces, returns `None` if the normalized string is empty, otherwise truncates to `MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN` characters and returns the resulting `String`.
+**Data flow**: It receives an optional description. If there is no description, or if the cleaned description is empty, it returns nothing. Otherwise it collapses all whitespace into single spaces, cuts the result to the maximum allowed length, and returns the cleaned string.
 
-**Call relations**: The capability-summary builder calls this before embedding manifest descriptions into summaries. Its normalization prevents multiline or excessively long descriptions from leaking directly into prompt-facing metadata.
+**Call relations**: plugin_capability_summary_from_loaded calls this before putting a plugin’s manifest description into a capability summary. This keeps plugin-provided text from being overly long or messy.
 
 *Call graph*: called by 1 (plugin_capability_summary_from_loaded).
 
@@ -3085,11 +3105,11 @@ fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String>
 fn default() -> Self
 ```
 
-**Purpose**: Creates an empty plugin-load outcome with no plugins and therefore no derived capabilities. It provides a generic-friendly default for callers that need a baseline outcome before loading.
+**Purpose**: Creates an empty plugin load result. This is useful when there are no plugins or when plugin loading is skipped or not yet available.
 
-**Data flow**: It constructs an empty `Vec<LoadedPlugin<M>>` and delegates to `Self::from_plugins`, returning the resulting `PluginLoadOutcome<M>`. No external state is touched.
+**Data flow**: It starts with no input besides the type being created. It builds an empty plugin list and passes it through the normal construction path, producing a PluginLoadOutcome with no plugins and no capability summaries.
 
-**Call relations**: Configuration-loading paths use this when no plugins are available or before layering plugin sources. By routing through `from_plugins`, it preserves the invariant that `capability_summaries` always matches the stored plugin list.
+**Call relations**: Higher-level plugin loading paths such as plugins_for_config_with_force_reload and plugins_for_layer_stack call this when they need a harmless empty outcome. It delegates to from_plugins so even the empty case is built the same way as the normal case.
 
 *Call graph*: called by 2 (plugins_for_config_with_force_reload, plugins_for_layer_stack); 2 external calls (from_plugins, new).
 
@@ -3100,11 +3120,11 @@ fn default() -> Self
 fn from_plugins(plugins: Vec<LoadedPlugin<M>>) -> Self
 ```
 
-**Purpose**: Constructs the canonical runtime outcome from a concrete list of loaded plugins and eagerly derives capability summaries. It centralizes the invariant that summaries are computed from the same plugin snapshot they accompany.
+**Purpose**: Creates the final load outcome from a list of loaded plugins. It keeps the full list and derives the compact capability summaries at the same time.
 
-**Data flow**: It takes ownership of `Vec<LoadedPlugin<M>>`, iterates over borrowed plugins, applies `filter_map(plugin_capability_summary_from_loaded)`, collects the resulting summaries into a `Vec<PluginCapabilitySummary>`, and returns `Self { plugins, capability_summaries }`.
+**Data flow**: It receives a vector of LoadedPlugin records. It walks through them, tries to build a capability summary for each active and useful plugin, collects those summaries, and returns a PluginLoadOutcome containing both the original plugin records and the derived summaries.
 
-**Call relations**: This is the main constructor used by plugin-resolution code and tests. All later accessor methods rely on the stored plugin list, while summary consumers use the precomputed `capability_summaries` generated here.
+**Call relations**: This is the main constructor used after plugin resolution, including by resolve_loaded_plugins_for_auth and by tests that check filtering behavior. It uses plugin_capability_summary_from_loaded to decide which plugins deserve a capability summary.
 
 *Call graph*: called by 3 (resolve_loaded_plugins_for_auth, capability_index_filters_inactive_and_zero_capability_plugins, effective_plugin_skill_roots_preserves_first_plugin_for_shared_root).
 
@@ -3115,11 +3135,11 @@ fn from_plugins(plugins: Vec<LoadedPlugin<M>>) -> Self
 fn effective_mcp_servers(&self) -> HashMap<String, M>
 ```
 
-**Purpose**: Merges MCP server definitions from all active plugins into one map, keeping the first definition seen for each server name. It produces the runtime-effective MCP configuration set.
+**Purpose**: Returns the MCP servers that should actually be available at runtime. MCP here means Model Context Protocol, a way for the system to talk to external tools or services exposed by plugins.
 
-**Data flow**: It iterates through `self.plugins`, filters to active plugins, then iterates each plugin’s `mcp_servers` map. For each `(name, config)`, it inserts into a new `HashMap<String, M>` with `entry(...).or_insert_with(|| config.clone())`, so later duplicates are ignored. It returns the merged map.
+**Data flow**: It starts with the stored plugins. It looks only at active plugins, then copies each MCP server definition into a new map. If two active plugins use the same server name, the first one wins and later duplicates are ignored. The result is a map from server name to server configuration.
 
-**Call relations**: Callers that need the final MCP server set invoke this after plugin loading. The first-wins insertion rule means plugin iteration order determines precedence when multiple active plugins declare the same server name.
+**Call relations**: Code that needs runtime MCP server names, such as sorted_effective_mcp_server_names, calls this to get the already-filtered set. This method does the active-plugin filtering so callers do not have to repeat it.
 
 *Call graph*: called by 1 (sorted_effective_mcp_server_names); 1 external calls (new).
 
@@ -3130,11 +3150,11 @@ fn effective_mcp_servers(&self) -> HashMap<String, M>
 fn effective_apps(&self) -> Vec<AppConnectorId>
 ```
 
-**Purpose**: Computes the deduplicated list of app connector IDs contributed by active plugins. It collapses duplicate connectors across plugins while preserving first-seen order.
+**Purpose**: Returns the app connector IDs from active plugins. An app connector ID is the system’s compact identifier for an app integration declared by a plugin.
 
-**Data flow**: It iterates over `self.plugins`, filters to active plugins, flattens each plugin’s `apps.iter()`, and passes that iterator of `&AppDeclaration` into `app_connector_ids_from_declarations`. The returned `Vec<AppConnectorId>` is the effective app list.
+**Data flow**: It reads all active plugins, gathers their app declarations, and passes them to app_connector_ids_from_declarations. The result is a list of connector IDs derived from those declarations.
 
-**Call relations**: This method is the app counterpart to effective MCP server and skill-root aggregation. It delegates deduplication policy to the crate-level helper so app connector ordering stays consistent with capability-summary generation.
+**Call relations**: This method is used when later code needs to know which plugin app integrations are actually available. It hands the declaration-to-ID conversion to app_connector_ids_from_declarations, keeping this method focused on filtering to active plugins.
 
 *Call graph*: 1 external calls (app_connector_ids_from_declarations).
 
@@ -3145,11 +3165,11 @@ fn effective_apps(&self) -> Vec<AppConnectorId>
 fn effective_plugin_hook_sources(&self) -> Vec<PluginHookSource>
 ```
 
-**Purpose**: Collects all hook source records from active plugins into one flat list. It exposes the concrete hook files and metadata that should participate at runtime.
+**Purpose**: Returns the hook sources from active plugins. Hooks are plugin-provided pieces that can be run at certain points in the program’s flow.
 
-**Data flow**: It iterates over active plugins, clones each `PluginHookSource` from `plugin.hook_sources`, collects them into a `Vec<PluginHookSource>`, and returns it. No sorting or deduplication is applied.
+**Data flow**: It reads the plugin list, skips inactive plugins, copies each active plugin’s hook sources, and returns them in one combined list. It does not change the stored plugins.
 
-**Call relations**: Consumers call this after plugin loading when they need to register or inspect hooks. Its behavior mirrors the plugin iteration order and intentionally preserves every active hook source.
+**Call relations**: Later hook-loading or hook-running code can call this to get only the hook sources that should count. The method centralizes the rule that disabled or failed plugins must not contribute hooks.
 
 
 ##### `PluginLoadOutcome::effective_plugin_hook_warnings`  (lines 173–179)
@@ -3158,11 +3178,11 @@ fn effective_plugin_hook_sources(&self) -> Vec<PluginHookSource>
 fn effective_plugin_hook_warnings(&self) -> Vec<String>
 ```
 
-**Purpose**: Aggregates hook-loading warnings from all active plugins. It provides a single list of non-fatal hook issues to surface to callers or logs.
+**Purpose**: Returns hook-loading warnings from active plugins. These warnings explain non-fatal hook problems while ignoring plugins that are disabled or failed.
 
-**Data flow**: It iterates over active plugins, clones each warning string from `plugin.hook_load_warnings`, collects them into a `Vec<String>`, and returns that vector.
+**Data flow**: It scans active plugins, copies their hook_load_warnings strings, and returns all of them in a single list. The original warning lists remain unchanged.
 
-**Call relations**: This is typically consumed alongside effective hook sources so callers can both activate hooks and report any partial-load problems. It does not transform warning content beyond flattening and cloning.
+**Call relations**: User-facing or logging code can call this after plugins are loaded to report hook issues that matter for active plugins. It keeps inactive plugin warnings from cluttering the runtime view.
 
 
 ##### `PluginLoadOutcome::capability_summaries`  (lines 181–183)
@@ -3171,11 +3191,11 @@ fn effective_plugin_hook_warnings(&self) -> Vec<String>
 fn capability_summaries(&self) -> &[PluginCapabilitySummary]
 ```
 
-**Purpose**: Returns the precomputed slice of capability summaries derived at construction time. It is the read-only accessor for model-facing plugin capability metadata.
+**Purpose**: Gives read-only access to the precomputed plugin capability summaries. These summaries describe what active plugins can offer in a compact form.
 
-**Data flow**: It borrows `self.capability_summaries` and returns `&[PluginCapabilitySummary]`. No computation or mutation occurs.
+**Data flow**: It reads the PluginLoadOutcome and returns a borrowed slice of its capability_summaries list. Nothing is copied or changed.
 
-**Call relations**: Callers use this instead of recomputing summaries from plugins. Its contents are guaranteed to reflect the plugin list passed to `from_plugins`.
+**Call relations**: Callers use this when they need the model-facing or UI-facing capability list. Because from_plugins already built the summaries, this method simply exposes them safely.
 
 
 ##### `PluginLoadOutcome::plugins`  (lines 185–187)
@@ -3184,11 +3204,11 @@ fn capability_summaries(&self) -> &[PluginCapabilitySummary]
 fn plugins(&self) -> &[LoadedPlugin<M>]
 ```
 
-**Purpose**: Exposes the underlying loaded-plugin records for inspection. It is the raw accessor when callers need more than the derived effective views.
+**Purpose**: Gives read-only access to the full loaded plugin records. This includes active plugins, inactive plugins, and plugins with load errors.
 
-**Data flow**: It borrows `self.plugins` and returns `&[LoadedPlugin<M>]`. No transformation occurs.
+**Data flow**: It reads the PluginLoadOutcome and returns a borrowed slice of its plugins list. It does not filter, copy, or modify anything.
 
-**Call relations**: This accessor supports code that needs per-plugin details such as errors, roots, or disabled paths rather than merged capability outputs.
+**Call relations**: Callers use this when they need the detailed raw plugin load results rather than only the effective runtime capabilities.
 
 
 ##### `PluginLoadOutcome::effective_skill_roots`  (lines 199–201)
@@ -3197,11 +3217,11 @@ fn plugins(&self) -> &[LoadedPlugin<M>]
 fn effective_skill_roots(&self) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Returns the sorted, deduplicated set of skill root paths from active plugins. It is the simplest filesystem-oriented view of enabled plugin skills.
+**Purpose**: Provides the effective skill folders through the EffectiveSkillRoots trait. A skill root is a folder where plugin-provided skills can be found.
 
-**Data flow**: It iterates over active plugins, clones every path in `plugin.skill_roots` into a `Vec<AbsolutePathBuf>`, sorts the vector with `sort_unstable`, removes duplicates with `dedup`, and returns it.
+**Data flow**: It receives the outcome through the trait method and forwards the request to PluginLoadOutcome’s built-in skill-root calculation. The result is a list of active, deduplicated skill paths.
 
-**Call relations**: This method backs the `EffectiveSkillRoots` trait implementation and is used by downstream skill-loading code that only needs paths, not plugin provenance.
+**Call relations**: This trait method lets other crates depend on the idea of “something that can provide effective skill roots” without naming the plugin outcome’s MCP configuration type. It delegates to the concrete PluginLoadOutcome implementation.
 
 
 ##### `PluginLoadOutcome::effective_plugin_skill_roots`  (lines 203–205)
@@ -3210,11 +3230,11 @@ fn effective_skill_roots(&self) -> Vec<AbsolutePathBuf>
 fn effective_plugin_skill_roots(&self) -> Vec<PluginSkillRoot>
 ```
 
-**Purpose**: Returns active skill roots annotated with the plugin that first claimed each path. It preserves provenance for shared roots while still deduplicating by filesystem path.
+**Purpose**: Provides effective skill folders together with the plugin they came from, through the EffectiveSkillRoots trait. This is useful when code needs both the folder path and its owning plugin.
 
-**Data flow**: It creates an output `Vec<PluginSkillRoot>` and a `HashSet<AbsolutePathBuf>` of seen paths. Iterating active plugins in stored order, it clones each unseen skill root path and pushes a `PluginSkillRoot { path, plugin_id: plugin.config_name.clone(), plugin_root: plugin.root.clone() }`. After collection it sorts the vector by `path` and returns it.
+**Data flow**: It receives the outcome through the trait method and forwards to PluginLoadOutcome’s concrete plugin-skill-root calculation. The result is a sorted list of PluginSkillRoot records, with duplicate paths assigned to the first active plugin that provided them.
 
-**Call relations**: The trait implementation delegates here when callers need both paths and plugin ownership. The first-seen rule is intentional and is covered by the file’s unit test for shared roots.
+**Call relations**: This is the trait-facing version of the plugin skill-root lookup. It allows skills-related code to call the method without caring about the exact MCP server configuration type used inside PluginLoadOutcome.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -3225,11 +3245,11 @@ fn effective_plugin_skill_roots(&self) -> Vec<PluginSkillRoot>
 fn test_path(name: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an absolute temporary test path from a simple name. It keeps test fixtures concise while ensuring `AbsolutePathBuf` validation is exercised.
+**Purpose**: Creates an absolute temporary path for tests. It gives tests realistic absolute paths without hard-coding machine-specific directories.
 
-**Data flow**: It reads the process temp directory via `std::env::temp_dir()`, joins the provided `name`, converts the result with `AbsolutePathBuf::from_absolute_path_checked`, and returns the validated absolute path or panics in the test if conversion fails.
+**Data flow**: It takes a short name, appends it to the system temporary directory, checks that the result is an absolute path, and returns it as an AbsolutePathBuf. If the temporary directory path were unexpectedly not absolute, the test would fail.
 
-**Call relations**: The test helper is used by fixture construction and assertions in this module’s tests so expected plugin roots and skill roots are generated consistently.
+**Call relations**: The test helper tests::loaded_plugin and the test case use this to build plugin roots and shared skill paths. It relies on temp_dir and from_absolute_path_checked to make valid test paths.
 
 *Call graph*: calls 1 internal fn (from_absolute_path_checked); 1 external calls (temp_dir).
 
@@ -3240,11 +3260,11 @@ fn test_path(name: &str) -> AbsolutePathBuf
 fn loaded_plugin(config_name: &str, skill_roots: Vec<AbsolutePathBuf>) -> LoadedPlugin<()>
 ```
 
-**Purpose**: Constructs a minimal active `LoadedPlugin<()>` fixture for tests. It fills nonessential fields with empty/default values while allowing tests to vary config name and skill roots.
+**Purpose**: Builds a simple active plugin record for tests. It fills in only the fields needed by the skill-root test and uses empty values for everything else.
 
-**Data flow**: It takes a `config_name` and `Vec<AbsolutePathBuf>` skill roots, allocates strings and empty collections for the remaining fields, derives `root` from `test_path(config_name)`, sets `enabled: true`, `has_enabled_skills: true`, and `error: None`, and returns the assembled `LoadedPlugin<()>`.
+**Data flow**: It takes a config name and a list of skill roots. It creates a LoadedPlugin with that name, a temporary root path, enabled set to true, no error, skills marked as present, and empty MCP server, app, hook, warning, and disabled-skill collections. The result is a ready-to-use test plugin.
 
-**Call relations**: The shared-root test uses this helper to create concise plugin fixtures without repeating boilerplate field initialization.
+**Call relations**: The test effective_plugin_skill_roots_preserves_first_plugin_for_shared_root calls this twice to create two plugins that point at the same skill folder. It uses tests::test_path to create each plugin’s root path.
 
 *Call graph*: 4 external calls (new, new, new, test_path).
 
@@ -3255,24 +3275,24 @@ fn loaded_plugin(config_name: &str, skill_roots: Vec<AbsolutePathBuf>) -> Loaded
 fn effective_plugin_skill_roots_preserves_first_plugin_for_shared_root()
 ```
 
-**Purpose**: Verifies that when two active plugins share the same skill-root path, the effective plugin-skill-root list keeps the first plugin’s identity. This locks in the precedence rule implemented by `effective_plugin_skill_roots`.
+**Purpose**: Checks an important duplicate-handling rule: if two active plugins point to the same skill folder, the first plugin in load order keeps ownership of that folder. This prevents later plugins from silently taking credit for a shared path.
 
-**Data flow**: It creates one shared absolute path, builds a `PluginLoadOutcome` from two fixture plugins that both reference it, calls `outcome.effective_plugin_skill_roots()`, and asserts equality against a single-element vector naming only the first plugin and its root.
+**Data flow**: It creates one shared skill path, builds two active test plugins that both use it, constructs a PluginLoadOutcome, and asks for effective plugin skill roots. It then compares the result with the expected single entry owned by the first plugin, zeta@test.
 
-**Call relations**: This test exercises the constructor plus the provenance-preserving aggregation path, specifically guarding against regressions that would overwrite first ownership with later plugins.
+**Call relations**: This test exercises PluginLoadOutcome::from_plugins and the effective plugin skill-root calculation. It uses tests::test_path and tests::loaded_plugin to set up the data, then assert_eq! to confirm the first-plugin-wins behavior.
 
 *Call graph*: calls 1 internal fn (from_plugins); 3 external calls (assert_eq!, test_path, vec!).
 
 
 ### `codex-mcp/src/plugin_config.rs`
 
-`config` · `plugin config load`
+`config` · `config load`
 
-This file is the bridge between plugin-authored JSON and the crate's internal `McpServerConfig` model. It accepts either a top-level `{ "mcpServers": ... }` object or a bare server-name map via the untagged `PluginMcpFile` enum, then parses each server independently so one malformed declaration does not invalidate the rest. The result type, `PluginMcpConfigParseOutcome`, deliberately separates successfully normalized servers from `PluginMcpServerParseError` entries keyed by server name.
+Plugins can declare MCP servers, where MCP means “Model Context Protocol,” a way for Codex to talk to external tools or services. This file is the translator between the plugin’s JSON file and the stricter configuration format Codex uses while running. Without it, plugins would either need to write configuration in exactly Codex’s internal shape, or a single mistake in one server entry could make all plugin MCP settings unusable.
 
-Normalization has two modes. `PluginMcpServerPlacement::Declared` preserves the plugin's declared placement but rewrites relative `cwd` values under the plugin root. `Environment { environment_id }` forcibly binds stdio servers to a specific environment, defaults missing or null `cwd` to the plugin root, resolves relative `cwd` beneath that root while rejecting path escapes like `..`, and rewrites `env_vars` according to whether the target environment is local or executor-owned. In executor-owned environments, bare env-var names become `McpServerEnvVar::Config { source: Some("remote") }`; invalid `source: "local"` entries are rejected. In local environments, `source: "remote"` is rejected.
+The file accepts two JSON layouts: either an object with an mcpServers field, or a plain map of server names to server settings. For each server, it cleans up small differences in naming and shape. For example, it ignores a plugin-declared transport type field after checking whether it looks familiar, rewrites OAuth clientId into the internal client_id form, and warns when a plugin sets options Codex will not use.
 
-The file also performs schema-shape cleanup before deserialization: it tolerates several transport `type` spellings, warns on unknown transport types, drops plugin-level OAuth `callbackPort` because Codex uses global callback settings, and renames OAuth `clientId` to the snake_case `client_id` expected by `McpServerConfig`. Final deserialization is done through `serde_json::from_value`, so any remaining structural mismatch becomes a per-server string error.
+A key idea is “placement,” meaning where the plugin’s server will run. If Codex preserves the plugin’s declared placement, relative working directories are resolved under the plugin’s folder. If an executor-owned environment is assigned, the file adds that environment id, gives stdio servers a safe default working directory, and checks environment variables so local and remote values are not mixed incorrectly. This is like checking a delivery address before sending a package: the settings may look close, but they must be made safe and unambiguous before use.
 
 #### Function details
 
@@ -3282,11 +3302,11 @@ The file also performs schema-shape cleanup before deserialization: it tolerates
 fn into_mcp_servers(self) -> BTreeMap<String, JsonValue>
 ```
 
-**Purpose**: Extracts the server-name map from either supported plugin MCP file shape. It hides whether the JSON used a top-level `mcpServers` wrapper or a bare map.
+**Purpose**: This converts either supported plugin file shape into the same simple form: a map from server name to raw JSON settings. It lets the rest of the parser ignore which top-level layout the plugin used.
 
-**Data flow**: Consumes `self` and returns the contained `BTreeMap<String, JsonValue>`, either from `PluginMcpServersFile.mcp_servers` or directly from the `ServerMap` variant.
+**Data flow**: It receives a parsed plugin MCP file, which may either wrap servers inside an mcpServers field or already be a server map. It extracts the server map from whichever shape was used. The result is one collection of named server JSON values ready for per-server normalization.
 
-**Call relations**: This helper is used by `parse_plugin_mcp_config` after top-level deserialization so the rest of the parser can iterate a uniform server map.
+**Call relations**: This is the small adapter at the front of the parsing path. Once the plugin JSON has been decoded, the parser uses this to get a uniform list of servers before each server is normalized and either accepted or reported as invalid.
 
 
 ##### `parse_plugin_mcp_config`  (lines 62–82)
@@ -3299,11 +3319,11 @@ fn parse_plugin_mcp_config(
 ) -> Result<PluginMcpConfigParseOutcome, serde_json::Error>
 ```
 
-**Purpose**: Parses a plugin MCP JSON document and normalizes each declared server independently. Top-level JSON syntax/schema errors fail the whole parse, but per-server normalization failures are accumulated alongside successful servers.
+**Purpose**: This is the main entry point for turning a plugin’s MCP JSON text into usable Codex server configuration. It returns both the servers that worked and clear per-server errors for the ones that did not.
 
-**Data flow**: Reads `plugin_root`, raw JSON `contents`, and a `PluginMcpServerPlacement`. It deserializes `contents` into `PluginMcpFile`, initializes a default `PluginMcpConfigParseOutcome`, iterates over `parsed.into_mcp_servers()`, and for each `(name, config_value)` either inserts the normalized `McpServerConfig` into `outcome.servers` or pushes `PluginMcpServerParseError { name, message }` into `outcome.errors`. It returns `Ok(outcome)` unless top-level deserialization failed.
+**Data flow**: It takes the plugin’s root folder, the JSON text, and a placement rule. First it parses the top-level JSON document. If the whole document is malformed, it returns a JSON parse error. If the document is readable, it walks through each named server, asks the normalizer to turn that server into a runtime config, stores successful results in a map, and stores failures as named error messages.
 
-**Call relations**: This is the public entry point for plugin MCP parsing. It delegates all per-server rewriting and validation to `normalize_plugin_mcp_server`.
+**Call relations**: This function drives the file’s overall flow. It creates an empty outcome, then calls normalize_plugin_mcp_server for each server. That design means one bad server does not stop its valid sibling servers from being returned.
 
 *Call graph*: calls 1 internal fn (normalize_plugin_mcp_server); 1 external calls (default).
 
@@ -3318,11 +3338,11 @@ fn normalize_plugin_mcp_server(
 ) -> Result<McpServerConfig, String>
 ```
 
-**Purpose**: Normalizes one plugin-declared server JSON value into a concrete `McpServerConfig`. It applies placement-specific rewrites before deserializing and optionally rebinding environment-variable sources.
+**Purpose**: This turns one raw plugin server entry into an McpServerConfig, the stricter configuration Codex can actually run. It also applies special rules when the server is bound to a particular execution environment.
 
-**Data flow**: Reads `plugin_root`, a `JsonValue`, and placement. It first obtains a mutable JSON object from `normalize_plugin_mcp_server_value`. In `Environment` placement it overwrites `environment_id`, and for stdio-like objects (`command` present) it rewrites `cwd`: relative strings are resolved with `executor_plugin_cwd`, null or missing values become the plugin root, and non-string values are left untouched. It then deserializes the object into `McpServerConfig`; if placement is `Environment`, it mutably passes the config through `bind_environment_env_vars`. It returns the config or a string error.
+**Data flow**: It receives the plugin folder, one server’s JSON value, and the placement rule. It first cleans the raw JSON into a better-shaped object. If the placement is an executor environment, it adds the environment id, adjusts the working directory for command-based stdio servers, and defaults the working directory to the plugin root when none is given. It then asks serde, the JSON conversion library, to deserialize the object into McpServerConfig. Finally, for environment-bound servers, it validates and rewrites environment variable sources before returning the finished config or an error string.
 
-**Call relations**: This worker is called by `parse_plugin_mcp_config` for each server. It delegates path safety to `executor_plugin_cwd`, env-var authority rules to `bind_environment_env_vars`, and schema cleanup to `normalize_plugin_mcp_server_value`.
+**Call relations**: parse_plugin_mcp_config calls this once per declared server. This function coordinates the lower-level helpers: normalize_plugin_mcp_server_value does general cleanup, executor_plugin_cwd safely resolves relative working directories, and bind_environment_env_vars enforces local-versus-remote environment variable rules.
 
 *Call graph*: calls 3 internal fn (bind_environment_env_vars, executor_plugin_cwd, normalize_plugin_mcp_server_value); called by 1 (parse_plugin_mcp_config); 4 external calls (Object, String, to_string_lossy, matches!).
 
@@ -3333,11 +3353,11 @@ fn normalize_plugin_mcp_server(
 fn executor_plugin_cwd(plugin_root: &Path, configured_cwd: &str) -> Result<PathBuf, String>
 ```
 
-**Purpose**: Resolves a plugin-declared working directory for executor-owned placement while preventing escapes outside the plugin root. Absolute paths are accepted as-is; relative paths must stay strictly beneath the plugin root.
+**Purpose**: This safely resolves a plugin server’s working directory when the server is owned by an executor environment. It prevents a relative path from escaping the plugin’s folder.
 
-**Data flow**: Reads `plugin_root` and `configured_cwd`. It parses `configured_cwd` as a `Path`; if absolute, it returns that path unchanged. Otherwise it scans path components and rejects any `ParentDir`, `RootDir`, or Windows prefix component with a formatted error. Safe relative paths are joined onto `plugin_root` and returned.
+**Data flow**: It takes the plugin root path and the configured cwd string. If the configured path is absolute, it returns it unchanged. If it is relative, it checks for path parts like .., a filesystem root, or a platform prefix that could point outside the plugin root. Safe relative paths are joined onto the plugin root; unsafe ones become an explanatory error.
 
-**Call relations**: This helper is used only by `normalize_plugin_mcp_server` when environment placement needs to rewrite a relative stdio `cwd` safely.
+**Call relations**: normalize_plugin_mcp_server calls this when an environment-bound command server has a string cwd. Its result is put back into the JSON object before the server is converted into the final runtime configuration.
 
 *Call graph*: called by 1 (normalize_plugin_mcp_server); 3 external calls (join, new, format!).
 
@@ -3348,11 +3368,11 @@ fn executor_plugin_cwd(plugin_root: &Path, configured_cwd: &str) -> Result<PathB
 fn bind_environment_env_vars(config: &mut McpServerConfig) -> Result<(), String>
 ```
 
-**Purpose**: Rewrites or validates `env_vars` for stdio servers after an environment has been forced onto the config. It enforces that local environments use local sources and executor-owned environments use remote sources.
+**Purpose**: This checks environment variable declarations for stdio MCP servers and makes sure they match where the server will run. It prevents a remote executor-owned plugin from accidentally asking for local-only values, and prevents a local environment from using remote-only values.
 
-**Data flow**: Mutably reads an `McpServerConfig`. If the transport is not `Stdio`, it returns `Ok(())`. Otherwise it computes `is_local_environment` and iterates `env_vars`: bare `Name(name)` entries become `Config { name, source: Some("remote") }` for non-local environments and remain unchanged for local ones; `Config` entries are validated against `(is_local_environment, source)` and may have missing remote sources filled in or produce formatted errors for invalid local/remote combinations. It mutates the config in place and returns success or the first error.
+**Data flow**: It receives a mutable McpServerConfig. It first asks whether the target environment is local. If the server is not a stdio server, it leaves the config unchanged. For stdio servers, it walks through each environment variable entry. Plain variable names in a remote environment are rewritten into explicit remote-sourced config entries. Explicit config entries are accepted, filled in with a remote source when appropriate, or rejected when their source conflicts with the environment. It returns success after updating the config, or an error message for an invalid source choice.
 
-**Call relations**: This helper is called by `normalize_plugin_mcp_server` only for `Environment` placement, after deserialization has produced a typed config.
+**Call relations**: normalize_plugin_mcp_server calls this after the server has been deserialized into McpServerConfig and only when environment placement is being applied. It is the final safety check before a normalized environment-bound config is accepted.
 
 *Call graph*: calls 1 internal fn (is_local_environment); called by 1 (normalize_plugin_mcp_server); 3 external calls (format!, take, unreachable!).
 
@@ -3367,24 +3387,24 @@ fn normalize_plugin_mcp_server_value(
 ) -> JsonMap<String, JsonValue>
 ```
 
-**Purpose**: Performs JSON-shape cleanup on one plugin server declaration before typed deserialization. It tolerates plugin-facing field names and placement-specific path rewriting while warning about ignored or unknown fields.
+**Purpose**: This performs lightweight cleanup on one raw server JSON object before stricter deserialization happens. It smooths over plugin-friendly field names and removes or warns about settings Codex does not use directly.
 
-**Data flow**: Reads `plugin_root`, a raw `JsonValue`, and placement. Non-object values become an empty JSON object. For object values, it removes `type` and warns if the string is not one of `http`, `streamable_http`, `streamable-http`, or `stdio`. It removes `oauth`, drops any `callbackPort` with a warning, renames `clientId` to `client_id` when needed, and reinserts non-empty OAuth objects. In `Declared` placement, if `cwd` is a relative string, it rewrites it to `plugin_root.join(cwd)` as a string. It returns the normalized `JsonMap<String, JsonValue>`.
+**Data flow**: It takes the plugin root, a raw JSON value, and the placement rule. If the value is not a JSON object, it returns an empty object, which will later fail normal config parsing with a useful error. For object values, it removes the type field after warning about unknown transport names, rewrites OAuth clientId to client_id, ignores OAuth callbackPort with a warning, and keeps any remaining OAuth settings. When placement is declared and cwd is a relative string, it turns that cwd into a path under the plugin root. The output is a cleaned JSON object ready for final conversion.
 
-**Call relations**: This is the first normalization stage used by `normalize_plugin_mcp_server`, keeping plugin-facing JSON quirks out of the typed deserialization path.
+**Call relations**: normalize_plugin_mcp_server calls this at the start of per-server normalization. Its cleaned object becomes the input for placement-specific edits and then for conversion into McpServerConfig.
 
 *Call graph*: called by 1 (normalize_plugin_mcp_server); 7 external calls (new, Object, String, join, new, matches!, warn!).
 
 
 ### `codex-mcp/src/catalog.rs`
 
-`domain_logic` · `configuration resolution`
+`domain_logic` · `config load and runtime catalog resolution`
 
-This file is the core data model and resolution logic for MCP server registration precedence. `McpPluginAttribution` stores plugin identity for later tool attribution, while `McpServerSource` distinguishes where a registration came from and encodes one subtle policy: disabled selected-plugin registrations do not become name-scoped vetoes for later higher-precedence runtime overlays. `RegistrationPrecedence` orders sources by tier and, for plugins and selected plugins, uses `Reverse<usize>` so earlier discovery or selection order wins within that tier.
+MCP means Model Context Protocol, a way for Codex to connect to external tool servers. This file is the rulebook for building the final list of those servers. Different sources can offer servers: plugins, explicitly selected plugins, user configuration, compatibility shims, and extensions. Sometimes they use the same server name, or one source wants to remove a server that another source added. Without this catalog, the rest of the system would not know which server should win, whether a disabled server should stay disabled, or how to explain conflicts.
 
-`McpServerRegistration` is the pre-resolution declaration type, with constructors for each source category. `CatalogAction` extends that model to include removals, allowing compatibility and extension layers to explicitly delete a logical server name. `McpCatalogBuilder` accumulates actions plus a `BTreeSet` of disabled names. In `build`, actions are stably sorted by precedence so insertion order breaks ties within equal precedence. The builder then computes the last action per name as the winner, groups actions by `(name, tier)` to emit `McpServerConflict` records only for same-tier collisions, and finally materializes `ResolvedMcpServer` entries for winning registrations while dropping winning removals.
+The main workflow is like collecting sign-up sheets for the same event. `McpCatalogBuilder` records every action: register this server, remove that server, or mark a name disabled. When `build` runs, it sorts actions by a fixed precedence order, uses later/higher-priority actions as the winners for each name, records same-level collisions as conflicts, and then applies disabled-server rules. One important detail is that disabled registrations from most sources can become a name-wide veto, meaning later overlays keep that name disabled. A selected plugin is different: its disabled policy applies only to its own registration and does not poison an unrelated runtime server with the same name.
 
-The disabled-name logic is easy to miss: if a winning registration is disabled either by its own config or by a legacy disabled-name veto, its `config.enabled` is forced false; and for sources whose disabled state should persist as a name veto, that name is reinserted into the disabled set so later overlays built from `to_builder` inherit the veto. `ResolvedMcpCatalog` then exposes lookup, cloning back to a builder, extraction of plain configs, plugin attribution for winning plugin-owned servers, selected-plugin server-name iteration, and conflict inspection.
+The result, `ResolvedMcpCatalog`, is immutable. Other code can ask it for one server, all server configs, plugin attribution for tool provenance, selected-plugin server names, or conflict reports.
 
 #### Function details
 
@@ -3394,11 +3414,11 @@ The disabled-name logic is easy to miss: if a winning registration is disabled e
 fn new(plugin_id: String, display_name: String) -> Self
 ```
 
-**Purpose**: Constructs plugin attribution metadata from a plugin ID and display name. The resulting value is attached to plugin-sourced MCP registrations and later surfaced for provenance.
+**Purpose**: Creates a small identity record for the plugin that supplied an MCP server. This matters because later, when a tool comes from a plugin-owned server, Codex can say which plugin it came from.
 
-**Data flow**: Consumes two `String` values, stores them in a new `McpPluginAttribution`, and returns the struct without side effects.
+**Data flow**: It receives a plugin ID and a human-friendly display name. It stores both strings in a new `McpPluginAttribution` value and returns that value unchanged.
 
-**Call relations**: It is called by tests and higher-level configuration assembly when creating plugin or selected-plugin registrations that need attribution preserved through catalog resolution.
+**Call relations**: Plugin discovery, selected-plugin setup, runtime configuration building, and provenance tests create these attribution records before registering plugin-owned MCP servers.
 
 *Call graph*: called by 6 (plugin, selected_mcp_attribution_does_not_join_an_unrelated_local_summary, tool_plugin_provenance_collects_app_and_mcp_sources, to_mcp_config_with_plugin_registrations, selected_plugin_wins_after_discovered_plugin_requirements, runtime_config_with_context).
 
@@ -3409,11 +3429,11 @@ fn new(plugin_id: String, display_name: String) -> Self
 fn plugin_id(&self) -> &str
 ```
 
-**Purpose**: Returns the stored plugin identifier string slice. This is the stable identity used for provenance and joins.
+**Purpose**: Returns the stable internal ID of the plugin. Code uses this when it needs the exact plugin identity rather than the display label.
 
-**Data flow**: Reads `self.plugin_id` and returns `&str` referencing it.
+**Data flow**: It reads the stored plugin ID from the attribution object and returns it as borrowed text. Nothing is changed.
 
-**Call relations**: This accessor supports downstream provenance consumers; it does not participate in catalog resolution itself.
+**Call relations**: This is an accessor for consumers of resolved plugin attribution, especially after `ResolvedMcpCatalog::plugin_attributions_by_server_name` has exposed the winning plugin-owned servers.
 
 
 ##### `McpPluginAttribution::display_name`  (lines 27–29)
@@ -3422,11 +3442,11 @@ fn plugin_id(&self) -> &str
 fn display_name(&self) -> &str
 ```
 
-**Purpose**: Returns the human-facing plugin display name. It preserves the label associated with the registration source.
+**Purpose**: Returns the plugin's user-facing name. This is useful for messages, summaries, or provenance displays where a readable label is better than an internal ID.
 
-**Data flow**: Reads `self.display_name` and returns `&str` referencing it.
+**Data flow**: It reads the stored display name and returns it as borrowed text. The attribution object stays the same.
 
-**Call relations**: Like `plugin_id`, this accessor is used by downstream attribution logic rather than by the builder’s precedence algorithm.
+**Call relations**: This is used by code that receives plugin attribution and wants to show people which plugin supplied a server or tool.
 
 
 ##### `McpServerSource::disabled_registration_is_name_veto`  (lines 49–53)
@@ -3435,11 +3455,11 @@ fn display_name(&self) -> &str
 fn disabled_registration_is_name_veto(&self) -> bool
 ```
 
-**Purpose**: Determines whether a disabled winning registration should persist as a legacy name-scoped veto across later catalog extensions. Selected-plugin registrations are explicitly excluded from this persistence rule.
+**Purpose**: Decides whether a disabled winning registration should disable the whole server name for later overlays. The special case is a selected plugin, whose disabled setting should not block an unrelated runtime source that happens to reuse the same name.
 
-**Data flow**: Reads the enum variant in `self`, applies a `matches!` check, and returns `false` only for `SelectedPlugin`, `true` for all other sources.
+**Data flow**: It looks at the source variant. It returns `false` for `SelectedPlugin` and `true` for every other source.
 
-**Call relations**: It is consulted inside `McpCatalogBuilder::build` when deciding whether a disabled winner should reinsert its name into the persistent disabled-name set.
+**Call relations**: `McpCatalogBuilder::build` calls this while applying disabled rules, so the final catalog knows whether to preserve a disabled name as a broader veto.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3450,11 +3470,11 @@ fn disabled_registration_is_name_veto(&self) -> bool
 fn tier(self) -> u8
 ```
 
-**Purpose**: Maps detailed precedence values to a coarse tier number used for conflict grouping. Different orders within the same source class collapse to the same tier.
+**Purpose**: Groups registration priorities into broad levels, such as plugin, selected plugin, config, compatibility, and extension. This is used to notice conflicts among actions that are competing at the same level.
 
-**Data flow**: Matches on `self` and returns a `u8` tier: plugin 0, selected plugin 1, config 2, compatibility 3, extension 4.
+**Data flow**: It receives one precedence value and converts it to a small number: lower numbers are lower tiers and higher numbers are higher tiers. It ignores ordering details inside a tier, such as plugin order.
 
-**Call relations**: This helper is used during `McpCatalogBuilder::build` to group actions by `(name, tier)` so only same-tier collisions become `McpServerConflict` entries.
+**Call relations**: `McpCatalogBuilder::build` uses this after sorting actions, so it can report same-tier name collisions separately from normal higher-priority overrides.
 
 
 ##### `McpServerRegistration::from_config`  (lines 87–94)
@@ -3463,11 +3483,11 @@ fn tier(self) -> u8
 fn from_config(name: String, config: McpServerConfig) -> Self
 ```
 
-**Purpose**: Creates a registration sourced from static config with config-tier precedence. Config registrations outrank plugins and selected plugins but lose to compatibility and extension overlays under the current ordering.
+**Purpose**: Creates a registration for an MCP server declared by user or app configuration. Configuration has higher priority than plugin registrations but lower priority than compatibility and extension sources.
 
-**Data flow**: Consumes a logical server name and `McpServerConfig`, wraps them with `McpServerSource::Config` and `RegistrationPrecedence::Config`, and returns the new registration via `McpServerRegistration::new`.
+**Data flow**: It receives a server name and its `McpServerConfig`, labels the source as `Config`, assigns config-level precedence, and returns a complete registration.
 
-**Call relations**: Called by configuration assembly and tests whenever a config-defined server should enter the catalog with the standard config precedence.
+**Call relations**: Configuration-building code and catalog tests use this before handing the registration to `McpCatalogBuilder::register`; internally it delegates to `McpServerRegistration::new`.
 
 *Call graph*: called by 5 (disabled_winner_remains_a_veto_when_the_catalog_is_extended, selected_plugins_override_discovered_plugins_but_not_config, source_precedence_preserves_the_winning_registration, effective_mcp_servers_preserve_runtime_servers, to_mcp_config_with_plugin_registrations); 1 external calls (new).
 
@@ -3483,11 +3503,11 @@ fn from_plugin(
     ) -> Self
 ```
 
-**Purpose**: Creates a registration declared by a discovered plugin. Earlier plugin discovery order wins within the plugin tier.
+**Purpose**: Creates a registration for an MCP server supplied by a discovered plugin. It includes plugin attribution so later tool provenance can point back to that plugin.
 
-**Data flow**: Consumes a server name, `McpPluginAttribution`, plugin order index, and `McpServerConfig`; wraps the source as `McpServerSource::Plugin` and precedence as `RegistrationPrecedence::Plugin(Reverse(plugin_order))`; returns the registration.
+**Data flow**: It receives the server name, plugin identity, discovery order, and server config. It wraps the attribution as a plugin source, converts the order into plugin precedence, and returns a registration.
 
-**Call relations**: Used when importing plugin-provided MCP servers into the catalog. Its precedence encoding is what lets earlier plugins beat later ones in same-tier conflicts.
+**Call relations**: Plugin registration paths and tests call this before adding the registration to the builder. It delegates the final struct creation to `McpServerRegistration::new`.
 
 *Call graph*: called by 6 (disabled_discovered_plugin_remains_a_veto_for_runtime_overlays, earlier_plugin_wins_with_an_explicit_conflict, selected_plugins_override_discovered_plugins_but_not_config, source_precedence_preserves_the_winning_registration, tool_plugin_provenance_collects_app_and_mcp_sources, to_mcp_config_with_plugin_registrations); 4 external calls (new, Plugin, Plugin, Reverse).
 
@@ -3503,11 +3523,11 @@ fn from_selected_plugin(
     ) -> Self
 ```
 
-**Purpose**: Creates a registration for a thread-selected plugin, positioned above discovered plugins and below config. Earlier selection order wins within the selected-plugin tier.
+**Purpose**: Creates a registration for a plugin that was explicitly selected for the current thread or context. These registrations beat ordinary discovered plugins but do not beat configuration.
 
-**Data flow**: Consumes a server name, plugin attribution, selection order, and config; wraps them in `McpServerSource::SelectedPlugin` and `RegistrationPrecedence::SelectedPlugin(Reverse(selection_order))`; returns the registration.
+**Data flow**: It receives a name, selected-plugin attribution, selection order, and server config. It marks the source as `SelectedPlugin`, assigns selected-plugin precedence, and returns a registration.
 
-**Call relations**: Used by runtime capability-root selection flows and tests that verify selected plugins override discovered plugins but do not create persistent disabled-name vetoes.
+**Call relations**: Runtime context setup and selected-plugin tests use this to feed selected plugin servers into the catalog. It builds the final value through `McpServerRegistration::new`.
 
 *Call graph*: called by 5 (disabled_selected_plugin_does_not_veto_runtime_overlays, selected_plugins_override_discovered_plugins_but_not_config, selected_mcp_attribution_does_not_join_an_unrelated_local_summary, selected_plugin_wins_after_discovered_plugin_requirements, runtime_config_with_context); 4 external calls (new, SelectedPlugin, SelectedPlugin, Reverse).
 
@@ -3522,11 +3542,11 @@ fn from_compatibility(
     ) -> Self
 ```
 
-**Purpose**: Creates a compatibility-layer registration with compatibility precedence and a string identifier for the compatibility source. This source can also later be removed by name.
+**Purpose**: Creates a registration for a compatibility-provided MCP server. Compatibility registrations sit above config in the precedence order.
 
-**Data flow**: Consumes a server name, an ID convertible into `String`, and config; converts the ID, wraps it in `McpServerSource::Compatibility`, assigns `RegistrationPrecedence::Compatibility`, and returns the registration.
+**Data flow**: It receives a server name, a compatibility ID, and a config. It turns the ID into a string, marks the source as `Compatibility`, assigns compatibility precedence, and returns the registration.
 
-**Call relations**: Used when legacy or compatibility shims contribute MCP servers that should sit above config and below extensions in the precedence order.
+**Call relations**: Runtime configuration and precedence tests call this before registration. It uses `McpServerRegistration::new` to assemble the shared registration shape.
 
 *Call graph*: called by 3 (equal_precedence_uses_insertion_order_not_source_identity, source_precedence_preserves_the_winning_registration, runtime_config_with_context); 2 external calls (into, new).
 
@@ -3542,11 +3562,11 @@ fn from_extension(
     ) -> Self
 ```
 
-**Purpose**: Creates an extension-contributed registration with extension precedence and explicit contribution order. Extension registrations are the highest-precedence source in this resolver.
+**Purpose**: Creates a registration for an MCP server contributed by an extension. Extensions have the highest broad source tier in this catalog.
 
-**Data flow**: Consumes a server name, extension ID, contribution order, and config; converts the ID, wraps it in `McpServerSource::Extension`, assigns `RegistrationPrecedence::Extension(contribution_order)`, and returns the registration.
+**Data flow**: It receives a server name, extension ID, contribution order, and config. It stores the ID as an extension source, records the extension precedence, and returns the registration.
 
-**Call relations**: Used by runtime extension overlays and tests that verify extensions can replace lower-precedence winners while still being affected by persisted disabled-name vetoes.
+**Call relations**: Runtime configuration and disabled-rule tests use this for extension overlays. It hands the final assembly to `McpServerRegistration::new`.
 
 *Call graph*: called by 6 (disabled_discovered_plugin_remains_a_veto_for_runtime_overlays, disabled_selected_plugin_does_not_veto_runtime_overlays, disabled_veto_only_disables_the_winning_registration, disabled_winner_remains_a_veto_when_the_catalog_is_extended, source_precedence_preserves_the_winning_registration, runtime_config_with_context); 3 external calls (into, new, Extension).
 
@@ -3562,11 +3582,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Internal constructor that stores the registration’s name, source, config, and precedence without applying any policy. It is the common endpoint for all source-specific constructors.
+**Purpose**: Builds the common registration object used by all source-specific constructors. It keeps the source, config, name, and precedence together so the resolver can compare registrations fairly.
 
-**Data flow**: Consumes the four fields and returns `Self { name, source, config, precedence }`.
+**Data flow**: It receives the already-decided name, source, config, and precedence. It places them into a `McpServerRegistration` and returns it.
 
-**Call relations**: All public `from_*` constructors delegate here so the struct layout is initialized consistently.
+**Call relations**: All public `from_*` constructors call this after they have chosen the right source label and precedence for their kind of registration.
 
 
 ##### `CatalogAction::name`  (lines 194–199)
@@ -3575,11 +3595,11 @@ fn new(
 fn name(&self) -> &str
 ```
 
-**Purpose**: Returns the logical server name targeted by a register or remove action. This lets the builder treat both action kinds uniformly when grouping and selecting winners.
+**Purpose**: Gets the server name affected by a catalog action, whether the action registers a server or removes one. This lets the builder compare actions that target the same logical server.
 
-**Data flow**: Matches on `self` and returns a borrowed `&str` from either the boxed registration or the remove action’s `name` field.
+**Data flow**: It reads either the registration name or the removal name and returns borrowed text. The action is not changed.
 
-**Call relations**: Used inside `McpCatalogBuilder::build` when indexing winners and conflict groups by server name.
+**Call relations**: `McpCatalogBuilder::build` uses this while grouping actions by server name and while deciding the winning action for each name.
 
 
 ##### `CatalogAction::precedence`  (lines 201–206)
@@ -3588,11 +3608,11 @@ fn name(&self) -> &str
 fn precedence(&self) -> RegistrationPrecedence
 ```
 
-**Purpose**: Returns the precedence associated with a register or remove action. This allows stable sorting and winner selection across both action kinds.
+**Purpose**: Gets the priority value for a catalog action. The resolver uses this to decide which source wins when multiple actions mention the same server name.
 
-**Data flow**: Matches on `self` and returns the stored `RegistrationPrecedence`, dereferencing the remove action’s field when needed.
+**Data flow**: It reads the precedence from either a registration or a removal action and returns that value. Nothing else changes.
 
-**Call relations**: Used by `McpCatalogBuilder::build` as the sort key and as input to tier grouping.
+**Call relations**: `McpCatalogBuilder::build` uses this to sort all actions and to group same-tier actions for conflict reporting.
 
 
 ##### `CatalogAction::conflict_action`  (lines 208–215)
@@ -3601,11 +3621,11 @@ fn precedence(&self) -> RegistrationPrecedence
 fn conflict_action(&self) -> McpServerConflictAction
 ```
 
-**Purpose**: Converts an internal action into the public conflict-reporting enum that records whether a contender registered or removed a server. The source is cloned into the public value.
+**Purpose**: Converts an internal action into the public conflict-report form. This hides the full server config and reports only whether a source registered or removed the server.
 
-**Data flow**: Matches on `self`; for registrations it returns `McpServerConflictAction::Register(registration.source.clone())`, and for removals it returns `McpServerConflictAction::Remove(source.clone())`.
+**Data flow**: It looks at the action. A registration becomes `Register(source)`, and a removal becomes `Remove(source)`, cloning the source identity for the report.
 
-**Call relations**: Called during conflict construction in `McpCatalogBuilder::build` so the resolved catalog can expose human-meaningful same-tier contenders and outcomes.
+**Call relations**: `McpCatalogBuilder::build` calls this when it records same-tier name collisions and when it describes the final outcome of such a collision.
 
 *Call graph*: 2 external calls (Register, Remove).
 
@@ -3616,11 +3636,11 @@ fn conflict_action(&self) -> McpServerConflictAction
 fn register(&mut self, registration: McpServerRegistration)
 ```
 
-**Purpose**: Adds a registration action to the mutable builder. Registrations are stored in insertion order until resolution time.
+**Purpose**: Adds a server registration to the list of inputs that will later be resolved. It does not decide the winner immediately; it simply records the claim.
 
-**Data flow**: Consumes an `McpServerRegistration`, boxes it, wraps it in `CatalogAction::Register`, and pushes it onto `self.actions`.
+**Data flow**: It receives a completed `McpServerRegistration`, wraps it as a register action, and appends it to the builder's action list.
 
-**Call relations**: This is the primary mutation API used by callers and tests to feed declarations into the catalog before `build` resolves precedence.
+**Call relations**: Code that discovers config, plugin, compatibility, or extension servers calls this before `McpCatalogBuilder::build` performs the final precedence pass.
 
 *Call graph*: 2 external calls (new, Register).
 
@@ -3631,11 +3651,11 @@ fn register(&mut self, registration: McpServerRegistration)
 fn disable(&mut self, name: String)
 ```
 
-**Purpose**: Adds a legacy disabled-name veto for a logical server name. The veto is applied after source resolution to the winning registration for that name.
+**Purpose**: Marks a server name as disabled using the legacy name-based rule. This is a broad veto that is applied after the winning source is chosen.
 
-**Data flow**: Consumes a `String` name and inserts it into `self.disabled_server_names`.
+**Data flow**: It receives a server name and inserts it into the builder's disabled-name set. Later, any winning registration with that name will be forced disabled.
 
-**Call relations**: Used by callers and tests to model legacy disable semantics; `build` later consults this set when finalizing winning registrations.
+**Call relations**: This feeds disabled information into `McpCatalogBuilder::build`, which combines it with per-registration enabled flags and source-specific veto rules.
 
 *Call graph*: 1 external calls (insert).
 
@@ -3646,11 +3666,11 @@ fn disable(&mut self, name: String)
 fn remove_compatibility(&mut self, name: String, id: impl Into<String>)
 ```
 
-**Purpose**: Adds a compatibility-layer removal action for a logical server name. If it wins by precedence and insertion order, the server disappears from the resolved catalog.
+**Purpose**: Records that a compatibility source removes a server name. This lets a compatibility layer cancel a server without pretending to register a replacement config.
 
-**Data flow**: Consumes a name and compatibility ID, converts the ID into `String`, constructs `CatalogAction::Remove` with compatibility source and precedence, and pushes it into `self.actions`.
+**Data flow**: It receives a server name and compatibility ID, turns the ID into a string, creates a removal action with compatibility precedence, and appends it to the action list.
 
-**Call relations**: Used when compatibility overlays need to explicitly delete a server name rather than replace it with another registration.
+**Call relations**: When `McpCatalogBuilder::build` later resolves actions, this removal can become the winning action for that server name, causing no server to appear in the final catalog.
 
 *Call graph*: 1 external calls (into).
 
@@ -3666,11 +3686,11 @@ fn remove_extension(
     )
 ```
 
-**Purpose**: Adds an extension-layer removal action with explicit contribution order. This lets runtime overlays remove a server name at extension precedence.
+**Purpose**: Records that an extension removes a server name. This gives extensions a high-priority way to take a server out of the final catalog.
 
-**Data flow**: Consumes a name, extension ID, and contribution order; converts the ID, constructs a remove action with `McpServerSource::Extension` and matching precedence, and appends it to `self.actions`.
+**Data flow**: It receives a server name, extension ID, and contribution order. It creates an extension removal action with that precedence and appends it to the builder.
 
-**Call relations**: Used by extension/runtime flows and tests that need removal to participate in the same precedence and conflict machinery as registrations.
+**Call relations**: `McpCatalogBuilder::build` treats this alongside registrations; if the removal wins for its name, the final resolved catalog simply omits that server.
 
 *Call graph*: 2 external calls (into, Extension).
 
@@ -3681,11 +3701,11 @@ fn remove_extension(
 fn build(mut self) -> ResolvedMcpCatalog
 ```
 
-**Purpose**: Resolves all accumulated actions into an immutable `ResolvedMcpCatalog`. It applies precedence, stable tie-breaking, same-tier conflict reporting, and disabled-name persistence rules.
+**Purpose**: Turns all recorded registrations, removals, and disabled names into the final resolved catalog. This is the heart of the file: it decides winners, records conflicts, and applies disabled behavior.
 
-**Data flow**: Consumes the builder mutably. It stable-sorts `self.actions` by `CatalogAction::precedence`, walks the sorted actions to compute the last action per name as the winner and to group actions by `(name, tier)`, builds `McpServerConflict` entries for groups with multiple same-tier contenders, then iterates winners: winning registrations become `ResolvedMcpServer` entries, possibly with `config.enabled` forced false if the config was disabled or the name is in the disabled set; winning removals are dropped. When a disabled winner’s source returns true from `disabled_registration_is_name_veto`, the name is reinserted into the disabled set so future `to_builder` extensions inherit the veto. It returns `ResolvedMcpCatalog { actions, disabled_server_names, servers, conflicts }`.
+**Data flow**: It starts with the builder's action list and disabled-name set. It stably sorts actions by precedence, walks them so stronger or later tie-breaking actions overwrite earlier winners for the same name, groups same-name same-tier actions into conflict reports, then converts winning register actions into `ResolvedMcpServer` entries while dropping winning removal actions. It also forces disabled configs when a name is disabled or a winning registration was already disabled, and it may preserve that name as a future veto.
 
-**Call relations**: This is the file’s central resolver. All builder mutation methods feed into it, and `ResolvedMcpCatalog::to_builder` exists specifically so callers can extend a previously built catalog while preserving actions and persisted disabled-name state.
+**Call relations**: After callers have filled a `McpCatalogBuilder` using `register`, `disable`, and remove methods, they call `build` to produce the immutable `ResolvedMcpCatalog` used by the rest of MCP setup and runtime configuration.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -3696,11 +3716,11 @@ fn build(mut self) -> ResolvedMcpCatalog
 fn source(&self) -> &McpServerSource
 ```
 
-**Purpose**: Returns the winning server’s source metadata. Consumers use this to inspect provenance after resolution.
+**Purpose**: Returns where the winning server came from, such as a plugin, config, compatibility layer, or extension. This is important for attribution and source-specific behavior.
 
-**Data flow**: Reads `self.source` and returns `&McpServerSource`.
+**Data flow**: It reads the stored source from a resolved server and returns it by reference. The server is unchanged.
 
-**Call relations**: Used by catalog consumers and by helper methods like `plugin_attributions_by_server_name` and `selected_plugin_server_names`.
+**Call relations**: Catalog query methods, especially plugin attribution and selected-plugin filtering, use this source information to decide how to present or filter resolved servers.
 
 
 ##### `ResolvedMcpServer::config`  (lines 337–339)
@@ -3709,11 +3729,11 @@ fn source(&self) -> &McpServerSource
 fn config(&self) -> &McpServerConfig
 ```
 
-**Purpose**: Returns the winning server’s resolved configuration, including any forced `enabled = false` applied during build. This is the final config visible to downstream runtime setup.
+**Purpose**: Returns the actual server configuration that won resolution. Other code uses this to start or expose the MCP server with the correct settings.
 
-**Data flow**: Reads `self.config` and returns `&McpServerConfig`.
+**Data flow**: It reads the stored `McpServerConfig` from the resolved server and returns it by reference. Nothing is modified.
 
-**Call relations**: Used by callers that need the final effective MCP server configuration after precedence and disable resolution.
+**Call relations**: This is the basic accessor behind consumers that need the chosen configuration, including the catalog method that exports all configured servers.
 
 
 ##### `ResolvedMcpCatalog::builder`  (lines 352–354)
@@ -3722,11 +3742,11 @@ fn config(&self) -> &McpServerConfig
 fn builder() -> McpCatalogBuilder
 ```
 
-**Purpose**: Creates a fresh empty catalog builder. It is the standard entry point for assembling registrations before resolution.
+**Purpose**: Creates an empty catalog builder. This is the normal starting point for collecting MCP registrations before resolving them.
 
-**Data flow**: Calls `McpCatalogBuilder::default()` and returns the new builder.
+**Data flow**: It creates the builder's default state: no actions and no disabled names. It returns that empty builder to the caller.
 
-**Call relations**: Widely used by tests and configuration assembly as the starting point for catalog construction.
+**Call relations**: Catalog tests and runtime configuration paths call this first, then add registrations or removals, and finally call `McpCatalogBuilder::build`.
 
 *Call graph*: called by 12 (disabled_discovered_plugin_remains_a_veto_for_runtime_overlays, disabled_selected_plugin_does_not_veto_runtime_overlays, disabled_veto_only_disables_the_winning_registration, disabled_winner_remains_a_veto_when_the_catalog_is_extended, earlier_plugin_wins_with_an_explicit_conflict, equal_precedence_uses_insertion_order_not_source_identity, selected_plugins_override_discovered_plugins_but_not_config, source_precedence_preserves_the_winning_registration, effective_mcp_servers_preserve_runtime_servers, selected_mcp_attribution_does_not_join_an_unrelated_local_summary (+2 more)); 1 external calls (default).
 
@@ -3737,11 +3757,11 @@ fn builder() -> McpCatalogBuilder
 fn to_builder(&self) -> McpCatalogBuilder
 ```
 
-**Purpose**: Clones a resolved catalog back into a mutable builder while preserving action history and persisted disabled-name vetoes. This supports incremental extension of an already-resolved catalog.
+**Purpose**: Turns an already resolved catalog back into a mutable builder. This is useful when later runtime overlays need to extend or adjust an existing catalog while preserving earlier actions and disabled-name vetoes.
 
-**Data flow**: Reads `self.actions` and `self.disabled_server_names`, clones both collections, and returns a new `McpCatalogBuilder` containing them.
+**Data flow**: It copies the catalog's stored action history and disabled-name set into a new `McpCatalogBuilder`. The resolved catalog remains unchanged.
 
-**Call relations**: Used in tests and runtime flows that first resolve one layer, then add later overlays while keeping prior disable semantics intact.
+**Call relations**: After a catalog has been built, callers can use this to reopen the input list, add more actions, and run `build` again with the old resolution context preserved.
 
 *Call graph*: 1 external calls (clone).
 
@@ -3752,11 +3772,11 @@ fn to_builder(&self) -> McpCatalogBuilder
 fn server(&self, name: &str) -> Option<&ResolvedMcpServer>
 ```
 
-**Purpose**: Looks up the winning resolved server by logical name. It returns `None` if the name has no winning registration or was removed.
+**Purpose**: Looks up one resolved MCP server by name. This is the direct way to ask, 'Did this server make it into the final catalog, and if so, what won?'
 
-**Data flow**: Reads `self.servers` and returns `Option<&ResolvedMcpServer>` from the map lookup.
+**Data flow**: It receives a server name, searches the resolved server map, and returns either a reference to the matching `ResolvedMcpServer` or no result.
 
-**Call relations**: This is the direct lookup API used by tests and downstream runtime code after catalog resolution.
+**Call relations**: Consumers use this after `McpCatalogBuilder::build` when they need details for one specific server rather than the whole catalog.
 
 
 ##### `ResolvedMcpCatalog::configured_servers`  (lines 367–372)
@@ -3765,11 +3785,11 @@ fn server(&self, name: &str) -> Option<&ResolvedMcpServer>
 fn configured_servers(&self) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Exports the resolved catalog as a plain `HashMap<String, McpServerConfig>`. This strips source metadata and keeps only final configs keyed by server name.
+**Purpose**: Exports the final winning server configurations as a plain name-to-config map. This is useful for code that only needs to run or pass along server configs and does not care about source metadata.
 
-**Data flow**: Iterates `self.servers`, clones each name and each server config, collects them into a `HashMap`, and returns it.
+**Data flow**: It walks the resolved server map, clones each server name and config, and returns them in a `HashMap`. Source information and conflicts are left out.
 
-**Call relations**: Used by downstream configuration consumers that only need effective configs, not provenance or conflict details.
+**Call relations**: Runtime MCP configuration code can call this on the resolved catalog to get the concrete set of server configs to use.
 
 
 ##### `ResolvedMcpCatalog::plugin_attributions_by_server_name`  (lines 375–388)
@@ -3778,11 +3798,11 @@ fn configured_servers(&self) -> HashMap<String, McpServerConfig>
 fn plugin_attributions_by_server_name(&self) -> HashMap<String, McpPluginAttribution>
 ```
 
-**Purpose**: Returns plugin attribution only for winning servers owned by plugins or selected plugins. Non-plugin sources are omitted.
+**Purpose**: Returns plugin identity for every winning server that came from a plugin or selected plugin. This supports provenance: showing which plugin supplied a tool or server.
 
-**Data flow**: Iterates `self.servers`, inspects each `ResolvedMcpServer::source()`, clones the server name and `McpPluginAttribution` for `Plugin` and `SelectedPlugin` variants, filters out `Config`, `Compatibility`, and `Extension`, and collects the result into a `HashMap`.
+**Data flow**: It scans all resolved servers. For plugin and selected-plugin sources, it clones the server name and attribution into a new map; for config, compatibility, and extension sources, it skips the server.
 
-**Call relations**: This method bridges catalog resolution to tool provenance logic by exposing which winning server names came from which plugins.
+**Call relations**: Tool provenance and plugin-summary code use this after resolution so only the plugin-owned servers that actually won are credited.
 
 
 ##### `ResolvedMcpCatalog::selected_plugin_server_names`  (lines 391–395)
@@ -3791,11 +3811,11 @@ fn plugin_attributions_by_server_name(&self) -> HashMap<String, McpPluginAttribu
 fn selected_plugin_server_names(&self) -> impl Iterator<Item = &str>
 ```
 
-**Purpose**: Iterates the names of winning servers supplied specifically by selected plugins. It is restricted to crate visibility because it supports internal runtime behavior.
+**Purpose**: Lists the names of winning servers that came specifically from thread-selected plugins. This lets runtime code distinguish explicitly selected plugin servers from ordinary discovered plugin servers.
 
-**Data flow**: Iterates `self.servers`, checks each source for `McpServerSource::SelectedPlugin(_)`, and yields `&str` names for matching entries.
+**Data flow**: It scans the resolved servers and yields only the names whose source is `SelectedPlugin`. It returns an iterator, so names are produced as the caller loops over them.
 
-**Call relations**: Used internally where runtime behavior depends on whether a winning server came from a thread-selected plugin rather than a discovered plugin or config.
+**Call relations**: Runtime context code can call this after catalog resolution to know which selected plugin servers are active in the current thread or request context.
 
 
 ##### `ResolvedMcpCatalog::conflicts`  (lines 397–399)
@@ -3804,22 +3824,22 @@ fn selected_plugin_server_names(&self) -> impl Iterator<Item = &str>
 fn conflicts(&self) -> &[McpServerConflict]
 ```
 
-**Purpose**: Returns the recorded same-tier conflicts discovered during build. These conflicts describe contenders and the final outcome after precedence and insertion-order tie-breaking.
+**Purpose**: Returns the recorded same-tier name conflicts. These reports explain cases where multiple equal-level actions targeted the same server name, even though final precedence still produced one outcome.
 
-**Data flow**: Reads `self.conflicts` and returns it as a slice `&[McpServerConflict]`.
+**Data flow**: It reads the catalog's conflict list and returns it as a borrowed slice. The catalog is not changed.
 
-**Call relations**: Used by tests and diagnostics to inspect collisions that occurred during catalog resolution.
+**Call relations**: After `McpCatalogBuilder::build` has detected conflicts, callers can use this accessor to inspect or report them without rerunning resolution.
 
 
 ### `core/src/mcp.rs`
 
-`orchestration` · `config resolution / MCP setup`
+`orchestration` · `config load and session/thread setup`
 
-This file defines `McpManager`, a small orchestration object that owns a `PluginsManager` and an extension registry and exposes progressively richer MCP views. The core work happens in `runtime_config_with_context`. It first creates an `McpServerContributionContext`, either global or thread-scoped, then asynchronously walks every extension contributor and collects three kinds of contributions: ordered `Set` overlays, ordered `Remove` overlays, and selected-plugin registrations. The code tracks a single monotonically increasing `contribution_order` across all contributors so conflict resolution reflects actual emission order rather than contributor grouping.
+This file is the meeting point for all sources of MCP server configuration. MCP means “Model Context Protocol,” a way for Codex to talk to outside tools and services. A user may define servers in their config, plugins may add more, Codex may add a built-in legacy “apps” server, and host extensions may add or remove servers at runtime. Without this file, those sources would stay separate, and Codex would not have one reliable answer to the question: “Which MCP servers are available right now?”
 
-Next it asks `Config::to_mcp_config_with_plugin_registrations` for the base config, seeded with any selected-plugin registrations. It then mutates the catalog builder with a compatibility registration for the legacy Codex Apps MCP server when `apps_enabled` is true, or removes that compatibility entry otherwise. Extension overlays are applied afterward as extension registrations/removals, preserving contributor ID and contribution order for conflict accounting. Once built, the final catalog is scanned for conflicts and each resolved conflict is logged with contenders and outcome.
+The main type is McpManager. It keeps a plugin manager and, optionally, an extension registry. When asked for runtime configuration, it first asks extensions for their contributions. These contributions can set a server, remove a server, or register a selected plugin-backed server. It records the order of those actions because later actions can intentionally override earlier ones, like sticky notes placed on top of one another.
 
-The remaining methods are convenience projections over that machinery: `configured_servers` returns only config/plugin-backed servers without runtime overlays, `runtime_servers` returns configured plus host-contributed servers before auth gating, and `effective_servers` applies auth gating to produce `EffectiveMcpServer` values.
+Then it converts the normal Codex config into an MCP config, adds plugin-selected registrations, adds or removes the legacy Codex Apps server depending on whether apps are enabled, and applies extension overlays. If several sources fight over the same server name, it keeps the catalog’s resolved result and logs a warning. The file also offers simpler views: only configured servers, runtime servers before authentication filtering, and effective servers after login-based access rules are applied.
 
 #### Function details
 
@@ -3829,11 +3849,11 @@ The remaining methods are convenience projections over that machinery: `configur
 fn new(plugins_manager: Arc<PluginsManager>) -> Self
 ```
 
-**Purpose**: Constructs an `McpManager` that uses plugins but no host-installed extension contributions. It initializes the extension registry to an empty registry.
+**Purpose**: Creates a basic MCP manager using the given plugin manager and no host-installed extensions. This is useful in normal paths or tests where only config and plugins should affect MCP servers.
 
-**Data flow**: Takes `plugins_manager: Arc<PluginsManager>` and returns `McpManager { plugins_manager, extensions: empty_extension_registry() }`.
+**Data flow**: It receives a shared plugin manager. It also creates an empty extension registry, meaning there are no runtime extension contributions. It returns an McpManager that can later build MCP server lists from config and plugins only.
 
-**Call relations**: This is the common constructor used by many runtime and test call sites that do not need extension overlays. It funnels into the same manager behavior as `new_with_extensions`, just with an empty registry.
+**Call relations**: Many command and session setup paths call this when they need MCP support without extension contributions. Internally it asks the extension API for an empty registry so the rest of the manager can use the same flow whether extensions exist or not.
 
 *Call graph*: called by 14 (run_get, run_list, run_login, run_logout, list_accessible_connectors_from_mcp_tools_with_environment_manager, guardian_subagent_does_not_inherit_parent_exec_policy_rules, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx (+4 more)); 1 external calls (empty_extension_registry).
 
@@ -3847,11 +3867,11 @@ fn new_with_extensions(
     ) -> Self
 ```
 
-**Purpose**: Constructs an `McpManager` with both plugin support and an explicit extension registry. It enables host-installed MCP contributors to participate in runtime resolution.
+**Purpose**: Creates an MCP manager that can include servers contributed by host-installed extensions. This is the constructor to use when the surrounding app wants extensions to affect the MCP server catalog.
 
-**Data flow**: Accepts `plugins_manager: Arc<PluginsManager>` and `extensions: Arc<ExtensionRegistry<Config>>`, then returns a `McpManager` storing both.
+**Data flow**: It receives a shared plugin manager and a shared extension registry. It stores both inside the new McpManager. Nothing is resolved yet; the manager simply keeps these sources ready for later configuration building.
 
-**Call relations**: Used by callers that need extension-contributed MCP servers or removals. It is the more general constructor; `new` is the simplified variant that supplies an empty registry.
+**Call relations**: Setup code that has an extension registry calls this to produce a manager with extension awareness. Later, runtime configuration methods use the stored registry to ask extensions what MCP servers they want to add or remove.
 
 *Call graph*: called by 3 (new, installed_manager, later_extension_can_remove_same_name_registration).
 
@@ -3862,11 +3882,11 @@ fn new_with_extensions(
 async fn runtime_config(&self, config: &Config) -> McpConfig
 ```
 
-**Purpose**: Builds the runtime MCP configuration in the global context, including compatibility built-ins and extension overlays. It is the public convenience wrapper for non-thread-specific resolution.
+**Purpose**: Builds the MCP configuration for the current global runtime context. It includes normal config, plugins, compatibility behavior, and extension contributions.
 
-**Data flow**: Takes `&self` and `config: &Config`, forwards to `runtime_config_with_context(config, None)`, and returns the resulting `McpConfig`.
+**Data flow**: It receives the main Codex config. It passes that config along with no thread-specific extension data into the shared runtime-building helper. The result is an McpConfig ready to be used for server lookup.
 
-**Call relations**: Called by `runtime_servers` and `effective_servers` when they need the fully overlaid runtime config. It delegates all substantive work to `runtime_config_with_context`.
+**Call relations**: Higher-level methods call this when they need the runtime MCP picture, such as before listing runtime servers or computing effective servers. It delegates the real work to McpManager::runtime_config_with_context so the global and thread-specific paths stay consistent.
 
 *Call graph*: calls 1 internal fn (runtime_config_with_context); called by 2 (effective_servers, runtime_servers).
 
@@ -3881,11 +3901,11 @@ async fn runtime_config_for_thread(
     ) -> McpConfig
 ```
 
-**Purpose**: Builds the runtime MCP configuration using thread-specific extension initialization data. This allows extensions to contribute servers based on per-thread context.
+**Purpose**: Builds an MCP configuration for a specific thread or conversation setup. This lets extensions make thread-specific MCP contributions when they have extra initialization data.
 
-**Data flow**: Accepts `config: &Config` and `thread_init: &ExtensionDataInit`, forwards to `runtime_config_with_context(config, Some(thread_init))`, and returns `McpConfig`.
+**Data flow**: It receives the main Codex config and thread initialization data from the extension system. It passes both into the shared runtime-building helper. The output is an McpConfig that reflects that particular thread context.
 
-**Call relations**: This is the thread-aware sibling of `runtime_config`. It exists for flows that need extension contributions scoped to a particular thread rather than the global environment.
+**Call relations**: This is the thread-aware counterpart to McpManager::runtime_config. It uses McpManager::runtime_config_with_context so all ordering, plugin registration, compatibility, and conflict behavior is identical to the global path.
 
 *Call graph*: calls 1 internal fn (runtime_config_with_context).
 
@@ -3900,11 +3920,11 @@ async fn runtime_config_with_context(
     ) -> McpConfig
 ```
 
-**Purpose**: Resolves the full runtime MCP configuration by merging config, selected-plugin registrations, compatibility registrations, and ordered extension set/remove overlays. It is the file’s main composition routine.
+**Purpose**: Assembles the full runtime MCP configuration from every active source. It is the core routine that decides which MCP server registrations are present after config, plugins, built-ins, and extensions are combined.
 
-**Data flow**: Consumes `config` plus optional `thread_init`. It builds a contribution context (`global` or `for_thread`), iterates extension contributors asynchronously, and accumulates `selected_plugin_registrations` plus ordered `OrderedMcpOverlay` actions. It then awaits `config.to_mcp_config_with_plugin_registrations(...)`, converts the catalog to a builder, conditionally registers or removes the legacy Codex Apps compatibility server, applies each overlay as an extension registration/removal, builds the catalog, logs any conflicts, stores the built catalog back into `mcp_config.mcp_server_catalog`, and returns the updated `McpConfig`.
+**Data flow**: It starts with the Codex config and optional thread initialization data. From that it creates an extension contribution context, then asks each MCP contributor for its actions. It separates plugin selections from add/remove overlays, preserving the order of extension actions. Next it turns the base config plus selected plugin registrations into an MCP config, opens the server catalog for editing, adds or removes the legacy Codex Apps server depending on app settings, applies extension additions and removals, logs any conflicts the catalog reports, and returns the completed McpConfig.
 
-**Call relations**: This private method is the implementation behind both `runtime_config` and `runtime_config_for_thread`. It delegates base-config creation to `Config`, registration construction to `McpServerRegistration` constructors, and final server extraction to other methods in this file.
+**Call relations**: Both public runtime configuration entry points call this helper. It calls into extension contributors, config conversion, MCP catalog registration helpers, and conflict reporting. In the bigger flow, it is the central “merge desk” where all MCP server sources are reconciled before other code asks for server maps or authentication-filtered results.
 
 *Call graph*: calls 6 internal fn (new, from_compatibility, from_extension, from_selected_plugin, for_thread, global); called by 2 (runtime_config, runtime_config_for_thread); 4 external calls (new, to_mcp_config_with_plugin_registrations, codex_apps_mcp_server_config, warn!).
 
@@ -3915,11 +3935,11 @@ async fn runtime_config_with_context(
 async fn configured_servers(&self, config: &Config) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Returns only the MCP servers that come from static config and plugin-backed config, without runtime extension overlays. It is the narrowest server view exposed by the manager.
+**Purpose**: Returns only the MCP servers that come from user config and plugins, without runtime extension additions or compatibility overlays. This is useful when code wants the base configured view rather than the full runtime view.
 
-**Data flow**: Awaits `config.to_mcp_config(self.plugins_manager.as_ref())`, then passes the resulting `McpConfig` to `configured_mcp_servers`, returning `HashMap<String, McpServerConfig>`.
+**Data flow**: It receives the Codex config. It converts that config into an MCP config using the plugin manager, then extracts the configured MCP servers as a name-to-server map. It does not change the manager or apply extension contributions.
 
-**Call relations**: Used when callers want the configured baseline rather than runtime overlays or auth-gated effective servers. It bypasses `runtime_config_with_context` entirely.
+**Call relations**: Callers use this when they specifically need config-backed and plugin-backed servers only. Unlike McpManager::runtime_servers, it does not call the runtime merge path, so extension overlays and compatibility-only runtime additions are left out.
 
 *Call graph*: 2 external calls (to_mcp_config, configured_mcp_servers).
 
@@ -3930,11 +3950,11 @@ async fn configured_servers(&self, config: &Config) -> HashMap<String, McpServer
 async fn runtime_servers(&self, config: &Config) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Returns the configured and host-contributed MCP servers before auth gating. It exposes the runtime catalog as plain `McpServerConfig` values.
+**Purpose**: Returns the MCP servers available at runtime before login or authentication rules are applied. This answers “what servers are configured or contributed right now?” without yet asking whether the user is allowed to use each one.
 
-**Data flow**: Awaits `self.runtime_config(config)`, then extracts a `HashMap<String, McpServerConfig>` via `configured_mcp_servers(&mcp_config)`.
+**Data flow**: It receives the Codex config. It first builds the full runtime MCP config, then extracts the configured server map from that result. The returned map is keyed by server name and contains raw server configuration values.
 
-**Call relations**: This method sits between `runtime_config` and `effective_servers`: it includes runtime overlays but does not apply auth-based filtering or transformation into `EffectiveMcpServer`.
+**Call relations**: This method calls McpManager::runtime_config to get the merged runtime picture, then hands that config to the MCP helper that extracts server configs. It sits above the core merge logic and below callers that need a simple server list.
 
 *Call graph*: calls 1 internal fn (runtime_config); 1 external calls (configured_mcp_servers).
 
@@ -3949,11 +3969,11 @@ async fn effective_servers(
     ) -> HashMap<String, EffectiveMcpServer>
 ```
 
-**Purpose**: Returns the final runtime MCP servers after auth gating and compatibility handling. It is the highest-level server view in this file.
+**Purpose**: Returns the MCP servers that are actually usable after authentication rules are considered. This is the practical final answer for code that needs to know which servers the current user can access.
 
-**Data flow**: Awaits `self.runtime_config(config)` and then passes the resulting `McpConfig` plus optional `CodexAuth` to `effective_mcp_servers`, returning `HashMap<String, EffectiveMcpServer>`.
+**Data flow**: It receives the Codex config and an optional authentication object, which represents the current login state. It builds the runtime MCP config, then passes that config and the authentication information to the MCP helper that filters or annotates servers according to access rules. The result is a name-to-effective-server map.
 
-**Call relations**: Called by higher-level runtime code that needs the actual usable MCP server set. It depends on `runtime_config` for overlay resolution and delegates auth gating to `effective_mcp_servers`.
+**Call relations**: Callers use this when they need the final, access-aware MCP server list. It depends on McpManager::runtime_config for the merged catalog, then hands off to the MCP layer to apply authentication gating and produce EffectiveMcpServer values.
 
 *Call graph*: calls 1 internal fn (runtime_config); 1 external calls (effective_mcp_servers).
 
@@ -3963,13 +3983,15 @@ These files define provider registries, model-manager configuration and helpers,
 
 ### `model-provider-info/src/lib.rs`
 
-`domain_logic` · `config load and provider selection/setup`
+`config` · `startup and config load`
 
-This crate is the canonical data and policy layer for model provider definitions. It declares `WireApi`, currently only `Responses`, with custom deserialization that rejects the removed `chat` value using a tailored migration error. `ModelProviderInfo` is the main schema: display name, base URL, multiple auth mechanisms (`env_key`, bearer token, command auth, AWS SigV4), optional query params and headers, retry/timeouts, and capability flags such as `requires_openai_auth` and `supports_websockets`. `ModelProviderAwsAuthInfo` carries optional AWS profile and region.
+Codex can send model requests to different services, and each service needs practical details: where its API lives, how to authenticate, what headers to send, and how long to retry when the network is flaky. This file is the central recipe book for those provider definitions.
 
-Behavior lives on `ModelProviderInfo`. `validate` enforces mutually exclusive auth combinations, especially around AWS and command auth, and forbids AWS plus websockets. `build_header_map` merges literal `http_headers` with environment-backed `env_http_headers`, silently skipping invalid header names/values and unset or blank env vars. `to_api_provider` chooses a default base URL based on `AuthMode` (ChatGPT Codex endpoint for ChatGPT/PAT-style auth, otherwise OpenAI API), builds headers, clamps retry counts and timeouts through helper accessors, and returns a `codex_api::Provider`. `api_key` resolves a non-empty env var or returns a structured `CodexErr::EnvVar` with optional instructions.
+It contains the data shape for a provider, `ModelProviderInfo`, plus rules that keep invalid combinations out. For example, a provider should not ask for both an environment-variable API key and AWS signing at the same time. That would be like giving two different payment methods for the same checkout and not saying which one wins.
 
-The file also defines built-in provider constructors: `create_openai_provider` injects version and organization/project headers and enables OpenAI auth/websockets; `create_amazon_bedrock_provider` sets the Mantle base URL, AWS auth defaults, and the required `x-amzn-mantle-client-agent: codex` header; `create_oss_provider` and `create_oss_provider_with_base_url` derive localhost-compatible providers from environment overrides. `built_in_model_providers` assembles the default catalog, and `merge_configured_model_providers` extends it while allowing only `aws.profile`/`aws.region` overrides for the built-in Amazon Bedrock entry. The overall design keeps provider definitions serializable, validated, and directly convertible into runtime HTTP client configuration.
+The file also creates built-in providers so Codex works without extra setup. OpenAI gets special defaults, including login support and WebSocket support. Amazon Bedrock gets AWS authentication settings and a required client-agent header. Local open-source providers use localhost URLs and can be adjusted with experimental environment variables.
+
+Finally, it turns these human-facing provider settings into the lower-level API provider object used when Codex actually makes network requests. It also merges user-defined providers from config, while protecting built-in providers from being accidentally overwritten except for the narrow Bedrock AWS profile and region settings.
 
 #### Function details
 
@@ -3979,11 +4001,11 @@ The file also defines built-in provider constructors: `create_openai_provider` i
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats the wire API enum as the lowercase string used in config and diagnostics.
+**Purpose**: This turns the provider wire protocol value into text for display or serialization. Right now the only supported protocol is `responses`.
 
-**Data flow**: It matches `self`, maps `WireApi::Responses` to the literal `"responses"`, and writes that string into the provided formatter.
+**Data flow**: It starts with a `WireApi` value, chooses the matching lowercase text, and writes that text into the formatter. The visible result is the string `responses`.
 
-**Call relations**: This is standard display support for provider config values; it is used wherever a `WireApi` needs to be rendered textually.
+**Call relations**: This is used whenever Rust formatting asks how to print a `WireApi`. It hands the final text to the standard formatter so logs, messages, or serialized output can show a readable value.
 
 *Call graph*: 1 external calls (write_str).
 
@@ -3994,11 +4016,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Deserializes the wire API from config text while providing a migration-specific error for the removed `chat` protocol.
+**Purpose**: This reads a provider wire protocol from configuration text. It accepts `responses` and deliberately rejects the old `chat` value with a helpful migration message.
 
-**Data flow**: It deserializes an input string, matches it against known variants, returns `WireApi::Responses` for `"responses"`, emits `serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)` for `"chat"`, and otherwise returns an unknown-variant error listing only `responses`.
+**Data flow**: It receives serialized data, reads it as a string, and compares the string to known protocol names. `responses` becomes the internal enum value; `chat` becomes a clear custom error; anything else becomes an unknown-value error.
 
-**Call relations**: Serde invokes this during `ModelProviderInfo` deserialization from TOML/JSON, making unsupported legacy config fail with a targeted remediation message.
+**Call relations**: This runs while provider config is being parsed. It protects the rest of the system from seeing unsupported protocol choices, so later request code can assume the provider uses the supported Responses API.
 
 *Call graph*: 3 external calls (deserialize, custom, unknown_variant).
 
@@ -4009,11 +4031,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn validate(&self) -> std::result::Result<(), String>
 ```
 
-**Purpose**: Checks a provider definition for invalid combinations of auth and capability settings before runtime use.
+**Purpose**: This checks whether a provider definition makes sense before Codex tries to use it. It catches unsafe or contradictory authentication settings early, when the user can still get a clear config error.
 
-**Data flow**: It reads the provider’s `aws`, `supports_websockets`, `env_key`, `experimental_bearer_token`, `auth`, and `requires_openai_auth` fields. If `aws` is present, it rejects websocket support and accumulates any conflicting auth-related fields into an error string. If command `auth` is present, it rejects an empty trimmed `auth.command` and similarly rejects coexistence with `env_key`, `experimental_bearer_token`, or `requires_openai_auth`. It returns `Ok(())` only when no conflicts are found.
+**Data flow**: It reads the provider's authentication-related fields, such as AWS settings, command-based auth, environment-variable keys, bearer tokens, OpenAI login requirements, and WebSocket support. If the combination is valid, it returns success; if not, it returns a plain error message explaining the conflict.
 
-**Call relations**: Higher-level config validation calls this to reject unsupported provider definitions early; it encapsulates the policy constraints around mutually exclusive auth modes.
+**Call relations**: This function is part of the config safety gate. Later code that creates clients and sends requests can rely on these rules having ruled out confusing combinations, such as AWS signing mixed with bearer-token authentication.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -4024,11 +4046,11 @@ fn validate(&self) -> std::result::Result<(), String>
 fn build_header_map(&self) -> CodexResult<HeaderMap>
 ```
 
-**Purpose**: Constructs the HTTP header set that should be attached to requests for this provider, combining static and environment-derived headers.
+**Purpose**: This builds the actual HTTP headers that should be sent to a provider. Headers are small name-value labels attached to a web request, such as organization IDs or provider-specific flags.
 
-**Data flow**: It computes an initial capacity from the lengths of `http_headers` and `env_http_headers`, creates a `HeaderMap`, inserts each static header whose name and value successfully parse, then iterates environment-backed headers, reading each env var and inserting the header only when the env var exists, is non-blank after trimming, and both header name and value parse successfully. It returns the populated `HeaderMap` wrapped in `CodexResult`.
+**Data flow**: It reads fixed headers from the provider config and also reads optional headers whose values come from environment variables. Valid, non-empty values are inserted into an HTTP header map; invalid names or values are skipped. The result is the header map used by outgoing requests.
 
-**Call relations**: Only `to_api_provider` calls this. It isolates header parsing and env-var expansion from the rest of provider conversion.
+**Call relations**: This is called by `ModelProviderInfo::to_api_provider` when turning config into a ready-to-use API provider. It gathers the request labels before the lower-level API layer starts making network calls.
 
 *Call graph*: called by 1 (to_api_provider); 4 external calls (with_capacity, try_from, try_from, var).
 
@@ -4039,11 +4061,11 @@ fn build_header_map(&self) -> CodexResult<HeaderMap>
 fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider>
 ```
 
-**Purpose**: Converts a serializable provider definition into the lower-level `codex_api::Provider` used by the HTTP client layer.
+**Purpose**: This converts Codex's provider configuration into the lower-level provider object used by the API client. It bridges friendly config settings and the concrete request settings needed to call a model service.
 
-**Data flow**: It takes an optional `AuthMode`, chooses a default base URL of `CHATGPT_CODEX_BASE_URL` for ChatGPT/PAT/agent-identity auth modes or `https://api.openai.com/v1` otherwise, overrides that with `self.base_url` when present, builds headers via `build_header_map`, constructs an `ApiRetryConfig` using `self.request_max_retries()` and fixed retry policy flags, and returns an `ApiProvider` containing the provider name, base URL, optional query params clone, headers, retry config, and `self.stream_idle_timeout()`.
+**Data flow**: It reads the provider name, base URL, query parameters, headers, retry settings, stream timeout, and the current authentication mode. If no base URL is set, it chooses the normal OpenAI API URL or the ChatGPT Codex backend URL depending on the auth mode. It returns an API provider object ready for model requests.
 
-**Call relations**: Model-listing and other runtime setup paths call this when they need a concrete API client configuration. It delegates header assembly and effective retry/timeout calculation to helper methods.
+**Call relations**: This is called when code such as `list_models` needs to contact a provider. It asks `build_header_map`, `request_max_retries`, and `stream_idle_timeout` for the pieces needed by the network layer, then hands off a complete provider description.
 
 *Call graph*: calls 3 internal fn (build_header_map, request_max_retries, stream_idle_timeout); called by 1 (list_models); 2 external calls (from_millis, matches!).
 
@@ -4054,11 +4076,11 @@ fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvide
 fn api_key(&self) -> CodexResult<Option<String>>
 ```
 
-**Purpose**: Resolves the provider’s API key from the configured environment variable, enforcing that the value exists and is non-empty when `env_key` is configured.
+**Purpose**: This retrieves an API key from the environment when a provider is configured to use one. It avoids storing secrets directly in config files.
 
-**Data flow**: If `self.env_key` is `Some`, it reads that environment variable, filters out blank values, and returns `Ok(Some(value))`; if the variable is missing or blank it returns `CodexErr::EnvVar` containing the variable name and optional instructions. If `env_key` is `None`, it returns `Ok(None)`.
+**Data flow**: It checks whether the provider names an environment variable. If so, it reads that variable and requires it to be non-empty; if the value is missing, it returns an error that can include setup instructions. If no environment key is configured, it returns no key without error.
 
-**Call relations**: Authentication setup paths such as bearer-token resolution call this when a provider uses env-var API key auth.
+**Call relations**: This is called by authentication code such as `realtime_api_key` and `bearer_auth_for_provider`. Those callers use the returned secret, if present, to authorize requests to the provider.
 
 *Call graph*: called by 2 (realtime_api_key, bearer_auth_for_provider); 1 external calls (var).
 
@@ -4069,11 +4091,11 @@ fn api_key(&self) -> CodexResult<Option<String>>
 fn request_max_retries(&self) -> u64
 ```
 
-**Purpose**: Computes the effective request retry count by applying the default and hard cap.
+**Purpose**: This decides how many times Codex may retry a failed normal HTTP request for this provider. It gives every provider a safe default while limiting overly large user settings.
 
-**Data flow**: It reads `self.request_max_retries`, falls back to `DEFAULT_REQUEST_MAX_RETRIES` when absent, clamps the result to `MAX_REQUEST_MAX_RETRIES`, and returns the final `u64`.
+**Data flow**: It reads the optional configured retry count. If none is set, it uses the built-in default; if a value is set above the hard maximum, it lowers it to the maximum. The output is the effective retry count.
 
-**Call relations**: `to_api_provider` uses this when building `ApiRetryConfig`, ensuring user config cannot exceed the hard retry cap.
+**Call relations**: This is used by `ModelProviderInfo::to_api_provider` while building the API client's retry policy. The network layer then uses that number when requests fail due to server or transport problems.
 
 *Call graph*: called by 1 (to_api_provider).
 
@@ -4084,11 +4106,11 @@ fn request_max_retries(&self) -> u64
 fn stream_max_retries(&self) -> u64
 ```
 
-**Purpose**: Computes the effective maximum number of stream reconnection attempts with defaulting and clamping.
+**Purpose**: This decides how many times Codex may reconnect after a streaming response is dropped. Streaming means the provider sends data gradually instead of all at once.
 
-**Data flow**: It reads `self.stream_max_retries`, substitutes `DEFAULT_STREAM_MAX_RETRIES` when absent, clamps to `MAX_STREAM_MAX_RETRIES`, and returns the resulting `u64`.
+**Data flow**: It reads the optional configured stream retry count, falls back to a default when missing, and caps the value at a hard maximum. The result is the effective number of reconnection attempts.
 
-**Call relations**: This accessor is used by higher-level streaming logic outside this file to obtain a bounded reconnection policy from provider config.
+**Call relations**: This value is available to streaming request code that needs to decide how persistent it should be when a long-running response connection breaks.
 
 
 ##### `ModelProviderInfo::stream_idle_timeout`  (lines 311–315)
@@ -4097,11 +4119,11 @@ fn stream_max_retries(&self) -> u64
 fn stream_idle_timeout(&self) -> Duration
 ```
 
-**Purpose**: Returns the effective idle timeout for streaming responses as a `Duration`.
+**Purpose**: This decides how long Codex should wait with no activity on a streaming response before treating the connection as lost.
 
-**Data flow**: It maps `self.stream_idle_timeout_ms` through `Duration::from_millis` when present, otherwise returns `Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS)`.
+**Data flow**: It reads the optional timeout in milliseconds. If none is configured, it uses the default timeout. It converts the millisecond number into a duration value that the rest of the program can use.
 
-**Call relations**: `to_api_provider` uses this to populate the runtime provider’s stream idle timeout.
+**Call relations**: This is called by `ModelProviderInfo::to_api_provider`, which includes the timeout in the API provider object. The request layer uses it to avoid waiting forever on a silent stream.
 
 *Call graph*: called by 1 (to_api_provider); 1 external calls (from_millis).
 
@@ -4112,11 +4134,11 @@ fn stream_idle_timeout(&self) -> Duration
 fn websocket_connect_timeout(&self) -> Duration
 ```
 
-**Purpose**: Returns the effective timeout for establishing a websocket connection.
+**Purpose**: This decides how long Codex should wait while opening a WebSocket connection before giving up. A WebSocket is a long-lived two-way connection used for some real-time API traffic.
 
-**Data flow**: It converts `self.websocket_connect_timeout_ms` to a `Duration` when configured, otherwise returns the default `DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS` as a `Duration`.
+**Data flow**: It reads the optional configured WebSocket connection timeout in milliseconds, or uses the default if none is set. It returns that as a duration value.
 
-**Call relations**: Higher-level websocket transport setup reads this accessor when deciding how long to wait for provider websocket connections.
+**Call relations**: This supports code that opens WebSocket connections for providers that allow them. It gives that code a provider-specific timeout without hard-coding the value elsewhere.
 
 *Call graph*: 1 external calls (from_millis).
 
@@ -4127,11 +4149,11 @@ fn websocket_connect_timeout(&self) -> Duration
 fn create_openai_provider(base_url: Option<String>) -> ModelProviderInfo
 ```
 
-**Purpose**: Builds the built-in OpenAI provider definition with Codex-specific defaults for auth, headers, and websocket support.
+**Purpose**: This creates the built-in OpenAI provider definition. It gives Codex a ready-to-use OpenAI setup without requiring the user to write provider config by hand.
 
-**Data flow**: It takes an optional base URL override and returns a `ModelProviderInfo` named `OpenAI` with that base URL, no explicit env-key auth, `wire_api: Responses`, static `http_headers` containing a `version` header from `CARGO_PKG_VERSION`, environment-backed headers for `OpenAI-Organization` and `OpenAI-Project`, default retry/timeout fields left unset, `requires_openai_auth: true`, and `supports_websockets: true`.
+**Data flow**: It takes an optional base URL override and fills in the OpenAI provider fields: display name, protocol, default headers, optional organization and project headers from environment variables, OpenAI login requirement, and WebSocket support. It returns a complete `ModelProviderInfo` value.
 
-**Call relations**: Built-in catalog assembly and many tests use this constructor as the canonical OpenAI provider baseline.
+**Call relations**: This is called when building the default provider catalog and by many tests that need a realistic OpenAI provider. The resulting provider can later be validated, merged with config, or converted into an API provider.
 
 *Call graph*: called by 17 (model_client_with_counting_attestation, test_model_client_session, installed_extension_contributes_web_run_when_enabled, test_personal_access_token_uses_chatgpt_codex_base_url, test_supports_remote_compaction_for_openai, test_validate_provider_aws_rejects_conflicting_auth, test_validate_provider_aws_rejects_websockets, openai_provider_rejects_bedrock_api_key_auth, provider_info_with_command_auth, provider_without_command_auth_reports_no_command_auth (+7 more)); 1 external calls (env!).
 
@@ -4144,11 +4166,11 @@ fn create_amazon_bedrock_provider(
     ) -> ModelProviderInfo
 ```
 
-**Purpose**: Builds the built-in Amazon Bedrock provider definition targeting the Bedrock Mantle OpenAI-compatible endpoint.
+**Purpose**: This creates the built-in Amazon Bedrock provider definition. Bedrock uses AWS-style authentication rather than a normal OpenAI API key, so it needs its own defaults.
 
-**Data flow**: It takes an optional `ModelProviderAwsAuthInfo`, substitutes a default `{ profile: None, region: None }` when absent, and returns a `ModelProviderInfo` named `Amazon Bedrock` with the Mantle base URL, `aws` auth configured, `wire_api: Responses`, a static `x-amzn-mantle-client-agent: codex` header, no env-key or bearer-token auth, and websocket support disabled.
+**Data flow**: It receives optional AWS auth settings, supplies empty profile and region fields when none are provided, and fills in Bedrock's base URL, protocol, AWS auth field, required client-agent header, and disabled WebSocket support. It returns a complete provider definition.
 
-**Call relations**: This constructor is used by `built_in_model_providers` and by tests that verify Bedrock-specific defaults and header behavior.
+**Call relations**: This is used when building the default provider catalog and throughout tests that exercise Bedrock behavior. Later merge logic can adjust only the AWS profile and region for this built-in provider.
 
 *Call graph*: called by 14 (guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_4, use_bedrock_provider, test_amazon_bedrock_provider_adds_mantle_client_agent_header, api_provider_for_bedrock_bearer_token_uses_configured_region_endpoint, approval_review_preferred_model_uses_bedrock_gpt_5_4, capabilities_disable_unsupported_hosted_tools, managed_auth_takes_precedence_over_aws_auth, openai_auth_is_not_exposed_to_bedrock, amazon_bedrock_provider_creates_static_models_manager, amazon_bedrock_provider_returns_bedrock_account_state (+4 more)); 1 external calls (from).
 
@@ -4159,11 +4181,11 @@ fn create_amazon_bedrock_provider(
 fn is_openai(&self) -> bool
 ```
 
-**Purpose**: Identifies whether a provider is the built-in OpenAI provider by display name.
+**Purpose**: This answers whether a provider is the built-in OpenAI provider. It is a small helper for places where OpenAI needs special treatment.
 
-**Data flow**: It compares `self.name` to the constant `OPENAI_PROVIDER_NAME` and returns a boolean.
+**Data flow**: It compares the provider's display name with the OpenAI display name. The output is true for OpenAI and false otherwise.
 
-**Call relations**: Other auth and capability logic uses this quick predicate, including `supports_remote_compaction`.
+**Call relations**: This is used by `realtime_api_key` and by `supports_remote_compaction`. Those callers use it to decide whether OpenAI-specific features or authentication paths apply.
 
 *Call graph*: called by 2 (realtime_api_key, supports_remote_compaction).
 
@@ -4174,11 +4196,11 @@ fn is_openai(&self) -> bool
 fn is_amazon_bedrock(&self) -> bool
 ```
 
-**Purpose**: Identifies whether a provider is the built-in Amazon Bedrock provider by display name.
+**Purpose**: This answers whether a provider is the built-in Amazon Bedrock provider. It helps other code choose Bedrock-specific setup.
 
-**Data flow**: It compares `self.name` to `AMAZON_BEDROCK_PROVIDER_NAME` and returns a boolean.
+**Data flow**: It compares the provider's display name with the Amazon Bedrock display name and returns a true-or-false answer.
 
-**Call relations**: Provider creation/selection logic uses this to branch into Bedrock-specific handling.
+**Call relations**: This is called by `create_model_provider`, which can use the answer to create the right kind of runtime provider behavior for Bedrock.
 
 *Call graph*: called by 1 (create_model_provider).
 
@@ -4189,11 +4211,11 @@ fn is_amazon_bedrock(&self) -> bool
 fn supports_remote_compaction(&self) -> bool
 ```
 
-**Purpose**: Determines whether the provider can use Codex’s remote compaction path.
+**Purpose**: This tells Codex whether a provider supports remote compaction, a feature where conversation shrinking or summarizing can be delegated to the provider service.
 
-**Data flow**: It returns true when `self.is_openai()` is true or when `codex_api::is_azure_responses_provider(&self.name, self.base_url.as_deref())` recognizes the provider as Azure Responses-compatible; otherwise it returns false.
+**Data flow**: It checks whether the provider is OpenAI, or whether it matches an Azure Responses-compatible provider according to its name and base URL. It returns true when remote compaction is allowed and false otherwise.
 
-**Call relations**: Higher-level compaction selection logic calls this to decide whether to offload compaction remotely.
+**Call relations**: This is called by `should_use_remote_compact_task` when Codex decides whether to run compaction remotely. It uses `is_openai` for the OpenAI case and an external Azure check for compatible Azure providers.
 
 *Call graph*: calls 1 internal fn (is_openai); called by 1 (should_use_remote_compact_task); 1 external calls (is_azure_responses_provider).
 
@@ -4204,11 +4226,11 @@ fn supports_remote_compaction(&self) -> bool
 fn has_command_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether the provider uses command-backed auth configuration.
+**Purpose**: This reports whether the provider uses command-backed authentication. That means Codex runs a configured command to obtain a bearer token instead of reading a fixed key.
 
-**Data flow**: It checks `self.auth.is_some()` and returns the resulting boolean.
+**Data flow**: It checks whether the provider's `auth` field is present. The result is true when command-based auth is configured and false when it is not.
 
-**Call relations**: External auth-selection code uses this as a simple predicate when deciding how to obtain credentials.
+**Call relations**: This is called by higher-level authentication checks named `has_command_auth`. Those checks can then decide whether any provider setup requires running an external token command.
 
 *Call graph*: called by 1 (has_command_auth).
 
@@ -4221,11 +4243,11 @@ fn built_in_model_providers(
 ) -> HashMap<String, ModelProviderInfo>
 ```
 
-**Purpose**: Constructs the default provider registry shipped with Codex.
+**Purpose**: This creates the default provider catalog that ships with Codex. It makes OpenAI, Amazon Bedrock, Ollama, and LM Studio available before the user adds anything to their config.
 
-**Data flow**: It takes an optional OpenAI base URL override, creates the built-in OpenAI and Amazon Bedrock providers, creates OSS providers for Ollama and LM Studio using their default ports and `WireApi::Responses`, then collects those `(id, provider)` pairs into a `HashMap<String, ModelProviderInfo>`.
+**Data flow**: It receives an optional OpenAI base URL override, creates provider definitions for OpenAI and Amazon Bedrock, creates local open-source provider definitions for Ollama and LM Studio, and stores them in a map keyed by provider ID. The output is the starting provider catalog.
 
-**Call relations**: Config-loading code uses this as the starting catalog before applying user-defined providers or overrides.
+**Call relations**: This function calls the provider factory functions for each built-in entry. Its result is later combined with user configuration by `merge_configured_model_providers` so startup has one complete provider list.
 
 *Call graph*: calls 1 internal fn (create_oss_provider); 2 external calls (create_amazon_bedrock_provider, create_openai_provider).
 
@@ -4239,11 +4261,11 @@ fn merge_configured_model_providers(
 ) -> Result<HashMap<String, ModelP
 ```
 
-**Purpose**: Merges user-configured providers into the built-in provider catalog while enforcing special override rules for Amazon Bedrock.
+**Purpose**: This combines user-defined providers with the built-in provider catalog. It lets users add new providers while protecting built-in defaults from accidental replacement.
 
-**Data flow**: It takes an existing provider map and a configured-provider map. For each configured entry, if the key is `amazon-bedrock`, it extracts `provider.aws`, verifies the remaining provider equals `ModelProviderInfo::default()` and errors otherwise, then applies only `profile` and `region` overrides into the built-in Bedrock provider’s nested `aws` struct. For any other key, it inserts the configured provider only if that key is not already present. It returns the merged map or an explanatory `Err(String)`.
+**Data flow**: It starts with the built-in provider map and a second map from config. For most provider IDs, it inserts the configured provider only if that ID is not already built in. For Amazon Bedrock, it allows only `aws.profile` and `aws.region` changes and rejects any other attempted changes. It returns the merged map or an error message.
 
-**Call relations**: This function sits between config deserialization and runtime provider use, combining built-ins with user additions while preventing unsupported replacement of protected built-in fields.
+**Call relations**: This is used after config is read. It sits between raw configuration and runtime provider use, making sure the final catalog includes user additions but keeps important built-in providers consistent.
 
 *Call graph*: 2 external calls (format!, default).
 
@@ -4254,11 +4276,11 @@ fn merge_configured_model_providers(
 fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo
 ```
 
-**Purpose**: Builds a localhost-style OSS provider definition, honoring experimental environment overrides for port or full base URL.
+**Purpose**: This creates a local open-source provider definition, such as Ollama or LM Studio, using default localhost settings. It also allows experimental environment variables to override the local port or full base URL.
 
-**Data flow**: It takes a default port and `WireApi`, reads `CODEX_OSS_PORT`, trims and parses it as `u16` when present, falls back to the supplied default port, formats `http://localhost:<port>/v1` as the default base URL, then reads `CODEX_OSS_BASE_URL` and uses it when non-empty. Finally it delegates to `create_oss_provider_with_base_url` with the chosen URL and wire API.
+**Data flow**: It receives the provider's default port and wire protocol. It reads `CODEX_OSS_PORT` and `CODEX_OSS_BASE_URL` from the environment if present and non-empty, builds a localhost base URL when needed, then passes the final URL to `create_oss_provider_with_base_url`. The output is a provider definition.
 
-**Call relations**: `built_in_model_providers` calls this to create the default Ollama and LM Studio entries while allowing environment-based local overrides.
+**Call relations**: This is called by `built_in_model_providers` for Ollama and LM Studio. It delegates the final struct construction to `create_oss_provider_with_base_url` after deciding what base URL should be used.
 
 *Call graph*: calls 1 internal fn (create_oss_provider_with_base_url); called by 1 (built_in_model_providers); 2 external calls (format!, var).
 
@@ -4269,38 +4291,42 @@ fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelPr
 fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> ModelProviderInfo
 ```
 
-**Purpose**: Constructs a generic OSS-compatible provider definition for a specific base URL and wire protocol.
+**Purpose**: This creates a local open-source provider definition using an exact base URL. It is the final constructor after any default or environment-based URL choice has already been made.
 
-**Data flow**: It takes a base URL string and `WireApi`, then returns a `ModelProviderInfo` named `gpt-oss` with that base URL, no auth configuration, no extra headers or query params, unset retry/timeout overrides, and both `requires_openai_auth` and `supports_websockets` set to false.
+**Data flow**: It receives a base URL string and a wire protocol, then fills in a provider named `gpt-oss` with no API-key requirement, no extra headers, default retry and timeout behavior, and no WebSocket support. It returns the completed `ModelProviderInfo`.
 
-**Call relations**: This is the final constructor used by `create_oss_provider` after environment override resolution.
+**Call relations**: This is called by `create_oss_provider`. That caller decides the URL, and this function packages it into the common provider shape used by the rest of Codex.
 
 *Call graph*: called by 1 (create_oss_provider).
 
 
 ### `models-manager/src/config.rs`
 
-`config` · `config load`
+`config` · `config load and model setup`
 
-This file contains a single data structure, `ModelsManagerConfig`, which centralizes the tunable inputs consumed by the models-management layer. The struct is `Debug`, `Clone`, and `Default`, making it easy to log, duplicate, and instantiate with all fields unset or false. Most fields are optional to distinguish between an explicit configured value and the absence of configuration: `model_context_window` and `model_auto_compact_token_limit` carry token-count limits as `Option<i64>`, `tool_output_token_limit` uses `Option<usize>` for output sizing, `base_instructions` carries optional prompt text, `model_supports_reasoning_summaries` records an optional capability override, and `model_catalog` can embed a full `codex_protocol::openai_models::ModelsResponse` catalog for model discovery. The only non-optional field is `personality_enabled`, a boolean feature toggle that defaults to `false`. The shape of this struct suggests the manager merges static configuration, runtime capability detection, and catalog-derived metadata elsewhere; this file’s role is to preserve those inputs in a typed form without imposing policy. An important invariant is that `None` means “leave unspecified / derive elsewhere,” not zero or empty-string semantics, which lets higher layers distinguish omission from intentional override.
+This file is small but important because it gives the models manager one clear place to store its model-related settings. A language model system needs to know practical limits, such as how much text a model can read at once, when long conversations should be compacted, and how much tool output can be included. It may also need base instructions, personality behavior, and information about which models are available.
+
+The main piece is `ModelsManagerConfig`, a plain data structure. Most fields are optional, meaning they can be absent if the caller or configuration source does not provide them. That lets the rest of the system distinguish between “use the default behavior” and “the user explicitly set this value.” For example, `model_context_window` can hold the model’s maximum input size, while `model_auto_compact_token_limit` can say when the system should shorten or summarize a conversation. `model_catalog` can carry a catalog response from the OpenAI models protocol, like a menu of available models.
+
+The struct can be cloned, printed for debugging, and created with default empty values. In everyday terms, this file provides the blank form that other parts of the program fill out before deciding how to run a model.
 
 
 ### `models-manager/src/model_presets.rs`
 
 `config` · `config load`
 
-This file is a compatibility shim consisting of two public string constants: `HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG` and `HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG`. The module-level comment explains the context: the system no longer ships hardcoded model presets, and model listings now come from the active catalog, but older migration flows or persisted configuration may still reference these keys. By keeping the exact legacy names in one place, the codebase can continue to recognize or suppress old migration notices without scattering string literals across parsing and UI logic. The constants encode the historical config keys exactly, including the mixed punctuation in `hide_gpt-5.1-codex-max_migration_prompt`, which is easy to mistype and therefore benefits from centralization. There is no behavior here; the value of the file is semantic continuity during upgrades. A reader should understand that these constants do not imply the corresponding presets still exist—only that compatibility with prior configuration and migration prompts is intentionally maintained.
+This file is a small compatibility shim. In older versions of the system, there were hardcoded model presets and related migration prompts. Those presets have since been removed, and the available models are now read from the active catalog instead. However, some users may still have saved configuration values that refer to old prompt-hiding options. If the code simply forgot those names, older settings could stop being recognized, and users might see migration prompts again even after choosing to hide them. To avoid that, this file preserves the exact text of two legacy configuration keys as constants. Think of them like old forwarding addresses: the office moved, but mail sent to the old address still needs to be understood. The constants themselves do not list models or perform any migration. They are just stable names that other parts of the system can refer to when reading or writing compatibility settings.
 
 
 ### `models-manager/src/lib.rs`
 
-`util` · `startup`
+`orchestration` · `cross-cutting`
 
-This library root declares the crate's internal and public modules, re-exports `AuthMode` and `ModelsManagerConfig`, and defines two utility-style functions used elsewhere in the models manager. `bundled_models_response` embeds `../models.json` at compile time with `include_str!` and deserializes it into `codex_protocol::openai_models::ModelsResponse` using `serde_json::from_str`. Because it returns `Result<ModelsResponse, serde_json::Error>`, callers can decide whether parse failures should propagate or be converted into panics.
+This file is like the reception desk for the models manager library. It tells the rest of the program which parts of this crate are available, such as model presets, model information, manager logic, collaboration mode presets, and test support. It also re-exports a couple of important types so callers can import them from one convenient place instead of knowing the crate’s internal layout.
 
-The second helper, `client_version_to_whole`, converts the crate's Cargo package version into a stable `major.minor.patch` string by reading the compile-time `CARGO_PKG_VERSION_*` environment macros and formatting them together. This intentionally strips any prerelease or build metadata from the full semantic version, matching the comment example of turning `1.2.3-alpha.4` into `1.2.3`.
+The file includes one important data-loading helper: it reads a bundled `models.json` file that ships inside the program and turns it into a `ModelsResponse`, which is the structured form the rest of the system expects when talking about available OpenAI-style models. Because the JSON is compiled into the program, this works without needing to find a separate file on disk at runtime.
 
-Although small, these functions are foundational: the bundled catalog loader seeds managers with an offline/default model list, and the normalized version string is used in cache eligibility and remote `/models` requests so cache entries and provider responses are keyed to a coarse client version rather than a prerelease suffix.
+It also includes a small version helper. Package versions can include extra labels like `-alpha.4`, but sometimes the system only wants the three-number version, such as `1.2.3`. This helper builds that clean version from compile-time package information. Without this file, callers would have to know more internal module paths, and there would be no single simple place to load the bundled model catalog or get the normalized client version.
 
 #### Function details
 
@@ -4310,11 +4336,11 @@ Although small, these functions are foundational: the bundled catalog loader see
 fn bundled_models_response() -> std::result::Result<codex_protocol::openai_models::ModelsResponse, serde_json::Error>
 ```
 
-**Purpose**: Loads and parses the bundled `models.json` file shipped with the crate. It gives callers a typed `ModelsResponse` snapshot of the built-in catalog.
+**Purpose**: Loads the model catalog that is packaged with the application and turns it into structured data the rest of the code can use. Someone would use this when they need the default list of known models without fetching it from a network service or reading a runtime file.
 
-**Data flow**: It takes no arguments, reads the compile-time embedded JSON string from `include_str!("../models.json")`, deserializes it with `serde_json::from_str`, and returns either a `ModelsResponse` or a `serde_json::Error`. It does not mutate any state.
+**Data flow**: It starts with the text contents of the bundled `models.json` file, which are embedded in the compiled program. It asks the JSON parser to convert that text into a `ModelsResponse`. The result is either the parsed model list or an error explaining that the bundled JSON could not be read as the expected shape.
 
-**Call relations**: This helper is used by manager code that needs the authoritative bundled catalog, especially during initialization and merge logic. It delegates all parsing to Serde and leaves error handling to its callers.
+**Call relations**: This helper relies on the compile-time file inclusion step to supply the raw JSON text, then hands that text to the JSON parser. Higher-level model manager code can call it when it needs a ready-to-use default model catalog.
 
 *Call graph*: 2 external calls (include_str!, from_str).
 
@@ -4325,24 +4351,26 @@ fn bundled_models_response() -> std::result::Result<codex_protocol::openai_model
 fn client_version_to_whole() -> String
 ```
 
-**Purpose**: Builds a normalized `major.minor.patch` client version string from Cargo package metadata. It intentionally omits prerelease qualifiers.
+**Purpose**: Returns the client package version as only three numbers, such as `1.2.3`. This is useful when other parts of the system need a stable version string without pre-release labels like `alpha` or `beta`.
 
-**Data flow**: It takes no inputs and reads the compile-time `CARGO_PKG_VERSION_MAJOR`, `MINOR`, and `PATCH` values. It formats them into a single dotted `String` and returns that string without side effects.
+**Data flow**: It reads the package’s major, minor, and patch version numbers that were baked in during compilation. It joins those three pieces with dots and returns the resulting string. It does not read user input or change any stored state.
 
-**Call relations**: This helper is consumed by cache and remote-refresh paths that need a stable version identifier. It does not call into crate logic beyond standard formatting.
+**Call relations**: This function uses Rust’s formatting machinery to build the string from compile-time package values. Other code can call it whenever it needs the simplified client version for reporting, comparison, or protocol metadata.
 
 *Call graph*: 1 external calls (format!).
 
 
 ### `models-manager/src/model_info.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `model selection and configuration`
 
-This module contains the concrete rules for producing and mutating `codex_protocol::openai_models::ModelInfo`. It embeds the shared base prompt from `prompt.md` as `BASE_INSTRUCTIONS`, defines a default personality header and two local personality variants, and exposes two public functions.
+A model is not just a name like "gpt-5". The rest of the system needs to know practical facts about it: how much text it can read, whether it supports reasoning summaries, what instructions it should receive, and how tool output should be shortened if it is too long. This file is the place where those facts are filled in or adjusted.
 
-`with_config_overrides` takes an existing `ModelInfo` and applies selected `ModelsManagerConfig` fields. The overrides are intentionally asymmetric: `model_supports_reasoning_summaries = Some(true)` can enable support, but `Some(false)` does not disable an already-supported model. `model_context_window` is clamped to `max_context_window` when present. `model_auto_compact_token_limit` is copied directly. `tool_output_token_limit` rewrites `truncation_policy` while preserving whether the model truncates by bytes or tokens; byte limits are derived from token counts using `approx_bytes_for_tokens` and saturate to `i64::MAX` on conversion overflow. Prompt-related config also has precedence rules: explicit `base_instructions` replaces the model's base instructions and clears `model_messages`, while disabling personality clears `model_messages` without changing base instructions.
+Its main job is to take model information from elsewhere and make it usable in the current installation. If the configuration says to override a setting, `with_config_overrides` applies that override carefully. For example, if a user asks for a smaller context window, it will not exceed the model's known maximum. If a tool output limit is given in tokens, it converts that into the kind of truncation rule the model expects.
 
-`model_info_from_slug` builds a minimal but usable fallback descriptor for unknown slugs. It logs a warning, mirrors the slug into `display_name`, marks visibility as `None`, sets conservative defaults for reasoning, truncation, context window, tools, and feature flags, and marks `used_fallback_model_metadata = true`. For a small allowlist of local slugs, `local_personality_messages_for_slug` attaches a `ModelMessages` template whose instructions interpolate a `{{ personality }}` placeholder between a fixed header and the shared base instructions.
+The file also provides a fallback for unknown model names. If the system sees a model slug it does not recognize, `model_info_from_slug` creates a conservative `ModelInfo` record so the program can keep running instead of failing immediately. This is like giving an unfamiliar appliance a basic instruction card: not perfect, but enough to operate safely.
+
+Finally, it contains local personality message templates for a small set of model slugs. These templates let certain models receive a friendly or pragmatic style setting, while other models simply get the standard base instructions.
 
 #### Function details
 
@@ -4352,11 +4380,11 @@ This module contains the concrete rules for producing and mutating `codex_protoc
 fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo
 ```
 
-**Purpose**: Applies `ModelsManagerConfig` overrides to a `ModelInfo` while preserving important model invariants such as max context window and truncation mode. It is the final mutation step after catalog lookup or fallback synthesis.
+**Purpose**: This function takes an existing model description and applies settings from the local models manager configuration. It is used when the system already has candidate model metadata but needs to respect user or deployment-specific choices.
 
-**Data flow**: It takes `mut model: ModelInfo` and `config: &ModelsManagerConfig`. It conditionally enables `supports_reasoning_summaries`, clamps `context_window` to `max_context_window` when `model_context_window` is set, copies `model_auto_compact_token_limit`, rewrites `truncation_policy` based on `tool_output_token_limit` using either `TruncationPolicyConfig::bytes` with `approx_bytes_for_tokens` or `TruncationPolicyConfig::tokens`, and then either replaces `base_instructions` plus clears `model_messages` when `base_instructions` is configured or clears `model_messages` when `personality_enabled` is false. It returns the modified `ModelInfo`.
+**Data flow**: It receives a `ModelInfo` record and a `ModelsManagerConfig`. It reads optional values from the config, such as whether reasoning summaries are supported, the desired context window, auto-compaction limits, tool output limits, and custom base instructions. It updates the model record in place, making sure a requested context window does not go above the model's maximum. If tool output should be limited, it creates a new truncation rule either in bytes or in tokens. It returns the adjusted `ModelInfo`.
 
-**Call relations**: This function is called by `construct_model_info_from_candidates` after a model has been resolved from remote candidates or fallback metadata. It delegates byte estimation to `approx_bytes_for_tokens` and uses protocol constructors for truncation-policy rebuilding.
+**Call relations**: This function is called by `construct_model_info_from_candidates` after possible model descriptions have been found. In that larger flow, it acts as the final tailoring step: the candidate metadata comes in, local configuration is applied, and the resulting model information is handed back for the rest of the system to use.
 
 *Call graph*: calls 2 internal fn (bytes, tokens); called by 1 (construct_model_info_from_candidates); 2 external calls (approx_bytes_for_tokens, try_from).
 
@@ -4367,11 +4395,11 @@ fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> 
 fn model_info_from_slug(slug: &str) -> ModelInfo
 ```
 
-**Purpose**: Constructs a fallback `ModelInfo` for unknown or missing model slugs so the system can continue operating with conservative defaults. It also attaches local personality templates for a small set of special slugs.
+**Purpose**: This function creates a minimal model description when the system only has a model slug, meaning a short model name, and cannot find full metadata for it. It lets the program continue with sensible fallback assumptions instead of stopping because the model is unknown.
 
-**Data flow**: It takes `slug: &str`, logs a warning, and returns a fully populated `ModelInfo` whose `slug` and `display_name` are the input slug, whose prompt fields use `BASE_INSTRUCTIONS` and `local_personality_messages_for_slug(slug)`, whose truncation policy defaults to `TruncationPolicyConfig::bytes(10_000)`, whose context windows default to `Some(272_000)`, and whose many capability flags are set to safe defaults; `used_fallback_model_metadata` is set to `true`.
+**Data flow**: It receives a model slug as text. It logs a warning so operators know fallback metadata is being used. Then it builds a new `ModelInfo` record using the slug as both the internal name and display name, standard base instructions, default input types, conservative capability flags, and a fixed context window. It also asks `local_personality_messages_for_slug` whether this slug should get local personality message templates. The output is a complete `ModelInfo` marked as fallback metadata.
 
-**Call relations**: This function is used when `construct_model_info_from_candidates` cannot match a requested slug to the active catalog, and it is also reused by tests and other code that need a baseline `ModelInfo`. It delegates optional personality-message construction to `local_personality_messages_for_slug`.
+**Call relations**: This function is used in several places that need model metadata even when normal lookup fails, including `construct_model_info_from_candidates`, `remote_model`, and tests around truncation behavior. It hands off to `local_personality_messages_for_slug` to add optional personality instructions for known local slugs, and otherwise returns a plain fallback model description.
 
 *Call graph*: calls 3 internal fn (local_personality_messages_for_slug, bytes, default_input_modalities); called by 5 (model_with_default_service_tier, remote_model, build_stage_one_input_message_truncates_rollout_using_model_context_window, build_stage_one_input_message_uses_default_limit_when_model_context_window_missing, construct_model_info_from_candidates); 2 external calls (new, warn!).
 
@@ -4382,24 +4410,24 @@ fn model_info_from_slug(slug: &str) -> ModelInfo
 fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages>
 ```
 
-**Purpose**: Returns special local `ModelMessages` templates for a small allowlist of slugs that support personality injection. All other slugs receive no extra message template.
+**Purpose**: This helper decides whether a particular model slug should receive local personality instruction templates. It exists so only selected models get the extra friendly or pragmatic style options.
 
-**Data flow**: It takes `slug: &str`, matches it against `"gpt-5.2-codex"` and `"exp-codex-personality"`, and for those cases returns `Some(ModelMessages { instructions_template, instructions_variables })` where the template concatenates the default header, `{{ personality }}`, and `BASE_INSTRUCTIONS`, and the variables provide empty/default, friendly, and pragmatic personality strings. For any other slug it returns `None`.
+**Data flow**: It receives a model slug as text. If the slug matches one of the supported personality-enabled model names, it builds a `ModelMessages` value containing an instruction template and named personality text options. The template combines a short identity header, a placeholder where the chosen personality can be inserted, and the main base instructions. If the slug is not recognized for this feature, it returns nothing.
 
-**Call relations**: This helper is called only by `model_info_from_slug` while constructing fallback metadata. It isolates the slug-specific personality behavior from the larger fallback descriptor.
+**Call relations**: This helper is called only by `model_info_from_slug`. During fallback model creation, `model_info_from_slug` asks it whether to attach personality-aware messages. The helper supplies those messages for specific slugs and stays out of the way for all others.
 
 *Call graph*: called by 1 (model_info_from_slug); 2 external calls (new, format!).
 
 
 ### `models-manager/src/collaboration_mode_presets.rs`
 
-`domain_logic` · `request handling`
+`config` · `startup and mode listing`
 
-This file is a small domain-logic module that materializes the two shipped collaboration modes: `Plan` and `Default`. It imports the raw instruction text for both modes from `codex_collaboration_mode_templates`, plus protocol types such as `CollaborationModeMask`, `ModeKind`, `ReasoningEffort`, and the `TUI_VISIBLE_COLLABORATION_MODES` list. The `DEFAULT` template is parsed once into a `LazyLock<Template>` so rendering work and parse validation happen centrally rather than on every call.
+This file is like the menu card for the system’s built-in collaboration styles. A collaboration mode is a named bundle of settings that tells the assistant how to behave: for example, whether it should focus on planning, what reasoning effort to ask for, and what developer instructions to include behind the scenes.
 
-The exported entrypoint, `builtin_collaboration_mode_presets`, returns the presets in a fixed order: plan first, default second. `plan_preset` is fully static except for deriving its display name from `ModeKind::Plan`; it explicitly sets `reasoning_effort` to `Some(Some(ReasoningEffort::Medium))` and embeds the plan instructions verbatim. `default_preset` instead computes its instructions dynamically through `default_mode_instructions`, because the default prompt contains a `KNOWN_MODE_NAMES` placeholder. That helper formats the visible mode names from `TUI_VISIBLE_COLLABORATION_MODES` into human-readable English and renders the parsed template with that substitution.
+The file creates two presets. The Plan preset uses fixed planning instructions and asks for medium reasoning effort. The Default preset uses a text template. Before that template is given to the assistant, the file fills in the names of the collaboration modes that are visible in the text user interface. This lets the default instructions mention the available modes without hard-coding the list in two places.
 
-A notable detail is the formatting policy in `format_mode_names`: zero modes becomes the literal string `none`, one mode is returned directly, two modes use `"A and B"`, and three or more are comma-joined without a final conjunction. Both template parse and render failures are treated as programmer errors and panic immediately.
+A small formatting helper turns mode names into readable text, such as “none”, “Plan”, “Plan and Default”, or a comma-separated list. The default instruction template is parsed only once using a lazy static value, meaning the program waits until it is first needed and then reuses it. If the template cannot be parsed or rendered, the program deliberately stops, because these built-in instructions are expected to be valid at build/runtime and the system cannot safely continue with broken presets.
 
 #### Function details
 
@@ -4409,11 +4437,11 @@ A notable detail is the formatting policy in `format_mode_names`: zero modes bec
 fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask>
 ```
 
-**Purpose**: Builds the complete built-in collaboration mode preset list used by managers and mode-listing code. It returns exactly the plan preset followed by the default preset.
+**Purpose**: Returns the full list of built-in collaboration mode presets. Other parts of the system use this when they need to show or filter the modes that are available by default.
 
-**Data flow**: It takes no arguments and reads no mutable state. It invokes the local preset constructors, collects their `CollaborationModeMask` results into a `Vec`, and returns that vector without side effects.
+**Data flow**: It takes no input. It creates a fresh list containing the Plan preset and the Default preset, then returns that list to the caller.
 
-**Call relations**: This is the file's public aggregation point. It is used when model-manager implementations need to expose collaboration modes, and it delegates the actual field population to `plan_preset` and `default_preset`.
+**Call relations**: When mode-listing or preset-filtering code needs the built-in choices, it calls this function as the front door for this file. This function gathers the individual preset builders into one list so callers do not need to know how each preset is made.
 
 *Call graph*: called by 4 (builtin_collaboration_mode_presets, list_collaboration_modes, list_collaboration_modes, filtered_presets); 1 external calls (vec!).
 
@@ -4424,11 +4452,11 @@ fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask>
 fn plan_preset() -> CollaborationModeMask
 ```
 
-**Purpose**: Constructs the built-in `Plan` collaboration mode mask with its fixed reasoning and instruction settings. The preset is named from `ModeKind::Plan.display_name()` rather than hard-coded text.
+**Purpose**: Builds the built-in “Plan” collaboration mode. This mode gives the assistant planning-focused instructions and asks it to use medium reasoning effort.
 
-**Data flow**: It takes no inputs. It creates a `CollaborationModeMask` whose `name` and `mode` come from `ModeKind::Plan`, whose `model` is `None`, whose `reasoning_effort` is `Some(Some(ReasoningEffort::Medium))`, and whose `developer_instructions` wraps the imported `COLLABORATION_MODE_PLAN` string; it returns that struct.
+**Data flow**: It takes no input. It creates a collaboration mode record with the display name for Plan, marks its kind as Plan, leaves the model unchanged, sets reasoning effort to medium, adds the Plan developer instructions, and returns the completed record.
 
-**Call relations**: This helper is only used as one element of `builtin_collaboration_mode_presets`. It does not delegate further because all of its fields are static constants or enum-derived values.
+**Call relations**: This is one of the preset builders used by the top-level preset list. It does not call other local helpers because all of its values are fixed constants or simple enum values.
 
 
 ##### `default_preset`  (lines 30–38)
@@ -4437,11 +4465,11 @@ fn plan_preset() -> CollaborationModeMask
 fn default_preset() -> CollaborationModeMask
 ```
 
-**Purpose**: Constructs the built-in `Default` collaboration mode mask, including dynamically rendered developer instructions. Unlike the plan preset, it leaves reasoning effort unspecified.
+**Purpose**: Builds the normal built-in “Default” collaboration mode. This is the fallback everyday mode, with instructions generated from a template.
 
-**Data flow**: It takes no inputs. It builds a `CollaborationModeMask` with `name` and `mode` derived from `ModeKind::Default`, `model` set to `None`, `reasoning_effort` set to `None`, and `developer_instructions` set to the string returned by `default_mode_instructions`; it returns the completed struct.
+**Data flow**: It takes no input. It creates a collaboration mode record with the display name for Default, marks its kind as Default, leaves the model and reasoning effort unchanged, asks `default_mode_instructions` to produce the instruction text, and returns the completed record.
 
-**Call relations**: This helper contributes the second preset in `builtin_collaboration_mode_presets`. It delegates prompt generation to `default_mode_instructions` because the default instructions depend on the current visible mode list.
+**Call relations**: This function is used when the built-in preset list is assembled. Unlike the Plan preset, it hands off to `default_mode_instructions` because the Default instructions need to include the current list of visible mode names.
 
 *Call graph*: calls 1 internal fn (default_mode_instructions).
 
@@ -4452,11 +4480,11 @@ fn default_preset() -> CollaborationModeMask
 fn default_mode_instructions() -> String
 ```
 
-**Purpose**: Renders the default collaboration-mode instruction template after substituting the visible mode names. It is the only place where the parsed `Template` static is used.
+**Purpose**: Creates the instruction text used by the Default collaboration mode. It fills a template with the names of the modes that users can see in the interface.
 
-**Data flow**: It reads `TUI_VISIBLE_COLLABORATION_MODES`, passes that slice to `format_mode_names`, then renders `COLLABORATION_MODE_DEFAULT_TEMPLATE` with a single key-value binding from `KNOWN_MODE_NAMES_TEMPLATE_KEY` to the formatted names. It returns the rendered `String`, panicking if rendering fails.
+**Data flow**: It reads the system’s list of text-interface-visible collaboration modes. It sends that list to `format_mode_names` to turn it into human-readable wording, inserts that wording into the default instruction template, and returns the finished instruction string. If rendering fails, it stops the program because the built-in template is considered invalid.
 
-**Call relations**: This function is called only by `default_preset` when constructing the default mode's `developer_instructions`. It delegates the English list formatting to `format_mode_names` and relies on the lazily parsed template prepared at module initialization.
+**Call relations**: This function sits between `default_preset` and the lower-level formatting helper. `default_preset` asks it for ready-to-use instructions, and it relies on `format_mode_names` to prepare the one template value that changes.
 
 *Call graph*: calls 1 internal fn (format_mode_names); called by 1 (default_preset).
 
@@ -4467,20 +4495,24 @@ fn default_mode_instructions() -> String
 fn format_mode_names(modes: &[ModeKind]) -> String
 ```
 
-**Purpose**: Converts a slice of `ModeKind` values into a human-readable phrase for prompt insertion. It chooses different wording depending on how many modes are present.
+**Purpose**: Turns a list of collaboration mode kinds into readable English text. It exists so template text can say mode names naturally instead of showing a raw list.
 
-**Data flow**: It accepts `modes: &[ModeKind]`, maps each mode to its `display_name`, and matches on the resulting slice length. It returns `"none"` for an empty slice, the sole name for one element, `"first and second"` for two elements, or a comma-joined string for longer lists.
+**Data flow**: It receives a slice of mode values. It looks up each mode’s display name, then returns a string: “none” for an empty list, the single name for one item, “first and second” for two items, or a comma-separated list for three or more.
 
-**Call relations**: This helper exists solely to support `default_mode_instructions`. It isolates the prompt-facing formatting rule so the template renderer receives a ready-to-insert string.
+**Call relations**: This helper is called by `default_mode_instructions` while preparing the Default mode template. It does not know anything about templates or presets; it only converts mode names into friendly wording.
 
 *Call graph*: called by 1 (default_mode_instructions); 2 external calls (format!, iter).
 
 
 ### `utils/approval-presets/src/lib.rs`
 
-`domain_logic` · `startup and settings selection`
+`config` · `config load and permission selection`
 
-This file is a compact domain table for approval and permission defaults. Its main data type, `ApprovalPreset`, is a plain struct containing a stable `id`, user-facing `label` and `description`, an `AskForApproval` policy, an `ActivePermissionProfile` identifying the selected built-in profile, and the concrete `PermissionProfile` to apply. `builtin_approval_presets()` returns three hard-coded presets: `read-only`, which uses `AskForApproval::OnRequest` plus the built-in read-only profile; `auto`/`Default`, which grants workspace write access while still requiring approval for broader actions; and `full-access`, which disables approval prompts and uses the dangerous full-access profile with `PermissionProfile::Disabled`. The descriptions are intentionally UI-ready strings but the module itself stays UI-agnostic so both TUI and MCP server code can consume the same definitions. The second function, `builtin_permission_profile_for_active_permission_profile`, is a narrow resolver for built-in active-profile IDs. It first rejects any profile with `extends` set, ensuring only direct built-ins are recognized, then matches the profile ID string against the three built-in constants and returns the corresponding concrete `PermissionProfile`, or `None` for unknown/custom IDs.
+This file is a small catalog of permission presets. A preset combines two closely related ideas: what Codex is allowed to do, and when it must ask the user first. For example, one preset lets Codex read files but requires approval before editing anything. Another lets it edit files in the current workspace but still asks before using the internet. A third gives full access and does not ask for approval, which is intentionally marked as risky.
+
+The main data shape is `ApprovalPreset`. It is like a menu item: it has an internal ID, a label for display, a short explanation for users, an approval rule, and the actual permission profile that should be applied. Keeping this here means the text user interface and the MCP server can use the same definitions instead of each inventing its own version.
+
+The file also includes a lookup helper that turns a built-in active permission profile ID back into the concrete permission profile. It only accepts plain built-in profiles, not profiles that extend or customize another one. This keeps the helper predictable: it answers only for the known presets and returns nothing for anything custom or unknown.
 
 #### Function details
 
@@ -4490,11 +4522,11 @@ This file is a compact domain table for approval and permission defaults. Its ma
 fn builtin_approval_presets() -> Vec<ApprovalPreset>
 ```
 
-**Purpose**: Returns the complete built-in list of approval presets used by clients to present standard approval/permission combinations. The list is fixed and ordered.
+**Purpose**: Returns the standard list of approval and permission presets that users can choose from. This is used wherever the program needs to show or apply the built-in safety modes.
 
-**Data flow**: Constructs and returns a `Vec<ApprovalPreset>` containing three literal `ApprovalPreset` values. Each entry embeds static strings, a concrete `AskForApproval` variant, an `ActivePermissionProfile::new(...)` built from a built-in ID constant, and the matching `PermissionProfile` constructor or variant.
+**Data flow**: Nothing is passed in. The function builds a fresh list containing three preset records: read-only, default workspace access, and full access. The result is a vector of `ApprovalPreset` values, ready for a user interface or server code to display or apply.
 
-**Call relations**: Callers use this function when populating UI choices or default policy menus. It does not depend on runtime state and delegates only to the protocol types' constructors for the active-profile wrappers and permission profiles.
+**Call relations**: When another part of the system needs the preset menu, it calls this function. Inside, the function constructs the list directly and uses the vector-building helper to return all presets together.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4507,22 +4539,24 @@ fn builtin_permission_profile_for_active_permission_profile(
 ) -> Option<PermissionProfile>
 ```
 
-**Purpose**: Maps a built-in `ActivePermissionProfile` identifier back to its concrete `PermissionProfile`, but only for non-extended built-ins. It rejects custom inheritance chains by returning `None` when `extends` is present.
+**Purpose**: Turns a built-in active permission profile identifier into the concrete permission rules it represents. It is useful when the system has stored or received the name of a built-in profile and needs the actual rules behind it.
 
-**Data flow**: Reads `active_permission_profile: &ActivePermissionProfile`, first checks `active_permission_profile.extends.is_some()` and returns `None` if true. Otherwise it matches `active_permission_profile.id.as_str()` against the three built-in ID constants and returns `Some(PermissionProfile::read_only())`, `Some(PermissionProfile::workspace_write())`, `Some(PermissionProfile::Disabled)`, or `None` for unknown IDs.
+**Data flow**: It receives an `ActivePermissionProfile`, which contains an ID and may also say it extends another profile. If the profile extends something else, the function refuses to guess and returns `None`. Otherwise, it compares the ID with the known built-in profile IDs and returns the matching permission profile, or `None` if the ID is unknown.
 
-**Call relations**: This function is called by code that needs to recover the concrete permission profile from a selected built-in active profile. Its control flow is a simple guard-plus-match and it delegates only to the `PermissionProfile` constructors for the recognized built-ins.
+**Call relations**: This function is called when code already has an active profile and needs to resolve it into real permissions. For recognized built-ins, it hands off to the standard constructors for read-only and workspace-write profiles; for the full-access built-in, it returns the disabled permission profile, meaning normal permission restrictions are not applied.
 
 *Call graph*: calls 2 internal fn (read_only, workspace_write).
 
 
 ### `tui/src/model_catalog.rs`
 
-`data_model` · `configuration and model-selection flows`
+`data_model` · `startup and model selection`
 
-This file defines `ModelCatalog`, a minimal data holder used by the TUI to expose available models. Internally it stores a `Vec<ModelPreset>` and offers only two methods: construction and listing. There is no indexing, filtering, caching, or I/O here; the catalog is simply cloned back out on request. The use of `Result<Vec<ModelPreset>, Infallible>` in `try_list_models` is a deliberate interface choice: callers can treat this catalog like other model providers that may fail, while this implementation guarantees success. That keeps higher-level code generic without introducing special cases for tests or static catalogs.
+The TUI needs to know which model options are available, for example when showing a model picker or when tests need a predictable set of choices. This file provides that list in the simplest possible form: a ModelCatalog is just a wrapper around a vector, which is a growable list, of ModelPreset values. A ModelPreset comes from the shared protocol code and represents one selectable model configuration.
 
-Because the catalog owns its vector and returns clones, callers cannot mutate the internal list through shared references. The file therefore acts as a lightweight adapter between configuration/test setup and UI flows that expect a catalog-like object.
+The catalog is like a printed menu at a restaurant. It does not cook anything or decide what the user should order. It simply stores the menu items and can hand a copy of them to whoever asks.
+
+There are two main actions. First, ModelCatalog::new builds a catalog from a list supplied by some other part of the program. Second, ModelCatalog::try_list_models returns the stored list. The word “try” usually means something might fail, but here the result cannot fail: the error type is Infallible, meaning “there is no possible error.” The method still returns a Result so it can fit the same shape as other catalog sources that might need network access, file access, or other fallible work.
 
 #### Function details
 
@@ -4532,11 +4566,11 @@ Because the catalog owns its vector and returns clones, callers cannot mutate th
 fn new(models: Vec<ModelPreset>) -> Self
 ```
 
-**Purpose**: Constructs a catalog from an owned vector of `ModelPreset` entries.
+**Purpose**: Creates a new catalog from a supplied list of model presets. This is used when the program or a test already knows which models should be available and wants to package them into a reusable catalog object.
 
-**Data flow**: It takes `models: Vec<ModelPreset>` by value and stores it directly in `Self { models }`. It returns a new `ModelCatalog` and does not touch external state.
+**Data flow**: A list of ModelPreset values goes in. The function stores that list inside a new ModelCatalog. The finished ModelCatalog comes out, ready to be kept by the TUI or passed to code that needs to show or inspect model choices.
 
-**Call relations**: This constructor is used by runtime and test setup code that needs a concrete catalog instance before passing it into model-selection or service-tier logic.
+**Call relations**: This function is called during the main run flow and by several tests that need controlled model lists, such as set_fast_mode_test_catalog, test_model_catalog, model_switch_recomputes_catalog_default_service_tier, and service_tier_commands_lowercase_catalog_names. In each case, it turns a plain list of model presets into the catalog object that later code can ask for model options.
 
 *Call graph*: called by 5 (run, set_fast_mode_test_catalog, test_model_catalog, model_switch_recomputes_catalog_default_service_tier, service_tier_commands_lowercase_catalog_names).
 
@@ -4547,22 +4581,24 @@ fn new(models: Vec<ModelPreset>) -> Self
 fn try_list_models(&self) -> Result<Vec<ModelPreset>, Infallible>
 ```
 
-**Purpose**: Returns the catalog contents as a cloned vector through a fallible-looking API that cannot actually fail.
+**Purpose**: Returns the catalog’s available model presets. It gives callers their own copy of the list so they can read or display it without changing the catalog’s stored version.
 
-**Data flow**: It reads `self.models`, clones the vector, wraps it in `Ok(...)`, and returns `Result<Vec<ModelPreset>, Infallible>`. No internal state is modified.
+**Data flow**: The function reads the ModelCatalog’s internal model list. It clones that list, meaning it makes a separate copy, then wraps it in Ok to say the lookup succeeded. Because the error type is Infallible, this particular catalog cannot report a failure.
 
-**Call relations**: This method serves callers that expect a `try_*` listing interface. Its `Infallible` error type signals that this implementation is a simple local source rather than a remote or computed catalog.
+**Call relations**: No direct callers are shown in the provided call graph, but this method is the catalog’s read-out point. After ModelCatalog::new has stored the available presets, this function is the piece other code would use when it needs the current list of selectable models.
 
 
 ### `tui/src/update_action.rs`
 
-`domain_logic` · `startup and update prompting/execution`
+`domain_logic` · `after TUI exit / update prompt`
 
-This file is the narrow translation layer between how Codex was installed and what command should be shown or executed to update it. Its core type is the `UpdateAction` enum, whose variants encode the supported upgrade paths: global npm, global bun, Homebrew cask, and standalone Unix or Windows installers. In release builds and tests, `UpdateAction::from_install_context` inspects `codex_install_context::InstallContext.method` and maps each known `InstallMethod` to one enum variant; `InstallMethod::Other` intentionally yields `None`, which suppresses update prompting and automatic update execution for unknown packaging environments.
+Codex can be installed in several different ways, and each one needs a different update command. Someone who installed with npm should not be told to run a Homebrew command, and a standalone Windows install needs a different installer command than a Unix one. This file is the small translation table that keeps those choices straight.
 
-The enum also owns the exact command payload. `command_args` returns a program name plus a static slice of arguments, with standalone variants deliberately re-running the latest hosted installer script rather than trying to patch an existing local install. `command_str` turns that tuple into a shell-escaped display string using `shlex::try_join`, with a plain concatenation fallback if quoting fails. The top-level `get_update_action` is only compiled in non-debug builds and asks `InstallContext::current()` for the runtime installation context before delegating to the enum mapper.
+The main type is `UpdateAction`, an enum, which means a fixed list of possible choices. Each choice represents one update route: npm, bun, Homebrew, standalone Unix, or standalone Windows. When Codex can inspect its install context, `from_install_context` converts that context into one of these choices. If the install method is unknown, it returns nothing, so the rest of the program can avoid offering an update command it cannot trust.
 
-Tests pin down both the install-context mapping and the exact standalone command lines, which is important because the prompt UI renders these strings verbatim and the updater later executes the same command tuple.
+Once an action is chosen, `command_args` turns it into the actual program name and argument list to execute. `command_str` formats the same command as readable text for display, quoting it like a shell command when possible. This is like having both the recipe card for the computer to follow and the human-readable version shown to the user.
+
+The file also includes tests that check the install-method mapping and make sure the standalone installer commands stay exactly as expected.
 
 #### Function details
 
@@ -4572,11 +4608,11 @@ Tests pin down both the install-context mapping and the exact standalone command
 fn from_install_context(context: &InstallContext) -> Option<Self>
 ```
 
-**Purpose**: Maps a detected `InstallContext` into the specific `UpdateAction` the application knows how to present and run.
+**Purpose**: This function looks at how Codex was installed and chooses the matching update action. It is used so the app can suggest or run the right update command instead of guessing.
 
-**Data flow**: It reads `context.method` and pattern-matches on the `InstallMethod` variant. Known package managers become fixed `UpdateAction` variants; standalone installs branch again on `StandalonePlatform` to choose Unix vs. Windows; `Other` becomes `None`. It returns `Option<UpdateAction>` and does not mutate external state.
+**Data flow**: It receives an `InstallContext`, which describes the install method. It reads the method field, matches known methods such as npm, bun, Homebrew, or standalone platform, and returns the matching `UpdateAction`. If the method is `Other`, it returns `None`, meaning there is no safe update action to offer.
 
-**Call relations**: This is the decision point used by `get_update_action` after runtime install detection. Its `None` result propagates upward so callers can skip update UI or execution when the install origin is unsupported.
+**Call relations**: When the app wants to know whether an update can be run, `get_update_action` asks the install-context code for the current installation details and then hands them to this function. This function does only the decision step; later code uses the returned action to build or run the command.
 
 *Call graph*: called by 1 (get_update_action).
 
@@ -4587,11 +4623,11 @@ fn from_install_context(context: &InstallContext) -> Option<Self>
 fn command_args(self) -> (&'static str, &'static [&'static str])
 ```
 
-**Purpose**: Returns the exact executable name and argument vector needed to perform the selected update action.
+**Purpose**: This function turns an update action into the exact command and arguments needed to perform that update. It is for code that needs to actually run the update, not just describe it.
 
-**Data flow**: It consumes `self` by value and matches each enum variant to a `(&'static str, &'static [&'static str])` pair. Package-manager variants produce direct commands like `npm install -g @openai/codex`; standalone variants produce shell or PowerShell invocations that fetch and run the latest installer script. It returns only static data and writes no state.
+**Data flow**: It starts with one `UpdateAction` value. For each possible action, it returns a command name, such as `npm`, `bun`, `brew`, `sh`, or `powershell`, plus a fixed list of arguments. Nothing is changed elsewhere; the output is the command recipe the caller can execute.
 
-**Call relations**: This function feeds both display and execution paths: `command_str` formats its output for the prompt, and `run_update_action` uses the same tuple to spawn the updater so the shown command matches the executed one.
+**Call relations**: The update runner calls this when it is time to launch the updater. `command_str` also calls it first, then turns the same command pieces into a display string so users can see what will be run.
 
 *Call graph*: called by 2 (run_update_action, command_str).
 
@@ -4602,11 +4638,11 @@ fn command_args(self) -> (&'static str, &'static [&'static str])
 fn command_str(self) -> String
 ```
 
-**Purpose**: Builds a human-readable shell command string from the structured command tuple for display in the UI.
+**Purpose**: This function makes a human-readable command line from an update action. It is useful for showing the user the update command in prompts or logs.
 
-**Data flow**: It first calls `command_args` to get the program and arguments, then chains the command with the arg slice and passes the iterator to `shlex::try_join` for shell-safe quoting. If quoting fails, it falls back to `format!("{command} {}", args.join(" "))`. It returns an owned `String` and does not modify shared state.
+**Data flow**: It takes an `UpdateAction`, asks `command_args` for the executable and arguments, then joins them into one shell-like string. It tries to quote the pieces safely with `shlex`; if that fails, it falls back to a simpler string made from the command plus the joined arguments.
 
-**Call relations**: This is used where the update command must be rendered to the user, notably in `render_ref`, and also by `run_update_action` when it needs a printable representation alongside actual execution.
+**Call relations**: Display code such as `render_ref` uses this to show the command, and the update-running flow can also use it when explaining what will happen. It depends on `command_args` so the displayed command and the executed command come from the same source.
 
 *Call graph*: calls 1 internal fn (command_args); called by 2 (run_update_action, render_ref); 2 external calls (try_join, once).
 
@@ -4617,11 +4653,11 @@ fn command_str(self) -> String
 fn get_update_action() -> Option<UpdateAction>
 ```
 
-**Purpose**: Looks up the current installation method at runtime and converts it into an optional update action.
+**Purpose**: This function asks the system how Codex is currently installed and returns the matching update action, if one is known. It is the simple public doorway for the rest of the release build to ask, “Can we update this install, and how?”
 
-**Data flow**: It calls `InstallContext::current()` to obtain the process's detected install context, then passes that reference into `UpdateAction::from_install_context`. The returned `Option<UpdateAction>` is forwarded unchanged.
+**Data flow**: It calls `InstallContext::current()` to read the current installation information, then passes that information into `UpdateAction::from_install_context`. The result is either a specific update action or `None` if Codex cannot identify a supported update path.
 
-**Call relations**: This is the release-build entry into the file's logic. It is consulted by startup/update flows such as `run`, `run_update_prompt_if_needed`, and `get_upgrade_version` so those callers can tailor update checks and prompts to the actual installation channel.
+**Call relations**: Higher-level flows such as `run`, `run_update_prompt_if_needed`, and `get_upgrade_version` call this when deciding whether to offer or prepare an update. This function connects the outside install-detection code to this file’s update-action mapping.
 
 *Call graph*: calls 2 internal fn (current, from_install_context); called by 3 (run, run_update_prompt_if_needed, get_upgrade_version).
 
@@ -4632,11 +4668,11 @@ fn get_update_action() -> Option<UpdateAction>
 fn maps_install_context_to_update_action()
 ```
 
-**Purpose**: Verifies that every supported `InstallMethod` maps to the intended `UpdateAction`, and that unsupported installs map to `None`.
+**Purpose**: This test verifies that each supported install method maps to the correct update action, and that an unknown install method maps to no action. It protects against accidentally telling users to update with the wrong tool.
 
-**Data flow**: The test constructs several `InstallContext` values, including standalone contexts with temporary absolute paths, then compares `UpdateAction::from_install_context` results against expected enum variants using `assert_eq!`. It reads temporary filesystem paths only to satisfy standalone context construction.
+**Data flow**: The test builds several sample `InstallContext` values, including npm, bun, Homebrew, standalone Unix, standalone Windows, and an unknown method. For each one, it calls `UpdateAction::from_install_context` and checks that the returned value matches the expected result.
 
-**Call relations**: This test exercises the enum-mapping branch table directly, guarding the behavior relied on by `get_update_action` and all higher-level update flows.
+**Call relations**: This test exercises `from_install_context` directly. It does not run during normal app use; it runs in the test suite to make sure the decision table stays correct as install methods evolve.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 2 external calls (assert_eq!, temp_dir).
 
@@ -4647,11 +4683,11 @@ fn maps_install_context_to_update_action()
 fn standalone_update_commands_rerun_latest_installer()
 ```
 
-**Purpose**: Pins the standalone update commands to the hosted installer re-execution strategy on Unix and Windows.
+**Purpose**: This test checks that the standalone Unix and Windows update actions use the expected installer commands. It matters because standalone updates work by re-running the latest official installer in non-interactive mode.
 
-**Data flow**: It calls `command_args` on `UpdateAction::StandaloneUnix` and `UpdateAction::StandaloneWindows` and asserts the returned command/argument tuples exactly match the expected shell and PowerShell invocations. It returns no value and mutates no state.
+**Data flow**: The test calls `command_args` on the standalone Unix and Windows actions. It compares the returned command and argument lists with the exact expected shell and PowerShell installer invocations.
 
-**Call relations**: This test protects the command definitions consumed by both UI rendering and actual update execution, ensuring standalone installs always rerun the latest installer rather than a stale local path.
+**Call relations**: This test exercises `command_args` for the standalone cases. It runs only in the test suite and acts as a guardrail so future edits do not silently break the standalone update path.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4661,11 +4697,13 @@ These files define the built-in pet catalog, acquire and validate cached sprites
 
 ### `tui/src/pets/catalog.rs`
 
-`data_model` · `cross-cutting static metadata used during pet lookup, validation, and tests`
+`data_model` · `pet selection and asset loading`
 
-This file is almost entirely declarative. It establishes the default frame geometry used by app-compatible pets—192×208 pixel frames arranged in an 8×9 grid—and derives the full spritesheet dimensions from those constants. The `BuiltinPet` struct is a compact copyable record containing the stable pet id, display name, description, and versioned spritesheet filename. `BUILTIN_PETS` is the complete catalog array, currently including `codex`, `dewey`, `fireball`, `rocky`, `seedy`, `stacky`, `bsod`, and `null-signal`.
+This file is like a small product shelf for the app’s built-in companion pets. Each pet has a short internal ID, a display name, a user-facing description, and the filename of its sprite sheet. A sprite sheet is one image that contains many animation frames laid out in a grid, like a contact sheet of drawings. The constants at the top define the shared size and layout of those sprite sheets, so the rest of the pet system can know how wide, tall, and grid-shaped the animation image should be.
 
-The small amount of behavior here exists to support lookup and testing. `builtin_pet` performs a linear search over the static slice and returns a copied `BuiltinPet` when the id matches exactly; this is the entry point used by higher layers to distinguish built-in pets from custom ones. In test builds, `write_test_spritesheet` creates a blank RGBA image with the exact catalog spritesheet dimensions and saves it to disk, allowing asset-pack and model tests to exercise validation and loading logic without shipping real art assets. The important invariant carried by this file is that all built-in pets share one fixed spritesheet geometry, which downstream code assumes when validating downloads, slicing frames, and generating default animations.
+The main data type, `BuiltinPet`, is a simple record for one pet. `BUILTIN_PETS` is the fixed list of pets that ship with the app, such as Codex, Dewey, Fireball, and others. The lookup function `builtin_pet` lets other parts of the program ask, “Do we have a built-in pet with this ID?” and get back the matching record if it exists.
+
+There is also a test-only helper that creates an empty sprite sheet file with the correct dimensions. That lets tests exercise the pet loading code without needing real artwork. Without this catalog, the app would not have a reliable source of truth for which built-in pets exist or which image files should be used for them.
 
 #### Function details
 
@@ -4675,11 +4713,11 @@ The small amount of behavior here exists to support lookup and testing. `builtin
 fn builtin_pet(id: &str) -> Option<BuiltinPet>
 ```
 
-**Purpose**: Looks up a built-in pet definition by its stable id string. It returns a copied catalog entry so callers can use the metadata without borrowing the static slice.
+**Purpose**: Looks up a built-in pet by its internal ID, such as `codex` or `dewey`. Other code uses it to confirm that a requested pet exists and to find the pet’s display text and sprite sheet filename.
 
-**Data flow**: Input is `id: &str`. It iterates `BUILTIN_PETS`, copies each `BuiltinPet`, finds the first entry whose `pet.id == id`, and returns `Option<BuiltinPet>`.
+**Data flow**: It takes an ID string as input. It scans the fixed `BUILTIN_PETS` list, compares each pet’s `id` to the input, and returns a copy of the matching pet record if one is found. If no pet has that ID, it returns nothing, represented as `None`.
 
-**Call relations**: Used by asset-pack orchestration and pet-model loading to decide whether a selector refers to a built-in pet, and by tests that verify URL generation.
+**Call relations**: When code needs to work with a named built-in pet, it calls this function first as the catalog lookup. The public CDN path test uses it to check URL behavior, `ensure_builtin_pack_for_pet` uses it when preparing a built-in pet pack, and `load_with_codex_home` uses it while loading pet-related data from the user’s Codex home setup.
 
 *Call graph*: called by 3 (builtin_pet_url_uses_public_cdn_path, ensure_builtin_pack_for_pet, load_with_codex_home).
 
@@ -4690,24 +4728,26 @@ fn builtin_pet(id: &str) -> Option<BuiltinPet>
 fn write_test_spritesheet(path: &std::path::Path)
 ```
 
-**Purpose**: Writes a synthetic blank spritesheet file with the exact built-in dimensions for use in tests. This provides a structurally valid image without requiring real pet artwork.
+**Purpose**: Creates a blank sprite sheet image for tests, using the same dimensions expected for real built-in pet artwork. This lets tests create believable pet files without storing or generating actual animations.
 
-**Data flow**: Input is `path: &Path`. It creates an `image::RgbaImage` with `SPRITESHEET_WIDTH` and `SPRITESHEET_HEIGHT`, saves it to `path`, and panics on failure via `unwrap()` because it is test-only.
+**Data flow**: It takes a filesystem path as input. It creates a new transparent RGBA image, meaning an image with red, green, blue, and alpha transparency channels, sized to the full expected sprite sheet width and height. It then saves that image to the given path, changing the test filesystem by writing the file there.
 
-**Call relations**: Called by test helpers in the asset-pack and model modules whenever they need a valid spritesheet fixture.
+**Call relations**: This helper is only compiled for tests. Test setup functions call it when they need a fake pet asset: `write_test_pack`, `write_pet_manifest`, `write_legacy_avatar`, and `write_pet` use it to put a correctly sized placeholder sprite sheet on disk before exercising the loading and manifest code.
 
 *Call graph*: called by 4 (write_test_pack, write_pet_manifest, write_legacy_avatar, write_pet); 1 external calls (new).
 
 
 ### `tui/src/pets/asset_pack.rs`
 
-`io_transport` · `asset fetch and cache validation before built-in pet load or preview`
+`io_transport` · `when a built-in pet asset is needed`
 
-This module is the built-in asset boundary for pets. It distinguishes built-in pets from custom pets by treating the CDN-facing spritesheet filename as the cache key and storing validated files under `cache/tui-pets/<version>/assets/`. `builtin_spritesheet_path` and `pack_dir` centralize that directory layout.
+Built-in pets are not shipped as image files inside the TUI package. Instead, this file is the “fetch and verify” layer for those pet images. Its job is narrow but important: by the time it finishes, there should be a valid spritesheet file at a known local path, or a clear error saying the asset is unavailable.
 
-`ensure_builtin_pet` is the main workflow. It first checks whether the destination file already exists and passes `validate_cached_spritesheet`; if so, it exits immediately. Otherwise it constructs a public HTTPS URL from the catalog entry, downloads the bytes with a hard timeout and byte limit, creates the parent assets directory, writes the payload to a uniquely named staging file, validates the staging image dimensions, and then attempts an atomic rename into place. If the rename fails—typically because another process raced to install the same asset—it revalidates the destination and accepts the race winner if valid, cleaning up the staging file. Only if the destination exists but is still invalid does it remove it and retry installation.
+A spritesheet is one image file that contains many animation frames, like a flipbook laid out in a grid. The TUI needs that grid to have exact dimensions. If the file is missing, damaged, too large, downloaded from an unsafe-looking URL, or the wrong size, the pet could fail to load or display incorrectly.
 
-The helper functions enforce important safety constraints: URLs must parse and use `https`, redirects are revalidated, oversized downloads are rejected both by `Content-Length` and by capped streaming reads, and cached spritesheets must exactly match the catalog’s expected width and height. Test-only helpers can populate a complete fake built-in pack by writing blank spritesheets with the correct geometry.
+The main flow is: build the cache path, check whether a valid file is already there, and if not, build the CDN URL and download the file with a timeout and size limit. The download is first written to a temporary staging file. Only after the image dimensions are checked is it moved into the final cache location. That staging step is like putting a package on an inspection table before shelving it; it avoids leaving half-written or invalid files where the rest of the app expects safe assets.
+
+The file also includes test-only helpers that create fake valid pet packs so other tests can run without reaching the network.
 
 #### Function details
 
@@ -4717,11 +4757,11 @@ The helper functions enforce important safety constraints: URLs must parse and u
 fn builtin_spritesheet_path(codex_home: &Path, file: &str) -> PathBuf
 ```
 
-**Purpose**: Computes the on-disk cache path for a built-in pet spritesheet file under the versioned pet asset pack. It is the canonical location used by both download/install and later model loading.
+**Purpose**: Builds the local file path where a built-in pet’s spritesheet should live in the cache. Callers use this when they need to read, validate, or test the cached image file.
 
-**Data flow**: Inputs are `codex_home: &Path` and the CDN filename `file: &str`. It derives `pack_dir(codex_home)`, appends `assets`, appends `file`, and returns the resulting `PathBuf`.
+**Data flow**: It receives the user’s CODEX_HOME directory and a spritesheet filename. It asks `pack_dir` for the versioned pet cache folder, adds the `assets` folder, then adds the filename. The result is a full path to the expected local image file.
 
-**Call relations**: Used by `ensure_builtin_pet` to choose the destination path and by tests to verify that `write_test_pack` installed all built-ins in the expected location.
+**Call relations**: The main download flow in `ensure_builtin_pet` uses this first to decide where the pet image belongs. The test `tests::write_test_pack_installs_all_builtins` also uses it to check that test spritesheets were written in the same place real code would look.
 
 *Call graph*: calls 1 internal fn (pack_dir); called by 2 (ensure_builtin_pet, write_test_pack_installs_all_builtins).
 
@@ -4732,11 +4772,11 @@ fn builtin_spritesheet_path(codex_home: &Path, file: &str) -> PathBuf
 fn ensure_builtin_pet(codex_home: &Path, pet: catalog::BuiltinPet) -> Result<()>
 ```
 
-**Purpose**: Ensures that a built-in pet’s spritesheet exists locally and has the exact expected dimensions, downloading and atomically installing it if necessary. It also tolerates concurrent installers by accepting a valid destination that appears after a failed rename.
+**Purpose**: Makes sure one built-in pet’s spritesheet is present locally and has the expected image dimensions. If the cached copy is missing or invalid, it downloads a fresh one and installs it safely.
 
-**Data flow**: Inputs are `codex_home` and a `catalog::BuiltinPet`. It computes the destination path, validates any existing cached file, otherwise builds the CDN URL, downloads bytes with `download_bytes_with_limit`, creates the parent directory, writes a uniquely named staging file, validates the staging image, tries `install_downloaded_spritesheet`, and on failure revalidates or replaces the destination. It writes directories/files under the cache and may remove invalid staging or destination files; it returns `Result<()>`.
+**Data flow**: It starts with CODEX_HOME and a built-in pet record, which includes the spritesheet filename. It turns that into a destination path, checks whether the existing file is valid, and returns immediately if it is. If not, it builds a CDN URL, downloads the bytes with a size limit, creates the cache directory, writes the bytes to a temporary staging file, validates that staging image, and then renames it into the final destination. If the rename has a conflict, it checks whether another valid file appeared in the meantime; otherwise it removes a bad destination and tries the install again. The output is success if a valid local spritesheet exists, or an error if it cannot safely provide one.
 
-**Call relations**: Called by the higher-level `ensure_builtin_pack_for_pet` orchestration only for catalog pets. It delegates URL construction, download, validation, and final rename to helpers so each failure mode is isolated and contextualized.
+**Call relations**: This is the central function called by the higher-level pet-pack flow, `ensure_builtin_pack_for_pet`. It coordinates the helpers in this file: `builtin_spritesheet_path` chooses the target, `builtin_pet_url` prepares the download address, `download_bytes_with_limit` fetches the file, `validate_cached_spritesheet` checks both cached and newly downloaded images, and `install_downloaded_spritesheet` performs the final move into place.
 
 *Call graph*: calls 5 internal fn (builtin_pet_url, builtin_spritesheet_path, download_bytes_with_limit, install_downloaded_spritesheet, validate_cached_spritesheet); called by 1 (ensure_builtin_pack_for_pet); 4 external calls (format!, create_dir_all, remove_file, write).
 
@@ -4747,11 +4787,11 @@ fn ensure_builtin_pet(codex_home: &Path, pet: catalog::BuiltinPet) -> Result<()>
 fn builtin_pet_url(pet: catalog::BuiltinPet) -> Result<String>
 ```
 
-**Purpose**: Builds the public CDN URL for a built-in pet’s spritesheet filename and validates that the resulting URL is acceptable for download. The filename itself is taken directly from the catalog entry.
+**Purpose**: Builds the public CDN URL for a built-in pet’s spritesheet. It also checks that the URL uses HTTPS, meaning the download must use an encrypted web connection.
 
-**Data flow**: Input is a `catalog::BuiltinPet`. It formats `https://persistent.oaistatic.com/codex/pets/v1/<spritesheet_file>`, passes that string through `validate_download_url`, and returns the validated URL string.
+**Data flow**: It receives a built-in pet record and reads its spritesheet filename. It appends that filename to the fixed Codex pet CDN base URL, validates the resulting URL, and returns the URL string if it is acceptable.
 
-**Call relations**: Used by `ensure_builtin_pet` before downloading and by a unit test that locks the public path format.
+**Call relations**: `ensure_builtin_pet` calls this when it needs to download a missing or invalid asset. The test `tests::builtin_pet_url_uses_public_cdn_path` calls it directly to make sure built-in pets point at the intended public CDN path.
 
 *Call graph*: calls 1 internal fn (validate_download_url); called by 2 (ensure_builtin_pet, builtin_pet_url_uses_public_cdn_path); 1 external calls (format!).
 
@@ -4762,11 +4802,11 @@ fn builtin_pet_url(pet: catalog::BuiltinPet) -> Result<String>
 fn pack_dir(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the root directory for the current built-in pet asset-pack version under `CODEX_HOME`. This isolates versioning so future asset-pack revisions can coexist cleanly.
+**Purpose**: Builds the versioned root directory for the built-in pet cache. The version part lets the project change cache layout or assets later without mixing old and new files.
 
-**Data flow**: Input is `codex_home: &Path`. It joins `cache/tui-pets` and the constant version string `v1`, returning a `PathBuf`.
+**Data flow**: It receives CODEX_HOME, appends the shared pet cache folder, then appends the current pet pack version. It returns that directory path.
 
-**Call relations**: Used by `builtin_spritesheet_path` and the test helper `write_test_pack` to keep all built-in asset paths under the same versioned root.
+**Call relations**: `builtin_spritesheet_path` uses this as the base for real cached assets. The test helper `write_test_pack` uses the same base so test files mimic the real cache layout.
 
 *Call graph*: called by 2 (builtin_spritesheet_path, write_test_pack); 1 external calls (join).
 
@@ -4777,11 +4817,11 @@ fn pack_dir(codex_home: &Path) -> PathBuf
 fn download_bytes_with_limit(url: &str, max_bytes: u64) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Downloads a pet asset over HTTPS with a fixed timeout and strict maximum size enforcement. It rejects oversized responses both before and during streaming.
+**Purpose**: Downloads a pet asset from the web while enforcing safety limits. It requires an HTTPS URL, uses a timeout, and refuses files larger than the configured maximum size.
 
-**Data flow**: Inputs are a URL string and `max_bytes`. It validates the URL, builds a blocking `reqwest` client with `PET_DOWNLOAD_TIMEOUT`, performs a GET, requires a successful HTTP status, revalidates the final response URL after redirects, checks `content_length` if present, then streams at most `max_bytes + 1` bytes into a `Vec<u8>` and errors if the actual byte count exceeds the limit. It returns the downloaded bytes.
+**Data flow**: It receives a URL and a maximum byte count. It validates the URL, creates a blocking HTTP client with a timeout, sends the request, rejects failed HTTP responses, and validates the final response URL too. It checks the server’s declared content length when available, then reads at most one byte more than the allowed size so it can detect oversized downloads even when the server did not declare the size. It returns the downloaded bytes, or an error if the download is unsafe, too large, slow, or unsuccessful.
 
-**Call relations**: Called only from `ensure_builtin_pet`. It delegates URL safety checks to `validate_download_url` and exists to keep network I/O and size-limit logic separate from installation flow.
+**Call relations**: `ensure_builtin_pet` calls this only after deciding the local cache cannot be trusted. It hands the returned bytes back to `ensure_builtin_pet`, which writes them to a staging file and validates the image before installing it.
 
 *Call graph*: calls 1 internal fn (validate_download_url); called by 1 (ensure_builtin_pet); 3 external calls (new, builder, bail!).
 
@@ -4792,11 +4832,11 @@ fn download_bytes_with_limit(url: &str, max_bytes: u64) -> Result<Vec<u8>>
 fn install_downloaded_spritesheet(staging: &Path, destination: &Path) -> Result<()>
 ```
 
-**Purpose**: Atomically installs a validated staging file into its final cache location using filesystem rename. This keeps callers from observing partially written spritesheets.
+**Purpose**: Moves a validated downloaded spritesheet from its temporary staging location into the final cache location. This is the last step that makes the asset visible to the rest of the app.
 
-**Data flow**: Inputs are `staging: &Path` and `destination: &Path`. It performs `fs::rename(staging, destination)` with contextual error reporting and returns `Result<()>`.
+**Data flow**: It receives two paths: the staging file and the destination file. It renames the staging file to the destination path. On success, the temporary file is gone and the final cached file exists; on failure, it returns an error explaining the failed install.
 
-**Call relations**: Used by `ensure_builtin_pet` after staging validation and again during the race-recovery path.
+**Call relations**: `ensure_builtin_pet` calls this after the staging file has passed image validation. If the first install attempt fails, `ensure_builtin_pet` decides whether another valid file already exists or whether it should remove a bad destination and try this install step again.
 
 *Call graph*: called by 1 (ensure_builtin_pet); 1 external calls (rename).
 
@@ -4807,11 +4847,11 @@ fn install_downloaded_spritesheet(staging: &Path, destination: &Path) -> Result<
 fn validate_download_url(value: &str) -> Result<()>
 ```
 
-**Purpose**: Rejects malformed or non-HTTPS download URLs before network access or after redirects. This prevents accidental use of unsupported schemes.
+**Purpose**: Checks that a pet asset download URL is valid and uses HTTPS. This prevents the downloader from accepting unsupported or less safe URL schemes.
 
-**Data flow**: Input is a URL string. It parses the string with `Url::parse`, checks that `url.scheme() == "https"`, and returns `Ok(())` or an error.
+**Data flow**: It receives a URL string, parses it as a URL, then inspects its scheme, which is the part like `https` at the front. If the URL cannot be parsed or does not use HTTPS, it returns an error. If it passes, it returns success without changing anything.
 
-**Call relations**: Called by both `builtin_pet_url` and `download_bytes_with_limit`, so both the initial URL and any redirected final URL must satisfy the same HTTPS-only rule.
+**Call relations**: `builtin_pet_url` uses this to check URLs built from the project’s CDN base and pet filename. `download_bytes_with_limit` uses it before making the request and again on the final response URL, so redirects cannot silently move the download to a non-HTTPS address.
 
 *Call graph*: called by 2 (builtin_pet_url, download_bytes_with_limit); 2 external calls (parse, bail!).
 
@@ -4822,11 +4862,11 @@ fn validate_download_url(value: &str) -> Result<()>
 fn validate_cached_spritesheet(path: &Path) -> Result<()>
 ```
 
-**Purpose**: Checks that a cached spritesheet file decodes successfully and matches the exact built-in catalog dimensions. It treats any mismatch as an invalid cache entry.
+**Purpose**: Checks whether a spritesheet file is structurally usable by reading its image dimensions. It makes sure the file is exactly the width and height the pet renderer expects.
 
-**Data flow**: Input is `path: &Path`. It reads image dimensions via `image::image_dimensions`, compares them against `catalog::SPRITESHEET_WIDTH` and `catalog::SPRITESHEET_HEIGHT`, and returns `Ok(())` or a descriptive error.
+**Data flow**: It receives a file path. It asks the image library to read the image dimensions from that file. If the width and height match the catalog’s expected spritesheet size, it returns success. If the file cannot be read or the dimensions are wrong, it returns an error that describes the problem.
 
-**Call relations**: This validator is used repeatedly by `ensure_builtin_pet` on both destination and staging files, and by tests to confirm that generated fixtures match the expected geometry.
+**Call relations**: `ensure_builtin_pet` uses this several times: first to trust an existing cache file, then to inspect the staging file after download, and later to see whether a valid destination file already appeared after an install conflict. The test `tests::write_test_pack_installs_all_builtins` uses it to confirm that test-generated spritesheets are valid.
 
 *Call graph*: called by 2 (ensure_builtin_pet, write_test_pack_installs_all_builtins); 2 external calls (bail!, image_dimensions).
 
@@ -4837,11 +4877,11 @@ fn validate_cached_spritesheet(path: &Path) -> Result<()>
 fn write_test_pack(codex_home: &Path)
 ```
 
-**Purpose**: Populates a temporary built-in asset pack with valid test spritesheets for every catalog pet. It exists only in test builds.
+**Purpose**: Creates a complete fake built-in pet asset pack for tests. This lets tests use the normal cache paths without downloading real files from the network.
 
-**Data flow**: Input is `codex_home: &Path`. It computes the assets directory under `pack_dir(codex_home)`, creates it, iterates `catalog::BUILTIN_PETS`, and for each pet writes a synthetic spritesheet file using `catalog::write_test_spritesheet`.
+**Data flow**: It receives a CODEX_HOME-like directory for a test. It builds the versioned assets directory, creates it, then loops over every built-in pet from the catalog and writes a test spritesheet file with the right filename. It changes the filesystem by creating directories and image files, and returns nothing.
 
-**Call relations**: Used by tests in this module and in the pet model module to simulate a fully installed built-in asset cache without network access.
+**Call relations**: The test `tests::write_test_pack_installs_all_builtins` calls this to verify the helper creates all expected files. Another test elsewhere, `load_builtin_pet_uses_app_catalog_storage`, also calls it so pet-loading code can run against a realistic local cache.
 
 *Call graph*: calls 2 internal fn (pack_dir, write_test_spritesheet); called by 2 (write_test_pack_installs_all_builtins, load_builtin_pet_uses_app_catalog_storage); 1 external calls (create_dir_all).
 
@@ -4852,11 +4892,11 @@ fn write_test_pack(codex_home: &Path)
 fn builtin_pet_url_uses_public_cdn_path()
 ```
 
-**Purpose**: Verifies that catalog pet ids map to the expected public CDN URL format. This protects the externally visible asset path contract.
+**Purpose**: Checks that the URL builder points a known built-in pet at the expected public CDN address. This guards against accidental changes to the CDN path format.
 
-**Data flow**: It looks up the `dewey` catalog entry, calls `builtin_pet_url`, unwraps the result, and asserts the returned string equals the expected CDN URL.
+**Data flow**: It looks up the built-in pet named `dewey`, passes that pet to `builtin_pet_url`, and compares the returned string with the exact expected URL. The test passes if they match and fails if the URL changes.
 
-**Call relations**: This test exercises `catalog::builtin_pet` plus `builtin_pet_url` together to lock down the URL-building convention.
+**Call relations**: This test exercises `builtin_pet_url` directly. It also uses the catalog lookup for a real built-in pet so the check reflects the actual pet metadata used by the app.
 
 *Call graph*: calls 2 internal fn (builtin_pet_url, builtin_pet); 1 external calls (assert_eq!).
 
@@ -4867,24 +4907,24 @@ fn builtin_pet_url_uses_public_cdn_path()
 fn write_test_pack_installs_all_builtins()
 ```
 
-**Purpose**: Checks that the test helper writes every built-in spritesheet into the correct cache location and that each file passes structural validation. It ensures the fixture generator mirrors production layout and dimensions.
+**Purpose**: Checks that the test pack helper writes every built-in pet spritesheet into the right cache location and that each file looks valid. This keeps the test fixture aligned with the real cache rules.
 
-**Data flow**: It creates a temporary directory, calls `write_test_pack`, iterates `catalog::BUILTIN_PETS`, computes each expected path with `builtin_spritesheet_path`, asserts the file exists, and validates it with `validate_cached_spritesheet`.
+**Data flow**: It creates a temporary directory, asks `write_test_pack` to fill it with built-in pet assets, then loops over every built-in pet. For each one, it builds the expected path with `builtin_spritesheet_path`, checks that a file exists there, and validates the image dimensions with `validate_cached_spritesheet`.
 
-**Call relations**: This test validates the interaction between `write_test_pack`, `builtin_spritesheet_path`, and `validate_cached_spritesheet`.
+**Call relations**: This test ties together the test helper and the real path and validation helpers. By using `write_test_pack`, `builtin_spritesheet_path`, and `validate_cached_spritesheet` together, it confirms that test-created assets are placed where production code expects them and meet the same shape requirements.
 
 *Call graph*: calls 3 internal fn (builtin_spritesheet_path, validate_cached_spritesheet, write_test_pack); 2 external calls (assert!, tempdir).
 
 
 ### `tui/src/pets/model.rs`
 
-`domain_logic` · `pet selection resolution and manifest load before frame extraction/rendering`
+`domain_logic` · `pet selection and loading, before rendering`
 
-This module is the pet-definition model layer. Its central type, `Pet`, contains normalized metadata: id, display name, description, local spritesheet path, frame geometry, frame count, and a map of named `Animation`s composed of `AnimationFrame { sprite_index, duration }`. The key invariant is that every returned `Pet` points to an existing local spritesheet whose dimensions exactly match the app’s canonical spritesheet size.
+This file is the pet loader and normalizer. A user or test can refer to a pet in several ways: by a built-in catalog id, by `custom:<id>`, by an older avatar folder, or by a direct filesystem path. This module turns all of those into one clear in-memory shape: a `Pet` with a real spritesheet file, frame size, grid layout, and named animations.
 
-`Pet::load_with_codex_home` dispatches selectors in priority order: path-like strings are treated as explicit filesystem paths; `custom:<id>` selectors force custom-pet lookup; otherwise built-in catalog ids are recognized first, and any remaining value falls back to custom-pet lookup. Built-ins load from the managed asset-pack path and receive the shared default geometry and default animation set. Custom and legacy avatar pets load `pet.json` or `avatar.json`, parse `PetFile`, derive display/id defaults, resolve a manifest-relative spritesheet path while forbidding absolute or parent-traversing escapes, validate spritesheet dimensions, validate the frame grid against the spritesheet, and load animations.
+The important promise is safety and consistency. By the time loading succeeds, the spritesheet exists, has the exact app-supported image size, and its frame grid covers the image exactly. This is like checking that a strip of film has the right number of frames before putting it in the projector. Without these checks, later drawing code could read the wrong image area, crash on missing files, or cache frames under the wrong identity.
 
-Animation loading starts from the built-in default animation map. If the manifest provides no animations, those defaults are retained. Otherwise each custom `AnimationSpec` is validated for non-empty frames, in-range sprite indices, finite FPS within `MAX_ANIMATION_FPS`, fallback naming, and loop shape; an `idle` animation is inserted if absent, and all fallback references are checked. The module also computes a frame-cache key by hashing spritesheet bytes plus frame geometry, ensuring cache invalidation when either art or slicing parameters change. The large test suite covers selector routing, defaults, cache-key behavior, path safety, frame-grid validation, and animation validation.
+The file supports built-in pets using catalog defaults, custom pets through `pet.json`, and legacy avatars through `avatar.json`. It also limits custom animation speed and frame counts so a bad manifest cannot create unreasonable work. For custom manifests, spritesheet paths must stay inside the pet folder, which prevents one pet definition from pointing at unrelated local files. The tests at the bottom document the expected defaults and many failure cases.
 
 #### Function details
 
@@ -4894,11 +4934,11 @@ Animation loading starts from the built-in default animation map. If the manifes
 fn total_duration(&self) -> Duration
 ```
 
-**Purpose**: Returns the sum of all frame durations in an animation. This is used to decide when non-looping animations have completed.
+**Purpose**: Adds up how long all frames in one animation last. The renderer can use this to know where a repeating animation cycle begins or ends in time.
 
-**Data flow**: It reads `self.frames`, maps each frame to `frame.duration`, sums them into a `Duration`, and returns the total.
+**Data flow**: It reads the animation's list of frames, takes each frame's duration, adds those durations together, and returns one total time value. It does not change the animation.
 
-**Call relations**: Used by ambient animation timing code when computing loop behavior and fallback transitions.
+**Call relations**: When `current_animation_frame` needs to pick the right frame for the current moment, it calls this helper to understand the full length of the animation timeline.
 
 *Call graph*: called by 1 (current_animation_frame).
 
@@ -4909,11 +4949,11 @@ fn total_duration(&self) -> Duration
 fn load_with_codex_home(value: &str, codex_home: Option<&Path>) -> Result<Self>
 ```
 
-**Purpose**: Resolves a user-facing pet selector into a concrete validated `Pet`, choosing among explicit paths, forced custom selectors, built-in catalog ids, and default custom lookup. It is the main entry point into the model layer.
+**Purpose**: Loads a pet from the user's selector text. It decides whether the text means a path, a custom pet, a built-in catalog pet, or a plain custom id.
 
-**Data flow**: Inputs are `value: &str` and optional `codex_home`. It checks `path_like(value)` first and delegates to `load_pet_path` if true; otherwise it strips the `custom:` prefix and delegates to `load_custom_pet`, or looks up a built-in via `catalog::builtin_pet` and delegates to `load_builtin_pet`, or finally falls back to `load_custom_pet(value, codex_home)`. It returns `Result<Pet>`.
+**Data flow**: It receives the selector string and an optional `CODEX_HOME` folder. It first checks if the selector looks like a filesystem path, then checks for the `custom:` prefix, then checks the built-in catalog, and finally treats the value as a custom id. It returns a fully validated `Pet` or an error explaining what could not be loaded.
 
-**Call relations**: Called by `AmbientPet::load` and many tests. It orchestrates selector routing while delegating actual loading and validation to the specialized helpers.
+**Call relations**: This is the main doorway into this file. Tests and higher-level loading code call it, and it delegates to `load_pet_path`, `load_custom_pet`, or `load_builtin_pet` depending on what kind of selector it sees.
 
 *Call graph*: calls 5 internal fn (builtin_pet, load_builtin_pet, load_custom_pet, load_pet_path, path_like); called by 9 (load, custom_pet_rejects_spritesheet_path_escape, custom_pet_selector_falls_back_to_legacy_avatar_manifest, custom_pet_selector_loads_codex_home_pet_manifest, load_builtin_pet_uses_app_catalog_storage, load_pet_error_from_dir, load_pet_from_dir, load_pet_json_path_uses_containing_directory, custom_pet_entries).
 
@@ -4924,11 +4964,11 @@ fn load_with_codex_home(value: &str, codex_home: Option<&Path>) -> Result<Self>
 fn frame_count(&self) -> usize
 ```
 
-**Purpose**: Returns the normalized number of frames in the pet’s frame grid. This is a simple accessor used by frame extraction code.
+**Purpose**: Returns how many sprite frames this pet has. Drawing code uses this to know the valid range of frame numbers.
 
-**Data flow**: It reads `self.frame_count` and returns it as `usize`.
+**Data flow**: It reads the already computed `frame_count` field from the `Pet` and returns it unchanged.
 
-**Call relations**: Used by `prepare_png_frames` when constructing the expected frame-cache file list.
+**Call relations**: Frame preparation code such as `prepare_png_frames` calls this when it needs to split a spritesheet into individual cached frames.
 
 *Call graph*: called by 1 (prepare_png_frames).
 
@@ -4939,11 +4979,11 @@ fn frame_count(&self) -> usize
 fn frame_cache_key(&self) -> Result<String>
 ```
 
-**Purpose**: Computes a stable cache key for extracted frames based on both spritesheet contents and frame geometry. This ensures frame caches are invalidated when either the image or slicing parameters change.
+**Purpose**: Builds a stable cache name for this pet's decoded frames. It changes when the spritesheet image or frame layout changes, so stale cached frames are not reused by mistake.
 
-**Data flow**: It reads the spritesheet bytes from `self.spritesheet_path`, hashes them with SHA-256, formats the digest together with `frame_width`, `frame_height`, `columns`, and `rows`, and returns the resulting `String` in a `Result`.
+**Data flow**: It reads the spritesheet bytes from disk, hashes them with SHA-256, then combines that hash with the frame width, frame height, column count, and row count. It returns a string such as a content fingerprint, or an error if the file cannot be read.
 
-**Call relations**: Used by `AmbientPet::load` to choose a frame-cache directory unique to the current spritesheet and frame spec.
+**Call relations**: Code that caches rendered frames can call this after a `Pet` has been loaded. The tests check that changing image contents or frame layout changes the resulting key.
 
 *Call graph*: 3 external calls (digest, format!, read).
 
@@ -4954,11 +4994,11 @@ fn frame_cache_key(&self) -> Result<String>
 fn default() -> Self
 ```
 
-**Purpose**: Provides the app’s canonical frame geometry for manifests that omit an explicit `frame` section. This keeps custom pets aligned with built-in spritesheet layout by default.
+**Purpose**: Provides the app's standard frame layout when a pet manifest does not specify one. This keeps simple custom pets from having to repeat the normal dimensions.
 
-**Data flow**: It returns a `FrameSpec` populated from `catalog::DEFAULT_FRAME_WIDTH`, `DEFAULT_FRAME_HEIGHT`, `DEFAULT_FRAME_COLUMNS`, and `DEFAULT_FRAME_ROWS`.
+**Data flow**: It reads default frame constants from the catalog and returns a `FrameSpec` containing the standard width, height, column count, and row count.
 
-**Call relations**: Used by `load_pet_manifest` when a manifest does not specify frame geometry.
+**Call relations**: Manifest loading uses this default inside `load_pet_manifest` when the JSON file leaves out the `frame` section.
 
 
 ##### `custom_pet_selector`  (lines 149–151)
@@ -4967,11 +5007,11 @@ fn default() -> Self
 fn custom_pet_selector(id: &str) -> String
 ```
 
-**Purpose**: Formats a custom pet id into the explicit `custom:<id>` selector syntax. This lets callers force custom-pet resolution even when an id might collide with a built-in.
+**Purpose**: Turns a custom pet id into the selector format used by the loader. For example, it makes the explicit form that starts with `custom:`.
 
-**Data flow**: Input is `id: &str`. It formats and returns `custom:<id>` as a `String`.
+**Data flow**: It receives a plain id string, prefixes it with the custom pet marker, and returns the combined selector string.
 
-**Call relations**: Used by tests and by higher-level code that needs an unambiguous selector for custom pet entries.
+**Call relations**: Tests and custom pet listing code use this to produce selector text that `Pet::load_with_codex_home` will route to `load_custom_pet`.
 
 *Call graph*: called by 4 (custom_pet_rejects_spritesheet_path_escape, custom_pet_selector_falls_back_to_legacy_avatar_manifest, custom_pet_selector_loads_codex_home_pet_manifest, custom_pet_entries); 1 external calls (format!).
 
@@ -4982,11 +5022,11 @@ fn custom_pet_selector(id: &str) -> String
 fn load_builtin_pet(pet: catalog::BuiltinPet, codex_home: Option<&Path>) -> Result<Pet>
 ```
 
-**Purpose**: Loads a built-in catalog pet from the managed asset-pack cache and attaches the shared default animation set. It assumes the asset has already been downloaded.
+**Purpose**: Creates a `Pet` for one of the built-in catalog pets. It assumes the built-in spritesheet has already been downloaded or installed under `CODEX_HOME`.
 
-**Data flow**: Inputs are a `catalog::BuiltinPet` and optional `codex_home`. It requires `codex_home`, computes the spritesheet path with `super::builtin_spritesheet_path`, errors if the file does not exist, and returns a `Pet` populated from catalog metadata, default frame geometry, `default_frame_count()`, and `default_animations()`.
+**Data flow**: It receives a catalog pet record and the `CODEX_HOME` path. It builds the expected spritesheet location, checks that the file exists, then returns a `Pet` filled with catalog names, descriptions, standard frame settings, and default animations.
 
-**Call relations**: Called only from `Pet::load_with_codex_home` after built-in catalog lookup. It depends on external orchestration to have run `ensure_builtin_pack_for_pet` first.
+**Call relations**: `Pet::load_with_codex_home` calls this after `catalog::builtin_pet` recognizes the selector as built-in. It relies on `default_frame_count` and `default_animations` to match the app's standard spritesheet layout.
 
 *Call graph*: calls 2 internal fn (default_animations, default_frame_count); called by 1 (load_with_codex_home); 2 external calls (bail!, builtin_spritesheet_path).
 
@@ -4997,11 +5037,11 @@ fn load_builtin_pet(pet: catalog::BuiltinPet, codex_home: Option<&Path>) -> Resu
 fn load_custom_pet(value: &str, codex_home: Option<&Path>) -> Result<Pet>
 ```
 
-**Purpose**: Loads a custom pet or legacy avatar by id from `CODEX_HOME`. It prefers `pets/<id>/pet.json` and falls back to `avatars/<id>/avatar.json`.
+**Purpose**: Loads a user-created pet from the app's home folder. It also supports the older avatar folder layout for backward compatibility.
 
-**Data flow**: Inputs are the selector value and optional `codex_home`. It requires `codex_home`, constructs `pets/<value>` and `avatars/<value>` directories, checks for `pet.json` or `avatar.json`, and delegates to `load_pet_manifest` with a cache id from `custom_pet_cache_id(value)`; if neither manifest exists it returns `unknown pet <value>`.
+**Data flow**: It receives a custom id and `CODEX_HOME`. It looks first in `CODEX_HOME/pets/<id>/pet.json`, then in `CODEX_HOME/avatars/<id>/avatar.json`. If it finds a manifest, it passes the folder to `load_pet_manifest`; otherwise it returns an unknown-pet error.
 
-**Call relations**: Called by `Pet::load_with_codex_home` for explicit custom selectors and as the final fallback for non-built-in ids.
+**Call relations**: `Pet::load_with_codex_home` calls this for `custom:<id>` selectors and for plain ids that are not built-ins. It uses `custom_pet_cache_id` so custom pets get cache ids distinct from built-in or path-loaded pets.
 
 *Call graph*: calls 2 internal fn (custom_pet_cache_id, load_pet_manifest); called by 1 (load_with_codex_home); 1 external calls (bail!).
 
@@ -5012,11 +5052,11 @@ fn load_custom_pet(value: &str, codex_home: Option<&Path>) -> Result<Pet>
 fn load_pet_path(value: &str) -> Result<Pet>
 ```
 
-**Purpose**: Loads a pet from an explicit filesystem path pointing either to a pet directory or directly to a manifest file. It canonicalizes the containing directory and supports both `pet.json` and legacy `avatar.json`.
+**Purpose**: Loads a pet from an explicit file or directory path. This is useful for tests and for local pet development outside the normal app home folder.
 
-**Data flow**: Input is a selector string path. It expands `~` via `expand_path`, reads metadata to distinguish file vs directory, chooses the containing directory, canonicalizes it, selects `pet.json` if present else `avatar.json`, derives a fallback id from the directory name or `pet`, and delegates to `load_pet_manifest(pet_dir, manifest_file, fallback_id, fallback_id)`.
+**Data flow**: It expands `~` if needed, checks whether the path is a directory or a file, uses the containing directory when given a manifest file, canonicalizes the directory, chooses `pet.json` or `avatar.json`, and then calls `load_pet_manifest`. It returns a validated `Pet` or an error if the path is invalid.
 
-**Call relations**: Called by `Pet::load_with_codex_home` whenever `path_like(value)` is true.
+**Call relations**: `Pet::load_with_codex_home` calls this whenever the selector looks path-like. It hands the actual parsing and validation work to `load_pet_manifest`.
 
 *Call graph*: calls 2 internal fn (expand_path, load_pet_manifest); called by 1 (load_with_codex_home); 2 external calls (bail!, metadata).
 
@@ -5032,11 +5072,11 @@ fn load_pet_manifest(
 ) -> Result<Pet>
 ```
 
-**Purpose**: Parses a pet manifest file, resolves and validates its spritesheet, normalizes ids and display metadata, validates frame geometry, and loads animations into a final `Pet`. It is the core manifest-to-model conversion routine.
+**Purpose**: Reads and validates a pet manifest file. This is where custom pet JSON becomes the normalized `Pet` object used by the rest of the app.
 
-**Data flow**: Inputs are `pet_dir`, `manifest_file`, `fallback_id`, and `cache_id`. It reads and parses the JSON manifest into `PetFile`, trims optional `id` and `displayName`, derives `display_name`, chooses `pet_id` based on whether `cache_id` equals `fallback_id`, trims `description`, resolves the spritesheet path with `resolve_spritesheet_path`, checks that the file exists, validates image dimensions with `validate_app_spritesheet_dimensions`, obtains a `FrameSpec` default if absent, validates the frame grid with `validate_frame_spec`, loads animations with `load_animations(file.animations, frame_count)`, and returns the assembled `Pet`.
+**Data flow**: It receives a pet directory, manifest filename, fallback id, and cache id. It reads the JSON, chooses an id and display name, resolves the spritesheet path safely, checks that the image exists and has the right size, validates the frame grid, loads animations, and returns a complete `Pet`.
 
-**Call relations**: Called by both `load_custom_pet` and `load_pet_path`. It delegates path safety, image validation, frame-grid validation, and animation normalization to dedicated helpers.
+**Call relations**: Both `load_custom_pet` and `load_pet_path` call this after they have found a manifest location. It coordinates the detailed helpers for path safety, image size checking, frame checking, and animation checking.
 
 *Call graph*: calls 4 internal fn (load_animations, resolve_spritesheet_path, validate_app_spritesheet_dimensions, validate_frame_spec); called by 2 (load_custom_pet, load_pet_path); 4 external calls (join, bail!, read_to_string, from_str).
 
@@ -5047,11 +5087,11 @@ fn load_pet_manifest(
 fn resolve_spritesheet_path(pet_dir: &Path, spritesheet_path: &str) -> Result<PathBuf>
 ```
 
-**Purpose**: Resolves a manifest-relative spritesheet path while forbidding absolute paths and parent-directory traversal. This keeps each custom pet self-contained inside its own directory.
+**Purpose**: Turns the manifest's spritesheet path into a real path while keeping it inside the pet folder. This prevents a pet file from reaching outside its own directory.
 
-**Data flow**: Inputs are `pet_dir: &Path` and `spritesheet_path: &str`. It constructs a `Path`, rejects it if absolute or if any component is `ParentDir` or Windows `Prefix`, otherwise joins it onto `pet_dir` and returns the resulting `PathBuf`.
+**Data flow**: It receives the pet directory and the path written in the manifest. If the path is absolute, uses `..`, or has a platform prefix, it returns an error. Otherwise it joins the path onto the pet directory and returns it.
 
-**Call relations**: Used only by `load_pet_manifest` before checking file existence and image dimensions.
+**Call relations**: `load_pet_manifest` calls this before checking the spritesheet file. It is the security gate that stops path escape tricks.
 
 *Call graph*: called by 1 (load_pet_manifest); 3 external calls (join, new, bail!).
 
@@ -5062,11 +5102,11 @@ fn resolve_spritesheet_path(pet_dir: &Path, spritesheet_path: &str) -> Result<Pa
 fn validate_app_spritesheet_dimensions(path: &Path) -> Result<(u32, u32)>
 ```
 
-**Purpose**: Ensures that a spritesheet image matches the app’s canonical full-sheet dimensions. Custom pets must still use the same overall sheet size even if they choose a different frame grid.
+**Purpose**: Checks that the spritesheet image has the exact pixel size the app supports. This keeps the later frame-splitting code simple and predictable.
 
-**Data flow**: Input is `path: &Path`. It reads image dimensions, compares them to `catalog::SPRITESHEET_WIDTH` and `catalog::SPRITESHEET_HEIGHT`, and returns `(width, height)` on success or an error on mismatch.
+**Data flow**: It receives an image path, reads the image dimensions, compares them with the catalog's required spritesheet width and height, and returns those dimensions if they match. If they do not match, it returns an error.
 
-**Call relations**: Called by `load_pet_manifest` before frame-grid validation.
+**Call relations**: `load_pet_manifest` calls this before validating the frame grid. The result becomes the real image size used by `validate_frame_spec`.
 
 *Call graph*: called by 1 (load_pet_manifest); 2 external calls (bail!, image_dimensions).
 
@@ -5081,11 +5121,11 @@ fn validate_frame_spec(
 ) -> Result<usize>
 ```
 
-**Purpose**: Checks that a frame grid is non-zero, exactly covers the spritesheet dimensions, and does not exceed the maximum allowed frame count. It converts the validated frame count into `usize` for later indexing.
+**Purpose**: Checks that the declared frame size and grid are usable. It makes sure the frames cover the whole spritesheet exactly and do not exceed the app's maximum count.
 
-**Data flow**: Inputs are `frame: &FrameSpec`, `spritesheet_width`, and `spritesheet_height`. It rejects zero width/height/columns/rows, computes total grid width and height with checked multiplication, compares them to the spritesheet dimensions, computes `columns * rows` with overflow checks, converts that count to `usize`, rejects counts above `MAX_PET_FRAMES`, and returns the validated frame count.
+**Data flow**: It receives a frame specification and the spritesheet's width and height. It rejects zero values, arithmetic overflow, mismatched total grid size, and too many frames. On success, it returns the calculated frame count.
 
-**Call relations**: Used by `load_pet_manifest` after image-dimension validation and before animation loading.
+**Call relations**: `load_pet_manifest` calls this after reading the image size. Its returned frame count is then used to validate animation frame references.
 
 *Call graph*: called by 1 (load_pet_manifest); 2 external calls (bail!, try_from).
 
@@ -5096,11 +5136,11 @@ fn validate_frame_spec(
 fn custom_pet_cache_id(id: &str) -> String
 ```
 
-**Purpose**: Builds the normalized cache id used for custom pets loaded from `CODEX_HOME`. This distinguishes custom pets from built-ins in frame-cache paths.
+**Purpose**: Creates the internal cache id for a custom pet. The prefix keeps custom pets from colliding with other pet ids.
 
-**Data flow**: Input is `id: &str`. It formats and returns `custom-<id>`.
+**Data flow**: It receives a custom id string, prefixes it with `custom-`, and returns the new string.
 
-**Call relations**: Used by `load_custom_pet` when passing a stable cache id into `load_pet_manifest`.
+**Call relations**: `load_custom_pet` uses this before calling `load_pet_manifest`, so the loaded `Pet` gets a cache-safe id.
 
 *Call graph*: called by 1 (load_custom_pet); 1 external calls (format!).
 
@@ -5111,11 +5151,11 @@ fn custom_pet_cache_id(id: &str) -> String
 fn path_like(value: &str) -> bool
 ```
 
-**Purpose**: Heuristically decides whether a selector string should be treated as a filesystem path rather than a pet id. It recognizes relative path markers, home-relative paths, absolute paths, and path separators.
+**Purpose**: Decides whether a selector looks like a filesystem path rather than a pet id. This lets users pass local folders or manifest files directly.
 
-**Data flow**: Input is `value: &str`. It returns true for `.`, `..`, strings starting with `~/`, `../`, or `./`, absolute paths, or any string containing `/` or `\`; otherwise false.
+**Data flow**: It receives the selector text and checks for path signs such as `.`, `..`, `~/`, slashes, backslashes, or an absolute path. It returns true if the selector should be treated as a path.
 
-**Call relations**: Used by `Pet::load_with_codex_home` as the first dispatch check so explicit paths take precedence over id-based lookup.
+**Call relations**: `Pet::load_with_codex_home` calls this first, before trying custom or built-in ids, so explicit paths are not confused with pet names.
 
 *Call graph*: called by 1 (load_with_codex_home); 1 external calls (new).
 
@@ -5126,11 +5166,11 @@ fn path_like(value: &str) -> bool
 fn expand_path(value: &str) -> Result<PathBuf>
 ```
 
-**Purpose**: Expands `~` and `~/...` selectors using the `HOME` environment variable. Other paths are returned unchanged as `PathBuf`s.
+**Purpose**: Expands a leading `~` into the user's home directory. This supports familiar shell-style paths such as `~/my-pet`.
 
-**Data flow**: Input is `value: &str`. If the value is `~` or starts with `~/`, it reads `HOME` from the environment and returns the home directory or a child path under it; otherwise it returns `PathBuf::from(value)`.
+**Data flow**: It receives a path string. If it is `~` or starts with `~/`, it reads the `HOME` environment variable and builds the expanded path. Otherwise it returns the path as written.
 
-**Call relations**: Called by `load_pet_path` before filesystem metadata lookup.
+**Call relations**: `load_pet_path` calls this before checking the path on disk.
 
 *Call graph*: called by 1 (load_pet_path); 2 external calls (from, var_os).
 
@@ -5144,11 +5184,11 @@ fn load_animations(
 ) -> Result<HashMap<String, Animation>>
 ```
 
-**Purpose**: Builds the final animation map for a pet by starting from default app animations and optionally overlaying validated manifest-defined animations. It also guarantees that an `idle` animation exists and that all fallback references are valid.
+**Purpose**: Builds the final animation map for a pet. It starts with the app's defaults, then applies any custom animations from the manifest.
 
-**Data flow**: Inputs are a `HashMap<String, AnimationSpec>` and `frame_count`. It initializes `animations` with `default_animations()`. If no specs are provided, it validates the defaults against `frame_count` and returns them. Otherwise it iterates each spec, rejects empty frame lists and out-of-range sprite indices, validates `fps` or defaults to 8.0, converts fps to per-frame `Duration`, chooses fallback `idle` when unspecified, derives `loop_start` from `loop_animation` defaulting to looping, inserts the constructed `Animation`, ensures `idle` exists via `or_insert_with(idle_animation)`, validates all animations with `validate_animation_indices`, and returns the map.
+**Data flow**: It receives animation specs from JSON and the pet's total frame count. For each custom animation it checks that frames exist, checks that frames are in range, chooses a safe frames-per-second value, converts speed into per-frame duration, sets looping and fallback behavior, and stores the result. It returns a validated map of named animations.
 
-**Call relations**: Called by `load_pet_manifest` and directly by a unit test. It delegates final consistency checks to `validate_animation_indices`.
+**Call relations**: `load_pet_manifest` calls this after it knows the frame count. It uses `default_animations` as a baseline and `validate_animation_indices` as the final consistency check.
 
 *Call graph*: calls 2 internal fn (default_animations, validate_animation_indices); called by 2 (load_pet_manifest, custom_animation_specs_keep_manifest_fps_and_loop_shape); 2 external calls (from_secs_f64, bail!).
 
@@ -5162,11 +5202,11 @@ fn validate_animation_indices(
 ) -> Result<()>
 ```
 
-**Purpose**: Performs cross-animation consistency checks after animation construction. It ensures every animation has frames, every sprite index is within range, and every fallback animation name exists in the map.
+**Purpose**: Checks that every animation is internally safe. It catches empty animations, frame numbers outside the spritesheet, and fallbacks that point to missing animation names.
 
-**Data flow**: Inputs are `animations: &HashMap<String, Animation>` and `frame_count`. It iterates all animations, rejects empty frame vectors, rejects any `frame.sprite_index >= frame_count`, checks `animations.contains_key(&animation.fallback)`, and returns `Result<()>`.
+**Data flow**: It receives the completed animation map and the pet's frame count. It walks every animation and every frame reference, returning success only if all frame indexes and fallback names are valid.
 
-**Call relations**: Used by `load_animations` both for the default-only path and after overlaying custom specs.
+**Call relations**: `load_animations` calls this both for all-default animations and after custom specs have been merged in.
 
 *Call graph*: called by 1 (load_animations); 1 external calls (bail!).
 
@@ -5177,11 +5217,11 @@ fn validate_animation_indices(
 fn default_frame_count() -> usize
 ```
 
-**Purpose**: Returns the number of frames implied by the canonical built-in grid dimensions. This is the built-in pet frame count and the baseline for many tests.
+**Purpose**: Returns the number of frames in the app's standard spritesheet layout. Built-in pets use this standard count.
 
-**Data flow**: It multiplies `catalog::DEFAULT_FRAME_COLUMNS * catalog::DEFAULT_FRAME_ROWS`, casts to `usize`, and returns the result.
+**Data flow**: It multiplies the catalog's default column count by the default row count and returns the result as a number of frames.
 
-**Call relations**: Used by `load_builtin_pet` and tests that need the canonical frame count.
+**Call relations**: `load_builtin_pet` uses this for built-in pets, and tests use it when checking custom animation loading against the default layout.
 
 *Call graph*: called by 2 (load_builtin_pet, custom_animation_specs_keep_manifest_fps_and_loop_shape).
 
@@ -5192,11 +5232,11 @@ fn default_frame_count() -> usize
 fn default_animations() -> HashMap<String, Animation>
 ```
 
-**Purpose**: Constructs the built-in/default animation map shared by built-in pets and by custom pets that omit animation definitions. It includes both current app-state names and legacy aliases.
+**Purpose**: Creates the app's built-in set of named pet animations. These include idle, movement, status, and older alias names.
 
-**Data flow**: It creates an array of `(name, Animation)` pairs including `idle`, directional movement, waving/jumping aliases, and notification-state animations like `failed`, `waiting`, `running`, and `review`. Most non-idle entries are built with `app_state_animation`, while `idle` uses `idle_animation`; the pairs are collected into a `HashMap<String, Animation>` and returned.
+**Data flow**: It constructs a map from animation names to `Animation` values. It uses `idle_animation` for the calm loop and `app_state_animation` for animations based on particular spritesheet rows.
 
-**Call relations**: Used by `load_builtin_pet`, `load_animations`, and several tests that verify row assignments and timing patterns.
+**Call relations**: Built-in pet loading uses this directly. Custom animation loading starts from this map and then replaces or adds entries from the manifest.
 
 *Call graph*: calls 2 internal fn (app_state_animation, idle_animation); called by 5 (load_animations, load_builtin_pet, app_idle_animation_uses_calm_loop, app_notification_states_use_expected_rows, app_running_animation_repeats_then_settles_into_idle).
 
@@ -5207,11 +5247,11 @@ fn default_animations() -> HashMap<String, Animation>
 fn idle_animation() -> Animation
 ```
 
-**Purpose**: Defines the calm looping idle animation used as the baseline and fallback for other animations. Its frame durations are intentionally uneven to create a less mechanical idle motion.
+**Purpose**: Defines the default calm idle animation. This is the resting behavior that many other animations fall back to.
 
-**Data flow**: It constructs an `Animation` whose frames are sprite indices 0 through 5 with fixed millisecond durations `[1680, 660, 660, 840, 840, 1920]`, `loop_start: Some(0)`, and fallback `idle`.
+**Data flow**: It creates a fixed list of sprite indexes and millisecond durations, marks the animation as looping from the start, and sets its fallback to itself.
 
-**Call relations**: Used directly by `default_animations` and appended by `app_state_animation` after repeated primary motion frames.
+**Call relations**: `default_animations` includes it as `idle`, and `app_state_animation` appends its frames so one-shot app-state animations can settle back into idle.
 
 *Call graph*: called by 2 (app_state_animation, default_animations).
 
@@ -5227,11 +5267,11 @@ fn app_state_animation(
 ) -> Animation
 ```
 
-**Purpose**: Builds a notification or movement animation from one spritesheet row, repeating its primary frames three times before settling into the idle sequence. The loop starts at the beginning of the repeated primary section after the initial pass-through.
+**Purpose**: Builds a standard animation from one row of the default spritesheet. It plays the active motion a few times, then transitions into idle.
 
-**Data flow**: Inputs are `row_index`, `frame_count`, `frame_duration_ms`, and `final_frame_duration_ms`. It creates `primary_frames` by mapping columns in the given row to sprite indices with the final frame receiving a longer duration, clones that sequence three times, appends `idle_animation().frames`, computes `primary_frame_count` as the length of the repeated primary section, and returns an `Animation` with `loop_start: Some(primary_frame_count)` and fallback `idle`.
+**Data flow**: It receives a row number, number of frames, normal frame duration, and final-frame duration. It turns that row into sprite indexes, repeats the primary sequence three times, appends idle frames, and returns an animation whose loop begins at the idle part.
 
-**Call relations**: Used by `default_animations` to generate all non-idle built-in/default animations.
+**Call relations**: `default_animations` calls this for running, waving, jumping, waiting, review, failed, and legacy alias animations.
 
 *Call graph*: calls 1 internal fn (idle_animation); called by 1 (default_animations).
 
@@ -5242,11 +5282,11 @@ fn app_state_animation(
 fn write_minimal_pet() -> tempfile::TempDir
 ```
 
-**Purpose**: Creates a temporary pet directory containing a minimal valid manifest and spritesheet. It is a convenience fixture for many model tests.
+**Purpose**: Creates a temporary pet folder with a simple valid manifest. Tests use it when they need a normal custom pet without repeating setup code.
 
-**Data flow**: It delegates to `write_pet_manifest` with a JSON manifest containing id, display name, description, and default spritesheet path, and returns the resulting `TempDir`.
+**Data flow**: It supplies a small JSON manifest with id, display name, description, and spritesheet path, then delegates to the test manifest writer. It returns the temporary directory.
 
-**Call relations**: Used by multiple tests that need a simple valid custom pet fixture.
+**Call relations**: Many tests call this before loading a pet through `load_pet_from_dir` or `Pet::load_with_codex_home`.
 
 *Call graph*: 1 external calls (write_pet_manifest).
 
@@ -5257,11 +5297,11 @@ fn write_minimal_pet() -> tempfile::TempDir
 fn write_pet_manifest(manifest: &str) -> tempfile::TempDir
 ```
 
-**Purpose**: Writes an arbitrary manifest string plus a valid test spritesheet into a temporary directory. This is the low-level fixture builder for manifest-loading tests.
+**Purpose**: Writes a test pet manifest and a matching test spritesheet into a temporary folder. This gives tests realistic files on disk.
 
-**Data flow**: Input is a manifest JSON string. It creates a temp directory, writes `pet.json`, writes a valid `spritesheet.webp` via `catalog::write_test_spritesheet`, and returns the directory.
+**Data flow**: It creates a temporary directory, writes `pet.json` with the provided text, writes a valid test spritesheet image, and returns the directory.
 
-**Call relations**: Used by `write_minimal_pet` and many validation tests to create custom manifest scenarios.
+**Call relations**: Test helpers and validation tests use this to create both valid and intentionally invalid manifests.
 
 *Call graph*: calls 1 internal fn (write_test_spritesheet); 2 external calls (write, tempdir).
 
@@ -5272,11 +5312,11 @@ fn write_pet_manifest(manifest: &str) -> tempfile::TempDir
 fn load_pet_from_dir(dir: &tempfile::TempDir) -> Pet
 ```
 
-**Purpose**: Loads a pet from a temporary directory fixture and unwraps success. It reduces repetition in tests that expect valid manifests.
+**Purpose**: Loads a pet from a temporary directory and expects success. It keeps successful-load tests short.
 
-**Data flow**: Input is `&tempfile::TempDir`. It converts the directory path to `&str`, calls `Pet::load_with_codex_home(..., None)`, unwraps the result, and returns the `Pet`.
+**Data flow**: It takes a temporary directory, converts its path to text, calls `Pet::load_with_codex_home` with no app home folder, unwraps the successful result, and returns the `Pet`.
 
-**Call relations**: Used by several tests that validate successful path-based loading.
+**Call relations**: Tests that verify valid manifests and cache-key behavior call this helper.
 
 *Call graph*: calls 1 internal fn (load_with_codex_home); 1 external calls (path).
 
@@ -5287,11 +5327,11 @@ fn load_pet_from_dir(dir: &tempfile::TempDir) -> Pet
 fn load_pet_error_from_dir(dir: &tempfile::TempDir) -> anyhow::Error
 ```
 
-**Purpose**: Loads a pet from a temporary directory fixture and unwraps the error. It is a convenience helper for negative validation tests.
+**Purpose**: Attempts to load a pet from a temporary directory and expects failure. It keeps rejection tests focused on the error being checked.
 
-**Data flow**: Input is `&tempfile::TempDir`. It converts the directory path to `&str`, calls `Pet::load_with_codex_home(..., None)`, unwraps the error, and returns it.
+**Data flow**: It takes a temporary directory, passes its path to `Pet::load_with_codex_home`, unwraps the error, and returns that error.
 
-**Call relations**: Used by tests that verify specific manifest validation failures.
+**Call relations**: Validation tests call this after writing bad manifests, then inspect the error message.
 
 *Call graph*: calls 1 internal fn (load_with_codex_home); 1 external calls (path).
 
@@ -5302,11 +5342,11 @@ fn load_pet_error_from_dir(dir: &tempfile::TempDir) -> anyhow::Error
 fn load_builtin_pet_uses_app_catalog_storage()
 ```
 
-**Purpose**: Verifies that built-in pet loading reads metadata from the catalog and spritesheets from the managed asset-pack location. It also checks the default frame geometry.
+**Purpose**: Checks that a built-in pet loads from the app's catalog storage and receives the expected metadata and frame layout.
 
-**Data flow**: It creates a temporary `CODEX_HOME`, populates it with `write_test_pack`, loads `dewey` via `Pet::load_with_codex_home`, and asserts the resulting id, display name, description, spritesheet path, frame width/height, and grid dimensions.
+**Data flow**: It creates a temporary app home, writes a test built-in asset pack, loads the built-in pet `dewey`, and compares the resulting id, display name, description, spritesheet path, and frame settings with expected values.
 
-**Call relations**: This test exercises the built-in branch of `Pet::load_with_codex_home` and `load_builtin_pet`.
+**Call relations**: This test exercises `Pet::load_with_codex_home`, which routes to `load_builtin_pet`.
 
 *Call graph*: calls 2 internal fn (write_test_pack, load_with_codex_home); 2 external calls (assert_eq!, tempdir).
 
@@ -5317,11 +5357,11 @@ fn load_builtin_pet_uses_app_catalog_storage()
 fn app_idle_animation_uses_calm_loop()
 ```
 
-**Purpose**: Checks the exact sprite indices, durations, and loop point of the default idle animation. This locks down the intended idle motion profile.
+**Purpose**: Checks that the default idle animation uses the expected sprite order, timing, and loop start.
 
-**Data flow**: It builds `default_animations()`, selects `idle`, derives sprite indices and durations via helper functions, and asserts they match the expected vectors and `loop_start`.
+**Data flow**: It builds default animations, selects `idle`, and compares its sprite indexes, durations, and loop setting against fixed expected values.
 
-**Call relations**: This test validates `idle_animation` as exposed through `default_animations`.
+**Call relations**: This test documents the behavior of `default_animations` and `idle_animation`.
 
 *Call graph*: calls 1 internal fn (default_animations); 1 external calls (assert_eq!).
 
@@ -5332,11 +5372,11 @@ fn app_idle_animation_uses_calm_loop()
 fn app_running_animation_repeats_then_settles_into_idle()
 ```
 
-**Purpose**: Verifies the structure of the default `running` animation: three repetitions of the primary row frames followed by the idle sequence. It also checks the longer final-frame duration and loop start.
+**Purpose**: Checks that the running animation plays its motion several times and then settles into idle. This confirms the intended transition shape.
 
-**Data flow**: It builds `default_animations()`, selects `running`, compares slices of sprite indices and durations against expected vectors, and asserts the loop start equals 18.
+**Data flow**: It builds default animations, inspects the `running` animation, verifies that its primary frames repeat three times, verifies that idle frames follow, and checks the timing and loop point.
 
-**Call relations**: This test validates the composition logic in `app_state_animation` as used by `default_animations`.
+**Call relations**: This test covers `default_animations`, especially the `app_state_animation` pattern.
 
 *Call graph*: calls 1 internal fn (default_animations); 2 external calls (assert_eq!, vec!).
 
@@ -5347,11 +5387,11 @@ fn app_running_animation_repeats_then_settles_into_idle()
 fn app_notification_states_use_expected_rows()
 ```
 
-**Purpose**: Checks that the default `waiting`, `review`, and `failed` animations pull frames from the intended spritesheet rows. This protects the semantic-to-row mapping.
+**Purpose**: Checks that notification-related animations use the intended rows of the spritesheet. This guards against accidentally moving status animations to the wrong sprites.
 
-**Data flow**: It builds `default_animations()`, extracts the first frames of the named animations, and asserts their sprite indices match the expected row-based sequences.
+**Data flow**: It builds default animations and compares the first frame indexes for `waiting`, `review`, and `failed` with the expected row-based indexes.
 
-**Call relations**: This test validates the row-index arguments passed to `app_state_animation` inside `default_animations`.
+**Call relations**: This test verifies the row choices made inside `default_animations` through `app_state_animation`.
 
 *Call graph*: calls 1 internal fn (default_animations); 1 external calls (assert_eq!).
 
@@ -5362,11 +5402,11 @@ fn app_notification_states_use_expected_rows()
 fn custom_animation_specs_keep_manifest_fps_and_loop_shape()
 ```
 
-**Purpose**: Verifies that manifest-defined animations preserve explicit FPS and non-looping behavior rather than being normalized to default timings. It also checks fallback preservation.
+**Purpose**: Checks that custom animation settings from a manifest are preserved. In particular, it verifies speed, non-looping behavior, and fallback name.
 
-**Data flow**: It calls `load_animations` with a custom spec containing frames `[1,2]`, `fps: 2.0`, `loop: false`, and fallback `idle`, then asserts the resulting animation has sprite indices `[1,2]`, durations `[500,500]`, `loop_start: None`, and fallback `idle`.
+**Data flow**: It creates one custom animation spec with frames, frames-per-second, no loop, and idle fallback. It loads animations and checks the resulting frame indexes, durations, loop setting, and fallback.
 
-**Call relations**: This test directly exercises the custom-spec branch of `load_animations`.
+**Call relations**: This test calls `load_animations` directly and uses `default_frame_count` to provide a valid frame range.
 
 *Call graph*: calls 2 internal fn (default_frame_count, load_animations); 3 external calls (from, assert_eq!, vec!).
 
@@ -5377,11 +5417,11 @@ fn custom_animation_specs_keep_manifest_fps_and_loop_shape()
 fn load_pet_directory_uses_app_pet_manifest_defaults()
 ```
 
-**Purpose**: Checks that a minimal manifest inherits the default frame geometry and default animations. This is the baseline custom-pet loading behavior.
+**Purpose**: Checks that a simple custom pet directory loads correctly using default frame and animation settings. This proves minimal manifests are enough.
 
-**Data flow**: It creates a minimal pet fixture, loads it with `load_pet_from_dir`, and asserts id, display name, frame geometry, frame count, and presence of idle animation frames.
+**Data flow**: It writes a minimal pet folder, loads it, and compares id, display name, frame settings, frame count, and existence of idle animation with expected defaults.
 
-**Call relations**: This test exercises `load_pet_manifest` with omitted `frame` and `animations` fields.
+**Call relations**: This test goes through `load_pet_from_dir`, which calls `Pet::load_with_codex_home` and then the path-based manifest loader.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, load_pet_from_dir, write_minimal_pet).
 
@@ -5392,11 +5432,11 @@ fn load_pet_directory_uses_app_pet_manifest_defaults()
 fn frame_cache_key_changes_with_spritesheet_contents()
 ```
 
-**Purpose**: Verifies that the frame-cache key changes when the spritesheet bytes change, even if the manifest stays the same. This protects frame-cache invalidation on asset updates.
+**Purpose**: Checks that the frame cache key changes when the image file changes. This prevents stale decoded frames from being reused after image edits.
 
-**Data flow**: It creates a minimal pet, loads it and records `frame_cache_key`, overwrites the spritesheet with a different solid-color image of the same dimensions, reloads the pet, and asserts the new key differs from the old one.
+**Data flow**: It writes and loads a minimal pet, records its cache key, overwrites the spritesheet with a different image, reloads the pet, and asserts that the new cache key is different.
 
-**Call relations**: This test exercises `Pet::frame_cache_key` and the content-hash portion of its output.
+**Call relations**: This test exercises `Pet::frame_cache_key` after loading pets through the normal path flow.
 
 *Call graph*: 5 external calls (assert_ne!, Rgba, from_pixel, load_pet_from_dir, write_minimal_pet).
 
@@ -5407,11 +5447,11 @@ fn frame_cache_key_changes_with_spritesheet_contents()
 fn frame_cache_key_changes_with_frame_spec()
 ```
 
-**Purpose**: Checks that the frame-cache key also changes when frame geometry changes, even if the spritesheet contents are structurally valid. This prevents cache collisions between different slicing schemes.
+**Purpose**: Checks that the frame cache key changes when the same spritesheet is interpreted with a different frame grid. This matters because different grids produce different cut-out frames.
 
-**Data flow**: It loads one pet with default frame spec and another with a custom `frame` section over the same-sized spritesheet, computes both cache keys, and asserts they differ.
+**Data flow**: It loads one pet with the default frame layout and another with a custom frame layout, then compares their cache keys and expects them to differ.
 
-**Call relations**: This test validates the geometry suffix included by `Pet::frame_cache_key`.
+**Call relations**: This test uses `write_minimal_pet`, `write_pet_manifest`, `load_pet_from_dir`, and `Pet::frame_cache_key`.
 
 *Call graph*: 4 external calls (assert_ne!, load_pet_from_dir, write_minimal_pet, write_pet_manifest).
 
@@ -5422,11 +5462,11 @@ fn frame_cache_key_changes_with_frame_spec()
 fn load_pet_json_path_uses_containing_directory()
 ```
 
-**Purpose**: Verifies that passing a direct path to `pet.json` loads the pet relative to that file’s containing directory. This supports explicit manifest-file selectors.
+**Purpose**: Checks that passing a direct `pet.json` path loads assets relative to that file's folder. This supports convenient local testing.
 
-**Data flow**: It creates a minimal pet fixture, calls `Pet::load_with_codex_home` on the `pet.json` path string, canonicalizes the expected spritesheet path, and asserts the loaded `pet.spritesheet_path` matches it.
+**Data flow**: It writes a minimal pet, passes the path to its `pet.json` into `Pet::load_with_codex_home`, and confirms the resolved spritesheet path is the canonical file beside that manifest.
 
-**Call relations**: This test exercises the file-path branch of `load_pet_path`.
+**Call relations**: This test exercises the path branch of `Pet::load_with_codex_home` and the directory selection inside `load_pet_path`.
 
 *Call graph*: calls 1 internal fn (load_with_codex_home); 2 external calls (assert_eq!, write_minimal_pet).
 
@@ -5437,11 +5477,11 @@ fn load_pet_json_path_uses_containing_directory()
 fn custom_pet_selector_loads_codex_home_pet_manifest()
 ```
 
-**Purpose**: Checks that `custom:<id>` selectors load from `CODEX_HOME/pets/<id>/pet.json` and assign the normalized custom cache id. This ensures explicit custom selection bypasses built-in lookup.
+**Purpose**: Checks that a `custom:<id>` selector loads a pet from `CODEX_HOME/pets/<id>`. It also verifies the internal custom cache id.
 
-**Data flow**: It creates a minimal pet fixture, copies its manifest and spritesheet into `CODEX_HOME/pets/chefito`, loads `custom:chefito`, and asserts the resulting id is `custom-chefito` and the spritesheet path points into the `pets` directory.
+**Data flow**: It creates a temporary app home, copies a valid manifest and spritesheet into the custom pets folder, loads with `custom_pet_selector`, and checks the pet id and spritesheet path.
 
-**Call relations**: This test exercises `custom_pet_selector`, `Pet::load_with_codex_home`, and `load_custom_pet` on the primary custom-pet path.
+**Call relations**: This test covers `custom_pet_selector`, `Pet::load_with_codex_home`, `load_custom_pet`, and `load_pet_manifest` working together.
 
 *Call graph*: calls 2 internal fn (load_with_codex_home, custom_pet_selector); 5 external calls (assert_eq!, copy, create_dir_all, tempdir, write_minimal_pet).
 
@@ -5452,11 +5492,11 @@ fn custom_pet_selector_loads_codex_home_pet_manifest()
 fn custom_pet_selector_falls_back_to_legacy_avatar_manifest()
 ```
 
-**Purpose**: Verifies that explicit custom selectors also support legacy avatar storage under `CODEX_HOME/avatars/<id>/avatar.json`. This preserves backward compatibility with older pet storage.
+**Purpose**: Checks that old avatar folders still load as custom pets. This protects users who have older local pet data.
 
-**Data flow**: It creates a minimal pet fixture, copies its manifest as `avatar.json` plus spritesheet into `CODEX_HOME/avatars/legacy`, loads `custom:legacy`, and asserts the resulting id is `custom-legacy` and display name is preserved.
+**Data flow**: It creates `CODEX_HOME/avatars/<id>/avatar.json` with a valid spritesheet, loads using a `custom:<id>` selector, and verifies the custom id and display name.
 
-**Call relations**: This test exercises the legacy-avatar fallback branch in `load_custom_pet`.
+**Call relations**: This test exercises the legacy fallback branch in `load_custom_pet`.
 
 *Call graph*: calls 2 internal fn (load_with_codex_home, custom_pet_selector); 5 external calls (assert_eq!, copy, create_dir_all, tempdir, write_minimal_pet).
 
@@ -5467,11 +5507,11 @@ fn custom_pet_selector_falls_back_to_legacy_avatar_manifest()
 fn custom_pet_rejects_spritesheet_path_escape()
 ```
 
-**Purpose**: Checks that manifests cannot reference spritesheets outside their own directory via `..` traversal. This enforces the self-contained custom-pet invariant.
+**Purpose**: Checks that a custom manifest cannot point its spritesheet outside the pet directory. This is an important local-file safety rule.
 
-**Data flow**: It creates `CODEX_HOME/pets/escape/pet.json` with `spritesheetPath: ../spritesheet.webp`, loads `custom:escape`, captures the error, and asserts the message mentions that the spritesheet path must stay inside the pet directory.
+**Data flow**: It writes a manifest whose spritesheet path uses `..`, tries to load it as a custom pet, and asserts that the error says the path must stay inside the pet folder.
 
-**Call relations**: This test validates `resolve_spritesheet_path` as reached through `load_pet_manifest`.
+**Call relations**: This test reaches `resolve_spritesheet_path` through `Pet::load_with_codex_home` and `load_custom_pet`.
 
 *Call graph*: calls 2 internal fn (load_with_codex_home, custom_pet_selector); 4 external calls (assert!, create_dir_all, write, tempdir).
 
@@ -5482,11 +5522,11 @@ fn custom_pet_rejects_spritesheet_path_escape()
 fn custom_pet_rejects_zero_frame_dimensions()
 ```
 
-**Purpose**: Verifies that frame specs with zero dimensions or counts are rejected. This prevents invalid slicing geometry.
+**Purpose**: Checks that frame width, height, columns, and rows cannot be zero. Zero values would make the spritesheet impossible to split sensibly.
 
-**Data flow**: It writes a manifest with `frame.width = 0`, loads it expecting failure via `load_pet_error_from_dir`, and asserts the error mentions non-zero frame dimensions and grid counts.
+**Data flow**: It writes a manifest with a zero frame width, loads expecting an error, and confirms the error mentions non-zero frame dimensions and grid counts.
 
-**Call relations**: This test exercises the zero-check branch in `validate_frame_spec`.
+**Call relations**: This test exercises `validate_frame_spec` through the normal manifest loading path.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5497,11 +5537,11 @@ fn custom_pet_rejects_zero_frame_dimensions()
 fn custom_pet_rejects_frame_grid_that_does_not_cover_spritesheet()
 ```
 
-**Purpose**: Checks that the frame grid must exactly cover the spritesheet dimensions. Partial coverage or mismatch is not allowed.
+**Purpose**: Checks that the declared frame grid must exactly cover the spritesheet. A partial grid would make frame indexes ambiguous or wrong.
 
-**Data flow**: It writes a manifest with a 7×9 grid over the canonical spritesheet, loads it expecting failure, and asserts the error mentions exact coverage of the spritesheet.
+**Data flow**: It writes a manifest whose columns do not span the full image width, loads expecting an error, and confirms the error mentions exact coverage.
 
-**Call relations**: This test validates the total-width/total-height comparison in `validate_frame_spec`.
+**Call relations**: This test reaches `validate_frame_spec` after `validate_app_spritesheet_dimensions` succeeds.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5512,11 +5552,11 @@ fn custom_pet_rejects_frame_grid_that_does_not_cover_spritesheet()
 fn custom_pet_rejects_excessive_frame_count()
 ```
 
-**Purpose**: Verifies that extremely dense frame grids exceeding `MAX_PET_FRAMES` are rejected. This bounds memory and indexing assumptions.
+**Purpose**: Checks that a pet cannot declare an unreasonably large number of frames. This protects the app from excessive memory or processing work.
 
-**Data flow**: It writes a manifest with a huge 192×234 frame grid, loads it expecting failure, and asserts the error mentions exceeding the maximum.
+**Data flow**: It writes a manifest with a very dense frame grid, loads expecting an error, and confirms the error mentions the maximum frame count.
 
-**Call relations**: This test exercises the frame-count upper-bound check in `validate_frame_spec`.
+**Call relations**: This test covers the frame-count limit enforced by `validate_frame_spec`.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5527,11 +5567,11 @@ fn custom_pet_rejects_excessive_frame_count()
 fn custom_pet_rejects_empty_animation_frames()
 ```
 
-**Purpose**: Checks that custom animations must contain at least one frame. Empty animation definitions are invalid.
+**Purpose**: Checks that every custom animation must contain at least one frame. An animation with no frames could not be displayed.
 
-**Data flow**: It writes a manifest whose `idle` animation has an empty `frames` array, loads it expecting failure, and asserts the error mentions that the animation must include at least one frame.
+**Data flow**: It writes a manifest where `idle` has an empty frame list, loads expecting an error, and checks the message.
 
-**Call relations**: This test validates the early empty-frame rejection in `load_animations`.
+**Call relations**: This test exercises the empty-frame validation inside `load_animations`.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5542,11 +5582,11 @@ fn custom_pet_rejects_empty_animation_frames()
 fn custom_pet_rejects_animation_frame_outside_grid()
 ```
 
-**Purpose**: Verifies that animation sprite indices must be within the validated frame count. References past the end of the grid are rejected.
+**Purpose**: Checks that animations cannot refer to frame numbers beyond the pet's frame grid. This prevents drawing from outside the spritesheet.
 
-**Data flow**: It writes a manifest whose `idle` animation references sprite index 72 on a 72-frame sheet, loads it expecting failure, and asserts the error mentions the out-of-range index.
+**Data flow**: It writes a manifest where `idle` refers to frame 72 in a 72-frame zero-based grid, loads expecting an error, and checks the message.
 
-**Call relations**: This test exercises the sprite-index bounds check in `load_animations`.
+**Call relations**: This test covers frame reference validation in `load_animations` and `validate_animation_indices`.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5557,11 +5597,11 @@ fn custom_pet_rejects_animation_frame_outside_grid()
 fn custom_pet_rejects_invalid_animation_fps()
 ```
 
-**Purpose**: Checks that custom animation FPS must be finite, positive, and no greater than `MAX_ANIMATION_FPS`. Excessive or invalid FPS values are rejected.
+**Purpose**: Checks that custom animation speed must stay within the allowed range. This prevents impossible, infinite, or too-fast animation timing.
 
-**Data flow**: It writes a manifest with `fps: 120.0`, loads it expecting failure, and asserts the error mentions the allowed FPS range.
+**Data flow**: It writes a manifest with `fps` set above the maximum, loads expecting an error, and checks that the message mentions the allowed range.
 
-**Call relations**: This test validates the FPS validation branch in `load_animations`.
+**Call relations**: This test exercises the frames-per-second validation inside `load_animations`.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5572,11 +5612,11 @@ fn custom_pet_rejects_invalid_animation_fps()
 fn custom_pet_rejects_animation_fallback_to_missing_animation()
 ```
 
-**Purpose**: Verifies that non-looping animations cannot name a fallback animation that does not exist. Fallback references are checked after all animations are assembled.
+**Purpose**: Checks that an animation's fallback must name an existing animation. A missing fallback would leave non-looping animations with nowhere to go.
 
-**Data flow**: It writes a manifest with a `wave` animation whose fallback is `missing`, loads it expecting failure, and asserts the error mentions the missing fallback animation.
+**Data flow**: It writes a manifest with a `wave` animation whose fallback is `missing`, loads expecting an error, and checks that the missing fallback is reported.
 
-**Call relations**: This test exercises `validate_animation_indices` after custom animation insertion.
+**Call relations**: This test reaches `validate_animation_indices` through `load_animations`.
 
 *Call graph*: 3 external calls (assert!, load_pet_error_from_dir, write_pet_manifest).
 
@@ -5587,11 +5627,11 @@ fn custom_pet_rejects_animation_fallback_to_missing_animation()
 fn sprite_indices(animation: &Animation) -> Vec<usize>
 ```
 
-**Purpose**: Extracts the sprite indices from an animation into a vector for concise assertions in tests. It is a pure inspection helper.
+**Purpose**: Extracts just the sprite numbers from an animation for easy test comparisons. It keeps test assertions readable.
 
-**Data flow**: Input is `&Animation`. It iterates `animation.frames`, maps each frame to `frame.sprite_index`, collects into `Vec<usize>`, and returns it.
+**Data flow**: It receives an animation, walks its frames, collects each frame's `sprite_index`, and returns the list of indexes.
 
-**Call relations**: Used by animation-structure tests to compare expected frame sequences.
+**Call relations**: Several animation tests call this helper after building `default_animations` or custom animations.
 
 
 ##### `tests::durations_ms`  (lines 1029–1035)
@@ -5600,8 +5640,8 @@ fn sprite_indices(animation: &Animation) -> Vec<usize>
 fn durations_ms(animation: &Animation) -> Vec<u128>
 ```
 
-**Purpose**: Extracts frame durations in milliseconds from an animation for test assertions. It simplifies checking timing patterns.
+**Purpose**: Extracts frame durations in milliseconds from an animation for easy test comparisons. This avoids repeating conversion code in each test.
 
-**Data flow**: Input is `&Animation`. It iterates `animation.frames`, maps each frame to `frame.duration.as_millis()`, collects into `Vec<u128>`, and returns it.
+**Data flow**: It receives an animation, walks its frames, converts each duration to milliseconds, and returns the list of millisecond values.
 
-**Call relations**: Used by tests that verify idle and running animation timing.
+**Call relations**: Animation timing tests call this helper when checking idle, running, and custom animation durations.

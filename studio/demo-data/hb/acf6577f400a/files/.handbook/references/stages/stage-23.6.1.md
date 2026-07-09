@@ -1,10 +1,6 @@
 # Analytics and telemetry tests  `stage-23.6.1`
 
-This stage is cross-cutting test infrastructure for the system’s observability layer. Rather than participating in startup or the main loop itself, it verifies that analytics events, metrics, logs, and traces emitted throughout the codebase are encoded, routed, filtered, and exported correctly.
-
-The otel integration crate is the backbone: tests.rs assembles the suite, suite/mod.rs organizes scenarios, and harness/mod.rs provides in-memory exporters and metric-inspection helpers. The suite then checks specific behaviors: validation rejects bad metric inputs; timing covers duration histograms and timer recording; send exercises exporter delivery and shutdown; snapshot reads live metric state; runtime_summary and manager_metrics verify SessionTelemetry aggregation and tagging; otel_export_routing_policy checks how fields are split between logs and trace events; and otlp_http_loopback confirms real OTLP/HTTP payloads and constraints.
-
-Outside the otel package, analytics client tests cover destination selection, batching, serialization, reducer behavior, metadata inheritance, and lifecycle accounting. App-server analytics tests verify default enablement and emitted payload inspection. Core and state tests confirm exact metric names and tags, tracing-event field emission, broad request/tool/sandbox telemetry regressions, and SQLite log filtering for OpenTelemetry SDK noise.
+This stage is a behind-the-scenes safety check for observability: the code that records what the system is doing. “Telemetry” means measurements, logs, and traces that help developers understand sessions without inspecting them by hand. The OpenTelemetry test entry files, tests.rs and suite/mod.rs, assemble the test suite, while harness/mod.rs provides an in-memory fake metrics collector. The validation, timing, send, snapshot, runtime_summary, manager_metrics, export-routing, and HTTP loopback tests check that metrics reject bad input, record durations, flush correctly, can be read immediately, summarize runtime activity, carry the right labels, route sensitive details safely, and can be exported to a local fake collector. The analytics client tests check that app-server activity becomes the right analytics events, with batching and privacy limits. The app-server analytics tests decide when analytics should run and provide HTTP capture helpers. Core task and utility tests verify telemetry tags for proxy use, memory, compaction, feedback, authentication failures, and thread names. The main core OpenTelemetry test checks session logs and traces. The state log filter test keeps noisy low-level SDK messages out of the user-facing log database.
 
 ## Files in this stage
 
@@ -13,25 +9,31 @@ These files define the OpenTelemetry integration test crate, organize its suite 
 
 ### `otel/tests/tests.rs`
 
-`test` · `test crate setup and execution`
+`test` · `test discovery and test compilation`
 
-This file is the root of the `otel/tests` integration test crate. It begins with `#![allow(clippy::expect_used)]`, explicitly relaxing a lint that would otherwise complain about `expect` calls in test code; that signals the test suite prefers direct, fail-fast assertions over production-style error propagation. It then declares two modules: `harness` and `suite`. `harness` is the shared support layer for spinning up fixtures, test environments, or common assertions, while `suite` is the collection of scenario-focused test modules declared in `suite/mod.rs`. There is no runtime logic here beyond crate assembly, but this file is still important because integration tests in Rust are compiled as separate crates rooted at files like this one. The file therefore controls what helper code and test cases are visible to the test runner, and it establishes the boundary between reusable test infrastructure and the actual OpenTelemetry behavior checks.
+This file is like the front door for a group of tests. It does not contain test cases itself. Instead, it connects two nearby modules: `harness`, which likely provides shared test setup and helper tools, and `suite`, which likely contains the actual test scenarios.
+
+The first line relaxes one lint rule from Clippy, Rust’s extra code checker. Normally, Clippy may warn when tests use `expect`, a helper that stops the test with a clear message if something goes wrong. In test code, that is often acceptable because a failed setup should usually fail loudly and explain why. This file allows that style for this test target.
+
+Without this file, Rust would not know to compile and run the `harness` and `suite` modules as part of this integration test. In everyday terms, it is the table of contents for this test package: short, but necessary for the rest of the tests to be found.
 
 
 ### `otel/tests/suite/mod.rs`
 
 `test` · `test discovery and compilation`
 
-This file contains no executable logic; its entire job is to define the structure of the `otel` test suite by declaring eight sibling submodules: `manager_metrics`, `otel_export_routing_policy`, `otlp_http_loopback`, `runtime_summary`, `send`, `snapshot`, `timing`, and `validation`. In Rust test code, this kind of `mod.rs` acts as the compilation-time manifest for the suite: each listed module becomes part of the `suite` tree and can contribute tests, helpers, fixtures, or assertions. The design keeps scenario-specific test code split by concern rather than accumulating all OpenTelemetry coverage in one file. That matters for discoverability: readers can infer the suite covers metrics emitted by the manager, export routing behavior, OTLP HTTP loopback behavior, runtime summaries, send paths, snapshotting, timing-sensitive behavior, and validation rules. Because there are no items re-exported here, consumers access content through the module hierarchy itself, and the file's only state is the static module graph it establishes at compile time.
+This file does not contain test logic itself. Instead, it names the separate test files that make up the OpenTelemetry test suite, such as tests for metric management, export routing, loopback HTTP behavior, runtime summaries, sending data, snapshots, timing, and validation. In Rust, a `mod` line is like putting a chapter into a book: it makes another source file part of the current module tree. Without this file, those test modules would not be connected here, so the test runner might not discover or compile them as part of this suite. Its main job is organization. It keeps the suite split into focused files while still presenting them as one coherent group of tests.
 
 
 ### `otel/tests/harness/mod.rs`
 
-`test` · `test setup and metric assertion helpers`
+`test` · `test execution`
 
-This file is a test-only harness around the metrics subsystem. Its main helper, `build_metrics_with_defaults`, creates an `InMemoryMetricExporter`, builds a `MetricsConfig::in_memory` using fixed test environment/service metadata, applies any supplied default tags through repeated `with_tag` calls, and returns both the resulting `MetricsClient` and the exporter so tests can emit metrics and inspect what was exported.
+This file exists so metrics tests can be clear and repeatable. In normal use, metrics may be sent to an outside telemetry system. In tests, that would be slow, flaky, and hard to inspect. Instead, this harness builds a MetricsClient connected to an in-memory exporter, which is like a notebook that records every metric the code tried to send.
 
-The remaining helpers navigate OpenTelemetry SDK metric data structures. `latest_metrics` fetches the exporter’s finished metric batches, takes the last `ResourceMetrics` snapshot, and panics with clear messages if nothing has been exported yet. `find_metric` walks `scope_metrics()` and then `metrics()` to locate a metric by name across instrumentation scopes. `attributes_to_map` converts an iterator of `KeyValue` references into a `BTreeMap<String, String>` for deterministic assertions on tags/attributes. `histogram_data` is a specialized extractor for floating-point histogram metrics: it finds the named metric, asserts there is exactly one data point, and returns the bucket bounds, bucket counts, sum, and count as plain Rust values. It panics on unexpected aggregation or metric data types, which is appropriate for tests because those mismatches indicate the test setup or metric definition is wrong rather than a recoverable runtime condition.
+The helpers cover the common steps most tests need. First, build_metrics_with_defaults creates a test metrics setup and optionally adds default tags, which are labels attached to every metric, such as service names or metadata. After the code under test records metrics, latest_metrics pulls out the most recent batch from the in-memory exporter. find_metric searches that batch by metric name. attributes_to_map turns OpenTelemetry key-value labels into a simple sorted map, making assertions easier to read. histogram_data extracts bucket boundaries, bucket counts, sum, and total count from a histogram metric, while deliberately failing fast if the metric is missing or is not shaped like the test expects.
+
+Together these helpers keep individual tests focused on the behavior they care about, rather than on the plumbing needed to read OpenTelemetry data structures.
 
 #### Function details
 
@@ -43,11 +45,11 @@ fn build_metrics_with_defaults(
 ) -> Result<(MetricsClient, InMemoryMetricExporter)>
 ```
 
-**Purpose**: Creates a metrics client backed by an in-memory exporter and preloads any requested default tags. It is the standard fixture constructor for metrics tests.
+**Purpose**: Creates a ready-to-use metrics client for tests, connected to an in-memory exporter instead of a real telemetry backend. Tests use it when they need to record metrics and then inspect exactly what was produced.
 
-**Data flow**: Takes `default_tags: &[(&str, &str)]` → creates `InMemoryMetricExporter::default()` → builds `MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter.clone())` → folds over `default_tags`, applying each via `config.with_tag(*key, *value)?` → constructs `MetricsClient::new(config)?` → returns `Ok((metrics, exporter))`.
+**Data flow**: It receives a list of default tag key-value pairs. It creates an in-memory exporter, builds a test MetricsConfig using the package version and fixed test service details, adds each default tag to that config, then constructs a MetricsClient. It returns both the client, which records metrics, and the exporter, which stores the recorded output for later inspection.
 
-**Call relations**: Many metrics tests call this first to obtain a ready-to-use client and inspectable exporter. It delegates actual config and client validation to production code (`MetricsConfig` and `MetricsClient`).
+**Call relations**: Many metrics tests start here before exercising the code they want to check. This helper relies on the metrics configuration builder and MetricsClient constructor, then hands the client to the test and the exporter to later helpers such as latest_metrics.
 
 *Call graph*: calls 2 internal fn (new, in_memory); called by 13 (manager_allows_disabling_metadata_tags, manager_attaches_metadata_tags_to_metrics, manager_attaches_optional_service_name_tag, manager_records_plugin_install_elicitation_sent_metric, manager_records_plugin_install_suggestion_metric, client_sends_enqueued_metric, send_builds_payload_with_tags_and_histograms, send_merges_default_tags_per_line, shutdown_flushes_in_memory_exporter, shutdown_without_metrics_exports_nothing (+3 more)); 2 external calls (default, env!).
 
@@ -58,11 +60,11 @@ fn build_metrics_with_defaults(
 fn latest_metrics(exporter: &InMemoryMetricExporter) -> ResourceMetrics
 ```
 
-**Purpose**: Returns the most recently exported `ResourceMetrics` batch from the in-memory exporter. It gives tests a single snapshot to inspect after emitting metrics.
+**Purpose**: Gets the newest exported metrics batch from the in-memory exporter. Tests use it after recording metrics so they can inspect the final captured data.
 
-**Data flow**: Accepts `&InMemoryMetricExporter` → calls `get_finished_metrics()` and expects success → converts the finished batches into an iterator, takes `.last()`, and expects one batch to exist → returns that `ResourceMetrics`.
+**Data flow**: It receives an in-memory exporter. It asks the exporter for all finished metric batches, takes the last one, and returns it as ResourceMetrics. If no finished metrics are available, it stops the test with a clear failure message.
 
-**Call relations**: Tests call this after recording metrics to inspect the latest export cycle. It is often paired with `find_metric`, `attributes_to_map`, or `histogram_data`.
+**Call relations**: After tests create a metrics client with build_metrics_with_defaults and record one or more metrics, they call this helper to retrieve the captured batch. The returned ResourceMetrics is then commonly passed to find_metric or histogram_data for detailed checks.
 
 *Call graph*: called by 12 (manager_allows_disabling_metadata_tags, manager_attaches_metadata_tags_to_metrics, manager_attaches_optional_service_name_tag, manager_records_plugin_install_elicitation_sent_metric, manager_records_plugin_install_suggestion_metric, client_sends_enqueued_metric, send_builds_payload_with_tags_and_histograms, send_merges_default_tags_per_line, shutdown_flushes_in_memory_exporter, record_duration_records_histogram (+2 more)); 1 external calls (get_finished_metrics).
 
@@ -76,11 +78,11 @@ fn find_metric(
 ) -> Option<&'a Metric>
 ```
 
-**Purpose**: Searches a `ResourceMetrics` tree for a metric with a given name across all instrumentation scopes. It abstracts away the nested OpenTelemetry SDK structure.
+**Purpose**: Looks through a captured metrics batch and finds the metric with a given name. This saves tests from repeating the nested OpenTelemetry search code.
 
-**Data flow**: Takes `&ResourceMetrics` and `name: &str` → iterates through `resource_metrics.scope_metrics()` and then each scope’s `metrics()` → compares `metric.name()` to `name` → returns `Some(&Metric)` on the first match or `None` if absent.
+**Data flow**: It receives a ResourceMetrics object and a metric name. It walks through the grouped metric data, checks each metric's name, and returns the matching metric if one is found. If there is no match, it returns nothing.
 
-**Call relations**: This helper is used directly by many tests and by `histogram_data`. It centralizes the traversal logic so tests do not repeat nested loops.
+**Call relations**: Tests call this directly when they want to assert that a named metric exists and inspect it themselves. histogram_data also uses it first, because extracting histogram values only makes sense after locating the named metric.
 
 *Call graph*: called by 15 (histogram_data, manager_allows_disabling_metadata_tags, manager_attaches_metadata_tags_to_metrics, manager_attaches_optional_service_name_tag, manager_records_plugin_install_elicitation_sent_metric, manager_records_plugin_install_suggestion_metric, client_sends_enqueued_metric, send_builds_payload_with_tags_and_histograms, send_merges_default_tags_per_line, shutdown_flushes_in_memory_exporter (+5 more)); 1 external calls (scope_metrics).
 
@@ -93,11 +95,11 @@ fn attributes_to_map(
 ) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Converts a metric attribute iterator into a deterministic `BTreeMap` for easy equality assertions. It normalizes OpenTelemetry `KeyValue` objects into owned strings.
+**Purpose**: Turns metric attributes, which are OpenTelemetry key-value labels, into an ordinary sorted map of strings. This makes test assertions simpler and more readable.
 
-**Data flow**: Accepts any iterator yielding `&KeyValue` → maps each item to `(kv.key.as_str().to_string(), kv.value.as_str().to_string())` → collects into `BTreeMap<String, String>` and returns it.
+**Data flow**: It receives an iterator over KeyValue attributes. For each attribute, it converts the key and value into owned strings, then collects them into a BTreeMap, which keeps keys in a stable sorted order. It returns that map without changing the original metric data.
 
-**Call relations**: Tests use this after locating a metric or data point to compare exported attributes against expected tag sets without depending on iteration order.
+**Call relations**: After a test finds a metric or data point, it uses this helper to compare the metric's labels against expected tags. It is often used alongside latest_metrics and find_metric in tests that verify metadata or default tags.
 
 *Call graph*: called by 11 (manager_allows_disabling_metadata_tags, manager_attaches_metadata_tags_to_metrics, manager_attaches_optional_service_name_tag, manager_records_plugin_install_elicitation_sent_metric, manager_records_plugin_install_suggestion_metric, client_sends_enqueued_metric, send_builds_payload_with_tags_and_histograms, send_merges_default_tags_per_line, manager_snapshot_metrics_collects_without_shutdown, snapshot_collects_metrics_without_shutdown (+1 more)); 1 external calls (map).
 
@@ -111,11 +113,11 @@ fn histogram_data(
 ) -> (Vec<f64>, Vec<u64>, f64, u64)
 ```
 
-**Purpose**: Extracts the single data point from a named floating-point histogram metric and returns its bucket structure and totals in plain Rust collections. It is a convenience assertion helper for duration and histogram tests.
+**Purpose**: Extracts the important values from a named histogram metric so tests can check duration or bucket-based measurements. A histogram is a metric that groups observed numbers into ranges, like sorting temperatures into low, medium, and high buckets.
 
-**Data flow**: Takes `&ResourceMetrics` and metric `name` → finds the metric with `find_metric(...).expect(...)` → matches `metric.data()` expecting `AggregatedMetrics::F64(MetricData::Histogram(histogram))` → collects histogram data points into a vector, asserts there is exactly one point, then collects that point’s bounds and bucket counts and reads its sum and count → returns `(Vec<f64>, Vec<u64>, f64, u64)`; panics on unexpected metric type or aggregation.
+**Data flow**: It receives a captured ResourceMetrics object and a metric name. It finds the metric, verifies that it is a floating-point histogram with exactly one data point, then collects the bucket boundaries, bucket counts, total sum, and total count. It returns those four pieces as simple values; if the metric is missing or has an unexpected shape, it fails the test immediately.
 
-**Call relations**: Histogram-focused tests call this after `latest_metrics` to avoid manual pattern matching on SDK metric types. It depends on `find_metric` for lookup and intentionally panics when the exported metric shape is not the expected histogram form.
+**Call relations**: Tests that check timing and duration metrics call this after retrieving exported metrics with latest_metrics. Internally it delegates the name lookup to find_metric, then performs the stricter histogram-specific checks before handing simple data back to the test.
 
 *Call graph*: calls 1 internal fn (find_metric); called by 4 (send_builds_payload_with_tags_and_histograms, record_duration_records_histogram, record_duration_seconds_uses_fractional_seconds_and_scaled_buckets, timer_result_records_success); 2 external calls (assert_eq!, panic!).
 
@@ -125,11 +127,13 @@ These tests walk through the metrics client and session telemetry APIs from vali
 
 ### `otel/tests/suite/validation.rs`
 
-`test` · `input validation and error-path verification`
+`test` · `test run`
 
-This file is a focused negative-test suite for `MetricsClient` and `MetricsConfig`. The small helper `build_in_memory_client` constructs a valid in-memory metrics client used by the per-metric validation tests. The tests then deliberately supply malformed inputs and assert on the exact `MetricsError` variant and payload using `matches!` guards.
+This is a safety-check test file for the OpenTelemetry metrics layer. Metrics are small measurements the program records, such as counts or timing values. Tags are extra labels attached to those measurements, like adding a sticky note that says which route or feature produced the number. If metric names or tags are malformed, the monitoring data can become confusing, rejected by outside tools, or inconsistent across the system.
 
-Two classes of validation are covered. Configuration-time validation is exercised by calling `MetricsConfig::in_memory(...).with_tag("bad key", "value")`, which must reject an invalid default tag key before a client is even built. Runtime recording validation is exercised through `metrics.counter(...)` and `metrics.histogram(...)`: invalid per-call tag keys and values must be rejected, invalid metric names such as `"bad name"` must produce `MetricsError::InvalidMetricName`, and negative increments on counters must produce `MetricsError::NegativeCounterIncrement` carrying both the metric name and the offending increment. Each runtime test shuts the client down afterward to keep the metrics pipeline lifecycle clean even though recording failed. These tests document that validation happens early and returns structured, inspectable errors rather than silently sanitizing bad input.
+The file builds a lightweight metrics client that writes to an in-memory exporter instead of a real monitoring backend. That makes the tests fast and self-contained: they can ask, “Would this input be accepted?” without sending anything over the network.
+
+Each test deliberately gives the metrics API one bad piece of input. It then checks that the returned error is the specific expected error, not just any failure. This matters because callers can rely on precise error kinds to understand what went wrong. The tests cover invalid global config tags, invalid per-metric tag keys, invalid per-metric tag values, invalid metric names, and negative counter increments. In short, this file acts like a guardrail inspection: it proves the metrics client rejects bad labels and impossible counts before they enter the telemetry pipeline.
 
 #### Function details
 
@@ -139,11 +143,11 @@ Two classes of validation are covered. Configuration-time validation is exercise
 fn build_in_memory_client() -> Result<MetricsClient>
 ```
 
-**Purpose**: Creates a valid in-memory `MetricsClient` fixture for validation tests. It centralizes the standard test configuration so each negative test can focus on one invalid input.
+**Purpose**: Creates a metrics client for tests that records data in memory rather than sending it to an external service. This lets validation tests exercise the real metrics API without depending on a live monitoring system.
 
-**Data flow**: It constructs an `InMemoryMetricExporter`, builds a `MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)`, and passes that config to `MetricsClient::new`. It returns the resulting `Result<MetricsClient>`.
+**Data flow**: It starts with no inputs. It creates a default in-memory metric exporter, builds a metrics configuration for a test service using the package version, and passes that configuration into the metrics client constructor. The result is either a ready-to-use MetricsClient or an error if the client cannot be created.
 
-**Call relations**: This helper is called by the runtime validation tests for invalid tag keys/values, invalid metric names, and negative increments. It provides the baseline valid client those tests intentionally misuse.
+**Call relations**: The validation tests call this helper when they need a working metrics client before trying one bad metric operation. It relies on the metrics configuration builder and client constructor, so the tests use the same setup path as normal code, just with an in-memory destination.
 
 *Call graph*: calls 2 internal fn (new, in_memory); called by 4 (counter_rejects_invalid_metric_name, counter_rejects_invalid_tag_key, counter_rejects_negative_increment, histogram_rejects_invalid_tag_value); 2 external calls (default, env!).
 
@@ -154,11 +158,11 @@ fn build_in_memory_client() -> Result<MetricsClient>
 fn invalid_tag_component_is_rejected() -> Result<()>
 ```
 
-**Purpose**: Verifies that invalid default tag components are rejected during metrics configuration building. It specifically checks the error payload for a bad tag key containing a space.
+**Purpose**: Checks that a bad tag key is rejected while building the metrics configuration. This protects the system from starting with globally attached labels that outside telemetry tools may not accept.
 
-**Data flow**: It creates an in-memory metrics config with a fresh `InMemoryMetricExporter`, calls `.with_tag("bad key", "value")`, unwraps the resulting error, and asserts via `matches!` that the error is `MetricsError::InvalidTagComponent` with `label == "tag key"` and `value == "bad key"`.
+**Data flow**: It builds an in-memory metrics configuration and then tries to add the tag key "bad key" with value "value". Because the key contains a space, the call is expected to fail. The test unwraps the error and verifies that it is specifically an InvalidTagComponent error for a tag key with the bad value preserved.
 
-**Call relations**: This is the configuration-time validation test in the file. Unlike the others, it does not build a `MetricsClient`; it stops at config construction.
+**Call relations**: This test exercises configuration-time validation directly, without using the shared client helper. It calls the in-memory configuration builder and then checks the resulting error with an assertion, proving bad global tags are stopped before a MetricsClient is even created.
 
 *Call graph*: calls 1 internal fn (in_memory); 3 external calls (default, assert!, env!).
 
@@ -169,11 +173,11 @@ fn invalid_tag_component_is_rejected() -> Result<()>
 fn counter_rejects_invalid_tag_key() -> Result<()>
 ```
 
-**Purpose**: Checks that `MetricsClient::counter` validates per-call tag keys and rejects invalid ones. It confirms the returned error identifies the bad key as a tag-key problem.
+**Purpose**: Checks that a counter metric refuses a tag whose key is malformed. A counter is a number that only goes up, such as a request count or turn count.
 
-**Data flow**: It obtains a valid in-memory client from `build_in_memory_client()`, calls `metrics.counter("codex.turns", 1, &[("bad key", "value")])`, unwraps the error, and asserts that it matches `MetricsError::InvalidTagComponent` with the expected label and value. It then shuts the client down.
+**Data flow**: It first obtains a test MetricsClient from build_in_memory_client. Then it tries to record the counter "codex.turns" with an increment of 1 and a tag key of "bad key". The metric call returns an error instead of recording the value, and the test verifies that the error says the tag key is invalid. Finally, it shuts down the test client cleanly.
 
-**Call relations**: This test depends on `build_in_memory_client` for setup and exercises the counter recording path's input validation branch.
+**Call relations**: This test depends on build_in_memory_client for a real client configured with an in-memory exporter. After setup, it exercises the counter path and uses an assertion to confirm that per-metric tag validation catches the bad key at record time.
 
 *Call graph*: calls 1 internal fn (build_in_memory_client); 1 external calls (assert!).
 
@@ -184,11 +188,11 @@ fn counter_rejects_invalid_tag_key() -> Result<()>
 fn histogram_rejects_invalid_tag_value() -> Result<()>
 ```
 
-**Purpose**: Verifies that histogram recording validates tag values and rejects invalid ones. It distinguishes bad values from bad keys in the returned error.
+**Purpose**: Checks that a histogram metric refuses a malformed tag value. A histogram records measured values, such as request latency, so they can later be summarized into ranges or percentiles.
 
-**Data flow**: It builds a valid in-memory client, calls `metrics.histogram("codex.request_latency", 3, &[("route", "bad value")])`, unwraps the error, and asserts that it is `MetricsError::InvalidTagComponent` with `label == "tag value"` and `value == "bad value"`. It then shuts the client down.
+**Data flow**: It creates a test MetricsClient, then tries to record the histogram "codex.request_latency" with value 3 and a tag pair where the value is "bad value". Because the tag value contains invalid text, the call returns an InvalidTagComponent error. The test confirms the error names the tag value and includes the rejected value, then shuts down the client.
 
-**Call relations**: This test uses the shared client fixture and targets the histogram recording path's tag-value validation logic.
+**Call relations**: This test uses build_in_memory_client for setup, just like the counter validation tests. It then follows the histogram recording path and checks that validation happens before the bad measurement can enter the metrics pipeline.
 
 *Call graph*: calls 1 internal fn (build_in_memory_client); 1 external calls (assert!).
 
@@ -199,11 +203,11 @@ fn histogram_rejects_invalid_tag_value() -> Result<()>
 fn counter_rejects_invalid_metric_name() -> Result<()>
 ```
 
-**Purpose**: Checks that metric names are validated before recording and that malformed names are rejected with `InvalidMetricName`. It documents the error variant used for naming violations.
+**Purpose**: Checks that a counter cannot be recorded with an invalid metric name. This keeps metric names predictable and compatible with the telemetry system.
 
-**Data flow**: It creates a valid in-memory client, calls `metrics.counter("bad name", 1, &[])`, unwraps the error, and asserts that it matches `MetricsError::InvalidMetricName { name }` with `name == "bad name"`. It then shuts the client down.
+**Data flow**: It creates a test MetricsClient and then tries to record a counter named "bad name" with an increment of 1 and no tags. The space in the name makes it invalid, so the call returns an InvalidMetricName error. The test verifies the rejected name is reported correctly and then shuts down the client.
 
-**Call relations**: This test reuses `build_in_memory_client` and exercises the metric-name validation branch of the counter API.
+**Call relations**: This test gets its client from build_in_memory_client, then focuses on the metric-name validation inside the counter recording path. Its assertion proves that bad names are rejected separately from tag or counter-value problems.
 
 *Call graph*: calls 1 internal fn (build_in_memory_client); 1 external calls (assert!).
 
@@ -214,24 +218,24 @@ fn counter_rejects_invalid_metric_name() -> Result<()>
 fn counter_rejects_negative_increment() -> Result<()>
 ```
 
-**Purpose**: Verifies that counters reject negative increments rather than accepting them or coercing them. It checks that the error reports both the metric name and the invalid increment.
+**Purpose**: Checks that a counter refuses a negative increment. Since counters represent values that only increase, allowing a negative change would make the metric misleading.
 
-**Data flow**: It builds a valid in-memory client, calls `metrics.counter("codex.turns", -1, &[])`, unwraps the error, and asserts that it matches `MetricsError::NegativeCounterIncrement { name, inc }` with the expected values. It then shuts the client down.
+**Data flow**: It creates a test MetricsClient and tries to record the counter "codex.turns" with an increment of -1. The counter call returns a NegativeCounterIncrement error rather than recording the value. The test confirms both the metric name and the bad increment are included in the error, then shuts down the client.
 
-**Call relations**: This is the final runtime validation test and covers the numeric validation branch of the counter API using the shared client fixture.
+**Call relations**: This test uses build_in_memory_client for the common metrics setup, then exercises the counter-specific rule that increments must not be negative. The assertion ties the failure to the expected counter validation behavior.
 
 *Call graph*: calls 1 internal fn (build_in_memory_client); 1 external calls (assert!).
 
 
 ### `otel/tests/suite/timing.rs`
 
-`test` · `duration metric recording verification`
+`test` · `test run`
 
-This file concentrates on timing metrics emitted as histograms. All tests use the shared in-memory metrics harness, record one or more durations, shut the client down, and inspect the exported histogram data through `histogram_data` plus direct metric lookup. The first test covers `record_duration`, asserting that a 15 ms duration becomes a histogram named `codex.request_latency` with unit `ms`, description `Duration in milliseconds.`, non-empty bucket bounds, sum `15.0`, and count `1`.
+This is a test file for the project’s OpenTelemetry metrics support. OpenTelemetry is a standard way for software to report what it is doing, such as how long requests take. Here, the focus is timing: when the code records a duration, does that duration show up in the exported metrics in the shape other tools expect?
 
-The second test exercises `record_duration_seconds_with_description`, recording three durations—200 ms, 1 s, and 4.9 s—and asserting the exact bucket boundaries used for second-based histograms. It also checks the bucket counts vector, total sum `6.1`, count `3`, unit `s`, and the custom description string. This documents the scaled bucket scheme rather than merely checking that some histogram exists.
+The tests build a metrics system using a test exporter, record one or more durations, then shut the metrics system down so any buffered data is flushed. After that, they inspect the latest exported metrics. A histogram is like sorting measured times into labeled buckets: for example, “under 0.5 seconds” or “under 1 second.” These tests verify that the histogram has bucket boundaries, the right number of recorded events, the expected total sum, and the correct metric metadata.
 
-The final test covers the timer API by creating a timer with `start_timer` and letting it drop immediately. After shutdown it verifies that one histogram sample was recorded with the expected unit/description and that the `route=chat` attribute was preserved. Together these tests define the contract for explicit and scoped timing instrumentation.
+The file also checks two different time units. One path records milliseconds and expects the unit to be `ms`; another records seconds, including fractional seconds, and expects second-based bucket boundaries. The last test checks the timer object style, where starting a timer and then letting it go out of scope records one measurement automatically, like starting a stopwatch and logging the time when you put it down.
 
 #### Function details
 
@@ -241,11 +245,11 @@ The final test covers the timer API by creating a timer with `start_timer` and l
 fn record_duration_records_histogram() -> Result<()>
 ```
 
-**Purpose**: Verifies that recording a millisecond duration produces a histogram with the default millisecond unit and description. It checks both aggregate values and metric metadata.
+**Purpose**: This test proves that recording a duration in milliseconds creates a histogram metric. It also checks that the metric uses milliseconds as its unit and has the standard duration description.
 
-**Data flow**: It builds an in-memory metrics client, records `codex.request_latency` with a 15 ms `Duration` and tag `route=chat`, then shuts down. It reads the latest exported metrics, decodes histogram bounds, bucket counts, sum, and count for that metric, and then looks up the metric directly to assert its unit is `ms` and its description is `Duration in milliseconds.`.
+**Data flow**: The test starts with a fresh test metrics system and exporter. It records a 15 millisecond duration for the metric named `codex.request_latency`, with a `route=chat` label. After shutdown flushes the data, it reads the exported metrics, extracts the histogram, and checks that exactly one timing was counted, that the total is 15.0, and that the metric metadata says the unit is `ms` with the expected description.
 
-**Call relations**: This test is a direct consumer of the metrics timing API and uses the shared harness helpers to inspect the exported histogram after shutdown.
+**Call relations**: The Rust test runner calls this function as an individual test. Inside, it relies on `build_metrics_with_defaults` to create the test setup, `latest_metrics` to read what was exported, `histogram_data` to pull out the histogram details, and `find_metric` to inspect the metric’s unit and description.
 
 *Call graph*: calls 4 internal fn (build_metrics_with_defaults, find_metric, histogram_data, latest_metrics); 3 external calls (from_millis, assert!, assert_eq!).
 
@@ -256,11 +260,11 @@ fn record_duration_records_histogram() -> Result<()>
 fn record_duration_seconds_uses_fractional_seconds_and_scaled_buckets() -> Result<()>
 ```
 
-**Purpose**: Checks that second-based duration recording converts `Duration` values to fractional seconds and uses the expected bucket boundaries. It validates the exact histogram schema for second-unit timings.
+**Purpose**: This test proves that durations can be recorded in seconds, including fractional seconds, and that the histogram buckets are scaled for seconds rather than milliseconds. It protects against accidentally reporting second-based timings with the wrong unit or bucket layout.
 
-**Data flow**: It creates an in-memory metrics client, records three durations under `codex.request_duration_seconds` using `record_duration_seconds_with_description`, then shuts down. It reads the exported histogram data, asserts the exact `bounds` vector, the exact `bucket_counts` vector, the floating-point sum near `6.1`, and total count `3`, then looks up the metric to verify unit `s` and the custom description string.
+**Data flow**: The test creates a fresh metrics system and exporter, then records three durations: 0.2 seconds, 1 second, and 4.9 seconds. Each value is recorded under `codex.request_duration_seconds` with a method label and a custom description. After shutdown, the test reads the exported histogram and checks the exact second-based bucket boundaries, the bucket counts for the three measurements, the total sum of about 6.1 seconds, the count of 3, and the metric unit and description.
 
-**Call relations**: This test extends the basic duration test by covering the alternate seconds-based API and its bucket scaling behavior.
+**Call relations**: The Rust test runner calls this function during the test suite. The function uses `build_metrics_with_defaults` for setup, `latest_metrics` to retrieve exported results, `histogram_data` to inspect bucket boundaries and counts, and `find_metric` to confirm the metric’s public metadata.
 
 *Call graph*: calls 4 internal fn (build_metrics_with_defaults, find_metric, histogram_data, latest_metrics); 4 external calls (from_millis, from_secs, assert!, assert_eq!).
 
@@ -271,22 +275,24 @@ fn record_duration_seconds_uses_fractional_seconds_and_scaled_buckets() -> Resul
 fn timer_result_records_success() -> Result<()>
 ```
 
-**Purpose**: Verifies that the scoped timer API records a histogram sample when the timer is created and then dropped. It also checks that timer-supplied attributes are attached to the resulting histogram point.
+**Purpose**: This test checks the stopwatch-style timing API. It verifies that starting a timer succeeds and that dropping the timer records one histogram measurement with the original labels attached.
 
-**Data flow**: It builds an in-memory metrics client, starts a timer for `codex.request_latency` with `route=chat`, asserts timer creation succeeded, and lets the timer go out of scope. After shutdown it reads the histogram data for the metric, asserts one sample was recorded, verifies unit `ms` and description `Duration in milliseconds.`, then extracts the histogram point attributes and checks that `route=chat` is present.
+**Data flow**: The test creates a fresh metrics system and exporter, then starts a timer for `codex.request_latency` with the label `route=chat`. The timer is kept only inside a small block; when the block ends, the timer is dropped, which records the elapsed time. After shutdown, the test reads the exported histogram, checks that one measurement was recorded, confirms the unit and description, then converts the metric attributes into a simple map and checks that the `route` label is still `chat`.
 
-**Call relations**: This test covers the RAII-style timing path rather than explicit duration recording. It still relies on the shared harness helpers for post-shutdown histogram inspection.
+**Call relations**: The Rust test runner calls this function as part of the timing test suite. It uses `build_metrics_with_defaults` to prepare an isolated metrics environment, `latest_metrics` and `histogram_data` to verify the recorded timing, `find_metric` to locate the exported metric, and `attributes_to_map` to make the metric labels easy to compare.
 
 *Call graph*: calls 5 internal fn (attributes_to_map, build_metrics_with_defaults, find_metric, histogram_data, latest_metrics); 2 external calls (assert!, assert_eq!).
 
 
 ### `otel/tests/suite/send.rs`
 
-`test` · `metrics client send/flush verification`
+`test` · `test run`
 
-This file focuses on `MetricsClient` behavior independent of `SessionTelemetry`. The tests use `build_metrics_with_defaults` to create an in-memory metrics pipeline with optional default tags, record counters, histograms, and gauges, shut the client down, and inspect the exported `ResourceMetrics`. Assertions descend into concrete OpenTelemetry metric representations: counters are expected as `AggregatedMetrics::U64(MetricData::Sum)`, gauges as `AggregatedMetrics::I64(MetricData::Gauge)`, and latency metrics as histograms decoded through the shared `histogram_data` helper.
+This is a test file for the telemetry system, which is the part of the project that records measurements such as counters, histograms, and gauges. In plain terms, it checks that when Codex says “record one turn,” “record this tool latency,” or “record how many operations are active,” those measurements end up in the exported metrics data with the right names, values, descriptions, and labels.
 
-A key concern here is tag precedence. The tests show that default tags are merged per metric line and that per-call tags override defaults with the same key (`env=dev` overriding `env=prod`, or `service=worker` overriding `service=codex-cli`). They also verify that descriptions supplied through `counter_with_description` and `gauge_with_description` survive export unchanged. The histogram assertions check both bucket accounting and attribute propagation. Separate tests cover the asynchronous/background send path by recording a metric and ensuring it appears after shutdown, flushing semantics for in-memory exporters, and the no-op case where shutting down without recording anything yields no exported metrics at all. Together these tests document the exact payload shape and lifecycle of metric emission.
+The tests use an in-memory exporter, which is like a fake mailbox for metrics: instead of sending data over the network, the system drops the finished metrics into a place the test can inspect. Each test builds a metrics client, records one or more measurements, calls shutdown to force delivery, then reads back the exported metrics.
+
+A major focus is tags, also called attributes: small key-value labels such as service=codex-cli or env=prod. The file checks that default tags are added to every metric, that per-call tags can add more detail, and that a per-call tag can override a default tag when both use the same key. It also verifies that shutdown is safe both when there are queued metrics waiting to be sent and when no metrics were recorded at all.
 
 #### Function details
 
@@ -296,11 +302,11 @@ A key concern here is tag precedence. The tests show that default tags are merge
 fn send_builds_payload_with_tags_and_histograms() -> Result<()>
 ```
 
-**Purpose**: Verifies that counters, histograms, and gauges are exported with the correct descriptions, values, and merged tags. It also checks that per-call tags override defaults where keys collide.
+**Purpose**: This test checks the full shape of a metrics export when several metric types are recorded. It confirms that counters, histograms, and gauges keep their values, descriptions, and tags, including default tags and per-metric overrides.
 
-**Data flow**: It builds a metrics client with default tags `service=codex-cli` and `env=prod`, records a described counter with per-call tags `model=gpt-5.1` and `env=dev`, records a histogram for `codex.tool_latency`, records a described gauge for `codex.active`, and shuts the client down. It then reads the latest exported metrics, extracts and validates the counter description/value/attributes, decodes histogram bounds, bucket counts, sum, count, and attributes, and finally validates the gauge description, point value, and attributes.
+**Data flow**: The test starts by creating a metrics client with default tags for service and environment. It records a counter, a histogram, and a gauge, then shuts the client down so queued data is exported. It reads the exported metrics back from the in-memory exporter and compares what came out against the expected names, values, descriptions, bucket counts, sums, and attributes.
 
-**Call relations**: This top-level test drives several `MetricsClient` recording APIs in one flow and uses the shared harness helpers to inspect the exported metrics after shutdown.
+**Call relations**: This test drives the normal send path from the outside. It relies on the harness to build the metrics client, collect the latest exported data, find named metrics, convert attributes into an easy-to-compare map, and extract histogram details. It is run by the test framework to prove that the public recording methods produce the correct OpenTelemetry output.
 
 *Call graph*: calls 5 internal fn (attributes_to_map, build_metrics_with_defaults, find_metric, histogram_data, latest_metrics); 4 external calls (from, assert!, assert_eq!, panic!).
 
@@ -311,11 +317,11 @@ fn send_builds_payload_with_tags_and_histograms() -> Result<()>
 fn send_merges_default_tags_per_line() -> Result<()>
 ```
 
-**Purpose**: Checks that default tags are merged independently for each metric and that per-metric overrides apply only to the metric being recorded. It demonstrates line-by-line tag precedence.
+**Purpose**: This test checks the rule for combining default tags with tags supplied for one specific metric. It makes sure default tags are reused on every metric, but a metric-specific tag wins when it uses the same key.
 
-**Data flow**: It creates a metrics client with defaults `service=codex-cli`, `env=prod`, and `region=us`, records `codex.alpha` with overriding `env=dev` and `component=alpha`, records `codex.beta` with overriding `service=worker` and `component=beta`, then shuts down. It reads exported metrics, extracts the single counter point for each metric, converts attributes to maps, and compares them to the expected merged maps for alpha and beta separately.
+**Data flow**: The test creates a metrics client with default service, environment, and region tags. It records two counters: one overrides the environment, and the other overrides the service. After shutdown, it reads each exported counter and checks that the final attributes are the expected merged set for that individual metric.
 
-**Call relations**: This test is invoked directly by the test runner and focuses specifically on tag-merging semantics. It reuses the harness metric lookup and attribute conversion helpers.
+**Call relations**: This test focuses on tag-merging behavior in the send flow. It uses the shared harness to create the test metrics setup and inspect the exported results, then uses assertions to lock in the intended precedence rule so later changes do not accidentally change how labels are attached.
 
 *Call graph*: calls 4 internal fn (attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics); 3 external calls (from, assert_eq!, panic!).
 
@@ -326,11 +332,11 @@ fn send_merges_default_tags_per_line() -> Result<()>
 fn client_sends_enqueued_metric() -> Result<()>
 ```
 
-**Purpose**: Verifies that a metric queued for background processing is actually exported once the client is shut down. It confirms the asynchronous send path is not dropping data.
+**Purpose**: This test verifies that a metric recorded by the client is not left sitting in an internal queue. It proves that the background sending work delivers the metric by the time shutdown completes.
 
-**Data flow**: It builds an in-memory metrics client, records `codex.turns` with increment `1` and tag `model=gpt-5.1`, then shuts down the client. After reading the latest exported metrics, it finds the counter, collects its sum data points, asserts there is exactly one point with value `1`, converts attributes to a map, and checks that the `model` tag is present.
+**Data flow**: The test creates a metrics client with no default tags, records one counter with a model tag, and calls shutdown. It then reads the exporter output, finds the counter, checks that exactly one point was exported, and confirms that the value and model tag survived the trip.
 
-**Call relations**: This test isolates the enqueue-and-flush path rather than exercising multiple metric types. It depends on shutdown to force delivery before inspecting the exporter.
+**Call relations**: This test exercises the queued send path as a user would experience it: record first, flush on shutdown, inspect later. The harness supplies the in-memory exporter and lookup helpers, while the assertions confirm that the background worker did its job.
 
 *Call graph*: calls 4 internal fn (attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics); 2 external calls (assert_eq!, panic!).
 
@@ -341,11 +347,11 @@ fn client_sends_enqueued_metric() -> Result<()>
 fn shutdown_flushes_in_memory_exporter() -> Result<()>
 ```
 
-**Purpose**: Ensures that calling `shutdown()` flushes pending metrics to the in-memory exporter even for a minimal single-counter case. It is a focused flush semantics test.
+**Purpose**: This test makes sure shutdown forces recorded metrics out to the exporter. Without this behavior, a program could exit after recording metrics but lose them before they are delivered.
 
-**Data flow**: It creates a metrics client, records `codex.turns` with no tags, calls `shutdown()`, then reads the latest exported metrics and extracts the counter's sum data points. The only assertion is that exactly one point was exported.
+**Data flow**: The test creates a metrics client, records one counter, and immediately shuts the client down. It then asks the in-memory exporter for the latest metrics, finds the counter, and checks that one data point was exported.
 
-**Call relations**: This test is a narrower companion to `client_sends_enqueued_metric`, concentrating on shutdown flush behavior rather than tag contents.
+**Call relations**: This test is centered on the shutdown part of the metrics lifecycle. It uses the harness to build and inspect the exporter, and it confirms that shutdown is not just cleanup but also a final flush step.
 
 *Call graph*: calls 3 internal fn (build_metrics_with_defaults, find_metric, latest_metrics); 2 external calls (assert_eq!, panic!).
 
@@ -356,22 +362,26 @@ fn shutdown_flushes_in_memory_exporter() -> Result<()>
 fn shutdown_without_metrics_exports_nothing() -> Result<()>
 ```
 
-**Purpose**: Checks that shutting down an unused metrics client does not emit empty or spurious exports. It validates the no-data path.
+**Purpose**: This test checks the quiet path where the metrics client is shut down without any measurements being recorded. It ensures the system does not create empty or misleading metric exports.
 
-**Data flow**: It builds an in-memory metrics client, immediately calls `shutdown()`, then reads `exporter.get_finished_metrics()` and asserts that the returned collection is empty.
+**Data flow**: The test creates a metrics client with an in-memory exporter and records nothing. After shutdown, it asks the exporter for finished metrics and expects the list to be empty.
 
-**Call relations**: This is the simplest send-path test and covers the edge case where no metrics were recorded before shutdown.
+**Call relations**: This test covers an edge case in the same shutdown flow used by the other tests. Instead of looking up a metric, it checks the exporter directly to confirm that doing nothing produces no exported data.
 
 *Call graph*: calls 1 internal fn (build_metrics_with_defaults); 1 external calls (assert!).
 
 
 ### `otel/tests/suite/snapshot.rs`
 
-`test` · `on-demand metric snapshot verification`
+`test` · `test run`
 
-This file verifies that metrics can be synchronously collected from the runtime reader before any periodic export or shutdown occurs. Both tests use `MetricsConfig::in_memory(...).with_tag("service", "codex-cli")?.with_runtime_reader()` so the metrics pipeline supports snapshot reads. The first test records a plain counter directly through `MetricsClient`, calls `snapshot()`, and inspects the returned metric set to ensure the counter exists with the expected merged attributes. It also checks that the underlying `InMemoryMetricExporter` has not received any finished exports yet, proving snapshot collection is separate from exporter flush.
+Telemetry is the system’s way of recording facts such as “a shell tool was called successfully.” In normal use, these measurements may be exported later by a background process. These tests make sure there is also a reliable “show me what has been recorded right now” path.
 
-The second test wraps the same metrics client in `SessionTelemetry` and records the same logical counter through the manager. Its expected attribute map is larger because manager metadata enrichment is active: `app.version`, `auth_mode`, `model`, `originator`, `service`, and `session_source` are merged with the per-call `tool` and `success` tags. Both tests decode the metric as a `U64` sum with exactly one data point and convert attributes into a `BTreeMap` for deterministic comparison. Together they document the distinction between snapshot reads and exporter-driven delivery, and they show how manager-level metadata affects snapshot contents just as it affects exported metrics.
+The file builds an in-memory metrics exporter, which is like a notebook kept inside the test instead of sending data over the network. It then records a counter named `codex.tool.call` with labels such as the tool name and whether it succeeded. A snapshot is taken immediately, and the test looks inside that snapshot to confirm the counter exists and has exactly the expected labels.
+
+The first test checks this behavior directly through `MetricsClient`. It also confirms that taking a snapshot does not count as a finished periodic export. That distinction matters: snapshots should be a read-only peek, not a signal that the exporter lifecycle has ended.
+
+The second test checks the same idea through `SessionTelemetry`, which adds session-wide labels such as model name, app version, authentication mode, originator, and session source. This protects the higher-level telemetry path from silently dropping important context.
 
 #### Function details
 
@@ -381,11 +391,11 @@ The second test wraps the same metrics client in `SessionTelemetry` and records 
 fn snapshot_collects_metrics_without_shutdown() -> Result<()>
 ```
 
-**Purpose**: Verifies that `MetricsClient::snapshot()` returns current metric data without requiring shutdown or periodic export. It also proves that taking a snapshot does not populate the finished-export buffer.
+**Purpose**: This test proves that a `MetricsClient` can record a counter and immediately return it in a snapshot. It also verifies that asking for a snapshot does not trigger the normal “finished metrics” export path.
 
-**Data flow**: It creates an `InMemoryMetricExporter`, builds a runtime-reader-enabled in-memory `MetricsConfig` with a default `service` tag, constructs a `MetricsClient`, records `codex.tool.call` with `tool=shell` and `success=true`, and calls `snapshot()`. It finds the counter in the returned snapshot, unwraps the single `U64` sum point, converts attributes to a map, and compares them to the expected merged tags. Finally it reads `exporter.get_finished_metrics()` and asserts that no periodic exports have occurred.
+**Data flow**: The test starts with an empty in-memory exporter and builds a metrics configuration with a fixed service tag. It records one `codex.tool.call` counter with `tool=shell` and `success=true`, then asks the metrics client for a snapshot. The snapshot is searched for that metric, its labels are converted into a simple map, and the result is compared with the expected labels. Finally, the exporter is checked to make sure no completed background export has appeared.
 
-**Call relations**: This is the direct snapshot-path test for `MetricsClient`. It uses the shared `find_metric` and `attributes_to_map` helpers to inspect the snapshot payload.
+**Call relations**: This test uses the metrics setup path by creating a configuration and a `MetricsClient`, then uses helper functions to find the metric and turn its attributes into an easy-to-compare map. It exercises the snapshot path directly, without going through session-level telemetry.
 
 *Call graph*: calls 4 internal fn (new, in_memory, attributes_to_map, find_metric); 6 external calls (from, default, assert!, assert_eq!, env!, panic!).
 
@@ -396,22 +406,20 @@ fn snapshot_collects_metrics_without_shutdown() -> Result<()>
 fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()>
 ```
 
-**Purpose**: Checks that `SessionTelemetry::snapshot_metrics()` exposes current metric state without shutdown and includes manager metadata enrichment. It is the manager-level counterpart to the direct client snapshot test.
+**Purpose**: This test proves that the higher-level `SessionTelemetry` object can also return a current metrics snapshot. It checks that session context is attached to the metric along with the metric’s own labels.
 
-**Data flow**: It creates an in-memory runtime-reader-enabled metrics client with a default `service` tag, constructs a populated `SessionTelemetry` and attaches the metrics client, records `codex.tool.call` through `manager.counter(...)`, and calls `snapshot_metrics()`. It finds the counter in the returned snapshot, unwraps the single sum point, converts attributes to a map, and asserts equality with a map containing manager metadata (`app.version`, `auth_mode`, `model`, `originator`, `session_source`) plus the default and per-call tags.
+**Data flow**: The test creates an in-memory metrics client, then wraps it in a `SessionTelemetry` object with details such as thread ID, model, account ID, authentication mode, originator, terminal type, and CLI session source. It records one `codex.tool.call` counter through the session manager. When it asks for a metrics snapshot, it finds the counter and compares its labels against the expected combined set: session labels plus `tool=shell` and `success=true`.
 
-**Call relations**: This test is invoked directly by the test runner and exercises the snapshot path through the `SessionTelemetry` wrapper rather than the raw metrics client.
+**Call relations**: This test sits one layer above the direct metrics-client test. It calls into `SessionTelemetry`, which adds standard session information before handing measurements to the underlying metrics client, and then it uses the same snapshot inspection helpers to confirm the final recorded metric is correct.
 
 *Call graph*: calls 6 internal fn (new, new, in_memory, attributes_to_map, find_metric, new); 5 external calls (from, default, assert_eq!, env!, panic!).
 
 
 ### `otel/tests/suite/runtime_summary.rs`
 
-`test` · `runtime metrics aggregation verification`
+`test` · `test run`
 
-This file contains a single integration-style test for the runtime metrics reader path. It creates an `InMemoryMetricExporter`, builds a `MetricsClient` from `MetricsConfig::in_memory(...).with_runtime_reader()`, and attaches that client to a `SessionTelemetry` populated with realistic session metadata. The test then explicitly resets runtime metrics and emits a representative mix of telemetry: a tool result with a 250 ms duration, an API request with a 300 ms duration, a websocket request with a 400 ms duration, one SSE event with a 120 ms duration, and two websocket events totaling 100 ms. One websocket event payload is a synthetic `responsesapi.websocket_timing` JSON message containing engine and overhead timing fields; the test expects those values to be parsed into dedicated summary fields.
-
-It also records turn-level duration histograms for TTFT and TTFM. Finally, it calls `runtime_metrics_summary()` and compares the returned `RuntimeMetricsSummary` struct against a fully populated expected value. The assertions document the summary contract precisely: counts and cumulative durations are grouped into `RuntimeMetricTotals` for tool calls, API calls, streaming events, websocket calls, and websocket events, while protocol-specific timing metrics are surfaced as scalar millisecond fields. This test therefore validates both accumulation and extraction logic from heterogeneous telemetry sources.
+This test acts like a small rehearsal of a Codex session. Instead of sending real telemetry to an outside service, it uses an in-memory metrics exporter, which is like a notebook kept inside the test so the recorded numbers can be inspected immediately. The test creates a telemetry session, clears any previous runtime metric totals, then records several kinds of activity: one tool result, one normal API request, one WebSocket request, one server-sent event, two WebSocket events, and two turn timing measurements. It also feeds in a special WebSocket timing message that contains detailed timing numbers from the responses API. After all of that, it asks the session for a `RuntimeMetricsSummary`, which is the compact “receipt” of what happened during the run. The expected summary is written out by hand, including each count and total duration. The final assertion compares the real summary to that expected receipt. This matters because runtime metrics are used to explain where time went during a session. If this test failed, Codex might report misleading totals, miss important streaming or WebSocket timings, or fail to include response API timing details.
 
 #### Function details
 
@@ -421,22 +429,26 @@ It also records turn-level duration histograms for TTFT and TTFM. Finally, it ca
 fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<()>
 ```
 
-**Purpose**: Exercises the runtime metrics summary end to end by recording tool, API, SSE, websocket, and turn timing telemetry and then reading back the aggregated summary. It verifies both simple counters/durations and parsed websocket timing metrics.
+**Purpose**: This test verifies that a telemetry session can collect many different runtime measurements and combine them into one accurate summary. It is used to catch mistakes where a metric is not counted, counted twice, or given the wrong duration.
 
-**Data flow**: It creates an in-memory exporter and metrics client with a runtime reader, constructs `SessionTelemetry` with attached metrics, and calls `reset_runtime_metrics()`. It then emits a tool result, API request, websocket request, one SSE event result, two websocket event results (including one JSON timing payload), and two named duration metrics for TTFT and TTFM. Finally it calls `runtime_metrics_summary()`, unwraps the returned summary, and compares it to an expected `RuntimeMetricsSummary` containing exact counts, cumulative durations, and extracted timing fields such as `responses_api_overhead_ms` and `responses_api_engine_service_ttft_ms`.
+**Data flow**: The test starts with a fresh in-memory metrics exporter and builds a metrics client and telemetry session around it. It then records sample events with known durations and known timing values. After recording, it asks for the runtime summary and compares that result with a hand-written expected summary. Nothing is sent over the network; the important output is whether the assertion passes or fails.
 
-**Call relations**: This is a direct test entrypoint for the runtime-summary feature. It drives multiple `SessionTelemetry` recording methods in sequence so the summary reader can aggregate across all supported runtime metric categories.
+**Call relations**: During the test, this function calls constructors such as `new` and `in_memory` to set up a fake telemetry environment, then uses the session's recording methods to simulate real session activity. At the end, it uses `assert_eq!` to make the runtime summary prove that the earlier records were gathered and totaled correctly.
 
 *Call graph*: calls 4 internal fn (new, new, in_memory, new); 6 external calls (from_millis, default, new, assert_eq!, env!, Text).
 
 
 ### `otel/tests/suite/manager_metrics.rs`
 
-`test` · `metrics emission and shutdown verification`
+`test` · `test run`
 
-This test file exercises `SessionTelemetry` as the higher-level wrapper around `MetricsClient`, focusing on the exact attribute sets attached to exported metrics. Each test builds an in-memory metrics pipeline with `build_metrics_with_defaults`, constructs a `SessionTelemetry` with concrete session metadata (`ThreadId`, model names, optional account/auth fields, originator, terminal kind, and `SessionSource::Cli`), records one metric, shuts the metrics pipeline down, and inspects the exported `AggregatedMetrics` payload. The assertions are intentionally concrete: they descend into `MetricData::Sum` for `U64` counters, require exactly one data point, and convert OpenTelemetry attributes into a `BTreeMap<String, String>` for stable comparison.
+This is a test file for the telemetry layer, which is the part of the system that reports measurements such as “a session started” or “a plugin install was suggested.” Metrics are only useful if their labels are correct. Labels, also called attributes or tags, are small pieces of context like the model name, app version, authentication mode, or tool type. They are like sticky notes on a measurement that explain what the number means.
 
-The file covers three important design choices. First, manager-level metadata tags such as `app.version`, `auth_mode`, `model`, `originator`, and `session_source` are automatically merged into metric attributes unless explicitly disabled. Second, a separately configured `service_name` tag is optional and only appears when set through `with_metrics_service_name`. Third, the plugin-install helper methods intentionally emit reduced attribute sets: the tests confirm that only the public, low-cardinality fields (`tool_type`, `response_action`, `completed`) survive, while more identifying inputs like plugin IDs or display names are not asserted as exported attributes. These tests therefore document both enrichment and redaction behavior.
+Each test builds a temporary in-memory metrics setup, creates a `SessionTelemetry` object, records one metric, shuts metrics down so pending data is flushed, then reads back what was exported. The test then checks the metric’s attributes exactly.
+
+The file covers two broad behaviors. First, it checks general session metric tagging: metadata should be added by default, can be turned off, and can include an optional service name. Second, it checks special plugin-install metrics. Those tests make sure only safe, intended labels are included, such as `tool_type`, `response_action`, and `completed`, while more detailed plugin names are not attached as metric labels here.
+
+Without these tests, telemetry changes could accidentally remove important context, add unwanted identifying detail, or break dashboards that depend on stable metric labels.
 
 #### Function details
 
@@ -446,11 +458,11 @@ The file covers three important design choices. First, manager-level metadata ta
 fn manager_attaches_metadata_tags_to_metrics() -> Result<()>
 ```
 
-**Purpose**: Verifies that a `SessionTelemetry` configured with metrics enrichment adds session metadata tags to a normal counter metric. The test confirms that per-call tags are merged with manager metadata and default metrics tags.
+**Purpose**: This test proves that ordinary metrics recorded through `SessionTelemetry` automatically receive session metadata tags. It checks that a session-start counter includes context such as app version, model, originator, authentication mode, session source, and the metric’s own `source` tag.
 
-**Data flow**: It creates an in-memory metrics/exporter pair with a default `service=codex-cli` tag, constructs `SessionTelemetry::new(...)` with model, account, auth mode, originator, terminal, and CLI session source, then attaches metrics via `with_metrics`. It records `codex.session_started` with increment `1` and a per-call `source=tui` tag, shuts metrics down, reads the latest exported resource metrics, extracts the single `U64` sum point, converts its attributes to a `BTreeMap`, and compares that map against the expected merged attributes.
+**Data flow**: The test starts with a temporary metrics exporter and a telemetry manager configured with a model, account, authentication mode, originator, terminal type, and CLI session source. It records one counter named `codex.session_started`, flushes the metrics, then reads the exported data back. The output is expected to be one metric point whose attributes match the full expected map of metadata plus the explicit `source=tui` tag.
 
-**Call relations**: This is a top-level test entrypoint. It drives the normal manager metric path by invoking the constructor and metrics attachment path, then uses the shared harness helpers to locate and decode the exported metric after shutdown.
+**Call relations**: During the test, the test harness builds the metrics setup, then `SessionTelemetry::new` creates the telemetry object used by the test. After the counter is recorded and metrics are shut down, helper functions fetch the latest exported metrics, find the named metric, and convert its attributes into a simple map so the assertion can compare expected and actual tags.
 
 *Call graph*: calls 6 internal fn (new, attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics, new); 4 external calls (from, assert_eq!, env!, panic!).
 
@@ -461,11 +473,11 @@ fn manager_attaches_metadata_tags_to_metrics() -> Result<()>
 fn manager_allows_disabling_metadata_tags() -> Result<()>
 ```
 
-**Purpose**: Checks that `SessionTelemetry` can emit metrics without automatically attaching session metadata. It proves that only explicitly supplied metric tags remain when metadata tagging is disabled.
+**Purpose**: This test proves that callers can record metrics without the automatic session metadata tags. That matters when a metric should carry only the attributes explicitly supplied by the code that records it.
 
-**Data flow**: It builds an in-memory metrics client with no default tags, creates a populated `SessionTelemetry`, and attaches metrics through `with_metrics_without_metadata_tags`. After recording `codex.session_started` with `source=tui`, it shuts down the exporter, finds the emitted counter, unwraps the single `U64` sum point, converts attributes to a map, and asserts that the map contains only `source=tui`.
+**Data flow**: The test creates a temporary metrics exporter and a telemetry manager, but attaches metrics using the option that disables metadata tags. It records a `codex.session_started` counter with only `source=tui`, flushes the metrics, then reads back the exported point. The expected result is a single attribute map containing only `source=tui` and none of the usual session metadata.
 
-**Call relations**: This test follows the same export-inspection pattern as the previous one, but exercises the alternate attachment path that suppresses manager metadata. It relies on the harness helpers to inspect the resulting metric payload.
+**Call relations**: The test relies on the shared harness to create and inspect metrics. It exercises the `with_metrics_without_metadata_tags` path on `SessionTelemetry`, then uses the same read-back helpers as the metadata test to confirm that the manager did not add extra labels before export.
 
 *Call graph*: calls 6 internal fn (new, attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics, new); 3 external calls (from, assert_eq!, panic!).
 
@@ -476,11 +488,11 @@ fn manager_allows_disabling_metadata_tags() -> Result<()>
 fn manager_attaches_optional_service_name_tag() -> Result<()>
 ```
 
-**Purpose**: Confirms that `SessionTelemetry` can inject an additional `service_name` metric attribute when configured explicitly. The test isolates this optional tag from the rest of the metadata behavior.
+**Purpose**: This test checks that a caller can add a custom service name tag to metrics. This is useful when the same telemetry code may run inside different applications or clients and the exported metrics need to say which one produced them.
 
-**Data flow**: It creates metrics/exporter state, builds a `SessionTelemetry` without account or auth metadata, sets an explicit service name through `with_metrics_service_name("my_app_server_client")`, then attaches metrics and records `codex.session_started`. After shutdown it extracts the single counter point's attributes and asserts that the `service_name` key exists with the configured value.
+**Data flow**: The test builds temporary metrics, creates a telemetry manager without account or authentication details, sets a service name of `my_app_server_client`, and records a session-start counter. After flushing and reading the metric back, it converts the point’s attributes into a map and checks that the `service_name` attribute is present with the configured value.
 
-**Call relations**: This test is invoked directly by the test runner and exercises the builder-style configuration chain on `SessionTelemetry` before metric emission. It delegates metric lookup and attribute decoding to the shared harness utilities.
+**Call relations**: This test follows the same setup-record-flush-read pattern as the other manager metric tests. It specifically exercises the configuration step that adds a service name before metrics are attached, then uses the harness helpers to locate the exported counter and inspect its tags.
 
 *Call graph*: calls 6 internal fn (new, attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics, new); 2 external calls (assert_eq!, panic!).
 
@@ -491,11 +503,11 @@ fn manager_attaches_optional_service_name_tag() -> Result<()>
 fn manager_records_plugin_install_suggestion_metric() -> Result<()>
 ```
 
-**Purpose**: Validates the specialized plugin-install suggestion metric emitted by `SessionTelemetry`. It checks that the exported counter uses the expected metric name constant and only the intended summary attributes.
+**Purpose**: This test verifies the metric emitted when the system suggests installing a plugin or connector. It makes sure the exported labels describe the safe, dashboard-relevant facts: tool type, user response action, and whether installation completed.
 
-**Data flow**: It builds in-memory metrics, creates a telemetry manager with metadata tagging disabled, and calls `record_plugin_install_suggestion` with tool type `connector`, an internal tool identifier, display name, response action `accept`, `user_confirmed=true`, and `completed=false`. After shutdown it finds the metric named by `PLUGIN_INSTALL_SUGGESTION_METRIC`, unwraps the single `U64` sum point, converts attributes to a map, and asserts equality with a map containing `completed=false`, `response_action=accept`, and `tool_type=connector`.
+**Data flow**: The test creates a telemetry manager with metadata tags disabled, then records a plugin-install suggestion for a connector named Google Calendar with an `accept` response, user confirmation set to true, and completion set to false. After metrics are flushed, it finds the plugin-install suggestion metric and reads its attributes. The expected output is one metric point labeled with `tool_type=connector`, `response_action=accept`, and `completed=false`.
 
-**Call relations**: This test covers one of the manager's domain-specific metric helpers rather than the generic `counter` API. It uses the same post-shutdown inspection flow as the other tests to verify the helper's attribute-shaping behavior.
+**Call relations**: The test calls the specialized `record_plugin_install_suggestion` method on `SessionTelemetry` instead of the generic counter method. The harness then retrieves the exported metric by the shared metric-name constant and turns its attributes into a map so the test can confirm that the specialized recorder chose the right labels.
 
 *Call graph*: calls 6 internal fn (new, attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics, new); 2 external calls (assert_eq!, panic!).
 
@@ -506,11 +518,11 @@ fn manager_records_plugin_install_suggestion_metric() -> Result<()>
 fn manager_records_plugin_install_elicitation_sent_metric() -> Result<()>
 ```
 
-**Purpose**: Checks the metric emitted when a plugin-install elicitation is sent. It ensures the helper records the expected metric name and a minimal attribute set.
+**Purpose**: This test verifies the metric emitted when the system sends an installation prompt, or elicitation, for a plugin. It checks that the metric records the broad tool type without attaching the specific plugin identifier or display name as labels.
 
-**Data flow**: It creates in-memory metrics, constructs a telemetry manager with metadata tags disabled, and calls `record_plugin_install_elicitation_sent` with tool type `plugin`, a concrete plugin identifier, and display name `Slack`. After shutdown it locates the metric named by `PLUGIN_INSTALL_ELICITATION_SENT_METRIC`, extracts the single counter point, converts attributes to a map, and asserts that only `tool_type=plugin` is present.
+**Data flow**: The test creates temporary metrics and a telemetry manager with automatic metadata tags disabled. It records that an installation elicitation was sent for a Slack plugin, flushes the exporter, and reads back the named metric. The expected result is one metric point with only `tool_type=plugin` in its attributes.
 
-**Call relations**: This is another direct test of a specialized `SessionTelemetry` helper. It follows the same harness-driven export decoding path to verify that the helper emits a low-cardinality metric payload.
+**Call relations**: This test exercises the specialized `record_plugin_install_elicitation_sent` method. After that method records the metric, the shared test helpers collect the latest exported metrics, find the expected metric by its constant name, and expose the attributes for the final equality check.
 
 *Call graph*: calls 6 internal fn (new, attributes_to_map, build_metrics_with_defaults, find_metric, latest_metrics, new); 2 external calls (assert_eq!, panic!).
 
@@ -520,11 +532,15 @@ These tests cover how telemetry is routed between logs and traces and how comple
 
 ### `otel/tests/suite/otel_export_routing_policy.rs`
 
-`test` · `request/event telemetry routing verification`
+`test` · `test run`
 
-This file builds end-to-end in-memory log and trace pipelines around `OtelProvider::log_export_filter` and `OtelProvider::trace_export_filter`, then emits `SessionTelemetry` events inside a root tracing span to inspect how fields are routed. The helper functions are central to the assertions: `log_attributes` converts an `SdkLogRecord`'s attributes into a stable `BTreeMap`, `span_event_attributes` does the same for trace events, `any_value_to_string` normalizes OpenTelemetry `AnyValue` variants into strings, and the two `find_*_by_*` helpers locate a specific log or span event by its `event.name` attribute.
+OpenTelemetry is a standard way for software to report what it is doing through logs and traces. A log is like a detailed receipt; a trace is more like a map of what happened during a request. This test file checks that Codex splits information correctly between those two places.
 
-The tests cover several event families. User prompts and tool results are intentionally split: logs retain sensitive payloads such as prompt text, tool arguments, output, and user email, while trace events keep only derived counts and lengths (`prompt_length`, `output_line_count`, etc.) and explicitly omit raw content. Auth recovery and API/websocket auth observability events are different: they are expected to appear in both logs and traces with concrete auth-related attributes like `auth.header_attached`, `auth.recovery_phase`, request IDs, Cloudflare ray IDs, and environment-derived auth metadata from `AuthEnvTelemetryMetadata`. Each test constructs a subscriber with both OTEL layers attached, forces flush on both providers, then inspects the exported records to prove the routing policy is deterministic and privacy-aware.
+Each test builds an in-memory telemetry setup, so nothing is sent over the network. It creates a fake log exporter and a fake trace exporter, runs a small piece of SessionTelemetry behavior, flushes the captured data, and then inspects what was recorded.
+
+The main idea is privacy-aware routing. For example, when a user prompt is recorded, the log may contain the actual prompt and user email because it is sent through the log-only path. The trace event should contain useful counts and lengths, such as prompt length or image count, but not the prompt text or user identity. The same pattern is checked for tool results, authentication recovery, API requests, and WebSocket activity.
+
+Small helper functions turn telemetry attributes into easy-to-compare maps and find the event being tested. Without these tests, a future code change could silently put secrets into traces or remove important authentication debugging fields from telemetry.
 
 #### Function details
 
@@ -534,11 +550,11 @@ The tests cover several event families. User prompts and tool results are intent
 fn log_attributes(record: &SdkLogRecord) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Converts an `SdkLogRecord`'s attribute iterator into a sorted string map suitable for assertions. It gives the tests a uniform representation regardless of the underlying OTEL value types.
+**Purpose**: This helper turns the attributes on a captured log record into a simple name-to-text map. The tests use it so they can ask plain questions like “does this log contain the prompt?” without dealing with OpenTelemetry’s internal value types.
 
-**Data flow**: It reads `(key, value)` pairs from `record.attributes_iter()`, converts each key to `String`, converts each `AnyValue` through `any_value_to_string`, and collects the results into a `BTreeMap<String, String>`. It does not mutate external state.
+**Data flow**: It receives one SDK log record. It reads each attribute from the record, converts the attribute value into a string using any_value_to_string, and returns a sorted map from attribute name to text value. It does not change the log record.
 
-**Call relations**: This helper is called by all log-routing tests after logs are exported. It sits between raw OTEL log records and the concrete equality assertions on individual attributes.
+**Call relations**: The test functions call this after telemetry has been flushed into the in-memory log exporter. It supports find_log_by_event_name indirectly and is also used directly by the tests to check the exact fields on each chosen log event.
 
 *Call graph*: called by 6 (otel_export_routing_policy_routes_api_request_auth_observability, otel_export_routing_policy_routes_auth_recovery_log_and_trace_events, otel_export_routing_policy_routes_tool_result_log_and_trace_events, otel_export_routing_policy_routes_user_prompt_log_and_trace_events, otel_export_routing_policy_routes_websocket_connect_auth_observability, otel_export_routing_policy_routes_websocket_request_transport_observability); 1 external calls (attributes_iter).
 
@@ -549,11 +565,11 @@ fn log_attributes(record: &SdkLogRecord) -> BTreeMap<String, String>
 fn span_event_attributes(event: &opentelemetry::trace::Event) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Builds a stable string map from a trace event's attribute list. The tests use it to inspect trace-safe event payloads without depending on OTEL's internal structures.
+**Purpose**: This helper turns the attributes on a trace event into a simple name-to-text map. It lets the tests compare trace data without needing to know the OpenTelemetry attribute structures.
 
-**Data flow**: It reads the `attributes` vector from an `opentelemetry::trace::Event`, converts each `KeyValue` key to `String`, converts each value with `to_string()`, and collects the pairs into a `BTreeMap<String, String>`. It returns the map without side effects.
+**Data flow**: It receives one trace event. It walks through that event’s attributes, converts each value to text with the value’s normal string form, and returns a sorted map from attribute name to text value. It leaves the event unchanged.
 
-**Call relations**: This helper is used by every trace-routing test after spans are flushed and exported. It provides the normalized view that the tests compare against expected trace attributes.
+**Call relations**: The test functions call this after looking inside the finished span captured by the in-memory span exporter. find_span_event_by_name_attr also uses the same idea to locate a trace event by its event.name attribute.
 
 *Call graph*: called by 6 (otel_export_routing_policy_routes_api_request_auth_observability, otel_export_routing_policy_routes_auth_recovery_log_and_trace_events, otel_export_routing_policy_routes_tool_result_log_and_trace_events, otel_export_routing_policy_routes_user_prompt_log_and_trace_events, otel_export_routing_policy_routes_websocket_connect_auth_observability, otel_export_routing_policy_routes_websocket_request_transport_observability).
 
@@ -564,11 +580,11 @@ fn span_event_attributes(event: &opentelemetry::trace::Event) -> BTreeMap<String
 fn any_value_to_string(value: &AnyValue) -> String
 ```
 
-**Purpose**: Normalizes OpenTelemetry log `AnyValue` variants into strings for deterministic assertions. It handles primitive, byte, list, and map values explicitly.
+**Purpose**: This helper converts OpenTelemetry log values into ordinary strings so tests can compare them easily. OpenTelemetry log attributes can be integers, booleans, text, bytes, lists, maps, and other forms, so this function gives the tests one common format.
 
-**Data flow**: It pattern-matches on the input `&AnyValue`: integers, doubles, booleans, and strings are converted directly; bytes are decoded with `String::from_utf8_lossy`; list and map variants are formatted with debug output; all remaining variants fall back to debug formatting. It returns the resulting `String` and writes no state.
+**Data flow**: It receives one OpenTelemetry AnyValue. It checks what kind of value it is, converts common types directly into readable text, decodes bytes as UTF-8 when possible, and falls back to debug-style text for complex or unknown values. The result is a string.
 
-**Call relations**: This helper is used indirectly by all log assertions through `log_attributes`. It encapsulates the value-conversion policy so the tests can compare plain strings.
+**Call relations**: log_attributes uses this for every log attribute it reads. The test functions do not usually call it directly, but their log assertions depend on it to make OpenTelemetry values comparable with expected strings.
 
 *Call graph*: 4 external calls (as_str, to_string, from_utf8_lossy, format!).
 
@@ -582,11 +598,11 @@ fn find_log_by_event_name(
 ) -> &'a opentelemetry_sdk::logs::in_memory_exporter::LogDataWithReso
 ```
 
-**Purpose**: Finds the exported log record whose `event.name` attribute matches a requested telemetry event. It fails the test immediately if no such log exists.
+**Purpose**: This helper finds the captured log event with a specific event.name attribute. It keeps each test focused on the event it cares about instead of manually searching through all logs.
 
-**Data flow**: It iterates over a slice of `LogDataWithResource`, converts each record's attributes with `log_attributes`, checks whether the `event.name` entry equals the requested `event_name`, and returns a reference to the first matching log. If none match, it panics with `expect`.
+**Data flow**: It receives a list of captured log records and the event name to search for. It checks each log’s attributes, looking for event.name equal to the requested name. It returns the matching log data, or fails the test if no such log exists.
 
-**Call relations**: Each log-routing test uses this helper after collecting emitted logs to isolate the specific event under inspection, such as `codex.user_prompt` or `codex.api_request`.
+**Call relations**: Every test uses this after flushing the in-memory log exporter. It relies on log_attributes to read log attributes in a simple form, then hands the matching log back to the test for detailed assertions.
 
 *Call graph*: called by 6 (otel_export_routing_policy_routes_api_request_auth_observability, otel_export_routing_policy_routes_auth_recovery_log_and_trace_events, otel_export_routing_policy_routes_tool_result_log_and_trace_events, otel_export_routing_policy_routes_user_prompt_log_and_trace_events, otel_export_routing_policy_routes_websocket_connect_auth_observability, otel_export_routing_policy_routes_websocket_request_transport_observability); 1 external calls (iter).
 
@@ -600,11 +616,11 @@ fn find_span_event_by_name_attr(
 ) -> &'a opentelemetry::trace::Event
 ```
 
-**Purpose**: Locates a trace event by its `event.name` attribute within a finished span's event list. It gives the tests a direct handle on the event payload they want to inspect.
+**Purpose**: This helper finds a trace event with a specific event.name attribute inside a finished span. It is the trace-side companion to find_log_by_event_name.
 
-**Data flow**: It iterates over a slice of `opentelemetry::trace::Event`, converts each event's attributes with `span_event_attributes`, checks for a matching `event.name`, and returns a reference to the first match. If no event matches, it panics via `expect`.
+**Data flow**: It receives a list of trace events and the event name to search for. It converts each event’s attributes into a map, checks event.name, and returns the first matching event. If none is found, the test fails with a clear message.
 
-**Call relations**: All trace-routing tests call this helper after retrieving finished spans. It narrows a span's event list down to the single telemetry event being asserted.
+**Call relations**: Every test uses this after flushing the in-memory span exporter and reading the events from the finished span. It relies on span_event_attributes to inspect each event, then gives the matching event back for detailed checks.
 
 *Call graph*: called by 6 (otel_export_routing_policy_routes_api_request_auth_observability, otel_export_routing_policy_routes_auth_recovery_log_and_trace_events, otel_export_routing_policy_routes_tool_result_log_and_trace_events, otel_export_routing_policy_routes_user_prompt_log_and_trace_events, otel_export_routing_policy_routes_websocket_connect_auth_observability, otel_export_routing_policy_routes_websocket_request_transport_observability); 1 external calls (iter).
 
@@ -615,11 +631,11 @@ fn find_span_event_by_name_attr(
 fn auth_env_metadata() -> AuthEnvTelemetryMetadata
 ```
 
-**Purpose**: Constructs a fixed `AuthEnvTelemetryMetadata` fixture used by auth-observability tests. The values are chosen to make presence/absence assertions explicit.
+**Purpose**: This helper creates a fixed set of fake authentication-environment facts for tests. It represents things like whether API key environment variables are present and whether a refresh-token URL override was configured.
 
-**Data flow**: It returns a new `AuthEnvTelemetryMetadata` struct with hard-coded booleans and `Some("configured")` for the provider key name. It reads no external state and mutates nothing.
+**Data flow**: It takes no input. It builds and returns an AuthEnvTelemetryMetadata value with known true, false, and named settings. Nothing outside the returned value is changed.
 
-**Call relations**: The API-request and websocket auth tests call this helper when enriching `SessionTelemetry` with environment-derived auth metadata before emitting events.
+**Call relations**: The API-request and WebSocket tests attach this metadata to SessionTelemetry before recording events. That lets those tests verify that authentication environment details appear in both logs and traces where expected.
 
 
 ##### `otel_export_routing_policy_routes_user_prompt_log_and_trace_events`  (lines 95–203)
@@ -628,11 +644,11 @@ fn auth_env_metadata() -> AuthEnvTelemetryMetadata
 fn otel_export_routing_policy_routes_user_prompt_log_and_trace_events()
 ```
 
-**Purpose**: Verifies that user prompt telemetry is split correctly: raw prompt content and user email go only to logs, while traces receive only aggregate prompt statistics. It also checks that all exported logs are routed through the log-only target.
+**Purpose**: This test checks how user prompts are split between logs and traces. It verifies that the full prompt and user email are kept in log-only telemetry, while the trace receives only safer summary facts such as length and input counts.
 
-**Data flow**: The test creates in-memory log and span exporters, builds corresponding OTEL providers and tracing layers, and installs a subscriber with both layers filtered by `OtelProvider` routing predicates. Inside `with_default`, it rebuilds tracing interest, constructs `SessionTelemetry`, enters a root span, and emits `manager.user_prompt(...)` with one text input, one remote image, and one local image. After forcing flush, it reads exported logs and spans, asserts log targets, extracts the `codex.user_prompt` log and trace event, converts attributes with the helpers, and checks that logs contain `prompt` and `user.email` while traces contain only counts and lengths and omit sensitive fields.
+**Data flow**: The test creates in-memory log and trace exporters, wires them into a tracing subscriber with Codex’s log and trace filters, then records a prompt containing text, a remote image, and a local image. After flushing, it reads the captured logs and spans. It expects the log to contain the prompt text and user email, and expects the trace event to contain counts and length but not the prompt, email, or account id.
 
-**Call relations**: This is a top-level routing-policy test. It exercises the `SessionTelemetry::user_prompt` emission path under a subscriber configured with both OTEL sinks, then delegates record lookup and normalization to the local helper functions.
+**Call relations**: This is one of the main privacy-routing checks. It calls the helper functions to find the codex.user_prompt log and trace event and to turn their attributes into maps. It exercises SessionTelemetry.user_prompt through the same OpenTelemetry routing filters used by the production telemetry provider.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 11 external calls (default, default, builder, builder, assert!, assert_eq!, new, with_default, layer, filter_fn (+1 more)).
 
@@ -643,11 +659,11 @@ fn otel_export_routing_policy_routes_user_prompt_log_and_trace_events()
 fn otel_export_routing_policy_routes_tool_result_log_and_trace_events()
 ```
 
-**Purpose**: Checks that tool-result telemetry keeps raw arguments, output, and MCP metadata in logs but emits only summarized lengths/counts in traces. It validates the privacy boundary for tool execution events.
+**Purpose**: This test checks how tool-call results are split between logs and traces. It makes sure sensitive tool arguments and output go to logs, while traces only receive safer measurements such as argument length, output length, and line count.
 
-**Data flow**: It sets up in-memory log and trace exporters and a dual-layer subscriber exactly as in the prompt test. Inside the subscriber context it creates `SessionTelemetry`, enters a root span, and emits `tool_result_with_tags` for a `shell` tool call with secret arguments, multiline output, and extra tags `mcp_server` and `mcp_server_origin`. After flushing, it inspects the `codex.tool_result` log and trace event: the log attribute map must include raw arguments/output and MCP tags, while the trace attribute map must include `arguments_length`, `output_length`, and `output_line_count` and must not include the raw or MCP fields.
+**Data flow**: The test sets up in-memory OpenTelemetry exporters and a subscriber, creates a telemetry session, and records a successful shell tool result with secret arguments, secret output, and MCP tags. After flushing, it inspects the log and trace data. The log must include the full arguments, output, and MCP tag values; the trace must include only summary lengths and line count, not the raw arguments, output, or MCP tags.
 
-**Call relations**: This test is another direct consumer of the shared setup and helper functions. It specifically drives the `SessionTelemetry::tool_result_with_tags` path to verify sink-specific field routing.
+**Call relations**: This test follows the same pattern as the user-prompt test but focuses on SessionTelemetry.tool_result_with_tags. It uses find_log_by_event_name, find_span_event_by_name_attr, log_attributes, and span_event_attributes to compare the two telemetry sinks.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 11 external calls (default, default, builder, builder, assert!, assert_eq!, new, with_default, layer, filter_fn (+1 more)).
 
@@ -658,11 +674,11 @@ fn otel_export_routing_policy_routes_tool_result_log_and_trace_events()
 fn otel_export_routing_policy_routes_auth_recovery_log_and_trace_events()
 ```
 
-**Purpose**: Ensures auth-recovery telemetry is exported to both logs and traces with the same concrete auth fields. Unlike prompt/tool payloads, these observability fields are expected to be trace-safe.
+**Purpose**: This test checks that authentication recovery events are recorded consistently in both logs and traces. Unlike prompts or tool output, these fields are operational debugging details, so the test expects the same recovery facts in both places.
 
-**Data flow**: It builds in-memory log and trace pipelines, installs the filtered subscriber, creates `SessionTelemetry` with `TelemetryAuthMode::Chatgpt`, enters a root span, and emits `record_auth_recovery` with mode, step, outcome, request identifiers, error strings, and `state_changed=true`. After flushing, it finds the `codex.auth_recovery` log and trace event, converts both to maps, and asserts that both contain the same auth-related keys and values.
+**Data flow**: The test builds fake log and trace exporters, creates a telemetry session using ChatGPT-style authentication, and records an authentication recovery event with request id, Cloudflare ray id, error name, error code, and state-change status. After flushing, it finds the auth recovery log and trace event. It checks that both contain the expected mode, step, outcome, request identifiers, error details, and state-changed flag.
 
-**Call relations**: This test uses the same subscriber wiring as the previous routing tests but exercises the auth-recovery event path. It demonstrates that not all events are split asymmetrically; some are duplicated across both sinks.
+**Call relations**: This test exercises SessionTelemetry.record_auth_recovery. It uses the shared helper functions to locate and inspect the codex.auth_recovery event in both telemetry outputs, confirming that routing does not strip important authentication troubleshooting fields.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 10 external calls (default, default, builder, builder, assert_eq!, new, with_default, layer, filter_fn, registry).
 
@@ -673,11 +689,11 @@ fn otel_export_routing_policy_routes_auth_recovery_log_and_trace_events()
 fn otel_export_routing_policy_routes_api_request_auth_observability()
 ```
 
-**Purpose**: Verifies that API request telemetry carries auth-header, recovery, endpoint, error, and auth-environment metadata into both logs and traces. It also checks that conversation-start events inherit auth environment metadata.
+**Purpose**: This test checks that API request telemetry includes the authentication details needed to debug unauthorized requests. It also checks that environment-derived authentication metadata is attached to conversation and request events.
 
-**Data flow**: It creates in-memory exporters and a dual OTEL subscriber, then inside the subscriber context constructs `SessionTelemetry`, enriches it with `with_auth_env(auth_env_metadata())`, enters a root span, emits `conversation_starts(...)`, and then emits `record_api_request(...)` with a 401 status, auth-header details, retry/recovery flags, endpoint `/responses`, request IDs, and auth error fields. After flushing, it extracts the `codex.conversation_starts` and `codex.api_request` logs plus the corresponding trace events, converts attributes to maps, and asserts the presence of specific auth environment and request observability fields in both sinks.
+**Data flow**: The test creates in-memory exporters, creates a telemetry session with fixed authentication environment metadata, starts a conversation, and records an API request that returned a 401 unauthorized response. It then reads logs and traces. It verifies that conversation telemetry contains environment facts, and that API request telemetry includes header attachment, header name, retry behavior, recovery mode and phase, endpoint, error details, and selected environment facts.
 
-**Call relations**: This test extends the routing-policy coverage from privacy splitting into auth observability propagation. It depends on `auth_env_metadata` for fixture data and on the helper lookup/conversion functions for assertions.
+**Call relations**: This test exercises SessionTelemetry.conversation_starts and SessionTelemetry.record_api_request together because request telemetry can include session-level authentication environment context. It uses auth_env_metadata to supply known values and the shared finder and attribute helpers to inspect codex.conversation_starts and codex.api_request events.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 10 external calls (default, default, builder, builder, assert_eq!, new, with_default, layer, filter_fn, registry).
 
@@ -688,11 +704,11 @@ fn otel_export_routing_policy_routes_api_request_auth_observability()
 fn otel_export_routing_policy_routes_websocket_connect_auth_observability()
 ```
 
-**Purpose**: Checks that websocket connection telemetry exports auth and endpoint observability fields to logs and traces, including connection reuse and recovery-phase details. It confirms websocket connect events receive the same auth-environment enrichment as API requests.
+**Purpose**: This test checks that WebSocket connection telemetry includes useful authentication and connection details. A WebSocket is a long-lived network connection, so connection failures need enough information to explain whether authentication headers, retries, or environment settings were involved.
 
-**Data flow**: It sets up in-memory log and trace exporters and the filtered subscriber, creates `SessionTelemetry` enriched with `auth_env_metadata`, enters a root span, and emits `record_websocket_connect(...)` with latency, 401 status, auth-header details, retry/recovery metadata, endpoint `/responses`, `connection_reused=false`, request IDs, and auth error fields. After flushing, it finds the `codex.websocket_connect` log and trace event, converts attributes to maps, and asserts the expected log-side and trace-side auth fields.
+**Data flow**: The test sets up in-memory telemetry, creates a session with fixed authentication environment metadata, and records a WebSocket connect attempt that failed with a 401 response. It flushes and inspects the captured data. The log must include fields such as auth header presence, header name, endpoint, connection reuse status, error, and provider key name; the trace must include recovery phase and refresh-token override status.
 
-**Call relations**: This test follows the same orchestration pattern as the API-request test but drives the websocket-connect event path. It uses the local helpers to isolate and inspect the exported event in each sink.
+**Call relations**: This test exercises SessionTelemetry.record_websocket_connect. It uses auth_env_metadata for predictable environment fields and the shared log and span helpers to verify that codex.websocket_connect is exported with the expected authentication observability data.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 10 external calls (default, default, builder, builder, assert_eq!, new, with_default, layer, filter_fn, registry).
 
@@ -703,22 +719,24 @@ fn otel_export_routing_policy_routes_websocket_connect_auth_observability()
 fn otel_export_routing_policy_routes_websocket_request_transport_observability()
 ```
 
-**Purpose**: Verifies that websocket request transport telemetry exports connection reuse, error message, and auth-environment metadata to both logs and traces. It covers the lower-level request/stream path rather than initial connection setup.
+**Purpose**: This test checks telemetry for a WebSocket request after a connection exists. It verifies that transport-level facts, such as whether the connection was reused and what error occurred, are visible in telemetry.
 
-**Data flow**: It constructs in-memory log and trace exporters, installs the filtered subscriber, creates `SessionTelemetry` with auth environment metadata, enters a root span, and emits `record_websocket_request(...)` with a 23 ms duration, error message `stream error`, and `connection_reused=true`. After flushing, it extracts the `codex.websocket_request` log and trace event, converts attributes to maps, and asserts the expected transport and auth-environment fields in each.
+**Data flow**: The test creates in-memory log and trace exporters, builds a telemetry session with fixed authentication environment metadata, and records a WebSocket request that ended with a stream error on a reused connection. After flushing, it finds the WebSocket request log and trace event. It checks that both include connection reuse information, that the log includes the error message, and that environment authentication facts are present where expected.
 
-**Call relations**: This is the final routing-policy test in the file. It reuses the same subscriber/exporter setup and helper functions, but targets the websocket request event path to complete auth/transport observability coverage.
+**Call relations**: This test exercises SessionTelemetry.record_websocket_request. Like the other routing tests, it runs through Codex’s log and trace export filters and uses the shared helper functions to locate and inspect the codex.websocket_request telemetry in both outputs.
 
 *Call graph*: calls 4 internal fn (find_log_by_event_name, find_span_event_by_name_attr, log_attributes, span_event_attributes); 10 external calls (default, default, builder, builder, assert_eq!, new, with_default, layer, filter_fn, registry).
 
 
 ### `otel/tests/suite/otlp_http_loopback.rs`
 
-`test` · `exporter integration and transport verification`
+`test` · `test run`
 
-This file is a full-stack transport test for the OTLP/HTTP exporters in `codex_otel`. Instead of mocking the exporter, it starts a real `TcpListener` on `127.0.0.1:0`, accepts connections in a background thread, parses incoming HTTP requests, and stores each request's path, content type, and body in a local `CapturedRequest` struct. `read_http_request` implements a minimal HTTP/1.1 parser with explicit timeouts, incremental reads, header/body size guards, UTF-8 validation for headers, lower-cased header names, and `Content-Length`-based body collection. `write_http_response` sends a minimal empty response so the exporter can complete normally.
+OpenTelemetry is a standard way for programs to report what they are doing: metrics, logs, and traces. Metrics are numbers like counters and gauges. Logs are event messages. Traces describe a path of work through the system. This file makes sure Codex’s OpenTelemetry HTTP exporter really sends those items in the expected JSON form.
 
-The tests then configure either `MetricsClient` or `OtelProvider` with `OtelExporter::OtlpHttp` using JSON protocol and point the endpoint at the loopback server. Metrics tests verify `/v1/metrics` requests contain counter and gauge names plus tags. Log tests install the provider's logger layer and assert `/v1/logs` contains the emitted `event.name`. Trace tests install the tracing layer, emit spans and events, and assert `/v1/traces` contains span names, service metadata, configured span attributes, and trace events. The trace tests also cover W3C propagation helpers: they set a parent from `W3cTraceContext`, read back the current span context, and verify configured tracestate entries merge safely with incoming tracestate. A global `TRACE_CONTEXT_CONFIG_LOCK` serializes tests that mutate trace-context-related configuration so concurrent test execution cannot interfere.
+The tests start a local TCP listener on the machine, like setting up a temporary mailbox. Codex is configured to export telemetry to that local address. A background thread accepts incoming HTTP requests, reads the path, headers, and body, replies with a simple success response, and stores what it saw. The test then creates telemetry data, shuts the exporter down so buffered data is flushed, and checks the captured request.
+
+The file also checks trace-context behavior. Trace context is the small piece of information that lets separate parts of a system agree they are working on the same request. One test verifies that unsafe configured trace-state values, such as values containing newlines, are rejected because they would be unsafe inside HTTP headers. Other tests make sure trace export still works inside different Tokio runtimes, which are Rust async task runners.
 
 #### Function details
 
@@ -730,11 +748,11 @@ fn read_http_request(
 ) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)>
 ```
 
-**Purpose**: Reads and parses a single HTTP request from a `TcpStream` for the loopback collector. It is intentionally minimal but robust enough to capture OTLP/HTTP exporter traffic in tests.
+**Purpose**: Reads one raw HTTP request from a TCP connection and turns it into useful pieces: the requested path, the headers, and the body bytes. The tests use it so their fake collector can inspect what the exporter sent.
 
-**Data flow**: It takes a mutable `TcpStream`, sets a 2-second read timeout, and repeatedly reads into a scratch buffer through a retrying closure that tolerates `WouldBlock` and `Interrupted` until a deadline. It accumulates bytes until `\r\n\r\n` marks the end of headers, rejects oversized headers, decodes headers as UTF-8, parses the request line to extract the path, lowercases and stores headers in a `HashMap<String, String>`, then if `content-length` is present continues reading until the full body is available, rejecting premature EOF or oversized bodies. It returns `(path, headers, body_bytes)`.
+**Data flow**: It receives an open TCP stream. It waits up to a short deadline for data, reads until the HTTP headers are complete, parses the request line to find the path, stores headers in a lowercase lookup map, then reads the body according to the Content-Length header. It returns the path, headers, and body, or an input/output error if the request is missing, malformed, too large, or too slow.
 
-**Call relations**: This helper is called by each background loopback server thread whenever a connection is accepted. The export tests depend on it to turn raw exporter traffic into structured request captures for later assertions.
+**Call relations**: The loopback server threads inside the exporter tests call this whenever Codex connects to the fake collector. After this function has captured the request details, the server sends a response and later hands the captured data back to the test for assertions.
 
 *Call graph*: 7 external calls (from_secs, new, now, set_read_timeout, new, new, from_utf8).
 
@@ -745,11 +763,11 @@ fn read_http_request(
 fn write_http_response(stream: &mut TcpStream, status: &str) -> std::io::Result<()>
 ```
 
-**Purpose**: Sends a minimal HTTP/1.1 response back to the exporter so the client side can complete its request successfully. The status line is parameterized to let tests simulate acceptance.
+**Purpose**: Writes a minimal HTTP response back to the exporter. This lets the fake collector tell Codex, “I received your telemetry,” without running a real OpenTelemetry collector.
 
-**Data flow**: It formats an HTTP response string with the provided status, zero content length, and `Connection: close`, writes the bytes to the mutable `TcpStream`, and flushes the stream. It returns any I/O error from `write_all` or `flush`.
+**Data flow**: It receives an open TCP stream and a status string such as “202 Accepted”. It builds a tiny HTTP response with no body, writes it to the stream, and flushes the stream so the client sees it promptly. It returns success or an input/output error.
 
-**Call relations**: Each loopback server thread calls this immediately after attempting to parse a request. It complements `read_http_request` by completing the request-response exchange expected by the OTLP exporter.
+**Call relations**: The server threads call this after trying to read each incoming request. It completes the pretend collector exchange so the exporter can finish cleanly instead of waiting for a server reply.
 
 *Call graph*: 3 external calls (flush, write_all, format!).
 
@@ -760,11 +778,11 @@ fn write_http_response(stream: &mut TcpStream, status: &str) -> std::io::Result<
 fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()>
 ```
 
-**Purpose**: Verifies that the OTLP/HTTP metrics exporter sends JSON payloads to `/v1/metrics` and includes the recorded metric names and tags. It exercises both counter and gauge export through a real HTTP connection.
+**Purpose**: Checks that the metrics exporter sends metric data to an HTTP OpenTelemetry endpoint. It proves that counters, gauges, labels, and JSON content type all appear in the outgoing request.
 
-**Data flow**: The test binds a nonblocking loopback listener, spawns a server thread that accepts connections, parses requests with `read_http_request`, responds `202 Accepted`, and sends captured requests back over an `mpsc` channel. It constructs a `MetricsClient` using `MetricsConfig::otlp(...)` with an `OtlpHttp` exporter pointed at `http://{addr}/v1/metrics`, records a counter, histogram, and gauge, then shuts the client down. After joining the server and receiving captures, it finds the `/v1/metrics` request, checks that `content-type` starts with `application/json`, decodes the body lossily, and asserts that the body contains `codex.turns`, `codex.active`, and the `component=test` tag.
+**Data flow**: The test starts a local listener, creates a metrics client pointed at that listener, records a counter and a gauge, then shuts the client down to force sending. It receives the captured HTTP requests from the server thread and checks that the request went to `/v1/metrics`, used JSON, and contained the expected metric names and label values.
 
-**Call relations**: This is a top-level integration test for the metrics export path. It drives the real exporter over TCP and relies on the local loopback server helpers to capture and inspect the outbound request.
+**Call relations**: This is a top-level test. It relies on `read_http_request` and `write_http_response` through its background fake collector, and it exercises the real `MetricsClient` and OTLP HTTP exporter path.
 
 *Call graph*: calls 2 internal fn (new, otlp); 8 external calls (from_secs, new, from_utf8_lossy, bind, assert!, env!, format!, spawn).
 
@@ -775,11 +793,11 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()>
 fn otlp_http_exporter_sends_logs_to_collector() -> std::result::Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Checks that OTEL log export over HTTP reaches `/v1/logs` with a JSON payload containing the emitted log event name. It validates the provider's logger layer and log exporter wiring.
+**Purpose**: Checks that log events created through Rust’s tracing system are exported over HTTP as OpenTelemetry log data. This catches problems where logs might be recorded locally but never leave the process.
 
-**Data flow**: It starts the same style of loopback server and then builds an `OtelProvider` from `OtelSettings` with `exporter` set to an `OtlpHttp` endpoint at `/v1/logs`, while trace and metrics exporters are disabled. It obtains `logger_layer()`, installs it on a tracing subscriber, emits a `tracing::event!` targeted at `codex_otel.log_only` with `event.name = "codex.test.log_exported"`, and calls `otel.shutdown()`. After collecting captured requests, it finds the `/v1/logs` request, checks JSON content type, decodes the body, and asserts that the event name appears in the payload.
+**Data flow**: The test starts a local listener, configures an OpenTelemetry provider with only log export enabled, attaches its logger layer to a tracing subscriber, and emits one named log event. After shutdown, it inspects the captured request and confirms that `/v1/logs`, a JSON content type, and the expected event name are present.
 
-**Call relations**: This test exercises the provider-level log export path rather than the standalone metrics client. It depends on the loopback server helpers and on `OtelProvider::from` to build the logger layer under test.
+**Call relations**: This top-level test uses the same fake collector pattern as the metrics test. The tracing subscriber sends the event into the provider, the provider sends it to the loopback server, and the captured request is checked afterward.
 
 *Call graph*: calls 1 internal fn (from); 12 external calls (new, from_secs, new, from, from_utf8_lossy, bind, assert!, env!, format!, spawn (+2 more)).
 
@@ -790,11 +808,11 @@ fn otlp_http_exporter_sends_logs_to_collector() -> std::result::Result<(), Box<d
 fn otel_provider_rejects_header_unsafe_configured_tracestate()
 ```
 
-**Purpose**: Ensures provider construction fails when configured tracestate contains header-unsafe values. This protects OTLP/trace propagation from invalid newline-containing entries.
+**Purpose**: Checks that the OpenTelemetry provider refuses trace-state configuration that would be unsafe in an HTTP header. This protects telemetry propagation from malformed or potentially dangerous header values.
 
-**Data flow**: It calls `OtelProvider::from(&OtelSettings { ... })` with a trace exporter configured for OTLP/HTTP and a `tracestate` map containing `"one\ntwo"` as a value. It captures the resulting error, asserts that provider creation failed, and checks that the error string mentions `configured tracestate value`.
+**Data flow**: The test builds provider settings with a configured tracestate value containing a newline. It asks the provider to build itself and expects that to fail. It then checks that the error message points to the unsafe configured tracestate value.
 
-**Call relations**: This is a direct configuration-validation test. Unlike the loopback export tests, it never starts a provider successfully or emits telemetry; it verifies rejection during provider construction.
+**Call relations**: This test does not use the loopback server because it is testing configuration validation before any network export happens. It directly exercises provider creation and confirms bad trace-context settings are rejected early.
 
 *Call graph*: calls 1 internal fn (from); 6 external calls (from, new, new, from, assert!, env!).
 
@@ -805,11 +823,11 @@ fn otel_provider_rejects_header_unsafe_configured_tracestate()
 fn otlp_http_exporter_sends_traces_to_collector() -> std::result::Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Verifies end-to-end OTLP/HTTP trace export, including span export, trace event export, configured span attributes, and tracestate merging with propagated parent context. It is the most complete trace loopback test in the file.
+**Purpose**: Checks that spans and trace events are exported over HTTP, and that configured trace-state values are merged safely into propagated trace context. A span is a named stretch of work inside a trace.
 
-**Data flow**: The test first acquires `TRACE_CONTEXT_CONFIG_LOCK` to serialize trace-context-sensitive execution, then starts the loopback server. It builds an `OtelProvider` with `trace_exporter` pointing at `/v1/traces`, configured span attributes, and configured tracestate entries. After installing `tracing_layer()` on a subscriber, it creates a span with OTEL semantic fields, sets its parent from a `W3cTraceContext` containing both `traceparent` and incoming `tracestate`, enters the span, reads back `current_span_w3c_trace_context()`, emits a trace-safe event `codex.test.trace_event`, and logs an info message. After shutdown it asserts that the propagated tracestate string reflects merging of configured entries into the incoming vendor entry, then inspects the captured `/v1/traces` request body for the span name, service name, configured attribute, and trace event name.
+**Data flow**: The test locks shared trace-context configuration so similar tests do not interfere with each other, starts a fake collector, and configures trace export to `/v1/traces`. It creates a span, sets its parent from incoming W3C trace context, enters the span, reads back the current propagated context, emits trace events, and shuts down the provider. It then checks both the propagated tracestate string and the captured JSON body for the span name, service name, configured attribute, and event name.
 
-**Call relations**: This test combines the loopback transport harness with the trace-context helper APIs from `codex_otel`. It validates both exporter transport and propagation behavior in one flow.
+**Call relations**: This is the main end-to-end trace test. It uses the helper HTTP reader and writer through the server thread, calls into Codex’s trace-context helper functions to set and read W3C context, and verifies that the exporter sends the resulting trace to the fake collector.
 
 *Call graph*: calls 1 internal fn (from); 13 external calls (from, from_secs, new, from, from_utf8_lossy, bind, assert!, assert_eq!, env!, format! (+3 more)).
 
@@ -820,11 +838,11 @@ fn otlp_http_exporter_sends_traces_to_collector() -> std::result::Result<(), Box
 async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime() -> std::result::Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Checks that OTLP/HTTP trace export works correctly when the test itself runs inside a multi-threaded Tokio runtime. It guards against runtime-specific exporter issues.
+**Purpose**: Checks that trace export works while running inside a multi-threaded Tokio runtime. Tokio is Rust’s common async task runner, so this guards against exporter behavior that only works in plain synchronous tests.
 
-**Data flow**: Under `#[tokio::test]`, it acquires the trace-context lock, starts the loopback server, constructs an `OtelProvider` with an OTLP/HTTP trace exporter to `/v1/traces`, installs the tracing layer on a subscriber, emits a span named `trace-loopback-tokio` and an info event inside that span, then shuts the provider down. After collecting captured requests, it verifies the `/v1/traces` request has JSON content type and that the body contains the span name and service name.
+**Data flow**: The async test starts a fake HTTP collector, builds an OpenTelemetry provider with trace export enabled, installs the tracing layer, creates and enters a span, emits a trace message, then shuts the provider down. It reads the captured request and confirms that `/v1/traces`, JSON content, the span name, and the service name were sent.
 
-**Call relations**: This test mirrors the synchronous trace loopback test but specifically exercises the exporter under Tokio's multi-thread runtime. It uses the same local server capture pattern for assertions.
+**Call relations**: This top-level Tokio test follows the same loopback pattern as the synchronous trace test, but runs under a multi-thread async runtime. It demonstrates that the exporter can operate correctly when an async runtime is already active.
 
 *Call graph*: calls 1 internal fn (from); 12 external calls (new, from_secs, new, from, from_utf8_lossy, bind, assert!, env!, format!, spawn (+2 more)).
 
@@ -835,11 +853,11 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime() -> std:
 fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime() -> std::result::Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Verifies trace export also succeeds inside a manually created current-thread Tokio runtime running on a dedicated OS thread. It covers another runtime integration mode that can expose shutdown or scheduling bugs.
+**Purpose**: Checks that trace export also works inside a single-threaded Tokio runtime. This is important because single-thread runtimes have different blocking and scheduling constraints than multi-thread ones.
 
-**Data flow**: It acquires the trace-context lock, starts the loopback server, then spawns a separate thread that builds a current-thread Tokio runtime and runs an async block. Inside that runtime it constructs an `OtelProvider` with an OTLP/HTTP trace exporter to `/v1/traces`, installs the tracing layer, emits a span named `trace-loopback-current-thread` with an info event, shuts the provider down, and sends the result back over an `mpsc` channel. The outer test waits for runtime completion, joins the runtime thread and server thread, then inspects the captured `/v1/traces` request for JSON content type, span name, and service name.
+**Data flow**: The test starts a fake collector, then starts a separate thread containing a current-thread Tokio runtime. Inside that runtime it creates the OpenTelemetry provider, records a span and trace message, shuts the provider down, and sends the result back through a channel. The outer test waits for completion, collects the HTTP request, and checks that it contains the expected trace endpoint, JSON content type, span name, and service name.
 
-**Call relations**: This test is the runtime-variant companion to the previous trace tests. It adds an extra thread and result channel around the same provider/exporter flow to validate current-thread Tokio compatibility.
+**Call relations**: This top-level test combines the loopback collector with an explicitly built current-thread Tokio runtime. The extra runtime thread and result channel let the test prove the exporter finishes cleanly even in that stricter async environment.
 
 *Call graph*: 5 external calls (from_secs, from_utf8_lossy, bind, assert!, spawn).
 
@@ -849,13 +867,17 @@ These files build up analytics-focused fixtures and verify analytics client beha
 
 ### `analytics/src/client_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is the focused unit-test companion to `analytics/src/client.rs`. Unlike the larger reducer-oriented test suite, these tests target the client façade and delivery helpers directly. The helper constructors build minimal `TrackEventRequest` values—one regular skill invocation event and one accepted-line-fingerprint event—plus representative client requests and responses for turn start/steer, thread lifecycle, and an ignored thread archive case.
+This is a test file for the analytics system. The analytics client watches some client requests and server responses, turns the important ones into internal analytics facts, and later sends event payloads either to an HTTP endpoint or, in debug builds, to a local capture file. These tests act like a checklist for that behavior.
 
-A key theme is destination behavior. In debug builds, tests verify that `AnalyticsEventsDestination::from_base_url_and_capture_file` chooses `CaptureFile`, creates the file immediately, and on Unix applies mode `0o600`. Additional async tests send captured requests through `send_track_events_request`, then read the JSONL file back to confirm exact serialized payloads and that isolated batches become separate lines. Another test confirms that capture write failures still count as consumed delivery, matching the production design that capture mode disables network fallback.
+The file first defines small sample events, requests, responses, and threads. These are like stage props: realistic enough to exercise the analytics code, but simple and predictable. The tests then check three main areas.
 
-The file also validates client-side filtering and batching. `client_with_receiver` constructs an `AnalyticsEventsClient` around a test channel so tests can inspect raw `AnalyticsFact`s emitted by `track_request` and `track_response`. Those tests prove only analytics-relevant request/response variants are enqueued. Finally, `track_event_request_batches_only_isolates_accepted_line_fingerprint_events` documents the batching rule that accepted-line fingerprint events must be sent in isolated requests while ordinary events can be grouped before and after them.
+First, they verify destination selection. In debug builds, a caller can ask analytics to write JSON lines to a capture file, which is useful for local inspection. In normal release builds, that capture-file option is ignored and analytics goes to the HTTP endpoint instead.
+
+Second, they verify capture-file writing. A sent event should appear as exactly the serialized JSON request expected, one payload per line. Even if writing fails, the delivery is treated as consumed so the queue does not get stuck retrying a bad local debug path.
+
+Third, they verify filtering and batching. Only analytics-relevant app-server requests and responses are enqueued. Archive messages are ignored. Accepted-line-fingerprint events are split into their own one-event requests, while ordinary events can stay grouped together.
 
 #### Function details
 
@@ -865,11 +887,11 @@ The file also validates client-side filtering and batching. `client_with_receive
 fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest
 ```
 
-**Purpose**: Builds a minimal accepted-line-fingerprints analytics event fixture for batching and capture tests.
+**Purpose**: Builds a sample analytics event for accepted line fingerprints, meaning information about code lines the user accepted. Tests use it to check special batching rules for this event type.
 
-**Data flow**: Accepts `thread_id`, constructs a boxed `CodexAcceptedLineFingerprintsEventRequest` with fixed turn id, counts, and empty fingerprints, wraps it in `TrackEventRequest::AcceptedLineFingerprints`, and returns it.
+**Data flow**: It takes a thread ID as input, copies it into a fixed test event, fills in predictable fields such as turn ID, model name, and line counts, and returns a `TrackEventRequest` containing that event. It does not change any outside state.
 
-**Call relations**: Used by batching tests to represent the event type that must be isolated into its own request.
+**Call relations**: This helper creates the special event that `track_event_request_batches_only_isolates_accepted_line_fingerprint_events` uses to prove these events are separated from ordinary analytics events. It also supplies one of the event types used by the capture-file batch test.
 
 *Call graph*: 3 external calls (new, new, AcceptedLineFingerprints).
 
@@ -880,11 +902,11 @@ fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest
 fn sample_regular_track_event(thread_id: &str) -> TrackEventRequest
 ```
 
-**Purpose**: Builds a minimal non-isolated skill invocation analytics event fixture.
+**Purpose**: Builds a normal sample analytics event for a skill invocation, meaning a user or system action that invoked a named skill. Tests use it as the ordinary event type to compare against the special accepted-line-fingerprint event.
 
-**Data flow**: Accepts `thread_id`, formats `skill-{thread_id}` as the skill id, fills `SkillInvocationEventParams` with fixed turn/model/invocation data, wraps it in `TrackEventRequest::SkillInvocation`, and returns it.
+**Data flow**: It takes a thread ID, uses it in the event’s thread field and in a generated skill ID, fills in fixed test values for the rest, and returns a `TrackEventRequest`. No files, queues, or shared state are touched.
 
-**Call relations**: Used by capture and batching tests as the ordinary event type that can share requests.
+**Call relations**: The capture-file tests call this helper when they need a predictable event payload. It is also paired with accepted-line-fingerprint events in batching tests so the code can prove which events stay grouped and which are isolated.
 
 *Call graph*: called by 1 (capture_file_writes_exact_serialized_request); 2 external calls (SkillInvocation, format!).
 
@@ -895,11 +917,11 @@ fn sample_regular_track_event(thread_id: &str) -> TrackEventRequest
 fn unique_capture_path(name: &str) -> PathBuf
 ```
 
-**Purpose**: Generates a unique temporary JSONL path for capture-file tests.
+**Purpose**: Creates a unique temporary file path for debug analytics capture tests. This avoids tests stepping on each other’s files when they run close together or in parallel.
 
-**Data flow**: Accepts a name prefix, reads the current system time in nanoseconds since the Unix epoch, gets the process id, formats a filename `codex-analytics-{name}-{pid}-{nonce}.jsonl`, joins it under `std::env::temp_dir()`, and returns the `PathBuf`.
+**Data flow**: It takes a short name, reads the current time and the current process ID, combines them with the system temporary directory, and returns a path ending in `.jsonl`. It only creates a path string; the file is created later by the analytics destination code.
 
-**Call relations**: Used by all capture-file tests to avoid collisions between runs.
+**Call relations**: Destination and capture-file tests call this before asking analytics to write locally. It gives each test its own scratch location, which is then passed into destination creation or direct capture-file sending.
 
 *Call graph*: called by 4 (analytics_destination_uses_explicit_capture_file, capture_file_writes_exact_serialized_request, capture_file_writes_final_batches_as_separate_lines, capture_write_failure_still_consumes_delivery); 3 external calls (now, format!, temp_dir).
 
@@ -910,11 +932,11 @@ fn unique_capture_path(name: &str) -> PathBuf
 fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFact>)
 ```
 
-**Purpose**: Constructs an enabled `AnalyticsEventsClient` backed by a test channel so tests can inspect enqueued `AnalyticsFact`s directly.
+**Purpose**: Creates a test analytics client together with the receiving end of its internal queue. This lets tests see exactly what the client tried to enqueue.
 
-**Data flow**: Creates an `mpsc` channel, builds an `AnalyticsEventsQueue` with that sender and empty dedupe sets, wraps it in `AnalyticsEventsClient { queue: Some(queue) }`, and returns the client plus receiver.
+**Data flow**: It creates a small message channel, wraps the sending side in an `AnalyticsEventsQueue`, initializes the duplicate-prevention sets, and returns the client plus the receiver. The caller can then trigger tracking and inspect what arrives on the receiver.
 
-**Call relations**: Shared by the request-filtering and response-filtering tests.
+**Call relations**: The request-filtering and response-filtering tests use this setup. They call tracking methods on the returned client, then read from the receiver to confirm whether an `AnalyticsFact` was or was not queued.
 
 *Call graph*: called by 2 (track_request_only_enqueues_analytics_relevant_requests, track_response_only_enqueues_analytics_relevant_responses); 4 external calls (new, new, new, channel).
 
@@ -925,11 +947,11 @@ fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFac
 fn analytics_destination_uses_explicit_capture_file()
 ```
 
-**Purpose**: Verifies that in debug builds an explicit capture-file path selects `CaptureFile`, creates the file, and applies secure Unix permissions.
+**Purpose**: Checks that, in debug builds, an explicit capture file path makes analytics write to that file instead of sending over the network. It also checks that the file is created empty and privately readable/writable on Unix systems.
 
-**Data flow**: Generates a unique path, calls `AnalyticsEventsDestination::from_base_url_and_capture_file` with that path, asserts the returned enum variant, reads the file contents to confirm it exists and is empty, optionally checks Unix mode `0o600`, and removes the file.
+**Data flow**: It creates a unique path, asks the destination builder to use that capture file, and compares the result with the expected capture-file destination. It then reads the file to confirm it starts empty, checks file permissions on Unix, and deletes the file afterward.
 
-**Call relations**: Tests the capture-file branch of destination selection and initialization.
+**Call relations**: This test directly exercises `AnalyticsEventsDestination::from_base_url_and_capture_file`. It relies on `unique_capture_path` for a safe scratch file and validates the debug-only local capture path used by later capture-writing tests.
 
 *Call graph*: calls 2 internal fn (from_base_url_and_capture_file, unique_capture_path); 3 external calls (assert_eq!, metadata, remove_file).
 
@@ -940,11 +962,11 @@ fn analytics_destination_uses_explicit_capture_file()
 fn analytics_destination_uses_http_without_capture_file()
 ```
 
-**Purpose**: Verifies that without a capture file the destination is the expected HTTP endpoint URL.
+**Purpose**: Checks the normal destination choice when no capture file is requested. Analytics should send to the backend HTTP endpoint built from the base URL.
 
-**Data flow**: Calls `from_base_url_and_capture_file` with a backend-api base URL and `None`, then asserts the returned destination is `Http` with `/codex/analytics-events/events` appended.
+**Data flow**: It passes a backend base URL and no capture file into the destination builder, then compares the returned destination with the exact expected HTTP URL. It does not touch the filesystem.
 
-**Call relations**: Tests the normal network-delivery branch of destination selection.
+**Call relations**: This test covers the everyday path of `AnalyticsEventsDestination::from_base_url_and_capture_file`: no local debug capture, so the destination becomes the analytics-events HTTP endpoint.
 
 *Call graph*: calls 1 internal fn (from_base_url_and_capture_file); 1 external calls (assert_eq!).
 
@@ -955,11 +977,11 @@ fn analytics_destination_uses_http_without_capture_file()
 fn analytics_destination_ignores_capture_file_in_release()
 ```
 
-**Purpose**: Verifies that non-debug builds ignore an explicit capture-file path and still choose HTTP delivery.
+**Purpose**: Checks that release builds do not honor the debug capture-file option. This helps prevent production builds from silently writing analytics data to an arbitrary local file.
 
-**Data flow**: Calls `from_base_url_and_capture_file` with a capture path in a release-only test configuration and asserts the result is the expected `Http` destination.
+**Data flow**: It passes both a backend base URL and a capture-file path, then expects the destination to still be the HTTP endpoint. The capture path is only a test value and should not be used.
 
-**Call relations**: Documents the compile-time behavior difference between debug and non-debug builds.
+**Call relations**: This release-only test exercises the same destination builder as the debug destination tests, but proves the build configuration changes the behavior: capture files are for debug builds only.
 
 *Call graph*: calls 1 internal fn (from_base_url_and_capture_file); 2 external calls (assert_eq!, from).
 
@@ -970,11 +992,11 @@ fn analytics_destination_ignores_capture_file_in_release()
 async fn capture_file_writes_exact_serialized_request()
 ```
 
-**Purpose**: Checks that sending one batch to a capture-file destination writes exactly one JSON line containing the serialized `TrackEventsRequest`.
+**Purpose**: Checks that sending one analytics event to a capture file writes exactly the JSON payload expected. This guards against accidental changes in the capture-file format.
 
-**Data flow**: Creates a unique capture path and `CaptureFile` destination, builds one regular event and its expected JSON value, creates dummy auth, calls `send_track_events_request`, reads the file, parses the single line as JSON, and asserts it equals `{ "events": [expected_event] }`, then removes the file.
+**Data flow**: It creates a temporary capture path, builds one regular sample event, serializes that event to the expected JSON value, and sends it through the analytics sending function with dummy authentication. It then reads the file, parses the single line as JSON, compares it with `{ "events": [...] }`, and removes the file.
 
-**Call relations**: Exercises the debug capture path inside `send_track_events_request`.
+**Call relations**: This test calls `sample_regular_track_event` and `unique_capture_path`, then hands the event to `send_track_events_request`. Instead of checking the network, it checks the capture-file destination, which is the debug path used for inspecting outgoing analytics.
 
 *Call graph*: calls 3 internal fn (sample_regular_track_event, unique_capture_path, create_dummy_chatgpt_auth_for_testing); 7 external calls (assert_eq!, read_to_string, remove_file, from_str, to_value, send_track_events_request, vec!).
 
@@ -985,11 +1007,11 @@ async fn capture_file_writes_exact_serialized_request()
 async fn capture_file_writes_final_batches_as_separate_lines()
 ```
 
-**Purpose**: Verifies that after batching, each final request batch written to a capture file occupies its own JSONL line.
+**Purpose**: Checks that each final analytics batch is written as its own line in the capture file. This matters because JSON-lines files store one complete JSON object per line, making captured requests easy to read and replay.
 
-**Data flow**: Creates a capture destination and dummy auth, builds a vector of regular and accepted-line events, iterates over `track_event_request_batches(events)` and sends each batch, then reads and parses all file lines and asserts there are three payloads in the expected order, finally removing the file.
+**Data flow**: It creates a capture file, builds three events, splits them into request batches, and sends each batch to the capture destination. It reads all file lines back, parses each line as JSON, and confirms there are three separate payloads in the expected order.
 
-**Call relations**: Tests the interaction between batching rules and capture-file delivery.
+**Call relations**: This test connects batching and sending: `track_event_request_batches` decides how events are split, and `send_track_events_request` writes each split batch. The test confirms the two pieces produce separate captured requests rather than one merged blob.
 
 *Call graph*: calls 2 internal fn (unique_capture_path, create_dummy_chatgpt_auth_for_testing); 6 external calls (assert_eq!, read_to_string, remove_file, send_track_events_request, track_event_request_batches, vec!).
 
@@ -1000,11 +1022,11 @@ async fn capture_file_writes_final_batches_as_separate_lines()
 fn capture_write_failure_still_consumes_delivery()
 ```
 
-**Purpose**: Checks that capture mode reports delivery as handled even when appending to the capture file fails.
+**Purpose**: Checks that a failed debug capture-file write is still treated as a completed delivery. This prevents a bad local capture path from clogging the analytics queue forever during tests or debug runs.
 
-**Data flow**: Constructs a capture-file destination whose parent directory does not exist, builds a `TrackEventsRequest` with one regular event, calls `capture_track_events_request`, and asserts it returns `true`.
+**Data flow**: It creates a path under a missing parent directory, builds a payload with one regular event, and asks the capture writer to write it. The expected result is success from the caller’s point of view, even though the file cannot actually be written.
 
-**Call relations**: Documents the production behavior that capture mode disables network fallback even on write failure.
+**Call relations**: This test calls the debug capture-writing function directly. It proves that local capture failures are deliberately swallowed so the higher-level delivery loop can keep moving.
 
 *Call graph*: calls 1 internal fn (unique_capture_path); 2 external calls (assert!, vec!).
 
@@ -1015,11 +1037,11 @@ fn capture_write_failure_still_consumes_delivery()
 fn sample_turn_start_request() -> ClientRequest
 ```
 
-**Purpose**: Builds a minimal `ClientRequest::TurnStart` fixture for request-filtering tests.
+**Purpose**: Builds a sample client request that starts a turn, meaning the user begins a new interaction in an existing thread. The request-filtering test uses it as an analytics-relevant request.
 
-**Data flow**: Constructs `RequestId::Integer(1)`, fills `TurnStartParams` with thread id `thread-1`, empty input, and default remaining fields, and returns the request.
+**Data flow**: It creates a `ClientRequest::TurnStart` with a fixed request ID, thread ID, empty input, and default values for less important fields. The result is a ready-made request object for tests.
 
-**Call relations**: Used by the request-filtering test as one of the allowed request variants.
+**Call relations**: The request-filtering test passes this request into `client.track_request` and expects an analytics fact to be queued. It represents one of the request types the analytics client should notice.
 
 *Call graph*: called by 1 (track_request_only_enqueues_analytics_relevant_requests); 3 external calls (default, new, Integer).
 
@@ -1030,11 +1052,11 @@ fn sample_turn_start_request() -> ClientRequest
 fn sample_turn_steer_request() -> ClientRequest
 ```
 
-**Purpose**: Builds a minimal `ClientRequest::TurnSteer` fixture for request-filtering tests.
+**Purpose**: Builds a sample client request that steers an existing turn, meaning it adds guidance or input while a turn is expected to continue. The request-filtering test uses it as another request that should be recorded.
 
-**Data flow**: Constructs `RequestId::Integer(2)`, fills `TurnSteerParams` with fixed thread and expected turn ids and empty input, and returns the request.
+**Data flow**: It creates a `ClientRequest::TurnSteer` with fixed thread and turn IDs, empty input, and no extra metadata. It returns that request object without changing anything else.
 
-**Call relations**: Used by the request-filtering test as the other allowed request variant.
+**Call relations**: The request-filtering test sends this through `client.track_request` after the turn-start request. Both are expected to become queued analytics facts.
 
 *Call graph*: called by 1 (track_request_only_enqueues_analytics_relevant_requests); 2 external calls (new, Integer).
 
@@ -1045,11 +1067,11 @@ fn sample_turn_steer_request() -> ClientRequest
 fn sample_thread_archive_request() -> ClientRequest
 ```
 
-**Purpose**: Builds a `ClientRequest::ThreadArchive` fixture representing a request type that should be ignored by analytics tracking.
+**Purpose**: Builds a sample request to archive a thread. Tests use it as an example of a client request that should not be recorded for analytics.
 
-**Data flow**: Constructs `RequestId::Integer(3)`, fills `ThreadArchiveParams` with `thread-1`, and returns the request.
+**Data flow**: It creates a `ClientRequest::ThreadArchive` with a fixed request ID and thread ID, then returns it. There are no side effects.
 
-**Call relations**: Used by the request-filtering test as the ignored control case.
+**Call relations**: The request-filtering test passes this request into `client.track_request` after the relevant request types. The receiver should stay empty, proving archive requests are intentionally ignored.
 
 *Call graph*: called by 1 (track_request_only_enqueues_analytics_relevant_requests); 1 external calls (Integer).
 
@@ -1060,11 +1082,11 @@ fn sample_thread_archive_request() -> ClientRequest
 fn sample_thread(thread_id: &str) -> Thread
 ```
 
-**Purpose**: Builds a minimal `Thread` fixture shared by thread-start, thread-resume, and thread-fork response builders.
+**Purpose**: Builds a realistic but fixed thread object for response tests. It avoids repeating the same large thread setup in each sample response helper.
 
-**Data flow**: Accepts `thread_id`, fills a `Thread` with deterministic session id, preview, provider, timestamps, cwd, source, and empty turns, and returns it.
+**Data flow**: It takes a thread ID, uses it to fill the thread ID and session ID, supplies fixed metadata such as status, source, working directory, version, and timestamps, and returns a `Thread`. It does not access external services.
 
-**Call relations**: Used by the three thread response helpers to avoid repeating the full thread literal.
+**Call relations**: The thread-start, thread-resume, and thread-fork response helpers call this to embed a thread in their response payloads. Those response payloads are then used to test which server responses analytics records.
 
 *Call graph*: called by 3 (sample_thread_fork_response, sample_thread_resume_response, sample_thread_start_response); 3 external calls (new, test_path_buf, format!).
 
@@ -1075,11 +1097,11 @@ fn sample_thread(thread_id: &str) -> Thread
 fn sample_thread_start_response() -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a minimal `ClientResponsePayload::ThreadStart` fixture for response-filtering tests.
+**Purpose**: Builds a sample server response for starting a thread. The response-filtering test uses it as one of the response types that should produce analytics.
 
-**Data flow**: Calls `sample_thread("thread-1")`, embeds it in `ThreadStartResponse` with fixed model/provider/policy fields, and returns the response enum.
+**Data flow**: It creates a sample thread, adds model, provider, working directory, approval, sandbox, and related fixed settings, wraps everything in a `ThreadStart` response payload, and returns it.
 
-**Call relations**: Used by the response-filtering test as one of the allowed response variants.
+**Call relations**: The response-filtering test sends this payload to `client.track_response` and expects a queued `AnalyticsFact::ClientResponse`. It proves thread-start responses are analytics-relevant.
 
 *Call graph*: calls 1 internal fn (sample_thread); called by 1 (track_response_only_enqueues_analytics_relevant_responses); 3 external calls (ThreadStart, new, test_path_buf).
 
@@ -1090,11 +1112,11 @@ fn sample_thread_start_response() -> ClientResponsePayload
 fn sample_thread_resume_response() -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a minimal `ClientResponsePayload::ThreadResume` fixture for response-filtering tests.
+**Purpose**: Builds a sample server response for resuming an existing thread. Tests use it to confirm resuming a thread is considered analytics-relevant.
 
-**Data flow**: Calls `sample_thread("thread-2")`, embeds it in `ThreadResumeResponse` with fixed metadata, and returns the response enum.
+**Data flow**: It creates a sample thread with a different ID, fills in fixed model and runtime settings, leaves the initial turns page absent, wraps the data in a `ThreadResume` response payload, and returns it.
 
-**Call relations**: Used by the response-filtering test as another allowed response variant.
+**Call relations**: The response-filtering test passes this payload to `client.track_response`. The expected queued fact shows that resume responses are included in analytics tracking.
 
 *Call graph*: calls 1 internal fn (sample_thread); called by 1 (track_response_only_enqueues_analytics_relevant_responses); 3 external calls (ThreadResume, new, test_path_buf).
 
@@ -1105,11 +1127,11 @@ fn sample_thread_resume_response() -> ClientResponsePayload
 fn sample_thread_fork_response() -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a minimal `ClientResponsePayload::ThreadFork` fixture for response-filtering tests.
+**Purpose**: Builds a sample server response for forking a thread, meaning creating a new thread from an existing conversation path. Tests use it as another response that should be recorded.
 
-**Data flow**: Calls `sample_thread("thread-3")`, embeds it in `ThreadForkResponse` with fixed metadata, and returns the response enum.
+**Data flow**: It creates a sample thread, supplies fixed model and runtime settings, wraps it in a `ThreadFork` response payload, and returns it.
 
-**Call relations**: Used by the response-filtering test to cover the thread-fork branch.
+**Call relations**: The response-filtering test sends this payload through `client.track_response` and expects it to be enqueued. Together with start and resume responses, it covers the main thread-creation style responses.
 
 *Call graph*: calls 1 internal fn (sample_thread); called by 1 (track_response_only_enqueues_analytics_relevant_responses); 3 external calls (ThreadFork, new, test_path_buf).
 
@@ -1120,11 +1142,11 @@ fn sample_thread_fork_response() -> ClientResponsePayload
 fn sample_turn_start_response() -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a minimal `ClientResponsePayload::TurnStart` fixture for response-filtering tests.
+**Purpose**: Builds a sample server response for starting a turn. Tests use it to confirm turn-level server responses are also analytics-relevant.
 
-**Data flow**: Constructs a `Turn` with id `turn-1`, `InProgress` status, and empty items, wraps it in `TurnStartResponse`, and returns the response enum.
+**Data flow**: It creates a `Turn` with a fixed ID, empty items, full item view, and an in-progress status, then wraps it in a `TurnStart` response payload. It returns that payload.
 
-**Call relations**: Used by the response-filtering test as one of the allowed turn response variants.
+**Call relations**: The response-filtering test passes this response to `client.track_response`. A queued analytics fact confirms that the analytics client records turn-start responses.
 
 *Call graph*: called by 1 (track_response_only_enqueues_analytics_relevant_responses); 2 external calls (TurnStart, new).
 
@@ -1135,11 +1157,11 @@ fn sample_turn_start_response() -> ClientResponsePayload
 fn sample_turn_steer_response() -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a minimal `ClientResponsePayload::TurnSteer` fixture for response-filtering tests.
+**Purpose**: Builds a sample server response for steering a turn. Tests use it as the response counterpart to a turn-steer request.
 
-**Data flow**: Constructs `TurnSteerResponse { turn_id: "turn-2" }` and returns it inside `ClientResponsePayload::TurnSteer`.
+**Data flow**: It creates a `TurnSteer` response payload containing a fixed new turn ID and returns it. It does not read or write anything outside the function.
 
-**Call relations**: Used by the response-filtering test as the final allowed response variant.
+**Call relations**: The response-filtering test sends this payload into `client.track_response` and expects analytics output. This proves turn-steer responses are included in the tracked response set.
 
 *Call graph*: called by 1 (track_response_only_enqueues_analytics_relevant_responses); 1 external calls (TurnSteer).
 
@@ -1150,11 +1172,11 @@ fn sample_turn_steer_response() -> ClientResponsePayload
 fn track_request_only_enqueues_analytics_relevant_requests()
 ```
 
-**Purpose**: Verifies that `AnalyticsEventsClient::track_request` enqueues only turn-start and turn-steer requests and ignores unrelated request types.
+**Purpose**: Checks that the analytics client queues facts only for client requests that matter to analytics. It should record turn start and turn steer requests, but ignore thread archive requests.
 
-**Data flow**: Builds a client and receiver with `client_with_receiver`, sends a turn-start and turn-steer request through `track_request` and asserts each yields `AnalyticsFact::ClientRequest` on the receiver, then sends a thread-archive request and asserts the receiver remains empty.
+**Data flow**: It creates a test client and receiver, sends sample turn-start and turn-steer requests through `track_request`, and confirms each produces a queued `ClientRequest` analytics fact. It then sends an archive request and confirms the queue remains empty.
 
-**Call relations**: Tests the request-type filtering logic in `AnalyticsEventsClient::track_request`.
+**Call relations**: This test uses `client_with_receiver` as its observation point and the three sample request helpers as inputs. It exercises the client’s request-filtering logic directly.
 
 *Call graph*: calls 4 internal fn (client_with_receiver, sample_thread_archive_request, sample_turn_start_request, sample_turn_steer_request); 2 external calls (Integer, assert!).
 
@@ -1165,11 +1187,11 @@ fn track_request_only_enqueues_analytics_relevant_requests()
 fn track_response_only_enqueues_analytics_relevant_responses()
 ```
 
-**Purpose**: Verifies that `AnalyticsEventsClient::track_response` enqueues only thread lifecycle and turn lifecycle responses and ignores unrelated responses.
+**Purpose**: Checks that the analytics client queues facts only for server responses that matter to analytics. It records thread and turn lifecycle responses, but ignores thread archive responses.
 
-**Data flow**: Builds a client and receiver, sends thread-start, thread-resume, thread-fork, turn-start, and turn-steer responses through `track_response` and asserts each yields `AnalyticsFact::ClientResponse`, then sends a thread-archive response and asserts the receiver remains empty.
+**Data flow**: It creates a test client and receiver, feeds in sample thread-start, thread-resume, thread-fork, turn-start, and turn-steer responses, and confirms each queues a `ClientResponse` analytics fact. It then feeds in a thread-archive response and confirms nothing new is queued.
 
-**Call relations**: Tests the response-type filtering logic in `AnalyticsEventsClient::track_response`.
+**Call relations**: This test uses the response helper functions to cover each important response kind. By reading from the receiver after each call to `track_response`, it verifies the response-filtering rules.
 
 *Call graph*: calls 6 internal fn (client_with_receiver, sample_thread_fork_response, sample_thread_resume_response, sample_thread_start_response, sample_turn_start_response, sample_turn_steer_response); 3 external calls (ThreadArchive, Integer, assert!).
 
@@ -1180,26 +1202,24 @@ fn track_response_only_enqueues_analytics_relevant_responses()
 fn track_event_request_batches_only_isolates_accepted_line_fingerprint_events()
 ```
 
-**Purpose**: Verifies that batching groups ordinary events together but isolates accepted-line-fingerprint events into one-event batches.
+**Purpose**: Checks the batching rule for analytics events: accepted-line-fingerprint events must travel alone, while ordinary events can be grouped together. This helps keep special event payloads separated from regular analytics traffic.
 
-**Data flow**: Builds a mixed vector of regular and accepted-line events, passes it to `track_event_request_batches`, and asserts the number and sizes of returned batches plus that the isolated batches contain events whose `should_send_in_isolated_request()` is true.
+**Data flow**: It builds a list containing two ordinary events, two accepted-line-fingerprint events, and two more ordinary events. It passes the list to the batch splitter, then checks that the output is four batches: ordinary pair, special single, special single, ordinary pair.
 
-**Call relations**: Tests the batching policy used by `send_track_events` before delivery.
+**Call relations**: This test calls `track_event_request_batches`, using the sample event helpers to create the input mix. It confirms the batching function respects each event’s `should_send_in_isolated_request` rule.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, track_event_request_batches, vec!).
 
 
 ### `analytics/src/analytics_client_tests.rs`
 
-`test` · `test execution`
+`test` · `test`
 
-This file is the main behavioral specification for the analytics subsystem. Most of it is test-only fixture construction around `AnalyticsReducer`, `TrackEventRequest`, and the app-server protocol types. The helper functions synthesize realistic `Thread`, `Turn`, `ClientRequest`, `ClientResponsePayload`, `ServerNotification`, approval requests/responses, plugin metadata, and custom analytics facts so tests can drive reducer state transitions without standing up a server.
+The analytics reducer listens to many small facts: a client connects, a thread starts, a turn begins, a tool runs, a review finishes, a plugin is used, or an error happens. This test file feeds the reducer carefully chosen examples of those facts and then checks the outgoing analytics events. In everyday terms, it is like a receipt checker: after a complicated shopping trip, it confirms every item was recorded once, in the right category, with the right totals.
 
-A recurring pattern is staged ingestion: helpers like `ingest_initialize`, `ingest_turn_prerequisites`, `ingest_review_prerequisites`, `ingest_completed_command_execution_item`, `ingest_complete_child_turn`, and `ingest_rejected_turn_steer` feed ordered `AnalyticsFact` sequences into a reducer and collect emitted `TrackEventRequest`s. This lets tests focus on specific invariants: thread initialization should wait for client metadata, turn events require both initialization and resolved config, accepted-line events should emit once on completion from the latest diff, review events should denormalize onto tool items only within the same thread, and subagent threads should inherit parent connection metadata unless an explicit turn connection supersedes it.
+The first part of the file builds reusable sample data: fake threads, turns, approval requests, tool items, errors, plugin metadata, and runtime metadata. These helpers keep the tests readable and make each scenario realistic.
 
-The assertions are concrete JSON-shape checks, not just type checks. They verify exact field names, enum serialization, nullability, counts, timestamps, and nested metadata for app usage, plugins, hooks, compaction, guardian reviews, command execution, thread initialization, turn events, and turn-steer events. Several tests also lock down edge cases: ignored unrelated requests/responses, aborted approvals emitting once, reused item ids not crossing threads, accepted steer counts excluding rejected steers, and started-at remaining null when no start notification arrived.
-
-Because the reducer itself lives elsewhere, this file’s value is in documenting expected control flow and state prerequisites through executable scenarios. The helper builders are intentionally repetitive and explicit so each test can assemble only the facts relevant to the behavior under scrutiny.
+The tests then cover the main analytics promises. They verify JSON shapes for events, so dashboards and downstream systems do not break. They check reducer behavior across lifecycles: thread initialization, turn completion, steering requests, tool-item completion, reviews, subagents, compaction, hooks, apps, plugins, and skills. They also test edge cases, such as ignoring unrelated requests, not emitting incomplete turn events, preventing duplicate app/plugin usage events, keeping review counts scoped to the correct thread, and dropping huge line fingerprints while still reporting aggregate accepted-line counts.
 
 #### Function details
 
@@ -1215,11 +1235,11 @@ fn sample_thread_with_metadata(
 )
 ```
 
-**Purpose**: Builds a representative `codex_app_server_protocol::Thread` fixture with configurable identity, source, and lineage fields for reducer tests.
+**Purpose**: Builds a realistic fake thread with common metadata such as IDs, session ID, source, working directory, and parent thread information. Tests use it when they need a thread object without repeating all fields.
 
-**Data flow**: Takes `thread_id`, `ephemeral`, `source`, `thread_source`, and `parent_thread_id`; fills a `Thread` struct with deterministic session id, preview, provider, timestamps, cwd, version, and empty turns; returns the populated thread.
+**Data flow**: It receives a thread ID, whether the thread is temporary, where the session came from, optional thread source, and optional parent ID. It fills in standard sample values around those inputs and returns a complete Thread value.
 
-**Call relations**: Used by both thread-start and thread-resume response builders so tests can vary thread metadata without duplicating the full struct literal.
+**Call relations**: This is the base helper for thread-start and thread-resume samples. Those helpers call it so tests can focus on the behavior being checked instead of thread construction details.
 
 *Call graph*: called by 2 (sample_thread_resume_response_with_source, sample_thread_start_response); 3 external calls (new, test_path_buf, format!).
 
@@ -1234,11 +1254,11 @@ fn sample_thread_start_response(
 ) -> ClientResponsePayload
 ```
 
-**Purpose**: Wraps a sample thread in a `ClientResponsePayload::ThreadStart` fixture with standard model and policy metadata.
+**Purpose**: Creates a fake successful response for starting a new thread. Tests use it to make the reducer believe the app server has opened a thread.
 
-**Data flow**: Accepts `thread_id`, `ephemeral`, and `model`, calls `sample_thread_with_metadata` with `Exec`/`User` defaults and no parent, then embeds the thread plus cwd, approval, sandbox, and model fields into `ThreadStartResponse` inside `ClientResponsePayload`.
+**Data flow**: It takes a thread ID, temporary-thread flag, and model name. It builds a thread with sample metadata, wraps it in a thread-start response, and returns it as a client response payload.
 
-**Call relations**: Used widely by tests that need a thread lifecycle to begin from a start response. It is a common prerequisite in reducer setup helpers.
+**Call relations**: Many reducer tests call this after an initialize fact. It hands the reducer the thread metadata needed before later turn, review, compaction, or subagent assertions can make sense.
 
 *Call graph*: calls 1 internal fn (sample_thread_with_metadata); called by 6 (guardian_review_event_ingests_custom_fact_with_optional_target_item, ingest_review_prerequisites, ingest_turn_prerequisites, initialize_caches_client_and_thread_lifecycle_publishes_once_initialized, item_review_summaries_do_not_cross_threads_with_reused_item_ids, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit); 3 external calls (ThreadStart, new, test_path_buf).
 
@@ -1249,11 +1269,11 @@ fn sample_thread_start_response(
 fn sample_app_server_client_metadata() -> CodexAppServerClientMetadata
 ```
 
-**Purpose**: Returns a canonical `CodexAppServerClientMetadata` fixture used in serialization assertions.
+**Purpose**: Returns a standard sample description of the client that is talking to the app server. Tests use it when checking serialized analytics events.
 
-**Data flow**: Constructs and returns a `CodexAppServerClientMetadata` with `DEFAULT_ORIGINATOR`, fixed client name/version, stdio transport, and `experimental_api_enabled: Some(true)`.
+**Data flow**: It reads no input. It returns fixed metadata such as product client ID, client name, client version, transport, and experimental API flag.
 
-**Call relations**: Used by serialization-only tests that need stable expected nested client metadata in event payloads.
+**Call relations**: Serialization tests for compaction and turn events call this so their expected JSON includes consistent client information.
 
 *Call graph*: called by 2 (compaction_event_serializes_expected_shape, turn_event_serializes_expected_shape).
 
@@ -1264,11 +1284,11 @@ fn sample_app_server_client_metadata() -> CodexAppServerClientMetadata
 fn sample_runtime_metadata() -> CodexRuntimeMetadata
 ```
 
-**Purpose**: Returns a canonical `CodexRuntimeMetadata` fixture used across reducer and serialization tests.
+**Purpose**: Returns a standard sample description of the runtime environment. This lets tests check that analytics events include operating system and Codex version details.
 
-**Data flow**: Constructs and returns a `CodexRuntimeMetadata` with fixed version, OS, OS version, and architecture strings.
+**Data flow**: It takes no input. It produces fixed runtime values such as Codex version, OS, OS version, and CPU architecture.
 
-**Call relations**: Shared by many tests and setup helpers whenever runtime metadata must be attached to initialize facts or expected event payloads.
+**Call relations**: Initialization helpers and event-shape tests call it whenever reducer output needs runtime metadata.
 
 *Call graph*: called by 7 (compaction_event_ingests_custom_fact, compaction_event_serializes_expected_shape, guardian_review_event_ingests_custom_fact_with_optional_target_item, ingest_initialize, ingest_rejected_turn_steer, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit, turn_event_serializes_expected_shape).
 
@@ -1283,11 +1303,11 @@ fn sample_thread_resume_response(
 ) -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a standard thread-resume response fixture using default session and thread-source values.
+**Purpose**: Creates a simple fake response for resuming an existing thread. Tests use it when they do not need special source or parent-thread details.
 
-**Data flow**: Accepts `thread_id`, `ephemeral`, and `model`, forwards them to `sample_thread_resume_response_with_source` with `Exec`, `Some(User)`, and no parent, and returns the resulting `ClientResponsePayload`.
+**Data flow**: It receives a thread ID, temporary-thread flag, and model name. It passes those plus default source information into the more detailed resume helper and returns the resulting client response payload.
 
-**Call relations**: Used by tests that need a resumed thread without customizing source or lineage. It is a convenience wrapper over the more configurable builder.
+**Call relations**: This is a convenience wrapper used by initialization and rejected-steering tests. It delegates the actual construction to sample_thread_resume_response_with_source.
 
 *Call graph*: calls 1 internal fn (sample_thread_resume_response_with_source); called by 2 (ingest_rejected_turn_steer, initialize_caches_client_and_thread_lifecycle_publishes_once_initialized).
 
@@ -1304,11 +1324,11 @@ fn sample_thread_resume_response_with_source(
     paren
 ```
 
-**Purpose**: Builds a `ClientResponsePayload::ThreadResume` fixture with caller-controlled session source, thread source, and parent lineage.
+**Purpose**: Creates a fake thread-resume response with explicit session source, thread source, and parent thread information. Tests use it for subagent and lineage scenarios.
 
-**Data flow**: Takes thread identity and metadata arguments, constructs the underlying thread via `sample_thread_with_metadata`, then embeds it into `ThreadResumeResponse` with standard model/provider/policy fields and returns it as `ClientResponsePayload`.
+**Data flow**: It takes thread identity, temporary flag, model, source details, and optional parent ID. It builds a full ThreadResume payload containing both standard defaults and those specific lineage fields.
 
-**Call relations**: Used directly by tests that need subagent or inherited-lineage scenarios, and indirectly by `sample_thread_resume_response`.
+**Call relations**: The simple resume helper calls this with defaults. Subagent and compaction tests call it directly when they need the reducer to remember where a resumed thread came from.
 
 *Call graph*: calls 1 internal fn (sample_thread_with_metadata); called by 2 (compaction_event_ingests_custom_fact, sample_thread_resume_response); 3 external calls (ThreadResume, new, test_path_buf).
 
@@ -1319,11 +1339,11 @@ fn sample_thread_resume_response_with_source(
 fn sample_turn_start_request(thread_id: &str, request_id: i64) -> ClientRequest
 ```
 
-**Purpose**: Creates a representative `ClientRequest::TurnStart` containing one text input and one image input.
+**Purpose**: Builds a fake client request to start a turn. The request includes both text and an image so tests can verify input-image counting.
 
-**Data flow**: Accepts `thread_id` and integer `request_id`, constructs `RequestId::Integer`, fills `TurnStartParams` with the thread id, two `UserInput` entries, and defaulted remaining fields, and returns the request enum.
+**Data flow**: It receives a thread ID and request ID. It creates a TurnStart request for that thread with sample user inputs and returns it as a ClientRequest.
 
-**Call relations**: Used by turn lifecycle setup helpers and tests that verify request tracking or pending-turn behavior.
+**Call relations**: Turn lifecycle helpers and error-handling tests feed this request into the reducer before sending a matching response or error.
 
 *Call graph*: called by 3 (ingest_turn_prerequisites, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit, turn_start_error_response_discards_pending_start_request); 3 external calls (default, Integer, vec!).
 
@@ -1334,11 +1354,11 @@ fn sample_turn_start_request(thread_id: &str, request_id: i64) -> ClientRequest
 fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload
 ```
 
-**Purpose**: Creates a `ClientResponsePayload::TurnStart` fixture for an in-progress turn with no items yet.
+**Purpose**: Builds a fake successful response for starting a turn. Tests use it to connect a client request to a concrete turn ID.
 
-**Data flow**: Accepts `turn_id`, constructs a `Turn` with `InProgress` status and empty items, wraps it in `TurnStartResponse`, and returns `ClientResponsePayload::TurnStart`.
+**Data flow**: It receives a turn ID. It creates an in-progress Turn object with that ID and returns it in a TurnStart response payload.
 
-**Call relations**: Paired with `sample_turn_start_request` in setup helpers to establish reducer turn state.
+**Call relations**: Turn setup helpers and unrelated-request tests use it to verify that the reducer only creates turn state when the response matches a relevant pending request.
 
 *Call graph*: called by 4 (ingest_turn_prerequisites, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit, turn_start_error_response_discards_pending_start_request, unrelated_client_requests_are_ignored_by_reducer); 2 external calls (TurnStart, vec!).
 
@@ -1349,11 +1369,11 @@ fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload
 fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNotification
 ```
 
-**Purpose**: Builds a `ServerNotification::TurnStarted` fixture carrying a started timestamp for a turn.
+**Purpose**: Creates a fake server notification saying a turn has started. Tests use it to give the reducer a start timestamp.
 
-**Data flow**: Takes `thread_id` and `turn_id`, constructs a `Turn` with `started_at: Some(455)` and `InProgress` status, wraps it in `TurnStartedNotification`, and returns the notification enum.
+**Data flow**: It receives a thread ID and turn ID. It returns a notification containing an in-progress turn with a fixed started-at timestamp.
 
-**Call relations**: Used when tests need the reducer to record explicit turn start timing before completion or item activity.
+**Call relations**: Turn and tool-item tests send this before completion so emitted analytics can include start time and duration-related context.
 
 *Call graph*: called by 4 (ingest_completed_command_execution_item, ingest_turn_prerequisites, item_lifecycle_notifications_publish_command_execution_event, subagent_tool_items_inherit_parent_connection_metadata); 2 external calls (TurnStarted, vec!).
 
@@ -1364,11 +1384,11 @@ fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNot
 fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> TurnTokenUsageFact
 ```
 
-**Purpose**: Creates a `TurnTokenUsageFact` fixture with fixed token counts for reducer tests.
+**Purpose**: Creates sample token usage for a turn. Tokens are the chunks of text the model reads or writes, and analytics uses them for cost and performance reporting.
 
-**Data flow**: Accepts `thread_id` and `turn_id`, fills a `TokenUsage` struct with deterministic totals and wraps it in `TurnTokenUsageFact`.
+**Data flow**: It receives thread and turn IDs. It returns a custom fact with fixed input, cached input, output, reasoning, and total token counts.
 
-**Call relations**: Injected by setup helpers and inheritance tests to verify token usage fields appear on emitted turn events.
+**Call relations**: Turn prerequisite setup and subagent tests feed this into the reducer so final turn events can include usage numbers.
 
 *Call graph*: called by 2 (ingest_turn_prerequisites, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit).
 
@@ -1384,11 +1404,11 @@ fn sample_turn_completed_notification(
 ) -> ServerNoti
 ```
 
-**Purpose**: Builds a `ServerNotification::TurnCompleted` fixture with configurable terminal status and optional codex error info.
+**Purpose**: Builds a fake server notification saying a turn has finished. Tests use it to trigger final turn analytics.
 
-**Data flow**: Takes `thread_id`, `turn_id`, terminal `AppServerTurnStatus`, and optional `CodexErrorInfo`; constructs a `Turn` with `completed_at: Some(456)`, `duration_ms: Some(1234)`, and optional wrapped `AppServerTurnError`; returns the notification enum.
+**Data flow**: It receives a thread ID, turn ID, final status, and optional error details. It returns a TurnCompleted notification with fixed completion time and duration, and includes an error object when requested.
 
-**Call relations**: This is the standard terminal event used across many tests to trigger reducer emission of turn-level analytics.
+**Call relations**: Many lifecycle tests use this as the final step. Once it is ingested, the reducer may emit turn events, accepted-line summaries, or nothing if prerequisites are missing.
 
 *Call graph*: called by 12 (accepted_steers_increment_turn_steer_count, ingest_complete_child_turn, item_completed_without_turn_state_does_not_create_turn_state, reducer_emits_accepted_line_fingerprints_once_from_latest_turn_diff_on_completion, reducer_emits_large_accepted_line_aggregates_without_fingerprints, turn_completed_without_started_notification_emits_null_started_at, turn_does_not_emit_without_required_prerequisites, turn_event_counts_completed_tool_items, turn_lifecycle_emits_failed_turn_event, turn_lifecycle_emits_interrupted_turn_event_without_error (+2 more)); 2 external calls (TurnCompleted, vec!).
 
@@ -1399,11 +1419,11 @@ fn sample_turn_completed_notification(
 fn sample_turn_resolved_config(thread_id: &str, turn_id: &str) -> TurnResolvedConfigFact
 ```
 
-**Purpose**: Creates a `TurnResolvedConfigFact` fixture describing the resolved model, permissions, and session settings for a turn.
+**Purpose**: Creates sample resolved configuration for a turn, such as model, permissions, sandbox, approval policy, and collaboration mode. This is required for full turn analytics.
 
-**Data flow**: Accepts `thread_id` and `turn_id`, fills a `TurnResolvedConfigFact` with fixed model/provider, read-only permission profile, cwd, approval policy, reviewer, collaboration mode, and image count, and returns it.
+**Data flow**: It receives thread and turn IDs. It returns a TurnResolvedConfigFact filled with realistic defaults and those IDs.
 
-**Call relations**: Used by setup helpers and child-turn completion helpers because the reducer requires resolved config before it can emit a turn event.
+**Call relations**: Turn setup helpers and error-discard tests send this custom fact before completion so the reducer has the configuration fields needed for a turn event.
 
 *Call graph*: called by 3 (ingest_complete_child_turn, ingest_turn_prerequisites, turn_start_error_response_discards_pending_start_request); 2 external calls (read_only, from).
 
@@ -1414,11 +1434,11 @@ fn sample_turn_resolved_config(thread_id: &str, turn_id: &str) -> TurnResolvedCo
 fn sample_turn_profile() -> TurnProfile
 ```
 
-**Purpose**: Returns a deterministic `TurnProfile` fixture with timing and sampling counters.
+**Purpose**: Creates sample timing breakdowns for a turn. These timings show where time was spent, such as model sampling or tool blocking.
 
-**Data flow**: Constructs and returns a `TurnProfile` with fixed before/after sampling timings and request/retry counts.
+**Data flow**: It takes no input. It returns fixed timing values and request/retry counts.
 
-**Call relations**: Injected into reducer state by setup helpers so emitted turn events can include profile metrics.
+**Call relations**: Turn setup helpers and child-turn helpers attach this profile to the reducer before completion, allowing emitted turn events to include performance fields.
 
 *Call graph*: called by 2 (ingest_complete_child_turn, ingest_turn_prerequisites).
 
@@ -1433,11 +1453,11 @@ fn sample_turn_steer_request(
 ) -> ClientRequest
 ```
 
-**Purpose**: Creates a representative `ClientRequest::TurnSteer` with one text input and one local image input.
+**Purpose**: Builds a fake request to steer an already-running turn, meaning the user adds more input while a turn is active. It includes text and a local image.
 
-**Data flow**: Accepts `thread_id`, `expected_turn_id`, and integer `request_id`, constructs `TurnSteerParams` with those values plus two `UserInput` entries and empty optional metadata, and returns `ClientRequest::TurnSteer`.
+**Data flow**: It receives a thread ID, expected active turn ID, and request ID. It returns a TurnSteer client request with sample inputs.
 
-**Call relations**: Used by accepted and rejected turn-steer tests and by the helper that simulates rejected steer flows.
+**Call relations**: Steering tests feed this into the reducer before either an accepted response or a rejection error, so the reducer can produce a steer analytics event.
 
 *Call graph*: called by 3 (accepted_steers_increment_turn_steer_count, accepted_turn_steer_emits_expected_event, ingest_rejected_turn_steer); 2 external calls (Integer, vec!).
 
@@ -1448,11 +1468,11 @@ fn sample_turn_steer_request(
 fn sample_turn_steer_response(turn_id: &str) -> ClientResponsePayload
 ```
 
-**Purpose**: Builds a successful `ClientResponsePayload::TurnSteer` fixture naming the accepted turn id.
+**Purpose**: Builds a fake successful response to a turn-steering request. It tells the reducer which turn accepted the added input.
 
-**Data flow**: Accepts `turn_id`, wraps it in `TurnSteerResponse`, and returns `ClientResponsePayload::TurnSteer`.
+**Data flow**: It receives the accepted turn ID and wraps it in a TurnSteer response payload.
 
-**Call relations**: Paired with `sample_turn_steer_request` in tests that verify accepted steer analytics.
+**Call relations**: Accepted-steering tests pair this with sample_turn_steer_request to check that accepted events are emitted and steer counts increase.
 
 *Call graph*: called by 2 (accepted_steers_increment_turn_steer_count, accepted_turn_steer_emits_expected_event); 1 external calls (TurnSteer).
 
@@ -1463,11 +1483,11 @@ fn sample_turn_steer_response(turn_id: &str) -> ClientResponsePayload
 fn no_active_turn_steer_error() -> JSONRPCErrorError
 ```
 
-**Purpose**: Creates a JSON-RPC error fixture representing a rejected steer because no active turn exists.
+**Purpose**: Creates a sample JSON-RPC error for trying to steer when no turn is active. JSON-RPC is the request-response message format used here.
 
-**Data flow**: Constructs and returns `JSONRPCErrorError` with code `-32600`, message `no active turn to steer`, and no extra data.
+**Data flow**: It takes no input and returns an error with a fixed code and message.
 
-**Call relations**: Used by rejected-steer tests and by the pending-turn-start discard test to simulate a specific server-side rejection.
+**Call relations**: Rejected-steering and pending-request cleanup tests use it to verify that the reducer records or ignores the error in the right circumstances.
 
 *Call graph*: called by 4 (accepted_steers_increment_turn_steer_count, rejected_turn_steer_uses_request_connection_metadata, turn_start_error_response_discards_pending_start_request, turn_steer_does_not_emit_without_pending_request).
 
@@ -1478,11 +1498,11 @@ fn no_active_turn_steer_error() -> JSONRPCErrorError
 fn no_active_turn_steer_error_type() -> AnalyticsJsonRpcError
 ```
 
-**Purpose**: Creates the analytics-classified error type corresponding to the no-active-turn steer rejection.
+**Purpose**: Returns the analytics-friendly category for the no-active-turn steering error. This category is what appears in tracking output.
 
-**Data flow**: Returns `AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::NoActiveTurn)`.
+**Data flow**: It takes no input and returns an AnalyticsJsonRpcError value representing a TurnSteer NoActiveTurn failure.
 
-**Call relations**: Passed alongside `no_active_turn_steer_error` so reducer tests can verify rejection-reason mapping.
+**Call relations**: Steering tests pass it alongside the raw error so the reducer can map the rejection reason to no_active_turn.
 
 *Call graph*: called by 3 (accepted_steers_increment_turn_steer_count, rejected_turn_steer_uses_request_connection_metadata, turn_steer_does_not_emit_without_pending_request); 1 external calls (TurnSteer).
 
@@ -1493,11 +1513,11 @@ fn no_active_turn_steer_error_type() -> AnalyticsJsonRpcError
 fn non_steerable_review_error() -> JSONRPCErrorError
 ```
 
-**Purpose**: Creates a JSON-RPC error fixture indicating the active turn is a non-steerable review turn.
+**Purpose**: Creates a sample error for trying to steer a review turn, which is not allowed. It includes structured error data, not just text.
 
-**Data flow**: Builds `JSONRPCErrorError` with code `-32600`, message `cannot steer a review turn`, and serialized `AppServerTurnError` data containing `CodexErrorInfo::ActiveTurnNotSteerable { turn_kind: Review }`.
+**Data flow**: It takes no input. It serializes a turn error explaining that the active turn is a review and returns it as JSON-RPC error data.
 
-**Call relations**: Used by the rejected-steer mapping test that verifies this server error becomes the `non_steerable_review` analytics reason.
+**Call relations**: The non-steerable rejection test uses this raw error together with its analytics error type to check the final rejection reason.
 
 *Call graph*: called by 1 (rejected_turn_steer_maps_active_turn_not_steerable_error_type); 1 external calls (to_value).
 
@@ -1508,11 +1528,11 @@ fn non_steerable_review_error() -> JSONRPCErrorError
 fn non_steerable_review_error_type() -> AnalyticsJsonRpcError
 ```
 
-**Purpose**: Creates the analytics-classified error type for a non-steerable review turn rejection.
+**Purpose**: Returns the analytics-friendly category for the non-steerable review-turn error.
 
-**Data flow**: Returns `AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::NonSteerableReview)`.
+**Data flow**: It takes no input and returns an AnalyticsJsonRpcError value for TurnSteer NonSteerableReview.
 
-**Call relations**: Passed with `non_steerable_review_error` into the rejected-steer helper to drive the expected mapping.
+**Call relations**: The matching rejected-steering test passes it to the shared ingest helper so the reducer emits non_steerable_review.
 
 *Call graph*: called by 1 (rejected_turn_steer_maps_active_turn_not_steerable_error_type); 1 external calls (TurnSteer).
 
@@ -1523,11 +1543,11 @@ fn non_steerable_review_error_type() -> AnalyticsJsonRpcError
 fn input_too_large_steer_error() -> JSONRPCErrorError
 ```
 
-**Purpose**: Creates a JSON-RPC error fixture for steer input rejected as too large.
+**Purpose**: Creates a sample error for a steering request whose input is too large. This checks that input validation failures become clear analytics reasons.
 
-**Data flow**: Constructs `JSONRPCErrorError` with code `-32602`, a maximum-length message, and JSON data containing `input_error_code`, `actual_chars`, and `max_chars`.
+**Data flow**: It takes no input. It returns a JSON-RPC error containing an input_too_large code and size details.
 
-**Call relations**: Used by the rejected-steer mapping test for oversized input.
+**Call relations**: The input-too-large steering test uses this with input_too_large_error_type to verify the reducer's rejection mapping.
 
 *Call graph*: called by 1 (rejected_turn_steer_maps_input_too_large_error_type); 1 external calls (json!).
 
@@ -1538,11 +1558,11 @@ fn input_too_large_steer_error() -> JSONRPCErrorError
 fn input_too_large_error_type() -> AnalyticsJsonRpcError
 ```
 
-**Purpose**: Creates the analytics-classified error type for oversized input.
+**Purpose**: Returns the analytics-friendly category for an input-too-large error.
 
-**Data flow**: Returns `AnalyticsJsonRpcError::Input(InputError::TooLarge)`.
+**Data flow**: It takes no input and returns an AnalyticsJsonRpcError value for Input TooLarge.
 
-**Call relations**: Supplied with `input_too_large_steer_error` so the reducer can emit the correct rejection reason.
+**Call relations**: The rejected-steering test passes it to the shared helper so the emitted event has rejection_reason input_too_large.
 
 *Call graph*: called by 1 (rejected_turn_steer_maps_input_too_large_error_type); 1 external calls (Input).
 
@@ -1558,11 +1578,11 @@ async fn ingest_rejected_turn_steer(
 ) -> serde_j
 ```
 
-**Purpose**: Runs a full reducer scenario that establishes thread/turn context, submits a steer request, injects a rejection error, and returns the emitted turn-steer event as JSON.
+**Purpose**: Sets up a realistic reducer state, sends a turn-steering request, then sends a rejection error. It returns the emitted analytics event as JSON for easy assertions.
 
-**Data flow**: Mutably borrows a reducer and output vector, calls `ingest_turn_prerequisites`, ingests an additional initialize fact and thread resume response on another connection, clears prior events, ingests a steer request and matching `ErrorResponse`, asserts exactly one output event, serializes that event to `serde_json::Value`, and returns it.
+**Data flow**: It receives a reducer, output event list, raw error, and optional categorized error. It ingests setup facts, a request from one connection, an error response, checks that exactly one event appeared, and returns that event serialized as JSON.
 
-**Call relations**: This helper is shared by the three rejected-turn-steer tests. It encapsulates the prerequisite reducer state needed for a rejection to emit analytics.
+**Call relations**: Several rejected-steering tests call this shared flow. Internally it uses turn setup, initialize metadata, resume metadata, and sample steering requests to exercise the same path as real app-server traffic.
 
 *Call graph*: calls 5 internal fn (ingest_turn_prerequisites, sample_runtime_metadata, sample_thread_resume_response, sample_turn_steer_request, ingest); called by 3 (rejected_turn_steer_maps_active_turn_not_steerable_error_type, rejected_turn_steer_maps_input_too_large_error_type, rejected_turn_steer_uses_request_connection_metadata); 4 external calls (new, Integer, assert_eq!, to_value).
 
@@ -1573,11 +1593,11 @@ async fn ingest_rejected_turn_steer(
 async fn ingest_initialize(reducer: &mut AnalyticsReducer, out: &mut Vec<TrackEventRequest>)
 ```
 
-**Purpose**: Feeds a standard initialize fact into the reducer for connection 7.
+**Purpose**: Sends a standard initialize fact into the reducer. Initialization tells analytics which client and runtime are connected.
 
-**Data flow**: Constructs `AnalyticsFact::Initialize` with fixed client info, runtime metadata from `sample_runtime_metadata`, and stdio transport, ingests it into the reducer, and awaits completion.
+**Data flow**: It receives a reducer and output list. It builds a fixed Initialize fact and ingests it, possibly updating reducer state but not normally producing an event.
 
-**Call relations**: Used by broader setup helpers and tests that need initialized connection metadata before thread or turn events can be emitted.
+**Call relations**: Turn setup and unrelated-response tests call this before later facts, because many analytics events need client and runtime metadata.
 
 *Call graph*: calls 2 internal fn (sample_runtime_metadata, ingest); called by 3 (ingest_turn_prerequisites, turn_start_error_response_discards_pending_start_request, unrelated_client_responses_are_ignored_by_reducer).
 
@@ -1593,11 +1613,11 @@ async fn ingest_turn_prerequisites(
     include_started: bool
 ```
 
-**Purpose**: Builds up reducer state for a turn lifecycle test, optionally including initialize, resolved config, started notification, and token usage.
+**Purpose**: Performs the common setup needed before testing turn completion. It can include initialization, resolved configuration, start notification, token usage, and profile timing.
 
-**Data flow**: Depending on boolean flags, it may call `ingest_initialize`, ingest a thread-start response and clear emitted events, then always ingests a turn-start request and response. It conditionally ingests resolved config, started notification, and token usage, and finally ingests a `TurnProfileFact`.
+**Data flow**: It receives a reducer, output list, and four booleans controlling which setup facts to send. It ingests the chosen facts and leaves the reducer ready for turn-completion tests.
 
-**Call relations**: This is the main shared setup routine for turn-related tests. Different tests toggle its flags to verify which prerequisites are required for later emissions.
+**Call relations**: Most turn lifecycle, steering, and accepted-line tests call this helper. It hides repetitive setup while letting each test choose which prerequisites are present or missing.
 
 *Call graph*: calls 9 internal fn (ingest_initialize, sample_thread_start_response, sample_turn_profile, sample_turn_resolved_config, sample_turn_start_request, sample_turn_start_response, sample_turn_started_notification, sample_turn_token_usage_fact, ingest); called by 11 (accepted_steers_increment_turn_steer_count, accepted_turn_steer_emits_expected_event, ingest_rejected_turn_steer, reducer_emits_accepted_line_fingerprints_once_from_latest_turn_diff_on_completion, reducer_emits_large_accepted_line_aggregates_without_fingerprints, turn_completed_without_started_notification_emits_null_started_at, turn_does_not_emit_without_required_prerequisites, turn_event_counts_completed_tool_items, turn_lifecycle_emits_failed_turn_event, turn_lifecycle_emits_interrupted_turn_event_without_error (+1 more)); 7 external calls (new, Custom, Notification, TurnProfile, TurnResolvedConfig, TurnTokenUsage, Integer).
 
@@ -1611,11 +1631,11 @@ async fn ingest_review_prerequisites(
 )
 ```
 
-**Purpose**: Initializes reducer state for review-related tests by establishing client metadata and a started thread.
+**Purpose**: Sets up the reducer for tests about reviews and tool items. It initializes the client and starts a thread, then clears emitted setup events.
 
-**Data flow**: Ingests `sample_initialize_fact(7)`, then a thread-start response for `thread-1`, and clears any emitted events so subsequent assertions focus only on review behavior.
+**Data flow**: It receives a reducer and event list. It ingests a standard initialize fact and a thread-start response, then empties the event list so later assertions only see the event under test.
 
-**Call relations**: Shared by tests covering user approvals, guardian reviews, and tool-item review denormalization.
+**Call relations**: Review, approval, guardian, and tool-item tests call this before sending approval requests or item notifications.
 
 *Call graph*: calls 3 internal fn (sample_initialize_fact, sample_thread_start_response, ingest); called by 9 (aborted_server_request_publishes_aborted_user_review_event_once, command_execution_approval_response_publishes_user_review_event, effective_session_permissions_response_publishes_session_user_review_event, guardian_completed_notification_publishes_review_event_with_thread_metadata, item_lifecycle_notifications_publish_command_execution_event, item_review_summaries_do_not_cross_threads_with_reused_item_ids, permissions_reviews_emit_events_without_denormalizing_onto_tool_items, subagent_tool_items_inherit_parent_connection_metadata, terminal_reviews_denormalize_counts_onto_tool_item_events); 2 external calls (new, Integer).
 
@@ -1631,11 +1651,11 @@ async fn ingest_completed_command_execution_item(
 )
 ```
 
-**Purpose**: Simulates a command execution item lifecycle from turn start through item start and item completion.
+**Purpose**: Sends a full command-tool lifecycle into the reducer: turn started, command item started, command item completed. Tests use it to trigger command execution analytics.
 
-**Data flow**: Ingests a turn-started notification for the given thread, then an `ItemStarted` notification with an in-progress command item, then an `ItemCompleted` notification with a completed command item carrying exit code and duration.
+**Data flow**: It receives a reducer, event list, thread ID, and item ID. It ingests notifications for a command item moving from in-progress to completed and leaves any emitted events in the list.
 
-**Call relations**: Used by tests that need a finished command execution event, especially when verifying review counts denormalized onto tool-item analytics.
+**Call relations**: Review-summary tests call this after creating review state, so they can check whether review counts are attached to the final tool-item event.
 
 *Call graph*: calls 3 internal fn (sample_command_execution_item_with_id, sample_turn_started_notification, ingest); called by 3 (item_review_summaries_do_not_cross_threads_with_reused_item_ids, permissions_reviews_emit_events_without_denormalizing_onto_tool_items, terminal_reviews_denormalize_counts_onto_tool_item_events); 4 external calls (new, ItemCompleted, ItemStarted, Notification).
 
@@ -1646,11 +1666,11 @@ async fn ingest_completed_command_execution_item(
 fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact
 ```
 
-**Purpose**: Builds a reusable initialize fact fixture with websocket transport and explicit capabilities.
+**Purpose**: Builds a reusable initialize fact with fixed client, capability, runtime, and transport metadata.
 
-**Data flow**: Accepts `connection_id`, constructs `AnalyticsFact::Initialize` with fixed client info, capabilities, runtime metadata, and `DEFAULT_ORIGINATOR`, and returns it.
+**Data flow**: It receives a connection ID. It returns an AnalyticsFact::Initialize tied to that connection.
 
-**Call relations**: Used by review setup and subagent inheritance tests when they need a concrete initialize fact value rather than immediately ingesting one.
+**Call relations**: Review setup and subagent inheritance tests use it to seed the reducer with known connection metadata.
 
 *Call graph*: called by 2 (ingest_review_prerequisites, subagent_events_use_inherited_connection_unless_turn_connection_is_explicit).
 
@@ -1666,11 +1686,11 @@ async fn ingest_complete_child_turn(
 )
 ```
 
-**Purpose**: Completes a child/subagent turn by ingesting resolved config, profile, and terminal completion facts in sequence.
+**Purpose**: Completes a child or subagent turn with the minimum facts needed for a turn event. It is useful when testing inherited metadata.
 
-**Data flow**: For the given `thread_id` and `turn_id`, constructs three facts—resolved config, turn profile, and completed notification—and ingests them one after another into the reducer.
+**Data flow**: It receives a reducer, event list, thread ID, and turn ID. It ingests resolved config, profile timing, and a completed-turn notification.
 
-**Call relations**: Used by the subagent inheritance test to verify emitted turn events for child threads after lineage metadata has been established.
+**Call relations**: The subagent metadata test calls this after creating a subagent thread to check whether turn events inherit or override connection data correctly.
 
 *Call graph*: calls 4 internal fn (sample_turn_completed_notification, sample_turn_profile, sample_turn_resolved_config, ingest); called by 1 (subagent_events_use_inherited_connection_unless_turn_connection_is_explicit); 5 external calls (new, Custom, Notification, TurnProfile, TurnResolvedConfig).
 
@@ -1685,11 +1705,11 @@ fn sample_command_execution_item(
 ) -> ThreadItem
 ```
 
-**Purpose**: Convenience wrapper that creates a command execution `ThreadItem` with the default item id `item-1`.
+**Purpose**: Creates a standard fake shell command item. Tests use it when they do not need a custom item ID.
 
-**Data flow**: Accepts status, exit code, and duration, forwards them to `sample_command_execution_item_with_id("item-1", ...)`, and returns the resulting `ThreadItem`.
+**Data flow**: It receives command status, optional exit code, and optional duration. It delegates to the ID-specific helper using item-1 and returns a ThreadItem.
 
-**Call relations**: Used by several tests and by the action-mutating helper when the specific item id is not important.
+**Call relations**: Tool-item tests and action-count tests call this helper, while sample_command_execution_item_with_actions builds on it for command-action scenarios.
 
 *Call graph*: calls 1 internal fn (sample_command_execution_item_with_id); called by 4 (item_completed_without_turn_state_does_not_create_turn_state, item_lifecycle_notifications_publish_command_execution_event, sample_command_execution_item_with_actions, subagent_tool_items_inherit_parent_connection_metadata).
 
@@ -1705,11 +1725,11 @@ fn sample_command_execution_item_with_id(
 ) -> ThreadItem
 ```
 
-**Purpose**: Builds a `ThreadItem::CommandExecution` fixture with caller-controlled item id and terminal fields.
+**Purpose**: Creates a fake shell command item with a caller-chosen ID. This allows tests to check thread and item scoping.
 
-**Data flow**: Accepts `id`, status, optional exit code, and optional duration, fills a `CommandExecution` thread item with fixed command, cwd, process id, source, and empty actions/output, and returns it.
+**Data flow**: It receives an item ID, status, optional exit code, and optional duration. It returns a CommandExecution thread item with sample command text, working directory, process ID, and source.
 
-**Call relations**: Used directly by item lifecycle helpers and indirectly by the default-id wrapper.
+**Call relations**: The completed-command lifecycle helper uses it to produce matching started and completed items, and the simpler command helper delegates to it.
 
 *Call graph*: called by 2 (ingest_completed_command_execution_item, sample_command_execution_item); 2 external calls (new, test_path_buf).
 
@@ -1725,11 +1745,11 @@ fn sample_command_execution_item_with_actions(
 ) -> ThreadItem
 ```
 
-**Purpose**: Creates a command execution item and then replaces its `command_actions` vector with caller-supplied actions.
+**Purpose**: Creates a fake command item and attaches a chosen list of command actions, such as read, list files, search, or unknown. Tests use it to verify action counting.
 
-**Data flow**: Builds a base item via `sample_command_execution_item`, pattern-matches it as `ThreadItem::CommandExecution`, mutates the embedded `command_actions` field, and returns the modified item; panics if the variant is unexpectedly different.
+**Data flow**: It receives status, exit code, duration, and action list. It first builds a normal command item, replaces its command_actions field, and returns the modified item.
 
-**Call relations**: Used by the command execution event test that verifies action-category counts in emitted analytics.
+**Call relations**: The command execution lifecycle test uses it at item completion so analytics can count action categories in the emitted event.
 
 *Call graph*: calls 1 internal fn (sample_command_execution_item); called by 1 (item_lifecycle_notifications_publish_command_execution_event); 1 external calls (unreachable!).
 
@@ -1740,11 +1760,11 @@ fn sample_command_execution_item_with_actions(
 fn sample_command_approval_request(request_id: i64, approval_id: Option<&str>) -> ServerRequest
 ```
 
-**Purpose**: Builds a server approval request fixture for command execution reviews.
+**Purpose**: Creates a fake server request asking the user to approve a command execution. This models the app asking permission before running a shell command.
 
-**Data flow**: Accepts integer `request_id` and optional `approval_id`, constructs `ServerRequest::CommandExecutionRequestApproval` with fixed thread/turn/item ids, timestamps, command text, and mostly empty optional fields, and returns it.
+**Data flow**: It receives a request ID and optional approval ID. It returns a ServerRequest tied to thread-1, turn-1, and item-1 with sample command information.
 
-**Call relations**: Used by tests covering user review events, aborted requests, and review denormalization onto tool items.
+**Call relations**: User-review and aborted-request tests ingest this before a response or abort, so the reducer can remember an approval review is pending.
 
 *Call graph*: called by 4 (aborted_server_request_publishes_aborted_user_review_event_once, command_execution_approval_response_publishes_user_review_event, item_review_summaries_do_not_cross_threads_with_reused_item_ids, terminal_reviews_denormalize_counts_onto_tool_item_events); 1 external calls (Integer).
 
@@ -1758,11 +1778,11 @@ fn sample_command_approval_response(
 ) -> ServerResponse
 ```
 
-**Purpose**: Builds a server approval response fixture carrying a chosen command approval decision.
+**Purpose**: Creates a fake user response to a command approval request. Tests use it to finish a pending review.
 
-**Data flow**: Accepts integer `request_id` and `CommandExecutionApprovalDecision`, wraps them in `ServerResponse::CommandExecutionRequestApproval`, and returns the response.
+**Data flow**: It receives a request ID and decision. It returns a ServerResponse carrying that decision.
 
-**Call relations**: Paired with `sample_command_approval_request` in tests that verify how reducer review state resolves.
+**Call relations**: Approval-response tests pair it with sample_command_approval_request to check that user review events and final approval summaries are produced.
 
 *Call graph*: called by 4 (aborted_server_request_publishes_aborted_user_review_event_once, command_execution_approval_response_publishes_user_review_event, item_review_summaries_do_not_cross_threads_with_reused_item_ids, terminal_reviews_denormalize_counts_onto_tool_item_events); 1 external calls (Integer).
 
@@ -1773,11 +1793,11 @@ fn sample_command_approval_response(
 fn sample_permissions_approval_request(request_id: i64) -> ServerRequest
 ```
 
-**Purpose**: Builds a server approval request fixture for permissions reviews rather than command execution reviews.
+**Purpose**: Creates a fake server request asking for broader permissions, such as network access. This tests permission-review analytics separate from command reviews.
 
-**Data flow**: Accepts integer `request_id`, constructs `ServerRequest::PermissionsRequestApproval` with fixed thread/turn/item ids, cwd, reason, and a request profile enabling network access, and returns it.
+**Data flow**: It receives a request ID. It returns a PermissionsRequestApproval server request with sample thread, turn, item, reason, working directory, and requested network permission.
 
-**Call relations**: Used by tests that verify permissions reviews emit standalone review events and do not denormalize onto unrelated tool items.
+**Call relations**: Permission review tests ingest this before an effective permissions response to verify approved, denied, and session-scoped outcomes.
 
 *Call graph*: called by 2 (effective_session_permissions_response_publishes_session_user_review_event, permissions_reviews_emit_events_without_denormalizing_onto_tool_items); 2 external calls (Integer, test_path_buf).
 
@@ -1791,11 +1811,11 @@ fn sample_effective_permissions_approval_response(
 ) -> CoreRequestPermissionsResponse
 ```
 
-**Purpose**: Builds the effective permissions response fixture returned after a permissions approval decision is applied.
+**Purpose**: Builds the core response that says what permissions were actually granted and for what scope. Scope means whether permission applies just to this turn or the whole session.
 
-**Data flow**: Accepts a `CoreRequestPermissionProfile` and `CorePermissionGrantScope`, wraps them with `strict_auto_review: false` into `CoreRequestPermissionsResponse`, and returns it.
+**Data flow**: It receives a permission profile and grant scope. It returns a CoreRequestPermissionsResponse using those values with strict auto-review disabled.
 
-**Call relations**: Used by permissions review tests to distinguish denied turn-scoped responses from approved session-scoped responses.
+**Call relations**: Permission tests use it after a permissions approval request so the reducer can turn the decision into a review event.
 
 *Call graph*: called by 2 (effective_session_permissions_response_publishes_session_user_review_event, permissions_reviews_emit_events_without_denormalizing_onto_tool_items).
 
@@ -1810,11 +1830,11 @@ fn sample_guardian_review_completed(
 ) -> ServerNotification
 ```
 
-**Purpose**: Builds a guardian review completion notification fixture with optional target item id and configurable terminal status.
+**Purpose**: Creates a fake notification that the guardian reviewer finished reviewing an action. The guardian is an automated reviewer for risky actions.
 
-**Data flow**: Accepts `review_id`, optional `target_item_id`, and `GuardianApprovalReviewStatus`, constructs `ServerNotification::ItemGuardianApprovalReviewCompleted` with fixed thread/turn ids, timestamps, command action details, and a `GuardianApprovalReview` payload, and returns it.
+**Data flow**: It receives a review ID, optional target item ID, and guardian status. It returns a notification with sample command action details, start and completion times, and review result.
 
-**Call relations**: Used by the guardian review notification test to verify reducer emission of review analytics with inherited thread metadata.
+**Call relations**: The guardian-completed test ingests this after review prerequisites to check that guardian review events include thread metadata and timing.
 
 *Call graph*: called by 1 (guardian_completed_notification_publishes_review_event_with_thread_metadata); 2 external calls (ItemGuardianApprovalReviewCompleted, test_path_buf).
 
@@ -1825,11 +1845,11 @@ fn sample_guardian_review_completed(
 fn expected_absolute_path(path: &PathBuf) -> String
 ```
 
-**Purpose**: Computes the canonical absolute path string expected by skill-id normalization tests, falling back to the original path if canonicalization fails.
+**Purpose**: Computes the expected normalized absolute path string for path-related tests. It makes assertions work even if the test path can or cannot be canonicalized by the operating system.
 
-**Data flow**: Accepts a `PathBuf`, attempts `std::fs::canonicalize`, falls back to cloning the original path on error, converts the result to a lossy string, normalizes backslashes to forward slashes, and returns it.
+**Data flow**: It receives a path. It tries to canonicalize it, falls back to the original path if that fails, converts it to text, and normalizes backslashes to forward slashes.
 
-**Call relations**: Used only by path-normalization tests to compare reducer helper output against a platform-stable absolute-path representation.
+**Call relations**: Skill path normalization tests call this when the expected answer should be an absolute path rather than a repository-relative path.
 
 *Call graph*: called by 3 (normalize_path_for_skill_id_admin_scoped_uses_absolute_path, normalize_path_for_skill_id_repo_root_not_in_skill_path_uses_absolute_path, normalize_path_for_skill_id_user_scoped_uses_absolute_path); 1 external calls (canonicalize).
 
@@ -1840,11 +1860,11 @@ fn expected_absolute_path(path: &PathBuf) -> String
 fn normalize_path_for_skill_id_repo_scoped_uses_relative_path()
 ```
 
-**Purpose**: Verifies that repo-scoped skill paths are normalized relative to the repository root.
+**Purpose**: Checks that a skill inside a repository is identified by its path relative to that repository. This keeps repo-scoped skill IDs stable across machines.
 
-**Data flow**: Constructs repo-root and skill-path fixtures, calls `normalize_path_for_skill_id` with a repo URL and root, and asserts the result is `.codex/skills/doc/SKILL.md`.
+**Data flow**: It builds a repo root and skill path under that root, calls the normalization function, and asserts the result is the relative .codex path.
 
-**Call relations**: This test documents the repo-scoped branch of the skill-id path normalization helper.
+**Call relations**: This is a direct test of normalize_path_for_skill_id. It verifies the repository case used later by skill ID generation.
 
 *Call graph*: calls 1 internal fn (normalize_path_for_skill_id); 2 external calls (from, assert_eq!).
 
@@ -1855,11 +1875,11 @@ fn normalize_path_for_skill_id_repo_scoped_uses_relative_path()
 fn normalize_path_for_skill_id_user_scoped_uses_absolute_path()
 ```
 
-**Purpose**: Verifies that user-scoped skill paths normalize to absolute paths when no repo context exists.
+**Purpose**: Checks that a user-scoped skill uses an absolute path when there is no repository context. This avoids pretending a personal skill belongs to a repo.
 
-**Data flow**: Builds a user skill path, computes the expected absolute path with `expected_absolute_path`, calls `normalize_path_for_skill_id` with no repo URL/root, and asserts equality.
+**Data flow**: It builds a user skill path, calls the normalization function without repo information, computes the expected absolute path, and compares them.
 
-**Call relations**: Covers the non-repo branch of skill-id path normalization for user-installed skills.
+**Call relations**: It uses expected_absolute_path as the expected-value helper and exercises normalize_path_for_skill_id directly.
 
 *Call graph*: calls 2 internal fn (expected_absolute_path, normalize_path_for_skill_id); 2 external calls (from, assert_eq!).
 
@@ -1870,11 +1890,11 @@ fn normalize_path_for_skill_id_user_scoped_uses_absolute_path()
 fn normalize_path_for_skill_id_admin_scoped_uses_absolute_path()
 ```
 
-**Purpose**: Verifies that admin-scoped skill paths also normalize to absolute paths without repo context.
+**Purpose**: Checks that an admin or system skill uses an absolute path. This gives system-wide skills a distinct and stable identity.
 
-**Data flow**: Builds an admin skill path under `/etc`, computes the expected absolute path, calls `normalize_path_for_skill_id` with no repo context, and asserts equality.
+**Data flow**: It builds an /etc skill path, normalizes it without repo information, and compares the result to the expected absolute path.
 
-**Call relations**: Complements the user-scoped path test with another non-repo location.
+**Call relations**: Like the user-scoped test, it combines expected_absolute_path with normalize_path_for_skill_id.
 
 *Call graph*: calls 2 internal fn (expected_absolute_path, normalize_path_for_skill_id); 2 external calls (from, assert_eq!).
 
@@ -1885,11 +1905,11 @@ fn normalize_path_for_skill_id_admin_scoped_uses_absolute_path()
 fn normalize_path_for_skill_id_repo_root_not_in_skill_path_uses_absolute_path()
 ```
 
-**Purpose**: Checks that repo-scoped normalization falls back to an absolute path when the skill path is not actually under the declared repo root.
+**Purpose**: Checks the fallback behavior when repo information exists but the skill path is not actually inside that repo. In that case, relative path would be misleading.
 
-**Data flow**: Constructs mismatched repo-root and skill-path values, computes the expected absolute path, calls `normalize_path_for_skill_id`, and asserts the fallback result.
+**Data flow**: It builds a repo root and a skill path elsewhere, calls normalization, and asserts the result is the absolute path.
 
-**Call relations**: Documents an important edge case in skill-id normalization: repo context is only used when the path is truly nested under the repo root.
+**Call relations**: This protects normalize_path_for_skill_id from producing incorrect repo-relative IDs for unrelated paths.
 
 *Call graph*: calls 2 internal fn (expected_absolute_path, normalize_path_for_skill_id); 2 external calls (from, assert_eq!).
 
@@ -1900,11 +1920,11 @@ fn normalize_path_for_skill_id_repo_root_not_in_skill_path_uses_absolute_path()
 fn app_mentioned_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of an app-mentioned analytics event.
+**Purpose**: Checks the exact JSON for an app-mentioned analytics event. App-mentioned means Codex referenced or invoked an app connector.
 
-**Data flow**: Builds a `TrackEventsContext`, constructs `TrackEventRequest::AppMentioned` using `codex_app_metadata`, serializes it to JSON, and compares the full payload against an expected `json!` value.
+**Data flow**: It builds tracking context and an app invocation, creates the event, serializes it to JSON, and compares it to the expected object.
 
-**Call relations**: One of several serialization contract tests that lock down event field names and nesting.
+**Call relations**: This test exercises codex_app_metadata through the AppMentioned event wrapper and protects downstream consumers from schema changes.
 
 *Call graph*: calls 1 internal fn (codex_app_metadata); 3 external calls (AppMentioned, assert_eq!, to_value).
 
@@ -1915,11 +1935,11 @@ fn app_mentioned_event_serializes_expected_shape()
 fn app_used_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of an app-used analytics event.
+**Purpose**: Checks the exact JSON for an app-used analytics event. This confirms connector, app name, invocation type, and tracking fields are placed correctly.
 
-**Data flow**: Builds tracking context and `TrackEventRequest::AppUsed`, serializes it, and compares the result to the expected JSON object.
+**Data flow**: It builds tracking context and a sample app invocation, wraps it as AppUsed, serializes it, and compares against expected JSON.
 
-**Call relations**: Pairs with the app-mentioned serialization test to cover both app analytics event variants.
+**Call relations**: It uses codex_app_metadata in the app-used path, complementing the app-mentioned serialization test.
 
 *Call graph*: calls 1 internal fn (codex_app_metadata); 3 external calls (AppUsed, assert_eq!, to_value).
 
@@ -1930,11 +1950,11 @@ fn app_used_event_serializes_expected_shape()
 fn accepted_line_fingerprints_event_serializes_expected_shape()
 ```
 
-**Purpose**: Verifies the serialized JSON structure of the accepted-line-fingerprints analytics event.
+**Purpose**: Checks the JSON shape for accepted-line fingerprint analytics. These events summarize code lines accepted from a model-generated diff.
 
-**Data flow**: Constructs a boxed `CodexAcceptedLineFingerprintsEventRequest` inside `TrackEventRequest::AcceptedLineFingerprints`, serializes it to JSON, and asserts the exact nested payload including empty `line_fingerprints`.
+**Data flow**: It builds an event with thread, turn, model, repo hash, accepted line counts, and an empty fingerprint list. It serializes the event and compares it to expected JSON.
 
-**Call relations**: Locks down the wire shape expected from the accepted-lines feature.
+**Call relations**: This schema test supports reducer tests that later emit accepted-line events from turn diffs.
 
 *Call graph*: 5 external calls (new, new, AcceptedLineFingerprints, assert_eq!, to_value).
 
@@ -1945,11 +1965,11 @@ fn accepted_line_fingerprints_event_serializes_expected_shape()
 async fn reducer_emits_large_accepted_line_aggregates_without_fingerprints()
 ```
 
-**Purpose**: Checks that a very large diff produces one accepted-line event with aggregate counts but no uploaded fingerprints, and remains under a size threshold.
+**Purpose**: Verifies that very large diffs still report accepted line counts but omit detailed fingerprints. This prevents analytics payloads from becoming too large.
 
-**Data flow**: Initializes reducer turn state, constructs a diff with 20,000 added lines, ingests a `TurnDiffUpdated` notification and then a completion notification, filters emitted events for `AcceptedLineFingerprints`, and asserts counts, empty fingerprints, and serialized size under 2.1 MB.
+**Data flow**: It sets up a full turn, feeds a huge diff with 20,000 added lines, completes the turn, then checks one accepted-line event with counts and no fingerprints.
 
-**Call relations**: Exercises the reducer’s accepted-line aggregation path and the design choice from `accepted_lines.rs` to omit fingerprints from uploaded payloads.
+**Call relations**: It uses turn prerequisites and a completed-turn notification to exercise the reducer’s accepted-line emission path at completion time.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 8 external calls (new, TurnDiffUpdated, new, Notification, default, assert!, assert_eq!, format!).
 
@@ -1960,11 +1980,11 @@ async fn reducer_emits_large_accepted_line_aggregates_without_fingerprints()
 async fn reducer_emits_accepted_line_fingerprints_once_from_latest_turn_diff_on_completion()
 ```
 
-**Purpose**: Verifies that only the latest diff snapshot for a turn is used when emitting the accepted-line event at completion time.
+**Purpose**: Checks that the reducer uses the latest diff and emits accepted-line analytics only once when the turn completes.
 
-**Data flow**: Sets up turn prerequisites, ingests two successive `TurnDiffUpdated` notifications with different added lines, confirms no immediate events, then ingests turn completion and asserts exactly one accepted-line event reflecting only the latest diff.
+**Data flow**: It sends two diff updates for the same turn, then completes the turn. It verifies that one event is emitted and its aggregate count reflects the latest diff.
 
-**Call relations**: Documents reducer behavior around diff replacement rather than accumulation across multiple updates.
+**Call relations**: This test depends on the normal turn setup helper and confirms that diff updates are stored until completion rather than emitted immediately.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 8 external calls (new, TurnDiffUpdated, new, Notification, default, assert!, assert_eq!, format!).
 
@@ -1975,11 +1995,11 @@ async fn reducer_emits_accepted_line_fingerprints_once_from_latest_turn_diff_on_
 fn compaction_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a compaction analytics event including nested client/runtime metadata and compaction fields.
+**Purpose**: Checks the exact JSON for a compaction event. Compaction means shrinking conversation context so a long session can continue within model limits.
 
-**Data flow**: Constructs a `TrackEventRequest::Compaction` using `codex_compaction_event_params`, serializes it, and compares the full JSON payload to an expected object.
+**Data flow**: It builds a compaction event with client, runtime, thread, token, timing, and status data, serializes it, and compares it with expected JSON.
 
-**Call relations**: Serialization contract test for compaction events.
+**Call relations**: It exercises codex_compaction_event_params using sample client and runtime metadata, separate from reducer ingestion tests.
 
 *Call graph*: calls 3 internal fn (sample_app_server_client_metadata, sample_runtime_metadata, codex_compaction_event_params); 4 external calls (new, Compaction, assert_eq!, to_value).
 
@@ -1990,11 +2010,11 @@ fn compaction_event_serializes_expected_shape()
 fn compaction_implementation_serializes_remote_v2()
 ```
 
-**Purpose**: Verifies the enum serialization string for `CompactionImplementation::ResponsesCompactionV2`.
+**Purpose**: Checks the string used for the ResponsesCompactionV2 compaction implementation. This protects the public analytics value.
 
-**Data flow**: Serializes the enum value to JSON and asserts the result is `"responses_compaction_v2"`.
+**Data flow**: It serializes the enum value and asserts the JSON string is responses_compaction_v2.
 
-**Call relations**: A narrow serialization test protecting one specific enum wire value.
+**Call relations**: This focused serialization test supports compaction event schema stability.
 
 *Call graph*: 2 external calls (assert_eq!, to_value).
 
@@ -2005,11 +2025,11 @@ fn compaction_implementation_serializes_remote_v2()
 fn app_used_dedupe_is_keyed_by_turn_and_connector()
 ```
 
-**Purpose**: Checks that app-used deduplication in `AnalyticsEventsQueue` is scoped by `(turn_id, connector_id)`.
+**Purpose**: Checks that app-used events are only queued once per turn and connector. This prevents duplicate analytics when the same app is detected repeatedly.
 
-**Data flow**: Constructs a queue with empty dedupe sets, creates one app invocation and two tracking contexts for different turns, calls `should_enqueue_app_used` repeatedly, and asserts true/false/true across same-turn duplicate and different-turn reuse.
+**Data flow**: It builds an analytics queue with empty dedupe sets, one app, and two turn contexts. It checks that the first use in a turn is allowed, the repeat is blocked, and the same app in another turn is allowed.
 
-**Call relations**: Tests queue-level dedupe behavior rather than reducer logic.
+**Call relations**: This directly tests AnalyticsEventsQueue’s app-used deduplication behavior without involving the reducer.
 
 *Call graph*: 5 external calls (new, new, new, assert_eq!, channel).
 
@@ -2020,11 +2040,11 @@ fn app_used_dedupe_is_keyed_by_turn_and_connector()
 fn thread_initialized_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a thread-initialized analytics event.
+**Purpose**: Checks the JSON shape for a thread-initialized event. This event records that a conversation thread exists and captures its startup context.
 
-**Data flow**: Constructs `TrackEventRequest::ThreadInitialized` with explicit metadata, serializes it, and compares the result to an expected JSON object.
+**Data flow**: It builds a ThreadInitialized event with client, runtime, model, source, mode, and timestamps, serializes it, and compares it to expected JSON.
 
-**Call relations**: Serialization contract test for thread lifecycle analytics.
+**Call relations**: This schema test supports reducer tests that emit thread initialization from thread-start or resume responses.
 
 *Call graph*: 4 external calls (ThreadInitialized, Feature, assert_eq!, to_value).
 
@@ -2035,11 +2055,11 @@ fn thread_initialized_event_serializes_expected_shape()
 fn command_execution_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a command execution analytics event including action counts and approval summary fields.
+**Purpose**: Checks the JSON shape for a command execution analytics event. This event describes a completed shell command tool item.
 
-**Data flow**: Builds `TrackEventRequest::CommandExecution` with a populated `CodexCommandExecutionEventParams`, serializes it, and compares the payload to expected JSON.
+**Data flow**: It builds a command event with base tool fields, review counts, approval outcome, status, source, exit code, and command action counts. It serializes and compares the result.
 
-**Call relations**: Serialization contract test for tool-item analytics.
+**Call relations**: This verifies the event type independently from reducer tests that create command execution events from item notifications.
 
 *Call graph*: 3 external calls (CommandExecution, assert_eq!, to_value).
 
@@ -2050,11 +2070,11 @@ fn command_execution_event_serializes_expected_shape()
 fn review_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a review analytics event, including subagent lineage metadata.
+**Purpose**: Checks the JSON shape for a review event, including reviewer, subject, trigger, result, timing, and subagent lineage.
 
-**Data flow**: Constructs `TrackEventRequest::ReviewEvent` with populated `CodexReviewEventParams`, serializes it, and compares the result to expected JSON.
+**Data flow**: It constructs a CodexReviewEventRequest, serializes it, and asserts every expected field and string value appears correctly.
 
-**Call relations**: Serialization contract test for review events.
+**Call relations**: This schema test supports later reducer tests for user reviews, guardian reviews, and permissions reviews.
 
 *Call graph*: 3 external calls (ReviewEvent, assert_eq!, to_value).
 
@@ -2065,11 +2085,11 @@ fn review_event_serializes_expected_shape()
 async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialized()
 ```
 
-**Purpose**: Verifies that thread lifecycle events are withheld until initialize metadata is available, then emitted with cached client/runtime fields.
+**Purpose**: Verifies that the reducer waits for client initialization before publishing thread lifecycle analytics. Without that wait, events would miss client and runtime metadata.
 
-**Data flow**: Ingests a thread-start response before initialize and asserts no events, ingests initialize and still expects none, then ingests a thread-resume response and asserts one thread-initialized event whose nested metadata matches the cached initialize fact.
+**Data flow**: It first sends a thread response before initialization and expects no event. Then it initializes the connection, resumes another thread, and checks that exactly one initialized-thread event includes cached client and runtime fields.
 
-**Call relations**: Documents reducer dependency on initialize facts for thread lifecycle emission.
+**Call relations**: This test uses sample thread start and resume responses to exercise reducer state: initialization is cached, and later thread lifecycle events can use it.
 
 *Call graph*: calls 2 internal fn (sample_thread_resume_response, sample_thread_start_response); 7 external calls (new, new, default, Integer, assert!, assert_eq!, to_value).
 
@@ -2080,11 +2100,11 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
 async fn unrelated_client_requests_are_ignored_by_reducer()
 ```
 
-**Purpose**: Checks that non-analytics-relevant client requests do not create pending reducer state.
+**Purpose**: Checks that requests unrelated to turn starts do not create pending turn state. This prevents accidental analytics from mismatched responses.
 
-**Data flow**: Ingests a `ThreadArchive` client request and then an unrelated turn-start response, and asserts no events were emitted.
+**Data flow**: It sends a thread-archive request, then a turn-start-looking response with the same request ID, and confirms no events are emitted.
 
-**Call relations**: Covers reducer filtering of irrelevant request types.
+**Call relations**: The test pairs an unrelated request with sample_turn_start_response to make sure the reducer does not match responses too broadly.
 
 *Call graph*: calls 1 internal fn (sample_turn_start_response); 5 external calls (new, new, default, Integer, assert!).
 
@@ -2095,11 +2115,11 @@ async fn unrelated_client_requests_are_ignored_by_reducer()
 async fn unrelated_client_responses_are_ignored_by_reducer()
 ```
 
-**Purpose**: Checks that non-analytics-relevant client responses are ignored even after initialization.
+**Purpose**: Checks that unrelated client responses do not emit analytics by themselves. The reducer should only react to response types it understands for analytics.
 
-**Data flow**: Initializes the reducer, ingests a `ThreadArchive` response, and asserts the output remains empty.
+**Data flow**: It initializes the reducer, sends a thread-archive response, and asserts the output list remains empty.
 
-**Call relations**: Complements the unrelated-request test for the response side.
+**Call relations**: It uses ingest_initialize for realistic client metadata, then verifies the reducer ignores the archive response.
 
 *Call graph*: calls 1 internal fn (ingest_initialize); 6 external calls (new, ThreadArchive, new, default, Integer, assert!).
 
@@ -2110,11 +2130,11 @@ async fn unrelated_client_responses_are_ignored_by_reducer()
 async fn compaction_event_ingests_custom_fact()
 ```
 
-**Purpose**: Verifies that a custom compaction fact emits a compaction event enriched with cached thread/session/subagent metadata.
+**Purpose**: Checks that a custom compaction fact becomes a compaction analytics event with thread, client, runtime, and subagent lineage attached.
 
-**Data flow**: Initializes reducer state, ingests a subagent thread-resume response with parent lineage, clears prior events, ingests a custom `Compaction` fact, serializes emitted events, and asserts one compaction event with expected session id, thread source, subagent source, parent thread id, and compaction fields.
+**Data flow**: It initializes a connection, resumes a subagent thread, clears setup events, ingests a compaction fact, then asserts the emitted JSON fields.
 
-**Call relations**: Exercises reducer enrichment of custom facts using previously cached thread metadata.
+**Call relations**: This test combines resume-with-source setup and a CustomAnalyticsFact::Compaction to exercise the reducer’s custom compaction path.
 
 *Call graph*: calls 3 internal fn (sample_runtime_metadata, sample_thread_resume_response_with_source, from_string); 9 external calls (SubAgent, new, new, Custom, Compaction, default, Integer, assert_eq!, to_value).
 
@@ -2125,11 +2145,11 @@ async fn compaction_event_ingests_custom_fact()
 async fn guardian_review_event_ingests_custom_fact_with_optional_target_item()
 ```
 
-**Purpose**: Verifies that a custom guardian review fact emits the expected guardian review analytics event, including optional-null fields.
+**Purpose**: Checks that a custom guardian review fact emits a guardian-review analytics event, even when there is no target item ID.
 
-**Data flow**: Initializes reducer and thread state, clears prior events, ingests a custom `GuardianReview` fact with many optional fields unset, serializes emitted events, and asserts one `codex_guardian_review` payload with expected metadata and null handling.
+**Data flow**: It initializes, starts a thread, clears setup events, sends a GuardianReview custom fact, and checks session, client, runtime, reviewed action, status, timeout, and optional fields.
 
-**Call relations**: Documents reducer behavior for direct custom guardian review facts, distinct from notification-derived review events.
+**Call relations**: This test uses sample runtime and thread-start response setup, then exercises the reducer’s custom guardian-review path.
 
 *Call graph*: calls 2 internal fn (sample_runtime_metadata, sample_thread_start_response); 9 external calls (new, new, Custom, GuardianReview, default, Integer, assert!, assert_eq!, to_value).
 
@@ -2140,11 +2160,11 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item()
 async fn item_lifecycle_notifications_publish_command_execution_event()
 ```
 
-**Purpose**: Checks that command execution analytics are emitted only when an item completes, not when it starts, and that action counts and timing are computed correctly.
+**Purpose**: Verifies that a command execution event is emitted when a command item completes, not when it starts. It also checks action counts and timing.
 
-**Data flow**: Sets up review prerequisites, ingests turn-started and item-started notifications and asserts no events, then ingests an item-completed notification with four command actions, serializes the emitted event, and asserts exact counts, timing, approval summary, and inherited metadata.
+**Data flow**: It sets up review prerequisites, sends a turn-started notification, sends item-started, verifies no event yet, sends item-completed with command actions, and checks the emitted event.
 
-**Call relations**: Exercises reducer tool-item lifecycle handling and command-action categorization.
+**Call relations**: This test uses command item helpers and turn-start notification to exercise the reducer’s tool-item lifecycle tracking.
 
 *Call graph*: calls 4 internal fn (ingest_review_prerequisites, sample_command_execution_item, sample_command_execution_item_with_actions, sample_turn_started_notification); 10 external calls (new, ItemCompleted, ItemStarted, new, Notification, default, assert!, assert_eq!, to_value, vec!).
 
@@ -2155,11 +2175,11 @@ async fn item_lifecycle_notifications_publish_command_execution_event()
 async fn command_execution_approval_response_publishes_user_review_event()
 ```
 
-**Purpose**: Verifies that a completed command approval request/response pair emits a user review analytics event.
+**Purpose**: Checks that a user’s command approval response becomes a review event. This records human approval decisions in analytics.
 
-**Data flow**: Sets up review prerequisites, ingests a command approval server request and asserts no immediate event, then ingests the matching server response and asserts one review event with expected ids, subject kind, reviewer, status, and duration.
+**Data flow**: It sets up a thread, sends a command approval request, confirms no immediate event, sends an accept response, and verifies the emitted review fields.
 
-**Call relations**: Documents reducer review lifecycle for command approvals.
+**Call relations**: It pairs sample_command_approval_request with sample_command_approval_response to test the reducer’s pending-review matching.
 
 *Call graph*: calls 3 internal fn (ingest_review_prerequisites, sample_command_approval_request, sample_command_approval_response); 6 external calls (new, new, default, assert!, assert_eq!, to_value).
 
@@ -2170,11 +2190,11 @@ async fn command_execution_approval_response_publishes_user_review_event()
 async fn permissions_reviews_emit_events_without_denormalizing_onto_tool_items()
 ```
 
-**Purpose**: Checks that permissions approval events emit review analytics but do not increment review counts on later tool-item events with the same item id.
+**Purpose**: Checks that permission reviews emit review events but do not get counted on unrelated tool-item summaries. Denormalizing means copying review counts onto tool events.
 
-**Data flow**: Sets up review prerequisites, ingests a permissions approval request and effective denied response, asserts the emitted review event fields, clears events, then simulates a completed command execution item with item id `permissions-1` and asserts its review counters remain zero.
+**Data flow**: It sends a permissions request and denied effective response, verifies a permissions review event, then completes a command item with the same item ID and checks review counts remain zero.
 
-**Call relations**: Protects the reducer invariant that permissions reviews are not denormalized onto tool-item analytics.
+**Call relations**: This test combines permission review helpers with the completed-command helper to protect separation between permission reviews and command tool-item reviews.
 
 *Call graph*: calls 4 internal fn (ingest_completed_command_execution_item, ingest_review_prerequisites, sample_effective_permissions_approval_response, sample_permissions_approval_request); 8 external calls (new, default, new, default, Integer, assert!, assert_eq!, to_value).
 
@@ -2185,11 +2205,11 @@ async fn permissions_reviews_emit_events_without_denormalizing_onto_tool_items()
 async fn effective_session_permissions_response_publishes_session_user_review_event()
 ```
 
-**Purpose**: Verifies that an approved session-scoped permissions response emits a review event with `session_approval` resolution.
+**Purpose**: Checks that granting permissions for the whole session produces an approved review event with session approval resolution.
 
-**Data flow**: Sets up review prerequisites, ingests a permissions approval request and an effective response granting session-scoped network access, serializes emitted events, and asserts the review status is approved with session resolution.
+**Data flow**: It sets up a thread, sends a permissions request, sends an effective response granting network permission for the session, and checks the emitted review status and resolution.
 
-**Call relations**: Covers the approved/session branch of permissions review handling.
+**Call relations**: It uses the permissions request and effective permissions response helpers to exercise the reducer’s permission decision mapping.
 
 *Call graph*: calls 3 internal fn (ingest_review_prerequisites, sample_effective_permissions_approval_response, sample_permissions_approval_request); 6 external calls (new, new, default, Integer, assert_eq!, to_value).
 
@@ -2200,11 +2220,11 @@ async fn effective_session_permissions_response_publishes_session_user_review_ev
 async fn aborted_server_request_publishes_aborted_user_review_event_once()
 ```
 
-**Purpose**: Checks that aborting a pending approval request emits one aborted review event and that a later response for the same request id is ignored.
+**Purpose**: Verifies that an aborted approval request produces exactly one aborted review event and cannot later be completed again.
 
-**Data flow**: Sets up review prerequisites, ingests a command approval request and then `ServerRequestAborted`, asserts one aborted review event, clears events, then ingests a late approval response and asserts no further events.
+**Data flow**: It creates a pending command approval, sends an abort, checks the aborted review event, clears events, then sends a late accept response and expects no new event.
 
-**Call relations**: Documents reducer cleanup of pending review state after abort.
+**Call relations**: This test uses command approval helpers to ensure the reducer removes pending review state after abort.
 
 *Call graph*: calls 3 internal fn (ingest_review_prerequisites, sample_command_approval_request, sample_command_approval_response); 7 external calls (new, new, default, Integer, assert!, assert_eq!, to_value).
 
@@ -2215,11 +2235,11 @@ async fn aborted_server_request_publishes_aborted_user_review_event_once()
 async fn guardian_completed_notification_publishes_review_event_with_thread_metadata()
 ```
 
-**Purpose**: Verifies that guardian review completion notifications emit review events enriched with cached thread metadata.
+**Purpose**: Checks that a guardian review completion notification emits a review event with the thread’s cached metadata.
 
-**Data flow**: Sets up review prerequisites, ingests a guardian review completed notification, serializes the first emitted event, and asserts review id, item id, thread source, reviewer, status, and timing fields.
+**Data flow**: It sets up a thread, ingests a sample guardian completion notification, serializes the first event, and checks review ID, item ID, subject, reviewer, status, and timing.
 
-**Call relations**: Covers the notification-driven guardian review path distinct from custom guardian review facts.
+**Call relations**: It uses ingest_review_prerequisites and sample_guardian_review_completed to exercise notification-driven guardian review analytics.
 
 *Call graph*: calls 2 internal fn (ingest_review_prerequisites, sample_guardian_review_completed); 6 external calls (new, new, Notification, default, assert_eq!, to_value).
 
@@ -2230,11 +2250,11 @@ async fn guardian_completed_notification_publishes_review_event_with_thread_meta
 async fn terminal_reviews_denormalize_counts_onto_tool_item_events()
 ```
 
-**Purpose**: Checks that terminal user reviews are summarized onto later tool-item analytics for the same thread/item.
+**Purpose**: Checks that completed terminal reviews are summarized on the related tool-item event. This lets command events include review counts and final approval outcome.
 
-**Data flow**: Sets up review prerequisites, ingests a command approval request and an `AcceptForSession` response, clears events, simulates a completed command execution item, serializes the resulting tool-item event, and asserts review counts and final approval outcome reflect the prior review.
+**Data flow**: It creates and completes a user approval review, clears review events, completes the matching command item, and checks review counts and final approval outcome on the command event.
 
-**Call relations**: Documents reducer denormalization of terminal review summaries onto tool-item events.
+**Call relations**: It combines approval request/response helpers with the completed-command helper to verify review summaries are attached at item completion.
 
 *Call graph*: calls 4 internal fn (ingest_completed_command_execution_item, ingest_review_prerequisites, sample_command_approval_request, sample_command_approval_response); 5 external calls (new, new, default, assert_eq!, to_value).
 
@@ -2245,11 +2265,11 @@ async fn terminal_reviews_denormalize_counts_onto_tool_item_events()
 async fn item_review_summaries_do_not_cross_threads_with_reused_item_ids()
 ```
 
-**Purpose**: Ensures review summaries are keyed by thread as well as item id so reused item ids in another thread do not inherit prior review counts.
+**Purpose**: Checks that review summaries are scoped by thread as well as item ID. Reusing item IDs in different threads must not mix analytics.
 
-**Data flow**: Sets up review prerequisites, starts a second thread, ingests a command approval request/response in the first thread, clears events, simulates a completed command execution item with the same item id in the second thread, and asserts zero review counts and unknown approval outcome.
+**Data flow**: It creates two threads, records a review for item-1 in thread-1, then completes item-1 in thread-2 and checks review counts are zero.
 
-**Call relations**: Protects reducer state partitioning across threads.
+**Call relations**: This test uses thread-start, approval, and completed-command helpers to prove reducer matching includes thread identity.
 
 *Call graph*: calls 5 internal fn (ingest_completed_command_execution_item, ingest_review_prerequisites, sample_command_approval_request, sample_command_approval_response, sample_thread_start_response); 6 external calls (new, new, default, Integer, assert_eq!, to_value).
 
@@ -2260,11 +2280,11 @@ async fn item_review_summaries_do_not_cross_threads_with_reused_item_ids()
 fn subagent_thread_started_review_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the JSON shape of a thread-initialized event produced for a review subagent thread.
+**Purpose**: Checks serialization for a subagent thread started for review work. A subagent is a child agent thread created for a specific task.
 
-**Data flow**: Builds `SubAgentThreadStartedInput` with `SubAgentSource::Review`, converts it with `subagent_thread_started_event_request`, wraps it in `TrackEventRequest::ThreadInitialized`, serializes it, and asserts expected fields.
+**Data flow**: It builds a SubAgentThreadStartedInput with Review source, wraps it as a thread-initialized event, serializes it, and checks client, source, created time, and lineage fields.
 
-**Call relations**: Serialization contract test for one subagent source variant.
+**Call relations**: This directly exercises subagent_thread_started_event_request for the review subagent case.
 
 *Call graph*: calls 1 internal fn (subagent_thread_started_event_request); 3 external calls (ThreadInitialized, assert_eq!, to_value).
 
@@ -2275,11 +2295,11 @@ fn subagent_thread_started_review_serializes_expected_shape()
 fn subagent_thread_started_thread_spawn_serializes_thread_lineage()
 ```
 
-**Purpose**: Asserts that thread-spawn subagent initialization events include parent and fork lineage fields.
+**Purpose**: Checks that a thread-spawn subagent event includes parent and forked-from thread IDs. This preserves conversation lineage.
 
-**Data flow**: Creates concrete parent and forked-from thread ids, builds `SubAgentThreadStartedInput` with `SubAgentSource::ThreadSpawn`, serializes the resulting thread-initialized event, and asserts thread source, subagent source, parent thread id, forked-from id, and session id.
+**Data flow**: It creates valid parent and fork IDs, builds a subagent-start input with ThreadSpawn source, serializes the event, and asserts lineage fields.
 
-**Call relations**: Covers the lineage-rich subagent source variant.
+**Call relations**: This tests subagent_thread_started_event_request for the thread-spawn source variant.
 
 *Call graph*: calls 2 internal fn (subagent_thread_started_event_request, from_string); 3 external calls (ThreadInitialized, assert_eq!, to_value).
 
@@ -2290,11 +2310,11 @@ fn subagent_thread_started_thread_spawn_serializes_thread_lineage()
 fn subagent_thread_started_memory_consolidation_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the serialized subagent source string for memory-consolidation subagent threads.
+**Purpose**: Checks serialization for a subagent started for memory consolidation. Memory consolidation is background summarizing or cleanup of stored context.
 
-**Data flow**: Builds a `SubAgentThreadStartedInput` with `SubAgentSource::MemoryConsolidation`, serializes the resulting event, and asserts the `subagent_source` and null parent thread id.
+**Data flow**: It builds a memory-consolidation subagent input, serializes the thread-initialized event, and verifies the subagent source and missing parent field.
 
-**Call relations**: Serialization contract test for another subagent source variant.
+**Call relations**: It exercises subagent_thread_started_event_request for the MemoryConsolidation source.
 
 *Call graph*: calls 1 internal fn (subagent_thread_started_event_request); 3 external calls (ThreadInitialized, assert_eq!, to_value).
 
@@ -2305,11 +2325,11 @@ fn subagent_thread_started_memory_consolidation_serializes_expected_shape()
 fn subagent_thread_started_other_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts that `SubAgentSource::Other` serializes using its contained string value.
+**Purpose**: Checks that a custom subagent source string is serialized correctly. This covers future or less common subagent kinds.
 
-**Data flow**: Builds a `SubAgentThreadStartedInput` with `Other("guardian")`, serializes the resulting event, and asserts `subagent_source == "guardian"` and null parent thread id.
+**Data flow**: It builds a subagent input with Other("guardian"), serializes it, and checks the source string and null parent.
 
-**Call relations**: Covers the open-ended subagent source variant.
+**Call relations**: It exercises subagent_thread_started_event_request for the Other source variant.
 
 *Call graph*: calls 1 internal fn (subagent_thread_started_event_request); 4 external calls (ThreadInitialized, assert_eq!, Other, to_value).
 
@@ -2320,11 +2340,11 @@ fn subagent_thread_started_other_serializes_expected_shape()
 fn subagent_thread_started_other_serializes_explicit_parent_thread_id()
 ```
 
-**Purpose**: Checks that `Other(...)` subagent events preserve an explicitly supplied parent thread id.
+**Purpose**: Checks that a custom subagent source can still include an explicit parent thread ID. This keeps lineage available even for non-standard subagents.
 
-**Data flow**: Creates a concrete parent thread id, builds `SubAgentThreadStartedInput` with `Other("guardian")` and `parent_thread_id: Some(...)`, serializes the event, and asserts the parent thread id field.
+**Data flow**: It builds a valid parent thread ID, creates an Other("guardian") subagent input with that parent, serializes it, and checks both fields.
 
-**Call relations**: Extends the previous test to cover explicit lineage on `Other` sources.
+**Call relations**: It complements the previous Other-source test by covering explicit parent lineage.
 
 *Call graph*: calls 2 internal fn (subagent_thread_started_event_request, from_string); 4 external calls (ThreadInitialized, assert_eq!, Other, to_value).
 
@@ -2335,11 +2355,11 @@ fn subagent_thread_started_other_serializes_explicit_parent_thread_id()
 async fn subagent_thread_started_publishes_without_initialize()
 ```
 
-**Purpose**: Verifies that custom subagent-thread-started facts can emit thread initialization analytics even without a prior initialize fact.
+**Purpose**: Verifies that a custom subagent-thread-start fact can emit a thread-initialized event even without a prior initialize fact. Subagents may be created internally, not through a normal client connection.
 
-**Data flow**: Creates a default reducer, ingests `CustomAnalyticsFact::SubAgentThreadStarted`, serializes emitted events, and asserts one thread-initialized event with the supplied client metadata and subagent source.
+**Data flow**: It ingests a SubAgentThreadStarted custom fact into a fresh reducer and checks one emitted thread-initialized event with client and subagent fields.
 
-**Call relations**: Documents a special reducer path where subagent-start events are self-contained and do not depend on connection initialization.
+**Call relations**: This exercises the reducer’s custom subagent thread path, independent of normal connection initialization.
 
 *Call graph*: 6 external calls (new, Custom, SubAgentThreadStarted, default, assert_eq!, to_value).
 
@@ -2350,11 +2370,11 @@ async fn subagent_thread_started_publishes_without_initialize()
 async fn subagent_events_use_inherited_connection_unless_turn_connection_is_explicit()
 ```
 
-**Purpose**: Checks that subagent threads inherit parent connection metadata for custom and turn events until an explicit turn connection is established, after which explicit connection metadata wins.
+**Purpose**: Checks how subagent events choose client metadata. They should inherit from the parent thread unless a later turn explicitly uses another connection.
 
-**Data flow**: Initializes a parent connection and thread, ingests a `SubAgentThreadStarted` fact for a child thread with parent lineage, emits and checks a compaction event using inherited metadata, completes a child turn and checks the emitted turn event still uses inherited metadata, then initializes a second connection and explicit turn-start request/response for the child thread, completes another child turn, and asserts the new turn event uses the explicit connection’s client metadata.
+**Data flow**: It initializes a parent connection, starts a parent thread, starts a subagent thread, checks a compaction and completed turn inherit parent metadata, then starts a turn through another connection and checks that explicit metadata wins.
 
-**Call relations**: This is a comprehensive inheritance test covering reducer metadata sourcing across parent-child thread relationships and later explicit overrides.
+**Call relations**: This large integration-style test uses many helpers to exercise reducer metadata inheritance across subagent thread, compaction, turn completion, token usage, and explicit turn start paths.
 
 *Call graph*: calls 8 internal fn (ingest_complete_child_turn, sample_initialize_fact, sample_runtime_metadata, sample_thread_start_response, sample_turn_start_request, sample_turn_start_response, sample_turn_token_usage_fact, from_string); 11 external calls (new, new, Custom, Compaction, SubAgentThreadStarted, TurnTokenUsage, default, Integer, assert_eq!, panic! (+1 more)).
 
@@ -2365,11 +2385,11 @@ async fn subagent_events_use_inherited_connection_unless_turn_connection_is_expl
 async fn subagent_tool_items_inherit_parent_connection_metadata()
 ```
 
-**Purpose**: Verifies that tool-item analytics emitted from subagent threads inherit parent connection metadata and lineage fields.
+**Purpose**: Checks that tool-item events inside a subagent thread inherit parent client metadata and include subagent lineage.
 
-**Data flow**: Sets up review prerequisites, ingests a `SubAgentThreadStarted` fact for a child thread, clears events, ingests turn-started, item-started, and item-completed notifications for the subagent thread, serializes emitted events, and asserts thread source, subagent source, parent thread id, and client name.
+**Data flow**: It sets up a parent thread, starts a subagent thread, sends turn and command item notifications for the subagent, then checks the command event’s source, parent ID, and client name.
 
-**Call relations**: Covers inheritance behavior for tool-item events specifically, not just turn or custom events.
+**Call relations**: It combines review prerequisites, a SubAgentThreadStarted fact, turn-start notification, and command item helpers to test tool-item metadata inheritance.
 
 *Call graph*: calls 3 internal fn (ingest_review_prerequisites, sample_command_execution_item, sample_turn_started_notification); 10 external calls (new, ItemCompleted, ItemStarted, new, Custom, Notification, SubAgentThreadStarted, default, assert_eq!, to_value).
 
@@ -2380,11 +2400,11 @@ async fn subagent_tool_items_inherit_parent_connection_metadata()
 fn plugin_used_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a plugin-used analytics event.
+**Purpose**: Checks the JSON shape for a plugin-used event. Plugins can add skills, MCP servers, and app connectors, and analytics records which plugin was used during a turn.
 
-**Data flow**: Builds tracking context and sample plugin metadata, constructs `TrackEventRequest::PluginUsed` via `codex_plugin_used_metadata`, serializes it, and compares against expected JSON.
+**Data flow**: It builds tracking context and sample plugin metadata, creates a PluginUsed event, serializes it, and compares all expected plugin and turn fields.
 
-**Call relations**: Serialization contract test for plugin usage analytics.
+**Call relations**: It exercises codex_plugin_used_metadata with sample_plugin_metadata.
 
 *Call graph*: calls 2 internal fn (sample_plugin_metadata, codex_plugin_used_metadata); 3 external calls (PluginUsed, assert_eq!, to_value).
 
@@ -2395,11 +2415,11 @@ fn plugin_used_event_serializes_expected_shape()
 fn plugin_management_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a plugin management event such as plugin installation.
+**Purpose**: Checks the JSON shape for a plugin management event, such as plugin installed. This records plugin metadata outside a specific turn.
 
-**Data flow**: Builds sample plugin metadata, constructs `TrackEventRequest::PluginInstalled` via `codex_plugin_metadata`, serializes it, and compares against expected JSON.
+**Data flow**: It builds a PluginInstalled event from sample plugin metadata, serializes it, and compares plugin ID, name, marketplace, skill flag, server count, connector IDs, and product client ID.
 
-**Call relations**: Serialization contract test for plugin state-change analytics.
+**Call relations**: It exercises codex_plugin_metadata for the normal local plugin ID path.
 
 *Call graph*: calls 2 internal fn (sample_plugin_metadata, codex_plugin_metadata); 3 external calls (PluginInstalled, assert_eq!, to_value).
 
@@ -2410,11 +2430,11 @@ fn plugin_management_event_serializes_expected_shape()
 fn plugin_management_event_can_use_remote_plugin_id_override()
 ```
 
-**Purpose**: Verifies that plugin analytics prefer `remote_plugin_id` over the local parsed plugin id when present.
+**Purpose**: Checks that plugin analytics can use a remote plugin ID when one is provided. This lets server-side plugin identity override the local config ID.
 
-**Data flow**: Mutates sample plugin metadata to set `remote_plugin_id`, constructs a plugin-installed event, serializes it, and asserts the payload’s `plugin_id` uses the override while name and marketplace remain unchanged.
+**Data flow**: It builds sample plugin metadata, sets a remote_plugin_id, serializes a plugin-installed event, and verifies the overridden ID while other metadata remains unchanged.
 
-**Call relations**: Documents an important identifier-selection rule in plugin metadata serialization.
+**Call relations**: It reuses sample_plugin_metadata and codex_plugin_metadata to test the override branch.
 
 *Call graph*: calls 2 internal fn (sample_plugin_metadata, codex_plugin_metadata); 3 external calls (PluginInstalled, assert_eq!, to_value).
 
@@ -2425,11 +2445,11 @@ fn plugin_management_event_can_use_remote_plugin_id_override()
 fn hook_run_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a hook-run analytics event.
+**Purpose**: Checks the JSON for a hook-run event. A hook is user, project, system, or cloud-provided code that runs at certain Codex lifecycle points.
 
-**Data flow**: Builds tracking context and a `HookRunFact`, constructs `TrackEventRequest::HookRun` via `codex_hook_run_metadata`, serializes it, and compares against expected JSON.
+**Data flow**: It builds tracking context and a completed pre-tool-use hook fact, creates the event, serializes it, and compares expected fields.
 
-**Call relations**: Serialization contract test for hook analytics.
+**Call relations**: It exercises codex_hook_run_metadata through the HookRun event wrapper.
 
 *Call graph*: calls 1 internal fn (codex_hook_run_metadata); 3 external calls (HookRun, assert_eq!, to_value).
 
@@ -2440,11 +2460,11 @@ fn hook_run_event_serializes_expected_shape()
 fn hook_run_metadata_maps_sources_and_statuses()
 ```
 
-**Purpose**: Verifies mapping of multiple hook sources and statuses into their serialized analytics strings.
+**Purpose**: Checks that hook source and status enum values become the expected analytics strings. This protects dashboards from inconsistent labels.
 
-**Data flow**: Builds tracking context, serializes four `codex_hook_run_metadata` outputs for system/project/cloud-requirements/unknown sources and completed/blocked/failed statuses, and asserts the resulting JSON fields.
+**Data flow**: It serializes hook metadata for system, project, cloud requirements, and unknown sources with different statuses, then compares the source and status strings.
 
-**Call relations**: Documents enum-to-string mapping behavior in hook metadata generation.
+**Call relations**: This directly tests codex_hook_run_metadata mapping behavior across several source/status combinations.
 
 *Call graph*: calls 1 internal fn (codex_hook_run_metadata); 2 external calls (assert_eq!, to_value).
 
@@ -2455,11 +2475,11 @@ fn hook_run_metadata_maps_sources_and_statuses()
 fn hook_run_metadata_maps_stopped_status()
 ```
 
-**Purpose**: Verifies that `HookRunStatus::Stopped` serializes as `stopped`.
+**Purpose**: Checks that a stopped hook run serializes with status stopped. This covers a terminal state separate from completed, blocked, or failed.
 
-**Data flow**: Builds tracking context, serializes one hook metadata value with stopped status, and asserts the `hook_source` and `status` fields.
+**Data flow**: It builds tracking context and a stopped user hook fact, serializes hook metadata, and checks source and status strings.
 
-**Call relations**: A narrow serialization test for one status variant.
+**Call relations**: It is a focused companion to the broader hook source/status mapping test.
 
 *Call graph*: calls 1 internal fn (codex_hook_run_metadata); 2 external calls (assert_eq!, to_value).
 
@@ -2470,11 +2490,11 @@ fn hook_run_metadata_maps_stopped_status()
 fn plugin_used_dedupe_is_keyed_by_turn_and_plugin()
 ```
 
-**Purpose**: Checks that plugin-used deduplication is scoped by `(turn_id, plugin_id)`.
+**Purpose**: Checks that plugin-used events are only queued once per turn and plugin. This avoids duplicate tracking when the same plugin contributes multiple times in one turn.
 
-**Data flow**: Constructs a queue with empty dedupe sets, creates sample plugin metadata and two tracking contexts for different turns, calls `should_enqueue_plugin_used` repeatedly, and asserts true/false/true across duplicate and cross-turn cases.
+**Data flow**: It builds an analytics queue with empty dedupe sets, sample plugin metadata, and two turn contexts. It verifies first use is allowed, repeated use in the same turn is blocked, and use in a different turn is allowed.
 
-**Call relations**: Queue-level dedupe test parallel to the app-used dedupe test.
+**Call relations**: This directly tests AnalyticsEventsQueue’s plugin-used deduplication behavior.
 
 *Call graph*: calls 1 internal fn (sample_plugin_metadata); 5 external calls (new, new, new, assert_eq!, channel).
 
@@ -2485,11 +2505,11 @@ fn plugin_used_dedupe_is_keyed_by_turn_and_plugin()
 async fn reducer_ingests_skill_invoked_fact()
 ```
 
-**Purpose**: Verifies that a custom skill-invoked fact emits the expected skill invocation analytics event with a computed local skill id.
+**Purpose**: Checks that a custom skill-invoked fact becomes a skill invocation analytics event with a stable skill ID.
 
-**Data flow**: Builds tracking context and a user skill path, computes the expected skill id with `skill_id_for_local_skill`, ingests `CustomAnalyticsFact::SkillInvoked`, serializes emitted events, and asserts the full JSON payload.
+**Data flow**: It builds tracking context, a user skill path, computes the expected local skill ID, ingests a SkillInvoked fact, and compares the emitted JSON.
 
-**Call relations**: Exercises reducer handling of custom skill invocation facts.
+**Call relations**: It exercises both skill_id_for_local_skill and the reducer’s custom SkillInvoked handling.
 
 *Call graph*: calls 1 internal fn (skill_id_for_local_skill); 8 external calls (from, new, Custom, SkillInvoked, default, assert_eq!, to_value, vec!).
 
@@ -2500,11 +2520,11 @@ async fn reducer_ingests_skill_invoked_fact()
 async fn reducer_includes_plugin_id_for_plugin_skill_invocations()
 ```
 
-**Purpose**: Checks that plugin-backed skill invocations include the plugin id in emitted analytics.
+**Purpose**: Checks that skill invocations coming from plugins include the plugin ID. This links skill usage back to the plugin that provided it.
 
-**Data flow**: Builds tracking context and a plugin skill path, ingests a `SkillInvoked` custom fact with `plugin_id: Some(...)`, serializes emitted events, and asserts the payload contains that plugin id.
+**Data flow**: It builds a plugin skill invocation with plugin_id, ingests it, serializes output, and asserts the plugin_id appears in event_params.
 
-**Call relations**: Covers the plugin-associated branch of skill invocation analytics.
+**Call relations**: This is a narrower companion to reducer_ingests_skill_invoked_fact, focused on plugin-provided skills.
 
 *Call graph*: 8 external calls (from, new, Custom, SkillInvoked, default, assert_eq!, to_value, vec!).
 
@@ -2515,11 +2535,11 @@ async fn reducer_includes_plugin_id_for_plugin_skill_invocations()
 async fn reducer_ingests_hook_run_fact()
 ```
 
-**Purpose**: Verifies that a custom hook-run fact emits the expected hook analytics event.
+**Purpose**: Checks that a custom hook-run fact becomes a hook-run analytics event.
 
-**Data flow**: Builds a reducer and tracking context, ingests `CustomAnalyticsFact::HookRun`, serializes emitted events, and asserts one event with expected hook name, source, and status.
+**Data flow**: It ingests a HookRun custom fact with tracking context, hook name, source, and failed status, then asserts one emitted event with matching fields.
 
-**Call relations**: Exercises reducer handling of custom hook facts.
+**Call relations**: It exercises the reducer path that turns CustomAnalyticsFact::HookRun into a TrackEventRequest::HookRun.
 
 *Call graph*: 6 external calls (new, Custom, HookRun, default, assert_eq!, to_value).
 
@@ -2530,11 +2550,11 @@ async fn reducer_ingests_hook_run_fact()
 async fn reducer_ingests_app_and_plugin_facts()
 ```
 
-**Purpose**: Verifies that custom app-mentioned, app-used, and plugin-used facts each emit their corresponding analytics events.
+**Purpose**: Checks that custom app-mentioned, app-used, and plugin-used facts each produce the right analytics event type.
 
-**Data flow**: Builds tracking context, ingests three custom facts in sequence, serializes emitted events, and asserts the array length and event types in order.
+**Data flow**: It builds shared tracking context, ingests three custom facts in sequence, serializes outputs, and checks that three expected event types appear in order.
 
-**Call relations**: Covers reducer handling of several simple custom fact variants.
+**Call relations**: This test covers the reducer’s simple pass-through conversions for app and plugin usage facts using sample plugin metadata.
 
 *Call graph*: calls 1 internal fn (sample_plugin_metadata); 9 external calls (new, Custom, AppMentioned, AppUsed, PluginUsed, default, assert_eq!, to_value, vec!).
 
@@ -2545,11 +2565,11 @@ async fn reducer_ingests_app_and_plugin_facts()
 async fn reducer_ingests_plugin_state_changed_fact()
 ```
 
-**Purpose**: Verifies that a plugin state-change custom fact emits the correct plugin management event.
+**Purpose**: Checks that a plugin state change, such as disabled, produces the corresponding plugin management event.
 
-**Data flow**: Builds sample plugin metadata, ingests `CustomAnalyticsFact::PluginStateChanged` with `PluginState::Disabled`, serializes emitted events, and asserts the exact JSON payload.
+**Data flow**: It ingests a PluginStateChanged custom fact with sample plugin metadata and Disabled state, then compares the emitted JSON to the expected codex_plugin_disabled event.
 
-**Call relations**: Exercises reducer mapping from plugin state changes to event types.
+**Call relations**: It exercises the reducer path for plugin state changes and relies on sample_plugin_metadata for consistent plugin details.
 
 *Call graph*: calls 1 internal fn (sample_plugin_metadata); 6 external calls (new, Custom, PluginStateChanged, default, assert_eq!, to_value).
 
@@ -2560,11 +2580,11 @@ async fn reducer_ingests_plugin_state_changed_fact()
 fn turn_event_serializes_expected_shape()
 ```
 
-**Purpose**: Asserts the exact JSON shape of a fully populated turn analytics event.
+**Purpose**: Checks the full JSON shape for a turn event. Turn events are the main record of one model interaction, including configuration, status, timing, tool counts, and token usage.
 
-**Data flow**: Constructs `TrackEventRequest::TurnEvent` with a detailed `CodexTurnEventParams`, serializes it, parses an expected JSON string into `serde_json::Value`, and asserts equality.
+**Data flow**: It builds a CodexTurnEventRequest with many fields populated, serializes it, parses expected JSON, and asserts exact equality.
 
-**Call relations**: Serialization contract test for the largest and most detailed analytics event type in the subsystem.
+**Call relations**: This schema test supports reducer lifecycle tests that later emit turn events from many smaller facts.
 
 *Call graph*: calls 2 internal fn (sample_app_server_client_metadata, sample_runtime_metadata); 4 external calls (new, TurnEvent, assert_eq!, to_value).
 
@@ -2575,11 +2595,11 @@ fn turn_event_serializes_expected_shape()
 async fn accepted_turn_steer_emits_expected_event()
 ```
 
-**Purpose**: Verifies that an accepted turn-steer request/response pair emits the expected turn-steer analytics event.
+**Purpose**: Checks that an accepted turn-steering request emits a turn-steer analytics event with request metadata and accepted turn ID.
 
-**Data flow**: Sets up turn prerequisites, ingests a steer request and matching steer response, asserts one output event, serializes it, and checks thread/session ids, expected and accepted turn ids, image count, result, timestamps, and nested metadata.
+**Data flow**: It sets up a turn, sends a steering request and successful response, then asserts one event with thread, session, input-image count, result, timestamps, client, runtime, and lineage fields.
 
-**Call relations**: Exercises reducer handling of successful steer requests.
+**Call relations**: It uses ingest_turn_prerequisites plus steering request/response helpers to exercise the accepted-steering reducer path.
 
 *Call graph*: calls 3 internal fn (ingest_turn_prerequisites, sample_turn_steer_request, sample_turn_steer_response); 7 external calls (new, new, default, Integer, assert!, assert_eq!, to_value).
 
@@ -2590,11 +2610,11 @@ async fn accepted_turn_steer_emits_expected_event()
 async fn rejected_turn_steer_uses_request_connection_metadata()
 ```
 
-**Purpose**: Verifies that rejected turn-steer events use the request connection’s cached metadata and map the no-active-turn error to the correct rejection reason.
+**Purpose**: Checks that a rejected steering event uses metadata from the request connection. This matters when multiple clients or connections are active.
 
-**Data flow**: Calls `ingest_rejected_turn_steer` with the no-active-turn error and classified error type, then asserts the returned JSON payload fields including `result: rejected` and `rejection_reason: no_active_turn`.
+**Data flow**: It calls the shared rejected-steering helper with a no-active-turn error, then checks rejected status, reason, thread fields, client metadata, runtime, and timestamp.
 
-**Call relations**: One of several tests built on the shared rejected-steer helper.
+**Call relations**: It relies on ingest_rejected_turn_steer to build the multi-connection setup and focuses on the resulting event fields.
 
 *Call graph*: calls 3 internal fn (ingest_rejected_turn_steer, no_active_turn_steer_error, no_active_turn_steer_error_type); 4 external calls (new, default, assert!, assert_eq!).
 
@@ -2605,11 +2625,11 @@ async fn rejected_turn_steer_uses_request_connection_metadata()
 async fn rejected_turn_steer_maps_active_turn_not_steerable_error_type()
 ```
 
-**Purpose**: Checks that a non-steerable review rejection maps to the `non_steerable_review` analytics reason.
+**Purpose**: Checks that a non-steerable review-turn error becomes the rejection reason non_steerable_review.
 
-**Data flow**: Runs `ingest_rejected_turn_steer` with the review-specific error fixture and classified error type, then asserts the emitted payload’s `rejection_reason` field.
+**Data flow**: It runs the shared rejected-steering flow with the non-steerable raw error and categorized error, then asserts the rejection_reason field.
 
-**Call relations**: Covers one specific rejection-reason mapping branch.
+**Call relations**: It uses non_steerable_review_error and non_steerable_review_error_type to exercise one branch of rejection mapping.
 
 *Call graph*: calls 3 internal fn (ingest_rejected_turn_steer, non_steerable_review_error, non_steerable_review_error_type); 3 external calls (new, default, assert_eq!).
 
@@ -2620,11 +2640,11 @@ async fn rejected_turn_steer_maps_active_turn_not_steerable_error_type()
 async fn rejected_turn_steer_maps_input_too_large_error_type()
 ```
 
-**Purpose**: Checks that oversized input rejection maps to the `input_too_large` analytics reason.
+**Purpose**: Checks that an input-too-large steering error becomes the rejection reason input_too_large.
 
-**Data flow**: Runs `ingest_rejected_turn_steer` with the oversized-input error fixture and classified error type, then asserts the emitted payload’s `rejection_reason` field.
+**Data flow**: It runs the shared rejected-steering flow with the input-too-large raw error and categorized error, then asserts the rejection_reason field.
 
-**Call relations**: Covers another rejection-reason mapping branch.
+**Call relations**: It uses input_too_large_steer_error and input_too_large_error_type to exercise the input validation branch of rejection mapping.
 
 *Call graph*: calls 3 internal fn (ingest_rejected_turn_steer, input_too_large_error_type, input_too_large_steer_error); 3 external calls (new, default, assert_eq!).
 
@@ -2635,11 +2655,11 @@ async fn rejected_turn_steer_maps_input_too_large_error_type()
 async fn turn_steer_does_not_emit_without_pending_request()
 ```
 
-**Purpose**: Verifies that an error response alone does not emit a turn-steer event unless a matching pending steer request was previously recorded.
+**Purpose**: Checks that a steering error response alone does not emit an event. The reducer must first have seen the matching request.
 
-**Data flow**: Creates a default reducer, ingests an `ErrorResponse` for a steer request id without first ingesting the request, and asserts the output vector remains empty.
+**Data flow**: It sends an ErrorResponse for a request ID into a fresh reducer and asserts no events are produced.
 
-**Call relations**: Documents reducer dependence on pending request state for steer analytics.
+**Call relations**: This protects the reducer’s pending-request matching logic for turn-steer analytics.
 
 *Call graph*: calls 2 internal fn (no_active_turn_steer_error, no_active_turn_steer_error_type); 4 external calls (new, default, Integer, assert!).
 
@@ -2650,11 +2670,11 @@ async fn turn_steer_does_not_emit_without_pending_request()
 async fn turn_start_error_response_discards_pending_start_request()
 ```
 
-**Purpose**: Checks that an error response for a turn-start request clears pending request state so a later synthetic response cannot resurrect it.
+**Purpose**: Checks that a failed turn-start request is removed from pending state. A later synthetic response must not resurrect it.
 
-**Data flow**: Initializes reducer state, ingests a turn-start request, ingests an error response for that request id, then ingests a late turn-start response and later resolved-config/completion facts for the same turn id, asserting no events are emitted at any stage.
+**Data flow**: It initializes, sends a turn-start request, sends an error, then sends a late turn-start response and later completion facts. It asserts no events are emitted.
 
-**Call relations**: Protects reducer cleanup semantics for failed turn-start requests.
+**Call relations**: This uses turn-start, error, resolved-config, and completion helpers to verify failed starts cannot create later turn analytics.
 
 *Call graph*: calls 6 internal fn (ingest_initialize, no_active_turn_steer_error, sample_turn_completed_notification, sample_turn_resolved_config, sample_turn_start_request, sample_turn_start_response); 8 external calls (new, new, Custom, Notification, TurnResolvedConfig, default, Integer, assert!).
 
@@ -2665,11 +2685,11 @@ async fn turn_start_error_response_discards_pending_start_request()
 async fn turn_lifecycle_emits_turn_event()
 ```
 
-**Purpose**: Verifies the normal happy-path turn lifecycle emits one turn event with resolved config, token usage, tool counts, timing, and cached metadata.
+**Purpose**: Checks the normal successful turn lifecycle. When all required facts arrive, the reducer should emit one complete turn event.
 
-**Data flow**: Sets up full turn prerequisites including initialize, resolved config, started notification, and token usage, ingests turn completion, asserts one output event, serializes it, and checks many nested fields and counters.
+**Data flow**: It sets up initialization, turn start, resolved config, started notification, token usage, and profile. Then it sends completion and checks the emitted event’s metadata, counts, timing, status, and token fields.
 
-**Call relations**: This is the core reducer lifecycle test for completed turns.
+**Call relations**: This is the main happy-path reducer test for turn analytics, built on ingest_turn_prerequisites and sample_turn_completed_notification.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 7 external calls (new, new, Notification, default, assert!, assert_eq!, to_value).
 
@@ -2680,11 +2700,11 @@ async fn turn_lifecycle_emits_turn_event()
 async fn turn_event_counts_completed_tool_items()
 ```
 
-**Purpose**: Checks that completed tool items of various kinds are counted into the correct per-turn aggregate counters and that MCP tool events preserve plugin id.
+**Purpose**: Checks that a final turn event counts completed tool items by type, including shell commands, file changes, MCP tools, dynamic tools, subagent tools, web search, and image generation.
 
-**Data flow**: Sets up turn prerequisites, ingests one MCP item-started notification, ingests a series of completed items across command execution, file change, MCP, dynamic tool, collab agent, subagent activity, web search, and image generation, verifies the emitted MCP tool call event, then completes the turn and asserts the turn event’s aggregate tool counters.
+**Data flow**: It sets up a turn, sends one started MCP item and several completed tool items, confirms MCP event plugin metadata, completes the turn, and checks the final counts.
 
-**Call relations**: Exercises reducer aggregation across multiple tool-item variants before turn completion.
+**Call relations**: It exercises the reducer’s item-completion accounting and final turn-summary emission.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 9 external calls (new, ItemCompleted, ItemStarted, new, Notification, default, assert_eq!, to_value, vec!).
 
@@ -2695,11 +2715,11 @@ async fn turn_event_counts_completed_tool_items()
 async fn item_completed_without_turn_state_does_not_create_turn_state()
 ```
 
-**Purpose**: Verifies that stray item-completed notifications do not create synthetic turn state that would later emit a turn event.
+**Purpose**: Checks that an item completion by itself does not create turn state. This prevents stray notifications from causing bogus turn events.
 
-**Data flow**: Creates a default reducer, ingests an item-completed notification for an unknown turn, then ingests turn completion for that same turn, and asserts no events were emitted.
+**Data flow**: It ingests a completed command item in a fresh reducer, then a turn-completed notification for the same turn, and asserts no events are emitted.
 
-**Call relations**: Documents reducer refusal to infer turn lifecycle solely from item completion.
+**Call relations**: It uses command item and turn completion helpers to prove the reducer requires a real turn setup before summarizing.
 
 *Call graph*: calls 2 internal fn (sample_command_execution_item, sample_turn_completed_notification); 6 external calls (new, ItemCompleted, new, Notification, default, assert!).
 
@@ -2710,11 +2730,11 @@ async fn item_completed_without_turn_state_does_not_create_turn_state()
 async fn accepted_steers_increment_turn_steer_count()
 ```
 
-**Purpose**: Checks that only accepted steer requests increment the `steer_count` on the eventual turn event.
+**Purpose**: Checks that accepted steering requests increase the final turn’s steer count, while rejected ones do not.
 
-**Data flow**: Sets up turn prerequisites, ingests one accepted steer pair, one rejected steer pair, and another accepted steer pair, then completes the turn and asserts the emitted turn event has `steer_count == 2`.
+**Data flow**: It sets up a turn, sends one accepted steer, one rejected steer, another accepted steer, then completes the turn and asserts the turn event has steer_count 2.
 
-**Call relations**: Connects steer-event handling with later turn-event aggregation.
+**Call relations**: It combines steering helpers, no-active-turn error helpers, and final turn completion to verify reducer counting.
 
 *Call graph*: calls 6 internal fn (ingest_turn_prerequisites, no_active_turn_steer_error, no_active_turn_steer_error_type, sample_turn_completed_notification, sample_turn_steer_request, sample_turn_steer_response); 7 external calls (new, new, Notification, default, Integer, assert_eq!, to_value).
 
@@ -2725,11 +2745,11 @@ async fn accepted_steers_increment_turn_steer_count()
 async fn turn_does_not_emit_without_required_prerequisites()
 ```
 
-**Purpose**: Verifies that turn completion alone is insufficient; the reducer requires both initialize metadata and resolved config before emitting a turn event.
+**Purpose**: Checks that turn completion does not emit analytics when essential setup is missing. This avoids incomplete or misleading events.
 
-**Data flow**: Runs two separate reducer scenarios: one missing initialize and one missing resolved config. In each case it ingests completion after partial prerequisites and asserts no events are emitted.
+**Data flow**: It runs two scenarios: one without initialization and one without resolved config. In both, it completes the turn and asserts no output.
 
-**Call relations**: Documents the reducer’s minimum prerequisite set for turn analytics.
+**Call relations**: It uses ingest_turn_prerequisites with different flags to test the reducer’s required-field gates.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 5 external calls (new, new, Notification, default, assert!).
 
@@ -2740,11 +2760,11 @@ async fn turn_does_not_emit_without_required_prerequisites()
 async fn turn_lifecycle_emits_failed_turn_event()
 ```
 
-**Purpose**: Checks that failed turns emit turn events carrying both app-server turn error info and separately tracked codex error classification.
+**Purpose**: Checks that a failed turn emits a turn event with both app-server error information and Codex error classification.
 
-**Data flow**: Sets up turn prerequisites, ingests a custom `TurnCodexError` fact derived from a `CodexErr`, then ingests a failed turn completion notification with `BadRequest`, serializes the emitted event, and asserts failed status plus `turn_error`, `codex_error_kind`, and null HTTP status code.
+**Data flow**: It sets up a turn, ingests a custom Codex error fact, completes the turn with failed status and bad-request info, then checks status, turn_error, and codex_error_kind fields.
 
-**Call relations**: Exercises reducer merging of custom codex error facts with terminal turn status.
+**Call relations**: It combines normal turn prerequisites, TurnCodexError custom fact, and failed completion to test error enrichment.
 
 *Call graph*: calls 3 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification, from_codex_err); 9 external calls (new, new, Custom, Notification, TurnCodexError, default, assert_eq!, InvalidRequest, to_value).
 
@@ -2755,11 +2775,11 @@ async fn turn_lifecycle_emits_failed_turn_event()
 async fn turn_lifecycle_emits_interrupted_turn_event_without_error()
 ```
 
-**Purpose**: Verifies that interrupted turns emit a turn event with interrupted status but no error classification.
+**Purpose**: Checks that an interrupted turn emits an interrupted status without inventing an error. Interruption is not always a failure.
 
-**Data flow**: Sets up turn prerequisites, ingests an interrupted completion notification, serializes the emitted event, and asserts `status: interrupted` with null `turn_error` and `codex_error_kind`.
+**Data flow**: It sets up a turn, completes it with Interrupted status and no error info, then asserts status is interrupted and error fields are null.
 
-**Call relations**: Covers a non-success terminal status distinct from explicit failure.
+**Call relations**: This is a focused variant of the turn lifecycle tests using the normal setup helper and completion notification.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 6 external calls (new, new, Notification, default, assert_eq!, to_value).
 
@@ -2770,11 +2790,11 @@ async fn turn_lifecycle_emits_interrupted_turn_event_without_error()
 async fn turn_completed_without_started_notification_emits_null_started_at()
 ```
 
-**Purpose**: Checks that if no `TurnStarted` notification was seen, the emitted turn event leaves `started_at` null while still carrying completion timing and null token usage.
+**Purpose**: Checks that a completed turn can still emit when the started notification was missing, but started_at and token fields remain null if not provided.
 
-**Data flow**: Sets up turn prerequisites without the started notification or token usage, ingests completion, serializes the emitted event, and asserts `started_at == null`, `duration_ms == 1234`, and all token fields are null.
+**Data flow**: It sets up initialization and resolved config without start notification or token usage, completes the turn, and checks null started_at and token fields while preserving duration.
 
-**Call relations**: Documents reducer behavior when only completion timing is available.
+**Call relations**: This tests the reducer’s graceful handling of partial-but-sufficient turn lifecycle data.
 
 *Call graph*: calls 2 internal fn (ingest_turn_prerequisites, sample_turn_completed_notification); 6 external calls (new, new, Notification, default, assert_eq!, to_value).
 
@@ -2785,22 +2805,24 @@ async fn turn_completed_without_started_notification_emits_null_started_at()
 fn sample_plugin_metadata() -> PluginTelemetryMetadata
 ```
 
-**Purpose**: Builds a representative `PluginTelemetryMetadata` fixture with capability summary, MCP servers, and connector ids.
+**Purpose**: Builds reusable fake plugin metadata with a plugin ID, display name, skill support, MCP server names, and app connector IDs.
 
-**Data flow**: Parses `sample@test` into a `PluginId`, constructs `PluginCapabilitySummary` with display name, skills flag, two MCP server names, and two connector ids, wraps it in `PluginTelemetryMetadata`, and returns it.
+**Data flow**: It takes no input. It parses a sample plugin ID and returns PluginTelemetryMetadata with a populated capability summary.
 
-**Call relations**: Shared by plugin serialization, dedupe, and reducer-ingestion tests throughout the file.
+**Call relations**: Plugin serialization, deduplication, reducer ingestion, and plugin state tests call this to share one consistent plugin fixture.
 
 *Call graph*: calls 1 internal fn (parse); called by 6 (plugin_management_event_can_use_remote_plugin_id_override, plugin_management_event_serializes_expected_shape, plugin_used_dedupe_is_keyed_by_turn_and_plugin, plugin_used_event_serializes_expected_shape, reducer_ingests_app_and_plugin_facts, reducer_ingests_plugin_state_changed_fact); 1 external calls (vec!).
 
 
 ### `app-server/tests/suite/v2/analytics.rs`
 
-`test` · `cross-cutting telemetry assertions in integration tests`
+`test` · `test execution`
 
-This file is half test suite, half support module for other v2 tests. The two top-level tests build a `codex_core::config::Config` with `ConfigBuilder`, inject an OTLP/HTTP JSON metrics exporter, leave `analytics_enabled` unset, and then call `codex_core::otel_init::build_provider` with different `default_analytics_enabled` values. Rather than asserting provider existence directly, they inspect `provider.metrics()` because a provider may still exist for non-metrics telemetry. That distinction is an important design detail captured here.
+This file is part test, part test toolbox. Analytics are the small event reports the app-server sends so the project can understand things like thread starts, turns, and goals. In normal life these reports would go to a real service. In tests, this file sets up a fake web server and teaches the tests how to wait for, read, and check those reports safely.
 
-The rest of the file helps other suites capture and inspect analytics traffic. `mount_analytics_capture` mounts a `POST /codex/analytics-events/events` endpoint on a `MockServer` and writes ChatGPT auth fixture data so analytics requests have account context. `wait_for_analytics_payload` and `wait_for_matching_analytics_event` poll `received_requests()` until a matching analytics POST arrives, repeatedly sleeping 25 ms between checks and parsing request bodies as JSON. Thin wrappers select by `event_type` or by goal-event fields. Finally, `thread_initialized_event` extracts the `codex_thread_initialized` event from a payload, and `assert_basic_thread_initialized_event` checks the common event fields such as thread/session ids, client identity, transport `stdio`, model, non-ephemeral status, source lineage fields, initialization mode, and presence of a numeric `created_at` timestamp.
+The first two tests verify an important default: if the user has not explicitly set analytics on or off, the app-server may choose its own default. One test says “when the default is off, metrics must stay off.” The other says “when the default is on, metrics must be enabled.” This protects privacy and product behavior from changing by accident.
+
+The helper functions then act like a mailroom for analytics tests. They mount a fake HTTP endpoint, write a fake ChatGPT login file so the app has account information, wait until a matching analytics request arrives, parse its JSON body, and pull out specific events. Other test files use these helpers to assert that starting, resuming, forking, steering, and completing goals all produce the expected analytics records. Without this file, those tests would either need to duplicate a lot of setup code or would be much less precise about what analytics were actually emitted.
 
 #### Function details
 
@@ -2810,11 +2832,11 @@ The rest of the file helps other suites capture and inspect analytics traffic. `
 fn set_metrics_exporter(config: &mut codex_core::config::Config)
 ```
 
-**Purpose**: Mutates a config to enable OTLP/HTTP JSON metrics export with a localhost endpoint. It gives analytics tests a concrete exporter configuration without relying on external environment.
+**Purpose**: This helper edits a test configuration so metrics are sent through the OpenTelemetry HTTP exporter. OpenTelemetry is a common format for sending monitoring data, and here it is aimed at a local test endpoint rather than a real analytics service.
 
-**Data flow**: Takes a mutable `codex_core::config::Config` reference → assigns `config.otel.metrics_exporter = OtelExporterKind::OtlpHttp { endpoint: "http://localhost:4318", headers: HashMap::new(), protocol: OtelHttpProtocol::Json, tls: None }` → returns unit after mutating the config in place.
+**Data flow**: It takes a mutable config object as input. It replaces the config's metrics exporter setting with an HTTP JSON exporter pointed at localhost, with no extra headers or TLS settings. It does not return a value; the config is changed in place.
 
-**Call relations**: Both default-analytics tests call it before invoking `build_provider`, so they differ only in the default-enable flag rather than exporter setup.
+**Call relations**: The two analytics-default tests call this before building a telemetry provider. It gives those tests a realistic metrics destination so they can check whether the provider actually enables metrics under different default settings.
 
 *Call graph*: called by 2 (app_server_default_analytics_disabled_without_flag, app_server_default_analytics_enabled_with_flag); 1 external calls (new).
 
@@ -2825,11 +2847,11 @@ fn set_metrics_exporter(config: &mut codex_core::config::Config)
 async fn app_server_default_analytics_disabled_without_flag() -> Result<()>
 ```
 
-**Purpose**: Verifies that when analytics are unset in config and the app-server default flag is false, metrics are not initialized.
+**Purpose**: This test proves that app-server metrics stay disabled when the config does not explicitly mention analytics and the app-server default says analytics should be off. It protects the system from accidentally collecting metrics by default.
 
-**Data flow**: Builds a config rooted at a temp codex home, calls `set_metrics_exporter`, sets `config.analytics_enabled = None`, invokes `build_provider(..., default_analytics_enabled = false)`, computes `has_metrics` by checking `provider.as_ref().and_then(|otel| otel.metrics()).is_some()`, and asserts `has_metrics == false`.
+**Data flow**: It creates a temporary Codex home folder, builds a fresh config, sets a metrics exporter, and then leaves the analytics setting unset. It asks the telemetry setup code to build a provider with the default-analytics flag set to false. It then checks the provider and expects that no metrics component exists.
 
-**Call relations**: This direct test documents the default-off behavior for app-server analytics when config does not explicitly opt in.
+**Call relations**: This test uses set_metrics_exporter to prepare the config, then hands the config to codex_core::otel_init::build_provider. The final assertion is the safety check: even though an exporter was configured, metrics must not appear because the default flag was false.
 
 *Call graph*: calls 2 internal fn (set_metrics_exporter, build_provider); 3 external calls (new, assert_eq!, default).
 
@@ -2840,11 +2862,11 @@ async fn app_server_default_analytics_disabled_without_flag() -> Result<()>
 async fn app_server_default_analytics_enabled_with_flag() -> Result<()>
 ```
 
-**Purpose**: Verifies that when analytics are unset in config but the app-server default flag is true, metrics are initialized.
+**Purpose**: This test proves the opposite default case: when analytics are not explicitly configured and the app-server default says analytics should be on, metrics are enabled. It ensures the app-server can opt into analytics by default when intended.
 
-**Data flow**: Builds a temp config, injects the metrics exporter, leaves `analytics_enabled = None`, calls `build_provider(..., default_analytics_enabled = true)`, derives `has_metrics` from `provider.metrics()`, and asserts `has_metrics == true`.
+**Data flow**: It creates a temporary Codex home folder, builds a fresh config, points metrics at an HTTP exporter, and leaves analytics unset. It builds a telemetry provider with the default-analytics flag set to true. It then checks that the provider includes a metrics component.
 
-**Call relations**: This is the counterpart to the previous test and isolates the effect of the default-enable flag.
+**Call relations**: Like the disabled-default test, it relies on set_metrics_exporter and then calls the shared telemetry builder. The assertion confirms that the default flag is respected by the telemetry setup path.
 
 *Call graph*: calls 2 internal fn (set_metrics_exporter, build_provider); 3 external calls (new, assert_eq!, default).
 
@@ -2855,11 +2877,11 @@ async fn app_server_default_analytics_enabled_with_flag() -> Result<()>
 async fn mount_analytics_capture(server: &MockServer, codex_home: &Path) -> Result<()>
 ```
 
-**Purpose**: Prepares a mock analytics ingestion endpoint and writes ChatGPT auth fixture data so tests can observe emitted analytics requests with authenticated context.
+**Purpose**: This helper prepares a fake analytics receiver for tests. It also writes fake ChatGPT authentication data so analytics events can include the account and user information they normally depend on.
 
-**Data flow**: Registers a `POST /codex/analytics-events/events` mock on the provided `MockServer` that returns HTTP 200, then writes ChatGPT auth under the given codex-home path with account/user ids set to `account-123`/`user-123` → returns `Result<()>`.
+**Data flow**: It receives a mock HTTP server and a Codex home path. It mounts a rule on the mock server that accepts POST requests to the analytics-events endpoint and replies with HTTP 200, meaning “accepted.” Then it writes a test auth file containing a token, account id, and user ids. It returns success or an error if setup fails.
 
-**Call relations**: Imported by many other v2 tests that need to capture analytics traffic before exercising thread or turn operations.
+**Call relations**: Many app-server analytics tests call this before performing actions that should emit analytics, such as starting, resuming, or forking threads and tracking goal lifecycle events. It sets the stage so later helpers can read the HTTP requests that the app-server sends.
 
 *Call graph*: calls 1 internal fn (new); called by 10 (thread_fork_tracks_thread_initialized_analytics, thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal, thread_resume_tracks_thread_initialized_analytics, thread_start_tracks_thread_initialized_analytics, turn_profile_tracks_blocking_tool_and_follow_up_sampling, turn_start_tracks_turn_event_analytics, turn_steer_rejects_context_only_input_without_merging_context, turn_steer_rejects_oversized_text_input, turn_steer_requires_active_turn, turn_steer_returns_active_turn_id); 5 external calls (given, new, write_chatgpt_auth, method, path).
 
@@ -2873,11 +2895,11 @@ async fn wait_for_analytics_payload(
 ) -> Result<Value>
 ```
 
-**Purpose**: Polls the mock server until any analytics POST body is observed, then parses and returns the full JSON payload.
+**Purpose**: This helper waits until the fake analytics server receives any analytics payload, then returns that payload as parsed JSON. It is useful when a test wants to inspect the whole batch of analytics events.
 
-**Data flow**: Given a `MockServer` and timeout duration, repeatedly calls `server.received_requests().await`, sleeps 25 ms when none are present or no matching analytics POST exists, and once a `POST /codex/analytics-events/events` request is found, clones its body and parses it with `serde_json::from_slice` into `Value` → returns the parsed payload or an invalid-payload error.
+**Data flow**: It takes the mock server and a maximum wait time. It repeatedly asks the server for received requests, looking for a POST to the analytics endpoint. If no matching request has arrived yet, it sleeps briefly and tries again until the timeout expires. When it finds a request, it parses the body from raw bytes into JSON and returns it.
 
-**Call relations**: Used by tests that want the entire analytics batch payload, especially those extracting `codex_thread_initialized` from the events array.
+**Call relations**: Thread start, resume, and fork analytics tests call this after triggering app-server behavior. They then pass the returned payload to helpers such as thread_initialized_event to find and check the expected event.
 
 *Call graph*: called by 3 (thread_fork_tracks_thread_initialized_analytics, thread_resume_tracks_thread_initialized_analytics, thread_start_tracks_thread_initialized_analytics); 5 external calls (from_millis, received_requests, from_slice, sleep, timeout).
 
@@ -2892,11 +2914,11 @@ async fn wait_for_analytics_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Waits for a single analytics event with a specific `event_type` anywhere in captured analytics batches.
+**Purpose**: This helper waits for a single analytics event with a given event type. It saves tests from manually scanning every analytics payload.
 
-**Data flow**: Accepts a mock server, timeout, and `event_type` string → delegates to `wait_for_matching_analytics_event` with a predicate comparing `event["event_type"]` to the requested type → returns the matching event JSON value.
+**Data flow**: It receives the mock server, a timeout, and the event type string to look for. It builds a small matching rule that checks each event's event_type field, then delegates the actual polling and JSON parsing to wait_for_matching_analytics_event. It returns the first matching event as JSON.
 
-**Call relations**: Acts as a convenience wrapper for tests that care about one named event rather than the whole payload.
+**Call relations**: Tests for turn events, active-turn behavior, and profiling call this after the app-server should have emitted a specific event. This function is the simple front door for event-type based checks, while wait_for_matching_analytics_event does the lower-level searching.
 
 *Call graph*: calls 1 internal fn (wait_for_matching_analytics_event); called by 4 (turn_profile_tracks_blocking_tool_and_follow_up_sampling, turn_start_tracks_turn_event_analytics, turn_steer_requires_active_turn, turn_steer_returns_active_turn_id).
 
@@ -2912,11 +2934,11 @@ async fn wait_for_goal_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Waits for a `codex_goal_event` whose nested `event_kind` and `goal_status` fields match the requested values.
+**Purpose**: This helper waits for a specific goal analytics event, including both the kind of goal event and its status. It is tailored for tests that check the lifecycle of goals.
 
-**Data flow**: Takes a mock server, timeout, `event_kind`, and `goal_status` → delegates to `wait_for_matching_analytics_event` with a predicate that checks `event_type == "codex_goal_event"` and the two nested `event_params` fields → returns the matching event JSON value.
+**Data flow**: It receives the mock server, a timeout, an expected event kind, and an expected goal status. It creates a matching rule that requires the event type to be codex_goal_event and also checks event_params.event_kind and event_params.goal_status. It returns the first JSON event that satisfies all three checks.
 
-**Call relations**: Used by goal-lifecycle tests elsewhere to avoid repeating nested JSON matching logic.
+**Call relations**: The goal lifecycle test calls this when it expects goal-related analytics to arrive. It delegates the repeated polling and parsing work to wait_for_matching_analytics_event, adding only the goal-specific matching rule.
 
 *Call graph*: calls 1 internal fn (wait_for_matching_analytics_event); called by 1 (thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal).
 
@@ -2931,11 +2953,11 @@ async fn wait_for_matching_analytics_event(
 ) -> Result<Value>
 ```
 
-**Purpose**: Scans captured analytics POST requests until it finds an event satisfying an arbitrary predicate. It is the core polling primitive behind the event-specific helpers.
+**Purpose**: This is the general search helper for analytics events. It waits for analytics HTTP requests, opens their JSON bodies, and returns the first event accepted by a caller-provided matching rule.
 
-**Data flow**: Given a mock server, timeout, and predicate `matches`, it repeatedly fetches `received_requests`, filters for `POST /codex/analytics-events/events`, parses each request body as JSON, extracts the `events` array if present, searches for the first event where `matches(event)` is true, and returns a clone of that event; otherwise it sleeps 25 ms and retries until timeout.
+**Data flow**: It receives a mock server, a timeout, and a matching function. Inside the timeout, it repeatedly reads the server's received requests. For each POST to the analytics endpoint, it parses the request body as JSON, looks for an events array, and tests each event with the matching function. If one matches, it returns that event; otherwise it sleeps briefly and keeps waiting.
 
-**Call relations**: Both `wait_for_analytics_event` and `wait_for_goal_event` delegate here, making it the generic event-selection engine for analytics assertions.
+**Call relations**: wait_for_analytics_event and wait_for_goal_event both call this instead of duplicating the polling loop. It is the shared engine behind “wait until the analytics event I care about appears” in the test suite.
 
 *Call graph*: called by 2 (wait_for_analytics_event, wait_for_goal_event); 5 external calls (from_millis, received_requests, from_slice, sleep, timeout).
 
@@ -2946,11 +2968,11 @@ async fn wait_for_matching_analytics_event(
 fn thread_initialized_event(payload: &Value) -> Result<&Value>
 ```
 
-**Purpose**: Extracts the `codex_thread_initialized` event from a parsed analytics payload. It fails with a descriptive error if the payload lacks an events array or the event is absent.
+**Purpose**: This helper pulls the thread-initialized analytics event out of a full analytics payload. Tests use it when they expect a thread start, resume, or fork to report that a thread was initialized.
 
-**Data flow**: Reads `payload["events"]` as an array, returning an error if missing, then searches for the first event whose `event_type` equals `codex_thread_initialized` → returns a borrowed reference to that event `Value`.
+**Data flow**: It receives a JSON payload. It first looks for an events array and returns an error if that array is missing. It then scans the events for one whose event_type is codex_thread_initialized. If found, it returns a reference to that event; if not, it returns an error explaining that the expected event was absent.
 
-**Call relations**: Called by thread analytics tests after `wait_for_analytics_payload` returns a full batch.
+**Call relations**: Thread start, resume, and fork tests call this after wait_for_analytics_payload has returned a full analytics request body. It narrows the payload down to the one event that assert_basic_thread_initialized_event can then inspect in detail.
 
 *Call graph*: called by 3 (thread_fork_tracks_thread_initialized_analytics, thread_resume_tracks_thread_initialized_analytics, thread_start_tracks_thread_initialized_analytics).
 
@@ -2968,11 +2990,11 @@ fn assert_basic_thread_initialized_event(
 )
 ```
 
-**Purpose**: Asserts the common field set expected on a `codex_thread_initialized` analytics event. It checks identifiers, client metadata, transport, model, lineage defaults, initialization mode, and timestamp presence.
+**Purpose**: This helper checks the common required fields of a thread-initialized analytics event. It keeps several tests consistent about what a valid thread initialization report must contain.
 
-**Data flow**: Consumes an event JSON value plus expected `thread_id`, `session_id`, `expected_model`, `initialization_mode`, and `expected_thread_source` → performs a series of `assert_eq!` and `assert!` checks against nested `event_params` fields such as `app_server_client.product_client_id`, `rpc_transport`, `ephemeral`, `thread_source`, `subagent_source`, `parent_thread_id`, and `created_at` → returns unit.
+**Data flow**: It receives the event JSON and the expected thread id, session id, model, initialization mode, and thread source. It compares those expected values against fields inside event_params, also checking fixed values such as the default client name, stdio transport, non-ephemeral status, null parent and subagent fields, and the presence of a numeric created_at timestamp. It returns nothing; a mismatch fails the test.
 
-**Call relations**: Used by multiple thread analytics tests to enforce a shared baseline before those tests assert scenario-specific fields.
+**Call relations**: Thread start, resume, and fork analytics tests call this after extracting the thread-initialized event. It is the final checklist that proves the event contains the right identity, client, model, source, and timing information.
 
 *Call graph*: called by 3 (thread_fork_tracks_thread_initialized_analytics, thread_resume_tracks_thread_initialized_analytics, thread_start_tracks_thread_initialized_analytics); 2 external calls (assert!, assert_eq!).
 
@@ -2982,13 +3004,15 @@ These tests exercise telemetry emitted by core application helpers, task metrics
 
 ### `core/src/tasks/mod_tests.rs`
 
-`test` · `unit test execution`
+`test` · `test run`
 
-This test module builds a minimal `SessionTelemetry` backed by `InMemoryMetricExporter` so metric helper behavior can be asserted without a live telemetry backend. `test_session_telemetry` constructs a `MetricsClient` using `MetricsConfig::in_memory(...).with_runtime_reader()` and then creates a `SessionTelemetry` with fixed thread/model/session metadata, finally stripping metadata tags via `with_metrics_without_metadata_tags` so assertions only need to consider the helper-specific attributes.
+This is a test file for a small but important kind of bookkeeping: telemetry metrics. A metric is a counted measurement, like “this happened once,” often with labels that explain the situation. Here, the code checks that when the task system reports certain events, the recorded metric has both the right value and the right descriptive tags.
 
-The remaining helpers inspect the exporter snapshot. `find_metric` walks `ResourceMetrics -> scope_metrics -> metrics` to locate a metric by name and panics if absent. `attributes_to_map` normalizes OpenTelemetry `KeyValue` iterators into a sorted `BTreeMap<String, String>` for deterministic comparison. `metric_point` asserts that the chosen metric is a `U64` sum with exactly one data point and returns that point's attributes and value.
+The tests use an in-memory metrics exporter, which is like a clipboard instead of a real reporting service. The code under test writes metrics to it, and the tests read the clipboard back to make sure the entry is correct. This avoids sending anything over the network while still testing the real metric-writing path.
 
-Each test follows the same pattern: create telemetry, call one helper under test, snapshot metrics, extract the single point, and compare both the counter value and the exact attribute map. The cases cover both boolean branches for network proxy activity, both allowed/disallowed memory-read combinations with citation tagging, and manual versus automatic compaction tagging. These tests are intentionally narrow and concrete: they lock down the emitted tag keys and stringified boolean values used by dashboards and downstream metric consumers.
+There are helper functions that build a fake session with metrics enabled, find a named metric in the captured snapshot, turn its labels into an easy-to-compare map, and extract the single counter value the test expects. Then the individual tests cover three metric families: whether a network proxy was active during a turn, whether memory reading was enabled and actually allowed, and whether a task compaction was manual or automatic and what type it was.
+
+Without these tests, a later code change could still compile but record the wrong label names, wrong true/false values, or wrong metric counter, making dashboards and product analysis unreliable.
 
 #### Function details
 
@@ -2998,11 +3022,11 @@ Each test follows the same pattern: create telemetry, call one helper under test
 fn test_session_telemetry() -> SessionTelemetry
 ```
 
-**Purpose**: Builds a `SessionTelemetry` instance wired to an in-memory metrics exporter for deterministic metric assertions.
+**Purpose**: Creates a fake session telemetry object that records metrics in memory for tests. Test cases use it so they can inspect what metrics were emitted without contacting a real telemetry service.
 
-**Data flow**: Creates an `InMemoryMetricExporter`, wraps it in a `MetricsClient` configured with `MetricsConfig::in_memory`, then constructs `SessionTelemetry::new(...)` with fixed thread/model/source metadata and returns the telemetry after calling `with_metrics_without_metadata_tags`. No external state is modified.
+**Data flow**: It starts with a fresh in-memory metric exporter, builds a metrics client configured for testing, creates a new session identity and session metadata, then attaches the metrics client to that session. The result is a SessionTelemetry value ready to receive metric events during a test.
 
-**Call relations**: Every metric test calls this first to obtain an isolated telemetry sink. It supplies the common fixture used before invoking the helper under test.
+**Call relations**: Each metric test calls this first to get a clean, isolated telemetry session. It calls the telemetry and metrics constructors needed to build that session, and the returned object is later passed into the metric-emitting functions being tested.
 
 *Call graph*: calls 4 internal fn (new, new, in_memory, new); called by 6 (emit_compact_metric_records_auto_local, emit_compact_metric_records_manual_remote_v2, emit_turn_memory_metric_records_config_disabled_without_citations, emit_turn_memory_metric_records_read_allowed_with_citations, emit_turn_network_proxy_metric_records_active_turn, emit_turn_network_proxy_metric_records_inactive_turn); 2 external calls (default, env!).
 
@@ -3013,11 +3037,11 @@ fn test_session_telemetry() -> SessionTelemetry
 fn find_metric(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric
 ```
 
-**Purpose**: Searches a metrics snapshot for a metric with the requested name and returns it.
+**Purpose**: Looks through a captured metrics snapshot and returns the metric with a requested name. It gives the tests a simple way to locate the exact measurement they care about.
 
-**Data flow**: Iterates through `resource_metrics.scope_metrics()` and each contained metric, comparing `metric.name()` to `name`. It returns a borrowed `&Metric` on the first match or panics if none is found.
+**Data flow**: It receives a ResourceMetrics snapshot and a metric name. It searches through the snapshot’s groups of metrics until it finds one with that name, then returns it. If no matching metric exists, it stops the test with a clear failure message.
 
-**Call relations**: Only `metric_point` uses this helper as the first step in extracting a single asserted metric from the snapshot.
+**Call relations**: This helper is used by metric_point. The individual tests do not search the snapshot themselves; they ask metric_point for the metric value and labels, and metric_point relies on this function to find the named metric first.
 
 *Call graph*: called by 1 (metric_point); 2 external calls (scope_metrics, panic!).
 
@@ -3030,11 +3054,11 @@ fn attributes_to_map(
 ) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Converts an iterator of OpenTelemetry attributes into a deterministic string map for equality assertions.
+**Purpose**: Converts metric labels into a sorted map of strings so tests can compare them easily. This makes the assertions clear and stable, regardless of the original label order.
 
-**Data flow**: Consumes an iterator of `&KeyValue`, maps each key/value to owned `String` pairs using `as_str()`, collects them into a `BTreeMap<String, String>`, and returns that map.
+**Data flow**: It receives an iterator over metric key-value labels. For each label, it turns the key and value into plain strings and collects them into a BTreeMap, which keeps keys in sorted order. The output is a map from label name to label value.
 
-**Call relations**: `metric_point` calls this after locating the single data point so tests can compare attributes with `assert_eq!` independent of iteration order.
+**Call relations**: metric_point calls this after it has found the single metric data point. The returned map is handed back to the test, which compares it with the expected labels.
 
 *Call graph*: called by 1 (metric_point); 1 external calls (map).
 
@@ -3045,11 +3069,11 @@ fn attributes_to_map(
 fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<String, String>, u64)
 ```
 
-**Purpose**: Extracts the sole counter data point for a named metric and returns its attributes and numeric value.
+**Purpose**: Extracts the labels and count from a named counter metric in a captured snapshot. It also checks that the metric has exactly the simple shape these tests expect: one unsigned integer counter with one data point.
 
-**Data flow**: Reads a `ResourceMetrics` snapshot and metric name, finds the metric via `find_metric`, matches its aggregated data as `AggregatedMetrics::U64(MetricData::Sum(sum))`, collects the sum's data points, asserts there is exactly one point, converts that point's attributes with `attributes_to_map`, and returns `(BTreeMap<String, String>, u64)`. It panics on unexpected metric shape or type.
+**Data flow**: It receives a metrics snapshot and a metric name. It finds the metric, checks that it is an unsigned integer counter sum, checks that there is exactly one recorded point, converts that point’s labels into a map, and returns the label map plus the counter value. If the metric has an unexpected form, it fails the test.
 
-**Call relations**: All concrete tests call this after snapshotting metrics. It encapsulates the assumptions that these helpers emit exactly one `u64` counter point.
+**Call relations**: All six test cases call this after emitting a metric and taking a snapshot. It ties together find_metric and attributes_to_map so each test can focus on checking the expected value and labels.
 
 *Call graph*: calls 2 internal fn (attributes_to_map, find_metric); called by 6 (emit_compact_metric_records_auto_local, emit_compact_metric_records_manual_remote_v2, emit_turn_memory_metric_records_config_disabled_without_citations, emit_turn_memory_metric_records_read_allowed_with_citations, emit_turn_network_proxy_metric_records_active_turn, emit_turn_network_proxy_metric_records_inactive_turn); 2 external calls (assert_eq!, panic!).
 
@@ -3060,11 +3084,11 @@ fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<Str
 fn emit_turn_network_proxy_metric_records_active_turn()
 ```
 
-**Purpose**: Verifies that the network-proxy metric helper emits a single counter increment tagged with `active=true` and the supplied temporary-memory tag.
+**Purpose**: Tests that a turn with the network proxy active records the network proxy metric correctly. It verifies both the count and the labels that describe the active state and temporary memory setting.
 
-**Data flow**: Creates test telemetry, calls `emit_turn_network_proxy_metric` with `network_proxy_active=true`, snapshots metrics, extracts the point for `TURN_NETWORK_PROXY_METRIC`, and asserts both value `1` and the exact two-attribute map.
+**Data flow**: It creates a test telemetry session, emits the network proxy metric with active set to true and a temporary-memory label set to true, then snapshots the recorded metrics. It extracts the relevant metric and checks that its value is 1 and its labels say active=true and tmp_mem_enabled=true.
 
-**Call relations**: This is a direct unit test of the production helper's true branch.
+**Call relations**: This test uses test_session_telemetry to set up a clean metrics recorder, calls emit_turn_network_proxy_metric from the task code under test, then uses metric_point to read back what was recorded.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_turn_network_proxy_metric).
 
@@ -3075,11 +3099,11 @@ fn emit_turn_network_proxy_metric_records_active_turn()
 fn emit_turn_network_proxy_metric_records_inactive_turn()
 ```
 
-**Purpose**: Verifies that the network-proxy metric helper emits `active=false` when the proxy is inactive.
+**Purpose**: Tests that a turn with the network proxy inactive records the network proxy metric correctly. It makes sure the false case is reported explicitly, not lost or mislabeled.
 
-**Data flow**: Creates test telemetry, calls `emit_turn_network_proxy_metric` with `false`, snapshots metrics, extracts `TURN_NETWORK_PROXY_METRIC`, and asserts value `1` plus the expected `active=false` and `tmp_mem_enabled=false` tags.
+**Data flow**: It creates a test telemetry session, emits the network proxy metric with active set to false and a temporary-memory label set to false, then snapshots the metrics. It confirms that the metric count is 1 and that the labels contain active=false and tmp_mem_enabled=false.
 
-**Call relations**: This complements the active-case test by covering the helper's false branch.
+**Call relations**: Like the active-turn test, it sets up telemetry with test_session_telemetry, exercises emit_turn_network_proxy_metric, and reads the result through metric_point. Together, the two tests cover both true and false network proxy states.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_turn_network_proxy_metric).
 
@@ -3090,11 +3114,11 @@ fn emit_turn_network_proxy_metric_records_inactive_turn()
 fn emit_turn_memory_metric_records_read_allowed_with_citations()
 ```
 
-**Purpose**: Checks that the memory metric helper marks all tags true when memory is enabled by feature and config and the turn cited memories.
+**Purpose**: Tests the memory metric when memory reading is fully allowed and citations are present. This checks the happy path where the feature is enabled, configuration permits it, and the output includes memory citations.
 
-**Data flow**: Creates test telemetry, calls `emit_turn_memory_metric(true, true, true)`, snapshots metrics, extracts `TURN_MEMORY_METRIC`, and asserts a single increment with `config_use_memories=true`, `feature_enabled=true`, `has_citations=true`, and `read_allowed=true`.
+**Data flow**: It creates a test telemetry session, emits the memory metric with feature enabled, config enabled, and citations present, then snapshots the metrics. It verifies that the counter is 1 and that the labels report feature_enabled=true, config_use_memories=true, has_citations=true, and read_allowed=true.
 
-**Call relations**: This is the positive-path unit test for memory metric tagging.
+**Call relations**: The test prepares telemetry with test_session_telemetry, calls emit_turn_memory_metric from the task code, and uses metric_point to inspect the recorded TURN_MEMORY_METRIC. It confirms that the metric code derives read_allowed correctly when both enabling inputs are true.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_turn_memory_metric).
 
@@ -3105,11 +3129,11 @@ fn emit_turn_memory_metric_records_read_allowed_with_citations()
 fn emit_turn_memory_metric_records_config_disabled_without_citations()
 ```
 
-**Purpose**: Checks that the memory metric helper reports `read_allowed=false` when config disables memories, even if the feature flag is enabled.
+**Purpose**: Tests the memory metric when the feature exists but the user or configuration has disabled memory use. It checks that the metric records memory reading as not allowed and notes that no citations were present.
 
-**Data flow**: Creates test telemetry, calls `emit_turn_memory_metric(true, false, false)`, snapshots metrics, extracts `TURN_MEMORY_METRIC`, and asserts the expected false/true tag combination and counter value `1`.
+**Data flow**: It creates a test telemetry session, emits the memory metric with feature enabled, config disabled, and citations absent, then snapshots the metrics. It checks that the counter is 1 and that the labels report feature_enabled=true, config_use_memories=false, has_citations=false, and read_allowed=false.
 
-**Call relations**: This covers the helper's derived `read_allowed` logic when feature and config flags differ.
+**Call relations**: This test follows the same setup-emit-read pattern as the other metric tests. It calls emit_turn_memory_metric and then metric_point, covering the important case where one setting blocks memory reads even though the feature itself is available.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_turn_memory_metric).
 
@@ -3120,11 +3144,11 @@ fn emit_turn_memory_metric_records_config_disabled_without_citations()
 fn emit_compact_metric_records_manual_remote_v2()
 ```
 
-**Purpose**: Verifies that compaction metrics include the requested type and `manual=true` for manual runs.
+**Purpose**: Tests that a manual remote_v2 compaction event is counted with the right labels. Compaction here means shrinking or summarizing task context, and the metric needs to say what kind happened and whether a person triggered it.
 
-**Data flow**: Creates test telemetry, calls `emit_compact_metric(&session_telemetry, "remote_v2", true)`, snapshots metrics, extracts `TASK_COMPACT_METRIC`, and asserts value `1` with `manual=true` and `type=remote_v2`.
+**Data flow**: It creates a test telemetry session, emits the compact metric with type remote_v2 and manual set to true, then snapshots the metrics. It confirms that the counter value is 1 and that the labels are type=remote_v2 and manual=true.
 
-**Call relations**: This is a direct unit test of compaction metric tagging for manual runs.
+**Call relations**: The test gets its telemetry object from test_session_telemetry, calls emit_compact_metric from the task module, and uses metric_point to read back TASK_COMPACT_METRIC. It covers the manual remote compaction path.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_compact_metric).
 
@@ -3135,22 +3159,24 @@ fn emit_compact_metric_records_manual_remote_v2()
 fn emit_compact_metric_records_auto_local()
 ```
 
-**Purpose**: Verifies that compaction metrics include `manual=false` for automatic local compaction.
+**Purpose**: Tests that an automatic local compaction event is counted with the right labels. This protects the distinction between automatic background compaction and manual compaction requested by a user or caller.
 
-**Data flow**: Creates test telemetry, calls `emit_compact_metric(&session_telemetry, "local", false)`, snapshots metrics, extracts `TASK_COMPACT_METRIC`, and asserts value `1` with `manual=false` and `type=local`.
+**Data flow**: It creates a test telemetry session, emits the compact metric with type local and manual set to false, then snapshots the metrics. It verifies that the counter value is 1 and that the labels are type=local and manual=false.
 
-**Call relations**: This complements the manual compaction test by covering the automatic branch.
+**Call relations**: This test mirrors the manual remote compaction test but uses the automatic local case. It relies on test_session_telemetry for setup, emit_compact_metric for the behavior under test, and metric_point for reading the recorded metric.
 
 *Call graph*: calls 2 internal fn (metric_point, test_session_telemetry); 2 external calls (assert_eq!, emit_compact_metric).
 
 
 ### `core/src/util_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test file builds a miniature tracing subscriber to capture feedback-tag events emitted by utility code in the parent module and related crates. The core test harness is `TagCollectorLayer`, a `tracing_subscriber::Layer` that listens only to events whose metadata target is `"feedback_tags"`; when such an event arrives it records all fields through `TagCollectorVisitor`, merges them into a shared `BTreeMap<String, String>`, and increments a shared event counter. The visitor implements `Visit` for booleans, strings, and generic debug values, so the tests observe the exact serialized field payloads that downstream telemetry would see, including quoted debug formatting for `Option`-like string fields.
+This is a test file. Its main job is to prove that the project’s feedback-tag reporting works the way monitoring tools expect. Feedback tags are small pieces of context, such as which API endpoint was used or whether an authorization header was attached. They are sent through Rust’s tracing system, which is a structured logging and telemetry pipeline.
 
-The tests cover several subtle invariants in feedback-tag emission. They verify that `emit_feedback_request_tags_with_auth_env` includes both request-level auth fields and environment-derived auth telemetry, that auth-recovery emitters preserve 401-specific fields under dedicated `auth_401_*` keys, and that later emissions actively clear stale optional fields by writing empty-string values rather than leaving prior values in place. Another regression check ensures legacy emitters that do not carry auth-env data do not wipe previously emitted auth-env tags. The file also includes a compile-only macro smoke test for `feedback_tags!` and a small behavioral test for `normalize_thread_name`, asserting whitespace-only names are rejected while trimmed names are preserved.
+To inspect those tracing events, the file builds a tiny test-only collector. `TagCollectorLayer` listens for events whose target is `feedback_tags`, and `TagCollectorVisitor` pulls each field out of the event into a map of names to string values. Think of it like putting a temporary basket under a mail slot so the tests can inspect exactly which letters were delivered.
+
+The tests then emit feedback tags in several situations: normal request reporting, authentication recovery after a 401 unauthorized response, clearing old error fields, preserving the latest failure details, and supporting older emitters that do not send every field. The file also checks that blank optional fields are deliberately written as empty strings, rather than leaving stale values behind. Finally, it verifies that thread names are trimmed and empty names are rejected.
 
 #### Function details
 
@@ -3160,11 +3186,11 @@ The tests cover several subtle invariants in feedback-tag emission. They verify 
 fn feedback_tags_macro_compiles()
 ```
 
-**Purpose**: Provides a compile-time smoke test for the `feedback_tags!` macro using mixed field types, including a type that only implements `Debug`.
+**Purpose**: This test checks that the `feedback_tags!` macro can accept different kinds of values, including strings, booleans, and values that only support debug printing. Its purpose is to catch compile-time breakage in the macro interface.
 
-**Data flow**: Defines a local `OnlyDebug` struct, then invokes `feedback_tags!` with string, boolean, and debug-only values. It returns no value; success is purely that the macro expansion type-checks and compiles.
+**Data flow**: The test defines a small local type that can be debug-printed, then passes several fields into the macro. Nothing is returned; the important result is that the code compiles successfully.
 
-**Call relations**: This is a standalone unit test invoked by the test runner. It does not inspect runtime output; its role is to guard macro ergonomics and accepted argument forms.
+**Call relations**: The Rust test runner calls this test. Inside it, the test invokes the `feedback_tags!` macro directly to make sure callers elsewhere in the project can keep using that macro shape.
 
 *Call graph*: 1 external calls (feedback_tags!).
 
@@ -3175,11 +3201,11 @@ fn feedback_tags_macro_compiles()
 fn record_bool(&mut self, field: &tracing::field::Field, value: bool)
 ```
 
-**Purpose**: Captures a boolean tracing field into the collector map under the field's tracing name.
+**Purpose**: This method records a boolean field from a tracing event into the test collector. It lets tests later ask, for example, whether a tag like `auth_header_attached` was emitted as `true` or `false`.
 
-**Data flow**: Reads the incoming `Field` metadata and `bool` value, converts both to owned `String`s, and inserts them into `self.tags`. It mutates the visitor's internal `BTreeMap` and returns unit.
+**Data flow**: It receives a field name and a boolean value from the tracing system. It turns the field name and value into strings, then stores them in the visitor’s tag map.
 
-**Call relations**: It is called by tracing's event-recording machinery when `TagCollectorLayer::on_event` asks an event to record itself into the visitor. It exists so tests can inspect emitted boolean tags as strings.
+**Call relations**: This method is called by the tracing event recording process when `TagCollectorLayer::on_event` asks an event to write its fields into a `TagCollectorVisitor`. It contributes one captured field to the map that the test later checks.
 
 *Call graph*: 1 external calls (name).
 
@@ -3190,11 +3216,11 @@ fn record_bool(&mut self, field: &tracing::field::Field, value: bool)
 fn record_str(&mut self, field: &tracing::field::Field, value: &str)
 ```
 
-**Purpose**: Captures a string tracing field into the collector map using the field name as the key.
+**Purpose**: This method records a string field from a tracing event into the test collector. It is used for tags such as endpoint names, request IDs, and error codes.
 
-**Data flow**: Takes a `Field` and `&str`, clones both into owned strings, and inserts them into `self.tags`. It updates visitor state in place and returns unit.
+**Data flow**: It receives a field name and a string value. It copies both into the visitor’s tag map so the test can compare the recorded value with the expected value.
 
-**Call relations**: Like the other `Visit` methods, this is driven indirectly by `event.record(&mut visitor)` inside `TagCollectorLayer::on_event`. It handles plain string-valued tracing fields.
+**Call relations**: The tracing event recording process calls this when an emitted feedback tag is a string. It is part of the path from an emitted telemetry event to the assertions in the tests.
 
 *Call graph*: 1 external calls (name).
 
@@ -3205,11 +3231,11 @@ fn record_str(&mut self, field: &tracing::field::Field, value: &str)
 fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug)
 ```
 
-**Purpose**: Captures any tracing field recorded through `Debug` formatting, preserving the exact debug-rendered representation.
+**Purpose**: This method records fields that are supplied in debug-print form rather than as plain strings or booleans. Debug printing is Rust’s standard way to turn many values into a readable representation for developers.
 
-**Data flow**: Reads the field name and a `&dyn Debug`, formats the value with `{:?}`, and stores the resulting string in `self.tags`. This mutates the visitor map and returns unit.
+**Data flow**: It receives a field name and a value that can be debug-printed. It formats that value into a string and stores it under the field name in the visitor’s tag map.
 
-**Call relations**: This path is important for optional and non-string fields emitted by feedback-tag helpers; `TagCollectorLayer::on_event` relies on it when tracing records values via debug formatting rather than typed string/bool methods.
+**Call relations**: The tracing system calls this during event recording when a field is not handled by the more specific boolean or string methods. The tests rely on this because many optional values are emitted in a quoted debug-style form.
 
 *Call graph*: 2 external calls (name, format!).
 
@@ -3220,11 +3246,11 @@ fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::
 fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>)
 ```
 
-**Purpose**: Intercepts tracing events for the `feedback_tags` target and accumulates their fields into shared test state.
+**Purpose**: This method is the test collector’s event hook. It watches tracing events and captures only the ones meant for feedback tags.
 
-**Data flow**: Receives a `tracing::Event` and subscriber context, checks `event.metadata().target()`, and returns early for non-feedback events. For matching events it creates a default `TagCollectorVisitor`, asks the event to record into it, extends the shared `tags` map with the collected fields, increments the shared `event_count`, and returns unit.
+**Data flow**: It receives a tracing event. If the event is not targeted at `feedback_tags`, it ignores it. If it is, it creates a visitor, asks the event to write its fields into that visitor, merges the collected tags into shared test storage, and increments a shared event counter.
 
-**Call relations**: This method is invoked by the tracing subscriber installed in each test via `registry().with(...).set_default()`. It is the bridge between production feedback-tag emitters and the assertions in the test cases.
+**Call relations**: The tracing subscriber calls this method whenever an event is emitted while the test collector is installed. The feedback-tag emission functions trigger those events, and the individual tests inspect the stored tags and event count afterward.
 
 *Call graph*: 3 external calls (default, metadata, record).
 
@@ -3235,11 +3261,11 @@ fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>)
 fn emit_feedback_request_tags_records_sentry_feedback_fields()
 ```
 
-**Purpose**: Verifies that request-tag emission with explicit auth-environment telemetry produces the full expected set of tracing fields in a single feedback event.
+**Purpose**: This test verifies that a full feedback request event includes the expected request, authentication, and environment fields. It protects the data that monitoring tools such as Sentry need for debugging failures.
 
-**Data flow**: Builds shared `tags` and `event_count` state, installs `TagCollectorLayer` as the default subscriber, constructs an `AuthEnvTelemetry` and a populated `FeedbackRequestTags`, then calls `emit_feedback_request_tags_with_auth_env`. After emission it clones the collected tag map and asserts exact string values for endpoint, auth header, auth env, request ID, error, and follow-up fields, plus an event count of 1.
+**Data flow**: The test creates shared storage for captured tags, installs the test tracing collector, builds an authentication-environment snapshot, and emits feedback request tags with that snapshot. It then reads the captured map and checks that each important field has the expected string value, and that exactly one feedback event was recorded.
 
-**Call relations**: The test runner invokes this directly. It drives the external emitter and depends on `TagCollectorLayer::on_event` plus the visitor methods to observe the emitted tracing payload.
+**Call relations**: The test runner calls this test. The test sets up `TagCollectorLayer`, calls `emit_feedback_request_tags_with_auth_env`, and then relies on `TagCollectorLayer::on_event` and `TagCollectorVisitor` to capture what was emitted.
 
 *Call graph*: 6 external calls (new, new, new, assert_eq!, emit_feedback_request_tags_with_auth_env, registry).
 
@@ -3250,11 +3276,11 @@ fn emit_feedback_request_tags_records_sentry_feedback_fields()
 fn emit_feedback_auth_recovery_tags_preserves_401_specific_fields()
 ```
 
-**Purpose**: Checks that auth-recovery telemetry writes 401-specific request metadata into dedicated `auth_401_*` fields rather than dropping them.
+**Purpose**: This test checks that authentication recovery reporting keeps the details from a 401 unauthorized response. A 401 response means the server rejected the credentials, so preserving its request ID, Cloudflare ray ID, and error code is important for diagnosis.
 
-**Data flow**: Creates the same tracing capture setup as other tests, invokes `emit_feedback_auth_recovery_tags` with recovery metadata and 401-related identifiers/errors, then reads the collected map and asserts the four `auth_401_*` keys contain the expected debug-formatted strings. It also asserts exactly one event was emitted.
+**Data flow**: The test installs the tag collector, emits authentication recovery tags with specific 401-related values, then reads the captured tag map. It confirms that the 401 request ID, ray ID, error message, and error code were recorded, and that one event was emitted.
 
-**Call relations**: This standalone test is run by the test harness. It validates behavior of the auth-recovery emitter by observing the tracing event captured through the installed layer.
+**Call relations**: The test runner calls this test. The authentication recovery emitter produces the event, and the custom tracing layer captures it so the assertions can verify the fields.
 
 *Call graph*: 5 external calls (new, new, new, assert_eq!, registry).
 
@@ -3265,11 +3291,11 @@ fn emit_feedback_auth_recovery_tags_preserves_401_specific_fields()
 fn emit_feedback_auth_recovery_tags_clears_stale_401_fields()
 ```
 
-**Purpose**: Ensures a later auth-recovery emission clears previously populated 401-specific fields when the new event omits them.
+**Purpose**: This test makes sure old 401 error details do not accidentally remain visible after a later recovery update omits them. Without this, monitoring could show yesterday’s error as if it belonged to the current request.
 
-**Data flow**: Installs the collector subscriber, emits one recovery event with populated 401 fields, then emits a second event whose `auth_cf_ray`, `auth_error`, and `auth_error_code` are `None`. It clones the final merged tag map and asserts the latest request ID is present while the omitted fields were overwritten with empty-string values, and that two events were observed.
+**Data flow**: The test first emits recovery tags with full 401 details, then emits a second recovery event where several optional 401 fields are missing. It reads the final captured tag values and checks that missing fields became empty strings, while the newer request ID replaced the older one. It also checks that two events were captured.
 
-**Call relations**: The test runner invokes it directly. Its significance is cumulative: because `TagCollectorLayer` extends a persistent map across events, the assertions prove the emitter actively writes clearing values instead of relying on absence.
+**Call relations**: The test runner calls this test. Two calls to the authentication recovery emitter create two tracing events, and `TagCollectorLayer::on_event` merges the latest fields into the shared map for inspection.
 
 *Call graph*: 5 external calls (new, new, new, assert_eq!, registry).
 
@@ -3280,11 +3306,11 @@ fn emit_feedback_auth_recovery_tags_clears_stale_401_fields()
 fn emit_feedback_request_tags_preserves_latest_auth_fields_after_unauthorized()
 ```
 
-**Purpose**: Confirms that request-tag emission after an unauthorized response retains the latest auth identifiers and error details in the normal auth fields.
+**Purpose**: This test verifies that after an unauthorized response, the ordinary request-tag emitter still reports the most recent authentication failure details. That helps developers see the failed request and the follow-up recovery result together.
 
-**Data flow**: Sets up tracing capture, calls `emit_feedback_request_tags` with a `FeedbackRequestTags` containing retry/recovery and 401-related fields, then inspects the collected map. It asserts request ID, CF-Ray, auth error, auth error code, and follow-up success are present with the expected serialized values, and that only one event was emitted.
+**Data flow**: The test installs the collector and emits feedback request tags describing a retry after unauthorized access, including request IDs, error details, and a failed follow-up status. It then reads the captured tags and confirms those latest authentication fields were recorded, with one event counted.
 
-**Call relations**: This test is directly executed by the test harness. It covers the non-auth-env emitter path and checks that unauthorized-response metadata survives into the emitted feedback tags.
+**Call relations**: The test runner calls this test. It calls `emit_feedback_request_tags`, which emits a tracing event that the collector layer receives and stores for the assertions.
 
 *Call graph*: 6 external calls (new, new, new, assert_eq!, emit_feedback_request_tags, registry).
 
@@ -3295,11 +3321,11 @@ fn emit_feedback_request_tags_preserves_latest_auth_fields_after_unauthorized()
 fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters()
 ```
 
-**Purpose**: Verifies that a legacy request-tag emission without auth-env data clears ordinary auth fields but leaves previously emitted auth-env telemetry intact.
+**Purpose**: This test checks compatibility between newer feedback emitters that include authentication-environment details and older emitters that do not. It ensures older calls clear per-request fields without wiping out environment fields that should remain known.
 
-**Data flow**: Installs the collector, emits a first event through `emit_feedback_request_tags_with_auth_env` with full request and environment data, then emits a second event through `emit_feedback_request_tags` where all optional auth fields are `None`. It reads the merged tag map and asserts ordinary auth fields and follow-up fields became empty strings while all `auth_env_*` fields still retain their earlier values; it also checks that two events were captured.
+**Data flow**: The test first emits a rich feedback event with authentication-environment information. It then emits a second, simpler event with many optional request fields missing. After both events, it checks that missing request fields were replaced by empty strings, while environment fields such as API-key presence remained available. It also checks that two events were captured.
 
-**Call relations**: The test runner invokes this directly. It specifically exercises interaction between two different emitter APIs and relies on the collector's persistent map to detect unintended overwrites.
+**Call relations**: The test runner calls this test. It uses both `emit_feedback_request_tags_with_auth_env` and `emit_feedback_request_tags`, while the tracing collector captures their combined effect so the test can verify backward-compatible behavior.
 
 *Call graph*: 7 external calls (new, new, new, assert_eq!, emit_feedback_request_tags, emit_feedback_request_tags_with_auth_env, registry).
 
@@ -3310,22 +3336,20 @@ fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters()
 fn normalize_thread_name_trims_and_rejects_empty()
 ```
 
-**Purpose**: Checks the normalization helper's whitespace handling for thread names.
+**Purpose**: This test verifies that thread names are cleaned up before use. Names made only of spaces are rejected, while names with extra spaces around them are trimmed.
 
-**Data flow**: Calls `normalize_thread_name` with an all-whitespace string and with a padded non-empty string, then asserts the results are `None` and a trimmed `Some(String)` respectively. It has no side effects beyond assertions.
+**Data flow**: The test passes a whitespace-only string and expects no usable name back. It then passes a name with leading and trailing spaces and expects the cleaned name `my thread` as the result.
 
-**Call relations**: This is an isolated unit test run by the test harness. It documents the helper's contract for empty-after-trim input.
+**Call relations**: The test runner calls this test. It directly exercises `normalize_thread_name`, which is imported from the surrounding utility module, and checks the returned values with assertions.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/tests/suite/otel.rs`
 
-`test` · `cross-cutting observability during request processing, tool execution, and approvals`
+`test` · `test run`
 
-This module is a dense observability test suite covering two layers: line-oriented tracing output captured by `tracing_test::traced_test`, and explicit span-field recording captured with a custom `tracing_subscriber` writing into a leaked `Mutex<Vec<u8>>`. Small helpers parse log lines (`extract_log_field`), assert that MCP-related fields are present but empty for non-MCP tools, synthesize shell-command function-call events, and generate platform-specific `touch` commands.
-
-The SSE-focused tests mount mock streams containing assistant messages, malformed JSON, `response.failed`, `response.completed`, reasoning items, deltas, and function/custom-tool calls. They then submit simple `Op::UserInput` turns and assert that logs contain `codex.api_request`, `codex.conversation_starts`, `codex.sse_event`, token-usage fields, response-kind span names, and tool metadata such as `tool_name` and `from`. Tool-result tests verify the exact telemetry emitted for unsupported custom tools, unsupported function calls, and shell commands, including arguments, output text, success flags, and empty MCP fields. Approval-flow tests drive `ExecApprovalRequest` events and submit `Op::ExecApproval` decisions to confirm `codex.tool_decision` logs record `approved`, `approvedforsession`, or `denied` with the correct source (`config` or `user`). Finally, `sandbox_outcome_event_records_outcome` directly exercises `SessionTelemetry::sandbox_outcome`, asserting duration fields and outcome serialization.
+Telemetry is the system’s flight recorder. When Codex talks to the model, receives streamed events, runs tools, or asks the user for approval, operators need clear records of what happened. This test file builds small fake conversations against a mock server and then inspects the tracing output to make sure those records are present and correctly labeled. The tests cover both normal paths, like a completed model response with token usage, and failure paths, like malformed server-sent events. A server-sent event stream, or SSE, is a way for a server to send a sequence of updates over one HTTP response. The file also checks tool-related telemetry: unsupported function calls, shell command calls, sandbox retries, and whether a command was approved by configuration or by the user. Several helper functions create fake shell calls, create platform-specific commands, and search log lines for named fields. Without these tests, telemetry could silently lose important details such as token counts, error messages, approval source, or tool output, making real problems much harder to diagnose.
 
 #### Function details
 
@@ -3335,11 +3359,11 @@ The SSE-focused tests mount mock streams containing assistant messages, malforme
 fn extract_log_field(line: &str, key: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts a named field value from a tracing log line, supporting both quoted `key="value"` and bare `key=value` formats. It is careful not to confuse similarly prefixed keys when scanning whitespace-delimited tokens.
+**Purpose**: Pulls one named value out of a single formatted log line. It understands both quoted fields, such as key="value", and plain fields, such as key=value.
 
-**Data flow**: Inputs are a log line and the target key. The function first searches for a quoted prefix and, if found, slices until the next quote; otherwise it scans whitespace-separated tokens, trims trailing commas, strips a bare `key=` prefix, and returns the matched value as `Some(String)` or `None` if absent.
+**Data flow**: It receives a log line and a field name. It first looks for a quoted value, then scans space-separated tokens for an unquoted value. It returns the value as text when found, or nothing when the field is absent.
 
-**Call relations**: Only `assert_empty_mcp_tool_fields` calls this helper. The two unit tests at the top of the file indirectly validate its parsing behavior.
+**Call relations**: This is a small helper used by assert_empty_mcp_tool_fields when tests need to check specific telemetry fields instead of doing broad text matching.
 
 *Call graph*: called by 1 (assert_empty_mcp_tool_fields); 1 external calls (format!).
 
@@ -3350,11 +3374,11 @@ fn extract_log_field(line: &str, key: &str) -> Option<String>
 fn assert_empty_mcp_tool_fields(line: &str) -> Result<(), String>
 ```
 
-**Purpose**: Checks that a telemetry line contains `mcp_server` and `mcp_server_origin` fields and that both are empty strings. It is used to prove non-MCP tool telemetry still emits those keys in blank form.
+**Purpose**: Checks that MCP-related tool fields are present in a log line but empty. MCP means Model Context Protocol, a way tools can be provided by external servers; these tests expect no external MCP server for local tool calls.
 
-**Data flow**: Input is a single log line. The function extracts `mcp_server` and `mcp_server_origin` via `extract_log_field`, returns descriptive `Err(String)` values if either field is missing or non-empty, and otherwise returns `Ok(())`.
+**Data flow**: It receives one log line. It extracts mcp_server and mcp_server_origin, verifies both exist, and verifies both values are empty. It returns success or a clear error message explaining what was wrong.
 
-**Call relations**: The custom-tool, function-call, and shell-command tool-result tests call this helper inside `logs_assert` closures after locating the relevant `codex.tool_result` line.
+**Call relations**: Tool-result tests call this helper after finding a codex.tool_result log line, so they can confirm local tools are not accidentally reported as MCP tools.
 
 *Call graph*: calls 1 internal fn (extract_log_field); 1 external calls (format!).
 
@@ -3365,11 +3389,11 @@ fn assert_empty_mcp_tool_fields(line: &str) -> Result<(), String>
 fn shell_command_call(call_id: &str, command: &str) -> serde_json::Value
 ```
 
-**Purpose**: Builds a synthetic Responses API function-call event for the `shell_command` tool. It keeps shell-command SSE fixtures concise in the tests below.
+**Purpose**: Builds a fake model function-call event that asks Codex to run a shell command. Tests use it to simulate the model requesting command execution.
 
-**Data flow**: Inputs are a call id and command string. The function wraps the command in a JSON arguments object, stringifies it, passes it to `ev_function_call(call_id, "shell_command", &args)`, and returns the resulting `serde_json::Value` event.
+**Data flow**: It receives a call id and command text. It wraps the command in JSON arguments and passes that to the shared response-event builder. The result is a JSON event shaped like a shell_command function call.
 
-**Call relations**: Several shell-command telemetry and approval tests use this helper when mounting SSE streams so they do not have to handcraft the JSON each time.
+**Call relations**: Many shell-command telemetry tests use this helper while mounting fake SSE responses on the mock server.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 1 external calls (json!).
 
@@ -3380,11 +3404,11 @@ fn shell_command_call(call_id: &str, command: &str) -> serde_json::Value
 fn touch_command(path: &str) -> String
 ```
 
-**Purpose**: Returns a platform-appropriate command string that creates a file, allowing approval tests to use a harmless shell command on both Windows and Unix-like systems. The command text itself is later embedded in shell-command tool calls.
+**Purpose**: Creates a small command that makes a file, using the right syntax for the current operating system. This lets approval tests request a realistic command without hard-coding Unix-only syntax.
 
-**Data flow**: Input is the target path string. The function checks `cfg!(windows)` and returns either a PowerShell `New-Item` command or `/usr/bin/touch <path>`.
+**Data flow**: It receives a file path. On Windows it returns a PowerShell New-Item command; on other systems it returns a /usr/bin/touch command. It does not run the command itself.
 
-**Call relations**: All user-approval and sandbox-approval tests call this helper to generate the shell command used in the mocked tool call.
+**Call relations**: User-approval and sandbox-retry tests call this when they need a shell command that will trigger approval handling.
 
 *Call graph*: called by 6 (handle_sandbox_error_user_approves_for_session_records_tool_decision, handle_sandbox_error_user_approves_retry_records_tool_decision, handle_sandbox_error_user_denies_records_tool_decision, handle_shell_command_user_approved_for_session_records_tool_decision, handle_shell_command_user_approved_records_tool_decision, handle_shell_command_user_denies_records_tool_decision); 2 external calls (cfg!, format!).
 
@@ -3395,11 +3419,11 @@ fn touch_command(path: &str) -> String
 fn extract_log_field_handles_empty_bare_values()
 ```
 
-**Purpose**: Unit-tests that `extract_log_field` correctly returns empty strings for bare fields written as `key=` with no value. This guards a parsing edge case used by MCP-field assertions.
+**Purpose**: Verifies that extract_log_field can read empty unquoted values. This matters because telemetry sometimes records a field as present but blank.
 
-**Data flow**: It constructs a sample log line with empty `mcp_server` and `mcp_server_origin` values, calls `extract_log_field` twice, and asserts both results are `Some(String::new())`.
+**Data flow**: It creates a sample log line with mcp_server= and mcp_server_origin=. It asks extract_log_field for each field and asserts that the returned value is an empty string.
 
-**Call relations**: This is a standalone synchronous test validating the helper’s parsing semantics.
+**Call relations**: The Rust test runner calls this directly. It protects the helper that later tool-result tests rely on.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3410,11 +3434,11 @@ fn extract_log_field_handles_empty_bare_values()
 fn extract_log_field_does_not_confuse_similar_keys()
 ```
 
-**Purpose**: Unit-tests that searching for `mcp_server` does not accidentally match `mcp_server_origin`. It protects against prefix-collision bugs in log parsing.
+**Purpose**: Verifies that extract_log_field does not mistake one field name for another longer field name. For example, mcp_server should not match mcp_server_origin.
 
-**Data flow**: It builds a line containing only `mcp_server_origin=stdio`, calls `extract_log_field` for both keys, and asserts `mcp_server` is `None` while `mcp_server_origin` is `Some("stdio")`.
+**Data flow**: It creates a sample log line containing only mcp_server_origin. It confirms that looking up mcp_server returns nothing, while looking up mcp_server_origin returns the expected value.
 
-**Call relations**: This is the second direct helper test and complements the empty-value case.
+**Call relations**: The Rust test runner calls this directly. It prevents false positives in later checks of telemetry field names.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3425,11 +3449,11 @@ fn extract_log_field_does_not_confuse_similar_keys()
 async fn responses_api_emits_api_request_event()
 ```
 
-**Purpose**: Checks that a normal turn emits high-level telemetry events for the API request and conversation start. It validates the presence of `codex.api_request` and `codex.conversation_starts` log lines.
+**Purpose**: Checks that sending user input to the Responses API creates telemetry for the API request and for the start of a conversation.
 
-**Data flow**: The test mounts a minimal completed SSE stream, builds a default session, submits a text `Op::UserInput`, waits for `TurnComplete`, and then scans captured logs for the two expected event names.
+**Data flow**: It starts a mock server, prepares a completed fake stream, builds a test Codex instance, and submits the text "hello". After the turn finishes, it scans captured logs for codex.api_request and codex.conversation_starts.
 
-**Call relations**: It is a top-level traced async test and serves as the broadest smoke test for request-start telemetry.
+**Call relations**: The test runner calls this asynchronous test. It uses the mock server and test Codex builder to drive the normal request path, then inspects tracing output.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3440,11 +3464,11 @@ async fn responses_api_emits_api_request_event()
 async fn process_sse_emits_tracing_for_output_item()
 ```
 
-**Purpose**: Verifies that processing an assistant message SSE event emits a `codex.sse_event` log line tagged as `response.output_item.done`. This confirms output-item completion is traced.
+**Purpose**: Checks that a completed assistant output item from the SSE stream is logged as a response output event.
 
-**Data flow**: The test mounts an SSE stream containing `ev_assistant_message` and `ev_completed`, submits a simple user turn, waits for completion, and searches logs for a line containing both `codex.sse_event` and `event.kind=response.output_item.done`.
+**Data flow**: It mounts a fake stream containing an assistant message and a completion event, submits user input, waits for the turn to complete, and searches logs for a codex.sse_event with response.output_item.done.
 
-**Call relations**: It is one of several SSE-processing telemetry tests that differ only in the mounted event stream and expected log content.
+**Call relations**: The test runner calls this. It exercises the stream-processing path and confirms that individual response items are visible in telemetry.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3455,11 +3479,11 @@ async fn process_sse_emits_tracing_for_output_item()
 async fn process_sse_emits_failed_event_on_parse_error()
 ```
 
-**Purpose**: Ensures malformed SSE payloads produce a failed `codex.sse_event` log with the JSON parse error message. The test disables GhostCommit to keep the flow deterministic after the parse failure.
+**Purpose**: Checks that malformed streamed data is recorded as a telemetry error instead of disappearing silently.
 
-**Data flow**: It mounts a raw non-JSON SSE body, builds a session with `Feature::GhostCommit` disabled, submits a user turn, waits for `TurnComplete`, and asserts logs contain `codex.sse_event`, `error.message`, and the specific parser text `expected ident at line 1 column 2`.
+**Data flow**: It serves an invalid SSE payload, submits user input, waits for Codex to finish handling the turn, and looks for a codex.sse_event log containing the JSON parse error message.
 
-**Call relations**: This test covers the malformed-input branch of SSE processing rather than a structured `response.failed` event.
+**Call relations**: The test runner calls this. It drives the SSE parser through a bad-input path and confirms the error is handed to tracing.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3470,11 +3494,11 @@ async fn process_sse_emits_failed_event_on_parse_error()
 async fn process_sse_records_failed_event_when_stream_closes_without_completed()
 ```
 
-**Purpose**: Checks that if the SSE stream ends after an assistant message but before `response.completed`, Codex records a failed SSE event noting the premature close. This guards incomplete-stream telemetry.
+**Purpose**: Checks that Codex logs a failure when a stream ends before the required response.completed event arrives.
 
-**Data flow**: The test mounts an SSE stream with only `ev_assistant_message`, disables GhostCommit, submits a user turn, waits for completion, and scans logs for `codex.sse_event` with `error.message` mentioning `stream closed before response.completed`.
+**Data flow**: It serves a stream with an assistant message but no completed marker. After a user turn, it searches logs for a codex.sse_event whose error says the stream closed too early.
 
-**Call relations**: It is another negative SSE-path test, focused on transport termination rather than parse failure.
+**Call relations**: The test runner calls this. It verifies the stream-processing code records an incomplete response as a failure.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3485,11 +3509,11 @@ async fn process_sse_records_failed_event_when_stream_closes_without_completed()
 async fn process_sse_failed_event_records_response_error_message()
 ```
 
-**Purpose**: Verifies that a structured `response.failed` event with an error object logs the embedded error message. The test then allows a follow-up local-shell completion so the turn can finish cleanly.
+**Purpose**: Checks that an explicit response.failed event from the server includes the server’s error message in telemetry.
 
-**Data flow**: It mounts one SSE stream containing a JSON `response.failed` with `{message: "boom", code: "bad"}`, then a second stream with an assistant message and completion. After submitting a user turn and waiting for `TurnComplete`, it asserts logs contain `codex.sse_event`, `event.kind=response.failed`, `error.message`, and `boom`.
+**Data flow**: It serves a failed response whose error message is "boom", then serves a follow-up successful response so the overall turn can finish. It waits for completion and confirms the failure log contains response.failed and the message.
 
-**Call relations**: This test covers the structured failure branch where the response error object is well-formed and should be surfaced verbatim.
+**Call relations**: The test runner calls this. It exercises the failure-event branch of SSE handling and then lets Codex continue through the normal follow-up flow.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3500,11 +3524,11 @@ async fn process_sse_failed_event_records_response_error_message()
 async fn process_sse_failed_event_logs_parse_error()
 ```
 
-**Purpose**: Checks that even when a `response.failed` event has an invalid error payload shape, Codex still logs a `codex.sse_event` for `response.failed`. The emphasis is on not dropping telemetry when parsing the nested error object fails.
+**Purpose**: Checks that Codex still logs a response.failed event even when the error payload has an unexpected shape.
 
-**Data flow**: The test mounts a malformed `response.failed` event whose `response.error` is a string, then a second completion stream, submits a user turn, waits for completion, and asserts logs contain `codex.sse_event` with `event.kind=response.failed`.
+**Data flow**: It sends a response.failed event where the error field is a plain string instead of an object, then sends a normal follow-up stream. After the turn finishes, it verifies that response.failed appeared in telemetry.
 
-**Call relations**: It complements the previous test by covering malformed nested error content rather than a valid error object.
+**Call relations**: The test runner calls this. It covers a defensive path where telemetry should survive malformed error details.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3515,11 +3539,11 @@ async fn process_sse_failed_event_logs_parse_error()
 async fn process_sse_failed_event_logs_missing_error()
 ```
 
-**Purpose**: Ensures a `response.failed` event lacking an `error` field still produces a `codex.sse_event` log tagged as `response.failed`. This guards another malformed-server edge case.
+**Purpose**: Checks that a response.failed event with no error object is still visible in logs.
 
-**Data flow**: It mounts an SSE stream containing `{"type":"response.failed","response":{}}`, disables GhostCommit, submits a user turn, waits for completion, and asserts the logs contain a `codex.sse_event` line with `event.kind=response.failed`.
+**Data flow**: It serves a failed response with an empty response body, submits user input, waits for completion, and confirms a codex.sse_event for response.failed was written.
 
-**Call relations**: This is the missing-error variant of the malformed `response.failed` telemetry tests.
+**Call relations**: The test runner calls this. It ensures missing optional error details do not prevent the event itself from being recorded.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3530,11 +3554,11 @@ async fn process_sse_failed_event_logs_missing_error()
 async fn process_sse_failed_event_logs_response_completed_parse_error()
 ```
 
-**Purpose**: Verifies that a malformed `response.completed` payload logs a parse error rather than silently succeeding. The expected log mentions failure to parse `ResponseCompleted`.
+**Purpose**: Checks that a malformed response.completed event records a parse error in telemetry.
 
-**Data flow**: The test mounts a malformed `response.completed` event with an empty `response` object, then a second completion stream, submits a user turn, waits for completion, and asserts logs contain `codex.sse_event`, `event.kind=response.completed`, `error.message`, and `failed to parse ResponseCompleted`.
+**Data flow**: It sends a response.completed event without the expected completed-response fields, then provides a successful follow-up stream. After the turn finishes, it searches logs for response.completed plus a parse-error message.
 
-**Call relations**: It is the `response.completed` analogue of the malformed `response.failed` tests.
+**Call relations**: The test runner calls this. It validates telemetry for a bad completion payload in the stream-processing code.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3545,11 +3569,11 @@ async fn process_sse_failed_event_logs_response_completed_parse_error()
 async fn process_sse_emits_completed_telemetry()
 ```
 
-**Purpose**: Checks that a well-formed `response.completed` event logs token-usage telemetry fields for input, output, cached, reasoning, and total/tool tokens. This validates extraction of usage counters from the SSE payload.
+**Purpose**: Checks that a completed response logs token usage. Token counts matter for cost, performance, and debugging model behavior.
 
-**Data flow**: The test mounts a `response.completed` SSE event whose `usage` object contains concrete token counts, submits a user turn, waits for completion, and scans logs for a `codex.sse_event` line containing `event.kind=response.completed` plus `input_token_count=3`, `output_token_count=5`, `cached_token_count=1`, `reasoning_token_count=2`, and `tool_token_count=9`.
+**Data flow**: It serves a completed response with input, cached input, output, reasoning, and total token counts. After a user turn, it checks that those numbers appear on the codex.sse_event log.
 
-**Call relations**: This is the positive counterpart to the malformed completion test and focuses on line-level telemetry rather than span fields.
+**Call relations**: The test runner calls this. It exercises the completed-response path and verifies that usage data is copied into telemetry fields.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3560,11 +3584,11 @@ async fn process_sse_emits_completed_telemetry()
 async fn turn_and_completed_response_spans_record_token_usage()
 ```
 
-**Purpose**: Asserts that both the `handle_responses` completion span and the enclosing turn span record detailed token-usage fields and reasoning effort. It validates span enrichment, not just emitted event lines.
+**Purpose**: Checks that token usage is attached not only to event logs but also to tracing spans. A span is a timed section of work, like a labeled stopwatch around a request or turn.
 
-**Data flow**: The test installs a custom tracing subscriber writing into an in-memory buffer, mounts a `response.completed` SSE event with usage counts, builds a session configured with `ReasoningEffort::High` and GhostCommit disabled, submits a user turn, waits for completion, and converts the buffer to a string. It then asserts one log line for `handle_responses{... otel.name="completed" ...}` contains request reasoning effort and usage fields, and another `turn{otel.name="session_task.turn" ...}` line contains the corresponding turn-level token-usage fields including non-cached input tokens.
+**Data flow**: It installs a tracing subscriber that writes into an in-memory buffer, serves a completed response with usage numbers, runs a Codex turn with high reasoning effort, then reads the buffer and asserts that both the response span and turn span contain the expected token fields.
 
-**Call relations**: This test is one of the span-field-focused cases that bypass `traced_test` and instead install a dedicated subscriber to inspect span close output.
+**Call relations**: The test runner calls this. It sets up its own tracing capture instead of relying on the default traced test helper so it can inspect full span-close output.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 12 external calls (leak, new, default, new, new, from_utf8, new, assert!, wait_for_event, set_default (+2 more)).
 
@@ -3575,11 +3599,11 @@ async fn turn_and_completed_response_spans_record_token_usage()
 async fn handle_responses_span_records_response_kind_and_tool_name()
 ```
 
-**Purpose**: Verifies that `handle_responses` spans record both the response kind and tool name when processing a function call, and still emit a separate completion span afterward. It checks metadata attached to spans rather than event logs.
+**Purpose**: Checks that response-handling spans say what kind of response item was processed and, for tool calls, which tool name was involved.
 
-**Data flow**: Using a custom subscriber buffer, the test mounts one SSE stream with `ev_function_call("function-call", "nonexistent", ...)` and completion, then a second stream with a final assistant message. After submitting a user turn and waiting for completion, it asserts the logs contain a `handle_responses{... otel.name="function_call" ... tool_name="nonexistent" ... from="output_item_done"}` line and another `handle_responses{... otel.name="completed"}` line.
+**Data flow**: It captures tracing output, serves a fake unsupported function call followed by completion, then serves a follow-up assistant message. After the turn, it looks for span lines showing a function_call with tool_name="nonexistent" and a completed response span.
 
-**Call relations**: It complements the token-usage span test by focusing on response-kind/tool-name metadata for intermediate response items.
+**Call relations**: The test runner calls this. It exercises the response handler’s metadata recording for function-call items and completion items.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 12 external calls (leak, new, default, new, new, from_utf8, new, assert!, wait_for_event, set_default (+2 more)).
 
@@ -3590,11 +3614,11 @@ async fn handle_responses_span_records_response_kind_and_tool_name()
 async fn record_responses_sets_span_fields_for_response_events()
 ```
 
-**Purpose**: Checks a broad matrix of `handle_responses` span names and optional fields across created, rate-limit, function-call, assistant-message, reasoning, delta, and completed events. It is the most exhaustive span-field regression in the file.
+**Purpose**: Checks that many different streamed response event types set the expected span fields. This makes the tracing timeline readable when debugging detailed model streams.
 
-**Data flow**: The test installs a custom subscriber, mounts a first `/responses` body containing `ev_response_created`, `response.output_item.added` for a function call, message-added, reasoning-added, text deltas, reasoning-summary and reasoning-content deltas, a function-call done event, an assistant message, a reasoning item, and completion; then mounts a second completion response. After submitting a user turn and waiting for completion, it scans the buffered logs for expected `handle_responses{...}` lines matching each `(otel.name, from, tool_name)` tuple while also requiring `codex.request.reasoning_effort=high`.
+**Data flow**: It captures tracing output, builds one SSE stream containing created, added item, message, reasoning, text delta, function call, and completed events, then runs a user turn. It loops over expected span names and checks that each appears with the right source and tool metadata when applicable.
 
-**Call relations**: This test drives the richest synthetic SSE stream in the file. It validates that the response-recording layer consistently annotates spans across many event kinds.
+**Call relations**: The test runner calls this. It uses mounted HTTP responses rather than the simpler SSE helper so it can test a richer sequence of streamed events.
 
 *Call graph*: calls 5 internal fn (mount_response_once, sse, sse_response, start_mock_server, test_codex); 13 external calls (leak, new, default, new, new, from_utf8, new, assert!, wait_for_event, format! (+3 more)).
 
@@ -3605,11 +3629,11 @@ async fn record_responses_sets_span_fields_for_response_events()
 async fn handle_response_item_records_tool_result_for_custom_tool_call()
 ```
 
-**Purpose**: Verifies telemetry for an unsupported custom tool call, including call id, tool name, raw arguments, synthesized failure output, `success=false`, and empty MCP fields. It proves unsupported custom tools still produce a structured `codex.tool_result` event.
+**Purpose**: Checks that an unsupported custom tool call is reported as a failed tool result with useful details.
 
-**Data flow**: The test mounts a first SSE stream with `ev_custom_tool_call("custom-tool-call", "unsupported_tool", ...)` and completion, then a second stream with a final assistant message. After submitting a user turn and waiting for completion, it locates the `codex.tool_result` line for that call id and checks the expected substrings plus `assert_empty_mcp_tool_fields(line)`.
+**Data flow**: It serves a custom tool call named unsupported_tool, then a follow-up assistant response. After the turn completes, it finds the codex.tool_result line and checks call id, tool name, arguments, failure output, success=false, and empty MCP fields.
 
-**Call relations**: This is one of three tool-result tests; it covers the custom-tool branch specifically.
+**Call relations**: The test runner calls this. It uses assert_empty_mcp_tool_fields to verify that local unsupported custom tools are not labeled as MCP tools.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3620,11 +3644,11 @@ async fn handle_response_item_records_tool_result_for_custom_tool_call()
 async fn handle_response_item_records_tool_result_for_function_call()
 ```
 
-**Purpose**: Checks telemetry for an unsupported ordinary function call. The expected output text is `unsupported call: <name>` and the event must include arguments, failure status, and blank MCP fields.
+**Purpose**: Checks that an unsupported normal function call is reported as a failed tool result.
 
-**Data flow**: The test mounts a function-call SSE stream followed by a completion stream, submits a user turn, waits for a `TokenCount` event, then finds the `codex.tool_result` line for `function-call`. It asserts presence of `tool_name=nonexistent`, the JSON arguments, `output=unsupported call: nonexistent`, `success=false`, and empty MCP fields.
+**Data flow**: It serves a function call named nonexistent, then a follow-up assistant response. Once Codex reaches token-count reporting, it checks the tool-result log for the call id, tool name, arguments, failure text, success=false, and empty MCP fields.
 
-**Call relations**: It parallels the custom-tool test but exercises the standard function-call path.
+**Call relations**: The test runner calls this. It follows the function-call handling path and then reuses assert_empty_mcp_tool_fields for the MCP-related checks.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3635,11 +3659,11 @@ async fn handle_response_item_records_tool_result_for_function_call()
 async fn handle_response_item_records_tool_result_for_shell_command_call()
 ```
 
-**Purpose**: Verifies that shell-command execution emits a `codex.tool_result` event with the command arguments, some non-empty output field, `success=false`, and blank MCP fields. The test configures approvals so the shell command can run without prompting.
+**Purpose**: Checks that a shell command tool call produces a tool-result telemetry event, even when the command result is not successful.
 
-**Data flow**: The test mounts a shell-command function call and a follow-up assistant completion, builds a session with GhostCommit disabled and approval policy forced to `Never`, submits a user turn, waits for completion, and inspects the `codex.tool_result` line for `shell-call`. It checks `tool_name=shell_command`, the serialized command arguments, that an `output=` field exists and is non-empty, `success=false`, and empty MCP fields.
+**Data flow**: It serves a shell_command call for "echo shell", configures approval so no user prompt is needed, and serves a follow-up assistant response. After the turn, it checks the tool-result log for the tool name, command arguments, non-empty output, success=false, and empty MCP fields.
 
-**Call relations**: This is the shell-command variant of the tool-result telemetry tests and uses `shell_command_call` to build the SSE fixture.
+**Call relations**: The test runner calls this. It uses shell_command_call to create the fake model request and assert_empty_mcp_tool_fields to confirm local-tool labeling.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 3 external calls (default, wait_for_event, vec!).
 
@@ -3654,11 +3678,11 @@ fn tool_decision_assertion(
 ) -> impl Fn(&[&str]) -> Result<(), String> + 'a
 ```
 
-**Purpose**: Builds a reusable log-assertion closure that checks a `codex.tool_decision` event for a specific call id, decision, and source. It normalizes comparisons by lowercasing the matched line.
+**Purpose**: Builds a reusable log-checking function for shell command approval decisions. The generated checker looks for one call id, one expected decision, and one expected decision source.
 
-**Data flow**: Inputs are the target call id, expected decision string, and expected source string. The function clones them into owned strings and returns a closure that scans a slice of log lines for `codex.tool_decision` with the call id, then verifies lowercase substrings for `tool_name=shell_command`, `decision=<expected>`, and `source=<expected>`.
+**Data flow**: It receives the expected call id, decision, and source, stores them in owned strings, and returns a closure. When that closure later receives log lines, it finds the matching codex.tool_decision event and checks the tool name, decision, and source.
 
-**Call relations**: All shell-command approval-decision tests call this helper inside `logs_assert`, allowing each test to focus on driving the approval path rather than rewriting the same log parsing.
+**Call relations**: Shell approval tests call this helper when passing a log assertion. It keeps all tool-decision log checks consistent across config approval, user approval, session approval, and denial cases.
 
 *Call graph*: called by 7 (handle_sandbox_error_user_approves_for_session_records_tool_decision, handle_sandbox_error_user_approves_retry_records_tool_decision, handle_sandbox_error_user_denies_records_tool_decision, handle_shell_command_autoapprove_from_config_records_tool_decision, handle_shell_command_user_approved_for_session_records_tool_decision, handle_shell_command_user_approved_records_tool_decision, handle_shell_command_user_denies_records_tool_decision).
 
@@ -3672,11 +3696,11 @@ fn sandbox_outcome_assertion(
 ) -> impl Fn(&[&str]) -> Result<(), String> + 'a
 ```
 
-**Purpose**: Builds a reusable log-assertion closure for `codex.sandbox_outcome` events, checking the outcome and both duration fields. It is tailored to the direct `SessionTelemetry::sandbox_outcome` test.
+**Purpose**: Builds a reusable log-checking function for sandbox outcome telemetry. A sandbox is a restricted environment used to run commands more safely.
 
-**Data flow**: Inputs are a call id and expected outcome string. The returned closure finds the matching `codex.sandbox_outcome` line, lowercases it, and verifies `tool_name=shell_command`, `outcome=<expected>`, `initial_duration_ms=12`, and `escalated_duration_ms=34`.
+**Data flow**: It receives a call id and expected outcome, stores them, and returns a closure. When given log lines, the closure finds the matching codex.sandbox_outcome event and checks the tool name, outcome, and recorded durations.
 
-**Call relations**: Only `sandbox_outcome_event_records_outcome` uses this helper.
+**Call relations**: sandbox_outcome_event_records_outcome calls this helper to verify the telemetry emitted directly by SessionTelemetry.
 
 *Call graph*: called by 1 (sandbox_outcome_event_records_outcome).
 
@@ -3687,11 +3711,11 @@ fn sandbox_outcome_assertion(
 fn sandbox_outcome_event_records_outcome()
 ```
 
-**Purpose**: Directly exercises `SessionTelemetry::sandbox_outcome` and verifies the emitted log line records the expected outcome and durations. This bypasses the rest of Codex to test the telemetry helper in isolation.
+**Purpose**: Checks that SessionTelemetry writes a sandbox outcome event with the expected outcome and timing fields.
 
-**Data flow**: The test constructs a `SessionTelemetry` with a fresh `ThreadId`, model names, auth mode, app name, terminal kind, and `SessionSource::Cli`, then calls `telemetry.sandbox_outcome("shell_command", "sandbox-outcome-call", "escalated", 12ms, Some(34ms))`. It finally runs `logs_assert` with `sandbox_outcome_assertion(...)`.
+**Data flow**: It creates a SessionTelemetry object for a fake session, records a sandbox outcome for a shell command with initial and escalated durations, and then checks the captured logs using sandbox_outcome_assertion.
 
-**Call relations**: This is the only test in the file that does not build a `TestCodex` session. It validates the telemetry emitter directly.
+**Call relations**: The test runner calls this. Unlike the longer Codex turn tests, it calls the telemetry object directly to focus only on sandbox outcome logging.
 
 *Call graph*: calls 3 internal fn (sandbox_outcome_assertion, new, new); 1 external calls (from_millis).
 
@@ -3702,11 +3726,11 @@ fn sandbox_outcome_event_records_outcome()
 async fn handle_shell_command_autoapprove_from_config_records_tool_decision()
 ```
 
-**Purpose**: Checks that when configuration auto-approves shell commands, telemetry records a `codex.tool_decision` event with decision `approved` and source `config`. It covers the non-interactive approval path.
+**Purpose**: Checks that when configuration automatically allows a shell command, telemetry records the decision as approved by config.
 
-**Data flow**: The test mounts a shell-command call and completion, builds a session with approval policy `OnRequest` but permission profile `Disabled`, submits a user turn, waits for completion, and asserts logs satisfy `tool_decision_assertion("auto_config_call", "approved", "config")`.
+**Data flow**: It serves a shell command call, configures permissions so the command can be approved without asking the user, runs a user turn, waits for completion, and checks for a codex.tool_decision event with decision approved and source config.
 
-**Call relations**: It is the config-driven approval counterpart to the user-driven approval tests below.
+**Call relations**: The test runner calls this. It uses shell_command_call to create the request and tool_decision_assertion to inspect the resulting log.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion); 3 external calls (default, wait_for_event, vec!).
 
@@ -3717,11 +3741,11 @@ async fn handle_shell_command_autoapprove_from_config_records_tool_decision()
 async fn handle_shell_command_user_approved_records_tool_decision()
 ```
 
-**Purpose**: Verifies that when the user explicitly approves a shell command, telemetry records decision `approved` with source `user`. It drives the interactive approval flow through `ExecApprovalRequest` and `Op::ExecApproval`.
+**Purpose**: Checks that when the user approves a shell command once, telemetry records an approved decision from the user.
 
-**Data flow**: The test mounts a shell-command call using a platform-specific touch command, builds a session with `AskForApproval::UnlessTrusted`, submits a user turn, waits for `EventMsg::ExecApprovalRequest`, extracts the effective approval id, submits `Op::ExecApproval { decision: ReviewDecision::Approved }`, waits for `TokenCount`, and asserts the expected tool-decision log.
+**Data flow**: It creates a platform-specific file-touch command, serves it as a shell call, submits user input, waits for an execution approval request, sends back an Approved decision, and then checks logs for the approved user decision.
 
-**Call relations**: This test is one of several nearly identical approval-flow tests that differ only in the submitted `ReviewDecision` and expected telemetry strings.
+**Call relations**: The test runner calls this. It uses touch_command to build the command and tool_decision_assertion to verify the approval record.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
@@ -3732,11 +3756,11 @@ async fn handle_shell_command_user_approved_records_tool_decision()
 async fn handle_shell_command_user_approved_for_session_records_tool_decision()
 ```
 
-**Purpose**: Checks that approving a shell command for the session records decision `approvedforsession` with source `user`. It validates the persistent-approval variant of the interactive flow.
+**Purpose**: Checks that when the user approves a shell command for the whole session, telemetry records that stronger approval choice.
 
-**Data flow**: The setup mirrors the previous test, but after receiving `ExecApprovalRequest` it submits `ReviewDecision::ApprovedForSession`. After waiting for `TokenCount`, it asserts the log matches `tool_decision_assertion("user_approved_session_call", "approvedforsession", "user")`.
+**Data flow**: It serves a shell command call, waits for Codex to ask for approval, submits an ApprovedForSession decision, waits for progress, and checks that the tool-decision log says approvedforsession from user.
 
-**Call relations**: It shares the same control flow as the ordinary user-approval test but covers the session-scoped approval branch.
+**Call relations**: The test runner calls this. It follows the same approval-request path as the one-time approval test, but with a session-wide decision.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
@@ -3747,11 +3771,11 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision()
 async fn handle_sandbox_error_user_approves_retry_records_tool_decision()
 ```
 
-**Purpose**: Verifies telemetry when the user approves a retry after a sandbox-related approval request. The expected decision is still `approved` from source `user`.
+**Purpose**: Checks that when a command needs a retry after sandbox trouble and the user approves, telemetry records that approval.
 
-**Data flow**: The test mounts a shell-command call and completion, builds a session requiring approval, submits a user turn, waits for `ExecApprovalRequest`, responds with `ReviewDecision::Approved`, waits for `TokenCount`, and asserts the corresponding tool-decision log for `sandbox_retry_call`.
+**Data flow**: It serves a shell command call that triggers the approval flow, submits user input, waits for the approval request, sends an Approved decision, then checks the tool-decision log for approved from user.
 
-**Call relations**: Although named for sandbox retry, its observable assertion is the same decision/source pair as ordinary user approval; the distinction is the scenario being exercised in the runtime.
+**Call relations**: The test runner calls this. It uses the same helper pattern as other approval tests so sandbox-retry approvals are logged consistently.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
@@ -3762,11 +3786,11 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision()
 async fn handle_shell_command_user_denies_records_tool_decision()
 ```
 
-**Purpose**: Checks that denying a shell command emits a `codex.tool_decision` event with decision `denied` and source `user`. This covers the negative branch of interactive approval.
+**Purpose**: Checks that when the user denies a shell command, telemetry records a denied decision from the user.
 
-**Data flow**: The test mounts a shell-command call and completion, builds a session with `UnlessTrusted`, submits a user turn, waits for `ExecApprovalRequest`, submits `ReviewDecision::Denied`, waits for `TokenCount`, and asserts the denial log via `tool_decision_assertion("user_denied_call", "denied", "user")`.
+**Data flow**: It serves a shell command call, waits for Codex to ask for approval, sends a Denied decision, waits for progress, and checks that the tool-decision log says denied from user.
 
-**Call relations**: It is the denial counterpart to the user-approval tests.
+**Call relations**: The test runner calls this. It covers the negative branch of the user approval flow and uses tool_decision_assertion for the final log check.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
@@ -3777,11 +3801,11 @@ async fn handle_shell_command_user_denies_records_tool_decision()
 async fn handle_sandbox_error_user_approves_for_session_records_tool_decision()
 ```
 
-**Purpose**: Verifies that approving a sandbox-related shell command for the session records `approvedforsession` from source `user`. It covers the persistent-approval branch in the sandbox-error scenario.
+**Purpose**: Checks that session-wide approval during a sandbox-related retry path is logged as approved for session by the user.
 
-**Data flow**: The test follows the same pattern as the other approval tests: mount shell-command SSE, build a session requiring approval, submit a turn, wait for `ExecApprovalRequest`, respond with `ReviewDecision::ApprovedForSession`, wait for `TokenCount`, and assert the expected tool-decision log for `sandbox_session_call`.
+**Data flow**: It creates a platform-appropriate touch command, serves it as a shell call, waits for an approval request, submits ApprovedForSession, then checks logs for the matching decision and source.
 
-**Call relations**: This is the sandbox-scenario analogue of `handle_shell_command_user_approved_for_session_records_tool_decision`.
+**Call relations**: The test runner calls this. It combines the sandbox retry scenario with the session-wide user approval decision.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
@@ -3792,22 +3816,24 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision()
 async fn handle_sandbox_error_user_denies_records_tool_decision()
 ```
 
-**Purpose**: Checks that denying a sandbox-related shell command emits decision `denied` from source `user`. It completes the matrix of sandbox approval outcomes.
+**Purpose**: Checks that denial during a sandbox-related command flow is logged as a user denial.
 
-**Data flow**: The test mounts the shell-command SSE sequence, builds a session with `UnlessTrusted`, submits a turn, waits for `ExecApprovalRequest`, submits `ReviewDecision::Denied`, waits for `TokenCount`, and asserts the denial log for `sandbox_deny_call`.
+**Data flow**: It serves a shell command call, waits for the execution approval request, sends Denied, waits for progress, and checks logs for a codex.tool_decision event showing denied from user.
 
-**Call relations**: This is the final approval-decision test and the sandbox-error counterpart to `handle_shell_command_user_denies_records_tool_decision`.
+**Call relations**: The test runner calls this. It completes the matrix of sandbox-related approval outcomes by covering the denial case.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, tool_decision_assertion, touch_command); 4 external calls (default, wait_for_event, panic!, vec!).
 
 
 ### `state/src/log_db_filter_tests.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This file is a focused async integration test around the state runtime’s log persistence layer. The test creates an isolated temporary Codex home directory using a UUID suffix, initializes a full `StateRuntime`, and starts the logging layer returned by `start(runtime.clone())`. It then installs that layer as the default tracing subscriber with a permissive `Targets` filter set to `TRACE`, ensuring any filtering observed comes from the sink implementation itself rather than subscriber-level suppression.
+This test checks an important cleanup rule for the project’s saved logs. The system records tracing logs into a SQLite database, but one outside library, OpenTelemetry SDK, can produce very detailed low-level messages. Those messages are useful when debugging the library itself, but they would clutter the application’s own log history if saved at every level.
 
-The test emits four events: `TRACE` and `DEBUG` for target `opentelemetry_sdk`, `INFO` for the same target, and `TRACE` for target `codex_state`. After forcing `layer.flush().await` and dropping the subscriber guard, it queries persisted logs through `runtime.query_logs(&crate::LogQuery::default())`. The assertion projects each row down to `(level, target, message)` and expects only two retained rows: the `INFO` OpenTelemetry event and the `TRACE` Codex event. That makes the intended invariant explicit: low-level OpenTelemetry SDK chatter is filtered out before storage, but normal application traces and higher-level SDK messages remain queryable. The test also performs best-effort cleanup of the temporary directory at the end.
+The test creates a temporary state directory, starts a real StateRuntime, attaches the database logging layer, and then emits four log messages. Two are low-level messages from the OpenTelemetry SDK and should be dropped. One is a higher-level OpenTelemetry message and should stay. One is a low-level message from this project’s own state code and should also stay.
+
+After forcing the logging layer to flush, the test reads the saved logs back from the runtime and compares them with the exact expected result. This is like checking a mailroom rule: junk mail from one sender at certain priority levels is thrown away, but important mail from that sender and all project mail still reaches the inbox. Finally, it removes the temporary directory so the test does not leave files behind.
 
 #### Function details
 
@@ -3817,10 +3843,10 @@ The test emits four events: `TRACE` and `DEBUG` for target `opentelemetry_sdk`, 
 async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs()
 ```
 
-**Purpose**: Builds a temporary runtime and tracing subscriber, emits representative log events, flushes the sink, and asserts that only the allowed records were written to the log database. It specifically exercises the sink’s special-case filtering for `opentelemetry_sdk` targets.
+**Purpose**: This asynchronous test proves that the SQLite log sink filters out OpenTelemetry SDK trace and debug logs, while keeping OpenTelemetry info logs and this project’s own trace logs. Someone would use this test to make sure the saved log history stays useful instead of being flooded by noisy library internals.
 
-**Data flow**: It derives a unique temporary `codex_home` path from `std::env::temp_dir()` plus a generated `Uuid`, passes that path and a provider string into `StateRuntime::init`, and feeds the resulting runtime into `start(...)` to obtain the log layer. With a default subscriber guard installed, it writes four tracing events, flushes the layer, queries all logs via `runtime.query_logs(&crate::LogQuery::default())`, maps each `LogRow` to `(level.as_str(), target.as_str(), message.as_deref())`, and compares the collected vector against the expected retained rows. Finally it removes the temporary directory with `tokio::fs::remove_dir_all` on a best-effort basis.
+**Data flow**: It starts with a fresh temporary folder and a test provider name, then builds a StateRuntime that writes state and logs there. It installs the logging layer, emits several log events with different sources and levels, flushes pending log writes, and queries the stored log rows. The output is not returned to a caller; instead, the test passes only if the database contains exactly the two expected retained log entries, and then it deletes the temporary folder.
 
-**Call relations**: This is a top-level Tokio test invoked by the test runner. Within the test flow it drives runtime initialization first, then constructs the logging layer, then emits events under a permissive subscriber filter so the sink’s own filtering logic is what determines persistence, and finally validates persisted output by querying the runtime after an explicit flush.
+**Call relations**: The Tokio test runner calls this function as part of the test suite. Inside the test, it relies on runtime initialization to create the state database, uses the log layer startup path to connect tracing events to SQLite storage, then calls the runtime’s log query path to verify what was actually saved. The final assertion ties the whole flow together by confirming that the filtering rule worked end to end.
 
 *Call graph*: calls 1 internal fn (init); 10 external calls (new, assert_eq!, format!, default, temp_dir, remove_dir_all, debug!, info!, trace!, registry).

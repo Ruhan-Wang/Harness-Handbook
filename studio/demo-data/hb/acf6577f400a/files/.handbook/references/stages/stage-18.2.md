@@ -1,8 +1,6 @@
 # App-server protocol schemas and transport contracts  `stage-18.2`
 
-This stage is cross-cutting infrastructure that defines the wire contract between app-server clients, servers, and adjacent transports. It sits beneath request handling and the main server loop: startup code, runtime RPC dispatch, notifications, and tooling all depend on these schemas to serialize, validate, and interpret messages consistently.
-
-At the base, jsonrpc_lite.rs supplies the shared JSON-RPC envelope model, while app-server/src/error_code.rs standardizes server error payloads. The crate facades in app-server-protocol/src/lib.rs, protocol/mod.rs, v2/mod.rs, and app-server-transport/src/lib.rs assemble the public API exposed to implementations and generators. common.rs is the central method-to-type registry spanning shared requests, responses, and notifications; serde_helpers.rs and v2/shared.rs handle wire-format quirks and enum casing. Versioned payloads live in v1.rs and the many v2 modules, covering threads, turns, items, reviews, accounts, models, permissions, config, plugins, filesystem/process control, MCP, realtime, remote control, and more, with mappers.rs preserving v1 compatibility by adapting legacy command execution into v2 shapes. export.rs, schema_fixtures.rs, and experimental_api.rs turn the Rust types into filtered JSON Schema and TypeScript artifacts. Transport-side message contracts in outgoing_message.rs, remote_control/protocol.rs, and mcp-server/outgoing_message.rs carry those protocol values over concrete connections, while the TUI conversion helper bridges approval payloads into UI-local models.
+This stage is the shared rulebook for how the app server and its clients talk. It sits behind the main work loop: before any feature can send a request, reply, warning, file update, or command output, both sides need to agree on the exact message shape. The JSON-RPC files define the basic envelope, like an addressed letter with a request, response, notification, or error inside. The common, v1, and v2 protocol files define the actual “forms” that go in those envelopes: startup, login, threads, turns, items, reviews, realtime sessions, accounts, models, apps, permissions, config, plugins, hooks, feedback, files, processes, MCP, remote control, and more. Helper and mapper files smooth over format details and keep older v1 command requests working with v2. The export and fixture tools turn Rust types into TypeScript and JSON Schema so other clients can use the same contract and detect accidental changes. Transport files describe outgoing messages, remote-control websocket rules, and JSON-RPC errors. Small bridge files translate approvals and MCP messages into the shapes other parts of the system expect.
 
 ## Files in this stage
 
@@ -11,13 +9,13 @@ These files establish the crate-level entry points and the shared JSON-RPC and p
 
 ### `app-server-protocol/src/jsonrpc_lite.rs`
 
-`data_model` · `request handling`
+`data_model` · `request handling and protocol serialization`
 
-This module contains the protocol’s minimal JSON-RPC framing types. `JSONRPC_VERSION` is declared as `"2.0"`, but the module-level comment makes the design choice explicit: the system does not send or require the standard `jsonrpc` field. Instead, the wire model is represented by `JSONRPCMessage`, an untagged enum over `JSONRPCRequest`, `JSONRPCNotification`, `JSONRPCResponse`, and `JSONRPCError`.
+This file is the protocol “envelope” for app-server messages. JSON-RPC is a common way for one program to call methods in another program using JSON text, but this project uses a lighter version: it does not require the usual "jsonrpc": "2.0" field, even though it keeps a JSONRPC_VERSION constant for that version string.
 
-`RequestId` is also an untagged enum, allowing either `String(String)` or `Integer(i64)` IDs. It derives serde, schemars, and `ts_rs::TS`, with the integer variant explicitly exported to TypeScript as `number`. The module aliases `Result` to `serde_json::Value`, so successful JSON-RPC responses can carry arbitrary JSON payloads.
+The main idea is simple: every incoming or outgoing message is one of four shapes. A request asks for something and includes an id so the answer can be matched back to the question. A notification announces something but does not expect an answer. A successful response carries the matching id and a result. An error response carries the matching id plus an error code, message, and optional extra data.
 
-The request and notification structs both carry a `method: String` and optional `params: Option<serde_json::Value>`, serialized only when present. `JSONRPCRequest` additionally includes `id: RequestId` and optional distributed tracing metadata via `trace: Option<W3cTraceContext>`. `JSONRPCResponse` pairs an `id` with a `result`, while `JSONRPCError` wraps `JSONRPCErrorError { code, data, message }` plus the request ID. The file is mostly data definitions; its only behavior is `Display` formatting for `RequestId`, which renders either the raw string ID or decimal integer form.
+The RequestId type matters because different clients may identify requests with either strings or numbers. This file accepts both, like a coat-check ticket that may be labeled “42” or “abc-123” but still points to one request. The structures also support automatic JSON conversion, JSON schema generation, and TypeScript type generation, so Rust, JSON, and frontend code can agree on the same message format. Requests may also include W3C trace context, which is tracing information used to follow one operation across several services.
 
 #### Function details
 
@@ -27,40 +25,46 @@ The request and notification structs both carry a `method: String` and optional 
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats a `RequestId` for display by emitting either the contained string or the decimal representation of the integer variant. It gives request IDs a uniform textual form for logs and messages.
+**Purpose**: This function turns a request id into readable text. It lets code print or log a RequestId the same way whether the id was originally a string or a number.
 
-**Data flow**: Reads `self` and mutable formatter `f`; for `RequestId::String(value)` it writes `value` directly with `write_str`, and for `RequestId::Integer(value)` it formats the integer with `write!`. Returns `fmt::Result` and writes only to the formatter output stream.
+**Data flow**: It receives a RequestId and a formatter, which is Rust’s destination for display text. If the id is a string, it writes that string directly. If the id is an integer, it converts the number to text while writing it. The result is either successful formatted output or a formatting error from the underlying writer.
 
-**Call relations**: This is the `fmt::Display` implementation for `RequestId`, used implicitly anywhere a request ID is formatted as text. It does not call internal helpers beyond standard formatting primitives.
+**Call relations**: This is used whenever RequestId is displayed through Rust’s standard formatting system, such as in logs, error messages, or string interpolation. Inside the function, string ids are handed to the formatter’s write_str method, while integer ids are handed to Rust’s write! formatting macro so both forms become plain text.
 
 *Call graph*: 2 external calls (write_str, write!).
 
 
 ### `app-server-protocol/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting: used whenever other code imports protocol types or schema/export helpers`
 
-This file is the crate root for `app-server-protocol`, and its main responsibility is curating the public API. It declares internal modules for `experimental_api`, `export`, `jsonrpc_lite`, `protocol`, and `schema_fixtures`, then re-exports a broad set of items so downstream code can depend on one stable namespace instead of the internal module layout.
+This file does not implement protocol behavior itself. Instead, it acts like a reception desk for the crate: callers import from this one place, and this file points them to the right underlying module. That matters because the protocol library contains many pieces: request and response types, event mappings, item builders, thread history structures, experimental API definitions, JSON-RPC support, and tools for generating JSON Schema and TypeScript definitions. Without this file, every caller would need to know the library’s internal folder layout and import each piece from its private location.
 
-The re-exports reveal the crate’s responsibilities. From `export`, it exposes schema and code-generation entry points such as `generate_json`, `generate_ts`, `generate_types`, and option types like `GenerateTsOptions`. From `jsonrpc_lite`, it surfaces lightweight JSON-RPC protocol types. From `protocol`, it re-exports common shared types, event mapping helpers, item builders, thread history structures, selected v1 request/response types, and the entire v2 protocol surface via `pub use protocol::v2::*`. It also exposes schema fixture readers and writers for tests and tooling, with one hidden helper reserved for test support. The design intentionally mixes stable protocol definitions with generation utilities in one crate so the same source of truth can drive runtime serialization, schema export, and fixture generation. This file is active anywhere protocol types are imported, schemas are generated, or tests need fixture trees derived from the protocol definitions.
+The file first declares the internal modules that make up the crate. Then it publicly re-exports selected names from those modules. “Re-export” means the item still lives in its original module, but users can access it directly through this crate’s public API. For example, code outside the crate can use protocol data types such as initialization parameters, authentication responses, Git information, sandbox settings, and v2 protocol definitions without caring where they are stored internally.
+
+It also exposes schema fixture helpers used to read and write protocol schema examples, plus export functions that generate JSON, TypeScript, and internal JSON Schema output. One test-only helper is marked as hidden from normal documentation, which signals that it exists for tests rather than as part of the everyday public surface.
 
 
 ### `app-server-protocol/src/protocol/mod.rs`
 
-`orchestration` · `compile-time module wiring / cross-cutting`
+`orchestration` · `compile-time module wiring`
 
-This file is the protocol module root: it does not implement behavior itself, but it determines how the rest of the protocol schema is structured and exposed to the crate. The public modules `common`, `event_mapping`, `item_builders`, `thread_history`, `v1`, and `v2` form the externally consumable protocol surface, while `mappers` and `serde_helpers` remain internal implementation details. That split is important because it signals which pieces are intended as stable API definitions versus translation and serialization support used behind the scenes.
+This file does not contain the protocol rules itself. Instead, it organizes the protocol area of the project, much like a folder index at the front of a binder. The app-server protocol is the shared language used to describe messages, events, item shapes, versioned APIs, and conversion helpers. Without this file, Rust would not know how to find those pieces under the `protocol` namespace, and code such as `lib.rs` could not re-export or use them cleanly.
 
-The module layout also encodes the protocol’s versioning strategy. Shared definitions live outside the versioned trees, while request/response payloads that differ by API generation are isolated under `v1` and `v2`. Consumers reaching this module through the crate root can import protocol types without needing to know the internal file layout, and the comment indicates that `lib.rs` re-exports pieces from `protocol::common`. In practice, this file is the namespace switchboard for schema compilation, serde support, JSON Schema generation, and TypeScript export performed by the child modules. Because there are no functions or state here, its main invariant is module visibility: public declarations define the supported protocol surface, and private declarations keep helper machinery out of the public API.
+The `pub mod` entries are public doors: they make modules like `common`, `event_mapping`, `item_builders`, `thread_history`, `v1`, and `v2` available to code outside this module. The plain `mod` entries are private doors: `mappers` and `serde_helpers` are still compiled and used inside the protocol implementation, but they are not exposed as part of the public interface. That matters because helper code can change without forcing outside callers to depend on its details.
+
+The versioned modules, `v1` and `v2`, suggest that the protocol supports more than one shape of API or message format. This file is what keeps those pieces grouped under one clear protocol namespace.
 
 
 ### `app-server-protocol/src/protocol/serde_helpers.rs`
 
-`util` · `cross-cutting`
+`io_transport` · `protocol encoding and decoding`
 
-This file is a focused collection of serialization/deserialization helpers intended to be referenced from `#[serde(...)]` field attributes elsewhere in the protocol layer. It defines three generic free functions, each adapting Serde behavior without introducing new wrapper types. The first helper targets `Option<PathBuf>` fields and normalizes an empty path string into `None`; it first deserializes using Serde’s standard `Option<PathBuf>` implementation, then post-processes the result by filtering out any `PathBuf` whose `OsStr` is empty. That preserves ordinary `None` and non-empty paths while collapsing a protocol edge case that would otherwise produce `Some("")`.
+When this project sends or receives protocol messages, it uses Serde, a Rust library that turns structured data into formats like JSON and back again. Most fields can use Serde’s default behavior, but a few need special rules. This file keeps those special rules in one place so message types can opt into them without repeating code.
 
-The other two helpers expose `serde_with::rust::double_option` for fields typed as `Option<Option<T>>`, preserving the distinction between an omitted field, an explicit null, and a concrete value. Rather than reimplementing that logic, this file forwards directly to the external helper module for both deserialize and serialize paths. The design is intentionally minimal: no local state, no custom error shaping, and no protocol-specific types beyond `PathBuf`. Its value is in centralizing these conventions so protocol structs can opt into consistent wire semantics declaratively.
+The first rule treats an empty path as if no path was provided. That matters because some clients or formats may send an empty string for a path, even though the program really wants to understand that as “there is no path here.” It is like treating a blank address line on a form as unanswered, not as a real address.
+
+The other two helpers deal with a “double option,” written in Rust as `Option<Option<T>>`. This is used when the protocol must tell apart three cases: a field was not sent at all, a field was sent as `null`, or a field was sent with a real value. Normal optional fields only distinguish two of those. These helpers delegate to the `serde_with` library, which provides the careful encoding and decoding needed for that three-way meaning.
 
 #### Function details
 
@@ -70,11 +74,11 @@ The other two helpers expose `serde_with::rust::double_option` for fields typed 
 fn deserialize_empty_path_as_none(deserializer: D) -> Result<Option<PathBuf>, D::Error>
 ```
 
-**Purpose**: Deserializes an optional filesystem path and converts an empty path payload into `None` instead of leaving it as `Some(PathBuf::new())` or equivalent.
+**Purpose**: This function reads an optional file path from incoming serialized data and turns an empty path into `None`, meaning “no path.” It is useful when protocol input may represent a missing path as an empty string.
 
-**Data flow**: It accepts a generic Serde `Deserializer`, invokes the standard `Option::<PathBuf>::deserialize` implementation to obtain `Option<PathBuf>`, then applies `Option::filter` with a predicate that checks `!path.as_os_str().is_empty()`. The function returns the filtered `Option<PathBuf>` wrapped in `Result`, propagating any deserialization error from Serde unchanged.
+**Data flow**: It receives a Serde deserializer, which is the reader for the incoming data. It first asks Serde to read the data as an optional `PathBuf`, then checks the result: if there is a path but its text is empty, it removes it. The output is either a real non-empty path, `None`, or an error if the input could not be read as a path.
 
-**Call relations**: This helper is intended to be invoked by Serde during field deserialization when a struct field is annotated to use it. In its internal flow it delegates only to the external `deserialize` implementation for `Option<PathBuf>`, then performs the protocol-specific normalization step locally.
+**Call relations**: Serde calls this helper when a protocol field is configured to use this custom path-reading rule. Inside, it hands the basic reading work to Serde’s normal `deserialize` behavior, then adds the project-specific cleanup step before returning the value to the message being built.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -85,11 +89,11 @@ fn deserialize_empty_path_as_none(deserializer: D) -> Result<Option<PathBuf>, D:
 fn deserialize_double_option(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 ```
 
-**Purpose**: Deserializes a nested optional value so callers can distinguish between a missing field, an explicit null, and a present non-null value.
+**Purpose**: This function reads a field where the protocol needs to distinguish between “not present,” “present but null,” and “present with a value.” It preserves that three-way meaning using `Option<Option<T>>`.
 
-**Data flow**: It takes a generic `Deserializer` for some `T: Deserialize<'de>` and forwards that deserializer directly to `serde_with::rust::double_option::deserialize`. The returned value is `Result<Option<Option<T>>, D::Error>`, preserving all three states without additional transformation or local state.
+**Data flow**: It receives a Serde deserializer for incoming data and a target value type `T`. It passes the deserializer to `serde_with`’s double-option reader, which interprets the field’s presence and value. The result is an outer `Option` for whether the field existed, and an inner `Option` for whether the field’s value was null or real.
 
-**Call relations**: This function is used as a Serde field-level adapter wherever protocol structs need tri-state optional semantics. Its entire implementation is delegation to the external `serde_with` deserializer, serving as a local stable entry point for that behavior.
+**Call relations**: Serde uses this helper when decoding a protocol field that needs three distinct states. This function does not invent the decoding rules itself; it forwards the work to `serde_with::rust::double_option::deserialize`, then returns that result to the surrounding protocol message.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -103,22 +107,26 @@ fn serialize_double_option(
 ) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes a nested optional value using Serde conventions that preserve the distinction between absent, null, and concrete values.
+**Purpose**: This function writes a three-state optional field back into serialized protocol data. It keeps the difference between an omitted field, a null field, and a field with a value.
 
-**Data flow**: It receives a borrowed `&Option<Option<T>>` plus a generic Serde `Serializer`, then passes both directly to `serde_with::rust::double_option::serialize`. It returns the serializer’s `Ok`/`Error` result unchanged and does not mutate any state.
+**Data flow**: It receives a reference to an `Option<Option<T>>` and a Serde serializer, which is the writer for outgoing data. It gives both to `serde_with`’s double-option writer, which emits the correct serialized form for the field’s state. The output is Serde’s normal success result, or an error if writing fails.
 
-**Call relations**: This helper is called by Serde during struct serialization for fields configured to use it. In the call flow it acts purely as a thin wrapper around the external `serde_with` serializer so protocol types can reuse the same tri-state encoding convention consistently.
+**Call relations**: Serde calls this helper when encoding a protocol field that uses the double-option convention. The function hands off the actual writing to `serde_with::rust::double_option::serialize` so outgoing messages match the same three-way meaning expected during decoding.
 
 *Call graph*: 1 external calls (serialize).
 
 
 ### `app-server-protocol/src/protocol/common.rs`
 
-`data_model` · `cross-cutting protocol definition, serialization, and schema export`
+`data_model` · `cross-cutting protocol definition, request handling, schema export, and tests`
 
-This file is the protocol catalog for the app-server boundary. Its core job is to declare the enums that represent every client-initiated request, server-initiated request, and server/client notification, then derive the serde, TypeScript, and JSON Schema machinery needed to move those messages over JSON-RPC and publish the contract externally. Rather than hand-writing dozens of near-identical enums and helpers, it uses macros to generate `ClientRequest`, `ClientResponse`, `ClientResponsePayload`, `ServerRequest`, `ServerResponse`, `ServerRequestPayload`, `ServerNotification`, and `ClientNotification`, along with helper methods such as ID extraction, method-name recovery, JSON-RPC conversion, schema export, and type visitation.
+This file is the protocol contract between the app server and anything that talks to it, such as a desktop app, editor extension, or other host. Without it, the two sides could easily disagree about message names, fields, response shapes, or which operations must not run at the same time.
 
-A notable design feature is request serialization scoping. `ClientRequestSerializationScope` classifies requests into concurrency buckets such as global config, per-thread, per-process, per-watch, or per-MCP OAuth server; the generated `ClientRequest::serialization_scope()` computes these from request params so higher layers can serialize conflicting operations while allowing unrelated ones to run concurrently. Another important axis is experimental gating: macro annotations attach explicit experimental reasons to methods, or defer to param-level inspection via the `ExperimentalApi` trait when only certain fields are unstable. The file also includes a small set of concrete protocol structs for fuzzy file search and a large test module that locks down exact JSON shapes, omitted optional params, rename behavior, experimental markers, and serialization-scope decisions.
+Most of the file is a central catalogue of messages. A client can ask the server to start or resume a thread, read files, run commands, log in, list models, change configuration, and more. The server can ask the client for approvals, refreshed tokens, tool input, or attestations. The server can also send one-way notifications such as “thread started”, “item completed”, “file system changed”, or “account updated”.
+
+The file uses Rust macros to avoid writing the same boilerplate for every message. From one compact definition, it generates typed Rust enums, JSON serialization rules, TypeScript exports, and JSON Schema exports. Think of it like one master menu that prints both the waiter’s copy and the kitchen’s copy, so everyone uses the same item names.
+
+A key detail is request serialization scope. Some requests are allowed to run in parallel, while others are grouped by thread, configuration, account login, process, or watch id so they happen in a safe order. The tests at the bottom protect many wire-format details so older clients and newer servers keep understanding each other.
 
 #### Function details
 
@@ -128,11 +136,11 @@ A notable design feature is request serialization scoping. `ClientRequestSeriali
 fn has_chatgpt_account(self) -> bool
 ```
 
-**Purpose**: Classifies an authentication mode by whether it corresponds to an authenticated human ChatGPT account. It distinguishes ChatGPT-backed and personal-token-backed modes from direct API-key, agent identity, and Bedrock modes.
+**Purpose**: This answers whether an authentication mode represents a human ChatGPT-style account rather than only a direct API key or machine identity. Code can use it when it needs to know whether account-specific ChatGPT behavior is available.
 
-**Data flow**: Takes `self: AuthMode` by value and pattern-matches the enum variant. It returns `true` for `Chatgpt`, `ChatgptAuthTokens`, and `PersonalAccessToken`, and `false` for `ApiKey`, `AgentIdentity`, and `BedrockApiKey`; it does not mutate any state.
+**Data flow**: It takes one AuthMode value, checks which variant it is, and returns true for ChatGPT, externally supplied ChatGPT tokens, or a personal access token. It returns false for API keys, agent identity, and Bedrock API keys, and it does not change anything.
 
-**Call relations**: This is a leaf classification helper on the `AuthMode` enum, used by higher-level account/auth logic when protocol consumers need to know whether a mode implies a ChatGPT account context rather than a raw provider credential.
+**Call relations**: Other account or capability code can call this as a small decision point when it has already parsed or stored an AuthMode. It does not hand work off to other functions; it simply returns the classification.
 
 
 ##### `AuthMode::uses_codex_backend`  (lines 61–69)
@@ -141,11 +149,11 @@ fn has_chatgpt_account(self) -> bool
 fn uses_codex_backend(self) -> bool
 ```
 
-**Purpose**: Reports whether an auth mode routes through Codex-managed backend services instead of talking directly to a model provider API. It encodes the protocol-level distinction between Codex-backed account modes and direct credential modes.
+**Purpose**: This answers whether an authentication mode goes through Codex services instead of talking directly to a model provider API. It helps callers choose the right backend path.
 
-**Data flow**: Consumes `self: AuthMode`, matches on the variant, and returns `true` for `Chatgpt`, `ChatgptAuthTokens`, `AgentIdentity`, and `PersonalAccessToken`, while returning `false` for `ApiKey` and `BedrockApiKey`. No external state is read or written.
+**Data flow**: It takes one AuthMode value, matches it against the known modes, and returns true for ChatGPT, externally supplied ChatGPT tokens, agent identity, and personal access token. It returns false for direct OpenAI API keys and Bedrock API keys, with no side effects.
 
-**Call relations**: Like `AuthMode::has_chatgpt_account`, this is a pure helper used by callers outside this file to branch on backend behavior, especially where transport or capability decisions depend on Codex mediation.
+**Call relations**: Code that is deciding how to route model or account traffic can call this after it has an AuthMode. The function is self-contained and does not call other project code.
 
 
 ##### `ServerRequest::try_from`  (lines 1417–1419)
@@ -154,11 +162,11 @@ fn uses_codex_backend(self) -> bool
 fn try_from(value: JSONRPCRequest) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Converts a generic JSON-RPC request object into the strongly typed `ServerRequest` enum defined by this protocol file. It is the bridge from transport-level JSON-RPC framing into typed server-to-client request variants.
+**Purpose**: This converts a raw JSON-RPC request into one of the typed server-to-client request variants. It is used when the program wants safety and named Rust fields instead of loose JSON.
 
-**Data flow**: Accepts a `JSONRPCRequest`, serializes it to a generic `serde_json::Value`, then deserializes that value into `ServerRequest`. It returns either the typed enum or a `serde_json::Error`; it performs no side effects beyond serialization/deserialization work.
+**Data flow**: It receives a JSONRPCRequest, turns that request into a JSON value, then asks Serde, the serialization library, to decode that value as a ServerRequest. The result is either a typed ServerRequest or a JSON decoding error.
 
-**Call relations**: This `TryFrom` implementation is invoked when infrastructure receives a server-originated JSON-RPC request and needs typed dispatch. Internally it delegates entirely to `serde_json::to_value` and `serde_json::from_value`, relying on the enum's serde tags and renames generated by `server_request_definitions!`.
+**Call relations**: This is the bridge from generic transport data into the typed protocol defined in this file. It calls external JSON conversion helpers, and callers use the returned ServerRequest to inspect the id, method, params, and expected response type.
 
 *Call graph*: 2 external calls (from_value, to_value).
 
@@ -169,11 +177,11 @@ fn try_from(value: JSONRPCRequest) -> Result<Self, Self::Error>
 fn absolute_path_string(path: &str) -> String
 ```
 
-**Purpose**: Builds a normalized absolute-path string for test assertions. It ensures fixture paths are rooted and rendered exactly as the absolute-path helper library would serialize them.
+**Purpose**: This test helper makes a stable absolute path string for expected JSON values. It keeps path formatting consistent across tests.
 
-**Data flow**: Takes a `&str`, strips any leading slash, prefixes one slash via `format!`, converts it with `test_path_buf`, and returns the displayed path as a `String`. It reads no shared state and writes nothing.
+**Data flow**: It receives a path-like string, makes sure it starts with a slash, builds a test absolute path with the external test helper, and returns that path as display text.
 
-**Call relations**: This helper is called by serialization tests that compare JSON output containing absolute filesystem paths, so expected JSON strings match the same path normalization used by protocol types.
+**Call relations**: Serialization tests call this when they need to compare JSON containing paths. It relies on the external test path builder so the expected strings match the path type’s own formatting.
 
 *Call graph*: 2 external calls (test_path_buf, format!).
 
@@ -184,11 +192,11 @@ fn absolute_path_string(path: &str) -> String
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Constructs an `AbsolutePathBuf` test value from a string path. It centralizes path normalization for tests that need typed absolute-path params rather than plain strings.
+**Purpose**: This test helper creates an AbsolutePathBuf for request or response structs that require real absolute paths. It saves each test from repeating the same setup.
 
-**Data flow**: Receives a `&str`, normalizes it to a rooted path string with `format!`, passes it through `test_path_buf`, then converts to an absolute-path wrapper with `.abs()`. It returns the typed path and does not mutate external state.
+**Data flow**: It receives a path-like string, normalizes it to begin with a slash, creates a test path buffer, converts it to an absolute path value, and returns that value.
 
-**Call relations**: Used throughout the test module when building request params or notification payloads that contain absolute paths, keeping fixtures concise and consistent with production path serialization.
+**Call relations**: Many tests call this before constructing protocol messages with file paths. It hands back values that are then serialized and compared against expected JSON.
 
 *Call graph*: 2 external calls (test_path_buf, format!).
 
@@ -199,11 +207,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn request_id() -> RequestId
 ```
 
-**Purpose**: Provides a stable integer `RequestId` fixture for tests. It avoids repeating the same literal construction across many assertions.
+**Purpose**: This test helper returns the same simple request id every time. It makes tests easier to read by hiding repeated id construction.
 
-**Data flow**: Creates and returns `RequestId::Integer(1)` from a local constant. No inputs are read and no state is modified.
+**Data flow**: It takes no input, creates RequestId::Integer with the fixed number 1, and returns it.
 
-**Call relations**: This helper is used by the serialization-scope tests to populate request IDs while focusing assertions on scope behavior rather than ID construction.
+**Call relations**: Serialization-scope tests call this while building many ClientRequest values. It depends only on the RequestId integer constructor.
 
 *Call graph*: 1 external calls (Integer).
 
@@ -214,11 +222,11 @@ fn request_id() -> RequestId
 fn client_request_serialization_scope_covers_keyed_families()
 ```
 
-**Purpose**: Verifies that representative client requests with key-bearing params map to the correct `ClientRequestSerializationScope` variants. It exercises thread-, process-, watch-, config-, account-, environment-, and MCP-scoped requests.
+**Purpose**: This test checks that requests tied to a particular thread, process, file watch, configuration area, account area, or similar key are grouped under the right serialization scope. That grouping is what prevents unsafe overlapping work.
 
-**Data flow**: Constructs many `ClientRequest` values with concrete params, often using `request_id()`, `absolute_path()`, `PathBuf::from`, `json!`, and vectors. For each request it calls `serialization_scope()` and asserts the returned `Option<ClientRequestSerializationScope>` matches the expected keyed scope; no persistent state is changed.
+**Data flow**: It creates many representative ClientRequest values, asks each one for its serialization_scope, and compares the result with the expected scope. The output is success if all assertions match, or a test failure if any request is grouped incorrectly.
 
-**Call relations**: This test directly validates the behavior generated by `client_request_definitions!` and `serialization_scope_expr!`. It is invoked by the Rust test runner and serves as regression coverage for macro-specified serialization policies on requests that should serialize by shared key.
+**Call relations**: The Rust test runner calls this test. It uses the local request_id and absolute_path helpers plus standard constructors and assertions to exercise the serialization rules generated from the request definitions.
 
 *Call graph*: 8 external calls (default, from, new, absolute_path, request_id, assert_eq!, json!, vec!).
 
@@ -229,11 +237,11 @@ fn client_request_serialization_scope_covers_keyed_families()
 fn client_request_serialization_scope_covers_unkeyed_representatives()
 ```
 
-**Purpose**: Checks that representative requests intended to run concurrently either produce `None` serialization scope or the expected global/shared-read scope for unkeyed operations. It complements the keyed-family test by covering intentionally concurrent APIs.
+**Purpose**: This test checks examples of requests that are intentionally concurrent or globally shared-read. It protects the rule that not every request should be forced into a queue.
 
-**Data flow**: Builds sample `ClientRequest` values for initialize, thread start, command exec without process ID, filesystem reads, append-only thread history reads, MCP resource reads without thread context, and remote-control operations. It calls `serialization_scope()` on each and asserts the exact `Option<ClientRequestSerializationScope>` result.
+**Data flow**: It builds representative ClientRequest values, calls serialization_scope on each, and asserts either no scope or the expected global shared scope. Nothing is returned except test pass or failure.
 
-**Call relations**: Run by the test harness, this test confirms that the macro-declared serialization annotations preserve concurrency where intended and only impose global serialization on the remote-control families that explicitly require it.
+**Call relations**: The test runner calls it alongside the keyed-scope test. It uses request_id and absolute_path to build sample messages and confirms the generated request metadata behaves as intended.
 
 *Call graph*: 7 external calls (absolute_path, request_id, default, default, default, assert_eq!, vec!).
 
@@ -244,11 +252,11 @@ fn client_request_serialization_scope_covers_unkeyed_representatives()
 fn serialize_get_conversation_summary() -> Result<()>
 ```
 
-**Purpose**: Confirms the legacy `GetConversationSummary` client request serializes to the expected JSON shape, including plain-string thread ID encoding and camelCase field names.
+**Purpose**: This test verifies the legacy GetConversationSummary request still serializes to the exact JSON shape expected by clients and servers. It protects backward compatibility.
 
-**Data flow**: Creates a `ThreadId` from a UUID string, wraps it in `v1::GetConversationSummaryParams::ThreadId`, embeds that in `ClientRequest::GetConversationSummary`, serializes with `serde_json::to_value`, and compares the result to a literal `json!` object. It returns `anyhow::Result<()>` to propagate parse/serialization failures.
+**Data flow**: It creates a thread id from a string, builds the request, serializes it to JSON, and compares that JSON with the expected method name, id, and params.
 
-**Call relations**: This test is invoked by the test runner and validates serde behavior for one deprecated v1 request variant generated by `client_request_definitions!`.
+**Call relations**: The test runner calls it. It relies on ThreadId parsing and Serde serialization, then uses an assertion to make sure the protocol wire format has not drifted.
 
 *Call graph*: calls 1 internal fn (from_string); 2 external calls (Integer, assert_eq!).
 
@@ -259,11 +267,11 @@ fn serialize_get_conversation_summary() -> Result<()>
 fn serialize_initialize_with_opt_out_notification_methods() -> Result<()>
 ```
 
-**Purpose**: Verifies that `Initialize` requests serialize optional client capabilities, including `optOutNotificationMethods`, exactly as expected on the wire.
+**Purpose**: This test checks that an initialize request can advertise capabilities, including a list of notification methods the client does not want. That matters during startup negotiation.
 
-**Data flow**: Builds a `ClientRequest::Initialize` with populated `v1::InitializeParams` and nested `InitializeCapabilities`, serializes it to JSON, and asserts equality with a hand-written `json!` value. It returns `Result<()>` for test ergonomics.
+**Data flow**: It builds an Initialize request with client information and capability flags, serializes it to JSON, and compares the result with the expected camelCase fields and method name.
 
-**Call relations**: This test covers the initialization handshake contract and ensures optional capability fields survive serde renaming and nesting correctly.
+**Call relations**: The test runner calls it to protect the startup handshake format. It uses RequestId construction, vector construction, and JSON equality assertions.
 
 *Call graph*: 3 external calls (Integer, assert_eq!, vec!).
 
@@ -274,11 +282,11 @@ fn serialize_initialize_with_opt_out_notification_methods() -> Result<()>
 fn deserialize_initialize_with_opt_out_notification_methods() -> Result<()>
 ```
 
-**Purpose**: Checks the inverse of the previous test: JSON for `initialize` with opt-out notification methods deserializes into the exact typed `ClientRequest` value.
+**Purpose**: This test checks the reverse of initialization serialization: JSON from a client can be read back into the typed Initialize request. It ensures incoming startup messages are understood correctly.
 
-**Data flow**: Starts from a literal `json!` object, deserializes it with `serde_json::from_value` into `ClientRequest`, and compares the result to a manually constructed `ClientRequest::Initialize`. It returns `Result<()>` on success or deserialization failure.
+**Data flow**: It starts with a JSON object, deserializes it into ClientRequest, and compares the typed result with the expected Rust value.
 
-**Call relations**: This test is called by the test harness to lock down backward-compatible parsing of initialization capabilities, complementing the serialization test.
+**Call relations**: The test runner calls it. It uses Serde’s JSON decoding and verifies that the same fields tested during serialization are accepted on input.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -289,11 +297,11 @@ fn deserialize_initialize_with_opt_out_notification_methods() -> Result<()>
 fn conversation_id_serializes_as_plain_string() -> Result<()>
 ```
 
-**Purpose**: Ensures `ThreadId` serializes as a bare JSON string rather than an object wrapper. This is important because many protocol payloads embed thread IDs directly.
+**Purpose**: This test verifies that a conversation or thread id appears in JSON as just a string, not as a wrapped object. That keeps the public wire format simple.
 
-**Data flow**: Parses a `ThreadId` from a UUID string, serializes it with `serde_json::to_value`, and asserts the result equals a JSON string literal. It returns `Result<()>`.
+**Data flow**: It parses a thread id from text, serializes it to JSON, and checks that the JSON value is the same plain string.
 
-**Call relations**: This focused test supports many request/notification contracts in this file by pinning the serialization behavior of the shared `ThreadId` type used in v1 payloads.
+**Call relations**: The test runner calls it as a focused compatibility check for ThreadId formatting. It uses ThreadId parsing and JSON serialization.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (assert_eq!).
 
@@ -304,11 +312,11 @@ fn conversation_id_serializes_as_plain_string() -> Result<()>
 fn conversation_id_deserializes_from_plain_string() -> Result<()>
 ```
 
-**Purpose**: Verifies that a plain JSON string can be parsed back into `ThreadId`. It protects the inverse compatibility guarantee of the previous test.
+**Purpose**: This test verifies that a plain JSON string can be read back into a ThreadId. It protects clients that send ids as simple strings.
 
-**Data flow**: Deserializes a JSON string literal into `ThreadId` using `serde_json::from_value`, constructs the expected `ThreadId` from the same UUID string, and asserts equality. It returns `Result<()>`.
+**Data flow**: It starts with a JSON string, deserializes it into a ThreadId, and compares it to a ThreadId parsed from the same text.
 
-**Call relations**: Run by the test harness, this test confirms that protocol consumers can send thread IDs as simple strings and still obtain the typed identifier.
+**Call relations**: The test runner calls it. Together with the matching serialization test, it confirms ThreadId round-trips cleanly through JSON.
 
 *Call graph*: 3 external calls (assert_eq!, json!, from_value).
 
@@ -319,11 +327,11 @@ fn conversation_id_deserializes_from_plain_string() -> Result<()>
 fn serialize_client_notification() -> Result<()>
 ```
 
-**Purpose**: Checks that the `ClientNotification::Initialized` variant serializes without a `params` field. This captures the special no-payload notification shape generated by the notification macro.
+**Purpose**: This test checks the one client-to-server notification defined here, Initialized. It verifies that notifications with no payload do not accidentally include a params field.
 
-**Data flow**: Constructs `ClientNotification::Initialized`, serializes it to JSON, and asserts the output contains only the `method` field. It returns `Result<()>`.
+**Data flow**: It creates ClientNotification::Initialized, serializes it, and compares the JSON with an object containing only the method name.
 
-**Call relations**: This test validates the `client_notification_definitions!` output for payload-less notifications and is executed by the standard test runner.
+**Call relations**: The test runner calls it to protect the client notification wire format generated by the macro.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -334,11 +342,11 @@ fn serialize_client_notification() -> Result<()>
 fn serialize_server_request() -> Result<()>
 ```
 
-**Purpose**: Verifies serialization of a legacy server-initiated approval request and the payload-to-request constructor path. It checks both wire JSON and helper enum behavior.
+**Purpose**: This test verifies a legacy server-to-client approval request for command execution. It protects the exact JSON shape used when the server asks the client to approve a command.
 
-**Data flow**: Builds `v1::ExecCommandApprovalParams` with a parsed `ThreadId`, command vector, cwd, and parsed command list; wraps it in `ServerRequest::ExecCommandApproval`; serializes to JSON and asserts the exact shape. It also constructs `ServerRequestPayload::ExecCommandApproval`, calls `request_with_id`, and asserts the reconstructed request matches the original.
+**Data flow**: It builds approval params, wraps them in a ServerRequest with an id, serializes the request to JSON, and checks the expected fields. It also checks that a ServerRequestPayload can be turned into the same request with the supplied id.
 
-**Call relations**: This test exercises code generated by `server_request_definitions!`, specifically `ServerRequest::id` and `ServerRequestPayload::request_with_id`, and confirms legacy v1 server requests still serialize correctly.
+**Call relations**: The test runner calls it. It uses ThreadId parsing, payload construction, and the generated id and request_with_id helpers to verify both serialization and payload wrapping.
 
 *Call graph*: calls 1 internal fn (from_string); 5 external calls (from, ExecCommandApproval, Integer, assert_eq!, vec!).
 
@@ -349,11 +357,11 @@ fn serialize_server_request() -> Result<()>
 fn serialize_chatgpt_auth_tokens_refresh_request() -> Result<()>
 ```
 
-**Purpose**: Checks the wire format for the server-to-client `account/chatgptAuthTokens/refresh` request, including enum string values and optional previous account ID.
+**Purpose**: This test checks the server request that asks a client or host app to refresh externally managed ChatGPT tokens. It ensures the method name and reason fields stay stable.
 
-**Data flow**: Constructs `ServerRequest::ChatgptAuthTokensRefresh` with concrete params, serializes it to JSON, and compares against a literal expected object. It returns `Result<()>`.
+**Data flow**: It builds a ChatgptAuthTokensRefresh request, serializes it, and compares it with expected JSON containing the refresh reason and previous account id.
 
-**Call relations**: This test is run by the test harness to validate one of the newer v2 server request variants generated by the macro.
+**Call relations**: The test runner calls it to protect an authentication-related server-to-client message. It uses the generated ServerRequest serialization.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -364,11 +372,11 @@ fn serialize_chatgpt_auth_tokens_refresh_request() -> Result<()>
 fn serialize_attestation_generate_request() -> Result<()>
 ```
 
-**Purpose**: Verifies serialization of the server-initiated attestation generation request and the payload helper that wraps params into a request with an ID.
+**Purpose**: This test verifies the server request that asks the client to generate an attestation result. Attestation is a proof-like check, so the request format must stay predictable.
 
-**Data flow**: Creates empty `v2::AttestationGenerateParams`, embeds them in `ServerRequest::AttestationGenerate`, serializes to JSON, and asserts the exact object. It also creates `ServerRequestPayload::AttestationGenerate`, calls `request_with_id`, and checks equality with the original request.
+**Data flow**: It creates empty attestation params, builds the ServerRequest, serializes it, and compares the JSON. It also verifies that ServerRequestPayload creates the same request when given an id.
 
-**Call relations**: This test covers both the serde contract and the helper constructor generated by `server_request_definitions!` for a modern v2 request.
+**Call relations**: The test runner calls it. It exercises both direct request construction and the generated payload-to-request helper.
 
 *Call graph*: 3 external calls (AttestationGenerate, Integer, assert_eq!).
 
@@ -379,11 +387,11 @@ fn serialize_attestation_generate_request() -> Result<()>
 fn serialize_server_response() -> Result<()>
 ```
 
-**Purpose**: Confirms that a typed client-to-server response to a server request serializes with the correct method tag, ID, and nested `response` payload.
+**Purpose**: This test verifies a typed client response to a server approval request. It makes sure the response includes the original id, method name, and decision in the expected JSON form.
 
-**Data flow**: Builds `ServerResponse::CommandExecutionRequestApproval` with a concrete approval decision, checks `id()` and `method()`, serializes to JSON, and asserts the exact output. It returns `Result<()>`.
+**Data flow**: It builds a ServerResponse with an approval decision, checks its id and method helper results, serializes it, and compares the JSON.
 
-**Call relations**: This test validates helper methods generated on `ServerResponse` and the serde tagging for server-request response messages.
+**Call relations**: The test runner calls it. It exercises the generated ServerResponse id, method, and serialization behavior.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -394,11 +402,11 @@ fn serialize_server_response() -> Result<()>
 fn serialize_mcp_server_elicitation_request() -> Result<()>
 ```
 
-**Purpose**: Tests serialization of an MCP elicitation request carrying a JSON-schema-like form definition, plus the payload helper path. It ensures the tagged request mode and `_meta` field layout are preserved.
+**Purpose**: This test checks the server request used when an MCP server asks the user for input. MCP means Model Context Protocol, a way for outside tools and resources to connect to the model workflow.
 
-**Data flow**: Deserializes a JSON object into `v2::McpElicitationSchema`, builds `v2::McpServerElicitationRequestParams::Form`, wraps it in `ServerRequest::McpServerElicitationRequest`, serializes to JSON, and asserts the exact structure. It also constructs the corresponding `ServerRequestPayload`, calls `request_with_id`, and checks equality.
+**Data flow**: It builds a requested JSON schema, places it inside elicitation params, creates a ServerRequest, serializes it, and compares the exact JSON. It also checks payload-to-request conversion for the same request.
 
-**Call relations**: This test is invoked by the test runner to validate a complex server request variant generated by `server_request_definitions!`, especially one with nested tagged payload semantics.
+**Call relations**: The test runner calls it. It uses JSON decoding for the nested schema, then exercises generated serialization and request wrapping.
 
 *Call graph*: 5 external calls (McpServerElicitationRequest, Integer, assert_eq!, json!, from_value).
 
@@ -409,11 +417,11 @@ fn serialize_mcp_server_elicitation_request() -> Result<()>
 fn serialize_get_account_rate_limits() -> Result<()>
 ```
 
-**Purpose**: Verifies that a client request whose params are `Option<()>` serializes without a `params` field when `None`. It specifically covers `account/rateLimits/read`.
+**Purpose**: This test verifies that the account rate-limit read request is serialized without a params field when there are no params. That keeps the wire format clean and compatible.
 
-**Data flow**: Constructs `ClientRequest::GetAccountRateLimits` with `params: None`, checks `id()` and `method()`, serializes to JSON, and asserts the resulting object omits `params`. It returns `Result<()>`.
+**Data flow**: It builds a ClientRequest::GetAccountRateLimits with params set to None, checks its id and method, serializes it, and compares the JSON.
 
-**Call relations**: This test protects the serde behavior of optional-unit params in the generated `ClientRequest` enum for no-argument methods.
+**Call relations**: The test runner calls it. It exercises generated ClientRequest helpers and optional-params serialization.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -424,11 +432,11 @@ fn serialize_get_account_rate_limits() -> Result<()>
 fn serialize_get_account_token_usage() -> Result<()>
 ```
 
-**Purpose**: Checks the same omitted-params behavior as the previous test, but for `account/usage/read`.
+**Purpose**: This test verifies that the account usage read request is serialized correctly when it has no params. It protects a small but user-visible account API.
 
-**Data flow**: Builds `ClientRequest::GetAccountTokenUsage` with `None` params, verifies `id()` and `method()`, serializes to JSON, and compares to the expected object lacking `params`. It returns `Result<()>`.
+**Data flow**: It builds a GetAccountTokenUsage request with no params, checks the id and method, serializes it, and compares the JSON.
 
-**Call relations**: This test complements the rate-limits case and ensures multiple no-arg request variants behave consistently under serde.
+**Call relations**: The test runner calls it. It uses the generated ClientRequest id, method, and serialization behavior.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -439,11 +447,11 @@ fn serialize_get_account_token_usage() -> Result<()>
 fn serialize_client_response() -> Result<()>
 ```
 
-**Purpose**: Validates serialization of a large, nested `ClientResponse::ThreadStart` payload, including thread metadata, path handling, enums, and nested settings-like fields.
+**Purpose**: This test verifies the JSON form of a server-to-client response for starting a thread. It protects a large and important response shape used after a client asks to create a thread.
 
-**Data flow**: Uses `absolute_path()` to build typed paths, constructs a detailed `v2::ThreadStartResponse` and wraps it in `ClientResponse::ThreadStart`, checks `id()` and `method()`, serializes to JSON, and asserts equality with a fully expanded expected object. It returns `Result<()>`.
+**Data flow**: It builds a detailed ThreadStart response with thread metadata, paths, model settings, and sandbox settings, wraps it in ClientResponse, serializes it, and compares the resulting JSON.
 
-**Call relations**: This test exercises the generated `ClientResponse` helpers and serves as a broad regression test for nested v2 response serialization, especially camelCase conversion and absolute-path rendering.
+**Call relations**: The test runner calls it. It uses the absolute_path helper and generated ClientResponse id and method helpers to confirm the response contract.
 
 *Call graph*: 5 external calls (new, Integer, absolute_path, assert_eq!, vec!).
 
@@ -454,11 +462,11 @@ fn serialize_client_response() -> Result<()>
 fn serialize_config_requirements_read() -> Result<()>
 ```
 
-**Purpose**: Ensures `configRequirements/read` also omits `params` when represented as `None`. It covers another no-argument request variant.
+**Purpose**: This test checks the request that reads configuration requirements. It verifies that a no-params request serializes to only method and id.
 
-**Data flow**: Constructs `ClientRequest::ConfigRequirementsRead` with `params: None`, serializes it, and asserts the JSON contains only `method` and `id`. It returns `Result<()>`.
+**Data flow**: It builds ConfigRequirementsRead with params None, serializes it, and compares the JSON.
 
-**Call relations**: This test is part of the suite pinning down optional-unit request serialization generated by `client_request_definitions!`.
+**Call relations**: The test runner calls it to protect one configuration-related client request format.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -469,11 +477,11 @@ fn serialize_config_requirements_read() -> Result<()>
 fn serialize_account_login_api_key() -> Result<()>
 ```
 
-**Purpose**: Checks the tagged-union wire format for `LoginAccount` when using the API key variant.
+**Purpose**: This test verifies the login request shape for API-key authentication. It ensures the secret is placed under the expected field name.
 
-**Data flow**: Builds `ClientRequest::LoginAccount` with `v2::LoginAccountParams::ApiKey`, serializes to JSON, and asserts the payload contains `type: apiKey` and the `apiKey` field. It returns `Result<()>`.
+**Data flow**: It builds a LoginAccount request with an API key, serializes it, and compares the JSON with type apiKey and apiKey fields.
 
-**Call relations**: This test validates one branch of the account-login request enum defined in v2 and wrapped by the generated `ClientRequest` variant.
+**Call relations**: The test runner calls it as part of the account-login wire-format checks.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -484,11 +492,11 @@ fn serialize_account_login_api_key() -> Result<()>
 fn serialize_account_login_chatgpt() -> Result<()>
 ```
 
-**Purpose**: Verifies the standard ChatGPT login variant serializes with the correct discriminator and omits falsey optional fields not meant to appear.
+**Purpose**: This test verifies the standard ChatGPT login request shape. It also confirms that a false streamlined-login flag is omitted from JSON.
 
-**Data flow**: Constructs `ClientRequest::LoginAccount` with `v2::LoginAccountParams::Chatgpt { codex_streamlined_login: false }`, serializes it, and compares to the expected JSON containing only `type: chatgpt`. It returns `Result<()>`.
+**Data flow**: It builds a LoginAccount request for ChatGPT with streamlined login disabled, serializes it, and compares the JSON.
 
-**Call relations**: This test complements the API-key login case and confirms serde omission behavior inside the nested login params enum.
+**Call relations**: The test runner calls it. It protects the compact default JSON form for ChatGPT login.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -499,11 +507,11 @@ fn serialize_account_login_chatgpt() -> Result<()>
 fn serialize_account_login_chatgpt_streamlined() -> Result<()>
 ```
 
-**Purpose**: Checks that the ChatGPT login variant includes `codexStreamlinedLogin` when that flag is true.
+**Purpose**: This test verifies the ChatGPT login request when streamlined login is explicitly enabled. It checks that the extra flag appears only when needed.
 
-**Data flow**: Builds the ChatGPT login request with `codex_streamlined_login: true`, serializes it, and asserts the JSON includes both the `type` discriminator and the streamlined-login flag. It returns `Result<()>`.
+**Data flow**: It builds a ChatGPT LoginAccount request with the streamlined flag set to true, serializes it, and compares the expected JSON.
 
-**Call relations**: This test covers the alternate serialization branch of the same nested login enum, ensuring conditional field emission is correct.
+**Call relations**: The test runner calls it alongside the non-streamlined version to cover both branches of this login format.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -514,11 +522,11 @@ fn serialize_account_login_chatgpt_streamlined() -> Result<()>
 fn serialize_account_login_chatgpt_device_code() -> Result<()>
 ```
 
-**Purpose**: Verifies serialization of the device-code login variant for account login.
+**Purpose**: This test verifies the login request shape for the ChatGPT device-code flow. Device-code login is the flow where a user authorizes on another device or browser.
 
-**Data flow**: Constructs `ClientRequest::LoginAccount` with `v2::LoginAccountParams::ChatgptDeviceCode`, serializes it, and asserts the JSON contains the expected `type: chatgptDeviceCode` payload. It returns `Result<()>`.
+**Data flow**: It builds a LoginAccount request using the ChatgptDeviceCode variant, serializes it, and compares the JSON type field.
 
-**Call relations**: This test adds coverage for another branch of the login tagged union used by the generated client request.
+**Call relations**: The test runner calls it as another account-login compatibility check.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -529,11 +537,11 @@ fn serialize_account_login_chatgpt_device_code() -> Result<()>
 fn serialize_account_logout() -> Result<()>
 ```
 
-**Purpose**: Ensures the logout request serializes as a no-params method call.
+**Purpose**: This test verifies the logout request shape. It makes sure logout does not send an unnecessary params field.
 
-**Data flow**: Builds `ClientRequest::LogoutAccount` with `params: None`, serializes it, and asserts the JSON contains only `method` and `id`. It returns `Result<()>`.
+**Data flow**: It builds LogoutAccount with params None, serializes it, and checks method and id only.
 
-**Call relations**: This test is another guardrail around optional-unit params and account-auth request wire shape.
+**Call relations**: The test runner calls it to protect the account logout protocol.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -544,11 +552,11 @@ fn serialize_account_logout() -> Result<()>
 fn serialize_account_login_chatgpt_auth_tokens() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the unstable/internal ChatGPT auth-token login variant, including token and account metadata fields.
+**Purpose**: This test verifies login using externally supplied ChatGPT auth tokens. That mode is marked for special host-app use, so its exact field names matter.
 
-**Data flow**: Constructs `ClientRequest::LoginAccount` with `v2::LoginAccountParams::ChatgptAuthTokens`, serializes it, and compares to expected JSON containing `accessToken`, `chatgptAccountId`, and `chatgptPlanType`. It returns `Result<()>`.
+**Data flow**: It builds LoginAccount with access token, account id, and plan type, serializes it, and compares the JSON.
 
-**Call relations**: This test covers a less common login branch and ensures the custom discriminator spelling `chatgptAuthTokens` is preserved.
+**Call relations**: The test runner calls it as part of the account authentication format suite.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -559,11 +567,11 @@ fn serialize_account_login_chatgpt_auth_tokens() -> Result<()>
 fn serialize_get_account() -> Result<()>
 ```
 
-**Purpose**: Verifies both compact and expanded serialization forms of `account/read`, depending on whether `refresh_token` is false or true.
+**Purpose**: This test verifies the account read request both with and without an explicit token refresh request. It checks that default false values are omitted while true values are sent.
 
-**Data flow**: Builds two `ClientRequest::GetAccount` values: one with `refresh_token: false` and one with `refresh_token: true`. It serializes each and asserts that the false case yields an empty params object while the true case includes `refreshToken: true`.
+**Data flow**: It builds two GetAccount requests, serializes each, and compares the JSON: one has empty params, and the other includes refreshToken.
 
-**Call relations**: This test is run by the test harness to pin down serde defaults and omission behavior inside a non-optional params struct.
+**Call relations**: The test runner calls it. It protects optional/default field behavior in account reads.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -574,11 +582,11 @@ fn serialize_get_account() -> Result<()>
 fn account_serializes_fields_in_camel_case() -> Result<()>
 ```
 
-**Purpose**: Checks that the `v2::Account` enum serializes each variant and nested field names in camelCase, including Bedrock credential source values.
+**Purpose**: This test checks that account values use camelCase field names in JSON, such as apiKey and planType. That is the style expected by TypeScript and JSON clients.
 
-**Data flow**: Constructs several `v2::Account` variants (`ApiKey`, `Chatgpt`, and two `AmazonBedrock` forms), serializes each to JSON, and asserts exact equality with expected literals. It returns `Result<()>`.
+**Data flow**: It creates several account variants, serializes each to JSON, and compares the field names and values with the expected form.
 
-**Call relations**: Although it tests a type defined elsewhere, this file includes the test because account payloads are part of the protocol surface exercised by requests and notifications declared here.
+**Call relations**: The test runner calls it. Although the account types live outside this file, this protocol test protects their wire format because this file exposes account-related messages.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -589,11 +597,11 @@ fn account_serializes_fields_in_camel_case() -> Result<()>
 fn account_defaults_legacy_bedrock_credential_source() -> Result<()>
 ```
 
-**Purpose**: Ensures deserializing a legacy Bedrock account payload without `credentialSource` defaults to `AwsManaged`.
+**Purpose**: This test verifies backward compatibility for older Amazon Bedrock account JSON that did not include a credential source. It ensures old data still reads as AWS-managed credentials.
 
-**Data flow**: Deserializes a minimal JSON object into `v2::Account`, then asserts the result equals the `AmazonBedrock` variant with `credential_source: AwsManaged`. It returns `Result<()>`.
+**Data flow**: It deserializes a JSON account object with only the type field and checks that the resulting account has the expected default credential source.
 
-**Call relations**: This test protects backward compatibility for older serialized account payloads consumed through the protocol.
+**Call relations**: The test runner calls it as a compatibility guard for account data used by the protocol.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -604,11 +612,11 @@ fn account_defaults_legacy_bedrock_credential_source() -> Result<()>
 fn serialize_list_models() -> Result<()>
 ```
 
-**Purpose**: Verifies the default wire shape of the `model/list` request, including explicit nulls for optional pagination fields.
+**Purpose**: This test verifies the model list request format. It checks that default pagination and visibility fields are represented as null.
 
-**Data flow**: Constructs `ClientRequest::ModelList` with `v2::ModelListParams::default()`, serializes it, and asserts the JSON contains `limit`, `cursor`, and `includeHidden` as null. It returns `Result<()>`.
+**Data flow**: It builds ModelList with default params, serializes it, and compares method, id, and null params fields.
 
-**Call relations**: This test validates one representative list-style request generated by `client_request_definitions!`.
+**Call relations**: The test runner calls it to protect the model discovery API shape.
 
 *Call graph*: 3 external calls (Integer, default, assert_eq!).
 
@@ -619,11 +627,11 @@ fn serialize_list_models() -> Result<()>
 fn serialize_model_provider_capabilities_read() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the `modelProvider/capabilities/read` request with an empty params object.
+**Purpose**: This test verifies the request that reads model-provider capabilities. It ensures an empty params object is still sent where the protocol expects one.
 
-**Data flow**: Builds `ClientRequest::ModelProviderCapabilitiesRead` with empty params, serializes it, and compares to the expected JSON. It returns `Result<()>`.
+**Data flow**: It builds the request, serializes it, and compares the JSON with an empty params object.
 
-**Call relations**: This test covers a simple v2 request variant and confirms empty-struct params serialize as `{}` rather than being omitted.
+**Call relations**: The test runner calls it as a focused check for the model provider capability endpoint.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -634,11 +642,11 @@ fn serialize_model_provider_capabilities_read() -> Result<()>
 fn serialize_list_collaboration_modes() -> Result<()>
 ```
 
-**Purpose**: Verifies the `collaborationMode/list` request serializes with an empty params object.
+**Purpose**: This test verifies the request that lists collaboration mode presets. It protects the experimental method’s JSON shape.
 
-**Data flow**: Constructs `ClientRequest::CollaborationModeList` from default params, serializes it, and asserts the exact JSON shape. It returns `Result<()>`.
+**Data flow**: It builds CollaborationModeList with default params, serializes it, and compares the JSON.
 
-**Call relations**: This test covers an experimental request variant's serde contract without testing experimental gating itself.
+**Call relations**: The test runner calls it to make sure the generated ClientRequest entry for collaboration modes stays stable.
 
 *Call graph*: 3 external calls (Integer, default, assert_eq!).
 
@@ -649,11 +657,11 @@ fn serialize_list_collaboration_modes() -> Result<()>
 fn serialize_list_apps() -> Result<()>
 ```
 
-**Purpose**: Checks the default serialization of the `app/list` request, including null pagination and optional thread filter fields.
+**Purpose**: This test verifies the request that lists apps. It checks default cursor, limit, and thread id fields.
 
-**Data flow**: Builds `ClientRequest::AppsList` with default params, serializes it, and asserts the JSON contains `cursor`, `limit`, and `threadId` as null. It returns `Result<()>`.
+**Data flow**: It builds AppsList with default params, serializes it, and compares the JSON containing null pagination and thread fields.
 
-**Call relations**: This test validates another list-style request variant generated by the client request macro.
+**Call relations**: The test runner calls it to protect the app listing protocol.
 
 *Call graph*: 3 external calls (Integer, default, assert_eq!).
 
@@ -664,11 +672,11 @@ fn serialize_list_apps() -> Result<()>
 fn serialize_environment_add() -> Result<()>
 ```
 
-**Purpose**: Verifies the wire format for the experimental `environment/add` request.
+**Purpose**: This test verifies the experimental request that registers or replaces a remote environment. It checks the environment id and execution server URL field names.
 
-**Data flow**: Constructs `ClientRequest::EnvironmentAdd` with an environment ID and exec server URL, serializes it, and asserts the expected camelCase JSON fields. It returns `Result<()>`.
+**Data flow**: It builds EnvironmentAdd params, wraps them in a ClientRequest, serializes the request, and compares the JSON.
 
-**Call relations**: This test covers the request's serde contract; a separate test in this module checks its experimental marker.
+**Call relations**: The test runner calls it. A separate experimental-gating test checks that the same method is marked experimental.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -679,11 +687,11 @@ fn serialize_environment_add() -> Result<()>
 fn serialize_fs_get_metadata() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the filesystem metadata request with an absolute path payload.
+**Purpose**: This test verifies the file-system metadata request format. It ensures absolute paths serialize the way clients expect.
 
-**Data flow**: Uses `absolute_path()` to build the path, constructs `ClientRequest::FsGetMetadata`, serializes it, and compares to expected JSON using `absolute_path_string()` semantics. It returns `Result<()>`.
+**Data flow**: It creates an absolute test path, builds FsGetMetadata, serializes it, and compares the path string in JSON.
 
-**Call relations**: This test validates one of the intentionally concurrent filesystem request variants declared in the client request macro.
+**Call relations**: The test runner calls it. It uses the local absolute_path and absolute_path_string helpers to compare typed and JSON path forms.
 
 *Call graph*: 3 external calls (Integer, absolute_path, assert_eq!).
 
@@ -694,11 +702,11 @@ fn serialize_fs_get_metadata() -> Result<()>
 fn serialize_fs_watch() -> Result<()>
 ```
 
-**Purpose**: Verifies the wire format for `fs/watch`, including watch ID and absolute path serialization.
+**Purpose**: This test verifies the request that starts watching a file-system path for changes. It checks both the watch id and path fields.
 
-**Data flow**: Builds `ClientRequest::FsWatch` with a watch ID and absolute path, serializes it, and asserts the exact JSON object. It returns `Result<()>`.
+**Data flow**: It builds FsWatch with a watch id and absolute path, serializes it, and compares the expected JSON.
 
-**Call relations**: This test complements the serialization-scope tests for filesystem watch requests by checking the actual serde output.
+**Call relations**: The test runner calls it as part of file-system protocol coverage. The serialization-scope tests separately verify that watch requests are grouped by watch id.
 
 *Call graph*: 3 external calls (Integer, absolute_path, assert_eq!).
 
@@ -709,11 +717,11 @@ fn serialize_fs_watch() -> Result<()>
 fn serialize_list_experimental_features() -> Result<()>
 ```
 
-**Purpose**: Checks the default serialization of `experimentalFeature/list`, including null pagination and thread filter fields.
+**Purpose**: This test verifies the request that lists experimental features with default pagination. It protects the shape of the feature discovery API.
 
-**Data flow**: Constructs `ClientRequest::ExperimentalFeatureList` with default params, serializes it, and asserts the expected JSON. It returns `Result<()>`.
+**Data flow**: It builds ExperimentalFeatureList with default params, serializes it, and compares JSON with null cursor, limit, and thread id.
 
-**Call relations**: This test validates the request's wire shape; the request itself is not marked experimental despite listing experimental features.
+**Call relations**: The test runner calls it. It checks the generated ClientRequest serialization for this configuration-related method.
 
 *Call graph*: 3 external calls (Integer, default, assert_eq!).
 
@@ -724,11 +732,11 @@ fn serialize_list_experimental_features() -> Result<()>
 fn serialize_list_experimental_features_with_thread_id() -> Result<()>
 ```
 
-**Purpose**: Verifies non-default serialization of `experimentalFeature/list` when cursor, limit, and thread ID are provided.
+**Purpose**: This test verifies experimental-feature listing when pagination and a thread id are supplied. It ensures non-default optional fields appear correctly.
 
-**Data flow**: Builds `ClientRequest::ExperimentalFeatureList` with explicit values, serializes it, and compares to the expected JSON containing those fields. It returns `Result<()>`.
+**Data flow**: It builds ExperimentalFeatureList with cursor, limit, and thread id, serializes it, and compares the JSON values.
 
-**Call relations**: This test complements the default-params case by ensuring optional fields are emitted correctly when present.
+**Call relations**: The test runner calls it alongside the default version to cover both empty and populated params.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -739,11 +747,11 @@ fn serialize_list_experimental_features_with_thread_id() -> Result<()>
 fn serialize_thread_background_terminals_clean() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the experimental request that cleans background terminals for a thread.
+**Purpose**: This test verifies the experimental request that cleans background terminals for a thread. It checks that the thread id is sent correctly.
 
-**Data flow**: Constructs `ClientRequest::ThreadBackgroundTerminalsClean` with a thread ID, serializes it, and asserts the exact JSON shape. It returns `Result<()>`.
+**Data flow**: It builds ThreadBackgroundTerminalsClean, serializes it, and compares method, id, and threadId.
 
-**Call relations**: This test validates one of the thread-scoped experimental request variants declared in the macro.
+**Call relations**: The test runner calls it to protect one of the background-terminal protocol messages.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -754,11 +762,11 @@ fn serialize_thread_background_terminals_clean() -> Result<()>
 fn serialize_thread_background_terminals_list() -> Result<()>
 ```
 
-**Purpose**: Verifies serialization of the background-terminal listing request, including null pagination fields.
+**Purpose**: This test verifies the experimental request that lists background terminals for a thread. It checks the default pagination fields.
 
-**Data flow**: Builds `ClientRequest::ThreadBackgroundTerminalsList` with thread ID and `None` cursor/limit, serializes it, and asserts the expected JSON. It returns `Result<()>`.
+**Data flow**: It builds ThreadBackgroundTerminalsList with a thread id and no cursor or limit, serializes it, and compares the JSON.
 
-**Call relations**: This test covers another thread-scoped request variant and its nested params layout.
+**Call relations**: The test runner calls it as part of the background-terminal API coverage.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -769,11 +777,11 @@ fn serialize_thread_background_terminals_list() -> Result<()>
 fn serialize_thread_background_terminals_terminate() -> Result<()>
 ```
 
-**Purpose**: Checks the wire format for terminating a background terminal by thread and process ID.
+**Purpose**: This test verifies the experimental request that terminates a background terminal. It checks both the thread id and process id fields.
 
-**Data flow**: Constructs `ClientRequest::ThreadBackgroundTerminalsTerminate`, serializes it, and compares to the expected JSON object. It returns `Result<()>`.
+**Data flow**: It builds ThreadBackgroundTerminalsTerminate, serializes it, and compares the JSON.
 
-**Call relations**: This test validates the serde contract for a thread-scoped terminal-management request.
+**Call relations**: The test runner calls it to protect the terminate message in the background-terminal family.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -784,11 +792,11 @@ fn serialize_thread_background_terminals_terminate() -> Result<()>
 fn serialize_thread_realtime_start() -> Result<()>
 ```
 
-**Purpose**: Verifies serialization of the experimental realtime conversation start request with many optional fields populated.
+**Purpose**: This test verifies the experimental request that starts a realtime thread session, including audio output settings and voice choice. Realtime here means an ongoing interactive session rather than a single text turn.
 
-**Data flow**: Builds `ClientRequest::ThreadRealtimeStart` with architecture, thread ID, model, output modality, startup-context flag, prompt, session ID, version, and voice, serializes it, and asserts the exact JSON. It returns `Result<()>`.
+**Data flow**: It builds ThreadRealtimeStart with many optional and required fields, serializes it, and compares the complete JSON object.
 
-**Call relations**: This test covers a complex experimental request variant whose params include nested enums and optional fields with nuanced omission behavior.
+**Call relations**: The test runner calls it. It protects the generated serialization for realtime startup, while other tests check its experimental gating.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -799,11 +807,11 @@ fn serialize_thread_realtime_start() -> Result<()>
 fn serialize_thread_realtime_start_prompt_default_and_null() -> Result<()>
 ```
 
-**Purpose**: Pins down the distinction between omitted prompt, explicit null prompt, and deserialization back into the corresponding `Option<Option<String>>` states for realtime start.
+**Purpose**: This test checks a subtle distinction in realtime startup: leaving prompt out versus explicitly sending prompt as null. That distinction lets clients say either “use the default” or “clear/no prompt”.
 
-**Data flow**: Constructs two `ClientRequest::ThreadRealtimeStart` values—one with `prompt: None` and one with `prompt: Some(None)`—serializes each and asserts the expected JSON difference. It then deserializes matching JSON payloads back into `ClientRequest` and asserts equality with the original values.
+**Data flow**: It builds one request with prompt absent and another with prompt explicitly null, serializes both, and compares their JSON. It also deserializes JSON examples back into the expected typed requests.
 
-**Call relations**: This test is important because the realtime-start params intentionally preserve a three-state prompt field; it validates both serialization and parsing of that subtle contract.
+**Call relations**: The test runner calls it. It uses JSON construction and equality assertions to protect both directions of this special optional-field behavior.
 
 *Call graph*: 3 external calls (Integer, assert_eq!, json!).
 
@@ -814,11 +822,11 @@ fn serialize_thread_realtime_start_prompt_default_and_null() -> Result<()>
 fn serialize_thread_realtime_append_speech() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the experimental realtime speech-append request.
+**Purpose**: This test verifies the request that appends spoken text to a realtime thread. It checks that thread id and text are sent under the expected names.
 
-**Data flow**: Builds `ClientRequest::ThreadRealtimeAppendSpeech` with thread ID and text, serializes it, and asserts the exact JSON output. It returns `Result<()>`.
+**Data flow**: It builds ThreadRealtimeAppendSpeech, serializes it, and compares the JSON.
 
-**Call relations**: This test covers another realtime request variant generated by the client request macro.
+**Call relations**: The test runner calls it as part of realtime protocol coverage.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -829,11 +837,11 @@ fn serialize_thread_realtime_append_speech() -> Result<()>
 fn serialize_thread_status_changed_notification() -> Result<()>
 ```
 
-**Purpose**: Verifies the wire format of the `thread/status/changed` server notification.
+**Purpose**: This test verifies the server notification sent when a thread changes status. Notifications are one-way messages, so clients rely on their exact method names and payload shapes.
 
-**Data flow**: Constructs `ServerNotification::ThreadStatusChanged` with a thread ID and idle status, serializes it, and compares to the expected JSON object with `method` and `params`. It returns `Result<()>`.
+**Data flow**: It builds a ThreadStatusChanged notification with an idle status, serializes it, and compares the JSON method and params.
 
-**Call relations**: This test validates notification serialization generated by `server_notification_definitions!` for a common thread lifecycle event.
+**Call relations**: The test runner calls it. It exercises the server notification enum generated by the notification macro.
 
 *Call graph*: 2 external calls (ThreadStatusChanged, assert_eq!).
 
@@ -844,11 +852,11 @@ fn serialize_thread_status_changed_notification() -> Result<()>
 fn serialize_thread_realtime_output_audio_delta_notification() -> Result<()>
 ```
 
-**Purpose**: Checks serialization of the experimental realtime audio-output delta notification, including nested audio chunk metadata.
+**Purpose**: This test verifies the realtime notification that streams an audio chunk from the server. It protects the base64 audio payload metadata fields.
 
-**Data flow**: Builds `ServerNotification::ThreadRealtimeOutputAudioDelta` with thread ID and a `ThreadRealtimeAudioChunk`, serializes it, and asserts the exact JSON shape. It returns `Result<()>`.
+**Data flow**: It builds ThreadRealtimeOutputAudioDelta with audio data, sample rate, channel count, sample count, and no item id, serializes it, and compares the JSON.
 
-**Call relations**: This test covers a complex notification variant and complements later tests that verify its experimental marker.
+**Call relations**: The test runner calls it. Later experimental-gating tests also check that this notification is marked experimental.
 
 *Call graph*: 2 external calls (ThreadRealtimeOutputAudioDelta, assert_eq!).
 
@@ -859,11 +867,11 @@ fn serialize_thread_realtime_output_audio_delta_notification() -> Result<()>
 fn mock_experimental_method_is_marked_experimental()
 ```
 
-**Purpose**: Ensures the mock experimental client request reports the expected experimental reason string.
+**Purpose**: This test verifies that a test-only mock method is reported as experimental. It exists to prove the experimental-gating machinery works.
 
-**Data flow**: Constructs `ClientRequest::MockExperimentalMethod` with a default params value, calls `ExperimentalApi::experimental_reason(&request)`, and asserts the returned `Option<&'static str>` is `Some("mock/experimentalMethod")`.
+**Data flow**: It builds MockExperimentalMethod, asks the ExperimentalApi trait for its experimental reason, and compares that reason with the expected method name.
 
-**Call relations**: This test directly validates the `ExperimentalApi` implementation generated for `ClientRequest` by `client_request_definitions!` when a variant carries an explicit `#[experimental(...)]` annotation.
+**Call relations**: The test runner calls it. It directly exercises the generated ExperimentalApi implementation for ClientRequest.
 
 *Call graph*: 4 external calls (experimental_reason, Integer, default, assert_eq!).
 
@@ -874,11 +882,11 @@ fn mock_experimental_method_is_marked_experimental()
 fn environment_add_is_marked_experimental()
 ```
 
-**Purpose**: Checks that the `environment/add` request is surfaced as experimental with its method string as the reason.
+**Purpose**: This test verifies that the environment/add request is marked experimental. That prevents callers from using it unless experimental APIs are allowed.
 
-**Data flow**: Builds `ClientRequest::EnvironmentAdd`, invokes `ExperimentalApi::experimental_reason`, and asserts the result is `Some("environment/add")`. No state is mutated.
+**Data flow**: It builds EnvironmentAdd, asks for its experimental reason, and checks that the reason is environment/add.
 
-**Call relations**: This test confirms explicit experimental tagging on a concrete request variant generated by the macro.
+**Call relations**: The test runner calls it. It uses the same generated experimental metadata that runtime gating code would consult.
 
 *Call graph*: 3 external calls (experimental_reason, Integer, assert_eq!).
 
@@ -889,11 +897,11 @@ fn environment_add_is_marked_experimental()
 fn command_exec_permission_profile_is_marked_experimental()
 ```
 
-**Purpose**: Verifies field-level experimental gating for `command/exec` when the optional `permission_profile` param is present.
+**Purpose**: This test verifies field-level experimental gating: command/exec itself can be stable, while using its permissionProfile field is experimental. This is more precise than marking the whole method experimental.
 
-**Data flow**: Constructs `ClientRequest::OneOffCommandExec` with `permission_profile: Some(...)`, calls `ExperimentalApi::experimental_reason` on the request, and asserts the result is `Some("command/exec.permissionProfile")`.
+**Data flow**: It builds OneOffCommandExec with a permission profile set, asks for the experimental reason, and checks that the reason points to command/exec.permissionProfile.
 
-**Call relations**: Unlike explicit variant-level tags, this test exercises the `inspect_params: true` path in the generated `ClientRequest` experimental implementation, where the params type itself determines whether the request is experimental.
+**Call relations**: The test runner calls it. It exercises the inspect_params path, where the request asks its params type whether any field is experimental.
 
 *Call graph*: 4 external calls (experimental_reason, Integer, assert_eq!, vec!).
 
@@ -904,11 +912,11 @@ fn command_exec_permission_profile_is_marked_experimental()
 fn thread_realtime_start_is_marked_experimental()
 ```
 
-**Purpose**: Ensures the realtime-start request reports its explicit experimental reason.
+**Purpose**: This test verifies that starting realtime mode is marked experimental. It helps keep unfinished or unstable realtime APIs behind the experimental gate.
 
-**Data flow**: Builds `ClientRequest::ThreadRealtimeStart` with representative params, calls `ExperimentalApi::experimental_reason`, and asserts the returned reason is `Some("thread/realtime/start")`.
+**Data flow**: It builds ThreadRealtimeStart, asks for its experimental reason, and compares it with thread/realtime/start.
 
-**Call relations**: This test validates explicit experimental tagging on one of the realtime request variants.
+**Call relations**: The test runner calls it. It checks the generated ClientRequest experimental metadata for a method-level experimental flag.
 
 *Call graph*: 3 external calls (experimental_reason, Integer, assert_eq!).
 
@@ -919,11 +927,11 @@ fn thread_realtime_start_is_marked_experimental()
 fn thread_goal_methods_are_not_marked_experimental()
 ```
 
-**Purpose**: Confirms that the thread goal set/get/clear request family is considered stable and returns no experimental reason.
+**Purpose**: This test verifies that thread goal set, get, and clear requests are considered stable. It protects them from accidentally being hidden behind experimental gating.
 
-**Data flow**: Constructs `ClientRequest::ThreadGoalSet`, `ThreadGoalGet`, and `ThreadGoalClear`, calls `ExperimentalApi::experimental_reason` on each, and asserts all results are `None`.
+**Data flow**: It builds three thread-goal ClientRequest values, asks each for its experimental reason, and asserts that each returns None.
 
-**Call relations**: This test guards against accidental experimental tagging of stable goal-management methods in the generated `ClientRequest` implementation.
+**Call relations**: The test runner calls it. It uses the generated ExperimentalApi implementation as runtime gating code would.
 
 *Call graph*: 2 external calls (Integer, assert_eq!).
 
@@ -934,11 +942,11 @@ fn thread_goal_methods_are_not_marked_experimental()
 fn thread_goal_notifications_are_not_marked_experimental()
 ```
 
-**Purpose**: Checks that thread goal update and clear notifications are also treated as stable by the derived `ExperimentalApi` implementation on `ServerNotification`.
+**Purpose**: This test verifies that thread goal update and clear notifications are not experimental. It protects stable notification delivery for goal-related UI.
 
-**Data flow**: Builds a `v2::ThreadGoal`, wraps it in `ServerNotification::ThreadGoalUpdated`, also constructs `ServerNotification::ThreadGoalCleared`, calls `ExperimentalApi::experimental_reason` on both, and asserts both are `None`.
+**Data flow**: It builds goal updated and goal cleared notifications, asks each for an experimental reason, and asserts that no reason is returned.
 
-**Call relations**: This test validates the derive-based experimental metadata on notifications, ensuring only explicitly annotated notification variants are gated.
+**Call relations**: The test runner calls it. It exercises the generated ExperimentalApi implementation for ServerNotification.
 
 *Call graph*: 3 external calls (ThreadGoalCleared, ThreadGoalUpdated, assert_eq!).
 
@@ -949,11 +957,11 @@ fn thread_goal_notifications_are_not_marked_experimental()
 fn thread_settings_updated_notification_is_marked_experimental()
 ```
 
-**Purpose**: Ensures the `thread/settings/updated` notification carries its experimental reason string.
+**Purpose**: This test verifies that the thread settings updated notification is marked experimental. That matters because clients may need to opt in before receiving or depending on it.
 
-**Data flow**: Constructs a detailed `ServerNotification::ThreadSettingsUpdated` with nested `ThreadSettings`, including an absolute cwd path and collaboration mode settings, then calls `ExperimentalApi::experimental_reason` and asserts it returns `Some("thread/settings/updated")`.
+**Data flow**: It builds a ThreadSettingsUpdated notification with representative settings, asks for its experimental reason, and checks the expected reason string.
 
-**Call relations**: This test covers explicit experimental tagging on a notification variant generated by `server_notification_definitions!` and derived `ExperimentalApi`.
+**Call relations**: The test runner calls it. It uses the absolute_path helper and the generated notification experimental metadata.
 
 *Call graph*: 3 external calls (ThreadSettingsUpdated, absolute_path, assert_eq!).
 
@@ -964,11 +972,11 @@ fn thread_settings_updated_notification_is_marked_experimental()
 fn turn_moderation_metadata_notification_is_marked_experimental()
 ```
 
-**Purpose**: Checks that the moderation metadata notification is marked experimental.
+**Purpose**: This test verifies that moderation metadata notifications for turns are experimental. Moderation metadata is extra structured information, so the gate can protect clients from unstable shape changes.
 
-**Data flow**: Builds `ServerNotification::TurnModerationMetadata` with thread ID, turn ID, and arbitrary JSON metadata, calls `ExperimentalApi::experimental_reason`, and asserts the expected reason string is returned.
+**Data flow**: It builds a TurnModerationMetadata notification with JSON metadata, asks for its experimental reason, and compares it with the expected method name.
 
-**Call relations**: This test validates another explicitly annotated notification variant in the generated notification enum.
+**Call relations**: The test runner calls it. It checks the ExperimentalApi implementation generated for server notifications.
 
 *Call graph*: 3 external calls (TurnModerationMetadata, assert_eq!, json!).
 
@@ -979,11 +987,11 @@ fn turn_moderation_metadata_notification_is_marked_experimental()
 fn thread_realtime_started_notification_is_marked_experimental()
 ```
 
-**Purpose**: Verifies that the realtime-started notification reports its experimental reason.
+**Purpose**: This test verifies that the notification announcing realtime startup is experimental. It keeps realtime notification support behind opt-in behavior.
 
-**Data flow**: Constructs `ServerNotification::ThreadRealtimeStarted`, invokes `ExperimentalApi::experimental_reason`, and asserts the result is `Some("thread/realtime/started")`.
+**Data flow**: It builds ThreadRealtimeStarted, asks for the experimental reason, and asserts that the reason is thread/realtime/started.
 
-**Call relations**: This test is part of the realtime notification gating coverage for the derived `ExperimentalApi` implementation.
+**Call relations**: The test runner calls it. It uses the generated ServerNotification experimental metadata.
 
 *Call graph*: 3 external calls (ThreadRealtimeStarted, experimental_reason, assert_eq!).
 
@@ -994,11 +1002,11 @@ fn thread_realtime_started_notification_is_marked_experimental()
 fn thread_realtime_output_audio_delta_notification_is_marked_experimental()
 ```
 
-**Purpose**: Ensures the realtime output-audio delta notification is marked experimental in metadata as well as serializable on the wire.
+**Purpose**: This test verifies that realtime audio output delta notifications are marked experimental. It protects clients that do not yet support streaming audio notifications.
 
-**Data flow**: Builds `ServerNotification::ThreadRealtimeOutputAudioDelta` with a nested audio chunk, calls `ExperimentalApi::experimental_reason`, and asserts the expected reason string.
+**Data flow**: It builds a ThreadRealtimeOutputAudioDelta notification, asks for its experimental reason, and compares it with the expected method name.
 
-**Call relations**: This test complements the earlier serialization test for the same notification variant by checking experimental gating metadata.
+**Call relations**: The test runner calls it. It complements the serialization test for the same notification by checking access gating.
 
 *Call graph*: 3 external calls (ThreadRealtimeOutputAudioDelta, experimental_reason, assert_eq!).
 
@@ -1009,22 +1017,24 @@ fn thread_realtime_output_audio_delta_notification_is_marked_experimental()
 fn command_execution_request_approval_additional_permissions_is_marked_experimental()
 ```
 
-**Purpose**: Verifies field-level experimental gating on the server-request approval params type when `additional_permissions` is present.
+**Purpose**: This test verifies field-level experimental gating for additional permissions inside command approval params. It ensures this extra permission request feature is detected even though the surrounding approval request is otherwise normal.
 
-**Data flow**: Constructs `v2::CommandExecutionRequestApprovalParams` with nested additional filesystem permissions and other approval metadata, calls `ExperimentalApi::experimental_reason(&params)` directly on the params object, and asserts the result is `Some("item/commandExecution/requestApproval.additionalPermissions")`.
+**Data flow**: It builds CommandExecutionRequestApprovalParams with additional file-system permissions, asks the params value for its experimental reason, and checks that the reason names the additionalPermissions field.
 
-**Call relations**: This test targets param-type experimental inspection rather than a top-level request enum, validating the field-sensitive `ExperimentalApi` implementation used by request/notification gating elsewhere in the protocol.
+**Call relations**: The test runner calls it. It directly exercises the ExperimentalApi implementation for the params type, which request-level gating can also consult.
 
 *Call graph*: 3 external calls (experimental_reason, assert_eq!, vec!).
 
 
 ### `app-server-protocol/src/protocol/mappers.rs`
 
-`domain_logic` · `request translation`
+`io_transport` · `request handling`
 
-This file contains a single `From` implementation that maps `v1::ExecOneOffCommandParams` into `v2::CommandExecParams`. Its role is narrowly focused but important: it codifies the exact compatibility contract between the older request schema and the richer v2 execution model. The conversion moves shared fields directly (`command`, `cwd`) and translates optional timeout data from the v1 numeric type into the v2 `i64` representation using `i64::try_from`. If that conversion fails, it does not propagate an error; instead it substitutes a hardcoded fallback of `60_000`, making timeout conversion intentionally lossy but predictable.
+This file is a small compatibility bridge between two versions of the app server protocol. A protocol is the agreed shape of messages sent between parts of the system. Over time, the newer version gained more options for running a command, such as whether to stream input or output, whether to attach a terminal, and whether to disable limits. Older requests do not know about those options.
 
-All v2 fields that have no v1 equivalent are initialized to conservative defaults: no `process_id`, no TTY, no stdin/stdout streaming, no output cap override, no timeout disablement, no environment override, no terminal size, and no permission profile. `sandbox_policy` is the only nontrivial nested mapping, converted only when present via `Into::into`, implying a separate policy mapper elsewhere. The implementation is purely functional and stateless: it consumes the v1 value and constructs a fresh v2 struct in one expression. The main invariant is that every v2 field is explicitly populated, so callers never receive a partially initialized command request during version bridging.
+The file teaches Rust how to turn a v1::ExecOneOffCommandParams value into a v2::CommandExecParams value. Think of it like filling out a newer, longer form using information from an older, shorter form. Fields that existed in the old form, such as the command, working directory, timeout, and sandbox policy, are copied across. Fields that only exist in the new form are filled with safe defaults, such as no process id, no terminal, no streaming, no custom environment, and no disabled timeout.
+
+One important detail is the timeout conversion. The old timeout value is converted into the signed number type used by the newer protocol. If that conversion somehow fails, it falls back to 60,000 milliseconds, which is one minute. Without this mapper, older clients or stored requests would need special handling elsewhere, or they could fail when the server expects the newer command parameter format.
 
 #### Function details
 
@@ -1034,22 +1044,22 @@ All v2 fields that have no v1 equivalent are initialized to conservative default
 fn from(value: v1::ExecOneOffCommandParams) -> Self
 ```
 
-**Purpose**: Builds a `v2::CommandExecParams` from a consumed `v1::ExecOneOffCommandParams`, preserving the fields both versions share and filling every newer v2 field with explicit compatibility defaults. It also converts the optional timeout into `i64`, falling back to `60_000` if the source value cannot be represented.
+**Purpose**: This function builds a version 2 command-execution request from a version 1 one. It preserves the information the old request can provide and supplies sensible default values for newer options that did not exist before.
 
-**Data flow**: Input is a by-value `v1::ExecOneOffCommandParams`. It reads `command`, `timeout_ms`, `cwd`, and `sandbox_policy`; moves `command` and `cwd` directly into the result; maps `timeout_ms` through `i64::try_from(...).unwrap_or(60_000)` when present; maps `sandbox_policy` with `Into::into` when present; and writes fixed literals or `None` into all remaining v2-only fields (`process_id`, `tty`, streaming flags, output cap controls, `disable_timeout`, `env`, `size`, `permission_profile`). It returns a fully populated `v2::CommandExecParams` and mutates no external state.
+**Data flow**: It receives a v1::ExecOneOffCommandParams value containing the command to run and optional settings like timeout, working directory, and sandbox policy. It copies or converts those known fields into a new v2::CommandExecParams value, while setting newer fields such as terminal mode, streaming, environment, size, and permission profile to default empty or false values. The result is a complete version 2 command request ready for the newer protocol code to use.
 
-**Call relations**: This conversion is invoked wherever code needs to pass a legacy v1 one-off command request into logic standardized on the v2 command execution type. Within that flow it serves as the version-bridge step before downstream execution or validation code consumes `v2::CommandExecParams`; its only delegated work is the nested `sandbox_policy` conversion and the standard-library integer conversion used for `timeout_ms`.
+**Call relations**: This conversion is used whenever Rust's standard From conversion is requested between the old command parameter type and the new one. In the larger flow, code that receives or upgrades a version 1 command request can call on this function implicitly or explicitly, then pass the resulting v2::CommandExecParams onward to the newer command execution path.
 
 
 ### `app-server-protocol/src/protocol/v1.rs`
 
-`data_model` · `request/response schema definition across startup, auth, conversation handling, approvals, and config persistence`
+`data_model` · `API boundary during startup and request handling`
 
-This file is a dense schema catalog for the v1 protocol. It consists entirely of serde-serializable request and response structs and enums, each annotated for JSON Schema generation (`schemars::JsonSchema`) and TypeScript export (`ts_rs::TS`). The types bridge the app-server API to shared protocol primitives from `codex_protocol`, such as `ThreadId`, `ReviewDecision`, `SandboxPolicy`, `SessionSource`, `TurnAbortReason`, `ParsedCommand`, and model/config enums like `ReasoningEffort`, `ReasoningSummary`, `Verbosity`, `SandboxMode`, and `ForcedLoginMethod`.
+This file is like a set of blank forms for the app-server protocol. It does not run the server or make decisions by itself. Instead, it defines the exact fields that can travel between a client, such as an editor or UI, and the app server. Without these definitions, both sides could disagree about what a message looks like, which would make requests fail or be misunderstood.
 
-The file covers several distinct API areas. Initialization uses `InitializeParams`, `ClientInfo`, `InitializeCapabilities`, and `InitializeResponse`, including negotiated capability flags like `experimental_api`, `request_attestation`, and notification suppression via `opt_out_notification_methods`. Conversation lookup is modeled by the untagged `GetConversationSummaryParams`, which accepts either a rollout path or a `conversationId`, and returns a `ConversationSummary` with filesystem location, preview text, timestamps, model provider, cwd, CLI version, source, and optional git metadata. Approval flows are represented separately for patch application and command execution, each carrying a `conversation_id`, correlation `call_id`, and a `ReviewDecision` response. Configuration persistence is captured by `UserSavedConfig`, `SandboxSettings`, and `Tools`, where most fields are optional to support partial user overrides rather than a fully materialized config.
+Most types here are small data containers. For example, `InitializeParams` tells the server who the client is and what features it supports, while `InitializeResponse` tells the client where the server is running and where its Codex home directory is. Conversation-related types describe saved conversations, including preview text, timestamps, working directory, source, and optional Git information. Approval types describe moments when the agent needs the user to allow a patch or shell command before continuing.
 
-Several design choices matter for consumers: many fields are optional and omitted when absent, camelCase is used almost everywhere except `ConversationGitInfo`’s snake_case payload, and `SandboxSettings.writable_roots` defaults to an empty vector to avoid null handling. `AbsolutePathBuf` is used where the protocol requires canonical absolute paths, while plain `PathBuf` is used for more general path references. The file therefore acts as the compatibility contract for older clients and servers, not as executable logic.
+The file also defines request and response shapes for login, authentication status, Git diffs, one-off command execution, saved user configuration, sandbox settings, and interruption results. Many structs derive serialization traits, meaning they can be turned into JSON and read back again. They also derive JSON Schema and TypeScript bindings, so other languages and tools can use the same contract. In short, this file is the protocol dictionary for version 1 of the app server API.
 
 
 ### V2 shared core and conversation model
@@ -1057,20 +1067,26 @@ This group introduces the v2 namespace, its shared enums and generic notificatio
 
 ### `app-server-protocol/src/protocol/v2/mod.rs`
 
-`orchestration` · `cross-cutting`
+`data_model` · `cross-cutting`
 
-This module is the aggregation point for the entire v2 app-server protocol. It declares all protocol-area submodules—such as account, config, process, review, notification, realtime, thread, and windows_sandbox—and then publicly re-exports their contents so downstream code can import protocol v2 types from a single place instead of addressing each leaf module individually. The file itself contains no executable logic; its significance is structural. It establishes the canonical composition of the v2 schema, including shared definitions via `shared` and feature-specific request/response/notification types in the other modules. Because every listed module is re-exported with `pub use ...::*`, this file effectively defines the public boundary of the versioned protocol crate for consumers, schema generation, and TypeScript export discovery. The `#[cfg(test)] mod tests;` declaration also makes room for protocol-level validation tests without exposing them in production builds. A reader should treat this file as the index of what belongs to protocol v2 and as the place where version membership is made explicit.
+This file does not define message formats itself. Instead, it acts like the table of contents and reception desk for the protocol’s second version. The protocol is the shared language used by different parts of the system to talk to each other, such as account actions, file-system events, notifications, plugins, remote control, threads, turns, and more.
+
+Each `mod` line tells Rust that there is a separate source file or folder for one topic area. For example, account-related protocol pieces live in the account module, file-system pieces live in the fs module, and real-time communication pieces live in the realtime module. Keeping these areas separate prevents one huge, hard-to-read file.
+
+Each `pub use` line then makes the public items from those topic modules available through this single `protocol::v2` namespace. In everyday terms, callers do not need to know which drawer a form is stored in; they can come to this front desk and ask for it by name.
+
+The `shared` module is included too, which likely contains common pieces reused by several protocol areas. The test module is only compiled when running tests. Without this file, other code would have to import protocol pieces from many scattered module paths, and the project would lose a clear public boundary for version 2 of the protocol.
 
 
 ### `app-server-protocol/src/protocol/v2/shared.rs`
 
-`util` · `cross-cutting protocol conversion and schema generation`
+`data_model` · `cross-cutting API request and response translation`
 
-This file centralizes reusable protocol types that appear across many v2 endpoints. It starts with the `v2_enum_from_core!` macro, which generates API enums mirroring core enums while changing serde/TS casing and adding both `to_core` and `From<core>` conversions. The file then defines concrete shared types: `NonSteerableTurnKind`, `CodexErrorInfo`, `AskForApproval`, `ApprovalsReviewer`, and `SandboxMode`.
+This file is a small bridge between two worlds: the outside API and the server’s internal code. Clients need stable, friendly names such as camelCase or kebab-case in JSON, while the core Codex code has its own Rust types and naming. Without this layer, API clients could receive confusing or unstable values, and the server would have to expose its internal type shapes directly.
 
-`CodexErrorInfo` is a carefully curated translation layer over upstream/core error variants. It preserves structured HTTP status metadata on selected variants and rewrites nested `turn_kind` into the v2 enum. `AskForApproval` is more involved: its `Granular` variant expands into booleans that are packed into or unpacked from `CoreGranularApprovalConfig`, with `skill_approval` and `request_permissions` defaulting to `false` on deserialization. `ApprovalsReviewer` is notable because it accepts both `"auto_review"` and legacy `"guardian_subagent"`; instead of deriving `JsonSchema`, it hand-builds a string enum schema with a descriptive compatibility note. `SandboxMode` is a straightforward kebab-case enum bridge.
+The file mostly defines enums, which are lists of allowed choices. For example, it describes what kind of approval policy is active, who reviews approval requests, what sandbox mode limits file or system access, and what kind of error happened. It also defines conversions in both directions: from API v2 types into core types when a request comes in, and from core types back into API v2 types when sending a response.
 
-The helper `default_enabled()` returns `true` for use by other modules’ serde defaults. Overall, this file’s design goal is stable external wire compatibility even when core enums use different casing, legacy aliases, or richer internal representations.
+One important detail is that some API values are intentionally renamed for compatibility and clarity. For example, approval reviewers accept both the current value `auto_review` and the older `guardian_subagent`. The file also builds a custom JSON schema, which is a machine-readable description of valid API values, so tools and generated TypeScript definitions can understand the contract.
 
 #### Function details
 
@@ -1080,11 +1096,11 @@ The helper `default_enabled()` returns `true` for use by other modules’ serde 
 fn default_enabled() -> bool
 ```
 
-**Purpose**: Supplies a const default boolean value of `true` for serde defaults in other protocol types. It exists as a reusable named function because serde attributes require a function path.
+**Purpose**: Returns `true` as a default value for settings that should be switched on unless the caller says otherwise. It is a tiny helper used when a missing field should mean “enabled.”
 
-**Data flow**: Takes no input, reads no state, and returns the literal boolean `true`.
+**Data flow**: Nothing goes in. The function always produces the boolean value `true`, and it does not read or change anything else.
 
-**Call relations**: Referenced from serde default annotations elsewhere in the protocol module tree. It is not part of runtime control flow so much as compile-time wiring for deserialization defaults.
+**Call relations**: This is a reusable default function for shared API types. It sits alongside the data definitions so serialization or configuration code can refer to one clear default instead of repeating the literal value.
 
 
 ##### `CodexErrorInfo::from`  (lines 115–145)
@@ -1093,11 +1109,11 @@ fn default_enabled() -> bool
 fn from(value: CoreCodexErrorInfo) -> Self
 ```
 
-**Purpose**: Translates core codex error variants into the v2 API error enum, preserving structured metadata where present. It also converts nested non-steerable turn kinds into the API enum.
+**Purpose**: Converts an internal Codex error description into the public API v2 error description. This keeps API clients seeing the v2 names and shapes, even when the server stores the error internally in a core type.
 
-**Data flow**: Consumes `CoreCodexErrorInfo`, matches each variant, and returns the corresponding `CodexErrorInfo`. For HTTP-related variants it copies `http_status_code`; for `ActiveTurnNotSteerable` it converts `turn_kind` via `NonSteerableTurnKind::from`; all simple variants map one-to-one.
+**Data flow**: It receives a core error value. It checks which error case it is, copies over any extra information such as an optional HTTP status code, converts nested turn-kind information when needed, and returns the matching API v2 error value.
 
-**Call relations**: Used whenever backend/core failures are surfaced through v2 responses or notifications. In the nested active-turn case it delegates to `NonSteerableTurnKind::from` so the entire error payload is converted consistently.
+**Call relations**: This function is used when an error produced inside the core system needs to be sent out through the v2 protocol. For the `ActiveTurnNotSteerable` case, it hands the nested turn kind to `NonSteerableTurnKind::from` so that nested value is translated too.
 
 
 ##### `NonSteerableTurnKind::from`  (lines 149–154)
@@ -1106,11 +1122,11 @@ fn from(value: CoreCodexErrorInfo) -> Self
 fn from(value: CoreNonSteerableTurnKind) -> Self
 ```
 
-**Purpose**: Maps the core non-steerable turn kind enum into the v2 enum. It preserves whether the active turn is blocked because of review or compact mode.
+**Purpose**: Converts the internal description of a turn that cannot be steered into the API v2 version. A “non-steerable” turn is a kind of active operation, such as review or compaction, that cannot accept more user direction mid-turn.
 
-**Data flow**: Accepts `CoreNonSteerableTurnKind`, matches `Review` or `Compact`, and returns the corresponding `NonSteerableTurnKind` variant.
+**Data flow**: It receives a core turn-kind value. It matches `Review` to `Review` and `Compact` to `Compact`, then returns the API-facing version.
 
-**Call relations**: Called from `CodexErrorInfo::from` when converting `ActiveTurnNotSteerable` errors. It is a small nested adapter in the broader error translation path.
+**Call relations**: This conversion is part of error translation. When `CodexErrorInfo::from` sees that an active turn cannot be steered, it uses this helper to translate the turn kind included in that error.
 
 
 ##### `AskForApproval::to_core`  (lines 182–202)
@@ -1119,11 +1135,11 @@ fn from(value: CoreNonSteerableTurnKind) -> Self
 fn to_core(self) -> CoreAskForApproval
 ```
 
-**Purpose**: Converts the API-facing approval policy into the core protocol representation used by backend logic. The granular variant is packed into `CoreGranularApprovalConfig`.
+**Purpose**: Turns an API v2 approval policy into the internal approval policy the core server understands. This is used when a client or UI chooses when Codex should ask before doing something risky.
 
-**Data flow**: Consumes `self` and matches each variant. Simple variants map directly to `CoreAskForApproval`; `Granular` extracts its five booleans and constructs `CoreAskForApproval::Granular(CoreGranularApprovalConfig { ... })`; the resulting core enum is returned.
+**Data flow**: It receives an API approval setting such as `on-request`, `never`, or the detailed `granular` form. It maps simple choices directly, and for the granular choice it gathers the individual permission flags into the core granular approval configuration. It returns the core approval policy.
 
-**Call relations**: Invoked by configuration and request-building flows when user-supplied v2 approval settings must be applied to runtime/core config. It delegates only in the sense of constructing the core granular config payload for the backend.
+**Call relations**: This function is called when user-facing approval choices need to affect the real runtime configuration, such as while setting an approval policy, applying a built-in permission mode, or updating configuration. For granular approval, it constructs the core granular configuration object before handing it onward.
 
 *Call graph*: called by 3 (try_set_approval_policy_on_config, builtin_permission_mode_selection_item, set_approval_policy); 1 external calls (Granular).
 
@@ -1134,11 +1150,11 @@ fn to_core(self) -> CoreAskForApproval
 fn from(value: CoreAskForApproval) -> Self
 ```
 
-**Purpose**: Converts a core approval policy into the v2 API enum, unpacking granular configuration into explicit booleans. This keeps the wire format readable and stable for clients.
+**Purpose**: Turns the internal approval policy back into the API v2 form. This lets the server report the current approval behavior to clients using the public protocol’s names and fields.
 
-**Data flow**: Consumes `CoreAskForApproval`, matches each variant, and returns the corresponding `AskForApproval`. For `CoreAskForApproval::Granular`, it reads the embedded `granular_config` fields and expands them into the named booleans of `AskForApproval::Granular`.
+**Data flow**: It receives a core approval policy. It maps simple policies directly, and if the policy is granular it pulls out each detailed flag, such as sandbox approval and request permissions, and returns the matching API v2 `Granular` value.
 
-**Call relations**: Used broadly when effective config or thread state is exposed back to clients, including config reads, session synchronization, event handling, and request/response assembly. It is the reverse half of the approval-policy boundary conversion.
+**Call relations**: This function is used in many places that need to show or synchronize current approval settings, including event handling, feature flag updates, session state reporting, and permission-related UI flows. It is the outward-facing half of the approval-policy translation pair.
 
 *Call graph*: called by 16 (ask_for_approval_granular_round_trips_request_permissions_flag, sync_auto_review_runtime_state_from_effective_config, update_feature_flags, handle_event, session_state_for_thread_read, sync_active_thread_permission_settings_to_cached_session, submit_user_message_with_history_and_shell_escape_policy, open_full_access_confirmation, open_permissions_popup, preset_matches_current (+6 more)).
 
@@ -1149,11 +1165,11 @@ fn from(value: CoreAskForApproval) -> Self
 fn schema_name() -> String
 ```
 
-**Purpose**: Provides the explicit schema name for the custom `JsonSchema` implementation of `ApprovalsReviewer`. This keeps generated schema output stable and readable.
+**Purpose**: Provides the name used for this type in generated JSON schema. JSON schema is a machine-readable description of what values are valid in JSON.
 
-**Data flow**: Takes no input and returns the fixed string `"ApprovalsReviewer"`.
+**Data flow**: Nothing meaningful goes in. It returns the fixed schema name `ApprovalsReviewer` and does not change any state.
 
-**Call relations**: Called by schemars during schema generation for this enum. It pairs with `ApprovalsReviewer::json_schema` to replace the derive-generated schema with a custom one.
+**Call relations**: Schema generation code calls this as part of documenting the API type. It pairs with `ApprovalsReviewer::json_schema`, which describes the allowed string values.
 
 
 ##### `ApprovalsReviewer::json_schema`  (lines 245–250)
@@ -1162,11 +1178,11 @@ fn schema_name() -> String
 fn json_schema(_generator: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Builds a custom JSON Schema for `ApprovalsReviewer` that documents both canonical and legacy accepted string values. It ensures schema consumers see compatibility details that serde aliases alone would hide.
+**Purpose**: Builds the JSON schema for the approval reviewer setting. It tells tools that this setting is a string and lists the accepted values, including the older compatibility name.
 
-**Data flow**: Ignores the provided `SchemaGenerator`, calls `string_enum_schema_with_description` with the accepted values `user`, `auto_review`, and `guardian_subagent` plus a long description, and returns the resulting `Schema`.
+**Data flow**: It receives a schema generator argument, but does not need to use it. It passes the accepted string values and a human-readable explanation to `string_enum_schema_with_description`, then returns the schema that helper builds.
 
-**Call relations**: Invoked by schemars when exporting protocol schema. It delegates schema object construction to `string_enum_schema_with_description` so the enum-specific method stays declarative.
+**Call relations**: This function is called by schema generation for the public API. It delegates the low-level schema-building work to `string_enum_schema_with_description` so the reviewer-specific function can stay focused on the allowed reviewer values and their meaning.
 
 *Call graph*: calls 1 internal fn (string_enum_schema_with_description).
 
@@ -1177,11 +1193,11 @@ fn json_schema(_generator: &mut SchemaGenerator) -> Schema
 fn string_enum_schema_with_description(values: &[&str], description: &str) -> Schema
 ```
 
-**Purpose**: Constructs a string-enum JSON Schema object with an attached description. It is a reusable helper for custom schema generation.
+**Purpose**: Creates a JSON schema for a string field that can only be one of a fixed set of values, with explanatory text attached. It is a small helper for making API documentation accurate and readable.
 
-**Data flow**: Accepts a slice of allowed string values and a description string, creates a `SchemaObject` with `instance_type` set to string and `metadata.description` populated, fills `enum_values` with `JsonValue::String` entries for each allowed value, wraps it in `Schema::Object`, and returns it.
+**Data flow**: It receives a list of allowed strings and a description. It builds a schema object marked as a string, adds the description as metadata, converts each allowed string into a JSON value, stores them as the enum choices, and returns the finished schema.
 
-**Call relations**: Called by `ApprovalsReviewer::json_schema` to avoid duplicating low-level schemars object assembly. It is a local helper for custom schema authoring rather than runtime protocol logic.
+**Call relations**: This helper is called by `ApprovalsReviewer::json_schema`. It does the mechanical schema construction so the caller only has to supply the meaning and the list of accepted values.
 
 *Call graph*: called by 1 (json_schema); 3 external calls (new, default, Object).
 
@@ -1192,11 +1208,11 @@ fn string_enum_schema_with_description(values: &[&str], description: &str) -> Sc
 fn to_core(self) -> CoreApprovalsReviewer
 ```
 
-**Purpose**: Converts the API reviewer-routing enum into the core config enum. It collapses the API’s accepted values into the backend’s canonical reviewer choices.
+**Purpose**: Converts the API v2 reviewer choice into the internal reviewer choice. This decides whether approval requests go to the user or to the automated review path inside the core system.
 
-**Data flow**: Consumes `self`, matches `User` or `AutoReview`, and returns `CoreApprovalsReviewer::User` or `CoreApprovalsReviewer::AutoReview` respectively.
+**Data flow**: It receives an API reviewer value. `User` becomes the core `User` value, and `AutoReview` becomes the core `AutoReview` value. It returns that core value without changing anything else.
 
-**Call relations**: Used when applying v2 configuration or request overrides to backend runtime settings. It is the outbound half of the reviewer-routing conversion boundary.
+**Call relations**: This is used when API or configuration input needs to be applied to the core system. It is the inward conversion for the approval reviewer setting.
 
 
 ##### `ApprovalsReviewer::from`  (lines 281–286)
@@ -1205,11 +1221,11 @@ fn to_core(self) -> CoreApprovalsReviewer
 fn from(value: CoreApprovalsReviewer) -> Self
 ```
 
-**Purpose**: Converts the core reviewer-routing enum into the v2 API enum. It exposes the backend’s effective reviewer choice to clients.
+**Purpose**: Converts the internal reviewer choice into the API v2 reviewer choice. This lets the server expose the current reviewer setting without leaking internal type names.
 
-**Data flow**: Accepts `CoreApprovalsReviewer`, matches `User` or `AutoReview`, and returns the corresponding `ApprovalsReviewer` variant.
+**Data flow**: It receives a core reviewer value. It maps `User` to the API `User` variant and `AutoReview` to the API `AutoReview` variant, then returns the API value.
 
-**Call relations**: Used when serializing effective config or thread/session state back to clients. It complements `to_core` for round-tripping reviewer settings.
+**Call relations**: This is the outward conversion for reviewer settings. It complements `ApprovalsReviewer::to_core`, so the same concept can move safely in both directions between API and core code.
 
 
 ##### `SandboxMode::to_core`  (lines 299–305)
@@ -1218,11 +1234,11 @@ fn from(value: CoreApprovalsReviewer) -> Self
 fn to_core(self) -> CoreSandboxMode
 ```
 
-**Purpose**: Maps the v2 sandbox mode enum into the core config enum used by backend execution policy logic. The conversion is direct and exhaustive.
+**Purpose**: Converts the API v2 sandbox mode into the internal sandbox mode. Sandbox mode describes how much access Codex has to files and the wider system, from read-only to full access.
 
-**Data flow**: Consumes `self`, matches `ReadOnly`, `WorkspaceWrite`, or `DangerFullAccess`, and returns the corresponding `CoreSandboxMode` variant.
+**Data flow**: It receives an API sandbox choice. It maps `ReadOnly`, `WorkspaceWrite`, and `DangerFullAccess` to the matching core values, then returns the core sandbox mode.
 
-**Call relations**: Called when thread/config requests specify sandbox mode and the backend needs the core representation. It is a simple boundary adapter with no nested delegation.
+**Call relations**: This function is used when a client-selected or configured sandbox setting must be applied to the core runtime. It is the inward-facing translation for sandbox permissions.
 
 
 ##### `SandboxMode::from`  (lines 309–315)
@@ -1231,29 +1247,33 @@ fn to_core(self) -> CoreSandboxMode
 fn from(value: CoreSandboxMode) -> Self
 ```
 
-**Purpose**: Maps the core sandbox mode enum into the v2 API enum. It exposes effective sandbox mode in the API’s kebab-case/camel-case schema layer.
+**Purpose**: Converts the internal sandbox mode back into the API v2 sandbox mode. This lets clients see the active sandbox setting using the public protocol’s names.
 
-**Data flow**: Accepts `CoreSandboxMode`, matches its three variants, and returns the corresponding `SandboxMode` value.
+**Data flow**: It receives a core sandbox mode. It maps each possible core value to the matching API v2 value and returns it, without changing any state.
 
-**Call relations**: Used when effective configuration or thread state is serialized back to clients. It is the inverse of `SandboxMode::to_core`.
+**Call relations**: This function is used when reporting sandbox configuration outward through the v2 API. It pairs with `SandboxMode::to_core` so sandbox settings can round-trip cleanly between clients and the core server.
 
 
 ### `app-server-protocol/src/protocol/v2/notification.rs`
 
-`data_model` · `request handling`
+`data_model` · `cross-cutting protocol messaging`
 
-This file defines several standalone notification structs that represent server-initiated events outside of feature-specific request/response flows. All types derive `Serialize`, `Deserialize`, `JsonSchema`, and `TS`, so the same Rust definitions drive wire encoding, JSON schema generation, and exported TypeScript bindings. `DeprecationNoticeNotification` carries a short deprecation summary plus optional migration details. `WarningNotification` models a user-facing warning that may optionally target a specific thread, while `GuardianWarningNotification` makes the thread target mandatory for guardian-specific warnings. `ErrorNotification` packages a `TurnError` together with retry semantics and the affected `thread_id` and `turn_id`; the `will_retry` flag is an important protocol invariant because it distinguishes transient background failures from turn-interrupting errors. `ServerRequestResolvedNotification` links a completed server-side request back to a `RequestId` and thread. The file’s design is intentionally data-only: there are no constructors or helpers, so field names, optionality, and serde casing are the protocol contract. The imported `TurnError` and `RequestId` tie these notifications back to the broader turn-processing and request-tracking model defined elsewhere in v2.
+This file does not contain running behavior. Instead, it defines several message formats used when the server needs to tell the client something outside the normal request-and-response flow. Think of these structs like standardized forms: one form for a deprecation notice, one for a warning, one for an error, and so on. Because both the server and client use the same forms, they can exchange messages without guessing what each field means.
+
+Each notification is designed for a specific kind of news. A deprecation notice tells the client that some feature or behavior is going away, with optional details about what to do instead. A warning can be general or tied to a particular thread. A guardian warning is always tied to a thread and carries a user-facing message. An error notification includes the actual turn error, the thread and turn it belongs to, and whether the server plans to retry automatically. A server-request-resolved notification tells the client that a previously opened server-side request has been completed.
+
+The derive annotations make these message types easy to convert to and from JSON, generate JSON schema, and export matching TypeScript types. In plain terms, this helps keep Rust backend code, API documentation, and frontend code in sync.
 
 
 ### `app-server-protocol/src/protocol/v2/thread_data.rs`
 
-`data_model` · `cross-cutting thread/turn payload serialization`
+`data_model` · `API request and response serialization`
 
-This file contains the reusable data structures that represent threads and turns themselves. `Thread` captures identity, session tree relationships (`session_id`, `forked_from_id`, `parent_thread_id`), preview text, persistence mode, provider, timestamps, runtime `ThreadStatus`, optional rollout path, cwd, CLI version, source metadata, optional git info, optional user-facing name, and an optionally populated `turns` vector. `Turn` carries item payloads plus `items_view`, status, optional `TurnError`, and timing fields. `TurnItemsView` defaults to `Full`, which is important for backward compatibility with legacy payloads that omitted the field.
+This file is mostly a set of shared labels and record shapes. In plain terms, it describes how a conversation thread is packaged when it crosses the app-server boundary. Without it, different parts of the system could disagree about basic facts such as where a thread came from, what status it is in, which turns belong to it, or how errors should be shown to a user.
 
-The file also defines source enums. `SessionSource` is a serde-friendly API enum that maps core session origins into public categories, intentionally collapsing `CoreSessionSource::Mcp` into `AppServer` and hiding `Internal(_)` as `Unknown`. `ThreadSource` is more specialized: it serializes as a plain string via `try_from = "String"` and `into = "String"`, delegates parsing/formatting to `CoreThreadSource`, and exposes a custom `JsonSchema` that is simply the schema for a string. That design lets feature-specific thread sources remain open-ended while still round-tripping through the core parser.
+The file defines two kinds of source labels. `SessionSource` says what created the overall session, such as the command line, VS Code, app-server, or a custom source. `ThreadSource` says why a particular thread exists, such as a user thread, a subagent thread, a feature-created thread, or memory consolidation. These labels are translated to and from lower-level core protocol types, like a border checkpoint between the app-server API and the internal engine.
 
-The behavioral code is all conversion glue: bidirectional `SessionSource` mapping, string-based `ThreadSource` parsing/formatting, and bidirectional conversion between API and core thread-source enums. `TurnError` derives `thiserror::Error`, formatting itself as its `message` while carrying optional structured `CodexErrorInfo` and additional details.
+The main records are `Thread`, `Turn`, `GitInfo`, `TurnItemsView`, and `TurnError`. A `Thread` is the full conversation container: IDs, timestamps, working directory, model provider, source, optional Git details, optional title, and a list of turns. A `Turn` is one exchange or unit of work inside the thread, including its items, status, timing, and possible error. The serialization and schema annotations make these shapes usable as JSON and exportable to TypeScript, so frontend and API consumers can rely on the same structure.
 
 #### Function details
 
@@ -1263,11 +1283,11 @@ The behavioral code is all conversion glue: bidirectional `SessionSource` mappin
 fn from(value: CoreSessionSource) -> Self
 ```
 
-**Purpose**: Converts a core session source into the API-facing `SessionSource` enum. It also intentionally hides internal-only sources from app-server clients.
+**Purpose**: This converts an internal core session source into the app-server protocol version of that source. It keeps public-facing source names stable and hides internal-only sources by turning them into `Unknown`.
 
-**Data flow**: Consumes `CoreSessionSource`, matches each variant, and returns the corresponding `SessionSource`: `Cli`, `VsCode`, `Exec`, `AppServer` for `Mcp`, `Custom(source)`, `SubAgent(sub)`, or `Unknown` for both `Internal(_)` and `Unknown`.
+**Data flow**: It receives a `CoreSessionSource`, which is the lower-level engine's label for where a session came from. It matches that label to the app-server-facing `SessionSource`; custom names and subagent details are carried across, while internal-only labels are not exposed and become `Unknown`. The output is the protocol-safe source value that can be sent to clients.
 
-**Call relations**: Used whenever thread/session metadata from core state is exposed through the v2 API. It delegates no further logic beyond constructing nested `Custom` or `SubAgent` variants.
+**Call relations**: This function sits at the boundary where core thread data is being prepared for the app-server API. When it sees a custom source or subagent source, it hands that contained value into the matching app-server variant so the information is preserved for the response.
 
 *Call graph*: 2 external calls (Custom, SubAgent).
 
@@ -1278,11 +1298,11 @@ fn from(value: CoreSessionSource) -> Self
 fn from(value: SessionSource) -> Self
 ```
 
-**Purpose**: Converts the API `SessionSource` enum back into the core session source enum. It reverses the public-facing mapping used for thread metadata and request handling.
+**Purpose**: This converts the app-server protocol session source back into the core protocol's session source. It is used when information coming through the app-server layer needs to be understood by the lower-level engine.
 
-**Data flow**: Consumes `SessionSource`, matches each variant, and returns the corresponding `CoreSessionSource`: `Cli`, `VSCode`, `Exec`, `Mcp` for `AppServer`, `Custom(source)`, `SubAgent(sub)`, or `Unknown`.
+**Data flow**: It receives a `SessionSource` from the app-server side. It maps each public variant to the matching core variant, including carrying through custom source text and subagent information. The result is a `CoreSessionSource` that core protocol code can use.
 
-**Call relations**: Used when API-layer session source values need to be handed back to core logic or persisted in core-native form. It is the inverse boundary adapter for `SessionSource::from`.
+**Call relations**: This is the reverse trip of `SessionSource::from`: it moves source labels from the API-facing world back into the core protocol world. For custom and subagent values, it passes the embedded data into the core variant constructors so no meaningful source detail is lost.
 
 *Call graph*: 2 external calls (Custom, SubAgent).
 
@@ -1293,11 +1313,11 @@ fn from(value: SessionSource) -> Self
 fn schema_name() -> String
 ```
 
-**Purpose**: Provides the explicit schema name for the custom `JsonSchema` implementation of `ThreadSource`. This keeps generated schema output stable despite custom string-based serialization.
+**Purpose**: This gives the JSON schema generator the public name `ThreadSource` for this type. A JSON schema is a machine-readable description of what valid JSON should look like.
 
-**Data flow**: Takes no input and returns the fixed string `"ThreadSource"`.
+**Data flow**: It takes no outside data beyond the type itself. It returns the fixed text name `ThreadSource`, which schema generation tools use when documenting or referencing this type.
 
-**Call relations**: Called by schemars during schema generation for `ThreadSource`, alongside `ThreadSource::json_schema`.
+**Call relations**: This is called by schema-generation machinery when building the protocol schema. It does not call other project logic; it simply supplies the stable name that other generated documentation or client code can refer to.
 
 
 ##### `ThreadSource::json_schema`  (lines 82–84)
@@ -1306,11 +1326,11 @@ fn schema_name() -> String
 fn json_schema(generator: &mut SchemaGenerator) -> Schema
 ```
 
-**Purpose**: Defines `ThreadSource`’s JSON Schema as a plain string schema. This matches its serde representation, which is an untagged scalar string rather than an enum object.
+**Purpose**: This tells the JSON schema generator that `ThreadSource` should be represented as a string in JSON. Even though Rust stores it as named variants, clients see and send it as text.
 
-**Data flow**: Accepts a mutable `SchemaGenerator`, delegates to `String::json_schema(generator)`, and returns the resulting `Schema`.
+**Data flow**: It receives a schema generator object. Instead of building a custom object shape, it asks the normal `String` schema logic to produce the schema, then returns that schema. The result says, in effect, `ThreadSource` is valid wherever a string is valid.
 
-**Call relations**: Invoked by schemars when exporting protocol schema. It intentionally reuses the built-in string schema instead of enumerating values, because feature names are open-ended.
+**Call relations**: Schema-generation code calls this when it needs to describe `ThreadSource` for API consumers. The function delegates to the existing string schema generation, keeping the external contract simple and matching the file's string-based conversion behavior.
 
 *Call graph*: 1 external calls (json_schema).
 
@@ -1321,11 +1341,11 @@ fn json_schema(generator: &mut SchemaGenerator) -> Schema
 fn try_from(value: String) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Parses a string into the API `ThreadSource` by delegating to the core thread-source parser and then converting the parsed core value. This centralizes validation and accepted labels in the core type.
+**Purpose**: This tries to turn a plain string into a `ThreadSource`. It is useful when JSON or another text-based API gives the server a thread-source value.
 
-**Data flow**: Accepts a `String`, calls `value.parse::<CoreThreadSource>()`, maps the successful parse through `Into::into` to produce `ThreadSource`, and returns `Result<ThreadSource, String>` with the parser’s error string on failure.
+**Data flow**: It receives a string from outside the typed Rust world. It asks the core thread-source parser to understand that text, then converts the parsed core value into the app-server `ThreadSource`. If the text is not valid, it returns an error message instead of inventing a value.
 
-**Call relations**: Used by serde deserialization because `ThreadSource` is declared with `#[serde(try_from = "String")]`. It depends on the core parser and then on `From<CoreThreadSource> for ThreadSource` for the final mapping.
+**Call relations**: This is part of the deserialization path for `ThreadSource`, because the type is declared to be read from a string. It relies on the core protocol's parsing rules first, then uses the conversion into `ThreadSource` so the app-server and core layers interpret the same text the same way.
 
 
 ##### `String::from`  (lines 96–98)
@@ -1334,11 +1354,11 @@ fn try_from(value: String) -> Result<Self, Self::Error>
 fn from(value: ThreadSource) -> Self
 ```
 
-**Purpose**: Formats an API `ThreadSource` back into its scalar string representation by converting through the core thread-source type. This keeps serialization aligned with the core formatter.
+**Purpose**: This turns a `ThreadSource` back into the string form used in JSON and TypeScript-facing APIs. It is the outgoing companion to `ThreadSource::try_from`.
 
-**Data flow**: Consumes `ThreadSource`, converts it to `CoreThreadSource` via `CoreThreadSource::from(value)`, then converts that core value into `String` and returns it.
+**Data flow**: It receives a typed app-server `ThreadSource`. It first converts that value into the core protocol's `CoreThreadSource`, then turns the core value into a string. The output is the text that can be serialized into JSON.
 
-**Call relations**: Used by serde serialization because `ThreadSource` is declared with `#[serde(into = "String")]`. It relies on the `From<ThreadSource> for CoreThreadSource` adapter and the core type’s string conversion.
+**Call relations**: This is used when `ThreadSource` needs to leave Rust as a string, such as in API responses. It hands off to the core conversion and string formatting path so the app-server does not define a separate spelling for the same source labels.
 
 *Call graph*: 1 external calls (from).
 
@@ -1349,11 +1369,11 @@ fn from(value: ThreadSource) -> Self
 fn from(value: CoreThreadSource) -> Self
 ```
 
-**Purpose**: Converts a parsed core thread source into the API enum. It preserves built-in variants and carries feature names through unchanged.
+**Purpose**: This converts a core protocol thread source into the app-server protocol's `ThreadSource`. It lets app-server responses reuse the lower-level engine's source classification without exposing a different type.
 
-**Data flow**: Consumes `CoreThreadSource`, matches `User`, `Subagent`, `Feature(feature)`, or `MemoryConsolidation`, and returns the corresponding `ThreadSource` variant, moving the feature string when present.
+**Data flow**: It receives a `CoreThreadSource`. It matches each core variant to the app-server variant with the same meaning. If the source is tied to a named feature, it carries that feature name into `ThreadSource::Feature`. The output is the app-server protocol value.
 
-**Call relations**: Used after `ThreadSource::try_from` parses a string through the core type, and anywhere core thread metadata is exposed through the API. It is the inbound half of the thread-source boundary conversion.
+**Call relations**: This is used after core code has identified why a thread exists and that information needs to be presented through the app-server protocol. For feature-created threads, it calls into the `Feature` variant construction so the feature name travels with the source label.
 
 *Call graph*: 1 external calls (Feature).
 
@@ -1364,24 +1384,24 @@ fn from(value: CoreThreadSource) -> Self
 fn from(value: ThreadSource) -> Self
 ```
 
-**Purpose**: Converts the API `ThreadSource` enum into the core thread-source enum. It preserves feature labels and built-in source categories exactly.
+**Purpose**: This converts the app-server protocol's `ThreadSource` back into the core protocol type. It is needed when API-facing data must be passed into core code that expects its own type.
 
-**Data flow**: Consumes `ThreadSource`, matches `User`, `Subagent`, `Feature(feature)`, or `MemoryConsolidation`, and returns the corresponding `CoreThreadSource` variant.
+**Data flow**: It receives a `ThreadSource` value. It maps user, subagent, feature, and memory-consolidation cases to the matching core variants, carrying the feature name along when present. The output is a `CoreThreadSource` ready for lower-level protocol logic.
 
-**Call relations**: Used by `String::from` during serialization and anywhere API thread-source values must be passed into core logic. It is the outbound half of the thread-source conversion pair.
+**Call relations**: This is the reverse of `ThreadSource::from`. It is part of the bridge between the app-server protocol and the core protocol, and it uses the core `Feature` variant when the source includes a feature name.
 
 *Call graph*: 1 external calls (Feature).
 
 
 ### `app-server-protocol/src/protocol/v2/thread.rs`
 
-`data_model` · `thread request handling, pagination, and event serialization`
+`data_model` · `cross-cutting`
 
-This file is the main protocol model for thread-oriented operations. It declares request and response structs for starting, resuming, forking, updating settings, reading, listing, searching, archiving, deleting, unsubscribing, naming, compacting, rolling back, and managing background terminals. Several fields use custom serde helpers to preserve nuanced semantics: `service_tier: Option<Option<String>>` distinguishes omission from explicit clearing, and `path` on resume/fork treats empty strings as absent. Experimental fields are annotated with `ExperimentalApi` metadata so schema filtering and runtime gating can identify them precisely.
+A “thread” here is a saved conversation or work session with the agent. This file does not run the thread itself. Instead, it defines the data envelopes that travel between the app server and its clients, much like standardized forms at a service desk. Without these definitions, the client and server could disagree about field names, optional values, pagination cursors, permission settings, token usage, or status updates.
 
-The file also defines pagination containers (`ThreadListResponse`, `ThreadTurnsListResponse`, `ThreadTurnsItemsListResponse`, and `TurnsPage`), thread goal management types, thread memory mode, and token usage reporting. `ThreadListParams.cwd` is intentionally polymorphic via the untagged `ThreadListCwdFilter`, accepting either one string or many. `ThreadStatus` is a tagged enum with an `Active` variant carrying `active_flags`, while `ThreadMemoryMode` exposes both a string form and a core conversion.
+Most of the file is made of request and response types. For example, there are structures for starting a thread, resuming one from disk or history, forking one into a new thread, changing settings, archiving or deleting, listing turns, listing background terminal processes, and updating goals or metadata. Many fields are optional so a client can say “leave this unchanged,” while a few use a special nested optional form so the client can distinguish “not provided” from “clear this value.”
 
-Behavior is limited to six conversion helpers. `TurnsPage::from` repackages a turn-list response for resume bootstrapping. `ThreadGoal::from` adapts core goal state into API fields, stringifying the thread id and converting status. `ThreadTokenUsage::from` and `TokenUsageBreakdown::from` recursively translate core token accounting into API payloads, preserving total/last breakdowns and optional context window. These adapters keep the wire schema decoupled from core types while remaining structurally faithful.
+The file also defines notification messages that the server can send when something changes, such as a thread starting, being archived, changing status, or using more tokens. Several types are marked experimental, meaning the API can expose them only when the client has opted into that feature. A small number of conversion functions translate lower-level core protocol types into these public v2 API types, keeping the external API stable even if internal storage uses different Rust types.
 
 #### Function details
 
@@ -1391,11 +1411,11 @@ Behavior is limited to six conversion helpers. `TurnsPage::from` repackages a tu
 fn from(response: ThreadTurnsListResponse) -> Self
 ```
 
-**Purpose**: Converts a `ThreadTurnsListResponse` into the simpler `TurnsPage` wrapper used by thread resume responses. It reuses the same pagination data under a different type name.
+**Purpose**: Turns a full thread-turns-list response into the smaller page object used inside a resume response. This lets the resume API include an initial page of turns without inventing a second shape for the same paging data.
 
-**Data flow**: Consumes `ThreadTurnsListResponse`, copies `data`, `next_cursor`, and `backwards_cursor` into a new `TurnsPage`, and returns it.
+**Data flow**: It receives a ThreadTurnsListResponse containing a list of turns plus forward and backward pagination cursors. It copies those three pieces into a TurnsPage. The result is a page with the same turn data and cursors, but under the type expected by thread resume responses.
 
-**Call relations**: Used when a resume flow includes an initial turns page and wants to embed the result under `initial_turns_page`. It is a shallow adapter with no nested transformation beyond moving the existing fields.
+**Call relations**: This conversion is used when code already has the normal result of listing turns and needs to place it into the optional initialTurnsPage field of a resume response. It acts as a small adapter between the standalone turns-list API and the resume API bootstrap flow.
 
 
 ##### `ThreadGoal::from`  (lines 682–693)
@@ -1404,11 +1424,11 @@ fn from(response: ThreadTurnsListResponse) -> Self
 fn from(value: codex_protocol::protocol::ThreadGoal) -> Self
 ```
 
-**Purpose**: Transforms a core thread goal into the API-facing `ThreadGoal` payload. It preserves counters and timestamps while converting the goal status enum and thread id representation.
+**Purpose**: Converts an internal core thread goal into the v2 API version that clients receive. This keeps client-facing data simple, including changing the internal thread id into a string.
 
-**Data flow**: Consumes `codex_protocol::protocol::ThreadGoal`, converts `thread_id` to string, copies `objective`, `token_budget`, `tokens_used`, `time_used_seconds`, `created_at`, and `updated_at`, converts `status` via `.into()`, and returns the assembled `ThreadGoal`.
+**Data flow**: It receives a core ThreadGoal with fields such as thread id, objective, status, token budget, tokens used, elapsed time, and timestamps. It copies those values into the v2 ThreadGoal shape, converting the id and status into their API forms. The output is ready to serialize and send to a client.
 
-**Call relations**: Called by thread goal handling code when returning goal state to clients, including the goal-set path. It relies on the macro-generated `ThreadGoalStatus` conversion for the nested status field.
+**Call relations**: The thread_goal_set_inner flow calls this after setting or updating a goal. In that story, the lower-level goal is produced by the core system, then this function repackages it so the API response can return the public v2 version.
 
 *Call graph*: called by 1 (thread_goal_set_inner).
 
@@ -1419,11 +1439,11 @@ fn from(value: codex_protocol::protocol::ThreadGoal) -> Self
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical lowercase string label for a thread memory mode. It provides a lightweight textual form without going through serde.
+**Purpose**: Returns the plain text spelling for a thread memory mode. It is useful when code needs a stable string such as "enabled" or "disabled" for display, logging, or protocol-adjacent decisions.
 
-**Data flow**: Consumes `self`, matches `Enabled` or `Disabled`, and returns the corresponding `&'static str` literal `"enabled"` or `"disabled"`.
+**Data flow**: It receives a ThreadMemoryMode value. If the value is Enabled, it returns the string "enabled"; if it is Disabled, it returns "disabled". It does not change anything else.
 
-**Call relations**: Used wherever code needs a stable string representation of memory mode outside JSON serialization, such as logging, metrics, or command construction.
+**Call relations**: This is a helper attached to the ThreadMemoryMode enum. Other code can call it whenever it needs the API mode represented as a simple lowercase word rather than as a Rust enum value.
 
 
 ##### `ThreadMemoryMode::to_core`  (lines 821–826)
@@ -1432,11 +1452,11 @@ fn as_str(self) -> &'static str
 fn to_core(self) -> codex_protocol::protocol::ThreadMemoryMode
 ```
 
-**Purpose**: Converts the API thread memory mode enum into the core protocol enum. The mapping is direct and exhaustive.
+**Purpose**: Converts the v2 API memory-mode value into the matching core protocol value. This lets the public API type be accepted by lower-level code that expects the internal representation.
 
-**Data flow**: Consumes `self`, matches `Enabled` or `Disabled`, and returns `codex_protocol::protocol::ThreadMemoryMode::Enabled` or `Disabled`.
+**Data flow**: It receives a v2 ThreadMemoryMode, checks whether it is Enabled or Disabled, and returns the corresponding codex_protocol core ThreadMemoryMode. Nothing is stored or modified by this function.
 
-**Call relations**: Used when thread memory mode requests from clients are applied to backend/core state. It is the outbound boundary adapter for this enum.
+**Call relations**: This function is the bridge from the API layer into the core protocol layer for memory settings. When a client asks to set memory mode, server-side code can use this conversion before handing the value to the part of the system that actually applies the setting.
 
 
 ##### `ThreadTokenUsage::from`  (lines 1299–1305)
@@ -1445,11 +1465,11 @@ fn to_core(self) -> codex_protocol::protocol::ThreadMemoryMode
 fn from(value: CoreTokenUsageInfo) -> Self
 ```
 
-**Purpose**: Converts core token usage info into the API notification payload used for thread token usage updates. It preserves both cumulative and last-turn breakdowns.
+**Purpose**: Converts internal token-usage information into the v2 notification shape sent to clients. Tokens are the chunks of text the model reads and writes, so this lets clients show how much context and output a thread has consumed.
 
-**Data flow**: Consumes `CoreTokenUsageInfo`, converts `total_token_usage` and `last_token_usage` via `TokenUsageBreakdown::from`, copies `model_context_window`, and returns `ThreadTokenUsage { total, last, model_context_window }`.
+**Data flow**: It receives CoreTokenUsageInfo, which contains total usage, usage for the latest step, and the model context-window size. It converts the total and latest usage into TokenUsageBreakdown values and copies the context-window value. The output is a ThreadTokenUsage object suitable for a thread token usage update notification.
 
-**Call relations**: Called when sending token-usage update notifications to a connection. It delegates the nested breakdown conversion to `TokenUsageBreakdown::from` so the top-level adapter stays concise.
+**Call relations**: send_thread_token_usage_update_to_connection calls this when preparing a token-usage update for a connected client. The server gathers core usage numbers, this function reshapes them for v2, and the connection-sending code can then serialize and deliver the notification.
 
 *Call graph*: called by 1 (send_thread_token_usage_update_to_connection).
 
@@ -1460,20 +1480,22 @@ fn from(value: CoreTokenUsageInfo) -> Self
 fn from(value: CoreTokenUsage) -> Self
 ```
 
-**Purpose**: Maps a core token usage breakdown into the API-facing breakdown struct. It preserves all token counters exactly.
+**Purpose**: Converts one internal token-usage record into the public breakdown clients understand. It preserves the important categories: total, input, cached input, output, and reasoning output tokens.
 
-**Data flow**: Accepts `CoreTokenUsage`, copies `total_tokens`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `reasoning_output_tokens` into a new `TokenUsageBreakdown`, and returns it.
+**Data flow**: It receives a CoreTokenUsage value. It copies each token count into the matching field of TokenUsageBreakdown. The result is a client-facing summary of one slice of token usage, with no side effects.
 
-**Call relations**: Used by `ThreadTokenUsage::from` for both the cumulative and last-turn usage sections. It is the leaf conversion in the token accounting adaptation path.
+**Call relations**: This function is used as the smaller building block inside token-usage conversion. When ThreadTokenUsage::from prepares the full usage object, it relies on this conversion for both the total usage and the most recent usage.
 
 
 ### `app-server-protocol/src/protocol/v2/turn.rs`
 
-`data_model` · `request/response schema definition and turn event serialization`
+`data_model` · `request handling and event notification`
 
-This file is primarily a schema layer: it declares the serialized request, response, and notification structs/enums used by the app-server’s v2 turn APIs, and derives Serde, JSON Schema, and TypeScript exports for them. The top half models turn lifecycle state (`TurnStatus`), turn-scoped overrides (`TurnStartParams`), steering and interruption requests, and notifications such as turn started/completed, diff updates, and plan updates. `TurnStartParams` is the densest type: it carries thread identity, user input, optional Responses API metadata, optional additional context fragments, environment selection, cwd/workspace overrides, approval and sandbox policy overrides, model/service-tier/reasoning/personality overrides, optional output schema, and experimental collaboration mode. Several fields are explicitly sticky across subsequent turns, and `service_tier` uses a double-`Option` serde helper so callers can distinguish omitted vs explicit null.
+A “turn” is one round of interaction with Codex: the user sends text, images, mentions, or skills, and the assistant works until it finishes, is interrupted, or fails. This file describes the data that can cross that boundary. Think of it like a set of labeled forms: one form starts a turn, another adds more input to an active turn, another reports that the plan changed, and so on.
 
-The lower half focuses on user input and plan conversion. `ByteRange` and `TextElement` preserve UI-defined spans inside text input, including an optional placeholder that is intentionally encapsulated behind constructor/accessor methods. `UserInput` supports text, remote images, local images, skills, and mentions; conversion to/from `CoreUserInput` renames the remote image URL field and rejects unsupported core variants with `unreachable!`. `text_char_count` counts Unicode scalar values only for text inputs, returning zero for non-text variants. Finally, `TurnPlanStep` and `TurnPlanStepStatus` convert plan-tool core types into the exported v2 notification shape.
+Most of the file is made of serializable types, meaning Rust can turn them into JSON and back. It also exports TypeScript definitions, so browser or app clients can use the same shapes. The start and steer request types include user input plus optional overrides such as working directory, model, sandbox rules, approval routing, reasoning settings, and extra context. Notifications report important events back to clients, such as a turn starting, completing, producing a diff, or updating its plan.
+
+The file also bridges between this public v2 API and the project’s internal “core” types. Small conversion functions translate byte ranges, text elements, user input, and plan step statuses back and forth. That keeps the outside protocol stable while allowing the internal engine to use its own representations.
 
 #### Function details
 
@@ -1483,11 +1505,11 @@ The lower half focuses on user input and plan conversion. `ByteRange` and `TextE
 fn from(value: CoreByteRange) -> Self
 ```
 
-**Purpose**: Converts a core `codex_protocol::user_input::ByteRange` into the app-server protocol `ByteRange` by copying its numeric bounds unchanged.
+**Purpose**: Converts an internal byte range into the v2 protocol byte range sent to or received from clients. A byte range marks a start and end position inside a text buffer.
 
-**Data flow**: Takes a `CoreByteRange` with `start` and `end` fields, reads those two `usize` values, and constructs a new public `ByteRange` with the same coordinates. It returns the new protocol-layer value and does not mutate external state.
+**Data flow**: It receives a core byte range with a start and end position. It copies those two numbers into the public v2 `ByteRange`. The result is a protocol-friendly value with the same span.
 
-**Call relations**: This conversion is used when higher-level protocol values are built from core user-input structures, notably through `TextElement::from` and `UserInput::from` paths that surface core data to API consumers.
+**Call relations**: This sits at the boundary between the internal user-input model and the v2 API model. When text elements are converted outward, this function supplies the public byte-range shape used inside those elements.
 
 
 ##### `CoreByteRange::from`  (lines 229–234)
@@ -1496,11 +1518,11 @@ fn from(value: CoreByteRange) -> Self
 fn from(value: ByteRange) -> Self
 ```
 
-**Purpose**: Converts the public protocol `ByteRange` back into the core `CoreByteRange` representation expected by lower-level logic.
+**Purpose**: Converts a v2 protocol byte range back into the internal core byte range. This lets client-provided text spans be understood by the engine.
 
-**Data flow**: Consumes a `ByteRange`, reads its `start` and `end` fields, and returns a `CoreByteRange` with identical bounds. No shared state is read or written.
+**Data flow**: It receives a public `ByteRange` with start and end positions. It copies those positions into the core byte-range type. The output is ready for internal user-input processing.
 
-**Call relations**: This is the inverse bridge used when app-server request payloads are lowered into core protocol types, especially from `CoreTextElement::from` and then `UserInput::into_core`.
+**Call relations**: This is the reverse of `ByteRange::from`. It is used as part of converting protocol text elements into the core form that the rest of Codex works with.
 
 
 ##### `TextElement::new`  (lines 248–253)
@@ -1509,11 +1531,11 @@ fn from(value: ByteRange) -> Self
 fn new(byte_range: ByteRange, placeholder: Option<String>) -> Self
 ```
 
-**Purpose**: Constructs a `TextElement` from an explicit byte span and optional placeholder string, preserving the UI metadata attached to a text fragment.
+**Purpose**: Creates a text element that points at a span inside a larger text string, with an optional display placeholder. A placeholder is human-readable text the UI can show for a special embedded element.
 
-**Data flow**: Accepts a `ByteRange` and `Option<String>`, stores them directly into a new `TextElement`, and returns that value. It performs no validation on the range or placeholder contents.
+**Data flow**: It takes a byte range and an optional placeholder string. It stores both in a new `TextElement`. The output is a ready-to-use marker for a special part of a text input.
 
-**Call relations**: It is the canonical constructor for this type: conversion from core text elements delegates here, and tests/builders call it directly when fabricating text-element spans.
+**Call relations**: The call graph shows this constructor being used by thread-reading and input-related flows, including paste expansion and tests around pending user input. `TextElement::from` also calls it when converting an internal text element into the v2 protocol form.
 
 *Call graph*: called by 4 (thread_read_returns_summary_without_turns, task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input, text_elements, expand_pending_pastes).
 
@@ -1524,11 +1546,11 @@ fn new(byte_range: ByteRange, placeholder: Option<String>) -> Self
 fn set_placeholder(&mut self, placeholder: Option<String>)
 ```
 
-**Purpose**: Replaces the stored placeholder text for an existing `TextElement`.
+**Purpose**: Changes the optional placeholder text on an existing text element. This is useful when the same span should remain, but the label shown to a user needs to be added, removed, or replaced.
 
-**Data flow**: Takes `&mut self` plus a new `Option<String>`, overwrites the private `placeholder` field, and returns unit. The byte range is left unchanged.
+**Data flow**: It receives a mutable text element and a new optional placeholder. It replaces the old placeholder with the new one. It does not return a separate value; the existing object is changed in place.
 
-**Call relations**: This is a local mutator for callers that need to adjust UI display metadata after construction; it does not delegate further.
+**Call relations**: This is a small editing helper for code that already has a `TextElement`. It does not hand off to other functions in the provided call graph.
 
 
 ##### `TextElement::placeholder`  (lines 259–261)
@@ -1537,11 +1559,11 @@ fn set_placeholder(&mut self, placeholder: Option<String>)
 fn placeholder(&self) -> Option<&str>
 ```
 
-**Purpose**: Exposes the optional placeholder as a borrowed string slice without giving direct mutable access to the private field.
+**Purpose**: Returns the text element’s placeholder, if it has one, without giving callers ownership of the stored string. This lets callers read the label safely.
 
-**Data flow**: Reads `self.placeholder`, converts `Option<String>` to `Option<&str>` via `as_deref`, and returns the borrowed view. It does not allocate or mutate state.
+**Data flow**: It reads the optional placeholder stored inside the text element. If one exists, it returns it as borrowed text; if not, it returns nothing. The text element itself is unchanged.
 
-**Call relations**: This accessor complements `set_placeholder` and `new`, letting consumers inspect placeholder metadata while preserving field encapsulation.
+**Call relations**: This is a read-only accessor used by code that needs to inspect a text element. It has no listed calls or callers in the provided graph.
 
 
 ##### `TextElement::from`  (lines 265–270)
@@ -1550,11 +1572,11 @@ fn placeholder(&self) -> Option<&str>
 fn from(value: CoreTextElement) -> Self
 ```
 
-**Purpose**: Builds a public `TextElement` from a core `CoreTextElement`, including extraction of the placeholder through the core type’s conversion-only accessor.
+**Purpose**: Converts an internal core text element into the v2 protocol text element. This prepares special text spans to be sent through the public API.
 
-**Data flow**: Consumes a `CoreTextElement`, converts its nested `byte_range` via `Into`, reads the optional placeholder through `_placeholder_for_conversion_only()`, clones that borrowed placeholder into an owned `String` when present, and passes both pieces into `TextElement::new`. It returns the resulting protocol-layer element.
+**Data flow**: It receives a core text element. It converts the core byte range into the public byte-range type, reads the core placeholder through its conversion-only accessor, turns that placeholder into an owned string when present, and builds a v2 `TextElement`. The result carries the same span and optional label in protocol form.
 
-**Call relations**: This function is part of the core-to-public conversion chain. `UserInput::from` uses it when translating text input element spans from core protocol values.
+**Call relations**: This function calls the core element’s `_placeholder_for_conversion_only` method to read the placeholder, then calls `TextElement::new` to build the public value. It is part of the outward conversion path from internal user input to API user input.
 
 *Call graph*: 2 external calls (_placeholder_for_conversion_only, new).
 
@@ -1565,11 +1587,11 @@ fn from(value: CoreTextElement) -> Self
 fn from(value: TextElement) -> Self
 ```
 
-**Purpose**: Converts a public `TextElement` into the core `CoreTextElement` expected by downstream protocol logic.
+**Purpose**: Converts a v2 protocol text element into the internal core text element. This lets special spans received from clients travel into the engine’s own user-input model.
 
-**Data flow**: Consumes a `TextElement`, converts its `byte_range` into `CoreByteRange`, moves out the owned `placeholder`, and constructs the core value with `CoreTextElement::new`. It returns the new core element.
+**Data flow**: It receives a public `TextElement`. It converts the byte range into the core byte-range type and passes the placeholder along. The output is a core text element with the same span and optional label.
 
-**Call relations**: This is the lowering step used by `UserInput::into_core` when serializable app-server text input is transformed into core protocol input.
+**Call relations**: This function calls the core `TextElement` constructor to create the internal value. It is used by the inward conversion path when `UserInput::into_core` turns protocol input into core input.
 
 *Call graph*: 1 external calls (new).
 
@@ -1580,11 +1602,11 @@ fn from(value: TextElement) -> Self
 fn into_core(self) -> CoreUserInput
 ```
 
-**Purpose**: Lowers each public `UserInput` variant into the corresponding `CoreUserInput` variant, including field renaming and nested text-element conversion.
+**Purpose**: Turns v2 user input into the internal input type used by the Codex engine. This is how client-submitted text, images, local images, skills, and mentions enter the core system.
 
-**Data flow**: Consumes `self` and pattern-matches on the variant. For `Text`, it moves the `text` string and maps each `TextElement` through `Into::into`; for `Image`, it renames `url` to `image_url`; for `LocalImage`, `Skill`, and `Mention`, it forwards the stored fields unchanged. It returns a `CoreUserInput` and writes no external state.
+**Data flow**: It consumes a public `UserInput` value. For text, it keeps the text string and converts every text element into the core form. For remote images, it renames the public `url` field into the core `image_url` field. For local images, skills, and mentions, it passes through the relevant paths and names. The output is a core user-input value.
 
-**Call relations**: This function is the main bridge from API-layer turn input into core protocol processing. It delegates nested conversions for text spans so the rest of the system can operate on core types.
+**Call relations**: This function is the main inward bridge for user input in turn start and steer requests. It does not call named project functions in the provided graph beyond the standard conversions for nested text elements.
 
 
 ##### `UserInput::from`  (lines 334–352)
@@ -1593,11 +1615,11 @@ fn into_core(self) -> CoreUserInput
 fn from(value: CoreUserInput) -> Self
 ```
 
-**Purpose**: Raises a core `CoreUserInput` into the exported app-server `UserInput` enum, translating supported variants into the public wire shape.
+**Purpose**: Turns internal core user input into the v2 protocol form. This is used when internal input needs to be shown, stored, or returned through the public API.
 
-**Data flow**: Consumes a `CoreUserInput` and matches its variant. `Text` maps nested `CoreTextElement`s into `TextElement`s; `Image` renames `image_url` to `url`; `LocalImage`, `Skill`, and `Mention` are copied structurally. Any unsupported core variant falls into `unreachable!`, asserting that this protocol layer should never receive it.
+**Data flow**: It receives a core user-input value. It maps text, images, local images, skills, and mentions into the matching public variants, converting text elements along the way. If it receives a core variant this v2 protocol does not support, it stops as unreachable because the code expects that case never to be sent here.
 
-**Call relations**: This is the inverse of `into_core`, used when core-layer user input must be surfaced through app-server APIs or notifications. Its `unreachable!` marks an invariant between the supported core and public variant sets.
+**Call relations**: This is the outward bridge paired with `UserInput::into_core`. Its only explicit call in the provided graph is to `unreachable!`, which marks unsupported internal variants as a programming error rather than a normal API case.
 
 *Call graph*: 1 external calls (unreachable!).
 
@@ -1608,11 +1630,11 @@ fn from(value: CoreUserInput) -> Self
 fn text_char_count(&self) -> usize
 ```
 
-**Purpose**: Computes the Unicode character count for text input while treating all non-text input variants as contributing zero characters.
+**Purpose**: Counts how many human-visible characters are in a text input. Non-text inputs count as zero because images, skills, and mentions do not contain freeform message text here.
 
-**Data flow**: Borrows `self`, matches on the variant, and for `Text` counts `text.chars()`. For `Image`, `LocalImage`, `Skill`, and `Mention`, it returns `0` directly. No state is mutated.
+**Data flow**: It looks at the kind of `UserInput`. If it is text, it counts Unicode characters in the text string. If it is any other input kind, it returns zero. Nothing is changed.
 
-**Call relations**: This is a small helper on the input model itself, likely used by callers that need text-length accounting without separately unpacking the enum.
+**Call relations**: This is a small helper for code that needs a rough text length from mixed user input. It has no listed calls or callers in the provided graph.
 
 
 ##### `TurnPlanStep::from`  (lines 430–435)
@@ -1621,11 +1643,11 @@ fn text_char_count(&self) -> usize
 fn from(value: CorePlanItemArg) -> Self
 ```
 
-**Purpose**: Converts a core plan item argument into the public turn-plan step shape used in plan update notifications.
+**Purpose**: Converts an internal plan item into the v2 protocol plan step sent to clients. A plan step is one item in the assistant’s visible checklist of work.
 
-**Data flow**: Consumes a `CorePlanItemArg`, moves its `step` string, converts its `status` through `Into`, and returns a `TurnPlanStep`. No external state is touched.
+**Data flow**: It receives a core plan item with a step description and status. It copies the description and converts the internal status into the public status enum. The output is a `TurnPlanStep` ready to appear in a plan update notification.
 
-**Call relations**: This conversion is used when plan-tool output from the core layer is repackaged into `TurnPlanUpdatedNotification.plan` entries.
+**Call relations**: This function is part of the path that turns internal planning data into `TurnPlanUpdatedNotification` data. It relies on `TurnPlanStepStatus::from` for the status conversion.
 
 
 ##### `TurnPlanStepStatus::from`  (lines 439–445)
@@ -1634,22 +1656,22 @@ fn from(value: CorePlanItemArg) -> Self
 fn from(value: CorePlanStepStatus) -> Self
 ```
 
-**Purpose**: Maps each core plan-step status enum variant to the corresponding public v2 status variant.
+**Purpose**: Converts an internal plan-step status into the v2 protocol status. The statuses describe whether a plan item is waiting, currently being worked on, or finished.
 
-**Data flow**: Consumes a `CorePlanStepStatus`, matches `Pending`, `InProgress`, or `Completed`, and returns the identically named `TurnPlanStepStatus`. It is a pure enum translation.
+**Data flow**: It receives a core status: pending, in progress, or completed. It maps that status to the matching public enum value. The output is safe to serialize in the v2 API.
 
-**Call relations**: This is the nested status conversion used by `TurnPlanStep::from` so plan notifications expose stable app-server protocol enums instead of core ones.
+**Call relations**: This supports `TurnPlanStep::from`, which uses it while preparing plan update data for clients. It does not call other functions in the provided graph.
 
 
 ### `app-server-protocol/src/protocol/v2/item.rs`
 
-`data_model` · `thread item serialization, item lifecycle notifications, approval prompts, and tool-call/result transport`
+`data_model` · `request handling`
 
-This is the largest item-level protocol schema module. It declares the `ThreadItem` enum that represents all item kinds a client can observe in a thread—user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes, MCP and dynamic tool calls, collaboration events, web search, image operations, review-mode markers, and context compaction. Around that core enum it defines many supporting types: command approval decisions, parsed command actions, memory citations, guardian auto-review payloads, command/file-change approval request and response structs, dynamic tool call payloads, and numerous streaming notifications.
+A client UI needs a clear stream of what the agent is doing: what the user said, what the agent answered, which command is running, whether a patch succeeded, or when the user must approve something risky. This file is the shared dictionary for that stream. It defines the data structures that are serialized to JSON and exported as TypeScript types, so Rust server code and web clients can agree on the exact names and fields.
 
-Most behavior is conversion logic between core protocol types and v2 wire types. `ThreadItem::from` is the central adapter: it pattern-matches each `CoreTurnItem` variant, converts nested content, concatenates agent text fragments, derives file-change status with an `InProgress` fallback when core status is absent, converts MCP durations from `Duration` to `Option<i64>` milliseconds, and delegates nested conversions to helpers such as `convert_patch_changes`, `HookPromptFragment::from`, `PatchApplyStatus::from`, `McpToolCallStatus::from`, and `WebSearchAction::from`. Other conversions map approval decisions, guardian review actions, command parsing structures, memory citations, and collaboration agent states.
+The central type is `ThreadItem`, which is like a timeline card in a chat: one card might be a user message, another a shell command, another a web search, another a file edit. Around it are smaller types for statuses, approval decisions, patch details, tool-call results, guardian safety reviews, and notifications for “started,” “completed,” or “new text delta arrived.”
 
-A few functions encode important compatibility rules: `ThreadItem::id` provides a uniform identifier accessor across all variants; `CommandExecutionStatus::from` and `PatchApplyStatus::from` intentionally only map terminal core statuses because `InProgress` is represented elsewhere in lifecycle handling; and `CommandExecutionRequestApprovalParams::strip_experimental_fields` explicitly removes unstable outbound fields for compatibility with clients that should not see them yet.
+Because the server has older or deeper internal types, many functions here convert from those core types into the v2 protocol types, and sometimes back again. Without this file, clients would either receive unstable internal details or have no reliable way to render agent activity, ask for approvals, or route tool responses.
 
 #### Function details
 
@@ -1659,11 +1681,11 @@ A few functions encode important compatibility rules: `ThreadItem::id` provides 
 fn from(value: CoreReviewDecision) -> Self
 ```
 
-**Purpose**: Maps a core review decision into the v2 command-approval decision enum, preserving richer approval outcomes such as session approval and policy amendments. It also collapses timeout into a decline for the client-facing API.
+**Purpose**: Turns the core server’s review decision for a command into the v2 API decision that a client understands. This keeps client-facing wording stable even if the internal approval system uses different names.
 
-**Data flow**: Consumes `CoreReviewDecision`, pattern-matches each variant, converts embedded exec-policy or network-policy amendments with `.into()` where present, and returns the corresponding `CommandExecutionApprovalDecision`. No state is mutated.
+**Data flow**: It receives an internal command review decision. It matches each possible outcome, such as approved, denied, aborted, approved for session, or approved with a policy change, and produces the matching v2 approval decision. If the core decision carries a proposed execution or network policy change, that extra data is converted and carried along.
 
-**Call relations**: This conversion is used when approval outcomes from core need to be surfaced through v2 request/response or notification payloads.
+**Call relations**: This conversion is used when approval results move from the internal safety/review system toward the app-server protocol. It hands off any policy amendment details to their own conversion logic so the outgoing payload uses v2 shapes.
 
 
 ##### `MemoryCitation::from`  (lines 137–142)
@@ -1672,11 +1694,11 @@ fn from(value: CoreReviewDecision) -> Self
 fn from(value: CoreMemoryCitation) -> Self
 ```
 
-**Purpose**: Converts a core memory citation bundle into the v2 representation attached to agent messages. It preserves both the cited entries and the associated rollout/thread identifiers.
+**Purpose**: Converts an internal memory citation into the v2 format shown to clients. A memory citation explains which saved memory or prior thread information supported an agent message.
 
-**Data flow**: Consumes `CoreMemoryCitation`, maps `entries` through `Into::into` into `Vec<MemoryCitationEntry>`, moves `rollout_ids` into `thread_ids`, and returns `MemoryCitation`.
+**Data flow**: It receives a core memory citation containing citation entries and rollout/thread identifiers. It converts each entry into the v2 `MemoryCitationEntry` shape and renames the core rollout identifiers into `thread_ids`. The result is a client-ready citation object.
 
-**Call relations**: This conversion is invoked from `ThreadItem::from` when adapting a core `AgentMessage` that carries memory citation metadata.
+**Call relations**: This is used when an agent message is converted into a `ThreadItem`. It relies on `MemoryCitationEntry::from` for each individual citation entry.
 
 
 ##### `MemoryCitationEntry::from`  (lines 156–163)
@@ -1685,11 +1707,11 @@ fn from(value: CoreMemoryCitation) -> Self
 fn from(value: CoreMemoryCitationEntry) -> Self
 ```
 
-**Purpose**: Converts one cited memory span from the core type into the v2 wire struct. It is a direct field-preserving adapter.
+**Purpose**: Converts one internal memory citation entry into the v2 entry format. Each entry points to a path, line range, and note that explain the source of remembered information.
 
-**Data flow**: Consumes `CoreMemoryCitationEntry`, moves `path`, `line_start`, `line_end`, and `note` into a new `MemoryCitationEntry`, and returns it.
+**Data flow**: It receives a core citation entry. It copies the path, start line, end line, and explanatory note into the v2 struct. The output is one citation entry suitable for JSON serialization.
 
-**Call relations**: This function is used by `MemoryCitation::from` while converting the citation's `entries` vector.
+**Call relations**: This is called as part of `MemoryCitation::from`, which gathers many entries into the full citation object attached to an agent message.
 
 
 ##### `CommandAction::into_core`  (lines 167–188)
@@ -1698,11 +1720,11 @@ fn from(value: CoreMemoryCitationEntry) -> Self
 fn into_core(self) -> CoreParsedCommand
 ```
 
-**Purpose**: Turns the v2 parsed-command action enum back into the core parsed-command type used by internal command-processing code. It preserves the command text and any parsed path/query metadata.
+**Purpose**: Converts a client-facing parsed command action back into the core command parser’s type. This is useful when data that came through the v2 protocol must be interpreted by internal command logic.
 
-**Data flow**: Consumes `self`, pattern-matches each `CommandAction` variant, renames the `command` field to the core `cmd` field, converts `AbsolutePathBuf` to a plain path buffer for `Read`, and returns the corresponding `CoreParsedCommand` variant.
+**Data flow**: It receives a v2 `CommandAction`, such as reading a file, listing files, searching, or an unknown command. It renames fields into the core format and converts absolute paths into regular path buffers where needed. It returns the matching core parsed-command value.
 
-**Call relations**: This is the outbound adapter used when client-provided or v2-layer command action data must be handed back to core parsing/execution logic.
+**Call relations**: This function sits on the boundary from the app protocol back into core command understanding. It does not call other project-specific converters, but it preserves the action kind so later internal code can reason about the command.
 
 
 ##### `CommandAction::from_core_with_cwd`  (lines 190–207)
@@ -1711,11 +1733,11 @@ fn into_core(self) -> CoreParsedCommand
 fn from_core_with_cwd(value: CoreParsedCommand, cwd: &AbsolutePathBuf) -> Self
 ```
 
-**Purpose**: Builds a v2 command action from a core parsed command while rebasing relative read paths against a supplied working directory. This makes the wire payload carry an absolute path for `Read` actions.
+**Purpose**: Converts an internally parsed command action into the v2 format, using the current working directory to make read paths absolute. This helps clients display file actions clearly and safely.
 
-**Data flow**: Consumes a `CoreParsedCommand` and borrows `cwd: &AbsolutePathBuf`; for `Read`, joins `cwd` with the core path and stores the resulting absolute path, while other variants move command/query/path fields directly. Returns a `CommandAction` and does not mutate external state.
+**Data flow**: It receives a core parsed command and the command’s working directory. For read actions, it joins the relative path from the parser onto the working directory so the client gets an absolute path. Other action types are copied into the matching v2 form. The output is a client-facing `CommandAction`.
 
-**Call relations**: This helper is used when core parsed-command data is exposed to clients and the client-facing representation needs a cwd-aware absolute path for file reads.
+**Call relations**: This is used when command details are prepared for display or approval prompts. Its one important handoff is to path joining, because clients should not have to guess what a relative file path means.
 
 *Call graph*: calls 1 internal fn (join).
 
@@ -1726,11 +1748,11 @@ fn from_core_with_cwd(value: CoreParsedCommand, cwd: &AbsolutePathBuf) -> Self
 fn id(&self) -> &str
 ```
 
-**Purpose**: Provides a uniform way to access the stable item identifier regardless of which `ThreadItem` variant is present. It avoids repeated exhaustive matching at call sites.
+**Purpose**: Returns the identifier for any kind of thread item. This gives callers one simple way to ask, “Which timeline card is this?” without caring whether it is a message, command, file change, or tool call.
 
-**Data flow**: Borrows `&self`, matches every enum variant, and returns a shared `&str` reference to that variant's `id` field. It performs no allocation or mutation.
+**Data flow**: It receives a reference to a `ThreadItem`. It checks which variant it is and returns the shared `id` field from that variant. It does not change the item.
 
-**Call relations**: This accessor is used by code that needs item identity without caring about item kind, especially notification and UI plumbing around heterogeneous thread items.
+**Call relations**: Any code that works generically with timeline items can call this instead of writing a separate match for every item type. It keeps item identity access consistent across all current `ThreadItem` variants.
 
 
 ##### `AutoReviewDecisionSource::from`  (lines 440–444)
@@ -1739,11 +1761,11 @@ fn id(&self) -> &str
 fn from(value: CoreGuardianAssessmentDecisionSource) -> Self
 ```
 
-**Purpose**: Converts the core guardian decision-source enum into the v2 auto-review decision-source enum. At present it exposes only the `Agent` source.
+**Purpose**: Converts the internal source of an automatic approval-review decision into the v2 source type. At present, the only supported source is the agent.
 
-**Data flow**: Consumes `CoreGuardianAssessmentDecisionSource`, matches the single supported variant, and returns `AutoReviewDecisionSource::Agent`.
+**Data flow**: It receives a core guardian decision source. It maps the internal `Agent` value to the v2 `Agent` value. The result can be placed in an approval-review completion notification.
 
-**Call relations**: This adapter is used when guardian auto-review completion data is emitted to clients.
+**Call relations**: This belongs to the guardian approval-review conversion path. It is used when the server reports who or what produced a final automatic review decision.
 
 
 ##### `GuardianRiskLevel::from`  (lines 459–466)
@@ -1752,11 +1774,11 @@ fn from(value: CoreGuardianAssessmentDecisionSource) -> Self
 fn from(value: CoreGuardianRiskLevel) -> Self
 ```
 
-**Purpose**: Maps the core guardian risk classification into the v2 risk-level enum used in approval auto-review payloads. It preserves the exact severity bucket.
+**Purpose**: Converts the internal safety risk level into the v2 risk level shown to clients. Risk levels describe how dangerous a reviewed action appears to be.
 
-**Data flow**: Consumes `CoreGuardianRiskLevel`, matches `Low`, `Medium`, `High`, or `Critical`, and returns the corresponding `GuardianRiskLevel`.
+**Data flow**: It receives a core risk value: low, medium, high, or critical. It returns the matching v2 value with the same meaning. No extra data is added or removed.
 
-**Call relations**: This conversion is part of building `GuardianApprovalReview` payloads from core assessment results.
+**Call relations**: This supports guardian approval-review notifications. It lets the internal safety system report risk in a stable client-facing format.
 
 
 ##### `GuardianUserAuthorization::from`  (lines 481–488)
@@ -1765,11 +1787,11 @@ fn from(value: CoreGuardianRiskLevel) -> Self
 fn from(value: CoreGuardianUserAuthorization) -> Self
 ```
 
-**Purpose**: Maps the core guardian user-authorization level into the v2 enum. It preserves whether the user is unknown or classified at low/medium/high authorization.
+**Purpose**: Converts the internal estimate of user authorization into the v2 format. This describes how strongly the system believes the user authorized the action.
 
-**Data flow**: Consumes `CoreGuardianUserAuthorization`, matches each variant, and returns the corresponding `GuardianUserAuthorization`.
+**Data flow**: It receives a core authorization value: unknown, low, medium, or high. It maps that value directly to the corresponding v2 value. The result can be included in a guardian review payload.
 
-**Call relations**: This adapter is used alongside risk-level conversion when constructing approval auto-review payloads.
+**Call relations**: This is part of the guardian review data path, alongside risk-level and rationale fields. It helps clients display why an automatic approval decision was made.
 
 
 ##### `GuardianCommandSource::from`  (lines 514–519)
@@ -1778,11 +1800,11 @@ fn from(value: CoreGuardianUserAuthorization) -> Self
 fn from(value: CoreGuardianCommandSource) -> Self
 ```
 
-**Purpose**: Converts the core command-source enum used by guardian reviews into the v2 command-source enum. It distinguishes shell-originated commands from unified-exec commands.
+**Purpose**: Converts the internal command source into the v2 command source. This tells clients whether a reviewed command came from the shell path or unified execution path.
 
-**Data flow**: Consumes `CoreGuardianCommandSource`, matches `Shell` or `UnifiedExec`, and returns the corresponding `GuardianCommandSource`.
+**Data flow**: It receives a core guardian command source. It maps `Shell` to `Shell` and `UnifiedExec` to `UnifiedExec`. The output is the v2 enum used in review actions.
 
-**Call relations**: This conversion is used inside `GuardianApprovalReviewAction::from` when adapting command and execve review actions.
+**Call relations**: This is used while converting guardian review actions from core into protocol form, especially for command and execve reviews.
 
 
 ##### `CoreGuardianCommandSource::from`  (lines 523–528)
@@ -1791,11 +1813,11 @@ fn from(value: CoreGuardianCommandSource) -> Self
 fn from(value: GuardianCommandSource) -> Self
 ```
 
-**Purpose**: Converts the v2 guardian command-source enum back into the core enum. It is the inverse adapter for request paths that send review actions inward.
+**Purpose**: Converts a v2 guardian command source back into the core command source. This is needed when a client-facing review action must be turned back into an internal review action.
 
-**Data flow**: Consumes `GuardianCommandSource`, matches `Shell` or `UnifiedExec`, and returns the corresponding `CoreGuardianCommandSource`.
+**Data flow**: It receives a v2 `GuardianCommandSource`. It maps each variant to the matching core variant. The output is ready for core guardian assessment code.
 
-**Call relations**: This conversion is used by `CoreGuardianAssessmentAction::try_from` when rebuilding core review actions from v2 payloads.
+**Call relations**: This is used by `CoreGuardianAssessmentAction::try_from` when converting protocol review actions back into core review actions.
 
 
 ##### `GuardianApprovalReviewAction::from`  (lines 639–696)
@@ -1804,11 +1826,11 @@ fn from(value: GuardianCommandSource) -> Self
 fn from(value: CoreGuardianAssessmentAction) -> Self
 ```
 
-**Purpose**: Transforms a core guardian assessment action into the tagged v2 review-action enum used in auto-review notifications. It preserves the action-specific payload for commands, execve, patch application, network access, MCP tool calls, and permission requests.
+**Purpose**: Converts an internal guardian assessment action into the v2 action format. A review action is the thing being judged, such as a command, patch, network access, tool call, or permission request.
 
-**Data flow**: Consumes `CoreGuardianAssessmentAction`, pattern-matches each variant, converts nested enums (`source`, `protocol`, `permissions`) where needed, moves strings/paths/vectors directly, and returns the corresponding `GuardianApprovalReviewAction` variant.
+**Data flow**: It receives a core guardian action. It matches the action kind, copies its fields, and converts nested values such as command source, network protocol, and requested permissions into v2-compatible forms. The output is a `GuardianApprovalReviewAction` that can be sent to clients.
 
-**Call relations**: This is the outward-facing adapter for guardian review notifications; it delegates nested conversions to `GuardianCommandSource::from`, `NetworkApprovalProtocol` conversion, and `RequestPermissionProfile` conversion.
+**Call relations**: This function is used when the server emits guardian approval-review notifications. It hands nested pieces to their own conversion methods so the full review action is safe to serialize through the v2 API.
 
 
 ##### `CoreGuardianAssessmentAction::try_from`  (lines 702–759)
@@ -1817,11 +1839,11 @@ fn from(value: CoreGuardianAssessmentAction) -> Self
 fn try_from(value: GuardianApprovalReviewAction) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert a v2 guardian review action back into the core assessment-action type, validating nested permission payloads as needed. It returns an `io::Error` when nested conversions fail.
+**Purpose**: Converts a v2 guardian review action back into the internal core action, returning an error if a nested permission conversion fails. This is the reverse path for data that needs to re-enter the core safety system.
 
-**Data flow**: Consumes `GuardianApprovalReviewAction`, pattern-matches each variant, converts nested command source and network protocol values, and for `RequestPermissions` calls `permissions.try_into()?`. Wraps the constructed core action in `Ok(...)` or propagates conversion errors.
+**Data flow**: It receives a v2 guardian review action. It matches the action kind, copies fields into the core form, and converts nested values such as command source, network protocol, and permissions. It returns either a core action or an input/output error if permissions cannot be converted.
 
-**Call relations**: This is the inverse of `GuardianApprovalReviewAction::from`; it is used when client-supplied review-action data must be handed back to core approval logic.
+**Call relations**: This is the counterpart to `GuardianApprovalReviewAction::from`. It hands permission conversion to the permission profile’s own fallible converter because some client-facing permission shapes may not be valid internally.
 
 
 ##### `WebSearchAction::from`  (lines 783–796)
@@ -1830,11 +1852,11 @@ fn try_from(value: GuardianApprovalReviewAction) -> Result<Self, Self::Error>
 fn from(value: codex_protocol::models::WebSearchAction) -> Self
 ```
 
-**Purpose**: Converts the core web-search action descriptor into the v2 tagged enum. It preserves the specific search/open/find-in-page operation and its optional parameters.
+**Purpose**: Converts an internal web-search action into the v2 format. This lets clients show whether the agent searched, opened a page, searched within a page, or did something unknown.
 
-**Data flow**: Consumes `codex_protocol::models::WebSearchAction`, matches each variant, moves optional query/url/pattern fields into the corresponding `WebSearchAction`, and returns it.
+**Data flow**: It receives a core web-search action. It copies search queries, URLs, and find patterns into the matching v2 variant, or maps unknown actions to `Other`. The result is a client-ready description of the web search step.
 
-**Call relations**: This conversion is used by `ThreadItem::from` for `CoreTurnItem::WebSearch`, and also by web-search event handling paths that need the same client-facing action shape.
+**Call relations**: This is called when web-search events are converted for the protocol, including from `ThreadItem::from` and from web-search completion handling. It gives those flows a consistent action payload.
 
 *Call graph*: called by 2 (handle_web_search_end, from).
 
@@ -1845,11 +1867,11 @@ fn from(value: codex_protocol::models::WebSearchAction) -> Self
 fn from(value: CoreTurnItem) -> Self
 ```
 
-**Purpose**: Converts a core turn item into the v2 `ThreadItem` enum that clients consume. It is the central translation point for all item kinds emitted during a thread or turn.
+**Purpose**: Converts an internal turn item into the v2 timeline item that clients display. This is one of the main bridges from the agent engine’s internal event stream to the public app-server protocol.
 
-**Data flow**: Consumes `CoreTurnItem` and pattern-matches each variant. It maps nested user inputs and hook prompt fragments, concatenates agent message text from `CoreAgentMessageContent::Text` entries, copies plan/reasoning/image/sleep fields, converts web-search actions, transforms file changes via `convert_patch_changes` and a status fallback to `PatchApplyStatus::InProgress`, converts MCP tool-call status/result/error and duration, and maps context compaction directly. Returns the assembled `ThreadItem` without mutating external state.
+**Data flow**: It receives a core turn item. Depending on the item kind, it copies IDs and fields, converts nested content such as user inputs, hook fragments, memory citations, file changes, web search actions, MCP tool-call results, and statuses, and calculates durations in milliseconds where available. The output is a `ThreadItem` ready to send in started or completed notifications.
 
-**Call relations**: This function is called by item lifecycle handlers when emitting started/completed notifications. It delegates nested work to helpers such as `convert_patch_changes`, `HookPromptFragment::from`, `PatchApplyStatus::from`, `McpToolCallStatus::from`, `McpToolCallResult::from`, `McpToolCallError::from`, `MemoryCitation::from`, and `WebSearchAction::from`.
+**Call relations**: This conversion is called by item-started and item-completed handlers. It delegates patch conversion to `convert_patch_changes` and uses several `from` conversions in this file so each nested piece becomes the correct v2 shape.
 
 *Call graph*: calls 3 internal fn (convert_patch_changes, from, from); called by 2 (handle_item_completed, handle_item_started).
 
@@ -1860,11 +1882,11 @@ fn from(value: CoreTurnItem) -> Self
 fn from(value: codex_protocol::items::HookPromptFragment) -> Self
 ```
 
-**Purpose**: Converts a core hook prompt fragment into the v2 fragment struct. It preserves the fragment text and the originating hook run identifier.
+**Purpose**: Converts one internal hook prompt fragment into the v2 shape. A hook prompt fragment is a piece of prompt text produced by a hook run.
 
-**Data flow**: Consumes `codex_protocol::items::HookPromptFragment`, moves `text` and `hook_run_id` into a new `HookPromptFragment`, and returns it.
+**Data flow**: It receives a core hook prompt fragment. It copies the text and hook run identifier into a v2 `HookPromptFragment`. The result can be included in a `ThreadItem::HookPrompt`.
 
-**Call relations**: This conversion is used by `ThreadItem::from` when adapting `CoreTurnItem::HookPrompt`.
+**Call relations**: This is used inside `ThreadItem::from` when a core hook prompt is turned into a client-visible timeline item.
 
 
 ##### `CommandExecutionStatus::from`  (lines 919–925)
@@ -1873,11 +1895,11 @@ fn from(value: codex_protocol::items::HookPromptFragment) -> Self
 fn from(value: &CoreExecCommandStatus) -> Self
 ```
 
-**Purpose**: Converts an owned core command-execution terminal status into the v2 status enum by delegating to the borrowed implementation. It avoids duplicating the actual mapping logic.
+**Purpose**: Converts an internal command execution status into the v2 status. It tells clients whether a command completed, failed, or was declined.
 
-**Data flow**: Consumes `CoreExecCommandStatus`, borrows it temporarily, calls `Self::from(&value)`, and returns the resulting `CommandExecutionStatus`.
+**Data flow**: One implementation receives the core status by value and forwards to the borrowed-status conversion. The borrowed conversion then maps each core terminal status to its matching v2 status. The result is used in command execution items.
 
-**Call relations**: This owned conversion exists as a convenience wrapper around the borrowed conversion implementation used elsewhere in the codebase.
+**Call relations**: This supports command execution display and notification payloads. The by-value converter calls the by-reference converter to avoid duplicating the mapping.
 
 *Call graph*: 1 external calls (from).
 
@@ -1888,11 +1910,11 @@ fn from(value: &CoreExecCommandStatus) -> Self
 fn from(value: &CorePatchApplyStatus) -> Self
 ```
 
-**Purpose**: Converts an owned core patch-apply terminal status into the v2 status enum by delegating to the borrowed implementation. It keeps the mapping logic centralized.
+**Purpose**: Converts an internal patch-apply status into the v2 file-change status. This tells clients whether a file edit completed, failed, or was declined.
 
-**Data flow**: Consumes `CorePatchApplyStatus`, borrows it, calls `Self::from(&value)`, and returns the resulting `PatchApplyStatus`.
+**Data flow**: One implementation receives the core patch status by value and forwards to the borrowed-status conversion. The borrowed conversion maps each core terminal status to the corresponding v2 status. The output is used in file-change timeline items.
 
-**Call relations**: This wrapper supports callers that own the core status while reusing the borrowed conversion logic.
+**Call relations**: This is used when core file-change items are converted into `ThreadItem::FileChange`. The by-value path reuses the borrowed conversion for the actual mapping.
 
 *Call graph*: 1 external calls (from).
 
@@ -1903,11 +1925,11 @@ fn from(value: &CorePatchApplyStatus) -> Self
 fn from(value: CoreMcpToolCallStatus) -> Self
 ```
 
-**Purpose**: Maps the core MCP tool-call lifecycle status into the v2 enum. It preserves whether the call is still running, completed successfully, or failed.
+**Purpose**: Converts the internal status of an MCP tool call into the v2 status. MCP means Model Context Protocol, a way for the agent to call external tools provided by servers.
 
-**Data flow**: Consumes `CoreMcpToolCallStatus`, matches `InProgress`, `Completed`, or `Failed`, and returns the corresponding `McpToolCallStatus`.
+**Data flow**: It receives a core MCP tool-call status. It maps in-progress, completed, and failed states to the same meanings in the v2 enum. The result becomes part of a `ThreadItem::McpToolCall`.
 
-**Call relations**: This conversion is used by `ThreadItem::from` when adapting `CoreTurnItem::McpToolCall`.
+**Call relations**: This is called from `ThreadItem::from` while building a client-visible MCP tool-call item. It keeps the timeline status vocabulary consistent with other protocol items.
 
 *Call graph*: called by 1 (from).
 
@@ -1918,11 +1940,11 @@ fn from(value: CoreMcpToolCallStatus) -> Self
 fn from(value: CoreSubAgentActivityKind) -> Self
 ```
 
-**Purpose**: Converts the core sub-agent activity kind into the v2 enum used in thread items and notifications. It preserves whether the sub-agent started, interacted, or was interrupted.
+**Purpose**: Converts an internal sub-agent activity kind into the v2 form. This records whether a sub-agent started, was interacted with, or was interrupted.
 
-**Data flow**: Consumes `CoreSubAgentActivityKind`, matches each variant, and returns the corresponding `SubAgentActivityKind`.
+**Data flow**: It receives a core sub-agent activity value. It returns the matching v2 value with the same meaning. No other state is changed.
 
-**Call relations**: This adapter is used wherever core collaboration/sub-agent activity is surfaced through the v2 item model.
+**Call relations**: This supports timeline items that describe activity from helper or child agents. It is part of the general pattern of translating core event types into stable v2 protocol types.
 
 
 ##### `CollabAgentState::from`  (lines 1073–1104)
@@ -1931,11 +1953,11 @@ fn from(value: CoreSubAgentActivityKind) -> Self
 fn from(value: CoreAgentStatus) -> Self
 ```
 
-**Purpose**: Converts a core agent runtime status into the v2 collaboration-agent state, including any terminal message text when present. It normalizes all statuses into a common `{ status, message }` shape.
+**Purpose**: Converts an internal collaborative agent status into the v2 state shown to clients. It also preserves any human-readable message for completed or errored states.
 
-**Data flow**: Consumes `CoreAgentStatus`, matches each variant, sets the corresponding `CollabAgentStatus`, and fills `message` with `None`, the optional completion message, or `Some(error)` for errored states. Returns a new `CollabAgentState`.
+**Data flow**: It receives a core agent status. For simple states like running, interrupted, shutdown, or not found, it creates a v2 state with no message. For completed and errored states, it carries over the associated message in the appropriate optional field. The output is a `CollabAgentState`.
 
-**Call relations**: This conversion is used by multiple collaboration event handlers when they need to publish the latest known state of spawned/resumed/closed agents to clients.
+**Call relations**: This is used by collaboration event flows such as spawn, resume, interaction, close, and server-notification conversion. It lets those flows report the current state of one or more collaborating agents in a uniform client-facing way.
 
 *Call graph*: called by 6 (item_event_to_server_notification, collab_resume_end_maps_to_item_completed_resume_agent, handle_collab_agent_interaction_end, handle_collab_agent_spawn_end, handle_collab_close_end, handle_collab_resume_end).
 
@@ -1946,11 +1968,11 @@ fn from(value: CoreAgentStatus) -> Self
 fn strip_experimental_fields(&mut self)
 ```
 
-**Purpose**: Removes unstable fields from an approval-request payload before it is sent to clients that should not receive experimental data. Currently it strips only `additional_permissions`.
+**Purpose**: Removes fields that are marked experimental before sending approval parameters to clients that should not receive them. This protects compatibility while the API is still changing.
 
-**Data flow**: Borrows `&mut self` and sets `self.additional_permissions = None`. It returns `()` and mutates the payload in place.
+**Data flow**: It receives a mutable approval-parameter object. It sets the `additional_permissions` field to `None`, leaving the rest of the approval request unchanged. The same object is modified in place.
 
-**Call relations**: This method is called on outbound approval-request payloads as a compatibility filter; the comment notes it is a temporary hardcoded approach pending a more generic experimental-field stripping mechanism.
+**Call relations**: This is used on outbound command approval requests when the server needs to hide experimental data. The comment notes that this is a temporary, hand-coded compatibility step rather than a general experimental-field system.
 
 
 ##### `DynamicToolCallOutputContentItem::from`  (lines 1439–1446)
@@ -1959,27 +1981,35 @@ fn strip_experimental_fields(&mut self)
 fn from(item: DynamicToolCallOutputContentItem) -> Self
 ```
 
-**Purpose**: Converts the v2 dynamic-tool output content item into the core dynamic-tools content item. It preserves whether the content is text or an image URL.
+**Purpose**: Converts a v2 dynamic tool-call output item into the core dynamic-tools format. Dynamic tools can return content such as text or images for the agent to use.
 
-**Data flow**: Consumes `DynamicToolCallOutputContentItem`, matches `InputText` or `InputImage`, moves the contained string, and returns the corresponding `codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem`.
+**Data flow**: It receives a v2 output content item. If it is text, it copies the text into the core text variant; if it is an image, it copies the image URL into the core image variant. The result is ready for internal dynamic-tool handling.
 
-**Call relations**: This conversion is used when client-provided dynamic tool call responses are handed back to core dynamic-tool execution logic.
+**Call relations**: This is the bridge from protocol-level dynamic tool responses back into the core tool system. It preserves the content kind so later agent logic can consume text and images correctly.
 
 
 ### `app-server-protocol/src/protocol/v2/review.rs`
 
 `data_model` · `request handling`
 
-This file models the review-start API in protocol v2. It begins by deriving a protocol-facing `ReviewDelivery` enum from the core protocol enum via the `v2_enum_from_core!` macro, preserving the allowed delivery modes `Inline` and `Detached` while keeping the v2 schema aligned with shared core definitions. `ReviewStartParams` identifies the source thread, the review target, and an optional delivery preference; when omitted, delivery defaults to inline behavior as documented in the field comment. `ReviewStartResponse` returns the resulting `Turn` plus a `review_thread_id`, which is either the original thread for inline execution or a newly created thread for detached execution. The `ReviewTarget` tagged enum is the main domain model here: it supports reviewing all uncommitted changes, a diff against a named base branch, a specific commit identified by SHA with an optional UI title, or arbitrary custom instructions equivalent to the older free-form prompt style. Serde and TS tagging use `type` with camelCase naming, making the discriminated union explicit on the wire. The file is purely declarative, but its comments encode important semantics around default delivery and the meaning of the returned thread id.
+This file is a contract between the client and the server for the “start a review” feature. In plain terms, it says: when a user asks the system to review code, what information must the client send, and what shape will the server’s answer have? Without this file, the two sides could disagree about whether the user wants to review uncommitted files, a branch comparison, a commit, or custom instructions.
+
+The main request type is `ReviewStartParams`. It includes the current conversation thread, the review target, and an optional delivery choice. Delivery means where the review should happen: inline in the same thread, or detached in a new review thread.
+
+The response type, `ReviewStartResponse`, gives back a `Turn`, which represents the started assistant work, plus the thread id where the review is actually running. That matters because detached reviews create a different thread from the original one.
+
+`ReviewTarget` lists the possible things to review. It can mean local uncommitted changes, changes compared with a base branch, one specific commit, or fully custom review instructions. The file also derives serialization, JSON schema, and TypeScript output, so the same message shapes can be used safely across Rust, JSON APIs, and frontend TypeScript code.
 
 
 ### `app-server-protocol/src/protocol/v2/realtime.rs`
 
-`data_model` · `realtime session setup and streaming event serialization`
+`data_model` · `request handling and realtime event streaming`
 
-This file models the experimental realtime API surface for a thread. It introduces `ThreadRealtimeAudioChunk`, a transport-friendly audio frame carrying base64/string `data`, `sample_rate`, `num_channels`, optional `samples_per_channel`, and optional `item_id`. Around that, it defines request/response structs for starting a realtime session, appending audio/text/speech, stopping a session, and listing supported voices. `ThreadRealtimeStartParams` is the richest payload: it allows per-session overrides for architecture, model, protocol version, voice, transport (`Websocket` or `Webrtc { sdp }`), startup context inclusion, and a double-optional `prompt` that distinguishes omission from explicit null.
+This file is like the shared form book for a live conversation feature. Both sides need to agree on what a “start realtime session” request looks like, what an audio chunk contains, and what kinds of notifications may arrive while the session is running. Without these definitions, the client and server could send JSON that looks right to one side but cannot be understood by the other.
 
-The notification types describe the event stream emitted after startup: acceptance (`ThreadRealtimeStartedNotification`), raw non-audio items, transcript deltas and completions, output audio chunks, remote SDP for WebRTC, errors, and closure reasons. The only executable logic is the pair of `From` implementations between `CoreRealtimeAudioFrame` and `ThreadRealtimeAudioChunk`. Both are symmetric destructuring/reconstruction adapters with no validation or transformation, which keeps the app-server wire format aligned with the core realtime engine while still letting this crate own its exported schema and TypeScript bindings.
+Most of the file is made of small data types. The request types describe actions a client can take: start realtime for a thread, append audio, append text, append speech-ready text, stop realtime, or list supported voices. The response types are the matching replies. The notification types describe events the backend can push back, such as “started,” “new item added,” transcript text streaming in pieces, final transcript text, output audio, WebRTC connection details, errors, and closure.
+
+The file also exports TypeScript and JSON schema descriptions. In plain terms, that means frontend code and API tools can use the same contract instead of hand-copying it. One important bridge is `ThreadRealtimeAudioChunk`, which mirrors the core protocol’s audio frame type. The two conversion functions let this v2 API type move cleanly to and from the deeper core protocol type.
 
 #### Function details
 
@@ -1989,11 +2019,11 @@ The notification types describe the event stream emitted after startup: acceptan
 fn from(value: CoreRealtimeAudioFrame) -> Self
 ```
 
-**Purpose**: Converts a core realtime audio frame into the v2 thread realtime audio chunk used on the app-server API. It is a lossless field-for-field adaptation.
+**Purpose**: This converts a core realtime audio frame into the v2 API’s thread audio chunk shape. It is used when audio data from the lower-level protocol needs to be exposed through this app-server protocol type.
 
-**Data flow**: Consumes `CoreRealtimeAudioFrame`, destructures out `data`, `sample_rate`, `num_channels`, `samples_per_channel`, and `item_id`, then returns `ThreadRealtimeAudioChunk` with those same values.
+**Data flow**: It receives a core audio frame containing encoded audio data, sample rate, channel count, optional sample count, and an optional item id. It copies those same pieces into a `ThreadRealtimeAudioChunk`. The result is the same audio information, but packaged in the type used by this v2 thread realtime API.
 
-**Call relations**: Used when backend/core realtime events need to be emitted through the v2 protocol, especially in output-audio notifications or any API surface that exposes audio frames. It does not delegate further because all fields are scalar or optional scalar values.
+**Call relations**: This is a bridge between the core realtime protocol and the app-server v2 protocol. When code needs to present core audio as a thread realtime API message, this conversion can be called directly or through Rust’s standard `From`/`Into` conversion pattern.
 
 
 ##### `CoreRealtimeAudioFrame::from`  (lines 46–61)
@@ -2002,11 +2032,11 @@ fn from(value: CoreRealtimeAudioFrame) -> Self
 fn from(value: ThreadRealtimeAudioChunk) -> Self
 ```
 
-**Purpose**: Converts the API-facing `ThreadRealtimeAudioChunk` back into the core realtime frame type consumed by backend logic. This is the inverse of the other conversion.
+**Purpose**: This converts the v2 API’s thread audio chunk back into the core protocol’s audio frame shape. It is used when audio supplied through the app-server API needs to be handed down to the lower-level realtime system.
 
-**Data flow**: Takes ownership of a `ThreadRealtimeAudioChunk`, destructures its five fields, and rebuilds a `CoreRealtimeAudioFrame` with identical contents.
+**Data flow**: It receives a `ThreadRealtimeAudioChunk` with audio data and its basic format details. It moves those fields into a `CoreRealtimeAudioFrame`. The result is the same audio content, now packaged for the core realtime protocol to consume.
 
-**Call relations**: Used when client-supplied audio chunks from `thread/realtime/appendAudio` or similar flows must be handed to the core realtime subsystem. It sits at the protocol boundary and performs no validation beyond Rust type compatibility.
+**Call relations**: This is the reverse bridge of `ThreadRealtimeAudioChunk::from`. When incoming thread realtime audio must be passed into the core realtime machinery, this conversion turns the public v2 API type into the internal core type, either explicitly or through Rust’s `From`/`Into` conversion pattern.
 
 
 ### V2 account and configuration surfaces
@@ -2014,11 +2044,15 @@ These files cover user/session state, models and apps, permissions and configura
 
 ### `app-server-protocol/src/protocol/v2/account.rs`
 
-`data_model` · `request/response serialization and notification payload definition across account-related API calls`
+`data_model` · `request handling and account-related notifications`
 
-This file is the protocol surface for account features in API v2. Most of it is made of serde/JsonSchema/ts-rs annotated enums and structs that precisely shape JSON and generated TypeScript definitions for account login flows, session management, token refresh, rate-limit inspection, token-usage reporting, add-credits nudges, and account-change notifications. The `Account` enum models the currently authenticated provider account with variants for API key, ChatGPT, and Amazon Bedrock; the Bedrock variant uses a serde default so omitted `credential_source` fields deserialize to `AwsManaged`. Login is split into request and response enums so each auth mode carries only the fields relevant to that flow, including an experimental internal-only `chatgptAuthTokens` path and a device-code variant with verification URL and user code.
+This file is mostly a dictionary of account-related messages for the v2 protocol. In plain terms, it says: “when a client asks to log in, list sessions, read rate limits, refresh tokens, or receive an account update, this is the exact form of the request or reply.” That matters because the server may be written in Rust while clients may use TypeScript or JSON. Without these shared shapes, both sides could disagree about field names, optional values, or what kinds of account states are possible.
 
-The second major responsibility is adapting core protocol/domain types into this v2 schema. `From` implementations convert `ProviderAccount`, rate-limit snapshots, windows, credits, spend-control limits, and reached-type enums from `codex_protocol` types into the local exported forms. These conversions preserve optionality, map nested structures recursively, and normalize a few representation details such as rounding `used_percent` from a core floating-point value into an `i32`. Several payloads intentionally use plain `String` identifiers instead of UUID-specific types to avoid JSON Schema and TypeScript generation quirks; conversion to stronger ID types is deferred to higher layers. Sparse rolling notifications are documented as merge-on-client updates rather than full replacements, which is an important behavioral contract not visible from the field list alone.
+The file covers several account paths: API-key accounts, ChatGPT accounts, and Amazon Bedrock accounts. It also describes login flows, including browser OAuth, device-code login, and an internal token-supplied flow. For multi-account use, it defines sessions, workspaces, switching, and logout messages.
+
+A large part of the file describes usage limits. It exposes snapshots of rate-limit windows, credits, spend-control limits, reset credits, and token-usage summaries. Think of these snapshots like a fuel gauge: they show how much has been used, when the tank resets, and whether special credit or workspace rules are affecting access.
+
+The final piece is translation. The app’s deeper core protocol has its own account and limit types. The small `From` conversions here turn those internal types into the v2 API types, keeping the public protocol stable while the inside of the system can use its own models.
 
 #### Function details
 
@@ -2028,11 +2062,11 @@ The second major responsibility is adapting core protocol/domain types into this
 fn default_bedrock_credential_source() -> AmazonBedrockCredentialSource
 ```
 
-**Purpose**: Supplies the default Amazon Bedrock credential source used when deserializing an `Account::AmazonBedrock` payload that omits `credential_source`. It hard-codes the protocol default to AWS-managed credentials.
+**Purpose**: This supplies the default credential source for an Amazon Bedrock account when a client does not send one. It keeps older or simpler clients working by assuming AWS-managed credentials unless told otherwise.
 
-**Data flow**: It takes no arguments and reads no external state. It constructs and returns the enum value `AmazonBedrockCredentialSource::AwsManaged`, which serde uses through the `default` attribute on the `credential_source` field.
+**Data flow**: No input is provided. The function simply returns the `AwsManaged` credential source value, which is then used as the missing default for the `credential_source` field.
 
-**Call relations**: This function is not part of request handling logic directly; serde invokes it during deserialization only when an `amazonBedrock` account object lacks the `credential_source` property. It delegates to no other code because the default is a single constant enum variant.
+**Call relations**: This function is tied to the Amazon Bedrock account data shape through the serialization settings. When incoming JSON omits the credential source, the deserialization process calls this helper so the account object still has a clear, usable value.
 
 
 ##### `Account::from`  (lines 43–51)
@@ -2041,11 +2075,11 @@ fn default_bedrock_credential_source() -> AmazonBedrockCredentialSource
 fn from(account: ProviderAccount) -> Self
 ```
 
-**Purpose**: Converts an internal/provider-facing `ProviderAccount` enum into the v2 protocol `Account` enum exposed on the wire. It preserves the provider-specific payload fields while changing only the type namespace.
+**Purpose**: This converts an internal provider account into the public v2 `Account` form that clients understand. It preserves the account kind and carries over the small amount of account-specific detail, such as ChatGPT email and plan type.
 
-**Data flow**: It consumes a `ProviderAccount` value, pattern-matches on its variant, and rebuilds the corresponding local `Account` variant. For `Chatgpt` it moves `email` and `plan_type`; for `AmazonBedrock` it moves `credential_source`; for `ApiKey` it returns the empty `ApiKey {}` variant.
+**Data flow**: It receives a `ProviderAccount` from the core account layer. It checks which kind it is: API key, ChatGPT, or Amazon Bedrock. It then builds the matching v2 `Account` value with the same relevant fields and returns it.
 
-**Call relations**: This conversion is used wherever higher layers need to serialize provider account state into a v2 response such as `GetAccountResponse`. It is a leaf adapter: callers hand it a core/provider model, and it delegates only to Rust pattern matching without invoking helper functions.
+**Call relations**: This sits at the boundary between internal account state and the API protocol. When account information needs to be sent out through v2 responses or notifications, this conversion adapts the core model into the client-facing model.
 
 
 ##### `RateLimitSnapshot::from`  (lines 422–435)
@@ -2054,11 +2088,11 @@ fn from(account: ProviderAccount) -> Self
 fn from(value: CoreRateLimitSnapshot) -> Self
 ```
 
-**Purpose**: Transforms a core rate-limit snapshot into the v2 snapshot shape returned by account rate-limit endpoints and notifications. It performs the top-level field mapping and recursively converts nested optional substructures.
+**Purpose**: This converts the core system’s rate-limit snapshot into the v2 protocol snapshot sent to clients. It keeps the same overall meaning while translating nested pieces, such as windows, credits, and spend-control limits, into their v2 forms.
 
-**Data flow**: It consumes a `CoreRateLimitSnapshot` and copies scalar/optional fields like `limit_id`, `limit_name`, and `plan_type` directly. For nested fields it maps `primary` and `secondary` through `RateLimitWindow::from`, `credits` through `CreditsSnapshot::from`, `individual_limit` through `SpendControlLimitSnapshot::from`, and `rate_limit_reached_type` through `RateLimitReachedType::from`, returning a fully populated local `RateLimitSnapshot`.
+**Data flow**: It receives a core `RateLimitSnapshot` containing optional fields about limit identity, time windows, credits, plan type, and why a limit was reached. It copies simple fields directly and converts nested core values into v2 values when they are present. The output is a v2 `RateLimitSnapshot` ready for API responses or notifications.
 
-**Call relations**: Callers use this when exposing core metering state through `GetAccountRateLimitsResponse` or `AccountRateLimitsUpdatedNotification`. It sits at the center of the conversion chain, delegating nested pieces to the other `From` implementations in this file so the outer response builder does not need to know each sub-type mapping.
+**Call relations**: This function is used when the server reports account rate-limit status through the v2 protocol. It hands nested conversion work to `RateLimitWindow::from`, `CreditsSnapshot::from`, `SpendControlLimitSnapshot::from`, and `RateLimitReachedType::from` so each smaller piece is translated consistently.
 
 
 ##### `RateLimitReachedType::from`  (lines 450–466)
@@ -2067,11 +2101,11 @@ fn from(value: CoreRateLimitSnapshot) -> Self
 fn from(value: CoreRateLimitReachedType) -> Self
 ```
 
-**Purpose**: Maps the core enum describing why a rate limit was hit into the v2 protocol enum with the same semantic cases. It preserves all distinct workspace-owner/member and credits/usage-limit reasons.
+**Purpose**: This converts the core explanation for a reached limit into the v2 explanation clients receive. The explanation distinguishes between general rate limits, depleted credits, and workspace owner or member usage-limit cases.
 
-**Data flow**: It takes a `CoreRateLimitReachedType`, matches each variant, and returns the corresponding local `RateLimitReachedType` variant. No fields are transformed because both enums are simple tagged cases.
+**Data flow**: It takes a core `RateLimitReachedType` value. It matches the exact reason and returns the corresponding v2 `RateLimitReachedType` value with the same meaning.
 
-**Call relations**: This function is reached from `RateLimitSnapshot::from` when a core snapshot includes `rate_limit_reached_type`. It delegates nowhere else; its role is to isolate the wire-format enum from the core enum so the rest of the protocol layer can depend only on local exported types.
+**Call relations**: This is called as part of building a v2 `RateLimitSnapshot` when the core snapshot says a limit has been reached. It keeps the public-facing reason aligned with the internal reason without exposing the internal type directly.
 
 
 ##### `CoreRateLimitReachedType::from`  (lines 470–486)
@@ -2080,11 +2114,11 @@ fn from(value: CoreRateLimitReachedType) -> Self
 fn from(value: RateLimitReachedType) -> Self
 ```
 
-**Purpose**: Performs the reverse conversion from the v2 `RateLimitReachedType` back into the core `CoreRateLimitReachedType`. This allows code that accepts protocol-layer values to pass them back into core logic without exposing protocol enums downstream.
+**Purpose**: This converts a v2 rate-limit-reached reason back into the core protocol’s version of that reason. It is useful when client-facing values need to be passed back into internal logic without losing the exact meaning.
 
-**Data flow**: It consumes a local `RateLimitReachedType`, matches on the five possible variants, and returns the equivalent `CoreRateLimitReachedType`. The transformation is one-to-one and does not touch any external state.
+**Data flow**: It receives a v2 `RateLimitReachedType`. It checks which reason it represents and returns the matching core `CoreRateLimitReachedType`.
 
-**Call relations**: This reverse adapter is used when protocol input or intermediate state must be converted back into core metering types. Unlike the forward conversion used by snapshot serialization, this one supports flows moving from API-layer representations into internal logic.
+**Call relations**: This is the reverse companion to `RateLimitReachedType::from`. Together they let code move the same set of limit-reached reasons across the API boundary in either direction.
 
 
 ##### `RateLimitWindow::from`  (lines 501–507)
@@ -2093,11 +2127,11 @@ fn from(value: RateLimitReachedType) -> Self
 fn from(value: CoreRateLimitWindow) -> Self
 ```
 
-**Purpose**: Converts a core rate-limit window into the v2 wire representation, including normalizing percentage precision. It turns the core floating-point usage percentage into an integer percentage for clients.
+**Purpose**: This converts one core rate-limit time window into the simpler v2 window shown to clients. A window describes how much of a limit has been used and when that window resets.
 
-**Data flow**: It consumes a `CoreRateLimitWindow`, reads `used_percent`, `window_minutes`, and `resets_at`, rounds `used_percent` with `.round()` and casts it to `i32`, renames `window_minutes` to `window_duration_mins`, and returns a local `RateLimitWindow`.
+**Data flow**: It receives a core `RateLimitWindow` with a usage percentage, optional window length, and optional reset time. It rounds the usage percentage to a whole number, copies the timing fields, and returns the v2 `RateLimitWindow`.
 
-**Call relations**: This function is called from `RateLimitSnapshot::from` for both `primary` and `secondary` windows when those options are present. It is a narrow leaf conversion whose main design choice is the explicit rounding step before serialization.
+**Call relations**: This is called while converting a full `RateLimitSnapshot`. It handles the small but important detail of presenting usage as an integer percentage, which is easier for clients to display.
 
 
 ##### `CreditsSnapshot::from`  (lines 520–526)
@@ -2106,11 +2140,11 @@ fn from(value: CoreRateLimitWindow) -> Self
 fn from(value: CoreCreditsSnapshot) -> Self
 ```
 
-**Purpose**: Adapts the core credits snapshot into the v2 credits payload embedded in rate-limit responses. It preserves the account's credit availability, unlimited flag, and optional balance string exactly.
+**Purpose**: This converts the core view of account credits into the v2 credit snapshot sent to clients. It tells the client whether credits exist, whether they are unlimited, and what balance text should be shown if available.
 
-**Data flow**: It takes a `CoreCreditsSnapshot`, copies `has_credits`, `unlimited`, and `balance` into a new local `CreditsSnapshot`, and returns it. There is no computation beyond field transfer.
+**Data flow**: It receives a core `CreditsSnapshot`. It copies `has_credits`, `unlimited`, and `balance` into a new v2 `CreditsSnapshot`, then returns it.
 
-**Call relations**: This converter is invoked by `RateLimitSnapshot::from` when the core snapshot includes credits information. It exists to keep the outer snapshot conversion simple and to decouple the exported schema type from the core protocol type.
+**Call relations**: This is used inside `RateLimitSnapshot::from` when the core rate-limit data includes credit information. It keeps credit display data moving cleanly from the account system to the v2 API.
 
 
 ##### `SpendControlLimitSnapshot::from`  (lines 541–548)
@@ -2119,22 +2153,24 @@ fn from(value: CoreCreditsSnapshot) -> Self
 fn from(value: CoreSpendControlLimitSnapshot) -> Self
 ```
 
-**Purpose**: Converts a core spend-control limit snapshot into the v2 representation used inside account rate-limit payloads. It carries over the monetary/string values and reset timing without reinterpretation.
+**Purpose**: This converts the core spend-control limit information into the v2 form clients can display. Spend-control limits are account or workspace spending caps, separate from ordinary short-term rate limits.
 
-**Data flow**: It consumes a `CoreSpendControlLimitSnapshot`, copies `limit`, `used`, `remaining_percent`, and `resets_at` into a local `SpendControlLimitSnapshot`, and returns the new struct. No optional wrapping or numeric normalization is applied here.
+**Data flow**: It receives a core `SpendControlLimitSnapshot` with the configured limit, amount used, remaining percentage, and reset time. It copies those values into the v2 `SpendControlLimitSnapshot` and returns it.
 
-**Call relations**: This function is called from `RateLimitSnapshot::from` when an `individual_limit` is present in the core snapshot. It is one of the nested adapters that collectively build the full v2 rate-limit response tree.
+**Call relations**: This is called while converting a full `RateLimitSnapshot` when individual spend-control information is present. It lets the public v2 response include spending-cap details without exposing the internal core type.
 
 
 ### `app-server-protocol/src/protocol/v2/model.rs`
 
-`data_model` · `model catalog reads and model-related notifications during turn execution`
+`data_model` · `request handling and API serialization`
 
-This file is a compact schema module for model-related API payloads. It exports macro-generated enums for model reroute reasons and verification markers, request/response structs for reading provider capabilities and listing models, and the nested model metadata types used in those responses (`Model`, `ModelUpgradeInfo`, `ModelServiceTier`, `ReasoningEffortOption`, `ModelAvailabilityNux`). It also defines notifications for model rerouting, model verification, and arbitrary moderation metadata attached to a turn.
+This file is mostly a set of data definitions for the app server's model API. Think of it like a set of blank forms: one form asks for a page of models, another form returns the model list, another announces that a request was rerouted from one model to another. These forms matter because both sides of the API need to agree on the same field names and meanings.
 
-The `Model` struct is the main payload shape and includes both catalog metadata (`id`, `display_name`, `description`, `hidden`, `is_default`) and capability/configuration details such as supported reasoning efforts, default reasoning effort, input modalities, personality support, and service-tier information. Several serde defaults are important here: `input_modalities` falls back to `default_input_modalities`, `supports_personality` and tier lists default to empty/false, and `default_service_tier` is optional. That keeps deserialization stable across older payloads and partial catalogs.
+The structs are marked so they can be turned into JSON, read back from JSON, described in a JSON schema, and exported as TypeScript types. In plain terms, Rust, web clients, and documentation tools can all share the same contract. The `camelCase` setting means fields like `next_cursor` become `nextCursor` in the API, matching common JavaScript style.
 
-Behavior in this file is intentionally minimal. `ModelAvailabilityNux::from` is a direct adapter from the core type, exposing only the user-facing message string that explains availability or upgrade context for a model.
+The file defines request and response types for reading provider capabilities and listing models. A `Model` includes display text, availability notes, upgrade information, supported reasoning effort levels, input types, service tiers, and whether it is the default. It also defines notification payloads for model rerouting, model verification, and moderation metadata.
+
+Two enums are copied from the core protocol into this v2 protocol layer. This keeps the external API stable while still reusing the deeper shared model definitions.
 
 #### Function details
 
@@ -2144,20 +2180,24 @@ Behavior in this file is intentionally minimal. `ModelAvailabilityNux::from` is 
 fn from(value: CoreModelAvailabilityNux) -> Self
 ```
 
-**Purpose**: Converts the core model-availability NUX payload into the v2 wire struct. It preserves the explanatory message shown to clients.
+**Purpose**: This converts a core protocol `ModelAvailabilityNux` value into the version 2 API version of the same idea. A “NUX” message is a new-user-experience note, such as text explaining model availability to the user.
 
-**Data flow**: Consumes `CoreModelAvailabilityNux`, moves `value.message` into a new `ModelAvailabilityNux`, and returns it. No state is mutated.
+**Data flow**: It receives a core availability note containing a message. It copies that message into the v2 API struct. The result is a `ModelAvailabilityNux` value ready to be included in a v2 API response.
 
-**Call relations**: This adapter is used when model catalog data from core includes availability NUX information that must be serialized through the v2 API.
+**Call relations**: This function is used automatically through Rust's `From` conversion pattern whenever code needs to translate core model data into the v2 protocol shape. It sits at the boundary between internal protocol data and the public v2 API data, making sure the client receives the expected field layout.
 
 
 ### `app-server-protocol/src/protocol/v2/apps.rs`
 
-`data_model` · `request/response serialization for app listing and app-change notifications`
+`data_model` · `request handling and protocol serialization`
 
-This file is primarily a protocol schema module: it declares request/response payloads such as `AppsListParams`, `AppsListResponse`, and `AppListUpdatedNotification`, plus the nested metadata structs that describe an app (`AppBranding`, `AppMetadata`, `AppReview`, `AppScreenshot`, `AppInfo`, `AppSummary`). All types derive `Serialize`, `Deserialize`, `JsonSchema`, and `TS`, so the same Rust definitions drive JSON transport, schema generation, and TypeScript export.
+This file is mostly a set of data definitions for an experimental API that lists available apps or connectors. Think of it like a printed form: it does not fetch apps itself, but it defines exactly which boxes exist on the form, such as app name, logo, install link, category, screenshots, and whether the app is enabled.
 
-The only behavioral logic is around category normalization. `AppInfo::category` computes a single display category by first checking `branding.category`, then falling back to the first non-empty string in `app_metadata.categories`. The helper trims whitespace and rejects empty strings, so callers do not have to distinguish between missing, blank, and whitespace-only categories. `AppSummary` is a reduced projection of `AppInfo` intended for plugin responses; its `From<AppInfo>` implementation preserves only the identifier, name, description, install URL, and the derived category. A notable design choice is that `AppInfo` carries several booleans with explicit serde defaults (`is_accessible`, `is_enabled`, `plugin_display_names`), making absent fields deserialize into stable, client-friendly values rather than `Option`s.
+The types are prepared for several audiences at once. They can be serialized and deserialized, meaning converted to and from data sent over the wire, usually JSON. They also produce JSON Schema and TypeScript definitions, which helps other parts of the system and front-end code agree on the same message format.
+
+The request type, AppsListParams, lets a caller ask for a page of apps, optionally continuing from a cursor, setting a limit, checking feature access for a thread, or forcing fresh data instead of cached data. The response types carry either a full list of AppInfo records or a notification that the list changed.
+
+There is one small piece of behavior: AppInfo can choose a clean category for an app. It first looks at branding, then falls back to metadata categories, ignoring blank strings. AppSummary then uses that helper to create a smaller, simpler version of an app record for plugin responses.
 
 #### Function details
 
@@ -2167,11 +2207,11 @@ The only behavioral logic is around category normalization. `AppInfo::category` 
 fn category(&self) -> Option<String>
 ```
 
-**Purpose**: Computes a normalized category string for an app from the richer metadata already stored on `AppInfo`. It prefers branding metadata and only falls back to app metadata categories when branding does not yield a usable value.
+**Purpose**: This method picks the best display category for an app. It prefers the category in the app's branding, but if that is missing or blank, it looks through the app metadata categories for the first usable one.
 
-**Data flow**: Reads `self.branding.category` first, passes it through `non_empty_category` to trim whitespace and discard blank strings, and if that returns `None`, reads `self.app_metadata.categories`, scans the vector in order, and returns the first category whose trimmed text is non-empty. Produces `Option<String>` and does not mutate any state.
+**Data flow**: It starts with one AppInfo record. It reads the optional branding category, trims and checks it through non_empty_category, and returns it if it is meaningful. If not, it reads the optional metadata category list, checks each category the same way, and returns the first non-blank category. If nothing usable exists, it returns no category.
 
-**Call relations**: This method is used when converting a full `AppInfo` into an `AppSummary`, so summary generation inherits the same fallback and normalization rules instead of duplicating them.
+**Call relations**: This is used when a full AppInfo is turned into an AppSummary. In that flow, AppSummary::from asks AppInfo::category for a clean category so the summary does not expose empty or misleading category text.
 
 *Call graph*: called by 1 (from).
 
@@ -2182,11 +2222,11 @@ fn category(&self) -> Option<String>
 fn non_empty_category(category: Option<&str>) -> Option<String>
 ```
 
-**Purpose**: Normalizes an optional category string by trimming it and rejecting empty results. It centralizes the distinction between absent, blank, and meaningful category values.
+**Purpose**: This helper turns an optional category string into a clean category value only if it contains real text. It prevents blank strings, including strings that are only spaces, from being treated as valid categories.
 
-**Data flow**: Accepts `Option<&str>`, returns early with `None` if the option is absent, trims the borrowed string slice, checks `is_empty`, and either returns `None` or allocates and returns `Some(String)` from the trimmed text. It has no side effects.
+**Data flow**: It receives either no category or a borrowed category string. If there is no string, it returns no category. If there is a string, it trims whitespace from the ends; an empty result becomes no category, while a real value is copied into a new String and returned.
 
-**Call relations**: This helper is the shared predicate used by `AppInfo::category` for both the branding field and each candidate in the metadata category list, ensuring both paths apply identical cleanup rules.
+**Call relations**: AppInfo::category relies on this helper whenever it checks branding or metadata categories. It acts like a small filter at the gate, allowing only meaningful category names into the final app summary.
 
 
 ##### `AppSummary::from`  (lines 145–154)
@@ -2195,22 +2235,26 @@ fn non_empty_category(category: Option<&str>) -> Option<String>
 fn from(value: AppInfo) -> Self
 ```
 
-**Purpose**: Builds the compact summary representation from a full `AppInfo` by moving over only the fields needed by lightweight plugin-facing responses. It also computes the summary category using the same normalization logic as the full app model.
+**Purpose**: This conversion creates a smaller AppSummary from a full AppInfo. It keeps only the fields needed for a compact plugin-facing response: id, name, description, install URL, and a cleaned-up category.
 
-**Data flow**: Consumes an `AppInfo`, invokes `value.category()` before moving fields out, then constructs `AppSummary` with `id`, `name`, `description`, `install_url`, and the derived `category`. Returns the new summary and drops all other `AppInfo` fields.
+**Data flow**: It takes ownership of a full AppInfo record. Before moving fields out of it, it asks AppInfo::category to calculate the best category. Then it builds a new AppSummary using selected fields from the original app and the computed category. The output is the smaller summary object.
 
-**Call relations**: This conversion is the caller of `AppInfo::category`; it sits at the boundary where richer app inventory data is reduced to a smaller payload for downstream consumers.
+**Call relations**: This function is used whenever code wants to present app information in a shorter form. During that conversion, it hands category selection to AppInfo::category so the summary gets the same category-cleaning behavior as the full app model.
 
 *Call graph*: calls 1 internal fn (category).
 
 
 ### `app-server-protocol/src/protocol/v2/collaboration_mode.rs`
 
-`data_model` · `request/response serialization for collaboration mode preset listing`
+`data_model` · `request handling`
 
-This module is a thin schema adapter around collaboration mode presets. It declares an empty `CollaborationModeListParams` request, a `CollaborationModeListResponse` containing a vector of masks, and the `CollaborationModeMask` struct itself. The mask exposes the preset `name` plus optional `mode`, `model`, and `reasoning_effort`, mirroring the core configuration surface while remaining serializable to JSON and exportable to TypeScript.
+This file is part of the app server’s public protocol: the set of messages the server and client agree to exchange. Its job is to describe, in a stable and serializable form, what a collaboration mode preset looks like when sent over the API.
 
-The only logic is the `From<CoreCollaborationModeMask>` conversion, which performs a field-for-field transfer from the core type imported from `codex_protocol::config_types`. One subtle point is the `reasoning_effort` field type: `Option<Option<ReasoningEffort>>`. That preserves three distinct states on the wire—field absent, field explicitly null, and field set to a concrete effort—so clients can distinguish “unset” from “intentionally cleared.” The serde and ts-rs rename attributes keep the field spelled `reasoning_effort` rather than camel-casing it, matching existing protocol expectations.
+A collaboration mode preset is like a saved profile for how the assistant should work. It can include a human-readable name, an optional mode, an optional model name, and an optional reasoning effort setting. The file defines three message types: an empty request for asking for the list, one item of preset metadata, and the response containing a list of those items.
+
+The types derive serialization support, which means they can be turned into JSON and read back from JSON. They also derive schema and TypeScript export support, so client developers can get matching type definitions instead of guessing the response format.
+
+One small but important bridge is included: converting the core application’s internal collaboration mode data into this API-facing version. That keeps the public protocol separate from the internal configuration types, while still making it easy to send the internal data to clients.
 
 #### Function details
 
@@ -2220,22 +2264,24 @@ The only logic is the `From<CoreCollaborationModeMask>` conversion, which perfor
 fn from(value: CoreCollaborationModeMask) -> Self
 ```
 
-**Purpose**: Converts the core collaboration mode preset descriptor into the v2 protocol struct without changing semantics. It preserves optionality exactly so clients can see whether each preset overrides a field or leaves it unspecified.
+**Purpose**: This converts an internal collaboration mode preset into the version used by the app server protocol. It is used when the server has core configuration data and needs to send it to a client in the API’s expected shape.
 
-**Data flow**: Consumes a `CoreCollaborationModeMask`, moves out `name`, `mode`, `model`, and `reasoning_effort`, and returns a new `CollaborationModeMask`. No external state is read or written.
+**Data flow**: It receives a core collaboration mode preset containing a name and optional settings. It copies those fields into a protocol-facing `CollaborationModeMask`. The result is a value ready to be placed in an API response and serialized, for example as JSON.
 
-**Call relations**: This conversion is used wherever core collaboration mode inventory is exposed through the v2 API, acting as the final adaptation step before serialization.
+**Call relations**: This function is the bridge between the core configuration layer and the protocol layer. When code builds a collaboration mode list response, it can call this conversion so internal preset data becomes client-facing preset metadata without duplicating field-copying logic elsewhere.
 
 
 ### `app-server-protocol/src/protocol/v2/permissions.rs`
 
-`data_model` · `approval prompts, permission profile reads, sandbox configuration parsing, and permission-related request/response serialization`
+`data_model` · `cross-cutting: used when reading, writing, and converting permission data during requests, settings sync, and approvals`
 
-This module is the protocol boundary for permission-related data. It models network approval context, additional filesystem and network permissions, request and granted permission profiles, active permission profile selection, filesystem path/sandbox entry abstractions, sandbox policies, exec-policy amendments, network policy amendments, and approval request/response payloads. Many of these types exist specifically to bridge between client-friendly wire shapes and core types that still use older path representations or internal enums.
+This file is a border checkpoint between the app-server protocol and the core permission engine. Clients speak in versioned JSON-friendly objects, while the core code uses its own Rust types. This file keeps those two worlds aligned.
 
-The most involved logic is in the filesystem permission conversions. `AdditionalFileSystemPermissions::from` supports both legacy read/write root lists and the newer canonical `entries` representation: if core exposes legacy roots, it populates both the deprecated `read`/`write` fields and synthesizes equivalent `entries`; otherwise it preserves canonical entries and `glob_scan_max_depth`. The inverse `TryFrom` accepts either representation, converting `LegacyAppPathString` values into native absolute paths and propagating invalid-path errors as `io::Error`. Similar bidirectional adapters exist for request/additional permission profiles, filesystem special paths, sandbox entries, and network permissions.
+The main idea is simple: describe permission choices in a form that can safely travel over an API, then convert them into the stricter internal form before the system acts on them. It covers network permissions, file-system permissions, active permission profiles, sandbox policies, and small policy changes such as allowing a command or a network host.
 
-`SandboxPolicy` has custom deserialization to reject deprecated restricted-read settings (`readOnly.access` and `workspaceWrite.readOnlyAccess`) with explicit error messages, while still accepting older payload shapes that map cleanly to current variants. The `to_core`/`from` methods then translate between the v2 enum and core runtime sandbox policy, including the nested external-sandbox network access mode.
+A lot of the code is translation. For example, a file permission may arrive as a legacy path string, a glob pattern, or a special path such as project roots or temporary directories. The file turns that into the core representation, reporting an input error if a path cannot be understood. It also does the reverse when sending information back to clients.
+
+One important detail is backward compatibility. Some old fields are still accepted or emitted, but newer fields are preferred. For sandbox policies, the file explicitly rejects old “restricted read” settings and tells callers to use permission profiles instead. Without this file, clients and the core would disagree about what a permission request means, which could lead to broken requests or unsafe access decisions.
 
 #### Function details
 
@@ -2245,11 +2291,11 @@ The most involved logic is in the filesystem permission conversions. `Additional
 fn from(value: CoreNetworkApprovalContext) -> Self
 ```
 
-**Purpose**: Converts the core network approval context into the v2 wire struct used in approval prompts. It preserves the target host and protocol.
+**Purpose**: Builds the public version 2 network approval context from the core network approval context. This is used when the server needs to describe a network request to an API client.
 
-**Data flow**: Consumes `CoreNetworkApprovalContext`, moves `host`, converts `protocol` with `.into()`, and returns `NetworkApprovalContext`.
+**Data flow**: It receives a core object containing a host name and a protocol. It copies the host text and converts the protocol into the version 2 protocol enum. It returns the API-facing context object.
 
-**Call relations**: This adapter is used when managed-network approval requests are surfaced to clients.
+**Call relations**: This sits at the boundary where core approval information is prepared for protocol output. It does not call other project functions directly except the standard conversion for the protocol value.
 
 
 ##### `AdditionalFileSystemPermissions::from`  (lines 73–124)
@@ -2258,11 +2304,11 @@ fn from(value: CoreNetworkApprovalContext) -> Self
 fn from(value: CoreFileSystemPermissions<AbsolutePathBuf>) -> Self
 ```
 
-**Purpose**: Converts core filesystem permissions into the v2 additional-permissions shape while preserving backward compatibility with deprecated `read`/`write` root lists. When legacy roots are present, it also synthesizes canonical `entries` so clients can consume either representation.
+**Purpose**: Converts core file-system permission additions into the version 2 API form. It also fills the newer entry-based field even when the core data came from older separate read and write root lists.
 
-**Data flow**: Consumes `CoreFileSystemPermissions<AbsolutePathBuf>`. If `legacy_read_write_roots()` returns roots, it allocates an `entries` vector sized for both read and write lists, converts each absolute path into `LegacyAppPathString`, emits deprecated `read`/`write` fields, and creates matching `FileSystemSandboxEntry` values with `Read` or `Write` access. Otherwise it preserves `glob_scan_max_depth` and maps canonical `entries` through `FileSystemSandboxEntry::from`. Returns `AdditionalFileSystemPermissions`.
+**Data flow**: It receives core file permissions based on absolute paths. If the permissions can be expressed as old read/write root lists, it turns those roots into legacy path strings and also creates matching sandbox entries. Otherwise, it converts each existing core sandbox entry into the API entry form and carries over the glob scan depth. It returns an API permission object.
 
-**Call relations**: This conversion is used by higher-level permission profile adapters and is covered by tests that verify both legacy-root synthesis and canonical-entry preservation.
+**Call relations**: This function calls the core helper that detects legacy read/write roots, and it preallocates space for generated entries. Tests call it to make sure legacy roots populate entries and modern canonical entries are preserved.
 
 *Call graph*: called by 2 (additional_file_system_permissions_populates_entries_for_legacy_roots, additional_file_system_permissions_preserves_canonical_entries); 2 external calls (legacy_read_write_roots, with_capacity).
 
@@ -2273,11 +2319,11 @@ fn from(value: CoreFileSystemPermissions<AbsolutePathBuf>) -> Self
 fn try_from(value: AdditionalFileSystemPermissions) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert the v2 additional-filesystem-permissions payload back into core filesystem permissions, accepting either canonical `entries` or deprecated `read`/`write` roots. It validates and normalizes path strings into native absolute paths.
+**Purpose**: Converts version 2 file-system permission additions back into the core form, checking that any path strings can be understood as real absolute paths. Someone would use this before applying client-requested file permissions inside the core system.
 
-**Data flow**: Consumes `AdditionalFileSystemPermissions`. If `entries` is present, it converts each entry with `CoreFileSystemSandboxEntry::try_from` and builds a core permissions struct with `glob_scan_max_depth: None`. Otherwise it converts `read` and `write` `LegacyAppPathString` values into native path URIs and absolute paths, then calls `CoreFileSystemPermissions::from_read_write_roots`. Finally it overwrites `glob_scan_max_depth` from the input and returns `Ok(core_permissions)` or an `io::Error` on invalid paths.
+**Data flow**: It receives an API permission object. If the newer entries field is present, it converts each entry into a core sandbox entry. If entries are absent, it falls back to old read and write lists, converts their legacy path strings through native path URI rules into absolute paths, and builds core permissions from those roots. It then copies the optional glob scan depth and returns either core permissions or an input error.
 
-**Call relations**: This is the inverse of `AdditionalFileSystemPermissions::from`; it is used by request/additional/granted permission profile conversions whenever client-supplied filesystem permissions must be handed to core.
+**Call relations**: This is the inward half of the protocol boundary. It calls the core constructor for legacy read/write roots when old fields are used, and it is used by higher-level profile conversions when client data must become core data.
 
 *Call graph*: 1 external calls (from_read_write_roots).
 
@@ -2288,11 +2334,11 @@ fn try_from(value: AdditionalFileSystemPermissions) -> Result<Self, Self::Error>
 fn from(value: CoreNetworkPermissions) -> Self
 ```
 
-**Purpose**: Converts core network permission settings into the v2 additional-network-permissions struct. It currently exposes only the optional enabled flag.
+**Purpose**: Converts core network permission additions into the version 2 API form. It preserves whether network access is explicitly enabled, disabled, or left unspecified.
 
-**Data flow**: Consumes `CoreNetworkPermissions`, moves `enabled` into `AdditionalNetworkPermissions`, and returns it.
+**Data flow**: It receives core network permissions with an optional enabled flag. It copies that flag into the API object and returns it.
 
-**Call relations**: This adapter is used by request and additional permission profile conversions.
+**Call relations**: This small converter is used by profile conversions when network permission data is being sent outward to clients.
 
 
 ##### `CoreNetworkPermissions::from`  (lines 190–194)
@@ -2301,11 +2347,11 @@ fn from(value: CoreNetworkPermissions) -> Self
 fn from(value: AdditionalNetworkPermissions) -> Self
 ```
 
-**Purpose**: Converts the v2 additional-network-permissions struct back into the core network permissions type. It is a direct field-preserving adapter.
+**Purpose**: Converts version 2 network permission additions into the core form. This lets client-supplied network permission settings be used by the permission engine.
 
-**Data flow**: Consumes `AdditionalNetworkPermissions`, moves `enabled` into `CoreNetworkPermissions`, and returns it.
+**Data flow**: It receives the API object with an optional enabled flag. It copies that flag into the core object and returns it.
 
-**Call relations**: This inverse conversion is used when client-supplied permission overlays are passed into core.
+**Call relations**: This is used by request and profile conversions when network permission data moves from the API layer into core logic.
 
 
 ##### `RequestPermissionProfile::from`  (lines 208–213)
@@ -2314,11 +2360,11 @@ fn from(value: AdditionalNetworkPermissions) -> Self
 fn from(value: CoreRequestPermissionProfile) -> Self
 ```
 
-**Purpose**: Converts the core request-permission profile into the v2 wire struct used in permission approval prompts. It preserves optional network and filesystem sections.
+**Purpose**: Turns a core request permission profile into the version 2 API shape. This is useful when the server needs to show a client what extra permissions are being requested.
 
-**Data flow**: Consumes `CoreRequestPermissionProfile`, maps `network` with `AdditionalNetworkPermissions::from`, maps `file_system` with `AdditionalFileSystemPermissions::from`, and returns `RequestPermissionProfile`.
+**Data flow**: It receives a core request profile. If network permissions are present, it converts them to API network permissions. If file-system permissions are present, it converts them to API file-system permissions. It returns the API request profile.
 
-**Call relations**: This adapter is used when core asks the client to approve requested permissions.
+**Call relations**: This function composes the smaller network and file-system converters so a whole request profile can cross from core code to protocol output.
 
 
 ##### `CoreRequestPermissionProfile::try_from`  (lines 219–227)
@@ -2327,11 +2373,11 @@ fn from(value: CoreRequestPermissionProfile) -> Self
 fn try_from(value: RequestPermissionProfile) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert a v2 request-permission profile back into the core type, validating nested filesystem permissions as needed. It propagates path-conversion failures.
+**Purpose**: Turns a version 2 request permission profile into the core request profile, validating file paths along the way. This is needed before the core can decide whether to grant requested permissions.
 
-**Data flow**: Consumes `RequestPermissionProfile`, maps `network` with `CoreNetworkPermissions::from`, converts optional `file_system` with `CoreFileSystemPermissions::<AbsolutePathBuf>::try_from` and `transpose()?`, and returns `Ok(CoreRequestPermissionProfile)` or an `io::Error`.
+**Data flow**: It receives an API request profile. It converts any network section directly and tries to convert any file-system section, which may fail if a path is invalid. It returns either a core request profile or an input error.
 
-**Call relations**: This is the inverse of `RequestPermissionProfile::from`; it is used when client-provided permission requests or review actions are sent back to core.
+**Call relations**: This function composes the inward network and file-system converters. It is part of the approval/request path where client-provided permission requests become internal permission data.
 
 
 ##### `FileSystemSpecialPath::from`  (lines 258–267)
@@ -2340,11 +2386,11 @@ fn try_from(value: RequestPermissionProfile) -> Result<Self, Self::Error>
 fn from(value: CoreFileSystemSpecialPath) -> Self
 ```
 
-**Purpose**: Converts the core special filesystem path enum into the v2 tagged enum. It preserves both known symbolic paths and unknown custom symbolic paths with their optional subpaths.
+**Purpose**: Converts a core special file-system location into the version 2 API enum. Special locations are named places like project roots, the system temporary directory, or the root of the file system.
 
-**Data flow**: Consumes `CoreFileSystemSpecialPath`, matches each variant, moves any `subpath` or `path` payloads, and returns the corresponding `FileSystemSpecialPath`.
+**Data flow**: It receives a core special-path value. It matches the exact variant and copies any attached subpath or unknown-path text. It returns the matching API special-path value.
 
-**Call relations**: This conversion is used by `FileSystemPath::from` when adapting special-path filesystem entries.
+**Call relations**: This supports file path conversion when core file-system rules need to be described to clients.
 
 
 ##### `CoreFileSystemSpecialPath::from`  (lines 271–280)
@@ -2353,11 +2399,11 @@ fn from(value: CoreFileSystemSpecialPath) -> Self
 fn from(value: FileSystemSpecialPath) -> Self
 ```
 
-**Purpose**: Converts the v2 special filesystem path enum back into the core enum. It is the inverse adapter for symbolic path references.
+**Purpose**: Converts a version 2 special file-system location into the core enum. This lets client-provided special locations be used by the core permission engine.
 
-**Data flow**: Consumes `FileSystemSpecialPath`, matches each variant, moves any payload fields, and returns the corresponding `CoreFileSystemSpecialPath`.
+**Data flow**: It receives an API special-path value. It matches the variant and copies any attached subpath or unknown-path text. It returns the matching core special-path value.
 
-**Call relations**: This conversion is used by `CoreFileSystemPath::try_from` when rebuilding core filesystem paths from v2 payloads.
+**Call relations**: This supports file path conversion when API file-system rules are accepted into core data.
 
 
 ##### `FileSystemPath::from`  (lines 296–306)
@@ -2366,11 +2412,11 @@ fn from(value: FileSystemSpecialPath) -> Self
 fn from(value: CoreFileSystemPath<AbsolutePathBuf>) -> Self
 ```
 
-**Purpose**: Converts a core filesystem path into the v2 tagged path enum, translating absolute native paths into legacy app path strings for wire compatibility. It preserves glob patterns and special paths as structured variants.
+**Purpose**: Converts a core file-system path rule into the version 2 API form. The rule may be a concrete path, a glob pattern, or a named special location.
 
-**Data flow**: Consumes `CoreFileSystemPath<AbsolutePathBuf>`, matches `Path`, `GlobPattern`, or `Special`; for `Path`, converts the absolute path with `LegacyAppPathString::from_abs_path`, and for `Special`, converts the nested special path with `.into()`. Returns `FileSystemPath`.
+**Data flow**: It receives a core path rule. For a concrete path, it turns the absolute path into the legacy app path string used by this API. For a glob pattern, it copies the pattern. For a special path, it converts the special-path value. It returns the API path rule.
 
-**Call relations**: This adapter is used by `FileSystemSandboxEntry::from` and higher-level filesystem permission conversions.
+**Call relations**: This function calls path-string conversion for absolute paths and delegates special-path conversion when needed. It is used inside sandbox entry and permission conversions that send file rules outward.
 
 *Call graph*: calls 1 internal fn (from_abs_path); 1 external calls (into).
 
@@ -2381,11 +2427,11 @@ fn from(value: CoreFileSystemPath<AbsolutePathBuf>) -> Self
 fn try_from(value: FileSystemPath) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert the v2 filesystem path enum back into the core path type, validating path strings and preserving glob/special variants. Invalid path strings become `io::Error`s.
+**Purpose**: Converts a version 2 file-system path rule into the core form, validating concrete paths. This protects the core from receiving path strings it cannot safely interpret.
 
-**Data flow**: Consumes `FileSystemPath`. For `Path`, converts `LegacyAppPathString` to a native `PathUri`, then to an absolute path; for `GlobPattern`, moves the pattern directly; for `Special`, converts the nested special path with `.into()`. Returns `Ok(CoreFileSystemPath<AbsolutePathBuf>)` or an error.
+**Data flow**: It receives an API path rule. For a concrete path, it parses the legacy path string using the native path convention and turns it into an absolute path. For a glob pattern, it copies the pattern. For a special path, it converts the special-path value. It returns either a core path rule or an input error.
 
-**Call relations**: This inverse conversion is used by `CoreFileSystemSandboxEntry::try_from` and ultimately by all inbound filesystem permission profile conversions.
+**Call relations**: This function calls the native path-convention helper for concrete paths and delegates special-path conversion when needed. It is used by sandbox entry conversion before file permissions enter the core.
 
 *Call graph*: calls 1 internal fn (native); 1 external calls (into).
 
@@ -2396,11 +2442,11 @@ fn try_from(value: FileSystemPath) -> Result<Self, Self::Error>
 fn from(value: CoreFileSystemSandboxEntry<AbsolutePathBuf>) -> Self
 ```
 
-**Purpose**: Converts a core filesystem sandbox entry into the v2 wire struct. It preserves both the path selector and the access mode.
+**Purpose**: Converts one core file-system sandbox entry into the version 2 API entry. A sandbox entry is one rule saying which path-like target has read, write, or deny access.
 
-**Data flow**: Consumes `CoreFileSystemSandboxEntry<AbsolutePathBuf>`, converts `path` with `.into()`, converts `access` with `.into()`, and returns `FileSystemSandboxEntry`.
+**Data flow**: It receives a core entry with a path rule and an access mode. It converts the path rule into the API path form and converts the access mode into the API enum. It returns the API entry.
 
-**Call relations**: This adapter is used by `AdditionalFileSystemPermissions::from` when preserving canonical filesystem permission entries.
+**Call relations**: This is used by broader file-system permission conversion when a list of core sandbox entries needs to be sent to clients.
 
 
 ##### `CoreFileSystemSandboxEntry::try_from`  (lines 350–355)
@@ -2409,11 +2455,11 @@ fn from(value: CoreFileSystemSandboxEntry<AbsolutePathBuf>) -> Self
 fn try_from(value: FileSystemSandboxEntry) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert a v2 filesystem sandbox entry back into the core type, validating the nested path and translating the access mode. It propagates path-conversion failures.
+**Purpose**: Converts one version 2 sandbox entry into the core entry, checking the path part if needed. This is used before the core applies a client-supplied file access rule.
 
-**Data flow**: Consumes `FileSystemSandboxEntry`, converts `path` with `try_into()?`, converts `access` with `to_core()`, and returns `Ok(CoreFileSystemSandboxEntry<AbsolutePathBuf>)` or an `io::Error`.
+**Data flow**: It receives an API entry with a path rule and an access mode. It tries to convert the path rule into the core form and converts the access mode into the core enum. It returns either the core entry or an input error.
 
-**Call relations**: This inverse conversion is used by `CoreFileSystemPermissions::try_from` when rebuilding canonical filesystem permission entries.
+**Call relations**: This is called by file-system permission conversion when entry-based file rules are accepted from the API.
 
 
 ##### `ActivePermissionProfile::new`  (lines 407–412)
@@ -2422,11 +2468,11 @@ fn try_from(value: FileSystemSandboxEntry) -> Result<Self, Self::Error>
 fn new(id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs an active permission profile selection from an identifier, leaving `extends` unset. It is a convenience constructor for code that only needs to select a profile by id.
+**Purpose**: Creates an active permission profile from just an identifier. It is a convenience for saying “use this named profile” when there is no explicit parent profile attached.
 
-**Data flow**: Accepts any `id` implementing `Into<String>`, converts it, sets `extends: None`, and returns a new `ActivePermissionProfile`.
+**Data flow**: It receives anything that can become text, such as a string. It stores that text as the profile id and sets the parent profile field to none. It returns the new active profile.
 
-**Call relations**: This helper is widely used by session/thread permission-selection code and tests that need to create a profile selection without manually filling the struct.
+**Call relations**: Many tests and flows call this when selecting or updating a permission profile by id, including active profile selection, embedded turn permissions, auto-review mode, and settings update scenarios.
 
 *Call graph*: called by 24 (permission_snapshot_setter_preserves_permission_constraints, session_configuration_apply_rebinds_symbolic_profile_to_updated_workspace_roots, active_profile_selection_uses_profile_id_only, auto_review_mode, override_turn_context_sends_thread_settings_update, permission_settings_sync_updates_active_snapshot_without_rewriting_side_thread, embedded_turn_permissions_select_profile_id_only, embedded_turn_permissions_use_active_profile_selection, remote_turn_permissions_preserve_active_profile_selection, submission_includes_configured_active_permission_profile (+14 more)); 1 external calls (into).
 
@@ -2437,11 +2483,11 @@ fn new(id: impl Into<String>) -> Self
 fn read_only() -> Self
 ```
 
-**Purpose**: Builds the built-in read-only active permission profile by delegating to the core helper and converting the result back into the v2 type. It ensures the v2 layer stays aligned with core’s canonical read-only profile definition.
+**Purpose**: Creates the built-in read-only active permission profile in the version 2 API form. This gives callers a safe default profile without needing to know its internal id details.
 
-**Data flow**: Calls `CoreActivePermissionProfile::read_only()`, converts the returned core profile with `.into()`, and returns `ActivePermissionProfile`.
+**Data flow**: It asks the core model for its read-only profile, then converts that core profile into the API profile type. It returns the API active profile.
 
-**Call relations**: This convenience constructor is used by status and thread-settings code that needs the standard read-only profile without hardcoding its identifier.
+**Call relations**: Callers use this in settings, status, and test flows that need the standard read-only profile. It delegates the actual built-in definition to the core type.
 
 *Call graph*: called by 4 (inactive_thread_settings_notification_updates_cached_collaboration_mode, thread_settings_for_test, status_permissions_named_read_only_profile_shows_builtin_label, status_permissions_read_only_profile_shows_additional_writable_roots); 1 external calls (read_only).
 
@@ -2452,11 +2498,11 @@ fn read_only() -> Self
 fn from(value: CoreActivePermissionProfile) -> Self
 ```
 
-**Purpose**: Converts the core active permission profile into the v2 wire struct. It preserves the selected profile id and optional parent profile id.
+**Purpose**: Converts a core active permission profile into the version 2 API profile. This is used when reporting the currently selected permission profile to clients.
 
-**Data flow**: Consumes `CoreActivePermissionProfile`, moves `id` and `extends` into `ActivePermissionProfile`, and returns it.
+**Data flow**: It receives the core profile with an id and optional parent profile id. It copies both fields into the API type and returns it.
 
-**Call relations**: This adapter is used when active permission profile state is exposed to clients.
+**Call relations**: This is the outward profile conversion used wherever core session or permission state is exposed through the version 2 protocol.
 
 
 ##### `CoreActivePermissionProfile::from`  (lines 429–434)
@@ -2465,11 +2511,11 @@ fn from(value: CoreActivePermissionProfile) -> Self
 fn from(value: ActivePermissionProfile) -> Self
 ```
 
-**Purpose**: Converts the v2 active permission profile back into the core type. It is a direct field-preserving adapter.
+**Purpose**: Converts a version 2 active permission profile into the core profile. This lets the core use a profile selection that came from the API layer.
 
-**Data flow**: Consumes `ActivePermissionProfile`, moves `id` and `extends` into `CoreActivePermissionProfile`, and returns it.
+**Data flow**: It receives the API profile with an id and optional parent profile id. It copies both fields into the core type and returns it.
 
-**Call relations**: This inverse conversion is used when client-selected active profiles are passed into core session or thread configuration.
+**Call relations**: This is the inward profile conversion used when client or protocol data must update core permission state.
 
 
 ##### `AdditionalPermissionProfile::from`  (lines 448–453)
@@ -2478,11 +2524,11 @@ fn from(value: ActivePermissionProfile) -> Self
 fn from(value: CoreAdditionalPermissionProfile) -> Self
 ```
 
-**Purpose**: Converts the core additional-permission overlay into the v2 wire struct used for per-command permission requests. It preserves optional network and filesystem overlays.
+**Purpose**: Converts a core additional permission profile into the version 2 API form. Additional profiles are partial overlays, such as extra permissions requested for one command.
 
-**Data flow**: Consumes `CoreAdditionalPermissionProfile`, maps `network` with `AdditionalNetworkPermissions::from`, maps `file_system` with `AdditionalFileSystemPermissions::from`, and returns `AdditionalPermissionProfile`.
+**Data flow**: It receives a core additional profile. It converts any network section and any file-system section into their API forms. It returns the API additional profile.
 
-**Call relations**: This adapter is used when core exposes extra per-command permissions to clients, such as in approval prompts.
+**Call relations**: This function combines the smaller network and file-system converters when extra permissions need to be shown to the client.
 
 
 ##### `CoreAdditionalPermissionProfile::try_from`  (lines 485–493)
@@ -2491,11 +2537,11 @@ fn from(value: CoreAdditionalPermissionProfile) -> Self
 fn try_from(value: GrantedPermissionProfile) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert the v2 additional-permission overlay back into the core type, validating nested filesystem permissions. It propagates invalid path errors.
+**Purpose**: Converts a granted version 2 permission profile into the core additional permission profile, validating file paths if present. This is used after a client approves extra permissions so the core can apply them.
 
-**Data flow**: Consumes `AdditionalPermissionProfile`, maps `network` with `CoreNetworkPermissions::from`, converts optional `file_system` with `CoreFileSystemPermissions::<AbsolutePathBuf>::try_from` and `transpose()?`, and returns `Ok(CoreAdditionalPermissionProfile)` or an `io::Error`.
+**Data flow**: It receives a granted permission profile with optional network and file-system sections. It converts the network section directly and tries to convert the file-system section, which may return an input error for invalid paths. It returns either the core additional profile or an error.
 
-**Call relations**: This inverse conversion is used when client-provided additional permission overlays must be applied in core.
+**Call relations**: This is part of the approval path after a response comes back from a client. It reuses the lower-level converters so granted permissions match the core permission engine’s format.
 
 
 ##### `SandboxPolicy::deserialize`  (lines 576–616)
@@ -2504,11 +2550,11 @@ fn try_from(value: GrantedPermissionProfile) -> Result<Self, Self::Error>
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Implements custom deserialization for sandbox policies so the protocol can accept some legacy shapes while explicitly rejecting deprecated restricted-read settings. It normalizes accepted legacy payloads into the current `SandboxPolicy` enum.
+**Purpose**: Reads a sandbox policy from incoming data while keeping some backward compatibility and rejecting old unsafe or unsupported fields. A sandbox policy describes how tightly command execution is boxed in, like full access, read-only, or workspace-write access.
 
-**Data flow**: Deserializes into the private `SandboxPolicyDeserialize` helper enum, matches the result, and constructs the corresponding `SandboxPolicy`. For `ReadOnly` and `WorkspaceWrite`, it checks legacy access fields and returns a serde custom error if they are `Restricted`; otherwise it preserves network access, writable roots, and tmpdir exclusion flags. Returns `Result<SandboxPolicy, D::Error>`.
+**Data flow**: It receives serialized input from Serde, Rust’s common serialization library. It first reads into a helper enum that includes legacy fields. It then maps that helper into the current SandboxPolicy. If an old restricted-read field is present, it returns a clear deserialization error telling the caller to use permission profiles instead.
 
-**Call relations**: This logic runs automatically during serde deserialization of sandbox policy payloads, acting as the compatibility and validation gate for inbound config or API data.
+**Call relations**: Serde calls this automatically whenever a SandboxPolicy is deserialized. Inside, it calls the helper deserializer and creates custom error messages for unsupported legacy settings.
 
 *Call graph*: 3 external calls (deserialize, custom, matches!).
 
@@ -2519,11 +2565,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn to_core(&self) -> codex_protocol::protocol::SandboxPolicy
 ```
 
-**Purpose**: Converts the v2 sandbox policy enum into the core runtime sandbox policy. It preserves variant-specific settings and translates external-sandbox network access into the core enum.
+**Purpose**: Converts the version 2 sandbox policy into the core sandbox policy. This is needed before the core can actually run commands under the chosen sandbox rules.
 
-**Data flow**: Borrows `&self`, matches each variant, clones `writable_roots` when needed, copies booleans, maps `NetworkAccess::{Restricted,Enabled}` to `CoreNetworkAccess`, and returns `codex_protocol::protocol::SandboxPolicy`.
+**Data flow**: It reads the API sandbox variant. It copies booleans and writable roots, and for the external sandbox network setting it maps the API network access enum to the core enum. It returns the matching core sandbox policy.
 
-**Call relations**: This conversion is used when v2-layer sandbox policy data must be applied to core runtime/session configuration.
+**Call relations**: This function is called when displaying or deriving permission profile information from a thread response. It is the inward bridge from protocol sandbox settings to the core runtime policy.
 
 *Call graph*: called by 1 (display_permission_profile_from_thread_response).
 
@@ -2534,11 +2580,11 @@ fn to_core(&self) -> codex_protocol::protocol::SandboxPolicy
 fn from(value: codex_protocol::protocol::SandboxPolicy) -> Self
 ```
 
-**Purpose**: Converts the core runtime sandbox policy into the v2 wire enum. It preserves all variant-specific fields and maps external-sandbox network access back into the v2 enum.
+**Purpose**: Converts a core sandbox policy into the version 2 API form. This lets the server report the active sandbox setup to clients.
 
-**Data flow**: Consumes `codex_protocol::protocol::SandboxPolicy`, matches each variant, moves or copies fields into the corresponding `SandboxPolicy`, and returns it.
+**Data flow**: It receives a core sandbox policy. It matches the variant, copies roots and flags, and maps the core external-sandbox network access enum into the API enum. It returns the API sandbox policy.
 
-**Call relations**: This adapter is used when runtime sandbox policy state is exposed back to clients and is covered by round-trip tests for multiple variants.
+**Call relations**: Tests call this to confirm sandbox policies round-trip correctly, including read-only, workspace-write, and external sandbox network access. It is also used when configured session state is synced to client-facing settings.
 
 *Call graph*: called by 5 (sandbox_policy_round_trips_external_sandbox_network_access, sandbox_policy_round_trips_read_only_network_access, sandbox_policy_round_trips_workspace_write_access, session_configured_external_sandbox_keeps_external_runtime_policy, session_configured_syncs_widget_config_permissions_and_cwd).
 
@@ -2549,11 +2595,11 @@ fn from(value: codex_protocol::protocol::SandboxPolicy) -> Self
 fn into_core(self) -> CoreExecPolicyAmendment
 ```
 
-**Purpose**: Converts the v2 exec-policy amendment wrapper into the core amendment type. It forwards the command prefix vector into core’s constructor.
+**Purpose**: Turns a version 2 execution policy amendment into the core form. An execution policy amendment is a command prefix that should be allowed or recognized by policy.
 
-**Data flow**: Consumes `self`, passes `self.command` to `CoreExecPolicyAmendment::new`, and returns the resulting core amendment.
+**Data flow**: It consumes the API object containing a list of command words. It passes that list to the core constructor. It returns the core execution policy amendment.
 
-**Call relations**: This helper is used when a client accepts a command with an exec-policy amendment and the amendment must be applied in core.
+**Call relations**: This is used when an API-level command policy change needs to be applied by the core policy code. It delegates construction and validation rules to the core type.
 
 *Call graph*: 1 external calls (new).
 
@@ -2564,11 +2610,11 @@ fn into_core(self) -> CoreExecPolicyAmendment
 fn from(value: CoreExecPolicyAmendment) -> Self
 ```
 
-**Purpose**: Converts a core exec-policy amendment into the v2 transparent wrapper. It exposes the amendment as a plain command vector on the wire.
+**Purpose**: Converts a core execution policy amendment into the version 2 API form. This is useful when reporting stored or updated command policy changes to clients.
 
-**Data flow**: Consumes `CoreExecPolicyAmendment`, calls `value.command()` to borrow the command slice, clones it with `to_vec()`, and returns `ExecPolicyAmendment`.
+**Data flow**: It receives a core amendment. It asks the core object for its command list, copies that list into a vector, and returns the API amendment.
 
-**Call relations**: This adapter is used when proposed or applied exec-policy amendments are surfaced to clients and is exercised by amendment-related tests.
+**Call relations**: Tests call this around appending execution policy amendments, including rejecting empty prefixes and updating policy files. It is the outward bridge for command policy changes.
 
 *Call graph*: called by 2 (append_execpolicy_amendment_rejects_empty_prefix, append_execpolicy_amendment_updates_policy_and_file); 1 external calls (command).
 
@@ -2579,11 +2625,11 @@ fn from(value: CoreExecPolicyAmendment) -> Self
 fn into_core(self) -> CoreNetworkPolicyAmendment
 ```
 
-**Purpose**: Converts the v2 network policy amendment into the core amendment type. It preserves the host and translates the rule action into the core enum.
+**Purpose**: Turns a version 2 network policy amendment into the core form. A network policy amendment says whether a particular host should be allowed or denied.
 
-**Data flow**: Consumes `self`, moves `host`, converts `action` with `to_core()`, constructs `CoreNetworkPolicyAmendment`, and returns it.
+**Data flow**: It consumes the API object containing a host and an allow-or-deny action. It copies the host and converts the action enum into the core action. It returns the core amendment.
 
-**Call relations**: This helper is used when a client chooses to apply a persistent network allow/deny rule and that amendment must be forwarded to core.
+**Call relations**: This is used when a client-supplied host rule needs to be applied by core network policy code. It delegates action conversion through the enum’s core converter.
 
 *Call graph*: 1 external calls (to_core).
 
@@ -2594,24 +2640,26 @@ fn into_core(self) -> CoreNetworkPolicyAmendment
 fn from(value: CoreNetworkPolicyAmendment) -> Self
 ```
 
-**Purpose**: Converts a core network policy amendment into the v2 wire struct. It preserves the host and maps the rule action into the exported enum.
+**Purpose**: Converts a core network policy amendment into the version 2 API form. This lets clients see host allow/deny rules in the protocol’s stable shape.
 
-**Data flow**: Consumes `CoreNetworkPolicyAmendment`, moves `host`, converts `action` with `NetworkPolicyRuleAction::from`, and returns `NetworkPolicyAmendment`.
+**Data flow**: It receives a core amendment with a host and action. It copies the host and converts the core action into the API action enum. It returns the API amendment.
 
-**Call relations**: This adapter is used when proposed or existing network policy amendments are exposed to clients.
+**Call relations**: This is the outward bridge for network policy changes. It calls the action enum conversion so the public API uses its own versioned values rather than exposing core types directly.
 
 *Call graph*: 1 external calls (from).
 
 
 ### `app-server-protocol/src/protocol/v2/config.rs`
 
-`data_model` · `config load, config inspection, config editing, and config-related notifications`
+`config` · `config read/write and protocol message exchange`
 
-This is the central schema file for configuration-related API traffic. It models where config comes from (`ConfigLayerSource`), what the effective config contains (`Config` and many nested structs/enums), how layered config is reported (`ConfigLayerMetadata`, `ConfigLayer`, `ConfigReadResponse`), how requirements are surfaced (`ConfigRequirements` and related hook/network/residency structs), and how external-agent migration and config editing APIs exchange data. Nearly every type derives serde/schema/TS traits so the same definitions serve runtime transport and generated client types.
+This file is mostly a contract. It does not load config files itself. Instead, it defines the names and shapes of the messages that other parts of the system use when reading, writing, explaining, and importing configuration.
 
-The main behavior is precedence handling for config layers. `ConfigLayerSource::precedence` assigns explicit numeric priorities to each source, including the distinction between base user config and profile-overlaid user config. `PartialOrd` is then implemented in terms of those numbers so sorting or comparisons reflect override order: lower precedence means “more easily overridden.” Another small compatibility helper is `ForcedChatgptWorkspaceIds::into_vec`, which collapses the backward-compatible untagged enum (`Single` or `Multiple`) into a uniform `Vec<String>` for internal consumers.
+A useful way to think about it is as the form template used by both sides of a conversation. If the client asks to read config, `ConfigReadParams` says what the request may contain, and `ConfigReadResponse` says what the reply will contain. If a setting is written, `ConfigValueWriteParams`, `ConfigBatchWriteParams`, `ConfigWriteResponse`, and related error/status types describe the request and outcome.
 
-A notable design choice throughout the file is preserving backward compatibility and partial evolution: many fields are optional, some are flattened into `additional` maps for unknown keys, and several structs are marked `ExperimentalApi` or carry explicit experimental field annotations so the protocol can expose unstable capabilities without breaking older clients.
+The file also models where configuration came from. `ConfigLayerSource` names layers such as system config, user config, project config, session flags, and managed enterprise settings. These layers matter because later, higher-priority layers can override earlier ones.
+
+Many structs derive serialization, JSON schema, and TypeScript generation support. In plain terms, that means the same Rust definitions can be turned into JSON for the wire protocol, machine-checkable schemas, and matching TypeScript types for frontend or client code. Without this file, different parts of the app could disagree about what a config message means, which would make configuration reads, writes, diagnostics, and migrations unreliable.
 
 #### Function details
 
@@ -2621,11 +2669,11 @@ A notable design choice throughout the file is preserving backward compatibility
 fn precedence(&self) -> i16
 ```
 
-**Purpose**: Assigns a fixed numeric precedence to each config layer source so override order is deterministic and comparable. It encodes the policy that later, more specific, or legacy-forced layers win over earlier ones.
+**Purpose**: This gives each configuration layer a priority number. The number answers a practical question: if two layers set the same option, which layer wins?
 
-**Data flow**: Reads the enum variant and, for `User`, also inspects whether `profile` is `Some`. Returns an `i16` precedence value: MDM lowest, then system, enterprise-managed, user/base, user/profile, project, session flags, and finally legacy managed config variants highest. It does not mutate state.
+**Data flow**: It starts with one `ConfigLayerSource`, such as system config, user config, project config, or command-line session flags. It matches that source to a fixed priority number, with higher numbers meaning stronger override power. It returns that number without changing anything else.
 
-**Call relations**: This method is the basis for `PartialOrd`; comparisons between two layer sources delegate to these numeric values rather than duplicating the match logic.
+**Call relations**: When two config layers need to be ordered, `ConfigLayerSource::partial_cmp` calls this method for each layer. The returned numbers become the simple basis for deciding which settings can override which others.
 
 *Call graph*: called by 1 (partial_cmp).
 
@@ -2636,11 +2684,11 @@ fn precedence(&self) -> i16
 fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>
 ```
 
-**Purpose**: Implements ordering for config layer sources in terms of override precedence. It makes ordinary comparisons reflect the semantic rule that higher-precedence layers override lower-precedence ones.
+**Purpose**: This lets two configuration layer sources be compared according to their override priority. It makes ordinary comparison or sorting use the same rule as the config system: lower-priority layers come before higher-priority layers.
 
-**Data flow**: Accepts `&self` and `&other`, calls `precedence()` on both values, compares the resulting integers, and wraps the `Ordering` in `Some(...)`. Returns `Option<Ordering>` as required by `PartialOrd` and has no side effects.
+**Data flow**: It receives two layer sources: `self` and `other`. It asks each one for its precedence number, compares those numbers, and returns the ordering result. It does not inspect or merge the actual config values.
 
-**Call relations**: This trait method is invoked by generic ordering/sorting code whenever config layers are compared; internally it delegates entirely to `ConfigLayerSource::precedence` for both operands.
+**Call relations**: This function is the comparison hook for `ConfigLayerSource`. Its whole job is to delegate the real priority decision to `ConfigLayerSource::precedence` for both sides, then hand that ordering back to whatever code is comparing layers.
 
 *Call graph*: calls 1 internal fn (precedence); 1 external calls (precedence).
 
@@ -2651,33 +2699,39 @@ fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>
 fn into_vec(self) -> Vec<String>
 ```
 
-**Purpose**: Normalizes the backward-compatible workspace-id representation into a single vector form. It lets downstream code ignore whether the wire payload used a single string or an array.
+**Purpose**: This normalizes an older flexible API shape into one simple list of workspace IDs. It lets callers treat both a single workspace ID and multiple workspace IDs the same way.
 
-**Data flow**: Consumes `self`; if it is `Single(value)`, allocates and returns a one-element `Vec<String>`, and if it is `Multiple(values)`, returns the existing vector unchanged. No external state is touched.
+**Data flow**: It takes ownership of a `ForcedChatgptWorkspaceIds` value. If the value contains one string, it wraps that string in a one-item list. If it already contains a list, it returns that list as-is.
 
-**Call relations**: This helper is used by internal consumers that want a uniform collection after deserialization, collapsing the compatibility enum into the shape most processing code expects.
+**Call relations**: This is used after deserializing the backward-compatible workspace restriction field. Instead of making later code check whether it received one ID or many, this function turns both cases into a plain vector before the next step.
 
 *Call graph*: 1 external calls (vec!).
 
 
 ### `app-server-protocol/src/protocol/v2/experimental_feature.rs`
 
-`data_model` · `request handling for feature flag UI, config inspection, and runtime toggle updates`
+`data_model` · `request handling`
 
-This file models the API surface around feature flags exposed to clients. `ExperimentalFeatureListParams` supports paginated listing with an opaque `cursor`, optional `limit`, and an optional `thread_id` used to compute enablement in the context of an existing thread’s refreshed configuration, including project-local config tied to that thread’s cwd. That thread-aware parameter is a notable design choice: feature visibility is not purely global, but can depend on per-thread configuration state.
+This file does not run behavior by itself. Instead, it defines the message formats for a feature-flag API: a way for users or tools to see which experimental features exist, what state they are in, and whether they are enabled. A feature flag is like a light switch for unfinished or optional product behavior. Without these shared definitions, the server might send fields the client does not understand, or the client might ask for changes in a shape the server cannot read.
 
-Feature metadata itself is represented by `ExperimentalFeature`, which combines a stable config key (`name`), lifecycle stage (`ExperimentalFeatureStage`), optional user-facing beta-only copy (`display_name`, `description`, `announcement`), and two booleans distinguishing current effective enablement from default enablement. The stage enum captures the progression from `UnderDevelopment` through `Beta` and `Stable` to `Deprecated` and `Removed`, giving clients enough information to render warnings or hide obsolete toggles. `ExperimentalFeatureListResponse` returns a page of `data` plus an optional `next_cursor` for continuation.
+The file describes request and response bodies for two main actions. First, a client can ask for a paged list of experimental features. The request can include a cursor, which is an opaque bookmark for continuing from a previous page, a limit for page size, and optionally a thread id so the server can calculate enablement using that thread’s current configuration. The response returns feature entries plus another cursor if more results are available.
 
-The second half of the file defines mutation payloads for runtime toggles. `ExperimentalFeatureEnablementSetParams` carries a `BTreeMap<String, bool>` keyed by canonical feature name; omitted features are intentionally left unchanged, and an empty map is a no-op. The response echoes the entries actually updated in another ordered `BTreeMap`, which provides deterministic serialization order useful for tests and UI diffing. Overall, the file freezes the wire contract for feature discovery and selective enablement updates without embedding policy logic.
+Second, a client can send a map of feature names to true-or-false enabled states. Only the named features are changed; missing ones stay as they are. The response echoes the entries that were updated.
+
+The types are also prepared for JSON, JSON Schema, and TypeScript generation. In plain terms, this means the same contract can be checked, documented, and reused by frontend code without hand-copying it.
 
 
 ### `app-server-protocol/src/protocol/v2/plugin.rs`
 
-`data_model` · `request/response schema definition and protocol serialization`
+`data_model` · `request handling`
 
-This file is a large protocol surface definition for plugin-related RPCs and notifications. Most of the file consists of serde/ts-rs/schemars-annotated structs and enums that precisely shape request and response payloads for listing skills and hooks, adding/removing/upgrading marketplaces, listing and reading plugins, installing/uninstalling plugins, reading remote skill contents, and managing plugin sharing. The schema distinguishes local filesystem-backed marketplaces from remote-only catalogs via `PluginMarketplaceEntry.path: Option<AbsolutePathBuf>` and `PluginSource` variants (`Local`, `Git`, `Remote`). Several fields intentionally preserve nullable-vs-omitted semantics, such as optional marketplace selectors and sharing metadata, while others default for backward compatibility, like `PluginSummary.availability` defaulting to `Available` and accepting the upstream alias `ENABLED`.
+This file is mostly a dictionary of message formats. When a client asks to list plugins, read a plugin, install one, share one, list skills, or inspect hooks, the server needs a clear agreement about the names and types of every field in the request and response. This file provides that agreement.
 
-The behavioral code in the file is limited to five `From` conversions that adapt core skill types from `codex_protocol::protocol` into v2 API types. Those conversions are field-preserving and recursive: `SkillMetadata::from` maps nested `interface` and `dependencies`, converts `scope`, and explicitly forces `enabled: true` because the core metadata does not carry the app-server’s effective enablement state. `SkillDependencies::from` maps each tool dependency element-by-element, and `SkillScope::from` is a closed enum translation with no fallback branch. The file ends with `SkillsChangedNotification`, a pure invalidation signal telling clients to re-run `skills/list` rather than expecting embedded delta data.
+The structs describe practical pieces of plugin data: where marketplaces live, which plugins are installed, what a plugin looks like in the UI, which skills it contains, what hooks it registers, and how shared plugins are made visible to users or groups. The enums describe fixed choices, such as whether a plugin can be installed, whether sharing is listed or private, or whether a skill belongs to the user, a repository, the system, or an administrator.
+
+The file also derives JSON serialization, JSON schema, and TypeScript output. In plain terms, that means the same Rust definitions can be turned into network messages, documentation-like schemas, and matching frontend types. This helps prevent the server and user interface from silently disagreeing.
+
+At the end, a few conversion functions translate lower-level core skill data into this v2 API shape. That keeps the public API stable even if the internal skill representation comes from another crate.
 
 #### Function details
 
@@ -2687,11 +2741,11 @@ The behavioral code in the file is limited to five `From` conversions that adapt
 fn from(value: CoreSkillMetadata) -> Self
 ```
 
-**Purpose**: Converts a core `CoreSkillMetadata` record into the v2 `SkillMetadata` payload exposed by app-server. It preserves descriptive fields and nested metadata while supplying the API-layer `enabled` flag as `true` by default.
+**Purpose**: Turns internal skill metadata from the core protocol into the v2 app-server version that can be returned to clients. This is useful because the server may store or discover skills in one internal format but expose them through a separate public API format.
 
-**Data flow**: Consumes a `CoreSkillMetadata` value by value. It copies `name`, `description`, `short_description`, and `path`; maps `interface` through `SkillInterface::from` when present; maps `dependencies` through `SkillDependencies::from` when present; converts `scope` through `SkillScope::from`; and returns a new `SkillMetadata` with `enabled` hard-coded to `true`.
+**Data flow**: It receives one core skill record containing the skill name, description, optional interface details, optional dependency details, path, and scope. It copies the simple fields across, converts nested interface and dependency data into their v2 forms when present, converts the scope into the v2 enum, and marks the exposed skill as enabled. The result is a complete `SkillMetadata` value ready for v2 responses.
 
-**Call relations**: Used wherever core skill discovery results need to be surfaced through the v2 protocol. In that flow it acts as the top-level adapter, delegating nested conversion to the interface, dependency, and scope converters so callers can transform an entire skill tree with a single `into()`.
+**Call relations**: This conversion is used when skill discovery produces core protocol skill records and the app-server needs to send them through the v2 plugin and skills API. While building the public record, it hands nested work to `SkillInterface::from`, `SkillDependencies::from`, and `SkillScope::from` so each smaller piece is translated consistently.
 
 
 ##### `SkillInterface::from`  (lines 815–824)
@@ -2700,11 +2754,11 @@ fn from(value: CoreSkillMetadata) -> Self
 fn from(value: CoreSkillInterface) -> Self
 ```
 
-**Purpose**: Transforms a core skill interface description into the API-facing `SkillInterface`. It is a direct field mapping for presentation-oriented metadata such as names, prompts, colors, and icon paths.
+**Purpose**: Converts the UI-facing details of a skill from the core format into the v2 API format. These details include things a client might show to a user, such as display name, short description, icons, color, and a default prompt.
 
-**Data flow**: Takes `CoreSkillInterface`, reads its optional fields `display_name`, `short_description`, `brand_color`, `default_prompt`, `icon_small`, and `icon_large`, and returns a `SkillInterface` containing the same values without mutation.
+**Data flow**: It receives a core skill interface object. It moves each optional display-related field into a new v2 `SkillInterface` object without changing the meaning of the values. The output is the client-facing version of the skill's presentation details.
 
-**Call relations**: Invoked from `SkillMetadata::from` when a discovered skill includes interface metadata. It exists to isolate nested interface translation so the top-level metadata conversion stays shallow and compositional.
+**Call relations**: This function is called as part of `SkillMetadata::from` whenever a core skill includes interface information. It is the small adapter that lets the larger skill conversion keep presentation fields in the same shape expected by the v2 API.
 
 
 ##### `SkillDependencies::from`  (lines 828–836)
@@ -2713,11 +2767,11 @@ fn from(value: CoreSkillInterface) -> Self
 fn from(value: CoreSkillDependencies) -> Self
 ```
 
-**Purpose**: Converts a core dependency list into the v2 `SkillDependencies` structure. Its main job is to recursively translate each tool dependency entry.
+**Purpose**: Converts a skill's tool requirements from the core format into the v2 API format. This lets clients see what external tools or services a skill depends on.
 
-**Data flow**: Consumes `CoreSkillDependencies`, takes ownership of its `tools` vector, iterates through it with `into_iter()`, maps each element via `SkillToolDependency::from`, collects the results into a new `Vec<SkillToolDependency>`, and returns `SkillDependencies { tools }`.
+**Data flow**: It receives a core dependency object containing a list of tool dependencies. It walks through that list, converts each tool dependency into the v2 shape, collects the converted tools, and returns a new `SkillDependencies` value.
 
-**Call relations**: Called from `SkillMetadata::from` when a skill declares dependencies. It delegates per-item conversion to `SkillToolDependency::from` so callers get a fully converted dependency graph rather than raw core entries.
+**Call relations**: This function is called by `SkillMetadata::from` when a skill has dependency information. For each individual tool requirement, it delegates to `SkillToolDependency::from`, so the list-level conversion stays simple and each item is translated the same way.
 
 
 ##### `SkillToolDependency::from`  (lines 840–849)
@@ -2726,11 +2780,11 @@ fn from(value: CoreSkillDependencies) -> Self
 fn from(value: CoreSkillToolDependency) -> Self
 ```
 
-**Purpose**: Maps one core tool dependency record into the API schema used in skill metadata. It preserves both generic dependency identity fields and transport-specific optional fields.
+**Purpose**: Converts one tool dependency for a skill from the core representation into the v2 API representation. A tool dependency describes something the skill needs, such as a command, transport, or URL.
 
-**Data flow**: Accepts `CoreSkillToolDependency`, copies `type`, `value`, `description`, `transport`, `command`, and `url` into a new `SkillToolDependency`, and returns it unchanged apart from the type rename to `r#type` in Rust.
+**Data flow**: It receives one core tool dependency with fields like type, value, description, transport, command, and URL. It copies those fields into a new v2 `SkillToolDependency` object, preserving optional fields when they exist. The output is one dependency item suitable for client responses.
 
-**Call relations**: Reached through `SkillDependencies::from` for each dependency entry in a skill. It is the leaf conversion in the skill dependency adaptation chain.
+**Call relations**: This function is called by `SkillDependencies::from` for every tool listed in a skill's dependencies. It is the per-item translator inside the broader dependency conversion flow.
 
 
 ##### `SkillScope::from`  (lines 853–860)
@@ -2739,20 +2793,22 @@ fn from(value: CoreSkillToolDependency) -> Self
 fn from(value: CoreSkillScope) -> Self
 ```
 
-**Purpose**: Translates the core skill scope enum into the v2 protocol enum. The mapping is exhaustive and preserves the semantic scope category exactly.
+**Purpose**: Converts the internal skill scope into the v2 API skill scope. The scope says where a skill comes from or who controls it, such as user, repository, system, or administrator.
 
-**Data flow**: Reads a `CoreSkillScope` variant and matches it to one of `SkillScope::User`, `Repo`, `System`, or `Admin`, returning the corresponding v2 enum value.
+**Data flow**: It receives one core scope value. It matches that value to the equivalent v2 scope value and returns it. No other data is read or changed.
 
-**Call relations**: Used by `SkillMetadata::from` when adapting top-level skill metadata. It provides the enum bridge needed so API payloads stay decoupled from core protocol type names and serde settings.
+**Call relations**: This function is called by `SkillMetadata::from` while preparing a full skill record for the v2 API. It keeps the public enum separate from the core enum while preserving the same meaning for each scope.
 
 
 ### `app-server-protocol/src/protocol/v2/hook.rs`
 
-`data_model` · `hook lifecycle notifications and hook run serialization`
+`data_model` · `request handling and event notification serialization`
 
-This module exposes hook execution state to clients. A series of `v2_enum_from_core!` macro invocations define protocol enums mirroring core hook concepts such as event names, handler types, execution mode, scope, source, trust status, run status, and output entry kind. On top of those enums, the file defines `HookOutputEntry`, `HookRunSummary`, and the `HookStartedNotification` / `HookCompletedNotification` payloads used to stream hook lifecycle events.
+This file is a translation layer between the project’s internal hook records and the public protocol sent to clients. A hook is like a checkpoint script: it can run at certain moments, produce messages, block work, or add context. Clients need a stable, clearly named format for seeing what hooks ran, where they came from, and what happened.
 
-The behavioral code is straightforward conversion logic. `HookOutputEntry::from` maps a single core output entry into the v2 struct, converting the entry kind and preserving the text. `HookRunSummary::from` performs a full record conversion: it maps all enum fields through `Into`, copies timestamps and identifiers, preserves the source path, and converts each output entry in `entries` with an iterator pipeline. The `source` field on `HookRunSummary` has a serde default supplied by `default_hook_source`, which returns `HookSource::Unknown`; this ensures older payloads or omitted fields still deserialize into a valid enum value instead of failing. The file is intentionally transport-focused: it does not execute hooks, only describes and translates their observed results.
+Most of the file defines small named value sets, such as the hook event name, execution mode, source, trust status, run status, and output kind. These are copied from the core protocol into this app-server protocol version, so version 2 can stay stable even if the internal code changes later. The structs then describe the actual messages: a hook output entry is one piece of text from a hook, and a hook run summary is the full report for one hook run, including timing, status, source file path, and all output entries.
+
+The conversion functions turn internal core types into these public version 2 types. That matters because the server should not leak internal data shapes directly to clients. The file also derives JSON serialization and TypeScript schema generation, so the same definitions can be safely used by Rust code, JSON API messages, and frontend TypeScript code.
 
 #### Function details
 
@@ -2762,11 +2818,11 @@ The behavioral code is straightforward conversion logic. `HookOutputEntry::from`
 fn default_hook_source() -> HookSource
 ```
 
-**Purpose**: Provides the fallback hook source used during deserialization when no explicit source is present. It keeps the wire format backward-compatible by defaulting missing values to `Unknown`.
+**Purpose**: Provides a safe fallback source for older or incomplete hook data that does not say where the hook came from. Instead of failing or leaving the field empty, the API labels it as unknown.
 
-**Data flow**: Takes no arguments and returns `HookSource::Unknown`. It reads and writes no state.
+**Data flow**: No input is needed. The function simply returns the `Unknown` hook source value, which is then used as the default when deserializing a `HookRunSummary` that is missing its `source` field.
 
-**Call relations**: This function is referenced by serde as the default provider for `HookRunSummary.source`, so it runs only during deserialization of payloads missing that field.
+**Call relations**: This function is tied to the `source` field on `HookRunSummary` through Serde, the JSON reading and writing library. When incoming JSON lacks that field, Serde calls this function so the rest of the hook summary can still be read cleanly.
 
 
 ##### `HookOutputEntry::from`  (lines 89–94)
@@ -2775,11 +2831,11 @@ fn default_hook_source() -> HookSource
 fn from(value: CoreHookOutputEntry) -> Self
 ```
 
-**Purpose**: Converts one core hook output entry into the v2 wire representation. It preserves the textual payload and translates the entry kind into the exported enum.
+**Purpose**: Converts one internal hook output entry into the version 2 API form. This is used when the server needs to show clients a warning, error, feedback message, or other text produced by a hook.
 
-**Data flow**: Consumes a `CoreHookOutputEntry`, converts `value.kind` with `.into()`, moves `value.text`, and returns a new `HookOutputEntry`. No side effects occur.
+**Data flow**: It receives a core hook output entry containing a kind and some text. It converts the kind into the version 2 enum and keeps the text unchanged. The result is a `HookOutputEntry` ready to serialize into the public protocol.
 
-**Call relations**: This conversion is used while building a full `HookRunSummary`; each core entry in the summary's `entries` vector is mapped through this function.
+**Call relations**: This conversion is used when building a full `HookRunSummary`. As each internal output entry is encountered, `HookRunSummary::from` hands it to this conversion so the summary contains client-facing entries rather than internal ones.
 
 
 ##### `HookRunSummary::from`  (lines 119–136)
@@ -2788,53 +2844,61 @@ fn from(value: CoreHookOutputEntry) -> Self
 fn from(value: CoreHookRunSummary) -> Self
 ```
 
-**Purpose**: Transforms a complete core hook run record into the client-facing summary payload used in notifications. It preserves execution identity, timing, ordering, status, and all emitted output entries.
+**Purpose**: Converts a complete internal hook run report into the version 2 API report that clients can receive. It preserves the important facts: what hook ran, where it came from, when it ran, whether it succeeded, and what it printed.
 
-**Data flow**: Consumes `CoreHookRunSummary`, converts enum-valued fields (`event_name`, `handler_type`, `execution_mode`, `scope`, `source`, `status`) via `.into()`, moves scalar and optional fields directly, and converts `entries` by iterating and mapping each element through `Into::into` before collecting into a `Vec<HookOutputEntry>`. Returns the assembled `HookRunSummary`.
+**Data flow**: It receives a core hook run summary. Simple fields such as IDs, timestamps, messages, and paths are copied across. Enum fields such as event name, mode, scope, source, and status are converted into their version 2 forms. The list of output entries is walked one by one, and each entry is converted with `HookOutputEntry::from`. The result is a `HookRunSummary` suitable for API notifications or responses.
 
-**Call relations**: This is the main adapter used when hook lifecycle events are surfaced to v2 clients; it delegates per-entry conversion to `HookOutputEntry::from` and relies on the macro-generated enum conversions for the rest.
+**Call relations**: This is the main bridge from the core hook system into the app-server protocol. When hook started or completed notifications need to include a run summary, this conversion prepares the public version of that summary and delegates each output item to `HookOutputEntry::from`.
 
 
 ### `app-server-protocol/src/protocol/v2/feedback.rs`
 
-`data_model` · `request handling for user feedback and diagnostics submission`
+`data_model` · `request handling`
 
-This file specifies the request and response schema for a feedback submission endpoint. `FeedbackUploadParams` requires a `classification` string and then layers on optional context: a free-form `reason`, an optional `thread_id` to associate the feedback with a conversation, a boolean `include_logs` flag, optional extra log file paths, and optional structured `tags` stored in a `BTreeMap<String, String>`. The use of `PathBuf` for `extra_log_files` indicates these are filesystem references supplied by the client rather than opaque attachment ids.
+This file is like a simple paper form for sending feedback. It does not perform the upload itself. Instead, it defines what information can be sent and what information comes back.
 
-The request shape is designed to support both lightweight feedback and richer diagnostic submissions. `include_logs` defaults to false and is omitted when false, keeping the serialized payload compact; `extra_log_files` and `tags` are nullable/optional so clients can progressively add detail without constructing placeholder values. The ordered `BTreeMap` for tags gives deterministic key ordering across serialization and generated bindings.
+`FeedbackUploadParams` describes the request from a client. It includes the feedback category, an optional written reason, an optional thread ID to connect the feedback to an existing conversation, and a flag saying whether logs should be included. It can also carry extra log file paths and optional tags, which are key-value labels such as environment or feature names. The fields are serialized using camelCase names, meaning Rust-style names like `thread_id` become API-style names like `threadId`.
 
-`FeedbackUploadResponse` returns a single `thread_id: String`, which implies the server normalizes or creates a thread association for the uploaded feedback and reports that canonical identifier back to the caller. The file itself contains no upload mechanics, file reading, or validation rules; it only defines the exact wire-level contract for the feedback workflow.
+`FeedbackUploadResponse` describes the server's reply. It returns a `thread_id`, so the client can know which feedback thread was created or used.
+
+The file also derives support for JSON serialization, deserialization, JSON Schema generation, and TypeScript type export. In plain terms, that means the same definitions can be used by Rust code, API documentation or validation tools, and frontend TypeScript code without rewriting the shape by hand.
 
 
 ### `app-server-protocol/src/protocol/v2/attestation.rs`
 
-`data_model` · `request handling for optional attestation flows`
+`data_model` · `request handling`
 
-This file contains the minimal schema for the `attestation/generate` API in protocol v2. `AttestationGenerateParams` is an empty parameter object, intentionally represented as a struct rather than omitted entirely so the method has a stable, explicit request shape for serde, schema generation, and TypeScript bindings. It derives `Default`, which makes it easy for callers and tests to construct the request without fields.
+This file is like a small form template for one protocol action: asking the server to generate an attestation token. An attestation token is an opaque proof string. “Opaque” means code that receives it should pass it along or store it, but should not try to inspect its inside meaning.
 
-`AttestationGenerateResponse` carries a single `token: String`, documented as an opaque client attestation token. The opacity is significant: the protocol contract promises transport of the token, not any client-visible structure or semantics. Both types use camelCase serde naming and export into the `v2/` TypeScript output tree, keeping them aligned with the rest of the versioned API surface.
+There are two data types here. `AttestationGenerateParams` represents the input for the generate request. It is currently empty, which means the client does not need to send any extra fields to ask for a token. Keeping it as a named type still matters because it gives this protocol action a clear place to grow later if parameters are added.
 
-There is no validation or generation logic here; this file’s responsibility is to freeze the wire format. In practice it is active only when a client has negotiated or opted into attestation-related behavior elsewhere in the protocol and needs a typed payload for the request/response exchange.
+`AttestationGenerateResponse` represents the server’s answer. It contains one field, `token`, which is the generated attestation token string.
+
+The derives on these structs make them usable across the protocol boundary: they can be serialized and deserialized, meaning converted to and from formats like JSON; they can produce JSON Schema for validation or documentation; and they can export TypeScript definitions so frontend or client code can use the same shapes. Field names are set to camelCase to match common JSON and TypeScript style.
 
 
 ### `app-server-protocol/src/protocol/v2/environment.rs`
 
-`data_model` · `request handling when environments are registered or updated`
+`data_model` · `protocol definition and request handling`
 
-This file contains the schema for a simple environment-registration API. `EnvironmentAddParams` carries two required strings: `environment_id`, which identifies the environment being added, and `exec_server_url`, which points at the execution server endpoint associated with that environment. The shape is intentionally small and direct, suggesting that environment creation or discovery happens elsewhere and this method only binds an identifier to a reachable execution backend.
+This file is a small protocol contract. In plain terms, it describes what information must be sent when a client asks the server to add an environment, and what the server sends back afterward. An “environment” here is identified by an `environment_id` and points to an execution server through `exec_server_url`, which is the address where work for that environment can be run.
 
-`EnvironmentAddResponse` is an empty success object, which means the protocol treats successful registration as acknowledgment-only and does not return derived metadata, canonicalized values, or server-generated ids. As with the rest of the v2 protocol, both types derive serde serialization/deserialization, JSON Schema, and TypeScript export metadata, and use camelCase field naming on the wire.
+The important job of this file is consistency. The structs are marked so they can be turned into JSON and read back from JSON using `serde`, which is Rust’s common serialization library. They also produce a JSON Schema, which is a machine-readable description of valid JSON, and TypeScript types, so frontend or client code can use the same contract without guessing.
 
-There is no embedded validation logic here, so constraints such as uniqueness of `environment_id`, URL correctness, or replacement semantics must be enforced by the server implementation that consumes these types. This file’s role is to define the exact request and response envelope for that interaction.
+The `camelCase` setting matters because Rust field names usually use underscores, like `environment_id`, while JSON APIs often use names like `environmentId`. This file bridges that difference automatically. Without this file, different parts of the system could disagree about what an “add environment” request looks like, leading to broken API calls or duplicated type definitions.
 
 
 ### `app-server-protocol/src/protocol/v2/remote_control.rs`
 
-`data_model` · `remote-control request handling and status notification serialization`
+`data_model` · `request handling and protocol serialization`
 
-This file is the protocol model for remote-control features. It declares request and response structs for enabling and disabling remote control, reading current status, starting and polling pairing, listing paired clients with pagination and sort order, and revoking a client. The central shared state shape is `RemoteControlStatusChangedNotification`, which carries `status: RemoteControlConnectionStatus`, `server_name`, `installation_id`, and optional `environment_id`. Both `RemoteControlEnableResponse` and `RemoteControlDisableResponse` intentionally mirror that exact payload, allowing the implementation to derive synchronous RPC responses from the same state snapshot used for notifications.
+Remote control needs both sides of the system to agree on exactly what information is sent over the wire. This file is that agreement. It does not open network connections itself or decide whether remote control should be allowed. Instead, it defines the data packets that other code sends and receives.
 
-Serde annotations preserve the wire contract: booleans like `ephemeral` and `manual_code` default to `false` and are omitted when false, while list parameters keep nullable optional fields such as `cursor`, `limit`, and `order`. `RemoteControlConnectionStatus` is a compact enum with `Disabled`, `Connecting`, `Connected`, and `Errored`, representing the externally visible lifecycle rather than transport internals. The only behavior in the file is two `From` impls that destructure a status notification and rebuild the corresponding response type. That design avoids duplicate field-copying logic in handlers and guarantees response payloads stay structurally aligned with the notification schema.
+The file covers several everyday actions: enabling or disabling remote control, telling clients when the connection status changes, starting a pairing flow, checking whether a pairing code has been claimed, listing known remote clients, and revoking one client. The structs are like forms with named fields. For example, a status response includes the current status, the server name, the installation id, and possibly an environment id.
+
+The types derive serialization support, meaning Rust values can be converted to and from formats like JSON. They also derive JSON Schema and TypeScript output, so non-Rust clients can use matching definitions. Field names are converted to camelCase, which is common in JSON and TypeScript.
+
+A small but important detail is the `ephemeral` flag on enable and disable requests. It defaults to false and is skipped when false, keeping older or simpler messages compact. The two conversion functions copy a status notification into response objects, so the same status data can be reused when replying to an enable or disable request.
 
 #### Function details
 
@@ -2844,11 +2908,11 @@ Serde annotations preserve the wire contract: booleans like `ephemeral` and `man
 fn from(notification: RemoteControlStatusChangedNotification) -> Self
 ```
 
-**Purpose**: Builds an enable-response payload from a `RemoteControlStatusChangedNotification`. It reuses the notification’s connection snapshot as the RPC result after enabling remote control.
+**Purpose**: This turns a remote-control status notification into the response returned after enabling remote control. It lets the code reuse the same status information instead of rebuilding the response field by field elsewhere.
 
-**Data flow**: Consumes a `RemoteControlStatusChangedNotification`, destructures `status`, `server_name`, `installation_id`, and `environment_id`, and returns a `RemoteControlEnableResponse` containing the same values.
+**Data flow**: It receives a `RemoteControlStatusChangedNotification`, which contains the connection status, server name, installation id, and optional environment id. It takes those four pieces out and places them unchanged into a new `RemoteControlEnableResponse`. The result is a response object ready to be serialized and sent back to the caller.
 
-**Call relations**: Called by the remote-control enable flow and its scenario test path after the system obtains or emits a status notification. It serves as the final adapter from shared status state into the specific response type returned by `enable`.
+**Call relations**: When the enable flow has produced or received a status notification, the enable-related code calls this conversion to shape that notification into the expected enable response. In tests or scenario code, the same conversion is used to confirm that enabling remote control returns the same status details clients would see in a status-change notification.
 
 *Call graph*: called by 2 (serve_enable_remote_control_scenario, enable).
 
@@ -2859,11 +2923,11 @@ fn from(notification: RemoteControlStatusChangedNotification) -> Self
 fn from(notification: RemoteControlStatusChangedNotification) -> Self
 ```
 
-**Purpose**: Builds a disable-response payload from a `RemoteControlStatusChangedNotification`. It lets disable handlers return the same connection snapshot shape used by status-change notifications.
+**Purpose**: This turns a remote-control status notification into the response returned after disabling remote control. It provides a simple bridge between the general status update format and the specific disable response format.
 
-**Data flow**: Takes a `RemoteControlStatusChangedNotification`, reads `status`, `server_name`, `installation_id`, and `environment_id`, and returns `RemoteControlDisableResponse` with those fields copied directly.
+**Data flow**: It receives a `RemoteControlStatusChangedNotification` with the current status and identity fields. It copies the status, server name, installation id, and optional environment id into a new `RemoteControlDisableResponse`. Nothing is transformed or looked up; the output is the same information in the response type expected by disable callers.
 
-**Call relations**: Used by the disable flow, including the compatibility path that retries without params for older servers. In that call chain it converts the shared status notification/state object into the concrete RPC response expected by callers.
+**Call relations**: When the disable flow finishes or receives a status update, it calls this conversion to return a disable response with the latest remote-control state. A compatibility-focused test also uses it in the path that retries disabling without parameters for older servers, so the final reply still has the standard disable-response shape.
 
 *Call graph*: called by 2 (disable_remote_control_retries_without_params_for_older_servers, disable).
 
@@ -2873,40 +2937,52 @@ This set defines the operational RPCs for command execution, processes, filesyst
 
 ### `app-server-protocol/src/protocol/v2/command_exec.rs`
 
-`data_model` · `request handling for standalone process execution and streaming session control`
+`data_model` · `request handling`
 
-This file models the full wire contract for `command/exec` and its follow-up methods. The central request type, `CommandExecParams`, describes how a client asks the server to run an argv vector outside the thread/turn system. It includes execution mode flags (`tty`, `stream_stdin`, `stream_stdout_stderr`), resource controls (`output_bytes_cap`, `disable_output_cap`, `timeout_ms`, `disable_timeout`), process identity (`process_id`), environment and cwd overrides, optional PTY size, and sandbox selection via either `sandbox_policy` or the experimental `permission_profile`. The comments encode important invariants that the server is expected to enforce: empty commands are invalid; PTY implies stdin/stdout streaming; several features require a client-supplied `processId`; and timeout/output-cap options are mutually exclusive with their corresponding disable flags.
+This file is like the order form and receipt format for running shell-style commands through the app server. It does not actually start processes itself. Instead, it describes the exact data that travels between a client and the server when a client wants to run a standalone command inside the server’s sandbox, which is the controlled environment that limits what the command can do.
 
-The rest of the file defines the lifecycle around that execution. `CommandExecResponse` returns the final exit code and any buffered stdout/stderr, with the explicit rule that streamed output is not duplicated into the final response. `CommandExecWriteParams`, `CommandExecTerminateParams`, and `CommandExecResizeParams` target an existing connection-scoped process id and each have empty success response structs, making the protocol acknowledge control actions without extra payload. `CommandExecTerminalSize` standardizes PTY dimensions as rows and columns. For streaming, `CommandExecOutputStream` distinguishes stdout from stderr, and `CommandExecOutputDeltaNotification` carries base64-encoded chunks plus a `cap_reached` marker indicating truncation at the configured capture limit.
+The main request type, `CommandExecParams`, says what command to run, where to run it, what environment variables to use, whether output should be buffered or streamed live, and whether the command should run as a terminal session. It also describes safety and resource controls, such as timeouts, output size limits, and sandbox or permission settings.
 
-The file is purely declarative, but it captures subtle transport semantics: process ids are scoped to a connection, output chunks are base64 rather than raw bytes, and if the originating connection disappears the associated process is expected to be terminated by the server. The `ExperimentalApi` derive on `CommandExecParams` also marks this surface as gated or opt-in relative to the stable protocol.
+Several smaller request and response types cover follow-up actions for a running command. A client can write bytes to stdin, close stdin, resize a pseudo-terminal, or terminate the process. Output can arrive as `CommandExecOutputDeltaNotification` messages, where chunks are base64-encoded so raw bytes can safely travel through JSON text.
+
+The derives on these types make them serializable, deserializable, schema-generating, and exportable to TypeScript. Without this file, different parts of the system could disagree about what a command execution request or response looks like, causing clients and the server to misunderstand each other.
 
 
 ### `app-server-protocol/src/protocol/v2/process.rs`
 
 `data_model` · `request handling`
 
-This module is the schema for the `process/*` API family. It models both control requests and asynchronous output/exit notifications for connection-scoped subprocesses started by the app server. `ProcessTerminalSize` captures PTY dimensions in character cells and is reused by spawn and resize operations. `ProcessSpawnParams` is the central request payload: it includes the argv vector, a client-chosen `process_handle`, absolute `cwd`, PTY enablement, stdin/stdout streaming flags, optional output and timeout limits, environment overrides, and optional initial PTY size. Two fields—`output_bytes_cap` and `timeout_ms`—use a double-`Option` serde helper to distinguish omitted (use server default) from explicit `null` (disable limit), which is a subtle but important wire-level contract. Empty marker structs represent successful responses for spawn, stdin writes, kills, and PTY resize. `ProcessWriteStdinParams` supports writing base64-encoded bytes, closing stdin, or both in one request. `ProcessOutputStream` labels streamed chunks as stdout or stderr. `ProcessOutputDeltaNotification` carries base64 output chunks and indicates truncation on the final chunk when a cap is reached. `ProcessExitedNotification` reports the final exit code plus buffered stdout/stderr when not streamed, along with per-stream cap flags. The comments encode key invariants: duplicate active handles are rejected per connection, PTY mode implies streaming behavior, and streamed output is not duplicated into the final exit notification.
+This file does not run processes itself. Instead, it defines the data structures that travel across the protocol when a client asks the app server to run a command on the server machine. Think of it like a set of standardized forms: one form says “start this command in this folder,” another says “write these bytes to its input,” another says “the process printed this output,” and another says “the process has exited.”
+
+The main request type, `ProcessSpawnParams`, describes everything needed to start a standalone process: the command words, a client-chosen process handle used as a name for later messages, the working directory, optional environment changes, timeouts, output limits, and whether the process should behave like it is attached to a terminal. A PTY, or pseudo-terminal, means the program sees a terminal-like screen instead of plain input and output pipes; `ProcessTerminalSize` describes that screen size in rows and columns.
+
+The other request types describe follow-up actions: writing to stdin, killing the process, or resizing the PTY. The notification types describe messages the server sends back later: output chunks, marked as stdout or stderr, and a final exit report with exit code and any captured output. The structs derive serialization, JSON schema, and TypeScript bindings, so Rust, JSON clients, and TypeScript code all share the same contract.
 
 
 ### `app-server-protocol/src/protocol/v2/fs.rs`
 
-`data_model` · `request handling and notification delivery for filesystem access`
+`data_model` · `request handling`
 
-This file is the typed contract for a broad filesystem API exposed over protocol v2. Every operation uses explicit request and response structs with `AbsolutePathBuf` for paths that must be absolute on the host, making path expectations part of the type system rather than an informal convention. The API covers reading and writing files (`FsReadFileParams`/`FsReadFileResponse`, `FsWriteFileParams`/`FsWriteFileResponse`), creating directories, querying metadata, listing directory contents, removing paths, copying files or directory trees, and subscribing to change notifications.
+This file is like a set of blank forms for filesystem requests in protocol version 2. It does not actually open, save, delete, or watch files itself. Instead, it defines the data that travels between a client and the server when those actions are requested.
 
-Several payloads encode important semantics directly in their fields and comments. File contents are transported as base64 strings (`data_base64`) rather than raw bytes. Directory creation and removal expose optional booleans (`recursive`, `force`) whose absence means server defaults apply; comments document those defaults as `true`. Metadata responses flatten common stat information into booleans for directory/file/symlink plus millisecond timestamps, using `0` when creation or modification time is unavailable. Directory listings return only direct child names in `FsReadDirectoryEntry.file_name`, not full paths, along with file-vs-directory classification.
+Each struct describes one request or response. For example, `FsReadFileParams` says that a read request must include an absolute path, and `FsReadFileResponse` says the server answers with the file contents encoded as base64. Base64 is a text-safe way to carry raw file bytes through formats like JSON, which are mainly built for text.
 
-The watch API introduces connection-scoped identifiers: `FsWatchParams` binds a client-provided `watch_id` to an absolute path, `FsWatchResponse` returns the canonicalized watched path, `FsUnwatchParams` tears down that subscription, and `FsChangedNotification` reports changed absolute paths associated with the watch. Empty response structs are used consistently for acknowledgment-only operations. The file contains no I/O implementation, but it precisely defines the transport shapes and invariants that filesystem-capable server code must honor.
+The file covers common filesystem operations: reading and writing files, creating directories, getting metadata such as whether a path is a file or directory, listing directory entries, removing paths, copying files or folders, and subscribing to change notifications. Watch requests use a caller-provided `watch_id`, which acts like a ticket number so later change messages or unwatch requests can refer to the same watch.
+
+The derive attributes make these structs serializable and deserializable, meaning they can be turned into protocol messages and read back again. They also generate JSON Schema and TypeScript definitions, helping Rust and TypeScript code stay in sync. Without this file, clients and the server could easily disagree about field names, path formats, or response contents.
 
 
 ### `app-server-protocol/src/protocol/v2/mcp.rs`
 
-`io_transport` · `MCP server discovery, MCP tool/resource requests, and MCP elicitation round-tripping`
+`data_model` · `cross-cutting`
 
-This module is the MCP-facing transport schema for app-server. It declares request/response payloads for listing MCP server status, reading resources, invoking tools, refreshing server inventory, and handling OAuth login completion. It also defines the wire representations of MCP tool-call results and errors, plus a substantial typed schema model for MCP elicitation forms (`McpElicitationSchema` and its nested enum/string/number/boolean variants).
+MCP, the Model Context Protocol, lets Codex connect to outside tool servers. This file is mostly a dictionary for that part of the system: it names every request, response, notification, and small status value that can cross the app-server protocol boundary. Without it, the server and client could disagree about simple but important things, such as how to ask for a tool call, how to report that OAuth login finished, or how to describe a form that an MCP server wants the user to fill in.
 
-The conversion logic falls into two groups. First, simple adapters map core MCP tool-call results and errors into v2 structs: `McpServerToolCallResponse::from` preserves content, structured content, error flag, and metadata; `McpToolCallResult::from` preserves the same payload minus `is_error`; and `McpToolCallError::from` exposes only the message. Second, elicitation bridging converts between app-server’s v2 types, core approval types, and RMCP model types. `McpServerElicitationAction` can be converted to the core approval action or to/from `rmcp::model::ElicitationAction`. `McpServerElicitationRequest::try_from` parses a core form request’s `requested_schema` JSON into the strongly typed v2 schema, failing with `serde_json::Error` if the schema is invalid or null; URL-mode requests pass through directly. Response conversions intentionally drop client `_meta` when converting to or from RMCP `CreateElicitationResult`, leaving `meta: None` in both directions.
+The file covers several everyday flows. A client can list MCP servers and see their tools, resources, templates, and login state. It can read a resource from a named server. It can call a named tool with JSON arguments and receive JSON content back. It can refresh server state or start an OAuth login and receive the authorization URL to open.
+
+A large section describes “elicitation,” which means an MCP server asking the user for more information. That can be a typed form, with fields like strings, numbers, booleans, and selectable options, or a URL-based prompt. The schema types are deliberately strict so clients can safely render forms from them.
+
+Most types derive serialization, JSON schema, and TypeScript export support. In plain terms, the same Rust definitions become both the wire format and the client-facing type definitions, reducing drift between backend and frontend.
 
 #### Function details
 
@@ -2916,11 +2992,11 @@ The conversion logic falls into two groups. First, simple adapters map core MCP 
 fn from(result: CoreMcpCallToolResult) -> Self
 ```
 
-**Purpose**: Converts a core MCP call-tool result into the direct response payload returned by the v2 MCP tool-call API. It preserves both unstructured and structured content plus error signaling metadata.
+**Purpose**: Turns the core tool-call result into the version 2 response sent over the app-server protocol. Someone uses this when an MCP tool has finished and the result needs to be shaped for API clients.
 
-**Data flow**: Consumes `CoreMcpCallToolResult`, moves `content`, `structured_content`, `is_error`, and `meta` into a new `McpServerToolCallResponse`, and returns it.
+**Data flow**: It receives a core MCP tool result containing content, optional structured content, an optional error flag, and optional metadata. It copies those fields into the protocol response type. The output is the same information, but wrapped in the public v2 response shape.
 
-**Call relations**: This adapter is used on the synchronous MCP tool-call response path where the server returns the tool result directly to the client.
+**Call relations**: This is a bridge between the lower-level Codex protocol model and the app-server protocol model. After core finishes a tool call, this conversion prepares the data for the client-facing response instead of exposing the core type directly.
 
 
 ##### `McpToolCallResult::from`  (lines 157–163)
@@ -2929,11 +3005,11 @@ fn from(result: CoreMcpCallToolResult) -> Self
 fn from(result: CoreMcpCallToolResult) -> Self
 ```
 
-**Purpose**: Converts a core MCP call-tool result into the item/notification-oriented result struct embedded in thread items. It intentionally omits the separate `is_error` flag because error cases are represented elsewhere.
+**Purpose**: Turns a core MCP tool-call result into a smaller result type used by this protocol. It keeps the returned content and metadata but does not include the separate error marker used by the full server response.
 
-**Data flow**: Consumes `CoreMcpCallToolResult`, moves `content`, `structured_content`, and `meta` into `McpToolCallResult`, and returns it.
+**Data flow**: It takes a core result with JSON content, optional structured content, an optional error flag, and optional metadata. It keeps the content, structured content, and metadata, and leaves out the error flag. The output is a v2 `McpToolCallResult` value.
 
-**Call relations**: This conversion is used when MCP tool-call outcomes are attached to `ThreadItem::McpToolCall` rather than returned as a direct RPC response.
+**Call relations**: This conversion is used wherever the protocol needs the successful-result-shaped view of a tool call. It lets the rest of the app use the core result internally while still sending a stable v2 shape outward.
 
 
 ##### `McpToolCallError::from`  (lines 167–171)
@@ -2942,11 +3018,11 @@ fn from(result: CoreMcpCallToolResult) -> Self
 fn from(error: CoreMcpToolCallError) -> Self
 ```
 
-**Purpose**: Converts a core MCP tool-call error into the simplified v2 error payload. It exposes only the human-readable message.
+**Purpose**: Turns a core MCP tool-call error into the simpler error type exposed by this protocol. It keeps the human-readable error message.
 
-**Data flow**: Consumes `CoreMcpToolCallError`, moves `error.message` into a new `McpToolCallError`, and returns it.
+**Data flow**: It receives a core error object with a message. It copies that message into the v2 error object. The output is an API-friendly error value.
 
-**Call relations**: This adapter is used when failed MCP tool calls are represented in item payloads or notifications.
+**Call relations**: This sits at the boundary between internal tool execution and client-facing reporting. When core reports a tool-call failure, this conversion shapes the failure for v2 protocol users.
 
 
 ##### `McpServerElicitationAction::to_core`  (lines 255–261)
@@ -2955,11 +3031,11 @@ fn from(error: CoreMcpToolCallError) -> Self
 fn to_core(self) -> codex_protocol::approvals::ElicitationAction
 ```
 
-**Purpose**: Maps the v2 elicitation action enum into the core approvals-layer elicitation action. It preserves the user's accept/decline/cancel choice.
+**Purpose**: Converts a user’s elicitation choice into the equivalent core Codex action. The choice can be accept, decline, or cancel.
 
-**Data flow**: Consumes `self`, matches `Accept`, `Decline`, or `Cancel`, and returns the corresponding `codex_protocol::approvals::ElicitationAction`.
+**Data flow**: It receives one v2 action value. It matches that value to the same meaning in the core protocol type. The output is the core action that internal Codex code understands.
 
-**Call relations**: This conversion is used when a client’s elicitation response must be forwarded into core approval handling.
+**Call relations**: This is used when a response comes from the app-server protocol side and must be handed back to core logic. It is a small translator between the public API language and the internal Codex language.
 
 
 ##### `ElicitationAction::from`  (lines 265–271)
@@ -2968,11 +3044,11 @@ fn to_core(self) -> codex_protocol::approvals::ElicitationAction
 fn from(value: McpServerElicitationAction) -> Self
 ```
 
-**Purpose**: Converts the v2 elicitation action into the RMCP model action enum. It is the bridge from app-server’s wire type to the RMCP library type.
+**Purpose**: Converts the v2 elicitation action into the action type used by the RMCP library. RMCP is the Rust MCP implementation this code interoperates with.
 
-**Data flow**: Consumes `McpServerElicitationAction`, matches each variant, and returns the corresponding `rmcp::model::ElicitationAction`.
+**Data flow**: It takes a v2 action: accept, decline, or cancel. It maps it to the matching RMCP action. The output is a value that RMCP can send or store as part of an MCP elicitation result.
 
-**Call relations**: This conversion is used by `CreateElicitationResult::from` when building an RMCP result from a v2 elicitation response.
+**Call relations**: This function is used when protocol-level user input needs to be handed to RMCP. It keeps the app-server type separate from the library type while making the handoff painless.
 
 
 ##### `McpServerElicitationAction::from`  (lines 275–281)
@@ -2981,11 +3057,11 @@ fn from(value: McpServerElicitationAction) -> Self
 fn from(value: rmcp::model::ElicitationAction) -> Self
 ```
 
-**Purpose**: Converts an RMCP elicitation action back into the v2 action enum. It preserves the same three-way decision space.
+**Purpose**: Converts an RMCP elicitation action back into the v2 protocol action. This lets data coming from the MCP library be represented in the app-server protocol.
 
-**Data flow**: Consumes `rmcp::model::ElicitationAction`, matches `Accept`, `Decline`, or `Cancel`, and returns the corresponding `McpServerElicitationAction`.
+**Data flow**: It receives an RMCP action value. It matches accept, decline, or cancel to the corresponding v2 action. The output is the app-server protocol version of that same choice.
 
-**Call relations**: This adapter is used when RMCP results are translated back into app-server’s v2 response type.
+**Call relations**: This is the reverse of the RMCP-facing conversion. It is used when RMCP produces or carries an elicitation result and the app-server needs to expose it through the v2 API.
 
 
 ##### `McpServerElicitationRequest::try_from`  (lines 650–673)
@@ -2994,11 +3070,11 @@ fn from(value: rmcp::model::ElicitationAction) -> Self
 fn try_from(value: CoreElicitationRequest) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Attempts to convert a core elicitation request into the typed v2 elicitation request enum, validating form schemas by deserializing them from raw JSON. Invalid form schemas cause conversion failure instead of producing a malformed wire payload.
+**Purpose**: Turns a core elicitation request into the v2 request type, while checking that form schemas really match the strict form shape this API promises. It can fail if a core form request contains invalid schema JSON.
 
-**Data flow**: Consumes `CoreElicitationRequest`. For `Form`, it moves `meta` and `message`, deserializes `requested_schema` with `serde_json::from_value`, and returns `Ok(McpServerElicitationRequest::Form { ... })` or a `serde_json::Error`. For `Url`, it moves fields directly into `McpServerElicitationRequest::Url` and returns `Ok(...)`.
+**Data flow**: It receives a core elicitation request. If the request is a form, it keeps the metadata and message, then parses the raw JSON schema into the typed v2 schema; invalid or null schema data becomes an error. If the request is URL-based, it copies the metadata, message, URL, and elicitation id directly. The output is either a valid v2 elicitation request or a JSON parsing error.
 
-**Call relations**: This conversion is exercised by tests covering valid form/url requests and invalid/null form schemas. It is the key validation boundary between loosely typed core JSON schema payloads and the strongly typed v2 elicitation schema model.
+**Call relations**: Tests call this for form requests, URL requests, and invalid form schemas. In the real flow, it is the safety gate between loosely shaped core request data and the stricter client-facing v2 shape, using JSON parsing to reject forms the client contract cannot describe.
 
 *Call graph*: called by 4 (mcp_server_elicitation_request_from_core_form_request, mcp_server_elicitation_request_from_core_url_request, mcp_server_elicitation_request_rejects_invalid_core_form_schema, mcp_server_elicitation_request_rejects_null_core_form_schema); 1 external calls (from_value).
 
@@ -3009,11 +3085,11 @@ fn try_from(value: CoreElicitationRequest) -> Result<Self, Self::Error>
 fn from(value: McpServerElicitationRequestResponse) -> Self
 ```
 
-**Purpose**: Converts a v2 elicitation response into the RMCP `CreateElicitationResult` used by the MCP library. It forwards the action and content but intentionally drops client metadata.
+**Purpose**: Turns a v2 elicitation response into the RMCP result type expected by the MCP library. This is used after a client answers an MCP server’s prompt.
 
-**Data flow**: Consumes `McpServerElicitationRequestResponse`, converts `action` with `.into()`, moves `content`, sets `meta: None`, and returns `rmcp::model::CreateElicitationResult`.
+**Data flow**: It takes the client-facing response, including the action and optional content. It converts the action into RMCP’s action type and copies the content. It deliberately sets RMCP metadata to none, so the returned RMCP result contains only the action and content.
 
-**Call relations**: This is the outbound bridge from app-server’s v2 response payload to RMCP. It relies on the `From<McpServerElicitationAction> for rmcp::model::ElicitationAction` conversion.
+**Call relations**: This function is part of the path from app-server client response back to the MCP server. Once the user accepts, declines, or cancels, this conversion prepares the answer for RMCP.
 
 
 ##### `McpServerElicitationRequestResponse::from`  (lines 702–708)
@@ -3022,20 +3098,26 @@ fn from(value: McpServerElicitationRequestResponse) -> Self
 fn from(value: rmcp::model::CreateElicitationResult) -> Self
 ```
 
-**Purpose**: Converts an RMCP elicitation result back into the v2 response struct. It preserves the action and structured content while normalizing metadata to `None`.
+**Purpose**: Turns an RMCP elicitation result into the v2 response type. This is useful when data from RMCP needs to be checked, echoed, or exposed through the app-server protocol.
 
-**Data flow**: Consumes `rmcp::model::CreateElicitationResult`, converts `action` with `.into()`, moves `content`, sets `meta: None`, and returns `McpServerElicitationRequestResponse`.
+**Data flow**: It receives an RMCP result with an action, optional content, and possible metadata. It converts the action into the v2 action and copies the content. It sets the v2 metadata field to none. The output is the protocol response shape.
 
-**Call relations**: This conversion is used in round-trip scenarios and tests that verify app-server’s v2 elicitation response shape can be reconstructed from RMCP results.
+**Call relations**: A round-trip test calls this to confirm RMCP results can move into the v2 type cleanly. It is the reverse bridge of the conversion that sends v2 responses into RMCP.
 
 *Call graph*: called by 1 (mcp_server_elicitation_response_round_trips_rmcp_result).
 
 
 ### `app-server-protocol/src/protocol/v2/windows_sandbox.rs`
 
-`data_model` · `request handling`
+`data_model` · `request handling and setup status reporting`
 
-This module contains the Windows-specific protocol schema for sandbox configuration and diagnostics. `WindowsWorldWritableWarningNotification` reports potentially unsafe filesystem findings using a bounded list of `sample_paths`, an `extra_count` for omitted additional matches, and a `failed_scan` flag to indicate incomplete inspection. Two enums capture setup and status state: `WindowsSandboxSetupMode` distinguishes elevated from unelevated setup flows, and `WindowsSandboxReadiness` reports whether the sandbox is ready, not configured, or requires an update. `WindowsSandboxSetupStartParams` starts a setup attempt with a chosen mode and an optional absolute working directory, represented by `AbsolutePathBuf`. The corresponding `WindowsSandboxSetupStartResponse` only indicates whether setup was actually started, which implies the operation may be rejected or skipped without immediate completion. `WindowsSandboxReadinessResponse` wraps the readiness enum for query-style responses. Finally, `WindowsSandboxSetupCompletedNotification` is the asynchronous completion event, echoing the mode used, a success boolean, and an optional error string when setup fails. As with the other protocol files, all types derive serde, schema, and TypeScript traits, making this file the authoritative wire contract for Windows sandbox lifecycle messaging.
+This file is like a set of blank forms for one narrow topic: preparing and checking the Windows sandbox. A sandbox is a safety boundary that lets the app run work with tighter limits, so mistakes or risky commands are less likely to affect the wider computer. Without these shared message definitions, the server and client could disagree about field names, possible states, or what a setup result means.
+
+The file does not perform the setup itself. Instead, it defines data structures that can be serialized, meaning turned into a format that can travel across an app protocol, usually as JSON. It also derives JSON schema and TypeScript output, so other parts of the system, including frontend or client code, can use matching types automatically.
+
+The messages cover a few moments in the Windows sandbox flow. One notification warns when world-writable paths are found, meaning locations that many users or processes can write to and may be unsafe. Another set of types describes whether setup should run in elevated mode, with higher Windows permissions, or unelevated mode, with normal permissions. Other messages ask to start setup, report whether setup started, check whether the sandbox is ready, and notify when setup finishes with either success or an error message.
+
+All fields are named in camelCase when sent over the wire, which keeps the protocol friendly to JavaScript and TypeScript clients.
 
 
 ### Schema export and experimental filtering
@@ -3045,13 +3127,13 @@ These files describe how the protocol surface is analyzed for experimental field
 
 `domain_logic` · `cross-cutting`
 
-This module establishes the contract for experimental API gating. The `ExperimentalApi` trait exposes a single method, `experimental_reason`, which returns an optional stable reason string identifying the experimental method or field in use. That reason is later turned into user-facing capability errors and used by export code to strip unstable surface area from generated artifacts.
+Some parts of the app-server protocol are stable, while others are experimental and should only be used by clients that explicitly opt in. This file is the common checkpoint for that rule. It defines the ExperimentalApi trait, which is a small promise that a type can answer the question: “does this value contain anything experimental, and if so, why?” The answer is either a short reason string or nothing.
 
-For field-level metadata, the file defines `ExperimentalField { type_name, field_name, reason }` and registers instances through `inventory::collect!`. `experimental_fields()` materializes the inventory into a `Vec<&'static ExperimentalField>`, giving the export pipeline a runtime list of all experimental fields declared across protocol types. `experimental_required_message()` standardizes the capability error text as `"<reason> requires experimentalApi capability"`.
+The file also defines ExperimentalField, a small record describing an experimental field by type name, field name, and reason. These records are collected through the inventory system, which is like a shared noticeboard that different protocol types can pin entries to at compile time. Schema-generating code can later read that noticeboard and hide or mark experimental fields.
 
-A key design choice is the set of blanket `ExperimentalApi` impls for `Option<T>`, `Vec<T>`, `HashMap<K, V, S>`, and `BTreeMap<K, V>`. These implementations recursively inspect contained values and return the first nested experimental reason they find, allowing derive-generated implementations on structs and enums to mark fields as `#[experimental(nested)]` without hand-writing traversal logic.
+A useful detail is that experimental use can be nested. If an optional value, list, hash map, or ordered map contains something experimental, the container reports the first experimental reason it finds. This means callers do not need custom searching code for every shape of data. They can ask the outer value and get a clear yes-or-no answer.
 
-The tests validate the derive macro integration across enum variant shapes, nested optional fields, nested collections, nested maps, and optional experimental fields that only count as experimental when present.
+The tests prove that the derive macro works for enum variants, nested fields, collections, maps, and optional experimental fields.
 
 #### Function details
 
@@ -3061,11 +3143,11 @@ The tests validate the derive macro integration across enum variant shapes, nest
 fn experimental_fields() -> Vec<&'static ExperimentalField>
 ```
 
-**Purpose**: Returns the runtime registry of all experimental fields declared across protocol types. Export code uses this list to remove unstable properties from generated TypeScript and JSON Schema output.
+**Purpose**: Returns the full set of experimental protocol fields that have been registered elsewhere in the program. This is used when other code needs a complete catalog of experimental fields, such as when producing filtered schemas or TypeScript definitions.
 
-**Data flow**: Reads the global `inventory` of `ExperimentalField` registrations, iterates over it, and collects the entries into a `Vec<&'static ExperimentalField>`. It returns that vector without mutating state.
+**Data flow**: It takes no input. It reads the global inventory of ExperimentalField records, turns that inventory into an iterator, collects references to all registered entries into a list, and returns that list without changing the records.
 
-**Call relations**: This function is called by `filter_experimental_schema`, `filter_experimental_ts`, and `filter_experimental_ts_tree` to drive field-level filtering. It is the bridge between compile-time field registration and runtime export pruning.
+**Call relations**: Schema and TypeScript filtering code calls this when it needs to know which fields are experimental. This function acts like the doorway into the shared registry, so those callers do not need to know how the registry is stored.
 
 *Call graph*: called by 3 (filter_experimental_schema, filter_experimental_ts, filter_experimental_ts_tree).
 
@@ -3076,11 +3158,11 @@ fn experimental_fields() -> Vec<&'static ExperimentalField>
 fn experimental_required_message(reason: &str) -> String
 ```
 
-**Purpose**: Builds the canonical capability error message for an experimental reason identifier. It keeps user-visible gating text consistent across the protocol.
+**Purpose**: Builds the standard message used when a caller tries to use an experimental method or field without enabling the experimentalApi capability. Keeping this wording in one place makes errors consistent.
 
-**Data flow**: Takes `reason: &str` and formats it into a new `String` of the form `"{reason} requires experimentalApi capability"`. It has no side effects.
+**Data flow**: It receives a reason string, inserts that reason into a fixed sentence, and returns the finished message as a new string. It does not read or change any shared state.
 
-**Call relations**: This helper is used wherever the protocol needs to report that a request or field requires the experimental API capability. It does not participate in traversal or filtering itself.
+**Call relations**: Other validation or request-checking code can call this after it has discovered an experimental reason. This function then turns the internal reason identifier into the human-facing explanation.
 
 *Call graph*: 1 external calls (format!).
 
@@ -3091,11 +3173,11 @@ fn experimental_required_message(reason: &str) -> String
 fn experimental_reason(&self) -> Option<&'static str>
 ```
 
-**Purpose**: Propagates experimental detection through optional values by inspecting the contained value only when present. `None` is always treated as stable.
+**Purpose**: Lets an optional value report experimental use only when it actually contains a value. If the option is empty, it is treated as stable.
 
-**Data flow**: Reads `self: &Option<T>` where `T: ExperimentalApi` → if `Some`, calls the inner value’s `experimental_reason`; if `None`, returns `None`. It is pure and allocates nothing.
+**Data flow**: It receives an Option containing a type that also knows how to report experimental use. If there is a contained value, it asks that value for its reason. If there is no value, it returns nothing.
 
-**Call relations**: This blanket impl is used implicitly by derive-generated `ExperimentalApi` implementations for optional fields and nested optional structures. It enables `#[experimental(nested)]` fields to work without custom code.
+**Call relations**: This is used automatically anywhere an optional protocol field is checked through the ExperimentalApi trait. It passes the question inward to the contained value instead of forcing every caller to unwrap optional fields by hand.
 
 
 ##### `Vec::experimental_reason`  (lines 41–43)
@@ -3104,11 +3186,11 @@ fn experimental_reason(&self) -> Option<&'static str>
 fn experimental_reason(&self) -> Option<&'static str>
 ```
 
-**Purpose**: Propagates experimental detection through vectors by returning the first nested experimental reason found among elements. Empty vectors are stable.
+**Purpose**: Lets a list report whether any item inside it uses an experimental API feature. It returns the first experimental reason it finds.
 
-**Data flow**: Reads `self: &Vec<T>` where `T: ExperimentalApi` → iterates elements and applies `ExperimentalApi::experimental_reason` until one returns `Some`, otherwise returns `None`. It does not mutate the collection.
+**Data flow**: It receives a list of values that can each report experimental use. It walks through the items in order, asks each one for a reason, stops at the first reason it finds, and returns that reason. If no item is experimental, it returns nothing.
 
-**Call relations**: This impl is used transitively by nested collection fields in protocol types and is validated by the nested-collections test. It supports export/runtime gating for list-valued experimental content.
+**Call relations**: This supports nested protocol data, where a field may be a collection of more detailed objects. Higher-level checks can ask the list directly instead of writing their own loop.
 
 
 ##### `HashMap::experimental_reason`  (lines 47–49)
@@ -3117,11 +3199,11 @@ fn experimental_reason(&self) -> Option<&'static str>
 fn experimental_reason(&self) -> Option<&'static str>
 ```
 
-**Purpose**: Propagates experimental detection through hash maps by scanning values for the first experimental entry. Keys are ignored because only values implement the trait.
+**Purpose**: Lets a hash map, which is a key-value lookup table, report whether any stored value uses an experimental API feature. The keys are only labels; the values are what matter for this check.
 
-**Data flow**: Reads `self: &HashMap<K, V, S>` where `V: ExperimentalApi` → iterates `self.values()` and returns the first nested `Some(reason)`, else `None`. It is pure.
+**Data flow**: It receives a map whose values can report experimental use. It looks through the map values, asks each one for an experimental reason, and returns the first reason found. If none of the values are experimental, it returns nothing.
 
-**Call relations**: This blanket impl supports nested map fields in protocol types and is exercised by the nested-maps test. It lets derive-generated code treat map-valued fields the same way as other nested containers.
+**Call relations**: This is used when protocol data stores nested objects in a map. It allows the outer map to take part in the same ExperimentalApi checking flow as ordinary structs and lists.
 
 
 ##### `BTreeMap::experimental_reason`  (lines 53–55)
@@ -3130,11 +3212,11 @@ fn experimental_reason(&self) -> Option<&'static str>
 fn experimental_reason(&self) -> Option<&'static str>
 ```
 
-**Purpose**: Propagates experimental detection through ordered maps by scanning values for nested experimental usage. Like the hash-map impl, only values matter.
+**Purpose**: Lets an ordered map report whether any of its values use an experimental API feature. Like the hash map version, it checks values rather than keys.
 
-**Data flow**: Reads `self: &BTreeMap<K, V>` where `V: ExperimentalApi` → iterates ordered values and returns the first nested experimental reason found, or `None` if all values are stable. No state is changed.
+**Data flow**: It receives an ordered key-value map whose values can report experimental use. It scans the values, asks each one for a reason, returns the first reason found, or returns nothing if all values are stable.
 
-**Call relations**: This impl is available for protocol types that use ordered maps and participates implicitly in derive-generated traversal. It mirrors the `HashMap` behavior for deterministic map types.
+**Call relations**: This fits ordered maps into the same experimental-checking system. Code that asks a protocol value for its experimental reason can work the same way whether nested data is stored in a struct, list, hash map, or ordered map.
 
 
 ##### `tests::derive_supports_all_enum_variant_shapes`  (lines 109–126)
@@ -3143,11 +3225,11 @@ fn experimental_reason(&self) -> Option<&'static str>
 fn derive_supports_all_enum_variant_shapes()
 ```
 
-**Purpose**: Verifies that the `ExperimentalApi` derive macro correctly marks unit, tuple, and named enum variants while leaving stable variants unmarked. It protects the enum-side code generation contract.
+**Purpose**: Checks that the derive macro can mark different kinds of enum variants as experimental. Enum variants can be simple names, tuple-like values, or named-field records, and all should work correctly.
 
-**Data flow**: Constructs several `EnumVariantShapes` values, calls `ExperimentalApiTrait::experimental_reason` on each, and asserts the returned `Option<&'static str>` matches the expected reason or `None`. It has no side effects.
+**Data flow**: It creates or references several enum variant values, asks each one for its experimental reason, and compares the answer to the expected result. Experimental variants should return their configured reason, while the stable variant should return nothing.
 
-**Call relations**: This test validates the derive macro behavior that production protocol enums rely on. It specifically covers variant-shape handling rather than container traversal.
+**Call relations**: This test exercises code produced by the ExperimentalApi derive macro. It uses assertions to confirm that enum-level experimental markers feed correctly into the shared ExperimentalApi trait.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3158,11 +3240,11 @@ fn derive_supports_all_enum_variant_shapes()
 fn derive_supports_nested_experimental_fields()
 ```
 
-**Purpose**: Checks that a field marked `#[experimental(nested)]` forwards the inner experimental reason when populated and stays stable when absent. It confirms optional nested traversal works.
+**Purpose**: Checks that a struct field marked as nested can pass through an experimental reason from the value inside it. This matters because experimental features may be hidden inside optional sub-objects.
 
-**Data flow**: Builds `NestedFieldShape` values with `inner: Some(...)` and `inner: None`, evaluates `experimental_reason`, and compares the results to the expected nested reason or `None`. No external state is touched.
+**Data flow**: It builds one struct whose optional inner field contains an experimental enum value and another whose inner field is empty. It asks each struct for its reason and expects the first to report the inner enum reason and the second to report nothing.
 
-**Call relations**: This test exercises the interaction between derive-generated field logic and the blanket `Option<T>` implementation. It covers the nested optional-field path used by real protocol structs.
+**Call relations**: This test confirms that derived ExperimentalApi implementations cooperate with the Option implementation in this file. The derived struct logic asks the optional field, and the optional field asks its contained value.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3173,11 +3255,11 @@ fn derive_supports_nested_experimental_fields()
 fn derive_supports_nested_collections()
 ```
 
-**Purpose**: Checks that nested vectors surface the first experimental element and that empty vectors remain stable. It validates collection traversal in derive-generated implementations.
+**Purpose**: Checks that a nested list can reveal an experimental item inside it. This prevents experimental use from being missed just because it is inside a collection.
 
-**Data flow**: Constructs `NestedCollectionShape` values containing either a mix of stable and experimental enum variants or an empty vector, then asserts the returned experimental reason matches expectations. It is side-effect free.
+**Data flow**: It builds a struct with a list containing one stable enum value and one experimental enum value, then checks that the struct reports the experimental reason. It also builds a struct with an empty list and checks that it reports nothing.
 
-**Call relations**: This test depends on the blanket `Vec<T>` implementation and confirms that derive-generated nested-field handling composes correctly with it.
+**Call relations**: This test ties together the derive macro and the Vec implementation of ExperimentalApi. The struct delegates to the list, and the list searches its items for the first experimental reason.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3188,11 +3270,11 @@ fn derive_supports_nested_collections()
 fn derive_supports_nested_maps()
 ```
 
-**Purpose**: Checks that nested maps surface experimental reasons from their values and that empty maps remain stable. It validates map traversal support in the derive system.
+**Purpose**: Checks that a nested map can reveal an experimental value stored under a key. This makes sure map-shaped protocol fields are not a blind spot for experimental gating.
 
-**Data flow**: Constructs `NestedMapShape` values with either a populated `HashMap<String, EnumVariantShapes>` or an empty map, calls `experimental_reason`, and asserts the expected result. It mutates no shared state.
+**Data flow**: It builds a struct whose map contains an experimental enum value and checks that the reason is found. It then builds a struct with an empty map and checks that no reason is reported.
 
-**Call relations**: This test covers the blanket `HashMap` implementation as used through a derive-generated nested field. It ensures map-valued protocol fields participate in experimental gating.
+**Call relations**: This test confirms that derived struct checking works with the HashMap implementation in this file. The struct asks the map, and the map searches its stored values.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3203,24 +3285,24 @@ fn derive_supports_nested_maps()
 fn derive_marks_optional_experimental_fields_when_some()
 ```
 
-**Purpose**: Verifies that an explicitly experimental optional field is considered experimental only when present, even if the contained collection is empty. This distinguishes field-level gating from nested-content gating.
+**Purpose**: Checks that an optional field directly marked as experimental counts as experimental when it is present. If the optional field is absent, it should not trigger the experimental gate.
 
-**Data flow**: Builds `ExperimentalFieldShape` with `optional_collection: Some(Vec::new())` and `None`, evaluates `experimental_reason`, and asserts `Some("field/optionalCollection")` versus `None`. It has no side effects.
+**Data flow**: It builds one struct where the optional experimental field is present, even though the contained list is empty, and expects the field's own reason. It builds another where the field is absent and expects no reason.
 
-**Call relations**: This test documents the semantics of field-level `#[experimental("...")]` on optional fields, complementing the nested traversal tests. It protects export/runtime gating behavior for optional experimental fields.
+**Call relations**: This test covers a different case from nested checking: the field itself is experimental, not necessarily the values inside it. It confirms that the derive macro reports the field-level reason when the optional field is used.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `app-server-protocol/src/export.rs`
 
-`orchestration` · `build/export tooling`
+`orchestration` · `build-time schema generation`
 
-This module is the protocol crate’s largest orchestration layer for schema export. It emits per-type TypeScript files and JSON Schemas, then post-processes them into stable consumable outputs. The top-level entrypoints are `generate_types`, `generate_ts[_with_options]`, `generate_json[_with_experimental]`, and `generate_internal_json_schema`. TypeScript generation writes root and `v2/` files via `ts-rs` exporters on request/notification/response types, optionally strips experimental methods and fields, generates `index.ts` files, prepends a generated-code header in parallel, optionally runs Prettier, and finally trims trailing whitespace.
+This file is the protocol exporter. Its job is to take the app-server protocol as written in Rust and produce clear contract files for outside consumers: `.ts` files for TypeScript users and `.json` schema files for validators and code generators. Without it, other clients would have to guess the shape of requests, responses, and notifications, and experimental features could accidentally appear in the stable public API.
 
-JSON generation emits individual schemas for JSON-RPC envelopes and protocol payload types, then builds a bundled schema document with `build_schema_bundle`. That bundler rewrites `$ref` targets into namespaces, preserves selected shared root definitions, annotates schemas and variants with stable titles, detects naming collisions, and writes both a mixed bundle and a flattened v2-only bundle for downstream code generators. The flattening path preserves shared root unions like `ClientRequest` and `ServerNotification` while recursively pulling in non-v2 dependencies and validating that no `#/definitions/v2/` refs remain dangling.
+The file works like a careful publishing pipeline. First it asks the protocol types to export themselves. Then it writes index files so consumers can import everything from one place. It adds a “generated code” warning header, optionally runs Prettier to format TypeScript, and trims stray whitespace. For JSON Schema, it writes individual schemas, combines them into one large bundle, and creates a flatter v2-only bundle for tools that cannot understand nested schema namespaces.
 
-A substantial portion of the file is dedicated to stable-vs-experimental filtering. It uses `experimental_fields()` plus hard-coded experimental method/type lists to remove unstable union arms, object properties, generated files, and schema definitions from both TS and JSON outputs. Because generated TS is manipulated as source text, the module includes a small parser-like toolkit (`ScanState`, `Depth`, top-level splitting, property parsing, string literal parsing) that understands braces, comments, strings, and generic angle brackets well enough to safely edit unions and object/interface bodies without a full TypeScript parser. The extensive tests lock down edge cases such as import pruning, namespaced ref rewriting, flat-v2 dependency retention, and the absence of `?: T | null` outside approved parameter types.
+A large part of the file is cleanup and safety work. It strips experimental methods, fields, and generated type files from stable exports. It rewrites JSON Schema references so that shared and namespaced types point to the right place. It also gives anonymous schema variants useful names, because downstream code generators need stable model names. The tests at the bottom protect these guarantees with realistic examples.
 
 #### Function details
 
@@ -3230,11 +3312,11 @@ A substantial portion of the file is dedicated to stable-vs-experimental filteri
 fn namespace(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the optional namespace assigned to a generated schema, such as `v2`. It exposes the internal `Option<String>` as `Option<&str>` for read-only consumers.
+**Purpose**: Returns the optional namespace for a generated schema, such as `v2`. A namespace is like a folder name used to separate newer protocol types from older shared ones.
 
-**Data flow**: Reads `self.namespace` and converts it with `as_deref()` into `Option<&str>`. It returns borrowed data and does not mutate state.
+**Data flow**: It reads the schema object's stored namespace → converts it from owned text to a borrowed text view → returns either that text or nothing.
 
-**Call relations**: Used by bundling helpers like `collect_namespaced_types` and `build_schema_bundle` when deciding where definitions belong and how `$ref` values should be rewritten.
+**Call relations**: Schema-bundling code asks this when deciding whether a schema belongs at the root of the bundle or inside a named section.
 
 
 ##### `GeneratedSchema::logical_name`  (lines 71–73)
@@ -3243,11 +3325,11 @@ fn namespace(&self) -> Option<&str>
 fn logical_name(&self) -> &str
 ```
 
-**Purpose**: Returns the schema’s logical type name without namespace decoration. This is the key used for output filenames and bundle definition names.
+**Purpose**: Returns the plain type name for a generated schema, without any namespace prefix. This is the name used as the schema definition key.
 
-**Data flow**: Borrows and returns `&self.logical_name`. No transformation beyond borrowing occurs.
+**Data flow**: It reads the stored logical name → returns it as borrowed text → does not change the schema.
 
-**Call relations**: Consumed by bundling and filtering code to compare against allowlists, ignored definitions, and namespace ownership maps.
+**Call relations**: Bundling and filtering code uses this name to compare schemas against allowlists and to place definitions under the right key.
 
 
 ##### `GeneratedSchema::value`  (lines 75–77)
@@ -3256,11 +3338,11 @@ fn logical_name(&self) -> &str
 fn value(&self) -> &Value
 ```
 
-**Purpose**: Returns the underlying JSON schema value for a generated schema record. It provides read-only access to the schema payload collected during export.
+**Purpose**: Returns the actual JSON Schema value stored inside a `GeneratedSchema`. This lets later steps inspect definitions and references.
 
-**Data flow**: Borrows and returns `&self.value` as a `&serde_json::Value`. It does not clone or mutate.
+**Data flow**: It reads the stored JSON value → returns a borrowed view of it → leaves the original untouched.
 
-**Call relations**: Used by namespace collection and bundle assembly code that needs to inspect nested `definitions` or `$defs` inside each generated schema.
+**Call relations**: The namespace collection step uses this to discover nested definitions that also need namespace-aware references.
 
 
 ##### `generate_types`  (lines 81–85)
@@ -3269,11 +3351,11 @@ fn value(&self) -> &Value
 fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()>
 ```
 
-**Purpose**: Runs both TypeScript and JSON schema generation into a single output directory. It is the convenience entrypoint for callers that want the full export set.
+**Purpose**: Runs the full export: TypeScript first, then JSON Schema. It is the simple one-call entry for producing all protocol artifacts.
 
-**Data flow**: Takes `out_dir` and optional `prettier` path → calls `generate_ts(out_dir, prettier)` and then `generate_json(out_dir)` → returns `Ok(())` only if both succeed. It writes generated files under `out_dir`.
+**Data flow**: It receives an output directory and optional Prettier path → writes TypeScript files, then JSON files → returns success or the first error it hits.
 
-**Call relations**: This function is a thin orchestrator above the two specialized generation paths. It delegates all substantive work to `generate_ts` and `generate_json`.
+**Call relations**: This is the top-level helper that hands work to `generate_ts` and `generate_json` in sequence.
 
 *Call graph*: calls 2 internal fn (generate_json, generate_ts).
 
@@ -3284,11 +3366,11 @@ fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()>
 fn default() -> Self
 ```
 
-**Purpose**: Defines the standard TypeScript export behavior: generate indices, ensure generated headers, run Prettier, and exclude experimental API by default. It centralizes the baseline policy used by binaries and fixture generation.
+**Purpose**: Provides the normal TypeScript generation settings. By default it creates index files, adds generated-code headers, runs Prettier, and excludes experimental APIs.
 
-**Data flow**: Constructs and returns a `GenerateTsOptions` value with `generate_indices: true`, `ensure_headers: true`, `run_prettier: true`, and `experimental_api: false`. It has no side effects.
+**Data flow**: It takes no input → creates a settings object with the standard flags → returns that object.
 
-**Call relations**: Called by the export CLI `main`, by `generate_ts`, and by fixture-writing code to seed option structs before selective overrides.
+**Call relations**: The normal TypeScript generator and callers such as schema fixture generation start from these defaults unless they need special behavior.
 
 *Call graph*: called by 3 (main, generate_ts, write_schema_fixtures_with_options).
 
@@ -3299,11 +3381,11 @@ fn default() -> Self
 fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()>
 ```
 
-**Purpose**: Generates TypeScript output using the default option set. It is the simple wrapper for callers that do not need fine-grained control.
+**Purpose**: Generates TypeScript protocol files using the standard options. It is the convenient public wrapper for normal use.
 
-**Data flow**: Takes `out_dir` and optional `prettier` path, creates a default `GenerateTsOptions`, and forwards all arguments to `generate_ts_with_options`. Returns that function’s `Result<()>`.
+**Data flow**: It receives an output directory and optional Prettier path → builds default options → passes everything to the configurable generator.
 
-**Call relations**: Called by `generate_types`; internally it exists only to pair `GenerateTsOptions::default` with `generate_ts_with_options`.
+**Call relations**: The full export path calls this before generating JSON schemas.
 
 *Call graph*: calls 2 internal fn (default, generate_ts_with_options); called by 1 (generate_types).
 
@@ -3318,11 +3400,11 @@ fn generate_ts_with_options(
 ) -> Result<()>
 ```
 
-**Purpose**: Executes the full TypeScript export pipeline: emit files, optionally strip experimental API, generate indexes, ensure headers, optionally format with Prettier, and normalize trailing whitespace. It is the main TS generation driver.
+**Purpose**: Performs the full TypeScript export with caller-controlled options. It creates folders, exports all protocol request/response/notification types, filters unstable pieces when needed, writes index files, adds headers, formats, and cleans whitespace.
 
-**Data flow**: Takes `out_dir`, optional `prettier`, and `GenerateTsOptions` → ensures `out_dir` and `out_dir/v2` exist, invokes `export_all_to`/response exporters for client and server request/notification families, optionally filters experimental TS, optionally writes root and `v2/index.ts`, recursively collects `.ts` files, optionally prepends `GENERATED_TS_HEADER` in parallel worker threads, optionally runs Prettier over all TS files, then trims trailing spaces/tabs line-by-line. It returns `Result<()>` and writes/rewrites many files under the output tree.
+**Data flow**: It receives a destination, optional Prettier executable, and generation options → writes many `.ts` files and possibly removes or edits some → returns success or a detailed failure.
 
-**Call relations**: This is called by `generate_ts` and indirectly by the export CLI. It delegates emission to protocol type exporters, filtering to `filter_experimental_ts`, index creation to `generate_index_ts`, file discovery to `ts_files_in_recursive`, header insertion to `prepend_header_if_missing`, and final cleanup to `trim_trailing_whitespace_in_ts_files`.
+**Call relations**: This is the main TypeScript pipeline behind `generate_ts`; it calls the lower-level file, filtering, indexing, and formatting helpers.
 
 *Call graph*: calls 5 internal fn (ensure_dir, filter_experimental_ts, generate_index_ts, trim_trailing_whitespace_in_ts_files, ts_files_in_recursive); called by 1 (generate_ts); 11 external calls (export_all_to, export_all_to, join, export_all_to, export_all_to, anyhow!, new, export_client_responses, export_server_responses, available_parallelism (+1 more)).
 
@@ -3333,11 +3415,11 @@ fn generate_ts_with_options(
 fn generate_json(out_dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Generates stable JSON schema output with experimental API excluded. It is the default JSON export wrapper.
+**Purpose**: Generates the stable JSON Schema export. Stable means experimental protocol pieces are left out.
 
-**Data flow**: Takes `out_dir` and forwards to `generate_json_with_experimental(out_dir, false)`. Returns the delegated `Result<()>` and writes JSON files under `out_dir`.
+**Data flow**: It receives an output directory → calls the JSON generator with experimental API disabled → returns the result.
 
-**Call relations**: Called by `generate_types`; it exists to expose the common stable-export case without requiring callers to pass the experimental flag explicitly.
+**Call relations**: The full export path calls this after TypeScript generation.
 
 *Call graph*: calls 1 internal fn (generate_json_with_experimental); called by 1 (generate_types).
 
@@ -3348,11 +3430,11 @@ fn generate_json(out_dir: &Path) -> Result<()>
 fn generate_internal_json_schema(out_dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Writes internal-only JSON schema artifacts that are not part of the public app-server protocol bundle. Currently it emits the schema for `RolloutLine`.
+**Purpose**: Writes an internal JSON Schema for `RolloutLine`, a protocol-related internal data shape. This is separate from the public app-server protocol bundle.
 
-**Data flow**: Ensures `out_dir` exists, then writes the schema for `RolloutLine` via `write_json_schema::<RolloutLine>(out_dir, "RolloutLine")`. Returns `Result<()>` and writes one schema file.
+**Data flow**: It receives an output directory → makes sure the directory exists → writes one schema file → returns success or an error.
 
-**Call relations**: This helper is separate from the public protocol export path and delegates directory creation to `ensure_dir` plus schema emission to `write_json_schema`.
+**Call relations**: It uses the same schema-writing machinery as the public exporter, but only for this internal type.
 
 *Call graph*: calls 1 internal fn (ensure_dir).
 
@@ -3363,11 +3445,11 @@ fn generate_internal_json_schema(out_dir: &Path) -> Result<()>
 fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -> Result<()>
 ```
 
-**Purpose**: Generates individual JSON schema files plus bundled schema documents, optionally retaining experimental API surface. It is the main JSON export driver.
+**Purpose**: Builds the JSON Schema export, optionally including experimental API parts. It writes individual schema files, a full combined bundle, and a flat v2 bundle for simpler code generators.
 
-**Data flow**: Ensures `out_dir` exists, builds a list of envelope schema emitters, executes them into a `Vec<GeneratedSchema>`, extends that vector with exported client/server param/response/notification schemas, drops most `v1` entries except an allowlist, builds a mixed bundle with `build_schema_bundle`, optionally filters experimental fields/methods from the bundle, writes the mixed bundle and a flattened v2 bundle, and if stable mode is requested also post-processes individual JSON files and removes experimental type files. Returns `Result<()>` and writes multiple `.json` outputs.
+**Data flow**: It receives an output directory and a flag for experimental API inclusion → emits schema files for protocol envelopes and method payloads → bundles and filters them → writes final JSON outputs.
 
-**Call relations**: Called by `generate_json` and by tests covering stable and experimental export behavior. It delegates bundling to `build_schema_bundle`, flattening to `build_flat_v2_schema`, stable filtering to `filter_experimental_schema` and `filter_experimental_json_files`, and file writes to `write_pretty_json`.
+**Call relations**: This is the main JSON pipeline behind `generate_json` and the JSON-related tests.
 
 *Call graph*: calls 6 internal fn (build_flat_v2_schema, build_schema_bundle, ensure_dir, filter_experimental_json_files, filter_experimental_schema, write_pretty_json); called by 3 (generate_json, generate_json_filters_experimental_fields_and_methods, generate_json_includes_remote_control_methods_with_experimental_api); 9 external calls (join, new, export_client_notification_schemas, export_client_param_schemas, export_client_response_schemas, export_server_notification_schemas, export_server_param_schemas, export_server_response_schemas, vec!).
 
@@ -3378,11 +3460,11 @@ fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -> Re
 fn filter_experimental_ts(out_dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Removes experimental methods, fields, and generated type files from an on-disk TypeScript export tree. It is the stable-output post-processing step for TS.
+**Purpose**: Removes experimental TypeScript API pieces from a generated output directory. This prevents unstable methods, fields, and type files from appearing in the stable package.
 
-**Data flow**: Reads registered experimental fields and the computed set of experimental method-related type names, rewrites `ClientRequest.ts` to drop experimental union arms, rewrites matching type files to remove experimental properties, then deletes generated `.ts` files for experimental-only types. Returns `Result<()>` after mutating files under `out_dir`.
+**Data flow**: It reads the registered experimental fields and method-related types → edits or deletes generated `.ts` files → returns success or an error.
 
-**Call relations**: Called by `generate_ts_with_options` when `experimental_api` is false. It delegates method filtering to `filter_client_request_ts`, field filtering to `filter_experimental_type_fields_ts`, and file deletion to `remove_generated_type_files`.
+**Call relations**: The TypeScript generator calls this when the caller did not request the experimental API.
 
 *Call graph*: calls 5 internal fn (experimental_fields, experimental_method_types, filter_client_request_ts, filter_experimental_type_fields_ts, remove_generated_type_files); called by 1 (generate_ts_with_options).
 
@@ -3393,11 +3475,11 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()>
 fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) -> Result<()>
 ```
 
-**Purpose**: Applies the same experimental-TypeScript filtering logic as `filter_experimental_ts`, but against an in-memory file tree instead of the filesystem. This supports fixture generation in tests.
+**Purpose**: Applies the same experimental TypeScript filtering to an in-memory tree of files instead of files on disk. This is useful for test fixture generation.
 
-**Data flow**: Takes `tree: &mut BTreeMap<PathBuf, String>` representing relative TS file contents, rewrites `ClientRequest.ts` if present, groups registered experimental fields by type name, rewrites matching file contents to remove those fields, and removes entries for experimental-only generated types. Returns `Result<()>` after mutating the map in place.
+**Data flow**: It receives a map from file paths to file text → rewrites affected entries and removes experimental type entries → leaves the map as the filtered version.
 
-**Call relations**: Called by `generate_typescript_schema_fixture_subtree_for_tests`. It mirrors the on-disk filtering path but delegates to the pure string transformers `filter_client_request_ts_contents` and `filter_experimental_type_fields_ts_contents`, then uses `remove_generated_type_entries` instead of deleting files.
+**Call relations**: Fixture-building code uses this mirror of the disk-based filter so tests can compare generated content without writing every step to disk.
 
 *Call graph*: calls 5 internal fn (experimental_fields, experimental_method_types, filter_client_request_ts_contents, filter_experimental_type_fields_ts_contents, remove_generated_type_entries); called by 1 (generate_typescript_schema_fixture_subtree_for_tests); 3 external calls (new, new, take).
 
@@ -3408,11 +3490,11 @@ fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) -> Result<(
 fn filter_client_request_ts(out_dir: &Path, experimental_methods: &[&str]) -> Result<()>
 ```
 
-**Purpose**: Rewrites the generated `ClientRequest.ts` file on disk to remove union arms for experimental client methods. It is a targeted post-processor for a file whose method union cannot be fully filtered by schema-level processing alone.
+**Purpose**: Edits `ClientRequest.ts` on disk to remove union entries for experimental client methods. A union is a TypeScript “one of these shapes” type.
 
-**Data flow**: Builds `out_dir/ClientRequest.ts`, returns early if it does not exist, otherwise reads the file to a string, transforms it with `filter_client_request_ts_contents`, and writes the filtered content back. Returns `Result<()>` and mutates that single file.
+**Data flow**: It finds `ClientRequest.ts` → reads its text if it exists → filters the text → writes it back.
 
-**Call relations**: Called by `filter_experimental_ts` as part of stable TS export cleanup. It delegates the actual source-text transformation to `filter_client_request_ts_contents`.
+**Call relations**: The broader experimental TypeScript filter calls this as a special case because client methods are stored in one combined TypeScript union.
 
 *Call graph*: calls 1 internal fn (filter_client_request_ts_contents); called by 1 (filter_experimental_ts); 3 external calls (join, read_to_string, write).
 
@@ -3423,11 +3505,11 @@ fn filter_client_request_ts(out_dir: &Path, experimental_methods: &[&str]) -> Re
 fn filter_client_request_ts_contents(mut content: String, experimental_methods: &[&str]) -> String
 ```
 
-**Purpose**: Removes experimental method variants from the body of a generated `ClientRequest` type alias and prunes now-unused type imports. It performs source-text surgery without a full TS parser.
+**Purpose**: Removes experimental method arms from the text of the generated `ClientRequest` TypeScript type. It also deletes now-unused type imports.
 
-**Data flow**: Takes the full file `content` string and a slice of experimental method names, splits the type alias into prefix/body/suffix, splits top-level union arms on `|`, extracts each arm’s `method` literal, drops arms whose method is in the experimental set, rejoins the union, reconstructs the file, then removes import lines whose imported type names are no longer referenced in the surviving alias body. Returns the rewritten `String`.
+**Data flow**: It receives TypeScript source text and method names to remove → splits the type union at top-level `|` separators → drops matching method variants → returns rewritten source text.
 
-**Call relations**: Used by both `filter_client_request_ts` and `filter_experimental_ts_tree`. It depends on `split_type_alias`, `split_top_level`, `extract_method_from_arm`, and `prune_unused_type_imports` to safely edit generated TS.
+**Call relations**: Both the disk-based and in-memory TypeScript filters use this for the `ClientRequest.ts` special case.
 
 *Call graph*: calls 3 internal fn (prune_unused_type_imports, split_top_level, split_type_alias); called by 2 (filter_client_request_ts, filter_experimental_ts_tree); 1 external calls (format!).
 
@@ -3441,11 +3523,11 @@ fn filter_experimental_type_fields_ts(
 ) -> Result<()>
 ```
 
-**Purpose**: Removes experimental properties from generated TypeScript type files based on registered field metadata. It scans the export tree and rewrites only files whose type names match experimental field registrations.
+**Purpose**: Removes experimental properties from generated TypeScript type files. It groups experimental fields by their containing type, then edits only matching files.
 
-**Data flow**: Builds a `HashMap<String, HashSet<String>>` from type name to experimental field names, returns early if empty, recursively enumerates `.ts` files under `out_dir`, derives each file’s type name from its stem, and for matching types rewrites the file via `filter_experimental_fields_in_ts_file`. Returns `Result<()>` after mutating selected files.
+**Data flow**: It receives an output directory and registered experimental fields → scans generated TypeScript files → rewrites files whose type name has experimental fields.
 
-**Call relations**: Called by `filter_experimental_ts` and several tests that validate edge-case TS filtering. It delegates file enumeration to `ts_files_in_recursive` and per-file rewriting to `filter_experimental_fields_in_ts_file`.
+**Call relations**: The stable TypeScript export calls this after the main generation step; several tests call it directly with small sample files.
 
 *Call graph*: calls 2 internal fn (filter_experimental_fields_in_ts_file, ts_files_in_recursive); called by 4 (filter_experimental_ts, experimental_type_fields_ts_filter_handles_generated_command_params_shape, experimental_type_fields_ts_filter_handles_interface_shape, experimental_type_fields_ts_filter_keeps_imports_used_in_intersection_suffix); 1 external calls (new).
 
@@ -3459,11 +3541,11 @@ fn filter_experimental_fields_in_ts_file(
 ) -> Result<()>
 ```
 
-**Purpose**: Applies experimental-field removal to one TypeScript file on disk. It is the file-level wrapper around the pure content transformer.
+**Purpose**: Reads one TypeScript file, removes selected experimental fields from it, and writes the result back.
 
-**Data flow**: Reads `path` into a string, transforms it with `filter_experimental_type_fields_ts_contents` using the provided set of field names, and writes the result back to the same path. Returns `Result<()>` and mutates that file.
+**Data flow**: It receives a file path and field names → reads the file text → filters the type body → writes the updated text.
 
-**Call relations**: Called by `filter_experimental_type_fields_ts` for each matching generated type file. It delegates the parsing/editing logic to `filter_experimental_type_fields_ts_contents`.
+**Call relations**: The directory-wide TypeScript field filter calls this for each file whose type name matches registered experimental fields.
 
 *Call graph*: calls 1 internal fn (filter_experimental_type_fields_ts_contents); called by 1 (filter_experimental_type_fields_ts); 2 external calls (read_to_string, write).
 
@@ -3477,11 +3559,11 @@ fn filter_experimental_type_fields_ts_contents(
 ) -> String
 ```
 
-**Purpose**: Removes named experimental properties from a generated TypeScript object/interface body and prunes imports that become unused afterward. It handles both type aliases and interface shapes.
+**Purpose**: Removes selected property declarations from TypeScript source text. It understands generated type aliases and interfaces well enough to avoid splitting inside nested objects or comments.
 
-**Data flow**: Takes file `content` and a set of experimental field names, locates the top-level object body with `type_body_brace_span`, splits fields at top-level commas/semicolons, strips leading block comments before property-name parsing, drops fields whose parsed property name is in the experimental set, reconstructs the body, then prunes unused single-type imports based on the remaining usage scope. Returns the rewritten `String`.
+**Data flow**: It receives source text and field names → finds the main type body → splits top-level fields → drops matching properties → removes unused imports → returns rewritten text.
 
-**Call relations**: Used by `filter_experimental_fields_in_ts_file` and `filter_experimental_ts_tree`. It relies on `type_body_brace_span`, `split_top_level_multi`, `strip_leading_block_comments`, `parse_property_name`, and `prune_unused_type_imports` to avoid corrupting nested TS syntax.
+**Call relations**: Used by both disk-based filtering and in-memory fixture filtering.
 
 *Call graph*: calls 4 internal fn (prune_unused_type_imports, split_top_level_multi, split_type_alias, type_body_brace_span); called by 2 (filter_experimental_fields_in_ts_file, filter_experimental_ts_tree); 1 external calls (format!).
 
@@ -3492,11 +3574,11 @@ fn filter_experimental_type_fields_ts_contents(
 fn filter_experimental_schema(bundle: &mut Value) -> Result<()>
 ```
 
-**Purpose**: Removes experimental fields, methods, and method-only type definitions from a bundled JSON schema value. It is the stable-output filter for schema bundles and individual schema files.
+**Purpose**: Removes experimental API pieces from a JSON Schema value. It covers fields, method variants, and leftover type definitions.
 
-**Data flow**: Reads registered experimental fields, removes matching properties from the root schema and nested definitions, prunes experimental method variants from arrays/objects recursively, and deletes definitions for experimental-only method parameter/response/dependency types. It mutates the provided `serde_json::Value` in place and returns `Result<()>`.
+**Data flow**: It receives a mutable JSON value → looks up registered experimental items → edits the schema in place → returns success.
 
-**Call relations**: Called by `generate_json_with_experimental`, `filter_experimental_json_files`, and tests that validate stable filtering. It delegates field removal to `filter_experimental_fields_in_root` and `filter_experimental_fields_in_definitions`, method pruning to `prune_experimental_methods`, and definition cleanup to `remove_experimental_method_type_definitions`.
+**Call relations**: The JSON export pipeline and tests call this to turn a complete schema into the stable public version.
 
 *Call graph*: calls 5 internal fn (experimental_fields, filter_experimental_fields_in_definitions, filter_experimental_fields_in_root, prune_experimental_methods, remove_experimental_method_type_definitions); called by 4 (filter_experimental_json_files, generate_json_with_experimental, stable_schema_filter_removes_mock_experimental_method, stable_schema_filter_removes_mock_thread_start_field).
 
@@ -3510,11 +3592,11 @@ fn filter_experimental_fields_in_root(
 )
 ```
 
-**Purpose**: Removes experimental properties from the root schema object when its `title` matches a registered experimental field’s owning type. It handles the top-level schema case outside nested definitions.
+**Purpose**: Removes experimental fields when the schema value itself is the schema for the affected type.
 
-**Data flow**: Reads the schema’s `title` string, compares it against each registered `ExperimentalField.type_name`, and for matches removes the named property from the schema via `remove_property_from_schema`. It mutates the provided schema value in place.
+**Data flow**: It reads the schema title → compares it to registered experimental field type names → removes matching properties and required markers.
 
-**Call relations**: Called by `filter_experimental_schema` before nested-definition filtering. It exists because the root schema may itself represent a concrete type with removable experimental fields.
+**Call relations**: The main schema filter calls this before checking nested definitions.
 
 *Call graph*: calls 1 internal fn (remove_property_from_schema); called by 1 (filter_experimental_schema); 1 external calls (get).
 
@@ -3528,11 +3610,11 @@ fn filter_experimental_fields_in_definitions(
 )
 ```
 
-**Purpose**: Removes experimental properties from the bundle’s `definitions` map. It is the entrypoint for recursive definition-map filtering.
+**Purpose**: Looks inside a schema bundle’s `definitions` map and removes experimental fields from definitions there.
 
-**Data flow**: Looks up `bundle["definitions"]` as a mutable object map and, if present, passes it plus the registered field list to `filter_experimental_fields_in_definitions_map`. It mutates the bundle in place and returns no value.
+**Data flow**: It receives a mutable schema bundle → finds its definitions object → passes that map to the recursive definition filter.
 
-**Call relations**: Called by `filter_experimental_schema`. It is a shallow wrapper that isolates the `definitions` lookup from the recursive map-walking logic.
+**Call relations**: The main schema filter uses this so experimental fields are removed not only from the root schema but from bundled child schemas too.
 
 *Call graph*: calls 1 internal fn (filter_experimental_fields_in_definitions_map); called by 1 (filter_experimental_schema); 1 external calls (get_mut).
 
@@ -3546,11 +3628,11 @@ fn filter_experimental_fields_in_definitions_map(
 )
 ```
 
-**Purpose**: Recursively traverses schema definition maps, including namespace submaps, and removes registered experimental properties from matching type definitions. It understands both flat and namespaced bundle layouts.
+**Purpose**: Recursively removes experimental fields from a definitions map, including maps nested under namespaces like `v2`.
 
-**Data flow**: Iterates mutable `(def_name, def_schema)` pairs in a `Map<String, Value>`. If an entry is a namespace map, it recurses into that object; otherwise it compares each registered field’s `type_name` against `def_name` using `definition_matches_type` and removes matching properties from `def_schema` via `remove_property_from_schema`. It mutates the map contents in place.
+**Data flow**: It receives a definitions object and experimental field list → walks each definition → removes matching properties from matching types.
 
-**Call relations**: Called by `filter_experimental_fields_in_definitions`. It depends on `is_namespace_map` to distinguish nested namespace containers from actual schema objects.
+**Call relations**: Called by the definitions-level experimental filter; it uses namespace detection so it can descend into namespace containers without treating them as schemas.
 
 *Call graph*: calls 3 internal fn (definition_matches_type, is_namespace_map, remove_property_from_schema); called by 1 (filter_experimental_fields_in_definitions); 1 external calls (iter_mut).
 
@@ -3561,11 +3643,11 @@ fn filter_experimental_fields_in_definitions_map(
 fn is_namespace_map(value: &Value) -> bool
 ```
 
-**Purpose**: Heuristically distinguishes a namespace container object from an actual JSON Schema object. This prevents recursive definition walkers from treating namespace maps as schemas.
+**Purpose**: Decides whether a JSON object looks like a namespace container rather than an actual schema. A namespace container is a map of names to schemas.
 
-**Data flow**: Inspects a `Value`; returns `false` unless it is an object with no `$`-prefixed keys, no obvious schema-shape keys like `type`/`properties`/`oneOf`, and all values are themselves objects. It is pure.
+**Data flow**: It receives a JSON value → checks for schema-like keys such as `type` or `properties` → returns true only if it looks like a plain map of schema objects.
 
-**Call relations**: Used by `filter_experimental_fields_in_definitions_map` and `remove_experimental_method_type_definitions_map` to recurse correctly through namespaced definition trees.
+**Call relations**: Filtering code uses this to know when to recurse into a namespace such as `definitions.v2`.
 
 *Call graph*: called by 2 (filter_experimental_fields_in_definitions_map, remove_experimental_method_type_definitions_map).
 
@@ -3576,11 +3658,11 @@ fn is_namespace_map(value: &Value) -> bool
 fn definition_matches_type(def_name: &str, type_name: &str) -> bool
 ```
 
-**Purpose**: Checks whether a definition key corresponds to a logical type name, either exactly or as a namespaced suffix like `v2::Type`. It normalizes matching across bundle layouts.
+**Purpose**: Checks whether a schema definition name refers to a given Rust type name. It supports both plain names and names with namespace-like prefixes.
 
-**Data flow**: Takes `def_name` and `type_name` strings and returns `true` if `def_name == type_name` or if it ends with `::{type_name}`. It has no side effects.
+**Data flow**: It receives a definition name and type name → compares exact match or `::TypeName` suffix → returns true or false.
 
-**Call relations**: Called during experimental-field filtering to decide whether a schema definition owns a registered experimental field. It encapsulates the exact matching rule used across namespaced and non-namespaced definitions.
+**Call relations**: Experimental field and type-definition filters use this to find definitions that represent experimental types.
 
 *Call graph*: called by 1 (filter_experimental_fields_in_definitions_map); 1 external calls (format!).
 
@@ -3591,11 +3673,11 @@ fn definition_matches_type(def_name: &str, type_name: &str) -> bool
 fn remove_property_from_schema(schema: &mut Value, field_name: &str)
 ```
 
-**Purpose**: Deletes a named property from a schema object and removes it from the `required` list, recursing through nested `schema` wrappers when present. It is the primitive used for field-level schema filtering.
+**Purpose**: Deletes a field from a JSON Schema object and also removes it from the schema’s required-field list. This keeps the schema valid after field removal.
 
-**Data flow**: Mutably inspects a schema `Value`, removes `field_name` from `properties` if present, retains only nonmatching entries in `required`, and if the schema contains an inner `schema` field recursively applies the same removal there. It mutates in place and returns no value.
+**Data flow**: It receives a mutable schema and field name → removes that field from `properties`, `required`, and nested `schema` wrappers → changes the schema in place.
 
-**Call relations**: Used by both root-level and definition-level experimental field filtering. Its recursive `schema` handling covers wrapped schema shapes that would otherwise retain stale required entries.
+**Call relations**: Experimental field filtering calls this whenever a registered unstable property must be hidden.
 
 *Call graph*: called by 2 (filter_experimental_fields_in_definitions_map, filter_experimental_fields_in_root); 1 external calls (get_mut).
 
@@ -3606,11 +3688,11 @@ fn remove_property_from_schema(schema: &mut Value, field_name: &str)
 fn prune_experimental_methods(bundle: &mut Value, experimental_methods: &[&str])
 ```
 
-**Purpose**: Removes schema variants corresponding to experimental client methods from an arbitrary schema tree. It prepares the experimental method set and delegates recursive traversal.
+**Purpose**: Removes method variants for experimental client methods from a JSON Schema bundle. A method variant is one possible request shape in a `oneOf` or similar list.
 
-**Data flow**: Builds a `HashSet<&str>` from the provided method slice, ignoring empty strings, then calls `prune_experimental_methods_inner` on the mutable bundle. It mutates the bundle in place.
+**Data flow**: It receives a mutable bundle and method names → builds a lookup set → recursively prunes matching variants.
 
-**Call relations**: Called by `filter_experimental_schema` after field filtering. It exists mainly to normalize the method list before recursive pruning.
+**Call relations**: The main schema filter calls this after field filtering.
 
 *Call graph*: calls 1 internal fn (prune_experimental_methods_inner); called by 1 (filter_experimental_schema).
 
@@ -3621,11 +3703,11 @@ fn prune_experimental_methods(bundle: &mut Value, experimental_methods: &[&str])
 fn prune_experimental_methods_inner(value: &mut Value, experimental_methods: &HashSet<&str>)
 ```
 
-**Purpose**: Recursively walks a JSON value and removes array elements that represent experimental method variants. It is the tree traversal behind method pruning.
+**Purpose**: Walks through any JSON value and removes array entries that represent experimental methods. It continues into nested objects and arrays.
 
-**Data flow**: Matches on `Value`: for arrays, retains only items for which `is_experimental_method_variant` is false and then recurses into remaining items; for objects, recurses into all values; scalars are ignored. It mutates the tree in place.
+**Data flow**: It receives a mutable JSON value and method-name set → retains only non-experimental array items → recursively checks all children.
 
-**Call relations**: Called only by `prune_experimental_methods`. It depends on `is_experimental_method_variant` to recognize the specific schema shape of a method-discriminated union arm.
+**Call relations**: This is the recursive worker behind `prune_experimental_methods`.
 
 *Call graph*: called by 1 (prune_experimental_methods).
 
@@ -3636,11 +3718,11 @@ fn prune_experimental_methods_inner(value: &mut Value, experimental_methods: &Ha
 fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<&str>) -> bool
 ```
 
-**Purpose**: Recognizes whether a schema object encodes a method-discriminated variant whose `method` literal is in the experimental set. It supports both `const` and single-value `enum` encodings.
+**Purpose**: Recognizes whether one JSON Schema variant describes an experimental method. It looks for a `method` property fixed to one of the experimental names.
 
-**Data flow**: Inspects a `Value` as an object, drills into `properties.method`, extracts either `const` or a one-element `enum`, and returns whether that method string is contained in the provided `HashSet<&str>`. It is pure.
+**Data flow**: It receives a JSON value and method-name set → checks `properties.method.const` or single-value `enum` → returns true if it should be removed.
 
-**Call relations**: Used by `prune_experimental_methods_inner` to decide which array entries to drop from union-like schema arrays.
+**Call relations**: It is the predicate used by recursive method pruning when deciding which schema variants to drop.
 
 
 ##### `filter_experimental_json_files`  (lines 547–556)
@@ -3649,11 +3731,11 @@ fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<
 fn filter_experimental_json_files(out_dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Applies stable experimental filtering to every generated JSON file on disk and removes experimental-only schema files afterward. It is the file-tree counterpart to bundle filtering.
+**Purpose**: Post-processes all generated JSON files in a directory to remove experimental API parts. It also deletes JSON files for experimental-only types.
 
-**Data flow**: Recursively enumerates `.json` files under `out_dir`, reads each into a `Value`, mutates it with `filter_experimental_schema`, writes it back prettily, computes experimental method-related type names, and deletes matching generated `.json` files from root, `v1`, and `v2` subdirs. Returns `Result<()>` after mutating the output tree.
+**Data flow**: It scans for `.json` files → reads each as JSON → filters it → writes it back → removes generated files for experimental method types.
 
-**Call relations**: Called by `generate_json_with_experimental` only in stable mode. It delegates file discovery to `json_files_in_recursive`, parsing to `read_json_value`, schema mutation to `filter_experimental_schema`, writing to `write_pretty_json`, and cleanup to `remove_generated_type_files`.
+**Call relations**: The JSON generator calls this after writing individual and bundled schemas when producing the stable export.
 
 *Call graph*: calls 6 internal fn (experimental_method_types, filter_experimental_schema, json_files_in_recursive, read_json_value, remove_generated_type_files, write_pretty_json); called by 1 (generate_json_with_experimental).
 
@@ -3664,11 +3746,11 @@ fn filter_experimental_json_files(out_dir: &Path) -> Result<()>
 fn experimental_method_types() -> HashSet<String>
 ```
 
-**Purpose**: Computes the set of generated type names that exist only to support experimental client methods or their dependencies. This set drives file and definition removal in stable exports.
+**Purpose**: Builds the set of type names connected to experimental methods. These are the generated parameter, response, and dependency types that should disappear from stable exports.
 
-**Data flow**: Creates an empty `HashSet<String>`, then feeds the configured experimental param, response, and dependency type lists through `collect_experimental_type_names`. Returns the populated set.
+**Data flow**: It reads constant lists of experimental type paths → extracts the final type names → returns a set of names.
 
-**Call relations**: Used by TS filtering, JSON filtering, in-memory tree filtering, and schema-definition cleanup. It centralizes the hard-coded mapping from experimental methods to generated type names.
+**Call relations**: Both TypeScript and JSON filtering use this set to delete generated experimental type files and definitions.
 
 *Call graph*: calls 1 internal fn (collect_experimental_type_names); called by 4 (filter_experimental_json_files, filter_experimental_ts, filter_experimental_ts_tree, remove_experimental_method_type_definitions); 1 external calls (new).
 
@@ -3679,11 +3761,11 @@ fn experimental_method_types() -> HashSet<String>
 fn collect_experimental_type_names(entries: &[&str], out: &mut HashSet<String>)
 ```
 
-**Purpose**: Normalizes a list of possibly namespaced type identifiers into bare type names and inserts them into an output set. It strips whitespace and namespace prefixes.
+**Purpose**: Adds type names from a list of possibly qualified type paths into a set. It keeps only the final name after `::`.
 
-**Data flow**: Iterates `entries: &[&str]`, trims each string, skips empties, takes the last `::` segment if present, and inserts the resulting nonempty name into `out: &mut HashSet<String>`. It mutates the provided set in place.
+**Data flow**: It receives string entries and an output set → trims and extracts names → inserts non-empty names into the set.
 
-**Call relations**: Called only by `experimental_method_types` to populate the aggregate set from multiple constant lists.
+**Call relations**: The experimental method type collector calls this for parameter, response, and dependency type lists.
 
 *Call graph*: called by 1 (experimental_method_types).
 
@@ -3698,11 +3780,11 @@ fn remove_generated_type_files(
 ) -> Result<()>
 ```
 
-**Purpose**: Deletes generated files for a set of type names across root, `v1`, and `v2` directories. It is used to physically remove experimental-only artifacts from stable exports.
+**Purpose**: Deletes generated files for a set of type names from the root, `v1`, and `v2` output folders. This hides experimental-only types from stable disk output.
 
-**Data flow**: For each `type_name` and each subdir in `""`, `"v1"`, `"v2"`, constructs the expected file path with the given extension, checks existence, and removes the file if present. Returns `Result<()>` and mutates the filesystem.
+**Data flow**: It receives an output directory, type names, and file extension → builds possible paths → removes files that exist.
 
-**Call relations**: Called by `filter_experimental_ts` and `filter_experimental_json_files` after content-level filtering. It is the final cleanup step for types that should disappear entirely.
+**Call relations**: Experimental TypeScript and JSON filters call this after editing shared files.
 
 *Call graph*: called by 2 (filter_experimental_json_files, filter_experimental_ts); 3 external calls (join, format!, remove_file).
 
@@ -3717,11 +3799,11 @@ fn remove_generated_type_entries(
 )
 ```
 
-**Purpose**: Removes generated file entries for a set of type names from an in-memory file tree. It mirrors `remove_generated_type_files` for test fixture generation.
+**Purpose**: Removes generated type files from an in-memory file tree. It mirrors `remove_generated_type_files` without touching disk.
 
-**Data flow**: For each type name and each of the root/`v1`/`v2` relative locations, constructs the corresponding `PathBuf` and removes that key from `tree: &mut BTreeMap<PathBuf, String>`. It mutates the map in place.
+**Data flow**: It receives a path-to-content map, type names, and extension → builds root, `v1`, and `v2` paths → deletes matching map entries.
 
-**Call relations**: Called by `filter_experimental_ts_tree` after content filtering. It provides the non-filesystem equivalent of generated-file deletion.
+**Call relations**: The in-memory TypeScript fixture filter uses this to remove experimental type files from fixture content.
 
 *Call graph*: called by 1 (filter_experimental_ts_tree); 2 external calls (from, format!).
 
@@ -3732,11 +3814,11 @@ fn remove_generated_type_entries(
 fn remove_experimental_method_type_definitions(bundle: &mut Value)
 ```
 
-**Purpose**: Deletes schema definitions corresponding to experimental-only method types from a bundle’s `definitions` tree. This prevents stable bundles from retaining unreachable experimental schemas.
+**Purpose**: Removes schema definitions for types that exist only because of experimental methods.
 
-**Data flow**: Computes the experimental type-name set, looks up mutable `definitions`, and if present recursively removes matching entries via `remove_experimental_method_type_definitions_map`. It mutates the bundle in place.
+**Data flow**: It receives a mutable bundle → gets the experimental method type names → removes matching entries from the definitions map.
 
-**Call relations**: Called by `filter_experimental_schema` after method pruning. It complements file deletion by cleaning the bundled schema document itself.
+**Call relations**: The main JSON schema filter calls this after removing experimental method variants.
 
 *Call graph*: calls 2 internal fn (experimental_method_types, remove_experimental_method_type_definitions_map); called by 1 (filter_experimental_schema); 1 external calls (get_mut).
 
@@ -3750,11 +3832,11 @@ fn remove_experimental_method_type_definitions_map(
 )
 ```
 
-**Purpose**: Recursively removes definitions whose names match experimental-only type names, including inside namespace maps. It is the definition-map walker behind experimental type cleanup.
+**Purpose**: Recursively deletes experimental method type definitions from a definitions map, including nested namespace maps.
 
-**Data flow**: Collects keys to remove by comparing each definition name against all experimental type names with `definition_matches_type`, removes those keys, then recurses into any remaining values recognized as namespace maps. It mutates the provided map in place.
+**Data flow**: It receives a definitions object and names to remove → collects matching keys → removes them → descends into namespace containers.
 
-**Call relations**: Called by `remove_experimental_method_type_definitions`. It relies on `is_namespace_map` to recurse only into namespace containers.
+**Call relations**: This is the worker used by `remove_experimental_method_type_definitions`.
 
 *Call graph*: calls 1 internal fn (is_namespace_map); called by 1 (remove_experimental_method_type_definitions); 3 external calls (keys, remove, values_mut).
 
@@ -3765,11 +3847,11 @@ fn remove_experimental_method_type_definitions_map(
 fn prune_unused_type_imports(content: String, type_alias_body: &str) -> String
 ```
 
-**Purpose**: Drops simple `import type { X } from ...` lines whose imported type name no longer appears in the relevant type alias body. It keeps TS post-processing from leaving stale imports behind.
+**Purpose**: Removes simple TypeScript `import type` lines when the imported type is no longer used. This keeps filtered files from referring to deleted experimental types.
 
-**Data flow**: Takes full file `content` and a `type_alias_body` usage scope, preserves whether the original content ended with a newline, scans each line, removes lines whose imported type name parsed by `parse_imported_type_name` is absent from `type_alias_body`, rejoins the remaining lines, and restores the trailing newline if needed. Returns the rewritten `String`.
+**Data flow**: It receives full file text and the remaining type body → checks each import line → drops imports whose type name no longer appears → returns rewritten text.
 
-**Call relations**: Called after TS union/property filtering by `filter_client_request_ts_contents` and `filter_experimental_type_fields_ts_contents`. It intentionally handles only simple one-name type imports.
+**Call relations**: The TypeScript method and field filters call this after removing parts of a generated type.
 
 *Call graph*: calls 1 internal fn (parse_imported_type_name); called by 2 (filter_client_request_ts_contents, filter_experimental_type_fields_ts_contents); 1 external calls (new).
 
@@ -3780,11 +3862,11 @@ fn prune_unused_type_imports(content: String, type_alias_body: &str) -> String
 fn parse_imported_type_name(line: &str) -> Option<&str>
 ```
 
-**Purpose**: Parses a simple single-name `import type { Name } from ...` line and returns the imported type name. It rejects multi-import and aliased forms.
+**Purpose**: Extracts the type name from a simple TypeScript line like `import type { Foo } from ...`. It deliberately ignores complex imports.
 
-**Data flow**: Trims the input line, checks for the `import type {` prefix, splits at `} from `, trims the extracted name, and returns `Some(&str)` only if the name is nonempty, contains no comma, and contains no ` as `. Otherwise returns `None`.
+**Data flow**: It receives one line of text → checks the expected import shape → returns the single imported type name if present.
 
-**Call relations**: Used exclusively by `prune_unused_type_imports` to identify import lines eligible for removal.
+**Call relations**: Unused-import pruning calls this for each line before deciding whether to keep or remove it.
 
 *Call graph*: called by 1 (prune_unused_type_imports).
 
@@ -3795,11 +3877,11 @@ fn parse_imported_type_name(line: &str) -> Option<&str>
 fn json_files_in_recursive(dir: &Path) -> Result<Vec<PathBuf>>
 ```
 
-**Purpose**: Recursively enumerates all `.json` files under a directory. It is a small filesystem traversal helper for schema post-processing.
+**Purpose**: Finds all JSON files under a directory and its subdirectories.
 
-**Data flow**: Uses a stack of directories starting with `dir`, repeatedly reads directory entries, pushes subdirectories, and collects paths whose extension is `json`. Returns a `Vec<PathBuf>` of discovered files.
+**Data flow**: It receives a starting directory → walks folders using a stack → collects paths ending in `.json` → returns the list.
 
-**Call relations**: Called by `filter_experimental_json_files` to find every generated JSON file that needs stable filtering.
+**Call relations**: The experimental JSON post-processor uses this to revisit every generated schema file.
 
 *Call graph*: called by 1 (filter_experimental_json_files); 4 external calls (new, read_dir, matches!, vec!).
 
@@ -3810,11 +3892,11 @@ fn json_files_in_recursive(dir: &Path) -> Result<Vec<PathBuf>>
 fn read_json_value(path: &Path) -> Result<Value>
 ```
 
-**Purpose**: Reads and parses a JSON file into a `serde_json::Value` with path-specific error context. It is the basic JSON file loader for post-processing and tests.
+**Purpose**: Reads a JSON file and parses it into a JSON value. It adds helpful error context if reading or parsing fails.
 
-**Data flow**: Reads the file at `path` to a string, parses it with `serde_json::from_str`, and returns the resulting `Value`. It does not mutate state.
+**Data flow**: It receives a file path → reads text from disk → parses JSON → returns the parsed value or an error.
 
-**Call relations**: Used by `filter_experimental_json_files` during on-disk rewriting and by tests that inspect generated bundle contents.
+**Call relations**: JSON filtering and tests use this when they need to inspect generated schema files.
 
 *Call graph*: called by 2 (filter_experimental_json_files, generate_json_filters_experimental_fields_and_methods); 2 external calls (read_to_string, from_str).
 
@@ -3825,11 +3907,11 @@ fn read_json_value(path: &Path) -> Result<Value>
 fn split_type_alias(content: &str) -> Option<(String, String, String)>
 ```
 
-**Purpose**: Splits a TypeScript type-alias declaration into prefix, body, and suffix around the top-level `=` and trailing `;`. It provides a simple structural decomposition for source-text rewriting.
+**Purpose**: Splits a TypeScript type alias into the text before `=`, the body, and the text from the final semicolon onward.
 
-**Data flow**: Searches `content` for the first `=` and last `;`; if both exist in the right order, returns `(prefix, body, suffix)` as owned `String`s, otherwise `None`. It is pure.
+**Data flow**: It receives TypeScript source text → finds the first `=` and last `;` → returns three pieces if the shape is valid.
 
-**Call relations**: Used by `filter_client_request_ts_contents` and `filter_experimental_type_fields_ts_contents` to isolate the editable portion of generated type aliases.
+**Call relations**: TypeScript filtering uses this to isolate the union or object body before removing experimental pieces.
 
 *Call graph*: called by 2 (filter_client_request_ts_contents, filter_experimental_type_fields_ts_contents).
 
@@ -3840,11 +3922,11 @@ fn split_type_alias(content: &str) -> Option<(String, String, String)>
 fn type_body_brace_span(content: &str) -> Option<(usize, usize)>
 ```
 
-**Purpose**: Finds the byte span of the top-level `{ ... }` body for either a type alias or an `export interface` declaration. It lets field filtering target object bodies precisely.
+**Purpose**: Finds the main `{ ... }` body of a generated TypeScript type alias or interface. This lets field filtering edit only the object’s properties.
 
-**Data flow**: If the content contains `=`, searches for the top-level brace span after it; otherwise looks for `export interface` and searches after that marker. Returns `Some((open_index, close_index))` or `None` if no suitable body is found.
+**Data flow**: It receives TypeScript text → looks after `=` or `export interface` → finds the matching top-level braces → returns their character positions.
 
-**Call relations**: Called by `filter_experimental_type_fields_ts_contents`. It delegates brace matching to `find_top_level_brace_span`.
+**Call relations**: The TypeScript field-content filter calls this before splitting object fields.
 
 *Call graph*: calls 1 internal fn (find_top_level_brace_span); called by 1 (filter_experimental_type_fields_ts_contents).
 
@@ -3855,11 +3937,11 @@ fn type_body_brace_span(content: &str) -> Option<(usize, usize)>
 fn find_top_level_brace_span(input: &str) -> Option<(usize, usize)>
 ```
 
-**Purpose**: Finds the first top-level brace pair in a string while ignoring nested syntax, strings, and comments. It is the core scanner used by TS source-text parsing helpers.
+**Purpose**: Finds a matching pair of top-level braces in TypeScript-like text while ignoring braces inside strings and comments.
 
-**Data flow**: Initializes `ScanState`, iterates `input.char_indices()`, records an opening `{` seen at top level outside ignored syntax, updates scanner state on every character, and returns the matching top-level closing `}` span once found. Returns `Option<(usize, usize)>`.
+**Data flow**: It scans characters with a small state machine → records the first top-level `{` and matching `}` → returns their positions if found.
 
-**Call relations**: Used by `type_body_brace_span` and `extract_method_from_arm`. It depends on `ScanState` and `Depth` to avoid false matches inside nested constructs.
+**Call relations**: Used for finding type bodies and for inspecting union arms that contain object shapes.
 
 *Call graph*: called by 2 (extract_method_from_arm, type_body_brace_span); 1 external calls (default).
 
@@ -3870,11 +3952,11 @@ fn find_top_level_brace_span(input: &str) -> Option<(usize, usize)>
 fn split_top_level(input: &str, delimiter: char) -> Vec<String>
 ```
 
-**Purpose**: Splits a string on a single delimiter only when that delimiter appears at top level outside nested syntax. It is a convenience wrapper over the multi-delimiter splitter.
+**Purpose**: Splits text on one delimiter only when that delimiter is at the top level, not inside braces, parentheses, strings, or comments.
 
-**Data flow**: Takes `input` and `delimiter`, forwards to `split_top_level_multi(input, &[delimiter])`, and returns the resulting `Vec<String>`. It is pure.
+**Data flow**: It receives text and one delimiter → delegates to the multi-delimiter splitter → returns trimmed pieces.
 
-**Call relations**: Used when splitting union arms and object fields in TS source-text transformations.
+**Call relations**: Client request filtering uses this to split union arms and object fields safely.
 
 *Call graph*: calls 1 internal fn (split_top_level_multi); called by 2 (extract_method_from_arm, filter_client_request_ts_contents).
 
@@ -3885,11 +3967,11 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<String>
 fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String>
 ```
 
-**Purpose**: Splits a string on any of several delimiters, but only at top level outside strings, comments, and nested braces/brackets/parens/angles. It is the general-purpose tokenizer for lightweight TS parsing.
+**Purpose**: Splits text on any of several delimiters, but only at top level. This prevents accidental splits inside nested object types or generic types.
 
-**Data flow**: Scans `input` with `ScanState`, tracks the start index of the current segment, emits trimmed nonempty substrings whenever a delimiter is encountered at top level outside ignored syntax, and appends the final tail. Returns a `Vec<String>`.
+**Data flow**: It receives text and delimiter characters → scans with nesting and comment/string awareness → returns non-empty trimmed parts.
 
-**Call relations**: Called by `split_top_level` and directly by `filter_experimental_type_fields_ts_contents`. It is one of the key helpers that makes source-text filtering robust enough for generated TS.
+**Call relations**: Field filtering and union parsing use this as their safe splitter.
 
 *Call graph*: called by 2 (filter_experimental_type_fields_ts_contents, split_top_level); 2 external calls (new, default).
 
@@ -3900,11 +3982,11 @@ fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String>
 fn extract_method_from_arm(arm: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts the string literal assigned to the `method` property from a TypeScript union arm representing an object type. It is used to identify experimental request variants.
+**Purpose**: Reads a TypeScript union arm and tries to find its fixed `method` string. This identifies which request method a union variant represents.
 
-**Data flow**: Finds the arm’s top-level brace span, slices the inner object body, splits top-level fields on commas, parses each field into `(name, value)`, and when `name == "method"` parses the leading string literal from the value and returns it as `Some(String)`. Returns `None` if no method literal is found.
+**Data flow**: It receives one union-arm string → finds its object body → scans properties → parses the `method` string literal → returns that method if found.
 
-**Call relations**: Used by `filter_client_request_ts_contents` to decide which union arms to remove. It depends on `find_top_level_brace_span`, `split_top_level`, `parse_property`, and `parse_string_literal`.
+**Call relations**: Client request filtering uses this to decide which union arms are experimental and should be removed.
 
 *Call graph*: calls 4 internal fn (find_top_level_brace_span, parse_property, parse_string_literal, split_top_level).
 
@@ -3915,11 +3997,11 @@ fn extract_method_from_arm(arm: &str) -> Option<String>
 fn parse_property(input: &str) -> Option<(String, &str)>
 ```
 
-**Purpose**: Parses a TypeScript object property declaration into its property name and the remainder of the value text after the colon. It is a small helper for field inspection.
+**Purpose**: Parses a TypeScript-like property into its name and value text. It expects a property name followed by a colon.
 
-**Data flow**: Calls `parse_property_name(input)` to get the property name, finds the first `:`, and returns `(name, trimmed_value_suffix)` if both are present. Otherwise returns `None`.
+**Data flow**: It receives property text → parses the property name → finds the colon → returns the name and text after the colon.
 
-**Call relations**: Used by `extract_method_from_arm` when scanning object-type fields.
+**Call relations**: Method extraction uses this while scanning fields inside a union arm.
 
 *Call graph*: calls 1 internal fn (parse_property_name); called by 1 (extract_method_from_arm).
 
@@ -3930,11 +4012,11 @@ fn parse_property(input: &str) -> Option<(String, &str)>
 fn strip_leading_block_comments(input: &str) -> &str
 ```
 
-**Purpose**: Removes one or more leading `/* ... */` block comments from a field snippet before property-name parsing. This prevents documentation comments from confusing TS field filtering.
+**Purpose**: Skips over leading `/* ... */` comments before a TypeScript field. This lets field-name parsing work even when generated comments appear before properties.
 
-**Data flow**: Trims leading whitespace, repeatedly strips a leading block comment if present and complete, then returns the remaining `&str`. It does not allocate unless the caller later copies the result.
+**Data flow**: It receives text → repeatedly removes leading block comments and whitespace → returns the remaining slice.
 
-**Call relations**: Used by `filter_experimental_type_fields_ts_contents` before calling `parse_property_name` on generated field snippets that may begin with doc comments.
+**Call relations**: TypeScript field filtering calls this before checking whether a field is experimental.
 
 
 ##### `parse_property_name`  (lines 821–855)
@@ -3943,11 +4025,11 @@ fn strip_leading_block_comments(input: &str) -> &str
 fn parse_property_name(input: &str) -> Option<String>
 ```
 
-**Purpose**: Parses a TypeScript property name from a field declaration, supporting quoted names, identifiers, and optional `?` markers. It rejects inputs that are not property declarations.
+**Purpose**: Parses a TypeScript property name, including quoted names and optional fields marked with `?`. It only accepts names followed by a colon.
 
-**Data flow**: Trims leading whitespace, first tries to parse a quoted string literal name followed by `:`, otherwise scans identifier characters with `is_ident_char`, optionally consumes a trailing `?`, and returns the property name as `Some(String)` only if the remaining text starts with `:`. Returns `None` on failure.
+**Data flow**: It receives property text → reads a quoted string or identifier → skips an optional `?` → confirms a colon → returns the property name.
 
-**Call relations**: Used by `parse_property` and by TS field filtering to identify which generated properties should be removed.
+**Call relations**: Used by property parsing and experimental field filtering.
 
 *Call graph*: calls 2 internal fn (is_ident_char, parse_string_literal); called by 1 (parse_property).
 
@@ -3958,11 +4040,11 @@ fn parse_property_name(input: &str) -> Option<String>
 fn parse_string_literal(input: &str) -> Option<(String, usize)>
 ```
 
-**Purpose**: Parses a single- or double-quoted string literal from the start of an input string, honoring backslash escapes. It returns both the literal contents and the number of bytes consumed.
+**Purpose**: Parses a single- or double-quoted string literal and handles escaped characters. It reports both the string content and how much text was consumed.
 
-**Data flow**: Reads the first character as the quote delimiter, scans subsequent characters while tracking escape state, and on the matching closing quote returns `(literal_contents, consumed_len)`. Returns `None` if the input does not start with a quote or the literal is unterminated.
+**Data flow**: It receives text → verifies the opening quote → scans until the matching unescaped quote → returns the literal content and consumed length.
 
-**Call relations**: Used by `extract_method_from_arm` and `parse_property_name` to recognize quoted property names and method literals.
+**Call relations**: Property-name parsing and method extraction use this for quoted fields and method names.
 
 *Call graph*: called by 2 (extract_method_from_arm, parse_property_name).
 
@@ -3973,11 +4055,11 @@ fn parse_string_literal(input: &str) -> Option<(String, usize)>
 fn is_ident_char(ch: char) -> bool
 ```
 
-**Purpose**: Defines the subset of characters accepted in parsed TypeScript identifier property names for this lightweight parser. It allows ASCII alphanumerics and underscore.
+**Purpose**: Checks whether a character can be part of a simple TypeScript identifier used here. It allows ASCII letters, digits, and underscore.
 
-**Data flow**: Takes a `char` and returns `true` if it is ASCII alphanumeric or `_`, otherwise `false`. It is pure.
+**Data flow**: It receives one character → tests it against the allowed set → returns true or false.
 
-**Call relations**: Used by `parse_property_name` during identifier scanning.
+**Call relations**: Property-name parsing uses this while reading unquoted field names.
 
 *Call graph*: called by 1 (parse_property_name).
 
@@ -3988,11 +4070,11 @@ fn is_ident_char(ch: char) -> bool
 fn observe(&mut self, ch: char)
 ```
 
-**Purpose**: Updates the lightweight TS scanner state for one character, tracking nesting depth, strings, escapes, and comments. It is the engine behind top-level splitting and brace matching.
+**Purpose**: Updates the scanner’s memory after seeing one character. It tracks whether parsing is inside a string, comment, or nested brackets.
 
-**Data flow**: Mutates `self` based on the incoming character: exits line comments on newline, exits block comments on `*/`, handles string delimiters and escapes, detects comment starts from prior `/`, and adjusts `Depth` counters for braces, brackets, parens, and angle brackets when not inside ignored syntax. It returns no value.
+**Data flow**: It receives one character → updates comment/string flags and nesting depth → changes the scan state in place.
 
-**Call relations**: Called repeatedly by `find_top_level_brace_span` and `split_top_level_multi`. Its correctness determines whether TS source-text edits respect nested syntax boundaries.
+**Call relations**: Top-level splitters and brace finders rely on this to avoid being fooled by punctuation inside nested or ignored syntax.
 
 
 ##### `ScanState::in_ignored_syntax`  (lines 965–967)
@@ -4001,11 +4083,11 @@ fn observe(&mut self, ch: char)
 fn in_ignored_syntax(&self) -> bool
 ```
 
-**Purpose**: Reports whether the scanner is currently inside a string literal or comment. This tells callers whether delimiters and braces should be ignored.
+**Purpose**: Reports whether the scanner is currently inside syntax that should be ignored for structural parsing, such as a string or comment.
 
-**Data flow**: Reads `self.string_delim`, `self.block_comment`, and `self.line_comment` and returns `true` if any are active. It is pure.
+**Data flow**: It reads the scanner flags → returns true if inside a string, block comment, or line comment.
 
-**Call relations**: Used by the scanner-driven parsing helpers to avoid splitting or matching syntax inside comments and strings.
+**Call relations**: Brace-finding and splitting code consult this before treating punctuation as meaningful.
 
 
 ##### `Depth::is_top_level`  (lines 979–981)
@@ -4014,11 +4096,11 @@ fn in_ignored_syntax(&self) -> bool
 fn is_top_level(&self) -> bool
 ```
 
-**Purpose**: Reports whether all tracked nesting counters are zero. It defines the notion of “top level” for the lightweight TS parser.
+**Purpose**: Reports whether the current scan position is not nested inside braces, brackets, parentheses, or angle brackets.
 
-**Data flow**: Reads `brace`, `bracket`, `paren`, and `angle` counters and returns `true` only when all are zero. It is pure.
+**Data flow**: It reads the four nesting counters → returns true only when all are zero.
 
-**Call relations**: Used by `find_top_level_brace_span` and `split_top_level_multi` to decide when delimiters and braces are structurally significant.
+**Call relations**: The TypeScript text parser uses this to split only at real top-level separators.
 
 
 ##### `build_schema_bundle`  (lines 984–1065)
@@ -4027,11 +4109,11 @@ fn is_top_level(&self) -> bool
 fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value>
 ```
 
-**Purpose**: Combines many generated per-type schemas into one bundled JSON Schema document with a unified `definitions` map, namespace-aware `$ref` rewriting, extracted nested definitions, and schema annotation. It is the central bundling algorithm for protocol JSON export.
+**Purpose**: Combines many individual JSON Schemas into one bundle with a shared `definitions` map. It also fixes references so namespaced types point to the right place.
 
-**Data flow**: Takes `Vec<GeneratedSchema>`, computes known namespaced types, iterates each schema, skips ignored definitions, rewrites refs either into the schema’s own namespace or toward known namespaced definitions, extracts nested `definitions` from each schema value, annotates schemas and nested definitions with titles, inserts definitions into root or namespace maps while detecting collisions, rewrites forced refs for extracted definitions that belong in another namespace, and finally constructs a root object containing `$schema`, `title`, `type`, and the assembled `definitions`. Returns the bundled `Value`.
+**Data flow**: It receives generated schemas → collects known namespaced type names → moves nested definitions into the bundle → rewrites `$ref` links → returns one combined JSON Schema value.
 
-**Call relations**: Called by `generate_json_with_experimental` and several tests. It delegates namespace discovery to `collect_namespaced_types`, ref rewriting to `rewrite_refs_to_namespace`, `rewrite_refs_to_known_namespaces`, and `rewrite_named_ref_to_namespace`, annotation to `annotate_schema`, and insertion/collision handling to `insert_into_namespace`.
+**Call relations**: The JSON generator calls this before writing the main combined schema bundle.
 
 *Call graph*: calls 7 internal fn (annotate_schema, collect_namespaced_types, insert_into_namespace, namespace_for_definition, rewrite_named_ref_to_namespace, rewrite_refs_to_known_namespaces, rewrite_refs_to_namespace); called by 4 (generate_json_with_experimental, build_schema_bundle_rewrites_root_helper_refs_to_namespaced_defs, stable_schema_filter_removes_mock_experimental_method, stable_schema_filter_removes_mock_thread_start_field); 4 external calls (new, Object, String, new).
 
@@ -4042,11 +4124,11 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value>
 fn build_flat_v2_schema(bundle: &Value) -> Result<Value>
 ```
 
-**Purpose**: Transforms the mixed bundled schema into a flat v2-only bundle suitable for downstream code generators that cannot traverse nested namespace maps. It preserves shared root unions and pulls in any non-v2 dependencies they reference.
+**Purpose**: Creates a v2-focused schema bundle with v2 definitions placed at the root. This helps code generators that only look one level deep in `definitions`.
 
-**Data flow**: Validates that the input bundle root and `definitions.v2` exist, clones the root, starts flat definitions from the `v2` namespace contents, copies selected shared root schemas (`ClientRequest`, `ServerNotification`), collects their non-v2 refs, recursively gathers dependent root definitions, merges everything into one flat `definitions` map, retitles the bundle as `...V2`, rewrites `#/definitions/v2/` refs to `#/definitions/`, and validates that no namespaced refs remain and all referenced definitions are present. Returns the flattened `Value`.
+**Data flow**: It receives the full mixed bundle → copies v2 definitions and needed shared dependencies → rewrites v2 references → verifies no references are broken → returns the flat bundle.
 
-**Call relations**: Called by `generate_json_with_experimental` and tested directly. It delegates dependency discovery to `collect_non_v2_refs` and `collect_definition_dependencies`, ref rewriting to `rewrite_ref_prefix`, and integrity checks to `ensure_no_ref_prefix` and `ensure_referenced_definitions_present`.
+**Call relations**: The JSON generator writes this as the separate v2 bundle, and tests check that it keeps shared request and notification shapes.
 
 *Call graph*: calls 5 internal fn (collect_definition_dependencies, collect_non_v2_refs, ensure_no_ref_prefix, ensure_referenced_definitions_present, rewrite_ref_prefix); called by 2 (generate_json_with_experimental, build_flat_v2_schema_keeps_shared_root_schemas_and_dependencies); 6 external calls (new, new, Object, String, anyhow!, format!).
 
@@ -4057,11 +4139,11 @@ fn build_flat_v2_schema(bundle: &Value) -> Result<Value>
 fn collect_non_v2_refs(value: &Value) -> HashSet<String>
 ```
 
-**Purpose**: Collects root-definition references from a schema tree, excluding refs that already point into the `v2` namespace. It identifies shared-root dependencies needed by the flat-v2 bundle.
+**Purpose**: Collects references to root-level definitions, excluding references already under `v2`. These are shared dependencies needed by the flat v2 bundle.
 
-**Data flow**: Creates an empty `HashSet<String>`, recursively traverses the input value with `collect_non_v2_refs_inner`, and returns the accumulated set of referenced definition names. It is pure aside from mutating the local set.
+**Data flow**: It receives a JSON value → recursively scans for `$ref` strings → returns the set of non-v2 definition names.
 
-**Call relations**: Used by `build_flat_v2_schema` and `collect_definition_dependencies` to discover non-v2 dependencies that must be retained in the flattened bundle.
+**Call relations**: Flat v2 bundle creation uses this to know which shared helper schemas to pull in.
 
 *Call graph*: calls 1 internal fn (collect_non_v2_refs_inner); called by 2 (build_flat_v2_schema, collect_definition_dependencies); 1 external calls (new).
 
@@ -4072,11 +4154,11 @@ fn collect_non_v2_refs(value: &Value) -> HashSet<String>
 fn collect_non_v2_refs_inner(value: &Value, refs: &mut HashSet<String>)
 ```
 
-**Purpose**: Recursively walks a schema tree and records `$ref` targets under `#/definitions/` that do not start with `#/definitions/v2/`. It is the traversal worker for non-v2 dependency collection.
+**Purpose**: Recursively walks a JSON value to find non-v2 definition references.
 
-**Data flow**: For objects, inspects `$ref` and inserts the referenced name when it is a non-v2 root definition, then recurses into all child values; for arrays, recurses into each item; scalars are ignored. It mutates the provided `refs` set in place.
+**Data flow**: It receives a JSON value and an output set → adds matching `$ref` targets → descends through objects and arrays.
 
-**Call relations**: Called only by `collect_non_v2_refs`.
+**Call relations**: This is the worker behind `collect_non_v2_refs`.
 
 *Call graph*: called by 1 (collect_non_v2_refs).
 
@@ -4090,11 +4172,11 @@ fn collect_definition_dependencies(
 ) -> HashSet<String>
 ```
 
-**Purpose**: Computes the transitive closure of non-v2 definition dependencies starting from an initial set of names. It ensures the flat-v2 bundle includes all shared root helpers still referenced indirectly.
+**Purpose**: Finds all shared definition dependencies reachable from an initial set of names. It follows references like a breadcrumb trail.
 
-**Data flow**: Takes the root `definitions` map and an initial `HashSet<String>` of names, then performs a worklist traversal: pop a name, skip if already seen, look up its schema, collect its non-v2 refs, and enqueue unseen dependencies. Returns the final `seen` set.
+**Data flow**: It receives the full definitions map and starting names → repeatedly scans each referenced definition for more references → returns every discovered dependency name.
 
-**Call relations**: Called by `build_flat_v2_schema` after collecting direct non-v2 refs from shared root schemas.
+**Call relations**: Flat v2 bundle creation uses this so shared helpers are not copied without their own required helper types.
 
 *Call graph*: calls 1 internal fn (collect_non_v2_refs); called by 1 (build_flat_v2_schema); 2 external calls (new, get).
 
@@ -4105,11 +4187,11 @@ fn collect_definition_dependencies(
 fn rewrite_ref_prefix(value: &mut Value, prefix: &str, replacement: &str)
 ```
 
-**Purpose**: Recursively rewrites `$ref` strings by replacing one prefix with another. It is used to flatten namespaced refs into root refs.
+**Purpose**: Rewrites `$ref` strings by replacing one prefix with another throughout a JSON value.
 
-**Data flow**: Traverses a mutable `Value`; whenever it finds an object `$ref` string, it applies `String::replace(prefix, replacement)`, then recurses into child values and array items. It mutates the tree in place.
+**Data flow**: It receives a mutable JSON value, old prefix, and replacement → walks all objects and arrays → changes matching reference strings in place.
 
-**Call relations**: Called by `build_flat_v2_schema` after assembling the flat bundle so all `#/definitions/v2/...` refs become `#/definitions/...`.
+**Call relations**: The flat v2 bundle uses this to turn `#/definitions/v2/Type` references into `#/definitions/Type` references.
 
 *Call graph*: called by 1 (build_flat_v2_schema).
 
@@ -4120,11 +4202,11 @@ fn rewrite_ref_prefix(value: &mut Value, prefix: &str, replacement: &str)
 fn ensure_no_ref_prefix(value: &Value, prefix: &str, label: &str) -> Result<()>
 ```
 
-**Purpose**: Validates that a schema tree contains no `$ref` values starting with a forbidden prefix. It turns leftover namespaced refs into a descriptive error.
+**Purpose**: Checks that no `$ref` in a schema still starts with an unwanted prefix. It is a safety check after reference rewriting.
 
-**Data flow**: Searches the schema with `first_ref_with_prefix`; if a matching ref is found, returns an `anyhow!` error naming the offending reference and label, otherwise returns `Ok(())`. It does not mutate state.
+**Data flow**: It receives a schema, forbidden prefix, and label → searches for the first bad reference → returns success or an error naming the problem.
 
-**Call relations**: Called by `build_flat_v2_schema` after ref rewriting to ensure flattening completed successfully.
+**Call relations**: Flat v2 bundle creation calls this after rewriting v2 references.
 
 *Call graph*: calls 1 internal fn (first_ref_with_prefix); called by 1 (build_flat_v2_schema); 1 external calls (anyhow!).
 
@@ -4135,11 +4217,11 @@ fn ensure_no_ref_prefix(value: &Value, prefix: &str, label: &str) -> Result<()>
 fn first_ref_with_prefix(value: &Value, prefix: &str) -> Option<String>
 ```
 
-**Purpose**: Finds the first `$ref` string in a schema tree that starts with a given prefix. It is a diagnostic helper for validation.
+**Purpose**: Finds the first `$ref` string in a JSON value that starts with a given prefix.
 
-**Data flow**: Recursively traverses objects and arrays, returning the first matching `$ref` string clone it encounters, or `None` if no match exists. It is pure.
+**Data flow**: It receives a JSON value and prefix → recursively scans objects and arrays → returns the first matching reference if any.
 
-**Call relations**: Used by `ensure_no_ref_prefix` to produce a concrete offending reference in error messages.
+**Call relations**: The no-bad-prefix check uses this to produce a helpful error.
 
 *Call graph*: called by 1 (ensure_no_ref_prefix).
 
@@ -4150,11 +4232,11 @@ fn first_ref_with_prefix(value: &Value, prefix: &str) -> Option<String>
 fn ensure_referenced_definitions_present(schema: &Value, label: &str) -> Result<()>
 ```
 
-**Purpose**: Checks that every `#/definitions/...` reference in a schema points to an existing top-level definition. It guards against producing incomplete bundles.
+**Purpose**: Verifies that every local definition reference in a schema points to a definition that actually exists. This catches broken bundles before they are written.
 
-**Data flow**: Reads the bundle’s `definitions` object, recursively collects missing referenced names into a `HashSet` via `collect_missing_definitions`, and returns `Ok(())` if empty or an `anyhow!` error listing sorted missing names otherwise. It does not mutate the schema.
+**Data flow**: It receives a schema and label → gathers missing referenced names → returns success if none are missing, otherwise an error listing them.
 
-**Call relations**: Called by `build_flat_v2_schema` as a final integrity check after flattening and ref rewriting.
+**Call relations**: Flat v2 bundle creation calls this as a final integrity check.
 
 *Call graph*: calls 1 internal fn (collect_missing_definitions); called by 1 (build_flat_v2_schema); 3 external calls (new, get, anyhow!).
 
@@ -4169,11 +4251,11 @@ fn collect_missing_definitions(
 )
 ```
 
-**Purpose**: Recursively scans a schema tree for `#/definitions/...` refs whose top-level definition name is absent from the provided definitions map. It is the worker behind missing-definition validation.
+**Purpose**: Recursively collects local `$ref` targets that are absent from a definitions map.
 
-**Data flow**: Traverses objects and arrays; when it finds a `$ref` under `#/definitions/`, it extracts the first path segment after `definitions/` and inserts it into `missing` if `definitions` lacks that key. It mutates the provided set in place.
+**Data flow**: It receives a JSON value, existing definitions, and a missing-name set → scans every child → inserts names whose definitions are missing.
 
-**Call relations**: Called by `ensure_referenced_definitions_present`.
+**Call relations**: The referenced-definition integrity check uses this as its recursive worker.
 
 *Call graph*: called by 1 (ensure_referenced_definitions_present); 1 external calls (contains_key).
 
@@ -4189,11 +4271,11 @@ fn insert_into_namespace(
 ) -> Result<()>
 ```
 
-**Purpose**: Inserts a schema definition into a namespace object inside the bundle’s `definitions` map, creating the namespace map if needed. It enforces that namespace entries are objects.
+**Purpose**: Adds a schema definition into a namespace object inside the bundle. If the namespace does not exist, it creates it.
 
-**Data flow**: Looks up or creates `definitions[namespace]` as a `Value::Object`, then inserts the named schema into that map via `insert_definition`. Returns `Result<()>` and mutates the definitions map.
+**Data flow**: It receives the bundle definitions map, namespace, name, and schema → finds or creates the namespace map → inserts the definition safely.
 
-**Call relations**: Called by `build_schema_bundle` whenever a schema or extracted nested definition belongs under a namespace like `v2`.
+**Call relations**: Schema bundle building calls this when placing v2 or other namespaced definitions.
 
 *Call graph*: calls 1 internal fn (insert_definition); called by 1 (build_schema_bundle); 3 external calls (entry, anyhow!, format!).
 
@@ -4209,11 +4291,11 @@ fn insert_definition(
 ) -> Result<()>
 ```
 
-**Purpose**: Inserts one named schema definition into a definitions map while detecting collisions between unequal schemas. Equal duplicates are tolerated; unequal duplicates become an error with rename guidance.
+**Purpose**: Inserts one schema definition and detects naming collisions. If the same name already exists with different content, it returns a clear error.
 
-**Data flow**: Checks whether `definitions` already contains `name`; if absent, inserts `schema`. If present and equal, returns success unchanged; if present and different, extracts existing/new titles and returns an `anyhow!` collision error naming the location and suggesting `#[schemars(rename = ...)]`. It mutates the map only on successful insertion.
+**Data flow**: It receives a definitions map, name, schema, and location label → compares with any existing entry → inserts or reports a collision.
 
-**Call relations**: Called by `insert_into_namespace` and indirectly by `build_schema_bundle` to enforce uniqueness of bundled definitions.
+**Call relations**: Namespace insertion uses this to avoid silently overwriting schema definitions.
 
 *Call graph*: called by 1 (insert_into_namespace); 4 external calls (get, insert, get, anyhow!).
 
@@ -4224,11 +4306,11 @@ fn insert_definition(
 fn write_json_schema_with_return(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
 ```
 
-**Purpose**: Generates a JSON schema for one Rust type, writes it to the appropriate output path, and returns a `GeneratedSchema` record describing the emitted schema for later bundling. It is the per-type schema emission primitive.
+**Purpose**: Generates a JSON Schema for one Rust type, writes it to disk when appropriate, and returns it for bundling. It also applies naming and variant cleanup needed by code generators.
 
-**Data flow**: Takes `out_dir` and a schema `name`, splits namespace and logical name, decides whether the schema should be included in JSON codegen, generates the raw schema with `schema_for!(T)`, optionally strips selected v1 variants, checks for numbered-definition collisions, annotates titles, computes the output path (including namespace subdir), writes pretty JSON unless excluded/ignored, and returns `GeneratedSchema { namespace, logical_name, value, in_v1_dir }`.
+**Data flow**: It receives an output directory and schema name → derives namespace and logical name → builds the schema from the Rust type → filters special legacy variants, annotates it, writes a JSON file, and returns `GeneratedSchema`.
 
-**Call relations**: Used by `generate_json_with_experimental` through emitter closures and by tests. It delegates namespace parsing to `split_namespace`, v1 pruning to `strip_v1_client_request_variants_from_json_schema` / `strip_v1_server_notification_variants_from_json_schema`, collision checks to `enforce_numbered_definition_collision_overrides`, annotation to `annotate_schema`, directory creation to `ensure_dir`, and writing to `write_pretty_json`.
+**Call relations**: The JSON export pipeline uses this through small emitter functions for many protocol types.
 
 *Call graph*: calls 7 internal fn (annotate_schema, enforce_numbered_definition_collision_overrides, ensure_dir, split_namespace, strip_v1_client_request_variants_from_json_schema, strip_v1_server_notification_variants_from_json_schema, write_pretty_json); 4 external calls (join, format!, schema_for!, to_value).
 
@@ -4239,11 +4321,11 @@ fn write_json_schema_with_return(out_dir: &Path, name: &str) -> Result<Generated
 fn enforce_numbered_definition_collision_overrides(schema_name: &str, schema: &mut Value)
 ```
 
-**Purpose**: Checks a generated schema’s nested definitions for numbered-name collisions such as `Type` and `Type2` coexisting in a problematic way. It fails fast on ambiguous generated naming.
+**Purpose**: Checks a schema for suspicious generated definition names such as `Foo1` when `Foo` also exists. That usually means two different types collided in generated names.
 
-**Data flow**: Looks for both `definitions` and `$defs` maps in the schema and, when present, passes each to `detect_numbered_definition_collisions` along with the schema name and container key. It does not mutate the schema.
+**Data flow**: It receives a schema name and schema value → inspects `definitions` and `$defs` maps → panics if it detects a numbered collision.
 
-**Call relations**: Called by `write_json_schema_with_return` before annotation and writing.
+**Call relations**: Single-schema writing calls this before accepting a generated schema.
 
 *Call graph*: calls 1 internal fn (detect_numbered_definition_collisions); called by 1 (write_json_schema_with_return); 1 external calls (get).
 
@@ -4254,11 +4336,11 @@ fn enforce_numbered_definition_collision_overrides(schema_name: &str, schema: &m
 fn strip_v1_client_request_variants_from_json_schema(schema: &mut Value)
 ```
 
-**Purpose**: Removes selected legacy v1 client-request method variants from a generated `ClientRequest` schema. It keeps JSON exports aligned with the intended v1 surface.
+**Purpose**: Removes selected legacy v1 client request methods from the JSON schema export. This keeps the JSON schema focused on the intended public surface.
 
-**Data flow**: Builds a `HashSet<&str>` from `V1_CLIENT_REQUEST_METHODS` and passes it to `strip_method_variants_from_json_schema`. It mutates the schema in place.
+**Data flow**: It builds the set of v1 methods to remove → passes the schema and set to the generic method-variant stripper.
 
-**Call relations**: Called by `write_json_schema_with_return` only when emitting the `ClientRequest` schema.
+**Call relations**: Single-schema writing calls this specifically for `ClientRequest`.
 
 *Call graph*: calls 1 internal fn (strip_method_variants_from_json_schema); called by 1 (write_json_schema_with_return).
 
@@ -4269,11 +4351,11 @@ fn strip_v1_client_request_variants_from_json_schema(schema: &mut Value)
 fn strip_v1_server_notification_variants_from_json_schema(schema: &mut Value)
 ```
 
-**Purpose**: Removes selected server-notification method variants from generated JSON schema output. It excludes methods intentionally omitted from JSON exports.
+**Purpose**: Removes selected server notification methods from the JSON schema export. These are excluded from the JSON-facing schema.
 
-**Data flow**: Builds a `HashSet<&str>` from `EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON` and passes it to `strip_method_variants_from_json_schema`. It mutates the schema in place.
+**Data flow**: It builds the set of notification methods to remove → passes the schema and set to the generic method-variant stripper.
 
-**Call relations**: Called by `write_json_schema_with_return` only when emitting the `ServerNotification` schema.
+**Call relations**: Single-schema writing calls this specifically for `ServerNotification`.
 
 *Call graph*: calls 1 internal fn (strip_method_variants_from_json_schema); called by 1 (write_json_schema_with_return).
 
@@ -4284,11 +4366,11 @@ fn strip_v1_server_notification_variants_from_json_schema(schema: &mut Value)
 fn strip_method_variants_from_json_schema(schema: &mut Value, methods_to_remove: &HashSet<&str>)
 ```
 
-**Purpose**: Removes union variants whose method discriminator is in a removal set, then prunes now-unreachable local definitions. It is the generic variant-stripping helper for generated schemas.
+**Purpose**: Removes method variants from a schema’s top-level `oneOf` list and then drops definitions no longer reachable. This avoids leaving dead helper definitions behind.
 
-**Data flow**: Mutably accesses the schema root object, retains only `oneOf` variants not matched by `is_method_variant_in_set`, computes reachable local definitions with `reachable_local_definitions`, and then retains only those definitions in the root `definitions` map. It mutates the schema in place.
+**Data flow**: It receives a schema and method names → filters matching variants → computes reachable local definitions → retains only those definitions.
 
-**Call relations**: Called by both v1-specific stripping helpers. It depends on `is_method_variant_in_set` for variant recognition and `reachable_local_definitions` to clean up orphaned nested definitions.
+**Call relations**: The v1 client request and server notification special-case filters both use this.
 
 *Call graph*: calls 1 internal fn (reachable_local_definitions); called by 2 (strip_v1_client_request_variants_from_json_schema, strip_v1_server_notification_variants_from_json_schema); 1 external calls (as_object_mut).
 
@@ -4299,11 +4381,11 @@ fn strip_method_variants_from_json_schema(schema: &mut Value, methods_to_remove:
 fn is_method_variant_in_set(value: &Value, methods: &HashSet<&str>) -> bool
 ```
 
-**Purpose**: Checks whether a schema variant object has a `method` discriminator whose literal value is in a target set. It recognizes the schema shape used for request/notification unions.
+**Purpose**: Checks whether a schema variant represents one of a given set of methods.
 
-**Data flow**: Inspects `value.properties.method`, extracts its literal with `string_literal`, and returns whether that method is contained in `methods`. It is pure.
+**Data flow**: It receives a JSON variant and method set → looks for a fixed `method` property → returns true if that method is in the set.
 
-**Call relations**: Used by `strip_method_variants_from_json_schema` when filtering `oneOf` arrays.
+**Call relations**: Method-variant stripping uses this as its test for each `oneOf` entry.
 
 *Call graph*: calls 1 internal fn (string_literal).
 
@@ -4314,11 +4396,11 @@ fn is_method_variant_in_set(value: &Value, methods: &HashSet<&str>) -> bool
 fn reachable_local_definitions(schema: &Value, defs_key: &str) -> HashSet<String>
 ```
 
-**Purpose**: Computes which local definitions in a schema remain reachable from the root after variant pruning. It supports cleanup of nested `definitions` maps.
+**Purpose**: Finds which local schema definitions are still reachable after variants have been removed. Reachable means some remaining schema still references them.
 
-**Data flow**: Reads the schema’s local definitions map, initializes a queue and reachable set, collects root-level refs excluding nested definition maps, then repeatedly follows refs inside reachable definitions until closure is reached. Returns the set of reachable definition names.
+**Data flow**: It receives a schema and definitions key name → starts from references outside the definitions map → follows references through definitions → returns the reachable definition names.
 
-**Call relations**: Called by `strip_method_variants_from_json_schema` to decide which nested definitions to retain.
+**Call relations**: Method-variant stripping uses this to prune unused local definitions.
 
 *Call graph*: calls 2 internal fn (collect_local_definition_refs, collect_local_definition_refs_excluding_maps); called by 1 (strip_method_variants_from_json_schema); 3 external calls (new, get, new).
 
@@ -4334,11 +4416,11 @@ fn collect_local_definition_refs_excluding_maps(
 )
 ```
 
-**Purpose**: Collects local-definition refs from a schema tree while skipping traversal into definition containers themselves. This avoids treating all definitions as root-reachable.
+**Purpose**: Collects local definition references while skipping entire definition maps. This finds references from the real schema body, not from every definition whether used or not.
 
-**Data flow**: Recurses through objects and arrays, skipping keys equal to the active defs key, `$defs`, or `definitions`, then calls `collect_local_definition_ref_here` on each visited node. It mutates the provided queue and reachable set.
+**Data flow**: It receives a JSON value, definition key, queue, and reachable set → scans children except definitions containers → records referenced definition names.
 
-**Call relations**: Called by `reachable_local_definitions` for the initial root traversal.
+**Call relations**: Reachability analysis uses this for its initial scan.
 
 *Call graph*: calls 1 internal fn (collect_local_definition_ref_here); called by 1 (reachable_local_definitions).
 
@@ -4354,11 +4436,11 @@ fn collect_local_definition_refs(
 )
 ```
 
-**Purpose**: Collects local-definition refs from a schema subtree, including inside nested structures. It is used when traversing already-reachable definitions.
+**Purpose**: Collects local definition references from a JSON value, including all nested children.
 
-**Data flow**: Calls `collect_local_definition_ref_here` on the current node, then recurses through all object values and array items. It mutates the provided queue and reachable set.
+**Data flow**: It receives a JSON value, definition key, queue, and reachable set → records any `$ref` at this value → recursively scans children.
 
-**Call relations**: Called by `reachable_local_definitions` while expanding the worklist of reachable definitions.
+**Call relations**: Reachability analysis uses this when following references inside already-reachable definitions.
 
 *Call graph*: calls 1 internal fn (collect_local_definition_ref_here); called by 1 (reachable_local_definitions).
 
@@ -4374,11 +4456,11 @@ fn collect_local_definition_ref_here(
 )
 ```
 
-**Purpose**: Examines one schema node for a local `$ref` into the active definitions container and enqueues the referenced definition if newly discovered. It is the primitive ref extractor for reachability analysis.
+**Purpose**: Checks one JSON value for a local `$ref` to a definition and adds it to the reachability queue if new.
 
-**Data flow**: Reads `value` as an object, extracts `$ref` as a string, checks for the `#/{defs_key}/` prefix, takes the first path segment after that prefix, and if newly inserted into `reachable` also pushes it onto `queue`. It mutates both collections in place.
+**Data flow**: It receives a JSON value, definition key, queue, and reachable set → extracts a `#/{defs_key}/Name` reference if present → stores the name.
 
-**Call relations**: Used by both local-definition ref collectors during reachability analysis.
+**Call relations**: Both local-reference collectors use this small shared step.
 
 *Call graph*: called by 2 (collect_local_definition_refs, collect_local_definition_refs_excluding_maps); 2 external calls (as_object, format!).
 
@@ -4393,11 +4475,11 @@ fn detect_numbered_definition_collisions(
 )
 ```
 
-**Purpose**: Panics if a schema contains both a base definition name and a numbered variant like `Type2`, which would indicate unstable or ambiguous generated naming. It is a defensive invariant check.
+**Purpose**: Detects generated schema definition names that look like automatic collision fallbacks. It panics to force the developer to add an explicit rename.
 
-**Data flow**: Iterates definition keys, trims trailing ASCII digits from each to compute a base name, and if the trimmed base differs and also exists as a key, panics with a detailed collision message naming the schema and container. It does not mutate state.
+**Data flow**: It receives a schema name, definitions container name, and definitions map → checks whether names like `Foo1` coexist with `Foo` → panics on a collision.
 
-**Call relations**: Called by `enforce_numbered_definition_collision_overrides` during per-type schema generation.
+**Call relations**: The numbered-collision enforcement helper calls this for each definitions map.
 
 *Call graph*: called by 1 (enforce_numbered_definition_collision_overrides); 3 external calls (contains_key, keys, panic!).
 
@@ -4408,11 +4490,11 @@ fn detect_numbered_definition_collisions(
 fn write_json_schema(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
 ```
 
-**Purpose**: Thin wrapper around `write_json_schema_with_return` that preserves the public helper name. It emits one schema and returns its `GeneratedSchema` metadata.
+**Purpose**: Public crate-level wrapper that writes a JSON Schema for one Rust type and returns its generated schema metadata.
 
-**Data flow**: Forwards `out_dir` and `name` to `write_json_schema_with_return::<T>` and returns the resulting `Result<GeneratedSchema>`. It writes the same files as the delegated function.
+**Data flow**: It receives an output directory and schema name → delegates to the main single-schema writer → returns the generated schema.
 
-**Call relations**: Used by `generate_internal_json_schema`; otherwise it simply exposes the lower-level emitter under a shorter name.
+**Call relations**: Internal schema generation and other crate code use this simpler wrapper.
 
 
 ##### `write_pretty_json`  (lines 1531–1536)
@@ -4421,11 +4503,11 @@ fn write_json_schema(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
 fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()>
 ```
 
-**Purpose**: Serializes a value as pretty-printed JSON and writes it to disk with contextualized errors. It is the common JSON file writer for export outputs.
+**Purpose**: Writes a JSON value to disk using human-readable formatting. Pretty formatting makes generated schema files easier to inspect and diff.
 
-**Data flow**: Takes a target `PathBuf` and any `Serialize` value, converts it to pretty JSON bytes with `serde_json::to_vec_pretty`, writes those bytes to the path with `fs::write`, and returns `Result<()>`. It mutates the filesystem.
+**Data flow**: It receives a path and serializable value → converts the value to pretty JSON bytes → writes the file.
 
-**Call relations**: Called by bundle generation, JSON file filtering, and per-type schema emission.
+**Call relations**: The JSON generator, schema writer, and experimental JSON filter use this whenever they write schema files.
 
 *Call graph*: called by 3 (filter_experimental_json_files, generate_json_with_experimental, write_json_schema_with_return); 2 external calls (write, to_vec_pretty).
 
@@ -4436,11 +4518,11 @@ fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()>
 fn split_namespace(name: &str) -> (Option<&str>, &str)
 ```
 
-**Purpose**: Splits a fully qualified schema name like `v2::Type` into `(namespace, logical_name)`. Names without `::` are treated as unnamespaced.
+**Purpose**: Splits a type name like `v2::ThreadStartParams` into namespace `v2` and logical name `ThreadStartParams`.
 
-**Data flow**: Uses `split_once("::")` on `name` and returns either `(Some(ns), rest)` or `(None, name)`. It is pure.
+**Data flow**: It receives a name string → looks for `::` → returns optional namespace plus the remaining name.
 
-**Call relations**: Called by `write_json_schema_with_return` to decide output paths and bundle namespace placement.
+**Call relations**: Single-schema writing uses this to decide both file location and bundle namespace.
 
 *Call graph*: called by 1 (write_json_schema_with_return).
 
@@ -4451,11 +4533,11 @@ fn split_namespace(name: &str) -> (Option<&str>, &str)
 fn rewrite_refs_to_namespace(value: &mut Value, ns: &str)
 ```
 
-**Purpose**: Recursively rewrites local `#/definitions/...` refs so they point under a specific namespace in the bundled schema. It keeps namespaced schemas internally consistent after insertion.
+**Purpose**: Rewrites local schema references so they point inside a specific namespace. For example, `#/definitions/Foo` becomes `#/definitions/v2/Foo`.
 
-**Data flow**: Traverses a mutable schema `Value`; when it finds a `$ref` string starting with `#/definitions/`, it prefixes the referenced suffix with `{ns}/` unless already namespaced, then recurses into child values and arrays. It mutates the schema in place.
+**Data flow**: It receives a mutable JSON value and namespace → walks all children → updates `$ref` strings that need the namespace prefix.
 
-**Call relations**: Called by `build_schema_bundle` for schemas and nested definitions that belong to a namespace.
+**Call relations**: Schema bundle building calls this for schemas and definitions that belong to a namespace.
 
 *Call graph*: called by 1 (build_schema_bundle); 1 external calls (format!).
 
@@ -4466,11 +4548,11 @@ fn rewrite_refs_to_namespace(value: &mut Value, ns: &str)
 fn rewrite_refs_to_known_namespaces(value: &mut Value, types: &HashMap<String, String>)
 ```
 
-**Purpose**: Retargets bare root-definition refs to the namespace that actually owns the referenced type, based on a precomputed type-to-namespace map. This fixes shared root helpers that refer to namespaced definitions.
+**Purpose**: Rewrites references in shared root schemas when the referenced type is known to live in a namespace. This prevents broken references in mixed root/v2 bundles.
 
-**Data flow**: Traverses a mutable schema `Value`; for each `$ref` under `#/definitions/`, extracts the referenced name and optional tail, looks up the owning namespace with `namespace_for_definition`, and rewrites the ref to `#/definitions/{ns}/{name}{tail}` when a namespace is known. It mutates the schema in place.
+**Data flow**: It receives a mutable JSON value and map of type names to namespaces → walks `$ref` strings → retargets known names to their namespace.
 
-**Call relations**: Called by `build_schema_bundle` for unnamespaced schemas so shared root definitions can still point at namespaced v2 leaf types.
+**Call relations**: Schema bundle building uses this for root schemas that refer to v2 types.
 
 *Call graph*: calls 1 internal fn (namespace_for_definition); called by 1 (build_schema_bundle); 2 external calls (new, format!).
 
@@ -4481,11 +4563,11 @@ fn rewrite_refs_to_known_namespaces(value: &mut Value, types: &HashMap<String, S
 fn collect_namespaced_types(schemas: &[GeneratedSchema]) -> HashMap<String, String>
 ```
 
-**Purpose**: Builds a map from logical type names to the namespace that owns them by inspecting generated schemas and their nested definitions. It informs later `$ref` rewriting decisions.
+**Purpose**: Builds a map from type names to the namespace where they are defined. It includes top-level schemas and nested definitions inside those schemas.
 
-**Data flow**: Iterates `schemas`, and for each namespaced schema inserts its logical name plus any keys found in nested `definitions` or `$defs` into a `HashMap<String, String>` if not already present. Returns the completed map.
+**Data flow**: It receives generated schemas → examines schemas with namespaces → records logical names and nested definition names → returns the map.
 
-**Call relations**: Called by `build_schema_bundle` before ref rewriting. Its output is consumed by `rewrite_refs_to_known_namespaces` and `namespace_for_definition`.
+**Call relations**: Bundle construction uses this map before rewriting references.
 
 *Call graph*: called by 1 (build_schema_bundle); 1 external calls (new).
 
@@ -4499,11 +4581,11 @@ fn namespace_for_definition(
 ) -> Option<&'a String>
 ```
 
-**Purpose**: Looks up which namespace owns a definition name, falling back from numbered generated names to their unnumbered base. It supports ref rewriting and extracted-definition placement.
+**Purpose**: Finds the namespace for a definition name, including generated names with trailing numbers. This helps resolve references after schema generation renames some definitions.
 
-**Data flow**: Checks `types.get(name)` first; if absent, trims trailing ASCII digits and checks the trimmed base name when different. Returns `Option<&String>`.
+**Data flow**: It receives a definition name and type-to-namespace map → checks exact name, then name without trailing digits → returns a namespace if found.
 
-**Call relations**: Used by `build_schema_bundle` and `rewrite_refs_to_known_namespaces` whenever a definition name must be mapped to its namespace.
+**Call relations**: Reference rewriting and bundle placement use this during schema bundling.
 
 *Call graph*: called by 2 (build_schema_bundle, rewrite_refs_to_known_namespaces).
 
@@ -4514,11 +4596,11 @@ fn namespace_for_definition(
 fn variant_definition_name(base: &str, variant: &Value) -> Option<String>
 ```
 
-**Purpose**: Synthesizes a stable title/name for a schema variant based on discriminator literals or single-property shapes. It gives anonymous union arms deterministic names for downstream tooling.
+**Purpose**: Creates a useful schema title for an unnamed variant. It derives names from discriminator fields such as `method` or `type`.
 
-**Data flow**: Inspects a variant schema’s `properties` and `required` arrays, prefers literals from `method` or `type`, otherwise derives from a sole property key, converts the chosen token to PascalCase, and appends a suffix based on the base union type (`Request`, `Notification`, `EventMsg`, etc.). Returns `Option<String>`.
+**Data flow**: It receives a base schema name and variant JSON → looks for fixed properties or single required fields → returns a PascalCase name if it can infer one.
 
-**Call relations**: Called by `annotate_variant_list` when a variant lacks an explicit title. It depends on `literal_from_property`, `string_literal`, and `to_pascal_case`.
+**Call relations**: Variant annotation uses this to give code generators stable model names.
 
 *Call graph*: calls 2 internal fn (literal_from_property, to_pascal_case); called by 1 (annotate_variant_list); 2 external calls (get, format!).
 
@@ -4529,11 +4611,11 @@ fn variant_definition_name(base: &str, variant: &Value) -> Option<String>
 fn literal_from_property(props: &'a Map<String, Value>, key: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Extracts a string literal discriminator from a named property schema. It is a tiny convenience wrapper around `string_literal`.
+**Purpose**: Gets a fixed string value from a named property schema. A fixed value may be stored as `const` or a one-value `enum`.
 
-**Data flow**: Looks up `props[key]` and passes the value to `string_literal`, returning `Option<&str>`. It is pure.
+**Data flow**: It receives a properties map and key → finds the property schema → returns its string literal if present.
 
-**Call relations**: Used by `variant_definition_name` and `variant_title_collision_key` when inspecting discriminator properties.
+**Call relations**: Variant naming and collision reporting use this to read discriminator values.
 
 *Call graph*: called by 2 (variant_definition_name, variant_title_collision_key); 1 external calls (get).
 
@@ -4544,11 +4626,11 @@ fn literal_from_property(props: &'a Map<String, Value>, key: &str) -> Option<&'a
 fn string_literal(value: &Value) -> Option<&str>
 ```
 
-**Purpose**: Extracts a string literal from a schema encoded either as `const: "..."` or as a one-element `enum`. It normalizes the two common discriminator encodings.
+**Purpose**: Extracts a fixed string from a schema value, whether represented as `const` or as the first value of an `enum`.
 
-**Data flow**: Reads `value["const"]` as a string if present, otherwise reads the first string element of `value["enum"]`. Returns `Option<&str>` without mutation.
+**Data flow**: It receives a schema value → checks `const`, then `enum` → returns the string if found.
 
-**Call relations**: Used by method-variant detection, discriminator-title generation, and variant naming/collision diagnostics.
+**Call relations**: Method filtering, variant naming diagnostics, and discriminator title generation all use this helper.
 
 *Call graph*: called by 3 (is_method_variant_in_set, set_discriminator_titles, variant_title_collision_key); 1 external calls (get).
 
@@ -4559,11 +4641,11 @@ fn string_literal(value: &Value) -> Option<&str>
 fn annotate_schema(value: &mut Value, base: Option<&str>)
 ```
 
-**Purpose**: Recursively annotates a schema tree with generated titles for variants and discriminator properties. It improves downstream code generation and schema readability.
+**Purpose**: Adds helpful titles to schema variants and discriminator properties throughout a JSON Schema value. These titles make generated models more stable and readable.
 
-**Data flow**: Matches on `Value`; for objects it delegates to `annotate_object`, for arrays it recurses into each item, and scalars are ignored. It mutates the schema in place.
+**Data flow**: It receives a mutable JSON value and optional base name → recurses through objects and arrays → inserts missing titles where it can.
 
-**Call relations**: Called during per-type schema generation and bundle assembly, and recursively by `annotate_object` and `annotate_variant_list`.
+**Call relations**: Schema writing and bundle construction call this before schemas are written or merged.
 
 *Call graph*: calls 1 internal fn (annotate_object); called by 4 (annotate_object, annotate_variant_list, build_schema_bundle, write_json_schema_with_return).
 
@@ -4574,11 +4656,11 @@ fn annotate_schema(value: &mut Value, base: Option<&str>)
 fn annotate_object(map: &mut Map<String, Value>, base: Option<&str>)
 ```
 
-**Purpose**: Annotates one schema object by setting discriminator-property titles, naming variants in `oneOf`/`anyOf`, and recursing through nested schema-bearing fields. It is the object-specific worker for schema annotation.
+**Purpose**: Annotates one JSON object schema by naming variants, discriminator properties, nested definitions, properties, and child schemas.
 
-**Data flow**: Reads the object’s `title` to title discriminator properties in `properties`, annotates `oneOf` and `anyOf` arrays via `annotate_variant_list`, recurses into nested `definitions`, `$defs`, `properties`, `items`, `additionalProperties`, and all other child values except those already handled. It mutates the object in place.
+**Data flow**: It receives a mutable JSON object and optional base name → updates relevant child schema sections → recurses into remaining schema content.
 
-**Call relations**: Called by `annotate_schema`. It delegates variant naming to `annotate_variant_list` and discriminator-property titling to `set_discriminator_titles`.
+**Call relations**: This is the object-specific worker behind `annotate_schema`.
 
 *Call graph*: calls 3 internal fn (annotate_schema, annotate_variant_list, set_discriminator_titles); called by 1 (annotate_schema); 3 external calls (get, get_mut, iter_mut).
 
@@ -4589,11 +4671,11 @@ fn annotate_object(map: &mut Map<String, Value>, base: Option<&str>)
 fn annotate_variant_list(variants: &mut [Value], base: Option<&str>)
 ```
 
-**Purpose**: Ensures each schema variant in a union has a stable title and titled discriminator properties, while detecting generated-name collisions. It is central to producing deterministic union schemas.
+**Purpose**: Adds titles to variants in `oneOf` or `anyOf` lists when they do not already have one. It also guards against generated title collisions.
 
-**Data flow**: Scans existing variant titles into a `HashSet`, then for each variant either keeps its title or generates one from `variant_definition_name`, panicking on collisions detected via `variant_title_collision_key`, inserts the generated title into the variant object, titles discriminator properties if present, and recursively annotates the variant schema. It mutates the variant list in place.
+**Data flow**: It receives a mutable list of variants and optional base name → tracks existing titles → generates missing names → sets discriminator property titles → annotates each variant recursively.
 
-**Call relations**: Called by `annotate_object` for both `oneOf` and `anyOf` arrays. It depends on `variant_title`, `variant_definition_name`, `variant_title_collision_key`, `set_discriminator_titles`, and `annotate_schema`.
+**Call relations**: Object annotation calls this for union-like schema sections.
 
 *Call graph*: calls 5 internal fn (annotate_schema, set_discriminator_titles, variant_definition_name, variant_title, variant_title_collision_key); called by 1 (annotate_object); 5 external calls (new, String, iter, iter_mut, panic!).
 
@@ -4604,11 +4686,11 @@ fn annotate_variant_list(variants: &mut [Value], base: Option<&str>)
 fn variant_title_collision_key(base: &str, generated_name: &str, variant: &Value) -> String
 ```
 
-**Purpose**: Builds a detailed diagnostic string describing the shape of a variant whose generated title collides with another. It makes panic messages actionable when naming heuristics are ambiguous.
+**Purpose**: Builds a detailed text key explaining why two schema variants would receive the same generated title. This makes panic messages actionable.
 
-**Data flow**: Starts with `base` and `generated` fields, then inspects discriminator literals and other literal-valued properties, sole-property shapes, and single required keys to append identifying fragments; if nothing descriptive is found, includes the full variant JSON. Returns the assembled `String`.
+**Data flow**: It receives the base name, generated name, and variant → gathers discriminator and literal clues → returns a joined diagnostic string.
 
-**Call relations**: Called by `annotate_variant_list` only when a generated variant title would collide with an existing one.
+**Call relations**: Variant annotation calls this only when it detects a naming collision.
 
 *Call graph*: calls 2 internal fn (literal_from_property, string_literal); called by 1 (annotate_variant_list); 3 external calls (get, format!, vec!).
 
@@ -4619,11 +4701,11 @@ fn variant_title_collision_key(base: &str, generated_name: &str, variant: &Value
 fn set_discriminator_titles(props: &mut Map<String, Value>, owner: &str)
 ```
 
-**Purpose**: Adds `title` fields to discriminator property schemas like `method`, `type`, or `status` when they have string literals and no title yet. This improves generated model names for downstream tools.
+**Purpose**: Adds titles to fixed discriminator properties such as `method`, `type`, or `status`. This helps code generators create better names for those literal fields.
 
-**Data flow**: Iterates the fixed `DISCRIMINATOR_KEYS`, and for each matching property whose schema has a string literal and lacks `title`, inserts `"{owner}{PascalKey}"` into that property object. It mutates the properties map in place.
+**Data flow**: It receives a properties map and owner name → finds fixed literal discriminator properties → inserts a title if one is missing.
 
-**Call relations**: Called by `annotate_object` and `annotate_variant_list` after determining the owning schema or variant name.
+**Call relations**: Object and variant annotation call this after identifying the schema owner.
 
 *Call graph*: calls 2 internal fn (string_literal, to_pascal_case); called by 2 (annotate_object, annotate_variant_list); 3 external calls (get_mut, String, format!).
 
@@ -4634,11 +4716,11 @@ fn set_discriminator_titles(props: &mut Map<String, Value>, owner: &str)
 fn variant_title(value: &Value) -> Option<&str>
 ```
 
-**Purpose**: Returns the explicit `title` of a schema variant if present. It is a small accessor used during annotation.
+**Purpose**: Reads the `title` field from a schema variant if it has one.
 
-**Data flow**: Reads the value as an object and then `obj["title"]` as a string, returning `Option<&str>`. It is pure.
+**Data flow**: It receives a JSON value → checks whether it is an object with a string `title` → returns that title if present.
 
-**Call relations**: Used by `annotate_variant_list` to preserve existing titles and seed the collision-detection set.
+**Call relations**: Variant annotation uses this to avoid renaming variants that already have explicit titles.
 
 *Call graph*: called by 1 (annotate_variant_list); 1 external calls (as_object).
 
@@ -4649,11 +4731,11 @@ fn variant_title(value: &Value) -> Option<&str>
 fn to_pascal_case(input: &str) -> String
 ```
 
-**Purpose**: Converts strings with underscores or hyphens into PascalCase. It is used to derive schema and discriminator titles from method/type literals.
+**Purpose**: Converts names like `thread-start` or `thread_start` into `ThreadStart`. This produces Rust- and TypeScript-style type names.
 
-**Data flow**: Iterates input characters, uppercasing the next character after `_` or `-` separators and otherwise appending characters as-is. Returns the transformed `String`.
+**Data flow**: It receives text → capitalizes the first letter after separators → skips `_` and `-` → returns the converted string.
 
-**Call relations**: Used by `variant_definition_name` and `set_discriminator_titles` when synthesizing stable schema titles.
+**Call relations**: Variant and discriminator title generation use this when turning protocol method names into model names.
 
 *Call graph*: called by 2 (set_discriminator_titles, variant_definition_name); 1 external calls (new).
 
@@ -4664,11 +4746,11 @@ fn to_pascal_case(input: &str) -> String
 fn ensure_dir(dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Creates an output directory tree with contextualized errors. It is the common directory-preparation helper for export routines.
+**Purpose**: Creates an output directory and any missing parent directories. It adds context to errors so failures say which directory could not be created.
 
-**Data flow**: Calls `fs::create_dir_all(dir)` and returns `Result<()>`, adding the directory path to any error message. It mutates the filesystem by creating directories as needed.
+**Data flow**: It receives a directory path → calls the filesystem to create it → returns success or an error.
 
-**Call relations**: Called by TS generation, JSON generation, internal schema generation, and per-type schema emission before writing files.
+**Call relations**: All disk-writing generation paths use this before writing into an output folder.
 
 *Call graph*: called by 4 (generate_internal_json_schema, generate_json_with_experimental, generate_ts_with_options, write_json_schema_with_return); 1 external calls (create_dir_all).
 
@@ -4679,11 +4761,11 @@ fn ensure_dir(dir: &Path) -> Result<()>
 fn rewrite_named_ref_to_namespace(value: &mut Value, ns: &str, name: &str)
 ```
 
-**Purpose**: Rewrites refs to one specific definition name so they point into a target namespace, preserving any trailing JSON Pointer path. It fixes extracted-definition refs after bundle placement decisions are made.
+**Purpose**: Rewrites references to one named definition so they point into a namespace. It handles both direct references and references to subpaths under that definition.
 
-**Data flow**: Traverses a mutable schema `Value`; when it finds a `$ref` equal to `#/definitions/{name}` or prefixed by that path plus `/`, it rewrites it to `#/definitions/{ns}/{name}` with the same suffix, then recurses into child values and arrays. It mutates the tree in place.
+**Data flow**: It receives a mutable JSON value, namespace, and name → walks all children → replaces matching `$ref` strings.
 
-**Call relations**: Called by `build_schema_bundle` for definitions that were extracted from one schema but ultimately inserted into a namespace different from the containing schema.
+**Call relations**: Bundle construction uses this when a root schema had a nested definition that was forced into a namespace.
 
 *Call graph*: called by 1 (build_schema_bundle); 1 external calls (format!).
 
@@ -4694,11 +4776,11 @@ fn rewrite_named_ref_to_namespace(value: &mut Value, ns: &str, name: &str)
 fn prepend_header_if_missing(path: &Path) -> Result<()>
 ```
 
-**Purpose**: Ensures a generated TypeScript file begins with the standard generated-code header comment. It avoids duplicating the header when already present.
+**Purpose**: Adds the generated-code warning header to a TypeScript file if it is not already present.
 
-**Data flow**: Opens `path`, reads the full file into a string, returns early if it already starts with `GENERATED_TS_HEADER`, otherwise recreates the file and writes the header followed by the original content. Returns `Result<()>` and mutates the file on disk.
+**Data flow**: It receives a file path → reads the file → if the header is missing, rewrites the file with the header followed by original content.
 
-**Call relations**: Called in parallel worker threads by `generate_ts_with_options` when `ensure_headers` is enabled.
+**Call relations**: The TypeScript generator runs this over generated files, in parallel, before formatting.
 
 *Call graph*: 3 external calls (new, create, open).
 
@@ -4709,11 +4791,11 @@ fn prepend_header_if_missing(path: &Path) -> Result<()>
 fn ts_files_in(dir: &Path) -> Result<Vec<PathBuf>>
 ```
 
-**Purpose**: Lists `.ts` files directly inside one directory, sorted by path. It is used for index generation.
+**Purpose**: Lists TypeScript files directly inside one directory, without descending into subdirectories.
 
-**Data flow**: Reads directory entries from `dir`, collects paths that are files with extension `ts`, sorts the vector, and returns it. It does not recurse.
+**Data flow**: It receives a directory path → reads entries → keeps files ending in `.ts` → sorts and returns the paths.
 
-**Call relations**: Called by `generate_index_ts` to gather root-level and `v2`-level TypeScript files for re-export generation.
+**Call relations**: Index-file generation uses this to know what files to re-export.
 
 *Call graph*: called by 1 (generate_index_ts); 3 external calls (new, new, read_dir).
 
@@ -4724,11 +4806,11 @@ fn ts_files_in(dir: &Path) -> Result<Vec<PathBuf>>
 fn ts_files_in_recursive(dir: &Path) -> Result<Vec<PathBuf>>
 ```
 
-**Purpose**: Recursively enumerates all `.ts` files under a directory tree, sorted by path. It supports header insertion, whitespace cleanup, and field filtering.
+**Purpose**: Lists all TypeScript files under a directory and its subdirectories.
 
-**Data flow**: Uses a directory stack starting at `dir`, pushes subdirectories, collects file paths whose extension is `ts`, sorts the final vector, and returns it. It does not mutate files.
+**Data flow**: It receives a directory path → walks folders with a stack → collects `.ts` files → sorts and returns them.
 
-**Call relations**: Called by `generate_ts_with_options` and `filter_experimental_type_fields_ts`.
+**Call relations**: The TypeScript generator uses this for headers, formatting, and whitespace cleanup; experimental field filtering also uses it.
 
 *Call graph*: called by 2 (filter_experimental_type_fields_ts, generate_ts_with_options); 4 external calls (new, new, read_dir, vec!).
 
@@ -4739,11 +4821,11 @@ fn ts_files_in_recursive(dir: &Path) -> Result<Vec<PathBuf>>
 fn trim_trailing_whitespace_in_ts_files(paths: &[PathBuf]) -> Result<()>
 ```
 
-**Purpose**: Normalizes generated TypeScript files by removing trailing spaces and tabs from each line. It is a final cleanup pass after generation and optional formatting.
+**Purpose**: Removes trailing spaces and tabs from generated TypeScript files. This keeps generated output clean and stable in version control.
 
-**Data flow**: For each path in `paths`, reads the file content, computes a trimmed version with `trim_trailing_line_whitespace`, and rewrites the file only if the content changed. Returns `Result<()>` and mutates files as needed.
+**Data flow**: It receives a list of paths → reads each file → trims trailing line whitespace → writes back only if changed.
 
-**Call relations**: Called by `generate_ts_with_options` after header insertion and optional Prettier execution.
+**Call relations**: The TypeScript generator runs this as its final cleanup step.
 
 *Call graph*: calls 1 internal fn (trim_trailing_line_whitespace); called by 1 (generate_ts_with_options); 2 external calls (read_to_string, write).
 
@@ -4754,11 +4836,11 @@ fn trim_trailing_whitespace_in_ts_files(paths: &[PathBuf]) -> Result<()>
 fn trim_trailing_line_whitespace(content: &str) -> String
 ```
 
-**Purpose**: Removes trailing spaces and tabs from every line of a string while preserving newline structure. It is the pure text transformer behind TS whitespace cleanup.
+**Purpose**: Removes spaces and tabs at the end of each line while preserving line breaks. It works on text already loaded in memory.
 
-**Data flow**: Allocates an output string with the input capacity, iterates lines using `split_inclusive('\n')`, trims trailing spaces/tabs from each line body, preserves newline characters, and returns the cleaned `String`.
+**Data flow**: It receives text → processes each line → returns cleaned text.
 
-**Call relations**: Used by `trim_trailing_whitespace_in_ts_files` and by test fixture generation helpers.
+**Call relations**: File cleanup and schema fixture generation use this shared text helper.
 
 *Call graph*: called by 2 (trim_trailing_whitespace_in_ts_files, generate_typescript_schema_fixture_subtree_for_tests); 1 external calls (with_capacity).
 
@@ -4769,11 +4851,11 @@ fn trim_trailing_line_whitespace(content: &str) -> String
 fn generate_index_ts(out_dir: &Path) -> Result<PathBuf>
 ```
 
-**Purpose**: Writes an `index.ts` file that re-exports all generated root-level types and optionally the `v2` namespace. It gives consumers a single import surface.
+**Purpose**: Writes an `index.ts` file that re-exports generated TypeScript types from one directory. This gives consumers a single import point.
 
-**Data flow**: Collects root `.ts` files and checks whether `out_dir/v2` contains any non-index TS files, builds export lines with `index_ts_entries`, prepends the generated header with `generated_index_ts_with_header`, writes the result to `out_dir/index.ts`, and returns the index path.
+**Data flow**: It receives an output directory → lists TypeScript files there and checks for v2 files → builds index content with a header → writes `index.ts`.
 
-**Call relations**: Called by `generate_ts_with_options` for both the root output directory and the `v2` subdirectory.
+**Call relations**: The TypeScript generator calls this for the root output and the `v2` subdirectory.
 
 *Call graph*: calls 3 internal fn (generated_index_ts_with_header, index_ts_entries, ts_files_in); called by 1 (generate_ts_with_options); 2 external calls (join, create).
 
@@ -4784,11 +4866,11 @@ fn generate_index_ts(out_dir: &Path) -> Result<PathBuf>
 fn generate_index_ts_tree(tree: &mut BTreeMap<PathBuf, String>)
 ```
 
-**Purpose**: Generates `index.ts` entries inside an in-memory TypeScript fixture tree rather than on disk. It mirrors `generate_index_ts` for tests.
+**Purpose**: Adds `index.ts` files to an in-memory TypeScript file tree. It mirrors disk index generation for fixture creation.
 
-**Data flow**: Scans `tree` keys to collect root-level entries and detect whether `v2` contains TS files, inserts a root `index.ts` entry built by `index_ts_entries`, then collects `v2` entries and inserts `v2/index.ts` when applicable. It mutates the `BTreeMap<PathBuf, String>` in place.
+**Data flow**: It receives a map of paths to contents → computes root and v2 export entries → inserts index files into the map.
 
-**Call relations**: Called by `generate_typescript_schema_fixture_subtree_for_tests` during fixture assembly.
+**Call relations**: Schema fixture generation uses this before comparing in-memory generated TypeScript output.
 
 *Call graph*: calls 1 internal fn (index_ts_entries); called by 1 (generate_typescript_schema_fixture_subtree_for_tests); 1 external calls (from).
 
@@ -4799,11 +4881,11 @@ fn generate_index_ts_tree(tree: &mut BTreeMap<PathBuf, String>)
 fn generated_index_ts_with_header(content: String) -> String
 ```
 
-**Purpose**: Prepends the standard generated-code header to already-built index content. It is a tiny helper for index file emission.
+**Purpose**: Prepends the generated-code warning header to index file content.
 
-**Data flow**: Allocates a string large enough for the header plus content, appends `GENERATED_TS_HEADER`, then appends `content`, and returns the combined `String`.
+**Data flow**: It receives index body text → allocates space for header plus body → returns the combined string.
 
-**Call relations**: Called by `generate_index_ts` before writing the on-disk index file.
+**Call relations**: Disk index generation uses this before writing `index.ts`.
 
 *Call graph*: called by 1 (generate_index_ts); 1 external calls (with_capacity).
 
@@ -4814,11 +4896,11 @@ fn generated_index_ts_with_header(content: String) -> String
 fn index_ts_entries(paths: &[&Path], has_v2_ts: bool) -> String
 ```
 
-**Purpose**: Builds the body of an `index.ts` file by emitting sorted `export type { Name } from "./Name";` lines for generated TS files, excluding `index` and `EventMsg`, and optionally adding a `v2` namespace export. It is the pure formatter behind index generation.
+**Purpose**: Builds the export lines for a TypeScript index file. It skips the index file itself and one special `EventMsg` type.
 
-**Data flow**: Takes a slice of paths and a `has_v2_ts` flag, extracts unique file stems for `.ts` files excluding `index` and `EventMsg`, sorts and deduplicates them, formats one export line per stem, and appends `export * as v2 from "./v2";` when requested. Returns the assembled `String`.
+**Data flow**: It receives TypeScript paths and a flag for whether v2 exists → extracts unique file stems → writes `export type` lines and optionally a `v2` namespace export → returns the text.
 
-**Call relations**: Used by both `generate_index_ts` and `generate_index_ts_tree`.
+**Call relations**: Both disk and in-memory index generation use this to produce consistent index contents.
 
 *Call graph*: called by 2 (generate_index_ts, generate_index_ts_tree); 3 external calls (iter, new, format!).
 
@@ -4829,11 +4911,11 @@ fn index_ts_entries(paths: &[&Path], has_v2_ts: bool) -> String
 fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()>
 ```
 
-**Purpose**: Validates the checked-in TypeScript fixture tree for several stable-export invariants, especially that optional nullable fields (`?: T | null`) appear only in approved parameter-like types and that experimental entries are absent. It is a broad regression test over generated TS output.
+**Purpose**: Checks generated TypeScript fixtures for important public-shape rules: no experimental API in stable output, no `undefined` unions, and optional nullable fields only where allowed.
 
-**Data flow**: Loads the vendored TypeScript fixture subtree, inspects specific files and tree membership for expected inclusions/exclusions, then scans every `.ts` file for `| undefined` and disallowed `?: ... | null` patterns using custom line/segment parsing logic, collecting offenders and asserting both offender sets are empty. It reads fixture files but does not mutate them.
+**Data flow**: It reads fixture files → searches their text for forbidden patterns and missing removals → fails the test with detailed offending locations if rules are broken.
 
-**Call relations**: This test exercises the end-to-end effects of TS generation and filtering indirectly through checked-in fixtures. It depends on `schema_root` and `read_schema_fixture_subtree` rather than calling generation functions directly.
+**Call relations**: This test protects the TypeScript export pipeline and experimental filtering behavior.
 
 *Call graph*: calls 1 internal fn (read_schema_fixture_subtree); 9 external calls (new, new, new, schema_root, assert!, assert_eq!, format!, matches!, from_utf8).
 
@@ -4844,11 +4926,11 @@ fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()>
 fn schema_root() -> Result<PathBuf>
 ```
 
-**Purpose**: Resolves the root directory of vendored schema fixtures from a known fixture file path. It is a small test helper for locating checked-in schema assets.
+**Purpose**: Finds the root directory that contains schema fixtures for tests.
 
-**Data flow**: Uses `find_resource!` to locate `schema/typescript/index.ts`, walks up two parent directories, and returns the resulting `PathBuf`. It returns an error if resource resolution or parent derivation fails.
+**Data flow**: It locates the known TypeScript fixture resource → moves up to the schema root directory → returns that path.
 
-**Call relations**: Called by `generated_ts_optional_nullable_fields_only_in_params` to locate the fixture tree.
+**Call relations**: The TypeScript fixture test calls this before reading fixture files.
 
 *Call graph*: 1 external calls (find_resource!).
 
@@ -4859,11 +4941,11 @@ fn schema_root() -> Result<PathBuf>
 fn generate_ts_with_experimental_api_retains_experimental_entries() -> Result<()>
 ```
 
-**Purpose**: Checks that raw TS export paths still include experimental methods and fields when experimental filtering is not applied. It verifies the positive case opposite the stable-export tests.
+**Purpose**: Verifies that raw TypeScript export still contains experimental methods and fields when experimental filtering is not applied.
 
-**Data flow**: Calls `export_to_string()` on `ClientRequest`, `v2::MockExperimentalMethodParams`, `v2::MockExperimentalMethodResponse`, `v2::ThreadStartParams`, and `v2::CommandExecutionRequestApprovalParams`, then asserts that experimental method names and field names are present in the generated strings. It performs no filesystem writes.
+**Data flow**: It exports selected types to strings → checks for experimental method, parameter, response, and field names → returns success if they are present.
 
-**Call relations**: This test validates the unfiltered generation behavior that precedes `filter_experimental_ts` in stable exports.
+**Call relations**: This test confirms that filtering, not the base exporter, is responsible for hiding experimental API.
 
 *Call graph*: 4 external calls (export_to_string, export_to_string, export_to_string, assert_eq!).
 
@@ -4874,11 +4956,11 @@ fn generate_ts_with_experimental_api_retains_experimental_entries() -> Result<()
 fn stable_schema_filter_removes_mock_thread_start_field() -> Result<()>
 ```
 
-**Purpose**: Verifies that bundle-level experimental schema filtering removes a known experimental field from `ThreadStartParams`. It is a focused regression test for field pruning in JSON bundles.
+**Purpose**: Checks that the stable JSON schema filter removes an experimental field from `ThreadStartParams`.
 
-**Data flow**: Creates a temp output dir, emits a schema for `v2::ThreadStartParams`, builds a bundle from that single schema, applies `filter_experimental_schema`, locates the matching definition, inspects its `properties`, and asserts `mockExperimentalField` is absent. It cleans up the temp directory afterward.
+**Data flow**: It writes a temporary schema → bundles it → applies the experimental filter → inspects the resulting definition → asserts the experimental property is gone.
 
-**Call relations**: This test directly exercises `build_schema_bundle` plus `filter_experimental_schema` on a minimal input.
+**Call relations**: This directly exercises schema bundling plus field filtering.
 
 *Call graph*: calls 2 internal fn (build_schema_bundle, filter_experimental_schema); 6 external calls (assert_eq!, format!, create_dir, remove_dir_all, temp_dir, vec!).
 
@@ -4889,11 +4971,11 @@ fn stable_schema_filter_removes_mock_thread_start_field() -> Result<()>
 fn build_schema_bundle_rewrites_root_helper_refs_to_namespaced_defs() -> Result<()>
 ```
 
-**Purpose**: Checks that `build_schema_bundle` rewrites refs inside unnamespaced helper schemas so they point at namespaced v2 definitions when appropriate. It protects against dangling root refs in mixed bundles.
+**Purpose**: Verifies that bundle construction rewrites references from shared root helper schemas to v2 definitions when needed.
 
-**Data flow**: Constructs several synthetic `GeneratedSchema` values in memory, including an unnamespaced helper with refs to `ThreadId`, `MessagePhase`, and `UserInput`, builds a bundle, and asserts the resulting `$ref` strings point to `#/definitions/v2/...` where expected while preserving local helper refs. It mutates only local test data.
+**Data flow**: It builds a small artificial set of schemas → bundles them → checks that references to `ThreadId`, `MessagePhase`, and `UserInput` point into `definitions.v2`.
 
-**Call relations**: This test targets the `rewrite_refs_to_known_namespaces` path inside `build_schema_bundle`.
+**Call relations**: This protects the reference-rewriting logic used by the JSON bundle generator.
 
 *Call graph*: calls 1 internal fn (build_schema_bundle); 2 external calls (assert_eq!, vec!).
 
@@ -4904,11 +4986,11 @@ fn build_schema_bundle_rewrites_root_helper_refs_to_namespaced_defs() -> Result<
 fn build_flat_v2_schema_keeps_shared_root_schemas_and_dependencies() -> Result<()>
 ```
 
-**Purpose**: Verifies that flat-v2 bundle generation preserves shared root unions and pulls in their non-v2 dependencies while removing the nested `v2` namespace. It protects the downstream-codegen compatibility path.
+**Purpose**: Checks that the flat v2 bundle includes v2 definitions plus shared root request/notification schemas and their dependencies.
 
-**Data flow**: Builds a synthetic mixed bundle JSON value, calls `build_flat_v2_schema`, inspects the resulting title, definitions membership, retained union variant titles, and absence of `#/definitions/v2/` refs, and asserts all expected shared and dependent definitions remain present. It uses only in-memory values.
+**Data flow**: It creates an artificial full bundle → flattens it → inspects titles, included definitions, kept variants, and absence of `#/definitions/v2/` references.
 
-**Call relations**: This test directly exercises `build_flat_v2_schema` and its dependency-collection/ref-rewrite logic.
+**Call relations**: This test protects the flat v2 schema path used for downstream Python-style code generation.
 
 *Call graph*: calls 1 internal fn (build_flat_v2_schema); 2 external calls (assert_eq!, json!).
 
@@ -4919,11 +5001,11 @@ fn build_flat_v2_schema_keeps_shared_root_schemas_and_dependencies() -> Result<(
 fn experimental_type_fields_ts_filter_handles_interface_shape() -> Result<()>
 ```
 
-**Purpose**: Checks that TS field filtering can remove an experimental property from an `export interface` declaration, not just type aliases. It covers one parser shape handled by `type_body_brace_span`.
+**Purpose**: Verifies that TypeScript experimental field filtering works on `export interface` files, not only type aliases.
 
-**Data flow**: Creates a temp directory and writes `CustomParams.ts` containing an interface with stable and unstable fields, defines a synthetic `ExperimentalField`, runs `filter_experimental_type_fields_ts`, reads the file back, and asserts the unstable field is gone while stable fields remain. It cleans up via a drop guard.
+**Data flow**: It writes a sample interface file → filters one experimental field → reads the result → checks that only the unstable field was removed.
 
-**Call relations**: This test directly exercises `filter_experimental_type_fields_ts` and the interface branch of `filter_experimental_type_fields_ts_contents`.
+**Call relations**: This test directly exercises the TypeScript field filter on an interface-shaped file.
 
 *Call graph*: calls 1 internal fn (filter_experimental_type_fields_ts); 6 external calls (assert_eq!, format!, create_dir_all, read_to_string, write, temp_dir).
 
@@ -4934,11 +5016,11 @@ fn experimental_type_fields_ts_filter_handles_interface_shape() -> Result<()>
 fn experimental_type_fields_ts_filter_keeps_imports_used_in_intersection_suffix() -> Result<()>
 ```
 
-**Purpose**: Checks that TS field filtering does not over-prune imports still referenced outside the main object body, such as in an intersection suffix. It protects a subtle import-usage-scope edge case.
+**Purpose**: Checks that filtering a TypeScript field does not remove imports still used after the main object body, such as in an intersection type suffix.
 
-**Data flow**: Writes a temp `Config.ts` containing imports and a type alias with an object body intersected with another type expression, removes one experimental field via `filter_experimental_type_fields_ts`, then asserts the unstable field is gone but both `JsonValue` and `Keep` imports remain. It mutates only temp files.
+**Data flow**: It writes a sample type with imports and an intersection suffix → removes one field → reads the result → asserts needed imports remain.
 
-**Call relations**: This test targets the `import_usage_scope` logic in `filter_experimental_type_fields_ts_contents` and `prune_unused_type_imports`.
+**Call relations**: This protects the unused-import pruning logic from being too aggressive.
 
 *Call graph*: calls 1 internal fn (filter_experimental_type_fields_ts); 6 external calls (assert_eq!, format!, create_dir_all, read_to_string, write, temp_dir).
 
@@ -4949,11 +5031,11 @@ fn experimental_type_fields_ts_filter_keeps_imports_used_in_intersection_suffix(
 fn experimental_type_fields_ts_filter_handles_generated_command_params_shape() -> Result<()>
 ```
 
-**Purpose**: Checks that TS field filtering handles generated command-params formatting with embedded comments and preserves unrelated imports. It covers a realistic generated-file shape.
+**Purpose**: Verifies that the TypeScript field filter handles the comment-heavy shape produced for generated command parameter types.
 
-**Data flow**: Writes a temp `CommandExecParams.ts` file containing commented fields and imports, defines `permissionProfile` as experimental, runs `filter_experimental_type_fields_ts`, reads the file back, and asserts the target field is removed while `sandboxPolicy` and its import remain. It uses temp files only.
+**Data flow**: It writes a realistic generated type file → removes one experimental field → checks that the neighboring stable field and needed import remain.
 
-**Call relations**: This test exercises comment stripping and property parsing in `filter_experimental_type_fields_ts_contents`.
+**Call relations**: This guards the top-level field splitter and comment handling used in stable TypeScript exports.
 
 *Call graph*: calls 1 internal fn (filter_experimental_type_fields_ts); 6 external calls (assert_eq!, format!, create_dir_all, read_to_string, write, temp_dir).
 
@@ -4964,11 +5046,11 @@ fn experimental_type_fields_ts_filter_handles_generated_command_params_shape() -
 fn stable_schema_filter_removes_mock_experimental_method() -> Result<()>
 ```
 
-**Purpose**: Verifies that bundle-level experimental filtering removes a known experimental client method from `ClientRequest`. It is a focused regression test for method pruning.
+**Purpose**: Checks that the stable JSON schema filter removes an experimental client method from `ClientRequest`.
 
-**Data flow**: Creates a temp directory, emits a `ClientRequest` schema, builds a bundle, applies `filter_experimental_schema`, serializes the bundle to a string, and asserts the experimental method name is absent. It removes the temp directory afterward.
+**Data flow**: It writes and bundles a `ClientRequest` schema → filters it → serializes the bundle → asserts the experimental method string is absent.
 
-**Call relations**: This test directly exercises `build_schema_bundle` plus `filter_experimental_schema` on a request-union schema.
+**Call relations**: This directly tests method pruning in the JSON schema filter.
 
 *Call graph*: calls 2 internal fn (build_schema_bundle, filter_experimental_schema); 7 external calls (assert_eq!, format!, create_dir, remove_dir_all, to_string, temp_dir, vec!).
 
@@ -4979,11 +5061,11 @@ fn stable_schema_filter_removes_mock_experimental_method() -> Result<()>
 fn generate_json_filters_experimental_fields_and_methods() -> Result<()>
 ```
 
-**Purpose**: Runs end-to-end stable JSON generation and asserts that experimental fields, methods, and dependent type files are absent from both individual schemas and bundled outputs. It is the broad regression test for stable JSON export.
+**Purpose**: Runs the JSON generator in stable mode and verifies that experimental fields, methods, type files, and v2 namespace references are absent from outputs.
 
-**Data flow**: Creates a temp output dir, calls `generate_json_with_experimental(..., false)`, reads multiple generated files and bundles, checks for absence of experimental strings and files, validates flat-v2 bundle title and lack of namespaced refs, inspects retained `ClientRequest` and `ServerNotification` method sets, and cleans up the temp directory. It performs real filesystem generation and reads.
+**Data flow**: It generates schemas into a temporary directory → reads individual and bundled files → checks removed experimental content and required stable methods → validates the flat v2 bundle shape.
 
-**Call relations**: This test exercises the full stable JSON pipeline, including per-type emission, bundle building, experimental filtering, flat-v2 generation, and file deletion.
+**Call relations**: This is the broad end-to-end test for stable JSON schema generation.
 
 *Call graph*: calls 2 internal fn (generate_json_with_experimental, read_json_value); 6 external calls (assert_eq!, format!, create_dir, read_to_string, remove_dir_all, temp_dir).
 
@@ -4994,24 +5076,26 @@ fn generate_json_filters_experimental_fields_and_methods() -> Result<()>
 fn generate_json_includes_remote_control_methods_with_experimental_api() -> Result<()>
 ```
 
-**Purpose**: Verifies that enabling experimental API generation retains remote-control methods and their schema files. It is the positive counterpart to stable JSON filtering tests.
+**Purpose**: Verifies that experimental remote-control methods and schemas are included when JSON generation is explicitly run with experimental API enabled.
 
-**Data flow**: Creates a temp output dir, calls `generate_json_with_experimental(..., true)`, reads `ClientRequest.json`, asserts remote-control method names are present, and checks that the corresponding v2 schema files exist. It removes the temp directory afterward.
+**Data flow**: It generates schemas with the experimental flag on → reads `ClientRequest.json` and checks method names → checks that related v2 schema files exist.
 
-**Call relations**: This test directly exercises the experimental-enabled branch of `generate_json_with_experimental`, confirming that filtering is skipped.
+**Call relations**: This complements the stable filtering test by proving the opt-in experimental path keeps those APIs.
 
 *Call graph*: calls 1 internal fn (generate_json_with_experimental); 6 external calls (assert!, format!, create_dir, read_to_string, remove_dir_all, temp_dir).
 
 
 ### `app-server-protocol/src/schema_fixtures.rs`
 
-`util` · `schema generation, fixture comparison, and test support`
+`orchestration` · `schema generation and fixture tests`
 
-This file supports schema fixture testing and regeneration. At the top level, `read_schema_fixture_tree` and `read_schema_fixture_subtree` load vendored fixture files from `schema/typescript` and `schema/json`, returning a `BTreeMap<PathBuf, Vec<u8>>` keyed by relative path for deterministic comparison. File reads are normalized by `read_file_bytes`: JSON files are parsed, recursively canonicalized, and pretty-serialized so object key order and many schema-array orderings become stable across platforms; TypeScript files have CRLF normalized and the standard generated banner stripped so fixture diffs focus on schema content rather than boilerplate.
+This file is a bridge between the protocol types in Rust and the schema files stored on disk. In everyday terms, it keeps the project's “official copies” of the protocol documents tidy and comparable. Without it, tests could fail just because Windows used different line endings, JSON object keys appeared in a different order, or old generated files were left behind.
 
-Generation flows split in two. `generate_typescript_schema_fixture_subtree_for_tests` exports the root request/notification types plus all visited response dependencies into an in-memory tree, filters experimental files, synthesizes `index.ts`, and trims trailing whitespace. `write_schema_fixtures_with_options` is the destructive on-disk regeneration path: it empties `schema/typescript` and `schema/json`, then invokes the crate’s TypeScript and JSON generators with an `experimental_api` option.
+The file has two main jobs. First, it can read a schema fixture tree from disk. While reading, it normalizes the contents: JSON is parsed and written back in a stable pretty format, TypeScript line endings are made consistent, and the standard generated banner is ignored for comparisons. This makes fixture tests focus on real schema meaning instead of formatting noise.
 
-The TypeScript dependency traversal is implemented by `collect_typescript_fixture_file`, `visit_typescript_fixture_dependencies`, and `TypeScriptFixtureCollector`. They use `ts_rs::TS` metadata (`output_path`, `export_to_string`, `visit_dependencies`) plus a `HashSet<TypeId>` to avoid duplicate exports and recursively collect every referenced type exactly once. Tests at the bottom pin the JSON canonicalization behavior for sortable arrays.
+Second, it can regenerate the fixture directories. It empties the existing TypeScript and JSON schema folders, asks the crate’s schema generators to write fresh files, and optionally includes experimental protocol pieces.
+
+For tests, it can also build an in-memory TypeScript fixture tree directly from Rust protocol types. A small visitor, `TypeScriptFixtureCollector`, walks through TypeScript type dependencies so related types are included once, like collecting all recipe cards needed for one meal without duplicating cards already picked.
 
 #### Function details
 
@@ -5021,11 +5105,11 @@ The TypeScript dependency traversal is implemented by `collect_typescript_fixtur
 fn read_schema_fixture_tree(schema_root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>>
 ```
 
-**Purpose**: Reads both vendored schema subtrees (`typescript` and `json`) under a schema root and merges them into one relative-path map.
+**Purpose**: Reads the full saved schema fixture set from a schema root directory. It gathers both the TypeScript fixtures and the JSON fixtures into one ordered collection so tests can compare them as a single tree.
 
-**Data flow**: Takes `schema_root`, derives `typescript_root` and `json_root` with `join`, recursively collects files from each subtree, prefixes each relative path with its top-level label, and inserts the normalized bytes into a `BTreeMap`. It returns the combined map.
+**Data flow**: It receives the path to the schema root. From that, it looks under `typescript` and `json`, reads every file in each subtree through `collect_files_recursive`, prefixes each relative path with its fixture kind, and returns a sorted map from relative path to file bytes.
 
-**Call relations**: This is the broadest fixture reader in the file, delegating all traversal and normalization to `collect_files_recursive` and `read_file_bytes`.
+**Call relations**: This is a top-level reader for fixture comparisons. It delegates the actual directory walking and file cleanup to `collect_files_recursive`, so callers get normalized fixture contents without needing to know the on-disk details.
 
 *Call graph*: calls 1 internal fn (collect_files_recursive); 3 external calls (new, join, from).
 
@@ -5039,11 +5123,11 @@ fn read_schema_fixture_subtree(
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>>
 ```
 
-**Purpose**: Reads one labeled fixture subtree such as `typescript` or `json` and annotates traversal failures with the subtree path.
+**Purpose**: Reads just one named part of the schema fixture directory, such as only the TypeScript tree or another labeled subtree. This is useful for tests that want to inspect a smaller slice of the fixtures.
 
-**Data flow**: Accepts a schema root and subtree label, joins them into `subtree_root`, calls `collect_files_recursive`, and returns the resulting `BTreeMap<PathBuf, Vec<u8>>`. Errors are wrapped with contextual text naming the subtree.
+**Data flow**: It receives a schema root and a label. It joins them into one directory path, asks `collect_files_recursive` to read that directory, and returns the normalized files as a sorted map. If reading fails, it adds context naming the subtree that failed.
 
-**Call relations**: Tests call this helper when they want to compare one fixture family at a time rather than the whole tree.
+**Call relations**: This function is called by `generated_ts_optional_nullable_fields_only_in_params`, a test or check that needs a specific fixture subtree. It uses the same recursive reader as the full-tree reader, so both paths normalize files in the same way.
 
 *Call graph*: calls 1 internal fn (collect_files_recursive); called by 1 (generated_ts_optional_nullable_fields_only_in_params); 1 external calls (join).
 
@@ -5054,11 +5138,11 @@ fn read_schema_fixture_subtree(
 fn generate_typescript_schema_fixture_subtree_for_tests() -> Result<BTreeMap<PathBuf, Vec<u8>>>
 ```
 
-**Purpose**: Builds an in-memory TypeScript fixture tree matching the vendored TypeScript schema layout used by tests.
+**Purpose**: Builds the TypeScript schema fixture files in memory for tests, starting from the protocol’s main request and notification types. It lets tests compare generated TypeScript without writing files to disk.
 
-**Data flow**: Initializes mutable `files` and `seen` collections, exports the root request/notification types and traverses response-type dependencies via `visit_typescript_fixture_dependencies`, then filters experimental files, generates an index tree, trims trailing whitespace in every file, and converts the `String` contents into UTF-8 byte vectors. It returns a deterministic `BTreeMap<PathBuf, Vec<u8>>`.
+**Data flow**: It starts with empty collections for generated files and already-seen Rust types. It exports TypeScript for client requests, client notifications, server requests, server notifications, and their response dependencies. Then it removes experimental TypeScript entries, adds an index file, trims trailing whitespace, converts text into bytes, and returns the completed file map.
 
-**Call relations**: This is the test-side generator counterpart to on-disk schema generation. It orchestrates repeated calls into `collect_typescript_fixture_file` through the visitor helpers, then post-processes the tree for fixture comparison.
+**Call relations**: This function is a test helper that coordinates several smaller pieces. It uses `collect_typescript_fixture_file` indirectly through dependency visitors, asks protocol helper functions to visit response types, then passes the result through export helpers such as `filter_experimental_ts_tree`, `generate_index_ts_tree`, and `trim_trailing_line_whitespace` so the output matches normal generated fixtures.
 
 *Call graph*: calls 4 internal fn (filter_experimental_ts_tree, generate_index_ts_tree, trim_trailing_line_whitespace, visit_typescript_fixture_dependencies); 2 external calls (new, new).
 
@@ -5069,11 +5153,11 @@ fn generate_typescript_schema_fixture_subtree_for_tests() -> Result<BTreeMap<Pat
 fn write_schema_fixtures(schema_root: &Path, prettier: Option<&Path>) -> Result<()>
 ```
 
-**Purpose**: Regenerates vendored schema fixtures on disk using default options.
+**Purpose**: Regenerates the checked-in schema fixture directories using the default options. Tooling can call this when the protocol schema has intentionally changed and the saved fixtures need to be refreshed.
 
-**Data flow**: Receives the schema root and optional prettier path, constructs default `SchemaFixtureOptions`, and forwards all work to `write_schema_fixtures_with_options`. It returns that result unchanged.
+**Data flow**: It receives the schema root directory and an optional path to Prettier, a JavaScript formatter. It fills in default fixture options and passes everything to `write_schema_fixtures_with_options`. It returns success or any error from that fuller regeneration step.
 
-**Call relations**: This is the simple tooling entrypoint used when callers do not need to toggle experimental schema emission.
+**Call relations**: This is the simple public entry point for fixture writing. It exists so callers that do not care about special options can avoid constructing `SchemaFixtureOptions` themselves.
 
 *Call graph*: calls 1 internal fn (write_schema_fixtures_with_options); 1 external calls (default).
 
@@ -5088,11 +5172,11 @@ fn write_schema_fixtures_with_options(
 ) -> Result<()>
 ```
 
-**Purpose**: Deletes and rewrites the vendored TypeScript and JSON schema fixture directories with configurable experimental API inclusion.
+**Purpose**: Regenerates both TypeScript and JSON schema fixture directories, with an option to include experimental API items. It also removes stale files first, so deleted schema files do not linger unnoticed.
 
-**Data flow**: Computes `typescript_out_dir` and `json_out_dir`, empties both via `ensure_empty_dir`, then invokes crate-level TypeScript generation with `GenerateTsOptions { experimental_api, ..default }` and JSON generation with the same experimental flag. It returns `Ok(())` only after both outputs are regenerated.
+**Data flow**: It receives the schema root, an optional Prettier path, and fixture options. It builds output paths for `typescript` and `json`, empties and recreates both directories, calls the TypeScript generator with the selected options, then calls the JSON generator with the same experimental setting. It returns success once both sets have been written.
 
-**Call relations**: Tooling reaches this function either directly or through `write_schema_fixtures`; it coordinates directory setup and delegates actual schema emission to crate-level generators.
+**Call relations**: This is the main write-side coordinator. `write_schema_fixtures` calls it with defaults, and it hands work to `ensure_empty_dir`, `generate_ts_with_options`, and `generate_json_with_experimental` in that order.
 
 *Call graph*: calls 2 internal fn (default, ensure_empty_dir); called by 1 (write_schema_fixtures); 3 external calls (join, generate_json_with_experimental, generate_ts_with_options).
 
@@ -5103,11 +5187,11 @@ fn write_schema_fixtures_with_options(
 fn ensure_empty_dir(dir: &Path) -> Result<()>
 ```
 
-**Purpose**: Recreates a directory from scratch so schema regeneration cannot leave stale files behind.
+**Purpose**: Makes sure a directory exists and contains no old files. This prevents stale generated schema files from staying on disk after regeneration.
 
-**Data flow**: Checks whether `dir` exists; if so, removes it recursively, then creates the directory tree anew. It returns unit on success and wraps filesystem failures with path-specific context.
+**Data flow**: It receives a directory path. If the path already exists, it removes the whole directory tree. Then it creates the directory again. It returns success or an error with a helpful message if removal or creation fails.
 
-**Call relations**: This helper is called by `write_schema_fixtures_with_options` before writing fresh TypeScript and JSON outputs.
+**Call relations**: This helper is used by `write_schema_fixtures_with_options` before new TypeScript and JSON schemas are generated. It is the cleanup step that makes regeneration safe and complete.
 
 *Call graph*: called by 1 (write_schema_fixtures_with_options); 3 external calls (exists, create_dir_all, remove_dir_all).
 
@@ -5118,11 +5202,11 @@ fn ensure_empty_dir(dir: &Path) -> Result<()>
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Reads one fixture file and normalizes its contents according to file type so comparisons are stable across platforms and generators.
+**Purpose**: Reads one fixture file and normalizes it so comparisons are fair across platforms and generator runs. It treats JSON and TypeScript specially because their formatting can vary without changing the schema meaning.
 
-**Data flow**: Reads raw bytes from `path`. For `.json`, it parses into `serde_json::Value`, canonicalizes recursively, and pretty-serializes back to bytes; for `.ts`, it decodes UTF-8, normalizes line endings to `\n`, strips the standard generated header if present, and returns the resulting bytes; all other files are returned unchanged.
+**Data flow**: It receives a file path and reads the raw bytes from disk. For JSON files, it parses the bytes, canonicalizes the JSON structure, and writes it back in pretty form. For TypeScript files, it decodes UTF-8 text, changes Windows-style line endings to Unix-style line endings, and removes the standard generated header if present. Other files are returned unchanged.
 
-**Call relations**: Directory traversal delegates every file through this function, making it the normalization choke point for fixture comparisons.
+**Call relations**: This function is called by `collect_files_recursive` for every file it finds. It hands JSON work to `canonicalize_json`, while it performs TypeScript text cleanup directly.
 
 *Call graph*: calls 1 internal fn (canonicalize_json); called by 1 (collect_files_recursive); 5 external calls (extension, from_utf8, from_slice, to_vec_pretty, read).
 
@@ -5133,11 +5217,11 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>>
 fn canonicalize_json(value: &Value) -> Value
 ```
 
-**Purpose**: Recursively rewrites JSON values into a deterministic form by sorting object keys and sorting only those arrays whose elements all admit a safe stable sort key.
+**Purpose**: Turns a JSON value into a stable form for fixture comparison. It sorts object keys and, where safe, sorts arrays whose order does not affect JSON Schema meaning.
 
-**Data flow**: Matches on the input `Value`. Arrays are first canonicalized element-wise; if every element yields a key from `schema_array_item_sort_key`, the function sorts by that key and then by serialized JSON as a tiebreaker, otherwise it preserves original order. Objects are rebuilt with lexicographically sorted keys and recursively canonicalized children. Scalars are cloned unchanged.
+**Data flow**: It receives a JSON value. If the value is an object, it sorts the keys and canonicalizes each child. If it is an array, it canonicalizes each item and sorts the array only when every item has a safe sort key. Primitive values such as strings, numbers, booleans, and null are copied as-is. It returns the cleaned-up JSON value.
 
-**Call relations**: This function is used only by `read_file_bytes` for JSON fixture normalization. Its selective array sorting is a deliberate design choice to avoid changing semantics for order-sensitive arrays.
+**Call relations**: This is used by `read_file_bytes` when reading JSON fixture files. It relies on `schema_array_item_sort_key` to decide whether an array can be safely sorted, avoiding changes to arrays where order might be meaningful.
 
 *Call graph*: calls 1 internal fn (schema_array_item_sort_key); called by 1 (read_file_bytes); 6 external calls (with_capacity, Array, Object, clone, with_capacity, to_string).
 
@@ -5148,11 +5232,11 @@ fn canonicalize_json(value: &Value) -> Value
 fn schema_array_item_sort_key(item: &Value) -> Option<String>
 ```
 
-**Purpose**: Determines whether a JSON array element can participate in stable schema-array sorting and, if so, produces the comparison key.
+**Purpose**: Decides whether one JSON array item has a safe, stable key that can be used for sorting. This lets fixture comparison ignore harmless ordering differences without changing arrays whose order could matter.
 
-**Data flow**: Inspects one `Value`: nulls, booleans, numbers, and strings get prefixed scalar keys; objects get keys only if they contain a string `$ref` or `title`; arrays and unkeyed objects return `None`. The returned `Option<String>` tells callers whether sorting is safe.
+**Data flow**: It receives one JSON value from an array. Simple values get keys based on their type and value. Objects get a key only if they have a string `$ref` field or a string `title` field. Nested arrays and objects without those known fields get no key. The result is either a string sort key or `None` to mean “do not sort this array.”
 
-**Call relations**: `canonicalize_json` calls this for every array element and aborts sorting for the whole array if any element lacks a key.
+**Call relations**: This helper is called only by `canonicalize_json`. It acts like a safety check: if any array item cannot produce a key, `canonicalize_json` keeps that whole array in its original order.
 
 *Call graph*: called by 1 (canonicalize_json); 1 external calls (format!).
 
@@ -5163,11 +5247,11 @@ fn schema_array_item_sort_key(item: &Value) -> Option<String>
 fn collect_files_recursive(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>>
 ```
 
-**Purpose**: Walks a directory tree, following symlink targets via metadata, and returns normalized file contents keyed by paths relative to the traversal root.
+**Purpose**: Walks through a directory tree and reads every regular file beneath it. It returns paths relative to the root so the result can be compared or written without depending on the machine’s absolute paths.
 
-**Data flow**: Starts with a stack containing `root`, repeatedly pops directories, reads entries, stats each path with `metadata`, pushes subdirectories back onto the stack, skips non-files, strips the root prefix from file paths, and inserts `read_file_bytes(path)` into a `BTreeMap`. It returns the full map after traversal completes.
+**Data flow**: It receives a root directory. It keeps a stack of directories to visit, reads each directory entry, follows symlinks through file metadata, descends into subdirectories, skips non-file entries, and reads file contents with `read_file_bytes`. It returns a sorted map from relative file path to normalized bytes.
 
-**Call relations**: Both fixture-reading entrypoints delegate to this walker. It centralizes recursive traversal while relying on `read_file_bytes` for per-file normalization.
+**Call relations**: Both `read_schema_fixture_tree` and `read_schema_fixture_subtree` rely on this function for the actual disk traversal. It calls `read_file_bytes`, so every collected file is normalized before it reaches the caller.
 
 *Call graph*: calls 1 internal fn (read_file_bytes); called by 2 (read_schema_fixture_subtree, read_schema_fixture_tree); 4 external calls (new, metadata, read_dir, vec!).
 
@@ -5181,11 +5265,11 @@ fn collect_typescript_fixture_file(
 ) -> Result<()>
 ```
 
-**Purpose**: Exports one `ts_rs::TS` type into the fixture tree exactly once and recursively visits its TypeScript dependencies.
+**Purpose**: Exports one Rust type as a TypeScript fixture file and then discovers the other TypeScript types it depends on. It avoids exporting the same Rust type more than once.
 
-**Data flow**: Given mutable `files` and `seen`, it asks `T::output_path()` for a destination and returns early if absent or already seen by `TypeId`. Otherwise it exports the type to a string, normalizes the relative path, normalizes line endings, inserts the file content, then constructs a `TypeScriptFixtureCollector` and invokes `T::visit_dependencies`. Any visitor error is propagated.
+**Data flow**: It receives mutable maps for generated files and already-seen type IDs, and it is parameterized by the Rust type to export. If that type has no output path or was already seen, it stops. Otherwise it exports the TypeScript text, normalizes the output path and line endings, stores the file, then creates a `TypeScriptFixtureCollector` to visit and collect dependency types. It returns success or the first export error encountered.
 
-**Call relations**: This is the core recursive export primitive used directly by the test generator and indirectly by the dependency visitor implementation.
+**Call relations**: This is the core worker behind in-memory TypeScript fixture generation. `TypeScriptFixtureCollector::visit` calls it whenever the TypeScript type visitor finds a dependency, and it calls `normalize_relative_fixture_path` before inserting the file into the fixture map.
 
 *Call graph*: calls 1 internal fn (normalize_relative_fixture_path); 3 external calls (export_to_string, output_path, visit_dependencies).
 
@@ -5196,11 +5280,11 @@ fn collect_typescript_fixture_file(
 fn normalize_relative_fixture_path(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Normalizes a relative fixture path by rebuilding it from its path components.
+**Purpose**: Cleans up a generated fixture path into a consistent relative path. This helps the same generated TypeScript file appear under the same key across platforms.
 
-**Data flow**: Takes a `Path`, iterates its components, collects them into a new `PathBuf`, and returns that normalized path. No filesystem access occurs.
+**Data flow**: It receives a path, breaks it into path components, and collects those components into a new `PathBuf`. The returned path is used as the key for a fixture file.
 
-**Call relations**: `collect_typescript_fixture_file` uses this before inserting exported TypeScript content into the fixture map.
+**Call relations**: This small helper is called by `collect_typescript_fixture_file` just before the generated TypeScript text is stored. It keeps path handling centralized for generated fixture entries.
 
 *Call graph*: called by 1 (collect_typescript_fixture_file); 1 external calls (components).
 
@@ -5215,11 +5299,11 @@ fn visit_typescript_fixture_dependencies(
 ) -> Result<()>
 ```
 
-**Purpose**: Runs an arbitrary dependency visitation closure against a `TypeScriptFixtureCollector` and converts any deferred visitor error into a returned `Result`.
+**Purpose**: Runs a caller-provided dependency visit using the fixture collector and converts any collection error into the function’s result. It is a small wrapper that makes dependency visiting fit neatly into normal error handling.
 
-**Data flow**: Builds a `TypeScriptFixtureCollector` over the shared `files` and `seen` sets, invokes the supplied closure with it, then checks `visitor.error` and returns either that error or success. It does not itself export types except through the visitor callback.
+**Data flow**: It receives the current generated file map, the set of already-seen types, and a callback that knows which protocol types to visit. It builds a `TypeScriptFixtureCollector`, passes it to the callback, checks whether the collector recorded an error, and returns either that error or success.
 
-**Call relations**: The TypeScript test generator uses this helper to traverse response-type sets exposed by `visit_client_response_types` and `visit_server_response_types`.
+**Call relations**: This is called by `generate_typescript_schema_fixture_subtree_for_tests` when it needs to add client and server response types. The callback performs the protocol-specific visiting, while this function supplies the common collector setup and error check.
 
 *Call graph*: called by 1 (generate_typescript_schema_fixture_subtree_for_tests).
 
@@ -5230,11 +5314,11 @@ fn visit_typescript_fixture_dependencies(
 fn visit(&mut self)
 ```
 
-**Purpose**: Implements `ts_rs::TypeVisitor` by exporting each visited dependency type into the fixture tree unless a prior error has already occurred.
+**Purpose**: Responds when the TypeScript generation library reports a dependent type. It collects that dependency as another fixture file unless an earlier dependency already failed.
 
-**Data flow**: On each visited `T`, it first checks whether `self.error` is already set; if not, it calls `collect_typescript_fixture_file::<T>` and stores any resulting error into `self.error`. It returns unit and mutates the collector’s shared maps and error slot.
+**Data flow**: It receives the collector state and the dependency type being visited. If an error has already been stored, it does nothing. Otherwise it calls `collect_typescript_fixture_file` for that type and stores any resulting error inside the collector.
 
-**Call relations**: This method is invoked by `TS::visit_dependencies` and by the explicit dependency-walking closures, making it the adapter between ts-rs traversal and fixture collection.
+**Call relations**: This method is called by the `ts_rs` dependency visitor machinery during TypeScript export. It feeds each discovered type back into `collect_typescript_fixture_file`, which may recursively visit more dependencies.
 
 
 ##### `tests::canonicalize_json_sorts_string_arrays`  (lines 343–347)
@@ -5243,11 +5327,11 @@ fn visit(&mut self)
 fn canonicalize_json_sorts_string_arrays()
 ```
 
-**Purpose**: Verifies that `canonicalize_json` sorts arrays of plain strings into deterministic order.
+**Purpose**: Checks that `canonicalize_json` sorts arrays of strings into a stable order. This protects fixture comparisons from harmless ordering differences in simple JSON arrays.
 
-**Data flow**: Constructs an unsorted JSON string array and an expected sorted array, calls `canonicalize_json`, and asserts equality. It writes no persistent state.
+**Data flow**: It builds a JSON array containing `b` then `a`, builds the expected array containing `a` then `b`, calls `canonicalize_json`, and asserts that the result matches the expected sorted value.
 
-**Call relations**: This unit test guards one of the intended normalization behaviors used during fixture comparison.
+**Call relations**: This test directly exercises `canonicalize_json`. It documents one important promise of the normalization logic used when `read_file_bytes` reads JSON fixtures.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -5258,11 +5342,11 @@ fn canonicalize_json_sorts_string_arrays()
 fn canonicalize_json_sorts_schema_ref_arrays()
 ```
 
-**Purpose**: Verifies that `canonicalize_json` sorts arrays of schema objects by `$ref` value.
+**Purpose**: Checks that `canonicalize_json` sorts arrays of JSON Schema reference objects by their `$ref` value. This covers a common schema case where array order should not affect validation meaning.
 
-**Data flow**: Builds a JSON array containing two `$ref` objects in reverse order, canonicalizes it, and asserts that the result matches the expected sorted array. No external state is touched.
+**Data flow**: It builds a JSON array with references to `B` and then `A`, builds the expected array with `A` before `B`, calls `canonicalize_json`, and asserts that the normalized result has the expected order.
 
-**Call relations**: This test specifically covers the object-key path in `schema_array_item_sort_key`, ensuring schema reference arrays compare stably.
+**Call relations**: This test verifies the cooperation between `canonicalize_json` and `schema_array_item_sort_key`. It makes sure schema reference arrays are treated as safely sortable during fixture normalization.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -5272,18 +5356,28 @@ This final group captures the transport-layer message contracts, remote-control 
 
 ### `app-server-transport/src/lib.rs`
 
-`orchestration` · `startup`
+`io_transport` · `cross-cutting`
 
-This crate root is a façade over two internal modules: `outgoing_message` and `transport`. It does not implement transport behavior itself; instead, it selects which internal types and functions are part of the crate’s stable external interface. From `outgoing_message`, it re-exports identifiers and queueable response/error message types such as `ConnectionId`, `OutgoingMessage`, `OutgoingResponse`, `OutgoingError`, and `QueuedOutgoingMessage`. From `transport`, it re-exports the main runtime driver `AppServerTransport`, startup coordination via `AppServerStartupLock` and `acquire_app_server_startup_lock`, parse and policy errors, connection-origin metadata, remote-control configuration and availability types, event types, environment-variable helpers, socket-path helpers, and startup functions for stdio, websocket, and control-socket acceptors. This organization makes the crate consumable from a single import path while hiding the internal module layout. The file’s main design role is boundary definition: it tells readers which transport concepts are intended for use by other crates and which startup/remote-control entry points are officially exposed. Because all behavior is delegated to the submodules, this file is active wherever transport functionality is imported, especially during server startup and connection establishment.
+This file does not contain its own logic. Instead, it acts like a reception desk for the transport crate: other code can come here to find the pieces needed to talk to the app server, without needing to know how the crate is split internally.
+
+The transport crate appears to cover several ways of connecting to or controlling an app server, including standard input/output, WebSocket connections, and a remote-control socket. It also exposes startup helpers, such as paths for lock files and control sockets, plus policy and error types that explain when remote control is allowed, unavailable, or disabled by requirements.
+
+The file pulls in two internal modules: `outgoing_message`, which defines the shapes and errors for messages being sent out, and `transport`, which provides the connection setup, startup coordination, remote-control policy, and event types. Then it re-exports selected items with `pub use`, meaning outside code can import them directly from this crate instead of reaching into its private layout.
+
+This matters because it keeps the crate’s public surface stable and easy to understand. Internal files can be reorganized later, but users of the library can keep depending on this single, tidy API.
 
 
 ### `app-server-transport/src/outgoing_message.rs`
 
-`data_model` · `cross-cutting during outbound message routing and writing`
+`data_model` · `request handling`
 
-This file is a compact data-model module for outbound transport traffic. `ConnectionId` is a thin `u64` newtype used as a stable identifier for a live transport connection; it derives equality, hashing, and copy semantics so it can be stored in maps and attached to events. Its `Display` implementation prints the raw numeric id, which is useful in logs and diagnostics.
+This file is like the outgoing mail format for the app server. When the server needs to talk to a connected client, it may send a request, a notification, a successful response, or an error response. The `OutgoingMessage` enum gathers those possibilities into one type, so the rest of the transport code can put “something to send” into a queue without caring which exact kind it is.
 
-The main payload type is `OutgoingMessage`, an untagged serializable enum that can carry a `ServerRequest`, an app-server-specific `ServerNotification`, a successful `OutgoingResponse`, or an `OutgoingError`. The response and error structs preserve the JSON-RPC request id and either a protocol `Result` or `JSONRPCErrorError`. `QueuedOutgoingMessage` wraps an `OutgoingMessage` together with an optional `tokio::sync::oneshot::Sender<()>` used by writers to signal that a particular message has been fully written. That completion channel is intentionally optional so most messages can be queued without extra synchronization overhead. The file contains almost no behavior beyond formatting and construction; its importance is in standardizing the exact shape of outbound messages shared across stdio, websocket, unix-socket, and remote-control transports.
+The file also defines `ConnectionId`, a stable numeric label for a client connection. Its display behavior prints just the number, which is useful for logs and human-readable messages.
+
+Two response structs, `OutgoingResponse` and `OutgoingError`, describe the two ways the server can answer a client request: with a result or with a JSON-RPC error. JSON-RPC is a common request-and-response message format; here, the imported protocol types provide the official request IDs, results, notifications, and error shapes.
+
+Finally, `QueuedOutgoingMessage` wraps an outgoing message while it waits to be written to the client. It can optionally carry a one-time completion signal, called a `oneshot` channel, so another task can be told when the message has actually been written. Without this file, different parts of the transport layer would have to invent their own message shapes and queue bookkeeping, making routing and writing responses much harder to keep consistent.
 
 #### Function details
 
@@ -5293,11 +5387,11 @@ The main payload type is `OutgoingMessage`, an untagged serializable enum that c
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats a connection id as its underlying decimal integer. This keeps logs and user-facing diagnostics concise and stable.
+**Purpose**: This function defines how a connection ID appears when it is turned into text. It prints the underlying number, which makes connection IDs easy to read in logs, diagnostics, or formatted messages.
 
-**Data flow**: Borrows `self` and a formatter, writes `self.0` into the formatter with `write!`, and returns the formatting result.
+**Data flow**: It receives a `ConnectionId` and a formatter, which is the standard Rust object used for building text output. It writes the numeric ID into that formatter. The result is either success or a formatting error if the formatter could not accept the text.
 
-**Call relations**: Used implicitly anywhere `ConnectionId` is formatted, especially in transport logging and diagnostics.
+**Call relations**: Whenever code formats a `ConnectionId` for display, Rust calls this function automatically. Inside, it hands the work to the standard `write!` formatting machinery, so callers get a plain numeric label instead of a debug-style wrapper.
 
 *Call graph*: 1 external calls (write!).
 
@@ -5308,24 +5402,24 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(message: OutgoingMessage) -> Self
 ```
 
-**Purpose**: Constructs a queued outbound message with no write-completion notifier attached. It is the default constructor used by most transport code paths.
+**Purpose**: This function creates a queue-ready outgoing message with no completion notification attached. It is the simple default way to put a server-to-client message into the outgoing pipeline.
 
-**Data flow**: Consumes an `OutgoingMessage` and returns `QueuedOutgoingMessage { message, write_complete_tx: None }`.
+**Data flow**: It takes an `OutgoingMessage` as input. It stores that message in a new `QueuedOutgoingMessage` and sets the optional write-completion sender to `None`, meaning nobody is waiting to be notified when the write finishes. It returns the newly wrapped message.
 
-**Call relations**: Called by multiple transport and test paths whenever a message is enqueued without needing an acknowledgment that the writer flushed it.
+**Call relations**: Code that enqueues messages for connected clients calls this when it wants to place a message onto the outgoing writer queue. Later parts of the transport system can read the wrapped message and send it to the client; if no completion sender was attached, they do not need to report back after writing.
 
 *Call graph*: called by 8 (enqueue_incoming_message, shutdown_cancels_blocked_outbound_forwarding, remote_control_http_mode_enrolls_before_connecting, remote_control_transport_clears_outgoing_buffer_when_backend_acks, remote_control_transport_manages_virtual_clients_and_routes_messages, enqueue_incoming_request_does_not_block_when_writer_queue_is_full, broadcast_does_not_block_on_slow_connection, to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is_full).
 
 
 ### `app-server-transport/src/transport/remote_control/protocol.rs`
 
-`data_model` · `cross-cutting; used whenever remote-control URLs or wire payloads are constructed or parsed`
+`io_transport` · `remote control setup and message exchange`
 
-This file is the schema layer for remote control. It declares the request/response structs used for enrollment, refresh, pairing start, and pairing status, plus the websocket envelope types exchanged between backend and app-server. `ClientId` and `StreamId` are transparent string wrappers used to key virtual remote clients and per-stream sequencing; `StreamId::new_random` generates a UUID v7 string for new outbound streams.
+Remote control needs two things to work safely: a clear message format, and a careful way to decide which remote service the app is allowed to contact. This file provides both. It defines small request and response shapes for enrollment, token refresh, pairing, and pairing-status checks. These shapes are turned into or read from JSON, so both sides of the connection agree on field names and meaning.
 
-The websocket protocol distinguishes `ClientEvent` values coming from the backend (`ClientMessage`, chunked message fragments, acknowledgements, ping, close) from `ServerEvent` values sent back (`ServerMessage`, chunked server message fragments, ack, pong). `ClientEnvelope` and `ServerEnvelope` carry those events together with `client_id`, optional or required `stream_id`, sequence cursoring, and reconnect metadata. `ServerEvent::segment_id` exposes the chunk index only for `ServerMessageChunk`, which lets reconnect/ack logic reason about partially acknowledged segmented payloads.
+It also defines the live message envelopes passed between the remote client and the local server. A client sends JSON-RPC messages, chunks of large messages, acknowledgements, pings, and close notices. The server sends responses, chunks, acknowledgements, and pongs. The envelope around each message adds a client id, stream id, and sequence id, much like a postal label that says who the message is for and where it fits in order.
 
-The other major responsibility is URL validation and derivation. `normalize_remote_control_base_url` parses the configured base URL, ensures the path ends with `/`, and enforces a strict host/scheme policy: HTTPS for `chatgpt.com`, `chatgpt-staging.com`, and their subdomains; HTTP or HTTPS only for localhost/loopback. `normalize_remote_control_url` then derives the concrete enroll, refresh, pair, pair-status, and websocket endpoints under `wham/remote/control/server`, switching the websocket scheme to `wss` for HTTPS bases and `ws` for HTTP localhost. The tests lock in accepted ChatGPT and localhost forms and reject lookalike or insecure external hosts.
+The URL functions are a safety gate. They accept HTTPS URLs for chatgpt.com or chatgpt-staging.com, and allow HTTP only for localhost development. They then build the exact enrollment, refresh, pairing, pairing-status, and websocket URLs. Without this file, different parts of remote control could disagree about message shape, lose track of message chunks, or accidentally connect to an unsafe host.
 
 #### Function details
 
@@ -5335,11 +5429,11 @@ The other major responsibility is URL validation and derivation. `normalize_remo
 fn from(code: RemoteControlPairingStatusCode) -> Self
 ```
 
-**Purpose**: Converts the internal pairing-status code enum into the serialized request body expected by the backend.
+**Purpose**: This converts a pairing code into the request body used to ask whether pairing has been claimed. It makes sure exactly the right field is filled in, depending on whether the code is the normal pairing code or the manual pairing code.
 
-**Data flow**: Consumes a `RemoteControlPairingStatusCode` and returns `RemoteControlPairingStatusRequest` with exactly one of `pairing_code` or `manual_pairing_code` populated and the other set to `None`.
+**Data flow**: It receives a RemoteControlPairingStatusCode value. If that value holds a normal pairing code, it creates a request with pairing_code filled and manual_pairing_code empty. If it holds a manual code, it does the reverse. The result is a RemoteControlPairingStatusRequest ready to be serialized as JSON.
 
-**Call relations**: Used by pairing-status orchestration after parameter validation has already ensured only one code type is present.
+**Call relations**: There are no explicit callers shown in the graph, because this is a standard Rust conversion method that can be used indirectly through conversion helpers. It sits between code that has a pairing code and the HTTP request code that needs a correctly shaped status-check body.
 
 
 ##### `StreamId::new_random`  (lines 99–101)
@@ -5348,11 +5442,11 @@ fn from(code: RemoteControlPairingStatusCode) -> Self
 fn new_random() -> Self
 ```
 
-**Purpose**: Creates a fresh stream identifier using a time-ordered UUID v7.
+**Purpose**: This creates a fresh stream identifier for a remote-control conversation. A stream id helps separate one flow of messages from another, like giving each phone call its own call number.
 
-**Data flow**: Calls `uuid::Uuid::now_v7()`, converts it to a string, wraps it in `StreamId`, and returns it.
+**Data flow**: It takes no input. It asks the UUID library for a new time-ordered random UUID, turns that UUID into text, wraps it in a StreamId, and returns it.
 
-**Call relations**: Used when the transport needs a new per-stream identifier for outbound server envelopes.
+**Call relations**: When remote-control code needs a new stream, this function supplies an id that can be placed into client and server envelopes. It delegates the actual unique-id creation to the external UUID function now_v7.
 
 *Call graph*: 1 external calls (now_v7).
 
@@ -5363,11 +5457,11 @@ fn new_random() -> Self
 fn segment_id(&self) -> Option<usize>
 ```
 
-**Purpose**: Extracts the chunk index from a segmented server event and returns `None` for non-chunk events.
+**Purpose**: This answers one simple question: does this server event represent one chunk of a larger message, and if so, which chunk number is it? It is useful for tracking acknowledgements and resend work for split-up messages.
 
-**Data flow**: Pattern-matches `self`; returns `Some(segment_id)` for `ServerMessageChunk` and `None` for `ServerMessage`, `Ack`, and `Pong`.
+**Data flow**: It receives a server event. If the event is a ServerMessageChunk, it extracts and returns that chunk's segment_id. For a whole server message, an acknowledgement, or a pong, it returns nothing because those events are not individual chunks.
 
-**Call relations**: Supports buffering and acknowledgement logic that only cares about chunked payloads.
+**Call relations**: This helper belongs to the server-event type itself. Other message-sending or reconnect logic can use it when it needs to treat chunked messages differently from ordinary events.
 
 
 ##### `is_allowed_remote_control_chatgpt_host`  (lines 193–201)
@@ -5376,11 +5470,11 @@ fn segment_id(&self) -> Option<usize>
 fn is_allowed_remote_control_chatgpt_host(host: &Option<Host<&str>>) -> bool
 ```
 
-**Purpose**: Checks whether a parsed URL host is exactly `chatgpt.com` / `chatgpt-staging.com` or one of their subdomains.
+**Purpose**: This checks whether a URL host is one of the ChatGPT hosts that remote control is allowed to use. It prevents lookalike or unrelated domains from being accepted.
 
-**Data flow**: Reads `Option<Host<&str>>`, returns `false` for non-domain hosts, and otherwise compares the domain string against the allowed exact names and suffixes.
+**Data flow**: It receives an optional parsed host from a URL. If the host is not a domain name, it returns false. If it is a domain, it returns true only for chatgpt.com, chatgpt-staging.com, or their subdomains; otherwise it returns false.
 
-**Call relations**: Used by base-URL normalization to enforce the production/staging host allowlist.
+**Call relations**: normalize_remote_control_base_url calls this during URL validation. It is one half of the safety check: this function covers real ChatGPT hosts, while is_localhost covers local development hosts.
 
 *Call graph*: called by 1 (normalize_remote_control_base_url).
 
@@ -5391,11 +5485,11 @@ fn is_allowed_remote_control_chatgpt_host(host: &Option<Host<&str>>) -> bool
 fn is_localhost(host: &Option<Host<&str>>) -> bool
 ```
 
-**Purpose**: Recognizes localhost and loopback IPv4/IPv6 hosts.
+**Purpose**: This checks whether a URL points back to the same machine. That matters because local development may use plain HTTP, while public remote-control hosts must be HTTPS.
 
-**Data flow**: Matches the parsed host and returns `true` for domain `localhost` or loopback IP addresses; otherwise `false`.
+**Data flow**: It receives an optional parsed host from a URL. It returns true for the domain name localhost, for loopback IPv4 addresses such as 127.0.0.1, and for loopback IPv6 addresses such as ::1. All other hosts return false.
 
-**Call relations**: Used by base-URL normalization to permit local development URLs over HTTP or HTTPS.
+**Call relations**: normalize_remote_control_base_url calls this while deciding whether the URL scheme is allowed. Together with is_allowed_remote_control_chatgpt_host, it separates safe production targets from safe local testing targets.
 
 *Call graph*: called by 1 (normalize_remote_control_base_url).
 
@@ -5408,11 +5502,11 @@ fn normalize_remote_control_url(
 ) -> io::Result<RemoteControlTarget>
 ```
 
-**Purpose**: Validates a configured remote-control base URL and derives all concrete backend endpoint URLs from it.
+**Purpose**: This turns a user-provided remote-control base URL into the exact set of endpoint URLs needed by the feature. It also chooses the correct websocket scheme: wss for secure HTTPS, ws for local HTTP.
 
-**Data flow**: Calls `normalize_remote_control_base_url` to parse and validate the base URL, then joins fixed relative paths for enroll, refresh, pair, pair-status, and websocket endpoints. It rewrites the websocket URL scheme to `wss` when the base scheme is HTTPS and `ws` otherwise, and returns a populated `RemoteControlTarget` or an `InvalidInput` `io::Error` if parsing/joining fails.
+**Data flow**: It receives a URL string. First it asks normalize_remote_control_base_url to parse, validate, and add a trailing slash if needed. Then it appends fixed paths for enrollment, refresh, pairing, pairing-status, and the websocket connection. If any URL cannot be built, it returns an input error. On success, it returns a RemoteControlTarget containing all five final URL strings.
 
-**Call relations**: Called throughout enrollment, persistence, startup, and tests whenever the subsystem needs canonical endpoint URLs.
+**Call relations**: This is the main URL-building function used by remote-control setup paths such as load_or_enroll_server, persist_preference, enable, and resolve_persisted_preference, as well as many enrollment and preference tests. It hands validation to normalize_remote_control_base_url, then provides the rest of the system with concrete URLs to call.
 
 *Call graph*: calls 1 internal fn (normalize_remote_control_base_url); called by 33 (load_or_enroll_server, persist_preference, enable, resolve_persisted_preference, clearing_persisted_remote_control_enrollment_removes_only_matching_entry, enroll_remote_control_server_parse_failure_includes_response_body, persisted_remote_control_enrollment_round_trips_by_target_and_account, remote_control_enrollment_refreshes_server_token_before_expiry, normalize_remote_control_url_rejects_unsupported_urls, start_remote_control (+15 more)).
 
@@ -5423,11 +5517,11 @@ fn normalize_remote_control_url(
 fn normalize_remote_control_base_url(remote_control_url: &str) -> io::Result<Url>
 ```
 
-**Purpose**: Parses and validates the configured remote-control base URL against strict scheme and host rules.
+**Purpose**: This parses and validates the base remote-control URL before anything tries to connect to it. It is the main guardrail that rejects unsafe schemes and untrusted hosts.
 
-**Data flow**: Parses the input string into `Url`, appends a trailing slash to the path if missing, inspects the host, and accepts only `https` for allowed ChatGPT/staging hosts or `http`/`https` for localhost. On failure it returns `InvalidInput` with a message describing the accepted URL classes.
+**Data flow**: It receives a URL string. It parses it into a URL object, adds a trailing slash to the path if one is missing, then checks the scheme and host. HTTPS is allowed for localhost and approved ChatGPT domains; HTTP is allowed only for localhost. If the URL fails parsing or safety checks, it returns an invalid-input error. If it passes, it returns the normalized URL object.
 
-**Call relations**: Used directly by environment-client URL construction elsewhere and indirectly by `normalize_remote_control_url`.
+**Call relations**: normalize_remote_control_url calls this before building endpoint URLs, and environment_clients_url also calls it when it needs the normalized base. This function relies on is_localhost and is_allowed_remote_control_chatgpt_host for the host checks, and on the external URL parser to understand the input string.
 
 *Call graph*: calls 2 internal fn (is_allowed_remote_control_chatgpt_host, is_localhost); called by 2 (environment_clients_url, normalize_remote_control_url); 2 external calls (parse, format!).
 
@@ -5438,11 +5532,11 @@ fn normalize_remote_control_base_url(remote_control_url: &str) -> io::Result<Url
 fn normalize_remote_control_url_accepts_chatgpt_https_urls()
 ```
 
-**Purpose**: Verifies that production and staging ChatGPT HTTPS base URLs normalize into the expected endpoint set.
+**Purpose**: This test proves that approved ChatGPT HTTPS URLs are accepted and expanded into the expected remote-control endpoints. It covers both the main chatgpt.com domain and a staging subdomain.
 
-**Data flow**: Calls `normalize_remote_control_url` on representative ChatGPT and staging URLs and asserts the returned `RemoteControlTarget` contains the exact expected `wss` websocket URL and HTTPS REST endpoints.
+**Data flow**: It feeds known-good ChatGPT URLs into normalize_remote_control_url. It compares the returned RemoteControlTarget values with the exact websocket, enroll, refresh, pair, and pair-status URLs that should be produced.
 
-**Call relations**: Locks in accepted production/staging URL forms.
+**Call relations**: The Rust test runner calls this test during automated testing. It protects the production URL behavior so future changes do not accidentally reject valid ChatGPT hosts or build the wrong endpoint paths.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5453,11 +5547,11 @@ fn normalize_remote_control_url_accepts_chatgpt_https_urls()
 fn normalize_remote_control_url_accepts_localhost_urls()
 ```
 
-**Purpose**: Verifies that localhost HTTP and HTTPS URLs are accepted and normalized correctly.
+**Purpose**: This test proves that localhost URLs work for development, both with HTTP and HTTPS. It also checks that HTTP becomes ws and HTTPS becomes wss for websocket connections.
 
-**Data flow**: Normalizes localhost URLs and asserts the resulting target uses `ws` for HTTP localhost and `wss` for HTTPS localhost, with the expected REST endpoint paths.
+**Data flow**: It gives normalize_remote_control_url two localhost base URLs. For each one, it checks that the returned RemoteControlTarget contains the expected endpoint strings and websocket scheme.
 
-**Call relations**: Covers the local-development branch of URL validation.
+**Call relations**: The Rust test runner calls this during automated testing. It keeps local development support from being broken while the stricter production host checks remain in place.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5468,24 +5562,24 @@ fn normalize_remote_control_url_accepts_localhost_urls()
 fn normalize_remote_control_url_rejects_unsupported_urls()
 ```
 
-**Purpose**: Ensures insecure or lookalike hosts are rejected with the documented validation error.
+**Purpose**: This test checks that unsafe or unsupported remote-control URLs are rejected. It is especially important because small domain-name mistakes can become security problems.
 
-**Data flow**: Iterates over unsupported URLs, calls `normalize_remote_control_url`, asserts each call fails with `ErrorKind::InvalidInput`, and checks the exact error message.
+**Data flow**: It loops over several bad URL examples, such as plain HTTP for chatgpt.com, unrelated domains, old or lookalike domains, and fake localhost subdomains. Each URL is passed to normalize_remote_control_url, and the test confirms that the result is an invalid-input error with the expected message.
 
-**Call relations**: Protects the host/scheme allowlist from accidental broadening.
+**Call relations**: The Rust test runner calls this test during automated testing. It exercises normalize_remote_control_url, which in turn uses the base-url validation helpers, so the test covers the file's main safety boundary.
 
 *Call graph*: calls 1 internal fn (normalize_remote_control_url); 1 external calls (assert_eq!).
 
 
 ### `app-server/src/error_code.rs`
 
-`util` · `cross-cutting error response construction`
+`util` · `cross-cutting request handling`
 
-This file is a compact utility module for JSON-RPC error construction. It declares numeric constants for the standard JSON-RPC codes used by the server—invalid request (`-32600`), method not found (`-32601`), invalid params (`-32602`), internal error (`-32603`)—plus an overloaded server code (`-32001`) and a string constant for the special `input_too_large` condition. The constants are public or crate-public depending on whether other crates need direct access.
+The app server speaks JSON-RPC, a request-and-response format where failures are sent back as structured error objects with a numeric code and a message. This file is the server’s small error-code toolbox. Instead of every caller remembering that “invalid request” is -32600 or “method not found” is -32601, they call a clearly named helper and get the right error shape back.
 
-The four exported constructor functions are thin wrappers around a single private `error` helper. Each wrapper fixes the numeric code and accepts any message convertible into `String`, returning a `codex_app_server_protocol::JSONRPCErrorError` with `data: None`. This keeps call sites terse and avoids repeated struct literals throughout request handlers, transport code, and bespoke error mapping.
+Think of it like a set of preprinted complaint forms at a service desk. Different workers may need to report different problems, but the form layout and official category codes must stay the same. Without this file, error replies could drift apart: the wrong code might be used, messages might be wrapped differently, or clients might receive inconsistent responses.
 
-There is intentionally no branching or logging here: the module’s only job is to standardize protocol payload shape. Because many unrelated subsystems call these helpers, this file acts as a cross-cutting vocabulary layer between internal failures and externally visible JSON-RPC responses.
+The public-facing pieces are constants for known error codes and helper functions such as `invalid_request`, `invalid_params`, and `internal_error`. Each helper accepts a message, then delegates to the private `error` function. That shared function builds a `JSONRPCErrorError` object with a code, the text message, and no extra data. The result is predictable, simple, and easy for client software to understand.
 
 #### Function details
 
@@ -5495,11 +5589,11 @@ There is intentionally no branching or logging here: the module’s only job is 
 fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError
 ```
 
-**Purpose**: Builds a JSON-RPC error object for malformed requests using code `-32600`. It is the standard constructor for request-shape or protocol-state violations.
+**Purpose**: Builds a JSON-RPC error saying the client sent a request that is not valid. This is used when the server cannot treat the incoming message as a proper request at all.
 
-**Data flow**: Accepts any message convertible into `String`, forwards it with `INVALID_REQUEST_ERROR_CODE` to `error`, and returns the resulting `JSONRPCErrorError`.
+**Data flow**: It receives a human-readable message. It pairs that message with the standard “invalid request” numeric code, passes both to the shared error builder, and returns a structured JSON-RPC error object.
 
-**Call relations**: Widely used by request dispatch and transport code whenever the incoming request itself is invalid or cannot be processed in the current protocol state.
+**Call relations**: Many request-processing paths call this when they reject a malformed or impossible request, such as during startup, request dispatch, process writing, watching, control sending, or configuration write failures. It hands the actual object construction to `error` so every invalid-request reply has the same shape.
 
 *Call graph*: calls 1 internal fn (error); called by 38 (handle_thread_rollback_failed, send_control, start, command_no_longer_running_error, handle_process_write, watch, dispatch_initialized_client_request, config_write_error, map_fs_error, load_plugin_share_config_and_auth (+15 more)).
 
@@ -5510,11 +5604,11 @@ fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError
 fn method_not_found(message: impl Into<String>) -> JSONRPCErrorError
 ```
 
-**Purpose**: Builds a JSON-RPC error object for unknown or unsupported methods using code `-32601`. It standardizes the response for unrecognized RPC method names.
+**Purpose**: Builds a JSON-RPC error saying the requested method or operation does not exist. This is how the server tells a client, in protocol terms, “I do not know how to do that.”
 
-**Data flow**: Accepts a message, passes it with `METHOD_NOT_FOUND_ERROR_CODE` to `error`, and returns the constructed `JSONRPCErrorError`.
+**Data flow**: It takes an explanatory message, combines it with the standard “method not found” code, and returns the JSON-RPC error object produced by the shared builder.
 
-**Call relations**: Used by handlers that reject unsupported operations or unknown method names.
+**Call relations**: Callers use this when a client asks for unsupported behavior, such as unsupported thread-store operations or unknown thread/core write actions. Like the other public helpers, it delegates to `error` for the common construction step.
 
 *Call graph*: calls 1 internal fn (error); called by 3 (thread_turns_items_list, core_thread_write_error, unsupported_thread_store_operation).
 
@@ -5525,11 +5619,11 @@ fn method_not_found(message: impl Into<String>) -> JSONRPCErrorError
 fn invalid_params(message: impl Into<String>) -> JSONRPCErrorError
 ```
 
-**Purpose**: Builds a JSON-RPC error object for parameter validation failures using code `-32602`. It is used when the method exists but the supplied arguments are malformed or semantically invalid.
+**Purpose**: Builds a JSON-RPC error saying the method exists, but the client supplied bad arguments. This is different from an invalid request: the request is understandable, but its details are wrong.
 
-**Data flow**: Accepts a message, forwards it with `INVALID_PARAMS_ERROR_CODE` to `error`, and returns the resulting error object.
+**Data flow**: It receives a message explaining what was wrong with the parameters. It attaches the standard “invalid params” code and returns a structured error object.
 
-**Call relations**: Called by parameter-parsing and validation code such as process/terminal request handlers.
+**Call relations**: This is used by code that checks specific request details, such as terminal size conversion, standard-input writing, general writing, and process spawning. Those callers decide what is wrong; this function turns that decision into the correct JSON-RPC error response by calling `error`.
 
 *Call graph*: calls 1 internal fn (error); called by 5 (write, terminal_size_from_protocol, write_stdin, process_spawn, terminal_size_from_protocol).
 
@@ -5540,11 +5634,11 @@ fn invalid_params(message: impl Into<String>) -> JSONRPCErrorError
 fn internal_error(message: impl Into<String>) -> JSONRPCErrorError
 ```
 
-**Purpose**: Builds a JSON-RPC error object for server-side failures using code `-32603`. It is the generic fallback for unexpected internal problems.
+**Purpose**: Builds a JSON-RPC error saying something went wrong inside the server. It is used when the client request may be reasonable, but the server failed while trying to process it.
 
-**Data flow**: Accepts a message, forwards it with `INTERNAL_ERROR_CODE` to `error`, and returns the resulting `JSONRPCErrorError`.
+**Data flow**: It takes an explanatory message, combines it with the standard “internal error” code, and returns a JSON-RPC error object with no extra data attached.
 
-**Call relations**: Used broadly across server orchestration and request handling when internal operations fail after a request has already been accepted.
+**Call relations**: Server internals call this when failures occur during flows such as startup, uninitialized startup, response sending, request cancellation, event handling, or client error notification. It uses `error` so internal failures are reported in the same format as other JSON-RPC errors.
 
 *Call graph*: calls 1 internal fn (error); called by 21 (apply_bespoke_event_handling, start, start_uninitialized, send_response_as, abort_pending_server_requests, cancel_requests_for_thread_cancels_all_thread_requests, notify_client_error_forwards_error_to_waiter, send_error_routes_to_target_connection, map_error, map_fs_error (+11 more)).
 
@@ -5555,24 +5649,24 @@ fn internal_error(message: impl Into<String>) -> JSONRPCErrorError
 fn error(code: i64, message: impl Into<String>) -> JSONRPCErrorError
 ```
 
-**Purpose**: Private helper that constructs the actual `JSONRPCErrorError` struct from a code and message. It ensures all exported constructors produce the same `data: None` shape.
+**Purpose**: Creates the actual JSON-RPC error object used by all the named helper functions. It is the single place that defines the common error shape: code, message, and no extra data.
 
-**Data flow**: Consumes an `i64` code and message convertible into `String`, converts the message, and returns `JSONRPCErrorError { code, message, data: None }`.
+**Data flow**: It receives a numeric error code and a message value that can be turned into text. It converts the message into a `String`, puts the code and message into a `JSONRPCErrorError`, sets the optional data field to empty, and returns that object.
 
-**Call relations**: Called by all four public constructor helpers in this module.
+**Call relations**: The four named helpers call this after choosing the right standard code. Because they all funnel through this one builder, the rest of the server can create different kinds of errors without duplicating the object-building details.
 
 *Call graph*: called by 4 (internal_error, invalid_params, invalid_request, method_not_found); 1 external calls (into).
 
 
 ### `mcp-server/src/outgoing_message.rs`
 
-`io_transport` · `cross-cutting`
+`io_transport` · `request handling and outgoing message delivery`
 
-This file is the outbound transport abstraction for the MCP server. `OutgoingMessageSender` wraps an unbounded Tokio sender plus two pieces of state: an `AtomicI64` used to allocate monotonically increasing numeric request ids for server-originated requests, and a mutex-protected `HashMap<RequestId, oneshot::Sender<Value>>` that stores the callback channel waiting for each client response. That callback map is what lets features like approval elicitation send a request to the client and later resume when `process_response` delivers the matching result.
+This file solves a practical communication problem: the server needs a safe, consistent way to talk back to the client. Some messages are simple announcements, some are replies to client requests, and some are server requests that need an answer later. Without this file, different parts of the server could format messages differently, lose track of replies, or send invalid JSON-RPC, which is the standard message shape used here.
 
-The sender exposes four main operations. `send_request` allocates an id, stores a oneshot sender in the callback map, enqueues an `OutgoingMessage::Request`, and returns the receiver. `notify_client_response` removes the callback entry and forwards the raw JSON result into the waiting oneshot, warning if the id is unknown or the receiver has gone away. `send_response` serializes any `Serialize` payload into JSON and falls back to `send_error` with `internal_error` if serialization fails. `send_event_as_notification` converts a Codex `Event` into a `codex/event` notification, optionally wrapping it in `OutgoingNotificationParams` so `_meta.requestId` and `_meta.threadId` can be attached for MCP multiplexing.
+The main piece is `OutgoingMessageSender`. Think of it like a post office counter. Other server code hands it a message. It puts the right label on it, gives requests a unique ID, and drops the message into a channel, which is an in-memory queue used by asynchronous tasks. When the server sends a request to the client, it also stores a one-time callback in a map. Later, when the client’s response arrives, that stored callback is used to wake whoever was waiting.
 
-The file also defines the internal `OutgoingMessage` enum and the `From<OutgoingMessage> for OutgoingJsonRpcMessage` conversion that flattens custom RMCP request/notification wrappers into standard JSON-RPC wire messages. Tests verify both flattening behavior and the exact notification payload shape with and without `_meta`.
+The file also defines the message shapes: request, notification, response, and error. It then converts those internal shapes into real JSON-RPC 2.0 messages. There is special support for sending Codex events as MCP notifications, including optional `_meta` data such as the original request ID or thread ID when several conversations share one connection.
 
 #### Function details
 
@@ -5582,11 +5676,11 @@ The file also defines the internal `OutgoingMessage` enum and the `From<Outgoing
 fn new(sender: mpsc::UnboundedSender<OutgoingMessage>) -> Self
 ```
 
-**Purpose**: Creates a fresh outbound sender with request-id allocation and an empty callback registry. It is the constructor used by the main processor task.
+**Purpose**: Creates a new outgoing message sender around an existing message queue. Server code uses this when it wants one shared object responsible for sending messages and tracking replies.
 
-**Data flow**: It takes an `mpsc::UnboundedSender<OutgoingMessage>`, initializes `next_request_id` to zero, stores the sender, creates an empty `HashMap<RequestId, oneshot::Sender<Value>>` inside a Tokio `Mutex`, and returns `OutgoingMessageSender`.
+**Data flow**: It receives an unbounded sender, which is the sending half of an in-memory queue. It creates a request counter starting at zero and an empty map for pending request callbacks. The result is an `OutgoingMessageSender` ready to be shared by server code.
 
-**Call relations**: It is called from `run_main` before constructing `MessageProcessor`, and also from tests that exercise outbound behavior in isolation. All later send/notify methods operate on the state initialized here.
+**Call relations**: This is the setup step for the rest of the file. Later calls such as `send_request`, `send_response`, `send_notification`, and `send_error` all depend on the queue and callback map created here.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -5601,11 +5695,11 @@ async fn send_request(
     ) -> oneshot::Receiver<Value>
 ```
 
-**Purpose**: Sends a server-originated JSON-RPC request to the client and returns a oneshot receiver for the eventual response payload. It is the core primitive used for elicitation flows.
+**Purpose**: Sends a request from the server to the client and gives the caller a way to wait for the client’s answer. This is used when the server needs the client to make a decision or provide data, not just receive a notification.
 
-**Data flow**: Inputs are a method string and optional JSON params. It atomically allocates a numeric `RequestId`, creates a oneshot channel, inserts the sender half into `request_id_to_callback` under that id, constructs `OutgoingMessage::Request(OutgoingRequest { id, method, params })`, sends it on the unbounded channel, and returns the receiver half. If the channel send fails, the receiver is still returned but will never be fulfilled unless some other path injects a response.
+**Data flow**: It takes a method name and optional JSON parameters. It creates a fresh numeric request ID, creates a one-use response channel, stores the sending end of that response channel under the request ID, then sends an outgoing request into the message queue. It returns the receiving end, so the caller can wait for the later response value.
 
-**Call relations**: It is used by approval modules such as `handle_exec_approval_request` and `handle_patch_approval_request` to ask the client for approval. The matching response later flows back through `notify_client_response`.
+**Call relations**: This function starts a request-and-reply story. It sends an `OutgoingMessage::Request`; later, when another part of the server sees the client’s reply, `notify_client_response` uses the saved request ID to deliver the answer back to the original waiter.
 
 *Call graph*: 5 external calls (fetch_add, send, Number, Request, channel).
 
@@ -5616,11 +5710,11 @@ async fn send_request(
 async fn notify_client_response(&self, id: RequestId, result: Value)
 ```
 
-**Purpose**: Matches an inbound client response to the callback registered for that request id and delivers the raw JSON result. It also cleans up the callback map entry.
+**Purpose**: Delivers a client response to the server task that originally sent the matching request. It is the other half of `send_request`.
 
-**Data flow**: It takes a `RequestId` and `Value`, locks `request_id_to_callback`, removes the entry for that id, and if found sends the result into the stored oneshot sender. If the send fails because the receiver was dropped, or if no entry exists, it emits a warning. It returns unit.
+**Data flow**: It receives a request ID and a JSON result from the client. It looks up that ID in the pending-callback map and removes it, because each response should be used only once. If a waiting callback exists, it sends the result through it; if not, or if the receiver has gone away, it writes a warning.
 
-**Call relations**: It is called by `MessageProcessor::process_response` whenever the client sends a JSON-RPC response. Its successful path wakes tasks spawned by code that previously called `send_request`.
+**Call relations**: This function completes the flow begun by `send_request`. It does not send a JSON-RPC message outward; instead, it connects an incoming client response back to the local Rust task that was waiting for it.
 
 *Call graph*: 1 external calls (warn!).
 
@@ -5631,11 +5725,11 @@ async fn notify_client_response(&self, id: RequestId, result: Value)
 async fn send_response(&self, id: RequestId, response: T)
 ```
 
-**Purpose**: Serializes a typed response payload and enqueues it as a JSON-RPC success response. Serialization failures are converted into JSON-RPC internal errors for the same request id.
+**Purpose**: Sends a successful response to a request that came from the client. It lets server code reply with any serializable Rust value instead of manually building JSON.
 
-**Data flow**: Inputs are a request id and any `T: Serialize`. It attempts `serde_json::to_value(response)`; on success it wraps the result in `OutgoingMessage::Response(OutgoingResponse { id, result })` and sends it on the channel. On serialization failure it calls `send_error` with `ErrorData::internal_error(format!(...))` and returns unit.
+**Data flow**: It receives the client’s request ID and a response value. It tries to turn that value into JSON. If that succeeds, it wraps the JSON as an outgoing response and sends it to the queue. If serialization fails, it sends a JSON-RPC internal error instead.
 
-**Call relations**: It is used throughout request handlers such as initialization, ping, tool listing, and tool-call error paths. Its fallback to `send_error` ensures malformed response payloads still produce a protocol-level reply.
+**Call relations**: This is the normal success path for answering client requests. When the response value cannot be turned into JSON, it hands off to `send_error` so the client still receives a clear failure message rather than silence.
 
 *Call graph*: calls 1 internal fn (send_error); 5 external calls (internal_error, send, Response, format!, to_value).
 
@@ -5650,11 +5744,11 @@ async fn send_event_as_notification(
     )
 ```
 
-**Purpose**: Converts a Codex protocol `Event` into a `codex/event` MCP notification, optionally attaching `_meta` fields for request and thread correlation. It preserves the raw event payload when wrapper serialization fails.
+**Purpose**: Sends a Codex protocol event to the client as an MCP notification. This is used for server-to-client updates that are not direct replies, such as session events.
 
-**Data flow**: Inputs are an `Event` reference and optional `OutgoingNotificationMeta`. It serializes the event to JSON, then tries to serialize `OutgoingNotificationParams { meta, event: event_json.clone() }`; if that wrapper fails it warns and falls back to the plain event JSON. It then calls `send_notification` with method `codex/event` and the chosen params. It returns unit.
+**Data flow**: It receives a Codex event and optional notification metadata. It serializes the event into JSON. If metadata is present, it tries to wrap the metadata and event together so the JSON has an MCP-style `_meta` field plus the event fields. If that wrapping fails, it falls back to sending just the event JSON and logs a warning. It then sends a `codex/event` notification.
 
-**Call relations**: It is called by session-running code that streams Codex events back to the MCP client. Internally it delegates the actual enqueueing to `send_notification`.
+**Call relations**: This is a specialized helper for MCP event streaming. After shaping the event payload, it delegates the actual queue send to `send_notification`, keeping the low-level notification-sending path in one place.
 
 *Call graph*: calls 1 internal fn (send_notification); 2 external calls (to_value, warn!).
 
@@ -5665,11 +5759,11 @@ async fn send_event_as_notification(
 async fn send_notification(&self, notification: OutgoingNotification)
 ```
 
-**Purpose**: Enqueues an outbound JSON-RPC notification without expecting any response. It is the low-level notification primitive.
+**Purpose**: Sends a one-way message to the client. A notification is like an announcement: it does not expect a response.
 
-**Data flow**: It takes an `OutgoingNotification`, wraps it in `OutgoingMessage::Notification`, sends it on the unbounded channel, and returns unit. Channel send failure is ignored.
+**Data flow**: It receives an `OutgoingNotification`, wraps it as an outgoing message, and pushes it into the message queue. It does not return a reply channel or record any callback.
 
-**Call relations**: It is called directly by `send_event_as_notification` and could be used by other server code needing fire-and-forget notifications. The stdout writer later converts the queued message into wire JSON.
+**Call relations**: This is the shared sending path for notifications. `send_event_as_notification` calls it after building the special `codex/event` notification payload.
 
 *Call graph*: called by 1 (send_event_as_notification); 2 external calls (send, Notification).
 
@@ -5680,11 +5774,11 @@ async fn send_notification(&self, notification: OutgoingNotification)
 async fn send_error(&self, id: RequestId, error: ErrorData)
 ```
 
-**Purpose**: Enqueues a JSON-RPC error response for a specific request id. It is the low-level error primitive used across the server.
+**Purpose**: Sends an error response for a specific client request. This tells the client that its request could not be completed and includes structured error details.
 
-**Data flow**: Inputs are a request id and `ErrorData`. It wraps them in `OutgoingMessage::Error(OutgoingError { id, error })`, sends that enum value on the unbounded channel, and returns unit. Channel send failure is ignored.
+**Data flow**: It receives the request ID and an `ErrorData` value. It wraps those into an outgoing error message and sends it into the queue. It does not wait for any response.
 
-**Call relations**: It is called directly by handlers that need to reject requests and indirectly by `send_response` when response serialization fails. The queued error is later converted to `JsonRpcMessage::Error` by `OutgoingJsonRpcMessage::from`.
+**Call relations**: This is used directly when server code needs to report failure. `send_response` also calls it when a supposedly successful response cannot be converted into JSON.
 
 *Call graph*: called by 1 (send_response); 2 external calls (send, Error).
 
@@ -5695,11 +5789,11 @@ async fn send_error(&self, id: RequestId, error: ErrorData)
 fn from(val: OutgoingMessage) -> Self
 ```
 
-**Purpose**: Transforms the server’s internal outbound message enum into the flattened RMCP JSON-RPC wire representation. It is the final structural conversion before serialization to stdout.
+**Purpose**: Converts this file’s internal outgoing message types into the JSON-RPC 2.0 message type expected by the MCP library. This is the final packaging step before serialization to the client.
 
-**Data flow**: It consumes an `OutgoingMessage` and pattern-matches each variant. Requests become `JsonRpcMessage::Request(JsonRpcRequest { jsonrpc: 2.0, id, request: CustomRequest::new(method, params) })`; notifications become `JsonRpcMessage::Notification(JsonRpcNotification { ... CustomNotification::new(...) })`; responses become `JsonRpcMessage::Response(JsonRpcResponse { ... })`; errors become `JsonRpcMessage::Error(JsonRpcError { id: Some(id), error, ... })`. It returns the constructed `OutgoingJsonRpcMessage`.
+**Data flow**: It receives an `OutgoingMessage`, checks which kind it is, and builds the matching JSON-RPC request, notification, response, or error. It preserves the request ID, method name, parameters, result, or error data as appropriate, and adds the JSON-RPC version marker.
 
-**Call relations**: It is used by the stdout writer task in `run_main` when draining the outgoing channel. This conversion is what ensures internal request/notification structs flatten into standard JSON-RPC `method`/`params` fields on the wire.
+**Call relations**: The sender methods create internal `OutgoingMessage` values because they are convenient for server code. This conversion turns those values into the standardized wire format used by the transport layer.
 
 *Call graph*: 6 external calls (new, new, Error, Notification, Request, Response).
 
@@ -5710,11 +5804,11 @@ fn from(val: OutgoingMessage) -> Self
 fn outgoing_request_serializes_as_jsonrpc_request()
 ```
 
-**Purpose**: Checks that an internal outbound request converts into a flattened JSON-RPC request object with top-level `method` and `params`. It guards against RMCP wrapper fields leaking into serialized output.
+**Purpose**: Checks that an outgoing request becomes a proper JSON-RPC request when serialized. This protects the exact wire shape clients expect.
 
-**Data flow**: It constructs an `OutgoingMessage::Request`, converts it into `OutgoingJsonRpcMessage`, serializes to `serde_json::Value`, inspects the resulting object, and asserts the expected `jsonrpc`, `id`, `method`, and `params` fields are present while `request` is absent.
+**Data flow**: The test builds a request with an ID, method, and parameters, converts it into an outgoing JSON-RPC message, then serializes it to JSON. It verifies that the JSON has `jsonrpc`, `id`, `method`, and `params` fields and does not contain an unwanted wrapper field.
 
-**Call relations**: This unit test validates the `From<OutgoingMessage>` implementation used by the stdout writer. It specifically covers the request branch.
+**Call relations**: This test exercises `OutgoingJsonRpcMessage::from` for request messages. It is run by the test runner to catch formatting regressions before they affect real clients.
 
 *Call graph*: 6 external calls (Number, Request, assert!, assert_eq!, json!, to_value).
 
@@ -5725,11 +5819,11 @@ fn outgoing_request_serializes_as_jsonrpc_request()
 fn outgoing_notification_serializes_as_jsonrpc_notification()
 ```
 
-**Purpose**: Checks that an internal outbound notification serializes as a flattened JSON-RPC notification. It also verifies that absent params become JSON null and no nested `notification` field remains.
+**Purpose**: Checks that an outgoing notification becomes a proper JSON-RPC notification when serialized. This matters because notifications must look different from requests: they have no request ID.
 
-**Data flow**: It builds an `OutgoingMessage::Notification`, converts and serializes it, then asserts the top-level `jsonrpc`, `method`, and `params` values and the absence of a `notification` wrapper field.
+**Data flow**: The test builds a notification, converts it into a JSON-RPC message, and serializes it to JSON. It verifies the version and method fields, confirms the parameters are represented as JSON null when absent, and checks that no unwanted wrapper field appears.
 
-**Call relations**: This test complements `tests::outgoing_request_serializes_as_jsonrpc_request` by covering the notification branch of `OutgoingJsonRpcMessage::from`.
+**Call relations**: This test exercises `OutgoingJsonRpcMessage::from` for notification messages. It helps ensure the MCP library’s custom notification type is flattened into the JSON-RPC shape clients actually read.
 
 *Call graph*: 4 external calls (Notification, assert!, assert_eq!, to_value).
 
@@ -5740,11 +5834,11 @@ fn outgoing_notification_serializes_as_jsonrpc_notification()
 async fn test_send_event_as_notification() -> Result<()>
 ```
 
-**Purpose**: Verifies that sending an event notification without metadata emits a `codex/event` notification whose params are exactly the serialized event object. It confirms the no-meta fast path.
+**Purpose**: Checks that a Codex event without extra metadata is sent as a `codex/event` notification. This verifies the basic event-to-client path.
 
-**Data flow**: It creates an unbounded channel and `OutgoingMessageSender`, constructs a realistic `Event::SessionConfigured` payload, calls `send_event_as_notification(&event, None)`, receives the queued `OutgoingMessage`, pattern-matches it as a notification, and compares its method and params against the expected serialized event JSON.
+**Data flow**: The test creates an in-memory outgoing queue, builds an `OutgoingMessageSender`, creates a sample session-configured event, and asks the sender to send it as a notification. It then reads the queued message and confirms the method is `codex/event` and the parameters match the event JSON.
 
-**Call relations**: This test exercises `OutgoingMessageSender::send_event_as_notification` and indirectly `send_notification`. It validates the branch where no `_meta` wrapper is attached.
+**Call relations**: This test calls `OutgoingMessageSender::new` and `send_event_as_notification`. Through that helper, it also exercises the notification-sending path used for real MCP event updates.
 
 *Call graph*: calls 4 internal fn (new, read_only, new, new); 7 external calls (new, assert_eq!, test_path_buf, panic!, default, SessionConfigured, to_value).
 
@@ -5755,11 +5849,11 @@ async fn test_send_event_as_notification() -> Result<()>
 async fn test_send_event_as_notification_with_meta() -> Result<()>
 ```
 
-**Purpose**: Verifies that event notifications with metadata include an `_meta` object containing `requestId` while preserving the event payload fields. It checks the wrapper serialization path.
+**Purpose**: Checks that event notifications can include MCP `_meta` data, specifically a request ID. This makes sure clients can connect an event back to the request that caused it.
 
-**Data flow**: It sets up a sender and channel, constructs a `SessionConfigured` event plus `OutgoingNotificationMeta { request_id: Some(...), thread_id: None }`, sends the event, receives the queued notification, and asserts the params JSON matches the expected object with `_meta.requestId` and the flattened event body.
+**Data flow**: The test creates a sender and a sample event, then adds metadata containing a string request ID. After sending the event as a notification, it reads the queued notification and compares the JSON payload against the expected structure with `_meta.requestId` plus the event fields.
 
-**Call relations**: This test covers the metadata branch of `send_event_as_notification`. It ensures MCP-specific correlation data is inserted in the shape expected by clients.
+**Call relations**: This test focuses on the metadata-wrapping branch inside `send_event_as_notification`. It confirms that the helper still sends through the normal notification path while enriching the payload.
 
 *Call graph*: calls 4 internal fn (new, read_only, new, new); 8 external calls (new, String, assert_eq!, test_path_buf, json!, panic!, default, SessionConfigured).
 
@@ -5770,24 +5864,26 @@ async fn test_send_event_as_notification_with_meta() -> Result<()>
 async fn test_send_event_as_notification_with_meta_and_thread_id() -> Result<()>
 ```
 
-**Purpose**: Verifies that event notifications can carry both `requestId` and `threadId` in `_meta`. It protects the multiplexing metadata used when multiple Codex threads share one MCP connection.
+**Purpose**: Checks that event notifications can include both a request ID and a thread ID in `_meta`. This is important when several conversation threads share one MCP connection.
 
-**Data flow**: It constructs a sender, event, and `OutgoingNotificationMeta` containing both a string request id and a `ThreadId`, sends the event, receives the queued notification, and asserts the params JSON includes `_meta.requestId`, `_meta.threadId`, and the expected event body.
+**Data flow**: The test creates a sender, a thread ID, a sample event, and metadata containing both the request ID and thread ID. It sends the notification, receives the queued message, and verifies that the JSON contains the expected `_meta.requestId`, `_meta.threadId`, and event content.
 
-**Call relations**: This test extends the previous metadata test to the full correlation case. It validates the exact serialized shape consumed by clients that need thread-aware event routing.
+**Call relations**: This test covers the richer metadata case in `send_event_as_notification`. It protects the behavior described by the file’s comments: thread information must travel with notifications when multiplexed threads are involved.
 
 *Call graph*: calls 4 internal fn (new, read_only, new, new); 8 external calls (new, String, assert_eq!, test_path_buf, json!, panic!, default, SessionConfigured).
 
 
 ### `tui/src/app_server_approval_conversions.rs`
 
-`util` · `request handling`
+`domain_logic` · `approval request handling and display`
 
-This file contains two small but important translation functions used around approval UX. `granted_permission_profile_from_request` converts the core/native `codex_protocol::request_permissions::RequestPermissionProfile` into the app-server-facing `GrantedPermissionProfile`, preserving optional network permissions and converting file-system permissions through the protocol's `Into` implementation. `file_update_changes_to_display` converts a vector of app-server `FileUpdateChange` records into the TUI's `HashMap<PathBuf, FileChange>` display model, mapping each `PatchChangeKind` variant to the corresponding `FileChange::{Add,Delete,Update}` shape and keying by the changed path.
+The terminal UI receives and sends approval information: for example, which extra network or file access was granted, and which files a proposed patch would change. Different parts of the system describe that information in slightly different forms. This file is the small adapter between those forms, like a plug converter between two devices.
 
-The tests are concrete and reveal intended invariants. They verify that add diffs become `FileChange::Add`, that request-permission payloads with legacy `read`/`write` lists are canonicalized into `entries` in the granted profile, and that already-canonical `entries` survive unchanged. The local `absolute_path` helper exists only to build valid `AbsolutePathBuf` fixtures for those tests.
+One helper turns a core permission request into the app-server format used when reporting a granted permission. It preserves the network setting and converts the file-system permission section into the app-server version.
 
-Overall, this module is intentionally narrow: it does not own approval logic, only the exact shape conversions needed where the TUI diverges from raw app-server types or needs a richer display-oriented file-change map.
+The other helper turns a list of file update records from the app-server protocol into the UI’s display model. The server says, in protocol terms, “this path was added, deleted, or updated, with this diff.” The UI wants a map from file path to a display-friendly `FileChange`, so it can show the right kind of change in the approval screen.
+
+Without this file, approval screens would either need conversion code scattered through the UI, or the UI could send and display permission information in the wrong shape.
 
 #### Function details
 
@@ -5799,11 +5895,11 @@ fn granted_permission_profile_from_request(
 ) -> GrantedPermissionProfile
 ```
 
-**Purpose**: Transforms a core request-permissions profile into the app-server's granted-permissions payload shape.
+**Purpose**: Turns a core permission request into the app-server format for a granted permission. This is used when the UI needs to submit or describe what permission was approved.
 
-**Data flow**: It takes a `CoreRequestPermissionProfile` by value. It reads `value.network` and, when present, maps it into `AdditionalNetworkPermissions { enabled: network.enabled }`. It reads `value.file_system` and converts it with `Into::into`. It returns a new `GrantedPermissionProfile` and writes no external state.
+**Data flow**: It receives a core `RequestPermissionProfile`, which may contain network permission and file-system permission sections. It copies the network `enabled` value into the app-server network permission type, converts the file-system section into the app-server type, and returns a `GrantedPermissionProfile` ready for outbound use.
 
-**Call relations**: This helper is used when formatting requested-permissions rules for outbound submission/display. It isolates the protocol boundary so callers can work with the core-native request type and only convert at the app-server edge.
+**Call relations**: When permission rules are being formatted for approval, `format_requested_permissions_rule` calls this helper so it can work with the granted-permission shape expected by the app-server protocol. The helper does only the translation step and hands the finished profile back to that larger approval-formatting flow.
 
 *Call graph*: called by 1 (format_requested_permissions_rule).
 
@@ -5816,11 +5912,11 @@ fn file_update_changes_to_display(
 ) -> HashMap<PathBuf, FileChange>
 ```
 
-**Purpose**: Converts app-server file-update change records into the TUI's per-path diff display model.
+**Purpose**: Converts file-change records from the app-server protocol into the UI’s own file-change display model. This lets the approval UI show added, deleted, and updated files in the form it expects.
 
-**Data flow**: It consumes `Vec<FileUpdateChange>`, iterates through each change, converts `change.path` into a `PathBuf`, pattern-matches `change.kind`, and builds a `FileChange::Add`, `FileChange::Delete`, or `FileChange::Update { unified_diff, move_path }` using `change.diff` and any move target. It collects the `(PathBuf, FileChange)` pairs into a `HashMap<PathBuf, FileChange>` and returns it.
+**Data flow**: It receives a list of `FileUpdateChange` values. For each one, it turns the path string into a `PathBuf`, looks at whether the patch adds, deletes, or updates the file, and builds the matching `FileChange`. It returns a `HashMap` keyed by file path, so the UI can look up each displayed file change by its path.
 
-**Call relations**: This function serves approval and diff-rendering code that needs a display-friendly map keyed by path rather than raw protocol records. It performs the one-time normalization before UI rendering.
+**Call relations**: This helper sits at the boundary between protocol data and UI display data. No specific caller is shown in the provided call graph, but its role is to be used when app-server patch information needs to be shown through the terminal UI’s diff display model.
 
 
 ##### `tests::absolute_path`  (lines 73–75)
@@ -5829,11 +5925,11 @@ fn file_update_changes_to_display(
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an `AbsolutePathBuf` test fixture from a string path and fails the test if the path is not absolute.
+**Purpose**: Creates an absolute path value for tests. It keeps the test cases short and makes sure test paths are valid absolute paths.
 
-**Data flow**: It takes `&str`, converts it to `PathBuf`, then calls `AbsolutePathBuf::try_from(...)`. On success it returns the absolute path wrapper; on failure it panics via `expect`.
+**Data flow**: It receives a path string, turns it into a normal `PathBuf`, then tries to convert that into an `AbsolutePathBuf`. If the string is not an absolute path, the test fails immediately; otherwise it returns the absolute path object.
 
-**Call relations**: This helper is only used inside the module's tests to keep fixture construction concise and to guarantee valid absolute-path inputs for permission-profile assertions.
+**Call relations**: The permission-conversion tests call this helper when building sample read and write paths. It prepares realistic path values so the tests can focus on permission conversion rather than path setup.
 
 *Call graph*: calls 1 internal fn (try_from); 1 external calls (from).
 
@@ -5844,11 +5940,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn converts_file_update_changes_to_display()
 ```
 
-**Purpose**: Verifies that an app-server add-change becomes the expected `FileChange::Add` entry in the display map.
+**Purpose**: Checks that an app-server file-add record becomes the UI’s display form for an added file. This protects the file-change conversion from accidental shape changes.
 
-**Data flow**: It constructs a one-element `Vec<FileUpdateChange>`, passes it to `file_update_changes_to_display`, and compares the returned `HashMap<PathBuf, FileChange>` against an expected literal with `assert_eq!`.
+**Data flow**: It builds one `FileUpdateChange` for adding `foo.txt` with simple diff text. It passes that list into `file_update_changes_to_display`, then compares the result with the expected map from `foo.txt` to `FileChange::Add` containing the same text.
 
-**Call relations**: This test exercises the add-path branch of `file_update_changes_to_display` and documents the intended path-keyed output shape.
+**Call relations**: This test exercises `file_update_changes_to_display` directly. It confirms that the protocol-to-display adapter produces the exact structure the rest of the UI expects.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5859,11 +5955,11 @@ fn converts_file_update_changes_to_display()
 fn converts_request_permissions_into_granted_permissions()
 ```
 
-**Purpose**: Checks that legacy-style request permissions with separate read/write lists are converted into a granted profile with canonical sandbox entries.
+**Purpose**: Checks that requested network and file permissions become the expected granted-permission profile. It also verifies the file-system permission data is expressed in the canonical entry-list form.
 
-**Data flow**: It builds an app-server `RequestPermissionProfile` containing network and file-system permissions, converts it into the core request type with `try_from`, passes that to `granted_permission_profile_from_request`, and asserts that the result contains the expected network flag plus synthesized `entries` for read and write paths.
+**Data flow**: It builds a sample request with network enabled, one read path, and one write path. The request is first converted into the core permission type, then passed into `granted_permission_profile_from_request`. The test compares the output with the expected app-server granted profile, including read and write sandbox entries.
 
-**Call relations**: This test documents that the conversion preserves semantics while canonicalizing file-system permissions into the app-server's granted-profile representation.
+**Call relations**: This test exercises `granted_permission_profile_from_request` using a common permission request shape. It depends on the test path helper to create valid absolute paths, then verifies the conversion result with an equality check.
 
 *Call graph*: 3 external calls (try_from, assert_eq!, vec!).
 
@@ -5874,10 +5970,10 @@ fn converts_request_permissions_into_granted_permissions()
 fn converts_request_permissions_into_canonical_granted_permissions()
 ```
 
-**Purpose**: Verifies that already-canonical file-system permission entries remain unchanged when converted into a granted profile.
+**Purpose**: Checks that a request already using the canonical file-system entry format stays correct after conversion. This guards against losing special path permissions such as root access.
 
-**Data flow**: It constructs a `RequestPermissionProfile` whose file-system permissions are expressed directly as `entries`, converts it to the core request type, feeds it to `granted_permission_profile_from_request`, and asserts equality with the expected `GrantedPermissionProfile`.
+**Data flow**: It builds a request with no network section and one file-system entry for the special root path with write access. After converting that request into the core type, it passes it into `granted_permission_profile_from_request` and compares the result with the expected granted profile containing the same special entry.
 
-**Call relations**: This test covers the non-legacy path of the conversion and ensures the helper does not rewrite or lose canonical sandbox entries.
+**Call relations**: This test covers a second path through `granted_permission_profile_from_request`: permissions that are already written as sandbox entries. It complements the other permission test, which starts from older read/write path lists.
 
 *Call graph*: 3 external calls (try_from, assert_eq!, vec!).

@@ -1,10 +1,10 @@
 # TUI text layout, wrapping, and text-rendering primitives  `stage-22.2.3`
 
-This stage is cross-cutting rendering infrastructure for the TUI’s main drawing path. It sits underneath higher-level widgets and views, turning styled text, markdown, ANSI output, and diff content into terminal-width-aware rows that can be measured, wrapped, truncated, scrolled, and finally emitted without breaking styling or hyperlinks.
+This stage is shared behind-the-scenes support for drawing text in the terminal interface. It is used whenever the app needs to show output, Markdown, diffs, links, or styled lines inside a limited screen area.
 
-At the geometry layer, tui/src/render/mod.rs supplies Insets and safe rectangle-shrinking helpers, while tui/src/render/line_utils.rs standardizes line ownership conversion and prefix composition used by many renderers. tui/src/width.rs adds guard checks so wrapping code can bail out when prefixes leave no usable columns. ansi-escape/src/lib.rs converts ANSI-colored strings into ratatui text with project-specific tab handling. tui/src/line_truncation.rs measures and cuts Line values at display-cell boundaries without losing style or alignment.
+The geometry helper in render/mod.rs lets drawing code add padding inside a rectangle, like leaving margins in a page. line_utils.rs prepares display lines so they can be safely stored, copied, and given prefixes. width.rs checks whether there is any usable space left after those prefixes. ansi-escape/src/lib.rs converts colored terminal output into drawable text and expands tabs so columns line up.
 
-For richer text, tui/src/markdown_text_merge.rs coalesces fragmented markdown text events so visible runs such as URLs stay recognizable. tui/src/terminal_hyperlinks.rs then tracks hyperlinks separately from visible text and cooperates with tui/src/wrapping.rs, whose standard and hyperlink-preserving wrappers produce layout-safe lines and byte-range mappings. tui/src/live_wrap.rs supports incremental streamed wrapping, and cloud-tasks/src/scrollable_diff.rs builds on these primitives to provide cached, width-aware, vertically scrollable wrapped diff views.
+Several files then shape text to fit. line_truncation.rs measures and cuts styled text without splitting wide characters such as emoji. wrapping.rs wraps rich terminal text while preserving styling, indentation, byte positions, and whole clickable URLs. live_wrap.rs does similar wrapping for incoming plain text. markdown_text_merge.rs joins adjacent Markdown text pieces after parsing so rendering sees smoother text. terminal_hyperlinks.rs keeps link targets separate from visible words until the final drawing step. scrollable_diff.rs uses these pieces to show wrapped diffs and messages with a valid scroll position.
 
 ## Files in this stage
 
@@ -13,13 +13,15 @@ These small primitives define common rectangle and line composition helpers that
 
 ### `tui/src/render/mod.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting during terminal rendering`
 
-This module is the lightweight root of the rendering subsystem. Beyond declaring the `highlight`, `line_utils`, and `renderable` submodules, it defines a compact `Insets` value type and a `RectExt` extension trait implemented for ratatui's `Rect`.
+Terminal screens are drawn by giving each widget a rectangle: an x and y position, plus a width and height. Many parts of the interface need the same simple operation: take a rectangle and carve out some inside space so text, borders, popups, or menus do not touch the edges. This file provides that shared language.
 
-`Insets` stores four unsigned margins—`left`, `top`, `right`, and `bottom`—and offers two constructors tailored to common layout patterns. `Insets::tlbr` accepts explicit top/left/bottom/right values, while `Insets::vh` creates symmetric vertical and horizontal padding by assigning the same `v` to top and bottom and the same `h` to left and right. The fields are private, so these constructors are the intended way to build instances outside the module.
+The main type is `Insets`, which means “how much space to remove from each side.” It stores separate values for the left, top, right, and bottom sides. There are two convenient ways to create one: `tlbr` when each side may be different, and `vh` when the vertical sides share one value and the horizontal sides share another.
 
-`RectExt::inset` applies an `Insets` to a `Rect` using saturating arithmetic. It computes total horizontal and vertical padding with `saturating_add`, shifts `x` and `y` inward with `saturating_add`, and shrinks `width` and `height` with `saturating_sub`. That means oversized insets never underflow into huge dimensions; instead they collapse the rectangle toward zero size. This behavior is important for terminal layouts where widgets may be asked to render into very small areas and should degrade safely rather than panic or wrap arithmetic.
+The file also adds an `inset` method to `ratatui`'s `Rect` type. `ratatui` is the terminal user-interface library used by this project. Calling `inset` returns a smaller rectangle moved inward by the requested amounts. It uses saturating arithmetic, which means subtraction never goes below zero and addition never overflows. In plain terms: if someone asks for more padding than the rectangle can fit, the result becomes safely tiny instead of crashing or wrapping into nonsense sizes.
+
+It also names the rendering submodules that live under this folder, but its own real job is this reusable rectangle-padding helper.
 
 #### Function details
 
@@ -29,11 +31,11 @@ This module is the lightweight root of the rendering subsystem. Beyond declaring
 fn tlbr(top: u16, left: u16, bottom: u16, right: u16) -> Self
 ```
 
-**Purpose**: Constructs an `Insets` value from explicit top, left, bottom, and right margins.
+**Purpose**: Creates an `Insets` value when the caller wants to give the top, left, bottom, and right padding separately. This is useful for layouts where one side needs extra room, such as reserving space beside a text area or inside a popup.
 
-**Data flow**: It takes four `u16` arguments, assigns them to the corresponding private fields of `Insets`, and returns the new struct.
+**Data flow**: The caller provides four numbers: top, left, bottom, and right. The function stores those numbers in an `Insets` object with the matching side names. The output is that ready-to-use padding description; it does not change anything else.
 
-**Call relations**: This constructor is used throughout rendering code wherever asymmetric padding is needed around a widget or sub-rectangle.
+**Call relations**: Rendering and layout code call this when they need uneven spacing around a rectangle. Those callers later pass the returned `Insets` to rectangle-shrinking code so the final drawing area is moved inward by the requested side-specific amounts.
 
 *Call graph*: called by 15 (layout_areas_with_textarea_right_reserve, render_ref, render_ref, render_popup, render_ref, as_renderable, render_ref, from, render_lines, render_markdown_content (+5 more)).
 
@@ -44,11 +46,11 @@ fn tlbr(top: u16, left: u16, bottom: u16, right: u16) -> Self
 fn vh(v: u16, h: u16) -> Self
 ```
 
-**Purpose**: Constructs symmetric insets using one vertical value and one horizontal value.
+**Purpose**: Creates an `Insets` value from just two numbers: one vertical amount for both top and bottom, and one horizontal amount for both left and right. This is the quick path for ordinary padding where opposite sides match.
 
-**Data flow**: It takes `v` and `h`, assigns `top = bottom = v` and `left = right = h`, and returns the resulting `Insets`.
+**Data flow**: The caller provides a vertical value and a horizontal value. The function copies the vertical value into both `top` and `bottom`, and copies the horizontal value into both `left` and `right`. It returns the completed `Insets` value without touching any outside state.
 
-**Call relations**: This constructor is used by renderers that want uniform vertical and horizontal padding without specifying all four sides separately.
+**Call relations**: Rendering code calls this during common drawing tasks where a widget or menu needs even padding. The returned spacing is then used to shrink a `Rect`, giving later drawing code a cleaner inner area to paint into.
 
 *Call graph*: called by 7 (render, render, render, render, menu_surface_inset, render, render_ref).
 
@@ -59,22 +61,22 @@ fn vh(v: u16, h: u16) -> Self
 fn inset(&self, insets: Insets) -> Rect
 ```
 
-**Purpose**: Returns a new rectangle reduced by the supplied insets using saturating arithmetic to avoid underflow.
+**Purpose**: Returns a smaller rectangle inside the original one, based on the requested `Insets`. It is used to turn an outer area, such as a bordered box, into the inner area where content should actually be drawn.
 
-**Data flow**: It takes `&self` and an `Insets`, computes total horizontal and vertical padding, adds left/top to `x` and `y`, subtracts total padding from `width` and `height` with saturation, and returns the new `Rect`.
+**Data flow**: The function reads the original rectangle's position and size, plus the padding amounts from `Insets`. It moves the rectangle's starting x position right by the left inset and its y position down by the top inset. It then reduces the width by the left and right insets together, and the height by the top and bottom insets together. The result is a new `Rect`; the original rectangle is left unchanged. If the insets are too large, the math safely stops at zero-sized dimensions instead of producing invalid values.
 
-**Call relations**: This extension method is consumed by inset-aware renderables and layout code whenever a child should render inside padded bounds.
+**Call relations**: This method is the workhorse that uses the `Insets` created by `Insets::tlbr` or `Insets::vh`. Rendering code can ask for an inner rectangle and then hand that rectangle to lower-level drawing routines, so borders, margins, and reserved spaces stay consistent across the terminal interface.
 
 
 ### `tui/src/render/line_utils.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting during terminal rendering and tests`
 
-This file contains a compact set of text-line utilities used by multiple renderers. The main concern is ownership: many ratatui APIs produce borrowed `Line<'_>` values, but downstream rendering pipelines often need owned `Line<'static>` values that can be stored, combined, or returned without lifetime coupling. `line_to_static` performs that conversion by preserving the line's `style` and `alignment` while cloning each `Span`'s style and converting its content into an owned `Cow::Owned(String)`.
+The terminal UI uses ratatui `Line` and `Span` values to describe styled text. A `Span` is a piece of text with styling, and a `Line` is a row made from spans. Some lines borrow their text from elsewhere, which is efficient but can be awkward when the program needs to keep those lines after the original text might disappear. This file solves that by turning borrowed lines into fully owned lines, a bit like photocopying a note instead of holding a pointer to someone else’s notebook.
 
-`push_owned_lines` is a convenience wrapper that appends a slice of borrowed lines into an output `Vec<Line<'static>>` by repeatedly calling `line_to_static`. This avoids repeated boilerplate in transcript, markdown, command, and wrapping code.
+The helpers here are deliberately small. One function clones a single line into a `'static` line, meaning the new line owns its text and is not tied to the lifetime of the source. Another appends many such owned copies into an output list. A separate helper adds a prefix span to each line, using one prefix for the first line and another for later lines. That is useful for things like bullets, indentation, prompts, or continuation markers in wrapped text.
 
-The file also includes two formatting helpers. `prefix_lines` prepends one `Span` to the first line and another to all subsequent lines, preserving each original line's spans and reapplying the original line style to the reconstructed `Line`. This is used for bullets, gutters, and continuation prefixes. In tests, `is_blank_line_spaces_only` defines a narrow notion of blankness: a line is blank if it has no spans or every span is empty or consists only of literal spaces. Tabs and newlines are intentionally not treated as blank, which matters for line-buffering logic that distinguishes visually empty lines from other whitespace.
+There is also a test-only blank-line checker that treats a line as blank only when it has no spans or only space characters. Together, these utilities keep rendering code elsewhere simpler and safer by centralizing common line-copying and line-shaping tasks.
 
 #### Function details
 
@@ -84,11 +86,11 @@ The file also includes two formatting helpers. `prefix_lines` prepends one `Span
 fn line_to_static(line: &Line<'_>) -> Line<'static>
 ```
 
-**Purpose**: Clones a borrowed ratatui `Line` into an owned `Line<'static>` while preserving styling and alignment.
+**Purpose**: This function makes an owned copy of a ratatui text line. Someone uses it when they have a line that borrows text from somewhere else but need a version that can safely live on its own.
 
-**Data flow**: It takes `&Line<'_>`, copies the line's `style` and `alignment`, iterates its spans, clones each span's `style`, converts each span's content to an owned `String`, wraps that in `Cow::Owned`, collects the new spans, and returns the reconstructed `Line<'static>`.
+**Data flow**: It receives a reference to a `Line` whose text may be borrowed. It copies the line’s style, alignment, and each styled text span, turning every span’s text into an owned string. It returns a new `Line<'static>` that no longer depends on the original text source.
 
-**Call relations**: This is the core ownership-conversion helper used by `push_owned_lines` whenever borrowed lines need to be retained beyond their original lifetime.
+**Call relations**: This is the basic copying tool used by `push_owned_lines`. Other rendering code usually does not call it directly; instead, it asks `push_owned_lines` to copy several lines, and that helper calls `line_to_static` once for each line.
 
 *Call graph*: called by 1 (push_owned_lines).
 
@@ -99,11 +101,11 @@ fn line_to_static(line: &Line<'_>) -> Line<'static>
 fn push_owned_lines(src: &[Line<'a>], out: &mut Vec<Line<'static>>)
 ```
 
-**Purpose**: Appends owned copies of borrowed lines into an existing output vector.
+**Purpose**: This function copies a group of borrowed UI lines into an output list as fully owned lines. It is useful when render-building code wants to collect lines from different places without worrying about how long the original text will remain valid.
 
-**Data flow**: It takes a slice of borrowed `Line`s and a mutable `Vec<Line<'static>>`, iterates the source slice, converts each line with `line_to_static`, and pushes the result into `out`. It returns no value and mutates the destination vector.
+**Data flow**: It receives a slice of source lines and a mutable output vector. For each source line, it calls `line_to_static` to make an owned copy, then pushes that copy into the output vector. The source is unchanged, and the output list grows by the number of copied lines.
 
-**Call relations**: This helper is used by many higher-level renderers that accumulate output lines from borrowed sources. It delegates the actual cloning work to `line_to_static`.
+**Call relations**: This helper is used by several rendering paths, including command display, exploring display, transcript building, markdown appending, stacked field rendering, adaptive wrapping, and screen-limit tests. In those flows, higher-level code gathers text to show, then calls this function when it needs to add safe, owned copies to the final display list.
 
 *Call graph*: calls 1 internal fn (line_to_static); called by 9 (command_display_lines, exploring_display_lines, transcript_lines, user_shell_output_is_limited_by_screen_lines, append_markdown, append_markdown_agent, render_stacked_field, adaptive_wrap_lines, word_wrap_lines).
 
@@ -114,11 +116,11 @@ fn push_owned_lines(src: &[Line<'a>], out: &mut Vec<Line<'static>>)
 fn is_blank_line_spaces_only(line: &Line<'_>) -> bool
 ```
 
-**Purpose**: Determines whether a line is visually blank under a strict spaces-only definition used in tests.
+**Purpose**: This test-only function checks whether a UI line is blank in a very strict sense: it must be empty or contain only ordinary space characters. It exists to support tests that need predictable blank-line behavior.
 
-**Data flow**: It takes `&Line<'_>`, returns `true` immediately if the line has no spans, otherwise checks that every span is either empty or consists entirely of `' '` characters. It returns a boolean and does not mutate state.
+**Data flow**: It receives a reference to a line. If the line has no spans, it returns `true`. Otherwise, it examines every span and returns `true` only if each span is empty or made entirely of space characters; tabs, newlines, or other characters make the result `false`.
 
-**Call relations**: This test-only helper is used by `commit_complete_lines` tests to reason about blank-line handling with a narrower definition than generic whitespace.
+**Call relations**: The function is compiled only for tests. It is called by `commit_complete_lines` in test-related checking, where the code needs to tell whether a rendered line should count as blank without accidentally treating tabs or other whitespace as spaces.
 
 *Call graph*: called by 1 (commit_complete_lines).
 
@@ -133,11 +135,11 @@ fn prefix_lines(
 ) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Prepends one prefix span to the first line and another prefix span to all following lines, returning a new owned line vector.
+**Purpose**: This function adds a styled prefix to every line in a list. It uses one prefix for the first line and a different prefix for all following lines, which is helpful for things like labels, bullets, wrapped command output, or indented continuation lines.
 
-**Data flow**: It takes owned `Vec<Line<'static>>` plus `initial_prefix` and `subsequent_prefix` spans. It enumerates the lines, allocates a new span vector for each line, clones and inserts the appropriate prefix based on index, extends with the original line's spans, rebuilds the line with `Line::from(spans)`, reapplies the original line style via `.style(l.style)`, and collects the results into a new `Vec<Line<'static>>`.
+**Data flow**: It takes ownership of a vector of owned lines, plus two owned prefix spans. For each line, it creates a new span list, puts the right prefix at the front, then appends the original spans after it. It returns a new vector of lines with the prefixes added and preserves each line’s style.
 
-**Call relations**: This helper is used by multiple renderers that need hanging prefixes such as bullets, gutters, or continuation markers. It is a pure transformation over already-owned lines.
+**Call relations**: Higher-level renderers call this when they have already built some display lines and need to decorate them before showing them. It is used in footer rendering, changes blocks, command and exploring displays, screen-limit tests, and collaboration event rendering, where consistent first-line versus following-line prefixes make the output easier to read.
 
 *Call graph*: called by 7 (render_footer_from_props, render_footer_line, render_changes_block, command_display_lines, exploring_display_lines, user_shell_output_is_limited_by_screen_lines, collab_event).
 
@@ -147,13 +149,15 @@ These utilities handle width guards, ANSI-to-text conversion, line truncation, a
 
 ### `tui/src/width.rs`
 
-`util` · `cross-cutting during rendering`
+`util` · `cross-cutting`
 
-This utility module centralizes a subtle rendering invariant used by transcript and hyperlink layout code: after subtracting fixed prefix columns such as bullets, gutters, or labels, the remaining content width must be strictly positive. Returning `0` and continuing with wrapping logic tends to produce empty lines or unstable formatting in very narrow terminals, so these helpers encode a stronger contract.
+Terminal output often has a fixed prefix before the main text: a bullet, gutter, label, or other marker. Those prefix columns are useful, but on a very narrow terminal they can take up all the available width. If the program then tries to wrap or draw the remaining content at width zero, the result can be blank, jumpy, or otherwise unreliable.
 
-`usable_content_width` performs the core arithmetic on `usize`. It uses `checked_sub` to avoid underflow when reserved columns exceed total width, then filters out `0`, returning `Some(n)` only when `n > 0`. Any exhausted or overdrawn width becomes `None`, which callers interpret as a signal to render only the prefix or otherwise fall back to a non-wrapping path.
+This file centralizes that width calculation. Instead of every renderer subtracting widths in its own way, callers use these helpers. The helpers subtract the reserved prefix width from the total terminal width and only return a value when at least one column remains for content. If no usable space is left, they return `None`, meaning “do not try normal content rendering; use a prefix-only fallback instead.”
 
-`usable_content_width_u16` is a convenience wrapper for call sites that receive terminal dimensions as `u16`, converting both arguments to `usize` before delegating to the main helper. The tests cover the edge cases that matter most for layout stability: exact exhaustion, over-reservation, and parity between the `usize` and `u16` variants.
+A simple analogy is seating at a table: if the name cards take up the whole table, there is no room left for plates. This file tells the rest of the program whether there is real table space left, rather than pretending there is a zero-width place setting.
+
+There are two versions because terminal dimensions may arrive as different number types. The `u16` version converts those numbers and reuses the main calculation, so the rule stays consistent everywhere.
 
 #### Function details
 
@@ -163,11 +167,11 @@ This utility module centralizes a subtle rendering invariant used by transcript 
 fn usable_content_width(total_width: usize, reserved_cols: usize) -> Option<usize>
 ```
 
-**Purpose**: Computes remaining content width after reserving fixed columns and rejects zero or negative effective widths.
+**Purpose**: Calculates how much width is left for content after fixed prefix columns are reserved. It returns a usable positive number, or `None` when there is no room left.
 
-**Data flow**: It takes `total_width` and `reserved_cols` as `usize`, performs `checked_sub`, and then filters the result so only values greater than zero survive. It returns `Option<usize>` with `Some(remaining)` for usable widths and `None` when subtraction underflows or yields zero.
+**Data flow**: It receives the total available width and the number of columns already reserved. It safely subtracts the reserved columns from the total, avoiding underflow when the reserved amount is larger. If the result is greater than zero, it returns that number; otherwise it returns `None` and changes nothing else.
 
-**Call relations**: This is the core helper wrapped by `usable_content_width_u16`; callers use its `None` contract to choose prefix-only rendering fallbacks.
+**Call relations**: This is the core rule used by the file. `usable_content_width_u16` calls it after converting terminal-style `u16` widths into ordinary `usize` numbers, so both helper paths make the same decision about whether content can be rendered.
 
 *Call graph*: called by 1 (usable_content_width_u16).
 
@@ -178,11 +182,11 @@ fn usable_content_width(total_width: usize, reserved_cols: usize) -> Option<usiz
 fn usable_content_width_u16(total_width: u16, reserved_cols: u16) -> Option<usize>
 ```
 
-**Purpose**: Adapts the strict-positive width calculation to `u16` terminal dimensions.
+**Purpose**: Provides the same width check for callers that receive terminal widths as `u16` values. It exists so rendering code can use the helper without doing its own conversions.
 
-**Data flow**: It takes `u16` widths, converts both to `usize` with `usize::from`, calls `usable_content_width`, and returns the resulting `Option<usize>` unchanged.
+**Data flow**: It receives total width and reserved columns as `u16` values. It converts both to `usize`, passes them to `usable_content_width`, and returns that function’s result unchanged: either a positive content width or `None`.
 
-**Call relations**: Rendering code such as `display_hyperlink_lines` and `lines` calls this wrapper because terminal APIs commonly expose dimensions as `u16`.
+**Call relations**: This is the convenience doorway used by rendering code such as `display_hyperlink_lines` and `lines`. When those callers need to lay out text in a terminal, this function hands the real calculation off to `usable_content_width` so narrow-screen fallback behavior stays consistent.
 
 *Call graph*: calls 1 internal fn (usable_content_width); called by 2 (display_hyperlink_lines, lines); 1 external calls (from).
 
@@ -193,11 +197,11 @@ fn usable_content_width_u16(total_width: u16, reserved_cols: u16) -> Option<usiz
 fn usable_content_width_returns_none_when_reserved_exhausts_width()
 ```
 
-**Purpose**: Checks the core helper's behavior at exhaustion, over-reservation, and the smallest positive remainder.
+**Purpose**: Checks that the main width helper refuses to return zero-width or negative-space results. It also confirms that a single remaining column is considered usable.
 
-**Data flow**: It calls `usable_content_width` with several width/reservation pairs and asserts `None` for zero or exhausted space and `Some(1)` when one content column remains.
+**Data flow**: The test feeds several total-width and reserved-column pairs into `usable_content_width`. It compares each returned value with the expected result: `None` when the reserved space uses everything or more, and `Some(1)` when exactly one column remains.
 
-**Call relations**: This test documents the strict-positive invariant that downstream rendering code relies on.
+**Call relations**: This test protects the core promise of `usable_content_width`. It uses assertion checks to make sure future changes do not accidentally let callers try normal rendering when no content space is available.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -208,24 +212,24 @@ fn usable_content_width_returns_none_when_reserved_exhausts_width()
 fn usable_content_width_u16_matches_usize_variant()
 ```
 
-**Purpose**: Verifies that the `u16` wrapper preserves the same semantics as the `usize` implementation.
+**Purpose**: Checks that the `u16` wrapper follows the same behavior as the main helper. This matters because terminal dimensions commonly arrive as `u16` values.
 
-**Data flow**: It calls `usable_content_width_u16` on representative exhausted and positive cases and asserts the expected `Option<usize>` results.
+**Data flow**: The test calls `usable_content_width_u16` with sample widths and compares the results against the expected outcomes. It verifies both the no-space case and the one-column-remaining case.
 
-**Call relations**: This test protects the wrapper used by terminal-dimension call sites from diverging from the core helper.
+**Call relations**: This test guards the convenience wrapper used by rendering paths. By checking the wrapper directly, it helps ensure callers like `display_hyperlink_lines` and `lines` get the same safe fallback signal as they would from the main helper.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `ansi-escape/src/lib.rs`
 
-`util` · `rendering time for TUI/CLI transcript text`
+`io_transport` · `cross-cutting display rendering`
 
-This file wraps `ansi_to_tui` so callers can safely render ANSI-decorated output in `ratatui` widgets. The first concern it addresses is tabs: transcript and guttered views can render tab characters awkwardly, especially when upstream tools like `nl` use tabs between line numbers and content. `expand_tabs` therefore performs a best-effort normalization, replacing each tab with four spaces while leaving tab-free strings borrowed to avoid allocation.
+Terminal programs often decorate their output with ANSI escape codes. These are hidden character sequences that mean things like “make this text red” or “reset the style.” A user should see the styled text, not the raw codes. This file is the small conversion layer that translates those strings into Ratatui text, which is the text format used by the terminal user interface library.
 
-`ansi_escape_line` is the single-line convenience API. It first normalizes tabs, then delegates full ANSI parsing to `ansi_escape`. Because the parser returns a `Text` that may contain multiple lines, this helper explicitly inspects `text.lines`: it returns an empty line for no output, clones the only line when exactly one exists, and logs a warning before returning just the first line if multiple lines were produced. That behavior preserves the caller contract without silently hiding the mismatch.
+Before converting a single-line value, it replaces tab characters with four spaces. This is a practical display fix: tabs can line up badly when the app adds a left-side gutter, such as line numbers in transcript views. Think of it like replacing a stretchy spacer with a fixed-width spacer so the layout does not jump around.
 
-`ansi_escape` performs the actual ANSI-to-`Text<'static>` conversion using `IntoText`. The implementation intentionally chooses the simpler conversion path over the crate’s faster `to_text()` API to avoid lifetime complexity. Parsing failures are treated as unrecoverable programmer or upstream-data errors: both `NomError` and `Utf8Error` are logged with `tracing::error!` and then cause an immediate panic.
+The main public functions are split by expected shape. `ansi_escape` converts a whole string into styled multi-line text. `ansi_escape_line` is for places that expect exactly one line; if the converted result contains more than one line, it logs a warning and keeps only the first. Parsing errors are treated as serious internal surprises: the file logs the problem and panics, meaning it stops execution rather than trying to display uncertain output.
 
 #### Function details
 
@@ -235,11 +239,11 @@ This file wraps `ansi_to_tui` so callers can safely render ANSI-decorated output
 fn expand_tabs(s: &str) -> std::borrow::Cow<'_, str>
 ```
 
-**Purpose**: Normalizes tab characters to spaces for more predictable transcript rendering while avoiding allocation when no tabs are present.
+**Purpose**: This helper replaces tab characters with four spaces so text lines display more predictably in transcript and terminal views. If there are no tabs, it avoids making a new copy and simply reuses the original text.
 
-**Data flow**: Reads a string slice, checks for `\t`, and returns `Cow::Owned` with tabs replaced by four spaces when needed or `Cow::Borrowed` of the original string otherwise.
+**Data flow**: It receives a string slice. It checks whether the string contains a tab. If it does, it creates a new owned string where every tab is replaced by four spaces; if it does not, it returns a borrowed view of the original string unchanged.
 
-**Call relations**: Used only by `ansi_escape_line` as a preprocessing step before ANSI parsing.
+**Call relations**: This is used by `ansi_escape_line` before style conversion happens. Its job is to clean up spacing first, so the later rendering step does not inherit tab-related alignment problems.
 
 *Call graph*: called by 1 (ansi_escape_line); 2 external calls (Borrowed, Owned).
 
@@ -250,11 +254,11 @@ fn expand_tabs(s: &str) -> std::borrow::Cow<'_, str>
 fn ansi_escape_line(s: &str) -> Line<'static>
 ```
 
-**Purpose**: Parses ANSI text expected to represent a single line and returns a `ratatui::text::Line`, warning if the parsed result spans multiple lines.
+**Purpose**: This function converts ANSI-styled text that is expected to be one line into a single Ratatui `Line`. It is useful when a caller knows it needs one display row, not a block of text.
 
-**Data flow**: Consumes a string slice, normalizes tabs with `expand_tabs`, parses ANSI markup with `ansi_escape`, inspects the resulting `Text.lines`, and returns an empty line, the sole line clone, or the first line clone after logging a warning.
+**Data flow**: It receives a raw string, first replaces tabs with spaces through `expand_tabs`, then passes the cleaned text into `ansi_escape` to convert ANSI escape codes into styled text. If the result has no lines, it returns an empty line. If it has one line, it returns that line. If it has several lines, it logs a warning and returns only the first line.
 
-**Call relations**: This is the single-line convenience wrapper over `ansi_escape`; it is the likely API used by callers rendering one transcript row at a time.
+**Call relations**: This function sits on top of the lower-level `ansi_escape` converter. Callers use it when they need a safe single-line result; it delegates the actual ANSI parsing to `ansi_escape` and adds the one-line check around it.
 
 *Call graph*: calls 2 internal fn (ansi_escape, expand_tabs); 1 external calls (warn!).
 
@@ -265,22 +269,24 @@ fn ansi_escape_line(s: &str) -> Line<'static>
 fn ansi_escape(s: &str) -> Text<'static>
 ```
 
-**Purpose**: Converts an ANSI-decorated string into `ratatui::text::Text<'static>` using `ansi_to_tui`.
+**Purpose**: This function converts a string containing ANSI terminal escape codes into Ratatui `Text`, preserving styles such as colors in the form the user interface can draw. It is the core conversion function in this file.
 
-**Data flow**: Consumes a string slice and calls `IntoText::into_text()`. On success it returns the parsed `Text`; on `NomError` or `Utf8Error` it logs the error details and panics.
+**Data flow**: It receives a raw string and asks the `ansi_to_tui` library to parse it into styled text. If parsing succeeds, it returns that styled text. If parsing fails because of an unexpected parser error or UTF-8 text error, it logs the error and panics, stopping execution because the code treats those failures as impossible or unrecoverable in normal use.
 
-**Call relations**: Called by `ansi_escape_line` and serves as the core ANSI parsing primitive for this crate.
+**Call relations**: `ansi_escape_line` calls this when it needs styled text before selecting a single line. This function hands off the detailed ANSI parsing to the external `ansi_to_tui` library, then either returns the converted Ratatui text or records a serious error and stops.
 
 *Call graph*: called by 1 (ansi_escape_line); 2 external calls (panic!, error!).
 
 
 ### `tui/src/line_truncation.rs`
 
-`util` · `cross-cutting during UI rendering`
+`util` · `UI rendering`
 
-This utility file contains three focused helpers for width-aware line truncation. `line_width` computes the visible width of a `Line` by summing the Unicode display widths of each span’s content using `unicode_width`. `truncate_line_to_width` performs the actual truncation: it preserves the original line’s `style` and `alignment`, walks spans in order, copies zero-width spans through unchanged, stops once the requested width is filled, and when a span would overflow it cuts that span at a character boundary using `UnicodeWidthChar` so wide characters are never split mid-scalar. The truncated prefix of the overflowing span is rebuilt with the original span style.
+Terminal screens are measured in columns, not just in letters. Some characters take one column, some take two, and some take none. This file solves the problem of making a styled line fit into a limited number of columns without cutting a character in half or losing its styling. That matters for rows, footers, wrapped details, and other parts of the text user interface where overflowing text would spill into neighboring UI areas.
 
-`truncate_line_with_ellipsis_if_overflow` adds a UI-oriented overflow marker. It first handles the zero-width case, then uses `line_width` as a fast no-overflow precheck so unchanged lines can be returned without rebuilding. If overflow occurs, it truncates to `max_width - 1`, appends a styled `…`, and chooses the ellipsis style from the last surviving span so the marker visually matches the truncated content. These helpers are intended for short UI rows such as footers, list rows, and compact detail lines rather than large-scale text processing loops.
+The main idea is simple: a line is made of styled pieces called spans. The code first knows how to measure the full visible width of those spans. Then it can build a new line by copying whole spans while there is room, and trimming the final span character by character when only part of it fits. It preserves the line’s overall style and alignment, and it keeps each copied or shortened piece styled like the original.
+
+There is also a user-friendly version that adds an ellipsis, “…”, when text has been shortened. It first checks whether the line already fits; if so, it returns the original line unchanged. This is like checking whether a label fits on a shelf before cutting it down and adding “…” to show there was more.
 
 #### Function details
 
@@ -290,11 +296,11 @@ This utility file contains three focused helpers for width-aware line truncation
 fn line_width(line: &Line<'_>) -> usize
 ```
 
-**Purpose**: Computes the visible terminal-cell width of a styled `Line`.
+**Purpose**: This function measures how many terminal columns a styled line will occupy. It is used when the program needs to know whether a line already fits before deciding to shorten it.
 
-**Data flow**: Iterates over the line’s spans, measures each span’s content with `UnicodeWidthStr::width`, sums the widths, and returns the total `usize`.
+**Data flow**: It receives a reference to a styled line. It looks at each span in the line, measures the visible width of that span’s text using Unicode-aware width rules, and adds those widths together. It returns the total column width and does not change the line.
 
-**Call relations**: Used by the ellipsis helper as a fast precheck before rebuilding a line.
+**Call relations**: The ellipsis helper calls this first as a quick check. If the measured width is small enough, the caller can keep the original line exactly as it is instead of doing extra truncation work.
 
 *Call graph*: called by 1 (truncate_line_with_ellipsis_if_overflow); 1 external calls (iter).
 
@@ -305,11 +311,11 @@ fn line_width(line: &Line<'_>) -> usize
 fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static>
 ```
 
-**Purpose**: Truncates a styled line to a maximum display width without adding any overflow marker. It preserves line-level style/alignment and span-level styling for retained content.
+**Purpose**: This function cuts a styled line down so it fits within a given terminal width. It preserves the line’s style and alignment, and keeps as much text as can safely fit.
 
-**Data flow**: Consumes an owned `Line<'static>` and `max_width`; returns an empty line immediately for width 0; otherwise destructures the line, iterates spans while tracking used width, copies fully fitting spans, skips zero-width spans through unchanged, and when a span would overflow scans its characters with `UnicodeWidthChar::width` to find the largest fitting prefix, pushes that prefix as a styled span if non-empty, then returns a rebuilt `Line` with the original style/alignment and truncated spans.
+**Data flow**: It receives an owned styled line and a maximum width. If the width is zero, it returns an empty line. Otherwise, it walks through the line’s spans from left to right, copying spans that fully fit. When a span would overflow, it checks that span character by character, measuring each character’s terminal width, and keeps only the prefix that fits. It returns a new line containing the kept spans and any shortened final span.
 
-**Call relations**: Used by `truncate_line_with_ellipsis_if_overflow` and by rendering code that needs hard truncation without an ellipsis.
+**Call relations**: The ellipsis helper calls this when it already knows the line is too wide. This function does the careful cutting work, while its caller decides whether to add a visible overflow marker afterward.
 
 *Call graph*: called by 1 (truncate_line_with_ellipsis_if_overflow); 6 external calls (from, styled, width, width, new, with_capacity).
 
@@ -323,22 +329,24 @@ fn truncate_line_with_ellipsis_if_overflow(
 ) -> Line<'static>
 ```
 
-**Purpose**: Truncates a styled line and appends an ellipsis only when the original content exceeds the available width.
+**Purpose**: This function shortens a styled line only if needed, and adds an ellipsis to show that text was omitted. It is intended for compact UI rows where users need a clear sign that the original text continued.
 
-**Data flow**: Consumes an owned `Line<'static>` and `max_width`; returns an empty line for width 0; computes `line_width(&line)` and returns the original line unchanged if it already fits; otherwise truncates to `max_width.saturating_sub(1)` with `truncate_line_to_width`, derives the ellipsis style from the last surviving span or default style, appends `Span::styled("…", ellipsis_style)`, and returns the rebuilt line.
+**Data flow**: It receives an owned styled line and a maximum width. If the width is zero, it returns an empty line. Otherwise, it measures the line; if it already fits, it returns the original line unchanged. If it is too wide, it truncates the line to one column less than the maximum, then appends a styled ellipsis using the style of the last remaining span when possible. The result is a line that fits the requested width and visibly signals overflow.
 
-**Call relations**: Used by multiple renderers for compact UI rows where overflow should be visibly indicated.
+**Call relations**: Many UI rendering paths call this when drawing constrained text, including footer rendering, item rendering, row rendering, wrapped detail lines, line building, and masked text area rendering. It coordinates the two lower-level helpers: first measuring with line_width, then cutting with truncate_line_to_width when overflow is present.
 
 *Call graph*: calls 2 internal fn (line_width, truncate_line_to_width); called by 8 (render_with_mask_and_textarea_right_reserve, detail_wrapped_lines, render_footer, build_line, render, render_rows_single_line_with_col_width_mode, render_items, render); 3 external calls (from, styled, new).
 
 
 ### `tui/src/markdown_text_merge.rs`
 
-`util` · `markdown parse pipeline`
+`util` · `markdown rendering`
 
-This file defines one utility type, `DecodedTextMerge<I>`, parameterized over an iterator of `(pulldown_cmark::Event<'a>, Range<usize>)`. The adapter wraps the input iterator in `Peekable` so it can look ahead for consecutive `Event::Text` items. Its purpose is subtle but important: pulldown-cmark and markdown extensions can split visually contiguous text around delimiters or entity boundaries, which makes downstream token recognition harder if consumers see each fragment separately. By merging adjacent already-decoded text events, the renderer can detect whole URLs and other tokens without reconstructing text from the original markdown source.
+Markdown parsers do not always produce one text event for what a person sees as one run of text. For example, parser extensions or delimiter rules can split text around special characters, even when the final visible text should be read as continuous. That can be a problem for later code that looks for words, tokens, or spans that cross those invisible parser boundaries.
 
-The implementation is intentionally narrow. Non-text events pass through unchanged with their original source range. When the current event is `Event::Text`, `next` checks whether the following event is also text; if not, it returns the original text event unchanged. If adjacent text continues, it converts the first text fragment into an owned `String`, repeatedly consumes following `Event::Text` items, appends their decoded contents, and extends the current range’s `end` to the last merged event’s end offset. The returned event is a single merged `Event::Text` paired with the combined source range. This preserves offset-aware rendering while giving later stages a contiguous decoded string.
+This file solves that by adding `DecodedTextMerge`, a wrapper around another iterator. An iterator is simply something that gives items one at a time. The wrapped iterator produces Markdown events together with their source byte ranges. `DecodedTextMerge` watches those events as they pass through. If it sees a text event followed immediately by more text events, it joins their already-decoded text into one larger text event. At the same time, it expands the source range so it still covers the full original stretch of Markdown.
+
+The important detail is that it does not rebuild the text from the raw Markdown source. It uses the parser-decoded text, so things like escaped characters or Markdown-specific decoding stay correct. Non-text events are passed through unchanged. You can think of it like taping together adjacent slips of paper that belong to the same sentence, while keeping the label that says where the whole sentence came from.
 
 #### Function details
 
@@ -348,11 +356,11 @@ The implementation is intentionally narrow. Non-text events pass through unchang
 fn new(iter: I) -> Self
 ```
 
-**Purpose**: Wraps an event iterator in the text-merging adapter.
+**Purpose**: Creates a `DecodedTextMerge` wrapper around an existing stream of parsed Markdown events. It prepares the stream so the wrapper can look one item ahead and decide whether nearby text events should be joined.
 
-**Data flow**: It takes an iterator `I`, converts it to `Peekable` with `peekable()`, stores it in `DecodedTextMerge`, and returns the new adapter.
+**Data flow**: It receives an iterator of Markdown events with source ranges. It turns that iterator into a peekable iterator, meaning the code can briefly look at the next item without consuming it. It returns a new `DecodedTextMerge` value ready to be used like any other iterator.
 
-**Call relations**: Constructed by `render_markdown_lines_with_width_and_cwd` before events are fed into the markdown `Writer`.
+**Call relations**: The Markdown rendering path calls this from `render_markdown_lines_with_width_and_cwd` after parsing Markdown. From that point on, later rendering code reads from the wrapper instead of directly from the parser stream, so adjacent decoded text can be combined before layout and display decisions are made.
 
 *Call graph*: called by 1 (render_markdown_lines_with_width_and_cwd); 1 external calls (peekable).
 
@@ -363,11 +371,11 @@ fn new(iter: I) -> Self
 fn next(&mut self) -> Option<Self::Item>
 ```
 
-**Purpose**: Returns the next event, merging any run of adjacent `Event::Text` items into one decoded text event with a combined source range.
+**Purpose**: Produces the next Markdown event, joining consecutive text events into one when possible. This keeps visible text together for downstream rendering or token recognition, while preserving the combined source range.
 
-**Data flow**: It pulls the next `(event, range)` from the inner iterator. Non-text events are returned unchanged. For a text event, it peeks ahead; if the next event is not text, it returns the original text and range. Otherwise it converts the first text fragment into a mutable string, repeatedly consumes following text events, appends their contents, updates `range.end` to the latest end offset, and returns one merged `Event::Text` with the expanded range.
+**Data flow**: It asks the wrapped iterator for the next event and its source range. If the event is not text, it returns it unchanged. If it is text, it checks whether the following events are also text. For each neighboring text event, it appends the decoded text to a growing string and extends the range end to cover the later source text. It returns one merged text event with the full range, or the original text event if there was nothing to merge.
 
-**Call relations**: Used implicitly by the markdown rendering pipeline whenever the writer iterates parser events. Its merged output improves downstream URL and token recognition without changing non-text event flow.
+**Call relations**: After `DecodedTextMerge::new` installs this wrapper in the Markdown rendering flow, normal iteration calls this method whenever the renderer wants the next event. Internally it uses the underlying iterator’s `next` and look-ahead behavior to collect adjacent text events, then hands the cleaned-up event stream onward to the rest of the renderer.
 
 *Call graph*: 3 external calls (next, matches!, Text).
 
@@ -377,13 +385,13 @@ This core layout path wraps text while preserving semantic hyperlink boundaries 
 
 ### `tui/src/terminal_hyperlinks.rs`
 
-`io_transport` · `rendering and terminal output`
+`domain_logic` · `rendering and scrollback output`
 
-This module introduces `TerminalHyperlink`, a column range plus destination URL, and `HyperlinkLine`, a `Line<'static>` paired with zero or more hyperlink annotations. The core design choice is separation of concerns: visible text is laid out and wrapped as ordinary ratatui content, while hyperlink metadata is tracked in display-column coordinates and only converted into OSC 8 escape sequences at the last possible moment. That prevents invisible escape bytes from affecting width calculations, wrapping, or buffer geometry.
+Terminal hyperlinks use OSC 8 escape codes, which are invisible bytes that tell supporting terminals “this text points to this URL.” If those bytes were mixed into the text too early, the layout engine might count them as characters and wrap or measure lines incorrectly. This file avoids that by treating hyperlinks like sticky notes attached to column ranges: the visible line stays clean, while separate annotations say which visible columns should link where.
 
-The file covers the full hyperlink lifecycle. Construction helpers create plain or annotated lines, `push_span` appends visible spans while optionally attaching a validated web destination over the span's column range, and `annotate_web_urls_in_line` discovers bare `http`/`https` URLs in rendered text using punctuation trimming and balanced-delimiter handling. When wrapping occurs, `remap_wrapped_line` maps source hyperlink ranges onto wrapped output fragments by matching rendered text against the remaining source text in display order, skipping boundary whitespace differences and merging adjacent ranges with the same destination. Prefix insertion similarly shifts hyperlink columns to stay aligned with visible text.
+The main type, `HyperlinkLine`, pairs a normal Ratatui `Line` with a list of hyperlink ranges. Helper functions can turn plain lines into hyperlink-aware lines, add prefixes while shifting link positions, detect web URLs in text, and preserve links when lines are wrapped. The wrapping logic is careful because a link may be split across visual rows; each fragment still needs the same destination.
 
-For output, `decorate_spans` injects OSC 8 open/close sequences into cloned spans while preserving style runs, and `mark_buffer_hyperlinks` post-processes a rendered `Buffer` by re-wrapping each logical line exactly as ratatui did, remapping hyperlinks onto those wrapped rows, and replacing matching cell symbols with OSC 8-decorated versions. Additional helpers mark already-underlined or cyan-underlined cells as hyperlinks, validate destinations with `url::Url`, and strip OSC 8 sequences in tests. The implementation is careful about Unicode display width, contiguous-range merging, and rejecting non-web schemes or control characters in destinations.
+At output time, the file finally inserts OSC 8 terminal codes around the right characters or buffer cells. It also validates destinations so only safe `http` and `https` URLs become clickable. In everyday terms, this file is like keeping mailing labels separate from packages until shipping time: the package size stays accurate, and the label is applied only when it is ready to leave.
 
 #### Function details
 
@@ -393,11 +401,11 @@ For output, `decorate_spans` injects OSC 8 open/close sequences into cloned span
 fn new(line: Line<'static>) -> Self
 ```
 
-**Purpose**: Creates a `HyperlinkLine` from a visible ratatui `Line` with no hyperlink annotations yet. It is the basic constructor used throughout rendering and wrapping code.
+**Purpose**: Creates a hyperlink-aware line from ordinary visible text, starting with no links attached. Code uses this when it wants text that may later gain clickable ranges.
 
-**Data flow**: It takes `line: Line<'static>`, stores it in `HyperlinkLine { line, hyperlinks: Vec::new() }`, and returns the new value.
+**Data flow**: It receives a Ratatui line as input. It stores that line unchanged and creates an empty list for hyperlink annotations. The result is a `HyperlinkLine` that looks the same on screen but can carry link metadata.
 
-**Call relations**: Many rendering and transcript-building paths call this when starting a line before optional hyperlink annotation is added later.
+**Call relations**: Many rendering and transcript-building paths call this as the first step when they need a line that can participate in hyperlink-aware wrapping, history insertion, or display.
 
 *Call graph*: called by 23 (display_lines_for_history_insert, render_transcript_lines_for_reflow, display_hyperlink_lines, ensure_line, hard_break, pop_link, push_blank_line, push_line, push_text_spans, push_text_spans_to_table_cell (+13 more)); 1 external calls (new).
 
@@ -408,11 +416,11 @@ fn new(line: Line<'static>) -> Self
 fn width(&self) -> usize
 ```
 
-**Purpose**: Returns the display width of the visible line content. Hyperlink metadata does not affect this measurement.
+**Purpose**: Returns the visible width of the line in terminal columns. This matters because hyperlink ranges are stored by what the user sees, not by byte position in memory.
 
-**Data flow**: It reads `self.line.width()` and returns the resulting `usize`.
+**Data flow**: It reads the stored visible line and asks Ratatui how wide it is. It returns that column count and changes nothing.
 
-**Call relations**: Span-appending and history-writing code use this to compute column offsets before adding more visible content.
+**Call relations**: It is used when adding spans or writing history so callers can place new text and link ranges after the existing visible content.
 
 *Call graph*: called by 2 (write_history_line, push_span); 1 external calls (width).
 
@@ -423,11 +431,11 @@ fn width(&self) -> usize
 fn push_span(&mut self, span: Span<'static>, destination: Option<&str>)
 ```
 
-**Purpose**: Appends a visible span to the line and, when given a valid web destination, records a hyperlink covering exactly that span's display columns. Zero-width spans do not create links.
+**Purpose**: Adds a styled piece of text to the line and, if given a valid web URL, marks that new text as clickable. This is useful when building a line piece by piece.
 
-**Data flow**: It takes `&mut self`, a `Span<'static>`, and `destination: Option<&str>`. It computes `start` from the current line width and `end` by adding the span content width, pushes the span into `self.line`, validates the optional destination through `web_destination`, and if the span has positive width and the destination is valid, pushes a `TerminalHyperlink { columns: start..end, destination }` into `self.hyperlinks`.
+**Data flow**: It takes a span of visible text and an optional destination string. It measures where the span will land, appends the span to the line, validates the destination as a web URL, and adds a hyperlink range for the span if appropriate. The line is changed in place.
 
-**Call relations**: This is used by line-building code that already knows semantic link destinations. It combines visible-text mutation with synchronized hyperlink-range bookkeeping.
+**Call relations**: This builds on `HyperlinkLine::width` to find the start column, then relies on `web_destination` to reject unsafe or non-web links before storing the annotation.
 
 *Call graph*: calls 1 internal fn (width); 1 external calls (push_span).
 
@@ -438,11 +446,11 @@ fn push_span(&mut self, span: Span<'static>, destination: Option<&str>)
 fn style(mut self, style: ratatui::style::Style) -> Self
 ```
 
-**Purpose**: Applies a ratatui style to the visible line while leaving hyperlink metadata unchanged. It supports fluent styling of already-constructed hyperlink lines.
+**Purpose**: Applies a visual style, such as color or emphasis, to the whole visible line while keeping hyperlink annotations intact. It is used when already-built hyperlink lines need consistent styling.
 
-**Data flow**: It takes ownership of `self`, applies `self.line.style(style)`, stores the styled line back, and returns the modified `HyperlinkLine`.
+**Data flow**: It receives a style and a `HyperlinkLine`. It replaces the line’s visible style with the new one and returns the updated `HyperlinkLine`; the link ranges are preserved.
 
-**Call relations**: Prewrapped-line insertion code uses this when styling a line after its hyperlink structure has already been established.
+**Call relations**: Callers that prepare prewrapped display lines use this after the text and link information already exist.
 
 *Call graph*: called by 1 (push_prewrapped_line); 1 external calls (style).
 
@@ -453,11 +461,11 @@ fn style(mut self, style: ratatui::style::Style) -> Self
 fn from(text: String) -> Self
 ```
 
-**Purpose**: Converts a `Line<'static>` into a plain `HyperlinkLine`. It is the `From<Line<'static>>` implementation backing ergonomic conversions.
+**Purpose**: Provides a convenient conversion from plain text-like inputs into a `HyperlinkLine`. It makes hyperlink-aware APIs easier to call even when there are no links yet.
 
-**Data flow**: It takes a `Line<'static>`, forwards it to `HyperlinkLine::new`, and returns the resulting `HyperlinkLine`.
+**Data flow**: It receives plain line content in one supported form, converts it to a Ratatui line if needed, and wraps it in a new `HyperlinkLine` with an empty hyperlink list.
 
-**Call relations**: Transcript and display helpers rely on this conversion when they have visible lines but no hyperlink metadata yet.
+**Call relations**: Transcript and display code use this conversion when they want to pass ordinary visible text into flows that expect hyperlink-aware lines.
 
 *Call graph*: called by 3 (active_cell_transcript_hyperlink_lines, display_hyperlink_lines, transcript_hyperlink_lines); 2 external calls (from, new).
 
@@ -468,11 +476,11 @@ fn from(text: String) -> Self
 fn visible_lines(lines: Vec<HyperlinkLine>) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Drops hyperlink metadata and returns only the visible ratatui lines. It is the escape hatch back to plain text rendering.
+**Purpose**: Strips away hyperlink metadata and returns only the visible Ratatui lines. This is useful for layout or rendering steps that only care about what text looks like.
 
-**Data flow**: It consumes `Vec<HyperlinkLine>`, maps each element to its `.line`, collects those into `Vec<Line<'static>>`, and returns the vector.
+**Data flow**: It receives a list of `HyperlinkLine` values. For each one, it takes the visible `line` field and discards the separate hyperlink list. The output is a list of plain visible lines.
 
-**Call relations**: Renderers and height calculators call this when they need geometry or display text only and hyperlink semantics are not needed at that stage.
+**Call relations**: Render and height-calculation code call this when they need to measure or display text without considering clickable annotations.
 
 *Call graph*: called by 9 (render, desired_transcript_height, display_lines_for_mode, render_markdown_text_with_width_and_cwd, render, desired_height, render, controller_live_view_matches_render_during_interleaved_table_streaming, hyperlink_lines_to_plain_strings).
 
@@ -483,11 +491,11 @@ fn visible_lines(lines: Vec<HyperlinkLine>) -> Vec<Line<'static>>
 fn plain_hyperlink_lines(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Wraps plain visible lines into `HyperlinkLine` values with empty hyperlink lists. It is the inverse of `visible_lines` for non-linked content.
+**Purpose**: Wraps ordinary visible lines in `HyperlinkLine` containers without adding any links. It is a bridge from plain text rendering into hyperlink-aware rendering.
 
-**Data flow**: It consumes `Vec<Line<'static>>`, maps each line through `HyperlinkLine::new`, collects the results, and returns `Vec<HyperlinkLine>`.
+**Data flow**: It receives a list of Ratatui lines. It turns each one into a `HyperlinkLine` whose visible text is the same and whose hyperlink list starts empty. The output keeps the same line order.
 
-**Call relations**: Display and transcript assembly code uses this when starting from plain rendered lines before optional annotation or remapping.
+**Call relations**: Several display, transcript, and wrapping paths use this when they need the hyperlink-aware shape even though the source text has no known link annotations yet.
 
 *Call graph*: called by 8 (display_hyperlink_lines, display_hyperlink_lines_for_mode, transcript_hyperlink_lines, insert_history_lines_with_mode_and_wrap_policy, display_hyperlink_lines, render_source, remap_wrapped_line, insert_history_lines_with_wrap_policy).
 
@@ -502,11 +510,11 @@ fn prefix_hyperlink_lines(
 ) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Prepends one prefix span to the first line and another to subsequent lines, shifting all existing hyperlink column ranges accordingly. It preserves semantic links after visible indentation or bullets are inserted.
+**Purpose**: Adds a prefix span to each line, using one prefix for the first line and another for later lines. It also shifts every hyperlink range so links still point to the same visible text after the prefix is inserted.
 
-**Data flow**: It consumes a vector of `HyperlinkLine`s plus `initial_prefix` and `subsequent_prefix` spans. For each line it chooses the appropriate prefix by index, computes the prefix display width, rebuilds the line's span list with the prefix inserted at the front while preserving the original line style, increments every hyperlink range by that width, and returns the transformed vector.
+**Data flow**: It receives hyperlink-aware lines plus two prefix spans. For each line, it inserts the right prefix at the front, measures the prefix width, and moves all hyperlink column ranges to the right by that amount. It returns the updated list.
 
-**Call relations**: Display-line rendering uses this when adding prefixes such as bullets or labels after hyperlink annotation already exists.
+**Call relations**: Display rendering uses this when adding visual markers or indentation before lines; the function protects existing links from becoming misaligned.
 
 *Call graph*: called by 1 (render_display_lines).
 
@@ -520,11 +528,11 @@ fn adaptive_wrap_hyperlink_lines(
 ) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Wraps hyperlink lines with adaptive indentation while preserving hyperlink destinations on the wrapped fragments. It mirrors visible wrapping but reattaches semantic ranges afterward.
+**Purpose**: Wraps hyperlink-aware lines to fit a target width while preserving their clickable regions. This matters when long text must be split across terminal rows without losing link destinations.
 
-**Data flow**: It takes a slice of `HyperlinkLine` and `RtOptions<'static>`. For each source line it clones the wrap options, using the original initial indent only for the first line and replacing later lines' initial indent with the subsequent indent, wraps the visible `Line` via `adaptive_wrap_line`, converts wrapped lines to `'static`, remaps hyperlinks with `remap_wrapped_line`, extends an output vector with the remapped fragments, and returns the accumulated `Vec<HyperlinkLine>`.
+**Data flow**: It receives source `HyperlinkLine` values and wrapping options. It wraps each visible line with the regular wrapping engine, converts wrapped output to owned lines, then remaps the original hyperlink annotations onto the wrapped fragments. It returns new hyperlink-aware wrapped lines.
 
-**Call relations**: Higher-level display code calls this when width-constrained transcript output must wrap while retaining semantic links. It delegates visible wrapping to the wrapping subsystem and hyperlink preservation to `remap_wrapped_line`.
+**Call relations**: Display code calls this when preparing text for the terminal. It delegates visible wrapping to `adaptive_wrap_line` and then calls `remap_wrapped_line` so the link metadata follows the text.
 
 *Call graph*: calls 2 internal fn (remap_wrapped_line, adaptive_wrap_line); called by 1 (display_hyperlink_lines); 3 external calls (new, iter, clone).
 
@@ -535,11 +543,11 @@ fn adaptive_wrap_hyperlink_lines(
 fn annotate_web_urls(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Scans a batch of visible lines for bare web URLs and returns hyperlink-annotated equivalents. It is the bulk convenience wrapper around per-line URL discovery.
+**Purpose**: Scans plain visible lines and marks any web URLs inside them as clickable. It lets ordinary text automatically gain terminal hyperlinks.
 
-**Data flow**: It consumes `Vec<Line<'static>>`, maps each line through `annotate_web_urls_in_line`, collects the resulting `Vec<HyperlinkLine>`, and returns it.
+**Data flow**: It receives plain Ratatui lines. Each line is passed through `annotate_web_urls_in_line`, which keeps the visible text unchanged and adds hyperlink ranges for detected URLs. The output is a list of `HyperlinkLine` values.
 
-**Call relations**: Display pipelines call this when they want automatic semantic links for visible URL text without manually attaching destinations.
+**Call relations**: Display-building paths call this when they have text that may contain bare `http` or `https` links.
 
 *Call graph*: called by 3 (display_hyperlink_lines, display_hyperlink_lines, display_hyperlink_lines).
 
@@ -550,11 +558,11 @@ fn annotate_web_urls(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine>
 fn annotate_web_urls_in_line(line: Line<'static>) -> HyperlinkLine
 ```
 
-**Purpose**: Discovers bare `http`/`https` URLs in one visible line and records them as hyperlink ranges over the existing text. The visible line content itself is unchanged.
+**Purpose**: Finds web URLs inside one visible line and attaches hyperlink annotations for them. The text itself is not rewritten.
 
-**Data flow**: It concatenates the line's span contents into a `String`, constructs `HyperlinkLine::new(line)`, computes `web_links_in_text(&text)`, assigns that vector to `out.hyperlinks`, and returns `out`.
+**Data flow**: It receives one Ratatui line. It joins the span text into a single string for scanning, creates a new `HyperlinkLine` around the original line, and fills its hyperlink list with ranges found by `web_links_in_text`. The result is the same visible line plus link metadata.
 
-**Call relations**: Text-span builders and tests call this when converting already-rendered text into semantic hyperlink lines. It delegates URL tokenization and validation to `web_links_in_text`.
+**Call relations**: It is the per-line worker behind `annotate_web_urls`, and table or markdown rendering code can also call it directly when adding text spans.
 
 *Call graph*: calls 2 internal fn (new, web_links_in_text); called by 3 (writes_semantic_web_link_without_changing_visible_text, push_text_spans, push_text_spans_to_table_cell).
 
@@ -568,11 +576,11 @@ fn remap_wrapped_line(
 ) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Transfers hyperlink ranges from an unwrapped source line onto a set of wrapped visible lines by matching output text back to source text in display order. It is the key preservation step that keeps links correct after wrapping or table layout changes.
+**Purpose**: Reattaches original hyperlink ranges after a visible line has been wrapped into multiple display lines. Without this, links could disappear or point at the wrong columns after wrapping.
 
-**Data flow**: Inputs are a source `HyperlinkLine` and wrapped visible `Vec<Line<'static>>`. The function first converts wrapped lines to plain `HyperlinkLine`s, concatenates source visible text with `line_text`, and tracks both source byte and source display-column positions. For each wrapped line after the first, it trims leading whitespace from the remaining source slice and advances source positions accordingly. It then finds the earliest suffix of the rendered line that matches the remaining source prefix via `longest_suffix_matching_prefix`; for each mapped character, it computes display width, finds any source hyperlink whose range contains the current source column, and adds the corresponding output-column range to the wrapped line with `push_link_range`. It returns the wrapped lines with reconstructed hyperlink metadata.
+**Data flow**: It receives one source `HyperlinkLine` and the wrapped visible lines produced from it. It compares the wrapped text fragments with the original text in display order, skips whitespace that wrapping may add or remove at row edges, and copies the correct destination onto each matching output column. It returns wrapped `HyperlinkLine` values with fresh hyperlink ranges.
 
-**Call relations**: Wrapping, table-cell layout, history insertion, and buffer hyperlink marking all rely on this function after visible wrapping has already happened. It delegates text extraction and contiguous-range merging to small helpers.
+**Call relations**: Wrapping, table-cell layout, history insertion, and buffer-marking code call this after text has been split. It uses `line_text`, `longest_suffix_matching_prefix`, and `push_link_range` to perform the mapping.
 
 *Call graph*: calls 4 internal fn (line_text, longest_suffix_matching_prefix, plain_hyperlink_lines, push_link_range); called by 7 (insert_history_hyperlink_lines_with_mode_and_wrap_policy, flush_current_line, wrap_cell, wrap_cell, adaptive_wrap_hyperlink_lines, mark_buffer_hyperlinks, wrapping_maps_repeated_link_labels_by_source_position).
 
@@ -583,11 +591,11 @@ fn remap_wrapped_line(
 fn line_text(line: &Line<'_>) -> String
 ```
 
-**Purpose**: Concatenates all span contents in a ratatui line into one plain string. It ignores style and hyperlink metadata.
+**Purpose**: Extracts the plain visible string from a Ratatui line by joining all its spans. It gives other functions a simple text view for matching and scanning.
 
-**Data flow**: It takes `&Line`, iterates over `line.spans`, collects each span's content into a `String`, and returns that string.
+**Data flow**: It reads each span’s content from a line, concatenates those pieces in order, and returns the resulting string. It does not keep style information or change the line.
 
-**Call relations**: Only `remap_wrapped_line` uses this helper to compare visible source and wrapped text.
+**Call relations**: `remap_wrapped_line` calls this to compare source text with wrapped output text.
 
 *Call graph*: called by 1 (remap_wrapped_line).
 
@@ -598,11 +606,11 @@ fn line_text(line: &Line<'_>) -> String
 fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize>
 ```
 
-**Purpose**: Finds the earliest byte index in a rendered string such that the suffix starting there matches the prefix of the remaining source string. This lets remapping ignore inserted leading whitespace or indentation in wrapped output.
+**Purpose**: Finds where a rendered line fragment begins matching the remaining source text. This helps account for indentation or other leading text that may appear in wrapped output.
 
-**Data flow**: It iterates over all character boundary indices in `rendered` plus the end index, and returns the first index where `source.starts_with(&rendered[index..])` and the index is not the full rendered length. The result is `Option<usize>`.
+**Data flow**: It receives a rendered string and a source string. It tries possible character boundaries in the rendered string and finds a suffix that is also the start of the source string. It returns the byte index where that suffix begins, or no result if there is no usable match.
 
-**Call relations**: This helper is used only by `remap_wrapped_line` to align wrapped fragments with the remaining source text.
+**Call relations**: `remap_wrapped_line` uses this to line up wrapped display text with the original unwrapped text before copying hyperlink ranges.
 
 *Call graph*: called by 1 (remap_wrapped_line); 1 external calls (once).
 
@@ -613,11 +621,11 @@ fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize>
 fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, destination: &str)
 ```
 
-**Purpose**: Adds a hyperlink range to a line, merging it with the previous range when the destination matches and the ranges are contiguous. This keeps per-line hyperlink metadata compact.
+**Purpose**: Adds a hyperlink range to a line, merging it with the previous range when they touch and point to the same destination. This keeps hyperlink annotations compact and continuous.
 
-**Data flow**: It takes `&mut HyperlinkLine`, a `Range<usize>`, and `destination: &str`. Empty ranges are ignored. If the last existing hyperlink has the same destination and ends exactly where the new range starts, its end is extended; otherwise a new `TerminalHyperlink` with an owned destination string is pushed.
+**Data flow**: It receives a mutable `HyperlinkLine`, a column range, and a destination. Empty ranges are ignored. If the new range directly follows the previous same-destination link, that previous range is extended; otherwise a new hyperlink entry is appended.
 
-**Call relations**: Only `remap_wrapped_line` calls this while reconstructing wrapped hyperlink fragments character by character.
+**Call relations**: `remap_wrapped_line` calls this repeatedly while rebuilding link ranges character by character on wrapped output.
 
 *Call graph*: called by 1 (remap_wrapped_line); 1 external calls (is_empty).
 
@@ -628,11 +636,11 @@ fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, destination: &
 fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink>
 ```
 
-**Purpose**: Scans plain text for whitespace-delimited web URL tokens, trims surrounding punctuation, validates them, and returns hyperlink column ranges for each discovered URL. It is the bare-URL detector used for automatic annotation.
+**Purpose**: Detects bare web URLs in a plain string and returns their visible column ranges. It is careful with punctuation around links, such as parentheses or a period at the end of a sentence.
 
-**Data flow**: It takes `text: &str`, iterates over `split_ascii_whitespace()` tokens while tracking a `search_from` byte offset to locate each token in the original string, trims leading punctuation with `is_leading_punctuation`, trims trailing punctuation with `trailing_url_end`, validates the candidate via `web_destination`, computes start and end display columns using Unicode width on the original prefix and candidate, pushes `TerminalHyperlink { columns, destination }` for each valid URL, and returns the collected vector.
+**Data flow**: It receives text, splits it by ASCII whitespace into tokens, trims likely leading and trailing punctuation, validates each candidate as an `http` or `https` URL, and measures where it appears in terminal columns. It returns a list of hyperlink annotations.
 
-**Call relations**: Automatic line annotation calls this after flattening spans into plain text. It delegates punctuation handling and destination validation to dedicated helpers.
+**Call relations**: `annotate_web_urls_in_line` calls this to turn ordinary text into link-aware text. It relies on `trailing_url_end` and `web_destination` to avoid marking punctuation or unsafe destinations.
 
 *Call graph*: calls 2 internal fn (trailing_url_end, web_destination); called by 1 (annotate_web_urls_in_line); 1 external calls (new).
 
@@ -643,11 +651,11 @@ fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink>
 fn is_leading_punctuation(ch: char) -> bool
 ```
 
-**Purpose**: Classifies punctuation characters that should be stripped from the front of a token before URL validation. This avoids linking surrounding delimiters instead of the URL itself.
+**Purpose**: Decides whether a character at the front of a token is punctuation that should not be part of a detected URL. This prevents text like `(https://example.com` from including the opening parenthesis in the link.
 
-**Data flow**: It takes `ch: char` and returns whether it matches one of the configured leading punctuation characters such as parentheses, brackets, braces, angle brackets, commas, periods, semicolons, exclamation marks, or quotes.
+**Data flow**: It receives one character and checks it against a small set of punctuation marks. It returns true if that character should be skipped before URL parsing.
 
-**Call relations**: Only `web_links_in_text` uses this helper during token trimming.
+**Call relations**: It is used inside URL detection while trimming the start of candidate tokens.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -658,11 +666,11 @@ fn is_leading_punctuation(ch: char) -> bool
 fn trailing_url_end(candidate: &str) -> usize
 ```
 
-**Purpose**: Finds the byte index where a candidate URL should end after trimming trailing punctuation, while preserving balanced closing delimiters that are legitimately part of the URL. It prevents common punctuation-adjacent false positives.
+**Purpose**: Finds where a URL candidate should end after removing sentence punctuation that follows it. It preserves balanced delimiters that genuinely belong in the URL, such as parentheses in Wikipedia links.
 
-**Data flow**: It starts from `candidate.len()`, repeatedly inspects the last character of the remaining prefix, trims commas/periods/semicolons/exclamation marks/quotes unconditionally, trims closing delimiters only when `has_unmatched_closing_delimiter` says they are unmatched, and returns the final end index.
+**Data flow**: It receives a candidate string. Starting from the end, it trims commas, periods, and similar punctuation, and trims closing brackets only when they are unmatched. It returns the byte position where the usable URL ends.
 
-**Call relations**: This helper is called by `web_links_in_text` to sanitize token tails before URL parsing.
+**Call relations**: `web_links_in_text` calls this before validating a token as a web destination. It asks `has_unmatched_closing_delimiter` whether a closing bracket is extra punctuation or part of the URL.
 
 *Call graph*: calls 1 internal fn (has_unmatched_closing_delimiter); called by 1 (web_links_in_text); 1 external calls (matches!).
 
@@ -673,11 +681,11 @@ fn trailing_url_end(candidate: &str) -> usize
 fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool
 ```
 
-**Purpose**: Determines whether a closing delimiter at the end of a candidate appears more times than its matching opening delimiter. This is used to decide whether a trailing `)`, `]`, `}`, or `>` is punctuation or part of the URL.
+**Purpose**: Checks whether a closing delimiter, such as `)` or `]`, has more closings than openings in a candidate URL. This helps decide whether the final delimiter should be trimmed.
 
-**Data flow**: It maps the provided closing delimiter to its opening counterpart, counts occurrences of both characters in `candidate`, and returns whether closings outnumber openings.
+**Data flow**: It receives the candidate text and a closing delimiter. It chooses the matching opening delimiter, counts openings and closings in the text, and returns true if the closing delimiter appears unmatched.
 
-**Call relations**: Only `trailing_url_end` uses this helper to preserve balanced delimiters in URLs such as Wikipedia links with parentheses.
+**Call relations**: `trailing_url_end` uses this while trimming the right edge of a possible URL.
 
 *Call graph*: called by 1 (trailing_url_end).
 
@@ -688,11 +696,11 @@ fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool
 fn web_destination(destination: &str) -> Option<String>
 ```
 
-**Purpose**: Validates and sanitizes a hyperlink destination string for terminal use, accepting only `http` and `https` URLs with a host. Control characters are stripped before parsing.
+**Purpose**: Validates and cleans a hyperlink destination so only real web URLs are used. It accepts only `http` and `https` URLs with a host, and removes control characters.
 
-**Data flow**: It takes `destination: &str`, filters out control characters into `safe_destination`, parses that string with `Url::parse`, rejects parse failures, rejects schemes other than `http` or `https`, rejects URLs without `host_str()`, and returns `Some(safe_destination)` or `None`.
+**Data flow**: It receives a destination string. It filters out control characters, parses the result as a URL, checks that the scheme is `http` or `https`, and confirms there is a host name. It returns the cleaned URL string if valid, otherwise nothing.
 
-**Call relations**: Span attachment, bare-URL discovery, OSC 8 emission, and buffer marking all rely on this validator to ensure only safe web links become terminal hyperlinks.
+**Call relations**: This is the safety gate used before creating OSC 8 hyperlinks, detecting URLs, adding span links, or marking buffer cells.
 
 *Call graph*: called by 4 (pop_link, mark_matching_cells, osc8_hyperlink, web_links_in_text); 2 external calls (parse, matches!).
 
@@ -703,11 +711,11 @@ fn web_destination(destination: &str) -> Option<String>
 fn osc8_hyperlink(destination: &str, text: &str) -> String
 ```
 
-**Purpose**: Wraps visible text in an OSC 8 hyperlink sequence when the destination is a valid web URL. Invalid destinations leave the visible text unchanged.
+**Purpose**: Wraps visible text in OSC 8 terminal hyperlink codes when the destination is a safe web URL. OSC 8 is the terminal escape-code format for clickable links.
 
-**Data flow**: It takes `destination` and `text`, validates the destination with `web_destination`, returns `text.to_string()` on failure, or formats `"\x1b]8;;{destination}\x07{text}\x1b]8;;\x07"` on success.
+**Data flow**: It receives a destination and visible text. It validates the destination with `web_destination`; if valid, it returns the text surrounded by hyperlink start and end escape sequences. If invalid, it returns the original text unchanged.
 
-**Call relations**: Buffer and cell-marking code call this at the final output stage when converting semantic links into terminal escape sequences.
+**Call relations**: Buffer-marking functions call this at the final output stage when invisible terminal hyperlink codes are allowed to be inserted.
 
 *Call graph*: calls 1 internal fn (web_destination); called by 2 (mark_buffer_hyperlinks, mark_matching_cells); 1 external calls (format!).
 
@@ -718,11 +726,11 @@ fn osc8_hyperlink(destination: &str, text: &str) -> String
 fn strip_osc8(text: &str) -> String
 ```
 
-**Purpose**: Removes OSC 8 hyperlink sequences from a string while preserving visible text. It is a test-only helper for asserting that hyperlink decoration does not alter visible output.
+**Purpose**: Removes OSC 8 hyperlink escape codes from text while leaving the visible characters. It exists for tests that need to check what a user would actually see.
 
-**Data flow**: It scans the input bytes, detects OSC 8 open/close prefixes beginning with `ESC ] 8 ;;`, skips payload bytes until BEL or ST terminators, otherwise decodes and appends the current Unicode character to an output `String`, and returns the stripped string.
+**Data flow**: It receives a string that may contain OSC 8 start or end sequences. It walks through the bytes, skips those escape sequences, copies normal characters into a new string, and returns the stripped visible text.
 
-**Call relations**: Tests use this to verify that OSC 8 wrapping preserves visible text exactly.
+**Call relations**: Test code uses this to prove that hyperlink decoration does not change the readable text.
 
 *Call graph*: 1 external calls (with_capacity).
 
@@ -733,11 +741,11 @@ fn strip_osc8(text: &str) -> String
 fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Converts a `HyperlinkLine` into visible spans that include OSC 8 open/close sequences at hyperlink boundaries while preserving ratatui styles. It is the span-level emission path for history or scrollback writers.
+**Purpose**: Adds OSC 8 hyperlink codes into a line’s spans while preserving the original styling as much as possible. This is used for output paths that write spans rather than directly marking buffer cells.
 
-**Data flow**: If the line has no hyperlinks, it clones and returns the original spans. Otherwise it iterates character by character through each span, tracks current display column and active hyperlink index, closes the previous OSC 8 sequence when leaving a link, opens a new one when entering a link using a validated destination, appends each visible character with `push_styled_content`, and appends a final close sequence if a link remains active. The result is `Vec<Span<'static>>` containing visible text plus OSC control bytes embedded in span content.
+**Data flow**: It receives a `HyperlinkLine`. If there are no links, it returns the original spans. Otherwise it walks through visible characters, opens a hyperlink when entering a linked range, closes it when leaving, and groups adjacent content with the same style. The output is a new span list containing both visible text and invisible hyperlink codes.
 
-**Call relations**: History-writing code calls this when serializing styled lines with semantic hyperlinks. It delegates span coalescing and close-sequence appending to small helpers.
+**Call relations**: History-writing code calls this when it is ready to serialize or display linked text. It uses `push_styled_content` and `append_to_last_span` to keep the span list tidy.
 
 *Call graph*: calls 2 internal fn (append_to_last_span, push_styled_content); called by 1 (write_history_line); 2 external calls (new, format!).
 
@@ -748,11 +756,11 @@ fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>>
 fn push_styled_content(out: &mut Vec<Span<'static>>, content: &str, style: ratatui::style::Style)
 ```
 
-**Purpose**: Appends text to the output span list, merging with the previous span when the style matches. This avoids unnecessary span fragmentation during OSC decoration.
+**Purpose**: Appends text to a span list, reusing the previous span when the style is the same. This avoids creating many tiny spans unnecessarily.
 
-**Data flow**: It takes `out: &mut Vec<Span<'static>>`, `content: &str`, and a `Style`. If the last span has the same style, it mutates that span's content to append the new text; otherwise it pushes a new styled span containing an owned string.
+**Data flow**: It receives an output span list, content, and a style. If the last output span has the same style, it appends the content there; otherwise it creates a new styled span. The span list is changed in place.
 
-**Call relations**: Only `decorate_spans` uses this helper while rebuilding styled output around hyperlink boundaries.
+**Call relations**: `decorate_spans` uses this while inserting both visible characters and hyperlink opening codes.
 
 *Call graph*: called by 1 (decorate_spans); 1 external calls (styled).
 
@@ -763,11 +771,11 @@ fn push_styled_content(out: &mut Vec<Span<'static>>, content: &str, style: ratat
 fn append_to_last_span(out: &mut [Span<'static>], content: &str)
 ```
 
-**Purpose**: Appends raw text to the content of the last span in place. It is used for OSC close markers that should inherit the style of the preceding visible content.
+**Purpose**: Adds raw text to the end of the last span in a span list. It is mainly used to attach a hyperlink closing code without changing styling boundaries.
 
-**Data flow**: It takes a mutable slice of spans and `content: &str`; if a last span exists, it mutates its content to append the provided string.
+**Data flow**: It receives a mutable slice of spans and content to append. If there is a last span, it extends that span’s content; if the list is empty, it does nothing.
 
-**Call relations**: This helper is called only by `decorate_spans` when closing an active hyperlink sequence.
+**Call relations**: `decorate_spans` calls this when closing an active OSC 8 hyperlink.
 
 *Call graph*: called by 1 (decorate_spans); 1 external calls (last_mut).
 
@@ -783,11 +791,11 @@ fn mark_buffer_hyperlinks(
 )
 ```
 
-**Purpose**: Post-processes a rendered ratatui `Buffer` to inject OSC 8 hyperlinks into the exact cells corresponding to semantic hyperlink ranges, even after ratatui word wrapping. It is the buffer-level emission path used during terminal rendering.
+**Purpose**: Adds terminal hyperlink codes directly to the already-rendered terminal buffer cells for annotated lines. This is the final step that makes visible characters clickable on screen.
 
-**Data flow**: Inputs are a mutable `Buffer`, target `Rect`, a slice of logical `HyperlinkLine`s, and `scroll_rows`. The function returns early for zero-width areas. For each logical line it constructs a `Paragraph` from the visible line, computes its wrapped height at `area.width`, skips hyperlink-free lines except for advancing the logical row counter, otherwise renders the paragraph into a temporary off-screen `Buffer`, reconstructs each wrapped visible row as a trimmed `Line<String>`, remaps source hyperlinks onto those wrapped rows with `remap_wrapped_line`, and for every linked output cell within the visible scroll window replaces the cell symbol with `osc8_hyperlink(destination, symbol)` unless the cell is skipped or blank. It updates `logical_row` by the rendered height after each logical line.
+**Data flow**: It receives a mutable Ratatui buffer, the screen area, hyperlink-aware lines, and a scroll offset. For each linked line, it reproduces Ratatui’s wrapping in a temporary buffer, remaps link ranges onto the wrapped rows, skips off-screen rows, and replaces each linked nonblank cell’s symbol with an OSC 8-wrapped symbol. The visible glyph stays the same, but the terminal can treat it as a link.
 
-**Call relations**: Render paths call this after visible content has already been painted into the terminal buffer. It delegates wrapping alignment to ratatui itself and hyperlink reconstruction to `remap_wrapped_line` so OSC bytes are inserted only after geometry is fixed.
+**Call relations**: Render paths call this after normal text rendering. It calls `remap_wrapped_line` so wrapping is respected and `osc8_hyperlink` to create the actual terminal escape sequence.
 
 *Call graph*: calls 2 internal fn (osc8_hyperlink, remap_wrapped_line); called by 4 (render, render, render, buffer_hyperlinks_follow_word_wrapping); 6 external calls (empty, new, new, from, try_from, from).
 
@@ -798,11 +806,11 @@ fn mark_buffer_hyperlinks(
 fn mark_url_hyperlink(buf: &mut Buffer, area: Rect, destination: &str)
 ```
 
-**Purpose**: Marks matching cells in a buffer as hyperlinks when they already look like URL-styled text, specifically cyan and underlined. It is a heuristic post-processor for rendered URL text.
+**Purpose**: Marks cells in an area as one hyperlink when they look like the UI’s URL style: cyan and underlined. It is a convenience wrapper for a specific visual convention.
 
-**Data flow**: It takes a mutable buffer, area, and destination string, then calls `mark_matching_cells` with a predicate requiring `cell.fg == Color::Cyan` and the underlined modifier.
+**Data flow**: It receives a buffer, a rectangular area, and a destination URL. It asks `mark_matching_cells` to decorate only cells whose foreground color is cyan and whose modifier includes underline. Matching cells are changed to contain OSC 8-wrapped symbols.
 
-**Call relations**: Renderers use this when visible styling already identifies URL text and they want to attach a semantic destination afterward.
+**Call relations**: Render code calls this when it has already drawn a URL-looking region and wants those styled cells to become clickable.
 
 *Call graph*: calls 1 internal fn (mark_matching_cells); called by 3 (render, render, mark_url_hyperlink).
 
@@ -813,11 +821,11 @@ fn mark_url_hyperlink(buf: &mut Buffer, area: Rect, destination: &str)
 fn mark_underlined_hyperlink(buf: &mut Buffer, area: Rect, destination: &str)
 ```
 
-**Purpose**: Marks matching underlined cells in a buffer as hyperlinks regardless of foreground color. It is a broader heuristic than `mark_url_hyperlink`.
+**Purpose**: Marks every underlined nonblank cell in an area as pointing to one destination. It is useful when underline alone signals a clickable reference.
 
-**Data flow**: It forwards the buffer, area, and destination to `mark_matching_cells` with a predicate that checks only for the underlined modifier.
+**Data flow**: It receives a buffer, area, and destination. It delegates to `mark_matching_cells` with a rule that selects cells containing the underline modifier. Matching cells are rewritten with hyperlink escape codes.
 
-**Call relations**: Reference rendering and related paths call this when underlining alone identifies clickable text.
+**Call relations**: Reference rendering code calls this after drawing underlined text that should behave as a hyperlink.
 
 *Call graph*: calls 1 internal fn (mark_matching_cells); called by 2 (mark_underlined_hyperlink, render_ref).
 
@@ -833,11 +841,11 @@ fn mark_matching_cells(
 )
 ```
 
-**Purpose**: Scans a rectangular buffer region and wraps every nonblank, non-skipped cell satisfying a caller-provided predicate in an OSC 8 hyperlink sequence. It is the generic cell-marking primitive behind style-based hyperlink attachment.
+**Purpose**: Decorates buffer cells that pass a caller-provided test with OSC 8 hyperlink codes. It is the shared worker behind the style-specific marking helpers.
 
-**Data flow**: It takes a mutable buffer, area, destination, and predicate. If `web_destination(destination)` is `None`, it returns immediately. Otherwise it iterates over `area.positions()`, and for each cell that is not skipped, not blank after trimming, and satisfies `matches`, it replaces the cell symbol with `osc8_hyperlink(destination, cell.symbol())`.
+**Data flow**: It receives a buffer, area, destination, and a matching rule. It first validates the destination; if invalid, it changes nothing. Then it walks every cell in the area, skips blank or hidden cells, applies the matching rule, and wraps matching cell symbols with `osc8_hyperlink`.
 
-**Call relations**: Both style-based marking helpers delegate to this function. It centralizes destination validation and per-cell OSC insertion.
+**Call relations**: `mark_url_hyperlink` and `mark_underlined_hyperlink` call this with different visual matching rules.
 
 *Call graph*: calls 2 internal fn (osc8_hyperlink, web_destination); called by 2 (mark_underlined_hyperlink, mark_url_hyperlink); 1 external calls (positions).
 
@@ -848,11 +856,11 @@ fn mark_matching_cells(
 fn only_web_destinations_receive_osc8()
 ```
 
-**Purpose**: Verifies that OSC 8 wrapping is emitted only for valid web URLs, strips control characters from destinations, and preserves visible text. It protects the destination-validation boundary.
+**Purpose**: Checks that only safe web destinations get OSC 8 hyperlink codes. It also verifies that control characters are removed and that stripping OSC 8 leaves the visible text.
 
-**Data flow**: The test calls `osc8_hyperlink` with valid and invalid schemes, compares outputs, and uses `strip_osc8` to assert that visible text remains unchanged after wrapping.
+**Data flow**: The test feeds valid and invalid destinations into `osc8_hyperlink`, compares the output with expected strings, and uses `strip_osc8` to confirm the readable text remains unchanged.
 
-**Call relations**: This test exercises `web_destination`, `osc8_hyperlink`, and `strip_osc8` together as the final-output safety path.
+**Call relations**: This protects the safety behavior shared by all final hyperlink output paths.
 
 *Call graph*: 2 external calls (assert!, assert_eq!).
 
@@ -863,11 +871,11 @@ fn only_web_destinations_receive_osc8()
 fn discovers_punctuated_web_url_columns()
 ```
 
-**Purpose**: Checks that URL discovery trims surrounding punctuation and computes the correct display-column range. It validates token trimming around bare URLs.
+**Purpose**: Checks that URL detection ignores surrounding punctuation when recording link columns. This covers common text like a link inside parentheses followed by a period.
 
-**Data flow**: It calls `web_links_in_text("See (https://example.com/a).")` and asserts a single `TerminalHyperlink` with the expected columns and destination.
+**Data flow**: The test passes a sentence containing `(https://example.com/a).` into `web_links_in_text`. It expects one hyperlink whose range covers only the URL characters and whose destination excludes punctuation.
 
-**Call relations**: This test covers punctuation handling in `web_links_in_text`.
+**Call relations**: This verifies the trimming logic used by automatic URL annotation.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -878,11 +886,11 @@ fn discovers_punctuated_web_url_columns()
 fn preserves_balanced_parentheses_in_bare_web_urls()
 ```
 
-**Purpose**: Ensures balanced parentheses that are part of a URL are preserved rather than trimmed as punctuation. This protects common URLs such as Wikipedia article links.
+**Purpose**: Checks that balanced parentheses inside a URL are kept as part of the link. This prevents legitimate URLs, such as Wikipedia article links, from being shortened incorrectly.
 
-**Data flow**: It constructs a URL containing parentheses, embeds it in surrounding punctuation, calls `web_links_in_text`, and asserts that the discovered hyperlink spans the full destination width.
+**Data flow**: The test builds a sentence around a URL ending in balanced parentheses and scans it with `web_links_in_text`. It expects the full URL, including the balanced parentheses, to be linked.
 
-**Call relations**: This test specifically validates `trailing_url_end` and `has_unmatched_closing_delimiter` behavior.
+**Call relations**: This guards the delimiter-counting behavior used by `trailing_url_end`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -893,11 +901,11 @@ fn preserves_balanced_parentheses_in_bare_web_urls()
 fn decorates_a_contiguous_web_link_with_one_osc8_pair()
 ```
 
-**Purpose**: Verifies that a single contiguous hyperlink range becomes one OSC 8 open/close pair and that non-linked lines are returned unchanged. It protects span decoration compactness.
+**Purpose**: Checks that one continuous linked range becomes one OSC 8 hyperlink wrapper, not many separate wrappers. It also confirms that lines with no links are left alone.
 
-**Data flow**: It constructs a `HyperlinkLine` whose entire visible text is one hyperlink, calls `decorate_spans`, and asserts the result is a single span containing `osc8_hyperlink(destination, destination)`. It also checks that a plain line decorates to its original span.
+**Data flow**: The test creates a `HyperlinkLine` whose whole visible text is linked, runs `decorate_spans`, and compares the result with a single OSC 8-wrapped span. It then checks that an unlinked line returns its original span.
 
-**Call relations**: This test exercises the span-level emission path in `decorate_spans`.
+**Call relations**: This verifies the span decoration path used when writing hyperlink-aware history lines.
 
 *Call graph*: 3 external calls (from, assert_eq!, vec!).
 
@@ -908,11 +916,11 @@ fn decorates_a_contiguous_web_link_with_one_osc8_pair()
 fn wrapping_maps_repeated_link_labels_by_source_position()
 ```
 
-**Purpose**: Ensures hyperlink remapping uses source position rather than repeated visible text labels when reconstructing wrapped links. This avoids attaching a link to the wrong repeated substring.
+**Purpose**: Checks that remapping links after wrapping uses the original source position, not just matching text. This matters when the same word appears more than once but only one occurrence is linked.
 
-**Data flow**: It builds a source line `"here here"` with a hyperlink only on the second word, calls `remap_wrapped_line` with an unchanged wrapped line, and asserts that the resulting hyperlink range still covers only columns `5..9`.
+**Data flow**: The test creates a line reading `here here`, marks only the second `here` as linked, and passes it through `remap_wrapped_line`. It expects the link to stay on the second occurrence.
 
-**Call relations**: This test targets the source-position tracking logic inside `remap_wrapped_line`.
+**Call relations**: This protects `remap_wrapped_line` from a subtle bug where repeated text could cause links to move to the wrong copy.
 
 *Call graph*: calls 2 internal fn (new, remap_wrapped_line); 3 external calls (from, assert_eq!, vec!).
 
@@ -923,24 +931,24 @@ fn wrapping_maps_repeated_link_labels_by_source_position()
 fn buffer_hyperlinks_follow_word_wrapping()
 ```
 
-**Purpose**: Verifies that buffer-level hyperlink marking follows ratatui word wrapping and decorates exactly the wrapped cells corresponding to the URL text. It protects the final render-stage integration.
+**Purpose**: Checks that buffer-cell hyperlink marking follows Ratatui word wrapping correctly. A URL split across rows should still have every visible URL character linked.
 
-**Data flow**: The test constructs a logical line containing a URL hyperlink, renders the visible text into a `Buffer` with a narrow width, calls `mark_buffer_hyperlinks`, then scans buffer cells for OSC 8-decorated symbols, strips OSC 8, concatenates the linked visible text, and asserts it equals the destination URL.
+**Data flow**: The test renders a line containing a URL into a narrow buffer, calls `mark_buffer_hyperlinks`, then collects cells that contain the OSC 8 link and strips the escape codes. It expects the collected visible text to equal the full destination URL.
 
-**Call relations**: This test exercises the full buffer-marking path, including temporary paragraph layout and `remap_wrapped_line`.
+**Call relations**: This verifies the full on-screen path: normal paragraph rendering, wrapped link remapping, and final buffer-cell OSC 8 decoration.
 
 *Call graph*: calls 2 internal fn (new, mark_buffer_hyperlinks); 7 external calls (empty, from, new, new, from, assert_eq!, format!).
 
 
 ### `tui/src/wrapping.rs`
 
-`domain_logic` · `render-time text layout and cursor/range calculations across many TUI views`
+`domain_logic` · `text rendering`
 
-This module is the TUI’s concrete wrapping engine for `ratatui::text::Line` values. It has two major responsibilities. First, it wraps styled lines while preserving span boundaries and styles: `flatten_line` concatenates span text and records byte ranges, `wrap_ranges_trim` computes wrapped byte slices against the flattened string, and `slice_line_spans` maps each wrapped range back into borrowed `Span` fragments patched with the parent line style. `RtOptions` mirrors the subset of `textwrap::Options` the TUI needs, but uses `Line` values for `initial_indent` and `subsequent_indent` so prefixes can themselves be styled.
+Terminal screens are narrow, so messages, command output, markdown, and tool results must be split into display lines. A normal word wrapper often treats slashes and hyphens as safe break points. That is fine for prose, but bad for URLs: if `https://example.com/a-b` is split in the middle, many terminal emulators no longer recognize it as one clickable link. This file solves that problem.
 
-Second, it detects URL-like tokens and changes wrapping behavior to avoid splitting them on `/` or `-`. The heuristic strips surrounding punctuation, recognizes absolute URLs with schemes, bare domains with path/query/fragment, `localhost`, and IPv4 hosts, while intentionally rejecting path-like strings such as `src/main.rs`. `adaptive_wrap_line` chooses among three paths: ordinary wrapping for non-URL lines, URL-preserving `textwrap` options for URL-only lines, and a custom mixed-token wrapper for prose-plus-URL lines. That mixed wrapper tokenizes on ASCII spaces, keeps URL tokens atomic even if overlong, but still breaks oversized non-URL tokens using `textwrap::core::Word::break_apart`.
+It has two wrapping paths. The standard path uses the `textwrap` library much like a regular paragraph wrapper. The adaptive path first checks whether a line contains something that looks like a URL. If not, it uses the standard path. If it does, it changes the wrapping rules so URL-like tokens stay whole. For lines that mix prose and URLs, it uses a custom token-by-token wrapper: ordinary words still wrap neatly, but the URL is treated like a fragile label that should not be cut.
 
-A subtle part of the file is reconstructing source byte ranges from `textwrap` output when `textwrap` returns `Cow::Owned` lines due to inserted hyphenation penalties or synthetic indent prefixes. `map_owned_wrapped_line_to_range` walks the owned output against the source text, strips synthetic prefixes, tolerates trailing penalty `-`, preserves leading spaces on the first line, and logs a warning instead of panicking if only a partial mapping is possible. The extensive tests exercise Unicode width, indent interactions, style preservation, URL heuristics, and several regressions around owned-line range mapping.
+The file also understands Ratatui `Line` and `Span` values, which are pieces of terminal text with style such as color. It flattens styled text to wrap it, then maps the chosen byte ranges back onto the original spans so colors survive. Several helper functions detect URL-like tokens, validate hosts and ports, and convert wrapped output back into source ranges for cursor positioning.
 
 #### Function details
 
@@ -950,11 +958,11 @@ A subtle part of the file is reconstructing source byte ranges from `textwrap` o
 fn wrap_ranges(text: &str, width_or_options: O) -> Vec<Range<usize>>
 ```
 
-**Purpose**: Computes source byte ranges for each wrapped line, preserving trailing spaces and adding a one-byte sentinel used by textarea cursor-position logic. It is the low-level range-oriented counterpart to visible line wrapping.
+**Purpose**: Finds the byte ranges in the original text that correspond to each wrapped display line. It keeps trailing spaces and adds a one-byte sentinel so textarea cursor code can reason about line ends.
 
-**Data flow**: Accepts `text: &str` and anything convertible into `textwrap::Options`, wraps the text with `textwrap::wrap`, then for each wrapped `Cow<str>` maps it back to a `Range<usize>` in the original source. Borrowed slices are mapped by pointer arithmetic when possible; owned slices fall back to synthetic-prefix-aware reconstruction. After each mapped range it counts trailing spaces in the source, extends the range by those spaces plus one sentinel byte, advances a running cursor, and returns `Vec<Range<usize>>`.
+**Data flow**: It receives source text and either a width or wrapping options. It asks `textwrap` to wrap the text, maps each wrapped slice back to byte positions in the original string, includes trailing spaces, and returns a list of source ranges.
 
-**Call relations**: Used by cursor/range consumers and exercised directly by regression tests. Internally it delegates to `borrowed_slice_range` for cheap exact mapping and to `map_owned_wrapped_line_to_range` when `textwrap` materializes owned output.
+**Call relations**: Cursor-oriented wrapping code calls this when it needs positions rather than styled display lines. It relies on `borrowed_slice_range` when `textwrap` returns a borrowed slice, and falls back to `map_owned_wrapped_line_to_range` when `textwrap` has created a new string with indentation or hyphenation characters.
 
 *Call graph*: calls 2 internal fn (borrowed_slice_range, map_owned_wrapped_line_to_range); called by 3 (wrapped_lines, wrap_ranges_indent_prefix_coincides_with_source_char, wrap_ranges_recovers_with_non_space_indents); 3 external calls (into, new, wrap).
 
@@ -965,11 +973,11 @@ fn wrap_ranges(text: &str, width_or_options: O) -> Vec<Range<usize>>
 fn wrap_ranges_trim(text: &str, width_or_options: O) -> Vec<Range<usize>>
 ```
 
-**Purpose**: Computes wrapped source byte ranges without preserving trailing spaces and without the extra sentinel byte. This is the range form used by visible line wrapping where trailing whitespace should not be carried forward.
+**Purpose**: Finds byte ranges for wrapped lines without preserving trailing spaces or adding the cursor sentinel. This is the general-purpose range helper used by normal line wrapping.
 
-**Data flow**: Takes source text and `textwrap::Options`, wraps with `textwrap::wrap`, maps each borrowed or owned wrapped slice back into source byte ranges, advances a cursor to the end of each mapped segment, and returns the resulting `Vec<Range<usize>>` unchanged by trailing-space expansion.
+**Data flow**: It receives text plus wrapping options, runs `textwrap`, maps each output line back to the original text, and returns clean byte ranges for the visible content.
 
-**Call relations**: Called by `word_wrap_line` to determine which source bytes belong on each visual line, and by tests that validate reconstruction when `textwrap` emits owned lines with penalty characters.
+**Call relations**: `word_wrap_line` uses this to decide which parts of the flattened line belong on each rendered row. Like `wrap_ranges`, it uses direct pointer mapping when possible and the owned-line mapper when `textwrap` produced synthetic output.
 
 *Call graph*: calls 2 internal fn (borrowed_slice_range, map_owned_wrapped_line_to_range); called by 2 (wrap_ranges_trim_handles_owned_lines_with_penalty_char, word_wrap_line); 3 external calls (into, new, wrap).
 
@@ -980,11 +988,11 @@ fn wrap_ranges_trim(text: &str, width_or_options: O) -> Vec<Range<usize>>
 fn borrowed_slice_range(text: &str, slice: &str) -> Option<Range<usize>>
 ```
 
-**Purpose**: Attempts to recover the byte range of a wrapped slice by checking whether the slice points directly into the original source string. It is a fast path for `Cow::Borrowed` output from `textwrap`.
+**Purpose**: Checks whether a string slice really points inside the original source text and, if so, returns its byte range. This is a fast and exact way to map borrowed wrapped text back to the input.
 
-**Data flow**: Reads raw pointers and lengths from `text` and `slice`, verifies that the slice lies within the source allocation bounds, and if so returns the offset range `start..end`; otherwise returns `None`.
+**Data flow**: It receives the original text and a slice. It compares their memory addresses, and if the slice lies inside the original text, it converts that address difference into a start and end byte range.
 
-**Call relations**: Used by both `wrap_ranges` and `wrap_ranges_trim` before falling back to owned-line reconstruction.
+**Call relations**: `wrap_ranges` and `wrap_ranges_trim` try this first for borrowed `textwrap` output. If it cannot prove the slice came from the source, those callers switch to the safer character-by-character mapper.
 
 *Call graph*: called by 2 (wrap_ranges, wrap_ranges_trim).
 
@@ -1000,11 +1008,11 @@ fn map_owned_wrapped_line_to_range(
 ) -> Range<usize>
 ```
 
-**Purpose**: Best-effort maps a materialized wrapped line back to source bytes when `textwrap` inserted synthetic characters such as indent prefixes or trailing hyphenation penalties. It is designed to recover useful ranges without crashing on imperfect matches.
+**Purpose**: Maps a wrapped line that `textwrap` built as a new string back to the original source text. This matters when `textwrap` adds indentation or a hyphen that does not exist in the source.
 
-**Data flow**: Accepts the original `text`, a starting `cursor`, the owned `wrapped` line, and the `synthetic_prefix` that may have been prepended by wrapping. It strips the synthetic prefix if present, skips leading source spaces when the wrapped line does not begin with a space, then walks wrapped characters against source characters from `cursor`, advancing `end` on exact matches. A trailing synthesized `-` at end-of-line is ignored; unmatched synthetic chars before any source match are skipped; after partial matching, a mismatch triggers a warning and returns the partial `start..end` range.
+**Data flow**: It receives the original text, the current source cursor, the wrapped string, and any synthetic indent prefix. It strips the prefix, skips source spaces as needed, walks matching characters, ignores a trailing inserted hyphen, and returns the best matching source byte range.
 
-**Call relations**: This is the fallback path used by `wrap_ranges` and `wrap_ranges_trim` whenever pointer-based mapping is impossible. Multiple regression tests call it directly to lock down edge cases involving indent prefixes, repeated prefix patterns, and partial mismatches.
+**Call relations**: `wrap_ranges` and `wrap_ranges_trim` call this whenever direct slice mapping is not available. If it sees an unexpected mismatch after matching real source characters, it logs a warning and returns the safe partial range instead of crashing.
 
 *Call graph*: called by 6 (borrowed_slice_range_rejects_slices_outside_source_text, map_owned_wrapped_line_to_range_indent_coincides_with_source, map_owned_wrapped_line_to_range_recovers_on_non_prefix_mismatch, map_owned_wrapped_line_to_range_repro_overconsumes_repeated_prefix_patterns, wrap_ranges, wrap_ranges_trim); 2 external calls (warn!, unreachable!).
 
@@ -1015,11 +1023,11 @@ fn map_owned_wrapped_line_to_range(
 fn line_contains_url_like(line: &Line<'_>) -> bool
 ```
 
-**Purpose**: Checks whether any token across all spans in a `Line` looks URL-like. It flattens styled content before applying the text-level heuristic.
+**Purpose**: Checks whether a styled terminal line contains any token that looks like a URL. It lets wrapping code choose URL-safe behavior without caring how the line is split into styled spans.
 
-**Data flow**: Concatenates `line.spans[*].content` into a `String`, passes that string to `text_contains_url_like`, and returns the resulting boolean.
+**Data flow**: It receives a Ratatui `Line`, concatenates all span text into one plain string, then asks `text_contains_url_like` whether any whitespace-separated token resembles a URL.
 
-**Call relations**: Used by adaptive wrapping and hyperlink insertion logic as the first branch point for deciding whether URL-preserving behavior is needed.
+**Call relations**: `adaptive_wrap_line` uses this as its first decision point. Other rendering code also calls it when deciding how to treat hyperlink-like history text.
 
 *Call graph*: calls 1 internal fn (text_contains_url_like); called by 2 (insert_history_hyperlink_lines_with_mode_and_wrap_policy, adaptive_wrap_line).
 
@@ -1030,11 +1038,11 @@ fn line_contains_url_like(line: &Line<'_>) -> bool
 fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool
 ```
 
-**Purpose**: Determines whether a line contains both a URL-like token and substantive non-URL prose. Decorative markers such as bullets and ordered-list prefixes do not count as the non-URL side.
+**Purpose**: Checks whether a line has both a URL-like token and real non-URL words. This separates URL-only lines from prose that merely contains a URL.
 
-**Data flow**: Flattens all span contents into a `String`, delegates to `text_has_mixed_url_and_non_url_tokens`, and returns `true` only when both categories are present.
+**Data flow**: It receives a styled line, joins its span text into one string, then delegates to the plain-text mixed-token checker. Decorative markers such as list bullets do not count as real prose.
 
-**Call relations**: Called after URL detection by adaptive wrapping and hyperlink rendering to decide whether to use the custom mixed-token wrapper instead of all-or-nothing URL-preserving options.
+**Call relations**: `adaptive_wrap_line` uses this after detecting a URL. If the line is mixed, wrapping switches to the custom mixed URL wrapper; otherwise it can use simpler URL-preserving options.
 
 *Call graph*: calls 1 internal fn (text_has_mixed_url_and_non_url_tokens); called by 2 (insert_history_hyperlink_lines_with_mode_and_wrap_policy, adaptive_wrap_line).
 
@@ -1045,11 +1053,11 @@ fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool
 fn text_contains_url_like(text: &str) -> bool
 ```
 
-**Purpose**: Scans plain text for any whitespace-delimited token that matches the module’s URL heuristic. It is the simplest public URL detector in the file.
+**Purpose**: Checks plain text for any whitespace-separated token that looks like a URL. It is the main URL detector for unstyled text.
 
-**Data flow**: Splits `text` on ASCII whitespace, applies `is_url_like_token` to each token, and returns whether any token matched.
+**Data flow**: It receives text, splits it on ASCII whitespace, tests each token, and returns true as soon as one token is URL-like.
 
-**Call relations**: Used by `line_contains_url_like`; it is the text-level primitive behind adaptive URL-aware wrapping.
+**Call relations**: `line_contains_url_like` builds plain text from styled spans and then calls this. The result controls whether wrapping should protect URLs from being split.
 
 *Call graph*: called by 1 (line_contains_url_like).
 
@@ -1060,11 +1068,11 @@ fn text_contains_url_like(text: &str) -> bool
 fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool
 ```
 
-**Purpose**: Checks whether text contains at least one URL-like token and at least one substantive non-URL token. It short-circuits as soon as both conditions are satisfied.
+**Purpose**: Decides whether text contains at least one URL-like token and at least one meaningful non-URL token. It ignores visual markers that are not content words.
 
-**Data flow**: Iterates over ASCII-whitespace-delimited tokens, classifies each token with `is_url_like_token` and `is_substantive_non_url_token`, tracks `saw_url` and `saw_non_url`, and returns `true` once both flags are set or `false` after the scan completes.
+**Data flow**: It receives text, scans each whitespace-separated token, records whether it has seen a URL and whether it has seen real non-URL content, and returns true once both are present.
 
-**Call relations**: Used only by `line_has_mixed_url_and_non_url_tokens` to support the mixed URL/prose wrapping branch.
+**Call relations**: `line_has_mixed_url_and_non_url_tokens` calls this after flattening a styled line. It uses `is_url_like_token` and `is_substantive_non_url_token` to classify each token.
 
 *Call graph*: calls 2 internal fn (is_substantive_non_url_token, is_url_like_token); called by 1 (line_has_mixed_url_and_non_url_tokens).
 
@@ -1075,11 +1083,11 @@ fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool
 fn is_url_like_token(raw_token: &str) -> bool
 ```
 
-**Purpose**: Classifies a single token as URL-like after stripping surrounding punctuation. It accepts either absolute URLs with schemes or bare-host forms that satisfy stricter host validation.
+**Purpose**: Decides whether one token, such as `example.com/path`, should be treated as a URL. This is intentionally cautious so ordinary file paths are not mistaken for links.
 
-**Data flow**: Trims punctuation with `trim_url_token`, rejects empty results, then returns whether either `is_absolute_url_like` or `is_bare_url_like` succeeds on the trimmed token.
+**Data flow**: It receives a raw token, strips surrounding punctuation, then checks whether the cleaned token is either an absolute URL with `://` or a bare host-style URL.
 
-**Call relations**: This is the central token classifier used by text-level URL detection and by mixed-token wrapping when tagging words as URL or non-URL.
+**Call relations**: Mixed-line detection and mixed wrapping both call this to mark fragile URL tokens. It hands the detailed checks to `is_absolute_url_like` and `is_bare_url_like`.
 
 *Call graph*: calls 3 internal fn (is_absolute_url_like, is_bare_url_like, trim_url_token); called by 2 (mixed_url_wrap_ranges, text_has_mixed_url_and_non_url_tokens).
 
@@ -1090,11 +1098,11 @@ fn is_url_like_token(raw_token: &str) -> bool
 fn is_substantive_non_url_token(raw_token: &str) -> bool
 ```
 
-**Purpose**: Determines whether a token should count as meaningful non-URL prose for mixed-content detection. It filters out empty tokens and decorative markers.
+**Purpose**: Decides whether a token is real non-URL content rather than punctuation, a bullet, or a list marker. This prevents a line like `1. https://...` from being treated as mixed prose.
 
-**Data flow**: Trims punctuation with `trim_url_token`, returns `false` if the trimmed token is empty or `is_decorative_marker_token` says it is structural markup, otherwise returns whether any character in the trimmed token is alphanumeric.
+**Data flow**: It receives a raw token, trims URL-style surrounding punctuation, rejects empty or decorative tokens, and then checks whether any alphanumeric character remains.
 
-**Call relations**: Used only by `text_has_mixed_url_and_non_url_tokens` to avoid treating bullets, pipes, and list markers as prose.
+**Call relations**: `text_has_mixed_url_and_non_url_tokens` calls this for tokens that are not URLs. It uses `is_decorative_marker_token` to filter layout symbols.
 
 *Call graph*: calls 2 internal fn (is_decorative_marker_token, trim_url_token); called by 1 (text_has_mixed_url_and_non_url_tokens).
 
@@ -1105,11 +1113,11 @@ fn is_substantive_non_url_token(raw_token: &str) -> bool
 fn is_decorative_marker_token(raw_token: &str, token: &str) -> bool
 ```
 
-**Purpose**: Recognizes tokens that are visual structure rather than prose, such as bullets, quote markers, box-drawing prefixes, and ordered-list markers. These tokens are ignored when deciding whether a line mixes URL and prose.
+**Purpose**: Recognizes small tokens that are visual structure, such as bullets, pipes, tree-drawing characters, or ordered-list markers. These should not count as prose.
 
-**Data flow**: Trims the raw token, compares it against a fixed set of marker strings, and if none match, asks `is_ordered_list_marker` whether the token is a numeric list prefix.
+**Data flow**: It receives the raw token and its trimmed form, compares the raw text against known marker symbols, and also checks for numeric list markers like `1.` or `2)`.
 
-**Call relations**: Called by `is_substantive_non_url_token` as a filter before counting a token as meaningful prose.
+**Call relations**: `is_substantive_non_url_token` calls this while deciding whether non-URL text is meaningful. It delegates numeric marker recognition to `is_ordered_list_marker`.
 
 *Call graph*: calls 1 internal fn (is_ordered_list_marker); called by 1 (is_substantive_non_url_token); 1 external calls (matches!).
 
@@ -1120,11 +1128,11 @@ fn is_decorative_marker_token(raw_token: &str, token: &str) -> bool
 fn is_ordered_list_marker(raw_token: &str, token: &str) -> bool
 ```
 
-**Purpose**: Detects numeric ordered-list prefixes like `1.` or `2)`. It treats only all-digit tokens with a trailing list punctuation marker as decorative.
+**Purpose**: Recognizes ordered-list markers such as `1.` or `23)`. These are layout labels, not substantive words.
 
-**Data flow**: Checks that `token` consists entirely of ASCII digits and that the original raw token ends with `.` or `)`, then returns the boolean result.
+**Data flow**: It receives the raw token and trimmed token, checks that the trimmed part is all digits, and verifies that the raw token ended with `.` or `)`.
 
-**Call relations**: Used by `is_decorative_marker_token` to classify ordered-list prefixes.
+**Call relations**: `is_decorative_marker_token` calls this when it needs to decide whether a token is a numbered list prefix.
 
 *Call graph*: called by 1 (is_decorative_marker_token).
 
@@ -1135,11 +1143,11 @@ fn is_ordered_list_marker(raw_token: &str, token: &str) -> bool
 fn trim_url_token(token: &str) -> &str
 ```
 
-**Purpose**: Removes punctuation commonly surrounding URLs in prose before heuristic classification. This prevents wrappers like parentheses or trailing commas from breaking URL detection.
+**Purpose**: Removes punctuation that commonly surrounds URLs in prose, such as parentheses, commas, periods, and quotes. This lets `(https://example.com)` still be detected as a URL.
 
-**Data flow**: Returns a borrowed subslice of `token` with leading and trailing characters trimmed when they match the module’s punctuation set: brackets, braces, angle brackets, commas, periods, semicolons, colons, exclamation marks, and quotes.
+**Data flow**: It receives a token and returns a borrowed slice with matching surrounding punctuation removed from both ends.
 
-**Call relations**: Used by both URL and non-URL token classifiers as the normalization step before further checks.
+**Call relations**: Both URL detection and non-URL token detection call this before classifying a token. It is the shared cleanup step for token-based wrapping decisions.
 
 *Call graph*: called by 2 (is_substantive_non_url_token, is_url_like_token).
 
@@ -1150,11 +1158,11 @@ fn trim_url_token(token: &str) -> &str
 fn is_absolute_url_like(token: &str) -> bool
 ```
 
-**Purpose**: Recognizes `scheme://...` tokens as URL-like, using `url::Url::parse` for standard schemes and a fallback syntax check for custom schemes. It is intentionally permissive for nonstandard schemes once the prefix is valid.
+**Purpose**: Checks for full URLs that include a scheme, such as `https://`, `ftp://`, or a custom app scheme. A scheme is the prefix before `://` that says what kind of link it is.
 
-**Data flow**: Rejects tokens lacking `://`, then tries `url::Url::parse`. For parsed URLs with schemes `http`, `https`, `ftp`, `ftps`, `ws`, or `wss`, it requires `host_str().is_some()`; for other parsed schemes it accepts them directly. If parsing fails, it falls back to `has_valid_scheme_prefix` and returns that result.
+**Data flow**: It receives a cleaned token, rejects it if it lacks `://`, tries to parse it as a URL, verifies hosts for common network schemes, and falls back to a custom scheme-prefix check if parsing fails.
 
-**Call relations**: Called by `is_url_like_token` as one half of URL classification, complementing bare-host detection.
+**Call relations**: `is_url_like_token` calls this before trying bare-domain URL rules. It uses the URL parser for standard cases and `has_valid_scheme_prefix` for custom schemes.
 
 *Call graph*: calls 1 internal fn (has_valid_scheme_prefix); called by 1 (is_url_like_token); 2 external calls (matches!, parse).
 
@@ -1165,11 +1173,11 @@ fn is_absolute_url_like(token: &str) -> bool
 fn has_valid_scheme_prefix(token: &str) -> bool
 ```
 
-**Purpose**: Validates the syntax of a custom URL scheme prefix when full URL parsing fails. It ensures the token still looks like `scheme://rest` rather than arbitrary punctuation.
+**Purpose**: Checks whether the part before `://` looks like a valid custom URL scheme. This catches links such as `myapp://open` even if the URL parser does not accept them.
 
-**Data flow**: Splits the token once on `://`, rejects empty scheme or rest, checks that the first scheme character is ASCII alphabetic and all remaining scheme characters are ASCII alphanumeric or one of `+`, `-`, `.`, then returns the boolean result.
+**Data flow**: It receives a token, splits it at `://`, ensures both sides are present, and checks that the scheme starts with a letter and contains only allowed scheme characters.
 
-**Call relations**: Used only by `is_absolute_url_like` as a fallback for custom schemes rejected by the `url` crate.
+**Call relations**: `is_absolute_url_like` calls this as a fallback when normal URL parsing fails.
 
 *Call graph*: called by 1 (is_absolute_url_like).
 
@@ -1180,11 +1188,11 @@ fn has_valid_scheme_prefix(token: &str) -> bool
 fn is_bare_url_like(token: &str) -> bool
 ```
 
-**Purpose**: Recognizes URL-like tokens without a scheme, such as `www.example.com/path`, `localhost:3000/api`, or `127.0.0.1:8080/health`. It deliberately rejects path-like strings and bare domains without a URL-ish trailer unless they start with `www.`.
+**Purpose**: Checks for URL-like text without a scheme, such as `www.example.com`, `localhost:3000/api`, or `127.0.0.1/health`. It avoids treating ordinary paths as URLs.
 
-**Data flow**: Splits the token into `host_port` and a trailer-presence flag with `split_host_port_and_trailer`, rejects empty hosts and bare hosts lacking both trailer and `www.` prefix, then separates host and optional port via `split_host_and_port`. If a port exists it must satisfy `is_valid_port`; finally the host must equal `localhost`, satisfy `is_ipv4`, or satisfy `is_domain_name`.
+**Data flow**: It receives a cleaned token, separates the host and optional URL trailer, splits out an optional port, validates the port if present, and accepts only localhost, IPv4 addresses, or valid domain names.
 
-**Call relations**: Called by `is_url_like_token` as the second URL-classification path for scheme-less tokens.
+**Call relations**: `is_url_like_token` calls this after checking absolute URLs. It uses small helpers to split host, port, and trailer and to validate each kind of host.
 
 *Call graph*: calls 5 internal fn (is_domain_name, is_ipv4, is_valid_port, split_host_and_port, split_host_port_and_trailer); called by 1 (is_url_like_token).
 
@@ -1195,11 +1203,11 @@ fn is_bare_url_like(token: &str) -> bool
 fn split_host_port_and_trailer(token: &str) -> (&str, bool)
 ```
 
-**Purpose**: Separates the host/port prefix of a bare URL candidate from any path, query, or fragment trailer. It also reports whether such a trailer existed.
+**Purpose**: Separates the host-and-port part of a bare URL from the path, query, or fragment that follows it. The trailer is what makes `example.com/path` look URL-like.
 
-**Data flow**: Searches `token` for the first `/`, `?`, or `#`; if found returns `(&token[..idx], true)`, otherwise returns `(token, false)`.
+**Data flow**: It receives a token and looks for `/`, `?`, or `#`. If found, it returns the part before that marker and says a trailer exists; otherwise it returns the whole token and says there is no trailer.
 
-**Call relations**: Used by `is_bare_url_like` to enforce the rule that most bare hosts need a URL-ish trailer.
+**Call relations**: `is_bare_url_like` calls this before host and port validation.
 
 *Call graph*: called by 1 (is_bare_url_like).
 
@@ -1210,11 +1218,11 @@ fn split_host_port_and_trailer(token: &str) -> (&str, bool)
 fn split_host_and_port(host_port: &str) -> (&str, Option<&str>)
 ```
 
-**Purpose**: Splits a host-and-port candidate into host and optional numeric port, while intentionally declining to parse bracketed IPv6 notation. This keeps the first-pass heuristic simple and conservative.
+**Purpose**: Splits a host from a numeric port suffix like `localhost:3000`. It intentionally does not try to understand bracketed IPv6 addresses.
 
-**Data flow**: If `host_port` starts with `[`, returns the whole string as host with no port. Otherwise it tries `rsplit_once(':')`; when both sides are non-empty and the suffix is all ASCII digits, it returns `(host, Some(port))`, else `(host_port, None)`.
+**Data flow**: It receives a host-port string, rejects bracketed forms for special handling, and if the final colon is followed by digits, returns the host plus that port. Otherwise it returns the whole string as the host.
 
-**Call relations**: Called by `is_bare_url_like` before host and port validation.
+**Call relations**: `is_bare_url_like` calls this after separating any path or query trailer.
 
 *Call graph*: called by 1 (is_bare_url_like).
 
@@ -1225,11 +1233,11 @@ fn split_host_and_port(host_port: &str) -> (&str, Option<&str>)
 fn is_valid_port(port: &str) -> bool
 ```
 
-**Purpose**: Validates that a port string is numeric and within the `u16` range. It rejects empty, too-long, and non-digit ports.
+**Purpose**: Checks whether a port string is a valid network port number. Ports must be digits and fit in the normal 0 to 65535 range.
 
-**Data flow**: Checks length and digit-only constraints, then parses the string as `u16` and returns whether parsing succeeded.
+**Data flow**: It receives the port text, rejects empty, too-long, or non-digit values, then parses it as a 16-bit unsigned number and returns whether that worked.
 
-**Call relations**: Used by `is_bare_url_like` when a bare URL candidate includes `:port`.
+**Call relations**: `is_bare_url_like` calls this when a bare URL token includes a port.
 
 *Call graph*: called by 1 (is_bare_url_like).
 
@@ -1240,11 +1248,11 @@ fn is_valid_port(port: &str) -> bool
 fn is_ipv4(host: &str) -> bool
 ```
 
-**Purpose**: Checks whether a host string is a valid dotted-quad IPv4 address. Each octet must parse as `u8`.
+**Purpose**: Checks whether a host looks like an IPv4 address, such as `192.168.1.1`. IPv4 is the familiar four-number internet address format.
 
-**Data flow**: Splits the host on `.`, requires exactly four parts, and returns whether every non-empty part parses successfully as `u8`.
+**Data flow**: It receives host text, splits it by dots, requires exactly four parts, and checks each part can be parsed as a byte-sized number.
 
-**Call relations**: Used by `is_bare_url_like` as one accepted host form.
+**Call relations**: `is_bare_url_like` uses this as one of the accepted host forms.
 
 *Call graph*: called by 1 (is_bare_url_like).
 
@@ -1255,11 +1263,11 @@ fn is_ipv4(host: &str) -> bool
 fn is_domain_name(host: &str) -> bool
 ```
 
-**Purpose**: Validates a hostname as a domain name with a recognized top-level-label shape. It requires at least one dot and validates all labels conservatively.
+**Purpose**: Checks whether a host looks like a normal domain name with a real-looking top-level ending, such as `example.com`. This helps reject file paths like `src/main.rs`.
 
-**Data flow**: Lowercases the host, rejects strings without `.`, splits on `.`, takes the last label as the TLD and validates it with `is_tld`, then requires all preceding labels to satisfy `is_domain_label`; returns the combined boolean result.
+**Data flow**: It lowercases the host, requires at least one dot, checks the last label as a top-level domain, and checks each earlier label for domain-name rules.
 
-**Call relations**: Used by `is_bare_url_like` for bare-domain URL detection.
+**Call relations**: `is_bare_url_like` uses this after localhost and IPv4 checks. It relies on `is_tld` and the label rules to decide whether the host is plausible.
 
 *Call graph*: calls 1 internal fn (is_tld); called by 1 (is_bare_url_like).
 
@@ -1270,11 +1278,11 @@ fn is_domain_name(host: &str) -> bool
 fn is_tld(label: &str) -> bool
 ```
 
-**Purpose**: Checks whether a top-level domain label has a plausible shape. The heuristic accepts only alphabetic labels of length 2 through 63.
+**Purpose**: Checks whether the final part of a domain, such as `com` or `org`, is a plausible top-level domain. It must be alphabetic and reasonably sized.
 
-**Data flow**: Reads `label.len()` and its characters, returning `true` only if the length is in range and every character is ASCII alphabetic.
+**Data flow**: It receives one domain label and returns true only if it is 2 to 63 characters long and all letters.
 
-**Call relations**: Called by `is_domain_name` when validating the final hostname label.
+**Call relations**: `is_domain_name` calls this for the final domain segment before accepting a bare host.
 
 *Call graph*: called by 1 (is_domain_name).
 
@@ -1285,11 +1293,11 @@ fn is_tld(label: &str) -> bool
 fn is_domain_label(label: &str) -> bool
 ```
 
-**Purpose**: Validates a non-TLD domain label. Labels must be non-empty, at most 63 characters, start and end alphanumeric, and contain only alphanumerics or hyphens internally.
+**Purpose**: Checks whether one non-final piece of a domain name follows common domain label rules. Labels may contain letters, digits, and hyphens, but cannot start or end with a hyphen.
 
-**Data flow**: Checks length bounds, extracts first and last characters, and returns whether boundary and per-character constraints all hold.
+**Data flow**: It receives a label, rejects empty or too-long labels, reads the first and last characters, and confirms every character is allowed.
 
-**Call relations**: Used by `is_domain_name` for each hostname label before the TLD.
+**Call relations**: This is the label-level rule used by the domain-name validation path. It supports the URL detector’s goal of accepting domains while rejecting ordinary path-like text.
 
 
 ##### `url_preserving_wrap_options`  (lines 493–497)
@@ -1298,11 +1306,11 @@ fn is_domain_label(label: &str) -> bool
 fn url_preserving_wrap_options(opts: RtOptions<'a>) -> RtOptions<'a>
 ```
 
-**Purpose**: Transforms wrapping options so URL-like tokens are never split by punctuation or hyphenation. It switches to ASCII-space tokenization, disables hyphenation, and forbids breaking words.
+**Purpose**: Changes wrapping options so URL-like tokens are not split at slashes, hyphens, or arbitrary character boundaries. It is the simple protection mode for URL-only lines.
 
-**Data flow**: Consumes `RtOptions`, replaces `word_separator` with `WordSeparator::AsciiSpace`, `word_splitter` with `WordSplitter::NoHyphenation`, sets `break_words(false)`, and returns the modified options.
+**Data flow**: It receives runtime wrapping options, changes word separation to spaces only, disables hyphen-based splitting, disables long-word breaking, and returns the adjusted options.
 
-**Call relations**: Used by `adaptive_wrap_line` for URL-only lines where preserving the entire token is more important than fitting within width.
+**Call relations**: `adaptive_wrap_line` calls this when a line contains a URL but not meaningful surrounding prose.
 
 *Call graph*: calls 1 internal fn (word_separator); called by 1 (adaptive_wrap_line).
 
@@ -1313,11 +1321,11 @@ fn url_preserving_wrap_options(opts: RtOptions<'a>) -> RtOptions<'a>
 fn adaptive_wrap_line(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>>
 ```
 
-**Purpose**: Wraps a single `Line` using URL-aware heuristics. It preserves default wrapping for ordinary prose, preserves whole URL tokens on URL-only lines, and uses a custom mixed-token algorithm when prose and URLs coexist.
+**Purpose**: Wraps one styled terminal line and automatically chooses the safest wrapping strategy for URLs. Callers use it when text might contain clickable links.
 
-**Data flow**: Reads the input `Line` and base `RtOptions`, first checks `line_contains_url_like`; if false it returns `word_wrap_line(line, base)`. If true, it checks `line_has_mixed_url_and_non_url_tokens`; mixed lines go to `mixed_url_wrap_line`, otherwise it calls `word_wrap_line` with `url_preserving_wrap_options(base)`.
+**Data flow**: It receives a line and wrapping options. It first checks for URL-like text; if none is found, it uses normal wrapping. If URLs are present, it either uses mixed URL-aware wrapping for prose plus URLs or URL-preserving options for URL-only text.
 
-**Call relations**: This is the main adaptive entry point used by many rendering paths. It dispatches between the standard wrapper and the custom mixed-token wrapper based on the URL heuristics.
+**Call relations**: Many rendering paths call this while building transcript, command, and history display lines. It is the main decision point that routes work to `word_wrap_line`, `mixed_url_wrap_line`, or URL-preserving options.
 
 *Call graph*: calls 5 internal fn (line_contains_url_like, line_has_mixed_url_and_non_url_tokens, mixed_url_wrap_line, url_preserving_wrap_options, word_wrap_line); called by 14 (command_display_lines, exploring_display_lines, transcript_lines, user_shell_output_is_limited_by_screen_lines, insert_history_hyperlink_lines_with_mode_and_wrap_policy, flush_current_line, adaptive_wrap_hyperlink_lines, adaptive_wrap_lines, adaptive_wrap_line_keeps_long_url_like_token_intact, adaptive_wrap_line_mixed_line_counts_leading_spaces_before_first_word (+4 more)).
 
@@ -1331,11 +1339,11 @@ fn adaptive_wrap_lines(
 ) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Applies adaptive wrapping across multiple input lines while using `initial_indent` only for the first output line and `subsequent_indent` thereafter. Each source line is analyzed independently for URL content.
+**Purpose**: Wraps a sequence of lines with the same URL-aware rules as `adaptive_wrap_line`. It applies the initial indent only to the first input line and continuation indent afterward.
 
-**Data flow**: Consumes an iterable of values implementing the private `IntoLineInput` trait plus base `RtOptions`. For each input line it converts to `LineInput`, chooses options that preserve the original initial indent only for the first overall line and substitute `subsequent_indent` on later lines, calls `adaptive_wrap_line`, then copies the wrapped results into an owned `Vec<Line<'static>>` via `push_owned_lines`.
+**Data flow**: It receives any iterable of line-like inputs plus wrapping options. For each input line, it chooses the right indent, calls `adaptive_wrap_line`, converts the result into owned output lines, and appends them to the output list.
 
-**Call relations**: Used by higher-level renderers that need URL-aware wrapping over multi-line content. It orchestrates repeated calls to `adaptive_wrap_line` and normalizes ownership for downstream storage.
+**Call relations**: Higher-level renderers call this for transcript and history sections. It repeatedly uses `adaptive_wrap_line` and then `push_owned_lines` so the final lines can outlive the borrowed inputs.
 
 *Call graph*: calls 2 internal fn (push_owned_lines, adaptive_wrap_line); called by 7 (install_confirmation_lines, as_renderable, push_section_header, as_renderable, transcript_lines, render_transcript_content_lines, display_lines); 2 external calls (into_iter, new).
 
@@ -1346,11 +1354,11 @@ fn adaptive_wrap_lines(
 fn from(width: usize) -> Self
 ```
 
-**Purpose**: Provides a shorthand conversion from a plain width into default wrapping options. This lets callers pass `usize` widths directly to wrapping functions.
+**Purpose**: Lets a plain width number be used wherever runtime wrapping options are expected. This keeps simple call sites short.
 
-**Data flow**: Accepts a `usize` width, calls `RtOptions::new(width)`, and returns the resulting options struct.
+**Data flow**: It receives a width and returns a new `RtOptions` value with that width and default wrapping behavior.
 
-**Call relations**: Used implicitly by generic wrapping APIs whenever callers supply a width instead of a full `RtOptions` value.
+**Call relations**: Generic wrapping functions accept values that can turn into `RtOptions`; this conversion is what makes calls like `word_wrap_line(line, 80)` work.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -1361,11 +1369,11 @@ fn from(width: usize) -> Self
 fn new(width: usize) -> Self
 ```
 
-**Purpose**: Constructs default wrapping options for ratatui lines. The defaults mirror ordinary `textwrap` behavior while keeping indent prefixes as `Line` values.
+**Purpose**: Creates the default runtime wrapping configuration for Ratatui lines. It sets width, no indentation, normal word breaking, and the default `textwrap` behavior.
 
-**Data flow**: Creates and returns `RtOptions` with the provided `width`, `LineEnding::LF`, default empty `initial_indent` and `subsequent_indent`, `break_words = true`, `WordSeparator::new()`, `WrapAlgorithm::FirstFit`, and `WordSplitter::HyphenSplitter`.
+**Data flow**: It receives a target width and builds an `RtOptions` struct with default line ending, empty first and subsequent indents, word breaking enabled, and standard separator, splitter, and algorithm settings.
 
-**Call relations**: This is the base constructor used throughout rendering code and tests before callers selectively override individual wrapping behaviors.
+**Call relations**: Rendering code and tests call this whenever they need to customize wrapping options. Builder-style methods then adjust individual fields.
 
 *Call graph*: called by 43 (install_confirmation_lines, as_renderable, push_section_header, as_renderable, wrap_standard_row, wrap_styled_line, command_display_lines, exploring_display_lines, transcript_lines, user_shell_output_is_limited_by_screen_lines (+15 more)); 2 external calls (default, new).
 
@@ -1376,11 +1384,11 @@ fn new(width: usize) -> Self
 fn line_ending(self, line_ending: textwrap::LineEnding) -> Self
 ```
 
-**Purpose**: Returns a copy of the options with a different line-ending policy. It is a standard builder-style setter.
+**Purpose**: Returns a copy of the options with a different line-ending setting. Line endings describe how wrapped lines would be separated in plain text.
 
-**Data flow**: Consumes `self`, replaces `line_ending`, preserves all other fields via struct update syntax, and returns the new `RtOptions`.
+**Data flow**: It receives existing options and a line-ending value, replaces that field, and returns the updated options.
 
-**Call relations**: Used by callers customizing wrapping behavior before passing options into wrapping functions.
+**Call relations**: This is one of the builder-style methods used when callers need more than just a width.
 
 
 ##### `RtOptions::width`  (lines 611–613)
@@ -1389,11 +1397,11 @@ fn line_ending(self, line_ending: textwrap::LineEnding) -> Self
 fn width(self, width: usize) -> Self
 ```
 
-**Purpose**: Returns a copy of the options with a different target width. This is useful when deriving per-line widths after accounting for indent prefixes.
+**Purpose**: Returns a copy of the options with a different target width. This is useful when indentation has reduced the available content space.
 
-**Data flow**: Consumes `self`, writes the new `width`, and returns the updated options.
+**Data flow**: It receives existing options and a new width, replaces the width field, and returns the updated options.
 
-**Call relations**: Used internally by wrapping code when computing reduced widths for initial and subsequent lines.
+**Call relations**: Wrapping code uses this style of option adjustment when it asks `textwrap` to wrap first and subsequent lines at different available widths.
 
 
 ##### `RtOptions::initial_indent`  (lines 615–620)
@@ -1402,11 +1410,11 @@ fn width(self, width: usize) -> Self
 fn initial_indent(self, initial_indent: Line<'a>) -> Self
 ```
 
-**Purpose**: Sets the styled prefix to prepend to the first wrapped output line. The indent itself is represented as a `Line`, not plain text.
+**Purpose**: Returns a copy of the options with a new prefix for the first wrapped output line. The prefix is itself a styled Ratatui line.
 
-**Data flow**: Consumes `self`, replaces `initial_indent`, and returns the updated options.
+**Data flow**: It receives existing options and a styled line to use as the first-line indent, stores it, and returns the updated options.
 
-**Call relations**: Used by callers and by multi-line wrappers when shifting from initial to subsequent indentation semantics.
+**Call relations**: Multi-line wrappers use this to ensure only the very first output line receives the initial indent; later input lines are switched to the subsequent indent.
 
 
 ##### `RtOptions::subsequent_indent`  (lines 622–627)
@@ -1415,11 +1423,11 @@ fn initial_indent(self, initial_indent: Line<'a>) -> Self
 fn subsequent_indent(self, subsequent_indent: Line<'a>) -> Self
 ```
 
-**Purpose**: Sets the styled prefix for continuation lines after the first wrapped output line. This supports hanging indents and list formatting.
+**Purpose**: Returns a copy of the options with a new prefix for continuation lines. This lets wrapped text align under bullets, quotes, or other UI decorations.
 
-**Data flow**: Consumes `self`, replaces `subsequent_indent`, and returns the updated options.
+**Data flow**: It receives existing options and a styled line to use after the first wrapped line, stores it, and returns the updated options.
 
-**Call relations**: Used by callers configuring wrapped layout and by adaptive/standard multi-line wrappers.
+**Call relations**: Renderers set this before calling the wrapping functions when they need wrapped lines to line up visually.
 
 
 ##### `RtOptions::break_words`  (lines 629–634)
@@ -1428,11 +1436,11 @@ fn subsequent_indent(self, subsequent_indent: Line<'a>) -> Self
 fn break_words(self, break_words: bool) -> Self
 ```
 
-**Purpose**: Controls whether overlong words may be split to fit the width. Disabling it allows lines to overflow rather than breaking tokens.
+**Purpose**: Returns a copy of the options with word-breaking turned on or off. Turning it off allows a long token to overflow instead of being split.
 
-**Data flow**: Consumes `self`, replaces `break_words`, and returns the updated options.
+**Data flow**: It receives existing options and a boolean, stores that choice, and returns the updated options.
 
-**Call relations**: Used directly by callers and indirectly by `url_preserving_wrap_options` to prevent URL splitting.
+**Call relations**: URL-preserving wrapping turns this off so long URLs remain one token. Tests also use it to verify overflow behavior.
 
 
 ##### `RtOptions::word_separator`  (lines 636–641)
@@ -1441,11 +1449,11 @@ fn break_words(self, break_words: bool) -> Self
 fn word_separator(self, word_separator: textwrap::WordSeparator) -> RtOptions<'a>
 ```
 
-**Purpose**: Sets the tokenization strategy used by `textwrap` when finding wrap opportunities. This is how the module switches between default and ASCII-space-only behavior.
+**Purpose**: Returns a copy of the options with a different rule for finding word boundaries. A word boundary is a place where wrapping may consider a break.
 
-**Data flow**: Consumes `self`, replaces `word_separator`, and returns the updated options.
+**Data flow**: It receives existing options and a `textwrap` word separator, stores it, and returns the updated options.
 
-**Call relations**: Called by `url_preserving_wrap_options` and available to callers that need explicit separator control.
+**Call relations**: `url_preserving_wrap_options` calls this to switch to space-only separation so slashes and hyphens inside URLs are not treated as break points.
 
 *Call graph*: called by 1 (url_preserving_wrap_options).
 
@@ -1456,11 +1464,11 @@ fn word_separator(self, word_separator: textwrap::WordSeparator) -> RtOptions<'a
 fn wrap_algorithm(self, wrap_algorithm: textwrap::WrapAlgorithm) -> RtOptions<'a>
 ```
 
-**Purpose**: Sets the `textwrap` wrap algorithm. It is a builder-style passthrough for callers that need non-default line-fitting behavior.
+**Purpose**: Returns a copy of the options with a different wrapping algorithm. The algorithm decides how to choose line breaks once possible break points are known.
 
-**Data flow**: Consumes `self`, replaces `wrap_algorithm`, and returns the updated options.
+**Data flow**: It receives existing options and an algorithm value, replaces the field, and returns the updated options.
 
-**Call relations**: Used during option construction before wrapping; `word_wrap_line` later transfers the field into `textwrap::Options`.
+**Call relations**: This builder method is available for callers that need a different `textwrap` strategy while still using Ratatui-aware wrapping.
 
 
 ##### `RtOptions::word_splitter`  (lines 650–655)
@@ -1469,11 +1477,11 @@ fn wrap_algorithm(self, wrap_algorithm: textwrap::WrapAlgorithm) -> RtOptions<'a
 fn word_splitter(self, word_splitter: textwrap::WordSplitter) -> RtOptions<'a>
 ```
 
-**Purpose**: Sets the per-word splitting strategy, such as hyphen splitting or no hyphenation. This controls how long tokens may be broken once selected for wrapping.
+**Purpose**: Returns a copy of the options with a different rule for splitting inside words. This controls behavior such as breaking at hyphens.
 
-**Data flow**: Consumes `self`, replaces `word_splitter`, and returns the updated options.
+**Data flow**: It receives existing options and a splitter value, stores it, and returns the updated options.
 
-**Call relations**: Used by callers and by `url_preserving_wrap_options`; `word_wrap_line` copies it into `textwrap::Options`.
+**Call relations**: URL-preserving setup uses this kind of option to disable hyphen splitting, while ordinary wrapping keeps the default splitter.
 
 
 ##### `word_wrap_line`  (lines 659–730)
@@ -1482,11 +1490,11 @@ fn word_splitter(self, word_splitter: textwrap::WordSplitter) -> RtOptions<'a>
 fn word_wrap_line(line: &'a Line<'a>, width_or_options: O) -> Vec<Line<'a>>
 ```
 
-**Purpose**: Wraps a single styled `Line` using standard `textwrap` behavior while preserving span styles and applying styled initial/subsequent indents. It is the core non-URL-aware wrapper.
+**Purpose**: Wraps one styled Ratatui line using the standard wrapping path while preserving styles and indentation. It is the core non-adaptive wrapper.
 
-**Data flow**: Flattens the input line into a `String` plus span byte bounds via `flatten_line`, converts `RtOptions` into `textwrap::Options`, computes the first wrapped range with width reduced by `initial_indent.width()`, and if empty returns a clone of the initial indent. Otherwise it slices the original spans for the first range with `slice_line_spans`, patches each span with the parent line style, prepends the initial indent, and pushes that line. It then skips leading spaces after the first range, computes remaining wrapped ranges using width reduced by `subsequent_indent.width()`, slices and styles each continuation range, prepends the subsequent indent, and returns `Vec<Line<'a>>`.
+**Data flow**: It receives a styled line and width/options, flattens all spans into plain text, computes wrapped byte ranges, slices the original spans back into those ranges, adds the proper first or continuation indent, and returns styled output lines.
 
-**Call relations**: This is the standard wrapping primitive used directly by many renderers and indirectly by `adaptive_wrap_line` for non-URL and URL-only cases. It depends on `wrap_ranges_trim` for source-range reconstruction and on span flatten/slice helpers for style preservation.
+**Call relations**: General rendering code calls this when URL protection is not needed, and `adaptive_wrap_line` falls back to it for non-URL lines. It depends on `flatten_line`, `wrap_ranges_trim`, and `slice_line_spans` to move between styled text and byte ranges.
 
 *Call graph*: calls 3 internal fn (flatten_line, slice_line_spans, wrap_ranges_trim); called by 20 (wrap_cell, render_stacked_field, wrap_cell, adaptive_wrap_line, ascii_space_separator_with_no_hyphenation_keeps_url_intact, break_words_false_allows_overflow_for_long_word, empty_initial_indent_subsequent_spaces, empty_input_yields_single_empty_line, hyphen_splitter_breaks_at_hyphen, indent_consumes_width_leaving_one_char_space (+10 more)); 4 external calls (into, new, new, vec!).
 
@@ -1497,11 +1505,11 @@ fn word_wrap_line(line: &'a Line<'a>, width_or_options: O) -> Vec<Line<'a>>
 fn width(&self, text: &str) -> usize
 ```
 
-**Purpose**: Computes the display width of a token slice represented by a `MixedUrlWord`. Width is measured in terminal columns, not bytes.
+**Purpose**: Measures how wide one mixed-wrapper word appears on screen. This matters because some characters, such as emoji, take more than one terminal column.
 
-**Data flow**: Clones the stored `range`, indexes into the provided source `text`, passes the substring to `display_width`, and returns the resulting `usize`.
+**Data flow**: It receives a `MixedUrlWord` and the full source text, slices the word’s byte range, measures its display width, and returns that width.
 
-**Call relations**: Used by `split_mixed_url_word` and the mixed-token wrapping algorithm when deciding whether a piece fits on the current line.
+**Call relations**: `split_mixed_url_word` uses this to decide whether a non-URL token must be broken into smaller pieces.
 
 *Call graph*: called by 1 (split_mixed_url_word); 2 external calls (display_width, clone).
 
@@ -1512,11 +1520,11 @@ fn width(&self, text: &str) -> usize
 fn mixed_url_wrap_line(line: &'a Line<'a>, rt_opts: RtOptions<'a>) -> Vec<Line<'a>>
 ```
 
-**Purpose**: Wraps a line containing both URL and non-URL tokens using the custom mixed-token algorithm. It preserves URL tokens intact while still allowing oversized non-URL tokens to split.
+**Purpose**: Wraps a styled line that contains both prose and URLs. It keeps URL tokens whole while still allowing normal prose and very long non-URL words to wrap.
 
-**Data flow**: Flattens the input line and span bounds, computes available widths after subtracting initial and subsequent indent widths, obtains wrapped source ranges from `mixed_url_wrap_ranges`, then for each range builds either an initial- or subsequent-indented output `Line`, slices the original spans with `slice_line_spans`, patches span styles with the parent line style, and collects the results. If no ranges were produced, it returns a single clone of the initial indent.
+**Data flow**: It receives a styled line and options, flattens the line, computes URL-aware source ranges, slices the original styled spans for each range, adds first or continuation indentation, and returns styled wrapped lines.
 
-**Call relations**: Reached only from `adaptive_wrap_line` when URL and substantive prose coexist on the same line. It delegates the actual token-fitting logic to `mixed_url_wrap_ranges`.
+**Call relations**: `adaptive_wrap_line` calls this only for mixed URL/prose lines. It uses `mixed_url_wrap_ranges` for the custom line-break decisions and `slice_line_spans` to preserve styles.
 
 *Call graph*: calls 3 internal fn (flatten_line, mixed_url_wrap_ranges, slice_line_spans); called by 1 (adaptive_wrap_line); 2 external calls (new, vec!).
 
@@ -1531,11 +1539,11 @@ fn mixed_url_wrap_ranges(
 ) -> Vec<Range<usize>>
 ```
 
-**Purpose**: Computes source byte ranges for mixed URL/prose wrapping. It tokenizes on ASCII spaces, keeps URL tokens atomic, and greedily fills lines while resplitting oversized non-URL tokens as needed.
+**Purpose**: Computes byte ranges for wrapping mixed prose and URL text. Think of it as packing words into rows while treating URLs as unbreakable fragile items.
 
-**Data flow**: Accepts flattened `text` plus separate widths for the first and continuation lines. It records leading-space width, tokenizes with `WordSeparator::AsciiSpace.find_words`, converts each non-empty token into `MixedUrlWord { range, is_url }`, then iterates through words while maintaining current line start/end, current line width, and current width limit. Each word may be expanded into smaller pieces by `split_mixed_url_word`; pieces are either appended to the current line if they fit, or cause the current line range to be finalized and a new line to begin. The function returns the accumulated `Vec<Range<usize>>`.
+**Data flow**: It receives text plus available widths for the first and later lines. It splits text by spaces, marks each word as URL or non-URL, splits overlong non-URL words when needed, then builds source ranges that fit the current line width.
 
-**Call relations**: Used exclusively by `mixed_url_wrap_line`. It is the heart of the adaptive mixed-content path and relies on `is_url_like_token` for classification and `split_mixed_url_word` for breaking long non-URL tokens.
+**Call relations**: `mixed_url_wrap_line` calls this to get the ranges it will render. It uses `is_url_like_token` to protect URLs and `split_mixed_url_word` to break only non-URL words.
 
 *Call graph*: calls 2 internal fn (is_url_like_token, split_mixed_url_word); called by 1 (mixed_url_wrap_line); 1 external calls (new).
 
@@ -1546,11 +1554,11 @@ fn mixed_url_wrap_ranges(
 fn split_mixed_url_word(text: &str, word: MixedUrlWord, line_limit: usize) -> Vec<MixedUrlWord>
 ```
 
-**Purpose**: Breaks an oversized non-URL token into smaller pieces that fit within a line limit, while leaving URL tokens untouched. It uses `textwrap`’s low-level word-breaking logic for the split points.
+**Purpose**: Breaks a non-URL word into smaller pieces if it is too wide for the available line. URL words are deliberately never split here.
 
-**Data flow**: Takes source `text`, a `MixedUrlWord`, and `line_limit`. If the word is a URL or already fits, it returns a one-element vector containing the original word. Otherwise it constructs `textwrap::core::Word` from the source substring, iterates over `break_apart(line_limit.max(1))`, converts each piece back into a `MixedUrlWord` with adjusted byte ranges and `is_url = false`, and returns the pieces.
+**Data flow**: It receives the full text, a word range, and a line width. If the word is a URL or already fits, it returns it unchanged; otherwise it asks `textwrap` to break it apart and returns smaller word ranges.
 
-**Call relations**: Called by `mixed_url_wrap_ranges` whenever a non-URL token may need to be split to fit either the initial or continuation width.
+**Call relations**: `mixed_url_wrap_ranges` calls this before placing words on lines, and may call it again when continuation indentation leaves less room.
 
 *Call graph*: calls 1 internal fn (width); called by 1 (mixed_url_wrap_ranges); 3 external calls (new, from, vec!).
 
@@ -1561,11 +1569,11 @@ fn split_mixed_url_word(text: &str, word: MixedUrlWord, line_limit: usize) -> Ve
 fn flatten_line(line: &Line<'_>) -> (String, Vec<(Range<usize>, ratatui::style::Style)>)
 ```
 
-**Purpose**: Converts a styled `Line` into a flat string plus byte ranges and styles for each original span. This creates the mapping needed to wrap text as plain content and then reconstruct styled slices.
+**Purpose**: Turns a styled Ratatui line into plain text plus a map of which byte ranges came from which styled spans. This makes wrapping possible without losing color or style information.
 
-**Data flow**: Iterates over `line.spans`, appends each span’s text to a `String`, tracks cumulative byte offsets, records `(start..end, span.style)` for each span, and returns `(flat, span_bounds)`.
+**Data flow**: It receives a line, appends each span’s text into one string, records the start and end bytes for each span along with its style, and returns both the flat string and the bounds map.
 
-**Call relations**: Used by both `word_wrap_line` and `mixed_url_wrap_line` before they compute wrapped ranges and slice the original spans back out.
+**Call relations**: `word_wrap_line` and `mixed_url_wrap_line` call this before wrapping. Later, `slice_line_spans` uses the recorded bounds to rebuild styled pieces.
 
 *Call graph*: called by 2 (mixed_url_wrap_line, word_wrap_line); 2 external calls (new, new).
 
@@ -1576,11 +1584,11 @@ fn flatten_line(line: &Line<'_>) -> (String, Vec<(Range<usize>, ratatui::style::
 fn as_ref(&self) -> &Line<'a>
 ```
 
-**Purpose**: Provides a shared borrowed `&Line` view over either a borrowed or owned `LineInput`. It hides the ownership distinction from wrapping loops.
+**Purpose**: Provides a borrowed view of a line input whether it was originally borrowed or owned. This lets wrapper loops treat all input forms the same.
 
-**Data flow**: Matches on `self` and returns a reference to the contained `Line` in either variant.
+**Data flow**: It receives a `LineInput` enum value and returns a reference to the contained `Line` in either case.
 
-**Call relations**: Used by `adaptive_wrap_lines` and `word_wrap_lines` after converting heterogeneous inputs through `IntoLineInput`.
+**Call relations**: Multi-line wrapping functions call this after converting flexible inputs into `LineInput` values.
 
 
 ##### `Line::into_line_input`  (lines 946–948)
@@ -1589,11 +1597,11 @@ fn as_ref(&self) -> &Line<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Converts line-like inputs into the internal `LineInput` enum so wrapping APIs can accept borrowed or owned values uniformly. The implementation covers `&Line`, `&mut Line`, and owned `Line` forms.
+**Purpose**: Converts a Ratatui line reference into the internal line-input wrapper. This avoids copying when the caller already has a line.
 
-**Data flow**: Depending on the concrete impl, wraps the input as either `LineInput::Borrowed` or `LineInput::Owned` and returns it.
+**Data flow**: It receives a borrowed line and returns a `LineInput::Borrowed` variant pointing at it.
 
-**Call relations**: Invoked implicitly by generic multi-line wrappers when iterating over line inputs of various ownership forms.
+**Call relations**: `word_wrap_lines` and `adaptive_wrap_lines` use the `IntoLineInput` trait so callers can pass borrowed lines, owned lines, strings, spans, or span lists.
 
 *Call graph*: 2 external calls (Borrowed, Owned).
 
@@ -1604,11 +1612,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Allows owned `String` values to be passed directly into multi-line wrapping APIs. The string is converted into a ratatui `Line` first.
+**Purpose**: Converts an owned string into a styled line input for wrapping. This makes plain strings acceptable to the multi-line wrapper.
 
-**Data flow**: Consumes the `String`, constructs `Line::from(self)`, wraps it as `LineInput::Owned`, and returns it.
+**Data flow**: It receives a `String`, turns it into a Ratatui `Line`, wraps that as an owned `LineInput`, and returns it.
 
-**Call relations**: Used implicitly by `word_wrap_lines` and `adaptive_wrap_lines` when callers provide string collections.
+**Call relations**: The generic multi-line wrappers call this through the `IntoLineInput` trait when their input iterator yields owned strings.
 
 *Call graph*: 2 external calls (from, Owned).
 
@@ -1619,11 +1627,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Allows borrowed `&str` values to be passed directly into multi-line wrapping APIs. Each string slice becomes an owned `Line` wrapper.
+**Purpose**: Converts a string slice into an owned Ratatui line for wrapping. This lets callers pass plain `&str` values directly.
 
-**Data flow**: Converts the `&str` into `Line::from(self)`, wraps it as `LineInput::Owned`, and returns it.
+**Data flow**: It receives a borrowed string slice, builds a `Line` from it, stores that line as owned input, and returns the wrapper value.
 
-**Call relations**: Used implicitly by generic wrapping loops for string-slice inputs.
+**Call relations**: `word_wrap_lines` and `adaptive_wrap_lines` use this through the trait when wrapping arrays or iterators of string slices.
 
 *Call graph*: 2 external calls (from, Owned).
 
@@ -1634,11 +1642,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Allows `Cow<str>` values to be wrapped through the same generic line-input path. This avoids forcing callers to normalize ownership first.
+**Purpose**: Converts a copy-on-write string into an owned Ratatui line input. A copy-on-write string may be borrowed or owned, but the wrapper stores it as a line.
 
-**Data flow**: Consumes the `Cow<str>`, converts it into `Line::from(self)`, wraps it as `LineInput::Owned`, and returns it.
+**Data flow**: It receives a `Cow<str>`, builds a `Line` from it, wraps the line as owned input, and returns it.
 
-**Call relations**: Participates in the generic input conversion used by multi-line wrappers.
+**Call relations**: The flexible input trait uses this so callers with `Cow` text do not need to convert it manually before wrapping.
 
 *Call graph*: 2 external calls (from, Owned).
 
@@ -1649,11 +1657,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Allows a single styled `Span` to be treated as a one-line input to the wrapping APIs. The span is promoted into a `Line`.
+**Purpose**: Converts a single styled span into a line input. This lets callers wrap one styled fragment without first putting it in a line themselves.
 
-**Data flow**: Consumes the `Span`, converts it into `Line::from(self)`, wraps it as `LineInput::Owned`, and returns it.
+**Data flow**: It receives a `Span`, turns it into a `Line`, wraps that line as owned input, and returns it.
 
-**Call relations**: Used implicitly when callers pass spans directly into generic wrapping functions.
+**Call relations**: The multi-line wrappers accept this through the shared input-conversion trait.
 
 *Call graph*: 2 external calls (from, Owned).
 
@@ -1664,11 +1672,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn into_line_input(self) -> LineInput<'a>
 ```
 
-**Purpose**: Allows a vector of spans to be treated as one styled line for wrapping. This is convenient for callers assembling line content piecemeal.
+**Purpose**: Converts a vector of styled spans into a line input. This is useful when a caller has already built styled pieces but not a Ratatui `Line`.
 
-**Data flow**: Consumes `Vec<Span<'a>>`, converts it into `Line::from(self)`, wraps it as `LineInput::Owned`, and returns it.
+**Data flow**: It receives a vector of spans, builds a `Line` from the vector, wraps the line as owned input, and returns it.
 
-**Call relations**: Used by generic multi-line wrappers when callers provide span vectors instead of prebuilt `Line` values.
+**Call relations**: `word_wrap_lines` and `adaptive_wrap_lines` can use this conversion when an input iterator yields span vectors.
 
 *Call graph*: 2 external calls (from, Owned).
 
@@ -1679,11 +1687,11 @@ fn into_line_input(self) -> LineInput<'a>
 fn word_wrap_lines(lines: I, width_or_options: O) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Wraps a sequence of inputs using standard wrapping, applying the initial indent only once across the entire output and the subsequent indent everywhere after that. It returns owned `'static` lines suitable for storage and rendering.
+**Purpose**: Wraps a sequence of line-like inputs using the standard, non-adaptive wrapper. It applies the special initial indent only once across the whole sequence.
 
-**Data flow**: Converts `width_or_options` into `RtOptions`, iterates over the input sequence converting each item through `IntoLineInput`, chooses options that preserve the original initial indent only for the first overall line and replace it with `subsequent_indent` for later source lines, calls `word_wrap_line` for each, and appends owned copies into `Vec<Line<'static>>` via `push_owned_lines`.
+**Data flow**: It receives an iterator of inputs and width/options. Each input is converted to `LineInput`, wrapped with `word_wrap_line`, then copied into an owned output vector; after the first input, the subsequent indent becomes the initial indent.
 
-**Call relations**: Used by higher-level renderers that need standard wrapping over multiple lines. It orchestrates repeated calls to `word_wrap_line` and ownership normalization.
+**Call relations**: Renderers and tests call this when text is known to be ordinary prose or when URL-aware behavior is not desired. It uses `push_owned_lines` so the returned lines are independent of temporary input data.
 
 *Call graph*: calls 2 internal fn (push_owned_lines, word_wrap_line); called by 8 (agent_markdown_cell_survives_insert_history_rewrap, e2e_stream_blockquote_wrap_preserves_green_style, display_lines, wrapped_details_lines, wrap_lines_accepts_borrowed_iterators, wrap_lines_accepts_str_slices, wrap_lines_applies_initial_indent_only_once, wrap_lines_without_indents_is_concat_of_single_wraps); 3 external calls (into_iter, into, new).
 
@@ -1694,11 +1702,11 @@ fn word_wrap_lines(lines: I, width_or_options: O) -> Vec<Line<'static>>
 fn word_wrap_lines_borrowed(lines: I, width_or_options: O) -> Vec<Line<'a>>
 ```
 
-**Purpose**: Borrowing variant of multi-line standard wrapping that returns `Vec<Line<'a>>` instead of owning `'static` copies. It is mainly useful in tests and contexts where borrowed output is sufficient.
+**Purpose**: Wraps a sequence of borrowed Ratatui lines without converting the output to static ownership. It is a borrowed-output variant of the standard multi-line wrapper.
 
-**Data flow**: Converts options into `RtOptions`, iterates over borrowed `&Line` inputs, applies the original initial indent only to the first overall line and substitutes `subsequent_indent` thereafter, extends an output vector with each `word_wrap_line` result, and returns the borrowed lines.
+**Data flow**: It receives borrowed lines and options, wraps each with `word_wrap_line`, switches to continuation indentation after the first line, and extends a borrowed-output vector.
 
-**Call relations**: Used by tests and any internal callers that can keep the original line storage alive while consuming wrapped output.
+**Call relations**: Tests and any borrowed-line callers use this when the input lines live long enough for the output to borrow from them.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); called by 3 (word_wrap_does_not_split_words_simple_english, wrap_lines_borrowed_applies_initial_indent_only_once, wrap_lines_borrowed_without_indents_is_concat_of_single_wraps); 3 external calls (into_iter, into, new).
 
@@ -1713,11 +1721,11 @@ fn slice_line_spans(
 ) -> Line<'a>
 ```
 
-**Purpose**: Extracts a byte-range slice from an original styled `Line`, preserving the styles of the intersecting source spans. It is the inverse mapping step after wrapping on flattened text.
+**Purpose**: Rebuilds a styled line for a chosen byte range of the original line. It is what keeps colors and other styles attached after wrapping.
 
-**Data flow**: Accepts the original line, precomputed `span_bounds`, and a target byte `range`. It iterates over span bounds, skips spans entirely before the range, stops after spans entirely beyond it, computes overlap segments for intersecting spans, slices the corresponding substring from `original.spans[i].content`, wraps each slice as a borrowed `Span` with the original span style, and returns a new `Line` carrying the original line style and alignment.
+**Data flow**: It receives the original line, recorded span bounds, and a byte range. It finds overlapping spans, slices their text to the requested range, keeps their styles, and returns a new line made from those borrowed slices.
 
-**Call relations**: Used by both `word_wrap_line` and `mixed_url_wrap_line` to reconstruct styled wrapped lines from source byte ranges.
+**Call relations**: `word_wrap_line` and `mixed_url_wrap_line` call this for every output row after deciding the source byte ranges.
 
 *Call graph*: called by 2 (mixed_url_wrap_line, word_wrap_line); 3 external calls (new, Borrowed, iter).
 
@@ -1728,11 +1736,11 @@ fn slice_line_spans(
 fn concat_line(line: &Line) -> String
 ```
 
-**Purpose**: Test helper that concatenates all span contents in a `Line` into a plain `String`. It makes assertions compare rendered text without caring about span boundaries.
+**Purpose**: Joins the text of a Ratatui line’s spans into one plain string for test comparisons. It ignores styling so tests can check visible text easily.
 
-**Data flow**: Iterates over `line.spans`, collects each span’s content into a single `String`, and returns it.
+**Data flow**: It receives a line, reads each span’s content, concatenates the strings, and returns the combined text.
 
-**Call relations**: Used throughout the module’s tests to simplify expected-output assertions.
+**Call relations**: Most wrapping tests use this helper to compare rendered output without repeating span-joining code.
 
 
 ##### `tests::trivial_unstyled_no_indents_wide_width`  (lines 1090–1095)
@@ -1741,11 +1749,11 @@ fn concat_line(line: &Line) -> String
 fn trivial_unstyled_no_indents_wide_width()
 ```
 
-**Purpose**: Verifies that a short unstyled line remains a single line when the width is ample. It checks the simplest no-wrap case.
+**Purpose**: Verifies that a short unstyled line stays unchanged when the width is wide enough.
 
-**Data flow**: Builds `Line::from("hello")`, wraps it with width 10, and asserts that the output length is 1 and the concatenated content is unchanged.
+**Data flow**: It builds `hello`, wraps it at width 10, and checks that one output line contains the same text.
 
-**Call relations**: Exercises `word_wrap_line` in the baseline path with no indents or style complications.
+**Call relations**: This is a baseline test for `word_wrap_line` before narrower widths, styles, or indentation are introduced.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1756,11 +1764,11 @@ fn trivial_unstyled_no_indents_wide_width()
 fn simple_unstyled_wrap_narrow_width()
 ```
 
-**Purpose**: Checks that ordinary prose wraps at spaces when the width is narrow. It confirms standard word-boundary behavior.
+**Purpose**: Verifies that ordinary text wraps at a space when the width is narrow.
 
-**Data flow**: Creates `"hello world"` as a `Line`, wraps at width 5, and asserts two output lines containing `hello` and `world`.
+**Data flow**: It wraps `hello world` at width 5 and checks that the output lines are `hello` and `world`.
 
-**Call relations**: Directly validates `word_wrap_line`’s standard wrapping behavior.
+**Call relations**: This tests the basic standard wrapping path through `word_wrap_line`.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1771,11 +1779,11 @@ fn simple_unstyled_wrap_narrow_width()
 fn simple_styled_wrap_preserves_styles()
 ```
 
-**Purpose**: Ensures wrapping preserves span styles across line boundaries. It specifically checks that a styled first span remains styled after wrapping.
+**Purpose**: Checks that wrapping a styled line does not lose the style attached to each span.
 
-**Data flow**: Builds a line from a red `"hello "` span plus an unstyled `"world"` span, wraps at width 6, and asserts both text segmentation and foreground-color preservation on the resulting spans.
+**Data flow**: It creates a line where `hello` is red and `world` is unstyled, wraps it, and checks both the text and foreground colors.
 
-**Call relations**: Exercises `word_wrap_line` together with `flatten_line` and `slice_line_spans` style reconstruction.
+**Call relations**: This exercises `word_wrap_line`, `flatten_line`, and `slice_line_spans` together.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 3 external calls (from, assert_eq!, vec!).
 
@@ -1786,11 +1794,11 @@ fn simple_styled_wrap_preserves_styles()
 fn with_initial_and_subsequent_indents()
 ```
 
-**Purpose**: Verifies that initial and continuation indents are applied correctly and consume width as expected. It checks hanging-indent behavior over multiple wrapped lines.
+**Purpose**: Verifies that first-line and continuation-line indents are applied correctly.
 
-**Data flow**: Constructs `RtOptions` with `- ` initial indent and two-space subsequent indent, wraps `"hello world foo"`, and asserts the prefixes and segmented content of all three output lines.
+**Data flow**: It builds options with `- ` for the first line and two spaces for later lines, wraps a sentence, and checks the rendered prefixes and text.
 
-**Call relations**: Tests `word_wrap_line`’s indent-aware width calculations and line assembly.
+**Call relations**: This confirms the indentation logic inside `word_wrap_line` and `RtOptions` builder methods.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_line); 3 external calls (from, assert!, assert_eq!).
 
@@ -1801,11 +1809,11 @@ fn with_initial_and_subsequent_indents()
 fn empty_initial_indent_subsequent_spaces()
 ```
 
-**Purpose**: Checks that an empty initial indent and non-empty subsequent indent behave sensibly. Continuation lines should still receive the configured prefix.
+**Purpose**: Checks that continuation indentation works even when the first line has no indent.
 
-**Data flow**: Builds options with empty initial indent and four-space subsequent indent, wraps `"hello world foobar"`, and asserts that only continuation lines start with the spaces.
+**Data flow**: It wraps text with an empty initial indent and four-space subsequent indent, then verifies only later output lines start with spaces.
 
-**Call relations**: Exercises `word_wrap_line`’s distinction between first-line and continuation indentation.
+**Call relations**: This protects a common layout case for `word_wrap_line`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_line); 2 external calls (from, assert!).
 
@@ -1816,11 +1824,11 @@ fn empty_initial_indent_subsequent_spaces()
 fn empty_input_yields_single_empty_line()
 ```
 
-**Purpose**: Confirms that wrapping an empty line still yields one output line rather than zero. This preserves rendering invariants for empty content.
+**Purpose**: Verifies that wrapping an empty line still produces one empty output line. This avoids disappearing rows in the UI.
 
-**Data flow**: Wraps `Line::from("")` at width 10 and asserts a single empty output line.
+**Data flow**: It wraps an empty line at width 10 and checks that the output length is one and the text is empty.
 
-**Call relations**: Validates the empty-input branch in `word_wrap_line`.
+**Call relations**: This tests the empty-input branch in `word_wrap_line`.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1831,11 +1839,11 @@ fn empty_input_yields_single_empty_line()
 fn leading_spaces_preserved_on_first_line()
 ```
 
-**Purpose**: Ensures leading spaces in the source are preserved on the first wrapped line. This matters for indentation-sensitive display text.
+**Purpose**: Checks that leading spaces at the start of a line are preserved on the first wrapped output line.
 
-**Data flow**: Wraps `"   hello"` at width 8 and asserts the single output line still begins with three spaces.
+**Data flow**: It wraps text beginning with three spaces and checks the output still includes them.
 
-**Call relations**: Exercises the source-range mapping and first-line handling in `word_wrap_line`.
+**Call relations**: This guards behavior in the range-mapping and first-line wrapping path.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1846,11 +1854,11 @@ fn leading_spaces_preserved_on_first_line()
 fn multiple_spaces_between_words_dont_start_next_line_with_spaces()
 ```
 
-**Purpose**: Checks that extra spaces between words do not become leading spaces on the next wrapped line. Wrapping should skip inter-word padding at line starts.
+**Purpose**: Verifies that extra spaces between words do not become leading spaces on the next wrapped line.
 
-**Data flow**: Wraps `"hello   world"` at width 8 and asserts the two output lines are `hello` and `world` without leading spaces on the second line.
+**Data flow**: It wraps `hello   world` and checks that the second line starts directly with `world`.
 
-**Call relations**: Validates the `skip_leading_spaces` logic in `word_wrap_line`.
+**Call relations**: This checks the cleanup step in `word_wrap_line` after the first wrapped range.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1861,11 +1869,11 @@ fn multiple_spaces_between_words_dont_start_next_line_with_spaces()
 fn break_words_false_allows_overflow_for_long_word()
 ```
 
-**Purpose**: Confirms that disabling `break_words` leaves an overlong token intact even when it exceeds the width. Overflow is preferred to splitting in this mode.
+**Purpose**: Checks that disabling word breaking lets an overlong word stay on one line.
 
-**Data flow**: Builds options with width 5 and `break_words(false)`, wraps a long single token, and asserts the output is one unchanged line.
+**Data flow**: It creates options with `break_words` false, wraps a very long word at width 5, and verifies no split occurs.
 
-**Call relations**: Tests `word_wrap_line` with non-default `RtOptions` propagated into `textwrap`.
+**Call relations**: This confirms that `RtOptions::break_words` reaches the `textwrap` configuration used by `word_wrap_line`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1876,11 +1884,11 @@ fn break_words_false_allows_overflow_for_long_word()
 fn hyphen_splitter_breaks_at_hyphen()
 ```
 
-**Purpose**: Verifies that the default hyphen splitter allows wrapping at hyphens. This documents standard `textwrap` behavior for hyphenated words.
+**Purpose**: Verifies the default standard wrapper can split a hyphenated word at the hyphen.
 
-**Data flow**: Wraps `"hello-world"` at width 7 and asserts the output lines are `hello-` and `world`.
+**Data flow**: It wraps `hello-world` at width 7 and checks that the first output line is `hello-`.
 
-**Call relations**: Exercises `word_wrap_line` under default `WordSplitter::HyphenSplitter` behavior.
+**Call relations**: This documents the normal behavior that URL-preserving mode intentionally changes.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1891,11 +1899,11 @@ fn hyphen_splitter_breaks_at_hyphen()
 fn indent_consumes_width_leaving_one_char_space()
 ```
 
-**Purpose**: Checks that very wide indents reduce available content width but still leave at least one column for text. This guards the `.max(1)` width floor.
+**Purpose**: Checks that indentation reduces the available wrapping width but still leaves at least one character of content space.
 
-**Data flow**: Builds options with width 4, initial indent `>>>>`, subsequent indent `--`, wraps `"hello"`, and asserts the resulting lines are `>>>>h`, `--el`, and `--lo`.
+**Data flow**: It uses an indent as wide as the target width, wraps `hello`, and verifies the word is split across indented lines.
 
-**Call relations**: Validates `word_wrap_line`’s saturating width subtraction and minimum-width logic.
+**Call relations**: This protects the width calculations in `word_wrap_line`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1906,11 +1914,11 @@ fn indent_consumes_width_leaving_one_char_space()
 fn wide_unicode_wraps_by_display_width()
 ```
 
-**Purpose**: Ensures wrapping uses terminal display width rather than byte count or scalar count. Double-width emoji should consume two columns each.
+**Purpose**: Verifies that wide Unicode characters, such as emoji, wrap by terminal display width rather than byte count.
 
-**Data flow**: Wraps three emoji at width 4 and asserts they occupy two output lines with two emoji on the first line and one on the second.
+**Data flow**: It wraps three emoji at width 4 and checks the first line contains two emoji and the second contains one.
 
-**Call relations**: Exercises `word_wrap_line` through `textwrap`’s display-width handling.
+**Call relations**: This confirms `textwrap` display-width behavior is preserved through `word_wrap_line`.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -1921,11 +1929,11 @@ fn wide_unicode_wraps_by_display_width()
 fn styled_split_within_span_preserves_style()
 ```
 
-**Purpose**: Verifies that splitting inside a single styled span preserves that style on both resulting fragments. It guards against style loss when slicing spans mid-span.
+**Purpose**: Checks that if one styled span is split across lines, both pieces keep the original style.
 
-**Data flow**: Creates a red `"abcd"` span, wraps at width 2, and asserts both output spans remain red and contain `ab` and `cd` respectively.
+**Data flow**: It wraps a red `abcd` span at width 2 and verifies both output spans are red with text `ab` and `cd`.
 
-**Call relations**: Tests `slice_line_spans` and style patching as used by `word_wrap_line`.
+**Call relations**: This directly exercises `slice_line_spans` after `word_wrap_line` splits inside a span.
 
 *Call graph*: calls 1 internal fn (word_wrap_line); 3 external calls (from, assert_eq!, vec!).
 
@@ -1936,11 +1944,11 @@ fn styled_split_within_span_preserves_style()
 fn wrap_lines_applies_initial_indent_only_once()
 ```
 
-**Purpose**: Checks that multi-line wrapping applies the initial indent only to the very first output line across all inputs. Later wrapped pieces should use the subsequent indent.
+**Purpose**: Verifies that multi-line wrapping applies the special initial indent only to the very first output line.
 
-**Data flow**: Builds indented options, wraps two input lines with `word_wrap_lines`, collects rendered strings, and asserts only the first output starts with `- ` while all later outputs start with two spaces.
+**Data flow**: It wraps two input lines with first and continuation indents, then checks that only the first rendered line starts with the initial prefix.
 
-**Call relations**: Exercises `word_wrap_lines`’s cross-line indent orchestration.
+**Call relations**: This tests the indentation flow in `word_wrap_lines`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_lines); 3 external calls (from, assert!, vec!).
 
@@ -1951,11 +1959,11 @@ fn wrap_lines_applies_initial_indent_only_once()
 fn wrap_lines_without_indents_is_concat_of_single_wraps()
 ```
 
-**Purpose**: Verifies that multi-line wrapping without indents behaves like concatenating individually wrapped lines. It checks the simplest aggregate case.
+**Purpose**: Checks that wrapping multiple short lines without indents simply returns those lines unchanged.
 
-**Data flow**: Wraps two short lines with `word_wrap_lines` at width 10 and asserts the output strings are exactly `hello` and `world!`.
+**Data flow**: It wraps `hello` and `world!` at a wide width and compares the output text list.
 
-**Call relations**: Tests `word_wrap_lines` in the no-indent path.
+**Call relations**: This is a simple behavior check for `word_wrap_lines`.
 
 *Call graph*: calls 1 internal fn (word_wrap_lines); 2 external calls (assert_eq!, vec!).
 
@@ -1966,11 +1974,11 @@ fn wrap_lines_without_indents_is_concat_of_single_wraps()
 fn wrap_lines_borrowed_applies_initial_indent_only_once()
 ```
 
-**Purpose**: Checks the borrowed multi-line wrapper’s indent semantics. It should mirror the owned variant’s one-time initial indent behavior.
+**Purpose**: Verifies the borrowed multi-line wrapper follows the same one-time initial indent rule.
 
-**Data flow**: Builds indented options, wraps an array iterator with `word_wrap_lines_borrowed`, collects rendered strings, and asserts only the first output line uses the initial indent.
+**Data flow**: It wraps borrowed lines with first and continuation indents and checks the prefixes in the rendered output.
 
-**Call relations**: Exercises `word_wrap_lines_borrowed` specifically.
+**Call relations**: This mirrors the owned-output test for `word_wrap_lines_borrowed`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_lines_borrowed); 2 external calls (from, assert!).
 
@@ -1981,11 +1989,11 @@ fn wrap_lines_borrowed_applies_initial_indent_only_once()
 fn wrap_lines_borrowed_without_indents_is_concat_of_single_wraps()
 ```
 
-**Purpose**: Verifies the borrowed multi-line wrapper’s basic no-indent behavior. It should preserve each short line unchanged.
+**Purpose**: Checks that the borrowed multi-line wrapper leaves short unindented lines unchanged.
 
-**Data flow**: Wraps two borrowed lines at width 10 and asserts the rendered outputs are `hello` and `world!`.
+**Data flow**: It wraps two borrowed lines at a wide width and compares the resulting text strings.
 
-**Call relations**: Tests `word_wrap_lines_borrowed` in the simplest path.
+**Call relations**: This is a baseline test for `word_wrap_lines_borrowed`.
 
 *Call graph*: calls 1 internal fn (word_wrap_lines_borrowed); 2 external calls (from, assert_eq!).
 
@@ -1996,11 +2004,11 @@ fn wrap_lines_borrowed_without_indents_is_concat_of_single_wraps()
 fn wrap_lines_accepts_borrowed_iterators()
 ```
 
-**Purpose**: Confirms that the generic owned-output wrapper accepts iterators of borrowed `Line` values. This validates the `IntoLineInput` abstraction.
+**Purpose**: Verifies that the flexible multi-line wrapper accepts line values from an iterator and wraps them correctly.
 
-**Data flow**: Passes an array of `Line` values into `word_wrap_lines`, collects rendered strings, and asserts the expected wrapped output sequence.
+**Data flow**: It passes an array of lines to `word_wrap_lines`, wraps at width 10, and checks the resulting line texts.
 
-**Call relations**: Exercises the `IntoLineInput` implementations together with `word_wrap_lines`.
+**Call relations**: This tests the `IntoLineInput` conversion path used by `word_wrap_lines`.
 
 *Call graph*: calls 1 internal fn (word_wrap_lines); 2 external calls (from, assert_eq!).
 
@@ -2011,11 +2019,11 @@ fn wrap_lines_accepts_borrowed_iterators()
 fn wrap_lines_accepts_str_slices()
 ```
 
-**Purpose**: Confirms that `&str` inputs can be wrapped directly through the generic multi-line API. This is another `IntoLineInput` coverage test.
+**Purpose**: Verifies that plain string slices can be passed directly to the multi-line wrapper.
 
-**Data flow**: Wraps an array of string slices with `word_wrap_lines` at width 12 and asserts the expected rendered strings.
+**Data flow**: It wraps an array of `&str` values and checks the output lines.
 
-**Call relations**: Validates the `str::into_line_input` implementation in the context of `word_wrap_lines`.
+**Call relations**: This covers the `str::into_line_input` conversion used by `word_wrap_lines`.
 
 *Call graph*: calls 1 internal fn (word_wrap_lines); 1 external calls (assert_eq!).
 
@@ -2026,11 +2034,11 @@ fn wrap_lines_accepts_str_slices()
 fn line_height_counts_double_width_emoji()
 ```
 
-**Purpose**: Checks that line count changes appropriately with widths when content contains double-width emoji. It is a compact regression test for display-width accounting.
+**Purpose**: Checks that line count changes correctly for emoji that occupy two terminal columns.
 
-**Data flow**: Creates a line from three emoji and asserts the number of wrapped lines at widths 4, 2, and 6.
+**Data flow**: It wraps the same emoji string at widths 4, 2, and 6, and checks the number of output lines for each width.
 
-**Call relations**: Indirectly exercises `word_wrap_line`’s width handling.
+**Call relations**: This reinforces display-width behavior in the standard wrapping path.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2041,11 +2049,11 @@ fn line_height_counts_double_width_emoji()
 fn word_wrap_does_not_split_words_simple_english()
 ```
 
-**Purpose**: Verifies that ordinary English prose wraps at spaces rather than splitting words mid-token. It uses a longer paragraph to exercise repeated wrapping.
+**Purpose**: Verifies that normal English prose wraps at word boundaries into the expected lines.
 
-**Data flow**: Wraps a sample paragraph with `word_wrap_lines_borrowed` at width 40, joins the output with newlines, and asserts the exact expected wrapped text.
+**Data flow**: It wraps a sample paragraph at width 40, joins the output with newlines, and compares against the expected paragraph layout.
 
-**Call relations**: Tests standard prose behavior through the borrowed multi-line wrapper.
+**Call relations**: This is an end-to-end check of `word_wrap_lines_borrowed` for ordinary prose.
 
 *Call graph*: calls 1 internal fn (word_wrap_lines_borrowed); 2 external calls (from, assert_eq!).
 
@@ -2056,11 +2064,11 @@ fn word_wrap_does_not_split_words_simple_english()
 fn ascii_space_separator_with_no_hyphenation_keeps_url_intact()
 ```
 
-**Purpose**: Demonstrates that ASCII-space tokenization plus no hyphenation and `break_words(false)` keeps a long URL on one line. This is the behavior adaptive wrapping relies on for URL-only lines.
+**Purpose**: Checks that space-only separation, no hyphenation, and no word breaking keep a long URL on one line.
 
-**Data flow**: Builds explicit URL-preserving options, wraps a long URL at width 24, and asserts a single unchanged output line.
+**Data flow**: It builds URL-preserving-like options, wraps a long URL at a narrow width, and verifies the output is still a single unbroken URL.
 
-**Call relations**: Exercises `word_wrap_line` under the same option pattern produced by `url_preserving_wrap_options`.
+**Call relations**: This documents the key behavior behind `url_preserving_wrap_options` and `adaptive_wrap_line`.
 
 *Call graph*: calls 2 internal fn (new, word_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -2071,11 +2079,11 @@ fn ascii_space_separator_with_no_hyphenation_keeps_url_intact()
 fn text_contains_url_like_matches_expected_tokens()
 ```
 
-**Purpose**: Checks that the URL heuristic accepts representative positive examples, including schemes, bare domains, localhost, IPv4, and punctuation-wrapped URLs.
+**Purpose**: Verifies that the URL detector accepts common URL-like forms.
 
-**Data flow**: Iterates over a fixed array of positive strings and asserts `text_contains_url_like(text)` for each.
+**Data flow**: It loops over examples with schemes, bare domains, localhost, IPv4 addresses, and surrounding punctuation, and asserts each is detected.
 
-**Call relations**: Directly validates the text-level URL detector and, transitively, the token heuristics beneath it.
+**Call relations**: This tests the plain-text URL detection path used by `line_contains_url_like`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2086,11 +2094,11 @@ fn text_contains_url_like_matches_expected_tokens()
 fn text_contains_url_like_rejects_non_urls()
 ```
 
-**Purpose**: Checks that the URL heuristic rejects representative false positives such as file paths, key-value strings, and plain dotted words. This keeps adaptive wrapping conservative.
+**Purpose**: Verifies that the URL detector rejects ordinary paths and non-link tokens.
 
-**Data flow**: Iterates over a fixed array of negative strings and asserts `!text_contains_url_like(text)` for each.
+**Data flow**: It loops over examples such as `src/main.rs`, `foo/bar`, and `hello.world`, and asserts none are detected as URLs.
 
-**Call relations**: Directly validates the rejection side of the URL heuristic.
+**Call relations**: This guards the conservative heuristics in the URL detection helpers.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2101,11 +2109,11 @@ fn text_contains_url_like_rejects_non_urls()
 fn line_contains_url_like_checks_across_spans()
 ```
 
-**Purpose**: Ensures URL detection works when the URL is embedded across styled spans in a `Line`. Flattening should not lose the token.
+**Purpose**: Checks that URL detection works even when a line is made of multiple styled spans.
 
-**Data flow**: Builds a multi-span line containing prose, a cyan URL span, and trailing prose, then asserts `line_contains_url_like(&line)`.
+**Data flow**: It builds a line with prose, a cyan URL span, and more prose, then asserts the line-level detector sees the URL.
 
-**Call relations**: Exercises `line_contains_url_like`’s span concatenation behavior.
+**Call relations**: This tests `line_contains_url_like`, including its span-concatenation step.
 
 *Call graph*: 3 external calls (from, assert!, vec!).
 
@@ -2116,11 +2124,11 @@ fn line_contains_url_like_checks_across_spans()
 fn line_has_mixed_url_and_non_url_tokens_detects_prose_plus_url()
 ```
 
-**Purpose**: Checks that mixed-content detection recognizes a line containing both prose and a URL. This is the branch condition for the custom mixed wrapper.
+**Purpose**: Verifies that a sentence containing a URL is recognized as mixed URL and non-URL text.
 
-**Data flow**: Creates a plain line with prose plus URL and asserts `line_has_mixed_url_and_non_url_tokens(&line)`.
+**Data flow**: It builds a line with words before and after a URL and asserts the mixed-token detector returns true.
 
-**Call relations**: Directly validates the mixed-content detector used by `adaptive_wrap_line`.
+**Call relations**: This tests the branch condition that sends `adaptive_wrap_line` to mixed URL wrapping.
 
 *Call graph*: 2 external calls (from, assert!).
 
@@ -2131,11 +2139,11 @@ fn line_has_mixed_url_and_non_url_tokens_detects_prose_plus_url()
 fn line_has_mixed_url_and_non_url_tokens_ignores_pipe_prefix()
 ```
 
-**Purpose**: Ensures decorative pipe prefixes do not count as substantive non-URL tokens. A line containing only a pipe marker and a URL should not be treated as mixed prose.
+**Purpose**: Checks that a decorative pipe prefix beside a URL does not count as prose.
 
-**Data flow**: Builds a line from a pipe-prefix span and a URL span, then asserts the mixed-content detector returns false.
+**Data flow**: It builds a line with a pipe-style prefix and a URL, then asserts it is not treated as mixed content.
 
-**Call relations**: Exercises `is_decorative_marker_token` through `line_has_mixed_url_and_non_url_tokens`.
+**Call relations**: This tests decorative-marker filtering in the mixed-token detector.
 
 *Call graph*: 3 external calls (from, assert!, vec!).
 
@@ -2146,11 +2154,11 @@ fn line_has_mixed_url_and_non_url_tokens_ignores_pipe_prefix()
 fn line_has_mixed_url_and_non_url_tokens_ignores_ordered_list_marker()
 ```
 
-**Purpose**: Ensures ordered-list markers like `1.` are ignored when deciding whether a line mixes URL and prose. This avoids unnecessary mixed-token wrapping for list items that are just a URL.
+**Purpose**: Checks that a numbered list marker beside a URL does not count as prose.
 
-**Data flow**: Creates `"1. https://example.com/path"` and asserts the mixed-content detector returns false.
+**Data flow**: It builds `1. https://example.com/path` and asserts the mixed detector returns false.
 
-**Call relations**: Validates the ordered-list-marker branch in the non-URL token heuristic.
+**Call relations**: This covers `is_ordered_list_marker` through the line-level mixed-token path.
 
 *Call graph*: 2 external calls (from, assert!).
 
@@ -2161,11 +2169,11 @@ fn line_has_mixed_url_and_non_url_tokens_ignores_ordered_list_marker()
 fn text_contains_url_like_accepts_custom_scheme_with_separator()
 ```
 
-**Purpose**: Checks that custom schemes with `://` are accepted even if the `url` crate would reject them. This covers the fallback scheme-prefix validator.
+**Purpose**: Verifies that custom scheme URLs such as `myapp://...` are detected.
 
-**Data flow**: Asserts `text_contains_url_like("myapp://open/some/path")`.
+**Data flow**: It passes a custom-scheme token to the URL detector and asserts it returns true.
 
-**Call relations**: Exercises `has_valid_scheme_prefix` through the public detector.
+**Call relations**: This tests the fallback scheme-prefix logic used by `is_absolute_url_like`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2176,11 +2184,11 @@ fn text_contains_url_like_accepts_custom_scheme_with_separator()
 fn text_contains_url_like_rejects_invalid_ports()
 ```
 
-**Purpose**: Ensures bare URL detection rejects malformed ports. This prevents strings like `localhost:99999/path` from being treated as URLs.
+**Purpose**: Checks that bare URLs with invalid ports are not accepted.
 
-**Data flow**: Asserts that `text_contains_url_like` returns false for examples with out-of-range and non-numeric ports.
+**Data flow**: It tests a port that is too large and a non-numeric port, asserting both are rejected.
 
-**Call relations**: Validates `is_valid_port` through the public detector.
+**Call relations**: This covers `is_valid_port` through the plain URL detection flow.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2191,11 +2199,11 @@ fn text_contains_url_like_rejects_invalid_ports()
 fn adaptive_wrap_line_keeps_long_url_like_token_intact()
 ```
 
-**Purpose**: Verifies that adaptive wrapping leaves a long URL-like token unsplit even when it exceeds the width. This is the core user-visible URL-preservation behavior.
+**Purpose**: Verifies that adaptive wrapping keeps a long URL-like token whole even when it exceeds the width.
 
-**Data flow**: Wraps a long bare-domain URL-like string with `adaptive_wrap_line` at width 20 and asserts a single unchanged output line.
+**Data flow**: It wraps a long bare-domain URL at width 20 and checks the output is one unchanged line.
 
-**Call relations**: Exercises the URL-only branch of `adaptive_wrap_line`.
+**Call relations**: This tests the URL-only branch of `adaptive_wrap_line`.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -2206,11 +2214,11 @@ fn adaptive_wrap_line_keeps_long_url_like_token_intact()
 fn adaptive_wrap_line_preserves_default_behavior_for_non_url_tokens()
 ```
 
-**Purpose**: Checks that adaptive wrapping does not disable ordinary splitting for long non-URL tokens. Non-URL content should still wrap using default behavior.
+**Purpose**: Checks that adaptive wrapping does not change behavior for text with no URL.
 
-**Data flow**: Wraps a long underscore-delimited non-URL token with `adaptive_wrap_line` at width 20 and asserts that multiple output lines are produced.
+**Data flow**: It wraps a long non-URL token at width 20 and asserts it splits into more than one line.
 
-**Call relations**: Exercises the non-URL branch of `adaptive_wrap_line`, which delegates to `word_wrap_line` unchanged.
+**Call relations**: This confirms `adaptive_wrap_line` falls back to `word_wrap_line` when URL detection is false.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 2 external calls (from, assert!).
 
@@ -2221,11 +2229,11 @@ fn adaptive_wrap_line_preserves_default_behavior_for_non_url_tokens()
 fn adaptive_wrap_line_mixed_line_keeps_regular_words_intact()
 ```
 
-**Purpose**: Verifies the mixed-content wrapper keeps the URL intact while still wrapping surrounding prose at word boundaries. It checks the custom mixed-token algorithm’s main success case.
+**Purpose**: Verifies that a mixed prose-and-URL line wraps neatly while keeping the URL intact.
 
-**Data flow**: Wraps a prose-plus-URL sentence with `adaptive_wrap_line` at width 36, joins the output with newlines, and asserts the exact expected wrapped text.
+**Data flow**: It wraps a sentence containing a URL at width 36, joins the output with newlines, and compares the expected layout.
 
-**Call relations**: Exercises the mixed-content branch of `adaptive_wrap_line` and `mixed_url_wrap_line`.
+**Call relations**: This exercises `adaptive_wrap_line` through `mixed_url_wrap_line` and `mixed_url_wrap_ranges`.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -2236,11 +2244,11 @@ fn adaptive_wrap_line_mixed_line_keeps_regular_words_intact()
 fn adaptive_wrap_line_mixed_line_wraps_long_non_url_token()
 ```
 
-**Purpose**: Checks that on mixed URL/prose lines, an oversized non-URL token can still be split while the URL remains present intact. This distinguishes the mixed wrapper from the URL-only path.
+**Purpose**: Checks that mixed URL wrapping can still split a very long non-URL token. The URL stays protected, but ordinary oversized tokens do not force huge lines.
 
-**Data flow**: Builds a line containing prose, a short URL, and a long non-URL token, wraps it adaptively at width 24, and asserts some output line still contains the URL while no output line contains the entire long token unsplit.
+**Data flow**: It builds text with a URL plus a long non-URL token, wraps it narrowly, then asserts the URL appears intact and the long token does not appear as one unbroken string.
 
-**Call relations**: Exercises `mixed_url_wrap_ranges` and `split_mixed_url_word` through `adaptive_wrap_line`.
+**Call relations**: This tests `split_mixed_url_word` through the adaptive mixed-line path.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 3 external calls (from, assert!, format!).
 
@@ -2251,11 +2259,11 @@ fn adaptive_wrap_line_mixed_line_wraps_long_non_url_token()
 fn adaptive_wrap_line_mixed_line_counts_leading_spaces_before_first_word()
 ```
 
-**Purpose**: Ensures the mixed-content wrapper accounts for leading spaces on the first output line when splitting long non-URL tokens. This guards a subtle width-calculation edge case.
+**Purpose**: Verifies that leading spaces on the first mixed line count against the available width.
 
-**Data flow**: Wraps a line with six leading spaces, a long non-URL token, and a URL using adaptive wrapping with a matching subsequent indent, then asserts the first two rendered lines match the expected split positions.
+**Data flow**: It wraps an indented mixed line with a continuation indent and checks the first pieces of the long word are split according to the real visible width.
 
-**Call relations**: Exercises the leading-space accounting logic inside `mixed_url_wrap_ranges`.
+**Call relations**: This protects leading-space accounting in `mixed_url_wrap_ranges`.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -2266,11 +2274,11 @@ fn adaptive_wrap_line_mixed_line_counts_leading_spaces_before_first_word()
 fn adaptive_wrap_line_mixed_line_resplits_long_token_for_continuation_width()
 ```
 
-**Purpose**: Checks that a long non-URL token may need to be split differently once continuation lines have a narrower effective width due to indent. The mixed wrapper should resplit for the new limit.
+**Purpose**: Checks that a long non-URL token is re-split when continuation lines have less room because of indentation.
 
-**Data flow**: Wraps a long token followed by a URL with adaptive wrapping at width 10 and a four-space subsequent indent, then asserts the first three rendered lines match the expected continuation-width splits.
+**Data flow**: It wraps a long word followed by a URL with a four-space continuation indent and checks the first continuation pieces fit the smaller width.
 
-**Call relations**: Exercises the branch in `mixed_url_wrap_ranges` that resplits pending non-URL pieces for continuation widths.
+**Call relations**: This tests the loop in `mixed_url_wrap_ranges` that reprocesses pieces after the line limit changes.
 
 *Call graph*: calls 2 internal fn (new, adaptive_wrap_line); 2 external calls (from, assert_eq!).
 
@@ -2281,11 +2289,11 @@ fn adaptive_wrap_line_mixed_line_resplits_long_token_for_continuation_width()
 fn map_owned_wrapped_line_to_range_recovers_on_non_prefix_mismatch()
 ```
 
-**Purpose**: Verifies that owned-line range mapping returns the matched prefix rather than failing catastrophically when a later character mismatches. This protects against partial synthetic output mismatches.
+**Purpose**: Verifies that owned-line range mapping returns the matched prefix instead of failing on an unexpected mismatch.
 
-**Data flow**: Calls `map_owned_wrapped_line_to_range("hello world", 0, "helloX", "")` and asserts the returned range is `0..5`.
+**Data flow**: It maps `helloX` against source `hello world` and checks the returned range covers only `hello`.
 
-**Call relations**: Directly tests the mismatch-recovery behavior of the owned-line mapper.
+**Call relations**: This tests the recovery behavior in `map_owned_wrapped_line_to_range`.
 
 *Call graph*: calls 1 internal fn (map_owned_wrapped_line_to_range); 1 external calls (assert_eq!).
 
@@ -2296,11 +2304,11 @@ fn map_owned_wrapped_line_to_range_recovers_on_non_prefix_mismatch()
 fn borrowed_slice_range_rejects_slices_outside_source_text()
 ```
 
-**Purpose**: Checks that pointer-based range recovery rejects slices from unrelated allocations and that the owned-line fallback can still recover a sensible range. This guards against unsafe assumptions about borrowed slices.
+**Purpose**: Checks that pointer-based slice mapping rejects a slice from a different string, even if the text looks similar.
 
-**Data flow**: Creates an external `String`, asserts `borrowed_slice_range(text, &external)` is `None`, then maps the same content with `map_owned_wrapped_line_to_range` and asserts `0..4`.
+**Data flow**: It creates a source string and a separate external string, verifies direct borrowed mapping fails, then checks the fallback mapper can still map the text.
 
-**Call relations**: Exercises both the rejection path in `borrowed_slice_range` and the fallback path in `map_owned_wrapped_line_to_range`.
+**Call relations**: This covers both `borrowed_slice_range` and `map_owned_wrapped_line_to_range`.
 
 *Call graph*: calls 1 internal fn (map_owned_wrapped_line_to_range); 2 external calls (from, assert_eq!).
 
@@ -2311,11 +2319,11 @@ fn borrowed_slice_range_rejects_slices_outside_source_text()
 fn map_owned_wrapped_line_to_range_indent_coincides_with_source()
 ```
 
-**Purpose**: Verifies that synthetic indent prefixes are stripped before source matching even when the source begins with the same characters. This prevents overconsuming source bytes.
+**Purpose**: Verifies that synthetic indentation is not mistaken for matching source text when both start with the same character.
 
-**Data flow**: Simulates a wrapped line with synthetic `- ` indent against source text beginning with `-`, maps it back to source bytes, and asserts the full expected range `0..10`.
+**Data flow**: It maps a wrapped string with `- ` indentation against source text that also starts with `-`, and checks the returned range covers the intended source words.
 
-**Call relations**: Directly tests a regression in `map_owned_wrapped_line_to_range` around indent-prefix ambiguity.
+**Call relations**: This protects the prefix-stripping logic in `map_owned_wrapped_line_to_range`.
 
 *Call graph*: calls 1 internal fn (map_owned_wrapped_line_to_range); 1 external calls (assert_eq!).
 
@@ -2326,11 +2334,11 @@ fn map_owned_wrapped_line_to_range_indent_coincides_with_source()
 fn wrap_ranges_indent_prefix_coincides_with_source_char()
 ```
 
-**Purpose**: End-to-end regression test ensuring `wrap_ranges` reconstructs the full source text when indent prefixes share characters with the source. It validates the mapper in realistic wrapped output.
+**Purpose**: Checks the full range-wrapping path when an indent prefix begins with the same character as the source text.
 
-**Data flow**: Wraps a list-item string with matching initial and subsequent indents, rebuilds the source text by walking the returned ranges with cursor progression, and asserts the rebuilt text equals the original.
+**Data flow**: It wraps text starting with `-` using `- ` indents, rebuilds the source from returned ranges, and verifies the rebuilt text equals the original.
 
-**Call relations**: Exercises `wrap_ranges` together with owned-line mapping under an indent-prefix collision scenario.
+**Call relations**: This is an end-to-end test for `wrap_ranges` and its owned-line mapping fallback.
 
 *Call graph*: calls 1 internal fn (wrap_ranges); 3 external calls (new, assert!, assert_eq!).
 
@@ -2341,11 +2349,11 @@ fn wrap_ranges_indent_prefix_coincides_with_source_char()
 fn map_owned_wrapped_line_to_range_repro_overconsumes_repeated_prefix_patterns()
 ```
 
-**Purpose**: Checks that the owned-line mapper does not overconsume source bytes when repeated prefix patterns appear in both source and synthetic indent. It guards against a subtle repeated-pattern bug.
+**Purpose**: Guards against a bug where repeated prefix-like text could make the mapper consume too much source.
 
-**Data flow**: Uses `textwrap` to produce a wrapped line from `"- - foo"` with `- ` indents, maps the first wrapped line back to source, computes the expected maximum mapped length after stripping the synthetic prefix, and asserts the mapped length does not exceed that maximum.
+**Data flow**: It wraps `- - foo` with `- ` indentation, maps the first wrapped line, and asserts the mapped length is not longer than the non-prefix wrapped content.
 
-**Call relations**: Directly validates a regression scenario for `map_owned_wrapped_line_to_range`.
+**Call relations**: This focuses on `map_owned_wrapped_line_to_range` in a tricky repeated-pattern case.
 
 *Call graph*: calls 1 internal fn (map_owned_wrapped_line_to_range); 4 external calls (assert!, panic!, new, wrap).
 
@@ -2356,11 +2364,11 @@ fn map_owned_wrapped_line_to_range_repro_overconsumes_repeated_prefix_patterns()
 fn wrap_ranges_recovers_with_non_space_indents()
 ```
 
-**Purpose**: Ensures `wrap_ranges` can reconstruct the full source text even when `textwrap` emits owned lines due to non-space indent prefixes. This covers another realistic owned-output case.
+**Purpose**: Verifies that range wrapping can reconstruct the original text when `textwrap` creates owned lines because of non-space indentation.
 
-**Data flow**: Wraps a sentence with `* ` initial indent and two-space subsequent indent, asserts that some wrapped lines are owned, rebuilds the source text from the returned ranges using cursor progression, and asserts exact equality with the original text.
+**Data flow**: It wraps a sentence with `* ` and space indents, confirms owned lines occur, gets ranges from `wrap_ranges`, rebuilds the text from those ranges, and checks it matches the source.
 
-**Call relations**: Exercises `wrap_ranges` and the owned-line mapper under non-space indent conditions.
+**Call relations**: This tests `wrap_ranges` and `map_owned_wrapped_line_to_range` together under realistic indentation.
 
 *Call graph*: calls 1 internal fn (wrap_ranges); 5 external calls (new, assert!, assert_eq!, new, wrap).
 
@@ -2371,11 +2379,11 @@ fn wrap_ranges_recovers_with_non_space_indents()
 fn wrap_ranges_trim_handles_owned_lines_with_penalty_char()
 ```
 
-**Purpose**: Verifies that trimmed range reconstruction works when owned wrapped lines include inserted penalty characters from custom splitting. The reconstructed source should still be exact.
+**Purpose**: Checks that trimmed range mapping works when `textwrap` inserts a penalty character such as a hyphen during word splitting.
 
-**Data flow**: Defines a custom splitter that allows breaks at every character, wraps a long token with `wrap_ranges_trim`, rebuilds the source by concatenating the returned ranges, and asserts both exact reconstruction and that multiple ranges were produced.
+**Data flow**: It configures a custom splitter, wraps a long token, gets trimmed ranges, rebuilds the source from those ranges, and verifies the result matches the original text.
 
-**Call relations**: Directly tests `wrap_ranges_trim`’s handling of owned lines with synthesized penalty characters.
+**Call relations**: This tests `wrap_ranges_trim` and its fallback mapping for owned `textwrap` output.
 
 *Call graph*: calls 1 internal fn (wrap_ranges_trim); 4 external calls (new, assert!, assert_eq!, Custom).
 
@@ -2385,13 +2393,15 @@ These components apply wrapping incrementally or cache wrapped lines into a scro
 
 ### `tui/src/live_wrap.rs`
 
-`util` · `cross-cutting during streamed text rendering`
+`domain_logic` · `main loop / live terminal rendering`
 
-This file defines a minimal streaming wrapper around Unicode display width. `Row` is the output unit: a `String` plus an `explicit_break` flag indicating whether the row ended because of an actual newline rather than a hard wrap. `RowBuilder` maintains three pieces of mutable state: `target_width`, a `current_line` buffer for the still-open logical line, and a `rows` vector containing completed wrapped rows from previous fragments and explicit breaks.
+A terminal is not measured in letters. It is measured in columns, and some visible characters use two columns while others use none. This file solves the problem of showing live, growing text in a terminal without letting it spill past the right edge.
 
-The core ingestion path is `push_fragment`. It scans the incoming fragment for `\n`, appends non-newline slices into `current_line`, flushes on each newline via `flush_current_line(true)`, and after the final slice calls `wrap_current_line` so overlong buffered content is split into width-bounded rows. `wrap_current_line` repeatedly calls `take_prefix_by_width` to peel off the largest fitting prefix; fully fitting trailing content stays buffered so later fragments can continue the same logical line. `flush_current_line` finalizes the current logical line and has a subtle boundary case: if a newline arrives exactly at a width boundary, it emits an empty explicit-break row so fragmentation remains invariant.
+The main piece is `RowBuilder`. Think of it like a small text wrapping machine. Text fragments arrive over time, maybe a few characters at once, maybe with newline characters inside. `RowBuilder` collects the unfinished part of the current logical line, cuts off completed display rows whenever they become too wide, and saves those rows as `Row` values. A `Row` stores the text for one visual line and whether that line ended because the input had a real newline, rather than because the screen width forced a wrap.
 
-`set_width` rewraps all accumulated content by reconstructing the logical text from committed rows plus the current buffer and feeding it back through `push_fragment`. `display_rows` includes the current partial line for rendering, while `drain_commit_ready` removes the oldest committed rows once the visible row count exceeds a caller-specified retention limit. Width calculations use `unicode_width`, so emoji and CJK characters consume the correct number of terminal cells.
+The file is careful about Unicode width. For example, an emoji may count as two terminal columns, so simple byte or character counts would be wrong. The helper `take_prefix_by_width` chooses the largest safe prefix that fits in a given number of columns.
+
+There is also support for changing the width. When the width changes, the builder reconstructs the text it has already seen and wraps it again. This is simple but important for terminal resize behavior. The tests check normal ASCII text, wide Unicode characters, input arriving in chunks, newline handling, and rewrapping after width changes.
 
 #### Function details
 
@@ -2401,11 +2411,11 @@ The core ingestion path is `push_fragment`. It scans the incoming fragment for `
 fn width(&self) -> usize
 ```
 
-**Purpose**: Returns the display width of a wrapped row’s text.
+**Purpose**: Returns how many terminal columns this row's text will occupy. This is different from counting characters because some characters, such as emoji or CJK characters, are wider on screen.
 
-**Data flow**: Measures `self.text` with `UnicodeWidthStr::width` and returns the resulting `usize`.
+**Data flow**: It reads the row's `text` string, asks the Unicode width library to measure its visible terminal width, and returns that number. It does not change the row.
 
-**Call relations**: Used by tests and any caller that needs to verify wrapped rows fit the target width.
+**Call relations**: This is a small convenience used when code needs to check whether a `Row` fits within a terminal width. In this file's tests, it helps confirm that rows produced after a width change are not too wide.
 
 
 ##### `RowBuilder::new`  (lines 30–36)
@@ -2414,11 +2424,11 @@ fn width(&self) -> usize
 fn new(target_width: usize) -> Self
 ```
 
-**Purpose**: Creates a new incremental wrapper with a minimum width of one cell.
+**Purpose**: Creates a fresh row-wrapping builder for a chosen terminal width. It makes sure the width is never less than one column, because wrapping to zero columns would not make sense.
 
-**Data flow**: Takes `target_width`, clamps it with `max(1)`, initializes `current_line` to an empty `String` and `rows` to an empty `Vec<Row>`, and returns the new builder.
+**Data flow**: It receives a requested width, changes it to at least `1` if needed, starts with an empty current line, and starts with no completed rows. The result is a ready-to-use `RowBuilder`.
 
-**Call relations**: Used by rendering code and tests to start a fresh wrapping session.
+**Call relations**: This is the starting point for anyone who wants to wrap live text. The tests and live overflow behavior create builders through this function before feeding text into them.
 
 *Call graph*: called by 6 (fragmentation_invariance_long_token, newline_splits_rows, rewrap_on_width_change, rows_do_not_exceed_width_ascii, rows_do_not_exceed_width_emoji_cjk, live_001_commit_on_overflow); 2 external calls (new, new).
 
@@ -2429,11 +2439,11 @@ fn new(target_width: usize) -> Self
 fn width(&self) -> usize
 ```
 
-**Purpose**: Returns the current target wrap width.
+**Purpose**: Reports the current target width used for wrapping. Someone would use this to ask, "How many terminal columns is this builder currently wrapping to?"
 
-**Data flow**: Reads and returns `self.target_width`.
+**Data flow**: It reads the builder's stored `target_width` and returns it. Nothing is changed.
 
-**Call relations**: Simple accessor for callers tracking current wrap settings.
+**Call relations**: This is an information-only helper. It fits beside `set_width`, which changes the width, by letting other code inspect the width currently in effect.
 
 
 ##### `RowBuilder::set_width`  (lines 42–55)
@@ -2442,11 +2452,11 @@ fn width(&self) -> usize
 fn set_width(&mut self, width: usize)
 ```
 
-**Purpose**: Changes the target width and rewraps all accumulated content to match the new width.
+**Purpose**: Changes the wrap width and rebuilds the stored rows so they match the new size. This matters when the terminal is resized.
 
-**Data flow**: Clamps the new width to at least one, drains all committed rows while reconstructing their text and explicit newlines into a temporary string, appends the current partial line, clears `current_line`, then feeds the reconstructed text back through `push_fragment` to rebuild `rows` and `current_line` under the new width.
+**Data flow**: It receives a new width, clamps it to at least one column, then gathers all already-produced row text plus any unfinished current line back into one string. It preserves explicit line breaks by inserting newline characters where needed. Then it clears the old state and feeds the reconstructed text back through `push_fragment`, producing rows for the new width.
 
-**Call relations**: Used when terminal width changes after content has already been accumulated.
+**Call relations**: This function uses `push_fragment` as the normal doorway back into the wrapping process, rather than duplicating the wrapping rules. It is exercised by the resize-focused test, which checks that rows are rewrapped after the width shrinks.
 
 *Call graph*: calls 1 internal fn (push_fragment); 1 external calls (new).
 
@@ -2457,11 +2467,11 @@ fn set_width(&mut self, width: usize)
 fn push_fragment(&mut self, fragment: &str)
 ```
 
-**Purpose**: Appends a streamed text fragment, which may contain embedded newlines, into the wrapper state.
+**Purpose**: Adds a new piece of incoming text to the builder. The text may be a whole message, a tiny chunk, or include newline characters.
 
-**Data flow**: Returns immediately for an empty fragment; otherwise scans `fragment.char_indices()`, appends non-newline slices into `current_line`, calls `flush_current_line(true)` on each newline, then appends any trailing slice and calls `wrap_current_line()` so overlong buffered content is split into committed rows.
+**Data flow**: It receives a string slice. If it is empty, it does nothing. Otherwise it scans for newline characters. Text before a newline is added to the current line, then that line is flushed as an explicit break. Text after the final newline is added to the current line and wrapped as far as possible. Completed visual rows are stored in the builder, while any still-fitting tail remains buffered.
 
-**Call relations**: This is the main ingestion method used by streaming renderers and by `set_width` during rewrap.
+**Call relations**: This is the main input path for live text. It calls `flush_current_line` when it sees real newlines and `wrap_current_line` after appending ordinary text. `set_width` also uses it to reprocess saved text after a width change.
 
 *Call graph*: calls 2 internal fn (flush_current_line, wrap_current_line); called by 1 (set_width).
 
@@ -2472,11 +2482,11 @@ fn push_fragment(&mut self, fragment: &str)
 fn end_line(&mut self)
 ```
 
-**Purpose**: Explicitly terminates the current logical line as if a newline had been received.
+**Purpose**: Finishes the current logical line as if a newline had just arrived. It is useful when the caller knows a line is complete even without passing a `\n` character.
 
-**Data flow**: Calls `flush_current_line(true)` with no return value.
+**Data flow**: It takes no extra input. It tells the builder to flush the current line with `explicit_break` set to true, which may create one final row marked as ending at a real line break.
 
-**Call relations**: Used by callers that want to finalize a line boundary without embedding `\n` in the fragment stream.
+**Call relations**: This is a small public shortcut around `flush_current_line`. It uses the same internal path as `push_fragment` uses when it encounters a newline.
 
 *Call graph*: calls 1 internal fn (flush_current_line).
 
@@ -2487,11 +2497,11 @@ fn end_line(&mut self)
 fn rows(&self) -> &[Row]
 ```
 
-**Purpose**: Returns the committed wrapped rows accumulated so far, excluding any still-buffered partial line.
+**Purpose**: Returns the completed rows produced so far, without removing them. These are rows that have already been wrapped or explicitly finished.
 
-**Data flow**: Returns a shared slice reference to `self.rows`.
+**Data flow**: It reads the builder's stored `rows` list and returns a borrowed view of it. The unfinished current line is not included, and nothing is changed.
 
-**Call relations**: Used by callers and tests that only want finalized rows.
+**Call relations**: This is for callers that want to inspect or render only committed rows. Several tests use it to verify exactly what rows have been produced after pushing text.
 
 
 ##### `RowBuilder::display_rows`  (lines 90–99)
@@ -2500,11 +2510,11 @@ fn rows(&self) -> &[Row]
 fn display_rows(&self) -> Vec<Row>
 ```
 
-**Purpose**: Returns the rows suitable for immediate display, including the current partial line if one exists.
+**Purpose**: Builds a display-ready list of rows, including the unfinished current line if there is one. This is useful for drawing the current live state on screen.
 
-**Data flow**: Clones `self.rows` into a new vector, appends a synthetic non-explicit `Row` built from `current_line` when that buffer is non-empty, and returns the vector.
+**Data flow**: It clones the completed rows into a new list. If the current line buffer is not empty, it appends that buffer as a final row marked as not ending in an explicit break. It returns this new list without changing the builder.
 
-**Call relations**: Used by renderers that need to show both committed and in-progress content.
+**Call relations**: This sits between internal buffering and user-visible output. The newline test uses it because the most recent text after a newline may still be a partial line that should appear on screen.
 
 
 ##### `RowBuilder::drain_commit_ready`  (lines 103–115)
@@ -2513,11 +2523,11 @@ fn display_rows(&self) -> Vec<Row>
 fn drain_commit_ready(&mut self, max_keep: usize) -> Vec<Row>
 ```
 
-**Purpose**: Drains the oldest committed rows once the total display row count exceeds a retention limit.
+**Purpose**: Removes and returns old rows when the builder has more display rows than a caller wants to keep. This helps a live interface keep only a limited recent window while committing older rows elsewhere.
 
-**Data flow**: Computes `display_count` as committed rows plus one if `current_line` is non-empty; if that count is within `max_keep`, returns an empty vector; otherwise computes how many committed rows can be removed, removes that many from the front of `self.rows`, collects them into a new vector, and returns the drained rows.
+**Data flow**: It receives `max_keep`, counts completed rows plus the unfinished current line if present, and decides how many old completed rows exceed that limit. It removes that many rows from the front of the stored list and returns them in their original order. It never drains the current partial line.
 
-**Call relations**: Used by scrolling/streaming consumers that want to commit old rows while keeping only a bounded visible tail.
+**Call relations**: This is used when live output grows beyond a retention limit. It acts after wrapping has produced rows, handing older completed rows off to whatever part of the program stores or finalizes them.
 
 *Call graph*: 2 external calls (new, with_capacity).
 
@@ -2528,11 +2538,11 @@ fn drain_commit_ready(&mut self, max_keep: usize) -> Vec<Row>
 fn flush_current_line(&mut self, explicit_break: bool)
 ```
 
-**Purpose**: Finalizes the current logical line, wrapping any buffered content first and then recording an explicit line break when requested.
+**Purpose**: Finalizes the current logical line, usually because a real newline was seen or requested. It records whether the line ended explicitly rather than only because it wrapped.
 
-**Data flow**: Calls `wrap_current_line()` to emit any full-width wrapped rows; if `explicit_break` is true and `current_line` is empty, pushes an empty `Row { text: "", explicit_break: true }` to preserve boundary semantics; otherwise swaps out the remaining `current_line` into a new explicit-break row; finally clears `current_line`.
+**Data flow**: It first wraps any over-wide content in the current line. If an explicit break is requested, it either pushes the leftover current text as a row marked with `explicit_break: true`, or, if the line already ended exactly at a wrap boundary, it pushes an empty explicit row to remember that the newline happened. Then it clears the current line buffer.
 
-**Call relations**: Called by `push_fragment` on newline boundaries and by `end_line`.
+**Call relations**: This is an internal helper used by `push_fragment` and `end_line`. It relies on `wrap_current_line` first so that only the final leftover part gets the explicit line-break marker.
 
 *Call graph*: calls 1 internal fn (wrap_current_line); called by 2 (end_line, push_fragment); 2 external calls (new, swap).
 
@@ -2543,11 +2553,11 @@ fn flush_current_line(&mut self, explicit_break: bool)
 fn wrap_current_line(&mut self)
 ```
 
-**Purpose**: Moves as much buffered content as necessary from `current_line` into committed wrapped rows while leaving any final fitting suffix buffered for future fragments.
+**Purpose**: Cuts the current line into completed visual rows whenever it grows beyond the target width. It leaves any still-fitting tail in the current buffer so more text can be appended later.
 
-**Data flow**: Loops until `current_line` is empty or fully fits; each iteration calls `take_prefix_by_width(&current_line, target_width)`, handles the pathological `taken == 0` case by forcing one scalar into a row to avoid infinite loops, breaks when the suffix is empty because the whole line fits, or otherwise pushes the fitting prefix as a non-explicit row and replaces `current_line` with the suffix.
+**Data flow**: It repeatedly looks at `current_line` and asks `take_prefix_by_width` for the largest prefix that fits. If there is extra text after that prefix, it stores the prefix as a non-explicit wrapped row and keeps processing the suffix. If the whole current line fits, it stops and leaves it buffered. It also has a safety fallback to consume one Unicode scalar value if no width can be taken.
 
-**Call relations**: Used internally after fragment ingestion and before explicit line flushes.
+**Call relations**: This is the core wrapping engine. `push_fragment` calls it after ordinary text arrives, and `flush_current_line` calls it before marking a logical line as finished. It delegates the exact Unicode column counting to `take_prefix_by_width`.
 
 *Call graph*: calls 1 internal fn (take_prefix_by_width); called by 2 (flush_current_line, push_fragment).
 
@@ -2558,11 +2568,11 @@ fn wrap_current_line(&mut self)
 fn take_prefix_by_width(text: &str, max_cols: usize) -> (String, &str, usize)
 ```
 
-**Purpose**: Splits a string into the largest prefix whose visible width does not exceed a maximum number of columns.
+**Purpose**: Finds the longest beginning part of a string that fits within a given number of terminal columns. This is the low-level Unicode-aware measuring tool used by the wrapper.
 
-**Data flow**: Returns `(String::new(), text, 0)` for zero width or empty input; otherwise scans `text.char_indices()`, accumulates Unicode character widths with `UnicodeWidthChar::width`, stops before overflow or exactly at `max_cols`, then returns `(prefix_string, suffix_str, prefix_width)`.
+**Data flow**: It receives text and a maximum column count. It walks through the text character by character, adds each character's terminal width, and stops before adding one that would overflow. It returns three things: the fitting prefix as a new string, the remaining suffix as a slice of the original text, and the width of the prefix.
 
-**Call relations**: Used by `RowBuilder::wrap_current_line` and by other rendering code that needs width-bounded string prefixes.
+**Call relations**: Inside this file, `wrap_current_line` uses it to decide where to cut rows. It is also available to other rendering code, such as `render_lines`, when that code needs the same safe terminal-width split.
 
 *Call graph*: called by 2 (render_lines, wrap_current_line); 2 external calls (new, width).
 
@@ -2573,11 +2583,11 @@ fn take_prefix_by_width(text: &str, max_cols: usize) -> (String, &str, usize)
 fn rows_do_not_exceed_width_ascii()
 ```
 
-**Purpose**: Checks that ASCII input is wrapped into committed rows that do not exceed the target width.
+**Purpose**: Checks the basic wrapping behavior for ordinary one-column ASCII text. It proves that long plain text is split into rows of the requested width.
 
-**Data flow**: Creates a `RowBuilder` of width 10, pushes a long ASCII fragment, clones committed rows, and compares them to the expected wrapped rows.
+**Data flow**: The test creates a builder with width 10, pushes a longer sentence into it, then reads the completed rows. It compares them with the exact rows expected after wrapping.
 
-**Call relations**: Basic wrapping correctness test.
+**Call relations**: This test starts with `RowBuilder::new` and drives the normal input path. It protects the simple case that all other wrapping behavior builds on.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -2588,11 +2598,11 @@ fn rows_do_not_exceed_width_ascii()
 fn rows_do_not_exceed_width_emoji_cjk()
 ```
 
-**Purpose**: Checks that wrapping respects double-width emoji and CJK characters.
+**Purpose**: Checks that wide Unicode characters are counted by screen width, not by byte count or simple character count. This matters for emoji and East Asian text in a terminal.
 
-**Data flow**: Creates a width-6 builder, pushes a fragment containing emoji and CJK text, clones committed rows, and compares them to the expected first wrapped row.
+**Data flow**: The test creates a builder with width 6, pushes text containing emoji and Chinese characters, then checks that only the portion that safely fits is emitted as a completed row. The remaining text stays buffered.
 
-**Call relations**: Unicode-width correctness test.
+**Call relations**: This test exercises the path from `RowBuilder::new` through live wrapping and indirectly validates the Unicode width logic used by `take_prefix_by_width`.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -2603,11 +2613,11 @@ fn rows_do_not_exceed_width_emoji_cjk()
 fn fragmentation_invariance_long_token()
 ```
 
-**Purpose**: Verifies that wrapping the same text in one chunk or many smaller chunks produces identical committed rows.
+**Purpose**: Checks that wrapping gives the same completed rows whether text arrives all at once or in small chunks. This is important for live streams, where input often arrives piece by piece.
 
-**Data flow**: Wraps a long token once as a whole and once in 3-character chunks using separate builders, clones both row vectors, and compares them for equality.
+**Data flow**: The test wraps the alphabet once as a single string and once as repeated three-character fragments. It then compares the completed rows from both builders and expects them to match.
 
-**Call relations**: Regression test for incremental-stream invariance.
+**Call relations**: This test creates two builders with `RowBuilder::new` and feeds them through the public input method. It guards against bugs where chunk boundaries accidentally affect wrapping results.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -2618,11 +2628,11 @@ fn fragmentation_invariance_long_token()
 fn newline_splits_rows()
 ```
 
-**Purpose**: Checks that embedded newlines create explicit-break rows and start a new logical line.
+**Purpose**: Checks that newline characters create explicit line breaks and separate later text onto a following display row.
 
-**Data flow**: Creates a builder, pushes `hello\nworld`, gets `display_rows`, and asserts at least one row has `explicit_break`, the first row text is `hello`, and some row starts with `world`.
+**Data flow**: The test creates a builder, pushes `hello\nworld`, then asks for display rows. It verifies that at least one row is marked as an explicit break, that the first row contains `hello`, and that another row starts with `world`.
 
-**Call relations**: Covers newline handling and explicit-break semantics.
+**Call relations**: This test drives the newline path in `push_fragment`, which calls the internal flush logic. It uses `display_rows` so the partial `world` line is visible even if it has not been finalized.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert!, assert_eq!).
 
@@ -2633,24 +2643,26 @@ fn newline_splits_rows()
 fn rewrap_on_width_change()
 ```
 
-**Purpose**: Checks that changing the target width rewraps existing content so all committed rows fit the new width.
+**Purpose**: Checks that changing the target width rebuilds existing rows to fit the new width. This protects terminal resize behavior.
 
-**Data flow**: Creates a width-10 builder, pushes text, asserts some rows exist, calls `set_width(5)`, then asserts every committed row’s width is at most 5.
+**Data flow**: The test creates a builder at width 10, pushes text long enough to produce rows, then changes the width to 5. It reads the rows afterward and asserts that every completed row is no wider than 5 columns.
 
-**Call relations**: Covers the rewrap path in `set_width`.
+**Call relations**: This test exercises `set_width`, which reconstructs prior text and sends it back through `push_fragment`. It also uses `Row::width` to verify the resulting rows fit.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert!).
 
 
 ### `cloud-tasks/src/scrollable_diff.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `during terminal UI rendering and input handling`
 
-This file defines two tightly coupled types: `ScrollViewState`, which stores the current vertical offset and known geometry (`scroll`, `viewport_h`, `content_h`), and `ScrollableDiff`, which owns both the original text lines and a cached wrapped representation. The wrapped cache is rebuilt only when width changes or content is replaced, so callers are expected to call `set_content` and then `set_width` when the display area changes.
+A terminal screen has a fixed width and height, but diffs and messages can be much longer and wider than the space available. This file solves that by turning raw text lines into wrapped display lines, then tracking which part of those display lines should currently be visible. Think of it like a paper document behind a small window: the document can be taller than the window, and this code decides which slice of it is showing.
 
-The key behavior lives in `rewrap`. It iterates raw lines, normalizes tabs to four spaces, preserves empty lines, and wraps by display width using `unicode_width` so wide Unicode characters count correctly. It prefers soft breaks at whitespace and selected punctuation, tracked via `last_soft_idx`; if no soft break exists, it hard-wraps the current accumulated line. It also treats embedded `\n` characters inside a raw string as explicit line breaks. Alongside each wrapped output line, it records the originating raw line index in `wrapped_src_idx`, which lets higher-level rendering recover semantic context from wrapped display rows.
+There are two main pieces. `ScrollViewState` stores the basic geometry: how far down the view is scrolled, how tall the visible window is, and how tall the wrapped content is. Its job is to make sure the scroll position never points past the end.
 
-Scroll state is always clamped against `content_h - viewport_h`, using saturating arithmetic so shrinking content or viewport never underflows. Width `0` is a special case: wrapping is disabled and raw lines are copied directly. `percent_scrolled` reports the visible bottom edge as a percentage of total content, but intentionally returns `None` when geometry is incomplete or scrolling is unnecessary.
+`ScrollableDiff` owns the original lines and a cached wrapped version. The cache matters because wrapping text can be repeated often during drawing, especially in a terminal user interface. When new content arrives, the cache is cleared. When the width is set, the file rebuilds the wrapped lines for that width and remembers which original raw line each wrapped line came from. That source-line map lets later drawing code style wrapped lines while still knowing their original meaning.
+
+The wrapping is careful about character display width, including wider Unicode characters, and it prefers to break at spaces or punctuation when possible. It also exposes simple scrolling actions: move by a delta, page up or down, jump to top or bottom, and report a rough percentage scrolled.
 
 #### Function details
 
@@ -2660,11 +2672,11 @@ Scroll state is always clamped against `content_h - viewport_h`, using saturatin
 fn clamp(&mut self)
 ```
 
-**Purpose**: Constrains the current scroll offset so it never points past the last valid top row for the known content and viewport heights. This is the invariant keeper used whenever geometry changes.
+**Purpose**: This keeps the saved scroll position inside the part of the content that can actually be shown. It prevents the view from being scrolled below the end after the content or window size changes.
 
-**Data flow**: Reads `self.content_h`, `self.viewport_h`, and `self.scroll`; computes `max_scroll` with `saturating_sub`; if `scroll` exceeds that maximum, rewrites `self.scroll` in place. It returns no value and only mutates the struct.
+**Data flow**: It reads the current content height and viewport height, computes the largest allowed scroll value, and compares the current scroll against it. If the scroll is too large, it lowers it to the maximum safe value; otherwise it leaves it alone.
 
-**Call relations**: This is invoked after viewport or wrap geometry changes so stale scroll positions are corrected immediately. `ScrollableDiff::set_width` uses it after rebuilding wrapped content, and `ScrollableDiff::set_viewport` uses it after changing visible height.
+**Call relations**: When `ScrollableDiff::set_width` rebuilds the wrapped content, the content height may change, so it calls this to repair the scroll position. `ScrollableDiff::set_viewport` also calls it when the visible window height changes.
 
 *Call graph*: called by 2 (set_viewport, set_width).
 
@@ -2675,11 +2687,11 @@ fn clamp(&mut self)
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty scrollable text buffer with no content, no cached wrapping, and default scroll geometry. It is just the explicit constructor for the type.
+**Purpose**: This creates an empty scrollable text view ready to receive content. It is the simple starting point for code that needs a fresh `ScrollableDiff`.
 
-**Data flow**: Takes no arguments and delegates to `Default` to produce a `ScrollableDiff` whose vectors are empty, `wrap_cols` is `None`, and `state` is zeroed. It returns that new instance.
+**Data flow**: It takes no content or settings from the caller. It uses the type's default values to create empty raw lines, empty wrapped lines, no remembered wrap width, and a zeroed scroll state, then returns that new object.
 
-**Call relations**: Used by callers that need a fresh local diff/message viewer before content is loaded. It does not perform wrapping itself; later calls to `set_content` and `set_width` establish usable state.
+**Call relations**: This constructor is used when a new scrollable diff view is needed. Internally it hands the work to the standard default creation behavior, so the rest of the file can rely on a consistent empty starting state.
 
 *Call graph*: called by 1 (new); 1 external calls (default).
 
@@ -2690,11 +2702,11 @@ fn new() -> Self
 fn set_content(&mut self, lines: Vec<String>)
 ```
 
-**Purpose**: Replaces the underlying raw text lines and invalidates all cached wrapping derived from the previous content. It deliberately postpones rewrapping until width is supplied again.
+**Purpose**: This replaces the text that the scrollable view will show. It deliberately does not wrap the text right away, because wrapping depends on the current display width.
 
-**Data flow**: Consumes a `Vec<String>` of new raw lines, stores it into `self.raw`, clears `self.wrapped` and `self.wrapped_src_idx`, resets `self.state.content_h` to `0`, and sets `self.wrap_cols` to `None` to force a future rebuild. It returns no value.
+**Data flow**: It receives a list of raw strings. It stores them as the new original content, clears any old wrapped lines and source-line mapping, resets the recorded content height to zero, and forgets the previous wrap width so the next width update will rebuild the cache.
 
-**Call relations**: Called when higher-level UI logic swaps in a different diff or conversation body. Because it clears `wrap_cols`, even reusing the same width later will trigger `set_width` to rebuild the cache.
+**Call relations**: Higher-level UI code such as `apply_selection_to_fields` calls this when the selected diff or message changes. After this, the normal flow is for layout code to call `set_width`, which rebuilds the display-ready wrapped lines.
 
 *Call graph*: called by 1 (apply_selection_to_fields).
 
@@ -2705,11 +2717,11 @@ fn set_content(&mut self, lines: Vec<String>)
 fn set_width(&mut self, width: u16)
 ```
 
-**Purpose**: Updates the active wrap width and rebuilds the wrapped-line cache only when the width actually changed. It also re-clamps scroll afterward so the current offset remains valid for the new content height.
+**Purpose**: This tells the view how many terminal columns it has available and refreshes wrapping if that width changed. Without this, long lines would not fit the current screen area correctly.
 
-**Data flow**: Reads the requested `width` and compares it to `self.wrap_cols`; if unchanged, it exits early. Otherwise it stores the new width, calls `rewrap(width)` to regenerate `wrapped`, `wrapped_src_idx`, and `state.content_h`, then mutates `state.scroll` via `state.clamp()`.
+**Data flow**: It receives a width in columns. If the width is the same as the cached width, it does nothing. If it changed, it records the new width, rebuilds the wrapped line cache for that width, and then clamps the scroll position so it still points to a valid place.
 
-**Call relations**: This is the normal entry point after layout changes. It delegates all wrapping logic to `ScrollableDiff::rewrap` and then to `ScrollViewState::clamp` to preserve scroll invariants.
+**Call relations**: Layout or drawing code calls this when the terminal area changes or after new content is set. It hands the detailed wrapping work to `ScrollableDiff::rewrap`, then uses `ScrollViewState::clamp` to keep scrolling safe.
 
 *Call graph*: calls 2 internal fn (clamp, rewrap).
 
@@ -2720,11 +2732,11 @@ fn set_width(&mut self, width: u16)
 fn set_viewport(&mut self, height: u16)
 ```
 
-**Purpose**: Records the visible height of the scroll view and immediately adjusts scroll if the viewport shrink would otherwise leave the offset out of range.
+**Purpose**: This records how many rows are visible in the scrollable area. It also fixes the scroll position if the visible window has become too small or too large for the old scroll value.
 
-**Data flow**: Takes a `height`, writes it into `self.state.viewport_h`, then mutates `self.state.scroll` indirectly through `self.state.clamp()`. It returns no value.
+**Data flow**: It receives a height in rows, stores it in the scroll state, then checks whether the current scroll is still allowed. If not, it pulls the scroll back to the nearest valid value.
 
-**Call relations**: Used by rendering code whenever the on-screen rectangle changes height. Unlike `set_width`, it does not rebuild wrapping because only vertical geometry changed.
+**Call relations**: UI layout code calls this when it knows the height of the viewing area. It relies on `ScrollViewState::clamp` to enforce the same safety rule used after wrapping changes.
 
 *Call graph*: calls 1 internal fn (clamp).
 
@@ -2735,11 +2747,11 @@ fn set_viewport(&mut self, height: u16)
 fn wrapped_lines(&self) -> &[String]
 ```
 
-**Purpose**: Exposes the cached wrapped display lines as an immutable slice for rendering. It assumes the caller has already synchronized width with `set_width`.
+**Purpose**: This gives drawing code the already-wrapped lines that should be displayed. It avoids making the renderer repeat the wrapping work every time it paints the screen.
 
-**Data flow**: Reads `self.wrapped` and returns `&[String]` referencing the internal cache without mutation.
+**Data flow**: It reads the internal wrapped-line cache and returns a shared view of it. It does not change the content, the cache, or the scroll state.
 
-**Call relations**: Rendering code consumes this slice to build styled output rows. It is paired with `wrapped_src_indices` when the renderer needs to map display rows back to original raw lines.
+**Call relations**: `style_conversation_lines` calls this when it is ready to turn the wrapped text into styled terminal output. The expectation is that `set_width` has already been called so the cache matches the current screen width.
 
 *Call graph*: called by 1 (style_conversation_lines).
 
@@ -2750,11 +2762,11 @@ fn wrapped_lines(&self) -> &[String]
 fn wrapped_src_indices(&self) -> &[usize]
 ```
 
-**Purpose**: Returns the per-display-line mapping back to the originating raw line index. This preserves semantic grouping after wrapping.
+**Purpose**: This tells callers which original raw line each wrapped display line came from. That is useful when a single long source line becomes several visible lines but still needs to be styled or interpreted as one original line.
 
-**Data flow**: Reads `self.wrapped_src_idx` and returns it as `&[usize]` without modifying state.
+**Data flow**: It reads the stored source-index list and returns a shared view of it. Each entry corresponds to a wrapped line and points back to the matching raw line number.
 
-**Call relations**: Used alongside `wrapped_lines` by conversation rendering so wrapped continuations can still inspect the original unwrapped source line and detect headers, bullets, or code fences.
+**Call relations**: `style_conversation_lines` uses this alongside `wrapped_lines` so it can style visible lines while still knowing their original source. The mapping is rebuilt by `rewrap` whenever the width changes.
 
 *Call graph*: called by 1 (style_conversation_lines).
 
@@ -2765,11 +2777,11 @@ fn wrapped_src_indices(&self) -> &[usize]
 fn raw_line_at(&self, idx: usize) -> &str
 ```
 
-**Purpose**: Fetches a raw source line by index, returning an empty string for out-of-range access instead of panicking. This gives renderers a forgiving lookup API.
+**Purpose**: This returns one original, unwrapped line by index. It gives callers a safe way to ask for raw content without crashing if the index is out of range.
 
-**Data flow**: Takes `idx`, reads `self.raw.get(idx)`, converts the `String` to `&str` when present, and otherwise returns `""`. It does not mutate state.
+**Data flow**: It receives a raw line index. If that line exists, it returns it as text; if not, it returns an empty string instead of failing.
 
-**Call relations**: Conversation styling uses this to recover the original line corresponding to a wrapped display row. The empty-string fallback avoids defensive bounds checks in callers.
+**Call relations**: `style_conversation_lines` calls this when it needs to look back from a wrapped line to the original line. This works together with `wrapped_src_indices`, which supplies the raw-line index to look up.
 
 *Call graph*: called by 1 (style_conversation_lines).
 
@@ -2780,11 +2792,11 @@ fn raw_line_at(&self, idx: usize) -> &str
 fn scroll_by(&mut self, delta: i16)
 ```
 
-**Purpose**: Moves the scroll position by a signed row delta while enforcing top and bottom bounds. Negative deltas scroll upward; positive deltas scroll downward.
+**Purpose**: This moves the view up or down by a signed amount while preventing it from going before the start or after the end. It is the basic scroll action used for small movements and by paging.
 
-**Data flow**: Reads `delta`, converts current `state.scroll` and `delta` to `i32`, adds them, clamps the result between `0` and `self.max_scroll()`, then writes the clamped value back to `self.state.scroll` as `u16`. It returns no value.
+**Data flow**: It receives a positive or negative delta. It adds that delta to the current scroll value, then clamps the result between zero and the maximum possible scroll, and stores the safe result back into the state.
 
-**Call relations**: This is the primitive scrolling operation. `page_by` delegates directly to it, and it relies on `max_scroll` for the lower geometry bound.
+**Call relations**: Direct input handling can use this for line-by-line scrolling. `ScrollableDiff::page_by` also calls it, so both small scrolling and page scrolling share the same boundary checks. It asks `ScrollableDiff::max_scroll` for the lower end of the valid range.
 
 *Call graph*: calls 1 internal fn (max_scroll); called by 1 (page_by).
 
@@ -2795,11 +2807,11 @@ fn scroll_by(&mut self, delta: i16)
 fn page_by(&mut self, delta: i16)
 ```
 
-**Purpose**: Provides a semantic alias for larger scroll jumps, typically one viewport minus one row. Its behavior is intentionally identical to `scroll_by`.
+**Purpose**: This scrolls by a larger amount, usually close to one screenful. It exists as a clear page-up or page-down operation while reusing the same safety checks as normal scrolling.
 
-**Data flow**: Accepts a signed `delta` and forwards it unchanged to `scroll_by`; state mutation occurs there. It returns no value.
+**Data flow**: It receives a positive or negative page delta and passes it directly to `scroll_by`. The current scroll state is updated there, with limits applied.
 
-**Call relations**: Higher-level input handling can call this for page-up/page-down style movement without duplicating scroll logic. It exists mainly to express intent in the call flow.
+**Call relations**: Keyboard handling can call this for page-style movement. It delegates to `ScrollableDiff::scroll_by` so page movement cannot overshoot the content any more than normal movement can.
 
 *Call graph*: calls 1 internal fn (scroll_by).
 
@@ -2810,11 +2822,11 @@ fn page_by(&mut self, delta: i16)
 fn scroll_to_top(&mut self)
 ```
 
-**Purpose**: Jumps the view to the first row of content. It is the absolute reset operation for vertical position.
+**Purpose**: This jumps the view straight to the beginning of the content. It is useful for Home-key style navigation or resetting the view.
 
-**Data flow**: Writes `0` directly into `self.state.scroll` and returns no value.
+**Data flow**: It takes no input beyond the current object. It sets the scroll position to zero and leaves the content and wrapping cache unchanged.
 
-**Call relations**: Used when callers want deterministic positioning at the beginning of content. It does not need `max_scroll` because the top bound is always zero.
+**Call relations**: This is a direct navigation helper. Unlike incremental scrolling, it does not need to ask other functions for boundaries because the top is always scroll position zero.
 
 
 ##### `ScrollableDiff::scroll_to_bottom`  (lines 93–95)
@@ -2823,11 +2835,11 @@ fn scroll_to_top(&mut self)
 fn scroll_to_bottom(&mut self)
 ```
 
-**Purpose**: Jumps the view to the last valid top row so the bottom of content is visible. It respects current viewport and content heights.
+**Purpose**: This jumps the view to the lowest valid scroll position, so the bottom of the content is visible. It is useful for End-key style navigation or following newly loaded content.
 
-**Data flow**: Reads `self.max_scroll()` and writes that value into `self.state.scroll`. It returns no value.
+**Data flow**: It computes the largest allowed scroll value from the content height and viewport height, then stores that value as the current scroll position.
 
-**Call relations**: Used for end-of-content navigation. It delegates the geometry calculation to `max_scroll` rather than recomputing the subtraction inline.
+**Call relations**: This navigation helper calls `ScrollableDiff::max_scroll` to find the correct bottom position. That keeps its behavior consistent with `scroll_by`, which uses the same limit.
 
 *Call graph*: calls 1 internal fn (max_scroll).
 
@@ -2838,11 +2850,11 @@ fn scroll_to_bottom(&mut self)
 fn percent_scrolled(&self) -> Option<u8>
 ```
 
-**Purpose**: Computes an approximate scroll percentage based on the visible bottom edge of the viewport, not just the top offset. It intentionally suppresses percentages when geometry is incomplete or scrolling is irrelevant.
+**Purpose**: This reports roughly how far through the content the visible window has reached. It returns no percentage when there is not enough information or when all content already fits on screen.
 
-**Data flow**: Reads `state.content_h`, `state.viewport_h`, and `state.scroll`; returns `None` if content or viewport height is zero or if content fits entirely in the viewport. Otherwise it computes `(scroll + viewport_h) / content_h * 100`, rounds it, clamps to `0..=100`, and returns `Some(u8)`.
+**Data flow**: It reads the content height, viewport height, and current scroll. If there is no content, no viewport, or no need to scroll, it returns `None`. Otherwise it calculates where the bottom of the visible window falls as a percentage of the total content height, rounds it, limits it to 0 through 100, and returns it.
 
-**Call relations**: Overlay title rendering uses this to show progress through long diff or conversation content. It is read-only and depends on prior calls that established wrapping and viewport geometry.
+**Call relations**: This can be used by UI code to show a scroll indicator, such as "73%". It does not call other local helpers and does not change state; it simply summarizes the current geometry.
 
 
 ##### `ScrollableDiff::max_scroll`  (lines 110–112)
@@ -2851,11 +2863,11 @@ fn percent_scrolled(&self) -> Option<u8>
 fn max_scroll(&self) -> u16
 ```
 
-**Purpose**: Calculates the greatest legal top-row offset for the current content and viewport heights. It centralizes the saturating subtraction used by scrolling operations.
+**Purpose**: This calculates the furthest down the view is allowed to scroll. It is the shared rule that keeps scrolling from moving past the bottom.
 
-**Data flow**: Reads `self.state.content_h` and `self.state.viewport_h`, computes `content_h.saturating_sub(viewport_h)`, and returns the resulting `u16` without mutation.
+**Data flow**: It reads the wrapped content height and the viewport height. If the content is taller than the viewport, it returns the difference; if not, it returns zero.
 
-**Call relations**: This helper is used by relative and absolute bottom scrolling paths. `scroll_by` uses it for clamping, and `scroll_to_bottom` uses it for direct positioning.
+**Call relations**: `ScrollableDiff::scroll_by` calls this when limiting incremental movement, and `ScrollableDiff::scroll_to_bottom` calls it when jumping to the end. Keeping this calculation in one place makes those actions agree.
 
 *Call graph*: called by 2 (scroll_by, scroll_to_bottom).
 
@@ -2866,10 +2878,10 @@ fn max_scroll(&self) -> u16
 fn rewrap(&mut self, width: u16)
 ```
 
-**Purpose**: Rebuilds the wrapped display cache from raw lines for a specific column width, preserving a mapping from each wrapped row back to its source line. It is the core text-layout routine for this viewer.
+**Purpose**: This rebuilds the display-ready version of the raw text for a given terminal width. It is what turns long source lines into shorter lines that fit on screen.
 
-**Data flow**: Takes `width`; if zero, clones `self.raw` into `self.wrapped` and updates `state.content_h`. Otherwise it iterates `self.raw` with indices, replaces tabs with four spaces, emits empty wrapped lines for empty inputs, and then scans characters while tracking display width with `UnicodeWidthChar` and `UnicodeWidthStr`. It splits on explicit `\n`, prefers soft wraps at whitespace/punctuation via `last_soft_idx`, hard-wraps when necessary, pushes each emitted segment into `out`, records the corresponding raw index in `out_idx`, then stores both vectors into `self.wrapped` and `self.wrapped_src_idx` and updates `self.state.content_h`.
+**Data flow**: It receives a width in columns and reads all raw lines. If the width is zero, it copies the raw lines as-is and records their count as the content height. Otherwise it expands tabs into spaces, walks through each character, measures how wide it appears in the terminal, and starts a new wrapped line when the current one would become too wide. It prefers breaking at spaces or punctuation when possible, records which raw line produced each wrapped line, then replaces the cached wrapped lines, replaces the source-index map, and updates the content height.
 
-**Call relations**: Only `set_width` invokes this, making width changes the sole trigger for cache regeneration. The renderer later consumes both outputs to style wrapped rows while still reasoning about original raw-line structure.
+**Call relations**: `ScrollableDiff::set_width` calls this whenever the available width changes. After this function rebuilds the cache, drawing code can use `wrapped_lines`, `wrapped_src_indices`, and `raw_line_at` to render and style the text without doing its own wrapping.
 
 *Call graph*: called by 1 (set_width); 6 external calls (new, width, width, new, matches!, take).

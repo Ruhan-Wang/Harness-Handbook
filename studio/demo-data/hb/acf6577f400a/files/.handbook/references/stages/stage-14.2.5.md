@@ -1,8 +1,10 @@
 # Exec-server filesystem sandbox services  `stage-14.2.5`
 
-This stage is cross-cutting execution infrastructure for all exec-server filesystem access. It sits beneath higher-level RPC handlers and task execution code, providing the concrete backends used whenever the server must read files, inspect directories, resolve paths, or mutate filesystem state, either locally, remotely, or through a sandbox.
+This stage is shared behind-the-scenes support for the exec server when it needs to work with files. The exec server may be running commands locally, in a restricted sandbox, or on another machine, but the rest of the system should be able to ask for simple actions like read, write, list, copy, or delete.
 
-local_file_system.rs is the main host-side implementation of the ExecutorFileSystem trait. It performs ordinary filesystem work directly, can wrap those operations in an unsandboxed adapter, and can delegate eligible requests to a sandboxed backend. sandboxed_file_system.rs provides that backend: it accepts only native-path, sandbox-allowed operations and forwards them to a helper instead of touching the host filesystem itself. fs_helper.rs defines the helper JSON protocol and also offers an in-process executor for the same operation set, while fs_sandbox.rs is the subprocess runner that derives permissions, launches the helper under sandbox constraints, and converts helper I/O into typed results. remote_file_system.rs supplies an alternative ExecutorFileSystem that proxies the same operations to another exec-server over RPC. file_read.rs builds on these backends to manage per-connection open-file handles and serve bounded random-access block reads efficiently.
+The local file system layer is the front desk for files on the same machine. It either performs the action directly or sends it through a sandbox, which is a locked-down area that limits which paths can be touched. The sandboxed file system layer is the safe version of those same operations, enforcing the sandbox rules. The filesystem sandbox runner starts helper work inside that restricted space and carefully controls what environment and file access the helper receives.
+
+The helper protocol is the messenger format for filesystem actions. It turns requests into real file operations and turns results or failures back into replies. Remote file system support uses a similar idea to make files on another machine look local. File-read support handles long reads in small chunks, tracking open reads and rejecting unsafe or stale requests.
 
 ## Files in this stage
 
@@ -11,13 +13,15 @@ Manages the exec-server RPC surface for opening file-read handles and serving bo
 
 ### `exec-server/src/file_read.rs`
 
-`domain_logic` · `request handling / connection-scoped file reads`
+`io_transport` · `request handling and connection teardown`
 
-This file implements a small stateful service for chunked file reads. `FileReadHandleManager` stores a mutex-protected `HashMap<String, Arc<File>>` keyed by caller-supplied handle ids, with a hard cap of `MAX_OPEN_FILE_READS` (128) per manager. `open` converts an async `tokio::fs::File` into a blocking `std::fs::File`, rejects duplicate handle ids, enforces the open-handle limit, and stores the file under the requested id. The manager does not generate ids itself; it validates and preserves the caller’s chosen string.
+This file is a small bookkeeping and disk-reading layer for file downloads or file inspection. Instead of reading a whole file at once, the server opens a file, gives it a handle ID, and later reads requested byte ranges from that handle. A handle ID is like a coat-check ticket: the client does not keep the file itself, but it can use the ticket to ask for more pieces.
 
-`read_block` is the main operation. It first validates that the requested length is between 1 and `codex_file_system::FILE_READ_CHUNK_SIZE`, then clones the `Arc<File>` for the handle under the mutex and performs the actual read in `tokio::task::spawn_blocking`. The blocking helper `read_block_at` repeatedly calls platform-specific positional I/O (`FileExt::read_at` on Unix, `seek_read` on Windows), handling `Interrupted` by retrying, stopping on EOF, and detecting `u64` offset overflow via `checked_add`. The returned `FileReadBlock` contains the bytes actually read and an `eof` flag set whenever fewer than `len` bytes were obtained.
+The main type, FileReadHandleManager, stores open files in a shared map protected by a mutex, which is a lock that stops two async tasks from changing the map at the same time. It limits each connection to 128 open file reads, so a client cannot accidentally or maliciously leave unlimited files open.
 
-A notable design choice is failure cleanup: if the blocking task fails or the read returns an error, `read_block` proactively closes that handle so future reads cannot continue against a potentially bad file state. `close` removes one handle, and `close_all` clears the entire map, which is useful during connection shutdown.
+Reads are done by offset and length. The length must be between 1 byte and the project’s configured maximum chunk size. The actual disk read is moved into a blocking worker task, because normal file reads can pause the thread, and this server uses async code where blocking the main runtime would slow other work. If a read fails, the handle is closed, so the server does not keep a possibly bad file session around.
+
+The file also hides platform differences: Unix and Windows use different system calls to read from a specific file offset, but the rest of the code can call one shared helper.
 
 #### Function details
 
@@ -31,11 +35,11 @@ async fn open(
     ) -> io::Result<String>
 ```
 
-**Purpose**: Registers a new open file under a caller-provided handle id, enforcing uniqueness and a per-manager limit.
+**Purpose**: Registers a newly opened file under a client-provided handle ID so later requests can read from it. It refuses duplicate handle IDs and refuses to keep more than the allowed number of open file reads for the connection.
 
-**Data flow**: Takes ownership of a `String` handle id and a `tokio::fs::File` → converts the file into `std::fs::File` and wraps it in `Arc` → locks the handle map, rejects duplicate ids and maps already at `MAX_OPEN_FILE_READS`, inserts the file under the id, and returns `Ok(handle_id)`.
+**Data flow**: It receives a handle ID and an async file object. It converts the async file into a standard file object, wraps it so it can be safely shared, locks the handle table, checks for duplicate IDs and the open-file limit, then stores the file. It returns the handle ID on success, or an input error if the request would create a conflict or exceed the limit.
 
-**Call relations**: Called by higher-level file-read open RPC handling; it is the entry point that populates manager state for later block reads.
+**Call relations**: This is called when the higher-level open-file request wants to start a read session. It prepares the stored file handle that later read requests will look up through FileReadHandleManager::read_block.
 
 *Call graph*: called by 1 (open); 4 external calls (new, into_std, new, format!).
 
@@ -51,11 +55,11 @@ async fn read_block(
     ) -> io::Result<FileReadBlock>
 ```
 
-**Purpose**: Reads a bounded block of bytes from a previously opened file handle at a specific offset, closing the handle on failure.
+**Purpose**: Reads one requested chunk of bytes from a previously opened file handle. It checks that the requested chunk size is safe, finds the stored file, and performs the disk read without blocking the async server runtime.
 
-**Data flow**: Accepts a handle id, byte offset, and requested length → validates length with `validate_read_block_len`, locks the map long enough to clone the `Arc<File>` or return `unknown_handle_error`, then runs `read_block_at(&file, offset, len)` inside `spawn_blocking`. If the blocking task panics/cancels, converts that join error into `io::Error::other`; if the final result is any error, calls `close(handle_id)` before returning it. On success returns `FileReadBlock { bytes, eof }`.
+**Data flow**: It receives a handle ID, a byte offset, and a length. First it validates the length, then it locks the handle table long enough to copy out the matching file reference. It runs the real file read in a blocking worker task and returns a FileReadBlock containing the bytes and an end-of-file flag. If the handle is unknown, it returns a not-found error. If the read itself fails, it closes that handle before returning the error.
 
-**Call relations**: Used by the file-read RPC path after `open`; it delegates actual positional I/O to `read_block_at` and cleanup to `close`.
+**Call relations**: This is called by the higher-level read-block request after a file has been opened. It relies on validate_read_block_len before reading, hands the actual disk work to read_block_at through a blocking task, and calls FileReadHandleManager::close when a read failure means the handle should no longer be kept.
 
 *Call graph*: calls 2 internal fn (close, validate_read_block_len); called by 1 (read_block); 3 external calls (other, format!, spawn_blocking).
 
@@ -66,11 +70,11 @@ async fn read_block(
 async fn close(&self, handle_id: &str)
 ```
 
-**Purpose**: Removes one open file handle from the manager.
+**Purpose**: Forgets one open file-read handle. This releases the server’s stored reference to that file for this manager.
 
-**Data flow**: Locks the handle map and removes the entry for `handle_id`, ignoring whether it existed.
+**Data flow**: It receives a handle ID, locks the handle table, and removes that entry if it exists. It does not return anything and does not report an error if the handle was already gone.
 
-**Call relations**: Called explicitly by close RPC handling and internally by `read_block` after read failures.
+**Call relations**: This is used when a higher-level close request ends a read session. FileReadHandleManager::read_block also calls it automatically after a failed read, so later requests do not keep using a bad or inconsistent handle.
 
 *Call graph*: called by 2 (read_block, close).
 
@@ -81,11 +85,11 @@ async fn close(&self, handle_id: &str)
 async fn close_all(&self)
 ```
 
-**Purpose**: Drops all tracked open file handles at once.
+**Purpose**: Closes every tracked file-read handle at once. This is useful when a connection is ending and the server needs to clean up all file-read sessions owned by it.
 
-**Data flow**: Locks the handle map and clears it completely.
+**Data flow**: It takes no handle ID. It locks the handle table and clears every stored file entry. Nothing is returned; the visible effect is that all previously known handles become unknown.
 
-**Call relations**: Used during connection shutdown to release all per-connection file-read state.
+**Call relations**: This is called during shutdown or connection cleanup. It is the broad cleanup partner to FileReadHandleManager::close, which removes only one handle.
 
 *Call graph*: called by 1 (shutdown).
 
@@ -96,11 +100,11 @@ async fn close_all(&self)
 fn read_block_at(file: &File, offset: u64, len: usize) -> io::Result<FileReadBlock>
 ```
 
-**Purpose**: Performs the actual positional file read loop against a blocking `std::fs::File`, retrying interrupts and detecting EOF.
+**Purpose**: Reads up to a requested number of bytes from a file starting at a specific offset. It keeps trying until it fills the requested chunk, reaches the end of the file, or hits a real read error.
 
-**Data flow**: Allocates a `Vec<u8>` of length `len`, tracks `bytes_read`, repeatedly computes `read_offset = offset + bytes_read` with overflow checking, calls `read_file_at` into the remaining slice, retries on `Interrupted`, stops on zero-byte reads, truncates the buffer to the actual bytes read, and returns `FileReadBlock { eof: bytes_read < len, bytes }`.
+**Data flow**: It receives a standard file reference, an offset, and a length. It creates a byte buffer of that length, repeatedly asks read_file_at to fill the remaining part, and advances the read position as bytes arrive. If the file ends early, it returns the bytes read so far with eof set to true. If the full length is read, eof is false. If the offset calculation would overflow or the operating system reports a real error, it returns an error.
 
-**Call relations**: Called only from `FileReadHandleManager::read_block` inside `spawn_blocking`; it isolates blocking and platform-specific I/O.
+**Call relations**: This is the low-level reading worker used by FileReadHandleManager::read_block inside a blocking task. It delegates the platform-specific offset read to read_file_at so the rest of the code does not need to care whether it is running on Unix or Windows.
 
 *Call graph*: calls 1 internal fn (read_file_at); 1 external calls (vec!).
 
@@ -111,11 +115,11 @@ fn read_block_at(file: &File, offset: u64, len: usize) -> io::Result<FileReadBlo
 fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize>
 ```
 
-**Purpose**: Provides the platform-specific positional read primitive used by block reads.
+**Purpose**: Performs one operating-system-level read from a file at a given byte offset. It gives the rest of the file a single name for an operation that is spelled differently on Unix and Windows.
 
-**Data flow**: On Unix, calls `std::os::unix::fs::FileExt::read_at`; on Windows, calls `std::os::windows::fs::FileExt::seek_read`; returns the resulting `io::Result<usize>`.
+**Data flow**: It receives a file, a mutable byte slice to fill, and an offset. On Unix it reads with the Unix offset-read API; on Windows it uses the Windows seek-read API. It returns how many bytes were placed into the buffer, or an I/O error from the operating system.
 
-**Call relations**: Used by `read_block_at` so the higher-level loop can stay platform-neutral.
+**Call relations**: read_block_at calls this each time it needs more bytes. This helper is the platform bridge: read_block_at owns the retry and end-of-file logic, while read_file_at performs the actual system call.
 
 *Call graph*: called by 1 (read_block_at); 2 external calls (read_at, seek_read).
 
@@ -126,11 +130,11 @@ fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize>
 fn validate_read_block_len(len: usize) -> io::Result<()>
 ```
 
-**Purpose**: Rejects zero-length or oversized block-read requests before any file lookup or I/O occurs.
+**Purpose**: Checks that a requested file-read chunk length is allowed. This prevents empty reads and prevents a client from asking the server to allocate or return an overly large block.
 
-**Data flow**: Checks whether `len` lies in `1..=FILE_READ_CHUNK_SIZE`; returns `Ok(())` when valid or `io::ErrorKind::InvalidInput` with a descriptive message otherwise.
+**Data flow**: It receives a length. It compares that length with the valid range: at least 1 byte and no more than the configured file-read chunk size. It returns success if the length is valid, or an input error explaining the allowed range if not.
 
-**Call relations**: Called at the start of `FileReadHandleManager::read_block`.
+**Call relations**: FileReadHandleManager::read_block calls this before looking up the handle or starting disk work. That means invalid requests are rejected early, before the server spends effort reading from a file.
 
 *Call graph*: called by 1 (read_block); 2 external calls (new, format!).
 
@@ -141,11 +145,11 @@ fn validate_read_block_len(len: usize) -> io::Result<()>
 fn unknown_handle_error(handle_id: &str) -> io::Error
 ```
 
-**Purpose**: Constructs the standard not-found error for missing file-read handles.
+**Purpose**: Builds a clear error for the case where a client asks for a file-read handle the server does not know about. This helps callers distinguish a missing handle from a disk-read failure.
 
-**Data flow**: Formats the missing handle id into an `io::Error` with kind `NotFound` and returns it.
+**Data flow**: It receives the handle ID string. It creates and returns a not-found I/O error whose message names that handle. It does not read or change any stored state.
 
-**Call relations**: Used by `FileReadHandleManager::read_block` when the requested handle id is absent from the manager.
+**Call relations**: FileReadHandleManager::read_block uses this when the handle table has no entry for the requested ID. It keeps the error message creation in one place so unknown-handle failures are reported consistently.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -155,13 +159,15 @@ Defines the helper-process request/response protocol and the direct executor use
 
 ### `exec-server/src/fs_helper.rs`
 
-`domain_logic` · `sandbox helper request handling`
+`io_transport` · `request handling`
 
-This file is the protocol contract between the main exec-server and the helper subprocess launched for sandboxed filesystem access. `FsHelperRequest` is a tagged enum over the supported filesystem RPCs (`fs/readFile`, `fs/writeFile`, `fs/createDirectory`, `fs/getMetadata`, `fs/canonicalize`, `fs/readDirectory`, `fs/remove`, `fs/copy`), and `FsHelperResponse` wraps either a successful `FsHelperPayload` or a `JSONRPCErrorError`. The payload enum mirrors the request operations and includes a small `operation()` helper plus a family of `expect_*` methods that downcast a generic payload to the expected response type, returning an internal JSON-RPC error if the operation tag does not match.
+This file is a bridge between a remote-style command, such as “read this file,” and the actual local file system. Think of it like a service desk form: callers submit a form saying which file operation they want, and this code checks the form, performs the work, and returns the answer in the expected shape.
 
-`run_direct_request` is the implementation used by the helper binary itself. It instantiates `DirectFileSystem` and executes the requested operation without any sandbox context (`sandbox: None` everywhere). Read-file responses are base64-encoded using `STANDARD`; write-file requests decode base64 and reject malformed input as `invalid_request`. Directory creation and removal apply default booleans when the request omits them (`recursive` defaults true; `force` defaults true for remove). Metadata and directory listing responses are translated field-by-field into protocol structs.
+The main request type, FsHelperRequest, lists every supported operation: read a file, write a file, create a directory, get file metadata, resolve a path to its real location, read a directory, remove something, or copy something. The matching response types wrap either a successful result or a JSON-RPC error. JSON-RPC is a simple request/response format often used between processes.
 
-Error mapping is intentionally opinionated. `map_fs_error` converts `io::ErrorKind::NotFound` into JSON-RPC not-found, `InvalidInput` and `PermissionDenied` into invalid-request, and everything else into internal-error. That means protocol consumers can distinguish user mistakes and missing paths from helper/runtime failures. The included test verifies that path values serialize as `file:` URIs in both requests and responses, which is an important cross-platform invariant for the helper protocol.
+A key detail is that file contents are sent as Base64 text. Base64 is a way to safely carry raw bytes inside JSON strings. When reading, bytes are encoded before returning. When writing, the incoming Base64 string is decoded back into bytes first.
+
+The central function, run_direct_request, uses DirectFileSystem to perform the requested operation without an extra sandbox argument. File-system failures are converted into clear protocol errors: missing files become “not found,” bad input or permission problems become “invalid request,” and unexpected failures become internal errors. The small expect_* helpers protect callers from accidentally treating one kind of response as another.
 
 #### Function details
 
@@ -171,11 +177,11 @@ Error mapping is intentionally opinionated. `map_fs_error` converts `io::ErrorKi
 fn operation(&self) -> &'static str
 ```
 
-**Purpose**: Returns the protocol method string corresponding to the concrete payload variant.
+**Purpose**: This returns the protocol method name for a successful helper response. It lets error messages and response checks say, in a standard way, which file-system operation a payload belongs to.
 
-**Data flow**: Matches `self` against all payload variants and returns the associated `FS_*_METHOD` constant as `&'static str`.
+**Data flow**: It receives one response payload variant, such as a read-file response or copy response. It matches that variant to the corresponding method-name string and returns that string without changing anything.
 
-**Call relations**: Used by the `expect_*` downcast helpers to report mismatched response types.
+**Call relations**: The expect_* functions call this when they receive the wrong response type. They use it to explain what actually came back, so the caller can see the mismatch clearly.
 
 
 ##### `FsHelperPayload::expect_read_file`  (lines 107–112)
@@ -184,11 +190,11 @@ fn operation(&self) -> &'static str
 fn expect_read_file(self) -> Result<FsReadFileResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsReadFileResponse`, rejecting any other operation as an internal protocol mismatch.
+**Purpose**: This checks that a helper response really is a read-file response and extracts it. It prevents code from silently treating the wrong kind of file-system result as file contents.
 
-**Data flow**: Consumes `self` → returns `Ok(response)` for `ReadFile`, otherwise calls `unexpected_response(FS_READ_FILE_METHOD, other.operation())` and returns that `JSONRPCErrorError`.
+**Data flow**: It takes a payload. If the payload contains read-file data, it returns that data. If it contains any other operation’s response, it builds a JSON-RPC error describing the mismatch.
 
-**Call relations**: Used by callers that issued a read-file request and need a typed response.
+**Call relations**: This is used by code that sent a read-file request and now wants the matching result. If the payload is not for reading, it hands off to unexpected_response to create a clear internal error.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -199,11 +205,11 @@ fn expect_read_file(self) -> Result<FsReadFileResponse, JSONRPCErrorError>
 fn expect_write_file(self) -> Result<FsWriteFileResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsWriteFileResponse`.
+**Purpose**: This checks that a helper response is the empty success result for writing a file. It is a safety check for callers that just asked the helper to write data.
 
-**Data flow**: Consumes `self` → returns the inner write-file response on matching variant or an internal mismatch error via `unexpected_response` otherwise.
+**Data flow**: It takes a payload. If it is a write-file response, it returns that response. Otherwise, it turns the mismatch into a JSON-RPC error.
 
-**Call relations**: Used after write-file helper calls to enforce operation/response consistency.
+**Call relations**: It sits after a write-file helper call in the bigger flow. When the response type does not match, it calls unexpected_response so the caller gets a useful explanation instead of bad assumptions.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -216,11 +222,11 @@ fn expect_create_directory(
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsCreateDirectoryResponse`.
+**Purpose**: This checks that the helper returned the expected response for creating a directory. It confirms that the caller is looking at the result of the operation it actually requested.
 
-**Data flow**: Consumes `self` → returns the create-directory response on match or an internal mismatch error naming the expected and actual operations.
+**Data flow**: It receives a payload. If it is a create-directory response, it returns it. If some other response arrived, it produces a JSON-RPC error saying what was expected and what was received.
 
-**Call relations**: Used by create-directory helper call sites.
+**Call relations**: This belongs to the response-validation step after a create-directory request. It relies on unexpected_response to build the standard error message when the helper response is inconsistent.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -231,11 +237,11 @@ fn expect_create_directory(
 fn expect_get_metadata(self) -> Result<FsGetMetadataResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsGetMetadataResponse`.
+**Purpose**: This extracts file metadata only when the payload is truly a metadata response. Metadata means facts about a file, such as whether it is a directory and how large it is.
 
-**Data flow**: Consumes `self` → returns the metadata response on match or an internal mismatch error otherwise.
+**Data flow**: It takes a payload and checks its kind. A get-metadata payload is returned to the caller. Any other payload becomes a JSON-RPC error explaining the unexpected operation.
 
-**Call relations**: Used by metadata helper call sites.
+**Call relations**: Callers use this after asking for metadata. If the helper sends back a different operation’s response, this function calls unexpected_response to report the protocol mix-up.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -246,11 +252,11 @@ fn expect_get_metadata(self) -> Result<FsGetMetadataResponse, JSONRPCErrorError>
 fn expect_canonicalize(self) -> Result<FsCanonicalizeResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsCanonicalizeResponse`.
+**Purpose**: This checks that a response contains the result of canonicalizing a path. Canonicalizing means resolving a path into its normalized, real form.
 
-**Data flow**: Consumes `self` → returns the canonicalize response on match or an internal mismatch error otherwise.
+**Data flow**: It receives a payload. If the payload contains a canonicalized path, it returns that response. If not, it returns a JSON-RPC error that names the expected and actual operation.
 
-**Call relations**: Used by canonicalize helper call sites.
+**Call relations**: This is used after a canonicalize request. On mismatch, it delegates to unexpected_response so the same clear error style is used across all helper response checks.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -263,11 +269,11 @@ fn expect_read_directory(
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsReadDirectoryResponse`.
+**Purpose**: This extracts a directory listing only when the payload is really a read-directory response. It protects callers from confusing a directory listing with another file-system result.
 
-**Data flow**: Consumes `self` → returns the directory-listing response on match or an internal mismatch error otherwise.
+**Data flow**: It takes a payload. If it contains directory entries, it returns them. If it contains another operation’s response, it returns a JSON-RPC error instead.
 
-**Call relations**: Used by read-directory helper call sites.
+**Call relations**: This is part of the normal flow after a read-directory request. If the response does not match the request, it calls unexpected_response to describe the mismatch.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -278,11 +284,11 @@ fn expect_read_directory(
 fn expect_remove(self) -> Result<FsRemoveResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsRemoveResponse`.
+**Purpose**: This checks that the helper response is for a remove operation, such as deleting a file or directory. It gives callers a simple success response only when the response type is correct.
 
-**Data flow**: Consumes `self` → returns the remove response on match or an internal mismatch error otherwise.
+**Data flow**: It receives a payload. A remove response is returned unchanged. Any other response is converted into a JSON-RPC error that says the helper returned the wrong operation.
 
-**Call relations**: Used by remove helper call sites.
+**Call relations**: Code that requested deletion uses this before trusting the result. For mismatches, it uses unexpected_response to create the standard internal error.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -293,11 +299,11 @@ fn expect_remove(self) -> Result<FsRemoveResponse, JSONRPCErrorError>
 fn expect_copy(self) -> Result<FsCopyResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Downcasts a generic helper payload into `FsCopyResponse`.
+**Purpose**: This checks that the helper response is for a copy operation. It is a guardrail that keeps protocol responses paired with the requests that caused them.
 
-**Data flow**: Consumes `self` → returns the copy response on match or an internal mismatch error otherwise.
+**Data flow**: It takes a payload. If it is a copy response, it returns that response. Otherwise, it produces a JSON-RPC error naming the expected copy operation and the actual response operation.
 
-**Call relations**: Used by copy helper call sites.
+**Call relations**: This is used after a copy request has been sent. When the response is not a copy response, it calls unexpected_response to report the protocol inconsistency.
 
 *Call graph*: calls 1 internal fn (unexpected_response).
 
@@ -308,11 +314,11 @@ fn expect_copy(self) -> Result<FsCopyResponse, JSONRPCErrorError>
 fn unexpected_response(expected: &str, actual: &str) -> JSONRPCErrorError
 ```
 
-**Purpose**: Builds the internal JSON-RPC error used when a helper response payload does not match the operation the caller expected.
+**Purpose**: This creates a standard error for the case where the helper returned a response for the wrong file-system operation. It makes protocol bugs easier to diagnose.
 
-**Data flow**: Formats `expected` and `actual` operation names into a message and wraps it with `internal_error(...)`.
+**Data flow**: It receives the method name the caller expected and the method name actually found. It combines them into a readable message and wraps that message as an internal JSON-RPC error.
 
-**Call relations**: Shared by all `FsHelperPayload::expect_*` methods.
+**Call relations**: All of the expect_* response-checking functions call this when their payload does not match. It hands the formatted message to internal_error so the rest of the system sees a normal JSON-RPC error object.
 
 *Call graph*: calls 1 internal fn (internal_error); called by 8 (expect_canonicalize, expect_copy, expect_create_directory, expect_get_metadata, expect_read_directory, expect_read_file, expect_remove, expect_write_file); 1 external calls (format!).
 
@@ -325,11 +331,11 @@ async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError>
 ```
 
-**Purpose**: Executes one helper request directly against the host filesystem using `DirectFileSystem` and returns the corresponding typed helper payload.
+**Purpose**: This performs one file-system helper request directly on the local file system and returns the matching protocol response. It is the main worker that turns helper commands into real reads, writes, deletes, copies, and directory lookups.
 
-**Data flow**: Consumes an `FsHelperRequest` → matches by operation and invokes the corresponding `ExecutorFileSystem` method on `DirectFileSystem` with `sandbox: None`. For reads, base64-encodes file bytes; for writes, base64-decodes input and rejects malformed data as `invalid_request`; for create/remove, fills default option booleans when omitted; for metadata and directory listing, maps backend structs into protocol response structs; all filesystem `io::Error`s are converted through `map_fs_error` → returns `Result<FsHelperPayload, JSONRPCErrorError>`.
+**Data flow**: It receives an FsHelperRequest. It creates a DirectFileSystem, chooses the right file operation, converts data when needed, and waits for the file-system work to finish. On success it returns the matching FsHelperPayload; on failure it converts the file-system error into a JSON-RPC error. For reads, raw bytes become Base64 text. For writes, Base64 text becomes raw bytes before writing.
 
-**Call relations**: Called by the standalone helper binary’s `run_main`; it is the in-process implementation of the helper protocol.
+**Call relations**: This is called by run_main when the process is running as the file-system helper. Inside the function, each request variant hands off to the matching DirectFileSystem operation. Any file-system error is passed through map_fs_error so callers receive protocol-friendly errors rather than raw operating-system errors.
 
 *Call graph*: called by 1 (run_main); 8 external calls (Canonicalize, Copy, CreateDirectory, GetMetadata, ReadDirectory, ReadFile, Remove, WriteFile).
 
@@ -340,11 +346,11 @@ async fn run_direct_request(
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError
 ```
 
-**Purpose**: Maps filesystem `io::Error`s into JSON-RPC error categories suitable for helper responses.
+**Purpose**: This translates low-level file-system errors into the JSON-RPC error categories used by the helper protocol. It helps callers understand whether a problem is a missing file, a bad request, or an unexpected failure.
 
-**Data flow**: Reads `err.kind()` → returns `not_found(err.to_string())` for `NotFound`, `invalid_request(err.to_string())` for `InvalidInput` or `PermissionDenied`, and `internal_error(err.to_string())` for all other kinds.
+**Data flow**: It receives an input/output error from the operating system or file-system layer. It checks the error kind, turns the message into text, and returns a JSON-RPC error: not found for missing paths, invalid request for bad input or permission denial, and internal error for everything else.
 
-**Call relations**: Used throughout `run_direct_request` so all helper operations share the same error classification.
+**Call relations**: run_direct_request uses this after every DirectFileSystem operation that can fail. The function delegates to not_found, invalid_request, or internal_error to build the final protocol error.
 
 *Call graph*: calls 3 internal fn (internal_error, invalid_request, not_found); 2 external calls (kind, to_string).
 
@@ -355,11 +361,11 @@ fn map_fs_error(err: io::Error) -> JSONRPCErrorError
 fn helper_protocol_uses_path_uris() -> serde_json::Result<()>
 ```
 
-**Purpose**: Verifies that helper request and response JSON encodes filesystem paths as `file:` URIs rather than platform-native path strings.
+**Purpose**: This test checks that helper requests and responses serialize paths as file URI strings, not as plain local path text. A file URI is a path written in URL form, starting with file:, which can represent both local and server-style paths.
 
-**Data flow**: Builds both local and UNC-style `PathUri` values, serializes a write-file request and canonicalize response containing each path, compares the resulting JSON structures to expected `serde_json::json!` values, and asserts the serialized path strings start with `file:`.
+**Data flow**: It builds example path URI values, converts helper request and response objects into JSON, and compares the JSON against the exact expected shape. It also checks that the serialized path string matches the original URI and starts with file:.
 
-**Call relations**: Documents a key protocol invariant for cross-platform helper communication.
+**Call relations**: This test exercises the serialization rules for FsHelperRequest, FsHelperResponse, and FsHelperPayload. It uses write-file and canonicalize examples because they cover paths in both incoming requests and outgoing responses.
 
 *Call graph*: calls 2 internal fn (from_path, parse); 8 external calls (new, assert!, assert_eq!, Canonicalize, WriteFile, Ok, to_value, current_dir).
 
@@ -369,13 +375,15 @@ Builds the sandboxed filesystem backend by validating sandboxable requests, invo
 
 ### `exec-server/src/fs_sandbox.rs`
 
-`domain_logic` · `sandboxed filesystem request handling`
+`orchestration` · `request handling`
 
-This file is the sandboxed counterpart to `fs_helper.rs`. `FileSystemSandboxRunner` owns `ExecServerRuntimePaths` and a sanitized helper environment map. Its `run` method takes a `FileSystemSandboxContext` plus an `FsHelperRequest`, derives a concrete native cwd, converts the context’s permissions into a native `PermissionProfile`, augments the filesystem policy so the helper can at least start and read its own runtime binaries, normalizes top-level path aliases, forces network access to `Restricted`, and then launches the current executable with `--codex-run-as-fs-helper` under a sandbox manager.
+The execution server sometimes needs a small helper process to do file-system work, such as reading or changing files. This file is the gatekeeper for that helper. It turns a requested permission profile into a real sandboxed command, starts the helper, sends it a JSON request through standard input, then reads a JSON response from standard output.
 
-Several subtle permission adjustments happen before launch. `sandbox_cwd` either uses the context’s explicit cwd or falls back to the current process cwd, but only if the permission profile has no cwd-dependent entries; otherwise it rejects the request. `helper_read_roots` collects parent directories of `codex_self_exe` and optional `codex_linux_sandbox_exe`, deduplicated. `add_helper_runtime_permissions` ensures restricted profiles include the platform-minimal read entry and grants read access to helper runtime roots only when not already allowed. `normalize_file_system_policy_root_aliases` rewrites path entries through `normalize_top_level_alias`, which canonicalizes the first existing ancestor whose normalized path differs, preserving suffixes so alias roots like symlinked top-level directories still match sandbox checks.
+The main idea is: lock the helper in a room, but make sure the room still contains the tools it needs. The code first decides the helper’s working directory. That matters because some permissions are relative to the current project folder. It then converts URI-style paths into native operating-system paths, adds minimal read access needed for platform startup and for the Codex helper binaries, normalizes path aliases, and blocks network access.
 
-Process execution is also tightly controlled. `helper_env` filters inherited environment variables to a small allowlist (`PATH`, temp vars, macOS CoreFoundation encoding, optional Bazel debug vars, and Windows case-insensitive PATH) to avoid leaking secrets into the helper. `sandbox_exec_request` asks `SandboxManager` to choose and transform a `SandboxCommand` for the helper executable. `run_command` then spawns the transformed command, writes the serialized request to stdin, waits for output, treats nonzero exit status as an internal error including stderr, and otherwise decodes `FsHelperResponse`, returning either the payload or the structured helper error. Tests focus on permission augmentation, cwd validation, helper environment filtering, and preserving helper runtime readability without weakening caller write restrictions.
+A second important job is environment cleanup. Instead of passing the whole process environment, which could include secrets like API keys, it keeps only a small allowlist such as PATH and temporary-directory variables.
+
+Finally, it asks the sandboxing layer to transform the helper command for the current platform, launches it, writes the request JSON, waits for it to finish, and converts either the helper payload or error into the server’s JSON-RPC error format.
 
 #### Function details
 
@@ -385,11 +393,11 @@ Process execution is also tightly controlled. `helper_env` filters inherited env
 fn new(runtime_paths: ExecServerRuntimePaths) -> Self
 ```
 
-**Purpose**: Constructs a sandbox runner with runtime helper paths and a sanitized environment snapshot for helper subprocesses.
+**Purpose**: Creates a runner that knows where the Codex helper programs live and what small set of environment variables may be passed to them. This is used before any sandboxed helper request can be run.
 
-**Data flow**: Takes `ExecServerRuntimePaths`, computes `helper_env()` from the current process environment, and returns `FileSystemSandboxRunner { runtime_paths, helper_env }`.
+**Data flow**: It receives runtime paths for the current executable and optional sandbox executable. It calls helper_env to build a cleaned environment map, then stores both pieces in a FileSystemSandboxRunner.
 
-**Call relations**: Used when creating the filesystem sandbox subsystem; later `run` calls reuse the prefiltered helper environment.
+**Call relations**: Construction happens before sandboxed file-system work. Later, FileSystemSandboxRunner::run uses the stored paths and environment to prepare each helper process.
 
 *Call graph*: calls 1 internal fn (helper_env); called by 2 (sandbox_exec_request_carries_helper_env, new).
 
@@ -404,11 +412,11 @@ async fn run(
     ) -> Result<FsHelperPayload, JSONRPCErrorError>
 ```
 
-**Purpose**: Executes one filesystem helper request inside a sandbox derived from the supplied filesystem sandbox context.
+**Purpose**: Runs one file-system helper request inside the correct sandbox. It is the main high-level path for turning a server request into a safely executed helper process.
 
-**Data flow**: Takes `&FileSystemSandboxContext` and `FsHelperRequest` → resolves cwd with `sandbox_cwd`, converts sandbox permissions into native `PermissionProfile`, extracts and mutates the filesystem policy, computes helper runtime read roots unless legacy landlock is requested, augments permissions with `add_helper_runtime_permissions`, normalizes root aliases, rebuilds a permission profile with restricted network, prepares a sandboxed exec request via `sandbox_exec_request`, serializes the helper request to JSON bytes, and awaits `run_command` to obtain `FsHelperPayload` or `JSONRPCErrorError`.
+**Data flow**: It takes a sandbox context and a helper request. It finds the working directory, converts requested permissions into native sandbox permissions, adds the helper’s own startup read access, normalizes path aliases, forces the network to be restricted, builds a sandbox command, serializes the request as JSON, and returns either the helper payload or a JSON-RPC error.
 
-**Call relations**: Called by higher-level sandboxed filesystem operations; it orchestrates all helper permission preparation and subprocess execution.
+**Call relations**: This is called by the broader run_sandboxed flow. It coordinates sandbox_cwd, helper_read_roots, add_helper_runtime_permissions, normalize_file_system_policy_root_aliases, sandbox_exec_request, and run_command in that order so the helper is launched only after permissions are prepared.
 
 *Call graph*: calls 7 internal fn (sandbox_exec_request, add_helper_runtime_permissions, helper_read_roots, normalize_file_system_policy_root_aliases, run_command, sandbox_cwd, from_runtime_permissions_with_enforcement); called by 1 (run_sandboxed); 2 external calls (new, to_vec).
 
@@ -424,11 +432,11 @@ fn sandbox_exec_request(
     ) -> Result<SandboxExecRequest, J
 ```
 
-**Purpose**: Builds the sandbox manager request that will launch the helper executable under the chosen sandbox implementation.
+**Purpose**: Builds the exact sandboxed command that will start the file-system helper. It hides the platform-specific sandbox setup behind one request object.
 
-**Data flow**: Takes a `PermissionProfile`, cwd `PathUri`, and sandbox context → creates `SandboxManager`, extracts runtime permissions, selects an initial sandbox with `select_initial`, builds a `SandboxCommand` pointing at `runtime_paths.codex_self_exe` with `--codex-run-as-fs-helper`, cloned helper env, and cwd, then calls `transform(...)` with enforcement flags and runtime helper paths → returns `SandboxExecRequest` or `invalid_request` on transform failure.
+**Data flow**: It receives a permission profile, a working-directory URI, and sandbox settings. It selects an appropriate sandbox, builds a command that runs the current Codex executable in helper mode, attaches the cleaned environment, and asks the sandbox manager to transform it into the final executable request.
 
-**Call relations**: Used only by `run` after permission normalization; it delegates sandbox selection and command transformation to `codex_sandboxing`.
+**Call relations**: FileSystemSandboxRunner::run calls this after permissions are finalized. It hands the resulting SandboxExecRequest back to run, which passes it to run_command for actual process execution.
 
 *Call graph*: calls 2 internal fn (to_runtime_permissions, new); called by 1 (run); 2 external calls (clone, vec!).
 
@@ -439,11 +447,11 @@ fn sandbox_exec_request(
 fn sandbox_cwd(sandbox: &FileSystemSandboxContext) -> Result<SandboxCwd, JSONRPCErrorError>
 ```
 
-**Purpose**: Determines the native and URI working directory to use for sandbox policy evaluation and helper execution.
+**Purpose**: Decides which directory the sandboxed helper should treat as its current working directory. This is important because some permissions depend on the project or current folder.
 
-**Data flow**: Reads `sandbox.cwd` → if present, converts it with `native_sandbox_cwd` and returns both URI and native path; otherwise, if the sandbox has cwd-dependent permissions, returns `invalid_request`; if not, reads the current sandbox cwd from `current_sandbox_cwd()`, validates it as absolute, converts it to `PathUri`, and returns `SandboxCwd { uri, native }`.
+**Data flow**: It reads the sandbox context. If the context already has a cwd URI, it converts it to a native absolute path. If no cwd is provided but permissions depend on cwd, it returns an invalid-request error. Otherwise it uses the server’s current sandbox cwd and converts that into both a native path and URI.
 
-**Call relations**: Called by `FileSystemSandboxRunner::run` and directly by tests; it enforces the invariant that dynamic permission aliases require an explicit cwd.
+**Call relations**: FileSystemSandboxRunner::run calls this at the start of request preparation. Several tests call it directly to confirm it accepts explicit native directories and rejects unsafe or ambiguous missing directories.
 
 *Call graph*: calls 6 internal fn (native_sandbox_cwd, current_sandbox_cwd, invalid_request, has_cwd_dependent_permissions, from_absolute_path, from_abs_path); called by 3 (run, sandbox_cwd_rejects_cwd_dependent_profile_without_context_cwd, sandbox_cwd_rejects_non_native_context_cwd_without_fallback).
 
@@ -454,11 +462,11 @@ fn sandbox_cwd(sandbox: &FileSystemSandboxContext) -> Result<SandboxCwd, JSONRPC
 fn native_sandbox_cwd(cwd: &PathUri) -> Result<AbsolutePathBuf, JSONRPCErrorError>
 ```
 
-**Purpose**: Converts a `PathUri` cwd into a native absolute path suitable for sandbox policy checks.
+**Purpose**: Converts a path URI for the working directory into an absolute path understood by the local operating system. It exists so the rest of the sandbox code can work with native paths.
 
-**Data flow**: Calls `cwd.to_abs_path()`, mapping conversion failures into `invalid_request(err.to_string())`, and returns `AbsolutePathBuf`.
+**Data flow**: It receives a PathUri. It asks the URI to become an absolute local path; if that is impossible on this operating system, it turns the problem into an invalid-request error.
 
-**Call relations**: Used by `sandbox_cwd` when the caller supplied an explicit cwd URI.
+**Call relations**: sandbox_cwd calls this when the sandbox context provides a cwd. It is the small conversion step between URI-based protocol data and native file-system sandbox rules.
 
 *Call graph*: calls 1 internal fn (to_abs_path); called by 1 (sandbox_cwd).
 
@@ -469,11 +477,11 @@ fn native_sandbox_cwd(cwd: &PathUri) -> Result<AbsolutePathBuf, JSONRPCErrorErro
 fn helper_read_roots(runtime_paths: &ExecServerRuntimePaths) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Collects the parent directories of helper runtime executables that may need explicit read permission inside restricted sandboxes.
+**Purpose**: Finds the directories the helper may need to read just to start and run. These are usually the folders containing the Codex executable and, on Linux, the sandbox executable.
 
-**Data flow**: Starts with `runtime_paths.codex_self_exe` and optionally `codex_linux_sandbox_exe`, takes each parent directory, converts it to `AbsolutePathBuf`, deduplicates by value, and returns the resulting vector.
+**Data flow**: It receives runtime paths. It looks at the parent directory of each relevant executable, keeps only absolute paths, removes duplicates, and returns those directories as read roots.
 
-**Call relations**: Used by `run` and tests to determine which runtime directories may need to be added to the filesystem policy.
+**Call relations**: FileSystemSandboxRunner::run uses this unless legacy Landlock mode is active. Tests call it to verify helper startup directories are added without disturbing existing write permissions.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 4 (run, helper_permissions_include_helper_read_root_without_additional_permissions, helper_permissions_include_linux_sandbox_alias_parent, helper_permissions_preserve_existing_writes); 2 external calls (new, once).
 
@@ -488,11 +496,11 @@ fn add_helper_runtime_permissions(
 )
 ```
 
-**Purpose**: Augments a filesystem sandbox policy so the helper can start and read its own runtime files without unnecessarily broadening access.
+**Purpose**: Adds the minimum extra file permissions the helper needs to function, without widening access more than necessary. Without this, a tightly restricted helper might fail before it can do the requested work.
 
-**Data flow**: Mutably inspects `file_system_policy` and the helper runtime roots plus cwd → if the policy lacks full-disk read access, ensures a `FileSystemSpecialPath::Minimal` read entry is present; then for each helper root, checks `can_read_path_with_cwd`, and if not already readable, pushes a `FileSystemSandboxEntry` granting read access to that path.
+**Data flow**: It receives a mutable file-system policy, helper read-root directories, and the working directory. If the policy does not already allow full-disk reads, it adds a minimal platform read entry. Then it adds read entries for helper executable directories only when the policy cannot already read them.
 
-**Call relations**: Called by `run` before sandbox launch and by tests that verify helper startup permissions.
+**Call relations**: FileSystemSandboxRunner::run calls this while preparing the final policy. The tests call it repeatedly to check that minimal reads are added, helper directories become readable, and existing write rules are preserved.
 
 *Call graph*: calls 2 internal fn (can_read_path_with_cwd, has_full_disk_read_access); called by 6 (run, helper_permissions_enable_minimal_reads_for_restricted_profile, helper_permissions_enable_minimal_reads_for_restricted_profile_with_writes, helper_permissions_include_helper_read_root_without_additional_permissions, helper_permissions_include_linux_sandbox_alias_parent, helper_permissions_preserve_existing_writes).
 
@@ -503,11 +511,11 @@ fn add_helper_runtime_permissions(
 fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystemSandboxPolicy)
 ```
 
-**Purpose**: Rewrites explicit path entries in a filesystem policy through top-level alias normalization so sandbox checks use canonicalized roots.
+**Purpose**: Rewrites path entries in a file-system policy so top-level path aliases are made consistent. This helps the sandbox recognize paths that may be spelled differently because of symlinks or platform aliases.
 
-**Data flow**: Mutably iterates `file_system_policy.entries`, and for each `FileSystemPath::Path { path }`, replaces the path with `normalize_top_level_alias(path.clone())`.
+**Data flow**: It receives a mutable file-system policy. For every entry that names a concrete path, it replaces that path with the result of normalize_top_level_alias. Special symbolic paths are left unchanged.
 
-**Call relations**: Used by `run` after helper permission augmentation to reduce mismatches caused by symlinked root aliases.
+**Call relations**: FileSystemSandboxRunner::run calls this after helper permissions are added and before the sandbox command is built. It delegates the actual path check to normalize_top_level_alias.
 
 *Call graph*: calls 1 internal fn (normalize_top_level_alias); called by 1 (run).
 
@@ -518,11 +526,11 @@ fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystem
 fn normalize_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf
 ```
 
-**Purpose**: Canonicalizes the first existing ancestor of a path whose normalized form differs, preserving the remaining suffix, to collapse top-level alias paths onto their canonical roots.
+**Purpose**: Looks for the first existing ancestor of a path whose canonical spelling differs, then rebuilds the full path from that normalized ancestor. This is mainly to avoid sandbox mismatches caused by path aliases.
 
-**Data flow**: Converts `AbsolutePathBuf` to `PathBuf`, walks its ancestors, skips nonexistent ancestors, canonicalizes existing ones with `canonicalize_preserving_symlinks`, ignores unchanged ancestors, computes the suffix below the changed ancestor, and if the recombined normalized path is absolute returns it; otherwise falls back to the original path.
+**Data flow**: It receives an absolute path. It walks upward through that path’s ancestors, checks which ancestors exist, tries to canonicalize them while preserving symlink behavior, and if it finds a different spelling, appends the original remaining suffix to that normalized ancestor. If nothing useful is found, it returns the original path.
 
-**Call relations**: Used by `normalize_file_system_policy_root_aliases`; it is a best-effort normalization step rather than a strict requirement.
+**Call relations**: normalize_file_system_policy_root_aliases calls this for each concrete policy path. It does not launch anything or change the file system; it only returns a better path spelling.
 
 *Call graph*: calls 2 internal fn (from_absolute_path, to_path_buf); called by 1 (normalize_file_system_policy_root_aliases); 2 external calls (canonicalize_preserving_symlinks, symlink_metadata).
 
@@ -533,11 +541,11 @@ fn normalize_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf
 fn helper_env() -> HashMap<String, String>
 ```
 
-**Purpose**: Builds the helper subprocess environment by filtering the current process environment through the allowlist rules.
+**Purpose**: Builds the environment variable map that the helper process is allowed to see. This protects secrets by not forwarding the server’s entire environment.
 
-**Data flow**: Reads `std::env::vars_os()`, forwards the iterator to `helper_env_from_vars`, and returns the resulting `HashMap<String, String>`.
+**Data flow**: It reads the current process environment and passes all variables through helper_env_from_vars. The result is a map containing only allowlisted variables and their string values.
 
-**Call relations**: Called by `FileSystemSandboxRunner::new` and tested directly.
+**Call relations**: FileSystemSandboxRunner::new calls this once when the runner is created. A test also calls it directly to ensure it matches the same allowlist rules used by helper_env_from_vars.
 
 *Call graph*: calls 1 internal fn (helper_env_from_vars); called by 2 (new, helper_env_carries_only_allowlisted_runtime_vars); 1 external calls (vars_os).
 
@@ -550,11 +558,11 @@ fn helper_env_from_vars(
 ) -> HashMap<String, String>
 ```
 
-**Purpose**: Filters an arbitrary environment-variable iterator down to the subset allowed to reach the helper subprocess.
+**Purpose**: Filters any given list of environment variables down to the safe helper allowlist. This makes the filtering easy to test without depending on the real machine environment.
 
-**Data flow**: Consumes an iterator of `(OsString, OsString)` pairs, converts keys and values lossily to strings, keeps only entries whose key passes `helper_env_key_is_allowed`, and collects them into a `HashMap<String, String>`.
+**Data flow**: It receives key-value environment pairs. For each key, it asks helper_env_key_is_allowed whether the variable may pass; allowed keys and values are converted to strings and collected into a map, while all others are dropped.
 
-**Call relations**: Used by `helper_env` and by tests that verify filtering behavior with synthetic environments.
+**Call relations**: helper_env uses this for the real environment. Platform-specific tests feed it sample variables to prove PATH and temp variables survive while secrets such as API keys do not.
 
 *Call graph*: called by 4 (helper_env, helper_env_preserves_corefoundation_text_encoding, helper_env_preserves_path_for_system_bwrap_discovery_without_leaking_secrets, helper_env_preserves_windows_path_key_for_system_bwrap_discovery); 1 external calls (into_iter).
 
@@ -565,11 +573,11 @@ fn helper_env_from_vars(
 fn helper_env_key_is_allowed(key: &str) -> bool
 ```
 
-**Purpose**: Decides whether a single environment-variable name may be inherited by the helper subprocess.
+**Purpose**: Answers whether one environment variable name is safe and useful for the helper. It keeps startup necessities and rejects unrelated variables that may contain secrets.
 
-**Data flow**: Checks membership in `FS_HELPER_ENV_ALLOWLIST`, allows `__CF_USER_TEXT_ENCODING` on macOS, allows Bazel/bwrap debug variables when enabled, and allows case-insensitive `PATH` on Windows → returns a boolean.
+**Data flow**: It receives a variable name. It checks the fixed allowlist, adds a macOS startup variable when on macOS, adds Bazel test variables in debug Bazel builds, and treats PATH case-insensitively on Windows.
 
-**Call relations**: Used by `helper_env_from_vars` as the central allowlist predicate.
+**Call relations**: helper_env_from_vars relies on this decision for every environment variable. It calls bazel_bwrap_env_key_is_allowed for the special debug-build Bazel case.
 
 *Call graph*: calls 1 internal fn (bazel_bwrap_env_key_is_allowed); 1 external calls (cfg!).
 
@@ -580,11 +588,11 @@ fn helper_env_key_is_allowed(key: &str) -> bool
 fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool
 ```
 
-**Purpose**: In debug builds, conditionally allows a small set of Bazel/runfiles variables needed for locating `bwrap` under Bazel test environments.
+**Purpose**: Allows a small set of Bazel test environment variables needed to find bubblewrap-style sandbox tooling during debug builds. In non-debug builds, it always rejects them.
 
-**Data flow**: Checks whether `option_env!("BAZEL_PACKAGE")` is set and whether `key` is in `FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST`; returns that boolean. In non-debug builds the alternate definition always returns false.
+**Data flow**: It receives an environment variable name. In debug builds, it checks whether the code is running under a Bazel package and whether the key is in the Bazel allowlist; otherwise it returns false.
 
-**Call relations**: Called only from `helper_env_key_is_allowed`.
+**Call relations**: helper_env_key_is_allowed calls this as one part of its environment filtering decision. This keeps test-only sandbox discovery support out of normal release behavior.
 
 *Call graph*: called by 1 (helper_env_key_is_allowed); 1 external calls (option_env!).
 
@@ -598,11 +606,11 @@ async fn run_command(
 ) -> Result<FsHelperPayload, JSONRPCErrorError>
 ```
 
-**Purpose**: Executes the prepared sandboxed helper command, sends it the serialized request on stdin, and decodes its stdout response.
+**Purpose**: Actually starts the prepared sandboxed helper process, sends it the request, and reads its answer. This is the point where the prepared command becomes a running child process.
 
-**Data flow**: Takes `SandboxExecRequest` and request JSON bytes → spawns the child with `spawn_command`, takes piped stdin or returns internal error, writes all request bytes, shuts down stdin, waits for full output, returns internal error with exit status and trimmed stderr if the process failed, otherwise deserializes `FsHelperResponse` from stdout and returns either the payload or the structured helper error.
+**Data flow**: It receives a SandboxExecRequest and serialized request JSON. It spawns the process, writes the JSON to the child’s standard input, closes input, waits for output, checks the exit status, decodes the child’s standard output as an FsHelperResponse, and returns either the payload or the helper’s error.
 
-**Call relations**: Called by `FileSystemSandboxRunner::run` after sandbox preparation; it delegates process creation to `spawn_command`.
+**Call relations**: FileSystemSandboxRunner::run calls this after sandbox_exec_request has built the safe command. run_command delegates process creation to spawn_command and turns failed process status or invalid JSON into internal errors.
 
 *Call graph*: calls 2 internal fn (spawn_command, internal_error); called by 1 (run); 2 external calls (format!, from_slice).
 
@@ -621,11 +629,11 @@ fn spawn_command(
 ) -> Result<tokio::process::Child, JSONRPCErrorError>
 ```
 
-**Purpose**: Turns a transformed sandbox exec request into a configured `tokio::process::Command` and spawns it with piped stdio.
+**Purpose**: Turns the sandbox execution request into a Tokio child process, which is an asynchronously managed operating-system process. It sets up clean input, output, error streams, directory, and environment.
 
-**Data flow**: Destructures `SandboxExecRequest` to extract argv, cwd, env, and optional `arg0` → rejects empty argv as `invalid_request`, creates `Command::new(program)`, sets Unix `arg0` when present, appends args, sets current dir, clears inherited env, installs the filtered env map, pipes stdin/stdout/stderr, enables `kill_on_drop(true)`, and spawns the child, mapping I/O errors through `io_error`.
+**Data flow**: It receives a SandboxExecRequest and extracts the command arguments, cwd, environment, and optional Unix arg0. If the command is empty, it returns an invalid request. Otherwise it creates a process with cleared environment, the supplied environment only, piped stdin/stdout/stderr, and kill-on-drop enabled, then starts it.
 
-**Call relations**: Used only by `run_command`; it is the low-level process-launch helper.
+**Call relations**: run_command calls this before writing the helper request. The child process it returns is then used by run_command to send JSON and collect the helper response.
 
 *Call graph*: calls 1 internal fn (invalid_request); called by 1 (run_command); 2 external calls (new, piped).
 
@@ -636,11 +644,11 @@ fn spawn_command(
 fn io_error(err: std::io::Error) -> JSONRPCErrorError
 ```
 
-**Purpose**: Converts a plain I/O error into an internal JSON-RPC error for sandbox helper orchestration failures.
+**Purpose**: Converts a low-level input/output error into the JSON-RPC error shape used by the server. This gives callers a consistent error format.
 
-**Data flow**: Formats `err.to_string()` into `internal_error(...)` and returns the resulting `JSONRPCErrorError`.
+**Data flow**: It receives a std::io::Error, turns it into text, wraps that text as an internal JSON-RPC error, and returns it.
 
-**Call relations**: Used by cwd fallback, process spawning, stdin writes, and wait/output collection in this file.
+**Call relations**: The command-running path uses this kind of conversion when file, pipe, directory, or process operations fail. It keeps those failures from leaking as raw Rust errors.
 
 *Call graph*: calls 1 internal fn (internal_error); 1 external calls (to_string).
 
@@ -651,11 +659,11 @@ fn io_error(err: std::io::Error) -> JSONRPCErrorError
 fn json_error(err: serde_json::Error) -> JSONRPCErrorError
 ```
 
-**Purpose**: Converts helper request/response JSON encoding or decoding failures into internal JSON-RPC errors with helper-specific context.
+**Purpose**: Converts JSON encoding or decoding failures into the server’s JSON-RPC error format. This is used when talking to the helper through JSON messages fails.
 
-**Data flow**: Formats the serde error into `failed to encode or decode fs sandbox helper message: ...`, wraps it with `internal_error(...)`, and returns it.
+**Data flow**: It receives a serde_json error. It formats a clear message saying the helper message could not be encoded or decoded, wraps it as an internal error, and returns it.
 
-**Call relations**: Used when serializing helper requests and deserializing helper responses.
+**Call relations**: The request-and-response flow uses this when serializing the helper request or parsing the helper response. That keeps protocol failures reported in the same style as other server errors.
 
 *Call graph*: calls 1 internal fn (internal_error); 1 external calls (format!).
 
@@ -666,11 +674,11 @@ fn json_error(err: serde_json::Error) -> JSONRPCErrorError
 fn helper_permissions_enable_minimal_reads_for_restricted_profile()
 ```
 
-**Purpose**: Verifies that restricted filesystem policies gain the platform-minimal read permission needed for helper startup.
+**Purpose**: Checks that a restricted policy with no entries still gets the platform’s minimal read permissions for helper startup.
 
-**Data flow**: Builds a restricted policy with no entries, calls `add_helper_runtime_permissions`, and asserts the policy now includes platform defaults.
+**Data flow**: It creates a temporary absolute cwd and an empty restricted policy, applies add_helper_runtime_permissions, then asserts the policy includes platform default reads.
 
-**Call relations**: Exercises the minimal-read insertion branch.
+**Call relations**: This test exercises add_helper_runtime_permissions directly to protect the startup-read behavior used by FileSystemSandboxRunner::run.
 
 *Call graph*: calls 2 internal fn (add_helper_runtime_permissions, from_absolute_path); 4 external calls (new, assert!, restricted_policy, temp_dir).
 
@@ -681,11 +689,11 @@ fn helper_permissions_enable_minimal_reads_for_restricted_profile()
 fn helper_permissions_enable_minimal_reads_for_restricted_profile_with_writes()
 ```
 
-**Purpose**: Checks that adding helper startup permissions still enables minimal reads even when the original policy already contains write entries.
+**Purpose**: Checks that adding helper read permissions still happens when the restricted policy already contains write access.
 
-**Data flow**: Builds a restricted policy with one writable path, augments it, and asserts platform defaults are included.
+**Data flow**: It creates a cwd, adds a writable path entry, calls add_helper_runtime_permissions, and asserts that platform default reads are included.
 
-**Call relations**: Covers the same minimal-read logic in the presence of existing writes.
+**Call relations**: This test supports the same helper-permission path used by FileSystemSandboxRunner::run, with the extra case that write permissions are already present.
 
 *Call graph*: calls 2 internal fn (add_helper_runtime_permissions, from_absolute_path); 4 external calls (assert!, restricted_policy, temp_dir, vec!).
 
@@ -696,11 +704,11 @@ fn helper_permissions_enable_minimal_reads_for_restricted_profile_with_writes()
 fn helper_permissions_preserve_existing_writes()
 ```
 
-**Purpose**: Verifies that helper permission augmentation adds needed read access without removing or weakening existing write permissions.
+**Purpose**: Verifies that helper startup read permissions do not remove or weaken an existing write permission.
 
-**Data flow**: Builds runtime paths and a restricted policy with one writable path, augments it using computed helper roots, and asserts the helper runtime directory is readable while the original writable path remains writable.
+**Data flow**: It builds runtime paths from the current executable, creates a policy with one writable directory, adds helper read roots, and then checks both that the helper directory is readable and the original directory remains writable.
 
-**Call relations**: Exercises `helper_read_roots` plus `add_helper_runtime_permissions` on a realistic policy.
+**Call relations**: This test calls helper_read_roots and add_helper_runtime_permissions together, mirroring the preparation sequence inside FileSystemSandboxRunner::run.
 
 *Call graph*: calls 4 internal fn (add_helper_runtime_permissions, helper_read_roots, new, from_absolute_path); 5 external calls (assert!, restricted_policy, current_exe, temp_dir, vec!).
 
@@ -711,11 +719,11 @@ fn helper_permissions_preserve_existing_writes()
 fn helper_env_carries_only_allowlisted_runtime_vars()
 ```
 
-**Purpose**: Checks that `helper_env()` exactly matches filtering the current process environment through the allowlist predicate.
+**Purpose**: Confirms that helper_env returns exactly the current environment variables allowed by the filtering rule.
 
-**Data flow**: Computes `helper_env()`, independently filters `std::env::vars_os()` with `helper_env_key_is_allowed`, collects the expected map, and asserts equality.
+**Data flow**: It calls helper_env, independently filters the real environment using helper_env_key_is_allowed, and compares the two maps.
 
-**Call relations**: Validates the production helper environment snapshot logic.
+**Call relations**: This test checks the environment setup used by FileSystemSandboxRunner::new before any helper command is built.
 
 *Call graph*: calls 1 internal fn (helper_env); 2 external calls (assert_eq!, vars_os).
 
@@ -726,11 +734,11 @@ fn helper_env_carries_only_allowlisted_runtime_vars()
 fn helper_env_preserves_path_for_system_bwrap_discovery_without_leaking_secrets()
 ```
 
-**Purpose**: Ensures helper environment filtering keeps path/temp variables needed for startup while dropping unrelated sensitive variables.
+**Purpose**: Checks that PATH and temporary-directory variables survive filtering, while home directories, API keys, and proxy settings are dropped.
 
-**Data flow**: Feeds a synthetic environment containing PATH/temp vars plus HOME, API key, and proxy settings into `helper_env_from_vars`, then asserts only the allowlisted path/temp entries remain.
+**Data flow**: It feeds sample environment variables into helper_env_from_vars and expects a map containing only PATH, TMPDIR, TMP, and TEMP.
 
-**Call relations**: Exercises `helper_env_from_vars` and `helper_env_key_is_allowed` with a controlled input set.
+**Call relations**: This test focuses on helper_env_from_vars, the filter used by helper_env, to guard against accidentally passing sensitive environment variables to the sandboxed helper.
 
 *Call graph*: calls 1 internal fn (helper_env_from_vars); 1 external calls (assert_eq!).
 
@@ -741,11 +749,11 @@ fn helper_env_preserves_path_for_system_bwrap_discovery_without_leaking_secrets(
 fn helper_env_preserves_corefoundation_text_encoding()
 ```
 
-**Purpose**: On macOS, verifies that the CoreFoundation text-encoding variable is preserved for helper startup.
+**Purpose**: On macOS, checks that the special CoreFoundation text-encoding variable is preserved for helper startup.
 
-**Data flow**: Builds a synthetic environment containing `__CF_USER_TEXT_ENCODING` and `HOME`, filters it, and asserts only the CoreFoundation variable remains.
+**Data flow**: It passes a macOS-specific encoding variable and HOME into helper_env_from_vars, then expects only the encoding variable to remain.
 
-**Call relations**: Covers the macOS-specific allowlist branch.
+**Call relations**: This platform-specific test protects the macOS branch inside helper_env_key_is_allowed.
 
 *Call graph*: calls 1 internal fn (helper_env_from_vars); 1 external calls (assert_eq!).
 
@@ -756,11 +764,11 @@ fn helper_env_preserves_corefoundation_text_encoding()
 fn helper_env_preserves_windows_path_key_for_system_bwrap_discovery()
 ```
 
-**Purpose**: On Windows, verifies that case-insensitive PATH keys are preserved while similarly named variables are not.
+**Purpose**: On Windows, checks that PATH is kept even when its casing is written as Path, while similar-looking unsafe names are rejected.
 
-**Data flow**: Builds a synthetic environment containing `Path`, `PATH_INJECTION`, and a secret, filters it, and asserts only `Path` remains.
+**Data flow**: It sends sample Windows-style environment variables into helper_env_from_vars and expects only the Path entry to remain.
 
-**Call relations**: Covers the Windows-specific PATH handling branch.
+**Call relations**: This platform-specific test protects the Windows case-insensitive PATH rule inside helper_env_key_is_allowed.
 
 *Call graph*: calls 1 internal fn (helper_env_from_vars); 1 external calls (assert_eq!).
 
@@ -771,11 +779,11 @@ fn helper_env_preserves_windows_path_key_for_system_bwrap_discovery()
 fn sandbox_exec_request_carries_helper_env()
 ```
 
-**Purpose**: Checks that the sandbox exec request built for the helper includes the filtered PATH entry from the current environment.
+**Purpose**: Checks that the sandbox execution request includes the cleaned helper environment, especially PATH.
 
-**Data flow**: Finds the current PATH-like variable, builds runtime paths, runner, cwd, restricted permission profile, and sandbox context, calls `sandbox_exec_request`, and asserts the resulting request env contains the same PATH key/value.
+**Data flow**: It finds PATH in the current environment, builds runtime paths and a runner, creates a restricted permission profile with a writable cwd, asks sandbox_exec_request to build the command, and asserts the request environment contains the expected PATH value.
 
-**Call relations**: Exercises `FileSystemSandboxRunner::new` and `sandbox_exec_request` together.
+**Call relations**: This test calls FileSystemSandboxRunner::new and then FileSystemSandboxRunner::sandbox_exec_request, confirming that environment prepared at construction reaches the final command.
 
 *Call graph*: calls 5 internal fn (new, new, from_runtime_permissions, current_dir, from_abs_path); 6 external calls (assert_eq!, restricted_policy, sandbox_context_with_cwd, current_exe, vars_os, vec!).
 
@@ -786,11 +794,11 @@ fn sandbox_exec_request_carries_helper_env()
 fn sandbox_cwd_uses_context_cwd()
 ```
 
-**Purpose**: Verifies that an explicit sandbox context cwd is used directly.
+**Purpose**: Checks that an explicit cwd in the sandbox context is used as the sandbox working directory.
 
-**Data flow**: Builds an absolute temp-dir cwd URI and a cwd-dependent policy, wraps them in a sandbox context, calls `sandbox_cwd`, and asserts the returned `SandboxCwd` matches the supplied URI and native path.
+**Data flow**: It builds an absolute temporary cwd, converts it to a URI, creates a cwd-dependent policy and context, then expects sandbox_cwd to return both the same URI and native path.
 
-**Call relations**: Exercises the explicit-cwd branch of `sandbox_cwd`.
+**Call relations**: This test protects the first branch of sandbox_cwd, which FileSystemSandboxRunner::run depends on when permissions are relative to a project directory.
 
 *Call graph*: calls 2 internal fn (from_absolute_path, from_abs_path); 5 external calls (assert_eq!, restricted_policy, sandbox_context_with_cwd, temp_dir, vec!).
 
@@ -801,11 +809,11 @@ fn sandbox_cwd_uses_context_cwd()
 fn sandbox_cwd_rejects_non_native_context_cwd_without_fallback()
 ```
 
-**Purpose**: Ensures that a cwd URI invalid on the current platform is rejected rather than silently falling back.
+**Purpose**: Checks that a cwd URI that is not valid for the current operating system is rejected rather than silently replaced.
 
-**Data flow**: Builds a non-native `PathUri`, wraps it in a cwd-dependent sandbox context, calls `sandbox_cwd`, and asserts the returned `invalid_request` error matches the platform-specific message.
+**Data flow**: It creates a deliberately non-native cwd URI, builds a sandbox context using it, calls sandbox_cwd, and compares the returned error to the expected invalid-request error.
 
-**Call relations**: Covers the `native_sandbox_cwd` failure path.
+**Call relations**: This test calls sandbox_cwd directly to ensure native_sandbox_cwd failures are visible to callers instead of falling back to some other directory.
 
 *Call graph*: calls 1 internal fn (sandbox_cwd); 5 external calls (assert_eq!, non_native_cwd, restricted_policy, sandbox_context_with_cwd, vec!).
 
@@ -816,11 +824,11 @@ fn sandbox_cwd_rejects_non_native_context_cwd_without_fallback()
 fn sandbox_cwd_rejects_cwd_dependent_profile_without_context_cwd()
 ```
 
-**Purpose**: Verifies that sandbox contexts with dynamic/cwd-dependent permissions must provide an explicit cwd.
+**Purpose**: Checks that cwd-dependent permissions require an explicit cwd. This prevents relative project-root permissions from being interpreted against the wrong directory.
 
-**Data flow**: Builds a restricted policy using `project_roots`, converts it into a sandbox context without cwd, calls `sandbox_cwd`, and asserts the error message about requiring cwd.
+**Data flow**: It creates a policy that refers to project roots, builds a sandbox context without a cwd, calls sandbox_cwd, and asserts the error message explains that cwd is required.
 
-**Call relations**: Exercises the no-cwd rejection branch in `sandbox_cwd`.
+**Call relations**: This test protects the guard in sandbox_cwd that FileSystemSandboxRunner::run relies on before preparing permissions.
 
 *Call graph*: calls 4 internal fn (sandbox_cwd, from_permission_profile, from_runtime_permissions, restricted); 2 external calls (assert_eq!, vec!).
 
@@ -831,11 +839,11 @@ fn sandbox_cwd_rejects_cwd_dependent_profile_without_context_cwd()
 fn helper_permissions_include_helper_read_root_without_additional_permissions()
 ```
 
-**Purpose**: Checks that helper runtime directories are added as readable roots when the original policy lacks them.
+**Purpose**: Checks that the helper executable’s parent directory becomes readable even when the original policy has no extra permissions.
 
-**Data flow**: Builds runtime paths and an empty restricted policy, augments it with helper roots, and asserts the helper executable’s parent directory becomes readable.
+**Data flow**: It builds runtime paths from the current executable, creates a restricted policy, adds helper runtime permissions, and asserts the executable’s parent directory can be read.
 
-**Call relations**: Exercises the helper-root insertion branch of `add_helper_runtime_permissions`.
+**Call relations**: This test combines helper_read_roots and add_helper_runtime_permissions, matching the helper-read-root logic used in FileSystemSandboxRunner::run.
 
 *Call graph*: calls 4 internal fn (add_helper_runtime_permissions, helper_read_roots, new, from_absolute_path); 5 external calls (new, assert!, restricted_policy, current_exe, temp_dir).
 
@@ -846,11 +854,11 @@ fn helper_permissions_include_helper_read_root_without_additional_permissions()
 fn helper_permissions_include_linux_sandbox_alias_parent()
 ```
 
-**Purpose**: Verifies that both the main executable parent and the Linux sandbox alias parent are granted read access when they differ.
+**Purpose**: Checks that both the Codex executable directory and a separate Linux sandbox executable directory are added as helper read roots.
 
-**Data flow**: Builds runtime paths with distinct `codex_self_exe` and `codex_linux_sandbox_exe` parents, augments an empty restricted policy, and asserts both parent directories are readable.
+**Data flow**: It creates temporary fake executable paths in different parent directories, builds runtime paths, applies helper runtime permissions, and asserts both parent directories are readable.
 
-**Call relations**: Exercises deduplicated multi-root handling in `helper_read_roots` and permission insertion.
+**Call relations**: This test protects helper_read_roots behavior for installations where the Linux sandbox executable is stored outside the main Codex executable directory.
 
 *Call graph*: calls 4 internal fn (add_helper_runtime_permissions, helper_read_roots, new, from_absolute_path); 5 external calls (new, assert!, restricted_policy, temp_dir, tempdir).
 
@@ -861,11 +869,11 @@ fn helper_permissions_include_linux_sandbox_alias_parent()
 fn restricted_policy(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxPolicy
 ```
 
-**Purpose**: Small test helper that constructs a restricted filesystem policy from explicit entries.
+**Purpose**: Creates a restricted file-system policy for tests. It keeps test setup short and readable.
 
-**Data flow**: Forwards the provided entries into `FileSystemSandboxPolicy::restricted` and returns the policy.
+**Data flow**: It receives a list of file-system sandbox entries and returns a restricted FileSystemSandboxPolicy containing them.
 
-**Call relations**: Used by many tests in this module to keep setup concise.
+**Call relations**: Many tests call this helper before exercising add_helper_runtime_permissions, sandbox_cwd, or sandbox_exec_request.
 
 *Call graph*: calls 1 internal fn (restricted).
 
@@ -879,11 +887,11 @@ fn sandbox_context_with_cwd(
     ) -> crate::FileSystemSandboxContext
 ```
 
-**Purpose**: Small test helper that builds a filesystem sandbox context from a policy and explicit cwd.
+**Purpose**: Builds a sandbox context with both permissions and an explicit working directory for tests.
 
-**Data flow**: Creates a `PermissionProfile` from the supplied policy with restricted network, then wraps it with `from_permission_profile_with_cwd(cwd)` and returns the context.
+**Data flow**: It receives a file-system policy and cwd URI, wraps the policy with a restricted network setting into a permission profile, then creates a FileSystemSandboxContext using that cwd.
 
-**Call relations**: Used by cwd-related tests and sandbox exec request tests.
+**Call relations**: Tests use this helper when they need sandbox_cwd or sandbox_exec_request to see an explicit cwd, matching the shape used by real requests.
 
 *Call graph*: calls 2 internal fn (from_permission_profile_with_cwd, from_runtime_permissions).
 
@@ -894,11 +902,11 @@ fn sandbox_context_with_cwd(
 fn non_native_cwd() -> PathUri
 ```
 
-**Purpose**: Builds a `PathUri` that is intentionally invalid as a native path on the current platform.
+**Purpose**: Creates a cwd URI that should be invalid on the current operating system. This is used to test rejection of non-native paths.
 
-**Data flow**: Chooses a UNC-style URI on Unix or a Unix-style URI on Windows, parses it as `PathUri`, and returns it.
+**Data flow**: It chooses a Unix-incompatible URI on Windows or a Windows/network-style URI on Unix, parses it as a PathUri, and returns it.
 
-**Call relations**: Used by the non-native cwd rejection test.
+**Call relations**: tests::sandbox_cwd_rejects_non_native_context_cwd_without_fallback calls this to feed sandbox_cwd a path it must reject.
 
 *Call graph*: calls 1 internal fn (parse).
 
@@ -909,11 +917,11 @@ fn non_native_cwd() -> PathUri
 fn path_entry(path: AbsolutePathBuf, access: FileSystemAccessMode) -> FileSystemSandboxEntry
 ```
 
-**Purpose**: Small test helper that creates a path-based filesystem sandbox entry with the requested access mode.
+**Purpose**: Builds a concrete path permission entry for tests. It avoids repeating the full struct shape in each test.
 
-**Data flow**: Wraps an `AbsolutePathBuf` and `FileSystemAccessMode` into `FileSystemSandboxEntry { path: FileSystemPath::Path { path }, access }`.
+**Data flow**: It receives an absolute path and an access mode such as read or write. It returns a FileSystemSandboxEntry that applies that access mode to the path.
 
-**Call relations**: Used by permission-augmentation tests.
+**Call relations**: Tests use this helper when constructing restricted policies for add_helper_runtime_permissions and sandbox_exec_request scenarios.
 
 
 ##### `tests::special_entry`  (lines 676–684)
@@ -925,22 +933,22 @@ fn special_entry(
     ) -> FileSystemSandboxEntry
 ```
 
-**Purpose**: Small test helper that creates a special-path filesystem sandbox entry with the requested access mode.
+**Purpose**: Builds a special symbolic path permission entry for tests, such as project-root-based permissions. This helps test permissions that depend on cwd.
 
-**Data flow**: Wraps a `FileSystemSpecialPath` and `FileSystemAccessMode` into `FileSystemSandboxEntry { path: FileSystemPath::Special { value }, access }`.
+**Data flow**: It receives a special path value and an access mode. It returns a FileSystemSandboxEntry using that special path rather than a fixed absolute path.
 
-**Call relations**: Used by cwd-dependent permission tests.
+**Call relations**: cwd-focused tests use this helper to create policies that make sandbox_cwd’s cwd requirement meaningful.
 
 
 ### `exec-server/src/sandboxed_file_system.rs`
 
-`domain_logic` · `filesystem request handling under sandboxed execution`
+`io_transport` · `request handling`
 
-This file provides the sandboxed filesystem backend used when operations must execute inside a platform sandbox. `SandboxedFileSystem` owns a `FileSystemSandboxRunner`, created from `ExecServerRuntimePaths`, which is responsible for launching or contacting the helper. The private `run_sandboxed` method is the common transport step: it sends an `FsHelperRequest` plus `FileSystemSandboxContext` to the runner and converts helper-side `JSONRPCErrorError` values into `tokio::io::Error` via `map_sandbox_error`.
+This file is the guarded doorway between the exec server and the local file system. Instead of opening or changing files directly, it sends each request to a sandbox helper process through FileSystemSandboxRunner. The sandbox is like a security desk: every file action must show both a valid local path and a sandbox policy that allows the action.
 
-Each concrete operation follows the same pattern: require a sandbox context whose policy actually demands sandbox execution, reject non-native URIs by forcing `PathUri::to_abs_path()`, build the corresponding helper request with `sandbox: None` inside the payload, await the helper response, and then extract the typed payload with `expect_*` methods. `read_file` and `write_file` additionally translate file contents through base64 (`data_base64`) because the helper protocol is JSON-RPC based. `get_metadata` and `read_directory` map protocol response structs into local `FileMetadata` and `ReadDirectoryEntry` values.
+The main type, SandboxedFileSystem, implements the ExecutorFileSystem interface, so the rest of the server can ask for normal file operations without knowing the details of the sandbox machinery. For every operation, the code first requires a real platform sandbox context. Then it checks that the PathUri can be turned into a native absolute path, which rejects non-local or unsupported URI-style paths. Only after those checks does it build a helper request, run it inside the sandbox, and translate the response into the server’s normal data types.
 
-A deliberate limitation appears in `read_file_stream`: streaming reads are unsupported under platform sandboxing and immediately return `io::ErrorKind::Unsupported`. Error mapping preserves not-found and invalid-input semantics from helper JSON-RPC codes while collapsing everything else to `io::Error::other`. The key invariants are that only native filesystem URIs are accepted and that callers must supply a sandbox context whose policy actually runs in the sandbox.
+File contents are sent through the helper as base64 text, which is a safe way to carry raw bytes inside JSON-style messages. One important limitation is that streaming reads are deliberately not supported here, because this sandbox helper only supports whole-file read requests. Sandbox error codes are also translated into ordinary input/output errors, so callers get familiar results such as “not found” or “invalid input.”
 
 #### Function details
 
@@ -950,11 +958,11 @@ A deliberate limitation appears in `read_file_stream`: streaming reads are unsup
 fn new(runtime_paths: ExecServerRuntimePaths) -> Self
 ```
 
-**Purpose**: Constructs a sandboxed filesystem backend with a helper runner configured from runtime executable paths.
+**Purpose**: Creates a SandboxedFileSystem ready to run file operations through the sandbox helper. It uses the server’s runtime paths to set up the helper runner that will later execute sandboxed requests.
 
-**Data flow**: Takes `ExecServerRuntimePaths`, passes them to `FileSystemSandboxRunner::new`, stores the resulting runner in `sandbox_runner`, and returns the initialized `SandboxedFileSystem`.
+**Data flow**: It receives ExecServerRuntimePaths, which say where runtime support files live. It passes those paths into FileSystemSandboxRunner::new and stores the resulting runner inside a new SandboxedFileSystem. The result is a reusable file-system object.
 
-**Call relations**: Called when the system selects the sandboxed filesystem implementation. All later filesystem methods delegate transport work through the runner created here.
+**Call relations**: This is the setup step. It is called when code builds an executor file system with runtime paths, and also by tests that check sandboxed path behavior. After construction, the operation methods use the stored runner through run_sandboxed.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (with_runtime_paths, sandboxed_file_system_rejects_non_native_uri_as_invalid_input).
 
@@ -969,11 +977,11 @@ async fn run_sandboxed(
     ) -> FileSystemResult<FsHelperPayload>
 ```
 
-**Purpose**: Executes one helper request inside the platform sandbox and normalizes helper JSON-RPC errors into I/O errors.
+**Purpose**: Sends one file-system helper request into the platform sandbox and returns the helper’s answer. It centralizes the common step of running the sandbox and converting sandbox protocol errors into normal I/O errors.
 
-**Data flow**: Accepts a borrowed `FileSystemSandboxContext` and an `FsHelperRequest`, awaits `self.sandbox_runner.run(sandbox, request)`, and maps any `JSONRPCErrorError` failure through `map_sandbox_error`, returning `FsHelperPayload` on success.
+**Data flow**: It receives a sandbox context and a helper request, such as “read this file” or “copy this path.” It asks the FileSystemSandboxRunner to run that request under the sandbox. If the runner reports a JSON-RPC error, it turns that into an io::Error; otherwise it returns the helper payload.
 
-**Call relations**: This is the shared execution path used by every concrete sandboxed filesystem operation in the file.
+**Call relations**: All real file operations call this after they have checked the sandbox and path. It hands the request off to FileSystemSandboxRunner::run, then gives the response back to methods such as read_file, write_file, copy, and remove.
 
 *Call graph*: calls 1 internal fn (run); called by 8 (canonicalize, copy, create_directory, get_metadata, read_directory, read_file, remove, write_file).
 
@@ -988,11 +996,11 @@ fn canonicalize(
     ) -> ExecutorFileSystemFuture<'a, PathUri>
 ```
 
-**Purpose**: Canonicalizes a native path by asking the sandbox helper to resolve it inside the sandbox context.
+**Purpose**: Finds the normalized, real version of a path while staying inside the sandbox rules. Canonicalizing is useful for resolving things like relative pieces or symbolic links into a clear absolute path.
 
-**Data flow**: Takes a `PathUri` and optional sandbox, requires a real platform sandbox via `require_platform_sandbox`, validates the URI is native with `validate_native_path`, builds `FsHelperRequest::Canonicalize(FsCanonicalizeParams { path: path.clone(), sandbox: None })`, runs it through `run_sandboxed`, extracts the canonicalize payload with `expect_canonicalize`, maps helper errors, and returns `response.path`.
+**Data flow**: It receives a PathUri and an optional sandbox context. It first requires that the sandbox is present and suitable, then checks that the path is a native local path. It sends a Canonicalize request through run_sandboxed and returns the path from the helper response.
 
-**Call relations**: Exposed through the `ExecutorFileSystem` trait implementation. It follows the standard validate-then-helper pattern shared by the other operations.
+**Call relations**: This operation follows the standard pattern used by this file: require_platform_sandbox, validate_native_path, then run_sandboxed. The public ExecutorFileSystem call boxes this asynchronous work so callers can use it through the shared file-system interface.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, Canonicalize, clone).
 
@@ -1007,11 +1015,11 @@ fn read_file(
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>>
 ```
 
-**Purpose**: Reads an entire file through the sandbox helper and decodes the helper’s base64 payload into raw bytes.
+**Purpose**: Reads the full contents of a file through the sandbox. It returns the file as raw bytes, while the helper communication carries those bytes as base64 text.
 
-**Data flow**: Requires a sandbox context, validates the path, sends `FsHelperRequest::ReadFile(FsReadFileParams { path: path.clone(), sandbox: None })` via `run_sandboxed`, extracts the read-file payload with `expect_read_file`, then decodes `response.data_base64` using `STANDARD.decode`. Invalid base64 is converted into `io::ErrorKind::InvalidData` with a message naming `fs/readFile` and `dataBase64`.
+**Data flow**: It receives a path and an optional sandbox context. After requiring a valid sandbox and native path, it sends a ReadFile request through run_sandboxed. The helper returns base64-encoded file data; this function decodes that text into bytes and returns them, or reports invalid data if decoding fails.
 
-**Call relations**: Used by the trait adapter for full-file reads. It is one of the few methods here that performs a nontrivial post-processing step after the helper response.
+**Call relations**: Callers use this through the ExecutorFileSystem interface when they need a whole file at once. Internally it relies on require_platform_sandbox, validate_native_path, and run_sandboxed, then converts the helper’s response into the byte vector expected by the rest of the server.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, ReadFile, clone).
 
@@ -1026,11 +1034,11 @@ fn read_file_stream(
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>
 ```
 
-**Purpose**: Rejects streaming file reads for sandboxed filesystems because that mode is not implemented for platform sandboxing.
+**Purpose**: Rejects streaming file reads for this sandboxed file system. Streaming means reading a file gradually in chunks, but this platform sandbox path only supports whole-file reads.
 
-**Data flow**: Ignores the provided path and sandbox arguments and returns a boxed async future that immediately yields `Err(io::Error::new(io::ErrorKind::Unsupported, ...))`.
+**Data flow**: It receives a path and optional sandbox context, but intentionally does not use them. It immediately returns an Unsupported I/O error explaining that streaming file reads do not support platform sandboxing.
 
-**Call relations**: This is the `ExecutorFileSystem` trait’s streaming-read implementation for the sandboxed backend. It intentionally short-circuits instead of delegating to `run_sandboxed`.
+**Call relations**: This exists because ExecutorFileSystem requires a streaming-read method. Instead of pretending streaming is available, it clearly stops the call at the boundary and tells callers to use the normal read_file flow if they need sandboxed file contents.
 
 *Call graph*: 2 external calls (pin, new).
 
@@ -1046,11 +1054,11 @@ fn write_file(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Writes an entire file through the sandbox helper after base64-encoding the provided bytes.
+**Purpose**: Writes bytes to a file through the sandbox. It protects the operation by requiring a sandbox policy before any write request is sent.
 
-**Data flow**: Requires a sandbox, validates the path, encodes `contents: Vec<u8>` with `STANDARD.encode`, builds `FsHelperRequest::WriteFile(FsWriteFileParams { path: path.clone(), data_base64, sandbox: None })`, runs it, extracts `expect_write_file`, maps helper errors, and returns `()`.
+**Data flow**: It receives a path, the bytes to write, and an optional sandbox context. It checks the sandbox and native path, encodes the bytes as base64 text, sends a WriteFile request through run_sandboxed, and returns success if the helper confirms the write.
 
-**Call relations**: Reached through the trait implementation for write operations. It mirrors `read_file` but in the opposite direction.
+**Call relations**: This is the sandboxed write path used through ExecutorFileSystem. Like the other operations, it performs local validation first, then hands the actual file change to run_sandboxed so FileSystemSandboxRunner can enforce the platform sandbox.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, WriteFile, clone).
 
@@ -1066,11 +1074,11 @@ fn create_directory(
     ) -> ExecutorFileSystemFuture<'a,
 ```
 
-**Purpose**: Creates a directory through the sandbox helper, honoring the caller’s recursive option.
+**Purpose**: Creates a directory through the sandbox, optionally creating missing parent directories too. This lets callers prepare workspace folders without bypassing sandbox restrictions.
 
-**Data flow**: Requires a sandbox, validates the path, builds `FsHelperRequest::CreateDirectory(FsCreateDirectoryParams { path: path.clone(), recursive: Some(options.recursive), sandbox: None })`, runs it, extracts `expect_create_directory`, maps errors, and returns `()`.
+**Data flow**: It receives a target path, create-directory options, and an optional sandbox context. It requires an allowed sandbox, checks the path, packages the path and recursive option into a CreateDirectory request, then sends it through run_sandboxed. It returns success when the helper accepts the operation.
 
-**Call relations**: Used by the trait adapter for directory creation. It is a straightforward request/acknowledgement helper call.
+**Call relations**: The ExecutorFileSystem interface calls this when a directory needs to be made. It uses require_platform_sandbox and validate_native_path before passing the request to run_sandboxed, which performs the actual sandboxed helper call.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, CreateDirectory, clone).
 
@@ -1085,11 +1093,11 @@ fn get_metadata(
     ) -> ExecutorFileSystemFuture<'a, FileMetadata>
 ```
 
-**Purpose**: Fetches file metadata through the sandbox helper and converts the protocol response into the local metadata struct.
+**Purpose**: Asks for basic facts about a file-system item through the sandbox. These facts include whether it is a file, directory, or symbolic link, plus size and timestamps.
 
-**Data flow**: Requires a sandbox, validates the path, sends `FsHelperRequest::GetMetadata(FsGetMetadataParams { path: path.clone(), sandbox: None })`, extracts `expect_get_metadata`, maps helper errors, and constructs `FileMetadata` by copying `is_directory`, `is_file`, `is_symlink`, `size`, `created_at_ms`, and `modified_at_ms` from the response.
+**Data flow**: It receives a path and optional sandbox context. After sandbox and path checks, it sends a GetMetadata request through run_sandboxed. It then copies the helper’s metadata fields into the FileMetadata type used by the rest of the exec server.
 
-**Call relations**: Called via the trait implementation when metadata is requested under sandboxing. It is one of the methods that translates protocol types into local domain types.
+**Call relations**: Callers use this through ExecutorFileSystem when they need to inspect a path before deciding what to do. The function follows the common validation-and-run pattern, then translates the helper response into the local data model.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, GetMetadata, clone).
 
@@ -1104,11 +1112,11 @@ fn read_directory(
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>
 ```
 
-**Purpose**: Lists directory entries through the sandbox helper and maps each protocol entry into the local directory-entry type.
+**Purpose**: Lists the entries inside a directory through the sandbox. It returns simple information for each child, such as the name and whether it is a file or directory.
 
-**Data flow**: Requires a sandbox, validates the path, sends `FsHelperRequest::ReadDirectory(FsReadDirectoryParams { path: path.clone(), sandbox: None })`, extracts `expect_read_directory`, maps helper errors, then transforms `response.entries` into `Vec<ReadDirectoryEntry>` by copying `file_name`, `is_directory`, and `is_file` for each entry.
+**Data flow**: It receives a directory path and optional sandbox context. It requires a suitable sandbox, validates the native path, sends a ReadDirectory request through run_sandboxed, and converts each helper entry into a ReadDirectoryEntry for callers.
 
-**Call relations**: Used by the trait adapter for directory listing. Like `get_metadata`, it performs protocol-to-local type conversion after the helper call.
+**Call relations**: This is the directory-listing operation behind the ExecutorFileSystem interface. It depends on require_platform_sandbox and validate_native_path before run_sandboxed, then reshapes the helper’s response into the server’s standard entry list.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, ReadDirectory, clone).
 
@@ -1124,11 +1132,11 @@ fn remove(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Removes a file or directory through the sandbox helper using the caller’s recursive and force options.
+**Purpose**: Deletes a file or directory through the sandbox. Its options decide whether directory removal can be recursive and whether missing paths should be ignored.
 
-**Data flow**: Requires a sandbox, validates the path, builds `FsHelperRequest::Remove(FsRemoveParams { path: path.clone(), recursive: Some(remove_options.recursive), force: Some(remove_options.force), sandbox: None })`, runs it, extracts `expect_remove`, maps errors, and returns `()`.
+**Data flow**: It receives a path, remove options, and an optional sandbox context. It checks that sandboxing is active and that the path is native, then sends a Remove request containing the recursive and force flags through run_sandboxed. It returns success when the helper confirms removal.
 
-**Call relations**: Reached through the trait implementation for delete operations. It follows the same validation and helper-dispatch pattern as the other mutating methods.
+**Call relations**: This method is called through ExecutorFileSystem when something must be deleted safely. It uses the shared helper path: validate the request locally, then let FileSystemSandboxRunner carry out the deletion inside the sandbox.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, Remove, clone).
 
@@ -1145,11 +1153,11 @@ fn copy(
     ) -> Execut
 ```
 
-**Purpose**: Copies a file or directory through the sandbox helper, validating both source and destination URIs first.
+**Purpose**: Copies a file or directory from one path to another through the sandbox. It checks both the source and destination paths before asking the helper to do the copy.
 
-**Data flow**: Requires a sandbox, validates both `source_path` and `destination_path` as native paths, builds `FsHelperRequest::Copy(FsCopyParams { source_path: source_path.clone(), destination_path: destination_path.clone(), recursive: options.recursive, sandbox: None })`, runs it, extracts `expect_copy`, maps errors, and returns `()`.
+**Data flow**: It receives a source path, destination path, copy options, and an optional sandbox context. It requires an allowed sandbox, validates both paths as native local paths, sends a Copy request through run_sandboxed, and returns success when the helper confirms the copy.
 
-**Call relations**: Used by the trait adapter for copy operations. It is the only operation here that validates two paths before dispatch.
+**Call relations**: This is the safe copy operation exposed through ExecutorFileSystem. It calls the same sandbox and path guards as the other operations, but applies path validation twice because both ends of the copy must be acceptable.
 
 *Call graph*: calls 3 internal fn (run_sandboxed, require_platform_sandbox, validate_native_path); 3 external calls (pin, Copy, clone).
 
@@ -1160,11 +1168,11 @@ fn copy(
 fn validate_native_path(path: &PathUri) -> FileSystemResult<()>
 ```
 
-**Purpose**: Rejects non-native `PathUri` values by requiring that they convert to an absolute local filesystem path.
+**Purpose**: Checks that a PathUri can be converted into a native absolute file-system path. This prevents sandboxed file operations from receiving unsupported URI-style paths.
 
-**Data flow**: Calls `path.to_abs_path()`, discards the successful absolute path with `drop`, and returns `Ok(())` or the underlying filesystem error.
+**Data flow**: It receives a PathUri. It calls to_abs_path on it and discards the converted path if conversion succeeds. It returns success for valid native paths or an error if the path cannot be treated as a local absolute path.
 
-**Call relations**: Private guard used by every sandboxed operation before helper dispatch. It enforces the invariant tested in the companion test file.
+**Call relations**: Every sandboxed operation calls this before sending a helper request. It acts like an early gatekeeper, so run_sandboxed only receives requests with paths the platform file system can actually understand.
 
 *Call graph*: calls 1 internal fn (to_abs_path); called by 8 (canonicalize, copy, create_directory, get_metadata, read_directory, read_file, remove, write_file).
 
@@ -1177,11 +1185,11 @@ fn require_platform_sandbox(
 ) -> FileSystemResult<&FileSystemSandboxContext>
 ```
 
-**Purpose**: Ensures the caller supplied a sandbox context whose policy actually requires platform sandbox execution.
+**Purpose**: Ensures that a file operation is actually being run with a sandbox policy that should use platform sandboxing. Without this check, the sandboxed file-system layer could be called in a mode where its safety guarantee does not apply.
 
-**Data flow**: Takes `Option<&FileSystemSandboxContext>`, filters it with `sandbox.should_run_in_sandbox()`, and returns the borrowed context on success. If absent or not sandbox-running, it returns `io::ErrorKind::InvalidInput` with a message naming the accepted policies.
+**Data flow**: It receives an optional sandbox context. If a context is present and says it should run in the sandbox, the function returns that context. Otherwise it returns an InvalidInput error explaining that sandboxed operations require a ReadOnly or WorkspaceWrite sandbox policy.
 
-**Call relations**: Private precondition check used by all helper-backed operations. It prevents accidental use of this backend for unrestricted/non-platform-sandbox policies.
+**Call relations**: All file operations call this before path validation and before run_sandboxed. It is the first safety check in the flow, making sure the rest of this file is only used when the sandbox is truly active.
 
 *Call graph*: called by 8 (canonicalize, copy, create_directory, get_metadata, read_directory, read_file, remove, write_file).
 
@@ -1192,11 +1200,11 @@ fn require_platform_sandbox(
 fn map_sandbox_error(error: JSONRPCErrorError) -> io::Error
 ```
 
-**Purpose**: Translates helper-side JSON-RPC error codes into conventional `io::Error` kinds for filesystem callers.
+**Purpose**: Translates sandbox protocol errors into ordinary I/O errors that the rest of the server already understands. This keeps callers from needing to know the sandbox helper’s JSON-RPC error codes.
 
-**Data flow**: Matches `JSONRPCErrorError.code`: `-32004` becomes `io::ErrorKind::NotFound`, `-32600` becomes `io::ErrorKind::InvalidInput`, and all other codes become `io::Error::other(error.message)`.
+**Data flow**: It receives a JSONRPCErrorError with a numeric code and message. A “not found” code becomes an io::ErrorKind::NotFound, an “invalid request” code becomes InvalidInput, and all other codes become a general I/O error with the same message.
 
-**Call relations**: Used by `run_sandboxed` and by `expect_*` extraction failures after helper responses. It is the error-shaping boundary between JSON-RPC and filesystem APIs.
+**Call relations**: run_sandboxed uses this when FileSystemSandboxRunner reports an error, and individual operation methods also use it when unpacking helper responses. It is the adapter between the sandbox helper’s protocol language and normal Rust I/O error handling.
 
 *Call graph*: 2 external calls (new, other).
 
@@ -1206,11 +1214,13 @@ Provides the concrete local filesystem implementation and the RPC-forwarding rem
 
 ### `exec-server/src/local_file_system.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `cross-cutting file operations during request handling`
 
-This file defines three layers of filesystem behavior. `DirectFileSystem` performs actual host filesystem operations against native absolute paths derived from `PathUri`; it rejects any sandbox context outright. `UnsandboxedFileSystem` wraps `DirectFileSystem` and only rejects sandbox contexts that explicitly request platform sandbox execution, allowing callers to pass through non-sandbox metadata without changing behavior. `LocalFileSystem` is the top-level router: it always has an unsandboxed backend and may also hold a `SandboxedFileSystem`, selecting between them with `file_system_for` based on `FileSystemSandboxContext::should_run_in_sandbox`.
+This file is the local file cabinet for the exec server. Other parts of the server ask for file operations through a shared interface, and this file turns those requests into real operating-system file actions. Without it, the server could not open files, inspect folders, write results, or safely route file access when sandboxing is required.
 
-The implementation is careful about path validity and safety. All direct operations convert `PathUri` with `to_abs_path()`, so non-native URIs fail early. Whole-file reads are capped at `MAX_READ_FILE_BYTES` (512 MiB) using both metadata preflight and a `take(MAX_READ_FILE_BYTES + 1)` read to catch races where the file grows after metadata is fetched. Streaming reads use `ReaderStream` with `FILE_READ_CHUNK_SIZE`, but `LocalFileSystem::open_file_for_read` explicitly forbids platform-sandboxed streaming. Metadata combines `metadata` and `symlink_metadata` so symlink-ness is preserved while size/type reflect the target. Recursive copy runs in `spawn_blocking`, supports directories, regular files, and symlinks, rejects copying a directory into itself or a descendant, and preserves symlinks rather than dereferencing them. Helper routines such as `resolve_existing_path` canonicalize the deepest existing ancestor and then re-append unresolved suffixes, which avoids symlink/`..` escape ambiguities and is reused for sandbox cwd resolution.
+There are three layers. LocalFileSystem is the public router. It looks at the optional sandbox context and chooses either the sandboxed file system or the ordinary one. UnsandboxedFileSystem is a safety wrapper around direct access: it refuses requests that claim they need platform sandboxing, because those must go through the sandboxed path instead. DirectFileSystem is the layer that actually talks to the operating system using Tokio, an asynchronous runtime that lets file work happen without blocking the whole server.
+
+The file also includes careful edge-case behavior. Whole-file reads are capped at 512 MB so a request cannot accidentally load a huge file into memory. Streamed reads are available for reading in chunks. Directory copies are done recursively, but copying a directory into itself or one of its children is rejected, like stopping someone from packing a box inside itself. Symlinks, which are file-system shortcuts, are copied as links rather than as their targets when supported.
 
 #### Function details
 
@@ -1220,11 +1230,11 @@ The implementation is careful about path validity and safety. All direct operati
 fn file_too_large_error() -> io::Error
 ```
 
-**Purpose**: Constructs the specific `io::Error` returned when a whole-file read exceeds the hard 512 MiB limit. The message embeds the configured byte limit so callers get a concrete failure reason.
+**Purpose**: Creates the standard error used when a caller tries to read a file larger than this module allows. This keeps large files from being loaded fully into memory by accident.
 
-**Data flow**: It reads the `MAX_READ_FILE_BYTES` constant, formats it into an error string, and returns a new `io::Error` with kind `InvalidInput`. It does not mutate any state.
+**Data flow**: It takes no input, uses the fixed maximum read size, builds a readable error message, and returns an input-error value that can be sent back to the caller.
 
-**Call relations**: This helper is used by `DirectFileSystem::read_file` on both the metadata-size precheck path and the post-read overflow check, so the same error shape is emitted whether the file was already too large or grew during reading.
+**Call relations**: DirectFileSystem::read_file calls this when the file size is too large before or after reading, so all oversized-file failures use the same wording.
 
 *Call graph*: called by 1 (read_file); 2 external calls (new, format!).
 
@@ -1235,11 +1245,11 @@ fn file_too_large_error() -> io::Error
 fn unsandboxed() -> Self
 ```
 
-**Purpose**: Builds a `LocalFileSystem` that only exposes host filesystem access and has no configured sandbox backend. It is the constructor used for the global `LOCAL_FS` and test/default unsandboxed setups.
+**Purpose**: Builds a local file system that always uses normal, direct file access. This is useful when the server is running without configured sandbox runtime paths.
 
-**Data flow**: It creates a default `UnsandboxedFileSystem`, stores it in the `unsandboxed` field, sets `sandboxed` to `None`, and returns the assembled `LocalFileSystem`.
+**Data flow**: It takes no input, creates the default unsandboxed layer, leaves the sandboxed layer empty, and returns a LocalFileSystem ready for ordinary file operations.
 
-**Call relations**: Callers use this when they want `LocalFileSystem` routing logic without runtime sandbox paths. Later operations that request sandbox execution will fail through `LocalFileSystem::sandboxed` because this constructor leaves that field unset.
+**Call relations**: Test setup code such as default_for_tests calls this when it needs a simple local file system without sandbox routing.
 
 *Call graph*: called by 1 (default_for_tests); 1 external calls (default).
 
@@ -1250,11 +1260,11 @@ fn unsandboxed() -> Self
 fn with_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self
 ```
 
-**Purpose**: Builds a `LocalFileSystem` that can route sandbox-eligible operations into a configured `SandboxedFileSystem`. It is the constructor for production contexts that know the executor runtime paths.
+**Purpose**: Builds a local file system that can use both normal access and sandboxed access. The runtime paths tell the sandbox where its working directories and support files live.
 
-**Data flow**: It creates a default `UnsandboxedFileSystem`, constructs `SandboxedFileSystem::new(runtime_paths)`, stores it in `sandboxed`, and returns the populated `LocalFileSystem`.
+**Data flow**: It receives runtime path settings, creates the default unsandboxed layer, creates a SandboxedFileSystem from those paths, and returns a LocalFileSystem with both routes available.
 
-**Call relations**: Higher-level setup code calls this when runtime paths are available. Subsequent file operations use `file_system_for` to choose this sandboxed backend only when the provided `FileSystemSandboxContext` says the operation should run in the sandbox.
+**Call relations**: Higher-level setup paths such as local, new, and create_file_system_context call this when the server has enough configuration to support sandboxed file work.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (local, new, create_file_system_context); 1 external calls (default).
 
@@ -1265,11 +1275,11 @@ fn with_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self
 fn sandboxed(&self) -> io::Result<&SandboxedFileSystem>
 ```
 
-**Purpose**: Returns the configured sandbox backend or produces a clear invalid-input error if sandboxed operations were requested without runtime-path configuration. It centralizes that configuration check in one place.
+**Purpose**: Returns the configured sandboxed file system, or explains why one is not available. It protects callers from trying to run sandboxed work without the needed setup.
 
-**Data flow**: It reads `self.sandboxed`; if present it returns `&SandboxedFileSystem`, otherwise it constructs and returns an `io::Error` with kind `InvalidInput` and a fixed explanatory message.
+**Data flow**: It reads the LocalFileSystem's optional sandboxed field. If present, it returns a reference to it; if absent, it returns an input error saying runtime paths are required.
 
-**Call relations**: Only `LocalFileSystem::file_system_for` calls this, so all routed operations share the same failure mode when a sandbox context requests sandbox execution but the `LocalFileSystem` was created unsandboxed.
+**Call relations**: LocalFileSystem::file_system_for calls this whenever a request says it should run in a sandbox.
 
 *Call graph*: called by 1 (file_system_for).
 
@@ -1285,11 +1295,11 @@ fn file_system_for(
         Option<&'a FileSystemSandboxContext>,
 ```
 
-**Purpose**: Chooses the concrete backend for one operation based on the optional `FileSystemSandboxContext`. It is the dispatch point that decides between `UnsandboxedFileSystem` and `SandboxedFileSystem`.
+**Purpose**: Chooses the right file-system backend for one operation. It is the traffic officer that sends sandboxed requests to the sandbox and ordinary requests to the unsandboxed path.
 
-**Data flow**: It inspects the optional sandbox context with `should_run_in_sandbox`. If true, it fetches `self.sandboxed()?` and returns that backend plus the original sandbox reference; otherwise it returns `&self.unsandboxed` plus the same sandbox reference.
+**Data flow**: It receives an optional sandbox context. If that context says sandboxing is needed, it returns the sandboxed file system and the context; otherwise it returns the unsandboxed file system and the same context.
 
-**Call relations**: Every routed async operation on `LocalFileSystem` calls this first. It delegates sandbox configuration validation to `sandboxed` and then hands the chosen backend to methods like `canonicalize`, `read_file`, `write_file`, `remove`, and `copy`.
+**Call relations**: Most LocalFileSystem operations call this first, then forward the real work to whichever backend it selected.
 
 *Call graph*: calls 1 internal fn (sandboxed); called by 9 (canonicalize, copy, create_directory, get_metadata, read_directory, read_file, read_file_stream, remove, write_file).
 
@@ -1304,11 +1314,11 @@ async fn open_file_for_read(
     ) -> FileSystemResult<tokio::fs::File>
 ```
 
-**Purpose**: Opens a file handle for streaming reads, but only for unsandboxed access. It explicitly blocks platform-sandboxed streaming because that mode is unsupported.
+**Purpose**: Opens a local file for streaming-style reading when sandboxing is not required. It deliberately refuses platform sandboxing because this streaming read path does not support it.
 
-**Data flow**: It reads the optional sandbox context; if it requests sandbox execution, it returns an `InvalidInput` error. Otherwise it forwards the path and sandbox to `self.unsandboxed.open_file_for_read` and returns the resulting `tokio::fs::File`.
+**Data flow**: It receives a path and optional sandbox context. If the context requires sandboxing, it returns an error; otherwise it asks the unsandboxed file system to open the file and returns the opened Tokio file.
 
-**Call relations**: This method is used by higher-level open/read-stream paths that need a raw file handle. Unlike the other routed methods, it bypasses `file_system_for` and hardcodes unsandboxed behavior because sandbox streaming is intentionally disallowed.
+**Call relations**: The higher-level open flow calls this when it needs a raw readable file handle. It hands the work to UnsandboxedFileSystem::open_file_for_read for the non-sandboxed case.
 
 *Call graph*: calls 1 internal fn (open_file_for_read); called by 1 (open); 1 external calls (new).
 
@@ -1323,11 +1333,11 @@ fn canonicalize(
     ) -> ExecutorFileSystemFuture<'a, PathUri>
 ```
 
-**Purpose**: Canonicalizes a `PathUri` through whichever backend applies to the current sandbox context. It normalizes symlinks and path components according to the selected filesystem implementation.
+**Purpose**: Turns a path into its canonical form, meaning the operating system's resolved absolute version. This removes ambiguity such as `.` components and followed links.
 
-**Data flow**: It takes a path and optional sandbox context, resolves `(file_system, sandbox)` via `file_system_for`, awaits `file_system.canonicalize(path, sandbox)`, and returns the resulting canonical `PathUri`.
+**Data flow**: It receives a path and optional sandbox context, picks the correct backend with file_system_for, sends the request there, and returns the resolved PathUri or an error.
 
-**Call relations**: The `ExecutorFileSystem` trait implementation boxes this async method. It is the standard routed path for callers that want canonicalization without knowing whether the operation will run sandboxed or unsandboxed.
+**Call relations**: The ExecutorFileSystem implementation for LocalFileSystem boxes this async work so callers can use it through the shared file-system interface.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (canonicalize); 1 external calls (pin).
 
@@ -1342,11 +1352,11 @@ fn read_file(
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>>
 ```
 
-**Purpose**: Reads an entire file through the selected backend and returns its bytes. The actual size limits and path validation are enforced by the delegated backend.
+**Purpose**: Reads a whole file into memory, using either the sandboxed or unsandboxed route as appropriate.
 
-**Data flow**: It accepts a `PathUri` and optional sandbox context, chooses a backend with `file_system_for`, awaits `read_file`, and returns the resulting `Vec<u8>` or propagated I/O error.
+**Data flow**: It receives a path and optional sandbox context, selects the backend, forwards the read request, and returns the file bytes or an error.
 
-**Call relations**: This is the boxed implementation behind the trait’s `read_file`. It exists mainly to route to either `UnsandboxedFileSystem` or `SandboxedFileSystem` while preserving the caller’s sandbox context.
+**Call relations**: The shared file-system interface calls into this method for LocalFileSystem read requests, and this method delegates the actual file access to the selected backend.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (read_file); 1 external calls (pin).
 
@@ -1361,11 +1371,11 @@ fn read_file_stream(
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>
 ```
 
-**Purpose**: Starts a streaming file read through the selected backend. It returns a `FileSystemReadStream` rather than buffering the whole file in memory.
+**Purpose**: Starts a chunk-by-chunk file read instead of loading the whole file at once. This is useful for larger files or callers that want streaming data.
 
-**Data flow**: It receives the path and optional sandbox context, resolves the backend with `file_system_for`, awaits `read_file_stream`, and returns the stream object.
+**Data flow**: It receives a path and optional sandbox context, chooses the backend, asks it for a read stream, and returns that stream or an error.
 
-**Call relations**: The trait implementation boxes this method for generic callers. Backend-specific restrictions, such as unsandboxed-only raw file opening, are enforced below this routing layer.
+**Call relations**: It follows the same routing pattern as the other LocalFileSystem operations, handing the stream creation to the selected file-system backend.
 
 *Call graph*: calls 1 internal fn (file_system_for); 1 external calls (pin).
 
@@ -1381,11 +1391,11 @@ fn write_file(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Writes a complete byte buffer to a file using the backend chosen for the current sandbox context. It is the routed entry for file creation or overwrite.
+**Purpose**: Writes bytes to a file through the correct local route. It keeps callers from needing to know whether sandboxing applies.
 
-**Data flow**: It takes a destination `PathUri`, owned `Vec<u8>` contents, and optional sandbox context; `file_system_for` selects the backend, then the method awaits `write_file` and returns `()` on success.
+**Data flow**: It receives a path, the bytes to write, and optional sandbox context. It selects the backend, passes the bytes along, and returns success or an error.
 
-**Call relations**: The trait implementation delegates here. This method does no transformation itself beyond backend selection, leaving path conversion and actual disk I/O to the concrete filesystem.
+**Call relations**: The ExecutorFileSystem write path calls this, and this method forwards to the sandboxed or unsandboxed implementation chosen by file_system_for.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (write_file); 1 external calls (pin).
 
@@ -1401,11 +1411,11 @@ fn create_directory(
     ) -> ExecutorFileSystemFuture<'a,
 ```
 
-**Purpose**: Creates a directory through the selected backend, honoring the caller’s recursive option. It routes sandbox-aware directory creation without duplicating implementation details.
+**Purpose**: Creates a directory, optionally including missing parent directories, through the correct backend.
 
-**Data flow**: It accepts a path, `CreateDirectoryOptions`, and optional sandbox context; after `file_system_for`, it awaits the backend’s `create_directory` and returns success or the propagated error.
+**Data flow**: It receives a path, directory creation options, and optional sandbox context. It chooses the backend, forwards the request, and returns success or an error.
 
-**Call relations**: This is the boxed trait path for directory creation. It delegates recursive/non-recursive semantics to the concrete backend implementation.
+**Call relations**: The shared create-directory operation reaches this method first for LocalFileSystem, then the selected backend performs the operating-system work.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (create_directory); 1 external calls (pin).
 
@@ -1420,11 +1430,11 @@ fn get_metadata(
     ) -> ExecutorFileSystemFuture<'a, FileMetadata>
 ```
 
-**Purpose**: Fetches `FileMetadata` for a path through the appropriate backend. It is the routed metadata lookup used by the executor API.
+**Purpose**: Fetches basic facts about a file or folder, such as whether it is a file, directory, or symlink and how large it is.
 
-**Data flow**: It takes a path and optional sandbox context, selects a backend with `file_system_for`, awaits `get_metadata`, and returns the populated `FileMetadata` structure.
+**Data flow**: It receives a path and optional sandbox context, selects a backend, asks that backend for metadata, and returns the FileMetadata record or an error.
 
-**Call relations**: The trait implementation forwards here. The concrete backend decides how to derive symlink, size, and timestamp fields.
+**Call relations**: The public metadata call on LocalFileSystem is boxed through the ExecutorFileSystem interface and lands here before being delegated.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (get_metadata); 1 external calls (pin).
 
@@ -1439,11 +1449,11 @@ fn read_directory(
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>
 ```
 
-**Purpose**: Lists directory entries through the selected backend and returns simplified entry metadata. It routes directory enumeration across sandbox modes.
+**Purpose**: Lists the entries inside a directory through the correct backend.
 
-**Data flow**: It receives a directory path and optional sandbox context, resolves the backend, awaits `read_directory`, and returns a `Vec<ReadDirectoryEntry>`.
+**Data flow**: It receives a directory path and optional sandbox context, selects the backend, asks for the directory entries, and returns names plus simple type flags for each readable entry.
 
-**Call relations**: This method is the trait-facing routed implementation. It delegates filtering and metadata probing of individual entries to the backend.
+**Call relations**: The ExecutorFileSystem directory-listing call reaches this router, which then passes the request to the sandboxed or unsandboxed file system.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (read_directory); 1 external calls (pin).
 
@@ -1459,11 +1469,11 @@ fn remove(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Deletes a file or directory using the backend chosen for the current sandbox context. It passes through recursive and force semantics from `RemoveOptions`.
+**Purpose**: Deletes a file or directory through the correct backend, following options such as recursive deletion and force.
 
-**Data flow**: It takes a path, `RemoveOptions`, and optional sandbox context, selects the backend via `file_system_for`, awaits `remove`, and returns `()` or an error.
+**Data flow**: It receives a path, removal options, and optional sandbox context. It selects the backend, forwards the deletion request, and returns success or an error.
 
-**Call relations**: The trait implementation boxes this method. Concrete deletion behavior, including force-on-not-found and directory handling, lives in the delegated backend.
+**Call relations**: The shared remove operation calls into this method, and this method delegates to the backend chosen by file_system_for.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (remove); 1 external calls (pin).
 
@@ -1480,11 +1490,11 @@ fn copy(
     ) -> Execut
 ```
 
-**Purpose**: Copies a file, directory, or symlink through the selected backend. It is the routed entry for copy operations that may need sandbox-aware behavior.
+**Purpose**: Copies a file, directory, or symlink through the correct backend. It hides the sandbox routing decision from callers.
 
-**Data flow**: It accepts source and destination `PathUri`s, `CopyOptions`, and optional sandbox context; after backend selection with `file_system_for`, it awaits `copy` and returns success or error.
+**Data flow**: It receives source and destination paths, copy options, and optional sandbox context. It chooses the backend, forwards the copy request, and returns success or an error.
 
-**Call relations**: The trait implementation forwards here. The heavy lifting, including recursive directory copy and symlink preservation, is delegated to the concrete filesystem.
+**Call relations**: The ExecutorFileSystem copy call for LocalFileSystem reaches this router, which then hands the operation to either the sandboxed or unsandboxed file system.
 
 *Call graph*: calls 1 internal fn (file_system_for); called by 1 (copy); 1 external calls (pin).
 
@@ -1499,11 +1509,11 @@ async fn open_file_for_read(
     ) -> FileSystemResult<tokio::fs::File>
 ```
 
-**Purpose**: Opens a file for reading on the host filesystem while rejecting requests that explicitly require platform sandboxing. It is a compatibility wrapper around `DirectFileSystem`.
+**Purpose**: Opens a file for reading only if the request does not require platform sandboxing. It is a guardrail before direct file access.
 
-**Data flow**: It checks the optional sandbox context with `reject_platform_sandbox_context`; on success it forwards the path to `self.file_system.open_file_for_read` with `None` sandbox and returns the `tokio::fs::File`.
+**Data flow**: It receives a path and optional sandbox context, rejects contexts that require sandboxing, then asks DirectFileSystem to open the file with no sandbox context.
 
-**Call relations**: Called from `LocalFileSystem::open_file_for_read`, this wrapper preserves the caller-facing sandbox parameter shape while ensuring direct host access is never used for a sandbox-required operation.
+**Call relations**: LocalFileSystem::open_file_for_read calls this after it has decided that streaming reads must use the unsandboxed path.
 
 *Call graph*: calls 2 internal fn (open_file_for_read, reject_platform_sandbox_context); called by 1 (open_file_for_read).
 
@@ -1518,11 +1528,11 @@ fn canonicalize(
     ) -> ExecutorFileSystemFuture<'a, PathUri>
 ```
 
-**Purpose**: Canonicalizes a path using direct host filesystem access, but only when the sandbox context does not demand sandbox execution. It strips the sandbox parameter before delegation.
+**Purpose**: Resolves a path using direct local access, but first rejects requests that should have been sandboxed.
 
-**Data flow**: It validates the optional sandbox with `reject_platform_sandbox_context`, then awaits `self.file_system.canonicalize(path, None)` and returns the canonical `PathUri`.
+**Data flow**: It receives a path and optional sandbox context, checks that platform sandboxing is not requested, forwards to DirectFileSystem::canonicalize, and returns the resolved path or error.
 
-**Call relations**: This is the unsandboxed branch selected by `LocalFileSystem::file_system_for`. The trait implementation boxes it for polymorphic use.
+**Call relations**: It is used through the UnsandboxedFileSystem implementation of the shared file-system interface when a non-sandboxed canonicalize request is routed here.
 
 *Call graph*: calls 2 internal fn (canonicalize, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1537,11 +1547,11 @@ fn read_file(
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>>
 ```
 
-**Purpose**: Reads a whole file from the host filesystem unless the caller explicitly requested sandbox execution. It forwards to `DirectFileSystem` after validation.
+**Purpose**: Reads a whole file through direct local access after confirming the request is not supposed to run in a sandbox.
 
-**Data flow**: It checks the sandbox context with `reject_platform_sandbox_context`, calls `self.file_system.read_file(path, None)`, awaits the result, and returns the file bytes.
+**Data flow**: It receives a path and optional sandbox context, rejects platform-sandboxed requests, forwards to DirectFileSystem::read_file, and returns the bytes or an error.
 
-**Call relations**: Used when `LocalFileSystem` routes a read to the unsandboxed backend. It exists to reject only platform-sandbox requests, unlike `DirectFileSystem`, which rejects any sandbox context at all.
+**Call relations**: When LocalFileSystem chooses the unsandboxed backend for a read, this wrapper enforces the no-platform-sandbox rule before direct reading happens.
 
 *Call graph*: calls 2 internal fn (read_file, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1556,11 +1566,11 @@ fn read_file_stream(
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>
 ```
 
-**Purpose**: Starts a streaming read from the host filesystem when sandbox execution is not required. It is the streaming counterpart to unsandboxed whole-file reads.
+**Purpose**: Creates a streaming read from a file through direct local access, while refusing platform-sandboxed requests.
 
-**Data flow**: It validates the sandbox context with `reject_platform_sandbox_context`, delegates to `self.file_system.read_file_stream(path, None)`, and returns the resulting `FileSystemReadStream`.
+**Data flow**: It receives a path and optional sandbox context, checks the context, forwards to DirectFileSystem::read_file_stream, and returns a stream or error.
 
-**Call relations**: This method is selected by `LocalFileSystem::file_system_for` for unsandboxed streaming reads and boxed by the trait implementation.
+**Call relations**: It sits between LocalFileSystem's routing decision and DirectFileSystem's actual stream creation for unsandboxed reads.
 
 *Call graph*: calls 2 internal fn (read_file_stream, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1576,11 +1586,11 @@ fn write_file(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Writes bytes to a host file unless the sandbox context requires sandbox execution. It is a thin validation-and-forwarding wrapper.
+**Purpose**: Writes a file directly, but only for requests that do not need platform sandboxing.
 
-**Data flow**: It checks the sandbox context, passes the path and owned contents to `self.file_system.write_file(path, contents, None)`, awaits completion, and returns `()`.
+**Data flow**: It receives a path, bytes, and optional sandbox context. It rejects sandbox-required contexts, forwards the bytes to DirectFileSystem::write_file, and returns success or an error.
 
-**Call relations**: Chosen by `LocalFileSystem` for unsandboxed writes. It preserves the public API shape while ensuring platform-sandbox requests fail early.
+**Call relations**: LocalFileSystem can route write requests here for ordinary access; this method then hands the real write to DirectFileSystem.
 
 *Call graph*: calls 2 internal fn (write_file, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1596,11 +1606,11 @@ fn create_directory(
     ) -> ExecutorFileSystemFuture<'a,
 ```
 
-**Purpose**: Creates a directory on the host filesystem when sandbox execution is not required. It forwards recursive options unchanged.
+**Purpose**: Creates a directory directly after confirming the request belongs outside the platform sandbox.
 
-**Data flow**: It validates the sandbox context, delegates `path` and `CreateDirectoryOptions` to `self.file_system.create_directory(path, options, None)`, awaits completion, and returns success or error.
+**Data flow**: It receives a path, creation options, and optional sandbox context. It rejects platform-sandboxed requests, forwards to DirectFileSystem::create_directory, and returns success or an error.
 
-**Call relations**: This is the unsandboxed branch for directory creation selected by `LocalFileSystem::file_system_for`.
+**Call relations**: This wrapper is the unsandboxed branch for directory creation before the direct operating-system call is made.
 
 *Call graph*: calls 2 internal fn (create_directory, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1615,11 +1625,11 @@ fn get_metadata(
     ) -> ExecutorFileSystemFuture<'a, FileMetadata>
 ```
 
-**Purpose**: Retrieves metadata from the host filesystem unless the caller explicitly requested sandbox execution. It forwards directly to `DirectFileSystem` after validation.
+**Purpose**: Reads file metadata directly while preventing accidental bypass of required sandboxing.
 
-**Data flow**: It checks the sandbox context, awaits `self.file_system.get_metadata(path, None)`, and returns the resulting `FileMetadata`.
+**Data flow**: It receives a path and optional sandbox context, rejects platform-sandboxed requests, forwards to DirectFileSystem::get_metadata, and returns the metadata or an error.
 
-**Call relations**: Used by routed metadata requests on the unsandboxed path and boxed by the trait implementation.
+**Call relations**: It is the unsandboxed backend for metadata lookups selected by LocalFileSystem::file_system_for.
 
 *Call graph*: calls 2 internal fn (get_metadata, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1634,11 +1644,11 @@ fn read_directory(
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>
 ```
 
-**Purpose**: Enumerates a host directory unless the sandbox context requires sandbox execution. It is the unsandboxed wrapper for directory listing.
+**Purpose**: Lists a directory directly, but only when the request does not require platform sandboxing.
 
-**Data flow**: It validates the sandbox context, delegates to `self.file_system.read_directory(path, None)`, awaits the result, and returns the collected entries.
+**Data flow**: It receives a path and optional sandbox context, validates that sandboxing is not required, forwards to DirectFileSystem::read_directory, and returns the entries or an error.
 
-**Call relations**: Selected by `LocalFileSystem::file_system_for` for unsandboxed directory reads.
+**Call relations**: LocalFileSystem routes ordinary directory-listing requests here, and this wrapper passes them to DirectFileSystem.
 
 *Call graph*: calls 2 internal fn (read_directory, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1654,11 +1664,11 @@ fn remove(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Deletes a host filesystem path unless the sandbox context explicitly requires sandbox execution. It forwards force/recursive options unchanged.
+**Purpose**: Deletes a file or directory directly after checking that the operation is allowed to run outside the sandbox.
 
-**Data flow**: It checks the sandbox context, calls `self.file_system.remove(path, options, None)`, awaits completion, and returns `()` or the propagated error.
+**Data flow**: It receives a path, removal options, and optional sandbox context. It rejects platform-sandboxed requests, forwards to DirectFileSystem::remove, and returns success or an error.
 
-**Call relations**: This is the unsandboxed deletion path used by `LocalFileSystem` when sandbox execution is not requested.
+**Call relations**: It forms the unsandboxed branch for deletion requests before the direct file-system layer performs the removal.
 
 *Call graph*: calls 2 internal fn (remove, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1675,11 +1685,11 @@ fn copy(
     ) -> Execut
 ```
 
-**Purpose**: Copies a host filesystem object unless the sandbox context requires sandbox execution. It forwards source, destination, and copy options to `DirectFileSystem`.
+**Purpose**: Copies files, directories, or symlinks directly while refusing requests that require sandboxing.
 
-**Data flow**: It validates the sandbox context, delegates to `self.file_system.copy(source_path, destination_path, options, None)`, awaits completion, and returns success or error.
+**Data flow**: It receives source and destination paths, copy options, and optional sandbox context. It checks the context, forwards the copy to DirectFileSystem::copy, and returns success or an error.
 
-**Call relations**: This method is the unsandboxed branch for copy operations selected by `LocalFileSystem::file_system_for`.
+**Call relations**: When LocalFileSystem chooses the unsandboxed backend for copying, this method guards the route and then delegates the real copy work.
 
 *Call graph*: calls 2 internal fn (copy, reject_platform_sandbox_context); 1 external calls (pin).
 
@@ -1694,11 +1704,11 @@ async fn open_file_for_read(
     ) -> FileSystemResult<tokio::fs::File>
 ```
 
-**Purpose**: Opens a regular file from a native absolute path on the host filesystem. It is the lowest-level async file-open primitive in this module.
+**Purpose**: Opens a regular file from the local disk for reading. It is the low-level entry point for direct read operations.
 
-**Data flow**: It rejects any non-`None` sandbox context via `reject_sandbox_context`, converts the `PathUri` to an absolute native path with `to_abs_path()`, and awaits `regular_file::open(path.as_path())`, returning a `tokio::fs::File`.
+**Data flow**: It receives a PathUri and optional sandbox context. It rejects any sandbox context, converts the URI into an absolute local path, opens it as a regular file, and returns the file handle.
 
-**Call relations**: This method underpins `DirectFileSystem::read_file`, `DirectFileSystem::read_file_stream`, and the unsandboxed/raw open path above it. It centralizes path conversion and regular-file enforcement.
+**Call relations**: DirectFileSystem::read_file and DirectFileSystem::read_file_stream call this so they share the same path conversion and regular-file check.
 
 *Call graph*: calls 3 internal fn (reject_sandbox_context, open, to_abs_path); called by 3 (read_file, read_file_stream, open_file_for_read); 1 external calls (as_path).
 
@@ -1713,11 +1723,11 @@ fn canonicalize(
     ) -> ExecutorFileSystemFuture<'a, PathUri>
 ```
 
-**Purpose**: Resolves a `PathUri` to its canonical absolute path on the host filesystem. It follows symlinks and normalizes the result back into `PathUri` form.
+**Purpose**: Asks the operating system for the fully resolved version of a path. This helps remove ambiguity caused by relative pieces or symlinks.
 
-**Data flow**: It rejects sandbox context, converts the input `PathUri` to an absolute path, awaits `tokio::fs::canonicalize`, wraps the result in `AbsolutePathBuf::from_absolute_path`, converts that to `PathUri::from_abs_path`, and returns it.
+**Data flow**: It receives a PathUri and optional sandbox context, rejects sandbox use, converts to an absolute path, canonicalizes it with the operating system, converts it back to a PathUri, and returns it.
 
-**Call relations**: This is the concrete canonicalization implementation used by the unsandboxed wrapper and, through routing, by `LocalFileSystem` when sandboxing is not selected.
+**Call relations**: UnsandboxedFileSystem::canonicalize delegates here after checking that the request is allowed to use direct access.
 
 *Call graph*: calls 4 internal fn (reject_sandbox_context, from_absolute_path, from_abs_path, to_abs_path); called by 1 (canonicalize); 3 external calls (pin, canonicalize, as_path).
 
@@ -1732,11 +1742,11 @@ fn read_file(
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>>
 ```
 
-**Purpose**: Reads an entire file into memory with a strict 512 MiB cap and race-resistant overflow detection. It is the non-streaming file-read implementation for direct host access.
+**Purpose**: Reads an entire local file into memory, with a fixed size limit to protect the server from very large reads.
 
-**Data flow**: It opens the file with `open_file_for_read`, fetches metadata to precheck `metadata.len()`, allocates a `Vec<u8>` with that capacity, reads via `file.take(MAX_READ_FILE_BYTES + 1).read_to_end(&mut bytes)`, checks the actual bytes read against the limit, and returns the byte vector or `file_too_large_error()`.
+**Data flow**: It opens the file, reads its metadata size, rejects it if it is over the limit, reads up to one byte beyond the limit as a second check, and returns the collected bytes.
 
-**Call relations**: Called through the unsandboxed wrapper and `LocalFileSystem` routing. It uses `file_too_large_error` on both preflight and post-read paths so callers see a consistent invalid-input failure.
+**Call relations**: UnsandboxedFileSystem::read_file delegates here. This method uses DirectFileSystem::open_file_for_read and file_too_large_error for its safety checks.
 
 *Call graph*: calls 2 internal fn (open_file_for_read, file_too_large_error); called by 1 (read_file); 2 external calls (pin, with_capacity).
 
@@ -1751,11 +1761,11 @@ fn read_file_stream(
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>
 ```
 
-**Purpose**: Creates a chunked asynchronous read stream for a file on the host filesystem. It avoids buffering the whole file and uses the configured chunk size.
+**Purpose**: Turns a local file into a stream of byte chunks. This lets callers consume the file gradually instead of all at once.
 
-**Data flow**: It opens the file with `open_file_for_read`, wraps it in `ReaderStream::with_capacity(file, FILE_READ_CHUNK_SIZE)`, then wraps that in `FileSystemReadStream::new` and returns the stream.
+**Data flow**: It opens the file, wraps it in a ReaderStream with the configured chunk size, and returns a FileSystemReadStream.
 
-**Call relations**: This is the concrete streaming implementation used by the unsandboxed wrapper and routed `LocalFileSystem` reads.
+**Call relations**: UnsandboxedFileSystem::read_file_stream delegates here after sandbox checks. This method relies on DirectFileSystem::open_file_for_read for the actual file opening.
 
 *Call graph*: calls 2 internal fn (open_file_for_read, new); called by 1 (read_file_stream); 2 external calls (pin, with_capacity).
 
@@ -1771,11 +1781,11 @@ fn write_file(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Writes a complete byte buffer to a native absolute path on the host filesystem. It is the direct implementation for file creation or overwrite.
+**Purpose**: Writes the given bytes to a local file path using direct operating-system access.
 
-**Data flow**: It rejects sandbox context, converts the `PathUri` to an absolute path, awaits `tokio::fs::write(path.as_path(), contents)`, and returns `()` on success.
+**Data flow**: It receives a path, byte contents, and optional sandbox context. It rejects sandbox context, converts the path to an absolute local path, writes the bytes, and returns success or the write error.
 
-**Call relations**: Used by `UnsandboxedFileSystem::write_file` and then by routed `LocalFileSystem` writes.
+**Call relations**: UnsandboxedFileSystem::write_file calls this once it has confirmed the operation does not require platform sandboxing.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (write_file); 3 external calls (pin, write, as_path).
 
@@ -1791,11 +1801,11 @@ fn create_directory(
     ) -> ExecutorFileSystemFuture<'a,
 ```
 
-**Purpose**: Creates a directory on the host filesystem, either one level or recursively depending on `CreateDirectoryOptions`. It is the direct implementation behind routed directory creation.
+**Purpose**: Creates a local directory, either just the final directory or all missing parent directories depending on the options.
 
-**Data flow**: It rejects sandbox context, converts the path to an absolute path, chooses `tokio::fs::create_dir_all` when `options.recursive` is true or `tokio::fs::create_dir` otherwise, awaits the operation, and returns `Ok(())`.
+**Data flow**: It receives a path, creation options, and optional sandbox context. It rejects sandbox context, converts the path, chooses single-directory or recursive creation, and returns success or an error.
 
-**Call relations**: This method is called through the unsandboxed wrapper for non-sandbox directory creation.
+**Call relations**: UnsandboxedFileSystem::create_directory delegates here for the actual disk operation.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (create_directory); 4 external calls (pin, create_dir, create_dir_all, as_path).
 
@@ -1810,11 +1820,11 @@ fn get_metadata(
     ) -> ExecutorFileSystemFuture<'a, FileMetadata>
 ```
 
-**Purpose**: Builds the executor’s `FileMetadata` view for a host path, including symlink status and millisecond timestamps. It intentionally combines target metadata with symlink metadata.
+**Purpose**: Collects simple facts about a local file-system item, including whether it is a file, folder, or symlink and its timestamps.
 
-**Data flow**: It rejects sandbox context, converts the path, awaits both `tokio::fs::metadata` and `tokio::fs::symlink_metadata`, then constructs `FileMetadata` with `is_dir`, `is_file`, `is_symlink`, `size`, and `created_at_ms`/`modified_at_ms` derived via `system_time_to_unix_ms`, defaulting missing timestamps to `0`.
+**Data flow**: It receives a path and optional sandbox context, rejects sandbox context, reads normal metadata and symlink metadata, builds a FileMetadata record, and returns it.
 
-**Call relations**: This is the concrete metadata implementation used on the unsandboxed path. It relies on `system_time_to_unix_ms` to normalize `SystemTime` values into signed millisecond integers.
+**Call relations**: UnsandboxedFileSystem::get_metadata calls this after its platform-sandbox guard. The timestamp fields use system_time_to_unix_ms to become millisecond numbers.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (get_metadata); 4 external calls (pin, metadata, symlink_metadata, as_path).
 
@@ -1829,11 +1839,11 @@ fn read_directory(
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>
 ```
 
-**Purpose**: Enumerates a directory and returns simplified entry records containing file name and basic type flags. Entries whose metadata cannot be read are silently skipped.
+**Purpose**: Lists the readable entries inside a local directory. Entries whose metadata cannot be read are skipped rather than failing the whole listing.
 
-**Data flow**: It rejects sandbox context, converts the directory path, opens `tokio::fs::read_dir`, iterates with `next_entry().await?`, fetches `tokio::fs::metadata(entry.path())` for each entry, continues on metadata failure, and pushes `ReadDirectoryEntry { file_name, is_directory, is_file }` into a result vector.
+**Data flow**: It receives a path and optional sandbox context, rejects sandbox context, opens the directory, loops over entries, reads each entry's metadata when possible, and returns a list of names and type flags.
 
-**Call relations**: This method backs unsandboxed directory listing. Its skip-on-metadata-error behavior is a deliberate resilience choice so one unreadable child does not fail the whole listing.
+**Call relations**: UnsandboxedFileSystem::read_directory delegates here when LocalFileSystem has chosen ordinary local access.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (read_directory); 5 external calls (pin, new, metadata, read_dir, as_path).
 
@@ -1849,11 +1859,11 @@ fn remove(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Deletes a file, symlink, or directory from the host filesystem, honoring recursive and force options. It distinguishes directories using `symlink_metadata` so symlinks are removed as files rather than traversed.
+**Purpose**: Deletes a local file or directory, following options for recursive deletion and ignoring missing paths when forced.
 
-**Data flow**: It rejects sandbox context, converts the path, calls `tokio::fs::symlink_metadata`, and on success branches by `file_type`: directories use `remove_dir_all` or `remove_dir` depending on `options.recursive`, everything else uses `remove_file`. If metadata lookup returns `NotFound` and `options.force` is true, it returns success; otherwise it propagates the error.
+**Data flow**: It receives a path, removal options, and optional sandbox context. It rejects sandbox context, checks what kind of item exists, removes a file or directory appropriately, and returns success; if the path is missing and force is true, it also returns success.
 
-**Call relations**: This is the concrete deletion implementation used by the unsandboxed wrapper and routed `LocalFileSystem` removes.
+**Call relations**: UnsandboxedFileSystem::remove calls this after rejecting platform-sandboxed requests.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (remove); 6 external calls (pin, remove_dir, remove_dir_all, remove_file, symlink_metadata, as_path).
 
@@ -1870,11 +1880,11 @@ fn copy(
     ) -> Execut
 ```
 
-**Purpose**: Copies a regular file, directory tree, or symlink on the host filesystem using blocking stdlib operations offloaded to a blocking task. It enforces recursive directory copy and prevents copying a directory into itself or a descendant.
+**Purpose**: Copies a local file-system item. It supports regular files, directories when recursive copying is requested, and symlinks.
 
-**Data flow**: It rejects sandbox context, converts source and destination `PathUri`s to owned `PathBuf`s, then runs a `spawn_blocking` closure. Inside the closure it reads `symlink_metadata(source)`, branches on file type, requires `options.recursive` for directories, checks `destination_is_same_or_descendant_of_source`, calls `copy_dir_recursive` for directories, `copy_symlink` for symlinks, `std::fs::copy` for regular files, and otherwise returns an `InvalidInput` error. Join errors from `spawn_blocking` are mapped to `io::Error::other`.
+**Data flow**: It receives source and destination paths, copy options, and optional sandbox context. It rejects sandbox context, converts both paths, then runs the blocking copy work on a separate thread so the async runtime is not stalled. It returns success or a clear error.
 
-**Call relations**: This is the concrete copy implementation used by the unsandboxed wrapper and routed `LocalFileSystem` copies. It delegates directory recursion, symlink recreation, and descendant detection to helpers in this file.
+**Call relations**: UnsandboxedFileSystem::copy delegates here. Inside the copy path, helper functions perform recursive directory copying, symlink copying, and checks that prevent copying a directory into itself.
 
 *Call graph*: calls 2 internal fn (reject_sandbox_context, to_abs_path); called by 1 (copy); 2 external calls (pin, spawn_blocking).
 
@@ -1885,11 +1895,11 @@ fn copy(
 fn reject_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Result<()>
 ```
 
-**Purpose**: Rejects any direct filesystem call that was given a sandbox context at all. It enforces the invariant that `DirectFileSystem` never interprets sandbox metadata.
+**Purpose**: Refuses any sandbox context for direct file-system operations. This keeps the lowest layer simple and prevents callers from thinking direct access is sandboxed.
 
-**Data flow**: It inspects the optional sandbox argument; if `Some`, it returns an `InvalidInput` `io::Error` with a fixed message, otherwise it returns `Ok(())`.
+**Data flow**: It receives an optional sandbox context. If one is present, it returns an input error; if none is present, it returns success.
 
-**Call relations**: All `DirectFileSystem` operations call this before touching paths or disk, making it the guardrail that keeps direct host access separate from sandbox-aware routing.
+**Call relations**: DirectFileSystem methods call this before touching the operating system directly.
 
 *Call graph*: called by 8 (canonicalize, copy, create_directory, get_metadata, open_file_for_read, read_directory, remove, write_file); 1 external calls (new).
 
@@ -1900,11 +1910,11 @@ fn reject_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Res
 fn reject_platform_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Result<()>
 ```
 
-**Purpose**: Rejects only sandbox contexts that explicitly request platform sandbox execution. It allows unsandboxed wrappers to accept a context object when it does not imply sandbox routing.
+**Purpose**: Refuses requests that say they must run in the platform sandbox. This prevents the unsandboxed wrapper from silently bypassing required isolation.
 
-**Data flow**: It checks `sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox)` and returns an `InvalidInput` error if true; otherwise it returns `Ok(())`.
+**Data flow**: It receives an optional sandbox context. If the context says sandboxing should run, it returns an error; otherwise it returns success.
 
-**Call relations**: Every `UnsandboxedFileSystem` method calls this before delegating to `DirectFileSystem`, so callers can pass through non-sandbox contexts without tripping the stricter `reject_sandbox_context` check.
+**Call relations**: UnsandboxedFileSystem methods call this before delegating to DirectFileSystem.
 
 *Call graph*: called by 10 (canonicalize, copy, create_directory, get_metadata, open_file_for_read, read_directory, read_file, read_file_stream, remove, write_file); 1 external calls (new).
 
@@ -1915,11 +1925,11 @@ fn reject_platform_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -
 fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Recursively copies a directory tree using blocking stdlib APIs, preserving regular files and symlinks. It creates target directories as needed and descends depth-first.
+**Purpose**: Copies a directory tree by walking through every child item. It preserves regular files and symlinks while recreating folders at the destination.
 
-**Data flow**: It creates the target directory with `std::fs::create_dir_all`, iterates `std::fs::read_dir(source)`, computes each child target with `target.join(entry.file_name())`, inspects `entry.file_type()`, recursively calls itself for directories, uses `std::fs::copy` for files, and `copy_symlink` for symlinks.
+**Data flow**: It receives a source directory and target directory, creates the target directory, reads each source entry, and copies each child according to whether it is a directory, file, or symlink.
 
-**Call relations**: This helper is called only from `DirectFileSystem::copy` after directory-specific validation has already happened, including the recursive option check and descendant-of-source rejection.
+**Call relations**: This helper is part of the directory-copy path used by DirectFileSystem::copy when recursive copying is allowed.
 
 *Call graph*: calls 1 internal fn (copy_symlink); 4 external calls (join, copy, create_dir_all, read_dir).
 
@@ -1933,11 +1943,11 @@ fn destination_is_same_or_descendant_of_source(
 ) -> io::Result<bool>
 ```
 
-**Purpose**: Determines whether a copy destination resolves to the source directory itself or somewhere beneath it. This prevents recursive self-copy explosions.
+**Purpose**: Checks whether a directory copy would place the destination inside the source directory. That dangerous case is rejected because it can create endless self-copying.
 
-**Data flow**: It canonicalizes the source path with `std::fs::canonicalize`, resolves the destination with `resolve_existing_path` so partially nonexistent targets are handled, checks `destination.starts_with(&source)`, and returns the resulting boolean.
+**Data flow**: It receives source and destination paths, canonicalizes the source, resolves the existing portion of the destination, compares whether the destination starts with the source path, and returns true or false.
 
-**Call relations**: Called from `DirectFileSystem::copy` only for directory copies, before recursion begins. It relies on `resolve_existing_path` so the check still works when the destination path does not yet exist.
+**Call relations**: DirectFileSystem::copy uses this check before recursive directory copying so it can stop invalid copy requests early.
 
 *Call graph*: calls 1 internal fn (resolve_existing_path); 2 external calls (starts_with, canonicalize).
 
@@ -1948,11 +1958,11 @@ fn destination_is_same_or_descendant_of_source(
 fn resolve_existing_path(path: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Canonicalizes the deepest existing ancestor of a path and then reattaches any nonexistent suffix components. This preserves symlink resolution for the existing prefix while still returning a usable path for not-yet-created descendants.
+**Purpose**: Resolves a path as much as possible even when the final file or folder does not exist yet. It canonicalizes the existing parent and then appends the not-yet-existing tail.
 
-**Data flow**: Starting from `path`, it repeatedly walks upward while the current path does not exist, pushing missing `file_name`s into `unresolved_suffix`. It canonicalizes the remaining existing path with `std::fs::canonicalize`, then appends the saved suffix components in reverse order and returns the resulting `PathBuf`.
+**Data flow**: It receives a path, walks upward collecting missing path pieces until it finds an existing path, canonicalizes that existing path, appends the missing pieces back, and returns the resolved path.
 
-**Call relations**: This helper is used by `destination_is_same_or_descendant_of_source`, `current_sandbox_cwd`, and a regression test covering symlink-parent `..` escapes. It is a key design choice for safe path reasoning when the full path may not exist yet.
+**Call relations**: current_sandbox_cwd and destination_is_same_or_descendant_of_source call this. A Unix test also checks that it handles symlink and `..` path escapes correctly.
 
 *Call graph*: called by 3 (current_sandbox_cwd, destination_is_same_or_descendant_of_source, resolve_existing_path_handles_symlink_parent_dotdot_escape); 2 external calls (new, canonicalize).
 
@@ -1963,11 +1973,11 @@ fn resolve_existing_path(path: &Path) -> io::Result<PathBuf>
 fn current_sandbox_cwd() -> io::Result<PathBuf>
 ```
 
-**Purpose**: Returns the current working directory in resolved form suitable for sandbox path calculations. It wraps `current_dir` with the same canonicalize-existing-prefix logic used elsewhere.
+**Purpose**: Returns the current working directory in a resolved form suitable for sandbox decisions. This matters when the current directory may include symlinks or other path tricks.
 
-**Data flow**: It reads `std::env::current_dir()`, maps any failure into `io::Error::other` with context text, passes the resulting path to `resolve_existing_path`, and returns the resolved `PathBuf`.
+**Data flow**: It reads the process's current directory, converts any read failure into a clearer error, resolves the path with resolve_existing_path, and returns the resolved PathBuf.
 
-**Call relations**: Higher-level sandbox setup calls this to anchor sandbox cwd handling. It delegates all path normalization details to `resolve_existing_path`.
+**Call relations**: The sandbox_cwd flow calls this when it needs the server's current directory for sandbox setup.
 
 *Call graph*: calls 1 internal fn (resolve_existing_path); called by 1 (sandbox_cwd); 1 external calls (current_dir).
 
@@ -1978,11 +1988,11 @@ fn current_sandbox_cwd() -> io::Result<PathBuf>
 fn copy_symlink(source: &Path, target: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Recreates a symlink at the destination rather than copying the target contents. It is platform-specific because Windows needs to know whether the link points to a directory.
+**Purpose**: Copies a symlink as a symlink instead of copying the file or folder it points to. A symlink is a shortcut-like file-system entry.
 
-**Data flow**: It reads the source link target with `std::fs::read_link`. On Unix it calls `std::os::unix::fs::symlink(&link_target, target)`. On Windows it calls `symlink_points_to_directory(source)?` and then chooses `symlink_dir` or `symlink_file`. On unsupported platforms it returns an `Unsupported` error.
+**Data flow**: It receives source and target paths, reads the source link's target, and creates a new symlink at the destination. On Unix it uses the standard symlink call; on Windows it chooses a file or directory symlink; on unsupported platforms it returns an error.
 
-**Call relations**: This helper is used by both `copy_dir_recursive` and `DirectFileSystem::copy` when the source object is a symlink. On Windows it depends on `symlink_points_to_directory` to preserve link kind even for dangling directory symlinks.
+**Call relations**: copy_dir_recursive calls this for symlink entries, and DirectFileSystem::copy uses the same behavior when the top-level source is a symlink.
 
 *Call graph*: calls 1 internal fn (symlink_points_to_directory); called by 1 (copy_dir_recursive); 5 external calls (new, read_link, symlink, symlink_dir, symlink_file).
 
@@ -1993,11 +2003,11 @@ fn copy_symlink(source: &Path, target: &Path) -> io::Result<()>
 fn symlink_points_to_directory(source: &Path) -> io::Result<bool>
 ```
 
-**Purpose**: Determines whether a Windows symlink is a directory symlink by inspecting symlink metadata rather than following the target. This supports dangling directory symlinks.
+**Purpose**: On Windows, checks whether a symlink is marked as pointing to a directory. Windows needs this distinction when creating a replacement symlink.
 
-**Data flow**: It reads `std::fs::symlink_metadata(source)?`, accesses the Windows-specific `FileTypeExt::is_symlink_dir()` flag, and returns the resulting boolean.
+**Data flow**: It receives a symlink path, reads symlink metadata without following the link, checks the directory-symlink flag, and returns true or false.
 
-**Call relations**: Only the Windows branch of `copy_symlink` calls this, so symlink recreation can choose `symlink_dir` versus `symlink_file` correctly.
+**Call relations**: copy_symlink calls this on Windows before deciding whether to create a directory symlink or a file symlink.
 
 *Call graph*: called by 1 (copy_symlink); 1 external calls (symlink_metadata).
 
@@ -2008,11 +2018,11 @@ fn symlink_points_to_directory(source: &Path) -> io::Result<bool>
 fn system_time_to_unix_ms(time: SystemTime) -> i64
 ```
 
-**Purpose**: Converts a `SystemTime` into a signed Unix-milliseconds timestamp, falling back to `0` on underflow or conversion failure. It normalizes filesystem timestamps into the executor’s metadata format.
+**Purpose**: Converts a system timestamp into milliseconds since the Unix epoch, which is the common time count starting at January 1, 1970.
 
-**Data flow**: It computes `time.duration_since(UNIX_EPOCH)`, converts the duration’s milliseconds to `i64` if possible, and returns that value or `0` if any step fails.
+**Data flow**: It receives a SystemTime, measures its duration since the Unix epoch, converts that duration to a 64-bit millisecond number if possible, and returns 0 if the conversion cannot be made.
 
-**Call relations**: Used by `DirectFileSystem::get_metadata` for `created_at_ms` and `modified_at_ms`, ensuring missing or invalid timestamps do not fail metadata retrieval.
+**Call relations**: DirectFileSystem::get_metadata uses this when filling creation and modification times in FileMetadata.
 
 *Call graph*: 1 external calls (duration_since).
 
@@ -2023,11 +2033,11 @@ fn system_time_to_unix_ms(time: SystemTime) -> i64
 fn resolve_existing_path_handles_symlink_parent_dotdot_escape() -> io::Result<()>
 ```
 
-**Purpose**: Regression test proving that `resolve_existing_path` resolves a symlinked parent before applying `..`, preventing path confusion through symlink escapes. It encodes the intended canonicalization semantics for sandbox-related path handling.
+**Purpose**: Tests that resolve_existing_path correctly handles a path that goes through a symlink and then uses `..` to move upward. This protects path resolution behavior that matters for sandbox safety.
 
-**Data flow**: It creates a temp directory tree with `allowed` and `outside`, adds a symlink `allowed/link -> outside`, resolves `allowed/link/../secret.txt`, resolves the temp root separately, and asserts the first result equals `<resolved temp root>/secret.txt`.
+**Data flow**: It creates temporary allowed and outside folders, adds a symlink from the allowed folder to the outside folder, resolves a tricky path through that link and parent reference, and checks that the result matches the expected resolved location.
 
-**Call relations**: This test directly exercises `resolve_existing_path` and documents why the helper canonicalizes the existing prefix before reattaching unresolved suffix components.
+**Call relations**: This test directly exercises resolve_existing_path and documents an important edge case involving symlink parents.
 
 *Call graph*: calls 1 internal fn (resolve_existing_path); 4 external calls (assert_eq!, create_dir_all, symlink, new).
 
@@ -2038,11 +2048,11 @@ fn resolve_existing_path_handles_symlink_parent_dotdot_escape() -> io::Result<()
 fn symlink_points_to_directory_handles_dangling_directory_symlinks() -> io::Result<()>
 ```
 
-**Purpose**: Windows-only regression test verifying that `symlink_points_to_directory` still reports `true` after the target directory has been removed. It protects the symlink-copy logic for dangling directory links.
+**Purpose**: On Windows, tests that a directory symlink is still recognized as a directory symlink even after its target directory is removed. This matters for copying dangling symlinks.
 
-**Data flow**: It creates a temp directory and source directory, attempts to create a directory symlink, removes the source directory, then asserts `symlink_points_to_directory(&link_path)? == true`. If symlink creation is unavailable, it exits early with success.
+**Data flow**: It creates a temporary directory and a directory symlink to it, removes the target directory, calls symlink_points_to_directory on the symlink, and checks that the answer is still true.
 
-**Call relations**: This test covers the Windows-specific helper used by `copy_symlink`, ensuring directory symlink recreation remains correct even when the original target no longer exists.
+**Call relations**: This test directly supports the Windows branch of copy_symlink, which needs to know what kind of symlink to recreate.
 
 *Call graph*: 4 external calls (assert_eq!, create_dir, remove_dir, new).
 
@@ -2051,11 +2061,13 @@ fn symlink_points_to_directory_handles_dangling_directory_symlinks() -> io::Resu
 
 `io_transport` · `request handling`
 
-This file is the remote filesystem adapter used by clients that want a local trait object but execute operations through an `ExecServerClient`. `RemoteFileSystem` holds a `LazyRemoteExecServerClient`, so each method first awaits `client.get()` and converts any connection/setup failure with `map_remote_error`. The concrete async methods then issue the corresponding RPC request structs: `FsCanonicalizeParams`, `FsReadFileParams`, `FsWriteFileParams`, `FsCreateDirectoryParams`, `FsGetMetadataParams`, `FsReadDirectoryParams`, `FsRemoveParams`, and `FsCopyParams`.
+This file is the bridge between local-looking file operations and a file system that actually lives behind a remote exec server. Without it, code that wants to read or write files would need to know the remote protocol details itself, including how to package paths, sandbox rules, file bytes, and errors.
 
-Data conversion is explicit. `read_file` decodes `response.data_base64` using `base64::STANDARD`, returning `InvalidData` if the server sends malformed base64. `get_metadata` and `read_directory` map protocol response fields into local `FileMetadata` and `ReadDirectoryEntry` values. `read_file_stream` is special: it rejects sandbox contexts that require platform sandboxing with `io::ErrorKind::Unsupported`, because the chunked streaming protocol does not support that mode, and otherwise delegates to `remote_file_stream::open`.
+The main type, `RemoteFileSystem`, holds a lazily created remote client. “Lazy” means the connection is only fetched when an operation needs it, like only calling a courier when you actually have a package to send. Each file operation gets that client, builds the matching protocol request, sends it, and converts the remote reply back into the project’s normal file-system types.
 
-The trait implementation simply boxes each async method into `ExecutorFileSystemFuture`, keeping the public interface object-safe. `remote_sandbox_context` clones an optional `FileSystemSandboxContext` and calls `drop_cwd_if_unused`, preserving URI-based paths while stripping unnecessary cwd state before transmission. `map_remote_error` is the key error boundary: JSON-RPC server code `-32004` becomes `NotFound`, `-32600` becomes `InvalidInput`, transport closure becomes `BrokenPipe`, and all other remote failures become generic `io::Error::other(...)`. The tests document cwd-dropping behavior and the broken-pipe mapping for closed/disconnected transports.
+File contents are sent as Base64 text, which is a safe way to carry raw bytes through a text-based protocol. Metadata and directory entries are translated from protocol shapes into local structs. Sandbox context is copied and cleaned before sending, so the remote side receives only the working-directory information it truly needs. Remote server failures are also translated into ordinary `io::Error` kinds, such as “not found,” “invalid input,” or “broken pipe,” so callers can react in the usual Rust file-I/O way.
+
+One important limitation is that streaming reads do not support platform sandboxing here; the file rejects that combination instead of pretending it is safe.
 
 #### Function details
 
@@ -2065,11 +2077,11 @@ The trait implementation simply boxes each async method into `ExecutorFileSystem
 fn new(client: LazyRemoteExecServerClient) -> Self
 ```
 
-**Purpose**: Constructs a remote filesystem adapter around a lazily initialized exec-server client.
+**Purpose**: Creates a `RemoteFileSystem` around a remote exec-server client. Callers use it when they want the standard executor file-system interface to operate through a remote server instead of directly on local disk.
 
-**Data flow**: It takes a `LazyRemoteExecServerClient`, emits a trace log, stores the client in `RemoteFileSystem`, and returns the new wrapper.
+**Data flow**: It receives a lazy remote client, records a trace message for debugging, and stores the client inside a new `RemoteFileSystem`. The result is a ready-to-use remote file-system adapter.
 
-**Call relations**: It is called by higher-level remote transport setup and path-URI tests. All subsequent filesystem trait calls route through the stored lazy client.
+**Call relations**: Setup code such as `remote_with_transport` calls this when wiring a remote transport into the executor. Tests that check path and sandbox URI behavior also create this object so later file operations can travel through the remote protocol.
 
 *Call graph*: called by 2 (remote_with_transport, remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conversion); 1 external calls (trace!).
 
@@ -2084,11 +2096,11 @@ fn canonicalize(
     ) -> ExecutorFileSystemFuture<'a, PathUri>
 ```
 
-**Purpose**: Requests canonicalization of a remote path and returns the normalized `PathUri` from the server.
+**Purpose**: Asks the remote server to turn a path into its canonical, cleaned-up form. This is used when the rest of the system needs the remote side’s real view of a path, not a local guess.
 
-**Data flow**: It takes `&PathUri` and optional sandbox context, logs the operation, awaits `self.client.get()`, builds `FsCanonicalizeParams` with a cloned path and `remote_sandbox_context(sandbox)`, sends `fs_canonicalize`, maps remote errors to `io::Error`, and returns `response.path`.
+**Data flow**: It takes a path and optional sandbox rules, gets the remote client, cleans the sandbox context with `remote_sandbox_context`, sends a canonicalize request, and returns the path from the server’s response. If the client or server reports an error, that error is converted into a normal I/O error.
 
-**Call relations**: It backs the `ExecutorFileSystem::canonicalize` trait method. It delegates sandbox shaping to `remote_sandbox_context` and connection/error translation to `map_remote_error`.
+**Call relations**: When executor code calls the file-system trait’s canonicalize operation, this method is the remote implementation. It relies on the lazy client for transport and on `remote_sandbox_context` so sandbox information is sent in the right remote-friendly form.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2103,11 +2115,11 @@ fn read_file(
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>>
 ```
 
-**Purpose**: Reads an entire remote file in one RPC call and decodes the returned base64 payload into raw bytes.
+**Purpose**: Reads an entire remote file into memory as bytes. It lets callers treat a remote file read like an ordinary file read.
 
-**Data flow**: It takes `&PathUri` and optional sandbox context, logs, acquires the remote client, sends `fs_read_file` with cloned path and transformed sandbox, then decodes `response.data_base64` using `STANDARD.decode`. RPC failures are mapped with `map_remote_error`; invalid base64 becomes `io::ErrorKind::InvalidData` with a message naming `dataBase64`.
+**Data flow**: It receives a path and optional sandbox context, gets the remote client, sends a read-file request, and receives file contents encoded as Base64 text. It decodes that text back into raw bytes and returns them; invalid Base64 becomes an invalid-data I/O error.
 
-**Call relations**: It backs the `ExecutorFileSystem::read_file` trait method and is exercised by the path-URI integration test to verify that URIs are transmitted unchanged.
+**Call relations**: This is used through the executor file-system interface when a caller wants the full file at once. It hands sandbox cleanup to `remote_sandbox_context` and depends on the remote client to perform the actual read.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2122,11 +2134,11 @@ fn read_file_stream(
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>
 ```
 
-**Purpose**: Starts a chunked remote file read stream when sandbox constraints permit it.
+**Purpose**: Opens a remote file for streaming reads, so callers can consume it gradually instead of loading it all at once. It refuses sandboxed streaming when the sandbox requires platform enforcement, because that combination is not supported here.
 
-**Data flow**: It takes `&PathUri` and optional sandbox context. If the sandbox exists and `should_run_in_sandbox` is true, it immediately returns `io::ErrorKind::Unsupported`. Otherwise it logs, acquires the remote client, clones the path, transforms the sandbox with `remote_sandbox_context`, and delegates to `file_stream::open` to obtain a `FileSystemReadStream`.
+**Data flow**: It checks the optional sandbox first. If the sandbox says the operation must run in a platform sandbox, it returns an unsupported-operation error. Otherwise it gets the remote client, prepares the cleaned sandbox context, and asks `file_stream::open` to create the read stream.
 
-**Call relations**: It backs the `ExecutorFileSystem::read_file_stream` trait method. Its main special role is enforcing the invariant that streaming reads are unavailable for platform-sandboxed execution.
+**Call relations**: The executor file-system trait calls this when a streaming read is requested. This method is the gatekeeper for the unsupported sandbox case, then delegates the stream-specific remote protocol work to the file stream module.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 5 external calls (pin, new, open, trace!, clone).
 
@@ -2142,11 +2154,11 @@ fn write_file(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Writes a complete file to the remote exec-server by base64-encoding the provided contents and sending them in one RPC request.
+**Purpose**: Writes bytes to a file on the remote side. It hides the protocol detail that raw bytes must be encoded before being sent.
 
-**Data flow**: It takes `&PathUri`, `contents: Vec<u8>`, and optional sandbox context, logs, acquires the client, builds `FsWriteFileParams` with a cloned path, `STANDARD.encode(contents)`, and transformed sandbox, sends `fs_write_file`, maps any remote error, and returns `Ok(())` on success.
+**Data flow**: It takes a path, a byte vector, and optional sandbox rules. It gets the remote client, Base64-encodes the bytes into text, sends a write-file request, and returns success when the server accepts it. Remote failures become ordinary I/O errors.
 
-**Call relations**: It backs the `ExecutorFileSystem::write_file` trait method and follows the same client acquisition and sandbox conversion pattern as the other RPC wrappers.
+**Call relations**: This is called through the executor file-system interface when higher-level code wants to save file contents remotely. It uses `remote_sandbox_context` before handing the request to the remote client.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2162,11 +2174,11 @@ fn create_directory(
     ) -> ExecutorFileSystemFuture<'a,
 ```
 
-**Purpose**: Creates a remote directory with optional recursive behavior.
+**Purpose**: Creates a directory on the remote file system. It also carries the caller’s choice about whether missing parent folders should be created automatically.
 
-**Data flow**: It takes `&PathUri`, `CreateDirectoryOptions`, and optional sandbox context, logs, acquires the client, sends `fs_create_directory` with cloned path, `recursive: Some(options.recursive)`, and transformed sandbox, maps errors, and returns `Ok(())`.
+**Data flow**: It receives a path, directory-creation options, and optional sandbox context. It gets the remote client, sends the path plus the recursive option to the server, and returns success or a mapped I/O error.
 
-**Call relations**: It backs the `ExecutorFileSystem::create_directory` trait method.
+**Call relations**: Executor file-system users reach this method when they request directory creation against a remote backend. The method prepares the request and depends on the remote server to do the actual disk change.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2181,11 +2193,11 @@ fn get_metadata(
     ) -> ExecutorFileSystemFuture<'a, FileMetadata>
 ```
 
-**Purpose**: Fetches remote metadata for a path and converts the protocol response into the local `FileMetadata` struct.
+**Purpose**: Fetches basic facts about a remote path, such as whether it is a file, directory, or symbolic link, and its size and timestamps. Callers use this before deciding how to treat a path.
 
-**Data flow**: It takes `&PathUri` and optional sandbox context, logs, acquires the client, sends `fs_get_metadata`, maps errors, and constructs `FileMetadata` from the response fields `is_directory`, `is_file`, `is_symlink`, `size`, `created_at_ms`, and `modified_at_ms`.
+**Data flow**: It takes a path and optional sandbox rules, obtains the remote client, sends a metadata request, and converts the protocol response into the local `FileMetadata` shape. The returned object contains only the normalized metadata fields the rest of the executor expects.
 
-**Call relations**: It backs the `ExecutorFileSystem::get_metadata` trait method and is one of the methods that demonstrates explicit protocol-to-domain struct mapping.
+**Call relations**: This sits behind the executor file-system trait’s metadata operation. It uses `remote_sandbox_context` for safe request preparation and translates the remote response so higher layers do not need to know the protocol format.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2200,11 +2212,11 @@ fn read_directory(
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>
 ```
 
-**Purpose**: Lists a remote directory and maps each protocol entry into the local `ReadDirectoryEntry` type.
+**Purpose**: Lists the entries inside a remote directory. It gives callers a simple list of names and basic file-versus-directory information.
 
-**Data flow**: It takes `&PathUri` and optional sandbox context, logs, acquires the client, sends `fs_read_directory`, maps errors, then transforms `response.entries` with `into_iter().map(...)` into a `Vec<ReadDirectoryEntry>` containing `file_name`, `is_directory`, and `is_file`.
+**Data flow**: It receives a directory path and optional sandbox context, gets the remote client, and sends a read-directory request. It then maps each protocol entry into a local `ReadDirectoryEntry` and returns the collected list.
 
-**Call relations**: It backs the `ExecutorFileSystem::read_directory` trait method.
+**Call relations**: This method is used when the executor file-system interface needs a directory listing from the remote backend. It performs the remote call, then reshapes the result for code that expects the project’s common file-system types.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2220,11 +2232,11 @@ fn remove(
     ) -> ExecutorFileSystemFuture<'a, ()>
 ```
 
-**Purpose**: Removes a remote file or directory using the provided recursive and force options.
+**Purpose**: Deletes a file or directory on the remote side. It carries options such as recursive deletion and force deletion so callers can request the same behavior they would expect from local file operations.
 
-**Data flow**: It takes `&PathUri`, `RemoveOptions`, and optional sandbox context, logs, acquires the client, sends `fs_remove` with cloned path, `recursive: Some(options.recursive)`, `force: Some(options.force)`, and transformed sandbox, maps errors, and returns `Ok(())`.
+**Data flow**: It takes the target path, remove options, and optional sandbox rules. It gets the remote client, sends a remove request with the recursive and force flags, and returns success if the server completes the deletion.
 
-**Call relations**: It backs the `ExecutorFileSystem::remove` trait method.
+**Call relations**: Higher-level executor code reaches this through the file-system trait when it wants to delete something remotely. This method packages the deletion request and lets the remote server perform the actual filesystem change.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2241,11 +2253,11 @@ fn copy(
     ) -> Execut
 ```
 
-**Purpose**: Requests a remote filesystem copy operation between two paths.
+**Purpose**: Copies a file or directory from one remote path to another. It includes the recursive option for directory copies.
 
-**Data flow**: It takes source and destination `&PathUri`, `CopyOptions`, and optional sandbox context, logs, acquires the client, sends `fs_copy` with cloned source and destination paths, `recursive: options.recursive`, and transformed sandbox, maps errors, and returns `Ok(())`.
+**Data flow**: It receives a source path, destination path, copy options, and optional sandbox context. It gets the remote client, sends a copy request with both paths and the recursive flag, and returns success or a mapped I/O error.
 
-**Call relations**: It backs the `ExecutorFileSystem::copy` trait method.
+**Call relations**: This is the remote implementation of the executor file-system copy operation. It uses `remote_sandbox_context` to prepare sandbox data, then hands the actual copy command to the remote client.
 
 *Call graph*: calls 2 internal fn (get, remote_sandbox_context); 3 external calls (pin, trace!, clone).
 
@@ -2258,11 +2270,11 @@ fn remote_sandbox_context(
 ) -> Option<FileSystemSandboxContext>
 ```
 
-**Purpose**: Prepares an optional sandbox context for transmission to the remote server by cloning it and dropping cwd when that cwd is not semantically needed.
+**Purpose**: Prepares sandbox information before it is sent to the remote server. It removes the current working directory from the sandbox context when that directory is not needed, avoiding unnecessary or misleading path information.
 
-**Data flow**: It takes `Option<&FileSystemSandboxContext>`, clones the inner value when present, applies `FileSystemSandboxContext::drop_cwd_if_unused`, and returns `Option<FileSystemSandboxContext>`.
+**Data flow**: It receives an optional reference to a sandbox context. If there is no sandbox, it returns `None`; if there is one, it clones it, drops the current working directory when it is unused, and returns the cleaned copy.
 
-**Call relations**: It is called by every remote filesystem RPC wrapper and by the streaming helper path. Tests in this file verify both the cwd-dropping and cwd-preserving cases.
+**Call relations**: Every remote file operation calls this before sending sandbox data. The unit tests exercise both important cases: dropping an unused working directory and preserving one that sandbox rules still depend on.
 
 *Call graph*: called by 11 (canonicalize, copy, create_directory, get_metadata, read_directory, read_file, read_file_stream, remove, write_file, remote_sandbox_context_drops_unused_cwd (+1 more)).
 
@@ -2273,11 +2285,11 @@ fn remote_sandbox_context(
 fn map_remote_error(error: ExecServerError) -> io::Error
 ```
 
-**Purpose**: Converts `ExecServerError` values from the remote transport into conventional local `tokio::io::Error` kinds.
+**Purpose**: Converts exec-server errors into standard Rust I/O errors. This matters because callers of a file system expect familiar categories like “not found” or “invalid input,” not remote protocol error codes.
 
-**Data flow**: It pattern-matches the input `ExecServerError`. Server code `-32004` becomes `io::ErrorKind::NotFound`; server code `-32600` becomes `InvalidInput`; other server errors become `io::Error::other(message)`; `Closed` and `Disconnected(_)` become `BrokenPipe` with the fixed message `exec-server transport closed`; all remaining variants become `io::Error::other(error.to_string())`.
+**Data flow**: It receives an `ExecServerError`. Server “not found” errors become `io::ErrorKind::NotFound`, invalid request errors become `InvalidInput`, closed or disconnected transports become `BrokenPipe`, and other failures become a general I/O error with the available message.
 
-**Call relations**: It is used by all remote filesystem methods and by `remote_file_stream::open` to normalize transport and server failures at the filesystem boundary.
+**Call relations**: Remote file operations use this whenever getting the client or awaiting a remote request fails. The transport-error test checks the important case where a closed or disconnected connection is reported as a broken pipe.
 
 *Call graph*: 3 external calls (new, other, to_string).
 
@@ -2288,11 +2300,11 @@ fn map_remote_error(error: ExecServerError) -> io::Error
 fn remote_sandbox_context_drops_unused_cwd()
 ```
 
-**Purpose**: Verifies that `remote_sandbox_context` removes cwd when the sandbox policy does not require it.
+**Purpose**: Checks that sandbox cleanup removes the current working directory when the permissions do not need it. This prevents remote requests from carrying extra local path context for no reason.
 
-**Data flow**: The test builds a restricted sandbox policy rooted at a concrete path, derives a `PermissionProfile`, constructs a `FileSystemSandboxContext` with a cwd, calls `remote_sandbox_context`, and asserts that the resulting context has `cwd == None`.
+**Data flow**: The test builds a restricted file-system policy that points at a concrete path, creates a sandbox context with a current working directory, runs `remote_sandbox_context`, and checks that the resulting context has no current working directory.
 
-**Call relations**: It documents the intended optimization performed by `remote_sandbox_context` before sandbox data is sent over RPC.
+**Call relations**: The test harness calls this during automated tests. It directly exercises `remote_sandbox_context` and uses permission-profile helpers to create a realistic sandbox input.
 
 *Call graph*: calls 4 internal fn (remote_sandbox_context, from_permission_profile_with_cwd, from_runtime_permissions, restricted); 3 external calls (assert_eq!, path_uri, vec!).
 
@@ -2303,11 +2315,11 @@ fn remote_sandbox_context_drops_unused_cwd()
 fn remote_sandbox_context_preserves_required_cwd()
 ```
 
-**Purpose**: Verifies that `remote_sandbox_context` keeps cwd when the sandbox policy depends on project-root-relative semantics.
+**Purpose**: Checks that sandbox cleanup keeps the current working directory when sandbox rules depend on project-root special paths. This protects remote sandbox behavior from losing context it still needs.
 
-**Data flow**: The test builds a restricted sandbox policy using `FileSystemSpecialPath::project_roots`, derives permissions, constructs a sandbox context with a cwd, calls `remote_sandbox_context`, and asserts that the resulting context still contains that cwd.
+**Data flow**: The test builds a policy using a special project-roots path, creates a sandbox context with a current working directory, runs `remote_sandbox_context`, and confirms that the same working directory is still present afterward.
 
-**Call relations**: It complements the previous test by covering the branch where `drop_cwd_if_unused` must retain cwd information.
+**Call relations**: The test harness runs this alongside the other sandbox cleanup test. Together, they show that `remote_sandbox_context` is selective: it drops unused context but keeps required context.
 
 *Call graph*: calls 4 internal fn (remote_sandbox_context, from_permission_profile_with_cwd, from_runtime_permissions, restricted); 3 external calls (assert_eq!, path_uri, vec!).
 
@@ -2318,11 +2330,11 @@ fn remote_sandbox_context_preserves_required_cwd()
 fn transport_errors_map_to_broken_pipe()
 ```
 
-**Purpose**: Checks that closed or disconnected transport errors are surfaced to filesystem callers as `BrokenPipe` with a stable message.
+**Purpose**: Verifies that closed and disconnected remote transports are reported as a broken pipe. A broken pipe is the standard I/O way to say the communication channel is no longer usable.
 
-**Data flow**: The test creates an array containing `ExecServerError::Closed` and `ExecServerError::Disconnected(...)`, maps each through `map_remote_error`, collects `(kind, message)` pairs, and asserts that both become `io::ErrorKind::BrokenPipe` with `exec-server transport closed`.
+**Data flow**: The test creates two transport-related exec-server errors, maps each one with `map_remote_error`, collects the resulting error kind and message, and compares them with the expected broken-pipe results.
 
-**Call relations**: It documents the transport-failure branch of `map_remote_error`.
+**Call relations**: The test harness calls this during automated tests. It protects the behavior that remote file operations rely on when their underlying connection disappears.
 
 *Call graph*: 2 external calls (assert_eq!, Disconnected).
 
@@ -2333,11 +2345,11 @@ fn transport_errors_map_to_broken_pipe()
 fn absolute_test_path(name: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an absolute temporary filesystem path for sandbox-context tests.
+**Purpose**: Builds an absolute temporary path for tests. It gives the tests a valid absolute path without hard-coding a machine-specific location.
 
-**Data flow**: It takes a `name: &str`, joins it onto `std::env::temp_dir()`, converts the result with `AbsolutePathBuf::from_absolute_path`, and returns the validated absolute path.
+**Data flow**: It takes a simple name, appends it to the operating system’s temporary directory, converts that path into the project’s absolute-path type, and returns it.
 
-**Call relations**: It is a local test helper used by `path_uri` and the sandbox-context tests.
+**Call relations**: Test helper code calls this when constructing path values for sandbox and URI tests. `tests::path_uri` builds on it to make `PathUri` values.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 1 external calls (temp_dir).
 
@@ -2348,10 +2360,10 @@ fn absolute_test_path(name: &str) -> AbsolutePathBuf
 fn path_uri(name: &str) -> PathUri
 ```
 
-**Purpose**: Converts a named temporary absolute path into a `PathUri` for tests.
+**Purpose**: Creates a `PathUri` test value from a simple name. A `PathUri` is the project’s URI-style representation of a file path.
 
-**Data flow**: It takes `name: &str`, obtains an absolute path via `absolute_test_path`, converts it with `PathUri::from_abs_path`, and returns the URI.
+**Data flow**: It receives a name, turns it into an absolute test path using `tests::absolute_test_path`, converts that absolute path into a `PathUri`, and returns the URI.
 
-**Call relations**: It is a fixture helper used by the sandbox-context tests.
+**Call relations**: The sandbox-context tests call this helper when they need current-working-directory paths expressed in the same URI form used by remote file-system requests.
 
 *Call graph*: calls 1 internal fn (from_abs_path); 1 external calls (absolute_test_path).

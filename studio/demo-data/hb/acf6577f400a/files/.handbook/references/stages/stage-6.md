@@ -1,10 +1,12 @@
 # Persistence and local runtime services startup  `stage-6`
 
-This stage runs during startup and establishes the local persistence foundation that the rest of the application depends on. Its job is to open the SQLite-backed runtime, apply schema migrations, recover from damaged databases when possible, and only then expose durable state services to higher layers such as rollout and thread metadata management.
+This stage runs during startup and prepares the app’s local storage so the rest of Codex can work safely. It is like opening a workshop before the day begins: checking the filing cabinets, updating their labels, and repairing any damaged drawers.
 
-At the core, state/src/runtime.rs constructs the shared StateRuntime by opening and migrating the state, logs, goals, and memories databases, then providing helpers for integrity checks, filesystem paths, and orderly shutdown. state/src/migrations.rs supplies the embedded migrators and the migration policy, including tolerance for databases that may already have been advanced by a newer binary. If initialization fails because of corruption, state/src/runtime/recovery.rs detects that case and backs up the affected database files or the entire SQLite home for rebuild; cli/src/state_db_recovery.rs turns those failures into user-facing recovery guidance in the interactive CLI.
+The main entry point is state/src/runtime.rs. It opens the local SQLite databases, which are small file-based databases, applies needed schema updates, and hands usable store objects to the rest of the program. state/src/migrations.rs defines those updates in a careful way so different Codex versions can share the same database without older versions crashing on newer changes.
 
-On top of the runtime, rollout/src/state_db.rs integrates rollout storage with the SQLite state runtime, blocks startup until required metadata backfill is complete, and offers thread metadata listing, lookup, reconciliation, and repair operations. core/src/state_db_bridge.rs gives core code a narrow entry point into that rollout state initialization without depending directly on rollout internals.
+Rollout data has its own path. core/src/state_db_bridge.rs gives core code a simple place to start and refer to the rollout state database. rollout/src/state_db.rs connects older session files on disk with the faster SQLite index, waits for copying to finish, and offers helpers to read or fix thread metadata.
+
+If storage is broken, recovery code steps in. cli/src/state_db_recovery.rs explains startup failures to the user or moves bad state aside. state/src/runtime/recovery.rs backs up only damaged database files so fresh ones can be created.
 
 ## Files in this stage
 
@@ -15,9 +17,11 @@ These files provide the top-level entry points that connect higher layers into r
 
 `orchestration` · `startup`
 
-This file is intentionally minimal. It re-exports `StateDbHandle` from `codex_rollout::state_db` so the rest of the core crate can refer to the database handle through a stable local module path, and it defines `init_state_db`, an async wrapper around `rollout_state_db::init(config)`. The wrapper takes the core `Config` type and returns `Option<StateDbHandle>`, preserving the rollout crate's semantics that database initialization may be disabled or unavailable.
+This file exists to keep the core crate from reaching directly into the rollout crate everywhere it needs the state database. A state database is a place where the system can store and read persistent state, rather than keeping everything only in memory. Without this bridge, callers would need to know the exact external module path and setup function, which would spread that dependency through the codebase.
 
-There is no additional policy, caching, or error translation here; the value of the file is architectural. By routing initialization through this bridge, the core crate can keep rollout-state-db wiring localized and avoid scattering direct imports of the rollout module throughout the codebase. That also makes future substitution or instrumentation easier because callers depend on this narrow function rather than the external module directly.
+The file does two simple things. First, it re-exports `StateDbHandle`, which means other code can import the database handle from this local bridge instead of from `codex_rollout` directly. A handle is like a key or remote control for talking to an already-created database connection. Second, it defines `init_state_db`, an asynchronous startup helper. “Asynchronous” means it may wait for work such as opening storage or connecting to a service without blocking the whole program.
+
+When given the main `Config`, `init_state_db` passes that configuration to the rollout state database initializer and returns whatever it produces. The result is optional: if state database support is not configured or cannot be created in the expected way, the caller may receive no handle.
 
 #### Function details
 
@@ -27,26 +31,24 @@ There is no additional policy, caching, or error translation here; the value of 
 async fn init_state_db(config: &Config) -> Option<StateDbHandle>
 ```
 
-**Purpose**: Initializes the rollout state database for the provided configuration and returns the resulting handle if one is available. It is a direct async pass-through to the rollout crate.
+**Purpose**: Starts the rollout state database using the application configuration. Callers use it during setup when they want an optional `StateDbHandle` they can pass around to code that needs persistent state.
 
-**Data flow**: It takes `&Config`, awaits `rollout_state_db::init(config)`, and returns the resulting `Option<StateDbHandle>` unchanged. No additional state is read or written in this module.
+**Data flow**: It receives a `Config`, reads no other local data, and forwards that configuration to the rollout crate’s state database initializer. After waiting for that initializer to finish, it returns the resulting `Option<StateDbHandle>`: either a usable database handle or nothing.
 
-**Call relations**: Called during startup when session services are being assembled and optional persistence needs to be brought online. It delegates all initialization logic to the external rollout state-db implementation.
+**Call relations**: This function is the local doorway into the external rollout state database setup. When startup code calls it, it immediately hands the work off to `codex_rollout::state_db::init`, then passes that result back to the caller without adding extra rules of its own.
 
 *Call graph*: 1 external calls (init).
 
 
 ### `rollout/src/state_db.rs`
 
-`orchestration` · `startup and request handling`
+`io_transport` · `startup and thread lookup/update paths`
 
-This file is the main orchestration layer between rollout files on disk and the SQLite state database. It defines `StateDbHandle` as `Arc<codex_state::StateRuntime>`, startup timing constants, and a set of async helpers that either initialize the runtime or perform DB-first operations with careful fallback behavior.
+Rollout files are the original record of a conversation thread, but scanning many files is slow. This file lets the program use a SQLite database instead, while still treating the rollout files as the source of truth when the database is missing, stale, or not ready. Think of it like a library card catalog: the books are still on the shelves, but the catalog makes them much faster to find.
 
-Initialization flows through `init`/`try_init` into `try_init_with_roots_inner`, which opens the runtime, waits for rollout metadata backfill to reach `BackfillStatus::Complete`, records the gate duration with `codex_state::record_backfill_gate`, and closes the runtime on failure. `wait_for_backfill_gate` repeatedly reads backfill state, optionally triggers `metadata::backfill_sessions_with_lease` in tests or `metadata::backfill_sessions` in normal runs, warns once loudly and then logs informational retries, and times out after a fixed startup window.
+At startup, the file initializes the SQLite-backed runtime and runs a “backfill,” which means reading existing rollout files and filling the database with their metadata. It waits until that work is complete before returning the database handle, so callers do not unknowingly read half-built state. If startup logging is not ready yet, warnings are also printed directly to standard error so the user can still see what went wrong.
 
-For non-owning contexts, `get_state_db` opens the DB only if the file exists and backfill is already complete, recording fallback reasons like `db_unavailable`, `db_error`, or `backfill_incomplete` instead of mutating startup state.
-
-The rest of the file translates rollout-facing concepts into `codex_state` calls: `cursor_to_anchor` converts list cursors into millisecond `Anchor`s; listing helpers map sort keys, source filters, provider filters, cwd filters, and parent-thread filters into `codex_state` query types; stale rollout paths returned from SQLite are detected with `existing_rollout_path`, warned about, and deleted from the DB. Reconciliation helpers either apply incremental `RolloutItem`s or rebuild metadata from the rollout file, normalize cwd paths for comparison, preserve existing git info and explicit titles when appropriate, repair archived flags, update memory mode, and perform read-repair when filesystem fallback discovers a better rollout path. Throughout, the design favors resilience: absent DB context becomes a no-op or `None`, and most DB errors are downgraded to warnings so rollout features can continue via filesystem scanning.
+After startup, the file provides small adapter functions for common thread operations: listing threads, finding a rollout path by thread id, updating timestamps, marking memory state, and applying new rollout items to the database. It also contains repair paths. If SQLite points to a missing rollout file, or a file-based fallback succeeds, these helpers can update or rebuild the database row so future reads are correct.
 
 #### Function details
 
@@ -56,11 +58,11 @@ The rest of the file translates rollout-facing concepts into `codex_state` calls
 async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle>
 ```
 
-**Purpose**: Initializes the SQLite state runtime for normal callers and converts any startup failure into a warning plus `None`.
+**Purpose**: Starts the local SQLite state system for normal application use. It is forgiving: if setup fails, it warns and returns no database handle instead of crashing the caller.
 
-**Data flow**: Reads a `RolloutConfigView`, materializes it into an owned `RolloutConfig`, and extracts `codex_home`, `sqlite_home`, and `model_provider_id`. It awaits `try_init_with_roots`; on success it returns `Some(StateDbHandle)`, and on error it formats a detailed message, emits a startup warning, and returns `None`.
+**Data flow**: It receives a configuration view, turns it into a concrete rollout configuration, and passes the important paths and default model provider into the lower-level initializer. If initialization succeeds, the caller gets a shared database runtime; if it fails, the error is turned into a startup warning and the caller gets `None`.
 
-**Call relations**: This is the forgiving startup entry used when callers prefer degraded behavior over surfacing initialization errors. It delegates all real work to `try_init_with_roots` and only adds error-to-warning conversion around that path.
+**Call relations**: This is the friendly entry point for callers that want best-effort state persistence. It delegates the real work to `try_init_with_roots`, and uses `emit_startup_warning` when that work fails. The test `state_db_init_backfills_before_returning` calls it to verify that startup waits for backfill.
 
 *Call graph*: calls 3 internal fn (from_view, emit_startup_warning, try_init_with_roots); called by 1 (state_db_init_backfills_before_returning); 1 external calls (format!).
 
@@ -71,11 +73,11 @@ async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle>
 async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDbHandle>
 ```
 
-**Purpose**: Initializes the SQLite state runtime but preserves the exact error for callers that need to handle or surface it.
+**Purpose**: Starts the SQLite state system but preserves the exact error if something goes wrong. Callers use this when they want to report or handle initialization failure themselves.
 
-**Data flow**: Consumes a `RolloutConfigView`, clones it into `RolloutConfig`, extracts the same three root values as `init`, and forwards them to `try_init_with_roots`. It returns `anyhow::Result<StateDbHandle>` unchanged from the deeper initialization path.
+**Data flow**: It receives a configuration view, extracts the database home, Codex home, and default model provider, then asks the shared initializer to open and prepare the database. On success it returns the database runtime; on failure it returns the original error with context.
 
-**Call relations**: This function is used by callers such as app-server setup and test client startup that need explicit failure propagation. It is a thin wrapper over `try_init_with_roots`, unlike `init` which swallows errors.
+**Call relations**: This is the stricter sibling of `init`. It calls `try_init_with_roots` just like `init` does, but does not swallow errors. It is used by startup flows such as `start_test_client_with_capacity` and `init_state_db_for_app_server_target`.
 
 *Call graph*: calls 2 internal fn (from_view, try_init_with_roots); called by 2 (start_test_client_with_capacity, init_state_db_for_app_server_target).
 
@@ -90,11 +92,11 @@ async fn try_init_with_roots(
 ) -> anyhow::Result<StateDbHandle>
 ```
 
-**Purpose**: Starts initialization from explicit filesystem roots and default provider id, using the normal backfill behavior.
+**Purpose**: Initializes the database when the caller already has the needed filesystem roots and default provider string. It exists so both public startup functions can share the same core path.
 
-**Data flow**: Takes owned `PathBuf` values for `codex_home` and `sqlite_home` plus a provider id `String`. It forwards them to `try_init_with_roots_inner` with `backfill_lease_seconds` set to `None`, and returns that result.
+**Data flow**: It takes the Codex home path, SQLite home path, and default model provider, then forwards them to the inner initializer without a special test lease setting. The result is either a ready database runtime or an error.
 
-**Call relations**: This helper is the common internal target for both public initialization entry points. It exists to share the main startup logic with the test-only lease-aware variant.
+**Call relations**: `init` and `try_init` both call this after unpacking configuration. It immediately hands off to `try_init_with_roots_inner`, which does the actual database open and backfill wait.
 
 *Call graph*: calls 1 internal fn (try_init_with_roots_inner); called by 2 (init, try_init).
 
@@ -110,11 +112,11 @@ async fn try_init_with_roots_and_backfill_lease(
 ) -> anyhow::Result<StateDbH
 ```
 
-**Purpose**: Runs initialization with an explicit backfill lease duration so tests can simulate concurrent or stuck startup backfills deterministically.
+**Purpose**: Provides a test-only way to initialize the database with a custom backfill lease time. A lease is a temporary claim that lets one worker perform backfill work without others racing it.
 
-**Data flow**: Accepts the same owned roots and provider id as `try_init_with_roots`, plus an `i64` lease duration. It passes all of them into `try_init_with_roots_inner` wrapped in `Some(backfill_lease_seconds)` and returns the resulting `anyhow::Result<StateDbHandle>`.
+**Data flow**: It receives the same paths and provider as the normal initializer, plus a lease duration in seconds. It forwards all of that to the inner initializer, which uses the lease setting while waiting for backfill.
 
-**Call relations**: This test-only helper feeds the same core startup path as production initialization, but forces `wait_for_backfill_gate` to use lease-aware backfill logic.
+**Call relations**: This is compiled only for tests. It calls `try_init_with_roots_inner` with a lease override so tests can exercise timing and coordination behavior without waiting for production-length intervals.
 
 *Call graph*: calls 1 internal fn (try_init_with_roots_inner).
 
@@ -130,11 +132,11 @@ async fn try_init_with_roots_inner(
 ) -> anyhow::Result<StateDbHandle
 ```
 
-**Purpose**: Performs the actual startup sequence: open the runtime, wait for metadata backfill completion, record gate telemetry, and close on failure.
+**Purpose**: Does the real startup sequence: open the SQLite runtime, wait for backfill to complete, record timing, and close the runtime if startup cannot finish safely.
 
-**Data flow**: Consumes owned `codex_home`, `sqlite_home`, `default_model_provider_id`, and an optional lease duration. It calls `codex_state::StateRuntime::init` with the SQLite home and provider id, wrapping any failure with path context. It records `Instant::now()`, awaits `wait_for_backfill_gate`, reports the elapsed time and result through `codex_state::record_backfill_gate`, closes the runtime if the gate failed, and otherwise returns the initialized handle.
+**Data flow**: It receives filesystem paths, a default model provider, and an optional lease setting. It opens the SQLite runtime, measures how long the backfill gate takes, waits for that gate, records the result for telemetry, and returns the runtime only if the database is ready.
 
-**Call relations**: Both root-based initialization wrappers funnel into this function. It orchestrates the two critical phases—runtime open and backfill gate—and delegates the polling/backfill loop to `wait_for_backfill_gate`.
+**Call relations**: `try_init_with_roots` and the test-only lease initializer both funnel into this function. It calls `wait_for_backfill_gate` to make sure old rollout metadata has been imported before anyone starts using SQLite.
 
 *Call graph*: calls 2 internal fn (wait_for_backfill_gate, init); called by 2 (try_init_with_roots, try_init_with_roots_and_backfill_lease); 4 external calls (now, as_path, clone, record_backfill_gate).
 
@@ -150,11 +152,11 @@ async fn wait_for_backfill_gate(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Polls the runtime until startup metadata backfill is complete, opportunistically running backfill work and timing out if completion never arrives.
+**Purpose**: Waits until the database says its startup backfill is complete. This prevents callers from reading a partially populated database.
 
-**Data flow**: Reads the runtime, `codex_home`, default provider id, and optional lease duration. In a loop it fetches `get_backfill_state`; if status is `Complete`, it returns `Ok(())`. Otherwise it triggers either `metadata::backfill_sessions_with_lease` or `metadata::backfill_sessions`, re-reads backfill state, checks again for completion, compares elapsed time against `STARTUP_BACKFILL_WAIT_TIMEOUT`, emits a warning on the first wait and `info!` on later waits, sleeps for `STARTUP_BACKFILL_POLL_INTERVAL`, and eventually returns either success or a timeout/read error.
+**Data flow**: It repeatedly reads the database backfill state. If backfill is incomplete, it runs the appropriate backfill routine, checks again, and either returns success, sleeps before retrying, or returns a timeout error if the wait takes too long.
 
-**Call relations**: This function is called only from `try_init_with_roots_inner` as the startup gatekeeper. It delegates actual metadata population to the `metadata` module and controls retry cadence, logging behavior, and timeout semantics around that work.
+**Call relations**: `try_init_with_roots_inner` calls this during startup. It uses `metadata::backfill_sessions` or `metadata::backfill_sessions_with_lease` to do the import work, and uses `emit_startup_warning` for the first visible wait message so early startup problems are not hidden.
 
 *Call graph*: calls 3 internal fn (backfill_sessions, backfill_sessions_with_lease, emit_startup_warning); called by 1 (try_init_with_roots_inner); 6 external calls (now, anyhow!, format!, info!, get_backfill_state, sleep).
 
@@ -165,11 +167,11 @@ async fn wait_for_backfill_gate(
 fn emit_startup_warning(message: &str)
 ```
 
-**Purpose**: Sends a startup warning through tracing and mirrors it to stderr when tracing has not yet been configured.
+**Purpose**: Reports a startup warning in a way that works before the normal logging system is ready. This helps users see database startup problems instead of losing them silently.
 
-**Data flow**: Takes a message string slice, logs it with `warn!`, checks `tracing::dispatcher::has_been_set()`, and if no dispatcher exists prints the same message to stderr with `eprintln!`. It returns `()` and maintains no state.
+**Data flow**: It receives a message, sends it to tracing as a warning, and, if no tracing dispatcher has been installed yet, also prints the same message to standard error. It returns nothing.
 
-**Call relations**: This helper is used by `init` for initialization failures and by `wait_for_backfill_gate` for the first visible backfill-delay warning. It centralizes the early-startup logging fallback.
+**Call relations**: `init` uses this when database setup fails, and `wait_for_backfill_gate` uses it when startup has to wait for backfill. It is the small safety valve for early messages.
 
 *Call graph*: called by 2 (init, wait_for_backfill_gate); 3 external calls (eprintln!, has_been_set, warn!).
 
@@ -180,11 +182,11 @@ fn emit_startup_warning(message: &str)
 async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle>
 ```
 
-**Purpose**: Opens the SQLite state DB only when it already exists and has completed startup backfill, for optional read-only or non-owning contexts.
+**Purpose**: Opens the SQLite database only if it already exists and has finished backfilling. It is for read-only or non-owning situations where this process should not start backfill itself.
 
-**Data flow**: Reads `sqlite_home` and `model_provider_id` from a `RolloutConfigView`. It computes the DB path with `codex_state::state_db_path`, checks existence via `tokio::fs::try_exists`, records a `db_unavailable` fallback and returns `None` if absent, otherwise attempts `StateRuntime::init`; on init failure it records `db_error` and returns `None`. If init succeeds, it passes the runtime into `require_backfill_complete` and returns that result.
+**Data flow**: It checks whether the expected database file exists. If not, it records a fallback and returns `None`; if it exists, it tries to open the runtime and then asks `require_backfill_complete` to verify that it is safe to use.
 
-**Call relations**: This helper is used where the process should not trigger rollout backfill itself, such as app-server mode. It delegates final readiness validation to `require_backfill_complete` after doing existence and open checks.
+**Call relations**: `init_state_db_for_app_server_target` calls this for optional database access. Unlike `init`, it does not run rollout backfill; it calls `require_backfill_complete` and otherwise records fallback reasons for metrics.
 
 *Call graph*: calls 2 internal fn (require_backfill_complete, init); called by 1 (init_state_db_for_app_server_target); 5 external calls (record_fallback, state_db_path, model_provider_id, sqlite_home, try_exists).
 
@@ -198,11 +200,11 @@ fn sqlite_telemetry_recorder(
 ) -> codex_state::DbTelemetryHandle
 ```
 
-**Purpose**: Exposes the OTEL-backed SQLite telemetry adapter from `sqlite_metrics` under the state DB module's API.
+**Purpose**: Builds a telemetry recorder for SQLite database activity. Telemetry means measurements and events used to understand how the system behaves.
 
-**Data flow**: Accepts a `codex_otel::MetricsClient` and originator string, forwards them to `sqlite_metrics::recorder`, and returns the resulting `codex_state::DbTelemetryHandle`.
+**Data flow**: It receives a metrics client and an origin label, then passes them to the SQLite metrics recorder builder. The result is a database telemetry handle that other state code can use.
 
-**Call relations**: This is a simple pass-through convenience function so callers configuring the state DB can obtain the proper telemetry handle without importing the lower-level adapter module directly.
+**Call relations**: This is a thin adapter around `sqlite_metrics::recorder`. It lets callers create database metrics using the rollout crate’s chosen metrics wiring.
 
 *Call graph*: calls 1 internal fn (recorder).
 
@@ -216,11 +218,11 @@ async fn require_backfill_complete(
 ) -> Option<StateDbHandle>
 ```
 
-**Purpose**: Validates that an already-open runtime has completed startup backfill before allowing callers to use it.
+**Purpose**: Checks whether an opened database is safe to read. It rejects databases whose startup backfill is missing, incomplete, or unreadable.
 
-**Data flow**: Takes ownership of a `StateDbHandle` and borrows the `codex_home` path for logging. It awaits `runtime.get_backfill_state()`: if status is `Complete`, it returns `Some(runtime)`; if status is another value, it warns, records `backfill_incomplete`, and returns `None`; if the read fails, it warns, records `db_error`, and returns `None`.
+**Data flow**: It receives a database runtime and a path used for warning messages. It reads the backfill state; if the state is complete, it returns the runtime, otherwise it logs the problem, records a fallback reason, and returns `None`.
 
-**Call relations**: This function is the final gate in `get_state_db`. It does not attempt repair or backfill itself; it only decides whether the optional DB handle is safe to expose.
+**Call relations**: `get_state_db` calls this after opening an existing database. This separates “can the database file be opened?” from “does it contain complete enough data to trust?”
 
 *Call graph*: called by 1 (get_state_db); 3 external calls (get_backfill_state, record_fallback, warn!).
 
@@ -231,11 +233,11 @@ async fn require_backfill_complete(
 fn cursor_to_anchor(cursor: Option<&Cursor>) -> Option<codex_state::Anchor>
 ```
 
-**Purpose**: Converts a rollout listing cursor into the millisecond-precision `codex_state::Anchor` format expected by SQLite queries.
+**Purpose**: Converts a list cursor into the database’s paging anchor. A paging anchor tells SQLite where the next page of results should start.
 
-**Data flow**: Accepts `Option<&Cursor>`. If absent it returns `None`. Otherwise it reads the cursor timestamp, converts nanoseconds to milliseconds, attempts `i64` conversion, reconstructs a `chrono::DateTime<Utc>` with `from_timestamp_millis`, and wraps it in `codex_state::Anchor { ts }`. Any failed conversion step yields `None`.
+**Data flow**: It receives an optional cursor. If one exists, it extracts its timestamp, converts nanoseconds to milliseconds, turns that into a UTC timestamp, and wraps it as a database anchor; if any step cannot be done safely, it returns `None`.
 
-**Call relations**: Both DB listing helpers call this before querying SQLite so filesystem/list-layer cursors can be reused against the state runtime's pagination API.
+**Call relations**: `list_thread_ids_db` and `list_threads_db` call this before asking SQLite for paged results. It translates the rollout listing layer’s cursor format into the state database’s format.
 
 *Call graph*: called by 2 (list_thread_ids_db, list_threads_db); 2 external calls (from_timestamp_millis, try_from).
 
@@ -246,11 +248,11 @@ fn cursor_to_anchor(cursor: Option<&Cursor>) -> Option<codex_state::Anchor>
 fn normalize_cwd_for_state_db(cwd: &Path) -> PathBuf
 ```
 
-**Purpose**: Normalizes a working-directory path into the canonical comparison form used by SQLite metadata, falling back to the original path on normalization failure.
+**Purpose**: Turns a current working directory path into a stable form before storing or comparing it in SQLite. This reduces false mismatches caused by path spelling differences.
 
-**Data flow**: Borrows a `Path`, passes it to `normalize_for_path_comparison`, and returns either the normalized `PathBuf` or `cwd.to_path_buf()` if normalization errors. It does not touch external state.
+**Data flow**: It receives a path and tries to normalize it for path comparison. If normalization succeeds, it returns the normalized path; if normalization fails, it keeps the original path instead of failing the whole operation.
 
-**Call relations**: This helper is used anywhere rollout-derived cwd values are written or compared in the DB path: backfill, incremental apply, reconciliation, and read-repair all rely on it to keep path matching stable.
+**Call relations**: Backfill and update paths use this before writing or filtering by working directory. In this file it is called by `apply_rollout_items`, `read_repair_rollout_path`, and `reconcile_rollout`; the metadata backfill code also relies on it.
 
 *Call graph*: called by 4 (backfill_sessions_with_lease, apply_rollout_items, read_repair_rollout_path, reconcile_rollout); 1 external calls (normalize_for_path_comparison).
 
@@ -267,11 +269,11 @@ async fn list_thread_ids_db(
     allowed_sources
 ```
 
-**Purpose**: Queries SQLite for a page of thread IDs using rollout-style filters, without scanning rollout files on disk.
+**Purpose**: Asks SQLite for a page of thread ids that match basic filters. It is used for fast parity checks without scanning rollout directories.
 
-**Data flow**: Takes an optional runtime reference plus codex home, page size, optional cursor, sort key, allowed session sources, optional provider filters, archived flag, and a stage label. If context is absent it returns `None`. It warns on codex-home mismatch, converts the cursor with `cursor_to_anchor`, serializes each `SessionSource` into a `String`, clones provider filters if present, maps the sort key into `codex_state::SortKey`, and awaits `ctx.list_thread_ids(...)`. On success it returns `Some(Vec<ThreadId>)`; on error it warns with the stage and returns `None`.
+**Data flow**: It receives an optional database context, a Codex home path, paging information, sort choice, allowed session sources, model providers, and archive filtering. If there is no database context it returns `None`; otherwise it converts filters into database-friendly forms, queries SQLite, and returns either the ids or `None` after logging a warning.
 
-**Call relations**: This function is a DB-only parity/listing helper used by higher-level listing flows. It delegates the actual query to `StateRuntime::list_thread_ids` after translating rollout-layer filter types into the state-layer equivalents.
+**Call relations**: This is a database-side listing helper. It uses `cursor_to_anchor` to translate paging, warns if the provided Codex home does not match the runtime’s home, and then hands the query to the state runtime.
 
 *Call graph*: calls 1 internal fn (cursor_to_anchor); 3 external calls (as_slice, iter, warn!).
 
@@ -288,11 +290,11 @@ async fn list_threads_db(
     sort_direction: So
 ```
 
-**Purpose**: Fetches thread metadata pages from SQLite using rollout-facing filters and performs cleanup when the DB points at stale rollout paths.
+**Purpose**: Asks SQLite for a page of full thread metadata instead of just ids. It supports filters such as source, model provider, working directory, parent thread, archive state, and search text.
 
-**Data flow**: Accepts an optional runtime, codex home, pagination and sorting inputs, source/provider/cwd filters, optional parent thread id, archived flag, and optional search term. It returns `None` immediately if no context exists, warns on codex-home mismatch, converts the cursor to an anchor, serializes allowed sources to strings, clones provider filters, normalizes cwd filters, builds a `codex_state::ThreadFilterOptions`, and queries either `list_threads_by_parent` or `list_threads`. On success with a parent filter it returns the page unchanged. Otherwise it iterates through `page.items`, checks each `rollout_path` with `crate::compression::existing_rollout_path`, rewrites the path if an existing compressed/uncompressed variant is found, or warns and deletes the stale thread row if no file exists. It then returns the filtered page; query errors produce a warning and `None`.
+**Data flow**: It receives an optional database context and listing filters. It converts cursors, source values, provider lists, working-directory filters, sort settings, and search text into a database filter object; then it queries SQLite. For normal listings, it also checks that each returned rollout path still exists and deletes stale database rows when the file is gone.
 
-**Call relations**: Higher-level listing code uses this as the DB-first path before filesystem fallback. It delegates querying to the runtime and, for non-parent listings, adds a reconciliation pass that prunes stale DB entries discovered during read time.
+**Call relations**: Thread-listing flows such as `find_latest_thread_path`, `list_threads_with_db_fallback`, and `list_rollout_threads` call this for fast database-backed results. It calls `cursor_to_anchor` for paging and `existing_rollout_path` to protect callers from stale paths, except for parent-filtered listings where the persisted database state is treated as authoritative.
 
 *Call graph*: calls 1 internal fn (cursor_to_anchor); called by 3 (find_latest_thread_path, list_threads_with_db_fallback, list_rollout_threads); 5 external calls (with_capacity, as_slice, iter, existing_rollout_path, warn!).
 
@@ -308,11 +310,11 @@ async fn find_rollout_path_by_id(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Looks up a thread's rollout file path in SQLite and downgrades lookup failures to warnings plus `None`.
+**Purpose**: Looks up the rollout file path for one thread id using SQLite. This is the fast path before falling back to slower filesystem search.
 
-**Data flow**: Takes an optional runtime reference, a `ThreadId`, optional archived filter, and a stage label. If context is absent it returns `None`; otherwise it awaits `ctx.find_rollout_path_by_id(thread_id, archived_only)` and returns the `Option<PathBuf>` on success, or logs a warning containing the stage and returns `None` on error.
+**Data flow**: It receives an optional database context, a thread id, an optional archive filter, and a stage name for warning messages. If no context exists it returns `None`; otherwise it asks SQLite for the path and returns that path, or logs the database error and returns `None`.
 
-**Call relations**: This helper is used by DB-first thread-path lookup flows. It is intentionally thin: it delegates the actual lookup to the runtime and only adds optional-context handling and warning-based error suppression.
+**Call relations**: This helper is a leaf adapter around the state runtime’s lookup. The `stage` text lets whichever caller is doing a lookup identify where a warning came from.
 
 
 ##### `mark_thread_memory_mode_polluted`  (lines 468–483)
@@ -325,11 +327,11 @@ async fn mark_thread_memory_mode_polluted(
 )
 ```
 
-**Purpose**: Marks a thread's memory-mode state as polluted in the memories sub-database, if a state runtime is available.
+**Purpose**: Marks a thread’s memory mode as polluted in the memories database. In plain terms, it records that the thread’s memory-related state may no longer be clean or trustworthy.
 
-**Data flow**: Accepts an optional runtime reference, a `ThreadId`, and a stage label. If context is `None` it returns immediately. Otherwise it calls `ctx.memories().mark_thread_memory_mode_polluted(thread_id).await`; any error is logged with the stage, and the function returns `()`.
+**Data flow**: It receives an optional database context, a thread id, and a stage label. If the context is missing it does nothing; otherwise it calls the memories part of the state runtime to mark the thread, logging a warning if the write fails.
 
-**Call relations**: This helper is invoked from tool-handling and external-context paths when thread memory mode becomes suspect. It delegates the actual mutation to the memories API on the runtime.
+**Call relations**: Callers such as `maybe_mark_thread_memory_mode_polluted`, `mark_thread_memory_mode_polluted_if_external_context`, and `handle_any_tool` use this when outside activity can affect memory state. This function keeps that write optional and non-fatal.
 
 *Call graph*: called by 3 (maybe_mark_thread_memory_mode_polluted, mark_thread_memory_mode_polluted_if_external_context, handle_any_tool); 1 external calls (warn!).
 
@@ -345,11 +347,11 @@ async fn reconcile_rollout(
     items: &[RolloutItem]
 ```
 
-**Purpose**: Synchronizes a rollout file's metadata into SQLite, either incrementally from supplied items/builder data or by re-extracting metadata from the file.
+**Purpose**: Brings SQLite back into agreement with a rollout file. It can either apply known rollout items directly or read the rollout file to rebuild metadata.
 
-**Data flow**: Takes an optional runtime, rollout path, default provider, optional `ThreadMetadataBuilder`, rollout items slice, optional archived filter, and optional new memory mode. If no runtime exists it returns. If a builder is supplied or items are non-empty, it forwards directly to `apply_rollout_items` with stage `reconcile_rollout` and returns. Otherwise it calls `metadata::extract_metadata_from_rollout`, warns and exits on extraction failure, normalizes the extracted cwd, derives memory mode defaulting to `"enabled"`, optionally loads existing metadata with `ctx.get_thread` to preserve git info and explicit title, adjusts `archived_at` according to `archived_only`, upserts the thread metadata, and then updates thread memory mode. Upsert or memory-mode failures are warned and not propagated.
+**Data flow**: It receives an optional database context, a rollout path, a default provider, optional prebuilt metadata, any new rollout items, archive guidance, and an optional new memory mode. If items or a builder are available, it delegates to `apply_rollout_items`; otherwise it extracts metadata from the rollout file, normalizes paths, preserves selected existing fields, applies archive rules, upserts the thread row, and updates memory mode.
 
-**Call relations**: This is the main repair/reconciliation entry used by metadata update flows, listing fallback, and read-repair. It either delegates to `apply_rollout_items` for incremental updates or performs a full file-based rebuild when no incremental context is available.
+**Call relations**: This is used by update and fallback flows, including `list_threads_with_db_fallback`, `read_repair_rollout_path`, and several metadata update tests. It calls `metadata::extract_metadata_from_rollout` when it needs to rebuild from disk, and `apply_rollout_items` when incremental data is already available.
 
 *Call graph*: calls 3 internal fn (extract_metadata_from_rollout, apply_rollout_items, normalize_cwd_for_state_db); called by 8 (thread_metadata_update_repairs_loaded_thread_without_resetting_summary, list_threads_with_db_fallback, read_repair_rollout_path, update_thread_metadata_clears_git_info_fields, update_thread_metadata_keeps_archived_thread_archived_in_sqlite, update_thread_metadata_keeps_live_archived_thread_archived_in_sqlite, update_thread_metadata_preserves_memory_mode_when_updating_git_info, update_thread_metadata); 2 external calls (is_empty, warn!).
 
@@ -365,11 +367,11 @@ async fn read_repair_rollout_path(
 )
 ```
 
-**Purpose**: Repairs SQLite metadata after filesystem fallback discovers the correct rollout path for a thread.
+**Purpose**: Fixes SQLite after the program successfully found a rollout file by another method. This is a “repair while reading” path: once the correct file is known, the database is updated so the next lookup can be fast.
 
-**Data flow**: Accepts an optional runtime, optional thread id, optional archived filter, and the discovered rollout path. If no runtime exists it returns. On the fast path, when a thread id is present and `ctx.get_thread` returns metadata, it clones that metadata, replaces `rollout_path`, normalizes `cwd`, adjusts `archived_at` according to `archived_only`, compares the repaired value to the original, and if changed warns and attempts `upsert_thread`; a successful upsert returns immediately. If no existing metadata was seen, or the fast-path upsert failed, it warns that slow-path repair is needed, reads the session meta line to infer a default provider, and calls `reconcile_rollout` with no builder and no items to rebuild metadata from file contents.
+**Data flow**: It receives an optional database context, maybe a thread id, optional archive guidance, and the correct rollout path. If an existing database row can be read, it updates the path and normalized working directory only when something actually changed; if the row is missing or the quick update fails, it reads session metadata from the file and calls `reconcile_rollout` to rebuild the row.
 
-**Call relations**: This function is called after filesystem lookup succeeds where DB lookup was stale or missing. It first tries an in-place metadata correction, then falls back to full reconciliation if the row is absent, unreadable, or not repairable directly.
+**Call relations**: `find_thread_path_by_id_str_in_subdir` and `list_threads_with_db_fallback` call this after filesystem fallback succeeds. It uses `normalize_cwd_for_state_db` for stable path storage and hands slow repairs to `reconcile_rollout`.
 
 *Call graph*: calls 3 internal fn (read_session_meta_line, normalize_cwd_for_state_db, reconcile_rollout); called by 2 (find_thread_path_by_id_str_in_subdir, list_threads_with_db_fallback); 2 external calls (to_path_buf, warn!).
 
@@ -385,11 +387,11 @@ async fn apply_rollout_items(
     items: &[RolloutIte
 ```
 
-**Purpose**: Applies incremental rollout items and associated metadata builder state into SQLite for a single thread.
+**Purpose**: Applies newly seen rollout items to SQLite without rereading the whole rollout file. This keeps the database current as a thread changes.
 
-**Data flow**: Takes an optional runtime, rollout path, default provider, optional builder, rollout items slice, stage label, optional new memory mode, and optional updated-at override. If no runtime exists it returns. It clones the provided builder or derives one from `metadata::builder_from_items`; if derivation fails it warns about a missing builder and returns. It fills in `builder.model_provider` from `default_provider` when absent, overwrites `builder.rollout_path`, normalizes `builder.cwd`, and calls `ctx.apply_rollout_items(&builder, items, new_thread_memory_mode, updated_at_override).await`. Errors are logged with stage and path.
+**Data flow**: It receives an optional database context, rollout path, default provider, optional metadata builder, item list, stage label, optional memory mode, and optional updated-at timestamp override. It obtains or builds metadata, fills in a default provider if missing, stores the rollout path, normalizes the working directory, and asks the state runtime to apply the items; failures are logged but not thrown.
 
-**Call relations**: This helper is the incremental-update engine beneath `reconcile_rollout`. It is used when callers already have parsed rollout items or a partially built metadata object and want SQLite updated without rescanning the file.
+**Call relations**: `reconcile_rollout` calls this when it already has a metadata builder or new rollout items. It may use `metadata::builder_from_items` if no builder was supplied, then delegates the actual database update to the state runtime.
 
 *Call graph*: calls 2 internal fn (builder_from_items, normalize_cwd_for_state_db); called by 1 (reconcile_rollout); 2 external calls (to_path_buf, warn!).
 
@@ -405,11 +407,11 @@ async fn touch_thread_updated_at(
 ) -> bool
 ```
 
-**Purpose**: Updates a thread's `updated_at` timestamp in SQLite when both runtime context and thread id are available.
+**Purpose**: Updates a thread’s `updated_at` time in SQLite. Callers use this when a thread should appear recently changed even if only the timestamp needs adjusting.
 
-**Data flow**: Accepts an optional runtime, optional thread id, a `DateTime<Utc>` timestamp, and a stage label. If either the runtime or thread id is missing it returns `false`. Otherwise it awaits `ctx.touch_thread_updated_at(thread_id, updated_at)` and returns the resulting boolean, or logs a warning and returns `false` if the DB call fails.
+**Data flow**: It receives an optional database context, an optional thread id, the new timestamp, and a stage label. If the database context or thread id is missing it returns `false`; otherwise it writes the new timestamp and returns whether SQLite reported success, logging and returning `false` on error.
 
-**Call relations**: This is a small convenience wrapper for callers that may or may not have DB context or a resolved thread id. It delegates the actual timestamp mutation to the runtime and standardizes failure handling.
+**Call relations**: This is a small database-write helper for callers that already know the thread id and timestamp. The `stage` label is included in warnings so failures can be traced back to the calling flow.
 
 
 ### SQLite runtime initialization
@@ -417,15 +419,13 @@ These files open, migrate, and assemble the shared SQLite-backed runtime and its
 
 ### `state/src/runtime.rs`
 
-`orchestration` · `startup`
+`orchestration` · `startup, runtime storage access, teardown, and storage diagnostics`
 
-This file is the orchestration hub for persistent runtime state. It defines `RuntimeDbSpec`, a small descriptor used to name each SQLite database, derive its path under `codex_home`, and tag telemetry phases. Four specs (`STATE_DB`, `LOGS_DB`, `GOALS_DB`, `MEMORIES_DB`) feed common startup logic while keeping logs isolated in a dedicated file to reduce lock contention.
+Codex keeps several kinds of local data on disk: thread state, log history, goals, and memories. This file is the piece that turns a Codex home folder into a working set of database connections. Without it, the rest of the system would not know where those database files live, how to open them, how to upgrade their tables, or how to cleanly shut them down.
 
-`StateRuntime` owns the main state pool, a separate logs pool, and higher-level stores (`GoalStore`, `MemoryStore`) built on top of the goals and memories databases. `init` and `init_inner` perform the full startup sequence: create the home directory, build tolerant migrators from `migrations.rs`, derive all DB paths, open and migrate each SQLite file in order, and on any failure warn and close already-open pools before returning the error. After all pools are live, startup ensures the singleton `backfill_state` row exists, queries `MAX(threads.updated_at_ms)` to seed an `AtomicI64` cache, constructs the runtime, and runs log-database startup maintenance best-effort.
+The main type is StateRuntime. Think of it like a small building manager for four storage rooms. At startup it creates the home directory if needed, opens each SQLite database file, runs migrations (database upgrade scripts), and records telemetry so failures and slow startup phases can be seen later. Logs are kept in their own database file to reduce lock contention, meaning fewer tasks fight over the same SQLite writer lock.
 
-The lower-level helpers centralize SQLite configuration: WAL mode, normal synchronous mode, 5-second busy timeout, incremental auto-vacuum, and a 5-connection pool. `open_sqlite` records telemetry for both open and migrate phases and wraps failures in `RuntimeDbInitError` with the DB label and path. Additional helpers expose canonical filenames and paths, enumerate all runtime DB paths, clear only the memories DB contents in an existing home, and run `PRAGMA integrity_check` against an existing database file.
-
-The test module validates three important behaviors: integrity checks return `ok` for a valid DB, runtime migrators tolerate newer-applied migration versions that strict SQLx migrators reject, and explicit telemetry receives success counters for every initialization phase.
+The file also provides simple path helpers, a database integrity check, and a special memory-clearing helper used by a debug command. If startup fails partway through, it closes any databases it already opened so no background pool is left running. The tests at the bottom verify that integrity checks work, that the runtime can tolerate a database marked with newer migrations, and that startup telemetry records each expected phase.
 
 #### Function details
 
@@ -435,11 +435,11 @@ The test module validates three important behaviors: integrity checks return `ok
 fn path(self, codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the filesystem path for one runtime database under a given Codex home directory. It encapsulates the filename stored in the DB spec.
+**Purpose**: Builds the full file path for one runtime database inside the Codex home directory. It lets the rest of the file avoid repeating filename-joining logic.
 
-**Data flow**: It takes `self` and a borrowed `codex_home: &Path`, joins `self.filename` onto that directory, and returns the resulting `PathBuf`.
+**Data flow**: It receives a Codex home folder path and reads the database filename stored in the RuntimeDbSpec. It joins the folder and filename together, then returns the resulting path.
 
-**Call relations**: Startup and path helper functions call this whenever they need the concrete location of the state, logs, goals, or memories database.
+**Call relations**: The database constants use this helper during startup and in public path helpers. It is the small path-building step before any SQLite file can be opened.
 
 *Call graph*: 1 external calls (join).
 
@@ -450,11 +450,11 @@ fn path(self, codex_home: &Path) -> PathBuf
 async fn init(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>>
 ```
 
-**Purpose**: Public entry point for creating a fully initialized `StateRuntime` with default telemetry behavior. It delegates all real work to `init_inner`.
+**Purpose**: Starts the normal StateRuntime used by the application. Callers use it when they want the local state databases opened, migrated, and ready for use.
 
-**Data flow**: It takes ownership of `codex_home: PathBuf` and `default_provider: String`, passes them plus `None` for `telemetry_override` into `Self::init_inner`, awaits the result, and returns `anyhow::Result<Arc<StateRuntime>>`.
+**Data flow**: It receives the Codex home folder and the default provider name. It passes those values into the shared startup routine with no test telemetry override, then returns a shared StateRuntime object or an error.
 
-**Call relations**: Many production and test setup paths invoke this to bring up persistence. It is the standard wrapper around the more configurable `init_inner`.
+**Call relations**: Many production and integration flows call this as the public entry point. It immediately hands the real work to StateRuntime::init_inner so normal startup and test startup follow the same path.
 
 *Call graph*: called by 181 (state_runtime, remote_control_state_runtime, remote_control_state_runtime, remote_control_state_runtime, external_agent_config_import_sends_completion_notification_for_sync_only_import, init_state_db, disable_waits_for_in_flight_durable_enable, listen_off_exits_without_persisted_remote_control_enable, listen_off_honors_persisted_remote_control_enable, listen_off_ignores_persisted_enable_when_disabled_by_requirements (+15 more)); 1 external calls (init_inner).
 
@@ -469,11 +469,11 @@ async fn init_with_telemetry_for_tests(
     ) -> anyhow::Result<Arc<Self>>
 ```
 
-**Purpose**: Test-only initializer that injects an explicit telemetry sink into runtime startup. It exists so tests can assert which initialization phases were recorded.
+**Purpose**: Starts StateRuntime in tests while sending database startup metrics to a test-provided telemetry collector. This makes startup behavior observable without using the real telemetry system.
 
-**Data flow**: It takes `codex_home`, `default_provider`, and a borrowed `DbTelemetry` implementation, forwards them to `Self::init_inner` with `Some(telemetry_override)`, and returns the initialized runtime.
+**Data flow**: It receives the home folder, provider name, and a telemetry object. It forwards them to the shared startup routine and returns the created runtime or the startup error.
 
-**Call relations**: The telemetry test calls this instead of `init` so startup metrics can be captured and inspected.
+**Call relations**: The telemetry-focused test calls this to inspect which startup phases were reported. Like the normal initializer, it delegates to StateRuntime::init_inner.
 
 *Call graph*: called by 1 (init_records_successful_sqlite_init_phases_to_explicit_telemetry); 1 external calls (init_inner).
 
@@ -488,11 +488,11 @@ async fn init_inner(
     ) -> anyhow::Result<Arc<Self>>
 ```
 
-**Purpose**: Performs the full runtime startup sequence: directory creation, migrator selection, database open/migrate, singleton-row initialization, cache seeding, store construction, and log maintenance. It is the central orchestration function for persistence startup.
+**Purpose**: Does the real startup work for StateRuntime. It opens all runtime databases, runs their migrations, prepares supporting stores, and builds the runtime object used by the rest of the system.
 
-**Data flow**: It receives `codex_home`, `default_provider`, and an optional telemetry sink. It creates the home directory, constructs tolerant migrators for all four DBs, derives each DB path, and opens state, logs, goals, and memories pools in order via the corresponding `open_*_sqlite` helpers. On each failure branch it logs a warning, closes any pools already opened using `close_sqlite_pools`, and returns the error. After successful opens it calls `ensure_backfill_state_row_in_pool`, records telemetry for that phase, runs `SELECT MAX(threads.updated_at_ms) FROM threads` to seed `thread_updated_at_millis`, constructs `GoalStore` and `MemoryStore`, wraps pools in `Arc`, stores the provider string and home path, then invokes `runtime.run_logs_startup_maintenance().await` best-effort before returning `Arc<Self>`.
+**Data flow**: It starts with a Codex home path, a provider name, and optional telemetry. It creates the directory, builds migrators, computes database paths, opens state/logs/goals/memories databases, ensures a backfill tracking row exists, reads the latest thread update time, creates GoalStore and MemoryStore wrappers, runs log maintenance, and returns a shared StateRuntime. If any required step fails, it closes any database pools already opened and returns the error.
 
-**Call relations**: Both `init` and the test-only initializer funnel into this function. It delegates DB-specific opening to `open_state_sqlite`, `open_logs_sqlite`, `open_goals_sqlite`, and `open_memories_sqlite`, and cleanup to `close_sqlite_pools` whenever a later phase fails after earlier pools succeeded.
+**Call relations**: StateRuntime::init and the test initializer both call this. It coordinates lower-level helpers such as open_state_sqlite, open_logs_sqlite, open_goals_sqlite, open_memories_sqlite, ensure_backfill_state_row_in_pool, and close_sqlite_pools.
 
 *Call graph*: calls 12 internal fn (runtime_goals_migrator, runtime_logs_migrator, runtime_memories_migrator, close_sqlite_pools, ensure_backfill_state_row_in_pool, new, new, open_goals_sqlite, open_logs_sqlite, open_memories_sqlite (+2 more)); 9 external calls (clone, new, new, now, as_path, query_scalar, runtime_state_migrator, create_dir_all, warn!).
 
@@ -503,11 +503,11 @@ async fn init_inner(
 fn codex_home(&self) -> &Path
 ```
 
-**Purpose**: Returns the configured Codex home directory for the runtime. It exposes the root under which all runtime databases live.
+**Purpose**: Returns the Codex home directory used by this runtime. Callers use it when they need to create or find files alongside the runtime databases.
 
-**Data flow**: It borrows `self`, calls `self.codex_home.as_path()`, and returns `&Path`.
+**Data flow**: It reads the stored PathBuf from the StateRuntime and returns it as a path reference. Nothing is changed.
 
-**Call relations**: Tests and helper code call this when they need to derive additional files relative to the runtime’s home directory.
+**Call relations**: Thread setup helpers call this when they need to know where this runtime lives on disk. It is a simple accessor after startup has completed.
 
 *Call graph*: called by 2 (seed_thread_metadata, upsert_test_thread); 1 external calls (as_path).
 
@@ -518,11 +518,11 @@ fn codex_home(&self) -> &Path
 fn thread_goals(&self) -> &GoalStore
 ```
 
-**Purpose**: Exposes the embedded `GoalStore` owned by the runtime. It provides access to goal-specific operations without exposing the underlying pool directly.
+**Purpose**: Returns the goal store for reading or changing goals tied to threads. This gives callers a focused interface instead of exposing the raw goals database pool.
 
-**Data flow**: It borrows `self` and returns `&GoalStore` from the `thread_goals` field.
+**Data flow**: It reads the GoalStore stored inside StateRuntime and returns a shared reference to it. No database query happens here by itself.
 
-**Call relations**: Goal-related commands and tests call this accessor before invoking goal store methods.
+**Call relations**: Goal-related operations call this before getting, setting, clearing, or seeding thread goals. It connects higher-level goal commands to the store created during startup.
 
 *Call graph*: called by 4 (clear_thread_goal, get_thread_goal, set_thread_goal, seed_thread_cleanup_state).
 
@@ -533,11 +533,11 @@ fn thread_goals(&self) -> &GoalStore
 fn memories(&self) -> &MemoryStore
 ```
 
-**Purpose**: Exposes the embedded `MemoryStore` owned by the runtime. It is the accessor for memory-specific persistence operations.
+**Purpose**: Returns the memory store for reading or changing stored memories. Callers use it instead of touching the memories database directly.
 
-**Data flow**: It borrows `self` and returns `&MemoryStore` from the `memories` field.
+**Data flow**: It reads the MemoryStore inside StateRuntime and returns a shared reference. The function itself does not modify data.
 
-**Call relations**: Memory workflows call this accessor to reach the memory subsystem after runtime initialization.
+**Call relations**: Memory-related flows call this when they need to claim, complete, fail, seed, or inspect memory work. It exposes the MemoryStore that init_inner built from the memories and state database pools.
 
 *Call graph*: called by 5 (claim, failed, succeed, seed_stage1_output_for_existing_thread, memory_pool).
 
@@ -548,11 +548,11 @@ fn memories(&self) -> &MemoryStore
 async fn close(&self)
 ```
 
-**Purpose**: Shuts down the runtime’s stores and SQLite pools in an orderly async sequence. It waits for pool workers to exit.
+**Purpose**: Cleanly shuts down all database pools owned by the runtime. This prevents background database workers from staying alive after the runtime is no longer needed.
 
-**Data flow**: It borrows `self`, awaits `self.memories.close()`, `self.thread_goals.close()`, `self.logs_pool.close()`, and `self.pool.close()`, and returns `()`.
+**Data flow**: It starts with an active StateRuntime. It asks the memory store and goal store to close, then closes the logs database pool and the main state database pool. It returns after shutdown requests have completed.
 
-**Call relations**: Shutdown or test teardown paths call this when they want a clean stop of all persistence resources owned by the runtime.
+**Call relations**: Callers use this during teardown. It is the orderly counterpart to StateRuntime startup, closing the stores and pools that init_inner opened.
 
 *Call graph*: calls 2 internal fn (close, close).
 
@@ -563,11 +563,11 @@ async fn close(&self)
 async fn clear_memory_data_in_sqlite_home(sqlite_home: &Path) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Opens an existing memories database under a Codex home, clears its stored memory data, and reports whether the DB existed. It is a targeted maintenance operation that does not require a full runtime.
+**Purpose**: Deletes memory data from the memories database in a given SQLite home folder, if that database exists. It is used by a debug command that needs to reset memories without removing all state.
 
-**Data flow**: It takes `sqlite_home: &Path`, derives the memories DB path with `MEMORIES_DB.path`, checks existence with `tokio::fs::try_exists`, and returns `Ok(false)` immediately if absent. If present, it builds a tolerant memories migrator, opens the DB with `open_memories_sqlite`, calls `memories::clear_memory_data_in_pool(&pool)`, closes the pool, and returns `Ok(true)`.
+**Data flow**: It receives a folder path, builds the memories database path, and first checks whether the file exists. If not, it returns false. If it exists, it opens and migrates the memories database, clears memory data inside it, closes the pool, and returns true.
 
-**Call relations**: The debug clear-memories command invokes this standalone helper. It reuses the same migrator and open logic as full startup but only for the memories database.
+**Call relations**: The debug clear-memories command calls this. Internally it reuses the normal memories database migrator and open_memories_sqlite path so the cleanup runs against the expected schema.
 
 *Call graph*: calls 3 internal fn (runtime_memories_migrator, clear_memory_data_in_pool, open_memories_sqlite); called by 1 (run_debug_clear_memories_command); 1 external calls (try_exists).
 
@@ -578,11 +578,11 @@ async fn clear_memory_data_in_sqlite_home(sqlite_home: &Path) -> anyhow::Result<
 async fn close_sqlite_pools(pools: &[&SqlitePool])
 ```
 
-**Purpose**: Closes a slice of SQLite pools sequentially. It is a small cleanup helper used during partial-startup failure handling.
+**Purpose**: Closes a list of SQLite connection pools. It is used when startup fails after some databases have already opened.
 
-**Data flow**: It takes a slice of borrowed `&SqlitePool`, iterates over it, awaits `pool.close()` for each entry, and returns `()`.
+**Data flow**: It receives a slice of database pools. It walks through them one by one and asks each pool to close. It does not return data.
 
-**Call relations**: `init_inner` calls this on error paths after one or more databases have already been opened, ensuring no partially initialized pools are left running.
+**Call relations**: StateRuntime::init_inner calls this on error paths. It keeps partial startup failures from leaving open database workers behind.
 
 *Call graph*: called by 1 (init_inner).
 
@@ -593,11 +593,11 @@ async fn close_sqlite_pools(pools: &[&SqlitePool])
 fn base_sqlite_options(path: &Path) -> SqliteConnectOptions
 ```
 
-**Purpose**: Constructs the common SQLite connection options shared by all runtime databases. It centralizes the runtime’s WAL, sync, timeout, and logging policy.
+**Purpose**: Creates the common SQLite connection settings used by the runtime databases. These settings make database files if missing, use write-ahead logging, and wait briefly when the database is busy.
 
-**Data flow**: It takes a database `&Path`, starts from `SqliteConnectOptions::new()`, sets the filename, enables `create_if_missing(true)`, configures WAL journal mode, normal synchronous mode, a 5-second busy timeout, and disables SQL statement logging, then returns the configured `SqliteConnectOptions`.
+**Data flow**: It receives a database path. It builds SQLite connection options with that filename, file creation enabled, WAL mode, normal sync behavior, a five-second busy timeout, and SQL statement logging disabled, then returns those options.
 
-**Call relations**: `open_sqlite` calls this before adding DB-specific options such as incremental auto-vacuum.
+**Call relations**: open_sqlite calls this before opening any runtime database. It centralizes the shared SQLite behavior so state, logs, goals, and memories are opened consistently.
 
 *Call graph*: called by 1 (open_sqlite); 2 external calls (from_secs, new).
 
@@ -612,11 +612,11 @@ async fn open_state_sqlite(
 ) -> anyhow::Result<SqlitePool>
 ```
 
-**Purpose**: Opens and migrates the main state database using the shared SQLite startup logic. It exists mainly to attach the `STATE_DB` spec and document state-specific maintenance constraints.
+**Purpose**: Opens and migrates the main state database. This database stores core runtime state such as threads and backfill tracking.
 
-**Data flow**: It takes a path, migrator, and optional telemetry sink, and forwards them to `open_sqlite(path, migrator, STATE_DB, telemetry_override)`, returning the resulting `SqlitePool` or error.
+**Data flow**: It receives a path, a migrator, and optional telemetry. It forwards those to the generic open_sqlite helper using the state database specification and returns the opened pool or an error.
 
-**Call relations**: `init_inner` uses this for the state DB, and a migration-compatibility test calls it directly. All substantive work is delegated to `open_sqlite`.
+**Call relations**: StateRuntime::init_inner calls this during startup. A test also calls it directly to verify the runtime migrator behaves correctly.
 
 *Call graph*: calls 1 internal fn (open_sqlite); called by 2 (init_inner, open_state_sqlite_tolerates_newer_applied_migrations).
 
@@ -631,11 +631,11 @@ async fn open_logs_sqlite(
 ) -> anyhow::Result<SqlitePool>
 ```
 
-**Purpose**: Opens and migrates the dedicated logs database using the shared startup logic. It binds the generic opener to the `LOGS_DB` spec.
+**Purpose**: Opens and migrates the logs database. Logs are separated from state so heavy log writing is less likely to block other state updates.
 
-**Data flow**: It forwards its path, migrator, and telemetry arguments into `open_sqlite` with `LOGS_DB` and returns the resulting pool.
+**Data flow**: It receives a path, migrator, and optional telemetry. It delegates to open_sqlite using the logs database specification and returns the resulting pool or error.
 
-**Call relations**: `init_inner` calls this after the state DB opens successfully.
+**Call relations**: StateRuntime::init_inner calls this after the state database opens. It is a thin, named wrapper around the shared open_sqlite routine.
 
 *Call graph*: calls 1 internal fn (open_sqlite); called by 1 (init_inner).
 
@@ -650,11 +650,11 @@ async fn open_goals_sqlite(
 ) -> anyhow::Result<SqlitePool>
 ```
 
-**Purpose**: Opens and migrates the goals database using the shared startup logic. It is the goals-specific wrapper around `open_sqlite`.
+**Purpose**: Opens and migrates the goals database. This prepares storage for per-thread goal information.
 
-**Data flow**: It passes its arguments to `open_sqlite` with the `GOALS_DB` spec and returns the resulting pool or error.
+**Data flow**: It receives a database path, migrator, and optional telemetry. It calls open_sqlite with the goals database specification and returns an opened pool or an error.
 
-**Call relations**: `init_inner` invokes this after the logs DB is ready.
+**Call relations**: StateRuntime::init_inner calls this before creating GoalStore. It relies on the common open_sqlite behavior used by all runtime databases.
 
 *Call graph*: calls 1 internal fn (open_sqlite); called by 1 (init_inner).
 
@@ -669,11 +669,11 @@ async fn open_memories_sqlite(
 ) -> anyhow::Result<SqlitePool>
 ```
 
-**Purpose**: Opens and migrates the memories database using the shared startup logic. It is used both during full runtime startup and standalone memory cleanup.
+**Purpose**: Opens and migrates the memories database. This prepares storage for remembered information used across runtime work.
 
-**Data flow**: It forwards its path, migrator, and telemetry arguments into `open_sqlite` with `MEMORIES_DB` and returns the resulting pool.
+**Data flow**: It receives a path, migrator, and optional telemetry. It passes them to open_sqlite with the memories database specification and returns the ready pool or an error.
 
-**Call relations**: Both `init_inner` and `clear_memory_data_in_sqlite_home` call this wrapper.
+**Call relations**: StateRuntime::init_inner calls this during normal startup, and clear_memory_data_in_sqlite_home calls it for the debug memory-clearing path.
 
 *Call graph*: calls 1 internal fn (open_sqlite); called by 2 (clear_memory_data_in_sqlite_home, init_inner).
 
@@ -689,11 +689,11 @@ async fn open_sqlite(
 ) -> anyhow::Result<SqlitePool>
 ```
 
-**Purpose**: Implements the common open-and-migrate sequence for a runtime SQLite database, including telemetry and error wrapping. It is the low-level startup primitive shared by all four DBs.
+**Purpose**: Contains the shared recipe for opening a runtime SQLite database and applying migrations. It also records telemetry for the open and migration phases.
 
-**Data flow**: It takes a DB path, migrator, `RuntimeDbSpec`, and optional telemetry sink. It builds connection options from `base_sqlite_options(path)` and adds `auto_vacuum(SqliteAutoVacuum::Incremental)`, then times and executes `SqlitePoolOptions::new().max_connections(5).connect_with(options)`. It records the open result via `crate::telemetry::record_init_result`, wraps open failures in `recovery::RuntimeDbInitError::new(spec.label, "open", path, source)`, then times `migrator.run(&pool)`, records that result too, closes the pool on migration failure, wraps the migration error with the same DB label/path context, and returns the live `SqlitePool` on success.
+**Data flow**: It receives a path, a migrator, a database specification, and optional telemetry. It builds connection options, opens a pool with up to five connections, records whether opening succeeded, runs migrations, records whether migration succeeded, and returns the pool. If opening or migration fails, it wraps the error with the database label and path; if migration fails after opening, it closes the pool first.
 
-**Call relations**: All four `open_*_sqlite` wrappers delegate to this function. It is the shared implementation that enforces consistent SQLite settings and telemetry across database types.
+**Call relations**: The four database-specific open helpers all call this. It is the common workhorse behind state, logs, goals, and memories startup.
 
 *Call graph*: calls 3 internal fn (base_sqlite_options, new, record_init_result); called by 4 (open_goals_sqlite, open_logs_sqlite, open_memories_sqlite, open_state_sqlite); 3 external calls (now, run, new).
 
@@ -706,11 +706,11 @@ async fn ensure_backfill_state_row_in_pool(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures the singleton `backfill_state` row with `id = 1` exists in the state database. It avoids unnecessary writer contention by checking first whether the row is already present.
+**Purpose**: Makes sure the state database has the single tracking row used for backfill work. Backfill means filling in older or missing data after a schema or feature change.
 
-**Data flow**: It takes a borrowed `SqlitePool`, runs `SELECT 1 FROM backfill_state WHERE id = 1` via `query_scalar(...).fetch_optional(pool)`, and returns early if a row exists. Otherwise it executes an `INSERT ... ON CONFLICT(id) DO NOTHING` statement binding `1_i64`, `crate::BackfillStatus::Pending.as_str()`, and `Utc::now().timestamp()` for `updated_at`, then returns `Ok(())`.
+**Data flow**: It receives a state database pool. It first checks whether the backfill tracking row already exists. If it does, it returns without writing. If not, it inserts a pending row with the current timestamp, using conflict protection so another writer creating it at the same time is harmless.
 
-**Call relations**: `init_inner` calls this after all databases are open and migrated. It is part of startup state seeding before the runtime begins normal operation.
+**Call relations**: StateRuntime::init_inner calls this after opening databases. It prepares the state database for later backfill jobs without forcing an unnecessary write on every startup.
 
 *Call graph*: called by 1 (init_inner); 2 external calls (now, query).
 
@@ -721,11 +721,11 @@ async fn ensure_backfill_state_row_in_pool(
 fn state_db_filename() -> String
 ```
 
-**Purpose**: Returns the canonical filename for the state database. It exposes the configured constant as an owned `String`.
+**Purpose**: Returns the configured filename for the main state database. This is useful for code that needs the name but not a full path.
 
-**Data flow**: It reads `STATE_DB.filename`, converts it with `.to_string()`, and returns the result.
+**Data flow**: It reads the state database specification and returns its filename as a new string. Nothing else changes.
 
-**Call relations**: Callers use this helper when they need the standard state DB filename without reconstructing it from constants.
+**Call relations**: This is a public helper alongside the other database filename helpers. It reflects the same constant used by startup.
 
 
 ##### `state_db_path`  (lines 470–472)
@@ -734,11 +734,11 @@ fn state_db_filename() -> String
 fn state_db_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the full path to the state database under a Codex home directory. It is the path helper for the main state DB.
+**Purpose**: Builds the full path to the main state database inside a Codex home folder.
 
-**Data flow**: It takes `codex_home: &Path`, calls `STATE_DB.path(codex_home)`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a Codex home path and combines it with the state database filename. It returns the resulting path.
 
-**Call relations**: Tests and other code use this helper when opening or inspecting the state DB directly.
+**Call relations**: Tests use this to create or inspect state databases. It follows the same path rule used by runtime startup.
 
 *Call graph*: called by 2 (open_state_sqlite_tolerates_newer_applied_migrations, sqlite_integrity_check_reports_ok_for_valid_db).
 
@@ -749,11 +749,11 @@ fn state_db_path(codex_home: &Path) -> PathBuf
 fn logs_db_filename() -> String
 ```
 
-**Purpose**: Returns the canonical filename for the logs database. It exposes the logs DB constant as an owned string.
+**Purpose**: Returns the configured filename for the logs database.
 
-**Data flow**: It reads `LOGS_DB.filename`, converts it to `String`, and returns it.
+**Data flow**: It reads the logs database specification and returns the filename as a string. It does not touch the file system.
 
-**Call relations**: Used by callers that need the standard logs DB filename.
+**Call relations**: This public helper mirrors the logs database path used during startup.
 
 
 ##### `logs_db_path`  (lines 478–480)
@@ -762,11 +762,11 @@ fn logs_db_filename() -> String
 fn logs_db_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the full path to the logs database under a Codex home directory. It is the path helper for the dedicated log store.
+**Purpose**: Builds the full path to the logs database inside a Codex home folder.
 
-**Data flow**: It takes `codex_home: &Path`, calls `LOGS_DB.path(codex_home)`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a Codex home path, joins it with the logs database filename, and returns the path.
 
-**Call relations**: Other modules can use this helper when they need to inspect or manipulate the logs DB file directly.
+**Call relations**: Other parts of the system can use this when they need to locate the logs database without opening the full runtime.
 
 
 ##### `goals_db_filename`  (lines 482–484)
@@ -775,11 +775,11 @@ fn logs_db_path(codex_home: &Path) -> PathBuf
 fn goals_db_filename() -> String
 ```
 
-**Purpose**: Returns the canonical filename for the goals database. It is a simple accessor over the goals DB spec.
+**Purpose**: Returns the configured filename for the goals database.
 
-**Data flow**: It reads `GOALS_DB.filename`, converts it to `String`, and returns it.
+**Data flow**: It reads the goals database specification and returns its filename as a string. No state is changed.
 
-**Call relations**: Used wherever the standard goals DB filename is needed.
+**Call relations**: This helper stays in sync with the database file that StateRuntime::init_inner opens for goals.
 
 
 ##### `goals_db_path`  (lines 486–488)
@@ -788,11 +788,11 @@ fn goals_db_filename() -> String
 fn goals_db_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the full path to the goals database under a Codex home directory. It is the path helper for goal persistence.
+**Purpose**: Builds the full path to the goals database inside a Codex home folder.
 
-**Data flow**: It takes `codex_home: &Path`, calls `GOALS_DB.path(codex_home)`, and returns a `PathBuf`.
+**Data flow**: It receives a Codex home path and joins it with the goals database filename. It returns the full path.
 
-**Call relations**: Callers use this helper to locate the goals DB file without duplicating filename knowledge.
+**Call relations**: It is the public path helper for the same goals database opened by open_goals_sqlite.
 
 
 ##### `memories_db_filename`  (lines 490–492)
@@ -801,11 +801,11 @@ fn goals_db_path(codex_home: &Path) -> PathBuf
 fn memories_db_filename() -> String
 ```
 
-**Purpose**: Returns the canonical filename for the memories database. It exposes the configured memories DB name as a string.
+**Purpose**: Returns the configured filename for the memories database.
 
-**Data flow**: It reads `MEMORIES_DB.filename`, converts it with `.to_string()`, and returns it.
+**Data flow**: It reads the memories database specification and returns the filename as a string. It performs no I/O.
 
-**Call relations**: Used by code that needs the standard memories DB filename.
+**Call relations**: This helper reflects the filename used by memory startup and debug memory cleanup.
 
 
 ##### `memories_db_path`  (lines 494–496)
@@ -814,11 +814,11 @@ fn memories_db_filename() -> String
 fn memories_db_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the full path to the memories database under a Codex home directory. It is the path helper for memory persistence.
+**Purpose**: Builds the full path to the memories database inside a Codex home folder.
 
-**Data flow**: It takes `codex_home: &Path`, calls `MEMORIES_DB.path(codex_home)`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a Codex home path, joins it with the memories database filename, and returns the full path.
 
-**Call relations**: Maintenance and inspection code can use this helper to locate the memories DB file.
+**Call relations**: It matches the path that open_memories_sqlite uses during startup and cleanup.
 
 
 ##### `runtime_db_paths`  (lines 498–506)
@@ -827,11 +827,11 @@ fn memories_db_path(codex_home: &Path) -> PathBuf
 fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath>
 ```
 
-**Purpose**: Returns the labeled paths for all runtime databases under a Codex home directory. It provides a complete inventory of the runtime’s SQLite files.
+**Purpose**: Returns the labels and paths for all runtime database files. This is useful for diagnostics, backup, recovery, or reporting.
 
-**Data flow**: It takes `codex_home: &Path`, iterates over the `RUNTIME_DBS` array, maps each `RuntimeDbSpec` into a `RuntimeDbPath { label, path: spec.path(codex_home) }`, collects the results into a `Vec<RuntimeDbPath>`, and returns it.
+**Data flow**: It receives a Codex home path. It walks over the runtime database specifications, builds each database path, pairs it with a human-readable label, and returns the collection.
 
-**Call relations**: Higher-level tooling can call this to enumerate all DB files for backup, diagnostics, or cleanup.
+**Call relations**: This helper gathers the same database list used by startup into one public view. Recovery or tooling code can use it to know every runtime database file.
 
 
 ##### `sqlite_integrity_check`  (lines 509–524)
@@ -840,11 +840,11 @@ fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath>
 async fn sqlite_integrity_check(path: &Path) -> anyhow::Result<Vec<String>>
 ```
 
-**Purpose**: Runs SQLite’s built-in `PRAGMA integrity_check` against an existing database file and returns all result rows. It is a diagnostic helper for corruption detection.
+**Purpose**: Runs SQLite's built-in integrity check on an existing database file. This helps detect file corruption or structural problems.
 
-**Data flow**: It takes a database `&Path`, builds read-only `SqliteConnectOptions` with `create_if_missing(false)` and statement logging disabled, opens a single-connection pool, executes `sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_all(&pool)`, closes the pool, and returns the collected `Vec<String>`.
+**Data flow**: It receives a database path. It opens the file read-only without creating it, runs PRAGMA integrity_check, collects the returned messages, closes the pool, and returns those messages.
 
-**Call relations**: A test in this file calls it directly, and operational diagnostics can use it to inspect an on-disk SQLite database without starting the full runtime.
+**Call relations**: A test calls this to confirm a valid database reports ok. In production-style diagnostics, it can be used before deciding whether a database needs recovery.
 
 *Call graph*: called by 1 (sqlite_integrity_check_reports_ok_for_valid_db); 2 external calls (new, new).
 
@@ -855,11 +855,11 @@ async fn sqlite_integrity_check(path: &Path) -> anyhow::Result<Vec<String>>
 fn counters(&self) -> Vec<MetricEvent>
 ```
 
-**Purpose**: Returns a snapshot of the telemetry counter events recorded by the test telemetry sink. It clones the stored events so assertions can inspect them without holding the mutex.
+**Purpose**: Returns a copy of the telemetry counter events captured during a test. It lets assertions inspect telemetry without exposing the internal lock-protected list.
 
-**Data flow**: It locks `self.counters: Mutex<Vec<MetricEvent>>`, iterates over the stored events, clones each event’s `name` and `tags` into a new `MetricEvent`, collects them into a `Vec`, and returns that vector.
+**Data flow**: It locks the stored vector of metric events, copies each event's name and tags, and returns the copied list. The original stored events remain unchanged.
 
-**Call relations**: The telemetry initialization test calls this after runtime startup to inspect which DB init phases were recorded.
+**Call relations**: The telemetry startup test uses this after initializing StateRuntime. It reads what tests::TestTelemetry::counter collected during startup.
 
 
 ##### `tests::TestTelemetry::counter`  (lines 572–580)
@@ -868,11 +868,11 @@ fn counters(&self) -> Vec<MetricEvent>
 fn counter(&self, name: &str, _inc: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Implements the `DbTelemetry` counter hook for tests by recording each counter event into an in-memory vector. It ignores the increment value and stores only the metric name and tags.
+**Purpose**: Records a counter metric event in the test telemetry collector. It is the test double for the real telemetry counter API.
 
-**Data flow**: It receives a metric `name`, an unused increment, and a tag slice, locks the `counters` mutex, converts the tags into a `BTreeMap` via `tags_to_map`, pushes a new `MetricEvent { name: name.to_string(), tags }`, and returns `()`.
+**Data flow**: It receives a metric name, an increment value that this test ignores, and tags. It converts the tags into a map, locks the internal event list, and appends a new MetricEvent.
 
-**Call relations**: Runtime startup telemetry calls this through the `DbTelemetry` trait when the test passes `TestTelemetry` into `init_with_telemetry_for_tests`.
+**Call relations**: Database startup telemetry calls this through the DbTelemetry interface. The test later reads the saved events with tests::TestTelemetry::counters.
 
 *Call graph*: 1 external calls (tags_to_map).
 
@@ -888,11 +888,11 @@ fn record_duration(
         )
 ```
 
-**Purpose**: Implements the `DbTelemetry` duration hook as a no-op for tests. The tests in this file only care about counter events.
+**Purpose**: Accepts duration metrics during tests but intentionally does nothing with them. The tests in this file only care that counter events were emitted.
 
-**Data flow**: It accepts a metric name, duration, and tags but ignores them all and returns `()` without mutating state.
+**Data flow**: It receives a metric name, a duration, and tags. It ignores all of them and returns without changing stored data.
 
-**Call relations**: This satisfies the `DbTelemetry` trait so `TestTelemetry` can be injected into runtime startup.
+**Call relations**: The telemetry system may call this through the DbTelemetry interface while startup runs. It exists so TestTelemetry satisfies the full interface.
 
 
 ##### `tests::tags_to_map`  (lines 591–595)
@@ -901,11 +901,11 @@ fn record_duration(
 fn tags_to_map(tags: &[(&str, &str)]) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Converts a slice of telemetry tag pairs into an owned `BTreeMap<String, String>`. It gives tests a stable, comparable representation of metric tags.
+**Purpose**: Turns telemetry tags into a map that is easy for tests to compare. Tags are small key-value labels attached to a metric.
 
-**Data flow**: It takes `&[(&str, &str)]`, iterates over the pairs, clones each key and value into owned `String`s, collects them into a `BTreeMap`, and returns it.
+**Data flow**: It receives a list of string pairs. It copies each key and value into a BTreeMap and returns that map.
 
-**Call relations**: `TestTelemetry::counter` uses this helper when storing incoming telemetry events.
+**Call relations**: tests::TestTelemetry::counter calls this before storing metric events. It makes later assertions deterministic and simple.
 
 
 ##### `tests::open_db_pool`  (lines 597–605)
@@ -914,11 +914,11 @@ fn tags_to_map(tags: &[(&str, &str)]) -> BTreeMap<String, String>
 async fn open_db_pool(path: &Path) -> SqlitePool
 ```
 
-**Purpose**: Opens a simple SQLite pool for an existing database path in tests. It is a convenience helper for direct migration checks.
+**Purpose**: Opens an existing SQLite database for tests. It is used when a test wants a plain pool without the runtime's migration-tolerant open path.
 
-**Data flow**: It takes a `&Path`, builds `SqliteConnectOptions` with `create_if_missing(false)`, calls `SqlitePool::connect_with(...)`, awaits the connection, and returns the resulting `SqlitePool`, panicking on failure with `expect`.
+**Data flow**: It receives a database path, opens a SQLite pool with file creation disabled, and returns the pool. If opening fails, the test panics.
 
-**Call relations**: The migration-compatibility test uses this helper to open the state DB with strict settings before running the embedded `STATE_MIGRATOR` directly.
+**Call relations**: The migration-tolerance test calls this to demonstrate how the strict migrator behaves before comparing it with open_state_sqlite.
 
 *Call graph*: 2 external calls (new, connect_with).
 
@@ -929,11 +929,11 @@ async fn open_db_pool(path: &Path) -> SqlitePool
 async fn sqlite_integrity_check_reports_ok_for_valid_db()
 ```
 
-**Purpose**: Verifies that `sqlite_integrity_check` returns `"ok"` for a valid SQLite database. It exercises the helper against a minimal real database file.
+**Purpose**: Verifies that sqlite_integrity_check reports ok for a simple valid database. This protects the diagnostic helper from regressions.
 
-**Data flow**: It creates a unique temp directory, creates the Codex home on disk, derives the state DB path, opens a SQLite DB there, creates a sample table, closes the pool, runs `sqlite_integrity_check(&path)`, asserts the returned vector equals `["ok"]`, and removes the temp directory.
+**Data flow**: The test creates a temporary Codex home, creates a state database with one sample table, closes it, runs sqlite_integrity_check, and asserts that the result is exactly ok. It then removes the temporary directory.
 
-**Call relations**: This Tokio test is invoked by the test runner. It drives the public integrity-check helper end to end against an actual on-disk database.
+**Call relations**: The test runner calls this as an asynchronous test. It exercises state_db_path and sqlite_integrity_check together.
 
 *Call graph*: calls 3 internal fn (sqlite_integrity_check, state_db_path, unique_temp_dir); 6 external calls (new, connect_with, assert_eq!, query, create_dir_all, remove_dir_all).
 
@@ -944,11 +944,11 @@ async fn sqlite_integrity_check_reports_ok_for_valid_db()
 async fn open_state_sqlite_tolerates_newer_applied_migrations()
 ```
 
-**Purpose**: Verifies that the runtime’s tolerant state migrator accepts a database whose migration table contains a newer version than the binary knows about, while the strict embedded migrator rejects it. It protects mixed-version compatibility behavior.
+**Purpose**: Verifies that the runtime state migrator can open a database that contains a record for a future migration. This matters when a user downgrades to an older binary after a newer one has touched the database.
 
-**Data flow**: It creates a temp state DB, applies `STATE_MIGRATOR`, manually inserts a fake future migration row into `_sqlx_migrations`, closes the pool, reopens the DB with `open_db_pool`, runs the strict `STATE_MIGRATOR` and asserts it fails with `MigrateError::VersionMissing(9_999)`, then constructs `runtime_state_migrator()`, opens the DB through `open_state_sqlite`, expects success, closes the tolerant pool, and removes the temp directory.
+**Data flow**: The test creates a temporary state database, applies the current schema, manually inserts a fake future migration record, and closes the pool. It first proves the strict migrator rejects that database, then uses the runtime migrator through open_state_sqlite and expects it to open successfully. Finally it closes the pool and removes the temp directory.
 
-**Call relations**: This test directly exercises the interaction between `migrations.rs` and `open_state_sqlite`, proving that runtime startup uses the relaxed migration policy rather than SQLx’s strict default.
+**Call relations**: The test runner calls this to protect startup compatibility. It compares direct strict migration behavior with the runtime's tolerant open path.
 
 *Call graph*: calls 3 internal fn (open_state_sqlite, state_db_path, unique_temp_dir); 9 external calls (new, connect_with, assert!, query, open_db_pool, runtime_state_migrator, create_dir_all, remove_dir_all, vec!).
 
@@ -959,22 +959,24 @@ async fn open_state_sqlite_tolerates_newer_applied_migrations()
 async fn init_records_successful_sqlite_init_phases_to_explicit_telemetry()
 ```
 
-**Purpose**: Verifies that runtime initialization emits success telemetry for every expected open, migrate, and post-open phase when an explicit telemetry sink is supplied. It checks the completeness of startup instrumentation.
+**Purpose**: Verifies that successful StateRuntime startup reports every expected database initialization phase to telemetry. This helps ensure startup observability does not silently disappear.
 
-**Data flow**: It creates a temp directory and a default `TestTelemetry`, initializes the runtime with `StateRuntime::init_with_telemetry_for_tests`, reads back recorded events via `telemetry.counters()`, filters them to `DB_INIT_METRIC` counters with `status=success`, extracts the `phase` tag values into a `BTreeSet`, compares that set against the expected phase names, closes the runtime pools, and removes the temp directory.
+**Data flow**: The test creates a temporary home and a TestTelemetry collector, starts StateRuntime with that collector, reads the recorded counter events, filters for successful database init events, extracts their phase names, and compares them with the expected set. It then closes database pools and removes the temporary directory.
 
-**Call relations**: This Tokio test drives the test-only initializer and then inspects the telemetry sink’s recorded counters. It validates the instrumentation performed inside `open_sqlite`, `ensure_backfill_state_row_in_pool`, and the post-init query path.
+**Call relations**: The test runner calls this as an asynchronous test. It drives StateRuntime::init_with_telemetry_for_tests and inspects events captured by TestTelemetry.
 
 *Call graph*: calls 2 internal fn (init_with_telemetry_for_tests, unique_temp_dir); 3 external calls (assert_eq!, default, remove_dir_all).
 
 
 ### `state/src/migrations.rs`
 
-`config` · `startup`
+`config` · `database startup and maintenance`
 
-This module exposes four static `sqlx::migrate::Migrator` values, one each for the state, logs, goals, and memories databases, using `sqlx::migrate!` to embed migration directories at compile time. Its key behavior is not the static definitions themselves but the `runtime_migrator` helper, which clones the relevant `Migrator` configuration while setting `ignore_missing: true`.
+A database migration is a planned change to a database layout, such as adding a table or column. This file collects four embedded migration sets: one for general state, one for logs, one for goals, and one for memories. Embedding them means the migration files are bundled into the compiled program, so the program knows how to bring a database up to the version it expects.
 
-That flag is a deliberate compatibility choice: if an older Codex binary starts against a database whose `_sqlx_migrations` table contains versions newer than the binary knows about, startup should still succeed instead of failing with a "database is ahead of me" error. The implementation preserves all other migration semantics—borrowed migration list, locking mode, transaction behavior, migration table name, and schema-creation settings—so known migrations are still checksum-validated and applied normally. The four public runtime helpers simply specialize this policy for each database family. In practice, runtime initialization code calls these wrappers rather than the strict embedded migrators, allowing concurrent mixed-version binaries to share the same SQLite files more safely.
+The important extra behavior here is tolerance for a database that is “ahead” of the current program. Imagine two versions of Codex running at the same time. A newer version may upgrade the database first. Without this file’s runtime wrapper, the older version could refuse to open the database because it sees migration versions newer than the ones built into it. The helper in this file creates a copy of a migrator with `ignore_missing` turned on. That means unknown newer migrations are ignored, while known migrations are still checked by checksum, which verifies that a migration the program does know about has not changed unexpectedly.
+
+The small public helper functions each return this relaxed runtime migrator for one database area. Other startup and cleanup code can ask for the right migrator without needing to know the compatibility details.
 
 #### Function details
 
@@ -984,11 +986,11 @@ That flag is a deliberate compatibility choice: if an older Codex binary starts 
 fn runtime_migrator(base: &'static Migrator) -> Migrator
 ```
 
-**Purpose**: Constructs a `Migrator` copy suitable for runtime startup by reusing an embedded migration set but relaxing the "missing version" check. It preserves all migration metadata except for enabling `ignore_missing`.
+**Purpose**: This function turns a normal embedded database migrator into a runtime-friendly one that does not fail when the database contains newer migration records. It preserves the actual known migration list and safety checks, but relaxes only the case where the database has been upgraded by a newer program.
 
-**Data flow**: It takes a borrowed static `Migrator` reference, reads its `migrations`, `locking`, `no_tx`, `table_name`, and `create_schemas` fields, wraps the migration slice with `Cow::Borrowed`, and returns a new `Migrator` value whose `ignore_missing` field is forced to `true`.
+**Data flow**: It receives a reference to one built-in migrator. It builds a new migrator using the same migrations, locking rules, transaction setting, migration table name, and schema-creation settings, but changes the setting that controls missing migrations so unknown newer entries are ignored. It returns that new migrator without changing the original one.
 
-**Call relations**: This helper is not called directly by startup code; instead the database-specific wrapper functions invoke it to produce tolerant migrators. Those wrappers are then consumed by runtime initialization and maintenance paths that open SQLite databases.
+**Call relations**: The four area-specific helper functions call this when they need a runtime migrator for state, logs, goals, or memories. Inside, it uses a borrowed view of the existing migration list, so the wrapper can reuse the embedded migration data rather than copying it.
 
 *Call graph*: called by 4 (runtime_goals_migrator, runtime_logs_migrator, runtime_memories_migrator, runtime_state_migrator); 1 external calls (Borrowed).
 
@@ -999,11 +1001,11 @@ fn runtime_migrator(base: &'static Migrator) -> Migrator
 fn runtime_state_migrator() -> Migrator
 ```
 
-**Purpose**: Produces the tolerant runtime migrator for the main state database. It is the state-specific entry point for the compatibility policy implemented in `runtime_migrator`.
+**Purpose**: This function gives callers the compatibility-friendly migrator for the main state database. It is a simple named doorway so callers do not have to know which embedded migration set to wrap.
 
-**Data flow**: It reads the `STATE_MIGRATOR` static and passes it into `runtime_migrator`, returning the resulting `Migrator` by value.
+**Data flow**: It takes no input. It reads the embedded state migration set, passes it through the shared runtime wrapper, and returns the resulting migrator.
 
-**Call relations**: This wrapper is used wherever the state DB must be opened under runtime compatibility rules. It delegates all substantive behavior to `runtime_migrator`.
+**Call relations**: It delegates the real work to `runtime_migrator`. Code that needs to migrate or open the state database can use this function to get the relaxed runtime behavior consistently.
 
 *Call graph*: calls 1 internal fn (runtime_migrator).
 
@@ -1014,11 +1016,11 @@ fn runtime_state_migrator() -> Migrator
 fn runtime_logs_migrator() -> Migrator
 ```
 
-**Purpose**: Produces the tolerant runtime migrator for the dedicated logs database. It ensures log DB startup accepts newer-applied migration versions while still validating known ones.
+**Purpose**: This function gives startup code the compatibility-friendly migrator for the logs database. It helps log storage open safely even if another newer Codex process has already applied newer log migrations.
 
-**Data flow**: It takes no arguments, reads `LOGS_MIGRATOR`, and returns `runtime_migrator(&LOGS_MIGRATOR)`.
+**Data flow**: It takes no input. It reads the embedded logs migration set, wraps it with the shared runtime behavior, and returns the new migrator.
 
-**Call relations**: Runtime startup calls this before opening the logs SQLite file in `init_inner`. The function itself is only a thin specialization over `runtime_migrator`.
+**Call relations**: It calls `runtime_migrator` to apply the common compatibility rule. It is called by `init_inner` during initialization when the logs database area is being prepared.
 
 *Call graph*: calls 1 internal fn (runtime_migrator); called by 1 (init_inner).
 
@@ -1029,11 +1031,11 @@ fn runtime_logs_migrator() -> Migrator
 fn runtime_goals_migrator() -> Migrator
 ```
 
-**Purpose**: Produces the tolerant runtime migrator for the goals database. It applies the same mixed-version startup policy to goal-tracking schema migrations.
+**Purpose**: This function gives startup code the compatibility-friendly migrator for the goals database. It lets the goals storage layer tolerate newer migration records while still validating the migrations it knows about.
 
-**Data flow**: It reads `GOALS_MIGRATOR`, forwards it to `runtime_migrator`, and returns the copied `Migrator`.
+**Data flow**: It takes no input. It reads the embedded goals migration set, sends it to the shared runtime wrapper, and returns the resulting migrator.
 
-**Call relations**: This function is invoked during `init_inner` before opening the goals DB. It exists so callers do not need to know which static migrator corresponds to that database.
+**Call relations**: It relies on `runtime_migrator` for the actual wrapping behavior. `init_inner` calls it during setup when goal-related database tables need to be checked or created.
 
 *Call graph*: calls 1 internal fn (runtime_migrator); called by 1 (init_inner).
 
@@ -1044,11 +1046,11 @@ fn runtime_goals_migrator() -> Migrator
 fn runtime_memories_migrator() -> Migrator
 ```
 
-**Purpose**: Produces the tolerant runtime migrator for the memories database. It is used both during full runtime startup and when opening the memories DB for standalone cleanup.
+**Purpose**: This function gives callers the compatibility-friendly migrator for the memories database. It is used both when setting up memory storage and when clearing memory data in the SQLite home area.
 
-**Data flow**: It reads `MEMORIES_MIGRATOR`, passes it through `runtime_migrator`, and returns the resulting `Migrator`.
+**Data flow**: It takes no input. It reads the embedded memory migration set, wraps it with the shared runtime compatibility settings, and returns that migrator to the caller.
 
-**Call relations**: Both `init_inner` and `clear_memory_data_in_sqlite_home` obtain their memories migrator through this wrapper. Like the other wrappers, it delegates the actual policy construction to `runtime_migrator`.
+**Call relations**: It calls `runtime_migrator` so memory storage gets the same “ignore unknown newer migrations” behavior as the other database areas. It is called by `init_inner` during initialization and by `clear_memory_data_in_sqlite_home` when memory data is being cleaned up.
 
 *Call graph*: calls 1 internal fn (runtime_migrator); called by 2 (clear_memory_data_in_sqlite_home, init_inner).
 
@@ -1058,13 +1060,13 @@ These files handle startup failure recovery for local databases and present CLI-
 
 ### `cli/src/state_db_recovery.rs`
 
-`util` · `interactive TUI startup failure handling and recovery`
+`orchestration` · `startup`
 
-This file is a narrow support module used only during interactive startup. Its boundary type is `codex_tui::LocalStateDbStartupError`, which the main CLI extracts from a generic `std::io::Error` using `startup_error`. From there, the helpers classify failures into lock contention (`is_locked`), corruption (`is_corruption`), or auto-recoverable cases (`is_auto_backup_recoverable`). Recovery is intentionally conservative: corruption is recoverable, and one additional case is treated as recoverable when the parent `sqlite_home` path is unexpectedly a file instead of a directory, detected by `sqlite_home_is_blocking_file`.
+Codex keeps local data in SQLite database files. SQLite is a small file-based database, so startup can fail if another Codex process has the file locked, if the file is damaged, or if something that should be a folder is actually a plain file. This file keeps that recovery behavior out of the main command-line startup path, like a small roadside-assistance kit for database startup failures.
 
-The user-facing functions print distinct guidance for each situation. `print_locked_guidance` tells the user another Codex process is using local data; `print_diagnostic_guidance` points them to `codex doctor`; `print_auto_backup_start` explains that damaged local database files are being moved aside. All three include a shared technical-details block with the failing database path and low-level cause string. `backup_files_for_fresh_start` delegates the actual backup/move operation to `codex_state::backup_runtime_db_for_fresh_start`.
+The code first unwraps startup errors to see whether they are the special local database error type used by the TUI layer. It then classifies the failure using helper checks from `codex_state`: one check looks for lock-related messages, and another looks for corruption-related messages. A separate check catches the case where the SQLite home path is blocked by a file where a directory should be.
 
-After a successful backup-and-rebuild, `confirm_fresh_start_rebuild` prints the rebuilt database path and backup folder, then either pauses for Enter when stdin and stderr are both terminals or continues automatically in non-interactive environments. `backup_folder` derives the displayed backup directory from the first returned `RuntimeDbBackup`, matching the invariant that all moved files for one recovery attempt live under the same backup folder.
+If the failure is recoverable, this file can ask `codex_state` to back up the broken database file and prepare a fresh start. It prints user-facing messages before and after that backup, including the database location and backup folder when available. If the terminal is interactive, it pauses for Enter so the user can read what happened; otherwise it keeps going. It also provides simpler guidance for cases where automatic recovery is not used, such as telling the user to run `codex doctor` or close another running Codex process.
 
 #### Function details
 
@@ -1074,11 +1076,11 @@ After a successful backup-and-rebuild, `confirm_fresh_start_rebuild` prints the 
 fn startup_error(err: &std::io::Error) -> Option<&LocalStateDbStartupError>
 ```
 
-**Purpose**: Extracts a `LocalStateDbStartupError` reference from a generic I/O error if that is the underlying cause.
+**Purpose**: This function checks whether a general input/output error is really a local state database startup error hidden inside it. It is used when higher-level startup code receives a broad error but needs the database-specific details.
 
-**Data flow**: Borrows a `std::io::Error`, reads its inner source via `get_ref()`, attempts `downcast_ref::<LocalStateDbStartupError>()`, and returns `Option<&LocalStateDbStartupError>`.
+**Data flow**: It receives a standard Rust I/O error. It looks inside that error for an attached underlying error, then tries to view that underlying value as `LocalStateDbStartupError`. If the match succeeds, it returns a borrowed reference to that database startup error; otherwise it returns nothing.
 
-**Call relations**: Used by `run_interactive_tui` in `main.rs` to decide whether a TUI startup failure should enter the local-state recovery path.
+**Call relations**: This is the doorway from general startup failure handling into the more specific recovery logic in this file. It relies on the standard error wrapper's stored inner error rather than doing any database work itself.
 
 *Call graph*: 1 external calls (get_ref).
 
@@ -1089,11 +1091,11 @@ fn startup_error(err: &std::io::Error) -> Option<&LocalStateDbStartupError>
 fn is_locked(detail: &str) -> bool
 ```
 
-**Purpose**: Classifies a SQLite error-detail string as a lock-contention failure.
+**Purpose**: This function answers the question: does this database error message mean another process is using the database? That matters because a lock should usually be fixed by closing the other Codex process, not by rebuilding the database.
 
-**Data flow**: Passes the detail string into `codex_state::sqlite_error_detail_is_lock` and returns the resulting boolean.
+**Data flow**: It receives the detailed error text from SQLite. It passes that text to the state layer's lock detector and returns the yes-or-no result unchanged.
 
-**Call relations**: Used by `run_interactive_tui` after extracting a startup error to choose lock-specific guidance.
+**Call relations**: It is a thin command-line-facing wrapper around `codex_state`'s SQLite lock knowledge. Startup code can use it before deciding to show the locked-database guidance.
 
 *Call graph*: 1 external calls (sqlite_error_detail_is_lock).
 
@@ -1104,11 +1106,11 @@ fn is_locked(detail: &str) -> bool
 fn is_corruption(detail: &str) -> bool
 ```
 
-**Purpose**: Classifies a SQLite error-detail string as corruption.
+**Purpose**: This function checks whether an SQLite error detail looks like database corruption. Corruption is one of the cases where Codex may be able to move the bad file aside and create a clean replacement.
 
-**Data flow**: Passes the detail string into `codex_state::sqlite_error_detail_is_corruption` and returns the resulting boolean.
+**Data flow**: It receives the error detail string. It sends that string to the state layer's corruption detector, then returns the resulting true-or-false answer.
 
-**Call relations**: Used by `is_auto_backup_recoverable` as one of the recoverable conditions.
+**Call relations**: It is used by `is_auto_backup_recoverable` as one reason to allow automatic backup-and-rebuild recovery. The actual knowledge of SQLite corruption phrases lives in `codex_state`.
 
 *Call graph*: called by 1 (is_auto_backup_recoverable); 1 external calls (sqlite_error_detail_is_corruption).
 
@@ -1119,11 +1121,11 @@ fn is_corruption(detail: &str) -> bool
 fn is_auto_backup_recoverable(startup_error: &LocalStateDbStartupError) -> bool
 ```
 
-**Purpose**: Determines whether a startup failure should trigger automatic backup-and-rebuild recovery.
+**Purpose**: This function decides whether a startup database failure is safe enough for automatic recovery by backing up the bad local database and starting fresh. It treats either database corruption or a blocking file in the database home path as recoverable.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, reads its detail string, and returns true when either `is_corruption(detail)` is true or `sqlite_home_is_blocking_file(startup_error)` detects a file where the SQLite home directory should be.
+**Data flow**: It receives a `LocalStateDbStartupError`, reads its human-readable detail text, and checks whether that detail suggests corruption. It also checks the database path to see whether its parent path is wrongly occupied by a file. If either condition is true, it returns true; otherwise it returns false.
 
-**Call relations**: Used by `run_interactive_tui` to decide whether to attempt automatic recovery or fall back to diagnostic guidance.
+**Call relations**: This is the main recovery decision point in the file. It calls `is_corruption` for error-text classification and `sqlite_home_is_blocking_file` for the filesystem shape check before the caller decides whether to run the backup path.
 
 *Call graph*: calls 3 internal fn (is_corruption, sqlite_home_is_blocking_file, detail).
 
@@ -1134,11 +1136,11 @@ fn is_auto_backup_recoverable(startup_error: &LocalStateDbStartupError) -> bool
 fn sqlite_home_is_blocking_file(startup_error: &LocalStateDbStartupError) -> bool
 ```
 
-**Purpose**: Detects the special case where the parent directory of the failing database path exists as a regular file.
+**Purpose**: This helper detects a specific setup problem: the place where Codex expects a database directory is instead a regular file. In that situation, startup cannot create or open the database normally, but the file can be backed up and replaced by a directory.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, gets `database_path()`, walks to its parent, reads filesystem metadata, and returns true when that metadata exists and reports `is_file()`.
+**Data flow**: It receives the startup database error, reads the database path from it, and looks at that path's parent. It asks the filesystem for information about the parent path. If the parent exists and is a regular file, it returns true; otherwise it returns false.
 
-**Call relations**: Used only by `is_auto_backup_recoverable`.
+**Call relations**: It is called only by `is_auto_backup_recoverable`. It supplies the filesystem-based reason for recovery, complementing the corruption check that looks at SQLite's error message.
 
 *Call graph*: calls 1 internal fn (database_path); called by 1 (is_auto_backup_recoverable).
 
@@ -1149,11 +1151,11 @@ fn sqlite_home_is_blocking_file(startup_error: &LocalStateDbStartupError) -> boo
 fn print_auto_backup_start(startup_error: &LocalStateDbStartupError)
 ```
 
-**Purpose**: Prints the user-facing explanation shown before damaged local database files are moved aside automatically.
+**Purpose**: This function tells the user that Codex found what appears to be a damaged local database and is about to move it aside. It makes the automatic recovery action visible instead of silently changing files.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, prints two explanatory stderr lines about damage and rebuilding, then delegates the path/cause block to `print_technical_details`.
+**Data flow**: It receives the startup error, prints two plain-language lines to standard error, then calls `print_technical_details` to include the database location and original cause.
 
-**Call relations**: Called by `run_interactive_tui` immediately before attempting `backup_files_for_fresh_start`.
+**Call relations**: It is used at the start of the automatic backup flow. After it prints the friendly explanation, it hands off to `print_technical_details` for the reusable low-level facts.
 
 *Call graph*: calls 1 internal fn (print_technical_details); 1 external calls (eprintln!).
 
@@ -1166,11 +1168,11 @@ async fn backup_files_for_fresh_start(
 ) -> std::io::Result<Vec<RuntimeDbBackup>>
 ```
 
-**Purpose**: Moves the failing runtime database files aside so Codex can rebuild fresh local state.
+**Purpose**: This asynchronous function performs the actual backup step needed for a fresh database start. It asks the state layer to move the failed runtime database file out of the way so Codex can rebuild local data.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, reads its `database_path()`, and awaits `codex_state::backup_runtime_db_for_fresh_start`, returning the resulting `Vec<RuntimeDbBackup>` or I/O error.
+**Data flow**: It receives the startup error and reads the failed database path from it. It passes that path to `codex_state::backup_runtime_db_for_fresh_start`, waits for the file operation to finish, and returns either a list of backup records or an I/O error.
 
-**Call relations**: Called by `run_interactive_tui` during automatic recovery and by tests that verify backup behavior.
+**Call relations**: This file does not implement the low-level file-moving itself; it delegates that to `codex_state`. The tests call this function directly to prove that only the failed database is backed up and that a blocking file can be replaced.
 
 *Call graph*: calls 1 internal fn (database_path); called by 2 (backup_backs_up_only_failed_database_file, backup_replaces_blocking_sqlite_home_file); 1 external calls (backup_runtime_db_for_fresh_start).
 
@@ -1184,11 +1186,11 @@ fn confirm_fresh_start_rebuild(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Prints the post-recovery confirmation message and optionally pauses for Enter before startup continues.
+**Purpose**: This function tells the user that Codex successfully rebuilt its local database after moving the damaged one into a backup. It also pauses for confirmation when the user is in an interactive terminal, so the message is not missed.
 
-**Data flow**: Borrows the startup error and backup list, prints that the local database was rebuilt, prints the database path and backup folder (via `backup_folder` or `unavailable`), then checks whether stdin and stderr are terminals. In a terminal it prompts `Press Enter to continue.` and reads one line from stdin; otherwise it prints that startup is continuing automatically. Returns `std::io::Result<()>`.
+**Data flow**: It receives the original startup error and the backup records created during recovery. It prints a success explanation, the database path, and either the backup folder path or a note that it is unavailable. If both standard input and standard error are terminals, it waits for the user to press Enter; otherwise it prints that startup will continue. It returns success unless reading from input fails.
 
-**Call relations**: Called by `run_interactive_tui` after a successful backup-and-rebuild so the user sees what happened before the TUI retries startup.
+**Call relations**: This is the closing message for the automatic recovery flow. It uses `backup_folder` to turn the backup records into a user-friendly folder path, then either waits for the person at the keyboard or continues immediately in non-interactive runs such as scripts.
 
 *Call graph*: calls 1 internal fn (backup_folder); 4 external calls (new, eprintln!, stderr, stdin).
 
@@ -1199,11 +1201,11 @@ fn confirm_fresh_start_rebuild(
 fn print_diagnostic_guidance(startup_error: &LocalStateDbStartupError)
 ```
 
-**Purpose**: Prints the fallback guidance for unrecoverable local database startup failures.
+**Purpose**: This function prints advice for a damaged database situation when automatic recovery is not being completed here. It points the user to `codex doctor`, which is the command meant to inspect the setup and suggest next steps.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, prints stderr lines explaining that the database appears damaged, recommends `codex doctor`, asks the user to share technical details when seeking help, and then prints the shared technical-details block.
+**Data flow**: It receives the startup error, prints a short explanation and support guidance to standard error, then prints the technical details from the error.
 
-**Call relations**: Called by `run_interactive_tui` when corruption is not auto-recoverable or when automatic backup itself fails.
+**Call relations**: This is one of the user-facing fallback paths. It reuses `print_technical_details` so support information is formatted the same way as in the automatic backup message.
 
 *Call graph*: calls 1 internal fn (print_technical_details); 1 external calls (eprintln!).
 
@@ -1214,11 +1216,11 @@ fn print_diagnostic_guidance(startup_error: &LocalStateDbStartupError)
 fn print_locked_guidance(startup_error: &LocalStateDbStartupError)
 ```
 
-**Purpose**: Prints the guidance shown when startup fails because another Codex process is holding the local database lock.
+**Purpose**: This function explains the common case where Codex cannot start because another Codex process is already using the local database. It tells the user to close other copies and try again.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, prints stderr lines explaining that another Codex process is using local data and should be quit, then prints the shared technical-details block.
+**Data flow**: It receives the startup error, prints lock-specific guidance to standard error, and then prints the database path and cause through `print_technical_details`.
 
-**Call relations**: Called by `run_interactive_tui` when `is_locked` is true.
+**Call relations**: This is the message path that pairs with lock detection from `is_locked`. Like the other guidance functions, it delegates the repeated technical section to `print_technical_details`.
 
 *Call graph*: calls 1 internal fn (print_technical_details); 1 external calls (eprintln!).
 
@@ -1229,11 +1231,11 @@ fn print_locked_guidance(startup_error: &LocalStateDbStartupError)
 fn print_technical_details(startup_error: &LocalStateDbStartupError)
 ```
 
-**Purpose**: Prints the common low-level path and cause details for local database startup failures.
+**Purpose**: This small helper prints the exact database location and original error detail. It gives users and support helpers the concrete facts needed to investigate without repeating formatting code in every message.
 
-**Data flow**: Borrows `LocalStateDbStartupError`, prints `Technical details:`, then prints the database location and the raw cause string from `detail()`.
+**Data flow**: It receives a `LocalStateDbStartupError`. It reads the database path and detail message from it, then writes those values to standard error under a `Technical details` heading.
 
-**Call relations**: Shared by the auto-backup, diagnostic, and locked guidance printers.
+**Call relations**: Several user-facing functions call this after their plain-language explanation: `print_auto_backup_start`, `print_diagnostic_guidance`, and `print_locked_guidance`. It is the shared final paragraph for database startup failure messages.
 
 *Call graph*: called by 3 (print_auto_backup_start, print_diagnostic_guidance, print_locked_guidance); 1 external calls (eprintln!).
 
@@ -1244,11 +1246,11 @@ fn print_technical_details(startup_error: &LocalStateDbStartupError)
 fn backup_folder(backups: &[RuntimeDbBackup]) -> Option<&Path>
 ```
 
-**Purpose**: Returns the parent directory of the first backup path, which is used as the displayed backup folder for a recovery attempt.
+**Purpose**: This helper finds the folder that contains the backup files, using the first backup record as the example. It exists so the success message can show one useful folder instead of listing file records.
 
-**Data flow**: Borrows a slice of `RuntimeDbBackup`, takes the first element if present, and returns `backup_path.parent()` as `Option<&Path>`.
+**Data flow**: It receives a slice of backup records. It looks at the first record, takes that record's backup file path, and returns the parent folder if both exist. If there are no backups or no parent folder, it returns nothing.
 
-**Call relations**: Used by `confirm_fresh_start_rebuild`; tests verify the derived folder path.
+**Call relations**: It is called by `confirm_fresh_start_rebuild` while preparing the success message. The dedicated test checks that it reports the parent directory of the first backup path.
 
 *Call graph*: called by 1 (confirm_fresh_start_rebuild); 1 external calls (first).
 
@@ -1259,11 +1261,11 @@ fn backup_folder(backups: &[RuntimeDbBackup]) -> Option<&Path>
 async fn backup_backs_up_only_failed_database_file() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that recovery backs up only the specific failed database file and leaves unrelated runtime DB files intact.
+**Purpose**: This test proves that recovery backs up only the database file that failed, not every local database file. That matters because a problem in one database should not unnecessarily disturb unrelated local state.
 
-**Data flow**: Creates a temp SQLite home, writes both state and logs DB files, constructs a `LocalStateDbStartupError` for the logs DB, calls `backup_files_for_fresh_start`, and asserts that only the failed DB path appears in backups, the failed file is gone, the state DB remains, and the backup file exists.
+**Data flow**: It creates a temporary Codex data area with two database files: one normal state file and one failed logs file. It builds a startup error pointing at the failed file, runs `backup_files_for_fresh_start`, and then checks that the failed file was removed into a backup while the other state file still exists.
 
-**Call relations**: Tests `backup_files_for_fresh_start` against the normal corruption case.
+**Call relations**: The test calls the same backup wrapper that production recovery uses. It verifies the contract between this CLI recovery layer and the lower-level `codex_state` backup function.
 
 *Call graph*: calls 2 internal fn (backup_files_for_fresh_start, new); 6 external calls (new, assert!, assert_eq!, logs_db_path, state_db_path, write).
 
@@ -1274,11 +1276,11 @@ async fn backup_backs_up_only_failed_database_file() -> std::io::Result<()>
 async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies recovery when the SQLite home path is blocked by a regular file instead of a directory.
+**Purpose**: This test proves that Codex can recover when the expected SQLite home directory is blocked by a regular file. It checks both the decision to treat that case as recoverable and the file replacement behavior.
 
-**Data flow**: Creates a temp path where `sqlite-home` is a file, constructs a startup error for a DB path under that file path, asserts `is_auto_backup_recoverable`, calls `backup_files_for_fresh_start`, and then asserts the path has become a directory and the backup exists.
+**Data flow**: It creates a temporary path and writes a plain file where a database directory should be. It creates a startup error for a database under that path, confirms that `is_auto_backup_recoverable` returns true, runs the backup routine, and checks that the blocking path is now a directory and that a backup file exists.
 
-**Call relations**: Tests the special blocking-file recovery path recognized by `sqlite_home_is_blocking_file`.
+**Call relations**: The test exercises both the recovery decision helper and the backup wrapper. It anchors the special `sqlite_home_is_blocking_file` case in real filesystem behavior.
 
 *Call graph*: calls 2 internal fn (backup_files_for_fresh_start, new); 5 external calls (new, assert!, assert_eq!, state_db_path, write).
 
@@ -1289,24 +1291,24 @@ async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()>
 fn backup_folder_uses_parent_of_first_backup_path()
 ```
 
-**Purpose**: Verifies that the displayed backup folder is derived from the first backup entry’s parent directory.
+**Purpose**: This test checks the small formatting helper used in the recovery success message. It ensures the displayed backup folder is the parent directory of the first backup file.
 
-**Data flow**: Constructs a one-element `Vec<RuntimeDbBackup>`, calls `backup_folder`, and asserts the returned path equals the parent directory of the backup path.
+**Data flow**: It builds one fake backup record with an original database path and a backup file path. It calls `backup_folder` and compares the result with the expected parent directory.
 
-**Call relations**: Direct unit test for `backup_folder`.
+**Call relations**: The test protects the behavior that `confirm_fresh_start_rebuild` relies on when it tells the user where their backed-up database was placed.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `state/src/runtime/recovery.rs`
 
-`util` · `startup error handling and corruption recovery`
+`io_transport` · `database startup and corruption recovery`
 
-This file is the runtime’s SQLite recovery utility layer. `RuntimeDbInitError` wraps initialization failures with a database label, operation name, path, and source error so later code can recover the exact database path that failed. The helper `runtime_db_path_for_corruption_error` walks an `anyhow::Error` chain, first requiring that some source looks like SQLite corruption, then extracting the embedded `RuntimeDbInitError` path if present.
+Codex keeps several small runtime databases in the same SQLite home folder. If SQLite says one database is corrupt, the safest fix is often to move that database out of the way and let the program rebuild it. This file does that carefully. It knows how to recognize SQLite corruption errors, find which database path was involved, and back up the right files before a fresh start.
 
-Corruption detection is intentionally broad. `is_sqlite_corruption_error` scans the error chain and delegates each source to `sqlite_error_source_is_corruption`, which recognizes `sqlx::Error::Database` values whose message or SQLite code indicates corruption. Both textual details (`database disk image is malformed`, `file is not a database`, `sqlite_corrupt`, `(code: 11)`, etc.) and numeric/string codes (`11`, `26`, `sqlite_corrupt`, `sqlite_notadb`) are accepted. A separate helper detects lock/busy messages.
+SQLite can store extra companion files next to a database, commonly ending in `-wal` and `-shm`. These are like scratchpads SQLite uses to keep recent changes and shared state. When backing up a database, this file moves those side files too, so the backup is complete and the new database starts cleanly.
 
-Backup logic distinguishes two cases. `backup_runtime_db_for_fresh_start` normally backs up only the target database and its `-wal`/`-shm` sidecars by calling `backup_runtime_db_files`; if the supposed SQLite home path exists but is not a directory, it instead moves that blocking path aside wholesale with `backup_blocking_sqlite_home` and recreates the directory. Backups are placed under uniquely named timestamped directories created by `create_unique_backup_dir`. `backup_sqlite_paths` renames only files that actually exist and removes the empty backup directory if nothing was found. The result is a `Vec<RuntimeDbBackup>` mapping original paths to backup destinations.
+The backup is placed under a `db-backups` folder with a unique timestamped name, so older backups are not overwritten. There is also a fallback for an odd case: if the expected SQLite home path is not a folder, it backs up that blocking path itself and recreates the folder. The file also defines `RuntimeDbInitError`, a small error wrapper that remembers which database operation failed and where, making later recovery decisions possible.
 
 #### Function details
 
@@ -1321,11 +1323,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a structured initialization error that records which runtime database operation failed and at what path. This preserves enough context for later corruption recovery.
+**Purpose**: Creates a database-startup error that remembers what operation failed, which database label it was for, the path involved, and the original error. This extra context lets recovery code later identify the exact database file that may need to be backed up.
 
-**Data flow**: Consumes static `label` and `operation` strings, a `&Path`, and an `anyhow::Error`, clones the path with `to_path_buf`, and returns `RuntimeDbInitError`.
+**Data flow**: It receives a label, an operation name, a filesystem path, and the underlying error. It copies the path into owned storage and packages all four pieces into a `RuntimeDbInitError`. The result is an error value that carries both human-readable context and the original cause.
 
-**Call relations**: Called by database-opening code when wrapping initialization failures so later helpers can recover the failing path from the error chain.
+**Call relations**: Database-opening code uses this when an SQLite database fails to initialize. Later, recovery helpers can inspect this wrapped error to find the path that failed instead of guessing from a message string.
 
 *Call graph*: called by 2 (open_sqlite, runtime_db_path_for_corruption_error_ignores_corrupt_word_in_path); 1 external calls (to_path_buf).
 
@@ -1336,11 +1338,11 @@ fn new(
 fn path(&self) -> &Path
 ```
 
-**Purpose**: Returns the stored database path as a borrowed `&Path`. It is a small accessor used during error-chain inspection.
+**Purpose**: Returns the database path stored inside a `RuntimeDbInitError`. It is used when recovery code needs to know which database file was involved in the failure.
 
-**Data flow**: Reads `self.path` and returns `self.path.as_path()`.
+**Data flow**: It reads the saved path from the error and returns it as a borrowed path reference. Nothing is copied or changed.
 
-**Call relations**: Used by `runtime_db_path_for_corruption_error` after downcasting an error-chain source to `RuntimeDbInitError`.
+**Call relations**: This is a small accessor used by `runtime_db_path_for_corruption_error` after that function finds a `RuntimeDbInitError` inside a larger error chain.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -1351,11 +1353,11 @@ fn path(&self) -> &Path
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats the initialization error with operation, label, path, and source message for human-readable diagnostics. The output is suitable for logs and surfaced errors.
+**Purpose**: Builds the user-facing text for a `RuntimeDbInitError`. It explains what operation failed, which database label was involved, where it happened, and what the underlying error said.
 
-**Data flow**: Reads the struct fields and writes a formatted string into the provided formatter.
+**Data flow**: It reads the error's operation, label, path, and source error, then writes a sentence into Rust's formatting output. It does not change the error.
 
-**Call relations**: This powers the standard `Display` representation of `RuntimeDbInitError` when it appears in error chains.
+**Call relations**: Rust calls this automatically when the error is printed or converted to text. That makes logs and messages clear enough for a person to understand what went wrong.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1366,11 +1368,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn source(&self) -> Option<&(dyn std::error::Error + 'static)>
 ```
 
-**Purpose**: Exposes the wrapped underlying error as the standard error source. This keeps the original failure in the error chain.
+**Purpose**: Exposes the original lower-level error that caused this database initialization error. This lets error-reporting and recovery code walk backward through the chain of causes.
 
-**Data flow**: Returns `Some(self.source.as_ref())` as `&(dyn Error + 'static)`.
+**Data flow**: It reads the stored `anyhow::Error` and returns it as the source error. No data is changed.
 
-**Call relations**: This enables `anyhow::Error::chain()` traversal used by the corruption-detection helpers.
+**Call relations**: Rust's standard error machinery calls this when code asks for the cause of an error. The corruption-detection logic relies on being able to inspect every error in the chain.
 
 *Call graph*: 1 external calls (as_ref).
 
@@ -1383,11 +1385,11 @@ async fn backup_runtime_db_for_fresh_start(
 ) -> std::io::Result<Vec<RuntimeDbBackup>>
 ```
 
-**Purpose**: Moves the affected runtime database out of the way so it can be recreated cleanly, backing up either the database file set or an invalid blocking SQLite-home path. It also creates the SQLite home directory if it was missing.
+**Purpose**: Moves a runtime SQLite database out of the way so Codex can create a clean replacement. It tries to preserve other databases in the same folder instead of wiping the whole SQLite home.
 
-**Data flow**: Consumes `db_path`, derives `sqlite_home = db_path.parent()`, errors if there is no parent, then inspects `tokio::fs::metadata(sqlite_home)`. If the parent exists and is a directory it delegates to `backup_runtime_db_files`; if it exists but is not a directory it delegates to `backup_blocking_sqlite_home`; if it does not exist it creates the directory and returns an error saying no files were found; other metadata errors are propagated. Returns a vector of `RuntimeDbBackup` records on success.
+**Data flow**: It receives the path to the database that should be replaced. It checks the parent folder: if it is a normal directory, it backs up that database plus its SQLite side files; if the parent path exists but is not a directory, it backs up that blocking path and recreates the folder; if the parent does not exist, it creates it and reports that there was nothing to back up. It returns a list of original paths and where they were moved.
 
-**Call relations**: This is the top-level recovery action invoked after corruption is detected and the failing DB path is known.
+**Call relations**: This is the main recovery action callers use after detecting corruption. It delegates the normal database-file case to `backup_runtime_db_files` and the unusual blocked-folder case to `backup_blocking_sqlite_home`.
 
 *Call graph*: calls 2 internal fn (backup_blocking_sqlite_home, backup_runtime_db_files); 5 external calls (parent, other, format!, create_dir_all, metadata).
 
@@ -1398,11 +1400,11 @@ async fn backup_runtime_db_for_fresh_start(
 fn runtime_db_path_for_corruption_error(err: &anyhow::Error) -> Option<PathBuf>
 ```
 
-**Purpose**: Extracts the failing runtime database path from an `anyhow::Error` chain, but only when the chain also indicates SQLite corruption. Non-corruption errors return `None` even if they contain a `RuntimeDbInitError`.
+**Purpose**: Looks at an error and, only if it is truly an SQLite corruption error, tries to extract the database path that failed. This prevents the program from backing up files just because a path or message happened to contain the word "corrupt."
 
-**Data flow**: Consumes `&anyhow::Error`, first calls `is_sqlite_corruption_error`; if false returns `None`. Otherwise it walks `err.chain()`, finds the first source downcastable to `RuntimeDbInitError`, and returns a cloned `PathBuf` from its `path()` accessor.
+**Data flow**: It receives a broad `anyhow::Error`. First it checks whether any cause in the error chain looks like SQLite corruption. If not, it returns nothing. If yes, it searches the same chain for a `RuntimeDbInitError` and returns the path stored there.
 
-**Call relations**: Used by higher-level startup recovery logic to decide which database file should be backed up after an initialization failure.
+**Call relations**: This function connects error recognition with recovery. It calls `is_sqlite_corruption_error` before using `RuntimeDbInitError::path`, so backup decisions are based on both a real SQLite corruption signal and a known database path.
 
 *Call graph*: calls 1 internal fn (is_sqlite_corruption_error); 1 external calls (chain).
 
@@ -1413,11 +1415,11 @@ fn runtime_db_path_for_corruption_error(err: &anyhow::Error) -> Option<PathBuf>
 fn is_sqlite_corruption_error(err: &anyhow::Error) -> bool
 ```
 
-**Purpose**: Determines whether any source in an `anyhow::Error` chain looks like a SQLite corruption error. It is the broad corruption predicate used before attempting recovery.
+**Purpose**: Answers a yes-or-no question: does this error chain contain an SQLite error that means the database is corrupt or not really a database?
 
-**Data flow**: Consumes `&anyhow::Error`, iterates `err.chain()`, and returns true if any source satisfies `sqlite_error_source_is_corruption`.
+**Data flow**: It receives an `anyhow::Error`, walks through its chain of causes, and tests each cause. It returns `true` as soon as one cause matches known SQLite corruption patterns; otherwise it returns `false`.
 
-**Call relations**: Called by `runtime_db_path_for_corruption_error` and potentially other recovery decisions that need to distinguish corruption from unrelated failures.
+**Call relations**: This is used by `runtime_db_path_for_corruption_error` as the gatekeeper before recovery starts. It relies on `sqlite_error_source_is_corruption` to inspect each individual error cause.
 
 *Call graph*: called by 1 (runtime_db_path_for_corruption_error); 1 external calls (chain).
 
@@ -1428,11 +1430,11 @@ fn is_sqlite_corruption_error(err: &anyhow::Error) -> bool
 fn sqlite_error_source_is_corruption(source: &(dyn std::error::Error + 'static)) -> bool
 ```
 
-**Purpose**: Checks one error source for SQLite corruption by downcasting to `sqlx::Error::Database` and inspecting both message text and SQLite error code. Non-SQLx or non-database errors are ignored.
+**Purpose**: Checks one error cause to see whether it is an SQLite database error reporting corruption. It understands both SQLite message text and SQLite error codes.
 
-**Data flow**: Consumes a trait-object error source, attempts `downcast_ref::<sqlx::Error>()`, requires the `Database` variant, then returns true if `sqlite_error_detail_is_corruption(database_error.message())` or the optional code satisfies `sqlite_database_code_is_corruption`.
+**Data flow**: It receives one error from an error chain. If the error is not a `sqlx::Error`, or not a database error inside `sqlx`, it returns `false`. If it is a database error, it checks the message text and optional database code for known corruption signs and returns the result.
 
-**Call relations**: Used internally by `is_sqlite_corruption_error` while scanning an error chain.
+**Call relations**: This is the per-error test used while `is_sqlite_corruption_error` walks through a full error chain. It hands message checking to `sqlite_error_detail_is_corruption` and code checking to `sqlite_database_code_is_corruption`.
 
 *Call graph*: calls 1 internal fn (sqlite_error_detail_is_corruption).
 
@@ -1443,11 +1445,11 @@ fn sqlite_error_source_is_corruption(source: &(dyn std::error::Error + 'static))
 fn sqlite_database_code_is_corruption(code: Cow<'_, str>) -> bool
 ```
 
-**Purpose**: Recognizes SQLite corruption/not-a-database codes in either numeric or symbolic string form. Matching is case-insensitive.
+**Purpose**: Recognizes SQLite's machine-readable corruption codes. SQLite may report corruption as numbers such as `11` or `26`, or as names such as `SQLITE_CORRUPT` and `SQLITE_NOTADB`.
 
-**Data flow**: Consumes a `Cow<'_, str>`, lowercases it, and returns true for `11`, `26`, `sqlite_corrupt`, or `sqlite_notadb`.
+**Data flow**: It receives a database error code as text. It lowercases the code and compares it with the known corruption code forms. It returns `true` for a match and `false` otherwise.
 
-**Call relations**: Called by `sqlite_error_source_is_corruption` when a SQLx database error exposes a code.
+**Call relations**: This supports `sqlite_error_source_is_corruption` when SQLite provides a separate error code. It complements message-text matching, because different SQLite layers may expose the same problem in different forms.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1458,11 +1460,11 @@ fn sqlite_database_code_is_corruption(code: Cow<'_, str>) -> bool
 fn sqlite_error_detail_is_corruption(detail: &str) -> bool
 ```
 
-**Purpose**: Recognizes corruption-related SQLite error messages by substring matching. It accepts both canonical SQLite phrases and embedded code strings.
+**Purpose**: Recognizes common SQLite corruption phrases in an error message. This catches cases where SQLite reports the problem in plain text instead of, or in addition to, a code.
 
-**Data flow**: Consumes an error-detail string, lowercases it, and returns true if it contains any known corruption/not-a-database phrase or code marker.
+**Data flow**: It receives an error detail string, lowercases it, and searches for phrases such as "database disk image is malformed," "file is not a database," and SQLite corruption code markers. It returns `true` if any known phrase is present.
 
-**Call relations**: Used by `sqlite_error_source_is_corruption` as the message-text half of corruption detection.
+**Call relations**: This is called by `sqlite_error_source_is_corruption` while deciding whether an SQLx database error should trigger recovery. It is also useful as a standalone text check for SQLite corruption wording.
 
 *Call graph*: called by 1 (sqlite_error_source_is_corruption).
 
@@ -1473,11 +1475,11 @@ fn sqlite_error_detail_is_corruption(detail: &str) -> bool
 fn sqlite_error_detail_is_lock(detail: &str) -> bool
 ```
 
-**Purpose**: Recognizes SQLite lock/busy messages by substring matching. This is separate from corruption detection.
+**Purpose**: Recognizes SQLite messages that mean the database is temporarily locked or busy. This is different from corruption: a locked database may just need to be retried later.
 
-**Data flow**: Consumes an error-detail string, lowercases it, and returns true if it contains `database is locked` or `database is busy`.
+**Data flow**: It receives an error detail string, lowercases it, and checks for "database is locked" or "database is busy." It returns a boolean answer and changes nothing.
 
-**Call relations**: This helper is available to callers that need to distinguish transient lock contention from corruption.
+**Call relations**: This function is a sibling to the corruption text checker. It helps callers distinguish a temporary access problem from a damaged database, so they do not unnecessarily back up and rebuild data.
 
 
 ##### `backup_runtime_db_files`  (lines 144–152)
@@ -1486,11 +1488,11 @@ fn sqlite_error_detail_is_lock(detail: &str) -> bool
 async fn backup_runtime_db_files(db_path: &Path) -> std::io::Result<Vec<RuntimeDbBackup>>
 ```
 
-**Purpose**: Backs up one runtime database file plus its `-wal` and `-shm` sidecars into a unique backup directory. It requires the database path to have a parent directory.
+**Purpose**: Backs up one normal SQLite database file and its companion files. This is the common recovery path when the SQLite home is a valid folder.
 
-**Data flow**: Consumes `db_path`, derives `sqlite_home = db_path.parent()`, builds the three candidate paths with `sqlite_paths(db_path)`, and delegates to `backup_sqlite_paths(sqlite_home, ...)`, returning the resulting backup records.
+**Data flow**: It receives the main database path, finds its parent SQLite home folder, builds the list of related SQLite paths, and passes those paths to the lower-level backup routine. It returns the list of files that were actually moved, or an I/O error if the backup cannot be done.
 
-**Call relations**: Called by `backup_runtime_db_for_fresh_start` in the normal case where the SQLite home exists as a directory.
+**Call relations**: This is called by `backup_runtime_db_for_fresh_start` for the normal case. It uses `sqlite_paths` to include the `-wal` and `-shm` side files, then lets `backup_sqlite_paths` do the actual filesystem moves.
 
 *Call graph*: calls 2 internal fn (backup_sqlite_paths, sqlite_paths); called by 1 (backup_runtime_db_for_fresh_start); 1 external calls (parent).
 
@@ -1504,11 +1506,11 @@ async fn backup_sqlite_paths(
 ) -> std::io::Result<Vec<RuntimeDbBackup>>
 ```
 
-**Purpose**: Moves a provided set of SQLite-related paths into a newly created unique backup directory, recording original and backup locations. If none of the candidate paths exist, it removes the empty backup directory and returns an error.
+**Purpose**: Moves a given set of SQLite-related files into a newly created backup folder. It records exactly where each file came from and where it went.
 
-**Data flow**: Consumes `sqlite_home` and an iterator of `PathBuf`s, creates a unique backup directory under `sqlite_home/db-backups`, loops over each path, checks `try_exists`, renames existing files into the backup directory using `file_name` for the destination name, and pushes `RuntimeDbBackup` entries. If no files were moved it removes the backup directory and returns an `io::Error::other`; otherwise it returns the backup vector.
+**Data flow**: It receives the SQLite home folder and a list of paths to consider. It creates a unique backup directory, checks each path to see whether it exists, and renames existing files into the backup directory. If no files were found, it removes the empty backup directory and returns an error; otherwise it returns a list of `RuntimeDbBackup` records.
 
-**Call relations**: This is the shared implementation behind file-set backup, called by `backup_runtime_db_files`.
+**Call relations**: This is the worker used by `backup_runtime_db_files`. It depends on `create_unique_backup_dir` to avoid overwriting older backups and on `file_name` to keep each moved file's name when placing it in the backup folder.
 
 *Call graph*: calls 2 internal fn (create_unique_backup_dir, file_name); called by 1 (backup_runtime_db_files); 6 external calls (join, new, other, remove_dir, rename, try_exists).
 
@@ -1519,11 +1521,11 @@ async fn backup_sqlite_paths(
 async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<RuntimeDbBackup>>
 ```
 
-**Purpose**: Backs up an invalid path occupying the SQLite home location when that path is not a directory, then recreates the SQLite home directory. This recovers from a filesystem obstacle rather than a corrupt DB file set.
+**Purpose**: Handles the unusual case where the expected SQLite home path exists but is not a directory. It moves that blocking path aside and recreates the needed folder.
 
-**Data flow**: Consumes `sqlite_home`, derives its parent, constructs a sibling backup-parent name like `<sqlite_home>.db-backups`, creates a unique backup directory there, renames the blocking path into that directory under its original file name, recreates `sqlite_home` as a directory, and returns one `RuntimeDbBackup` describing the move.
+**Data flow**: It receives the intended SQLite home path. It finds the parent directory, creates a special backup parent name based on the blocked path, creates a unique backup directory, renames the blocking path into it, and then creates a fresh directory at the original SQLite home path. It returns one backup record for the moved path.
 
-**Call relations**: Called by `backup_runtime_db_for_fresh_start` when the expected SQLite home exists but is not a directory.
+**Call relations**: This is called by `backup_runtime_db_for_fresh_start` when startup finds that the SQLite home path exists but cannot be used as a folder. It uses `create_unique_backup_dir` and `file_name` to make a safe destination before moving anything.
 
 *Call graph*: calls 2 internal fn (create_unique_backup_dir, file_name); called by 1 (backup_runtime_db_for_fresh_start); 5 external calls (parent, format!, create_dir_all, rename, vec!).
 
@@ -1534,11 +1536,11 @@ async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<
 fn sqlite_paths(db_path: &Path) -> Vec<PathBuf>
 ```
 
-**Purpose**: Builds the standard SQLite file set for one database path: the main file plus `-wal` and `-shm` sidecars. This defines what gets backed up together.
+**Purpose**: Builds the full set of files that belong to a SQLite database for backup purposes: the main database file, its write-ahead log file, and its shared-memory file.
 
-**Data flow**: Consumes `db_path`, appends `-wal` and `-shm` to its OS string, and returns a `Vec<PathBuf>` containing the main path and both sidecar paths.
+**Data flow**: It receives the main database path. It creates two more paths by appending `-wal` and `-shm` to that path, then returns all three paths in a list.
 
-**Call relations**: Used by `backup_runtime_db_files` before delegating to `backup_sqlite_paths`.
+**Call relations**: This is called by `backup_runtime_db_files` before the actual backup begins. It makes sure recovery does not leave behind SQLite side files that could interfere with a fresh database.
 
 *Call graph*: called by 1 (backup_runtime_db_files); 2 external calls (as_os_str, vec!).
 
@@ -1549,11 +1551,11 @@ fn sqlite_paths(db_path: &Path) -> Vec<PathBuf>
 async fn create_unique_backup_dir(backup_parent: &Path) -> std::io::Result<PathBuf>
 ```
 
-**Purpose**: Creates a timestamped backup directory under a given parent, retrying with an incrementing sequence number until it finds an unused name. This avoids collisions across repeated recovery attempts.
+**Purpose**: Creates a new backup directory whose name will not collide with an existing backup. It is like making a fresh labeled box before moving files into storage.
 
-**Data flow**: Consumes `backup_parent`, ensures the parent directory exists, computes a Unix-seconds timestamp from `SystemTime::now()`, then loops creating `sqlite-<timestamp>-<sequence>` directories until `create_dir` succeeds or a non-AlreadyExists error occurs. Returns the created `PathBuf`.
+**Data flow**: It receives a parent backup folder path. It ensures that parent folder exists, gets the current time in seconds, and tries to create a directory named with that timestamp plus a sequence number. If the name already exists, it increases the sequence number and tries again. It returns the path of the directory it successfully created.
 
-**Call relations**: Called by both `backup_sqlite_paths` and `backup_blocking_sqlite_home` to allocate a unique destination directory.
+**Call relations**: Both `backup_sqlite_paths` and `backup_blocking_sqlite_home` call this before moving files. This keeps backups separated and avoids accidentally overwriting an earlier recovery backup.
 
 *Call graph*: called by 2 (backup_blocking_sqlite_home, backup_sqlite_paths); 5 external calls (join, format!, now, create_dir, create_dir_all).
 
@@ -1564,20 +1566,18 @@ async fn create_unique_backup_dir(backup_parent: &Path) -> std::io::Result<PathB
 fn file_name(path: &Path) -> std::io::Result<&std::ffi::OsStr>
 ```
 
-**Purpose**: Returns the final path component needed to preserve original file names inside backup directories. It errors when the path has no file name.
+**Purpose**: Extracts the final name part of a path so a file or folder can be recreated under a backup directory with the same name. It reports a clear error if the path has no usable name.
 
-**Data flow**: Consumes `&Path`, calls `path.file_name()`, and returns the `&OsStr` or an `io::Error::other` describing the invalid path.
+**Data flow**: It receives a path and asks for its last component. If one exists, it returns that name. If not, it returns an I/O error explaining that a backup name cannot be created for the path.
 
-**Call relations**: Used by both backup implementations when constructing destination paths inside the backup directory.
+**Call relations**: This helper is used whenever backup code needs to build a destination path: `backup_sqlite_paths` uses it for database files, and `backup_blocking_sqlite_home` uses it for the blocked SQLite home path.
 
 *Call graph*: called by 2 (backup_blocking_sqlite_home, backup_sqlite_paths); 1 external calls (file_name).
 
 ## 📊 State Registers Touched
 
-- `reg-codex-home-install-context` — The discovered installation layout, CODEX_HOME location, bundled assets, helper binaries, and machine-local installation facts shared across startup and maintenance flows.
-- `reg-state-runtime` — The shared SQLite-backed runtime handle and opened databases that provide durable local state services to higher layers.
-- `reg-rollout-and-thread-store` — The durable rollout transcript and thread-store persistence layer used for resume, reconstruction, metadata sync, archive, and repair.
-- `reg-thread-metadata-index` — The structured thread metadata, reconciliation, spawn-edge, and listing state maintained in SQLite for thread ownership and browsing.
-- `reg-runtime-log-store` — The durable runtime log and feedback artifact store used for diagnostics, support capture, and later investigation.
-- `reg-goals-store` — The persisted and live per-thread goal state, including current goals and related structured goal metadata surfaced in sessions and UI.
-- `reg-backfill-lease-state` — The durable coordination/lease state for one-time or resumable metadata backfills and startup repair work that blocks or gates higher-level initialization.
+- `reg-install-home-context` — The discovered Codex home folder, install location, bundled resources, and stable local installation identity.
+- `reg-state-databases` — The opened local SQLite stores and migration state that hold structured runtime data for threads, agents, goals, jobs, and summaries.
+- `reg-rollout-thread-store` — The durable conversation log and searchable thread index used to resume, rebuild, archive, restore, and display sessions.
+- `reg-background-work-queues` — The shared set of background tasks such as cloud refreshes, cleanup jobs, memory jobs, skill watchers, agent jobs, update checks, and session maintenance.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.

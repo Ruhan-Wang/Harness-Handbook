@@ -1,10 +1,12 @@
 # Unified-exec sessions and PTY/process backends  `stage-14.2.2`
 
-This stage is the low-level execution engine for interactive unified-exec sessions. It sits beneath tool handlers and session orchestration, providing the concrete process objects, PTY/pipe transports, and backend abstractions that let higher layers start commands, stream output, write stdin, and stop processes in a uniform way across local, remote, Unix, and Windows execution.
+This stage is the low-level machinery that lets the system run interactive commands, keep them alive, talk to them, and stop them safely. It sits behind the main tool loop: when a command is approved, these pieces turn that request into a real process and stream its output back.
 
-At the core, core/src/unified_exec/mod.rs defines the shared request, context, and storage types, while errors.rs standardizes failure reporting. process.rs wraps one running command—whether spawned locally or represented by an exec-server process—and normalizes buffering, exit state, cancellation, and termination. process_manager.rs builds on that wrapper to allocate process IDs, launch sandboxed commands via core/src/spawn.rs, track live background jobs, poll/write output, emit events, and clean up. The write_stdin tool handler is the interactive entry point into that manager.
+The unified_exec front door defines the shared request shapes, limits, and helpers, while its errors file gives the whole area one clear failure language. process and process_manager are the control room: they start commands, reuse sessions, collect output, send later input, track exits, cancel work, and clean up. The write_stdin handler is the small inlet that sends more text into an already-running command.
 
-On the backend side, exec-server/src/process.rs defines the common process/event contract; local_process.rs implements direct local execution, and remote_process.rs adapts RPC-controlled remote execution to the same traits. utils/pty supplies the actual PTY and pipe implementations, Unix process-group control, and Windows ConPTY support, while windows-sandbox-rs exposes the available backend families to the sandboxed unified-exec layer.
+On the exec-server side, process defines the common process contract. local_process runs commands on the server machine, and remote_process makes a remote command look local. spawn is the safe doorway for launching programs with the right folder, environment, network, and input/output setup.
+
+The pty utilities provide the actual plumbing: pipes for simple programs, PTYs, or “fake terminals,” for interactive ones, process groups for cleanup, and Windows ConPTY bridges for terminal behavior on Windows.
 
 ## Files in this stage
 
@@ -13,13 +15,15 @@ These files define the unified-exec module surface, error model, per-process wra
 
 ### `core/src/unified_exec/mod.rs`
 
-`orchestration` · `cross-cutting setup and shared unified-exec definitions`
+`orchestration` · `request handling`
 
-This module is the root of the unified exec subsystem. Beyond the high-level design comments, it declares the internal submodules (`async_watcher`, `errors`, `head_tail_buffer`, `process`, `process_manager`, `process_state`) and re-exports the key types that other parts of the crate use, including `UnifiedExecError`, `UnifiedExecProcess`, and spawn lifecycle abstractions. It also defines the subsystem-wide constants that shape behavior: yield-time bounds, Windows-specific minimum startup yield, default background timeout, output token defaults, transcript byte cap, and maximum number of tracked processes.
+When the system needs to run a command for a user, it cannot simply start a shell and hope for the best. It has to ask for approval when needed, choose a sandbox (a restricted place where commands can run more safely), stream output back without flooding the model, and keep long-running processes available for later input. This file gathers the main building blocks for that job.
 
-The file introduces several core data structures. `UnifiedExecContext` bundles the `Arc<Session>`, `Arc<TurnContext>`, and tool `call_id` needed by async watchers and event emitters. `ExecCommandRequest` and `WriteStdinRequest` capture the full parameter sets for starting a command and writing to an existing process, including cwd, shell mode, sandbox permissions, network settings, truncation policy, and optional permission metadata. `ProcessStore` is the in-memory registry of active processes plus reserved ids, and `UnifiedExecProcessManager` wraps that store in a Tokio `Mutex` while enforcing a minimum write-stdin yield timeout.
+It declares the module’s public surface: errors, process types, lifecycle hooks, and the process manager. It also defines important limits, such as how long the system should wait before returning output and how much output can be kept. These limits are like guardrails: without them, a command could hang too long or produce too much text.
 
-The remaining helpers are small but important: `clamp_yield_time` normalizes requested wait times into platform-aware bounds, `resolve_max_tokens` applies the default output-token limit, and `generate_chunk_id` creates a six-hex-digit identifier for output chunks. This file itself contains little orchestration logic, but it defines the shared types and invariants that the process manager and watchers build on.
+The central data shapes are `UnifiedExecContext`, which ties a command to the current session and turn, and request structs for starting a command or writing to an existing process. `ProcessStore` is the in-memory registry of running or reserved processes. `UnifiedExecProcessManager` owns that store behind a mutex, which is a lock that prevents two async tasks from changing the process list at the same time.
+
+The file also includes small helpers for clamping wait times, choosing output token limits, and making short chunk identifiers used when returning streamed output.
 
 #### Function details
 
@@ -29,11 +33,11 @@ The remaining helpers are small but important: `clamp_yield_time` normalizes req
 fn set_deterministic_process_ids_for_tests(enabled: bool)
 ```
 
-**Purpose**: Forwards a test-only toggle into the process-manager implementation so process id allocation becomes deterministic. It exists to make integration tests stable and reproducible.
+**Purpose**: This turns predictable process IDs on or off for tests. Predictable IDs make tests easier to write because the expected result does not change randomly each run.
 
-**Data flow**: Accepts a boolean `enabled` flag and passes it directly to `process_manager::set_deterministic_process_ids_for_tests`, returning `()` and mutating only the allocator behavior maintained in that submodule.
+**Data flow**: It receives a true-or-false setting. It passes that setting into the process manager’s test hook. Nothing is returned; the effect is that later test-created processes can use deterministic IDs instead of normal generated ones.
 
-**Call relations**: It is called by higher-level test setup via `set_deterministic_process_ids`. This wrapper keeps the module root as the public entry point while delegating the actual implementation to `process_manager`.
+**Call relations**: Test setup code calls this when it needs stable process IDs. This function does not implement the ID behavior itself; it forwards the request to the process manager layer, where process creation actually happens.
 
 *Call graph*: calls 1 internal fn (set_deterministic_process_ids_for_tests); called by 1 (set_deterministic_process_ids).
 
@@ -44,11 +48,11 @@ fn set_deterministic_process_ids_for_tests(enabled: bool)
 fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self
 ```
 
-**Purpose**: Constructs the lightweight context object shared by unified-exec eventing code. It packages the session, turn, and call id needed to emit process-related events.
+**Purpose**: This creates a small bundle of information that says which session, which conversation turn, and which tool call a command belongs to. It gives later code one object to carry that identity around.
 
-**Data flow**: Consumes `Arc<Session>`, `Arc<TurnContext>`, and a `String` call id, then returns `UnifiedExecContext { session, turn, call_id }` with no side effects.
+**Data flow**: It takes a shared session, a shared turn context, and a call ID string. It stores them together in a new `UnifiedExecContext`. The result is returned to the caller and can then travel with an exec request.
 
-**Call relations**: It is used by call-handling and exec startup paths such as `handle_call`, `exec_command_with_tty`, and a fallback-output test helper. Downstream async watcher code reads these fields when sending output and terminal events.
+**Call relations**: Higher-level tool handling code builds this context before asking unified exec to run something. Later execution code uses the stored session and turn information for policy decisions, environment setup, and linking output back to the right call.
 
 *Call graph*: called by 3 (handle_call, exec_command_with_tty, failed_initial_end_for_unstored_process_uses_fallback_output).
 
@@ -59,11 +63,11 @@ fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self
 fn remove(&mut self, process_id: i32) -> Option<ProcessEntry>
 ```
 
-**Purpose**: Removes a process entry and clears its reservation in one operation. It keeps the active-process map and reserved-id set in sync.
+**Purpose**: This removes a process from the in-memory process registry. It also clears any reservation for that same process ID, so the ID is no longer treated as occupied.
 
-**Data flow**: Takes `&mut self` and a numeric `process_id`, removes that id from `reserved_process_ids`, removes and returns any matching `ProcessEntry` from `processes`, and leaves the store mutated accordingly.
+**Data flow**: It receives a process ID. First it removes that ID from the reserved-ID set. Then it removes the matching process entry from the process map. It returns the removed process entry if one existed, or nothing if the ID was not present.
 
-**Call relations**: It is called by `prune_processes_if_needed` when old or excess processes are being evicted. The method encapsulates the invariant that deleting a process also frees its reserved id.
+**Call relations**: Cleanup code calls this while pruning old or excess processes. By removing both the reservation and the process entry together, it keeps the store from believing a process ID is still taken after the process has been discarded.
 
 *Call graph*: called by 1 (prune_processes_if_needed).
 
@@ -74,11 +78,11 @@ fn remove(&mut self, process_id: i32) -> Option<ProcessEntry>
 fn new(max_write_stdin_yield_time_ms: u64) -> Self
 ```
 
-**Purpose**: Creates a process manager with an empty store and a normalized maximum stdin-yield timeout. It enforces that write-stdin polling never uses a timeout below the subsystem’s empty-input minimum.
+**Purpose**: This builds a new manager for interactive exec processes. The manager owns the process registry and decides the maximum wait time allowed when writing input to an existing process.
 
-**Data flow**: Accepts `max_write_stdin_yield_time_ms`, initializes `process_store` with `ProcessStore::default()`, computes `max_write_stdin_yield_time_ms.max(MIN_EMPTY_YIELD_TIME_MS)`, and returns the populated manager.
+**Data flow**: It receives a requested maximum yield time for `write_stdin`, meaning how long the system may wait for more output after sending input. It creates an empty `ProcessStore` inside a mutex lock and stores the maximum, but never lets it go below the minimum required for empty input. It returns a ready-to-use process manager.
 
-**Call relations**: It is called by the manager’s `Default` impl and by session/test setup helpers. The constructor establishes the manager-wide timeout bound that later write-stdin operations rely on.
+**Call relations**: Session and test setup code call this when they need a fresh unified exec manager. The manager created here is later used by command execution and stdin-writing paths to coordinate access to running processes.
 
 *Call graph*: called by 3 (new, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx); 2 external calls (new, default).
 
@@ -89,11 +93,11 @@ fn new(max_write_stdin_yield_time_ms: u64) -> Self
 fn default() -> Self
 ```
 
-**Purpose**: Builds a process manager using the standard background terminal timeout constant. It is the normal constructor for production and many tests.
+**Purpose**: This creates a process manager using the standard timeout for background terminal work. It is the convenient choice when callers do not need a custom timeout.
 
-**Data flow**: Takes no arguments and returns `Self::new(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)`.
+**Data flow**: It takes no input. It calls the manager constructor with the default maximum background terminal timeout. It returns a new `UnifiedExecProcessManager` with an empty process store and standard timing behavior.
 
-**Call relations**: It is used by multiple tests and runtime setup paths that do not need a custom stdin-yield cap. The implementation simply delegates to `new`.
+**Call relations**: Tests and setup code use this when the normal behavior is enough. It funnels creation through `UnifiedExecProcessManager::new`, so the same minimum-time safeguards are applied.
 
 *Call graph*: called by 7 (unified_exec_uses_the_trusted_sandbox_cwd, zsh_fork_execpolicy_allow_preserves_parent_sandbox_override, zsh_fork_first_attempt_preserves_additional_permissions_request, zsh_fork_first_attempt_preserves_parent_sandbox_override, completed_pipe_commands_preserve_exit_code, remote_exec_server_rejects_inherited_fd_launches, unified_exec_uses_remote_exec_server_when_configured); 1 external calls (new).
 
@@ -104,11 +108,11 @@ fn default() -> Self
 fn clamp_yield_time(yield_time_ms: u64) -> u64
 ```
 
-**Purpose**: Normalizes an initial exec yield timeout into platform-aware minimum and maximum bounds. On Windows it applies an additional startup floor before clamping.
+**Purpose**: This keeps a requested wait time inside safe bounds. It prevents callers from asking for a wait that is too short to be useful or too long to be acceptable.
 
-**Data flow**: Accepts `yield_time_ms`, conditionally raises it to at least `WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS` when `cfg!(windows)` is true, then clamps the result into `[MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS]` and returns the bounded `u64`.
+**Data flow**: It receives a wait time in milliseconds. On Windows, it first raises very small initial waits to a higher floor because starting terminal commands there can need more time. Then it clamps the value between the module’s minimum and maximum limits. The adjusted number is returned.
 
-**Call relations**: It is called by `exec_command` before waiting for initial process output. This helper centralizes timeout policy so callers do not duplicate platform-specific rules.
+**Call relations**: Command execution calls this before deciding how long to wait for initial output. It protects the rest of the exec flow from unreasonable timing values supplied by a caller.
 
 *Call graph*: called by 1 (exec_command); 1 external calls (cfg!).
 
@@ -119,11 +123,11 @@ fn clamp_yield_time(yield_time_ms: u64) -> u64
 fn resolve_max_tokens(max_tokens: Option<usize>) -> usize
 ```
 
-**Purpose**: Applies the default output-token limit when a caller does not specify one. It keeps token-budget handling consistent across exec paths.
+**Purpose**: This chooses the output token limit to use when a caller may or may not have supplied one. A token is a small chunk of text as counted for model input and output limits.
 
-**Data flow**: Takes `Option<usize>` and returns the contained value or `DEFAULT_MAX_OUTPUT_TOKENS` if `None`.
+**Data flow**: It receives an optional maximum token count. If the caller supplied a value, it returns that value. If not, it returns the module’s default output limit.
 
-**Call relations**: It is used by output truncation logic such as `truncate_code_mode_result` and `model_output_max_tokens`. The helper isolates the defaulting rule from those consumers.
+**Call relations**: Output truncation paths call this when they need a concrete limit before shortening command output for the model. It keeps default behavior consistent wherever unified exec output is sized.
 
 *Call graph*: called by 2 (truncate_code_mode_result, model_output_max_tokens).
 
@@ -134,22 +138,24 @@ fn resolve_max_tokens(max_tokens: Option<usize>) -> usize
 fn generate_chunk_id() -> String
 ```
 
-**Purpose**: Generates a short random hexadecimal identifier for an output chunk or exec response. The id is six hex digits long.
+**Purpose**: This creates a short random identifier for an output chunk. The identifier helps label pieces of streamed command output without needing a long or meaningful name.
 
-**Data flow**: Creates a thread-local RNG with `rng()`, iterates six times, formats each random nibble from `0..16` as lowercase hex, collects the pieces into a `String`, and returns it.
+**Data flow**: It takes no input. It asks the random number generator for six hexadecimal digits, each chosen from 0 through f. It joins those digits into a string and returns it.
 
-**Call relations**: It is called by `handle_call`, `exec_command`, and `write_stdin` when constructing tool outputs or chunk metadata. The helper provides lightweight unique-ish ids without involving external state.
+**Call relations**: Tool-call handling, command execution, and stdin-writing paths call this when they need to name a returned chunk of output. It is a small utility that supports the larger streaming flow.
 
 *Call graph*: called by 3 (handle_call, exec_command, write_stdin); 1 external calls (rng).
 
 
 ### `core/src/unified_exec/errors.rs`
 
-`data_model` · `cross-cutting error propagation`
+`data_model` · `request handling`
 
-This file is the central error model for the unified exec subsystem. `UnifiedExecError` is a `thiserror::Error` enum with human-readable messages tailored to the API surface exposed by interactive process execution. Several variants carry structured data: `CreateProcess { message }` and `ProcessFailed { message }` preserve backend failure text; `UnknownProcessId { process_id }` reports stale or invalid process references using the externally visible numeric id; and `SandboxDenied { message, output }` bundles both the denial explanation and a full `ExecToolCallOutput` snapshot so callers can surface the blocked command’s output context. Other variants represent fixed conditions such as failed stdin writes, closed stdin on non-TTY sessions, and missing command lines.
+When the system runs a command for the user, several things can go wrong: the process may fail to start, a running process may crash, the system may not recognize the process ID, standard input may already be closed, or a sandbox security rule may block the command. This file names those situations in one place through the `UnifiedExecError` enum. An enum is a type that can be one of several named choices, like a form with exactly one checked box.
 
-The impl block adds small constructor helpers for the variants most frequently synthesized by orchestration code. These helpers do not add logic beyond wrapping arguments into the corresponding enum variant, but they standardize call sites and make intent explicit where process startup, runtime execution, or sandbox checks fail. The file is intentionally minimal: it defines the error vocabulary used across process creation, command execution, stdin writes, and sandbox policy enforcement, while leaving all control flow to higher-level modules.
+The file also controls how these failures are shown as readable error text. It uses `thiserror`, a Rust helper library that turns each error case into a normal error message. One important detail is that a sandbox denial carries both a human-readable message and the command output collected so far, so callers can explain the denial without losing useful context.
+
+Without this file, the execution code would have to pass around loose strings or unrelated error types. That would make it easier to lose important details, harder to show consistent messages, and harder for callers to react differently to different failures.
 
 #### Function details
 
@@ -159,11 +165,11 @@ The impl block adds small constructor helpers for the variants most frequently s
 fn create_process(message: String) -> Self
 ```
 
-**Purpose**: Constructs the `CreateProcess` variant from a backend error message. It is the canonical wrapper for failures that occur before a unified exec session is successfully started.
+**Purpose**: This is a small convenience function for making the specific error used when the system cannot start a unified execution process. It keeps callers from having to know the exact enum shape.
 
-**Data flow**: Takes an owned `String` message and returns `Self::CreateProcess { message }` without side effects or mutation.
+**Data flow**: A text message explaining what went wrong goes in. The function wraps that message in the `CreateProcess` error form. The result is a `UnifiedExecError` value that can be returned to higher-level code and eventually shown or logged.
 
-**Call relations**: It is called by `open_session_with_exec_env` when process startup fails. The helper keeps startup-error construction concise and consistent at that orchestration boundary.
+**Call relations**: When `open_session_with_exec_env` tries to open a new execution session and process creation fails, it calls this helper to turn the low-level failure text into the standard unified-exec error type.
 
 *Call graph*: called by 1 (open_session_with_exec_env).
 
@@ -174,11 +180,11 @@ fn create_process(message: String) -> Self
 fn process_failed(message: String) -> Self
 ```
 
-**Purpose**: Constructs the `ProcessFailed` variant for runtime execution failures after a process exists or during command interaction. It distinguishes operational failure from startup failure.
+**Purpose**: This creates the general error used when a unified execution process has failed after being started or while being interacted with. It gives several parts of the execution flow a shared way to report process failure.
 
-**Data flow**: Consumes an owned `String` message and returns `Self::ProcessFailed { message }`, producing no external output.
+**Data flow**: A failure explanation goes in as a string. The function places it inside the `ProcessFailed` error form. The output is a `UnifiedExecError` that carries the explanation in a structured, consistent way.
 
-**Call relations**: It is used by `write`, `exec_command`, `write_stdin`, and `fail_process_with_message` when an existing process reports failure or command interaction cannot complete normally. Those callers use it to propagate a uniform runtime-failure category upward.
+**Call relations**: Code paths that run commands, write to a process, write to standard input, or explicitly mark a process as failed use this helper when they need to report that the process did not complete normally.
 
 *Call graph*: called by 4 (write, exec_command, write_stdin, fail_process_with_message).
 
@@ -189,24 +195,26 @@ fn process_failed(message: String) -> Self
 fn sandbox_denied(message: String, output: ExecToolCallOutput) -> Self
 ```
 
-**Purpose**: Constructs the `SandboxDenied` variant with both a denial message and captured exec output. It preserves enough context for callers to report why sandboxed execution was blocked.
+**Purpose**: This creates the error used when the sandbox blocks a command. A sandbox is a safety boundary that prevents commands from doing things they are not allowed to do.
 
-**Data flow**: Accepts a denial `message: String` and an `ExecToolCallOutput`, then returns `Self::SandboxDenied { message, output }`.
+**Data flow**: A denial message and an `ExecToolCallOutput` value go in. The output value is the command-output record the execution tool uses. The function bundles both into the `SandboxDenied` error form, so the caller keeps both the reason for the block and any relevant output details.
 
-**Call relations**: It is called by `check_for_sandbox_denial_with_text` after sandbox-denial heuristics identify a blocked command. The helper packages the denial details into the subsystem’s shared error type.
+**Call relations**: When `check_for_sandbox_denial_with_text` detects text showing that the sandbox denied the command, it calls this helper to produce the standard error that can travel back through the execution system.
 
 *Call graph*: called by 1 (check_for_sandbox_denial_with_text).
 
 
 ### `core/src/unified_exec/process.rs`
 
-`domain_logic` · `process lifetime: spawn, output streaming/polling, exit detection, termination`
+`orchestration` · `during an exec command, from process start through output streaming, exit, and cleanup`
 
-This file is the per-process core of unified exec. Its main abstraction, `UnifiedExecProcess`, wraps either a local `ExecCommandSession` or a remote `Arc<dyn ExecProcess>` inside `ProcessHandle`, then layers shared state on top: a `HeadTailBuffer` guarded by `tokio::sync::Mutex` for accumulated output, a `broadcast::Sender<Vec<u8>>` for live subscribers, `Notify` objects for output arrival and closure, a `CancellationToken` used as the process-exit signal, and a `watch` channel carrying `ProcessState` (`has_exited`, `exit_code`, optional failure message). The optional `_spawn_lifecycle` keeps launch-time resources alive until after spawn.
+Running a command is messy because there are two back ends here: a local pseudo-terminal, or PTY, which behaves like a real terminal, and a remote exec server process. This file hides that difference behind `UnifiedExecProcess`, so higher-level code can write input, read output, interrupt, terminate, and check exit state without caring where the process actually lives.
 
-Construction differs by transport. `from_spawned` wires local stdout/stderr receivers into a background task, checks for immediate or very early exit via `exit_rx`, and otherwise spawns a waiter that updates state when the child exits. `from_exec_server_started` starts a polling task that repeatedly calls `ExecProcess::read`, appends chunks into the shared buffer, broadcasts them, records remote failures/exits, and waits on the exec-server wake channel between polls. Both constructors apply an early-exit grace period so callers can observe short-lived failures synchronously.
+Think of it like a universal remote control. The TV models are different, but the buttons should still mean the same thing. Internally, the file stores a transport-specific process handle, a rolling output buffer, notification objects for tasks waiting on new output, a cancellation token, and a watched `ProcessState` that records whether the process exited or failed.
 
-Operational methods expose stdin writes, interrupt/terminate behavior, output handles for polling/streaming, and sandbox-denial detection. Sandbox denial is only checked once the process has exited and sandboxing is enabled; it reconstructs an `ExecToolCallOutput` from aggregated text and uses `is_likely_sandbox_denied`, truncating the surfaced message with `formatted_truncate_text`. Termination always closes output state, cancels waiters, and aborts the output task. `Drop` defensively terminates the process so leaked handles do not leave background children running.
+When a process starts, this file launches a background task to collect output. For local PTY processes, it receives combined stdout and stderr chunks. For exec-server processes, it repeatedly asks the server for new chunks and listens for wake-up signals. Each chunk is saved for later snapshots and also broadcast to live listeners.
+
+It also performs an important early check: if a sandboxed command exits almost immediately, the captured output is inspected to see whether the sandbox blocked the command. Without this file, callers would need separate, error-prone logic for local versus remote processes, and process cleanup could easily leak running commands or leave listeners waiting forever.
 
 #### Function details
 
@@ -216,11 +224,11 @@ Operational methods expose stdin writes, interrupt/terminate behavior, output ha
 fn inherited_fds(&self) -> Vec<i32>
 ```
 
-**Purpose**: Provides the list of raw file descriptors that must remain open across child `exec()` during process launch. The default implementation returns no descriptors.
+**Purpose**: This hook lets a spawn helper say which file descriptors must stay open while a child process is being created. A file descriptor is a small operating-system number that points to an open file, pipe, or similar resource.
 
-**Data flow**: Reads no state and takes only `&self` → constructs an empty `Vec<i32>` by default → returns that vector to the spawn path.
+**Data flow**: It receives the lifecycle object itself and, by default, reads no extra data. It returns an empty list, meaning there are no special open resources to preserve unless another implementation overrides it.
 
-**Call relations**: Called by process-launch orchestration before spawning a local process so launch code can pass inherited descriptors into PTY/pipe spawn helpers. Implementors override it when a specific launch sequence needs parent-owned FDs preserved until `after_spawn()`.
+**Call relations**: This is part of the `SpawnLifecycle` contract used around local process startup. The default behavior is deliberately safe and does nothing; specialized lifecycle objects can provide descriptors before spawning, then clean up after spawning.
 
 *Call graph*: 1 external calls (new).
 
@@ -231,11 +239,11 @@ fn inherited_fds(&self) -> Vec<i32>
 fn after_spawn(&mut self)
 ```
 
-**Purpose**: Runs post-spawn cleanup or release logic once the child process has been created. The default implementation is a no-op.
+**Purpose**: This hook runs after a child process has been spawned, giving custom launch code a chance to release or finalize any temporary setup. The default version intentionally does nothing.
 
-**Data flow**: Takes `&mut self`, reads no external state, performs no transformation by default, and returns unit.
+**Data flow**: It receives mutable access to the lifecycle object. It produces no return value and changes nothing unless a custom implementation overrides it.
 
-**Call relations**: Invoked by the process manager immediately after successful local or remote spawn so custom lifecycle implementations can release temporary resources that had to survive until the child existed.
+**Call relations**: It pairs with `SpawnLifecycle::inherited_fds`: first resources can be kept open for the child, then `after_spawn` marks the point where the parent may safely stop holding them.
 
 
 ##### `UnifiedExecProcess::fmt`  (lines 92–98)
@@ -244,11 +252,11 @@ fn after_spawn(&mut self)
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats a debug view of the process that reports whether it has exited, its exit code, and the sandbox type without exposing all internal synchronization fields.
+**Purpose**: This creates a short debug description of a `UnifiedExecProcess`. It is meant for logs and developer diagnostics, not for user-facing output.
 
-**Data flow**: Reads derived state through `has_exited()` and `exit_code()` plus the stored `sandbox_type` → builds a `DebugStruct` named `UnifiedExecProcess` → writes formatted output into the provided formatter.
+**Data flow**: It reads whether the process has exited, the current exit code if any, and the sandbox type. It writes those facts into Rust's debug formatter and returns the formatting result.
 
-**Call relations**: Used by Rust debug formatting; it delegates to the process-state accessors so the debug output reflects live state rather than raw internal fields.
+**Call relations**: When Rust debug-printing is requested for `UnifiedExecProcess`, this method calls `has_exited` and `exit_code` so the printed view reflects the current process state without exposing every internal field.
 
 *Call graph*: calls 2 internal fn (exit_code, has_exited); 1 external calls (debug_struct).
 
@@ -263,11 +271,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Initializes a fresh unified process wrapper around an already-created transport-specific process handle. It allocates all shared output, notification, cancellation, and state-tracking primitives in their default empty state.
+**Purpose**: This builds the shared bookkeeping around an already-created process handle. It sets up output storage, notifications, cancellation, broadcast channels, and state tracking.
 
-**Data flow**: Consumes a `ProcessHandle`, `SandboxType`, and optional `SpawnLifecycleHandle` → creates a default `HeadTailBuffer`, `Notify` instances, `AtomicBool(false)` for output closure, a new `CancellationToken`, a broadcast channel for output chunks, and a watch channel seeded with `ProcessState::default()` → returns a `UnifiedExecProcess` with no output task yet attached.
+**Data flow**: It takes a local or exec-server process handle, the sandbox type, and optional spawn-lifecycle object. It creates fresh shared buffers, notification objects, a cancellation token, a broadcast channel for output chunks, and a watch channel for process state, then returns a ready `UnifiedExecProcess` with no output task yet.
 
-**Call relations**: Used internally by both `from_spawned` and `from_exec_server_started` as the common constructor before those paths attach transport-specific output tasks and exit watchers.
+**Call relations**: `from_spawned` and `from_exec_server_started` use this as the common constructor. After it creates the shared shell, those functions attach the correct background output task for the transport being used.
 
 *Call graph*: calls 1 internal fn (default); 8 external calls (new, new, new, new, new, channel, default, channel).
 
@@ -278,11 +286,11 @@ fn new(
 async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError>
 ```
 
-**Purpose**: Writes bytes to the process stdin using the appropriate transport and normalizes transport-specific write failures into unified-exec errors and state transitions.
+**Purpose**: This sends bytes to the running process as standard input. Callers use it when they need to type into the command, for example to answer a prompt.
 
-**Data flow**: Takes a byte slice. For `Local`, clones the bytes into a `Vec<u8>` and sends them through `writer_sender()`, mapping send failure to `UnifiedExecError::WriteToStdin`. For `ExecServer`, awaits `process_handle.write`; `Accepted` returns `Ok(())`, `UnknownProcess` or `StdinClosed` mark the watched `ProcessState` exited, cancel the token, and return `WriteToStdin`, `Starting` also returns `WriteToStdin`, and transport errors become `UnifiedExecError::process_failed(err.to_string())`.
+**Data flow**: It receives a byte slice. For a local PTY, it sends those bytes to the PTY writer channel. For an exec-server process, it asks the server to write the bytes and checks whether the server accepted them. If the process is gone or stdin is closed, it marks the process as exited, cancels waiting work, and returns a write error.
 
-**Call relations**: Called from `write_stdin` when interactive input is sent to a TTY-backed process. On remote write statuses that imply the process is gone or stdin is unavailable, it proactively updates local state so later polling sees the process as exited.
+**Call relations**: This method is the input side of the unified process wrapper. It hides the difference between local channel-based writing and remote server writing, and it updates shared state when a write reveals that the process can no longer receive input.
 
 *Call graph*: calls 1 internal fn (process_failed); 3 external calls (cancel, send_replace, borrow).
 
@@ -293,11 +301,11 @@ async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError>
 fn output_handles(&self) -> OutputHandles
 ```
 
-**Purpose**: Packages the shared output buffer and synchronization primitives into a lightweight struct for polling consumers.
+**Purpose**: This packages the shared output-related objects so another task can read and update process output safely. It is a small handoff bundle for background output collectors.
 
-**Data flow**: Reads the process’s `Arc`-wrapped output fields and cancellation token → clones the shared handles → returns an `OutputHandles` struct containing them.
+**Data flow**: It reads the process's shared output buffer, notification objects, closed flag, and cancellation token. It clones the shared pointers and returns them inside an `OutputHandles` struct.
 
-**Call relations**: Used by higher-level polling and startup code that needs coordinated access to buffered output, output notifications, closure notifications, and the exit cancellation token without exposing the whole process object.
+**Call relations**: `from_exec_server_started` uses this before starting the exec-server output task. That task receives the handles so it can append chunks, wake listeners, mark output as closed, and cancel waiters.
 
 *Call graph*: 2 external calls (clone, clone).
 
@@ -308,11 +316,11 @@ fn output_handles(&self) -> OutputHandles
 fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>>
 ```
 
-**Purpose**: Creates a new broadcast subscription for live output chunks emitted by the process.
+**Purpose**: This gives a caller a live subscription to future output chunks from the process. It is for streaming output as it arrives.
 
-**Data flow**: Reads `self.output_tx` → calls `subscribe()` → returns a `broadcast::Receiver<Vec<u8>>` positioned for future chunks.
+**Data flow**: It reads the internal broadcast sender and creates a new receiver subscribed to that stream. The caller gets future byte chunks, but not necessarily old chunks already sent.
 
-**Call relations**: Called by `start_streaming_output` to attach event-streaming consumers that should receive output incrementally as the background output task forwards chunks.
+**Call relations**: `start_streaming_output` calls this when it wants to stream command output to another part of the system. The background output tasks feed the broadcast channel that this receiver listens to.
 
 *Call graph*: called by 1 (start_streaming_output); 1 external calls (subscribe).
 
@@ -323,11 +331,11 @@ fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>>
 fn cancellation_token(&self) -> CancellationToken
 ```
 
-**Purpose**: Exposes a clone of the process cancellation token used to signal exit or forced termination.
+**Purpose**: This returns a clone of the process cancellation token. A cancellation token is a shared stop signal that async tasks can watch.
 
-**Data flow**: Reads `self.cancellation_token` → clones it → returns the clone.
+**Data flow**: It reads the internal token and returns a clone that points to the same cancellation state. Cancelling any linked token tells all watchers that the process is done or should stop.
 
-**Call relations**: Used by `start_streaming_output` and other waiters that need a transport-independent signal that the process has exited or been terminated.
+**Call relations**: `start_streaming_output` calls this so its streaming loop can stop promptly when the process exits, fails, or is terminated.
 
 *Call graph*: called by 1 (start_streaming_output); 1 external calls (clone).
 
@@ -338,11 +346,11 @@ fn cancellation_token(&self) -> CancellationToken
 fn output_drained_notify(&self) -> Arc<Notify>
 ```
 
-**Purpose**: Returns the notification object used by external streaming logic to observe when output has been drained.
+**Purpose**: This returns a notification object used to signal that output has been fully consumed. It lets cooperating tasks wait until no more buffered output needs to be sent.
 
-**Data flow**: Reads `self.output_drained` → clones the `Arc<Notify>` → returns it.
+**Data flow**: It reads the shared `output_drained` notifier and returns another shared reference to it. The function itself does not wait or notify.
 
-**Call relations**: Consumed by `start_streaming_output`, which coordinates event emission with output-drain signaling outside this file.
+**Call relations**: `start_streaming_output` calls this when coordinating output streaming and shutdown, so the streamer and the process wrapper can agree when output has been drained.
 
 *Call graph*: called by 1 (start_streaming_output); 1 external calls (clone).
 
@@ -353,11 +361,11 @@ fn output_drained_notify(&self) -> Arc<Notify>
 fn has_exited(&self) -> bool
 ```
 
-**Purpose**: Reports whether the process should be considered exited, combining watched state with direct local-session inspection when available.
+**Purpose**: This answers whether the process is known to have exited. It checks the shared process state, and for local processes also asks the PTY session directly.
 
-**Data flow**: Reads the current `ProcessState` from `state_rx`. For `Local`, returns `state.has_exited || process_handle.has_exited()`. For `ExecServer`, returns only `state.has_exited` because remote liveness is tracked through the watch state.
+**Data flow**: It reads the watched `ProcessState`. If the process is local, it combines that state with the PTY handle's own exit flag. It returns true if either source says the process has exited; for exec-server processes, it trusts the shared state.
 
-**Call relations**: Queried by sandbox-denial checks, debug formatting, and higher-level process management to decide whether a process is still live. The local branch intentionally trusts either source so direct PTY exit observation is not missed.
+**Call relations**: `fmt` uses this for debug output, and `check_for_sandbox_denial_with_text` uses it to avoid judging sandbox errors before a process has actually finished.
 
 *Call graph*: called by 2 (check_for_sandbox_denial_with_text, fmt); 1 external calls (borrow).
 
@@ -368,11 +376,11 @@ fn has_exited(&self) -> bool
 fn exit_code(&self) -> Option<i32>
 ```
 
-**Purpose**: Returns the best-known exit code for the process, preferring watched state but falling back to direct local-session inspection when necessary.
+**Purpose**: This returns the process exit code if one is known. An exit code is the number a program reports when it finishes, usually with zero meaning success.
 
-**Data flow**: Reads the current `ProcessState` from `state_rx`. For `Local`, returns `state.exit_code.or_else(|| process_handle.exit_code())`. For `ExecServer`, returns `state.exit_code`.
+**Data flow**: It reads the watched state. For local processes, if the state has no exit code yet, it also asks the PTY session. For exec-server processes, it returns the state value directly.
 
-**Call relations**: Used by sandbox-denial detection, debug formatting, and confirmed termination to surface the final exit status consistently across transports.
+**Call relations**: `fmt` includes this in debug output, `terminate_confirmed` records it when forcing shutdown, and `check_for_sandbox_denial_with_text` uses it when building an error report.
 
 *Call graph*: called by 3 (check_for_sandbox_denial_with_text, fmt, terminate_confirmed); 1 external calls (borrow).
 
@@ -383,11 +391,11 @@ fn exit_code(&self) -> Option<i32>
 fn finish_termination(&self)
 ```
 
-**Purpose**: Performs the common local cleanup after any termination path by marking output closed, waking waiters, cancelling the process token, and aborting the output task.
+**Purpose**: This performs the common local cleanup after a process is being stopped. It marks output as closed, wakes waiters, cancels linked tasks, and aborts the output collection task if one exists.
 
-**Data flow**: Writes `true` into `output_closed`, notifies `output_closed_notify`, cancels `cancellation_token`, and if `output_task` exists aborts that task. It returns unit.
+**Data flow**: It reads no external input. It changes internal shared flags and notifications: output becomes closed, waiters are woken, the cancellation token is cancelled, and the background output task is aborted.
 
-**Call relations**: Shared by both `terminate` and `terminate_confirmed` so all termination paths leave output consumers and pollers in a consistent closed state.
+**Call relations**: Both `terminate` and `terminate_confirmed` call this after sending the actual stop request. It centralizes the cleanup so all termination paths leave listeners in the same finished state.
 
 *Call graph*: called by 2 (terminate, terminate_confirmed); 1 external calls (cancel).
 
@@ -398,11 +406,11 @@ fn finish_termination(&self)
 fn terminate(&self)
 ```
 
-**Purpose**: Initiates best-effort process termination without waiting for remote confirmation, then immediately tears down local output state.
+**Purpose**: This asks the process to stop and immediately performs local cleanup. It is the fast, best-effort termination path.
 
-**Data flow**: For `Local`, calls `process_handle.terminate()`. For `ExecServer`, clones the remote handle and spawns an async task that awaits `terminate()` but ignores its result. Then calls `finish_termination()` to close output and cancel waiters.
+**Data flow**: It checks whether the process is local or exec-server backed. For a local process it calls the PTY terminate method. For an exec-server process it spawns an async task to request termination from the server. Then it calls `finish_termination` to close output and cancel waiters.
 
-**Call relations**: Used from `Drop`, `fail_and_terminate`, and manager-level failure handling when the system wants prompt shutdown even if remote termination acknowledgement is unavailable.
+**Call relations**: `drop` calls this automatically when the wrapper is destroyed, and `fail_and_terminate` uses it after recording a failure. The call graph also shows it used by `fail_process_with_message`, so explicit failure paths can stop the process promptly.
 
 *Call graph*: calls 1 internal fn (finish_termination); called by 3 (drop, fail_and_terminate, fail_process_with_message); 2 external calls (clone, spawn).
 
@@ -413,11 +421,11 @@ fn terminate(&self)
 async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError>
 ```
 
-**Purpose**: Terminates the process and only updates local exit state if the underlying termination request succeeds.
+**Purpose**: This asks the process to stop and waits for remote termination errors to be reported. It is useful when the caller needs confirmation instead of fire-and-forget cleanup.
 
-**Data flow**: For `Local`, invokes `terminate()`. For `ExecServer`, awaits `terminate()` and maps transport errors into `UnifiedExecError::process_failed`. On success, calls `signal_exit(self.exit_code())`, then `finish_termination()`, and returns `Ok(())`.
+**Data flow**: It sends a terminate request to the local process or awaits the exec-server terminate request. If the server reports an error, it returns a process failure error. Otherwise it records the current exit code through `signal_exit`, runs `finish_termination`, and returns success.
 
-**Call relations**: Used by manager-level explicit termination requests that need a reliable success/failure result. Unlike `terminate`, it does not mark the process exited if remote termination itself fails.
+**Call relations**: This is the stricter sibling of `terminate`. It calls `exit_code`, `signal_exit`, and `finish_termination` so the shared state and waiting tasks are updated after a confirmed stop.
 
 *Call graph*: calls 3 internal fn (exit_code, finish_termination, signal_exit).
 
@@ -428,11 +436,11 @@ async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError>
 async fn interrupt(&self) -> Result<(), UnifiedExecError>
 ```
 
-**Purpose**: Sends an interrupt signal to the running process using the transport-specific signal type.
+**Purpose**: This sends an interrupt signal to the process, similar to pressing Ctrl-C in a terminal. It gives the program a chance to stop itself cleanly.
 
-**Data flow**: Reads `process_handle`; for local PTY sessions sends `PtyProcessSignal::Interrupt`, for exec-server processes awaits `ExecServerProcessSignal::Interrupt`. Any signaling error is converted into `UnifiedExecError::process_failed(err.to_string())`.
+**Data flow**: It checks the transport. For a local PTY, it sends the PTY interrupt signal. For an exec-server process, it awaits the server's interrupt request. It returns success if the signal was sent, or a process failure error if sending failed.
 
-**Call relations**: Called from `write_stdin` when a non-TTY process receives the special interrupt control character instead of ordinary stdin bytes.
+**Call relations**: Callers use this when they want to interrupt rather than forcibly terminate. The method translates the single unified idea of interrupting into the signal type required by each backend.
 
 
 ##### `UnifiedExecProcess::fail_and_terminate`  (lines 247–253)
@@ -441,11 +449,11 @@ async fn interrupt(&self) -> Result<(), UnifiedExecError>
 fn fail_and_terminate(&self, message: String)
 ```
 
-**Purpose**: Records a failure message exactly once and then terminates the process.
+**Purpose**: This records a failure message for the process, if one has not already been recorded, and then stops the process. It is used when something outside normal process exit has gone wrong.
 
-**Data flow**: Reads current `ProcessState` from `state_rx`; if `failure_message` is absent, writes a new failed state via `state.failed(message)`. Then calls `terminate()` regardless. Returns unit.
+**Data flow**: It receives a failure message string. It reads the current state, stores the message only if there is not already a failure message, and then calls `terminate` to stop the process and clean up.
 
-**Call relations**: Used by manager-side failure paths such as network denial handling. The one-time write preserves the first failure cause even if later code attempts to fail the process again.
+**Call relations**: `fail_process_with_message` calls this in failure paths. This method connects state reporting with process shutdown, so users see a reason instead of only seeing that the process disappeared.
 
 *Call graph*: calls 1 internal fn (terminate); called by 1 (fail_process_with_message); 2 external calls (send_replace, borrow).
 
@@ -456,11 +464,11 @@ fn fail_and_terminate(&self, message: String)
 async fn snapshot_output(&self) -> Vec<Vec<u8>>
 ```
 
-**Purpose**: Captures the current buffered output chunks without draining them.
+**Purpose**: This takes a safe snapshot of the output collected so far. It is used when code needs to inspect accumulated output rather than stream future chunks.
 
-**Data flow**: Locks `output_buffer`, reads its chunk snapshot via `snapshot_chunks()`, and returns `Vec<Vec<u8>>` containing the buffered chunks.
+**Data flow**: It locks the shared output buffer, copies out its stored chunks, and returns them as byte vectors. The original buffer stays in place for other readers and writers.
 
-**Call relations**: Used by `check_for_sandbox_denial` to inspect all accumulated output text while leaving the buffer intact for other consumers.
+**Call relations**: `check_for_sandbox_denial` calls this after giving the process a brief chance to produce output, so sandbox detection can examine what the command printed before or while exiting.
 
 *Call graph*: called by 1 (check_for_sandbox_denial); 1 external calls (lock).
 
@@ -471,11 +479,11 @@ async fn snapshot_output(&self) -> Vec<Vec<u8>>
 fn sandbox_type(&self) -> SandboxType
 ```
 
-**Purpose**: Returns the sandbox mode associated with this process.
+**Purpose**: This returns which sandbox, if any, was used for the process. A sandbox is a restriction layer that limits what the command can access.
 
-**Data flow**: Reads the stored `sandbox_type` field and returns it by value.
+**Data flow**: It reads the stored sandbox type and returns it. It does not change any state.
 
-**Call relations**: Used by sandbox-denial detection to skip checks for unsandboxed processes and to pass the correct sandbox type into denial heuristics.
+**Call relations**: `check_for_sandbox_denial_with_text` calls this to decide whether sandbox-specific denial detection should run at all.
 
 *Call graph*: called by 1 (check_for_sandbox_denial_with_text).
 
@@ -486,11 +494,11 @@ fn sandbox_type(&self) -> SandboxType
 fn failure_message(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the currently recorded process failure message, if any.
+**Purpose**: This returns the recorded process failure message, if there is one. It lets higher-level code explain why the process failed beyond just an exit code.
 
-**Data flow**: Reads the current `ProcessState` from `state_rx`, clones `failure_message`, and returns `Option<String>`.
+**Data flow**: It reads the current watched process state and clones the optional failure message. The process state itself is not changed.
 
-**Call relations**: Queried by manager-level error handling to distinguish transport/process failures from ordinary exits and to preserve the original failure text.
+**Call relations**: The call graph shows `fail_process_with_message` using this. That lets external failure handling check what has already been recorded before deciding what to report or overwrite.
 
 *Call graph*: called by 1 (fail_process_with_message); 1 external calls (borrow).
 
@@ -501,11 +509,11 @@ fn failure_message(&self) -> Option<String>
 async fn check_for_sandbox_denial(&self) -> Result<(), UnifiedExecError>
 ```
 
-**Purpose**: Builds a text snapshot from buffered output and runs sandbox-denial detection against it, waiting briefly for initial output if necessary.
+**Purpose**: This checks whether a just-finished sandboxed process probably failed because the sandbox blocked it. It gathers the output first, because denial clues often appear in stderr text.
 
-**Data flow**: Waits up to 20 ms for `output_notify`, then calls `snapshot_output()`, concatenates all chunk bytes into one `Vec<u8>`, converts it with `String::from_utf8_lossy`, and delegates to `check_for_sandbox_denial_with_text`. Returns `Ok(())` or a sandbox-denied `UnifiedExecError`.
+**Data flow**: It briefly waits for output notification, snapshots collected output chunks, joins them into one byte buffer, converts the bytes to text, and passes that text to `check_for_sandbox_denial_with_text`. It returns success if no denial is detected, or a sandbox-denied error if one is detected.
 
-**Call relations**: Called by both constructors after early exit detection so short-lived sandbox failures can be surfaced immediately to callers before the process is handed off.
+**Call relations**: `from_spawned` and `from_exec_server_started` use this during early-exit handling. It depends on `snapshot_output` for the captured text and delegates the actual judgment to `check_for_sandbox_denial_with_text`.
 
 *Call graph*: calls 2 internal fn (check_for_sandbox_denial_with_text, snapshot_output); 4 external calls (from_millis, from_utf8_lossy, new, timeout).
 
@@ -519,11 +527,11 @@ async fn check_for_sandbox_denial_with_text(
     ) -> Result<(), UnifiedExecError>
 ```
 
-**Purpose**: Determines whether an exited sandboxed process likely failed because the sandbox denied an operation, and if so returns a structured sandbox-denied error.
+**Purpose**: This decides whether finished process output looks like a sandbox access denial and, if so, turns that into a clear error. It avoids treating ordinary failures as sandbox failures.
 
-**Data flow**: Takes output text, reads `sandbox_type()`, `has_exited()`, and `exit_code()`. If sandboxing is disabled or the process is still running, returns `Ok(())`. Otherwise constructs an `ExecToolCallOutput` with the text in both `stderr` and `aggregated_output`, calls `is_likely_sandbox_denied`, and on a positive match truncates the text with `formatted_truncate_text(…, TruncationPolicy::Tokens(UNIFIED_EXEC_OUTPUT_MAX_TOKENS))`. It returns `Err(UnifiedExecError::sandbox_denied(message, exec_output))` using either the truncated snippet or a fallback `Process exited with code ...` message.
+**Data flow**: It receives output text. It first checks the sandbox type and whether the process has exited; if there is no sandbox or the process is still running, it returns success. Otherwise it builds an execution-output summary with the exit code and text, asks the sandbox-denial detector, and if denied returns an error with a shortened readable snippet.
 
-**Call relations**: Invoked by `check_for_sandbox_denial` and by manager code that already has collected output text. It is the final gate that converts ordinary exited-process state into a sandbox-specific failure classification.
+**Call relations**: `check_for_sandbox_denial` calls this after collecting output. It calls `sandbox_type`, `has_exited`, and `exit_code` to gather context, then relies on `is_likely_sandbox_denied` and text truncation to produce a useful final error.
 
 *Call graph*: calls 6 internal fn (is_likely_sandbox_denied, sandbox_denied, exit_code, has_exited, sandbox_type, new); called by 1 (check_for_sandbox_denial); 4 external calls (default, formatted_truncate_text, format!, Tokens).
 
@@ -538,11 +546,11 @@ async fn from_spawned(
     ) -> Result<Self, UnifiedExecError>
 ```
 
-**Purpose**: Constructs a unified process from a locally spawned PTY/pipe session, starts output forwarding, and handles immediate or very early exit before returning.
+**Purpose**: This turns a newly spawned local PTY process into a `UnifiedExecProcess`. It starts local output collection and handles the special case where the process exits almost immediately.
 
-**Data flow**: Consumes `SpawnedPty` plus sandbox metadata and a spawn lifecycle handle. It extracts the local session, stdout/stderr receivers, and exit receiver; combines stdout/stderr into one receiver; builds `Self::new(ProcessHandle::Local(...))`; starts `spawn_local_output_task`; then probes `exit_rx` with `try_recv()`, followed by a timeout over `EARLY_EXIT_GRACE_PERIOD`. If an exit is observed, it records exit state and runs sandbox-denial detection before returning. Otherwise it spawns a background task awaiting `exit_rx` that updates watched state and cancels the token later.
+**Data flow**: It receives a `SpawnedPty`, sandbox type, and spawn-lifecycle object. It combines stdout and stderr into one output stream, creates the unified wrapper, starts the local output task, then checks the exit receiver immediately and again for a short grace period. If the process already exited, it records the exit and checks for sandbox denial; otherwise it spawns a watcher task that will record exit later.
 
-**Call relations**: Called by `open_session_with_exec_env` for local process launches. Its early-exit logic ensures callers can synchronously observe commands that fail almost immediately instead of storing them as long-lived sessions.
+**Call relations**: `open_session_with_exec_env` calls this after launching a local command. Inside, it uses `new` to build the wrapper and `spawn_local_output_task` to begin moving output into the shared buffer and broadcast stream.
 
 *Call graph*: called by 1 (open_session_with_exec_env); 8 external calls (clone, new, new, spawn_local_output_task, combine_output_receivers, Local, spawn, timeout).
 
@@ -556,11 +564,11 @@ async fn from_exec_server_started(
     ) -> Result<Self, UnifiedExecError>
 ```
 
-**Purpose**: Constructs a unified process from an already-started exec-server process, starts remote output polling, and waits briefly for an early exit or failure signal.
+**Purpose**: This turns a process that was started through the exec server into a `UnifiedExecProcess`. It starts the remote output polling task and checks for very fast failures.
 
-**Data flow**: Consumes `StartedExecProcess` and `SandboxType` → wraps the remote process in `ProcessHandle::ExecServer`, builds `Self::new`, derives `OutputHandles`, starts `spawn_exec_server_output_task`, then clones `state_rx` and waits up to `EARLY_EXIT_GRACE_PERIOD` for `has_exited` or `failure_message` to appear. If that happens in time, it runs sandbox-denial detection before returning the process.
+**Data flow**: It receives a `StartedExecProcess` and sandbox type. It wraps the server process handle, creates shared output handles, launches the exec-server output task, then watches the process state for a short grace period. If the process exits or fails quickly, it checks for sandbox denial before returning the wrapper.
 
-**Call relations**: Used by `open_session_with_exec_env` for remote exec-server launches and by tests. It relies on the spawned output task to populate state, so the early wait loops on the watch receiver rather than a direct exit channel.
+**Call relations**: This is called by `open_session_with_exec_env`, `blocking_terminate_unified_process`, `remote_process`, and `remote_process_waits_for_early_exit_event`. It uses `new`, `output_handles`, and `spawn_exec_server_output_task` to make a remote process look like the same kind of object as a local one.
 
 *Call graph*: called by 4 (blocking_terminate_unified_process, open_session_with_exec_env, remote_process, remote_process_waits_for_early_exit_event); 5 external calls (clone, new, spawn_exec_server_output_task, ExecServer, timeout).
 
@@ -575,11 +583,11 @@ fn spawn_exec_server_output_task(
         state_tx: watch::Sender<ProcessStat
 ```
 
-**Purpose**: Starts the background task that polls a remote exec-server process for output, exit, closure, and failure updates, then mirrors those into local shared state.
+**Purpose**: This starts the background task that collects output and state updates from an exec-server process. It is the bridge between the remote server protocol and the local shared buffers.
 
-**Data flow**: Takes `StartedExecProcess`, `OutputHandles`, an output broadcast sender, and a state watch sender. Inside the spawned loop it calls `process.read(after_seq, None, Some(0)).await`, appends each returned chunk into `output_buffer`, broadcasts the bytes, and notifies output waiters. If `failure` is present it writes a failed `ProcessState`, marks output closed, notifies closure, cancels the token, and exits. If `exited` is true it writes an exited state; if `closed` is true it marks output closed and cancels. It advances `after_seq` to `next_seq.checked_sub(1)` and waits on `wake_rx.changed()` before polling again. Read errors or wake-channel closure are converted into failed state plus output closure.
+**Data flow**: It receives the started server process, shared output handles, the output broadcast sender, and the process-state sender. The spawned task repeatedly reads new chunks from the server, appends them to the buffer, broadcasts them, wakes listeners, records failures or exits, marks output closed when the server says it is closed, and waits for server wake signals before reading again.
 
-**Call relations**: Spawned only by `from_exec_server_started`. It is the remote transport bridge that turns exec-server polling and wake notifications into the same buffer/notify/state model used by local processes.
+**Call relations**: `from_exec_server_started` calls this during remote process setup. The task feeds the same output buffer and broadcast channel that streaming callers use, so remote output follows the same path as local output after collection.
 
 *Call graph*: 4 external calls (borrow, send, send_replace, spawn).
 
@@ -594,11 +602,11 @@ fn spawn_local_output_task(
         output_closed: Arc<AtomicBool>,
 ```
 
-**Purpose**: Starts the background task that consumes merged local stdout/stderr chunks, stores them in the shared buffer, and rebroadcasts them to live subscribers.
+**Purpose**: This starts the background task that collects output from a local PTY process. It copies each output chunk into shared storage and sends it to live subscribers.
 
-**Data flow**: Takes a broadcast receiver of output chunks plus shared buffer/notify/closed state and an output sender. In a spawned loop it awaits `receiver.recv()`: on `Ok(chunk)` it locks the buffer, pushes the chunk, broadcasts it, and notifies output waiters; on `Lagged(_)` it skips missed chunks and continues; on `Closed` it marks output closed, notifies closure waiters, and exits.
+**Data flow**: It receives a broadcast receiver for local output, the shared buffer, notification objects, a closed flag, and an output broadcaster. The spawned task waits for chunks, stores each chunk in the buffer, rebroadcasts it, and wakes listeners. If it falls behind, it skips missed chunks and keeps going; if the source closes, it marks output closed and wakes waiters.
 
-**Call relations**: Spawned by `from_spawned` for local PTY/pipe sessions. It normalizes local output delivery into the same shared structures used by remote output polling.
+**Call relations**: `from_spawned` calls this after combining stdout and stderr. The task makes local PTY output available through the same buffer and streaming channel used by the rest of the unified execution system.
 
 *Call graph*: calls 1 internal fn (recv); 3 external calls (lock, send, spawn).
 
@@ -609,11 +617,11 @@ fn spawn_local_output_task(
 fn signal_exit(&self, exit_code: Option<i32>)
 ```
 
-**Purpose**: Marks the process as exited with the supplied exit code and triggers the cancellation token.
+**Purpose**: This records that the process has exited and cancels tasks waiting on it. It is a small internal helper for updating shared exit state consistently.
 
-**Data flow**: Reads current `ProcessState` from `state_rx`, writes `state.exited(exit_code)` into `state_tx`, cancels `cancellation_token`, and returns unit.
+**Data flow**: It receives an optional exit code. It reads the current state, replaces it with an exited version containing that code, sends the new state to watchers, and cancels the cancellation token.
 
-**Call relations**: Used by `terminate_confirmed` and the local early-exit path to publish a final exit state in one place.
+**Call relations**: `terminate_confirmed` calls this after a confirmed termination. Other exit paths update state directly, but this helper provides a compact way to pair exit-state recording with cancellation.
 
 *Call graph*: called by 1 (terminate_confirmed); 3 external calls (cancel, send_replace, borrow).
 
@@ -624,24 +632,24 @@ fn signal_exit(&self, exit_code: Option<i32>)
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures the underlying process is terminated when the wrapper is dropped.
+**Purpose**: This is the automatic cleanup that runs when a `UnifiedExecProcess` is destroyed. It prevents a wrapped process from being left running accidentally.
 
-**Data flow**: On mutable drop of `self`, calls `terminate()` and returns unit.
+**Data flow**: It receives mutable access to the process wrapper during destruction. It calls `terminate`, which sends the stop request and closes/cancels local output machinery.
 
-**Call relations**: Acts as the final safety net if higher-level code forgets to explicitly terminate or release a process handle.
+**Call relations**: Rust calls this automatically when the wrapper goes out of scope. By delegating to `terminate`, it reuses the same cleanup path as explicit termination and reduces the risk of leaked child processes.
 
 *Call graph*: calls 1 internal fn (terminate).
 
 
 ### `core/src/unified_exec/process_manager.rs`
 
-`orchestration` · `request handling and background process management`
+`orchestration` · `request handling and background process lifecycle`
 
-This file is the control plane for unified exec. It defines helper constants and environment shaping (`UNIFIED_EXEC_ENV`, network-denial messages, deterministic test IDs), then implements `UnifiedExecProcessManager` methods that span process creation, persistence, polling, pruning, and termination. The manager’s central state lives in a `ProcessStore` lock elsewhere; this file decides when entries are inserted, removed, or pruned.
+When Codex runs a command, it may finish quickly, or it may become a live background terminal that the user can keep polling or type into later. This file makes that possible. It gives each process an ID, builds the right environment variables, asks the sandbox and approval systems whether the command is allowed, starts the process locally or through a remote exec server, then gathers output until a time limit is reached. If the process is still alive, it stores the process so later calls can find it again.
 
-Launch flow starts in `exec_command`: it opens a sandboxed session through `open_session_with_sandbox`, optionally installs a background task that kills the process on deferred network denial, emits begin events, starts streaming output, stores long-lived processes before the initial yield window, then collects buffered output until a deadline using `collect_output_until_deadline`. That collector drains `HeadTailBuffer` chunks, waits on `Notify`, respects process exit via `CancellationToken`, and extends deadlines while the session is paused. After collection, `exec_command` resolves network approval, process failure, sandbox denial, and whether the process remains alive; short-lived commands emit end events immediately, while long-lived ones stay in the store for later `write_stdin` polling.
+The file also deals with the awkward edges of real processes. It watches for network permission denial, turns that into a clear error, and terminates the process if needed. It emits start and end events so the rest of the system can show what happened. It protects a newly started background process from being dropped too early, like putting a name tag on a suitcase before it goes onto the carousel. It also prunes old stored processes when there are too many, preferring not to remove the most recently used ones.
 
-`write_stdin` rehydrates the stored process plus output handles, supports interrupt-only writes for non-TTY sessions, performs bounded polling after writes, and removes exited processes after final network-approval cleanup. `open_session_with_exec_env` chooses among Windows sandbox launchers, remote exec-server startup, and local PTY/pipe spawning, including inherited-FD lifecycle hooks. The file also contains pruning policy: keep the 8 most recently used processes protected, prefer pruning exited entries outside that set, otherwise prune least-recently-used. Cleanup paths consistently unregister deferred network approvals before dropping entries.
+Without this file, command execution would be much less reliable: long-running commands could disappear, output could be missed, network-denial errors could be confusing, and process IDs could leak or collide.
 
 #### Function details
 
@@ -651,11 +659,11 @@ Launch flow starts in `exec_command`: it opens a sandboxed session through `open
 fn set_deterministic_process_ids_for_tests(enabled: bool)
 ```
 
-**Purpose**: Enables or disables the test-only global override that forces deterministic unified-exec process ID allocation.
+**Purpose**: Turns predictable process IDs on or off for tests. This makes test results repeatable instead of depending on random numbers.
 
-**Data flow**: Takes a `bool` and stores it into the static `FORCE_DETERMINISTIC_PROCESS_IDS` with relaxed ordering; returns unit.
+**Data flow**: It receives a true-or-false value, stores that value in a shared atomic flag, and returns nothing. Afterward, process ID allocation can read the flag and choose deterministic IDs.
 
-**Call relations**: Used by tests or test helpers to make `allocate_process_id` predictable without relying on random-number generation.
+**Call relations**: This is a test support switch. The call graph records it as being called in its own test-facing path, and the real effect is later seen when should_use_deterministic_process_ids checks the flag before allocate_process_id chooses an ID.
 
 *Call graph*: called by 1 (set_deterministic_process_ids_for_tests).
 
@@ -666,11 +674,11 @@ fn set_deterministic_process_ids_for_tests(enabled: bool)
 fn deterministic_process_ids_forced_for_tests() -> bool
 ```
 
-**Purpose**: Reads the test override flag controlling deterministic process ID allocation.
+**Purpose**: Reads whether tests have forced deterministic process IDs. It is a tiny helper that hides the shared flag access.
 
-**Data flow**: Loads the `FORCE_DETERMINISTIC_PROCESS_IDS` atomic with relaxed ordering and returns the resulting `bool`.
+**Data flow**: It reads the atomic test flag and returns true if deterministic IDs are currently forced, otherwise false. It does not change any state.
 
-**Call relations**: Called only by `should_use_deterministic_process_ids` as part of the process-ID allocation policy.
+**Call relations**: should_use_deterministic_process_ids calls this when deciding whether allocation should use predictable IDs. That keeps the allocation code from touching the flag directly.
 
 *Call graph*: called by 1 (should_use_deterministic_process_ids).
 
@@ -681,11 +689,11 @@ fn deterministic_process_ids_forced_for_tests() -> bool
 fn should_use_deterministic_process_ids() -> bool
 ```
 
-**Purpose**: Decides whether process IDs should be deterministic instead of random.
+**Purpose**: Decides whether process IDs should be predictable instead of random. This is useful in tests, where stable IDs make assertions easier.
 
-**Data flow**: Evaluates `cfg!(test)` and the runtime override from `deterministic_process_ids_forced_for_tests()` → returns `true` if either condition is true.
+**Data flow**: It checks whether the code is running in test mode and also reads the test override flag. It returns one true-or-false answer for the ID allocator.
 
-**Call relations**: Queried by `allocate_process_id` to switch between monotonic test IDs and random production IDs.
+**Call relations**: allocate_process_id calls this before choosing an ID. It combines the built-in test check with deterministic_process_ids_forced_for_tests so the allocator has one simple decision to follow.
 
 *Call graph*: calls 1 internal fn (deterministic_process_ids_forced_for_tests); called by 1 (allocate_process_id); 1 external calls (cfg!).
 
@@ -696,11 +704,11 @@ fn should_use_deterministic_process_ids() -> bool
 fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String>
 ```
 
-**Purpose**: Injects the fixed unified-exec environment defaults into an environment map, overriding any existing values for those keys.
+**Purpose**: Adds a standard set of environment variables for commands run through unified exec. These variables make command output plainer and more predictable, such as disabling colors and pagers.
 
-**Data flow**: Consumes a `HashMap<String, String>`, iterates over `UNIFIED_EXEC_ENV`, inserts each key/value pair into the map, and returns the modified map.
+**Data flow**: It receives an environment map, inserts fixed key-value pairs like NO_COLOR and PAGER, and returns the updated map. Existing values for those keys are overwritten.
 
-**Call relations**: Used during sandbox/session setup in `open_session_with_sandbox` so every unified-exec command runs with normalized locale, pager, and terminal-related variables.
+**Call relations**: open_session_with_sandbox calls this while preparing a command request. It happens before the command is handed to the tool orchestration layer, so every unified exec command gets the same baseline behavior.
 
 *Call graph*: called by 1 (open_session_with_sandbox).
 
@@ -713,11 +721,11 @@ fn exec_env_policy_from_shell_policy(
 ) -> codex_exec_server::ExecEnvPolicy
 ```
 
-**Purpose**: Converts the turn’s shell environment policy into the exec-server environment policy type.
+**Purpose**: Converts Codex's shell environment policy into the format expected by the exec server. An environment policy is the rulebook for which environment variables are inherited, excluded, or explicitly set.
 
-**Data flow**: Reads fields from `ShellEnvironmentPolicy` (`inherit`, `ignore_default_excludes`, `exclude`, `r#set`, `include_only`) → clones/maps them into a `codex_exec_server::ExecEnvPolicy` → returns that policy.
+**Data flow**: It receives a ShellEnvironmentPolicy, copies its inheritance and include/exclude rules into an ExecEnvPolicy, and returns that converted policy. It does not modify the original policy.
 
-**Call relations**: Called by `open_session_with_sandbox` when preparing `ExecServerEnvConfig` for requests that may run through an exec server.
+**Call relations**: open_session_with_sandbox calls this when building the exec-server environment configuration. That converted policy can later travel through exec_server_params_for_request when a remote backend starts the process.
 
 *Call graph*: called by 1 (open_session_with_sandbox).
 
@@ -731,11 +739,11 @@ fn env_overlay_for_exec_server(
 ) -> HashMap<String, String>
 ```
 
-**Purpose**: Computes the minimal environment overlay that must be sent to the exec server by removing variables whose values already match the locally applied policy environment.
+**Purpose**: Finds only the environment variables that differ from the locally computed policy environment. This avoids sending redundant values to the exec server.
 
-**Data flow**: Reads `request_env` and `local_policy_env`, filters request entries where `local_policy_env.get(key) != Some(value)`, clones those differing pairs into a new `HashMap`, and returns it.
+**Data flow**: It compares the request environment with the local policy environment. For each variable whose value is new or different, it copies that pair into a smaller map and returns it.
 
-**Call relations**: Used by `exec_server_env_for_request` so remote execution receives only runtime changes beyond the baseline local policy environment.
+**Call relations**: exec_server_env_for_request calls this when an exec-server environment configuration is present. It prepares the compact overlay that exec_server_params_for_request will include in the remote start request.
 
 *Call graph*: called by 1 (exec_server_env_for_request).
 
@@ -751,11 +759,11 @@ fn exec_server_env_for_request(
 )
 ```
 
-**Purpose**: Determines the environment policy and environment payload to send for an exec-server request.
+**Purpose**: Builds the environment information that should be sent to an exec server. It separates the policy rulebook from the explicit environment overrides.
 
-**Data flow**: Reads `request.exec_server_env_config`. If present, returns `(Some(policy.clone()), env_overlay_for_exec_server(&request.env, &local_policy_env))`; otherwise returns `(None, request.env.clone())`.
+**Data flow**: It receives an ExecRequest. If the request contains exec-server environment configuration, it returns that policy plus the smaller overlay; otherwise it returns no policy and a clone of the full request environment.
 
-**Call relations**: Called by `exec_server_params_for_request` to build the final remote execution parameters.
+**Call relations**: exec_server_params_for_request calls this while assembling the complete remote execution parameters. It delegates the comparison work to env_overlay_for_exec_server when needed.
 
 *Call graph*: calls 1 internal fn (env_overlay_for_exec_server); called by 1 (exec_server_params_for_request).
 
@@ -770,11 +778,11 @@ fn exec_server_params_for_request(
 ) -> codex_exec_server::ExecParams
 ```
 
-**Purpose**: Builds the `codex_exec_server::ExecParams` structure for launching a process through the exec server.
+**Purpose**: Packages a command request into the exact parameter object a remote exec server expects. This is the bridge between Codex's internal request shape and the server protocol.
 
-**Data flow**: Takes a unified-exec `process_id`, `ExecRequest`, and `tty` flag; derives `(env_policy, env)` via `exec_server_env_for_request`, converts the numeric process ID with `exec_server_process_id`, converts `cwd` with `PathUri::from_abs_path`, copies argv/arg0, sets `pipe_stdin` to `false`, and returns the assembled `ExecParams`.
+**Data flow**: It receives a process ID, an ExecRequest, and whether the command should use a terminal. It converts the process ID to the server form, converts the working directory to a URI, attaches command arguments and environment data, and returns ExecParams.
 
-**Call relations**: Used by `open_session_with_exec_env` in the remote-exec path before calling `start` on the exec backend.
+**Call relations**: open_session_with_exec_env calls this only when the selected environment is remote. It relies on exec_server_env_for_request for environment data and exec_server_process_id for the ID string.
 
 *Call graph*: calls 3 internal fn (exec_server_env_for_request, exec_server_process_id, from_abs_path); called by 1 (open_session_with_exec_env).
 
@@ -785,11 +793,11 @@ fn exec_server_params_for_request(
 fn drop(&mut self)
 ```
 
-**Purpose**: Marks the initial exec-command phase as inactive when the guard goes out of scope.
+**Purpose**: Marks the initial command-start call as no longer active when its guard goes out of scope. This prevents cleanup code from removing a process while its first response is still being prepared.
 
-**Data flow**: On drop, stores `false` into the guard’s shared `active: Arc<AtomicBool>` with release ordering.
+**Data flow**: It has no explicit input beyond the guard object. When the guard is dropped, it writes false into a shared atomic flag and returns nothing.
 
-**Call relations**: Created in `exec_command` only for processes that were stored as live background sessions; later termination logic checks this flag to avoid removing a process while the initial command call is still active.
+**Call relations**: exec_command creates this guard after storing a still-running process. Later, terminate_process checks the same flag and avoids removing a process that is still in its initial startup window.
 
 
 ##### `exec_server_process_id`  (lines 196–198)
@@ -798,11 +806,11 @@ fn drop(&mut self)
 fn exec_server_process_id(process_id: i32) -> String
 ```
 
-**Purpose**: Converts the manager’s numeric process ID into the string form expected by the exec server.
+**Purpose**: Converts an internal numeric process ID into the string form used by the exec server. It is deliberately simple so both sides use the same visible ID.
 
-**Data flow**: Takes `i32`, calls `to_string()`, and returns the resulting `String`.
+**Data flow**: It receives an integer process ID and returns the same value as a string. It does not read or change shared state.
 
-**Call relations**: Used by `exec_server_params_for_request` so local and remote process IDs stay aligned.
+**Call relations**: exec_server_params_for_request calls this while building remote execution parameters. The resulting string becomes the process_id field sent to the exec backend.
 
 *Call graph*: called by 1 (exec_server_params_for_request).
 
@@ -813,11 +821,11 @@ fn exec_server_process_id(process_id: i32) -> String
 async fn unregister_network_approval_for_entry(entry: &ProcessEntry)
 ```
 
-**Purpose**: Removes any deferred network-approval registration associated with a stored process entry.
+**Purpose**: Removes a stored network-approval registration for a process entry. This avoids leaving stale permission requests behind after a process is gone.
 
-**Data flow**: Reads `entry.network_approval` and upgrades `entry.session` from `Weak` to `Arc`; if both exist, awaits `session.services.network_approval.unregister_call(registration_id)` and otherwise does nothing.
+**Data flow**: It receives a ProcessEntry, checks whether it has a deferred network approval and whether its session is still alive, then asks the session's network approval service to unregister that call. It returns nothing.
 
-**Call relations**: Called whenever a process entry is removed or pruned—during `release_process_id`, `store_process` pruning cleanup, `terminate_all_processes`, and `terminate_process`—to avoid leaving stale approval registrations behind.
+**Call relations**: release_process_id, store_process, terminate_all_processes, and terminate_process call this during cleanup. It is always used after a process entry is being removed or discarded.
 
 *Call graph*: called by 4 (release_process_id, store_process, terminate_all_processes, terminate_process).
 
@@ -830,11 +838,11 @@ async fn finish_network_approval_after_process_exit_for_entry(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Completes deferred network approval for a stored process entry after it has exited, including the late-denial grace period.
+**Purpose**: Finishes any deferred network approval connected to a process that has exited. This turns a pending network decision into either success or a readable error.
 
-**Data flow**: Upgrades the entry’s weak session reference, clones the entry’s deferred approval, and delegates to `finish_deferred_network_approval_after_process_exit_for_session`, returning `Result<(), String>`.
+**Data flow**: It receives a ProcessEntry, upgrades its weak session reference if possible, forwards the session and deferred approval to the session-based helper, and returns either success or an error message string.
 
-**Call relations**: Used by `write_stdin` when a stored process has exited and been removed from the store, so final approval resolution happens before the response is returned.
+**Call relations**: write_stdin calls this after polling shows that a stored process has exited. It hands the real work to finish_deferred_network_approval_after_process_exit_for_session.
 
 *Call graph*: calls 1 internal fn (finish_deferred_network_approval_after_process_exit_for_session); called by 1 (write_stdin).
 
@@ -848,11 +856,11 @@ async fn finish_deferred_network_approval_for_session(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Finalizes deferred network approval against a concrete session and converts tool-layer errors into plain strings.
+**Purpose**: Completes a deferred network approval for a session, if there is still a session to report to. Deferred means the command was started while the network decision could still arrive later.
 
-**Data flow**: Takes an optional session reference and optional `DeferredNetworkApproval`. If no session exists, returns `Ok(())`. Otherwise awaits `finish_deferred_network_approval(session, deferred)` and maps any `ToolError` through `network_approval_error_message`.
+**Data flow**: It receives an optional session and optional deferred approval. If there is no session, it succeeds immediately; otherwise it calls the network approval finisher and converts any ToolError into a plain string.
 
-**Call relations**: Used by both `exec_command` and `write_stdin`, and by the post-exit helper, whenever a process outcome must be reconciled with deferred network approval.
+**Call relations**: exec_command and write_stdin use this when a process fails or needs final network approval cleanup. finish_deferred_network_approval_after_process_exit_for_session also calls it after waiting briefly for late denial.
 
 *Call graph*: calls 1 internal fn (finish_deferred_network_approval); called by 3 (exec_command, write_stdin, finish_deferred_network_approval_after_process_exit_for_session).
 
@@ -863,11 +871,11 @@ async fn finish_deferred_network_approval_for_session(
 fn network_approval_error_message(err: ToolError) -> String
 ```
 
-**Purpose**: Normalizes a `ToolError` from deferred network approval into the user-facing message string that should be attached to process failure.
+**Purpose**: Turns a network approval error into text that can be shown to a user. It preserves a rejection message when one exists.
 
-**Data flow**: Matches on `ToolError`: returns the embedded rejection message for `Rejected`, or `err.to_string()` for `Codex` errors.
+**Data flow**: It receives a ToolError. If the user or policy rejected the request, it returns that message; if it is a Codex error, it converts the error to a string.
 
-**Call relations**: Used by network-approval completion helpers to preserve meaningful denial text instead of exposing raw enum structure.
+**Call relations**: network_denial_message_for_session calls this when finishing deferred network approval fails. That message can then be used to fail and terminate the process.
 
 *Call graph*: called by 1 (network_denial_message_for_session); 1 external calls (to_string).
 
@@ -881,11 +889,11 @@ async fn network_denial_message_for_session(
 ) -> String
 ```
 
-**Purpose**: Produces the final message to use when network access is denied, either the fixed fallback string or a more specific message from deferred approval completion.
+**Purpose**: Creates the final message to use when network access is denied. It prefers a specific approval-service error, but falls back to a standard denial sentence.
 
-**Data flow**: If no session is available, returns `NETWORK_ACCESS_DENIED_MESSAGE`. Otherwise awaits `finish_deferred_network_approval(session, deferred)`; on success returns the fallback denial string, on error converts the error with `network_approval_error_message`.
+**Data flow**: It receives an optional session and optional deferred network approval. With no session it returns the default denial message; with a session it finishes the approval and returns either the default success-denial wording or the specific error text.
 
-**Call relations**: Used in `exec_command`, `write_stdin`, and `terminate_process_on_network_denial` when a process must be failed because network access was denied.
+**Call relations**: exec_command, write_stdin, and terminate_process_on_network_denial call this when network cancellation is observed. It uses finish_deferred_network_approval and network_approval_error_message to produce user-facing text.
 
 *Call graph*: calls 2 internal fn (finish_deferred_network_approval, network_approval_error_message); called by 3 (exec_command, write_stdin, terminate_process_on_network_denial).
 
@@ -896,11 +904,11 @@ async fn network_denial_message_for_session(
 async fn wait_for_late_network_denial(network_cancelled: Option<CancellationToken>) -> bool
 ```
 
-**Purpose**: Waits briefly after process exit to see whether a deferred network denial arrives slightly late.
+**Purpose**: Waits a very short time after process exit to see whether a network denial arrives. This prevents a race where the process exits and the denial signal follows milliseconds later.
 
-**Data flow**: Takes `Option<CancellationToken>`. If absent, returns `false`. If already cancelled, returns `true`. Otherwise races `network_cancelled.cancelled()` against `tokio::time::sleep(LATE_NETWORK_DENIAL_GRACE_PERIOD)` and returns whether cancellation won.
+**Data flow**: It receives an optional cancellation token. If there is no token it returns false; if the token is already cancelled or becomes cancelled during the grace period, it returns true; otherwise it returns false.
 
-**Call relations**: Called by post-exit network-approval completion so the manager does not miss denials that are signaled just after the process itself exits.
+**Call relations**: finish_deferred_network_approval_after_process_exit_for_session calls this before completing network approval. That gives the approval path a chance to notice a late denial before declaring cleanup done.
 
 *Call graph*: called by 1 (finish_deferred_network_approval_after_process_exit_for_session); 1 external calls (select!).
 
@@ -914,11 +922,11 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
 ) -> Result<(), St
 ```
 
-**Purpose**: Completes deferred network approval after first allowing a short grace period for late network-denial cancellation.
+**Purpose**: Completes network approval cleanup after a process exits, while accounting for late denial signals. It is the safer post-exit version of the normal finisher.
 
-**Data flow**: Extracts the deferred approval’s cancellation token if present, awaits `wait_for_late_network_denial`, then delegates to `finish_deferred_network_approval_for_session` and returns its `Result<(), String>`.
+**Data flow**: It receives an optional session and optional deferred approval. It first waits briefly for possible network cancellation, then finishes the deferred approval for the session and returns success or an error message.
 
-**Call relations**: Used by `exec_command` and the entry-based wrapper to reconcile network approval for processes that have already exited.
+**Call relations**: exec_command calls this for processes that exit during the initial command call. finish_network_approval_after_process_exit_for_entry also calls it when write_stdin discovers a stored process has exited.
 
 *Call graph*: calls 2 internal fn (finish_deferred_network_approval_for_session, wait_for_late_network_denial); called by 2 (exec_command, finish_network_approval_after_process_exit_for_entry).
 
@@ -929,11 +937,11 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
 fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> UnifiedExecError
 ```
 
-**Purpose**: Ensures a process is marked failed and terminated, then returns a `UnifiedExecError::ProcessFailed` carrying the preserved failure message.
+**Purpose**: Marks a process as failed, terminates it, and returns a UnifiedExecError describing the failure. It also respects an existing failure message if one was already recorded.
 
-**Data flow**: Reads `process.failure_message()`. If one already exists, terminates the process and returns `UnifiedExecError::process_failed(existing_message)`. Otherwise calls `process.fail_and_terminate(message.clone())` and returns `process_failed` using the stored failure message or the original fallback.
+**Data flow**: It receives a process and a message. If the process already has a failure message, it terminates and returns that existing error; otherwise it records the new message, terminates, and returns an error using the stored message.
 
-**Call relations**: Used by `exec_command` and `write_stdin` in error paths where the manager needs both side effects on the process and a unified error value for the caller.
+**Call relations**: exec_command and write_stdin call this when network approval or another process-level failure must be surfaced. It calls the process methods that record failure and stop the running command.
 
 *Call graph*: calls 4 internal fn (process_failed, fail_and_terminate, failure_message, terminate); called by 2 (exec_command, write_stdin).
 
@@ -949,11 +957,11 @@ async fn emit_failed_initial_exec_end_if_unstored(
     transcript: Arc<to
 ```
 
-**Purpose**: Emits a failed `ExecCommandEnd` event for commands that died before being stored as background processes.
+**Purpose**: Emits a failed end event for an initial command only if the process was never stored as a background process. This keeps event reporting complete without duplicating the watcher’s work.
 
-**Data flow**: Takes a `process_started_alive` flag plus context, request metadata, cwd, transcript buffer, fallback output text, failure message, and wall time. If `process_started_alive` is true it returns immediately; otherwise it awaits `emit_failed_exec_end_for_unified_exec(...)` with the provided transcript and fallback output.
+**Data flow**: It receives the startup state, execution context, request details, output transcript, fallback output, error message, and elapsed time. If the process had already been stored alive, it does nothing; otherwise it emits a failed exec-end event.
 
-**Call relations**: Called from `exec_command` only on startup-time failure paths so short-lived commands still produce the same end event shape as background watcher completion.
+**Call relations**: exec_command calls this on failure paths during the initial command call. Stored processes are left to the background watcher, while short-lived or failed-before-store processes get their end event here.
 
 *Call graph*: calls 1 internal fn (emit_failed_exec_end_for_unified_exec); called by 1 (exec_command); 1 external calls (clone).
 
@@ -968,11 +976,11 @@ fn terminate_process_on_network_denial(
 )
 ```
 
-**Purpose**: Spawns a watcher that terminates a running process if its deferred network approval is later cancelled.
+**Purpose**: Starts a background task that kills a process if its deferred network approval is denied. This lets a running command be stopped as soon as the sandbox network proxy says no.
 
-**Data flow**: Clones the deferred approval’s cancellation token and the process cancellation token, then spawns a task. That task waits either for network cancellation directly or for process exit followed by `wait_for_late_network_denial`; if denial is confirmed, it upgrades the weak session, computes a denial message with `network_denial_message_for_session`, and calls `process.fail_and_terminate(message)`.
+**Data flow**: It receives the process, a weak reference to the session, and the deferred network approval. The spawned task waits for either network cancellation or process exit plus a short grace period; if denial happened, it builds a message and fails the process.
 
-**Call relations**: Installed by `exec_command` whenever launch returns a deferred network approval. It decouples asynchronous network-policy enforcement from the main request/response path.
+**Call relations**: exec_command calls this right after a process starts with deferred network approval. The task uses network_denial_message_for_session and the process cancellation token to coordinate network and process lifetime.
 
 *Call graph*: calls 2 internal fn (cancellation_token, network_denial_message_for_session); called by 1 (exec_command); 4 external calls (as_ref, upgrade, select!, spawn).
 
@@ -983,11 +991,11 @@ fn terminate_process_on_network_denial(
 async fn allocate_process_id(&self) -> i32
 ```
 
-**Purpose**: Reserves and returns a unique unified-exec process ID.
+**Purpose**: Reserves a unique process ID for a new command. In production it uses random IDs; in tests it can use predictable IDs.
 
-**Data flow**: Loops while holding `self.process_store.lock()`. If deterministic IDs are enabled, computes the next ID as one greater than the current max reserved ID, with a floor of 1000; otherwise generates a random ID in `1_000..100_000`. If the candidate is already reserved it retries; otherwise inserts it into `reserved_process_ids` and returns it.
+**Data flow**: It locks the process store, chooses an ID, checks whether it is already reserved, and repeats until it finds a free one. It records the reserved ID and returns it.
 
-**Call relations**: Called before process launch to reserve an ID that remains unavailable until `release_process_id` or store removal frees it.
+**Call relations**: This is used before starting commands so later calls can refer to the process. It calls should_use_deterministic_process_ids to decide between test-friendly IDs and random production IDs.
 
 *Call graph*: calls 1 internal fn (should_use_deterministic_process_ids); 1 external calls (rng).
 
@@ -998,11 +1006,11 @@ async fn allocate_process_id(&self) -> i32
 async fn release_process_id(&self, process_id: i32)
 ```
 
-**Purpose**: Removes a process entry and frees its reserved process ID, including deferred network-approval cleanup if an entry existed.
+**Purpose**: Removes a process ID and its stored process entry from the manager. It also cleans up any network approval registration tied to that entry.
 
-**Data flow**: Locks `process_store`, removes the process by ID via `store.remove(process_id)`, drops the lock, and if an entry was removed awaits `unregister_network_approval_for_entry(&entry)`.
+**Data flow**: It receives a process ID, locks the store, removes that ID if present, then unregisters network approval for the removed entry. It returns nothing.
 
-**Call relations**: Used by `exec_command` and `write_stdin` on failure or final completion paths to ensure both the ID reservation and any approval registration are cleaned up.
+**Call relations**: exec_command and write_stdin call this when a process fails, exits, or should no longer be tracked. It delegates network approval cleanup to unregister_network_approval_for_entry.
 
 *Call graph*: calls 1 internal fn (unregister_network_approval_for_entry); called by 2 (exec_command, write_stdin).
 
@@ -1017,11 +1025,11 @@ async fn exec_command(
     ) -> Result<ExecCommandToolOutput, UnifiedExecError>
 ```
 
-**Purpose**: Launches a command under unified exec, emits startup events, optionally stores it as a background process, collects initial output until the requested yield deadline, and returns the first tool response or an error.
+**Purpose**: Starts a new command and returns the first chunk of its output. If the command keeps running, it stores the process so later calls can poll it or write input.
 
-**Data flow**: Consumes an `ExecCommandRequest` and `UnifiedExecContext`. It calls `open_session_with_sandbox`; on success wraps the process in `Arc`, optionally installs `terminate_process_on_network_denial`, creates a transcript buffer, emits a begin event, and starts live output streaming. If the process appears still alive, it stores a `ProcessEntry` plus an `InitialExecCommandGuard`. It then computes a bounded yield time, obtains `OutputHandles`, and calls `collect_output_until_deadline` to drain buffered output until deadline/exit/closure. The collected bytes are converted to text, token-counted, and packaged into `ExecCommandToolOutput`. Before returning, it checks deferred network denial, process failure, refreshed process status, post-exit network approval completion, sandbox denial, and whether to emit an immediate end event for short-lived commands. It may release the process ID and return errors on any of those branches.
+**Data flow**: It receives an ExecCommandRequest and execution context. It opens the command through sandbox and approval machinery, emits a begin event, starts output streaming, waits up to the requested yield time, checks for failure or network denial, records or releases the process as needed, and returns an ExecCommandToolOutput containing output, timing, process ID, and exit code.
 
-**Call relations**: This is the main unified-exec startup path. It orchestrates launch (`open_session_with_sandbox`), event emission (`start_streaming_output`, begin/end helpers), process persistence (`store_process`), output polling (`collect_output_until_deadline`), and cleanup/error conversion (`release_process_id`, network-approval finishers, sandbox checks).
+**Call relations**: This is the main new-command path. It calls open_session_with_sandbox to start the process, store_process for long-running commands, collect_output_until_deadline to gather output, refresh_process_state to see if the process is alive, and the event/network helpers to report success or failure.
 
 *Call graph*: calls 18 internal fn (unified_exec, new, emit_exec_end_for_unified_exec, start_streaming_output, clamp_yield_time, process_failed, generate_chunk_id, default, open_session_with_sandbox, refresh_process_state (+8 more)); 10 external calls (clone, downgrade, new, new, from_millis, now, collect_output_until_deadline, from_utf8_lossy, approx_token_count, new).
 
@@ -1035,11 +1043,11 @@ async fn write_stdin(
     ) -> Result<ExecCommandToolOutput, UnifiedExecError>
 ```
 
-**Purpose**: Handles follow-up interaction with a stored process: optional stdin write or interrupt, bounded output polling, exit-state refresh, and final response construction.
+**Purpose**: Sends input to an existing background terminal or polls it for more output. This is how an interactive command can continue after the first exec_command response.
 
-**Data flow**: Takes `WriteStdinRequest`, loads `PreparedProcessHandles` via `prepare_process_handles`, and optionally writes input. For non-TTY processes only the interrupt control character is accepted; other input yields `StdinClosed`. For TTY writes it awaits `process.write`, sleeping briefly after success to capture responsive output, and on write failure may refresh state or terminate/release the process depending on the error. It then computes a polling deadline based on empty-vs-nonempty input rules, calls `collect_output_until_deadline`, converts bytes to text, token-counts, checks network denial and process failure, refreshes process status, finishes network approval for exited entries, and returns `ExecCommandToolOutput` with the appropriate `process_id`, `exit_code`, and `event_call_id`.
+**Data flow**: It receives a WriteStdinRequest with a process ID, input text, timing, and output limits. It looks up the stored process, writes input when allowed, waits for output until a deadline, checks network and failure state, refreshes whether the process is alive or exited, and returns an ExecCommandToolOutput.
 
-**Call relations**: Invoked for subsequent polls and interactive writes after `exec_command` has stored a live process. It depends on `prepare_process_handles` and `refresh_process_state` to bridge from stored entries back to the per-process runtime.
+**Call relations**: This is the follow-up path after exec_command has stored a live process. It calls prepare_process_handles to borrow the needed process data, collect_output_until_deadline to gather output, refresh_process_state to update lifecycle state, and cleanup helpers when the process fails or exits.
 
 *Call graph*: calls 9 internal fn (process_failed, generate_chunk_id, prepare_process_handles, refresh_process_state, release_process_id, fail_process_with_message, finish_deferred_network_approval_for_session, finish_network_approval_after_process_exit_for_entry, network_denial_message_for_session); 7 external calls (from_millis, now, collect_output_until_deadline, from_utf8_lossy, approx_token_count, matches!, sleep).
 
@@ -1050,11 +1058,11 @@ async fn write_stdin(
 async fn refresh_process_state(&self, process_id: i32) -> ProcessStatus
 ```
 
-**Purpose**: Reconciles a stored process entry with its current runtime state and removes it from the store if it has exited.
+**Purpose**: Checks whether a stored process is still running, has exited, or is unknown. If it has exited, it removes the entry from the store.
 
-**Data flow**: Locks `process_store`, looks up the entry by ID, reads `entry.process.exit_code()` and `entry.process.has_exited()`. If absent, returns `ProcessStatus::Unknown`. If exited, removes the entry from the store and returns `ProcessStatus::Exited { exit_code, entry }`; otherwise returns `ProcessStatus::Alive { exit_code, call_id, process_id }`.
+**Data flow**: It receives a process ID, locks the process store, finds the entry, reads its exit code and exited flag, and returns Alive, Exited with the removed entry, or Unknown.
 
-**Call relations**: Used by both `exec_command` and `write_stdin` after polling or write attempts to decide whether the process remains interactive or has transitioned into final cleanup.
+**Call relations**: exec_command uses this after the first output wait for a newly stored process. write_stdin uses it after writing or polling to decide whether the returned output should still include a process ID.
 
 *Call graph*: called by 2 (exec_command, write_stdin); 1 external calls (new).
 
@@ -1068,11 +1076,11 @@ async fn prepare_process_handles(
     ) -> Result<PreparedProcessHandles, UnifiedExecError>
 ```
 
-**Purpose**: Extracts the live process and all shared polling-related handles from a stored process entry while updating its last-used timestamp.
+**Purpose**: Collects all the pieces needed to poll or write to a stored process. It updates the process’s last-used time so pruning knows it is active.
 
-**Data flow**: Locks `process_store`, finds the mutable `ProcessEntry` by ID or returns `UnknownProcessId`, sets `entry.last_used = Instant::now()`, obtains `OutputHandles` from `entry.process`, upgrades the weak session reference, subscribes to pause state if a session exists, clones the process and metadata fields, and returns a `PreparedProcessHandles` struct.
+**Data flow**: It receives a process ID, locks the store, finds the entry, updates last_used, clones the process and output handles, upgrades the session reference if possible, and returns a PreparedProcessHandles bundle.
 
-**Call relations**: Called by `write_stdin` before any interaction so polling can proceed without holding the store lock and pruning recency reflects active use.
+**Call relations**: write_stdin calls this at the start of every follow-up interaction. The returned handles let write_stdin work without keeping the store lock while waiting on output or writing input.
 
 *Call graph*: called by 1 (write_stdin); 2 external calls (clone, now).
 
@@ -1089,11 +1097,11 @@ async fn store_process(
         cwd: AbsolutePa
 ```
 
-**Purpose**: Persists a newly started live process in the manager store, prunes an older entry if capacity is exceeded, and starts the background exit watcher for event emission.
+**Purpose**: Saves a still-running process in the manager so it can be used later. It also starts a watcher that will emit the final end event when the process exits.
 
-**Data flow**: Builds a `ProcessEntry` from the supplied process, context metadata, cwd, timestamps, TTY flag, deferred network approval, weak session reference, and initial-command-active flag. While holding `process_store`, it calls `prune_processes_if_needed`, inserts the new entry, and captures any pruned entry. After releasing the lock, it unregisters network approval and terminates the pruned process if one existed, then calls `spawn_exit_watcher` with the new process and transcript.
+**Data flow**: It receives the process, context, command metadata, working directory, start time, process ID, terminal mode, network approval, transcript, and startup-active flag. It creates a ProcessEntry, prunes one old process if the store is full, inserts the new entry, terminates any pruned process, and starts the exit watcher.
 
-**Call relations**: Called only from `exec_command` for processes that survive the initial startup window. It is the handoff point from startup orchestration to background lifecycle management.
+**Call relations**: exec_command calls this when the initial command is still alive. It uses prune_processes_if_needed to make room, unregister_network_approval_for_entry if something was pruned, and spawn_exit_watcher so completion is reported later.
 
 *Call graph*: calls 2 internal fn (spawn_exit_watcher, unregister_network_approval_for_entry); called by 1 (exec_command); 4 external calls (clone, downgrade, prune_processes_if_needed, clone).
 
@@ -1110,11 +1118,11 @@ async fn open_session_with_exec_env(
         environment: &
 ```
 
-**Purpose**: Launches a process using the already-prepared execution environment, selecting the correct backend for Windows sandboxing, remote exec-server execution, or local PTY/pipe spawning.
+**Purpose**: Actually starts a process in the selected execution environment. Depending on the platform and environment, that may mean a Windows sandbox, a remote exec server, a local terminal, or a local pipe-based process.
 
-**Data flow**: Takes a process ID, `ExecRequest`, TTY flag, mutable `SpawnLifecycleHandle`, and exec `Environment`. It first reads inherited FDs from the lifecycle. On Windows restricted-token sandbox builds, it resolves `codex_home`, derives filesystem override settings, calls the appropriate Windows sandbox spawn helper based on `windows_sandbox_level`, runs `after_spawn()`, and wraps the result with `UnifiedExecProcess::from_spawned`. If the environment is remote, it rejects inherited FDs, starts the exec backend with `exec_server_params_for_request`, runs `after_spawn()`, and returns `from_exec_server_started`. Otherwise it splits `request.command` into program/args, spawns either a PTY process or a no-stdin pipe process with inherited FDs, runs `after_spawn()`, and returns `from_spawned`. Spawn/setup failures are mapped into `UnifiedExecError::create_process`.
+**Data flow**: It receives a process ID, ExecRequest, terminal flag, spawn lifecycle handle, and environment. It gathers inherited file descriptors, chooses the right backend, starts the process, marks the spawn lifecycle as completed, and wraps the result as a UnifiedExecProcess.
 
-**Call relations**: Called by the unified-exec runtime during sandbox/orchestrator execution. It is the backend-selection layer that bridges high-level exec requests to concrete process creation.
+**Call relations**: The unified exec runtime uses this when the orchestrator has approved and prepared a command. It calls exec_server_params_for_request for remote execution, platform sandbox helpers on Windows, or local spawn helpers otherwise.
 
 *Call graph*: calls 10 internal fn (find_codex_home, create_process, from_exec_server_started, from_spawned, exec_server_params_for_request, get_exec_backend, is_remote, spawn_process_no_stdin_with_inherited_fds, default, spawn_process_with_inherited_fds); 4 external calls (after_spawn, inherited_fds, spawn_windows_sandbox_session_elevated_for_permission_profile, spawn_windows_sandbox_session_legacy).
 
@@ -1130,11 +1138,11 @@ async fn open_session_with_sandbox(
     ) -> Result<(UnifiedExecProcess, Option
 ```
 
-**Purpose**: Builds the full sandboxed unified-exec tool request, runs it through the tool orchestrator/runtime, and converts the result into a started process plus optional deferred network approval.
+**Purpose**: Prepares a command for sandboxing, approval, environment setup, and eventual process startup. This is the policy-heavy doorway before a command is allowed to run.
 
-**Data flow**: Reads turn shell-environment policy to create `local_policy_env` via `create_env`, injects `CODEX_THREAD_ID_ENV_VAR`, applies unified-exec defaults, builds `ExecServerEnvConfig`, constructs a `ToolOrchestrator`, `UnifiedExecRuntime`, and exec approval requirement from session policy services, then assembles `UnifiedExecToolRequest` with command, cwd, env, sandbox/network/permission settings, and justification. It wraps session/turn/call metadata in `ToolCtx`, awaits `orchestrator.run(...)`, and on success returns `(result.output, result.deferred_network_approval)`. Tool errors are mapped either to `UnifiedExecError::sandbox_denied` when the orchestrator reports sandbox denial with output, or to `UnifiedExecError::create_process` otherwise.
+**Data flow**: It receives the high-level exec command request, working directory, and context. It builds environment variables, creates exec approval requirements, packages a UnifiedExecToolRequest, runs the tool orchestrator, and returns the started process plus any deferred network approval; sandbox denials are converted into unified exec errors.
 
-**Call relations**: Called at the start of `exec_command`. It delegates actual policy enforcement and sandbox/runtime setup to the tool orchestration subsystem, then normalizes the outcome for unified-exec management.
+**Call relations**: exec_command calls this before any process exists. It uses create_env, apply_unified_exec_env, exec_env_policy_from_shell_policy, ToolOrchestrator, and UnifiedExecRuntime to connect policy decisions to actual process creation.
 
 *Call graph*: calls 6 internal fn (create_env, new, new, apply_unified_exec_env, exec_env_policy_from_shell_policy, plain); called by 1 (exec_command).
 
@@ -1149,11 +1157,11 @@ async fn collect_output_until_deadline(
         output_closed_notify: &Arc<Notify>,
 ```
 
-**Purpose**: Drains buffered process output until a deadline, process exit/closure, or pause-aware timeout, returning the collected bytes in order.
+**Purpose**: Collects process output until either new output stops, the process closes, or the time limit expires. It is careful not to count user-facing pause time against the deadline.
 
-**Data flow**: Takes shared output buffer/notifiers, output-closed flags, a cancellation token, optional pause-state receiver, and a deadline. It repeatedly extends deadlines while paused, drains chunks from `HeadTailBuffer`, and appends them into a `Vec<u8>`. If no chunks are available, it waits on output arrival, process cancellation, output closure, timeout, or pause-state change. After exit is observed, it allows a short additional wait—capped by `POST_EXIT_CLOSE_WAIT_CAP`—for trailing output or closure before breaking. It returns the accumulated bytes.
+**Data flow**: It receives the shared output buffer, notification objects, close flags, process cancellation token, optional pause-state receiver, and deadline. It repeatedly drains available chunks, waits for more output or process exit, extends deadlines while paused, and returns all collected bytes.
 
-**Call relations**: Used by both `exec_command` and `write_stdin` as the common polling primitive. It relies on `extend_deadlines_while_paused` and `wait_for_pause_change` to avoid charging paused time against the caller’s yield window.
+**Call relations**: exec_command uses this to build the first tool response, and write_stdin uses it for later polls or input responses. It calls extend_deadlines_while_paused and wait_for_pause_change to cooperate with out-of-band pauses.
 
 *Call graph*: 10 external calls (cancelled, is_cancelled, from_millis, now, saturating_duration_since, lock, extend_deadlines_while_paused, with_capacity, pin!, select!).
 
@@ -1168,11 +1176,11 @@ async fn extend_deadlines_while_paused(
     )
 ```
 
-**Purpose**: Suspends deadline accounting while the session’s out-of-band elicitation pause flag remains true.
+**Purpose**: Moves output collection deadlines forward while the session is paused. This prevents a pause in the conversation from unfairly consuming the command’s output wait time.
 
-**Data flow**: Takes mutable references to an optional pause-state receiver, the main deadline, and optional post-exit deadline. If no receiver exists or the current value is false, it returns immediately. Otherwise it records `paused_at = Instant::now()`, waits until the receiver changes to false or closes, computes `paused_for = paused_at.elapsed()`, and adds that duration to both deadlines.
+**Data flow**: It receives an optional pause-state receiver, the main deadline, and an optional post-exit deadline. If paused, it waits until the pause ends, measures how long it lasted, and adds that duration to the deadlines.
 
-**Call relations**: Called inside `collect_output_until_deadline` before each polling iteration so pauses do not prematurely end output collection.
+**Call relations**: collect_output_until_deadline calls this at the top of each loop. It keeps the output collector’s timing fair when the session has temporarily paused for another interaction.
 
 *Call graph*: 1 external calls (now).
 
@@ -1183,11 +1191,11 @@ async fn extend_deadlines_while_paused(
 async fn wait_for_pause_change(pause_state: Option<&watch::Receiver<bool>>)
 ```
 
-**Purpose**: Provides a future that resolves when pause state changes, or never resolves if no pause receiver exists.
+**Purpose**: Waits until the pause state changes, or waits forever if there is no pause state to watch. It is used as one branch in output-waiting races.
 
-**Data flow**: If given `Some(&watch::Receiver<bool>)`, clones it and awaits `changed()`. If `None`, awaits `std::future::pending::<()>()` forever.
+**Data flow**: It receives an optional pause-state receiver. With a receiver, it waits for a change notification; without one, it returns a pending future that never completes on its own.
 
-**Call relations**: Used in `collect_output_until_deadline` select loops so pause transitions can wake the collector and trigger deadline extension.
+**Call relations**: collect_output_until_deadline includes this while waiting for output, exit, or timeout. That lets the collector wake up promptly when a pause begins or ends.
 
 
 ##### `UnifiedExecProcessManager::prune_processes_if_needed`  (lines 1241–1257)
@@ -1196,11 +1204,11 @@ async fn wait_for_pause_change(pause_state: Option<&watch::Receiver<bool>>)
 fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry>
 ```
 
-**Purpose**: Enforces the maximum number of stored unified-exec processes by selecting and removing one entry when capacity is reached.
+**Purpose**: Makes room in the process store when too many background processes are tracked. It removes at most one entry.
 
-**Data flow**: Reads `store.processes.len()`. If below `MAX_UNIFIED_EXEC_PROCESSES`, returns `None`. Otherwise it builds metadata tuples `(process_id, last_used, has_exited)` for all entries, asks `process_id_to_prune_from_meta` for a candidate, removes that process from the store if one is chosen, and returns the removed `ProcessEntry`.
+**Data flow**: It receives the mutable process store. If the store is below the maximum size, it returns nothing; otherwise it builds simple metadata, asks which process ID should be pruned, removes that entry, and returns it.
 
-**Call relations**: Called from `store_process` while holding the process-store lock, before inserting a new live process.
+**Call relations**: store_process calls this before inserting a new long-running process. The caller then performs async cleanup and termination outside the store lock.
 
 *Call graph*: calls 1 internal fn (remove); 1 external calls (process_id_to_prune_from_meta).
 
@@ -1211,11 +1219,11 @@ fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry>
 fn process_id_to_prune_from_meta(meta: &[(i32, Instant, bool)]) -> Option<i32>
 ```
 
-**Purpose**: Implements the pruning policy: protect the 8 most recently used processes, prefer exited processes outside that protected set, otherwise fall back to least-recently-used outside the protected set.
+**Purpose**: Chooses which process should be removed when the store is full. It protects the most recently used processes and prefers removing an already exited one.
 
-**Data flow**: Takes a slice of `(i32, Instant, bool)` metadata. If empty, returns `None`. Otherwise it clones and sorts one copy by reverse recency to build a `HashSet` of the 8 protected process IDs, clones and sorts another copy by ascending recency, then first searches for the oldest exited unprotected process and returns its ID if found; failing that, returns the oldest unprotected process ID.
+**Data flow**: It receives a list of process IDs with last-used times and exited flags. It sorts by recency, protects the newest eight, then returns the oldest unprotected exited process if possible, otherwise the oldest unprotected process.
 
-**Call relations**: Used only by `prune_processes_if_needed`, but isolated so tests can validate pruning behavior directly.
+**Call relations**: prune_processes_if_needed calls this with a lightweight snapshot of the store. Keeping this policy separate makes the pruning rule easy to understand and change.
 
 *Call graph*: 2 external calls (is_empty, to_vec).
 
@@ -1226,11 +1234,11 @@ fn process_id_to_prune_from_meta(meta: &[(i32, Instant, bool)]) -> Option<i32>
 async fn terminate_all_processes(&self)
 ```
 
-**Purpose**: Stops every stored unified-exec process and clears all process IDs from the manager.
+**Purpose**: Stops and forgets every stored background process. This is used for broad cleanup, such as shutting down a session or manager.
 
-**Data flow**: Locks `process_store`, drains all `ProcessEntry` values from `processes`, clears `reserved_process_ids`, drops the lock, then for each entry awaits `unregister_network_approval_for_entry(&entry)` and calls `entry.process.terminate()`.
+**Data flow**: It locks the store, drains all process entries, clears reserved IDs, then for each entry unregisters network approval and terminates the process. It returns nothing.
 
-**Call relations**: Used during broader shutdown or reset flows to tear down all background unified-exec sessions.
+**Call relations**: This is a manager-level teardown path. It uses unregister_network_approval_for_entry for each removed entry before telling the process to terminate.
 
 *Call graph*: calls 1 internal fn (unregister_network_approval_for_entry).
 
@@ -1241,11 +1249,11 @@ async fn terminate_all_processes(&self)
 async fn list_processes(&self) -> Vec<BackgroundTerminalInfo>
 ```
 
-**Purpose**: Returns metadata for currently live background terminal processes.
+**Purpose**: Returns a user-facing list of live background terminals. This lets other parts of the system show which commands are still running.
 
-**Data flow**: Locks `process_store`, filters entries whose `process.has_exited()` is false, sorts them by `process_id`, maps each to `BackgroundTerminalInfo { item_id, process_id, command, cwd }`, and returns the resulting vector.
+**Data flow**: It locks the process store, filters out exited processes, sorts the remaining entries by process ID, and converts each into BackgroundTerminalInfo with item ID, process ID, command, and working directory.
 
-**Call relations**: Provides read-only inspection of active background sessions for UI or API surfaces that need to enumerate them.
+**Call relations**: This is a read-only view over the process store. It does not call other project helpers; it simply translates stored process entries into the shape used by the background-terminal listing.
 
 
 ##### `UnifiedExecProcessManager::terminate_process`  (lines 1325–1357)
@@ -1254,24 +1262,24 @@ async fn list_processes(&self) -> Vec<BackgroundTerminalInfo>
 async fn terminate_process(&self, process_id: i32) -> bool
 ```
 
-**Purpose**: Terminates one stored process by ID, then removes it from the store if it is still the same process and not protected by an active initial exec-command call.
+**Purpose**: Stops one specific stored process and removes it from tracking when it is safe to do so. It avoids racing with a process that is still in its initial exec_command response.
 
-**Data flow**: First locks the store to fetch and clone the target `Arc<UnifiedExecProcess>` plus whether it already exited; if absent returns `false`. If still running, awaits `process.terminate_confirmed()` and returns `false` on failure. It then re-locks the store, re-fetches the entry, returns success if the entry disappeared or points to a different `Arc`, skips removal if `initial_exec_command_active` is still true, otherwise removes the entry. After unlocking, it unregisters network approval for the removed entry and returns `true`.
+**Data flow**: It receives a process ID, finds and clones the process, asks it to terminate if needed, then rechecks the store to ensure the same process is still there. If the initial command is still active it leaves the entry in place; otherwise it removes the entry, unregisters network approval, and returns true for success.
 
-**Call relations**: Used for explicit user-initiated termination of a background process. The double-check with `Arc::ptr_eq` and the initial-command-active guard prevents races with process replacement or startup bookkeeping.
+**Call relations**: This is the targeted cleanup path for one process. It uses pointer equality to avoid removing a different process that reused state, and calls unregister_network_approval_for_entry after removal.
 
 *Call graph*: calls 1 internal fn (unregister_network_approval_for_entry); 2 external calls (clone, ptr_eq).
 
 
 ### `core/src/tools/handlers/unified_exec/write_stdin.rs`
 
-`io_transport` · `interactive command continuation / polling`
+`io_transport` · `request handling during an existing terminal execution session`
 
-This file defines the lightweight transport side of unified exec after a process has already been started. `WriteStdinArgs` deserializes the model-facing request shape: `session_id` (the process id, intentionally named for model familiarity), optional `chars`, optional `max_output_tokens`, and a `yield_time_ms` default supplied by the shared unified-exec module.
+Some commands do not finish after one request. They may ask for input, keep printing output, or run in the background. This file is the bridge that lets the tool system talk to one of those existing command sessions. In everyday terms, if an earlier tool call opened a terminal, this file is the part that lets the model type more keys into it.
 
-`WriteStdinHandler` implements `ToolExecutor<ToolInvocation>` with the fixed tool name `write_stdin`, a schema from `create_write_stdin_tool`, and an async `handle_call` wrapper. The execution path is intentionally narrow: it rejects non-function payloads, parses `WriteStdinArgs`, and forwards them to `session.services.unified_exec_manager.write_stdin` as a `WriteStdinRequest` carrying the process id, stdin bytes, polling interval, output cap, and the turn's truncation policy.
+The handler accepts a function-style tool call named `write_stdin`. It reads the requested process identifier, the characters to send, how long to wait for new output, and any output-size limit. It then asks the shared `unified_exec_manager` to write those characters to the running process and collect the response.
 
-A subtle but important branch controls UI event emission. Empty `chars` means a background poll rather than a real keystroke submission, so the handler only emits `EventMsg::TerminalInteraction` if the response still reports a live `process_id`; otherwise the poll completed the process and should stay invisible. Non-empty stdin always emits an interaction event, even if the write causes the process to exit before the response returns. For completed sessions, post-hook generation is delegated to the same helper used by `exec_command`, allowing a final `write_stdin` poll to produce the Bash post-hook for the original command.
+There is one important distinction: sending an empty string is treated as a background poll, not as a visible user action. A poll just asks, “has the command produced anything new yet?” Because of that, the file only sends a terminal interaction event to the user interface when real input was typed, or when the process is still alive and the UI may need to keep waiting. Finally, it wraps the execution response so the rest of the tool framework can return it to the model. It also deliberately skips the usual “before tool use” hook because this is a continuation of an earlier command, not a brand-new command.
 
 #### Function details
 
@@ -1281,11 +1289,11 @@ A subtle but important branch controls UI event emission. Empty `chars` means a 
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the registered tool name for stdin continuation requests.
+**Purpose**: Returns the public name of this tool: `write_stdin`. The tool registry uses this name to match an incoming tool call to this handler.
 
-**Data flow**: It takes no inputs and returns `ToolName::plain("write_stdin")`.
+**Data flow**: It takes the handler itself as input, does not read any request data, and creates a plain tool name value containing `write_stdin`. The result is handed back to the tool framework.
 
-**Call relations**: The tool registry uses this identifier when exposing and dispatching the handler. It is the stable external name paired with the schema from `spec()`.
+**Call relations**: When the tool system is cataloging or dispatching tools, it asks this handler for its name. This function relies on the shared `plain` constructor to make the name in the standard format used by the rest of the registry.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -1296,11 +1304,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the model-facing schema for the `write_stdin` tool.
+**Purpose**: Provides the formal description of the `write_stdin` tool, such as what arguments it accepts. This is what tells the model and tool framework how the tool should be called.
 
-**Data flow**: It reads no handler state and simply returns the `ToolSpec` produced by `create_write_stdin_tool()`.
+**Data flow**: It receives no request-specific data. It calls the helper that builds the write-stdin tool specification, then returns that specification to the registry.
 
-**Call relations**: Called during tool registration. The schema helper encapsulates the JSON parameter definition so this handler stays focused on runtime behavior.
+**Call relations**: During tool setup or advertisement, the framework asks this handler for its spec. This function delegates the actual spec-building to `create_write_stdin_tool`, keeping this handler focused on runtime behavior.
 
 *Call graph*: calls 1 internal fn (create_write_stdin_tool).
 
@@ -1311,11 +1319,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async stdin-write implementation into the trait-required future type.
+**Purpose**: Starts processing one incoming `write_stdin` invocation. It turns the real async work into the future shape expected by the tool framework.
 
-**Data flow**: It consumes a `ToolInvocation`, calls `self.handle_call(invocation)`, pins the future, and returns it.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, current turn, and raw tool payload. It passes that invocation into `handle_call`, boxes and pins the resulting asynchronous task, and returns it so the framework can await it later.
 
-**Call relations**: The tool framework invokes this trait method at runtime. It is a thin adapter around `handle_call`.
+**Call relations**: The tool framework calls this when a `write_stdin` request arrives. This function is a small adapter: it hands the actual work to `WriteStdinHandler::handle_call` and uses `pin` so the async operation can be stored and driven by the generic executor.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1329,11 +1337,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Processes a `write_stdin` request by parsing arguments, forwarding them to the unified exec manager, optionally emitting a terminal interaction event, and returning the resulting exec output.
+**Purpose**: Does the real work of a `write_stdin` call: validates the request, writes input to the running process, optionally reports the terminal interaction to the UI, and returns the process output.
 
-**Data flow**: It consumes a `ToolInvocation`, extracting `session`, `turn`, and `payload`. Non-function payloads become `FunctionCallError::RespondToModel`. For function payloads it parses `WriteStdinArgs`, then calls `session.services.unified_exec_manager.write_stdin` with `WriteStdinRequest { process_id: args.session_id, input: &args.chars, yield_time_ms, max_output_tokens, truncation_policy: turn.truncation_policy }`. Manager errors are mapped into model-facing strings. After a successful response, it conditionally emits `EventMsg::TerminalInteraction` using either the returned live `process_id` or the original `session_id`, then boxes and returns the response as tool output.
+**Data flow**: It starts with a tool invocation containing the current session, turn settings, and payload. It first checks that the payload is a function-call payload; if not, it returns an error message for the model. It parses the JSON-like arguments into `WriteStdinArgs`, then sends the process id, input characters, wait time, output limit, and truncation policy to the unified execution manager. If that manager reports an error, the error is converted into a model-facing failure. If the write or poll succeeds, the function may emit a terminal interaction event: real typed input is shown, while empty polling is shown only if there is still a live process to wait on. Finally, it wraps the execution response as standard tool output.
 
-**Call relations**: This is called only by `handle`. It delegates actual process interaction to the unified exec manager and event publication to `session.send_event`; the conditional event branch distinguishes visible user input from invisible background polling.
+**Call relations**: This is called by `WriteStdinHandler::handle` whenever the framework dispatches this tool. It uses `parse_arguments` to turn raw tool arguments into typed values, calls into the session’s `unified_exec_manager` to interact with the process, builds a `TerminalInteractionEvent` when the UI should know about the interaction, and uses `boxed_tool_output` so the response fits the common tool-output interface. If the payload is unsupported or the write fails, it creates a `RespondToModel` error so the model gets a clear explanation.
 
 *Call graph*: calls 2 internal fn (boxed_tool_output, parse_arguments); called by 1 (handle); 2 external calls (TerminalInteraction, RespondToModel).
 
@@ -1344,11 +1352,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this runtime only applies to function-call payloads.
+**Purpose**: Answers whether this handler can accept the given kind of tool payload. For this handler, only function-call payloads are valid.
 
-**Data flow**: It inspects a `&ToolPayload` and returns `true` only for `ToolPayload::Function { .. }`.
+**Data flow**: It receives a payload description, checks whether it is the `Function` variant, and returns true or false. It does not change anything.
 
-**Call relations**: The core runtime uses this to gate hook-related behavior. It matches the payload assumption enforced in `handle_call`.
+**Call relations**: The runtime can call this before dispatching a tool request. This function uses a simple pattern check so `write_stdin` is only used for normal function-style tool calls, matching what `handle_call` expects to parse.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1359,11 +1367,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload>
 ```
 
-**Purpose**: Suppresses pre-hook emission for stdin writes and polls.
+**Purpose**: Deliberately returns no “before tool use” notification for `write_stdin`. This avoids treating continued input to an existing command as if it were a brand-new shell command.
 
-**Data flow**: It ignores the `ToolInvocation` and always returns `None`.
+**Data flow**: It receives the invocation but does not inspect it. It always returns `None`, meaning there is no pre-tool-use payload to emit.
 
-**Call relations**: The hook runtime calls this before tool execution, but `write_stdin` intentionally emits no pre-hook because it is transport for an already-started Bash command. The inline comments explain that empty writes are polls and non-empty writes continue a command that already emitted its pre-hook.
+**Call relations**: The core runtime asks handlers whether they want to emit a pre-use hook before execution. Here the answer is always no because the original command already produced the relevant pre-use event, and empty writes may only be background polls.
 
 
 ##### `WriteStdinHandler::post_tool_use_payload`  (lines 117–125)
@@ -1376,11 +1384,11 @@ fn post_tool_use_payload(
     ) -> Option<PostToolUsePayload>
 ```
 
-**Purpose**: Emits a Bash post-hook payload when a `write_stdin` call observes final completion of the underlying exec session.
+**Purpose**: Creates an after-tool-use notification when a `write_stdin` call observes that the original command has completed. This lets the system close out the earlier command properly, even if completion is noticed during a later poll or input write.
 
-**Data flow**: It takes the original `ToolInvocation` and resulting `ToolOutput`, passes them to `post_unified_exec_tool_use_payload`, and returns the helper's optional payload.
+**Data flow**: It receives the original invocation and the produced tool output. It passes both to the shared helper for unified execution post-use payloads, then returns whatever post-use payload that helper decides is appropriate.
 
-**Call relations**: The hook runtime invokes this after each stdin write or poll. By delegating to the shared helper, it can reuse the original exec call id and command metadata embedded in the output when a poll discovers that the process has finished.
+**Call relations**: After the tool finishes, the runtime calls this hook. This function delegates to `post_unified_exec_tool_use_payload`, because the logic for matching a `write_stdin` result back to the original command is shared with the rest of the unified execution tooling.
 
 *Call graph*: 1 external calls (post_unified_exec_tool_use_payload).
 
@@ -1390,13 +1398,15 @@ These files establish the exec-server process contract and then provide local an
 
 ### `exec-server/src/process.rs`
 
-`domain_logic` · `cross-cutting`
+`domain_logic` · `process lifetime`
 
-This file models executor-managed processes and the two ways clients observe them: retained reads and pushed events. `ExecProcessEvent` is the event enum for streamed output and lifecycle changes, with `Output(ProcessOutputChunk)`, sequenced `Exited` and `Closed` markers, and unsequenced `Failed(String)` for client-synthesized session failures. The helper methods on the enum expose the event sequence number when one exists and compute how many bytes the event contributes to replay retention.
+This file is the “process handle” layer of the exec server. It says what every runnable process must be able to do: tell callers its id, accept input, produce output, receive signals, terminate, and let callers follow events as they happen. Without this shared contract, each backend would need custom code for reading output or stopping a process.
 
-`ExecProcessEventLog` is the concrete replay/live fan-out mechanism. Internally it stores a mutex-protected `VecDeque<ExecProcessEvent>` plus a retained-byte counter, and a Tokio `broadcast::Sender` for live subscribers. `publish` clones the event into history, increments retained bytes, and evicts oldest events until both the configured event-count and byte-count capacities are satisfied; output chunks and failure strings count toward bytes, while exit/close markers do not. It then broadcasts the event live, intentionally ignoring send errors when no receivers are present. `subscribe` snapshots the current history into a replay queue and pairs it with a fresh broadcast receiver.
+A key part is `ExecProcessEvent`, which represents things that happen during a process run: bytes are printed, the process exits, output streams close, or the session fails. The file supports two ways to observe a process. One is polling retained output with `read`, like asking “what happened after this point?” The other is subscribing to pushed events, like listening to a live radio feed.
 
-`ExecProcessEventReceiver` first drains replayed events, then awaits live ones; if the bounded broadcast channel lagged, callers are expected to recover via `ExecProcess::read`. The file also defines the `ExecProcess` trait itself—process identity, wake subscription, event subscription, retained-output reads, stdin writes, signaling, and termination—and the `ExecBackend` trait for starting processes. The associated future type aliases standardize async return signatures across implementations.
+`ExecProcessEventLog` makes that live feed safer. It keeps a small replay history, so a new listener can catch up on recent events before receiving live ones. The history is bounded both by event count and by stored byte size, so huge output cannot grow memory forever. If a listener falls too far behind the live channel, the comments explain that it should recover by using `read` from the last known sequence number.
+
+The file also defines `ExecBackend`, the trait for anything that can start a process from `ExecParams` and return a `StartedExecProcess`.
 
 #### Function details
 
@@ -1406,11 +1416,11 @@ This file models executor-managed processes and the two ways clients observe the
 fn seq(&self) -> Option<u64>
 ```
 
-**Purpose**: Returns the ordering sequence number for process-owned events and `None` for synthetic failures. It distinguishes transport/session failures from events emitted by the process stream itself.
+**Purpose**: This returns the ordering number for events that came from the process itself. Callers use it to know where an event sits in the process output timeline.
 
-**Data flow**: It takes `&self` and pattern-matches the enum. For `Output`, it returns `Some(chunk.seq)`; for `Exited` and `Closed`, it returns the stored `seq`; for `Failed`, it returns `None`.
+**Data flow**: It receives one process event. If the event is output, exit, or close, it reads the event’s stored sequence number and returns it. If the event is a failure made by the client side rather than the process, it returns no number.
 
-**Call relations**: Ordering logic such as `publish_ordered_event` calls this to decide how to sequence or compare events. The method is purely interpretive and delegates nowhere.
+**Call relations**: When ordered process events are published, the publishing path asks this function for the event’s sequence number. That lets the caller treat real process events as ordered, while leaving transport or session failures outside that sequence.
 
 *Call graph*: called by 1 (publish_ordered_event).
 
@@ -1421,11 +1431,11 @@ fn seq(&self) -> Option<u64>
 fn retained_len(&self) -> usize
 ```
 
-**Purpose**: Computes how many bytes an event should count against replay retention limits. This lets the event log bound history by both event count and payload size.
+**Purpose**: This estimates how much stored space an event uses in the replay history. It exists so the event log can limit memory use when retaining recent events.
 
-**Data flow**: It takes `&self` and returns the output chunk length for `Output`, the message string length for `Failed`, and zero for `Exited` and `Closed`. It reads only the event’s in-memory fields and produces a `usize`.
+**Data flow**: It receives one event. For output, it counts the number of bytes in the output chunk. For a failure message, it counts the message length. Exit and close events count as zero because they carry no output bytes. It returns that size as a number.
 
-**Call relations**: `ExecProcessEventLog::publish` calls this when updating `retained_bytes` and when subtracting evicted events. The method encapsulates the retention accounting policy for each event variant.
+**Call relations**: The event log calls this whenever it publishes an event. The returned size is added to, or subtracted from, the replay buffer’s byte total so old events can be evicted when the buffer grows too large.
 
 *Call graph*: called by 1 (publish).
 
@@ -1436,11 +1446,11 @@ fn retained_len(&self) -> usize
 fn new(event_capacity: usize, byte_capacity: usize) -> Self
 ```
 
-**Purpose**: Constructs a new bounded event log with replay history and a live broadcast channel sized to the requested event capacity. It packages the shared state into an `Arc` so logs can be cloned cheaply.
+**Purpose**: This creates a fresh event log for one process. It sets up both the remembered event history and the live broadcast path for new events.
 
-**Data flow**: It takes `event_capacity` and `byte_capacity`, creates a Tokio broadcast channel with `event_capacity`, initializes an empty default `ExecProcessEventHistory`, stores capacities and sender in `ExecProcessEventLogInner`, wraps that in `Arc`, and returns `ExecProcessEventLog`.
+**Data flow**: It takes two limits: the maximum number of remembered events and the maximum number of retained bytes. It creates an empty history, opens a broadcast channel for live subscribers, stores the limits, and returns a shareable event log.
 
-**Call relations**: This constructor is used by process/session setup paths such as `new`, `start_process`, and `spawn_test_process`, and by the local unit test. It delegates channel creation to Tokio and establishes the shared state later used by `publish` and `subscribe`.
+**Call relations**: Process setup code calls this when a new process or test process is created. The returned log is then used by later publishing code to record events and by subscription code to give listeners replay plus live updates.
 
 *Call graph*: called by 4 (new, start_process, spawn_test_process, event_history_replay_is_bounded_by_retained_bytes); 4 external calls (new, new, channel, default).
 
@@ -1451,11 +1461,11 @@ fn new(event_capacity: usize, byte_capacity: usize) -> Self
 fn publish(&self, event: ExecProcessEvent)
 ```
 
-**Purpose**: Appends an event to replay history, evicts old history until both configured bounds are satisfied, and broadcasts the event to live subscribers. It is the single write path into the event stream.
+**Purpose**: This records a new process event and sends it to anyone currently listening. It also trims the replay history so it stays within its configured limits.
 
-**Data flow**: It takes `&self` and an owned `ExecProcessEvent`. It locks the history mutex, adds `event.retained_len()` to `retained_bytes`, pushes a clone of the event onto the back of the deque, and repeatedly pops from the front while either the event count exceeds `event_capacity` or retained bytes exceed `byte_capacity`, subtracting each evicted event’s retained length with `saturating_sub`. After updating history, it sends the original event on `live_tx`, discarding any send error.
+**Data flow**: It receives an event. First it locks the shared history, measures the event’s retained size, stores a copy at the back of the history, and then removes oldest events until both the event-count limit and byte limit are respected. After updating history, it sends the event through the live broadcast channel. It does not return a value.
 
-**Call relations**: Ordered process-event publication code such as `publish_ordered_event` invokes this after deciding an event is ready to expose. It depends on `ExecProcessEvent::retained_len` for accounting and on Tokio broadcast for live fan-out.
+**Call relations**: The ordered publishing path calls this after it has an event ready to announce. This function is the bridge between the durable short replay buffer and the live stream that subscribers receive immediately.
 
 *Call graph*: calls 1 internal fn (retained_len); called by 1 (publish_ordered_event); 1 external calls (clone).
 
@@ -1466,11 +1476,11 @@ fn publish(&self, event: ExecProcessEvent)
 fn subscribe(&self) -> ExecProcessEventReceiver
 ```
 
-**Purpose**: Creates a receiver that first replays the currently retained event history and then continues with live broadcast events. It gives new subscribers a consistent catch-up point without blocking publishers.
+**Purpose**: This creates a receiver for someone who wants to follow process events. The receiver starts with recent remembered events, then continues with live events.
 
-**Data flow**: It takes `&self`, locks the history mutex, creates a new broadcast receiver from `live_tx.subscribe()`, clones the current deque contents into a new `VecDeque`, and returns `ExecProcessEventReceiver { replay, live_rx }`.
+**Data flow**: It reads the current replay history while holding the history lock, subscribes to the live broadcast channel, copies the saved events into a private queue for the new receiver, and returns that receiver.
 
-**Call relations**: Process implementations call this from their `subscribe_events` methods to expose event streams to clients. It bridges the stored history maintained by `publish` into the consumer-facing receiver type.
+**Call relations**: Implementations of process subscription call this when a client asks to receive events. It hands back an `ExecProcessEventReceiver`, which later delivers the copied replay first and then waits on the live channel.
 
 *Call graph*: called by 2 (subscribe_events, subscribe_events).
 
@@ -1481,11 +1491,11 @@ fn subscribe(&self) -> ExecProcessEventReceiver
 fn empty() -> Self
 ```
 
-**Purpose**: Builds a receiver with no replayed events and a dummy live channel. It is a convenience for process implementations that currently have nothing to stream.
+**Purpose**: This creates a receiver that has no replayed events and no real event source. It is useful as a harmless placeholder when there is nothing to subscribe to.
 
-**Data flow**: It takes no arguments, creates a one-slot broadcast channel solely to obtain a receiver, initializes an empty `VecDeque` replay buffer, and returns `ExecProcessEventReceiver` containing both.
+**Data flow**: It creates a tiny broadcast channel, keeps only the receiving side, and pairs it with an empty replay queue. The returned receiver will not immediately produce any saved events.
 
-**Call relations**: Fallback `subscribe_events` implementations call this when they cannot provide a real event log. It avoids special-casing `Option` receivers elsewhere in the call flow.
+**Call relations**: Some `subscribe_events` implementations use this when they cannot provide a real stream. It lets callers still receive the expected receiver type without special-case setup.
 
 *Call graph*: called by 2 (subscribe_events, subscribe_events); 2 external calls (new, channel).
 
@@ -1496,11 +1506,11 @@ fn empty() -> Self
 async fn recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::RecvError>
 ```
 
-**Purpose**: Returns the next available process event, preferring replay history before switching to the live broadcast stream. It is the consumer-facing async pull API for pushed events.
+**Purpose**: This waits for the next event for a subscriber. It always delivers saved replay events before waiting for new live events.
 
-**Data flow**: It takes `&mut self`. If `self.replay.pop_front()` yields an event, it returns that immediately; otherwise it awaits `self.live_rx.recv()` and returns either the next live `ExecProcessEvent` or Tokio’s `RecvError` such as `Lagged` or `Closed`.
+**Data flow**: It first checks the receiver’s private replay queue. If an event is there, it removes and returns it. If replay is empty, it waits asynchronously on the live broadcast channel and returns the next live event or a receive error, such as falling behind the channel.
 
-**Call relations**: Higher-level message delivery code such as `receive_message` awaits this when forwarding process events to clients. It sits at the boundary between the replay snapshot created by `subscribe` and the ongoing live channel.
+**Call relations**: The message-receiving flow calls this when it needs the next process event to send onward. This function hides the two-stage behavior, so callers do not need to know whether an event came from history or from the live stream.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (receive_message); 1 external calls (pop_front).
 
@@ -1511,22 +1521,24 @@ async fn recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::RecvError
 async fn event_history_replay_is_bounded_by_retained_bytes()
 ```
 
-**Purpose**: Verifies that replay history eviction honors the retained-byte budget, even when event-count capacity would otherwise allow more events to remain. It specifically shows that a large output event can be dropped while later zero-byte lifecycle events are retained.
+**Purpose**: This test proves that the replay history respects the byte limit, not just the event-count limit. It checks that a large output event can be dropped while smaller lifecycle events remain available.
 
-**Data flow**: The test creates an `ExecProcessEventLog` with `event_capacity` 8 and `byte_capacity` 3, publishes an `Output` event containing `b"large"`, then `Exited` and `Closed` events. It subscribes, receives two replayed events via `timeout(..., events.recv())`, collects them into a vector, and asserts that only the `Exited` and `Closed` events remain in replay history.
+**Data flow**: The test creates an event log with room for several events but only three retained bytes. It publishes a large output chunk, then an exit event and a closed event. When it subscribes afterward, it reads the replayed events and verifies that only the exit and closed events are replayed.
 
-**Call relations**: This test drives `ExecProcessEventLog::new`, `publish`, `subscribe`, and `ExecProcessEventReceiver::recv` together. It documents the eviction policy that production publishers and subscribers rely on.
+**Call relations**: This test exercises `ExecProcessEventLog::new`, `publish`, `subscribe`, and receiver reads as a user would experience them. It protects the replay-buffer behavior that keeps process output from consuming unbounded memory.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, Output, vec!).
 
 
 ### `exec-server/src/local_process.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling and process lifetime`
 
-This file manages child processes launched through `codex_utils_pty`, tracks them in a `HashMap<ProcessId, ProcessEntry>`, and exposes both RPC-style methods (`exec`, `exec_read`, `exec_write`, `signal_process`, `terminate_process`) and trait-based APIs (`ExecBackend`, `ExecProcess`). A process begins as `ProcessEntry::Starting` to reserve its ID before spawn completes; on success it becomes `Running(Box<RunningProcess>)`, which stores the `ExecCommandSession`, TTY/stdin mode flags, retained output in a `VecDeque<RetainedOutputChunk>`, sequence counters, exit state, wake/event broadcasters, and closure bookkeeping.
+This file solves the practical problem of turning a remote request like “run this command in this folder” into a real operating-system process. Without it, the exec server could accept requests but would have no local engine for launching programs, collecting their output, or cleaning them up afterward.
 
-`start_process` validates `argv` and converts `cwd` from `PathUri` to a native path before launch, so non-native cwd URIs fail before any subprocess is created. Environment construction is explicit: `child_env` either uses `params.env` exactly or builds a shell-derived environment from `ExecEnvPolicy` and overlays explicit variables on top. After spawn, three tasks are launched: two `stream_output` tasks for stdout/stderr (or PTY output) and one `watch_exit` task. Output chunks are sequenced, retained up to `RETAINED_OUTPUT_BYTES_PER_PROCESS`, published to `ExecProcessEventLog`, and optionally forwarded as JSON-RPC notifications. `exec_read` supports long-polling with `wait_ms`, returning buffered chunks after `after_seq`, plus terminal state (`exited`, `closed`, `exit_code`) even when no new bytes arrive. Closure is emitted only after both output streams have ended and an exit code is known; then `maybe_emit_closed` schedules delayed eviction so late output after exit can still be observed until the stream truly closes. Tests cover cwd validation, environment policy overlay, late output retention, and post-close eviction.
+The main type, LocalProcess, owns a shared table of processes. Each process starts in a short “Starting” state, then becomes a RunningProcess with its session, recent output, exit status, event log, and wake-up tools for readers waiting on new data. Think of it like a small train station board: each train has an ID, a current state, a stream of announcements, and a cleanup time after it has finished.
+
+When a process starts, the file builds the child environment, chooses whether to run it with a terminal-like interface or simple pipes, then spawns background tasks. Two tasks read stdout and stderr output. Another waits for the exit code. Output is numbered with sequence numbers so clients can ask, “give me everything after item 12.” Only a bounded amount of output is retained to avoid unbounded memory growth. When both output streams close and the exit code is known, the process is marked closed, a notification is sent, and the record is removed after a short retention period.
 
 #### Function details
 
@@ -1536,11 +1548,11 @@ This file manages child processes launched through `codex_utils_pty`, tracks the
 fn default() -> Self
 ```
 
-**Purpose**: Creates a `LocalProcess` with a dummy notification sink that simply drains outbound messages. This gives tests and local callers a usable backend without wiring a real RPC transport.
+**Purpose**: Creates a usable local process backend when no notification channel is provided. It installs a dummy notification receiver so the rest of the code can still send notifications safely.
 
-**Data flow**: It creates an `mpsc` channel for `RpcServerOutboundMessage`, spawns a task that repeatedly receives and discards messages, wraps the sender in `RpcNotificationSender::new`, and returns `Self::new(...)`.
+**Data flow**: It starts with no inputs, creates an internal message channel, spawns a background task that simply drains messages from that channel, then returns a LocalProcess built with that sender.
 
-**Call relations**: Used by tests and default local setups. It delegates actual state initialization to `LocalProcess::new` after installing a no-op notification consumer.
+**Call relations**: Test setup and other default construction paths call this when they need a ready backend without wiring a real client. It hands the sender to LocalProcess::new, which builds the shared process table.
 
 *Call graph*: calls 1 internal fn (new); called by 5 (default_for_tests, local, closed_process_is_evicted_after_retention, exited_process_retains_late_output_past_retention, start_process_rejects_non_native_cwd_before_launch); 2 external calls (new, spawn).
 
@@ -1551,11 +1563,11 @@ fn default() -> Self
 fn new(notifications: RpcNotificationSender) -> Self
 ```
 
-**Purpose**: Constructs the process backend around a supplied notification sender. It initializes the shared process table and notification slot.
+**Purpose**: Builds a LocalProcess around a notification sender. This is used when the server wants process events, such as output or exit, to be pushed to a client.
 
-**Data flow**: It stores `Some(notifications)` inside an `RwLock`, creates an empty `HashMap<ProcessId, ProcessEntry>` inside a `tokio::sync::Mutex`, wraps both in `Inner`, then in `Arc`, and returns `LocalProcess { inner }`.
+**Data flow**: It receives a notification sender, stores it inside a shared lock, creates an empty process map protected by an asynchronous lock, and returns the new backend.
 
-**Call relations**: Called by `default` and external setup code. All later process operations share this `inner` state.
+**Call relations**: LocalProcess::default calls this with a dummy sender, while normal setup can call it with a real sender. Later functions use the stored sender through notification_sender.
 
 *Call graph*: called by 1 (new); 4 external calls (new, new, new, new).
 
@@ -1566,11 +1578,11 @@ fn new(notifications: RpcNotificationSender) -> Self
 async fn shutdown(&self)
 ```
 
-**Purpose**: Terminates all currently running processes and clears the process table. It is the backend’s coarse-grained teardown path.
+**Purpose**: Stops all currently running local processes owned by this backend. This is the cleanup path for server shutdown or test teardown.
 
-**Data flow**: It locks `inner.processes`, drains the map, filters out `Starting` entries, collects running processes, releases the lock, then iterates those processes and calls `process.session.terminate()` on each.
+**Data flow**: It locks the process table, removes every entry, keeps only entries that are already running, then asks each process session to terminate. The process table is left empty.
 
-**Call relations**: Invoked during backend shutdown. It intentionally performs termination after releasing the mutex so process teardown does not hold the shared map lock.
+**Call relations**: Higher-level shutdown code calls this when the backend is no longer needed. It does not wait for normal output handling; it directly asks remaining sessions to stop.
 
 *Call graph*: called by 1 (shutdown).
 
@@ -1581,11 +1593,11 @@ async fn shutdown(&self)
 fn set_notification_sender(&self, notifications: Option<RpcNotificationSender>)
 ```
 
-**Purpose**: Replaces or clears the outbound RPC notification sender used for process events. It allows the backend to detach from or reattach to a notification transport.
+**Purpose**: Changes where live process notifications are sent, or disables them. This is useful when the server connection changes or notifications should be muted.
 
-**Data flow**: It acquires the `RwLock` guarding `inner.notifications`, recovering from poisoning if necessary, and overwrites the stored `Option<RpcNotificationSender>` with the provided value.
+**Data flow**: It receives an optional notification sender, takes the write lock around the stored sender, and replaces the old value with the new one.
 
-**Call relations**: Higher-level orchestration calls this when connection state changes. Event-producing tasks later read the current sender through `notification_sender`.
+**Call relations**: External backend plumbing calls this to rewire outbound notifications. Later stream and lifecycle tasks read this value through notification_sender before sending updates.
 
 *Call graph*: called by 1 (set_notification_sender).
 
@@ -1599,11 +1611,11 @@ async fn start_process(
     ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError>
 ```
 
-**Purpose**: Validates execution parameters, reserves the process ID, spawns the child process, installs runtime state, and launches background tasks for output and exit tracking. It is the core process-creation routine in this file.
+**Purpose**: Starts a new operating-system process and records everything needed to interact with it later. It validates the request, launches the command, and starts background watchers for output and exit.
 
-**Data flow**: It extracts `program` and `args` from `params.argv`, errors if empty, converts `params.cwd` to a native path or returns `invalid_params`, reserves `process_id` in the process map as `Starting`, builds the child environment with `child_env`, chooses `spawn_pty_process`, `spawn_pipe_process`, or `spawn_pipe_process_no_stdin` based on `tty` and `pipe_stdin`, removes the placeholder on spawn failure, then creates `Notify`, `watch::channel`, and `ExecProcessEventLog`. It replaces the map entry with `Running(Box<RunningProcess { ... }>)`, initializes output retention state and `open_streams = 2`, spawns two `stream_output` tasks and one `watch_exit` task, and returns `(ExecResponse { process_id }, wake_tx, events)`.
+**Data flow**: It receives execution parameters, checks that the command and working folder are valid, reserves the requested process ID, builds the child environment, launches the process with either a terminal or pipes, stores the running record, then returns the process ID plus internal wake and event tools. If launch fails, it removes the temporary starting record and returns an error.
 
-**Call relations**: Both `exec` and trait-based `start` call this. It delegates environment construction to `child_env`, output ingestion to `stream_output`, and exit handling to `watch_exit`; it also uses RPC error helpers to distinguish invalid parameters, duplicate IDs, and internal spawn failures.
+**Call relations**: LocalProcess::exec uses this for JSON-RPC style requests, and LocalProcess::start uses it for the ExecBackend interface. After launch it hands output channels to stream_output and the exit channel to watch_exit so the process can be monitored in the background.
 
 *Call graph*: calls 7 internal fn (child_env, stream_output, watch_exit, new, internal_error, invalid_request, default); called by 2 (exec, start); 13 external calls (clone, new, new, new, new, spawn_pipe_process, spawn_pipe_process_no_stdin, spawn_pty_process, Running, format! (+3 more)).
 
@@ -1614,11 +1626,11 @@ async fn start_process(
 async fn exec(&self, params: ExecParams) -> Result<ExecResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Starts a process and returns only the RPC response payload. It is the JSON-RPC-facing convenience wrapper around `start_process`.
+**Purpose**: Public request-style wrapper for starting a process. It returns only the response a client needs, not the internal wake-up and event objects.
 
-**Data flow**: It forwards `params` to `start_process`, awaits the result, discards the returned wake sender and event log, and returns the `ExecResponse` or the original `JSONRPCErrorError`.
+**Data flow**: It receives execution parameters, calls start_process, discards the internal helper values, and returns the ExecResponse or the launch error.
 
-**Call relations**: RPC handlers call this when they only need the process ID response, not an `ExecProcess` object.
+**Call relations**: The JSON-RPC exec handler path calls this. It delegates all real work to start_process.
 
 *Call graph*: calls 1 internal fn (start_process); called by 1 (exec).
 
@@ -1632,11 +1644,11 @@ async fn exec_read(
     ) -> Result<ReadResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Reads retained output and terminal state for a process, optionally long-polling until new data or a deadline. It is the main read-side API for process output consumption.
+**Purpose**: Reads retained output and status for a process, optionally waiting briefly for new data. This lets clients poll without missing chunks.
 
-**Data flow**: It derives `after_seq`, `max_bytes`, and a deadline from `ReadParams`. In a loop, it locks the process map, validates the process exists and is `Running`, scans retained output chunks with `seq > after_seq`, accumulates up to `max_bytes` into `ProcessOutputChunk`s, computes `next_seq`, and builds `ReadResponse { chunks, next_seq, exited, exit_code, closed, failure: None }` plus a clone of `output_notify`. If there are chunks, the process is closed, a terminal event became newly visible, or the deadline has passed, it returns the response. Otherwise it waits on `output_notify.notified()` with `tokio::time::timeout` for the remaining duration and loops.
+**Data flow**: It receives a process ID, an optional sequence number to read after, an optional byte limit, and an optional wait time. It looks up the process, copies matching retained output chunks into a response, includes exit and closed status, and either returns immediately or waits until new output/status arrives or the deadline passes.
 
-**Call relations**: Called directly by RPC handlers and indirectly by `LocalProcess::read` and tests. It depends on `stream_output`, `watch_exit`, and `maybe_emit_closed` to populate retained chunks and terminal flags.
+**Call relations**: LocalProcess::read and test helpers call this to get process output. It relies on stream_output, watch_exit, and maybe_emit_closed to add chunks, mark exits, and wake waiting readers.
 
 *Call graph*: calls 1 internal fn (invalid_request); called by 3 (read, read_process_until_change, exec_read); 6 external calls (clone, from_millis, new, format!, now, timeout).
 
@@ -1650,11 +1662,11 @@ async fn exec_write(
     ) -> Result<WriteResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Writes input bytes to a running process’s stdin when that process was started with a writable input channel. It reports status rather than failing for common non-running cases.
+**Purpose**: Writes bytes to a running process’s standard input, when that process was started with an input channel. It reports clear statuses instead of treating every case as a hard error.
 
-**Data flow**: It inspects `params.chunk` length for metrics, locks the process map, returns `UnknownProcess` if absent, `Starting` if not yet running, or `StdinClosed` if neither `tty` nor `pipe_stdin` is enabled. Otherwise it obtains `process.session.writer_sender()`, sends the owned bytes asynchronously, maps send failure to `internal_error`, and returns `WriteResponse { status: Accepted }`.
+**Data flow**: It receives a process ID and byte chunk, looks up the process, checks whether it is running and has writable input, then sends the bytes to the process writer. It returns Accepted, Starting, UnknownProcess, or StdinClosed depending on what happened.
 
-**Call relations**: Used by RPC handlers and by `LocalProcess::write`. It relies on the session object created in `start_process` to expose the stdin writer channel.
+**Call relations**: LocalProcess::write calls this for the ExecProcess interface, and request handlers can call it directly. It uses the process session’s writer channel as the final handoff to the child process.
 
 *Call graph*: called by 2 (write, exec_write).
 
@@ -1668,11 +1680,11 @@ async fn signal_process(
     ) -> Result<SignalResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Sends a signal to a running process if it has not already exited. Missing or still-starting processes are treated as no-ops.
+**Purpose**: Sends a control signal, currently an interrupt, to a running process. This is how a client can ask a command to stop what it is doing without necessarily killing the whole backend.
 
-**Data flow**: It locks the process map, matches the target entry, returns success immediately if the process is already exited, otherwise converts the protocol `ProcessSignal` with `pty_process_signal` and calls `process.session.signal(...)`, mapping any failure to `internal_error`. It always returns `SignalResponse {}`.
+**Data flow**: It receives a process ID and signal, looks up the process, ignores missing or still-starting processes, skips already-exited processes, converts the protocol signal into the lower-level process signal, and sends it through the session.
 
-**Call relations**: Called by RPC handlers and by `LocalProcess::signal`. The only currently supported signal mapping is handled by `pty_process_signal`.
+**Call relations**: LocalProcess::signal calls this for the ExecProcess interface. It uses pty_process_signal to translate from the server protocol’s signal type to the process-launching library’s signal type.
 
 *Call graph*: calls 1 internal fn (pty_process_signal); called by 2 (signal, signal).
 
@@ -1686,11 +1698,11 @@ async fn terminate_process(
     ) -> Result<TerminateResponse, JSONRPCErrorError>
 ```
 
-**Purpose**: Requests termination of a running process and reports whether it was still running at the time of the request. It is the explicit kill/terminate API.
+**Purpose**: Asks a running process to terminate. Unlike a soft interrupt, this is the backend’s direct stop request.
 
-**Data flow**: It locks the process map, checks the target entry, returns `running: false` for missing, starting, or already-exited processes, otherwise calls `process.session.terminate()` and returns `TerminateResponse { running: true }`.
+**Data flow**: It receives a process ID, looks up the process, and if it is running and has not exited, calls terminate on its session. It returns whether there was a live process to stop.
 
-**Call relations**: Used by RPC handlers and by `LocalProcess::terminate`. Actual exit observation still happens asynchronously through `watch_exit`.
+**Call relations**: LocalProcess::terminate calls this for the ExecProcess interface. The shutdown path uses similar session termination logic for all processes at once.
 
 *Call graph*: called by 2 (terminate, terminate).
 
@@ -1701,11 +1713,11 @@ async fn terminate_process(
 fn child_env(params: &ExecParams) -> HashMap<String, String>
 ```
 
-**Purpose**: Builds the environment map for a child process, either using the explicit environment exactly or applying a shell-environment policy first and then overlaying explicit variables. It defines the backend’s environment-merging semantics.
+**Purpose**: Builds the environment variables that the child process will see. Environment variables are name-value settings like PATH that programs read from their surroundings.
 
-**Data flow**: If `params.env_policy` is `None`, it clones and returns `params.env`. Otherwise it converts the policy with `shell_environment_policy`, calls `shell_environment::create_env(&policy, None)`, extends that map with `params.env.clone()`, and returns the merged `HashMap<String, String>`.
+**Data flow**: It receives execution parameters. If there is no environment policy, it returns the exact environment map from the request. If a policy exists, it creates a base environment from that policy and then overlays the request’s explicit variables so request values win.
 
-**Call relations**: Only `start_process` calls this before spawning. Tests verify both the exact-env path and the policy-then-overlay behavior.
+**Call relations**: start_process calls this just before launching a command. It calls shell_environment_policy to convert the request’s policy shape into the shared shell-environment helper’s policy shape.
 
 *Call graph*: calls 2 internal fn (shell_environment_policy, create_env); called by 1 (start_process).
 
@@ -1716,11 +1728,11 @@ fn child_env(params: &ExecParams) -> HashMap<String, String>
 fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy
 ```
 
-**Purpose**: Converts the RPC-facing `ExecEnvPolicy` into the lower-level `ShellEnvironmentPolicy` expected by `codex_protocol::shell_environment`. It also normalizes pattern matching to case-insensitive environment-variable patterns.
+**Purpose**: Converts the exec protocol’s environment policy into the format expected by the shared environment-building code. This keeps process launching and protocol data loosely connected.
 
-**Data flow**: It copies `inherit`, `ignore_default_excludes`, and `r#set`, maps each `exclude` and `include_only` string into `EnvironmentVariablePattern::new_case_insensitive`, sets `use_profile` to `false`, and returns the assembled `ShellEnvironmentPolicy`.
+**Data flow**: It receives an ExecEnvPolicy, copies over inheritance and explicit set rules, turns text patterns into case-insensitive environment-variable patterns, disables profile loading, and returns a ShellEnvironmentPolicy.
 
-**Call relations**: Called only by `child_env` when an environment policy is present.
+**Call relations**: child_env calls this when a request includes an environment policy. The returned policy is then passed to the shell environment helper that creates the actual variable map.
 
 *Call graph*: called by 1 (child_env).
 
@@ -1731,11 +1743,11 @@ fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolic
 fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>
 ```
 
-**Purpose**: Starts a process and wraps it as a trait object implementing `ExecProcess`. This is the `ExecBackend`-facing constructor path.
+**Purpose**: Starts a process through the generic ExecBackend interface. This wraps the local process implementation in the common object shape used by the rest of the server.
 
-**Data flow**: It awaits `start_process(params)`, maps any `JSONRPCErrorError` through `map_handler_error`, constructs `LocalExecProcess { process_id, backend: self.clone(), wake_tx, events }`, wraps it in `Arc`, and returns `StartedExecProcess { process }`.
+**Data flow**: It receives execution parameters, calls start_process, converts any protocol-style error into an ExecServerError, then returns a StartedExecProcess containing a LocalExecProcess object.
 
-**Call relations**: The `ExecBackend` trait implementation boxes this method. It bridges the RPC-style startup routine into the trait-based process abstraction.
+**Call relations**: The ExecBackend trait method delegates to this async helper. It creates the LocalExecProcess that later forwards reads, writes, signals, and termination back to this LocalProcess backend.
 
 *Call graph*: calls 1 internal fn (start_process); 2 external calls (new, pin).
 
@@ -1746,11 +1758,11 @@ fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>
 fn process_id(&self) -> &ProcessId
 ```
 
-**Purpose**: Returns the stable process identifier for this started process handle. It exposes the ID without any async work.
+**Purpose**: Returns the ID assigned to this process. Callers use this ID to identify the process in logs, responses, and later requests.
 
-**Data flow**: It reads `self.process_id` and returns a shared reference.
+**Data flow**: It reads the stored process_id field and returns a reference to it without changing anything.
 
-**Call relations**: This satisfies the `ExecProcess` trait and is used by callers that need to correlate the handle with backend state.
+**Call relations**: This is part of the ExecProcess interface. Higher-level code can ask any process object for its ID without knowing that it is backed by LocalProcess.
 
 
 ##### `LocalExecProcess::subscribe_wake`  (lines 523–525)
@@ -1759,11 +1771,11 @@ fn process_id(&self) -> &ProcessId
 fn subscribe_wake(&self) -> watch::Receiver<u64>
 ```
 
-**Purpose**: Creates a watch receiver that is notified whenever the process advances its sequence number. It supports efficient wakeups for consumers polling for changes.
+**Purpose**: Lets callers subscribe to a lightweight wake-up signal that changes when new process activity happens. This is useful for code that wants to wait efficiently instead of constantly polling.
 
-**Data flow**: It calls `self.wake_tx.subscribe()` and returns the new `watch::Receiver<u64>`.
+**Data flow**: It reads the process’s watch sender and creates a new receiver subscribed to future sequence-number updates.
 
-**Call relations**: Part of the `ExecProcess` trait implementation. Sequence updates are sent by `stream_output`, `watch_exit`, and `maybe_emit_closed`.
+**Call relations**: This is part of the ExecProcess interface. stream_output, watch_exit, and maybe_emit_closed send updates on the same channel when output, exit, or close events occur.
 
 *Call graph*: 1 external calls (subscribe).
 
@@ -1774,11 +1786,11 @@ fn subscribe_wake(&self) -> watch::Receiver<u64>
 fn subscribe_events(&self) -> ExecProcessEventReceiver
 ```
 
-**Purpose**: Subscribes to the retained process event log. It gives consumers a stream of structured output/exited/closed events.
+**Purpose**: Lets callers subscribe to the process event log. The event log carries structured events such as output, exit, and closed.
 
-**Data flow**: It calls `self.events.subscribe()` and returns an `ExecProcessEventReceiver`.
+**Data flow**: It asks the stored ExecProcessEventLog for a new receiver and returns it. The process object itself is not changed.
 
-**Call relations**: This is the event-stream half of the `ExecProcess` trait. Events are published by `stream_output`, `watch_exit`, and `maybe_emit_closed`.
+**Call relations**: This is part of the ExecProcess interface. stream_output, watch_exit, and maybe_emit_closed publish the events that subscribers receive.
 
 *Call graph*: calls 1 internal fn (subscribe).
 
@@ -1794,11 +1806,11 @@ fn read(
     ) -> ExecProcessFuture<'_, ReadResponse>
 ```
 
-**Purpose**: Reads output and terminal state for this specific process handle. It is the trait-facing wrapper around backend reads.
+**Purpose**: Reads output and status for this specific process through the local backend. It is a convenience method that already knows the process ID.
 
-**Data flow**: It forwards `after_seq`, `max_bytes`, and `wait_ms` plus `self.process_id` to `self.backend.read(...)`, awaits the result, and returns `ReadResponse` or `ExecServerError`.
+**Data flow**: It receives read options, passes this process’s ID plus those options to the backend read method, and returns the resulting ReadResponse or error.
 
-**Call relations**: The `ExecProcess` trait boxes this method. It delegates all actual read logic to `LocalProcess::read` and ultimately `exec_read`.
+**Call relations**: The ExecProcess trait method wraps this in a boxed future. The actual read logic lives in LocalProcess::read and then LocalProcess::exec_read.
 
 *Call graph*: calls 1 internal fn (read); 1 external calls (pin).
 
@@ -1809,11 +1821,11 @@ fn read(
 fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 ```
 
-**Purpose**: Writes bytes to this process’s stdin through the backend. It is the trait-facing wrapper for input delivery.
+**Purpose**: Writes bytes to this specific process through the local backend. It saves callers from manually passing the process ID.
 
-**Data flow**: It forwards `self.process_id` and the owned `chunk` to `self.backend.write(...)`, awaits the result, and returns `WriteResponse` or `ExecServerError`.
+**Data flow**: It receives a byte vector, passes it with this process’s ID to the backend write method, and returns the write status or error.
 
-**Call relations**: Boxed by the `ExecProcess` trait implementation and delegated to `LocalProcess::write`.
+**Call relations**: The ExecProcess trait method wraps this in a boxed future. The actual input delivery happens through LocalProcess::write and LocalProcess::exec_write.
 
 *Call graph*: calls 1 internal fn (write); 1 external calls (pin).
 
@@ -1824,11 +1836,11 @@ fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Sends a protocol signal to this process through the backend. It exposes signaling on the started-process handle.
+**Purpose**: Sends a control signal to this specific process through the local backend. It is used for actions such as interrupting a running command.
 
-**Data flow**: It forwards `self.process_id` and `signal` to `self.backend.signal(...)`, awaits completion, and returns `()` or `ExecServerError`.
+**Data flow**: It receives a protocol signal, passes it with this process’s ID to the backend signal method, and returns success or an error.
 
-**Call relations**: Boxed by the `ExecProcess` trait implementation and delegated to `LocalProcess::signal`.
+**Call relations**: The ExecProcess trait method wraps this in a boxed future. LocalProcess::signal then calls signal_process to perform the session-level signal.
 
 *Call graph*: calls 1 internal fn (signal); 1 external calls (pin).
 
@@ -1839,11 +1851,11 @@ fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 fn terminate(&self) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Requests termination of this process through the backend. It is the trait-facing kill path.
+**Purpose**: Requests termination of this specific process through the local backend. It is the process-object version of the stop command.
 
-**Data flow**: It forwards `self.process_id` to `self.backend.terminate(...)`, awaits completion, and returns `()` or `ExecServerError`.
+**Data flow**: It uses its stored process ID, calls the backend terminate method, and returns success or an error.
 
-**Call relations**: Boxed by the `ExecProcess` trait implementation and delegated to `LocalProcess::terminate`.
+**Call relations**: The ExecProcess trait method wraps this in a boxed future. LocalProcess::terminate then calls terminate_process for the real stop request.
 
 *Call graph*: calls 1 internal fn (terminate); 1 external calls (pin).
 
@@ -1860,11 +1872,11 @@ async fn read(
     ) -> Result<ReadResponse, ExecServerEr
 ```
 
-**Purpose**: Backend-internal convenience wrapper that reads by `ProcessId` and maps RPC-style errors into `ExecServerError`. It adapts the RPC parameter struct to the trait-oriented API.
+**Purpose**: Adapts the backend’s read operation to the shared ExecProcess error type. It is the internal bridge between object-style process use and request-style read handling.
 
-**Data flow**: It constructs `ReadParams { process_id: process_id.clone(), after_seq, max_bytes, wait_ms }`, awaits `self.exec_read(...)`, maps any `JSONRPCErrorError` with `map_handler_error`, and returns `ReadResponse`.
+**Data flow**: It receives a process ID and read options, builds ReadParams, calls exec_read, and converts any JSON-RPC-style error into ExecServerError.
 
-**Call relations**: Called by `LocalExecProcess::read`. It exists to reuse `exec_read` rather than duplicating read logic.
+**Call relations**: LocalExecProcess::read calls this. It hands the work to exec_read, which performs the process lookup, output copying, and optional waiting.
 
 *Call graph*: calls 1 internal fn (exec_read); called by 1 (read); 1 external calls (clone).
 
@@ -1879,11 +1891,11 @@ async fn write(
     ) -> Result<WriteResponse, ExecServerError>
 ```
 
-**Purpose**: Backend-internal convenience wrapper that writes to a process by ID and maps handler errors into `ExecServerError`. It adapts the trait API to the RPC-style implementation.
+**Purpose**: Adapts the backend’s write operation to the shared ExecProcess error type. It packages raw bytes into the protocol request shape.
 
-**Data flow**: It constructs `WriteParams { process_id: process_id.clone(), chunk: chunk.into() }`, awaits `self.exec_write(...)`, maps errors with `map_handler_error`, and returns `WriteResponse`.
+**Data flow**: It receives a process ID and bytes, builds WriteParams, calls exec_write, and converts errors into ExecServerError.
 
-**Call relations**: Called by `LocalExecProcess::write`, reusing the main `exec_write` implementation.
+**Call relations**: LocalExecProcess::write calls this. exec_write then checks process state and sends the bytes to the child process input channel.
 
 *Call graph*: calls 1 internal fn (exec_write); called by 1 (write); 1 external calls (clone).
 
@@ -1898,11 +1910,11 @@ async fn signal(
     ) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Backend-internal convenience wrapper that signals a process by ID and maps handler errors into `ExecServerError`. It hides the RPC parameter struct from trait consumers.
+**Purpose**: Adapts process signaling to the shared ExecProcess error type. It hides the protocol request wrapping from callers.
 
-**Data flow**: It constructs `SignalParams { process_id: process_id.clone(), signal }`, awaits `self.signal_process(...)`, maps errors with `map_handler_error`, discards the empty response, and returns `Ok(())`.
+**Data flow**: It receives a process ID and signal, builds SignalParams, calls signal_process, converts any error, and returns an empty success result.
 
-**Call relations**: Called by `LocalExecProcess::signal`, reusing the main signaling implementation.
+**Call relations**: LocalExecProcess::signal calls this. signal_process performs the lookup and sends the lower-level signal.
 
 *Call graph*: calls 1 internal fn (signal_process); called by 1 (signal); 1 external calls (clone).
 
@@ -1913,11 +1925,11 @@ async fn signal(
 async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError>
 ```
 
-**Purpose**: Backend-internal convenience wrapper that terminates a process by ID and maps handler errors into `ExecServerError`. It adapts the trait API to the RPC-style implementation.
+**Purpose**: Adapts process termination to the shared ExecProcess error type. It lets process objects stop themselves through the backend.
 
-**Data flow**: It constructs `TerminateParams { process_id: process_id.clone() }`, awaits `self.terminate_process(...)`, maps errors with `map_handler_error`, discards the `running` flag, and returns `Ok(())`.
+**Data flow**: It receives a process ID, builds TerminateParams, calls terminate_process, converts any error, and returns success.
 
-**Call relations**: Called by `LocalExecProcess::terminate`, reusing the main termination implementation.
+**Call relations**: LocalExecProcess::terminate calls this. terminate_process checks whether the process is still live and asks its session to terminate.
 
 *Call graph*: calls 1 internal fn (terminate_process); called by 1 (terminate); 1 external calls (clone).
 
@@ -1928,11 +1940,11 @@ async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError>
 fn pty_process_signal(signal: ProcessSignal) -> PtyProcessSignal
 ```
 
-**Purpose**: Maps protocol-level process signals to the PTY library’s signal enum. It is the translation layer between exec-server protocol types and `codex_utils_pty`.
+**Purpose**: Translates the exec protocol’s signal name into the signal type used by the process-running library. This keeps the public protocol separate from the lower-level implementation.
 
-**Data flow**: It matches on `ProcessSignal` and returns the corresponding `PtyProcessSignal`; currently `Interrupt` maps directly to `PtyProcessSignal::Interrupt`.
+**Data flow**: It receives a ProcessSignal and returns the matching PtyProcessSignal. At present, Interrupt maps to Interrupt.
 
-**Call relations**: Only `signal_process` calls this before invoking `session.signal(...)`.
+**Call relations**: signal_process calls this just before sending a signal to the running session.
 
 *Call graph*: called by 1 (signal_process).
 
@@ -1943,11 +1955,11 @@ fn pty_process_signal(signal: ProcessSignal) -> PtyProcessSignal
 fn map_handler_error(error: JSONRPCErrorError) -> ExecServerError
 ```
 
-**Purpose**: Converts a JSON-RPC handler error into the backend’s `ExecServerError::Server` form. It preserves the numeric code and message.
+**Purpose**: Converts JSON-RPC-style errors into the server’s common execution error type. This lets different calling paths report failures in a consistent shape.
 
-**Data flow**: It reads `error.code` and `error.message` from `JSONRPCErrorError` and returns `ExecServerError::Server { code, message }`.
+**Data flow**: It receives an error with a code and message, copies those fields into an ExecServerError::Server value, and returns it.
 
-**Call relations**: Used by trait-oriented wrappers like `start`, `read`, `write`, `signal`, and `terminate` to reuse RPC-style implementations without exposing JSON-RPC error types.
+**Call relations**: The backend adapter methods use this when turning request-style functions into ExecBackend and ExecProcess results.
 
 
 ##### `stream_output`  (lines 621–677)
@@ -1962,11 +1974,11 @@ async fn stream_output(
 )
 ```
 
-**Purpose**: Consumes one child output stream, sequences and retains chunks, publishes events and notifications, and wakes blocked readers. It is the core ingestion loop for stdout/stderr or PTY output.
+**Purpose**: Continuously records output from one process stream and sends live output notifications. A stream is one source of bytes, such as stdout or stderr.
 
-**Data flow**: It repeatedly awaits `receiver.recv()`. For each chunk, it locks the process map, finds the running process, assigns `seq = next_seq`, increments `next_seq`, adds the chunk length to `retained_bytes`, pushes `RetainedOutputChunk { seq, stream, chunk: chunk.clone() }` into `output`, evicts oldest chunks until under `RETAINED_OUTPUT_BYTES_PER_PROCESS`, sends the new seq on `wake_tx`, publishes `ExecProcessEvent::Output`, and builds `ExecOutputDeltaNotification`. After releasing the lock it notifies `output_notify` waiters and, if a notification sender exists, asynchronously emits the JSON-RPC notification. When the receiver ends, it calls `finish_output_stream(process_id, inner).await`.
+**Data flow**: It receives a process ID, stream label, byte receiver, shared process state, and wake notifier. For each chunk, it assigns a sequence number, stores the chunk in the retained buffer, trims old retained data if needed, wakes readers, publishes an event, and sends a notification. When the input channel ends, it marks that stream finished.
 
-**Call relations**: Spawned twice by `start_process` and by test helpers. It feeds the state later observed by `exec_read`, and hands stream-completion bookkeeping to `finish_output_stream`.
+**Call relations**: start_process starts one task for stdout and one for stderr, and tests start the same tasks for fake processes. When the stream ends, this calls finish_output_stream, which may lead to the process being marked closed.
 
 *Call graph*: calls 3 internal fn (finish_output_stream, notification_sender, recv); called by 2 (start_process, spawn_test_process); 2 external calls (Output, clone).
 
@@ -1982,11 +1994,11 @@ async fn watch_exit(
 )
 ```
 
-**Purpose**: Waits for the child process exit code, records the exit event, notifies readers, emits an exit notification, and then checks whether the process can be marked closed. It is the exit-side counterpart to `stream_output`.
+**Purpose**: Waits for a process to exit and records its exit code. The exit code is the number a program returns to say whether it succeeded or failed.
 
-**Data flow**: It awaits the oneshot `exit_rx`, defaulting to `-1` if the sender is dropped. It locks the process map, and if the process is still running, assigns a new sequence number, stores `exit_code`, sends the seq on `wake_tx`, publishes `ExecProcessEvent::Exited { seq, exit_code }`, and builds `ExecExitedNotification`. It then notifies `output_notify`, optionally sends the exit notification through `notification_sender`, and finally awaits `maybe_emit_closed(process_id, inner)`.
+**Data flow**: It receives a process ID, a one-time exit-code receiver, shared process state, and wake notifier. When the exit code arrives, it stores it, assigns a sequence number, wakes readers, publishes an exit event, and sends an exit notification. If the exit channel fails, it uses -1.
 
-**Call relations**: Spawned by `start_process` and test helpers. It depends on `maybe_emit_closed` to emit the final closed event only after output streams have also ended.
+**Call relations**: start_process and test setup spawn this beside the output streaming tasks. After recording the exit, it calls maybe_emit_closed because the process may be fully done if both output streams have also ended.
 
 *Call graph*: calls 2 internal fn (maybe_emit_closed, notification_sender); called by 2 (start_process, spawn_test_process); 2 external calls (clone, clone).
 
@@ -1997,11 +2009,11 @@ async fn watch_exit(
 async fn finish_output_stream(process_id: ProcessId, inner: Arc<Inner>)
 ```
 
-**Purpose**: Marks one output stream as finished and then checks whether the process can now transition to closed. It tracks the countdown of remaining open output streams.
+**Purpose**: Records that one output stream has ended. A process is not fully closed until all output streams are done and the exit code is known.
 
-**Data flow**: It locks the process map, finds the running process, decrements `open_streams` if it is greater than zero, releases the lock, and then awaits `maybe_emit_closed(process_id, inner)`.
+**Data flow**: It receives a process ID and shared state, finds the running process, decreases its open-stream count if possible, then checks whether the whole process can now be closed.
 
-**Call relations**: Called at the end of each `stream_output` task. Closure is deferred to `maybe_emit_closed` because exit and both stream completions must all be observed.
+**Call relations**: stream_output calls this after its receiver ends. It then hands off to maybe_emit_closed to decide whether the final closed event should be emitted.
 
 *Call graph*: calls 1 internal fn (maybe_emit_closed); called by 1 (stream_output).
 
@@ -2012,11 +2024,11 @@ async fn finish_output_stream(process_id: ProcessId, inner: Arc<Inner>)
 async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>)
 ```
 
-**Purpose**: Transitions a process into the final closed state once it has exited and all output streams are finished, emits the closed event/notification, and schedules delayed eviction from the process table. It is the final lifecycle gate for process retention.
+**Purpose**: Marks a process as fully closed when it has exited and both output streams are finished. It also schedules removal of the closed process after a retention delay.
 
-**Data flow**: It locks the process map, returns early unless the process exists, is running, is not already closed, has `open_streams == 0`, and has `exit_code.is_some()`. It then sets `closed = true`, assigns a new sequence number, sends it on `wake_tx`, publishes `ExecProcessEvent::Closed { seq }`, clones `output_notify`, and builds `ExecClosedNotification`. After releasing the lock it notifies waiters, spawns a cleanup task that sleeps `EXITED_PROCESS_RETENTION` and removes the process entry only if it is still present and still closed, and optionally sends the closed notification through `notification_sender`.
+**Data flow**: It receives a process ID and shared state, checks the running process, and does nothing unless it is not already closed, has zero open streams, and has an exit code. If ready, it sets closed, assigns a sequence number, wakes readers, publishes a closed event, sends a closed notification, and starts a delayed cleanup task that removes the process if it is still closed.
 
-**Call relations**: Called from both `watch_exit` and `finish_output_stream`, so either side can trigger the final close once the other prerequisites are already satisfied. The delayed cleanup behavior is what allows tests to observe retention and eventual eviction.
+**Call relations**: watch_exit calls this after an exit, and finish_output_stream calls it after each stream ends. This is the final gate that turns separate exit and stream-end facts into one clear “closed” state.
 
 *Call graph*: calls 1 internal fn (notification_sender); called by 2 (finish_output_stream, watch_exit); 5 external calls (clone, clone, matches!, spawn, sleep).
 
@@ -2027,11 +2039,11 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>)
 fn notification_sender(inner: &Inner) -> Option<RpcNotificationSender>
 ```
 
-**Purpose**: Reads the current optional RPC notification sender from shared backend state. It centralizes poisoned-lock recovery for notification access.
+**Purpose**: Gets the current notification sender, if notifications are enabled. It centralizes safe access to the shared sender.
 
-**Data flow**: It acquires a read lock on `inner.notifications`, recovering from poisoning if necessary, clones the stored `Option<RpcNotificationSender>`, and returns it.
+**Data flow**: It receives the shared Inner state, takes a read lock around the optional sender, clones the sender if present, and returns it.
 
-**Call relations**: Used by `stream_output`, `watch_exit`, and `maybe_emit_closed` whenever they need to emit outbound notifications without holding the process-map mutex.
+**Call relations**: stream_output, watch_exit, and maybe_emit_closed call this before sending output, exit, and closed notifications. set_notification_sender changes the value this function later reads.
 
 *Call graph*: called by 3 (maybe_emit_closed, stream_output, watch_exit).
 
@@ -2042,11 +2054,11 @@ fn notification_sender(inner: &Inner) -> Option<RpcNotificationSender>
 fn test_exec_params(env: HashMap<String, String>) -> ExecParams
 ```
 
-**Purpose**: Builds a minimal valid `ExecParams` fixture for tests, with a real current working directory and configurable environment map. It reduces duplication across process tests.
+**Purpose**: Builds a small, valid ExecParams value for tests. It avoids repeating setup details in each test.
 
-**Data flow**: It constructs `ExecParams` with a fixed `process_id`, `argv = ["true"]`, `cwd` from `PathUri::from_path(current_dir())`, `env_policy = None`, the provided `env`, and `tty/pipe_stdin/arg0` defaults.
+**Data flow**: It receives an environment map, fills in a process ID, a simple true command, the current folder as the working directory, default terminal/input flags, and returns the parameters.
 
-**Call relations**: Used by multiple tests that need a baseline parameter set before mutating one field under test.
+**Call relations**: The environment and working-directory tests call this, then adjust only the fields they are testing.
 
 *Call graph*: calls 2 internal fn (from, from_path); 2 external calls (current_dir, vec!).
 
@@ -2057,11 +2069,11 @@ fn test_exec_params(env: HashMap<String, String>) -> ExecParams
 async fn start_process_rejects_non_native_cwd_before_launch()
 ```
 
-**Purpose**: Verifies that `start_process` rejects a non-native cwd URI before attempting to spawn a child. It protects the early validation path for `params.cwd`.
+**Purpose**: Checks that a process is not launched when its working directory URI cannot be represented as a local path on this machine. This protects the local backend from trying to run commands in impossible locations.
 
-**Data flow**: It constructs a platform-opposite `file:` URI, parses it into `PathUri`, confirms `to_abs_path()` fails, builds the expected `invalid_params` error string, inserts that cwd into `test_exec_params`, calls `LocalProcess::default().start_process(params).await`, and asserts the returned error equals the expected one.
+**Data flow**: It builds parameters with a deliberately non-native file URI, computes the expected invalid-parameter error, calls start_process, and asserts that the same error is returned.
 
-**Call relations**: This test exercises the cwd conversion branch inside `start_process`, ensuring invalid host paths are reported as parameter errors rather than internal spawn failures.
+**Call relations**: This test uses LocalProcess::default and tests::test_exec_params. It specifically exercises the validation path inside start_process before any spawn attempt.
 
 *Call graph*: calls 3 internal fn (default, invalid_params, parse); 5 external calls (new, assert_eq!, test_exec_params, format!, panic!).
 
@@ -2072,11 +2084,11 @@ async fn start_process_rejects_non_native_cwd_before_launch()
 fn child_env_defaults_to_exact_env()
 ```
 
-**Purpose**: Checks that `child_env` returns the explicit environment unchanged when no policy is supplied. It documents the no-policy semantics.
+**Purpose**: Verifies that, without an environment policy, the child environment is exactly the explicit map from the request. This confirms there is no accidental inheritance.
 
-**Data flow**: It builds test params with a one-variable environment, calls `child_env(&params)`, and asserts the returned `HashMap` exactly matches the input map.
+**Data flow**: It builds parameters containing one environment variable, calls child_env, and compares the result to the same one-variable map.
 
-**Call relations**: This test covers the early-return branch in `child_env` where `env_policy` is `None`.
+**Call relations**: This test calls tests::test_exec_params and directly checks child_env’s no-policy branch.
 
 *Call graph*: 3 external calls (from, assert_eq!, test_exec_params).
 
@@ -2087,11 +2099,11 @@ fn child_env_defaults_to_exact_env()
 fn child_env_applies_policy_then_overlay()
 ```
 
-**Purpose**: Verifies that policy-derived environment variables are created first and then overridden by explicit `params.env` entries. It captures the intended precedence rules.
+**Purpose**: Verifies that environment policy values are applied first and explicit request variables override them. This matters because a caller’s direct environment settings should win.
 
-**Data flow**: It builds params with overlay variables, installs an `ExecEnvPolicy` that sets `POLICY_SET`, computes the expected merged map (including Windows `PATHEXT` when applicable), calls `child_env(&params)`, and asserts equality.
+**Data flow**: It builds parameters with a policy-set variable and explicit variables, calls child_env, adjusts the expected result for Windows default PATHEXT behavior, and asserts equality.
 
-**Call relations**: This test exercises both `shell_environment_policy` and `child_env`, specifically the `env.extend(params.env.clone())` overlay behavior.
+**Call relations**: This test calls tests::test_exec_params and exercises child_env together with shell_environment_policy and the shared environment creation helper.
 
 *Call graph*: 5 external calls (from, new, assert_eq!, cfg!, test_exec_params).
 
@@ -2102,11 +2114,11 @@ fn child_env_applies_policy_then_overlay()
 async fn exited_process_retains_late_output_past_retention()
 ```
 
-**Purpose**: Verifies that a process which has exited but whose output streams remain open can still deliver late output even after the retention delay. It protects the distinction between `exited` and `closed`.
+**Purpose**: Checks an important edge case: a process that has exited is not removed just because the retention time has passed if its output streams are still open. Late output should still be readable.
 
-**Data flow**: It creates a backend and synthetic running process via `spawn_test_process`, sends an exit code, reads until the exit event is visible, sleeps past `EXITED_PROCESS_RETENTION`, sends a late stdout chunk, reads again after seq 1, asserts the late chunk appears with seq 2 and `closed == false`, then drops both output senders, waits until a closed response arrives, and shuts down the backend.
+**Data flow**: It creates a fake process, sends an exit code, reads the exit event, waits beyond the retention delay, sends output afterward, reads again to confirm that late output is present, then closes the streams and waits for final closure.
 
-**Call relations**: This test drives `watch_exit`, `stream_output`, and `maybe_emit_closed` together, proving cleanup is not triggered merely by elapsed retention time after exit.
+**Call relations**: This test uses spawn_test_process, read_process_until_change, read_process_until_closed, and LocalProcess::shutdown. It exercises watch_exit, stream_output, and maybe_emit_closed working together.
 
 *Call graph*: calls 1 internal fn (default); 9 external calls (from_millis, from_secs, assert!, assert_eq!, read_process_until_change, read_process_until_closed, spawn_test_process, sleep, timeout).
 
@@ -2117,11 +2129,11 @@ async fn exited_process_retains_late_output_past_retention()
 async fn closed_process_is_evicted_after_retention()
 ```
 
-**Purpose**: Verifies that once a process is both exited and closed, it is eventually removed from the process table after the configured retention period. It protects the delayed-eviction cleanup path.
+**Purpose**: Checks that a fully closed process is eventually removed from the backend’s process table. This prevents finished processes from accumulating forever.
 
-**Data flow**: It creates a backend and synthetic process, sends an exit code, drops both output senders so closure can occur, waits for a closed response, then repeatedly checks `backend.inner.processes` until the process ID disappears or a timeout expires, and finally shuts down the backend.
+**Data flow**: It creates a fake process, exits it, closes both output streams, waits until the read response says closed, then repeatedly checks the process map until the process ID disappears.
 
-**Call relations**: This test specifically exercises the cleanup task spawned by `maybe_emit_closed`.
+**Call relations**: This test uses spawn_test_process and read_process_until_closed. It verifies the delayed cleanup task created by maybe_emit_closed.
 
 *Call graph*: calls 1 internal fn (default); 7 external calls (from_millis, from_secs, assert!, read_process_until_closed, spawn_test_process, sleep, timeout).
 
@@ -2132,11 +2144,11 @@ async fn closed_process_is_evicted_after_retention()
 fn exit(&mut self, exit_code: i32)
 ```
 
-**Purpose**: Sends the synthetic process’s exit code exactly once in tests. It models child-process termination for the background `watch_exit` task.
+**Purpose**: Makes a fake test process report an exit code. It gives tests a simple way to trigger the same exit path a real process would use.
 
-**Data flow**: It takes the stored `oneshot::Sender<i32>` from `self.exit_tx`, panics if it was already used, sends the provided `exit_code`, and panics if the send fails.
+**Data flow**: It takes the stored one-time exit sender, sends the provided exit code through it, and removes the sender so exit cannot be sent twice.
 
-**Call relations**: Used by tests that simulate process exit after installing a fake running process with `spawn_test_process`.
+**Call relations**: The process-lifecycle tests call this after spawn_test_process. The watch_exit task receives the value and updates backend state.
 
 
 ##### `tests::spawn_test_process`  (lines 972–1032)
@@ -2145,11 +2157,11 @@ fn exit(&mut self, exit_code: i32)
 async fn spawn_test_process(backend: &LocalProcess, process_id: &str) -> TestProcess
 ```
 
-**Purpose**: Installs a synthetic running process directly into the backend and launches the same output/exit watcher tasks used for real processes. It provides deterministic control over stdout, stderr, and exit timing in tests.
+**Purpose**: Creates a fake running process inside LocalProcess without launching a real operating-system command. This lets tests drive output and exit timing precisely.
 
-**Data flow**: It creates channels for stdout, stderr, and exit; creates `Notify`, `watch::channel`, and `ExecProcessEventLog`; inserts a `ProcessEntry::Running(Box<RunningProcess { ... dummy_session(), tty: false, pipe_stdin: false, ... open_streams: 2, closed: false }>)` into `backend.inner.processes`; spawns two `stream_output` tasks and one `watch_exit` task; and returns `TestProcess { process_id, stdout_tx, stderr_tx, exit_tx: Some(exit_tx) }`.
+**Data flow**: It receives a backend and process ID string, creates channels for stdout, stderr, and exit, inserts a RunningProcess with a dummy session into the backend map, spawns stream_output and watch_exit tasks, and returns a TestProcess with senders the test can control.
 
-**Call relations**: Used by retention/eviction tests to exercise the real background lifecycle logic without spawning OS processes.
+**Call relations**: The lifecycle tests call this instead of start_process. It reuses the same stream_output and watch_exit functions as real processes, so the tests cover the real bookkeeping logic.
 
 *Call graph*: calls 4 internal fn (stream_output, watch_exit, new, from); 12 external calls (clone, new, new, new, new, assert!, Running, dummy_session, channel, channel (+2 more)).
 
@@ -2160,11 +2172,11 @@ async fn spawn_test_process(backend: &LocalProcess, process_id: &str) -> TestPro
 fn dummy_session() -> ExecCommandSession
 ```
 
-**Purpose**: Creates a minimal `ExecCommandSession` suitable for tests that never actually write to or signal a real child process. It satisfies the `RunningProcess` shape expected by the backend.
+**Purpose**: Builds a minimal process session for fake test processes. It exists only so the RunningProcess record has a session value without starting a real command.
 
-**Data flow**: It creates placeholder writer, stdout, stderr, and exit channels, packages them into `ProcessDriver`, calls `codex_utils_pty::spawn_from_driver(...)`, and returns the resulting `.session`.
+**Data flow**: It creates placeholder writer, output, and exit channels, wraps them in a ProcessDriver, passes that to the process utility library, and returns the resulting session.
 
-**Call relations**: Only `spawn_test_process` uses this helper to populate the synthetic `RunningProcess`.
+**Call relations**: spawn_test_process calls this while inserting a fake RunningProcess. The returned session is not the focus of the tests; the controlled channels are.
 
 *Call graph*: 4 external calls (spawn_from_driver, channel, channel, channel).
 
@@ -2179,11 +2191,11 @@ async fn read_process_until_change(
     ) -> ReadResponse
 ```
 
-**Purpose**: Convenience helper that performs a blocking `exec_read` with a one-second timeout and returns the response. It simplifies tests that wait for the next observable process change.
+**Purpose**: Reads from a process in tests and waits for a change, with a timeout so tests do not hang forever. It is a small polling helper.
 
-**Data flow**: It calls `backend.exec_read(ReadParams { process_id: process_id.clone(), after_seq, max_bytes: None, wait_ms: Some(1000) })` inside `tokio::time::timeout(Duration::from_secs(1), ...)`, unwraps both timeout and read success, and returns the `ReadResponse`.
+**Data flow**: It receives a backend, process ID, and optional sequence number, calls exec_read with a wait time, wraps that in a one-second timeout, and returns the successful ReadResponse.
 
-**Call relations**: Used by tests that need to observe exit, output, or close transitions without duplicating timeout boilerplate.
+**Call relations**: The lifecycle tests call this to observe exit and late output. It exercises the same exec_read path clients use.
 
 *Call graph*: calls 1 internal fn (exec_read); 3 external calls (from_secs, clone, timeout).
 
@@ -2197,24 +2209,24 @@ async fn read_process_until_closed(
     ) -> ReadResponse
 ```
 
-**Purpose**: Repeatedly reads process state until the backend reports `closed = true`. It abstracts the sequence bookkeeping needed to follow a process through multiple changes.
+**Purpose**: Keeps reading a test process until the backend reports it as closed. This hides the loop needed to consume events in order.
 
-**Data flow**: It loops calling `read_process_until_change`, returns immediately when `response.closed` is true, otherwise advances `after_seq` to the highest observed chunk seq or `response.next_seq - 1`, and repeats.
+**Data flow**: It starts with no sequence position, repeatedly calls read_process_until_change, updates the sequence marker from returned chunks or next_seq, and returns once the response has closed set to true.
 
-**Call relations**: Used by tests that need to wait for the final closed transition after exit and stream completion.
+**Call relations**: The lifecycle tests call this after triggering exit and stream closure. It depends on read_process_until_change, which in turn uses exec_read.
 
 *Call graph*: 1 external calls (read_process_until_change).
 
 
 ### `exec-server/src/remote_process.rs`
 
-`io_transport` · `request handling and remote process lifetime`
+`io_transport` · `request handling and process lifetime`
 
-This file defines two small wrappers with distinct lifetimes: `RemoteProcess`, which is the backend used to start a remote process, and `RemoteExecProcess`, which is the live process handle returned after startup. `RemoteProcess::start` is the key transition point: it clones the `process_id` from `ExecParams`, acquires the underlying remote client from `LazyRemoteExecServerClient`, registers a `Session` for that process id, and only then sends the remote `exec` request. That ordering ensures reads/events can be associated with the process immediately; if the `exec` RPC fails, it explicitly unregisters the session before returning the error.
+This file is an adapter. The rest of the system wants to start and talk to an execution process through common traits, without caring whether the process is local or remote. `RemoteProcess` fills that gap by using a lazy remote client, which means the network client is only obtained when it is actually needed.
 
-Once started, `RemoteExecProcess` is almost entirely a thin delegation layer over `Session`. It exposes the process id, wake subscription, event subscription, and async read/write/signal/terminate operations required by `ExecProcess`, boxing each async method into the trait’s future type. The concrete I/O semantics live in `Session`; this file preserves them while adding trace logging for mutating operations.
+When a remote process is started, the code first gets the client, registers a session for the requested process ID, and asks the remote server to run the command. The session is like a ticket number at a service desk: every later read, write, signal, or shutdown request uses that ticket so the remote server knows which process is being discussed. If starting the process fails after the session was registered, the file immediately unregisters that session so it does not leave stale state behind.
 
-A notable lifecycle detail is cleanup on drop: `RemoteExecProcess` clones its `Session` and spawns a detached Tokio task that calls `unregister()`. That means session teardown is best-effort and asynchronous, avoiding blocking drop while still cleaning up abandoned remote registrations when callers forget to terminate explicitly.
+Once started, the returned `RemoteExecProcess` exposes the standard `ExecProcess` interface. Reads ask the session for output, writes send bytes to the process input, signals forward actions such as interrupt or terminate, and subscriptions let callers be notified when new output or events are available. The important cleanup behavior is in `Drop`: when the process object is discarded, it spawns a background task to unregister the remote session.
 
 #### Function details
 
@@ -2224,11 +2236,11 @@ A notable lifecycle detail is cleanup on drop: `RemoteExecProcess` clones its `S
 fn new(client: LazyRemoteExecServerClient) -> Self
 ```
 
-**Purpose**: Constructs a `RemoteProcess` backend around a `LazyRemoteExecServerClient` and emits a trace message for backend creation.
+**Purpose**: Creates a `RemoteProcess` wrapper around a lazy remote exec server client. Use this when the system is being set up to run commands through a remote server instead of directly on the same machine.
 
-**Data flow**: Takes ownership of a lazily initialized remote client wrapper, stores it in the `client` field unchanged, and returns a new `RemoteProcess` value. Its only side effect is a tracing event.
+**Data flow**: It receives a lazy client object, records a trace log for debugging, and stores that client inside a new `RemoteProcess`. The result is a small backend object ready to start remote processes later.
 
-**Call relations**: This constructor is used when higher-level setup chooses the remote execution transport path. After construction, callers use the resulting backend through the `ExecBackend` trait, which routes startup into `RemoteProcess::start`.
+**Call relations**: This is called by `remote_with_transport` while building the remote execution setup. After that setup step, the returned `RemoteProcess` is used through the execution backend interface when someone asks to start a process.
 
 *Call graph*: called by 1 (remote_with_transport); 1 external calls (trace!).
 
@@ -2239,11 +2251,11 @@ fn new(client: LazyRemoteExecServerClient) -> Self
 fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>
 ```
 
-**Purpose**: Starts a remote process by registering a session for the requested process id and then issuing the remote exec request, returning a trait object-backed started process handle on success.
+**Purpose**: Starts a remote process through the backend interface and returns a standard started-process object. This is what lets the rest of the code ask for a process without knowing the process will actually run on another server.
 
-**Data flow**: Consumes `ExecParams` by value, clones `params.process_id` for session registration, awaits `self.client.get()` to obtain the concrete client, then awaits `register_session(&process_id)` to create a `Session`. It next sends `client.exec(params)`. On failure it asynchronously unregisters the session and returns the original error; on success it wraps `RemoteExecProcess { session }` in an `Arc` inside `StartedExecProcess`.
+**Data flow**: It receives execution parameters, including the process ID and command details. It prepares an asynchronous operation that gets the remote client, creates or uses a remote session, asks the server to execute the command, and finally returns a `StartedExecProcess` that wraps the remote session. If the remote start fails after session registration, the session is unregistered before the error is returned.
 
-**Call relations**: This async implementation is invoked by the `ExecBackend` trait adapter for remote backends. It depends on the lazy client acquisition and session registration path before delegating execution to the remote client; its cleanup branch exists specifically because registration happens before the exec RPC.
+**Call relations**: This function is the bridge from the generic `ExecBackend` trait into the remote implementation. Callers use the backend trait; this method boxes the asynchronous start work so it fits that trait, and the resulting process object later hands reads, writes, signals, and cleanup to the session.
 
 *Call graph*: calls 1 internal fn (get); 2 external calls (new, pin).
 
@@ -2254,11 +2266,11 @@ fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>
 fn process_id(&self) -> &crate::ProcessId
 ```
 
-**Purpose**: Returns the process identifier associated with the remote session-backed process handle.
+**Purpose**: Returns the identifier for the remote process. Callers use this when they need to label, track, or compare the running process.
 
-**Data flow**: Reads `self.session` and forwards to `session.process_id()`, returning a borrowed `ProcessId` reference without modifying any state.
+**Data flow**: It reads the process ID stored in the remote session and returns a reference to it. Nothing is changed.
 
-**Call relations**: Called by code using the `ExecProcess` trait when it needs stable identity for the running process. It is a pure accessor over the underlying session object.
+**Call relations**: This is part of the common `ExecProcess` interface. When outside code asks a process for its ID, this remote version simply delegates to the session, because the session is the object that knows which remote process it represents.
 
 *Call graph*: 1 external calls (process_id).
 
@@ -2269,11 +2281,11 @@ fn process_id(&self) -> &crate::ProcessId
 fn subscribe_wake(&self) -> watch::Receiver<u64>
 ```
 
-**Purpose**: Provides a watch receiver that signals output/progress wakeups for the remote process stream.
+**Purpose**: Lets callers subscribe to wake-up notifications from the remote process session. A wake-up notification is a lightweight signal that something may have changed, such as new output being available.
 
-**Data flow**: Reads `self.session` and returns the `watch::Receiver<u64>` produced by `session.subscribe_wake()`. No local transformation or mutation occurs.
+**Data flow**: It asks the session for a watch receiver, which is a subscription channel that can receive updated sequence information. It returns that receiver to the caller and does not otherwise change the process.
 
-**Call relations**: Used by consumers of the `ExecProcess` trait that long-poll or reactively wait for new remote output. This method simply exposes the session’s wake-notification mechanism.
+**Call relations**: This belongs to the `ExecProcess` interface. Higher-level code can call it when it wants to wait efficiently instead of repeatedly checking for output; the actual notification source is supplied by the session.
 
 *Call graph*: 1 external calls (subscribe_wake).
 
@@ -2284,11 +2296,11 @@ fn subscribe_wake(&self) -> watch::Receiver<u64>
 fn subscribe_events(&self) -> ExecProcessEventReceiver
 ```
 
-**Purpose**: Returns the event receiver for process lifecycle/events emitted by the remote session.
+**Purpose**: Lets callers listen for process events, such as lifecycle or status changes reported by the remote session. This gives the rest of the system a standard way to observe what happens to the remote process.
 
-**Data flow**: Delegates directly to `self.session.subscribe_events()` and returns the resulting `ExecProcessEventReceiver` unchanged.
+**Data flow**: It asks the session for an event receiver and returns it. The process object itself is not modified.
 
-**Call relations**: Called by higher-level process monitoring code through the `ExecProcess` trait. It participates in the event flow by exposing the session’s existing event channel rather than creating a new one.
+**Call relations**: This is another standard `ExecProcess` operation. Code that monitors process state calls this method, and the method passes through to the session because the session receives the actual remote event stream.
 
 *Call graph*: 1 external calls (subscribe_events).
 
@@ -2304,11 +2316,11 @@ fn read(
     ) -> ExecProcessFuture<'_, ReadResponse>
 ```
 
-**Purpose**: Reads process output from the remote session, optionally after a sequence number, with byte and wait limits.
+**Purpose**: Reads output from the remote process. Callers use it to fetch bytes produced by the process, with options for where to start reading, how much to read, and how long to wait.
 
-**Data flow**: Accepts `after_seq`, `max_bytes`, and `wait_ms`, forwards them unchanged to `self.session.read(...)`, awaits the remote/session result, and returns a `ReadResponse` or `ExecServerError`.
+**Data flow**: It receives an optional sequence number to read after, an optional maximum byte count, and an optional wait time in milliseconds. It wraps an asynchronous session read operation, sends those limits to the session, and eventually produces a `ReadResponse` or an error.
 
-**Call relations**: This boxed future implementation is reached through the `ExecProcess` trait’s `read` method. It delegates all sequencing and blocking semantics to the session layer, which is why this file contains no additional buffering logic.
+**Call relations**: This is the `ExecProcess` read method for remote processes. Higher-level process consumers call it through the common interface, and it hands the actual work to the session, which communicates with the remote server.
 
 *Call graph*: 2 external calls (pin, read).
 
@@ -2319,11 +2331,11 @@ fn read(
 fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 ```
 
-**Purpose**: Sends a chunk of stdin/input bytes to the remote process and traces the write operation.
+**Purpose**: Sends input bytes to the remote process. This is how callers type into or feed data to a remote command.
 
-**Data flow**: Consumes a `Vec<u8>` chunk, emits a trace log, forwards the bytes to `self.session.write(chunk)`, awaits completion, and returns the resulting `WriteResponse` or error.
+**Data flow**: It receives a byte chunk, records a trace log for debugging, wraps an asynchronous session write operation, and passes the bytes to the remote session. The result is a `WriteResponse` confirming what the remote side accepted, or an error.
 
-**Call relations**: Invoked via the `ExecProcess` trait when callers write to the running process. It is a thin transport adapter over session I/O with added observability.
+**Call relations**: This is called through the common `ExecProcess` interface when someone writes to the process input. The method does not send data itself; it delegates to the session, which is responsible for reaching the remote server.
 
 *Call graph*: 3 external calls (pin, write, trace!).
 
@@ -2334,11 +2346,11 @@ fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>
 fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Forwards a process signal request to the remote session and traces that control action.
+**Purpose**: Sends a control signal to the remote process, such as a request to interrupt or stop it. This lets local callers control a process that is actually running elsewhere.
 
-**Data flow**: Takes a `ProcessSignal`, logs the action, awaits `self.session.signal(signal)`, and returns `()` on success or an `ExecServerError` on failure.
+**Data flow**: It receives a `ProcessSignal`, records a trace log, wraps an asynchronous session signal operation, and forwards the signal to the remote session. It returns success if the remote side accepts the signal, or an error if not.
 
-**Call relations**: Reached through the `ExecProcess` trait’s signal path when callers need to interrupt or otherwise control the remote process. It delegates actual signal delivery to the session implementation.
+**Call relations**: This is the remote implementation of the standard process signal operation. Callers use the `ExecProcess` trait, and this method passes the request to the session so the remote server can apply it to the correct process.
 
 *Call graph*: 3 external calls (pin, signal, trace!).
 
@@ -2349,11 +2361,11 @@ fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>
 fn terminate(&self) -> ExecProcessFuture<'_, ()>
 ```
 
-**Purpose**: Requests termination of the remote process through the session and traces the request.
+**Purpose**: Requests that the remote process be terminated. This is the direct shutdown path for a still-running remote process.
 
-**Data flow**: Reads `self.session`, emits a trace event, awaits `session.terminate()`, and returns success/failure without additional transformation.
+**Data flow**: It records a trace log, wraps an asynchronous session termination operation, and asks the session to terminate the remote process. The result is either success or an execution server error.
 
-**Call relations**: Called through the `ExecProcess` trait when the process should be shut down explicitly. It is the explicit counterpart to the implicit unregister cleanup performed in `Drop`.
+**Call relations**: This is called through the `ExecProcess` interface when higher-level code wants to stop the process. The method forwards the request to the session, which knows how to tell the remote server which process to terminate.
 
 *Call graph*: 3 external calls (pin, terminate, trace!).
 
@@ -2364,11 +2376,11 @@ fn terminate(&self) -> ExecProcessFuture<'_, ()>
 fn drop(&mut self)
 ```
 
-**Purpose**: Performs asynchronous best-effort session cleanup when the remote process handle is dropped.
+**Purpose**: Cleans up the remote session when the local process object is discarded. This helps prevent the remote server from keeping an unused session around after the client is done with it.
 
-**Data flow**: Clones `self.session` into a new owned value, then spawns a Tokio task that awaits `session.unregister()`. It returns no value and cannot report unregister failures.
+**Data flow**: When the `RemoteExecProcess` is being destroyed, it clones the session handle and starts a background asynchronous task. That task unregisters the session on the remote side. The drop operation itself does not wait for the cleanup to finish.
 
-**Call relations**: This runs automatically when the last `RemoteExecProcess` handle is dropped. It is not part of normal call-based control flow, but it closes the lifecycle loop for sessions created by `RemoteProcess::start`.
+**Call relations**: This runs automatically when the last owner of the remote process object goes away. It is the safety net after normal process use: reads, writes, signals, and termination happen while the object is alive, and unregistering is kicked off when the object leaves scope.
 
 *Call graph*: 2 external calls (clone, spawn).
 
@@ -2378,11 +2390,15 @@ These files expose the common OS process spawn boundary and the top-level unifie
 
 ### `core/src/spawn.rs`
 
-`io_transport` · `subprocess launch during tool and shell command execution`
+`io_transport` · `shell tool execution / child process startup`
 
-This file defines the data needed to spawn a child process in a controlled way and implements the async launcher. `SpawnChildRequest` bundles the executable path, argument vector, optional Unix `arg0` override, absolute working directory, network sandbox policy, optional `NetworkProxy`, stdio policy, and a complete environment map. Two environment variable constants document the sandbox contract exposed to child processes: `CODEX_SANDBOX_NETWORK_DISABLED` is set when network sandboxing is not enabled for the tool call, and `CODEX_SANDBOX` is reserved for broader sandbox identification.
+When Codex runs an outside command, it cannot simply start it with the machine’s default settings. The command may need to run in a specific folder, with a carefully chosen set of environment variables, and sometimes with network access limited or routed through a proxy. This file gathers those choices into one request and turns them into a real child process.
 
-`spawn_child_async` destructures the request, logs the full launch configuration at trace level, and builds a `tokio::process::Command`. On Unix it sets `arg0`, allowing the visible argv[0] to differ from the executable path. It applies the working directory, optionally mutates the environment through the network proxy, clears inherited environment variables, and then installs only the provided environment map. If network sandboxing is disabled, it explicitly marks that in the child environment. On Unix, `pre_exec` optionally detaches the child from the controlling TTY for shell-tool calls and, on Linux, requests a parent-death signal so orphaned children terminate when Codex dies. Finally, stdio is configured either for captured shell-tool execution (`stdin` null, `stdout`/`stderr` piped) or full inheritance, and `kill_on_drop(true)` ensures abandoned child handles terminate the process.
+The main data bundle is `SpawnChildRequest`, which says what program to run, what arguments to pass, where to run it, what environment variables to use, whether network sandboxing applies, and how standard input/output should behave. `StdioPolicy` chooses between two modes: one for shell-tool calls where Codex captures output and prevents the command from waiting for keyboard input, and one where the child simply shares the parent process’s terminal streams.
+
+There are also two environment variable names used to tell the child process it is running under Codex sandbox rules. One marks that network access is disabled. Another is reserved for identifying the sandbox system more generally.
+
+On Unix systems, the file adds extra safety: shell-tool children can be detached from the terminal, and on Linux they can be told to die if the parent Codex process dies. This helps avoid abandoned background processes, like making sure a hired helper leaves when the supervisor leaves.
 
 #### Function details
 
@@ -2392,20 +2408,20 @@ This file defines the data needed to spawn a child process in a controlled way a
 async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child>
 ```
 
-**Purpose**: Builds and spawns a child process from a fully specified request, applying environment isolation, proxy settings, sandbox markers, Unix pre-exec hooks, and the requested stdio behavior.
+**Purpose**: Starts a child process using the exact program, arguments, folder, environment, network rules, and input/output policy requested by Codex. It is used when Codex needs to run an external command while preserving sandbox and cleanup rules.
 
-**Data flow**: Consumes `SpawnChildRequest`; reads `program`, `args`, optional `arg0`, `cwd`, `network_sandbox_policy`, optional `network`, `stdio_policy`, and mutable `env`; constructs `tokio::process::Command`, sets args/current dir, optionally mutates env via `network.apply_to_env`, clears inherited env and installs the provided map, conditionally sets `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR`, installs Unix `pre_exec` hooks for TTY detachment and Linux parent-death signaling, configures stdio as null+piped or inherited, enables `kill_on_drop(true)`, and returns `std::io::Result<Child>` from `spawn()`.
+**Data flow**: It receives a `SpawnChildRequest` containing the program path, command-line arguments, optional display name for argument zero, working directory, network sandbox policy, optional network proxy, standard input/output policy, and environment variables. It builds a Tokio `Command`, clears any default environment, applies the supplied environment and optional network proxy changes, adds a marker if network access is disabled, configures Unix process behavior where supported, chooses whether to capture or inherit input/output streams, and then spawns the process. The result is either a running child process object or an operating-system error explaining why it could not be started.
 
-**Call relations**: Called by higher-level execution paths such as generic exec and Linux sandbox spawning. It is the single subprocess-construction point those flows delegate to.
+**Call relations**: Higher-level execution paths call this when they are ready to actually launch a command: ordinary command execution uses it through `exec`, and Linux sandboxed execution uses it through `spawn_command_under_linux_sandbox`. Inside, it hands off low-level work to the operating-system process builder, standard-stream helpers, tracing, and Unix/Linux process setup calls so the caller does not have to repeat those details.
 
 *Call graph*: called by 2 (exec, spawn_command_under_linux_sandbox); 7 external calls (inherit, null, piped, new, getpid, matches!, trace!).
 
 
 ### `windows-sandbox-rs/src/unified_exec/backends/mod.rs`
 
-`orchestration` · `startup`
+`orchestration` · `compile-time module wiring`
 
-This file is the backend namespace hub for the `unified_exec` subsystem. It declares three crate-visible backend modules: `elevated`, `legacy`, and `windows_common`. The arrangement suggests that unified execution can dispatch between at least two concrete backend strategies—an elevated path and a legacy path—while sharing lower-level Windows-specific helpers through `windows_common`. The file itself contains no branching or runtime behavior; its significance is architectural. By collecting backend implementations under a single `backends` module, the crate can keep backend selection logic elsewhere while preserving a clean internal module tree. The `pub(crate)` visibility indicates these backends are intended for internal composition rather than direct public API use. This also gives maintainers freedom to evolve backend internals without breaking external callers. In practice, this file is active whenever the crate is compiled and whenever code in the unified execution layer resolves backend-specific types or functions, but it deliberately avoids embedding policy or execution logic here.
+This file does not contain executable logic itself. Instead, it acts like a small table of contents for the backend part of the unified execution feature. A backend is a concrete way to run something: for example, running with elevated permissions, using an older legacy path, or using shared Windows-specific helper code. By declaring the `elevated`, `legacy`, and `windows_common` modules here, this file makes those pieces visible to the surrounding crate while keeping their code split into separate files. Without this file, other parts of the unified execution system would not have a single, organized place to reach these backend implementations. It is like the signboard at the entrance to a workshop: it does not build anything itself, but it points to the rooms where the actual work happens.
 
 
 ### Portable PTY and pipe interfaces
@@ -2413,22 +2429,24 @@ These files present the public PTY crate surface and its cross-platform process-
 
 ### `utils/pty/src/lib.rs`
 
-`io_transport` · `process spawn / interactive session handling`
+`other` · `cross-cutting public API`
 
-This library root organizes the PTY/process subsystem into several modules: `pipe` for regular stdin/stdout/stderr transport, `process` for the common handle and driver abstractions, `process_group` for grouped process control, `pty` for pseudo-terminal spawning, and Windows-specific support under `win`. It also conditionally includes internal tests. The crate-level constant `DEFAULT_OUTPUT_BYTES_CAP` establishes a default one-megabyte cap for captured output, signaling that spawned-process output is intentionally bounded.
+This file does not contain the process-running logic itself. Instead, it gathers the important pieces from the crate’s internal modules and presents them as one clean public interface. Think of it like the reception desk in a workshop: the actual tools are stored in different rooms, but visitors come here to find the right one.
 
-Most of the file is public re-export wiring. It exposes spawn helpers for pipe-based and PTY-based execution, common process interaction types such as `ProcessHandle`, `SpawnedProcess`, `ProcessSignal`, and `TerminalSize`, and adapter utilities like `combine_output_receivers` and `spawn_from_driver` for integrations that already own the transport layer. Two type aliases, `ExecCommandSession` and `SpawnedPty`, preserve backwards compatibility with older naming. On Windows, it additionally re-exports ConPTY-related types and a capability probe via `conpty_supported`. The design centers on presenting one coherent process-execution API regardless of transport, while hiding the internal module split and platform-specific implementation details from callers.
+The crate supports two main ways to run a child process. One uses regular pipes for standard input, output, and error, which is useful for non-interactive commands. The other uses a PTY, short for “pseudo-terminal,” which makes the child process believe it is connected to a real terminal. That matters for interactive programs, colored output, terminal resizing, and command-line tools that behave differently when attached to a terminal.
+
+The file also re-exports shared process types, such as handles for controlling a spawned process, signals that can be sent to it, terminal size information, and helpers for combining output streams. It defines a default output buffer cap of one megabyte, which gives the rest of the crate a common safety limit for collected output. On Windows, it conditionally exposes ConPTY-related types, which are Windows’ built-in pseudo-terminal support.
 
 
 ### `utils/pty/src/process_group.rs`
 
-`util` · `spawn setup and termination`
+`util` · `process spawn and cleanup`
 
-This module centralizes the low-level OS calls that make process cleanup semantics consistent across the pipe and PTY backends. On Unix, it can detach a child from the parent's controlling terminal with `setsid`, fall back to `setpgid(0, 0)` when `setsid` fails with `EPERM`, and send signals to whole process groups rather than single PIDs. That distinction matters because shells, REPLs, and background jobs often spawn grandchildren that would otherwise survive if only the direct child were killed.
+When this project starts an external command, that command may start more commands of its own. If the project later stops only the first process, its children can keep running in the background. This file prevents that by using process groups: an operating-system feature that treats related processes like a single family. Then the project can send one signal to the whole family.
 
-The Linux-only `set_parent_death_signal` helper is designed for use inside `pre_exec`: it installs `PR_SET_PDEATHSIG` with `SIGTERM`, then immediately re-checks `getppid()` against the captured parent PID to close the fork/exec race where the parent dies before the setting takes effect. Group-kill helpers are intentionally best-effort: `kill_process_group_by_pid` first resolves a PGID with `getpgid`, and both it and the lower-level `signal_process_group_id` suppress `NotFound`/`ESRCH` so callers can treat already-exited groups as success.
+On Unix-like systems, the helpers here can put a new child process into its own process group, detach it from the parent terminal, and send signals such as SIGTERM, SIGINT, or SIGKILL. In plain terms: SIGTERM asks a process to stop, SIGINT is like pressing Ctrl-C, and SIGKILL forces it to stop immediately. On Linux, there is also a safety feature that tells the child to receive SIGTERM if its parent process dies, reducing the chance of orphaned work.
 
-The public API exposes three signal flavors by process-group ID—terminate (`SIGTERM`), interrupt (`SIGINT`), and kill (`SIGKILL`)—plus a convenience helper that derives the group from a `tokio::process::Child`. Non-Unix implementations return success or `false` as appropriate so higher-level code can compile unchanged.
+The file is careful about races and already-exited processes. If a process group is gone, the cleanup functions usually treat that as success, because there is nothing left to kill. On non-Unix platforms, these functions are harmless no-ops, so the rest of the code can call them without needing separate platform-specific branches.
 
 #### Function details
 
@@ -2438,11 +2456,11 @@ The public API exposes three signal flavors by process-group ID—terminate (`SI
 fn set_parent_death_signal(_parent_pid: i32) -> io::Result<()>
 ```
 
-**Purpose**: On Linux, arranges for the child to receive `SIGTERM` if its original parent dies and closes the race between fork and exec. On other platforms the alternate definition is a no-op.
+**Purpose**: On Linux, this asks the operating system to send SIGTERM to the child if the original parent process dies. This is a cleanup safety net, so a launched command is less likely to be left running after the launcher disappears.
 
-**Data flow**: Takes the captured `parent_pid`, calls `prctl(PR_SET_PDEATHSIG, SIGTERM)`, then compares `getppid()` to the captured value. If the parent changed, it raises `SIGTERM` in the child; otherwise it returns `Ok(())`, and any syscall failure becomes `last_os_error()`.
+**Data flow**: It receives the parent process ID captured before spawning the child. It tells the OS to set a parent-death signal, then checks the current parent ID again; if the parent has already changed, it raises SIGTERM in the child immediately. It returns success if the setup worked, or an I/O error if the OS call failed. On non-Linux systems, it simply returns success without changing anything.
 
-**Call relations**: This helper is invoked from the pipe backend's Unix `pre_exec` closure. It exists specifically to make orphaned detached children self-terminate when the spawning process disappears.
+**Call relations**: This is meant to be run during child setup before the new program fully starts. It talks directly to operating-system calls such as prctl, getppid, and raise; no other listed function in this file calls it.
 
 *Call graph*: 4 external calls (last_os_error, getppid, prctl, raise).
 
@@ -2453,11 +2471,11 @@ fn set_parent_death_signal(_parent_pid: i32) -> io::Result<()>
 fn detach_from_tty() -> io::Result<()>
 ```
 
-**Purpose**: Detaches the calling child from the controlling terminal by creating a new session. If `setsid` is not permitted because the process is already a group leader, it falls back to creating a fresh process group.
+**Purpose**: This detaches a child process from the controlling terminal by starting a new session. That matters for non-interactive commands, so they do not accidentally inherit terminal behavior from the parent.
 
-**Data flow**: Calls `libc::setsid()` and inspects the result. On success it returns `Ok(())`; on failure it reads `last_os_error()`, invokes `set_process_group()` only for `EPERM`, and otherwise returns the original error.
+**Data flow**: It takes no input. On Unix, it asks the OS to start a new session; if that fails because the process is already in a position where a new session is not allowed, it falls back to putting the process in its own process group. It returns success or an I/O error. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This function is used in the pipe backend's `pre_exec` hook before exec. It delegates to `set_process_group` only in the specific fallback case where a full session detach cannot be performed.
+**Call relations**: This is used during child-process setup. If the direct session-detach step fails with the expected permission-style case, it calls set_process_group as a fallback so the child is still separated from the parent’s group.
 
 *Call graph*: calls 1 internal fn (set_process_group); 2 external calls (last_os_error, setsid).
 
@@ -2468,11 +2486,11 @@ fn detach_from_tty() -> io::Result<()>
 fn set_process_group() -> io::Result<()>
 ```
 
-**Purpose**: Places the calling process into its own process group using `setpgid(0, 0)`. It is the lighter-weight fallback when a new session cannot be created.
+**Purpose**: This puts the current process into its own process group. The goal is to make a spawned command the leader of a group that can later be signaled or killed as one unit.
 
-**Data flow**: Calls `libc::setpgid(0, 0)` and returns `Ok(())` on success or `Err(last_os_error())` on failure.
+**Data flow**: It takes no input. On Unix, it calls the OS to set the process group ID of the current process to itself. It returns success if the OS accepts the change, or an I/O error if not. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This helper is called by `detach_from_tty` when `setsid` fails with `EPERM`. It gives the child a distinct process group so later group-directed signals still work.
+**Call relations**: This is intended for child setup before the child program starts running. detach_from_tty calls it as a fallback when starting a new session is not allowed.
 
 *Call graph*: called by 1 (detach_from_tty); 2 external calls (last_os_error, setpgid).
 
@@ -2483,11 +2501,11 @@ fn set_process_group() -> io::Result<()>
 fn kill_process_group_by_pid(_pid: u32) -> io::Result<()>
 ```
 
-**Purpose**: Finds the process group associated with a PID and sends `SIGKILL` to that entire group. Missing processes or groups are treated as benign.
+**Purpose**: This force-kills the process group that contains a given process ID. It is useful when the code knows the child process ID but not the process group ID.
 
-**Data flow**: Converts the input `u32` PID to `libc::pid_t`, calls `getpgid(pid)`, and if successful calls `killpg(pgid, SIGKILL)`. It suppresses `NotFound`/`ESRCH` from either lookup or kill, returning `Ok(())` in those cases, and propagates other OS errors.
+**Data flow**: It receives a process ID as a number. On Unix, it asks the OS which process group that process belongs to, then sends SIGKILL to the whole group. If the process or group is already gone, it treats that as okay; otherwise, real OS errors are returned. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This helper is used by `kill_child_process_group` when only a `tokio::process::Child` is available. It encapsulates the two-step PID-to-PGID resolution plus best-effort semantics.
+**Call relations**: kill_child_process_group uses this when it has a Tokio child process and can read its process ID. Internally, this function talks directly to the OS through getpgid and killpg.
 
 *Call graph*: called by 1 (kill_child_process_group); 3 external calls (last_os_error, getpgid, killpg).
 
@@ -2498,11 +2516,11 @@ fn kill_process_group_by_pid(_pid: u32) -> io::Result<()>
 fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<bool>
 ```
 
-**Purpose**: Internal Unix helper that sends an arbitrary signal to a known process-group ID and reports whether the group existed. It is the common implementation behind terminate, interrupt, and kill.
+**Purpose**: This is the shared Unix helper for sending a chosen signal to a known process group ID. It avoids repeating the same error handling in the terminate, interrupt, and kill functions.
 
-**Data flow**: Takes a `libc::pid_t` PGID and a signal number, calls `killpg`, and returns `Ok(true)` on success. If `killpg` reports `NotFound` or `ESRCH`, it returns `Ok(false)`; any other failure becomes `Err(last_os_error())`.
+**Data flow**: It receives a process group ID and a signal number. It sends that signal to the whole group. If the group exists, it returns true; if the group is already gone, it returns false; if another OS error happens, it returns that error.
 
-**Call relations**: This private helper is called by `terminate_process_group`, `interrupt_process_group`, and `kill_process_group`. It centralizes the shared error handling and existence reporting.
+**Call relations**: This is the private worker used by terminate_process_group, interrupt_process_group, and kill_process_group. Those public functions choose the signal, while this helper performs the common send-and-check behavior.
 
 *Call graph*: called by 3 (interrupt_process_group, kill_process_group, terminate_process_group); 2 external calls (last_os_error, killpg).
 
@@ -2513,11 +2531,11 @@ fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result
 fn terminate_process_group(_process_group_id: u32) -> io::Result<bool>
 ```
 
-**Purpose**: Sends `SIGTERM` to a specific process group and tells the caller whether that group still existed. It is the soft-termination counterpart to hard kill.
+**Purpose**: This asks a specific process group to stop by sending SIGTERM. SIGTERM is the polite shutdown signal: it gives programs a chance to clean up before exiting.
 
-**Data flow**: Converts the `u32` process-group ID to `libc::pid_t`, forwards it with `SIGTERM` to `signal_process_group_id`, and returns the resulting `io::Result<bool>`.
+**Data flow**: It receives a process group ID. On Unix, it passes that ID and the SIGTERM signal to signal_process_group_id, then returns whether the group was found and signaled. On non-Unix systems, it returns false because no signal was sent.
 
-**Call relations**: Higher-level termination code uses this when it wants a graceful process-tree shutdown before escalating. It is a thin public wrapper over the shared signaling helper.
+**Call relations**: Higher-level cleanup flows such as terminate_process_tree and terminate call this when they want a graceful stop for a whole process group. It delegates the actual OS signaling and missing-group handling to signal_process_group_id.
 
 *Call graph*: calls 1 internal fn (signal_process_group_id); called by 2 (terminate_process_tree, terminate).
 
@@ -2528,11 +2546,11 @@ fn terminate_process_group(_process_group_id: u32) -> io::Result<bool>
 fn interrupt_process_group(_process_group_id: u32) -> io::Result<()>
 ```
 
-**Purpose**: Sends `SIGINT` to a specific process group as a best-effort interrupt. It discards the existence boolean because callers only care whether the operation errored.
+**Purpose**: This sends SIGINT to a specific process group, which is similar to a user pressing Ctrl-C in a terminal. It is used when the project wants to interrupt a running command rather than immediately force-kill it.
 
-**Data flow**: Converts the `u32` process-group ID to `libc::pid_t`, calls `signal_process_group_id(..., SIGINT)`, maps the `bool` success indicator to `()`, and returns `io::Result<()>`.
+**Data flow**: It receives a process group ID. On Unix, it sends SIGINT through signal_process_group_id and ignores the true-or-false detail about whether the group still existed, returning only success or error. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This function is used by multiple backend-specific `signal` implementations when handling `ProcessSignal::Interrupt`. It provides Ctrl-C-like semantics to the whole process group.
+**Call relations**: Several signal-related callers use this when they need to pass an interrupt through to a child command group. It relies on signal_process_group_id for the actual group signal behavior.
 
 *Call graph*: calls 1 internal fn (signal_process_group_id); called by 3 (signal, signal, signal).
 
@@ -2543,11 +2561,11 @@ fn interrupt_process_group(_process_group_id: u32) -> io::Result<()>
 fn kill_process_group(_process_group_id: u32) -> io::Result<()>
 ```
 
-**Purpose**: Sends `SIGKILL` to a specific process group as a best-effort hard kill. Like interrupt, it ignores whether the group already vanished.
+**Purpose**: This force-kills a specific process group with SIGKILL. It is the hard-stop option for when a command and its descendants must be ended immediately.
 
-**Data flow**: Converts the `u32` process-group ID to `libc::pid_t`, calls `signal_process_group_id(..., SIGKILL)`, maps the boolean to `()`, and returns `io::Result<()>`.
+**Data flow**: It receives a process group ID. On Unix, it sends SIGKILL through signal_process_group_id and returns success unless the OS reports a real error. If the group is already gone, that is treated as fine. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This helper is the hard-stop primitive used by both pipe and PTY terminators and by other process-tree cleanup paths. It relies on `signal_process_group_id` for ESRCH suppression.
+**Call relations**: This is used by stronger cleanup paths such as drop, kill_process_tree, and kill when polite shutdown is not enough or when resources are being torn down. It hands the actual signal delivery to signal_process_group_id.
 
 *Call graph*: calls 1 internal fn (signal_process_group_id); called by 5 (drop, kill_process_tree, kill, kill, kill).
 
@@ -2558,24 +2576,24 @@ fn kill_process_group(_process_group_id: u32) -> io::Result<()>
 fn kill_child_process_group(_child: &mut Child) -> io::Result<()>
 ```
 
-**Purpose**: Kills the process group associated with a `tokio::process::Child` if that child still has a PID. It is a convenience wrapper for callers that have not cached the PGID separately.
+**Purpose**: This force-kills the process group belonging to a Tokio child process. It is a convenience wrapper for code that has a child handle rather than a raw process ID.
 
-**Data flow**: Reads `child.id()`, and if it yields `Some(pid)` forwards that PID to `kill_process_group_by_pid`; otherwise it returns `Ok(())`.
+**Data flow**: It receives a mutable child-process handle. It asks the handle for its process ID; if there is one, it calls kill_process_group_by_pid to kill the whole group. If there is no ID, it returns success because there is no known process to target. On non-Unix systems, it does nothing and returns success.
 
-**Call relations**: This helper is used by code paths that manage a Tokio child directly rather than through the crate's cached process-group IDs.
+**Call relations**: Callers use this during cleanup of an async child process. It bridges from Tokio’s child handle to the lower-level process-group cleanup function, kill_process_group_by_pid.
 
 *Call graph*: calls 1 internal fn (kill_process_group_by_pid); 1 external calls (id).
 
 
 ### `utils/pty/src/pipe.rs`
 
-`io_transport` · `process spawn and runtime I/O forwarding`
+`io_transport` · `process spawn and child process lifetime`
 
-This file is the pipe-mode spawn path for commands that should not run under a terminal emulator. Its core routine constructs a `tokio::process::Command`, clears and repopulates the environment from a provided `HashMap<String, String>`, sets the working directory, optionally overrides `argv[0]` on Unix, and configures stdin either as `Stdio::piped()` or `Stdio::null()` via the internal `PipeStdinMode` enum. On Unix, the `pre_exec` hook detaches the child from the controlling TTY, optionally installs Linux parent-death signaling, and closes inherited file descriptors except an explicit allowlist.
+Some programs need to be run in the background while this project feeds them input and watches their output. This file does that using regular pipes: one pipe for stdin, one for stdout, and one for stderr. A pipe is like a one-way tube between this program and the child program.
 
-After spawning, the file splits child I/O into channels: one `mpsc::Sender<Vec<u8>>` for stdin writes, separate `mpsc::Receiver<Vec<u8>>` streams for stdout and stderr, and a `oneshot::Receiver<i32>` for exit status. Dedicated Tokio tasks forward stdin bytes into the child and read stdout/stderr in 8 KiB chunks using `BufReader`, tolerating `Interrupted` reads and treating EOF or other errors as stream termination. A wait task converts `ExitStatus` into the shared integer convention using `exit_code_from_status`, updates shared `AtomicBool`/`Mutex<Option<i32>>` state, and fulfills the exit oneshot.
+The main worker is `spawn_process_with_stdin_mode`. It builds a command, sets its working folder and environment, chooses whether stdin should be writable or closed, and starts the child. It then creates small background tasks: one task writes bytes sent by the rest of the project into the child’s stdin, and other tasks continuously read stdout and stderr and forward those bytes through channels. A channel is an in-program queue used to pass messages safely between asynchronous tasks.
 
-Termination is process-group aware on Unix: `PipeChildTerminator` stores the spawned PID as a process-group ID and sends `SIGINT`/`SIGKILL` to the whole group so descendants do not survive shutdown. On Windows it falls back to direct process termination by PID.
+The file also creates a `ProcessHandle`, which is the project’s control panel for the child process. It can send input, track whether the process has exited, store the exit code, and terminate the child. On Unix-like systems it stops the whole process group, not just the first process, so child programs that spawn their own children do not get left behind. On Windows it uses the operating system API to terminate the process directly.
 
 #### Function details
 
@@ -2585,11 +2603,11 @@ Termination is process-group aware on Unix: `PipeChildTerminator` stores the spa
 fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>
 ```
 
-**Purpose**: Delivers an interactive-style signal to a pipe-backed child terminator. In practice it only supports `ProcessSignal::Interrupt`, mapping that to a Unix process-group interrupt and rejecting it on unsupported platforms.
+**Purpose**: Sends a softer control signal to the child process when supported. In practice this is used for an interrupt request, like pressing Ctrl-C in a terminal.
 
-**Data flow**: Reads the requested `ProcessSignal` plus the terminator's stored `process_group_id` on Unix. It matches the signal enum, transforms `Interrupt` into either `crate::process_group::interrupt_process_group(...)` or an `Unsupported` `io::Error`, and returns that result without mutating other shared state.
+**Data flow**: It receives a requested `ProcessSignal`. If the signal is `Interrupt` and the platform is Unix-like, it passes the interrupt to the child’s process group. On non-Unix platforms it reports that this signal is not supported. The result is either success or an operating-system error.
 
-**Call relations**: This method is invoked through `ProcessHandle::signal` when callers want a soft interrupt instead of a hard kill. It delegates to the process-group helper so the signal reaches the whole spawned group rather than only the immediate child.
+**Call relations**: This method is used through the `ChildTerminator` interface stored inside the `ProcessHandle`. When higher-level code asks the handle to interrupt the process, this method either hands the request to `interrupt_process_group` on Unix or to `unsupported_signal` elsewhere.
 
 *Call graph*: calls 2 internal fn (unsupported_signal, interrupt_process_group).
 
@@ -2600,11 +2618,11 @@ fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>
 fn kill(&mut self) -> io::Result<()>
 ```
 
-**Purpose**: Performs the hard-stop path for a pipe-backed process. It targets the entire Unix process group when available, uses a Windows PID kill helper on Windows, and otherwise becomes a no-op on unsupported targets.
+**Purpose**: Forcefully stops the child process. On Unix-like systems it kills the whole process group so related subprocesses are stopped too; on Windows it kills the process by its process ID.
 
-**Data flow**: Consumes mutable access to the terminator and reads either `process_group_id` or `pid` depending on platform. It converts that stored identifier into a backend-specific kill operation and returns the resulting `io::Result<()>`.
+**Data flow**: It reads the stored process identity: a process group ID on Unix-like systems, or a process ID on Windows. It sends a forceful termination request to the operating system. It returns success if the request was made successfully, or an I/O error if the operating system refused or failed it.
 
-**Call relations**: This is reached from `ProcessHandle::request_terminate`, which is itself used by `ProcessHandle::terminate` and drop cleanup. It delegates to `kill_process_group` or `kill_process` so shutdown semantics match the backend's platform capabilities.
+**Call relations**: This method is also used through the `ChildTerminator` inside `ProcessHandle`. When the rest of the system decides a spawned process must be stopped, this method delegates to `kill_process_group` on Unix-like systems or to `kill_process` on Windows.
 
 *Call graph*: calls 2 internal fn (kill_process, kill_process_group).
 
@@ -2615,11 +2633,11 @@ fn kill(&mut self) -> io::Result<()>
 fn kill_process(pid: u32) -> io::Result<()>
 ```
 
-**Purpose**: Implements Windows-only direct process termination by PID using Win32 APIs. It opens the process with terminate rights, calls `TerminateProcess`, and closes the handle regardless of success.
+**Purpose**: Windows-only helper that forcefully terminates one process by its process ID. It exists because Windows process termination uses a different system API than Unix-like systems.
 
-**Data flow**: Takes a `u32` PID, passes it to `OpenProcess(PROCESS_TERMINATE, ...)`, then feeds the returned handle to `TerminateProcess`. It captures `last_os_error()` before closing the handle, returns `Err` if opening or termination failed, and otherwise returns `Ok(())`.
+**Data flow**: It takes a Windows process ID. It asks Windows for a handle with permission to terminate that process, calls the Windows termination function, closes the handle afterward, and returns either success or the last operating-system error.
 
-**Call relations**: This helper is only used by `PipeChildTerminator::kill` on Windows. It isolates the unsafe Win32 sequence so the higher-level terminator can keep a platform-neutral interface.
+**Call relations**: It is called by `PipeChildTerminator::kill` on Windows. That keeps the public termination behavior the same for callers while hiding the Windows-specific steps in this small helper.
 
 *Call graph*: called by 1 (kill); 4 external calls (last_os_error, CloseHandle, OpenProcess, TerminateProcess).
 
@@ -2630,11 +2648,11 @@ fn kill_process(pid: u32) -> io::Result<()>
 async fn read_output_stream(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>)
 ```
 
-**Purpose**: Continuously drains one async output stream from the child and forwards each chunk into an `mpsc` channel. It stops on EOF or non-interruption errors.
+**Purpose**: Continuously reads bytes from one output stream, such as stdout or stderr, and forwards each chunk to a channel. This lets other parts of the program receive child output as it arrives.
 
-**Data flow**: Accepts an `AsyncRead + Unpin` reader and an `mpsc::Sender<Vec<u8>>`. It repeatedly reads into a reusable 8,192-byte buffer, clones the read slice into a fresh `Vec<u8>` for each successful read, sends that vector to the channel, retries on `ErrorKind::Interrupted`, and returns `()` when the stream closes or errors.
+**Data flow**: It receives an asynchronous reader and a sending side of a channel. It repeatedly reads up to 8 KB at a time. Each successful chunk is copied into a fresh byte vector and sent through the channel. If the stream reaches end-of-file, it stops. If a read is interrupted temporarily, it tries again; for other read errors, it stops.
 
-**Call relations**: This function is spawned separately for stdout and stderr inside `spawn_process_with_stdin_mode`. It is the low-level bridge between OS pipe reads and the channel-based output API exposed by `SpawnedProcess`.
+**Call relations**: `spawn_process_with_stdin_mode` starts background tasks that call this helper for stdout and stderr. Those tasks turn raw pipe reads into channel messages that the returned `SpawnedProcess` exposes to the caller.
 
 *Call graph*: 3 external calls (read, send, vec!).
 
@@ -2652,11 +2670,11 @@ async fn spawn_process_with_stdin_mode(
     inherit
 ```
 
-**Purpose**: Creates a fully wired pipe-backed `SpawnedProcess`, including child process creation, stdin writer task, stdout/stderr reader tasks, exit tracking, and a `ProcessHandle` with termination support. It is the shared implementation behind both normal pipe spawn and no-stdin variants.
+**Purpose**: Starts a child program using regular pipes and builds all the machinery needed to talk to it, read its output, wait for it, and stop it. This is the central implementation used by the simpler public spawn functions.
 
-**Data flow**: Consumes the executable path, argument slice, cwd, environment map, optional `arg0`, a `PipeStdinMode`, and an inherited-FD allowlist. It validates that `program` is non-empty, builds and configures a `tokio::process::Command`, spawns the child, extracts stdio handles, creates `mpsc` channels for stdin/stdout/stderr plus a `oneshot` for exit, launches async tasks to write stdin and read stdout/stderr, launches a wait task that computes an integer exit code and stores it in shared `Arc<AtomicBool>` and `Arc<StdMutex<Option<i32>>>`, then packages everything into `ProcessHandle::new` and returns `SpawnedProcess { session, stdout_rx, stderr_rx, exit_rx }`.
+**Data flow**: It receives the program name, arguments, working directory, environment variables, optional custom argv0 name, a choice of whether stdin is piped or closed, and a list of Unix file descriptors to preserve. It validates that a program was provided, configures a Tokio command, sets up platform-specific process behavior, starts the child, takes its stdin/stdout/stderr pipes, and creates channels plus background tasks for writing input, reading output, and waiting for exit. It returns a `SpawnedProcess` containing the control handle, output receivers, and exit notification receiver.
 
-**Call relations**: This is the central constructor called by `spawn_process` and `spawn_process_no_stdin_with_inherited_fds`. Internally it delegates Unix setup to `detach_from_tty`, Linux parent cleanup to `set_parent_death_signal`, inherited-FD pruning to `close_inherited_fds_except`, stream draining to `read_output_stream`, and exit normalization to `exit_code_from_status`.
+**Call relations**: `spawn_process` calls it when stdin should stay open. `spawn_process_no_stdin_with_inherited_fds` calls it when stdin should be closed and selected Unix file descriptors should be preserved. Internally it calls `exit_code_from_status` after the child finishes so callers get a simple numeric exit code instead of a raw operating-system status.
 
 *Call graph*: calls 1 internal fn (exit_code_from_status); called by 2 (spawn_process, spawn_process_no_stdin_with_inherited_fds); 13 external calls (clone, new, new, new, new, null, piped, new, bail!, new (+3 more)).
 
@@ -2673,11 +2691,11 @@ async fn spawn_process(
 ) -> Result<SpawnedProcess>
 ```
 
-**Purpose**: Public convenience wrapper for spawning a pipe-backed process with a writable stdin pipe. It selects the `Piped` stdin mode and no inherited file descriptors.
+**Purpose**: Public convenience function for starting a child process with writable stdin. Use this when the caller may need to send input to the program after it starts.
 
-**Data flow**: Passes `program`, `args`, `cwd`, `env`, and `arg0` through unchanged, adds `PipeStdinMode::Piped` and an empty inherited-FD slice, and returns the `Result<SpawnedProcess>` from the shared implementation.
+**Data flow**: It receives the program setup: executable name, arguments, working directory, environment, and optional argv0. It adds the choice that stdin should be piped, passes everything to `spawn_process_with_stdin_mode`, and returns the resulting `SpawnedProcess`.
 
-**Call relations**: This is the standard pipe entry used by higher-level callers that expect to write to child stdin. It exists only to choose the appropriate mode before delegating to `spawn_process_with_stdin_mode`.
+**Call relations**: This is the simple entry point for pipe-based spawning when input is needed. It delegates all real setup work to `spawn_process_with_stdin_mode` so the complicated pipe and task setup lives in one place.
 
 *Call graph*: calls 1 internal fn (spawn_process_with_stdin_mode).
 
@@ -2694,11 +2712,11 @@ async fn spawn_process_no_stdin(
 ) -> Result<SpawnedProcess>
 ```
 
-**Purpose**: Public convenience wrapper for spawning a pipe-backed process with stdin closed immediately. It is the simple no-stdin variant when no inherited descriptors need preserving.
+**Purpose**: Public convenience function for starting a child process with stdin closed immediately. Use this when the child should not wait for input from this program.
 
-**Data flow**: Forwards the executable, args, cwd, env, and optional `arg0`, appends an empty inherited-FD list, and returns the result from `spawn_process_no_stdin_with_inherited_fds`.
+**Data flow**: It receives the same basic process setup as `spawn_process`. It supplies an empty list of inherited file descriptors and passes the request to `spawn_process_no_stdin_with_inherited_fds`. The returned value is still a `SpawnedProcess`, but its stdin is connected to null rather than to a writable pipe.
 
-**Call relations**: This wrapper is used when callers want split stdout/stderr but no stdin channel. It delegates to the inherited-FD-aware variant so there is only one implementation of the null-stdin path.
+**Call relations**: This wrapper is for the common no-stdin case. It hands off to `spawn_process_no_stdin_with_inherited_fds`, which then uses the shared spawning implementation.
 
 *Call graph*: calls 1 internal fn (spawn_process_no_stdin_with_inherited_fds).
 
@@ -2716,26 +2734,26 @@ async fn spawn_process_no_stdin_with_inherited_fds(
 ) -
 ```
 
-**Purpose**: Spawns a pipe-backed process with stdin connected to `/dev/null` or platform equivalent while preserving a selected set of inherited Unix file descriptors across exec. This is the specialized path used by tests and session startup code that need descriptor inheritance without a PTY.
+**Purpose**: Starts a child process with stdin closed, while optionally preserving selected Unix file descriptors. This is useful when a child needs access to specific already-open resources but should not receive normal stdin.
 
-**Data flow**: Accepts the same spawn parameters as the normal pipe path plus `inherited_fds: &[i32]`. It forwards all inputs to `spawn_process_with_stdin_mode` with `PipeStdinMode::Null`, preserving the allowlist for the Unix `pre_exec` closure, and returns the resulting `SpawnedProcess`.
+**Data flow**: It receives the program setup plus a list of file descriptor numbers to keep open across the Unix `exec` step, which is the moment the child process becomes the requested program. It asks `spawn_process_with_stdin_mode` to use null stdin and to preserve those descriptors. It returns the completed `SpawnedProcess` setup.
 
-**Call relations**: This function is called by `spawn_process_no_stdin`, by session-opening code that needs inherited descriptors, and by tests that verify descriptor preservation. Its only job is selecting the null-stdin mode before handing off to the shared constructor.
+**Call relations**: It is called by `spawn_process_no_stdin` for the simple closed-stdin case, by higher-level session-opening code such as `open_session_with_exec_env`, and by tests that check inherited file descriptors. It delegates the actual command building, pipe setup, and waiting logic to `spawn_process_with_stdin_mode`.
 
 *Call graph*: calls 1 internal fn (spawn_process_with_stdin_mode); called by 3 (open_session_with_exec_env, spawn_process_no_stdin, pipe_spawn_no_stdin_can_preserve_inherited_fds).
 
 
 ### `utils/pty/src/pty.rs`
 
-`io_transport` · `process spawn, PTY I/O, terminal control`
+`io_transport` · `session startup and process runtime`
 
-This file is the terminal-backed spawn implementation. It supports two PTY strategies: a portable path using `portable_pty` for normal operation, and a Unix-specific raw `openpty`/`std::process::Command` path when selected inherited file descriptors must survive exec. Both paths return a `SpawnedProcess` with a `ProcessHandle`, stdout channel, dummy stderr channel (PTY output is merged), and exit oneshot.
+Many command-line programs change their behavior depending on whether they are connected to a real terminal. Shells, Python REPLs, text editors, and prompts often need a PTY, which is like a software version of a terminal window. This file is the bridge between the rest of the project and that terminal-like environment.
 
-The portable path opens a PTY pair from a platform-native PTY system (`ConPtySystem` on Windows, `native_pty_system()` elsewhere), builds a `portable_pty::CommandBuilder`, clears and repopulates the environment, spawns the child on the slave side, and then creates a blocking reader thread over the PTY master plus an async writer task guarded by `tokio::sync::Mutex`. On Unix it caches `child.process_id()` as the process-group ID because portable-pty makes the child a session leader, allowing group-wide interrupt/kill semantics.
+The main job here is to launch a child process, connect it to a PTY, and turn the low-level terminal pipes into easier async channels. Bytes sent by the rest of the program go into a writer channel and are written to the PTY. Bytes produced by the child are read from the PTY and sent out through a stdout channel. A separate waiting task watches for the child to exit and reports its exit code.
 
-The inherited-FD path bypasses portable-pty on Unix. It manually opens a PTY with `libc::openpty`, marks both ends `FD_CLOEXEC`, clones the slave fd three times for stdin/stdout/stderr, and in `pre_exec` resets several signal dispositions to defaults, clears the signal mask, creates a new session with `setsid`, makes fd 0 the controlling terminal via `TIOCSCTTY`, and closes all inherited descriptors except an allowlist while preserving CLOEXEC descriptors needed for exec-error reporting. It stores the master as `PtyMasterHandle::Opaque`, enabling later resize through raw `ioctl(TIOCSWINSZ)`.
+On normal paths, the file uses the portable-pty library so the same idea works across operating systems. On Unix, there is a special path for preserving selected file descriptors, which are numbered operating-system handles for open files, sockets, or pipes. That special path manually opens the PTY and carefully prepares the child process before it starts.
 
-Termination is careful about descendants: `PtyChildTerminator` prefers killing the Unix process group and also invokes the direct child killer in case the cached PGID is stale, while `RawPidTerminator` always targets the process group directly.
+The file also pays attention to cleanup. For interactive programs, killing only the top process can leave child processes behind. On Unix it therefore targets the whole process group, which is like dismissing an entire tour group instead of only the guide.
 
 #### Function details
 
@@ -2745,11 +2763,11 @@ Termination is careful about descendants: `PtyChildTerminator` prefers killing t
 fn conpty_supported() -> bool
 ```
 
-**Purpose**: Reports whether Windows ConPTY support is available. On non-Windows builds the alternate definition simply returns `true` so PTY support is treated as present.
+**Purpose**: This answers whether Windows has ConPTY, Microsoft's modern pseudo-terminal support. On non-Windows systems it simply says yes, because this project uses the native PTY support available there.
 
-**Data flow**: Takes no input and either forwards to `crate::win::conpty_supported()` on Windows or returns a constant boolean on other platforms.
+**Data flow**: It takes no input. On Windows it asks the Windows-specific support code whether ConPTY is available; elsewhere it returns true. The output is a simple true-or-false value used before trying to create terminal sessions.
 
-**Call relations**: This helper is used by higher-level code that needs to know whether the Windows PTY backend can be used.
+**Call relations**: When other code needs to know if PTY sessions can work on the current machine, it calls this function. On Windows, the question is handed off to the platform-specific ConPTY checker.
 
 *Call graph*: 1 external calls (conpty_supported).
 
@@ -2760,11 +2778,11 @@ fn conpty_supported() -> bool
 fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()>
 ```
 
-**Purpose**: Implements soft signaling for portable-PTY children. It supports `Interrupt` only when a Unix process-group ID was captured; otherwise it reports the signal as unsupported.
+**Purpose**: This sends a gentle control signal, currently an interrupt, to a process that was started through the portable PTY path. An interrupt is the programmatic version of pressing Ctrl-C in a terminal.
 
-**Data flow**: Reads the requested `ProcessSignal` and, on Unix, the optional `process_group_id`. For `Interrupt`, it either calls `interrupt_process_group(process_group_id)` or returns `unsupported_signal(signal)`.
+**Data flow**: It receives a requested process signal. If the signal is Interrupt and this Unix process has a known process group, it sends the interrupt to that whole group. If it cannot do that, it returns an error saying the signal is not supported.
 
-**Call relations**: This method is invoked through `ProcessHandle::signal` for PTY-backed sessions created by the portable path. It delegates to process-group signaling so shells and descendants receive the interrupt together.
+**Call relations**: The process handle calls this when higher-level code wants to interrupt a PTY-backed child. On Unix it delegates to the process-group helper so shells and their child commands receive the interrupt together.
 
 *Call graph*: calls 2 internal fn (unsupported_signal, interrupt_process_group).
 
@@ -2775,11 +2793,11 @@ fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()>
 fn kill(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Hard-kills a portable-PTY child, preferring Unix process-group semantics so descendant processes do not survive. It also invokes the direct child killer to cover stale or missing PGID cases.
+**Purpose**: This forcefully stops a process started through the portable PTY path. On Unix, it tries to stop the whole process group so background children from shells or REPLs do not survive.
 
-**Data flow**: On Unix, if `process_group_id` is present, it first records the result of `kill_process_group(process_group_id)`, then calls `self.killer.kill()`, and combines the two results so `NotFound` from the direct child can still succeed if the group kill worked. Without a PGID, it simply returns `self.killer.kill()`.
+**Data flow**: It reads the stored child-killer object and, on Unix, the stored process group id if one exists. With a group id, it asks the operating system to kill the group and also tries the direct child killer. Without a group id, it only uses the direct child killer. It returns success or an operating-system error.
 
-**Call relations**: This is the PTY backend's hard-stop implementation used by `ProcessHandle::request_terminate`. Its dual kill strategy is a deliberate design choice to match the pipe backend's descendant cleanup while still handling stale cached PGIDs.
+**Call relations**: The process handle uses this during shutdown or forced termination. It hands the hard-kill work to the process-group helper where possible, while still using portable-pty's own child killer as a fallback.
 
 *Call graph*: calls 1 internal fn (kill_process_group).
 
@@ -2790,11 +2808,11 @@ fn kill(&mut self) -> std::io::Result<()>
 fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()>
 ```
 
-**Purpose**: Implements `Interrupt` for the Unix raw-PTY path by signaling the cached process group directly. Unlike the portable terminator, this path always has a concrete PGID.
+**Purpose**: This sends an interrupt to a Unix process that was started through the manual PTY path. It targets the whole process group rather than only the first child process.
 
-**Data flow**: Takes a `ProcessSignal`, matches `Interrupt`, forwards the stored `process_group_id` to `interrupt_process_group`, and returns that `io::Result<()>`.
+**Data flow**: It receives a signal request and uses the stored process group id. For an Interrupt request, it sends the interrupt to that group and returns the result from the operating system.
 
-**Call relations**: This terminator is installed by `spawn_process_preserving_fds`, where the child was created manually and the process group ID is known from `child.id()`.
+**Call relations**: The manually spawned Unix PTY process uses this terminator inside its process handle. When higher-level code asks for Ctrl-C behavior, this function passes that request to the process-group interrupt helper.
 
 *Call graph*: calls 1 internal fn (interrupt_process_group).
 
@@ -2805,11 +2823,11 @@ fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()>
 fn kill(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Hard-kills the Unix raw-PTY child's process group. It is the simplest terminator because the raw path tracks only the PGID, not a portable child killer object.
+**Purpose**: This forcefully kills a Unix process group created by the manual PTY spawning path. It exists so cleanup reaches child processes launched by an interactive shell or REPL.
 
-**Data flow**: Reads `self.process_group_id`, passes it to `kill_process_group`, and returns the resulting `io::Result<()>`.
+**Data flow**: It reads the stored process group id, asks the operating system to kill that group, and returns success or the error that came back.
 
-**Call relations**: This method is used by `ProcessHandle::request_terminate` for sessions spawned through the inherited-FD PTY path.
+**Call relations**: The process handle calls this when the manual Unix PTY session must be torn down. It delegates the actual kill operation to the shared process-group helper.
 
 *Call graph*: calls 1 internal fn (kill_process_group).
 
@@ -2820,11 +2838,11 @@ fn kill(&mut self) -> std::io::Result<()>
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send>
 ```
 
-**Purpose**: Selects the concrete PTY system implementation for the current platform. It uses the custom `ConPtySystem` on Windows and `portable_pty::native_pty_system()` elsewhere.
+**Purpose**: This chooses the PTY implementation for the current operating system. Windows gets the project’s ConPTY wrapper, while other systems use the native portable-pty backend.
 
-**Data flow**: Takes no input and returns a boxed `dyn portable_pty::PtySystem + Send`, constructed from either `ConPtySystem::default()` or `native_pty_system()`.
+**Data flow**: It takes no input. It checks the compile-time operating system target and creates a boxed PTY system object for that platform. The result is returned to the spawning code as the thing that can open a new pseudo-terminal.
 
-**Call relations**: This helper is called only by `spawn_process_portable` so that the rest of the portable PTY logic can remain platform-neutral.
+**Call relations**: The portable spawn path calls this before opening a PTY. It hides the platform choice so the rest of the spawning code can proceed in the same shape on Windows, macOS, Linux, and similar systems.
 
 *Call graph*: called by 1 (spawn_process_portable); 3 external calls (new, native_pty_system, default).
 
@@ -2842,11 +2860,11 @@ async fn spawn_process(
 ) -> Result<SpawnedProcess>
 ```
 
-**Purpose**: Public convenience wrapper for PTY spawning without inherited file descriptors. It forwards to the more general inherited-FD-aware entry point with an empty allowlist.
+**Purpose**: This is the simple public way to start a program inside a PTY. It is used when no extra inherited file descriptors need to be kept open for the child.
 
-**Data flow**: Passes through `program`, `args`, `cwd`, `env`, `arg0`, and `size`, adds `&[]` for inherited fds, and returns the resulting `Result<SpawnedProcess>`.
+**Data flow**: It receives the program name, arguments, working directory, environment variables, optional display name for argv[0], and terminal size. It forwards all of that to the fuller spawning function with an empty list of inherited file descriptors. It returns a spawned-process bundle with input, output, exit, and control handles.
 
-**Call relations**: This is the standard PTY entry used by most callers. It exists to keep the common API simple while sharing implementation with the inherited-FD variant.
+**Call relations**: Callers use this when they just want an interactive terminal process. It immediately hands the real work to spawn_process_with_inherited_fds so there is one central decision point for all PTY launches.
 
 *Call graph*: calls 1 internal fn (spawn_process_with_inherited_fds).
 
@@ -2864,11 +2882,11 @@ async fn spawn_process_with_inherited_fds(
     inherited_f
 ```
 
-**Purpose**: Chooses the appropriate PTY spawn strategy based on platform and whether inherited file descriptors must be preserved. It rejects empty program names before dispatching.
+**Purpose**: This is the main entry for starting a PTY process, with an optional Unix-only feature for preserving selected open file descriptors across program startup. It also rejects empty program names early, before any terminal setup begins.
 
-**Data flow**: Consumes the executable path, args, cwd, env, optional `arg0`, terminal size, and inherited-FD slice. It first errors if `program` is empty, ignores `inherited_fds` on non-Unix, routes to `spawn_process_preserving_fds(...)` on Unix when the allowlist is non-empty, and otherwise calls `spawn_process_portable(...)`.
+**Data flow**: It receives the command setup, terminal size, and a list of file descriptors to preserve. If the program name is empty, it returns an error. On Unix, if preserved descriptors are requested, it chooses the manual Unix spawning path. Otherwise, it chooses the portable PTY spawning path. The output is either a ready-to-use SpawnedProcess or an error.
 
-**Call relations**: This is the main PTY constructor called by the simple wrapper, session-opening code, and several tests. Its key role is selecting between the portable backend and the Unix raw-PTY backend.
+**Call relations**: Higher-level session code and tests call this when launching PTY-backed commands. It acts like a fork in the road: ordinary launches go to spawn_process_portable, while Unix launches that must keep selected descriptors open go to spawn_process_preserving_fds.
 
 *Call graph*: calls 2 internal fn (spawn_process_portable, spawn_process_preserving_fds); called by 6 (open_session_with_exec_env, spawn_process, pty_preserving_inherited_fds_keeps_python_repl_running, pty_spawn_can_preserve_inherited_fds, pty_spawn_with_inherited_fds_reports_exec_failures, pty_spawn_with_inherited_fds_supports_resize); 1 external calls (bail!).
 
@@ -2886,11 +2904,11 @@ async fn spawn_process_portable(
 ) -> Result<SpawnedProces
 ```
 
-**Purpose**: Spawns a PTY-backed process using the `portable_pty` abstraction and wires it into the crate's channel-based session interface. It is the default PTY path when inherited descriptors are not needed.
+**Purpose**: This starts a process in a PTY using the cross-platform portable-pty library. It turns the raw terminal connection into async-friendly channels and a process handle for the rest of the system.
 
-**Data flow**: Takes spawn parameters plus `TerminalSize`, opens a PTY pair from `platform_native_pty_system()`, builds a `CommandBuilder` using `arg0` or `program`, clears and repopulates env, appends args, and spawns the child on the slave. It creates stdin/stdout/stderr channels, a blocking reader task that reads 8 KiB chunks from a cloned PTY master and forwards them to stdout, an async writer task that serializes writes through a mutex-protected PTY writer, and a blocking wait task that waits for child exit, stores exit state/code in shared Arcs, and sends the code over a oneshot. It then retains PTY handles in `PtyHandles`, constructs a `ProcessHandle`, and returns `SpawnedProcess`.
+**Data flow**: It receives the command details and terminal size. It opens a PTY, builds the child command with the requested directory, arguments, and environment, then starts the child on the PTY slave side. It creates background tasks: one reads terminal output into a stdout channel, one writes incoming input bytes to the terminal, and one waits for the child to exit. It returns a SpawnedProcess containing these channels and control handles.
 
-**Call relations**: This function is called by `spawn_process_with_inherited_fds` for the normal PTY case. It delegates PTY-system selection to `platform_native_pty_system` and uses `ProcessHandle::new` to expose the resulting session uniformly.
+**Call relations**: spawn_process_with_inherited_fds calls this for the normal path. It first asks platform_native_pty_system for the right PTY backend, then packages the reader, writer, waiter, terminator, and PTY handles into a ProcessHandle for higher-level code to use.
 
 *Call graph*: calls 1 internal fn (platform_native_pty_system); called by 1 (spawn_process_with_inherited_fds); 14 external calls (clone, new, new, new, new, new, new, cfg!, new, spawn (+4 more)).
 
@@ -2908,11 +2926,11 @@ async fn spawn_process_preserving_fds(
     inherited_fds:
 ```
 
-**Purpose**: Implements the Unix-only PTY spawn path that preserves selected inherited file descriptors across exec. It manually creates and configures the PTY and child process so descriptor inheritance and controlling-terminal setup are under explicit control.
+**Purpose**: This is the Unix-specific spawning path used when the child must inherit selected file descriptors. It manually builds the PTY setup so it can control exactly which descriptors stay open when the new program starts.
 
-**Data flow**: Accepts the executable, args, cwd, env, optional `arg0`, terminal size, and preserved `RawFd` slice. It opens a PTY with `open_unix_pty`, builds a `StdCommand`, clones the slave fd for stdin/stdout/stderr, and installs a `pre_exec` closure that resets several signal handlers to `SIG_DFL`, clears the signal mask, calls `setsid`, makes fd 0 the controlling terminal with `TIOCSCTTY`, and invokes `close_inherited_fds_except(&inherited_fds)`. After spawning it drops the parent slave handle, creates stdin/stdout channels, launches a blocking reader over the PTY master and an async writer over a cloned master, launches a blocking wait task that uses `exit_code_from_status`, stores the master as `PtyMasterHandle::Opaque { raw_fd, _handle }`, wraps a `RawPidTerminator` into `ProcessHandle`, and returns `SpawnedProcess`.
+**Data flow**: It receives the command setup, terminal size, and the descriptor numbers to preserve. It opens a Unix PTY, wires the slave side to the child’s stdin, stdout, and stderr, resets signal behavior before exec, creates a new terminal session, keeps only the requested extra descriptors open, and starts the child. Then it creates the same kind of reader, writer, exit-waiter, terminator, and process bundle as the portable path.
 
-**Call relations**: This path is selected by `spawn_process_with_inherited_fds` only on Unix when the caller requests preserved descriptors. It depends on `open_unix_pty`, `close_inherited_fds_except`, and `exit_code_from_status` to provide behavior the portable backend cannot guarantee.
+**Call relations**: spawn_process_with_inherited_fds calls this only on Unix when descriptor preservation is requested. It relies on open_unix_pty to create the terminal and uses close_inherited_fds_except inside the child setup step so only intended file descriptors survive into the executed program.
 
 *Call graph*: calls 1 internal fn (open_unix_pty); called by 1 (spawn_process_with_inherited_fds); 13 external calls (clone, new, new, new, to_vec, new, new, from, new, new (+3 more)).
 
@@ -2923,11 +2941,11 @@ async fn spawn_process_preserving_fds(
 fn open_unix_pty(size: TerminalSize) -> Result<(File, File)>
 ```
 
-**Purpose**: Allocates a Unix PTY master/slave pair with an initial terminal size and marks both ends close-on-exec. It returns owned `File` handles for both descriptors.
+**Purpose**: This opens a Unix pseudo-terminal pair: a master side controlled by this program and a slave side seen by the child as its terminal. It also applies the requested terminal size.
 
-**Data flow**: Takes a `TerminalSize`, converts it into `libc::winsize`, passes mutable master/slave fd pointers to `libc::openpty`, errors with `anyhow::bail!` if allocation fails, calls `set_cloexec` on both fds, and finally wraps them with `File::from_raw_fd` before returning `(File, File)`.
+**Data flow**: It receives a TerminalSize with rows and columns. It calls the operating system’s openpty function to create master and slave file descriptors, marks both as close-on-exec, and wraps them as File objects so Rust will close them safely later. It returns the pair or an error if the operating system could not create the PTY.
 
-**Call relations**: This helper is used exclusively by `spawn_process_preserving_fds`. It isolates the unsafe PTY allocation details from the larger spawn routine.
+**Call relations**: The manual Unix spawning path calls this before launching the child. It hands back the two ends needed for spawn_process_preserving_fds to connect the child to a terminal and keep the parent side for reading and writing.
 
 *Call graph*: calls 1 internal fn (set_cloexec); called by 1 (spawn_process_preserving_fds); 5 external calls (from_raw_fd, bail!, openpty, addr_of_mut!, null_mut).
 
@@ -2938,11 +2956,11 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)>
 fn set_cloexec(fd: RawFd) -> std::io::Result<()>
 ```
 
-**Purpose**: Sets the `FD_CLOEXEC` flag on a Unix file descriptor. This prevents accidental inheritance across exec unless the code explicitly preserves the descriptor.
+**Purpose**: This marks a Unix file descriptor as close-on-exec, meaning it will automatically close when a new program is executed unless deliberately preserved. This helps prevent accidental leaking of open files or pipes into child processes.
 
-**Data flow**: Reads the current descriptor flags with `fcntl(F_GETFD)`, ORs in `FD_CLOEXEC`, writes them back with `fcntl(F_SETFD, ...)`, and returns `Ok(())` or `Err(last_os_error())` if either syscall fails.
+**Data flow**: It receives a file descriptor number. It reads the descriptor’s current flags, adds the close-on-exec flag, writes the flags back, and returns success or the operating-system error that occurred.
 
-**Call relations**: This helper is called by `open_unix_pty` for both master and slave descriptors immediately after allocation.
+**Call relations**: open_unix_pty calls this for both ends of a newly opened PTY. That makes the PTY safer by default before the later spawning code intentionally chooses which handles the child should receive.
 
 *Call graph*: called by 1 (open_unix_pty); 2 external calls (last_os_error, fcntl).
 
@@ -2953,11 +2971,11 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()>
 fn close_inherited_fds_except(preserved_fds: &[RawFd])
 ```
 
-**Purpose**: Closes inherited Unix file descriptors other than stdio and an explicit preserve list, while intentionally leaving CLOEXEC descriptors alone so Rust's internal exec-error pipe still works. It is a best-effort cleanup pass over `/dev/fd`.
+**Purpose**: This closes unwanted Unix file descriptors in the child setup step, while leaving standard input/output/error and explicitly preserved descriptors alone. It is a cleanup sweep that prevents the new program from inheriting unrelated open resources.
 
-**Data flow**: Takes a slice of preserved `RawFd`s, reads `/dev/fd`, parses each directory entry name into an fd number, skips fds `<= 2` and any preserved fd, checks each remaining fd's flags with `fcntl(F_GETFD)`, skips descriptors that are already `FD_CLOEXEC`, collects the rest, and finally closes each collected fd with `libc::close`.
+**Data flow**: It receives a list of descriptor numbers that should be preserved. It scans /dev/fd, which lists open descriptors for the process, skips descriptors 0, 1, and 2, skips preserved ones, and also skips descriptors already marked close-on-exec. It closes the remaining descriptors and returns nothing.
 
-**Call relations**: This helper is used in both the pipe backend's Unix `pre_exec` closure and the raw-PTY inherited-FD path. Its CLOEXEC exception is a subtle but important design choice to preserve spawn error reporting.
+**Call relations**: The manual Unix spawn path uses this inside the pre-exec setup just before the child becomes the requested program. It supports spawn_process_preserving_fds by enforcing the promise that only selected extra descriptors remain open.
 
 *Call graph*: 5 external calls (contains, new, close, fcntl, read_dir).
 
@@ -2967,13 +2985,15 @@ These files provide the Windows-specific pseudoconsole, child-process wrapper, a
 
 ### `utils/pty/src/win/mod.rs`
 
-`generated` · `Windows PTY child lifetime and termination`
+`io_transport` · `while a Windows PTY child process is running`
 
-This vendored Windows module bridges raw Win32 process handles into the interfaces expected by `portable_pty`. The main type, `WinChild`, stores an `OwnedHandle` inside a `Mutex` so methods can clone the underlying process handle safely across waits, kill operations, and future polling. `WinChildKiller` is a lighter cloneable killer object that owns its own duplicated handle.
+A pseudo-terminal, or PTY, is a way for a program to pretend it is talking to a real terminal window. This file provides the Windows side of that support. Most of the project can use the general `portable_pty` interfaces, while this file hides the awkward Windows details such as process handles, exit codes, and waiting for a process to finish.
 
-The implementation is careful about Win32 semantics. `is_complete` calls `GetExitCodeProcess` and interprets `STILL_ACTIVE` as "not exited yet"; otherwise it wraps the numeric status in `portable_pty::ExitStatus`. `do_kill` and `WinChildKiller::kill` both call `TerminateProcess`, but unlike upstream WezTerm they correctly treat a zero return value as failure and nonzero as success. `WinChild::kill` intentionally swallows `do_kill` errors and returns `Ok(())`, matching the trait's best-effort expectations.
+The main type is `WinChild`, which represents a running child process. It keeps the Windows process handle inside a mutex, which is a lock that stops two pieces of code from using the same handle in an unsafe way at the same time. Through standard traits, `WinChild` can be asked: “Are you done yet?”, “Wait until you finish,” “What is your process ID?”, or “Please stop now.”
 
-As a `Child`, `WinChild` supports nonblocking `try_wait`, blocking `wait` via `WaitForSingleObject(INFINITE)` followed by `GetExitCodeProcess`, process ID lookup with `GetProcessId`, and raw-handle exposure. It also implements `Future`: `poll` first checks `is_complete`, and if the process is still running it clones the handle, spawns a thread that blocks in `WaitForSingleObject`, and wakes the task when the process exits. This gives async callers a way to await process completion without integrating directly with Tokio process primitives.
+There is also `WinChildKiller`, a smaller object whose only job is to kill the same process from somewhere else. This is useful when one part of the program owns the child process, but another part needs a safe emergency stop button.
+
+One important detail is the kill path. Windows reports success from `TerminateProcess` with a nonzero value and failure with `0`. This file intentionally fixes a bug from the copied upstream code where that meaning was reversed.
 
 #### Function details
 
@@ -2983,11 +3003,11 @@ As a `Child`, `WinChild` supports nonblocking `try_wait`, blocking `wait` via `W
 fn is_complete(&mut self) -> IoResult<Option<ExitStatus>>
 ```
 
-**Purpose**: Checks whether the Windows child process has exited and, if so, returns its exit status. It treats `STILL_ACTIVE` as a running process and any failed status query as "no result" rather than an error.
+**Purpose**: Checks whether the Windows child process has finished. If it has ended, it turns the Windows exit code into the project’s portable exit-status type; if it is still running, it says so without blocking.
 
-**Data flow**: Locks and clones the owned process handle, calls `GetExitCodeProcess`, inspects the returned `DWORD`, and returns `Ok(None)` if the process is still active or the API call failed, otherwise `Ok(Some(ExitStatus::with_exit_code(status)))`.
+**Data flow**: It reads the stored process handle, asks Windows for that process’s exit code, and looks at the answer. A special Windows value means “still active,” so the function returns no status yet; any real exit code is wrapped as an `ExitStatus` and returned.
 
-**Call relations**: This helper is used by both `WinChild::try_wait` and the async `Future` implementation's `poll` method to share the same completion check logic.
+**Call relations**: This is the quick status checker used by both `WinChild::try_wait` and the asynchronous `WinChild::poll`. Those callers rely on it to avoid blocking when they only want to know whether the process is already done.
 
 *Call graph*: called by 2 (poll, try_wait); 1 external calls (with_exit_code).
 
@@ -2998,11 +3018,11 @@ fn is_complete(&mut self) -> IoResult<Option<ExitStatus>>
 fn do_kill(&mut self) -> IoResult<()>
 ```
 
-**Purpose**: Performs the actual Win32 termination call for `WinChild`. It applies the corrected success check where `TerminateProcess` returning `0` means failure.
+**Purpose**: Actually asks Windows to terminate the child process. This is the low-level kill operation used by `WinChild::kill`.
 
-**Data flow**: Locks and clones the process handle, calls `TerminateProcess(handle, 1)`, and returns `Err(IoError::last_os_error())` only when the Win32 return value is `0`; otherwise it returns `Ok(())`.
+**Data flow**: It clones the stored process handle, passes that handle to Windows with an exit code of `1`, and checks Windows’s success flag. If Windows returns `0`, it converts the operating-system error into an I/O error; otherwise it reports success.
 
-**Call relations**: This internal helper is called by `WinChild::kill`. Separating it keeps the trait method small while preserving the corrected kill semantics.
+**Call relations**: This function sits underneath `WinChild::kill`. It contains the important Windows-specific rule that `TerminateProcess` returns nonzero on success, so the higher-level kill call does not need to know that detail.
 
 *Call graph*: called by 1 (kill); 1 external calls (last_os_error).
 
@@ -3013,11 +3033,11 @@ fn do_kill(&mut self) -> IoResult<()>
 fn kill(&mut self) -> IoResult<()>
 ```
 
-**Purpose**: Implements best-effort child termination for the `ChildKiller` trait. It invokes `do_kill` but intentionally ignores any error and always reports success.
+**Purpose**: Provides the standard child-process kill operation for `WinChild`. It tries to stop the process, but deliberately returns success even if the lower-level kill reports an error.
 
-**Data flow**: Mutably borrows `self`, calls `self.do_kill().ok()`, discards the result, and returns `Ok(())`.
+**Data flow**: It receives a mutable `WinChild`, calls `WinChild::do_kill`, discards that result, and then returns `Ok(())`. The process may be terminated as a side effect if Windows accepts the request.
 
-**Call relations**: This trait method is used by PTY termination paths that hold a `WinChild` directly. It delegates the actual Win32 call to `do_kill`.
+**Call relations**: This is the method the broader `portable_pty` child-killing interface calls when the owner of a `WinChild` wants it stopped. It delegates the real operating-system work to `WinChild::do_kill`.
 
 *Call graph*: calls 1 internal fn (do_kill).
 
@@ -3028,11 +3048,11 @@ fn kill(&mut self) -> IoResult<()>
 fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync>
 ```
 
-**Purpose**: Creates an independent killer object that can terminate the same process later. It duplicates the underlying process handle and wraps it in `WinChildKiller`.
+**Purpose**: Creates a separate kill handle for the same running process. This lets another part of the program stop the child without taking ownership of the full `WinChild` object.
 
-**Data flow**: Locks `self.proc`, clones the `OwnedHandle`, constructs `WinChildKiller { proc }`, boxes it as `Box<dyn ChildKiller + Send + Sync>`, and returns it.
+**Data flow**: It locks and clones the underlying Windows process handle, wraps that cloned handle in a new `WinChildKiller`, and returns it as a boxed child-killer object.
 
-**Call relations**: The PTY backend uses this when it needs a standalone killer separate from the child object itself.
+**Call relations**: This supports the `ChildKiller` interface. When outside code needs a standalone stop button, this method hands back a `WinChildKiller` that can later call its own `kill` method.
 
 *Call graph*: 1 external calls (new).
 
@@ -3043,11 +3063,11 @@ fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync>
 fn kill(&mut self) -> IoResult<()>
 ```
 
-**Purpose**: Terminates the process represented by the duplicated handle owned by `WinChildKiller`. It uses the same corrected Win32 success interpretation as `WinChild::do_kill`.
+**Purpose**: Stops the process referred to by a standalone `WinChildKiller`. It is useful when code has only been given permission to kill the child, not to wait on it or inspect it fully.
 
-**Data flow**: Calls `TerminateProcess(self.proc.as_raw_handle() as _, 1)` and returns `Err(IoError::last_os_error())` if the result is `0`, otherwise `Ok(())`.
+**Data flow**: It takes the stored Windows process handle, passes it to Windows’s terminate function with exit code `1`, and checks the result. A `0` result becomes the latest operating-system error; any nonzero result means the kill request succeeded.
 
-**Call relations**: This method is invoked by higher-level PTY termination code after `clone_killer` has produced a detached killer object.
+**Call relations**: This is called through the generic `ChildKiller` interface after `WinChild::clone_killer` or `WinChildKiller::clone_killer` has produced a killer object. It performs the same Windows termination action as `WinChild::do_kill`, but from the smaller killer-only type.
 
 *Call graph*: 2 external calls (last_os_error, as_raw_handle).
 
@@ -3058,11 +3078,11 @@ fn kill(&mut self) -> IoResult<()>
 fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync>
 ```
 
-**Purpose**: Duplicates the killer by cloning its owned process handle. This allows multiple independent killer objects to exist for the same process.
+**Purpose**: Makes another standalone killer for the same process. This allows multiple parts of the program to each hold their own safe way to request termination.
 
-**Data flow**: Calls `self.proc.try_clone().unwrap()`, wraps the cloned handle in a new `WinChildKiller`, boxes it, and returns it.
+**Data flow**: It clones the stored Windows process handle, puts the clone into a new `WinChildKiller`, and returns it as a boxed child-killer object.
 
-**Call relations**: This satisfies the `ChildKiller` trait's cloning requirement for the detached killer type.
+**Call relations**: This keeps the `ChildKiller` interface cloneable in practice. If code already has a `WinChildKiller` and needs to pass a copy elsewhere, this method creates that copy without involving the original `WinChild`.
 
 *Call graph*: 2 external calls (new, try_clone).
 
@@ -3073,11 +3093,11 @@ fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync>
 fn try_wait(&mut self) -> IoResult<Option<ExitStatus>>
 ```
 
-**Purpose**: Implements nonblocking wait for the `Child` trait by reusing `is_complete`. It returns immediately with either `Some(status)` or `None`.
+**Purpose**: Checks whether the child process has finished, without waiting around. It is the non-blocking way to ask for the process’s exit status.
 
-**Data flow**: Mutably borrows `self`, calls `self.is_complete()`, and returns that `IoResult<Option<ExitStatus>>` unchanged.
+**Data flow**: It takes the current `WinChild`, calls `WinChild::is_complete`, and returns either an exit status, no status yet, or an I/O error from the status check.
 
-**Call relations**: This trait method is used by `WinChild::wait` as a fast path before blocking and may also be called by external code through the `portable_pty::Child` interface.
+**Call relations**: This is part of the standard `Child` interface. `WinChild::wait` calls it first so that, if the process is already finished, it can return immediately instead of asking Windows to block.
 
 *Call graph*: calls 1 internal fn (is_complete); called by 1 (wait).
 
@@ -3088,11 +3108,11 @@ fn try_wait(&mut self) -> IoResult<Option<ExitStatus>>
 fn wait(&mut self) -> IoResult<ExitStatus>
 ```
 
-**Purpose**: Blocks until the Windows child exits and then returns its exit status. It first checks for an already-completed process to avoid unnecessary waiting.
+**Purpose**: Waits until the child process has exited and then returns its exit status. This is the blocking version of checking a child process.
 
-**Data flow**: Calls `try_wait()` and returns immediately if it yields `Some(status)`. Otherwise it clones the process handle, blocks in `WaitForSingleObject(..., INFINITE)`, then calls `GetExitCodeProcess` and returns `ExitStatus::with_exit_code(status)` on success or `IoError::last_os_error()` on failure.
+**Data flow**: It first asks `WinChild::try_wait` whether the process is already done. If not, it clones the process handle and tells Windows to wait forever until that process exits. After the wait completes, it asks Windows for the final exit code and returns it as an `ExitStatus`, or returns the last operating-system error if that lookup fails.
 
-**Call relations**: This is the blocking completion path required by the `Child` trait. It builds on `try_wait` and uses raw Win32 waiting only when needed.
+**Call relations**: This is the standard synchronous wait operation for `WinChild`. It uses `try_wait` for the fast path, then hands off to Windows’s `WaitForSingleObject` when it must pause until the process is finished.
 
 *Call graph*: calls 1 internal fn (try_wait); 3 external calls (with_exit_code, last_os_error, WaitForSingleObject).
 
@@ -3103,11 +3123,11 @@ fn wait(&mut self) -> IoResult<ExitStatus>
 fn process_id(&self) -> Option<u32>
 ```
 
-**Purpose**: Returns the Windows process ID for the wrapped child if it can be retrieved. A zero result from `GetProcessId` is treated as absence.
+**Purpose**: Returns the Windows process ID for the child, if Windows can provide one. A process ID is the number the operating system uses to identify a running process.
 
-**Data flow**: Locks `self.proc`, passes its raw handle to `GetProcessId`, and returns `Some(res)` when nonzero or `None` when zero.
+**Data flow**: It reads the stored process handle, asks Windows for the corresponding process ID, and returns `None` if Windows gives back `0`. Otherwise it returns the ID as a normal unsigned number.
 
-**Call relations**: The PTY backend uses this trait method to cache a process identifier when available.
+**Call relations**: This is exposed through the standard `Child` interface for callers that need to display, log, or otherwise refer to the operating-system process.
 
 
 ##### `WinChild::as_raw_handle`  (lines 149–152)
@@ -3116,11 +3136,11 @@ fn process_id(&self) -> Option<u32>
 fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle>
 ```
 
-**Purpose**: Exposes the underlying raw Windows process handle through the `Child` trait. It always returns `Some(...)` for this implementation.
+**Purpose**: Gives access to the underlying Windows process handle. This is for code that must call Windows-specific APIs directly.
 
-**Data flow**: Locks `self.proc`, reads `proc.as_raw_handle()`, wraps it in `Some`, and returns it.
+**Data flow**: It locks the stored process handle and returns the raw handle value inside an option. It does not create a new process or change the child; it simply exposes the existing handle.
 
-**Call relations**: This method supports lower-level integrations that need direct access to the process handle from a `portable_pty::Child` object.
+**Call relations**: This is part of the `Child` interface’s escape hatch for platform-specific work. Callers that understand Windows handles can use this value when the portable interface is not enough.
 
 
 ##### `WinChild::poll`  (lines 158–174)
@@ -3129,22 +3149,26 @@ fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle>
 fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<anyhow::Result<ExitStatus>>
 ```
 
-**Purpose**: Implements `Future` for `WinChild`, allowing async waiting on process completion. If the process is still running, it spawns a helper thread that blocks on the process handle and wakes the task when done.
+**Purpose**: Lets `WinChild` be used as an asynchronous future, meaning other work can continue while the program waits for the child process to exit. It reports ready when the process has finished.
 
-**Data flow**: Mutably pins `self`, calls `is_complete()`, and returns `Poll::Ready(Ok(status))` if exited or `Poll::Ready(Err(...))` if status retrieval failed. When still running, it clones the process handle and current waker, spawns a thread that calls `WaitForSingleObject(INFINITE)` and then `waker.wake()`, and returns `Poll::Pending`.
+**Data flow**: It first calls `WinChild::is_complete`. If an exit status is available, it returns it immediately; if an error occurs, it returns that error with extra context. If the process is still running, it clones the process handle, copies the task’s waker, starts a helper thread that waits for the process to exit, and returns `Pending`; when the helper thread sees the process finish, it wakes the async task so it can be checked again.
 
-**Call relations**: Async code awaiting a `WinChild` reaches this method. It reuses `is_complete` for the fast path and falls back to a thread-based wakeup strategy because Win32 process handles are not integrated directly with Rust async executors here.
+**Call relations**: This connects Windows process waiting to Rust’s async system. It uses `is_complete` for the quick check, then relies on a spawned waiting thread and the async waker to resume the larger workflow when the child process exits.
 
 *Call graph*: calls 1 internal fn (is_complete); 3 external calls (waker, Ready, spawn).
 
 
 ### `utils/pty/src/win/psuedocon.rs`
 
-`io_transport` · `process spawning and PTY session management on Windows`
+`io_transport` · `terminal session creation, command launch, resize, and teardown`
 
-This file is the Windows PTY integration layer around the ConPTY API. It dynamically loads `CreatePseudoConsole`, `ResizePseudoConsole`, and `ClosePseudoConsole` from either `conpty.dll` or `kernel32.dll`, and probes OS support by calling `RtlGetVersion` from `ntdll.dll` and comparing the build number against `MIN_CONPTY_BUILD` (17763). The central type is `PsuedoCon`, which owns the `HPCON` handle plus the input/output pipe `FileDescriptor`s that ConPTY only borrows; keeping those descriptors alive for the pseudoconsole lifetime is an explicit invariant.
+A pseudoterminal lets a program talk to a shell or command-line tool as if it were a real terminal window, even when no visible console exists. On Windows, that feature is called ConPTY, and it is only available on newer Windows 10 builds and later. This file hides the low-level Windows details behind a small Rust type called `PsuedoCon`.
 
-`PsuedoCon::new` creates the pseudoconsole with `PSEUDOCONSOLE_RESIZE_QUIRK`, and `Drop` always closes it. `spawn_command` builds a `STARTUPINFOEXW` with a `ProcThreadAttributeList` containing the pseudoconsole handle, disables inherited stdio by setting them to `INVALID_HANDLE_VALUE`, then calls `CreateProcessW` with `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT`. Before launch it resolves the executable path, quotes arguments according to Windows command-line escaping rules, constructs a double-NUL-terminated UTF-16 environment block, and chooses a current directory from explicit cwd or `USERPROFILE`, rejecting nonexistent directories. On process creation failure it logs and returns a detailed error including the rendered command line and cwd. The helper functions here are careful about UTF-16 encoding, PATH/PATHEXT lookup, relative cwd expansion, and preserving Windows quoting semantics for spaces, quotes, and trailing backslashes.
+The file first checks whether the running Windows version is new enough. It then loads the needed Windows functions from system libraries at runtime. That matters because older Windows versions may not have those functions at all; loading them only when needed avoids assuming too much about the machine.
+
+`PsuedoCon` owns the Windows pseudoconsole handle and the input/output pipe handles that the console borrows. Think of it like renting a room and keeping the keys alive until everyone has left: the pipes must stay open for as long as the pseudoconsole exists. The type can create the console, resize it, expose its raw Windows handle for other setup code, and spawn a command inside it.
+
+Starting a command is the most careful part. Windows process creation expects command lines, environment variables, and working directories in a particular UTF-16 format, so helper functions build those pieces correctly. The file also quotes arguments in the special way Windows requires, so spaces and quotation marks do not accidentally change what program receives.
 
 #### Function details
 
@@ -3154,11 +3178,11 @@ This file is the Windows PTY integration layer around the ConPTY API. It dynamic
 fn load_conpty() -> ConPtyFuncs
 ```
 
-**Purpose**: Loads the ConPTY function table from the host system. It prefers a side-loaded `conpty.dll` when present, otherwise falls back to `kernel32.dll` exports.
+**Purpose**: Loads the Windows functions needed to create and control a pseudoconsole. It prefers a separate `conpty.dll` if present, but falls back to `kernel32.dll`, where these functions normally live on supported Windows versions.
 
-**Data flow**: It takes no arguments, opens `kernel32.dll` as a required baseline source of `ConPtyFuncs`, then attempts to open `conpty.dll`. If the side-loaded DLL opens successfully it returns that function table; otherwise it returns the kernel32-backed table.
+**Data flow**: It starts with the names of Windows libraries on disk. It opens `kernel32.dll` and, if available, `conpty.dll`; the result is a table of callable Windows ConPTY functions. If the required system support is missing, it stops with an error message explaining that a newer Windows version is needed.
 
-**Call relations**: This function is used to initialize the global lazy `CONPTY` binding. It sits at the bottom of the startup path for all later pseudoconsole operations, because `PsuedoCon::new`, `resize`, and `drop` all invoke function pointers stored in that singleton.
+**Call relations**: This is used when the global ConPTY function table is first created. Later functions such as `PsuedoCon::new`, `PsuedoCon::resize`, and `PsuedoCon::drop` use that loaded table to call Windows.
 
 *Call graph*: 2 external calls (open, new).
 
@@ -3169,11 +3193,11 @@ fn load_conpty() -> ConPtyFuncs
 fn conpty_supported() -> bool
 ```
 
-**Purpose**: Reports whether the current Windows build is new enough to support ConPTY. The check is purely based on the OS build number threshold.
+**Purpose**: Answers the simple question: is this Windows system new enough to support ConPTY?
 
-**Data flow**: It reads the optional build number from `windows_build_number`, compares it against `MIN_CONPTY_BUILD`, and returns `true` only when a build number exists and is at least 17763.
+**Data flow**: It asks `windows_build_number` for the operating system build number. If a number is found and it is at least the minimum known ConPTY build, it returns `true`; otherwise it returns `false`.
 
-**Call relations**: This is the public capability probe for callers deciding whether to use ConPTY at all. It delegates the actual version query to `windows_build_number`.
+**Call relations**: Higher-level setup code can call this before trying to create a pseudoconsole. It relies on `windows_build_number` to get the actual Windows version information.
 
 *Call graph*: calls 1 internal fn (windows_build_number).
 
@@ -3184,11 +3208,11 @@ fn conpty_supported() -> bool
 fn windows_build_number() -> Option<u32>
 ```
 
-**Purpose**: Queries the real Windows build number using `RtlGetVersion`. It avoids relying on manifest-sensitive version APIs.
+**Purpose**: Reads the Windows build number directly from the operating system. This is used to decide whether ConPTY should be available.
 
-**Data flow**: It opens `ntdll.dll`, zero-initializes an `OSVERSIONINFOW`, fills in `dwOSVersionInfoSize`, and calls `RtlGetVersion`. On `STATUS_SUCCESS` it returns `Some(info.dwBuildNumber)`; otherwise, or if `ntdll.dll` cannot be opened, it returns `None`.
+**Data flow**: It opens `ntdll.dll`, prepares an empty Windows version-information structure, and asks Windows to fill it in. If Windows reports success, it returns the build number; if anything fails, it returns no value.
 
-**Call relations**: This function underpins `conpty_supported` and is also exercised directly by the unit test that verifies a build number can be obtained on the test host.
+**Call relations**: `conpty_supported` calls this during feature detection. The test `tests::windows_build_number_returns_value` also calls it to make sure the version lookup works on Windows test machines.
 
 *Call graph*: called by 2 (conpty_supported, windows_build_number_returns_value); 3 external calls (open, new, zeroed).
 
@@ -3199,11 +3223,11 @@ fn windows_build_number() -> Option<u32>
 fn drop(&mut self)
 ```
 
-**Purpose**: Closes the underlying pseudoconsole handle when the wrapper is dropped. This is the cleanup point that ends the ConPTY lifetime.
+**Purpose**: Closes the Windows pseudoconsole when the Rust `PsuedoCon` object is no longer used. This prevents the underlying Windows resource from leaking.
 
-**Data flow**: It reads `self.con` and passes it to `CONPTY.ClosePseudoConsole`. It does not return a value and relies on the struct fields `_input` and `_output` being dropped afterward to release the borrowed pipe handles.
+**Data flow**: It receives the existing `PsuedoCon` during cleanup, takes its stored Windows console handle, and passes it to Windows' close function. Nothing is returned; the important change is that the operating system resource is released.
 
-**Call relations**: This runs automatically during teardown of a `PsuedoCon`. It complements `PsuedoCon::new`, which creates the handle, and enforces the ownership model documented on the struct.
+**Call relations**: Rust calls this automatically when a `PsuedoCon` value is dropped. It is the final cleanup step after creation, command execution, and any resizing are finished.
 
 
 ##### `PsuedoCon::raw_handle`  (lines 137–139)
@@ -3212,11 +3236,11 @@ fn drop(&mut self)
 fn raw_handle(&self) -> HPCON
 ```
 
-**Purpose**: Exposes the raw `HPCON` handle stored inside the wrapper. It is a thin accessor for integration with lower-level Windows setup code.
+**Purpose**: Returns the underlying Windows pseudoconsole handle. Other Windows setup code needs this handle when attaching a child process to the pseudoconsole.
 
-**Data flow**: It reads `self.con` and returns that `HPCON` unchanged. No state is mutated.
+**Data flow**: It reads the stored handle from the `PsuedoCon` object and returns it unchanged. It does not create, close, or modify anything.
 
-**Call relations**: This accessor is used by external code that needs to pass the pseudoconsole handle onward, specifically the caller identified in the graph as `pseudoconsole_handle`.
+**Call relations**: The wider Windows PTY code calls this through `pseudoconsole_handle` when it needs to pass the pseudoconsole into lower-level Windows process setup.
 
 *Call graph*: called by 1 (pseudoconsole_handle).
 
@@ -3227,11 +3251,11 @@ fn raw_handle(&self) -> HPCON
 fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error>
 ```
 
-**Purpose**: Creates a new Windows pseudoconsole bound to the supplied input and output pipe handles. It validates the HRESULT and retains ownership of the descriptors for the console lifetime.
+**Purpose**: Creates a new Windows pseudoconsole with a requested size and connected input/output pipes. This is the point where the fake terminal room is actually opened.
 
-**Data flow**: It takes a `COORD` size and two `FileDescriptor`s, initializes an `HPCON` to `INVALID_HANDLE_VALUE`, and calls `CONPTY.CreatePseudoConsole` with the descriptors' raw handles and `PSEUDOCONSOLE_RESIZE_QUIRK`. If the HRESULT is not `S_OK` it returns an error via `ensure!`; otherwise it returns a `PsuedoCon` containing the created handle and the original descriptors in `_input` and `_output`.
+**Data flow**: It receives a terminal size plus two file descriptors, one for input and one for output. It passes their raw Windows handles to `CreatePseudoConsole`, checks that Windows returned success, and then stores the console handle together with the pipe objects so they stay alive. On success it returns a new `PsuedoCon`; on failure it returns an error.
 
-**Call relations**: This is the constructor used by the higher-level PTY setup path, specifically `create_conpty_handles`. Its successful result is later consumed by `resize`, `spawn_command`, and `drop`.
+**Call relations**: Higher-level PTY creation code calls this from `create_conpty_handles`. Once created, the returned `PsuedoCon` can be used by `spawn_command` to start a program, by `resize` to change its dimensions, and by `drop` to close it later.
 
 *Call graph*: called by 1 (create_conpty_handles); 2 external calls (ensure!, as_raw_handle).
 
@@ -3242,11 +3266,11 @@ fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Sel
 fn resize(&self, size: COORD) -> Result<(), Error>
 ```
 
-**Purpose**: Resizes an existing pseudoconsole to a new terminal geometry. It converts the ConPTY HRESULT into an `anyhow::Error` on failure.
+**Purpose**: Changes the size of the pseudoconsole, such as when a terminal window is resized. This lets programs inside the terminal know the new row and column count.
 
-**Data flow**: It takes a `COORD`, calls `CONPTY.ResizePseudoConsole(self.con, size)`, checks for `S_OK`, and returns `Ok(())` on success. On failure it formats an error message including the requested width and height.
+**Data flow**: It receives a new width-and-height value, sends that size to Windows for the stored pseudoconsole handle, and checks whether Windows accepted it. It returns success if the resize worked, or an error that includes the requested size if it did not.
 
-**Call relations**: This method is invoked by the higher-level `resize` caller in the PTY subsystem whenever terminal dimensions change.
+**Call relations**: The surrounding PTY layer calls this from its resize path. It hands the resize request directly to Windows through the ConPTY function table.
 
 *Call graph*: called by 1 (resize); 1 external calls (ensure!).
 
@@ -3257,11 +3281,11 @@ fn resize(&self, size: COORD) -> Result<(), Error>
 fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild>
 ```
 
-**Purpose**: Launches a child process attached to this pseudoconsole using `CreateProcessW` with extended startup attributes. It prepares Windows-native command line, environment, cwd, and process/thread handles.
+**Purpose**: Starts a child process inside this pseudoconsole. In everyday terms, this is what launches `cmd.exe`, PowerShell, or another terminal program so it talks through the PTY pipes.
 
-**Data flow**: It takes a `CommandBuilder`, zero-initializes `STARTUPINFOEXW` and `PROCESS_INFORMATION`, marks stdio handles invalid, allocates a `ProcThreadAttributeList` with one slot, and stores the pseudoconsole handle into that attribute list. It then derives `(exe, cmdline)` from `build_cmdline`, converts the UTF-16 command line back to an `OsString` for diagnostics, computes an optional UTF-16 cwd via `resolve_current_directory`, and builds a UTF-16 double-NUL environment block via `build_environment_block`. Those buffers are passed to `CreateProcessW`; on failure it reads `last_os_error`, logs a message, and returns an error with `bail!`. On success it wraps `pi.hThread` and `pi.hProcess` in `OwnedHandle`, drops the thread handle immediately after binding it, and returns a `WinChild` containing the process handle inside a `Mutex`.
+**Data flow**: It takes a `CommandBuilder`, which describes the program, arguments, environment variables, and working directory. It prepares Windows startup information, attaches the pseudoconsole handle, builds the executable path and command line, builds the environment block, resolves the working directory, and calls Windows `CreateProcessW`. If process creation succeeds, it wraps the process handle in a `WinChild`; if it fails, it reports the Windows error with the attempted command and directory.
 
-**Call relations**: This is the main process-launch path after a pseudoconsole exists. It orchestrates the helper functions in this file—`build_cmdline`, `resolve_current_directory`, and `build_environment_block`—and depends on `ProcThreadAttributeList::with_capacity` and `set_pty` so the child starts inside the ConPTY session.
+**Call relations**: This is the main launch step after a `PsuedoCon` has been created. It calls `build_cmdline`, `build_environment_block`, and `resolve_current_directory` to translate friendly command settings into the exact shapes Windows expects, then hands everything to `CreateProcessW`.
 
 *Call graph*: calls 4 internal fn (with_capacity, build_cmdline, build_environment_block, resolve_current_directory); 10 external calls (new, from_wide, last_os_error, bail!, format!, error!, zeroed, null, null_mut, from_raw_handle).
 
@@ -3272,11 +3296,11 @@ fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild>
 fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>>
 ```
 
-**Purpose**: Chooses and encodes the working directory passed to `CreateProcessW`. It only returns directories that currently exist.
+**Purpose**: Chooses and formats the working directory for the child process. It prefers the command's explicit current directory, falls back to `USERPROFILE`, and ignores paths that are not real directories.
 
-**Data flow**: It reads `USERPROFILE` and explicit cwd from the `CommandBuilder`, filters each through `Path::is_dir`, and prefers explicit cwd over home. If the chosen path is relative, it tries to join it against `env::current_dir`; otherwise it uses the path as-is. The selected path is encoded as a NUL-terminated UTF-16 `Vec<u16>` and returned as `Some`, or `None` if neither candidate exists.
+**Data flow**: It reads the command's requested current directory and `USERPROFILE` environment value. It picks the first usable directory, turns relative paths into paths based on the current process directory when possible, encodes the result as Windows UTF-16 text, and adds the required final zero marker. It returns that encoded directory or no value if there is nothing valid to use.
 
-**Call relations**: This helper is called only from `PsuedoCon::spawn_command` to supply the `lpCurrentDirectory` argument to `CreateProcessW`.
+**Call relations**: `PsuedoCon::spawn_command` calls this just before creating the process. Its output becomes the working-directory argument passed to Windows.
 
 *Call graph*: called by 1 (spawn_command); 5 external calls (get_cwd, get_env, new, new, current_dir).
 
@@ -3287,11 +3311,11 @@ fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>>
 fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16>
 ```
 
-**Purpose**: Constructs the Windows environment block for the child process in UTF-16 form. The result matches the `CREATE_UNICODE_ENVIRONMENT` expectation of `CreateProcessW`.
+**Purpose**: Builds the environment-variable block that Windows expects when starting a process. This block is how variables like `PATH` and `USERPROFILE` are passed to the child.
 
-**Data flow**: It iterates `cmd.iter_full_env_as_str()`, appending each key, an `=` separator, each value, and a terminating NUL to a `Vec<u16>`. After all entries it appends a final extra NUL, producing the required double-NUL-terminated block.
+**Data flow**: It reads all environment key-value pairs from the `CommandBuilder`. For each pair, it writes `key=value` as UTF-16 text followed by a zero marker, then adds one extra zero marker at the end to show the whole list is finished. The result is a vector of UTF-16 numbers ready for Windows.
 
-**Call relations**: This helper is used exclusively by `PsuedoCon::spawn_command` when preparing the environment pointer passed into `CreateProcessW`.
+**Call relations**: `PsuedoCon::spawn_command` calls this while preparing `CreateProcessW`. The produced block is passed directly into Windows process creation.
 
 *Call graph*: called by 1 (spawn_command); 3 external calls (iter_full_env_as_str, new, new).
 
@@ -3302,11 +3326,11 @@ fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16>
 fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)>
 ```
 
-**Purpose**: Resolves the executable path and assembles a correctly quoted Windows command line from a `CommandBuilder`. It also rejects malformed inputs such as a missing program name or embedded NULs in arguments.
+**Purpose**: Creates both the executable path and the full Windows command line for the child process. This is necessary because Windows process creation uses a single command-line string, not a clean list of arguments.
 
-**Data flow**: It inspects the `CommandBuilder`: if `is_default_prog()` is true, it uses `ComSpec` or falls back to `cmd.exe`; otherwise it reads `get_argv()`, errors if the argv list is empty, and resolves the first element through `search_path`. It then appends the executable and remaining arguments into a UTF-16 command-line buffer using `append_quoted`, checking each non-program argument for embedded NUL code units. Finally it NUL-terminates both the executable path buffer and the command-line buffer and returns them as `(Vec<u16>, Vec<u16>)`.
+**Data flow**: It receives a `CommandBuilder`. If the command uses the default program, it chooses `ComSpec` or `cmd.exe`; otherwise it takes the first argument as the program name and searches `PATH` for it. It then quotes the executable and each later argument safely, encodes the executable and command line as UTF-16, adds final zero markers, and returns both pieces. If no program name exists, it returns an error.
 
-**Call relations**: This helper is called by `PsuedoCon::spawn_command` before process creation. It delegates executable lookup to `search_path` and Windows escaping rules to `append_quoted`.
+**Call relations**: `PsuedoCon::spawn_command` calls this before `CreateProcessW`. It delegates program lookup to `search_path` and safe argument quoting to `append_quoted`.
 
 *Call graph*: calls 2 internal fn (append_quoted, search_path); called by 1 (spawn_command); 7 external calls (get_argv, get_env, is_default_prog, new, new, bail!, ensure!).
 
@@ -3317,11 +3341,11 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)>
 fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString
 ```
 
-**Purpose**: Searches the command's PATH and PATHEXT environment variables to resolve an executable name to an existing filesystem path. If no match is found, it leaves the original executable string unchanged.
+**Purpose**: Finds the actual executable file for a command name using Windows-style `PATH` and `PATHEXT` rules. This lets a command like `python` resolve to something like `python.exe` in a directory from `PATH`.
 
-**Data flow**: It takes the `CommandBuilder` and an executable `OsStr`, reads `PATH` and `PATHEXT`, iterates each PATH directory, first checking the bare candidate `path.join(exe)`, then trying each extension from PATHEXT by replacing or adding the extension. The first existing path is returned as an `OsString`; if PATH is absent or no candidate exists, it returns `exe.to_os_string()`.
+**Data flow**: It receives the command settings and a program name. If `PATH` is set, it checks each directory for the exact name, then checks the same name with extensions from `PATHEXT` such as `.EXE`. If it finds an existing file, it returns that full path; otherwise it returns the original name unchanged.
 
-**Call relations**: This function is only used by `build_cmdline` when the command is not the default shell program and the executable may need PATH-based resolution.
+**Call relations**: `build_cmdline` calls this when the command is not the default shell. Its result becomes the executable path used in the command line and passed to Windows.
 
 *Call graph*: called by 1 (build_cmdline); 4 external calls (get_env, new, to_os_string, split_paths).
 
@@ -3332,11 +3356,11 @@ fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString
 fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>)
 ```
 
-**Purpose**: Appends one argument to a UTF-16 Windows command-line buffer using Windows-compatible quoting and backslash escaping rules. It preserves arguments without special characters unquoted for simplicity.
+**Purpose**: Adds one command-line argument to a Windows command string with the right quoting rules. This protects spaces, quotes, and backslashes from being misunderstood by the child program.
 
-**Data flow**: It takes an `OsStr` argument and a mutable `Vec<u16>` buffer. If the argument is non-empty and contains no whitespace or quotes, it writes the UTF-16 code units directly. Otherwise it surrounds the argument with quotes and walks the encoded code units, doubling backslashes before a closing quote or at end-of-string, escaping literal quotes, and copying ordinary characters through. It mutates `cmdline` in place and returns no value.
+**Data flow**: It receives one argument and the command-line buffer being built. If the argument has no characters that require quoting, it appends it directly. Otherwise it surrounds the argument with quotes and carefully doubles or escapes backslashes before quotes and at the end, following Windows command-line parsing rules. It changes the buffer in place and returns nothing.
 
-**Call relations**: This helper is called repeatedly by `build_cmdline` for the executable and each subsequent argument so that `CreateProcessW` receives a command line that the child process parses correctly.
+**Call relations**: `build_cmdline` calls this for the executable name and each argument. Its output is part of the final command-line string passed by `PsuedoCon::spawn_command` to `CreateProcessW`.
 
 *Call graph*: called by 1 (build_cmdline); 3 external calls (encode_wide, is_empty, len).
 
@@ -3347,24 +3371,26 @@ fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>)
 fn windows_build_number_returns_value()
 ```
 
-**Purpose**: Verifies that the Windows version probe returns a build number on the test machine and that it exceeds the minimum ConPTY build threshold. It is a smoke test for the `RtlGetVersion` path.
+**Purpose**: Checks that the Windows build-number lookup works on the test machine. It does not try to pin an exact Windows version, only that the value exists and is new enough for ConPTY.
 
-**Data flow**: It calls `windows_build_number().unwrap()` to obtain a concrete build number and asserts that the value is greater than `MIN_CONPTY_BUILD`.
+**Data flow**: It calls `windows_build_number`, unwraps the returned value, and asserts that it is greater than the minimum ConPTY build. If the lookup fails or the build is too old, the test fails.
 
-**Call relations**: This test directly exercises `windows_build_number` rather than the higher-level `conpty_supported` helper, ensuring the low-level version query itself works.
+**Call relations**: This test exercises `windows_build_number` directly. It helps catch problems with the low-level version-reading code that `conpty_supported` depends on.
 
 *Call graph*: calls 1 internal fn (windows_build_number); 1 external calls (assert!).
 
 
 ### `utils/pty/src/win/conpty.rs`
 
-`generated` · `Windows PTY setup and PTY I/O lifetime`
+`io_transport` · `Windows PTY creation, command launch, terminal I/O, and resize handling`
 
-This vendored file is the Windows-specific PTY transport layer. It creates a pseudoconsole (`PsuedoCon`) backed by two anonymous pipes: one pipe feeds input into the console, and the other carries console output back to the parent. `create_conpty_handles` is the primitive that allocates those pipes and constructs the pseudoconsole with a `COORD` derived from `PtySize`.
+A terminal program needs two-way conversation with the process it runs: it sends keystrokes in, and it reads screen output back. On Windows, that conversation goes through ConPTY, a “pseudo terminal” API provided by the operating system. This file wraps that Windows-specific machinery so the rest of the project can use the common portable_pty interface instead of talking to Windows handles directly.
 
-`RawConPty` is a lower-level wrapper that owns the pseudoconsole plus its input/output file descriptors and can either expose the raw pseudoconsole handle or be decomposed into its owned parts using `ManuallyDrop` and `ptr::read` to avoid double-drop. The higher-level `ConPtySystem` implements `portable_pty::PtySystem::openpty` by creating shared `Inner` state inside `Arc<Mutex<_>>`, then returning a `PtyPair` whose master and slave both reference that shared state.
+The main helper, create_conpty_handles, builds two pipes. One pipe carries input toward the console program, and the other carries output back. It then creates a PsuedoCon object, which represents the Windows pseudo console, using the terminal size requested by the caller.
 
-`Inner` stores the live `PsuedoCon`, the readable output descriptor, an optional writable input descriptor, and the current `PtySize`. Its `resize` method updates both the underlying pseudoconsole and the cached size. `ConPtyMasterPty` exposes resize, size query, reader cloning, and one-time writer extraction; `take_writer` consumes the optional writer and errors if called twice. `ConPtySlavePty` delegates command spawning to the pseudoconsole itself. The overall design mirrors a Unix PTY pair while fitting Windows ConPTY's handle-based API.
+ConPtySystem is the normal entry point for code that wants a full terminal pair. It returns a master side and a slave side, like two ends of a phone line. The master side is used by the terminal UI to read output, write input, resize the terminal, and ask for the current size. The slave side is used to start the child command inside that pseudo console.
+
+The shared Inner struct keeps the actual Windows console, pipe handles, and current size behind a mutex, which is a lock that stops two tasks changing the same state at once. RawConPty is a lower-level escape hatch for callers that need the raw Windows pseudo-console handle and separate ownership of the underlying handles.
 
 #### Function details
 
@@ -3376,11 +3402,11 @@ fn create_conpty_handles(
 ) -> anyhow::Result<(PsuedoCon, FileDescriptor, FileDescriptor)>
 ```
 
-**Purpose**: Allocates the pipe endpoints and pseudoconsole needed for a Windows ConPTY session. It returns the pseudoconsole plus the parent-side writable stdin handle and readable stdout handle.
+**Purpose**: Creates the basic Windows pseudo-terminal plumbing: the Windows pseudo console plus one writable input handle and one readable output handle. Callers use it when they need a fresh ConPTY connection at a given terminal size.
 
-**Data flow**: Takes a `PtySize`, creates two `Pipe`s, converts rows and columns into a Win32 `COORD`, constructs `PsuedoCon::new(...)` with the read end of the stdin pipe and write end of the stdout pipe, and returns `(con, stdin.write, stdout.read)`.
+**Data flow**: It receives a PtySize with row and column counts. It creates two operating-system pipes, gives the read end of the input pipe and the write end of the output pipe to the Windows pseudo console, and keeps the opposite ends for the project to use. It returns the new PsuedoCon, a handle for writing input into it, and a handle for reading output from it.
 
-**Call relations**: This helper is used by both `RawConPty::new` and `ConPtySystem::openpty`. It centralizes the exact pipe wiring required by ConPTY.
+**Call relations**: This is the shared setup step used by ConPtySystem::openpty for the normal portable_pty path and by RawConPty::new for lower-level callers. It relies on pipe creation and pseudo-console creation underneath, then hands the finished pieces back to whichever path requested them.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (openpty, new); 1 external calls (new).
 
@@ -3391,11 +3417,11 @@ fn create_conpty_handles(
 fn new(cols: i16, rows: i16) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Constructs a low-level owned ConPTY wrapper from column and row counts. It is a convenience constructor around `create_conpty_handles`.
+**Purpose**: Builds a low-level RawConPty object for callers that need direct access to Windows ConPTY pieces instead of the higher-level master/slave interface. This is useful when another part of the Windows process-launch code wants to attach a process using the raw pseudo-console handle.
 
-**Data flow**: Accepts `cols: i16` and `rows: i16`, builds a `PtySize` with zero pixel dimensions, calls `create_conpty_handles`, and returns `RawConPty { con, input_write, output_read }`.
+**Data flow**: It receives column and row counts as signed numbers. It converts them into a PtySize, asks create_conpty_handles to make the console and pipes, and stores those pieces in a RawConPty. The result is a ready-to-use object containing the pseudo console, input writer, and output reader.
 
-**Call relations**: This constructor is used by other Windows-specific code that needs direct access to the pseudoconsole and its file descriptors rather than the `portable_pty` trait wrappers.
+**Call relations**: Outside this file, create_conpty and spawn_conpty_process_as_user call this when they need a raw Windows ConPTY setup. Internally, it delegates all actual pipe and pseudo-console creation to create_conpty_handles.
 
 *Call graph*: calls 1 internal fn (create_conpty_handles); called by 2 (create_conpty, spawn_conpty_process_as_user).
 
@@ -3406,11 +3432,11 @@ fn new(cols: i16, rows: i16) -> anyhow::Result<Self>
 fn pseudoconsole_handle(&self) -> RawHandle
 ```
 
-**Purpose**: Exposes the raw Windows pseudoconsole handle from a `RawConPty`. This is useful for APIs that need to pass the handle into process-creation attributes.
+**Purpose**: Returns the raw Windows handle for the pseudo console. This lets lower-level Windows process-startup code attach a child process to the ConPTY object.
 
-**Data flow**: Reads `self.con` and returns `self.con.raw_handle()` as a `RawHandle`.
+**Data flow**: It reads the PsuedoCon stored inside the RawConPty and asks it for its raw operating-system handle. It returns that handle without changing the RawConPty.
 
-**Call relations**: This method supports lower-level Windows process-spawn code that integrates ConPTY with custom startup attributes.
+**Call relations**: This is used after RawConPty::new has created the console and before or during Windows-specific process setup. It simply exposes the handle held by PsuedoCon so another layer can pass it to Windows APIs.
 
 *Call graph*: calls 1 internal fn (raw_handle).
 
@@ -3421,11 +3447,11 @@ fn pseudoconsole_handle(&self) -> RawHandle
 fn into_handles(self) -> (PsuedoCon, FileDescriptor, FileDescriptor)
 ```
 
-**Purpose**: Consumes `RawConPty` and returns its owned pseudoconsole and file descriptors without running their destructors twice. It uses `ManuallyDrop` plus raw pointer reads to move fields out safely.
+**Purpose**: Takes a RawConPty apart and gives ownership of its three internal pieces to the caller. This is for code that wants to keep using the pseudo console and pipe handles separately.
 
-**Data flow**: Takes ownership of `self`, wraps it in `ManuallyDrop`, uses `ptr::read` to extract `con`, `input_write`, and `output_read`, and returns that tuple.
+**Data flow**: It receives the RawConPty by value, meaning the caller gives it up. It carefully prevents Rust from automatically closing or dropping the internal handles, reads the PsuedoCon, input writer, and output reader out of the object, and returns them as separate values. After this, the RawConPty wrapper itself is no longer used.
 
-**Call relations**: This method is used by Windows-specific code paths that need to transfer ownership of the underlying handles out of the wrapper.
+**Call relations**: This fits the lower-level RawConPty path. After RawConPty::new builds the bundled object, a caller can use this function when it needs to hand the individual handles to other Windows setup code.
 
 *Call graph*: 2 external calls (new, read).
 
@@ -3436,11 +3462,11 @@ fn into_handles(self) -> (PsuedoCon, FileDescriptor, FileDescriptor)
 fn openpty(&self, size: PtySize) -> anyhow::Result<PtyPair>
 ```
 
-**Purpose**: Implements the `portable_pty` PTY-system interface for Windows ConPTY. It creates shared state and returns a master/slave pair backed by the same pseudoconsole.
+**Purpose**: Creates a complete portable_pty terminal pair backed by Windows ConPTY. This is the main high-level way the rest of the project asks Windows for a new pseudo terminal.
 
-**Data flow**: Takes a `PtySize`, calls `create_conpty_handles`, builds `Inner { con, readable, writable: Some(writable), size }` inside `Arc<Mutex<_>>`, constructs `ConPtyMasterPty` and `ConPtySlavePty` sharing that Arc, boxes them, and returns `PtyPair { master, slave }`.
+**Data flow**: It receives the requested terminal size. It creates the Windows pseudo console and its pipes, stores them with the current size inside shared locked state, then builds a master side and a slave side that both point to that same state. It returns a PtyPair containing those two boxed interface objects.
 
-**Call relations**: This is the entry point used by the PTY backend's `platform_native_pty_system` on Windows. It delegates actual handle creation to `create_conpty_handles`.
+**Call relations**: Code using the portable_pty abstraction calls this to open a new terminal. It calls create_conpty_handles for the Windows-specific setup, then wraps the result as ConPtyMasterPty and ConPtySlavePty so later code can read, write, resize, and spawn a command through standard trait methods.
 
 *Call graph*: calls 1 internal fn (create_conpty_handles); 3 external calls (new, new, new).
 
@@ -3457,11 +3483,11 @@ fn resize(
     ) -> Result<(), Error>
 ```
 
-**Purpose**: Resizes the underlying pseudoconsole and updates the cached PTY size. It is the mutable core operation behind the master PTY's resize API.
+**Purpose**: Changes the size of the underlying Windows pseudo console and remembers the new size locally. This keeps the operating system and the project’s stored terminal size in sync.
 
-**Data flow**: Accepts new row/column/pixel dimensions, calls `self.con.resize(COORD { X, Y })`, overwrites `self.size` with the new `PtySize`, and returns `Ok(())` or the propagated error.
+**Data flow**: It receives the new row count, column count, and pixel dimensions. It sends the row and column size to the Windows pseudo console, then updates the stored PtySize with both character-cell and pixel values. It returns success or an error if Windows rejects the resize.
 
-**Call relations**: This method is called by `ConPtyMasterPty::resize` after locking the shared `Inner` state.
+**Call relations**: ConPtyMasterPty::resize uses this when the terminal window changes size. The function hands the actual resize request to PsuedoCon, then updates the shared Inner state so ConPtyMasterPty::get_size can report the latest size later.
 
 *Call graph*: calls 1 internal fn (resize).
 
@@ -3472,11 +3498,11 @@ fn resize(
 fn resize(&self, size: PtySize) -> anyhow::Result<()>
 ```
 
-**Purpose**: Implements `MasterPty::resize` for ConPTY by locking shared state and forwarding to `Inner::resize`. It is the public resize surface seen by the rest of the crate.
+**Purpose**: Lets the master side resize the pseudo terminal. A terminal UI would call this when the user changes the window size.
 
-**Data flow**: Takes a `PtySize`, locks `self.inner`, passes the size fields to `inner.resize(...)`, and returns the resulting `anyhow::Result<()>`.
+**Data flow**: It receives a PtySize. It locks the shared Inner state so no other thread can change it at the same time, then asks Inner::resize to apply the new size to Windows and store it. It returns either success or the resize error.
 
-**Call relations**: The PTY backend calls this through the `MasterPty` trait when resizing a Windows PTY session.
+**Call relations**: This is part of the MasterPty interface used by higher-level terminal code. It sits above Inner::resize: callers talk to the master object, and the master object forwards the resize to the shared Windows-backed state.
 
 
 ##### `ConPtyMasterPty::get_size`  (lines 165–168)
@@ -3485,11 +3511,11 @@ fn resize(&self, size: PtySize) -> anyhow::Result<()>
 fn get_size(&self) -> Result<PtySize, Error>
 ```
 
-**Purpose**: Returns the cached current PTY size for a ConPTY master. It does not query the OS; it reads the size stored in shared state.
+**Purpose**: Reports the current size that this pseudo terminal believes it has. This is used when code needs to know the terminal’s rows, columns, and pixel dimensions.
 
-**Data flow**: Locks `self.inner`, copies `inner.size`, and returns it as `Result<PtySize, Error>`.
+**Data flow**: It locks the shared Inner state, reads the stored PtySize, and returns that size. It does not talk to Windows or change anything.
 
-**Call relations**: This satisfies the `MasterPty` trait and complements `resize` for callers that need to inspect current dimensions.
+**Call relations**: This is another MasterPty interface method. It complements ConPtyMasterPty::resize: resize updates the stored size, and get_size later reads it back for higher-level code.
 
 
 ##### `ConPtyMasterPty::try_clone_reader`  (lines 170–172)
@@ -3498,11 +3524,11 @@ fn get_size(&self) -> Result<PtySize, Error>
 fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>>
 ```
 
-**Purpose**: Provides a clone of the readable output side of the ConPTY master. Each clone can independently read console output.
+**Purpose**: Provides a reader for the output coming back from the pseudo terminal. The reader is how the project receives text and control sequences printed by the child process.
 
-**Data flow**: Locks `self.inner`, calls `readable.try_clone()?`, boxes the cloned reader as `Box<dyn std::io::Read + Send>`, and returns it.
+**Data flow**: It locks the shared Inner state, clones the readable output handle, wraps that clone as a standard Read object, and returns it. The original readable handle remains stored in Inner.
 
-**Call relations**: The PTY backend uses this trait method to create the reader object consumed by its blocking output-forwarding task.
+**Call relations**: Higher-level code calls this through the MasterPty interface when it wants to start reading terminal output. It works on the output pipe that create_conpty_handles originally connected to the Windows pseudo console.
 
 *Call graph*: 1 external calls (new).
 
@@ -3513,11 +3539,11 @@ fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>>
 fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>>
 ```
 
-**Purpose**: Transfers ownership of the writable input side of the ConPTY master exactly once. Subsequent attempts fail with an explicit error.
+**Purpose**: Gives the caller the one writer used to send input into the pseudo terminal. It can only be taken once, which prevents two independent writers from accidentally competing to feed the same terminal input stream.
 
-**Data flow**: Locks `self.inner`, takes `writable` out of its `Option<FileDescriptor>`, converts `None` into an `anyhow!("writer already taken")` error, boxes the descriptor as `Box<dyn std::io::Write + Send>`, and returns it.
+**Data flow**: It locks the shared Inner state and removes the stored writable input handle from its Option. If the writer is still present, it wraps it as a standard Write object and returns it. If someone already took it, it returns an error saying the writer was already taken.
 
-**Call relations**: The PTY backend calls this when creating the stdin writer task. The one-time take enforces exclusive ownership of the write handle.
+**Call relations**: Higher-level code calls this through the MasterPty interface when it is ready to send keyboard input or other bytes into the child process. The single-use behavior protects the input pipe created by create_conpty_handles from being handed out repeatedly.
 
 *Call graph*: 1 external calls (new).
 
@@ -3528,10 +3554,10 @@ fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>>
 fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>>
 ```
 
-**Purpose**: Spawns a child process attached to the pseudoconsole represented by the shared `Inner`. It is the slave-side implementation required by `portable_pty`.
+**Purpose**: Starts a command inside the Windows pseudo console. This is the step that actually connects a child program, such as a shell, to the terminal-like environment.
 
-**Data flow**: Locks `self.inner`, calls `inner.con.spawn_command(cmd)?`, boxes the returned child as `Box<dyn Child + Send + Sync>`, and returns it.
+**Data flow**: It receives a CommandBuilder describing what program to run and with what settings. It locks the shared Inner state, asks the PsuedoCon to spawn that command attached to the pseudo console, wraps the resulting child process object, and returns it.
 
-**Call relations**: This method is invoked by the PTY backend's portable spawn path after it has built a `CommandBuilder` for the child process.
+**Call relations**: This is the key SlavePty interface method. After ConPtySystem::openpty creates the master and slave pair, higher-level code uses the slave side to launch the command, while the master side is used to read output, write input, and resize the terminal.
 
 *Call graph*: 1 external calls (new).

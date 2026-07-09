@@ -1,8 +1,14 @@
 # Extension and integration tools  `stage-14.3`
 
-This stage is the system’s extension-facing execution layer: it sits across session startup and the per-turn tool path, connecting the core runtime to capabilities that come from MCP servers, plugins, connectors, hosted app integrations, and other non-core namespaces. Its job is to make those external capabilities discoverable, policy-checked, callable, and refreshable without hardwiring them into the core loop.
+This stage gives Codex its “extra equipment” beyond the core chat and code loop. It is mostly shared behind-the-scenes support, used during startup, while choosing tools during a turn, and when clients ask to discover apps or files.
 
-The MCP runtime, resources, and session integration sub-stage turns configured or plugin-declared MCP servers into live session connections, exposes their tools and resources, routes calls, and keeps auth, approvals, refresh, and resource access consistent as sessions change. Plugin and connector ecosystem management supplies the inventory and policy layer: it discovers installed and marketplace extensions, validates manifests, manages install/upgrade/remove flows, and determines naming, routing, provenance, and connector accessibility. Extension-backed tool runtimes and namespaces then assemble the actual turn-specific toolbox, publishing model-visible specs and executing dynamic, hosted, code-mode, memory, skill, web-search, and image-generation tools. Finally, app-server integration discovery and search adapters expose connector/app discovery and fuzzy file search to clients, turning backend integration data into user-facing APIs and updates.
+The MCP runtime is the bridge to outside programs that use the Model Context Protocol, a standard way for other apps to offer tools and resources. It starts those servers, lists what they provide, checks permissions, and sends tool results back to the session.
+
+Plugin and connector management is the supply chain. It finds, installs, updates, disables, and removes plugins, while deciding which connectors are visible and safe for a user.
+
+Extension-backed tool runtimes turn those add-ons into usable tools for the model, such as web search, image generation, memories, skills, and long-running code cells. They build the tool menu, run selected tools, and report progress.
+
+App-server discovery and search adapters are the front desk. They gather connector, app, and file-search results, clean and merge them, then return useful lists to the client.
 
 ## Sub-stages
 

@@ -1,10 +1,10 @@
 # Generated backend and protobuf contracts  `stage-18.3`
 
-This stage supplies the schema-derived contracts that sit underneath the system’s runtime communication with external services. It is cross-cutting infrastructure rather than business logic: other stages depend on these types whenever they decode backend HTTP responses, exchange gRPC thread-configuration messages, or speak the exec-server relay protocol.
+This stage is shared behind-the-scenes support. It is the system’s set of “forms” that different parts agree to fill out the same way. Most of it is generated from contracts: OpenAPI for web JSON APIs, and protobuf/gRPC for compact service messages sent between programs.
 
-The OpenAPI side is rooted in codex-backend-openapi-models/src/lib.rs and models/mod.rs, which expose the generated backend model set actually used by the workspace. Those models cover rate-limit and credit telemetry, spend controls, task and task-list responses, pull-request payloads, and delivered configuration bundles and TOML fragments. backend-client/src/types.rs is the important adapter layer on top: it compensates for inconsistent backend JSON, performs custom extraction, and offers higher-level accessors for account checks, task details, diffs, prompts, assistant messages, and error payloads.
+The backend client types describe the data the Codex backend sends back, such as accounts, usage limits, tasks, diffs, messages, errors, and token counts, with helpers to turn awkward responses into readable text. The OpenAPI crate exposes generated model modules, then gathers the needed types in one place. Those models cover rate limits, credit and spend controls, task details and task lists, pull requests, paginated results, and delivered configuration files or TOML fragments.
 
-The protobuf side provides generated wire contracts for two separate channels. config/src/thread_config/proto/codex.thread_config.v1.rs defines the thread-config loader service and its messages, while exec-server/src/proto/codex.exec_server.relay.v1.rs defines relay framing, control, heartbeat, and handshake messages. exec-server/src/relay_proto.rs narrows that generated surface to the relay types the rest of exec-server consumes.
+The protobuf files do the same job for internal services. The thread-config file defines requests, responses, and provider settings for asking another component for configuration. The exec-server relay file defines messages for handshakes, heartbeats, reconnects, resets, acknowledgements, and data transfer. The relay wrapper hides the generated details behind cleaner names.
 
 ## Files in this stage
 
@@ -13,11 +13,13 @@ These files introduce the handwritten backend-facing type layer and the generate
 
 ### `backend-client/src/types.rs`
 
-`data_model` · `response deserialization and downstream task/account inspection`
+`data_model` · `response parsing and task display`
 
-This file is the backend client’s type layer: it re-exports many generated OpenAPI models, then fills gaps with custom structs and enums where the generated schema is either awkward or too lossy. The first custom area is account-check parsing. `AccountsCheckResponse` accepts two incompatible wire formats for `accounts`: either a direct `Vec<AccountEntry>` or a map keyed by account id containing nested ChatGPT account objects. Its manual `Deserialize` implementation normalizes both into a single ordered `Vec<AccountEntry>`, using `account_ordering` to preserve server ordering and dropping map entries that are missing from the ordering or lack an `account_id`.
+This file is the backend client's translation layer for several API responses. When the client asks the server for account status, task details, rate limit information, or token usage, the answer comes back as JSON. JSON is just structured text, so this file describes how that text should be turned into Rust values the rest of the program can safely use.
 
-The second major area is task-details parsing. `CodeTaskDetailsResponse`, `Turn`, `TurnItem`, `ContentFragment`, `WorklogMessage`, and `TurnError` model only the fields needed by the client. Many collection fields use `deserialize_vec` so absent arrays deserialize as empty vectors instead of failing or producing `None`. The helper methods then interpret these raw structures: `ContentFragment::text` extracts only meaningful text fragments; `TurnItem::diff_text` understands both `output_diff` items and PR payloads; `Turn::message_texts`, `user_prompt`, and `error_summary` aggregate assistant output, user prompts, and failures into plain strings. The `CodeTaskDetailsResponseExt` trait exposes these as stable, higher-level queries over the current user, assistant, and diff turns. The included tests lock down precedence rules such as preferring `current_diff_task_turn` for diffs and joining multi-part prompts with blank lines.
+Some of the backend responses are not perfectly uniform. For example, account data may arrive either as a list or as a map keyed by account id. This file accepts both shapes and normalizes them into one cleaner form. It does something similar for task details: generated OpenAPI types were not good enough here, so the file defines hand-written models for turns, messages, content fragments, diffs, worklogs, and errors.
+
+The helper methods are like a clerk sorting a messy inbox. They pull out the important human-facing pieces: the assistant's text, the user's prompt, a unified diff, or a readable error message. They also ignore empty text and tolerate missing fields, which makes the client more robust when the backend omits optional data.
 
 #### Function details
 
@@ -27,11 +29,11 @@ The second major area is task-details parsing. `CodeTaskDetailsResponse`, `Turn`
 fn default() -> Self
 ```
 
-**Purpose**: Provides the serde default for the polymorphic `accounts` field by choosing an empty list representation. This lets missing `accounts` deserialize cleanly without special-case callers.
+**Purpose**: Provides the fallback value for account data when the backend does not include an accounts field. It treats missing accounts as an empty list rather than as an error.
 
-**Data flow**: It takes no arguments and constructs `RawAccounts::List(Vec::new())`. It reads no external state and returns the enum value used when serde applies `#[serde(default)]`.
+**Data flow**: No outside data comes in. It creates a RawAccounts value containing an empty vector, so later parsing code can continue as if the server simply returned no accounts.
 
-**Call relations**: Serde invokes this when `RawAccountsCheckResponse.accounts` is absent. Its output is then consumed by `AccountsCheckResponse::deserialize`, which treats the empty list as a normalized no-accounts case.
+**Call relations**: This is used by deserialization when RawAccountsCheckResponse is built from JSON and the accounts field is absent. It supports AccountsCheckResponse::deserialize by giving that function a safe starting point.
 
 *Call graph*: 2 external calls (List, new).
 
@@ -42,11 +44,11 @@ fn default() -> Self
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Manually deserializes account-check JSON that may encode accounts either as a list of `AccountEntry` values or as a map of nested ChatGPT account objects. It normalizes both shapes into the public `AccountsCheckResponse` structure.
+**Purpose**: Turns the backend's account-check JSON into the cleaner AccountsCheckResponse shape used by the client. It exists because the backend can send accounts in more than one format.
 
-**Data flow**: It receives a serde `Deserializer`, first deserializes into `RawAccountsCheckResponse`, then matches `raw.accounts`. For `RawAccounts::List`, it forwards the list unchanged. For `RawAccounts::Map`, it iterates `raw.account_ordering`, removes matching entries from the map, extracts the nested `account`, requires a present `account_id`, and builds `AccountEntry` values with copied `name`, `profile_picture_url`, and `structure`. It returns `AccountsCheckResponse { accounts, account_ordering, default_account_id }`.
+**Data flow**: It receives raw JSON through Serde, Rust's serialization and deserialization library. First it reads the JSON into RawAccountsCheckResponse. If accounts are already a list, it keeps them. If accounts are a map, it walks through account_ordering, looks up each account, pulls out the nested account information, and builds AccountEntry values. The result is one AccountsCheckResponse with accounts, ordering, and the default account id.
 
-**Call relations**: Serde calls this whenever an `AccountsCheckResponse` is decoded from backend JSON. It does not delegate to other local helpers beyond the intermediate raw types; downstream code receives a single normalized representation regardless of which wire format the backend emitted.
+**Call relations**: Serde calls this custom deserializer whenever code asks to parse an AccountsCheckResponse. It hands off the first parsing step to RawAccountsCheckResponse::deserialize, then performs the normalization that ordinary generated parsing could not do.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -57,11 +59,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn text(&self) -> Option<&str>
 ```
 
-**Purpose**: Extracts meaningful text from a content fragment while ignoring empty strings and non-text structured payloads. It is the core normalization step used by message and prompt extraction.
+**Purpose**: Extracts useful text from one piece of message content. It filters out non-text structured content and empty plain strings.
 
-**Data flow**: It reads `self` and matches on the enum variant. For `Structured`, it checks whether `content_type` equals `text` case-insensitively and, if so, returns the non-empty `text` field as `&str`. For `Text`, it trims whitespace and returns the raw string slice only when it is not blank. It returns `Option<&str>` and writes no state.
+**Data flow**: It reads one ContentFragment. If the fragment is structured, it only returns text when its content_type says it is text and the text is not empty. If the fragment is a raw string, it returns it only when it is not just whitespace. The output is either a borrowed text slice or nothing.
 
-**Call relations**: This helper is called by `TurnItem::text_values` and `WorklogMessage::text_values` while flattening nested content arrays into plain strings. Its filtering behavior determines which fragments appear in assistant messages and user prompts.
+**Call relations**: TurnItem::text_values and WorklogMessage::text_values rely on this method to avoid repeating the rules for what counts as real text. It is the small gatekeeper that keeps empty or non-text fragments out of user-facing output.
 
 
 ##### `TurnItem::text_values`  (lines 271–276)
@@ -70,11 +72,11 @@ fn text(&self) -> Option<&str>
 fn text_values(&self) -> Vec<String>
 ```
 
-**Purpose**: Collects all textual fragments from a single turn item into owned strings. It converts the item’s heterogeneous `content` array into a simple `Vec<String>`.
+**Purpose**: Collects all meaningful text pieces from a single turn item. A turn item can contain several content fragments, so this gathers them into a simple list of strings.
 
-**Data flow**: It reads `self.content`, iterates each `ContentFragment`, calls `ContentFragment::text`, converts present `&str` values to owned `String`s, and collects them. It returns the resulting vector without mutating any state.
+**Data flow**: It reads the item's content list. For each ContentFragment, it asks ContentFragment::text whether there is usable text. It copies each usable piece into a String and returns the list.
 
-**Call relations**: This is used by `Turn::message_texts` for assistant output items and by `Turn::user_prompt` for user input items. It delegates fragment-level filtering to `ContentFragment::text`.
+**Call relations**: Turn::message_texts and Turn::user_prompt use this when they need the text inside message items. It delegates the fine-grained filtering to ContentFragment::text.
 
 
 ##### `TurnItem::diff_text`  (lines 278–293)
@@ -83,11 +85,11 @@ fn text_values(&self) -> Vec<String>
 fn diff_text(&self) -> Option<String>
 ```
 
-**Purpose**: Extracts a unified diff string from a turn item when that item encodes diff output in one of the backend’s supported shapes. It understands both direct `output_diff` items and PR items carrying nested `output_diff.diff`.
+**Purpose**: Finds a code diff inside a turn item, if that item represents one. A diff is the patch-style text showing what changed in files.
 
-**Data flow**: It reads `self.kind`, `self.diff`, and `self.output_diff`. If `kind == "output_diff"`, it returns a cloned non-empty `self.diff`. Otherwise, if `kind == "pr"`, it looks for `self.output_diff.as_ref()?.diff` and returns a cloned non-empty nested diff. If neither pattern matches, it returns `None`.
+**Data flow**: It reads the item's kind and diff-related fields. If the kind is output_diff, it returns the direct diff field when it is not empty. If the kind is pr, it looks inside output_diff.diff and returns that when present. If neither shape contains a real diff, it returns nothing.
 
-**Call relations**: Called by `Turn::unified_diff` while scanning output items. Its branching captures backend schema variation so higher-level code can ask for a diff without caring which item type carried it.
+**Call relations**: Turn::unified_diff calls this across output items to find the first available patch. This method hides the fact that the backend may store diff text in different places depending on item type.
 
 
 ##### `Turn::unified_diff`  (lines 297–299)
@@ -96,11 +98,11 @@ fn diff_text(&self) -> Option<String>
 fn unified_diff(&self) -> Option<String>
 ```
 
-**Purpose**: Finds the first diff-bearing output item in a turn and returns its unified diff text. It reduces a turn’s output list to a single optional patch string.
+**Purpose**: Gets the first available unified diff from a turn's output items. A unified diff is the common patch format used by tools like git.
 
-**Data flow**: It reads `self.output_items`, iterates in order, applies `TurnItem::diff_text` to each item, and returns the first non-`None` result. It returns `Option<String>` and does not modify state.
+**Data flow**: It reads the turn's output_items in order. For each item, it asks TurnItem::diff_text whether that item contains a usable diff. It returns the first diff it finds, or nothing if none of the items contain one.
 
-**Call relations**: This helper is used by `CodeTaskDetailsResponse::unified_diff`, which checks the diff-task turn before the assistant turn. It delegates item-level interpretation to `TurnItem::diff_text`.
+**Call relations**: CodeTaskDetailsResponse::unified_diff calls this on the current diff task turn and assistant turn. This method is the turn-level search step between the full task response and individual output items.
 
 
 ##### `Turn::message_texts`  (lines 301–318)
@@ -109,11 +111,11 @@ fn unified_diff(&self) -> Option<String>
 fn message_texts(&self) -> Vec<String>
 ```
 
-**Purpose**: Aggregates assistant-visible text messages from a turn’s output items and assistant-authored worklog entries. It produces the plain-text conversational output for a turn, excluding diffs.
+**Purpose**: Collects assistant-facing text messages from a turn. It looks both at normal output message items and at assistant messages stored in the worklog.
 
-**Data flow**: It starts with an output vector built from `self.output_items`: only items with `kind == "message"` are kept, and each contributes strings from `TurnItem::text_values`. It then inspects `self.worklog`; for each `WorklogMessage`, if `is_assistant()` is true, it appends that message’s `text_values()`. It returns the accumulated `Vec<String>`.
+**Data flow**: It starts with an empty list. It reads output_items, keeps only items whose kind is message, and adds their text values. Then, if there is a worklog, it scans each worklog message, keeps only messages written by the assistant, and adds their text values too. It returns the combined list of strings.
 
-**Call relations**: Used by `CodeTaskDetailsResponse::assistant_text_messages` when combining current diff-task and assistant turns. It delegates role filtering and fragment extraction to `WorklogMessage::is_assistant`, `WorklogMessage::text_values`, and `TurnItem::text_values`.
+**Call relations**: CodeTaskDetailsResponse::assistant_text_messages calls this for the current diff task turn and assistant turn. Inside the worklog path, it uses WorklogMessage::is_assistant and WorklogMessage::text_values to decide what to include.
 
 
 ##### `Turn::user_prompt`  (lines 320–343)
@@ -122,11 +124,11 @@ fn message_texts(&self) -> Vec<String>
 fn user_prompt(&self) -> Option<String>
 ```
 
-**Purpose**: Extracts the user’s prompt text from input message items and joins multiple parts with blank lines. It treats missing roles as user messages by default.
+**Purpose**: Extracts the user's prompt text from a turn. It joins multiple prompt parts with blank lines so the result reads like a single message.
 
-**Data flow**: It reads `self.input_items`, keeps only items with `kind == "message"`, then filters to items whose `role` is either absent or equals `user` case-insensitively. It flattens each item through `TurnItem::text_values`, collects the strings, and returns `None` if no parts were found; otherwise it joins them with `"\n\n"` and returns `Some(String)`.
+**Data flow**: It reads input_items, keeps message items, and only includes items whose role is user or whose role is missing. It collects their text values. If there are no parts, it returns nothing. Otherwise, it joins the parts with two newline characters and returns the combined prompt.
 
-**Call relations**: Called by `CodeTaskDetailsResponse::user_text_prompt` for the current user turn. Its permissive role handling is important for backend payloads that omit the role field.
+**Call relations**: CodeTaskDetailsResponse::user_text_prompt calls this on the current user turn. It uses TurnItem::text_values to handle the content fragments inside each input item.
 
 
 ##### `Turn::error_summary`  (lines 345–347)
@@ -135,11 +137,11 @@ fn user_prompt(&self) -> Option<String>
 fn error_summary(&self) -> Option<String>
 ```
 
-**Purpose**: Converts an optional structured turn error into a single summary string. It is a thin adapter from `Option<TurnError>` to `Option<String>`.
+**Purpose**: Returns a readable error message for a turn if the turn has an error. It keeps callers from needing to inspect the error object directly.
 
-**Data flow**: It reads `self.error`, borrows it if present, and calls `TurnError::summary`. It returns that optional summary and writes no state.
+**Data flow**: It looks at the turn's optional error field. If an error is present, it asks TurnError::summary to turn the code and message into one string. If there is no error, it returns nothing.
 
-**Call relations**: Used by `CodeTaskDetailsResponse::assistant_error_message` to expose assistant-turn failures. All formatting logic lives in `TurnError::summary`.
+**Call relations**: CodeTaskDetailsResponse::assistant_error_message uses this on the current assistant turn. It is the bridge from task-level error lookup to TurnError's formatting rule.
 
 
 ##### `WorklogMessage::is_assistant`  (lines 351–357)
@@ -148,11 +150,11 @@ fn error_summary(&self) -> Option<String>
 fn is_assistant(&self) -> bool
 ```
 
-**Purpose**: Determines whether a worklog message was authored by the assistant. It performs a case-insensitive role check and treats missing author information as non-assistant.
+**Purpose**: Checks whether a worklog message was written by the assistant. This matters because only assistant worklog text should be shown as assistant output.
 
-**Data flow**: It reads `self.author`, then `author.role` if present, compares it to `assistant` ignoring ASCII case, and returns a boolean. No state is mutated.
+**Data flow**: It reads the optional author and the author's optional role. If the role exists and equals assistant, ignoring letter case, it returns true. Missing author, missing role, or any other role returns false.
 
-**Call relations**: This predicate is used by `Turn::message_texts` to include only assistant-authored worklog messages in extracted output text.
+**Call relations**: Turn::message_texts uses this while scanning a worklog. It acts as the filter that separates assistant messages from other worklog entries.
 
 
 ##### `WorklogMessage::text_values`  (lines 359–370)
@@ -161,11 +163,11 @@ fn is_assistant(&self) -> bool
 fn text_values(&self) -> Vec<String>
 ```
 
-**Purpose**: Extracts all textual parts from a worklog message’s optional content payload. It flattens nested content fragments into owned strings.
+**Purpose**: Collects meaningful text fragments from a worklog message. It safely returns an empty list when the message has no content.
 
-**Data flow**: It reads `self.content`. If present, it iterates `content.parts`, calls `ContentFragment::text` on each fragment, converts present slices to `String`, and collects them; if content is absent, it returns an empty vector. It writes no state.
+**Data flow**: It reads the message's optional content. If content exists, it walks through content.parts and uses ContentFragment::text to keep only usable text, returning those pieces as strings. If content is missing, it returns an empty vector.
 
-**Call relations**: Called by `Turn::message_texts` after `WorklogMessage::is_assistant` has selected assistant-authored entries. It delegates fragment filtering to `ContentFragment::text`.
+**Call relations**: Turn::message_texts calls this after WorklogMessage::is_assistant confirms the message came from the assistant. It reuses ContentFragment::text so worklog text follows the same filtering rules as normal message text.
 
 
 ##### `TurnError::summary`  (lines 374–383)
@@ -174,11 +176,11 @@ fn text_values(&self) -> Vec<String>
 fn summary(&self) -> Option<String>
 ```
 
-**Purpose**: Formats a turn error’s code and message into the most informative single-line summary available. It suppresses empty fields rather than emitting awkward separators.
+**Purpose**: Turns an error code and error message into one readable string. It avoids showing awkward empty pieces when only one part is present.
 
-**Data flow**: It reads `self.code` and `self.message`, substitutes empty strings for missing values, then matches on whether each is empty. It returns `None` if both are empty, just the code if only code exists, just the message if only message exists, or `"{code}: {message}"` if both exist.
+**Data flow**: It reads the optional code and message, treating missing values as empty strings. If both are empty, it returns nothing. If only one is present, it returns that one. If both are present, it returns them as "code: message".
 
-**Call relations**: Invoked by `Turn::error_summary`, which in turn feeds `CodeTaskDetailsResponse::assistant_error_message`. This function centralizes the formatting invariant used by tests.
+**Call relations**: Turn::error_summary calls this when a turn contains an error. It uses formatting to combine both fields in the common case where the backend provides both a machine-style code and a human-readable message.
 
 *Call graph*: 1 external calls (format!).
 
@@ -189,11 +191,11 @@ fn summary(&self) -> Option<String>
 fn unified_diff(&self) -> Option<String>
 ```
 
-**Purpose**: Extracts the preferred unified diff from the current task details, prioritizing the dedicated diff-task turn over the assistant turn. It gives callers one place to ask for patch output.
+**Purpose**: Finds the most relevant code diff in a task-details response. It prefers the dedicated diff task turn, then falls back to the assistant turn.
 
-**Data flow**: It reads `self.current_diff_task_turn` and `self.current_assistant_turn`, iterates those optional references in that order, calls `Turn::unified_diff` on each present turn, and returns the first diff found. It returns `Option<String>`.
+**Data flow**: It looks at current_diff_task_turn first and current_assistant_turn second. For each present turn, it asks Turn::unified_diff for a patch. It returns the first patch found, or nothing if neither turn contains one.
 
-**Call relations**: This is the trait implementation behind the public extension API for task details. Tests verify its precedence rule, and it delegates actual turn scanning to `Turn::unified_diff`.
+**Call relations**: This is part of the CodeTaskDetailsResponseExt trait implementation, giving callers a simple task-level method instead of making them know where diffs may be stored. It hands the detailed search to Turn::unified_diff.
 
 
 ##### `CodeTaskDetailsResponse::assistant_text_messages`  (lines 408–420)
@@ -202,11 +204,11 @@ fn unified_diff(&self) -> Option<String>
 fn assistant_text_messages(&self) -> Vec<String>
 ```
 
-**Purpose**: Collects assistant text output from the current diff-task and assistant turns. It merges both sources into a single ordered vector of message strings.
+**Purpose**: Collects assistant text messages from the task-details response. It gives the rest of the client a plain list of assistant-visible text, separate from diffs.
 
-**Data flow**: It initializes an empty `Vec<String>`, iterates over `self.current_diff_task_turn` and `self.current_assistant_turn` if present, extends the vector with each turn’s `message_texts()`, and returns the accumulated messages.
+**Data flow**: It creates an empty list. It checks the current diff task turn and current assistant turn, skipping any that are missing. For each present turn, it appends the result of Turn::message_texts. The output is one combined vector of strings.
 
-**Call relations**: This extension method is used by consumers that want conversational assistant output without parsing the raw turn structure. It delegates per-turn extraction to `Turn::message_texts`.
+**Call relations**: This method is exposed through CodeTaskDetailsResponseExt for higher-level display code. It delegates per-turn extraction to Turn::message_texts, which in turn reads output items and assistant worklog messages.
 
 *Call graph*: 1 external calls (new).
 
@@ -217,11 +219,11 @@ fn assistant_text_messages(&self) -> Vec<String>
 fn user_text_prompt(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the current user turn’s prompt text, if any. It is the high-level accessor for the normalized prompt assembled from input message fragments.
+**Purpose**: Returns the user's prompt from the current user turn, when one exists. It provides a simple way to show or reuse what the user asked.
 
-**Data flow**: It reads `self.current_user_turn`, borrows it if present, calls `Turn::user_prompt`, and returns the resulting `Option<String>`. No state is changed.
+**Data flow**: It reads current_user_turn. If there is a turn, it asks Turn::user_prompt to extract and join the prompt text. If the user turn is missing or has no prompt text, it returns nothing.
 
-**Call relations**: Part of the `CodeTaskDetailsResponseExt` trait implementation. It simply forwards to `Turn::user_prompt` for the current user turn.
+**Call relations**: This is the task-level entry point for prompt extraction in CodeTaskDetailsResponseExt. It hands the actual item filtering and joining to Turn::user_prompt.
 
 
 ##### `CodeTaskDetailsResponse::assistant_error_message`  (lines 426–430)
@@ -230,11 +232,11 @@ fn user_text_prompt(&self) -> Option<String>
 fn assistant_error_message(&self) -> Option<String>
 ```
 
-**Purpose**: Returns a summarized assistant-turn error message when the current assistant turn failed with structured error data. It exposes the assistant error in the same extension API as diffs and messages.
+**Purpose**: Returns a readable assistant error message from the task response, if the assistant turn failed and reported one.
 
-**Data flow**: It reads `self.current_assistant_turn`, borrows it if present, calls `Turn::error_summary`, and returns the optional summary string.
+**Data flow**: It reads current_assistant_turn. If present, it asks Turn::error_summary for the turn's formatted error. If there is no assistant turn or no usable error, it returns nothing.
 
-**Call relations**: This method is the top-level consumer-facing path for assistant error extraction. It delegates formatting to `Turn::error_summary` and ultimately `TurnError::summary`.
+**Call relations**: This is the task-level error lookup method in CodeTaskDetailsResponseExt. It delegates the turn-specific part to Turn::error_summary, which delegates formatting to TurnError::summary.
 
 
 ##### `deserialize_vec`  (lines 433–439)
@@ -243,11 +245,11 @@ fn assistant_error_message(&self) -> Option<String>
 fn deserialize_vec(deserializer: D) -> Result<Vec<T>, D::Error>
 ```
 
-**Purpose**: Deserializes an optional JSON array into a concrete vector, defaulting missing or null values to an empty `Vec`. It removes `Option<Vec<T>>` boilerplate from many struct fields.
+**Purpose**: Deserializes a vector field while treating a missing or null value as an empty list. This makes parsing tolerant of backend responses that omit arrays.
 
-**Data flow**: It accepts a serde `Deserializer`, deserializes `Option<Vec<T>>`, then maps `None` to `Vec::new()` via `unwrap_or_default`. It returns `Result<Vec<T>, D::Error>`.
+**Data flow**: It receives a Serde deserializer for a field that should be a Vec<T>. It first tries to read it as Option<Vec<T>>. If the value is present, it returns the vector. If it is missing or null, it returns an empty vector.
 
-**Call relations**: Serde uses this helper for `Turn.sibling_turn_ids`, `Turn.input_items`, `Turn.output_items`, `TurnItem.content`, and `Worklog.messages`. Those fields therefore always deserialize to usable vectors.
+**Call relations**: Several fields in Turn, TurnItem, and Worklog use this helper through serde attributes. During JSON parsing, Serde calls it for those fields so the rest of the code can safely loop over vectors without checking for null.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -258,11 +260,11 @@ fn deserialize_vec(deserializer: D) -> Result<Vec<T>, D::Error>
 fn fixture(name: &str) -> CodeTaskDetailsResponse
 ```
 
-**Purpose**: Loads one of the embedded task-details JSON fixtures and deserializes it into `CodeTaskDetailsResponse`. It centralizes fixture selection for the unit tests.
+**Purpose**: Loads a named test fixture and parses it as CodeTaskDetailsResponse. It keeps the tests short by centralizing fixture lookup and JSON parsing.
 
-**Data flow**: It takes a fixture name string, matches it to either `task_details_with_diff.json` or `task_details_with_error.json` via `include_str!`, panics on unknown names, then parses the JSON with `serde_json::from_str` and returns the typed response.
+**Data flow**: It receives a fixture name such as diff or error. It chooses the matching JSON file embedded at compile time, panics if the name is unknown, and parses the JSON into CodeTaskDetailsResponse. The parsed response is returned to the test.
 
-**Call relations**: All task-details tests call this helper before exercising the extension methods. It isolates fixture lookup so each test focuses on one extraction behavior.
+**Call relations**: All the tests in this module call this helper before checking extraction behavior. It uses include_str! to read fixture files into the test binary and serde_json::from_str to parse them.
 
 *Call graph*: 3 external calls (include_str!, panic!, from_str).
 
@@ -273,11 +275,11 @@ fn fixture(name: &str) -> CodeTaskDetailsResponse
 fn unified_diff_prefers_current_diff_task_turn()
 ```
 
-**Purpose**: Verifies that diff extraction prefers `current_diff_task_turn` when both task-detail turns may contain diff-like data. It guards the intended precedence rule.
+**Purpose**: Checks that diff extraction finds the expected diff when the current diff task turn contains one. This protects the preference order used by CodeTaskDetailsResponse::unified_diff.
 
-**Data flow**: It loads the `diff` fixture with `tests::fixture`, calls `unified_diff()`, asserts a diff is present, and checks that the returned string contains `diff --git`.
+**Data flow**: It loads the diff fixture, calls unified_diff on the parsed details, and expects a diff to be present. It then asserts that the returned text contains a git-style diff marker.
 
-**Call relations**: This test exercises `CodeTaskDetailsResponse::unified_diff` through the fixture helper. It exists specifically to catch regressions in turn ordering.
+**Call relations**: This test calls tests::fixture to get sample data and then exercises the public extension method. It indirectly covers CodeTaskDetailsResponse::unified_diff, Turn::unified_diff, and TurnItem::diff_text.
 
 *Call graph*: 2 external calls (assert!, fixture).
 
@@ -288,11 +290,11 @@ fn unified_diff_prefers_current_diff_task_turn()
 fn unified_diff_falls_back_to_pr_output_diff()
 ```
 
-**Purpose**: Checks that diff extraction can fall back to a PR item’s nested `output_diff.diff` when no direct diff item is available. It validates the alternate backend shape handled by `TurnItem::diff_text`.
+**Purpose**: Checks that diff extraction can fall back to a pull-request-style output_diff payload. This matters because the backend may store patch text in more than one shape.
 
-**Data flow**: It loads the `error` fixture, calls `unified_diff()`, asserts a diff exists, and verifies the returned patch mentions `lib.rs`.
+**Data flow**: It loads the error fixture, calls unified_diff, and expects a diff to be present. It asserts that the returned patch mentions lib.rs, proving the fallback path found the embedded diff.
 
-**Call relations**: This test covers the path from `CodeTaskDetailsResponse::unified_diff` through `Turn::unified_diff` into the PR branch of `TurnItem::diff_text`.
+**Call relations**: This test uses tests::fixture and then calls the task-level unified_diff method. It specifically protects the branch in TurnItem::diff_text that reads output_diff.diff from pr items.
 
 *Call graph*: 2 external calls (assert!, fixture).
 
@@ -303,11 +305,11 @@ fn unified_diff_falls_back_to_pr_output_diff()
 fn assistant_text_messages_extracts_text_content()
 ```
 
-**Purpose**: Ensures assistant message extraction returns only the expected text fragments from the fixture payload. It confirms that structured and raw text content are normalized correctly.
+**Purpose**: Checks that assistant text extraction returns the expected text and ignores non-text or irrelevant content. It verifies the client can show a clean assistant message.
 
-**Data flow**: It loads the `diff` fixture, calls `assistant_text_messages()`, and asserts the resulting vector equals a single `"Assistant response"` string.
+**Data flow**: It loads the diff fixture, calls assistant_text_messages, and compares the result with a one-item list containing "Assistant response".
 
-**Call relations**: This test exercises the chain `CodeTaskDetailsResponse::assistant_text_messages` → `Turn::message_texts` → `TurnItem::text_values`/`ContentFragment::text`.
+**Call relations**: This test calls tests::fixture and the CodeTaskDetailsResponseExt assistant_text_messages method. It indirectly exercises Turn::message_texts, TurnItem::text_values, and ContentFragment::text.
 
 *Call graph*: 2 external calls (assert_eq!, fixture).
 
@@ -318,11 +320,11 @@ fn assistant_text_messages_extracts_text_content()
 fn user_text_prompt_joins_parts_with_spacing()
 ```
 
-**Purpose**: Verifies that multiple user prompt parts are joined with a blank line separator. It locks down the exact formatting of `Turn::user_prompt`.
+**Purpose**: Checks that multiple user prompt fragments are joined with a blank line between them. This keeps reconstructed prompts readable.
 
-**Data flow**: It loads the `diff` fixture, calls `user_text_prompt()`, asserts a prompt exists, and compares it to the expected two-line string separated by `\n\n`.
+**Data flow**: It loads the diff fixture, calls user_text_prompt, and expects a prompt to be present. It then compares the result with two lines joined by two newline characters.
 
-**Call relations**: This test covers `CodeTaskDetailsResponse::user_text_prompt` and the joining behavior inside `Turn::user_prompt`.
+**Call relations**: This test uses tests::fixture and the task-level user_text_prompt method. It protects the joining behavior inside Turn::user_prompt.
 
 *Call graph*: 2 external calls (assert_eq!, fixture).
 
@@ -333,27 +335,35 @@ fn user_text_prompt_joins_parts_with_spacing()
 fn assistant_error_message_combines_code_and_message()
 ```
 
-**Purpose**: Checks that assistant error extraction combines both error code and message into a single summary string. It validates the formatting contract for failed turns.
+**Purpose**: Checks that an assistant error with both a code and a message is displayed as one combined string. This protects the readable error format shown to users.
 
-**Data flow**: It loads the `error` fixture, calls `assistant_error_message()`, asserts a value is present, and compares it to `APPLY_FAILED: Patch could not be applied`.
+**Data flow**: It loads the error fixture, calls assistant_error_message, and expects an error string to be present. It compares that string with "APPLY_FAILED: Patch could not be applied".
 
-**Call relations**: This test exercises `CodeTaskDetailsResponse::assistant_error_message` through `Turn::error_summary` and `TurnError::summary`.
+**Call relations**: This test uses tests::fixture and the task-level assistant_error_message method. It indirectly checks Turn::error_summary and TurnError::summary.
 
 *Call graph*: 2 external calls (assert_eq!, fixture).
 
 
 ### `codex-backend-openapi-models/src/lib.rs`
 
-`generated` · `cross-cutting`
+`data_model` · `compile time and whenever code imports API model types`
 
-This crate root exists to wrap and re-export OpenAPI-generated data structures without adding handwritten domain behavior. It enables `clippy::unwrap_used` and `clippy::expect_used` allowances at the crate level, reflecting the fact that generated code often uses patterns that would be discouraged in handwritten Rust but are acceptable for machine-produced model definitions. The only public item is `pub mod models;`, which delegates all actual type definitions to the generated or curated module tree under `src/models`. The comments document the intended workflow: regeneration scripts populate individual model files and the module index, and this root intentionally remains minimal so regeneration does not have to preserve custom logic. In practice, this file marks the crate as a pure schema package: consumers import request/response payload structs and enums from here, while serialization behavior, validation assumptions, and field layouts live in the generated model modules themselves.
+This file exists to make generated API data shapes available to the rest of the project. An OpenAPI model is a Rust type created from an API description, usually representing request and response data that travels over the network. Instead of hand-writing those types here, a regeneration script fills `src/models/` with generated Rust files and creates `src/models/mod.rs` to connect them together.
+
+This file then re-exports that generated area with `pub mod models;`, which is like putting a clear sign on a cabinet: “the API model definitions are in here.” Other crates can depend on this crate and access those shared data types through the `models` module.
+
+The `allow` line at the top relaxes two lint rules for this crate: it permits generated code to use `unwrap` and `expect`, which are Rust shortcuts that stop the program if a value is missing or invalid. That choice is common for generated code because the generator may produce patterns that would be noisy or impractical to edit by hand. Without this file, the generated model files would exist on disk but would not be exposed as the crate’s public API.
 
 
 ### `codex-backend-openapi-models/src/models/mod.rs`
 
 `data_model` · `cross-cutting`
 
-This module is the index for the backend model crate's concrete schema types. Rather than exposing every generated artifact wholesale, it declares each backing module as `pub(crate)` and then selectively re-exports the public types needed elsewhere in the workspace. The exports are grouped by feature area: configuration payloads such as `ConfigBundleResponse`, `ConfigFileResponse`, and delivered TOML fragments; cloud task entities such as `CodeTaskDetailsResponse`, `TaskResponse`, `ExternalPullRequestResponse`, `GitPullRequest`, `TaskListItem`, and the paginated task list wrapper; and rate-limit or billing-related payloads including `AdditionalRateLimitDetails`, `RateLimitStatusPayload`, `RateLimitStatusDetails`, `RateLimitWindowSnapshot`, `CreditStatusDetails`, `SpendControlLimitDetails`, and `SpendControlStatusDetails`. It also re-exports enum-like companion types from `rate_limit_status_payload`, including `PlanType`, `RateLimitReachedKind`, and `RateLimitReachedType`. The design keeps module filenames and generated internals hidden while giving the rest of the workspace a stable import surface. The comments note that this file used to be generator-produced but is now manually curated, which is important: adding a new model requires updating this export list explicitly, and unused generated types remain inaccessible by default.
+This file acts like an index page for backend API models. The project has many possible data shapes that can come from an OpenAPI definition, which is a machine-readable description of an HTTP API. Instead of exposing every generated model, this file deliberately keeps a shorter, curated list of only the types the current workspace uses.
+
+Each section groups related models by what they describe. The config section exposes response and TOML-related types, where TOML is a human-readable configuration file format. The cloud task section exposes types used to describe coding tasks, pull requests, and paginated task lists. The rate limit section exposes types that describe usage limits, credit status, spend controls, and limit windows.
+
+The pattern is simple: each `mod` line tells Rust where to find the actual model definition, and each `pub use` line makes that model available from this central `models` module. Without this file, other parts of the codebase would need to know the exact sub-file for every model, which would make imports more scattered and fragile. It is like a neatly labeled shelf: the actual items live in separate boxes, but this file decides which boxes are visible and easy to reach.
 
 
 ### Rate and spend status models
@@ -361,11 +371,13 @@ These generated schemas define the nested transport types for rate limits, credi
 
 ### `codex-backend-openapi-models/src/models/additional_rate_limit_details.rs`
 
-`generated` · `cross-cutting`
+`generated` · `API serialization and deserialization`
 
-This generated model file defines `AdditionalRateLimitDetails`, a serde-serializable struct used to move rate-limit detail payloads between the backend API and Rust code. The struct has two required string fields, `limit_name` and `metered_feature`, both serialized under those exact JSON keys. Its third field, `rate_limit`, is typed as `Option<Option<Box<models::RateLimitStatusDetails>>>` and uses `serde_with::rust::double_option`; that encoding preserves three distinct states during deserialization and serialization: field absent (`None`), field explicitly present with JSON `null` (`Some(None)`), and field present with an actual nested object (`Some(Some(Box<...>))`). `skip_serializing_if = "Option::is_none"` means the outer `None` state omits the key entirely.
+This file is a small data definition used when the backend talks through its OpenAPI interface. A rate limit is a rule that restricts how much of something a user or client can use, such as requests, messages, or another metered feature. This object names the limit, names the feature being measured, and may include a detailed status object for the actual limit.
 
-Aside from derived traits (`Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, `Deserialize`), the file contains only a constructor that initializes the required fields and leaves the optional nested rate-limit detail absent. There is no validation logic, normalization, or behavior beyond data representation, which is typical for OpenAPI-generated model leaf files.
+The main type, `AdditionalRateLimitDetails`, is a plain container. It has `limit_name`, which is the human or system name of the limit, and `metered_feature`, which says what usage is being counted. It also has `rate_limit`, which is optional in a careful way: the field may be absent, or it may be present with either a real value or an explicit `null`. That distinction matters in API data, because “not sent” and “sent as empty” can mean different things.
+
+The `serde` annotations tell Rust how to convert this struct to and from JSON, the common text format used by web APIs. Without this file, code using the generated API models would not have a shared, typed way to represent these extra rate-limit details.
 
 #### Function details
 
@@ -375,20 +387,22 @@ Aside from derived traits (`Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`
 fn new(limit_name: String, metered_feature: String) -> AdditionalRateLimitDetails
 ```
 
-**Purpose**: Creates a new `AdditionalRateLimitDetails` with the required identifiers populated and no nested `rate_limit` value set.
+**Purpose**: Creates a new `AdditionalRateLimitDetails` value with the required fields filled in. It leaves the optional detailed rate-limit status unset, so callers can add it later only when they have that information.
 
-**Data flow**: It takes `limit_name: String` and `metered_feature: String`, moves them directly into the struct fields, sets `rate_limit` to `None`, and returns the fully constructed `AdditionalRateLimitDetails` by value.
+**Data flow**: It takes a `limit_name` and a `metered_feature` as input. It puts those two strings into a new `AdditionalRateLimitDetails` struct and sets `rate_limit` to `None`, meaning no rate-limit detail field is included yet. The finished struct is returned to the caller.
 
-**Call relations**: This constructor is the file’s only behavior and serves as the convenient initialization path when callers have the required fields but no explicit rate-limit-status payload yet.
+**Call relations**: This is the convenience constructor for this generated model. Other code can call it when building an API response or request object, then optionally fill in `rate_limit` before the value is serialized to JSON or used elsewhere.
 
 
 ### `codex-backend-openapi-models/src/models/credit_status_details.rs`
 
-`generated` · `cross-cutting`
+`generated` · `API request and response serialization`
 
-This generated model file defines `CreditStatusDetails`, which captures whether an account has credits and whether usage is unlimited, plus optional descriptive fields about balances and estimated message counts. The required fields `has_credits` and `unlimited` are plain booleans. The optional fields use `Option<Option<...>>` with `serde_with::rust::double_option`: `balance` is an optional optional string, while `approx_local_messages` and `approx_cloud_messages` are optional optional vectors of arbitrary `serde_json::Value`. That schema preserves absent-vs-null-vs-present distinctions from the OpenAPI contract, which matters when the backend wants to signal “not provided” separately from “explicitly empty/unknown.”
+This is a generated model file, created from the project’s OpenAPI description, which is the contract that says what the backend API sends and expects. Its job is simple but important: describe the fields that make up credit status details in a way Rust can check at compile time.
 
-As with the other generated model leaf files, behavior is intentionally minimal. Derived traits provide serialization, deserialization, cloning, equality, and debugging. The constructor initializes the two required booleans from its arguments and leaves all optional detail fields absent (`None`). Any richer state, such as explicit null balances or populated approximate message arrays, must be assigned by callers after construction. The file contains no business rules about how credits are computed or interpreted.
+The main type, `CreditStatusDetails`, is a small data container. It records whether the user has credits, whether their access is unlimited, and optional extra information such as a balance or approximate message counts. The optional fields use a "double option" pattern. In plain terms, this lets the code tell the difference between a field being missing altogether and a field being present but explicitly set to `null`. That matters for APIs, because those two cases can carry different meanings.
+
+The `serde` annotations explain how this struct turns into JSON and back. `serde` is Rust’s common tool for serialization, meaning converting between in-memory values and formats like JSON. Without this file, other parts of the system would have to build and read this credit-status JSON by hand, which would be more error-prone and easier to get out of sync with the API contract.
 
 #### Function details
 
@@ -398,20 +412,22 @@ As with the other generated model leaf files, behavior is intentionally minimal.
 fn new(has_credits: bool, unlimited: bool) -> CreditStatusDetails
 ```
 
-**Purpose**: Builds a `CreditStatusDetails` value with the required credit flags set and all optional balance/message estimate fields omitted.
+**Purpose**: Creates a new credit-status value with the two required facts: whether credits exist and whether access is unlimited. The extra fields start out absent, so callers can fill them in only when they have that information.
 
-**Data flow**: It takes `has_credits: bool` and `unlimited: bool`, stores them directly in the struct, sets `balance`, `approx_local_messages`, and `approx_cloud_messages` to `None`, and returns the new `CreditStatusDetails`.
+**Data flow**: It takes two boolean inputs: `has_credits` and `unlimited`. It places those values into a new `CreditStatusDetails` struct, sets `balance`, `approx_local_messages`, and `approx_cloud_messages` to `None`, and returns the completed struct to the caller.
 
-**Call relations**: This constructor is the sole explicit behavior in the file and provides the minimal initialization path for the generated credit-status model.
+**Call relations**: The call graph does not show a specific caller for this constructor. In normal use, code that needs to create a credit-status API object would call this first, then optionally add balance or message-count details before the value is serialized into JSON or passed deeper into the backend model layer.
 
 
 ### `codex-backend-openapi-models/src/models/rate_limit_window_snapshot.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `request handling`
 
-This file declares `RateLimitWindowSnapshot`, a generated schema struct representing the state of a single rate-limit window at a point in time. All four fields are required integers: `used_percent`, `limit_window_seconds`, `reset_after_seconds`, and `reset_at`. Together they describe how much of the window has been consumed, the total window duration, how long remains until reset, and the reset timestamp or epoch-like integer value expected by the API.
+This is a generated model file, meaning it was created from the project’s OpenAPI description rather than handwritten. OpenAPI is a machine-readable contract for an HTTP API: it says what data the API expects and returns. This file is one small piece of that contract in Rust form.
 
-The constructor requires all four values and stores them directly, reflecting that a snapshot is only meaningful when complete. There is no validation that `used_percent` falls within 0–100, that durations are nonnegative, or that `reset_after_seconds` is consistent with `reset_at`; those invariants, if needed, must be enforced by upstream logic. The file’s role is purely to preserve the schema and serde mapping for this nested object, which is then embedded inside broader rate-limit status models. Because it derives the standard serde and utility traits, it can be serialized, deserialized, cloned, and compared as a passive value object.
+The main type, `RateLimitWindowSnapshot`, is a simple data container. It represents a snapshot of one rate-limit window: how full the window is, how long the window lasts, how many seconds remain until it resets, and the reset time. In everyday terms, it is like a fuel gauge for API usage: it says how much quota has been spent and when the tank refills.
+
+The `serde` annotations connect Rust field names to the JSON field names used over the network. `serde` is the common Rust tool for turning structured data into formats like JSON and back again. Without this file, other code would have to guess or duplicate the exact fields used for rate-limit information, increasing the chance of mismatches between the backend API and the client code.
 
 #### Function details
 
@@ -426,20 +442,24 @@ fn new(
     ) -> RateLimitWindowSnapshot
 ```
 
-**Purpose**: Creates a complete rate-limit window snapshot from its four required numeric fields. It is the direct constructor for this telemetry record.
+**Purpose**: Creates a new `RateLimitWindowSnapshot` from four integer values. Code uses it when it already knows the rate-limit numbers and wants them packaged into the standard API model.
 
-**Data flow**: It consumes `used_percent: i32`, `limit_window_seconds: i32`, `reset_after_seconds: i32`, and `reset_at: i32`, moves them into a new `RateLimitWindowSnapshot`, and returns the populated struct without touching external state.
+**Data flow**: The function receives four numbers: the percentage used, the window length in seconds, the seconds until reset, and the reset time. It places those values directly into a new `RateLimitWindowSnapshot` object and returns that object. It does not read outside state or change anything else.
 
-**Call relations**: This constructor is a leaf used when assembling detailed rate-limit responses that include primary or secondary window data. It performs no delegation and simply packages already computed metrics.
+**Call relations**: This constructor is the simple front door for building this model by hand. Other generated or application code can call it when preparing rate-limit data to pass around or serialize to JSON; the returned object can then be sent onward through the API serialization layer.
 
 
 ### `codex-backend-openapi-models/src/models/rate_limit_status_details.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `API request and response serialization`
 
-This file provides `RateLimitStatusDetails`, a generated schema object that captures both coarse and fine-grained rate-limit information. The required booleans `allowed` and `limit_reached` summarize the current decision state. Two additional fields, `primary_window` and `secondary_window`, are typed as `Option<Option<Box<models::RateLimitWindowSnapshot>>>` and use `serde_with::rust::double_option`, preserving the distinction between an omitted field, an explicit JSON `null`, and a concrete nested snapshot object. Each nested snapshot is boxed, which is typical of generated code for nested models.
+This is a generated OpenAPI model file. In plain terms, it is a small data container for telling a client, “yes, you may do this” or “no, you have hit a limit.” Rate limits are rules that stop someone from making too many requests in a period of time, like a turnstile that only allows a certain number of entries per minute.
 
-The constructor requires only the two booleans and initializes both window fields to `None`, meaning they are absent from the serialized payload unless later populated. This is important because the API can communicate a simple allow/deny result without committing to detailed window telemetry. The file contains no logic for computing percentages, reset times, or policy decisions; those values must be produced elsewhere and inserted into this model. Its main design nuance is the explicit preservation of wire-level nullability semantics for the optional window snapshots.
+The main type, RateLimitStatusDetails, stores two required answers: whether the request is allowed, and whether a limit has been reached. It can also include optional snapshots of two time windows: a primary window and a secondary window. A window snapshot is likely a small report about a counting period, such as how many requests were used and when the count resets.
+
+The optional window fields are intentionally flexible. They can be missing entirely, present with a real snapshot, or present as an explicit null value. That distinction matters in API traffic because “not provided” and “provided but empty” can mean different things.
+
+The file also derives serialization and deserialization support, meaning Rust values can be turned into JSON and JSON can be turned back into Rust values. Without this model, different parts of the backend and its clients would not have a shared, reliable structure for rate-limit status responses.
 
 #### Function details
 
@@ -449,20 +469,22 @@ The constructor requires only the two booleans and initializes both window field
 fn new(allowed: bool, limit_reached: bool) -> RateLimitStatusDetails
 ```
 
-**Purpose**: Builds a rate-limit status object from the required decision booleans. It leaves both optional window snapshots absent.
+**Purpose**: Creates a new rate-limit status value with the two essential answers: whether the action is allowed and whether the limit has been reached. It starts with no primary or secondary window details attached.
 
-**Data flow**: It accepts `allowed: bool` and `limit_reached: bool`, moves them into a new `RateLimitStatusDetails`, sets `primary_window` and `secondary_window` to `None`, and returns the struct.
+**Data flow**: It receives two boolean values: allowed and limit_reached. It places those into a new RateLimitStatusDetails object, sets both optional window fields to absent, and returns the completed object to the caller.
 
-**Call relations**: This is a leaf constructor used by higher-level rate-limit payload assembly when only the summary state is known initially. It delegates no work and serves as the base object before optional snapshots are attached.
+**Call relations**: Code that needs to build a rate-limit status response can call this constructor first, then optionally fill in the primary_window or secondary_window fields later. This function does not call other project functions; it simply prepares the basic data object for later API serialization or internal use.
 
 
 ### `codex-backend-openapi-models/src/models/spend_control_limit_details.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `request and response serialization`
 
-This file is a pure data-model leaf generated from the backend OpenAPI schema. `SpendControlLimitDetails` carries the concrete fields returned over the API for one limit window: textual `limit`, `used`, and `remaining` values; integer `used_percent` and `remaining_percent`; and integer reset timestamps/durations in `reset_after_seconds` and `reset_at`. The `source` field is notable because it uses `serde_with::rust::double_option`, making it a tri-state `Option<Option<String>>`: the field can be absent entirely, present with `null`, or present with a string value. That distinction matters for generated clients that need to preserve API semantics during serialization and deserialization.
+This file is a small data model. It gives the rest of the backend a dependable container for spend-limit information, like a receipt that says: total allowance, amount already spent, amount still available, percentages, and reset time. Without this shared shape, different parts of the system might disagree about field names or missing values when sending or receiving API data.
 
-The struct derives `Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize`, so it is intended to move unchanged between transport and application layers rather than enforce business rules locally. The only behavior is a convenience constructor that requires all non-optional fields and initializes `source` to `None`, meaning omitted rather than explicitly null. There is no validation of numeric ranges, timestamp meaning, or consistency between `used`, `remaining`, and percentages; callers must treat this type as a faithful schema container.
+The main type is `SpendControlLimitDetails`. It can be converted to and from JSON using Serde, a Rust library for serialization, meaning “turning structured data into a format like JSON” and deserialization, meaning “reading JSON back into structured data.” The field names are explicitly tied to the API names, such as `used_percent` and `reset_after_seconds`, so the JSON stays compatible with clients and servers.
+
+Most fields are required. The `source` field is special: it can be absent, present with a text value, or present as `null`. That distinction matters in APIs because “not mentioned” can mean something different from “intentionally empty.” The `new` function creates a valid record with all required values and leaves `source` unset by default.
 
 #### Function details
 
@@ -479,20 +501,22 @@ fn new(
         reset_at: i32,
 ```
 
-**Purpose**: Constructs a `SpendControlLimitDetails` with all required limit metrics populated and the optional `source` field omitted.
+**Purpose**: Creates a new spend-control limit details record from the required pieces of information. It is a convenience constructor so callers do not have to fill every field by hand.
 
-**Data flow**: Takes owned `String` values for `limit`, `used`, and `remaining`, plus `i32` values for `used_percent`, `remaining_percent`, `reset_after_seconds`, and `reset_at`. It places those inputs directly into a new struct, sets `source` to `None`, and returns the fully assembled `SpendControlLimitDetails` without mutating external state.
+**Data flow**: The caller provides the limit, used amount, remaining amount, used and remaining percentages, and reset timing values. The function puts those values into a new `SpendControlLimitDetails` object, sets `source` to missing by default, and returns the completed object.
 
-**Call relations**: This is a local convenience constructor for code that wants to instantiate the generated model without spelling every field name. It does not delegate to helpers or perform validation; serialization behavior is then handled by the derived serde implementations.
+**Call relations**: This constructor is used when some other part of the program needs to build this API model before storing it, returning it, or turning it into JSON. It does not call other project functions; it simply packages the supplied values into the standard data shape expected by the API.
 
 
 ### `codex-backend-openapi-models/src/models/spend_control_status_details.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `request and response serialization`
 
-This generated model wraps the higher-level status around spend controls. `SpendControlStatusDetails` contains a required boolean `reached` and an optional `individual_limit` pointing to `SpendControlLimitDetails` through `Option<Option<Box<...>>>`. As with other generated models using `serde_with::rust::double_option`, that nested option preserves three distinct wire states: field omitted, field present as `null`, or field present with an object payload. Boxing the nested model avoids embedding a potentially larger recursive value directly in the outer struct layout and matches the generator's conventions for optional nested objects.
+This is a generated data model, meaning it was produced from the project’s OpenAPI description rather than handwritten business logic. OpenAPI is a machine-readable description of an HTTP API: what requests and responses look like. This file gives Rust code a safe, predictable way to work with one particular API object: `SpendControlStatusDetails`.
 
-The file contains no domain logic beyond construction. Derived serde traits make it a transport-facing schema object, and the constructor intentionally initializes `individual_limit` to `None`, meaning the field is absent unless a caller explicitly sets it later. There is no enforcement that `individual_limit` be present when `reached` is true, or absent when false; those semantics belong to the backend contract rather than this Rust type. Readers should treat this file as a thin schema mirror whose main subtlety is preserving null-vs-missing distinctions during JSON round-trips.
+The object has two pieces of information. First, `reached` is a simple yes-or-no value that says whether the spend control threshold has been hit. Second, `individual_limit` can carry more detail about a specific spending limit. That field is deliberately wrapped so it can express subtle API states: the field may be missing entirely, present with no value, or present with actual limit details. This matters when talking to an API, because “not sent” and “sent as null” can mean different things.
+
+The `Serialize` and `Deserialize` traits let this structure be converted to and from formats such as JSON. In everyday terms, this file is like a labeled form: it says which boxes exist, which names they use in the API, and how to fill in a new blank copy with the minimum required information.
 
 #### Function details
 
@@ -502,22 +526,22 @@ The file contains no domain logic beyond construction. Derived serde traits make
 fn new(reached: bool) -> SpendControlStatusDetails
 ```
 
-**Purpose**: Creates a status object with the required `reached` flag set and no individual-limit payload attached.
+**Purpose**: Creates a new spend-control status object when the caller knows whether the limit has been reached. It starts with no individual limit details attached, leaving that optional information to be filled in later if needed.
 
-**Data flow**: Accepts a single `bool` argument, writes it into the `reached` field, initializes `individual_limit` to `None`, and returns the new `SpendControlStatusDetails`. It reads no external state and performs no transformation beyond field assignment.
+**Data flow**: The caller gives in one value: `reached`, a true-or-false answer to whether the spend control was hit. The function puts that value into a new `SpendControlStatusDetails` object and sets `individual_limit` to `None`, meaning the individual limit field is not included yet. The result is a ready-to-use status object.
 
-**Call relations**: This constructor is used when callers need the generated model in code before serde fills it from JSON. It is self-contained and leaves any nested `SpendControlLimitDetails` to be attached separately if needed.
+**Call relations**: This constructor is used when other parts of the code need to build this API model before sending it, storing it, or returning it. It does not call out to other functions; it simply creates the data structure in its default minimal form so later code can serialize it or add optional details.
 
 
 ### `codex-backend-openapi-models/src/models/rate_limit_status_payload.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `request handling and API serialization`
 
-This file contains the most structurally rich model in the set: `RateLimitStatusPayload`. Its required field, `plan_type`, uses the local `PlanType` enum to encode the caller’s subscription or workspace plan. The remaining fields—`rate_limit`, `credits`, `spend_control`, `additional_rate_limits`, and `rate_limit_reached_type`—all use `Option<Option<...>>` with `serde_with::rust::double_option`, preserving absent vs explicit-null vs concrete-value semantics across nested objects and lists. Nested detail objects are boxed where appropriate, and `additional_rate_limits` carries a vector of `AdditionalRateLimitDetails` when present.
+This file is a data blueprint for rate-limit status information. When the backend needs to send or receive JSON about a user's plan and usage limits, these Rust types describe exactly what fields can appear and what values are allowed. Think of it like a form template: every response must say the plan type, and it may also include details about rate limits, credits, spending controls, extra limits, or the specific reason a limit was reached.
 
-Two enums are defined alongside the payload. `RateLimitReachedKind` enumerates specific reasons for denial or exhaustion and includes an `Unknown` fallback via `#[serde(other)]`, making deserialization forward-compatible with new server values. `PlanType` similarly enumerates many plan variants and also falls back to `Unknown`. `RateLimitReachedType` is a small wrapper struct exposing the serialized field name `type` while avoiding Rust keyword conflicts by storing it as `kind`.
+The main type is `RateLimitStatusPayload`. Its required field is `plan_type`, which uses the `PlanType` enum to avoid loose strings like "plus" or "enterprise" being passed around unchecked. The other fields are optional in a careful way: they can be missing entirely, present with a real value, or present as JSON `null`. That distinction matters for APIs because “not provided” and “explicitly empty” can mean different things.
 
-The constructor requires only `plan_type` and initializes every optional status field to `None`, producing a minimal payload that communicates plan identity without any attached limit diagnostics. No policy evaluation occurs here; this file only defines and instantiates the wire schema.
+`RateLimitReachedType` and `RateLimitReachedKind` describe why access may have been blocked, such as normal rate limiting, depleted workspace credits, or a usage cap being reached. Unknown values are safely accepted instead of crashing, which helps older clients survive newer server responses. Because this file is generated, developers usually should not edit it by hand; changes should come from the OpenAPI definition.
 
 #### Function details
 
@@ -527,11 +551,11 @@ The constructor requires only `plan_type` and initializes every optional status 
 fn new(plan_type: PlanType) -> RateLimitStatusPayload
 ```
 
-**Purpose**: Constructs a top-level rate-limit payload with a required plan type and no optional detail sections populated. It is the minimal valid instance of this API schema.
+**Purpose**: Creates a new rate-limit status payload with the required plan type filled in and all optional details left out. This is useful when code wants to start with the smallest valid response and add extra information only when it is available.
 
-**Data flow**: It takes `plan_type: PlanType`, stores it directly, initializes `rate_limit`, `credits`, `spend_control`, `additional_rate_limits`, and `rate_limit_reached_type` to `None`, and returns the new `RateLimitStatusPayload`.
+**Data flow**: It takes one input, `plan_type`, which says what subscription or workspace plan applies. It places that value into a new `RateLimitStatusPayload` and sets every optional field, such as credits and spending controls, to `None`, meaning they will be absent unless later filled in. The result is a ready-to-use payload object.
 
-**Call relations**: This constructor is used when higher-level code begins assembling a rate-limit response from plan information and may later fill in detailed sections conditionally. It is a leaf function and does not invoke any subordinate helpers.
+**Call relations**: This constructor is the simple starting point for building this API model. Other backend code can call it when preparing a rate-limit status response, then optionally attach more detailed limit, credit, or spending information before the payload is serialized into JSON for the client.
 
 
 ### Task and pull request responses
@@ -539,11 +563,13 @@ These models cover task listings, detailed task payloads, and the pull-request s
 
 ### `codex-backend-openapi-models/src/models/code_task_details_response.rs`
 
-`generated` · `cross-cutting`
+`generated` · `request handling`
 
-This file defines `CodeTaskDetailsResponse`, a generated serde model for backend responses that expose a task plus optional turn snapshots. The required `task` field is stored as `Box<models::TaskResponse>`, which keeps the outer struct size stable and avoids embedding a potentially large nested task object inline. Three additional fields — `current_user_turn`, `current_assistant_turn`, and `current_diff_task_turn` — are each `Option<std::collections::HashMap<String, serde_json::Value>>`, allowing arbitrary JSON-shaped turn payloads keyed by string while still omitting absent sections during serialization via `skip_serializing_if = "Option::is_none"`.
+This file is a small data model: it says what information a “code task details” response contains when sent over the API. The main required piece is the task itself, stored as a TaskResponse. It can also include three optional pieces of extra turn information: the current user turn, the current assistant turn, and the current diff-task turn. A “turn” here means one step in an interaction, like a message or action in an ongoing back-and-forth.
 
-The struct derives the standard generated-model traits (`Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, `Deserialize`) and contains no domain logic. Its constructor accepts a concrete `models::TaskResponse`, boxes it, and initializes all optional turn maps to `None`. That makes the constructor suitable for building the minimal valid response object first and then selectively attaching whichever turn snapshots are available. The file is purely representational and relies on serde attributes rather than custom code to preserve the API schema.
+The optional fields are flexible maps from text keys to JSON values. In plain terms, that means they can hold mixed structured data without this file needing to spell out every possible field in advance. If one of these optional pieces is missing, it is left out when the response is converted to JSON, keeping the API response smaller and cleaner.
+
+The struct derives common Rust abilities such as cloning, debugging, comparison, and conversion to and from JSON through Serde, a library used for serialization and deserialization. Without this file, the backend and generated clients would not have a clear, typed description of this API response, making it easier for different parts of the system to disagree about what a task-details response looks like.
 
 #### Function details
 
@@ -553,22 +579,24 @@ The struct derives the standard generated-model traits (`Clone`, `Default`, `Deb
 fn new(task: models::TaskResponse) -> CodeTaskDetailsResponse
 ```
 
-**Purpose**: Builds the minimal valid `CodeTaskDetailsResponse` around a required task payload, leaving all optional turn snapshots unset.
+**Purpose**: This creates a new code task details response from a required task. It starts with no current turn information, leaving those optional fields empty until another part of the program fills them in if needed.
 
-**Data flow**: It takes `task: models::TaskResponse`, wraps it with `Box::new(task)`, assigns that boxed value to the `task` field, sets `current_user_turn`, `current_assistant_turn`, and `current_diff_task_turn` to `None`, and returns the struct.
+**Data flow**: It receives a TaskResponse as input. It wraps that task in a Box, which means the task is stored indirectly on the heap rather than directly inside the struct, and then builds a CodeTaskDetailsResponse with all three optional turn fields set to None. The result is a ready-to-use response object containing the task and no extra turn data.
 
-**Call relations**: This constructor is the file’s sole behavior and provides the standard generated-model initialization path before callers optionally populate any of the turn-map fields.
+**Call relations**: This constructor is used when some other part of the API code needs to build a task-details response. Inside, it calls the standard Box::new-style constructor to wrap the task before returning the finished response object.
 
 *Call graph*: 1 external calls (new).
 
 
 ### `codex-backend-openapi-models/src/models/git_pull_request.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `request handling and JSON serialization`
 
-This file contains the generated `GitPullRequest` schema, a fairly broad transport object for pull request details. Five fields are required: numeric PR `number`, `url`, textual `state`, and the booleans `merged` and `mergeable`. The remaining fields are optional and omitted when absent: `draft`, `title`, `body`, branch names (`base`, `head`), commit SHAs (`base_sha`, `head_sha`, `merge_commit_sha`), and three untyped JSON blobs for `comments`, `diff`, and `user`. Those `serde_json::Value` fields are a notable design choice: instead of modeling those nested structures precisely, the generated schema preserves arbitrary JSON payloads for consumers that need raw data.
+This is a generated OpenAPI model file. In plain terms, it is a labeled form for pull request information: number, URL, state, whether it was merged, whether it can be merged, and optional details like title, body, branch names, commit hashes, comments, diff, and user data.
 
-The constructor requires only the core fields and initializes every optional field to `None`, producing a minimal but valid PR object. There is no normalization of state strings, no consistency checks between `merged` and `mergeable`, and no parsing of the JSON-valued fields. This file is therefore purely about preserving the API contract and ownership of PR data, leaving interpretation and validation to higher layers. The derive set makes it easy to clone, compare, debug-print, and serialize the object as needed.
+The main type, `GitPullRequest`, is a Rust struct, which means a grouped set of named fields. The `serde` annotations tell Rust how each field should appear when converted to or from JSON. For example, the Rust field `base_sha` is written as `base_sha` in JSON. Some fields are optional, meaning they may be missing. When those optional fields have no value, they are skipped during JSON output instead of being written as empty placeholders.
+
+This file matters because API clients and servers need to agree on the exact shape of pull request data. Without a shared model like this, one part of the system might send a field under one name while another part expects a different name, causing confusing failures. Think of it like a standard shipping label: every package can contain different contents, but the address, tracking number, and required fields must be in predictable places.
 
 #### Function details
 
@@ -584,20 +612,22 @@ fn new(
     ) -> GitPullRequest
 ```
 
-**Purpose**: Constructs a minimal `GitPullRequest` from its required core fields. All optional metadata fields start absent.
+**Purpose**: Creates a new pull request record with the required fields filled in and all optional fields left empty. Someone would use this when they know the core pull request facts but may add extra details later.
 
-**Data flow**: It consumes `number: i32`, `url: String`, `state: String`, `merged: bool`, and `mergeable: bool`. Those values are copied or moved into a new `GitPullRequest`, while `draft`, `title`, `body`, branch refs, SHAs, and raw JSON fields are all initialized to `None`; the completed struct is then returned.
+**Data flow**: It receives the required pull request details: its number, URL, state, whether it has been merged, and whether it is mergeable. It places those values into a new `GitPullRequest` object, sets every optional field to `None` to mean “not provided,” and returns the completed object.
 
-**Call relations**: This is a leaf constructor used by code that needs a valid PR model before optionally attaching richer metadata. It does not call into any other helper and serves as the nested object source for higher-level response models.
+**Call relations**: The call graph does not show specific callers for this constructor. In the broader flow, code that needs to create a pull request model would call this first, then optionally fill in extra fields such as title, body, branch names, comments, or diff before the object is serialized to JSON or passed around inside the program.
 
 
 ### `codex-backend-openapi-models/src/models/external_pull_request_response.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `API response serialization and deserialization`
 
-This generated model file introduces `ExternalPullRequestResponse`, a transport struct used to serialize or deserialize pull-request-related API responses. The required fields are `id`, `assistant_turn_id`, and `pull_request`; the nested pull request is stored as `Box<models::GitPullRequest>`, which keeps the outer struct’s size stable and matches the generator’s strategy for nested object ownership. An additional optional field, `codex_updated_sha`, carries a SHA string when available and is omitted from serialized output when absent.
+This file is a small data container for one kind of backend response: an external pull request response. In plain terms, it says, “when the backend talks about a pull request created or updated outside the main system, this is the information that must travel over the API.”
 
-The constructor enforces the required shape by taking the two identifier strings and a concrete `GitPullRequest`, boxing the nested object internally, and initializing `codex_updated_sha` to `None`. That means a newly constructed response always represents the baseline API object without any post-update SHA attached. The file itself contains no logic for fetching pull requests, computing SHAs, or correlating assistant turns; it only preserves the response schema and ownership layout expected by serde and the OpenAPI contract. The distinction between required identifiers and optional update metadata is encoded directly in the field types and serde attributes.
+The struct stores four pieces of information. It has an `id` for this response record, an `assistant_turn_id` linking it back to the assistant interaction that caused it, a `pull_request` with the actual pull request details, and an optional `codex_updated_sha`, which is likely a Git commit identifier if Codex updated something. “Optional” means the value may be missing, and if it is missing it will not be included when the response is converted to JSON.
+
+The file uses Serde, a Rust library that turns Rust data into formats like JSON and back again. That matters because this type is meant to cross the boundary between the backend and outside clients. Without this file, code using the generated API models would not have a shared, typed way to represent this response, making API communication easier to get wrong.
 
 #### Function details
 
@@ -611,22 +641,24 @@ fn new(
     ) -> ExternalPullRequestResponse
 ```
 
-**Purpose**: Creates a response object for an external pull request using required identifiers and a nested `GitPullRequest`. It also initializes the optional `codex_updated_sha` as absent.
+**Purpose**: Creates a new `ExternalPullRequestResponse` with the required fields filled in. It starts with no `codex_updated_sha`, because that value is optional and may not be known or relevant.
 
-**Data flow**: It takes ownership of `id: String`, `assistant_turn_id: String`, and `pull_request: models::GitPullRequest`. The function wraps `pull_request` in `Box::new`, stores all three values in a new `ExternalPullRequestResponse`, sets `codex_updated_sha` to `None`, and returns the assembled struct.
+**Data flow**: It receives an response id, an assistant turn id, and a `GitPullRequest` object. It puts those values into a new response struct, wraps the pull request in a heap-owned box so the struct stores it indirectly, sets `codex_updated_sha` to missing, and returns the completed response object.
 
-**Call relations**: According to the call graph, this constructor invokes an external `new` while boxing or constructing nested content as part of response assembly. It is used when higher-level code needs to emit a pull-request response tied to an assistant turn, and it delegates only the nested object construction/boxing step rather than performing any API-side computation.
+**Call relations**: This constructor is used when other code needs to build this API response in a safe, consistent way. During construction it hands the pull request value to `Box::new`, which is the standard Rust tool for placing a value behind a pointer-like container.
 
 *Call graph*: 1 external calls (new).
 
 
 ### `codex-backend-openapi-models/src/models/task_list_item.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `API request and response serialization`
 
-This file provides the list-view representation of a task. `TaskListItem` includes required identity and visibility fields (`id`, `title`, `archived`, `has_unread_turn`) plus several optional enrichments: `has_generated_title`, floating-point `updated_at` and `created_at` timestamps, a free-form `task_status_display` map of JSON values, and optional `pull_requests` containing `ExternalPullRequestResponse` items. The use of `HashMap<String, serde_json::Value>` for status display indicates the backend can emit structured but not statically modeled display metadata, and the optional vectors/maps are omitted from serialized output when absent.
+This file is a data model: it says what information makes up a task list item when the backend sends or receives it as JSON. Think of it like a standard form for a row in a task list. Every row must have an id, a title, whether it is archived, and whether it has an unread turn. Some fields are optional, such as creation and update times, a generated-title flag, display status details, and related pull requests.
 
-The constructor reflects the intended minimum payload for creating or synthesizing this model in client code: it requires the stable identifiers and booleans, accepts `has_generated_title` because that flag may be known at creation time, and defaults all other optional metadata to `None`. No normalization or timestamp conversion occurs; `f64` values are stored exactly as provided by the API. This is therefore a transport schema rather than a richer domain object. A reader should note that list items and full task responses are modeled separately, so this type intentionally carries less detail than `TaskResponse`.
+The serde annotations tell Rust how to turn this struct into JSON and back again. Serde is a common Rust library for serialization, meaning converting in-memory data into formats like JSON, and deserialization, meaning reading JSON back into Rust values. Optional fields are skipped when they are missing, which keeps API responses clean and avoids sending empty values unnecessarily.
+
+The file also provides a small constructor, TaskListItem::new, for making a basic task list item with the required fields and a few selected optional values. Other optional fields start as empty and can be filled in later if the caller has that information. Without this model, different parts of the system could disagree about what a task list item looks like, making API communication fragile.
 
 #### Function details
 
@@ -642,20 +674,22 @@ fn new(
     ) -> TaskListItem
 ```
 
-**Purpose**: Builds a minimal task-list item with required identifiers and flags while leaving optional metadata unset.
+**Purpose**: Creates a new TaskListItem with the required task-list fields filled in. It gives callers a safe starting point where optional details that are not yet known are left empty.
 
-**Data flow**: Consumes `id` and `title` strings, an `Option<bool>` for `has_generated_title`, and required `archived` and `has_unread_turn` booleans. It copies those inputs into the struct, sets `updated_at`, `created_at`, `task_status_display`, and `pull_requests` to `None`, and returns the assembled `TaskListItem`.
+**Data flow**: The caller provides an id, a title, an optional has_generated_title flag, an archived flag, and a has_unread_turn flag. The function places those values into a new TaskListItem, sets updated_at, created_at, task_status_display, and pull_requests to None, and returns the completed struct to the caller.
 
-**Call relations**: This is a convenience constructor for code paths that need a list-item model without manually populating every optional field. It does not call other helpers and relies on derived serde behavior for later JSON encoding/decoding.
+**Call relations**: This constructor is used when code needs to build a task list item from known core details before sending it through the API model layer. It does not call other project functions; it simply assembles the data into the standard shape expected by the rest of the generated OpenAPI models.
 
 
 ### `codex-backend-openapi-models/src/models/paginated_list_task_list_item_.rs`
 
-`data_model` · `request/response serialization`
+`generated` · `request handling`
 
-This generated file declares `PaginatedListTaskListItem`, the schema used when the backend returns a page of `TaskListItem` records. The `items` field is required and stored as `Vec<models::TaskListItem>`, while `cursor` is optional and omitted from serialized output when absent. That shape reflects a common cursor-based pagination contract: every page has concrete items, and only some pages include a continuation token.
+This is a generated data model for the backend API. Its job is to describe, in Rust code, what a paginated task-list response looks like when data is sent to or received from JSON. Pagination means the server does not send every task at once; it sends a manageable batch, like one page of search results, and may include a cursor that points to where the next page starts.
 
-The constructor takes the item vector and initializes `cursor` to `None`, yielding a first-pass or terminal page representation with no next-page token attached. The file contains no pagination logic itself—no cursor encoding/decoding, no page-size enforcement, and no iteration helpers. Its responsibility is simply to preserve the wire format and ownership of the page contents. Because the type derives serde traits and standard utility traits, it can move cleanly between HTTP handlers, generated clients, and tests. The underscore in the filename reflects generator naming for a generic-like schema specialization, but the Rust type itself is the concrete `PaginatedListTaskListItem` model used throughout the API layer.
+The main type is `PaginatedListTaskListItem`. It contains two pieces of data: `items`, which is a list of `TaskListItem` records, and `cursor`, which may or may not be present. If `cursor` is missing, that usually means there is no next page or the caller did not provide one. The `serde` annotations tell Rust how to convert this structure to and from JSON. For example, the Rust field `items` appears as `"items"` in JSON, and `cursor` is skipped when it is empty.
+
+Without this file, other parts of the backend and generated client/server code would not have a shared, type-checked way to describe this particular paginated response. That would make API communication more error-prone, because callers would have to build the JSON shape by hand.
 
 #### Function details
 
@@ -665,20 +699,24 @@ The constructor takes the item vector and initializes `cursor` to `None`, yieldi
 fn new(items: Vec<models::TaskListItem>) -> PaginatedListTaskListItem
 ```
 
-**Purpose**: Creates a paginated task-list page with a required set of items and no cursor. It is the minimal constructor for this page wrapper.
+**Purpose**: Creates a new paginated task-list response from a list of task items. It starts with no cursor, which is useful when there is no next-page marker yet or the caller plans to fill it in later.
 
-**Data flow**: It takes ownership of `items: Vec<models::TaskListItem>`, stores that vector directly, sets `cursor` to `None`, and returns the resulting `PaginatedListTaskListItem`.
+**Data flow**: It receives a vector, meaning an ordered list, of `TaskListItem` values. It puts that list into the `items` field, sets `cursor` to `None`, and returns a complete `PaginatedListTaskListItem` object ready to serialize to JSON or pass around in Rust.
 
-**Call relations**: This constructor is used when callers have already assembled the page contents and either do not yet know or do not need a continuation cursor. It is a leaf function with no delegated work.
+**Call relations**: This constructor is the simple entry point for code that needs to build this response model. Generated API or backend code can call it when preparing a paginated task-list reply, then optionally set the cursor before the response is sent.
 
 
 ### `codex-backend-openapi-models/src/models/task_response.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `API serialization and response building`
 
-This generated schema represents a fuller task payload than the list item model. `TaskResponse` stores required `id`, `title`, `archived`, and a non-optional `external_pull_requests` vector, while optional fields capture creation time, generated-title status, current turn identity, unread-turn state, and arbitrary `denormalized_metadata` as a JSON map. The distinction between required and optional fields mirrors the API contract: external pull requests are always present as a vector, even if empty, whereas several other pieces of metadata may be omitted.
+A task is the unit of work or conversation that the backend exposes to clients. This file describes what information a task response can contain when the backend sends task data as JSON: its id, title, archive status, current turn, unread state, metadata, and related external pull requests.
 
-The constructor enforces that split by requiring the core identifiers plus the pull-request vector and defaulting all optional metadata to `None`. There is no validation of timestamp precision, metadata shape, or consistency between `current_turn_id` and `has_unread_turn`; the type simply preserves backend data. Because this file is generated and derives serde traits, its main role is stable serialization/deserialization rather than behavior. Readers comparing models should note that `TaskResponse` uses `external_pull_requests` while `TaskListItem` uses optional `pull_requests`, reflecting different response shapes rather than an internal transformation layer.
+The main piece is the `TaskResponse` struct. A struct is a named bundle of fields, like a form with labeled boxes. Some boxes are always required, such as `id`, `title`, `archived`, and `external_pull_requests`. Others are optional, such as `created_at` or `current_turn_id`; if they are missing, they are left out when the value is converted to JSON.
+
+The `serde` annotations tell Rust how to translate this struct to and from JSON. For example, the Rust field `created_at` becomes the JSON field `created_at`, and optional fields are skipped when empty. This matters because API clients expect a stable, predictable shape.
+
+The file also provides a small constructor, `TaskResponse::new`, for creating a task response with the required fields while safely starting all optional fields as empty. Without this model, different parts of the backend could accidentally send task data in inconsistent shapes.
 
 #### Function details
 
@@ -693,11 +731,11 @@ fn new(
     ) -> TaskResponse
 ```
 
-**Purpose**: Constructs a full task response object with required task identity, archive state, and pull-request list, leaving optional metadata absent.
+**Purpose**: Creates a new `TaskResponse` with the required task information filled in and all optional information left empty. This gives callers a safe starting point when they only know the minimum fields needed for an API response.
 
-**Data flow**: Takes owned `String` values for `id` and `title`, a required `bool` for `archived`, and a `Vec<ExternalPullRequestResponse>` for `external_pull_requests`. It writes those directly into the struct, initializes `created_at`, `has_generated_title`, `current_turn_id`, `has_unread_turn`, and `denormalized_metadata` to `None`, and returns the new `TaskResponse`.
+**Data flow**: It receives a task id, a title, an archived flag, and a list of external pull request responses. It places those values into a new `TaskResponse`, sets optional fields like creation time, current turn id, unread status, and metadata to `None`, and returns the completed struct.
 
-**Call relations**: This constructor supports manual instantiation of the generated response model. It is standalone, with later serialization and field access handled by the derived trait implementations and consuming code.
+**Call relations**: This constructor is used when some other part of the backend needs to build a task response before sending or further filling it. It does not hand work off to other functions; it simply packages the given values into the API model in the expected format.
 
 
 ### Configuration delivery payloads
@@ -705,11 +743,13 @@ These generated types describe delivered configuration files and TOML fragment b
 
 ### `codex-backend-openapi-models/src/models/config_bundle_response.rs`
 
-`generated` · `cross-cutting`
+`generated` · `API serialization and deserialization`
 
-This generated file defines `ConfigBundleResponse`, a small serde model used when the backend returns one or both configuration documents as nested objects. Both fields, `config_toml` and `requirements_toml`, use the type `Option<Option<Box<...>>>` with `serde_with::rust::double_option`. That representation preserves the distinction between a field omitted from the response entirely, a field explicitly set to `null`, and a field present with a concrete nested `DeliveredConfigToml` or `DeliveredRequirementsToml` object. Because `skip_serializing_if = "Option::is_none"` is applied to the outer option, absent values are not emitted during serialization.
+This file is a small data container for a “config bundle” response from the codex backend. In everyday terms, it describes the package the server may send back when a client asks for configuration: one possible item is a `config_toml` file, and another is a `requirements_toml` file. TOML is a human-readable configuration file format, often used for settings.
 
-The file contains no custom parsing or validation logic; serde attributes carry the schema semantics. Derived traits provide cloning, debugging, equality comparison, defaults, and serialization support. The constructor simply returns an empty bundle with both optional documents absent, which is the minimal baseline state for this response type. Callers that need to represent explicit nulls or actual delivered TOML fragments must set the nested options themselves after construction.
+The struct is designed for JSON communication. The `serde` annotations tell Rust how to turn this struct into JSON and how to read JSON back into it. A notable detail is that each field uses a double optional value: `Option<Option<...>>`. That lets the code tell three cases apart: the field was not included at all, the field was included but explicitly set to `null`, or the field included a real delivered file object. This distinction matters for APIs because “not mentioned” and “intentionally empty” can mean different things.
+
+Without this file, other generated client or server code would not have a shared Rust type for this response. That would make it easier for the API and the code to drift apart, or force callers to work with loose, error-prone JSON by hand.
 
 #### Function details
 
@@ -719,20 +759,24 @@ The file contains no custom parsing or validation logic; serde attributes carry 
 fn new() -> ConfigBundleResponse
 ```
 
-**Purpose**: Constructs an empty configuration bundle response with neither `config_toml` nor `requirements_toml` present.
+**Purpose**: Creates an empty `ConfigBundleResponse`, with neither configuration file set. This is useful as a clean starting point before filling in whichever files the response should include.
 
-**Data flow**: It takes no arguments, initializes `config_toml` to `None` and `requirements_toml` to `None`, and returns the resulting `ConfigBundleResponse`.
+**Data flow**: No information is passed in. The function builds a new response object where `config_toml` is absent and `requirements_toml` is absent. It returns that newly created object and does not change anything else.
 
-**Call relations**: As the only function in the file, it serves as the default explicit constructor for callers that want to start from an all-absent bundle and populate fields later if needed.
+**Call relations**: Code that needs to construct this API response can call this function first, then add the delivered config or requirements data if needed. It does not hand work off to other functions; it simply creates the default response shape expected by the generated model.
 
 
 ### `codex-backend-openapi-models/src/models/config_file_response.rs`
 
-`generated` · `cross-cutting`
+`generated` · `request and response serialization`
 
-This file defines `ConfigFileResponse`, a straightforward generated serde struct representing one configuration file and its metadata. All four fields are optional strings: `contents`, `sha256`, `updated_at`, and `updated_by_user_id`. Each field is serialized under its corresponding JSON key and omitted entirely when `None`, which lets the backend distinguish between known and unavailable metadata without introducing nested option semantics. Unlike some neighboring generated models, this type does not use `double_option`; there are only two states per field: present with a string or absent.
+This file is a small data container for information about a configuration file. When the backend sends or receives this kind of API response, it needs a shared shape so both sides agree on the field names and meanings. This struct is that shape.
 
-The struct derives `Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize`, making it suitable for transport and comparison but intentionally behavior-light. Its constructor accepts all four optional values directly and stores them unchanged, so callers can build fully populated responses or sparse partial ones in a single step. There is no checksum verification, timestamp parsing, or content normalization in this file; it is purely the schema-level representation of the API response.
+The main type, `ConfigFileResponse`, can hold four optional pieces of information: the file contents, a SHA-256 hash of those contents, the time it was last updated, and the user ID of the person who updated it. A SHA-256 hash is a fixed-length fingerprint of data; it helps check whether the contents changed or stayed the same.
+
+Each field is optional, meaning the response can leave it out. The serialization settings tell Rust how to turn this struct into JSON and back again. For example, the Rust field `updated_at` maps to the JSON name `updated_at`, and missing values are skipped when sending JSON. This matters because APIs often return partial information depending on permissions, state, or endpoint behavior.
+
+The file was generated by OpenAPI Generator, so it should usually not be edited by hand. Think of it like a printed form made from the official API blueprint: other code fills it in, reads from it, or converts it to JSON.
 
 #### Function details
 
@@ -747,20 +791,22 @@ fn new(
     ) -> ConfigFileResponse
 ```
 
-**Purpose**: Creates a `ConfigFileResponse` from caller-supplied optional file contents and metadata fields without applying any transformation.
+**Purpose**: Creates a new `ConfigFileResponse` from the four possible pieces of configuration file information. Code uses it when it wants to build this API response in one clear step.
 
-**Data flow**: It takes four arguments — `contents`, `sha256`, `updated_at`, and `updated_by_user_id`, each `Option<String>` — assigns them directly to the identically named struct fields, and returns the constructed `ConfigFileResponse`.
+**Data flow**: It receives optional values for the file contents, the SHA-256 fingerprint, the update time, and the updater's user ID. It places those values into a new `ConfigFileResponse` object without changing them. The result is a ready-to-use response value that can later be serialized into JSON or inspected by Rust code.
 
-**Call relations**: This constructor is the file’s only behavior and acts as a thin convenience wrapper over direct struct initialization for generated API model usage.
+**Call relations**: This constructor belongs to the generated model itself. Other parts of the backend or API client can call it when they need to create a response object, and the resulting value can then be handed to serialization code from `serde` to become JSON for the API boundary.
 
 
 ### `codex-backend-openapi-models/src/models/delivered_toml_fragment.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `request handling`
 
-This file declares `DeliveredTomlFragment`, a simple generated schema object with three required string fields: `id`, `name`, and `contents`. The serde annotations pin the serialized field names to the API contract, and the derive list (`Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, `Deserialize`) makes the type usable as a plain transport struct in both client and server code. Unlike richer domain types, this model does not interpret or validate the TOML text in `contents`; it preserves exactly what the API sends or expects.
+This is a generated model file from the OpenAPI description, which is the project’s machine-readable contract for its web API. In plain terms, it describes one kind of message the system can send or receive: a `DeliveredTomlFragment`. TOML is a human-readable configuration file format, and a “fragment” here means a piece of TOML content rather than a whole application by itself.
 
-The constructor requires all three fields up front, reflecting that none of them are optional in the schema. That design forces callers to provide a complete fragment object rather than constructing a partially initialized value. Because the file contains no parsing, formatting, or mutation helpers, its role is to carry fragment metadata and body text intact between layers. In practice, instances of this type are embedded in higher-level payloads such as delivered requirements collections, where the distinction between fragment identity (`id`), human-readable label (`name`), and actual TOML source (`contents`) matters for downstream display or assembly.
+The struct has three fields: `id`, which identifies the fragment; `name`, which gives it a human-friendly label; and `contents`, which holds the TOML text itself. The `serde` annotations tell Rust how to turn this struct into formats like JSON and back again. `serde` is a serialization library, meaning it helps convert in-memory Rust data into data that can travel over an API, and then reconstruct it later.
+
+Without this file, code using the generated API models would not have a shared, type-checked container for this response or request data. It is like having a standard delivery label on a package: every part of the system knows where to find the package ID, the name, and the contents.
 
 #### Function details
 
@@ -770,20 +816,24 @@ The constructor requires all three fields up front, reflecting that none of them
 fn new(id: String, name: String, contents: String) -> DeliveredTomlFragment
 ```
 
-**Purpose**: Builds a fully populated TOML fragment model from its required fields. It is the straightforward constructor for this generated schema type.
+**Purpose**: This creates a new `DeliveredTomlFragment` from an ID, a name, and the TOML text contents. It is a convenience constructor so callers can build the model in one clear step.
 
-**Data flow**: It consumes three `String` arguments—`id`, `name`, and `contents`—and moves them directly into a new `DeliveredTomlFragment`. It returns that struct without modifying any external state or performing validation.
+**Data flow**: The caller provides three strings: the fragment ID, the fragment name, and the fragment contents. The function places those strings into the matching fields of a new `DeliveredTomlFragment` value. It returns that completed value and does not change anything else.
 
-**Call relations**: This constructor is a leaf utility for callers assembling API payloads that include TOML fragments. It does not branch or delegate; it simply packages the provided values into the generated model.
+**Call relations**: This constructor is used when some other part of the code needs to produce this API model before sending it onward or storing it in memory. It does not call other project functions; it simply packages the provided pieces of data into the agreed API shape.
 
 
 ### `codex-backend-openapi-models/src/models/delivered_config_toml.rs`
 
-`generated` · `cross-cutting`
+`data_model` · `request handling`
 
-This file defines `DeliveredConfigToml`, a generated serde model used inside larger configuration bundle responses. Its single field, `enterprise_managed`, is typed as `Option<Option<Vec<models::DeliveredTomlFragment>>>` and annotated with `serde_with::rust::double_option`. That means the model can preserve three wire-level states for the `enterprise_managed` key: omitted entirely, explicitly present as `null`, or present with a concrete vector of `DeliveredTomlFragment` entries. The outer option is skipped during serialization when `None`, matching the OpenAPI schema’s optional-field semantics.
+This file is a small data model: it describes one kind of API object called `DeliveredConfigToml`. In plain terms, this object represents configuration text, in TOML form, that may be delivered to a client or another part of the system. TOML is a human-readable configuration format often used for settings files.
 
-The struct derives the standard generated traits and contains no parsing or merge logic for TOML fragments; it is only the transport representation. The constructor returns an instance with `enterprise_managed` absent, which is the minimal empty state. Any actual fragment list or explicit null must be assigned by callers after construction. Because this file is a leaf generated model, all meaningful behavior around interpreting or combining delivered TOML content lives elsewhere in the system.
+The struct currently has one field, `enterprise_managed`. That field can contain a list of delivered TOML fragments, meaning separate pieces of configuration. It is wrapped in two layers of `Option`, which lets the API distinguish between “this field was not provided at all” and “this field was provided but explicitly set to null.” That distinction matters in APIs because absence and intentional emptiness can mean different things.
+
+The `serde` settings tell Rust how to turn this struct into JSON and back again. Serde is the common Rust library for serialization, which means converting in-memory data into formats that can be sent over a network or stored, and deserialization, which is the reverse. The field is named `enterprise_managed` in the external API, and it is skipped when serializing if the outer option is missing.
+
+Without this file, code using the generated API models would not have a shared, type-checked way to represent this delivered configuration object.
 
 #### Function details
 
@@ -793,20 +843,20 @@ The struct derives the standard generated traits and contains no parsing or merg
 fn new() -> DeliveredConfigToml
 ```
 
-**Purpose**: Constructs an empty `DeliveredConfigToml` with no `enterprise_managed` fragments present.
+**Purpose**: Creates a blank `DeliveredConfigToml` value. Someone would use this when they need to start with an empty delivered configuration object and fill in fields later if needed.
 
-**Data flow**: It takes no arguments, sets `enterprise_managed` to `None`, and returns the resulting `DeliveredConfigToml` value.
+**Data flow**: No input is required. The function builds a new `DeliveredConfigToml` where `enterprise_managed` is set to `None`, meaning the field is not present yet. It returns that new struct and does not change anything else.
 
-**Call relations**: This is the file’s only function and serves as the default constructor for the generated model before callers optionally attach fragment data.
+**Call relations**: This constructor is the simple starting point for code that wants to create this API model by hand. After it returns the empty object, other code can set `enterprise_managed` before the value is serialized and sent, or leave it absent so it is omitted from the outgoing data.
 
 
 ### `codex-backend-openapi-models/src/models/delivered_requirements_toml.rs`
 
-`data_model` · `request/response serialization`
+`data_model` · `request handling and API serialization/deserialization`
 
-This file contains a single generated data model, `DeliveredRequirementsToml`, representing a response or nested payload that may include enterprise-managed TOML fragments. Its only field, `enterprise_managed`, is typed as `Option<Option<Vec<models::DeliveredTomlFragment>>>`, which is a deliberate three-state encoding used by the OpenAPI generator together with `serde_with::rust::double_option`: `None` means the field was absent, `Some(None)` means the field was explicitly present as `null`, and `Some(Some(vec))` means a concrete list of `DeliveredTomlFragment` values was supplied. The serde attributes also rename the field to `enterprise_managed` in serialized form and omit it entirely when the outer option is `None`.
+This file is a data model: it describes what information can appear in one part of the backend API, rather than doing calculations itself. The object represents delivered requirements related to TOML, which is a common plain-text configuration file format. Its one field, `enterprise_managed`, can be absent entirely, present with no value, or present with a list of `DeliveredTomlFragment` items. That extra distinction matters in APIs: “not mentioned” can mean something different from “explicitly set to empty or null,” much like leaving a form field blank versus checking a box that says “none.”
 
-The struct derives `Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize`, making it suitable as a passive transport object across API boundaries. The constructor does not populate any fragments; it creates the schema in its minimal absent-field state by setting `enterprise_managed` to `None`. There is no validation, normalization, or TOML parsing here—the file’s responsibility is strictly to preserve the wire-level shape and nullability semantics of the API contract.
+The file also teaches Rust’s serialization tools how to turn this object into JSON and back again. The `serde` settings say the API field name should be `enterprise_managed`, that missing data should be accepted, and that the field should be skipped when it is not set. Because this was generated from an OpenAPI contract, it helps keep the code in sync with the published API. Without this file, code using this API object would have to pass around loose, error-prone JSON instead of a typed structure.
 
 #### Function details
 
@@ -816,11 +866,11 @@ The struct derives `Clone`, `Default`, `Debug`, `PartialEq`, `Serialize`, and `D
 fn new() -> DeliveredRequirementsToml
 ```
 
-**Purpose**: Constructs an empty `DeliveredRequirementsToml` with no `enterprise_managed` field present. It provides the generated model’s minimal default wire representation.
+**Purpose**: Creates a fresh `DeliveredRequirementsToml` value with no `enterprise_managed` data set yet. Someone would use this when they want to build the API object step by step in Rust.
 
-**Data flow**: It takes no arguments and reads no external state. It allocates and returns a `DeliveredRequirementsToml` whose `enterprise_managed` field is initialized to `None`, meaning the field is absent rather than null or an empty list.
+**Data flow**: Nothing is passed in. The function makes a new struct and sets `enterprise_managed` to `None`, meaning the field is absent for now. It returns that new empty model to the caller, which may later fill in the field or serialize it as part of an API response or request.
 
-**Call relations**: This is a leaf constructor on a generated model. It is used when callers need to instantiate the payload before optionally filling in `enterprise_managed`; it delegates to no other helper.
+**Call relations**: This is the simple constructor for the model. Other code can call it whenever it needs a blank `DeliveredRequirementsToml` value; after that, Rust’s serialization and deserialization support can turn the value into API data or read API data back into the same shape.
 
 
 ### Thread-config protobuf bindings
@@ -828,11 +878,13 @@ This generated protobuf module provides the wire messages and gRPC service defin
 
 ### `config/src/thread_config/proto/codex.thread_config.v1.rs`
 
-`generated` · `request handling`
+`generated` · `config load and gRPC request handling`
 
-This generated file is the transport contract for fetching thread configuration over gRPC. Its message types mirror the domain concepts used elsewhere in config loading: `LoadThreadConfigRequest` carries optional `thread_id` and `cwd`; `LoadThreadConfigResponse` returns an ordered `Vec<ThreadConfigSource>`; `ThreadConfigSource` is a `oneof` wrapper around either `SessionThreadConfig` or `UserThreadConfig`. `SessionThreadConfig` contains an optional default `model_provider`, a repeated list of `ModelProvider` records, and a `HashMap<String, bool>` of feature flags. `ModelProvider` is the densest payload, carrying endpoint/auth/header/retry/websocket settings plus a numeric `wire_api` enum field. `StringMap` wraps string-to-string maps for query params and headers, and `ModelProviderAuthInfo` describes an external auth command invocation.
+This file is machine-generated from a Protocol Buffers definition. Protocol Buffers are a compact way to describe data so different parts of a system can exchange it safely. Here, the data is about loading configuration for a “thread”: which model provider to use, what features are on, authentication commands, headers, timeouts, and similar settings.
 
-The tonic client wrapper stores `tonic::client::Grpc<T>` and exposes builder-style configuration for origin, interceptor, compression, and message-size limits before issuing the unary `Load` RPC. The server wrapper stores the implementation behind `Arc<T>`, tracks accepted/sent compression encodings and optional message-size caps, and dispatches incoming HTTP requests by exact gRPC path. Unknown paths return a gRPC `Unimplemented` response. Because this file is generated, its logic is mostly glue: enum/string conversion, request metadata insertion, readiness checks, and tonic codec setup rather than domain validation.
+Think of this file as both the form and the post office instructions. The message structs describe the form: a request can include a thread id and current working directory; a response contains one or more configuration sources; a source can be session-specific or user-level. The generated client knows how to send the form over gRPC, which is a remote procedure call system that lets code call a function across a network or process boundary. The generated server knows how to receive that call and pass it to real application code that implements the actual loading behavior.
+
+The important point is that this file does not decide what the configuration should be. It only defines how configuration data is packaged, sent, received, and decoded. Without it, the configuration loader client and server could easily disagree about field names, types, paths, or service names, and calls to load thread configuration would fail or return unreadable data.
 
 #### Function details
 
@@ -842,11 +894,11 @@ The tonic client wrapper stores `tonic::client::Grpc<T>` and exposes builder-sty
 fn as_str_name(&self) -> &'static str
 ```
 
-**Purpose**: Returns the protobuf field-name spelling for a `WireApi` enum variant. The strings are the stable wire-schema identifiers, not Rust-friendly names.
+**Purpose**: Returns the stable Protocol Buffers name for a wire API value. This is useful when code needs the exact text name used in the schema, for logging, storage, or matching with protocol-level data.
 
-**Data flow**: Reads `self` and matches it against `WireApi::Unspecified` and `WireApi::Responses` → selects the corresponding static string literal → returns `&'static str` without mutating any state.
+**Data flow**: It starts with a `WireApi` enum value, such as `Unspecified` or `Responses`. It matches that value to the official schema name and returns that name as text. It does not change any stored data.
 
-**Call relations**: Used by callers that need protobuf enum names rather than numeric values, typically for serialization-adjacent or diagnostic code generated around the schema; it is a leaf helper in this file.
+**Call relations**: This helper belongs to the generated enum support code. Other code can call it whenever it needs to turn the numeric Rust enum value into the schema’s string label.
 
 
 ##### `WireApi::from_str_name`  (lines 116–122)
@@ -855,11 +907,11 @@ fn as_str_name(&self) -> &'static str
 fn from_str_name(value: &str) -> ::core::option::Option<Self>
 ```
 
-**Purpose**: Parses a protobuf enum field-name string back into a `WireApi` variant. It only accepts the exact schema names emitted by the proto definition.
+**Purpose**: Turns an official Protocol Buffers enum name back into a `WireApi` value. It lets code safely interpret text that uses the schema’s enum names.
 
-**Data flow**: Consumes `value: &str` → matches exact literals `WIRE_API_UNSPECIFIED` and `WIRE_API_RESPONSES` → returns `Some(WireApi)` for known names or `None` for anything else.
+**Data flow**: It receives a string. If the string is one of the known wire API names, it returns the matching enum value wrapped in `Some`; if the text is unknown, it returns `None`. Nothing else is changed.
 
-**Call relations**: Acts as the inverse of `WireApi::as_str_name` for code paths that receive textual enum names; it does not delegate further.
+**Call relations**: This is the reverse of `WireApi::as_str_name`. Code that reads protocol-style names can call it before storing or comparing the value as a Rust enum.
 
 
 ##### `thread_config_loader_client::ThreadConfigLoaderClient::connect`  (lines 141–148)
@@ -868,11 +920,11 @@ fn from_str_name(value: &str) -> ::core::option::Option<Self>
 async fn connect(dst: D) -> Result<Self, tonic::transport::Error>
 ```
 
-**Purpose**: Builds a transport-backed gRPC client by opening a `tonic::transport::Channel` to the supplied endpoint. It is the convenience constructor used when the caller has a URI-like destination rather than an already-built service.
+**Purpose**: Creates a ready-to-use client by opening a connection to a gRPC endpoint. A caller uses this when it has an address for the configuration loader service and wants to call it remotely.
 
-**Data flow**: Takes `dst` convertible into `tonic::transport::Endpoint` → constructs an endpoint, asynchronously connects it to obtain a `Channel` → wraps that channel with `Self::new` → returns `Result<ThreadConfigLoaderClient<Channel>, tonic::transport::Error>`.
+**Data flow**: It receives a destination, such as a service URL or endpoint-like value. It turns that into a tonic endpoint, connects asynchronously, then wraps the connection in a `ThreadConfigLoaderClient`. The result is either a connected client or a transport error if the connection cannot be made.
 
-**Call relations**: Invoked by higher-level remote loaders before issuing RPCs. Internally it delegates endpoint creation/connection to tonic transport and then funnels the result through the client `new` constructor.
+**Call relations**: This is the convenient starting point for client-side code. After connecting, it hands the live connection to `ThreadConfigLoaderClient::new`, which builds the actual client wrapper used for later `load` calls.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -883,11 +935,11 @@ async fn connect(dst: D) -> Result<Self, tonic::transport::Error>
 fn new(inner: T) -> Self
 ```
 
-**Purpose**: Wraps an arbitrary tonic-compatible transport/service in the generated client type. This is the base constructor for callers that already manage the underlying service.
+**Purpose**: Wraps an existing gRPC transport in a thread configuration loader client. This is used when the caller already has a channel or service object and just needs the generated client interface around it.
 
-**Data flow**: Accepts `inner: T` → converts it into `tonic::client::Grpc<T>` → stores it in `Self { inner }` → returns the initialized client.
+**Data flow**: It receives an inner transport object. It wraps that object in tonic’s gRPC client machinery and returns a `ThreadConfigLoaderClient` containing it. The original transport becomes owned by the new client.
 
-**Call relations**: Used by `connect` after opening a channel and by interceptor/origin constructors to normalize all client creation through the same wrapper.
+**Call relations**: This is used by `connect` after a network connection is opened, and also by generated setup helpers such as `with_interceptor`. It is the basic constructor for the client side of this service.
 
 *Call graph*: 1 external calls (new).
 
@@ -898,11 +950,11 @@ fn new(inner: T) -> Self
 fn with_origin(inner: T, origin: Uri) -> Self
 ```
 
-**Purpose**: Constructs a client that sends requests with an explicit origin URI. This is useful when the transport target and logical origin need to differ.
+**Purpose**: Creates a client that sends requests with a specific origin URI. This is useful in advanced routing setups where the transport connection and the logical service origin need to be distinguished.
 
-**Data flow**: Takes `inner: T` and `origin: Uri` → builds `tonic::client::Grpc::with_origin(inner, origin)` → returns `Self` containing that configured gRPC client.
+**Data flow**: It receives an inner transport and an origin URI. It builds tonic’s gRPC client wrapper using that origin and returns a `ThreadConfigLoaderClient`. The returned client will use that origin when making service calls.
 
-**Call relations**: Alternative constructor alongside `new`; it delegates origin handling to tonic and is chosen by callers that need custom authority/origin behavior.
+**Call relations**: This is another client construction path. It delegates the origin-aware wrapping to tonic’s generated support code, then returns the same kind of client used by `load`.
 
 *Call graph*: 1 external calls (with_origin).
 
@@ -916,11 +968,11 @@ fn with_interceptor(
         ) -> ThreadConfigLoaderClient<InterceptedService<T, F>>
 ```
 
-**Purpose**: Builds a client whose requests pass through a tonic interceptor. This enables cross-cutting request mutation such as auth metadata injection.
+**Purpose**: Creates a client that runs an interceptor around each request. An interceptor is a small hook that can inspect or modify outgoing calls, often to add authentication or tracing information.
 
-**Data flow**: Consumes `inner: T` and an interceptor `F` → wraps them in `InterceptedService::new(inner, interceptor)` → passes that wrapped service into `ThreadConfigLoaderClient::new` → returns a client specialized on `InterceptedService<T, F>`.
+**Data flow**: It receives a transport and an interceptor function or object. It combines them into an intercepted service, then wraps that service in a new `ThreadConfigLoaderClient`. The output is a client whose future requests pass through the interceptor first.
 
-**Call relations**: Chosen by callers that need per-request interception. It composes tonic’s interceptor wrapper with the standard client constructor rather than implementing request mutation itself.
+**Call relations**: This sits in the client setup path before any actual load request is sent. It uses the same underlying `new` construction pattern, but inserts the extra request hook in front of the transport.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -931,11 +983,11 @@ fn with_interceptor(
 fn send_compressed(mut self, encoding: CompressionEncoding) -> Self
 ```
 
-**Purpose**: Enables outbound request compression on the client. The setting is stored in the inner tonic client and returned in builder style.
+**Purpose**: Configures the client to compress outgoing requests using a chosen compression format. Compression can reduce network size, but the server must support the same format.
 
-**Data flow**: Takes ownership of `self` plus a `CompressionEncoding` → mutates `self.inner` via tonic’s `send_compressed` → returns the updated client.
+**Data flow**: It receives the client and a compression encoding. It updates the inner gRPC client so future requests are sent compressed, then returns the updated client for chaining. It does not send a request by itself.
 
-**Call relations**: Typically chained during client setup before `load`; it delegates compression configuration entirely to tonic.
+**Call relations**: This is a client configuration step used before calling `load`. It hands the compression choice to tonic’s client machinery, which applies it when a request is later sent.
 
 *Call graph*: 1 external calls (send_compressed).
 
@@ -946,11 +998,11 @@ fn send_compressed(mut self, encoding: CompressionEncoding) -> Self
 fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self
 ```
 
-**Purpose**: Configures the client to accept compressed responses from the server. This affects response decoding behavior for subsequent RPCs.
+**Purpose**: Configures the client to accept compressed responses from the server. This tells the client which compressed response format it knows how to decode.
 
-**Data flow**: Consumes `self` and an encoding → updates `self.inner` with tonic’s `accept_compressed` setting → returns the modified client.
+**Data flow**: It receives the client and a compression encoding. It updates the inner gRPC client so later responses using that encoding can be decompressed, then returns the updated client. No network call happens here.
 
-**Call relations**: Another builder-stage configuration method used before issuing RPCs; it simply forwards to tonic’s transport machinery.
+**Call relations**: This is usually called during client setup. When `load` later receives a response, tonic uses this setting to decode compressed response bodies if needed.
 
 *Call graph*: 1 external calls (accept_compressed).
 
@@ -961,11 +1013,11 @@ fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self
 fn max_decoding_message_size(mut self, limit: usize) -> Self
 ```
 
-**Purpose**: Sets an upper bound on decoded response size for this client. It overrides tonic’s default 4 MB decode limit.
+**Purpose**: Sets the largest response message the client is willing to decode. This protects the client from unexpectedly huge messages.
 
-**Data flow**: Consumes `self` and `limit: usize` → applies `max_decoding_message_size` to `self.inner` → returns the updated client.
+**Data flow**: It receives the client and a byte-size limit. It stores that limit in the inner gRPC client and returns the updated client. Future responses larger than the limit may be rejected by tonic.
 
-**Call relations**: Used during client construction when larger responses are expected; it delegates enforcement to tonic.
+**Call relations**: This is part of client setup before request sending. The limit is enforced later by tonic when `load` receives and decodes a response.
 
 *Call graph*: 1 external calls (max_decoding_message_size).
 
@@ -976,11 +1028,11 @@ fn max_decoding_message_size(mut self, limit: usize) -> Self
 fn max_encoding_message_size(mut self, limit: usize) -> Self
 ```
 
-**Purpose**: Sets an upper bound on encoded request size for this client. This constrains how large outbound protobuf payloads may be.
+**Purpose**: Sets the largest request message the client is willing to encode and send. This helps prevent accidental oversized outbound requests.
 
-**Data flow**: Consumes `self` and `limit: usize` → applies `max_encoding_message_size` to `self.inner` → returns the updated client.
+**Data flow**: It receives the client and a byte-size limit. It records that limit inside the inner gRPC client and returns the updated client. Future outgoing requests are checked against this setting.
 
-**Call relations**: Builder-stage companion to the decode limit setter; it is not involved in request semantics beyond transport sizing.
+**Call relations**: This prepares the client before calling `load`. Tonic uses the stored limit when it serializes the request into bytes for the gRPC call.
 
 *Call graph*: 1 external calls (max_encoding_message_size).
 
@@ -994,11 +1046,11 @@ async fn load(
         ) -> std::result::Result<tonic::Response<super::LoadThreadConfigResponse>, t
 ```
 
-**Purpose**: Issues the unary `Load` RPC against the remote `ThreadConfigLoader` service. It prepares tonic metadata, verifies readiness, and dispatches the protobuf request to the fixed service path.
+**Purpose**: Sends a `LoadThreadConfigRequest` to the thread configuration loader service and waits for a `LoadThreadConfigResponse`. This is the generated client method for the service’s main operation.
 
-**Data flow**: Accepts any `request` convertible into `tonic::Request<LoadThreadConfigRequest>` → awaits `self.inner.ready()` and maps readiness failures into `tonic::Status::unknown` → creates a default `tonic_prost::ProstCodec`, fixed `PathAndQuery` for `/codex.thread_config.v1.ThreadConfigLoader/Load`, and inserts `GrpcMethod` metadata into request extensions → performs `self.inner.unary(req, path, codec).await` → returns `Result<Response<LoadThreadConfigResponse>, tonic::Status>`.
+**Data flow**: It receives a request-like value containing fields such as thread id and current working directory. It first waits until the inner gRPC service is ready, converts the input into a proper gRPC request, attaches method metadata, and sends a unary call, meaning one request produces one response. It returns either the response from the server or a gRPC status error.
 
-**Call relations**: This is the client’s main RPC entrypoint, called by higher-level remote config loaders after constructing a request. It delegates transport readiness and unary invocation to tonic.
+**Call relations**: This is the client-side endpoint that application code calls when it wants thread configuration. It uses tonic’s readiness check, Protocol Buffers codec, fixed service path, and unary-call machinery to hand the request over to the remote server method named `Load`.
 
 *Call graph*: 6 external calls (ready, unary, new, into_request, from_static, default).
 
@@ -1009,11 +1061,11 @@ async fn load(
 fn new(inner: T) -> Self
 ```
 
-**Purpose**: Constructs a server wrapper around a concrete `ThreadConfigLoader` implementation. It stores the implementation behind an `Arc` and initializes default transport settings.
+**Purpose**: Builds a server wrapper around application code that implements the thread configuration loading behavior. The wrapper is what tonic can register as a gRPC service.
 
-**Data flow**: Takes `inner: T` → wraps it in `Arc::new(inner)` → forwards to `Self::from_arc` → returns the configured server wrapper.
+**Data flow**: It receives an implementation object for the `ThreadConfigLoader` trait. It places that object in shared ownership storage and builds a `ThreadConfigLoaderServer` around it. The result is a service object ready for further configuration or registration.
 
-**Call relations**: Used by server bootstrap code when registering the service with tonic’s `Server::builder`; it centralizes setup through `from_arc`.
+**Call relations**: This is the common server setup entry point. It immediately delegates to `from_arc`, which does the actual field setup using a shared pointer so requests can safely refer to the same implementation.
 
 *Call graph*: 2 external calls (new, from_arc).
 
@@ -1024,11 +1076,11 @@ fn new(inner: T) -> Self
 fn from_arc(inner: Arc<T>) -> Self
 ```
 
-**Purpose**: Constructs the server wrapper from an already-shared `Arc<T>`. This avoids an extra allocation when the implementation is already reference-counted.
+**Purpose**: Builds a server wrapper around an already shared implementation object. This is useful when the application already keeps the loader in an `Arc`, which is Rust’s thread-safe shared pointer.
 
-**Data flow**: Accepts `inner: Arc<T>` → builds `Self` with that `inner`, default compression-encoding sets, and `None` message-size limits → returns the server.
+**Data flow**: It receives a shared pointer to the real loader implementation. It stores that pointer and initializes compression and message-size settings to their defaults. It returns a configured server wrapper with no custom limits or compression enabled yet.
 
-**Call relations**: Called by `new` and available to callers that already manage shared ownership of the service implementation.
+**Call relations**: This is called by `new`, and can also be used directly by server setup code. Later, `call` uses the stored shared implementation to dispatch incoming gRPC requests to the real `load` method.
 
 *Call graph*: 1 external calls (default).
 
@@ -1039,11 +1091,11 @@ fn from_arc(inner: Arc<T>) -> Self
 fn with_interceptor(inner: T, interceptor: F) -> InterceptedService<Self, F>
 ```
 
-**Purpose**: Wraps the generated server in a tonic interceptor service. This allows request inspection or metadata enforcement before dispatch reaches the trait implementation.
+**Purpose**: Creates a server service that runs an interceptor around incoming requests. This hook can check or decorate requests before they reach the actual loader, for example for authentication or logging.
 
-**Data flow**: Consumes `inner: T` and interceptor `F` → constructs `Self::new(inner)` → wraps it with `InterceptedService::new` → returns the intercepted service.
+**Data flow**: It receives the loader implementation and an interceptor. It first builds a normal server wrapper, then combines it with the interceptor and returns the intercepted service. Incoming requests will pass through that interceptor before normal service handling.
 
-**Call relations**: Alternative to plain `new` during server registration when cross-cutting interception is required.
+**Call relations**: This is used during server setup instead of plain `new` when request filtering or metadata handling is needed. It wraps the generated server before tonic starts routing calls to `call`.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -1054,11 +1106,11 @@ fn with_interceptor(inner: T, interceptor: F) -> InterceptedService<Self, F>
 fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self
 ```
 
-**Purpose**: Enables decompression of incoming compressed requests on the server. The chosen encoding is recorded in the server’s accepted-encodings set.
+**Purpose**: Configures the server to accept compressed requests in a chosen format. This lets clients reduce request size when both sides support the same compression.
 
-**Data flow**: Consumes `self` and `encoding` → mutates `self.accept_compression_encodings` by enabling that encoding → returns the updated server wrapper.
+**Data flow**: It receives the server wrapper and a compression encoding. It marks that encoding as allowed for incoming requests, then returns the updated server. No request is processed at this point.
 
-**Call relations**: Used during server setup before registration; it affects how `call` later configures tonic’s per-request gRPC handler.
+**Call relations**: This is a server setup step. When `call` later receives a matching request, the generated gRPC machinery uses this setting while decoding the request body.
 
 *Call graph*: 1 external calls (enable).
 
@@ -1069,11 +1121,11 @@ fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self
 fn send_compressed(mut self, encoding: CompressionEncoding) -> Self
 ```
 
-**Purpose**: Enables compression of outgoing responses when the client supports the selected encoding. The setting is stored for later use during request dispatch.
+**Purpose**: Configures the server to compress responses using a chosen format when the client supports it. This can make responses smaller over the wire.
 
-**Data flow**: Consumes `self` and `encoding` → enables that encoding in `self.send_compression_encodings` → returns the modified server.
+**Data flow**: It receives the server wrapper and a compression encoding. It marks that encoding as available for outgoing responses and returns the updated server. The effect is applied later during request handling.
 
-**Call relations**: Builder-stage transport configuration consumed later by `call` when constructing the tonic `Grpc` handler.
+**Call relations**: This is called during server setup. The `call` function later copies this setting into tonic’s per-request gRPC handler so responses can be compressed when appropriate.
 
 *Call graph*: 1 external calls (enable).
 
@@ -1084,11 +1136,11 @@ fn send_compressed(mut self, encoding: CompressionEncoding) -> Self
 fn max_decoding_message_size(mut self, limit: usize) -> Self
 ```
 
-**Purpose**: Sets the maximum inbound message size the server will decode. This overrides tonic’s default decode limit for requests.
+**Purpose**: Sets the largest incoming request message the server will decode. This protects the service from unexpectedly large or abusive requests.
 
-**Data flow**: Consumes `self` and `limit: usize` → stores `Some(limit)` in `self.max_decoding_message_size` → returns the updated server.
+**Data flow**: It receives the server wrapper and a byte-size limit. It stores that limit in the server configuration and returns the updated server. Future incoming requests are checked against this size during decoding.
 
-**Call relations**: Configured before serving; the stored limit is later applied inside `call` when dispatching a matching RPC.
+**Call relations**: This is configured before the service starts receiving calls. When `call` builds the gRPC handler for a request, it passes this limit into tonic’s message-size configuration.
 
 
 ##### `thread_config_loader_server::ThreadConfigLoaderServer::max_encoding_message_size`  (lines 304–307)
@@ -1097,11 +1149,11 @@ fn max_decoding_message_size(mut self, limit: usize) -> Self
 fn max_encoding_message_size(mut self, limit: usize) -> Self
 ```
 
-**Purpose**: Sets the maximum outbound message size the server will encode. This constrains response payload size at the transport layer.
+**Purpose**: Sets the largest response message the server will encode and send. This helps avoid sending unexpectedly huge responses.
 
-**Data flow**: Consumes `self` and `limit: usize` → stores `Some(limit)` in `self.max_encoding_message_size` → returns the updated server.
+**Data flow**: It receives the server wrapper and a byte-size limit. It stores that limit in the server configuration and returns the updated server. Later responses larger than the limit may be rejected by tonic.
 
-**Call relations**: Another setup-time knob whose value is consumed by `call` when constructing the tonic gRPC responder.
+**Call relations**: This is a server setup option. During `call`, the stored limit is applied to the gRPC handler that serializes the response.
 
 
 ##### `thread_config_loader_server::ThreadConfigLoaderServer::poll_ready`  (lines 318–323)
@@ -1113,11 +1165,11 @@ fn poll_ready(
         ) -> Poll<std::result::Result<(), Self::Error>>
 ```
 
-**Purpose**: Reports the generated service as always ready to accept requests. The wrapper itself has no internal backpressure state.
+**Purpose**: Reports whether the generated server is ready to receive a request. In this generated implementation, it always says it is ready.
 
-**Data flow**: Ignores the task context argument → immediately returns `Poll::Ready(Ok(()))`.
+**Data flow**: It receives a mutable reference to the server and a task context, but does not need to inspect either in this implementation. It immediately returns a ready success value. It changes no server state.
 
-**Call relations**: Called by the surrounding hyper/tonic service machinery before dispatching requests; it does not delegate to the inner implementation.
+**Call relations**: The HTTP/gRPC runtime calls this before sending a request into `call`. Because this server wrapper has no internal back-pressure here, it simply tells the runtime to continue.
 
 *Call graph*: 1 external calls (Ready).
 
@@ -1128,11 +1180,11 @@ fn poll_ready(
 fn call(&mut self, req: http::Request<B>) -> Self::Future
 ```
 
-**Purpose**: Routes incoming HTTP requests to the generated gRPC method handler or returns an `Unimplemented` gRPC response for unknown paths. For the `Load` path it builds a unary service adapter around the user-implemented trait method and applies compression and message-size settings.
+**Purpose**: Routes an incoming HTTP/gRPC request to the correct generated service method. For this service, it recognizes the `Load` path and forwards the decoded request to the real loader implementation.
 
-**Data flow**: Takes `req: http::Request<B>` → inspects `req.uri().path()` → if the path matches `/codex.thread_config.v1.ThreadConfigLoader/Load`, clones the inner `Arc<T>` and current compression/size settings, constructs a local `LoadSvc` implementing `tonic::server::UnaryService<LoadThreadConfigRequest>`, creates a default `ProstCodec`, builds `tonic::server::Grpc`, applies compression and max-message-size config, and awaits `grpc.unary(method, req)` inside a boxed future returning `Ok(http::Response<tonic::body::Body>)`; otherwise constructs a default empty body response with gRPC status `Unimplemented` and content type headers and returns it in a boxed future.
+**Data flow**: It receives an HTTP request. It checks the request path: if it is the thread configuration `Load` path, it builds a small adapter service, applies compression and message-size settings, decodes the request with the Protocol Buffers codec, calls the implementation’s `load` method, and returns the gRPC response. If the path is unknown, it returns a gRPC “unimplemented” response.
 
-**Call relations**: This is the central server dispatch point invoked by tonic/hyper for every inbound request. On the happy path it delegates actual business handling to the implementor’s `ThreadConfigLoader::load`; on unmatched paths it short-circuits locally.
+**Call relations**: This is the main server-side request dispatch point. The runtime calls it after `poll_ready`; for valid `Load` calls it hands work to the application’s implementation of the `ThreadConfigLoader` trait, while tonic handles the byte-level encoding and response wrapping.
 
 *Call graph*: 6 external calls (pin, uri, new, default, new, default).
 
@@ -1143,11 +1195,11 @@ fn call(&mut self, req: http::Request<B>) -> Self::Future
 fn clone(&self) -> Self
 ```
 
-**Purpose**: Duplicates the generated server wrapper while preserving shared access to the same inner implementation and transport settings. Cloning is shallow because the implementation is stored in an `Arc`.
+**Purpose**: Creates another server wrapper pointing at the same underlying loader implementation and using the same settings. This lets the gRPC runtime duplicate the service handle safely when needed.
 
-**Data flow**: Reads `self.inner`, compression settings, and message-size options → clones the `Arc` and copies the remaining fields → returns a new `ThreadConfigLoaderServer<T>`.
+**Data flow**: It reads the existing server’s shared implementation pointer and configuration fields. It clones the shared pointer and copies the compression and size settings into a new server wrapper. The original and cloned wrappers both refer to the same real loader.
 
-**Call relations**: Used by tonic service infrastructure when the server wrapper must be duplicated across tasks or connections; it does not alter the underlying implementation.
+**Call relations**: This supports tonic’s service infrastructure, which may clone services as it builds routing or serves requests. The clone preserves the behavior configured by `new`, `from_arc`, and the compression or message-size setup methods.
 
 
 ### Exec relay protobuf bindings
@@ -1155,21 +1207,23 @@ These files expose the generated relay protocol types and the small handwritten 
 
 ### `exec-server/src/proto/codex.exec_server.relay.v1.rs`
 
-`generated` · `relay transport serialization/deserialization`
+`generated` · `network relay serialization`
 
-This file is generated code from `prost-build`, so it mirrors the protobuf schema directly rather than expressing handwritten domain logic. The top-level message is `RelayMessageFrame`, which carries protocol bookkeeping (`version`, `stream_id`, `ack`, `ack_bits`) plus a `oneof` body. That body can be one of six message variants exposed through the nested `relay_message_frame::Body` enum: `Data`, `AckFrame`, `Resume`, `Reset`, `Heartbeat`, or `Handshake`.
+This file is produced automatically from a Protocol Buffers schema. Protocol Buffers are a compact, agreed-upon way for two programs to turn structured messages into bytes and back again. In plain terms, this file is the relay’s shared vocabulary: both sides need to know what a “data packet”, “acknowledgement”, or “heartbeat” looks like so they can understand each other.
 
-The payload messages are intentionally compact. `RelayData` carries a sequence number, segmentation metadata (`segment_index`, `segment_count`), and raw bytes, allowing larger logical payloads to be split across frames. `RelayAck` and `RelayHeartbeat` are empty marker messages. `RelayResume` communicates the next expected sequence number after interruption. `RelayReset` carries a textual reason for tearing down or invalidating a stream. `RelayHandshake` wraps opaque handshake bytes, likely for session establishment or cryptographic negotiation at a higher layer.
+The central message is `RelayMessageFrame`. Think of it like an envelope. The envelope says which protocol version is being used, which stream it belongs to, and what has already been received. It then carries exactly one kind of body: actual data, an acknowledgement-only frame, a resume request, a reset notice, a heartbeat, or a handshake.
 
-Because this is generated, field tags, derives, and naming are schema-driven. Consumers should treat these structs as wire containers: they preserve protobuf compatibility and are typically wrapped by higher-level relay code rather than manipulated as business objects. Any schema evolution should happen in the `.proto` source, not here.
+`RelayData` carries real bytes and includes sequence and segment numbers so larger payloads can be split into pieces and reassembled in order. `RelayResume` tells the other side where to continue after an interruption. `RelayReset` explains why a stream is being closed or restarted. `RelayHeartbeat` is an empty “I am still alive” signal. `RelayHandshake` carries initial setup bytes.
+
+Because this file is generated, people normally should not edit it by hand. Changes should be made in the source `.proto` definition and regenerated, otherwise the Rust code and the protocol definition can drift apart.
 
 
 ### `exec-server/src/relay_proto.rs`
 
-`orchestration` · `relay transport type wiring`
+`data_model` · `cross-cutting`
 
-This module is a narrow adapter over the generated protobuf output in `proto/codex.exec_server.relay.v1.rs`. Using `#[path = ...] mod generated;`, it binds the generated file into the crate without exposing that long generated-module path everywhere else. It then selectively re-exports the relay protocol types with crate visibility: `RelayData`, `RelayHandshake`, `RelayMessageFrame`, `RelayReset`, `RelayResume`, and the nested `relay_message_frame` module that contains the `Body` oneof enum.
+The exec server needs to send and receive structured relay messages, such as handshakes, data packets, resets, and resume requests. Those message shapes are generated from a protocol definition, likely by a tool such as Protocol Buffers, which turns a shared message schema into Rust code. Generated files are often noisy and not meant to be edited by hand, so this file acts like a neat front desk: other code can import the important relay message types from here without caring where the generated code lives.
 
-The omission of some generated types from re-export is itself informative. For example, empty marker messages such as ack/heartbeat may be accessed through the generated module internally elsewhere or may not need direct exposure from this facade. The wrapper keeps the rest of the codebase insulated from generated-file naming and location details, which makes regeneration or path changes less invasive.
+It first points Rust at the generated source file, `proto/codex.exec_server.relay.v1.rs`, and loads it as a private module named `generated`. Then it re-exports only the relay types the rest of this crate is meant to use: `RelayData`, `RelayHandshake`, `RelayMessageFrame`, `RelayReset`, `RelayResume`, and the `relay_message_frame` helper module. The `pub(crate)` visibility means these names are available inside this crate, but not exposed as part of a public library API.
 
-There is no runtime behavior here; the file’s role is namespace control and dependency hygiene. Higher-level relay code can import concise crate-local names from `relay_proto` instead of depending directly on the generated module layout, while the generated code remains clearly isolated as machine-produced wire definitions.
+Without this file, many parts of the exec server would need to know the exact generated file path and module layout. That would make the code more fragile if the generated protocol code ever moves or changes shape.

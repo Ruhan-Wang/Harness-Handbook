@@ -1,8 +1,8 @@
 # Transport, streaming, and provider protocol suites  `stage-23.2.4.1`
 
-This stage sits at the API boundary of execution: it is the end-to-end transport test layer that validates how Codex talks to providers during live request/response and streaming turns. Rather than testing core reasoning logic, it pins down the mechanics that make sessions reliable across HTTP, SSE, WebSocket, and realtime transports.
+This stage tests the network edge of Codex: the place where a user turn becomes a request to a model service, and where streamed answers come back. It is mainly behind-the-scenes support for the main work loop. The large client suite checks the basic machinery: request shape, auth headers, history, reasoning options, token counts, and provider differences. Header-focused tests make sure turn, sub-agent, workspace, and proxy identity labels are carried correctly. Compression, model-list ETag refresh, quota errors, and safety-check downgrade tests protect specific provider rules and user-facing failures.
 
-client.rs and responses_headers.rs verify request construction: auth selection, provider- and Azure-specific shaping, injected instructions and skills, reasoning fields, subagent labels, and rich turn metadata. request_compression.rs and models_etag_responses.rs cover wire-level optimizations and cache-refresh behavior. agent_websocket.rs, client_websockets.rs, and realtime_conversation.rs exercise persistent transports, including prewarm/preconnect, incremental websocket requests, WebRTC flows, telemetry, handoff, and failure handling. compact_remote.rs, responses_lite.rs, and turn_state.rs check specialized protocol variants: remote compaction, lite-mode payload differences, and per-turn state propagation. stream_error_allows_next_turn.rs, stream_no_completed.rs, websocket_fallback.rs, quota_exceeded.rs, and safety_check_downgrade.rs harden recovery paths for incomplete streams, fallback to HTTP, quota failures, and safety reroutes. responses_api_proxy_headers.rs ensures proxy-added identity headers correctly link parent and subagent traffic.
+Several tests cover streaming paths. HTTP streaming recovery tests make sure Codex can retry if a stream ends early and can continue after a failed turn. WebSocket tests check long-lived connections for normal model replies, agent messages, warmups, retries, tracing, service tiers, and fallback to plain HTTP when WebSockets fail. Realtime conversation tests cover live audio/text sessions and handoffs back to the normal agent. Other tests cover remote compaction of long chats, the lighter Responses Lite request path, and temporary turn state that must be used for one turn only.
 
 ## Files in this stage
 
@@ -11,11 +11,13 @@ These tests cover how standard Responses API HTTP requests are constructed, anno
 
 ### `core/tests/suite/client.rs`
 
-`test` · `request construction, streaming, resume replay, and error/event handling during client integration tests`
+`test` · `test run`
 
-This file is a broad request-shaping and client-behavior suite. It defines small helpers for constructing deterministic Responses metadata, extracting message text from request JSON, asserting client metadata fields, writing synthetic `auth.json`, and creating a `ProviderAuthCommandFixture` whose script prints successive bearer tokens from a file. Many tests build a `test_codex` harness, submit a turn, wait for `TurnComplete`, and then inspect the captured request body sent to the mock Responses endpoint.
+Think of this file as a customs checkpoint for every request Codex sends to an AI model service. The tests start fake web servers, configure Codex in different ways, send user messages, and then inspect the exact HTTP request Codex produced. That matters because small mistakes here can break real conversations: the wrong token might be sent, resumed chats might lose history, model settings might be ignored, or rate-limit errors might not reach the user clearly.
 
-Coverage includes omission of per-item metadata for non-OpenAI providers, correct session/thread/install IDs and auth headers, preference of API keys over ChatGPT tokens when config says so, inclusion of AGENTS user instructions, developer instructions, apps guidance, environment context, and skill summaries or aliased skill roots under context-budget pressure. Resume tests verify that rollout history is replayed correctly, including legacy js_repl image-output shapes and modern image tool outputs with `detail: original`. Other tests validate reasoning effort, reasoning summary, responses-lite context settings, verbosity, collaboration-mode overrides, Azure Responses `store` plus preserved item IDs/call IDs, provider auth command refresh after 401, rate-limit snapshots in `TokenCount`, usage-limit and context-window error handling, incomplete-response content-filter errors, provider query/header/env-var overrides, and deduplication of streamed assistant deltas versus final assistant messages across turns. The file mixes high-level `CodexThread` tests with lower-level `ModelClient::stream` tests when direct control over provider configuration or prompt items is needed.
+The file covers several broad areas. It checks authentication, including API keys, ChatGPT tokens, environment-variable keys, and provider commands that print a bearer token. It checks conversation construction, including AGENTS.md instructions, developer messages, environment context, skills, app guidance, and resumed session files. It also checks model options such as reasoning effort, reasoning summaries, verbosity, Responses Lite behavior, and Azure-specific request requirements. Finally, it checks streamed response edge cases: token usage, rate-limit snapshots, context-window errors, incomplete responses, and duplicate streamed/final assistant messages.
+
+Most tests follow the same pattern: set up a mock server, build a test Codex instance, submit a user turn, wait until Codex reports completion or an error, then assert that the captured request or emitted event matches the expected behavior.
 
 #### Function details
 
@@ -28,11 +30,11 @@ fn test_turn_responses_metadata(
 ) -> codex_core::CodexResponsesMetadata
 ```
 
-**Purpose**: Builds deterministic Responses metadata for tests using fixed installation and window IDs. This makes outbound client metadata assertions stable across runs.
+**Purpose**: Builds a standard block of fake metadata for one model request in tests. This lets lower-level client tests send requests with realistic Codex session, thread, installation, and turn information.
 
-**Data flow**: Accepts a `ModelClient` reference and `ThreadId`, converts the thread ID to string, and calls `test_responses_metadata` with fixed installation ID, session/thread IDs derived from the thread ID, no turn ID, fixed window ID, `SessionSource::Exec`, no parent thread, and request kind `Turn`, returning the resulting metadata struct.
+**Data flow**: It receives a model client reference and a thread id, converts the thread id to text, combines it with fixed test identifiers, and returns a Codex responses metadata object. It does not change the client.
 
-**Call relations**: Lower-level client-stream tests call this helper when they bypass the higher-level harness and need to supply explicit metadata into `ModelClient::stream`.
+**Call relations**: The direct client-streaming tests call this before starting a Responses API stream. It hands metadata to the model client so those tests can focus on provider behavior instead of rebuilding the same metadata each time.
 
 *Call graph*: called by 2 (azure_responses_request_includes_store_and_reasoning_ids, send_provider_auth_request); 2 external calls (responses_metadata, to_string).
 
@@ -43,11 +45,11 @@ fn test_turn_responses_metadata(
 fn assert_message_role(request_body: &serde_json::Value, role: &str)
 ```
 
-**Purpose**: Asserts that a JSON request item has the expected `role` string. It is a tiny helper used in instruction-message tests.
+**Purpose**: Checks that a JSON request item has the expected message role, such as `user`, `developer`, or `assistant`. Tests use it to make request-shape assertions easier to read.
 
-**Data flow**: Reads `request_body["role"]` as a string, unwraps it, and compares it to the expected role with `assert_eq!`.
+**Data flow**: It receives a JSON value and an expected role string, reads the value's `role` field, and fails the test if the field is missing or different.
 
-**Call relations**: Instruction-injection tests call this helper when checking the ordering and roles of developer and user contextual messages.
+**Call relations**: Instruction-related tests call this after capturing a request from the mock server. It provides a small, shared assertion before those tests inspect the message contents.
 
 *Call graph*: called by 2 (includes_developer_instructions_message_in_request, includes_user_instructions_message_in_request); 1 external calls (assert_eq!).
 
@@ -58,11 +60,11 @@ fn assert_message_role(request_body: &serde_json::Value, role: &str)
 fn message_input_texts(item: &serde_json::Value) -> Vec<&str>
 ```
 
-**Purpose**: Extracts text strings from a message item’s `content` array in raw JSON request bodies. It ignores non-text entries.
+**Purpose**: Extracts all plain text snippets from the `content` array of a message JSON item. This helps tests look for instructions or conversation text without repeating JSON-walking code.
 
-**Data flow**: Reads `item["content"]` as an array, iterates entries, pulls `entry["text"]` string values when present, and returns them as `Vec<&str>`.
+**Data flow**: It receives one JSON message item, reads its `content` list, keeps entries that have a string `text` field, and returns those strings as a list of borrowed text slices.
 
-**Call relations**: Used by several tests that inspect raw request JSON rather than the higher-level `ResponsesRequest` helper.
+**Call relations**: Resume and instruction tests call this when checking captured request bodies. Other helpers also build on it to search for particular phrases.
 
 *Call graph*: called by 3 (includes_developer_instructions_message_in_request, includes_user_instructions_message_in_request, resume_includes_initial_messages_and_sends_prior_items).
 
@@ -73,11 +75,11 @@ fn message_input_texts(item: &serde_json::Value) -> Vec<&str>
 fn message_input_text_contains(request: &ResponsesRequest, role: &str, needle: &str) -> bool
 ```
 
-**Purpose**: Checks whether any message text for a given role in a captured request contains a substring. It simplifies assertions about injected guidance text.
+**Purpose**: Answers the question, `Does this captured request contain this text in messages with this role?` It is a convenience helper for tests that only care whether a guidance snippet is present or absent.
 
-**Data flow**: Calls `request.message_input_texts(role)`, iterates the returned strings, and returns `true` if any contain `needle`.
+**Data flow**: It receives a captured Responses request, a role name, and a search phrase. It asks the request for text messages with that role, searches each text for the phrase, and returns true or false.
 
-**Call relations**: Apps-guidance and environment-context tests use this helper to assert presence or absence of specific snippets in developer or user messages.
+**Call relations**: Apps and environment-context tests use it after the mock server records a request. Internally it relies on message-text extraction so each test does not have to parse JSON by hand.
 
 *Call graph*: calls 1 internal fn (message_input_texts).
 
@@ -93,11 +95,11 @@ fn assert_codex_client_metadata(
 )
 ```
 
-**Purpose**: Validates that a request body’s `client_metadata` and embedded `x-codex-turn-metadata` JSON agree on installation, session, thread, turn, and window identifiers. It checks both top-level and nested metadata consistency.
+**Purpose**: Verifies that Codex placed the right session, thread, turn, window, and installation identifiers into the request body metadata. These fields help backend systems trace which local conversation a request came from.
 
-**Data flow**: Reads `request_body["client_metadata"]`, asserts `x-codex-installation-id`, `session_id`, and `thread_id` match the expected strings, parses `x-codex-turn-metadata` as JSON, asserts its installation/session/thread IDs match, and finally asserts `client_metadata.turn_id` equals the nested `turn_id` and `x-codex-window-id` equals the nested `window_id`.
+**Data flow**: It receives a request JSON body and the expected ids. It reads `client_metadata`, parses the nested turn metadata JSON string, and fails the test if any id or paired field does not match.
 
-**Call relations**: Header/auth tests call this helper after capturing a request body to verify the metadata emitted by the client layer.
+**Call relations**: API-key and ChatGPT-auth request tests call this after checking headers. It confirms that request identity is consistent both in top-level client metadata and in the nested turn metadata.
 
 *Call graph*: called by 2 (chatgpt_auth_sends_correct_request, includes_session_id_thread_id_and_model_headers_in_request); 1 external calls (assert_eq!).
 
@@ -108,11 +110,11 @@ fn assert_codex_client_metadata(
 async fn non_openai_responses_requests_omit_item_turn_metadata()
 ```
 
-**Purpose**: Verifies that Responses requests sent through a non-OpenAI provider omit per-input-item metadata fields. This prevents OpenAI-specific item metadata from leaking to generic providers.
+**Purpose**: Checks that request input items for a non-standard Responses provider do not include per-item turn metadata. This prevents Codex from sending OpenAI-specific decoration to providers that may not accept it.
 
-**Data flow**: Starts a mock server, mounts a one-shot completion SSE, clones the built-in OpenAI provider and mutates its name/base URL/websocket support to represent a generic Responses provider, builds a harness using that provider, submits a simple user turn, waits for completion, reads the captured request body, extracts the `input` array, and asserts every item lacks a `metadata` field.
+**Data flow**: The test starts a mock server, points a copied provider configuration at it, submits `hello`, waits for the turn to finish, then inspects every input item in the captured JSON request. The expected result is that none of those items has a `metadata` field.
 
-**Call relations**: This top-level test focuses on request shaping for non-OpenAI providers and uses the standard harness path rather than low-level `ModelClient` streaming.
+**Call relations**: The async test runner invokes this test. It uses the common test Codex builder, mock SSE response helpers, and event-waiting helper to drive one complete request.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 7 external calls (default, start, assert!, built_in_model_providers, wait_for_event, format!, vec!).
 
@@ -129,11 +131,11 @@ fn write_auth_json(
 ) -> String
 ```
 
-**Purpose**: Writes a synthetic `auth.json` file containing optional API key plus ChatGPT-style tokens and returns the fake JWT used as `id_token`. It lets tests simulate mixed credential stores without real auth flows.
+**Purpose**: Creates a temporary `auth.json` file containing fake API-key and ChatGPT-token credentials. Tests use it to simulate a real saved login without contacting a real auth service.
 
-**Data flow**: Builds a JWT-like string by base64url-encoding a fixed header and payload containing email, plan type, and account ID, then constructs a `tokens` JSON object with `id_token`, `access_token`, `refresh_token`, and optional `account_id`. It wraps that in an `auth_json` object with optional `OPENAI_API_KEY` and `last_refresh`, pretty-serializes it, writes it to `codex_home/auth.json`, and returns the fake JWT string.
+**Data flow**: It receives a temporary Codex home directory plus optional API key, plan type, access token, and account id. It builds a fake unsigned JSON Web Token, writes all credentials to `auth.json`, and returns the fake id token string.
 
-**Call relations**: The API-key-preference test uses this helper to seed a credential store containing both API-key and ChatGPT credentials.
+**Call relations**: The API-key-preference test calls this before loading authentication from disk. The loaded auth then flows into Codex startup exactly as if a user already had credentials saved.
 
 *Call graph*: called by 1 (prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens); 6 external calls (path, format!, json!, to_string_pretty, to_vec, write).
 
@@ -144,11 +146,11 @@ fn write_auth_json(
 fn new(tokens: &[&str]) -> std::io::Result<Self>
 ```
 
-**Purpose**: Creates a temporary command fixture that prints successive bearer tokens from a file, one per invocation. It supports testing command-backed provider auth and refresh behavior.
+**Purpose**: Creates a temporary command-line program that prints one bearer token at a time. This lets tests simulate providers whose authentication token is fetched by running an external command.
 
-**Data flow**: Creates a temp directory and writes `tokens.txt` containing the supplied tokens one per line. On Unix it writes an executable `print-token.sh` that prints the first line and shifts the file; on Windows it writes `print-token.cmd` with equivalent behavior and returns `cmd.exe` plus `/D /Q /C .\print-token.cmd` args. It stores the tempdir, command string, and args in the fixture and returns it.
+**Data flow**: It receives a list of token strings, writes them to a temporary file, writes a small shell or Windows command script that prints and removes the first token, and returns a fixture containing the command, arguments, and temporary directory.
 
-**Call relations**: Provider-auth tests construct this fixture before passing its `auth()` output into the lower-level request helper.
+**Call relations**: The provider-auth tests call this before sending requests. Its fixture feeds `ProviderAuthCommandFixture::auth`, which becomes the provider auth configuration used by the model client.
 
 *Call graph*: called by 2 (provider_auth_command_refreshes_after_401, provider_auth_command_supplies_bearer_token); 7 external calls (new, new, metadata, set_permissions, write, tempdir, vec!).
 
@@ -159,11 +161,11 @@ fn new(tokens: &[&str]) -> std::io::Result<Self>
 fn auth(&self) -> ModelProviderAuthInfo
 ```
 
-**Purpose**: Converts the fixture into a `ModelProviderAuthInfo` suitable for provider configuration. It points the auth command at the fixture tempdir and uses a stable timeout.
+**Purpose**: Turns the temporary token-printing command into a `ModelProviderAuthInfo` configuration object. Codex can then run that command when it needs an Authorization bearer token.
 
-**Data flow**: Builds and returns `ModelProviderAuthInfo` with the fixture’s command and args, `timeout_ms` set via `non_zero_u64(5000)`, `refresh_interval_ms` 60000, and `cwd` set to the fixture tempdir converted to `AbsolutePathBuf`.
+**Data flow**: It reads the fixture's command, arguments, and temporary directory, adds timeout and refresh timing settings, and returns a provider-auth configuration. It does not run the command itself.
 
-**Call relations**: Provider-auth tests call this after constructing the fixture, then pass the resulting auth config into `send_provider_auth_request`.
+**Call relations**: The provider-auth tests call this and pass the result into `send_provider_auth_request`. It depends on `non_zero_u64` to build the non-zero timeout value required by the config type.
 
 *Call graph*: calls 2 internal fn (non_zero_u64, try_from); 1 external calls (path).
 
@@ -174,11 +176,11 @@ fn auth(&self) -> ModelProviderAuthInfo
 fn non_zero_u64(value: u64) -> NonZeroU64
 ```
 
-**Purpose**: Creates a `NonZeroU64` from a plain integer and panics if zero is supplied. It is a tiny helper for auth-command timeout configuration.
+**Purpose**: Converts a regular positive number into Rust's `NonZeroU64` type, which is a number type that cannot contain zero. It is used where configuration requires a timeout value that must be non-zero.
 
-**Data flow**: Calls `NonZeroU64::new(value)` and unwraps the result.
+**Data flow**: It receives a `u64`, tries to wrap it as non-zero, and returns the wrapped value. If zero is passed, the test fails immediately.
 
-**Call relations**: Only `ProviderAuthCommandFixture::auth` uses this helper.
+**Call relations**: `ProviderAuthCommandFixture::auth` calls this while building command-backed auth settings. It keeps the fixture code readable and makes the non-zero requirement explicit.
 
 *Call graph*: called by 1 (auth); 1 external calls (new).
 
@@ -189,11 +191,11 @@ fn non_zero_u64(value: u64) -> NonZeroU64
 async fn resume_includes_initial_messages_and_sends_prior_items()
 ```
 
-**Purpose**: Verifies resume behavior for a rollout containing prior user, system, and assistant messages. It checks that `initial_messages` stays empty while prior response items are replayed into the next request in the correct order relative to contextual messages and the new user input.
+**Purpose**: Tests that resuming a saved conversation sends the right old conversation items to the model, while not incorrectly converting saved response items into initial UI messages. This protects chat continuity after restart.
 
-**Data flow**: Writes a synthetic JSONL session file containing `session_meta`, a prior user message, a prior system message, and a prior assistant message with `phase: commentary`; starts a mock server and mounts a one-shot completion SSE; builds a resumed harness from that session file with a global `AGENTS.md`; inspects `session_configured.initial_messages` and asserts it serializes to `[]`; submits a new `hello` turn; waits for completion; then parses the captured request body’s `input` array into `(role, text)` pairs. It locates positions for the prior user message, prior assistant message, permissions developer message, AGENTS user instructions, environment context, and new user message, asserts the assistant item preserved `phase: commentary`, and checks the ordering `prior user < prior assistant < permissions < user instructions < environment < new user`.
+**Data flow**: It writes a fake session file with prior user, system, and assistant items, resumes Codex from that file, submits a new `hello`, then inspects the request. Prior user and assistant messages must appear before new context and new input, while the prior system message is excluded from API history.
 
-**Call relations**: This resume test inspects both session configuration and outbound request replay, validating how persisted rollout items are merged with freshly generated contextual messages.
+**Call relations**: The test runner invokes it. It uses the resume-capable test builder, mock SSE server, `message_input_texts`, and event waiting to verify both startup resume state and the next request body.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, test_codex, message_input_texts); 15 external calls (new, default, start, new, new_v4, new, assert!, assert_eq!, wait_for_event, json! (+5 more)).
 
@@ -204,11 +206,11 @@ async fn resume_includes_initial_messages_and_sends_prior_items()
 async fn resume_replays_legacy_js_repl_image_rollout_shapes()
 ```
 
-**Purpose**: Ensures resume remains compatible with an older rollout representation where js_repl image results were stored as a custom-tool-call output plus a separate user `input_image` message. Both legacy items must be replayed before the new user turn.
+**Purpose**: Checks backward compatibility for old saved sessions where JavaScript REPL image results were stored in an older two-item shape. Without this, users could resume older chats and lose image-related context.
 
-**Data flow**: Constructs a vector of `RolloutLine`s containing `SessionMeta`, a legacy `CustomToolCall`, a string-valued `CustomToolCallOutput`, and a standalone user `Message` with `ContentItem::InputImage`; writes them to a temp session file; starts a mock server with a one-shot completion SSE; resumes a harness from that file; submits `after resume`; then inspects the captured request `input` array. It finds the replayed `custom_tool_call_output` for `legacy-js-call`, asserts its `output` is the legacy stdout string, finds the replayed user image message containing the expected data URL, finds the new user message, and asserts both legacy items appear before the new user message.
+**Data flow**: It writes a rollout file containing a legacy custom tool call output and a separate user image message, resumes Codex, submits a new turn, and inspects the request input. The old tool output and image message must both be replayed before the new user text.
 
-**Call relations**: This targeted resume-compatibility test protects against regressions in rollout replay for historical js_repl image-output shapes.
+**Call relations**: The async test runner calls it. It uses rollout data structures directly, then relies on the test Codex resume path and mock server capture to prove the replay logic still understands legacy files.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 9 external calls (new, start, new, assert!, assert_eq!, skip_if_no_network!, create, vec!, writeln!).
 
@@ -219,11 +221,11 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes()
 async fn resume_replays_image_tool_outputs_with_detail()
 ```
 
-**Purpose**: Verifies that resumed function-call and custom-tool image outputs are replayed with structured `input_image` content including `detail: original`. It covers the modern structured image-output representation.
+**Purpose**: Checks that resumed tool outputs containing images preserve the image `detail` setting. The detail tells the model how much image information to consider, so dropping it would change what the model sees.
 
-**Data flow**: Builds a rollout containing `SessionMeta`, a `FunctionCall` plus `FunctionCallOutput` whose payload is `FunctionCallOutputPayload::from_content_items([InputImage { ... detail: Original }])`, and a `CustomToolCall` plus matching `CustomToolCallOutput` with the same image payload; writes it to a temp session file; starts a mock server with a one-shot completion SSE; resumes a harness; submits `after resume`; then extracts the replayed function-call output and custom-tool output from the captured request and asserts each `output` equals a JSON array containing one `input_image` object with the expected URL and `detail: "original"`.
+**Data flow**: It creates a saved rollout with both normal function-call output and custom-tool output containing image content marked `original`, resumes the conversation, submits another turn, and checks the captured request. Both replayed outputs must include the image URL and `detail: original`.
 
-**Call relations**: This resume test complements the legacy-shape test by validating current structured image-output replay.
+**Call relations**: The test runner calls it. It uses the resume builder and mock SSE response, then request-inspection helpers on the captured request to check both function and custom tool output forms.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 8 external calls (new, start, new, assert_eq!, skip_if_no_network!, create, vec!, writeln!).
 
@@ -234,11 +236,11 @@ async fn resume_replays_image_tool_outputs_with_detail()
 async fn includes_session_id_thread_id_and_model_headers_in_request()
 ```
 
-**Purpose**: Checks that a normal request includes session/thread headers, authorization, originator, prompt-cache key, and consistent client metadata. It validates the standard authenticated request envelope.
+**Purpose**: Verifies that a normal API-key request carries the session id, thread id, originator, authorization header, prompt cache key, and metadata. These values connect the backend request to the local Codex conversation.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with API-key auth, captures expected session and thread IDs from `session_configured`, submits a turn, waits for completion, then inspects the captured request. It asserts path `/v1/responses`, reads `session-id`, `thread-id`, `authorization`, and `originator` headers, reads the installation ID from the codex home file, asserts the headers match expected values, checks `prompt_cache_key` equals the thread ID string, and delegates nested metadata checks to `assert_codex_client_metadata`.
+**Data flow**: It starts a mock server, builds Codex with an API key, submits `hello`, waits for completion, then reads headers and JSON body from the captured request. The expected output is a set of matching ids and a bearer-token Authorization header.
 
-**Call relations**: This top-level request-envelope test uses the standard harness path and the metadata assertion helper.
+**Call relations**: The test runner invokes it. It uses `assert_codex_client_metadata` for the detailed metadata check after the mock server records the outgoing request.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, test_codex, assert_codex_client_metadata, from_api_key); 7 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, read_to_string, vec!).
 
@@ -249,11 +251,11 @@ async fn includes_session_id_thread_id_and_model_headers_in_request()
 async fn provider_auth_command_supplies_bearer_token()
 ```
 
-**Purpose**: Verifies that a provider configured with command-backed auth uses the command’s output as a bearer token on the Responses request. It checks the simplest successful auth-command path.
+**Purpose**: Tests that a provider-configured auth command can supply the bearer token used in the Authorization header. This supports enterprise or custom providers that issue tokens outside Codex.
 
-**Data flow**: Starts a mock server, mounts a one-shot SSE response that only matches when `authorization: Bearer command-token` is present, constructs a `ProviderAuthCommandFixture` with one token, and calls `send_provider_auth_request(server, auth_fixture.auth()).await`.
+**Data flow**: It creates a mock server expecting `Bearer command-token`, creates a command fixture that prints that token, and sends one provider-auth request. The test passes when the request reaches completion with the expected header.
 
-**Call relations**: This test delegates the actual low-level request issuance to `send_provider_auth_request`; the server-side matcher is what enforces the expected auth behavior.
+**Call relations**: The test runner calls it. It creates the fixture with `ProviderAuthCommandFixture::new`, converts it with `auth`, and delegates the actual client streaming work to `send_provider_auth_request`.
 
 *Call graph*: calls 4 internal fn (mount_sse_once_match, sse, new, send_provider_auth_request); 4 external calls (start, skip_if_no_network!, vec!, header).
 
@@ -264,11 +266,11 @@ async fn provider_auth_command_supplies_bearer_token()
 async fn provider_auth_command_refreshes_after_401()
 ```
 
-**Purpose**: Checks that command-backed provider auth refreshes after a 401 by rerunning the auth command and retrying with a new bearer token. It validates the retry path at the client layer.
+**Purpose**: Tests that Codex retries authentication by rerunning the provider auth command after a 401 unauthorized response. This matters when a command returns an expired token first and a fresh token next.
 
-**Data flow**: Starts a mock server, constructs a `ProviderAuthCommandFixture` with `first-token` then `second-token`, mounts one POST `/v1/responses` expectation returning 401 for `Bearer first-token` and one returning a successful SSE stream for `Bearer second-token`, then calls `send_provider_auth_request(server, auth_fixture.auth()).await`.
+**Data flow**: It sets up a server that rejects `first-token` with 401 and accepts `second-token`, creates a fixture that prints those tokens in order, then sends one request. The successful outcome is that Codex refreshes and completes using the second token.
 
-**Call relations**: Like the previous test, this one relies on `send_provider_auth_request` to drive the low-level stream while wiremock expectations verify the two-step auth refresh behavior.
+**Call relations**: The test runner invokes it. Like the simple provider-auth test, it uses the fixture and then hands off to `send_provider_auth_request` to exercise the real model client path.
 
 *Call graph*: calls 3 internal fn (sse, new, send_provider_auth_request); 8 external calls (given, start, new, skip_if_no_network!, vec!, header_regex, method, path).
 
@@ -279,11 +281,11 @@ async fn provider_auth_command_refreshes_after_401()
 async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuthInfo)
 ```
 
-**Purpose**: Issues one low-level streamed Responses request through a provider configured with command-backed auth and waits until the stream reaches `Completed`. It is a reusable helper for provider-auth tests.
+**Purpose**: Runs one streamed Responses API request through a custom provider that uses command-backed authentication. It is a shared helper for tests that assert server-side auth behavior.
 
-**Data flow**: Builds a `ModelProviderInfo` using the supplied `ModelProviderAuthInfo`, creates a temp codex home and default config, swaps in the provider, resolves an offline model and model info, creates a fresh `ThreadId`, `SessionTelemetry`, and `ModelClient`, builds deterministic responses metadata via `test_turn_responses_metadata`, creates a new client session and a `Prompt` containing one user `ResponseItem::Message`, then calls `client_session.stream(...)`. It consumes the stream until it sees `Ok(ResponseEvent::Completed { .. })`, ignoring intermediate events.
+**Data flow**: It receives a mock server and provider auth settings, builds a provider configuration pointing at the server, constructs model info, telemetry, a model client, prompt input, and metadata, then starts a stream. It reads events until a completed response appears.
 
-**Call relations**: Both provider-auth tests delegate to this helper so they can focus on server-side expectations while this function handles low-level client setup and streaming.
+**Call relations**: The provider-auth tests call this after setting up server expectations. It calls `test_turn_responses_metadata` and lower-level model-client streaming code so the tests exercise the same path used by real requests.
 
 *Call graph*: calls 10 internal fn (new, default, construct_model_info_offline, get_model_offline, test_turn_responses_metadata, from_auth_for_testing, from_api_key, new, new, disabled); called by 2 (provider_auth_command_refreshes_after_401, provider_auth_command_supplies_bearer_token); 5 external calls (new, new, load_default_config_for_test, format!, vec!).
 
@@ -294,11 +296,11 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
 async fn includes_base_instructions_override_in_request()
 ```
 
-**Purpose**: Verifies that `config.base_instructions` is inserted into the outbound `instructions` field. It checks direct base-instructions override propagation.
+**Purpose**: Checks that configured base instructions are sent in the request's `instructions` field. These are the top-level instructions that guide model behavior.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with API-key auth and `config.base_instructions = Some("test instructions")`, submits a turn, waits for completion, reads the captured request body, and asserts `instructions` contains `test instructions`.
+**Data flow**: It builds Codex with `base_instructions` set to `test instructions`, submits `hello`, waits for completion, then reads the captured request body. The expected result is that the instructions string contains the configured text.
 
-**Call relations**: This top-level request-shaping test focuses on the `instructions` field rather than contextual input messages.
+**Call relations**: The test runner calls it. It uses the standard mock SSE server and test Codex builder to drive a normal turn, then inspects the request.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, test_codex, from_api_key); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -309,11 +311,11 @@ async fn includes_base_instructions_override_in_request()
 async fn chatgpt_auth_sends_correct_request()
 ```
 
-**Purpose**: Checks the request envelope when using ChatGPT-style auth rather than API-key auth. It verifies path, bearer token, ChatGPT account header, streaming flags, include list, and client metadata.
+**Purpose**: Verifies the request shape when Codex is authenticated with ChatGPT-style tokens instead of a plain API key. This includes a different base path, account header, and encrypted reasoning include setting.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, clones the built-in OpenAI provider and points its base URL at `/api/codex`, builds a harness with dummy ChatGPT auth and that provider, captures expected session/thread IDs, submits a turn, waits for completion, then inspects the captured request. It asserts path `/api/codex/responses`, `authorization: Bearer Access Token`, `originator`, `chatgpt-account-id: account_id`, session/thread headers, consistent client metadata via `assert_codex_client_metadata`, `stream == true`, and `include[0] == "reasoning.encrypted_content"`.
+**Data flow**: It points the OpenAI provider at a fake `/api/codex` server, builds Codex with dummy ChatGPT auth, submits `hello`, and inspects the captured request. It checks authorization, account id, session/thread headers, metadata, streaming, and included reasoning content.
 
-**Call relations**: This is the ChatGPT-auth counterpart to the API-key request-envelope test.
+**Call relations**: The test runner invokes it. It uses `create_dummy_codex_auth` for fake ChatGPT credentials and `assert_codex_client_metadata` for the shared metadata checks.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, test_codex, assert_codex_client_metadata, create_dummy_codex_auth); 10 external calls (default, start, assert!, assert_eq!, built_in_model_providers, wait_for_event, format!, skip_if_no_network!, read_to_string, vec!).
 
@@ -324,11 +326,11 @@ async fn chatgpt_auth_sends_correct_request()
 async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens()
 ```
 
-**Purpose**: Verifies that when config prefers API-key auth, the client uses the API key even if `auth.json` also contains ChatGPT tokens that would otherwise be eligible. It tests credential-selection precedence.
+**Purpose**: Tests that Codex can prefer an API key even when saved ChatGPT tokens are also present. This prevents the wrong credential type from being used when configuration says API-key auth should win.
 
-**Data flow**: Starts a mock server with a successful SSE response that expects `Authorization: Bearer sk-test-key`, writes an `auth.json` containing both API key and ChatGPT tokens via `write_auth_json`, loads default config from that home and swaps in the mock provider, loads `CodexAuth` from auth storage, builds a `ThreadManager` manually with that auth manager and config, starts a thread, submits a turn, and waits for completion. The wiremock expectation enforces that the API key was used.
+**Data flow**: It writes an auth file containing both an API key and ChatGPT tokens, loads auth from disk, starts a thread manager with a mock provider, submits `hello`, and lets the mock server require the API-key bearer token. Completion proves the API key was used.
 
-**Call relations**: This test bypasses `test_codex` convenience auth setup and manually constructs the thread manager so it can exercise auth-storage loading and credential preference logic.
+**Call relations**: The test runner calls it. It uses `write_auth_json` to create the mixed credential file, then exercises the fuller thread-manager startup path instead of only the lightweight test builder.
 
 *Call graph*: calls 7 internal fn (default, auth_manager_from_auth, new, sse, write_auth_json, default_for_tests, from_auth_storage); 18 external calls (new, default, given, start, new, new, resolve_installation_id, thread_store_from_config, empty_extension_registry, built_in_model_providers (+8 more)).
 
@@ -339,11 +341,11 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens()
 async fn includes_user_instructions_message_in_request()
 ```
 
-**Purpose**: Checks that AGENTS/user instructions are injected as a contextual user message rather than merged into the top-level `instructions` field. It also verifies the surrounding permissions and environment-context messages.
+**Purpose**: Checks that AGENTS.md instructions are sent as contextual user content, not folded into the top-level instructions string. This keeps project guidance separate from base system instructions.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with API-key auth and a pre-build hook writing `AGENTS.md` containing `be nice`, submits a turn, waits for completion, and inspects the captured request body. It asserts `instructions` does not contain `be nice`, checks the first input item is a developer permissions message mentioning ``sandbox_mode``, checks the second input item is a user message whose texts include a `# AGENTS.md instructions` fragment containing `<INSTRUCTIONS>` and `be nice`, and also include an `<environment_context>...</environment_context>` fragment.
+**Data flow**: It writes an `AGENTS.md` file, submits a turn, then inspects the request. The top-level instructions must not contain the AGENTS text; the input should start with a developer permissions message, followed by a user context message containing AGENTS.md instructions and environment context.
 
-**Call relations**: This test uses `assert_message_role` and `message_input_texts` to validate the exact placement of injected user instructions in the request input array.
+**Call relations**: The test runner invokes it. It uses `assert_message_role` and `message_input_texts` to make the request-body checks readable.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, test_codex, assert_message_role, message_input_texts, from_api_key); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -354,11 +356,11 @@ async fn includes_user_instructions_message_in_request()
 async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth()
 ```
 
-**Purpose**: Verifies that Apps/Connectors guidance is injected as a developer message when the Apps feature is enabled and ChatGPT auth is in use. It must not appear in user messages.
+**Purpose**: Checks that Apps or Connectors guidance is added as a developer message when Apps are enabled and the user is authenticated through ChatGPT. This gives the model instructions for app-trigger syntax only when that feature is available.
 
-**Data flow**: Starts a mock server and mounts an `AppsTestServer`, builds a harness with dummy ChatGPT auth, `Feature::Apps` enabled, and `chatgpt_base_url` pointed at the apps server, submits a turn, waits for completion, then inspects the captured request via `message_input_text_contains`. It asserts the apps guidance snippet appears in a developer message and does not appear in any user message.
+**Data flow**: It mounts a fake Apps server, enables the Apps feature, builds Codex with dummy ChatGPT auth, submits `hello`, and searches the captured request. The Apps guidance must appear in developer messages and not in user messages.
 
-**Call relations**: This test focuses on auth-sensitive guidance injection and uses the apps mock server only to make the feature path realistic.
+**Call relations**: The test runner calls it. It uses `create_dummy_codex_auth`, the Apps test server, and `message_input_text_contains` to verify placement of the guidance text.
 
 *Call graph*: calls 5 internal fn (mount, mount_sse_once, sse, test_codex, create_dummy_codex_auth); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -369,11 +371,11 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth()
 async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled()
 ```
 
-**Purpose**: Checks that Apps guidance is not injected when using API-key auth, even if the Apps feature is enabled and an apps base URL is configured. It validates auth-mode gating.
+**Purpose**: Checks that Apps guidance is not sent for API-key authentication, even if the Apps feature flag is enabled. This prevents instructions for ChatGPT-only app behavior from leaking into unsupported sessions.
 
-**Data flow**: Starts a mock server and apps server, builds a harness with API-key auth, `Feature::Apps` enabled, and `chatgpt_base_url` set, submits a turn, waits for completion, and asserts the apps guidance snippet appears in neither developer nor user messages.
+**Data flow**: It enables Apps, uses API-key auth, submits `hello`, and searches all developer and user message text in the captured request. The Apps guidance snippet must be absent.
 
-**Call relations**: This is the API-key counterpart to the previous ChatGPT-auth apps-guidance test.
+**Call relations**: The test runner invokes it. It uses the same mock Apps setup as the ChatGPT-auth test, but changes the auth mode to prove the condition depends on credentials.
 
 *Call graph*: calls 5 internal fn (mount, mount_sse_once, sse, test_codex, from_api_key); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -384,11 +386,11 @@ async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled()
 async fn omits_apps_guidance_when_configured_off()
 ```
 
-**Purpose**: Verifies that Apps guidance is suppressed when `include_apps_instructions = false`, even under ChatGPT auth with the Apps feature enabled. It checks explicit config opt-out.
+**Purpose**: Checks that Apps instructions are omitted when the explicit `include_apps_instructions` setting is false. This gives configuration a clear way to suppress that guidance.
 
-**Data flow**: Starts a mock server and apps server, builds a harness with dummy ChatGPT auth, `Feature::Apps` enabled, `chatgpt_base_url` set, and `include_apps_instructions = false`, submits a turn, waits for completion, and asserts no developer message contains `<apps_instructions>`.
+**Data flow**: It enables Apps and ChatGPT auth but turns off app instructions in config, submits `hello`, then searches developer messages. The `<apps_instructions>` block must not be present.
 
-**Call relations**: This test complements the auth-based apps-guidance tests by covering the explicit configuration switch.
+**Call relations**: The test runner calls it. It uses `create_dummy_codex_auth`, the Apps test server, and text-search helper logic to check that the configuration override wins.
 
 *Call graph*: calls 5 internal fn (mount, mount_sse_once, sse, test_codex, create_dummy_codex_auth); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -399,11 +401,11 @@ async fn omits_apps_guidance_when_configured_off()
 async fn omits_environment_context_when_configured_off()
 ```
 
-**Purpose**: Checks that no `<environment_context>` user message is injected when `include_environment_context = false`. It validates another contextual-message toggle.
+**Purpose**: Checks that Codex does not include environment context when configuration disables it. Environment context describes things like the current workspace, so users may want to suppress it.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with `config.include_environment_context = false`, submits a turn, waits for completion, and asserts no user message text contains `<environment_context>`.
+**Data flow**: It builds Codex with `include_environment_context` set to false, submits `hello`, and examines user messages in the captured request. The `<environment_context>` block must be absent.
 
-**Call relations**: This test isolates the environment-context injection toggle from the broader instruction-message tests.
+**Call relations**: The test runner invokes it. It uses the standard one-turn mock server flow and the text-search helper to verify the request content.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 5 external calls (default, start, assert!, wait_for_event, vec!).
 
@@ -414,11 +416,11 @@ async fn omits_environment_context_when_configured_off()
 async fn skills_append_to_developer_message()
 ```
 
-**Purpose**: Verifies that discovered skills are summarized in a developer message, including the skill name, description, and normalized path to `SKILL.md`. It checks the non-aliased path form.
+**Purpose**: Verifies that discovered skills are summarized in a developer message. Skills are local reusable instructions or capabilities, and the model needs to know their names, descriptions, and file locations.
 
-**Data flow**: Creates a temp codex home with `skills/demo/SKILL.md`, builds a harness rooted at that home with API-key auth, submits a turn, waits for completion, then joins all developer message texts and asserts they contain `## Skills`, `demo: build charts`, and the normalized absolute path to the skill file.
+**Data flow**: It creates a temporary `skills/demo/SKILL.md`, builds Codex with that directory as the working area, submits `hello`, and inspects developer messages. The message must include a Skills section, the demo skill summary, and the normalized path to the skill file.
 
-**Call relations**: This test exercises skill discovery and developer-message augmentation under normal context-budget conditions.
+**Call relations**: The test runner calls it. It uses file-system setup, the test Codex builder, and captured request inspection to prove skill discovery affects the outgoing prompt.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, test_codex, from_api_key); 11 external calls (new, default, start, new, assert!, wait_for_event, canonicalize, skip_if_no_network!, create_dir_all, write (+1 more)).
 
@@ -429,11 +431,11 @@ async fn skills_append_to_developer_message()
 async fn skills_use_aliases_in_developer_message_under_budget_pressure()
 ```
 
-**Purpose**: Checks that when many skills and a small context window create budget pressure, skill paths are compressed using root aliases like `r0/...` and an explanatory `### Skill roots` section is included. It validates the aliasing fallback format.
+**Purpose**: Checks that long skill paths are shortened with aliases when prompt space is tight. This keeps the skill list useful without wasting too much of the model's context window.
 
-**Data flow**: Creates a temp codex home under a long shared prefix, writes 12 skill directories each with a minimal `SKILL.md`, builds a harness rooted there with API-key auth, bundled skills disabled in the config layer stack, and `model_context_window = Some(12_000)`, submits a turn, waits for completion, joins developer message texts, and asserts they contain `### Skill roots`, a root alias mapping `r0` to the normalized skill root path, a skill summary line like `- s00: d (file: r0/s00/SKILL.md)`, and explanatory alias-expansion instructions.
+**Data flow**: It creates many skills under a long temporary path, disables bundled skills, lowers the context window, submits `hello`, and inspects developer messages. The expected result is a `Skill roots` alias section and skill entries using compact paths like `r0/s00/SKILL.md`.
 
-**Call relations**: This test is the budget-pressure counterpart to the normal skills summary test and validates the path-aliasing representation.
+**Call relations**: The test runner invokes it. It uses temporary files and configuration layering to create budget pressure, then checks the generated developer guidance in the captured request.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, test_codex, from_api_key); 13 external calls (new, default, start, new, new_in, assert!, wait_for_event, canonicalize, format!, skip_if_no_network! (+3 more)).
 
@@ -444,11 +446,11 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure()
 async fn includes_configured_effort_in_request() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that an explicitly configured reasoning effort is serialized into the request body. It checks the `reasoning.effort` field directly.
+**Purpose**: Checks that an explicitly configured reasoning effort is sent to models that support it. Reasoning effort tells the model how much thinking effort to spend.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a `gpt-5.4` harness with `config.model_reasoning_effort = Some(ReasoningEffort::Medium)`, submits a turn, waits for completion, reads the captured request body, and asserts `reasoning.effort == "medium"`.
+**Data flow**: It configures model `gpt-5.4` with medium reasoning effort, submits `hello`, and reads the captured request body. The `reasoning.effort` field must be `medium`.
 
-**Call relations**: This is one of several request-shaping tests for reasoning configuration.
+**Call relations**: The test runner calls it. It uses the standard mock server and test builder to confirm config values flow into the outgoing request.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -459,11 +461,11 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()>
 async fn includes_no_effort_in_request() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks the default reasoning-effort behavior when no explicit effort is configured. For the default test model, the request still carries the model-defined default effort.
+**Purpose**: Despite its name, this test currently verifies that the request contains the model's default reasoning effort when no explicit effort is configured. It protects the defaulting behavior for the chosen test model.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a default `gpt-5.4` harness, submits a turn, waits for completion, reads the request body, and asserts `reasoning.effort == "medium"`.
+**Data flow**: It builds Codex with `gpt-5.4`, submits `hello`, and inspects the request body. The resulting `reasoning.effort` field is expected to be `medium`.
 
-**Call relations**: This test documents that the absence of explicit config does not mean omission when the model info defines a default effort.
+**Call relations**: The test runner invokes it. It shares the same one-turn request flow as other model-option tests and relies on model metadata for the default value.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -474,11 +476,11 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()>
 async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies explicitly that model-info defaults populate `reasoning.effort` when present. It overlaps with the previous test but frames the behavior in terms of model metadata.
+**Purpose**: Checks that model catalog information can provide a default reasoning effort. This means users do not need to configure effort manually for models with known defaults.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a default `gpt-5.4` harness, submits a turn, waits for completion, reads the request body, and asserts `reasoning.effort == "medium"`.
+**Data flow**: It builds Codex for `gpt-5.4`, submits `hello`, and checks the captured JSON request. The request must include `reasoning.effort` set to `medium` from model information.
 
-**Call relations**: This test reinforces the model-catalog default-effort behavior from a slightly different angle.
+**Call relations**: The test runner calls it. It follows the same mock-request pattern as the other reasoning-effort tests and validates the model-info default path.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -489,11 +491,11 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
 async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that per-turn collaboration-mode settings override the model and reasoning effort used in the outbound request. It validates turn-level settings precedence over session defaults.
+**Purpose**: Tests that per-turn collaboration-mode settings can override the model and reasoning effort used for a single user turn. This supports UI modes that temporarily change how Codex should answer.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a default `gpt-5.4` harness, constructs a `CollaborationMode` whose settings specify model `gpt-5.4` and `ReasoningEffort::High`, submits a raw `Op::UserInput` with explicit local environments, approval/sandbox settings from config, summary from config, and that collaboration mode, waits for completion, reads the request body, and asserts `model == "gpt-5.4"` and `reasoning.effort == "high"`.
+**Data flow**: It builds Codex, creates a collaboration mode with model `gpt-5.4` and high effort, submits `hello` with thread-setting overrides, and inspects the request. The outgoing body must use the overridden model and `reasoning.effort: high`.
 
-**Call relations**: This test bypasses the simple submit helper to inject explicit per-turn collaboration settings into `ThreadSettingsOverrides`.
+**Call relations**: The test runner invokes it. It uses `local_selections` and normal config values to fill required thread settings, then verifies the override in the captured request.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, local_selections, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -504,11 +506,11 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
 async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a configured reasoning summary mode is serialized into `reasoning.summary` and that no `reasoning.context` field is added in this case. It checks concise-summary request shaping.
+**Purpose**: Checks that a configured reasoning-summary style is sent in the request. Reasoning summaries are concise or detailed descriptions of the model's hidden reasoning, when supported.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with `config.model_reasoning_summary = Some(ReasoningSummary::Concise)`, submits a turn, waits for completion, reads the request body, and asserts `reasoning.summary == "concise"` and `reasoning.context` is absent.
+**Data flow**: It configures `ReasoningSummary::Concise`, submits `hello`, and reads the captured request body. The `reasoning.summary` field must be `concise`, and the `reasoning.context` field must be absent.
 
-**Call relations**: This is the baseline reasoning-summary serialization test.
+**Call relations**: The test runner calls it. It uses the common mock-server flow and request inspection to verify reasoning-summary configuration.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, wait_for_event, assert_eq!, skip_if_no_network!, vec!).
 
@@ -519,11 +521,11 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()>
 async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks request shaping for models marked `use_responses_lite`: they should set `reasoning.context = "all_turns"` and force `parallel_tool_calls = false` even if the model otherwise supports parallel tools.
+**Purpose**: Checks special request settings for models marked as using Responses Lite. For that mode, Codex should send all-turns reasoning context and turn off parallel tool calls.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness whose model-info override sets `use_responses_lite = true` and `supports_parallel_tool_calls = true`, submits a turn, waits for completion, reads the request body, and asserts `reasoning.context == "all_turns"` and `parallel_tool_calls == false`.
+**Data flow**: It overrides model info to enable Responses Lite and parallel-tool-call support, submits `hello`, and inspects the request body. The request must contain `reasoning.context: all_turns` and `parallel_tool_calls: false`.
 
-**Call relations**: This test targets a model-info-driven request-shaping branch distinct from ordinary reasoning-summary behavior.
+**Call relations**: The test runner invokes it. It uses model-info override support in the test builder to simulate this model capability combination.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, wait_for_event, assert_eq!, skip_if_no_network!, vec!).
 
@@ -534,11 +536,11 @@ async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls(
 async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a per-turn explicit reasoning summary overrides the model catalog’s default summary. It checks precedence between turn settings and model metadata.
+**Purpose**: Tests that a per-turn explicit reasoning summary setting beats the model catalog's default. This lets a user or UI choose a different summary style for one turn.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, loads the bundled model catalog and mutates `gpt-5.4` to support reasoning summaries with default `Detailed`, builds a harness using that catalog, submits a raw `Op::UserInput` whose `ThreadSettingsOverrides` set `summary: Some(ReasoningSummary::Concise)` and a collaboration mode using the session model, waits for completion, reads the request body, and asserts `reasoning.summary == "concise"`.
+**Data flow**: It edits the bundled model catalog so `gpt-5.4` defaults to detailed summaries, then submits a turn with overrides requesting concise summary. The captured request must send `reasoning.summary: concise`.
 
-**Call relations**: This test complements the configured-summary tests by proving turn-level summary settings beat catalog defaults.
+**Call relations**: The test runner calls it. It combines catalog editing, thread-setting overrides, and captured request assertions to prove per-turn settings take priority.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, local_selections, test_codex); 7 external calls (default, start, bundled_models_response, wait_for_event, assert_eq!, skip_if_no_network!, vec!).
 
@@ -549,11 +551,11 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
 async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that setting `model_reasoning_summary = None`/`ReasoningSummary::None` suppresses the `reasoning.summary` field entirely. It validates explicit omission behavior.
+**Purpose**: Checks that setting reasoning summary to `None` really omits the summary field. This is important when users do not want reasoning summaries requested.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with `config.model_reasoning_summary = Some(ReasoningSummary::None)`, submits a turn, waits for completion, reads the request body, and asserts `reasoning.summary` is absent.
+**Data flow**: It configures `ReasoningSummary::None`, submits `hello`, and inspects the request body. The `reasoning.summary` field must not exist.
 
-**Call relations**: This is the negative counterpart to the summary-inclusion tests.
+**Call relations**: The test runner invokes it. It follows the same request-capture pattern as the other reasoning-summary tests.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, wait_for_event, assert_eq!, skip_if_no_network!, vec!).
 
@@ -564,11 +566,11 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()>
 async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that explicitly disabling reasoning summaries overrides a model catalog default that would otherwise request a summary. It checks omission precedence over metadata defaults.
+**Purpose**: Checks that an explicit `None` setting suppresses a model catalog default reasoning summary. User configuration must be able to turn off summaries even when the model metadata suggests one.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, mutates the bundled `gpt-5.4` model catalog entry to support summaries with default `Detailed`, builds a harness with `config.model_reasoning_summary = Some(ReasoningSummary::None)` and that catalog, submits a turn, waits for completion, reads the request body, and asserts `reasoning.summary` is absent.
+**Data flow**: It edits the model catalog to default to detailed summaries, configures `ReasoningSummary::None`, submits `hello`, and checks the request. No `reasoning.summary` field should be sent.
 
-**Call relations**: This test is the catalog-default counterpart to the previous omission test.
+**Call relations**: The test runner calls it. It uses bundled model metadata plus config override to verify the priority order.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 7 external calls (default, start, bundled_models_response, wait_for_event, assert_eq!, skip_if_no_network!, vec!).
 
@@ -579,11 +581,11 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
 async fn includes_default_verbosity_in_request() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that the default verbosity for the test model is serialized into `text.verbosity`. It validates model-default verbosity shaping.
+**Purpose**: Checks that the default text verbosity is sent for a model that supports verbosity. Verbosity controls how terse or detailed the model's answer should be.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a default `gpt-5.4` harness, submits a turn, waits for completion, reads the request body, and asserts `text.verbosity == "low"`.
+**Data flow**: It builds Codex with `gpt-5.4`, submits `hello`, and reads the captured request body. The request must include `text.verbosity: low`.
 
-**Call relations**: This is the baseline verbosity serialization test.
+**Call relations**: The test runner invokes it. It uses the standard mock-server request capture used by the model-option tests.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -594,11 +596,11 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()>
 async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that configured verbosity is omitted for models that do not support verbosity controls. It checks capability gating rather than config parsing.
+**Purpose**: Checks that Codex does not send a verbosity setting to models that do not support it. This prevents provider errors caused by unsupported request fields.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness using model `test-no-verbosity` and `config.model_verbosity = Some(Verbosity::High)`, submits a turn, waits for completion, reads the request body, and asserts `text.verbosity` is absent.
+**Data flow**: It chooses a test model without verbosity support, configures high verbosity, submits `hello`, and inspects the request. The `text.verbosity` field must be absent.
 
-**Call relations**: This test complements the positive verbosity tests by covering unsupported-model behavior.
+**Call relations**: The test runner calls it. It verifies that model capability checks happen before request fields are added.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -609,11 +611,11 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
 async fn configured_verbosity_is_sent() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that an explicitly configured verbosity is serialized for models that support it. It validates the positive override path.
+**Purpose**: Checks that a configured verbosity value is sent for a supporting model. This confirms user preference is honored when the model can accept it.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a `gpt-5.4` harness with `config.model_verbosity = Some(Verbosity::High)`, submits a turn, waits for completion, reads the request body, and asserts `text.verbosity == "high"`.
+**Data flow**: It configures high verbosity for `gpt-5.4`, submits `hello`, and checks the captured request body. The `text.verbosity` field must be `high`.
 
-**Call relations**: This is the positive counterpart to the unsupported-model verbosity test.
+**Call relations**: The test runner invokes it. It complements the unsupported-model verbosity test by proving the positive path.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 6 external calls (default, start, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -624,11 +626,11 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()>
 async fn includes_developer_instructions_message_in_request()
 ```
 
-**Purpose**: Verifies that configured developer instructions are injected as a developer message while AGENTS instructions remain in a separate contextual user message. It checks the coexistence and placement of both instruction sources.
+**Purpose**: Checks that configured developer instructions are sent as a developer message, while AGENTS.md remains contextual user content. This keeps different instruction sources in their intended layers.
 
-**Data flow**: Starts a mock server with a one-shot completion SSE, builds a harness with API-key auth, a pre-build hook writing `AGENTS.md` containing `be nice`, and `config.developer_instructions = Some("be useful")`, submits a turn, waits for completion, and inspects the request body. It asserts the top-level `instructions` field does not contain `be nice`, checks the first input item is a developer permissions message mentioning ``sandbox_mode``, scans all developer messages to find one containing `be useful`, then checks the second input item is a user contextual message containing the AGENTS fragment with `be nice` and an environment-context fragment.
+**Data flow**: It writes `AGENTS.md`, configures developer instructions as `be useful`, submits `hello`, and inspects the request. It expects a permissions developer message, another developer message containing `be useful`, and a user context message containing AGENTS.md plus environment context.
 
-**Call relations**: This test extends the user-instructions test by adding configured developer instructions and verifying they are kept in developer-role messages.
+**Call relations**: The test runner calls it. It uses `assert_message_role` and `message_input_texts`, just like the user-instructions test, but also checks the additional developer-instructions path.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, test_codex, assert_message_role, message_input_texts, from_api_key); 6 external calls (default, start, assert!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -639,11 +641,11 @@ async fn includes_developer_instructions_message_in_request()
 async fn azure_responses_request_includes_store_and_reasoning_ids()
 ```
 
-**Purpose**: Checks low-level request shaping for an Azure-style Responses provider: requests must include `store: true`, preserve item IDs and call IDs across many response-item types, and target `/openai/responses`. It validates the raw `ModelClient::stream` serialization path.
+**Purpose**: Checks Azure Responses API request details, especially `store: true` and preservation of ids across reasoning, message, search, tool-call, and shell-call items. Azure needs these fields to maintain stored response state correctly.
 
-**Data flow**: Starts a mock server with a minimal created/completed SSE body, constructs a `ModelProviderInfo` named `azure` with base URL ending in `/openai`, loads default config and offline model info, creates a `ThreadId`, auth manager, session telemetry, and `ModelClient`, builds deterministic responses metadata, and constructs a `Prompt` containing eight response items: reasoning, assistant message, web search call, function call, function-call output, local shell call, custom tool call, and custom-tool output, each with IDs/call IDs. It streams the prompt until completion, then inspects the captured request and asserts path `/openai/responses`, `store == true`, `stream == true`, input length 8, and that the expected IDs/call IDs appear in the corresponding serialized input items.
+**Data flow**: It builds a custom Azure-like provider and a prompt containing many different response item types with ids or call ids. It streams one request, then inspects the captured body to confirm the Azure path, store and stream flags, input length, and preserved ids.
 
-**Call relations**: This test bypasses the high-level harness because it needs precise control over the prompt item sequence and provider configuration.
+**Call relations**: The test runner invokes it. It uses lower-level `ModelClient` streaming directly, along with `test_turn_responses_metadata`, to focus on request serialization rather than full Codex thread orchestration.
 
 *Call graph*: calls 12 internal fn (new, default, auth_manager_from_auth, construct_model_info_offline, get_model_offline, mount_sse_once, test_turn_responses_metadata, from_api_key, new, from_text (+2 more)); 10 external calls (new, start, new, assert_eq!, concat!, load_default_config_for_test, format!, Exec, skip_if_no_network!, vec!).
 
@@ -654,11 +656,11 @@ async fn azure_responses_request_includes_store_and_reasoning_ids()
 async fn token_count_includes_rate_limits_snapshot()
 ```
 
-**Purpose**: Verifies that a successful streamed response with token-usage completion and rate-limit headers produces a `TokenCount` event containing both usage info and the latest rate-limit snapshot. It checks the full serialized event payload.
+**Purpose**: Tests that final token-count events include both usage numbers and the latest rate-limit snapshot from response headers. This lets the UI show not only how many tokens were used but also how close the user is to limits.
 
-**Data flow**: Starts a mock server whose POST `/v1/responses` response is an SSE completion with total tokens 123 plus several `x-codex-*` rate-limit headers, builds a harness using an API-key-auth OpenAI provider pointed at that server, submits a turn, waits for a `TokenCount` event whose `info` is present, serializes that event to JSON, and asserts it exactly matches the expected nested usage and rate-limit structure. It then extracts the usage and rate-limit snapshot from the event and asserts key fields like total tokens and primary used percent/reset time, before waiting for `TurnComplete`.
+**Data flow**: It makes the mock server return a streamed completion with token usage and rate-limit headers, submits `hello`, waits for a token-count event, and serializes that event to JSON. The event must include total and last token usage, model context window, and primary/secondary rate-limit windows.
 
-**Call relations**: This event-focused test validates how transport headers and completion usage are merged into the client’s token-count event stream.
+**Call relations**: The test runner calls it. It uses normal Codex turn submission, then listens for `EventMsg::TokenCount` before waiting for final turn completion.
 
 *Call graph*: calls 3 internal fn (sse, test_codex, from_api_key); 15 external calls (default, given, start, new, assert_eq!, built_in_model_providers, wait_for_event, format!, assert_eq!, to_value (+5 more)).
 
@@ -669,11 +671,11 @@ async fn token_count_includes_rate_limits_snapshot()
 async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a 429 `usage_limit_reached` error still emits a `TokenCount` event carrying rate-limit information before surfacing an error event. It validates error-path rate-limit reporting.
+**Purpose**: Checks that a 429 usage-limit error still produces a rate-limit event before the user-facing error. This gives clients enough information to explain limit status.
 
-**Data flow**: Starts a mock server whose POST `/v1/responses` returns 429 with several rate-limit headers and a JSON error body of type `usage_limit_reached`, builds a default harness, submits a turn, waits for a `TokenCount` event, serializes it to JSON, and asserts it contains `info: null` plus the expected rate-limit snapshot. It then waits for an `Error` event and asserts the message mentions `usage limit`.
+**Data flow**: It configures the mock server to return a 429 error with rate-limit headers and a usage-limit JSON body, submits `hello`, then waits for a token-count event and an error event. The token-count event should contain rate limits but no usage info, and the error should mention usage limit.
 
-**Call relations**: This test complements the successful rate-limit snapshot test by covering the error path where no token-usage info is available.
+**Call relations**: The test runner invokes it. It uses request mocking, Codex submission, and event waiting to verify both backend error parsing and frontend event emission.
 
 *Call graph*: calls 1 internal fn (test_codex); 14 external calls (default, given, start, new, assert!, wait_for_event, json!, assert_eq!, to_value, skip_if_no_network! (+4 more)).
 
@@ -684,11 +686,11 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()>
 async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that a context-window-exceeded error emits a `TokenCount` event whose total tokens equal the effective model context window, followed by the canonical context-window error message. It checks synthetic token accounting on this failure path.
+**Purpose**: Checks that when the model reports a context-window overflow, Codex emits token usage equal to the effective model window. This gives the UI a useful number even though the provider did not complete normally.
 
-**Data flow**: Starts a mock server with one matcher-based failed SSE response for requests containing `trigger context window` and one successful seed-turn response, builds a harness configured with model `gpt-5.4` and `model_context_window = 272_000`, submits a seed turn and waits for completion, submits the triggering turn, waits for a `TokenCount` event whose `info.total_token_usage.total_tokens` equals `info.model_context_window`, extracts the info and asserts both equal the effective 95% window, then waits for an `Error` event and asserts its message equals `CodexErr::ContextWindowExceeded.to_string()`, and finally waits for `TurnComplete`.
+**Data flow**: It sets a known model context window, completes one seed turn, then sends a second turn that receives a context-length failure stream. The test waits for token-count info where total tokens equal the effective window, then checks that the error event is the standard context-window-exceeded message.
 
-**Call relations**: This test targets a specific error translation path where the client synthesizes token usage from model context-window metadata.
+**Call relations**: The test runner calls it. It uses one successful mocked response and one failed mocked response to make sure the token accounting and error path work after conversation history exists.
 
 *Call graph*: calls 4 internal fn (mount_sse_once_match, sse, sse_failed, test_codex); 9 external calls (default, start, assert!, assert_eq!, wait_for_event, skip_if_no_network!, unreachable!, vec!, body_string_contains).
 
@@ -699,11 +701,11 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that a streamed `response.incomplete` event with `reason: content_filter` surfaces a specific stream-disconnected error message and does not trigger retries when retries are disabled. It validates incomplete-response handling.
+**Purpose**: Checks that an incomplete streamed response caused by content filtering becomes a clear error message. This protects users from seeing only a vague disconnected-stream failure.
 
-**Data flow**: Starts a mock server with an SSE body containing `response.created`, a partial message item plus text delta, and a final `response.incomplete` object with `incomplete_details.reason = content_filter`, builds a harness with `stream_max_retries = Some(0)`, submits a turn, waits for an `Error` event, asserts its message equals `stream disconnected before completion: Incomplete response returned, reason: content_filter`, asserts only one request hit the mock, then waits for `TurnComplete`.
+**Data flow**: It makes the mock server stream partial content followed by `response.incomplete` with reason `content_filter`, submits a turn, and waits for an error event. The expected message includes both the stream-disconnected framing and the content-filter reason, and the request should not be retried.
 
-**Call relations**: This test focuses on stream termination semantics and error messaging for incomplete Responses API streams.
+**Call relations**: The test runner invokes it. It uses the mock SSE helpers and event waiting to exercise the stream parser's incomplete-response branch.
 
 *Call graph*: calls 3 internal fn (mount_sse_once, sse, test_codex); 7 external calls (default, start, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -714,11 +716,11 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
 async fn azure_overrides_assign_properties_used_for_responses_url()
 ```
 
-**Purpose**: Verifies that provider query-parameter, header, and env-key overrides are all applied when constructing a Responses request URL and headers. It uses an Azure-like `/openai/responses` endpoint with `api-version` query param.
+**Purpose**: Checks that a custom Azure-like provider uses configured URL pieces, query parameters, headers, and environment-variable auth. This protects provider override support for non-default deployments.
 
-**Data flow**: Starts a mock server, mounts a POST `/openai/responses` expectation requiring query param `api-version=2025-04-01-preview`, header `Custom-Header: Value`, and `Authorization: Bearer <PATH env var>`, builds a harness with dummy ChatGPT auth but a custom provider whose `env_key` is `PATH`, `query_params` contains the API version, and `http_headers` contains the custom header, submits a turn, and waits for completion. The wiremock expectation enforces the correct request shape.
+**Data flow**: It configures a provider with base URL `/openai`, an `api-version` query parameter, a custom header, and an auth key read from an existing environment variable. After submitting `hello`, the mock server must receive exactly that path, query, header, and bearer token.
 
-**Call relations**: This test validates provider override plumbing at the request-construction layer; it relies on server-side expectations rather than explicit post-hoc request inspection.
+**Call relations**: The test runner calls it. It uses `create_dummy_codex_auth` for loaded auth but expects the provider environment key to supply the request authorization.
 
 *Call graph*: calls 3 internal fn (sse, test_codex, create_dummy_codex_auth); 14 external calls (default, given, start, new, wait_for_event, format!, skip_if_no_network!, from, vec!, header (+4 more)).
 
@@ -729,11 +731,11 @@ async fn azure_overrides_assign_properties_used_for_responses_url()
 async fn env_var_overrides_loaded_auth()
 ```
 
-**Purpose**: Checks that a provider `env_key` bearer token overrides any loaded auth credentials when constructing the request. It uses the same Azure-like request shape as the previous test.
+**Purpose**: Checks that a provider environment-variable key overrides already loaded ChatGPT auth for the outgoing request. This matters for custom providers that should use their own token source.
 
-**Data flow**: Starts a mock server, mounts the same `/openai/responses` expectation requiring the `PATH`-derived bearer token plus query/header overrides, builds a harness with dummy ChatGPT auth and a custom provider specifying `env_key = PATH`, submits a turn, and waits for completion. Success of the wiremock expectation proves the env-var token was used instead of loaded auth.
+**Data flow**: It configures a provider whose auth token comes from an existing environment variable, while also building Codex with dummy ChatGPT auth. The submitted request must use the environment-variable bearer token, plus the configured path, query parameter, and custom header.
 
-**Call relations**: This test complements the previous provider-override test by emphasizing credential precedence rather than just URL/header shaping.
+**Call relations**: The test runner invokes it. It mirrors the Azure override test and uses `create_dummy_codex_auth` to prove loaded auth does not take precedence over the provider's env key.
 
 *Call graph*: calls 3 internal fn (sse, test_codex, create_dummy_codex_auth); 14 external calls (default, given, start, new, wait_for_event, format!, skip_if_no_network!, from, vec!, header (+4 more)).
 
@@ -744,11 +746,11 @@ async fn env_var_overrides_loaded_auth()
 fn create_dummy_codex_auth() -> CodexAuth
 ```
 
-**Purpose**: Creates a canned ChatGPT-style auth object for tests that need non-API-key auth without performing real login. It is a tiny wrapper around the testing constructor.
+**Purpose**: Creates fake ChatGPT-style authentication for tests. It avoids real login while still exercising code paths that depend on ChatGPT auth being present.
 
-**Data flow**: Calls `CodexAuth::create_dummy_chatgpt_auth_for_testing()` and returns the resulting `CodexAuth`.
+**Data flow**: It takes no input, calls the auth library's testing constructor, and returns a `CodexAuth` value containing dummy ChatGPT credentials.
 
-**Call relations**: Several ChatGPT-auth tests call this helper to keep setup concise and consistent.
+**Call relations**: Several ChatGPT-auth and provider-override tests call this before building Codex. It centralizes the fake-auth setup so each test can focus on request behavior.
 
 *Call graph*: calls 1 internal fn (create_dummy_chatgpt_auth_for_testing); called by 5 (azure_overrides_assign_properties_used_for_responses_url, chatgpt_auth_sends_correct_request, env_var_overrides_loaded_auth, includes_apps_guidance_as_developer_message_for_chatgpt_auth, omits_apps_guidance_when_configured_off).
 
@@ -759,20 +761,24 @@ fn create_dummy_codex_auth() -> CodexAuth
 async fn history_dedupes_streamed_and_final_messages_across_turns()
 ```
 
-**Purpose**: Verifies that conversation history sent on later turns contains one copy of each assistant message even when the original turn streamed deltas and then emitted a final assistant message with the same content. It checks deduplication across multiple turns.
+**Purpose**: Tests that Codex does not duplicate assistant messages when a response arrives first as streamed text deltas and then again as a final message item. Without this, conversation history sent on later turns could contain repeated assistant replies.
 
-**Data flow**: Starts a mock server with three identical SSE responses, each streaming an empty message item, several output-text deltas forming `Hey there!\n`, then a final assistant message with the same text and completion. It builds a harness with API-key auth, submits turns `U1`, `U2`, and `U3` sequentially, waiting for completion each time, then inspects the three captured requests. After asserting there are three `/v1/responses` requests, it takes the third request’s `input` array, slices off the tail equal in length to a hard-coded expected JSON array, and asserts that tail equals the expected sequence: user `U1`, assistant `Hey there!`, user `U2`, assistant `Hey there!`, user `U3`.
+**Data flow**: It sets up three sequential mock streamed responses that each emit deltas and the same final assistant message, submits user turns `U1`, `U2`, and `U3`, then inspects the third request. The tail of the third request must contain each user turn and one assistant message per completed prior turn, with no duplicate from streaming.
 
-**Call relations**: This top-level history test uses repeated identical streamed responses to prove the client stores only the final assistant message in replayed history rather than both deltas and final content.
+**Call relations**: The test runner calls it. It uses `mount_sse_sequence` to capture all three requests and verifies the accumulated history after multiple complete Codex turns.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, sse, test_codex, from_api_key); 7 external calls (default, start, assert_eq!, wait_for_event, json!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/responses_headers.rs`
 
-`test` · `integration test execution around outbound Responses API requests`
+`test` · `test run`
 
-The tests build real `ModelClient` or `TestCodex` fixtures against a wiremock SSE server and then inspect the captured outbound requests. Two small helpers support this: `normalize_git_remote_url` trims whitespace, trailing slashes, and an optional `.git` suffix so remote URLs can be compared robustly, and `test_turn_responses_metadata` constructs deterministic `CodexResponsesMetadata` using a fixed installation ID and a window id of `{thread_id}:0`. The first two tests create a `ModelProviderInfo` configured for `WireApi::Responses`, load a default test config, derive offline model info, create `SessionTelemetry`, and stream a trivial prompt until `ResponseEvent::Completed`; they then assert that `x-openai-subagent`, `x-codex-window-id`, and client metadata fields reflect `SessionSource::SubAgent(SubAgentSource::Review)` or `Other("my-task")`. The override test follows the same path but sets `config.model_supports_reasoning_summaries = Some(true)` and `config.model_reasoning_summary = Some(ReasoningSummary::Detailed)`, then confirms the serialized request body contains `reasoning.summary = "detailed"`. The largest test uses `test_codex()` instead of raw `ModelClient` to verify `x-codex-turn-metadata` across turns. It first captures a baseline turn, then initializes a real git repository in the test cwd, commits a file, adds an `origin` remote, and submits another turn that triggers two model requests in one turn. It asserts that both requests share the same `turn_id` and `turn_started_at_unix_ms`, that the new turn id differs from the baseline turn, and that workspace metadata includes the latest commit hash, normalized remote URL, and `has_changes = false`.
+When Codex talks to a model provider, it does not only send the user’s prompt. It also sends small pieces of context in HTTP headers and request metadata. These details tell the service where the request came from, which conversation turn it belongs to, whether it was started by a sub-agent, and what workspace state Codex is working in. If these values are missing or wrong, server-side logging, routing, debugging, and product behavior can become confused even though the text prompt itself looks fine.
+
+This test file uses a mock Responses API server, which is like a fake checkout counter that records exactly what Codex sends. Each test builds a small Codex client or test session, sends a simple prompt, waits for the fake streaming response to finish, and then inspects the recorded request.
+
+The tests cover several real-world cases. They check that review sub-agents and named sub-agents add the expected `x-openai-subagent` header. They check that model settings from configuration can override default model information and cause reasoning summary data to be sent. The larger end-to-end test creates a temporary Git repository and verifies that turn metadata includes stable per-turn IDs, timestamps, sandbox status, and Git workspace facts such as the latest commit and remote URL. In short, this file makes sure the invisible envelope around a model request is correct.
 
 #### Function details
 
@@ -782,11 +788,11 @@ The tests build real `ModelClient` or `TestCodex` fixtures against a wiremock SS
 fn normalize_git_remote_url(url: &str) -> String
 ```
 
-**Purpose**: Normalizes git remote URLs for comparison in assertions by removing superficial formatting differences. It specifically strips surrounding whitespace, a trailing slash, and a terminal `.git` suffix if present.
+**Purpose**: This helper makes two Git remote URLs easier to compare by removing harmless differences. It trims whitespace, removes a trailing slash, and ignores a final `.git` suffix.
 
-**Data flow**: Accepts `url: &str` → computes `normalized = url.trim().trim_end_matches('/')`, then removes a `.git` suffix when available and converts the result to an owned `String` → returns the normalized string without mutating external state.
+**Data flow**: It receives a remote URL as text. It cleans the text in a few simple ways, then returns the cleaned version as a new string. It does not change anything outside itself.
 
-**Call relations**: This helper is used only inside the git workspace metadata test to compare the captured remote URL against the expected `origin` URL without failing on equivalent formatting variants.
+**Call relations**: The Git workspace test uses this when comparing the remote URL found in request metadata with the URL reported by Git. This keeps the test focused on whether Codex found the right remote, not on minor formatting differences.
 
 
 ##### `test_turn_responses_metadata`  (lines 37–53)
@@ -799,11 +805,11 @@ fn test_turn_responses_metadata(
 ) -> codex_core::CodexResponsesMetadata
 ```
 
-**Purpose**: Builds deterministic turn-scoped Responses metadata for tests using a fixed installation id and a synthetic window id derived from the thread id. It keeps the metadata assertions stable across runs.
+**Purpose**: This helper builds predictable Responses API metadata for a single test turn. It gives the tests stable values, such as a fixed installation ID and a window ID based on the thread ID, so assertions can be exact.
 
-**Data flow**: Accepts a `&ModelClient` (unused except for signature parity), a `ThreadId`, and a `&SessionSource` → converts the thread id to string, derives `window_id = format!("{thread_id}:0")`, and passes those values plus `TEST_INSTALLATION_ID`, `turn_id = None`, `parent_thread_id = None`, and `TestCodexResponsesRequestKind::Turn` into `core_test_support::responses_metadata` → returns `codex_core::CodexResponsesMetadata`.
+**Data flow**: It receives a model client, a thread ID, and the session source. It turns the thread ID into text, combines it with a fixed installation ID and turn-related values, and returns a `CodexResponsesMetadata` object used when sending a model request.
 
-**Call relations**: The three `ModelClient`-based tests call this during setup before opening a stream. It acts as a stable metadata factory so those tests can focus on header/body assertions rather than reconstructing the metadata payload inline.
+**Call relations**: The sub-agent and model-override tests call this before opening a response stream. The returned metadata is passed into the client’s streaming call, and the tests later confirm that the resulting HTTP request contains the expected headers and body metadata.
 
 *Call graph*: called by 3 (responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review); 3 external calls (responses_metadata, format!, to_string).
 
@@ -814,11 +820,11 @@ fn test_turn_responses_metadata(
 async fn responses_stream_includes_subagent_header_on_review()
 ```
 
-**Purpose**: Verifies that a Responses stream initiated from the review subagent sends the correct `x-openai-subagent` header and matching Codex metadata fields. It also checks that unrelated headers like sandbox and parent-thread id are absent in this scenario.
+**Purpose**: This test proves that when a request comes from the built-in review sub-agent, Codex labels the outgoing model request with `x-openai-subagent: review`. It also checks related request metadata such as the Codex window ID and installation ID.
 
-**Data flow**: Starts a mock SSE server, mounts a request matcher requiring `x-openai-subagent: review`, constructs a `ModelProviderInfo` for the mock `/v1` endpoint, loads and adjusts test config, derives offline model and model info, creates a fresh `ThreadId`, `SessionTelemetry`, `ModelClient`, deterministic responses metadata, and a simple user `Prompt`, then streams until a `ResponseEvent::Completed` arrives → inspects the single recorded request and asserts exact header and JSON body metadata values → returns `()` via test success.
+**Data flow**: The test starts a mock server that expects the review sub-agent header. It builds a temporary configuration, creates a model client for a review sub-agent session, sends a small user message, waits for the fake stream to complete, and then reads the recorded request. The final assertions compare the recorded headers and JSON body fields with the expected values.
 
-**Call relations**: The Tokio test harness invokes this directly. It delegates metadata construction to `test_turn_responses_metadata` and uses the `ModelClient` streaming path rather than `TestCodex`, making it a focused transport-level assertion for review-subagent labeling.
+**Call relations**: This is one of the direct test cases in the file. It uses the shared metadata helper to prepare turn metadata, then relies on the mock Responses server to capture what the lower-level streaming client actually sent.
 
 *Call graph*: calls 11 internal fn (new, default, construct_model_info_offline, get_model_offline, mount_sse_once_match, sse, start_mock_server, test_turn_responses_metadata, new, new (+1 more)); 10 external calls (new, new, SubAgent, assert_eq!, load_default_config_for_test, skip_if_no_network!, format!, matches!, vec!, header).
 
@@ -829,11 +835,11 @@ async fn responses_stream_includes_subagent_header_on_review()
 async fn responses_stream_includes_subagent_header_on_other()
 ```
 
-**Purpose**: Checks the same subagent-header behavior as the review test, but for `SessionSource::SubAgent(SubAgentSource::Other("my-task"))`. It ensures arbitrary subagent names are propagated verbatim into the outbound header.
+**Purpose**: This test proves that a custom-named sub-agent is also reported to the model service. In this case, the outgoing request should contain `x-openai-subagent: my-task`.
 
-**Data flow**: Builds the same mock Responses setup and offline client stack as the review test, but uses `SubAgentSource::Other("my-task".to_string())` for the session source and mounts a matcher for `x-openai-subagent: my-task` → streams a trivial prompt to completion and then asserts the captured request header equals `Some("my-task")` → no persistent state is modified.
+**Data flow**: The test starts a mock server that matches the custom sub-agent header. It creates a temporary model configuration and a client whose session source is a custom sub-agent named `my-task`. After sending a simple prompt and reading the streaming response to completion, it inspects the captured request and checks that the header value is exactly the custom name.
 
-**Call relations**: This test is a sibling of the review-subagent test and is invoked directly by the harness. It reuses `test_turn_responses_metadata` and the same `ModelClient` flow to cover the alternate subagent variant.
+**Call relations**: This mirrors the review sub-agent test, but uses the more general custom sub-agent path. It calls the shared metadata builder, then exercises the same streaming request path that production code uses.
 
 *Call graph*: calls 11 internal fn (new, default, construct_model_info_offline, get_model_offline, mount_sse_once_match, sse, start_mock_server, test_turn_responses_metadata, new, new (+1 more)); 11 external calls (new, new, SubAgent, assert_eq!, load_default_config_for_test, skip_if_no_network!, format!, matches!, Other, vec! (+1 more)).
 
@@ -844,11 +850,11 @@ async fn responses_stream_includes_subagent_header_on_other()
 async fn responses_respects_model_info_overrides_from_config()
 ```
 
-**Purpose**: Ensures that config-driven model-info overrides affect the serialized Responses request body, specifically the reasoning-summary settings. It proves that enabling summaries in config causes a `reasoning` object with `summary: detailed` to be sent.
+**Purpose**: This test checks that configuration can override the default model information used when building a Responses API request. In particular, it verifies that enabling reasoning summaries in config causes a detailed reasoning summary setting to appear in the request body.
 
-**Data flow**: Creates a mock SSE server and recorder, builds a `ModelProviderInfo`, loads default config, overrides `model`, `model_provider`, `model_supports_reasoning_summaries`, and `model_reasoning_summary`, derives auth mode from a test API key, constructs offline model info and session telemetry, creates a `ModelClient`, deterministic responses metadata, and a simple prompt, then streams until completion → reads the captured request JSON, extracts the optional `reasoning` object, and asserts it exists and contains `summary == "detailed"` → returns `()` on success.
+**Data flow**: The test creates a mock server and a temporary configuration where the model is set to `gpt-3.5-turbo`, reasoning summaries are marked as supported, and the desired summary level is `Detailed`. It sends a prompt through a model client, captures the outgoing request, reads the JSON body, and checks that the `reasoning.summary` field is present and set to `detailed`.
 
-**Call relations**: The harness runs this as a focused serialization test. Like the subagent tests, it uses `test_turn_responses_metadata` and the raw `ModelClient` stream path, but its assertions target body fields derived from config/model-info interaction rather than headers.
+**Call relations**: This test uses the same streaming machinery as the header tests, but focuses on the request body rather than only HTTP headers. It calls the shared metadata helper and the offline model-info constructor so it can confirm that configuration choices make it all the way into the API request.
 
 *Call graph*: calls 12 internal fn (new, default, auth_manager_from_auth, construct_model_info_offline, mount_sse_once, sse, start_mock_server, test_turn_responses_metadata, from_api_key, new (+2 more)); 11 external calls (new, new, SubAgent, assert!, assert_eq!, load_default_config_for_test, skip_if_no_network!, format!, matches!, Other (+1 more)).
 
@@ -859,22 +865,26 @@ async fn responses_respects_model_info_overrides_from_config()
 async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e()
 ```
 
-**Purpose**: Exercises full-turn metadata generation in `TestCodex`, including stable per-turn identifiers and git workspace details once the cwd becomes a repository. It verifies both the baseline no-git case and the richer metadata emitted after repository initialization.
+**Purpose**: This end-to-end test checks that Codex attaches turn metadata to Responses API requests, including Git workspace details when the current folder is a Git repository. It confirms that every request in one user turn shares the same turn identity and timestamp.
 
-**Data flow**: Starts a mock SSE server, builds a `TestCodex` fixture, submits an initial turn against a one-shot SSE response, parses the `x-codex-turn-metadata` header from that request, and records the initial `turn_id` and `turn_started_at_unix_ms`. It then creates an isolated git config file, runs a sequence of `git` commands in the fixture cwd to initialize a repo, commit `README.md`, and add an `origin` remote, capturing expected HEAD and remote URL. Next it mounts a two-request response sequence for a single turn, submits another turn, collects both recorded requests, parses each `x-codex-turn-metadata` JSON header, and asserts shared turn id/timestamp within the turn, a new turn id relative to the baseline, sandbox/thread-source values, and workspace metadata including commit hash, normalized origin URL, and `has_changes = false` → returns `()` on success.
+**Data flow**: The test starts a mock server and a full test Codex session, then sends an initial prompt and checks that basic turn metadata is present. It then creates a real temporary Git repository, commits a file, adds an `origin` remote, and records the expected commit hash and remote URL. Next it sends another prompt that causes two model requests in the same turn, captures both requests, parses their `x-codex-turn-metadata` headers as JSON, and verifies shared turn fields, sandbox status, and workspace facts such as commit hash, remote URL, and whether there are uncommitted changes.
 
-**Call relations**: This test is invoked directly by the harness and differs from the others by using the higher-level `test_codex` orchestration instead of a raw `ModelClient`. It relies on `normalize_git_remote_url` only for the remote URL comparison after the git repository has been created.
+**Call relations**: Unlike the smaller client-level tests, this one drives a fuller Codex test harness. It uses mock response sequences to make one turn produce multiple requests, then checks that the orchestration around a real turn keeps metadata consistent across those requests and enriches it with Git information.
 
 *Call graph*: calls 5 internal fn (mount_response_sequence, mount_sse_once, sse, start_mock_server, test_codex); 8 external calls (from_utf8, assert!, assert_eq!, assert_ne!, skip_if_no_network!, from_str, write, vec!).
 
 
 ### `core/tests/suite/request_compression.rs`
 
-`test` · `integration test execution during outbound request serialization`
+`test` · `test execution`
 
-This small test module targets request-body compression behavior behind the `EnableRequestCompression` feature flag. Both tests stand up a mock SSE server, submit a trivial `Op::UserInput`, wait for `EventMsg::TurnComplete`, and then inspect the captured HTTP request body sent to the mock backend. The distinction under test is authentication mode: when the client is configured with dummy ChatGPT auth and a Codex backend-style base URL (`/backend-api/codex/v1`), the request should carry `content-encoding: zstd`; when the same feature is enabled but the client uses the default API-key-style path, the request should remain plain JSON.
+This is a test file, active only on non-Windows systems. It checks the exact HTTP request that Codex sends to a fake server. Think of the fake server like a mailroom camera: it lets the test inspect the package Codex mailed, including its label and contents.
 
-The compressed-path test goes beyond header inspection by decoding the raw bytes with `zstd::stream::decode_all` and parsing the result as JSON, asserting that the decoded payload contains an `input` field consistent with a Responses API request. The uncompressed-path test similarly parses the raw body bytes directly as JSON and checks for the same field. Together, the pair ensures compression is gated not just by the feature flag but also by backend/auth selection, and that enabling compression does not corrupt the serialized request body.
+Both tests start a mock server that replies with a short stream of server-sent events. Server-sent events are a simple way for a server to send progress messages over one open HTTP response. The tests then build a test Codex instance, point it at the mock server, submit a small user message, and wait until Codex reports that the turn is complete. Waiting matters because it proves the outgoing request has actually reached the mock server.
+
+The first test enables the request-compression feature and uses dummy ChatGPT/Codex-backend authentication. It expects the outgoing request to include the `content-encoding: zstd` header, then decompresses the body and checks that it is valid Responses API JSON.
+
+The second test also enables the feature, but leaves Codex using API-key style authentication. It expects no compression header and checks that the raw body is already readable JSON. Together, these tests make sure compression is applied only in the intended authentication path.
 
 #### Function details
 
@@ -884,11 +894,11 @@ The compressed-path test goes beyond header inspection by decoding the raw bytes
 async fn request_body_is_zstd_compressed_for_codex_backend_when_enabled() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that enabling request compression causes Responses API requests to the Codex backend to be sent with zstd compression when ChatGPT auth is in use.
+**Purpose**: This test proves that when request compression is enabled and Codex is using ChatGPT-style backend authentication, the request body is sent with zstd compression. It also proves the compressed bytes still contain the expected Responses API JSON once decompressed.
 
-**Data flow**: Starts a mock server, mounts a one-shot SSE completion, builds a `TestCodex` with dummy ChatGPT auth, enables `Feature::EnableRequestCompression`, points `config.model_provider.base_url` at the mock server's `/backend-api/codex/v1` path, submits a text-only `Op::UserInput`, waits for `TurnComplete`, inspects the captured request header `content-encoding`, decodes the compressed body with zstd, parses the decompressed bytes as JSON, and asserts the payload contains an `input` field.
+**Data flow**: The test starts by skipping itself if network-style tests are unavailable. It creates a mock server, installs one fake streaming response, and records the request Codex sends. It builds a test Codex instance with dummy ChatGPT authentication, turns on the request-compression feature, and points Codex at the mock backend URL. After submitting the text `compress me`, it waits for the turn to finish, reads the single captured request, checks that the `content-encoding` header says `zstd`, decompresses the body, parses it as JSON, and confirms the JSON has an `input` field. The result is success if all checks pass, or a test failure/error if any step is wrong.
 
-**Call relations**: This is the positive compression-path test; it drives the full request pipeline and then validates both transport metadata and payload integrity from the captured mock request.
+**Call relations**: The Tokio test runner calls this function as an asynchronous test. Inside, it relies on the test support helpers to start the mock server, mount a one-time streaming response, build a test Codex instance, and wait for the completion event. After Codex submits the user input and the mock server captures the outgoing request, this function performs the final inspection itself: it verifies the compression header, decodes the body with zstd, and checks the decoded JSON.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, create_dummy_chatgpt_auth_for_testing, new); 9 external calls (default, assert!, assert_eq!, wait_for_event, format!, from_slice, skip_if_no_network!, vec!, decode_all).
 
@@ -899,22 +909,24 @@ async fn request_body_is_zstd_compressed_for_codex_backend_when_enabled() -> any
 async fn request_body_is_not_compressed_for_api_key_auth_even_when_enabled() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that the compression feature does not apply to the API-key auth path, even when the feature flag is enabled and the backend URL resembles the Codex backend.
+**Purpose**: This test proves that simply enabling the compression feature is not enough to compress every request. When Codex is using API-key authentication, the request body should stay uncompressed.
 
-**Data flow**: Starts a mock server, mounts a one-shot SSE completion, builds a `TestCodex` without ChatGPT auth but with `Feature::EnableRequestCompression` enabled and the same `/backend-api/codex/v1` base URL, submits a text-only `Op::UserInput`, waits for `TurnComplete`, asserts the captured request has no `content-encoding` header, parses the raw body bytes directly as JSON, and checks for an `input` field.
+**Data flow**: The test first skips itself if the environment cannot run the needed network-style test. It starts a mock server, attaches one fake streaming response, and keeps a log of the request. It builds a test Codex instance without ChatGPT-style auth, enables request compression in the config, and points Codex at the mock backend URL. After submitting the text `do not compress`, it waits until Codex reports the turn is complete. It then reads the captured request, checks that there is no `content-encoding` header, parses the raw request body directly as JSON, and confirms the JSON has an `input` field. The result is success only if the request remained plain JSON.
 
-**Call relations**: This is the negative counterpart to the compressed-path test and proves that auth mode, not just URL shape plus feature flag, controls compression.
+**Call relations**: The Tokio test runner calls this function as an asynchronous test. Like the compression test, it uses the shared test helpers to create the mock server, prepare the fake server-sent event response, build Codex, and wait for the turn-complete event. The important difference is that it does not add dummy ChatGPT backend authentication, so after Codex sends the request, this function verifies that the lower-level request-sending code chose not to hand the body through zstd compression.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 7 external calls (default, assert!, wait_for_event, format!, from_slice, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/models_etag_responses.rs`
 
-`test` · `startup catalog fetch and mid-turn request handling`
+`test` · `automated test run`
 
-This single-test module sets up a full two-request tool-execution flow to prove that model-catalog refreshes are deduplicated across a turn. On startup, Codex fetches `/v1/models` and stores `ETAG_1`. The test then mounts a first `/responses` SSE stream that emits a shell-command tool call and includes `X-Models-Etag: ETAG_2`, which should trigger a catalog refresh because the response ETag differs from the cached one. A second `/responses` stream, representing the tool-output follow-up request, also carries `ETAG_2`; by that point the refresh should already have happened, so no second `/models` fetch should occur.
+This test protects a small but important piece of network behavior. Codex keeps a catalog of available models, fetched from the server’s `/v1/models` endpoint. The server labels that catalog with an ETag, which is like a version sticker on a document. Later, when Codex calls `/responses`, the server can send an `X-Models-Etag` header. If that header has a different sticker than the one Codex stored, Codex should know the model catalog changed and fetch `/v1/models` again.
 
-The test builds an authenticated session with retries minimized for determinism and disables the Apps feature to keep the tool path simple. It submits an explicit `Op::UserInput` with local environment selections and disabled permissions, waits for `TurnComplete`, then inspects the `/models` mocks and the tool-output request. Assertions verify the initial spawn fetch happened once, the mismatch-triggered refresh happened once at `/v1/models`, the refresh request included a `client_version` query parameter, and the tool-output request succeeded without causing another catalog fetch.
+The test starts a fake HTTP server, so it can control every response Codex sees. First it makes Codex start up and fetch the model list with one ETag. Then it sends a user request that produces a tool call, while the fake `/responses` reply includes a different model ETag. That mismatch should trigger exactly one refresh of `/v1/models`.
+
+Next, the test simulates the follow-up response after the tool output. This response carries the same new ETag. Since Codex has already refreshed to that version, it should not fetch the model list again. The final checks make sure the refresh happened once, used the expected `/v1/models` path, included the normal client version query parameter, and did not repeat unnecessarily.
 
 #### Function details
 
@@ -924,11 +936,11 @@ The test builds an authenticated session with retries minimized for determinism 
 async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch() -> Result<()>
 ```
 
-**Purpose**: Simulates a turn where the first `/responses` reply advertises a new models ETag and the second reply repeats that same ETag, then proves Codex refreshes `/models` only once. It also checks that the refresh uses the dedicated models client by requiring a `client_version` query parameter.
+**Purpose**: This test verifies that Codex refreshes its model catalog when a `/responses` reply reports a newer model ETag, and that it avoids a duplicate refresh when later replies report that same ETag. It is used to catch regressions in the logic that keeps the local model list in sync with the server.
 
-**Data flow**: The test defines two ETag constants and a shell-call id, mounts an initial `/models` response with `ETAG_1`, builds an authenticated session, and asserts the spawn-time `/v1/models` request occurred. It then mounts a second `/models` response with `ETAG_2`, a first `/responses` SSE stream that emits `ev_shell_command_call` plus header `X-Models-Etag: ETAG_2`, and a second `/responses` SSE stream for tool output with the same header. After submitting an explicit `Op::UserInput` and waiting for `TurnComplete`, it asserts the refresh `/models` mock saw exactly one request, that the request path is `/v1/models`, that its URL query contains `client_version`, and that the tool-output request exists while the refresh count remains one.
+**Data flow**: The test starts with a fake server, dummy authentication, and a Codex test instance configured to avoid retries so the result is predictable. It feeds Codex an initial `/v1/models` response with one ETag, then a streamed `/responses` reply with a different ETag and a shell tool call, then another streamed `/responses` reply with the same new ETag and a final assistant message. After Codex finishes the turn, the test inspects the fake server’s recorded requests: the model list must have been fetched once at startup, refreshed once after the mismatch, and not fetched a third time.
 
-**Call relations**: This is the file’s only top-level test. It drives the full request chain itself using mock mounts and event waiting, with no local helper functions beyond the imported test support.
+**Call relations**: During the test setup, it calls helpers that create the fake Codex instance, dummy login, local working-directory selection, permission settings, model-list responses, and streamed response bodies. Once the user input is submitted to Codex, the normal Codex turn machinery runs against the fake server. The test then waits for the turn-complete event and uses the mock server’s recorded requests to confirm the expected network behavior.
 
 *Call graph*: calls 8 internal fn (mount_models_once_with_etag, mount_response_once, sse, sse_response, local_selections, test_codex, turn_permission_fields, create_dummy_chatgpt_auth_for_testing); 10 external calls (clone, default, from_secs, start, new, assert!, assert_eq!, wait_for_event_with_timeout, skip_if_no_network!, vec!).
 
@@ -938,11 +950,15 @@ These suites exercise websocket and realtime session behavior, from request fram
 
 ### `core/tests/suite/agent_websocket.rs`
 
-`test` · `request handling during websocket integration tests`
+`test` · `test run`
 
-This file contains end-to-end websocket transport tests built around `start_websocket_server` fixtures that record each request body and handshake. The tests all skip when networked integration is unavailable. The basic shell-chain case verifies that a model-issued shell command over websocket causes Codex to send a second `response.create` containing tool output. The first-turn tests assert that websocket sessions begin with a non-generating startup prewarm request (`generate: false`) whose `x-codex-turn-metadata` marks `request_kind: prewarm`, followed by the actual turn request with populated tools and `request_kind: turn`. A delayed-handshake variant ensures the first user turn tolerates websocket startup latency.
+These tests act like a mock model service and watch what Codex sends to it. A WebSocket is like keeping a phone call open instead of making a new call for every message. That matters here because Codex may send an early “prewarm” request when it starts, then later send the user’s real prompt, tool results, and follow-up turns over the same connection.
 
-The v2 tests enable `Feature::ResponsesWebsocketsV2` and check the protocol differences: the handshake must include `openai-beta: responses_websockets=2026-02-06`, the warmup response ID becomes the `previous_response_id` for the first real turn, and subsequent tool-output turns chain from the immediately prior response ID. Additional tests verify service-tier propagation across prewarm boundaries: a fast tier supplied only for the first turn appears as `service_tier: "priority"` on that turn but not on warmup, a configured fast tier can be dropped by an explicit `None`, and later turns can independently update or clear the service tier without inheriting stale values.
+The file uses test helpers to start a fake WebSocket server. The fake server is given scripted events to send back, such as “a response was created,” “run this shell command,” “assistant says done,” and “response completed.” Codex is then started in test mode and pointed at that server. Each test submits one or more user turns and then inspects the JSON requests Codex sent.
+
+The tests cover two protocol styles. The older path sends turns without the newer v2 rules. The v2 path, enabled by a feature flag, adds a beta header, uses startup prewarming, and has different expectations around previous response IDs and service tiers. The service tier is the requested speed/priority level, such as a fast “priority” request.
+
+Without these tests, small changes in WebSocket startup, request metadata, shell-command chaining, or service-tier overrides could silently break real conversations with the model service.
 
 #### Function details
 
@@ -952,11 +968,11 @@ The v2 tests enable `Feature::ResponsesWebsocketsV2` and check the protocol diff
 async fn websocket_test_codex_shell_chain() -> Result<()>
 ```
 
-**Purpose**: Checks the basic websocket request/response chain for a shell-command tool call followed by a normal assistant reply. It ensures Codex emits two `response.create` requests on the same connection and includes non-empty input on the follow-up turn.
+**Purpose**: This test checks the basic WebSocket flow where the model asks Codex to run a shell command, then Codex sends the command result back in a second request. It proves that one user turn can become a small chain of WebSocket requests when tools are involved.
 
-**Data flow**: Starts a websocket fixture server configured to first emit a shell-command call and then an assistant message, builds a test harness with Windows shell support, submits a turn under the legacy sandbox policy, then inspects the recorded single connection. It asserts there are exactly two requests, both have `type == "response.create"`, and the second request’s `input` array exists and is non-empty before shutting down the server.
+**Data flow**: The test starts with a fake server scripted to first request an `echo websocket` shell command and then reply with a final assistant message. It builds a test Codex instance using a Windows-style command shell, submits the prompt “run the echo command,” and then reads the JSON requests captured by the server. The expected result is two `response.create` requests, with the second one carrying input items that continue the conversation after the shell command.
 
-**Call relations**: This top-level test drives the websocket transport through one tool round-trip. The server fixture supplies the shell call on the first request, causing Codex to execute the tool and send the second request that the test inspects.
+**Call relations**: At the start, the test asks the support code to start a WebSocket server and to build a Codex test instance. During the turn, Codex connects to that server, receives the scripted shell-command event, runs through its tool-call path, and sends another request back. The test then uses assertions to confirm that the server saw the expected two-step exchange before shutting the server down.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -967,11 +983,11 @@ async fn websocket_test_codex_shell_chain() -> Result<()>
 async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()>
 ```
 
-**Purpose**: Verifies that the first websocket-backed turn is preceded by a startup prewarm request and that both requests carry the expected metadata. It also confirms the actual turn request includes tools.
+**Purpose**: This test checks that Codex sends a startup prewarm request before the first real user turn. A prewarm request is a “get ready” message that does not ask the model to generate text yet.
 
-**Data flow**: Creates a websocket server that returns one warmup completion and one assistant response, builds a default test harness, submits a turn, and then inspects handshake and request logs. It asserts one handshake, two requests total, `warmup["type"] == "response.create"`, `warmup["generate"] == false`, parses `warmup["client_metadata"]["x-codex-turn-metadata"]` as JSON to verify `request_kind == "prewarm"` and matching `window_id`, checks the second request has a non-empty `tools` array and `type == "response.create"`, parses its turn metadata, and asserts `request_kind == "turn"`.
+**Data flow**: The fake server is prepared to answer two requests: a warmup request and then a real turn. Codex is started and the user submits “hello.” The test reads both captured JSON requests. The first must be a `response.create` request with `generate` set to false and metadata marking it as `prewarm`; the second must be a normal `response.create` turn with tools included and metadata marking it as a real `turn`.
 
-**Call relations**: This test exercises the startup path of websocket sessions. The fixture’s first response satisfies the prewarm request, after which Codex sends the real turn request that the test validates.
+**Call relations**: The test relies on the fake server to record exactly what Codex sends during startup and first-turn handling. It also parses the metadata JSON embedded inside the request so it can check that Codex labels the warmup and real turn correctly. This guards the handoff between startup preparation and actual user work.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 5 external calls (assert!, assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -982,11 +998,11 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()>
 async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> Result<()>
 ```
 
-**Purpose**: Ensures websocket startup prewarm still works when the server delays accepting the handshake. The key behavior is that turn submission waits correctly and still produces the expected warmup and turn requests.
+**Purpose**: This test checks that Codex still behaves correctly if opening the WebSocket connection is slow. It makes sure a delayed network handshake does not stop the startup prewarm and first real turn from being sent in order.
 
-**Data flow**: Starts a websocket server with explicit connection config including `accept_delay: 150ms`, then builds a harness and submits a turn. After completion it asserts one handshake, two requests, verifies the first request is a non-generating `response.create` warmup, and checks the second request is a `response.create` with a non-empty `tools` array before shutting down the server.
+**Data flow**: The fake server is configured to wait briefly before accepting the WebSocket connection. Codex is then started and asked to handle a “hello” turn. After Codex finishes, the test examines the captured requests. The output should still be two requests: a non-generating warmup request first, followed by a normal request with tools populated.
 
-**Call relations**: This top-level test targets transport timing rather than payload semantics. The delayed handshake forces Codex’s websocket startup path to tolerate connection latency before issuing the actual turn.
+**Call relations**: The test uses the header-capable fake server setup because that helper can also simulate connection delay. Codex must tolerate that delay while its startup and turn-processing paths overlap. The assertions verify that the slow handshake did not cause Codex to skip prewarming, lose tools, or send the wrong request type.
 
 *Call graph*: calls 2 internal fn (start_websocket_server_with_headers, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -997,11 +1013,11 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 async fn websocket_v2_test_codex_shell_chain() -> Result<()>
 ```
 
-**Purpose**: Validates the websocket v2 protocol for a shell-command chain, including warmup, response-ID chaining, function-call-output replay, and the required beta handshake header.
+**Purpose**: This test checks the newer WebSocket v2 path for a shell-command conversation. It confirms that v2 uses a startup warmup, sends the required beta header, links requests with previous response IDs, and returns shell command output in the follow-up request.
 
-**Data flow**: Starts a websocket server that emits a warmup completion, then a shell-command call, then a final assistant message. It builds a harness with Windows shell support and enables `ResponsesWebsocketsV2`, submits a turn, and inspects the recorded connection and handshake. The test asserts three requests total: warmup with `generate: false`, first real turn with `previous_response_id == "warm-1"` and non-empty input, and second turn with `previous_response_id == "resp-1"`. It then scans the second turn’s `input` array for a `function_call_output` item whose `call_id` matches the shell call, and finally asserts the handshake contains the exact `openai-beta` header value.
+**Data flow**: The test enables the WebSocket v2 feature flag, starts a fake server with three scripted stages, and submits a prompt that should cause a shell command. The server first receives a warmup request, then a request for the user’s turn, then a follow-up request after the command runs. The test checks that the warmup does not generate text, that later requests are `response.create`, that response IDs are linked as expected, that the command output includes the original call ID, and that the handshake includes the v2 beta header.
 
-**Call relations**: This test covers the v2 websocket flow where each new `response.create` references the prior response. The fixture’s shell-command event forces Codex to send the chained follow-up request containing tool output.
+**Call relations**: This test sits on the feature-flagged v2 route. The test builder turns that route on before Codex connects to the fake server. The scripted server drives Codex through warmup, tool call, and tool-result submission, while the final assertions confirm both the message bodies and the WebSocket handshake header expected by the v2 protocol.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1012,11 +1028,11 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()>
 async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() -> Result<()>
 ```
 
-**Purpose**: Checks that a fast service tier requested for the first real turn is applied there, but not retroactively to the startup prewarm request. It also verifies that the first turn does not chain from the warmup response in this case.
+**Purpose**: This test checks that the first real WebSocket v2 turn can choose a fast service tier even after a startup warmup was already sent without one. It protects the rule that per-turn settings can override what happened during prewarm.
 
-**Data flow**: Starts a websocket server with warmup and one assistant response, enables websocket v2 in the harness, and waits for the first recorded request to inspect the warmup before submitting the user turn. It asserts the warmup is a non-generating `response.create` with no `service_tier`, then submits a turn with `Some(ServiceTier::Fast.request_value())`. After completion it inspects the second request and asserts `type == "response.create"`, `service_tier == "priority"`, `previous_response_id` is absent, and `input` is non-empty.
+**Data flow**: Codex starts with WebSocket v2 enabled. The fake server waits for the warmup request, and the test confirms that this warmup has no `service_tier`. Then the test submits “hello” with the fast tier requested. The captured first real turn should include `service_tier` set to `priority`, should not be tied to the warmup through `previous_response_id`, and should include input items.
 
-**Call relations**: The test splits observation into pre-submit warmup inspection and post-submit turn inspection to prove that per-turn service-tier overrides are applied only to the actual user turn, not to the startup prewarm.
+**Call relations**: The fake server lets the test inspect the warmup before the real prompt is submitted. Codex then receives a turn-specific service-tier choice through the test helper. The assertions show that Codex applies that updated choice to the actual user request rather than blindly reusing the startup warmup settings.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1027,11 +1043,11 @@ async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() 
 async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Result<()>
 ```
 
-**Purpose**: Verifies that an explicit `None` service-tier override on the first real turn clears a fast tier inherited from configuration, even though the startup prewarm used that configured tier. It ensures stale tier state is not carried forward.
+**Purpose**: This test checks the opposite service-tier case: if startup prewarm used the fast tier from configuration, the first real turn can still drop it. It makes sure a warmup preference does not accidentally stick to later user work.
 
-**Data flow**: Starts a warmup-plus-response websocket server, builds a harness with websocket v2 enabled and `config.service_tier` preset to fast, and inspects the warmup request before submitting the turn. It asserts the warmup has `generate: false` and `service_tier == "priority"`, then submits a turn with `service_tier` explicitly `None`. After completion it inspects the first real turn request and asserts `type == "response.create"`, `service_tier` is absent, `previous_response_id` is absent, and `input` is non-empty.
+**Data flow**: The test starts Codex with WebSocket v2 enabled and a configured fast service tier. The warmup request is captured first and should contain `service_tier` as `priority`. Then the user submits “hello” with no service tier for that turn. The first real turn should omit `service_tier`, should not include `previous_response_id`, and should still contain input items.
 
-**Call relations**: This test complements the previous one by proving that turn-level overrides can remove a configured tier after prewarm, rather than inheriting the warmup’s setting.
+**Call relations**: The test builder sets the initial configuration that affects startup. After that, the submitted turn deliberately passes no tier. The fake server records both requests, and the assertions confirm that Codex separates startup configuration from the later per-turn choice.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1042,22 +1058,26 @@ async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Resu
 async fn websocket_v2_next_turn_uses_updated_service_tier() -> Result<()>
 ```
 
-**Purpose**: Checks that service-tier selection is evaluated independently on successive websocket v2 turns after startup prewarm. A fast first turn should not force the second turn to remain fast.
+**Purpose**: This test checks that service-tier choices can change from one WebSocket v2 turn to the next. It proves Codex does not keep using a fast tier after a later turn stops asking for it.
 
-**Data flow**: Starts a websocket server with warmup and two assistant responses, enables websocket v2, inspects the warmup request to confirm no `service_tier`, then submits two turns: first with fast tier, second with `None`. It asserts one handshake and three requests total, then inspects the two real turn requests: the first must have `service_tier == "priority"`, no `previous_response_id`, and non-empty input; the second must omit `service_tier`, omit `previous_response_id`, and also have non-empty input.
+**Data flow**: The fake server is scripted for a warmup and two real turns. Codex starts with WebSocket v2 enabled, and the warmup is checked to have no service tier. The first submitted turn asks for the fast tier, so its request should contain `service_tier` as `priority`. The second submitted turn asks for no tier, so its request should omit `service_tier`. Both real turns should contain input items and should not carry `previous_response_id`.
 
-**Call relations**: This top-level test extends the service-tier checks across multiple user turns on the same websocket connection, confirming that each turn’s tier is recomputed rather than inherited from the previous turn.
+**Call relations**: The test drives Codex through a longer sequence: startup warmup, first user turn, then second user turn. Each submitted turn passes its own service-tier setting through the test helper. The captured requests let the test confirm that Codex reads the current turn’s setting each time instead of reusing the previous turn’s value.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/client_websockets.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This test file builds a reusable `WebsocketTestHarness` around a `ModelClient`, synthetic `SessionId`/`ThreadId`, offline `ModelInfo`, and `SessionTelemetry`, then drives `ModelClientSession::stream`, `preconnect_websocket`, and `prewarm_websocket` against `WebSocketTestServer`. The helpers construct canonical `CodexResponsesMetadata` for three request kinds—turn, prewarm, and websocket connection—so assertions can inspect the exact metadata and headers sent on the wire. The suite verifies handshake headers such as `OpenAI-Beta`, `x-client-request-id`, `session-id`, `thread-id`, `user-agent`, and optional timing-metrics headers; request bodies such as `response.create`, `previous_response_id`, `input`, `generate`, `tools`, reasoning context, and per-request client metadata; and event translation from websocket frames into `ResponseEvent` variants like `Completed`, `ServerReasoningIncluded`, `RateLimits`, and `ModelsEtag`.
+This is a test file, not production code. It builds a fake WebSocket server and then drives the real Codex model client against it. A WebSocket is like keeping a phone line open instead of making a new phone call for every message; these tests make sure Codex opens that line correctly, reuses it when it should, and sends the right information on each request.
 
-A major theme is connection lifecycle: one websocket should be reused across turns, across dropped `ModelClientSession`s, after explicit preconnect, and after prewarm, even when request headers differ. Another is incremental create logic: when a prompt is a prefix extension of a completed response, the client should send only the suffix plus `previous_response_id`; if non-input fields change or a prior websocket turn failed, it must fall back to a full create. The file also checks trace propagation via W3C trace context in `client_metadata`, runtime metrics accounting, remote timing-metrics ingestion, and retry/reconnect behavior for websocket-specific terminal errors such as connection-limit failures.
+The tests cover the ordinary streaming path, preconnects, prewarm requests, connection reuse across turns and dropped sessions, and the newer “v2” incremental request behavior. Incremental means that if a later prompt starts with the same conversation as an earlier one, the client can send only the new part plus a previous response id, instead of resending everything.
+
+The file also checks observability details: trace context, runtime metrics, timing headers, reasoning-included signals, model etags, and rate-limit events. Several tests simulate server-side errors to confirm that user-facing events are emitted and that recoverable WebSocket connection-limit errors cause a reconnect.
+
+Helper functions at the bottom create prompts, fake model provider settings, test harnesses, metadata, and small streaming loops. Without this suite, changes to WebSocket streaming could silently break request shape, connection reuse, telemetry, or error handling.
 
 #### Function details
 
@@ -1067,11 +1087,11 @@ A major theme is connection lifecycle: one websocket should be reused across tur
 fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTraceContext)
 ```
 
-**Purpose**: Validates that a websocket request body carries W3C trace context only inside `client_metadata`, with the expected `traceparent` and optional `tracestate` values.
+**Purpose**: Checks that a WebSocket request carries the expected tracing information in its client metadata. Tracing information is the breadcrumb trail used to connect logs and timing data from one logical request.
 
-**Data flow**: It reads a JSON request body plus an expected `W3cTraceContext`, extracts `client_metadata`, pulls the traceparent/tracestate keys defined by the websocket client-metadata constants, compares them to the expected values, and asserts that no top-level `trace` field was emitted.
+**Data flow**: It receives a JSON request body and an expected W3C trace context. It reads the request's client metadata, compares the traceparent and tracestate values to the expected ones, and also confirms that trace data was not placed in the old top-level location. It returns nothing, but the test fails if anything is wrong.
 
-**Call relations**: This helper is used by trace-focused tests after a request has already been sent and captured by the mock websocket server. Those tests invoke it to prove that per-turn tracing survives connection reuse and is not overwritten by an earlier preconnect operation.
+**Call relations**: The trace-focused tests call this after sending WebSocket requests. It uses plain assertions to turn a mismatch into a clear test failure.
 
 *Call graph*: called by 2 (responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_reuses_connection_with_per_turn_trace_payloads); 2 external calls (assert!, assert_eq!).
 
@@ -1086,11 +1106,11 @@ fn responses_metadata(
 ) -> CodexResponsesMetadata
 ```
 
-**Purpose**: Builds canonical `CodexResponsesMetadata` for this suite using the harness session/thread identifiers and a supplied request kind.
+**Purpose**: Builds the standard Codex metadata block used on fake Responses API requests in these tests. This metadata identifies the installation, session, thread, window, request kind, and optional turn id.
 
-**Data flow**: It takes a `WebsocketTestHarness`, optional turn id, and `TestCodexResponsesRequestKind`; reads the harness `session_id` and `thread_id`; injects fixed installation/window/source values; and returns the metadata object produced by `core_test_support::responses_metadata`.
+**Data flow**: It takes the shared test harness, an optional turn id, and a request kind. It combines those with fixed test constants and returns a CodexResponsesMetadata value ready to attach to a request.
 
-**Call relations**: This is the common constructor behind the narrower metadata helpers. Tests do not usually call it directly; instead they go through `turn_metadata`, `prewarm_metadata`, or `websocket_connection_metadata` depending on which websocket path they are exercising.
+**Call relations**: The more specific metadata helpers call this so all tests use the same metadata format. It delegates the actual construction to the test support metadata builder.
 
 *Call graph*: called by 3 (prewarm_metadata, turn_metadata, websocket_connection_metadata); 1 external calls (responses_metadata).
 
@@ -1101,11 +1121,11 @@ fn responses_metadata(
 fn turn_metadata(harness: &WebsocketTestHarness, turn_id: Option<&str>) -> CodexResponsesMetadata
 ```
 
-**Purpose**: Produces request metadata for a normal turn request.
+**Purpose**: Creates metadata for an ordinary user turn. Tests use it when they want the request to look like a normal model interaction.
 
-**Data flow**: It accepts the harness and optional turn id, forwards them to `responses_metadata` with request kind `Turn`, and returns the resulting `CodexResponsesMetadata`.
+**Data flow**: It receives the test harness and optional turn id, then asks the shared metadata helper to label the request as a turn. It returns that metadata object.
 
-**Call relations**: Many stream-oriented tests call this helper before invoking `ModelClientSession::stream`, especially when they need to inspect serialized `x-codex-turn-metadata` or compare turn ids across initial and incremental creates.
+**Call relations**: Many request-shape, error, and event tests call this before streaming. It is a small wrapper around responses_metadata so the caller does not repeat the request-kind choice.
 
 *Call graph*: calls 1 internal fn (responses_metadata); called by 12 (responses_websocket_emits_rate_limit_events, responses_websocket_emits_reasoning_included_event, responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create, responses_websocket_preconnect_is_reused_even_with_header_changes, responses_websocket_request_prewarm_is_reused_even_with_header_changes, responses_websocket_request_prewarm_traces_logical_request, responses_websocket_request_prewarm_uses_caller_supplied_metadata, responses_websocket_sends_canonical_turn_metadata, responses_websocket_v2_after_error_uses_full_create_without_previous_response_id, responses_websocket_v2_surfaces_terminal_error_without_close_handshake (+2 more)).
 
@@ -1119,11 +1139,11 @@ fn prewarm_metadata(
 ) -> CodexResponsesMetadata
 ```
 
-**Purpose**: Produces request metadata for a websocket prewarm request.
+**Purpose**: Creates metadata for a prewarm request. A prewarm request prepares the model path before the real response is needed.
 
-**Data flow**: It takes the harness and optional turn id, delegates to `responses_metadata` with request kind `Prewarm`, and returns the metadata object.
+**Data flow**: It receives the test harness and optional turn id, marks the request kind as prewarm, and returns the metadata.
 
-**Call relations**: Prewarm tests use this helper before calling `prewarm_websocket` so they can verify that the request is marked as a prewarm and that follow-up streaming reuses the warmed response/connection.
+**Call relations**: Prewarm-specific tests call this before invoking prewarm_websocket. It reuses responses_metadata to keep the common metadata fields consistent.
 
 *Call graph*: calls 1 internal fn (responses_metadata); called by 4 (responses_websocket_prewarm_uses_v2_when_provider_supports_websockets, responses_websocket_request_prewarm_is_reused_even_with_header_changes, responses_websocket_request_prewarm_reuses_connection, responses_websocket_request_prewarm_traces_logical_request).
 
@@ -1134,11 +1154,11 @@ fn prewarm_metadata(
 fn websocket_connection_metadata(harness: &WebsocketTestHarness) -> CodexResponsesMetadata
 ```
 
-**Purpose**: Produces request metadata for a websocket connection establishment/preconnect operation.
+**Purpose**: Creates metadata for opening or preconnecting a WebSocket connection before any specific turn. This lets tests distinguish connection setup from an actual model request.
 
-**Data flow**: It reads the harness identifiers and returns `CodexResponsesMetadata` tagged with request kind `WebsocketConnection` via `responses_metadata`.
+**Data flow**: It receives the test harness, uses no turn id, marks the request kind as WebSocket connection, and returns the metadata.
 
-**Call relations**: Preconnect tests pass this metadata into `preconnect_websocket` to distinguish connection setup from later turn traffic and to verify that connection-level metadata does not leak into turn-level request payloads.
+**Call relations**: Preconnect tests call this before asking the client session to open the WebSocket early. It is another focused wrapper around responses_metadata.
 
 *Call graph*: calls 1 internal fn (responses_metadata); called by 4 (responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_preconnect_is_reused_even_with_header_changes, responses_websocket_preconnect_reuses_connection, responses_websocket_preconnect_runs_when_only_v2_feature_enabled).
 
@@ -1149,11 +1169,11 @@ fn websocket_connection_metadata(harness: &WebsocketTestHarness) -> CodexRespons
 async fn responses_websocket_streams_request()
 ```
 
-**Purpose**: Verifies the baseline websocket streaming path: one handshake, one `response.create` request, expected headers, and expected client metadata fields.
+**Purpose**: Verifies the basic happy path: the client streams a request over WebSocket and sends the expected request body and handshake headers.
 
-**Data flow**: It starts a websocket server scripted to emit `response.created` then `completed`, builds a harness and prompt, streams until completion, then inspects the captured handshake and request JSON for model name, `stream: true`, input length, installation id, and a positive websocket request-start timestamp.
+**Data flow**: The test starts a fake server, creates a harness and prompt, streams until completion, then inspects the single recorded request and handshake. It expects the model, stream flag, input, beta header, request id, session/thread ids, user agent, installation id, and start timestamp to be present.
 
-**Call relations**: This is the foundational happy-path test. It drives the standard `websocket_harness` plus `stream_until_complete` flow and then inspects the server-side capture rather than intermediate client events.
+**Call relations**: The async test runner invokes it. It uses the WebSocket server helper, harness builder, prompt builder, and stream helper, then shuts the fake server down.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1164,11 +1184,11 @@ async fn responses_websocket_streams_request()
 async fn responses_websocket_streams_without_feature_flag_when_provider_supports_websockets()
 ```
 
-**Purpose**: Checks that websocket streaming still occurs when runtime-metrics feature support is off, as long as the provider advertises websocket support.
+**Purpose**: Confirms that WebSocket streaming works when the provider itself says it supports WebSockets, even without a separate runtime feature flag.
 
-**Data flow**: It creates a websocket-capable harness with runtime metrics disabled, streams a simple prompt to completion, and asserts that exactly one handshake and one request were observed.
+**Data flow**: It starts a fake server, builds a harness with runtime metrics disabled, sends a prompt, and then checks that exactly one handshake and one request were made.
 
-**Call relations**: This test exercises the same stream path as the baseline test but changes harness configuration to prove provider capability alone is enough to select websockets.
+**Call relations**: The test runner calls it as an independent scenario. It relies on the harness-with-options helper to build a provider that supports WebSockets.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_options); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1179,11 +1199,11 @@ async fn responses_websocket_streams_without_feature_flag_when_provider_supports
 async fn responses_websocket_reuses_connection_with_per_turn_trace_payloads()
 ```
 
-**Purpose**: Ensures multiple turns reuse a single websocket connection while each request carries its own current tracing context.
+**Purpose**: Checks that two separate turns reuse the same WebSocket connection while still sending different trace metadata for each turn.
 
-**Data flow**: It installs test tracing, runs two instrumented turns in separate spans, captures the expected W3C trace context before each stream, then inspects the single connection's two request bodies and compares their metadata trace fields, also asserting the traceparents differ.
+**Data flow**: It starts tracing, sends two prompts under two different tracing spans, and records the expected trace context for each. It then inspects both request bodies and confirms each request has its own trace values, while only one WebSocket handshake happened.
 
-**Call relations**: The test is invoked as a two-turn scenario over one server connection. It relies on `assert_request_trace_matches` to validate payload shape and demonstrates that connection reuse does not imply trace reuse.
+**Call relations**: The test runner invokes it. It uses the trace assertion helper after streaming both turns through the same fake server connection.
 
 *Call graph*: calls 6 internal fn (start_websocket_server, install_test_tracing, assert_request_trace_matches, prompt_with_input, stream_until_complete, websocket_harness); 6 external calls (assert_eq!, assert_ne!, current_span_w3c_trace_context, skip_if_no_network!, info_span!, vec!).
 
@@ -1194,11 +1214,11 @@ async fn responses_websocket_reuses_connection_with_per_turn_trace_payloads()
 async fn responses_websocket_preconnect_does_not_replace_turn_trace_payload()
 ```
 
-**Purpose**: Proves that an earlier websocket preconnect does not stamp its trace context onto the later streamed turn request.
+**Purpose**: Ensures that opening a WebSocket early does not accidentally freeze or overwrite the trace information for the later real turn.
 
-**Data flow**: It preconnects using connection metadata, then runs a traced stream inside a span, captures the expected current trace context, and checks the sole request body against that turn trace rather than any preconnect-time trace.
+**Data flow**: It preconnects first, then streams a prompt inside a tracing span. It inspects the request body and confirms the trace metadata matches the turn span, not the earlier preconnect operation.
 
-**Call relations**: This test first exercises `preconnect_websocket`, then the normal stream path. It exists specifically to guard the handoff between connection setup and request emission.
+**Call relations**: The test runner invokes it. It combines preconnect metadata, tracing setup, the stream helper, and assert_request_trace_matches.
 
 *Call graph*: calls 7 internal fn (start_websocket_server, install_test_tracing, assert_request_trace_matches, prompt_with_input, stream_until_complete, websocket_connection_metadata, websocket_harness); 5 external calls (assert_eq!, current_span_w3c_trace_context, skip_if_no_network!, info_span!, vec!).
 
@@ -1209,11 +1229,11 @@ async fn responses_websocket_preconnect_does_not_replace_turn_trace_payload()
 async fn responses_websocket_preconnect_reuses_connection()
 ```
 
-**Purpose**: Checks that explicit preconnect opens the websocket once and the subsequent turn reuses that connection without another handshake.
+**Purpose**: Verifies that a preconnected WebSocket is reused for the later model request instead of opening a second connection.
 
-**Data flow**: It preconnects, streams a prompt, then inspects the server for one handshake, one request, and the expected `user-agent` and `x-codex-window-id` handshake headers.
+**Data flow**: It opens the connection early, sends a prompt, and then checks that there was one handshake and one request. It also checks useful handshake metadata such as user agent and window id.
 
-**Call relations**: The test is a direct preconnect-then-stream sequence. It validates the connection cache behavior rather than request-body semantics.
+**Call relations**: The test runner calls it. It uses websocket_connection_metadata for setup and stream_until_complete for the later turn.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_connection_metadata, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1224,11 +1244,11 @@ async fn responses_websocket_preconnect_reuses_connection()
 async fn responses_websocket_request_prewarm_reuses_connection()
 ```
 
-**Purpose**: Verifies that websocket prewarm sends a non-generating warmup request and that the later turn reuses the same connection and previous response id.
+**Purpose**: Checks that a prewarm request and the later real request share the same WebSocket connection. It also verifies that the real request can refer back to the prewarm response.
 
-**Data flow**: It prewarms with a prompt and prewarm metadata, then streams the same prompt. Afterwards it inspects two requests on one connection: the first has `generate: false` and empty `tools`, and the second references `previous_response_id` from the warmup and sends empty `input`.
+**Data flow**: It sends a prewarm request, then streams the same prompt. It inspects the first request to ensure generation was disabled and tools were empty, and inspects the second request to ensure it uses previous_response_id and sends no duplicate input.
 
-**Call relations**: This test drives `prewarm_websocket` followed by normal streaming. It demonstrates the warmup/follow-up protocol and the request-shape optimization that avoids resending input.
+**Call relations**: The test runner invokes it. It uses prewarm_metadata for the warmup request and stream_until_complete for the follow-up.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prewarm_metadata, prompt_with_input, stream_until_complete, websocket_harness_with_options); 4 external calls (assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -1239,11 +1259,11 @@ async fn responses_websocket_request_prewarm_reuses_connection()
 async fn responses_websocket_request_prewarm_uses_caller_supplied_metadata()
 ```
 
-**Purpose**: Confirms that prewarm honors the metadata object passed by the caller instead of forcing request kind `prewarm`.
+**Purpose**: Confirms that prewarm uses the metadata supplied by its caller, instead of always forcing the request kind to prewarm.
 
-**Data flow**: It calls `prewarm_websocket` with turn metadata, then parses the serialized `x-codex-turn-metadata` from the warmup request body and asserts the embedded `request_kind` is `turn`.
+**Data flow**: It calls prewarm_websocket with metadata marked as a normal turn. It then reads the recorded request metadata and expects the request_kind field to remain turn.
 
-**Call relations**: This is a metadata-override regression test for the prewarm path. It uses the same prewarm machinery as the reuse test but focuses only on metadata serialization.
+**Call relations**: The test runner calls it. It uses turn_metadata deliberately in a prewarm call to catch unwanted metadata rewriting.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, turn_metadata, websocket_harness_with_options); 4 external calls (assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -1254,11 +1274,11 @@ async fn responses_websocket_request_prewarm_uses_caller_supplied_metadata()
 async fn responses_websocket_request_prewarm_traces_logical_request()
 ```
 
-**Purpose**: Checks that a prewarmed websocket request still records the original logical user input in rollout/inference tracing even when the follow-up request sends empty `input` plus `previous_response_id`.
+**Purpose**: Ensures that a prewarmed request is still recorded in rollout tracing as the logical user input, even though the follow-up request sends only a previous response id.
 
-**Data flow**: It prewarms, creates a temporary trace bundle with `TraceWriter` and `InferenceTraceContext`, streams to completion, verifies the follow-up request uses `previous_response_id` and empty input, then replays the trace bundle and asserts the inference call references one conversation item containing the original `hello` text.
+**Data flow**: It prewarms a prompt, creates a trace writer, starts a fake conversation turn in the trace, streams the follow-up, and replays the trace bundle. It expects the trace to contain the original user text as the inference request item.
 
-**Call relations**: This test bridges websocket request optimization with rollout tracing. It first exercises prewarm, then a traced stream, then post-run trace replay to ensure logical request reconstruction remains correct.
+**Call relations**: The test runner invokes it. It ties together the prewarm path, normal turn metadata, the client stream, and rollout trace replay.
 
 *Call graph*: calls 7 internal fn (start_websocket_server, prewarm_metadata, prompt_with_input, turn_metadata, websocket_harness_with_options, enabled, create); 7 external calls (new, new, assert_eq!, replay_bundle, matches!, skip_if_no_network!, vec!).
 
@@ -1269,11 +1289,11 @@ async fn responses_websocket_request_prewarm_traces_logical_request()
 async fn responses_websocket_reuses_connection_after_session_drop()
 ```
 
-**Purpose**: Ensures the underlying websocket connection survives dropping one `ModelClientSession` and is reused by a later session from the same `ModelClient`.
+**Purpose**: Checks that dropping one ModelClientSession does not make the underlying client throw away a reusable WebSocket connection.
 
-**Data flow**: It streams one prompt in a scoped session, drops that session, creates a new session, streams another prompt, and then asserts the server saw one handshake and two requests on the same connection.
+**Data flow**: It sends one prompt using a short-lived session, lets that session go out of scope, creates a new session, and sends another prompt. It expects one handshake and two requests on the same connection.
 
-**Call relations**: This test targets client-level connection pooling rather than per-session state. It is invoked as two independent session lifetimes over one harness.
+**Call relations**: The test runner calls it. It uses the shared ModelClient from the harness to show reuse survives individual session objects.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1284,11 +1304,11 @@ async fn responses_websocket_reuses_connection_after_session_drop()
 async fn responses_websocket_sends_responses_lite_metadata_per_request()
 ```
 
-**Purpose**: Verifies that `use_responses_lite` affects only the requests made with a lite-enabled `ModelInfo`, not the whole connection.
+**Purpose**: Verifies that the “responses lite” marker is sent only for requests using a model configuration that asks for it. This guards against sticky per-connection state leaking between turns.
 
-**Data flow**: It clones and mutates `ModelInfo` values to create normal and lite variants, streams three turns through one session, then maps each captured request body to a reduced JSON view containing the lite metadata key, reasoning context, and `parallel_tool_calls`, and compares the sequence against the expected normal/lite/normal pattern.
+**Data flow**: It sends three requests over one connection: normal, lite, normal. It inspects each body and expects the lite metadata and reasoning context only on the middle request.
 
-**Call relations**: The test uses `stream_until_complete_with_model_info` repeatedly on one connection to prove request-local model flags are serialized per turn.
+**Call relations**: The test runner invokes it. It uses stream_until_complete_with_model_info so each request can use a different ModelInfo value.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete_with_model_info, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1299,11 +1319,11 @@ async fn responses_websocket_sends_responses_lite_metadata_per_request()
 async fn responses_websocket_preconnect_is_reused_even_with_header_changes()
 ```
 
-**Purpose**: Checks that a preconnected websocket is still reused when the later stream request carries different turn metadata headers.
+**Purpose**: Confirms that a preconnected WebSocket is reused even if later request-specific metadata would have changed headers in older designs.
 
-**Data flow**: It preconnects with connection metadata, then streams with turn metadata and a disabled inference trace, drains until `Completed`, and asserts the server observed one handshake and one request.
+**Data flow**: It preconnects, then streams a normal turn with turn metadata. It consumes the stream to completion and checks that only one handshake and one request occurred.
 
-**Call relations**: This is a connection-cache stability test. It specifically covers the case where header differences should not force a reconnect after preconnect.
+**Call relations**: The test runner calls it. It uses websocket_connection_metadata for the preconnect and turn_metadata for the stream, proving the connection stays usable across metadata differences.
 
 *Call graph*: calls 6 internal fn (start_websocket_server, prompt_with_input, turn_metadata, websocket_connection_metadata, websocket_harness, disabled); 4 external calls (assert_eq!, matches!, skip_if_no_network!, vec!).
 
@@ -1314,11 +1334,11 @@ async fn responses_websocket_preconnect_is_reused_even_with_header_changes()
 async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes()
 ```
 
-**Purpose**: Checks that a prewarmed websocket connection remains reusable even when the later stream request has different metadata headers.
+**Purpose**: Checks that a prewarm request remains reusable for the later request even when the later call has different request metadata.
 
-**Data flow**: It prewarms with prewarm metadata, then streams with turn metadata, drains to completion, and inspects the two request bodies to confirm warmup semantics and follow-up reuse via `previous_response_id` and empty input.
+**Data flow**: It prewarms with prewarm metadata, then streams with turn metadata. It inspects the two recorded requests and expects the second to reference the prewarm response and send empty input.
 
-**Call relations**: This mirrors the preconnect header-change test but for the prewarm path, ensuring metadata differences do not invalidate the warmed connection state.
+**Call relations**: The test runner invokes it. It exercises the same prewarm-to-follow-up path as other tests but focuses on metadata/header changes.
 
 *Call graph*: calls 6 internal fn (start_websocket_server, prewarm_metadata, prompt_with_input, turn_metadata, websocket_harness_with_options, disabled); 4 external calls (assert_eq!, matches!, skip_if_no_network!, vec!).
 
@@ -1329,11 +1349,11 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
 async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
 ```
 
-**Purpose**: Verifies that prewarm uses the websocket v2 path when the provider supports websockets, including the beta header and websocket-carried prewarm request.
+**Purpose**: Verifies that prewarm uses the v2 WebSocket request style when the provider supports WebSockets.
 
-**Data flow**: It prewarms with runtime metrics disabled, asserts one handshake and one websocket request, checks the `OpenAI-Beta` header contains the v2 token, then streams a follow-up turn and confirms no extra request was needed because the prewarm request already carried the prompt input.
+**Data flow**: It sends a prewarm request, checks that it used a WebSocket request and included the v2 beta header, then streams the prompt and confirms no extra request was needed.
 
-**Call relations**: This test covers the v2 prewarm selection logic and contrasts with legacy warmup behavior by asserting the prewarm itself is a websocket request.
+**Call relations**: The test runner calls it. It uses the prewarm helper path and then stream_until_complete to prove the warm request is the one reused.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prewarm_metadata, prompt_with_input, stream_until_complete, websocket_harness_with_options); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1344,11 +1364,11 @@ async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
 async fn responses_websocket_preconnect_runs_when_only_v2_feature_enabled()
 ```
 
-**Purpose**: Ensures preconnect still opens the websocket when only the v2 path is relevant, without sending a request body until a real turn arrives.
+**Purpose**: Checks that preconnect still opens the WebSocket when only the v2 WebSocket path is available.
 
-**Data flow**: It preconnects, asserts one handshake and zero connection requests plus no turn metadata header on the handshake, then streams a prompt and confirms the same connection is used and the beta header advertises websocket v2.
+**Data flow**: It preconnects and expects one handshake but no request body yet. Then it streams a prompt and expects the existing connection to carry one request with the v2 beta header.
 
-**Call relations**: This test isolates the connection-establishment half of v2 behavior: handshake first, request later.
+**Call relations**: The test runner invokes it. It uses websocket_connection_metadata for the setup and the normal stream helper for the later request.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_connection_metadata, websocket_harness_with_options); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1359,11 +1379,11 @@ async fn responses_websocket_preconnect_runs_when_only_v2_feature_enabled()
 async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websockets()
 ```
 
-**Purpose**: Checks that websocket v2 incremental requests use `previous_response_id` and only the suffix input when the second prompt extends the first completed response.
+**Purpose**: Confirms that v2 WebSocket requests use incremental creation when a second prompt extends the first conversation.
 
-**Data flow**: It streams an initial prompt that yields an assistant message id, then streams a second prompt containing the prior conversation plus a new user item, and inspects the second request body for `previous_response_id: resp-1`, suffix-only input, and the v2 beta header on the handshake.
+**Data flow**: It sends a first prompt that receives a response id and assistant message, then sends a second prompt containing the earlier conversation plus one new user message. The second request should include previous_response_id and only the new input item.
 
-**Call relations**: This is a core v2 incremental-create test. It depends on the first turn producing an assistant message that can anchor the prefix comparison for the second turn.
+**Call relations**: The test runner calls it. It uses the fake server’s scripted two-response sequence and then inspects the second recorded request.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_options); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1374,11 +1394,11 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
 async fn responses_websocket_v2_incremental_requests_are_reused_across_turns()
 ```
 
-**Purpose**: Verifies that v2 incremental request state survives across dropped sessions and still reuses the same websocket connection.
+**Purpose**: Checks that v2 incremental request state survives across separate ModelClientSession objects.
 
-**Data flow**: It runs one turn in one session, drops it, runs a prefix-extending second turn in a new session, and then checks one handshake, two requests, and a second request using `previous_response_id` plus suffix-only input.
+**Data flow**: It sends the first prompt in one session, drops that session, sends the extended prompt in a new session, and inspects the second request. It expects the client to still know the previous response id and send only the new input.
 
-**Call relations**: This combines v2 incremental logic with client-level connection reuse across session boundaries.
+**Call relations**: The test runner invokes it. It uses the shared harness client to show reuse is tied to the client/connection, not only one session object.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_options); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1389,11 +1409,11 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns()
 async fn responses_websocket_v2_wins_when_both_features_enabled()
 ```
 
-**Purpose**: Confirms that when both older websocket behavior and v2-capable conditions are present, the client chooses the v2 incremental request form.
+**Purpose**: Ensures the v2 WebSocket behavior is chosen when multiple WebSocket-related options could apply.
 
-**Data flow**: It streams two prefix-related turns and inspects the second request for `previous_response_id`, suffix-only input, and the v2 beta header, demonstrating v2 selection.
+**Data flow**: It sends two related prompts and checks that the second request uses previous_response_id and only new input, which is the v2 incremental shape. It also checks the handshake beta header.
 
-**Call relations**: This is a precedence test: it uses the same two-turn shape as other incremental tests but asserts the chosen protocol variant.
+**Call relations**: The test runner calls it. It uses the same stream helper and request inspection pattern as the other v2 selection tests.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_options); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1404,11 +1424,11 @@ async fn responses_websocket_v2_wins_when_both_features_enabled()
 async fn responses_websocket_emits_websocket_telemetry_events()
 ```
 
-**Purpose**: Checks that websocket activity increments websocket-specific runtime metrics rather than generic API/streaming counters.
+**Purpose**: Verifies that WebSocket calls and WebSocket events are counted in runtime telemetry, instead of being counted as ordinary HTTP streaming calls.
 
-**Data flow**: It resets runtime metrics, streams one prompt, waits briefly for async metric publication, then reads the telemetry summary and asserts zero API/streaming counts but one websocket call and two websocket events.
+**Data flow**: It resets telemetry, streams one prompt, waits briefly for metrics to settle, and reads the runtime metrics summary. It expects one WebSocket call and two WebSocket events, with normal API and streaming counts left at zero.
 
-**Call relations**: This test runs the normal websocket stream path and then inspects `SessionTelemetry` state after the fact.
+**Call relations**: The test runner invokes it. It uses the harness telemetry object created by websocket_harness and the stream helper.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 5 external calls (from_millis, assert_eq!, skip_if_no_network!, sleep, vec!).
 
@@ -1419,11 +1439,11 @@ async fn responses_websocket_emits_websocket_telemetry_events()
 async fn responses_websocket_includes_timing_metrics_header_when_runtime_metrics_enabled()
 ```
 
-**Purpose**: Verifies that enabling runtime metrics adds the timing-metrics request header and that timing frames update the telemetry summary fields.
+**Purpose**: Checks that the client asks the server for timing metrics when runtime metrics are enabled, and records the timing event it receives.
 
-**Data flow**: It uses a server that emits a `responsesapi.websocket_timing` event, streams a prompt, waits for metrics propagation, checks the handshake for `X-ResponsesAPI-Include-Timing-Metrics: true`, and asserts the telemetry summary fields match the timing payload values.
+**Data flow**: The fake server sends a websocket_timing event between response creation and completion. The test checks that the handshake includes the timing request header and that the telemetry summary contains the timing numbers.
 
-**Call relations**: This test couples request-header selection with downstream event ingestion. It uses the runtime-metrics-enabled harness variant.
+**Call relations**: The test runner calls it. It builds a harness with runtime metrics enabled and uses stream_until_complete to trigger the event.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_runtime_metrics); 5 external calls (from_millis, assert_eq!, skip_if_no_network!, sleep, vec!).
 
@@ -1434,11 +1454,11 @@ async fn responses_websocket_includes_timing_metrics_header_when_runtime_metrics
 async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_disabled()
 ```
 
-**Purpose**: Checks that the timing-metrics opt-in header is absent when runtime metrics are disabled.
+**Purpose**: Confirms that the timing metrics request header is not sent when runtime metrics are disabled.
 
-**Data flow**: It streams a prompt with a runtime-metrics-disabled harness and then inspects the handshake headers, expecting no timing-metrics header.
+**Data flow**: It streams one prompt through a harness with runtime metrics disabled, then reads the handshake headers. It expects no timing metrics header.
 
-**Call relations**: This is the negative counterpart to the timing-metrics-enabled test and guards the feature flag boundary.
+**Call relations**: The test runner invokes it. It uses the runtime-metrics harness wrapper with a false flag.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_runtime_metrics); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1449,11 +1469,11 @@ async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_di
 async fn responses_websocket_emits_reasoning_included_event()
 ```
 
-**Purpose**: Ensures a websocket response header `X-Reasoning-Included: true` is surfaced to callers as `ResponseEvent::ServerReasoningIncluded(true)`.
+**Purpose**: Verifies that a server response header saying reasoning was included becomes a ResponseEvent visible to the client.
 
-**Data flow**: It starts a websocket server configured with response headers, streams a prompt with turn metadata, iterates the event stream until completion, and records whether the reasoning-included event was seen.
+**Data flow**: It starts a fake server that adds the X-Reasoning-Included header, streams a prompt, and watches the event stream. It succeeds only if it sees ServerReasoningIncluded(true) before completion.
 
-**Call relations**: This test focuses on event translation from connection/response metadata into the stream of `ResponseEvent`s returned by `ModelClientSession::stream`.
+**Call relations**: The test runner calls it. It uses the server-with-headers helper and then reads events directly instead of only using stream_until_complete.
 
 *Call graph*: calls 5 internal fn (start_websocket_server_with_headers, prompt_with_input, turn_metadata, websocket_harness, disabled); 3 external calls (assert!, skip_if_no_network!, vec!).
 
@@ -1464,11 +1484,11 @@ async fn responses_websocket_emits_reasoning_included_event()
 async fn responses_websocket_emits_rate_limit_events()
 ```
 
-**Purpose**: Checks that websocket rate-limit payloads and related headers are converted into `ResponseEvent::RateLimits`, `ModelsEtag`, and `ServerReasoningIncluded` events with parsed structured data.
+**Purpose**: Checks that rate-limit information sent over the WebSocket is turned into structured client events, along with related response headers.
 
-**Data flow**: It injects a `codex.rate_limits` JSON event plus response headers, streams a prompt, collects the resulting events, and then asserts parsed plan type, primary window fields, credits, models etag, and reasoning-included state.
+**Data flow**: The fake server sends a codex.rate_limits event and headers for model etag and reasoning included. The test streams a prompt, captures the emitted events, and checks the parsed plan, usage percentage, reset time, credits, etag, and reasoning flag.
 
-**Call relations**: This test exercises the event parser on non-token websocket messages before normal response completion.
+**Call relations**: The test runner invokes it. It builds custom server responses and consumes the stream manually to inspect non-completion events.
 
 *Call graph*: calls 5 internal fn (start_websocket_server_with_headers, prompt_with_input, turn_metadata, websocket_harness, disabled); 5 external calls (assert!, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -1479,11 +1499,11 @@ async fn responses_websocket_emits_rate_limit_events()
 async fn responses_websocket_usage_limit_error_emits_rate_limit_event()
 ```
 
-**Purpose**: Verifies that a websocket 429 usage-limit error still yields a token-count/rate-limit event before surfacing an error event to the higher-level Codex thread.
+**Purpose**: Ensures a WebSocket usage-limit error still produces a rate-limit token-count event before the user-facing error.
 
-**Data flow**: It builds a full `test_codex` with retries disabled, submits a user turn, waits for a `TokenCount` event and serializes it to JSON for exact comparison, then waits for an `Error` event whose message mentions usage limits.
+**Data flow**: It scripts a prewarm success followed by a 429 usage-limit error. Through the higher-level Codex test harness, it submits user input, waits for a TokenCount event containing rate-limit percentages, then waits for an Error event mentioning the usage limit.
 
-**Call relations**: Unlike the lower-level `ModelClientSession` tests, this one drives the top-level `Codex` event loop to confirm websocket errors are translated into user-facing protocol events.
+**Call relations**: The test runner calls it. Unlike lower-level tests, it uses test_codex and wait_for_event to check the full application event path.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 9 external calls (default, assert!, wait_for_event, json!, assert_eq!, to_value, skip_if_no_network!, unreachable!, vec!).
 
@@ -1494,11 +1514,11 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event()
 async fn responses_websocket_invalid_request_error_with_status_is_forwarded()
 ```
 
-**Purpose**: Checks that a websocket error frame with HTTP status and invalid-request details is forwarded as a user-visible error event.
+**Purpose**: Checks that an invalid request error received over WebSocket is forwarded to the normal Codex error event stream.
 
-**Data flow**: It builds a `test_codex`, submits a user turn, waits for an `EventMsg::Error`, and asserts the message contains the server-provided invalid-request explanation.
+**Data flow**: It scripts a prewarm success followed by a 400 invalid_request_error. It submits user input through the high-level Codex harness and waits for an Error event whose message contains the server’s explanation.
 
-**Call relations**: This is another top-level event propagation test, focused on non-rate-limit terminal errors.
+**Call relations**: The test runner invokes it. It uses test_codex so the check covers the client-to-application event boundary.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 7 external calls (default, assert!, wait_for_event, json!, skip_if_no_network!, unreachable!, vec!).
 
@@ -1509,11 +1529,11 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded()
 async fn responses_websocket_connection_limit_error_reconnects_and_completes()
 ```
 
-**Purpose**: Ensures a websocket connection-limit error triggers a reconnect and allows the turn to complete on a fresh websocket when stream retries permit it.
+**Purpose**: Verifies that a specific WebSocket connection-limit error is treated as recoverable. The client should open a new WebSocket and retry.
 
-**Data flow**: It scripts one websocket connection to fail with `websocket_connection_limit_reached` and a second to succeed, configures stream retries to 1, submits a turn, then sums requests across all connections and checks that two handshakes occurred with the expected user-agent header.
+**Data flow**: The first fake connection returns a connection-limit error; the second returns a successful response. The test submits a turn and then checks that two WebSocket requests happened across two handshakes, both with the expected user agent.
 
-**Call relations**: This test covers retry orchestration above the websocket transport, proving that a specific server error code is treated as recoverable by reconnecting.
+**Call relations**: The test runner calls it. It uses the higher-level Codex harness with one stream retry allowed to prove reconnect behavior works end to end.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 4 external calls (assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -1524,11 +1544,11 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes()
 async fn responses_websocket_uses_incremental_create_on_prefix()
 ```
 
-**Purpose**: Verifies the non-v2 websocket path also uses incremental `response.create` with `previous_response_id` when the second prompt extends the first response history.
+**Purpose**: Checks that when a later prompt begins with the same items as the previous completed exchange, the client sends only the new suffix plus previous_response_id.
 
-**Data flow**: It streams two turns where the second prompt includes the first user message, the assistant reply, and a new user message, then inspects the second request body for `previous_response_id` and suffix-only input.
+**Data flow**: It sends an initial prompt and then a second prompt containing the first prompt, the assistant reply, and one new message. It inspects the requests and expects the first to be a full create and the second to be an incremental create.
 
-**Call relations**: This is the legacy/incremental counterpart to the v2 incremental tests and guards prefix-detection logic independent of protocol version selection.
+**Call relations**: The test runner invokes it. It relies on the fake server returning a response id and assistant message so the client can recognize the prefix.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1539,11 +1559,11 @@ async fn responses_websocket_uses_incremental_create_on_prefix()
 async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create()
 ```
 
-**Purpose**: Checks that serialized turn metadata, including `turn_id`, is attached both to the initial create and to a later incremental create request.
+**Purpose**: Ensures both full and incremental WebSocket create requests carry the correct per-turn metadata.
 
-**Data flow**: It streams two turns with distinct `CodexResponsesMetadata` values, parses `x-codex-turn-metadata` from both request bodies, and asserts the embedded and top-level `turn_id` values match the supplied metadata for each request.
+**Data flow**: It sends two related prompts with different turn ids in their metadata. It reads both request bodies, parses the embedded metadata JSON, and confirms each request has the matching turn id in both canonical and convenience metadata fields.
 
-**Call relations**: This test uses `stream_until_complete_with_metadata` to inject explicit metadata and then validates that incremental optimization does not drop or stale-cache it.
+**Call relations**: The test runner calls it. It uses stream_until_complete_with_metadata so each request can carry caller-selected metadata.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prompt_with_input, stream_until_complete_with_metadata, turn_metadata, websocket_harness); 4 external calls (assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -1554,11 +1574,11 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 async fn responses_websocket_sends_canonical_turn_metadata()
 ```
 
-**Purpose**: Verifies that a normal websocket request includes canonical serialized turn metadata and mirrors the `turn_id` at the top level of `client_metadata`.
+**Purpose**: Verifies that the request includes the canonical serialized turn metadata and mirrors the turn id in client metadata.
 
-**Data flow**: It streams one turn with explicit metadata, parses the `x-codex-turn-metadata` JSON string from the request body, and compares its `turn_id` to the top-level `client_metadata.turn_id` field.
+**Data flow**: It streams one prompt with a specific turn id, reads the recorded request, parses the x-codex-turn-metadata JSON string, and checks that the turn id appears as expected.
 
-**Call relations**: This is the single-request baseline for the more complex metadata-forwarding tests.
+**Call relations**: The test runner invokes it. It uses the metadata-aware stream helper to send the exact metadata under test.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, prompt_with_input, stream_until_complete_with_metadata, turn_metadata, websocket_harness); 4 external calls (assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -1569,11 +1589,11 @@ async fn responses_websocket_sends_canonical_turn_metadata()
 async fn responses_websocket_uses_previous_response_id_when_prefix_after_completed()
 ```
 
-**Purpose**: Confirms that once a prior response has completed, a prefix-extending next prompt uses `previous_response_id` and suffix-only input.
+**Purpose**: Checks that a completed first response can be used as the base for a later incremental request.
 
-**Data flow**: It streams two turns and inspects the second request body for `type: response.create`, `previous_response_id: resp-1`, and serialized suffix input.
+**Data flow**: It sends a first prompt through completion, then sends an extended prompt. The second request should include previous_response_id and only the new input after the known prefix.
 
-**Call relations**: This is another focused regression test around prefix detection after completion, overlapping with incremental-create coverage but emphasizing the completed-response precondition.
+**Call relations**: The test runner calls it. It is a focused version of the incremental-prefix test centered on the completed response id.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1584,11 +1604,11 @@ async fn responses_websocket_uses_previous_response_id_when_prefix_after_complet
 async fn responses_websocket_creates_on_non_prefix()
 ```
 
-**Purpose**: Checks that when the next prompt is not a prefix extension of the previous one, the client sends a full create request instead of an incremental one.
+**Purpose**: Ensures the client sends a full create request when the next prompt is not an extension of the previous conversation.
 
-**Data flow**: It streams two unrelated prompts and then inspects the second request body for a full `response.create` with model, `stream: true`, and the entire second prompt input.
+**Data flow**: It sends one prompt, then sends a different prompt that does not share the previous prefix. The second request should include the full new input and normal create fields, not previous_response_id.
 
-**Call relations**: This is the negative case for prefix optimization and guards against over-aggressive reuse of `previous_response_id`.
+**Call relations**: The test runner invokes it. It uses the ordinary stream helper and then inspects the second recorded request.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1599,11 +1619,11 @@ async fn responses_websocket_creates_on_non_prefix()
 async fn responses_websocket_creates_when_non_input_request_fields_change()
 ```
 
-**Purpose**: Ensures that even if the input shares a prefix, changing non-input request fields such as base instructions forces a full create without `previous_response_id`.
+**Purpose**: Checks that the client does not use incremental creation when important non-input request fields, such as base instructions, change.
 
-**Data flow**: It streams two prompts with different `BaseInstructions`, then inspects the second request body to confirm `previous_response_id` is absent and the full input is resent.
+**Data flow**: It sends a prompt with one set of base instructions, then another prompt with changed instructions and extra input. The second request should be a full create with no previous_response_id.
 
-**Call relations**: This test protects the request-equivalence check used before incremental optimization, proving it considers more than just input items.
+**Call relations**: The test runner calls it. It uses prompt_with_input_and_instructions to create prompts whose input prefix overlaps but whose request settings differ.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input_and_instructions, stream_until_complete, websocket_harness); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1614,11 +1634,11 @@ async fn responses_websocket_creates_when_non_input_request_fields_change()
 async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix()
 ```
 
-**Purpose**: Verifies the v2 path uses `previous_response_id` for prefix-extending prompts.
+**Purpose**: Confirms the v2 harness path uses previous_response_id for a prompt that extends an earlier completed response.
 
-**Data flow**: It streams two turns through a v2-configured harness and inspects the second request body for `previous_response_id` and suffix-only input.
+**Data flow**: It sends two related prompts through a v2-configured harness. It expects the first request to be a normal create and the second to include previous_response_id with only the new input.
 
-**Call relations**: This is the v2-specific positive case for incremental create, parallel to the legacy prefix tests.
+**Call relations**: The test runner invokes it. It uses websocket_harness_with_v2 and the normal stream helper.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_v2); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1629,11 +1649,11 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix()
 async fn responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change()
 ```
 
-**Purpose**: Checks that v2 also falls back to a full create when non-input request fields differ between turns.
+**Purpose**: Ensures the v2 WebSocket path falls back to a full create when request fields outside the input change.
 
-**Data flow**: It streams two prompts with different base instructions through a v2 harness and asserts the second request omits `previous_response_id` and includes the full input.
+**Data flow**: It sends two prompts with overlapping input but different base instructions. It inspects the second request and expects no previous_response_id and a full input payload.
 
-**Call relations**: This is the v2-specific negative case for incremental optimization.
+**Call relations**: The test runner calls it. It pairs the v2 harness with prompt_with_input_and_instructions.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input_and_instructions, stream_until_complete, websocket_harness_with_v2); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1644,11 +1664,11 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
 async fn responses_websocket_v2_after_error_uses_full_create_without_previous_response_id()
 ```
 
-**Purpose**: Ensures that after a websocket v2 turn fails, the next turn reconnects and sends a full create rather than trying to continue from the failed response id.
+**Purpose**: Checks that after a v2 WebSocket request fails, the next successful request starts fresh instead of building on possibly broken state.
 
-**Data flow**: It streams a successful first turn, starts a second turn that emits `response.failed` and yields an error, then streams a third turn and inspects two server connections: the third request is on a new connection, has no `previous_response_id`, and carries the full third prompt input.
+**Data flow**: It sends a successful first prompt, then a second prompt that receives a terminal failure, then a third prompt. The test expects the third request to happen on a new connection and to be a full create without previous_response_id.
 
-**Call relations**: This test spans success, terminal stream error, and recovery. It proves failed incremental state is discarded before the next attempt.
+**Call relations**: The test runner invokes it. It consumes the second stream manually to observe the error, then returns to stream_until_complete for the recovery request.
 
 *Call graph*: calls 6 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, turn_metadata, websocket_harness_with_v2, disabled); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1659,11 +1679,11 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
 async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake()
 ```
 
-**Purpose**: Checks that a terminal v2 websocket error is surfaced promptly even if the server does not close the websocket afterward.
+**Purpose**: Ensures a terminal response.failed event is surfaced promptly even if the server keeps the WebSocket open instead of closing it.
 
-**Data flow**: It runs a successful first turn, then a second turn whose stream emits `response.failed` without a close handshake, and uses a timeout while polling the stream to assert an error item is still produced.
+**Data flow**: It sends a first successful prompt, then a second prompt whose response is a failure event while the connection remains open. It waits with a timeout and expects the client stream to produce an error rather than hanging.
 
-**Call relations**: This guards the stream reader against hanging forever waiting for socket closure after a terminal protocol-level failure.
+**Call relations**: The test runner calls it. It uses the server-with-headers configuration to keep the connection open and a timeout to catch hangs.
 
 *Call graph*: calls 6 internal fn (start_websocket_server_with_headers, prompt_with_input, stream_until_complete, turn_metadata, websocket_harness_with_v2, disabled); 5 external calls (from_secs, assert!, skip_if_no_network!, timeout, vec!).
 
@@ -1674,11 +1694,11 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
 async fn responses_websocket_v2_sets_openai_beta_header()
 ```
 
-**Purpose**: Verifies that v2 websocket requests advertise the required beta feature token in the handshake.
+**Purpose**: Verifies that the v2 WebSocket path advertises the required OpenAI beta header during the handshake.
 
-**Data flow**: It streams one prompt through a v2 harness, reads the handshake `OpenAI-Beta` header, splits it on commas, and asserts the websocket-v2 token is present.
+**Data flow**: It streams one prompt through the v2 harness, reads the recorded handshake, splits the beta header values, and expects the v2 WebSocket marker to be present.
 
-**Call relations**: This is a focused handshake-header test for the v2 path.
+**Call relations**: The test runner invokes it. It uses websocket_harness_with_v2 and stream_until_complete, then checks only the handshake detail.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, prompt_with_input, stream_until_complete, websocket_harness_with_v2); 3 external calls (assert!, skip_if_no_network!, vec!).
 
@@ -1689,11 +1709,11 @@ async fn responses_websocket_v2_sets_openai_beta_header()
 fn message_item(text: &str) -> ResponseItem
 ```
 
-**Purpose**: Constructs a user `ResponseItem::Message` containing one `ContentItem::InputText` entry.
+**Purpose**: Creates a user message item for test prompts. It keeps tests readable by hiding the nested response-item structure.
 
-**Data flow**: It takes a text string and returns a `ResponseItem::Message` with `role: "user"`, no id/phase/metadata, and a one-element content vector containing the provided text.
+**Data flow**: It takes plain text and wraps it as a ResponseItem with role user and an input-text content item. It returns that ResponseItem.
 
-**Call relations**: Many prompt-building tests use this helper to create concise user message items without repeating the enum construction boilerplate.
+**Call relations**: Most prompt-building tests call this before prompt_with_input. It does not call other project helpers; it just constructs the test data shape.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1704,11 +1724,11 @@ fn message_item(text: &str) -> ResponseItem
 fn assistant_message_item(id: &str, text: &str) -> ResponseItem
 ```
 
-**Purpose**: Constructs an assistant `ResponseItem::Message` with a fixed id and one `ContentItem::OutputText` entry.
+**Purpose**: Creates an assistant message item with an id for tests that simulate an existing conversation history.
 
-**Data flow**: It takes an id and text, then returns a `ResponseItem::Message` with `role: "assistant"`, that id, and one output-text content item.
+**Data flow**: It takes an assistant message id and text, wraps them as a ResponseItem with role assistant and output-text content, and returns it.
 
-**Call relations**: Prefix/incremental tests use this helper to model prior assistant output inside a follow-up prompt so the client can detect shared history.
+**Call relations**: Incremental-request tests call this to place a prior assistant reply into the second prompt, letting the client recognize a shared conversation prefix.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1719,11 +1739,11 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem
 fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt
 ```
 
-**Purpose**: Creates a default `Prompt` and replaces its `input` field with the supplied response items.
+**Purpose**: Builds a Prompt containing the supplied input items and default settings for everything else.
 
-**Data flow**: It starts from `Prompt::default()`, assigns the provided `Vec<ResponseItem>` to `prompt.input`, and returns the prompt.
+**Data flow**: It starts from Prompt::default, replaces the input field with the provided ResponseItem list, and returns the prompt.
 
-**Call relations**: This is the base prompt constructor used by most tests and by `prompt_with_input_and_instructions`.
+**Call relations**: Nearly all tests use this to make a simple prompt. prompt_with_input_and_instructions builds on it when a test needs custom base instructions.
 
 *Call graph*: calls 1 internal fn (default); called by 32 (prompt_with_input_and_instructions, responses_websocket_creates_on_non_prefix, responses_websocket_emits_rate_limit_events, responses_websocket_emits_reasoning_included_event, responses_websocket_emits_websocket_telemetry_events, responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create, responses_websocket_includes_timing_metrics_header_when_runtime_metrics_enabled, responses_websocket_omits_timing_metrics_header_when_runtime_metrics_disabled, responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_preconnect_is_reused_even_with_header_changes (+15 more)).
 
@@ -1734,11 +1754,11 @@ fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt
 fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &str) -> Prompt
 ```
 
-**Purpose**: Creates a prompt with both explicit input items and custom base instructions.
+**Purpose**: Builds a Prompt with both input items and custom base instructions. Tests use it to prove instruction changes prevent incremental reuse.
 
-**Data flow**: It builds a prompt via `prompt_with_input`, then overwrites `prompt.base_instructions.text` with the supplied instruction string and returns the modified prompt.
+**Data flow**: It first creates a normal prompt from the input, then sets the base_instructions text, and returns the modified prompt.
 
-**Call relations**: Tests that need to force a non-input request-field change use this helper to make two otherwise similar prompts differ in instructions.
+**Call relations**: The non-input-field-change tests call this. It delegates the common prompt setup to prompt_with_input.
 
 *Call graph*: calls 1 internal fn (prompt_with_input); called by 2 (responses_websocket_creates_when_non_input_request_fields_change, responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change).
 
@@ -1749,11 +1769,11 @@ fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &s
 fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo
 ```
 
-**Purpose**: Builds the default websocket-capable `ModelProviderInfo` for a test server.
+**Purpose**: Creates a fake model provider configuration pointing at the test WebSocket server.
 
-**Data flow**: It takes a `WebSocketTestServer` and delegates to `websocket_provider_with_connect_timeout` with no explicit connect-timeout override.
+**Data flow**: It receives the fake server and asks the more detailed provider helper to build a provider with no special connect timeout. It returns a ModelProviderInfo.
 
-**Call relations**: This is the standard provider factory used by `websocket_harness_with_options`.
+**Call relations**: websocket_harness_with_options calls this when building the standard test harness. It keeps the common provider path short.
 
 *Call graph*: calls 1 internal fn (websocket_provider_with_connect_timeout); called by 1 (websocket_harness_with_options).
 
@@ -1767,11 +1787,11 @@ fn websocket_provider_with_connect_timeout(
 ) -> ModelProviderInfo
 ```
 
-**Purpose**: Constructs a `ModelProviderInfo` configured for the mock websocket server and the Responses wire API.
+**Purpose**: Builds a ModelProviderInfo configured to use the fake server as a Responses API provider with WebSocket support.
 
-**Data flow**: It reads the server URI, formats a `/v1` base URL, fills a `ModelProviderInfo` with websocket support enabled, retries disabled, idle timeout set, optional connect timeout, and `WireApi::Responses`, then returns it.
+**Data flow**: It takes the fake server and an optional WebSocket connect timeout. It fills in provider fields such as base URL, wire API, retry counts, idle timeout, auth requirements, and supports_websockets, then returns the provider info.
 
-**Call relations**: Provider-building helpers and harness setup call this to control transport-level behavior without involving the rest of the test harness.
+**Call relations**: websocket_provider calls this for the default provider setup. Tests could use it directly when they need timeout-specific provider behavior.
 
 *Call graph*: called by 1 (websocket_provider); 1 external calls (format!).
 
@@ -1782,11 +1802,11 @@ fn websocket_provider_with_connect_timeout(
 async fn websocket_harness(server: &WebSocketTestServer) -> WebsocketTestHarness
 ```
 
-**Purpose**: Creates the standard websocket test harness with runtime metrics disabled.
+**Purpose**: Creates the standard WebSocket test harness with runtime metrics disabled.
 
-**Data flow**: It forwards the server to `websocket_harness_with_runtime_metrics(false)` and returns the resulting `WebsocketTestHarness`.
+**Data flow**: It receives a fake server and forwards to the runtime-metrics harness helper with false. It returns a WebsocketTestHarness.
 
-**Call relations**: Most tests use this convenience wrapper when they do not need special runtime-metrics or provider options.
+**Call relations**: Most tests call this when they do not need runtime metrics. It is a convenience wrapper over websocket_harness_with_runtime_metrics.
 
 *Call graph*: calls 1 internal fn (websocket_harness_with_runtime_metrics); called by 16 (responses_websocket_creates_on_non_prefix, responses_websocket_creates_when_non_input_request_fields_change, responses_websocket_emits_rate_limit_events, responses_websocket_emits_reasoning_included_event, responses_websocket_emits_websocket_telemetry_events, responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create, responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_preconnect_is_reused_even_with_header_changes, responses_websocket_preconnect_reuses_connection, responses_websocket_reuses_connection_after_session_drop (+6 more)).
 
@@ -1800,11 +1820,11 @@ async fn websocket_harness_with_runtime_metrics(
 ) -> WebsocketTestHarness
 ```
 
-**Purpose**: Creates a websocket harness while explicitly choosing whether runtime metrics are enabled.
+**Purpose**: Creates a WebSocket test harness while letting the caller choose whether runtime metrics are enabled.
 
-**Data flow**: It forwards the server and boolean flag to `websocket_harness_with_options` and returns the harness.
+**Data flow**: It takes a fake server and a boolean flag, then forwards both to the general options helper. It returns the finished harness.
 
-**Call relations**: Timing-metrics and telemetry tests use this wrapper to toggle runtime-metrics behavior while keeping the rest of the harness standard.
+**Call relations**: Metric-specific tests call this directly. The default websocket_harness also routes through it.
 
 *Call graph*: calls 1 internal fn (websocket_harness_with_options); called by 3 (responses_websocket_includes_timing_metrics_header_when_runtime_metrics_enabled, responses_websocket_omits_timing_metrics_header_when_runtime_metrics_disabled, websocket_harness).
 
@@ -1818,11 +1838,11 @@ async fn websocket_harness_with_v2(
 ) -> WebsocketTestHarness
 ```
 
-**Purpose**: Creates a websocket harness for tests that conceptually target the v2 path.
+**Purpose**: Creates a harness for tests that explicitly describe the v2 WebSocket path.
 
-**Data flow**: It simply delegates to `websocket_harness_with_options` with the provided runtime-metrics flag and returns the harness.
+**Data flow**: It receives the fake server and runtime metrics flag, then forwards to the same general options helper used by the other harness builders. It returns the harness.
 
-**Call relations**: Although it currently shares implementation with the generic options helper, v2-specific tests call this wrapper to make their intent explicit.
+**Call relations**: V2-focused tests call this. In this file it is mainly a naming wrapper that makes test intent clear.
 
 *Call graph*: calls 1 internal fn (websocket_harness_with_options); called by 5 (responses_websocket_v2_after_error_uses_full_create_without_previous_response_id, responses_websocket_v2_creates_with_previous_response_id_on_prefix, responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change, responses_websocket_v2_sets_openai_beta_header, responses_websocket_v2_surfaces_terminal_error_without_close_handshake).
 
@@ -1836,11 +1856,11 @@ async fn websocket_harness_with_options(
 ) -> WebsocketTestHarness
 ```
 
-**Purpose**: Builds a websocket harness from the default websocket provider and a runtime-metrics toggle.
+**Purpose**: Creates a WebSocket test harness from the standard fake provider plus a runtime metrics choice.
 
-**Data flow**: It creates a provider via `websocket_provider(server)`, then passes that provider and the metrics flag into `websocket_harness_with_provider_options`.
+**Data flow**: It builds a provider from the fake server, then passes that provider and the metrics flag to the lower-level harness builder. It returns the resulting WebsocketTestHarness.
 
-**Call relations**: This is the main harness entry point for tests that need a standard provider but custom feature toggles.
+**Call relations**: Many tests and wrapper helpers call this. It connects provider creation to the full harness setup.
 
 *Call graph*: calls 2 internal fn (websocket_harness_with_provider_options, websocket_provider); called by 12 (responses_websocket_preconnect_runs_when_only_v2_feature_enabled, responses_websocket_prewarm_uses_v2_when_provider_supports_websockets, responses_websocket_request_prewarm_is_reused_even_with_header_changes, responses_websocket_request_prewarm_reuses_connection, responses_websocket_request_prewarm_traces_logical_request, responses_websocket_request_prewarm_uses_caller_supplied_metadata, responses_websocket_streams_without_feature_flag_when_provider_supports_websockets, responses_websocket_v2_incremental_requests_are_reused_across_turns, responses_websocket_v2_requests_use_v2_when_provider_supports_websockets, responses_websocket_v2_wins_when_both_features_enabled (+2 more)).
 
@@ -1854,11 +1874,11 @@ async fn websocket_harness_with_provider_options(
 ) -> WebsocketTestHarness
 ```
 
-**Purpose**: Assembles the full `WebsocketTestHarness`, including temp home, config, offline model info, telemetry, and `ModelClient`.
+**Purpose**: Builds the full test environment: temporary config, fake auth, telemetry, model info, ids, and ModelClient.
 
-**Data flow**: It creates a temp codex home, loads default test config, sets the model slug, optionally enables `Feature::RuntimeMetrics`, constructs offline `ModelInfo`, fresh `ThreadId`/`SessionId`, an auth manager from a dummy API key, in-memory metrics exporter/client, `SessionTelemetry`, and finally a `ModelClient` configured with the supplied provider and runtime-metrics flag. It returns all of that packaged in `WebsocketTestHarness`.
+**Data flow**: It receives a ModelProviderInfo and runtime metrics flag. It creates a temporary Codex home, loads test config, sets the model, optionally enables runtime metrics, constructs model and telemetry objects, creates a ModelClient, and returns all of that inside WebsocketTestHarness.
 
-**Call relations**: All harness constructors funnel into this function. It is the central setup point that wires together config, telemetry, and transport state for every websocket integration test.
+**Call relations**: websocket_harness_with_options calls this after choosing a provider. This is the central setup factory that all WebSocket tests depend on.
 
 *Call graph*: calls 9 internal fn (new, auth_manager_from_auth, construct_model_info_offline, from_api_key, new, new, in_memory, new, new); called by 1 (websocket_harness_with_options); 6 external calls (new, default, new, load_default_config_for_test, env!, clone).
 
@@ -1873,11 +1893,11 @@ async fn stream_until_complete(
 )
 ```
 
-**Purpose**: Streams a prompt to completion using default service-tier behavior.
+**Purpose**: Streams a prompt using the standard harness settings and waits until the model response completes.
 
-**Data flow**: It accepts a mutable `ModelClientSession`, harness, and prompt, then delegates to `stream_until_complete_with_service_tier` with `None` and returns once completion is observed.
+**Data flow**: It takes a mutable client session, the harness, and a prompt. It forwards to the service-tier-aware helper with no service tier and returns after completion.
 
-**Call relations**: Most tests use this helper as the simplest way to drive a websocket turn and wait until the stream reaches `ResponseEvent::Completed`.
+**Call relations**: Most tests call this to avoid repeating the event-loop boilerplate. It delegates to stream_until_complete_with_service_tier.
 
 *Call graph*: calls 1 internal fn (stream_until_complete_with_service_tier); called by 24 (responses_websocket_creates_on_non_prefix, responses_websocket_creates_when_non_input_request_fields_change, responses_websocket_emits_websocket_telemetry_events, responses_websocket_includes_timing_metrics_header_when_runtime_metrics_enabled, responses_websocket_omits_timing_metrics_header_when_runtime_metrics_disabled, responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_preconnect_reuses_connection, responses_websocket_preconnect_runs_when_only_v2_feature_enabled, responses_websocket_prewarm_uses_v2_when_provider_supports_websockets, responses_websocket_request_prewarm_reuses_connection (+14 more)).
 
@@ -1893,11 +1913,11 @@ async fn stream_until_complete_with_model_info(
     expected_response_
 ```
 
-**Purpose**: Streams a prompt with an explicit `ModelInfo` and asserts the completed response id matches an expected value.
+**Purpose**: Streams a prompt with a caller-supplied ModelInfo and checks that the completed response id matches what the test expects.
 
-**Data flow**: It builds turn metadata, starts `client_session.stream` with the supplied model info and disabled inference trace, iterates events until a `Completed` event appears, compares its `response_id` to the expected string, and panics if the stream ends first.
+**Data flow**: It builds normal turn metadata, starts the client stream with the supplied model info, reads events until a Completed event appears, checks the response id, and returns. If completion never arrives, it panics.
 
-**Call relations**: The responses-lite test uses this helper repeatedly to vary model flags per request while still asserting which mocked response completed.
+**Call relations**: The responses-lite metadata test calls this because it needs to vary model settings per request. It calls the client session’s stream method directly.
 
 *Call graph*: calls 3 internal fn (stream, turn_metadata, disabled); called by 1 (responses_websocket_sends_responses_lite_metadata_per_request); 2 external calls (assert_eq!, panic!).
 
@@ -1913,11 +1933,11 @@ async fn stream_until_complete_with_service_tier(
 )
 ```
 
-**Purpose**: Streams a prompt to completion while optionally overriding the service tier.
+**Purpose**: Streams a prompt while allowing the caller to specify an optional service tier, then waits for completion.
 
-**Data flow**: It creates turn metadata, then delegates to `stream_until_complete_with_metadata` with the supplied optional `ServiceTier` and the generated metadata.
+**Data flow**: It creates ordinary turn metadata, passes the prompt and optional service tier to the metadata-aware stream helper, and returns after completion.
 
-**Call relations**: This is the intermediate helper between the simplest stream wrapper and the fully parameterized metadata-aware version.
+**Call relations**: stream_until_complete calls this with no service tier. It is the bridge between the simplest stream helper and the fully configurable one.
 
 *Call graph*: calls 2 internal fn (stream_until_complete_with_metadata, turn_metadata); called by 1 (stream_until_complete).
 
@@ -1933,24 +1953,24 @@ async fn stream_until_complete_with_metadata(
     responses
 ```
 
-**Purpose**: Starts a websocket stream with explicit metadata and optional service tier, then drains it until completion.
+**Purpose**: Starts a WebSocket stream with explicit metadata and waits until a Completed event is seen.
 
-**Data flow**: It calls `ModelClientSession::stream` with the harness model info, telemetry, effort, reasoning summary, optional service-tier request value, provided `CodexResponsesMetadata`, and a disabled inference trace; then it polls the stream until it sees `Ok(ResponseEvent::Completed { .. })`.
+**Data flow**: It takes a client session, harness, prompt, optional service tier, and metadata. It calls the client session’s stream method with disabled rollout tracing, then consumes events until completion or stream end.
 
-**Call relations**: Metadata-sensitive tests call this helper directly so they can control the serialized turn metadata while still using a common completion-draining loop.
+**Call relations**: Metadata-focused tests call this directly, and the simpler stream helpers build on it. It is the core helper for driving a request through the client without inspecting every event.
 
 *Call graph*: calls 2 internal fn (stream, disabled); called by 3 (responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create, responses_websocket_sends_canonical_turn_metadata, stream_until_complete_with_service_tier); 1 external calls (matches!).
 
 
 ### `core/tests/suite/realtime_conversation.rs`
 
-`test` · `realtime session startup, streaming event handling, and delegation regression coverage`
+`test` · `test run`
 
-This is the largest realtime integration suite in the tree. It stands up mock websocket servers, mock SSE/Responses servers, and wiremock HTTP endpoints to exercise the full `Op::RealtimeConversation*` surface. The local `RealtimeCallRequestCapture` matcher records POST bodies for WebRTC call creation so tests can inspect multipart SDP/session payloads. Utility helpers normalize JSON fixtures, extract text or instructions from captured websocket requests, poll for specific websocket requests, derive the expected backend prompt by substituting the current user's first name into `codex_prompts::BACKEND_PROMPT`, and seed recent-thread metadata directly into the state DB for startup-context tests.
+This is a large end-to-end test file for Codex's realtime conversation mode. Realtime mode is the part of the system where a user can speak or type and receive live audio/text responses through a WebSocket, or start a WebRTC call where media flows separately and a sideband WebSocket carries control messages. The tests build fake HTTP, WebSocket, and streaming response servers so the feature can be checked without talking to real OpenAI services.
 
-The tests cover several major areas. Startup and transport tests verify websocket round trips, default version/model selection, explicit/configured voice handling, base URL and backend-prompt overrides, WebRTC call creation and sideband websocket joining, architecture-specific query parameters, and correct close/error semantics when startup, connect, or sideband join fails. Startup-context tests verify when context is injected, how config overrides can replace or disable it, how recent thread metadata and workspace maps are rendered, and how current-thread history is budgeted and truncated.
+The file checks the whole journey: starting a realtime session, sending audio frames and text messages, receiving audio back, closing cleanly, and reporting errors when a user sends audio or text before a session exists. It also checks configuration choices, such as default model/version, voice selection, backend prompt overrides, and startup context. Startup context is extra background inserted into the realtime instructions, like recent thread summaries and a workspace map.
 
-A second major cluster covers interaction between realtime and normal model turns. User text turns should still go to the Responses API rather than the realtime socket. Realtime tool/noop events, inbound handoff requests, transcript accumulation, assistant-message mirroring back to realtime handoff channels, and steering of active turns are all exercised with streaming SSE fixtures and websocket event sequences. Across these tests, the suite checks not just emitted events but exact request ordering, headers, URIs, prompt text, and persistence of handoff state until turn completion.
+A major theme is handoff. In these tests, the realtime service can ask the normal Codex agent to take over a question, and the agent's answer is then mirrored back to realtime. The tests make sure this delegation does not block audio forwarding, does not accidentally loop on echoed user messages, and keeps the right transcript snippets. Without this file, regressions in live conversation behavior could ship unnoticed because many failures only appear when network events arrive in tricky orders.
 
 #### Function details
 
@@ -1960,11 +1980,11 @@ A second major cluster covers interaction between realtime and normal model turn
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a request-capture matcher that stores matched wiremock requests in shared mutable state. It is used to inspect WebRTC call-creation POSTs after the fact.
+**Purpose**: Creates a small request recorder used by WebRTC call tests. It lets a mock server accept any matching request while saving the request so the test can inspect it later.
 
-**Data flow**: Allocates an empty `Vec<WiremockRequest>` inside `Arc<Mutex<_>>` and returns a `RealtimeCallRequestCapture` containing it.
+**Data flow**: It starts with no inputs. It creates an empty shared list protected by a mutex, which is a lock that stops two tasks changing the list at the same time, and returns a capture object holding that list.
 
-**Call relations**: Called by WebRTC tests before mounting a wiremock `Mock`. The returned value is cloned into the matcher chain and later queried with `single_request`.
+**Call relations**: The WebRTC tests create this capture before mounting a mock POST endpoint. Later, the mock endpoint calls its matcher method for incoming requests, and the test reads the saved request with `RealtimeCallRequestCapture::single_request`.
 
 *Call graph*: 3 external calls (new, new, new).
 
@@ -1975,11 +1995,11 @@ fn new() -> Self
 fn single_request(&self) -> WiremockRequest
 ```
 
-**Purpose**: Returns the only captured realtime call request and asserts that exactly one was recorded. It simplifies tests that expect a single POST to the call endpoint.
+**Purpose**: Returns the one recorded realtime call request and fails the test if there was not exactly one. This keeps WebRTC tests honest about how many call-creation HTTP requests Codex sent.
 
-**Data flow**: Locks the internal mutex, recovers from poisoning if necessary, asserts `requests.len() == 1`, clones the sole `WiremockRequest`, and returns it.
+**Data flow**: It reads the shared recorded-request list, checks that the list length is one, clones that request, and returns it to the test. It does not change the saved list.
 
-**Call relations**: Used by the WebRTC call tests after the mocked endpoint has been hit. It depends on `matches` having recorded requests during wiremock matching.
+**Call relations**: WebRTC call tests use this after starting a conversation to inspect the outgoing URL, headers, and multipart body that were captured by `RealtimeCallRequestCapture::matches`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1990,11 +2010,11 @@ fn single_request(&self) -> WiremockRequest
 fn matches(&self, request: &WiremockRequest) -> bool
 ```
 
-**Purpose**: Implements the wiremock `Match` trait by recording every incoming request and always returning `true`. This lets the capture object both match and observe requests.
+**Purpose**: Implements the mock-server matcher interface by accepting every request and saving a copy. It acts like a security camera at the mock endpoint: it does not block traffic, it records what passed by.
 
-**Data flow**: Locks the internal request vector, clones the incoming `WiremockRequest`, pushes it into storage, and returns `true` so the enclosing mock still matches.
+**Data flow**: It receives a mock HTTP request, locks the shared request list, pushes a clone of the request into that list, and returns true so the mock server treats the request as matched.
 
-**Call relations**: Wiremock invokes this during request matching for the WebRTC call endpoint. Tests never call it directly; they observe its side effects through `single_request`.
+**Call relations**: Wiremock calls this when Codex posts to the fake realtime call endpoint. The tests later use `RealtimeCallRequestCapture::single_request` to examine what this method recorded.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2005,11 +2025,11 @@ fn matches(&self, request: &WiremockRequest) -> bool
 fn normalized_json_string(raw: &str) -> Result<String>
 ```
 
-**Purpose**: Parses and reserializes a JSON string into canonical compact form for stable string comparison. It is used when asserting exact multipart session payloads.
+**Purpose**: Parses a JSON string and writes it back in a stable compact form. Tests use it when comparing generated multipart bodies where JSON spacing should not matter.
 
-**Data flow**: Accepts a raw JSON string, parses it into `serde_json::Value`, then serializes that value back to a compact JSON string and returns it as `Result<String>` with contextual error messages.
+**Data flow**: It takes raw text, parses it as JSON, serializes the parsed value back into a normalized string, and returns that string or an error if parsing or serialization fails.
 
-**Call relations**: Used by `conversation_webrtc_start_posts_generated_session` to normalize the expected session JSON before comparing it to the multipart request body.
+**Call relations**: `conversation_webrtc_start_posts_generated_session` uses this helper before comparing the expected generated session JSON inside a multipart WebRTC call request.
 
 *Call graph*: called by 1 (conversation_webrtc_start_posts_generated_session); 2 external calls (from_str, to_string).
 
@@ -2022,11 +2042,11 @@ fn websocket_request_text(
 ) -> Option<String>
 ```
 
-**Purpose**: Extracts the first text content item from a captured websocket request's `item.content[0].text` field. It is a convenience accessor for conversation item requests.
+**Purpose**: Pulls the text content out of a captured WebSocket request, if that request is a text conversation item. It saves tests from repeating the same nested JSON lookup.
 
-**Data flow**: Reads `request.body_json()["item"]["content"][0]["text"]`, converts it to `Option<String>`, and returns it.
+**Data flow**: It receives a captured WebSocket request, reads its JSON body, looks under the item content text field, and returns that text as an optional string.
 
-**Call relations**: Used within tests that need to identify or assert specific realtime text requests, often together with `wait_for_matching_websocket_request`.
+**Call relations**: Tests that wait for or inspect sent realtime text use this helper inside predicates or assertions, especially when checking that only explicit text messages are sent to realtime.
 
 *Call graph*: calls 1 internal fn (body_json).
 
@@ -2039,11 +2059,11 @@ fn websocket_request_instructions(
 ) -> Option<String>
 ```
 
-**Purpose**: Extracts the session instructions string from a captured websocket request. It is the main helper for startup-context and backend-prompt assertions.
+**Purpose**: Pulls the session instructions out of a captured WebSocket request. These instructions are the prompt and optional startup context sent when a realtime session is configured.
 
-**Data flow**: Reads `request.body_json()["session"]["instructions"]`, converts it to `Option<String>`, and returns it.
+**Data flow**: It receives a captured WebSocket request, reads the JSON body, looks for `session.instructions`, and returns the value as an optional string.
 
-**Call relations**: Many startup and configuration tests call this after capturing a `session.update` websocket request. It centralizes the JSON path for instruction inspection.
+**Call relations**: Many startup, prompt, and voice tests call this after Codex sends `session.update`, so they can verify exactly what instructions the realtime backend received.
 
 *Call graph*: calls 1 internal fn (body_json); called by 11 (conversation_disables_realtime_startup_context_with_empty_override, conversation_second_start_replaces_runtime, conversation_start_audio_text_close_round_trip, conversation_start_injects_startup_context_from_thread_history, conversation_startup_context_current_thread_selects_many_turns_by_budget, conversation_startup_context_falls_back_to_workspace_map, conversation_startup_context_is_truncated_and_sent_once_per_start, conversation_uses_default_realtime_backend_prompt, conversation_uses_empty_instructions_for_null_or_empty_prompt, conversation_uses_experimental_realtime_ws_backend_prompt_override (+1 more)).
 
@@ -2058,11 +2078,11 @@ async fn wait_for_websocket_request(
 ) -> Result<core_test_support::responses::We
 ```
 
-**Purpose**: Waits for a specific websocket request by connection and request index with a short timeout. It turns asynchronous server capture into a fallible helper with a descriptive timeout error.
+**Purpose**: Waits briefly for a specific request on a specific WebSocket connection. It turns a missing request into a clear timeout error instead of letting a test hang.
 
-**Data flow**: Accepts a websocket test server plus connection and request indices, awaits `server.wait_for_request(...)` under a two-second `timeout`, and returns the captured request or an `anyhow` error with contextual text if the timeout expires.
+**Data flow**: It takes a test WebSocket server plus connection and request indexes, waits up to two seconds for that captured request, and returns the request or an error with a helpful message.
 
-**Call relations**: Used by the WebRTC generated-session test to wait for the sideband `session.update` and queued text requests after the delayed websocket join.
+**Call relations**: `conversation_webrtc_start_posts_generated_session` uses this when the sideband WebSocket is expected to receive a session update and a queued text message after a WebRTC call starts.
 
 *Call graph*: calls 1 internal fn (wait_for_request); called by 1 (conversation_webrtc_start_posts_generated_session); 2 external calls (from_secs, timeout).
 
@@ -2073,11 +2093,11 @@ async fn wait_for_websocket_request(
 fn expected_realtime_backend_prompt() -> String
 ```
 
-**Purpose**: Builds the expected default realtime backend prompt string with the user-first-name placeholder substituted. It lets tests compare against the runtime's default prompt generation.
+**Purpose**: Builds the expected default realtime backend prompt for assertions. It fills the prompt's user-name placeholder the same way production code should.
 
-**Data flow**: Takes the constant `REALTIME_BACKEND_PROMPT`, trims trailing whitespace, replaces `{{ user_first_name }}` with the result of `test_user_first_name()`, and returns the resulting `String`.
+**Data flow**: It starts from the built-in realtime backend prompt, trims trailing whitespace, replaces the user-first-name placeholder with `test_user_first_name`, and returns the final string.
 
-**Call relations**: Used by the default-backend-prompt test to compute the expected instructions text sent in `session.update`.
+**Call relations**: `conversation_uses_default_realtime_backend_prompt` compares Codex's outgoing session instructions against this helper so the test follows the same name-substitution rule.
 
 *Call graph*: calls 1 internal fn (test_user_first_name).
 
@@ -2088,11 +2108,11 @@ fn expected_realtime_backend_prompt() -> String
 fn test_user_first_name() -> String
 ```
 
-**Purpose**: Derives a stable first-name-like string for tests from the current real name or username, falling back to `there`. It mirrors the placeholder substitution logic used in the realtime backend prompt.
+**Purpose**: Finds a reasonable first name for tests that check personalized prompts. If the machine cannot provide one, it falls back to the friendly word `there`.
 
-**Data flow**: Reads `whoami::realname()` and `whoami::username()`, splits each on whitespace, takes the first non-empty token, and returns it; if none are usable, returns `"there"`.
+**Data flow**: It reads the operating system's real name and username, takes the first non-empty first word it can find, and returns that word. If both are empty, it returns `there`.
 
-**Call relations**: Only `expected_realtime_backend_prompt` calls this helper.
+**Call relations**: `expected_realtime_backend_prompt` calls this helper so tests can predict the prompt text produced on different developer or CI machines.
 
 *Call graph*: called by 1 (expected_realtime_backend_prompt); 2 external calls (realname, username).
 
@@ -2107,11 +2127,11 @@ async fn wait_for_matching_websocket_request(
 ) -> core_test_support::responses::WebSocketReque
 ```
 
-**Purpose**: Polls all captured websocket requests until one satisfies a caller-provided predicate or a deadline expires. It is the flexible request-synchronization primitive used throughout the startup-context and noop tests.
+**Purpose**: Polls the fake WebSocket server until any captured request matches a condition. This is useful when the exact connection timing is not important but the content is.
 
-**Data flow**: Accepts a websocket test server, a human-readable description, and a predicate over `WebSocketRequest`. It repeatedly scans `server.connections()` for a cloned request matching the predicate, returning it when found; otherwise it sleeps 10 ms and retries until a 10-second deadline, after which it asserts and panics.
+**Data flow**: It receives a server, a human description, and a predicate function. It repeatedly scans all captured WebSocket requests until one passes the predicate, returns that request, or fails after ten seconds.
 
-**Call relations**: Used by tests that cannot rely on fixed connection/request indices, such as startup-context assertions that search for the first request containing instructions or a specific request type.
+**Call relations**: Startup-context and noop-tool tests use this to wait for meaningful outbound realtime messages, such as a `session.update` with instructions or proof that no unexpected `response.create` appeared.
 
 *Call graph*: calls 1 internal fn (connections); called by 7 (conversation_disables_realtime_startup_context_with_empty_override, conversation_start_injects_startup_context_from_thread_history, conversation_startup_context_current_thread_selects_many_turns_by_budget, conversation_startup_context_falls_back_to_workspace_map, conversation_startup_context_is_truncated_and_sent_once_per_start, conversation_uses_experimental_realtime_ws_startup_context_override, realtime_v2_noop_tool_call_returns_empty_function_output_without_response); 5 external calls (from_millis, from_secs, assert!, now, sleep).
 
@@ -2125,11 +2145,11 @@ fn run_realtime_conversation_test_in_subprocess(
 ) -> Result<()>
 ```
 
-**Purpose**: Re-executes a specific realtime test in a subprocess with controlled environment variables. It isolates auth and proxy environment behavior that would otherwise be hard to test in-process.
+**Purpose**: Runs a selected test again in a child process with controlled environment variables. This isolates tests that depend on whether an API key environment variable is present.
 
-**Data flow**: Builds a `Command` targeting the current test binary with `--exact <test_name>`, sets the subprocess marker env var, removes all proxy env vars listed in `codex_network_proxy::PROXY_ENV_KEYS`, conditionally sets or removes `OPENAI_API_KEY_ENV_VAR`, runs the command, and asserts the child exited successfully, including stdout/stderr in the failure message.
+**Data flow**: It receives a test name and optional API key, starts the current test binary with that exact test selected, removes proxy variables, sets or clears the API key, waits for completion, and fails if the child process failed.
 
-**Call relations**: Called by the tests that need to vary `OPENAI_API_KEY_ENV_VAR` or ensure preflight behavior under a clean environment. Those tests early-return to this helper when not already in the subprocess.
+**Call relations**: Auth-sensitive tests call this first from the parent process. The child process then runs the same test body with a marker environment variable so it performs the real assertions.
 
 *Call graph*: called by 2 (conversation_start_preflight_failure_emits_realtime_error_only, conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth); 3 external calls (assert!, new, current_exe).
 
@@ -2145,11 +2165,11 @@ async fn seed_recent_thread(
 ) -> Result<()>
 ```
 
-**Purpose**: Seeds thread metadata directly into the state DB and creates a placeholder rollout path so startup-context generation can discover recent work without paying for real model turns. It is a fixture helper for startup-context tests.
+**Purpose**: Creates fake recent-thread metadata so startup-context tests have realistic history to summarize. It avoids needing to run a full conversation just to create history.
 
-**Data flow**: Accepts a `TestCodex`, title, first user message, and slug; obtains the state DB from `test.codex`, creates a new `ThreadId`, computes `updated_at = Utc::now()`, writes an empty rollout file under the Codex home, builds `codex_state::ThreadMetadataBuilder` with session source `Cli`, fills cwd, model provider, git branch, title, and first user message, then upserts the metadata into the DB.
+**Data flow**: It receives a test Codex instance plus title, first user message, and slug. It creates a rollout placeholder file, builds thread metadata with workspace, provider, and branch information, writes it to the state database, and returns success or an error.
 
-**Call relations**: Used by startup-context tests that need recent-session summaries. It bypasses rollout-writing logic and directly prepares the metadata that startup-context rendering consumes.
+**Call relations**: Startup-context tests call this before starting realtime. The realtime startup code later reads that seeded history and includes it in the session instructions, which the tests inspect through WebSocket requests.
 
 *Call graph*: calls 4 internal fn (codex_home_path, workspace_path, new, new); called by 4 (conversation_disables_realtime_startup_context_with_empty_override, conversation_start_injects_startup_context_from_thread_history, conversation_startup_context_is_truncated_and_sent_once_per_start, conversation_uses_experimental_realtime_ws_startup_context_override); 3 external calls (now, format!, write).
 
@@ -2160,11 +2180,11 @@ async fn seed_recent_thread(
 async fn conversation_start_audio_text_close_round_trip() -> Result<()>
 ```
 
-**Purpose**: Exercises the basic websocket realtime lifecycle: start a conversation, receive session update and audio output, send audio and text input, and close the conversation. It also verifies handshake headers, URI, default voice, and request ordering.
+**Purpose**: Checks the basic realtime lifecycle: start a session, send audio and text, receive audio, and close. This is the simplest full round trip for the realtime WebSocket path.
 
-**Data flow**: Starts a websocket server with scripted responses across two connections, builds a websocket-backed `TestCodex`, submits `Op::RealtimeConversationStart` with audio output and explicit backend prompt, waits for `RealtimeConversationStarted` and `SessionUpdated`, submits `RealtimeConversationAudio` and `RealtimeConversationText`, waits for `AudioOut`, inspects captured websocket connections and handshakes for `session.update`, voice `cove`, instructions prefix, `x-session-id`, authorization header, and URI, then submits `RealtimeConversationClose` and waits for `RealtimeConversationClosed`.
+**Data flow**: It creates a fake WebSocket server, starts Codex against it, sends a realtime start operation, then sends one audio frame and one text message. It checks Codex emits started/session/audio/closed events and that the fake server received the expected session update, headers, URI, audio request, and text request.
 
-**Call relations**: This direct test is the baseline realtime round-trip scenario. Many later tests vary one aspect of this flow—version, transport, prompt, voice, or failure mode.
+**Call relations**: This test drives the public Codex operation API and relies on helpers like `websocket_request_instructions`. It exercises the same start/send/close flow that user interfaces depend on.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, test_codex, websocket_request_instructions); 8 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationAudio, RealtimeConversationStart, RealtimeConversationText, skip_if_no_network!, vec!).
 
@@ -2175,11 +2195,11 @@ async fn conversation_start_audio_text_close_round_trip() -> Result<()>
 async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()>
 ```
 
-**Purpose**: Verifies the default realtime websocket version and model selection when no explicit version or model is supplied. It expects v2 and `gpt-realtime-1.5`.
+**Purpose**: Verifies the default realtime settings when the caller does not choose a version or model. It protects the expected move to version 2 and the `gpt-realtime-1.5` model.
 
-**Data flow**: Starts a mock API server and websocket server, configures `experimental_realtime_ws_base_url` and empty startup context, builds `TestCodex`, submits `RealtimeConversationStart`, waits for `RealtimeConversationStarted`, then inspects the first realtime `session.update` request and handshake URI to assert started version `V2`, handshake URI `/v1/realtime?model=gpt-realtime-1.5`, default voice `marin`, and instructions `backend prompt`.
+**Data flow**: It configures a fake realtime base URL, starts a conversation with no model or version, waits for the start and handshake, then reads the first session update. It confirms the version, request URI, default voice, and instructions.
 
-**Call relations**: Invoked directly by the test runner. It focuses on default configuration resolution rather than message exchange after startup.
+**Call relations**: This test sits near the start of the suite because many other tests pin version 1 or override values. It confirms the default path before the more specialized cases.
 
 *Call graph*: calls 3 internal fn (start_mock_server, start_websocket_server, test_codex); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2190,11 +2210,11 @@ async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()>
 async fn conversation_webrtc_start_posts_generated_session() -> Result<()>
 ```
 
-**Purpose**: Tests WebRTC startup end to end: POSTing SDP plus generated session JSON to the call endpoint, emitting the SDP answer before sideband websocket join, queueing text until sideband connects, and then joining the call over websocket. It validates the multipart body and delayed sideband behavior.
+**Purpose**: Checks that starting a WebRTC realtime conversation posts both the SDP offer and generated session settings to the call-creation endpoint. SDP is the text format browsers use to negotiate a WebRTC connection.
 
-**Data flow**: Starts a mock HTTP server with a captured POST `/realtime/calls` returning an SDP answer and `Location` header, plus a websocket server whose accept is delayed. Builds `TestCodex` with realtime backend prompt/model/startup context/base URL and version v1, submits `RealtimeConversationStart` with `ConversationStartTransport::Webrtc { sdp }`, waits for `RealtimeConversationSdp`, submits realtime text before sideband join, waits for `SessionUpdated`, inspects the captured HTTP request path, headers, multipart body, and normalized session JSON, then waits for sideband websocket requests to assert `session.update` includes startup context and the queued text is sent after join. Finally it closes the conversation and waits for `RealtimeConversationClosed`.
+**Data flow**: It sets up a fake HTTP call endpoint and delayed sideband WebSocket, starts a WebRTC conversation, captures the SDP answer event, queues text before the sideband joins, then inspects the captured multipart POST body and later sideband WebSocket messages.
 
-**Call relations**: This direct test combines `RealtimeCallRequestCapture`, `normalized_json_string`, and `wait_for_websocket_request`. It is the main positive-path WebRTC integration test.
+**Call relations**: This test uses `RealtimeCallRequestCapture`, `normalized_json_string`, and `wait_for_websocket_request`. It proves the WebRTC media leg can begin before the control WebSocket is ready and that queued messages are delivered later.
 
 *Call graph*: calls 6 internal fn (new, start_mock_server, start_websocket_server_with_headers, test_codex, normalized_json_string, wait_for_websocket_request); 13 external calls (from_millis, given, new, from_utf8, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, RealtimeConversationText, skip_if_no_network! (+3 more)).
 
@@ -2205,11 +2225,11 @@ async fn conversation_webrtc_start_posts_generated_session() -> Result<()>
 async fn conversation_webrtc_start_uses_avas_architecture_query() -> Result<()>
 ```
 
-**Purpose**: Verifies that starting a WebRTC realtime conversation with `RealtimeConversationArchitecture::Avas` adds `architecture=avas` to the call-creation query string and still joins the returned call id over websocket. It checks architecture-specific routing.
+**Purpose**: Checks that WebRTC call creation adds the AVAS architecture query parameter when requested. This matters because the backend may route AVAS calls differently.
 
-**Data flow**: Starts a mock HTTP call endpoint with request capture and a websocket sideband server, builds `TestCodex` with realtime backend prompt/base URL and version v1, submits `RealtimeConversationStart` using WebRTC transport and `architecture: Some(Avas)`, waits for the SDP answer and later `SessionUpdated`, then asserts the captured POST query is `intent=quicksilver&architecture=avas` and the websocket handshake URI uses the returned `call_id`.
+**Data flow**: It starts fake HTTP and WebSocket servers, requests a WebRTC conversation with the AVAS architecture, waits for the SDP answer and session update, then checks the call POST URL query and sideband handshake URI.
 
-**Call relations**: Called directly by the test runner. It is a focused variant of the generated-session WebRTC test that targets architecture query composition.
+**Call relations**: This test uses `RealtimeCallRequestCapture` to inspect the call-creation request. It complements the general WebRTC start test by focusing on one routing option.
 
 *Call graph*: calls 4 internal fn (new, start_mock_server, start_websocket_server_with_headers, test_codex); 9 external calls (given, new, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!, method, path_regex).
 
@@ -2220,11 +2240,11 @@ async fn conversation_webrtc_start_uses_avas_architecture_query() -> Result<()>
 async fn conversation_webrtc_start_uses_configured_call_base_url_for_avas() -> Result<()>
 ```
 
-**Purpose**: Checks that WebRTC call creation for AVAS uses the configured call base URL while the sideband websocket still joins using the returned call id. It validates separation of HTTP call endpoint configuration from websocket base URL configuration.
+**Purpose**: Verifies that the configured WebRTC call base URL is honored for AVAS calls. Without this, tests and local deployments could accidentally post call setup to the wrong endpoint.
 
-**Data flow**: Starts a mock HTTP server with captured call endpoint and a websocket server, configures `experimental_realtime_webrtc_call_base_url` plus realtime websocket base URL and backend prompt, submits an AVAS WebRTC start, waits for SDP and `SessionUpdated`, then asserts the captured POST hit `/v1/realtime/calls` with `intent=quicksilver&architecture=avas` and the websocket handshake URI uses `/v1/realtime?intent=quicksilver&call_id=rtc_local_avas_test`.
+**Data flow**: It configures a custom call base URL, starts an AVAS WebRTC conversation, waits for the SDP and session update, then checks the captured call POST path/query and the sideband WebSocket handshake.
 
-**Call relations**: This direct test extends the previous AVAS query test by adding explicit call-base-url override coverage.
+**Call relations**: Like the AVAS query test, it uses `RealtimeCallRequestCapture`. It adds coverage for configuration-based routing rather than default routing.
 
 *Call graph*: calls 4 internal fn (new, start_mock_server, start_websocket_server_with_headers, test_codex); 10 external calls (given, new, assert_eq!, wait_for_event_match, format!, RealtimeConversationStart, skip_if_no_network!, vec!, method, path_regex).
 
@@ -2235,11 +2255,11 @@ async fn conversation_webrtc_start_uses_configured_call_base_url_for_avas() -> R
 async fn conversation_webrtc_close_while_sideband_connecting_drops_pending_join() -> Result<()>
 ```
 
-**Purpose**: Verifies that closing a WebRTC conversation after receiving the SDP answer but before the delayed sideband websocket connects cancels the pending join task cleanly. No stale realtime error or close events should leak afterward.
+**Purpose**: Ensures closing a WebRTC conversation while the sideband WebSocket is still connecting cancels that pending join. This prevents stale background tasks from emitting late errors or close events.
 
-**Data flow**: Starts a mock HTTP call endpoint and a websocket server with delayed accept, builds `TestCodex`, submits a WebRTC start, waits for the SDP answer, asserts no websocket handshake has occurred yet, submits `RealtimeConversationClose`, waits for a closed event with reason `requested`, then uses a short timeout to ensure no later realtime error or extra close event arrives and asserts the websocket server still saw no handshake.
+**Data flow**: It starts a WebRTC session whose sideband accept is delayed, waits for the SDP answer, closes the conversation immediately, then watches for unwanted later realtime errors or close events and checks that no sideband handshake completed.
 
-**Call relations**: Invoked directly by the test runner. It targets cancellation behavior in the gap between media-leg setup and sideband websocket establishment.
+**Call relations**: This test stresses timing around WebRTC startup. It verifies that `RealtimeConversationClose` wins over a still-pending sideband connection attempt.
 
 *Call graph*: calls 3 internal fn (start_mock_server, start_websocket_server_with_headers, test_codex); 12 external calls (from_millis, given, new, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, timeout, vec! (+2 more)).
 
@@ -2250,11 +2270,11 @@ async fn conversation_webrtc_close_while_sideband_connecting_drops_pending_join(
 async fn conversation_webrtc_sideband_connect_failure_closes_with_error() -> Result<()>
 ```
 
-**Purpose**: Checks that if the WebRTC sideband websocket cannot connect after call creation succeeds, the runtime emits a realtime error, closes the conversation with reason `error`, and rejects later realtime input as not running. It covers the post-SDP failure path.
+**Purpose**: Checks the failure path when WebRTC call creation succeeds but the sideband WebSocket cannot connect. The user should see a realtime error and the conversation should stop.
 
-**Data flow**: Starts a mock HTTP call endpoint returning SDP, configures realtime websocket base URL to an unreachable localhost port and retries to zero, builds `TestCodex`, submits a WebRTC start, waits for `RealtimeConversationStarted`, waits for the SDP answer, then waits for a realtime error event and a closed event with reason `error`. After closure it submits realtime text and asserts a normal `EventMsg::Error` reports `conversation is not running`.
+**Data flow**: It posts the WebRTC call successfully, points the sideband URL at a refused local port, waits for started and SDP events, then expects a realtime error followed by a closed event with reason `error`. It also checks later text submission is rejected because no conversation is running.
 
-**Call relations**: This direct test complements the pending-join cancellation test by covering actual sideband connection failure rather than user-requested close.
+**Call relations**: This test follows the WebRTC startup flow but forces the sideband connection to fail. It confirms that subsequent operations see the runtime as closed.
 
 *Call graph*: calls 2 internal fn (start_mock_server, test_codex); 10 external calls (given, new, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, RealtimeConversationText, skip_if_no_network!, method, path_regex).
 
@@ -2265,11 +2285,11 @@ async fn conversation_webrtc_sideband_connect_failure_closes_with_error() -> Res
 async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> Result<()>
 ```
 
-**Purpose**: Verifies that realtime startup uses `OPENAI_API_KEY_ENV_VAR` as the authorization bearer token when the process has ChatGPT auth but realtime requires API-key auth. It tests auth fallback behavior in a subprocess-controlled environment.
+**Purpose**: Checks that realtime can use an OpenAI API key from the environment when the configured auth is ChatGPT-style auth. Realtime requires API-key auth, so this fallback is important.
 
-**Data flow**: If not already in the subprocess, re-executes itself with `OPENAI_API_KEY_ENV_VAR=env-realtime-key`. In the subprocess it starts a websocket server, builds `TestCodex` with dummy ChatGPT auth, submits `RealtimeConversationStart`, waits for `RealtimeConversationStarted` and `SessionUpdated`, then asserts the second websocket handshake's `authorization` header is `Bearer env-realtime-key`. Finally it closes the conversation.
+**Data flow**: In the parent process it reruns itself with an environment API key. In the child, it starts a realtime conversation using dummy ChatGPT auth, waits for session setup, and verifies the WebSocket authorization header uses the environment key.
 
-**Call relations**: This direct test delegates environment setup to `run_realtime_conversation_test_in_subprocess` on the first invocation. Inside the child it follows the normal websocket startup path and inspects handshake headers.
+**Call relations**: It uses `run_realtime_conversation_test_in_subprocess` to control the environment. This pairs with the preflight-failure test where no fallback key exists.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, test_codex, run_realtime_conversation_test_in_subprocess, create_dummy_chatgpt_auth_for_testing); 7 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, var_os, vec!).
 
@@ -2280,11 +2300,11 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
 async fn conversation_transport_close_emits_closed_event() -> Result<()>
 ```
 
-**Purpose**: Ensures that when the websocket transport closes after startup, Codex emits `RealtimeConversationClosed` with reason `transport_closed`. It validates passive transport shutdown handling.
+**Purpose**: Verifies that when the WebSocket transport closes by itself, Codex reports a closed realtime conversation. This gives clients a clear signal that the live session ended.
 
-**Data flow**: Starts a websocket server that sends `session.updated` and then closes, builds `TestCodex`, submits `RealtimeConversationStart`, waits for `RealtimeConversationStarted` and `SessionUpdated`, then waits for `RealtimeConversationClosed` and asserts its reason is `transport_closed`.
+**Data flow**: It starts a fake server that sends a session update and then closes. The test starts realtime, waits for the session update, then waits for a closed event whose reason is `transport_closed`.
 
-**Call relations**: This direct test covers the transport-driven close path, distinct from explicit user close or startup failure.
+**Call relations**: This covers server-initiated shutdown, unlike tests where Codex explicitly sends `RealtimeConversationClose`.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2295,11 +2315,11 @@ async fn conversation_transport_close_emits_closed_event() -> Result<()>
 async fn conversation_audio_before_start_emits_error() -> Result<()>
 ```
 
-**Purpose**: Checks that sending realtime audio before any conversation has started yields a bad-request error. It guards the runtime's precondition checks.
+**Purpose**: Checks that sending realtime audio before a conversation exists produces a clear bad-request error. This prevents silent dropping of user audio.
 
-**Data flow**: Starts an empty websocket server, builds `TestCodex`, submits `Op::RealtimeConversationAudio` with one frame, waits for `EventMsg::Error`, and asserts `codex_error_info == Some(BadRequest)` and message `conversation is not running`.
+**Data flow**: It starts Codex without starting realtime, submits an audio frame, then waits for an error event saying the conversation is not running and marked as a bad request.
 
-**Call relations**: This direct test exercises the command-validation path without starting a realtime session.
+**Call relations**: This is one of the guardrail tests for operation ordering. It mirrors `conversation_text_before_start_emits_error` for text input.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 5 external calls (assert_eq!, wait_for_event_match, RealtimeConversationAudio, skip_if_no_network!, vec!).
 
@@ -2310,11 +2330,11 @@ async fn conversation_audio_before_start_emits_error() -> Result<()>
 async fn conversation_start_preflight_failure_emits_realtime_error_only() -> Result<()>
 ```
 
-**Purpose**: Verifies that a realtime start preflight failure emits only a realtime error event and does not emit a closed event. The tested preflight failure is missing API-key auth in a subprocess with no OpenAI env key.
+**Purpose**: Ensures an auth preflight failure is reported as a realtime error, without also emitting a misleading closed event. Preflight means the start request is rejected before a transport is opened.
 
-**Data flow**: If not already in the subprocess, re-executes itself with `OPENAI_API_KEY_ENV_VAR` removed. In the subprocess it starts an empty websocket server, builds `TestCodex` with dummy ChatGPT auth, submits `RealtimeConversationStart`, waits for a `RealtimeEvent::Error` carrying `realtime conversation requires API key auth`, then uses a short timeout to assert no `RealtimeConversationClosed` event arrives.
+**Data flow**: It runs in a subprocess with no API key, starts realtime using ChatGPT auth, waits for a realtime error saying API-key auth is required, then confirms no closed event arrives shortly after.
 
-**Call relations**: This direct test uses `run_realtime_conversation_test_in_subprocess` to control environment state. It targets the preflight validation branch before any transport connection is attempted.
+**Call relations**: It uses `run_realtime_conversation_test_in_subprocess` to guarantee the API key is absent. It complements the environment-key fallback test.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, test_codex, run_realtime_conversation_test_in_subprocess, create_dummy_chatgpt_auth_for_testing); 9 external calls (from_millis, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, var_os, timeout, vec!).
 
@@ -2325,11 +2345,11 @@ async fn conversation_start_preflight_failure_emits_realtime_error_only() -> Res
 async fn conversation_start_connect_failure_emits_realtime_error_only() -> Result<()>
 ```
 
-**Purpose**: Checks that a websocket connection failure during realtime start emits a realtime error but no closed event. It distinguishes connect failure from a started-then-closed session.
+**Purpose**: Checks that a connection failure during startup is reported as a realtime error and not as a normal close. This distinguishes 'never started' from 'started and later closed'.
 
-**Data flow**: Starts an unused websocket server, builds `TestCodex` configured with an unreachable realtime websocket base URL and version v1, submits `RealtimeConversationStart`, waits for a non-empty realtime error message, then uses a short timeout to assert no `RealtimeConversationClosed` event is emitted.
+**Data flow**: It points the realtime WebSocket base URL at a refused local port, submits a start operation, waits for a non-empty realtime error, and confirms no closed event follows within a short timeout.
 
-**Call relations**: This direct test complements the preflight-failure test by covering failure after preflight but before a successful connection.
+**Call relations**: This covers the transport-connect failure path for WebSocket realtime starts, separate from WebRTC sideband failures that occur after call creation.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 7 external calls (from_millis, assert!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, timeout, vec!).
 
@@ -2340,11 +2360,11 @@ async fn conversation_start_connect_failure_emits_realtime_error_only() -> Resul
 async fn conversation_text_before_start_emits_error() -> Result<()>
 ```
 
-**Purpose**: Checks that sending realtime text before starting a conversation yields a bad-request error. It is the text-input counterpart to the audio-before-start test.
+**Purpose**: Checks that sending realtime text before a conversation exists produces a clear bad-request error. This prevents user text from disappearing without feedback.
 
-**Data flow**: Starts an empty websocket server, builds `TestCodex`, submits `Op::RealtimeConversationText` with user role and text `hello`, waits for `EventMsg::Error`, and asserts bad-request classification and message `conversation is not running`.
+**Data flow**: It starts Codex without a realtime session, submits a realtime text operation, and waits for an error event saying the conversation is not running.
 
-**Call relations**: This direct test exercises the same precondition guard as the audio-before-start test but for text input.
+**Call relations**: This is the text counterpart to `conversation_audio_before_start_emits_error` and protects the same runtime-state check.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 5 external calls (assert_eq!, wait_for_event_match, RealtimeConversationText, skip_if_no_network!, vec!).
 
@@ -2355,11 +2375,11 @@ async fn conversation_text_before_start_emits_error() -> Result<()>
 async fn conversation_second_start_replaces_runtime() -> Result<()>
 ```
 
-**Purpose**: Verifies that starting a second realtime conversation replaces the first runtime, so subsequent audio goes to the new websocket session and the old one is not reused. It checks runtime replacement semantics.
+**Purpose**: Verifies that starting a second realtime conversation replaces the first runtime. After replacement, new audio should go to the new WebSocket connection, not the old one.
 
-**Data flow**: Starts a websocket server scripted for three connections: startup, first conversation, and second conversation. Builds `TestCodex`, starts the first conversation with prompt `old` and session id `conv_old`, waits for `sess_old`, starts a second conversation with prompt `new` and session id `conv_new`, waits for `sess_new`, sends realtime audio, waits for `AudioOut`, then inspects captured connections and handshakes to assert the first session used `old` instructions and `x-session-id=conv_old`, the second used `new` instructions and `x-session-id=conv_new`, and the audio append went to the second connection.
+**Data flow**: It starts one realtime session with old instructions and session id, then starts another with new instructions and session id. It sends audio and checks the fake server saw only the new connection receive the audio append.
 
-**Call relations**: This direct test extends the baseline startup flow to cover replacement of an existing realtime runtime by a new start command.
+**Call relations**: This test drives two `RealtimeConversationStart` operations back to back and uses `websocket_request_instructions` to prove each connection received the right setup.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, test_codex, websocket_request_instructions); 7 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationAudio, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2370,11 +2390,11 @@ async fn conversation_second_start_replaces_runtime() -> Result<()>
 async fn conversation_uses_experimental_realtime_ws_base_url_override() -> Result<()>
 ```
 
-**Purpose**: Checks that realtime conversation traffic uses `experimental_realtime_ws_base_url` instead of the startup websocket server configured for the test harness. It validates explicit routing override.
+**Purpose**: Checks that an experimental config value can redirect realtime WebSocket traffic to a custom base URL. This is useful for tests, local development, and alternate backends.
 
-**Data flow**: Starts separate startup and realtime websocket servers, builds `TestCodex` with the realtime base URL override and version v1, submits `RealtimeConversationStart`, waits for `SessionUpdated`, then asserts the startup server saw only its initial harness connection while the realtime server captured the actual `session.update` request.
+**Data flow**: It creates one startup server and one realtime server, configures the realtime override to point at the second server, starts realtime, and confirms only the realtime server receives the session update.
 
-**Call relations**: This direct test isolates base-URL override behavior by separating the harness websocket endpoint from the realtime endpoint.
+**Call relations**: This test verifies configuration wiring before later tests rely on custom realtime servers for startup-context and handoff scenarios.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2385,11 +2405,11 @@ async fn conversation_uses_experimental_realtime_ws_base_url_override() -> Resul
 async fn conversation_uses_default_realtime_backend_prompt() -> Result<()>
 ```
 
-**Purpose**: Verifies that when no prompt is supplied in the start op, realtime startup uses the default backend prompt plus configured startup context. It checks default prompt synthesis.
+**Purpose**: Verifies that when no prompt is supplied, Codex uses its built-in realtime backend prompt plus startup context. This protects the default assistant instructions.
 
-**Data flow**: Starts a websocket server, builds `TestCodex` with `experimental_realtime_ws_startup_context = "controlled startup context"`, submits `RealtimeConversationStart` with `prompt: None`, waits for `SessionUpdated`, then extracts instructions from the captured `session.update` request and asserts they equal `expected_realtime_backend_prompt() + "\n\ncontrolled startup context"`.
+**Data flow**: It configures a controlled startup context, starts realtime with no prompt, waits for the session update, and compares the outgoing instructions against `expected_realtime_backend_prompt` plus the context.
 
-**Call relations**: This direct test uses `expected_realtime_backend_prompt` and `websocket_request_instructions` to validate the default prompt path.
+**Call relations**: It calls `expected_realtime_backend_prompt`, which accounts for local user-name substitution, and `websocket_request_instructions` to inspect what was sent.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, test_codex, websocket_request_instructions); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2400,11 +2420,11 @@ async fn conversation_uses_default_realtime_backend_prompt() -> Result<()>
 async fn conversation_uses_empty_instructions_for_null_or_empty_prompt() -> Result<()>
 ```
 
-**Purpose**: Checks that explicit null or empty prompt values produce empty realtime instructions rather than falling back to defaults. It distinguishes `prompt: None` from `prompt: Some(None)` and `prompt: Some(Some(""))`.
+**Purpose**: Checks the difference between no prompt and an explicitly empty prompt. If the caller says null or empty, Codex should send empty instructions rather than falling back to defaults.
 
-**Data flow**: Starts a websocket server scripted for two conversation starts, builds `TestCodex` with empty startup context, loops over `(Some(None), "sess_null")` and `(Some(Some(String::new())), "sess_empty")`, submits `RealtimeConversationStart` for each, waits for `SessionUpdated`, closes the conversation, then inspects the two captured `session.update` requests and asserts both instruction strings are empty.
+**Data flow**: It starts two realtime sessions, one with an explicit null prompt and one with an empty string prompt. For each, it waits for the matching session id, closes it, then verifies both session updates contained empty instructions.
 
-**Call relations**: This direct test covers prompt-nullability semantics across two sequential starts on the same harness.
+**Call relations**: This test uses the same prompt-inspection helper as the default-prompt test, but proves explicit emptiness is respected.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, test_codex, websocket_request_instructions); 7 external calls (new, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2415,11 +2435,11 @@ async fn conversation_uses_empty_instructions_for_null_or_empty_prompt() -> Resu
 async fn conversation_uses_explicit_start_voice() -> Result<()>
 ```
 
-**Purpose**: Verifies that an explicit `voice` in `ConversationStartParams` is sent in the realtime session update. It checks per-start voice override behavior.
+**Purpose**: Verifies that a voice passed in the start operation is sent to realtime. Voice selection controls which spoken output voice the realtime backend should use.
 
-**Data flow**: Starts a websocket server, builds `TestCodex`, submits `RealtimeConversationStart` with `voice: Some(RealtimeVoice::Breeze)`, waits for `SessionUpdated`, then asserts the captured `session.update` request contains `session.audio.output.voice == "breeze"`.
+**Data flow**: It starts a realtime session with the `Breeze` voice, waits for the session update, and checks the outgoing session JSON contains `breeze` as the output voice.
 
-**Call relations**: This direct test focuses on start-op voice selection, contrasting with the configured-voice and wrong-version tests.
+**Call relations**: This test covers per-request voice selection. The configured-voice test covers the config fallback when no start voice is supplied.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2430,11 +2450,11 @@ async fn conversation_uses_explicit_start_voice() -> Result<()>
 async fn conversation_uses_configured_realtime_voice() -> Result<()>
 ```
 
-**Purpose**: Checks that configured realtime voice in `config.realtime.voice` is used when the start op does not specify one. It validates config-default voice selection.
+**Purpose**: Checks that the configured realtime voice is used when the start operation does not specify one. This makes user or project settings affect realtime speech.
 
-**Data flow**: Starts a websocket server, builds `TestCodex` with `config.realtime.voice = Some(Cove)`, submits `RealtimeConversationStart` without an explicit voice, waits for `SessionUpdated`, and asserts the captured `session.update` request uses `voice == "cove"`.
+**Data flow**: It sets the config voice to `Cove`, starts realtime without an explicit voice, waits for session setup, and verifies the session update contains `cove`.
 
-**Call relations**: This direct test complements the explicit-start-voice test by covering config-driven defaulting.
+**Call relations**: This complements `conversation_uses_explicit_start_voice` by proving the config path works.
 
 *Call graph*: calls 2 internal fn (start_websocket_server, test_codex); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2445,11 +2465,11 @@ async fn conversation_uses_configured_realtime_voice() -> Result<()>
 async fn conversation_rejects_voice_for_wrong_realtime_version() -> Result<()>
 ```
 
-**Purpose**: Verifies that specifying a voice unsupported by the selected realtime version yields a realtime error. In this suite, v2 rejects `cove`.
+**Purpose**: Ensures Codex rejects a voice option that is not supported by the selected realtime WebSocket version. This prevents sending invalid session settings to the backend.
 
-**Data flow**: Starts a mock API server, builds `TestCodex` with `config.realtime.version = V2`, submits `RealtimeConversationStart` with `voice: Some(Cove)`, waits for a realtime error event, and asserts the message mentions that realtime voice `cove` is not supported for v2.
+**Data flow**: It configures realtime version 2, starts a conversation with a version-incompatible voice, and waits for a realtime error message explaining the voice is unsupported for v2.
 
-**Call relations**: This direct test targets version/voice validation before or during startup rather than transport behavior.
+**Call relations**: This test focuses on validation before transport setup. It protects version-specific behavior that the successful voice tests do not cover.
 
 *Call graph*: calls 2 internal fn (start_mock_server, test_codex); 4 external calls (assert!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!).
 
@@ -2460,11 +2480,11 @@ async fn conversation_rejects_voice_for_wrong_realtime_version() -> Result<()>
 async fn conversation_uses_experimental_realtime_ws_backend_prompt_override() -> Result<()>
 ```
 
-**Purpose**: Checks that configured `experimental_realtime_ws_backend_prompt` overrides the prompt supplied in the start op. It validates config precedence for backend prompt selection.
+**Purpose**: Checks that a configured backend prompt override wins over the prompt passed in the start operation. This lets experimental configuration force a known prompt.
 
-**Data flow**: Starts a websocket server, builds `TestCodex` with backend prompt override `prompt from config`, submits `RealtimeConversationStart` with `prompt from op`, waits for `SessionUpdated`, then extracts instructions from the captured `session.update` request and asserts they start with `prompt from config`.
+**Data flow**: It sets the config backend prompt to `prompt from config`, starts realtime with a different operation prompt, waits for session setup, and verifies the sent instructions start with the configured prompt.
 
-**Call relations**: This direct test isolates backend-prompt precedence, using `websocket_request_instructions` for verification.
+**Call relations**: This test uses `websocket_request_instructions` and is part of the group that checks how prompts and startup context are combined.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, test_codex, websocket_request_instructions); 6 external calls (assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2475,11 +2495,11 @@ async fn conversation_uses_experimental_realtime_ws_backend_prompt_override() ->
 async fn conversation_uses_experimental_realtime_ws_startup_context_override() -> Result<()>
 ```
 
-**Purpose**: Verifies that configured startup context text replaces generated startup context content, even when recent thread metadata and workspace files exist. It ensures the override is literal and suppresses automatic sections.
+**Purpose**: Verifies that a configured startup-context override is appended to instructions instead of generating automatic context. This gives tests or operators precise control over what realtime receives.
 
-**Data flow**: Starts separate startup and realtime websocket servers, builds `TestCodex` with realtime base URL, version v1, backend prompt override, and startup context override `custom startup context`, seeds recent thread metadata and workspace files, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, extracts those instructions, and asserts they equal `prompt from config\n\ncustom startup context` and do not contain the startup-context header or workspace-map section.
+**Data flow**: It seeds recent-thread and workspace data, configures a custom startup context, starts realtime, waits for the session update with instructions, and checks those instructions contain only the configured prompt plus custom context.
 
-**Call relations**: This direct test uses `seed_recent_thread`, `wait_for_matching_websocket_request`, and `websocket_request_instructions` to prove the override bypasses generated startup context.
+**Call relations**: It calls `seed_recent_thread` to create data that automatic context would normally include, then proves the override bypasses that generated content.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, test_codex, seed_recent_thread, wait_for_matching_websocket_request, websocket_request_instructions); 7 external calls (assert!, assert_eq!, create_dir_all, write, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2490,11 +2510,11 @@ async fn conversation_uses_experimental_realtime_ws_startup_context_override() -
 async fn conversation_disables_realtime_startup_context_with_empty_override() -> Result<()>
 ```
 
-**Purpose**: Checks that setting the startup-context override to an empty string disables startup-context injection entirely. Only the backend prompt should remain in the session instructions.
+**Purpose**: Checks that setting the startup-context override to an empty string disables startup context entirely. This is different from using generated context.
 
-**Data flow**: Starts startup and realtime websocket servers, builds `TestCodex` with realtime base URL, version v1, backend prompt override, and empty startup-context override, seeds recent thread metadata and workspace files, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, and asserts the instructions equal `prompt from config` with no startup-context header or workspace-map content.
+**Data flow**: It seeds recent-thread and workspace data, configures an empty startup-context override, starts realtime, waits for instructions, and verifies only the prompt is sent with no generated context markers.
 
-**Call relations**: This direct test is the empty-string counterpart to the custom-startup-context override test.
+**Call relations**: This test uses the same setup helpers as the custom-context override test but proves the empty override means 'send none'.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, test_codex, seed_recent_thread, wait_for_matching_websocket_request, websocket_request_instructions); 7 external calls (assert!, assert_eq!, create_dir_all, write, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2505,11 +2525,11 @@ async fn conversation_disables_realtime_startup_context_with_empty_override() ->
 async fn conversation_start_injects_startup_context_from_thread_history() -> Result<()>
 ```
 
-**Purpose**: Verifies that generated startup context includes recent thread metadata and workspace map information when enabled. It checks the shape and content of the injected startup-context block.
+**Purpose**: Verifies that realtime startup instructions include generated context from recent thread history and workspace files. This helps a voice session begin with useful project background.
 
-**Data flow**: Starts startup and realtime websocket servers, builds `TestCodex` with realtime base URL and version v1, seeds one recent thread and workspace files, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, extracts the startup-context text, and asserts it contains the startup-context open/close tags, header, recent-session summary, latest branch, user ask text, workspace map section, and README marker while excluding unrelated memory prompt text.
+**Data flow**: It seeds a recent thread, creates a README in the workspace, starts realtime with startup context enabled, then reads the session instructions and checks for context tags, recent session details, branch info, user ask, and workspace map.
 
-**Call relations**: This direct test exercises the generated startup-context path rather than config overrides.
+**Call relations**: It uses `seed_recent_thread` and `wait_for_matching_websocket_request`. It is the main test for automatic startup-context generation.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, test_codex, seed_recent_thread, wait_for_matching_websocket_request, websocket_request_instructions); 6 external calls (assert!, create_dir_all, write, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2520,11 +2540,11 @@ async fn conversation_start_injects_startup_context_from_thread_history() -> Res
 async fn conversation_startup_context_current_thread_selects_many_turns_by_budget() -> Result<()>
 ```
 
-**Purpose**: Tests how startup-context generation selects and truncates current-thread turns under a token budget when resuming from a seeded history. It snapshots the rendered section to review ordering, omission, and truncation together.
+**Purpose**: Checks that startup context includes a budgeted summary of the current thread and truncates long turns safely. A budget keeps realtime instructions from becoming too large.
 
-**Data flow**: Starts mock API and realtime websocket servers, constructs a sequence of long and short user/assistant turns as `RolloutItem::ResponseItem` history, builds `TestCodex`, shuts it down, resumes a thread with `InitialHistory::Forked(history)` and API-key auth, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, isolates the `## Current Thread` section from the startup context, computes rendered-turn token counts, builds a snapshot string summarizing latest-source tokens, rendered turn count, over-budget turns, and the section body, asserts the snapshot with `insta`, and finally asserts that although the latest source exceeds 300 approximate tokens, no rendered turn exceeds the cap after truncation.
+**Data flow**: It builds a resumed thread with many user/assistant turns, starts realtime, extracts the `Current Thread` section from the sent instructions, snapshots it, and verifies no rendered turn exceeds the per-turn size limit.
 
-**Call relations**: This direct test is the most detailed startup-context budgeting check. It uses resumed-thread history rather than `seed_recent_thread` because it needs full turn content, not just metadata.
+**Call relations**: This test resumes a thread through the thread manager instead of running many model turns. It uses `wait_for_matching_websocket_request` to inspect the generated startup context.
 
 *Call graph*: calls 7 internal fn (auth_manager_from_auth, start_mock_server, start_websocket_server, test_codex, wait_for_matching_websocket_request, websocket_request_instructions, from_api_key); 7 external calls (assert_eq!, format!, assert_snapshot!, Forked, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2535,11 +2555,11 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
 async fn conversation_startup_context_falls_back_to_workspace_map() -> Result<()>
 ```
 
-**Purpose**: Verifies that when there is no recent thread history, startup-context generation still falls back to a workspace map. It ensures startup context remains useful in empty-history cases.
+**Purpose**: Checks that startup context still includes a workspace map even when there is no recent thread history. This gives realtime some orientation in a fresh workspace.
 
-**Data flow**: Starts startup and realtime websocket servers, builds `TestCodex` with realtime base URL and version v1, creates workspace directories and files, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, extracts the startup-context text, and asserts it contains startup-context framing plus the workspace-map section and the created file/directory names.
+**Data flow**: It creates workspace files and directories, starts realtime, reads the outgoing instructions, and checks for startup context tags plus file and directory names from the workspace map.
 
-**Call relations**: This direct test covers the fallback branch of startup-context generation when only workspace structure is available.
+**Call relations**: This is the no-history counterpart to the thread-history startup-context test.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, test_codex, wait_for_matching_websocket_request, websocket_request_instructions); 6 external calls (assert!, create_dir_all, write, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2550,11 +2570,11 @@ async fn conversation_startup_context_falls_back_to_workspace_map() -> Result<()
 async fn conversation_startup_context_is_truncated_and_sent_once_per_start() -> Result<()>
 ```
 
-**Purpose**: Checks that oversized startup context is truncated to a bounded length and only included in the initial `session.update`, not repeated on later realtime text messages. It validates both size control and one-time emission.
+**Purpose**: Verifies that very large startup context is trimmed and only sent during session setup, not repeated with later user text. This prevents oversized or duplicate realtime messages.
 
-**Data flow**: Starts startup and realtime websocket servers, seeds a recent thread with an oversized summary and a workspace marker file, builds `TestCodex`, submits `RealtimeConversationStart`, waits for a websocket request containing instructions, asserts the startup-context text contains framing and is at most about 20.5k characters, then submits realtime text `hello`, waits for a matching websocket request carrying that text, and asserts the text request is separate from the startup-context-bearing session update.
+**Data flow**: It seeds an oversized recent-thread summary, starts realtime, confirms the sent instructions contain context but stay under a length cap, then sends explicit realtime text and verifies that later text request contains only the user text.
 
-**Call relations**: This direct test uses `seed_recent_thread`, `wait_for_matching_websocket_request`, and `websocket_request_text` to prove startup context is bounded and not resent on subsequent realtime input.
+**Call relations**: It combines `seed_recent_thread`, `wait_for_matching_websocket_request`, and `websocket_request_text` to check both startup and later message behavior.
 
 *Call graph*: calls 5 internal fn (start_websocket_server, test_codex, seed_recent_thread, wait_for_matching_websocket_request, websocket_request_instructions); 7 external calls (assert!, assert_eq!, write, RealtimeConversationStart, RealtimeConversationText, skip_if_no_network!, vec!).
 
@@ -2565,11 +2585,11 @@ async fn conversation_startup_context_is_truncated_and_sent_once_per_start() -> 
 async fn conversation_user_text_turn_is_not_sent_to_realtime() -> Result<()>
 ```
 
-**Purpose**: Verifies that ordinary `Op::UserInput` turns continue to go through the Responses API even while a realtime conversation is running, and are not mirrored onto the realtime websocket. It checks separation between text-turn handling and realtime transport.
+**Purpose**: Checks that normal Codex user input is sent to the model API, not duplicated into the realtime WebSocket. This keeps typed agent turns separate from explicit realtime text operations.
 
-**Data flow**: Starts a mock API server with one SSE response and a realtime websocket server, builds `TestCodex` with realtime base URL and empty startup context, starts a realtime conversation and waits for `SessionUpdated`, submits a normal text `Op::UserInput`, waits for `TurnComplete`, asserts the Responses API request contains the user text, and inspects realtime connections to confirm only the initial `session.update` was sent there.
+**Data flow**: It starts realtime, submits a normal `UserInput` turn, waits for the model turn to complete, verifies the model request contains the typed text, and checks the realtime WebSocket saw only the initial session update.
 
-**Call relations**: This direct test bridges the normal turn pipeline and realtime runtime, proving they coexist without duplicating user text onto the realtime socket.
+**Call relations**: This test separates the normal agent path from the realtime transport path. It uses a mounted mock SSE response for the regular model turn.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, start_websocket_server, test_codex); 7 external calls (default, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2580,11 +2600,11 @@ async fn conversation_user_text_turn_is_not_sent_to_realtime() -> Result<()>
 async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_response() -> Result<()>
 ```
 
-**Purpose**: Checks that a v2 realtime noop tool call results in an empty `function_call_output` item and does not trigger a `response.create` request. It validates the silent-tool-call path.
+**Purpose**: Checks version 2 behavior for a realtime `remain_silent` tool call. Codex should answer the tool call with an empty output and not ask realtime to create another response.
 
-**Data flow**: Starts a mock API server and a realtime websocket server that emits `session.updated` followed by a `conversation.item.done` function call named `remain_silent`, builds `TestCodex` with realtime version v2, starts a realtime conversation, waits for `RealtimeEvent::NoopRequested` with the expected call id, then waits for the next websocket request and asserts it is a `conversation.item.create` carrying `function_call_output` with empty output. It then uses a short timeout around `wait_for_matching_websocket_request` to assert no `response.create` request appears.
+**Data flow**: It starts realtime v2, has the fake server send a function call named `remain_silent`, waits for Codex to report a noop request, then checks the WebSocket request is a function-call output with an empty string and no `response.create` appears.
 
-**Call relations**: This direct test targets the v2 tool-call handling branch and uses the flexible websocket-request matcher to prove absence of a follow-up response request.
+**Call relations**: This test uses `wait_for_matching_websocket_request` both to observe expected output and guard against an unwanted response request.
 
 *Call graph*: calls 4 internal fn (start_mock_server, start_websocket_server, test_codex, wait_for_matching_websocket_request); 8 external calls (from_millis, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, timeout, vec!).
 
@@ -2595,11 +2615,11 @@ async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_respon
 async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Result<()>
 ```
 
-**Purpose**: Verifies that when realtime requests a handoff and the delegated Responses API turn produces an assistant message, that final assistant text is mirrored back to realtime via `conversation.handoff.append`. It checks the outbound handoff bridge.
+**Purpose**: Verifies that when realtime asks the normal agent for help, the assistant's final text is appended back to the realtime handoff. This is how the voice session receives the agent's answer.
 
-**Data flow**: Starts a mock API server whose SSE stream yields one assistant message `assistant says hi`, plus a realtime websocket server that emits `session.updated`, transcript delta, and `conversation.handoff.requested`. Builds `TestCodex`, starts realtime, waits for `SessionUpdated` and `HandoffRequested`, waits for the delegated turn to complete, then polls realtime connections until a second request appears and asserts it is `conversation.handoff.append` with the expected `handoff_id` and output text prefixed by `"Agent Final Message":`.
+**Data flow**: It starts realtime, has the fake realtime server request a handoff, serves a normal model response saying `assistant says hi`, waits for turn completion, and checks the realtime WebSocket received a `conversation.handoff.append` with the formatted assistant message.
 
-**Call relations**: This direct test ties together inbound realtime handoff, delegated model turn execution, and outbound mirroring of the assistant result back to realtime.
+**Call relations**: This is a core handoff test. It connects inbound realtime handoff events, the normal SSE model response, and outbound realtime handoff append messages.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, start_websocket_server, test_codex); 10 external calls (from_millis, from_secs, assert_eq!, wait_for_event, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, now, sleep, vec!).
 
@@ -2610,11 +2630,11 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Re
 async fn conversation_handoff_persists_across_item_done_until_turn_complete() -> Result<()>
 ```
 
-**Purpose**: Checks that an active handoff remains in effect even after a realtime `conversation.item.done` event, until the delegated turn fully completes. Multiple assistant messages from the delegated turn should still be mirrored back under the same handoff id.
+**Purpose**: Ensures a handoff remains active even if realtime marks the source item done before the delegated model turn finishes. This lets later assistant text still be mirrored to the right handoff.
 
-**Data flow**: Starts a streaming SSE server whose first delegated turn emits two assistant messages gated by a oneshot channel, and a realtime websocket server that emits `session.updated`, `handoff.requested`, then later `conversation.item.done`. Builds `TestCodex`, starts realtime, waits for `SessionUpdated` and `HandoffRequested`, asserts the first mirrored `conversation.handoff.append` contains `assistant message 1`, waits for `ConversationItemDone`, releases the gate so the second assistant message arrives, asserts a second mirrored append contains `assistant message 2`, then waits for delegated completion and `TurnComplete`.
+**Data flow**: It uses a gated streaming model response with two assistant messages, starts realtime, receives a handoff, checks the first append, receives `conversation.item.done`, releases the second message, and checks the second append still uses the same handoff id.
 
-**Call relations**: This direct test extends the handoff-mirroring path to cover persistence of handoff state across intermediate realtime item completion events.
+**Call relations**: This test uses `sse_event` to build streaming chunks and proves the handoff lifetime is tied to model turn completion, not only realtime item completion.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, start_streaming_sse_server, test_codex); 7 external calls (assert_eq!, wait_for_event, wait_for_event_match, channel, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2625,11 +2645,11 @@ async fn conversation_handoff_persists_across_item_done_until_turn_complete() ->
 fn sse_event(event: Value) -> String
 ```
 
-**Purpose**: Wraps a single JSON event into an SSE-formatted string using the shared response helper. It keeps the streaming SSE fixtures concise.
+**Purpose**: Wraps one JSON event as a server-sent event response chunk for streaming tests. Server-sent events are a simple HTTP streaming format where the server pushes events over one response.
 
-**Data flow**: Accepts a `serde_json::Value`, wraps it in a one-element vector, passes it to `responses::sse`, and returns the resulting `String`.
+**Data flow**: It receives one JSON value, places it in a one-item list, passes it to the shared SSE formatter, and returns the formatted string.
 
-**Call relations**: Used by the streaming SSE handoff tests when constructing chunk bodies for `start_streaming_sse_server`.
+**Call relations**: Several streaming handoff tests call this when constructing fake model response chunks for `start_streaming_sse_server`.
 
 *Call graph*: calls 1 internal fn (sse); 1 external calls (vec!).
 
@@ -2640,11 +2660,11 @@ fn sse_event(event: Value) -> String
 fn message_input_texts(body: &Value, role: &str) -> Vec<String>
 ```
 
-**Purpose**: Extracts all `input_text` strings for messages of a given role from a raw request JSON body. It is a local JSON-inspection helper for delegated-turn assertions.
+**Purpose**: Extracts text spans for a chosen role from a model request JSON body. It helps tests confirm exactly what user text was sent to the model API.
 
-**Data flow**: Reads `body["input"]` as an array, filters items of type `message` and the requested role, flattens their `content` arrays, keeps spans of type `input_text`, collects their `text` strings, and returns them as `Vec<String>`.
+**Data flow**: It receives a JSON body and role name, walks the `input` array, keeps message items with that role, collects `input_text` content spans, and returns their text strings.
 
-**Call relations**: Used by the tests that inspect delegated Responses API requests generated from realtime handoff events.
+**Call relations**: `inbound_handoff_request_steers_active_turn` and `inbound_handoff_request_starts_turn_and_does_not_block_realtime_audio` use this helper after reading raw mock API requests.
 
 *Call graph*: called by 2 (inbound_handoff_request_starts_turn_and_does_not_block_realtime_audio, inbound_handoff_request_steers_active_turn); 1 external calls (get).
 
@@ -2655,11 +2675,11 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String>
 async fn inbound_handoff_request_starts_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that an inbound realtime `conversation.handoff.requested` event starts a delegated Responses API turn whose user input contains a `<realtime_delegation>` block. It checks the inbound handoff bridge into the normal turn pipeline.
+**Purpose**: Checks that a handoff request from realtime starts a normal Codex model turn. The delegated realtime transcript should become user input for the agent.
 
-**Data flow**: Starts a mock API server with one assistant response and a realtime websocket server that emits `session.updated`, transcript delta, and `handoff.requested`, builds `TestCodex`, starts realtime, waits for `SessionUpdated` and the matching `HandoffRequested`, waits for `TurnComplete`, then inspects the captured Responses API request and asserts one user text equals the expected `<realtime_delegation>` XML containing the input and transcript delta.
+**Data flow**: It starts realtime, has the fake server send transcript text and a handoff request, waits for model turn completion, then verifies the model request contains a `<realtime_delegation>` block with the input and transcript delta.
 
-**Call relations**: This direct test is the baseline inbound-handoff-to-turn path. Later tests vary transcript accumulation and interaction with active turns.
+**Call relations**: This is the basic inbound-delegation test. Later handoff tests add transcript accumulation, repeated handoffs, and non-blocking audio behavior.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, start_websocket_server, test_codex); 7 external calls (assert!, assert_eq!, wait_for_event, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2670,11 +2690,11 @@ async fn inbound_handoff_request_starts_turn() -> Result<()>
 async fn inbound_handoff_request_uses_active_transcript() -> Result<()>
 ```
 
-**Purpose**: Checks that the delegated `<realtime_delegation>` block uses the accumulated active transcript, not just the handoff event's `input_transcript` field. It verifies transcript assembly across assistant and user deltas.
+**Purpose**: Verifies that a handoff uses the active transcript built from recent realtime input and output deltas, not only the request's raw input field. This gives the agent better context.
 
-**Data flow**: Starts a mock API server and a realtime websocket server that emits `session.updated`, assistant transcript delta, user transcript delta, another assistant delta, and then `handoff.requested` with `input_transcript = "ignored"`, builds `TestCodex`, starts realtime, waits for startup and turn completion, then inspects the captured Responses API request and asserts the user text contains a `<realtime_delegation>` block whose `<transcript_delta>` concatenates all active transcript lines in order and ends with `user: ignored`.
+**Data flow**: It sends assistant and user transcript deltas before the handoff request, waits for the delegated turn, then checks the model request includes the ordered assistant/user transcript plus the handoff input.
 
-**Call relations**: This direct test extends the inbound handoff path by validating transcript accumulation logic before delegation.
+**Call relations**: This expands on the basic handoff-starts-turn test by checking transcript context construction.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, start_websocket_server, test_codex); 6 external calls (assert!, wait_for_event, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2685,11 +2705,11 @@ async fn inbound_handoff_request_uses_active_transcript() -> Result<()>
 async fn inbound_handoff_request_sends_transcript_delta_after_each_handoff() -> Result<()>
 ```
 
-**Purpose**: Verifies that transcript delta state is cleared between separate handoffs, so each delegated turn receives only the transcript accumulated since the previous handoff. It prevents transcript growth across unrelated delegated turns.
+**Purpose**: Checks that transcript deltas are reset after each handoff. The second delegated turn should not include the first handoff's transcript as stale context.
 
-**Data flow**: Starts a mock API server with two sequential SSE responses and a realtime websocket server that emits one handoff sequence, then later another after an intervening audio submission. Builds `TestCodex`, starts realtime, waits for the first delegated turn to complete, submits realtime audio to keep the session active, waits for the second delegated turn to complete, then inspects both captured Responses API requests. It asserts the first contains only `user: first question` and the second contains only `user: second question`, not a concatenation of both.
+**Data flow**: It serves two model responses and sends two realtime handoff requests separated by activity. After both turns complete, it inspects both model requests and confirms each contains only its own question's transcript delta.
 
-**Call relations**: This direct test covers repeated inbound handoffs on one realtime session and validates transcript reset semantics between them.
+**Call relations**: This protects repeated delegation sessions. It builds on the same handoff path as `inbound_handoff_request_starts_turn` but checks cleanup between handoffs.
 
 *Call graph*: calls 4 internal fn (mount_sse_sequence, start_mock_server, start_websocket_server, test_codex); 8 external calls (assert!, assert_eq!, wait_for_event, wait_for_event_match, RealtimeConversationAudio, RealtimeConversationStart, skip_if_no_network!, vec!).
 
@@ -2700,11 +2720,11 @@ async fn inbound_handoff_request_sends_transcript_delta_after_each_handoff() -> 
 async fn inbound_conversation_item_does_not_start_turn_and_still_forwards_audio() -> Result<()>
 ```
 
-**Purpose**: Checks that an inbound realtime `conversation.item.added` user message does not itself trigger a delegated turn, while unrelated realtime audio output continues to be forwarded. It distinguishes passive conversation items from explicit handoff requests.
+**Purpose**: Ensures an inbound realtime conversation item with role `user` does not itself start a Codex turn, while realtime audio still flows through. This avoids redelegating echoed local messages.
 
-**Data flow**: Starts a mock API server and a realtime websocket server that emits `session.updated`, a `conversation.item.added` user message, and an audio delta, builds `TestCodex`, starts realtime, waits for `SessionUpdated`, then waits under timeout for `AudioOut` and asserts its data. It also waits under a shorter timeout for `TurnStarted` and asserts that no such event occurs.
+**Data flow**: It starts realtime, has the server send a user conversation item followed by an audio delta, waits for the audio event, and confirms no normal Codex turn starts.
 
-**Call relations**: This direct test guards against over-eager delegation logic by proving only handoff requests, not arbitrary conversation items, start turns.
+**Call relations**: This guards against treating every inbound conversation item as a delegation trigger. Handoff requests, not user-role echoes, should start agent turns.
 
 *Call graph*: calls 3 internal fn (start_mock_server, start_websocket_server, test_codex); 8 external calls (from_millis, assert!, assert_eq!, wait_for_event_match, RealtimeConversationStart, skip_if_no_network!, timeout, vec!).
 
@@ -2715,11 +2735,11 @@ async fn inbound_conversation_item_does_not_start_turn_and_still_forwards_audio(
 async fn delegated_turn_user_role_echo_does_not_redelegate_and_still_forwards_audio() -> Result<()>
 ```
 
-**Purpose**: Verifies that when a delegated turn's assistant output is mirrored back to realtime and the realtime side echoes that text as a user-role conversation item, Codex does not start a second delegated turn. Audio forwarding must still continue normally.
+**Purpose**: Checks that when a delegated assistant answer is echoed back as a user-role realtime item, Codex does not start a second delegation loop. Audio forwarding must continue during that situation.
 
-**Data flow**: Starts a streaming SSE server whose delegated turn emits one assistant message and completes after a gate, plus a realtime websocket server that emits `session.updated`, `handoff.requested`, then later a user-role `conversation.item.added` echoing `assistant says hi` and an audio delta. Builds `TestCodex`, starts realtime, waits for the handoff request, asserts the mirrored `conversation.handoff.append` request contains the assistant text, waits for `AudioOut`, releases the completion gate, waits for `TurnComplete`, then asserts the API server saw exactly one request total.
+**Data flow**: It starts a delegated turn, waits for the assistant answer to be mirrored to realtime, then has realtime echo that text as a user item and send audio. The test confirms audio is forwarded and only one model request was made.
 
-**Call relations**: This direct test combines handoff mirroring, echo suppression, and audio forwarding. It protects against feedback loops between delegated turns and realtime conversation items.
+**Call relations**: This is a loop-prevention test for the handoff system. It also demonstrates that realtime audio events are still processed while a delegated turn is completing.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, start_streaming_sse_server, test_codex); 9 external calls (assert_eq!, wait_for_event, wait_for_event_match, eprintln!, channel, RealtimeConversationStart, skip_if_no_network!, now, vec!).
 
@@ -2730,11 +2750,11 @@ async fn delegated_turn_user_role_echo_does_not_redelegate_and_still_forwards_au
 async fn inbound_handoff_request_does_not_block_realtime_event_forwarding() -> Result<()>
 ```
 
-**Purpose**: Checks that while a delegated turn triggered by an inbound handoff is still pending, unrelated realtime events such as audio output continue to be forwarded promptly. It validates concurrency between delegated turn execution and realtime event handling.
+**Purpose**: Ensures realtime events keep flowing while a delegated model turn is still pending. A voice session should not freeze just because the normal agent is thinking.
 
-**Data flow**: Starts a streaming SSE server whose delegated turn completion is gated, plus a realtime websocket server that emits `session.updated`, transcript delta, `handoff.requested`, and an audio delta. Builds `TestCodex`, starts realtime, waits for `SessionUpdated` and `HandoffRequested`, then waits under timeout for `AudioOut` and asserts its data before releasing the delegated-turn completion gate. After completion it waits for `TurnComplete`.
+**Data flow**: It starts realtime, receives a handoff request that starts a gated model turn, then expects an audio delta from realtime before the model turn is allowed to finish.
 
-**Call relations**: This direct test focuses on non-blocking behavior during delegated turn execution, complementing the handoff-start tests.
+**Call relations**: This test uses a streaming server with a gate to hold the model response open. It proves event forwarding and delegated model work run independently enough for audio to continue.
 
 *Call graph*: calls 3 internal fn (start_websocket_server, start_streaming_sse_server, test_codex); 9 external calls (from_millis, assert_eq!, wait_for_event, wait_for_event_match, channel, RealtimeConversationStart, skip_if_no_network!, timeout, vec!).
 
@@ -2745,11 +2765,11 @@ async fn inbound_handoff_request_does_not_block_realtime_event_forwarding() -> R
 async fn inbound_handoff_request_steers_active_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that an inbound handoff arriving while a normal user turn is already active does not retroactively alter the in-flight request, but instead steers the next turn by adding a `<realtime_delegation>` block there. It checks active-turn steering semantics.
+**Purpose**: Checks that a realtime handoff arriving during an active user turn steers the next model request rather than being merged into the already-started request. This protects ordering when the user speaks while the agent is responding.
 
-**Data flow**: Starts a streaming SSE server with two sequential Responses API turns and a realtime websocket server that emits `session.updated` and later a handoff request on the same connection. Builds `TestCodex`, starts realtime, submits a normal `Op::UserInput` text turn, waits for an agent content delta to ensure the first turn is active, submits realtime audio to keep the session flowing, waits for the handoff request, releases the first turn completion gate, waits for both API requests and final `TurnComplete`, then parses both request bodies and extracts user texts with `message_input_texts`. It asserts the first request contains only `first prompt`, while the second contains both `first prompt` and the expected `<realtime_delegation>` block.
+**Data flow**: It starts a normal user turn, waits until the model is streaming output, then sends realtime audio that triggers a handoff. After both model requests complete, it verifies the first request has only the original prompt and the second includes the realtime delegation.
 
-**Call relations**: This direct test is the main coverage for steering behavior when realtime delegation arrives during an already-running standard turn.
+**Call relations**: This test uses `message_input_texts` to inspect both raw API requests. It covers a race-prone path where realtime input arrives during an ongoing turn.
 
 *Call graph*: calls 4 internal fn (start_websocket_server_with_headers, start_streaming_sse_server, test_codex, message_input_texts); 11 external calls (default, assert!, assert_eq!, wait_for_event, wait_for_event_match, channel, RealtimeConversationAudio, RealtimeConversationStart, from_slice, skip_if_no_network! (+1 more)).
 
@@ -2760,11 +2780,11 @@ async fn inbound_handoff_request_steers_active_turn() -> Result<()>
 async fn inbound_handoff_request_starts_turn_and_does_not_block_realtime_audio() -> Result<()>
 ```
 
-**Purpose**: Combines inbound handoff delegation with concurrent realtime audio forwarding, verifying that the delegated turn starts correctly and audio output is still delivered before the delegated turn completes. It is a focused concurrency regression test.
+**Purpose**: Checks that a realtime handoff starts a model turn and that audio arriving immediately afterward is still forwarded promptly. This combines delegation correctness with live-audio responsiveness.
 
-**Data flow**: Starts a streaming SSE server whose delegated turn completion is gated and a realtime websocket server that emits `session.updated`, transcript delta, `handoff.requested`, and an audio delta. Builds `TestCodex`, starts realtime, waits for `SessionUpdated` and the matching `HandoffRequested`, waits under timeout for `AudioOut`, releases the delegated-turn completion gate, waits for `TurnComplete`, then parses the sole API request and asserts its user texts include the expected `<realtime_delegation>` block.
+**Data flow**: It starts realtime, receives a handoff request and then an audio delta while the delegated model turn is gated open. It confirms the audio event arrives, releases the model completion, and verifies the model request contains the expected realtime delegation text.
 
-**Call relations**: This direct test overlaps with the non-blocking handoff test but also verifies the exact delegated request body, making it a combined correctness-and-concurrency check.
+**Call relations**: This final handoff test uses `message_input_texts` for request inspection and a gated streaming server to prove the delegated turn does not block realtime audio delivery.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, start_streaming_sse_server, test_codex, message_input_texts); 12 external calls (from_millis, assert!, assert_eq!, wait_for_event, wait_for_event_match, format!, channel, RealtimeConversationStart, from_slice, skip_if_no_network! (+2 more)).
 
@@ -2774,11 +2794,13 @@ These tests focus on preserving and reshaping conversation state across follow-u
 
 ### `core/tests/suite/compact_remote.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This file focuses on remote compaction paths, both legacy `/v1/responses/compact` and v2 inline compaction via a `compaction_trigger` item on `/v1/responses`. It defines helpers for approximate token estimation, canonical JSON normalization, compacted-summary output construction, realtime conversation setup/teardown, and request-shape snapshot formatting. Most tests use `TestCodexHarness` to build a full thread with ChatGPT or API-key auth, mount normal response streams plus either a remote compact endpoint or an inline v2 compaction response, then drive user turns and `Op::Compact` while inspecting captured requests and emitted events.
+Long agent conversations can grow too large for the model to read. Remote compaction is the safety valve: Codex sends the current conversation history to a remote endpoint, receives a compact replacement such as an encrypted summary, and then uses that smaller history for later model requests. Without this behavior, follow-up turns could overflow the model context window, lose important state, or send the wrong metadata to the service.
 
-The suite covers several dimensions. Manual remote compaction should send the right auth/session/thread headers, compaction metadata, and request fields, then replace follow-up history with the returned compaction item(s). A parity helper compares the shared request fields between a normal `/responses` request and a remote compact request, including prompt-cache-key reuse and service-tier differences between auth modes. Automatic remote compaction is tested both pre-turn and mid-turn, including failure handling, context-compaction lifecycle events, trimming of oversized function-call and tool-search outputs to fit the context window, and use of session base instructions in trim estimation. Realtime-specific tests start a websocket realtime conversation and verify that after compaction the next request restates either realtime-start or realtime-end instructions depending on whether the conversation is still active, unless the current turn already established the inactive baseline. Finally, turn-state propagation is checked for legacy HTTP compact, v2 HTTP compact, and v2 websocket compact: once sampling establishes `x-codex-turn-state`, later compact and continuation requests must replay that first value rather than replacing it with newer headers.
+This test file acts like a controlled rehearsal stage. It builds fake Codex sessions, fake HTTP and WebSocket model servers, and scripted model responses. Then it drives the session through user turns, tool calls, realtime conversations, model switches, failures, retries, shutdown and resume. After each scenario, it inspects the exact outgoing requests and events to make sure compaction behaves correctly.
+
+The tests verify practical details that matter in production: authentication headers, service tier rules, prompt cache keys, turn and window IDs, retry behavior, filtering hidden dynamic tools, trimming oversized tool output, preserving realtime start or end instructions, refreshing stale developer instructions, and carrying turn state across requests. Many tests also create snapshots of request shapes, like photos of the expected wire format, so future changes cannot accidentally rearrange history.
 
 #### Function details
 
@@ -2788,11 +2810,11 @@ The suite covers several dimensions. Manual remote compaction should send the ri
 fn approx_token_count(text: &str) -> i64
 ```
 
-**Purpose**: Provides a rough token estimate for a text string by dividing character count by four.
+**Purpose**: Gives a rough token estimate for a piece of text. Tests use it as a simple measuring tape when checking whether a compact request should fit inside a model's context window.
 
-**Data flow**: It computes `(len + 3) / 4`, converts to `i64`, and saturates to `i64::MAX` on conversion failure.
+**Data flow**: It receives text, estimates one token for about every four characters, protects against overflow, and returns the estimate as a number.
 
-**Call relations**: Token-trimming tests use this helper indirectly through compact-payload estimators.
+**Call relations**: The trim-estimation tests call this directly and through the larger payload estimators to compare ordinary instructions with oversized custom instructions.
 
 *Call graph*: called by 2 (estimate_compact_payload_tokens, remote_compact_trim_estimate_uses_session_base_instructions); 1 external calls (try_from).
 
@@ -2803,11 +2825,11 @@ fn approx_token_count(text: &str) -> i64
 fn estimate_compact_input_tokens(request: &responses::ResponsesRequest) -> i64
 ```
 
-**Purpose**: Estimates the token count of a compact request’s `input` items by summing approximate token counts of each serialized item.
+**Purpose**: Estimates how many tokens the input part of a compact request will use. This helps tests reason about whether history should be trimmed.
 
-**Data flow**: It iterates over `request.input()`, converts each item to a string, estimates its token count with `approx_token_count`, and returns the saturating sum.
+**Data flow**: It receives a captured compact request, reads each input item, turns each item into text, applies the rough token estimate, and returns the total.
 
-**Call relations**: The base-instructions trim-estimate test uses this helper to compare baseline and override compact payload sizes.
+**Call relations**: It is used by the full payload estimator and by the base-instructions trimming test to build a before-and-after size comparison.
 
 *Call graph*: calls 1 internal fn (input); called by 2 (estimate_compact_payload_tokens, remote_compact_trim_estimate_uses_session_base_instructions).
 
@@ -2818,11 +2840,11 @@ fn estimate_compact_input_tokens(request: &responses::ResponsesRequest) -> i64
 fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 ```
 
-**Purpose**: Estimates the total token count of a compact request payload, including both input items and instructions text.
+**Purpose**: Estimates the size of the full compact request payload, including both conversation input and instructions. This lets a test check that session instructions are included in trimming decisions.
 
-**Data flow**: It calls `estimate_compact_input_tokens(request)`, estimates tokens for `request.instructions_text()`, and returns the saturating sum.
+**Data flow**: It receives a compact request, estimates the input size, estimates the instruction text size, adds them, and returns the combined total.
 
-**Call relations**: This helper is used when proving that longer session base instructions can force trimming decisions.
+**Call relations**: The base-instructions trimming test calls this after capturing a baseline compact request, then uses the number to choose a context-window size for a second run.
 
 *Call graph*: calls 3 internal fn (instructions_text, approx_token_count, estimate_compact_input_tokens); called by 1 (remote_compact_trim_estimate_uses_session_base_instructions).
 
@@ -2833,11 +2855,11 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 fn assert_tools_payload_does_not_defer(body: &Value)
 ```
 
-**Purpose**: Asserts that a request’s model-visible `tools` payload contains no `defer_loading: true` declarations anywhere in the structure.
+**Purpose**: Checks that the tools sent to the model do not include hidden deferred-tool declarations. Deferred tools are tools that should stay invisible until discovered.
 
-**Data flow**: It reads `body["tools"]` if present, recursively checks it with `contains_defer_loading`, and fails the test if any deferred declaration is found.
+**Data flow**: It receives a JSON request body, looks for the tools section, searches inside it for any `defer_loading: true`, and fails the test if one is found.
 
-**Call relations**: The deferred-dynamic-tool filtering test uses this helper on both normal response and compact requests.
+**Call relations**: The dynamic-tool filtering test uses this on both normal model requests and compact requests to prove they expose the same safe tool list.
 
 *Call graph*: called by 1 (remote_compact_filters_deferred_dynamic_tools); 2 external calls (get, assert!).
 
@@ -2848,11 +2870,11 @@ fn assert_tools_payload_does_not_defer(body: &Value)
 fn namespace_child_tool_names(body: &Value, namespace: &str) -> Vec<String>
 ```
 
-**Purpose**: Extracts the child tool names from a namespace tool declaration in a request body.
+**Purpose**: Extracts the visible child tool names from a named tool namespace in a JSON request body. It is a small inspection helper for dynamic tool tests.
 
-**Data flow**: It scans `body["tools"]` for a namespace entry with the requested name, then collects the `name` field from each child tool in that namespace, defaulting to empty if absent.
+**Data flow**: It receives a JSON body and a namespace name, finds the matching namespace tool entry, collects its child tool names, and returns them as strings.
 
-**Call relations**: The deferred-dynamic-tool filtering test uses this helper to assert only visible child tools remain under a namespace.
+**Call relations**: It supports the deferred dynamic tools test by confirming that only the visible tool appears under the expected namespace.
 
 *Call graph*: 1 external calls (get).
 
@@ -2863,11 +2885,11 @@ fn namespace_child_tool_names(body: &Value, namespace: &str) -> Vec<String>
 fn contains_defer_loading(value: &Value) -> bool
 ```
 
-**Purpose**: Recursively checks whether a JSON value contains any `defer_loading: true` field.
+**Purpose**: Searches any JSON value for the marker that says a tool should be deferred. It is used to detect hidden declarations anywhere in a nested tools payload.
 
-**Data flow**: It pattern-matches on objects and arrays, recursively scanning nested values; scalars return false.
+**Data flow**: It receives a JSON value, recursively walks objects and arrays, and returns true if it finds `defer_loading` set to true; simple values return false.
 
-**Call relations**: This is the recursive worker behind `assert_tools_payload_does_not_defer`.
+**Call relations**: It is the recursive worker behind `assert_tools_payload_does_not_defer`, which is called by the dynamic-tool filtering test.
 
 
 ##### `canonical_json`  (lines 115–130)
@@ -2876,11 +2898,11 @@ fn contains_defer_loading(value: &Value) -> bool
 fn canonical_json(value: &Value) -> Value
 ```
 
-**Purpose**: Recursively sorts object keys to produce a canonicalized JSON value for stable equality comparisons.
+**Purpose**: Normalizes JSON object key order so two request bodies can be compared reliably. This avoids false test failures caused only by map ordering.
 
-**Data flow**: It clones scalars unchanged, maps arrays recursively, and for objects sorts key/value pairs by key before rebuilding the object.
+**Data flow**: It receives a JSON value, recursively sorts object keys, leaves arrays in order, clones simple values, and returns the normalized JSON.
 
-**Call relations**: The remote compact request-parity helper uses this to compare request bodies independent of object key order.
+**Call relations**: The request-parity helper uses it before comparing compact request fields with normal response request fields.
 
 *Call graph*: called by 1 (assert_remote_manual_compact_request_parity); 3 external calls (Array, Object, clone).
 
@@ -2891,11 +2913,11 @@ fn canonical_json(value: &Value) -> Value
 fn summary_with_prefix(summary: &str) -> String
 ```
 
-**Purpose**: Formats a summary string as the canonical compaction payload by prepending `SUMMARY_PREFIX` and a newline.
+**Purpose**: Builds a compaction summary string in the format Codex expects, with the standard summary prefix at the top.
 
-**Data flow**: It returns `format!("{SUMMARY_PREFIX}\n{summary}")`.
+**Data flow**: It receives summary text, prepends the shared `SUMMARY_PREFIX` and a newline, and returns the combined string.
 
-**Call relations**: Several snapshot and compact-output helpers use this when constructing expected compaction items.
+**Call relations**: Several snapshot tests use it when creating fake remote compaction responses, so the mocked summary looks like a real compacted summary.
 
 *Call graph*: called by 3 (snapshot_request_shape_remote_mid_turn_continuation_compaction, snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message, snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model_switch); 1 external calls (format!).
 
@@ -2906,11 +2928,11 @@ fn summary_with_prefix(summary: &str) -> String
 fn context_snapshot_options() -> ContextSnapshotOptions
 ```
 
-**Purpose**: Builds the standard request-snapshot rendering options for this file.
+**Purpose**: Defines how request snapshots should be simplified before being stored. It strips noisy capability instructions and keeps item text short.
 
-**Data flow**: It starts from default snapshot options, strips capability instructions, sets `KindWithTextPrefix { max_chars: 64 }`, and returns the result.
+**Data flow**: It starts with default snapshot options, turns on instruction stripping, chooses a compact render style, and returns the options.
 
-**Call relations**: Snapshot-formatting helpers call this to normalize all request-shape snapshots.
+**Call relations**: The labeled snapshot formatter calls this so many tests get consistent, readable snapshot output.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (format_labeled_requests_snapshot).
 
@@ -2924,11 +2946,11 @@ fn format_labeled_requests_snapshot(
 ) -> String
 ```
 
-**Purpose**: Formats a labeled multi-request snapshot string using the file’s standard snapshot options.
+**Purpose**: Creates a readable snapshot showing one or more labeled model requests for a scenario. Snapshots help reviewers see exactly how history was sent.
 
-**Data flow**: It forwards the scenario label, request sections, and `context_snapshot_options()` into `context_snapshot::format_labeled_requests_snapshot`.
+**Data flow**: It receives a scenario description and labeled captured requests, applies this file's snapshot options, and returns formatted text.
 
-**Call relations**: Many snapshot tests use this helper when asserting remote compaction request shapes.
+**Call relations**: Many tests call this inside snapshot assertions after they have driven Codex through compaction and captured the outgoing requests.
 
 *Call graph*: calls 2 internal fn (format_labeled_requests_snapshot, context_snapshot_options).
 
@@ -2939,11 +2961,11 @@ fn format_labeled_requests_snapshot(
 fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem>
 ```
 
-**Purpose**: Builds a remote compact output consisting of a single `ResponseItem::Compaction` with a prefixed summary.
+**Purpose**: Builds a fake remote compact response that contains only one compaction item. Tests use this to model the server replacing all old history with a summary.
 
-**Data flow**: It takes a summary string, wraps it with `summary_with_prefix`, places it in a one-element `Vec<ResponseItem::Compaction>`, and returns it.
+**Data flow**: It receives summary text, wraps it with the compaction prefix, puts it into a `ResponseItem::Compaction`, and returns a one-item list.
 
-**Call relations**: Tests that need a summary-only remote compact response use this helper to avoid repeating the item construction.
+**Call relations**: Realtime and turn-state tests use this helper when mounting mocked compact endpoints that should return a simple summary-only history.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -2954,11 +2976,11 @@ fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem>
 fn test_codex() -> TestCodexBuilder
 ```
 
-**Purpose**: Returns a `TestCodexBuilder` preconfigured with `RemoteCompactionV2` disabled by default.
+**Purpose**: Creates the standard test Codex builder for this file. It intentionally disables RemoteCompactionV2 unless a test turns it back on, so v1 behavior is the default.
 
-**Data flow**: It starts from the base `test_codex` builder and applies a config closure that disables `Feature::RemoteCompactionV2`.
+**Data flow**: It starts from the shared test builder, changes the configuration to disable the v2 compaction feature, and returns the builder.
 
-**Call relations**: Nearly every test in this file starts from this builder so legacy remote compaction is the default unless a test explicitly enables v2.
+**Call relations**: Almost every test starts here, then adds authentication, model choices, context limits, WebSocket settings, or feature flags for its specific scenario.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 31 (assert_remote_manual_compact_request_parity, auto_remote_compact_failure_stops_agent_loop, auto_remote_compact_trims_function_call_history_to_fit_context_window, remote_compact_and_resume_refresh_stale_developer_instructions, remote_compact_filters_deferred_dynamic_tools, remote_compact_persists_replacement_history_in_rollout, remote_compact_refreshes_stale_developer_instructions_without_resume, remote_compact_replaces_history_for_followups, remote_compact_rewrites_multiple_trailing_function_call_outputs, remote_compact_runs_automatically (+15 more)).
 
@@ -2971,11 +2993,11 @@ fn remote_realtime_test_codex_builder(
 ) -> TestCodexBuilder
 ```
 
-**Purpose**: Builds a `TestCodexBuilder` configured to talk to a mock realtime websocket server.
+**Purpose**: Creates a Codex test builder configured to talk to a fake realtime WebSocket server. It is used for tests where audio/realtime conversation state must survive compaction.
 
-**Data flow**: It reads the realtime server URI, starts from `test_codex()`, adds dummy API-key auth, and sets `experimental_realtime_ws_base_url` in config.
+**Data flow**: It receives a WebSocket test server, reads its URL, starts from the standard builder, adds dummy API-key auth, stores the realtime URL in config, and returns the builder.
 
-**Call relations**: Realtime-restatement tests use this helper to create a thread that can start and close realtime conversations.
+**Call relations**: Realtime snapshot tests call this after starting the fake realtime server and before building a Codex session.
 
 *Call graph*: calls 3 internal fn (uri, test_codex, from_api_key); called by 6 (remote_request_uses_custom_experimental_realtime_start_instructions, snapshot_request_shape_remote_compact_resume_restates_realtime_end, snapshot_request_shape_remote_manual_compact_restates_realtime_start, snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start).
 
@@ -2986,11 +3008,11 @@ fn remote_realtime_test_codex_builder(
 async fn start_remote_realtime_server() -> responses::WebSocketTestServer
 ```
 
-**Purpose**: Starts a websocket server scripted to accept a realtime conversation and keep the socket open for later transcript routing.
+**Purpose**: Starts a scripted fake realtime server for tests. The server sends a session-updated event and then stays open so later realtime transcript traffic does not end the session too early.
 
-**Data flow**: It calls `start_websocket_server` with a scripted connection whose first request returns a `session.updated` event and whose later request slots are empty vectors so the connection remains active.
+**Data flow**: It builds a list of WebSocket response batches, passes them to the test server helper, waits for the server to start, and returns it.
 
-**Call relations**: Realtime tests call this before building the codex harness so they can start a realtime conversation against a predictable backend.
+**Call relations**: All realtime compaction tests call this before creating their Codex builder, then shut the server down at the end.
 
 *Call graph*: calls 1 internal fn (start_websocket_server); called by 6 (remote_request_uses_custom_experimental_realtime_start_instructions, snapshot_request_shape_remote_compact_resume_restates_realtime_end, snapshot_request_shape_remote_manual_compact_restates_realtime_start, snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start); 1 external calls (vec!).
 
@@ -3001,11 +3023,11 @@ async fn start_remote_realtime_server() -> responses::WebSocketTestServer
 async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<()>
 ```
 
-**Purpose**: Starts a realtime conversation on a `CodexThread` and waits until both the high-level start event and the low-level `SessionUpdated` realtime event arrive.
+**Purpose**: Tells Codex to start a realtime conversation and waits until the session is actually established. This gives later compaction tests real realtime state to preserve or restate.
 
-**Data flow**: It submits `Op::RealtimeConversationStart` with audio output and startup context enabled, waits for either `RealtimeConversationStarted` or `Error`, then waits for a `RealtimeConversationRealtime(SessionUpdated)` event carrying the realtime session id.
+**Data flow**: It receives a Codex thread, submits a realtime-start operation, waits for a started event or error, then waits for the realtime session-updated event before returning success.
 
-**Call relations**: Realtime restatement tests call this before sending user turns so the thread has active realtime state to preserve or restate after compaction.
+**Call relations**: Realtime tests call it before sending user input; it hands control back only after Codex and the fake realtime server agree that the realtime session exists.
 
 *Call graph*: calls 1 internal fn (submit); called by 6 (remote_request_uses_custom_experimental_realtime_start_instructions, snapshot_request_shape_remote_compact_resume_restates_realtime_end, snapshot_request_shape_remote_manual_compact_restates_realtime_start, snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start); 2 external calls (wait_for_event_match, RealtimeConversationStart).
 
@@ -3016,11 +3038,11 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
 async fn close_realtime_conversation(codex: &codex_core::CodexThread) -> Result<()>
 ```
 
-**Purpose**: Closes an active realtime conversation and waits for the corresponding closed event.
+**Purpose**: Closes a realtime conversation and waits for Codex to report that it closed. Tests use it to check how compaction records an inactive realtime session.
 
-**Data flow**: It submits `Op::RealtimeConversationClose`, waits for `EventMsg::RealtimeConversationClosed`, and returns success.
+**Data flow**: It receives a Codex thread, submits a realtime-close operation, waits for the close event, and returns success.
 
-**Call relations**: Realtime tests call this to switch the thread from active to inactive realtime state before later compaction or follow-up turns.
+**Call relations**: Realtime tests call it between user turns or during cleanup, then inspect later model requests for the expected realtime-end instructions.
 
 *Call graph*: calls 1 internal fn (submit); called by 6 (remote_request_uses_custom_experimental_realtime_start_instructions, snapshot_request_shape_remote_compact_resume_restates_realtime_end, snapshot_request_shape_remote_manual_compact_restates_realtime_start, snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start); 1 external calls (wait_for_event_match).
 
@@ -3031,11 +3053,11 @@ async fn close_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
 fn assert_request_contains_realtime_start(request: &responses::ResponsesRequest)
 ```
 
-**Purpose**: Asserts that a request body restates active realtime-conversation instructions rather than inactive-end instructions.
+**Purpose**: Verifies that a model request restates the instructions for an active realtime conversation. This protects against compaction dropping realtime context.
 
-**Data flow**: It serializes the request body to a string and asserts it contains `<realtime_conversation>` but not `Reason: inactive`.
+**Data flow**: It receives a captured request, converts the JSON body to text, checks for the realtime wrapper, and checks that it does not contain the inactive-session reason.
 
-**Call relations**: Realtime-start restatement tests use this helper on post-compaction or post-manual-compact follow-up requests.
+**Call relations**: Tests for pre-turn and manual compaction call this on the post-compaction request when realtime is still active.
 
 *Call graph*: calls 1 internal fn (body_json); called by 2 (snapshot_request_shape_remote_manual_compact_restates_realtime_start, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start); 1 external calls (assert!).
 
@@ -3049,11 +3071,11 @@ fn assert_request_contains_custom_realtime_start(
 )
 ```
 
-**Purpose**: Asserts that a request body contains a custom configured realtime-start instruction string inside the realtime wrapper.
+**Purpose**: Verifies that a request uses custom realtime-start instructions instead of the default wording. This tests an experimental configuration path.
 
-**Data flow**: It serializes the request body, asserts it contains `<realtime_conversation>` and the supplied custom instructions, and asserts it does not contain the default `Realtime conversation started.` text.
+**Data flow**: It receives a captured request and expected instruction text, converts the body to text, checks the realtime wrapper, checks for the custom text, and checks that default text is absent.
 
-**Call relations**: The custom experimental realtime-start-instructions test uses this helper on the first normal request after starting realtime.
+**Call relations**: The custom realtime instructions test calls this after starting realtime and sending one normal user turn.
 
 *Call graph*: calls 1 internal fn (body_json); called by 1 (remote_request_uses_custom_experimental_realtime_start_instructions); 1 external calls (assert!).
 
@@ -3064,11 +3086,11 @@ fn assert_request_contains_custom_realtime_start(
 fn assert_request_contains_realtime_end(request: &responses::ResponsesRequest)
 ```
 
-**Purpose**: Asserts that a request body restates inactive realtime-conversation instructions.
+**Purpose**: Verifies that a model request restates that a realtime conversation became inactive. This matters because the model needs to know why realtime context stopped.
 
-**Data flow**: It serializes the request body and asserts it contains both `<realtime_conversation>` and `Reason: inactive`.
+**Data flow**: It receives a captured request, turns its JSON body into text, checks for the realtime wrapper, and checks for the inactive reason.
 
-**Call relations**: Realtime-end restatement tests use this helper on post-compaction or resumed follow-up requests.
+**Call relations**: Realtime end and resume snapshot tests call this on requests that should carry closed-realtime instructions after compaction or resume.
 
 *Call graph*: calls 1 internal fn (body_json); called by 3 (snapshot_request_shape_remote_compact_resume_restates_realtime_end, snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end, snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end); 1 external calls (assert!).
 
@@ -3079,11 +3101,11 @@ fn assert_request_contains_realtime_end(request: &responses::ResponsesRequest)
 async fn wait_for_turn_complete(codex: &codex_core::CodexThread)
 ```
 
-**Purpose**: Waits for `TurnComplete` with a longer timeout suitable for remote compaction tests.
+**Purpose**: Waits for Codex to finish a turn, with a longer timeout suitable for remote compaction tests. It keeps tests from racing ahead before the agent loop is done.
 
-**Data flow**: It calls `wait_for_event_with_timeout` on the codex thread, matching `EventMsg::TurnComplete(_)` and using `REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT`.
+**Data flow**: It receives a Codex thread, waits until a `TurnComplete` event appears or the timeout expires, and returns after the event is observed.
 
-**Call relations**: Most tests in this file use this helper instead of the shorter generic wait to avoid flakiness around remote compaction and realtime flows.
+**Call relations**: Many tests call this after submitting user input or a compact operation, before inspecting requests, events, or server call counts.
 
 *Call graph*: called by 11 (assert_remote_manual_compact_request_parity, remote_compact_filters_deferred_dynamic_tools, remote_compact_replaces_history_for_followups, remote_compact_trims_tool_search_output_to_empty_tools_array, remote_compact_v2_accepts_additional_output_items_before_compaction, remote_compact_v2_retries_failures_with_stream_retry_budget, remote_compact_v2_reuses_compaction_trigger_for_followups, remote_mid_turn_compact_v1_sends_turn_state_over_http, remote_mid_turn_compact_v2_sends_turn_state_over_http, remote_mid_turn_compact_v2_sends_turn_state_over_websocket (+1 more)); 1 external calls (wait_for_event_with_timeout).
 
@@ -3094,11 +3116,11 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread)
 async fn remote_compact_replaces_history_for_followups() -> Result<()>
 ```
 
-**Purpose**: Verifies the baseline legacy remote manual compaction flow: the compact request hits `/v1/responses/compact` with correct headers/metadata, and the next turn uses the returned compaction item as history.
+**Purpose**: Tests the core v1 manual compaction flow: old conversation history is sent to `/v1/responses/compact`, and later turns use the returned compacted history instead of the original messages.
 
-**Data flow**: It builds a ChatGPT-auth harness, mounts one normal response, one follow-up response, and a compact endpoint returning a single compaction item, submits a user turn, `Op::Compact`, and another user turn, then inspects compact-request headers/body and the follow-up request body/metadata to assert compaction replacement semantics.
+**Data flow**: It builds an authenticated session, sends a user turn, triggers compact, sends a follow-up turn, then inspects headers, metadata, request body fields, and follow-up history contents.
 
-**Call relations**: This is the foundational remote manual compaction test and the main source of header/metadata assertions for the legacy endpoint.
+**Call relations**: The test runner calls it directly. It relies on the standard builder, mocked SSE and compact endpoints, and `wait_for_turn_complete` to sequence the three phases.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 9 external calls (default, assert!, assert_eq!, assert_ne!, assert_snapshot!, from_str, json!, skip_if_no_network!, vec!).
 
@@ -3114,11 +3136,11 @@ async fn assert_remote_manual_compact_request_parity(
     scena
 ```
 
-**Purpose**: Compares a remote manual compact request against a normal `/responses` request to ensure shared request fields match, while allowing auth-dependent service-tier differences.
+**Purpose**: Shared helper that checks whether a manual compact request carries the same shared request settings as a normal model request. It also checks auth-specific service tier behavior.
 
-**Data flow**: It builds a harness with chosen auth and optional configured service tier, runs five varied turns plus a manual compact, captures the last normal request and the compact request, removes response-only fields from the expected body, canonicalizes both JSON objects, asserts prompt-cache-key reuse and expected service-tier behavior, and snapshots the diff.
+**Data flow**: It receives auth, optional configured service tier, expected service tier, and snapshot labels; it runs five varied turns, compacts, removes fields that should differ, normalizes JSON, compares, and snapshots the diff.
 
-**Call relations**: The two service-tier/prompt-cache-key tests call this helper with different auth cases to validate parity rules without duplicating the long scenario setup.
+**Call relations**: Two auth-focused tests call this: one for API-key auth and one for ChatGPT auth. It uses `canonical_json` and the standard turn-completion helper.
 
 *Call graph*: calls 6 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, canonical_json, test_codex, wait_for_turn_complete); called by 2 (remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cache_key, remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache_key); 4 external calls (default, assert_eq!, assert_snapshot!, vec!).
 
@@ -3129,11 +3151,11 @@ async fn assert_remote_manual_compact_request_parity(
 async fn remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cache_key() -> Result<()>
 ```
 
-**Purpose**: Checks that under API-key auth, legacy remote compact omits `service_tier` while still reusing the prompt-cache key.
+**Purpose**: Checks that API-key authenticated remote compaction reuses the prompt cache key but does not send a service tier. This prevents sending ChatGPT-only tier settings in API-key mode.
 
-**Data flow**: It calls `assert_remote_manual_compact_request_parity` with API-key auth, configured fast service tier, and an expectation that the compact request has no `service_tier` field.
+**Data flow**: It creates API-key auth, asks the shared parity helper to run the scenario, and expects no service tier in the compact request.
 
-**Call relations**: This is a thin auth-specific wrapper around the parity helper.
+**Call relations**: The test runner calls it; most work is delegated to `assert_remote_manual_compact_request_parity`.
 
 *Call graph*: calls 2 internal fn (assert_remote_manual_compact_request_parity, from_api_key); 1 external calls (skip_if_no_network!).
 
@@ -3144,11 +3166,11 @@ async fn remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cac
 async fn remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache_key() -> Result<()>
 ```
 
-**Purpose**: Checks that under ChatGPT auth, remote compact reuses both the prompt-cache key and the translated `service_tier` value.
+**Purpose**: Checks that ChatGPT-authenticated remote compaction reuses both the prompt cache key and the configured service tier. This confirms compact requests match normal ChatGPT request behavior.
 
-**Data flow**: It calls `assert_remote_manual_compact_request_parity` with ChatGPT auth, configured fast service tier, and an expectation that the compact request carries `priority`.
+**Data flow**: It creates dummy ChatGPT auth, calls the shared parity helper with the fast tier configured, and expects the outgoing service tier value used by the service.
 
-**Call relations**: This is the ChatGPT-auth counterpart to the API-key parity test.
+**Call relations**: The test runner calls it; it delegates the full conversation and request comparison to `assert_remote_manual_compact_request_parity`.
 
 *Call graph*: calls 2 internal fn (assert_remote_manual_compact_request_parity, create_dummy_chatgpt_auth_for_testing); 1 external calls (skip_if_no_network!).
 
@@ -3159,11 +3181,11 @@ async fn remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache
 async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<()>
 ```
 
-**Purpose**: Verifies the v2 manual compaction flow where compaction is requested inline on `/v1/responses` using a `compaction_trigger` item and the follow-up request preserves the returned compaction item.
+**Purpose**: Tests RemoteCompactionV2, where compaction is sent as a normal `/v1/responses` request containing a compaction trigger item. It confirms the returned compaction item becomes part of follow-up history.
 
-**Data flow**: It builds a v2-enabled harness, mounts a normal response, an inline compaction response containing a `compaction` output item, and a follow-up response, submits a user turn, `Op::Compact`, and another user turn, then inspects the compact request for beta-feature header, compaction metadata, and trigger item, and the follow-up request for the preserved compaction payload.
+**Data flow**: It enables the v2 feature, sends an initial turn, triggers compact, sends a follow-up, then checks beta feature headers, compaction metadata, trigger shape, and retained history.
 
-**Call relations**: This is the foundational manual v2 compaction test and the main contrast point with the legacy `/responses/compact` path.
+**Call relations**: The test runner calls it. It uses the standard builder with v2 enabled and waits between submitted operations before examining captured response requests.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert!, assert_eq!, from_str, skip_if_no_network!, vec!).
 
@@ -3174,11 +3196,11 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()>
 ```
 
-**Purpose**: Checks that v2 compaction retries both open failures and failed compaction streams using the normal stream retry budget, discarding failed compaction outputs.
+**Purpose**: Checks that v2 compaction retries failed streaming attempts using the stream retry budget. It also verifies that output from failed attempts is not kept.
 
-**Data flow**: It builds a v2 harness with `stream_max_retries = 2`, mounts a normal response, a 500 open failure, a failed compaction stream, a successful retried compaction stream, and a follow-up response, then runs user turn, compact, and follow-up turn and asserts the three compact attempts all used `compaction_trigger` while only the retried summary appears in the final follow-up request.
+**Data flow**: It scripts one normal turn, failed compact open, failed compact stream, successful compact retry, and follow-up turn; then it checks request count, trigger items, and final summary contents.
 
-**Call relations**: This test covers retry orchestration specific to inline v2 compaction.
+**Call relations**: The test runner calls it. It depends on response-sequence mocks and `wait_for_turn_complete` to exercise retry behavior inside the agent loop.
 
 *Call graph*: calls 5 internal fn (mount_response_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 5 external calls (default, assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3189,11 +3211,11 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -> Result<()>
 ```
 
-**Purpose**: Verifies that v2 compaction tolerates unrelated output items before the final compaction item and ignores them when building follow-up history.
+**Purpose**: Ensures v2 compaction can ignore unrelated output items that appear before the actual compaction item. The final history should keep only the compaction result.
 
-**Data flow**: It mounts a compaction stream containing an assistant message plus a compaction item, runs user turn, compact, and follow-up turn, then asserts the follow-up request contains the compaction payload but not the unrelated assistant message.
+**Data flow**: It enables v2, scripts a noisy compact response containing an assistant message before the compaction item, runs initial, compact, and follow-up turns, then checks the follow-up body.
 
-**Call relations**: This is a parser-tolerance test for the v2 compaction stream.
+**Call relations**: The test runner calls it. It uses mocked SSE responses and the turn-completion helper to confirm the compact stream parser ignores noise.
 
 *Call graph*: calls 5 internal fn (mount_sse_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 4 external calls (default, assert!, skip_if_no_network!, vec!).
 
@@ -3204,11 +3226,11 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
 async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()>
 ```
 
-**Purpose**: Checks that remote compact requests use the same model-visible tool payload as normal responses and that deferred dynamic tools are filtered out of both.
+**Purpose**: Tests that remote compact requests do not reveal deferred dynamic tools. Hidden tools should not become visible merely because Codex is compacting history.
 
-**Data flow**: It starts a thread with one deferred and one visible dynamic tool under a namespace, runs a user turn and manual compact, then compares the `tools` payloads of the normal response request and compact request, asserting no `defer_loading` fields remain and only the visible child tool is present.
+**Data flow**: It starts a thread with one hidden and one visible dynamic tool, runs a user turn and compact, then compares the tools payloads and checks only the visible tool remains.
 
-**Call relations**: This test ties remote compaction request construction to the same tool-visibility filtering rules used for normal model requests.
+**Call relations**: The test runner calls it. It uses `assert_tools_payload_does_not_defer` and `namespace_child_tool_names` to inspect both normal and compact request bodies.
 
 *Call graph*: calls 8 internal fn (mount_compact_json_once, mount_sse_once, sse, start_mock_server, assert_tools_payload_does_not_defer, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert_eq!, json!, json!, skip_if_no_network!, vec!).
 
@@ -3219,11 +3241,11 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()>
 async fn remote_compact_runs_automatically() -> Result<()>
 ```
 
-**Purpose**: Verifies automatic remote compaction after an over-limit turn, including compaction metadata and turn/window id behavior across the initial request, compact request, and continuation request.
+**Purpose**: Checks that remote compaction runs automatically when token usage crosses the configured limit. It also verifies that mid-turn automatic compaction keeps the same turn ID but moves to a new context window afterward.
 
-**Data flow**: It mounts an initial over-limit turn that emits a shell command, a follow-up response, and a remote compact endpoint, submits one user turn, waits for `ContextCompacted` and `TurnComplete`, then inspects compact-request headers/metadata and the follow-up request body to assert summary insertion and turn/window id transitions.
+**Data flow**: It scripts an initial response with huge token usage, a compact response, and a continuation response; then it watches for compaction events and inspects request metadata and follow-up history.
 
-**Call relations**: This is the baseline automatic remote compaction test for the legacy endpoint.
+**Call relations**: The test runner calls it. It uses the standard builder, mocked compact endpoint, and event waiting to observe automatic compaction inside one user turn.
 
 *Call graph*: calls 6 internal fn (mount_compact_user_history_with_summary_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 9 external calls (default, assert!, assert_eq!, assert_ne!, wait_for_event, wait_for_event_match, from_str, skip_if_no_network!, vec!).
 
@@ -3234,11 +3256,11 @@ async fn remote_compact_runs_automatically() -> Result<()>
 async fn remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()>
 ```
 
-**Purpose**: Checks that remote manual compaction rewrites oversized trailing function-call output to a truncation marker while preserving earlier function-call/result pairs and user-boundary messages.
+**Purpose**: Tests that manual remote compaction preserves tool-call structure while trimming oversized trailing tool output. The call remains, but the huge output is replaced by a short truncation message.
 
-**Data flow**: It runs two turns with shell-command tool calls under a small context window, mounts a remote compact endpoint, triggers manual compact, then inspects the compact request to assert both user messages remain, the older function call/output pair is intact, and the trailing function-call output was replaced with `CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE`.
+**Data flow**: It runs two shell-call turns with a small context window, triggers compact, then inspects compact input for user messages, function calls, and rewritten output text.
 
-**Call relations**: This is the baseline function-call trimming test for remote compaction.
+**Call relations**: The test runner calls it on non-Windows platforms. It uses mocked shell command calls and a compact endpoint to verify history rewriting before remote compaction.
 
 *Call graph*: calls 5 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3249,11 +3271,11 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Result<()>
 ```
 
-**Purpose**: Verifies that when multiple trailing parallel function calls overflow the context window, remote compaction rewrites each trailing output to the truncation marker.
+**Purpose**: Tests the same trimming behavior when there are multiple trailing parallel tool calls. Every trailing oversized output should be rewritten, not just the first one.
 
-**Data flow**: It runs one retained shell-call turn and one turn with two parallel shell calls, triggers manual compact, and asserts the compact request preserves the older pair while rewriting both trailing outputs to the truncation message.
+**Data flow**: It creates one retained call and two later parallel calls, triggers compact, and checks that all calls remain while both later outputs become the truncation message.
 
-**Call relations**: This extends the trimming logic from one trailing function call to multiple parallel trailing calls.
+**Call relations**: The test runner calls it on non-Windows platforms. It shares the same remote compact setup style as the single-call trimming test.
 
 *Call graph*: calls 5 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3264,11 +3286,11 @@ async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Re
 async fn auto_remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()>
 ```
 
-**Purpose**: Checks that the same trailing function-call output rewriting occurs during automatic remote compaction.
+**Purpose**: Checks that automatic remote compaction applies the same tool-output trimming rules as manual compaction. This prevents auto-compact requests from overflowing due to huge tool output.
 
-**Data flow**: It runs two turns that establish retained and trailing shell-call history, mounts a remote compact endpoint, submits a third turn that triggers auto compact, waits for completion, and then inspects the compact request for preserved user boundaries, intact older function-call output, and rewritten trailing output.
+**Data flow**: It runs prior turns with shell calls, triggers auto compaction through a later oversized turn, then inspects the compact request for retained calls and rewritten trailing output.
 
-**Call relations**: This is the automatic-compaction counterpart to the manual trimming test.
+**Call relations**: The test runner calls it on non-Windows platforms. It combines response token thresholds with the same compact request assertions used in manual trimming tests.
 
 *Call graph*: calls 5 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3279,11 +3301,11 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Result<()>
 ```
 
-**Purpose**: Verifies that oversized trailing `tool_search_output` history is rewritten to an empty `tools` array during remote compaction.
+**Purpose**: Tests trimming for dynamic tool-search results. If a discovered tool description is too large, the compact request keeps the search-output item but empties its tools list.
 
-**Data flow**: It starts a thread with an oversized deferred dynamic tool, runs a turn that triggers a tool search, mounts a remote compact endpoint, triggers manual compact, then inspects the compact request’s `tool_search_output` item and asserts its `tools` array is empty.
+**Data flow**: It creates an oversized deferred dynamic tool, scripts a tool-search call, runs a user turn, triggers compact, and checks that the compact request contains an empty tools array for that search output.
 
-**Call relations**: This test covers trimming logic for tool-search artifacts rather than function-call outputs.
+**Call relations**: The test runner calls it. It uses search-capable model configuration, dynamic tool setup, and the normal turn-completion helper.
 
 *Call graph*: calls 7 internal fn (mount_compact_user_history_with_summary_once, mount_sse_once, sse, start_mock_server, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 7 external calls (default, assert!, format!, json!, Namespace, skip_if_no_network!, vec!).
 
@@ -3294,11 +3316,11 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
 async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()>
 ```
 
-**Purpose**: Checks that if automatic remote compaction fails to parse its response, the current turn emits an error and stops instead of continuing to a post-compaction model request.
+**Purpose**: Ensures that if automatic remote compaction fails, Codex stops the current agent loop instead of continuing with unsafe or inconsistent history.
 
-**Data flow**: It mounts an initial over-limit turn, a compact endpoint returning an invalid payload shape, and a would-be post-compact response, submits one setup turn and then a turn that triggers auto compact, waits for an `Error` and `TurnComplete`, and asserts the compact endpoint was called once while the post-compact response was never requested.
+**Data flow**: It runs a turn that raises usage above the limit, scripts an invalid compact response for the next turn, waits for an error, and verifies no post-compact model request was made.
 
-**Call relations**: This is the failure-path test for automatic remote pre-turn compaction.
+**Call relations**: The test runner calls it. It uses mocked SSE and compact endpoints, then snapshots the failed compact request shape.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 9 external calls (default, assert!, assert_eq!, wait_for_event, wait_for_event_match, assert_snapshot!, json!, skip_if_no_network!, vec!).
 
@@ -3309,11 +3331,11 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()>
 async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result<()>
 ```
 
-**Purpose**: Verifies that remote compaction’s trim estimate includes session base instructions, so longer base instructions can force trailing function-call output rewriting.
+**Purpose**: Tests that compact-request size estimates include the session's base instructions. Large custom instructions should influence whether trailing tool output gets trimmed.
 
-**Data flow**: It first runs a baseline harness to capture a compact request and estimate its input/payload tokens, then builds a second harness with much longer `base_instructions` and a context window just above the baseline payload size, reruns the same history, triggers compact, and asserts the override compact request still preserves both function calls but rewrites the trailing output to the truncation marker.
+**Data flow**: It first captures a baseline compact request and estimates its size, then runs a second session with much larger base instructions and checks that trailing output is rewritten.
 
-**Call relations**: This test compares two separate sessions to prove trim estimation depends on instructions text, not just input items.
+**Call relations**: The test runner calls it on non-Windows platforms. It uses `approx_token_count`, `estimate_compact_input_tokens`, and `estimate_compact_payload_tokens` to set up the comparison.
 
 *Call graph*: calls 8 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, approx_token_count, estimate_compact_input_tokens, estimate_compact_payload_tokens, test_codex, create_dummy_chatgpt_auth_for_testing); 7 external calls (default, assert!, assert_eq!, wait_for_event, format!, skip_if_no_network!, vec!).
 
@@ -3324,11 +3346,11 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 async fn remote_manual_compact_emits_context_compaction_items() -> Result<()>
 ```
 
-**Purpose**: Verifies that manual remote compaction emits context-compaction item lifecycle events and the legacy `ContextCompacted` event.
+**Purpose**: Checks that manual remote compaction emits structured start and completion events for a context-compaction item. These events let clients show compaction progress.
 
-**Data flow**: It runs one normal turn, mounts a remote compact endpoint, submits `Op::Compact`, drains events until it has seen compaction item start/completion, legacy `ContextCompacted`, and `TurnComplete`, then asserts the item ids match and the compact endpoint was called once.
+**Data flow**: It runs one user turn, submits compact, reads events until item-started, item-completed, legacy compaction, and turn-complete events arrive, then compares the item IDs.
 
-**Call relations**: This is the remote-manual counterpart to the local compaction lifecycle-event tests.
+**Call relations**: The test runner calls it. It combines a mocked compact response with direct event-loop inspection instead of only checking HTTP requests.
 
 *Call graph*: calls 6 internal fn (mount_compact_user_history_with_summary_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert!, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3339,11 +3361,11 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()>
 async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()>
 ```
 
-**Purpose**: Checks that a malformed remote compact response causes a user-visible task error event during manual compaction.
+**Purpose**: Checks that a failed manual remote compact operation reports a useful task error. Users and clients should see that compaction failed and why.
 
-**Data flow**: It runs one normal turn, mounts a compact endpoint returning an invalid payload shape, submits `Op::Compact`, waits for an `Error` event, asserts the message mentions remote compact task failure and invalid payload details, then waits for turn completion.
+**Data flow**: It runs a user turn, scripts an invalid compact payload, submits compact, waits for an error event, checks the error text, and confirms the compact endpoint was called once.
 
-**Call relations**: This is the manual remote failure-path test.
+**Call relations**: The test runner calls it. It uses the same invalid-payload shape as some automatic-failure tests but focuses on manual compact event reporting.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert!, assert_eq!, wait_for_event, wait_for_event_match, json!, skip_if_no_network!, vec!).
 
@@ -3354,11 +3376,11 @@ async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()>
 async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()>
 ```
 
-**Purpose**: Documents the intended behavior that remote compaction replacement history should be persisted in rollout, including compaction items and assistant notes but excluding injected permissions context.
+**Purpose**: Intended to test that remote compaction replacement history is written to the rollout log, which is the saved record used for resume. It is currently ignored because the behavior is known to be changing.
 
-**Data flow**: It runs one normal turn, mounts a compact endpoint returning a compaction item plus assistant note, triggers manual compact, shuts down, reads the rollout file, and scans `RolloutItem::Compacted` entries for a matching `replacement_history` shape.
+**Data flow**: When enabled, it would run a turn, compact to a replacement history containing a summary and assistant note, shut down, read the rollout file, and look for the persisted compacted history.
 
-**Call relations**: This ignored test captures a known-incorrect area around rollout persistence for remote compaction.
+**Call relations**: The test runner skips it because of the ignore annotation. It uses file reading and rollout parsing to validate persistence rather than only live request behavior.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert!, assert_eq!, wait_for_event, read_to_string, json!, skip_if_no_network!, vec!).
 
@@ -3369,11 +3391,11 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()>
 async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Result<()>
 ```
 
-**Purpose**: Verifies that if remote compact output contains stale developer instructions, they are removed immediately after compaction and remain removed after a later resume.
+**Purpose**: Tests that stale developer instructions returned by remote compaction are removed both immediately and after session resume. Fresh developer instructions, such as permissions text, should be rebuilt.
 
-**Data flow**: It runs an initial turn, mounts a compact endpoint returning a stale developer message plus compaction item, runs manual compact and a same-session follow-up turn, shuts down, resumes from rollout, runs another turn, and asserts both the post-compact and post-resume request bodies contain fresh permissions instructions and the compaction item but not the stale developer text.
+**Data flow**: It runs a session, compacts to history containing stale developer text, sends another turn, shuts down, resumes from rollout, sends a resumed turn, and checks request bodies.
 
-**Call relations**: This test spans same-session and resumed behavior for developer-instruction refresh after remote compaction.
+**Call relations**: The test runner calls it. It uses the standard builder before shutdown and another builder for resume, with mocked model responses covering before compact, after compact, and after resume.
 
 *Call graph*: calls 4 internal fn (mount_compact_json_once, mount_sse_sequence, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert!, assert_eq!, wait_for_event, json!, skip_if_no_network!, vec!, start).
 
@@ -3384,11 +3406,11 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
 async fn remote_compact_refreshes_stale_developer_instructions_without_resume() -> Result<()>
 ```
 
-**Purpose**: Checks the same stale-developer-instruction refresh behavior within a single session, without involving resume.
+**Purpose**: Tests the immediate version of stale developer-instruction cleanup after remote compaction. It confirms Codex does not need a restart to refresh these instructions.
 
-**Data flow**: It runs an initial turn, mounts a compact endpoint returning stale developer instructions plus a compaction item, runs manual compact and a follow-up turn, then asserts the follow-up request body contains fresh permissions instructions and the compaction item but not the stale developer text.
+**Data flow**: It compacts to replacement history containing stale developer text, sends a follow-up turn in the same session, and checks that the stale text is absent while fresh permissions instructions and the compaction item are present.
 
-**Call relations**: This is the same-session subset of the previous test.
+**Call relations**: The test runner calls it. It is a shorter companion to the resume test and uses the same mocked compact output shape.
 
 *Call graph*: calls 4 internal fn (mount_compact_json_once, mount_sse_sequence, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert!, assert_eq!, wait_for_event, json!, skip_if_no_network!, vec!, start).
 
@@ -3399,11 +3421,11 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when remote pre-turn auto-compaction occurs while realtime remains active, documenting that the post-compaction request restates realtime-start instructions.
+**Purpose**: Snapshots the request shape when automatic pre-turn compaction happens while a realtime conversation is still active. The follow-up request should restate realtime-start instructions.
 
-**Data flow**: It starts a realtime server and conversation, runs one turn to exceed the threshold, mounts a remote compact endpoint returning a summary-only compaction item, runs a second turn that triggers pre-turn compaction, asserts the post-compaction request contains realtime-start instructions, snapshots the compact and follow-up requests, then closes realtime.
+**Data flow**: It starts fake realtime, runs two user turns with a low compact threshold, captures the compact request and post-compact request, checks realtime-start text, and records a snapshot.
 
-**Call relations**: This is the active-realtime pre-turn remote compaction snapshot test.
+**Call relations**: The test runner calls it. It uses the realtime server helpers, start and close helpers, and the realtime-start assertion helper.
 
 *Call graph*: calls 7 internal fn (mount_compact_json_once, mount_sse_sequence, assert_request_contains_realtime_start, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server); 8 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!, start).
 
@@ -3414,11 +3436,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
 async fn remote_request_uses_custom_experimental_realtime_start_instructions() -> Result<()>
 ```
 
-**Purpose**: Verifies that when custom experimental realtime-start instructions are configured, normal requests use them instead of the default realtime-start text.
+**Purpose**: Tests that configured experimental realtime-start instructions appear in ordinary model requests. This protects a customization path used by realtime integrations.
 
-**Data flow**: It starts a realtime server and conversation with custom config, runs one user turn, then asserts the captured request body contains the custom instructions inside the realtime wrapper and omits the default start text.
+**Data flow**: It starts fake realtime with custom start text in config, sends one user turn, captures the request, and checks that custom text replaces the default text.
 
-**Call relations**: This is a direct request-shape test for configurable realtime-start instructions.
+**Call relations**: The test runner calls it. It uses the realtime builder and `assert_request_contains_custom_realtime_start`.
 
 *Call graph*: calls 7 internal fn (mount_sse_once, sse, assert_request_contains_custom_realtime_start, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server); 5 external calls (default, wait_for_event, skip_if_no_network!, vec!, start).
 
@@ -3429,11 +3451,11 @@ async fn remote_request_uses_custom_experimental_realtime_start_instructions() -
 async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when remote pre-turn auto-compaction occurs after realtime was closed between turns, documenting that the post-compaction request restates realtime-end instructions.
+**Purpose**: Snapshots the request shape when pre-turn compaction happens after realtime has been closed between turns. The follow-up request should restate realtime-end instructions.
 
-**Data flow**: It starts and then closes a realtime conversation between two turns, mounts a remote compact endpoint, runs the second turn that triggers pre-turn compaction, asserts the post-compaction request contains realtime-end instructions, snapshots the compact and follow-up requests, and shuts down the realtime server.
+**Data flow**: It starts realtime, runs one turn, closes realtime, runs another turn that compacts first, then checks and snapshots the compact and post-compact requests.
 
-**Call relations**: This is the inactive-realtime counterpart to the active-realtime pre-turn snapshot test.
+**Call relations**: The test runner calls it. It uses realtime helpers and `assert_request_contains_realtime_end` to verify the closed-session marker.
 
 *Call graph*: calls 7 internal fn (mount_compact_json_once, mount_sse_sequence, assert_request_contains_realtime_end, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server); 8 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!, start).
 
@@ -3444,11 +3466,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when manual remote compaction occurs while realtime remains active, documenting that the next regular turn restates realtime-start instructions.
+**Purpose**: Snapshots the request shape after a manual compact while realtime is active. The next normal turn should still tell the model that realtime is active.
 
-**Data flow**: It starts a realtime conversation, runs one turn, mounts a remote compact endpoint, runs `Op::Compact` and a follow-up turn, asserts the follow-up request contains realtime-start instructions, snapshots the compact and follow-up requests, then closes realtime.
+**Data flow**: It starts realtime, sends a turn, manually compacts, sends another turn, then checks the post-compaction request for realtime-start instructions and snapshots both requests.
 
-**Call relations**: This is the manual-compaction analogue of the active-realtime pre-turn snapshot test.
+**Call relations**: The test runner calls it. It combines manual compaction with the shared realtime setup and assertion helpers.
 
 *Call graph*: calls 7 internal fn (mount_compact_json_once, mount_sse_sequence, assert_request_contains_realtime_start, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server); 8 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!, start).
 
@@ -3459,11 +3481,11 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when remote mid-turn compaction occurs after realtime was already closed before the turn, documenting that the continuation request does not restate realtime-end instructions because the current turn already established that baseline.
+**Purpose**: Tests a subtle realtime case: if a turn already established that realtime is inactive before mid-turn compaction, the continuation after compaction should not restate the realtime-end message again.
 
-**Data flow**: It starts and closes realtime before the second turn, scripts a second turn that triggers mid-turn compaction via a function call, mounts a remote compact endpoint, runs the turn, asserts the initial second-turn request contains realtime-end instructions while the post-compaction continuation does not, and snapshots all three requests.
+**Data flow**: It starts and closes realtime, sends a turn that first includes realtime-end instructions, triggers mid-turn compaction through a tool call and high token count, then checks the continuation body.
 
-**Call relations**: This test distinguishes pre-turn restatement from mid-turn continuation behavior once the inactive baseline is already in the current turn.
+**Call relations**: The test runner calls it. It uses realtime helpers, the realtime-end assertion on the pre-compaction request, and a snapshot of the compact and continuation layout.
 
 *Call graph*: calls 7 internal fn (mount_compact_json_once, mount_sse_sequence, assert_request_contains_realtime_end, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server); 9 external calls (default, assert!, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!, start).
 
@@ -3474,11 +3496,11 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes after remote manual compaction, shutdown, and resume, documenting that the first resumed turn restates realtime-end instructions reconstructed from previous-turn settings.
+**Purpose**: Snapshots behavior after manual compaction, shutdown, and resume when realtime had been closed. The resumed first turn should reconstruct and restate realtime-end instructions.
 
-**Data flow**: It starts and closes realtime, runs one turn, mounts a remote compact endpoint, runs manual compact, shuts down, resumes from rollout, runs another turn, asserts the resumed request contains realtime-end instructions, and snapshots the compact and resumed follow-up requests.
+**Data flow**: It starts realtime, sends a turn, closes realtime, manually compacts, shuts down, resumes from rollout, sends another turn, and checks the resumed request body.
 
-**Call relations**: This is the resume-aware realtime-end restatement test.
+**Call relations**: The test runner calls it. It uses realtime helpers plus the standard resume path from the test builder.
 
 *Call graph*: calls 9 internal fn (mount_compact_json_once, mount_sse_sequence, assert_request_contains_realtime_end, close_realtime_conversation, remote_realtime_test_codex_builder, start_realtime_conversation, start_remote_realtime_server, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!, start).
 
@@ -3489,11 +3511,11 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
 async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message() -> Result<()>
 ```
 
-**Purpose**: Documents current remote pre-turn auto-compaction behavior with a context override, showing that the compact request excludes the incoming user message while the post-compaction request includes it exactly once.
+**Purpose**: Documents current pre-turn compaction behavior with an incoming user message and context override. The compact request excludes the incoming user, while the follow-up request includes it once.
 
-**Data flow**: It runs three turns, applying a thread-settings environment override before the third, mounts a remote compact endpoint returning a prefixed summary, then snapshots the compact and post-compaction requests and asserts the third user text appears exactly once in the follow-up request.
+**Data flow**: It runs three user turns, adds a thread-settings context override before the third, lets pre-turn compaction happen, snapshots compact and follow-up requests, and counts the incoming user text in the follow-up.
 
-**Call relations**: This is the remote counterpart to the local snapshot documenting current exclusion of incoming user input from pre-turn compaction.
+**Call relations**: The test runner calls it. It uses `summary_with_prefix`, local environment selections, and request snapshots to pin down current behavior.
 
 *Call graph*: calls 7 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, local_selections, summary_with_prefix, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert_eq!, submit_thread_settings, test_path_buf, wait_for_event, assert_snapshot!, skip_if_no_network!, vec!).
 
@@ -3504,11 +3526,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
 async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model_switch() -> Result<()>
 ```
 
-**Purpose**: Documents current remote pre-turn compaction behavior during a model switch, showing that the compact request excludes the incoming user and strips `<model_switch>`, while the follow-up restores both.
+**Purpose**: Documents current behavior when pre-turn compaction happens during a model switch. The compact request strips the incoming model-switch marker, but the follow-up request restores it.
 
-**Data flow**: It runs a first turn on one model, updates thread settings to a new model, runs a second turn under auto-compaction conditions, then asserts the compact request omits the incoming user and `<model_switch>`, the follow-up request includes both old and new user messages plus `<model_switch>`, and snapshots all three requests.
+**Data flow**: It starts on one model, sends a turn, submits a model-switch setting, sends another turn that triggers compaction, then checks and snapshots initial, compact, and follow-up requests.
 
-**Call relations**: This is the remote model-switch snapshot counterpart to the local pre-turn model-switch snapshot.
+**Call relations**: The test runner calls it. It uses `summary_with_prefix`, thread-settings submission, and mocked requests for both models.
 
 *Call graph*: calls 7 internal fn (mount_compact_user_history_with_summary_once, mount_sse_once, sse, with_builder, summary_with_prefix, test_codex, create_dummy_chatgpt_auth_for_testing); 8 external calls (default, assert!, assert_eq!, submit_thread_settings, wait_for_event, assert_snapshot!, skip_if_no_network!, vec!).
 
@@ -3519,11 +3541,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceeded() -> Result<()>
 ```
 
-**Purpose**: Documents current behavior when remote pre-turn auto-compaction fails with a context-window error: the compact request excludes the incoming user and the turn stops without a post-compaction follow-up request.
+**Purpose**: Tests that a context-window error from the remote compact endpoint stops the turn and surfaces an error. It also snapshots the compact request that caused the failure.
 
-**Data flow**: It runs one setup turn, mounts a compact endpoint returning a 400 `context_length_exceeded` error and a would-be post-compact response, submits a second turn, waits for an `Error` and `TurnComplete`, asserts the post-compact response was never requested, snapshots the compact request, and checks the error message mentions the context window.
+**Data flow**: It runs an initial high-token turn, scripts the compact endpoint to return a context-length error on the next turn, waits for the error, confirms no follow-up request ran, and snapshots the compact request.
 
-**Call relations**: This is the remote failure-path snapshot test for pre-turn compaction.
+**Call relations**: The test runner calls it. It uses a mocked HTTP error response and standard event waiting to confirm failure handling.
 
 *Call graph*: calls 7 internal fn (mount_compact_response_once, mount_sse_once, mount_sse_sequence, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 10 external calls (default, new, assert!, assert_eq!, wait_for_event, wait_for_event_match, assert_snapshot!, json!, skip_if_no_network!, vec!).
 
@@ -3534,11 +3556,11 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
 async fn remote_pre_turn_compact_response_seeds_turn_state() -> Result<()>
 ```
 
-**Purpose**: Verifies that a remote pre-turn compact response can seed `x-codex-turn-state` for the first sampled request after compaction.
+**Purpose**: Checks that a pre-turn compact response can provide turn state, and that state is sent on the first model request after compaction. Turn state is a server-provided header that must travel with later requests in the same turn.
 
-**Data flow**: It mounts a first over-limit turn, a second normal turn, and a compact endpoint that returns both a compaction output and `x-codex-turn-state: compact-state`, submits two turns, then asserts the compact request had no turn-state header while the second normal response request did carry `compact-state`.
+**Data flow**: It runs one turn to exceed the threshold, scripts compact to return a turn-state header, runs the next turn, and checks that the compact request starts without state while the post-compact sample sends the returned state.
 
-**Call relations**: This test covers turn-state propagation from the compact response into the next sampled request in the pre-turn path.
+**Call relations**: The test runner calls it. It uses response-sequence mocks and `wait_for_turn_complete` to observe header flow across compact and sampling requests.
 
 *Call graph*: calls 6 internal fn (mount_compact_response_once, mount_response_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, new, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3549,11 +3571,11 @@ async fn remote_pre_turn_compact_response_seeds_turn_state() -> Result<()>
 async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()>
 ```
 
-**Purpose**: Checks that legacy mid-turn remote compaction over `/responses/compact` replays the first sampled `x-codex-turn-state` value on the compact request and all later continuation requests.
+**Purpose**: Tests turn-state propagation for v1 mid-turn compaction over HTTP. The state created by the first sample should be replayed to compact and all later requests in that turn.
 
-**Data flow**: It mounts a first response that emits a function call and `sampling-state`, a continuation response with `continuation-state`, a final response, and a compact endpoint returning `compact-state`, submits one turn that triggers mid-turn compaction, then asserts the compact request and both later `/responses` requests all carry `sampling-state` while the initial request had none.
+**Data flow**: It scripts an initial tool-call response that returns turn state, a compact response, and continuations; after the turn completes, it checks the turn-state header on compact and later model requests.
 
-**Call relations**: This is the legacy HTTP turn-state propagation test for mid-turn compaction.
+**Call relations**: The test runner calls it. It uses the v1 compact endpoint and verifies that later response headers do not replace the first established state.
 
 *Call graph*: calls 6 internal fn (mount_compact_response_once, mount_response_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, new, assert_eq!, json!, skip_if_no_network!, vec!).
 
@@ -3564,11 +3586,11 @@ async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()>
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()>
 ```
 
-**Purpose**: Checks that v2 mid-turn compaction over `/v1/responses` also replays the first sampled `x-codex-turn-state` value on the inline compaction request and all later continuation requests.
+**Purpose**: Tests turn-state propagation for v2 mid-turn compaction over ordinary HTTP responses. The v2 compaction request should be a normal `/v1/responses` request carrying the existing state.
 
-**Data flow**: It mounts a first response with `sampling-state`, an inline compaction response with `compact-state`, a continuation response with `continuation-state`, and a final response, submits one turn, then asserts all requests are `/v1/responses`, the second request contains `compaction_trigger`, and requests 1–3 all carry `sampling-state` after the first request established it.
+**Data flow**: It enables v2, scripts sampling, inline compaction, continuations, and final reply, then checks that every request after the first carries the original turn-state header.
 
-**Call relations**: This is the v2 HTTP counterpart to the legacy turn-state propagation test.
+**Call relations**: The test runner calls it. It uses `wait_for_turn_complete` and captured response requests rather than the separate v1 compact endpoint.
 
 *Call graph*: calls 5 internal fn (mount_response_sequence, with_builder, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 5 external calls (default, assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3579,11 +3601,11 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()>
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<()>
 ```
 
-**Purpose**: Checks that websocket v2 mid-turn compaction replays the first sampled turn-state value in `client_metadata` on the inline compaction request and later continuation requests.
+**Purpose**: Tests the same v2 turn-state propagation when model traffic goes over WebSocket. In WebSocket mode, the state is carried in client metadata instead of an HTTP header.
 
-**Data flow**: It starts a scripted websocket server whose metadata frames set `sampling-state`, `compact-state`, and `continuation-state` across requests, builds a v2-enabled websocket codex, submits one turn, then inspects the five websocket requests and asserts the prewarm and first sampled request have null turn state while the compaction and both later requests all carry `sampling-state` in `client_metadata`.
+**Data flow**: It starts a scripted WebSocket server, enables v2, sends a user turn, then reads all WebSocket request bodies and checks the client metadata values before and after compaction.
 
-**Call relations**: This is the websocket transport analogue of the v2 HTTP turn-state propagation test.
+**Call relations**: The test runner calls it. It uses `start_websocket_server`, the WebSocket-capable builder, and the normal turn-completion helper.
 
 *Call graph*: calls 4 internal fn (start_websocket_server, test_codex, wait_for_turn_complete, create_dummy_chatgpt_auth_for_testing); 5 external calls (default, assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3594,11 +3616,11 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
 async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes for remote mid-turn continuation compaction after tool output, showing the compact request includes tool artifacts and the follow-up request includes the returned compaction item.
+**Purpose**: Snapshots the normal v1 mid-turn compaction layout after a tool call. The compact request should include tool artifacts, and the continuation should include the returned compaction item.
 
-**Data flow**: It mounts an initial function-call response, a final response, and a remote compact endpoint returning a prefixed summary, submits one user turn, then snapshots the compact request and the post-compaction follow-up request.
+**Data flow**: It sends one user turn that produces a function call and high token usage, lets remote compaction run before continuation, then snapshots the compact request and post-compaction request.
 
-**Call relations**: This is the remote mid-turn snapshot counterpart to the local continuation-compaction snapshot.
+**Call relations**: The test runner calls it. It uses `summary_with_prefix`, a mocked compact endpoint, and request snapshots.
 
 *Call graph*: calls 6 internal fn (mount_compact_user_history_with_summary_once, mount_sse_sequence, with_builder, summary_with_prefix, test_codex, create_dummy_chatgpt_auth_for_testing); 6 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, skip_if_no_network!, vec!).
 
@@ -3609,11 +3631,11 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
 async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinjects_context() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when remote mid-turn compaction returns only a compaction item, documenting that the continuation request reinjects context before that compaction item.
+**Purpose**: Tests that when remote compact returns only a summary item, Codex reinjects necessary context before continuing the same turn. This keeps the model oriented after history replacement.
 
-**Data flow**: It mounts an initial function-call response, a final response, and a compact endpoint returning only a compaction item, submits one user turn, then snapshots the compact request and post-compaction request.
+**Data flow**: It scripts a tool-call turn that triggers compaction, returns a summary-only compact output, captures the continuation request, and snapshots compact plus continuation layouts.
 
-**Call relations**: This test documents the continuation-layout rule for summary-only remote compact output.
+**Call relations**: The test runner calls it. It uses mocked SSE endpoints and direct compact JSON output instead of the summary helper endpoint.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 7 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!).
 
@@ -3624,11 +3646,11 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
 async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjects_above_last_summary() -> Result<()>
 ```
 
-**Purpose**: Captures request shapes when a turn already contains an older remote compaction item and a later mid-turn remote compaction produces a newer one, documenting that context is reinjected above the latest summary.
+**Purpose**: Tests history layout when there is already an older compaction summary and a later auto-compaction creates a new one. Context should be reinjected above the latest summary in the next request.
 
-**Data flow**: It runs a setup turn, a manual compact producing an older summary, then a second turn that triggers mid-turn auto-compaction and returns a newer summary, asserts the second compact request still carries the older summary, and snapshots that compact request plus the second-turn request after compaction.
+**Data flow**: It runs a setup turn, manually compacts to create an older summary, runs another turn that triggers auto-compaction, then checks that the compact request carries the older summary and snapshots the next request.
 
-**Call relations**: This is a nuanced history-layering test for multiple remote compaction summaries across turns.
+**Call relations**: The test runner calls it. It uses a compact-summary sequence and compares both compact request history and the second-turn request layout.
 
 *Call graph*: calls 6 internal fn (mount_compact_user_history_with_summary_sequence, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 7 external calls (default, assert!, assert_eq!, wait_for_event, assert_snapshot!, skip_if_no_network!, vec!).
 
@@ -3639,22 +3661,24 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 async fn snapshot_request_shape_remote_manual_compact_without_previous_user_messages() -> Result<()>
 ```
 
-**Purpose**: Documents current remote manual `/compact` behavior when there is no prior user turn: the remote compact request is skipped and the next user turn proceeds with canonical context.
+**Purpose**: Tests that manual compact does nothing remotely when there is no prior user turn to summarize. The next real user turn should proceed with normal context.
 
-**Data flow**: It mounts a follow-up response and a compact endpoint returning an empty output, runs `Op::Compact` and then a user turn, asserts the compact endpoint was never called, and snapshots the follow-up request.
+**Data flow**: It submits compact before any user message, waits for completion, sends the first user turn, confirms no compact request was made, and snapshots the normal follow-up request.
 
-**Call relations**: This is the remote counterpart to the local edge-case snapshot for manual compaction without prior user history.
+**Call relations**: The test runner calls it. It uses mocked compact and model endpoints to prove the compact endpoint remains unused in the empty-history case.
 
 *Call graph*: calls 6 internal fn (mount_compact_json_once, mount_sse_once, sse, with_builder, test_codex, create_dummy_chatgpt_auth_for_testing); 7 external calls (default, assert_eq!, wait_for_event, assert_snapshot!, json!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/responses_lite.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This test file builds small Codex fixtures with targeted model/config overrides and inspects the exact HTTP requests emitted to the mock Responses server. The helpers at the top encode the important preconditions: `responses_extensions` installs standalone web-search and image-generation extensions into an `ExtensionRegistry<Config>`, `configure_responses_tools` forces live web search while disabling the standalone-web-search and image-gen-extension feature flags and enabling image generation, and `configure_image_capable_model` marks a model as accepting both text and image input. The tests then vary only one axis at a time.
+These are integration-style tests: they start a fake Responses API server, run a small Codex instance against it, then inspect the HTTP request Codex sent. The goal is to protect the contract between Codex and the Responses API. If this file were missing, Codex could accidentally send the wrong request shape for Responses Lite and nobody would notice until real API calls failed or tools appeared in the wrong form.
 
-The first image test proves that in lite mode a `UserInput::Image` carrying `ImageDetail::Original` is serialized as a bare `input_image` with only `image_url`, specifically for data URLs when resize-all-images is not enabled. The tooling tests compare lite and non-lite behavior: lite requests must carry the `x-openai-internal-codex-responses-lite: true` header, expose standalone tools (`web.run`, `image_gen.imagegen`) when extensions are installed, and omit hosted tool descriptors (`web_search`, `image_generation`) entirely. Without standalone extensions, lite still omits hosted tools rather than falling back. The compaction test verifies that `Op::Compact` uses the lite transport contract too, including the lite header, `reasoning.context = "all_turns"`, and forced `parallel_tool_calls = false` even when the model advertises parallel tool support.
+Responses Lite is treated differently from the normal Responses transport. For example, it adds a special request header, uses standalone extension tools for web search and image generation instead of hosted API tools, and slightly changes compaction requests. The tests act like a customs checkpoint: they do not care how Codex internally packed the suitcase, but they open the outgoing request and verify that the right items are inside and the wrong ones are absent.
+
+The helper functions build a test extension registry, turn on or off relevant feature flags, make a model accept image input, and search JSON tool lists. Each test then sets up a mock server response, configures a test Codex model, submits user input or a compact operation, waits for completion, and asserts on the captured request.
 
 #### Function details
 
@@ -3664,11 +3688,11 @@ The first image test proves that in lite mode a `UserInput::Image` carrying `Ima
 fn responses_extensions(auth: &CodexAuth) -> Arc<ExtensionRegistry<Config>>
 ```
 
-**Purpose**: Builds an extension registry containing the standalone web-search and image-generation extensions for tests that need Responses Lite to expose client-side tools.
+**Purpose**: Builds the standalone web search and image generation extensions needed by some tests. This lets the tests check whether Responses Lite exposes those tools as local extension tools rather than as hosted API tools.
 
-**Data flow**: It takes a `&CodexAuth`, clones it into an auth manager via test support, creates an `ExtensionRegistryBuilder<Config>`, installs the web-search and image-generation extensions, builds the registry, and returns it wrapped in `Arc<ExtensionRegistry<Config>>`.
+**Data flow**: It takes a test authentication object, turns it into an authentication manager, creates a new extension registry builder, installs the web search and image generation extensions into that builder, and returns the finished registry wrapped in shared ownership so the test Codex instance can use it.
 
-**Call relations**: This helper is used only by the tests that compare standalone-tool exposure in lite versus hosted-tool exposure in non-lite mode. Those tests call it before building the fixture so the resulting Codex instance advertises extension-backed tools during request construction.
+**Call relations**: The two tool-related tests call this helper when they need real standalone extensions available. Inside, it hands authentication to the extension installers, so later request-building code can advertise those extensions as callable tools.
 
 *Call graph*: calls 1 internal fn (auth_manager_from_auth); called by 2 (non_lite_uses_hosted_tools_when_standalone_features_are_disabled, responses_lite_uses_standalone_web_search_and_image_generation); 6 external calls (clone, new, new, install, install, clone).
 
@@ -3679,11 +3703,11 @@ fn responses_extensions(auth: &CodexAuth) -> Arc<ExtensionRegistry<Config>>
 fn configure_responses_tools(config: &mut Config)
 ```
 
-**Purpose**: Mutates a `Config` into the specific feature combination needed to test hosted-versus-standalone search and image-generation behavior.
+**Purpose**: Sets the feature switches so the tests exercise the intended tool behavior. It enables live web search and image generation while disabling feature paths that would hide the behavior being tested.
 
-**Data flow**: It receives `&mut Config`, sets `web_search_mode` to `WebSearchMode::Live`, disables `Feature::StandaloneWebSearch`, enables `Feature::ImageGeneration`, and disables `Feature::ImageGenExt`. Each mutation is asserted to succeed, so the helper fails fast if the config rejects the requested state.
+**Data flow**: It receives a mutable Codex configuration, changes web search mode to live, disables the standalone web search feature flag, enables image generation, and disables the image generation extension flag. It does not return a value; the configuration is changed in place.
 
-**Call relations**: It is passed into fixture builders in tests that need deterministic tool selection rules. The tests rely on this helper to ensure any observed hosted or standalone tool exposure comes from transport mode and installed extensions, not from unrelated feature defaults.
+**Call relations**: Tests pass this function into the test Codex builder during setup. The builder applies it before running a turn, so the outgoing request reflects this carefully chosen mix of enabled and disabled tool features.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3694,11 +3718,11 @@ fn configure_responses_tools(config: &mut Config)
 fn configure_image_capable_model(model_info: &mut codex_protocol::openai_models::ModelInfo)
 ```
 
-**Purpose**: Marks a model override as image-capable so image inputs and image-generation-related tool logic are eligible during the test.
+**Purpose**: Marks a test model as able to accept both text and images. The image-related tests need this so Codex is allowed to send image input to the Responses API.
 
-**Data flow**: It takes a mutable `ModelInfo` and replaces `input_modalities` with a two-element vector containing `InputModality::Text` and `InputModality::Image`. It returns no value and writes directly into the supplied model metadata.
+**Data flow**: It receives mutable model information and replaces the model’s input modality list with text and image. It returns nothing; the model description is updated in place.
 
-**Call relations**: Several tests pass this helper into `with_model_info_override` so the built fixture behaves like an image-capable model. In the image serialization and tool exposure cases, that prevents the request builder from stripping image-related capabilities for lack of model support.
+**Call relations**: Several tests use this as a model override while building the test Codex instance. That setup step makes later image and image-generation request checks meaningful, because the model is declared image-capable.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3709,11 +3733,11 @@ fn configure_image_capable_model(model_info: &mut codex_protocol::openai_models:
 fn has_hosted_tool(tools: &[Value], tool_type: &str) -> bool
 ```
 
-**Purpose**: Checks whether a serialized `tools` array contains a hosted tool entry of a given `type` string.
+**Purpose**: Checks whether a JSON list of tools contains a hosted API tool of a given type. This is used to confirm that Responses Lite omits hosted tools, while the non-lite path includes them.
 
-**Data flow**: It reads a slice of `serde_json::Value`, iterates through each tool object, extracts `tool["type"]` as a string, compares it to the requested `tool_type`, and returns `true` on the first match or `false` otherwise.
+**Data flow**: It receives a slice of JSON tool objects and a tool type string. It scans each tool, reads its `type` field if present, and returns true if any tool’s type matches the requested value; otherwise it returns false.
 
-**Call relations**: The hosted-tool assertions in lite and non-lite tests use this helper after decoding the request body. It provides the concrete predicate for proving that hosted `web_search` and `image_generation` descriptors are either omitted or present.
+**Call relations**: The tests call this after capturing an outgoing request body. It is the small inspection tool that turns a raw JSON array into a clear yes-or-no answer about whether hosted web search or hosted image generation was sent.
 
 *Call graph*: 1 external calls (iter).
 
@@ -3724,11 +3748,11 @@ fn has_hosted_tool(tools: &[Value], tool_type: &str) -> bool
 async fn responses_lite_strips_data_image_detail_without_resize_all_images() -> Result<()>
 ```
 
-**Purpose**: Verifies that Responses Lite removes `detail` metadata from a data-URL image input when resize-all-images is not active.
+**Purpose**: Verifies that Responses Lite sends a data URL image without including the image `detail` field when no resizing is being done. This protects a subtle request-shape rule for inline images.
 
-**Data flow**: The test starts a mock server, mounts a minimal SSE completion stream, builds a fixture whose `gpt-5.4` model override enables `use_responses_lite` and image input, submits `Op::UserInput` containing one `UserInput::Image` with a base64 PNG data URL and `Some(ImageDetail::Original)`, waits for `EventMsg::TurnComplete`, then inspects the captured request JSON. It locates the `input_image` content item and asserts exact equality with a JSON object containing only `type` and `image_url`.
+**Data flow**: The test skips itself if network-dependent tests are unavailable, starts a mock server, prepares a fake streaming response, and builds a test Codex model with Responses Lite and image input enabled. It submits an image-only user input with `Original` detail, waits for the turn to finish, then opens the captured request and checks that the image item contains only `type` and `image_url`, not the original detail setting.
 
-**Call relations**: This is a top-level async test invoked by the test runner after the network guard passes. It delegates setup to `start_mock_server`, `mount_sse_once`, `test_codex`, and `wait_for_event`, then performs direct JSON inspection to validate the transport contract.
+**Call relations**: This test uses the mock Responses server and the `test_codex` builder to drive Codex through a real request path. After `wait_for_event` confirms the turn is complete, it inspects the request that the mock server recorded and uses an equality assertion to lock down the exact outgoing JSON shape.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 5 external calls (default, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
@@ -3739,11 +3763,11 @@ async fn responses_lite_strips_data_image_detail_without_resize_all_images() -> 
 async fn responses_lite_uses_standalone_web_search_and_image_generation() -> Result<()>
 ```
 
-**Purpose**: Checks that lite mode advertises standalone extension tools and suppresses hosted tool descriptors when the relevant extensions are installed.
+**Purpose**: Checks that Responses Lite advertises web search and image generation as standalone extension tools, not as hosted tools inside the Responses API request. It also verifies the special Responses Lite header is present.
 
-**Data flow**: It creates a mock server and completion SSE, constructs dummy ChatGPT auth plus an extension registry from `responses_extensions`, builds a fixture with `use_responses_lite = true`, image-capable model metadata, and the tool-focused config mutator, submits a normal turn, then inspects the single request. The assertions verify the lite header is `true`, `tool_by_name("web", "run")` and `tool_by_name("image_gen", "imagegen")` exist, and the decoded `tools` array contains neither hosted `web_search` nor hosted `image_generation` entries.
+**Data flow**: The test starts a mock server and fake streaming response, creates dummy ChatGPT authentication, builds the extension registry, and configures a Responses Lite, image-capable test model with the relevant tool settings. It submits a user turn, captures the outgoing request, checks the lite header, confirms the standalone `web/run` and `image_gen/imagegen` tools are present, then verifies the JSON tool list does not include hosted `web_search` or `image_generation` entries.
 
-**Call relations**: This test is one half of the lite/non-lite comparison. It depends on `responses_extensions` to make standalone tools available and uses request inspection helpers on the captured mock request to prove the request builder chose extension-backed tools.
+**Call relations**: This test calls `responses_extensions` to make standalone tools available and uses `configure_responses_tools` during Codex setup. After the request is captured, it relies on request helper methods and `has_hosted_tool` to prove that the lite path chose standalone tools over hosted ones.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, responses_extensions, create_dummy_chatgpt_auth_for_testing); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -3754,11 +3778,11 @@ async fn responses_lite_uses_standalone_web_search_and_image_generation() -> Res
 async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result<()>
 ```
 
-**Purpose**: Ensures that conversation compaction uses the Responses Lite compact endpoint contract rather than the normal transport shape.
+**Purpose**: Verifies that conversation compaction also follows the Responses Lite transport rules. Compaction means asking the model to shrink or summarize prior conversation context so later turns can continue efficiently.
 
-**Data flow**: It mounts both a normal SSE response and a compact JSON response, builds a fixture with `use_responses_lite = true`, `supports_parallel_tool_calls = true`, and `Feature::RemoteCompactionV2` disabled, submits an initial user turn, then submits `Op::Compact`. After waiting for completion, it inspects the compact request and asserts the lite header is present, `reasoning.context` equals `all_turns`, and `parallel_tool_calls` is explicitly `false`.
+**Data flow**: The test starts a mock server with one normal streaming response and one compact JSON response. It builds a Responses Lite model that supports parallel tool calls, disables a remote compaction feature flag, sends a normal turn, then submits a compact operation. After completion, it captures the compact request and checks that the lite header is set, the reasoning context is `all_turns`, and `parallel_tool_calls` is explicitly false.
 
-**Call relations**: The test runner invokes this directly. It first consumes the ordinary response request generated by the initial turn, then validates the separate compaction request captured by `mount_compact_json_once`, proving that compacting follows the lite-specific transport rules.
+**Call relations**: This test drives both the ordinary turn path and the compaction path through the test Codex instance. It uses the mock server’s separate compact endpoint capture to inspect the special compaction request rather than the earlier normal response request.
 
 *Call graph*: calls 5 internal fn (mount_compact_json_once, mount_sse_once, sse, start_mock_server, test_codex); 5 external calls (assert_eq!, wait_for_event, json!, skip_if_no_network!, vec!).
 
@@ -3769,11 +3793,11 @@ async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result
 async fn responses_lite_omits_hosted_tools_without_standalone_extensions() -> Result<()>
 ```
 
-**Purpose**: Verifies that lite mode does not fall back to hosted search or image-generation tools when standalone extensions are absent.
+**Purpose**: Checks that Responses Lite does not fall back to hosted web search or hosted image generation when standalone extensions are not installed. This prevents Codex from silently exposing the wrong kind of tools.
 
-**Data flow**: It starts a mock server, mounts a completion SSE, builds a fixture with dummy auth, `use_responses_lite = true`, image-capable model metadata, and the tool-focused config mutator but no installed extensions, submits a turn, decodes the request body, extracts the `tools` array, and asserts that neither hosted `web_search` nor hosted `image_generation` appears.
+**Data flow**: The test starts a mock server, creates dummy authentication, configures a Responses Lite image-capable model, and applies the same tool feature settings as the other tool tests, but does not install standalone extensions. It submits a user turn, reads the captured request body, extracts the tools array, and confirms that hosted `web_search` and `image_generation` are both absent.
 
-**Call relations**: This test complements the standalone-extension case by removing only the extension registry. The resulting assertions show that omission of hosted tools is a lite-mode invariant, not merely a consequence of standalone tools being present.
+**Call relations**: This test is the companion to the standalone-extension test. Instead of calling `responses_extensions`, it leaves the extension registry out, then uses `has_hosted_tool` to verify that the request builder did not compensate by adding hosted tools.
 
 *Call graph*: calls 5 internal fn (mount_sse_once, sse, start_mock_server, test_codex, create_dummy_chatgpt_auth_for_testing); 3 external calls (assert!, skip_if_no_network!, vec!).
 
@@ -3784,24 +3808,24 @@ async fn responses_lite_omits_hosted_tools_without_standalone_extensions() -> Re
 async fn non_lite_uses_hosted_tools_when_standalone_features_are_disabled() -> Result<()>
 ```
 
-**Purpose**: Confirms that the normal Responses transport still exposes hosted search and image-generation tools under the same feature configuration where lite mode suppresses them.
+**Purpose**: Confirms the normal, non-lite Responses path still uses hosted web search and hosted image generation when the standalone feature paths are disabled. This makes sure the special Responses Lite behavior does not leak into the regular transport.
 
-**Data flow**: It creates a mock server and completion SSE, builds dummy auth and standalone extensions, constructs a fixture with an image-capable model but without enabling `use_responses_lite`, applies the same tool config mutator, submits a turn, and inspects the request. The assertions require that the lite header is absent, standalone tool names are absent, and the `tools` array contains hosted `web_search` and `image_generation` entries.
+**Data flow**: The test starts a mock server, creates dummy authentication, installs standalone extensions, configures an image-capable model without turning on Responses Lite, and applies the same tool settings. It submits a user turn, captures the request, verifies the lite header is missing, confirms standalone extension tool entries are absent, and checks that hosted `web_search` and `image_generation` entries are present in the JSON tools array.
 
-**Call relations**: This is the control case for the lite-mode tests. It reuses `responses_extensions` and `configure_responses_tools` so the only meaningful difference is transport mode, making the hosted-tool assertions a direct regression check against lite-specific behavior.
+**Call relations**: This test calls `responses_extensions`, but because the model is not marked as Responses Lite, the expected request shape is different. It acts as a control case for the lite-specific tests, proving that hosted tools are still used on the regular path.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, test_codex, responses_extensions, create_dummy_chatgpt_auth_for_testing); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/turn_state.rs`
 
-`test` · `request handling`
+`test` · `test execution`
 
-This suite validates the `x-codex-turn-state` mechanism that lets the server mint opaque state during a turn and have the client replay it on same-turn follow-up requests. The constant `TURN_STATE_HEADER` names the header/key under test. All three tests build a `TestCodex`, trigger a turn that causes at least one tool follow-up request, and then inspect the captured outbound requests.
+A “turn” is one round of interaction with the assistant: the user asks something, the model may request a tool like a shell command, and Codex may need to call the model again with the tool result. This file makes sure a special value called turn state behaves like a sticky note for that one round only. If the server sends this value, Codex should attach it to later follow-up requests in the same turn, so the server can keep its place. But Codex must not accidentally carry it into the next user turn, because that would mix two separate conversations.
 
-The first test uses the Responses HTTP path. It mounts a response sequence where the first SSE response includes a response header `x-codex-turn-state: ts-1`, emits reasoning plus a shell-command tool call, and completes; the second response completes the same logical turn; the third response is a separate later turn. The assertions check that the initial request has no turn-state header, the same-turn follow-up request replays `ts-1`, and the next turn clears it. It also parses `x-codex-turn-metadata` JSON to prove the first two requests share a `turn_id` while the third has a different one.
+The tests use fake servers instead of the real model service. The fake server sends carefully chosen event streams: a response is created, sometimes a shell command is requested, and then the response completes. The tests then inspect what Codex sent back to the server. They check that the first request starts without turn state, follow-up requests in the same turn include it, and the next new turn starts clean again.
 
-The websocket tests perform the same logical checks using `client_metadata` instead of HTTP headers. One verifies that state persists across requests on the same physical websocket connection but resets for the next logical turn. The other verifies stability within a single turn: if a later response metadata frame tries to change the turn state from `ts-1` to `ts-2`, subsequent same-turn follow-ups still send the original `ts-1`, showing that turn state is latched for the duration of the turn rather than updated mid-turn.
+The file also checks WebSocket behavior, where several logical requests can share one long-lived network connection. That is important because reusing the same connection must not mean reusing stale turn state.
 
 #### Function details
 
@@ -3811,11 +3835,11 @@ The websocket tests perform the same logical checks using `client_metadata` inst
 async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<()>
 ```
 
-**Purpose**: Verifies HTTP/SSE turn-state behavior: no state on the initial request, replay on same-turn follow-up, and reset on the next turn. It also confirms the first two requests belong to the same logical turn via `x-codex-turn-metadata`.
+**Purpose**: This test checks turn state when Codex talks to the model through streamed responses. It proves that a turn state header sent by the server is reused for a follow-up request in the same turn, but is not sent on the first request of the next turn.
 
-**Data flow**: It starts a mock server, mounts three responses where the first includes `x-codex-turn-state: ts-1` and a shell-command tool call, builds a `TestCodex`, submits one turn that triggers the tool follow-up and then a second independent turn, reads the captured requests from the response log, asserts the first request has no turn-state header, the second has `ts-1`, and the third has none, then defines a local parser that deserializes the `x-codex-turn-metadata` header JSON and extracts `turn_id`. It asserts the first and second requests share a turn id and the third differs.
+**Data flow**: The test starts a mock server and gives it three prepared responses. The first response includes the turn state header and asks Codex to run a shell command, which causes a same-turn follow-up request. The second response finishes that first turn, and the third response is for a new user turn. After submitting two user turns, the test reads the mock server’s request log and checks the headers: no turn state on the first request, the saved value on the follow-up, and no turn state on the new turn. It also reads each request’s turn metadata and checks that the first two requests share the same turn id while the third has a different one.
 
-**Call relations**: This test establishes the baseline turn-state contract on the Responses transport, against which the websocket variants mirror behavior.
+**Call relations**: The test builds its fake response sequence with the server-response helpers, mounts that sequence on a mock server, then creates a test Codex client with test_codex. When submit_turn is called, Codex drives the normal request flow against the mock server. The final assertions compare what the fake server received with the expected turn-state behavior.
 
 *Call graph*: calls 4 internal fn (mount_response_sequence, sse, start_mock_server, test_codex); 4 external calls (assert_eq!, assert_ne!, skip_if_no_network!, vec!).
 
@@ -3826,11 +3850,11 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
 async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<()>
 ```
 
-**Purpose**: Checks that websocket client metadata carries turn state across same-turn follow-up requests on a reused connection, but resets to null for the next logical turn. It mirrors the HTTP test on the websocket transport.
+**Purpose**: This test checks the same turn-state rule over a WebSocket connection, which is a single reusable two-way connection. It makes sure state is carried across same-turn follow-ups but cleared for the next user turn, even though the physical connection stays open.
 
-**Data flow**: It starts a websocket test server configured with one connection whose first response emits a `response.metadata` frame containing `x-codex-turn-state: ts-1`, followed by a shell-command tool call and completion, then two more responses for the same-turn follow-up and a later turn. It builds a websocket-backed `TestCodex`, submits two turns, asserts only one websocket handshake occurred, reads the single connection's three requests, maps each request's `body_json()["client_metadata"][TURN_STATE_HEADER]`, and asserts the sequence is `[null, "ts-1", null]`. It then shuts the server down.
+**Data flow**: The test starts a fake WebSocket server with three prepared request/response phases. In the first phase, the server sends metadata containing the turn state and asks for a shell command. In the second phase, Codex sends a follow-up request on the same turn and should include that turn state. In the third phase, Codex starts a new user turn and should send no turn state. The test then inspects the messages received on the single WebSocket connection and expects the client metadata values to be null, then "ts-1", then null.
 
-**Call relations**: This test proves that logical turn-state reset is independent of physical connection reuse: the same websocket stays open while the state still clears between turns.
+**Call relations**: The WebSocket fake server supplies the scripted responses, and test_codex builds a Codex client pointed at that server. The two submit_turn calls make Codex produce three model requests: the original turn, the tool follow-up, and the next turn. The test then checks the server’s recorded connection and shuts it down.
 
 *Call graph*: calls 2 internal fn (start_websocket_server_with_headers, test_codex); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -3841,11 +3865,11 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 async fn websocket_turn_state_is_stable_within_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that once websocket turn state is established for a turn, later metadata frames in the same turn do not replace it. Subsequent same-turn follow-ups must continue sending the original value.
+**Purpose**: This test checks that once Codex has chosen a turn state for a turn, it keeps using that original value for the rest of that turn. If a later same-turn response tries to provide a different value, Codex does not switch to it.
 
-**Data flow**: It starts a websocket server whose first response metadata sets `ts-1`, whose second response metadata attempts to set `ts-2`, and whose third response completes the turn after two shell-command follow-ups. It builds a websocket-backed `TestCodex`, submits one turn that triggers both follow-ups, asserts there was a single handshake, reads the three requests on that connection, extracts `client_metadata[TURN_STATE_HEADER]` from each, and asserts the sequence is `[null, "ts-1", "ts-1"]`. It then shuts the server down.
+**Data flow**: The fake WebSocket server is scripted for one user turn that needs two shell-command follow-ups. The first response sends turn state "ts-1" and requests a shell command. The second response sends a different turn state, "ts-2", and requests another shell command. The third response completes the turn. After one submitted user turn, the test reads the recorded WebSocket requests and checks the client metadata: the first request has no turn state, the first follow-up has "ts-1", and the second follow-up still has "ts-1" rather than the later "ts-2".
 
-**Call relations**: This test covers the latching invariant within a single turn, complementing the previous websocket test that focused on reset across turns.
+**Call relations**: The test uses the WebSocket test server to imitate a model service that changes its metadata mid-turn. The Codex test client runs through the scripted turn with submit_turn. The assertions confirm that Codex treats the first turn-state value like the fixed label for that turn, rather than updating it whenever later metadata arrives.
 
 *Call graph*: calls 2 internal fn (start_websocket_server_with_headers, test_codex); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -3855,11 +3879,15 @@ These regression suites verify retry, recovery, and transport fallback behavior 
 
 ### `core/tests/suite/stream_error_allows_next_turn.rs`
 
-`test` · `request handling and error recovery`
+`test` · `test run`
 
-This file contains a single end-to-end test around stream error recovery. It uses a raw `wiremock::MockServer` rather than the higher-level response helpers for the failing request so it can return an HTTP 500 JSON error body from `/v1/responses`. A second mock on the same endpoint matches a different prompt and returns a minimal SSE stream containing `response.created` and `completed`. The comments note that the configured provider disables request retries and allows only stream retries, so the first failing request should not loop indefinitely.
+This file is a safety test for a frustrating failure case: the model service starts a turn, something goes wrong, and the app must still be ready for the next user request. Without this behavior, one bad network or server response could leave the conversation "busy" forever, like a door that never unlocks after someone fails to enter.
 
-The test constructs a custom `ModelProviderInfo` pointing at the mock server’s `/v1` base URL, using `WireApi::Responses`, no OpenAI auth requirement, and short stream timeouts. It then builds `TestCodex` with that provider and a simple base instruction. The first submitted `Op::UserInput` contains `first message`; the test waits for an `EventMsg::Error` and then for `TurnComplete`, which is the critical invariant: even on stream failure, the running turn must be cleaned up. It then submits a second turn with `follow up` and waits for `TurnComplete` again. If the first failure had left the session stuck in a running state, this second submission would be rejected or hang, so the test directly guards the session-release path after transport errors.
+The test creates a fake HTTP server instead of talking to a real model provider. The first mocked model request, containing "first message", returns an HTTP 500 error with a JSON error body. That simulates the provider rejecting or failing the request. The provider configuration points Codex at this fake server and uses the Responses API, with retry limits set so the test stays predictable.
+
+Codex then receives the first user message. The test waits until Codex reports an error, and then waits for a TurnComplete event. That second event is important: it means Codex has cleaned up the failed turn and released the session.
+
+Next, the test sends a second user message, "follow up". This time the fake server returns a successful server-sent events stream, which is a standard way for servers to send response updates over one HTTP connection. The test passes only if Codex accepts this second turn and completes it. In short, the file guards against stream errors poisoning the whole conversation.
 
 #### Function details
 
@@ -3869,24 +3897,24 @@ The test constructs a custom `ModelProviderInfo` pointing at the mock server’s
 async fn continue_after_stream_error()
 ```
 
-**Purpose**: Simulates a streamed Responses API failure on one turn and verifies that a second turn can still be submitted and complete successfully afterward.
+**Purpose**: This asynchronous test verifies that after a model response stream fails, Codex still finishes the turn internally and allows a later user message to run normally. It is used to catch regressions where an error leaves the session locked or permanently busy.
 
-**Data flow**: Skips without network, starts a mock server, mounts one `/v1/responses` POST matcher for bodies containing `first message` that returns a 500 JSON error and another matcher for `follow up` that returns a minimal SSE success stream, constructs a custom `ModelProviderInfo` targeting that server, builds `TestCodex` with the provider and base instructions, submits a first `Op::UserInput` turn, waits for `Error` and then `TurnComplete`, submits a second `Op::UserInput` turn, and waits for its `TurnComplete`.
+**Data flow**: The test starts with a fake model server and two planned responses: one failing response for a prompt containing "first message", and one successful streaming response for a prompt containing "follow up". It builds a test Codex instance configured to use that fake server, submits the first message, and observes that Codex emits both an error and a turn-complete signal. Then it submits the second message and checks that this new turn completes successfully. The visible result is not a returned value, but proof through events and mock-server expectations that Codex recovered cleanly.
 
-**Call relations**: This is a standalone regression test with no internal helpers. Its entire purpose is to validate the control-flow transition from stream failure back to an idle session capable of accepting the next turn.
+**Call relations**: This function is the whole test scenario. It calls test helpers to start the mock server, create fake HTTP responses, build a TestCodex instance, submit user input, and wait for Codex events. The first half drives Codex into a controlled stream failure; the second half asks Codex to continue, showing that the earlier failure did not block the normal turn flow.
 
 *Call graph*: calls 2 internal fn (sse, test_codex); 12 external calls (default, given, start, new, wait_for_event, format!, json!, skip_if_no_network!, vec!, body_string_contains (+2 more)).
 
 
 ### `core/tests/suite/stream_no_completed.rs`
 
-`test` · `request handling`
+`test` · `test run`
 
-This test file builds a minimal failure/recovery scenario around the Responses SSE transport. It first synthesizes an intentionally incomplete SSE payload containing only a `response.output_item.done` event, then pairs it with a normal completed SSE response from the test support helpers. A streaming SSE server is started with two sequential responses: the first closes early, the second completes normally.
+This file tests a failure case in server-sent events, often called SSE: a way for a server to send a live stream of messages over one HTTP connection. The important rule here is that a model response is not truly finished until the stream includes a `response.completed` event. Without that final marker, Codex could wrongly treat a cut-off answer as complete, or fail instead of retrying.
 
-The test configures a `ModelProviderInfo` directly instead of mutating process environment, pointing `base_url` at the mock server and selecting `WireApi::Responses`. The retry knobs are the core of the scenario: `request_max_retries` is forced to `Some(0)` so only stream-level retry logic is exercised, while `stream_max_retries` is set to `Some(1)` to permit exactly one retry after the premature close. The test then constructs a `TestCodex`, submits a single `Op::UserInput` containing one `UserInput::Text`, and waits until an `EventMsg::TurnComplete` arrives.
+The test builds a tiny fake streaming server. On the first request, the server sends an incomplete stream: it reports that one output item is done, but never sends the final completion event. On the second request, it sends a proper completed response. The test then configures a `TestCodex` instance to use this fake server and to allow one retry for streaming failures.
 
-The key invariant checked at the end is request count: the mock server must have observed two requests, proving the client retried after detecting that the first stream terminated before `response.completed`. This catches regressions where early EOF might be treated as success or as a fatal non-retriable error.
+After submitting a simple user message, the test waits for Codex to announce that the turn is complete. That proves the retry worked: Codex noticed the first stream was incomplete, made another request, and accepted the completed second stream. Finally, the test checks that the fake server received exactly two requests, like checking a delivery log to confirm the first damaged package was replaced by a second good one.
 
 #### Function details
 
@@ -3896,11 +3924,11 @@ The key invariant checked at the end is request count: the mock server must have
 fn sse_incomplete() -> String
 ```
 
-**Purpose**: Constructs the exact malformed SSE transcript used to simulate a stream that ends before completion. The payload contains only a single `response.output_item.done` event and omits `response.completed`.
+**Purpose**: Builds a fake SSE response that is intentionally missing the final completion event. The test uses it to simulate a server connection that ends too early.
 
-**Data flow**: It takes no arguments and creates a one-element JSON event vector inline, then passes that vector to the test helper that serializes SSE frames. It returns the resulting `String` body and does not mutate any external state.
+**Data flow**: It takes no input. It creates a small JSON event saying an output item is done, wraps that event in the project’s SSE text format, and returns the resulting string. The returned stream looks plausible but is deliberately unfinished.
 
-**Call relations**: This helper is used only by `retries_on_early_close` to keep the incomplete-stream fixture explicit and reusable within the test setup.
+**Call relations**: The main test, `retries_on_early_close`, calls this helper while setting up the fake server. Its output becomes the body of the first server response, which is meant to trigger Codex’s retry path.
 
 *Call graph*: calls 1 internal fn (sse); called by 1 (retries_on_early_close); 1 external calls (vec!).
 
@@ -3911,22 +3939,24 @@ fn sse_incomplete() -> String
 async fn retries_on_early_close()
 ```
 
-**Purpose**: Exercises the full retry path for an SSE stream that closes too early, proving the agent retries once and still completes the turn. It also verifies that the retry is stream-specific rather than a broader request retry policy artifact.
+**Purpose**: Runs the full test scenario: first the fake server sends an incomplete stream, then it sends a completed one, and Codex should retry and finish the turn. This proves the streaming retry behavior works for early connection closes.
 
-**Data flow**: The test reads network availability via `skip_if_no_network!`, builds two SSE bodies (`sse_incomplete` and a completed response), and starts a streaming SSE server configured to serve them in order. It constructs a `ModelProviderInfo` with the server URI, `WireApi::Responses`, `stream_max_retries: Some(1)`, `request_max_retries: Some(0)`, and a short idle timeout, injects that into a `TestCodex` config, submits an `Op::UserInput` containing one text item, waits for `EventMsg::TurnComplete`, then reads the server request log and asserts that exactly two requests were made before shutting the server down.
+**Data flow**: It starts by skipping the test if networking is unavailable. It then creates two response bodies: one incomplete and one completed. It launches a fake streaming server that serves those responses in order. Next it builds a Codex test instance configured to talk to that server and to allow one stream retry. It submits a simple user message, waits until Codex reports the turn is complete, then reads the server’s request log and asserts that exactly two requests were made. At the end, it shuts the fake server down.
 
-**Call relations**: As the sole test entrypoint in the file, it orchestrates the entire scenario: fixture creation, codex construction, turn submission, completion wait, and final assertion. It delegates SSE body creation to `sse_incomplete`, server setup to the streaming SSE helper, and completion observation to `wait_for_event`.
+**Call relations**: This is the async test function run by the test framework. During setup it calls `sse_incomplete` for the broken first stream, `sse_completed` for the successful second stream, `start_streaming_sse_server` to create the fake server, and `test_codex` to build a Codex instance pointed at that server. During the test it submits user input to Codex, then uses `wait_for_event` to observe successful completion before checking the server request count.
 
 *Call graph*: calls 4 internal fn (sse_completed, start_streaming_sse_server, test_codex, sse_incomplete); 6 external calls (default, assert_eq!, wait_for_event, format!, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/websocket_fallback.rs`
 
-`test` · `transport setup and request streaming during integration tests`
+`test` · `test run`
 
-This file exercises transport-level resilience for providers configured with `WireApi::Responses` and `supports_websockets = true`. Each test points the model provider base URL at a mock server and configures retry counts so fallback behavior is deterministic. The first case mounts an explicit HTTP 426 response for `GET .../responses`, representing an upgrade-required failure during the startup prewarm connect; the expected behavior is immediate switch to HTTP, so the first real turn performs one POST and no extra WebSocket retries. The second case leaves the WebSocket path failing implicitly, allowing the startup prewarm plus the turn's initial attempt and two retries before the request is replayed over HTTP.
+Codex can talk to the model provider in two ways: through WebSockets, which are long-lived connections for streaming messages, or through HTTP, the more ordinary request-and-response path. This test file checks the safety net between those two paths. If WebSockets fail, Codex should not get stuck retrying forever or show confusing errors. It should switch to HTTP and keep the conversation working.
 
-The third test submits a fully specified `Op::UserInput` turn and consumes the event stream, collecting `StreamError` messages until `TurnComplete`. It asserts that the first retry message is hidden in release builds, while debug builds expose both reconnect notices. The final test submits two turns and counts server requests to prove fallback is sticky: all WebSocket attempts happen on startup and the first turn, while the second turn goes straight to HTTP. These tests specify both transport switching and the user-visible event behavior around retries.
+Each test starts a fake model server. The fake server records what Codex tried to do and can return scripted streaming responses using SSE, short for Server-Sent Events, which is a simple HTTP streaming format. The tests configure Codex to believe the provider supports WebSockets, then deliberately make WebSocket attempts fail or run out of retries. After a user turn is submitted, the tests count whether Codex used GET requests for WebSocket attempts and POST requests for HTTP fallback.
+
+The important behavior is that fallback is practical and user-friendly. A special “upgrade required” response should make Codex switch immediately. Ordinary WebSocket failures should be retried only up to the configured limit. The first retry error may be hidden in some builds to avoid noisy output. Once HTTP fallback is chosen, it should be “sticky,” like choosing a backup road after finding the main bridge closed: later turns should keep using the working route.
 
 #### Function details
 
@@ -3936,11 +3966,11 @@ The third test submits a fully specified `Op::UserInput` turn and consumes the e
 async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Result<()>
 ```
 
-**Purpose**: Verifies that an HTTP 426 on the WebSocket connect path causes immediate fallback to HTTP responses transport.
+**Purpose**: This test checks the fastest fallback path. If the fake server answers a WebSocket connection attempt with HTTP 426, meaning “upgrade required,” Codex should treat that as a signal to stop trying WebSockets and use HTTP instead.
 
-**Data flow**: It starts a mock server, mounts a `GET .../responses` matcher returning 426, mounts one SSE completion response for HTTP POST, builds a test whose provider points at the mock server with websocket support and limited retries, submits a turn, then counts received GET and POST requests. It asserts one websocket attempt, one HTTP attempt, and one captured HTTP response request.
+**Data flow**: The test starts a mock server, teaches it to reject WebSocket-style GET requests to the responses endpoint with status 426, and prepares one successful HTTP streaming response. It then builds a Codex test session configured for the Responses API with WebSockets enabled. After submitting the text “hello,” it reads the mock server’s recorded requests and counts WebSocket GET attempts and HTTP POST attempts. The expected result is one WebSocket attempt, one HTTP fallback request, and one consumed response.
 
-**Call relations**: This test covers the special-case fast fallback path triggered by upgrade-required responses during startup prewarm.
+**Call relations**: The async test runner calls this function as a standalone integration test. Inside it, the test support helpers create the fake server, mount the scripted SSE response, build a configured TestCodex instance, and submit a user turn. The final assertions connect the whole story: the mock server’s request log proves that Codex switched transport immediately instead of retrying the failed WebSocket handshake.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 8 external calls (given, new, assert_eq!, format!, skip_if_no_network!, vec!, method, path_regex).
 
@@ -3951,11 +3981,11 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
 async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()>
 ```
 
-**Purpose**: Checks that after the configured number of WebSocket stream retries is exhausted, the request is replayed over HTTP.
+**Purpose**: This test checks the normal failure path. When WebSocket streaming keeps failing, Codex should retry only the allowed number of times and then replay the same request over HTTP.
 
-**Data flow**: It mounts one SSE completion response, builds the same websocket-capable provider config without the explicit 426 matcher, submits a turn, counts GET and POST requests on the mock server, and asserts four websocket attempts total (startup prewarm plus initial try plus two retries), one HTTP attempt, and one captured HTTP response request.
+**Data flow**: The test starts a mock server and mounts a single successful SSE response for the eventual HTTP path. It configures Codex with WebSocket support enabled, two stream retries, and no extra HTTP request retries. After sending “hello,” it inspects the mock server’s recorded traffic. The before-and-after story is: Codex first tries WebSockets, fails enough times to exhaust its retry budget, then sends one HTTP POST that receives the prepared response.
 
-**Call relations**: This is the generic retry-exhaustion fallback case, contrasting with the immediate 426-triggered fallback.
+**Call relations**: The test runner invokes this function, and the function uses the shared test harness to stand up the mock provider and Codex session. The mounted SSE response is handed to the HTTP fallback path after the WebSocket attempts fail. The assertions verify that the retry policy and fallback machinery worked together: startup made one prewarm WebSocket attempt, the turn made the configured stream attempts, and only then did HTTP take over.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 4 external calls (assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3966,11 +3996,11 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
 async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result<()>
 ```
 
-**Purpose**: Verifies the sequence of `StreamError` messages shown to the user during websocket retry and fallback, with different expectations for debug and release builds.
+**Purpose**: This test checks what the user sees while WebSocket fallback is happening. It makes sure Codex does not always expose every early retry failure as a stream error message, which would make a recoverable problem look scarier than it is.
 
-**Data flow**: It mounts one SSE completion response, builds a websocket-capable test, manually submits `Op::UserInput` with local environment selections and disabled permissions, then loops over `codex.next_event()` under a timeout collecting `EventMsg::StreamError` messages until `TurnComplete`. It compares the collected messages against either `["Reconnecting... 1/2", "Reconnecting... 2/2"]` in debug builds or only `["Reconnecting... 2/2"]` otherwise, and asserts one HTTP response request was captured.
+**Data flow**: The test starts a mock server, prepares one successful HTTP SSE response, and builds a Codex session configured to try WebSockets first. Instead of using the higher-level helper for a turn, it submits a detailed user input operation with permission and environment settings, then listens to Codex events until the turn completes. It collects only StreamError messages, compares them with the expected reconnect messages for the build type, and confirms the HTTP fallback response was used once.
 
-**Call relations**: This test is the only one in the file that inspects the event stream rather than just counting transport requests, documenting the user-facing retry messaging policy.
+**Call relations**: The async test runner calls this function. The function relies on support helpers to create local environment selections, permission fields, the fake server, the SSE response, and the Codex test session. It then talks directly to the Codex event stream, which lets the test observe the user-facing messages produced during retries. The final comparison ties retry behavior to user experience: Codex may reconnect in the background, but the event stream should show only the intended retry notices before successful fallback.
 
 *Call graph*: calls 6 internal fn (mount_sse_once, sse, start_mock_server, local_selections, test_codex, turn_permission_fields); 9 external calls (default, from_secs, new, assert_eq!, cfg!, format!, skip_if_no_network!, timeout, vec!).
 
@@ -3981,11 +4011,11 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
 async fn websocket_fallback_is_sticky_across_turns() -> Result<()>
 ```
 
-**Purpose**: Checks that once websocket fallback activates, later turns continue using HTTP without attempting websocket again.
+**Purpose**: This test checks that once Codex has fallen back from WebSockets to HTTP, it keeps using HTTP for later turns in the same session. That avoids wasting time repeatedly trying a connection style that already failed.
 
-**Data flow**: It mounts two SSE completion responses, builds the websocket-capable provider config, submits two turns, counts GET and POST requests on the mock server, and asserts four websocket attempts total across startup and the first turn, two HTTP attempts total, and two captured HTTP response requests.
+**Data flow**: The test starts a mock server and mounts two scripted SSE responses, one for each HTTP turn. It builds a Codex session with WebSockets enabled and a limited WebSocket retry budget. It submits a first message and then a second message. After both finish, it counts the recorded WebSocket GET requests and HTTP POST requests. The expected result is that all WebSocket attempts happened during startup and the first turn, while both actual turns were completed through HTTP.
 
-**Call relations**: This test extends the retry-exhaustion scenario across multiple turns to prove fallback state persists for the session.
+**Call relations**: The test runner invokes this function as an integration test. The mock server and response sequence provide two successful HTTP fallback replies, while the TestCodex helper drives two user turns. The assertions show how this test fits into the larger fallback story: earlier tests prove Codex can switch to HTTP, and this one proves that the switch becomes session state rather than a one-time workaround.
 
 *Call graph*: calls 3 internal fn (mount_sse_sequence, start_mock_server, test_codex); 4 external calls (assert_eq!, format!, skip_if_no_network!, vec!).
 
@@ -3995,11 +4025,13 @@ These tests validate provider-facing protocol details around proxy identity, quo
 
 ### `core/tests/suite/responses_api_proxy_headers.rs`
 
-`test` · `integration test execution for outbound proxy/header decoration during multi-agent request handling`
+`test` · `test run`
 
-This module contains one end-to-end test for request-header propagation in multi-agent conversations. It mounts three SSE handlers on a mock server using body/header predicates: the first matches the parent request containing `PARENT_PROMPT` and no `x-openai-subagent` header, returning a `multi_agent_v1.spawn_agent` tool call; the second matches the spawned child request containing `CHILD_PROMPT`, excluding the spawn call id, and requiring `x-openai-subagent: collab_spawn`; the third matches the parent follow-up request that includes the spawn call id and again has no subagent header. Request compression is explicitly disabled so the body predicates can inspect plain text.
+This file is a focused integration test for collaboration-style agent spawning. In plain terms, it starts a fake Responses API server, asks Codex to run a parent prompt, makes that parent prompt spawn a child agent, and then inspects the HTTP requests that Codex sent. The important question is: can the outside API tell which request came from the main agent and which came from the spawned subagent?
 
-The helper `submit_turn_with_timeout` submits a local workspace-write turn with on-request approvals and waits for both `TurnStarted` and the matching `TurnComplete`, using `wait_for_event_result` to collect event summaries if a timeout occurs. `wait_for_matching_request` similarly polls a `ResponseMock` until a captured request satisfies a predicate or the global timeout expires. Once both parent and child requests are captured, the test extracts `x-codex-window-id` from each, parses it with `split_window_id`, and asserts both generations are zero while the child thread id differs from the parent thread id. It then checks that only the child carries `x-openai-subagent`, that the child's `x-codex-parent-thread-id` equals the parent's thread id, and that the JSON in `x-codex-turn-metadata` contains `parent_thread_id` but not `forked_from_thread_id`. The result is a precise contract for how spawned subagent requests should be labeled by the proxy layer.
+The test sets up three fake streamed responses: the first parent response tells Codex to call the subagent-spawning tool, the child response says it is done, and the final parent response reports completion. Then the test submits the parent prompt to a real test Codex session and waits until the turn finishes.
+
+After that, it examines the captured requests. The parent request must not carry the subagent identity header. The child request must carry `x-openai-subagent: collab_spawn`, must have its own thread identifier, and must point back to the parent thread through `x-codex-parent-thread-id` and turn metadata. Think of it like checking envelopes in an office: the parent and child letters must have different sender IDs, and the child letter must say which parent office sent it. Without this test, a regression could make subagent calls look like ordinary parent calls, which would break tracing, routing, or billing decisions that depend on these headers.
 
 #### Function details
 
@@ -4009,11 +4041,11 @@ The helper `submit_turn_with_timeout` submits a local workspace-write turn with 
 async fn responses_api_parent_and_subagent_requests_include_identity_headers() -> Result<()>
 ```
 
-**Purpose**: Exercises a parent turn that spawns a subagent and verifies the resulting parent and child Responses API requests carry the correct identity and lineage headers.
+**Purpose**: This is the main test. It proves that a parent Codex turn and the subagent it spawns send different, correct identity headers to the Responses API.
 
-**Data flow**: Starts a mock server, serializes spawn arguments containing `CHILD_PROMPT`, mounts three SSE handlers keyed by request-body/header predicates for the parent request, child request, and parent follow-up, builds a `TestCodex` with request compression disabled, submits the parent prompt via `submit_turn_with_timeout`, waits for matching captured parent and child requests via `wait_for_matching_request`, extracts and parses `x-codex-window-id` headers with `split_window_id`, asserts generation values and thread-id relationships, checks `x-openai-subagent` and `x-codex-parent-thread-id`, parses `x-codex-turn-metadata` JSON from the child request, and asserts the expected parent-thread linkage fields.
+**Data flow**: It starts with fixed parent and child prompts, then creates a mock server that returns scripted streaming responses. It submits the parent prompt to a test Codex instance, waits for the parent and child HTTP requests to appear, reads their headers and bodies, splits the window IDs into thread IDs and generation numbers, and finally checks that the parent, child, and parent-link information are all correct. Its output is success if every assertion passes, or a test error if any expected request or header is missing or wrong.
 
-**Call relations**: This is the sole top-level scenario in the file and orchestrates all local helpers to inspect both event completion and captured HTTP requests.
+**Call relations**: This function drives the whole test story. It calls the mock-server helpers to prepare fake API replies, uses `submit_turn_with_timeout` to make Codex run the prompt, uses `wait_for_matching_request` to find the captured parent and child requests, and uses `split_window_id` to understand the header format before making its final checks.
 
 *Call graph*: calls 7 internal fn (mount_sse_once_match, sse, start_mock_server, test_codex, split_window_id, submit_turn_with_timeout, wait_for_matching_request); 7 external calls (assert!, assert_eq!, json!, from_str, to_string, skip_if_no_network!, vec!).
 
@@ -4024,11 +4056,11 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
 async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()>
 ```
 
-**Purpose**: Submits a local turn configured for workspace write and waits for both start and completion within the global timeout window. It provides deterministic synchronization for the header-inspection test.
+**Purpose**: This helper submits a user prompt into the test Codex session and waits until that turn starts and finishes. It keeps the main test from racing ahead before Codex has actually sent the requests being inspected.
 
-**Data flow**: Takes a `TestCodex` and prompt, derives sandbox and permission fields from `PermissionProfile::workspace_write()` and the configured cwd, submits an `Op::UserInput` with local environment selections, `AskForApproval::OnRequest`, and default collaboration mode using the session model, waits for a `TurnStarted` event via `wait_for_event_result`, extracts its `turn_id`, then waits for a `TurnComplete` event whose `turn_id` matches, returning `Result<()>`.
+**Data flow**: It receives a `TestCodex` session and a prompt string. It reads the test model and working directory, builds the permission and thread settings needed for a realistic local turn, submits the prompt as user input, then watches Codex events until it sees the matching turn start and complete. It returns success when the turn is done, or an error if submission or waiting fails.
 
-**Call relations**: Called only by the top-level header test before it begins polling the mock server for parent and child requests.
+**Call relations**: The main test calls this after the mock server is ready. Inside, it uses permission-selection helpers to shape the turn request and relies on `wait_for_event_result` twice: first to find the `TurnStarted` event, then to find the matching `TurnComplete` event.
 
 *Call graph*: calls 4 internal fn (local_selections, turn_permission_fields, wait_for_event_result, workspace_write); called by 1 (responses_api_parent_and_subagent_requests_include_identity_headers); 3 external calls (default, unreachable!, vec!).
 
@@ -4043,11 +4075,11 @@ async fn wait_for_matching_request(
 ) -> Result<ResponsesRequest>
 ```
 
-**Purpose**: Polls a `ResponseMock` until one captured request satisfies a caller-provided predicate or the overall turn timeout expires. It turns asynchronous request arrival into a simple `Result<ResponsesRequest>`.
+**Purpose**: This helper waits for a mock API endpoint to receive a request that matches a condition chosen by the caller. It is used because the request may arrive asynchronously after Codex starts working.
 
-**Data flow**: Accepts a `ResponseMock`, label, and mutable predicate, repeatedly calls `mock.requests()`, searches for the first request matching the predicate, returns it if found, otherwise sleeps for `REQUEST_POLL_INTERVAL`, all wrapped in `tokio::time::timeout(TURN_TIMEOUT, ...)`; on timeout it returns an `anyhow!` error mentioning the label.
+**Data flow**: It receives a mock response recorder, a human-readable label for error messages, and a predicate function that says whether a request is the one wanted. It repeatedly looks through the recorded requests, sleeping briefly between checks, until one matches or the overall timeout expires. It returns the matching request, or an error saying which request it timed out waiting for.
 
-**Call relations**: The top-level test uses this helper twice, once for the parent request and once for the child request.
+**Call relations**: The main test calls this once for the parent request and once for the child request. It depends on the mock object’s recorded request list, and it gives the main test the concrete request data needed for header and body assertions.
 
 *Call graph*: calls 1 internal fn (requests); called by 1 (responses_api_parent_and_subagent_requests_include_identity_headers); 2 external calls (sleep, timeout).
 
@@ -4062,11 +4094,11 @@ async fn wait_for_event_result(
 ) -> Result<EventMsg>
 ```
 
-**Purpose**: Waits for an event satisfying a predicate while collecting short summaries of all seen events for timeout diagnostics. It improves failure messages in long-running asynchronous tests.
+**Purpose**: This helper waits for Codex to emit an event that matches a caller-provided condition. It also records short summaries of events it saw, so timeout errors are easier to understand.
 
-**Data flow**: Consumes a `TestCodex`, stage label, and predicate, initializes `seen_events`, repeatedly awaits `test.codex.next_event()`, pushes `event_summary(&event.msg)` into the log, returns the matching `EventMsg` when the predicate succeeds, and wraps the loop in `tokio::time::timeout(TURN_TIMEOUT, ...)`; on timeout it returns an error listing the summarized events.
+**Data flow**: It receives a test Codex session, a stage name such as `turn started`, and a predicate function. It repeatedly asks Codex for the next event, stores a shortened text summary of each event, and returns the first event that satisfies the predicate. If no matching event arrives before the timeout, it returns an error that includes the events seen so far.
 
-**Call relations**: Used by `submit_turn_with_timeout` for both the `TurnStarted` and matching `TurnComplete` waits.
+**Call relations**: `submit_turn_with_timeout` uses this helper to wait for the lifecycle events of a submitted turn. This function calls `event_summary` whenever it records an event for possible timeout diagnostics.
 
 *Call graph*: calls 1 internal fn (event_summary); called by 1 (submit_turn_with_timeout); 2 external calls (new, timeout).
 
@@ -4077,11 +4109,11 @@ async fn wait_for_event_result(
 fn event_summary(event: &EventMsg) -> String
 ```
 
-**Purpose**: Produces a truncated debug string for an event message so timeout errors remain readable. It is purely diagnostic.
+**Purpose**: This helper turns a Codex event into a short text snippet for error messages. It prevents timeout failures from dumping overly large event data.
 
-**Data flow**: Formats the `EventMsg` with `Debug`, truncates the resulting string to 240 characters, and returns it.
+**Data flow**: It receives an event, formats it as debug text, trims that text to 240 characters, and returns the shortened string. It does not change the event itself.
 
-**Call relations**: Only `wait_for_event_result` calls this helper while building timeout diagnostics.
+**Call relations**: `wait_for_event_result` calls this each time it sees an event while waiting. The summaries are only used if the wait times out, to help a developer understand what happened instead.
 
 *Call graph*: called by 1 (wait_for_event_result); 1 external calls (format!).
 
@@ -4092,11 +4124,11 @@ fn event_summary(event: &EventMsg) -> String
 fn request_body_contains(req: &wiremock::Request, text: &str) -> bool
 ```
 
-**Purpose**: Checks whether a raw wiremock request body contains a given text snippet. It is used in request-match predicates for parent and child requests.
+**Purpose**: This small helper checks whether an incoming mock HTTP request body contains a given piece of text. It is used to recognize which fake server response should apply to which request.
 
-**Data flow**: Attempts to decode `req.body` as UTF-8 and returns `true` only if decoding succeeds and the resulting string contains the target text.
+**Data flow**: It receives a raw mock HTTP request and a search string. It tries to read the request body as UTF-8 text, which is the common text encoding used for JSON, then checks whether that text includes the search string. It returns `true` if the body is readable and contains the text, otherwise `false`.
 
-**Call relations**: The top-level test uses this helper inside the mounted request predicates to distinguish parent, child, and follow-up requests.
+**Call relations**: The mock-server matching closures use this helper when deciding whether a captured request is the parent prompt, the child prompt, or a follow-up parent request. It is a low-level check supporting the main test’s request routing.
 
 *Call graph*: 1 external calls (from_utf8).
 
@@ -4107,11 +4139,11 @@ fn request_body_contains(req: &wiremock::Request, text: &str) -> bool
 fn request_header(req: &'a wiremock::Request, name: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Reads a named header from a raw wiremock request as a borrowed string slice if present and valid UTF-8.
+**Purpose**: This helper reads a named HTTP header from a mock request as plain text. It keeps the request-matching code simple and consistent.
 
-**Data flow**: Looks up `req.headers[name]`, converts the header value to `&str` with `to_str().ok()`, and returns `Option<&str>`.
+**Data flow**: It receives a mock HTTP request and a header name. It looks up that header and tries to convert its value to a text string. It returns the header text if present and readable, or no value if the header is missing or cannot be read as text.
 
-**Call relations**: Used in the request-match predicates to check for presence or absence of `x-openai-subagent`.
+**Call relations**: The mock-server matching closures use this helper to distinguish parent requests from child subagent requests before returning the scripted fake responses. The main assertions later use a similar header-reading method on the recorded `ResponsesRequest` objects.
 
 
 ##### `split_window_id`  (lines 256–261)
@@ -4120,22 +4152,26 @@ fn request_header(req: &'a wiremock::Request, name: &str) -> Option<&'a str>
 fn split_window_id(window_id: &str) -> Result<(&str, u64)>
 ```
 
-**Purpose**: Parses the `x-codex-window-id` header into its thread-id and generation components. It enforces the expected `<thread_id>:<generation>` format.
+**Purpose**: This helper separates a `x-codex-window-id` header into its thread ID and generation number. The test needs that split to compare parent and child threads clearly.
 
-**Data flow**: Splits the input string at the last `:`, returns an error if the separator is missing, parses the suffix as `u64`, and returns `(&str, u64)`.
+**Data flow**: It receives a window ID string that is expected to look like `thread-id:generation`. It splits at the last colon, parses the part after the colon as a number, and returns the thread ID text plus the generation number. If the string is not in the expected shape or the generation is not a number, it returns an error.
 
-**Call relations**: The top-level test uses this helper on both parent and child window-id headers before asserting lineage and generation invariants.
+**Call relations**: The main test calls this after it has captured the parent and child requests. The returned pieces let the test prove that both requests are generation zero, while also proving that the child has a different thread ID and correctly points back to the parent thread.
 
 *Call graph*: called by 1 (responses_api_parent_and_subagent_requests_include_identity_headers).
 
 
 ### `core/tests/suite/quota_exceeded.rs`
 
-`test` · `request failure handling regression coverage`
+`test` · `test run`
 
-This module contains a single end-to-end regression test for quota exhaustion. It mounts a mock SSE stream that first announces `response.created` and then sends a synthetic `response.failed` payload whose nested error has code `insufficient_quota` and the provider-style billing message. The test then builds a normal `TestCodex`, submits a simple text `Op::UserInput`, and listens to the event stream until `EventMsg::TurnComplete` arrives.
+This is a focused automated test for a frustrating real-world case: the remote service says the account has run out of quota. Without this test, Codex might accidentally show the raw API wording, emit the same error more than once, or fail to finish the turn cleanly.
 
-The key assertion is not just that an error occurs, but that exactly one `EventMsg::Error` is emitted and that its message is normalized to the user-facing string `Quota exceeded. Check your plan and billing details.`. The loop increments a counter for each error event, ignores unrelated events, and breaks only on turn completion. The final assertion on the counter guards against duplicate error propagation from multiple layers of the runtime. As a result, this file documents the expected translation from provider-specific quota failures into a single Codex error event during request handling.
+The test builds a fake server instead of calling the real API. That server sends a short stream of server-sent events, which are messages delivered over one open HTTP response, like updates arriving on a news ticker. First it says a response was created. Then it sends a failure with the API error code `insufficient_quota` and the billing-related message.
+
+The test then starts a Codex instance connected to that fake server and submits a simple user prompt: “quota?”. It listens to the events Codex produces. Whenever Codex emits an error event, the test counts it and checks that the message has been rewritten into the friendlier text: “Quota exceeded. Check your plan and billing details.” The loop stops when Codex says the turn is complete.
+
+The important behavior is the final check: exactly one error event must have appeared. This protects the user experience by making the quota problem clear, brief, and non-repetitive.
 
 #### Function details
 
@@ -4145,22 +4181,24 @@ The key assertion is not just that an error occurs, but that exactly one `EventM
 async fn quota_exceeded_emits_single_error_event() -> Result<()>
 ```
 
-**Purpose**: Simulates a quota-exceeded Responses API failure and verifies that Codex emits exactly one normalized error event before completing the turn. It protects against duplicate or unnormalized error reporting.
+**Purpose**: This test proves that when the API reports `insufficient_quota`, Codex turns it into one user-facing error event with a clear billing message. It also checks that the turn still reaches completion afterward.
 
-**Data flow**: Starts a mock server, mounts one SSE stream containing `ev_response_created("resp-1")` and a raw `response.failed` JSON event with `code = insufficient_quota`, builds `TestCodex`, submits a text user input, then repeatedly waits for any event. For each `EventMsg::Error`, it increments a counter and asserts the message equals the normalized quota text; on `EventMsg::TurnComplete` it exits the loop and finally asserts the counter is `1`.
+**Data flow**: The test starts by skipping itself if network-style testing is unavailable. It creates a mock server, programs that server to send a response-created event followed by a quota-failure event, then builds a Codex test instance pointed at that server. It sends a user input message into Codex, reads the events Codex emits, counts matching error events, checks the error text, and finally asserts that the count is exactly one.
 
-**Call relations**: This is the file's sole test entrypoint. It drives the normal submit/wait flow but inspects the emitted event stream rather than the outbound request body.
+**Call relations**: This function is the whole test scenario. It calls the test-support helpers to start the fake server, build the fake event stream, mount that stream as the server response, create a Codex test instance, and wait for outgoing Codex events. The assertions are the final judge: they confirm that the mocked API failure is translated into exactly one clean Codex error before the turn completes.
 
 *Call graph*: calls 4 internal fn (mount_sse_once, sse, start_mock_server, test_codex); 5 external calls (default, assert_eq!, wait_for_event, skip_if_no_network!, vec!).
 
 
 ### `core/tests/suite/safety_check_downgrade.rs`
 
-`test` · `request handling`
+`test` · `test suite`
 
-This file focuses on the safety-check path for high-risk cyber activity. The helper `disabled_text_turn` constructs a `UserInput` operation that disables approvals, selects local environments, derives sandbox and permission settings from `PermissionProfile::Disabled`, and explicitly requests `REQUESTED_MODEL` through `ThreadSettingsOverrides.collaboration_mode`. That ensures each test submits a turn under the same requested-model and permission conditions.
+This is a test file. It checks a safety-sensitive path where Codex asks for one model, but the service may answer with a different model or extra safety metadata. In plain terms, it is making sure Codex notices when the server says, “I used a safer or different model because this looked risky,” and then reports that clearly to the rest of the app.
 
-The tests then vary the server response. A mismatched `OpenAI-Model` response header should emit `EventMsg::ModelReroute` from `gpt-5.3-codex` to `gpt-5.2` with reason `HighRiskCyberActivity`, followed by a warning mentioning both models. A 400 JSON error with code `cyber_policy` should surface as `EventMsg::Error` with `CodexErrorInfo::CyberPolicy` and no retry. If the HTTP header matches the requested model but the SSE `response.created` payload embeds a different `OpenAI-Model`, Codex should still reroute and warn. Follow-up tool-call turns must emit at most one warning or one model-verification event per turn even if multiple responses in the turn repeat the metadata. Finally, model-verification metadata should produce a structured `EventMsg::ModelVerification` carrying `ModelVerification::TrustedAccessForCyber` without any reroute, warning event, or warning-like raw response item.
+The tests use a mock server, which is a fake OpenAI-style server that returns carefully chosen responses. This lets the test control every detail: response headers, streamed response events, error bodies, tool calls, and model verification metadata. Each test sends a user turn with permissions disabled and approval set to never, so the focus stays on the model-safety behavior rather than sandbox or approval behavior.
+
+The file checks several important cases. If the server returns a different model name, Codex should emit a model reroute event and a user-facing warning. If the server returns a cyber policy error, Codex should surface a typed cyber-policy error and not retry. If the only difference is letter casing, Codex should not warn. If the server sends structured model verification metadata, Codex should emit a structured verification event instead of turning that into a warning. Several tests also confirm these notices happen only once per user turn, even when the turn includes follow-up model calls.
 
 #### Function details
 
@@ -4170,11 +4208,11 @@ The tests then vary the server response. A mismatched `OpenAI-Model` response he
 fn disabled_text_turn(test: &TestCodex, text: &str) -> Op
 ```
 
-**Purpose**: Builds a user-input operation that requests the target model under disabled permissions and no approval prompts, matching the safety-check scenarios under test.
+**Purpose**: This helper builds a standard user message for these tests. It deliberately turns off sandbox permissions and automatic approval so each test can focus on model safety behavior, not tool permission behavior.
 
-**Data flow**: It takes a `&TestCodex` and text, derives `(sandbox_policy, permission_profile)` from `turn_permission_fields(PermissionProfile::Disabled, test.cwd_path())`, and returns `Op::UserInput` with one `UserInput::Text`, default additional context, local environment selections rooted at `test.config.cwd`, `approval_policy = Never`, the derived sandbox and permission profile, and a collaboration-mode override whose model is `REQUESTED_MODEL` and whose reasoning effort comes from `test.config.model_reasoning_effort`.
+**Data flow**: It takes a test Codex instance and a text prompt. It reads the test working directory and config, builds the matching permission and environment settings, wraps the text as user input, and returns an operation that can be submitted to Codex.
 
-**Call relations**: Every test in this file uses this helper to submit its turn. That keeps the requested-model and permission context identical so differences in observed events come only from the mocked server responses.
+**Call relations**: All the test cases call this helper before submitting input to Codex. It relies on support helpers to choose local environment settings and permission fields, so the individual tests do not have to repeat the same setup each time.
 
 *Call graph*: calls 3 internal fn (cwd_path, local_selections, turn_permission_fields); called by 7 (cyber_policy_response_emits_typed_error_without_retry, model_verification_emits_structured_event_without_reroute_or_warning, model_verification_only_emits_once_per_turn, openai_model_header_casing_only_mismatch_does_not_warn, openai_model_header_mismatch_emits_warning_event, openai_model_header_mismatch_only_emits_one_warning_per_turn, response_model_field_mismatch_emits_warning_when_header_matches_requested); 2 external calls (default, vec!).
 
@@ -4185,11 +4223,11 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op
 async fn openai_model_header_mismatch_emits_warning_event() -> Result<()>
 ```
 
-**Purpose**: Verifies that an `OpenAI-Model` response-header mismatch triggers both a model-reroute event and a warning event.
+**Purpose**: This test checks that Codex warns when the server response header says a different model was used than the one the user requested. This matters because a model change due to safety routing should be visible, not silent.
 
-**Data flow**: It mounts a completed SSE response with HTTP header `OpenAI-Model: gpt-5.2`, builds a fixture requesting `gpt-5.3-codex`, submits the disabled text turn, waits for `EventMsg::ModelReroute`, asserts `from_model`, `to_model`, and `reason`, then waits for `EventMsg::Warning` and asserts the warning message mentions both requested and server models. Finally it waits for `TurnComplete`.
+**Data flow**: The test starts a mock server, configures it to return a completed response with an OpenAI-Model header naming the server model, then submits a user turn requesting another model. It waits for Codex events and confirms that a model reroute event names both models and that a warning message mentions both of them before the turn completes.
 
-**Call relations**: This is the baseline safety-downgrade test. It drives the mocked mismatch through the normal turn flow and validates the event sequence emitted by Codex.
+**Call relations**: It uses the shared user-turn helper to send the prompt. It depends on the mock response helpers to simulate the server-side model change, then uses event waiting to observe Codex’s public behavior.
 
 *Call graph*: calls 6 internal fn (mount_response_once, sse_completed, sse_response, start_mock_server, test_codex, disabled_text_turn); 5 external calls (assert!, assert_eq!, wait_for_event, panic!, skip_if_no_network!).
 
@@ -4200,11 +4238,11 @@ async fn openai_model_header_mismatch_emits_warning_event() -> Result<()>
 async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()>
 ```
 
-**Purpose**: Checks that a 400 `cyber_policy` API error is surfaced as a typed Codex error rather than retried or converted into a reroute warning.
+**Purpose**: This test checks that a server-side cyber policy rejection becomes a specific cyber-policy error inside Codex. It also verifies Codex does not retry the same blocked request.
 
-**Data flow**: It mounts a single HTTP 400 response whose JSON body contains the cyber-policy message and code, builds a fixture requesting `REQUESTED_MODEL`, submits the disabled text turn, waits for `EventMsg::Error`, and asserts the error message equals `CYBER_POLICY_MESSAGE` and `codex_error_info` is `Some(CodexErrorInfo::CyberPolicy)`. It then confirms the mock saw exactly one request.
+**Data flow**: The test creates a mock HTTP 400 response whose error code is cyber_policy and whose message is the cyber policy warning text. After submitting a user turn, it waits for an error event, checks that the message is preserved, checks that the structured error type is CyberPolicy, and confirms the mock server saw only one request.
 
-**Call relations**: This test covers the hard-error branch rather than the warning/reroute branch. It uses the same turn helper but validates direct error mapping from API response to emitted event.
+**Call relations**: It uses the same test Codex setup and input helper as the other tests. Instead of a streamed successful response, it mounts a one-time error response and checks that Codex stops there rather than handing off to retry logic.
 
 *Call graph*: calls 4 internal fn (mount_response_once, start_mock_server, test_codex, disabled_text_turn); 6 external calls (new, assert_eq!, wait_for_event, panic!, json!, skip_if_no_network!).
 
@@ -4215,11 +4253,11 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()>
 async fn response_model_field_mismatch_emits_warning_when_header_matches_requested() -> Result<()>
 ```
 
-**Purpose**: Verifies that Codex still detects a safety downgrade when the HTTP header matches the requested model but the SSE `response.created` payload reports a different model.
+**Purpose**: This test checks a subtler downgrade signal: the outer HTTP header matches the requested model, but the streamed response metadata says a different model was used. Codex should still notice and warn.
 
-**Data flow**: It mounts an SSE response whose first event is a handcrafted `response.created` object containing `headers.OpenAI-Model = SERVER_MODEL`, while the outer HTTP response header is `OpenAI-Model: REQUESTED_MODEL`. After building the fixture and submitting the disabled text turn, it waits for `ModelReroute`, asserts the reroute fields, then waits for a warning whose message contains the high-risk-cyber phrase and asserts that warning mentions both models. It finally waits for `TurnComplete`.
+**Data flow**: The test prepares a streamed response where the HTTP OpenAI-Model header says the requested model, but the response.created event contains a header naming the server model. After submitting the turn, it waits for a reroute event, verifies the old and new model names and safety reason, then waits for a warning that explains the high-risk cyber activity downgrade.
 
-**Call relations**: This test complements the plain header-mismatch case by proving Codex also inspects model metadata embedded in the streamed response body.
+**Call relations**: It combines mock streaming helpers with the common input helper. It exercises the same event path as the plain header mismatch test, but proves Codex also inspects model information embedded inside the streamed response.
 
 *Call graph*: calls 6 internal fn (mount_response_once, sse, sse_response, start_mock_server, test_codex, disabled_text_turn); 6 external calls (assert!, assert_eq!, wait_for_event, panic!, skip_if_no_network!, vec!).
 
@@ -4230,11 +4268,11 @@ async fn response_model_field_mismatch_emits_warning_when_header_matches_request
 async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Result<()>
 ```
 
-**Purpose**: Checks that repeated model mismatches across multiple response phases in a single turn produce only one warning event.
+**Purpose**: This test makes sure Codex does not spam duplicate downgrade warnings during one user turn. Even if the turn causes more than one model response, the user should only see one warning for the same safety downgrade.
 
-**Data flow**: It mounts a response sequence: the first response requests a shell tool call and carries the mismatched `OpenAI-Model` header, and the second response completes the turn with the same mismatched header. After submitting the disabled text turn, it loops over all events until `TurnComplete`, counting warnings whose message mentions the requested model, and asserts the count is exactly one.
+**Data flow**: The test configures two server responses. The first response requests a shell command, causing Codex to make a follow-up model call; both responses carry the mismatched server model header. The test watches all events until the turn completes, counts warnings that mention the requested model, and expects exactly one.
 
-**Call relations**: This test exercises a multi-response turn to validate per-turn deduplication. It ensures warning emission is not repeated on the follow-up response after a tool call.
+**Call relations**: It uses a sequence of mock responses to mimic a multi-step turn. The first response hands off to tool-call behavior, which leads to the second response; the test then confirms the warning logic is remembered across those internal steps.
 
 *Call graph*: calls 6 internal fn (mount_response_sequence, sse, sse_response, start_mock_server, test_codex, disabled_text_turn); 5 external calls (assert_eq!, wait_for_event, json!, skip_if_no_network!, vec!).
 
@@ -4245,11 +4283,11 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
 async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()>
 ```
 
-**Purpose**: Verifies that case-only differences in the `OpenAI-Model` header do not count as a safety downgrade.
+**Purpose**: This test checks that Codex treats model names as the same when they differ only by uppercase or lowercase letters. That prevents false safety warnings caused by harmless formatting differences.
 
-**Data flow**: It mounts a completed SSE response whose `OpenAI-Model` header is the uppercase form of `REQUESTED_MODEL`, builds the fixture, submits the disabled text turn, then drains events until `TurnComplete` while counting `ModelReroute` events and high-risk-cyber warnings. It asserts both counts remain zero.
+**Data flow**: The test sends a response whose OpenAI-Model header is the requested model converted to uppercase. It submits a user turn, then counts model reroute and high-risk warning events until the turn completes. Both counts must stay at zero.
 
-**Call relations**: This is a normalization edge-case test for the mismatch detector. It proves model comparison is case-insensitive enough to avoid false-positive reroutes and warnings.
+**Call relations**: It uses the same mock server and input helper as the mismatch tests, but changes only the casing of the model name. This protects the reroute detection code from being too strict about text formatting.
 
 *Call graph*: calls 6 internal fn (mount_response_once, sse_completed, sse_response, start_mock_server, test_codex, disabled_text_turn); 3 external calls (assert_eq!, wait_for_event, skip_if_no_network!).
 
@@ -4260,11 +4298,11 @@ async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()>
 async fn model_verification_emits_structured_event_without_reroute_or_warning() -> Result<()>
 ```
 
-**Purpose**: Checks that model-verification metadata produces a structured verification event and suppresses reroute or warning side effects.
+**Purpose**: This test checks that explicit model verification metadata is reported as a structured verification event, not as a downgrade warning. In other words, verified trusted access is treated as a positive signal, not a problem.
 
-**Data flow**: It mounts an SSE response containing `ev_model_verification_metadata("resp-1", [TRUSTED_ACCESS_FOR_CYBER_VERIFICATION])`, builds the fixture, submits the disabled text turn, then drains events until `TurnComplete`. During the drain it counts `ModelVerification`, `Warning`, `ModelReroute`, and warning-like `RawResponseItem` messages, asserting the verification payload equals `vec![ModelVerification::TrustedAccessForCyber]` and that only one verification event occurs while all warning/reroute counts stay zero.
+**Data flow**: The mock server streams a normal response plus model verification metadata saying trusted access for cyber is present. The test submits a user turn, watches events until completion, and confirms exactly one ModelVerification event with the expected value. It also confirms there are no reroute events, no warning events, and no hidden warning text inserted into raw response items.
 
-**Call relations**: This test covers the structured-verification branch that should replace, not accompany, warning-based downgrade signaling.
+**Call relations**: It uses mock streamed metadata to exercise Codex’s verification-event path. It checks that this path stays separate from the downgrade-warning path tested earlier in the file.
 
 *Call graph*: calls 6 internal fn (mount_response_once, sse, sse_response, start_mock_server, test_codex, disabled_text_turn); 5 external calls (assert_eq!, wait_for_event, matches!, skip_if_no_network!, vec!).
 
@@ -4275,10 +4313,10 @@ async fn model_verification_emits_structured_event_without_reroute_or_warning() 
 async fn model_verification_only_emits_once_per_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies that repeated model-verification metadata across multiple responses in one turn is deduplicated to a single `ModelVerification` event.
+**Purpose**: This test makes sure model verification is announced only once during a single user turn. If a tool call causes Codex to ask the model again, repeated verification metadata should not create repeated events.
 
-**Data flow**: It mounts a two-response sequence where both responses include the same verification metadata and the first also triggers a shell tool call. After submitting the disabled text turn, it drains events until `TurnComplete`, counting `ModelVerification` events and panicking if any high-risk-cyber warning appears. It asserts the verification count is exactly one.
+**Data flow**: The test prepares two streamed responses, both containing the same trusted-access verification metadata. The first response also asks for a shell command, which causes a follow-up model response. The test counts ModelVerification events until the turn completes and expects one; it also fails immediately if a high-risk cyber warning appears.
 
-**Call relations**: This is the deduplication counterpart to the single-response verification test. It proves verification metadata is emitted once per turn even when repeated across tool-call follow-up responses.
+**Call relations**: It mirrors the duplicate-warning test, but for structured verification metadata. The response sequence drives a multi-step turn, and the event loop confirms Codex remembers that it already reported verification for that turn.
 
 *Call graph*: calls 6 internal fn (mount_response_sequence, sse, sse_response, start_mock_server, test_codex, disabled_text_turn); 6 external calls (assert_eq!, wait_for_event, panic!, json!, skip_if_no_network!, vec!).

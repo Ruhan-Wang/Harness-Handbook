@@ -1,8 +1,6 @@
 # Hook execution and stop-continue mediation  `stage-14.1.3`
 
-This stage is cross-cutting runtime infrastructure that sits between the session/turn execution flow and external hook programs. It is responsible for discovering configured hooks, deciding which ones apply to each lifecycle or tool event, executing them, and translating their outputs into concrete outcomes such as stop, block, continue, permission allow/deny, input rewrites, or extra model context.
-
-At the top, hooks/src/registry.rs exposes the public hook API and builds the legacy and modern engines from configuration. core/src/hook_runtime.rs is the adapter used by Session and TurnContext to invoke hooks around turns, tool calls, permission checks, and compaction while emitting metrics and developer-facing context. Within the modern engine, engine/mod.rs ties together discovery, execution, warnings, and output spilling; discovery.rs normalizes hook declarations from config and plugins; dispatcher.rs selects matching handlers and runs them concurrently; command_runner.rs launches child processes; output_parser.rs validates and decodes structured stdout; and output_spill.rs preserves oversized output safely. Event modules then supply per-event payload building and result aggregation: session start, prompt submission, stop/subagent stop, compact, pre/post tool use, and permission requests. legacy_notify.rs preserves the older fire-and-forget argv notification path.
+This stage is the system’s checkpoint network. It runs user-configured hooks, which are small external commands, at key moments in the conversation: session start, prompt submit, tool use, permission checks, compaction, and stopping. The registry and engine module are the front desk. They build the hook system, list hooks, preview them, and route events to the right runner, while still supporting the older notify path. Discovery finds hook definitions in config, policy, and plugins, then checks whether they are trusted. The dispatcher chooses which hooks match an event. The command runner starts those hooks as real processes, sends them JSON input, and captures results. The output parser turns their printed text into decisions the system understands, and output spill saves oversized output to a temp file with a short preview. The runtime connects all this back to the main conversation, progress reporting, telemetry, and added context. Event handlers apply the decisions: start and prompt hooks may add context or stop work; pre- and post-tool hooks may block, rewrite, warn, or continue; permission hooks approve or deny; compaction hooks guard history shrinking; stop hooks decide whether to end, block, or continue.
 
 ## Files in this stage
 
@@ -11,13 +9,13 @@ These files expose the public hook APIs and connect session-level runtime flows 
 
 ### `hooks/src/registry.rs`
 
-`orchestration` · `startup construction and event dispatch entrypoints`
+`orchestration` · `startup and hook event handling`
 
-This file is the main façade over the hooks subsystem. `HooksConfig` gathers all startup inputs: optional legacy notify argv, feature flags, trust bypass, config-layer stack, plugin hook sources and warnings, and shell program/args for command execution. `HookListOutcome` is a simple container for discovered hook entries plus warnings. `Hooks` itself stores two execution mechanisms: `after_agent`, a list of legacy `Hook` closures, and `engine`, a `ClaudeHooksEngine` that handles the newer structured hook events.
+Hooks are small external actions that Codex can run at important moments, such as when a session starts, before a tool runs, after a tool runs, or when the user submits a prompt. This file gives the rest of the program one simple object, `Hooks`, instead of making every caller know how hooks are loaded, trusted, previewed, and executed.
 
-`Hooks::new` wires these pieces together. If `legacy_notify_argv` is present and its first element is non-empty, it creates a single legacy notify hook via `crate::notify_hook`; otherwise the legacy list is empty. It then constructs `ClaudeHooksEngine::new(...)`, forwarding feature flags, trust settings, optional config stack, plugin sources/warnings, and a `CommandShell` built from the configured shell program and args. `dispatch` is only for legacy `HookEvent` values: it selects hooks with `hooks_for_event`, executes them sequentially, records each `HookResponse`, and stops early if a hook result says the surrounding operation should abort.
+Think of it like a reception desk. Other parts of the app say, “A session is starting” or “A tool is about to run,” and this file sends that request to the right hook machinery. Most modern hook work is delegated to `ClaudeHooksEngine`, which knows how to discover and run configured hook handlers. The file also keeps a small older path called `after_agent`, built from `legacy_notify_argv`, for legacy notification-style hooks.
 
-All other methods are thin pass-throughs to the engine for previewing or running specific event types such as session start, tool use, compaction, user prompt submit, and stop. `list_hooks` performs discovery without constructing a full `Hooks` instance, returning an empty result when the feature is disabled. `command_from_argv` is a small but important helper that rejects empty argv or empty program names before constructing a `tokio::process::Command` and attaching the remaining args.
+The `HooksConfig` struct gathers all the setup choices: whether hooks are enabled, whether trust checks are bypassed, configuration layers, plugin-provided hook sources, startup warnings, and shell settings. `list_hooks` uses similar configuration to discover hook entries for display without executing them. `command_from_argv` is a small helper that turns a command-line-style list of strings into an executable process command.
 
 #### Function details
 
@@ -27,11 +25,11 @@ All other methods are thin pass-throughs to the engine for previewing or running
 fn default() -> Self
 ```
 
-**Purpose**: Builds a `Hooks` instance using the default configuration.
+**Purpose**: Creates a `Hooks` registry using all default settings. This is useful when code needs a hook registry but has no special configuration to provide.
 
-**Data flow**: Calls `HooksConfig::default()` and passes it to `Self::new`, returning the constructed registry.
+**Data flow**: It starts with no input from the caller, creates a default `HooksConfig`, and passes that into `Hooks::new`. The result is a ready-to-use `Hooks` object with default behavior.
 
-**Call relations**: Provides the standard default constructor and delegates all real setup work to `Hooks::new`.
+**Call relations**: This is the convenience path into `Hooks::new`. Instead of duplicating setup logic, it relies on the normal constructor to build the registry.
 
 *Call graph*: 2 external calls (new, default).
 
@@ -42,11 +40,11 @@ fn default() -> Self
 fn new(config: HooksConfig) -> Self
 ```
 
-**Purpose**: Constructs the hooks registry from configuration, wiring legacy notify hooks and the structured Claude hooks engine.
+**Purpose**: Builds the main hook registry from configuration. It turns legacy notify settings into old-style hooks and builds the newer hook engine for all modern hook events.
 
-**Data flow**: Consumes `HooksConfig`. It filters `legacy_notify_argv` to ensure the argv vector exists, is non-empty, and has a non-empty program element; if valid, it maps it through `crate::notify_hook` and collects the single resulting hook into `after_agent`. It then constructs `ClaudeHooksEngine::new(...)` with feature flags, trust bypass, optional config stack reference, plugin sources/warnings, and a `CommandShell` built from `shell_program.unwrap_or_default()` and `shell_args`. Returns `Hooks { after_agent, engine }`.
+**Data flow**: It receives a `HooksConfig`. If a legacy notify command is present and usable, it converts it into an `after_agent` hook. It also passes feature flags, trust settings, config layers, plugin hook sources, warnings, and shell settings into `ClaudeHooksEngine::new`. It returns a `Hooks` object containing both the legacy hooks and the engine.
 
-**Call relations**: Called by `Hooks::default` and by external setup code that needs a configured registry. It is the central wiring point for both legacy and modern hook execution paths.
+**Call relations**: This is the main setup function. It is called when building hooks from configuration, when creating sessions and test contexts, when previewing session-start hooks, and in permission-hook tests. After construction, later methods on `Hooks` use the stored engine or legacy hook list.
 
 *Call graph*: calls 1 internal fn (new); called by 6 (install_mcp_permission_request_hook, build_hooks_for_config, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, preview_session_start_hooks, execve_permission_request_hook_short_circuits_prompt).
 
@@ -57,11 +55,11 @@ fn new(config: HooksConfig) -> Self
 fn startup_warnings(&self) -> &[String]
 ```
 
-**Purpose**: Exposes any warnings collected by the structured hook engine during initialization.
+**Purpose**: Returns warnings collected while setting up hooks. A caller can show these to the user so hook configuration problems are visible early.
 
-**Data flow**: Borrows `self`, calls `self.engine.warnings()`, and returns the borrowed slice of warning strings.
+**Data flow**: It reads the warning list stored inside the hook engine and returns it as a borrowed slice. It does not change anything.
 
-**Call relations**: Used by callers after construction to surface discovery or loading issues without rerunning initialization.
+**Call relations**: After `Hooks::new` builds the engine, this method gives the rest of the app a safe way to read the engine’s startup warnings.
 
 *Call graph*: calls 1 internal fn (warnings).
 
@@ -72,11 +70,11 @@ fn startup_warnings(&self) -> &[String]
 fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook]
 ```
 
-**Purpose**: Selects the legacy hook list associated with a given legacy `HookEvent`.
+**Purpose**: Finds the legacy hooks that apply to a particular legacy hook event. At present, it maps the `AfterAgent` event to the stored `after_agent` hook list.
 
-**Data flow**: Matches on a borrowed `HookEvent` and currently returns `&self.after_agent` for `HookEvent::AfterAgent { .. }`.
+**Data flow**: It receives a `HookEvent`, checks which kind of event it is, and returns the matching slice of legacy `Hook` objects. It does not run the hooks.
 
-**Call relations**: Called only by `dispatch` to determine which legacy hooks should run for a payload.
+**Call relations**: This is an internal helper used by `Hooks::dispatch`. `dispatch` asks it which legacy hooks are relevant before executing them.
 
 *Call graph*: called by 1 (dispatch).
 
@@ -87,11 +85,11 @@ fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook]
 async fn dispatch(&self, hook_payload: HookPayload) -> Vec<HookResponse>
 ```
 
-**Purpose**: Runs legacy hooks sequentially for a `HookPayload`, stopping early if one requests abort semantics.
+**Purpose**: Runs the legacy hooks for a given hook payload, one after another. It stops early if a hook says the operation should be aborted.
 
-**Data flow**: Consumes an owned `HookPayload`, looks up the relevant hook slice with `hooks_for_event(&hook_payload.hook_event)`, preallocates an outcomes vector, then iterates hooks in order. For each hook it awaits `hook.execute(&hook_payload)`, checks `outcome.result.should_abort_operation()`, pushes the `HookResponse`, and breaks the loop if abort was requested. Returns the collected responses.
+**Data flow**: It receives a `HookPayload`, uses the payload’s event to find matching legacy hooks, then executes each hook asynchronously. It collects each `HookResponse` into a vector. If a response says to abort, it stops running more hooks and returns the responses collected so far.
 
-**Call relations**: This is the runtime entrypoint for the legacy `Hook` mechanism; it relies on `hooks_for_event` for routing and on each hook's `execute` implementation for actual work.
+**Call relations**: This is the runner for the older hook path. It depends on `Hooks::hooks_for_event` to choose hooks, then calls each hook’s execution method and returns the outcomes to the caller.
 
 *Call graph*: calls 1 internal fn (hooks_for_event); 1 external calls (with_capacity).
 
@@ -105,11 +103,11 @@ fn preview_session_start(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates session-start previewing to the structured hook engine.
+**Purpose**: Shows what session-start hooks would run, without actually running them. This helps callers explain or display hook activity before it happens.
 
-**Data flow**: Borrows `self` and a `SessionStartRequest`, forwards the request to `self.engine.preview_session_start(request)`, and returns the resulting summaries.
+**Data flow**: It receives a session-start request by reference, passes it to the engine’s preview method, and returns a list of hook run summaries. No hook side effects occur.
 
-**Call relations**: Thin façade method exposing engine functionality through the public registry API.
+**Call relations**: This is a thin public doorway into the engine. Callers use `Hooks`, and `Hooks` delegates the preview work to `ClaudeHooksEngine`.
 
 *Call graph*: calls 1 internal fn (preview_session_start).
 
@@ -123,11 +121,11 @@ fn preview_pre_tool_use(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates pre-tool-use previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run before a tool is used, without executing them. This is useful for transparency and planning.
 
-**Data flow**: Borrows `self` and a `PreToolUseRequest`, forwards it to `self.engine.preview_pre_tool_use`, and returns the summaries.
+**Data flow**: It receives a pre-tool-use request by reference, forwards it to the engine, and returns summary records describing the matching hooks.
 
-**Call relations**: Part of the registry's pass-through preview API.
+**Call relations**: This method keeps callers from talking directly to the engine. It simply hands the preview request to the engine’s pre-tool-use preview function.
 
 *Call graph*: calls 1 internal fn (preview_pre_tool_use).
 
@@ -141,11 +139,11 @@ fn preview_permission_request(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates permission-request previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run for a permission request, without running them. Permission requests are moments where Codex asks whether an action should be allowed.
 
-**Data flow**: Borrows `self` and a `PermissionRequestRequest`, forwards it to `self.engine.preview_permission_request`, and returns the summaries.
+**Data flow**: It receives a permission request by reference, sends it to the engine’s preview function, and returns hook run summaries.
 
-**Call relations**: Public wrapper around the engine's permission-request preview path.
+**Call relations**: This is part of the public `Hooks` facade. It delegates the real matching and summary-building work to `ClaudeHooksEngine`.
 
 *Call graph*: calls 1 internal fn (preview_permission_request).
 
@@ -159,11 +157,11 @@ fn preview_post_tool_use(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates post-tool-use previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run after a tool has been used, without executing them. This lets the system report planned post-tool hook behavior safely.
 
-**Data flow**: Borrows `self` and a `PostToolUseRequest`, forwards it to `self.engine.preview_post_tool_use`, and returns the summaries.
+**Data flow**: It receives a post-tool-use request by reference, forwards it to the engine, and returns summaries of the hooks that would match.
 
-**Call relations**: Another thin preview wrapper in the registry API.
+**Call relations**: The method is a pass-through from the registry API to the engine’s post-tool-use preview logic.
 
 *Call graph*: calls 1 internal fn (preview_post_tool_use).
 
@@ -178,11 +176,11 @@ async fn run_session_start(
     ) -> SessionStartOutcome
 ```
 
-**Purpose**: Delegates execution of session-start hooks to the structured hook engine.
+**Purpose**: Runs hooks that should fire when a session starts. These hooks can perform setup or return information that affects the session-start flow.
 
-**Data flow**: Consumes an owned `SessionStartRequest` plus optional `turn_id`, awaits `self.engine.run_session_start(request, turn_id)`, and returns the resulting `SessionStartOutcome`.
+**Data flow**: It receives a `SessionStartRequest` and an optional turn identifier, passes both into the engine asynchronously, waits for completion, and returns a `SessionStartOutcome`.
 
-**Call relations**: Public runtime entrypoint for session-start hook execution.
+**Call relations**: Callers use this method when the session-start event actually happens. The registry delegates execution to the engine, which performs the hook work and produces the outcome.
 
 *Call graph*: calls 1 internal fn (run_session_start).
 
@@ -193,11 +191,11 @@ async fn run_session_start(
 async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome
 ```
 
-**Purpose**: Delegates execution of pre-tool-use hooks to the structured hook engine.
+**Purpose**: Runs hooks before a tool is used. These hooks can inspect or influence whether and how the tool action should proceed.
 
-**Data flow**: Consumes a `PreToolUseRequest`, awaits `self.engine.run_pre_tool_use(request)`, and returns `PreToolUseOutcome`.
+**Data flow**: It receives a `PreToolUseRequest`, gives it to the engine asynchronously, and returns the resulting `PreToolUseOutcome`.
 
-**Call relations**: Pass-through runtime wrapper.
+**Call relations**: This is the public execution path for pre-tool hooks. It hands the request to the engine, which decides which configured hooks apply and runs them.
 
 *Call graph*: calls 1 internal fn (run_pre_tool_use).
 
@@ -211,11 +209,11 @@ async fn run_permission_request(
     ) -> PermissionRequestOutcome
 ```
 
-**Purpose**: Delegates execution of permission-request hooks to the structured hook engine.
+**Purpose**: Runs hooks for a permission request. These hooks can help decide or shape the response when Codex needs approval for an action.
 
-**Data flow**: Consumes a `PermissionRequestRequest`, awaits `self.engine.run_permission_request(request)`, and returns `PermissionRequestOutcome`.
+**Data flow**: It receives a `PermissionRequestRequest`, forwards it to the engine asynchronously, and returns a `PermissionRequestOutcome`.
 
-**Call relations**: Pass-through runtime wrapper.
+**Call relations**: When permission logic reaches the hook stage, it calls this registry method. The method delegates execution to the engine and returns the engine’s decision-shaped result.
 
 *Call graph*: calls 1 internal fn (run_permission_request).
 
@@ -226,11 +224,11 @@ async fn run_permission_request(
 async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome
 ```
 
-**Purpose**: Delegates execution of post-tool-use hooks to the structured hook engine.
+**Purpose**: Runs hooks after a tool has finished. These hooks can react to the tool result, such as logging, cleanup, or follow-up checks.
 
-**Data flow**: Consumes a `PostToolUseRequest`, awaits `self.engine.run_post_tool_use(request)`, and returns `PostToolUseOutcome`.
+**Data flow**: It receives a `PostToolUseRequest`, sends it to the engine asynchronously, and returns a `PostToolUseOutcome`.
 
-**Call relations**: Pass-through runtime wrapper.
+**Call relations**: This is the registry’s public post-tool execution entry. The actual hook selection and running are done by the engine.
 
 *Call graph*: calls 1 internal fn (run_post_tool_use).
 
@@ -244,11 +242,11 @@ fn preview_pre_compact(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates pre-compaction previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run before conversation compaction, without executing them. Compaction means shortening or summarizing stored conversation context.
 
-**Data flow**: Borrows `self` and a `PreCompactRequest`, forwards it to `self.engine.preview_pre_compact`, and returns the summaries.
+**Data flow**: It receives a pre-compact request by reference, passes it to the engine, and returns summaries of matching hooks.
 
-**Call relations**: Public preview wrapper for compaction hooks.
+**Call relations**: This method is a preview doorway. It lets callers ask the registry what the engine would do before compaction, while avoiding side effects.
 
 *Call graph*: calls 1 internal fn (preview_pre_compact).
 
@@ -259,11 +257,11 @@ fn preview_pre_compact(
 async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome
 ```
 
-**Purpose**: Delegates execution of pre-compaction hooks to the structured hook engine.
+**Purpose**: Runs hooks before conversation compaction. These hooks can inspect or influence the compaction step before it happens.
 
-**Data flow**: Consumes a `PreCompactRequest`, awaits `self.engine.run_pre_compact(request)`, and returns `PreCompactOutcome`.
+**Data flow**: It receives a `PreCompactRequest`, forwards it to the engine asynchronously, and returns a `PreCompactOutcome`.
 
-**Call relations**: Public runtime wrapper for pre-compaction hooks.
+**Call relations**: When the compaction process reaches its pre-hook phase, this method passes control to the engine and returns the outcome.
 
 *Call graph*: calls 1 internal fn (run_pre_compact).
 
@@ -277,11 +275,11 @@ fn preview_post_compact(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates post-compaction previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run after conversation compaction, without executing them. This gives visibility into follow-up hook activity.
 
-**Data flow**: Borrows `self` and a `PostCompactRequest`, forwards it to `self.engine.preview_post_compact`, and returns the summaries.
+**Data flow**: It receives a post-compact request by reference, delegates to the engine, and returns hook run summaries.
 
-**Call relations**: Public preview wrapper for post-compaction hooks.
+**Call relations**: This is the registry-level preview path for post-compaction hooks. The engine does the matching and summary creation.
 
 *Call graph*: calls 1 internal fn (preview_post_compact).
 
@@ -292,11 +290,11 @@ fn preview_post_compact(
 async fn run_post_compact(&self, request: PostCompactRequest) -> StatelessHookOutcome
 ```
 
-**Purpose**: Delegates execution of post-compaction hooks to the structured hook engine.
+**Purpose**: Runs hooks after conversation compaction has happened. These hooks are stateless here, meaning they return a general success or result rather than changing a larger hook-specific state.
 
-**Data flow**: Consumes a `PostCompactRequest`, awaits `self.engine.run_post_compact(request)`, and returns `StatelessHookOutcome`.
+**Data flow**: It receives a `PostCompactRequest`, sends it to the engine asynchronously, and returns a `StatelessHookOutcome`.
 
-**Call relations**: Public runtime wrapper for post-compaction hooks.
+**Call relations**: After compaction, callers use this method to trigger configured post-compact hooks through the engine.
 
 *Call graph*: calls 1 internal fn (run_post_compact).
 
@@ -310,11 +308,11 @@ fn preview_user_prompt_submit(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates user-prompt-submit previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run when the user submits a prompt, without actually running them. This can help explain what automation is attached to user input.
 
-**Data flow**: Borrows `self` and a `UserPromptSubmitRequest`, forwards it to `self.engine.preview_user_prompt_submit`, and returns the summaries.
+**Data flow**: It receives a user-prompt-submit request by reference, forwards it to the engine, and returns summaries of matching hooks.
 
-**Call relations**: Public preview wrapper for prompt-submit hooks.
+**Call relations**: This is a public preview wrapper. The registry accepts the request and the engine performs the hook matching.
 
 *Call graph*: calls 1 internal fn (preview_user_prompt_submit).
 
@@ -328,11 +326,11 @@ async fn run_user_prompt_submit(
     ) -> UserPromptSubmitOutcome
 ```
 
-**Purpose**: Delegates execution of user-prompt-submit hooks to the structured hook engine.
+**Purpose**: Runs hooks when the user submits a prompt. These hooks can inspect or affect the submitted prompt flow.
 
-**Data flow**: Consumes a `UserPromptSubmitRequest`, awaits `self.engine.run_user_prompt_submit(request)`, and returns `UserPromptSubmitOutcome`.
+**Data flow**: It receives a `UserPromptSubmitRequest`, passes it into the engine asynchronously, and returns a `UserPromptSubmitOutcome`.
 
-**Call relations**: Public runtime wrapper for prompt-submit hooks.
+**Call relations**: When prompt submission reaches the hook stage, this method is the registry entry point. It delegates to the engine and returns the engine’s outcome.
 
 *Call graph*: calls 1 internal fn (run_user_prompt_submit).
 
@@ -346,11 +344,11 @@ fn preview_stop(
     ) -> Vec<codex_protocol::protocol::HookRunSummary>
 ```
 
-**Purpose**: Delegates stop-hook previewing to the structured hook engine.
+**Purpose**: Shows which hooks would run when a stop event occurs, without executing them. A stop event is part of shutting down or ending an operation.
 
-**Data flow**: Borrows `self` and a `StopRequest`, forwards it to `self.engine.preview_stop`, and returns the summaries.
+**Data flow**: It receives a stop request by reference, sends it to the engine’s preview function, and returns hook run summaries.
 
-**Call relations**: Public preview wrapper for stop hooks.
+**Call relations**: This method exposes stop-hook previewing through the registry facade while keeping the actual matching inside the engine.
 
 *Call graph*: calls 1 internal fn (preview_stop).
 
@@ -361,11 +359,11 @@ fn preview_stop(
 async fn run_stop(&self, request: StopRequest) -> StopOutcome
 ```
 
-**Purpose**: Delegates execution of stop hooks to the structured hook engine.
+**Purpose**: Runs hooks for a stop event. These hooks can perform final checks, cleanup, or other configured stop-time actions.
 
-**Data flow**: Consumes a `StopRequest`, awaits `self.engine.run_stop(request)`, and returns `StopOutcome`.
+**Data flow**: It receives a `StopRequest`, forwards it to the engine asynchronously, and returns a `StopOutcome`.
 
-**Call relations**: Public runtime wrapper for stop hooks.
+**Call relations**: When a stop event is actually being processed, callers use this method. The registry hands the request to the engine and returns the result.
 
 *Call graph*: calls 1 internal fn (run_stop).
 
@@ -376,11 +374,11 @@ async fn run_stop(&self, request: StopRequest) -> StopOutcome
 fn list_hooks(config: HooksConfig) -> HookListOutcome
 ```
 
-**Purpose**: Discovers configured structured hook handlers and returns their list plus warnings, without constructing a full `Hooks` registry.
+**Purpose**: Discovers configured hooks and returns them for display, without running them. If the hook feature is turned off, it returns an empty result.
 
-**Data flow**: Consumes `HooksConfig`. If `feature_enabled` is false, it returns `HookListOutcome::default()`. Otherwise it calls `crate::engine::discovery::discover_handlers` with the optional config stack reference, plugin sources, plugin load warnings, and trust-bypass flag, then returns `HookListOutcome { hooks: discovered.hook_entries, warnings: discovered.warnings }`.
+**Data flow**: It receives a `HooksConfig`. If hooks are disabled, it returns the default empty `HookListOutcome`. If hooks are enabled, it asks the discovery system to find hook handlers using config layers, plugin sources, plugin warnings, and trust settings. It returns the discovered hook entries plus any warnings.
 
-**Call relations**: Used by callers that need inspection/listing of configured hooks rather than runtime execution.
+**Call relations**: This function is separate from `Hooks::new` because listing hooks is different from running hooks. It calls the discovery layer directly to produce a report-style outcome.
 
 *Call graph*: calls 1 internal fn (discover_handlers); 1 external calls (default).
 
@@ -391,22 +389,24 @@ fn list_hooks(config: HooksConfig) -> HookListOutcome
 fn command_from_argv(argv: &[String]) -> Option<Command>
 ```
 
-**Purpose**: Safely converts an argv slice into a `tokio::process::Command`, rejecting missing or empty program names.
+**Purpose**: Turns a command-line-style list of strings into a process command that can be run later. The first string is the program name, and the rest are its arguments.
 
-**Data flow**: Accepts `&[String]`, uses `split_first()` to separate program and args, returns `None` if the slice is empty or the program string is empty, otherwise constructs `Command::new(program)`, appends `args`, and returns `Some(command)`.
+**Data flow**: It receives a slice of strings. If the slice is empty, or if the first string is empty, it returns `None` because there is no valid program to run. Otherwise it creates a `tokio::process::Command`, attaches the remaining strings as arguments, and returns it inside `Some`.
 
-**Call relations**: Used by the legacy notify path to turn configured argv into a spawnable command while treating empty configuration as disabled.
+**Call relations**: This is a small utility used wherever hook code needs to convert stored command arguments into an executable command. It relies on Tokio’s process command type, which is used for running external programs asynchronously.
 
 *Call graph*: 1 external calls (new).
 
 
 ### `core/src/hook_runtime.rs`
 
-`orchestration` · `cross-cutting during turn execution, tool execution, and compaction`
+`orchestration` · `cross-cutting during session turns, tool calls, approvals, compaction, and shutdown`
 
-This file is the execution layer for user/system/project hooks. For each hook family—session start, user prompt submit, pre/post tool use, permission request, stop, pre/post compact, and the legacy after-agent hook—it builds the corresponding request object from `Session` and `TurnContext`, previews matching runs to emit `HookStarted` events, executes the hook(s), emits `HookCompleted` events, records metrics and analytics, and persists any additional context fragments as separate developer messages. The helper `run_context_injecting_hook` abstracts the common preview/run/completed flow for hook types that can inject additional context and request turn stoppage.
+Hooks let users or organizations add custom checks and actions around a Codex session, like “before running a tool, inspect the command” or “when a session starts, add extra instructions.” This file is the runtime layer that makes those hooks fit safely into the normal turn flow. Without it, hooks might not run at the right time, users would not see hook start and finish events, and decisions like blocking a tool call or stopping a turn would be lost.
 
-The runtime also adapts session topology into hook-visible targets. Thread-spawn subagents get `SubagentStart`/`SubagentStop` targets and a `SubagentHookContext` containing agent ID/type; internal non-thread-spawn subagents skip lifecycle hooks entirely. Permission mode is normalized from approval policy into the hook contract’s `bypassPermissions` vs `default` strings. Pre-tool hooks can either continue with optional updated JSON input or block execution with a synthesized message that includes the command for Bash/apply_patch calls. Completed hook runs are tagged into metrics by hook name, source, and status, and are also converted into `HookRunFact` analytics using the completed turn ID when present. Additional contexts are intentionally recorded as separate developer messages to preserve ordering and avoid concatenation ambiguity.
+The file follows a repeated pattern. First it builds a request using the current session, turn id, working directory, model, transcript path, permission mode, and sometimes tool input or subagent information. Then it asks the hook system for a preview, so the UI can be told which hooks are starting. It runs the hooks, emits completion events, and records measurements and analytics. Some hooks can return extra context; this file turns that text into developer messages and adds them to the conversation, like slipping notes into the transcript for the model to read later.
+
+It also knows about special cases: thread-spawned subagents get subagent hook targets, internal subagents skip lifecycle hooks, legacy after-agent hooks still run, and compaction hooks can stop a compaction process.
 
 #### Function details
 
@@ -416,11 +416,11 @@ The runtime also adapts session topology into hook-visible targets. Thread-spawn
 fn from(value: UserPromptSubmitOutcome) -> Self
 ```
 
-**Purpose**: Converts a `SessionStartOutcome` into the internal normalized hook outcome shape used by the runtime.
+**Purpose**: Converts hook outcomes that can add extra context into one common internal shape. This lets session-start hooks and user-prompt hooks be treated the same way after they finish.
 
-**Data flow**: Consumes `SessionStartOutcome`, extracts `hook_events`, `should_stop`, and `additional_contexts`, discards `stop_reason`, and returns `ContextInjectingHookOutcome { hook_events, outcome: HookRuntimeOutcome { should_stop, additional_contexts } }`.
+**Data flow**: It receives a hook outcome with completed hook events, a stop flag, and added context strings. It ignores the detailed stop reason, keeps the events, and produces a `ContextInjectingHookOutcome` containing a simpler `HookRuntimeOutcome`.
 
-**Call relations**: Used implicitly by `run_context_injecting_hook` when running session-start hooks.
+**Call relations**: This conversion is used by `run_context_injecting_hook` after it awaits either a session-start hook run or a user-prompt-submit hook run. That shared helper can then emit completion events and return the same kind of result to its caller.
 
 
 ##### `run_pending_session_start_hooks`  (lines 103–156)
@@ -432,11 +432,11 @@ async fn run_pending_session_start_hooks(
 ) -> bool
 ```
 
-**Purpose**: Drains and runs any queued session-start hooks for the session, including thread-spawn subagent starts, and records any additional context they inject. It returns whether any hook requested that execution stop.
+**Purpose**: Runs any session-start hooks that are waiting to fire. These hooks can add context to the conversation or ask the runtime to stop early.
 
-**Data flow**: Loops while `sess.take_pending_session_start_source().await` yields a source. For each source it derives a `StartHookTarget`: thread-spawn subagents become `SubagentStart` with agent metadata from `subagent_hook_context`, ordinary root sessions become `SessionStart`, and other subagents short-circuit to `false`. It builds a `SessionStartRequest` from session ID, cwd, transcript path, model, permission mode, and target; previews matching hooks; runs them through `run_context_injecting_hook`; then calls `HookRuntimeOutcome::record_additional_contexts`. If any run requests stop, it returns `true`; otherwise it returns `false` after the queue is empty.
+**Data flow**: It reads pending start sources from the session one by one. For each one, it builds a request with session details, model, permission mode, transcript path, and the correct target: a normal session start or a thread-spawned subagent start. It previews the hooks, runs them, records any added context, and returns `true` if a hook says the session should stop.
 
-**Call relations**: Called from the main turn runner before normal turn processing. It delegates common hook execution to `run_context_injecting_hook` and target derivation to `subagent_hook_context` and `hook_permission_mode`.
+**Call relations**: The main turn runner calls this near the start of a turn. It uses `hook_permission_mode` to describe the approval setting, `subagent_hook_context` when the turn belongs to a thread-spawned subagent, and `run_context_injecting_hook` for the common start/complete event flow.
 
 *Call graph*: calls 3 internal fn (hook_permission_mode, run_context_injecting_hook, subagent_hook_context); called by 1 (run_turn); 1 external calls (matches!).
 
@@ -453,11 +453,11 @@ async fn run_pre_tool_use_hooks(
 ) -> PreToolUseHookResult
 ```
 
-**Purpose**: Runs `PreToolUse` hooks before a tool executes, emits hook events, records additional contexts, and returns either a possibly updated tool input or a blocking reason.
+**Purpose**: Runs hooks before a tool is allowed to execute. These hooks can let the tool proceed, change the tool input, add context, or block the tool call with a message.
 
-**Data flow**: Builds a `PreToolUseRequest` from session/turn IDs, optional thread-spawn subagent context, cwd, transcript path, model, permission mode, canonical tool name, matcher aliases, tool-use ID, and cloned tool input JSON. It previews hooks and emits started events, awaits `hooks.run_pre_tool_use(request)`, emits completed events, records any additional contexts, and then returns `PreToolUseHookResult::Continue { updated_input }` when `should_block` is false or no block reason is provided. If blocked with a reason, it formats either a command-specific message for Bash/apply_patch using `tool_input["command"]` or a generic tool-blocked message.
+**Data flow**: It receives the session, turn, tool id, tool name, and tool input. It builds a stable hook request, emits “hook started” events, runs matching pre-tool hooks, emits completion events, records any added context, and returns either `Continue` with optional updated input or `Blocked` with a human-readable reason.
 
-**Call relations**: Called by tool-dispatch code before executing a tool. It uses `emit_hook_started_events`, `emit_hook_completed_events`, `record_additional_contexts`, `thread_spawn_subagent_hook_context`, and `hook_permission_mode` to integrate hook execution into the turn runtime.
+**Call relations**: Tool dispatch calls this before executing a tool. It relies on `thread_spawn_subagent_hook_context` to include subagent details when needed, `hook_permission_mode` to describe approval behavior, and the emit/record helpers to keep the session transcript and UI in sync.
 
 *Call graph*: calls 7 internal fn (emit_hook_completed_events, emit_hook_started_events, hook_permission_mode, record_additional_contexts, thread_spawn_subagent_hook_context, matcher_aliases, name); called by 1 (dispatch_any_with_terminal_outcome); 4 external calls (clone, get, Blocked, format!).
 
@@ -473,11 +473,11 @@ async fn run_permission_request_hooks(
 ) -> Option<PermissionRequestDecisi
 ```
 
-**Purpose**: Runs `PermissionRequest` hooks around an approval request and returns any hook-supplied decision.
+**Purpose**: Runs hooks when Codex is about to ask for permission, such as approval for a tool action. These hooks can optionally supply a decision so the normal approval path can be adjusted.
 
-**Data flow**: Builds a `PermissionRequestRequest` from session/turn IDs, optional subagent context, cwd, transcript path, model, permission mode, tool name and matcher aliases from the payload, run ID suffix, and tool input. It previews hooks and emits started events, awaits `hooks.run_permission_request(request)`, emits completed events, and returns the optional `decision` from the outcome.
+**Data flow**: It receives a permission request payload, session and turn information, and a run id suffix. It builds a request with the tool name, aliases, input, transcript path, model, and permission mode, emits started events, runs permission hooks, emits completed events, and returns an optional decision.
 
-**Call relations**: Called by approval-request paths such as MCP tool approval and inline policy requests. It shares the same preview/start/completed event flow as other hook families.
+**Call relations**: Approval-related paths call this before or during permission prompts. It uses the same event helpers as other hook types, but unlike pre-tool hooks it does not change tool input or record extra context.
 
 *Call graph*: calls 4 internal fn (emit_hook_completed_events, emit_hook_started_events, hook_permission_mode, thread_spawn_subagent_hook_context); called by 4 (maybe_request_mcp_tool_approval, handle_inline_policy_request, request_approval, prompt).
 
@@ -494,11 +494,11 @@ async fn run_post_tool_use_hooks(
     tool_input: Value,
 ```
 
-**Purpose**: Runs `PostToolUse` hooks after a successful tool execution using the stable hook contract values rather than raw internal tool data.
+**Purpose**: Runs hooks after a tool has successfully produced output. This gives hooks a chance to observe the tool input and response after the fact.
 
-**Data flow**: Builds a `PostToolUseRequest` from session/turn IDs, optional subagent context, cwd, transcript path, model, permission mode, tool name, matcher aliases, tool-use ID, tool input JSON, and tool response JSON. It previews hooks and emits started events, awaits `hooks.run_post_tool_use(request)`, emits completed events using a clone of `outcome.hook_events`, and returns the full `PostToolUseOutcome`.
+**Data flow**: It receives the tool id, public tool name, matcher aliases, hook-safe tool input, and hook-safe tool response. It builds a request, emits started events, runs matching post-tool hooks, emits completed events, and returns the full post-tool outcome.
 
-**Call relations**: Called by tool-dispatch code after a tool succeeds. It mirrors the pre-tool flow but returns the hook library’s full post-tool outcome.
+**Call relations**: Tool dispatch calls this after a successful tool run. It depends on callers to pass the stable hook-facing data, then uses `thread_spawn_subagent_hook_context`, `hook_permission_mode`, and event emitters to fit the hook run into the session flow.
 
 *Call graph*: calls 4 internal fn (emit_hook_completed_events, emit_hook_started_events, hook_permission_mode, thread_spawn_subagent_hook_context); called by 1 (dispatch_any_with_terminal_outcome).
 
@@ -514,11 +514,11 @@ async fn run_turn_stop_hooks(
 ) -> StopOutcome
 ```
 
-**Purpose**: Runs stop hooks at the end of a turn, adapting root turns to `Stop` and thread-spawn child turns to `SubagentStop`. Internal non-thread-spawn subagents skip stop hooks entirely.
+**Purpose**: Runs stop hooks when a turn is ending. Stop hooks can inspect the final assistant message and may influence whether stopping work continues.
 
-**Data flow**: Examines `turn_context.session_source`. For thread-spawn subagents it builds `StopHookTarget::SubagentStop` with agent metadata and resolves the parent transcript path from `thread_store`; for other subagents it returns `StopOutcome::default()` immediately; for root turns it uses `StopHookTarget::Stop` and the current session transcript path. It then builds a `StopRequest` with session/turn IDs, cwd, transcript path, model, permission mode, `stop_hook_active`, optional last assistant message, and target; previews hooks and emits started events; runs `hooks.run_stop(request)`; emits completed events while taking ownership of `outcome.hook_events`; and returns the mutated `StopOutcome`.
+**Data flow**: It reads whether the turn is a normal session, a thread-spawned subagent, or an internal subagent. It builds either a normal stop request or a subagent stop request, including transcript paths when available. It emits started events, runs stop hooks, emits completed events, removes the events from the returned outcome, and returns the remaining stop outcome.
 
-**Call relations**: Called by the main turn runner during turn teardown. It uses `subagent_hook_context`, `hook_permission_mode`, and the common event emitters.
+**Call relations**: The main turn runner calls this near turn completion. It calls `subagent_hook_context` for thread-spawned subagents, skips internal subagents, uses `hook_permission_mode`, and sends all visible hook progress through the shared event helpers.
 
 *Call graph*: calls 4 internal fn (emit_hook_completed_events, emit_hook_started_events, hook_permission_mode, subagent_hook_context); called by 1 (run_turn); 3 external calls (default, take, warn!).
 
@@ -533,11 +533,11 @@ async fn run_pre_compact_hooks(
 ) -> PreCompactHookOutcome
 ```
 
-**Purpose**: Runs `PreCompact` hooks before compaction and converts the hook outcome into a simple continue/stopped enum.
+**Purpose**: Runs hooks just before conversation compaction starts. Compaction means shortening or summarizing stored context so the system can keep working within limits.
 
-**Data flow**: Builds a `PreCompactRequest` from session/turn IDs, optional subagent context, cwd, transcript path, model, and stringified compaction trigger. It previews hooks and emits started events, awaits `sess.hooks().run_pre_compact(request)`, emits completed events, and returns `PreCompactHookOutcome::Stopped` when `outcome.should_stop` is true or `Continue` otherwise.
+**Data flow**: It receives the session, turn, and compaction trigger. It labels the trigger as manual or automatic, builds a pre-compaction request, emits started events, runs the hooks, emits completed events, and returns whether compaction should continue or stop.
 
-**Call relations**: Called by local and remote compaction tasks before compaction begins.
+**Call relations**: Local and remote compaction tasks call this before compacting. It uses `compaction_trigger_label` for the hook-facing trigger text and `thread_spawn_subagent_hook_context` so subagent compactions carry the right context.
 
 *Call graph*: calls 4 internal fn (compaction_trigger_label, emit_hook_completed_events, emit_hook_started_events, thread_spawn_subagent_hook_context); called by 3 (run_compact_task_inner, run_remote_compact_task_inner, run_remote_compact_task_inner).
 
@@ -552,11 +552,11 @@ async fn run_post_compact_hooks(
 ) -> PostCompactHookOutcome
 ```
 
-**Purpose**: Runs `PostCompact` hooks after compaction and converts the hook outcome into a simple continue/stopped enum.
+**Purpose**: Runs hooks after conversation compaction has happened. These hooks can observe the compaction event and can ask the surrounding flow to stop.
 
-**Data flow**: Builds a `PostCompactRequest` from session/turn IDs, optional subagent context, cwd, transcript path, model, and stringified compaction trigger. It previews hooks and emits started events, awaits `sess.hooks().run_post_compact(request)`, emits completed events, and returns `PostCompactHookOutcome::Stopped` when `outcome.should_stop` is true or `Continue` otherwise.
+**Data flow**: It receives session and turn information plus the compaction trigger. It builds a post-compaction request, emits started events, runs the hooks, emits completed events, and returns either `Continue` or `Stopped`.
 
-**Call relations**: Called by local and remote compaction tasks after compaction completes.
+**Call relations**: Compaction tasks call this after local or remote compaction work. It mirrors `run_pre_compact_hooks`, using the same trigger-label and subagent-context helpers.
 
 *Call graph*: calls 4 internal fn (compaction_trigger_label, emit_hook_completed_events, emit_hook_started_events, thread_spawn_subagent_hook_context); called by 3 (run_compact_task_inner, run_remote_compact_task_inner, run_remote_compact_task_inner).
 
@@ -572,11 +572,11 @@ async fn run_legacy_after_agent_hook(
 ) -> bool
 ```
 
-**Purpose**: Runs the older `AfterAgent` hook API after agent completion, logging failures and optionally aborting turn completion if a hook requested abort.
+**Purpose**: Runs the older “after agent” hook format after an agent turn. This keeps backward compatibility for hook configurations that predate the newer hook system.
 
-**Data flow**: Parses the supplied `input` response items into user messages via `parse_turn_item`, builds a legacy `HookPayload` with session ID, cwd, client name, current UTC timestamp, thread ID, turn ID, input messages, and optional last assistant message, then awaits `hooks.dispatch(...)`. For each hook outcome it ignores successes, logs warnings for failures, and remembers the first aborting failure message. If no aborting failure occurred it returns `false`; otherwise it sends an `EventMsg::Error` with `CodexErrorInfo::Other` and returns `true`.
+**Data flow**: It receives the recent response items and optional last assistant message. It extracts user messages from the input, dispatches the legacy hook payload, logs failures, remembers the first failure that says to abort, and if needed sends an error event to the session. It returns `true` when the turn completion was aborted.
 
-**Call relations**: Called by the main turn runner after agent completion for backward compatibility with legacy hooks. Unlike the newer hook families, it uses the older dispatch API directly.
+**Call relations**: The main turn runner calls this after agent work. It does not use the newer preview/completed event path; instead it talks to the older hook dispatcher and reports aborts as session error events.
 
 *Call graph*: called by 1 (run_turn); 5 external calls (now, format!, iter, Error, warn!).
 
@@ -591,11 +591,11 @@ async fn inspect_pending_input(
 ) -> HookRuntimeOutcome
 ```
 
-**Purpose**: Runs input-inspection hooks for pending turn input before the input is recorded, currently only for user prompts.
+**Purpose**: Inspects input before it is recorded into the conversation. For normal user text, it runs user-prompt-submit hooks that may add context or stop the turn.
 
-**Data flow**: Matches `pending_input_item`. For `TurnInput::UserInput`, it builds a `UserPromptSubmitRequest` from session/turn IDs, optional subagent context, cwd, transcript path, model, permission mode, and the user message text from `UserMessageItem::new(content).message()`, then runs it through `run_context_injecting_hook` and returns the resulting `HookRuntimeOutcome`. For `ResponseItem` and `InterAgentCommunication`, it returns `HookRuntimeOutcome { should_stop: false, additional_contexts: Vec::new() }`.
+**Data flow**: It receives a pending turn input. If the input is user text, it builds a prompt-submit hook request, previews and runs those hooks, and returns whether to stop plus any added context. If the input is already a response item or inter-agent communication, it returns a no-op outcome.
 
-**Call relations**: Called before recording pending input in turn-processing paths. It delegates common hook execution to `run_context_injecting_hook`.
+**Call relations**: Input-recording flows call this before committing pending input. It uses `run_context_injecting_hook` for the common hook event flow and `thread_spawn_subagent_hook_context` and `hook_permission_mode` to fill in request details.
 
 *Call graph*: calls 4 internal fn (hook_permission_mode, run_context_injecting_hook, thread_spawn_subagent_hook_context, new); called by 2 (run_hooks_and_record_inputs, on_task_finished); 1 external calls (new).
 
@@ -611,11 +611,11 @@ async fn record_pending_input(
 )
 ```
 
-**Purpose**: Persists a pending input item into session history and then records any additional contexts produced by hooks.
+**Purpose**: Records a pending input item into the session transcript, then records any context that hooks added. This is the point where inspected input becomes part of the conversation history.
 
-**Data flow**: Matches the owned `TurnInput`: user input is recorded via `record_user_prompt_and_emit_turn_item`, a response item via `record_conversation_items`, and inter-agent communication via `record_inter_agent_communication`. After recording the primary input, it calls `record_additional_contexts` with the supplied extra context strings. It returns nothing.
+**Data flow**: It receives one pending input and a list of added context strings. Depending on the input kind, it records a user prompt, response item, or inter-agent communication. Then it turns the added context into developer messages and records those too.
 
-**Call relations**: Called after hook inspection succeeds so the original input and any hook-injected context are both persisted in order.
+**Call relations**: The input flow calls this after `inspect_pending_input` has run. It hands extra context to `record_additional_contexts`, keeping hook-added notes next to the input they relate to.
 
 *Call graph*: calls 1 internal fn (record_additional_contexts); called by 2 (run_hooks_and_record_inputs, on_task_finished); 1 external calls (from_ref).
 
@@ -631,11 +631,11 @@ async fn run_context_injecting_hook(
 ) -> HookRuntimeOutcome
 ```
 
-**Purpose**: Shared helper for hook families that can inject additional context and request turn stoppage. It centralizes the preview/start/completed event flow.
+**Purpose**: Provides the common run pattern for hooks that can add context to the conversation. It keeps session-start and user-prompt-submit hook handling consistent.
 
-**Data flow**: Accepts session and turn references, preview hook summaries, and a future producing some `Outcome: Into<ContextInjectingHookOutcome>`. It emits started events for the previews, awaits the future, converts the result into `ContextInjectingHookOutcome`, emits completed events for its `hook_events`, and returns the normalized `HookRuntimeOutcome`.
+**Data flow**: It receives preview information and a future hook result. It emits started events from the preview, waits for the hook outcome, converts that outcome into a common shape, emits completed events, and returns the stop flag plus added context.
 
-**Call relations**: Used by `run_pending_session_start_hooks` and `inspect_pending_input` to avoid duplicating the common hook execution pattern.
+**Call relations**: `run_pending_session_start_hooks` and `inspect_pending_input` call this instead of duplicating the same start-run-complete sequence. It delegates event sending to `emit_hook_started_events` and `emit_hook_completed_events`.
 
 *Call graph*: calls 2 internal fn (emit_hook_completed_events, emit_hook_started_events); called by 2 (inspect_pending_input, run_pending_session_start_hooks).
 
@@ -650,11 +650,11 @@ async fn record_additional_contexts(
     ) -> bool
 ```
 
-**Purpose**: Persists any additional contexts carried by a hook outcome and returns whether the hook requested stop.
+**Purpose**: Records the extra context carried by a hook outcome and then returns the hook’s stop decision. It is a small convenience method for flows that need both actions in order.
 
-**Data flow**: Consumes `self`, calls `record_additional_contexts(sess, turn_context, self.additional_contexts).await`, and returns `self.should_stop`.
+**Data flow**: It consumes a `HookRuntimeOutcome`, sends its context strings to `record_additional_contexts`, and then returns the original `should_stop` value.
 
-**Call relations**: Used by `run_pending_session_start_hooks` after `run_context_injecting_hook` so stop decisions and context persistence are handled together.
+**Call relations**: `run_pending_session_start_hooks` uses this after running a context-injecting hook, so added context is stored before the caller reacts to a possible stop request.
 
 *Call graph*: calls 1 internal fn (record_additional_contexts).
 
@@ -669,11 +669,11 @@ async fn record_additional_contexts(
 )
 ```
 
-**Purpose**: Converts hook-supplied additional context strings into developer messages and records them in conversation history.
+**Purpose**: Adds hook-provided context text to the conversation as developer messages. This lets later model work see the extra information supplied by hooks.
 
-**Data flow**: Takes owned `additional_contexts`, converts them with `additional_context_messages`, returns early if the resulting vector is empty, otherwise records them via `sess.record_conversation_items(turn_context, ...)`. It returns nothing.
+**Data flow**: It receives a list of context strings. It converts them into response items with `additional_context_messages`; if the list is empty it does nothing. Otherwise it records those items in the session conversation.
 
-**Call relations**: Called from multiple hook execution and input-recording paths whenever hooks inject extra context into the conversation.
+**Call relations**: Several hook flows call this after hooks return extra context, including pre-tool and input-recording paths. It is also called by `HookRuntimeOutcome::record_additional_contexts`, which wraps the same behavior.
 
 *Call graph*: calls 1 internal fn (additional_context_messages); called by 6 (record_additional_contexts, record_pending_input, run_pre_tool_use_hooks, run_hooks_and_record_inputs, on_task_finished, dispatch_any_with_terminal_outcome).
 
@@ -684,11 +684,11 @@ async fn record_additional_contexts(
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem>
 ```
 
-**Purpose**: Wraps each additional context string as a separate contextual developer message.
+**Purpose**: Turns raw hook context strings into conversation items that look like developer messages. Keeping each string separate preserves order and boundaries.
 
-**Data flow**: Consumes a vector of strings, maps each through `HookAdditionalContext::new`, converts each to a `ResponseItem` via `ContextualUserFragment::into`, collects them into a vector, and returns it.
+**Data flow**: It receives a vector of strings. For each string, it creates a `HookAdditionalContext`, converts that into a contextual user fragment, and finally into a response item. It returns the list of response items.
 
-**Call relations**: Used by `record_additional_contexts` and directly tested to ensure contexts remain separate and ordered.
+**Call relations**: `record_additional_contexts` uses this before writing hook context into the transcript. A test also calls it directly to confirm the messages stay separate and ordered.
 
 *Call graph*: called by 2 (record_additional_contexts, additional_context_messages_stay_separate_and_ordered).
 
@@ -703,11 +703,11 @@ async fn emit_hook_started_events(
 )
 ```
 
-**Purpose**: Emits `HookStarted` events for each previewed hook run.
+**Purpose**: Notifies the session that one or more hook runs have started. This lets clients show hook activity as it happens.
 
-**Data flow**: Iterates over `preview_runs`, wraps each `HookRunSummary` in `EventMsg::HookStarted(HookStartedEvent { turn_id: Some(turn_context.sub_id.clone()), run })`, sends it through `sess.send_event`, and returns nothing.
+**Data flow**: It receives preview summaries for hook runs. For each summary, it wraps it in a `HookStarted` event with the current turn id and sends it through the session event channel.
 
-**Call relations**: Called before actual hook execution by all modern hook families and by `run_context_injecting_hook`.
+**Call relations**: All modern hook runners call this before awaiting hook execution. It is the “starting bell” paired with `emit_hook_completed_events`, which sends the “finished” messages.
 
 *Call graph*: called by 7 (run_context_injecting_hook, run_permission_request_hooks, run_post_compact_hooks, run_post_tool_use_hooks, run_pre_compact_hooks, run_pre_tool_use_hooks, run_turn_stop_hooks); 1 external calls (HookStarted).
 
@@ -722,11 +722,11 @@ async fn emit_hook_completed_events(
 )
 ```
 
-**Purpose**: Processes completed hook events by recording metrics, analytics, and user-visible `HookCompleted` events.
+**Purpose**: Notifies the session that hook runs have finished, while also recording metrics and analytics for each run. This keeps users, operators, and product analytics in agreement about what happened.
 
-**Data flow**: Iterates over `completed_events`, calls `emit_hook_completed_metrics(turn_context, &completed)`, `track_hook_completed_analytics(sess, turn_context, &completed)`, then sends `EventMsg::HookCompleted(completed)` through the session. It returns nothing.
+**Data flow**: It receives completed hook events. For each one, it records telemetry metrics, sends an analytics fact, and emits a `HookCompleted` event to the session.
 
-**Call relations**: Called after hook execution by all modern hook families and by `run_context_injecting_hook`.
+**Call relations**: Every modern hook runner calls this after hook execution. It calls `emit_hook_completed_metrics` and `track_hook_completed_analytics` before sending the visible completion event.
 
 *Call graph*: calls 2 internal fn (emit_hook_completed_metrics, track_hook_completed_analytics); called by 7 (run_context_injecting_hook, run_permission_request_hooks, run_post_compact_hooks, run_post_tool_use_hooks, run_pre_compact_hooks, run_pre_tool_use_hooks, run_turn_stop_hooks); 1 external calls (HookCompleted).
 
@@ -737,11 +737,11 @@ async fn emit_hook_completed_events(
 fn emit_hook_completed_metrics(turn_context: &TurnContext, completed: &HookCompletedEvent)
 ```
 
-**Purpose**: Records per-hook-run count and optional duration metrics tagged by hook name, source, and status.
+**Purpose**: Records operational measurements for a completed hook run. These measurements help answer questions like how many hooks ran and how long they took.
 
-**Data flow**: Builds tags with `hook_run_metric_tags(&completed.run)`, increments `HOOK_RUN_METRIC` on `turn_context.session_telemetry`, and if `completed.run.duration_ms` exists and converts to `u64`, records `HOOK_RUN_DURATION_METRIC` with `Duration::from_millis(duration_ms)`. It returns nothing.
+**Data flow**: It receives the turn context and one completed hook event. It converts the hook run into metric tags, increments a hook-run counter, and if a duration is available records that duration.
 
-**Call relations**: Called by `emit_hook_completed_events` for every completed hook run.
+**Call relations**: `emit_hook_completed_events` calls this for each completed hook. It uses `hook_run_metric_tags` to turn hook details into stable label strings for the telemetry system.
 
 *Call graph*: calls 1 internal fn (hook_run_metric_tags); called by 1 (emit_hook_completed_events); 2 external calls (from_millis, try_from).
 
@@ -756,11 +756,11 @@ fn track_hook_completed_analytics(
 )
 ```
 
-**Purpose**: Sends a completed hook run to the analytics events client.
+**Purpose**: Sends a product analytics record for a completed hook run. This is separate from low-level telemetry and focuses on the hook event, source, and final status.
 
-**Data flow**: Builds `(tracking, hook)` via `hook_run_analytics_payload(sess.thread_id.to_string(), turn_context, completed)` and forwards them to `analytics_events_client.track_hook_run`. It returns nothing.
+**Data flow**: It receives the session, turn context, and completed event. It builds a tracking context and hook fact, then sends them to the session’s analytics client.
 
-**Call relations**: Called by `emit_hook_completed_events` alongside metric emission.
+**Call relations**: `emit_hook_completed_events` calls this after metrics are recorded. It uses `hook_run_analytics_payload` to build the exact analytics data.
 
 *Call graph*: calls 1 internal fn (hook_run_analytics_payload); called by 1 (emit_hook_completed_events).
 
@@ -775,11 +775,11 @@ fn hook_run_analytics_payload(
 ) -> (codex_analytics::TrackEventsContext, HookRunFact)
 ```
 
-**Purpose**: Builds the analytics tracking context and `HookRunFact` for a completed hook run.
+**Purpose**: Builds the analytics payload for a completed hook run. It chooses the right thread id, turn id, model name, hook event name, hook source, and hook status.
 
-**Data flow**: Reads the outer `thread_id`, `turn_context`, and `HookCompletedEvent`. It chooses the turn ID from `completed.turn_id` when present or falls back to `turn_context.sub_id`, builds a `TrackEventsContext` with `build_track_events_context`, and returns it paired with `HookRunFact { event_name, hook_source, status }` copied from `completed.run`.
+**Data flow**: It receives a thread id, turn context, and completed hook event. It prefers the turn id stored on the completed event, but falls back to the current turn context if the event has none. It returns a tracking context plus a hook-run fact.
 
-**Call relations**: Used by `track_hook_completed_analytics` and directly tested for turn-ID selection behavior.
+**Call relations**: `track_hook_completed_analytics` uses this before sending analytics. Tests call it directly to verify both the explicit-turn-id and fallback-turn-id cases.
 
 *Call graph*: called by 3 (hook_run_analytics_payload_falls_back_to_turn_context_id, hook_run_analytics_payload_uses_completed_turn_id, track_hook_completed_analytics); 1 external calls (build_track_events_context).
 
@@ -790,11 +790,11 @@ fn hook_run_analytics_payload(
 fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 3]
 ```
 
-**Purpose**: Maps a `HookRunSummary` into the fixed metric tag triplet used for hook metrics.
+**Purpose**: Converts hook run details into simple text labels for metrics. Metrics systems usually need stable short strings rather than rich enum values.
 
-**Data flow**: Matches `run.event_name`, `run.source`, and `run.status` into static strings and returns `[ ("hook_name", ...), ("source", ...), ("status", ...) ]`.
+**Data flow**: It receives a hook run summary. It maps the hook event name, hook source, and status into lowercase or display-friendly strings, then returns those three tag pairs.
 
-**Call relations**: Used by `emit_hook_completed_metrics` and tested to ensure metric tags align with analytics semantics.
+**Call relations**: `emit_hook_completed_metrics` calls this for every completed hook. Tests check that the labels match the analytics shape and include all expanded hook sources.
 
 *Call graph*: called by 1 (emit_hook_completed_metrics).
 
@@ -805,11 +805,11 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
 fn hook_permission_mode(turn_context: &TurnContext) -> String
 ```
 
-**Purpose**: Normalizes the turn’s approval policy into the hook contract’s permission-mode string.
+**Purpose**: Translates the turn’s approval policy into the permission-mode string expected by hooks. This gives hooks a simple view of whether permissions are being bypassed.
 
-**Data flow**: Reads `turn_context.approval_policy.value()`, maps `AskForApproval::Never` to `bypassPermissions` and all other modes to `default`, converts the chosen literal to `String`, and returns it.
+**Data flow**: It reads the approval policy from the turn context. If approvals are set to never ask, it returns `bypassPermissions`; otherwise it returns `default`.
 
-**Call relations**: Used when building requests for most hook families so hooks see a stable permission-mode vocabulary.
+**Call relations**: Most hook request builders call this so hooks receive a consistent permission mode. It is used for session start, prompt submit, tool hooks, permission hooks, and stop hooks.
 
 *Call graph*: called by 6 (inspect_pending_input, run_pending_session_start_hooks, run_permission_request_hooks, run_post_tool_use_hooks, run_pre_tool_use_hooks, run_turn_stop_hooks).
 
@@ -823,11 +823,11 @@ fn thread_spawn_subagent_hook_context(
 ) -> Option<SubagentHookContext>
 ```
 
-**Purpose**: Returns subagent hook context only for thread-spawn child sessions.
+**Purpose**: Adds subagent identity information to hook requests, but only for subagents created by thread spawning. Other sessions do not get this extra field.
 
-**Data flow**: Matches `turn_context.session_source`; for `SubAgentSource::ThreadSpawn` it delegates to `subagent_hook_context(sess, agent_role)` and wraps the result in `Some`, otherwise returns `None`.
+**Data flow**: It reads the session source from the turn context. If the turn belongs to a thread-spawned subagent, it builds and returns a `SubagentHookContext`; otherwise it returns `None`.
 
-**Call relations**: Used by tool, permission, compact, and input-inspection hook requests that optionally expose subagent metadata.
+**Call relations**: Tool, prompt, permission, and compaction hook builders call this when filling in optional subagent data. It delegates the actual context construction to `subagent_hook_context`.
 
 *Call graph*: calls 1 internal fn (subagent_hook_context); called by 6 (inspect_pending_input, run_permission_request_hooks, run_post_compact_hooks, run_post_tool_use_hooks, run_pre_compact_hooks, run_pre_tool_use_hooks).
 
@@ -838,11 +838,11 @@ fn thread_spawn_subagent_hook_context(
 fn subagent_hook_context(sess: &Arc<Session>, agent_role: &Option<String>) -> SubagentHookContext
 ```
 
-**Purpose**: Builds the hook-visible subagent identity from the session thread ID and optional agent role.
+**Purpose**: Builds the small identity record that hooks use to recognize a subagent. It includes an agent id and an agent type.
 
-**Data flow**: Reads `sess.thread_id()` and `agent_role`, returns `SubagentHookContext { agent_id: thread_id.to_string(), agent_type: agent_role.clone().unwrap_or_else(DEFAULT_ROLE_NAME) }`.
+**Data flow**: It reads the session thread id and the optional agent role. The thread id becomes the agent id, and the role becomes the agent type; if no role is provided, it uses the default agent role name.
 
-**Call relations**: Used by lifecycle hooks and by `thread_spawn_subagent_hook_context`.
+**Call relations**: `run_pending_session_start_hooks`, `run_turn_stop_hooks`, and `thread_spawn_subagent_hook_context` call this whenever they need hook-facing subagent identity information.
 
 *Call graph*: called by 3 (run_pending_session_start_hooks, run_turn_stop_hooks, thread_spawn_subagent_hook_context).
 
@@ -853,11 +853,11 @@ fn subagent_hook_context(sess: &Arc<Session>, agent_role: &Option<String>) -> Su
 fn compaction_trigger_label(value: CompactionTrigger) -> &'static str
 ```
 
-**Purpose**: Maps compaction trigger enums to the string labels used in hook requests.
+**Purpose**: Turns the compaction trigger into the short text label expected by hooks. This hides the internal enum behind a stable hook contract.
 
-**Data flow**: Matches `CompactionTrigger::Manual` or `Auto` and returns `manual` or `auto`.
+**Data flow**: It receives a compaction trigger value. It returns `manual` for user-requested compaction and `auto` for automatic compaction.
 
-**Call relations**: Used by pre/post compact hook request builders.
+**Call relations**: Both pre-compaction and post-compaction hook runners call this while building their hook requests.
 
 *Call graph*: called by 2 (run_post_compact_hooks, run_pre_compact_hooks).
 
@@ -868,11 +868,11 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str
 fn additional_context_messages_stay_separate_and_ordered()
 ```
 
-**Purpose**: Verifies that additional hook contexts are recorded as separate developer messages in original order.
+**Purpose**: Checks that multiple hook-added context strings become multiple developer messages in the same order. This protects against accidentally merging notes together.
 
-**Data flow**: Calls `additional_context_messages` with two strings, asserts the vector length is two, and inspects each `ResponseItem::Message` to assert developer role and exact text ordering.
+**Data flow**: It creates two sample context strings, converts them with `additional_context_messages`, and inspects the resulting response items. It asserts that there are two developer messages with the original text in order.
 
-**Call relations**: Tests the helper used by `record_additional_contexts`.
+**Call relations**: This test directly exercises the conversion helper used by `record_additional_contexts`, guarding the transcript behavior that hook users would notice.
 
 *Call graph*: calls 1 internal fn (additional_context_messages); 2 external calls (assert_eq!, vec!).
 
@@ -883,11 +883,11 @@ fn additional_context_messages_stay_separate_and_ordered()
 async fn hook_run_analytics_payload_uses_completed_turn_id()
 ```
 
-**Purpose**: Verifies that analytics payload generation prefers the completed event’s explicit turn ID over the current turn context ID.
+**Purpose**: Checks that analytics use the turn id supplied by a completed hook event when it is present. This matters when the hook event carries a more precise turn id than the surrounding context.
 
-**Data flow**: Builds a session/turn fixture and a `HookCompletedEvent` with `turn_id = Some(...)`, calls `hook_run_analytics_payload`, and asserts the returned tracking context and `HookRunFact` fields.
+**Data flow**: It creates a test session and a completed hook event with `turn-from-hook`. It builds the analytics payload and asserts that the payload uses that turn id, the expected thread id, model slug, event name, source, and status.
 
-**Call relations**: Tests turn-ID selection in analytics payload generation.
+**Call relations**: This test calls `hook_run_analytics_payload`, which is normally used by `track_hook_completed_analytics` during hook completion reporting.
 
 *Call graph*: calls 2 internal fn (hook_run_analytics_payload, make_session_and_context); 2 external calls (assert_eq!, sample_hook_run).
 
@@ -898,11 +898,11 @@ async fn hook_run_analytics_payload_uses_completed_turn_id()
 async fn hook_run_analytics_payload_falls_back_to_turn_context_id()
 ```
 
-**Purpose**: Verifies that analytics payload generation falls back to the turn context ID when the completed event lacks a turn ID.
+**Purpose**: Checks that analytics still get a turn id when the completed hook event does not include one. The fallback keeps analytics records complete.
 
-**Data flow**: Builds a fixture and a `HookCompletedEvent` with `turn_id = None`, calls `hook_run_analytics_payload`, and asserts the fallback turn ID and copied hook source/status.
+**Data flow**: It creates a test session and a completed hook event with no turn id. It builds the analytics payload and asserts that the turn id comes from the current turn context while source and status still come from the hook run.
 
-**Call relations**: Companion test for the analytics payload helper.
+**Call relations**: This test covers the fallback path inside `hook_run_analytics_payload`, which is used when `track_hook_completed_analytics` records completed hook runs.
 
 *Call graph*: calls 2 internal fn (hook_run_analytics_payload, make_session_and_context); 2 external calls (assert_eq!, sample_hook_run).
 
@@ -913,11 +913,11 @@ async fn hook_run_analytics_payload_falls_back_to_turn_context_id()
 fn hook_run_metric_tags_match_analytics_shape()
 ```
 
-**Purpose**: Verifies that hook metric tags encode the same hook name/source/status semantics used by analytics.
+**Purpose**: Checks that metric labels for hook name, source, and status use the expected strings. This helps keep telemetry labels consistent with analytics concepts.
 
-**Data flow**: Builds sample `HookRunSummary` values and asserts `hook_run_metric_tags` returns the expected tag arrays for project and cloud-requirements sources.
+**Data flow**: It builds sample hook runs with different sources and compares the output of `hook_run_metric_tags` to the expected tag arrays.
 
-**Call relations**: Tests the metric-tag mapping helper.
+**Call relations**: This test protects the helper used by `emit_hook_completed_metrics`, so completed hook metrics remain easy to group and query.
 
 *Call graph*: 2 external calls (assert_eq!, sample_hook_run).
 
@@ -928,11 +928,11 @@ fn hook_run_metric_tags_match_analytics_shape()
 fn hook_run_metric_tags_include_expanded_hook_sources()
 ```
 
-**Purpose**: Verifies that less common hook sources such as legacy managed-config MDM are mapped to the expected metric tag strings.
+**Purpose**: Checks that newer or more specific hook sources are represented in metric tags. This prevents those sources from being collapsed or mislabeled.
 
-**Data flow**: Builds a sample run with `HookSource::LegacyManagedConfigMdm`, calls `hook_run_metric_tags`, and asserts the returned tags.
+**Data flow**: It builds a sample hook run with a legacy managed-config MDM source and asserts that `hook_run_metric_tags` returns the exact expected source label.
 
-**Call relations**: Additional coverage for the metric-tag mapping helper.
+**Call relations**: This test focuses on the source-mapping part of `hook_run_metric_tags`, which is used whenever hook completion metrics are recorded.
 
 *Call graph*: 2 external calls (assert_eq!, sample_hook_run).
 
@@ -943,22 +943,26 @@ fn hook_run_metric_tags_include_expanded_hook_sources()
 fn sample_hook_run(status: HookRunStatus, source: HookSource) -> HookRunSummary
 ```
 
-**Purpose**: Builds a representative `HookRunSummary` fixture for hook-runtime tests.
+**Purpose**: Creates a reusable fake hook run summary for tests. It keeps the test cases focused on the fields they care about: status and source.
 
-**Data flow**: Constructs and returns a `HookRunSummary` with fixed IDs, stop event name, command handler type, sync execution mode, turn scope, source path, supplied source/status, timestamps, duration, and empty entries.
+**Data flow**: It receives a hook status and hook source, fills in the rest of the hook-run fields with fixed sample values, and returns a `HookRunSummary`.
 
-**Call relations**: Shared fixture for analytics and metric-tag tests.
+**Call relations**: The metric and analytics tests call this helper to build realistic completed hook data without repeating the same setup in each test.
 
 *Call graph*: 2 external calls (new, test_path_buf).
 
 
 ### `hooks/src/legacy_notify.rs`
 
-`io_transport` · `after-agent notification dispatch`
+`io_transport` · `after-agent hook notification`
 
-This file exists solely for legacy compatibility with older notification hooks that expect a final JSON argument rather than the newer structured hook engine. The internal `UserNotification` enum is tagged with `type` and kebab-case serde naming so that `AgentTurnComplete` serializes exactly as `{"type":"agent-turn-complete", ...}` with kebab-cased field names. The only supported source event is `HookEvent::AfterAgent`, which is converted by `legacy_notify_json` into a payload containing the thread id, turn id, cwd, optional client, input messages, and optional last assistant message.
+When the agent finishes responding, some older tools expect to be told by running a command and passing one final JSON argument to it. This file builds that old-style message and defines a hook named `legacy_notify` that launches the configured command.
 
-`notify_hook` turns a raw argv vector into a `Hook`. It stores the argv in an `Arc` so the returned closure can be cloned and invoked asynchronously. When executed, the closure reconstructs a `tokio::process::Command` via `command_from_argv`; an empty argv or empty program short-circuits to `HookResult::Success`, treating the hook as disabled. If payload serialization succeeds, the JSON string is appended as the final command-line argument. The command is then fully detached from interactive I/O by setting stdin/stdout/stderr to `Stdio::null()`. Spawning success is reported as `HookResult::Success`; spawn failure becomes `HookResult::FailedContinue`, meaning the failure is recorded but does not abort the surrounding operation. The tests pin the exact serialized JSON shape to preserve historical compatibility.
+The main idea is simple: take the modern hook payload, translate it into the older notification format, turn that into JSON, and append it to the command-line arguments. The JSON says that an agent turn completed, and includes the thread id, turn id, current working directory, optional client name, the user input messages, and the last assistant message if there is one.
+
+The file also deliberately silences the launched command’s standard input, output, and error streams. In plain terms, the notification command is started in the background and is not allowed to read from or write to the main program’s terminal. If the command cannot be started, the hook reports a failure but allows the main program to continue.
+
+The tests protect the exact old JSON shape, including names like `thread-id` and `agent-turn-complete`. That matters because outside scripts may depend on those exact names.
 
 #### Function details
 
@@ -968,11 +972,11 @@ This file exists solely for legacy compatibility with older notification hooks t
 fn legacy_notify_json(payload: &HookPayload) -> Result<String, serde_json::Error>
 ```
 
-**Purpose**: Serializes a modern `HookPayload` into the historical JSON notification format expected by legacy notify hooks.
+**Purpose**: Builds the backward-compatible JSON string that older notification commands expect. It translates the current hook payload into the older `agent-turn-complete` message format.
 
-**Data flow**: Reads a borrowed `HookPayload`, matches on `payload.hook_event`, and for `HookEvent::AfterAgent` constructs `UserNotification::AgentTurnComplete` using the event's thread id, turn id, input messages, last assistant message, plus `payload.cwd` and `payload.client`. It then serializes that enum with `serde_json::to_string` and returns `Result<String, serde_json::Error>`.
+**Data flow**: It receives a `HookPayload`, reads the completed-agent event inside it, and copies out the thread id, turn id, working directory, client name, input messages, and last assistant message. It then serializes that information into a JSON string. The result is either that JSON text or a JSON serialization error if something goes wrong.
 
-**Call relations**: Used by `notify_hook` at runtime before spawning the external command, and directly by the compatibility test that verifies the historical wire shape.
+**Call relations**: This is the translator used when the legacy notification needs its final command-line argument. The test `tests::legacy_notify_json_matches_historical_wire_shape` calls it to make sure the produced JSON still matches the historical format.
 
 *Call graph*: called by 1 (legacy_notify_json_matches_historical_wire_shape); 1 external calls (to_string).
 
@@ -983,11 +987,11 @@ fn legacy_notify_json(payload: &HookPayload) -> Result<String, serde_json::Error
 fn notify_hook(argv: Vec<String>) -> Hook
 ```
 
-**Purpose**: Builds a `Hook` that launches an external legacy notification command with the serialized payload appended as the last argv element.
+**Purpose**: Creates the actual `legacy_notify` hook that can run an external notification command. Someone uses this when they want the program to notify an older integration after the agent finishes a turn.
 
-**Data flow**: Consumes an argv vector, wraps it in `Arc`, and returns a `Hook` named `legacy_notify` whose async function clones the argv, calls `command_from_argv`, and returns `HookResult::Success` immediately if no valid command can be built. Otherwise it attempts `legacy_notify_json(payload)` and, on success, appends the JSON string as an argument. It nulls stdin/stdout/stderr, spawns the command, and returns `HookResult::Success` on spawn success or `HookResult::FailedContinue(err.into())` on spawn failure.
+**Data flow**: It receives the command arguments as a list of strings and stores them safely so the hook can use them later. When the hook runs, it turns those strings into a command, adds the legacy JSON payload as the last argument if serialization succeeds, disconnects the command from standard input/output/error, and tries to start it. It returns success if there is no command or if the command starts, and returns a non-stopping failure if the command cannot be launched.
 
-**Call relations**: Constructed from `Hooks::new` when `legacy_notify_argv` is configured. It delegates argv parsing to `command_from_argv` and payload serialization to `legacy_notify_json`.
+**Call relations**: This function packages the notification behavior into a `Hook` object for the wider hook system. When that hook is triggered with a payload, it prepares the external command and relies on the legacy JSON-building logic before spawning the process.
 
 *Call graph*: 1 external calls (new).
 
@@ -998,11 +1002,11 @@ fn notify_hook(argv: Vec<String>) -> Hook
 fn expected_notification_json() -> Value
 ```
 
-**Purpose**: Defines the canonical JSON object that legacy notification serialization must produce.
+**Purpose**: Creates the reference JSON value that the tests expect. It is the saved example of the old notification format that must not accidentally change.
 
-**Data flow**: Builds a test cwd path with `test_path_buf`, then returns a `serde_json::Value` via `json!` containing the exact kebab-case keys and expected values for an `agent-turn-complete` notification.
+**Data flow**: It builds a test working directory path and combines it with fixed example ids, messages, and client information. The output is a JSON value used as the comparison target in tests.
 
-**Call relations**: Shared by both tests as the golden wire-format fixture.
+**Call relations**: The test functions call this helper so they compare against the same expected legacy message shape. It keeps the test expectation in one place instead of repeating the full JSON object.
 
 *Call graph*: 2 external calls (test_path_buf, json!).
 
@@ -1013,11 +1017,11 @@ fn expected_notification_json() -> Value
 fn test_user_notification() -> Result<()>
 ```
 
-**Purpose**: Verifies serde serialization of the internal `UserNotification` enum itself.
+**Purpose**: Checks that the internal `UserNotification` value serializes into the exact JSON shape older users expect. This protects field names, the event type name, and optional fields.
 
-**Data flow**: Constructs a `UserNotification::AgentTurnComplete` with fixed sample data, serializes it to a JSON string, parses that string back into `serde_json::Value`, and asserts equality with `expected_notification_json()`.
+**Data flow**: It creates a sample `AgentTurnComplete` notification, serializes it to JSON text, parses that text back into a generic JSON value, and compares it with the shared expected JSON. The test passes only if the serialized form matches exactly.
 
-**Call relations**: Tests the enum's serde attributes independently of `HookPayload` conversion.
+**Call relations**: This test focuses on the notification data type itself. It uses `tests::expected_notification_json` as the known-good shape and catches accidental changes to the serialization rules.
 
 *Call graph*: 5 external calls (assert_eq!, test_path_buf, from_str, to_string, vec!).
 
@@ -1028,11 +1032,11 @@ fn test_user_notification() -> Result<()>
 fn legacy_notify_json_matches_historical_wire_shape() -> Result<()>
 ```
 
-**Purpose**: Checks that converting a real `HookPayload` through `legacy_notify_json` yields the exact historical JSON shape.
+**Purpose**: Checks that `legacy_notify_json` produces the same old JSON format when given a real hook payload. This protects the full translation from modern hook data to legacy notification data.
 
-**Data flow**: Builds a `HookPayload` containing `HookEvent::AfterAgent` with fixed ids/messages and current timestamp, calls `legacy_notify_json`, parses the resulting string into `serde_json::Value`, and compares it to `expected_notification_json()`.
+**Data flow**: It builds a realistic `HookPayload` for an after-agent event, including ids, current directory, client name, input text, and assistant text. It passes that payload into `legacy_notify_json`, parses the returned JSON string, and compares it with the expected JSON value. The test changes nothing outside itself.
 
-**Call relations**: Directly validates the runtime conversion path used by `notify_hook`.
+**Call relations**: This test exercises the public conversion function rather than only the lower-level notification enum. It confirms that the hook payload fields are copied into the legacy wire format correctly.
 
 *Call graph*: calls 3 internal fn (legacy_notify_json, from_string, new); 5 external calls (assert_eq!, now, test_path_buf, from_str, vec!).
 
@@ -1042,13 +1046,13 @@ These files discover configured hooks, assemble the engine, execute commands, pa
 
 ### `hooks/src/engine/mod.rs`
 
-`orchestration` · `startup initialization and per-event hook API`
+`orchestration` · `startup and hook event handling`
 
-This module is the top-level runtime surface for the hooks subsystem. It re-exports submodules for discovery, dispatch, command execution, output parsing, and schema loading, and defines the shared data structures they operate on. `CommandShell` captures the shell program and arguments used to execute command hooks. `ConfiguredHandler` is the normalized executable form of a discovered command hook, carrying event name, matcher, command string, timeout, source metadata, display order, and injected environment variables. Its `run_id` combines a stable event label, display order, and source path for protocol summaries.
+Hooks are outside commands that Codex can run at certain moments, such as before a tool is used, after a prompt is submitted, or when a session stops. This file acts like the switchboard for those hooks. Without it, the rest of the program would have to know where hooks come from, how to find the right ones for each event, how to run them, and how to clean up large hook output.
 
-`HookListEntry` is the richer listing model used for UI or inspection, including persisted key, plugin ID, enablement, managed status, current trust hash, and `HookTrustStatus`. `ClaudeHooksEngine` stores the discovered executable handlers, startup warnings, shell configuration, and a `HookOutputSpiller` used to offload large textual outputs.
+At startup, `ClaudeHooksEngine::new` either creates an empty engine if hooks are disabled, or asks the discovery code to find hook definitions from configuration and plugins. It stores the resulting handlers, any warnings found while loading them, the shell command used to execute hooks, and an output spiller. The spiller is a safety valve: if hook output is too large to keep inline, it can move that text elsewhere and replace it with a smaller reference.
 
-Construction happens through `ClaudeHooksEngine::new`. If hooks are disabled, it returns an empty engine immediately. Otherwise it eagerly touches generated schemas, runs discovery with config layers, plugin sources, and trust-bypass settings, and stores the resulting handlers and warnings. The remaining methods are thin event-specific façade methods: preview methods delegate to event modules to compute `HookRunSummary` values, while run methods delegate to event modules for execution and then selectively spill large outputs back through `HookOutputSpiller`. Session-start, pre-tool-use, post-tool-use, user-prompt-submit, and stop each post-process different output fields, while permission-request and compact events return event-module results directly.
+After startup, callers use this engine in two main ways. Preview methods answer “which hooks would run?” without actually running commands. Run methods execute the matching hooks for a specific event and return the event-specific outcome. Most of the detailed event behavior lives in the event modules; this file keeps the public shape consistent and adds shared cleanup, especially output spilling.
 
 #### Function details
 
@@ -1058,11 +1062,11 @@ Construction happens through `ClaudeHooksEngine::new`. If hooks are disabled, it
 fn run_id(&self) -> String
 ```
 
-**Purpose**: Builds a stable identifier for one configured handler execution from its event, display order, and source path. The ID is used in protocol summaries.
+**Purpose**: Builds a stable, human-readable identifier for one configured hook run. This is useful when showing summaries for hooks that are running or have completed.
 
-**Data flow**: It reads `self.event_name`, `self.display_order`, and `self.source_path`, converts the event to a label via `event_name_label()`, formats them into `"{label}:{display_order}:{source_path}"`, and returns the resulting `String`.
+**Data flow**: It reads the handler’s event name, display order, and source file path. It turns the event name into a short label, joins those pieces into one string, and returns that string as the hook run identifier.
 
-**Call relations**: This method is called by dispatcher summary builders when constructing running and completed `HookRunSummary` values.
+**Call relations**: Summary-building code calls this when it needs a compact name for a hook. It relies on `ConfiguredHandler::event_name_label` to make the event name readable before handing the final identifier back to the summary.
 
 *Call graph*: called by 2 (completed_summary, running_summary); 1 external calls (format!).
 
@@ -1073,11 +1077,11 @@ fn run_id(&self) -> String
 fn event_name_label(&self) -> &'static str
 ```
 
-**Purpose**: Maps a handler’s `HookEventName` to the kebab-case label used in run IDs. It provides a stable textual naming scheme across all supported events.
+**Purpose**: Turns the internal event name value into the short text label used in hook identifiers. It keeps labels consistent across all hook summaries.
 
-**Data flow**: It matches on `self.event_name` and returns a static string such as `pre-tool-use`, `session-start`, or `stop`.
+**Data flow**: It reads the handler’s event name. It matches that value to a fixed lowercase label such as `pre-tool-use` or `session-start`, then returns that label.
 
-**Call relations**: This private helper is used only by `ConfiguredHandler::run_id` to keep event-to-label mapping centralized.
+**Call relations**: It is used inside `ConfiguredHandler::run_id` as a helper. The rest of the system benefits indirectly because summaries get clear, predictable event names.
 
 
 ##### `ClaudeHooksEngine::new`  (lines 108–138)
@@ -1091,11 +1095,11 @@ fn new(
         plugin_hook_load_warn
 ```
 
-**Purpose**: Constructs a hook engine with discovered handlers, startup warnings, shell configuration, and output spilling support. It also supports a disabled mode that skips discovery entirely.
+**Purpose**: Creates the hook engine used by the rest of the program. It either starts with no hooks when hooks are disabled, or discovers configured hooks from configuration layers and plugins.
 
-**Data flow**: Inputs are `enabled`, `bypass_hook_trust`, an optional config stack, plugin hook sources and warnings, and a `CommandShell`. If `enabled` is false, it returns an engine with empty handlers and warnings plus a fresh `HookOutputSpiller`. Otherwise it touches generated schemas, calls `discovery::discover_handlers`, stores the discovered handlers and warnings, preserves the shell, and creates a new spiller.
+**Data flow**: It receives settings such as whether hooks are enabled, whether trust checks should be bypassed, configuration layers, plugin-provided hooks, plugin loading warnings, and the shell used to run commands. If hooks are disabled, it returns an engine with no handlers. If hooks are enabled, it loads generated schemas, discovers hook handlers and warnings, creates an output spiller, and returns a ready-to-use engine.
 
-**Call relations**: This constructor is called by higher-level startup code and many tests. It delegates discovery to `discover_handlers`, schema initialization to `schema_loader::generated_hook_schemas`, and spiller creation to `HookOutputSpiller::new`.
+**Call relations**: Startup and tests call this to build the engine before any hook event can be previewed or run. It hands discovery work to `discover_handlers`, initializes schema support through `generated_hook_schemas`, and creates the shared `HookOutputSpiller` used later by run methods.
 
 *Call graph*: calls 3 internal fn (discover_handlers, generated_hook_schemas, new); called by 18 (allow_managed_hooks_only_false_keeps_unmanaged_hooks, allow_managed_hooks_only_in_config_toml_does_not_enable_policy, allow_managed_hooks_only_keeps_managed_requirement_and_config_layer_hooks, allow_managed_hooks_only_skips_unmanaged_json_and_toml_hooks, allow_managed_hooks_only_skips_unmanaged_plugin_hooks, discovers_hooks_from_json_and_toml_in_the_same_layer, malformed_hooks_json_is_reported_as_startup_warning, plugin_hook_load_warnings_are_startup_warnings, plugin_hook_sources_expand_plugin_placeholders, plugin_hook_sources_run_with_plugin_env_and_plugin_source (+8 more)); 1 external calls (new).
 
@@ -1106,11 +1110,11 @@ fn new(
 fn warnings(&self) -> &[String]
 ```
 
-**Purpose**: Exposes the engine’s startup warnings collected during discovery and plugin loading. It provides read-only access to the stored warning list.
+**Purpose**: Returns startup warnings found while loading hook configuration. Callers use this to show users problems that did not fully stop the program.
 
-**Data flow**: It takes `&self` and returns `&[String]` referencing `self.warnings`.
+**Data flow**: It reads the engine’s stored warning list and returns it as a borrowed list. Nothing is changed.
 
-**Call relations**: This accessor is used by callers that need to surface startup diagnostics after engine construction.
+**Call relations**: Startup warning reporting calls this after the engine has been created. The warnings originally come from hook discovery done in `ClaudeHooksEngine::new`.
 
 *Call graph*: called by 1 (startup_warnings).
 
@@ -1124,11 +1128,11 @@ fn preview_session_start(
     ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Computes the run summaries for session-start hooks that would execute for a given request, without running them. It is the session-start preview façade.
+**Purpose**: Shows which session-start hooks would run for a given session-start request, without actually running any external commands.
 
-**Data flow**: It takes `&self` and a `&SessionStartRequest`, passes `&self.handlers` and the request to `crate::events::session_start::preview`, and returns the resulting `Vec<HookRunSummary>`.
+**Data flow**: It receives a session-start request and reads the engine’s configured handlers. It asks the session-start event module to match the request against those handlers and returns run summaries.
 
-**Call relations**: This method is called by external preview flows for session-start events. It delegates all selection and summary construction to the event module.
+**Call relations**: Higher-level preview code calls this when it wants a dry run for session-start hooks. This method delegates the event-specific matching to the session-start module.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_session_start).
 
@@ -1139,11 +1143,11 @@ fn preview_session_start(
 fn preview_pre_tool_use(&self, request: &PreToolUseRequest) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews which pre-tool-use hooks would run for a request. It forwards the engine’s discovered handlers into the event-specific preview logic.
+**Purpose**: Shows which hooks would run before a tool is used. It lets the caller inspect the planned hook activity without executing commands.
 
-**Data flow**: It takes `&self` and a `&PreToolUseRequest`, calls `crate::events::pre_tool_use::preview(&self.handlers, request)`, and returns the resulting summaries.
+**Data flow**: It receives a pre-tool-use request and the engine’s handler list. It passes both to the pre-tool-use event module, which returns summaries of matching hooks.
 
-**Call relations**: This is the pre-tool-use preview entrypoint used by higher-level code; it delegates entirely to the event module.
+**Call relations**: Preview callers use this before tool execution. The method is a thin bridge from the engine to the pre-tool-use event logic.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_pre_tool_use).
 
@@ -1157,11 +1161,11 @@ fn preview_permission_request(
     ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews permission-request hooks for a request without executing them. It is a thin wrapper over the event module.
+**Purpose**: Shows which permission-request hooks would run for a permission decision. This is a dry run only.
 
-**Data flow**: It takes `&self` and a `&PermissionRequestRequest`, calls `crate::events::permission_request::preview(&self.handlers, request)`, and returns the summaries.
+**Data flow**: It receives a permission-request request, reads the configured handlers, and asks the permission-request event module to produce hook run summaries.
 
-**Call relations**: This method is invoked by permission-request preview flows and delegates all logic to the corresponding event module.
+**Call relations**: Higher-level preview code calls this when permission-related hook behavior needs to be displayed. The permission-request event module does the actual matching.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_permission_request).
 
@@ -1175,11 +1179,11 @@ fn preview_post_tool_use(
     ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews post-tool-use hooks that match a request. It exposes the event module’s preview behavior through the engine façade.
+**Purpose**: Shows which hooks would run after a tool has been used. It does not execute the hook commands.
 
-**Data flow**: It takes `&self` and a `&PostToolUseRequest`, calls `crate::events::post_tool_use::preview(&self.handlers, request)`, and returns the resulting summaries.
+**Data flow**: It receives a post-tool-use request and passes it, along with the configured handlers, to the post-tool-use event module. The result is a list of summaries for hooks that would match.
 
-**Call relations**: This method is used by post-tool-use preview callers and delegates directly to the event module.
+**Call relations**: Preview callers use this after a tool-use scenario is known. This method keeps the engine API consistent while the post-tool-use module handles the details.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_post_tool_use).
 
@@ -1194,11 +1198,11 @@ async fn run_session_start(
     ) -> SessionStartOutcome
 ```
 
-**Purpose**: Executes session-start hooks and spills any large additional-context outputs after execution. It wraps event execution with output post-processing.
+**Purpose**: Runs the hooks that should fire when a session starts. It also checks any extra context returned by hooks and spills overly large text if needed.
 
-**Data flow**: It takes ownership of a `SessionStartRequest` and optional `turn_id`, extracts `session_id`, awaits `crate::events::session_start::run(&self.handlers, &self.shell, request, turn_id)`, then replaces `outcome.additional_contexts` with the result of `maybe_spill_texts(session_id, ...)` and returns the modified outcome.
+**Data flow**: It receives a session-start request and an optional turn identifier. It saves the session ID, passes the request to the session-start event runner with the shell and handlers, then post-processes the returned additional context through the output spiller. It returns the updated session-start outcome.
 
-**Call relations**: This async method is called during session-start handling. It delegates execution to the session-start event module and then delegates output-size management to `maybe_spill_texts`.
+**Call relations**: The session-start event path calls this to actually execute hooks. It delegates hook execution to the session-start module, then calls `ClaudeHooksEngine::maybe_spill_texts` so large hook-provided context does not overload later processing.
 
 *Call graph*: calls 2 internal fn (maybe_spill_texts, run); called by 1 (run_session_start).
 
@@ -1209,11 +1213,11 @@ async fn run_session_start(
 async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome
 ```
 
-**Purpose**: Executes pre-tool-use hooks and spills any large additional-context outputs. It is the runtime façade for pre-tool-use hook execution.
+**Purpose**: Runs hooks before a tool is used. These hooks can influence or add context to the tool-use flow.
 
-**Data flow**: It takes a `PreToolUseRequest`, extracts `session_id`, awaits `crate::events::pre_tool_use::run(&self.handlers, &self.shell, request)`, post-processes `outcome.additional_contexts` through `maybe_spill_texts`, and returns the updated outcome.
+**Data flow**: It receives a pre-tool-use request and keeps the session ID. It asks the pre-tool-use event module to run matching hooks using the configured shell, then sends any returned additional context through output spilling. It returns the adjusted outcome.
 
-**Call relations**: This method is invoked during pre-tool-use handling. It delegates execution to the event module and output spilling to `maybe_spill_texts`.
+**Call relations**: The tool-use flow calls this just before using a tool. The event module runs the actual hook commands, and `ClaudeHooksEngine::maybe_spill_texts` cleans up large returned text.
 
 *Call graph*: calls 2 internal fn (maybe_spill_texts, run); called by 1 (run_pre_tool_use).
 
@@ -1227,11 +1231,11 @@ async fn run_permission_request(
     ) -> PermissionRequestOutcome
 ```
 
-**Purpose**: Executes permission-request hooks without any additional output spilling step. It simply forwards the request to the event module.
+**Purpose**: Runs hooks that participate in a permission request. These hooks can help decide or report on whether an action should be allowed.
 
-**Data flow**: It takes a `PermissionRequestRequest`, awaits `crate::events::permission_request::run(&self.handlers, &self.shell, request)`, and returns the resulting `PermissionRequestOutcome` unchanged.
+**Data flow**: It receives a permission-request request. It passes the request, handler list, and shell to the permission-request event module, then returns that module’s outcome directly.
 
-**Call relations**: This async façade is used during permission-request handling and delegates entirely to the event module.
+**Call relations**: The permission flow calls this when a permission decision needs hook input. Unlike some other run methods, it does not do output spilling here because this outcome does not contain the same large context fields.
 
 *Call graph*: calls 1 internal fn (run); called by 1 (run_permission_request).
 
@@ -1245,11 +1249,11 @@ async fn run_post_tool_use(
     ) -> PostToolUseOutcome
 ```
 
-**Purpose**: Executes post-tool-use hooks and spills both additional contexts and the optional feedback message if needed. It performs the richest post-processing among the event runners in this file.
+**Purpose**: Runs hooks after a tool has completed. It also makes sure large feedback or context returned by hooks is safely spilled if needed.
 
-**Data flow**: It takes a `PostToolUseRequest`, extracts `session_id`, awaits `crate::events::post_tool_use::run(&self.handlers, &self.shell, request)`, rewrites `outcome.additional_contexts` via `maybe_spill_texts`, rewrites `outcome.feedback_message` via `maybe_spill_text`, and returns the modified outcome.
+**Data flow**: It receives a post-tool-use request and saves the session ID. It runs matching hooks through the post-tool-use event module, then processes returned additional context and optional feedback text through the output spiller. It returns the updated post-tool-use outcome.
 
-**Call relations**: This method is called during post-tool-use handling. It delegates execution to the event module and then uses both `maybe_spill_texts` and `maybe_spill_text` for output-size management.
+**Call relations**: The tool-use flow calls this after tool execution. The post-tool-use module handles command execution, while this method adds shared output cleanup through `ClaudeHooksEngine::maybe_spill_texts` and `ClaudeHooksEngine::maybe_spill_text`.
 
 *Call graph*: calls 3 internal fn (maybe_spill_text, maybe_spill_texts, run); called by 1 (run_post_tool_use).
 
@@ -1260,11 +1264,11 @@ async fn run_post_tool_use(
 fn preview_pre_compact(&self, request: &PreCompactRequest) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews pre-compact hooks for a compact request. It is a thin façade over the compact event module’s pre-preview path.
+**Purpose**: Shows which hooks would run before a compacting step. Compacting means reducing or summarizing conversation context so it fits better.
 
-**Data flow**: It takes `&self` and a `&PreCompactRequest`, calls `crate::events::compact::preview_pre(&self.handlers, request)`, and returns the summaries.
+**Data flow**: It receives a pre-compact request and reads the configured handlers. It asks the compact event module for summaries of matching pre-compact hooks and returns them.
 
-**Call relations**: This method is used by pre-compact preview flows and delegates directly to the compact event module.
+**Call relations**: Preview code for compacting calls this before any real pre-compact hooks are run. The compact module owns the matching rules.
 
 *Call graph*: calls 1 internal fn (preview_pre); called by 1 (preview_pre_compact).
 
@@ -1275,11 +1279,11 @@ fn preview_pre_compact(&self, request: &PreCompactRequest) -> Vec<HookRunSummary
 async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome
 ```
 
-**Purpose**: Executes pre-compact hooks. Unlike some other event runners, it does not perform output spilling in this layer.
+**Purpose**: Runs hooks before compacting happens. These hooks can participate in or affect the pre-compaction step.
 
-**Data flow**: It takes a `PreCompactRequest`, awaits `crate::events::compact::run_pre(&self.handlers, &self.shell, request)`, and returns the resulting `PreCompactOutcome` unchanged.
+**Data flow**: It receives a pre-compact request, passes it with the handler list and shell to the compact event module, and returns the pre-compact outcome from that module.
 
-**Call relations**: This async method is called during pre-compact handling and delegates entirely to the compact event module.
+**Call relations**: The compaction flow calls this before compacting context. This engine method delegates the actual hook execution to the compact module’s pre-compact runner.
 
 *Call graph*: calls 1 internal fn (run_pre); called by 1 (run_pre_compact).
 
@@ -1290,11 +1294,11 @@ async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome
 fn preview_post_compact(&self, request: &PostCompactRequest) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews post-compact hooks for a compact request. It forwards to the compact event module’s post-preview logic.
+**Purpose**: Shows which hooks would run after compacting finishes. It is a dry run and does not execute commands.
 
-**Data flow**: It takes `&self` and a `&PostCompactRequest`, calls `crate::events::compact::preview_post(&self.handlers, request)`, and returns the summaries.
+**Data flow**: It receives a post-compact request and the engine’s handler list. It asks the compact event module to identify matching post-compact hooks and returns their summaries.
 
-**Call relations**: This method is used by post-compact preview flows and delegates directly to the compact event module.
+**Call relations**: Compaction preview code calls this after a hypothetical compacting step. The compact module performs the event-specific matching.
 
 *Call graph*: calls 1 internal fn (preview_post); called by 1 (preview_post_compact).
 
@@ -1308,11 +1312,11 @@ async fn run_post_compact(
     ) -> StatelessHookOutcome
 ```
 
-**Purpose**: Executes post-compact hooks and returns their stateless outcome. No output spilling is applied here.
+**Purpose**: Runs hooks after compacting has completed. These are stateless hooks, meaning the returned outcome is simple and not tied to extra stored context in this method.
 
-**Data flow**: It takes a `PostCompactRequest`, awaits `crate::events::compact::run_post(&self.handlers, &self.shell, request)`, and returns the resulting `StatelessHookOutcome`.
+**Data flow**: It receives a post-compact request, sends it with the handlers and shell to the compact event module, and returns the resulting stateless hook outcome.
 
-**Call relations**: This async façade is used during post-compact handling and delegates entirely to the compact event module.
+**Call relations**: The compaction flow calls this after context has been compacted. The compact module runs the commands and produces the outcome.
 
 *Call graph*: calls 1 internal fn (run_post); called by 1 (run_post_compact).
 
@@ -1326,11 +1330,11 @@ fn preview_user_prompt_submit(
     ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews user-prompt-submit hooks for a request. It exposes the event module’s preview logic through the engine.
+**Purpose**: Shows which hooks would run when a user submits a prompt. It lets the program preview hook behavior without running external commands.
 
-**Data flow**: It takes `&self` and a `&UserPromptSubmitRequest`, calls `crate::events::user_prompt_submit::preview(&self.handlers, request)`, and returns the summaries.
+**Data flow**: It receives a user-prompt-submit request and reads the engine’s handler list. It passes both to the user-prompt-submit event module and returns hook run summaries.
 
-**Call relations**: This method is used by user-prompt-submit preview flows and delegates directly to the event module.
+**Call relations**: Prompt-submission preview code calls this before actual hook execution. The user-prompt-submit module decides which handlers match.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_user_prompt_submit).
 
@@ -1344,11 +1348,11 @@ async fn run_user_prompt_submit(
     ) -> UserPromptSubmitOutcome
 ```
 
-**Purpose**: Executes user-prompt-submit hooks and spills any large additional-context outputs. It wraps event execution with output post-processing.
+**Purpose**: Runs hooks when the user submits a prompt. It also protects the system from overly large extra context returned by those hooks.
 
-**Data flow**: It takes a `UserPromptSubmitRequest`, extracts `session_id`, awaits `crate::events::user_prompt_submit::run(&self.handlers, &self.shell, request)`, rewrites `outcome.additional_contexts` via `maybe_spill_texts`, and returns the updated outcome.
+**Data flow**: It receives a user-prompt-submit request and saves its session ID. It runs matching hooks through the user-prompt-submit event module, then sends returned additional context through the output spiller. It returns the updated outcome.
 
-**Call relations**: This async method is called during user-prompt-submit handling. It delegates execution to the event module and output spilling to `maybe_spill_texts`.
+**Call relations**: The prompt-submission flow calls this when a real user prompt arrives. The event module runs the hook commands, and `ClaudeHooksEngine::maybe_spill_texts` performs shared large-output cleanup.
 
 *Call graph*: calls 2 internal fn (maybe_spill_texts, run); called by 1 (run_user_prompt_submit).
 
@@ -1359,11 +1363,11 @@ async fn run_user_prompt_submit(
 fn preview_stop(&self, request: &StopRequest) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Previews stop hooks for a request. It is the stop-event preview façade.
+**Purpose**: Shows which hooks would run when a session or process stop event occurs. It does not run those hooks.
 
-**Data flow**: It takes `&self` and a `&StopRequest`, calls `crate::events::stop::preview(&self.handlers, request)`, and returns the resulting summaries.
+**Data flow**: It receives a stop request and the configured handlers. It asks the stop event module to produce summaries for matching hooks and returns those summaries.
 
-**Call relations**: This method is used by stop preview flows and delegates directly to the stop event module.
+**Call relations**: Stop preview code calls this before an actual stop hook run. The stop module handles the matching details.
 
 *Call graph*: calls 1 internal fn (preview); called by 1 (preview_stop).
 
@@ -1374,11 +1378,11 @@ fn preview_stop(&self, request: &StopRequest) -> Vec<HookRunSummary>
 async fn run_stop(&self, request: StopRequest) -> StopOutcome
 ```
 
-**Purpose**: Executes stop hooks and spills any continuation prompt fragments after execution. It post-processes the stop outcome’s fragment payloads.
+**Purpose**: Runs hooks for a stop event. It also checks continuation prompt fragments returned by hooks and spills large content when needed.
 
-**Data flow**: It takes a `StopRequest`, extracts `session_id`, awaits `crate::events::stop::run(&self.handlers, &self.shell, request)`, rewrites `outcome.continuation_fragments` via `maybe_spill_prompt_fragments`, and returns the modified outcome.
+**Data flow**: It receives a stop request and saves the session ID. It runs matching hooks through the stop event module, then sends any returned continuation fragments through the output spiller. It returns the updated stop outcome.
 
-**Call relations**: This async method is called during stop handling. It delegates execution to the stop event module and fragment spilling to `maybe_spill_prompt_fragments`.
+**Call relations**: The stop flow calls this when stop hooks need to execute. The stop module runs the hook commands, and `ClaudeHooksEngine::maybe_spill_prompt_fragments` applies the shared large-output safety step.
 
 *Call graph*: calls 2 internal fn (maybe_spill_prompt_fragments, run); called by 1 (run_stop).
 
@@ -1389,11 +1393,11 @@ async fn run_stop(&self, request: StopRequest) -> StopOutcome
 async fn maybe_spill_texts(&self, session_id: ThreadId, texts: Vec<String>) -> Vec<String>
 ```
 
-**Purpose**: Delegates a batch of text outputs to the output spiller, which may replace oversized inline text with spilled references. It centralizes that post-processing behind the engine.
+**Purpose**: Passes a list of hook-produced text blocks through the output spiller. This prevents very large hook text from being carried around inline when it should be stored separately.
 
-**Data flow**: It takes a `ThreadId` and `Vec<String>`, awaits `self.output_spiller.maybe_spill_texts(session_id, texts)`, and returns the possibly transformed vector.
+**Data flow**: It receives a session ID and a list of strings. It gives both to the shared output spiller, waits for the spiller to decide what to keep or replace, and returns the resulting list of strings.
 
-**Call relations**: This helper is called by several run methods after event execution whenever outcomes contain multiple text fields that may need spilling.
+**Call relations**: Several run methods call this after event-specific hook execution returns additional context. It centralizes the large-output cleanup so each event runner does not need to repeat that logic.
 
 *Call graph*: calls 1 internal fn (maybe_spill_texts); called by 4 (run_post_tool_use, run_pre_tool_use, run_session_start, run_user_prompt_submit).
 
@@ -1404,11 +1408,11 @@ async fn maybe_spill_texts(&self, session_id: ThreadId, texts: Vec<String>) -> V
 async fn maybe_spill_text(&self, session_id: ThreadId, text: Option<String>) -> Option<String>
 ```
 
-**Purpose**: Conditionally spills a single optional text output. It preserves `None` unchanged and only invokes the spiller for present text.
+**Purpose**: Applies output spilling to one optional text value. It leaves missing text alone and only processes real text.
 
-**Data flow**: It takes a `ThreadId` and `Option<String>`. If the option is `Some(text)`, it awaits `self.output_spiller.maybe_spill_text(session_id, text)` and wraps the result back in `Some`; if `None`, it returns `None` directly.
+**Data flow**: It receives a session ID and either some text or no text. If there is text, it sends it to the output spiller and wraps the result back as present text. If there is no text, it returns no text.
 
-**Call relations**: This helper is used by `run_post_tool_use` for the optional feedback message field.
+**Call relations**: `ClaudeHooksEngine::run_post_tool_use` calls this for optional feedback returned by post-tool-use hooks. It is the single-text version of the shared output spilling step.
 
 *Call graph*: calls 1 internal fn (maybe_spill_text); called by 1 (run_post_tool_use).
 
@@ -1423,24 +1427,26 @@ async fn maybe_spill_prompt_fragments(
     ) -> Vec<codex_protocol::items::HookPromptFra
 ```
 
-**Purpose**: Delegates prompt-fragment spilling to the output spiller for stop-hook continuation fragments. It handles structured prompt fragment outputs rather than plain strings.
+**Purpose**: Applies output spilling to hook-produced prompt fragments. A prompt fragment is a piece of text or prompt content that may be used later as continuation input.
 
-**Data flow**: It takes a `ThreadId` and a vector of `codex_protocol::items::HookPromptFragment`, awaits `self.output_spiller.maybe_spill_prompt_fragments(session_id, fragments)`, and returns the transformed fragment vector.
+**Data flow**: It receives a session ID and a list of hook prompt fragments. It passes them to the output spiller, which may replace large content with safer references, and returns the updated fragments.
 
-**Call relations**: This helper is called only by `run_stop` after stop-hook execution.
+**Call relations**: `ClaudeHooksEngine::run_stop` calls this after stop hooks return continuation fragments. It lets the stop flow reuse the same large-output protection used elsewhere in the engine.
 
 *Call graph*: calls 1 internal fn (maybe_spill_prompt_fragments); called by 1 (run_stop).
 
 
 ### `hooks/src/engine/discovery.rs`
 
-`domain_logic` · `startup hook discovery`
+`orchestration` · `config load / hook discovery`
 
-This file is the heart of hook discovery. `discover_handlers` gathers hook declarations from three sources: managed requirements embedded in `ConfigLayerStack::requirements()`, per-layer hook config from `hooks.json` or TOML `hooks` sections, and plugin hook bundles. It first computes persisted user/session hook state with `hook_states_from_stack`, derives a `HookDiscoveryPolicy` from requirements and the `bypass_hook_trust` flag, and then walks config layers in precedence order while deduplicating JSON hook folders. If both JSON and TOML hooks are present for one layer and both are non-empty, it emits a warning.
+Hooks are user- or admin-defined commands that run at certain moments, such as before a tool is used. This file solves the problem of collecting those hook definitions from several places without accidentally running something unsafe or unsupported. Without it, the engine would not know which hooks exist, where they came from, whether users disabled them, or whether they should be trusted enough to run.
 
-The normalization path flows through `append_hook_events` and `append_matcher_groups`. Matchers are canonicalized per event with `matcher_pattern_for_event`; invalid matchers only produce warnings for events where validation applies. Command handlers are normalized by resolving Windows overrides, rejecting async and empty commands, defaulting timeout to at least 1 second, substituting plugin environment placeholders like `${PLUGIN_ROOT}`, and computing a stable trust hash from a serialized `NormalizedHookIdentity`. Each concrete handler gets a durable positional key via `crate::hook_key`, a `HookListEntry` recording source, trust, enablement, and display order, and—if enabled and trusted or bypassed—a `ConfiguredHandler` for execution.
+The main flow starts in `discover_handlers`. It gathers saved hook state, builds a discovery policy, then looks through managed requirements, configuration layers, and plugin-provided hooks. For each source, it loads hook definitions from either `hooks.json` or the `hooks` section of `config.toml`, records warnings for bad files, and avoids reading the same JSON hook folder twice.
 
-Managed hooks are always enabled and treated as `HookTrustStatus::Managed`; unmanaged hooks consult persisted `HookStateToml` for `enabled` and `trusted_hash`. The file also contains path attribution helpers for synthetic sources such as MDM and enterprise-managed configs, including XML escaping for display-safe synthetic paths. Tests cover matcher behavior, trust bypass, malformed state tolerance, source attribution, and managed-source edge cases.
+The file then normalizes each hook into two outputs. One output is a visible `HookListEntry`, used to show the user what hooks exist and their trust status. The other is a `ConfiguredHandler`, which is only created when the hook is enabled and trusted, or when trust checks are explicitly bypassed. This is like a building lobby: everyone is logged at reception, but only people with permission get past the security door.
+
+It also marks where each hook came from, handles managed hooks differently from user hooks, chooses Windows-specific commands when needed, fills plugin environment placeholders, and skips unsupported hook types with clear warnings.
 
 #### Function details
 
@@ -1450,11 +1456,11 @@ Managed hooks are always enabled and treated as `HookTrustStatus::Managed`; unma
 fn allows(self, source: &HookHandlerSource<'_>) -> bool
 ```
 
-**Purpose**: Checks whether a discovered hook source is permitted under the current discovery policy. Its only current gate is whether unmanaged hooks should be excluded.
+**Purpose**: Decides whether a hook source is allowed under the current discovery rules. Its main rule is whether the system is restricted to managed hooks only.
 
-**Data flow**: It reads `self.allow_managed_hooks_only` and `source.is_managed`. It returns `true` for all sources unless managed-only mode is active, in which case it returns `true` only for managed sources.
+**Data flow**: It receives a policy and a hook source description. If managed-only mode is off, it lets the source through; if managed-only mode is on, it only lets the source through when the source is marked as managed. It returns a simple yes-or-no result.
 
-**Call relations**: This method is called by `append_hook_events` before any event expansion. It acts as the policy gate that suppresses unmanaged hooks when requirements demand managed-only discovery.
+**Call relations**: This is called by `append_hook_events` before any hook definitions from a source are expanded. It acts as an early gate so disallowed sources never become hook entries or runnable handlers.
 
 *Call graph*: called by 1 (append_hook_events).
 
@@ -1470,11 +1476,11 @@ fn discover_handlers(
 ) -> D
 ```
 
-**Purpose**: Builds the complete discovered hook set, including executable handlers, hook list entries, and startup warnings, from config layers and plugin sources. It is the top-level discovery pipeline used during engine construction.
+**Purpose**: Collects hooks from all known places and returns the final discovery result: runnable handlers, listable hook entries, and warnings. This is the main entry point for hook discovery.
 
-**Data flow**: Inputs are an optional `ConfigLayerStack`, plugin hook sources and their load warnings, and a `bypass_hook_trust` flag. It initializes output vectors and display-order state, computes persisted hook states, derives a `HookDiscoveryPolicy`, optionally appends managed requirement hooks, iterates config layers to load JSON and TOML hooks with warnings, appends discovered events into handlers and entries, then appends plugin hooks with plugin-specific environment variables. It returns a `DiscoveryResult` containing the final handlers, hook entries, and warnings.
+**Data flow**: It takes an optional config layer stack, plugin hook sources, existing plugin warnings, and a flag that can bypass trust checks. It reads hook state, builds a policy, loads managed hooks, config-file hooks, JSON hooks, TOML hooks, and plugin hooks, then returns a `DiscoveryResult` containing what can run, what can be displayed, and anything suspicious or invalid that was found.
 
-**Call relations**: This function is called by `ClaudeHooksEngine::new` during startup. It delegates source-specific work to `append_managed_requirement_handlers`, `load_hooks_json`, `load_toml_hooks_from_layer`, `append_hook_events`, and `append_plugin_hook_sources`, while using `hook_states_from_stack` and source-metadata helpers to drive policy and attribution.
+**Call relations**: Higher-level setup code calls this when it needs the hook engine configured. Inside, it delegates source-specific work to `append_managed_requirement_handlers`, `load_hooks_json`, `load_toml_hooks_from_layer`, `append_hook_events`, and `append_plugin_hook_sources`.
 
 *Call graph*: calls 8 internal fn (hook_states_from_stack, append_hook_events, append_managed_requirement_handlers, append_plugin_hook_sources, config_toml_source_path, hook_metadata_for_config_layer_source, load_hooks_json, load_toml_hooks_from_layer); called by 9 (new, allow_managed_hooks_only_false_keeps_unmanaged_hooks, allow_managed_hooks_only_in_config_toml_does_not_enable_policy, allow_managed_hooks_only_keeps_managed_requirement_and_config_layer_hooks, trusted_plugin_hook_stack, unknown_requirement_source_hooks_stay_managed, user_disablement_does_not_filter_managed_layer_hooks, user_disablement_filters_non_managed_hooks_but_not_managed_hooks, list_hooks); 4 external calls (new, new, new, format!).
 
@@ -1490,11 +1496,11 @@ fn append_managed_requirement_handlers(
     config_la
 ```
 
-**Purpose**: Adds hooks declared in managed requirements to the discovery outputs. It treats these hooks as managed and attributes them to the requirement source.
+**Purpose**: Adds hooks that come from managed requirements, which are rules supplied by an administrator or central policy. Managed hooks are treated as trusted policy-controlled hooks.
 
-**Data flow**: It receives mutable handler, entry, warning, and display-order accumulators plus the config stack, persisted hook states, and policy. It reads `config_layer_stack.requirements().managed_hooks`, returns early if absent, computes a source path and `HookSource`, constructs a managed `HookHandlerSource` with empty env and no plugin ID, clones the requirement hooks, and forwards them to `append_hook_events`.
+**Data flow**: It receives the growing handler list, hook entry list, warning list, display order, config stack, saved hook state, and policy. If there are managed hooks in the requirements, it finds their source path and source type, then passes their hook definitions into the normal hook-expansion path.
 
-**Call relations**: This helper is invoked only from `discover_handlers` before ordinary layer scanning. It delegates path attribution to `managed_hooks_source_path`, source attribution to `hook_source_for_requirement_source`, and actual event expansion to `append_hook_events`.
+**Call relations**: `discover_handlers` calls this before ordinary config layers are processed. It hands the actual hook parsing and entry creation to `append_hook_events` after labeling the source as managed.
 
 *Call graph*: calls 4 internal fn (requirements, append_hook_events, hook_source_for_requirement_source, managed_hooks_source_path); called by 1 (discover_handlers); 1 external calls (new).
 
@@ -1510,11 +1516,11 @@ fn append_plugin_hook_sources(
     plugin_hook_source
 ```
 
-**Purpose**: Transforms plugin hook bundles into discovered hook handlers and entries, injecting plugin-specific environment variables and stable plugin key prefixes. It is the plugin-specific branch of discovery.
+**Purpose**: Adds hooks supplied by plugins and prepares plugin-specific environment values for those hooks. This lets plugin hook commands refer to their plugin folders without hard-coding paths.
 
-**Data flow**: It takes mutable output accumulators, a vector of `PluginHookSource`, persisted hook states, and policy. For each plugin source it extracts roots, IDs, paths, and hooks; builds an env map containing `PLUGIN_ROOT`, `CLAUDE_PLUGIN_ROOT`, `PLUGIN_DATA`, and `CLAUDE_PLUGIN_DATA`; derives a plugin key source string; constructs a `HookHandlerSource` marked as `HookSource::Plugin`; and passes the hooks to `append_hook_events`.
+**Data flow**: It receives plugin hook source records and the shared discovery output lists. For each plugin, it builds environment variables such as `PLUGIN_ROOT` and `PLUGIN_DATA`, labels the source as a plugin, and sends the plugin’s hook definitions onward. The shared handler and entry lists may grow, and warnings may be added.
 
-**Call relations**: This helper is called by `discover_handlers` after config-layer discovery. It delegates plugin key-prefix formatting to `crate::declarations::plugin_hook_key_source` and relies on `append_hook_events` for matcher expansion, trust computation, and handler creation.
+**Call relations**: `discover_handlers` calls this after config-based hooks are processed. It delegates each plugin’s hook definitions to `append_hook_events`, which applies policy, trust, and normalization.
 
 *Call graph*: calls 2 internal fn (plugin_hook_key_source, append_hook_events); called by 1 (discover_handlers); 1 external calls (new).
 
@@ -1528,11 +1534,11 @@ fn managed_hooks_source_path(
 ) -> AbsolutePathBuf
 ```
 
-**Purpose**: Determines the source path to attribute to managed requirement hooks. It prefers a platform-specific managed directory when available and absolute, otherwise falls back to a synthetic or requirement-derived path.
+**Purpose**: Chooses the best path to show for managed hooks. It prefers the real managed hook directory for the current platform, but falls back to a useful policy source path when needed.
 
-**Data flow**: It reads the `ManagedHooksRequirementsToml` and optional `RequirementSource`. If `managed_dir_for_current_platform()` yields an absolute path that converts to `AbsolutePathBuf`, it returns that path; otherwise it calls `fallback_managed_hooks_source_path` and returns its result.
+**Data flow**: It receives managed hook requirements and an optional description of where those requirements came from. If the managed directory is absolute and can be normalized, it returns that path. Otherwise it returns a fallback path based on the requirement source.
 
-**Call relations**: This helper is used by `append_managed_requirement_handlers` to label managed hooks with a source path. Its branch structure preserves real filesystem attribution when possible and synthetic attribution otherwise.
+**Call relations**: `append_managed_requirement_handlers` uses this so managed hook entries have a meaningful source location. If no real directory is suitable, it relies on `fallback_managed_hooks_source_path`.
 
 *Call graph*: calls 3 internal fn (managed_dir_for_current_platform, fallback_managed_hooks_source_path, from_absolute_path); called by 1 (append_managed_requirement_handlers).
 
@@ -1545,11 +1551,11 @@ fn fallback_managed_hooks_source_path(
 ) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a synthetic or source-derived path for managed hooks when no concrete managed directory can be used. It preserves coarse provenance across several requirement-source variants.
+**Purpose**: Creates a reasonable display path for managed hooks when there is no direct hook directory to use. Some managed sources are not normal files, so this builds synthetic paths for them.
 
-**Data flow**: It matches on `Option<&RequirementSource>`. File-backed sources return their stored file path; MDM, composite, enterprise-managed, legacy-MDM, unknown, and absent sources are converted into synthetic absolute paths using formatted placeholder strings, with enterprise-managed `name` and `id` XML-escaped first. It returns an `AbsolutePathBuf`.
+**Data flow**: It receives an optional requirement source. File-backed sources return their file path; policy sources such as MDM or enterprise-managed settings become artificial but readable paths. Enterprise names and IDs are escaped before being placed into the path.
 
-**Call relations**: This helper is called by `managed_hooks_source_path` on fallback paths. It delegates placeholder path construction to `synthetic_layer_path` and escaping of enterprise display fields to `escape_xml_text`.
+**Call relations**: `managed_hooks_source_path` calls this when it cannot use a platform-specific managed hook directory. It uses `synthetic_layer_path` to create absolute paths and `escape_xml_text` to keep enterprise display values safe.
 
 *Call graph*: calls 2 internal fn (escape_xml_text, synthetic_layer_path); called by 1 (managed_hooks_source_path); 1 external calls (format!).
 
@@ -1563,11 +1569,11 @@ fn load_hooks_json(
 ) -> Option<(AbsolutePathBuf, HookEventsToml)>
 ```
 
-**Purpose**: Loads and parses a `hooks.json` file from a config folder, returning normalized hook events and recording warnings on read or parse failures. Empty hook sets are treated as absent.
+**Purpose**: Reads hook definitions from a `hooks.json` file inside a config folder. It turns file read or parse failures into warnings instead of crashing discovery.
 
-**Data flow**: It takes an optional config folder path and mutable warnings. It appends `hooks.json`, returns `None` if the file does not exist, reads the file contents as text, parses them as `HooksFile` with `serde_json::from_str`, normalizes the path to `AbsolutePathBuf`, and returns `Some((source_path, parsed.hooks))` only if the parsed hooks are non-empty. Any read, parse, or path-normalization error pushes a warning and yields `None`.
+**Data flow**: It receives an optional folder path and the warning list. If the folder or file is missing, it returns nothing. If the file exists, it reads text, parses JSON into hook data, normalizes the path, and returns the source path plus hooks only when hooks are present.
 
-**Call relations**: This loader is called by `discover_handlers` for each eligible config layer, with folder deduplication handled by the caller. It feeds successful results into `append_hook_events` alongside TOML-loaded hooks.
+**Call relations**: `discover_handlers` calls this for config layers that may have a JSON hook file. When it succeeds, the returned hook events are later passed to `append_hook_events`.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); called by 1 (discover_handlers); 3 external calls (format!, read_to_string, from_str).
 
@@ -1581,11 +1587,11 @@ fn load_toml_hooks_from_layer(
 ) -> Option<(AbsolutePathBuf, HookEventsToml)>
 ```
 
-**Purpose**: Extracts and deserializes the `hooks` section from a config layer’s TOML tree. It reports parse failures as warnings and ignores empty hook sets.
+**Purpose**: Extracts hook definitions from the `hooks` section of a config layer’s TOML data. TOML is the project’s main configuration format.
 
-**Data flow**: It takes a `ConfigLayerEntry` and mutable warnings, computes the layer’s source path, clones `layer.config["hooks"]` if present, attempts `HookEventsToml::deserialize`, and returns `Some((source_path, parsed))` only when the parsed hook events are non-empty. Deserialization failures append a warning and return `None`.
+**Data flow**: It receives one config layer and the warning list. It finds the layer’s source path, looks for a `hooks` value, tries to deserialize it into hook events, and returns those events only if they are not empty. Parse errors become warnings.
 
-**Call relations**: This helper is called by `discover_handlers` for each config layer. It uses `config_toml_source_path` for attribution and supplies successful hook sets to `append_hook_events`.
+**Call relations**: `discover_handlers` calls this while walking config layers. It uses `config_toml_source_path` for attribution, then sends successful hook events into the same path as JSON hooks.
 
 *Call graph*: calls 1 internal fn (config_toml_source_path); called by 1 (discover_handlers); 2 external calls (deserialize, format!).
 
@@ -1596,11 +1602,11 @@ fn load_toml_hooks_from_layer(
 fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf
 ```
 
-**Purpose**: Computes the path that should be shown as the source of a config layer’s TOML hooks. It collapses detailed layer metadata into a single absolute path or synthetic placeholder path.
+**Purpose**: Finds or constructs the path that should be shown for a config layer’s `config.toml`. This keeps hook warnings and list entries tied back to where the hook came from.
 
-**Data flow**: It matches on `layer.name`. File-backed system, user, and legacy-managed layers return their stored file path; project layers derive a config path from `hooks_config_folder()` or `.codex`; MDM, enterprise-managed, legacy-MDM, and session-flags layers produce synthetic absolute paths using formatted placeholders. It returns an `AbsolutePathBuf`.
+**Data flow**: It receives a config layer entry. For file-backed layers, it returns the real file path. For project layers, it builds the path under the project’s `.codex` folder or hook config folder. For virtual sources such as MDM, enterprise policy, or session flags, it returns a synthetic absolute path.
 
-**Call relations**: This helper is used both by `discover_handlers` when constructing policy metadata and by `load_toml_hooks_from_layer` for warning attribution. It delegates synthetic path creation to `synthetic_layer_path`.
+**Call relations**: `discover_handlers` and `load_toml_hooks_from_layer` call this whenever they need to label TOML-based hooks. It uses `synthetic_layer_path` for sources that do not live in a normal file.
 
 *Call graph*: calls 2 internal fn (hooks_config_folder, synthetic_layer_path); called by 2 (discover_handlers, load_toml_hooks_from_layer); 1 external calls (format!).
 
@@ -1611,11 +1617,11 @@ fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf
 fn synthetic_layer_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Creates an absolute placeholder path for non-filesystem config sources. It anchors synthetic paths against a platform-appropriate root.
+**Purpose**: Turns a made-up display path into an absolute path object. This is used for configuration sources that are real but not stored as normal files.
 
-**Data flow**: It takes a relative placeholder string and resolves it against `C:\` on Windows or `/` on non-Windows using `AbsolutePathBuf::resolve_path_against_base`. It returns the resulting absolute path buffer.
+**Data flow**: It receives a string such as `<mdm:domain:key>/config.toml`. It resolves that string against a platform-appropriate root, like `/` on Unix-like systems or `C:\` on Windows, and returns an absolute path buffer.
 
-**Call relations**: This helper is called by `config_toml_source_path` and `fallback_managed_hooks_source_path`. It centralizes the platform-specific root used for synthetic attribution paths.
+**Call relations**: `config_toml_source_path` and `fallback_managed_hooks_source_path` call this when they need a path-shaped label for virtual policy sources.
 
 *Call graph*: calls 1 internal fn (resolve_path_against_base); called by 2 (config_toml_source_path, fallback_managed_hooks_source_path).
 
@@ -1626,11 +1632,11 @@ fn synthetic_layer_path(path: &str) -> AbsolutePathBuf
 fn escape_xml_text(value: &str) -> String
 ```
 
-**Purpose**: Escapes XML-sensitive characters in display strings used inside synthetic enterprise-managed paths. This prevents raw `<`, `>`, `&`, and quote characters from appearing unescaped in those placeholders.
+**Purpose**: Escapes special characters in text before inserting it into synthetic enterprise-managed paths. This prevents names containing characters like `<` or `&` from making the path confusing or unsafe to display.
 
-**Data flow**: It takes an input `&str`, allocates a `String` with matching capacity, iterates characters, replaces XML-sensitive characters with entity strings, and copies all others unchanged. It returns the escaped string.
+**Data flow**: It receives a text value and walks through each character. Special XML-like characters are replaced with safe written-out forms such as `&lt;` and `&amp;`; all other characters are copied. It returns the escaped string.
 
-**Call relations**: This helper is only used by `fallback_managed_hooks_source_path` when formatting enterprise-managed synthetic paths. Its role is display-safe path construction rather than general serialization.
+**Call relations**: `fallback_managed_hooks_source_path` uses this for enterprise-managed policy names and IDs before building synthetic paths.
 
 *Call graph*: called by 1 (fallback_managed_hooks_source_path); 1 external calls (with_capacity).
 
@@ -1646,11 +1652,11 @@ fn append_hook_events(
     source: HookHandlerSource<
 ```
 
-**Purpose**: Expands a `HookEventsToml` bundle into matcher groups and appends any resulting handlers and hook entries, subject to discovery policy. It is the common bridge from source-specific loading to per-handler normalization.
+**Purpose**: Applies the discovery policy to one source of hook events and, if allowed, expands those events into concrete hook entries and runnable handlers.
 
-**Data flow**: It receives mutable output accumulators, a `HookHandlerSource`, a `HookEventsToml`, and a `HookDiscoveryPolicy`. If the policy disallows the source it returns immediately; otherwise it iterates `hook_events.into_matcher_groups()` and forwards each event’s matcher groups to `append_matcher_groups`.
+**Data flow**: It receives the shared output lists, source information, hook event definitions, and policy. If the source is not allowed, it returns without changing anything. Otherwise it breaks the hook events into event names and matcher groups, then passes each group onward.
 
-**Call relations**: This helper is called from `discover_handlers`, `append_managed_requirement_handlers`, and `append_plugin_hook_sources`. It delegates the detailed per-group and per-handler logic to `append_matcher_groups` after applying the coarse policy gate.
+**Call relations**: This is the common doorway used by managed requirements, config layers, and plugins. It calls `HookDiscoveryPolicy::allows` first, then delegates detailed per-hook processing to `append_matcher_groups`.
 
 *Call graph*: calls 3 internal fn (into_matcher_groups, allows, append_matcher_groups); called by 3 (append_managed_requirement_handlers, append_plugin_hook_sources, discover_handlers).
 
@@ -1666,11 +1672,11 @@ fn append_matcher_groups(
     source: &HookHandlerSou
 ```
 
-**Purpose**: Normalizes matcher groups into concrete hook list entries and executable command handlers. It performs matcher validation, command normalization, trust computation, enablement checks, and display-order assignment.
+**Purpose**: Turns grouped hook definitions into display entries and, when safe, runnable command handlers. This is where most validation, trust checking, enabling, and command normalization happens.
 
-**Data flow**: Inputs are mutable handler, entry, warning, and display-order accumulators; a `HookHandlerSource`; an event name; and a vector of `MatcherGroup`. For each group it derives an event-specific matcher pattern, validates it when applicable, then iterates cloned handlers. Command handlers are normalized by resolving Windows overrides, rejecting async or empty commands, defaulting timeout, computing a normalized trust hash, substituting `${KEY}` placeholders from `source.env`, generating a durable positional key, reading persisted state, deriving `enabled`, `trusted_hash`, and `trust_status`, and pushing a `HookListEntry`. If the hook is enabled and either trusted/managed or trust bypass is active, it also pushes a `ConfiguredHandler`. Unsupported prompt and agent handlers only emit warnings. It increments `display_order` after each command handler considered.
+**Data flow**: It receives matcher groups for one event and source. For each group, it chooses the matcher pattern, validates it when needed, then walks each hook handler. Command hooks get platform-specific command selection, timeout defaults, a stable trust hash, plugin environment substitution, enabled/trusted checks, and a display entry. If the hook is enabled and trusted, it also becomes a runnable handler. Unsupported or invalid hooks add warnings and are skipped.
 
-**Call relations**: This is the core expansion routine called by `append_hook_events` and directly by several tests. It delegates matcher canonicalization and validation to event helpers, trust hashing to `command_hook_hash`, and state interpretation to `hook_enabled`, `hook_trusted_hash`, and `hook_trust_status`.
+**Call relations**: `append_hook_events` calls this after splitting hook data by event. It uses helper functions such as `command_hook_hash`, `hook_enabled`, `hook_trusted_hash`, and `hook_trust_status` to decide what should merely be listed versus what may run.
 
 *Call graph*: calls 6 internal fn (command_hook_hash, hook_enabled, hook_trust_status, hook_trusted_hash, matcher_pattern_for_event, validate_matcher_pattern); called by 8 (append_hook_events, bypass_hook_trust_allows_enabled_untrusted_handlers, bypass_hook_trust_respects_disabled_handlers, post_tool_use_keeps_valid_matcher_during_discovery, pre_tool_use_keeps_valid_matcher_during_discovery, pre_tool_use_resolves_windows_command_override_during_discovery, pre_tool_use_treats_star_matcher_as_match_all, user_prompt_submit_ignores_invalid_matcher_during_discovery); 4 external calls (cfg!, hook_key, format!, matches!).
 
@@ -1686,11 +1692,11 @@ fn command_hook_hash(
 ) -> String
 ```
 
-**Purpose**: Computes a stable trust hash for a command hook from a normalized semantic identity rather than raw source text. Equivalent hooks from TOML and JSON therefore converge on the same trust fingerprint.
+**Purpose**: Creates a stable identity hash for a command hook so the system can tell whether the hook is the same one the user previously trusted. Equivalent hooks from JSON and TOML should produce the same trust identity.
 
-**Data flow**: It takes an event name, optional normalized matcher, the original `MatcherGroup`, and a normalized `HookHandlerConfig`. It clones the group, replaces its matcher and hooks with the normalized values, wraps that in `NormalizedHookIdentity`, converts it to `TomlValue`, and hashes/version-tags it with `version_for_toml`. It returns the resulting hash string.
+**Data flow**: It receives the event name, matcher, original matcher group, and normalized handler. It rebuilds a small normalized hook identity, converts it to TOML-shaped data, and produces a version string from that data. The returned string is used as the hook’s current hash.
 
-**Call relations**: This helper is called by `append_matcher_groups` before trust evaluation. Its output is compared against persisted trusted hashes by `hook_trust_status`.
+**Call relations**: `append_matcher_groups` calls this before checking trust. The hash it returns is compared with saved trusted hashes by `hook_trust_status`.
 
 *Call graph*: called by 1 (append_matcher_groups); 6 external calls (try_from, version_for_toml, clone, hook_event_key_label, unreachable!, vec!).
 
@@ -1705,11 +1711,11 @@ fn hook_trust_status(
 ) -> HookTrustStatus
 ```
 
-**Purpose**: Determines the trust status of a hook from its managed flag, current normalized hash, and persisted trusted hash. Managed hooks bypass hash comparison entirely.
+**Purpose**: Classifies whether a hook is managed, trusted, modified, or untrusted. This protects users from silently running changed or never-approved commands.
 
-**Data flow**: It reads `is_managed`, `current_hash`, and `trusted_hash`. Managed hooks return `HookTrustStatus::Managed`; otherwise a matching trusted hash yields `Trusted`, a non-matching trusted hash yields `Modified`, and absence of a trusted hash yields `Untrusted`.
+**Data flow**: It receives whether the hook is managed, the hook’s current hash, and an optional saved trusted hash. Managed hooks immediately become `Managed`. Unmanaged hooks are `Trusted` if the hashes match, `Modified` if a saved hash exists but differs, or `Untrusted` if no trusted hash exists.
 
-**Call relations**: This helper is called by `append_matcher_groups` when constructing each `HookListEntry` and deciding whether an unmanaged hook may execute without trust bypass.
+**Call relations**: `append_matcher_groups` calls this while deciding whether to create a runnable `ConfiguredHandler` and while filling the visible `HookListEntry`.
 
 *Call graph*: called by 1 (append_matcher_groups).
 
@@ -1720,11 +1726,11 @@ fn hook_trust_status(
 fn hook_enabled(is_managed: bool, state: Option<&HookStateToml>) -> bool
 ```
 
-**Purpose**: Computes whether a hook should be considered enabled based on managed status and persisted state. Managed hooks cannot be disabled by user state.
+**Purpose**: Decides whether a hook is enabled. Managed hooks are always enabled, while unmanaged hooks can be disabled by saved user state.
 
-**Data flow**: It takes `is_managed` and an optional `&HookStateToml`. It returns `true` for managed hooks, otherwise returns `false` only when the state explicitly contains `enabled: Some(false)`.
+**Data flow**: It receives whether the hook is managed and an optional saved hook state. If managed, it returns true. Otherwise it returns false only when the saved state explicitly says `enabled = false`; missing state or missing value means enabled.
 
-**Call relations**: This helper is called by `append_matcher_groups` for each discovered command handler. Its result is stored in `HookListEntry.enabled` and gates whether a `ConfiguredHandler` is emitted.
+**Call relations**: `append_matcher_groups` uses this before allowing a hook to run and before recording the enabled flag in the hook list.
 
 *Call graph*: called by 1 (append_matcher_groups).
 
@@ -1735,11 +1741,11 @@ fn hook_enabled(is_managed: bool, state: Option<&HookStateToml>) -> bool
 fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<&str>
 ```
 
-**Purpose**: Extracts the persisted trusted hash applicable to a hook, suppressing trust state for managed hooks. It ensures managed hooks are not evaluated against user trust records.
+**Purpose**: Fetches the saved trusted hash for an unmanaged hook. Managed hooks do not need this because policy itself is treated as trusted.
 
-**Data flow**: It takes `is_managed` and an optional `&HookStateToml`. For unmanaged hooks it returns `state.trusted_hash.as_deref()`, and for managed hooks it returns `None`.
+**Data flow**: It receives whether the hook is managed and optional saved state. For managed hooks it returns nothing. For unmanaged hooks it returns the saved trusted hash if one exists.
 
-**Call relations**: This helper is called by `append_matcher_groups` immediately before `hook_trust_status`. It isolates the rule that managed hooks ignore persisted trust hashes.
+**Call relations**: `append_matcher_groups` calls this and then passes the result to `hook_trust_status`.
 
 *Call graph*: called by 1 (append_matcher_groups).
 
@@ -1750,11 +1756,11 @@ fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<
 fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSource, bool)
 ```
 
-**Purpose**: Maps a config layer source to coarse hook provenance metadata: protocol-level `HookSource` and whether the source is managed. It intentionally discards source-specific details like file paths.
+**Purpose**: Maps a config layer’s origin to the hook source label and whether it counts as managed. This creates consistent source attribution for hook entries.
 
-**Data flow**: It matches on `&ConfigLayerSource` and returns a `(HookSource, bool)` pair for each variant, marking system, MDM, enterprise-managed, and legacy-managed variants as managed and user/project/session-flags as unmanaged.
+**Data flow**: It receives a config layer source, such as system, user, project, MDM, or enterprise-managed. It returns a pair: the public hook source category and a true-or-false managed marker.
 
-**Call relations**: This helper is called by `discover_handlers` when preparing per-layer `HookHandlerSource` values. It provides the source classification later stored in `HookListEntry` and `ConfiguredHandler`.
+**Call relations**: `discover_handlers` calls this for each config layer before loading hooks from that layer. The result is stored in `HookHandlerSource` and later copied into hook entries and runnable handlers.
 
 *Call graph*: called by 1 (discover_handlers).
 
@@ -1765,11 +1771,11 @@ fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSou
 fn hook_source_for_requirement_source(source: Option<&RequirementSource>) -> HookSource
 ```
 
-**Purpose**: Maps a managed requirement source to the protocol-level `HookSource` used for hooks originating from requirements. Composite sources inherit the first contributing source as coarse attribution.
+**Purpose**: Maps a managed requirements source to the hook source label used in discovery output. For combined requirement sources, it uses the first contributor as the best available label.
 
-**Data flow**: It matches on `Option<&RequirementSource>`, returning the corresponding `HookSource`. For `Composite`, it recursively examines `sources.first()`; unknown or absent sources map to `HookSource::Unknown`.
+**Data flow**: It receives an optional requirement source. It matches known sources such as MDM, system requirements, legacy managed config, enterprise-managed requirements, composite sources, or unknown, and returns the corresponding `HookSource` value.
 
-**Call relations**: This helper is used by `append_managed_requirement_handlers` to label requirement-derived hooks. Its recursive composite handling preserves the primary contributor when exact merged provenance cannot be represented.
+**Call relations**: `append_managed_requirement_handlers` calls this when preparing managed requirement hooks for `append_hook_events`.
 
 *Call graph*: called by 1 (append_managed_requirement_handlers).
 
@@ -1780,11 +1786,11 @@ fn hook_source_for_requirement_source(source: Option<&RequirementSource>) -> Hoo
 fn source_path() -> AbsolutePathBuf
 ```
 
-**Purpose**: Provides a reusable absolute test path for hook source attribution. It keeps test fixtures consistent across discovery tests.
+**Purpose**: Provides a reusable absolute test path for hook source files. This keeps tests short and consistent.
 
-**Data flow**: It constructs `/tmp/hooks.json` with `test_path_buf(...).abs()` and returns the resulting `AbsolutePathBuf`.
+**Data flow**: It builds `/tmp/hooks.json` as a test path and converts it into the absolute path type used by the production code. The resulting path is returned to the test.
 
-**Call relations**: This helper is used by multiple tests that need a stable source path when constructing expected handlers or hook sources.
+**Call relations**: Many tests call this before constructing a fake hook source for `append_matcher_groups`.
 
 *Call graph*: 1 external calls (test_path_buf).
 
@@ -1795,11 +1801,11 @@ fn source_path() -> AbsolutePathBuf
 fn hook_source() -> HookSource
 ```
 
-**Purpose**: Returns the canonical `HookSource::System` value used by several tests. It avoids repeating the same literal in expected values.
+**Purpose**: Provides a fixed hook source value for tests. It represents hooks coming from the system source.
 
-**Data flow**: It takes no input and returns `HookSource::System`.
+**Data flow**: It takes no input and returns `HookSource::System`. Nothing else is changed.
 
-**Call relations**: This helper is used by test fixture constructors and assertions involving managed/system hook sources.
+**Call relations**: The test helper `tests::hook_handler_source` uses this, and several assertions compare discovered handlers against this expected source.
 
 
 ##### `tests::hook_handler_source`  (lines 683–697)
@@ -1811,11 +1817,11 @@ fn hook_handler_source(
     ) -> super::HookHandlerSource<'a>
 ```
 
-**Purpose**: Builds a managed `HookHandlerSource` fixture for tests. It mirrors the production structure with a path-derived key source and empty environment.
+**Purpose**: Builds a managed test hook source description. Tests use it to exercise discovery behavior without constructing every field by hand each time.
 
-**Data flow**: It takes a path and hook-state map reference, formats the path display string into `key_source`, fills `source` from `hook_source()`, sets `is_managed` true and `bypass_hook_trust` false, and returns the constructed `HookHandlerSource`.
+**Data flow**: It receives a source path and saved hook state map. It fills in source metadata, marks the source as managed, disables trust bypass, uses no plugin environment, and returns a `HookHandlerSource`.
 
-**Call relations**: This helper is used by matcher and discovery tests that need a managed source fixture to pass into `append_matcher_groups`.
+**Call relations**: Tests pass its result into `append_matcher_groups` when they want hooks to behave like trusted managed/system hooks.
 
 *Call graph*: calls 1 internal fn (display); 2 external calls (hook_source, new).
 
@@ -1830,11 +1836,11 @@ fn unmanaged_hook_handler_source(
     ) -> super::HookHan
 ```
 
-**Purpose**: Builds an unmanaged `HookHandlerSource` fixture for tests, with configurable trust bypass. It is used to exercise user-state and trust behavior.
+**Purpose**: Builds an unmanaged test hook source description. This is used to test user-level trust and disablement behavior.
 
-**Data flow**: It takes a path, hook-state map reference, and `bypass_hook_trust` flag, derives `key_source` from the path display string, sets `source` to `HookSource::User`, marks `is_managed` false, and returns the constructed `HookHandlerSource`.
+**Data flow**: It receives a path, saved hook states, and a trust-bypass flag. It creates a `HookHandlerSource` marked as a user source, not managed, with no plugin environment, and returns it.
 
-**Call relations**: This helper is used by tests that verify trust bypass and disabled unmanaged hooks in `append_matcher_groups`.
+**Call relations**: Trust-related tests pass this helper’s output into `append_matcher_groups` to check how untrusted, trusted, disabled, and bypassed hooks behave.
 
 *Call graph*: calls 1 internal fn (display); 1 external calls (new).
 
@@ -1845,11 +1851,11 @@ fn unmanaged_hook_handler_source(
 fn composite_requirement_hook_source_uses_primary_source()
 ```
 
-**Purpose**: Verifies that composite requirement sources are attributed to their first contributing source. This protects the recursive primary-source rule in requirement-source mapping.
+**Purpose**: Checks that composite managed requirements use their first source as the public hook source label. This preserves a predictable attribution rule.
 
-**Data flow**: It constructs a `RequirementSource::Composite` with system and enterprise contributors, calls `hook_source_for_requirement_source`, and asserts that the result is `HookSource::System`.
+**Data flow**: It builds a composite requirement source with a system source first and an enterprise source second. It calls `hook_source_for_requirement_source` and asserts that the result is `HookSource::System`.
 
-**Call relations**: This test directly exercises the composite branch of `hook_source_for_requirement_source`.
+**Call relations**: This test covers the composite-source branch used by `append_managed_requirement_handlers` during managed hook discovery.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1860,11 +1866,11 @@ fn composite_requirement_hook_source_uses_primary_source()
 fn enterprise_managed_synthetic_path_escapes_display_fields()
 ```
 
-**Purpose**: Checks that enterprise-managed synthetic paths escape XML-sensitive characters in display fields. It prevents raw markup-like characters from leaking into synthetic source paths.
+**Purpose**: Checks that enterprise-managed synthetic paths escape special characters in names and IDs. This makes sure display paths remain safe and unambiguous.
 
-**Data flow**: It constructs an enterprise-managed requirement source with special characters, calls `fallback_managed_hooks_source_path`, converts the result to a display string, and asserts that escaped entities are present while raw text is absent.
+**Data flow**: It builds an enterprise-managed requirement source containing characters such as `<`, `>`, `&`, and quotes. It asks for the fallback managed hook source path and verifies that escaped text is present while raw unsafe text is not.
 
-**Call relations**: This test targets the `escape_xml_text` path indirectly through `fallback_managed_hooks_source_path`.
+**Call relations**: This test exercises `fallback_managed_hooks_source_path`, which in turn relies on `escape_xml_text` for enterprise display values.
 
 *Call graph*: 2 external calls (assert!, fallback_managed_hooks_source_path).
 
@@ -1875,11 +1881,11 @@ fn enterprise_managed_synthetic_path_escapes_display_fields()
 fn command_group(matcher: Option<&str>) -> MatcherGroup
 ```
 
-**Purpose**: Creates a one-command matcher group fixture used across matcher-related tests. It standardizes the command payload and optional matcher.
+**Purpose**: Creates a simple matcher group containing one `echo hello` command hook. Tests use it as a small standard hook fixture.
 
-**Data flow**: It takes an optional matcher string, converts it to owned form if present, constructs a `MatcherGroup` containing one `HookHandlerConfig::Command` with `echo hello`, and returns it.
+**Data flow**: It receives an optional matcher string. It builds a `MatcherGroup` with that matcher and one command hook with default timeout, no Windows override, no async behavior, and no status message.
 
-**Call relations**: This helper is used by multiple tests that call `append_matcher_groups` with minimal command-hook fixtures.
+**Call relations**: Several tests pass this fixture into `append_matcher_groups` to focus on matcher, trust, and discovery behavior rather than hook construction.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1890,11 +1896,11 @@ fn command_group(matcher: Option<&str>) -> MatcherGroup
 fn user_prompt_submit_ignores_invalid_matcher_during_discovery()
 ```
 
-**Purpose**: Verifies that `UserPromptSubmit` discovery ignores an invalid matcher rather than warning or dropping the handler. This reflects event-specific matcher semantics.
+**Purpose**: Verifies that an invalid matcher is ignored for a user-prompt-submit event when that event does not use the matcher in the same way. The hook should still be discovered.
 
-**Data flow**: It builds empty handler and warning accumulators, a managed source fixture, and a matcher group with an invalid pattern `[`, calls `append_matcher_groups`, and asserts that no warnings were produced and one handler was discovered with `matcher: None`.
+**Data flow**: It creates empty output lists, a managed hook source, and a command group with an invalid matcher string. After calling `append_matcher_groups`, it checks that there are no warnings and that one runnable handler was produced with no matcher.
 
-**Call relations**: This test directly exercises `append_matcher_groups` and the event-specific matcher normalization path via `matcher_pattern_for_event`.
+**Call relations**: This test directly exercises `append_matcher_groups` and the event-specific matcher logic it gets from `matcher_pattern_for_event`.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, hook_handler_source, source_path, new, vec!).
 
@@ -1905,11 +1911,11 @@ fn user_prompt_submit_ignores_invalid_matcher_during_discovery()
 fn pre_tool_use_keeps_valid_matcher_during_discovery()
 ```
 
-**Purpose**: Checks that a valid `PreToolUse` matcher survives discovery unchanged. It confirms that valid regex-like matchers are preserved for executable handlers.
+**Purpose**: Verifies that a valid matcher for a pre-tool-use hook is preserved. This ensures hooks can target specific tools.
 
-**Data flow**: It constructs a managed source and a command group with matcher `^Bash$`, calls `append_matcher_groups`, and asserts that one handler is produced with the same matcher and default timeout.
+**Data flow**: It creates a pre-tool-use command group with matcher `^Bash$`, runs `append_matcher_groups`, and asserts that the resulting handler keeps that matcher and the expected command fields.
 
-**Call relations**: This test drives the successful matcher-validation branch of `append_matcher_groups`.
+**Call relations**: This test confirms that `append_matcher_groups` accepts valid matcher patterns and copies them into runnable handlers.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, hook_handler_source, source_path, new, vec!).
 
@@ -1920,11 +1926,11 @@ fn pre_tool_use_keeps_valid_matcher_during_discovery()
 fn bypass_hook_trust_allows_enabled_untrusted_handlers()
 ```
 
-**Purpose**: Ensures trust bypass permits execution of enabled unmanaged hooks even when they are untrusted. It distinguishes execution gating from trust-status reporting.
+**Purpose**: Verifies that trust bypass mode allows an enabled but untrusted unmanaged hook to run. This is useful for special modes where trust checks are intentionally skipped.
 
-**Data flow**: It creates an unmanaged source fixture with `bypass_hook_trust = true` and no persisted state, calls `append_matcher_groups`, and asserts that both a handler and a hook entry are produced, with `trust_status` `Untrusted` and `enabled` true.
+**Data flow**: It creates an unmanaged hook source with trust bypass enabled and no saved trusted hash. After discovery, it checks that one handler and one hook entry exist, and that the entry still reports `Untrusted`.
 
-**Call relations**: This test exercises the execution gate inside `append_matcher_groups` where bypass overrides trust but not enablement.
+**Call relations**: This test exercises the trust gate inside `append_matcher_groups`, especially the rule that bypass affects whether a hook runs but does not rewrite its trust status.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, source_path, unmanaged_hook_handler_source, new, vec!).
 
@@ -1935,11 +1941,11 @@ fn bypass_hook_trust_allows_enabled_untrusted_handlers()
 fn bypass_hook_trust_respects_disabled_handlers()
 ```
 
-**Purpose**: Verifies that trust bypass does not override explicit user disablement. Disabled unmanaged hooks should still appear in the hook list but not execute.
+**Purpose**: Verifies that trust bypass does not override a user-disabled hook. A disabled hook should stay non-runnable even when trust checks are bypassed.
 
-**Data flow**: It builds a hook-state map containing `enabled: false` for the expected positional key, creates an unmanaged source with trust bypass enabled, calls `append_matcher_groups`, and asserts that no executable handlers are emitted while one hook entry remains with `enabled` false and `trust_status` `Untrusted`.
+**Data flow**: It creates saved hook state marking a specific unmanaged hook as disabled, then runs discovery with trust bypass enabled. It asserts that no runnable handlers are produced, while the hook entry still exists and is marked disabled and untrusted.
 
-**Call relations**: This test targets the interaction between `hook_enabled` and trust bypass inside `append_matcher_groups`.
+**Call relations**: This test covers the interaction between `hook_enabled`, trust bypass, and `append_matcher_groups`.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 7 external calls (new, assert_eq!, format!, source_path, unmanaged_hook_handler_source, from, vec!).
 
@@ -1950,11 +1956,11 @@ fn bypass_hook_trust_respects_disabled_handlers()
 fn pre_tool_use_treats_star_matcher_as_match_all()
 ```
 
-**Purpose**: Checks that the special `*` matcher is preserved as a match-all pattern for `PreToolUse`. It confirms discovery does not reject or rewrite this wildcard form.
+**Purpose**: Checks that a `*` matcher for a pre-tool-use hook is accepted as a match-all pattern. This lets a hook apply broadly to all tools.
 
-**Data flow**: It constructs a managed source and a command group with matcher `*`, calls `append_matcher_groups`, and asserts that one handler is produced whose matcher remains `Some("*")`.
+**Data flow**: It builds a command group with matcher `*`, runs `append_matcher_groups`, and asserts that one handler is produced with the matcher still set to `*`.
 
-**Call relations**: This test exercises the matcher normalization path in `append_matcher_groups` for wildcard tool matching.
+**Call relations**: This test verifies matcher validation behavior used inside `append_matcher_groups`.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, hook_handler_source, source_path, new, vec!).
 
@@ -1965,11 +1971,11 @@ fn pre_tool_use_treats_star_matcher_as_match_all()
 fn post_tool_use_keeps_valid_matcher_during_discovery()
 ```
 
-**Purpose**: Verifies that a valid `PostToolUse` matcher is retained during discovery. It mirrors the `PreToolUse` matcher-preservation behavior for another event type.
+**Purpose**: Verifies that valid matchers also work for post-tool-use hooks. This keeps targeting behavior consistent before and after tool execution.
 
-**Data flow**: It builds a managed source and a command group with matcher `Edit|Write`, calls `append_matcher_groups`, and asserts that one handler is produced with event `PostToolUse` and the same matcher.
+**Data flow**: It builds a post-tool-use command group with matcher `Edit|Write`, runs discovery, and checks that the handler has the post-tool-use event and the same matcher.
 
-**Call relations**: This test covers another successful matcher-validation branch of `append_matcher_groups`.
+**Call relations**: This test directly checks `append_matcher_groups` for another hook event type.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, hook_handler_source, source_path, new, vec!).
 
@@ -1980,11 +1986,11 @@ fn post_tool_use_keeps_valid_matcher_during_discovery()
 fn toml_hook_discovery_ignores_malformed_state_entries()
 ```
 
-**Purpose**: Confirms that malformed `hooks.state` entries inside a TOML config layer do not prevent valid hook event deserialization. Discovery should load the event hooks cleanly.
+**Purpose**: Verifies that malformed saved hook state does not prevent valid TOML hook definitions from loading. Bad state should not break hook discovery.
 
-**Data flow**: It constructs a `ConfigLayerEntry` whose config contains malformed state plus a valid `SessionStart` command hook, calls `load_toml_hooks_from_layer`, unwraps the returned hooks, and asserts that warnings are empty and the expected `HookEventsToml` was loaded.
+**Data flow**: It creates a config layer containing a malformed `hooks.state` entry plus a valid session-start hook. It calls `load_toml_hooks_from_layer` and asserts that the valid hook loads and no warning is produced for the malformed state.
 
-**Call relations**: This test directly exercises `load_toml_hooks_from_layer` and demonstrates that hook-event deserialization ignores unrelated malformed state entries.
+**Call relations**: This test exercises `load_toml_hooks_from_layer`, showing that hook definitions can be parsed even when unrelated state entries are malformed.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (new, assert_eq!, test_path_buf, config_with_malformed_state_and_session_start_hook, load_toml_hooks_from_layer).
 
@@ -1995,11 +2001,11 @@ fn toml_hook_discovery_ignores_malformed_state_entries()
 fn pre_tool_use_resolves_windows_command_override_during_discovery()
 ```
 
-**Purpose**: Checks that discovery chooses `command_windows` on Windows and the base `command` elsewhere. It validates platform-specific command normalization before execution.
+**Purpose**: Checks that command hooks choose the Windows-specific command on Windows and the normal command elsewhere. This keeps cross-platform hook configuration working.
 
-**Data flow**: It constructs a matcher group containing both `command` and `command_windows`, calls `append_matcher_groups`, and asserts that the discovered handler’s `command` matches the platform-appropriate string.
+**Data flow**: It creates a command hook with both `command` and `command_windows`, runs `append_matcher_groups`, and asserts that the resulting command matches the current operating system.
 
-**Call relations**: This test targets the `cfg!(windows)` branch inside `append_matcher_groups`.
+**Call relations**: This test covers the platform selection logic inside `append_matcher_groups`.
 
 *Call graph*: calls 1 internal fn (append_matcher_groups); 6 external calls (new, assert_eq!, hook_handler_source, source_path, new, vec!).
 
@@ -2010,11 +2016,11 @@ fn pre_tool_use_resolves_windows_command_override_during_discovery()
 fn config_with_malformed_state_and_session_start_hook() -> TomlValue
 ```
 
-**Purpose**: Builds a TOML-like fixture containing malformed hook state and one valid session-start command hook. It supports tests that verify tolerant hook-event loading.
+**Purpose**: Builds a test configuration value containing one bad hook state entry and one valid session-start hook. It is a fixture for TOML hook loading tests.
 
-**Data flow**: It creates a JSON object with `hooks.state.some_key.enabled = "not a bool"` and a valid `hooks.SessionStart` array, deserializes it into `TomlValue`, and returns the result.
+**Data flow**: It creates JSON-shaped data, including malformed `enabled` state and a valid command hook, then converts it into the TOML value type used by config layers. The constructed value is returned.
 
-**Call relations**: This helper is used by `tests::toml_hook_discovery_ignores_malformed_state_entries` to feed `load_toml_hooks_from_layer` a mixed-validity config document.
+**Call relations**: `tests::toml_hook_discovery_ignores_malformed_state_entries` calls this to feed `load_toml_hooks_from_layer`.
 
 *Call graph*: 2 external calls (from_value, json!).
 
@@ -2025,24 +2031,24 @@ fn config_with_malformed_state_and_session_start_hook() -> TomlValue
 fn hook_metadata_for_config_layer_source_discards_source_details()
 ```
 
-**Purpose**: Verifies that each `ConfigLayerSource` variant maps to the expected coarse `HookSource` and managed flag. It ensures discovery attribution ignores path/detail fields consistently.
+**Purpose**: Verifies that detailed config layer sources are mapped to the expected broad hook source categories and managed flags. This keeps public attribution simple and stable.
 
-**Data flow**: It constructs representative `ConfigLayerSource` values for all variants, calls `hook_metadata_for_config_layer_source` on each, and asserts the returned `(HookSource, bool)` pairs.
+**Data flow**: It creates examples of system, user, project, MDM, enterprise-managed, session, and legacy sources. For each one, it calls `hook_metadata_for_config_layer_source` and checks the returned source label and managed status.
 
-**Call relations**: This test directly exercises the source-classification helper used by `discover_handlers`.
+**Call relations**: This test protects the source-labeling behavior used by `discover_handlers` before it processes hooks from config layers.
 
 *Call graph*: 2 external calls (assert_eq!, test_path_buf).
 
 
 ### `hooks/src/engine/command_runner.rs`
 
-`io_transport` · `hook process execution`
+`io_transport` · `hook execution`
 
-This file is the low-level process runner for command-type hooks. `CommandRunResult` records wall-clock timestamps, elapsed duration, exit code, captured stdout/stderr, and any execution error string. The main async function, `run_command`, timestamps the start, builds a `tokio::process::Command` from the configured shell and handler, sets the working directory, pipes all standard streams, and enables `kill_on_drop` so abandoned children do not linger.
+This file is the bridge between the hook engine and the outside world. A hook is not run inside this Rust code directly; it is launched as a separate command, like asking another program to do a job and then reading its reply. Without this file, configured hooks could not actually execute, and the rest of the engine would have nothing concrete to report.
 
-Execution has three major failure points, each converted into a structured `CommandRunResult` instead of raising an exception. If spawning fails, it returns immediately with empty output and an error string. If writing the JSON payload to stdin fails, it attempts to kill the child and returns a specific `failed to write hook stdin` error. Otherwise it waits for completion under `tokio::time::timeout`, returning either captured output, a wait error, or a timeout error mentioning the configured timeout seconds. Durations are measured from `Instant` and saturated to `i64::MAX` if conversion overflows.
+The main flow starts by building the command line to run. If the user configured a specific shell program, that shell is used. Otherwise the file chooses the normal system shell: `cmd.exe` on Windows, or `$SHELL` with a `/bin/sh` fallback on Unix-like systems. The hook command is then passed to that shell, along with any environment variables from the handler.
 
-`build_command` decides whether to use an explicit shell program or a platform default shell. The default shell is `cmd.exe /C` on Windows, using `COMSPEC` when available, and `$SHELL -lc` on non-Windows, defaulting to `/bin/sh`.
+When the process starts, this file writes the provided JSON into the process standard input, which is the usual text channel a command can read from. It also captures standard output and standard error, the two text channels commands use to return normal messages and error messages. A timeout protects the system from a hook that never finishes. The result is packed into `CommandRunResult`, including start and end times, duration, exit code, captured text, and any launch, input, wait, or timeout error.
 
 #### Function details
 
@@ -2057,11 +2063,11 @@ async fn run_command(
 ) -> CommandRunResult
 ```
 
-**Purpose**: Runs one configured hook command in a child process, feeds it the JSON request on stdin, and returns a fully populated execution record. It normalizes spawn, stdin-write, wait, and timeout failures into `CommandRunResult` values.
+**Purpose**: Runs one configured hook command and returns a complete report of what happened. Someone uses this when the hook engine needs to turn a handler configuration into an actual process run, with JSON input and captured results.
 
-**Data flow**: Inputs are a `CommandShell`, a `ConfiguredHandler`, the serialized `input_json`, and a working directory path. It records start timestamps, builds a `Command`, configures cwd and piped stdio, spawns the child, optionally writes `input_json` bytes to stdin, then waits for output under a timeout derived from `handler.timeout_sec`. It returns a `CommandRunResult` containing timestamps, elapsed milliseconds, exit code and decoded stdout/stderr on success, or empty outputs plus an error string on failure.
+**Data flow**: It receives the shell settings, the configured handler, a JSON string to send to the hook, and the working directory where the command should run. It records the start time, builds the command, starts the child process, writes the JSON into its input, waits for it to finish within the handler's timeout, and reads its output streams. It returns a `CommandRunResult` containing timing, exit code if there is one, captured standard output and error, and an error message if spawning, writing, waiting, or timing out failed.
 
-**Call relations**: This async runner is called by `execute_handlers` for each selected hook. It delegates command construction to `build_command`, and its control flow branches on spawn failure, stdin write failure, successful completion, wait failure, or timeout.
+**Call relations**: This is called by `execute_handlers` when the engine is ready to run a hook handler. It asks `build_command` to prepare the process command first, then takes over the live process work: starting it, feeding it input, waiting for output, and turning the whole run into a structured result for the caller.
 
 *Call graph*: calls 1 internal fn (build_command); called by 1 (execute_handlers); 8 external calls (from_secs, now, piped, from_utf8_lossy, new, now, format!, timeout).
 
@@ -2072,11 +2078,11 @@ async fn run_command(
 fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command
 ```
 
-**Purpose**: Constructs the `tokio::process::Command` used to execute a hook command string under either an explicit shell or the platform default shell. It also injects the handler’s environment variables.
+**Purpose**: Creates the operating-system command object that will later be launched. It decides whether to use a default shell or a configured shell, adds the hook command text, and attaches the handler's environment variables.
 
-**Data flow**: It reads `shell.program`, `shell.args`, `handler.command`, and `handler.env`. If `shell.program` is empty it starts from `default_shell_command()` and appends only the command string; otherwise it creates a command for `shell.program`, appends `shell.args`, then the command string, and finally applies `handler.env` via `envs`. It returns the configured `Command` object.
+**Data flow**: It receives shell settings and a configured handler. If no shell program is configured, it asks `default_shell_command` for the platform's normal shell and adds the handler command to it. If a shell program is configured, it starts that program, adds the configured shell arguments, then adds the handler command. It returns a prepared `Command` object, but does not run it yet.
 
-**Call relations**: This helper is only called by `run_command`. It encapsulates the shell-selection branch so process execution code can focus on spawning and I/O.
+**Call relations**: `run_command` calls this before launching a hook process. `build_command` hides the command-line setup details from `run_command`, and calls `default_shell_command` only when the configuration has not named a shell explicitly.
 
 *Call graph*: calls 1 internal fn (default_shell_command); called by 1 (run_command); 1 external calls (new).
 
@@ -2087,24 +2093,24 @@ fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command
 fn default_shell_command() -> Command
 ```
 
-**Purpose**: Builds the fallback shell invocation used when no explicit shell program is configured. It chooses a conventional command interpreter and the argument needed to execute a command string.
+**Purpose**: Chooses a sensible default shell for the current operating system. This lets hook commands run even when the configuration does not name a shell program.
 
-**Data flow**: On Windows it reads `COMSPEC` or falls back to `cmd.exe`, creates a `Command`, and appends `/C`. On non-Windows it reads `SHELL` or falls back to `/bin/sh`, creates a `Command`, and appends `-lc`. It returns the prepared `Command`.
+**Data flow**: It reads an environment variable from the host machine: `COMSPEC` on Windows, or `SHELL` on non-Windows systems. If that variable is missing, it falls back to `cmd.exe` on Windows or `/bin/sh` elsewhere. It returns a command already set up with the shell flag used to execute a command string, such as `/C` on Windows or `-lc` on Unix-like systems.
 
-**Call relations**: This helper is called by `build_command` when the configured shell program is empty. Its sole role is to centralize platform-specific default shell selection.
+**Call relations**: `build_command` calls this when no custom shell program was provided. It supplies the basic shell wrapper, and `build_command` then adds the actual hook command that should be run.
 
 *Call graph*: called by 1 (build_command); 2 external calls (new, var).
 
 
 ### `hooks/src/engine/output_parser.rs`
 
-`domain_logic` · `hook stdout parsing during request handling and hook completion processing`
+`io_transport` · `hook output parsing during request handling`
 
-This file is the hook engine’s stdout interpretation layer. It defines small internal result structs such as `UniversalOutput`, `PreToolUseOutput`, `PermissionRequestOutput`, `PostToolUseOutput`, `StopOutput`, and compact/stateless variants, then provides one parser per hook event that deserializes event-specific wire schemas from `crate::schema`. The parsers all start from `parse_json`, which trims stdout, rejects empty or non-object JSON, and deserializes into the requested wire type.
+Hooks are outside commands that can influence what the system does next. They communicate by printing JSON text to standard output, which is the normal text stream a command writes back to its caller. This file is the translator between that outside JSON language and the engine’s simpler Rust structures.
 
-The important logic is not just deserialization but policy validation. `parse_pre_tool_use` supports both legacy `decision/reason` and newer hook-specific permission decisions, but rejects unsupported combinations like `permissionDecision:ask`, `allow` without `updatedInput`, `updatedInput` without `allow`, or universal fields such as `continue:false` and `suppressOutput`. `parse_permission_request` similarly rejects reserved fields like `updatedInput`, `updatedPermissions`, and `interrupt`. `parse_post_tool_use`, `parse_user_prompt_submit`, and stop parsers validate that `decision:block` includes a non-empty reason. Universal fields are normalized through `UniversalOutput::from`, preserving `continue`, `stop_reason`, `suppress_output`, and `system_message` for later event-specific handling.
+The main job is to parse each kind of hook result: session start, tool use before or after it happens, permission requests, user prompt submission, stop events, and compacting events. Each parser first checks that the output is real JSON shaped like an object. Then it converts the common fields, such as whether processing should continue, whether output should be hidden, and whether there is a system message. After that, it reads the fields that only make sense for that hook type.
 
-A key design choice is fail-open parsing: unsupported semantics become `invalid_reason` strings rather than panics, letting callers mark runs failed while preserving transcript-visible output. The embedded tests focus on reserved-field rejection for permission-request hooks.
+A lot of the file is careful rule-checking. For example, if a hook says “block this action,” it must give a non-empty reason. Some fields are recognized from the wire format but are not allowed here, so the parser records an invalid reason instead of blindly applying them. This is like a customs desk: the form may be readable, but some requests are not permitted to pass through.
 
 #### Function details
 
@@ -2114,11 +2120,11 @@ A key design choice is fail-open parsing: unsupported semantics become `invalid_
 fn parse_session_start(stdout: &str) -> Option<SessionStartOutput>
 ```
 
-**Purpose**: Parses stdout for a `SessionStart` hook into `SessionStartOutput`. It extracts universal fields plus optional `additional_context` from hook-specific output.
+**Purpose**: Reads the JSON output from a session-start hook and turns it into a session-start result. It keeps any extra context the hook wants to add.
 
-**Data flow**: Takes raw stdout text → `parse_json` deserializes it into `SessionStartCommandOutputWire` or returns `None` → passes `wire.universal` and optional `hook_specific_output.additional_context` into `session_start_output` → returns `Some(SessionStartOutput)` or `None`.
+**Data flow**: It receives raw stdout text from the hook. It asks the shared JSON parser to decode it into the session-start wire shape, then passes the common fields and optional additional context into the shared session-start builder. It returns either a filled SessionStartOutput or nothing if the text was empty, not JSON, or the wrong shape.
 
-**Call relations**: Called by higher-level completion parsing for session-start hooks after a command exits successfully and stdout appears JSON-like.
+**Call relations**: When the wider hook engine finishes running a session-start command, parse_completed calls this parser. This function relies on parse_json for safe decoding and session_start_output for the final internal shape.
 
 *Call graph*: calls 2 internal fn (parse_json, session_start_output); called by 1 (parse_completed).
 
@@ -2129,11 +2135,11 @@ fn parse_session_start(stdout: &str) -> Option<SessionStartOutput>
 fn parse_subagent_start(stdout: &str) -> Option<SessionStartOutput>
 ```
 
-**Purpose**: Parses stdout for a `SubagentStart` hook using the same shape as session-start output. It reuses the same internal constructor to keep semantics aligned.
+**Purpose**: Reads the JSON output from a subagent-start hook and turns it into the same internal shape used for session-start output. A subagent is a smaller helper agent, so its start event carries similar information.
 
-**Data flow**: Reads stdout → deserializes to `SubagentStartCommandOutputWire` via `parse_json` → extracts universal fields and optional `additional_context` → returns `SessionStartOutput` wrapped in `Some`, or `None` if parsing fails.
+**Data flow**: It takes raw stdout text, decodes it as the subagent-start wire format, extracts universal fields and optional additional context, and produces a SessionStartOutput. If decoding fails, it returns nothing.
 
-**Call relations**: Invoked by the generic completion path for subagent-start hooks; it delegates final struct assembly to `session_start_output`.
+**Call relations**: The general parse_completed flow calls this after a subagent-start hook completes. It shares the same builder as parse_session_start so both start events are interpreted consistently.
 
 *Call graph*: calls 2 internal fn (parse_json, session_start_output); called by 1 (parse_completed).
 
@@ -2147,11 +2153,11 @@ fn session_start_output(
 ) -> SessionStartOutput
 ```
 
-**Purpose**: Builds a `SessionStartOutput` from already-deserialized universal and hook-specific pieces. It is a shared constructor for session and subagent start events.
+**Purpose**: Builds the internal result object used for session-start-like events. It avoids duplicating the same conversion code for session starts and subagent starts.
 
-**Data flow**: Accepts `HookUniversalOutputWire` and optional additional-context string → converts the universal wire via `UniversalOutput::from` → returns `SessionStartOutput { universal, additional_context }`.
+**Data flow**: It receives universal wire fields plus optional extra context. It converts the universal wire fields into UniversalOutput and places both pieces into a SessionStartOutput.
 
-**Call relations**: Used only by `parse_session_start` and `parse_subagent_start` to avoid duplicating the same mapping logic.
+**Call relations**: parse_session_start and parse_subagent_start hand their decoded data to this helper. It delegates the common-field conversion to UniversalOutput::from.
 
 *Call graph*: calls 1 internal fn (from); called by 2 (parse_session_start, parse_subagent_start).
 
@@ -2162,11 +2168,11 @@ fn session_start_output(
 fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput>
 ```
 
-**Purpose**: Parses `PreToolUse` stdout and resolves whether it represents a block, an input rewrite, additional context, or an invalid unsupported response. It supports both legacy and newer permission-decision formats.
+**Purpose**: Reads output from a hook that runs before a tool is used. It decides whether the hook blocks the tool, adds context, updates the tool input, or has returned an unsupported request.
 
-**Data flow**: Deserializes stdout into `PreToolUseCommandOutputWire` → converts universal fields → inspects `hook_specific_output` to decide whether to interpret the response via hook-specific permission fields or legacy `decision/reason` → computes `invalid_reason` using universal and event-specific validators → if valid, derives `block_reason` for deny/block cases and `updated_input` only for `permissionDecision:allow` with `updatedInput` → returns `PreToolUseOutput` containing universal data, optional context, block reason, updated input, and invalid reason.
+**Data flow**: It takes raw stdout, decodes the pre-tool-use JSON, converts the common fields, then checks which decision style the hook used. If the output is valid, it may return a block reason or an updated input value. If the output asks for something unsupported, it records an invalid reason and withholds the action result.
 
-**Call relations**: Called by pre-tool-use completion handling after a hook exits with code 0. It delegates validation to `unsupported_pre_tool_use_universal`, `unsupported_pre_tool_use_hook_specific_output`, and `unsupported_pre_tool_use_legacy_decision`.
+**Call relations**: parse_completed calls this when a pre-tool-use hook finishes. It uses parse_json for decoding, UniversalOutput::from for common fields, and the pre-tool-use validation helpers to protect the engine from unsupported or incomplete decisions.
 
 *Call graph*: calls 3 internal fn (from, parse_json, unsupported_pre_tool_use_universal); called by 1 (parse_completed).
 
@@ -2177,11 +2183,11 @@ fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput>
 fn parse_permission_request(stdout: &str) -> Option<PermissionRequestOutput>
 ```
 
-**Purpose**: Parses `PermissionRequest` stdout into a normalized decision or an invalid-reason failure. It only accepts a narrow subset of the wire schema.
+**Purpose**: Reads output from a hook that decides whether a permission request should be allowed or denied. It also checks for reserved fields that this engine deliberately does not accept.
 
-**Data flow**: Deserializes stdout into `PermissionRequestCommandOutputWire` → converts universal fields → reads optional hook-specific decision → computes `invalid_reason` from unsupported universal fields or unsupported decision subfields → if valid, maps the wire decision into internal `PermissionRequestDecision` via `permission_request_decision` → returns `PermissionRequestOutput`.
+**Data flow**: It receives stdout text, decodes permission-request JSON, converts common fields, checks universal and hook-specific restrictions, and then converts a valid allow or deny decision into the internal enum. If the output contains unsupported fields, it returns the parsed common data with an invalid reason instead of a decision.
 
-**Call relations**: Used by permission-request completion parsing and directly by unit tests that verify reserved fields are rejected.
+**Call relations**: parse_completed uses this during normal hook processing, and the tests call it directly to confirm reserved fields are rejected. It depends on parse_json, UniversalOutput::from, and permission-request validation and decision conversion helpers.
 
 *Call graph*: calls 3 internal fn (from, parse_json, unsupported_permission_request_universal); called by 4 (permission_request_rejects_reserved_interrupt_field, permission_request_rejects_reserved_updated_input_field, permission_request_rejects_reserved_updated_permissions_field, parse_completed).
 
@@ -2192,11 +2198,11 @@ fn parse_permission_request(stdout: &str) -> Option<PermissionRequestOutput>
 fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput>
 ```
 
-**Purpose**: Parses `PostToolUse` stdout, validating stop/block semantics and extracting optional additional context. It distinguishes unsupported output from a valid block decision with feedback.
+**Purpose**: Reads output from a hook that runs after a tool has been used. It can report extra context or request that the result be blocked, but only with a valid non-empty reason.
 
-**Data flow**: Deserializes stdout into `PostToolUseCommandOutputWire` → converts universal fields → computes `invalid_reason` from unsupported universal or hook-specific fields → derives `should_block` from `decision == Block`, then computes `invalid_block_reason` if a block lacks a non-empty reason or if a reason appears without a decision while processing continues → extracts optional `additional_context` → returns `PostToolUseOutput` with block flag suppressed when invalid.
+**Data flow**: It takes stdout, decodes post-tool-use JSON, converts common fields, checks whether unsupported universal or hook-specific fields were used, and checks whether a block decision has a real reason. It returns a PostToolUseOutput that says whether blocking is actually allowed, what reason was given, and whether anything was invalid.
 
-**Call relations**: Called by post-tool-use completion handling; it relies on `unsupported_post_tool_use_universal`, `unsupported_post_tool_use_hook_specific_output`, and `invalid_block_message`.
+**Call relations**: parse_completed calls this after post-tool-use hooks. The function uses parse_json for decoding, UniversalOutput::from for common fields, invalid_block_message for a standard error message, and post-tool-use validation helpers before allowing a block.
 
 *Call graph*: calls 4 internal fn (from, invalid_block_message, parse_json, unsupported_post_tool_use_universal); called by 1 (parse_completed); 1 external calls (matches!).
 
@@ -2207,11 +2213,11 @@ fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput>
 fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput>
 ```
 
-**Purpose**: Parses `PreCompact` stdout into a minimal output carrying only universal fields. No event-specific validation is currently applied.
+**Purpose**: Reads output from a hook that runs before compaction. Compaction means reducing or summarizing stored conversation context.
 
-**Data flow**: Deserializes stdout into `PreCompactCommandOutputWire` → converts `wire.universal` via `UniversalOutput::from` → returns `PreCompactOutput { universal, invalid_reason: None }`.
+**Data flow**: It receives stdout, decodes it as pre-compact JSON, converts universal fields, and returns a PreCompactOutput. This parser does not currently apply extra validation beyond successful JSON decoding and common-field conversion.
 
-**Call relations**: Used by compact-event completion parsing for pre-compact hooks.
+**Call relations**: parse_pre_completed calls this during the pre-compaction flow. It uses parse_json and UniversalOutput::from.
 
 *Call graph*: calls 2 internal fn (from, parse_json); called by 1 (parse_pre_completed).
 
@@ -2222,11 +2228,11 @@ fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput>
 fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput>
 ```
 
-**Purpose**: Parses `PostCompact` stdout into a stateless output with universal fields only. It mirrors `parse_pre_compact` for the post phase.
+**Purpose**: Reads output from a hook that runs after compaction and returns a stateless hook result. Stateless here means the parser only keeps common output information and no event-specific decision.
 
-**Data flow**: Deserializes stdout into `PostCompactCommandOutputWire` → converts universal fields → returns `StatelessHookOutput { universal, invalid_reason: None }`.
+**Data flow**: It takes stdout, decodes post-compact JSON, converts the universal fields, and returns a StatelessHookOutput with no invalid reason set. If the JSON is absent or malformed, it returns nothing.
 
-**Call relations**: Used by compact-event completion parsing for post-compact hooks.
+**Call relations**: This is the post-compaction counterpart to parse_pre_compact. It uses parse_json for the wire format and UniversalOutput::from for the shared fields.
 
 *Call graph*: calls 2 internal fn (from, parse_json).
 
@@ -2237,11 +2243,11 @@ fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput>
 fn parse_user_prompt_submit(stdout: &str) -> Option<UserPromptSubmitOutput>
 ```
 
-**Purpose**: Parses `UserPromptSubmit` stdout and validates optional block decisions. It supports additional context but requires a non-empty reason when blocking.
+**Purpose**: Reads output from a hook that runs when a user submits a prompt. It can allow the prompt through, block it with a reason, or add context.
 
-**Data flow**: Deserializes stdout into `UserPromptSubmitCommandOutputWire` → computes `should_block` from `decision` → computes `invalid_block_reason` if block lacks a non-empty reason → extracts optional `additional_context` → returns `UserPromptSubmitOutput` with universal fields and a block flag only when valid.
+**Data flow**: It receives raw stdout, decodes the user-prompt-submit JSON, checks whether the hook asked to block, and verifies that a block has a non-empty reason. It returns the common fields, the block decision if valid, the reason, any invalid-block message, and optional extra context.
 
-**Call relations**: Called by generic completion parsing for user-prompt-submit hooks.
+**Call relations**: parse_completed calls this when a user prompt hook finishes. It uses parse_json, UniversalOutput::from, and invalid_block_message to apply the shared blocking rule.
 
 *Call graph*: calls 3 internal fn (from, invalid_block_message, parse_json); called by 1 (parse_completed); 1 external calls (matches!).
 
@@ -2252,11 +2258,11 @@ fn parse_user_prompt_submit(stdout: &str) -> Option<UserPromptSubmitOutput>
 fn parse_stop(stdout: &str) -> Option<StopOutput>
 ```
 
-**Purpose**: Parses `Stop` hook stdout into a normalized `StopOutput`. It delegates shared stop-event validation to `stop_output`.
+**Purpose**: Reads output from a hook that runs when the main session is stopping. It can request that stopping be blocked, but only with a clear reason.
 
-**Data flow**: Deserializes stdout into `StopCommandOutputWire` → passes universal fields, decision, reason, and event label `Stop` to `stop_output` → returns the resulting `StopOutput`.
+**Data flow**: It takes stdout, decodes stop-event JSON, and passes the universal fields, decision, reason, and event name into the shared stop builder. It returns a StopOutput or nothing if parsing fails.
 
-**Call relations**: Used by stop-event completion handling and shares logic with subagent-stop parsing.
+**Call relations**: parse_completed calls this for normal stop hooks. It shares the stop_output helper with parse_subagent_stop so both stop events follow the same validation rules.
 
 *Call graph*: calls 2 internal fn (parse_json, stop_output); called by 1 (parse_completed).
 
@@ -2267,11 +2273,11 @@ fn parse_stop(stdout: &str) -> Option<StopOutput>
 fn parse_subagent_stop(stdout: &str) -> Option<StopOutput>
 ```
 
-**Purpose**: Parses `SubagentStop` hook stdout using the same stop-event rules as `parse_stop`. The only difference is the event label used in error text.
+**Purpose**: Reads output from a hook that runs when a subagent stops. It uses the same internal stop result as the main stop event.
 
-**Data flow**: Deserializes stdout into `SubagentStopCommandOutputWire` → forwards universal fields, decision, reason, and label `SubagentStop` to `stop_output` → returns `StopOutput`.
+**Data flow**: It receives stdout, decodes the subagent-stop wire format, and sends the common fields, decision, reason, and subagent event name to the shared stop builder. The result is a StopOutput or nothing if the text cannot be parsed.
 
-**Call relations**: Called by subagent-stop completion handling and reuses the common stop parser helper.
+**Call relations**: parse_completed calls this for subagent stop hooks. It relies on parse_json for decoding and stop_output for the shared block-reason checks.
 
 *Call graph*: calls 2 internal fn (parse_json, stop_output); called by 1 (parse_completed).
 
@@ -2287,11 +2293,11 @@ fn stop_output(
 ) -> StopOutput
 ```
 
-**Purpose**: Constructs a `StopOutput` and validates that `decision:block` includes a non-empty reason. It centralizes stop-event semantics for both stop variants.
+**Purpose**: Builds a StopOutput for both main stop and subagent stop events. It enforces the rule that a block decision must include a non-empty reason.
 
-**Data flow**: Accepts universal wire fields, optional `BlockDecisionWire`, optional reason, and event name → computes `should_block` from the decision → if blocking without a trimmed reason, sets `invalid_block_reason` using `invalid_block_message` → converts universal fields and returns `StopOutput` with block flag disabled when invalid.
+**Data flow**: It receives universal wire fields, an optional block decision, an optional reason, and the event name for error wording. It converts the universal fields, checks whether blocking is valid, and returns a StopOutput with blocking enabled only if the reason passes validation.
 
-**Call relations**: Used by `parse_stop` and `parse_subagent_stop` so both events enforce identical block-reason rules.
+**Call relations**: parse_stop and parse_subagent_stop call this after decoding their JSON. It uses UniversalOutput::from for shared fields and invalid_block_message for the standard missing-reason error.
 
 *Call graph*: calls 2 internal fn (from, invalid_block_message); called by 2 (parse_stop, parse_subagent_stop); 1 external calls (matches!).
 
@@ -2302,11 +2308,11 @@ fn stop_output(
 fn from(value: HookUniversalOutputWire) -> Self
 ```
 
-**Purpose**: Maps the wire-level universal hook output fields into the engine’s internal representation. It is a straightforward field rename/normalization step.
+**Purpose**: Converts the shared hook output fields from the wire format into the internal UniversalOutput type. These are the fields that many hook events have in common.
 
-**Data flow**: Consumes `HookUniversalOutputWire` → copies `continue` into `continue_processing`, `stop_reason`, `suppress_output`, and `system_message` into a new `UniversalOutput` → returns it.
+**Data flow**: It receives HookUniversalOutputWire, copies over the continue flag, stop reason, suppress-output flag, and system message, and returns a UniversalOutput. No outside state is changed.
 
-**Call relations**: Called by nearly every event parser as the first normalization step after JSON deserialization.
+**Call relations**: Nearly every parser calls this after JSON decoding. It is the central adapter between the schema module’s wire names and the engine’s internal names.
 
 *Call graph*: called by 8 (parse_permission_request, parse_post_compact, parse_post_tool_use, parse_pre_compact, parse_pre_tool_use, parse_user_prompt_submit, session_start_output, stop_output).
 
@@ -2317,11 +2323,11 @@ fn from(value: HookUniversalOutputWire) -> Self
 fn parse_json(stdout: &str) -> Option<T>
 ```
 
-**Purpose**: Shared helper that parses stdout into a typed wire struct only when the content is non-empty JSON object text. It intentionally rejects arrays, scalars, and blank output.
+**Purpose**: Safely decodes hook stdout into a requested JSON-backed Rust type. It refuses empty text and JSON that is not an object.
 
-**Data flow**: Takes stdout string → trims whitespace; returns `None` if empty → parses into `serde_json::Value`; returns `None` on parse failure → checks `value.is_object()`; returns `None` if not → deserializes the value into generic `T` and returns `Some(T)` on success.
+**Data flow**: It trims the input text, returns nothing if it is empty, tries to parse it as JSON, checks that the top-level value is an object, and then converts it into the requested wire type. On any failure, it returns nothing instead of throwing an error.
 
-**Call relations**: This is the common entry point for all event-specific parsers, allowing callers to distinguish plain text/no output from structured hook JSON.
+**Call relations**: All event-specific parsers call this first. It uses serde_json, the project’s JSON library, to parse text and then deserialize it into the correct wire structure.
 
 *Call graph*: called by 10 (parse_permission_request, parse_post_compact, parse_post_tool_use, parse_pre_compact, parse_pre_tool_use, parse_session_start, parse_stop, parse_subagent_start, parse_subagent_stop, parse_user_prompt_submit); 2 external calls (from_str, from_value).
 
@@ -2332,11 +2338,11 @@ fn parse_json(stdout: &str) -> Option<T>
 fn looks_like_json(stdout: &str) -> bool
 ```
 
-**Purpose**: Heuristically detects whether stdout begins like JSON so callers can treat malformed JSON-like output as an error instead of a no-op. It is intentionally shallow and cheap.
+**Purpose**: Makes a quick guess about whether stdout starts like JSON. It is a lightweight check used before deeper parsing.
 
-**Data flow**: Reads stdout, trims only leading whitespace → checks whether the first non-space character is `{` or `[` → returns a boolean.
+**Data flow**: It receives stdout text, ignores leading whitespace, and returns true if the first meaningful character is `{` or `[`. It does not prove the JSON is valid; it only answers whether it appears JSON-like.
 
-**Call relations**: Used by completion parsers after `parse_json` fails, to decide whether to emit an invalid-JSON error entry.
+**Call relations**: The broader parsing flows call this before choosing JSON-style parsing paths. It complements parse_json, which performs the real decoding and validation.
 
 *Call graph*: called by 7 (parse_completed, parse_pre_completed, parse_completed, parse_completed, parse_completed, parse_completed, parse_completed).
 
@@ -2347,11 +2353,11 @@ fn looks_like_json(stdout: &str) -> bool
 fn invalid_block_message(event_name: &str) -> String
 ```
 
-**Purpose**: Formats the standard error message for block decisions that omit a non-empty reason. It keeps wording consistent across events.
+**Purpose**: Creates the standard error text for a hook that says “block” but does not give a meaningful reason. This keeps wording consistent across hook types.
 
-**Data flow**: Takes an event name string → interpolates it into `"{event_name} hook returned decision:block without a non-empty reason"` → returns the message.
+**Data flow**: It receives the event name, inserts it into a fixed sentence, and returns that sentence as a String. It changes no state.
 
-**Call relations**: Called by post-tool-use, user-prompt-submit, stop-output, and legacy pre-tool-use validation paths.
+**Call relations**: Blocking parsers and validators call this whenever they detect a missing or blank reason. It is used for post-tool-use, user-prompt-submit, stop-style events, and legacy pre-tool-use decisions.
 
 *Call graph*: called by 4 (parse_post_tool_use, parse_user_prompt_submit, stop_output, unsupported_pre_tool_use_legacy_decision); 1 external calls (format!).
 
@@ -2362,11 +2368,11 @@ fn invalid_block_message(event_name: &str) -> String
 fn unsupported_pre_tool_use_universal(universal: &UniversalOutput) -> Option<String>
 ```
 
-**Purpose**: Rejects universal output fields that `PreToolUse` does not support. This prevents hooks from using stop/suppress semantics reserved for other events.
+**Purpose**: Checks whether a pre-tool-use hook used common output fields that are not allowed for that event. It protects the engine from treating unsupported controls as valid.
 
-**Data flow**: Reads a `UniversalOutput` → if `continue_processing` is false, returns an unsupported-continue message; else if `stop_reason` is present, returns unsupported-stopReason; else if `suppress_output` is true, returns unsupported-suppressOutput; otherwise returns `None`.
+**Data flow**: It receives a UniversalOutput and examines continue_processing, stop_reason, and suppress_output. If one of those fields is not allowed in this context, it returns a clear invalid-reason message; otherwise it returns nothing.
 
-**Call relations**: Called first by `parse_pre_tool_use` before event-specific decision validation.
+**Call relations**: parse_pre_tool_use calls this before accepting any pre-tool-use decision. If it reports a problem, the parser records the invalid reason and avoids applying the requested action.
 
 *Call graph*: called by 1 (parse_pre_tool_use).
 
@@ -2377,11 +2383,11 @@ fn unsupported_pre_tool_use_universal(universal: &UniversalOutput) -> Option<Str
 fn unsupported_permission_request_universal(universal: &UniversalOutput) -> Option<String>
 ```
 
-**Purpose**: Rejects unsupported universal fields for `PermissionRequest` hooks. The event cannot stop processing or suppress output through universal controls.
+**Purpose**: Checks whether a permission-request hook used common output fields that are not supported for permission decisions. This prevents confusing global controls from changing permission behavior.
 
-**Data flow**: Inspects `UniversalOutput` in priority order: `continue_processing == false`, then `stop_reason.is_some()`, then `suppress_output` → returns the corresponding error string or `None`.
+**Data flow**: It receives a UniversalOutput and checks for continue:false, a stop reason, or suppress-output. It returns the first matching invalid-reason message, or nothing if the common fields are acceptable.
 
-**Call relations**: Used by `parse_permission_request` before checking hook-specific decision fields.
+**Call relations**: parse_permission_request calls this before converting an allow or deny decision. A reported problem stops the decision from being applied.
 
 *Call graph*: called by 1 (parse_permission_request).
 
@@ -2392,11 +2398,11 @@ fn unsupported_permission_request_universal(universal: &UniversalOutput) -> Opti
 fn unsupported_post_tool_use_universal(universal: &UniversalOutput) -> Option<String>
 ```
 
-**Purpose**: Rejects the one universal field currently unsupported for `PostToolUse`: `suppressOutput`. Other universal fields remain meaningful for this event.
+**Purpose**: Checks the common fields for post-tool-use output and rejects suppress-output, which is not supported for that event.
 
-**Data flow**: Checks `universal.suppress_output` → returns an unsupported-suppressOutput message if true, else `None`.
+**Data flow**: It receives a UniversalOutput. If suppress_output is true, it returns an invalid-reason message; otherwise it returns nothing.
 
-**Call relations**: Called by `parse_post_tool_use` as part of invalid-reason computation.
+**Call relations**: parse_post_tool_use calls this as part of deciding whether the hook’s output can be trusted and applied.
 
 *Call graph*: called by 1 (parse_post_tool_use).
 
@@ -2409,11 +2415,11 @@ fn unsupported_permission_request_hook_specific_output(
 ) -> Option<String>
 ```
 
-**Purpose**: Rejects reserved decision subfields that permission-request hooks are not allowed to use. This keeps the event limited to allow/deny behavior.
+**Purpose**: Checks permission-request decision details for fields that are reserved or unsupported. These fields may exist in the broader schema, but this engine does not allow them here.
 
-**Data flow**: Takes an optional borrowed `PermissionRequestDecisionWire` → returns `None` if absent → otherwise checks `updated_input`, `updated_permissions`, and `interrupt` in order and returns the first corresponding unsupported-field message, or `None` if none are set.
+**Data flow**: It receives an optional permission decision. If there is no decision, it returns nothing. If the decision includes updated input, updated permissions, or interrupt:true, it returns the matching invalid-reason message; otherwise it returns nothing.
 
-**Call relations**: Used internally by `parse_permission_request` when hook-specific output is present.
+**Call relations**: The permission-request parser uses this after checking common fields. Its result helps decide whether a parsed permission decision should be accepted or replaced by an invalid reason.
 
 
 ##### `permission_request_decision`  (lines 409–422)
@@ -2424,11 +2430,11 @@ fn permission_request_decision(
 ) -> PermissionRequestDecision
 ```
 
-**Purpose**: Converts a valid wire-level permission decision into the internal enum used by event execution code. Deny decisions get a normalized fallback message when none is supplied.
+**Purpose**: Converts a valid permission-request wire decision into the engine’s simpler allow-or-deny decision. It also supplies a default denial message when the hook does not provide one.
 
-**Data flow**: Reads `decision.behavior` → returns `PermissionRequestDecision::Allow` for `Allow`; for `Deny`, trims `decision.message` via `trimmed_reason` and uses it if present, otherwise falls back to `PermissionRequest hook denied approval` → returns the internal decision.
+**Data flow**: It receives a wire decision. For allow, it returns PermissionRequestDecision::Allow. For deny, it trims the optional message and uses it if non-empty, otherwise it returns a deny decision with a standard fallback message.
 
-**Call relations**: Called by `parse_permission_request` only after unsupported-field validation passes.
+**Call relations**: parse_permission_request uses this only after validation has passed. It relies on trimmed_reason to avoid treating whitespace as a real denial message.
 
 
 ##### `unsupported_post_tool_use_hook_specific_output`  (lines 424–432)
@@ -2439,11 +2445,11 @@ fn unsupported_post_tool_use_hook_specific_output(
 ) -> Option<String>
 ```
 
-**Purpose**: Rejects unsupported hook-specific fields for `PostToolUse`, currently `updatedMCPToolOutput`. The event may annotate or block, but not rewrite tool output.
+**Purpose**: Checks post-tool-use-specific output for an unsupported tool-output replacement field. This makes sure the hook cannot silently change a tool result through a field the engine does not implement.
 
-**Data flow**: Inspects `PostToolUseHookSpecificOutputWire` → if `updated_mcp_tool_output` is present, returns an unsupported-field message; otherwise returns `None`.
+**Data flow**: It receives the post-tool-use hook-specific output. If updated_mcp_tool_output is present, it returns an invalid-reason message; otherwise it returns nothing.
 
-**Call relations**: Used by `parse_post_tool_use` as part of invalid-reason detection.
+**Call relations**: parse_post_tool_use uses this during validation of hook-specific fields before deciding whether any block decision should count.
 
 
 ##### `unsupported_pre_tool_use_hook_specific_output`  (lines 434–475)
@@ -2454,11 +2460,11 @@ fn unsupported_pre_tool_use_hook_specific_output(
 ) -> Option<String>
 ```
 
-**Purpose**: Validates the newer hook-specific `PreToolUse` permission-decision format and rejects unsupported or inconsistent combinations. It encodes the event’s rewrite/block contract in one place.
+**Purpose**: Validates the newer pre-tool-use hook-specific decision fields. It checks that input updates, allow, ask, and deny decisions follow the rules this engine supports.
 
-**Data flow**: Reads `PreToolUseHookSpecificOutputWire` → first rejects `updated_input` unless `permission_decision` is `Allow` → then matches on `permission_decision`: `Allow` requires `updated_input`; `Ask` is always unsupported; `Deny` requires a non-empty trimmed `permission_decision_reason`; `None` rejects a stray `permission_decision_reason` but otherwise allows absence → returns an explanatory `Option<String>`.
+**Data flow**: It receives pre-tool-use hook-specific output. It rejects updated input unless the decision is allow, rejects allow without an updated input, rejects ask entirely, requires deny to include a non-empty reason, and rejects a reason without a decision. It returns a specific invalid-reason message or nothing if the output is acceptable.
 
-**Call relations**: Called by `parse_pre_tool_use` when hook-specific decision fields are in play; it uses `invalid_pre_tool_use_reason_message` for the deny-without-reason case.
+**Call relations**: parse_pre_tool_use uses this when the hook used the hook-specific decision format. It calls invalid_pre_tool_use_reason_message for the special deny-without-reason case and uses the shared trimming rule to judge whether a reason is meaningful.
 
 *Call graph*: calls 1 internal fn (invalid_pre_tool_use_reason_message); 1 external calls (matches!).
 
@@ -2472,11 +2478,11 @@ fn unsupported_pre_tool_use_legacy_decision(
 ) -> Option<String>
 ```
 
-**Purpose**: Validates the deprecated legacy `decision/reason` format for `PreToolUse`. Only `block` with a non-empty reason is accepted; `approve` and stray reasons are rejected.
+**Purpose**: Validates the older pre-tool-use decision fields. This lets the parser support old-style output while still enforcing today’s rules.
 
-**Data flow**: Takes optional `PreToolUseDecisionWire` and optional reason string → returns unsupported-approve for `Approve`; for `Block`, requires `trimmed_reason(reason)` and otherwise returns `invalid_block_message("PreToolUse")`; for `None`, rejects `reason` without decision and otherwise returns `None`.
+**Data flow**: It receives an optional old-style decision and optional reason. It rejects approve as unsupported, accepts block only if the reason is non-empty, and rejects a reason that appears without any decision. It returns an invalid-reason message or nothing.
 
-**Call relations**: Used by `parse_pre_tool_use` when no hook-specific permission decision fields are present.
+**Call relations**: parse_pre_tool_use uses this when no newer hook-specific decision fields are present. It calls invalid_block_message for the standard block-without-reason wording.
 
 *Call graph*: calls 1 internal fn (invalid_block_message).
 
@@ -2487,11 +2493,11 @@ fn unsupported_pre_tool_use_legacy_decision(
 fn invalid_pre_tool_use_reason_message() -> String
 ```
 
-**Purpose**: Provides the canonical error text for `permissionDecision:deny` without a non-empty `permissionDecisionReason`. It keeps this specific validation message centralized.
+**Purpose**: Creates the standard error text for a pre-tool-use deny decision that lacks a meaningful deny reason.
 
-**Data flow**: Returns a fixed `String` literal describing the missing deny reason requirement.
+**Data flow**: It takes no input and returns a fixed String explaining that permissionDecision:deny needs a non-empty permissionDecisionReason.
 
-**Call relations**: Called only from `unsupported_pre_tool_use_hook_specific_output`.
+**Call relations**: unsupported_pre_tool_use_hook_specific_output calls this for the deny-without-reason case so that message stays consistent.
 
 *Call graph*: called by 1 (unsupported_pre_tool_use_hook_specific_output).
 
@@ -2502,11 +2508,11 @@ fn invalid_pre_tool_use_reason_message() -> String
 fn trimmed_reason(reason: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes optional human-readable reason strings by trimming whitespace and discarding empty results. It prevents blank strings from counting as valid reasons.
+**Purpose**: Turns a reason string into a clean optional message. Blank or whitespace-only text is treated as no reason at all.
 
-**Data flow**: Takes `&str` → trims leading/trailing whitespace → returns `None` if the trimmed string is empty, otherwise returns `Some(trimmed.to_string())`.
+**Data flow**: It receives a string slice, trims whitespace from both ends, and returns the trimmed text if anything remains. If the result is empty, it returns nothing.
 
-**Call relations**: Used throughout decision validation and message normalization for pre-tool-use and permission-request parsing.
+**Call relations**: Decision conversion and validation helpers use this whenever a human-readable reason is required. It is the small shared rule that prevents spaces from counting as an explanation.
 
 
 ##### `tests::permission_request_rejects_reserved_updated_input_field`  (lines 524–544)
@@ -2515,11 +2521,11 @@ fn trimmed_reason(reason: &str) -> Option<String>
 fn permission_request_rejects_reserved_updated_input_field()
 ```
 
-**Purpose**: Tests that a permission-request hook output containing `decision.updatedInput` is parsed but marked invalid. This protects a reserved field from being silently accepted.
+**Purpose**: Tests that permission-request output is marked invalid when it tries to use the reserved updatedInput field.
 
-**Data flow**: Builds JSON stdout with `updatedInput` using `json!` → calls `parse_permission_request` → asserts the returned `invalid_reason` equals the expected unsupported-field message.
+**Data flow**: It builds a sample JSON permission-request response with behavior allow and updatedInput present. It parses that response and checks that the returned invalid_reason is the expected unsupported-updatedInput message.
 
-**Call relations**: Directly exercises `parse_permission_request`’s hook-specific validation branch.
+**Call relations**: This test calls parse_permission_request directly. It proves the permission-request validation path catches one reserved field before any allow decision is applied.
 
 *Call graph*: calls 1 internal fn (parse_permission_request); 2 external calls (assert_eq!, json!).
 
@@ -2530,11 +2536,11 @@ fn permission_request_rejects_reserved_updated_input_field()
 fn permission_request_rejects_reserved_updated_permissions_field()
 ```
 
-**Purpose**: Tests that `decision.updatedPermissions` is rejected for permission-request hooks. The parser must surface a specific invalid-reason string.
+**Purpose**: Tests that permission-request output is marked invalid when it tries to use the reserved updatedPermissions field.
 
-**Data flow**: Constructs JSON stdout containing `updatedPermissions` → parses it → asserts `invalid_reason` matches the unsupported updated-permissions message.
+**Data flow**: It creates sample JSON with an allow decision and updatedPermissions present. After parsing, it compares the parser’s invalid_reason with the expected unsupported-updatedPermissions message.
 
-**Call relations**: Covers another reserved-field branch inside `unsupported_permission_request_hook_specific_output` via `parse_permission_request`.
+**Call relations**: This test exercises parse_permission_request’s hook-specific validation. It guards against future changes accidentally allowing permission updates through this parser.
 
 *Call graph*: calls 1 internal fn (parse_permission_request); 2 external calls (assert_eq!, json!).
 
@@ -2545,24 +2551,24 @@ fn permission_request_rejects_reserved_updated_permissions_field()
 fn permission_request_rejects_reserved_interrupt_field()
 ```
 
-**Purpose**: Tests that `decision.interrupt: true` is rejected for permission-request hooks. This ensures unsupported control-flow semantics are not accepted.
+**Purpose**: Tests that permission-request output is marked invalid when it sets interrupt:true. The field is recognized but not supported for this event.
 
-**Data flow**: Creates JSON stdout with `interrupt: true` → calls `parse_permission_request` → asserts the parser returns the expected invalid-reason string.
+**Data flow**: It builds sample JSON containing an allow decision with interrupt set to true. It parses the JSON and asserts that the invalid_reason reports unsupported interrupt:true.
 
-**Call relations**: Exercises the final reserved-field validation branch in permission-request parsing.
+**Call relations**: This test calls parse_permission_request and checks the reserved-field rejection path. It helps ensure the engine does not start honoring interrupt behavior by accident.
 
 *Call graph*: calls 1 internal fn (parse_permission_request); 2 external calls (assert_eq!, json!).
 
 
 ### `hooks/src/output_spill.rs`
 
-`util` · `post-hook output processing`
+`io_transport` · `hook execution output preparation`
 
-This file encapsulates the policy for limiting hook-generated text that is surfaced back to the model. `HookOutputSpiller` stores a base output directory under the OS temp directory, specifically `<temp>/hook_outputs`. The token budget is fixed by `HOOK_OUTPUT_TOKEN_LIMIT` at 2,500 tokens.
+Hooks can produce a lot of text. Sending all of that text back into the model can waste the model’s limited reading space, called a token budget. This file acts like an overflow shelf: short hook output is passed through unchanged, but very long output is stored on disk and only a compact preview is shown.
 
-`HookOutputSpiller::maybe_spill_text` is the core routine. It first estimates token count with `approx_token_count`; if the text is already within budget, it returns the original string unchanged. Otherwise it computes a unique spill path under `<output_dir>/<thread_id>/<uuid>.txt` using `hook_output_path`. It then attempts to create the parent directory and write the full text asynchronously with `tokio::fs`. Any filesystem failure is logged with `tracing::warn!`, and the function falls back to an inline truncated preview using `formatted_truncate_text` with a token-based truncation policy.
+The main type is HookOutputSpiller. When it is created, it chooses a folder inside the operating system’s temporary directory, under hook_outputs. When asked to process hook text, it first estimates how many tokens the text would use. If the text fits under the limit, nothing special happens. If it is too large, the file builds a unique path for that thread, creates the needed folder, and writes the full text there. The returned text becomes a truncated head-and-tail style preview, followed by a note saying where the full hook output was saved.
 
-When spilling succeeds, the visible replacement is generated by `spilled_hook_output_preview`. A footer containing the recovery path is budgeted before truncation, so the preview plus footer still fits within the same token limit. The helper methods `maybe_spill_texts` and `maybe_spill_prompt_fragments` apply the same policy across vectors of raw strings or `HookPromptFragment`s, preserving fragment `hook_run_id`s while rewriting only the text. The design intentionally favors graceful degradation: callers always receive usable text even if the spill directory cannot be created or written.
+If saving fails, the code does not stop the whole hook flow. It logs a warning and falls back to returning only a truncated preview. This means the model still gets something useful, even if the full text could not be preserved.
 
 #### Function details
 
@@ -2572,11 +2578,11 @@ When spilling succeeds, the visible replacement is generated by `spilled_hook_ou
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a spiller rooted at the process temp directory under a fixed `hook_outputs` subdirectory.
+**Purpose**: Creates a HookOutputSpiller ready to save large hook outputs. It chooses a stable temporary folder where spilled hook text will be written.
 
-**Data flow**: Calls `std::env::temp_dir()` to get the OS temp path, resolves it against `/` into an `AbsolutePathBuf`, joins `HOOK_OUTPUTS_DIR`, and returns `HookOutputSpiller { output_dir }`.
+**Data flow**: It reads the operating system’s temporary directory, turns it into an absolute path, appends the hook_outputs folder name, and stores that as the spiller’s output directory. The result is a new HookOutputSpiller value.
 
-**Call relations**: Used by higher-level hook execution code when a default spill location is needed.
+**Call relations**: This is the setup step for the spiller. Later, when hook output needs to be checked, the other methods use the directory chosen here as the base place for saved full outputs.
 
 *Call graph*: calls 1 internal fn (resolve_path_against_base); called by 1 (new); 1 external calls (temp_dir).
 
@@ -2587,11 +2593,11 @@ fn new() -> Self
 async fn maybe_spill_text(&self, thread_id: ThreadId, text: String) -> String
 ```
 
-**Purpose**: Returns hook text inline when small enough, or writes the full text to disk and returns a truncated preview plus recovery path when it exceeds the token budget.
+**Purpose**: Checks one piece of hook text and either returns it unchanged or saves the full version to disk and returns a shorter replacement. This protects the model-visible hook output budget without throwing away the full text.
 
-**Data flow**: Consumes `thread_id` and an owned `text`. It estimates token count; if within `HOOK_OUTPUT_TOKEN_LIMIT`, it returns `text` unchanged. Otherwise it computes a unique file path with `hook_output_path`, attempts `fs::create_dir_all` on the parent directory, and on failure logs a warning and returns `formatted_truncate_text(text, Tokens(limit))`. If directory creation succeeds, it attempts `fs::write` of the full text; write failure follows the same warning-plus-inline-truncation fallback. On success it returns `spilled_hook_output_preview(&text, &path)`.
+**Data flow**: It takes a thread id and a text string. First it estimates the text size in tokens. If the text is small enough, it returns the original string. If it is too large, it builds a unique file path, creates the parent folder, and writes the full text there. On success, it returns a truncated preview with the saved file path added. If directory creation or writing fails, it logs a warning and returns only a truncated preview.
 
-**Call relations**: This is the core primitive called by the batch helpers `maybe_spill_texts` and `maybe_spill_prompt_fragments`.
+**Call relations**: This is the central worker in the file. The batch methods call it once per plain text item or prompt fragment. It relies on hook_output_path to choose a safe unique filename, and on spilled_hook_output_preview to build the final model-visible replacement after the full output has been saved.
 
 *Call graph*: calls 2 internal fn (hook_output_path, spilled_hook_output_preview); called by 3 (maybe_spill_text, maybe_spill_prompt_fragments, maybe_spill_texts); 6 external calls (approx_token_count, formatted_truncate_text, create_dir_all, write, Tokens, warn!).
 
@@ -2606,11 +2612,11 @@ async fn maybe_spill_texts(
     ) -> Vec<String>
 ```
 
-**Purpose**: Applies spill-or-inline logic to a batch of plain hook-output strings.
+**Purpose**: Applies the single-text spilling behavior to a list of hook output strings. It is useful when several hook outputs need the same size protection.
 
-**Data flow**: Accepts a `thread_id` and `Vec<String>`, preallocates an output vector with matching capacity, iterates through each text, awaits `maybe_spill_text(thread_id, text)`, pushes the result, and returns the transformed vector.
+**Data flow**: It takes a thread id and a list of strings. It creates a new list of the same expected size, sends each string through maybe_spill_text, and collects the returned strings. The output is a new list where each item is either unchanged or replaced by a preview plus saved-file note.
 
-**Call relations**: Used when callers need to process multiple context strings with the same spill policy.
+**Call relations**: This is a convenience wrapper around maybe_spill_text. Instead of making callers write the loop themselves, it performs the same spill check for every text item in order.
 
 *Call graph*: calls 1 internal fn (maybe_spill_text); called by 1 (maybe_spill_texts); 1 external calls (with_capacity).
 
@@ -2625,11 +2631,11 @@ async fn maybe_spill_prompt_fragments(
     ) -> Vec<HookPromptFragment>
 ```
 
-**Purpose**: Applies spill-or-inline logic to prompt fragments while preserving their originating hook run ids.
+**Purpose**: Applies hook-output spilling to prompt fragments while preserving each fragment’s hook run identity. A prompt fragment is a piece of text plus metadata saying which hook run produced it.
 
-**Data flow**: Accepts a `thread_id` and `Vec<HookPromptFragment>`, preallocates an output vector, iterates through fragments, rewrites each fragment's `text` by awaiting `maybe_spill_text(thread_id, fragment.text)`, keeps `hook_run_id` unchanged, and returns the rebuilt fragment vector.
+**Data flow**: It takes a thread id and a list of HookPromptFragment values. For each fragment, it sends only the fragment text through maybe_spill_text, then builds a new fragment with the possibly shortened text and the original hook_run_id unchanged. The result is a new list of prompt fragments safe to show within the output budget.
 
-**Call relations**: Used when blocked-stop continuation prompts need the same token-budget enforcement as ordinary hook text.
+**Call relations**: This method adapts the core maybe_spill_text behavior for structured prompt data. It is used when the caller has hook prompt fragments rather than plain strings, and it keeps the metadata attached while changing only the visible text when needed.
 
 *Call graph*: calls 1 internal fn (maybe_spill_text); called by 1 (maybe_spill_prompt_fragments); 1 external calls (with_capacity).
 
@@ -2640,11 +2646,11 @@ async fn maybe_spill_prompt_fragments(
 fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a unique spill-file path for one oversized hook output under the thread-specific directory.
+**Purpose**: Builds the file path where one oversized hook output should be saved. It keeps outputs grouped by thread and gives each saved file a unique name.
 
-**Data flow**: Takes the base `output_dir` and a `ThreadId`, converts the thread id to string, appends it as a directory, appends a randomly generated `Uuid::new_v4()` filename with `.txt`, and returns the resulting `AbsolutePathBuf`.
+**Data flow**: It receives the base output directory and a thread id. It appends the thread id as a folder name, then appends a newly generated unique .txt filename. The result is an absolute path for one saved hook output file.
 
-**Call relations**: Called only by `HookOutputSpiller::maybe_spill_text` when a spill is required.
+**Call relations**: maybe_spill_text calls this when it has decided the text is too large. The returned path is then used both for writing the full output and for telling the user or model where that full output can be found.
 
 *Call graph*: calls 1 internal fn (join); called by 1 (maybe_spill_text); 2 external calls (format!, to_string).
 
@@ -2655,24 +2661,26 @@ fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> Absolu
 fn spilled_hook_output_preview(text: &str, path: &AbsolutePathBuf) -> String
 ```
 
-**Purpose**: Creates the model-visible replacement text for a spilled output, ensuring the preview plus footer still fits the token budget.
+**Purpose**: Builds the replacement text shown after a hook output has been spilled to disk. It includes a shortened preview and a clear note pointing to the full saved file.
 
-**Data flow**: Accepts the original `text` and spill `path`, formats a footer `"\n\nFull hook output saved to: ..."`, estimates the footer token cost with `approx_token_count`, subtracts that from `HOOK_OUTPUT_TOKEN_LIMIT` using `saturating_sub`, truncates the original text with `formatted_truncate_text` under the reduced token budget, and concatenates the footer. Returns the final preview string.
+**Data flow**: It takes the original long text and the file path where the full text was saved. It first creates the footer containing that path, estimates how much of the token budget the footer uses, and subtracts that from the preview budget. It then truncates the original text to fit the remaining budget and appends the footer. The result is a single string that stays within the intended limit while still showing where to recover the full output.
 
-**Call relations**: Used by `HookOutputSpiller::maybe_spill_text` only after the full output has been successfully written to disk.
+**Call relations**: maybe_spill_text calls this after successfully writing the full text to disk. This function is the final packaging step: it turns the saved output path and the long original text into the compact message that will be visible to the model.
 
 *Call graph*: called by 1 (maybe_spill_text); 3 external calls (approx_token_count, format!, Tokens).
 
 
 ### `hooks/src/engine/dispatcher.rs`
 
-`orchestration` · `per-event handler selection and execution`
+`orchestration` · `hook dispatch during event handling`
 
-This file sits between discovered hook configuration and event-specific parsing logic. `select_handlers` and `select_handlers_for_matcher_inputs` filter a slice of `ConfiguredHandler` by `HookEventName` and matcher semantics. For tool-like and compact/session events, handlers are kept only if their matcher matches at least one provided input; if no matcher inputs are supplied, matching is evaluated against `None`. For `UserPromptSubmit` and `Stop`, matcher values are ignored and all handlers for the event are selected. A key design choice is that each handler is checked once even when multiple compatibility names are supplied, so one handler with a regex like `apply_patch|Write|Edit` runs only once per tool call.
+Hooks are user-defined commands that run at important moments, like before a tool is used, after a tool finishes, when a session starts, or when the system stops. This file answers three practical questions: which hooks apply right now, how do we run them, and how do we report what happened?
 
-`execute_handlers` runs the selected handlers concurrently using `FuturesUnordered`. It clones the shared JSON input and optional turn ID per task, invokes `run_command`, parses each result through a caller-supplied function, records completion order as tasks finish, then sorts the final vector back into original configured order before returning it. This preserves declaration order for downstream semantics while still exposing completion order in each `ParsedHandler`.
+First, it filters the configured hook list by event name. For some events it also checks a matcher, which is like a simple rule saying “only run this hook for Bash” or “run this hook for Edit or Write.” For prompt submission and stop events, matchers are ignored, so every hook for that event runs.
 
-The summary helpers, `running_summary` and `completed_summary`, construct `HookRunSummary` values with consistent IDs, scope, source metadata, timestamps, and output entries. `scope_for_event` maps session-start/subagent-start to thread scope and all other supported events to turn scope.
+Then it can run the chosen command hooks at the same time. Even though they may finish in any order, the final returned list is put back into the original configured order. The actual finish order is still recorded separately, which is useful for reporting what happened in real time.
+
+Finally, it builds hook run summaries. These summaries say whether a hook is running or completed, where it came from, when it started and ended, and what output entries it produced. Without this file, hook events would not reliably find the right commands, execute them, or produce consistent status information for the rest of the system.
 
 #### Function details
 
@@ -2686,11 +2694,11 @@ fn select_handlers(
 ) -> Vec<ConfiguredHandler>
 ```
 
-**Purpose**: Convenience wrapper that selects handlers for a single optional matcher input. It adapts the single-input API to the multi-input matcher-selection routine.
+**Purpose**: Chooses the configured hook handlers that match one event and, optionally, one matcher input such as a tool name. It is the simple entry point for the common case where there is only one name to match against.
 
-**Data flow**: It takes a handler slice, event name, and optional matcher input. It converts the optional input into a temporary `Vec<&str>` and passes that slice to `select_handlers_for_matcher_inputs`, returning the resulting cloned handlers.
+**Data flow**: It receives a list of configured handlers, the event currently happening, and maybe one text value to match. It turns that optional text into a small list and passes the real selection work onward. It returns a new list containing only the handlers that should run.
 
-**Call relations**: This function is used by many event preview/run paths and tests that only have one matcher input. It delegates all actual filtering logic to `select_handlers_for_matcher_inputs`.
+**Call relations**: Tests call this function to check everyday hook selection cases, such as stop hooks, tool hooks, compact hooks, and declaration order. Internally it delegates to select_handlers_for_matcher_inputs so the same matching rules are shared with callers that need to test several possible names for one event.
 
 *Call graph*: calls 1 internal fn (select_handlers_for_matcher_inputs); called by 19 (compact_hooks_match_trigger, post_tool_use_matches_tool_name, pre_tool_use_matches_tool_name, pre_tool_use_regex_alternation_matches_each_tool_name, pre_tool_use_star_matcher_matches_all_tools, select_handlers_keeps_duplicate_stop_handlers, select_handlers_keeps_overlapping_session_start_matchers, select_handlers_preserves_declaration_order, user_prompt_submit_ignores_matcher, preview_post (+9 more)).
 
@@ -2705,11 +2713,11 @@ fn select_handlers_for_matcher_inputs(
 ) -> Vec<ConfiguredHandler>
 ```
 
-**Purpose**: Filters discovered handlers down to those applicable for a given event and one or more matcher inputs. It preserves declaration order and avoids duplicate execution when multiple inputs match the same handler.
+**Purpose**: Chooses handlers for an event when there may be several possible matcher names for the same thing. This prevents one hook from running twice just because more than one alias matches it.
 
-**Data flow**: Inputs are a slice of `ConfiguredHandler`, a `HookEventName`, and a slice of matcher input strings. It iterates handlers, keeps only those with the requested event name, applies event-specific matcher logic using `matches_matcher`, clones the surviving handlers, and collects them into a `Vec<ConfiguredHandler>` in original order.
+**Data flow**: It reads the full configured handler list, keeps only handlers for the requested event, then applies matcher rules where that event type supports matching. If there are several matcher inputs, it checks whether any of them match, but it still includes each handler at most once. The output is a cloned list of matching handlers in their original order.
 
-**Call relations**: This is the core selection routine called by `select_handlers` and by event code that supplies multiple compatibility names. Its filtering semantics are consumed later by preview and run flows before `execute_handlers` is invoked.
+**Call relations**: select_handlers uses this as its worker for the one-input case. Hook preview and run paths also call it when an event may have compatibility names or aliases, and the alias-focused test checks that a combined matcher is selected once rather than repeated.
 
 *Call graph*: called by 8 (select_handlers, pre_tool_use_aliases_match_once_per_handler, preview, run, preview, run, preview, run); 1 external calls (iter).
 
@@ -2720,11 +2728,11 @@ fn select_handlers_for_matcher_inputs(
 fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary
 ```
 
-**Purpose**: Builds a protocol summary representing a hook that has started execution but not yet completed. It fills in static handler metadata and a current start timestamp.
+**Purpose**: Creates a status record saying that a hook command has started and is currently running. This lets the rest of the system show hook activity before the command has finished.
 
-**Data flow**: It reads fields from a `ConfiguredHandler`, computes a stable run ID with `run_id()`, derives scope with `scope_for_event`, stamps `started_at` with the current UTC timestamp, and returns a `HookRunSummary` with `status` set to `Running`, no completion time, no duration, and an empty `entries` list.
+**Data flow**: It takes one configured handler and copies identifying details from it, such as the event name, source, display order, and optional status message. It adds a fresh start time, marks the status as running, leaves completion fields empty, and returns a HookRunSummary.
 
-**Call relations**: This helper is used by higher-level event preview/run code when reporting in-flight hook execution. It depends on `ConfiguredHandler::run_id` and `scope_for_event` for consistent protocol metadata.
+**Call relations**: This function uses the handler’s run identifier and scope_for_event to fill in stable reporting fields. It is used by hook-running flows when they need to announce or store that a hook run has begun.
 
 *Call graph*: calls 2 internal fn (run_id, scope_for_event); 2 external calls (new, now).
 
@@ -2741,11 +2749,11 @@ async fn execute_handlers(
     parse: fn(&ConfiguredHandler, Comman
 ```
 
-**Purpose**: Runs a batch of configured handlers concurrently, parses each command result, records completion order, and returns parsed results in original configured order. It separates execution concurrency from externally visible ordering.
+**Purpose**: Runs a group of selected hook command handlers concurrently and parses each command result into the caller’s chosen output type. It lets hooks run efficiently while still returning results in the configured order.
 
-**Data flow**: Inputs are the shell configuration, a vector of handlers, serialized input JSON, working directory, optional turn ID, and a parse callback. It enumerates handlers to capture configured order, clones `input_json` and `turn_id` into async tasks, runs each handler via `run_command`, transforms each result with `parse`, assigns `completion_order` as futures resolve, sorts completed items by original configured order, and returns the parsed vector.
+**Data flow**: It receives the shell to use, handlers to run, input JSON to send to each command, the working directory, an optional turn id, and a parser function. For every handler, it starts run_command with the same input and directory. As each command finishes, it records that finish position, parses the command result, then later sorts everything back into the original handler order. It returns the parsed results.
 
-**Call relations**: This async orchestrator is called by multiple event-specific `run` implementations. It delegates process execution to `run_command` and leaves event-specific interpretation of command output to the supplied parse function.
+**Call relations**: Several hook event runners call this when they have already selected which hooks should run. It hands each command to run_command for the actual process execution, then hands each result to the parser supplied by the caller so different hook events can interpret command output in their own way.
 
 *Call graph*: calls 1 internal fn (run_command); called by 8 (run_post, run_pre, run, run, run, run, run, run); 2 external calls (new, new).
 
@@ -2761,11 +2769,11 @@ fn completed_summary(
 ) -> HookRunSummary
 ```
 
-**Purpose**: Builds a protocol summary for a finished hook execution using the captured command result and parsed output entries. It mirrors `running_summary` but fills in completion metadata.
+**Purpose**: Creates the final status record for a hook command after it has finished. This is the completed counterpart to running_summary.
 
-**Data flow**: It takes a `ConfiguredHandler`, a `CommandRunResult`, a final `HookRunStatus`, and a vector of protocol `HookOutputEntry` values. It reads handler metadata, computes run ID and scope, copies timestamps and duration from `run_result`, and returns a populated `HookRunSummary` with the supplied status and entries.
+**Data flow**: It receives the original handler, the command run timing/result information, a final status such as success or failure, and output entries to include. It combines those into a HookRunSummary with start time, completion time, duration, source details, event details, and entries filled in. The returned summary is ready for reporting or storage.
 
-**Call relations**: This helper is called by event-specific output parsers after `execute_handlers` completes each command. It pairs with `running_summary` to provide consistent before/after summary shapes.
+**Call relations**: Event-specific parse functions call this after command execution so every hook event reports completion in the same format. It relies on scope_for_event for the scope field and on the handler’s run identifier for consistent tracking.
 
 *Call graph*: calls 2 internal fn (run_id, scope_for_event); called by 8 (parse_completed, parse_pre_completed, parse_completed, parse_completed, parse_completed, parse_completed, parse_completed, parse_completed).
 
@@ -2776,11 +2784,11 @@ fn completed_summary(
 fn scope_for_event(event_name: HookEventName) -> HookScope
 ```
 
-**Purpose**: Maps each hook event type to its protocol execution scope. Session and subagent start hooks are thread-scoped; all other supported events are turn-scoped.
+**Purpose**: Decides whether a hook run belongs to the whole thread or just the current turn. A thread is the broader conversation, while a turn is one user/system exchange inside it.
 
-**Data flow**: It takes a `HookEventName`, matches on the enum variant, and returns the corresponding `HookScope`.
+**Data flow**: It receives a hook event name and maps it to a HookScope value. Session and subagent start events are treated as thread-wide. Tool use, prompt submission, compacting, subagent stop, and stop events are treated as turn-scoped. It returns that scope.
 
-**Call relations**: This helper is used by both `running_summary` and `completed_summary` so all summaries classify scope consistently.
+**Call relations**: running_summary and completed_summary both call this so started and finished hook reports agree about the lifetime of each event.
 
 *Call graph*: called by 2 (completed_summary, running_summary).
 
@@ -2796,11 +2804,11 @@ fn make_handler(
     ) -> ConfiguredHandler
 ```
 
-**Purpose**: Constructs a minimal `ConfiguredHandler` fixture for dispatcher tests. It standardizes source metadata and timeout while allowing event, matcher, command, and display order to vary.
+**Purpose**: Builds a small test hook handler with the fields needed by the selection tests. It keeps the tests focused on matching behavior instead of repeating setup details.
 
-**Data flow**: It takes an event name, optional matcher, command string, and display order, converts owned fields as needed, fills fixed source path and `HookSource::User`, and returns the resulting `ConfiguredHandler`.
+**Data flow**: It receives an event name, optional matcher text, command text, and display order. It fills in the remaining handler fields with test defaults, including a fake hooks file path, user source, timeout, and empty environment map. It returns a ConfiguredHandler ready for use in tests.
 
-**Call relations**: This helper is used throughout the test module to build handler lists for selection tests.
+**Call relations**: The test cases use this helper whenever they need sample handlers. It calls the test path helper to create a stable fake source path.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -2811,11 +2819,11 @@ fn make_handler(
 fn select_handlers_keeps_duplicate_stop_handlers()
 ```
 
-**Purpose**: Verifies that duplicate `Stop` handlers are both retained rather than deduplicated. This protects declaration-order semantics for matcherless stop hooks.
+**Purpose**: Checks that two stop hooks with the same command are both kept. This matters because duplicate-looking hooks may be intentionally configured separately.
 
-**Data flow**: It builds two `Stop` handlers with identical commands but different display orders, calls `select_handlers`, and asserts that both are returned in order.
+**Data flow**: The test creates two stop handlers, asks select_handlers for stop hooks, and checks that both come back in order. Nothing outside the test is changed.
 
-**Call relations**: This test exercises the `Stop` branch of `select_handlers`, which ignores matchers and preserves all handlers.
+**Call relations**: It exercises select_handlers for the Stop event, where matchers are not used and all handlers for that event should be selected.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2826,11 +2834,11 @@ fn select_handlers_keeps_duplicate_stop_handlers()
 fn select_handlers_keeps_overlapping_session_start_matchers()
 ```
 
-**Purpose**: Checks that multiple `SessionStart` handlers whose matchers both match the same input are all selected. Selection is per handler, not per unique command or matcher result.
+**Purpose**: Checks that different session-start hooks are both selected when their matchers overlap. A broad matcher should not hide another matching hook.
 
-**Data flow**: It creates two `SessionStart` handlers with overlapping matchers, calls `select_handlers` with input `startup`, and asserts that both handlers are returned in declaration order.
+**Data flow**: The test creates two session-start handlers with patterns that both match the same input, then selects handlers for that input. It verifies that both handlers are returned in display order.
 
-**Call relations**: This test drives the matcher-based branch of `select_handlers` for session-start events.
+**Call relations**: It calls select_handlers to confirm that matching is done per configured handler and that overlapping rules do not collapse separate handlers into one.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2841,11 +2849,11 @@ fn select_handlers_keeps_overlapping_session_start_matchers()
 fn compact_hooks_match_trigger()
 ```
 
-**Purpose**: Verifies that compact-event handlers are filtered by the provided trigger string. Only handlers whose matcher matches the trigger should be selected.
+**Purpose**: Checks that compact hooks are selected based on the compact trigger text, such as manual versus automatic. This keeps hooks from firing for the wrong kind of compact action.
 
-**Data flow**: It builds two `PreCompact` handlers with matchers `manual` and `auto`, calls `select_handlers` with input `manual`, and asserts that only the first handler is returned.
+**Data flow**: The test builds one manual and one automatic pre-compact handler, then selects using the manual trigger. It verifies that only the manual handler is returned.
 
-**Call relations**: This test exercises event-specific matcher filtering for compact hooks through `select_handlers`.
+**Call relations**: It calls select_handlers for a PreCompact event and confirms the matcher behavior used by compact-related hook flows.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2856,11 +2864,11 @@ fn compact_hooks_match_trigger()
 fn pre_tool_use_matches_tool_name()
 ```
 
-**Purpose**: Checks that `PreToolUse` selection matches handlers against the tool name. It confirms regex-style matcher filtering for tool hooks.
+**Purpose**: Checks that before-tool hooks match the tool name correctly. For example, a Bash hook should run before Bash but not before Edit.
 
-**Data flow**: It creates `PreToolUse` handlers for `Bash` and `Edit`, calls `select_handlers` with matcher input `Bash`, and asserts that only the Bash handler is selected.
+**Data flow**: The test creates two PreToolUse handlers, one for Bash and one for Edit. It selects using Bash as the matcher input and verifies that only the Bash handler is chosen.
 
-**Call relations**: This test covers the tool-event matcher path in `select_handlers`.
+**Call relations**: It calls select_handlers to validate the filtering rules used before a tool command runs.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2871,11 +2879,11 @@ fn pre_tool_use_matches_tool_name()
 fn post_tool_use_matches_tool_name()
 ```
 
-**Purpose**: Checks that `PostToolUse` selection uses the same tool-name matcher semantics as `PreToolUse`. It ensures consistency across pre/post tool events.
+**Purpose**: Checks that after-tool hooks also match the tool name correctly. The same tool-specific filtering should apply after a tool finishes.
 
-**Data flow**: It creates `PostToolUse` handlers for `Bash` and `Edit`, calls `select_handlers` with input `Bash`, and asserts that only the Bash handler is returned.
+**Data flow**: The test creates two PostToolUse handlers, one for Bash and one for Edit. It selects using Bash and confirms that only the Bash handler is returned.
 
-**Call relations**: This test exercises the post-tool-use branch of the matcher-based selection logic.
+**Call relations**: It calls select_handlers to validate the filtering rules used after a tool command has completed.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2886,11 +2894,11 @@ fn post_tool_use_matches_tool_name()
 fn pre_tool_use_star_matcher_matches_all_tools()
 ```
 
-**Purpose**: Verifies that the special `*` matcher matches any tool name for `PreToolUse`. It confirms wildcard semantics in handler selection.
+**Purpose**: Checks that a star matcher acts like “match everything” for before-tool hooks. This supports hooks that should run for any tool.
 
-**Data flow**: It builds one wildcard `PreToolUse` handler and one `Edit`-specific handler, calls `select_handlers` with input `Bash`, and asserts that only the wildcard handler is selected.
+**Data flow**: The test creates a catch-all PreToolUse handler and a specific Edit handler. It selects using Bash and confirms that the catch-all handler is selected while the Edit-only handler is not.
 
-**Call relations**: This test depends on `matches_matcher` behavior as exercised through `select_handlers`.
+**Call relations**: It calls select_handlers and indirectly verifies the shared matcher helper behavior used by the dispatcher.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2901,11 +2909,11 @@ fn pre_tool_use_star_matcher_matches_all_tools()
 fn pre_tool_use_regex_alternation_matches_each_tool_name()
 ```
 
-**Purpose**: Checks that a regex alternation matcher can match multiple tool names while excluding others. It validates multi-name matching for one handler.
+**Purpose**: Checks that a matcher can name several tools in one pattern, such as Edit or Write. It also checks that tools outside the pattern do not match.
 
-**Data flow**: It creates one `PreToolUse` handler with matcher `Edit|Write`, calls `select_handlers` three times with `Edit`, `Write`, and `Bash`, and asserts selected counts of 1, 1, and 0 respectively.
+**Data flow**: The test creates one PreToolUse handler with a matcher that accepts Edit or Write. It runs selection for Edit, Write, and Bash, then verifies that the first two select the handler and Bash does not.
 
-**Call relations**: This test exercises repeated calls to `select_handlers` against the same handler to validate matcher semantics.
+**Call relations**: It calls select_handlers multiple times to confirm regular-expression style matching works for tool names.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2916,11 +2924,11 @@ fn pre_tool_use_regex_alternation_matches_each_tool_name()
 fn pre_tool_use_aliases_match_once_per_handler()
 ```
 
-**Purpose**: Verifies that when multiple compatibility names are supplied, one handler is selected at most once even if several inputs match it. This prevents duplicate execution for alias-rich tool events.
+**Purpose**: Checks that when several compatibility names describe one tool action, each configured handler is selected only once. This avoids accidentally running a combined hook multiple times.
 
-**Data flow**: It builds four `PreToolUse` handlers, including one combined matcher `apply_patch|Write|Edit`, calls `select_handlers_for_matcher_inputs` with all three aliases, and asserts that exactly four handlers are returned with display orders 0 through 3.
+**Data flow**: The test creates handlers for apply_patch, Write, Edit, and one combined matcher covering all three. It selects with all three matcher inputs at once and verifies that four handlers come back, not extra duplicates, in the expected order.
 
-**Call relations**: This test directly targets `select_handlers_for_matcher_inputs`, specifically its design of filtering each handler once rather than once per matching input.
+**Call relations**: It calls select_handlers_for_matcher_inputs directly because this is the multi-input case that select_handlers wraps for simpler calls.
 
 *Call graph*: calls 1 internal fn (select_handlers_for_matcher_inputs); 2 external calls (assert_eq!, vec!).
 
@@ -2931,11 +2939,11 @@ fn pre_tool_use_aliases_match_once_per_handler()
 fn user_prompt_submit_ignores_matcher()
 ```
 
-**Purpose**: Checks that `UserPromptSubmit` selection ignores matcher contents entirely, even invalid ones. All handlers for the event should be selected.
+**Purpose**: Checks that user prompt submission hooks are selected even if their matcher is specific or invalid. For this event, matcher text is intentionally ignored.
 
-**Data flow**: It creates two `UserPromptSubmit` handlers with different matcher strings, including an invalid regex, calls `select_handlers` with no matcher input, and asserts that both handlers are returned in order.
+**Data flow**: The test creates two UserPromptSubmit handlers, one with a normal-looking matcher and one with invalid pattern text. It selects handlers for the event and verifies that both are returned.
 
-**Call relations**: This test exercises the unconditional-true branch for `UserPromptSubmit` in `select_handlers`.
+**Call relations**: It calls select_handlers to confirm the dispatcher does not try to evaluate matchers for UserPromptSubmit events.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2946,11 +2954,11 @@ fn user_prompt_submit_ignores_matcher()
 fn select_handlers_preserves_declaration_order()
 ```
 
-**Purpose**: Verifies that selected handlers remain in their original declaration order. Selection should filter but not reorder handlers.
+**Purpose**: Checks that selected handlers stay in the same order they were configured. Order matters because users may expect hooks to run or display in that sequence.
 
-**Data flow**: It builds three `Stop` handlers with commands `first`, `second`, and `third`, calls `select_handlers`, and asserts that the returned commands remain in that same order.
+**Data flow**: The test creates three stop handlers named first, second, and third. It selects stop handlers and verifies that the returned commands are still first, second, and third.
 
-**Call relations**: This test confirms the stable iteration order of `select_handlers` after filtering.
+**Call relations**: It calls select_handlers for the Stop event and protects the dispatcher’s promise that filtering does not reorder matching handlers.
 
 *Call graph*: calls 1 internal fn (select_handlers); 2 external calls (assert_eq!, vec!).
 
@@ -2960,13 +2968,11 @@ These event handlers cover session and prompt lifecycle moments, including start
 
 ### `hooks/src/events/session_start.rs`
 
-`domain_logic` · `session initialization and subagent launch`
+`orchestration` · `startup and subagent startup`
 
-This file defines the request/response types and execution path for `SessionStart` and `SubagentStart` hooks. `SessionStartSource` encodes the startup trigger (`Startup`, `Resume`, `Clear`, `Compact`) and is converted to the matcher string used during handler selection. `SessionStartRequest` carries the session/thread id, absolute cwd, optional transcript path, model, permission mode, and a `StartHookTarget` that distinguishes a normal session start from a subagent launch. `preview` performs only handler matching and converts each selected handler into a `HookRunSummary`.
+A “hook” is an external command the application runs at a chosen moment, like a doorbell that can trigger custom actions when someone enters. This file is responsible for the start-of-session doorbell. It covers two closely related events: starting the main session, and starting a subagent. First it identifies which configured hook commands match the event. Then it builds a JSON message with details such as the session id, working folder, transcript path, model, permission mode, and start reason or agent type. That JSON is sent to each matching command through the hook dispatcher.
 
-`run` is the main orchestration path. It first selects handlers by event name plus matcher input (`source.as_str()` for session starts, `agent_type` for subagents). If none match, it returns an empty `SessionStartOutcome`. Otherwise it serializes either `SessionStartCommandInput::new(...)` or a `SubagentStartCommandInput`, converting optional paths through `NullableString::from_path`. Serialization failures are turned into synthetic failed hook events via `common::serialization_failure_hook_events`, but never stop the session.
-
-Completed command runs are interpreted by `parse_completed`. Successful stdout may be parsed as structured hook JSON via `output_parser::parse_session_start` or `parse_subagent_start`; warnings become `Warning` entries, additional context is appended both to visible entries and the accumulated model-context vector, and plain non-JSON stdout is also treated as context. JSON-looking but invalid stdout is a hard failure. A key invariant is that only `SessionStart` honors `continue:false` by producing `HookRunStatus::Stopped`, `should_stop = true`, and an optional `Stop` entry; `SubagentStart` ignores that flag and remains context-only. The final outcome aggregates all completed events, whether any handler requested stop, the first stop reason, and flattened additional contexts.
+After the commands finish, this file translates their results into application-friendly outcomes. Successful plain text output becomes extra context for the model. Well-formed hook JSON can add warnings and context. Bad JSON-looking output is treated as an error rather than being silently fed to the model. For `SessionStart` only, hook JSON can say “continue: false”, which marks the run as stopped and records a reason. `SubagentStart` deliberately ignores that stop signal, so subagent hooks can add context but cannot block the subagent. Without this file, startup hooks would not run, their output would not be interpreted safely, and custom startup checks or context injection would not work.
 
 #### Function details
 
@@ -2976,11 +2982,11 @@ Completed command runs are interpreted by `parse_completed`. Successful stdout m
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Maps each `SessionStartSource` variant to the exact lowercase string used in hook matcher input and serialized payloads.
+**Purpose**: Turns the internal start reason into the short text value that hook configuration and hook input JSON expect. For example, it converts the `Startup` variant into `"startup"`.
 
-**Data flow**: Reads `self` by value and matches it to one of four static string literals: `startup`, `resume`, `clear`, or `compact`. Returns that `&'static str` without mutating any state.
+**Data flow**: It receives one `SessionStartSource` value → matches it to its named reason → returns a fixed lowercase string. It does not change any state.
 
-**Call relations**: Used when building `SessionStart` hook input and when deriving the matcher string for handler selection, so downstream dispatch and payload serialization agree on the same source label.
+**Call relations**: This is used when the start target needs a matcher value and when `run` builds the JSON sent to session-start hook commands. It gives the rest of the hook pipeline a stable text label instead of exposing Rust enum names.
 
 
 ##### `StartHookTarget::event_name`  (lines 64–69)
@@ -2989,11 +2995,11 @@ fn as_str(self) -> &'static str
 fn event_name(&self) -> HookEventName
 ```
 
-**Purpose**: Converts the target enum into the protocol-level hook event name so dispatch can distinguish session starts from subagent starts.
+**Purpose**: Identifies which hook event name applies to the current start target: main session start or subagent start. This lets the dispatcher choose the right configured commands.
 
-**Data flow**: Reads `self` and returns `HookEventName::SessionStart` for `SessionStart { .. }` or `HookEventName::SubagentStart` for `SubagentStart { .. }`.
+**Data flow**: It reads the `StartHookTarget` value → checks whether it is `SessionStart` or `SubagentStart` → returns the matching `HookEventName`. It has no side effects.
 
-**Call relations**: Called by both preview and execution paths before handler selection, ensuring the dispatcher searches the correct event bucket.
+**Call relations**: `preview` and `run` call this before asking the dispatcher to select matching handlers. It is the small adapter that connects this file’s start-target type to the shared hook dispatch system.
 
 
 ##### `StartHookTarget::matcher_input`  (lines 71–76)
@@ -3002,11 +3008,11 @@ fn event_name(&self) -> HookEventName
 fn matcher_input(&self) -> &str
 ```
 
-**Purpose**: Extracts the string used to match handlers within the selected start event type.
+**Purpose**: Provides the extra matching text used to narrow which hooks should run. For a session start this is the start source, and for a subagent start this is the agent type.
 
-**Data flow**: For `SessionStart`, reads the embedded `source` and returns `source.as_str()`. For `SubagentStart`, reads `agent_type` and returns its string slice.
+**Data flow**: It reads the target → for a session start, converts the source to text; for a subagent start, borrows the agent type text → returns that string slice for matching. It does not modify anything.
 
-**Call relations**: Feeds `dispatcher::select_handlers` in both `preview` and `run`, so session-start hooks match on source while subagent-start hooks match on agent type.
+**Call relations**: `preview` and `run` pass this value to the dispatcher along with the event name. That allows hook configuration to say things like “only run for resume starts” or “only run for this kind of agent.”
 
 
 ##### `preview`  (lines 94–106)
@@ -3018,11 +3024,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Computes the list of start-hook handlers that would run for a request, without executing any commands.
+**Purpose**: Shows which session-start or subagent-start hooks would run, without actually running their commands. This is useful for displaying planned hook activity to a caller.
 
-**Data flow**: Consumes a handler slice plus a borrowed `SessionStartRequest`, derives event name and matcher input from `request.target`, passes them to `dispatcher::select_handlers`, then maps each selected handler through `dispatcher::running_summary` into a `Vec<HookRunSummary>`.
+**Data flow**: It receives all configured handlers and a start request → asks the dispatcher to select the handlers matching the request’s event and matcher text → converts each selected handler into a “running” summary → returns those summaries. Nothing is executed.
 
-**Call relations**: Invoked by the higher-level `preview_session_start` API. It is the non-mutating mirror of `run`, sharing the same selection criteria so previews reflect actual execution.
+**Call relations**: `preview_session_start` calls this when it needs a dry-run style view. Internally, this function relies on `StartHookTarget::event_name`, `StartHookTarget::matcher_input`, and the dispatcher’s selection and summary helpers.
 
 *Call graph*: calls 1 internal fn (select_handlers); called by 1 (preview_session_start).
 
@@ -3038,11 +3044,11 @@ async fn run(
 ) -> SessionStartOutcome
 ```
 
-**Purpose**: Executes all matching `SessionStart` or `SubagentStart` handlers, serializes the correct input schema, and aggregates stop/context effects across all runs.
+**Purpose**: Runs the matching start hooks and combines their results into one outcome for the caller. It is the main workflow for turning a session-start request into completed hook events, stop decisions, and extra model context.
 
-**Data flow**: Takes configured handlers, a `CommandShell`, an owned `SessionStartRequest`, and an optional outer `turn_id`. It selects matching handlers; if none exist, returns an empty `SessionStartOutcome`. For `SessionStart`, it builds `SessionStartCommandInput::new(...)`; for `SubagentStart`, it constructs `SubagentStartCommandInput` directly, converting optional transcript paths with `NullableString::from_path`. It serializes to JSON with `serde_json::to_string`; on failure it emits synthetic failed hook events and returns a non-stopping outcome. On success it calls `dispatcher::execute_handlers`, passing cwd, the effective turn id, and `parse_completed`. It then reduces parsed results into `should_stop` via `any`, picks the first `stop_reason`, flattens all `additional_contexts_for_model` with `common::flatten_additional_contexts`, and returns the collected `HookCompletedEvent`s plus aggregate flags.
+**Data flow**: It receives configured handlers, a command shell, a start request, and an optional turn id → selects matching hooks → builds the correct JSON input for either session start or subagent start → runs each command through the dispatcher → reads each parsed result → returns the completed hook events, whether the session should stop, the first stop reason, and all added context. If JSON input cannot be serialized, it returns failure hook events instead of running commands.
 
-**Call relations**: Called by `run_session_start` in the engine-facing API. It delegates matching to `select_handlers`, command execution to `execute_handlers`, serialization-failure reporting to `common::serialization_failure_hook_events`, and per-run interpretation to `parse_completed`.
+**Call relations**: `run_session_start` calls this as the public flow for executing start hooks. This function hands matching and command execution to the dispatcher, uses schema types to build hook input, uses `serialization_failure_outcome` if input creation fails, and asks `parse_completed` to interpret each command result after execution.
 
 *Call graph*: calls 7 internal fn (execute_handlers, select_handlers, flatten_additional_contexts, serialization_failure_hook_events, serialization_failure_outcome, from_path, new); called by 1 (run_session_start); 3 external calls (new, format!, to_string).
 
@@ -3057,11 +3063,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<SessionStartHandlerData>
 ```
 
-**Purpose**: Interprets one finished start-hook command into protocol-visible output entries and internal stop/context data.
+**Purpose**: Interprets the result of one finished start hook command. It decides whether the hook succeeded, failed, added model context, produced a warning, or stopped a normal session start.
 
-**Data flow**: Accepts the `ConfiguredHandler`, a `CommandRunResult`, and an optional `turn_id`. It initializes `entries`, `status`, stop flags, and context accumulation. If `run_result.error` is present, it marks the run failed and emits an `Error` entry. Otherwise it branches on `exit_code`: code `0` inspects trimmed stdout; empty stdout is a no-op, structured stdout is parsed with `output_parser::parse_session_start` or `parse_subagent_start` depending on `handler.event_name`, invalid event names panic, JSON warnings become `Warning` entries, additional context is appended through `common::append_additional_context`, and `continue:false` only affects `SessionStart`, setting `HookRunStatus::Stopped`, `should_stop`, `stop_reason`, and an optional `Stop` entry. If parsing fails but stdout looks like JSON, it emits an event-specific invalid-JSON error; otherwise plain stdout becomes context. Nonzero exit codes and missing status codes become generic `Error` entries. Finally it builds a `HookCompletedEvent` via `dispatcher::completed_summary` and returns `dispatcher::ParsedHandler` containing `SessionStartHandlerData` and `completion_order: 0`.
+**Data flow**: It receives the handler that ran, the command’s exit details and output, and an optional turn id → checks for command errors or nonzero exit codes → if successful, parses recognized hook JSON or treats plain text as added context → rejects output that looks like broken JSON → builds a completed hook event plus internal data such as stop flags and context strings → returns that parsed package.
 
-**Call relations**: Passed as the parse callback into `dispatcher::execute_handlers` from `run`. The unit tests call it directly to verify nuanced behavior around plain stdout, invalid JSON-like stdout, and the difference between `SessionStart` and `SubagentStart` handling of `continue:false`.
+**Call relations**: The dispatcher calls this during `run` after each command finishes, and the tests call it directly to verify edge cases. It delegates JSON interpretation to the output parser, uses common helpers to record extra context, and uses the dispatcher to create the final run summary.
 
 *Call graph*: calls 5 internal fn (completed_summary, looks_like_json, parse_session_start, parse_subagent_start, append_additional_context); called by 5 (continue_false_preserves_context_for_later_turns, invalid_json_like_stdout_fails_instead_of_becoming_model_context, plain_stdout_becomes_model_context, subagent_start_continue_false_is_ignored, subagent_start_plain_stdout_becomes_model_context); 3 external calls (new, format!, panic!).
 
@@ -3072,11 +3078,11 @@ fn parse_completed(
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> SessionStartOutcome
 ```
 
-**Purpose**: Wraps synthetic serialization-failure hook events in a normal `SessionStartOutcome` that never requests stopping.
+**Purpose**: Builds a safe fallback outcome when the file cannot create the JSON input needed for hook commands. It preserves the failure events but avoids pretending hooks ran successfully.
 
-**Data flow**: Takes a prebuilt `Vec<HookCompletedEvent>` and returns `SessionStartOutcome` with those events, `should_stop = false`, `stop_reason = None`, and empty `additional_contexts`.
+**Data flow**: It receives already-created failure hook events → wraps them in a `SessionStartOutcome` → sets stopping to false, clears the stop reason, and returns no added context. It does not run any commands.
 
-**Call relations**: Used only from `run` when request payload serialization fails before any external command can be launched.
+**Call relations**: `run` calls this when serializing either session-start or subagent-start input fails. It keeps that exceptional path small and consistent with the normal outcome shape.
 
 *Call graph*: called by 1 (run); 1 external calls (new).
 
@@ -3087,11 +3093,11 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> Sessio
 fn plain_stdout_becomes_model_context()
 ```
 
-**Purpose**: Verifies that successful non-JSON stdout is preserved as model context rather than treated as an error.
+**Purpose**: Checks that ordinary text printed by a successful session-start hook is treated as extra context for the model. This protects the simple hook author experience: print text, and it becomes context.
 
-**Data flow**: Builds a default session-start handler and a successful `CommandRunResult` with `stdout = "hello from hook\n"`, passes them to `parse_completed`, and asserts that the parsed data contains one context string and the completed run contains a single `Context` entry with `Completed` status.
+**Data flow**: It creates a fake session-start handler and a fake successful command result with stdout → passes them to `parse_completed` → asserts that the parsed data contains the trimmed text as context and that the completed event records a context entry.
 
-**Call relations**: Directly exercises `parse_completed`'s plain-stdout branch for `SessionStart`.
+**Call relations**: This test calls the local `handler` and `run_result` helpers, then exercises `parse_completed` directly. It verifies one of the main behaviors that `run` relies on after the dispatcher executes hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3102,11 +3108,11 @@ fn plain_stdout_becomes_model_context()
 fn continue_false_preserves_context_for_later_turns()
 ```
 
-**Purpose**: Checks that structured `continue:false` output stops processing but still preserves emitted additional context.
+**Purpose**: Checks what happens when a session-start hook returns JSON saying the session should stop. It confirms that the stop reason is recorded while the hook’s added context is still preserved.
 
-**Data flow**: Creates a session-start handler and a successful run whose stdout is valid hook JSON containing `continue:false`, `stopReason`, and `additionalContext`. It parses the result and asserts both `should_stop`/`stop_reason` and retention of the context string in data and output entries.
+**Data flow**: It builds a fake successful command result containing session-start JSON with `continue: false`, a stop reason, and additional context → sends it to `parse_completed` → asserts that the parsed data says to stop, keeps the reason, keeps the context, and records both context and stop entries.
 
-**Call relations**: Targets the `SessionStart`-specific stop branch inside `parse_completed`.
+**Call relations**: This test uses `handler` and `run_result` to focus only on output parsing. It guards the behavior that only normal session-start hooks can block further processing.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3117,11 +3123,11 @@ fn continue_false_preserves_context_for_later_turns()
 fn invalid_json_like_stdout_fails_instead_of_becoming_model_context()
 ```
 
-**Purpose**: Ensures malformed JSON-looking stdout is rejected instead of being silently injected as context.
+**Purpose**: Checks that broken JSON-looking output is treated as a hook error, not as model context. This matters because accidentally feeding malformed control data to the model could hide a hook bug.
 
-**Data flow**: Supplies truncated JSON text on stdout with exit code `0`, invokes `parse_completed`, and asserts failed status, no accumulated context, and a single event-specific `Error` entry.
+**Data flow**: It creates a fake successful command result whose stdout begins like JSON but is invalid → passes it to `parse_completed` → asserts that no context is added and the hook run is marked failed with a clear error message.
 
-**Call relations**: Exercises the `looks_like_json` safeguard in `parse_completed`.
+**Call relations**: This test calls `handler`, `run_result`, and `parse_completed`. It protects the branch where `parse_completed` asks the output parser whether stdout looks like JSON after parsing fails.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3132,11 +3138,11 @@ fn invalid_json_like_stdout_fails_instead_of_becoming_model_context()
 fn subagent_start_plain_stdout_becomes_model_context()
 ```
 
-**Purpose**: Confirms that plain stdout from a `SubagentStart` hook is treated as context and preserves the supplied turn id.
+**Purpose**: Checks that a subagent-start hook can add context by printing plain text. It also confirms that the subagent turn id is carried into the completed event.
 
-**Data flow**: Builds a handler configured for `HookEventName::SubagentStart`, parses a successful run with plain stdout and `Some("turn-1")`, then asserts context accumulation, completed status, and propagation of `turn_id` into the `HookCompletedEvent`.
+**Data flow**: It creates a fake subagent-start handler and a successful command result with plain stdout → calls `parse_completed` with a turn id → verifies that the text becomes context, the run is completed, and the completed event keeps that turn id.
 
-**Call relations**: Covers the shared plain-stdout path in `parse_completed` for the subagent variant.
+**Call relations**: This test uses `handler_for` to make a subagent handler and `run_result` for fake command output. It validates the subagent path that `run` uses when dispatching `SubagentStart` hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler_for, run_result).
 
@@ -3147,11 +3153,11 @@ fn subagent_start_plain_stdout_becomes_model_context()
 fn subagent_start_continue_false_is_ignored()
 ```
 
-**Purpose**: Verifies that `SubagentStart` ignores `continue:false` and remains a context-only hook.
+**Purpose**: Checks that subagent-start hooks cannot stop processing even if their JSON says `continue: false`. They are allowed to add context, but not to block the subagent.
 
-**Data flow**: Parses valid subagent-start JSON containing `continue:false`, `stopReason`, and `additionalContext`, then asserts that no stop flags are set, the context is retained, and the run remains `Completed` rather than `Stopped`.
+**Data flow**: It creates a fake subagent-start hook result containing JSON with `continue: false`, a stop reason, and additional context → passes it to `parse_completed` → asserts that stopping is not requested, no stop reason is stored, and the context is still recorded.
 
-**Call relations**: Documents the intentional divergence between `SessionStart` and `SubagentStart` in `parse_completed`.
+**Call relations**: This test calls `handler_for`, `run_result`, and `parse_completed`. It protects the intentional difference between `SessionStart` and `SubagentStart` behavior inside `parse_completed`.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler_for, run_result).
 
@@ -3162,11 +3168,11 @@ fn subagent_start_continue_false_is_ignored()
 fn handler() -> ConfiguredHandler
 ```
 
-**Purpose**: Provides a convenience constructor for a default `SessionStart` test handler.
+**Purpose**: Creates a default fake handler for session-start tests. It saves each test from repeating the same setup.
 
-**Data flow**: Calls `handler_for(HookEventName::SessionStart)` and returns the resulting `ConfiguredHandler`.
+**Data flow**: It takes no input → calls `handler_for` with the session-start event name → returns the configured fake handler.
 
-**Call relations**: Used by multiple tests to avoid repeating the standard session-start handler setup.
+**Call relations**: Several tests call this when they need a normal session-start handler. It delegates the actual construction to `tests::handler_for`.
 
 *Call graph*: 1 external calls (handler_for).
 
@@ -3177,11 +3183,11 @@ fn handler() -> ConfiguredHandler
 fn handler_for(event_name: HookEventName) -> ConfiguredHandler
 ```
 
-**Purpose**: Constructs a minimal `ConfiguredHandler` for a chosen start-event type.
+**Purpose**: Builds a fake configured hook handler for a chosen event name. Tests use it to simulate either a session-start hook or a subagent-start hook without loading real configuration.
 
-**Data flow**: Accepts a `HookEventName`, fills a `ConfiguredHandler` with that event name, fixed command/timeout/source metadata, an absolute `/tmp/hooks.json` source path from `test_path_buf(...).abs()`, and an empty environment map, then returns it.
+**Data flow**: It receives a hook event name → fills in a `ConfiguredHandler` with a dummy command, timeout, source path, ordering, and empty environment → returns that handler. It uses a test path helper to create an absolute source path.
 
-**Call relations**: Shared by the test helpers and subagent-specific tests so `parse_completed` can be exercised with either start event.
+**Call relations**: `tests::handler` and the subagent tests call this helper. The returned handler is then passed into `parse_completed` so tests can check parsing behavior for different hook event names.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -3192,22 +3198,22 @@ fn handler_for(event_name: HookEventName) -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Builds deterministic `CommandRunResult` fixtures for parser tests.
+**Purpose**: Creates a fake command-run result for tests. This lets tests describe only the exit code and output they care about.
 
-**Data flow**: Accepts an optional exit code plus stdout/stderr strings, copies them into a `CommandRunResult` with fixed timestamps/duration and `error = None`, and returns it.
+**Data flow**: It receives an optional exit code, stdout text, and stderr text → wraps them with fixed timing values and no execution error → returns a `CommandRunResult` as if a hook command had already run.
 
-**Call relations**: Used by all tests in this module to isolate parser behavior from command execution details.
+**Call relations**: All parser-focused tests use this helper before calling `parse_completed`. It replaces the real command runner so the tests can focus on how completed output is interpreted.
 
 
 ### `hooks/src/events/user_prompt_submit.rs`
 
-`domain_logic` · `pre-prompt processing`
+`orchestration` · `request handling, when a user prompt is submitted`
 
-This file defines the request and outcome types for hooks that run when a user prompt is submitted. `UserPromptSubmitRequest` includes session and turn ids, optional subagent context, cwd, transcript path, model and permission mode, and the raw prompt text. `UserPromptSubmitOutcome` reports completed hook events plus whether processing should stop and any additional contexts to inject later.
+A “hook” is a user- or system-configured command that Codex runs at a specific moment, like a checkpoint. This file covers the UserPromptSubmit checkpoint: the moment after the user enters a prompt but before the rest of the turn proceeds. Without it, configured commands would not get a chance to review the prompt, block it for policy or safety reasons, or attach extra background information for the model.
 
-`preview` is straightforward: it selects handlers for `HookEventName::UserPromptSubmit` with no matcher and converts them to running summaries. `run` mirrors that selection, returns an empty outcome when no handlers match, and otherwise builds a `UserPromptSubmitCommandInput`. If the request came from a subagent, `SubagentCommandInputFields::from(request.subagent.as_ref())` extracts `agent_id` and `agent_type`; optional transcript paths are normalized with `NullableString::from_path`. Serialization failures are surfaced as synthetic failed hook events and do not themselves stop processing.
+The main flow is simple. First, the file finds all configured handlers that apply to the UserPromptSubmit event. Then it packages the current turn information into JSON: session id, turn id, working directory, model name, permission mode, transcript path, subagent details, and the prompt text itself. That JSON is sent to each matching command through the dispatcher.
 
-`parse_completed` contains the event semantics. Successful stdout may be valid structured JSON from `output_parser::parse_user_prompt_submit`, invalid JSON-looking text is a failure, and plain non-JSON stdout becomes additional model context. Parsed output can emit a warning, append additional context, request a stop via `continue:false`, or request a block via `decision:block`. Unlike stop hooks, a block here sets `HookRunStatus::Blocked` and also sets `should_stop = true` with `stop_reason = parsed.reason`; there is no continuation-fragment mechanism. Exit code `2` is also treated as a blocking shorthand, but stderr must contain a non-empty reason. Across all handlers, `run` aggregates with `any` for stopping, takes the first stop reason, and flattens all collected context strings.
+When each command finishes, this file interprets the result. A normal text response becomes extra context. A structured JSON response can say “continue,” “stop,” “block,” give a reason, or provide additional context. Exit code 2 is treated specially as a blocking decision, but only if the command writes a reason to standard error. The file then combines all hook results into one outcome: completed hook events for reporting, whether processing should stop, the first stop reason, and all extra context gathered from the hooks.
 
 #### Function details
 
@@ -3220,11 +3226,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Returns the `UserPromptSubmit` handlers that would run for a request, without executing them.
+**Purpose**: Shows which UserPromptSubmit hooks would run, without actually running them. This is useful for displaying planned hook activity before work starts.
 
-**Data flow**: Accepts configured handlers and an unused borrowed request, selects handlers for `HookEventName::UserPromptSubmit` with no matcher, maps them through `dispatcher::running_summary`, and returns the resulting summaries.
+**Data flow**: It receives the full list of configured handlers and a request object, though the request contents are not needed here. It filters the handlers down to those for the UserPromptSubmit event, turns each selected handler into a “running” summary, and returns those summaries.
 
-**Call relations**: Called by `preview_user_prompt_submit`; it shares the same event-selection criteria as `run`.
+**Call relations**: The higher-level preview_user_prompt_submit flow calls this when it wants a dry-run view. This function relies on select_handlers to choose the relevant hooks, then asks the dispatcher to format each selected hook as a running summary.
 
 *Call graph*: calls 1 internal fn (select_handlers); called by 1 (preview_user_prompt_submit).
 
@@ -3239,11 +3245,11 @@ async fn run(
 ) -> UserPromptSubmitOutcome
 ```
 
-**Purpose**: Executes all matching user-prompt-submit hooks and aggregates stop/context effects.
+**Purpose**: Runs all matching UserPromptSubmit hooks and combines their answers into one decision for the rest of the turn. It is the main entry point in this file for actually executing prompt-submission hooks.
 
-**Data flow**: Consumes handlers, shell, and an owned `UserPromptSubmitRequest`. It selects `UserPromptSubmit` handlers and returns an empty `UserPromptSubmitOutcome` if none match. Otherwise it derives optional subagent fields via `SubagentCommandInputFields::from(request.subagent.as_ref())`, constructs `UserPromptSubmitCommandInput`, converts the optional transcript path with `NullableString::from_path`, and serializes to JSON. On serialization failure it returns synthetic failed hook events via `serialization_failure_outcome`. On success it calls `dispatcher::execute_handlers` with cwd, `Some(request.turn_id)`, and `parse_completed`, then aggregates `should_stop`, the first `stop_reason`, and flattened additional contexts using `common::flatten_additional_contexts` before returning all completed events.
+**Data flow**: It receives configured handlers, a command shell for running external commands, and the prompt-submission request. It selects matching hooks, converts the request into JSON, executes each hook command, parses the completed results, and returns a UserPromptSubmitOutcome containing hook reports, whether to stop, a stop reason if any, and extra context strings for the model.
 
-**Call relations**: Invoked by `run_user_prompt_submit`. It delegates command execution to `execute_handlers`, per-run interpretation to `parse_completed`, and serialization-failure reporting to `common::serialization_failure_hook_events`.
+**Call relations**: The higher-level run_user_prompt_submit flow calls this when a prompt has been submitted. This function asks the dispatcher to select and execute handlers, passes parse_completed as the per-command result interpreter, uses common helpers to report serialization failures and combine extra context, and returns the final outcome to its caller.
 
 *Call graph*: calls 7 internal fn (execute_handlers, select_handlers, flatten_additional_contexts, serialization_failure_hook_events, serialization_failure_outcome, from_path, from); called by 1 (run_user_prompt_submit); 3 external calls (new, format!, to_string).
 
@@ -3258,11 +3264,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<UserPromptSubmitHandlerData>
 ```
 
-**Purpose**: Interprets one completed `UserPromptSubmit` hook run into visible output entries and internal stop/context data.
+**Purpose**: Turns one finished hook command into a clear hook result: completed, failed, blocked, or stopped. It also extracts any message that should be shown to the user and any extra context that should be saved for the model.
 
-**Data flow**: Takes a `ConfiguredHandler`, `CommandRunResult`, and optional `turn_id`. It initializes status, stop flags, and context accumulation. A transport-level `error` becomes failed status with an `Error` entry. For exit code `0`, empty stdout is ignored; valid structured stdout from `output_parser::parse_user_prompt_submit` may emit a `Warning`, append `additional_context` through `common::append_additional_context` when there is no invalid block reason, stop processing on `continue:false` by setting `Stopped`, `should_stop`, and optional `Stop` entry, fail on `invalid_block_reason`, or block by setting `Blocked`, `should_stop = true`, `stop_reason = parsed.reason.clone()`, and a `Feedback` entry. If parsing fails but stdout looks like JSON, it emits an invalid-JSON error; otherwise plain stdout is treated as additional context. Exit code `2` reads a blocking reason from trimmed stderr, producing blocked status and stop flags if present, or a specific error if absent. Other exit codes and missing status codes become generic failures. It wraps the result in `HookCompletedEvent` via `dispatcher::completed_summary` and returns `dispatcher::ParsedHandler<UserPromptSubmitHandlerData>`.
+**Data flow**: It receives the handler that ran, the raw command result, and the optional turn id. It checks for command errors, exit codes, standard output, and standard error. It parses structured JSON output when present, treats plain successful output as additional context, handles exit code 2 as a block with a required reason, and produces a ParsedHandler containing a completed hook event plus internal data such as should_stop, stop_reason, and collected context.
 
-**Call relations**: Passed into `dispatcher::execute_handlers` by `run`. The tests call it directly to validate stop preservation of context, block decisions, and stderr-based blocking.
+**Call relations**: The dispatcher uses this function after each executed hook command in the run flow. The unit tests also call it directly to check important edge cases. Inside, it delegates JSON recognition and parsing to output_parser, uses common helpers for context and trimmed text, and asks the dispatcher to build the final completed summary.
 
 *Call graph*: calls 5 internal fn (completed_summary, looks_like_json, parse_user_prompt_submit, append_additional_context, trimmed_non_empty); called by 4 (claude_block_decision_blocks_processing, claude_block_decision_requires_reason, continue_false_preserves_context_for_later_turns, exit_code_two_blocks_processing); 2 external calls (new, format!).
 
@@ -3273,11 +3279,11 @@ fn parse_completed(
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> UserPromptSubmitOutcome
 ```
 
-**Purpose**: Builds a non-stopping outcome around synthetic hook events created when request serialization fails.
+**Purpose**: Builds a safe outcome for the case where Codex cannot turn the hook input into JSON. This lets the caller report the failure without pretending any hook successfully ran.
 
-**Data flow**: Accepts a vector of `HookCompletedEvent` and returns `UserPromptSubmitOutcome` with those events, `should_stop = false`, `stop_reason = None`, and no additional contexts.
+**Data flow**: It receives already-created hook completion events that describe the serialization failure. It returns a UserPromptSubmitOutcome with those events, no stop request, no stop reason, and no added context.
 
-**Call relations**: Used only from `run` when `serde_json::to_string` fails.
+**Call relations**: The run function calls this only when preparing the JSON input for hook commands fails. The failure events are created by a common helper, and this function wraps them in the same outcome shape used by normal hook execution.
 
 *Call graph*: called by 1 (run); 1 external calls (new).
 
@@ -3288,11 +3294,11 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> UserPr
 fn continue_false_preserves_context_for_later_turns()
 ```
 
-**Purpose**: Verifies that `continue:false` stops prompt processing but still preserves emitted additional context.
+**Purpose**: Checks that a hook can both stop processing and still provide additional context. This protects the behavior where context from a stopped turn is preserved instead of thrown away.
 
-**Data flow**: Builds a handler and a successful JSON run containing `continue:false`, `stopReason`, and `additionalContext`, parses it, and asserts stopped status plus retention of the context string in both parsed data and output entries.
+**Data flow**: It creates a fake successful command result whose JSON says continue is false, gives a stop reason, and includes additional context. It passes that into parse_completed, then verifies that the parsed data says to stop, keeps the stop reason, keeps the context, and reports both a context entry and a stop entry.
 
-**Call relations**: Exercises the stop branch in `parse_completed`.
+**Call relations**: This test calls the local handler and run_result helpers to build test inputs, then calls parse_completed directly. It uses assertions to lock down how parse_completed should behave for a stop response with context.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3303,11 +3309,11 @@ fn continue_false_preserves_context_for_later_turns()
 fn claude_block_decision_blocks_processing()
 ```
 
-**Purpose**: Checks that a valid `decision:block` response blocks prompt processing and records the reason as feedback.
+**Purpose**: Checks that a structured block decision from a hook really blocks the prompt. It also verifies that extra context is still recorded alongside the blocking feedback.
 
-**Data flow**: Parses successful JSON containing `decision:block`, `reason`, and `additionalContext`, then asserts `should_stop = true`, `stop_reason` equal to the block reason, blocked status, and both context and feedback entries.
+**Data flow**: It builds a fake command result with JSON saying the decision is block, the reason is “slow down,” and additional context is present. After parse_completed runs, the test confirms that processing should stop, the reason is saved, the status is Blocked, and the output entries include both context and feedback.
 
-**Call relations**: Covers the structured block-decision path in `parse_completed`.
+**Call relations**: This test exercises parse_completed directly, using the test helper functions for a sample handler and command result. It protects the block-decision branch used when hooks return structured JSON.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3318,11 +3324,11 @@ fn claude_block_decision_blocks_processing()
 fn claude_block_decision_requires_reason()
 ```
 
-**Purpose**: Ensures that block decisions without a non-empty reason fail validation and do not inject context.
+**Purpose**: Checks that a hook is not allowed to block without explaining why. This prevents silent blocking, which would be confusing to users and callers.
 
-**Data flow**: Supplies JSON with `decision:block` but no reason, parses it, and asserts failed status, cleared stop/context data, and the specific validation error entry.
+**Data flow**: It creates a fake successful command result whose JSON says decision is block but does not include a non-empty reason. It passes that into parse_completed and verifies that the result is a failure, does not stop processing through the normal block path, and reports an error message.
 
-**Call relations**: Exercises the `invalid_block_reason` handling path in `parse_completed`.
+**Call relations**: This test calls parse_completed with helper-built inputs. It confirms that parse_completed rejects malformed block decisions instead of treating them as valid policy feedback.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3333,11 +3339,11 @@ fn claude_block_decision_requires_reason()
 fn exit_code_two_blocks_processing()
 ```
 
-**Purpose**: Verifies the legacy exit-code-2 blocking path for user prompt submit hooks.
+**Purpose**: Checks the shortcut rule that exit code 2 means the hook wants to block the prompt, as long as it writes a reason to standard error. This supports simple hook scripts that do not emit structured JSON.
 
-**Data flow**: Creates a run with `exit_code = Some(2)` and stderr containing a blocking reason, parses it, and asserts blocked status, `should_stop = true`, `stop_reason` from stderr, and a single `Feedback` entry.
+**Data flow**: It builds a fake command result with exit code 2 and standard error text saying “blocked by policy.” It passes that into parse_completed and verifies that processing should stop, the reason is saved, the status is Blocked, and the feedback entry contains the trimmed reason.
 
-**Call relations**: Covers the stderr-based blocking branch in `parse_completed`.
+**Call relations**: This test calls parse_completed directly with inputs from the local helpers. It protects the special exit-code behavior that parse_completed uses for simple blocking hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3348,11 +3354,11 @@ fn exit_code_two_blocks_processing()
 fn handler() -> ConfiguredHandler
 ```
 
-**Purpose**: Constructs a standard `UserPromptSubmit` handler fixture for parser tests.
+**Purpose**: Creates a sample configured UserPromptSubmit hook for the tests. It keeps the test setup short and consistent.
 
-**Data flow**: Returns a `ConfiguredHandler` with `event_name = HookEventName::UserPromptSubmit`, fixed command metadata, an absolute test source path, and an empty environment map.
+**Data flow**: It builds and returns a ConfiguredHandler with the UserPromptSubmit event name, a simple command string, a timeout, a fake source path, and default fields such as no matcher and an empty environment.
 
-**Call relations**: Shared by all tests in this module.
+**Call relations**: The tests call this helper whenever they need a handler to pass into parse_completed. It uses the test path helper to create a stable fake hooks configuration path.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -3363,22 +3369,24 @@ fn handler() -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Creates deterministic `CommandRunResult` fixtures for testing parser behavior.
+**Purpose**: Creates a sample command result for the tests. It lets each test focus on the exit code and output text that matter for that scenario.
 
-**Data flow**: Accepts optional exit code and stdout/stderr strings, copies them into a `CommandRunResult` with fixed timing fields and `error = None`, and returns it.
+**Data flow**: It receives an optional exit code, standard output text, and standard error text. It returns a CommandRunResult with fixed timing fields, those supplied outputs, and no command-level error.
 
-**Call relations**: Used by each parser test to supply controlled command outcomes.
+**Call relations**: The tests call this helper before calling parse_completed. It provides controlled command results so each test can check one parsing rule at a time.
 
 
 ### `hooks/src/events/stop.rs`
 
-`domain_logic` · `turn completion and subagent shutdown`
+`domain_logic` · `end-of-turn hook execution`
 
-This file defines the stop-hook request and outcome model for both top-level stop hooks and subagent stop hooks. `StopRequest` carries session and turn identifiers, cwd, transcript paths, model and permission metadata, whether a stop hook is already active, the last assistant message, and a `StopHookTarget`. The target determines both the protocol event (`Stop` vs `SubagentStop`) and whether a matcher string is supplied (`None` for `Stop`, `Some(agent_type)` for subagents).
+A hook is an outside command that the system calls at a specific moment, like ringing a doorbell before leaving a room. This file covers the moment when work is about to stop. It supports two related events: a normal Stop event and a SubagentStop event for a smaller helper agent.
 
-`preview` mirrors runtime selection by asking the dispatcher for handlers matching the event name and optional matcher. `run` performs the full path: select handlers, return an empty `StopOutcome` if none match, otherwise build either `StopCommandInput` or `SubagentStopCommandInput`. Optional strings and paths are normalized through `NullableString::from_string` and `NullableString::from_path`. Serialization failures are converted into synthetic failed hook events and never produce stop/block decisions.
+First, it can preview which configured hook commands would run for a given stop request. When actually running, it selects matching hooks, builds a JSON message describing the session, current folder, model, permission mode, transcript paths, and last assistant message, then sends that JSON to each hook command through the shared dispatcher.
 
-The core logic lives in `parse_completed`. For exit code `0`, stdout must be valid stop-hook JSON; unlike session-start hooks, arbitrary plain text is not accepted. Parsed output may emit warnings, request a hard stop via `continue:false`, or request a block via `decision:block` with a non-empty reason. A block reason becomes both a `Feedback` entry and a `HookPromptFragment` tied to the completed run id. Exit code `2` is a legacy shorthand for blocking: stderr must contain a non-blank continuation prompt, otherwise the run fails. `aggregate_results` then combines all handler data with a strict precedence: any stop suppresses all blocking, otherwise blocking reasons are concatenated in declaration order with `common::join_text_chunks`, and continuation fragments are preserved only for blocking handlers.
+The most important part is interpreting what the hook command says back. A hook can allow stopping, request that processing stop immediately with a reason, or block the stop and provide feedback such as “retry with tests.” That feedback is turned into continuation prompt fragments so the assistant can keep going with specific instructions. The file is strict about malformed output: invalid JSON, missing reasons for block decisions, failed commands, or strange exit codes become failed hook runs rather than silent guesses.
+
+If several hooks run, their results are combined. A stop decision wins over block decisions. If nothing stops but one or more hooks block, their feedback is joined in declaration order.
 
 #### Function details
 
@@ -3388,11 +3396,11 @@ The core logic lives in `parse_completed`. For exit code `0`, stdout must be val
 fn event_name(&self) -> HookEventName
 ```
 
-**Purpose**: Maps the stop target variant to the corresponding protocol hook event name.
+**Purpose**: This chooses the protocol event name that matches the kind of stop being processed. It lets the rest of the hook system treat a normal assistant stop and a subagent stop as two distinct hook events.
 
-**Data flow**: Reads `self` and returns `HookEventName::Stop` for `Stop` or `HookEventName::SubagentStop` for `SubagentStop { .. }`.
+**Data flow**: It reads the StopHookTarget value. If the target is a normal stop, it returns the Stop event name; if it is a subagent stop, it returns the SubagentStop event name. Nothing else is changed.
 
-**Call relations**: Used by both preview and execution to select the correct handler set.
+**Call relations**: The preview and run flows call this before selecting handlers, so the dispatcher only considers hook commands registered for the correct stop event.
 
 
 ##### `StopHookTarget::matcher_input`  (lines 54–59)
@@ -3401,11 +3409,11 @@ fn event_name(&self) -> HookEventName
 fn matcher_input(&self) -> Option<&str>
 ```
 
-**Purpose**: Extracts the optional matcher string used during stop-hook dispatch.
+**Purpose**: This provides the optional matching text used to narrow down which stop hooks apply. For subagent stops, the agent type can be used as the match key; for normal stops, there is no extra match key.
 
-**Data flow**: Returns `None` for top-level `Stop`, because ordinary stop hooks do not dispatch on a matcher, and `Some(agent_type.as_str())` for `SubagentStop`.
+**Data flow**: It reads the StopHookTarget value. A normal stop produces no matcher input, while a subagent stop produces the agent type as text. It only returns a borrowed view of existing data.
 
-**Call relations**: Passed into `dispatcher::select_handlers` so only subagent stop hooks use matcher-based filtering.
+**Call relations**: The preview and run flows pass this to the dispatcher together with the event name, so configured handlers can be filtered before any command is run.
 
 
 ##### `preview`  (lines 81–93)
@@ -3417,11 +3425,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Lists the stop handlers that would run for a given request without executing them.
+**Purpose**: This answers the question, “Which stop hooks would run for this request?” without actually running any external commands. It is useful for showing planned hook activity to callers or user interfaces.
 
-**Data flow**: Accepts configured handlers and a borrowed `StopRequest`, derives event name and matcher input from `request.target`, selects matching handlers, and maps them to `HookRunSummary` values via `dispatcher::running_summary`.
+**Data flow**: It receives the full list of configured handlers and a stop request. It asks the dispatcher to select only the handlers matching the request’s stop event and optional matcher input, then converts each selected handler into a running summary. It returns those summaries and does not change the request or handlers.
 
-**Call relations**: Called by the engine-facing `preview_stop` method and kept in sync with `run` by sharing the same selection logic.
+**Call relations**: This is called by the higher-level preview_stop flow. It relies on StopHookTarget::event_name and StopHookTarget::matcher_input indirectly through the request, then hands selection work to the dispatcher.
 
 *Call graph*: calls 1 internal fn (select_handlers); called by 1 (preview_stop).
 
@@ -3436,11 +3444,11 @@ async fn run(
 ) -> StopOutcome
 ```
 
-**Purpose**: Executes matching `Stop` or `SubagentStop` handlers and reduces their outputs into one stop/block decision.
+**Purpose**: This is the main worker for stop hooks. It selects the right hook commands, sends them a JSON description of the stop moment, waits for their results, and returns the combined decision.
 
-**Data flow**: Consumes handlers, shell, and an owned `StopRequest`. It selects matching handlers and returns a default-like empty `StopOutcome` if none match. For `Stop`, it constructs `StopCommandInput`; for `SubagentStop`, it constructs `SubagentStopCommandInput`, converting optional transcript paths and last assistant message through `NullableString` helpers. It serializes the input to JSON, returning synthetic failure events on serialization error. On success it calls `dispatcher::execute_handlers` with cwd, `Some(request.turn_id)`, and `parse_completed`, then passes the parsed handler data into `aggregate_results`. The returned `StopOutcome` contains all completed events plus aggregate stop/block flags, reasons, and continuation fragments.
+**Data flow**: It receives configured handlers, a command shell used to run external commands, and a StopRequest. It filters matching handlers; if none match, it returns an empty outcome. Otherwise it builds the correct JSON input for either Stop or SubagentStop, runs the selected commands in the request’s working directory, parses each completed command, combines their decisions, and returns hook event records plus final flags such as should_stop or should_block.
 
-**Call relations**: Invoked by `run_stop`. It delegates per-handler parsing to `parse_completed`, aggregate precedence rules to `aggregate_results`, and serialization-failure event generation to `common::serialization_failure_hook_events`.
+**Call relations**: This is called by the higher-level run_stop flow. It uses the dispatcher to select and execute hook commands, uses parse_completed as the callback that understands each command’s output, and uses aggregate_results to turn many hook answers into one final StopOutcome. If JSON input cannot be created, it asks common hook code to create failure events and wraps them with serialization_failure_outcome.
 
 *Call graph*: calls 7 internal fn (execute_handlers, select_handlers, serialization_failure_hook_events, aggregate_results, serialization_failure_outcome, from_path, from_string); called by 1 (run_stop); 3 external calls (new, format!, to_string).
 
@@ -3455,11 +3463,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<StopHandlerData>
 ```
 
-**Purpose**: Parses one completed stop-hook command into protocol output entries, stop/block flags, and optional continuation prompt fragments.
+**Purpose**: This translates one finished hook command into a structured result the system can trust. It decides whether that hook completed normally, failed, stopped processing, or blocked stopping with feedback.
 
-**Data flow**: Takes a `ConfiguredHandler`, `CommandRunResult`, and optional `turn_id`. It first validates that `handler.event_name` is `Stop` or `SubagentStop`, panicking otherwise. It initializes status and decision fields, then branches on command outcome. A transport-level `error` becomes failed status with an `Error` entry. Exit code `0` requires valid JSON parsed by `output_parser::parse_stop` or `parse_subagent_stop`; warnings become `Warning` entries, `continue:false` sets `Stopped`, `should_stop`, and optional `Stop` entry, invalid block reasons become failed `Error`s, and `decision:block` with a non-empty trimmed reason sets `Blocked`, `should_block`, `block_reason`, a `Feedback` entry, and a single `HookPromptFragment::from_single_hook(reason, completed.run.id.clone())`. Missing or blank block reasons fail with event-specific messages. Exit code `2` is treated specially: stderr must contain a non-empty trimmed continuation prompt, which produces the same blocked state and fragment; otherwise the run fails. Other exit codes or missing status codes become generic failures. It then builds `HookCompletedEvent` via `dispatcher::completed_summary` and returns `dispatcher::ParsedHandler<StopHandlerData>`.
+**Data flow**: It receives the handler that ran, the command’s exit information, and an optional turn id. It inspects command errors, exit code, standard output, and standard error. For successful commands, it parses event-specific JSON from standard output. For exit code 2, it treats non-empty standard error as feedback to continue. It returns a completed hook event plus StopHandlerData showing stop/block decisions and any continuation prompt fragments.
 
-**Call relations**: Supplied as the parser callback from `run`. The tests call it directly to validate precedence between stop and block, stderr-based blocking, and strict invalid-output handling.
+**Call relations**: The dispatcher calls this after each hook command finishes during run. The tests call it directly to check edge cases. Inside, it uses the output parser for Stop or SubagentStop JSON, shared text trimming for reasons, and dispatcher summary creation so the final event log has consistent status and entries.
 
 *Call graph*: calls 4 internal fn (completed_summary, parse_stop, parse_subagent_stop, trimmed_non_empty); called by 7 (block_decision_with_blank_reason_fails_instead_of_blocking, block_decision_with_reason_sets_continuation_prompt, block_decision_without_reason_is_invalid, continue_false_overrides_block_decision, exit_code_two_uses_stderr_feedback_only, exit_code_two_without_stderr_does_not_block, invalid_stdout_fails_instead_of_silently_nooping); 4 external calls (new, format!, panic!, unreachable!).
 
@@ -3472,11 +3480,11 @@ fn aggregate_results(
 ) -> StopHandlerData
 ```
 
-**Purpose**: Combines multiple parsed stop-hook results into one final decision with stop taking precedence over block.
+**Purpose**: This combines several individual hook decisions into one overall decision. It defines the priority rule: any stop decision wins; otherwise, block decisions are collected together.
 
-**Data flow**: Consumes an iterator of `&StopHandlerData`, collects it into a `Vec`, computes `should_stop` if any result requested stop, picks the first available `stop_reason`, computes `should_block` only when no stop occurred and at least one result requested block, joins all block reasons with `common::join_text_chunks` when blocking is active, and concatenates continuation fragments from blocking results in iteration order. Returns a new `StopHandlerData` carrying the aggregate values.
+**Data flow**: It receives a collection of StopHandlerData values. It checks whether any hook requested stopping, takes the first stop reason if present, and only considers blocking if nothing requested stopping. If blocking applies, it joins all block reasons and gathers all continuation fragments from blocking hooks. It returns one combined StopHandlerData value.
 
-**Call relations**: Called by `run` after all handlers finish, and directly by a unit test that verifies declaration-order concatenation of block reasons.
+**Call relations**: The run function calls this after all selected hooks have finished. A test also calls it directly to confirm that multiple block reasons are joined in declaration order.
 
 *Call graph*: calls 1 internal fn (join_text_chunks); called by 2 (run, aggregate_results_concatenates_blocking_reasons_in_declaration_order); 3 external calls (into_iter, iter, new).
 
@@ -3487,11 +3495,11 @@ fn aggregate_results(
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOutcome
 ```
 
-**Purpose**: Packages synthetic serialization-failure events into a non-stopping, non-blocking `StopOutcome`.
+**Purpose**: This creates a safe stop outcome for the rare case where the system cannot turn the request into JSON for a hook command. It records the failure events but does not stop or block the assistant.
 
-**Data flow**: Accepts a vector of `HookCompletedEvent` and returns `StopOutcome` with those events plus all decision flags cleared and an empty continuation-fragment list.
+**Data flow**: It receives already-created hook completion events that describe the serialization failure. It wraps them in a StopOutcome with all decision flags set to false and no continuation fragments. It does not inspect or modify the events.
 
-**Call relations**: Used only from `run` when request JSON cannot be serialized.
+**Call relations**: The run function calls this after common serialization-failure reporting has produced hook events. It is the final fallback path before returning to the higher-level stop runner.
 
 *Call graph*: called by 1 (run); 1 external calls (new).
 
@@ -3502,11 +3510,11 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOu
 fn block_decision_with_reason_sets_continuation_prompt()
 ```
 
-**Purpose**: Verifies that a valid `decision:block` response produces blocked status and a continuation fragment tied to the hook run id.
+**Purpose**: This test checks the happy path for a hook that blocks stopping and gives a useful reason. It proves that the reason becomes both the block reason and the continuation prompt sent back to the assistant.
 
-**Data flow**: Builds a stop handler and a successful JSON run containing `decision:block` and `reason`, parses it, and asserts blocked flags plus a single `HookPromptFragment` whose `hook_run_id` matches the completed run.
+**Data flow**: It builds a fake handler and a fake successful command result whose output says to block with the reason “retry with tests.” It passes them into parse_completed and compares the parsed data and run status with the expected blocked result.
 
-**Call relations**: Exercises the structured block branch in `parse_completed`.
+**Call relations**: This test exercises parse_completed directly, using the local handler and run_result helpers to avoid running a real external command.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3517,11 +3525,11 @@ fn block_decision_with_reason_sets_continuation_prompt()
 fn block_decision_without_reason_is_invalid()
 ```
 
-**Purpose**: Checks that `decision:block` without a non-empty reason is rejected.
+**Purpose**: This test checks that a hook cannot block stopping without explaining why. That matters because the assistant needs feedback in order to continue usefully.
 
-**Data flow**: Parses successful stdout containing only `{"decision":"block"}`, then asserts default handler data, failed status, and the specific validation error entry.
+**Data flow**: It creates a fake successful hook output with a block decision but no reason. After parse_completed reads it, the test expects no block decision to be recorded and expects the hook run to be marked failed with a clear error message.
 
-**Call relations**: Covers the missing-reason validation path in `parse_completed`.
+**Call relations**: This test calls parse_completed directly and confirms the validation rule used during real hook execution.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3532,11 +3540,11 @@ fn block_decision_without_reason_is_invalid()
 fn continue_false_overrides_block_decision()
 ```
 
-**Purpose**: Ensures that `continue:false` takes precedence over any simultaneous block decision fields.
+**Purpose**: This test checks the priority rule inside one hook response: an explicit request to stop overrides a block decision in the same output. It prevents mixed messages from being treated as a request to continue.
 
-**Data flow**: Supplies JSON containing both `continue:false` and `decision:block`, parses it, and asserts that the result is a stop with no block flags or continuation fragments.
+**Data flow**: It feeds parse_completed a fake output containing continue:false, a stop reason, and also a block decision. The parsed result is expected to request stopping, keep the stop reason, and produce no block reason or continuation prompt.
 
-**Call relations**: Documents the precedence encoded in `parse_completed` before block handling is considered.
+**Call relations**: This test calls parse_completed with local fake data. It documents the same priority rule that aggregate_results applies across multiple hooks: stopping wins over blocking.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3547,11 +3555,11 @@ fn continue_false_overrides_block_decision()
 fn exit_code_two_uses_stderr_feedback_only()
 ```
 
-**Purpose**: Verifies the legacy exit-code-2 blocking path that reads the continuation prompt from stderr.
+**Purpose**: This test checks the legacy or alternate signal where a hook exits with code 2 to block stopping. In that case, standard error is treated as the feedback text.
 
-**Data flow**: Creates a run with `exit_code = Some(2)`, ignored stdout, and non-empty stderr, parses it, and asserts blocked status, block reason, and a continuation fragment built from stderr text.
+**Data flow**: It creates a fake command result with exit code 2, ignored standard output, and standard error containing “retry with tests.” After parse_completed runs, the test expects a blocked status, that reason as feedback, and a continuation prompt fragment.
 
-**Call relations**: Exercises the dedicated exit-code-2 branch in `parse_completed`.
+**Call relations**: This test calls parse_completed directly and verifies the special exit-code path used during real hook execution.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3562,11 +3570,11 @@ fn exit_code_two_uses_stderr_feedback_only()
 fn exit_code_two_without_stderr_does_not_block()
 ```
 
-**Purpose**: Checks that exit code 2 without a usable stderr prompt fails instead of silently blocking.
+**Purpose**: This test checks that exit code 2 is not enough by itself to block stopping. The hook must also provide non-empty feedback text.
 
-**Data flow**: Parses a run with `exit_code = Some(2)` and blank stderr, then asserts default data, failed status, and the event-specific missing-prompt error.
+**Data flow**: It feeds parse_completed a fake command result with exit code 2 and blank standard error. The parsed result should stay at the default no-decision state, while the completed run should be marked failed with an explanatory error.
 
-**Call relations**: Covers the validation failure branch of the legacy blocking path.
+**Call relations**: This test directly exercises parse_completed’s validation for the exit-code-2 blocking path.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3577,11 +3585,11 @@ fn exit_code_two_without_stderr_does_not_block()
 fn block_decision_with_blank_reason_fails_instead_of_blocking()
 ```
 
-**Purpose**: Ensures whitespace-only block reasons are treated as invalid, not as usable continuation prompts.
+**Purpose**: This test checks that whitespace does not count as a real block reason. It protects the assistant from being asked to continue without meaningful instructions.
 
-**Data flow**: Parses JSON with `decision:block` and a blank `reason`, then asserts failed status and the same non-empty-reason validation error used for missing reasons.
+**Data flow**: It sends parse_completed a fake successful JSON response with decision:block and a reason made only of spaces. The result should not block, and the hook run should be marked failed with the same missing-reason error used when the reason is absent.
 
-**Call relations**: Exercises `common::trimmed_non_empty` integration inside `parse_completed`.
+**Call relations**: This test calls parse_completed directly and relies on the same trimming behavior used in production.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3592,11 +3600,11 @@ fn block_decision_with_blank_reason_fails_instead_of_blocking()
 fn invalid_stdout_fails_instead_of_silently_nooping()
 ```
 
-**Purpose**: Confirms that non-JSON stdout on a successful stop hook is always an error.
+**Purpose**: This test checks that malformed hook output is treated as a failure rather than ignored. That makes hook problems visible instead of silently changing behavior.
 
-**Data flow**: Supplies `stdout = "not json"` with exit code `0`, parses it, and asserts failed status, default data, and the invalid-stop-JSON error entry.
+**Data flow**: It creates a fake successful command result whose standard output is not valid JSON. parse_completed should return default decision data and a completed run marked failed with an invalid-output error.
 
-**Call relations**: Documents the stricter parsing contract for stop hooks compared with context-injecting hooks.
+**Call relations**: This test directly exercises parse_completed’s parsing-failure branch for normal Stop hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3607,11 +3615,11 @@ fn invalid_stdout_fails_instead_of_silently_nooping()
 fn aggregate_results_concatenates_blocking_reasons_in_declaration_order()
 ```
 
-**Purpose**: Verifies that multiple blocking results are merged in order and their continuation fragments are preserved in the same order.
+**Purpose**: This test checks how feedback from several blocking hooks is combined. It confirms that reasons keep their configured order and are separated clearly.
 
-**Data flow**: Constructs two `StopHandlerData` references with distinct block reasons and fragments, passes them to `aggregate_results`, and asserts the joined reason string `first\n\nsecond` plus ordered fragment concatenation.
+**Data flow**: It creates two StopHandlerData values that both block with different reasons and prompt fragments. It passes them to aggregate_results and expects one blocked result with the reasons joined as “first”, blank line, “second”, plus both prompt fragments preserved.
 
-**Call relations**: Directly tests the aggregation logic used by `run` after all handlers complete.
+**Call relations**: This test calls aggregate_results directly, covering the same combining step that run uses after all hook commands finish.
 
 *Call graph*: calls 1 internal fn (aggregate_results); 2 external calls (assert_eq!, vec!).
 
@@ -3622,11 +3630,11 @@ fn aggregate_results_concatenates_blocking_reasons_in_declaration_order()
 fn handler() -> ConfiguredHandler
 ```
 
-**Purpose**: Creates a standard `Stop` handler fixture for parser tests.
+**Purpose**: This helper builds a sample configured Stop hook for the tests. It gives parse_completed enough handler metadata to create realistic completed-run summaries.
 
-**Data flow**: Returns a `ConfiguredHandler` with `event_name = HookEventName::Stop`, fixed command metadata, an absolute test source path, and an empty environment map.
+**Data flow**: It takes no input. It returns a ConfiguredHandler with the Stop event name, a dummy command, a timeout, a fake source path, and other fixed fields. It does not run the command.
 
-**Call relations**: Shared by all parser tests in this module.
+**Call relations**: Several tests call this helper before calling parse_completed, so they can focus on output parsing behavior instead of repeating setup data.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -3637,22 +3645,22 @@ fn handler() -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Builds deterministic command-run fixtures for stop-hook parser tests.
+**Purpose**: This helper builds a fake command result for the tests. It lets tests describe only the exit code, standard output, and standard error that matter for parsing.
 
-**Data flow**: Accepts optional exit code and stdout/stderr strings, copies them into a `CommandRunResult` with fixed timing fields and `error = None`, and returns it.
+**Data flow**: It receives an optional exit code, stdout text, and stderr text. It returns a CommandRunResult with fixed timing values, those supplied streams, and no command-level error.
 
-**Call relations**: Used by every test here to isolate parsing behavior from process execution.
+**Call relations**: The parse_completed tests call this helper to simulate different hook command outcomes without launching real processes.
 
 
 ### `hooks/src/events/compact.rs`
 
-`domain_logic` · `pre-compact and post-compact hook handling during compaction lifecycle`
+`orchestration` · `during pre- and post-compaction hook handling`
 
-This module handles the compact lifecycle hooks, which are simpler than tool-use hooks because they have no matcher aliases, no tool-use ID suffixing, and no event-specific rewrite/block payloads beyond universal stop semantics. It defines `PreCompactRequest` and `PostCompactRequest` carrying session, turn, optional subagent metadata, cwd, transcript path, model, and a `trigger` string, plus outcome structs that report completed hook events and whether execution should stop.
+This file is the bridge between the compaction lifecycle and external hook commands. A hook is a user-configured command that Codex runs at a certain event, like “before compaction” or “after compaction.” Without this file, those commands would not receive the right context, their results would not be interpreted, and a hook would not be able to pause or stop compaction-related work.
 
-`preview_pre` and `preview_post` select handlers by `HookEventName` and the request trigger, then convert them into running summaries. `run_pre` and `run_post` perform the full flow: select matching handlers, early-return if none match, serialize request data into `PreCompactCommandInput` or `PostCompactCommandInput`, synthesize failed events if serialization fails, and otherwise execute handlers through `dispatcher::execute_handlers`. The resulting parsed handler data is folded into `should_stop` and first `stop_reason` while preserving all completed events.
+The flow is much like giving a stage crew a cue sheet. First, the file finds which configured hook commands match the event: PreCompact or PostCompact, plus the specific trigger such as a manual compaction. Preview functions report what would run. Run functions actually build a JSON message with details like session id, turn id, current folder, model, transcript path, subagent information, and trigger. That JSON is handed to the dispatcher, which starts each command in the chosen shell.
 
-Parsing is split between `parse_pre_completed` and a generic `parse_completed` used for post-compact. Both inspect `CommandRunResult` in the same order: transport error, exit code 0 with optional JSON parsing, nonzero exit code, or missing exit code. Plain stdout is ignored; JSON-like but invalid stdout becomes a failed run. For valid parsed output, `system_message` becomes a warning entry, `continue:false` becomes `HookRunStatus::Stopped` with a `Stop` entry, and stderr on nonzero exit is trimmed before falling back to `hook exited with code ...`.
+After a command finishes, this file turns the raw result into a clear hook event. It records failures, non-zero exit codes, missing exit codes, warning messages, and stop requests. Plain text output is ignored unless it looks like structured JSON. For PreCompact and PostCompact, a hook can return “continue: false” to stop later processing and optionally explain why.
 
 #### Function details
 
@@ -3665,11 +3673,11 @@ fn preview_pre(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Builds preview rows for `PreCompact` handlers matching the request trigger. It does not execute commands.
+**Purpose**: Shows which PreCompact hook commands would run for this request, without actually running them. This is useful when the system wants to display planned hook activity before doing the work.
 
-**Data flow**: Takes handler slice and `PreCompactRequest` → calls `dispatcher::select_handlers` with `HookEventName::PreCompact` and `Some(trigger)` → maps each selected handler to `dispatcher::running_summary` → returns `Vec<HookRunSummary>`.
+**Data flow**: It receives the full list of configured handlers and a pre-compaction request. It filters that list to handlers for the PreCompact event and the request’s trigger, then turns each matching handler into a short running summary. The result is a list of summaries and no outside state is changed.
 
-**Call relations**: Called by the higher-level pre-compact preview API before any hook execution occurs.
+**Call relations**: A higher-level preview flow, preview_pre_compact, calls this when it needs to explain upcoming pre-compaction hook work. This function asks the dispatcher to choose matching handlers, then asks the dispatcher to format each one as a running summary.
 
 *Call graph*: calls 1 internal fn (select_handlers); called by 1 (preview_pre_compact).
 
@@ -3684,11 +3692,11 @@ async fn run_pre(
 ) -> PreCompactOutcome
 ```
 
-**Purpose**: Executes all matching `PreCompact` handlers and aggregates whether compaction should stop. It handles no-match and serialization-failure cases explicitly.
+**Purpose**: Runs all matching PreCompact hooks and reports whether any of them asked the system to stop before compaction. It is the main execution path for hooks that happen before compaction.
 
-**Data flow**: Selects matching handlers for `PreCompact` and trigger → returns an empty `PreCompactOutcome` if none match → serializes request via `pre_command_input_json`; on error, returns failed synthetic events from `common::serialization_failure_hook_events` → otherwise executes handlers with `dispatcher::execute_handlers`, using `parse_pre_completed` to parse each result → computes `should_stop` as any parsed stop and `stop_reason` as the first available reason → returns outcome with collected completed events.
+**Data flow**: It receives configured handlers, a command shell, and a pre-compaction request. It selects matching handlers; if there are none, it returns an empty successful outcome. Otherwise it converts the request into JSON, runs the handlers in the request’s working directory, parses each completed command, and returns completed hook events plus a combined stop decision and reason.
 
-**Call relations**: Invoked by the public pre-compact run path; it delegates selection and execution to `dispatcher` and parsing to `parse_pre_completed`.
+**Call relations**: run_pre_compact calls this when pre-compaction hooks need to actually run. This function relies on pre_command_input_json to build the command input, dispatcher::execute_handlers to start commands, and parse_pre_completed to interpret each command’s result. If JSON creation fails, it uses common::serialization_failure_hook_events to turn that failure into hook events instead of crashing the flow.
 
 *Call graph*: calls 4 internal fn (execute_handlers, select_handlers, serialization_failure_hook_events, pre_command_input_json); called by 1 (run_pre_compact); 2 external calls (new, format!).
 
@@ -3699,11 +3707,11 @@ async fn run_pre(
 fn pre_command_input_json(request: &PreCompactRequest) -> Result<String, serde_json::Error>
 ```
 
-**Purpose**: Serializes a `PreCompactRequest` into the JSON stdin expected by compact hook commands. It includes lifecycle metadata and optional subagent fields.
+**Purpose**: Builds the JSON input sent to a PreCompact hook command. This gives the external command enough context to know what session, turn, model, folder, trigger, and optional subagent it is being run for.
 
-**Data flow**: Reads request fields and converts optional subagent via `SubagentCommandInputFields::from` and transcript path via `NullableString::from_path` → constructs `PreCompactCommandInput` with `hook_event_name = "PreCompact"` → serializes it with `serde_json::to_string` and returns the JSON string or serialization error.
+**Data flow**: It receives a PreCompactRequest. It pulls out subagent fields if present, converts the optional transcript path into the schema’s nullable string form, formats IDs and paths as strings, and serializes everything into one JSON string. It returns either that string or a serialization error.
 
-**Call relations**: Used by `run_pre` and directly by a unit test that verifies the serialized payload shape.
+**Call relations**: run_pre calls this just before executing hook commands. The test tests::pre_compact_input_includes_lifecycle_metadata also calls it to make sure the hook receives the expected lifecycle metadata.
 
 *Call graph*: calls 2 internal fn (from_path, from); called by 2 (run_pre, pre_compact_input_includes_lifecycle_metadata); 1 external calls (to_string).
 
@@ -3717,11 +3725,11 @@ fn preview_post(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Builds preview rows for `PostCompact` handlers matching the request trigger. It mirrors `preview_pre` for the post phase.
+**Purpose**: Shows which PostCompact hook commands would run for this request, without running them. It is the post-compaction counterpart to preview_pre.
 
-**Data flow**: Selects handlers with `HookEventName::PostCompact` and `Some(trigger)` → maps them to running summaries → returns the preview vector.
+**Data flow**: It receives configured handlers and a post-compaction request. It filters handlers to the PostCompact event and the request’s trigger, then converts each match into a summary. It returns those summaries without changing anything else.
 
-**Call relations**: Called by the higher-level post-compact preview API.
+**Call relations**: preview_post_compact calls this during the preview path for post-compaction hooks. The function delegates matching and summary formatting to the dispatcher.
 
 *Call graph*: calls 1 internal fn (select_handlers); called by 1 (preview_post_compact).
 
@@ -3736,11 +3744,11 @@ async fn run_post(
 ) -> StatelessHookOutcome
 ```
 
-**Purpose**: Executes all matching `PostCompact` handlers and aggregates stop decisions after compaction. It mirrors `run_pre` with post-specific input serialization and parsing.
+**Purpose**: Runs all matching PostCompact hooks and reports whether any hook asked later processing to stop. This is used after compaction has already happened.
 
-**Data flow**: Selects matching `PostCompact` handlers → returns empty `StatelessHookOutcome` if none → serializes request via `post_command_input_json`; on error returns synthetic failed events → otherwise executes handlers with `parse_post_completed` → folds parsed results into `should_stop`, first `stop_reason`, and completed events → returns the outcome.
+**Data flow**: It receives configured handlers, a shell, and a post-compaction request. It selects matching handlers; if none match, it returns an empty outcome. If handlers match, it serializes the request to JSON, runs the commands in the request’s current directory, parses their results, and returns completed hook events plus any stop request and reason.
 
-**Call relations**: Invoked by the public post-compact run path and delegates parsing to the generic post parser wrapper.
+**Call relations**: run_post_compact calls this when post-compaction hooks need to execute. It uses post_command_input_json for the command input, dispatcher::execute_handlers for running commands, and parse_post_completed for interpreting results. If input serialization fails, it reports that through common::serialization_failure_hook_events.
 
 *Call graph*: calls 4 internal fn (execute_handlers, select_handlers, serialization_failure_hook_events, post_command_input_json); called by 1 (run_post_compact); 2 external calls (new, format!).
 
@@ -3751,11 +3759,11 @@ async fn run_post(
 fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde_json::Error>
 ```
 
-**Purpose**: Serializes a `PostCompactRequest` into command stdin JSON. It is the post-phase counterpart to `pre_command_input_json`.
+**Purpose**: Builds the JSON input sent to a PostCompact hook command. It packages the same kind of lifecycle information as the pre-compaction input, but labels the event as PostCompact.
 
-**Data flow**: Converts optional subagent and transcript path, copies request metadata, sets `hook_event_name = "PostCompact"`, builds `PostCompactCommandInput`, and serializes it to a JSON string or returns a `serde_json::Error`.
+**Data flow**: It receives a PostCompactRequest. It extracts subagent data if present, converts paths and IDs into strings, includes model and trigger information, and serializes the full command input as JSON. It returns the JSON string or an error if serialization fails.
 
-**Call relations**: Used by `run_post` and by the unit test that checks post-compact input serialization.
+**Call relations**: run_post calls this before launching post-compaction hook commands. The test tests::post_compact_input_includes_lifecycle_metadata calls it to verify the shape of the JSON sent to hooks.
 
 *Call graph*: calls 2 internal fn (from_path, from); called by 2 (run_post, post_compact_input_includes_lifecycle_metadata); 1 external calls (to_string).
 
@@ -3770,11 +3778,11 @@ fn parse_pre_completed(
 ) -> dispatcher::ParsedHandler<CompactHandlerData>
 ```
 
-**Purpose**: Parses one completed `PreCompact` command run into transcript entries, run status, and stop metadata. It treats only universal output as valid structured JSON.
+**Purpose**: Turns the raw result of one PreCompact hook command into a structured completed hook event. It also detects whether the hook asked the system to stop before compaction.
 
-**Data flow**: Takes a handler, `CommandRunResult`, and optional turn ID → initializes empty entries/status/data → if `run_result.error` exists, marks failed with one error entry → else branches on `exit_code`: `0` parses stdout; empty stdout is ignored; valid `parse_pre_compact` output may emit a warning entry from `system_message`, a stopped status and `Stop` entry when `continue_processing` is false, or an error entry for `invalid_reason`; JSON-like but unparsable stdout becomes `hook returned invalid PreCompact hook JSON output`; nonzero exit uses trimmed stderr or fallback exit-code text; missing exit code yields a fixed error → wraps everything in `dispatcher::completed_summary` and returns `ParsedHandler<CompactHandlerData>`.
+**Data flow**: It receives the handler that ran, the command’s stdout, stderr, exit code, timing, and possible launch error, plus the turn id. If the command failed to start, exited badly, or returned invalid PreCompact JSON, it records a failure entry. If it returned valid hook JSON with a warning, it records that warning. If it returned continue:false, it marks the run as stopped, saves the stop reason, and creates a stop entry. It returns a parsed handler result containing the user-visible completed event and the internal stop data.
 
-**Call relations**: Used by `run_pre` and directly by tests covering stop behavior, invalid JSON, and plain-stdout no-op behavior.
+**Call relations**: dispatcher::execute_handlers uses this as the parser supplied by run_pre. Several tests call it directly to confirm important behavior: unsupported block decisions fail, continue:false stops the flow, and ordinary plain stdout is ignored.
 
 *Call graph*: calls 4 internal fn (completed_summary, looks_like_json, parse_pre_compact, trimmed_non_empty); called by 3 (block_decision_is_not_supported_for_pre_compact, continue_false_stops_before_compaction, pre_compact_ignores_plain_stdout); 1 external calls (new).
 
@@ -3789,11 +3797,11 @@ fn parse_post_completed(
 ) -> dispatcher::ParsedHandler<CompactHandlerData>
 ```
 
-**Purpose**: Thin wrapper that parses a `PostCompact` command run using the generic compact completion parser. It supplies the event label and parser function.
+**Purpose**: Turns the raw result of one PostCompact hook command into a structured completed hook event. It is a thin wrapper that supplies the PostCompact label and parser to the shared parsing helper.
 
-**Data flow**: Forwards handler, run result, turn ID, event label `PostCompact`, and `output_parser::parse_post_compact` into `parse_completed` → returns the parsed handler result.
+**Data flow**: It receives a handler, command result, and optional turn id. It forwards those values to parse_completed along with the PostCompact event label and the post-compaction output parser. It returns the parsed hook result produced by the shared helper.
 
-**Call relations**: Called by `run_post` and by tests for post-compact completion behavior.
+**Call relations**: dispatcher::execute_handlers uses this through run_post. The tests for post-compaction stopping and plain stdout call it directly. Internally it hands the real interpretation work to parse_completed.
 
 *Call graph*: calls 1 internal fn (parse_completed); called by 2 (post_compact_continue_false_stops_after_compaction, post_compact_ignores_plain_stdout).
 
@@ -3809,11 +3817,11 @@ fn parse_completed(
     parse_output: fn(&str) -> Option<output_parser::S
 ```
 
-**Purpose**: Generic completion parser for stateless compact hooks that support universal stop semantics. It handles command errors, invalid JSON-like stdout, warnings, and stop entries.
+**Purpose**: Provides the shared parsing rules for stateless compact hooks, currently used by PostCompact. It converts process results into user-facing hook status, warnings, errors, and stop decisions.
 
-**Data flow**: Accepts handler, run result, turn ID, event label, and a parser function returning `StatelessHookOutput` → processes `run_result.error`, `exit_code`, stdout, and stderr similarly to `parse_pre_completed` → on valid parsed output, emits warning entries for `system_message`, stop entries and `Stopped` status for `continue:false`, error entries for `invalid_reason`, and ignores plain stdout → returns `dispatcher::ParsedHandler<CompactHandlerData>` with completion summary and stop metadata.
+**Data flow**: It receives the handler, the command’s raw result, an optional turn id, an event label, and a function that knows how to parse that event’s JSON output. It checks for launch errors, exit codes, stdout, stderr, valid hook JSON, invalid JSON-looking output, warning messages, and continue:false stop requests. It returns a parsed handler result with a completed event and compact hook data saying whether processing should stop.
 
-**Call relations**: Used by `parse_post_completed` to avoid duplicating the common post-compact parsing logic.
+**Call relations**: parse_post_completed calls this to avoid duplicating the general compact-hook parsing logic. It calls completed_summary to build the final run summary and uses helper functions to recognize JSON-looking output and trim useful error text from stderr.
 
 *Call graph*: calls 3 internal fn (completed_summary, looks_like_json, trimmed_non_empty); called by 1 (parse_post_completed); 2 external calls (new, format!).
 
@@ -3824,11 +3832,11 @@ fn parse_completed(
 fn pre_compact_input_includes_lifecycle_metadata()
 ```
 
-**Purpose**: Tests that serialized pre-compact command input contains the expected lifecycle fields and values. It verifies the JSON contract sent to hooks.
+**Purpose**: Checks that PreCompact hook input JSON contains the expected lifecycle details. This protects the contract that external hook commands rely on.
 
-**Data flow**: Builds a fixture request via `pre_request()` → serializes it with `pre_command_input_json` → parses the JSON string back into `serde_json::Value` → asserts equality with the expected object.
+**Data flow**: It builds a sample pre-compaction request, serializes it with pre_command_input_json, parses the JSON back into a generic value, and compares it with the exact expected fields. Nothing is returned; the test passes or fails.
 
-**Call relations**: Directly exercises `pre_command_input_json`.
+**Call relations**: This test calls pre_command_input_json and tests::pre_request. It confirms that the JSON-building helper used by run_pre includes session, turn, folder, event name, model, trigger, and transcript path information.
 
 *Call graph*: calls 1 internal fn (pre_command_input_json); 3 external calls (assert_eq!, pre_request, from_str).
 
@@ -3839,11 +3847,11 @@ fn pre_compact_input_includes_lifecycle_metadata()
 fn post_compact_input_includes_lifecycle_metadata()
 ```
 
-**Purpose**: Tests that serialized post-compact command input contains the expected lifecycle metadata. It mirrors the pre-compact serialization test.
+**Purpose**: Checks that PostCompact hook input JSON contains the expected lifecycle details. It makes sure post-compaction hooks receive the same essential context as pre-compaction hooks, with the correct event name.
 
-**Data flow**: Creates a fixture request via `post_request()` → serializes with `post_command_input_json` → parses back to JSON value → asserts the expected object shape and values.
+**Data flow**: It creates a sample post-compaction request, serializes it with post_command_input_json, parses the JSON, and compares it against the expected object. The output is the test result.
 
-**Call relations**: Directly covers `post_command_input_json`.
+**Call relations**: This test calls post_command_input_json and tests::post_request. It guards the input contract used by run_post before hook commands are launched.
 
 *Call graph*: calls 1 internal fn (post_command_input_json); 3 external calls (assert_eq!, post_request, from_str).
 
@@ -3854,11 +3862,11 @@ fn post_compact_input_includes_lifecycle_metadata()
 fn block_decision_is_not_supported_for_pre_compact()
 ```
 
-**Purpose**: Tests that a pre-compact hook returning block-decision JSON is treated as invalid output rather than a valid block. Pre-compact only supports universal stop semantics.
+**Purpose**: Verifies that a PreCompact hook cannot use a block-style decision response. This matters because this hook type uses the universal continue/stop format instead.
 
-**Data flow**: Builds a fake handler and successful run result whose stdout is `{"decision":"block",...}` → parses with `parse_pre_completed` → asserts failed status and one error entry saying the JSON output is invalid.
+**Data flow**: It creates a fake successful command result whose stdout contains JSON with decision:block. It sends that through parse_pre_completed and checks that the parsed run is marked failed with an invalid PreCompact JSON error. The test produces no normal value; it passes if the assertions hold.
 
-**Call relations**: Exercises the invalid-JSON-like branch after `parse_pre_compact` rejects unsupported structured output.
+**Call relations**: This test calls tests::handler and tests::run_result to build the inputs, then calls parse_pre_completed. It documents a boundary in the PreCompact hook output format.
 
 *Call graph*: calls 1 internal fn (parse_pre_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3869,11 +3877,11 @@ fn block_decision_is_not_supported_for_pre_compact()
 fn continue_false_stops_before_compaction()
 ```
 
-**Purpose**: Tests that `continue:false` with `stopReason` stops pre-compact processing and records the stop reason. This is the main structured control-flow path for pre-compact hooks.
+**Purpose**: Verifies that a PreCompact hook can stop processing by returning continue:false. This is the safety valve that lets a hook prevent compaction from going ahead.
 
-**Data flow**: Creates a successful run result with stdout `{"continue":false,"stopReason":"nope"}` → parses it → asserts `Stopped` status, `should_stop = true`, `stop_reason = Some("nope")`, and one `Stop` entry with the same text.
+**Data flow**: It creates a fake successful command result with JSON saying continue:false and a stop reason. It parses that result and checks that the status is stopped, should_stop is true, the reason is saved, and the completed event contains a stop entry.
 
-**Call relations**: Directly validates the stop-handling branch in `parse_pre_completed`.
+**Call relations**: This test calls tests::handler, tests::run_result, and parse_pre_completed. It proves the stop signal that run_pre later aggregates is correctly extracted from one hook result.
 
 *Call graph*: calls 1 internal fn (parse_pre_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3884,11 +3892,11 @@ fn continue_false_stops_before_compaction()
 fn post_compact_continue_false_stops_after_compaction()
 ```
 
-**Purpose**: Tests that `continue:false` also stops processing for post-compact hooks. It verifies the generic post parser preserves stop semantics.
+**Purpose**: Verifies that a PostCompact hook can ask later processing to stop by returning continue:false. Even though compaction already happened, the system can still pause the surrounding flow.
 
-**Data flow**: Creates a successful run result with post-compact stop JSON → parses via `parse_post_completed` → asserts stopped status, `should_stop`, stop reason, and one `Stop` entry.
+**Data flow**: It creates a fake successful post-compaction command result with continue:false and a stop reason. It parses the result and checks that the parsed status, stop flag, saved reason, and stop output entry all match expectations.
 
-**Call relations**: Exercises `parse_post_completed` and, through it, the generic `parse_completed` stop branch.
+**Call relations**: This test calls tests::handler, tests::run_result, and parse_post_completed. It confirms that parse_post_completed and its shared helper parse post-compaction stop requests correctly.
 
 *Call graph*: calls 1 internal fn (parse_post_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3899,11 +3907,11 @@ fn post_compact_continue_false_stops_after_compaction()
 fn pre_compact_ignores_plain_stdout()
 ```
 
-**Purpose**: Tests that non-JSON stdout from a successful pre-compact hook is ignored rather than treated as an error. Plain logging output is therefore harmless.
+**Purpose**: Verifies that ordinary text printed by a PreCompact hook is ignored when it is not structured hook JSON. This lets hook scripts log simple messages without accidentally creating warnings or errors.
 
-**Data flow**: Creates a successful run result with plain text stdout → parses with `parse_pre_completed` → asserts completed status and no entries.
+**Data flow**: It creates a fake successful command result with plain stdout text. It parses it as a PreCompact result and checks that the status remains completed and there are no output entries.
 
-**Call relations**: Covers the plain-stdout no-op branch in pre-compact parsing.
+**Call relations**: This test calls tests::handler, tests::run_result, and parse_pre_completed. It protects the parsing rule used when run_pre processes real hook command output.
 
 *Call graph*: calls 1 internal fn (parse_pre_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3914,11 +3922,11 @@ fn pre_compact_ignores_plain_stdout()
 fn post_compact_ignores_plain_stdout()
 ```
 
-**Purpose**: Tests that non-JSON stdout from a successful post-compact hook is also ignored. This mirrors pre-compact behavior.
+**Purpose**: Verifies that ordinary text printed by a PostCompact hook is ignored when it is not structured hook JSON. This keeps casual logging separate from hook control messages.
 
-**Data flow**: Creates a successful run result with plain text stdout → parses with `parse_post_completed` → asserts completed status and empty entries.
+**Data flow**: It creates a fake successful post-compaction command result with plain stdout. It parses it and checks that the run is completed with no entries.
 
-**Call relations**: Covers the plain-stdout branch in the generic post parser.
+**Call relations**: This test calls tests::handler, tests::run_result, and parse_post_completed. It confirms the same plain-output behavior for the post-compaction parser.
 
 *Call graph*: calls 1 internal fn (parse_post_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -3929,11 +3937,11 @@ fn post_compact_ignores_plain_stdout()
 fn pre_request() -> super::PreCompactRequest
 ```
 
-**Purpose**: Builds a canonical `PreCompactRequest` fixture for serialization tests. It supplies stable IDs and paths.
+**Purpose**: Builds a sample PreCompactRequest for tests. It keeps repeated test setup short and consistent.
 
-**Data flow**: Constructs a `ThreadId` from a fixed UUID string, uses `/tmp` as absolute cwd, and fills fixed turn/model/trigger values → returns the request struct.
+**Data flow**: It creates fixed values for a session id, turn id, no subagent, current directory, no transcript path, model name, and manual trigger. It returns a ready-to-use PreCompactRequest.
 
-**Call relations**: Used by the pre-compact input serialization test.
+**Call relations**: The pre-compaction input JSON test calls this helper. It supplies predictable request data so the expected JSON can be compared exactly.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (test_path_buf).
 
@@ -3944,11 +3952,11 @@ fn pre_request() -> super::PreCompactRequest
 fn post_request() -> super::PostCompactRequest
 ```
 
-**Purpose**: Builds a canonical `PostCompactRequest` fixture for serialization tests. It mirrors `pre_request` with a different fixed thread ID.
+**Purpose**: Builds a sample PostCompactRequest for tests. It mirrors tests::pre_request but uses a post-compaction request type and a different fixed session id.
 
-**Data flow**: Creates a fixed `ThreadId`, absolute `/tmp` cwd, and constant turn/model/trigger values → returns the request.
+**Data flow**: It creates a fixed post-compaction request with session id, turn id, no subagent, test current directory, no transcript path, model name, and manual trigger. It returns that request.
 
-**Call relations**: Used by the post-compact input serialization test.
+**Call relations**: The post-compaction input JSON test calls this helper. It provides stable input for checking post_command_input_json.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (test_path_buf).
 
@@ -3959,11 +3967,11 @@ fn post_request() -> super::PostCompactRequest
 fn handler(event_name: HookEventName) -> ConfiguredHandler
 ```
 
-**Purpose**: Creates a representative `ConfiguredHandler` fixture for compact hook parsing tests. It fixes source metadata and command details.
+**Purpose**: Builds a sample configured hook handler for tests. It represents a user hook command without needing to load a real hooks file.
 
-**Data flow**: Takes a `HookEventName` → returns `ConfiguredHandler` with that event, no matcher, command `python3 compact_hook.py`, timeout 5, status message, `/tmp/hooks.json` source path, `HookSource::User`, display order 0, and empty env map.
+**Data flow**: It receives the hook event name to use. It fills in a command, timeout, status message, source path, source type, display order, and empty environment map, then returns a ConfiguredHandler.
 
-**Call relations**: Used by all compact parsing tests to supply handler metadata for completed summaries.
+**Call relations**: Parser tests call this helper before calling parse_pre_completed or parse_post_completed. It gives those parser functions enough handler metadata to build completed hook summaries.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -3974,11 +3982,11 @@ fn handler(event_name: HookEventName) -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Builds a deterministic `CommandRunResult` fixture for compact parsing tests. It avoids repeating timestamp and duration setup.
+**Purpose**: Builds a fake command execution result for tests. It lets tests simulate different hook outputs and exit codes without running an actual external process.
 
-**Data flow**: Takes optional exit code plus stdout/stderr strings → returns `CommandRunResult` with fixed timestamps, duration, copied stdout/stderr, and `error = None`.
+**Data flow**: It receives an optional exit code, stdout text, and stderr text. It combines them with fixed timing values and no launch error, then returns a CommandRunResult.
 
-**Call relations**: Used by all compact parsing tests as the simulated command execution result.
+**Call relations**: The parser tests call this helper to feed controlled command results into parse_pre_completed and parse_post_completed. This makes each test focus on parsing behavior instead of process execution.
 
 
 ### Tool and permission hooks
@@ -3986,13 +3994,13 @@ These event handlers mediate tool execution and approval requests, aggregating h
 
 ### `hooks/src/events/pre_tool_use.rs`
 
-`domain_logic` · `pre-tool execution handling before a tool is invoked`
+`orchestration` · `request handling, immediately before a tool call is executed`
 
-This module contains the event-specific logic for hooks that run before a tool invocation. `PreToolUseRequest` carries session and turn metadata, optional subagent context, cwd, transcript path, model, permission mode, canonical tool name plus matcher aliases, the `tool_use_id`, and the proposed `tool_input`. `PreToolUseOutcome` reports all completed hook events, whether execution should be blocked, the first block reason, any accumulated additional contexts, and an optional rewritten input.
+This file is the checkpoint before the agent uses a tool, such as running a shell command or calling another service. Think of it like a security guard at a workshop door: before a tool is handed over, configured checks can look at the request and say “go ahead,” “do not do that,” “remember this extra note,” or “use this changed input instead.”
 
-`preview` selects handlers using matcher inputs derived from the canonical tool name and aliases, then rewrites preview run IDs with the tool-use ID. `run` repeats selection, returns an empty outcome if nothing matches, serializes a `PreToolUseCommandInput`, and on serialization failure returns synthetic failed events with neutral outcome fields. Otherwise it executes handlers and aggregates results: any handler block sets `should_block`, the first block reason wins, all additional contexts are flattened in handler order, and `updated_input` is chosen only when no handler blocked.
+The main input is a PreToolUseRequest. It carries the session and turn identifiers, the current folder, the model name, the permission mode, the tool name, the tool call id, and the tool’s JSON input. The main output is a PreToolUseOutcome. It reports which hook commands ran, whether the tool should be blocked, why it was blocked, any extra context to give back to the model, and any rewritten tool input.
 
-The rewrite-selection rule is subtle and encoded in `latest_updated_input`: hook events are reported in configured order, but competing rewrites are resolved by completion order, so the hook that actually finished last wins. `parse_completed` interprets successful JSON output via `output_parser::parse_pre_tool_use`, emits warning entries for `system_message`, records valid `additionalContext`, turns deny/block responses into `Blocked` runs with `Feedback`, and accepts rewrites only when not blocked. Unsupported outputs fail open as `Failed`. A legacy shell convention also exists: exit code `2` plus non-empty stderr means block with that stderr as the reason.
+The flow is simple. First, the file finds configured hook handlers whose matcher fits the tool name or one of its aliases. Then it turns the request into JSON and sends that JSON to each selected hook command. When commands finish, it reads their exit codes and output. Exit code 2 with a message means “block.” Valid hook JSON can also deny the tool, add context, or provide updated input. If several hooks rewrite the input, the rewrite from the hook that finished last wins. If any hook blocks the call, rewrites are ignored.
 
 #### Function details
 
@@ -4005,11 +4013,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Builds preview summaries for pre-tool-use hooks matching the tool name or aliases. It appends the tool-use ID to each run ID.
+**Purpose**: Shows which pre-tool-use hooks would run for a given tool call, without actually running them. This is useful for reporting planned hook activity to the rest of the system.
 
-**Data flow**: Takes handlers and `PreToolUseRequest` → computes matcher inputs with `common::matcher_inputs` → selects matching handlers for `HookEventName::PreToolUse` → maps each running summary through `common::hook_run_for_tool_use` using `tool_use_id` → returns preview summaries.
+**Data flow**: It receives configured handlers and a tool-use request. It builds the possible matcher names from the real tool name and aliases, selects handlers for the PreToolUse event, then turns each selected handler into a run summary tied to the specific tool use id. It returns those summaries and changes nothing else.
 
-**Call relations**: Called by the higher-level pre-tool-use preview API and by tests that compare preview IDs with completed or synthetic failure IDs.
+**Call relations**: Higher-level preview code calls this when it wants to display pending hook runs. Internally it relies on shared matcher-building logic and the dispatcher’s handler selection, then wraps each selected run with tool-use-specific identity information.
 
 *Call graph*: calls 2 internal fn (select_handlers_for_matcher_inputs, matcher_inputs); called by 3 (preview_pre_tool_use, preview_and_completed_run_ids_include_tool_use_id, serialization_failure_run_ids_include_tool_use_id).
 
@@ -4024,11 +4032,11 @@ async fn run(
 ) -> PreToolUseOutcome
 ```
 
-**Purpose**: Executes matching pre-tool-use hooks and aggregates block state, block reason, additional context, and any final input rewrite. It handles no-match and serialization-failure cases explicitly.
+**Purpose**: Runs all matching pre-tool-use hooks and combines their answers into one decision about the tool call. This is the main function that decides whether the tool proceeds, is blocked, gets extra model context, or receives rewritten input.
 
-**Data flow**: Computes matcher inputs and selects matching handlers → returns empty `PreToolUseOutcome` if none → serializes request via `command_input_json`; on error synthesizes failed events with `serialization_failure_hook_events_for_tool_use` and wraps them with `serialization_failure_outcome` → otherwise executes handlers with `dispatcher::execute_handlers` and `parse_completed` → computes `should_block` with `any`, takes the first available `block_reason`, flattens additional contexts, and if no block occurred chooses `updated_input` via `latest_updated_input` → rewrites completed event IDs with `hook_completed_for_tool_use` and returns the outcome.
+**Data flow**: It receives configured handlers, a command shell used to execute hook commands, and the full request. It selects matching handlers, serializes the request into JSON, runs the handlers, parses each result, combines block decisions and extra context, and chooses the latest completed input rewrite unless the tool was blocked. It returns a PreToolUseOutcome containing completed hook events and the final decision.
 
-**Call relations**: Invoked by the public pre-tool-use run path; it delegates parsing to `parse_completed` and rewrite conflict resolution to `latest_updated_input`.
+**Call relations**: The broader hook engine calls this from the pre-tool-use runner. It hands selection to the dispatcher, input building to command_input_json, result interpretation to parse_completed through the dispatcher, context flattening to shared common code, and rewrite selection to latest_updated_input.
 
 *Call graph*: calls 8 internal fn (execute_handlers, select_handlers_for_matcher_inputs, flatten_additional_contexts, matcher_inputs, serialization_failure_hook_events_for_tool_use, command_input_json, latest_updated_input, serialization_failure_outcome); called by 1 (run_pre_tool_use); 2 external calls (new, format!).
 
@@ -4041,11 +4049,11 @@ fn latest_updated_input(
 ) -> Option<Value>
 ```
 
-**Purpose**: Chooses the winning rewritten tool input from multiple handlers based on completion order rather than configuration order. This reflects the event contract for competing rewrites.
+**Purpose**: Chooses which rewritten tool input should be used when more than one hook suggests a rewrite. The rule is that the hook that actually finished last wins.
 
-**Data flow**: Takes a slice of `dispatcher::ParsedHandler<PreToolUseHandlerData>` → iterates results, extracting `(completion_order, updated_input)` pairs for handlers that produced a rewrite → selects the pair with the maximum `completion_order` → returns the associated `serde_json::Value`, or `None` if no handler rewrote input.
+**Data flow**: It receives parsed hook results. It looks only at results that contain an updated input, pairs each rewrite with that hook’s completion order, and picks the rewrite with the highest completion order. It returns that JSON value, or nothing if no hook rewrote the input.
 
-**Call relations**: Called only by `run` after all handlers complete and only when no handler blocked execution.
+**Call relations**: run calls this after all matching hooks have finished. It exists because reporting stays in configured order, but rewrite conflicts are resolved by completion order.
 
 *Call graph*: called by 1 (run); 1 external calls (iter).
 
@@ -4056,11 +4064,11 @@ fn latest_updated_input(
 fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json::Error>
 ```
 
-**Purpose**: Serializes a `PreToolUseRequest` into the JSON stdin contract for pre-tool-use hooks. It preserves the canonical tool name even if aliases were used for matching.
+**Purpose**: Builds the JSON text that is sent to a pre-tool-use hook on standard input. It gives the hook enough context to make a policy decision or rewrite the tool input.
 
-**Data flow**: Converts optional subagent and transcript path, clones request metadata including `tool_input` and `tool_use_id`, sets `hook_event_name = "PreToolUse"`, builds `PreToolUseCommandInput`, and serializes it with `serde_json::to_string`.
+**Data flow**: It receives a PreToolUseRequest. It copies fields such as session id, turn id, current folder, model, permission mode, canonical tool name, tool input, and tool use id into the schema expected by hook commands, then serializes that structure into a JSON string. It returns either the JSON text or a serialization error.
 
-**Call relations**: Used by `run` before command execution and by a unit test that verifies the serialized `tool_name` field.
+**Call relations**: run calls this before executing selected hooks. The tests also call it directly to ensure the JSON uses the request’s real tool name, not an internal matcher alias.
 
 *Call graph*: calls 2 internal fn (from_path, from); called by 2 (run, command_input_uses_request_tool_name); 1 external calls (to_string).
 
@@ -4075,11 +4083,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<PreToolUseHandlerData>
 ```
 
-**Purpose**: Parses one pre-tool-use command result into transcript entries and per-handler block/context/rewrite data. It supports both structured JSON output and the legacy exit-code-2 blocking convention.
+**Purpose**: Turns the raw result of one hook command into a structured hook completion event and the decision data needed by the caller. It is where exit codes, standard output, and standard error become meanings like completed, failed, or blocked.
 
-**Data flow**: Takes handler, `CommandRunResult`, and optional turn ID → initializes entries/status/block/context/rewrite state → if transport error exists, marks failed with one error entry → else on exit code `0`, ignores empty stdout, parses JSON via `output_parser::parse_pre_tool_use`, emits warning entry for `system_message`, marks failed on `invalid_reason`, otherwise appends `additional_context` through `common::append_additional_context`, converts `block_reason` into `Blocked` status plus `Feedback` entry, and if not blocked stores `updated_input`; malformed JSON-like stdout becomes a failed run → on exit code `2`, trims stderr and treats non-empty text as block reason/feedback, otherwise fails with a specific missing-reason message → other exit codes and missing status code become generic failures → wraps the result in `dispatcher::completed_summary` and returns `ParsedHandler<PreToolUseHandlerData>`.
+**Data flow**: It receives the handler that ran, the command’s exit code and output, and an optional turn id. If the command failed to run, it records an error. If it exited successfully, it tries to parse meaningful pre-tool-use JSON from standard output; valid output can add warnings, context, blocking feedback, or updated input. Exit code 2 blocks only if standard error contains a reason. Other bad exits become failures. It returns a parsed handler containing the completed event, extracted decision data, and a placeholder completion order that the dispatcher later fills in.
 
-**Call relations**: Used by `run` as the dispatcher parse callback and directly by tests covering deny, rewrite, deprecated legacy decisions, invalid JSON, and stderr-based blocking.
+**Call relations**: The dispatcher calls this after each hook command finishes during run. Many tests call it directly because it contains the important contract between hook command output and system behavior.
 
 *Call graph*: calls 5 internal fn (completed_summary, looks_like_json, parse_pre_tool_use, append_additional_context, trimmed_non_empty); called by 13 (additional_context_is_recorded, deprecated_approve_decision_fails_open, deprecated_block_decision_blocks_processing, deprecated_block_decision_with_additional_context_blocks_processing, exit_code_two_blocks_processing, invalid_json_like_stdout_fails_instead_of_becoming_noop, last_completed_updated_input_wins, permission_decision_allow_can_update_input, permission_decision_allow_without_updated_input_fails_open, permission_decision_deny_blocks_processing (+3 more)); 2 external calls (new, format!).
 
@@ -4090,11 +4098,11 @@ fn parse_completed(
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PreToolUseOutcome
 ```
 
-**Purpose**: Wraps synthetic serialization-failure events in a neutral `PreToolUseOutcome`. Serialization errors do not themselves block or rewrite input.
+**Purpose**: Builds a safe default outcome when the system cannot serialize the hook input JSON. It records the failure events but does not block the tool by itself.
 
-**Data flow**: Takes a vector of `HookCompletedEvent` → returns `PreToolUseOutcome { hook_events, should_block: false, block_reason: None, additional_contexts: Vec::new(), updated_input: None }`.
+**Data flow**: It receives hook completion events that describe serialization failure. It puts them into a PreToolUseOutcome with no block, no reason, no extra context, and no updated input. The returned outcome lets the caller report the failure while continuing without a hook decision.
 
-**Call relations**: Called only by `run` on the early-return path when command input serialization fails.
+**Call relations**: run calls this only after command_input_json fails. The failure events themselves are built by shared common hook-reporting code.
 
 *Call graph*: called by 1 (run); 1 external calls (new).
 
@@ -4105,11 +4113,11 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PreToo
 fn command_input_uses_request_tool_name()
 ```
 
-**Purpose**: Tests that serialized pre-tool-use input uses the request’s canonical `tool_name`. Matching aliases must not leak into hook stdin.
+**Purpose**: Checks that hook input JSON contains the canonical tool name from the request. This prevents internal aliases used for matching from leaking into audit or policy data.
 
-**Data flow**: Builds a request fixture, overrides `tool_name`, serializes with `command_input_json`, parses the JSON back, and asserts `input["tool_name"]` equals the overridden value.
+**Data flow**: It creates a sample request, changes its tool name, serializes it with command_input_json, parses the JSON back, and verifies the tool_name field. Nothing outside the test is changed.
 
-**Call relations**: Directly exercises `command_input_json`.
+**Call relations**: This test calls the same serialization helper used by run. It protects the contract described in command_input_json.
 
 *Call graph*: calls 1 internal fn (command_input_json); 3 external calls (assert_eq!, request_for_tool_use, from_str).
 
@@ -4120,11 +4128,11 @@ fn command_input_uses_request_tool_name()
 fn permission_decision_deny_blocks_processing()
 ```
 
-**Purpose**: Tests that the newer hook-specific `permissionDecision: deny` format blocks execution and records feedback. This is the preferred structured blocking path.
+**Purpose**: Verifies that modern hook JSON with a deny decision blocks the tool call. It also checks that the denial reason is shown as feedback.
 
-**Data flow**: Creates successful JSON stdout with `permissionDecision = deny` and `permissionDecisionReason` → parses with `parse_completed` → asserts handler data marks block with the expected reason, run status is `Blocked`, and entries contain one `Feedback` item.
+**Data flow**: It feeds parse_completed a successful command result whose standard output says permissionDecision is deny. It expects parsed data to say the tool should block, with the provided reason, and expects the completed run status to be Blocked.
 
-**Call relations**: Covers the deny branch of structured pre-tool-use parsing.
+**Call relations**: This test exercises parse_completed directly with a fake handler and fake command result. It confirms how dispatcher-parsed hook output will affect run.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4135,11 +4143,11 @@ fn permission_decision_deny_blocks_processing()
 fn permission_decision_allow_can_update_input()
 ```
 
-**Purpose**: Tests that `permissionDecision: allow` with `updatedInput` produces a rewrite without blocking. This is the structured rewrite path.
+**Purpose**: Verifies that a hook can allow a tool call while rewriting the tool input. This is the positive path for input changes.
 
-**Data flow**: Creates successful JSON stdout with `permissionDecision = allow` and `updatedInput` → parses it → asserts no block, no context, and `updated_input` equals the rewritten JSON object, with completed status and no entries.
+**Data flow**: It passes parse_completed a successful hook output containing permissionDecision allow and an updatedInput object. It expects no block and expects the rewritten command JSON to be stored as updated_input.
 
-**Call relations**: Exercises the valid rewrite branch in `parse_completed`.
+**Call relations**: This test focuses on parse_completed, which run later uses to gather possible rewrites from all hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4150,11 +4158,11 @@ fn permission_decision_allow_can_update_input()
 fn last_completed_updated_input_wins()
 ```
 
-**Purpose**: Tests the rewrite conflict rule that the last completed handler wins, regardless of configuration order. This is a subtle but intentional invariant.
+**Purpose**: Checks the conflict rule for multiple input rewrites. The rewrite from the hook that finished later should win, even if that hook was configured earlier.
 
-**Data flow**: Parses two successful rewrite results, manually sets their `completion_order` values so the second-finished handler has the larger order, then calls `latest_updated_input` on both → asserts the returned JSON rewrite is from the later-finishing handler.
+**Data flow**: It creates two parsed hook results with different updated inputs, manually assigns completion order values, and calls latest_updated_input. It expects the rewrite with the later completion order to be returned.
 
-**Call relations**: Directly exercises `latest_updated_input` independent of full event execution.
+**Call relations**: This test directly protects the helper used by run after all hook commands have completed.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4165,11 +4173,11 @@ fn last_completed_updated_input_wins()
 fn permission_decision_allow_without_updated_input_fails_open()
 ```
 
-**Purpose**: Tests that `permissionDecision: allow` without `updatedInput` is rejected as unsupported rather than treated as approval. Pre-tool-use allow is only meaningful when rewriting input.
+**Purpose**: Confirms that an allow decision without an updated input is treated as an invalid hook response, but does not block the tool. “Fails open” means the hook is marked failed while the tool is not stopped.
 
-**Data flow**: Creates successful JSON stdout with `permissionDecision = allow` but no `updatedInput` → parses it → asserts no block/rewrite data, failed status, and one error entry with the unsupported-allow message.
+**Data flow**: It gives parse_completed a successful hook output containing permissionDecision allow but no updatedInput. It expects no block, no rewrite, a Failed status, and an error message explaining the unsupported response.
 
-**Call relations**: Covers one invalid-reason branch produced by `output_parser::parse_pre_tool_use`.
+**Call relations**: This test documents one edge of the hook output format handled inside parse_completed.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4180,11 +4188,11 @@ fn permission_decision_allow_without_updated_input_fails_open()
 fn deprecated_block_decision_blocks_processing()
 ```
 
-**Purpose**: Tests that the deprecated legacy `decision:block` format still blocks processing when accompanied by a reason. Backward compatibility is preserved.
+**Purpose**: Checks that the older hook format using decision: block still blocks the tool. This keeps compatibility with existing hook scripts.
 
-**Data flow**: Creates successful JSON stdout `{"decision":"block","reason":"..."}` → parses it → asserts blocked handler data, blocked run status, and one feedback entry with the reason.
+**Data flow**: It passes parse_completed old-style JSON with a block decision and reason. It expects the parsed data to block the tool and the completed run to contain feedback with that reason.
 
-**Call relations**: Exercises the legacy-decision compatibility path in `parse_completed`.
+**Call relations**: This test shows that parse_completed accepts both current and deprecated hook output forms.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4195,11 +4203,11 @@ fn deprecated_block_decision_blocks_processing()
 fn deprecated_block_decision_with_additional_context_blocks_processing()
 ```
 
-**Purpose**: Tests that legacy block decisions can still carry `additionalContext` through hook-specific output. Both context and feedback should be recorded.
+**Purpose**: Verifies that the older block format can also carry extra context for the model. The tool should still be blocked, and the context should be preserved.
 
-**Data flow**: Creates successful JSON stdout with legacy `decision:block`, `reason`, and hook-specific `additionalContext` → parses it → asserts blocked handler data with one context string, blocked status, and entries containing `Context` then `Feedback`.
+**Data flow**: It sends parse_completed old-style block JSON plus a hookSpecificOutput additionalContext field. It expects parsed data to include both the block reason and the extra context, and expects the run entries to show context followed by feedback.
 
-**Call relations**: Covers interaction between legacy blocking and additional-context recording.
+**Call relations**: This test exercises parse_completed together with the common helper that records additional context.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4210,11 +4218,11 @@ fn deprecated_block_decision_with_additional_context_blocks_processing()
 fn unsupported_permission_decision_fails_open()
 ```
 
-**Purpose**: Tests that unsupported `permissionDecision: ask` is rejected as a failed run rather than changing control flow. The engine does not implement ask semantics here.
+**Purpose**: Checks that an unsupported modern permission decision is treated as hook failure, not as a block. This avoids letting unclear hook output accidentally stop tool use.
 
-**Data flow**: Creates successful JSON stdout with `permissionDecision = ask` and a reason → parses it → asserts no block/rewrite data, failed status, and one error entry with the unsupported-ask message.
+**Data flow**: It feeds parse_completed JSON with permissionDecision ask. It expects no block, no rewrite, a Failed status, and an error entry naming the unsupported decision.
 
-**Call relations**: Exercises another invalid-reason branch from `output_parser::parse_pre_tool_use`.
+**Call relations**: This test guards parse_completed’s validation of modern hook output.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4225,11 +4233,11 @@ fn unsupported_permission_decision_fails_open()
 fn deprecated_approve_decision_fails_open()
 ```
 
-**Purpose**: Tests that the deprecated legacy `decision:approve` format is rejected. Legacy approval is unsupported for pre-tool-use hooks.
+**Purpose**: Checks that the old approve decision is no longer accepted as a successful decision. The hook is marked failed, but the tool is not blocked.
 
-**Data flow**: Creates successful JSON stdout `{"decision":"approve"}` → parses it → asserts no block/rewrite data, failed status, and one error entry with the unsupported-approve message.
+**Data flow**: It passes parse_completed old-style JSON with decision approve. It expects empty decision data, a Failed status, and an error explaining that the decision is unsupported.
 
-**Call relations**: Covers the legacy invalid-decision branch.
+**Call relations**: This test protects backward-compatibility boundaries in parse_completed: some old forms are accepted, but not all.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4240,11 +4248,11 @@ fn deprecated_approve_decision_fails_open()
 fn additional_context_is_recorded()
 ```
 
-**Purpose**: Tests that structured deny output can also carry `additionalContext`, which is recorded for both transcript and model use. Blocking does not suppress context recording.
+**Purpose**: Verifies that hook-provided extra context is captured and included in user-visible hook entries. This lets a hook tell the model something useful while also making a decision.
 
-**Data flow**: Creates successful JSON stdout with deny decision, deny reason, and `additionalContext` → parses it → asserts blocked handler data with one context string, blocked status, and entries containing `Context` followed by `Feedback`.
+**Data flow**: It gives parse_completed modern JSON that denies the tool and includes additionalContext. It expects the parsed data to include that context and the block reason, with matching context and feedback entries in the completed run.
 
-**Call relations**: Exercises the normal additional-context path in combination with structured blocking.
+**Call relations**: This test exercises parse_completed’s path that calls shared common code to append additional context.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4255,11 +4263,11 @@ fn additional_context_is_recorded()
 fn plain_stdout_is_ignored()
 ```
 
-**Purpose**: Tests that plain non-JSON stdout from a successful pre-tool-use hook is ignored. Hooks may log text without affecting execution.
+**Purpose**: Checks that ordinary non-JSON text printed by a successful hook is ignored. This lets simple scripts print harmless messages without changing the decision.
 
-**Data flow**: Creates a successful run result with plain text stdout → parses it → asserts no block/context/rewrite data, completed status, and no entries.
+**Data flow**: It passes parse_completed a successful command result with plain text on standard output. It expects the hook to be marked completed with no block, no context, no rewrite, and no entries.
 
-**Call relations**: Covers the plain-stdout no-op branch in `parse_completed`.
+**Call relations**: This test covers parse_completed’s fallback behavior when output is not meaningful hook JSON.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4270,11 +4278,11 @@ fn plain_stdout_is_ignored()
 fn invalid_json_like_stdout_fails_instead_of_becoming_noop()
 ```
 
-**Purpose**: Tests that malformed JSON-like stdout is treated as an error rather than ignored. This prevents partially structured output from silently disappearing.
+**Purpose**: Verifies that broken JSON-looking output is treated as an error, not silently ignored. This helps catch mistakes in hook scripts.
 
-**Data flow**: Creates a successful run result with truncated JSON stdout → parses it → asserts no block/context/rewrite data, failed status, and one error entry saying the pre-tool-use JSON output is invalid.
+**Data flow**: It sends parse_completed standard output that starts like JSON but is malformed. It expects no block, but the hook run status becomes Failed with an invalid JSON output message.
 
-**Call relations**: Exercises the `looks_like_json` failure branch in `parse_completed`.
+**Call relations**: This test covers the path where parse_completed asks the output parser whether text looks like JSON after parsing failed.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4285,11 +4293,11 @@ fn invalid_json_like_stdout_fails_instead_of_becoming_noop()
 fn exit_code_two_blocks_processing()
 ```
 
-**Purpose**: Tests the legacy shell convention that exit code `2` plus stderr blocks processing. The stderr text becomes the block reason and feedback entry.
+**Purpose**: Checks the simpler blocking convention where a hook exits with code 2 and writes the reason to standard error. This supports hooks that do not emit structured JSON.
 
-**Data flow**: Creates a run result with `exit_code = Some(2)` and stderr `blocked by policy\n` → parses it → asserts blocked handler data with trimmed reason, blocked status, and one feedback entry.
+**Data flow**: It passes parse_completed a command result with exit code 2 and a standard error message. It expects the parsed data to block with the trimmed message and the completed run to be Blocked with feedback.
 
-**Call relations**: Covers the exit-code-2 branch in `parse_completed`.
+**Call relations**: This test protects one of parse_completed’s non-JSON control paths.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4300,11 +4308,11 @@ fn exit_code_two_blocks_processing()
 fn preview_and_completed_run_ids_include_tool_use_id()
 ```
 
-**Purpose**: Tests that preview and completed pre-tool-use run IDs both include the same tool-use suffix. This keeps UI and transcript correlation stable.
+**Purpose**: Verifies that previewed and completed hook run identifiers include the tool use id. This keeps hook records tied to the exact tool call they refer to.
 
-**Data flow**: Builds a request fixture with known `tool_use_id` → calls `preview` and checks the formatted run ID → parses an empty successful completion and rewrites it with `common::hook_completed_for_tool_use` → asserts the completed run ID matches the preview ID.
+**Data flow**: It creates a request with a known tool use id, asks preview for planned runs, then parses a completed hook and wraps it with the same tool use id. It checks that both identifiers match the expected format.
 
-**Call relations**: Exercises both `preview` and the common completed-event ID rewriting helper.
+**Call relations**: This test connects preview, parse_completed, and shared hook-completion wrapping code to ensure they agree on run identity.
 
 *Call graph*: calls 3 internal fn (hook_completed_for_tool_use, parse_completed, preview); 4 external calls (assert_eq!, handler, request_for_tool_use, run_result).
 
@@ -4315,11 +4323,11 @@ fn preview_and_completed_run_ids_include_tool_use_id()
 fn serialization_failure_run_ids_include_tool_use_id()
 ```
 
-**Purpose**: Tests that synthetic serialization-failure events also include the tool-use suffix in their run IDs. Early failures must still align with preview rows.
+**Purpose**: Checks that even serialization failure events use the same tool-use-specific run identifiers as normal previews. This keeps error reporting consistent.
 
-**Data flow**: Builds a request fixture and preview rows → calls `common::serialization_failure_hook_events_for_tool_use` with one handler and the same tool-use ID → asserts the synthetic completed event’s run ID equals the preview run ID.
+**Data flow**: It creates a request, gets preview run ids, creates serialization-failure hook events for the same handler and tool use id, and compares the ids. It does not execute any hook command.
 
-**Call relations**: Covers the serialization-failure helper path used by `run`.
+**Call relations**: This test links preview with the shared serialization-failure reporting path used by run when command_input_json fails.
 
 *Call graph*: calls 2 internal fn (serialization_failure_hook_events_for_tool_use, preview); 4 external calls (assert_eq!, handler, request_for_tool_use, vec!).
 
@@ -4330,11 +4338,11 @@ fn serialization_failure_run_ids_include_tool_use_id()
 fn handler() -> ConfiguredHandler
 ```
 
-**Purpose**: Creates a representative `ConfiguredHandler` fixture for pre-tool-use tests. It fixes matcher, command, source metadata, and empty env.
+**Purpose**: Creates a sample configured pre-tool-use hook handler for tests. It gives tests a consistent fake hook command and matcher.
 
-**Data flow**: Returns a `ConfiguredHandler` with `HookEventName::PreToolUse`, matcher `^Bash$`, command `echo hook`, timeout 5, no status message, `/tmp/hooks.json` source path, `HookSource::User`, display order 0, and empty env map.
+**Data flow**: It builds a ConfiguredHandler with the PreToolUse event, a Bash matcher, a command string, timeout, source path, display order, and empty environment. It returns that handler to the test that requested it.
 
-**Call relations**: Used by parsing and preview-ID tests as stable handler metadata.
+**Call relations**: Most tests call this helper before calling parse_completed or preview, so they do not repeat setup details.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -4345,11 +4353,11 @@ fn handler() -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Builds deterministic `CommandRunResult` fixtures for pre-tool-use parsing tests. It avoids repeated boilerplate setup.
+**Purpose**: Creates a fake command execution result for tests. It lets tests describe a hook’s exit code and output without actually running a command.
 
-**Data flow**: Takes optional exit code and stdout/stderr strings → returns `CommandRunResult` with fixed timestamps, duration, copied outputs, and `error = None`.
+**Data flow**: It receives an optional exit code, standard output text, and standard error text. It wraps them with fixed timing fields and no execution error, then returns a CommandRunResult.
 
-**Call relations**: Used by all pre-tool-use parsing tests.
+**Call relations**: The parse_completed tests use this helper to simulate different hook command outcomes.
 
 
 ##### `tests::request_for_tool_use`  (lines 767–781)
@@ -4358,24 +4366,24 @@ fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunR
 fn request_for_tool_use(tool_use_id: &str) -> super::PreToolUseRequest
 ```
 
-**Purpose**: Builds a canonical `PreToolUseRequest` fixture with stable metadata and JSON tool input. Tests customize it as needed.
+**Purpose**: Creates a sample pre-tool-use request for tests. It represents a Bash tool call with a simple command input.
 
-**Data flow**: Takes a `tool_use_id` string → constructs a request with fresh `ThreadId`, fixed turn/model/permission mode/tool name, empty aliases, absolute `/tmp` cwd, and `tool_input` JSON `{ "command": "echo hello" }`.
+**Data flow**: It receives a tool use id and fills in a request with a new session id, fixed turn id, no subagent, a test current directory, model and permission strings, tool name Bash, no aliases, and JSON tool input. It returns the complete request.
 
-**Call relations**: Used by command-input and run-ID tests.
+**Call relations**: Preview and serialization tests call this helper so they can focus on run ids and serialized fields rather than request setup.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, test_path_buf, json!).
 
 
 ### `hooks/src/events/post_tool_use.rs`
 
-`domain_logic` · `post-tool execution handling after a tool returns`
+`domain_logic` · `after each tool call`
 
-This module handles hooks that run after a tool invocation completes. `PostToolUseRequest` carries session and turn metadata, optional subagent context, cwd, transcript path, model, permission mode, canonical tool name plus matcher aliases, the `tool_use_id`, and both `tool_input` and `tool_response`. The resulting `PostToolUseOutcome` reports all completed hook events, whether any hook blocked normal processing, any accumulated additional contexts, and a combined feedback message.
+When the system finishes using a tool, such as a shell command or an external MCP tool, this file decides which post-tool hooks should run, sends them a clear JSON summary of the tool call, and interprets their replies. Without this file, hooks could not react after a tool ran, so users would lose a way to catch risky output, add reminders for the model, or stop the current flow.
 
-`preview` computes matcher inputs from the canonical tool name and aliases, selects matching handlers for `HookEventName::PostToolUse`, and rewrites each preview run ID with the tool-use ID. `run` repeats selection, returns an empty outcome if nothing matches, serializes a `PostToolUseCommandInput`, and on serialization failure returns synthetic failed events through `serialization_failure_outcome`. Otherwise it executes handlers and folds parsed results: `flatten_additional_contexts` merges model-facing context from all handlers, `any` determines whether any handler blocked, and `join_text_chunks` combines feedback strings into one message.
+The main path starts by matching the tool name against configured hook rules. A preview function can show which hooks would run, while the run function actually executes them. Before execution, the request is turned into JSON. That JSON includes the session, turn, current directory, model, permission mode, tool name, tool input, tool response, and tool-use id.
 
-`parse_completed` is the core interpreter for command results. Successful JSON output is parsed with `output_parser::parse_post_tool_use`; `system_message` becomes a warning entry, valid `additionalContext` becomes both a `Context` entry and model context, `continue:false` becomes a stopped run with a `Stop` entry and synthesized feedback if needed, valid block decisions become `Blocked` runs with `Feedback`, and unsupported fields like `updatedMCPToolOutput` fail open as `Failed`. Exit code `2` plus stderr is also treated as a block-with-feedback convention. Plain stdout is ignored, while malformed JSON-like stdout is an error.
+After each hook command finishes, parse_completed translates its result into system events. Exit code 0 usually means success, but JSON on standard output can still ask to block, stop, add context, or show warnings. Exit code 2 is treated as a block if the hook wrote feedback to standard error. Bad JSON-looking output is reported as a hook failure, while plain text output is ignored. The file then combines all hook results into one outcome: completed hook events, whether normal processing should be blocked, extra context for the model, and optional feedback text.
 
 #### Function details
 
@@ -4388,11 +4396,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Builds preview summaries for post-tool-use hooks matching the tool name or aliases. It appends the tool-use ID to each run ID.
+**Purpose**: Shows which post-tool-use hooks would run for a given tool call, without actually running them. This is useful for displaying pending hook activity before the real work happens.
 
-**Data flow**: Takes handlers and `PostToolUseRequest` → computes matcher inputs via `common::matcher_inputs` → selects matching handlers for `HookEventName::PostToolUse` → maps each running summary through `common::hook_run_for_tool_use` with `tool_use_id` → returns preview summaries.
+**Data flow**: It receives a list of configured hooks and a post-tool-use request. It builds the set of tool names and aliases that can match hook rules, selects the matching PostToolUse handlers, and turns each selected handler into a run summary tied to the specific tool-use id. It returns those summaries and does not change anything.
 
-**Call relations**: Called by the higher-level post-tool-use preview API and by tests that compare preview IDs with completed IDs.
+**Call relations**: Higher-level preview code calls this when it needs to report upcoming post-tool hooks. It relies on the shared matcher-building helper and the dispatcher’s handler selection, then wraps each selected handler using the common tool-use summary format.
 
 *Call graph*: calls 2 internal fn (select_handlers_for_matcher_inputs, matcher_inputs); called by 3 (preview_post_tool_use, preview_and_completed_run_ids_include_tool_use_id, serialization_failure_run_ids_include_tool_use_id).
 
@@ -4407,11 +4415,11 @@ async fn run(
 ) -> PostToolUseOutcome
 ```
 
-**Purpose**: Executes matching post-tool-use hooks and aggregates block state, additional context, and feedback. It handles no-match and serialization-failure cases explicitly.
+**Purpose**: Actually runs all matching post-tool-use hooks and combines their decisions. This is the main function used after a tool has produced a result.
 
-**Data flow**: Computes matcher inputs and selects matching handlers → returns empty `PostToolUseOutcome` if none → serializes request via `command_input_json`; on error synthesizes failed events with `serialization_failure_hook_events_for_tool_use` and wraps them with `serialization_failure_outcome` → otherwise executes handlers with `dispatcher::execute_handlers` and `parse_completed` → flattens additional contexts, computes `should_block` with `any`, joins feedback strings with `join_text_chunks`, rewrites completed event IDs with `hook_completed_for_tool_use`, and returns the final outcome.
+**Data flow**: It receives configured hooks, a command shell for running hook commands, and the full post-tool-use request. It selects matching handlers; if none match, it returns an empty, non-blocking outcome. If handlers do match, it serializes the request into JSON, runs each hook command with that JSON as input, parses each completed command, then combines their added context, block decisions, feedback, and completed events into one outcome.
 
-**Call relations**: Invoked by the public post-tool-use run path; it delegates parsing to `parse_completed` and aggregation to common helpers.
+**Call relations**: The broader post-tool-use event flow calls this after a tool finishes. It delegates matching to the dispatcher, JSON creation to command_input_json, command execution to execute_handlers, result interpretation to parse_completed, and final text/context combining to common helpers.
 
 *Call graph*: calls 8 internal fn (execute_handlers, select_handlers_for_matcher_inputs, flatten_additional_contexts, join_text_chunks, matcher_inputs, serialization_failure_hook_events_for_tool_use, command_input_json, serialization_failure_outcome); called by 1 (run_post_tool_use); 2 external calls (new, format!).
 
@@ -4422,11 +4430,11 @@ async fn run(
 fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json::Error>
 ```
 
-**Purpose**: Serializes a `PostToolUseRequest` into the JSON stdin contract for post-tool-use hooks. It preserves the canonical tool name even when aliases were used for matching.
+**Purpose**: Builds the JSON message that is sent to a selected post-tool-use hook through its standard input. This gives the hook command all the facts it needs about the tool call it is judging.
 
-**Data flow**: Converts optional subagent and transcript path, clones request metadata including `tool_input`, `tool_response`, and `tool_use_id`, sets `hook_event_name = "PostToolUse"`, builds `PostToolUseCommandInput`, and serializes it with `serde_json::to_string`.
+**Data flow**: It reads the request fields, including session, turn, subagent information, current directory, model, permission mode, canonical tool name, tool input, tool response, and tool-use id. It converts optional paths and subagent data into schema-friendly fields, then serializes everything into a JSON string. The output is either that JSON string or a serialization error.
 
-**Call relations**: Used by `run` before command execution and by a unit test that verifies the serialized `tool_name` field.
+**Call relations**: run calls this before executing any hook commands. A test also calls it directly to make sure the JSON uses the real tool name from the request, not an internal matcher alias.
 
 *Call graph*: calls 2 internal fn (from_path, from); called by 2 (run, command_input_uses_request_tool_name); 1 external calls (to_string).
 
@@ -4441,11 +4449,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<PostToolUseHandlerData>
 ```
 
-**Purpose**: Parses one post-tool-use command result into transcript entries and per-handler aggregation data. It supports warnings, additional context, stop semantics, block feedback, and stderr-based blocking.
+**Purpose**: Turns one finished hook command into a structured hook event plus the decisions that matter to the model. It is the translator between raw process output and system behavior.
 
-**Data flow**: Takes handler, `CommandRunResult`, and optional turn ID → initializes entries/status/flags/accumulators → if transport error exists, marks failed with one error entry → else on exit code `0`, ignores empty stdout, parses JSON via `output_parser::parse_post_tool_use`, emits warning entry for `system_message`, appends valid `additional_context` through `common::append_additional_context` only when no invalid reason/block-reason exists, handles `continue:false` by marking `Stopped`, adding a `Stop` entry, and pushing either trimmed `reason` or synthesized stop text into feedback messages, handles `invalid_reason` and `invalid_block_reason` as failures, and handles valid block decisions by marking `Blocked`, setting `should_block`, and recording feedback entries/messages; malformed JSON-like stdout becomes a failed run → exit code `2` with non-empty trimmed stderr becomes blocked feedback, otherwise a specific failure; other exit codes and missing status code become generic failures → returns `ParsedHandler<PostToolUseHandlerData>` with completion summary and aggregation data.
+**Data flow**: It receives the handler that ran, the command’s exit code, standard output, standard error, timing/error information, and the optional turn id. It checks for execution errors first, then interprets exit codes and any JSON output. From that it builds user-visible entries such as errors, warnings, feedback, stops, or added context, and records whether the hook blocked processing. It returns a parsed handler result containing the completed event and this post-tool-specific data.
 
-**Call relations**: Used by `run` as the dispatcher parse callback and directly by tests covering all major output forms.
+**Call relations**: The dispatcher uses this as the parser callback after each hook command run. Tests exercise it heavily because it defines the important policy: JSON decisions can block or stop, exit code 2 can block with feedback, invalid hook output fails the hook, and plain non-JSON output is ignored.
 
 *Call graph*: calls 5 internal fn (completed_summary, looks_like_json, parse_post_tool_use, append_additional_context, trimmed_non_empty); called by 8 (additional_context_is_recorded, block_decision_stops_normal_processing, continue_false_stops_with_reason, continue_false_without_reason_synthesizes_feedback, exit_two_blocks_with_feedback, plain_stdout_is_ignored_for_post_tool_use, preview_and_completed_run_ids_include_tool_use_id, unsupported_updated_mcp_tool_output_fails_open); 2 external calls (new, format!).
 
@@ -4456,11 +4464,11 @@ fn parse_completed(
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PostToolUseOutcome
 ```
 
-**Purpose**: Wraps synthetic serialization-failure events in a neutral `PostToolUseOutcome`. It ensures serialization errors do not themselves block processing or add context.
+**Purpose**: Creates the fallback outcome used when the system cannot even build the JSON input for hooks. It reports the failure events but does not block the tool flow.
 
-**Data flow**: Takes a vector of `HookCompletedEvent` → returns `PostToolUseOutcome { hook_events, should_block: false, additional_contexts: Vec::new(), feedback_message: None }`.
+**Data flow**: It receives already-created hook completed events that describe the serialization failure. It wraps them in a PostToolUseOutcome with no block decision, no added context, and no feedback message.
 
-**Call relations**: Called only by `run` on the early-return path when command input JSON cannot be serialized.
+**Call relations**: run calls this only on the error path after command_input_json fails. The actual failure events are prepared by a common helper so they still look like normal hook completion records.
 
 *Call graph*: called by 1 (run); 1 external calls (new).
 
@@ -4471,11 +4479,11 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PostTo
 fn command_input_uses_request_tool_name()
 ```
 
-**Purpose**: Tests that serialized post-tool-use input uses the request’s canonical `tool_name`, not any matcher alias. This preserves stable audit semantics.
+**Purpose**: Checks that hook input JSON keeps the request’s real tool name. This prevents internal matching aliases from leaking into the hook input where consumers expect the canonical name.
 
-**Data flow**: Builds a request fixture, overrides `tool_name`, serializes with `command_input_json`, parses the JSON back, and asserts `input["tool_name"]` equals the overridden canonical name.
+**Data flow**: It builds a sample request, changes its tool_name to apply_patch, serializes it with command_input_json, parses the JSON back into a value, and verifies that the tool_name field is apply_patch.
 
-**Call relations**: Directly exercises `command_input_json`.
+**Call relations**: This test calls the same JSON builder that run uses before hook execution. It protects the contract documented in command_input_json: matcher aliases may help select hooks, but the hook receives the true tool name.
 
 *Call graph*: calls 1 internal fn (command_input_json); 3 external calls (assert_eq!, request_for_tool_use, from_str).
 
@@ -4486,11 +4494,11 @@ fn command_input_uses_request_tool_name()
 fn block_decision_stops_normal_processing()
 ```
 
-**Purpose**: Tests that a valid JSON block decision marks the run blocked and records feedback for the model. This is the main structured blocking path.
+**Purpose**: Verifies that a hook can ask to block further processing by returning a post-tool-use JSON decision. This protects the safety-check behavior of post-tool hooks.
 
-**Data flow**: Creates a successful run result with `{"decision":"block","reason":"..."}` stdout → parses with `parse_completed` → asserts handler data contains `should_block = true` and one feedback message, and run status is `Blocked`.
+**Data flow**: It creates a fake successful command result whose standard output says decision block with a reason. It feeds that into parse_completed and checks that the parsed data says should_block is true, includes feedback for the model, and marks the run as Blocked.
 
-**Call relations**: Covers the valid block-decision branch in `parse_completed`.
+**Call relations**: This test exercises parse_completed directly, using helper functions to build a handler and command result. It confirms the path that run later relies on when combining all hook decisions.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4501,11 +4509,11 @@ fn block_decision_stops_normal_processing()
 fn additional_context_is_recorded()
 ```
 
-**Purpose**: Tests that valid `additionalContext` is emitted both as transcript context and model-facing context. It should not imply blocking.
+**Purpose**: Verifies that a hook can add extra context for the model after seeing a tool result. This allows hooks to pass useful notes forward without blocking anything.
 
-**Data flow**: Creates successful JSON stdout with `hookSpecificOutput.additionalContext` → parses it → asserts handler data contains the context string and completed run entries contain one `Context` entry with the same text.
+**Data flow**: It creates a fake successful hook output containing PostToolUse-specific additionalContext JSON. It parses that result and checks that the context is stored for the model and also appears as a Context entry in the completed hook event.
 
-**Call relations**: Exercises the `append_additional_context` path in `parse_completed`.
+**Call relations**: This test calls parse_completed because that function is responsible for recognizing extra context. It protects the behavior later used by run when it gathers all added context from multiple hooks.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4516,11 +4524,11 @@ fn additional_context_is_recorded()
 fn unsupported_updated_mcp_tool_output_fails_open()
 ```
 
-**Purpose**: Tests that unsupported `updatedMCPToolOutput` causes a failed run rather than a block or rewrite. The event rejects output rewriting.
+**Purpose**: Checks that an unsupported post-tool hook feature is reported as a hook failure but does not block the main flow. “Fails open” here means the bad hook result is logged as failed, while normal processing is allowed to continue.
 
-**Data flow**: Creates successful JSON stdout containing `updatedMCPToolOutput` → parses it → asserts no block/context/feedback data, failed status, and one error entry with the unsupported-field message.
+**Data flow**: It creates a fake successful hook process that returns JSON with unsupported updatedMCPToolOutput. It parses the result and checks that no block or feedback is produced, while the completed run status is Failed with a clear error entry.
 
-**Call relations**: Covers the invalid-reason branch produced by `output_parser::parse_post_tool_use`.
+**Call relations**: This test focuses on parse_completed’s validation of parsed hook JSON. It ensures unsupported output is visible to users but is not accidentally treated as a reason to block.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4531,11 +4539,11 @@ fn unsupported_updated_mcp_tool_output_fails_open()
 fn exit_two_blocks_with_feedback()
 ```
 
-**Purpose**: Tests the legacy shell convention that exit code `2` plus stderr means block with feedback. This provides a non-JSON blocking path.
+**Purpose**: Verifies the legacy/simple blocking path where a hook exits with code 2 and writes feedback to standard error. This gives hook authors a non-JSON way to block.
 
-**Data flow**: Creates a run result with `exit_code = Some(2)` and stderr text → parses it → asserts handler data marks `should_block = true`, stores the stderr message as feedback, and sets run status to `Blocked`.
+**Data flow**: It creates a fake command result with exit code 2 and stderr text. It parses the result and checks that should_block becomes true, the stderr text becomes model feedback, and the run status is Blocked.
 
-**Call relations**: Exercises the exit-code-2 branch in `parse_completed`.
+**Call relations**: This test calls parse_completed with a helper-built handler and run result. It protects the exit-code convention that run depends on when executing real hook commands.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4546,11 +4554,11 @@ fn exit_two_blocks_with_feedback()
 fn continue_false_stops_with_reason()
 ```
 
-**Purpose**: Tests that `continue:false` stops processing and uses `reason` as model feedback while `stopReason` becomes the transcript stop entry. This distinguishes transcript stop text from model-facing feedback.
+**Purpose**: Checks that a hook can stop the current processing flow by returning continue false with a stop reason and model-facing reason. This is different from blocking a tool result; it tells the system not to continue the broader operation.
 
-**Data flow**: Creates successful JSON stdout with `continue:false`, `stopReason`, and `reason` → parses it → asserts no block flag, one feedback message equal to `reason`, stopped status, and one `Stop` entry equal to `stopReason`.
+**Data flow**: It creates a fake successful hook output containing continue false, stopReason, and reason. After parsing, it checks that the run status is Stopped, the stop entry uses the stopReason, and the model feedback uses the reason.
 
-**Call relations**: Covers the structured stop branch in `parse_completed` when both stop and feedback text are present.
+**Call relations**: This test exercises parse_completed’s stop-handling branch. It makes sure the dispatcher-facing completed event and the model-facing feedback are both filled correctly.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4561,11 +4569,11 @@ fn continue_false_stops_with_reason()
 fn continue_false_without_reason_synthesizes_feedback()
 ```
 
-**Purpose**: Tests that when a stop response omits both `stopReason` and `reason`, the parser synthesizes a default stop message for both transcript and model feedback. This avoids silent stops.
+**Purpose**: Verifies that when a hook says continue false without giving a reason, the system creates a useful default message. This avoids leaving users and the model with an unexplained stop.
 
-**Data flow**: Creates successful JSON stdout `{"continue":false}` → parses it → asserts feedback messages contain `PostToolUse hook stopped execution`, status is `Stopped`, and the completed run has one `Stop` entry with the same synthesized text.
+**Data flow**: It builds a fake successful hook output with only continue false. parse_completed turns that into a Stopped run, adds a default Stop entry, and records the same default text as feedback for the model.
 
-**Call relations**: Exercises the fallback-message branch in stop handling.
+**Call relations**: This test calls parse_completed to protect the default-message fallback used when hook authors omit optional explanation fields.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4576,11 +4584,11 @@ fn continue_false_without_reason_synthesizes_feedback()
 fn plain_stdout_is_ignored_for_post_tool_use()
 ```
 
-**Purpose**: Tests that plain non-JSON stdout from a successful post-tool-use hook is ignored. Hooks may log text without affecting execution.
+**Purpose**: Checks that ordinary non-JSON standard output from a successful hook is ignored. This lets hook commands print incidental text without causing warnings or failures.
 
-**Data flow**: Creates a successful run result with plain text stdout → parses it → asserts no block/context/feedback data, completed status, and no transcript entries.
+**Data flow**: It creates a fake successful command result with plain text on stdout. It parses the result and checks that there is no block, no added context, no feedback, no event entries, and the run status remains Completed.
 
-**Call relations**: Covers the plain-stdout no-op branch in `parse_completed`.
+**Call relations**: This test verifies parse_completed’s tolerant behavior for plain text. It matters because real scripts may accidentally print harmless output.
 
 *Call graph*: calls 1 internal fn (parse_completed); 3 external calls (assert_eq!, handler, run_result).
 
@@ -4591,11 +4599,11 @@ fn plain_stdout_is_ignored_for_post_tool_use()
 fn preview_and_completed_run_ids_include_tool_use_id()
 ```
 
-**Purpose**: Tests that preview run IDs and completed run IDs both include the same tool-use suffix. This keeps UI rows and transcript events correlated.
+**Purpose**: Verifies that both previewed hook runs and completed hook runs include the tool-use id in their run id. This lets the system connect a hook result to the exact tool call it belongs to.
 
-**Data flow**: Builds a request fixture with a known `tool_use_id` → calls `preview` and checks the generated run ID format → parses an empty successful completion and rewrites it with `common::hook_completed_for_tool_use` → asserts the completed run ID equals the preview run ID.
+**Data flow**: It builds a sample request, asks preview for matching runs, and checks the preview id. Then it parses a fake completed hook result, wraps it as a tool-use completion event, and checks that the completed id matches the same pattern.
 
-**Call relations**: Exercises both `preview` and the common run-ID rewriting helper used after parsing.
+**Call relations**: This test connects preview, parse_completed, and the common hook_completed_for_tool_use helper. It protects consistency between the pre-run display and the final completion event.
 
 *Call graph*: calls 3 internal fn (hook_completed_for_tool_use, parse_completed, preview); 4 external calls (assert_eq!, handler, request_for_tool_use, run_result).
 
@@ -4606,11 +4614,11 @@ fn preview_and_completed_run_ids_include_tool_use_id()
 fn serialization_failure_run_ids_include_tool_use_id()
 ```
 
-**Purpose**: Tests that synthetic serialization-failure events also use tool-use-suffixed run IDs. Even early failures must line up with preview rows.
+**Purpose**: Checks that even serialization-failure hook events include the tool-use id in their run id. This keeps error reporting tied to the exact tool call that triggered the hook.
 
-**Data flow**: Builds a request fixture and preview rows → calls `common::serialization_failure_hook_events_for_tool_use` with one handler and the same tool-use ID → asserts the synthetic completed event’s run ID matches the preview run ID.
+**Data flow**: It builds a sample request and gets the preview run id. It then creates serialization-failure completion events for the same handler and request, and verifies the failure event id matches the preview style.
 
-**Call relations**: Covers the serialization-failure helper path used by `run`.
+**Call relations**: This test uses preview and the common serialization-failure helper. It protects the error path that run uses when command_input_json cannot produce hook input.
 
 *Call graph*: calls 2 internal fn (serialization_failure_hook_events_for_tool_use, preview); 4 external calls (assert_eq!, handler, request_for_tool_use, vec!).
 
@@ -4621,11 +4629,11 @@ fn serialization_failure_run_ids_include_tool_use_id()
 fn handler() -> ConfiguredHandler
 ```
 
-**Purpose**: Creates a representative `ConfiguredHandler` fixture for post-tool-use tests. It fixes matcher, command, source metadata, and empty env.
+**Purpose**: Creates a sample configured PostToolUse hook for tests. It gives tests a consistent fake hook rule and command to parse or preview against.
 
-**Data flow**: Returns a `ConfiguredHandler` with `HookEventName::PostToolUse`, matcher `^Bash$`, command `python3 post_tool_use_hook.py`, timeout 5, status message, `/tmp/hooks.json` source path, `HookSource::User`, display order 0, and empty env map.
+**Data flow**: It constructs a ConfiguredHandler with a PostToolUse event name, a Bash matcher, a command string, timeout, display text, source path, source type, order, and empty environment. The result is a ready-to-use test handler.
 
-**Call relations**: Used by parsing and preview-ID tests as stable handler metadata.
+**Call relations**: Most tests call this helper before invoking preview or parse_completed. It keeps the test setup short and consistent so each test can focus on one behavior.
 
 *Call graph*: 2 external calls (test_path_buf, new).
 
@@ -4636,11 +4644,11 @@ fn handler() -> ConfiguredHandler
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult
 ```
 
-**Purpose**: Builds deterministic `CommandRunResult` fixtures for post-tool-use parsing tests. It avoids repeated boilerplate.
+**Purpose**: Creates a sample command execution result for tests. It lets tests describe only the exit code and output they care about.
 
-**Data flow**: Takes optional exit code and stdout/stderr strings → returns `CommandRunResult` with fixed timestamps, duration, copied output strings, and `error = None`.
+**Data flow**: It receives an optional exit code, stdout text, and stderr text. It fills in fixed start/end times, duration, and no execution error, then returns a CommandRunResult.
 
-**Call relations**: Used by all post-tool-use parsing tests.
+**Call relations**: The parse_completed tests call this helper to simulate different hook command outcomes, such as success, blocking exit code, invalid output, or plain text output.
 
 
 ##### `tests::request_for_tool_use`  (lines 586–601)
@@ -4649,24 +4657,26 @@ fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunR
 fn request_for_tool_use(tool_use_id: &str) -> super::PostToolUseRequest
 ```
 
-**Purpose**: Builds a canonical `PostToolUseRequest` fixture with stable metadata and JSON payloads. Tests customize it as needed.
+**Purpose**: Creates a sample post-tool-use request for tests. It represents a Bash tool call that echoed hello and returned a simple successful response.
 
-**Data flow**: Takes a `tool_use_id` string → constructs a request with fresh `ThreadId`, fixed turn/model/permission mode/tool name, empty aliases, absolute `/tmp` cwd, `tool_input` JSON `{ "command": "echo hello" }`, and `tool_response` JSON `{ "ok": true }`.
+**Data flow**: It receives a tool-use id and fills in a new session id, a fixed turn id, current directory, model, permission mode, tool name, empty aliases, JSON tool input, and JSON tool response. It returns a complete PostToolUseRequest.
 
-**Call relations**: Used by command-input and run-ID tests.
+**Call relations**: Preview and serialization tests call this helper to build realistic requests without repeating all fields. It supplies the request data that preview and command_input_json expect.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, test_path_buf, json!).
 
 
 ### `hooks/src/events/permission_request.rs`
 
-`domain_logic` · `approval-path request handling before user/guardian approval UI`
+`orchestration` · `permission approval path`
 
-This module implements the permission-request event, which runs before guardian or user approval UI and differs from `PreToolUse` in one crucial way: hooks do not rewrite tool input or stop execution directly. Instead, they may return an explicit allow/deny decision or abstain. The file defines `PermissionRequestRequest`, the internal/public `PermissionRequestDecision`, the final `PermissionRequestOutcome`, and a small per-handler data struct used during aggregation.
+This file exists so outside policy checks can participate in the moment when the system is about to ask whether a tool may run. A hook here is like a security desk before the main approval desk: it can wave something through, stop it with a reason, or say nothing and let the usual approval process continue.
 
-`preview` computes matcher inputs from the canonical tool name plus aliases, selects matching handlers for `HookEventName::PermissionRequest`, and rewrites each preview run ID with the request’s `run_id_suffix`. `run` repeats selection, returns early if nothing matches, serializes a `PermissionRequestCommandInput`, and on serialization failure synthesizes failed hook events whose run IDs still include the tool-use suffix. Otherwise it executes handlers through the dispatcher and parses each result with `parse_completed`.
+The flow has two parts. First, `preview` finds which configured hook commands match the tool being considered, so the user interface can show that those hooks are pending. Later, `run` finds the same matching hooks, builds a JSON message describing the request, runs each hook command, and turns their outputs into `HookCompletedEvent` records that can be shown in the transcript.
 
-The aggregation rule is intentionally conservative and encoded in `resolve_permission_request_decision`: any deny wins immediately, otherwise the latest encountered allow is retained, otherwise there is no hook verdict. `parse_completed` interprets successful JSON output via `output_parser::parse_permission_request`, emits warning entries for `system_message`, marks unsupported output as failed, and turns deny decisions into `Blocked` runs with `Feedback` entries. It also supports a legacy shell convention where exit code `2` plus non-empty stderr means deny; other nonzero or missing exit codes are failures.
+The important behavior is how multiple hook decisions are combined. A denial always wins, even if another hook allowed the request. If nobody denies but one or more hooks allow, the final result is allow. If no hook makes a decision, the normal permission flow continues. This conservative rule prevents a broad “allow” rule from accidentally overriding a more specific “deny” rule.
+
+The file also protects the rest of the system from bad hook behavior. If a hook crashes, exits strangely, or returns malformed JSON, that is recorded as a failed hook run rather than silently treated as permission.
 
 #### Function details
 
@@ -4679,11 +4689,11 @@ fn preview(
 ) -> Vec<HookRunSummary>
 ```
 
-**Purpose**: Builds preview summaries for permission-request hooks matching the tool name or aliases. It also appends the request-specific run ID suffix so preview rows line up with completed events.
+**Purpose**: Finds the permission-request hooks that would run for a particular tool request, without actually running them. This lets the interface show pending hook rows before the approval decision is made.
 
-**Data flow**: Takes handlers and `PermissionRequestRequest` → computes matcher inputs with `common::matcher_inputs` → selects matching handlers for `HookEventName::PermissionRequest` → maps each running summary through `common::hook_run_for_tool_use` using `run_id_suffix` → returns preview summaries.
+**Data flow**: It receives the full configured hook list and the current permission request. It turns the tool name and any aliases into matcher inputs, asks the dispatcher which handlers match the `PermissionRequest` event, and converts those matches into short run summaries. It returns those summaries and does not change the request or execute any commands.
 
-**Call relations**: Called by the higher-level permission-request preview API before execution.
+**Call relations**: This is called by `preview_permission_request` before the real hook execution. It relies on shared matching helpers, especially `matcher_inputs` and `select_handlers_for_matcher_inputs`, so previewing and running use the same selection rules.
 
 *Call graph*: calls 2 internal fn (select_handlers_for_matcher_inputs, matcher_inputs); called by 1 (preview_permission_request).
 
@@ -4698,11 +4708,11 @@ async fn run(
 ) -> PermissionRequestOutcome
 ```
 
-**Purpose**: Executes matching permission-request hooks and resolves their combined allow/deny verdict. It handles empty matches, serialization failures, and normal execution aggregation.
+**Purpose**: Runs all permission-request hooks that match the current tool request and produces both transcript-visible hook events and an optional final permission decision. This is the main execution path for this file.
 
-**Data flow**: Computes matcher inputs and selects matching handlers → returns empty outcome if none → serializes `build_command_input(&request)` with `serde_json::to_string`; on error returns synthetic failed events from `serialization_failure_hook_events_for_tool_use` and no decision → otherwise executes handlers with `dispatcher::execute_handlers` and `parse_completed` → resolves final decision from parsed handler decisions via `resolve_permission_request_decision` → rewrites completed event IDs with `hook_completed_for_tool_use` and returns `PermissionRequestOutcome`.
+**Data flow**: It receives configured handlers, a command shell used to run hook commands, and a request containing details such as the session, working directory, model, tool name, and tool input. It selects matching handlers, builds the JSON input they should receive, executes them, parses each completed run, and combines any allow or deny decisions. It returns a `PermissionRequestOutcome` containing completed hook events plus either allow, deny with a message, or no decision.
 
-**Call relations**: Invoked by the public permission-request run path; it delegates input construction, execution, parsing, and final decision folding to helper functions.
+**Call relations**: This is called by `run_permission_request` when the approval path reaches the hook stage. It uses `build_command_input` to prepare the hook payload, hands execution to `execute_handlers`, uses `parse_completed` as the per-hook result parser, and then calls `resolve_permission_request_decision` to turn many hook opinions into one final verdict.
 
 *Call graph*: calls 6 internal fn (execute_handlers, select_handlers_for_matcher_inputs, matcher_inputs, serialization_failure_hook_events_for_tool_use, build_command_input, resolve_permission_request_decision); called by 1 (run_permission_request); 3 external calls (new, format!, to_string).
 
@@ -4715,11 +4725,11 @@ fn resolve_permission_request_decision(
 ) -> Option<PermissionRequestDecision>
 ```
 
-**Purpose**: Combines multiple handler decisions into one final verdict using deny-first semantics. It preserves allow only when no deny appears.
+**Purpose**: Combines several hook decisions into one safe final answer. Its rule is simple: any deny wins; otherwise an allow is kept; otherwise there is no hook verdict.
 
-**Data flow**: Consumes an iterator of borrowed `PermissionRequestDecision` values → iterates in order, storing `Some(Allow)` when an allow is seen, but immediately returns a cloned `Deny { message }` when any deny appears → returns the last stored allow or `None` if no decisions were present.
+**Data flow**: It receives an ordered set of hook decisions. As it reads them, it remembers if it has seen an allow, but immediately returns a cloned deny decision if it sees one. The output is a single optional decision: deny, allow, or nothing.
 
-**Call relations**: Called only by `run` after all handlers have completed and been parsed.
+**Call relations**: This is called by `run` after all matching hooks have finished and their outputs have been parsed. It is the policy fold that keeps a specific block from being overridden by another hook’s allow.
 
 *Call graph*: called by 1 (run).
 
@@ -4730,11 +4740,11 @@ fn resolve_permission_request_decision(
 fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestCommandInput
 ```
 
-**Purpose**: Constructs the typed command-input payload for a permission-request hook. It serializes approval context but intentionally does not include matcher aliases.
+**Purpose**: Builds the structured input object that will be serialized to JSON and sent to each permission-request hook command. This gives hooks the context they need to decide whether a tool action should be allowed.
 
-**Data flow**: Reads request fields, converts optional subagent via `SubagentCommandInputFields::from`, converts transcript path via `NullableString::from_path`, and clones `tool_input` → returns a `PermissionRequestCommandInput` with `hook_event_name = "PermissionRequest"`.
+**Data flow**: It reads fields from the permission request, including session ID, turn ID, optional subagent information, transcript path, working directory, model, permission mode, tool name, and tool input. It converts paths and optional subagent data into the schema format expected by hook commands. It returns a `PermissionRequestCommandInput` ready to be turned into JSON.
 
-**Call relations**: Used by `run` immediately before JSON serialization.
+**Call relations**: This is called by `run` just before hook commands are executed. Its output is serialized and passed into `execute_handlers`, so every hook receives the same clear description of the permission request.
 
 *Call graph*: calls 2 internal fn (from_path, from); called by 1 (run).
 
@@ -4749,11 +4759,11 @@ fn parse_completed(
 ) -> dispatcher::ParsedHandler<PermissionRequestHandlerData>
 ```
 
-**Purpose**: Parses one permission-request hook command result into transcript entries, run status, and an optional internal decision. It supports both structured JSON output and the legacy exit-code-2 deny convention.
+**Purpose**: Turns one finished hook command run into a transcript event plus any permission decision hidden in its output. It also classifies failures, denials, warnings, and malformed output in a consistent way.
 
-**Data flow**: Takes handler metadata, `CommandRunResult`, and optional turn ID → initializes entries/status/decision → if `run_result.error` exists, marks failed with one error entry → else on exit code `0`, ignores empty stdout, parses JSON via `output_parser::parse_permission_request`, emits warning entry for `system_message`, marks failed on `invalid_reason`, maps valid allow/deny decisions into internal `PermissionRequestDecision`, and for deny also marks status `Blocked` and adds a `Feedback` entry; JSON-like but invalid stdout becomes a failed run → on exit code `2`, trims stderr and treats non-empty text as deny feedback/block, otherwise fails with a specific missing-reason message → other exit codes and missing status code become generic failures → wraps the result in `dispatcher::completed_summary` and returns `ParsedHandler<PermissionRequestHandlerData>`.
+**Data flow**: It receives the handler that ran, the command result with standard output, standard error, exit code, and possible execution error, plus the optional turn ID. If the command failed to run, it records an error. If it exited successfully, it tries to parse permission-request JSON from stdout; that JSON may contain a warning, an allow, a deny message, or an invalid-output reason. If it exits with code 2 and writes a non-empty stderr message, that is treated as a denial. Other nonzero or missing exit statuses become failures. It returns a parsed handler object containing the completed hook event and any allow/deny decision.
 
-**Call relations**: Used by `run` as the dispatcher parse callback; it is the event-specific bridge between raw command execution and decision aggregation.
+**Call relations**: This function is supplied to `execute_handlers` by `run`, so it is invoked for each hook command after it finishes. It uses `parse_permission_request` and `looks_like_json` to understand hook stdout, `trimmed_non_empty` to read denial text from stderr, and `completed_summary` to package the result for the rest of the hook system.
 
 *Call graph*: calls 4 internal fn (completed_summary, looks_like_json, parse_permission_request, trimmed_non_empty); 2 external calls (new, format!).
 
@@ -4764,11 +4774,11 @@ fn parse_completed(
 fn permission_request_deny_overrides_earlier_allow()
 ```
 
-**Purpose**: Tests the conservative aggregation rule that any deny beats an earlier allow. This protects specific deny policies from being overridden.
+**Purpose**: Checks that a denial still wins even when an earlier hook allowed the request. This protects the most important safety rule in the decision-combining logic.
 
-**Data flow**: Creates an array `[Allow, Deny { ... }]` → passes `decisions.iter()` to `resolve_permission_request_decision` → asserts the result is the deny decision with the same message.
+**Data flow**: It creates two decisions: first allow, then deny with a message. It passes them into `resolve_permission_request_decision` and expects the result to be the denial with the same message. Nothing outside the test is changed.
 
-**Call relations**: Directly exercises the deny-short-circuit branch of decision resolution.
+**Call relations**: This test exercises `resolve_permission_request_decision` directly. It represents the case where one policy layer permits an action but a later, more specific layer blocks it.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4779,11 +4789,11 @@ fn permission_request_deny_overrides_earlier_allow()
 fn permission_request_returns_allow_when_no_handler_denies()
 ```
 
-**Purpose**: Tests that allow is returned when one or more handlers allow and none deny. Multiple allows collapse to a single allow verdict.
+**Purpose**: Checks that the final decision is allow when at least one hook allows and no hook denies. This confirms that hooks can positively approve a request.
 
-**Data flow**: Creates two `Allow` decisions → resolves them → asserts the result is `Some(Allow)`.
+**Data flow**: It creates two allow decisions, passes them into `resolve_permission_request_decision`, and expects the result to be allow. It only verifies the returned value.
 
-**Call relations**: Covers the positive allow path in `resolve_permission_request_decision`.
+**Call relations**: This test calls `resolve_permission_request_decision` directly. It covers the non-blocking path used by `run` when all deciding hooks agree to allow the tool action.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4794,10 +4804,10 @@ fn permission_request_returns_allow_when_no_handler_denies()
 fn permission_request_returns_none_when_no_handler_decides()
 ```
 
-**Purpose**: Tests that no final decision is produced when no handler returns one. This leaves the normal approval flow untouched.
+**Purpose**: Checks that the system returns no hook verdict when there are no decisions to combine. This preserves the normal approval flow when hooks stay silent.
 
-**Data flow**: Creates an empty `Vec<PermissionRequestDecision>` → resolves `decisions.iter()` → asserts the result is `None`.
+**Data flow**: It creates an empty list of decisions, passes it into `resolve_permission_request_decision`, and expects `None` as the result. It does not produce side effects.
 
-**Call relations**: Covers the empty-input branch of decision resolution.
+**Call relations**: This test calls `resolve_permission_request_decision` directly. It represents the path where `run` found no allow or deny decision in any completed hook output.
 
 *Call graph*: 2 external calls (new, assert_eq!).

@@ -1,10 +1,6 @@
 # Streaming, line framing, and hidden-markup parsers  `stage-22.2.2`
 
-This stage provides the incremental parsing layer that sits between raw streamed model output and higher-level rendering or feature logic. It is cross-cutting infrastructure used during the main streaming path: it turns arbitrary byte or text chunks into stable text fragments, framed records, and extracted metadata without requiring the full response up front.
-
-At its core, stream_text.rs defines the shared parser contract and output shape for parsers that emit visible text while collecting side-channel payloads, and lib.rs exposes those building blocks as the crate’s public API. utf8_stream.rs adapts any text parser to raw byte streams, preserving correctness when UTF-8 characters are split across chunk boundaries. line_buffer.rs performs newline framing for partial byte records.
-
-On top of those primitives, inline_hidden_tag.rs extracts inline hidden markup while suppressing it from rendered text, and tagged_line_parser.rs recognizes whole-line opening and closing markers for block-style tagged sections even when lines arrive incrementally. table_detect.rs supplies consistent markdown table and code-fence detection rules to streaming consumers. mention_codec.rs translates visible mentions to and from structured link form, and citations.rs specializes the hidden-tag machinery to recover structured memory citation and thread ID data.
+This stage is shared behind-the-scenes support for reading text that arrives in pieces, such as live assistant output or process logs. Its job is to turn messy chunks into clean, useful events without losing hidden information. The stream-parser front door gathers these helpers for the rest of the project. Its common result model separates visible text from hidden parts, like citations or metadata, so the app can show only what users should see while still keeping machine-readable details. The UTF-8 stream reader safely joins raw bytes into text even when one character is split across chunks. The line buffer does a similar job for process output, waiting until a full newline-ended line is ready. Other parsers remove inline hidden tags, detect tagged blocks that start and end on their own lines, and extract structured memory citations. The table detector recognizes Markdown tables and code fences so display and cleanup code agree. The mention codec turns user-friendly tool mentions into stored links and back again. Together, these pieces act like filters on a conveyor belt for streamed text.
 
 ## Files in this stage
 
@@ -15,11 +11,11 @@ These files define the shared parser contract and crate-level exports that the s
 
 `data_model` · `cross-cutting`
 
-This file is the minimal abstraction layer for streamed text parsing. Its central data type, `StreamTextChunk<T>`, packages two parallel outputs from one parser step: `visible_text`, which is safe to surface to users immediately, and `extracted`, a `Vec<T>` of structured payloads pulled out of the stream while parsing. The struct derives `Debug`, `Clone`, `PartialEq`, and `Eq`, making it easy to compare parser outputs in tests and compose them across parser stages.
+Streaming text often arrives in small pieces, not as one complete message. That creates a practical problem: some parts may be normal text that can be shown right away, while other parts may be special hidden markers that should be extracted instead of displayed. This file gives the rest of the stream parser code a shared language for that job.
 
-The `Default` implementation intentionally produces an empty chunk with an empty `String` and empty `Vec`, which downstream code uses as the neutral element when a parser step yields nothing yet—especially important for buffering parsers that must wait for more input before deciding what to emit. The `is_empty` helper codifies that notion of “no output” by requiring both channels to be empty.
+The main data type, `StreamTextChunk<T>`, is the parser's answer after it receives one piece of input. It contains `visible_text`, which is ordinary text ready to render, and `extracted`, a list of hidden payloads found in that input. The `T` means the extracted payload can be any type chosen by a specific parser, much like a labeled box whose contents depend on what kind of parser is using it.
 
-The `StreamTextParser` trait defines the incremental parser lifecycle: `push_str` accepts one incoming text fragment and returns the chunk produced from just that push, while `finish` flushes any buffered parser state at end-of-stream or end-of-item. The trait leaves extraction semantics to implementations via the associated type `Extracted`, allowing the same interface to support citation extraction, tag parsing, or other hidden markup removal without coupling this file to any specific domain.
+The file also defines the `StreamTextParser` trait. A trait is a promise that different parser types can follow the same basic interface. Any parser using this trait must accept new text with `push_str` and must provide a final cleanup step with `finish`, which releases anything it had to keep buffered while waiting for more input. Without this file, different parsers would likely return results in incompatible ways, making streamed parsing harder to combine and reuse.
 
 #### Function details
 
@@ -29,11 +25,11 @@ The `StreamTextParser` trait defines the incremental parser lifecycle: `push_str
 fn default() -> Self
 ```
 
-**Purpose**: Constructs an empty parser result with no visible text and no extracted payloads. It serves as the neutral starting value and the standard “nothing emitted yet” result for buffering parsers.
+**Purpose**: Creates an empty parser result: no visible text and no extracted payloads. This is useful when a parser receives input but cannot safely emit anything yet, or when a final flush has nothing left to return.
 
-**Data flow**: It takes no arguments and reads no external state. It creates a fresh `StreamTextChunk<T>` whose `visible_text` is `String::new()` and whose `extracted` is `Vec::new()`, then returns that value without side effects.
+**Data flow**: It takes no outside input except the payload type chosen by the caller. It creates a fresh empty string for `visible_text` and a fresh empty list for `extracted`, then returns a `StreamTextChunk` containing both.
 
-**Call relations**: This is used by higher-level parser code whenever a push or flush produces no output yet, such as UTF-8 buffering and chunk aggregation paths. Callers rely on it to represent deferred emission without inventing special sentinel values.
+**Call relations**: Other parser helpers call this when they need a clean, empty result to start from or return. It is used during chunk collection, byte pushing, text pushing, finishing, and segment mapping, so it acts like the standard empty basket that many parser flows can hand back when there is nothing to show or extract.
 
 *Call graph*: called by 9 (collect_chunks, finish, push_str, collect_chunks, map_segments, collect_chunks, finish, push_bytes, collect_bytes); 2 external calls (new, new).
 
@@ -44,18 +40,22 @@ fn default() -> Self
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether a parser result produced absolutely nothing on either output channel. It is the canonical emptiness test for incremental parser steps.
+**Purpose**: Checks whether this parser result contains nothing at all. It answers the simple question: did this chunk produce any visible text or any extracted payloads?
 
-**Data flow**: It reads `self.visible_text` and `self.extracted`, evaluates whether both are empty, and returns a `bool`. It does not mutate the chunk or any external state.
+**Data flow**: It reads the chunk's `visible_text` and `extracted` list. If the text is empty and the extracted list is also empty, it returns `true`; otherwise it returns `false`. It does not change the chunk.
 
-**Call relations**: This helper is typically used by tests and parser consumers to distinguish a real emission from a buffering-only step. It does not delegate further and acts as a leaf predicate over `StreamTextChunk` state.
+**Call relations**: This is a convenience check for code that receives parser output and wants to skip no-op results. It sits at the edge of the result object itself, so callers do not need to repeat the two separate emptiness checks every time.
 
 
 ### `utils/stream-parser/src/lib.rs`
 
-`orchestration` · `startup`
+`util` · `cross-cutting`
 
-This crate root is a pure module-and-export file: it declares the internal parser modules that implement incremental text parsing behaviors, then selectively re-exports their public types and helpers as the crate’s stable interface. The module list shows the crate is organized around several specialized streaming parsers: assistant text parsing, citation extraction and stripping, inline hidden tag parsing, proposed-plan block parsing, generic stream text chunking, tagged-line parsing support, and UTF-8 boundary-safe byte stream decoding. The `pub use` section is the important contract here. Consumers of the crate do not need to know the internal module layout; they import `AssistantTextStreamParser`, `CitationStreamParser`, `InlineHiddenTagParser`, `ProposedPlanParser`, `StreamTextParser`, or `Utf8StreamParser` directly from the crate root, along with associated chunk/segment types and utility functions such as `strip_citations`, `extract_proposed_plan_text`, and `strip_proposed_plan_blocks`. Notably, `tagged_line_parser` is declared but not re-exported, implying it is an internal implementation detail used by other modules rather than part of the external API. This file therefore centralizes visibility decisions and keeps downstream code insulated from refactors inside the crate.
+This file does not contain parsing logic itself. Instead, it acts like the index desk at a library: it tells Rust which internal parser modules belong to this crate, and it re-exports the important pieces so other code can import them easily.
+
+The crate is about reading text that arrives in pieces rather than all at once. That matters for systems that display or process assistant output while it is still being generated. Different modules focus on different patterns inside that stream: normal assistant text, citation markers, hidden inline tags, proposed-plan blocks, tagged lines, and valid UTF-8 text. UTF-8 is the common text encoding used by Rust strings; a stream parser for it is important because a character can be split across two incoming chunks.
+
+By re-exporting names such as `AssistantTextStreamParser`, `CitationStreamParser`, `InlineHiddenTagParser`, `ProposedPlanParser`, `StreamTextParser`, and `Utf8StreamParser`, this file keeps callers from needing to know the crate's internal file layout. Without this file, users would have to import from each private module directly, or the crate would not expose these tools at all.
 
 
 ### Streaming input adapters
@@ -63,13 +63,13 @@ These utilities adapt raw streamed input into parseable units by handling UTF-8 
 
 ### `utils/stream-parser/src/utf8_stream.rs`
 
-`io_transport` · `request handling`
+`domain_logic` · `stream parsing`
 
-This file adapts text-oriented incremental parsers to byte-oriented upstream sources. `Utf8StreamParserError` distinguishes two failure modes: a definitively invalid UTF-8 sequence with `valid_up_to` and `error_len`, and an incomplete code point still buffered at EOF. Its `Display` implementation formats these cases into precise diagnostics.
+Streams often arrive in small byte chunks, not neat pieces of text. UTF-8, the common way to store text as bytes, can use more than one byte for a single character. That means a character like “é” may arrive as half in one chunk and half in the next. This file wraps an existing StreamTextParser, which expects valid text, and adds a small waiting room for unfinished UTF-8 bytes.
 
-`Utf8StreamParser<P>` stores the wrapped parser in `inner` and a `pending_utf8: Vec<u8>` buffer for undecoded bytes. `push_bytes` appends the incoming chunk to `pending_utf8` and then attempts `std::str::from_utf8` over the whole buffer. If decoding succeeds, the full decoded text is forwarded to `inner.push_str`, and the byte buffer is cleared. If decoding fails with a concrete `error_len`, the method rolls back the entire just-pushed chunk by truncating `pending_utf8` back to its old length and returns `InvalidUtf8`; this rollback is deliberate so the inner parser never sees a valid prefix from a chunk that ultimately failed. If decoding fails only because the buffer ends mid-code-point, the method emits any valid prefix before the incomplete suffix: when `valid_up_to == 0` it returns an empty `StreamTextChunk`, otherwise it decodes the valid prefix, forwards it, and drains those bytes from `pending_utf8`.
+The main type, Utf8StreamParser, receives byte chunks. It adds each chunk to its pending byte buffer, then tries to read the buffer as UTF-8 text. If everything is valid, it passes the text to the wrapped parser and clears the buffer. If the bytes end in the middle of a character, it passes along only the complete text before that point and keeps the unfinished bytes for later. If the bytes are truly invalid, it rolls back the newly added chunk so the inner parser never sees a half-bad result.
 
-`finish` first validates that any remaining buffered bytes are either valid UTF-8 or reports `InvalidUtf8` / `IncompleteUtf8AtEof`. If buffered bytes decode cleanly, it pushes them into the inner parser before calling `inner.finish`, then concatenates the two `StreamTextChunk`s by appending visible text and extracted payloads. `into_inner` returns the wrapped parser only when no undecoded invalid/incomplete bytes remain, while `into_inner_lossy` skips validation and drops any buffered partial code point. The tests focus on split multibyte characters, rollback after invalid chunks, EOF behavior, and the difference between strict and lossy extraction of the inner parser.
+The error type explains the two failure cases: invalid UTF-8, or the stream ending while a character is still incomplete. The tests show the important promises: split characters work, invalid chunks do not poison later parsing, and callers can choose either strict or lossy cleanup.
 
 #### Function details
 
@@ -79,11 +79,11 @@ This file adapts text-oriented incremental parsers to byte-oriented upstream sou
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats UTF-8 streaming errors into human-readable messages that include byte offsets and error lengths where applicable. It gives callers precise diagnostics for malformed byte streams.
+**Purpose**: Turns a UTF-8 stream error into a clear human-readable message. This is what someone sees when the error is printed or included in a log.
 
-**Data flow**: It reads the enum variant and its fields from `self`, writes the corresponding message into the provided formatter `f`, and returns the resulting `fmt::Result`.
+**Data flow**: It receives one error value and a formatter to write into. It checks which kind of error happened, writes a sentence with the useful details, and returns whether formatting succeeded.
 
-**Call relations**: This implementation is used implicitly whenever the error is displayed or propagated through standard error-reporting paths. It is a leaf formatter and does not affect parser state.
+**Call relations**: This is used through Rust’s standard Display formatting path. When other code prints a Utf8StreamParserError, this function supplies the message and uses the external write! formatting tool to place text into the output.
 
 *Call graph*: 1 external calls (write!).
 
@@ -94,11 +94,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(inner: P) -> Self
 ```
 
-**Purpose**: Constructs a byte-oriented wrapper around an existing text parser. The wrapper starts with no buffered undecoded bytes.
+**Purpose**: Creates a byte-aware wrapper around an existing text parser. Use it when incoming data is bytes but the parser underneath expects valid text.
 
-**Data flow**: It takes an `inner` parser of type `P`, stores it, initializes `pending_utf8` to an empty `Vec<u8>`, and returns the new `Utf8StreamParser<P>`.
+**Data flow**: It takes an inner parser as input. It stores that parser and starts with an empty buffer for pending UTF-8 bytes, then returns the ready-to-use wrapper.
 
-**Call relations**: Tests and production setup call this before any byte chunks are processed. It prepares the state later consumed by `Utf8StreamParser::push_bytes`, `Utf8StreamParser::finish`, and the `into_inner` methods.
+**Call relations**: The tests call this at the start of each scenario to build a parser around CitationStreamParser. After creation, the wrapper can receive byte chunks through push_bytes, be completed through finish, or be unwrapped later.
 
 *Call graph*: called by 6 (utf8_stream_parser_errors_on_incomplete_code_point_at_eof, utf8_stream_parser_handles_split_code_points_across_chunks, utf8_stream_parser_into_inner_errors_when_partial_code_point_is_buffered, utf8_stream_parser_into_inner_lossy_drops_buffered_partial_code_point, utf8_stream_parser_rolls_back_entire_chunk_when_invalid_byte_follows_valid_prefix, utf8_stream_parser_rolls_back_on_invalid_utf8_chunk); 1 external calls (new).
 
@@ -112,11 +112,11 @@ fn push_bytes(
     ) -> Result<StreamTextChunk<P::Extracted>, Utf8StreamParserError>
 ```
 
-**Purpose**: Accepts one raw byte chunk, decodes as much UTF-8 as is safely available, and forwards decoded text to the wrapped `StreamTextParser`. It preserves parser consistency by rolling back the entire chunk on definite UTF-8 errors.
+**Purpose**: Feeds one chunk of raw bytes into the wrapped text parser while protecting it from broken UTF-8. It is the main streaming entry point for normal input.
 
-**Data flow**: It takes `&[u8]`, records the old buffered length, appends the bytes to `self.pending_utf8`, and attempts `from_utf8` on the whole buffer. On full success it sends the decoded `&str` to `self.inner.push_str`, clears `pending_utf8`, and returns that `StreamTextChunk`. On invalid UTF-8 with `error_len`, it truncates `pending_utf8` back to `old_len` and returns `Utf8StreamParserError::InvalidUtf8`. On incomplete trailing UTF-8, it either returns `StreamTextChunk::default()` if no complete code point exists yet, or decodes the valid prefix, forwards it to `inner.push_str`, drains those bytes from `pending_utf8`, and returns the resulting chunk.
+**Data flow**: It receives a byte slice and appends it to any bytes already waiting from a previous chunk. If the combined bytes form valid UTF-8, it converts them to text, sends that text into the inner parser, clears the buffer, and returns the parser’s visible text and extracted items. If the bytes end with an unfinished character, it sends only the complete prefix and keeps the unfinished bytes. If the new chunk makes the data invalid, it removes that whole chunk from the pending buffer and returns an error.
 
-**Call relations**: This is the main byte-ingest entry and is used by higher-level collection code such as the test helper `tests::collect_bytes`. It delegates decoded text handling to the wrapped parser’s `push_str`, while owning all UTF-8 boundary detection and rollback behavior itself.
+**Call relations**: In the test helper collect_bytes, this is called repeatedly for each incoming chunk. When complete text is available, it hands that text to the wrapped parser’s push_str method; when no complete character is ready yet, it returns an empty default chunk.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (collect_bytes); 2 external calls (push_str, from_utf8).
 
@@ -127,11 +127,11 @@ fn push_bytes(
 fn finish(&mut self) -> Result<StreamTextChunk<P::Extracted>, Utf8StreamParserError>
 ```
 
-**Purpose**: Flushes any remaining buffered UTF-8 bytes and then flushes the wrapped text parser. It enforces that EOF cannot silently discard an incomplete code point.
+**Purpose**: Ends the byte stream and flushes any remaining complete text into the inner parser. It also detects the important error case where the stream ends halfway through a UTF-8 character.
 
-**Data flow**: It reads `self.pending_utf8`; if non-empty, it validates the bytes with `from_utf8`, returning `InvalidUtf8` or `IncompleteUtf8AtEof` on failure. If buffered bytes are valid, it either starts from `StreamTextChunk::default()` when none remain or forwards the decoded text to `self.inner.push_str` and clears the buffer. It then calls `self.inner.finish()`, appends the tail chunk’s `visible_text` and `extracted` into the first chunk, and returns the combined result.
+**Data flow**: It first looks at the pending byte buffer. If those bytes are invalid, it returns an error; if they are an incomplete final character, it returns the incomplete-at-end error. If complete text remains, it sends it to the inner parser and clears the buffer. Then it asks the inner parser to finish, combines that final output with any output just produced, and returns the combined result.
 
-**Call relations**: This is called at end-of-stream by consumers such as `tests::collect_bytes`. It bridges the byte-level buffering layer with the wrapped parser’s own flush semantics, ensuring both pending UTF-8 and parser-internal state are emitted in order.
+**Call relations**: collect_bytes calls this after all byte chunks have been pushed. It is the bridge between byte-level cleanup and the inner parser’s own finish step, making sure both layers get a chance to produce final visible text and extracted values.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (collect_bytes); 3 external calls (finish, push_str, from_utf8).
 
@@ -142,11 +142,11 @@ fn finish(&mut self) -> Result<StreamTextChunk<P::Extracted>, Utf8StreamParserEr
 fn into_inner(self) -> Result<P, Utf8StreamParserError>
 ```
 
-**Purpose**: Returns the wrapped parser only if the wrapper is not holding undecoded invalid or incomplete UTF-8 bytes. It is the strict extraction path for callers that want ownership back without losing buffered state silently.
+**Purpose**: Returns the wrapped parser only if it is safe to do so without leaving behind a broken UTF-8 character. This is the strict way to unwrap the parser.
 
-**Data flow**: It consumes `self`, checks whether `pending_utf8` is empty, and if so returns `Ok(self.inner)`. Otherwise it validates the buffered bytes with `from_utf8`; valid buffered bytes still permit returning `inner`, while invalid bytes produce `InvalidUtf8` and incomplete trailing bytes produce `IncompleteUtf8AtEof`.
+**Data flow**: It consumes the Utf8StreamParser. If there are no pending bytes, it returns the inner parser. If pending bytes exist, it checks whether they are valid UTF-8; invalid bytes produce an invalid UTF-8 error, and an unfinished final character produces an incomplete-at-end error. If the bytes are valid, it returns the inner parser without flushing those bytes.
 
-**Call relations**: This method is used when callers want to unwrap the adapter safely after streaming. Unlike `finish`, it does not flush buffered valid text into the inner parser; unlike `into_inner_lossy`, it refuses to ignore malformed or partial buffered bytes.
+**Call relations**: This is a public escape hatch for callers that want the original parser back. The related test checks that it refuses to unwrap when a partial character is still buffered, while finish is the safer choice when the caller wants pending text flushed first.
 
 *Call graph*: 1 external calls (from_utf8).
 
@@ -157,11 +157,11 @@ fn into_inner(self) -> Result<P, Utf8StreamParserError>
 fn into_inner_lossy(self) -> P
 ```
 
-**Purpose**: Returns the wrapped parser without validating or flushing any buffered undecoded bytes. It is an explicit escape hatch for callers willing to drop partial UTF-8 state.
+**Purpose**: Returns the wrapped parser without checking or flushing leftover bytes. This is useful only when the caller is willing to drop any unfinished UTF-8 character.
 
-**Data flow**: It consumes `self` and returns `self.inner`, ignoring `pending_utf8` entirely and performing no decoding, validation, or mutation beyond ownership transfer.
+**Data flow**: It consumes the wrapper and simply returns the inner parser. Any bytes waiting in the UTF-8 buffer are discarded as part of dropping the wrapper.
 
-**Call relations**: This is the permissive counterpart to `Utf8StreamParser::into_inner`. Tests use it to confirm that buffered partial code points can be discarded intentionally when strict correctness is not required.
+**Call relations**: This is the intentionally permissive counterpart to into_inner. The test for it shows the expected tradeoff: a buffered partial character disappears, and the inner parser can still be finished afterward.
 
 
 ##### `tests::collect_bytes`  (lines 190–204)
@@ -173,11 +173,11 @@ fn collect_bytes(
     ) -> Result<StreamTextChunk<String>, Utf8StreamParserError>
 ```
 
-**Purpose**: Aggregates the outputs of multiple `push_bytes` calls plus a final `finish` into one combined `StreamTextChunk`. It is a convenience helper for end-to-end UTF-8 streaming tests.
+**Purpose**: Provides a small test helper that feeds several byte chunks into a Utf8StreamParser and gathers all output into one result. It keeps the tests focused on behavior instead of repeated plumbing.
 
-**Data flow**: It takes a mutable `Utf8StreamParser<CitationStreamParser>` and a slice of byte-slice chunks, starts from `StreamTextChunk::default()`, loops over chunks calling `parser.push_bytes(chunk)?`, concatenates each returned chunk’s `visible_text` and `extracted` into the accumulator, then does the same with `parser.finish()?` and returns the accumulated result.
+**Data flow**: It receives a mutable parser and a list of byte chunks. For each chunk, it calls push_bytes and appends the returned visible text and extracted values to one running result. After all chunks, it calls finish and appends that final output too, then returns the combined result or the first error encountered.
 
-**Call relations**: This helper is invoked by the split-code-point test to exercise the normal streaming lifecycle. It delegates all actual decoding and parsing to `Utf8StreamParser::push_bytes` and `Utf8StreamParser::finish`.
+**Call relations**: The split-character test calls this helper to exercise the normal full-stream path. Inside, it uses push_bytes for each chunk and finish at the end, so it tests the wrapper the same way a real streaming caller would use it.
 
 *Call graph*: calls 3 internal fn (default, finish, push_bytes).
 
@@ -188,11 +188,11 @@ fn collect_bytes(
 fn utf8_stream_parser_handles_split_code_points_across_chunks()
 ```
 
-**Purpose**: Verifies that multibyte UTF-8 characters split across chunk boundaries are buffered and reconstructed correctly before reaching the inner parser. It also checks that extracted citation content survives this byte-level adaptation.
+**Purpose**: Checks that characters whose UTF-8 bytes are split across chunk boundaries still come out correctly. It also verifies that the wrapped citation parser can extract text while the wrapper is doing byte decoding.
 
-**Data flow**: The test defines three byte chunks containing split `é` and `中` sequences around citation tags, constructs a `Utf8StreamParser` around `CitationStreamParser`, runs `tests::collect_bytes`, and asserts that the final visible text is `"AéZ"` and the extracted payload list contains `"中"`.
+**Data flow**: It builds three byte chunks containing visible text, a citation tag, and multi-byte characters split between chunks. It creates a Utf8StreamParser around a CitationStreamParser, feeds all chunks through collect_bytes, and checks that the visible output is “AéZ” while the extracted citation is “中”.
 
-**Call relations**: It drives the happy-path integration of `Utf8StreamParser::new`, `tests::collect_bytes`, `Utf8StreamParser::push_bytes`, and `Utf8StreamParser::finish`.
+**Call relations**: This test starts by calling the constructors for the wrapper and inner parser. It then hands the real work to collect_bytes, which in turn drives push_bytes and finish, and finally uses assertions to confirm the combined behavior.
 
 *Call graph*: calls 2 internal fn (new, new); 3 external calls (assert_eq!, panic!, collect_bytes).
 
@@ -203,11 +203,11 @@ fn utf8_stream_parser_handles_split_code_points_across_chunks()
 fn utf8_stream_parser_rolls_back_on_invalid_utf8_chunk()
 ```
 
-**Purpose**: Checks that when a continuation byte is invalid, the wrapper rejects the chunk and restores the previous buffered state so a later valid continuation can still succeed. This confirms the chunk-level rollback guarantee.
+**Purpose**: Checks that a bad continuation byte does not permanently damage the parser’s buffered state. This matters because callers may want to recover after receiving one bad chunk.
 
-**Data flow**: The test pushes a leading byte `0xC3` and asserts the returned chunk is empty, then pushes invalid `0x28` and asserts it gets `InvalidUtf8 { valid_up_to: 0, error_len: 1 }`. It then pushes a valid continuation plus `x`, finishes the parser, and asserts the recovered visible output is `"éx"` with no extracted payloads and an empty tail.
+**Data flow**: It first sends the leading byte of “é”, which should be buffered because it is incomplete. Then it sends an invalid byte and expects an invalid UTF-8 error. After that, it sends the correct continuation byte plus “x” and verifies that the parser still produces “éx” with no extracted items.
 
-**Call relations**: It exercises `Utf8StreamParser::push_bytes` on both incomplete and invalid paths, then confirms recovery through another `push_bytes` and `finish` call after rollback.
+**Call relations**: The test creates a fresh wrapper and inner citation parser, then uses assertions and expected panics to prove the rollback promise. It focuses on the error path inside push_bytes: the new bad chunk is rejected, but the older pending byte remains usable.
 
 *Call graph*: calls 2 internal fn (new, new); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -218,11 +218,11 @@ fn utf8_stream_parser_rolls_back_on_invalid_utf8_chunk()
 fn utf8_stream_parser_rolls_back_entire_chunk_when_invalid_byte_follows_valid_prefix()
 ```
 
-**Purpose**: Verifies that a chunk containing a valid UTF-8 prefix followed by an invalid byte is rejected as a whole, rather than partially forwarded to the inner parser. This protects downstream parsers from seeing text from a failed chunk.
+**Purpose**: Checks that if one chunk contains some valid text followed by an invalid byte, none of that chunk is passed to the inner parser. This prevents the inner parser from seeing a partial result from a chunk that the caller may choose to retry or discard.
 
-**Data flow**: The test pushes `b"ok\xFF"`, expects `InvalidUtf8 { valid_up_to: 2, error_len: 1 }`, then pushes `b"!"` and asserts the next visible output is only `"!"`, proving the earlier `"ok"` prefix was not emitted.
+**Data flow**: It sends the bytes for “ok” followed by an invalid byte and expects an invalid UTF-8 error that points after the valid prefix. Then it sends “!” and verifies that only “!” appears as output, showing that “ok” was not secretly accepted before the error.
 
-**Call relations**: It specifically targets the rollback branch in `Utf8StreamParser::push_bytes` where `from_utf8` reports a concrete invalid sequence after some valid bytes.
+**Call relations**: The test builds a fresh parser with the usual constructors and then exercises the rollback rule. It confirms, through assertions, that push_bytes treats an invalid chunk as all-or-nothing.
 
 *Call graph*: calls 2 internal fn (new, new); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -233,11 +233,11 @@ fn utf8_stream_parser_rolls_back_entire_chunk_when_invalid_byte_follows_valid_pr
 fn utf8_stream_parser_errors_on_incomplete_code_point_at_eof()
 ```
 
-**Purpose**: Confirms that EOF with a buffered partial UTF-8 sequence is treated as an error rather than silently dropped or emitted. This enforces strict end-of-stream correctness.
+**Purpose**: Checks that ending the stream in the middle of a UTF-8 character is reported as an error. This protects callers from silently losing or corrupting the final character.
 
-**Data flow**: The test pushes two bytes of a three-byte sequence, asserts the immediate output is empty, then calls `finish` and checks that it returns `Utf8StreamParserError::IncompleteUtf8AtEof`.
+**Data flow**: It sends two bytes that begin but do not complete a multi-byte character. The push call should return no output because the parser is waiting for the rest. Then finish is called, and the test expects an IncompleteUtf8AtEof error.
 
-**Call relations**: It exercises the incomplete-buffer validation path in `Utf8StreamParser::finish` after a prior `Utf8StreamParser::push_bytes` buffered an unfinished code point.
+**Call relations**: This test creates a parser and drives the end-of-stream path. It shows the division of responsibility: push_bytes may wait for more data, but finish must decide that no more data is coming and report the unfinished character.
 
 *Call graph*: calls 2 internal fn (new, new); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -248,11 +248,11 @@ fn utf8_stream_parser_errors_on_incomplete_code_point_at_eof()
 fn utf8_stream_parser_into_inner_errors_when_partial_code_point_is_buffered()
 ```
 
-**Purpose**: Checks that strict unwrapping of the inner parser fails when the wrapper still holds an incomplete UTF-8 sequence. It distinguishes `into_inner` from the lossy variant.
+**Purpose**: Checks that the strict unwrapping method refuses to return the inner parser while an unfinished UTF-8 character is still buffered. This prevents accidental silent data loss.
 
-**Data flow**: The test pushes a single leading byte, asserts the returned chunk is empty, then calls `into_inner` and asserts it returns `Utf8StreamParserError::IncompleteUtf8AtEof`.
+**Data flow**: It sends one leading byte of a multi-byte character, which leaves the wrapper with pending data and no output. Then it calls into_inner and expects an IncompleteUtf8AtEof error instead of receiving the inner parser.
 
-**Call relations**: It directly exercises the validation logic in `Utf8StreamParser::into_inner` after state was established by `Utf8StreamParser::push_bytes`.
+**Call relations**: The test sets up the parser with the normal constructors and then targets into_inner specifically. It confirms that callers who want safety should not be allowed to bypass an unfinished byte sequence.
 
 *Call graph*: calls 2 internal fn (new, new); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -263,22 +263,24 @@ fn utf8_stream_parser_into_inner_errors_when_partial_code_point_is_buffered()
 fn utf8_stream_parser_into_inner_lossy_drops_buffered_partial_code_point()
 ```
 
-**Purpose**: Verifies that lossy unwrapping discards buffered partial UTF-8 bytes and returns the inner parser without error. It documents the intentional trade-off of the lossy API.
+**Purpose**: Checks the deliberately lossy unwrapping method. It proves that callers can choose to discard an unfinished UTF-8 character if that is acceptable for their situation.
 
-**Data flow**: The test pushes a single leading byte, asserts the output is empty, calls `into_inner_lossy` to recover the wrapped parser, then calls `inner.finish()` and asserts that the tail chunk is empty.
+**Data flow**: It sends one leading byte of a multi-byte character, producing no output and leaving that byte buffered. Then it calls into_inner_lossy to get the wrapped parser back, finishes the inner parser, and checks that no text appears from the discarded byte.
 
-**Call relations**: It contrasts with the strict `into_inner` test by exercising `Utf8StreamParser::into_inner_lossy` after the same buffered-partial setup from `Utf8StreamParser::push_bytes`.
+**Call relations**: This test contrasts with the strict into_inner test. It uses the same setup but follows the lossy path, showing that into_inner_lossy skips validation and hands back the inner parser directly.
 
 *Call graph*: calls 2 internal fn (new, new); 2 external calls (assert!, panic!).
 
 
 ### `ollama/src/line_buffer.rs`
 
-`util` · `cross-cutting stream parsing`
+`util` · `request handling`
 
-This file contains the internal `LineBuffer` type used when parsing Ollama's NDJSON pull stream and other line-oriented process output. The buffer stores accumulated bytes in a `bytes::BytesMut` and tracks `scanned_len`, the prefix length already searched and confirmed to contain no `\n`. That extra cursor is the key design choice: when more bytes arrive after a partial line, `take_line` searches only the newly appended suffix instead of rescanning the entire buffer each time.
+Programs often receive text output in uneven pieces. For example, a child process might write “hello\n”, but the reader might receive “he” first and “llo\n” later. This file provides `LineBuffer`, a simple holding area for those pieces. New bytes are appended as they arrive. When the rest of the system asks for a line, the buffer looks for a newline byte, which marks the end of a line. If it finds one, it cuts that complete line out of the front of the buffer and gives it back. If it does not find one, it keeps all the bytes for later.
 
-`extend_from_slice` simply appends incoming bytes to the existing `BytesMut`. `take_line` then uses `memchr` over `self.bytes[self.scanned_len..]` to find the next newline efficiently. If no newline exists, it updates `scanned_len` to the current buffer length and returns `None`, preserving all bytes for future appends. If a newline is found, it computes the absolute index, splits the buffer through that newline with `split_to`, resets `scanned_len` to zero because the remaining tail has not been searched yet, and returns the extracted line including the trailing newline. The type is crate-private and derives `Default`; in tests it also derives `Debug`, `PartialEq`, and `Eq` so internal state can be asserted directly.
+A small but important detail is `scanned_len`. This remembers how much of the buffer has already been checked and found not to contain a newline. That way, each call does not repeatedly search the same old bytes. Think of it like placing a bookmark after the part of a page you already inspected. When more bytes arrive, the next search starts from the bookmark rather than from the beginning.
+
+Without this file, code that reads standard output or standard error from a process would need to repeatedly solve the same awkward problem: turning unpredictable byte chunks into clean, complete lines without losing partial data.
 
 #### Function details
 
@@ -288,11 +290,11 @@ This file contains the internal `LineBuffer` type used when parsing Ollama's NDJ
 fn extend_from_slice(&mut self, bytes: &[u8])
 ```
 
-**Purpose**: Appends newly received bytes onto the end of the buffered stream data. It does not alter the scan cursor because previously scanned bytes remain valid.
+**Purpose**: Adds newly received bytes to the end of the buffer. This is used when output arrives from a process but may not yet form a complete line.
 
-**Data flow**: Takes `&mut self` and `bytes: &[u8]`, extends `self.bytes` with the provided slice, and returns `()`. The only state mutation is growth of the internal `BytesMut`.
+**Data flow**: It takes a slice of bytes as input. Those bytes are copied onto the end of the buffer’s existing bytes. It does not return a value; after it runs, the buffer simply contains more data waiting to be read as lines.
 
-**Call relations**: It is called by stream-ingestion code such as `push_process_output` and `push_stderr` before line extraction is attempted. It deliberately does not perform parsing itself so callers can append many chunks and then repeatedly call `take_line`.
+**Call relations**: When process output arrives, `push_process_output` and `push_stderr` call this function to store the new bytes. Later, code can call `LineBuffer::take_line` to see whether the accumulated bytes now include a complete line.
 
 *Call graph*: called by 2 (push_process_output, push_stderr); 1 external calls (extend_from_slice).
 
@@ -303,11 +305,11 @@ fn extend_from_slice(&mut self, bytes: &[u8])
 fn take_line(&mut self) -> Option<BytesMut>
 ```
 
-**Purpose**: Extracts the next complete newline-terminated line from the buffer if one is available. It preserves partial trailing data for future appends and avoids rescanning old bytes.
+**Purpose**: Tries to remove and return the next complete line from the buffer. A complete line means bytes up to and including a newline character.
 
-**Data flow**: Reads `self.scanned_len` and searches `self.bytes[self.scanned_len..]` with `memchr(b'\n', ...)`. If no newline is found, it sets `self.scanned_len = self.bytes.len()` and returns `None`. If a newline is found, it computes the absolute index, removes and returns the prefix up to and including that newline via `self.bytes.split_to(newline_index + 1)`, resets `self.scanned_len` to `0`, and leaves any remaining bytes in the buffer.
+**Data flow**: It looks through the buffered bytes, starting after the part it has already checked before. If it finds no newline, it records that the current buffer has been scanned and returns nothing. If it finds a newline, it splits the complete line off the front of the buffer, resets the scan marker, and returns that line.
 
-**Call relations**: It is used by consumers such as `push_stderr` and `take_stdout_message` after bytes have been appended. Those callers rely on its invariant that returned lines include the newline and that incomplete tails remain buffered.
+**Call relations**: `push_stderr` and `take_stdout_message` call this when they need to turn buffered process output into line-sized pieces. Inside, it uses a fast newline search and then splits the buffer so the returned line is removed while any later bytes stay behind for future calls.
 
 *Call graph*: called by 2 (push_stderr, take_stdout_message); 3 external calls (len, split_to, memchr).
 
@@ -317,13 +319,13 @@ These reusable parsers incrementally recognize hidden inline tags and line-delim
 
 ### `utils/stream-parser/src/inline_hidden_tag.rs`
 
-`domain_logic` · `cross-cutting streaming text parsing primitive used during chunk ingestion and EOF flush`
+`domain_logic` · `cross-cutting; active whenever streamed text chunks are parsed`
 
-This file implements a generic, stateful parser for inline tags whose delimiters are matched literally rather than by a full grammar. `InlineTagSpec<T>` defines each supported tag type with a typed `tag` marker plus static `open` and `close` delimiters. `ExtractedInlineTag<T>` is the output record containing the tag identity and captured body. Internally, the parser tracks `specs`, a `pending` string buffer holding undecided input, and an optional `active` tag with its close delimiter and accumulated content.
+This parser solves a common streaming problem: the text arrives in pieces, but tags may be split across those pieces. For example, one chunk might end with "<oa" and the next might start with "i-mem-citation>". A simple search on each chunk would miss that. This file keeps a small buffer of unfinished text so it can recognize tag openings and closings even when they cross chunk boundaries.
 
-`new` validates that at least one tag spec exists and that no opener or closer is empty. Parsing happens in `push_str`, which appends the incoming chunk to `pending` and then loops until no more progress can be made. If a tag is active, it searches `pending` for the active close delimiter. On success it finalizes the extracted tag, drains the consumed bytes, and continues. If no close delimiter is found, it computes the longest suffix of `pending` that could be the prefix of the close delimiter, appends the safe prefix into the active tag’s content, drains it, and waits for more input.
+The main type, InlineHiddenTagParser, is configured with one or more literal tag descriptions: an opening marker, a closing marker, and a label saying what kind of tag it is. As text is pushed in, the parser separates it into two streams. Normal text goes into visible_text. Text found between a configured opening and closing marker is removed from the visible output and returned as extracted data.
 
-If no tag is active, the parser searches for the earliest opener across all specs using `find_next_open`, breaking ties by preferring the longer opener at the same offset and then lower spec index. Text before the opener is emitted as visible output, the opener is drained, and a new `ActiveTag` begins. If no opener is found, `max_open_prefix_suffix_len` preserves any trailing bytes that might be the start of an opener while `drain_visible_to_suffix_match` emits the rest as visible text. `finish` auto-closes an active tag by emitting its buffered content as extracted data, or flushes remaining pending text as visible output when no tag is active. `longest_suffix_prefix_len` is the UTF-8-safe helper that makes chunk-boundary matching work even with non-ASCII delimiters.
+The parser is deliberately simple: matching is literal, and tags are not nested. Think of it like a highlighter with scissors: when it sees a configured opening marker, it starts cutting that section out until it sees the matching closing marker. If the input ends while a tag is still open, it treats the remaining buffered text as the hidden content and returns it anyway. The tests at the bottom check multiple tag kinds, non-English characters, tie-breaking between similar openers, and invalid empty delimiters.
 
 #### Function details
 
@@ -333,11 +335,11 @@ If no tag is active, the parser searches for the earliest opener across all spec
 fn new(specs: Vec<InlineTagSpec<T>>) -> Self
 ```
 
-**Purpose**: Constructs a generic hidden-tag parser and validates that its tag specifications are usable.
+**Purpose**: Creates a new inline tag parser from a list of tag rules. It refuses to start with no rules, or with empty opening or closing markers, because those would make matching meaningless or unsafe.
 
-**Data flow**: Consumes `specs: Vec<InlineTagSpec<T>>`, asserts that the vector is non-empty and that every `open` and `close` delimiter is non-empty, initializes `pending` to an empty `String` and `active` to `None`, and returns the parser.
+**Data flow**: It receives a list of tag specifications, checks that the list is not empty, then checks that every opening and closing marker has real text. If all checks pass, it returns a parser with those rules saved, an empty pending-text buffer, and no currently open tag.
 
-**Call relations**: This constructor is called by specialized wrappers such as `CitationStreamParser::new` and directly by tests that exercise generic behavior.
+**Call relations**: This is the setup step used by production code and by the tests before any text can be parsed. After construction, callers feed text into InlineHiddenTagParser::push_str and eventually call InlineHiddenTagParser::finish.
 
 *Call graph*: called by 6 (new, generic_inline_parser_prefers_longest_opener_at_same_offset, generic_inline_parser_rejects_empty_close_delimiter, generic_inline_parser_rejects_empty_open_delimiter, generic_inline_parser_supports_multiple_tag_types, generic_inline_parser_supports_non_ascii_tag_delimiters); 2 external calls (new, assert!).
 
@@ -348,11 +350,11 @@ fn new(specs: Vec<InlineTagSpec<T>>) -> Self
 fn find_next_open(&self) -> Option<(usize, usize)>
 ```
 
-**Purpose**: Finds the next opener occurrence in the pending buffer, choosing the earliest match and preferring longer openers when multiple specs match at the same position.
+**Purpose**: Finds the next configured opening tag marker inside the parser's pending text. If more than one marker starts at the same place, it chooses the longest one so a more specific tag wins over a shorter prefix.
 
-**Data flow**: Reads `self.specs` and `self.pending`, searches each spec’s `open` delimiter with `find`, collects `(position, open_len, spec_index)` candidates, selects the minimum by position then descending opener length then ascending spec index, and returns `Option<(open_position, spec_index)>`.
+**Data flow**: It reads the parser's saved tag rules and the current pending text. It searches for each opening marker, compares their positions, and returns the earliest match along with which rule matched. If nothing is found, it returns no match.
 
-**Call relations**: It is used only inside `InlineHiddenTagParser::push_str` when no tag is currently active and the parser needs to decide whether to start extracting a hidden tag.
+**Call relations**: InlineHiddenTagParser::push_str calls this when the parser is not already inside a hidden tag. Its answer decides whether the parser should pass more text through visibly or switch into hidden-content collection.
 
 *Call graph*: called by 1 (push_str).
 
@@ -363,11 +365,11 @@ fn find_next_open(&self) -> Option<(usize, usize)>
 fn max_open_prefix_suffix_len(&self) -> usize
 ```
 
-**Purpose**: Computes how many trailing bytes of the pending buffer must be retained because they could be the prefix of some opener delimiter.
+**Purpose**: Figures out how much text should be kept at the end of the pending buffer because it might be the beginning of an opening tag split across chunks.
 
-**Data flow**: Reads `self.specs` and `self.pending`, calls `longest_suffix_prefix_len(&self.pending, spec.open)` for each spec, takes the maximum match length, and returns that length or `0` if none match.
+**Data flow**: It compares the end of the pending text with the start of every configured opening marker. It returns the longest overlap length, or zero if the pending text cannot be the start of any opener.
 
-**Call relations**: This helper is called from `InlineHiddenTagParser::push_str` when no opener is currently found, so the parser can emit only the definitely visible prefix and keep a possible partial opener buffered.
+**Call relations**: InlineHiddenTagParser::push_str uses this when no full opening tag has been found yet. This lets the parser safely output text that definitely cannot become a tag, while holding back only the possible partial marker.
 
 *Call graph*: called by 1 (push_str).
 
@@ -378,11 +380,11 @@ fn max_open_prefix_suffix_len(&self) -> usize
 fn push_visible_prefix(out: &mut StreamTextChunk<ExtractedInlineTag<T>>, pending: &str)
 ```
 
-**Purpose**: Appends a non-empty visible text slice into the output chunk.
+**Purpose**: Adds a piece of confirmed normal text to the visible output. It skips empty strings so it does not do unnecessary work.
 
-**Data flow**: Takes a mutable `StreamTextChunk<ExtractedInlineTag<T>>` and a `pending: &str` slice, checks whether the slice is non-empty, and if so pushes it onto `out.visible_text`.
+**Data flow**: It receives an output chunk and a piece of pending text. If that text is not empty, it appends it to the chunk's visible_text field; it does not extract anything.
 
-**Call relations**: This small helper is used by parsing routines to centralize the “append only if non-empty” behavior when emitting visible text.
+**Call relations**: This is a small helper used while parsing, especially when text before an opening tag can be safely shown. InlineHiddenTagParser::drain_visible_to_suffix_match also uses the same behavior when draining confirmed visible text.
 
 
 ##### `InlineHiddenTagParser::drain_visible_to_suffix_match`  (lines 104–115)
@@ -395,11 +397,11 @@ fn drain_visible_to_suffix_match(
     )
 ```
 
-**Purpose**: Moves the definitely visible prefix of `pending` into output while preserving a trailing suffix that might complete an opener in a later chunk.
+**Purpose**: Moves safe visible text out of the parser's pending buffer while keeping a possible partial opening tag at the end. This is what prevents the parser from accidentally showing half of a tag marker too early.
 
-**Data flow**: Takes mutable `self`, mutable output chunk, and `keep_suffix_len: usize`; computes how many bytes can be emitted as `take = pending.len() - keep_suffix_len` with saturation, emits `self.pending[..take]` via `push_visible_prefix` if `take > 0`, then drains those bytes from `self.pending`.
+**Data flow**: It receives an output chunk and the number of ending characters to keep. It calculates everything before that kept suffix, appends that part to visible_text, and removes it from the pending buffer. The possible partial marker remains buffered for the next input chunk.
 
-**Call relations**: This helper is called from `InlineHiddenTagParser::push_str` in the no-active-tag, no-opener-found path.
+**Call relations**: InlineHiddenTagParser::push_str calls this when no complete opening tag is currently visible. It relies on InlineHiddenTagParser::push_visible_prefix to add confirmed normal text to the output.
 
 *Call graph*: called by 1 (push_str); 1 external calls (push_visible_prefix).
 
@@ -410,11 +412,11 @@ fn drain_visible_to_suffix_match(
 fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted>
 ```
 
-**Purpose**: Consumes one input chunk and incrementally emits visible text plus any fully parsed hidden-tag contents, buffering ambiguous suffixes across chunk boundaries.
+**Purpose**: Consumes one new piece of streamed text and returns whatever visible text or hidden tag content can be confidently produced now. This is the parser's main workhorse.
 
-**Data flow**: Appends `chunk` to `self.pending`, initializes an empty `StreamTextChunk`, and loops. If `self.active` exists, it searches `pending` for the active close delimiter; on success it takes the active tag, appends preceding bytes to its content, pushes an `ExtractedInlineTag` into output, drains through the close delimiter, and continues. If no close is found, it computes a suffix/prefix overlap with `longest_suffix_prefix_len`, appends the safe prefix into the active content, drains it, and breaks. If no tag is active, it calls `find_next_open`; on success it emits visible text before the opener, drains the opener, creates a new `ActiveTag`, and continues. If no opener is found, it computes `keep` with `max_open_prefix_suffix_len`, calls `drain_visible_to_suffix_match`, and breaks. It returns the accumulated output chunk.
+**Data flow**: It appends the new chunk to the pending buffer. If a hidden tag is already open, it searches for that tag's closing marker; found content is extracted, while unfinished content stays buffered only as much as needed to catch a split closing marker. If no tag is open, it searches for the next opening marker; text before it becomes visible, then the parser starts collecting hidden content. If no complete opening marker is present, it outputs only the text that cannot possibly be part of a split marker. The result is a StreamTextChunk containing visible text and any extracted tags produced by this push.
 
-**Call relations**: This is the core streaming algorithm used by specialized wrappers such as `CitationStreamParser::push_str`. It delegates to `find_next_open`, `max_open_prefix_suffix_len`, `drain_visible_to_suffix_match`, `push_visible_prefix`, and `longest_suffix_prefix_len` to keep the main loop readable.
+**Call relations**: Callers repeatedly use this as text arrives. Inside, it asks InlineHiddenTagParser::find_next_open where hidden text begins, uses InlineHiddenTagParser::max_open_prefix_suffix_len and longest_suffix_prefix_len to protect split markers across chunk boundaries, and uses InlineHiddenTagParser::drain_visible_to_suffix_match or InlineHiddenTagParser::push_visible_prefix to move safe visible text into the returned chunk.
 
 *Call graph*: calls 5 internal fn (drain_visible_to_suffix_match, find_next_open, max_open_prefix_suffix_len, longest_suffix_prefix_len, default); called by 1 (push_str); 2 external calls (push_visible_prefix, new).
 
@@ -425,11 +427,11 @@ fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted>
 fn finish(&mut self) -> StreamTextChunk<Self::Extracted>
 ```
 
-**Purpose**: Flushes the parser at EOF, auto-closing any active tag or emitting any remaining pending text as visible output.
+**Purpose**: Ends the stream and flushes anything still held inside the parser. This is needed because the last chunk may leave behind visible text or an unclosed hidden tag.
 
-**Data flow**: Creates an empty output chunk. If `self.active.take()` yields an active tag, it appends any remaining `self.pending` into that tag’s content, clears `pending`, pushes one `ExtractedInlineTag` into output, and returns immediately. Otherwise, if `pending` is non-empty, it appends it to `out.visible_text`, clears `pending`, and returns the output.
+**Data flow**: It creates an empty output chunk. If a tag is currently open, it treats all remaining pending text as that tag's content, clears the buffer, and returns it as extracted data. If no tag is open, it moves any remaining pending text into visible_text and clears the buffer.
 
-**Call relations**: This method is the end-of-stream counterpart to `push_str`, used by specialized wrappers’ `finish` implementations and by tests.
+**Call relations**: Callers should use this after the final push_str call. The test helper tests::collect_chunks does this to make sure results include the final buffered text.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (finish).
 
@@ -440,11 +442,11 @@ fn finish(&mut self) -> StreamTextChunk<Self::Extracted>
 fn longest_suffix_prefix_len(s: &str, needle: &str) -> usize
 ```
 
-**Purpose**: Finds the longest suffix of one string that is also a prefix of another, respecting UTF-8 character boundaries in the prefix string.
+**Purpose**: Finds how much of the end of one string matches the beginning of another string. The parser uses this to recognize possible tag markers that are split between chunks.
 
-**Data flow**: Accepts `s: &str` and `needle: &str`, computes the maximum candidate length as the smaller of `s.len()` and `needle.len() - 1`, iterates candidate lengths from largest to smallest, checks `needle.is_char_boundary(k)` and `s.ends_with(&needle[..k])`, and returns the first matching `k` or `0` if none match.
+**Data flow**: It receives a current string and a target marker. It checks the longest possible overlap first, while respecting character boundaries so multi-byte characters are not cut in the middle. It returns the overlap length, or zero if there is no overlap.
 
-**Call relations**: This helper underpins chunk-boundary buffering in `InlineHiddenTagParser::push_str` and `max_open_prefix_suffix_len`, especially for non-ASCII delimiters.
+**Call relations**: InlineHiddenTagParser::push_str calls this while waiting for a closing marker, and InlineHiddenTagParser::max_open_prefix_suffix_len uses the same idea for opening markers. It is the small matching tool that makes streaming-safe parsing possible.
 
 *Call graph*: called by 1 (push_str).
 
@@ -455,11 +457,11 @@ fn longest_suffix_prefix_len(s: &str, needle: &str) -> usize
 fn collect_chunks(parser: &mut P, chunks: &[&str]) -> StreamTextChunk<P::Extracted>
 ```
 
-**Purpose**: Combines chunk-by-chunk parser output and final flush output into one aggregate result for test assertions.
+**Purpose**: Runs a parser across several input chunks and combines all of its outputs into one result. It lets tests describe streaming input naturally without repeating boilerplate.
 
-**Data flow**: Takes a mutable generic parser and chunk slice, initializes a default `StreamTextChunk`, repeatedly appends each `push_str` result’s visible text and extracted items, then appends the `finish` result and returns the aggregate.
+**Data flow**: It receives a mutable parser and a list of text chunks. For each chunk, it calls push_str, appends returned visible text to a combined result, and gathers extracted tags. At the end it calls finish and adds that final output too.
 
-**Call relations**: This helper is shared by the generic parser tests to validate whole-stream behavior while still exercising incremental parsing.
+**Call relations**: The test cases call this after constructing an InlineHiddenTagParser. It exercises the same push-then-finish flow that real streaming code would use.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (finish, push_str).
 
@@ -470,11 +472,11 @@ fn collect_chunks(parser: &mut P, chunks: &[&str]) -> StreamTextChunk<P::Extract
 fn generic_inline_parser_supports_multiple_tag_types()
 ```
 
-**Purpose**: Verifies that one parser instance can recognize multiple configured tag types and preserve their identities in extracted output.
+**Purpose**: Checks that one parser can recognize more than one kind of hidden inline tag. It verifies both the visible text and the extracted tag labels and contents.
 
-**Data flow**: Constructs an `InlineHiddenTagParser` with `<a>` and `<b>` specs, feeds a mixed-tag input through `collect_chunks`, and asserts on visible text, extraction count, tag identities, and extracted contents.
+**Data flow**: It builds a parser with two tag rules, feeds it a string containing both tag types, and collects the output. The expected result is visible text with both hidden sections removed and two extracted records, one for each tag.
 
-**Call relations**: This test exercises the multi-spec path through `find_next_open` and the typed extraction behavior.
+**Call relations**: This test calls InlineHiddenTagParser::new to set up the parser and tests::collect_chunks to run the streaming flow. It confirms the main parser behavior for multiple configured tags.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, collect_chunks, vec!).
 
@@ -485,11 +487,11 @@ fn generic_inline_parser_supports_multiple_tag_types()
 fn generic_inline_parser_supports_non_ascii_tag_delimiters()
 ```
 
-**Purpose**: Checks that delimiter matching works correctly for non-ASCII tag strings split across chunk boundaries.
+**Purpose**: Checks that the parser works with non-ASCII characters in tag markers and content. This matters because some characters take more than one byte internally, and careless slicing could break them.
 
-**Data flow**: Builds a parser with `<é>` / `</é>` delimiters, feeds chunked input containing those delimiters and non-ASCII content through `collect_chunks`, and asserts on visible text and extracted content.
+**Data flow**: It creates a parser whose opening and closing markers contain "é", then feeds the input in chunks that split the marker. The expected output keeps only the surrounding visible letters and extracts the Chinese character inside the tag.
 
-**Call relations**: This test specifically validates the UTF-8-safe overlap logic implemented by `longest_suffix_prefix_len`.
+**Call relations**: This test uses InlineHiddenTagParser::new and tests::collect_chunks. It specifically protects the behavior supported by longest_suffix_prefix_len, which respects character boundaries.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, collect_chunks, vec!).
 
@@ -500,11 +502,11 @@ fn generic_inline_parser_supports_non_ascii_tag_delimiters()
 fn generic_inline_parser_prefers_longest_opener_at_same_offset()
 ```
 
-**Purpose**: Documents and verifies the tie-breaking rule that longer openers win when multiple tag specs match at the same byte position.
+**Purpose**: Checks the tie-breaking rule when two opening markers could start at the same position. The longer opener should win, so a specific marker is not mistaken for a shorter one.
 
-**Data flow**: Creates a parser with `<a>` and `<ab>` specs, parses input containing `<ab>`, and asserts that the extracted tag is the `Tag::B` variant with content `y` and that visible text excludes the whole `<ab>...</ab>` block.
+**Data flow**: It builds a parser with "<a>" and "<ab>" as possible openers, then feeds text containing "<ab>". The expected result is that the parser extracts the content as the tag tied to the longer "<ab>" rule.
 
-**Call relations**: This test targets the ordering logic inside `find_next_open`.
+**Call relations**: This test calls InlineHiddenTagParser::new and tests::collect_chunks. It confirms the selection behavior implemented by InlineHiddenTagParser::find_next_open.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, collect_chunks, vec!).
 
@@ -515,11 +517,11 @@ fn generic_inline_parser_prefers_longest_opener_at_same_offset()
 fn generic_inline_parser_rejects_empty_open_delimiter()
 ```
 
-**Purpose**: Ensures parser construction panics when a tag spec has an empty opener, preventing ambiguous or degenerate parsing behavior.
+**Purpose**: Checks that the parser refuses a tag rule with an empty opening marker. An empty opener would match everywhere and make parsing impossible to reason about.
 
-**Data flow**: Attempts to construct an `InlineHiddenTagParser` with `open: ""` and relies on the `#[should_panic]` expectation rather than returning a value.
+**Data flow**: It tries to create a parser with an empty open string and a normal close string. The expected outcome is a panic, meaning construction fails immediately instead of allowing a broken parser.
 
-**Call relations**: This test covers one of the constructor invariants enforced by `InlineHiddenTagParser::new`.
+**Call relations**: This test directly exercises the validation inside InlineHiddenTagParser::new. It does not proceed to parsing because the invalid configuration should be rejected at startup.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (vec!).
 
@@ -530,24 +532,24 @@ fn generic_inline_parser_rejects_empty_open_delimiter()
 fn generic_inline_parser_rejects_empty_close_delimiter()
 ```
 
-**Purpose**: Ensures parser construction panics when a tag spec has an empty closer, preventing malformed extraction rules.
+**Purpose**: Checks that the parser refuses a tag rule with an empty closing marker. Without a real closer, the parser could not know where hidden content ends.
 
-**Data flow**: Attempts to construct an `InlineHiddenTagParser` with `close: ""` and expects a panic.
+**Data flow**: It tries to create a parser with a normal open string and an empty close string. The expected outcome is a panic during construction.
 
-**Call relations**: This test covers the other delimiter invariant enforced by `InlineHiddenTagParser::new`.
+**Call relations**: This test directly exercises the validation inside InlineHiddenTagParser::new. Like the empty-opener test, it confirms bad tag rules are caught before any streamed text is processed.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (vec!).
 
 
 ### `utils/stream-parser/src/tagged_line_parser.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `stream parsing during incremental text handling`
 
-This file provides the core mechanics for recognizing line-based tag blocks in a stream without prematurely emitting text that might still turn out to be a tag delimiter. `TagSpec<T>` defines each supported tag pair as static `open` and `close` strings plus an associated tag value. Parsing output is expressed as `TaggedLineSegment<T>`, which distinguishes ordinary text (`Normal`) from tag lifecycle events (`TagStart`, `TagDelta`, `TagEnd`).
+Streaming text often arrives in chunks that do not line up with lines or tags. For example, one chunk might contain “<t” and the next might contain “ag>\n”. This file solves that by keeping a small amount of memory between calls, like holding a bookmark while reading a page a few words at a time.
 
-`TaggedLineParser<T>` maintains four pieces of state: the configured tag specs, the currently active tag if inside a block, a `detect_tag` flag controlling whether the parser is still evaluating the current line as a possible standalone tag line, and `line_buffer`, which accumulates the undecided line prefix. The main `parse` loop processes input character by character. While `detect_tag` is true, characters are buffered into `line_buffer`; the parser keeps waiting if the trimmed line is empty or still a prefix of any configured open/close delimiter. As soon as the buffered content can no longer become a tag line, it flips into plain-text mode and emits the buffered text. Newlines trigger `finish_line`, which decides whether the completed line is an opening tag, closing tag, or ordinary text.
+The main type, TaggedLineParser, is given a list of tag rules: an opening marker, a closing marker, and the tag value those markers represent. As text arrives, parse reads it character by character. At the start of each line it pauses before deciding whether the line is normal text or a tag line. It only accepts a tag if the trimmed line exactly matches a known open or close marker. If the line has extra text, it is treated as normal text.
 
-`finish` handles end-of-stream by resolving any unterminated buffered line using the same matching rules and forcibly emitting a `TagEnd` if a tag remained active. Segment emission is normalized through `push_segment`, which drops empty text fragments and coalesces adjacent `Normal` or same-tag `TagDelta` segments. A subtle invariant is that tag delimiters only match after trimming leading and trailing whitespace from the line, but any extra non-whitespace text on the line disqualifies it and causes the whole line to be emitted as normal content.
+When inside a tag block, ordinary text becomes TagDelta, meaning “content belonging to this tag.” Outside a tag block, it becomes Normal. TagStart and TagEnd mark the boundaries. finish is used when the stream ends, so any half-buffered line is resolved and any still-open tag is closed. push_segment keeps the output tidy by joining neighboring pieces of the same kind.
 
 #### Function details
 
@@ -557,11 +559,11 @@ This file provides the core mechanics for recognizing line-based tag blocks in a
 fn new(specs: Vec<TagSpec<T>>) -> Self
 ```
 
-**Purpose**: Builds a fresh line parser with a specific set of tag delimiter specifications. The parser starts outside any tag block and in tag-detection mode at the beginning of a line.
+**Purpose**: Creates a fresh parser with the tag rules it should recognize. A caller uses this before feeding streamed text into the parser.
 
-**Data flow**: It takes a `Vec<TagSpec<T>>` and stores it in `specs`, initializes `active_tag` to `None`, `detect_tag` to `true`, and `line_buffer` to an empty `String`, then returns the parser instance.
+**Data flow**: It receives a list of tag specifications, each saying what opening text and closing text count as a tag. It stores that list, starts with no active tag, prepares to look for tags at the start of a line, and creates an empty line buffer. The result is a ready-to-use TaggedLineParser.
 
-**Call relations**: Construction happens in higher-level parser setup and in tests that exercise line parsing behavior. It does not perform parsing itself; it prepares the state consumed later by `TaggedLineParser::parse` and `TaggedLineParser::finish`.
+**Call relations**: This is the setup step before parsing begins. The test helper tests::parser calls it to build a parser for test cases, and normal callers do the same before calling TaggedLineParser::parse.
 
 *Call graph*: called by 2 (new, parser); 1 external calls (new).
 
@@ -572,11 +574,11 @@ fn new(specs: Vec<TagSpec<T>>) -> Self
 fn parse(&mut self, delta: &str) -> Vec<TaggedLineSegment<T>>
 ```
 
-**Purpose**: Consumes one streamed text fragment and emits a sequence of normal-text and tag-related segments based on the parser’s current line and tag state. It incrementally buffers ambiguous line prefixes until they can be classified.
+**Purpose**: Consumes the next piece of streamed text and turns any completed decisions into output segments. It is designed for partial input, so it can wait when a possible tag has not fully arrived yet.
 
-**Data flow**: It reads and mutates `self.detect_tag`, `self.line_buffer`, and `self.active_tag` while iterating over `delta.chars()`. Characters are either appended to `line_buffer` during tag detection or accumulated in a temporary `run` string for plain text; completed lines are resolved via `finish_line`, and text fragments are emitted via `push_text`. It returns a `Vec<TaggedLineSegment<T>>` containing the segments produced from this input chunk.
+**Data flow**: It receives a text chunk. It reads characters one by one, buffering the start of a line while that line might still become a tag. If the buffered text stops matching any possible tag prefix, it releases it as normal text or tag content. When it reaches a newline, it asks finish_line to decide whether the whole line was a tag. It returns the segments that can be safely emitted from this chunk.
 
-**Call relations**: This is the main streaming entry used by outer parsers’ `push_str` implementations. During parsing it delegates line-final decisions to `TaggedLineParser::finish_line`, asks `TaggedLineParser::is_tag_prefix` whether a buffered slug could still become a delimiter, and routes actual text emission through `TaggedLineParser::push_text` so segment coalescing stays centralized.
+**Call relations**: This is the main workhorse used while text is arriving. It calls is_tag_prefix to decide whether to keep waiting, finish_line when a full line is available, and push_text when text should be emitted as either normal text or text inside the active tag.
 
 *Call graph*: calls 3 internal fn (finish_line, is_tag_prefix, push_text); called by 1 (push_str); 3 external calls (new, new, take).
 
@@ -587,11 +589,11 @@ fn parse(&mut self, delta: &str) -> Vec<TaggedLineSegment<T>>
 fn finish(&mut self) -> Vec<TaggedLineSegment<T>>
 ```
 
-**Purpose**: Flushes any buffered partial line and closes any still-open tag block at end-of-stream. It ensures the parser leaves no undecided line content or active tag state behind.
+**Purpose**: Ends the parsing session cleanly. It resolves any leftover buffered line and closes any tag block that was still open.
 
-**Data flow**: It reads `self.line_buffer`, `self.active_tag`, and the configured specs. If buffered line content exists, it trims it for delimiter matching via `match_open` and `match_close`; on a match it emits `TagStart` or `TagEnd`, otherwise it emits the buffered text through `push_text`. If a tag remains active afterward, it emits a final `TagEnd`, resets `detect_tag` to `true`, clears `active_tag` via `take`, and returns the accumulated segment vector.
+**Data flow**: It reads the parser’s saved line buffer and current active tag. If the buffered line exactly matches an opening tag, it emits a TagStart; if it exactly matches the matching closing tag, it emits a TagEnd; otherwise it emits the buffered text. Then, if a tag is still active, it emits a final TagEnd and clears the active tag. It returns the final segments and resets tag detection for future use.
 
-**Call relations**: This is called by outer parser `finish` paths when no more input will arrive. It mirrors the line-resolution logic used by `TaggedLineParser::finish_line`, but also performs the final cleanup step of auto-closing an active tag block so downstream consumers receive a balanced segment stream.
+**Call relations**: Callers use this after the last parse call, when no more text is coming. It uses match_open and match_close to classify the final line, push_text for ordinary leftover text, and push_segment to add boundary events cleanly.
 
 *Call graph*: calls 4 internal fn (match_close, match_open, push_text, push_segment); called by 1 (finish); 4 external calls (new, take, TagEnd, TagStart).
 
@@ -602,11 +604,11 @@ fn finish(&mut self) -> Vec<TaggedLineSegment<T>>
 fn finish_line(&mut self, segments: &mut Vec<TaggedLineSegment<T>>)
 ```
 
-**Purpose**: Classifies one completed buffered line as an opening tag line, a closing tag line, or ordinary text. It is the newline-triggered decision point for line-based tag recognition.
+**Purpose**: Decides what a completed line means. A line can be an opening tag, a closing tag, or plain text.
 
-**Data flow**: It takes mutable access to the parser and a mutable output segment vector. It drains `self.line_buffer`, trims the line for matching, checks `match_open` when no tag is active and `match_close` when the matching tag is active, updates `self.active_tag` and `self.detect_tag` accordingly, and otherwise forwards the original line text to `push_text`.
+**Data flow**: It takes the saved line buffer, removes the trailing newline only for checking, and trims surrounding spaces for tag matching. If the line exactly matches an opening tag and no tag is already active, it emits TagStart and marks that tag active. If it matches the closing tag for the active block, it emits TagEnd and clears the active tag. Otherwise it sends the whole original line onward as text.
 
-**Call relations**: This helper is invoked from `TaggedLineParser::parse` whenever a newline completes the current line under tag-detection mode. It delegates actual segment insertion to `push_segment` directly for tag boundary events and to `TaggedLineParser::push_text` for non-delimiter lines.
+**Call relations**: TaggedLineParser::parse calls this whenever it reaches a newline while watching for possible tags. It relies on match_open and match_close for the exact tag checks, and uses push_text or push_segment to produce the right output.
 
 *Call graph*: calls 4 internal fn (match_close, match_open, push_text, push_segment); called by 1 (parse); 3 external calls (take, TagEnd, TagStart).
 
@@ -617,11 +619,11 @@ fn finish_line(&mut self, segments: &mut Vec<TaggedLineSegment<T>>)
 fn push_text(&self, text: String, segments: &mut Vec<TaggedLineSegment<T>>)
 ```
 
-**Purpose**: Emits a text fragment in the correct segment form depending on whether the parser is currently inside a tag block. It abstracts the choice between visible normal text and tag-body delta text.
+**Purpose**: Adds a piece of ordinary text to the output in the correct category. The same characters mean different things depending on whether the parser is currently inside a tag block.
 
-**Data flow**: It takes an owned `String` plus the mutable segment list, reads `self.active_tag`, wraps the text as either `TaggedLineSegment::Normal` or `TaggedLineSegment::TagDelta(tag, text)`, and passes that segment to `push_segment` for empty-fragment suppression and coalescing.
+**Data flow**: It receives a text string and the growing output list. If there is an active tag, it wraps the text as TagDelta for that tag. If there is no active tag, it wraps the text as Normal. It then passes that segment to push_segment, which may append it or merge it with the previous segment.
 
-**Call relations**: This is the common text-emission path used by `TaggedLineParser::parse`, `TaggedLineParser::finish_line`, and `TaggedLineParser::finish`. By funneling all text through `push_segment`, it keeps adjacent text merging behavior consistent across streaming and flush paths.
+**Call relations**: parse, finish_line, and finish all call this when they have text that is not itself a tag marker. It delegates the final insertion to push_segment so output stays compact.
 
 *Call graph*: calls 1 internal fn (push_segment); called by 3 (finish, finish_line, parse); 2 external calls (Normal, TagDelta).
 
@@ -632,11 +634,11 @@ fn push_text(&self, text: String, segments: &mut Vec<TaggedLineSegment<T>>)
 fn is_tag_prefix(&self, slug: &str) -> bool
 ```
 
-**Purpose**: Determines whether the current trimmed line prefix could still become any configured opening or closing delimiter. It lets the parser delay emission while a tag line is still plausible.
+**Purpose**: Checks whether the current buffered line could still become a known tag. This is what lets the parser wait for more characters instead of wrongly emitting a partial tag as text.
 
-**Data flow**: It takes a candidate `slug`, trims trailing whitespace, scans `self.specs`, and returns `true` if any `spec.open` or `spec.close` starts with that slug; otherwise it returns `false`.
+**Data flow**: It receives the current possible tag text, trims trailing whitespace, and compares it against every known opening and closing marker. If any marker starts with that text, it returns true. Otherwise it returns false, meaning the line cannot be a tag anymore.
 
-**Call relations**: This predicate is consulted only from `TaggedLineParser::parse` while the parser is buffering a possible tag line. A false result is the signal that the buffered content can no longer be a standalone delimiter and should be emitted as ordinary text.
+**Call relations**: TaggedLineParser::parse calls this while reading a line. If it returns true, parse keeps buffering; if it returns false, parse stops waiting and emits the buffered characters as text.
 
 *Call graph*: called by 1 (parse).
 
@@ -647,11 +649,11 @@ fn is_tag_prefix(&self, slug: &str) -> bool
 fn match_open(&self, slug: &str) -> Option<T>
 ```
 
-**Purpose**: Looks up whether a fully formed trimmed line exactly matches any configured opening delimiter. It converts delimiter text into the parser’s tag identifier type.
+**Purpose**: Finds whether a completed line is exactly one of the configured opening tags. It returns the tag identity when there is a match.
 
-**Data flow**: It takes a `slug`, iterates over `self.specs`, finds the first spec whose `open` equals the slug, and returns `Some(spec.tag)` or `None` if no opening delimiter matches.
+**Data flow**: It receives a trimmed line. It compares that line with each configured opening marker. If one is equal, it returns the tag value from that rule; if none match, it returns nothing.
 
-**Call relations**: This exact-match helper is used by both `TaggedLineParser::finish_line` and `TaggedLineParser::finish` when deciding whether buffered line content should start a tag block. It isolates delimiter lookup from the surrounding state checks on `active_tag`.
+**Call relations**: finish_line uses this for complete lines during normal parsing, and finish uses it for a final buffered line at end of input. Its result tells those functions whether to emit TagStart.
 
 *Call graph*: called by 2 (finish, finish_line).
 
@@ -662,11 +664,11 @@ fn match_open(&self, slug: &str) -> Option<T>
 fn match_close(&self, slug: &str) -> Option<T>
 ```
 
-**Purpose**: Looks up whether a fully formed trimmed line exactly matches any configured closing delimiter. It maps closing delimiter text back to the associated tag identifier.
+**Purpose**: Finds whether a completed line is exactly one of the configured closing tags. It returns the tag identity when there is a match.
 
-**Data flow**: It takes a `slug`, scans `self.specs` for a spec whose `close` equals the slug, and returns the corresponding `tag` in `Some(...)` or `None` if unmatched.
+**Data flow**: It receives a trimmed line. It compares that line with each configured closing marker. If one is equal, it returns the tag value from that rule; if none match, it returns nothing.
 
-**Call relations**: This is paired with `TaggedLineParser::match_open` and is called from `TaggedLineParser::finish_line` and `TaggedLineParser::finish`. The surrounding control flow only treats a close match as valid when it matches the currently active tag.
+**Call relations**: finish_line uses this for complete lines during normal parsing, and finish uses it for a final buffered line at end of input. Its result tells those functions whether to emit TagEnd, but only when it matches the currently active tag.
 
 *Call graph*: called by 2 (finish, finish_line).
 
@@ -677,11 +679,11 @@ fn match_close(&self, slug: &str) -> Option<T>
 fn push_segment(segments: &mut Vec<TaggedLineSegment<T>>, segment: TaggedLineSegment<T>)
 ```
 
-**Purpose**: Appends a parsed segment to the output vector while normalizing away empty text fragments and merging adjacent compatible text segments. It keeps the emitted segment stream compact and stable.
+**Purpose**: Adds one parsed segment to the output while avoiding unnecessary clutter. It drops empty text pieces and joins neighboring text pieces of the same kind.
 
-**Data flow**: It takes a mutable `Vec<TaggedLineSegment<T>>` and one segment. For `Normal` and `TagDelta`, it drops empty strings, merges into the last segment when the variant matches and, for `TagDelta`, the tag value is equal; otherwise it pushes a new segment. `TagStart` and `TagEnd` are always appended as standalone events.
+**Data flow**: It receives the output list and one segment. Empty Normal or TagDelta text is ignored. A Normal segment is joined onto the previous Normal segment when possible. A TagDelta segment is joined onto the previous TagDelta only if both belong to the same tag. TagStart and TagEnd are always appended as separate boundary markers.
 
-**Call relations**: All segment-producing paths funnel through this helper either directly or via `TaggedLineParser::push_text`. That makes it the single place enforcing the invariant that adjacent text chunks are coalesced instead of emitted as many tiny fragments.
+**Call relations**: push_text uses this for normal text and tag content, while finish_line and finish use it for tag start and end events. It is the final cleanup step before segments leave the parser.
 
 *Call graph*: called by 3 (finish, finish_line, push_text); 4 external calls (Normal, TagDelta, TagEnd, TagStart).
 
@@ -692,11 +694,11 @@ fn push_segment(segments: &mut Vec<TaggedLineSegment<T>>, segment: TaggedLineSeg
 fn parser() -> TaggedLineParser<Tag>
 ```
 
-**Purpose**: Creates a test parser configured with a single `<tag>` / `</tag>` block specification. It centralizes fixture setup for the tagged-line parser tests.
+**Purpose**: Builds a small parser used by the tests. It recognizes one block tag with “<tag>” as the opener and “</tag>” as the closer.
 
-**Data flow**: It constructs a `Vec<TagSpec<Tag>>` with one `TagSpec` whose `tag` is `Tag::Block`, passes it to `TaggedLineParser::new`, and returns the resulting parser.
+**Data flow**: It creates a tag specification for the test-only Tag::Block value and passes it to TaggedLineParser::new. The result is a parser ready for test input.
 
-**Call relations**: This helper is called by the test cases so they all exercise the same parser configuration. It delegates all real initialization to `TaggedLineParser::new`.
+**Call relations**: The test cases call this helper so they all use the same setup. It keeps the tests focused on parser behavior rather than repeated construction code.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (vec!).
 
@@ -707,11 +709,11 @@ fn parser() -> TaggedLineParser<Tag>
 fn buffers_prefix_until_tag_is_decided()
 ```
 
-**Purpose**: Verifies that an incomplete delimiter prefix is buffered across chunks until the parser can conclusively recognize it as a tag line. It checks the intended incremental behavior for split tag markers.
+**Purpose**: Checks that the parser waits when a tag arrives split across chunks. This protects the streaming behavior that makes the parser useful.
 
-**Data flow**: The test creates a parser, feeds `"<t"` and then `"ag>\nline\n</tag>\n"`, extends one segment vector with the outputs from both parses plus `finish`, and compares the final segment list against the expected `TagStart`, `TagDelta`, and `TagEnd` sequence.
+**Data flow**: It creates a parser, feeds it “<t” first, then feeds the rest of the opening tag, a content line, and the closing tag. After finish, it compares the output with the expected TagStart, TagDelta, and TagEnd sequence.
 
-**Call relations**: It drives the public parsing lifecycle through the test fixture from `tests::parser`, exercising `TaggedLineParser::parse` and `TaggedLineParser::finish` together under a chunk-boundary condition.
+**Call relations**: This test exercises TaggedLineParser::parse across multiple calls and then TaggedLineParser::finish at the end. It confirms that partial tag prefixes are buffered instead of being emitted too early as normal text.
 
 *Call graph*: 2 external calls (assert_eq!, parser).
 
@@ -722,11 +724,11 @@ fn buffers_prefix_until_tag_is_decided()
 fn rejects_tag_lines_with_extra_text()
 ```
 
-**Purpose**: Checks that a would-be tag delimiter line is rejected when additional text appears on the same line. This confirms the parser’s strict “tag must appear alone on a line” rule.
+**Purpose**: Checks that a tag marker only counts when it appears alone on the line. This prevents text like “<tag> extra” from accidentally starting a block.
 
-**Data flow**: The test feeds `"<tag> extra\n"` into a fresh parser, appends the `finish` output, and asserts that the result is a single `TaggedLineSegment::Normal` containing the original line verbatim.
+**Data flow**: It creates a parser, feeds a line containing an opening tag plus extra words, then finishes the stream. It expects one Normal segment containing the whole line.
 
-**Call relations**: It uses the shared `tests::parser` fixture and validates the negative path in `TaggedLineParser::finish_line` / `TaggedLineParser::finish`, where exact trimmed delimiter matching fails and the buffered line is emitted as ordinary text.
+**Call relations**: This test drives TaggedLineParser::parse and TaggedLineParser::finish through the case where a tag-like line fails exact matching. It confirms the rule enforced by finish_line and the final-line logic in finish.
 
 *Call graph*: 2 external calls (assert_eq!, parser).
 
@@ -736,11 +738,13 @@ These helpers detect markdown-specific structures and encode or decode mention m
 
 ### `tui/src/table_detect.rs`
 
-`domain_logic` · `stream parsing and markdown analysis`
+`domain_logic` · `cross-cutting during Markdown parsing and streaming line scanning`
 
-This module contains two tightly related pieces of parsing logic over raw markdown source. The first is single-line pipe-table structure detection: `parse_table_segments` trims a line, strips optional outer pipes, splits on unescaped `|`, trims each segment, and rejects plain text without actual separators unless outer pipes were present. `is_table_header_line` then accepts any parsed segment list containing at least one non-empty cell, while `is_table_delimiter_line` requires every segment to match markdown alignment syntax such as `---`, `:---`, `---:`, or `:---:` with at least three dashes. These functions are intentionally structural rather than rendering-aware; escaped pipes remain in segment text because callers only need to know whether a line can participate in a table.
+Markdown tables are easy for people to read but tricky for a program to spot while text is still arriving line by line. A normal sentence may contain a pipe character, and code examples may contain many pipes that should not become tables. This file solves that problem by providing small, shared checks for table-shaped lines and a tracker for fenced code blocks, which are blocks started by three or more backticks or tildes.
 
-The second piece is incremental fenced-code tracking via `FenceTracker`. It stores optional open-fence state as `(marker_char, marker_len, FenceKind)` and updates that state one raw line at a time. `advance` ignores lines indented more than three spaces, strips blockquote prefixes before scanning, recognizes backtick and tilde fences of length three or more, and only closes a fence when marker character and minimum length match and no trailing content follows the closing marker. Fence info strings `md` and `markdown` are classified as `FenceKind::Markdown`; all others become `Other`. Callers query `kind()` before advancing each line so they know whether current pipe characters should count as markdown table syntax. Extensive tests cover escaped pipes, delimiter validity, fence matching, indentation, blockquotes, and close-marker edge cases.
+The table part works one line at a time. It trims the line, splits it on pipe characters that are real separators, and ignores escaped pipes such as `\|` because those are meant as text. It can then answer two important questions: does this look like a table header, and does this look like the required delimiter row made of dashes and optional colons?
+
+The fence part works like a bookmark that remembers whether the current stream is outside code, inside Markdown code, or inside some other language’s code. That matters because tables inside Markdown fences may still be meaningful, while pipes inside Rust or shell code are just code. It also understands blockquotes, so lines like `> | A | B |` can still be treated as table candidates.
 
 #### Function details
 
@@ -750,11 +754,11 @@ The second piece is incremental fenced-code tracking via `FenceTracker`. It stor
 fn parse_table_segments(line: &str) -> Option<Vec<&str>>
 ```
 
-**Purpose**: Parses one candidate markdown line into trimmed pipe-separated segments suitable for table-structure checks. It rejects empty lines and plain text without any real separator marker.
+**Purpose**: Splits one possible Markdown table line into its cell-like pieces. It is used when callers need to know whether a line has table structure, not when they need to render the table for display.
 
-**Data flow**: It takes `line: &str`, trims it, returns `None` if empty, records whether the trimmed line starts or ends with `|`, strips one leading and one trailing outer pipe if present, splits the remaining content with `split_unescaped_pipe`, rejects the result when there were no outer pipes and only one segment, trims each segment, and returns `Some(Vec<&str>)` when at least one segment remains.
+**Data flow**: It receives one raw line of text. It trims outer whitespace, removes a leading or trailing pipe if present, asks `split_unescaped_pipe` to cut only at real separator pipes, trims each resulting piece, and returns the pieces; if the line is empty or has no usable table separator, it returns nothing.
 
-**Call relations**: Header, delimiter, and holdback candidate detection all depend on this parser. It delegates only the low-level separator scan to `split_unescaped_pipe`, keeping policy decisions about outer pipes and emptiness here.
+**Call relations**: Higher-level table checks call this first because both headers and delimiter rows depend on the same idea of what counts as a pipe-separated line. The streaming table scanner and table candidate text logic rely on its answer before deciding whether consecutive lines form a real table.
 
 *Call graph*: calls 1 internal fn (split_unescaped_pipe); called by 3 (table_candidate_text, is_table_delimiter_line, is_table_header_line).
 
@@ -765,11 +769,11 @@ fn parse_table_segments(line: &str) -> Option<Vec<&str>>
 fn split_unescaped_pipe(content: &str) -> Vec<&str>
 ```
 
-**Purpose**: Splits a string on `|` characters that are not escaped by a preceding backslash. It preserves escaped pipes inside the returned segment slices.
+**Purpose**: Cuts a line into pieces at pipe characters that are not escaped. This prevents text like `A \| B` from being mistaken for two table cells.
 
-**Data flow**: It takes `content: &str`, scans its bytes left to right, skips over escaped characters after `\`, pushes slices between unescaped `|` positions into a preallocated `Vec<&str>`, appends the trailing slice after the loop, and returns the vector of borrowed segments.
+**Data flow**: It receives the already-trimmed table content without outer pipes. It walks through the bytes, skips over a character after a backslash, records each unescaped pipe as a split point, and returns borrowed slices of the original text.
 
-**Call relations**: Only `parse_table_segments` calls this helper. It exists as the structural hot-path primitive for table parsing.
+**Call relations**: It is the low-level helper used by `parse_table_segments`. Callers do not use it directly for table decisions; they get the safer, trimmed result from `parse_table_segments` instead.
 
 *Call graph*: called by 1 (parse_table_segments); 1 external calls (with_capacity).
 
@@ -780,11 +784,11 @@ fn split_unescaped_pipe(content: &str) -> Vec<&str>
 fn is_table_header_line(line: &str) -> bool
 ```
 
-**Purpose**: Determines whether a line has table-header shape: pipe-separated segments with at least one non-empty cell. It does not validate any following delimiter row.
+**Purpose**: Checks whether a line can serve as the header row of a Markdown pipe table. A header must have pipe-separated pieces and at least one non-empty cell.
 
-**Data flow**: It takes `line: &str`, runs `parse_table_segments(line)`, and returns `true` only when parsing succeeds and at least one segment is not empty.
+**Data flow**: It receives a line, passes it to `parse_table_segments`, then looks for any segment that is not empty. It returns true if such a segment exists and false otherwise.
 
-**Call relations**: Whole-buffer table holdback tests use this directly, and incremental holdback logic reaches the same predicate through shared helpers. It is the positive structural check for a potential header row.
+**Call relations**: The table holdback scanner calls this while reading source lines. It uses the result as the first half of the table pattern, waiting to see whether the next line is a delimiter row.
 
 *Call graph*: calls 1 internal fn (parse_table_segments); called by 1 (table_holdback_state).
 
@@ -795,11 +799,11 @@ fn is_table_header_line(line: &str) -> bool
 fn is_table_delimiter_segment(segment: &str) -> bool
 ```
 
-**Purpose**: Checks whether one segment matches markdown table alignment syntax. Valid forms are dash runs of length at least three with optional leading and/or trailing colons.
+**Purpose**: Checks one cell of a Markdown table delimiter row, such as `---`, `:---`, `---:`, or `:---:`. These dash-and-colon markers tell Markdown where the table header ends and how columns align.
 
-**Data flow**: It trims the input segment, rejects empties, strips at most one leading colon and one trailing colon, then returns whether the remaining text has length at least three and consists entirely of `-` characters.
+**Data flow**: It receives one segment, trims it, removes one optional colon from the start and one optional colon from the end, then checks that at least three dashes remain and that every remaining character is a dash. It returns true only for valid delimiter markers.
 
-**Call relations**: This is the per-cell predicate used by `is_table_delimiter_line`. It is intentionally private because callers care about whole-line delimiter validity.
+**Call relations**: It is the small rule used when validating a whole delimiter line. The delimiter-line check applies this same rule to every segment so a row is accepted only if all columns look like Markdown alignment markers.
 
 
 ##### `is_table_delimiter_line`  (lines 108–111)
@@ -808,11 +812,11 @@ fn is_table_delimiter_segment(segment: &str) -> bool
 fn is_table_delimiter_line(line: &str) -> bool
 ```
 
-**Purpose**: Determines whether every parsed segment in a line is a valid markdown table delimiter segment. It is the structural confirmation step paired with a preceding header line.
+**Purpose**: Checks whether a whole line is a valid Markdown table delimiter row. This is the row of dashes that must immediately follow a table header.
 
-**Data flow**: It takes `line: &str`, parses segments with `parse_table_segments`, and returns `true` only when parsing succeeds and every segment satisfies `is_table_delimiter_segment`.
+**Data flow**: It receives a line, splits it with `parse_table_segments`, and then verifies that every segment matches the delimiter-segment rule. It returns true only when the entire row is made of valid delimiter markers.
 
-**Call relations**: Whole-buffer holdback scanning uses this to confirm a table after a header. It complements `is_table_header_line` as the second half of the two-line table confirmation rule.
+**Call relations**: The table holdback scanner calls this after a possible header line. Together with `is_table_header_line`, it lets the scanner confirm that two neighboring lines really start a table.
 
 *Call graph*: calls 1 internal fn (parse_table_segments); called by 1 (table_holdback_state).
 
@@ -823,11 +827,11 @@ fn is_table_delimiter_line(line: &str) -> bool
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a fence tracker in the outside-of-fence state. No open fence marker or kind is remembered initially.
+**Purpose**: Creates a fresh fenced-code-block tracker. At creation time it assumes the reader is outside any fenced code block.
 
-**Data flow**: It returns `FenceTracker { state: None }` with no side effects.
+**Data flow**: It takes no input. It returns a `FenceTracker` with no remembered open fence.
 
-**Call relations**: Streaming scanners, test helpers, and fence tests create trackers through this constructor before feeding lines incrementally.
+**Call relations**: Streaming and Markdown parsing code create one tracker before walking through lines. Tests also create fresh trackers so each fence scenario starts from a clean state.
 
 *Call graph*: called by 12 (new, parse_lines_with_fence_state, fence_tracker_blockquote_prefix_stripped, fence_tracker_close_with_trailing_content_does_not_close, fence_tracker_indented_4_spaces_ignored, fence_tracker_markdown_case_insensitive, fence_tracker_markdown_fence, fence_tracker_mismatched_char_does_not_close, fence_tracker_nested_shorter_marker_does_not_close, fence_tracker_opens_and_closes_backtick_fence (+2 more)).
 
@@ -838,11 +842,11 @@ fn new() -> Self
 fn advance(&mut self, raw_line: &str)
 ```
 
-**Purpose**: Consumes one raw source line and updates fenced-code-block state according to markdown fence rules. It handles indentation limits, blockquote prefixes, opening fences, and matching close fences.
+**Purpose**: Feeds one raw source line into the fence tracker so it can notice when a fenced code block opens or closes. This is how the scanner avoids treating pipes inside ordinary code blocks as Markdown tables.
 
-**Data flow**: It takes `&mut self` and `raw_line: &str`, counts leading spaces and returns early if there are more than three, slices off those spaces, strips blockquote prefixes with `strip_blockquote_prefix`, parses a potential fence marker with `parse_fence_marker`, and then either closes the current fence when marker character/length match and trailing content is empty, or opens a new fence with kind `Markdown` or `Other` based on `is_markdown_fence_info`. If no valid fence marker is present, state is unchanged.
+**Data flow**: It receives a raw line, ignores it if it is indented more than three spaces, strips blockquote markers, and checks for a backtick or tilde fence marker. If no fence is open, a marker opens one and records whether it is Markdown or another language; if a fence is already open, a matching marker of sufficient length with no trailing text closes it. It updates the tracker’s stored state and returns nothing.
 
-**Call relations**: Incremental table holdback scanning calls this after classifying each line so the next line sees the updated fence context. It is the canonical fence-state machine shared across markdown-related code.
+**Call relations**: The streaming line flow calls this as lines are pushed through. Inside, it relies on `strip_blockquote_prefix`, `parse_fence_marker`, and `is_markdown_fence_info` to make the same fence decision every time.
 
 *Call graph*: calls 3 internal fn (is_markdown_fence_info, parse_fence_marker, strip_blockquote_prefix); called by 1 (push_line).
 
@@ -853,11 +857,11 @@ fn advance(&mut self, raw_line: &str)
 fn kind(&self) -> FenceKind
 ```
 
-**Purpose**: Returns the current fence context that applies before the next line mutates tracker state. Outside of any fence, it reports `FenceKind::Outside`.
+**Purpose**: Reports the current fence context: outside code, inside Markdown code, or inside other code. Callers use this to decide whether pipe characters on nearby lines should count as table syntax.
 
-**Data flow**: It reads `self.state` and returns the stored `FenceKind` or `FenceKind::Outside` when no fence is open.
+**Data flow**: It reads the tracker’s stored state. If there is no open fence, it returns `Outside`; otherwise it returns the stored fence kind.
 
-**Call relations**: Callers query this before processing a line structurally, especially the table holdback scanner and test helpers. It exposes fence context without exposing marker internals.
+**Call relations**: The streaming line flow calls this around line processing after the tracker has been advanced. Its answer guides whether table detection should run or be skipped for code content.
 
 *Call graph*: called by 1 (push_line).
 
@@ -868,11 +872,11 @@ fn kind(&self) -> FenceKind
 fn parse_fence_marker(line: &str) -> Option<(char, usize)>
 ```
 
-**Purpose**: Recognizes the opening run of a backtick or tilde fence and returns its marker character and run length. Runs shorter than three are rejected.
+**Purpose**: Recognizes the opening marker part of a fenced code block: at least three backticks or at least three tildes. It does not decide the language; it only identifies the marker character and length.
 
-**Data flow**: It inspects the first byte of `line`, returns `None` unless it is `` ` `` or `~`, counts the contiguous run length of that byte, rejects lengths under three, and otherwise returns `Some((marker_char, len))`.
+**Data flow**: It receives text that has already had leading indentation and blockquote markers removed. It checks the first byte, counts how many matching marker characters appear at the start, and returns the marker character plus its run length; if the line is not a valid marker, it returns nothing.
 
-**Call relations**: Only `FenceTracker::advance` calls this helper. It isolates the syntax for identifying candidate fence lines.
+**Call relations**: `FenceTracker::advance` calls this for each candidate line. The tracker then uses the marker information to open a new fence or test whether the current fence should close.
 
 *Call graph*: called by 1 (advance).
 
@@ -883,11 +887,11 @@ fn parse_fence_marker(line: &str) -> Option<(char, usize)>
 fn is_markdown_fence_info(trimmed_line: &str, marker_len: usize) -> bool
 ```
 
-**Purpose**: Determines whether the info string following a fence marker denotes markdown content. It recognizes `md` and `markdown` case-insensitively.
+**Purpose**: Decides whether the language label after a fence marker means the fenced content is Markdown. It accepts `md` and `markdown`, ignoring letter case.
 
-**Data flow**: It slices `trimmed_line` after `marker_len`, takes the first whitespace-delimited token, and returns whether that token equals `md` or `markdown` ignoring ASCII case.
+**Data flow**: It receives the trimmed fence line and the length of the marker at the start. It reads the first word after the marker and compares it with Markdown labels, returning true for Markdown and false otherwise.
 
-**Call relations**: Fence opening logic uses this to classify new fences as `FenceKind::Markdown` versus `FenceKind::Other`.
+**Call relations**: `FenceTracker::advance` calls this only when it has found a new opening fence. The result becomes the stored `FenceKind`, which later tells table detection whether pipes inside the fence may still matter.
 
 *Call graph*: called by 1 (advance).
 
@@ -898,11 +902,11 @@ fn is_markdown_fence_info(trimmed_line: &str, marker_len: usize) -> bool
 fn strip_blockquote_prefix(line: &str) -> &str
 ```
 
-**Purpose**: Removes all leading markdown blockquote markers from a line, including optional spaces after each `>`. This lets downstream parsers treat quoted tables and fences as their underlying content.
+**Purpose**: Removes leading Markdown blockquote markers, the `>` characters used for quoted text. This lets table and fence detection work inside blockquotes as well as in normal text.
 
-**Data flow**: It trims leading whitespace, repeatedly strips a leading `>` and one optional following space, trims leading whitespace again, and returns the remaining subslice once no more blockquote marker is present.
+**Data flow**: It receives a line, trims leading spaces, repeatedly removes a leading `>` plus an optional following space, and returns the remaining text slice. The original text is not copied.
 
-**Call relations**: Both fence tracking and table candidate detection rely on this helper so quoted markdown is interpreted structurally rather than rejected.
+**Call relations**: Fence tracking calls this before looking for code fences, and table candidate detection calls it before looking for table syntax. It gives both callers a clean view of the line’s real Markdown content.
 
 *Call graph*: called by 2 (table_candidate_text, advance).
 
@@ -913,11 +917,11 @@ fn strip_blockquote_prefix(line: &str) -> &str
 fn parse_table_segments_basic()
 ```
 
-**Purpose**: Checks that a standard fully-piped table row is split into trimmed cell segments. It validates the normal parsing path.
+**Purpose**: Verifies that a normal pipe table row with leading and trailing pipes is split into clean cell names.
 
-**Data flow**: The test calls `parse_table_segments("| A | B | C |")` and asserts that the result is `Some(vec!["A", "B", "C"])`.
+**Data flow**: It supplies `| A | B | C |` to `parse_table_segments` and checks that the result is three trimmed segments. Nothing outside the test is changed.
 
-**Call relations**: This test anchors the expected baseline behavior of `parse_table_segments`.
+**Call relations**: The Rust test runner calls this during automated tests. It protects the basic behavior that higher-level header and delimiter checks depend on.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -928,11 +932,11 @@ fn parse_table_segments_basic()
 fn parse_table_segments_no_outer_pipes()
 ```
 
-**Purpose**: Verifies that rows without leading or trailing outer pipes still parse when they contain internal separators. This matches common markdown table syntax.
+**Purpose**: Checks that table-like rows can be recognized even without a pipe at either edge.
 
-**Data flow**: It calls `parse_table_segments("A | B | C")` and asserts the expected three trimmed segments.
+**Data flow**: It sends `A | B | C` into the parser and expects three cells back. The test passes only if inner pipes are enough to form segments.
 
-**Call relations**: This test covers the branch where internal separators alone are sufficient to treat a line as table-like.
+**Call relations**: The test runner executes this to keep the parser compatible with Markdown table styles that omit outer border pipes.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -943,11 +947,11 @@ fn parse_table_segments_no_outer_pipes()
 fn parse_table_segments_no_leading_pipe()
 ```
 
-**Purpose**: Verifies parsing when only a trailing outer pipe is present. It ensures asymmetric outer-pipe forms are accepted.
+**Purpose**: Confirms that a row with a trailing pipe but no leading pipe is still accepted as table-shaped.
 
-**Data flow**: It calls `parse_table_segments("A | B | C |")` and asserts the expected segments.
+**Data flow**: It passes `A | B | C |` to `parse_table_segments` and checks for the three expected trimmed segments.
 
-**Call relations**: This test protects permissive handling of markdown rows missing a leading outer pipe.
+**Call relations**: This test supports the shared parsing rule used by both streaming detection and Markdown cleanup.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -958,11 +962,11 @@ fn parse_table_segments_no_leading_pipe()
 fn parse_table_segments_no_trailing_pipe()
 ```
 
-**Purpose**: Verifies parsing when only a leading outer pipe is present. It ensures the parser accepts the opposite asymmetric form as well.
+**Purpose**: Confirms that a row with a leading pipe but no trailing pipe is still accepted as table-shaped.
 
-**Data flow**: It calls `parse_table_segments("| A | B | C")` and asserts the expected segments.
+**Data flow**: It gives `| A | B | C` to `parse_table_segments` and expects the same three cell values. It only observes the parser result.
 
-**Call relations**: This complements the no-leading-pipe test for outer-pipe normalization.
+**Call relations**: The test runner uses this to guard a common Markdown table variation.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -973,11 +977,11 @@ fn parse_table_segments_no_trailing_pipe()
 fn parse_table_segments_single_segment_is_allowed()
 ```
 
-**Purpose**: Checks that a single segment enclosed by outer pipes is still considered a valid parsed result. The parser is structural and does not require multiple columns.
+**Purpose**: Checks that a line enclosed in outer pipes can produce a single table segment. This matters because the presence of outer pipes is still structural information.
 
-**Data flow**: It calls `parse_table_segments("| only |")` and asserts `Some(vec!["only"])`.
+**Data flow**: It passes `| only |` to `parse_table_segments` and expects one segment, `only`.
 
-**Call relations**: This test documents that outer pipes alone are enough to make a line table-like even with one segment.
+**Call relations**: This test documents an intentional parser choice so future changes do not reject single-column table rows.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -988,11 +992,11 @@ fn parse_table_segments_single_segment_is_allowed()
 fn parse_table_segments_without_pipe_returns_none()
 ```
 
-**Purpose**: Ensures plain text without any pipe separators is not misclassified as a table row. It protects against false positives.
+**Purpose**: Verifies that ordinary text with no pipe separator is not treated as a table line.
 
-**Data flow**: It calls `parse_table_segments("just text")` and asserts `None`.
+**Data flow**: It sends `just text` to `parse_table_segments` and expects no result.
 
-**Call relations**: This test covers the rejection path for non-table text.
+**Call relations**: The test runner uses this to protect against false table detection in normal prose.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1003,11 +1007,11 @@ fn parse_table_segments_without_pipe_returns_none()
 fn parse_table_segments_empty_returns_none()
 ```
 
-**Purpose**: Ensures empty and whitespace-only lines are rejected by the parser. Blank lines cannot participate in table structure.
+**Purpose**: Verifies that empty or whitespace-only lines are not considered table rows.
 
-**Data flow**: It calls `parse_table_segments("")` and `parse_table_segments("   ")`, asserting `None` for both.
+**Data flow**: It passes an empty string and a spaces-only string to `parse_table_segments` and expects no result from both.
 
-**Call relations**: This test protects the parser's early-empty-line guard.
+**Call relations**: This keeps blank lines from confusing the streaming table scanner.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1018,11 +1022,11 @@ fn parse_table_segments_empty_returns_none()
 fn parse_table_segments_escaped_pipe()
 ```
 
-**Purpose**: Verifies that escaped pipes remain inside a segment instead of splitting columns. This preserves structural correctness for cell text containing literal `|`.
+**Purpose**: Checks that an escaped pipe stays inside a cell instead of becoming a column break.
 
-**Data flow**: It calls `parse_table_segments(r"| A \| B | C |")` and asserts two segments, with the escaped pipe retained in the first segment text.
+**Data flow**: It passes a row containing `\|` and expects that text to remain in the first segment, with only the unescaped pipe splitting the row.
 
-**Call relations**: This test specifically validates `split_unescaped_pipe` behavior through the public parser.
+**Call relations**: The test runner uses this to protect the distinction between literal pipe text and table separators.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1033,11 +1037,11 @@ fn parse_table_segments_escaped_pipe()
 fn is_table_delimiter_segment_valid()
 ```
 
-**Purpose**: Checks representative valid delimiter-segment forms, including alignment colons and long dash runs. It pins the accepted syntax.
+**Purpose**: Verifies the accepted forms of one Markdown delimiter cell, including optional alignment colons.
 
-**Data flow**: It calls `is_table_delimiter_segment` on several valid strings and asserts each returns true.
+**Data flow**: It checks several dash-and-colon strings and expects each one to be accepted as valid.
 
-**Call relations**: This test covers the positive cases for the private delimiter-segment predicate.
+**Call relations**: This test protects the small rule that whole delimiter-line detection depends on.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1048,11 +1052,11 @@ fn is_table_delimiter_segment_valid()
 fn is_table_delimiter_segment_invalid()
 ```
 
-**Purpose**: Checks representative invalid delimiter-segment forms such as empty strings, too-short dash runs, and non-dash text. It guards against over-acceptance.
+**Purpose**: Verifies that empty text, too few dashes, and non-dash text are rejected as delimiter cells.
 
-**Data flow**: It calls `is_table_delimiter_segment` on invalid inputs and asserts each returns false.
+**Data flow**: It checks invalid strings and expects each one to fail the delimiter-segment test.
 
-**Call relations**: This complements the valid-segment test for delimiter syntax boundaries.
+**Call relations**: The test runner uses this to prevent loose delimiter matching that could turn ordinary text into tables.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1063,11 +1067,11 @@ fn is_table_delimiter_segment_invalid()
 fn is_table_delimiter_line_valid()
 ```
 
-**Purpose**: Verifies that full delimiter rows with multiple valid segments are accepted. It covers both outer-piped and minimally-piped forms.
+**Purpose**: Checks that complete delimiter rows are accepted in several common Markdown styles.
 
-**Data flow**: It calls `is_table_delimiter_line` on several valid delimiter rows and asserts true.
+**Data flow**: It gives valid delimiter lines to `is_table_delimiter_line` and expects true each time.
 
-**Call relations**: This test exercises whole-line delimiter validation built on parsed segments.
+**Call relations**: This test supports the scanner’s ability to confirm a table when a header is followed by a valid dash row.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1078,11 +1082,11 @@ fn is_table_delimiter_line_valid()
 fn is_table_delimiter_line_invalid()
 ```
 
-**Purpose**: Ensures non-delimiter rows are rejected by whole-line delimiter detection. It protects against confusing headers or short dashes with delimiter syntax.
+**Purpose**: Checks that non-delimiter rows and rows with too few dashes are rejected.
 
-**Data flow**: It calls `is_table_delimiter_line` on invalid rows and asserts false.
+**Data flow**: It passes invalid lines to `is_table_delimiter_line` and expects false.
 
-**Call relations**: This test covers the negative path for delimiter-line recognition.
+**Call relations**: The test runner uses this to guard against false positives in table detection.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1093,11 +1097,11 @@ fn is_table_delimiter_line_invalid()
 fn is_table_header_line_valid()
 ```
 
-**Purpose**: Verifies that typical header rows with at least one non-empty cell are accepted. It covers both outer-piped and plain internal-separator forms.
+**Purpose**: Verifies that common table header rows are recognized with or without outer pipes.
 
-**Data flow**: It calls `is_table_header_line` on valid examples and asserts true.
+**Data flow**: It passes header-like lines to `is_table_header_line` and expects true.
 
-**Call relations**: This test anchors the positive semantics of header detection.
+**Call relations**: This test protects the first step in the two-line table recognition process.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1108,11 +1112,11 @@ fn is_table_header_line_valid()
 fn is_table_header_line_all_empty_segments()
 ```
 
-**Purpose**: Ensures a row of only empty cells is not treated as a valid header. At least one visible cell is required.
+**Purpose**: Checks that a row of empty cells is not accepted as a table header.
 
-**Data flow**: It calls `is_table_header_line("| | |")` and asserts false.
+**Data flow**: It passes `| | |` to `is_table_header_line` and expects false because no cell contains real content.
 
-**Call relations**: This test protects the non-empty-cell requirement in header detection.
+**Call relations**: This prevents empty-looking separator lines from being treated as meaningful table headers.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1123,11 +1127,11 @@ fn is_table_header_line_all_empty_segments()
 fn fence_tracker_outside_by_default()
 ```
 
-**Purpose**: Checks that a new fence tracker starts outside any fence. It validates the initial state contract.
+**Purpose**: Confirms that a new fence tracker starts outside any fenced code block.
 
-**Data flow**: It constructs `FenceTracker::new()` and asserts `kind()` equals `FenceKind::Outside`.
+**Data flow**: It creates a tracker with `FenceTracker::new` and checks that `kind` reports `Outside`.
 
-**Call relations**: This is the baseline test for tracker initialization.
+**Call relations**: The test runner calls this to protect the initial state used before line scanning begins.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1138,11 +1142,11 @@ fn fence_tracker_outside_by_default()
 fn fence_tracker_opens_and_closes_backtick_fence()
 ```
 
-**Purpose**: Verifies opening, staying inside, and closing a backtick fence with non-markdown info. It confirms ordinary fence lifecycle behavior.
+**Purpose**: Verifies that backtick fences open, remain active across content lines, and close with a matching marker.
 
-**Data flow**: It advances a tracker through ` ```rust `, a content line, and ` ``` `, asserting `Other`, `Other`, then `Outside`.
+**Data flow**: It advances a tracker through an opening Rust fence, a code line, and a closing fence, checking the reported kind after each step.
 
-**Call relations**: This test exercises the standard backtick-fence path in `advance`.
+**Call relations**: This test exercises the main state transitions used when streaming source text contains non-Markdown code.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1153,11 +1157,11 @@ fn fence_tracker_opens_and_closes_backtick_fence()
 fn fence_tracker_opens_and_closes_tilde_fence()
 ```
 
-**Purpose**: Verifies the same lifecycle for tilde fences. It ensures both supported marker characters behave consistently.
+**Purpose**: Verifies that tilde fences work the same way as backtick fences.
 
-**Data flow**: It advances through `~~~python` and `~~~`, asserting `Other` then `Outside`.
+**Data flow**: It advances through `~~~python` and then `~~~`, expecting the tracker to enter `Other` and then return to `Outside`.
 
-**Call relations**: This complements the backtick-fence test.
+**Call relations**: The test runner uses this to keep support for both Markdown fence marker styles.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1168,11 +1172,11 @@ fn fence_tracker_opens_and_closes_tilde_fence()
 fn fence_tracker_markdown_fence()
 ```
 
-**Purpose**: Checks that markdown fences are classified distinctly from other fences and remain active across interior table-like lines. This matters because markdown fences are still eligible for table scanning.
+**Purpose**: Checks that a fence labeled `md` is treated as Markdown content, not ordinary code.
 
-**Data flow**: It advances through ` ```md `, a table-looking line, and ` ``` `, asserting `Markdown`, `Markdown`, then `Outside`.
+**Data flow**: It opens an `md` fence, advances through a table-like line, and then closes the fence, checking that the kind is `Markdown` until closure.
 
-**Call relations**: This test validates the `is_markdown_fence_info` branch used during fence opening.
+**Call relations**: This protects the behavior that lets table detection still consider pipes inside Markdown fences.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1183,11 +1187,11 @@ fn fence_tracker_markdown_fence()
 fn fence_tracker_markdown_case_insensitive()
 ```
 
-**Purpose**: Ensures markdown fence info matching is case-insensitive. It protects compatibility with varied fence info capitalization.
+**Purpose**: Verifies that Markdown fence labels are recognized regardless of letter case.
 
-**Data flow**: It advances through ` ```Markdown ` and ` ``` `, asserting `Markdown` then `Outside`.
+**Data flow**: It opens a fence labeled `Markdown`, checks for `Markdown` kind, then closes it and checks for `Outside`.
 
-**Call relations**: This test specifically covers case-insensitive info-string handling.
+**Call relations**: The test runner uses this to make fence detection forgiving in the same way users usually expect Markdown labels to be.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1198,11 +1202,11 @@ fn fence_tracker_markdown_case_insensitive()
 fn fence_tracker_nested_shorter_marker_does_not_close()
 ```
 
-**Purpose**: Verifies that a shorter marker inside an open longer fence does not close it, while a matching-length marker does. This preserves markdown fence matching rules.
+**Purpose**: Checks that a fence opened with a longer marker is not closed by a shorter marker inside it.
 
-**Data flow**: It opens with four backticks, advances a three-backtick line and asserts the fence remains `Other`, then advances a four-backtick line and asserts `Outside`.
+**Data flow**: It opens with four backticks, advances over three backticks, and confirms the fence remains open until four backticks appear.
 
-**Call relations**: This test covers the minimum-close-length rule in `advance`.
+**Call relations**: This test protects correct Markdown fence matching, which depends on closing markers being at least as long as the opener.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1213,11 +1217,11 @@ fn fence_tracker_nested_shorter_marker_does_not_close()
 fn fence_tracker_mismatched_char_does_not_close()
 ```
 
-**Purpose**: Ensures a tilde marker cannot close a backtick fence and vice versa. Fence marker character must match exactly.
+**Purpose**: Verifies that a tilde marker cannot close a backtick fence.
 
-**Data flow**: It opens a backtick fence, advances a tilde fence marker and asserts still `Other`, then advances a matching backtick close and asserts `Outside`.
+**Data flow**: It opens a backtick fence, advances over a tilde marker, confirms the fence remains open, then closes with backticks.
 
-**Call relations**: This test covers the marker-character matching rule in close detection.
+**Call relations**: The test runner uses this to guard the rule that opening and closing fence characters must match.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1228,11 +1232,11 @@ fn fence_tracker_mismatched_char_does_not_close()
 fn fence_tracker_indented_4_spaces_ignored()
 ```
 
-**Purpose**: Checks that lines indented more than three spaces are ignored for fence parsing. Such lines are treated as indented code, not fences.
+**Purpose**: Checks that a fence-like line indented by four spaces is ignored as a fence marker.
 
-**Data flow**: It advances a tracker with `    ```sh` and asserts the tracker remains `Outside`.
+**Data flow**: It advances a fresh tracker with an indented backtick line and expects the tracker to remain `Outside`.
 
-**Call relations**: This test protects the leading-space guard in `advance`.
+**Call relations**: This protects the Markdown rule that four-space indentation means an indented code block, not a fenced code block opener.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1243,11 +1247,11 @@ fn fence_tracker_indented_4_spaces_ignored()
 fn fence_tracker_blockquote_prefix_stripped()
 ```
 
-**Purpose**: Verifies that blockquote prefixes are removed before fence parsing so quoted fences still affect context. This aligns fence handling with quoted markdown semantics.
+**Purpose**: Verifies that fences inside blockquotes are still recognized.
 
-**Data flow**: It advances through `> ```sh` and `> `````, asserting `Other` then `Outside`.
+**Data flow**: It advances through quoted opening and closing fence lines, checking that the tracker enters `Other` and then returns to `Outside`.
 
-**Call relations**: This test validates the use of `strip_blockquote_prefix` inside `advance`.
+**Call relations**: This test confirms that `FenceTracker::advance` uses blockquote stripping before fence detection.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1258,11 +1262,11 @@ fn fence_tracker_blockquote_prefix_stripped()
 fn fence_tracker_close_with_trailing_content_does_not_close()
 ```
 
-**Purpose**: Ensures a would-be closing marker with trailing content does not terminate the fence. Only clean closing lines count.
+**Purpose**: Checks that a closing fence marker with extra text after it does not close the current fence.
 
-**Data flow**: It opens a fence, advances ` ``` extra ` and asserts still `Other`, then advances ` ``` ` and asserts `Outside`.
+**Data flow**: It opens a fence, advances over a marker followed by extra text and expects the fence to stay open, then advances over a clean marker and expects closure.
 
-**Call relations**: This test covers the trailing-content rejection branch in close detection.
+**Call relations**: The test runner uses this to protect the closing rule used by the streaming scanner.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1273,11 +1277,11 @@ fn fence_tracker_close_with_trailing_content_does_not_close()
 fn parse_fence_marker_backtick()
 ```
 
-**Purpose**: Checks that backtick fence markers are parsed with the correct run length. It validates the marker parser directly.
+**Purpose**: Verifies that backtick fence markers of three or more characters are recognized and counted.
 
-**Data flow**: It calls `parse_fence_marker` on backtick examples and asserts the expected `(char, len)` tuples.
+**Data flow**: It passes backtick marker lines to `parse_fence_marker` and checks that the returned marker character and length are correct.
 
-**Call relations**: This test isolates `parse_fence_marker` from tracker state.
+**Call relations**: This test protects the helper that `FenceTracker::advance` relies on before opening or closing fences.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1288,11 +1292,11 @@ fn parse_fence_marker_backtick()
 fn parse_fence_marker_tilde()
 ```
 
-**Purpose**: Checks that tilde fence markers are parsed correctly. It covers the alternate marker character.
+**Purpose**: Verifies that tilde fence markers are recognized.
 
-**Data flow**: It calls `parse_fence_marker("~~~python")` and asserts `Some(('~', 3))`.
+**Data flow**: It passes a tilde fence line and expects `parse_fence_marker` to return the tilde character and marker length.
 
-**Call relations**: This complements the backtick marker test.
+**Call relations**: The test runner uses this to keep tilde fence support aligned with backtick support.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1303,11 +1307,11 @@ fn parse_fence_marker_tilde()
 fn parse_fence_marker_too_short()
 ```
 
-**Purpose**: Ensures runs shorter than three are not treated as fences. This protects the minimum-length rule.
+**Purpose**: Checks that one- or two-character marker runs are not accepted as fences.
 
-**Data flow**: It calls `parse_fence_marker` on two-character backtick and tilde runs and asserts `None`.
+**Data flow**: It passes two-backtick and two-tilde strings and expects no marker result.
 
-**Call relations**: This test covers the parser's short-run rejection path.
+**Call relations**: This protects the Markdown requirement that fenced code blocks start with at least three marker characters.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1318,11 +1322,11 @@ fn parse_fence_marker_too_short()
 fn parse_fence_marker_not_fence()
 ```
 
-**Purpose**: Ensures ordinary text and empty input are not misclassified as fence markers. It protects the parser's initial-byte checks.
+**Purpose**: Checks that ordinary text and empty text are not mistaken for fence markers.
 
-**Data flow**: It calls `parse_fence_marker` on `hello` and `""`, asserting `None`.
+**Data flow**: It passes `hello` and an empty string to `parse_fence_marker` and expects no result.
 
-**Call relations**: This test covers non-fence inputs for the marker parser.
+**Call relations**: The test runner uses this to prevent false fence transitions during line scanning.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1333,11 +1337,11 @@ fn parse_fence_marker_not_fence()
 fn is_markdown_fence_info_basic()
 ```
 
-**Purpose**: Verifies markdown info-string recognition for `md` and `markdown`, including uppercase, and rejection of unrelated or absent info strings. It pins the fence-kind classification rule.
+**Purpose**: Verifies which fence language labels count as Markdown.
 
-**Data flow**: It calls `is_markdown_fence_info` on several fence lines and asserts the expected booleans.
+**Data flow**: It checks `md`, `markdown`, and uppercase `MD` as accepted labels, and checks Rust or no label as rejected.
 
-**Call relations**: This test isolates the info-string classifier used by `advance`.
+**Call relations**: This test protects the helper that decides whether a newly opened fence should be classified as `Markdown` or `Other`.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1348,22 +1352,24 @@ fn is_markdown_fence_info_basic()
 fn strip_blockquote_prefix_basic()
 ```
 
-**Purpose**: Checks that one or more leading blockquote markers are removed and non-quoted text is left unchanged. It validates the quote-stripping helper directly.
+**Purpose**: Verifies that leading blockquote markers are removed, including nested quote markers.
 
-**Data flow**: It calls `strip_blockquote_prefix` on quoted and unquoted examples and asserts the resulting slices.
+**Data flow**: It passes quoted and unquoted lines to `strip_blockquote_prefix` and checks the remaining text.
 
-**Call relations**: This test supports both fence and table parsing behavior by pinning the shared normalization helper.
+**Call relations**: The test runner uses this to protect the shared cleanup step used before both table and fence detection.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `tui/src/mention_codec.rs`
 
-`domain_logic` · `history serialization and deserialization`
+`domain_logic` · `history save/load`
 
-This file defines the round-trip format for mentions stored in TUI history. `LinkedMention` carries the visible sigil, mention text, and canonical target path; `DecodedHistoryText` returns reconstructed plain text alongside the extracted bindings. Encoding walks the original UTF-8 text byte-by-byte, looking only at `$` and `@` sigils that appear at valid plaintext boundaries and are followed by mention-name characters (`[A-Za-z0-9_-]`). It groups supplied bindings by `(sigil, mention)` into `VecDeque`s so repeated mentions are linked in encounter order rather than reusing the same path. Boundary helpers deliberately reject embedded substrings such as email addresses or package scopes while still allowing punctuation-delimited mentions and path-like suffixes after the linked token.
+The TUI needs to remember more than the words a user typed. If a user mentions a tool by writing `$figma` or a plugin by writing `@sample`, the history must keep the real target path too, such as `app://figma-1` or `plugin://sample@test`. This file is the translator between those two forms. Think of it like saving a contact in your phone: you see “Mom”, but the phone stores the actual number as well.
 
-Decoding performs the inverse scan over markdown text, recognizing only links of the form `[$name](path)` or `[@name](path)` with optional whitespace before `(`. It filters out false positives such as common environment variables (`$PATH`, `$HOME`, etc.) and only accepts paths that look like tool/plugin references (`app://`, `mcp://`, `plugin://`, `skill://`, or a filesystem `SKILL.md`). A compatibility branch maps `[@plugin](plugin://...)` back to `$plugin` when `at_mentions_enabled` is off, preserving older history semantics. The tests focus on ordering, punctuation boundaries, Unicode whitespace, legacy fallback, and avoiding accidental matches inside larger tokens.
+When saving history, `encode_history_mentions` scans the visible text and replaces known mentions with Markdown-style links like `[$figma](app://figma-1)`. It is careful not to turn random text into a mention. For example, it avoids embedded `@` text inside an email address or package name, and it keeps repeated mentions matched to their saved paths in order.
+
+When loading history, `decode_history_mentions_with_at_mentions` does the reverse. It finds those stored links, restores the visible `$name` or `@name` text, and returns a list of `LinkedMention` records containing the hidden paths. The code also protects common shell variables like `$PATH` from being mistaken for tool mentions, and it supports older history where plugin mentions used `$` instead of `@`.
 
 #### Function details
 
@@ -1373,11 +1379,11 @@ Decoding performs the inverse scan over markdown text, recognizing only links of
 fn encode_history_mentions(text: &str, mentions: &[LinkedMention]) -> String
 ```
 
-**Purpose**: Scans plain history text for visible mention tokens and replaces matched occurrences with markdown links using the supplied `LinkedMention` bindings. It only links supported sigils and consumes duplicate bindings in order so repeated names can map to different paths.
+**Purpose**: This turns visible mentions in user text into saved links that include the real destination path. It is used before storing history so later sessions can recover exactly which tool or plugin was meant.
 
-**Data flow**: Inputs are the source `text` and a slice of `LinkedMention` records. It first filters mentions to `$` and `@`, buckets them in a `HashMap<(char, &str), VecDeque<&str>>`, then walks the text by byte index, validating mention starts with `starts_plaintext_mention`, mention bodies with `is_mention_name_char`, and mention ends with `ends_plaintext_mention`. When a queued binding exists for the exact `(sigil, name)`, it emits `[sigilname](path)` into the output string and pops that path from the queue; otherwise it copies the original character unchanged. It returns the rewritten string and does not mutate external state.
+**Data flow**: It receives plain text plus a list of known linked mentions. It groups those mentions by their visible token, scans the text from left to right, and when it finds a matching `$name` or `@name` in a safe place, it replaces it with a link like `[$name](path)`. It returns the encoded string and does not change the input list.
 
-**Call relations**: This is the main encoder exercised by the mention codec tests. During scanning it delegates boundary and token-shape decisions to `starts_plaintext_mention`, `is_mention_name_char`, and `ends_plaintext_mention` so the core loop can decide whether to link or preserve raw text.
+**Call relations**: In the bigger flow, this is the save-side translator. The tests call it with many edge cases, and inside it asks small boundary-checking helpers such as `starts_plaintext_mention`, `ends_plaintext_mention`, and `is_mention_name_char` to decide whether text really is a mention before writing a link.
 
 *Call graph*: calls 3 internal fn (ends_plaintext_mention, is_mention_name_char, starts_plaintext_mention); called by 9 (encode_history_mentions_does_not_let_at_token_steal_later_tool_binding, encode_history_mentions_links_at_mentions_after_unicode_whitespace, encode_history_mentions_links_both_sigils_for_same_name, encode_history_mentions_links_bound_mentions_in_order, encode_history_mentions_links_dollar_mentions_after_punctuation, encode_history_mentions_links_parenthesized_at_mentions, encode_history_mentions_links_sentence_ending_at_mentions, encode_history_mentions_preserves_at_sigils, encode_history_mentions_skips_embedded_at_substrings); 4 external calls (new, with_capacity, matches!, is_empty).
 
@@ -1391,11 +1397,11 @@ fn decode_history_mentions_with_at_mentions(
 ) -> DecodedHistoryText
 ```
 
-**Purpose**: Parses stored history text containing linked mentions and reconstructs the visible text plus a list of extracted `LinkedMention` bindings. It optionally preserves `@` mentions instead of collapsing them into legacy `$` mentions.
+**Purpose**: This reads stored history text and restores the simple mention text users expect to see. At the same time, it rebuilds the list of hidden mention targets.
 
-**Data flow**: Inputs are markdown-ish `text` and the `at_mentions_enabled` feature flag. It iterates through the byte slice, and whenever it sees `[`, it asks `parse_history_linked_mention` whether a valid linked mention starts there. On success it appends the visible `sigil + name` token to the output text, pushes a `LinkedMention { sigil, mention, path }` into a vector, and jumps to the parsed end index; otherwise it copies the next UTF-8 character verbatim. It returns a `DecodedHistoryText` containing the reconstructed plain text and collected mentions.
+**Data flow**: It receives encoded history text and a flag saying whether `@` mentions are enabled. It scans for link-shaped text, asks `parse_history_linked_mention` whether each link is a real supported mention, writes the visible token back into the output text, and collects each mention's sigil, name, and path. It returns a `DecodedHistoryText` containing both the visible text and the recovered mention list.
 
-**Call relations**: This is the public decoder used by callers that load history text and by the tests covering legacy and `@`-mention behavior. It relies on `parse_history_linked_mention` to enforce all syntax, path, and compatibility rules.
+**Call relations**: This is the load-side translator. It is called by `new_with_at_mentions` when history is being reconstructed, and the tests call it to prove both modern `@` behavior and older fallback behavior work.
 
 *Call graph*: calls 1 internal fn (parse_history_linked_mention); called by 6 (new_with_at_mentions, decode_history_mentions_restores_at_sigil_for_tool_paths, decode_history_mentions_restores_plugin_links_with_at_sigil, decode_history_mentions_restores_visible_tokens, decode_history_mentions_without_at_mentions_ignores_at_non_plugin_paths, decode_history_mentions_without_at_mentions_uses_legacy_plugin_fallback); 2 external calls (with_capacity, new).
 
@@ -1411,11 +1417,11 @@ fn parse_history_linked_mention(
 ) -> Option<(char, &'a str, &'a str, usize)>
 ```
 
-**Purpose**: Recognizes one linked mention at a given `[` position and decides which visible sigil should be restored. It applies compatibility rules so only tool-like links survive decoding and legacy plugin links can downgrade from `@` to `$`.
+**Purpose**: This decides whether a link found in history is one of this app's saved mentions. It also decides which visible sigil, `$` or `@`, should be restored.
 
-**Data flow**: Inputs are the full `text`, its byte slice, the candidate `start` index, and `at_mentions_enabled`. It first tries `parse_linked_tool_mention` for `$`, then for `@`, and filters successful parses through `is_common_env_var` and `is_tool_path`. If `at_mentions_enabled` is false, an `@` mention is only accepted when its path starts with `plugin://`, and the returned sigil is rewritten to `$`. It returns `Some((sigil, name, path, end_index))` or `None`.
+**Data flow**: It receives the full text, its bytes, the starting position of a possible link, and the `@`-mentions setting. It tries to parse `$` and sometimes `@` linked mentions, rejects common environment variable names, checks that the path points to a known tool/plugin style location, and returns the restored sigil, name, path, and ending position when the link is valid.
 
-**Call relations**: This function is called only from `decode_history_mentions_with_at_mentions` when the outer scan encounters `[`. It delegates raw bracket-and-parenthesis parsing to `parse_linked_tool_mention`, then adds the semantic acceptance rules that determine whether the decoder should consume the link.
+**Call relations**: It sits between the broad decoder and the low-level link parser. `decode_history_mentions_with_at_mentions` asks it about each possible link, and it hands detailed parsing to `parse_linked_tool_mention` while using `is_common_env_var` and `is_tool_path` as safety filters.
 
 *Call graph*: calls 3 internal fn (is_common_env_var, is_tool_path, parse_linked_tool_mention); called by 1 (decode_history_mentions_with_at_mentions).
 
@@ -1431,11 +1437,11 @@ fn parse_linked_tool_mention(
 ) -> Option<(&'a str, &'a str, usize)>
 ```
 
-**Purpose**: Parses the concrete markdown fragment `[$name](path)` or `[@name](path)` starting at a `[` byte. It validates sigil placement, mention-name characters, closing delimiters, and a non-empty trimmed path.
+**Purpose**: This parses the exact stored shape of one mention link, such as `[$figma](app://figma-1)`. It only checks the syntax and extracts the name and path.
 
-**Data flow**: Inputs are the original `text`, its bytes, the `start` index, and the expected `sigil`. It checks for `[` followed immediately by that sigil, consumes a mention name using `is_mention_name_char`, requires a closing `]`, skips ASCII whitespace before `(`, then scans until `)` and trims the enclosed path. It returns borrowed slices for `name` and `path` plus the index after the closing `)`; otherwise it returns `None` without side effects.
+**Data flow**: It receives the text, its byte view, a starting index, and the expected sigil. It verifies the text starts with `[`, then the sigil, then a valid name, then `]`, optional spaces, and a parenthesized path. If all parts are present and the path is not empty, it returns the name, path, and where the link ends.
 
-**Call relations**: This is the low-level parser used by `parse_history_linked_mention` for both `$` and `@` candidates. It intentionally does syntax extraction only, leaving environment-variable and tool-path filtering to its caller.
+**Call relations**: This is the careful reader used by `parse_history_linked_mention`. It does not decide whether a path is meaningful; it only extracts the pieces so the caller can apply higher-level rules.
 
 *Call graph*: calls 1 internal fn (is_mention_name_char); called by 1 (parse_history_linked_mention).
 
@@ -1446,11 +1452,11 @@ fn parse_linked_tool_mention(
 fn is_mention_name_char(byte: u8) -> bool
 ```
 
-**Purpose**: Defines the byte-level character class allowed inside mention names. The accepted set is ASCII letters, digits, underscore, and hyphen.
+**Purpose**: This answers whether one byte can be part of a mention name. Mention names here are limited to letters, numbers, underscores, and hyphens.
 
-**Data flow**: It takes one `u8` and returns a boolean based on a `matches!` range check. It reads no external state and writes nothing.
+**Data flow**: It receives a single byte and checks it against the allowed ASCII characters. It returns `true` if the byte can be part of a mention name, otherwise `false`.
 
-**Call relations**: This helper is used by both `encode_history_mentions` and `parse_linked_tool_mention` so encoding and decoding agree on the exact mention token grammar.
+**Call relations**: Both the encoder and the low-level parser use this while walking through text. It is the shared rule that keeps mention-name recognition consistent in saved and loaded history.
 
 *Call graph*: called by 2 (encode_history_mentions, parse_linked_tool_mention); 1 external calls (matches!).
 
@@ -1461,11 +1467,11 @@ fn is_mention_name_char(byte: u8) -> bool
 fn starts_plaintext_mention(text: &str, index: usize) -> bool
 ```
 
-**Purpose**: Determines whether a sigil at a byte index begins a standalone plaintext mention rather than appearing inside another token. It treats start-of-string, whitespace, and non-name punctuation as valid left boundaries.
+**Purpose**: This checks whether an `@` mention starts in a reasonable place in normal text. It prevents the encoder from treating the middle of an email address or another word as a mention.
 
-**Data flow**: Inputs are the full `text` and the candidate byte `index`. It inspects the previous Unicode scalar, if any, and returns true when there is no previous character or when that character is whitespace or fails `is_mention_name_char_char`. It returns a boolean and has no side effects.
+**Data flow**: It receives the full text and the index of a possible mention sigil. If the sigil is at the start of the text, it accepts it. Otherwise it looks at the previous character and returns `true` only when that previous character is whitespace or not a mention-name character.
 
-**Call relations**: This helper is consulted by `encode_history_mentions` for `@` mentions and for non-tool plaintext-boundary checks, preventing accidental linking inside emails or package-like strings.
+**Call relations**: The encoder calls this before linking `@` mentions. It is part of the guardrail system that keeps ordinary text such as `foo@sample.com` from being rewritten.
 
 *Call graph*: called by 1 (encode_history_mentions).
 
@@ -1476,11 +1482,11 @@ fn starts_plaintext_mention(text: &str, index: usize) -> bool
 fn ends_plaintext_mention(text_bytes: &[u8], index: usize) -> bool
 ```
 
-**Purpose**: Determines whether the byte after a parsed mention name is a valid right boundary for plaintext linking. It allows sentence punctuation and path-like continuations to remain outside the linked token.
+**Purpose**: This checks where a plain text mention is allowed to end. It lets mentions end before punctuation or whitespace while still allowing useful suffixes like paths to remain outside the link.
 
-**Data flow**: It takes the text byte slice and the index immediately after the mention name. It returns true at end-of-input, on whitespace, on a period followed by whitespace or non-name punctuation, or on other non-name delimiters while explicitly rejecting continuation characters such as `.`, `/`, `\`, alphanumerics, `_`, and `-`. It produces only a boolean.
+**Data flow**: It receives the byte slice of the text and the index just after a detected mention name. It looks at the next byte, if any, and decides whether that byte is a safe boundary. It returns `true` when the mention can stop there.
 
-**Call relations**: This function is called from `encode_history_mentions` after a candidate name has been scanned. Its boundary rules are what make cases like `$figma/docs` encode as a linked `$figma` followed by `/docs` instead of rejecting the mention entirely.
+**Call relations**: The encoder uses this when deciding whether an `@` token should become a stored link. Together with `starts_plaintext_mention`, it keeps link creation precise rather than grabbing too much or too little text.
 
 *Call graph*: called by 1 (encode_history_mentions).
 
@@ -1491,11 +1497,11 @@ fn ends_plaintext_mention(text_bytes: &[u8], index: usize) -> bool
 fn is_mention_name_char_char(ch: char) -> bool
 ```
 
-**Purpose**: Provides the character-level version of the mention-name predicate for boundary checks on preceding Unicode characters.
+**Purpose**: This is the character-based version of the mention-name check. It is useful when the code is looking at Rust characters instead of raw bytes.
 
-**Data flow**: It accepts a `char` and returns true for ASCII alphanumerics, underscore, or hyphen. It has no side effects.
+**Data flow**: It receives one character, checks whether it is an ASCII letter, digit, underscore, or hyphen, and returns a yes/no answer.
 
-**Call relations**: This helper is used internally by `starts_plaintext_mention` to decide whether the character before a sigil makes the sigil embedded in a larger token.
+**Call relations**: It supports the plain-text boundary logic around mentions. It mirrors `is_mention_name_char`, but works at the character level so non-ASCII whitespace can still be handled safely.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1506,11 +1512,11 @@ fn is_mention_name_char_char(ch: char) -> bool
 fn is_common_env_var(name: &str) -> bool
 ```
 
-**Purpose**: Filters out uppercase names that are likely shell environment variables rather than intended tool mentions. This avoids decoding links like `$PATH` as structured mentions.
+**Purpose**: This prevents common shell variables like `$PATH` and `$HOME` from being mistaken for tool mentions. That matters because users may type normal command-line text into the TUI.
 
-**Data flow**: It takes a mention `name`, uppercases it with `to_ascii_uppercase`, and compares it against a fixed allowlist of common environment variable names such as `PATH`, `HOME`, `USER`, and `XDG_CONFIG_HOME`. It returns a boolean and does not mutate state.
+**Data flow**: It receives a name, converts it to uppercase, compares it with a fixed set of common environment variable names, and returns `true` if it matches one of them.
 
-**Call relations**: This semantic filter is applied by `parse_history_linked_mention` after syntax parsing succeeds, so only plausible tool/plugin mentions are restored into structured history metadata.
+**Call relations**: `parse_history_linked_mention` uses this as a safety check while decoding stored links. If a link name looks like a common environment variable, the decoder refuses to treat it as a tool mention.
 
 *Call graph*: called by 1 (parse_history_linked_mention); 1 external calls (matches!).
 
@@ -1521,11 +1527,11 @@ fn is_common_env_var(name: &str) -> bool
 fn is_tool_path(path: &str) -> bool
 ```
 
-**Purpose**: Recognizes canonical mention target paths that should round-trip as tool mentions. It accepts known URI schemes and filesystem paths ending in `SKILL.md`.
+**Purpose**: This decides whether a stored path looks like a real tool, plugin, app, MCP server, or skill target. It keeps the decoder from accepting arbitrary Markdown links as mentions.
 
-**Data flow**: It takes a `&str` path and returns true if it starts with `app://`, `mcp://`, `plugin://`, or `skill://`, or if the last path segment after `/` or `\` equals `SKILL.md` case-insensitively. It reads no external state.
+**Data flow**: It receives a path string and checks for known prefixes such as `app://`, `mcp://`, `plugin://`, and `skill://`. It also accepts paths whose final file name is `SKILL.md`. It returns `true` only for those recognized forms.
 
-**Call relations**: This helper is used by `parse_history_linked_mention` to reject arbitrary markdown links and keep decoding limited to tool/plugin references that the TUI intentionally stores.
+**Call relations**: `parse_history_linked_mention` calls this after a link has been syntactically parsed. This helper supplies the final “is this one of ours?” decision for modern tool-style paths.
 
 *Call graph*: called by 1 (parse_history_linked_mention).
 
@@ -1536,11 +1542,11 @@ fn is_tool_path(path: &str) -> bool
 fn decode_history_mentions_restores_visible_tokens()
 ```
 
-**Purpose**: Verifies that decoding converts linked `$` mentions back into visible plaintext tokens and preserves their paths in encounter order.
+**Purpose**: This test proves that stored `$` mention links are turned back into visible `$name` text and linked mention records. It covers app, plugin, and skill-file paths.
 
-**Data flow**: The test feeds a string containing three linked mentions into `decode_history_mentions_with_at_mentions(true)`, then compares the returned `DecodedHistoryText.text` and `mentions` vector against explicit expected values.
+**Data flow**: It feeds encoded history containing three linked mentions into the decoder. It then checks that the visible output text is simple and that the recovered mention list preserves each sigil, name, and path.
 
-**Call relations**: It exercises the normal decode path through `decode_history_mentions_with_at_mentions`, including parsing multiple links and preserving duplicate names with different paths.
+**Call relations**: During the test run, this calls `decode_history_mentions_with_at_mentions`. It confirms the main load-side path works for the common historical `$` form.
 
 *Call graph*: calls 1 internal fn (decode_history_mentions_with_at_mentions); 1 external calls (assert_eq!).
 
@@ -1551,11 +1557,11 @@ fn decode_history_mentions_restores_visible_tokens()
 fn decode_history_mentions_restores_plugin_links_with_at_sigil()
 ```
 
-**Purpose**: Checks that when `@` mentions are enabled, plugin links written with `@` decode back to visible `@name` tokens rather than legacy `$name` tokens.
+**Purpose**: This test checks that modern `@` plugin mentions are restored as `@name` when `@` mentions are enabled. It also confirms `$` tool mentions still work beside them.
 
-**Data flow**: The test passes mixed `[@sample](plugin://...)` and `[$figma](app://...)` text into the decoder with `at_mentions_enabled = true` and asserts both the visible text and structured mentions.
+**Data flow**: It sends encoded text with both an `@sample` plugin link and a `$figma` app link into the decoder. It expects the visible text and recovered mention list to keep the correct separate sigils.
 
-**Call relations**: It validates the `@` branch inside `parse_history_linked_mention` as reached from `decode_history_mentions_with_at_mentions`.
+**Call relations**: This test calls `decode_history_mentions_with_at_mentions` with the feature enabled. It protects the newer `@` mention behavior from accidentally being collapsed back into `$`.
 
 *Call graph*: calls 1 internal fn (decode_history_mentions_with_at_mentions); 1 external calls (assert_eq!).
 
@@ -1566,11 +1572,11 @@ fn decode_history_mentions_restores_plugin_links_with_at_sigil()
 fn decode_history_mentions_without_at_mentions_uses_legacy_plugin_fallback()
 ```
 
-**Purpose**: Confirms that disabled `@` mentions trigger the compatibility fallback that rewrites plugin `@` links to visible `$` mentions.
+**Purpose**: This test verifies compatibility when `@` mentions are not enabled. In that mode, plugin links written with `@` are restored as older `$` mentions.
 
-**Data flow**: The test decodes text containing an `@sample` plugin link and a `$figma` app link with `at_mentions_enabled = false`, then asserts that both visible tokens and stored sigils are `$`.
+**Data flow**: It gives the decoder encoded text containing an `@` plugin link and a `$` app link while the setting is off. It expects both visible mentions and both recovered records to use `$`.
 
-**Call relations**: It specifically covers the legacy fallback branch in `parse_history_linked_mention` invoked by the main decoder.
+**Call relations**: This calls `decode_history_mentions_with_at_mentions` in legacy mode. It ensures old UI behavior still understands plugin links stored with the newer shape.
 
 *Call graph*: calls 1 internal fn (decode_history_mentions_with_at_mentions); 1 external calls (assert_eq!).
 
@@ -1581,11 +1587,11 @@ fn decode_history_mentions_without_at_mentions_uses_legacy_plugin_fallback()
 fn decode_history_mentions_without_at_mentions_ignores_at_non_plugin_paths()
 ```
 
-**Purpose**: Ensures that when `@` mentions are disabled, non-plugin `@` links are left untouched instead of being misinterpreted as legacy tool mentions.
+**Purpose**: This test makes sure legacy mode does not accept every `@` link as a mention. Only plugin paths get the special fallback.
 
-**Data flow**: The test decodes `[@figma](app://figma-1)` with `at_mentions_enabled = false` and asserts that the original markdown text remains unchanged and no mentions are extracted.
+**Data flow**: It passes an encoded `@figma` link whose path is an app path, with `@` mentions disabled. It expects the text to remain unchanged and the recovered mention list to be empty.
 
-**Call relations**: It verifies the negative path in `parse_history_linked_mention` where the fallback only accepts `plugin://` targets.
+**Call relations**: This test calls `decode_history_mentions_with_at_mentions` to check the decoder's rejection path. It guards against accidentally turning unsupported `@` links into `$` mentions.
 
 *Call graph*: calls 1 internal fn (decode_history_mentions_with_at_mentions); 1 external calls (assert_eq!).
 
@@ -1596,11 +1602,11 @@ fn decode_history_mentions_without_at_mentions_ignores_at_non_plugin_paths()
 fn decode_history_mentions_restores_at_sigil_for_tool_paths()
 ```
 
-**Purpose**: Checks that enabled `@` mentions preserve the `@` sigil even for non-plugin tool paths such as `app://`.
+**Purpose**: This test confirms that, when `@` mentions are enabled, an `@` mention can point to a normal tool path and still be restored as `@`. It protects the unified mention behavior.
 
-**Data flow**: The test decodes a single `[@figma](app://figma-1)` link with `at_mentions_enabled = true` and asserts the visible text and `LinkedMention` contents.
+**Data flow**: It gives the decoder a stored `[@figma](app://figma-1)` link with `@` support enabled. It expects visible text `@figma` and a matching linked mention record.
 
-**Call relations**: It covers the accepted `@`-tool-path branch in `parse_history_linked_mention` through the public decoder.
+**Call relations**: This calls `decode_history_mentions_with_at_mentions`. It checks the path where `parse_history_linked_mention` accepts `@` for recognized tool paths.
 
 *Call graph*: calls 1 internal fn (decode_history_mentions_with_at_mentions); 1 external calls (assert_eq!).
 
@@ -1611,11 +1617,11 @@ fn decode_history_mentions_restores_at_sigil_for_tool_paths()
 fn encode_history_mentions_links_bound_mentions_in_order()
 ```
 
-**Purpose**: Verifies that repeated visible mentions consume queued bindings in order and leave unmatched later tokens untouched.
+**Purpose**: This test proves repeated visible mentions are linked to their saved paths in the same order they appear. That matters when the same name can refer to more than one target.
 
-**Data flow**: The test calls `encode_history_mentions` with text containing `$figma`, `$sample`, another `$figma`, and `$other`, plus three bindings. It asserts that the first two `$figma` occurrences use different paths in sequence and `$other` remains plain text.
+**Data flow**: It supplies text containing `$figma`, `$sample`, `$figma`, and an unmatched `$other`, plus three linked mention records. It expects the first three matching mentions to become links and `$other` to stay plain.
 
-**Call relations**: It exercises the encoder's `HashMap` plus `VecDeque` binding strategy and the main scanning loop.
+**Call relations**: This test calls `encode_history_mentions`. It verifies the encoder's queue-like matching behavior for repeated mention names.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1626,11 +1632,11 @@ fn encode_history_mentions_links_bound_mentions_in_order()
 fn encode_history_mentions_links_dollar_mentions_after_punctuation()
 ```
 
-**Purpose**: Checks that punctuation before a `$` mention still counts as a valid left boundary for linking.
+**Purpose**: This test checks that a `$` mention can be linked even when it appears after punctuation, such as inside parentheses. Users often write mentions this way in normal sentences.
 
-**Data flow**: The test encodes `($figma)` with one `$figma` binding and asserts that only the mention token becomes a markdown link inside the parentheses.
+**Data flow**: It gives the encoder the text `($figma)` and a matching linked mention. It expects only `$figma` to become a saved link, leaving the parentheses around it.
 
-**Call relations**: It validates the left-boundary logic in `starts_plaintext_mention` as used by `encode_history_mentions`.
+**Call relations**: This test calls `encode_history_mentions`. It protects the encoder's ability to find mentions that are not separated only by spaces.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1641,11 +1647,11 @@ fn encode_history_mentions_links_dollar_mentions_after_punctuation()
 fn encode_history_mentions_links_dollar_mentions_with_path_like_suffixes()
 ```
 
-**Purpose**: Ensures the encoder links the mention token itself while preserving following path-like or suffix characters outside the link.
+**Purpose**: This test checks that `$` mentions can be linked while suffixes like `/docs`, `.suffix`, or `\docs` remain visible after the link. This lets users refer to something inside or beside a mentioned tool target.
 
-**Data flow**: The test reuses one `LinkedMention` and calls `encode_history_mentions` on `$figma/docs`, `$figma.suffix`, and `$figma\docs`, asserting the exact split between linked token and trailing text.
+**Data flow**: It builds one `$figma` linked mention and checks several strings where extra path-like text follows the mention. The expected result is a link around `$figma` only, with the suffix left outside.
 
-**Call relations**: It covers the right-boundary behavior implemented by `ends_plaintext_mention` inside the encoder.
+**Call relations**: During the test run, it exercises the encoder behavior for mention endings. It protects the boundary rules used by `encode_history_mentions` from swallowing path-like suffixes.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1656,11 +1662,11 @@ fn encode_history_mentions_links_dollar_mentions_with_path_like_suffixes()
 fn encode_history_mentions_preserves_at_sigils()
 ```
 
-**Purpose**: Checks that `@` bindings encode as `[@name](path)` rather than being normalized to `$`.
+**Purpose**: This test confirms that `@` mentions stay `@` when they are encoded. It matters because `$` and `@` can mean different kinds of mentions to the user.
 
-**Data flow**: The test passes text with two `@` mentions and one unrelated `$other`, along with two `@` bindings, then asserts the exact encoded output.
+**Data flow**: It gives the encoder text containing two `@` mentions and one unrelated `$other`. It expects the two known `@` mentions to become `[@name](path)` links and the unrelated token to remain plain.
 
-**Call relations**: It exercises the encoder's per-sigil binding map and confirms that `@` and `$` are treated as distinct tokens.
+**Call relations**: This test calls `encode_history_mentions`. It guards against accidentally converting modern `@` mentions into older `$`-style links.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1671,11 +1677,11 @@ fn encode_history_mentions_preserves_at_sigils()
 fn encode_history_mentions_links_both_sigils_for_same_name()
 ```
 
-**Purpose**: Verifies that the same mention name can be linked separately for `@` and `$` without collisions.
+**Purpose**: This test proves `$figma` and `@figma` are treated as different visible tokens even though the name is the same. That prevents one mention type from stealing the other's path.
 
-**Data flow**: The test encodes `@figma then $figma` with one `@figma` binding and one `$figma` binding and asserts that each occurrence receives the correct path.
+**Data flow**: It supplies text with `@figma` followed by `$figma`, plus one linked mention for each sigil. It expects each token to be linked to its own path.
 
-**Call relations**: It validates the encoder's `(sigil, name)` map key, ensuring one sigil cannot consume the other's queued binding.
+**Call relations**: This test calls `encode_history_mentions`. It checks that the encoder groups mention records by both sigil and name, not by name alone.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1686,11 +1692,11 @@ fn encode_history_mentions_links_both_sigils_for_same_name()
 fn encode_history_mentions_does_not_let_at_token_steal_later_tool_binding()
 ```
 
-**Purpose**: Ensures an earlier `@name` occurrence does not consume a later `$name` binding when only the `$` binding exists.
+**Purpose**: This test ensures an unmatched `@figma` does not consume a later `$figma` binding. Without this, the wrong visible token could get linked and the intended one would be left plain.
 
-**Data flow**: The test encodes `@figma then $figma` with only a `$figma` binding and asserts that the `@figma` stays plain while the later `$figma` is linked.
+**Data flow**: It gives the encoder text containing `@figma` then `$figma`, but provides only a `$figma` linked mention. It expects `@figma` to stay plain and `$figma` to become the link.
 
-**Call relations**: It covers the same sigil-sensitive queueing behavior as the previous test, but from the negative case.
+**Call relations**: This test calls `encode_history_mentions`. It protects the encoder's sigil-aware matching rule.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1701,11 +1707,11 @@ fn encode_history_mentions_does_not_let_at_token_steal_later_tool_binding()
 fn encode_history_mentions_links_at_mentions_after_unicode_whitespace()
 ```
 
-**Purpose**: Checks that non-ASCII whitespace still counts as a valid left boundary for plaintext `@` mentions.
+**Purpose**: This test checks that `@` mentions still work after non-English or non-ASCII whitespace, such as a full-width space. That helps the TUI behave correctly for international text.
 
-**Data flow**: The test encodes a string containing a full-width space before `@sample` and asserts that the mention is linked correctly.
+**Data flow**: It gives the encoder text where `@sample` follows a full-width space and supplies a matching plugin mention. It expects the mention to be linked while the surrounding text stays unchanged.
 
-**Call relations**: It specifically exercises the Unicode-character path in `starts_plaintext_mention` used by the encoder.
+**Call relations**: This test calls `encode_history_mentions`. It specifically exercises the start-boundary logic used by `starts_plaintext_mention`.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1716,11 +1722,11 @@ fn encode_history_mentions_links_at_mentions_after_unicode_whitespace()
 fn encode_history_mentions_links_sentence_ending_at_mentions()
 ```
 
-**Purpose**: Verifies that a sentence-ending period after an `@` mention does not prevent linking.
+**Purpose**: This test confirms an `@` mention at the end of a sentence can be linked without absorbing the final period. It keeps normal punctuation readable.
 
-**Data flow**: The test encodes `Please ask @figma.` with one `@figma` binding and asserts that the period remains outside the generated link.
+**Data flow**: It passes text ending with `@figma.` and a matching linked mention. It expects the link around `@figma` and the period after the link.
 
-**Call relations**: It covers the period-handling branch in `ends_plaintext_mention` through `encode_history_mentions`.
+**Call relations**: This test calls `encode_history_mentions`. It checks the mention-ending logic supplied by `ends_plaintext_mention`.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1731,11 +1737,11 @@ fn encode_history_mentions_links_sentence_ending_at_mentions()
 fn encode_history_mentions_links_parenthesized_at_mentions()
 ```
 
-**Purpose**: Checks that parenthesized `@` mentions are recognized and linked correctly.
+**Purpose**: This test checks that `@` mentions inside parentheses are recognized. Parentheses should be treated as surrounding punctuation, not as part of the mention.
 
-**Data flow**: The test encodes `Please ask (@figma)` with one binding and asserts the exact markdown output with parentheses preserved around the link.
+**Data flow**: It passes text containing `(@figma)` and a matching plugin mention. It expects only `@figma` to become a link, with both parentheses preserved.
 
-**Call relations**: It exercises the encoder's boundary logic for punctuation-delimited mentions.
+**Call relations**: This test calls `encode_history_mentions`. It protects the start and end boundary checks for punctuation-wrapped `@` mentions.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1746,11 +1752,11 @@ fn encode_history_mentions_links_parenthesized_at_mentions()
 fn encode_history_mentions_skips_embedded_at_substrings()
 ```
 
-**Purpose**: Ensures the encoder does not treat embedded `@sample` substrings inside emails or package paths as standalone mentions.
+**Purpose**: This test makes sure the encoder does not link `@sample` when it appears inside an email-like string or package path. It should only link the standalone mention.
 
-**Data flow**: The test encodes `foo@sample.com npx @sample/pkg then @sample` with one `@sample` binding and asserts that only the final standalone token is linked.
+**Data flow**: It gives the encoder text containing `foo@sample.com`, `@sample/pkg`, and finally a standalone `@sample`, with one matching linked mention. It expects only the standalone final mention to become a link.
 
-**Call relations**: It validates the combined left- and right-boundary checks used by `encode_history_mentions` to avoid false positives.
+**Call relations**: This test calls `encode_history_mentions`. It guards the plain-text boundary rules that prevent accidental links in ordinary technical text.
 
 *Call graph*: calls 1 internal fn (encode_history_mentions); 1 external calls (assert_eq!).
 
@@ -1760,11 +1766,13 @@ This specialized parser turns hidden citation markup into structured memory cita
 
 ### `memories/read/src/citations.rs`
 
-`domain_logic` · `memory citation parsing during read-path processing`
+`domain_logic` · `memory citation parsing during response/request handling`
 
-This module turns citation strings emitted elsewhere in the system into `codex_protocol::memory_citation::MemoryCitation` values. The main parser accepts multiple citation blobs, scans each one for two independent sections, and merges the results: `<citation_entries>...</citation_entries>` contributes structured file/line annotations, while `<rollout_ids>` or legacy `<thread_ids>` contributes rollout/thread identifiers. Entry parsing is line-oriented and strict about shape: each non-empty line must look like `path:start-end|note=[text]`, with the note enclosed in a trailing bracket pair and both line numbers parseable as integers.
+When the system reads back memories, some responses may include citation markup: small tagged blocks that say where a memory came from and which prior threads or rollouts are connected to it. This file is the parser for that markup. Without it, those citations would remain as raw strings, so later code could not reliably show sources, count usage, or connect a memory back to earlier conversations.
 
-`parse_memory_citation` accumulates entries in encounter order and rollout IDs in first-seen order while deduplicating them with a `HashSet`. If no entries and no IDs are found across all input strings, it returns `None`; otherwise it returns a `MemoryCitation` containing whatever was successfully extracted. `thread_ids_from_memory_citation` then filters the stored rollout ID strings through `ThreadId::try_from`, silently dropping malformed IDs rather than failing the whole citation. The helper functions are intentionally small: `extract_block` performs delimiter-based substring extraction using `split_once`, and `extract_ids_block` prefers `<rollout_ids>` but falls back to `<thread_ids>`. The overall design is tolerant of partial or mixed-quality input: malformed entry lines and invalid IDs are ignored, but valid data from the same citation blob is preserved.
+The main parser, parse_memory_citation, looks through a list of citation strings. For each string, it searches for a <citation_entries> block. Lines inside that block are expected to look like a file path and line range, followed by a note. Each valid line becomes a MemoryCitationEntry. The parser also searches for rollout IDs, accepting both the newer <rollout_ids> tag and the older <thread_ids> tag. It removes duplicate IDs while keeping their first-seen order, like a guest list that does not let the same name sign in twice.
+
+If nothing useful is found, the parser returns None instead of an empty citation. That tells callers there was no real citation data. A separate helper, thread_ids_from_memory_citation, tries to turn stored rollout ID strings into ThreadId values, quietly skipping any strings that are not valid IDs.
 
 #### Function details
 
@@ -1774,11 +1782,11 @@ This module turns citation strings emitted elsewhere in the system into `codex_p
 fn parse_memory_citation(citations: Vec<String>) -> Option<MemoryCitation>
 ```
 
-**Purpose**: Parses one or more citation markup strings into a single `MemoryCitation`, collecting both file-line entries and rollout/thread IDs. It merges data across all provided strings and deduplicates IDs while preserving first-seen order.
+**Purpose**: This is the main entry point for turning raw citation markup into a MemoryCitation object. It extracts source entries and rollout/thread IDs, removes duplicate IDs, and returns nothing if the input contains no usable citation data.
 
-**Data flow**: Consumes `citations: Vec<String>`, initializes empty `entries`, `rollout_ids`, and `seen_rollout_ids`, iterates over each citation string, extracts a `<citation_entries>` block if present and extends `entries` with successfully parsed lines from `parse_memory_citation_entry`, extracts an IDs block via `extract_ids_block`, trims and filters non-empty ID lines, inserts unseen IDs into the set and vector, then returns `None` if both collections are empty or `Some(MemoryCitation { entries, rollout_ids })` otherwise.
+**Data flow**: It receives a list of citation strings. For each string, it reads any <citation_entries> block and turns valid lines into structured citation entries, then reads any rollout or thread ID block and keeps each ID only once. It returns Some(MemoryCitation) containing the collected entries and IDs, or None if both collections are empty.
 
-**Call relations**: This parser is called by higher-level read-path code that strips assistant markup and records memory-citation usage. Within the module it delegates block extraction to `extract_block`/`extract_ids_block` and per-line entry parsing to `parse_memory_citation_entry`.
+**Call relations**: This function is called when stage-one output usage is recorded and when hidden assistant markup is stripped while parsing memory citations. Inside that flow, it asks extract_block to find citation-entry text and extract_ids_block to find ID text, then packages the parsed results for the callers that need memory-source information.
 
 *Call graph*: calls 2 internal fn (extract_block, extract_ids_block); called by 2 (record_stage1_output_usage_and_detect_memory_citation, strip_hidden_assistant_markup_and_parse_memory_citation); 2 external calls (new, new).
 
@@ -1789,11 +1797,11 @@ fn parse_memory_citation(citations: Vec<String>) -> Option<MemoryCitation>
 fn thread_ids_from_memory_citation(memory_citation: &MemoryCitation) -> Vec<ThreadId>
 ```
 
-**Purpose**: Converts the string rollout IDs stored in a `MemoryCitation` into typed `ThreadId` values where possible. Invalid IDs are ignored rather than causing an error.
+**Purpose**: This function turns the citation’s stored rollout ID strings into ThreadId values, which are the system’s typed representation of conversation or thread identifiers. It is useful when later code needs real thread IDs rather than plain text.
 
-**Data flow**: Reads `memory_citation.rollout_ids`, iterates over the strings, attempts `ThreadId::try_from(id.as_str())` for each, keeps only successful conversions, and returns the resulting `Vec<ThreadId>`.
+**Data flow**: It receives a MemoryCitation and reads its rollout_ids list. It tries to convert each string into a ThreadId and drops any string that does not pass that conversion. It returns a list of valid ThreadId values and does not change the original citation.
 
-**Call relations**: This helper is used by telemetry/usage code that needs typed thread identifiers after citation parsing. It depends on `parse_memory_citation` having already collected rollout IDs as strings.
+**Call relations**: This is called when recording output usage for a memory citation. At that point, the citation has already been parsed, and this helper provides the caller with only the IDs that are safe to use as ThreadId values.
 
 *Call graph*: called by 1 (record_stage1_output_usage_for_memory_citation).
 
@@ -1804,11 +1812,11 @@ fn thread_ids_from_memory_citation(memory_citation: &MemoryCitation) -> Vec<Thre
 fn parse_memory_citation_entry(line: &str) -> Option<MemoryCitationEntry>
 ```
 
-**Purpose**: Parses a single citation-entry line into a `MemoryCitationEntry`. It expects a path, line range, and note in a compact delimiter-based format.
+**Purpose**: This helper parses one line from a citation-entry block into a MemoryCitationEntry. It expects the line to name a path, a line range, and a note explaining the citation.
 
-**Data flow**: Takes `line: &str`, trims it, returns `None` for empty input, splits from the right on `|note=[` to separate location from note, strips the closing `]`, splits the location from the right on `:` to isolate the path, splits the line range on `-`, parses `line_start` and `line_end` as integers, and returns `Some(MemoryCitationEntry { path, line_start, line_end, note })` if every step succeeds.
+**Data flow**: It receives one text line. It trims blank space, rejects empty or malformed lines, splits out the note, then splits the location into a path and start/end line numbers. If every part is present and the line numbers can be parsed, it returns a MemoryCitationEntry; otherwise it returns None.
 
-**Call relations**: This is an internal helper used only by `parse_memory_citation` while processing `<citation_entries>` blocks. Its failure mode is intentionally soft so malformed lines are skipped without aborting the whole citation.
+**Call relations**: It works as the line-by-line parser used by the main citation parser. parse_memory_citation feeds it each line from a citation-entry block so that only well-formed citation lines become structured entries.
 
 
 ##### `extract_block`  (lines 72–76)
@@ -1817,11 +1825,11 @@ fn parse_memory_citation_entry(line: &str) -> Option<MemoryCitationEntry>
 fn extract_block(text: &'a str, open: &str, close: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Extracts the substring between a given opening and closing marker. It is a generic delimiter helper used for citation markup sections.
+**Purpose**: This small helper pulls out the text between an opening tag and a closing tag. It is a reusable way to say, “give me the contents inside this marked section.”
 
-**Data flow**: Accepts `text`, `open`, and `close`; uses `split_once(open)` to discard any prefix before the opening marker, then `split_once(close)` on the remainder to isolate the body, and returns `Some(body)` or `None` if either delimiter is missing.
+**Data flow**: It receives a larger text string plus the exact opening and closing marker strings to look for. It finds the first opening marker, then the first closing marker after it, and returns the text between them. If either marker is missing, it returns None.
 
-**Call relations**: This helper is called directly by `parse_memory_citation` for `<citation_entries>` and indirectly through `extract_ids_block` for rollout/thread ID sections. It provides the module’s only markup extraction primitive.
+**Call relations**: parse_memory_citation uses it directly to read citation-entry blocks. extract_ids_block also uses it to look for ID blocks, so this helper is the shared low-level tool for reading the tagged citation format.
 
 *Call graph*: called by 2 (extract_ids_block, parse_memory_citation).
 
@@ -1832,10 +1840,10 @@ fn extract_block(text: &'a str, open: &str, close: &str) -> Option<&'a str>
 fn extract_ids_block(text: &str) -> Option<&str>
 ```
 
-**Purpose**: Finds the rollout/thread ID section in a citation string, supporting both current and legacy tag names. It abstracts the compatibility fallback away from the main parser.
+**Purpose**: This helper finds the block of rollout or thread IDs inside a citation string. It supports both the current <rollout_ids> tag and the older <thread_ids> tag.
 
-**Data flow**: Receives `text: &str`, first tries `extract_block(text, "<rollout_ids>", "</rollout_ids>")`, and if that returns `None`, tries `extract_block(text, "<thread_ids>", "</thread_ids>")`; it returns whichever body is found first.
+**Data flow**: It receives a citation text string. It first tries to extract text between <rollout_ids> and </rollout_ids>; if that is not present, it tries <thread_ids> and </thread_ids>. It returns the matching block text, or None if neither form exists.
 
-**Call relations**: Used only by `parse_memory_citation` when collecting rollout IDs. It delegates actual substring extraction to `extract_block` and encodes the backward-compatibility policy for legacy markup.
+**Call relations**: parse_memory_citation calls this when it is collecting IDs from each citation string. This helper delegates the actual tag search to extract_block, which keeps the tag-reading logic in one place.
 
 *Call graph*: calls 1 internal fn (extract_block); called by 1 (parse_memory_citation).

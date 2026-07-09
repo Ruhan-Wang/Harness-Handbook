@@ -1,10 +1,8 @@
 # MCP, exec, and sandbox wire models  `stage-18.4.5`
 
-This stage is cross-cutting infrastructure: it does not execute work itself, but defines the wire contracts that let the rest of the system start processes, talk to helpers, stream execution state, and cross privilege or sandbox boundaries safely. Everything here sits at the edges between components, where values must be serialized, named consistently, and interpreted the same way on both sides of a connection.
+This stage defines the “wire models” for parts of the system that talk across a boundary. A wire model is the exact shape of messages sent between programs, processes, or tools, usually as JSON or another stream format. These files are shared behind-the-scenes support: they do not run the main agent themselves, but they make sure both sides of a conversation agree on what each message means.
 
-The exec-server side is anchored by client_api.rs, which describes how clients connect, what transports and timeouts they use, and the transport-neutral HTTP client capability expected by higher layers. protocol.rs then supplies the JSON-RPC schema and method names for the actual exec-server operations, while process_id.rs gives those messages a distinct, strongly typed logical process identifier.
-
-For command execution output, exec_events.rs defines the JSONL event stream emitted by codex exec, so producers and consumers agree on every event and payload shape. On privileged execution paths, shell-escalation’s escalate_protocol.rs specifies the Unix request/response contract between patched shells and the escalation server, and windows-sandbox-rs’s ipc_framed.rs does the same for elevated Windows runners, including the framing format used on raw byte streams. Together, these models make inter-process coordination reliable and portable.
+The exec-server files describe how clients connect to an executor, how running processes are named, and what requests and replies look like for starting commands, reading output, accessing files, or making HTTP calls. The exec events file defines the JSON-lines event stream produced by `codex exec`, so outside tools can follow an agent run step by step. The Unix escalation protocol defines the messages exchanged when a shell command may need different sandbox permissions. The Windows framed IPC file does the same for communication with an elevated command runner, and also wraps messages into length-marked packets so they can be read safely from a stream.
 
 ## Files in this stage
 
@@ -13,13 +11,13 @@ These files establish the shared identifiers, connection settings, and core JSON
 
 ### `exec-server/src/client_api.rs`
 
-`config` · `connection configuration and cross-layer capability typing`
+`data_model` · `connection setup and request handling`
 
-This file is primarily a data-definition layer for the exec-server client subsystem. It declares the timeout constants used as defaults for remote connection and initialization, the `ExecServerClientConnectOptions` handshake settings, and transport-specific argument structs for websocket, Noise rendezvous, and stdio-backed connections. The Noise types are intentionally explicit about connection material: `NoiseRendezvousConnectBundle` packages the registry-authorized URL, environment and registration identifiers, pinned executor public key, and harness authorization as a single-use bundle, while `NoiseRendezvousConnectProvider` abstracts fetching a fresh bundle for each physical connection attempt.
+An exec-server is a service that can run work and make environment-owned HTTP requests on behalf of a client. This file is the shared vocabulary for connecting to one. It does not open sockets or start processes itself; instead, it defines the small bundles of information other code needs before that can happen.
 
-`ExecServerTransportParams` is the runtime-selected transport enum used by lazy remote clients and transport dispatch code. Its custom `Debug` implementation is careful about representation: websocket and stdio variants print their concrete fields, while the Noise variant is rendered as a non-exhaustive debug struct so provider internals and sensitive connection material are not dumped. The `websocket_url` constructor is a convenience for the common websocket case, filling in the standard connect and initialize timeouts.
+The file covers several connection styles. A remote server can be reached with a plain WebSocket URL. A more secure rendezvous flow can use Noise, which is an encrypted handshake protocol; in that case, the code keeps together the URL, server identity, public keys, and registry authorization as one single-use bundle so pieces from different connection attempts are not accidentally mixed. A local command-backed server can also be described with a program name, arguments, environment variables, and working directory.
 
-The file also defines the `HttpClient` trait, which is the HTTP analogue of the execution backend abstraction. It exposes both buffered and streamed request methods returning boxed futures, allowing higher layers to depend on environment-owned HTTP capability without coupling to whether requests are executed locally, over JSON-RPC, or through some future transport.
+`ExecServerTransportParams` is the main “menu” of transport choices. It says, in one value, whether the caller wants WebSocket, Noise rendezvous, or stdio. The file also defines `HttpClient`, a trait, meaning a promise that any concrete client must fulfill: it can send an HTTP request and either return the whole response body at once or provide a stream for reading it gradually. Without this file, higher-level code would need to know too much about each connection type and could not treat different transports uniformly.
 
 #### Function details
 
@@ -29,11 +27,11 @@ The file also defines the `HttpClient` trait, which is the HTTP analogue of the 
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats transport parameters for debugging while avoiding overexposure of Noise rendezvous internals. It gives detailed output for websocket and stdio transports and a redacted/non-exhaustive view for Noise.
+**Purpose**: This function controls how transport settings are shown in debug output. It makes ordinary connection details visible while keeping the Noise rendezvous variant intentionally sparse, because that path contains sensitive or complex authorization material.
 
-**Data flow**: It matches on `self`: `WebSocketUrl` writes a debug struct containing `websocket_url`, `connect_timeout`, and `initialize_timeout`; `NoiseRendezvous` writes `NoiseRendezvous` as non-exhaustive; `StdioCommand` writes a debug struct containing `command` and `initialize_timeout`. It returns the formatter result.
+**Data flow**: It receives one transport choice and a debug output writer. It looks at which kind of transport it is, writes a readable label and safe fields for that case, and returns whether formatting succeeded. It does not change the transport settings.
 
-**Call relations**: Used implicitly whenever `ExecServerTransportParams` is logged or debug-printed. It supports diagnostics for transport selection without leaking provider-backed rendezvous details.
+**Call relations**: This is used automatically when code asks Rust to print `ExecServerTransportParams` with debug formatting. Inside, it delegates to Rust’s debug-structure builder so logs and test failures show a tidy, structured view instead of a raw internal dump.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -44,11 +42,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn websocket_url(websocket_url: String) -> Self
 ```
 
-**Purpose**: Convenience constructor for the common websocket transport case using standard timeout defaults. It lets callers specify only the URL.
+**Purpose**: This is a convenience constructor for the common case where a caller only has a WebSocket address and wants the normal timeout settings. It saves callers from repeating the default connection and initialization timeouts every time.
 
-**Data flow**: It takes a `String` websocket URL and returns `ExecServerTransportParams::WebSocketUrl { websocket_url, connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT, initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT }`.
+**Data flow**: It takes a WebSocket URL string as input. It wraps that URL together with the file’s default connect timeout and default initialize timeout, then returns a `WebSocketUrl` transport setting ready for connection code to use.
 
-**Call relations**: Called by higher-level remote setup code and tests that want a websocket transport enum without manually supplying timeout values. The resulting enum is later consumed by lazy clients and transport dispatch.
+**Call relations**: Higher-level remote connection code calls this when it is preparing to talk to an exec-server over WebSocket. Tests also use it to build the same kind of transport value without spelling out all fields, which keeps the setup focused on the behavior being tested.
 
 *Call graph*: called by 2 (remote_inner, remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conversion).
 
@@ -57,11 +55,11 @@ fn websocket_url(websocket_url: String) -> Self
 
 `data_model` · `cross-cutting`
 
-This file is a compact data-model wrapper around a process identifier string. `ProcessId` is declared as `pub struct ProcessId(String)` with `Serialize`/`Deserialize` and `#[serde(transparent)]`, so on the wire it is encoded exactly like a plain JSON string while remaining a distinct Rust type in the codebase. The inherent methods cover the common ownership patterns: `new` accepts any `Into<String>`, `as_str` exposes a borrowed `&str`, and `into_inner` consumes the wrapper to return the owned `String`.
+`ProcessId` is like putting a label on a plain piece of text that says, “this string is a process ID.” The value inside is still just a `String`, but wrapping it in its own type makes the code clearer and safer: functions can ask for a `ProcessId` instead of accepting any random text.
 
-To make the type behave naturally in generic code, the file implements `Deref<Target = str>`, `Borrow<str>`, and `AsRef<str>`, all forwarding to `as_str`. That allows `ProcessId` to be used where string slices are expected, including map lookups keyed by `str`. `fmt::Display` delegates directly to the inner string’s formatter, preserving the exact identifier text. Several `From` conversions support construction from `String`, `&str`, and `&String`, plus conversion back into `String`.
+The file also makes this wrapper easy to use. Code can create one from a `String`, from a string slice like `"abc"`, or from a borrowed `String`. It can also turn a `ProcessId` back into the inner `String` when ownership of the text is needed. For read-only use, it behaves much like normal text: it can be viewed as `&str`, borrowed as `str`, dereferenced like a string, and printed.
 
-There is intentionally no validation logic here: the wrapper’s job is type distinction and ergonomic interoperability, not enforcing an identifier grammar. As a result, all semantics about uniqueness or scope are imposed by higher-level protocol/session code.
+The `Serialize` and `Deserialize` traits mean it can be sent to or read from formats such as JSON without adding an extra object layer. Because of `serde(transparent)`, it is stored as just the underlying string. Without this file, process identifiers would likely be passed around as bare strings, which would make the code easier to misuse and harder to understand.
 
 #### Function details
 
@@ -71,11 +69,11 @@ There is intentionally no validation logic here: the wrapper’s job is type dis
 fn new(value: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a `ProcessId` from any value convertible into `String`. It is the explicit constructor when callers want to signal they are creating a logical process identifier.
+**Purpose**: Creates a new `ProcessId` from any value that can be turned into a `String`. This is the main explicit constructor when code wants to mark some text as a process ID.
 
-**Data flow**: It takes `value: impl Into<String>`, converts it with `into()`, wraps the resulting `String` in `ProcessId`, and returns the new value.
+**Data flow**: It receives text-like input, converts that input into an owned `String`, then stores it inside a new `ProcessId`. The result is a typed process identifier ready to pass around.
 
-**Call relations**: Tests such as `noise_environment_refreshes_bundle_for_each_connection_attempt` call this directly when creating protocol objects. It delegates only to the standard `Into<String>` conversion.
+**Call relations**: Tests such as `noise_environment_refreshes_bundle_for_each_connection_attempt` call this when they need a clear process ID value. Internally it relies on Rust’s standard conversion behavior to turn the input into a `String`.
 
 *Call graph*: called by 1 (noise_environment_refreshes_bundle_for_each_connection_attempt); 1 external calls (into).
 
@@ -86,11 +84,11 @@ fn new(value: impl Into<String>) -> Self
 fn as_str(&self) -> &str
 ```
 
-**Purpose**: Returns the identifier as a borrowed string slice without transferring ownership. It is the common accessor used by the trait adapters in this file.
+**Purpose**: Gives a read-only view of the process ID as ordinary text. This is useful when code needs to compare, print, or look up the ID without taking it apart.
 
-**Data flow**: It takes `&self` and returns `&self.0` as `&str`.
+**Data flow**: It receives a borrowed `ProcessId`, looks at the inner `String`, and returns a borrowed `&str` view of that same text. Nothing is copied or changed.
 
-**Call relations**: The `Deref`, `Borrow<str>`, and `AsRef<str>` implementations all call this so there is one canonical borrowed-string view of the wrapped identifier.
+**Call relations**: This is the shared helper used by `ProcessId::deref`, `ProcessId::borrow`, and `ProcessId::as_ref`. Those trait methods all need the same simple operation: expose the ID as text.
 
 *Call graph*: called by 3 (as_ref, borrow, deref).
 
@@ -101,11 +99,11 @@ fn as_str(&self) -> &str
 fn into_inner(self) -> String
 ```
 
-**Purpose**: Consumes the wrapper and yields the owned underlying `String`. It is the escape hatch when callers need ownership of the raw identifier text.
+**Purpose**: Consumes the `ProcessId` and returns the plain `String` stored inside it. Use this when the wrapper is no longer needed and the caller wants to own the raw text.
 
-**Data flow**: It takes `self`, moves out `self.0`, and returns that `String`.
+**Data flow**: It takes ownership of a `ProcessId`, removes the inner `String`, and returns that string. After this, the original `ProcessId` value is gone.
 
-**Call relations**: This method stands alone as the owned extraction path; unlike `as_str`, it is not used by the trait implementations shown here.
+**Call relations**: This is a direct escape hatch from the wrapper type. It does not call other project code and is available when later code needs a normal owned string instead of a typed process ID.
 
 
 ##### `ProcessId::deref`  (lines 29–31)
@@ -114,11 +112,11 @@ fn into_inner(self) -> String
 fn deref(&self) -> &Self::Target
 ```
 
-**Purpose**: Makes `ProcessId` behave like `&str` in deref-coercion contexts. This improves ergonomics when passing a process id to APIs expecting string slices.
+**Purpose**: Lets a `ProcessId` act like a string slice in many read-only situations. This makes the wrapper convenient while still keeping its stronger type meaning.
 
-**Data flow**: It takes `&self`, calls `self.as_str()`, and returns the resulting `&str` as `&Self::Target`.
+**Data flow**: It receives a borrowed `ProcessId`, asks `ProcessId::as_str` for the inner text view, and returns that `&str` view. The stored ID is not changed.
 
-**Call relations**: Rust’s deref coercion machinery invokes this implicitly in many call sites. Internally it delegates to `ProcessId::as_str` to keep the borrowed representation consistent.
+**Call relations**: Rust calls this automatically in places where a `ProcessId` needs to behave like `str`. It delegates the actual text access to `ProcessId::as_str` so there is one consistent way to expose the inner string.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -129,11 +127,11 @@ fn deref(&self) -> &Self::Target
 fn borrow(&self) -> &str
 ```
 
-**Purpose**: Implements `Borrow<str>` so collections keyed by `ProcessId` can be queried with `&str`. This is especially useful for map lookups without allocating temporary `String`s.
+**Purpose**: Allows a `ProcessId` to be borrowed as plain `str`, which is especially useful for lookups in collections such as hash maps. For example, stored `ProcessId` keys can be searched using ordinary string text.
 
-**Data flow**: It takes `&self`, calls `self.as_str()`, and returns the borrowed `&str`.
+**Data flow**: It receives a borrowed `ProcessId`, calls `ProcessId::as_str`, and returns a borrowed text view. It does not allocate, copy, or modify anything.
 
-**Call relations**: Standard library collection APIs use this trait implementation implicitly. It forwards to `ProcessId::as_str` rather than duplicating access logic.
+**Call relations**: Collection and borrowing code can call this through Rust’s `Borrow` trait. It uses `ProcessId::as_str` so its behavior matches the other read-only string views.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -144,11 +142,11 @@ fn borrow(&self) -> &str
 fn as_ref(&self) -> &str
 ```
 
-**Purpose**: Implements `AsRef<str>` for generic APIs that accept string-like inputs. It provides another zero-copy borrowed view of the identifier.
+**Purpose**: Provides a standard way to view a `ProcessId` as `str`. This helps it work with generic code that accepts anything that can be referenced as text.
 
-**Data flow**: It takes `&self`, calls `self.as_str()`, and returns the resulting `&str`.
+**Data flow**: It takes a borrowed `ProcessId`, gets the inner text through `ProcessId::as_str`, and returns that borrowed text. The process ID remains unchanged.
 
-**Call relations**: Generic helper code may invoke this implicitly through `AsRef<str>` bounds. Like the other adapters, it centralizes on `ProcessId::as_str`.
+**Call relations**: Generic Rust APIs may call this through the `AsRef` trait when they need a text reference. Like the other view methods, it hands the work to `ProcessId::as_str`.
 
 *Call graph*: calls 1 internal fn (as_str).
 
@@ -159,11 +157,11 @@ fn as_ref(&self) -> &str
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats the process id exactly as its inner string for user-facing output and logging. There is no extra decoration or quoting added by the wrapper.
+**Purpose**: Controls how a `ProcessId` is shown when formatted for display, such as in logs or user-facing messages. It prints just the underlying ID text.
 
-**Data flow**: It takes `&self` and a mutable `fmt::Formatter`, then delegates formatting to `self.0.fmt(f)`, returning the resulting `fmt::Result`.
+**Data flow**: It receives a borrowed `ProcessId` and a formatter, then writes the inner string into that formatter. The output is whatever text the ID contains.
 
-**Call relations**: Any code using `{}` formatting on `ProcessId` reaches this implementation. It delegates directly to the wrapped `String` formatter.
+**Call relations**: Rust’s formatting system calls this when code uses display formatting, such as `{}`. It does not add decoration or metadata; it passes through the stored process ID text.
 
 
 ##### `ProcessId::from`  (lines 65–67)
@@ -172,11 +170,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn from(value: &String) -> Self
 ```
 
-**Purpose**: Converts an owned `String` into a `ProcessId`. This supports idiomatic `.into()` usage at many protocol construction sites.
+**Purpose**: Builds a `ProcessId` from existing string data using Rust’s standard `From` conversion pattern. This lets callers write natural conversion code instead of always calling the constructor directly.
 
-**Data flow**: It takes `value: String`, wraps it in `ProcessId`, and returns the new wrapper.
+**Data flow**: It receives string data, either owned or borrowed depending on which conversion is being used, and wraps equivalent owned text inside a `ProcessId`. Borrowed text is copied so the new process ID owns its contents.
 
-**Call relations**: Many tests and setup paths construct process ids through this `From<String>` implementation, often via `.into()`. It is one of the main ergonomic entry points for creating `ProcessId` values.
+**Call relations**: Many tests and helper routines use this conversion when setting up process IDs, including session, notification, executor, and spawn-related tests. It serves the same purpose as `ProcessId::new`, but through Rust’s common conversion mechanism.
 
 *Call graph*: called by 17 (process_events_are_delivered_in_seq_order_when_notifications_are_reordered, transport_disconnect_fails_sessions_and_rejects_new_sessions, wake_notifications_do_not_block_other_sessions, default_environment_has_ready_local_executor, spawn_test_process, test_exec_params, exec_params_with_argv, long_poll_read_fails_after_session_resume, output_and_exit_are_retained_after_notification_receiver_closes, terminate_reports_false_after_process_exit (+7 more)).
 
@@ -187,22 +185,24 @@ fn from(value: &String) -> Self
 fn from(value: ProcessId) -> Self
 ```
 
-**Purpose**: Converts a `ProcessId` back into its owned inner `String`. It is the inverse of the wrapper construction path for callers that need raw ownership.
+**Purpose**: Turns a `ProcessId` back into a plain owned `String` through Rust’s standard conversion pattern. This is useful when code must pass the ID to something that only accepts ordinary strings.
 
-**Data flow**: It takes `value: ProcessId`, moves out `value.0`, and returns that `String`.
+**Data flow**: It receives ownership of a `ProcessId`, takes out the inner `String`, and returns that string. The wrapper is consumed in the process.
 
-**Call relations**: This `From<ProcessId> for String` implementation is used implicitly by `.into()` when higher-level code needs to leave the typed wrapper and recover plain text.
+**Call relations**: Rust conversion code calls this when a `ProcessId` is converted into `String`. It is the trait-based counterpart to `ProcessId::into_inner`.
 
 
 ### `exec-server/src/protocol.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `cross-cutting protocol encoding during startup, request handling, streaming, and tests`
 
-This file is the protocol schema hub for the exec server. It declares string constants for every JSON-RPC method name, including initialization, process lifecycle operations (`process/start`, `process/read`, `process/write`, `process/signal`, `process/terminate`), process notifications (`process/output`, `process/exited`, `process/closed`), filesystem methods, and executor-owned HTTP methods. The bulk of the file consists of `Serialize`/`Deserialize` data structures that define the exact request and response payloads exchanged over the protocol.
+This file is like the form template drawer for the exec server protocol. When a client asks the server to start a process, read a file, send input, stop a process, or make an HTTP request, both sides need to agree on the exact field names and data formats. Without this file, one side might send “cwd” while the other expects something else, or binary output could be garbled while traveling through JSON.
 
-Several design choices are worth noting. `ByteChunk` is a transparent wrapper around `Vec<u8>` that serializes through the private `base64_bytes` module, so binary payloads such as process output, stdin writes, file blocks, and HTTP bodies appear as base64 strings in JSON while remaining typed as bytes in Rust. `ProcessId` is used throughout process-related messages to keep logical process handles distinct from OS pids. Many structs use `#[serde(rename_all = "camelCase")]` and selective `#[serde(default)]` or `skip_serializing_if` attributes to preserve a stable JSON shape, including backward-compatible handling of omitted or null optional fields like `timeoutMs`.
+The file starts by naming the protocol methods, such as `process/start`, `process/read`, `fs/readFile`, and `http/request`. These names are the labels used in JSON-RPC, a request-and-response style where each message says which method it wants.
 
-The file spans multiple protocol domains: execution (`ExecParams`, `ReadResponse`, `WriteResponse`, notifications), filesystem requests and metadata responses, environment info, and streamed HTTP response bodies via `HttpRequestBodyDeltaNotification`. Aside from the base64 helpers and tiny `ByteChunk` conversions, behavior is intentionally minimal; this module’s main responsibility is to define exact wire contracts.
+Most of the file is made of small data structures. Each one describes the inputs or outputs for a protocol action: initialization, process execution, reading output chunks, writing stdin, filesystem operations, and HTTP requests. Paths are carried as `PathUri`, so paths can be represented safely across operating systems. Optional sandbox information can travel with filesystem calls, so the server can apply filesystem access rules.
+
+A key detail is `ByteChunk`. JSON cannot carry raw bytes directly, so this file wraps byte arrays and serializes them as Base64 text, a common safe text encoding for binary data. That keeps terminal output, file blocks, stdin, and HTTP bodies intact while moving through JSON.
 
 #### Function details
 
@@ -212,11 +212,11 @@ The file spans multiple protocol domains: execution (`ExecParams`, `ReadResponse
 fn into_inner(self) -> Vec<u8>
 ```
 
-**Purpose**: Consumes a `ByteChunk` and returns the owned raw bytes it wraps. It is the owned extraction path for binary protocol fields after deserialization.
+**Purpose**: This takes a `ByteChunk` wrapper and gives back the raw bytes inside it. Code uses it when it no longer needs the protocol wrapper and wants the actual byte data.
 
-**Data flow**: It takes `self`, moves out the inner `Vec<u8>`, and returns it.
+**Data flow**: It starts with a `ByteChunk` containing a vector of bytes. The function removes the wrapper and returns that byte vector unchanged. Afterward, the original wrapper is consumed, meaning it is not kept around separately.
 
-**Call relations**: This helper is used wherever higher-level code needs to leave the protocol wrapper and operate directly on bytes. It does not delegate further.
+**Call relations**: This is a small convenience method for code that receives protocol messages containing binary data. After deserialization has turned Base64 text back into bytes, callers can use this function to hand those bytes to process stdin, file logic, or HTTP body handling.
 
 
 ##### `ByteChunk::from`  (lines 50–52)
@@ -225,11 +225,11 @@ fn into_inner(self) -> Vec<u8>
 fn from(value: Vec<u8>) -> Self
 ```
 
-**Purpose**: Wraps an owned byte vector in the protocol’s `ByteChunk` type. This is the ergonomic constructor used when preparing binary data for serialization.
+**Purpose**: This builds a `ByteChunk` from ordinary raw bytes. It lets other code wrap binary data in the protocol-friendly type before sending it through JSON.
 
-**Data flow**: It takes `value: Vec<u8>`, stores it in `ByteChunk`, and returns the wrapper.
+**Data flow**: It receives a vector of bytes, places that vector inside a `ByteChunk`, and returns the new wrapper. The bytes themselves are not changed here; the Base64 conversion happens later when serialization runs.
 
-**Call relations**: Callers use this through `ByteChunk::from` or `.into()` when populating protocol structs containing binary fields. It is the inverse of `ByteChunk::into_inner`.
+**Call relations**: This is used through Rust’s standard `From` conversion pattern. It fits into the larger flow whenever process output, file content, or HTTP body bytes need to become part of a protocol response or notification.
 
 
 ##### `base64_bytes::serialize`  (lines 477–482)
@@ -238,11 +238,11 @@ fn from(value: Vec<u8>) -> Self
 fn serialize(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes a byte slice as a base64 string for JSON transport. It is the custom serde serializer behind `ByteChunk`.
+**Purpose**: This turns raw bytes into Base64 text so they can be safely written into JSON. It exists because JSON strings are text, while process output and file or HTTP bodies may contain any byte values.
 
-**Data flow**: It takes `bytes: &[u8]` and a serde `Serializer`, encodes the bytes with `BASE64_STANDARD.encode(bytes)`, passes the resulting string to `serializer.serialize_str`, and returns the serializer’s result.
+**Data flow**: It receives a slice of bytes and a serializer, which is the component responsible for writing JSON-compatible data. It encodes the bytes using standard Base64, then asks the serializer to write that encoded text string. The output is a serialized JSON string representing the original bytes.
 
-**Call relations**: Serde invokes this automatically for `ByteChunk` fields because of `#[serde(with = "base64_bytes")]`. It delegates the actual encoding to the base64 engine and string emission to the serializer.
+**Call relations**: This function is called automatically by Serde, the serialization library, whenever a `ByteChunk` is being turned into JSON. It hands the final text form to the serializer’s string-writing function so the rest of the protocol can treat binary data as ordinary JSON text.
 
 *Call graph*: 1 external calls (serialize_str).
 
@@ -253,11 +253,11 @@ fn serialize(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 fn deserialize(deserializer: D) -> Result<Vec<u8>, D::Error>
 ```
 
-**Purpose**: Deserializes a base64-encoded JSON string back into raw bytes. It is the custom serde deserializer paired with `base64_bytes::serialize`.
+**Purpose**: This turns Base64 text from JSON back into the original raw bytes. It is the receiving-side partner to `base64_bytes::serialize`.
 
-**Data flow**: It takes a serde `Deserializer`, first deserializes a `String`, then decodes that string with `BASE64_STANDARD.decode(encoded)`. On success it returns `Vec<u8>`; on decode failure it converts the error into a serde custom error.
+**Data flow**: It receives a deserializer, reads a string from the incoming JSON, and treats that string as Base64. If decoding succeeds, it returns the original byte vector. If the text is not valid Base64, it returns a deserialization error so the bad protocol message is rejected.
 
-**Call relations**: Serde invokes this automatically when reading `ByteChunk` fields from JSON. It bridges textual JSON transport back into binary data for the rest of the protocol layer.
+**Call relations**: This function is called automatically by Serde when JSON is being read into a `ByteChunk`. It first relies on Serde to read the JSON string, then decodes that string so higher-level process, filesystem, or HTTP code receives real bytes instead of encoded text.
 
 *Call graph*: 1 external calls (deserialize).
 
@@ -268,11 +268,11 @@ fn deserialize(deserializer: D) -> Result<Vec<u8>, D::Error>
 fn filesystem_protocol_accepts_legacy_absolute_paths_and_serializes_path_uris()
 ```
 
-**Purpose**: Verifies backward-compatible deserialization of legacy absolute filesystem paths while ensuring serialization still emits canonical `PathUri` strings. It also checks sandbox context round-tripping in that mixed legacy/current shape.
+**Purpose**: This test checks that filesystem protocol messages still accept older-style absolute path strings, while writing them back out in the newer URI form. That matters for compatibility with clients or saved messages that were created before the path format changed.
 
-**Data flow**: The test builds native current-directory paths, constructs a `FileSystemSandboxContext` from a default permission profile and a `PathUri` cwd, serializes that sandbox to JSON, mutates its `cwd` field to a legacy native-path string, and then deserializes `FsReadFileParams` from JSON containing a legacy absolute `path` plus the modified sandbox. It compares the result to an expected `FsReadFileParams` using `PathUri::from_path`, then serializes the params back to JSON and asserts the output uses URI strings and the expected sandbox serialization.
+**Data flow**: The test builds a current-directory path and a sandbox context, then deliberately rewrites the sandbox JSON to contain a plain native path string. It deserializes that JSON into `FsReadFileParams`, checks that the result matches the expected `PathUri`-based structure, then serializes it again and confirms the output uses URI strings. The before state is legacy-looking JSON; the after state is the normalized protocol form.
 
-**Call relations**: This test exercises serde behavior for `FsReadFileParams`, `PathUri`, and `FileSystemSandboxContext` together. It documents a compatibility guarantee relied on by older clients sending native absolute paths.
+**Call relations**: This test exercises the protocol data types through JSON conversion rather than calling server behavior directly. It uses path conversion, sandbox construction, JSON parsing, JSON writing, and equality checks to prove that this file’s data model can bridge old client input and current protocol output.
 
 *Call graph*: calls 3 internal fn (from_permission_profile_with_cwd, default, from_path); 5 external calls (assert_eq!, from_value, json!, to_value, current_dir).
 
@@ -283,11 +283,11 @@ fn filesystem_protocol_accepts_legacy_absolute_paths_and_serializes_path_uris()
 fn http_request_timeout_treats_omitted_and_null_as_no_timeout()
 ```
 
-**Purpose**: Checks that `HttpRequestParams.timeout_ms` treats both an omitted field and an explicit JSON `null` as `None`, while preserving numeric values when provided. This locks in the intended optional-field semantics for HTTP requests.
+**Purpose**: This test confirms that an HTTP request with no timeout field and one with an explicit JSON `null` timeout both mean “no timeout.” It also confirms that a number is preserved as the requested millisecond timeout.
 
-**Data flow**: The test deserializes three `HttpRequestParams` values from JSON: one without `timeoutMs`, one with `timeoutMs: null`, and one with `timeoutMs: 1234`. It then asserts that the first two produce `timeout_ms == None` and the third produces `Some(1234)`, while also confirming the `request_id` values were parsed correctly.
+**Data flow**: The test creates three JSON HTTP request messages: one without `timeoutMs`, one with `timeoutMs` set to null, and one with `timeoutMs` set to 1234. It deserializes each into `HttpRequestParams` and checks the resulting `timeout_ms` field. The first two become `None`, meaning no deadline, while the third becomes `Some(1234)`.
 
-**Call relations**: This test targets serde defaults on `HttpRequestParams` and documents the wire compatibility expected by callers constructing executor-side HTTP requests.
+**Call relations**: This test protects the behavior of the HTTP request protocol shape defined in this file. It is run by the test suite and verifies that Serde’s optional-field behavior matches what callers expect when they send executor-side HTTP requests.
 
 *Call graph*: 3 external calls (assert_eq!, from_value, json!).
 
@@ -297,13 +297,15 @@ This file defines the structured JSONL event model emitted during exec runs for 
 
 ### `exec/src/exec_events.rs`
 
-`data_model` · `cross-cutting event serialization and consumption`
+`data_model` · `active throughout event streaming during an exec run`
 
-This file is a pure data-model module for the execution event stream. Its top-level type, `ThreadEvent`, is a serde-tagged enum using explicit event names like `thread.started`, `turn.completed`, and `item.updated`, so each JSONL record carries a stable `type` discriminator. Turn lifecycle is represented by `ThreadStartedEvent`, `TurnStartedEvent`, `TurnCompletedEvent`, and `TurnFailedEvent`; token accounting is captured in `Usage`, including cached input and reasoning output counts.
+This file is the shared vocabulary for reporting what happens during a `codex exec` session. Think of it like a receipt printer for an agent run: each line says something specific happened, such as a thread starting, a user turn beginning, a command running, a file patch being applied, or an error occurring. Without these definitions, consumers of the event stream would have to guess what each JSON object means, and small changes could easily break dashboards, wrappers, tests, or TypeScript clients.
 
-The other major branch is item tracking. `ThreadItem` pairs a stable `id` with a flattened `ThreadItemDetails` enum, so item payload fields appear inline in serialized JSON while still preserving a typed `type` tag such as `agent_message`, `command_execution`, or `todo_list`. Each item struct captures the concrete state relevant to that domain: command text, aggregated output, exit code, and `CommandExecutionStatus`; patch file paths and `PatchChangeKind`; MCP server/tool names, JSON arguments, result blocks, and error payloads; collab tool metadata including sender/receiver thread IDs and a `HashMap<String, CollabAgentState>` keyed by agent/thread identifier; web search query/action; and todo entries with completion flags.
+The main type is `ThreadEvent`, an enum, meaning a value can be one of several named event kinds. Each event is serialized with a `type` field such as `thread.started`, `turn.completed`, or `item.updated`. A thread is the larger conversation, while a turn is one prompt and the agent’s work to answer it.
 
-A notable design choice is the use of `serde_json::Value` for MCP content and metadata instead of tighter Rust MCP model types, explicitly favoring schema export and loose wire compatibility. Most enums use `snake_case` serde naming, several statuses derive `Default` with `InProgress` as the initial state, and optional fields are omitted or marked optional in generated TS where appropriate.
+Most detailed activity is represented as a `ThreadItem`. Each item has an `id` and a typed payload, such as an agent message, reasoning summary, command execution, file change, MCP tool call, collaboration tool call, web search, to-do list, or non-fatal error. Status enums record whether work is still in progress, completed, failed, or declined.
+
+The file also derives serialization, deserialization, and TypeScript export support. That means the same event shapes can be used safely in Rust, JSON, and generated TypeScript types.
 
 
 ### Privilege and sandbox IPC
@@ -311,13 +313,15 @@ These files describe the wire contracts used for Unix shell escalation and Windo
 
 ### `shell-escalation/src/unix/escalate_protocol.rs`
 
-`data_model` · `request handling`
+`data_model` · `request handling for intercepted Unix exec calls`
 
-This file is the schema layer for shell escalation on Unix. At the top it declares two string constants that form part of the process-environment contract: `CODEX_ESCALATE_SOCKET` tells exec wrappers which inherited file descriptor carries the escalation socket, and `EXEC_WRAPPER` tells patched shells which wrapper to invoke around `exec()`. The main request payload is `EscalateRequest`, a serde-serializable struct carrying the intercepted executable path, full argv vector, absolute working directory, and a complete environment map. Its `file` may be relative, and the comment establishes the invariant that consumers must resolve it against `workdir` before execution.
+This file is mostly a set of simple data shapes for the shell escalation system. The real-world problem is this: a command starts inside a patched shell, but before it actually runs, the system may need to ask, “Should this run normally, be rerun somewhere less restricted, or be blocked?” Without these shared types, the client and server could not reliably agree on what command was requested or what answer was given.
 
-Responses are split into two layers. `EscalateResponse` is the serialized server reply containing an `EscalateAction`, a compact wire enum with only `Run`, `Escalate`, and `Deny { reason }`. Separately, the non-serialized `EscalationDecision` and `EscalationExecution` enums represent richer internal policy outcomes: run locally, deny with an optional explanation, or escalate with a specific execution mode (`Unsandboxed`, `TurnDefault`, or explicit `EscalationPermissions`). The three constructor helpers on `EscalationDecision` make those outcomes explicit at call sites.
+The file defines environment variable names used as signposts. One tells wrapper programs where to find the inherited socket, which is like a private phone line back to the escalation server. Another tells patched shells what executable wrapper to use around exec calls, where exec means replacing the current process with a new program.
 
-The file also defines the super-exec side channel messages: `SuperExecMessage` forwards a list of inherited raw file descriptors, and `SuperExecResult` returns the child exit code after the server-side exec completes. Overall, this module contains mostly data definitions, but the comments encode important semantics about path resolution, sandbox selection, and how client/server responsibilities are divided.
+`EscalateRequest` describes the command that was caught: the program path, its arguments, working directory, and environment variables. `EscalateResponse` carries back the server’s answer as an `EscalateAction`: run it, escalate it, or deny it with an optional reason.
+
+There is also a more internal decision type, `EscalationDecision`, which can say not only “escalate” but also how to execute: outside the sandbox, with the turn’s default sandbox, or with explicit permissions. Finally, `SuperExecMessage` and `SuperExecResult` describe forwarding open file descriptors and reporting the final exit code after the command finishes.
 
 #### Function details
 
@@ -327,11 +331,11 @@ The file also defines the super-exec side channel messages: `SuperExecMessage` f
 fn run() -> Self
 ```
 
-**Purpose**: Constructs the internal decision variant meaning the intercepted command should execute normally without server-side escalation. It exists as a named constructor so callers express policy intent directly instead of spelling the enum variant inline.
+**Purpose**: This is a small convenience function that creates a decision meaning “run the command as-is.” It gives other code a clear, readable way to say that no escalation or blocking is needed.
 
-**Data flow**: It takes no arguments and reads no external state. It creates and returns `EscalationDecision::Run`, without mutating any shared data or performing I/O.
+**Data flow**: Nothing goes in. The function simply produces an `EscalationDecision` value in the `Run` state. It does not read external data or change anything else.
 
-**Call relations**: This helper is used by higher-level decision-making and session-processing code when policy concludes the client can execute directly. In the observed call flow, decision evaluators and session tests invoke it to produce the non-escalated branch that downstream logic then translates into a wire action or local execution path.
+**Call relations**: Decision-making code such as `process_decision` and `determine_action` uses this when the intercepted command should continue normally. Tests and session setup flows also use it to confirm that the wrapper and session behavior work when the answer is simply to run inside the normal path.
 
 *Call graph*: called by 5 (process_decision, determine_action, exec_closes_parent_socket_after_shell_spawn, handle_escalate_session_respects_run_in_sandbox_decision, start_session_exposes_wrapper_env_overlay).
 
@@ -342,11 +346,11 @@ fn run() -> Self
 fn escalate(execution: EscalationExecution) -> Self
 ```
 
-**Purpose**: Constructs the internal decision variant for commands that must be rerouted through the escalation server, preserving the chosen execution mode. It packages the caller's sandbox/execution choice into the richer policy enum.
+**Purpose**: This creates a decision meaning “do not just run this locally; send it through the escalation path.” The caller supplies the kind of escalated execution to use, such as unsandboxed execution or a specific permission set.
 
-**Data flow**: It accepts one `EscalationExecution` argument, wraps that value in `EscalationDecision::Escalate(...)`, and returns the new enum. No external state is read or written; the only transformation is embedding the execution-mode payload into the decision.
+**Data flow**: An `EscalationExecution` choice goes in. The function wraps that choice inside an `EscalationDecision::Escalate` value and returns it. Nothing else is modified.
 
-**Call relations**: Callers use this when policy or session state requires elevated/server-side execution, including paths that preserve explicit permissions or choose unsandboxed/default sandbox behavior. In the broader flow, decision processors create this variant first, and later orchestration code inspects it to launch the escalated execution branch rather than the direct-run branch.
+**Call relations**: Code such as `process_decision` uses this when a command needs special execution rather than the ordinary path. Session and executor tests call it to exercise the escalation flow, including cases where file descriptors are forwarded, commands are actually run through the executor, or explicit permissions must be passed along.
 
 *Call graph*: called by 5 (process_decision, dropping_session_aborts_intercept_workers_and_kills_spawned_child, handle_escalate_session_accepts_received_fds_that_overlap_destinations, handle_escalate_session_executes_escalated_command, handle_escalate_session_passes_permissions_to_executor); 1 external calls (Escalate).
 
@@ -357,24 +361,24 @@ fn escalate(execution: EscalationExecution) -> Self
 fn deny(reason: Option<String>) -> Self
 ```
 
-**Purpose**: Constructs the internal denial outcome, optionally carrying a human-readable reason that can be surfaced back to the requester. It standardizes creation of the refusal branch of escalation policy.
+**Purpose**: This creates a decision meaning “do not execute the command.” It can include a human-readable reason, which helps explain why the command was refused.
 
-**Data flow**: It takes an `Option<String>` reason, embeds it into `EscalationDecision::Deny { reason }`, and returns that enum value. It performs no side effects and does not consult any ambient state.
+**Data flow**: An optional text reason goes in. The function returns an `EscalationDecision::Deny` value containing that reason. It does not contact anything or change any shared state.
 
-**Call relations**: This helper is used by decision-processing code when neither direct execution nor escalation is permitted. Downstream logic can then inspect the returned denial variant and convert it into the serialized `EscalateAction::Deny` response sent back to the client.
+**Call relations**: `process_decision` calls this when the policy outcome is to block the intercepted command. That denial can later be turned into a protocol response so the client side knows not to launch the program and can surface the reason if one was provided.
 
 *Call graph*: called by 1 (process_decision).
 
 
 ### `windows-sandbox-rs/src/elevated/ipc_framed.rs`
 
-`io_transport` · `elevated runner handshake and streaming I/O`
+`io_transport` · `elevated command startup and I/O streaming`
 
-This file is the protocol definition for parent-to-elevated-runner communication. It contains both the serializable message types and the framing helpers that turn those messages into a stream-safe wire format. The protocol is versioned with `IPC_PROTOCOL_VERSION`, and every frame is a `FramedMessage` containing that version plus a tagged `Message` enum variant.
+When this project needs to run a command through an elevated Windows helper, two separate processes must stay in sync. The parent needs to say things like “start this command,” “send these stdin bytes,” or “please terminate.” The elevated runner needs to answer with things like “the child process is ready,” “here is stdout,” “here is stderr,” “the process exited,” or “something failed.” This file is the shared rulebook for that conversation.
 
-The schema covers the full elevated execution lifecycle: `SpawnRequest` carries command, cwd, environment, permission profile, workspace roots, home directories, capability SIDs, timeout, TTY mode, stdin-open state, and private-desktop preference; `SpawnReady` acknowledges child creation; `Output`, `Stdin`, `CloseStdin`, `Resize`, `Exit`, `Error`, and `Terminate` cover streaming and control. Binary payloads are represented as base64 strings, with `encode_bytes` and `decode_bytes` providing the conversion.
+The messages are JSON, which is a text format that is easy to inspect and version. Raw terminal bytes are not placed directly into JSON; they are converted to base64, a text-safe encoding, so arbitrary output or input can travel without corrupting the message. Each JSON message is wrapped in a frame: first four bytes say how long the message is, then the JSON bytes follow. This is like putting a label on a package saying exactly how big the package is, so the receiver knows where one message ends and the next begins.
 
-`write_frame` serializes a message to JSON bytes, enforces an 8 MiB maximum payload size, writes a little-endian `u32` length prefix followed by the payload, and flushes the writer. `read_frame` performs the inverse: it reads exactly four bytes for the length, treats `UnexpectedEof` at that boundary as clean end-of-stream, rejects oversized frames, reads the payload body, and deserializes JSON into `FramedMessage`. The framing layer is intentionally simple and stream-oriented, making it suitable for named pipes used by the elevated runner path.
+The file also sets a maximum frame size of 8 MiB. That is not part of the message language itself; it is a safety guard so a broken or hostile sender cannot make the receiver allocate huge memory by claiming an enormous packet is coming.
 
 #### Function details
 
@@ -384,11 +388,11 @@ The schema covers the full elevated execution lifecycle: `SpawnRequest` carries 
 fn encode_bytes(data: &[u8]) -> String
 ```
 
-**Purpose**: Base64-encodes raw bytes for inclusion in JSON IPC payloads. It is used for binary stdin/stdout/stderr transport over the text-based protocol.
+**Purpose**: Turns raw bytes into base64 text so they can be safely placed inside a JSON message. This is used for command input and output, where the bytes may contain anything, not just normal readable characters.
 
-**Data flow**: It takes a byte slice, passes it to the standard base64 engine, and returns the encoded `String`. It reads no external state and performs no I/O.
+**Data flow**: It receives a slice of bytes, such as the bytes for `hello` or bytes read from stdout. It encodes those bytes using standard base64. It returns a string that can safely travel as JSON text.
 
-**Call relations**: This helper is used by protocol producers and is exercised in the round-trip framing test when constructing an `OutputPayload`.
+**Call relations**: The round-trip test uses this before writing an `Output` message, proving that real byte data can be packed into the protocol. In normal use, the same idea is used whenever the parent or runner needs to send stdin, stdout, or stderr through the framed IPC messages.
 
 *Call graph*: called by 1 (framed_round_trip).
 
@@ -399,11 +403,11 @@ fn encode_bytes(data: &[u8]) -> String
 fn decode_bytes(data: &str) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Decodes a base64 payload string back into raw bytes. It is the inverse helper for binary data carried inside JSON messages.
+**Purpose**: Turns base64 text from a message back into the original raw bytes. A caller uses this after receiving stdin, stdout, or stderr data in the protocol.
 
-**Data flow**: It accepts a `&str`, decodes its UTF-8 bytes with the standard base64 engine, and returns a `Result<Vec<u8>>`. Errors from the decoder propagate through `anyhow` conversion.
+**Data flow**: It receives a string that should contain base64 text. It tries to decode that text into the original bytes. If the text is valid, it returns those bytes; if not, it returns an error explaining that decoding failed.
 
-**Call relations**: This helper is used by protocol consumers and tests that validate output payload round-tripping and stdin writer behavior.
+**Call relations**: The round-trip test calls this after reading an `Output` message to confirm that `hello` comes back unchanged. Another stdin-writer test elsewhere also calls it when checking that stdin data sent through the runner protocol can be read back correctly.
 
 *Call graph*: called by 2 (framed_round_trip, runner_stdin_writer_sends_close_stdin_after_input_eof).
 
@@ -414,11 +418,11 @@ fn decode_bytes(data: &str) -> Result<Vec<u8>>
 fn write_frame(mut writer: W, msg: &FramedMessage) -> Result<()>
 ```
 
-**Purpose**: Serializes a framed message to JSON and writes it with a 4-byte little-endian length prefix. It enforces a maximum payload size before writing.
+**Purpose**: Writes one complete protocol message to a byte stream in a form the other side can reliably read. It adds the length prefix before the JSON so the receiver knows exactly how many bytes belong to this message.
 
-**Data flow**: It takes a generic `Write` implementor and a borrowed `FramedMessage`, serializes the message with `serde_json::to_vec`, checks `payload.len()` against `MAX_FRAME_LEN`, writes the length prefix and payload bytes with `write_all`, flushes the writer, and returns `Result<()>`.
+**Data flow**: It receives a writable stream and a `FramedMessage`. It serializes the message into JSON bytes, checks that the payload is not larger than the 8 MiB safety limit, writes a four-byte little-endian length, writes the JSON payload, then flushes the stream so the data is pushed out. It returns success, or an error if serialization, size checking, writing, or flushing fails.
 
-**Call relations**: This is the outbound transport primitive used by the elevated runner client when sending spawn requests, and by tests that verify framing round-trips.
+**Call relations**: The test uses it to write a message into an in-memory buffer before reading it back. In the real elevated flow, `send_spawn_request` calls it when the parent sends the initial command-start request to the elevated runner.
 
 *Call graph*: called by 2 (framed_round_trip, send_spawn_request); 4 external calls (flush, write_all, bail!, to_vec).
 
@@ -429,11 +433,11 @@ fn write_frame(mut writer: W, msg: &FramedMessage) -> Result<()>
 fn read_frame(mut reader: R) -> Result<Option<FramedMessage>>
 ```
 
-**Purpose**: Reads one length-prefixed JSON frame from a byte stream and deserializes it into a `FramedMessage`. It treats EOF before a new frame header as a clean end-of-stream.
+**Purpose**: Reads one complete protocol message from a byte stream. It understands the same length-prefixed format written by `write_frame`.
 
-**Data flow**: It takes a generic `Read` implementor, attempts to `read_exact` four bytes into a length buffer, returns `Ok(None)` on `UnexpectedEof` at that stage, converts the header with `u32::from_le_bytes`, rejects lengths above `MAX_FRAME_LEN`, allocates a payload buffer of that size, reads the payload exactly, deserializes it with `serde_json::from_slice`, and returns `Ok(Some(msg))`.
+**Data flow**: It receives a readable stream. First it tries to read four bytes for the message length. If the stream ends cleanly before a length is available, it returns `None`, meaning there is no more message. Otherwise it checks the length against the 8 MiB safety limit, reads exactly that many JSON bytes, parses them into a `FramedMessage`, and returns it. Bad lengths, incomplete payloads, or invalid JSON become errors.
 
-**Call relations**: This is the inbound transport primitive used by the runner client to receive `spawn_ready` and by tests and helper wait loops that consume framed protocol messages.
+**Call relations**: The round-trip test calls this after `write_frame` to prove both sides of the framing format match. In the real elevated flow, `read_spawn_ready` uses it to wait for the runner’s startup acknowledgement, and `wait_for_frame_count` uses it while collecting messages in tests or helper logic.
 
 *Call graph*: called by 3 (framed_round_trip, read_spawn_ready, wait_for_frame_count); 5 external calls (read_exact, bail!, from_slice, from_le_bytes, vec!).
 
@@ -444,11 +448,11 @@ fn read_frame(mut reader: R) -> Result<Option<FramedMessage>>
 fn framed_round_trip()
 ```
 
-**Purpose**: Verifies that a framed `Output` message can be serialized, written, read back, and decoded without losing protocol version, stream identity, or payload bytes.
+**Purpose**: Checks that a message can be encoded, framed, written, read back, decoded, and still contain the same meaning and bytes. It protects the basic contract between parent and elevated runner.
 
-**Data flow**: It constructs a `FramedMessage` containing base64-encoded `"hello"`, writes it into a `Vec<u8>` with `write_frame`, reads it back with `read_frame`, asserts the version and output stream, decodes the payload with `decode_bytes`, and asserts the recovered bytes.
+**Data flow**: It builds an `Output` message containing base64-encoded `hello` on stdout. It writes that message into a memory buffer with `write_frame`, reads it back with `read_frame`, checks the protocol version and stream name, decodes the base64 payload with `decode_bytes`, and confirms the final bytes are still `hello`.
 
-**Call relations**: This test exercises the full happy-path interaction among `encode_bytes`, `write_frame`, `read_frame`, and `decode_bytes`.
+**Call relations**: This test exercises the main helper chain in this file: `encode_bytes`, `write_frame`, `read_frame`, and `decode_bytes`. It acts like a miniature parent-runner conversation in memory, without needing real named pipes or real processes.
 
 *Call graph*: calls 4 internal fn (decode_bytes, encode_bytes, read_frame, write_frame); 3 external calls (new, assert_eq!, panic!).
 
@@ -459,10 +463,10 @@ fn framed_round_trip()
 fn spawn_request_serializes_permission_profile()
 ```
 
-**Purpose**: Checks that `SpawnRequest` JSON includes the permission profile in the expected tagged form and omits unrelated legacy fields. It also verifies deserialization back into the same structured values.
+**Purpose**: Checks that a command-start request serializes and deserializes the permission profile in the expected JSON shape. This matters because the parent and elevated runner must agree on how sandbox permissions are described.
 
-**Data flow**: It builds a `SpawnRequest` with representative command, paths, capability SIDs, timeout, and flags; serializes the enclosing `FramedMessage` to a JSON value; asserts selected fields and absent keys; then deserializes back and asserts the recovered `permission_profile` and `workspace_roots`.
+**Data flow**: It builds a `SpawnRequest` with a command, working directory, workspace root, read-only permission profile, Codex home paths, capability identifiers, timeout, and terminal settings. It converts the full framed message to JSON, checks important JSON fields, then converts the JSON back into a `FramedMessage` and verifies that the permission profile and workspace roots survived unchanged.
 
-**Call relations**: This test validates the serde schema for the protocol types in this file, especially the shape of `SpawnRequest` when embedded in a framed message.
+**Call relations**: This test focuses on the `SpawnRequest` data defined in this file and the external `PermissionProfile::read_only` helper. It does not call the frame reader or writer; instead, it checks the JSON schema directly so changes to the message shape are caught early.
 
 *Call graph*: calls 1 internal fn (read_only); 8 external calls (new, new, from, assert_eq!, panic!, from_value, to_value, vec!).

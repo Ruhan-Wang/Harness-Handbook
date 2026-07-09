@@ -1,10 +1,6 @@
 # top-level codex CLI command verification  `stage-23.3.2`
 
-This stage sits at the command-entry boundary of the system: it verifies that the top-level codex CLI parses arguments, validates configuration, dispatches to the right command implementation, and reports failures in the exact form users and automation depend on. Rather than testing internal helpers, these integration tests exercise the real CLI surface and its observable behavior.
-
-The app-server and exec-server tests confirm strict config parsing before either server entrypoint starts. Command-specific regressions cover delete error ordering and update behavior, ensuring debug builds abort with a clear non-interactive diagnostic instead of entering updater flow. The debug command tests validate operational maintenance tools: clear-memories removes persisted state safely, and debug models emits correct JSON with bundled and non-bundled views.
-
-Feature tests check config-driven feature flags, persistence, warnings, and listing order. Plugin and marketplace tests cover the broader extension-management workflow: listing, JSON output, install/remove behavior, malformed marketplace handling, adding and removing marketplace sources, and the relocated marketplace upgrade command. MCP tests verify add/remove/list/get flows, transport-specific options, secret masking, migration notices, and invalid flag combinations. Finally, the live CLI smoke tests optionally validate the full binary against the real OpenAI endpoint.
+This stage checks the front door of the Codex command-line program. These are integration tests, meaning they run commands much like a real user would and check the visible results: exit codes, printed text, JSON output, and saved configuration files. The app-server and exec-server tests make sure strict config mode rejects unknown settings instead of ignoring mistakes. The delete test confirms Codex will not ask for deletion confirmation when the target session is missing. The update test makes sure debug builds fail clearly instead of dropping into the normal prompt. Debug tests cover clearing stored memories safely and printing model lists as valid JSON. Feature tests check command-line feature flags and config writing. Plugin tests cover plugin commands, marketplace add, remove, and upgrade behavior, including local folders, cleanup, and error messages. MCP tests cover adding, listing, getting, and removing MCP server entries, including hiding secrets in friendly output while preserving full JSON data. Finally, the live CLI smoke test can exercise the real program against the OpenAI API, but it is normally skipped to avoid network cost and outside-service failures.
 
 ## Files in this stage
 
@@ -13,9 +9,13 @@ These tests verify strict configuration handling and basic command-surface behav
 
 ### `cli/tests/app_server.rs`
 
-`test` · `startup/config validation`
+`test` · `test run`
 
-This file builds a real `codex` test process with `assert_cmd`, points it at an isolated temporary `CODEX_HOME`, and verifies that `app-server` refuses unknown keys when strict config parsing is enabled. The setup is intentionally minimal: it writes a `config.toml` containing only an invalid top-level field (`foo = "bar"`), then invokes `codex app-server --strict-config --listen off`. The assertion is not just that the command fails, but that stderr contains the specific validation message about an unknown configuration field, proving the failure happens during config decoding rather than later server startup. The helper centralizes command construction and environment wiring so the test always executes the compiled `codex` binary against the temporary home directory. A subtle design point is the `--listen off` argument: it prevents the test from depending on network binding or long-running server behavior, keeping the test focused entirely on configuration rejection at startup.
+This is a small automated test for the command-line app server. The real-world problem it protects against is a user writing a setting in `config.toml` that the program does not understand. If the program quietly accepted that file, the user might think their setting worked when it was actually ignored. This test makes sure strict mode catches that mistake.
+
+The test creates a temporary fake Codex home folder, like a clean mini user environment made just for the test. Inside it, it writes a `config.toml` file containing an unknown field, `foo = "bar"`. Then it starts the compiled `codex` command with `CODEX_HOME` pointed at that temporary folder, so the command reads this test config instead of any real user config.
+
+It runs `codex app-server --strict-config --listen off`. The `--strict-config` flag means unknown config fields should be treated as errors, and `--listen off` avoids starting a real listening server. The test then checks two things: the command fails, and its error output contains the phrase `unknown configuration field`. Without this test, a future change could accidentally let bad config through, weakening strict config validation for the app server.
 
 #### Function details
 
@@ -25,11 +25,11 @@ This file builds a real `codex` test process with `assert_cmd`, points it at an 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Constructs an `assert_cmd::Command` for the compiled `codex` binary and binds it to a supplied temporary home directory via `CODEX_HOME`.
+**Purpose**: This helper builds a command object for running the `codex` binary in a test. It also points the command at a chosen Codex home directory, so each test can use its own isolated configuration files.
 
-**Data flow**: Takes `codex_home: &Path`, resolves the binary path with `codex_utils_cargo_bin::cargo_bin("codex")`, creates an `assert_cmd::Command`, sets the `CODEX_HOME` environment variable on that process, and returns the configured command wrapped in `anyhow::Result`.
+**Data flow**: It receives a path to a temporary Codex home folder. It finds the compiled `codex` test binary, creates a command for it, sets the `CODEX_HOME` environment variable to the supplied path, and returns the ready-to-customize command object. If finding the binary fails, it returns that error instead.
 
-**Call relations**: This helper is invoked by `strict_config_rejects_unknown_config_fields_for_app_server` before any assertions. It delegates binary lookup and process construction so the test body can focus on CLI arguments and expected stderr.
+**Call relations**: The test function calls this helper after creating its temporary config directory. The helper relies on external test utilities to locate and create the command, then hands the prepared command back so the test can add app-server arguments and make assertions about the result.
 
 *Call graph*: called by 1 (strict_config_rejects_unknown_config_fields_for_app_server); 2 external calls (new, cargo_bin).
 
@@ -40,20 +40,24 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn strict_config_rejects_unknown_config_fields_for_app_server() -> Result<()>
 ```
 
-**Purpose**: Verifies that `codex app-server` exits with an error when strict config mode encounters an unknown field in `config.toml`.
+**Purpose**: This test proves that the app server refuses a configuration file with unknown fields when strict config checking is enabled. It exists to catch regressions where invalid config might otherwise be accepted silently.
 
-**Data flow**: Creates a `TempDir`, writes a malformed `config.toml` into that directory, obtains a configured command from `codex_command`, appends `app-server`, `--strict-config`, and `--listen off` arguments, executes the process, and asserts failure plus a stderr substring match. It returns `Ok(())` only if the command rejects the config as expected.
+**Data flow**: It starts with a new temporary directory, writes a `config.toml` containing an unsupported field, and asks `codex_command` for a command that will read from that directory. It then runs the command as `app-server` with strict config enabled and listening turned off. The expected outcome is a failed command whose standard error text includes `unknown configuration field`.
 
-**Call relations**: This is the test entrypoint. It calls `codex_command` to prepare the subprocess, then relies on `assert_cmd` assertion chaining and `predicates::str::contains` to validate that startup fails specifically because of strict config parsing.
+**Call relations**: This is the main test case in the file. It calls `codex_command` to get an isolated `codex` process setup, uses standard file writing to create the bad config, and uses the test assertion tools to check that the app server rejects the config in the expected way.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (new, contains, write).
 
 
 ### `cli/tests/delete.rs`
 
-`test` · `command validation/error handling`
+`test` · `test run`
 
-This file contains a single focused integration test that checks the CLI fails early on session lookup, before it ever reaches delete-confirmation logic. It creates a temporary `CODEX_HOME`, launches the compiled `codex` binary directly with `assert_cmd`, and requests deletion of a fixed UUID-like session identifier. The assertions are deliberately dual: stderr must contain the message indicating that no active or archived session matched the supplied identifier, and stderr must not contain the phrase `cannot confirm`. That negative assertion is the key behavior under test, because it proves the command does not proceed far enough to ask for or validate confirmation when the target session is missing. The test therefore locks down control-flow precedence in the delete command: existence checks happen before confirmation checks. No helper is needed because the setup is tiny and specific to this one scenario.
+Deleting data is risky, so the command-line tool needs to be careful about the order of its checks. This test makes sure the tool first looks for the session the user named, and only asks for deletion confirmation if that session actually exists. In everyday terms, it is like a clerk checking whether a file is in the cabinet before asking you to sign a form to destroy it.
+
+The test creates a fresh temporary `CODEX_HOME`, which is the directory where this tool stores its local data. Because the directory is empty, there are no active or archived sessions inside it. The test then runs the real `codex` command with `delete` and a sample session ID.
+
+The expected result is failure, but a specific kind of failure. The error message must say that no matching session was found. Just as importantly, the output must not include the phrase `cannot confirm`, because that would mean the program reached the confirmation step even though there was nothing valid to delete. This protects both user experience and deletion safety by enforcing the correct sequence: find the target first, then confirm.
 
 #### Function details
 
@@ -63,20 +67,24 @@ This file contains a single focused integration test that checks the CLI fails e
 fn missing_session_fails_before_delete_confirmation() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures `codex delete <id>` reports a missing session and does not emit confirmation-related errors when no matching session exists.
+**Purpose**: This test checks that deleting a nonexistent session stops with a clear “not found” error before the command tries to confirm the deletion. Someone would use this test to guard against a bug where the delete command asks for confirmation even though no session can be deleted.
 
-**Data flow**: Creates a temporary home directory, constructs an `assert_cmd::Command` for the `codex` binary, sets `CODEX_HOME`, passes the `delete` subcommand and a fixed session ID, executes the command, and asserts failure with one required stderr substring and one forbidden stderr substring. It returns success only if the command fails for the expected reason and in the expected phase.
+**Data flow**: The test starts with an empty temporary storage directory and points `CODEX_HOME` at it. It then runs the `codex delete` command with a fixed session ID. The command is expected to exit unsuccessfully, print a message saying no active or archived session matched, and not print `cannot confirm`.
 
-**Call relations**: This is the sole test entrypoint in the file. It directly constructs the subprocess instead of using a helper because there is only one scenario, and it relies on predicate composition to verify both positive and negative stderr conditions.
+**Call relations**: During the test, it creates a temporary directory, locates the built `codex` command-line program, runs that program with the delete arguments, and checks the command output. The external helpers provide the temporary directory, command construction, binary lookup, and text-matching checks used to verify the result.
 
 *Call graph*: 4 external calls (new, cargo_bin, contains, tempdir).
 
 
 ### `cli/tests/exec_server.rs`
 
-`test` · `startup/config validation`
+`test` · `test run`
 
-This file mirrors the app-server strict-config test but targets the execution server entrypoint. It writes an invalid `config.toml` containing an unknown top-level field into a temporary `CODEX_HOME`, then invokes `codex exec-server --strict-config --listen http://127.0.0.1:0`. The expected outcome is immediate startup failure with stderr mentioning an unknown configuration field. Using a concrete listen URL keeps the invocation syntactically valid for the server command while still ensuring the test’s real subject is config parsing, not runtime request handling. The helper function encapsulates binary lookup and environment setup so the test body remains a concise statement of preconditions and expected failure. As with the app-server variant, this test protects against regressions where unknown config keys might be silently ignored or only rejected later in startup.
+This is a small automated test for the command-line program. The real-life problem it checks is simple: if a user writes a setting that Codex does not understand, and asks for strict checking, Codex should say so and stop instead of ignoring the mistake. Without this test, a future change could accidentally let bad configuration slip through, which would make typos hard to notice.
+
+The test creates a temporary Codex home folder, like a disposable mini version of a user’s Codex directory. Inside it, it writes a `config.toml` file with one made-up field: `foo = "bar"`. Then it builds a command that runs the `codex` binary with `CODEX_HOME` pointed at that temporary folder, so the program reads this test config instead of any real user config.
+
+Next, the test runs `codex exec-server --strict-config --listen http://127.0.0.1:0`. The listen address uses port `0`, which means the operating system may choose any free port; the test is not trying to check networking here. It only checks startup validation. The expected result is failure, and the error text must include “unknown configuration field.”
 
 #### Function details
 
@@ -86,11 +94,11 @@ This file mirrors the app-server strict-config test but targets the execution se
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates a `codex` subprocess command configured with a caller-provided `CODEX_HOME`.
+**Purpose**: This helper prepares a command that will run the `codex` executable in a controlled test environment. It points `CODEX_HOME` at a supplied folder so the test can decide exactly which configuration files Codex sees.
 
-**Data flow**: Takes a path reference, resolves the built `codex` executable, constructs an `assert_cmd::Command`, sets the `CODEX_HOME` environment variable, and returns the command in a `Result`.
+**Data flow**: It receives a path to a temporary Codex home directory. It asks the test tooling for the compiled `codex` binary, creates a command for that binary, adds the `CODEX_HOME` environment variable, and returns the ready-to-customize command. If finding the binary fails, it returns that error instead.
 
-**Call relations**: The strict-config test calls this helper to avoid repeating binary resolution and environment wiring before adding `exec-server` arguments.
+**Call relations**: The test function calls this after creating and filling the temporary config directory. This helper hides the repeated setup details, then hands back a command object that the test extends with `exec-server` arguments before running assertions against it.
 
 *Call graph*: called by 1 (strict_config_rejects_unknown_config_fields_for_exec_server); 2 external calls (new, cargo_bin).
 
@@ -101,22 +109,24 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn strict_config_rejects_unknown_config_fields_for_exec_server() -> Result<()>
 ```
 
-**Purpose**: Checks that `codex exec-server` rejects unknown configuration fields when `--strict-config` is enabled.
+**Purpose**: This test proves that `codex exec-server` rejects unknown configuration fields when `--strict-config` is used. It is checking for a clear failure message rather than allowing a bad config to be quietly ignored.
 
-**Data flow**: Creates a temporary home directory, writes a `config.toml` containing `foo = "bar"`, obtains a command from `codex_command`, appends `exec-server`, `--strict-config`, and a loopback listen URL, executes the process, and asserts that it fails with stderr containing `unknown configuration field`.
+**Data flow**: It starts by creating a temporary directory, then writes a `config.toml` file containing an unsupported field. It asks `codex_command` to create a `codex` command using that directory as its home, adds the `exec-server`, `--strict-config`, and `--listen` arguments, runs the command, and checks that it fails with an error message containing “unknown configuration field.” The temporary files are automatically cleaned up afterward.
 
-**Call relations**: This test is the file’s main scenario and uses `codex_command` as setup. It delegates process execution and stderr matching to `assert_cmd` and `predicates`, focusing on the strict-config failure path.
+**Call relations**: This is the main test case in the file. It relies on `codex_command` to launch Codex with the test-only home directory, uses file-writing support to create the bad config, and uses assertion helpers to confirm the command exits unsuccessfully for the expected reason.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (new, contains, write).
 
 
 ### `cli/tests/update.rs`
 
-`test` · `CLI integration testing for debug-only update behavior`
+`test` · `test run for debug builds`
 
-This small integration test file exists specifically to pin down update-command behavior in debug builds. The helper `codex_command` creates an `assert_cmd::Command` for the built `codex` binary and injects a temporary `CODEX_HOME`, isolating the invocation from any real user state. The only test is compiled only when `debug_assertions` are enabled, matching the behavior it is asserting.
+This is a small safety test for the command-line program. In a debug build, which is the kind developers usually run while working on the project, `codex update` is not meant to be available. The important behavior is not just that the command fails, but that it fails in the right way: with a specific message, and without starting an interactive session that would hang the test or confuse the user.
 
-`update_does_not_start_interactive_prompt` creates a temporary home, runs `codex update`, and asserts failure with stderr containing the exact message ``codex update` is not available in debug builds`. The test is intentionally narrow: it does not inspect config or filesystem side effects because the contract being protected is that the command should stop before entering any interactive updater logic at all. In practice this guards against regressions where debug binaries accidentally expose production update flows or hang waiting for user interaction during automated test runs.
+The file first defines a helper that builds a test command for running the `codex` binary. It also points that command at a temporary `CODEX_HOME`, which is like giving the program a fresh, empty home folder so the test does not touch a real user’s settings.
+
+The actual test creates that temporary home folder, runs `codex update`, and checks two things: the command must fail, and its error output must say that `codex update` is not available in debug builds. The test is only compiled and run when debug assertions are enabled, so it specifically protects developer/debug behavior rather than release behavior.
 
 #### Function details
 
@@ -126,11 +136,11 @@ This small integration test file exists specifically to pin down update-command 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates an `assert_cmd::Command` for the `codex` executable with `CODEX_HOME` set to a temporary directory.
+**Purpose**: This helper prepares a command that runs the `codex` test binary with a chosen home directory. It keeps the test setup in one place so each test can run `codex` without using the developer’s real environment.
 
-**Data flow**: It takes `codex_home`, resolves the binary path with `cargo_bin`, constructs the command, sets `CODEX_HOME`, and returns the configured command in a `Result`.
+**Data flow**: It takes a path to a temporary Codex home folder. It finds the built `codex` binary, creates a command object for running it, sets the `CODEX_HOME` environment variable to the supplied path, and returns that ready-to-use command. If finding the binary fails, it returns that error instead.
 
-**Call relations**: The single test in this file calls it to launch `codex update` under isolated state.
+**Call relations**: The update test calls this helper before adding the `update` argument. Internally it relies on the test tooling to locate the compiled `codex` binary and create a runnable command, then hands the prepared command back to the test.
 
 *Call graph*: called by 1 (update_does_not_start_interactive_prompt); 2 external calls (new, cargo_bin).
 
@@ -141,11 +151,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 async fn update_does_not_start_interactive_prompt() -> Result<()>
 ```
 
-**Purpose**: Verifies that `codex update` is unavailable in debug builds and fails with the expected message instead of entering an interactive updater flow.
+**Purpose**: This test proves that `codex update` does not drop into the normal interactive prompt in debug builds. Instead, it should stop immediately with a clear error message.
 
-**Data flow**: It creates a temporary home, invokes `codex update`, and asserts process failure with stderr containing the debug-build unavailability message.
+**Data flow**: It creates a temporary folder to act as `CODEX_HOME`, asks `codex_command` for a command configured to use that folder, adds the `update` argument, runs the command, and checks the result. The expected outcome is failure, with standard error containing the message that `codex update` is not available in debug builds.
 
-**Call relations**: This async test is conditionally compiled under `debug_assertions` and uses `codex_command` to exercise the guarded update command path.
+**Call relations**: During the debug test run, the test framework calls this function. It uses `codex_command` to build the isolated command, uses the temporary-directory tool to avoid touching real user files, and uses a text-matching helper to check that the error message says the right thing.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -155,9 +165,13 @@ These tests cover maintenance-oriented debug commands and the feature-management
 
 ### `cli/tests/debug_clear_memories.rs`
 
-`test` · `maintenance command execution`
+`test` · `test run`
 
-This file exercises the memory-reset maintenance command against real on-disk SQLite databases created under a temporary `CODEX_HOME`. Both async tests first initialize state with `codex_state::StateRuntime::init`, which creates the expected schema. The first test seeds the main state DB with a `threads` row, seeds the memories DB with `stage1_outputs` and memory-related `jobs`, creates a `memories/` directory containing a stale markdown file, closes both pools, then runs `codex debug clear-memories`. After the command succeeds and prints `Cleared memory state`, the test reconnects to the memories DB and confirms that `stage1_outputs` is empty, memory job rows are gone, and the `memories/` directory still exists but has been emptied rather than deleted. The second test covers a degraded environment: it inserts memory data, deletes the main state DB file entirely, runs the same command, and verifies the memories DB is still reset while the missing state DB is not recreated. These tests are concrete regression checks for cleanup scope, schema targeting, and resilience when only part of the persisted state is present.
+This is an integration test file, meaning it runs the real `codex` command-line program in a temporary home directory and checks what happens on disk. The feature being tested is a debug command that clears Codex's memory state. In this project, “memory” is stored partly in SQLite databases, which are small file-based databases, and partly in files under a `memories` folder. If this cleanup command is wrong, old memory summaries or queued memory jobs could survive and affect later sessions, like a notebook that was supposed to be erased but still has pages tucked inside.
+
+The tests build a fake Codex home directory, initialize the normal state layout, and then manually insert sample rows into the memory-related database tables. One test also creates a stale memory summary file. After that, the tests run `codex debug clear-memories` as an external process, just as a user would from a terminal.
+
+The checks are deliberately concrete: the memory output rows must be gone, memory-related background jobs must be gone, and the `memories` directory must still exist but be empty. A second test removes the main state database before running the command, to prove that clearing memories still works even when the broader state database is missing.
 
 #### Function details
 
@@ -167,11 +181,11 @@ This file exercises the memory-reset maintenance command against real on-disk SQ
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Builds a `codex` subprocess command configured to use a specific temporary `CODEX_HOME`.
+**Purpose**: This helper prepares a command object for running the real `codex` binary during the tests. It also points the command at the temporary Codex home directory so the test does not touch a developer's real files.
 
-**Data flow**: Accepts a filesystem path, resolves the compiled `codex` binary, creates an `assert_cmd::Command`, injects `CODEX_HOME` into the child environment, and returns the configured command.
+**Data flow**: It receives the path to a temporary Codex home folder. It finds the compiled `codex` program, creates a command for it, sets the `CODEX_HOME` environment variable to the temporary folder, and returns the ready-to-run command object.
 
-**Call relations**: Both async tests call this helper immediately before invoking `debug clear-memories`, so command setup is shared while database seeding remains local to each scenario.
+**Call relations**: Both tests call this helper just before they run `codex debug clear-memories`. It hides the repeated setup needed to launch the command-line program safely in an isolated test environment.
 
 *Call graph*: called by 2 (debug_clear_memories_resets_memories_db_without_state_db, debug_clear_memories_resets_state_and_removes_memory_dir); 2 external calls (new, cargo_bin).
 
@@ -182,11 +196,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 async fn debug_clear_memories_resets_state_and_removes_memory_dir() -> Result<()>
 ```
 
-**Purpose**: Checks that `debug clear-memories` wipes memory-related database contents and empties the memory artifact directory while preserving its existence.
+**Purpose**: This test proves that `codex debug clear-memories` removes saved memory records, removes memory background jobs, and empties the memory files directory. It covers the normal case where both the main state database and the memories database exist.
 
-**Data flow**: Creates a temp home, initializes state runtime, computes `state_db_path` and `memories_db_path`, opens `SqlitePool`s to both databases, inserts a thread into `threads`, inserts one memory summary row into `stage1_outputs`, inserts two completed memory job rows into `jobs`, creates `memories/memory_summary.md`, closes pools, runs `codex debug clear-memories`, reconnects to the memories DB, queries counts from `stage1_outputs` and filtered `jobs`, and asserts both are zero. It also reads the `memories/` directory and asserts the directory exists but contains no entries.
+**Data flow**: It starts with a fresh temporary Codex home, initializes the state system, and writes fake conversation and memory data into the SQLite databases. It also creates a `memories` folder containing a stale `memory_summary.md` file. Then it runs the debug clear command. After the command finishes, it reconnects to the memories database and checks that memory output rows and memory jobs are gone, while the memory folder still exists but contains no files.
 
-**Call relations**: This test is one of the two main consumers of `codex_command`. It delegates schema creation to `StateRuntime::init`, uses direct SQL inserts to establish preconditions the CLI should clean up, then validates the command’s effects through SQL queries and filesystem inspection.
+**Call relations**: This test calls `codex_command` to run the real CLI after setting up the fake stored state. It relies on the state path helpers and database connections to create the before-state, then uses command assertions and database queries to verify the after-state.
 
 *Call graph*: calls 2 internal fn (codex_command, init); 12 external calls (connect, new, assert!, assert_eq!, memories_db_path, state_db_path, format!, contains, query, query_scalar (+2 more)).
 
@@ -197,20 +211,26 @@ async fn debug_clear_memories_resets_state_and_removes_memory_dir() -> Result<()
 async fn debug_clear_memories_resets_memories_db_without_state_db() -> Result<()>
 ```
 
-**Purpose**: Verifies that `debug clear-memories` still clears the memories database even if the primary state database file has been removed.
+**Purpose**: This test checks an edge case: clearing memories should still work even if the main state database file is missing. That matters because a repair or cleanup command should not fail just because one piece of local state is already gone.
 
-**Data flow**: Creates a temp home, initializes runtime to create databases, computes both DB paths, opens only the memories DB, inserts a `stage1_outputs` row, closes the pool, deletes the state DB file from disk, runs `codex debug clear-memories`, reconnects to the memories DB, queries the remaining `stage1_outputs` count, asserts it is zero, closes the pool, and finally asserts the deleted state DB file still does not exist.
+**Data flow**: It creates a temporary Codex home and initializes the usual databases. It inserts one fake memory output row into the memories database, closes that database connection, and then deletes the main state database file. Next it runs `codex debug clear-memories`. Finally, it checks that the memory output table is empty and that the missing state database was not recreated as a side effect.
 
-**Call relations**: Like the previous test, this one calls `codex_command` after preparing on-disk state. Its distinguishing role is to prove the cleanup command tolerates a missing state DB and limits itself to clearing memory state rather than reconstructing unrelated persistence.
+**Call relations**: Like the first test, this one uses `codex_command` to launch the real CLI. It sets up a narrower failure scenario before the launch, then verifies that the cleanup path focuses on the memories database and does not depend on the main state database being present.
 
 *Call graph*: calls 2 internal fn (codex_command, init); 11 external calls (connect, new, assert!, assert_eq!, memories_db_path, state_db_path, format!, contains, query, query_scalar (+1 more)).
 
 
 ### `cli/tests/debug_models.rs`
 
-`test` · `debug command execution`
+`test` · `test run`
 
-This file validates the shape and availability of model metadata exposed by the debug CLI. Each test runs the compiled `codex` binary in an isolated temporary home directory and captures raw process output instead of using predicate-based assertions. The stdout bytes are decoded as UTF-8, parsed into `serde_json::Value`, and then inspected for a `models` field that must be a non-empty JSON array. One test explicitly requests bundled models with `debug models --bundled`; the other exercises the default `debug models` path and confirms it succeeds without any authentication setup. The tests intentionally avoid asserting exact model contents, which would be brittle, and instead lock down the contract that the command returns syntactically valid JSON with at least one model entry. The shared helper ensures both tests execute the same binary with the same `CODEX_HOME` isolation, so differences in behavior come only from the CLI arguments.
+This is a small integration test for the Codex command-line program. Its job is to make sure a debugging command that lists available models actually works from the outside, the same way a user would run it in a terminal.
+
+The tests create a temporary Codex home folder for each run. That folder acts like a clean, empty user profile, so the test does not depend on any real local configuration, saved credentials, or previous state on the developer’s machine. This is like testing a new appliance in an empty room instead of in someone’s messy kitchen.
+
+Both tests start the compiled `codex` binary, run `debug models`, collect its output, and check three important things: the command exits successfully, the text printed to standard output is valid JSON, and that JSON contains a non-empty `models` array. One test uses `--bundled`, which asks for the built-in model list. The other uses the default behavior and confirms it still works without authentication.
+
+Without these tests, the project could accidentally break this diagnostic command, change its output into something that is no longer machine-readable JSON, or make it require login when it should not.
 
 #### Function details
 
@@ -220,11 +240,11 @@ This file validates the shape and availability of model metadata exposed by the 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates an `assert_cmd::Command` for the `codex` executable and scopes it to a temporary home directory.
+**Purpose**: This helper builds a command object for running the `codex` executable in a test. It also points the command at a temporary `CODEX_HOME` folder so each test starts with clean local state.
 
-**Data flow**: Receives `codex_home`, resolves the cargo-built `codex` binary path, constructs the command, sets `CODEX_HOME`, and returns the configured process handle.
+**Data flow**: It receives the path to a temporary Codex home directory. It finds the compiled `codex` binary, creates a command runner for it, adds the `CODEX_HOME` environment variable, and returns that ready-to-use command object or an error if setup fails.
 
-**Call relations**: Both JSON-output tests call this helper before adding their specific `debug models` arguments and collecting process output.
+**Call relations**: Both test functions call this first so they can run the real CLI in a controlled environment. It relies on external test utilities to locate the binary and create the command, then hands the prepared command back to the test so the test can add arguments and run it.
 
 *Call graph*: called by 2 (debug_models_bundled_prints_json, debug_models_default_prints_json_without_auth); 2 external calls (new, cargo_bin).
 
@@ -235,11 +255,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn debug_models_bundled_prints_json() -> Result<()>
 ```
 
-**Purpose**: Confirms that `codex debug models --bundled` succeeds and prints JSON containing a non-empty `models` array.
+**Purpose**: This test proves that `codex debug models --bundled` succeeds and prints a valid JSON object containing at least one model. The `--bundled` flag means it should use the model information shipped with the program.
 
-**Data flow**: Creates a temp directory, builds a command with `codex_command`, runs it with `debug models --bundled`, captures `Output`, asserts successful exit status, converts stdout bytes to `String`, parses JSON into `serde_json::Value`, and checks that `value["models"]` is an array with at least one element.
+**Data flow**: It creates a fresh temporary Codex home directory, asks `codex_command` for a command runner, adds the `debug models --bundled` arguments, and runs the process. It then checks that the process succeeded, converts the printed bytes into text, parses that text as JSON, and verifies that the `models` field is a non-empty array.
 
-**Call relations**: This test uses `codex_command` for process setup and then performs direct output parsing rather than assertion chaining, because it needs to validate JSON structure rather than a simple substring.
+**Call relations**: During the test run, this function is called by the Rust test harness. It uses `codex_command` for setup, then uses standard parsing and assertion tools to confirm that the CLI output has the promised shape.
 
 *Call graph*: calls 1 internal fn (codex_command); 4 external calls (from_utf8, new, assert!, from_str).
 
@@ -250,20 +270,24 @@ fn debug_models_bundled_prints_json() -> Result<()>
 fn debug_models_default_prints_json_without_auth() -> Result<()>
 ```
 
-**Purpose**: Confirms that the default `codex debug models` command works without prior login and returns the same basic JSON structure.
+**Purpose**: This test proves that the plain `codex debug models` command succeeds and prints valid model-list JSON even when there is no saved authentication. That matters because this debug information should be available in a clean environment.
 
-**Data flow**: Creates a temp home, invokes `codex_command`, runs `debug models`, captures stdout, asserts success, decodes stdout as UTF-8, parses it as JSON, and verifies the `models` field is a non-empty array.
+**Data flow**: It creates an empty temporary Codex home directory, builds a command runner through `codex_command`, adds the `debug models` arguments, and runs the CLI. It checks for a successful exit, turns standard output into text, parses it as JSON, and confirms that the `models` field is a non-empty array.
 
-**Call relations**: This test parallels `debug_models_bundled_prints_json` but covers the unauthenticated default path. It demonstrates that model listing is available without extra auth state and shares the same command-construction helper.
+**Call relations**: The Rust test harness runs this function as an integration test. Like the bundled test, it depends on `codex_command` to isolate the command from the real machine’s Codex state, then checks the command output with JSON parsing and assertions.
 
 *Call graph*: calls 1 internal fn (codex_command); 4 external calls (from_utf8, new, assert!, from_str).
 
 
 ### `cli/tests/features.rs`
 
-`test` · `feature command execution/config mutation`
+`test` · `test run`
 
-This file groups several end-to-end tests around the `codex features` command family and one top-level strict-config behavior. A shared helper launches the compiled binary against a temporary `CODEX_HOME`. Two tests cover configuration validation: one proves `--strict-config -c foo=bar` is rejected for a normal command (`mcp-server`), while another proves the same flag is explicitly unsupported for `codex cloud list` and yields a dedicated error message. The feature mutation tests run `features enable unified_exec` and `features disable shell_tool`, then read back `config.toml` from disk to confirm a `[features]` table was written with `true` or `false` values respectively, in addition to checking the success message. Another test enables `runtime_metrics` and asserts that under-development features emit a warning on stderr. The final test captures `features list` output, splits each line on the aligned double-space separator, extracts feature names, and compares the observed order to a sorted clone, enforcing alphabetical presentation without hard-coding the feature set. Together these tests validate CLI UX, config persistence format, and stable output ordering.
+These are integration tests, meaning they do not call the internal Rust code directly. Instead, they start the real `codex` command-line tool in a temporary home folder and inspect what it prints, whether it succeeds or fails, and what files it writes. The temporary folder acts like a clean user profile, so each test starts with no existing configuration and cannot disturb a real user's files.
+
+The helper `codex_command` builds a command for the compiled `codex` binary and points `CODEX_HOME` at that temporary folder. The tests then exercise real user commands such as `features enable unified_exec`, `features disable shell_tool`, and `features list`.
+
+Several tests protect important user-facing behavior. Strict config mode must reject unknown settings, but it must also clearly say when it is not supported for `codex cloud`. Feature enable and disable commands must update `config.toml` with a `[features]` section and the right true-or-false value. Under-development features must print a warning so users know they are opting into something less stable. Finally, the feature list must appear in alphabetical order, which keeps the output predictable and easy to scan.
 
 #### Function details
 
@@ -273,11 +297,11 @@ This file groups several end-to-end tests around the `codex features` command fa
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates a reusable `codex` subprocess command rooted at a temporary `CODEX_HOME`.
+**Purpose**: This helper creates a ready-to-run `codex` command for the tests. It also points the command at a temporary `CODEX_HOME`, so the test uses an isolated fake user directory instead of the real one.
 
-**Data flow**: Accepts a path, resolves the cargo-built `codex` binary, constructs an `assert_cmd::Command`, sets `CODEX_HOME`, and returns the configured command.
+**Data flow**: It receives the path to a temporary Codex home folder. It finds the built `codex` executable, creates a command object for it, adds the `CODEX_HOME` environment variable, and returns that prepared command or an error if the binary cannot be found.
 
-**Call relations**: All six scenario tests in this file call this helper before adding their specific arguments, making command setup consistent across validation, mutation, and listing cases.
+**Call relations**: All the tests call this helper before running `codex`. It hides the repeated setup work, so each test can focus on the command arguments and the expected result.
 
 *Call graph*: called by 6 (features_disable_writes_feature_flag_to_config, features_enable_under_development_feature_prints_warning, features_enable_writes_feature_flag_to_config, features_list_is_sorted_alphabetically_by_feature_name, strict_config_is_not_supported_for_cloud_command, strict_config_rejects_unknown_config_override); 2 external calls (new, cargo_bin).
 
@@ -288,11 +312,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn strict_config_rejects_unknown_config_override() -> Result<()>
 ```
 
-**Purpose**: Checks that an unknown `-c` configuration override is rejected when `--strict-config` is used with a regular command.
+**Purpose**: This test checks that strict configuration mode refuses an unknown config override. That matters because strict mode is meant to catch typos or unsupported settings instead of silently ignoring them.
 
-**Data flow**: Creates a temp home, builds a command with `codex_command`, runs `--strict-config -c foo=bar mcp-server`, and asserts process failure with stderr containing `unknown configuration field`.
+**Data flow**: It creates a fresh temporary Codex home, builds a `codex` command with `codex_command`, and runs `codex --strict-config -c foo=bar mcp-server`. The expected result is failure, with an error message saying there is an unknown configuration field.
 
-**Call relations**: This test uses the shared helper and focuses on strict override parsing rather than file-based config. It complements the server-specific strict-config tests elsewhere by covering command-line overrides.
+**Call relations**: It relies on `codex_command` for the isolated command setup. It then uses the command assertion tools to run the CLI and check the failure text printed to standard error.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -303,11 +327,11 @@ fn strict_config_rejects_unknown_config_override() -> Result<()>
 fn strict_config_is_not_supported_for_cloud_command() -> Result<()>
 ```
 
-**Purpose**: Verifies that `codex cloud` rejects `--strict-config` with a dedicated unsupported-message instead of attempting strict parsing.
+**Purpose**: This test checks that `--strict-config` gives a clear error when used with `codex cloud`. The goal is to prevent users from thinking strict config checking applies there when it does not.
 
-**Data flow**: Creates a temp home, obtains a command from `codex_command`, runs `--strict-config -c foo=bar cloud list`, and asserts failure with stderr containing the explicit unsupported text for `codex cloud`.
+**Data flow**: It starts with a fresh temporary Codex home, prepares the command, and runs `codex --strict-config -c foo=bar cloud list`. The command should fail and print a message explaining that `--strict-config` is not supported for `codex cloud`.
 
-**Call relations**: This test shares setup with the other strict-config case but validates a different control-flow branch: cloud commands short-circuit with a feature-support error rather than generic config-field validation.
+**Call relations**: Like the other CLI tests, it calls `codex_command` to prepare the binary and environment. It then hands control to the external command assertion library, which runs the command and checks the printed error.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -318,11 +342,11 @@ fn strict_config_is_not_supported_for_cloud_command() -> Result<()>
 async fn features_enable_writes_feature_flag_to_config() -> Result<()>
 ```
 
-**Purpose**: Ensures `features enable` persists the selected feature as `true` in `config.toml` and reports success to the user.
+**Purpose**: This test verifies that enabling a feature through the CLI actually saves that choice in `config.toml`. Without this, the command might appear to work but the setting would not persist for later runs.
 
-**Data flow**: Creates a temp home, runs `codex features enable unified_exec`, asserts success and a stdout confirmation message, then reads `config.toml` from disk and checks that it contains both a `[features]` section and `unified_exec = true`.
+**Data flow**: It creates a clean temporary Codex home, runs `codex features enable unified_exec`, and expects a success message. Then it reads the generated `config.toml` file and checks that it contains a `[features]` section and `unified_exec = true`.
 
-**Call relations**: This test invokes the shared command helper and then validates the command’s side effect by reading the generated config file, tying CLI output to actual persisted state.
+**Call relations**: It uses `codex_command` to run the real CLI in an isolated folder. After the command succeeds, it switches from command-output checking to file checking by reading the config file from that same temporary home.
 
 *Call graph*: calls 1 internal fn (codex_command); 4 external calls (new, assert!, contains, read_to_string).
 
@@ -333,11 +357,11 @@ async fn features_enable_writes_feature_flag_to_config() -> Result<()>
 async fn features_disable_writes_feature_flag_to_config() -> Result<()>
 ```
 
-**Purpose**: Ensures `features disable` persists the selected feature as `false` in `config.toml` and reports success.
+**Purpose**: This test verifies that disabling a feature through the CLI saves a false value in `config.toml`. This makes sure users can explicitly turn a feature off and have that choice remembered.
 
-**Data flow**: Creates a temp home, runs `codex features disable shell_tool`, asserts success and the expected stdout message, reads `config.toml`, and checks for a `[features]` table containing `shell_tool = false`.
+**Data flow**: It creates a temporary Codex home, runs `codex features disable shell_tool`, and expects a success message. It then reads `config.toml` and checks for both the `[features]` section and `shell_tool = false`.
 
-**Call relations**: This test is the disable-path counterpart to `features_enable_writes_feature_flag_to_config`, using the same helper and file-readback pattern to verify persisted configuration.
+**Call relations**: It follows the same outside-in pattern as the enable test: `codex_command` prepares the real CLI command, the assertion tools check the command result, and a direct file read confirms the lasting config change.
 
 *Call graph*: calls 1 internal fn (codex_command); 4 external calls (new, assert!, contains, read_to_string).
 
@@ -348,11 +372,11 @@ async fn features_disable_writes_feature_flag_to_config() -> Result<()>
 async fn features_enable_under_development_feature_prints_warning() -> Result<()>
 ```
 
-**Purpose**: Checks that enabling an under-development feature succeeds but emits a warning on stderr naming that feature.
+**Purpose**: This test checks that enabling an experimental or under-development feature warns the user. That warning is important because it tells users the feature may be less stable or still changing.
 
-**Data flow**: Creates a temp home, runs `codex features enable runtime_metrics`, and asserts successful exit plus stderr containing `Under-development features enabled: runtime_metrics.`.
+**Data flow**: It creates a clean temporary Codex home, runs `codex features enable runtime_metrics`, and expects the command to succeed. It then checks standard error for a warning that `runtime_metrics` is an under-development feature.
 
-**Call relations**: This test uses `codex_command` and focuses on user-facing warning behavior rather than file contents, covering a special-case branch in feature enabling.
+**Call relations**: It uses `codex_command` for the normal isolated CLI setup. The command assertion library runs the feature-enable command and checks the warning text that the CLI sends to standard error.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -363,11 +387,11 @@ async fn features_enable_under_development_feature_prints_warning() -> Result<()
 async fn features_list_is_sorted_alphabetically_by_feature_name() -> Result<()>
 ```
 
-**Purpose**: Verifies that `features list` prints feature rows ordered alphabetically by feature name.
+**Purpose**: This test makes sure `codex features list` prints feature names in alphabetical order. Sorted output is easier for people to scan and makes automated output checks more predictable.
 
-**Data flow**: Creates a temp home, runs `codex features list`, captures stdout bytes from the successful assertion result, decodes them to `String`, splits output into lines, extracts the feature name from each line by splitting on the aligned double-space separator, collects the names into a vector, clones and sorts that vector, and asserts the original order matches the sorted order.
+**Data flow**: It creates a temporary Codex home, runs `codex features list`, and captures the command's standard output. It turns the output bytes into text, extracts the feature name from each line, makes a sorted copy of those names, and checks that the original order already matches the sorted order.
 
-**Call relations**: This test uses the shared helper but differs from the others by inspecting formatted listing output. It depends on the command’s column alignment convention to parse names and then enforces ordering as a presentation invariant.
+**Call relations**: It starts with `codex_command` like the other tests, then inspects the full command output instead of only checking for one phrase. It uses the equality assertion to compare the actual feature order with the alphabetically sorted version.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (from_utf8, new, assert_eq!).
 
@@ -377,11 +401,13 @@ These tests exercise plugin and marketplace command behavior from broad listing/
 
 ### `cli/tests/plugin_cli.rs`
 
-`test` · `Comprehensive CLI integration testing for plugin and marketplace workflows`
+`test` · `test run`
 
-This is the main end-to-end test suite for the plugin subsystem’s CLI. It defines a large set of fixture builders that create temporary Codex homes, marketplace manifests, plugin manifests, and config entries. The helpers distinguish configured local marketplaces, unconfigured repo-local marketplaces, malformed or missing manifests, marketplaces with explicit empty product policies, and implicit system roots under bundled/runtime directories. `codex_command` and `codex_command_in` launch the built binary with isolated `CODEX_HOME`; `HOME` is also set so tests can control discovery of a home marketplace independently from Codex config.
+This is an integration test file: instead of calling internal Rust functions directly, it launches the real `codex` command and watches what happens. The tests build small fake plugin marketplaces in temporary folders. A marketplace is a folder with a manifest file that says which plugins exist, and each plugin has its own small `plugin.json` file. The tests also write a temporary Codex config file with plugins enabled, so they do not touch the developer’s real machine.
 
-The file validates marketplace listing in text and JSON forms, including how configured source metadata is attached by root, how home marketplaces appear, and how malformed or invalid configured marketplaces fail. It separately validates plugin listing, ensuring available plugins only appear in JSON with `--available`, installed plugins report enabled state and version, cached-but-unconfigured plugins hide version information, and unconfigured repo-local marketplaces are excluded from discovery. Installation/removal tests verify config mutations in `config.toml`, JSON result payloads, reinstall behavior, and removal after the marketplace itself has been deleted. Several tests pin down subtle policy decisions: configured marketplace snapshots are authoritative for plugin add, cached plugin files alone are insufficient after marketplace removal, implicit system roots without manifests are ignored, but custom marketplaces under those roots still error. The suite therefore documents both the happy path and many edge conditions around marketplace provenance and plugin authorization.
+The file checks two main areas. First, marketplace listing: Codex should show configured marketplaces, include the user’s home marketplace when present, output stable JSON when asked, and report clear errors when a marketplace is missing, malformed, or wrongly configured. Second, plugin listing, adding, and removing: Codex should show available and installed plugins correctly, copy installed plugins into its cache, update the config file, and refuse unsafe cases such as using an unconfigured local repository as an authority.
+
+A helpful way to read this file is as a set of “user stories” backed by disposable test data. The helper functions are the stage crew: they create fake homes, fake marketplaces, and expected rows. The test functions are the audience checks: they run commands and verify that Codex says and changes exactly what it should.
 
 #### Function details
 
@@ -391,11 +417,11 @@ The file validates marketplace listing in text and JSON forms, including how con
 fn marketplace_list_row(marketplace_name: &str, root: &Path) -> String
 ```
 
-**Purpose**: Formats one expected text-table row for marketplace listing output using the same column width as the `MARKETPLACE` header.
+**Purpose**: Builds the exact table row expected in `plugin marketplace list` output. It keeps spacing consistent so tests can compare human-readable command output without guessing.
 
-**Data flow**: It takes `marketplace_name` and `root`, interpolates them into a left-aligned string with width equal to `MARKETPLACE_HEADER.len()`, and returns the formatted row string.
+**Data flow**: It receives a marketplace name and a root folder path. It pads the name to match the table header width, appends the displayed path, and returns the resulting string.
 
-**Call relations**: Several marketplace list tests call it to build exact expected substrings for stdout assertions, avoiding duplicated formatting logic in the tests.
+**Call relations**: Marketplace-listing tests call this before running Codex, then use the returned row as the expected text that should appear in standard output.
 
 *Call graph*: called by 3 (marketplace_list_includes_home_marketplace_when_present, marketplace_list_includes_root_when_plugins_are_filtered_out, marketplace_list_shows_configured_marketplace_names); 1 external calls (format!).
 
@@ -406,11 +432,11 @@ fn marketplace_list_row(marketplace_name: &str, root: &Path) -> String
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Constructs an `assert_cmd::Command` for the `codex` binary with both `CODEX_HOME` and `HOME` pointed at the test home by default.
+**Purpose**: Creates a ready-to-run test command for the real `codex` binary. It points Codex at a temporary home folder so tests are isolated from the user’s real configuration.
 
-**Data flow**: It accepts `codex_home`, resolves the binary path, creates the command, sets `CODEX_HOME`, sets `HOME` to the same path, and returns the configured command.
+**Data flow**: It receives a temporary Codex home path. It finds the compiled `codex` executable, builds a command object, sets `CODEX_HOME` and `HOME` to the test folder, and returns that command or an error.
 
-**Call relations**: Most tests in the file call this helper directly. Setting `HOME` here makes home-marketplace discovery deterministic unless a test overrides `HOME` explicitly.
+**Call relations**: Almost every test calls this when it is ready to run a CLI command. `codex_command_in` also builds on it when a test needs to run from a specific current directory.
 
 *Call graph*: called by 29 (codex_command_in, marketplace_list_fails_when_configured_local_marketplace_source_is_missing, marketplace_list_fails_when_configured_marketplace_name_is_invalid, marketplace_list_fails_when_configured_marketplace_snapshot_is_malformed, marketplace_list_fails_when_configured_marketplace_snapshot_is_missing, marketplace_list_fails_when_home_marketplace_is_malformed, marketplace_list_includes_home_marketplace_when_present, marketplace_list_includes_root_when_plugins_are_filtered_out, marketplace_list_json_includes_configured_git_marketplace_source, marketplace_list_json_keys_configured_source_by_root (+15 more)); 2 external calls (new, cargo_bin).
 
@@ -421,11 +447,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn codex_command_in(codex_home: &Path, current_dir: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates a Codex command like `codex_command` but also fixes the process current working directory.
+**Purpose**: Creates a `codex` command that runs from a chosen working directory. This is useful for tests that need to check whether Codex treats the current repository as a local marketplace.
 
-**Data flow**: It takes `codex_home` and `current_dir`, obtains a command from `codex_command`, sets `.current_dir(current_dir)`, and returns it.
+**Data flow**: It receives a Codex home path and a current directory path. It first creates the normal isolated command, then changes that command’s working directory, and returns it.
 
-**Call relations**: The tests for unconfigured repo-local marketplaces use this helper so the CLI runs inside the marketplace source tree and can prove that repo-local discovery is not enough for configured plugin operations.
+**Call relations**: Tests for unconfigured local marketplaces use this to stand inside a fake marketplace folder before running `plugin list` or `plugin add`.
 
 *Call graph*: calls 1 internal fn (codex_command); called by 2 (plugin_add_rejects_unconfigured_repo_local_marketplaces, plugin_list_excludes_unconfigured_repo_local_marketplaces).
 
@@ -436,11 +462,11 @@ fn codex_command_in(codex_home: &Path, current_dir: &Path) -> Result<assert_cmd:
 fn configured_local_marketplace(source: &str) -> MarketplaceConfigUpdate<'_>
 ```
 
-**Purpose**: Builds a reusable `MarketplaceConfigUpdate` fixture for a local marketplace source path.
+**Purpose**: Builds a small configuration record that says a marketplace comes from a local folder. Tests use it when they want Codex to trust a temporary marketplace source.
 
-**Data flow**: It takes a source string and returns `MarketplaceConfigUpdate` with fixed timestamp, `source_type: "local"`, the supplied `source`, no `ref_name`, and empty `sparse_paths`.
+**Data flow**: It receives a source path as text. It returns a marketplace update object with fixed test metadata, source type `local`, that source path, and no revision or sparse paths.
 
-**Call relations**: Multiple setup helpers call it before passing the result to `record_user_marketplace`, centralizing the shape of configured local marketplace entries.
+**Call relations**: Setup helpers pass this object to `record_user_marketplace`, which writes the fake marketplace into the temporary Codex config.
 
 *Call graph*: called by 6 (setup_configured_marketplace_with_malformed_manifest, setup_configured_marketplace_without_manifest, setup_custom_marketplace_under_implicit_system_root, setup_local_marketplace, setup_local_marketplace_with_explicit_empty_products, setup_local_marketplace_with_implicit_system_roots).
 
@@ -451,13 +477,11 @@ fn configured_local_marketplace(source: &str) -> MarketplaceConfigUpdate<'_>
 fn write_plugins_enabled_config(codex_home: &Path) -> Result<()>
 ```
 
-**Purpose**: Writes a minimal `config.toml` that enables the plugin feature flag.
+**Purpose**: Writes the minimum Codex config needed to turn the plugins feature on. Without this, the CLI tests would not be exercising the plugin commands under normal enabled conditions.
 
-**Data flow**: It takes `codex_home`, writes `[features]
-plugins = true
-` to `CONFIG_TOML_FILE` under that directory, and returns `Ok(())`.
+**Data flow**: It receives the temporary Codex home path. It writes a config file containing a `[features]` section with `plugins = true`, then returns success or a file error.
 
-**Call relations**: Most setup helpers call this before creating marketplaces so plugin-related CLI commands run with plugins enabled.
+**Call relations**: Most setup helpers call this before creating or recording marketplaces, so later CLI commands run with plugin support enabled.
 
 *Call graph*: called by 11 (marketplace_list_fails_when_home_marketplace_is_malformed, marketplace_list_includes_home_marketplace_when_present, marketplace_list_json_includes_configured_git_marketplace_source, marketplace_list_json_keys_configured_source_by_root, plugin_list_json_includes_configured_git_marketplace_source, setup_configured_marketplace_with_malformed_manifest, setup_configured_marketplace_without_manifest, setup_custom_marketplace_under_implicit_system_root, setup_local_marketplace, setup_local_marketplace_with_explicit_empty_products (+1 more)); 2 external calls (join, write).
 
@@ -468,11 +492,11 @@ plugins = true
 fn write_marketplace_source_with_manifest(source: &Path, marketplace_manifest: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a marketplace directory tree and writes caller-supplied marketplace manifest contents plus a fixed sample plugin manifest.
+**Purpose**: Creates a fake marketplace folder using a manifest string supplied by the caller. It also creates a sample plugin folder and plugin metadata so Codex has something real to discover.
 
-**Data flow**: It takes `source` and `marketplace_manifest`, creates `.agents/plugins` and `plugins/sample/.codex-plugin`, writes the provided marketplace JSON to `.agents/plugins/marketplace.json`, writes a fixed plugin manifest containing name `sample`, version `1.2.3`, and description `Sample plugin`, and returns `Ok(())`.
+**Data flow**: It receives a source directory and marketplace manifest text. It creates the manifest and plugin directories, writes `marketplace.json`, writes the sample plugin’s `plugin.json`, and returns success or an I/O error.
 
-**Call relations**: The two marketplace-writing helpers delegate to this function so tests can vary only the marketplace manifest while reusing the same plugin fixture.
+**Call relations**: The two marketplace-writing helpers call this with either a normal manifest or a manifest whose product policy filters out plugins.
 
 *Call graph*: called by 2 (write_marketplace_source, write_marketplace_source_with_explicit_empty_products); 3 external calls (join, create_dir_all, write).
 
@@ -483,11 +507,11 @@ fn write_marketplace_source_with_manifest(source: &Path, marketplace_manifest: &
 fn write_marketplace_source(source: &Path) -> Result<()>
 ```
 
-**Purpose**: Creates the standard valid marketplace fixture used by most plugin and marketplace tests.
+**Purpose**: Creates the standard fake marketplace used by most tests. It contains one marketplace named `debug` and one plugin named `sample`.
 
-**Data flow**: It takes a source path and delegates to `write_marketplace_source_with_manifest` with a manifest naming marketplace `debug` and one local plugin source at `./plugins/sample`.
+**Data flow**: It receives a directory path. It passes that path and a normal marketplace manifest to the lower-level writer, which creates the files on disk.
 
-**Call relations**: Many setup helpers and direct tests call it to create a normal marketplace snapshot before recording config or invoking the CLI.
+**Call relations**: General setup helpers and several JSON-specific tests use this when they need a valid marketplace source before running Codex.
 
 *Call graph*: calls 1 internal fn (write_marketplace_source_with_manifest); called by 6 (marketplace_list_includes_home_marketplace_when_present, marketplace_list_json_includes_configured_git_marketplace_source, marketplace_list_json_keys_configured_source_by_root, plugin_list_json_includes_configured_git_marketplace_source, setup_local_marketplace, setup_unconfigured_local_marketplace).
 
@@ -498,11 +522,11 @@ fn write_marketplace_source(source: &Path) -> Result<()>
 fn write_marketplace_source_with_explicit_empty_products(source: &Path) -> Result<()>
 ```
 
-**Purpose**: Creates a valid marketplace fixture whose plugin policy explicitly sets an empty `products` list.
+**Purpose**: Creates a fake marketplace where the plugin has an explicit empty product list. This lets tests check that the marketplace root still appears even if plugin filtering removes visible plugins.
 
-**Data flow**: It takes a source path and delegates to `write_marketplace_source_with_manifest` with a manifest identical to the standard one except for `policy.products: []` on the sample plugin.
+**Data flow**: It receives a directory path. It writes a marketplace manifest with the sample plugin and an empty `products` policy, plus the sample plugin metadata.
 
-**Call relations**: Only the setup helper for the filtered-products scenario calls this, allowing one test to verify marketplace roots still appear even when no plugins are installable.
+**Call relations**: The setup helper for filtered plugins calls this, and the marketplace list test then confirms the root is still listed.
 
 *Call graph*: calls 1 internal fn (write_marketplace_source_with_manifest); called by 1 (setup_local_marketplace_with_explicit_empty_products).
 
@@ -513,11 +537,11 @@ fn write_marketplace_source_with_explicit_empty_products(source: &Path) -> Resul
 fn setup_local_marketplace() -> Result<(TempDir, TempDir)>
 ```
 
-**Purpose**: Builds the standard configured local marketplace test fixture and returns both the Codex home and marketplace source tempdirs.
+**Purpose**: Prepares the common happy-path test world: plugins are enabled, a valid marketplace exists, and Codex is configured to know about it.
 
-**Data flow**: It creates temporary `codex_home` and `source` directories, writes plugin-enabled config, writes the standard marketplace source, converts the source path to an owned string, records marketplace `debug` in config using `record_user_marketplace` and `configured_local_marketplace`, and returns `(codex_home, source)`.
+**Data flow**: It creates temporary Codex home and source directories. It writes the plugin feature config, writes the fake marketplace files, records the marketplace in the config, and returns both temporary directories.
 
-**Call relations**: This is the primary fixture factory for success-path tests covering marketplace listing, plugin listing, plugin add/remove, reinstall, and cached-plugin behavior.
+**Call relations**: Many plugin and marketplace tests call this first, then run CLI commands against the prepared home.
 
 *Call graph*: calls 3 internal fn (configured_local_marketplace, write_marketplace_source, write_plugins_enabled_config); called by 15 (marketplace_list_json_prints_configured_marketplaces, marketplace_list_shows_configured_marketplace_names, plugin_add_and_remove_updates_installed_plugin_config, plugin_add_json_prints_install_outcome, plugin_add_reinstalls_from_configured_marketplace_snapshot, plugin_add_rejects_cached_plugins_without_authorizing_marketplace_snapshot, plugin_list_available_requires_json, plugin_list_hides_version_for_cached_but_unconfigured_plugin, plugin_list_json_prints_available_plugins_when_requested, plugin_list_json_prints_installed_plugins (+5 more)); 2 external calls (new, record_user_marketplace).
 
@@ -528,11 +552,11 @@ fn setup_local_marketplace() -> Result<(TempDir, TempDir)>
 fn setup_unconfigured_local_marketplace() -> Result<(TempDir, TempDir)>
 ```
 
-**Purpose**: Creates a valid local marketplace on disk without recording it in Codex config.
+**Purpose**: Creates a valid marketplace on disk but does not record it in Codex config. This models a local folder that exists but has not been trusted by the user.
 
-**Data flow**: It creates temporary `codex_home` and `source`, writes plugin-enabled config, writes the standard marketplace source, and returns both tempdirs without calling `record_user_marketplace`.
+**Data flow**: It creates temporary Codex home and source directories, enables plugins, writes the marketplace files, and returns both directories without registering the marketplace.
 
-**Call relations**: Tests that prove unconfigured repo-local marketplaces are excluded from plugin discovery or installation call this helper.
+**Call relations**: Tests for rejecting unconfigured repository-local marketplaces use this before running Codex from inside the source folder.
 
 *Call graph*: calls 2 internal fn (write_marketplace_source, write_plugins_enabled_config); called by 2 (plugin_add_rejects_unconfigured_repo_local_marketplaces, plugin_list_excludes_unconfigured_repo_local_marketplaces); 1 external calls (new).
 
@@ -543,11 +567,11 @@ fn setup_unconfigured_local_marketplace() -> Result<(TempDir, TempDir)>
 fn setup_local_marketplace_with_explicit_empty_products() -> Result<(TempDir, TempDir)>
 ```
 
-**Purpose**: Creates a configured local marketplace whose plugin manifest policy filters out all products.
+**Purpose**: Builds a configured marketplace whose plugin is filtered out by policy. It is used to prove that marketplace listing is about roots, not only visible plugins.
 
-**Data flow**: It creates temporary home and source directories, writes plugin-enabled config, writes the explicit-empty-products marketplace source, records marketplace `debug` as a configured local marketplace, and returns `(codex_home, source)`.
+**Data flow**: It creates temporary home and source folders, enables plugins, writes the special manifest with an empty product list, records the marketplace, and returns the folders.
 
-**Call relations**: The marketplace list test for filtered-out plugins uses this helper to show that marketplace roots are still listed even when no plugins survive policy filtering.
+**Call relations**: The test for listing roots with filtered plugins calls this and then checks that the marketplace still appears.
 
 *Call graph*: calls 3 internal fn (configured_local_marketplace, write_marketplace_source_with_explicit_empty_products, write_plugins_enabled_config); called by 1 (marketplace_list_includes_root_when_plugins_are_filtered_out); 2 external calls (new, record_user_marketplace).
 
@@ -558,11 +582,11 @@ fn setup_local_marketplace_with_explicit_empty_products() -> Result<(TempDir, Te
 fn setup_configured_marketplace_without_manifest() -> Result<(TempDir, TempDir)>
 ```
 
-**Purpose**: Creates a configured local marketplace entry whose source directory lacks any marketplace manifest.
+**Purpose**: Creates a marketplace configuration pointing at an empty source folder. This gives tests a controlled missing-manifest failure.
 
-**Data flow**: It creates temporary home and source directories, writes plugin-enabled config, records marketplace `debug` pointing at the empty source directory, and returns both tempdirs.
+**Data flow**: It creates temporary home and source folders, enables plugins, records the source as a marketplace, but intentionally writes no marketplace manifest. It returns both folders.
 
-**Call relations**: Failure tests for marketplace and plugin listing call this helper to drive the missing-manifest error path for configured marketplace snapshots.
+**Call relations**: Marketplace and plugin listing failure tests use this setup, then verify that Codex reports the missing supported manifest clearly.
 
 *Call graph*: calls 2 internal fn (configured_local_marketplace, write_plugins_enabled_config); called by 2 (marketplace_list_fails_when_configured_marketplace_snapshot_is_missing, plugin_list_fails_when_configured_marketplace_snapshot_is_missing); 2 external calls (new, record_user_marketplace).
 
@@ -573,11 +597,11 @@ fn setup_configured_marketplace_without_manifest() -> Result<(TempDir, TempDir)>
 fn setup_configured_marketplace_with_malformed_manifest() -> Result<(TempDir, TempDir)>
 ```
 
-**Purpose**: Creates a configured local marketplace entry whose `marketplace.json` exists but contains invalid JSON.
+**Purpose**: Creates a marketplace whose manifest file exists but is invalid JSON. This checks that Codex reports bad marketplace files instead of silently ignoring them.
 
-**Data flow**: It creates temporary home and source directories, writes plugin-enabled config, creates `.agents/plugins`, writes `{not valid json` to `marketplace.json`, records marketplace `debug` pointing at that source, and returns both tempdirs.
+**Data flow**: It creates temporary folders, enables plugins, writes a broken `marketplace.json`, records the marketplace, and returns the home and source directories.
 
-**Call relations**: Malformed-snapshot tests for marketplace listing and plugin add use this helper to trigger parse failures while keeping the marketplace configured.
+**Call relations**: Failure tests for listing and adding plugins call this before checking that the CLI explains the parse error.
 
 *Call graph*: calls 2 internal fn (configured_local_marketplace, write_plugins_enabled_config); called by 2 (marketplace_list_fails_when_configured_marketplace_snapshot_is_malformed, plugin_add_fails_when_configured_marketplace_snapshot_is_malformed); 4 external calls (new, record_user_marketplace, create_dir_all, write).
 
@@ -588,11 +612,11 @@ fn setup_configured_marketplace_with_malformed_manifest() -> Result<(TempDir, Te
 fn setup_local_marketplace_with_implicit_system_roots() -> Result<(TempDir, TempDir, TempDir)>
 ```
 
-**Purpose**: Creates one normal configured marketplace plus two additional configured marketplaces under implicit bundled/runtime system root patterns.
+**Purpose**: Creates one normal configured marketplace plus fake system marketplace roots that have no manifests. This tests that Codex ignores missing manifests in special built-in locations.
 
-**Data flow**: It starts from `setup_local_marketplace`, creates a bundled root under `codex_home/.tmp/bundled-marketplaces/openai-bundled`, records it as a configured local marketplace, creates a separate `cache_home` tempdir with a runtime root under `codex-runtimes/.../plugins/openai-primary-runtime`, records that as another configured local marketplace, and returns `(codex_home, source, cache_home)`.
+**Data flow**: It starts with the standard local marketplace. Then it creates bundled and runtime marketplace directories under locations Codex treats specially, records them, creates a temporary cache home, and returns all needed folders.
 
-**Call relations**: The plugin list test for implicit system roots uses this helper to prove missing manifests under recognized system-root names are ignored rather than treated as fatal snapshot failures.
+**Call relations**: The system-root test calls this and then runs `plugin list` with `XDG_CACHE_HOME` set, expecting the normal marketplace to work and the empty system roots not to cause an error.
 
 *Call graph*: calls 2 internal fn (configured_local_marketplace, setup_local_marketplace); called by 1 (plugin_list_ignores_implicit_system_marketplace_roots_without_manifests); 3 external calls (new, record_user_marketplace, create_dir_all).
 
@@ -603,11 +627,11 @@ fn setup_local_marketplace_with_implicit_system_roots() -> Result<(TempDir, Temp
 fn setup_custom_marketplace_under_implicit_system_root() -> Result<(TempDir, std::path::PathBuf)>
 ```
 
-**Purpose**: Creates a configured marketplace under the bundled-marketplaces directory pattern but with a custom name that should not receive implicit-system-root leniency.
+**Purpose**: Creates a custom marketplace under a path that resembles a built-in system marketplace area. This checks that only known system roots get lenient missing-manifest treatment.
 
-**Data flow**: It creates a temporary home, writes plugin-enabled config, creates `.tmp/bundled-marketplaces/custom-marketplace`, records that path as a configured local marketplace named `custom-marketplace`, and returns `(codex_home, custom_root)`.
+**Data flow**: It creates a temporary Codex home, enables plugins, creates a custom marketplace directory under `.tmp/bundled-marketplaces`, records it, and returns the home and custom path.
 
-**Call relations**: The corresponding failure test uses this helper to show that only recognized implicit system marketplaces are ignored when missing manifests; custom ones still produce errors.
+**Call relations**: The matching failure test uses this setup, then verifies that Codex still errors because the marketplace is custom and lacks a manifest.
 
 *Call graph*: calls 2 internal fn (configured_local_marketplace, write_plugins_enabled_config); called by 1 (plugin_list_fails_for_custom_marketplace_under_system_root); 3 external calls (new, record_user_marketplace, create_dir_all).
 
@@ -618,11 +642,11 @@ fn setup_custom_marketplace_under_implicit_system_root() -> Result<(TempDir, std
 fn remove_installed_plugin_config(codex_home: &Path, plugin_key: &str) -> Result<()>
 ```
 
-**Purpose**: Deletes a specific `[plugins."..."]` section from `config.toml` while leaving the rest of the file intact.
+**Purpose**: Edits the test config to remove one installed plugin section while leaving cached plugin files on disk. This simulates a plugin that is present in the cache but no longer configured as installed.
 
-**Data flow**: It takes `codex_home` and `plugin_key`, reads `CONFIG_TOML_FILE` as text, computes the exact plugin section header string, iterates line-by-line while toggling a `skipping` flag from that header until the next section header, collects all non-skipped lines, rewrites the config file with the remaining lines plus a trailing newline, and returns `Ok(())`.
+**Data flow**: It receives a Codex home path and plugin key. It reads the config file, skips the matching plugin table and its lines, writes the rewritten config back, and returns success or a file error.
 
-**Call relations**: Only the cached-but-unconfigured plugin test calls this helper after installing a plugin, creating the state where plugin files remain cached on disk but the plugin is no longer configured.
+**Call relations**: The cached-but-unconfigured listing test calls this after installing a plugin, then checks how `plugin list` displays the leftover cache entry.
 
 *Call graph*: called by 1 (plugin_list_hides_version_for_cached_but_unconfigured_plugin); 5 external calls (join, new, format!, read_to_string, write).
 
@@ -633,11 +657,11 @@ fn remove_installed_plugin_config(codex_home: &Path, plugin_key: &str) -> Result
 fn setup_configured_local_marketplace_with_missing_source() -> Result<TempDir>
 ```
 
-**Purpose**: Creates a malformed config entry for a local marketplace that omits the required `source` field.
+**Purpose**: Writes a deliberately incomplete marketplace config that says the source type is local but omits the source path. This lets the CLI error message be tested.
 
-**Data flow**: It creates a temporary home, writes a `config.toml` containing `[features] plugins = true` and `[marketplaces.debug] source_type = "local"` but no `source`, and returns the tempdir.
+**Data flow**: It creates a temporary Codex home and writes a config with plugins enabled and `[marketplaces.debug]` missing its `source`. It returns the home directory.
 
-**Call relations**: The marketplace list failure test for missing local source uses this helper to trigger config-validation logic before any filesystem lookup.
+**Call relations**: The marketplace list failure test calls this before running Codex and checking for the missing-source message.
 
 *Call graph*: called by 1 (marketplace_list_fails_when_configured_local_marketplace_source_is_missing); 2 external calls (new, write).
 
@@ -648,11 +672,11 @@ fn setup_configured_local_marketplace_with_missing_source() -> Result<TempDir>
 fn setup_configured_local_marketplace_with_invalid_name() -> Result<TempDir>
 ```
 
-**Purpose**: Creates a malformed config entry whose marketplace table key contains an invalid marketplace name (`bad/name`).
+**Purpose**: Writes a marketplace config with an invalid name containing a slash. This checks that Codex validates names before trusting marketplace configuration.
 
-**Data flow**: It creates a temporary home and writes a `config.toml` enabling plugins and defining `[marketplaces."bad/name"]` with `source_type = "local"` and `source = "/tmp/debug"`, then returns the tempdir.
+**Data flow**: It creates a temporary Codex home and writes a config with plugins enabled and a marketplace named `bad/name`. It returns the home directory.
 
-**Call relations**: The invalid-name marketplace list test uses this helper to exercise marketplace-name validation on configured entries.
+**Call relations**: The invalid-name marketplace list test uses this setup and then checks that the CLI points to the bad marketplace name.
 
 *Call graph*: called by 1 (marketplace_list_fails_when_configured_marketplace_name_is_invalid); 2 external calls (new, write).
 
@@ -667,11 +691,11 @@ fn assert_configured_marketplace_snapshot_failure(
 )
 ```
 
-**Purpose**: Encapsulates the common stderr assertions for failures loading configured marketplace snapshots.
+**Purpose**: Checks a common failure shape for commands that load configured marketplace snapshots. It avoids repeating the same error-message assertions in several tests.
 
-**Data flow**: It takes an `assert_cmd::assert::Assert`, a `source` path, and a detail string, then chains assertions requiring failure and stderr substrings for the configured-snapshot failure prefix, marketplace name ``debug``, the source path display string, and the supplied detail.
+**Data flow**: It receives a command assertion, the source path, and an expected detail message. It marks the command as expected to fail and checks standard error for the shared heading, marketplace name, path, and detail.
 
-**Call relations**: Two plugin-oriented failure tests call this helper to keep their malformed/missing configured-snapshot assertions consistent.
+**Call relations**: Plugin-list and plugin-add failure tests call this after running Codex against missing or malformed configured marketplace snapshots.
 
 *Call graph*: called by 2 (plugin_add_fails_when_configured_marketplace_snapshot_is_malformed, plugin_list_fails_when_configured_marketplace_snapshot_is_missing); 3 external calls (failure, display, contains).
 
@@ -687,11 +711,11 @@ fn assert_marketplace_failure(
 )
 ```
 
-**Purpose**: Encapsulates the common stderr assertions for failures loading marketplaces in general, parameterized by marketplace name and source path.
+**Purpose**: Checks a common failure shape for marketplace loading errors. It makes sure the CLI names the marketplace, shows the source path, and includes the important detail.
 
-**Data flow**: It takes an `Assert`, `marketplace_name`, `source`, and `detail`, then asserts failure and stderr substrings for the generic marketplace-load failure prefix, the formatted marketplace name in backticks, the source path display string, and the supplied detail.
+**Data flow**: It receives a command assertion, marketplace name, source path, and detail text. It asserts failure and verifies those pieces appear in standard error.
 
-**Call relations**: Marketplace list failure tests call this helper for invalid names, missing manifests, and malformed manifests.
+**Call relations**: Marketplace-list failure tests call this helper after running the command in broken marketplace configurations.
 
 *Call graph*: called by 3 (marketplace_list_fails_when_configured_marketplace_name_is_invalid, marketplace_list_fails_when_configured_marketplace_snapshot_is_malformed, marketplace_list_fails_when_configured_marketplace_snapshot_is_missing); 4 external calls (failure, display, format!, contains).
 
@@ -702,11 +726,11 @@ fn assert_marketplace_failure(
 async fn marketplace_list_shows_configured_marketplace_names() -> Result<()>
 ```
 
-**Purpose**: Verifies text-mode marketplace listing shows the configured marketplace name and root in a space-aligned table without tab characters.
+**Purpose**: Verifies that `codex plugin marketplace list` shows a configured marketplace in a readable table. It also checks that the table does not use tab characters.
 
-**Data flow**: It creates the standard configured marketplace fixture, computes the expected row with `marketplace_list_row`, runs `codex plugin marketplace list`, and asserts stdout contains the table header, the expected row, and no tab characters.
+**Data flow**: It creates a valid configured marketplace, builds the expected row, runs the list command, and checks for success, the table header, the row, and no tabs.
 
-**Call relations**: This async test uses the standard fixture and row formatter to validate the human-readable marketplace list output.
+**Call relations**: The test runner invokes this as an async test. It relies on the standard marketplace setup, the row-format helper, and the command launcher.
 
 *Call graph*: calls 3 internal fn (codex_command, marketplace_list_row, setup_local_marketplace); 1 external calls (contains).
 
@@ -717,11 +741,11 @@ async fn marketplace_list_shows_configured_marketplace_names() -> Result<()>
 async fn marketplace_list_json_prints_configured_marketplaces() -> Result<()>
 ```
 
-**Purpose**: Checks the JSON representation of a configured local marketplace in `plugin marketplace list --json`.
+**Purpose**: Verifies that marketplace listing can return machine-readable JSON for a configured local marketplace. This protects scripts that depend on stable output.
 
-**Data flow**: It creates the standard configured marketplace fixture, captures stdout from `plugin marketplace list --json`, parses it as `serde_json::Value`, and asserts equality with an object containing one marketplace entry with `name`, `root`, and `marketplaceSource { sourceType: "local", source: <path> }`.
+**Data flow**: It creates a configured marketplace, runs `plugin marketplace list --json`, parses standard output as JSON, and compares it to the exact expected object.
 
-**Call relations**: This async test is the JSON counterpart to the basic marketplace list text test, using the same fixture but validating structured output.
+**Call relations**: The test runner calls it; the test uses the common setup and command helper, then hands the output to JSON parsing and equality checking.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert_eq!, from_slice).
 
@@ -732,11 +756,11 @@ async fn marketplace_list_json_prints_configured_marketplaces() -> Result<()>
 async fn marketplace_list_json_includes_configured_git_marketplace_source() -> Result<()>
 ```
 
-**Purpose**: Verifies that a configured git marketplace is listed with its normalized root path and git source metadata in JSON output.
+**Purpose**: Checks that JSON marketplace output preserves the original Git source information, even though the marketplace files live in a local cache folder.
 
-**Data flow**: It creates a temporary home and marketplace root under `.tmp/marketplaces/debug`, enables plugins, writes a valid marketplace snapshot there, records a git `MarketplaceConfigUpdate`, normalizes the root path, runs `plugin marketplace list --json`, parses stdout, and asserts the JSON includes `marketplaceSource { sourceType: "git", source: <repo-url> }` alongside the normalized root.
+**Data flow**: It creates a cached marketplace root, writes marketplace files there, records a Git source URL in config, runs the JSON list command, parses the output, and compares it to the expected JSON.
 
-**Call relations**: This async test bypasses the local-marketplace setup helper to create a git-configured marketplace and validate that list output reflects configured source provenance rather than local path provenance.
+**Call relations**: The test runner invokes it. It uses config-writing and marketplace-writing helpers, then checks that the CLI connects the cached root back to the configured Git source.
 
 *Call graph*: calls 3 internal fn (codex_command, write_marketplace_source, write_plugins_enabled_config); 5 external calls (new, assert_eq!, record_user_marketplace, canonicalize_existing_preserving_symlinks, from_slice).
 
@@ -747,11 +771,11 @@ async fn marketplace_list_json_includes_configured_git_marketplace_source() -> R
 async fn marketplace_list_json_keys_configured_source_by_root() -> Result<()>
 ```
 
-**Purpose**: Checks that configured source metadata is attached only to the marketplace entry whose root matches the configured marketplace root, even when another marketplace with the same name is discovered from `HOME`.
+**Purpose**: Verifies that configured source metadata is attached to the correct marketplace root when two marketplaces share the same name. This prevents Codex from mixing up a home marketplace and a cached configured marketplace.
 
-**Data flow**: It creates separate temporary Codex home and `HOME` directories, writes valid marketplace snapshots in both the home directory and `.tmp/marketplaces/debug`, records a git marketplace config for the latter, normalizes the configured root, runs `plugin marketplace list --json` with `HOME` overridden, parses stdout, and asserts the JSON contains two `debug` entries: one for the home root without `marketplaceSource`, and one for the configured root with git source metadata.
+**Data flow**: It creates one marketplace in a fake home and another in Codex’s cached marketplace area, records the cached one as Git-sourced, runs JSON listing with the fake home, parses output, and compares both entries.
 
-**Call relations**: This async test exercises a subtle merge/discovery rule: source metadata is keyed by root, not just marketplace name.
+**Call relations**: The test runner calls it. The setup creates a possible name collision, and the CLI output is checked to ensure only the configured cached root gets `marketplaceSource`.
 
 *Call graph*: calls 3 internal fn (codex_command, write_marketplace_source, write_plugins_enabled_config); 5 external calls (new, assert_eq!, record_user_marketplace, canonicalize_existing_preserving_symlinks, from_slice).
 
@@ -762,11 +786,11 @@ async fn marketplace_list_json_keys_configured_source_by_root() -> Result<()>
 async fn marketplace_list_includes_home_marketplace_when_present() -> Result<()>
 ```
 
-**Purpose**: Verifies that a marketplace discovered from the user `HOME` directory appears in text-mode marketplace listing.
+**Purpose**: Checks that Codex discovers a marketplace placed in the user’s home directory. This supports the simple case where a user keeps a local marketplace at home.
 
-**Data flow**: It creates temporary Codex home and separate `HOME` directories, writes a valid marketplace under `HOME`, enables plugins in Codex config, computes the expected row, runs `plugin marketplace list` with `HOME` overridden, and asserts stdout contains the header, expected row, and no tabs.
+**Data flow**: It creates separate temporary Codex home and user home folders, writes a marketplace in the user home, enables plugins, runs marketplace listing with `HOME` set to that folder, and checks the table output.
 
-**Call relations**: This async test uses direct fixture creation rather than configured marketplace setup to validate home-directory marketplace discovery.
+**Call relations**: The test runner invokes it. It uses the command helper but overrides `HOME` so the CLI searches the fake user home.
 
 *Call graph*: calls 4 internal fn (codex_command, marketplace_list_row, write_marketplace_source, write_plugins_enabled_config); 2 external calls (new, contains).
 
@@ -777,11 +801,11 @@ async fn marketplace_list_includes_home_marketplace_when_present() -> Result<()>
 async fn marketplace_list_includes_root_when_plugins_are_filtered_out() -> Result<()>
 ```
 
-**Purpose**: Ensures marketplace listing still shows a marketplace root even when plugin policy filtering leaves no installable plugins.
+**Purpose**: Ensures marketplace listing still shows a marketplace even if its plugins are excluded by product policy. A marketplace root should not disappear just because no plugin is currently available.
 
-**Data flow**: It creates a configured marketplace fixture with explicit empty products, computes the expected row, runs `plugin marketplace list`, and asserts stdout contains the header and row.
+**Data flow**: It creates a configured marketplace whose sample plugin has an empty products policy, runs marketplace listing, and checks that the marketplace row appears.
 
-**Call relations**: This async test targets a subtle behavior: marketplace visibility is independent of whether any plugins remain after policy filtering.
+**Call relations**: The test runner calls it after the special setup helper creates the filtered marketplace.
 
 *Call graph*: calls 3 internal fn (codex_command, marketplace_list_row, setup_local_marketplace_with_explicit_empty_products); 1 external calls (contains).
 
@@ -792,11 +816,11 @@ async fn marketplace_list_includes_root_when_plugins_are_filtered_out() -> Resul
 async fn marketplace_list_fails_when_configured_marketplace_snapshot_is_missing() -> Result<()>
 ```
 
-**Purpose**: Checks that marketplace listing fails with a detailed error when a configured marketplace root lacks a supported manifest.
+**Purpose**: Confirms that marketplace listing fails clearly when a configured marketplace root has no supported manifest. This prevents silent acceptance of broken configuration.
 
-**Data flow**: It creates a configured marketplace pointing at an empty directory, runs `plugin marketplace list`, and passes the resulting assertion object to `assert_marketplace_failure` with the expected marketplace name, source path, and missing-manifest detail.
+**Data flow**: It creates a configured marketplace without a manifest, runs marketplace listing, and checks that the failure names the marketplace, path, and missing-manifest problem.
 
-**Call relations**: This async test uses the missing-manifest fixture and shared assertion helper to validate the configured-snapshot failure path for marketplace listing.
+**Call relations**: The test runner invokes it. It uses the missing-manifest setup and the shared marketplace failure assertion.
 
 *Call graph*: calls 3 internal fn (assert_marketplace_failure, codex_command, setup_configured_marketplace_without_manifest).
 
@@ -807,11 +831,11 @@ async fn marketplace_list_fails_when_configured_marketplace_snapshot_is_missing(
 async fn marketplace_list_fails_when_configured_marketplace_name_is_invalid() -> Result<()>
 ```
 
-**Purpose**: Verifies that an invalid configured marketplace name causes marketplace listing to fail with a validation-oriented error.
+**Purpose**: Checks that a marketplace name containing invalid characters is rejected during listing. This protects later plugin identifiers from ambiguous or unsafe names.
 
-**Data flow**: It creates a temp home whose config contains marketplace key `bad/name`, runs `plugin marketplace list`, and feeds the assertion into `assert_marketplace_failure` with marketplace name `bad/name`, synthetic source path `<invalid config>`, and detail `marketplace name`.
+**Data flow**: It writes a config with the invalid marketplace name `bad/name`, runs marketplace listing, and checks that the command fails with a marketplace-name error.
 
-**Call relations**: This async test exercises config validation before marketplace loading, using the generic marketplace-failure assertion helper.
+**Call relations**: The test runner calls it. It uses the invalid-name setup and the shared marketplace failure checker.
 
 *Call graph*: calls 3 internal fn (assert_marketplace_failure, codex_command, setup_configured_local_marketplace_with_invalid_name); 1 external calls (new).
 
@@ -822,11 +846,11 @@ async fn marketplace_list_fails_when_configured_marketplace_name_is_invalid() ->
 async fn marketplace_list_fails_when_configured_local_marketplace_source_is_missing() -> Result<()>
 ```
 
-**Purpose**: Ensures a configured local marketplace entry without a `source` field fails with a specific invalid-source diagnostic.
+**Purpose**: Verifies that Codex reports a useful error when a local marketplace config has no source path. Without this, users would see a vague load failure.
 
-**Data flow**: It creates malformed config via the dedicated setup helper, runs `plugin marketplace list`, and asserts failure with stderr containing the generic marketplace-load prefix, marketplace name `debug`, placeholder source `<invalid source>`, and the missing-or-empty-source message.
+**Data flow**: It writes the incomplete config, runs marketplace listing, and checks standard error for the marketplace name, invalid source marker, and missing-source explanation.
 
-**Call relations**: This async test covers a distinct malformed-config branch not handled by the generic assertion helpers because the source placeholder is synthetic.
+**Call relations**: The test runner invokes it. It uses the missing-source setup and then directly checks the expected error text.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_configured_local_marketplace_with_missing_source); 1 external calls (contains).
 
@@ -837,11 +861,11 @@ async fn marketplace_list_fails_when_configured_local_marketplace_source_is_miss
 async fn marketplace_list_fails_when_home_marketplace_is_malformed() -> Result<()>
 ```
 
-**Purpose**: Checks that a malformed marketplace manifest discovered from `HOME` causes marketplace listing to fail and reports the manifest path and parse error.
+**Purpose**: Checks that a broken marketplace manifest in the user’s home directory causes a clear listing failure. This proves home-discovered marketplaces are validated like configured ones.
 
-**Data flow**: It creates temporary Codex home and `HOME`, enables plugins, creates `HOME/.agents/plugins`, writes invalid JSON to `marketplace.json`, runs `plugin marketplace list` with `HOME` overridden, and asserts stderr contains the marketplace-load failure prefix, the malformed manifest path, and the JSON parse detail `key must be a string`.
+**Data flow**: It creates temporary Codex home and user home folders, enables plugins, writes invalid JSON as the home marketplace manifest, runs listing with that home, and checks for the parse error.
 
-**Call relations**: This async test validates that home-discovered marketplaces are parsed and surfaced through the same failure reporting path as configured marketplaces.
+**Call relations**: The test runner calls it. It creates the malformed file inline, then uses the command helper with a fake `HOME`.
 
 *Call graph*: calls 2 internal fn (codex_command, write_plugins_enabled_config); 4 external calls (new, contains, create_dir_all, write).
 
@@ -852,11 +876,11 @@ async fn marketplace_list_fails_when_home_marketplace_is_malformed() -> Result<(
 async fn marketplace_list_fails_when_configured_marketplace_snapshot_is_malformed() -> Result<()>
 ```
 
-**Purpose**: Verifies that marketplace listing fails with parse details when a configured marketplace manifest contains invalid JSON.
+**Purpose**: Confirms that a configured marketplace with invalid JSON fails during marketplace listing. The command should explain the parse problem instead of hiding it.
 
-**Data flow**: It creates a configured marketplace with malformed `marketplace.json`, runs `plugin marketplace list`, and passes the assertion to `assert_marketplace_failure` with marketplace `debug`, the source path, and parse detail `key must be a string`.
+**Data flow**: It creates a configured marketplace with a malformed manifest, runs marketplace listing, and checks the shared marketplace-load failure message.
 
-**Call relations**: This async test is the malformed-manifest counterpart to the missing-manifest test, using the shared marketplace failure helper.
+**Call relations**: The test runner invokes it using the malformed-manifest setup and shared failure assertion.
 
 *Call graph*: calls 3 internal fn (assert_marketplace_failure, codex_command, setup_configured_marketplace_with_malformed_manifest).
 
@@ -867,11 +891,11 @@ async fn marketplace_list_fails_when_configured_marketplace_snapshot_is_malforme
 async fn plugin_list_prints_plugins_in_a_table() -> Result<()>
 ```
 
-**Purpose**: Checks the human-readable `plugin list` output for an available-but-not-installed plugin from a configured marketplace.
+**Purpose**: Verifies that `codex plugin list` shows available plugins in a human-readable table. It checks key columns, marketplace context, plugin status, version, and path.
 
-**Data flow**: It creates the standard configured marketplace fixture, computes the marketplace manifest path and plugin path, runs `codex plugin list`, and asserts stdout contains the marketplace heading, table headers (`PLUGIN`, `STATUS`, `VERSION`, `PATH`), the manifest path, plugin ID `sample@debug`, status `not installed`, and the plugin source path.
+**Data flow**: It creates a configured marketplace, computes the expected manifest and plugin paths, runs `plugin list`, and checks standard output for the table content.
 
-**Call relations**: This async test validates the default text rendering of available plugins discovered from configured marketplaces.
+**Call relations**: The test runner calls it. It relies on the standard setup and command helper, then checks the visible CLI table.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 1 external calls (contains).
 
@@ -882,11 +906,11 @@ async fn plugin_list_prints_plugins_in_a_table() -> Result<()>
 async fn plugin_list_json_prints_available_plugins_when_requested() -> Result<()>
 ```
 
-**Purpose**: Verifies that `plugin list --available --json` returns available plugins with full metadata, including marketplace source provenance and policy fields.
+**Purpose**: Checks that `plugin list --available --json` returns available plugins as structured JSON. This protects automation that reads plugin data programmatically.
 
-**Data flow**: It creates the standard configured marketplace fixture, computes plugin and source paths, runs `plugin list --available --json`, parses stdout as JSON, and asserts equality with an object containing an empty `installed` array and one `available` entry describing `sample@debug`, version `1.2.3`, disabled/not-installed state, local plugin source path, local marketplace source, `installPolicy: "AVAILABLE"`, and `authPolicy: "ON_INSTALL"`.
+**Data flow**: It creates a configured marketplace, runs the JSON available-list command, parses standard output, and compares it to the expected installed-empty and available-one-plugin JSON.
 
-**Call relations**: This async test covers the machine-readable available-plugin listing path, which is distinct from the default text-mode list.
+**Call relations**: The test runner invokes it. It uses the common setup and then verifies the CLI’s JSON schema and values.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert_eq!, from_slice).
 
@@ -897,11 +921,11 @@ async fn plugin_list_json_prints_available_plugins_when_requested() -> Result<()
 async fn plugin_list_json_includes_configured_git_marketplace_source() -> Result<()>
 ```
 
-**Purpose**: Checks that available plugin JSON includes git marketplace provenance when the marketplace is configured from a git source.
+**Purpose**: Ensures plugin JSON output includes the Git marketplace source when the marketplace was configured from Git. This lets callers understand where a cached plugin originally came from.
 
-**Data flow**: It creates a temporary home and marketplace root under `.tmp/marketplaces/debug`, enables plugins, writes a valid marketplace snapshot, records a git marketplace config, normalizes the plugin path, runs `plugin list --available --json`, parses stdout, and asserts the available plugin entry includes the normalized local plugin path plus `marketplaceSource { sourceType: "git", source: <repo-url> }`.
+**Data flow**: It creates a cached marketplace root, writes the sample plugin there, records a Git source URL, runs `plugin list --available --json`, parses output, and compares the plugin record to the expected JSON.
 
-**Call relations**: This async test mirrors the local-source available-plugin JSON test but proves marketplace provenance comes from config and can differ from the plugin’s local on-disk source path.
+**Call relations**: The test runner calls it. It combines file setup, config recording, path normalization, command execution, and JSON checking.
 
 *Call graph*: calls 3 internal fn (codex_command, write_marketplace_source, write_plugins_enabled_config); 5 external calls (new, assert_eq!, record_user_marketplace, canonicalize_existing_preserving_symlinks, from_slice).
 
@@ -912,11 +936,11 @@ async fn plugin_list_json_includes_configured_git_marketplace_source() -> Result
 async fn plugin_list_json_prints_installed_plugins() -> Result<()>
 ```
 
-**Purpose**: Verifies that after installation, `plugin list --json` reports the plugin under `installed` with `installed: true` and `enabled: true`.
+**Purpose**: Verifies that once a plugin is added, JSON listing reports it as installed and enabled. This checks the connection between installation, config, and listing.
 
-**Data flow**: It creates the standard configured marketplace fixture, computes plugin and source paths, runs `plugin add sample@debug`, then runs `plugin list --json`, parses stdout, and asserts equality with an object containing one installed plugin entry and an empty `available` array.
+**Data flow**: It creates a marketplace, runs `plugin add`, then runs `plugin list --json`, parses the output, and checks that the sample plugin appears under `installed` with the expected fields.
 
-**Call relations**: This async test composes plugin installation with subsequent listing to validate the installed-plugin JSON branch.
+**Call relations**: The test runner invokes it. It first uses the CLI to change state, then uses the CLI again to confirm that state is reflected.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert_eq!, from_slice).
 
@@ -927,11 +951,11 @@ async fn plugin_list_json_prints_installed_plugins() -> Result<()>
 async fn plugin_list_available_requires_json() -> Result<()>
 ```
 
-**Purpose**: Ensures the `--available` flag cannot be used without `--json` on `plugin list`.
+**Purpose**: Checks the command-line rule that `--available` must be used with `--json`. This prevents ambiguous human table output for a special listing mode.
 
-**Data flow**: It creates the standard configured marketplace fixture, runs `plugin list --available`, and asserts failure with stderr mentioning missing required arguments and specifically `--json`.
+**Data flow**: It creates a normal marketplace, runs `plugin list --available` without `--json`, and checks that the command fails with an argument error mentioning `--json`.
 
-**Call relations**: This async test validates CLI argument constraints rather than marketplace or plugin state.
+**Call relations**: The test runner calls it. It uses normal setup but is really testing command-line argument validation.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 1 external calls (contains).
 
@@ -942,11 +966,11 @@ async fn plugin_list_available_requires_json() -> Result<()>
 async fn plugin_list_shows_installed_version_when_plugin_is_installed() -> Result<()>
 ```
 
-**Purpose**: Checks that text-mode `plugin list` shows the installed plugin’s version and enabled status after installation.
+**Purpose**: Verifies that the human-readable plugin list shows version and installed/enabled status after installation. This gives users clear feedback about what is active.
 
-**Data flow**: It creates the standard configured marketplace fixture, runs `plugin add sample@debug`, then runs `plugin list` and asserts stdout contains `sample@debug`, version `1.2.3`, and status text `installed, enabled`.
+**Data flow**: It creates a marketplace, installs the sample plugin, runs `plugin list`, and checks output for the plugin id, version `1.2.3`, and installed/enabled status.
 
-**Call relations**: This async test is the text-output counterpart to the installed-plugin JSON test.
+**Call relations**: The test runner invokes it. It uses one CLI command to install and another to inspect the result.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 1 external calls (contains).
 
@@ -957,11 +981,11 @@ async fn plugin_list_shows_installed_version_when_plugin_is_installed() -> Resul
 async fn plugin_list_excludes_unconfigured_repo_local_marketplaces() -> Result<()>
 ```
 
-**Purpose**: Verifies that running inside a repository containing a marketplace does not make that marketplace eligible for plugin listing unless it is configured.
+**Purpose**: Ensures Codex does not treat the current local repository as a trusted marketplace unless it is configured. This is a safety check against accidentally loading local plugin definitions.
 
-**Data flow**: It creates an unconfigured local marketplace fixture, runs `plugin list --marketplace debug` from within the source directory using `codex_command_in`, and asserts success with stdout saying no plugins were found in marketplace `debug` and not matching `sample@debug`.
+**Data flow**: It creates a valid but unconfigured marketplace, runs `plugin list --marketplace debug` from inside that folder, and checks that no sample plugin is shown.
 
-**Call relations**: This async test uses the current-directory helper to prove repo-local discovery is intentionally excluded from plugin listing unless the marketplace is configured.
+**Call relations**: The test runner calls it. It uses `codex_command_in` to simulate being inside the marketplace directory while still expecting Codex to ignore it.
 
 *Call graph*: calls 2 internal fn (codex_command_in, setup_unconfigured_local_marketplace); 2 external calls (contains, is_match).
 
@@ -972,11 +996,11 @@ async fn plugin_list_excludes_unconfigured_repo_local_marketplaces() -> Result<(
 async fn plugin_list_fails_when_configured_marketplace_snapshot_is_missing() -> Result<()>
 ```
 
-**Purpose**: Checks that `plugin list` fails with the configured-snapshot error format when a configured marketplace root lacks a manifest.
+**Purpose**: Checks that plugin listing fails when a configured marketplace snapshot is missing its manifest. Installed or available plugin data should not be guessed from an invalid source.
 
-**Data flow**: It creates a configured marketplace pointing at an empty directory, runs `plugin list`, and passes the assertion to `assert_configured_marketplace_snapshot_failure` with the source path and missing-manifest detail.
+**Data flow**: It creates a configured marketplace without a manifest, runs `plugin list`, and checks for the standard configured-snapshot failure message.
 
-**Call relations**: This async test parallels the marketplace-list missing-snapshot case but validates the plugin-list-specific error prefix and wording.
+**Call relations**: The test runner invokes it. It uses the missing-manifest setup and the shared configured-snapshot failure assertion.
 
 *Call graph*: calls 3 internal fn (assert_configured_marketplace_snapshot_failure, codex_command, setup_configured_marketplace_without_manifest).
 
@@ -987,11 +1011,11 @@ async fn plugin_list_fails_when_configured_marketplace_snapshot_is_missing() -> 
 async fn plugin_list_ignores_implicit_system_marketplace_roots_without_manifests() -> Result<()>
 ```
 
-**Purpose**: Ensures missing manifests under recognized implicit system marketplace roots do not cause `plugin list` to fail.
+**Purpose**: Verifies that empty built-in system marketplace roots do not break plugin listing. Codex may create or know about these special locations before they contain a manifest.
 
-**Data flow**: It creates one normal configured marketplace plus bundled/runtime implicit system roots without manifests, runs `plugin list` with `XDG_CACHE_HOME` pointed at the runtime cache tempdir, and asserts success with output for the normal `debug` marketplace while stderr does not contain the configured-snapshot failure prefix.
+**Data flow**: It creates a normal marketplace plus empty bundled/runtime roots, runs `plugin list` with a fake cache home, and checks that the normal marketplace appears and no configured-snapshot error is printed.
 
-**Call relations**: This async test uses the specialized implicit-system-root fixture to validate a leniency rule for known system-managed marketplace locations.
+**Call relations**: The test runner calls it. The special setup creates both real and empty system-like roots so the CLI’s exception behavior can be tested.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace_with_implicit_system_roots); 1 external calls (contains).
 
@@ -1002,11 +1026,11 @@ async fn plugin_list_ignores_implicit_system_marketplace_roots_without_manifests
 async fn plugin_list_fails_for_custom_marketplace_under_system_root() -> Result<()>
 ```
 
-**Purpose**: Verifies that a custom configured marketplace placed under a system-root-like directory still fails if it lacks a manifest.
+**Purpose**: Checks that a custom marketplace placed under a system-like directory is not given the same lenient treatment as known built-in roots. Missing manifests should still fail for custom marketplaces.
 
-**Data flow**: It creates a configured custom marketplace under `.tmp/bundled-marketplaces/custom-marketplace`, runs `plugin list`, and asserts failure with stderr containing the configured-snapshot failure prefix, marketplace name, custom root path, and missing-manifest detail.
+**Data flow**: It creates and records a custom marketplace under `.tmp/bundled-marketplaces` without a manifest, runs `plugin list`, and checks the failure details.
 
-**Call relations**: This async test complements the previous one by showing the ignore rule is selective and does not apply to arbitrary custom marketplace names.
+**Call relations**: The test runner invokes it after the custom-root setup helper prepares the edge case.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_custom_marketplace_under_implicit_system_root); 1 external calls (contains).
 
@@ -1017,11 +1041,11 @@ async fn plugin_list_fails_for_custom_marketplace_under_system_root() -> Result<
 async fn plugin_list_hides_version_for_cached_but_unconfigured_plugin() -> Result<()>
 ```
 
-**Purpose**: Checks that if plugin files remain cached on disk but the plugin config entry is removed, `plugin list` treats it as not installed and suppresses the cached version.
+**Purpose**: Ensures a plugin left in the cache but removed from config is not shown as a normal installed plugin with a trusted version. This avoids giving stale cache data too much authority.
 
-**Data flow**: It creates the standard configured marketplace fixture, installs `sample@debug`, removes its `[plugins."sample@debug"]` section from config via `remove_installed_plugin_config`, runs `plugin list`, and asserts stdout contains the plugin ID and `not installed` but does not contain version `1.2.3`.
+**Data flow**: It creates a marketplace, installs the plugin, removes that plugin’s config section while leaving files in place, runs `plugin list`, and checks that the plugin is marked not installed and its version is hidden.
 
-**Call relations**: This async test creates a deliberately inconsistent state to prove installation status is driven by config authorization, not merely by cached files.
+**Call relations**: The test runner calls it. It uses the config-removal helper to create a state that could happen after manual config edits or partial cleanup.
 
 *Call graph*: calls 3 internal fn (codex_command, remove_installed_plugin_config, setup_local_marketplace); 1 external calls (contains).
 
@@ -1032,11 +1056,11 @@ async fn plugin_list_hides_version_for_cached_but_unconfigured_plugin() -> Resul
 async fn plugin_add_and_remove_updates_installed_plugin_config() -> Result<()>
 ```
 
-**Purpose**: Verifies that `plugin add` creates a plugin config section and `plugin remove` deletes it again.
+**Purpose**: Verifies that adding a plugin writes an installed-plugin section to config and removing it deletes that section. This checks the durable state Codex uses between runs.
 
-**Data flow**: It creates the standard configured marketplace fixture, runs `plugin add sample@debug` and asserts the success message, reads `config.toml` and checks for `[plugins."sample@debug"]`, then runs `plugin remove sample --marketplace debug`, asserts the removal message, rereads `config.toml`, and checks the plugin section is absent.
+**Data flow**: It creates a marketplace, runs `plugin add`, reads the config to confirm the plugin table exists, runs `plugin remove`, reads the config again, and confirms the table is gone.
 
-**Call relations**: This async test validates the persistent config side effects of plugin installation and removal in addition to command output.
+**Call relations**: The test runner invokes it. The CLI is used for both operations, while direct file reading confirms the persistent config changed correctly.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 3 external calls (assert!, contains, read_to_string).
 
@@ -1047,11 +1071,11 @@ async fn plugin_add_and_remove_updates_installed_plugin_config() -> Result<()>
 async fn plugin_add_json_prints_install_outcome() -> Result<()>
 ```
 
-**Purpose**: Checks the JSON payload emitted by `plugin add --json`, including the normalized installed cache path and auth policy.
+**Purpose**: Checks that `plugin add --json` reports the installed plugin details in a stable machine-readable form. This includes the final cache path and auth policy.
 
-**Data flow**: It creates the standard configured marketplace fixture, runs `plugin add sample@debug --json`, parses stdout as JSON, computes the expected installed cache path `plugins/cache/debug/sample/1.2.3`, normalizes it with `canonicalize_existing_preserving_symlinks`, and asserts equality with the expected object containing plugin identity, version, installed path, and `authPolicy: "ON_INSTALL"`.
+**Data flow**: It creates a marketplace, runs the add command with JSON output, parses standard output, normalizes the expected installed path, and compares the JSON object exactly.
 
-**Call relations**: This async test validates the structured install-result contract after a successful plugin installation.
+**Call relations**: The test runner calls it. It uses setup and command execution, then path normalization so the expected path matches the filesystem’s real form.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 3 external calls (assert_eq!, canonicalize_existing_preserving_symlinks, from_slice).
 
@@ -1062,11 +1086,11 @@ async fn plugin_add_json_prints_install_outcome() -> Result<()>
 async fn plugin_remove_json_prints_remove_outcome() -> Result<()>
 ```
 
-**Purpose**: Verifies the JSON payload emitted by `plugin remove --json` after a plugin has been installed.
+**Purpose**: Verifies that `plugin remove --json` reports which plugin was removed. This gives scripts a clear confirmation without parsing human text.
 
-**Data flow**: It creates the standard configured marketplace fixture, installs `sample@debug`, runs `plugin remove sample --marketplace debug --json`, parses stdout as JSON, and asserts equality with an object containing `pluginId`, `name`, and `marketplaceName`.
+**Data flow**: It creates a marketplace, installs the plugin, removes it with JSON output, parses standard output, and compares it to the expected plugin identity object.
 
-**Call relations**: This async test complements the install JSON test by pinning the machine-readable removal result shape.
+**Call relations**: The test runner invokes it. It first creates installed state with `plugin add`, then checks the removal command’s structured response.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert_eq!, from_slice).
 
@@ -1077,11 +1101,11 @@ async fn plugin_remove_json_prints_remove_outcome() -> Result<()>
 async fn plugin_add_rejects_unconfigured_repo_local_marketplaces() -> Result<()>
 ```
 
-**Purpose**: Ensures plugin installation cannot source plugins from an unconfigured repo-local marketplace even when run inside that repository.
+**Purpose**: Ensures Codex refuses to add a plugin from a local marketplace that exists only because the command is run inside its folder. The marketplace must be configured first.
 
-**Data flow**: It creates an unconfigured local marketplace fixture, runs `plugin add sample@debug` from within the source directory using `codex_command_in`, and asserts failure with stderr saying the plugin was not found in marketplace `debug`.
+**Data flow**: It creates a valid but unconfigured marketplace, runs `plugin add sample@debug` from that directory, and checks for a not-found error.
 
-**Call relations**: This async test is the add-command counterpart to the list exclusion test, proving configured marketplace snapshots are required for installation.
+**Call relations**: The test runner calls it. It uses `codex_command_in` to test the current-directory edge case.
 
 *Call graph*: calls 2 internal fn (codex_command_in, setup_unconfigured_local_marketplace); 1 external calls (contains).
 
@@ -1092,11 +1116,11 @@ async fn plugin_add_rejects_unconfigured_repo_local_marketplaces() -> Result<()>
 async fn plugin_add_fails_when_configured_marketplace_snapshot_is_malformed() -> Result<()>
 ```
 
-**Purpose**: Checks that plugin installation fails with the configured-snapshot error format when the configured marketplace manifest is malformed.
+**Purpose**: Checks that adding a plugin fails if the configured marketplace snapshot has invalid JSON. Codex should not install from a source it cannot parse.
 
-**Data flow**: It creates a configured marketplace with invalid JSON manifest, runs `plugin add sample@debug`, and passes the assertion to `assert_configured_marketplace_snapshot_failure` with the source path and parse detail.
+**Data flow**: It creates a configured marketplace with a malformed manifest, runs `plugin add sample@debug`, and checks for the standard configured-snapshot failure message.
 
-**Call relations**: This async test validates that plugin installation depends on successfully loading the configured marketplace snapshot before locating the plugin.
+**Call relations**: The test runner invokes it. It uses the malformed setup helper and the shared failure assertion.
 
 *Call graph*: calls 3 internal fn (assert_configured_marketplace_snapshot_failure, codex_command, setup_configured_marketplace_with_malformed_manifest).
 
@@ -1107,11 +1131,11 @@ async fn plugin_add_fails_when_configured_marketplace_snapshot_is_malformed() ->
 async fn plugin_add_reinstalls_from_configured_marketplace_snapshot() -> Result<()>
 ```
 
-**Purpose**: Verifies that re-running `plugin add` for an already installed plugin reinstalls from the configured marketplace snapshot and leaves the cached plugin manifest present.
+**Purpose**: Verifies that running `plugin add` for an already installed plugin succeeds and refreshes the cached plugin files. Reinstalling should be a safe repeat operation.
 
-**Data flow**: It creates the standard configured marketplace fixture, runs `plugin add sample@debug` twice, asserts the second invocation still reports success with the add message, and checks that `plugins/cache/debug/sample/1.2.3/.codex-plugin/plugin.json` exists as a file.
+**Data flow**: It creates a marketplace, adds the sample plugin, adds it again, checks for the success message, and confirms the cached plugin metadata file exists.
 
-**Call relations**: This async test exercises idempotent/reinstall behavior on the success path, showing the command does not short-circuit solely because cache files already exist.
+**Call relations**: The test runner calls it. The test uses the CLI twice to prove installation is repeatable.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert!, contains).
 
@@ -1122,11 +1146,11 @@ async fn plugin_add_reinstalls_from_configured_marketplace_snapshot() -> Result<
 async fn plugin_remove_works_after_marketplace_is_removed() -> Result<()>
 ```
 
-**Purpose**: Ensures an installed plugin can still be removed from config after its marketplace configuration has been deleted.
+**Purpose**: Ensures an installed plugin can still be removed after its marketplace has been removed from config. Users should be able to clean up installed plugins even if the source is gone.
 
-**Data flow**: It creates the standard configured marketplace fixture, installs `sample` from marketplace `debug`, removes marketplace `debug`, then runs `plugin remove sample@debug`, asserts the success message, reads `config.toml`, and confirms the plugin section is absent.
+**Data flow**: It creates and installs a plugin, removes the marketplace, removes the plugin by id, checks the success message, then reads config to confirm the plugin section was deleted.
 
-**Call relations**: This async test validates that plugin removal can rely on the installed plugin identifier/config entry even when the originating marketplace is no longer configured.
+**Call relations**: The test runner invokes it. It uses marketplace removal as a middle step, then proves plugin removal does not depend on the marketplace still being configured.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 3 external calls (assert!, contains, read_to_string).
 
@@ -1137,22 +1161,24 @@ async fn plugin_remove_works_after_marketplace_is_removed() -> Result<()>
 async fn plugin_add_rejects_cached_plugins_without_authorizing_marketplace_snapshot() -> Result<()>
 ```
 
-**Purpose**: Checks that cached plugin files are not sufficient to authorize installation once the marketplace snapshot has been removed.
+**Purpose**: Checks that cached plugin files alone are not enough to authorize installation. Codex must still have a configured marketplace snapshot that says the plugin is valid.
 
-**Data flow**: It creates the standard configured marketplace fixture, installs `sample@debug`, removes marketplace `debug`, asserts the cached plugin manifest file still exists under `plugins/cache/debug/sample/1.2.3`, then runs `plugin add sample@debug` again and asserts failure with stderr saying the plugin was not found in marketplace `debug`.
+**Data flow**: It creates a marketplace, installs the plugin so files exist in the cache, removes the marketplace config, confirms the cached file remains, then tries to add again and expects a not-found error.
 
-**Call relations**: This async test captures an important invariant: plugin add consults current marketplace authorization/snapshot state, not just the presence of cached plugin artifacts.
+**Call relations**: The test runner calls it. It links several CLI actions to test the security boundary between cache contents and trusted marketplace configuration.
 
 *Call graph*: calls 2 internal fn (codex_command, setup_local_marketplace); 2 external calls (assert!, contains).
 
 
 ### `cli/tests/marketplace_add.rs`
 
-`test` · `CLI integration testing for marketplace configuration commands`
+`test` · `test run`
 
-This integration test file builds temporary marketplace directories on disk, invokes the compiled `codex` binary with `assert_cmd`, and inspects both process output and the resulting filesystem/config state under a temporary `CODEX_HOME`. The helper `codex_command` standardizes command creation and injects `CODEX_HOME` so each test runs in isolation. `write_marketplace_source` creates a minimal but valid local marketplace layout: `.agents/plugins/marketplace.json`, a plugin manifest at `plugins/sample/.codex-plugin/plugin.json`, and a marker file in the plugin directory.
+This is an integration test file, meaning it runs the real `codex` command-line program instead of testing one small function in isolation. Its job is to prove that a user can add a plugin marketplace from a local directory and that Codex records that marketplace correctly in its configuration file. Think of it like a rehearsal with a temporary empty home folder: the test creates a fake marketplace on disk, runs the actual command, then looks at what the command printed and wrote.
 
-The success-path tests focus on the semantics of adding a local directory marketplace: the command should not copy the marketplace into the installed-marketplaces root, but instead persist a marketplace entry in `config.toml` with `source_type = "local"` and a canonicalized absolute source path. The JSON-mode test confirms the command reports the marketplace name, the resolved installed root/path string, and `alreadyAdded: false`. The failure-path tests pin down argument validation: passing the manifest file itself instead of its containing directory must fail with a directory-specific error, and combining `--sparse` with a local directory source must fail because sparse checkout is only meaningful for git sources. Together these tests define the CLI contract for local marketplace registration rather than marketplace installation.
+The helper code builds a small marketplace folder containing a marketplace manifest and one sample plugin. Each test uses temporary directories so it does not touch the developer’s real files. The tests set `CODEX_HOME` to that temporary folder, so the command behaves as if it is running for a fresh user.
+
+The file checks several important promises. A local marketplace directory should be saved in the config as a local source, not copied into the normal installed-marketplace location. With `--json`, the command should print a machine-readable summary. If the user points at the manifest file instead of the containing directory, Codex should reject it with a useful message. And if the user asks for `--sparse`, Codex should explain that sparse checkout only makes sense for git-based marketplaces, not plain local folders.
 
 #### Function details
 
@@ -1162,11 +1188,11 @@ The success-path tests focus on the semantics of adding a local directory market
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Constructs an `assert_cmd::Command` targeting the built `codex` executable and scopes it to a supplied temporary Codex home directory.
+**Purpose**: This helper prepares a command object for running the real `codex` binary in a test. It also sets `CODEX_HOME`, which tells Codex to use a temporary home directory instead of the user’s real one.
 
-**Data flow**: It takes `codex_home: &Path`, resolves the binary path via `codex_utils_cargo_bin::cargo_bin("codex")`, creates an `assert_cmd::Command`, sets the `CODEX_HOME` environment variable on that command, and returns the configured command wrapped in `anyhow::Result`.
+**Data flow**: It receives the path to a temporary Codex home folder. It finds the built `codex` executable, creates a test command for it, adds the `CODEX_HOME` environment variable, and returns that ready-to-customize command to the test.
 
-**Call relations**: All four tests call this helper before adding CLI arguments. It is the common setup step that ensures each invocation of `plugin marketplace add` reads and writes only the temporary test home.
+**Call relations**: Each test calls this helper right before running the command-line scenario it cares about. The helper supplies the common setup, and the individual tests then add their own current directory and command arguments before checking success or failure.
 
 *Call graph*: called by 4 (marketplace_add_json_prints_add_outcome, marketplace_add_local_directory_source, marketplace_add_rejects_local_manifest_file_source, marketplace_add_rejects_sparse_for_local_directory_source); 2 external calls (new, cargo_bin).
 
@@ -1177,11 +1203,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn write_marketplace_source(source: &Path, marker: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a minimal local marketplace tree on disk that the CLI can recognize as a valid marketplace containing one plugin named `sample`.
+**Purpose**: This helper creates a tiny fake marketplace folder on disk. Tests use it as sample input for the marketplace-add command.
 
-**Data flow**: It takes a root `source: &Path` and a `marker: &str`, creates `.agents/plugins` and `plugins/sample/.codex-plugin`, writes a fixed `marketplace.json` manifest naming marketplace `debug` and a local plugin source `./plugins/sample`, writes `plugin.json` with plugin name `sample`, and writes `marker.txt` containing the caller-provided marker string.
+**Data flow**: It receives a folder path and a marker string. It creates the expected marketplace and plugin directories, writes a marketplace manifest that names a `debug` marketplace with one `sample` plugin, writes the plugin’s own metadata file, and writes a marker text file inside the plugin folder.
 
-**Call relations**: Each test that needs a valid local marketplace calls this helper first. The tests then either pass the directory or a derived manifest path into `codex_command` to exercise success and validation branches.
+**Call relations**: The marketplace-add tests call this before running `codex`. It gives the command a realistic local marketplace to inspect, so the later assertions can focus on what Codex did with that source.
 
 *Call graph*: called by 4 (marketplace_add_json_prints_add_outcome, marketplace_add_local_directory_source, marketplace_add_rejects_local_manifest_file_source, marketplace_add_rejects_sparse_for_local_directory_source); 3 external calls (join, create_dir_all, write).
 
@@ -1192,11 +1218,11 @@ fn write_marketplace_source(source: &Path, marker: &str) -> Result<()>
 async fn marketplace_add_local_directory_source() -> Result<()>
 ```
 
-**Purpose**: Verifies that adding a local marketplace directory records configuration only, without creating an installed marketplace copy.
+**Purpose**: This test proves that adding a marketplace from a local directory succeeds and records the correct local path in Codex’s configuration. It also checks that Codex does not copy the local marketplace into the installed marketplace area.
 
-**Data flow**: It creates temporary `codex_home` and `source` directories, populates the source marketplace, computes a relative CLI argument from the source parent directory, runs `codex plugin marketplace add <relative-dir>`, then reads `config.toml` from `CODEX_HOME` and parses it as `toml::Value`. It asserts the installed-marketplace root for `debug` does not exist and that the config stores `source_type = "local"` and the canonicalized absolute source path.
+**Data flow**: It creates a temporary Codex home and a temporary fake marketplace. It runs `codex plugin marketplace add` using a relative path to that marketplace. After the command succeeds, it checks that no installed copy was created, reads the generated config file, and confirms that the `debug` marketplace is stored as a local source pointing to the canonical directory path.
 
-**Call relations**: This is a top-level async test. It uses `write_marketplace_source` for fixture creation, `codex_command` for process execution, and `marketplace_install_root` to prove the add operation did not materialize a copied marketplace under the managed install directory.
+**Call relations**: This is one of the main happy-path tests. It relies on `write_marketplace_source` to create the input marketplace and `codex_command` to run the real CLI in an isolated home. It then uses the project’s marketplace install-root helper and config file name to verify Codex’s observable results.
 
 *Call graph*: calls 3 internal fn (codex_command, write_marketplace_source, marketplace_install_root); 6 external calls (new, assert!, assert_eq!, format!, read_to_string, from_str).
 
@@ -1207,11 +1233,11 @@ async fn marketplace_add_local_directory_source() -> Result<()>
 async fn marketplace_add_json_prints_add_outcome() -> Result<()>
 ```
 
-**Purpose**: Checks the machine-readable JSON emitted by `plugin marketplace add --json` for a local directory source.
+**Purpose**: This test checks the command’s JSON output mode. JSON is a structured text format that other programs can read reliably, so this matters for scripts and automation.
 
-**Data flow**: It creates temporary home and source directories, writes the marketplace fixture, invokes `codex plugin marketplace add <relative-dir> --json`, captures stdout bytes, parses them into `serde_json::Value`, canonicalizes the source path and converts it into `AbsolutePathBuf`, and compares the parsed JSON to an expected object containing `marketplaceName`, `installedRoot`, and `alreadyAdded: false`.
+**Data flow**: It creates a temporary Codex home and fake local marketplace, then runs the add command with `--json`. It reads the command’s standard output, parses it as JSON, and compares it to the expected summary: the marketplace name, the local directory used as the installed root, and a flag saying this marketplace was not already added.
 
-**Call relations**: This async test follows the same setup path as the plain success test but validates the structured output branch instead of config contents. It depends on `codex_command` and `write_marketplace_source` to reach the JSON-producing code path.
+**Call relations**: Like the other success test, it uses `write_marketplace_source` for the fake marketplace and `codex_command` for the isolated CLI run. Its focus is not the config file, but the machine-readable result handed back to the caller.
 
 *Call graph*: calls 3 internal fn (codex_command, write_marketplace_source, try_from); 4 external calls (new, assert_eq!, format!, from_slice).
 
@@ -1222,11 +1248,11 @@ async fn marketplace_add_json_prints_add_outcome() -> Result<()>
 async fn marketplace_add_rejects_local_manifest_file_source() -> Result<()>
 ```
 
-**Purpose**: Ensures the CLI rejects a local source argument that points directly at `marketplace.json` instead of the marketplace directory.
+**Purpose**: This test makes sure Codex rejects a common mistake: passing the marketplace manifest file itself instead of the marketplace directory. The error message should tell the user what went wrong.
 
-**Data flow**: It creates temporary home and source directories, writes a valid marketplace fixture, derives the manifest file path `.agents/plugins/marketplace.json`, runs `codex plugin marketplace add <manifest-path>`, and asserts command failure with stderr containing the specific directory-vs-file validation message.
+**Data flow**: It creates a temporary Codex home and fake marketplace, then points the add command directly at `.agents/plugins/marketplace.json`. The expected result is command failure, and the test checks that standard error contains the message saying a local marketplace source must be a directory, not a file.
 
-**Call relations**: This async test uses the shared fixture and command helpers, but intentionally passes the wrong path shape to drive the CLI's local-source validation branch.
+**Call relations**: This is a negative-path test. It uses the same fake marketplace setup as the success cases, but deliberately gives the CLI the wrong path so it can verify Codex fails safely and explains the problem.
 
 *Call graph*: calls 2 internal fn (codex_command, write_marketplace_source); 2 external calls (new, contains).
 
@@ -1237,22 +1263,24 @@ async fn marketplace_add_rejects_local_manifest_file_source() -> Result<()>
 async fn marketplace_add_rejects_sparse_for_local_directory_source() -> Result<()>
 ```
 
-**Purpose**: Pins down that `--sparse` is invalid when the marketplace source is a local directory rather than a git repository.
+**Purpose**: This test confirms that `--sparse` is rejected for local marketplace folders. Sparse checkout means fetching only part of a git repository, so it does not apply to an ordinary local directory.
 
-**Data flow**: It creates temporary home and source directories, writes a valid local marketplace, runs `codex plugin marketplace add --sparse .agents <source-dir>`, and asserts failure with stderr mentioning that sparse mode is only supported for git marketplace sources.
+**Data flow**: It creates a temporary Codex home and fake marketplace, then runs the add command with `--sparse .agents` against the local directory. The command is expected to fail, and the test checks that the error text explains that sparse mode is only supported for git marketplace sources.
 
-**Call relations**: This async test again uses the common helpers, but combines a local source with git-only flags to verify the command-line parser or command implementation rejects that combination before any marketplace is added.
+**Call relations**: This negative-path test again uses `write_marketplace_source` and `codex_command` for setup. It protects the command-line behavior around an option that is valid in one kind of source but invalid for local directory sources.
 
 *Call graph*: calls 2 internal fn (codex_command, write_marketplace_source); 2 external calls (new, contains).
 
 
 ### `cli/tests/marketplace_remove.rs`
 
-`test` · `CLI integration testing for marketplace removal`
+`test` · `test run`
 
-This file sets up marketplace state directly in the temporary Codex home, then invokes the CLI to remove it. `codex_command` creates a binary invocation scoped by `CODEX_HOME`. `configured_marketplace_update` returns a fixed `MarketplaceConfigUpdate<'static>` representing a git-backed marketplace named later by the tests; this avoids repeating the same source metadata in each fixture. `write_installed_marketplace` creates a synthetic installed marketplace tree under `marketplace_install_root(codex_home)/<name>` with a minimal `.agents/plugins/marketplace.json` and a marker file.
+This is a test file for the Codex command-line tool. A “marketplace” here is a configured source of plugins, and the remove command is supposed to forget that source and delete its local installed copy. These tests create a temporary Codex home folder, like giving the command a fresh fake user account to work inside, so the real machine is not changed.
 
-The main success test seeds both configuration and installed files, runs `plugin marketplace remove debug`, and then checks two independent side effects: the `[marketplaces.debug]` section is gone from `config.toml`, and the installed root directory no longer exists. The JSON-mode test verifies the structured response includes the marketplace name and a normalized installed root path, using `canonicalize_existing_preserving_symlinks` before removal to match the CLI’s path reporting. The final test covers the negative case where neither config nor installed files exist; the command must fail with a precise message saying the marketplace is not configured or installed. These tests collectively define removal as a cleanup operation over both persistent config and on-disk marketplace contents.
+The file sets up two pieces of fake state: a marketplace entry in `config.toml`, and a matching installed marketplace folder on disk with a small marker file. It then runs the real `codex` binary with `CODEX_HOME` pointed at the temporary folder. That matters because these tests exercise the command as a user would run it, not just an internal function.
+
+There are three main behaviors being checked. First, a normal remove should print a friendly success message, delete the marketplace’s config section, and remove its installed folder. Second, when `--json` is passed, the command should print machine-readable JSON with the marketplace name and the exact installed path that was removed. Third, trying to remove a marketplace that is neither configured nor installed should fail with a clear error. Together, these tests protect both the user-facing behavior and the cleanup side effects.
 
 #### Function details
 
@@ -1262,11 +1290,11 @@ The main success test seeds both configuration and installed files, runs `plugin
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Builds an `assert_cmd::Command` for the `codex` binary with `CODEX_HOME` pointed at the test-specific temporary directory.
+**Purpose**: This helper prepares a command that runs the real `codex` executable in a controlled test home folder. Tests use it so every command reads and writes only inside a temporary directory.
 
-**Data flow**: It accepts `codex_home: &Path`, resolves the binary path with `cargo_bin`, constructs the command, sets `CODEX_HOME`, and returns the configured command in a `Result`.
+**Data flow**: It receives the path to a temporary Codex home folder. It finds the compiled `codex` binary, creates a command object for it, sets the `CODEX_HOME` environment variable to the given folder, and returns the ready-to-customize command.
 
-**Call relations**: Every test in this file calls it before invoking `plugin marketplace remove`, making it the shared process setup layer.
+**Call relations**: Each test calls this helper right before running the remove command. The helper hides the repeated setup work, then the tests add command-line arguments and assert whether the process succeeds or fails.
 
 *Call graph*: called by 3 (marketplace_remove_deletes_config_and_installed_root, marketplace_remove_json_prints_remove_outcome, marketplace_remove_rejects_unknown_marketplace); 2 external calls (new, cargo_bin).
 
@@ -1277,11 +1305,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn configured_marketplace_update() -> MarketplaceConfigUpdate<'static>
 ```
 
-**Purpose**: Provides a reusable `MarketplaceConfigUpdate<'static>` fixture representing a configured git marketplace.
+**Purpose**: This helper creates a standard fake marketplace configuration record for the tests. It gives the tests a consistent marketplace source to write into the temporary config file.
 
-**Data flow**: It constructs and returns a `MarketplaceConfigUpdate` with fixed timestamps, `source_type: "git"`, source URL `https://github.com/owner/repo.git`, `ref_name: Some("main")`, and no sparse paths.
+**Data flow**: It takes no input. It builds a marketplace update value containing fixed details such as a Git source URL, a branch name, and a last-updated timestamp, then returns that value for use when writing test configuration.
 
-**Call relations**: The two success-path tests call this helper and pass its return value into `record_user_marketplace` to seed config before exercising removal.
+**Call relations**: The success-case tests call this before recording a marketplace in the temporary Codex home. That prepared config is what the remove command later has to delete.
 
 *Call graph*: called by 2 (marketplace_remove_deletes_config_and_installed_root, marketplace_remove_json_prints_remove_outcome).
 
@@ -1292,11 +1320,11 @@ fn configured_marketplace_update() -> MarketplaceConfigUpdate<'static>
 fn write_installed_marketplace(codex_home: &Path, marketplace_name: &str) -> Result<()>
 ```
 
-**Purpose**: Creates a minimal installed marketplace directory tree under Codex’s managed marketplace install root.
+**Purpose**: This helper creates a fake installed marketplace folder on disk. It gives the remove command real files to delete during the test.
 
-**Data flow**: It takes `codex_home` and `marketplace_name`, computes `marketplace_install_root(codex_home).join(marketplace_name)`, creates `.agents/plugins`, writes an empty `marketplace.json`, writes `marker.txt`, and returns `Ok(())`.
+**Data flow**: It receives the temporary Codex home path and a marketplace name. It calculates where that marketplace should be installed, creates the expected plugin metadata directory, writes a minimal `marketplace.json`, writes a marker file, and returns success if all disk writes worked.
 
-**Call relations**: The success tests call it after recording marketplace config so the remove command has both config state and filesystem state to delete.
+**Call relations**: The success-case tests call this after adding marketplace configuration. It prepares the installed-folder side of the setup, so the remove command can prove it cleans up both configuration and files.
 
 *Call graph*: calls 1 internal fn (marketplace_install_root); called by 2 (marketplace_remove_deletes_config_and_installed_root, marketplace_remove_json_prints_remove_outcome); 2 external calls (create_dir_all, write).
 
@@ -1307,11 +1335,11 @@ fn write_installed_marketplace(codex_home: &Path, marketplace_name: &str) -> Res
 async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()>
 ```
 
-**Purpose**: Verifies that removing a marketplace deletes both its config entry and its installed directory, and emits the expected human-readable success message.
+**Purpose**: This test checks the normal human-facing remove path. It verifies that removing a marketplace succeeds, prints a friendly message, removes the config entry, and deletes the installed directory.
 
-**Data flow**: It creates a temporary home, records marketplace `debug` using `record_user_marketplace` and the shared update fixture, writes an installed marketplace tree, runs `codex plugin marketplace remove debug`, then reads `config.toml` as text and asserts the marketplace section string is absent and the installed root path no longer exists.
+**Data flow**: It starts with a fresh temporary Codex home. It writes a marketplace config entry and a fake installed marketplace folder, runs `codex plugin marketplace remove debug`, then reads the config file and checks the installed folder path. The expected end state is no `[marketplaces.debug]` entry and no installed `debug` directory.
 
-**Call relations**: This async test is the primary end-to-end removal scenario. It composes `configured_marketplace_update`, `write_installed_marketplace`, and `codex_command` to drive the CLI through its normal success path.
+**Call relations**: This is one of the main test scenarios. It uses the setup helpers to create a realistic marketplace, calls the `codex` binary through `codex_command`, and then directly inspects disk state to confirm the command did the full cleanup.
 
 *Call graph*: calls 3 internal fn (codex_command, configured_marketplace_update, write_installed_marketplace); 5 external calls (new, assert!, record_user_marketplace, contains, read_to_string).
 
@@ -1322,11 +1350,11 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()>
 async fn marketplace_remove_json_prints_remove_outcome() -> Result<()>
 ```
 
-**Purpose**: Checks that JSON mode for marketplace removal reports the removed marketplace name and normalized installed root path.
+**Purpose**: This test checks the machine-readable output mode for marketplace removal. It ensures `--json` prints the marketplace name and the removed install path in the exact JSON shape expected by other tools.
 
-**Data flow**: It creates a temporary home, seeds config and installed files for `debug`, computes and normalizes the installed root path before deletion, runs `codex plugin marketplace remove debug --json`, parses stdout as `serde_json::Value`, and compares it to the expected JSON object.
+**Data flow**: It creates a temporary Codex home, records a fake marketplace, and writes its installed folder. It calculates the normalized installed path, runs `codex plugin marketplace remove debug --json`, parses the command’s standard output as JSON, and compares it with the expected JSON object.
 
-**Call relations**: This async test follows the same setup as the plain success test but validates the structured-output branch. It uses path normalization to match the CLI’s reported root exactly.
+**Call relations**: This test follows the same setup path as the normal remove test, but focuses on output rather than checking the remaining files afterward. It uses the path-normalizing helper so the expected path matches how the command reports paths.
 
 *Call graph*: calls 4 internal fn (codex_command, configured_marketplace_update, write_installed_marketplace, marketplace_install_root); 5 external calls (new, assert_eq!, record_user_marketplace, canonicalize_existing_preserving_symlinks, from_slice).
 
@@ -1337,22 +1365,24 @@ async fn marketplace_remove_json_prints_remove_outcome() -> Result<()>
 async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()>
 ```
 
-**Purpose**: Ensures the remove command fails cleanly when asked to remove a marketplace that is neither configured nor installed.
+**Purpose**: This test checks the error path. It makes sure the command refuses to remove a marketplace that does not exist in configuration or on disk, and that the error message explains the problem.
 
-**Data flow**: It creates an empty temporary home, runs `codex plugin marketplace remove debug`, and asserts process failure with stderr containing the unknown-marketplace message.
+**Data flow**: It starts with an empty temporary Codex home and runs `codex plugin marketplace remove debug`. Because nothing named `debug` was configured or installed, the expected result is a failed command with an error message saying the marketplace is not configured or installed.
 
-**Call relations**: This async test exercises the command’s early validation/error path without any fixture setup beyond `codex_command`.
+**Call relations**: Unlike the other tests, this one deliberately skips the setup helpers that create a marketplace. It calls the command helper directly and verifies that the command reports a clean failure instead of pretending the remove succeeded.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
 
 ### `cli/tests/marketplace_upgrade.rs`
 
-`test` · `CLI integration testing for marketplace upgrade command routing`
+`test` · `test run`
 
-This small integration test file is entirely about command routing and output shape for marketplace upgrades. The shared `codex_command` helper creates an `assert_cmd::Command` for the built `codex` binary and injects a temporary `CODEX_HOME`, ensuring no real user configuration affects the tests.
+This is a small integration test file for the `codex` command-line tool. Instead of calling internal Rust functions directly, it starts the real `codex` binary the way a user would run it in a terminal. That matters because these tests check the public command layout and output, which are the parts users and scripts rely on.
 
-The first test verifies the nominal command path `codex plugin marketplace upgrade` succeeds even when there are no configured git marketplaces, and that it prints the explicit empty-state message `No configured Git marketplaces to upgrade.`. The second test exercises the same command in `--json` mode and asserts that stdout parses into a JSON object with three empty arrays: `selectedMarketplaces`, `upgradedRoots`, and `errors`. That output contract matters because callers can distinguish “nothing to do” from command failure without scraping text. The final test locks in a CLI migration: `codex marketplace upgrade` should now fail with an unrecognized-subcommand error, proving the old top-level route has been removed. Together these tests define both the current invocation path and the no-op behavior when no upgrade candidates exist.
+Each test creates a fresh temporary `CODEX_HOME`, which is the directory Codex uses as its home/config area. This keeps the test environment empty and isolated, like giving each test a brand-new desk with no old papers on it. In that empty setup, there are no configured Git marketplaces, so the upgrade command should report that there is nothing to upgrade.
+
+The file checks three important promises. First, `codex plugin marketplace upgrade` succeeds and prints a human-readable message. Second, the same command with `--json` succeeds and prints a machine-readable result with empty lists for selected marketplaces, upgraded roots, and errors. Third, the old top-level form, `codex marketplace upgrade`, no longer works and is rejected as an unrecognized subcommand. Together, these tests protect both user-facing text and automation-friendly JSON behavior.
 
 #### Function details
 
@@ -1362,11 +1392,11 @@ The first test verifies the nominal command path `codex plugin marketplace upgra
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates an `assert_cmd::Command` for the `codex` executable with a temporary `CODEX_HOME`.
+**Purpose**: This helper builds a command object for running the real `codex` executable in a test. It also points `CODEX_HOME` at a chosen temporary directory so each test runs with its own clean configuration area.
 
-**Data flow**: It takes a home path, resolves the cargo-built binary, constructs the command, sets `CODEX_HOME`, and returns the configured command.
+**Data flow**: It receives a filesystem path for the temporary Codex home directory. It finds the compiled `codex` binary, creates a command ready to run it, sets the `CODEX_HOME` environment variable on that command, and returns the prepared command or an error if the binary cannot be found.
 
-**Call relations**: All three tests call this helper before supplying arguments for either the supported nested command or the rejected legacy top-level command.
+**Call relations**: The three tests call this helper before adding their own command-line arguments. It centralizes the setup step so each test starts the same way: with a real `codex` process aimed at an isolated home directory.
 
 *Call graph*: called by 3 (marketplace_upgrade_json_prints_upgrade_outcome, marketplace_upgrade_no_longer_runs_at_top_level, marketplace_upgrade_runs_under_plugin); 2 external calls (new, cargo_bin).
 
@@ -1377,11 +1407,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 async fn marketplace_upgrade_runs_under_plugin() -> Result<()>
 ```
 
-**Purpose**: Verifies that the supported upgrade command path is `plugin marketplace upgrade` and that it succeeds with a clear no-op message when no git marketplaces are configured.
+**Purpose**: This test proves that the marketplace upgrade command is available in its intended location: under `plugin marketplace`. It checks the normal, human-readable output when there is nothing to upgrade.
 
-**Data flow**: It creates a temporary home, runs `codex plugin marketplace upgrade`, and asserts success plus stdout containing `No configured Git marketplaces to upgrade.`.
+**Data flow**: It creates a new temporary Codex home, builds a `codex` command using that directory, and runs `plugin marketplace upgrade`. Because the temporary home has no marketplace configuration, it expects the command to succeed and print a message saying there are no configured Git marketplaces to upgrade.
 
-**Call relations**: This async test uses `codex_command` to exercise the current command path and validate the human-readable empty-state branch.
+**Call relations**: This test relies on `codex_command` to create the isolated command. It then uses the command assertion tools to run the real CLI and check both the exit result and the text shown to the user.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -1392,11 +1422,11 @@ async fn marketplace_upgrade_runs_under_plugin() -> Result<()>
 async fn marketplace_upgrade_json_prints_upgrade_outcome() -> Result<()>
 ```
 
-**Purpose**: Checks the JSON payload emitted by `plugin marketplace upgrade --json` when there is nothing to upgrade.
+**Purpose**: This test checks the automation-friendly JSON form of the marketplace upgrade command. It makes sure scripts can read a stable, structured result when no marketplaces are configured.
 
-**Data flow**: It creates a temporary home, runs the JSON form of the upgrade command, captures stdout, parses it as `serde_json::Value`, and asserts equality with an object containing empty `selectedMarketplaces`, `upgradedRoots`, and `errors` arrays.
+**Data flow**: It creates a fresh temporary Codex home, runs `codex plugin marketplace upgrade --json`, and captures the command's standard output. It parses that output as JSON and compares it with the expected object: no selected marketplaces, no upgraded roots, and no errors.
 
-**Call relations**: This async test complements the text-output test by pinning the machine-readable no-op contract for the same command path.
+**Call relations**: Like the other tests, it starts by calling `codex_command` for a clean CLI run. After the command succeeds, it hands the captured bytes to JSON parsing and uses an equality assertion to verify the exact structured response.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (new, assert_eq!, from_slice).
 
@@ -1407,11 +1437,11 @@ async fn marketplace_upgrade_json_prints_upgrade_outcome() -> Result<()>
 async fn marketplace_upgrade_no_longer_runs_at_top_level() -> Result<()>
 ```
 
-**Purpose**: Ensures the deprecated top-level `marketplace upgrade` route is rejected by the CLI parser.
+**Purpose**: This test makes sure the old or unintended command shape, `codex marketplace upgrade`, is not accepted. It protects the command-line interface from accidentally reintroducing a confusing top-level shortcut.
 
-**Data flow**: It creates a temporary home, runs `codex marketplace upgrade`, and asserts failure with stderr containing `unrecognized subcommand 'upgrade'`.
+**Data flow**: It creates a fresh temporary Codex home, builds a `codex` command, and runs `marketplace upgrade` without the `plugin` prefix. The expected result is failure, with an error message saying `upgrade` is an unrecognized subcommand.
 
-**Call relations**: This async test uses `codex_command` to validate command-tree structure rather than marketplace behavior, proving callers must now go through `plugin marketplace`.
+**Call relations**: The test uses `codex_command` for the same isolated setup as the successful cases. It then checks the failure path, complementing the other tests by confirming not just where the command works, but also where it should not work.
 
 *Call graph*: calls 1 internal fn (codex_command); 2 external calls (new, contains).
 
@@ -1421,13 +1451,15 @@ These tests validate MCP server configuration lifecycle commands, from adding an
 
 ### `cli/tests/mcp_add_remove.rs`
 
-`test` · `CLI integration testing for MCP server configuration`
+`test` · `test suite`
 
-This integration test file drives the MCP server management CLI and then reads back the persisted global MCP server configuration using `codex_core::config::load_global_mcp_servers`. The shared `codex_command` helper launches the built binary with an isolated `CODEX_HOME`. Unlike tests that only inspect stdout, these tests validate the exact `McpServerTransportConfig` variants and fields written into config.
+This is an automated test file for the Codex command-line app. MCP means “Model Context Protocol,” a way for Codex to connect to external tools or services. These tests treat the `codex` binary like a real user would: they create a temporary Codex home folder, run commands such as `codex mcp add ...`, then inspect the saved configuration to make sure the command did the right thing.
 
-The stdio-path tests add a server named `docs` or `envy` with command arguments and optional repeated `--env` flags, then load the resulting server map and pattern-match on `McpServerTransportConfig::Stdio { command, args, env, env_vars, cwd }`. They assert command/arg preservation, enabled state, and that explicit env key/value pairs survive round-trip with the expected values. The remove flow is also tested for idempotence: removing an existing server empties the config, and removing it again succeeds with a “not found” message rather than failing.
+The temporary folder is important. It acts like a clean, throwaway user profile, so the tests do not touch a developer’s real settings. After each command runs, the tests load the global MCP server configuration from that folder and compare it with what should have been saved.
 
-The HTTP-path tests add `StreamableHttp` servers via `--url`, checking default absence of bearer-token wiring, custom `--bearer-token-env-var`, and OAuth metadata (`--oauth-client-id`, `--oauth-resource`). They also verify that no `.credentials.json` or `.env` files are created for the no-token case. Two negative tests pin down CLI validation: the removed `--with-bearer-token` flag must fail without writing config, and mixing URL mode with a command-style invocation must be rejected by argument parsing.
+The file covers two main kinds of MCP servers. One kind starts a local command through standard input/output, like running `echo hello`. The other connects to a web URL using “streamable HTTP,” which means communication happens over regular web requests in a streaming-friendly format. The tests also check environment variables, OAuth-related settings, removed command flags, and invalid combinations of options.
+
+In short, this file is a safety net for the CLI. If a future change breaks how MCP servers are added or removed, these tests should catch it before users do.
 
 #### Function details
 
@@ -1437,11 +1469,11 @@ The HTTP-path tests add `StreamableHttp` servers via `--url`, checking default a
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates an `assert_cmd::Command` for the `codex` binary scoped to a temporary Codex home.
+**Purpose**: This helper creates a command object that runs the `codex` binary with a specific temporary Codex home folder. Tests use it so every command reads and writes settings in an isolated place.
 
-**Data flow**: It accepts `codex_home`, resolves the binary path, constructs the command, sets `CODEX_HOME`, and returns the configured command in a `Result`.
+**Data flow**: It receives a path to a temporary Codex home folder. It finds the built `codex` executable, creates a command runner for it, sets the `CODEX_HOME` environment variable to the given path, and returns that ready-to-use command runner.
 
-**Call relations**: Every test in this file uses it to invoke `mcp add`, `mcp remove`, or `mcp list` under isolated configuration.
+**Call relations**: All the tests call this helper before running the CLI. It hands each test a prepared `codex` command so the test can add arguments, execute it, and then inspect the resulting configuration.
 
 *Call graph*: called by 8 (add_and_remove_server_updates_global_config, add_cant_add_command_and_url, add_streamable_http_rejects_removed_flag, add_streamable_http_with_custom_env_var, add_streamable_http_with_oauth_options, add_streamable_http_without_manual_token, add_with_env_preserves_key_order_and_values, profile_mcp_reports_legacy_profile_migration); 2 external calls (new, cargo_bin).
 
@@ -1452,11 +1484,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 async fn add_and_remove_server_updates_global_config() -> Result<()>
 ```
 
-**Purpose**: Verifies that adding a stdio MCP server writes the expected global config and that removing it deletes that config, including the idempotent second-remove case.
+**Purpose**: This test checks the basic happy path: adding a local MCP server writes it to global config, removing it deletes it, and removing it again gives a harmless “not found” message.
 
-**Data flow**: It creates a temporary home, runs `mcp add docs -- echo hello`, loads the global server map asynchronously, extracts `docs`, matches its transport as `McpServerTransportConfig::Stdio`, and asserts command, args, empty env/env_vars, absent cwd, and `enabled = true`. It then runs `mcp remove docs`, reloads and asserts the map is empty, runs the same remove again, and confirms the map remains empty while stdout reports no server found.
+**Data flow**: It starts with an empty temporary Codex home folder. It runs `codex mcp add docs -- echo hello`, then loads the saved MCP server list and checks that one enabled server named `docs` exists with command `echo` and argument `hello`. Next it runs `codex mcp remove docs`, reloads the server list, and checks that it is empty. Finally it removes `docs` again and confirms the command succeeds without recreating anything.
 
-**Call relations**: This async test is the main add/remove lifecycle scenario. It uses `codex_command` for CLI execution and `load_global_mcp_servers` after each mutation to verify persisted state rather than trusting command output alone.
+**Call relations**: The test uses `codex_command` to run the real CLI, then uses `load_global_mcp_servers` to read back what the CLI wrote. It relies on output text checks to confirm the user-facing messages match the expected add, remove, and not-found cases.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 5 external calls (new, assert!, assert_eq!, panic!, contains).
 
@@ -1467,11 +1499,11 @@ async fn add_and_remove_server_updates_global_config() -> Result<()>
 async fn profile_mcp_reports_legacy_profile_migration() -> Result<()>
 ```
 
-**Purpose**: Checks that using `--profile` with MCP commands against a legacy profile layout fails with a migration-oriented diagnostic.
+**Purpose**: This test makes sure the CLI gives a clear error when someone tries to use `mcp` commands with an old-style profile configuration. It protects users from silently editing the wrong settings file.
 
-**Data flow**: It creates a temporary home, writes a `config.toml` containing `[profiles.work]`, runs `codex --profile work mcp list`, and asserts failure with stderr mentioning that profile `work` cannot be used, the legacy config section, and the expected `work.config.toml` migration target.
+**Data flow**: It creates a temporary Codex home folder and writes a `config.toml` file containing a legacy `[profiles.work]` section. It then runs `codex --profile work mcp list` and expects the command to fail. The failure message must mention that `--profile work` cannot be used, point to `[profiles.work]`, and suggest the newer `work.config.toml` style.
 
-**Call relations**: This async test bypasses helper config loaders and writes the legacy profile file directly so the CLI enters its profile-migration error path.
+**Call relations**: The test calls `codex_command` to run the CLI against the temporary folder. It writes the setup file directly, then checks the command’s standard error output for the migration guidance users should see.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (new, contains, write).
 
@@ -1482,11 +1514,11 @@ async fn profile_mcp_reports_legacy_profile_migration() -> Result<()>
 async fn add_with_env_preserves_key_order_and_values() -> Result<()>
 ```
 
-**Purpose**: Verifies that repeated `--env` flags on `mcp add` are persisted as explicit environment entries with the expected keys and values.
+**Purpose**: This test checks that environment variables passed during `mcp add` are saved correctly. This matters because MCP servers often need tokens, paths, or feature flags in their environment.
 
-**Data flow**: It creates a temporary home, runs `mcp add envy --env FOO=bar --env ALPHA=beta -- python server.py`, loads the global server map, extracts `envy`, matches `transport` as `Stdio` with `env: Some(env)`, and asserts the map length is 2, `FOO` maps to `bar`, `ALPHA` maps to `beta`, and the server is enabled.
+**Data flow**: It runs `codex mcp add envy` with two `--env` values, `FOO=bar` and `ALPHA=beta`, followed by a local command `python server.py`. It then loads the saved MCP configuration, finds the `envy` server, and checks that both environment entries are present with the right values and that the server is enabled.
 
-**Call relations**: This async test uses `codex_command` to create the server and `load_global_mcp_servers` to inspect the persisted transport structure after parsing repeated CLI flags.
+**Call relations**: The test uses `codex_command` to execute the add command and `load_global_mcp_servers` to inspect the stored result. If the CLI parser or config writer changes how environment variables are stored, this test is meant to catch that.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 4 external calls (new, assert!, assert_eq!, panic!).
 
@@ -1497,11 +1529,11 @@ async fn add_with_env_preserves_key_order_and_values() -> Result<()>
 async fn add_streamable_http_without_manual_token() -> Result<()>
 ```
 
-**Purpose**: Checks that adding an HTTP MCP server with only `--url` produces a `StreamableHttp` transport with no token or header configuration and no credential side files.
+**Purpose**: This test checks that adding an HTTP-based MCP server without any manual token option creates a clean web-server configuration. It also confirms the command does not create credential files unnecessarily.
 
-**Data flow**: It creates a temporary home, runs `mcp add github --url https://example.com/mcp`, loads the server map, extracts `github`, matches `transport` as `McpServerTransportConfig::StreamableHttp`, and asserts the URL matches while `bearer_token_env_var`, `http_headers`, and `env_http_headers` are all `None`. It also asserts the server is enabled and that `.credentials.json` and `.env` do not exist under `CODEX_HOME`.
+**Data flow**: It starts with an empty temporary Codex home folder and runs `codex mcp add github --url https://example.com/mcp`. It loads the saved server list and confirms that `github` uses the streamable HTTP transport with the exact URL and no bearer token environment variable or extra HTTP headers. It also checks that `.credentials.json` and `.env` were not created.
 
-**Call relations**: This async test covers the simplest HTTP transport path and explicitly checks that the command does not create extra credential storage when no token-related option is supplied.
+**Call relations**: The test gets a prepared CLI command from `codex_command`, then reads the result through `load_global_mcp_servers`. It connects the command-line behavior to the saved config and to the absence of side-effect files.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 4 external calls (new, assert!, assert_eq!, panic!).
 
@@ -1512,11 +1544,11 @@ async fn add_streamable_http_without_manual_token() -> Result<()>
 async fn add_streamable_http_with_custom_env_var() -> Result<()>
 ```
 
-**Purpose**: Verifies that `--bearer-token-env-var` is persisted on a streamable HTTP MCP server.
+**Purpose**: This test checks that users can tell an HTTP MCP server which environment variable should contain its bearer token. A bearer token is a secret string used to prove access to a service.
 
-**Data flow**: It creates a temporary home, runs `mcp add issues --url https://example.com/issues --bearer-token-env-var GITHUB_TOKEN`, loads the server map, extracts `issues`, matches `StreamableHttp`, and asserts the URL, `bearer_token_env_var = Some("GITHUB_TOKEN")`, absent header fields, and enabled state.
+**Data flow**: It runs `codex mcp add issues --url https://example.com/issues --bearer-token-env-var GITHUB_TOKEN`. It then loads the configuration, finds the `issues` server, and checks that the URL is saved and that the bearer token environment variable name is `GITHUB_TOKEN`. It also confirms there are no extra header settings and that the server is enabled.
 
-**Call relations**: This async test exercises the HTTP transport branch with explicit bearer-token environment wiring and validates the resulting config via `load_global_mcp_servers`.
+**Call relations**: The test uses `codex_command` for the real CLI call and `load_global_mcp_servers` to verify the stored configuration. It focuses on the handoff from a command-line flag into the HTTP transport settings.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 4 external calls (new, assert!, assert_eq!, panic!).
 
@@ -1527,11 +1559,11 @@ async fn add_streamable_http_with_custom_env_var() -> Result<()>
 async fn add_streamable_http_with_oauth_options() -> Result<()>
 ```
 
-**Purpose**: Checks that OAuth-related CLI options are stored on the created MCP server entry.
+**Purpose**: This test checks that OAuth-related options are saved for an HTTP MCP server. OAuth is a common sign-in and authorization flow used by web services.
 
-**Data flow**: It creates a temporary home, runs `mcp add oauth-server --url https://example.com/mcp --oauth-client-id eci-prd-pub-codex-123 --oauth-resource https://resource.example.com`, loads the server map, extracts `oauth-server`, and asserts `oauth_client_id()` returns the configured client ID and `oauth_resource` matches the supplied resource URL.
+**Data flow**: It runs `codex mcp add oauth-server` with a URL, an OAuth client ID, and an OAuth resource URL. After loading the saved MCP servers, it finds `oauth-server` and checks that the OAuth client ID and resource were stored exactly as provided.
 
-**Call relations**: This async test focuses on metadata attached to the server entry beyond the transport enum fields, using `load_global_mcp_servers` to verify the persisted server object.
+**Call relations**: The test gets its command runner from `codex_command` and reads back the resulting configuration with `load_global_mcp_servers`. It confirms that OAuth command-line options make it all the way into the saved server definition.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 2 external calls (new, assert_eq!).
 
@@ -1542,11 +1574,11 @@ async fn add_streamable_http_with_oauth_options() -> Result<()>
 async fn add_streamable_http_rejects_removed_flag() -> Result<()>
 ```
 
-**Purpose**: Ensures the obsolete `--with-bearer-token` flag is rejected and does not leave behind any MCP server config.
+**Purpose**: This test makes sure an old removed flag, `--with-bearer-token`, is rejected instead of being accepted silently. That helps prevent users from thinking they configured authentication when they did not.
 
-**Data flow**: It creates a temporary home, runs `mcp add github --url https://example.com/mcp --with-bearer-token`, asserts failure with stderr mentioning the removed flag, then loads the global server map and asserts it is empty.
+**Data flow**: It runs `codex mcp add github --url https://example.com/mcp --with-bearer-token` in a temporary Codex home folder. The command is expected to fail and print an error mentioning the removed flag. The test then loads the server list and checks that no server was saved.
 
-**Call relations**: This async test drives a parser/validation failure path and then confirms via `load_global_mcp_servers` that no partial configuration was written.
+**Call relations**: The test uses `codex_command` to exercise the CLI parser and `load_global_mcp_servers` to confirm failure left no configuration behind. It ties an invalid user input directly to both the error message and the absence of side effects.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 3 external calls (new, assert!, contains).
 
@@ -1557,22 +1589,24 @@ async fn add_streamable_http_rejects_removed_flag() -> Result<()>
 async fn add_cant_add_command_and_url() -> Result<()>
 ```
 
-**Purpose**: Verifies that command-style and URL-style MCP server definitions are mutually exclusive at the CLI level.
+**Purpose**: This test checks that users cannot mix two different ways of defining an MCP server: a local command and a web URL. The CLI should force one clear transport choice.
 
-**Data flow**: It creates a temporary home, runs `mcp add github --url https://example.com/mcp --command -- echo hello`, asserts failure with stderr containing the unexpected-argument message for `--command`, then loads the global server map and asserts it remains empty.
+**Data flow**: It runs an `mcp add` command that includes both `--url https://example.com/mcp` and a command-style setup with `echo hello`. The command is expected to fail with an error about the unexpected `--command` argument. The test then loads the MCP configuration and verifies that nothing was saved.
 
-**Call relations**: This async test checks argument parsing rather than transport semantics, ensuring invalid mixed-mode invocations are rejected before config mutation.
+**Call relations**: The test calls `codex_command` to run the invalid CLI input and `load_global_mcp_servers` afterward to check that the failed command did not modify global config. It guards the boundary where command-line parsing decides which MCP transport style is allowed.
 
 *Call graph*: calls 2 internal fn (codex_command, load_global_mcp_servers); 3 external calls (new, assert!, contains).
 
 
 ### `cli/tests/mcp_list.rs`
 
-`test` · `CLI integration testing for MCP inspection commands`
+`test` · `test run`
 
-This file validates the read side of MCP server management after configuration has been written. `codex_command` launches the CLI under a temporary `CODEX_HOME`. The tests use `load_global_mcp_servers` to fetch the current server map, mutate it in memory, and write it back with `ConfigEditsBuilder::replace_mcp_servers(...).apply_blocking()` so they can exercise rendering paths that are hard to reach through CLI flags alone.
+This is an integration test file. Instead of testing one small function in isolation, it runs the real `codex` command-line program in a temporary home folder, much like a user would. MCP here means “Model Context Protocol,” a way for Codex to connect to external helper servers. The tests make sure the CLI behaves correctly when there are no MCP servers, when one server exists, and when a server has been disabled.
 
-`list_shows_empty_state` covers the simplest case: `codex mcp list` should succeed and print `No MCP servers configured yet.` when no servers exist. The larger `list_and_get_render_expected_output` test first adds a stdio server with one explicit secret env var, then edits the stored transport to add `env_vars` placeholders such as `APP_TOKEN` and `WORKSPACE_ID`. It verifies the table output includes headers, server identity, command, masked env values (`*****`), enabled status, and auth status `Unsupported`. It then checks `mcp list --json` returns a precise JSON array with the full stdio transport object, including unmasked stored env values and the added `env_vars`. Finally it validates `mcp get docs` in both text and JSON forms, including the suggested remove command. The last test disables a server in config and confirms `mcp get` collapses to the single-line `docs (disabled)` representation instead of the full detail block.
+The temporary `CODEX_HOME` folder is important. It gives each test a clean, throwaway configuration area, like testing a recipe in a fresh kitchen so old ingredients cannot affect the result. The helper `codex_command` creates a command that runs the built `codex` binary with that temporary home set.
+
+The tests check both friendly text output and machine-readable JSON output. The friendly output must mask secrets such as `TOKEN=secret` as `TOKEN=*****`, so users can safely copy terminal output without leaking private values. The JSON output, however, is expected to contain the real saved configuration, because tools may need exact data. The file also edits the saved MCP config directly to test details that are harder to create through the CLI alone, such as inherited environment variable names and disabled servers.
 
 #### Function details
 
@@ -1582,11 +1616,11 @@ This file validates the read side of MCP server management after configuration h
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 ```
 
-**Purpose**: Creates an `assert_cmd::Command` for the `codex` binary with `CODEX_HOME` set to the temporary test directory.
+**Purpose**: This helper creates a ready-to-run `codex` command for a test. It points the command at a temporary `CODEX_HOME`, so each test uses its own isolated configuration instead of the developer’s real files.
 
-**Data flow**: It takes a home path, resolves the cargo-built executable, constructs the command, sets `CODEX_HOME`, and returns the configured command.
+**Data flow**: It receives the path to a temporary Codex home folder. It finds the compiled `codex` binary, creates a command object for it, sets the `CODEX_HOME` environment variable on that command, and returns the prepared command. If finding the binary fails, it returns an error instead.
 
-**Call relations**: All three tests use this helper before invoking `mcp list`, `mcp get`, or `mcp add`.
+**Call relations**: The three tests call this whenever they need to run the CLI. It wraps the lower-level command creation and binary lookup, so the test bodies can focus on the MCP behavior they are checking rather than repeating setup code.
 
 *Call graph*: called by 3 (get_disabled_server_shows_single_line, list_and_get_render_expected_output, list_shows_empty_state); 2 external calls (new, cargo_bin).
 
@@ -1597,11 +1631,11 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command>
 fn list_shows_empty_state() -> Result<()>
 ```
 
-**Purpose**: Verifies that `mcp list` succeeds and prints the expected empty-state message when no MCP servers are configured.
+**Purpose**: This test confirms that `codex mcp list` gives a helpful message when no MCP servers have been configured. Without this behavior, a new user might see a blank or confusing result.
 
-**Data flow**: It creates a temporary home, runs `codex mcp list` via `.output()`, asserts the exit status is successful, decodes stdout as UTF-8, and checks that the output contains `No MCP servers configured yet.`.
+**Data flow**: It starts with a brand-new temporary Codex home folder. It builds a `codex` command for that folder, runs `mcp list`, reads the command’s standard output as text, and checks that the command succeeded and printed `No MCP servers configured yet.` Nothing lasting is written outside the temporary folder.
 
-**Call relations**: This synchronous test uses only `codex_command` and direct process output inspection to validate the zero-config rendering path.
+**Call relations**: This test uses `codex_command` to run the real CLI in an isolated setup. It then relies on normal process output and assertions to verify the user-facing empty-state message.
 
 *Call graph*: calls 1 internal fn (codex_command); 3 external calls (from_utf8, new, assert!).
 
@@ -1612,11 +1646,11 @@ fn list_shows_empty_state() -> Result<()>
 async fn list_and_get_render_expected_output() -> Result<()>
 ```
 
-**Purpose**: Exercises the full text and JSON rendering of an enabled stdio MCP server, including masked secrets and persisted transport fields.
+**Purpose**: This test checks the main happy path for MCP display commands: add a server, list it, fetch it by name, and verify both text and JSON forms. It also verifies that secrets are hidden in text output but preserved in JSON configuration output.
 
-**Data flow**: It creates a temporary home, adds server `docs` with `mcp add` and one `--env TOKEN=secret`, loads the server map asynchronously, mutates the `docs` transport to set `env_vars = ["APP_TOKEN", "WORKSPACE_ID"]`, writes the edited map back with `ConfigEditsBuilder`, then runs `mcp list`, `mcp list --json`, `mcp get docs`, and `mcp get docs --json`. It decodes text outputs, parses JSON outputs, and asserts on headers, masked values, enabled/auth labels, exact JSON structure, and the presence of the suggested remove command.
+**Data flow**: It begins with an empty temporary Codex home. It runs `codex mcp add docs` to save a server named `docs` with a command, arguments, and an environment secret. It then loads the saved MCP server configuration, edits it to include extra environment variable names, and writes the updated configuration back. After that it runs `mcp list`, `mcp list --json`, `mcp get docs`, and `mcp get docs --json`. The test checks that human-readable output includes the expected names, commands, status fields, and masked secrets, while the JSON output exactly matches the expected structured data.
 
-**Call relations**: This async test combines CLI writes, direct config mutation, and multiple read commands to validate both serialization and human-facing formatting paths that depend on stored transport details.
+**Call relations**: This test repeatedly calls `codex_command` to run separate CLI invocations against the same temporary home folder, so each command sees the configuration written by the previous one. It also calls `load_global_mcp_servers` and uses `ConfigEditsBuilder` to adjust the saved config before checking how the list and get commands render it.
 
 *Call graph*: calls 3 internal fn (codex_command, new, load_global_mcp_servers); 8 external calls (from_utf8, new, assert!, assert_eq!, panic!, contains, from_str, vec!).
 
@@ -1627,11 +1661,11 @@ async fn list_and_get_render_expected_output() -> Result<()>
 async fn get_disabled_server_shows_single_line() -> Result<()>
 ```
 
-**Purpose**: Checks that `mcp get` renders a disabled server as a compact single-line status instead of the normal detailed block.
+**Purpose**: This test verifies the special display for a disabled MCP server. When a server is disabled, `codex mcp get` should show a short single-line summary instead of the full server details.
 
-**Data flow**: It creates a temporary home, adds server `docs`, loads the server map, sets `docs.enabled = false`, writes the modified map back with `ConfigEditsBuilder`, runs `codex mcp get docs`, decodes stdout, and asserts the trimmed output equals exactly `docs (disabled)`.
+**Data flow**: It creates a temporary Codex home, runs the CLI to add a `docs` MCP server, then loads the saved server configuration. It changes the server’s `enabled` flag to false and writes the configuration back. Finally it runs `codex mcp get docs`, reads the output, and checks that the trimmed output is exactly `docs (disabled)`.
 
-**Call relations**: This async test uses the same add-then-edit pattern as the previous test, but specifically drives the disabled rendering branch in the `get` command.
+**Call relations**: Like the other tests, it uses `codex_command` to run the real CLI in a clean environment. It uses `load_global_mcp_servers` and `ConfigEditsBuilder` between CLI calls to put the configuration into a disabled state, then checks that the get command follows the intended disabled-server display path.
 
 *Call graph*: calls 3 internal fn (codex_command, new, load_global_mcp_servers); 4 external calls (from_utf8, new, assert!, assert_eq!).
 
@@ -1641,13 +1675,13 @@ These optional smoke tests run the real CLI binary against the live service to c
 
 ### `core/tests/suite/live_cli.rs`
 
-`test` · `request handling`
+`test` · `optional ignored test run`
 
-Unlike the rest of the suite, this file intentionally talks to the real network and is marked `#[ignore]` so CI remains deterministic and free. The tests are aimed at developers running local smoke checks with a valid `OPENAI_API_KEY`. The helper `require_api_key` enforces that prerequisite, while `run_live` does the heavy lifting of spawning the compiled `codex-rs` binary inside a temporary working directory and isolated temporary home directory with `CODEX_HOME` pointing at a fresh `.codex` tree.
+These tests answer a simple but important question: can the finished command-line tool actually talk to OpenAI and use tools in a real working directory? Most tests in a project try to be predictable and isolated. This file deliberately does the opposite, but only when a developer asks for it. It uses a real `OPENAI_API_KEY`, starts the real `codex-rs` binary, gives it a prompt, and checks whether the visible result matches what was requested.
 
-A notable design choice in `run_live` is that it bypasses `assert_cmd`’s command wrapper for process creation. Instead it constructs a plain `std::process::Command`, pipes stdin/stdout/stderr manually, writes a terminating newline to stdin so the session exits after one turn, and spawns one thread per output stream to tee bytes to both the parent terminal and an in-memory buffer. That gives live visibility during the test while still producing a captured `std::process::Output` that can be converted into `assert_cmd::Assert` for familiar assertions.
+The helper code creates temporary folders so the test does not touch the developer’s real files or Codex settings. Think of it like setting up a clean hotel room for the program: it can work there freely, and the room is thrown away afterward. The command is run with its output captured and also streamed live to the terminal, so the developer can watch what happens while still getting normal test assertions afterward.
 
-The two ignored tests then assert concrete side effects. One asks the model to create `hello.txt` via the shell/apply_patch path and checks the file exists with trimmed contents `hello`. The other asks the model to print the current working directory and asserts stdout contains the temporary directory path. Both short-circuit with a skip message if the API key is absent.
+There are two ignored tests. One asks the model to create `hello.txt` with the text `hello`, proving file editing through the shell path works. The other asks it to print the current working directory, proving the CLI can run a shell request and report the expected directory. Without this file, the project would still have unit tests, but it would lack a quick manual check that the whole real stack works together.
 
 #### Function details
 
@@ -1657,11 +1691,11 @@ The two ignored tests then assert concrete side effects. One asks the model to c
 fn require_api_key() -> String
 ```
 
-**Purpose**: Fetches `OPENAI_API_KEY` from the environment and fails immediately with a descriptive message if it is missing. It centralizes the live-test prerequisite check.
+**Purpose**: This function reads the `OPENAI_API_KEY` environment variable, which is the secret token needed to call the real OpenAI service. It stops immediately with a clear message if the key is missing, because these live tests cannot run without it.
 
-**Data flow**: Takes no arguments, reads `std::env::var("OPENAI_API_KEY")`, and returns the resulting `String` on success. If the variable is absent, it panics with an `expect` message instructing the caller to skip live tests.
+**Data flow**: It takes no direct input. It looks in the process environment for `OPENAI_API_KEY`; if the value is present, it returns that string so the child `codex-rs` process can use it. If the value is absent, it fails with an explanation instead of letting the test fail later in a more confusing way.
 
-**Call relations**: Called only by `run_live` during child-process setup. The top-level tests perform their own softer presence checks first so they can print a skip message instead of panicking.
+**Call relations**: The live command setup calls this when preparing to launch `codex-rs`. That keeps the API-key check close to the place where the child process environment is built.
 
 *Call graph*: called by 1 (run_live); 1 external calls (var).
 
@@ -1672,11 +1706,11 @@ fn require_api_key() -> String
 fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir)
 ```
 
-**Purpose**: Spawns the real `codex-rs` binary in an isolated temp workspace, streams its stdout/stderr live to the parent terminal, captures the same output for assertions, and returns both the `Assert` handle and working directory. It is the core harness for the live CLI smoke tests.
+**Purpose**: This is the shared test helper that runs the real `codex-rs` binary with a prompt in a clean temporary workspace. It gives the tests a ready-made result object for assertions, plus the temporary directory where any files should have been created.
 
-**Data flow**: Accepts a prompt string. It creates temporary working and home directories, creates `CODEX_HOME/.codex`, builds a `std::process::Command` pointing at the compiled `codex-rs` binary, sets `OPENAI_API_KEY`, `HOME`, and `CODEX_HOME`, appends CLI args `--allow-no-git-exec -v -- <prompt>`, and configures piped stdin/stdout/stderr. After spawning the child, it writes a newline to stdin so the session exits after one turn. It defines a nested `tee` helper that reads from a child stream in chunks, mirrors bytes to the parent stdout/stderr, accumulates them into `Vec<u8>`, and returns that buffer from a thread. `run_live` joins both tee threads, waits for process exit, constructs `std::process::Output { status, stdout, stderr }`, converts it to `assert_cmd::Assert`, and returns that together with the temp working directory.
+**Data flow**: It receives a prompt string. It creates temporary directories for the working folder and fake home/Codex home, adds the API key and environment settings, starts `codex-rs`, sends a newline so the session finishes after one turn, and captures both standard output and standard error. At the same time, it copies that output to the developer’s terminal for live visibility. It returns the captured command result, wrapped for convenient assertions, and the temporary working directory.
 
-**Call relations**: Both ignored live tests call this helper with different prompts. It delegates to `require_api_key` for credentials and encapsulates all process-management details so the tests themselves only assert on success, stdout, and filesystem side effects.
+**Call relations**: Both live smoke tests use this helper instead of duplicating the process-launching work. Inside, it asks `require_api_key` for the credential, starts the binary, collects the result, and hands that result back so each test can check its own expected behavior.
 
 *Call graph*: calls 1 internal fn (require_api_key); called by 2 (live_create_file_hello_txt, live_print_working_directory); 7 external calls (piped, new, new, cargo_bin, create_dir_all, stderr, stdout).
 
@@ -1687,11 +1721,11 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir)
 fn live_create_file_hello_txt()
 ```
 
-**Purpose**: Runs a live CLI prompt instructing the model to create `hello.txt` via the shell/apply_patch path, then verifies the file was actually created with the expected contents. It is a concrete end-to-end smoke test of tool use plus filesystem mutation.
+**Purpose**: This ignored smoke test checks whether the real CLI can ask the model to use the shell tool to create a file. It verifies the full path from prompt, to live model response, to tool execution, to a changed file on disk.
 
-**Data flow**: Takes no arguments. It first checks whether `OPENAI_API_KEY` is set; if not, it prints a skip message and returns early. Otherwise it calls `run_live` with a prompt that explicitly asks for `hello.txt` containing `hello`, asserts the child process succeeded, checks that `dir.path().join("hello.txt")` exists, reads the file to string, and asserts the trimmed contents equal `hello`.
+**Data flow**: It first checks whether `OPENAI_API_KEY` exists. If not, it prints a skip message and returns. If the key is present, it sends a prompt through `run_live` asking for `hello.txt` to be created with the text `hello`. It then checks that the command succeeded, that the file exists in the temporary directory, and that the file contents match the expected text after trimming whitespace.
 
-**Call relations**: This top-level ignored test depends on `run_live` for process execution and environment isolation. Its assertions are intentionally concrete so a developer can tell whether the live model successfully used the shell tool to modify the temp workspace.
+**Call relations**: This test is one of the direct users of `run_live`. It relies on that helper to create the isolated environment and run the binary, then performs file-system checks specific to the “create a file” scenario.
 
 *Call graph*: calls 1 internal fn (run_live); 5 external calls (assert!, assert_eq!, eprintln!, var, read_to_string).
 
@@ -1702,10 +1736,10 @@ fn live_create_file_hello_txt()
 fn live_print_working_directory()
 ```
 
-**Purpose**: Runs a live CLI prompt asking the model to print the current working directory and verifies stdout contains the temporary workspace path. It is a lightweight smoke test of shell execution and CLI output plumbing.
+**Purpose**: This ignored smoke test checks whether the real CLI can use the shell tool to print its current working directory. It confirms that the command runs in the intended temporary folder and that the output reaches the test harness.
 
-**Data flow**: Takes no arguments. It checks for `OPENAI_API_KEY`, printing a skip message and returning if absent. Otherwise it calls `run_live` with a prompt requesting the current working directory, then asserts process success and that stdout contains `dir.path().to_string_lossy()` using a predicate.
+**Data flow**: It first looks for `OPENAI_API_KEY`. If the key is missing, it prints a skip message and exits early. If the key is present, it calls `run_live` with a prompt asking the model to print the current directory. It then asserts that the command succeeded and that the captured standard output contains the path of the temporary directory.
 
-**Call relations**: This is the simpler companion to `live_create_file_hello_txt`. It reuses `run_live` but validates observable stdout rather than a created file.
+**Call relations**: This test also builds on `run_live`, using its launched real CLI session and captured output. Unlike the file-creation test, it focuses on what the command prints, so it checks the returned assertion object’s stdout for the temporary directory path.
 
 *Call graph*: calls 1 internal fn (run_live); 3 external calls (eprintln!, contains, var).

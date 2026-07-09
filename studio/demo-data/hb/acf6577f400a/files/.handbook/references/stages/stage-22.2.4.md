@@ -1,10 +1,10 @@
 # TUI presentation models, styling, and lightweight view helpers  `stage-22.2.4`
 
-This stage sits in the TUI presentation layer between low-level text layout and the concrete screens in the main interaction loop. Its job is to turn already-decided application state into compact, terminal-aware display models, reusable renderables, and consistent styling rules that many widgets can share.
+This stage is shared behind-the-scenes support for the terminal user interface. It sits above the low-level text drawing code and prepares what the user will see: colors, labels, rows, popups, footers, and status text. The color, style, chart palette, and spacing files choose readable colors, symbols, and margins so screens stay consistent on different terminals. The renderable building blocks let text and containers report their size and draw themselves.
 
-At the foundation, renderable.rs defines the common Renderable abstraction and simple row/column/inset composition, while history_cell/base.rs and selection_list.rs provide reusable visual building blocks for transcript cells and numbered menu rows. color.rs, style.rs, and ui_consts.rs establish the shared visual language: palette math, terminal-adaptive style constructors, and the gutter/indent constants that keep footers, live cells, and wrapped text aligned.
+Several files shape common controls. Key hints make shortcuts display consistently. Scroll state, selection rows, selection popups, and selection tabs keep lists, tabs, highlights, wrapping, and disabled choices predictable. The footer, action-required title, and popup constants build the bottom-pane messages that guide the user.
 
-Several files specialize that infrastructure for bottom-pane UI: footer.rs renders contextual footer lines, action_required_title.rs builds terminal-title text, popup_consts.rs standardizes popup hints, scroll_state.rs manages list selection and viewport movement, and selection_popup_common.rs plus selection_tabs.rs render consistent popup menus and tab bars. key_hint.rs normalizes bindings and formats shortcut labels used across those surfaces. The remaining helpers shape specific user-facing summaries—goals, skills, status fields, remote connection info, token-chart palettes, migration item labels, and warning deduplication—so higher-level widgets can present concise, coherent output.
+Other helpers turn internal data into friendly display models. Warning logic avoids repeated chat warnings. Migration, goal, skill, status, and remote-connection helpers convert raw settings, paths, counts, times, server details, and skill metadata into short readable text. History cells provide reusable transcript pieces, including wrapped text and links.
 
 ## Files in this stage
 
@@ -13,13 +13,15 @@ These files define the shared color, style, layout, and renderable foundations t
 
 ### `tui/src/color.rs`
 
-`util` · `cross-cutting during theme/style computation`
+`util` · `cross-cutting`
 
-This file contains three pure helpers over RGB tuples. `is_light` computes a luminance-like brightness score using the standard weighted sum `0.299*r + 0.587*g + 0.114*b` and compares it against `128.0`, giving callers a simple dark-vs-light background classification. `blend` performs straightforward alpha compositing between foreground and background tuples by linearly interpolating each channel with the supplied `alpha` and truncating back to `u8`.
+A terminal interface often has to adapt to many backgrounds and themes. A color that looks good on a dark background may be hard to read on a light one. This file is a small toolbox for making those choices more safely.
 
-The most substantial function is `perceptual_distance`, which approximates perceptual color difference by converting both colors from sRGB into CIE Lab-like coordinates and then taking Euclidean distance there (CIE76). It nests three local helpers to keep the conversion pipeline self-contained: `srgb_to_linear` applies the standard gamma correction threshold at `0.04045`; `rgb_to_xyz` multiplies the linearized channels by fixed coefficients for an XYZ transform; and `xyz_to_lab` normalizes against D65 reference white and applies the piecewise Lab transfer function threshold at `0.008856`. After converting both input colors, the function subtracts their `L`, `a`, and `b` components and returns the square root of the sum of squared deltas.
+It works with RGB colors, meaning colors described as three numbers: red, green, and blue, each from 0 to 255. The `is_light` helper answers a basic question: is this background closer to light or dark? That lets other parts of the UI pick contrasting text or highlight colors.
 
-There is no mutable state or I/O here; the file exists purely to support adaptive theme and style calculations elsewhere in the TUI.
+The `blend` helper mixes one color over another, like putting a partly transparent sheet of colored plastic on top of a background. This is useful for subtle row backgrounds, overlays, separators, shimmer effects, and message bubbles without needing a completely separate hard-coded color for every theme.
+
+The `perceptual_distance` helper estimates how far apart two colors appear to people. It converts ordinary screen RGB colors into a color space designed to better match human vision, then measures the distance there. This matters because two RGB values can be numerically different but visually similar, or the other way around.
 
 #### Function details
 
@@ -29,11 +31,11 @@ There is no mutable state or I/O here; the file exists purely to support adaptiv
 fn is_light(bg: (u8, u8, u8)) -> bool
 ```
 
-**Purpose**: Classifies an RGB background as light or dark using a weighted luminance heuristic. It gives theme code a simple boolean for contrast decisions.
+**Purpose**: Decides whether an RGB color should be treated as a light background. Other UI code can use this to choose colors that remain readable instead of accidentally placing pale text on a pale background.
 
-**Data flow**: It destructures `bg` into `(r, g, b)`, computes `y = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32`, and returns `true` when `y > 128.0`.
+**Data flow**: It receives a background color as three numbers: red, green, and blue. It combines them using weights that reflect how bright each color appears to human eyes, with green counting the most and blue the least. It returns `true` if the calculated brightness is above the midpoint threshold, and `false` otherwise.
 
-**Call relations**: This helper is called by theme-construction and style-selection code such as adaptive theme selection and message background styling. It is a leaf utility with no further delegation.
+**Call relations**: Theme-building and styling code calls this when it needs to adapt to a background color. It is used during theme creation, automatic theme selection, dense row styling, loading overlay styling, and user message background styling so those places can branch between light-background and dark-background choices.
 
 *Call graph*: called by 6 (from_parts, diff_theme_for_bg, adaptive_default_theme_selection, dense_row_background_style, transcript_loading_overlay_style, user_message_bg).
 
@@ -44,11 +46,11 @@ fn is_light(bg: (u8, u8, u8)) -> bool
 fn blend(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: f32) -> (u8, u8, u8)
 ```
 
-**Purpose**: Blends a foreground RGB color over a background RGB color using a scalar alpha. It is used to derive intermediate shades for overlays, separators, and shimmer effects.
+**Purpose**: Mixes two RGB colors using an opacity value. It is used when the UI wants a color that feels layered or softened, rather than a hard switch from one color to another.
 
-**Data flow**: It takes `fg`, `bg`, and `alpha`, computes each output channel as `fg_channel * alpha + bg_channel * (1.0 - alpha)`, casts the results to `u8`, and returns the blended `(r, g, b)` tuple.
+**Data flow**: It receives a foreground color, a background color, and an `alpha` value, which means how strongly the foreground should show through. For each red, green, and blue channel, it takes some of the foreground and the remaining amount from the background. It returns the newly mixed RGB color.
 
-**Call relations**: This helper is used by multiple style builders that need deterministic channel-wise interpolation. It is pure and does not call other local functions.
+**Call relations**: Styling code calls this while building theme pieces and visual effects. It supplies blended colors for dense rows, transcript loading overlays, shimmer spans, table separators, and user message backgrounds, letting those features create subtle contrast from the colors they already have.
 
 *Call graph*: called by 6 (from_parts, dense_row_background_style, transcript_loading_overlay_style, shimmer_spans, table_separator_style_for, user_message_bg).
 
@@ -59,22 +61,22 @@ fn blend(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: f32) -> (u8, u8, u8)
 fn perceptual_distance(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32
 ```
 
-**Purpose**: Computes an approximate perceptual distance between two RGB colors by converting them into Lab space and taking Euclidean distance. It is more visually meaningful than raw RGB distance for comparing theme colors.
+**Purpose**: Estimates how different two colors look to a person, not just how different their raw RGB numbers are. This is useful when the UI needs to avoid colors that are too visually close together.
 
-**Data flow**: It accepts two RGB tuples `a` and `b`, converts each channel from sRGB to linear RGB with the nested `srgb_to_linear`, transforms linear RGB to XYZ with `rgb_to_xyz`, converts XYZ to Lab with `xyz_to_lab`, then subtracts the resulting `L`, `a`, and `b` components and returns `(dl*dl + da*da + db*db).sqrt()` as `f32`.
+**Data flow**: It receives two RGB colors. It first converts each color from standard screen RGB into a linear form, then into XYZ, and then into Lab, a color space meant to line up more closely with human perception. It then measures the straight-line distance between the two Lab colors and returns that distance as a floating-point number.
 
-**Call relations**: This function stands alone as the most advanced color metric in the file. It is available to callers that need perceptual comparison rather than simple brightness or blending.
+**Call relations**: This is a standalone helper in this file. The provided call graph does not show any current callers, but it is available to other UI code that needs a human-oriented color difference score.
 
 
 ### `tui/src/style.rs`
 
-`util` · `cross-cutting rendering`
+`domain_logic` · `cross-cutting during TUI rendering`
 
-This module is a focused styling utility layer over `ratatui::style::Style`. It exposes public helpers for user-message and proposed-plan backgrounds, plus crate-visible helpers for shared accent styling and low-contrast markdown table separators. The implementation is palette-aware: it consults terminal default foreground/background colors from `terminal_palette`, uses `is_light` to distinguish light versus dark themes, and quantizes RGB through `best_color` or `rgb_color` depending on the terminal's color capability.
+A terminal app cannot assume everyone has the same background color or the same color support. A pale highlight that looks good on a black terminal may disappear on a white one. This file solves that by choosing colors based on what the terminal reports about its foreground, background, and color capability.
 
-The user-message and proposed-plan styles are intentionally parallel. `user_message_style` and `proposed_plan_style` fetch the terminal background via `default_bg()` and delegate to `_for` variants that either apply a computed background color or fall back to `Style::default()` when the terminal background is unknown. `user_message_bg` computes a subtle overlay by blending black at 4% on light terminals or white at 12% on dark terminals, then mapping that RGB to the best displayable color. `proposed_plan_bg` currently aliases the same background logic.
+The main idea is to provide a few reusable style recipes. User messages and proposed plans get a subtle background tint, made by blending a small amount of white or black into the current terminal background. Active or selected controls get a bold cyan-like accent; on light backgrounds, the cyan is darkened so it remains visible. Markdown table separators get an intentionally low-contrast color, so table rules are visible but do not compete with the text inside the table.
 
-Accent styling is bolder and foreground-based: on light backgrounds it uses a darker cyan-like RGB constant `(0, 95, 135)` to preserve contrast, otherwise plain `Color::Cyan`. Table separators are deliberately subdued; when both terminal fg/bg are known, the separator color is a 20% blend of foreground toward background, emitted as truecolor or ANSI-256 approximation when possible, and downgraded to `.dim()` for ANSI-16 or unknown palettes. Tests pin these contrast and fallback choices.
+The file uses Ratatui styles, which are instructions for how terminal text should look: foreground color, background color, boldness, dimness, and so on. It also adapts to terminal color support. If true color is available, it can use the exact blended color. If only a 256-color palette is available, it chooses the nearest available color. If it cannot safely choose a palette-aware color, it falls back to a simple dim style.
 
 #### Function details
 
@@ -84,11 +86,11 @@ Accent styling is bolder and foreground-based: on light backgrounds it uses a da
 fn user_message_style() -> Style
 ```
 
-**Purpose**: Builds the standard style for user-authored transcript messages using the terminal's detected default background. It is the convenience entry point used by renderers that do not already have palette data.
+**Purpose**: Returns the standard style for a message written by the user. It uses the current terminal background so the message can be lightly highlighted without becoming hard to read.
 
-**Data flow**: It reads `default_bg()` from terminal palette state, passes that `Option<(u8,u8,u8)>` into `user_message_style_for`, and returns the resulting `Style`.
+**Data flow**: It asks the terminal helper for the default background color, then passes that information to user_message_style_for. The result is a Ratatui Style with a subtle background color if the terminal background is known, or a plain default style if it is not.
 
-**Call relations**: Multiple transcript and surface renderers call this directly during paint. It delegates all actual style computation to `user_message_style_for` so palette lookup and style derivation stay separated.
+**Call relations**: Rendering code calls this whenever it draws user-authored content. This function is the convenient public entry point; it gathers the live terminal background and hands the real color decision to user_message_style_for.
 
 *Call graph*: calls 2 internal fn (user_message_style_for, default_bg); called by 7 (render, render_with_mask_and_textarea_right_reserve, render, render, render, render_menu_surface, render).
 
@@ -99,11 +101,11 @@ fn user_message_style() -> Style
 fn proposed_plan_style() -> Style
 ```
 
-**Purpose**: Builds the standard style for proposed-plan transcript regions using the terminal's default background. It mirrors `user_message_style` but for plan output.
+**Purpose**: Returns the standard style for a proposed plan shown in the interface. It currently uses the same kind of subtle background treatment as a user message.
 
-**Data flow**: It fetches `default_bg()`, forwards that optional RGB tuple to `proposed_plan_style_for`, and returns the resulting `Style`.
+**Data flow**: It reads the default terminal background and gives it to proposed_plan_style_for. The returned Style either contains a background tint or stays plain if the background is unknown.
 
-**Call relations**: Plan-display rendering calls this when styling plan lines. Like the user-message helper, it is a thin wrapper around the `_for` variant.
+**Call relations**: The display-line renderer calls this when it needs to draw proposed plan text. This wrapper supplies the current terminal background, while proposed_plan_style_for decides the exact style.
 
 *Call graph*: calls 2 internal fn (proposed_plan_style_for, default_bg); called by 1 (render_display_lines).
 
@@ -114,11 +116,11 @@ fn proposed_plan_style() -> Style
 fn table_separator_style() -> Style
 ```
 
-**Purpose**: Returns the shared style for decorative separators inside rendered markdown tables. The style is intentionally low-contrast so rules remain visible without competing with cell text.
+**Purpose**: Returns a quiet, low-contrast style for the lines that separate cells in markdown tables. The goal is to keep table structure visible without letting the separator marks dominate the content.
 
-**Data flow**: It reads `default_fg()`, `default_bg()`, and `stdout_color_level()`, passes them to `table_separator_style_for`, and returns the resulting `Style`.
+**Data flow**: It reads the terminal's default foreground color, default background color, and color support level. It passes those three pieces of information to table_separator_style_for, which returns the best separator style for that environment.
 
-**Call relations**: Markdown table rendering uses this when drawing internal rule characters. It delegates the actual blend and fallback logic to `table_separator_style_for`.
+**Call relations**: The table rendering code calls this when drawing markdown table rules. This function acts as the live-terminal wrapper around table_separator_style_for.
 
 *Call graph*: calls 4 internal fn (table_separator_style_for, default_bg, default_fg, stdout_color_level); called by 1 (render_table_lines).
 
@@ -129,11 +131,11 @@ fn table_separator_style() -> Style
 fn accent_style() -> Style
 ```
 
-**Purpose**: Returns the shared accent style for selected or active TUI controls using the terminal's default background. It centralizes the app's highlighted-control appearance.
+**Purpose**: Returns the shared accent style used for active or selected controls in the terminal interface. It makes selected things stand out consistently across different screens.
 
-**Data flow**: It reads `default_bg()`, forwards that optional RGB tuple to `accent_style_for`, and returns the resulting `Style`.
+**Data flow**: It reads the terminal background and passes it to accent_style_for. The output is a bold foreground style, using regular cyan on dark or unknown backgrounds and a darker cyan-like color on light backgrounds.
 
-**Call relations**: Selection and hint renderers call this for rows, tabs, and keymap affordances. It is the palette-aware wrapper around `accent_style_for`.
+**Call relations**: Selection rows, tabs, debug hints, picker hints, and keymap prefixes call this when they need the common highlight color. It centralizes that choice so selected UI pieces look consistent.
 
 *Call graph*: calls 2 internal fn (accent_style_for, default_bg); called by 7 (event_table_lines, selected_event_rows_use_the_shared_accent_style, selected_rows_use_the_shared_accent_style, tab_unit, keymap_debug_hint_line, keymap_picker_hint_line, keymap_row_prefix).
 
@@ -144,11 +146,11 @@ fn accent_style() -> Style
 fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style
 ```
 
-**Purpose**: Computes the user-message style for a specific terminal background, applying a subtle background fill only when that background is known. Unknown backgrounds leave the style untouched.
+**Purpose**: Builds the user-message style for a specific terminal background. This is useful when the caller already knows the background color, and it also makes the color logic easy to test.
 
-**Data flow**: It takes `terminal_bg: Option<(u8,u8,u8)>`; when `Some(bg)`, it returns `Style::default().bg(user_message_bg(bg))`, otherwise `Style::default()`.
+**Data flow**: It receives an optional RGB background color. If a color is present, it computes a suitable message background with user_message_bg and returns a Style using that background. If no background is known, it returns a default Style with no special coloring.
 
-**Call relations**: This is called by `user_message_style` and can also be used by tests or callers with explicit palette knowledge. It delegates color derivation to `user_message_bg`.
+**Call relations**: user_message_style calls this after reading the real terminal background. The function delegates the actual color calculation to user_message_bg.
 
 *Call graph*: calls 1 internal fn (user_message_bg); called by 1 (user_message_style); 1 external calls (default).
 
@@ -159,11 +161,11 @@ fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style
 fn proposed_plan_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style
 ```
 
-**Purpose**: Computes the proposed-plan style for a specific terminal background. Its current behavior matches the user-message background treatment exactly.
+**Purpose**: Builds the proposed-plan style for a specific terminal background. It gives proposed plans the same subtle background treatment used for user messages.
 
-**Data flow**: It takes `terminal_bg: Option<(u8,u8,u8)>`; when present it returns `Style::default().bg(proposed_plan_bg(bg))`, otherwise `Style::default()`.
+**Data flow**: It receives an optional RGB background color. When present, it calculates the background through proposed_plan_bg and returns a Style with that color. When absent, it returns an unmodified default Style.
 
-**Call relations**: Called by `proposed_plan_style`; it delegates the actual background color choice to `proposed_plan_bg`, preserving a separate semantic entry point even though the current implementation is shared.
+**Call relations**: proposed_plan_style calls this after checking the terminal background. This function passes the color choice down to proposed_plan_bg.
 
 *Call graph*: calls 1 internal fn (proposed_plan_bg); called by 1 (proposed_plan_style); 1 external calls (default).
 
@@ -174,11 +176,11 @@ fn proposed_plan_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style
 fn accent_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style
 ```
 
-**Purpose**: Computes the foreground accent style for active controls against a known or unknown terminal background. It chooses a darker cyan on light backgrounds and plain cyan otherwise, always with bold emphasis.
+**Purpose**: Chooses the accent color for a known or unknown terminal background. It exists so highlights remain visible whether the terminal is light, dark, or unable to report its background.
 
-**Data flow**: It takes `terminal_bg: Option<(u8,u8,u8)>`; if `terminal_bg.is_some_and(is_light)` it returns `Style::default().fg(best_color(LIGHT_BG_ACCENT_RGB)).bold()`, else `Style::default().fg(Color::Cyan).bold()`.
+**Data flow**: It receives an optional RGB background color. If the background exists and is light, it picks a darker cyan-like color and makes it bold. Otherwise, it uses standard cyan and makes it bold. The result is a Ratatui Style.
 
-**Call relations**: The shared accent wrapper and tests call this directly. It delegates palette quantization only in the light-background branch because the hard-coded darker accent must still fit the terminal's supported color space.
+**Call relations**: accent_style calls this during normal rendering after reading the terminal background. A test also calls it directly to confirm that light backgrounds get the darker accent.
 
 *Call graph*: calls 1 internal fn (best_color); called by 2 (accent_style, accent_style_uses_darker_cyan_on_light_backgrounds); 1 external calls (default).
 
@@ -193,11 +195,11 @@ fn table_separator_style_for(
 ) -> Style
 ```
 
-**Purpose**: Computes a separator style from explicit terminal foreground/background colors and a known stdout color level. It blends the separator toward the background and degrades gracefully when palette-aware color output is unavailable.
+**Purpose**: Chooses the table separator style from explicit terminal colors and color capability. It keeps separators subtle by blending the foreground toward the background.
 
-**Data flow**: Inputs are `terminal_fg`, `terminal_bg`, and `color_level`. If either color is `None`, it returns `Style::default().dim()`. Otherwise it computes `separator_rgb = blend(fg, bg, TABLE_SEPARATOR_FG_ALPHA)` and returns a foreground style using `rgb_color(separator_rgb)` for `TrueColor`, `best_color(separator_rgb)` for `Ansi256`, or `.dim()` for `Ansi16` and `Unknown`.
+**Data flow**: It receives optional foreground and background RGB colors plus a color support level. If either color is missing, it returns a dim default style. If both are known, it blends the foreground with the background at low strength, then uses the exact RGB color for true-color terminals, the nearest palette color for 256-color terminals, or a dim fallback for basic or unknown color support.
 
-**Call relations**: The public separator helper and tests use this function. It encapsulates the policy that separators should be palette-aware when possible but should never become visually dominant on low-color terminals.
+**Call relations**: table_separator_style calls this with live terminal information when rendering tables. The table separator tests call it directly with fixed colors to prove the blend works on dark and light backgrounds.
 
 *Call graph*: calls 3 internal fn (blend, best_color, rgb_color); called by 3 (table_separator_style, table_separator_blends_toward_dark_background, table_separator_blends_toward_light_background); 1 external calls (default).
 
@@ -208,11 +210,11 @@ fn table_separator_style_for(
 fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color
 ```
 
-**Purpose**: Derives the background color used behind user messages from the terminal's default background. The result is a subtle contrast overlay rather than a fixed theme color.
+**Purpose**: Calculates the actual background color used behind a user message. It creates a gentle tint that differs from the terminal background just enough to mark the message area.
 
-**Data flow**: It takes `terminal_bg: (u8,u8,u8)`, chooses `(top, alpha)` as black/0.04 for light backgrounds or white/0.12 for dark backgrounds using `is_light`, blends `top` over `terminal_bg`, maps the blended RGB through `best_color`, and returns the resulting `Color`.
+**Data flow**: It receives the terminal background as an RGB color. If that background is light, it blends in a small amount of black; if it is dark, it blends in a small amount of white. It then chooses the best terminal color for that blended result and returns it.
 
-**Call relations**: Both user-message styling and proposed-plan background derivation rely on this function. It centralizes the light-vs-dark overlay rule so related surfaces stay visually consistent.
+**Call relations**: user_message_style_for calls this when it needs a background color. proposed_plan_bg also reuses it so proposed plans and user messages share the same visual treatment.
 
 *Call graph*: calls 3 internal fn (blend, is_light, best_color); called by 2 (proposed_plan_bg, user_message_style_for).
 
@@ -223,11 +225,11 @@ fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color
 fn proposed_plan_bg(terminal_bg: (u8, u8, u8)) -> Color
 ```
 
-**Purpose**: Returns the background color for proposed-plan regions. At present it intentionally reuses the exact same background computation as user messages.
+**Purpose**: Returns the background color for proposed plan blocks. At the moment, it deliberately matches the user-message background.
 
-**Data flow**: It takes `terminal_bg: (u8,u8,u8)`, forwards it to `user_message_bg`, and returns that `Color` unchanged.
+**Data flow**: It receives the terminal background as an RGB color and passes it directly to user_message_bg. It returns whatever color user_message_bg chooses.
 
-**Call relations**: Called only by `proposed_plan_style_for`. Keeping this as a separate function preserves a semantic hook for future divergence without changing callers.
+**Call relations**: proposed_plan_style_for calls this when building the proposed-plan Style. This small wrapper keeps the proposed-plan concept separate, even though it currently shares the user-message color.
 
 *Call graph*: calls 1 internal fn (user_message_bg); called by 1 (proposed_plan_style_for).
 
@@ -238,11 +240,11 @@ fn proposed_plan_bg(terminal_bg: (u8, u8, u8)) -> Color
 fn accent_style_uses_darker_cyan_on_light_backgrounds()
 ```
 
-**Purpose**: Checks that accent styling switches away from plain cyan on light terminals and keeps bold emphasis. It protects the contrast rule for light backgrounds.
+**Purpose**: Checks that the accent style stays readable on light terminal backgrounds. It confirms that the file does not use bright cyan on white, where it could be hard to see.
 
-**Data flow**: The test calls `accent_style_for(Some((255,255,255)))`, then asserts that the foreground equals `best_color(LIGHT_BG_ACCENT_RGB)` and that the bold modifier is present.
+**Data flow**: The test gives accent_style_for a white background. It then checks that the foreground is the darker cyan-like accent color and that the style is bold.
 
-**Call relations**: This test exercises the light-background branch of `accent_style_for`, ensuring the palette-aware accent choice remains stable.
+**Call relations**: This test calls accent_style_for directly with a controlled background. It protects the behavior used indirectly by accent_style during real rendering.
 
 *Call graph*: calls 1 internal fn (accent_style_for); 2 external calls (assert!, assert_eq!).
 
@@ -253,11 +255,11 @@ fn accent_style_uses_darker_cyan_on_light_backgrounds()
 fn accent_style_uses_cyan_on_dark_or_unknown_backgrounds()
 ```
 
-**Purpose**: Verifies that dark or unknown backgrounds use the default cyan bold accent style. It covers both the explicit dark branch and the no-palette fallback.
+**Purpose**: Checks that the normal accent style is bold cyan when the background is dark or unknown. This covers the common fallback path.
 
-**Data flow**: It constructs the expected `Style::default().fg(Color::Cyan).bold()`, then asserts equality against `accent_style_for(Some((0,0,0)))` and `accent_style_for(None)`.
+**Data flow**: The test builds the expected bold cyan Style. It compares that with accent_style_for on a black background and with accent_style_for when no background is available.
 
-**Call relations**: This test complements the light-background test by pinning the fallback behavior of `accent_style_for`.
+**Call relations**: This test exercises the same decision path that accent_style relies on when the terminal background is dark or cannot be detected.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -268,11 +270,11 @@ fn accent_style_uses_cyan_on_dark_or_unknown_backgrounds()
 fn table_separator_blends_toward_dark_background()
 ```
 
-**Purpose**: Confirms that separator color blending produces a dark gray when white foreground is blended toward a black background in truecolor mode. It validates the blend ratio numerically.
+**Purpose**: Checks that table separators become a faint gray on a dark background. This ensures separator lines are visible but not too bright.
 
-**Data flow**: The test calls `table_separator_style_for(Some((255,255,255)), Some((0,0,0)), StdoutColorLevel::TrueColor)` and asserts that the resulting foreground is `rgb_color((51,51,51))`.
+**Data flow**: The test gives table_separator_style_for a white foreground, black background, and true-color support. It expects the resulting foreground color to be a dark gray RGB value.
 
-**Call relations**: This test exercises the truecolor branch of separator styling on a dark theme.
+**Call relations**: This test calls table_separator_style_for directly with fixed terminal colors. It verifies the color-blending behavior used by table_separator_style during table rendering.
 
 *Call graph*: calls 1 internal fn (table_separator_style_for); 1 external calls (assert_eq!).
 
@@ -283,11 +285,11 @@ fn table_separator_blends_toward_dark_background()
 fn table_separator_blends_toward_light_background()
 ```
 
-**Purpose**: Confirms that separator color blending produces a light gray when black foreground is blended toward a white background in truecolor mode. It validates the same alpha rule in the opposite direction.
+**Purpose**: Checks that table separators become a faint gray on a light background. This protects readability for users with light terminal themes.
 
-**Data flow**: It calls `table_separator_style_for(Some((0,0,0)), Some((255,255,255)), StdoutColorLevel::TrueColor)` and asserts that the foreground is `rgb_color((204,204,204))`.
+**Data flow**: The test gives table_separator_style_for a black foreground, white background, and true-color support. It expects the resulting foreground color to be a light gray RGB value.
 
-**Call relations**: This test covers the light-theme truecolor branch of separator styling.
+**Call relations**: This test directly verifies table_separator_style_for for light backgrounds, complementing the dark-background test and covering the same logic used by rendered markdown tables.
 
 *Call graph*: calls 1 internal fn (table_separator_style_for); 1 external calls (assert_eq!).
 
@@ -298,33 +300,35 @@ fn table_separator_blends_toward_light_background()
 fn table_separator_dims_when_palette_aware_color_is_unavailable()
 ```
 
-**Purpose**: Verifies that separator styling falls back to a dim default style when either palette colors are missing or the terminal only supports ANSI-16 colors. It protects the low-fidelity fallback path.
+**Purpose**: Checks the safe fallback for table separators when the code cannot choose a precise color. In those cases, dim text is used instead of risking a poor color choice.
 
-**Data flow**: It builds `Style::default().dim()` as the expected value, then asserts equality for an `Ansi16` call with known colors and for a `TrueColor` call with missing foreground color.
+**Data flow**: The test builds the expected dim Style. It then checks two fallback cases: a basic 16-color terminal, and a case where the terminal foreground color is missing. Both should return the dim style.
 
-**Call relations**: This test locks in the conservative fallback behavior of `table_separator_style_for` when palette-aware blending cannot be represented.
+**Call relations**: This test calls table_separator_style_for directly to protect the fallback behavior used by table_separator_style when terminal color information or color support is limited.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
 
 ### `tui/src/ui_consts.rs`
 
-`config` · `cross-cutting`
+`config` · `cross-cutting UI rendering`
 
-This file centralizes a small but important piece of UI geometry: how many terminal columns are reserved for the left-side prefix area. `LIVE_PREFIX_COLS` is defined as `2` and documented as the width consumed by the chat composer’s left border and padding, the leading spaces on status indicator lines, and the prefix budget for wrapped user history lines such as a `▌ ` marker. `FOOTER_INDENT_COLS` is then derived from that same value as a `usize`, avoiding repeated casts in code that indexes or pads string content rather than working in terminal-coordinate types. The main design choice is consistency through a single source of truth. By deriving footer indentation from `LIVE_PREFIX_COLS`, the file prevents subtle drift where different widgets might otherwise hard-code slightly different left margins. Although these are just constants, they influence wrapping, alignment, and visual rhythm across the interface, so keeping them together with explicit semantic comments helps maintainers understand that changing the value affects several independent rendering paths at once.
+This file is a small but important source of truth for terminal layout. In a text-based interface, everything is measured in columns, like spaces on a fixed-width grid. If the chat composer, status lines, and history wrapping each guessed their own left padding, the interface could look slightly crooked or wrap text at the wrong place.
+
+The main constant, `LIVE_PREFIX_COLS`, says that two terminal columns are reserved at the left side for a live cell prefix, such as a border and a space. Other UI pieces use the same value so they align with that live content. For example, status indicator lines can start with the same amount of blank space, and user history lines can wrap while accounting for the same prefix width.
+
+`FOOTER_INDENT_COLS` reuses that same value, but as a `usize`, which is the number type Rust commonly uses for sizes and indexing. This avoids repeated conversions elsewhere. The file is like marking the margin on a shared ruler: once the margin is set here, every part of the terminal UI can measure from the same place.
 
 
 ### `tui/src/render/renderable.rs`
 
-`domain_logic` · `cross-cutting`
+`domain_logic` · `main loop rendering`
 
-This file is the backbone of the TUI's lightweight rendering composition system. The central trait, `Renderable`, abstracts three concerns: drawing into a `Buffer`, reporting desired height for a given width, and optionally exposing cursor position/style. Default cursor methods return no cursor and `DefaultUserShape`, letting most renderables ignore cursor management.
+A terminal screen is just a grid of character cells, so every visible part of the app needs to answer a few practical questions: “Where should I draw?”, “How tall do I want to be?”, and sometimes “Where should the cursor go?” This file gives the app one common language for those questions through the Renderable trait. Anything that implements it can be placed into a larger screen layout.
 
-To make heterogeneous composition ergonomic, the file defines `RenderableItem<'a>` as either an owned boxed renderable or a borrowed trait object, plus conversion impls from `Box<dyn Renderable>` and from any concrete `Renderable` into a boxed trait object. It also implements `Renderable` for common leaf types—`()`, `&str`, `String`, `Span`, `Line`, `Paragraph`, `Option<R>`, and `Arc<R>`—so plain text and wrapped widgets can be inserted directly into layout containers.
+The file also provides adapters for common things. Plain strings, styled spans, lines, and paragraphs can all act as renderable items. Option means “draw this only if it exists.” Arc, a shared reference-counted pointer, lets the same renderable value be reused safely. RenderableItem wraps either an owned widget or a borrowed one, so layout code can store both kinds in one list.
 
-The layout containers are all vertical/horizontal combinators. `ColumnRenderable` stacks children top-to-bottom using each child's desired height and clips each child area with `intersection(area)`. `RowRenderable` lays out fixed-width children left-to-right and computes height as the maximum child height over the available widths. `FlexRenderable` is a more sophisticated vertical allocator: non-flex children reserve their desired heights first, then positive-flex children share remaining height proportionally, with a redistribution pass that satisfies short flex children early so unused space can be reallocated. The final flex child absorbs rounding slack.
-
-`InsetRenderable` wraps any child with `Insets`, shrinking render/cursor areas and expanding desired height by top/bottom padding. Finally, `RenderableExt::inset` offers a fluent way to wrap any renderable in an inset wrapper. Across all containers, cursor queries mirror render layout so the first child reporting a cursor determines the composite cursor position and style.
+The layout structs work like simple packing boxes. ColumnRenderable stacks children from top to bottom. RowRenderable places children from left to right with fixed widths. FlexRenderable is a smarter vertical stack: fixed children get space first, then flexible children share the remaining height. InsetRenderable adds padding around a child, like putting a picture inside a mat frame. Together, these pieces let the rest of the TUI compose screens from small parts without each screen reinventing layout math.
 
 #### Function details
 
@@ -334,11 +338,11 @@ The layout containers are all vertical/horizontal combinators. `ColumnRenderable
 fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Provides the default cursor-position behavior for renderables that do not manage a cursor.
+**Purpose**: This is the default answer for a renderable item that does not need to place the terminal cursor anywhere special. It says “no cursor position.”
 
-**Data flow**: It takes an area argument but ignores it and returns `None`.
+**Data flow**: It receives the screen rectangle where the item would draw, ignores it, and returns no position. Nothing on the screen buffer is changed.
 
-**Call relations**: Concrete renderables inherit this default unless they need to expose a cursor location to the terminal UI.
+**Call relations**: Layout containers ask their children for cursor positions while arranging the screen. If a child has not provided its own cursor logic, this default keeps it from claiming the cursor.
 
 
 ##### `Renderable::cursor_style`  (lines 20–22)
@@ -347,11 +351,11 @@ fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, _area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Provides the default cursor-style behavior for renderables that do not customize cursor appearance.
+**Purpose**: This is the default cursor appearance for renderable items. It uses the terminal’s normal user cursor shape unless a specific widget asks for something else.
 
-**Data flow**: It takes an area argument but ignores it and returns `SetCursorStyle::DefaultUserShape`.
+**Data flow**: It receives the drawing rectangle, ignores it, and returns the default cursor style. It does not draw or change data.
 
-**Call relations**: Composite renderables call this when a child with a cursor is found; leaf renderables can override it if they need a different cursor shape.
+**Call relations**: Containers use this after finding which child owns the cursor. If that child has no custom style, this default is the style handed back.
 
 
 ##### `RenderableItem::render`  (lines 31–36)
@@ -360,11 +364,11 @@ fn cursor_style(&self, _area: Rect) -> SetCursorStyle
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Dispatches rendering to either the owned or borrowed child renderable stored in the enum.
+**Purpose**: This draws a wrapped renderable item, whether the wrapper owns the item or only borrows it. It hides that ownership difference from layout code.
 
-**Data flow**: It takes a target `Rect` and mutable `Buffer`, matches on `self`, and forwards the render call to the contained child. It writes into the provided buffer and returns no value.
+**Data flow**: It receives a target area and a mutable terminal buffer, looks inside the wrapper, and forwards the drawing request to the actual child. The buffer is changed by whatever the child draws.
 
-**Call relations**: This enum-level dispatcher is used by composite containers like columns, rows, flex layouts, and inset wrappers whenever they render heterogeneous children.
+**Call relations**: When a container draws its children, it calls this wrapper method so it does not have to care whether each child is stored by value or by reference.
 
 *Call graph*: called by 1 (render).
 
@@ -375,11 +379,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Delegates desired-height calculation to the contained owned or borrowed child.
+**Purpose**: This asks the wrapped child how many rows it would like for a given width. It gives layout containers a uniform way to size owned and borrowed children.
 
-**Data flow**: It takes a width, matches on `self`, calls the child's `desired_height(width)`, and returns the resulting `u16`.
+**Data flow**: It receives an available width, forwards that width to the inner child, and returns the child’s requested height.
 
-**Call relations**: Composite layout containers rely on this method when sizing `RenderableItem` children without caring whether they are owned or borrowed.
+**Call relations**: Column, row, inset, and flex layout code use height requests to divide the available screen space before drawing.
 
 *Call graph*: called by 1 (desired_height).
 
@@ -390,11 +394,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Delegates cursor-position lookup to the contained child renderable.
+**Purpose**: This asks the wrapped child whether it wants to place the terminal cursor somewhere. It works the same for owned and borrowed children.
 
-**Data flow**: It takes an area, matches on `self`, forwards `cursor_pos(area)`, and returns the child's `Option<(u16, u16)>`.
+**Data flow**: It receives the child’s screen area, forwards it to the inner child, and returns either a cursor coordinate or nothing.
 
-**Call relations**: This dispatcher is used by composite renderables when searching children for the active cursor location.
+**Call relations**: Parent layouts call this while searching through their children for the widget that owns the cursor.
 
 *Call graph*: called by 1 (cursor_pos).
 
@@ -405,11 +409,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Delegates cursor-style lookup to the contained child renderable.
+**Purpose**: This asks the wrapped child what the cursor should look like. It keeps cursor styling independent of whether the child is owned or borrowed.
 
-**Data flow**: It takes an area, matches on `self`, forwards `cursor_style(area)`, and returns the resulting `SetCursorStyle`.
+**Data flow**: It receives the child’s screen area, forwards it to the inner child, and returns the child’s chosen cursor style.
 
-**Call relations**: Composite renderables use this after identifying which child owns the cursor.
+**Call relations**: Once a layout finds the child with a cursor position, it uses this method to forward that child’s cursor appearance to the terminal layer.
 
 *Call graph*: called by 1 (cursor_style).
 
@@ -420,11 +424,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn from(value: Box<dyn Renderable + 'a>) -> Self
 ```
 
-**Purpose**: Wraps an owned boxed renderable into the `RenderableItem::Owned` variant.
+**Purpose**: This converts a boxed renderable object into a RenderableItem that owns it. It is a convenience step used when building lists of renderable children.
 
-**Data flow**: It takes `Box<dyn Renderable + 'a>` and returns `RenderableItem::Owned(value)`.
+**Data flow**: It receives a boxed child and wraps it in the owned variant. The output is a RenderableItem ready to be stored in a container.
 
-**Call relations**: This conversion supports ergonomic insertion of boxed renderables into container APIs that accept `Into<RenderableItem<'a>>`.
+**Call relations**: Container builders and helper methods rely on this conversion so callers can pass boxed renderable pieces without manually naming the wrapper.
 
 *Call graph*: 1 external calls (Owned).
 
@@ -435,11 +439,11 @@ fn from(value: Box<dyn Renderable + 'a>) -> Self
 fn from(value: R) -> Self
 ```
 
-**Purpose**: Boxes any concrete renderable as a `Box<dyn Renderable>` trait object.
+**Purpose**: This boxes any concrete renderable value so it can be stored as a general renderable object. Boxing means putting the value behind a pointer so different renderable types can live in the same collection.
 
-**Data flow**: It takes a concrete `R: Renderable + 'a`, allocates it with `Box::new`, and returns `Box<dyn Renderable + 'a>`.
+**Data flow**: It receives a concrete renderable value, allocates a box for it, and returns that boxed renderable trait object.
 
-**Call relations**: This conversion underlies APIs like `ColumnRenderable::push` and `RowRenderable::push`, allowing callers to pass concrete renderables directly.
+**Call relations**: Push methods use this kind of conversion when they accept any renderable child and need to store it in a uniform owned form.
 
 *Call graph*: 1 external calls (new).
 
@@ -450,11 +454,11 @@ fn from(value: R) -> Self
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a string slice by delegating to ratatui's widget-ref rendering support.
+**Purpose**: This lets a string slice draw itself as one line of terminal text. It makes simple text usable anywhere a renderable item is expected.
 
-**Data flow**: It takes an area and mutable buffer and calls `self.render_ref(area, buf)`. It writes text into the buffer and returns no value.
+**Data flow**: It receives a screen area and buffer, then asks the underlying text widget code to draw the string into that area. The buffer gains the string’s characters.
 
-**Call relations**: This blanket implementation lets plain `&str` values participate directly in the `Renderable` ecosystem as leaf nodes.
+**Call relations**: Higher-level layouts can include plain borrowed text directly because this method supplies the required drawing behavior.
 
 
 ##### `str::desired_height`  (lines 86–88)
@@ -463,11 +467,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports that a string slice occupies one row when treated as a renderable leaf.
+**Purpose**: This says a string slice needs one terminal row. It treats plain borrowed text as a single-line item.
 
-**Data flow**: It ignores width and returns `1`.
+**Data flow**: It receives an available width, ignores it, and returns 1 row.
 
-**Call relations**: This sizing behavior is used by composite containers when laying out `&str` children.
+**Call relations**: Containers use this answer when stacking or measuring plain text items.
 
 
 ##### `String::render`  (lines 92–94)
@@ -476,11 +480,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders an owned string by delegating to ratatui's widget-ref rendering support.
+**Purpose**: This lets an owned String draw itself as terminal text. It gives owned text the same renderable behavior as borrowed text.
 
-**Data flow**: It takes an area and mutable buffer and calls `self.render_ref(area, buf)`. It writes into the buffer and returns no value.
+**Data flow**: It receives a screen area and buffer, then delegates to the text drawing code to write the string into the buffer.
 
-**Call relations**: This implementation allows owned `String` values to be inserted directly into renderable containers.
+**Call relations**: Screens can pass owned strings into render containers without wrapping them in a separate widget first.
 
 
 ##### `String::desired_height`  (lines 95–97)
@@ -489,11 +493,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports that an owned string occupies one row as a renderable leaf.
+**Purpose**: This says an owned String is treated as one line high. It keeps simple owned text easy to lay out.
 
-**Data flow**: It ignores width and returns `1`.
+**Data flow**: It receives a width, does not need it, and returns 1 row.
 
-**Call relations**: Composite layouts use this when sizing `String` children.
+**Call relations**: Layout containers call this when deciding how much vertical space to reserve for owned text.
 
 
 ##### `Span::render`  (lines 101–103)
@@ -502,11 +506,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a ratatui `Span` directly into the target buffer.
+**Purpose**: This draws a styled piece of text, such as colored or bold text. A span is still treated as one renderable line fragment.
 
-**Data flow**: It takes an area and mutable buffer and calls `self.render_ref(area, buf)`. It writes styled text into the buffer.
+**Data flow**: It receives a screen area and buffer, then uses the terminal text renderer to write the styled span into the buffer.
 
-**Call relations**: This implementation lets individual spans be used as standalone renderables in composed layouts.
+**Call relations**: This lets styled text participate directly in the same layout system as larger UI components.
 
 
 ##### `Span::desired_height`  (lines 104–106)
@@ -515,11 +519,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports that a single span occupies one row.
+**Purpose**: This says a styled span needs one row. Styling changes appearance, not the amount of vertical space requested here.
 
-**Data flow**: It ignores width and returns `1`.
+**Data flow**: It receives a width, ignores it, and returns 1 row.
 
-**Call relations**: This is the sizing counterpart to `Span::render` for layout containers.
+**Call relations**: Parent layouts use this when measuring styled text.
 
 
 ##### `Line::render`  (lines 110–112)
@@ -528,11 +532,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a ratatui `Line` using `WidgetRef` support.
+**Purpose**: This draws a full styled line of text. It bridges ratatui’s line type into this project’s renderable interface.
 
-**Data flow**: It takes an area and mutable buffer and calls `WidgetRef::render_ref(self, area, buf)`. It writes the line into the buffer.
+**Data flow**: It receives an area and buffer, then calls the line’s reference-rendering method to write into the buffer.
 
-**Call relations**: This implementation allows complete ratatui lines to be embedded directly in renderable compositions.
+**Call relations**: Any layout container can include a Line as a child because this method connects it to the common Renderable behavior.
 
 *Call graph*: 1 external calls (render_ref).
 
@@ -543,11 +547,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports that a single `Line` occupies one row.
+**Purpose**: This says a line of text needs one row. It matches the natural shape of a terminal line.
 
-**Data flow**: It ignores width and returns `1`.
+**Data flow**: It receives the available width, ignores it, and returns 1 row.
 
-**Call relations**: Composite layouts use this fixed height when stacking or arranging line renderables.
+**Call relations**: Containers use this value when placing Line children beside or above other renderable content.
 
 
 ##### `Paragraph::render`  (lines 119–121)
@@ -556,11 +560,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a ratatui `Paragraph` directly into the target buffer.
+**Purpose**: This draws a paragraph widget into the terminal buffer. A paragraph can wrap over multiple rows depending on its width.
 
-**Data flow**: It takes an area and mutable buffer and calls `self.render_ref(area, buf)`. It writes paragraph content into the buffer.
+**Data flow**: It receives an area and buffer, then lets the paragraph widget render itself into that rectangle.
 
-**Call relations**: This implementation lets richer wrapped text widgets participate in the same `Renderable` trait as simpler leaf types.
+**Call relations**: This allows multi-line text blocks from ratatui to be used directly inside this project’s custom layout containers.
 
 
 ##### `Paragraph::desired_height`  (lines 122–124)
@@ -569,11 +573,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes a paragraph's desired height by asking ratatui how many wrapped lines it would occupy at the given width.
+**Purpose**: This estimates how many rows a paragraph needs at a given width. It matters because wrapped text takes more lines when the available space is narrow.
 
-**Data flow**: It takes a width, calls `self.line_count(width)`, casts the result to `u16`, and returns it.
+**Data flow**: It receives a width, asks the paragraph how many wrapped lines it would produce, and returns that count as the desired height.
 
-**Call relations**: This sizing logic is used by composite containers to allocate enough vertical space for wrapped paragraphs.
+**Call relations**: Column and flex layouts use this to give paragraphs enough vertical room before they are drawn.
 
 
 ##### `Option::render`  (lines 128–132)
@@ -582,11 +586,11 @@ fn desired_height(&self, width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders an optional child only when it is present.
+**Purpose**: This lets optional UI content be renderable. If the value exists, it is drawn; if it is absent, nothing appears.
 
-**Data flow**: It takes an area and mutable buffer, checks `self`, and if `Some(renderable)` forwards `render(area, buf)`; otherwise it does nothing.
+**Data flow**: It receives an optional renderable, an area, and a buffer. When the option is Some, it forwards drawing to the child; when None, it leaves the buffer unchanged.
 
-**Call relations**: This blanket implementation allows optional UI fragments to be inserted into layouts without separate branching at call sites.
+**Call relations**: Callers can include optional sections in a layout without writing separate if-statements around every render call.
 
 
 ##### `Option::desired_height`  (lines 134–140)
@@ -595,11 +599,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports the contained child's desired height or zero when the option is empty.
+**Purpose**: This reports the height of optional content. Missing content asks for zero rows.
 
-**Data flow**: It takes a width, returns `renderable.desired_height(width)` for `Some`, and `0` for `None`.
+**Data flow**: It receives a width. If a child exists, it returns that child’s desired height; otherwise it returns 0.
 
-**Call relations**: Composite layouts use this to naturally collapse absent optional children.
+**Call relations**: Layouts can naturally collapse absent UI sections because this method says they take no space.
 
 
 ##### `Option::cursor_pos`  (lines 142–145)
@@ -608,11 +612,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Returns the contained child's cursor position when present.
+**Purpose**: This forwards cursor-position requests only when optional content exists. Missing content cannot own the cursor.
 
-**Data flow**: It takes an area, converts `self` to `Option<&R>`, calls `cursor_pos(area)` on the child if present, and returns the resulting option.
+**Data flow**: It receives an area. If a child is present, it asks that child for a cursor position; otherwise it returns no position.
 
-**Call relations**: This lets optional renderables participate in cursor propagation without extra branching.
+**Call relations**: Parent containers use this while searching for the active cursor, and optional sections simply disappear from that search when absent.
 
 
 ##### `Option::cursor_style`  (lines 147–152)
@@ -621,11 +625,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Returns the contained child's cursor style when present, otherwise the default cursor shape.
+**Purpose**: This forwards cursor style from optional content when present, or falls back to the default cursor shape when absent.
 
-**Data flow**: It takes an area, maps `Some(renderable)` to `renderable.cursor_style(area)`, and returns `DefaultUserShape` for `None`.
+**Data flow**: It receives an area. Some content returns its own cursor style; no content returns the default style.
 
-**Call relations**: This complements `Option::cursor_pos` in composite cursor handling.
+**Call relations**: This keeps cursor styling safe even when a UI section is conditionally hidden.
 
 
 ##### `Arc::render`  (lines 156–158)
@@ -634,11 +638,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders an `Arc`-wrapped renderable by delegating to the inner value.
+**Purpose**: This lets a shared renderable value draw itself through an Arc. Arc is a shared pointer that lets several owners refer to the same data.
 
-**Data flow**: It takes an area and mutable buffer, dereferences the `Arc`, and calls the inner renderable's `render` method.
+**Data flow**: It receives an area and buffer, looks through the shared pointer to the real child, and forwards the render call. The child changes the buffer.
 
-**Call relations**: This blanket implementation allows shared renderables to be inserted into layouts without manual dereferencing.
+**Call relations**: Shared UI pieces can be passed into layouts without losing the common Renderable interface.
 
 
 ##### `Arc::desired_height`  (lines 159–161)
@@ -647,11 +651,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Delegates desired-height calculation through an `Arc` wrapper.
+**Purpose**: This asks a shared renderable value how tall it wants to be. The Arc itself adds no layout behavior.
 
-**Data flow**: It takes a width, dereferences the `Arc`, and returns the inner renderable's desired height.
+**Data flow**: It receives a width, forwards it to the value inside the Arc, and returns the resulting height.
 
-**Call relations**: This is the sizing counterpart to `Arc::render`.
+**Call relations**: Containers can measure shared renderable objects just like ordinary owned objects.
 
 
 ##### `Arc::cursor_pos`  (lines 162–164)
@@ -660,11 +664,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Delegates cursor-position lookup through an `Arc` wrapper.
+**Purpose**: This forwards cursor-position requests through a shared pointer. It lets shared widgets still participate in cursor placement.
 
-**Data flow**: It takes an area, dereferences the `Arc`, and returns the inner renderable's cursor position.
+**Data flow**: It receives an area, asks the inner renderable for a cursor position, and returns that answer.
 
-**Call relations**: This supports shared renderables that expose cursor state.
+**Call relations**: Parent layouts do not need special logic for Arc-wrapped children when looking for cursor ownership.
 
 
 ##### `Arc::cursor_style`  (lines 165–167)
@@ -673,11 +677,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Delegates cursor-style lookup through an `Arc` wrapper.
+**Purpose**: This forwards cursor-style requests through a shared pointer. The shared pointer does not change the cursor choice.
 
-**Data flow**: It takes an area, dereferences the `Arc`, and returns the inner renderable's cursor style.
+**Data flow**: It receives an area, asks the inner renderable for its cursor style, and returns that style.
 
-**Call relations**: This complements `Arc::cursor_pos` for shared cursor-owning widgets.
+**Call relations**: After a shared child is found to own the cursor, this passes its style back up to the layout.
 
 
 ##### `ColumnRenderable::render`  (lines 175–185)
@@ -686,11 +690,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders children stacked vertically, clipping each child to the available parent area.
+**Purpose**: This draws children one under another, like stacking blocks vertically. Each child gets the height it asked for, limited to the available area.
 
-**Data flow**: It takes a parent `Rect` and mutable `Buffer`, initializes `y` to `area.y`, then for each child computes a child rectangle with the full width and the child's desired height, intersects it with the parent area, renders the child if the resulting area is non-empty, and advances `y` by the rendered height.
+**Data flow**: It receives a column area and buffer, walks through the children from top to bottom, creates a rectangle for each child, clips it to the column’s bounds, and asks visible children to draw. The buffer is filled by those children.
 
-**Call relations**: This is the main vertical composition routine for `ColumnRenderable`. It relies on each child's `desired_height` and `render` methods to lay out and draw the stack.
+**Call relations**: Screen-building code creates columns for vertical sections, and this method is the point where those sections are turned into actual terminal cells.
 
 *Call graph*: 1 external calls (new).
 
@@ -701,11 +705,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the total height of a vertical stack by summing child desired heights.
+**Purpose**: This reports the total height needed by a vertical stack. It adds up the requested heights of all children.
 
-**Data flow**: It takes a width, iterates all children, sums `child.desired_height(width)`, and returns the total `u16`.
+**Data flow**: It receives an available width, asks each child how tall it wants to be at that width, sums the answers, and returns the total.
 
-**Call relations**: This sizing method is used by parent layouts when a column itself is nested inside another renderable.
+**Call relations**: Parent layouts use this when a whole column is itself placed inside another layout.
 
 
 ##### `ColumnRenderable::cursor_pos`  (lines 198–211)
@@ -714,11 +718,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Finds the first child in the vertical stack that reports a cursor position and returns it in parent coordinates.
+**Purpose**: This finds the cursor position inside a vertical stack. It returns the first child cursor it finds, using that child’s actual area in the column.
 
-**Data flow**: It takes a parent area, walks children in render order while computing each child's rectangle exactly as `render` does, skips empty intersections, queries `child.cursor_pos(child_area)`, and returns the first non-`None` position found; otherwise `None`.
+**Data flow**: It receives the column’s area, walks children from top to bottom, computes each child’s rectangle, and asks visible children for a cursor position. It returns the first position found or nothing.
 
-**Call relations**: This mirrors `ColumnRenderable::render` so cursor lookup stays aligned with actual child placement.
+**Call relations**: The rest of the renderer can ask a column where the cursor belongs without knowing which child inside the column is interactive.
 
 *Call graph*: 1 external calls (new).
 
@@ -729,11 +733,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Returns the cursor style of the first vertically stacked child that owns the cursor.
+**Purpose**: This finds the cursor style for the child in a column that owns the cursor. If no child has a cursor, it uses the default style.
 
-**Data flow**: It takes a parent area, computes each child area as in `render`, checks whether `child.cursor_pos(child_area)` is `Some`, and if so returns `child.cursor_style(child_area)`; otherwise it falls back to `DefaultUserShape`.
+**Data flow**: It receives the column area, checks each child’s computed rectangle, and when it finds a child with a cursor position, returns that child’s style. If none is found, it returns the default cursor shape.
 
-**Call relations**: This method pairs with `ColumnRenderable::cursor_pos`, ensuring the style comes from the same child that supplies the cursor.
+**Call relations**: This pairs with ColumnRenderable::cursor_pos so cursor position and appearance both come from the same child.
 
 *Call graph*: 1 external calls (new).
 
@@ -744,11 +748,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty vertical renderable container.
+**Purpose**: This creates an empty vertical layout. Callers use it when they want to add children step by step.
 
-**Data flow**: It allocates an empty `Vec<RenderableItem<'a>>` and returns `ColumnRenderable { children }`.
+**Data flow**: It takes no input, creates an empty child list, and returns a new ColumnRenderable.
 
-**Call relations**: This constructor is widely used across the UI wherever a vertical stack is built incrementally.
+**Call relations**: Many screen builders start with this empty column, then add headers, menus, popups, or other sections before rendering.
 
 *Call graph*: called by 31 (new, reset_confirmation_header, settings_header, build, new, connectors_loading_popup_params, connectors_popup_params, model_menu_header, open_reasoning_popup, marketplace_add_error_popup_params (+15 more)); 1 external calls (vec!).
 
@@ -759,11 +763,11 @@ fn new() -> Self
 fn with(children: I) -> Self
 ```
 
-**Purpose**: Constructs a vertical renderable container from an iterable of children.
+**Purpose**: This creates a vertical layout from an existing list of children. It is a convenient way to build a complete column in one call.
 
-**Data flow**: It takes any `IntoIterator` of items convertible into `RenderableItem<'a>`, converts and collects them into the `children` vector, and returns the populated `ColumnRenderable`.
+**Data flow**: It receives something that can be iterated over, converts each item into a RenderableItem, stores them in order, and returns the column.
 
-**Call relations**: This constructor is used when a column's children are known up front rather than pushed incrementally.
+**Call relations**: Header, options, confirmation, and popup builders use this when their child list is known up front.
 
 *Call graph*: called by 7 (build_options, build_header, feedback_upload_consent_params, new, open_full_access_confirmation, open_world_writable_warning_confirmation, from); 1 external calls (into_iter).
 
@@ -774,11 +778,11 @@ fn with(children: I) -> Self
 fn push(&mut self, child: impl Into<Box<dyn Renderable + 'a>>)
 ```
 
-**Purpose**: Appends a new owned child renderable to the end of the vertical stack.
+**Purpose**: This appends one child to the bottom of a column. It is used when content is produced gradually.
 
-**Data flow**: It takes any value convertible into `Box<dyn Renderable + 'a>`, boxes/converts it, wraps it as `RenderableItem::Owned`, pushes it into `self.children`, and returns no value.
+**Data flow**: It receives a renderable child, converts it into a boxed owned renderable item, and adds it to the column’s child list.
 
-**Call relations**: This mutating builder method is used by higher-level renderers that assemble columns step by step.
+**Call relations**: Markdown, menu, and line-rendering helpers use this while building vertical output one piece at a time.
 
 *Call graph*: called by 3 (render_lines, render_markdown_content, render_menu); 2 external calls (into, Owned).
 
@@ -789,11 +793,11 @@ fn push(&mut self, child: impl Into<Box<dyn Renderable + 'a>>)
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty flex-based vertical layout container.
+**Purpose**: This creates an empty flexible vertical layout. A flexible layout can mix fixed-height children with children that share leftover space.
 
-**Data flow**: It allocates an empty `Vec<FlexChild<'a>>` and returns `FlexRenderable { children }`.
+**Data flow**: It takes no input, creates an empty list of flexible children, and returns the layout.
 
-**Call relations**: This constructor is used where vertical space must be shared proportionally among children rather than simply stacked at desired heights.
+**Call relations**: Composer and test code create this layout before pushing children with chosen flex values.
 
 *Call graph*: called by 4 (as_renderable_with_composer_right_reserve, as_renderable, flex_redistributes_space_unused_by_short_children, flex_reserves_non_flex_space_before_flexible_children); 1 external calls (vec!).
 
@@ -804,11 +808,11 @@ fn new() -> Self
 fn push(&mut self, flex: i32, child: impl Into<RenderableItem<'a>>)
 ```
 
-**Purpose**: Adds a child to the flex layout with an associated flex factor.
+**Purpose**: This adds a child to a flexible vertical layout with a flex factor. A positive flex factor means the child can receive a share of leftover height.
 
-**Data flow**: It takes an `i32` flex value and a child convertible into `RenderableItem<'a>`, converts the child, wraps both into `FlexChild { flex, child }`, pushes it into `self.children`, and returns no value.
+**Data flow**: It receives a flex number and a child, converts the child into a RenderableItem, wraps both together, and appends them to the child list.
 
-**Call relations**: This builder method feeds the allocation algorithm in `FlexRenderable::allocate`.
+**Call relations**: Callers build up a flex layout by repeating this method for fixed and flexible sections before the layout is measured or rendered.
 
 *Call graph*: 1 external calls (into).
 
@@ -819,11 +823,11 @@ fn push(&mut self, flex: i32, child: impl Into<RenderableItem<'a>>)
 fn allocate(&self, area: Rect) -> Vec<Rect>
 ```
 
-**Purpose**: Computes the vertical rectangles assigned to each flex child, reserving fixed children first and distributing remaining space among positive-flex children.
+**Purpose**: This is the space-sharing calculator for FlexRenderable. It decides the exact rectangle each child gets inside the available area.
 
-**Data flow**: It takes a parent `Rect`, initializes per-child sizes, allocates non-flex children their desired heights capped by remaining space, computes free space, repeatedly satisfies flex children whose desired height is less than or equal to their proportional share so unused space can be redistributed, then divides the remaining space proportionally among the remaining flex children with the last flex child absorbing rounding slack. Finally it converts the computed heights into stacked `Rect`s and returns `Vec<Rect>`.
+**Data flow**: It receives the parent rectangle, measures fixed children first, finds remaining height, gives short flexible children only what they need, redistributes unused space, then divides what remains among the other flexible children. It returns a list of rectangles, one per child.
 
-**Call relations**: This is the core layout algorithm used by all `FlexRenderable` trait methods (`render`, `desired_height`, `cursor_pos`, `cursor_style`).
+**Call relations**: FlexRenderable::render, desired_height, cursor_pos, and cursor_style all call this so drawing, measuring, and cursor lookup agree on the same layout.
 
 *Call graph*: called by 4 (cursor_pos, cursor_style, desired_height, render); 5 external calls (new, new, with_capacity, from, vec!).
 
@@ -834,11 +838,11 @@ fn allocate(&self, area: Rect) -> Vec<Rect>
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders each flex child into the rectangle assigned by the allocation algorithm.
+**Purpose**: This draws all children in their allocated flexible positions. It uses the same allocation rules that measurement and cursor lookup use.
 
-**Data flow**: It takes a parent area and mutable buffer, computes child rectangles with `allocate(area)`, zips them with `self.children`, and calls each child's `render` with its assigned rectangle.
+**Data flow**: It receives an area and buffer, asks allocate for child rectangles, pairs each rectangle with its child, and tells each child to draw into its rectangle.
 
-**Call relations**: This method is the drawing phase for `FlexRenderable`, directly consuming the geometry produced by `allocate`.
+**Call relations**: This is the rendering stage for flexible vertical layouts after callers have built them with new and push.
 
 *Call graph*: calls 1 internal fn (allocate).
 
@@ -849,11 +853,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the total height a flex layout would occupy at a given width by allocating against an effectively unbounded height.
+**Purpose**: This reports how tall the flexible layout would like to be for a given width. It computes that by laying the children out in an extremely tall imaginary area.
 
-**Data flow**: It constructs a synthetic `Rect::new(0, 0, width, u16::MAX)`, runs `allocate`, takes the last allocated rectangle if any, and returns its bottom coordinate or 0 when there are no children.
+**Data flow**: It receives a width, runs allocate with a rectangle whose height is the maximum u16 value, and returns the bottom edge of the last child rectangle, or 0 if there are no children.
 
-**Call relations**: This sizing method reuses the same allocation logic as rendering so desired-height calculations stay consistent with actual layout.
+**Call relations**: Parent layouts call this when a FlexRenderable is nested inside another renderable structure.
 
 *Call graph*: calls 1 internal fn (allocate); 1 external calls (new).
 
@@ -864,11 +868,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Finds the first flex child that reports a cursor position within its allocated rectangle.
+**Purpose**: This finds the cursor position inside a flexible vertical layout. It checks children using the same rectangles used for drawing.
 
-**Data flow**: It takes a parent area, computes child rectangles with `allocate(area)`, zips them with children, queries each child's `cursor_pos(rect)`, and returns the first non-`None` result.
+**Data flow**: It receives the parent area, allocates child rectangles, asks each child for a cursor position in its rectangle, and returns the first one found.
 
-**Call relations**: This mirrors flex rendering order and geometry so cursor lookup matches actual child placement.
+**Call relations**: The top-level renderer can ask the flex layout for cursor placement without knowing which flexible child is currently interactive.
 
 *Call graph*: calls 1 internal fn (allocate).
 
@@ -879,11 +883,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Returns the cursor style of the first flex child whose allocated rectangle contains that child's cursor.
+**Purpose**: This finds the cursor style belonging to the child that owns the cursor in a flexible layout. If no child owns the cursor, it returns the default style.
 
-**Data flow**: It takes a parent area, computes allocations, zips them with children, finds the first child whose `cursor_pos(rect)` is `Some`, maps that to `child.cursor_style(rect)`, and falls back to `DefaultUserShape` if none qualify.
+**Data flow**: It receives the parent area, allocates rectangles, finds the first child that reports a cursor position, asks that child for its style, and returns it. If none is found, it returns the default cursor shape.
 
-**Call relations**: This method complements `FlexRenderable::cursor_pos`, using the same allocation results to identify the cursor-owning child.
+**Call relations**: This keeps cursor appearance aligned with FlexRenderable::cursor_pos because both use the same allocation calculation.
 
 *Call graph*: calls 1 internal fn (allocate).
 
@@ -894,11 +898,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders fixed-width children left-to-right across a single row area until no width remains.
+**Purpose**: This draws children from left to right with fixed requested widths. It stops when there is no horizontal space left.
 
-**Data flow**: It takes a parent `Rect` and mutable `Buffer`, tracks the current `x`, computes each child area using the configured width capped by remaining width, stops if the child area is empty, renders the child, and advances `x` by the configured width using saturation.
+**Data flow**: It receives a row area and buffer, tracks the current x-position, gives each child the smaller of its requested width and remaining width, and asks non-empty children to draw. The buffer is changed by those children.
 
-**Call relations**: This is the horizontal composition routine for `RowRenderable`, used when children have explicit widths.
+**Call relations**: UI code uses rows for side-by-side pieces such as labels and values, and this method turns that horizontal arrangement into terminal cells.
 
 *Call graph*: 1 external calls (new).
 
@@ -909,11 +913,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the row's height as the maximum desired height among children over the widths they will actually receive.
+**Purpose**: This reports how tall a row needs to be. Since children sit side by side, the row needs the height of its tallest visible child.
 
-**Data flow**: It takes total available width, iterates children left-to-right, caps each configured width by remaining width, stops when width reaches zero, queries each child's `desired_height(w)`, tracks the maximum, subtracts consumed width, and returns the max height.
+**Data flow**: It receives total available width, walks children left to right, gives each child its usable width, asks for its height, and keeps the maximum. It returns that maximum height.
 
-**Call relations**: This sizing method lets a row participate in larger layouts while respecting each child's fixed-width allocation.
+**Call relations**: Parent layouts use this to reserve enough vertical space for a horizontal group.
 
 
 ##### `RowRenderable::cursor_pos`  (lines 413–426)
@@ -922,11 +926,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Finds the first horizontally arranged child that reports a cursor position within its assigned rectangle.
+**Purpose**: This finds a cursor position inside a horizontal row. It checks children from left to right using each child’s actual rectangle.
 
-**Data flow**: It takes a parent area, computes each child area exactly as `render` does, skips empty areas, queries `child.cursor_pos(child_area)`, and returns the first non-`None` position found.
+**Data flow**: It receives the row area, computes each child’s rectangle within the remaining width, asks visible children for a cursor position, and returns the first one found.
 
-**Call relations**: This mirrors row rendering geometry so cursor lookup stays consistent with actual horizontal placement.
+**Call relations**: This lets an interactive item inside a row report the cursor through the row to the wider rendering system.
 
 *Call graph*: 1 external calls (new).
 
@@ -937,11 +941,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Returns the cursor style of the first row child that owns the cursor.
+**Purpose**: This finds the cursor style for the child in a row that owns the cursor. If no child reports a cursor, it returns the default style.
 
-**Data flow**: It takes a parent area, computes child areas as in `render`, checks whether each child reports a cursor position, and returns that child's `cursor_style(child_area)` for the first match; otherwise `DefaultUserShape`.
+**Data flow**: It receives the row area, computes child rectangles from left to right, and returns the style of the first child that has a cursor position. Otherwise it returns the default cursor shape.
 
-**Call relations**: This method pairs with `RowRenderable::cursor_pos` to propagate cursor appearance from the active horizontal child.
+**Call relations**: This mirrors RowRenderable::cursor_pos so both cursor location and cursor shape come from the same side-by-side child.
 
 *Call graph*: 1 external calls (new).
 
@@ -952,11 +956,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty horizontal renderable container.
+**Purpose**: This creates an empty horizontal layout. Callers use it before adding fixed-width children.
 
-**Data flow**: It allocates an empty `Vec<(u16, RenderableItem<'a>)>` and returns `RowRenderable { children }`.
+**Data flow**: It takes no input, creates an empty child list, and returns a RowRenderable.
 
-**Call relations**: This constructor is used where fixed-width horizontal composition is needed.
+**Call relations**: Selection-option UI code creates rows this way before filling them with the pieces that should appear side by side.
 
 *Call graph*: called by 1 (selection_option_row_with_dim); 1 external calls (vec!).
 
@@ -967,11 +971,11 @@ fn new() -> Self
 fn push(&mut self, width: u16, child: impl Into<Box<dyn Renderable>>)
 ```
 
-**Purpose**: Appends a fixed-width owned child to the horizontal row.
+**Purpose**: This appends a fixed-width child to the right side of a row. The width says how much horizontal space the child should be offered.
 
-**Data flow**: It takes a width and a child convertible into `Box<dyn Renderable>`, boxes/converts the child, wraps it as `RenderableItem::Owned`, pushes `(width, child)` into `self.children`, and returns no value.
+**Data flow**: It receives a width and renderable child, boxes and owns the child, and stores the pair in the row’s child list.
 
-**Call relations**: This mutating builder method is used to assemble rows incrementally.
+**Call relations**: After RowRenderable::new, callers use this repeatedly to assemble the row before it is measured or drawn.
 
 *Call graph*: 2 external calls (into, Owned).
 
@@ -982,11 +986,11 @@ fn push(&mut self, width: u16, child: impl Into<Box<dyn Renderable>>)
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the wrapped child inside the parent area reduced by the configured insets.
+**Purpose**: This draws a child inside a padded area. The padding keeps the child away from the outer edges.
 
-**Data flow**: It takes a parent area and mutable buffer, computes `area.inset(self.insets)`, and forwards rendering to the child with that inset rectangle.
+**Data flow**: It receives an outer area and buffer, shrinks the area by the stored insets, and tells the child to draw inside the smaller rectangle.
 
-**Call relations**: This wrapper is used whenever a renderable should draw inside padded bounds rather than flush to its assigned rectangle.
+**Call relations**: When code wraps content in InsetRenderable or uses the inset helper, this method applies the padding during the actual draw.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (inset).
 
@@ -997,11 +1001,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports the wrapped child's desired height plus vertical padding, using reduced width for the child calculation.
+**Purpose**: This reports the height needed for a padded child. It includes both the child’s height and the top and bottom padding.
 
-**Data flow**: It takes a width, subtracts left and right inset values from it, asks the child for `desired_height` at that inner width, adds top and bottom inset values, and returns the total.
+**Data flow**: It receives an outer width, subtracts left and right padding before asking the child for height, then adds top and bottom padding to the result.
 
-**Call relations**: This sizing method ensures parent layouts reserve enough space for both the child content and its padding.
+**Call relations**: Parent layouts use this so padded content gets enough room for both its contents and its surrounding blank space.
 
 *Call graph*: calls 1 internal fn (desired_height).
 
@@ -1012,11 +1016,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Queries the wrapped child's cursor position within the inset inner rectangle.
+**Purpose**: This asks the padded child for its cursor position inside the inner padded area. Padding affects where the child is allowed to place the cursor.
 
-**Data flow**: It takes a parent area, computes `area.inset(self.insets)`, forwards `cursor_pos` to the child, and returns the result.
+**Data flow**: It receives the outer area, shrinks it by the insets, asks the child for a cursor position in that inner area, and returns the child’s answer.
 
-**Call relations**: This keeps cursor lookup aligned with the padded render area used by `InsetRenderable::render`.
+**Call relations**: This keeps cursor lookup consistent with rendering, because both use the same inset rectangle.
 
 *Call graph*: calls 1 internal fn (cursor_pos); 1 external calls (inset).
 
@@ -1027,11 +1031,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> SetCursorStyle
 ```
 
-**Purpose**: Queries the wrapped child's cursor style within the inset inner rectangle.
+**Purpose**: This forwards cursor-style lookup to the padded child using the same inner area used for drawing. The padding wrapper does not choose its own cursor style.
 
-**Data flow**: It takes a parent area, computes `area.inset(self.insets)`, forwards `cursor_style` to the child, and returns the result.
+**Data flow**: It receives the outer area, shrinks it by the insets, asks the child for a cursor style in that inner area, and returns that style.
 
-**Call relations**: This complements `InsetRenderable::cursor_pos` for padded cursor propagation.
+**Call relations**: When an inset child owns the cursor, this passes the child’s cursor appearance back through the padding wrapper.
 
 *Call graph*: calls 1 internal fn (cursor_style); 1 external calls (inset).
 
@@ -1042,11 +1046,11 @@ fn cursor_style(&self, area: Rect) -> SetCursorStyle
 fn new(child: impl Into<RenderableItem<'a>>, insets: Insets) -> Self
 ```
 
-**Purpose**: Constructs an inset wrapper around a child renderable.
+**Purpose**: This creates a padded wrapper around a renderable child. It is useful when a caller wants explicit control over the padding values.
 
-**Data flow**: It takes a child convertible into `RenderableItem<'a>` and an `Insets`, converts the child, stores both fields, and returns `InsetRenderable { child, insets }`.
+**Data flow**: It receives a child and an Insets value, converts the child into a RenderableItem, stores both, and returns the wrapper.
 
-**Call relations**: This constructor is used directly in a few call sites and indirectly by the fluent `RenderableExt::inset` helper.
+**Call relations**: Popup, table-cell, and live-tail rendering code call this when they need content drawn with margins around it.
 
 *Call graph*: called by 3 (from, insert_cell, live_tail_renderable); 1 external calls (into).
 
@@ -1057,11 +1061,11 @@ fn new(child: impl Into<RenderableItem<'a>>, insets: Insets) -> Self
 fn inset(self, insets: Insets) -> RenderableItem<'a>
 ```
 
-**Purpose**: Fluently wraps any concrete renderable in an owned `InsetRenderable` and returns it as a `RenderableItem`.
+**Purpose**: This is a convenience helper that turns any renderable value into a padded renderable item. It lets callers write layout code in a fluent style.
 
-**Data flow**: It takes ownership of `self` plus an `Insets`, boxes `self` as a `Renderable`, wraps that boxed child in `InsetRenderable { child, insets }`, boxes the wrapper, and returns `RenderableItem::Owned(...)`.
+**Data flow**: It receives a renderable value and insets, boxes the value as a child, wraps it in an InsetRenderable, boxes that wrapper, and returns it as an owned RenderableItem.
 
-**Call relations**: This extension method is the ergonomic entrypoint for callers that want to add padding around any renderable without manually constructing `InsetRenderable`.
+**Call relations**: Code that already has a renderable can call this helper instead of manually constructing InsetRenderable and RenderableItem layers.
 
 *Call graph*: 2 external calls (new, Owned).
 
@@ -1071,9 +1075,13 @@ This group covers keybinding display logic and the footer/title builders that tu
 
 ### `tui/src/key_hint.rs`
 
-`util` · `cross-cutting`
+`domain_logic` · `cross-cutting during TUI input handling and hint rendering`
 
-This module provides the small but important abstraction layer between raw `crossterm::event::KeyEvent` values and the rest of the TUI. `KeyBinding` stores a `KeyCode` plus `KeyModifiers` and exposes constructors for common combinations (`plain`, `alt`, `shift`, `ctrl`, `ctrl_alt`). The core logic is `normalize_key_parts`, which smooths over terminal inconsistencies: uppercase ASCII letters are normalized to lowercase plus `SHIFT`, and raw C0 control characters such as LF or `\u{0012}` are mapped back to `ctrl-j` or `ctrl-r` when no modifiers are reported. `KeyBinding::is_press` compares normalized binding parts against normalized event parts and accepts both `Press` and `Repeat` kinds while rejecting `Release`. `KeyBindingListExt` extends slices of bindings with `is_pressed`, treating them as alternatives for one action. `is_plain_text_key_event` draws the boundary used by searchable pickers: printable characters without Ctrl or Alt count as text input even if some views also bind those letters for navigation. For UI display, `display_label` converts bindings into human-readable strings with platform-sensitive Alt prefixes (`⌥ + ` on macOS/tests, `alt + ` elsewhere), and `From<KeyBinding> for Span` renders them dimmed via `key_hint_style`. `has_ctrl_or_alt` and `is_altgr` help callers distinguish real command modifiers from Windows AltGr input. The tests focus on normalization correctness and matching behavior across uppercase and raw-control-character edge cases.
+A terminal app cannot always trust that every terminal reports keys in the same shape. For example, one terminal may report Shift+A as “A with no shift flag,” while another reports “a with shift.” Some Ctrl key presses arrive as old-style invisible control characters instead of as “Ctrl plus a letter.” This file is the shared translator for those cases.
+
+Its main type, `KeyBinding`, stores one shortcut as a key plus modifier keys such as Ctrl, Shift, or Alt. When a real key event arrives, the matching code first normalizes both sides into a common form, like putting two differently written addresses into the same format before comparing them. That lets features such as lists, pickers, history search, and text input use one consistent shortcut system instead of each inventing its own fragile comparisons.
+
+The file also draws shortcut labels for the UI, such as `ctrl + k`, `shift + a`, or arrow symbols, using a dim style so they look like hints rather than main content. Finally, it separates ordinary printable typing from command shortcuts, which matters for searchable lists: pressing `j` should type into the search box, while Ctrl+J can still mean “move down.”
 
 #### Function details
 
@@ -1083,11 +1091,11 @@ This module provides the small but important abstraction layer between raw `cros
 fn new(key: KeyCode, modifiers: KeyModifiers) -> Self
 ```
 
-**Purpose**: Constructs a `KeyBinding` from an explicit key code and modifier set without applying normalization.
+**Purpose**: Creates a `KeyBinding` from a key and its modifier keys. Other code uses this when it wants to define a shortcut such as plain Enter, Ctrl+K, or Alt+Up.
 
-**Data flow**: Accepts a `KeyCode` and `KeyModifiers`, stores them directly in `Self`, and returns the new binding.
+**Data flow**: A key code and a set of modifier keys go in. The function stores them together without changing them. A new `KeyBinding` value comes out.
 
-**Call relations**: Used by the convenience constructors, config parsing, and one test that needs a custom modifier combination.
+**Call relations**: This is the small constructor underneath the convenience helpers `plain`, `alt`, `shift`, `ctrl`, and `ctrl_alt`. Configuration parsing and some tests also call it directly when they need an exact custom combination.
 
 *Call graph*: called by 7 (alt, ctrl, ctrl_alt, plain, shift, shift_letter_binding_preserves_other_modifiers_with_uppercase_compat, parse_keybinding).
 
@@ -1098,11 +1106,11 @@ fn new(key: KeyCode, modifiers: KeyModifiers) -> Self
 fn from_event(event: KeyEvent) -> Self
 ```
 
-**Purpose**: Builds a normalized `KeyBinding` from a raw `KeyEvent`.
+**Purpose**: Turns a raw terminal key event into this file’s normalized shortcut form. This is useful when the program wants to record or compare what the user actually pressed.
 
-**Data flow**: Reads `event.code` and `event.modifiers`, normalizes them with `normalize_key_parts`, and returns a `KeyBinding` containing the normalized pair.
+**Data flow**: A terminal `KeyEvent` goes in. Its key and modifier parts are passed through `normalize_key_parts`, which fixes common reporting differences. A `KeyBinding` containing the normalized key and modifiers comes out.
 
-**Call relations**: Called when converting runtime key events into binding-like values for matching or config serialization.
+**Call relations**: Input-handling code calls this after receiving a key event, and configuration code uses it when converting a key event into a config-friendly key description. It relies on `normalize_key_parts` so callers do not need to know terminal compatibility details.
 
 *Call graph*: calls 1 internal fn (normalize_key_parts); called by 2 (handle_key_event, key_event_to_config_key_spec).
 
@@ -1113,11 +1121,11 @@ fn from_event(event: KeyEvent) -> Self
 fn is_press(&self, event: KeyEvent) -> bool
 ```
 
-**Purpose**: Checks whether a raw key event should trigger this binding, including compatibility normalization and repeat acceptance.
+**Purpose**: Checks whether a real key event activates this shortcut. It accepts normal key presses and held-key repeats, but rejects key releases.
 
-**Data flow**: Normalizes both the binding’s stored `(key, modifiers)` and the incoming event’s `(code, modifiers)` with `normalize_key_parts`, compares them for equality, and additionally requires `event.kind` to be `Press` or `Repeat`. Returns `bool`.
+**Data flow**: The stored binding and an incoming terminal event go in. Both are normalized so equivalent forms, such as uppercase letters and Shift+letter, compare the same. The function returns true only if the normalized key parts match and the event is a press or repeat.
 
-**Call relations**: Used directly by slice matching and tests. It is the core runtime matcher for one binding.
+**Call relations**: This is the core matching check used by shortcut sets through `KeyBinding::is_pressed`. It hands the messy comparison work to `normalize_key_parts` before making the final yes-or-no decision.
 
 *Call graph*: calls 1 internal fn (normalize_key_parts).
 
@@ -1128,11 +1136,11 @@ fn is_press(&self, event: KeyEvent) -> bool
 fn parts(&self) -> (KeyCode, KeyModifiers)
 ```
 
-**Purpose**: Returns the binding’s stored key code and modifiers as a tuple.
+**Purpose**: Returns the raw key and modifier pieces stored inside a binding. Code that needs to serialize or inspect a binding can use this instead of reaching into its private fields.
 
-**Data flow**: Reads `self.key` and `self.modifiers` and returns `(KeyCode, KeyModifiers)`.
+**Data flow**: A `KeyBinding` goes in as `self`. The function reads its key and modifier fields. It returns those two values as a pair and changes nothing.
 
-**Call relations**: Used by config serialization code that needs to inspect a binding’s raw components.
+**Call relations**: Configuration-writing code calls this when turning a binding back into a config key specification. It is a simple doorway from the compact binding object back to its two ingredients.
 
 *Call graph*: called by 1 (binding_to_config_key_spec).
 
@@ -1143,11 +1151,11 @@ fn parts(&self) -> (KeyCode, KeyModifiers)
 fn display_label(&self) -> String
 ```
 
-**Purpose**: Formats a binding into a human-readable label for footer hints and picker UI.
+**Purpose**: Builds the human-readable label shown in the TUI for a shortcut. It turns internal key names into friendly labels like `enter`, `space`, `↑`, or `ctrl + k`.
 
-**Data flow**: Converts modifiers to a prefix string with `modifiers_to_string`, maps special keys like Enter, arrows, PageUp/PageDown, and space to friendly labels, lowercases other key strings, concatenates prefix and key, and returns the resulting `String`.
+**Data flow**: A binding goes in. The modifier keys are converted to text with `modifiers_to_string`, then the key itself is converted to a friendly word, symbol, or lowercase string. The final label string comes out.
 
-**Call relations**: Used by the `Span` conversion impl when rendering key hints in the UI.
+**Call relations**: The `Span::from` conversion calls this when a key binding needs to be displayed as styled UI text. It is the text-making half of the hint-rendering path.
 
 *Call graph*: calls 1 internal fn (modifiers_to_string); called by 1 (from); 2 external calls (to_string, format!).
 
@@ -1161,11 +1169,11 @@ fn normalize_key_parts(
 ) -> (KeyCode, KeyModifiers)
 ```
 
-**Purpose**: Normalizes key code/modifier pairs so bindings match across terminal reporting quirks.
+**Purpose**: Converts key reports into one standard shape before comparison. This hides differences between terminals, especially for shifted letters and Ctrl key combinations.
 
-**Data flow**: Accepts a `KeyCode` and mutable `KeyModifiers`. Non-character keys are returned unchanged. For character keys, if modifiers are empty and the char is a supported C0 control character, it returns the corresponding printable char plus `CONTROL`. If the char is uppercase ASCII, it inserts `SHIFT` and lowercases the char. Otherwise it returns the original pair.
+**Data flow**: A key code and modifier set go in. If the key is not a character, they come back unchanged. If it is an old-style control character with no modifiers, `c0_control_char_to_ctrl_char` maps it to the matching Ctrl shortcut. If it is an uppercase ASCII letter, the function adds Shift and stores the lowercase letter. The normalized pair comes out.
 
-**Call relations**: Called by both `KeyBinding::from_event` and `KeyBinding::is_press`, making it the shared normalization rule for matching and serialization.
+**Call relations**: `KeyBinding::from_event`, `KeyBinding::is_press`, and configuration key conversion all call this so they speak the same key language. It delegates the special old control-character mapping to `c0_control_char_to_ctrl_char`.
 
 *Call graph*: calls 1 internal fn (c0_control_char_to_ctrl_char); called by 3 (from_event, is_press, key_parts_to_config_key_spec); 3 external calls (Char, insert, is_empty).
 
@@ -1176,11 +1184,11 @@ fn normalize_key_parts(
 fn c0_control_char_to_ctrl_char(ch: char) -> Option<char>
 ```
 
-**Purpose**: Maps raw C0 control characters to the printable character used in `ctrl-<char>` bindings.
+**Purpose**: Recognizes old terminal control characters and translates them into the visible key that Ctrl was probably pressed with. For example, a raw line-feed character can mean Ctrl+J.
 
-**Data flow**: Converts the input `char` to `u32`, matches ranges for NUL (`ctrl-space`), `0x01..=0x1a` (`ctrl-a` through `ctrl-z`), and `0x1c..=0x1f` (`ctrl-4` through `ctrl-7`), and returns `Option<char>`.
+**Data flow**: One character goes in. The function looks at its numeric code and, for supported control-code ranges, calculates the matching printable character such as a letter, space, or digit. It returns that character if recognized, or nothing if the character is not one of the supported control codes.
 
-**Call relations**: Used only by `normalize_key_parts` to support terminals that report Ctrl chords as raw control bytes.
+**Call relations**: `normalize_key_parts` calls this only when a character arrives with no modifiers. That keeps Ctrl compatibility in one narrow helper instead of spreading old terminal rules across the TUI.
 
 *Call graph*: called by 1 (normalize_key_parts); 2 external calls (from_u32, from).
 
@@ -1191,11 +1199,11 @@ fn c0_control_char_to_ctrl_char(ch: char) -> Option<char>
 fn is_pressed(&self, event: KeyEvent) -> bool
 ```
 
-**Purpose**: Checks whether any binding in a slice matches a given key event.
+**Purpose**: Checks whether any shortcut in a group matches one incoming key event. This lets one action have several alternative keys.
 
-**Data flow**: Borrows a slice of `KeyBinding` and a `KeyEvent`, iterates the slice, calls `binding.is_press(event)` for each, and returns true on the first match.
+**Data flow**: A slice of bindings and a terminal key event go in. The function asks each binding whether it matches the event using `is_press`. It returns true as soon as one matches, or false if none do.
 
-**Call relations**: Used by higher-level key-dispatch helpers that treat a binding list as one action’s alternatives.
+**Call relations**: History search helpers call this when deciding whether a key should trigger backward or forward history search. It is the group-level wrapper around the single-binding matcher.
 
 *Call graph*: called by 2 (is_history_search_forward_key, is_history_search_key).
 
@@ -1206,11 +1214,11 @@ fn is_pressed(&self, event: KeyEvent) -> bool
 fn is_plain_text_key_event(event: KeyEvent) -> bool
 ```
 
-**Purpose**: Determines whether a key event should be treated as literal text input rather than a command/navigation chord.
+**Purpose**: Decides whether a key event should be treated as ordinary typed text instead of as a command shortcut. This protects search boxes and text inputs from accidentally swallowing printable characters.
 
-**Data flow**: Pattern-matches the event and returns true only for `KeyCode::Char(ch)` where `ch` is not an ASCII control character and modifiers contain neither `CONTROL` nor `ALT`.
+**Data flow**: A terminal key event goes in. The function checks that it is a character, that the character is not an invisible control character, and that Ctrl and Alt are not pressed. It returns true for plain text typing and false for command-like input.
 
-**Call relations**: Called by input-handling code and searchable pickers to avoid stealing printable characters for navigation.
+**Call relations**: Several key handlers call this before applying navigation shortcuts. It gives them a shared rule: plain printable keys can update text, while modified keys remain available for commands.
 
 *Call graph*: called by 4 (handle_key_event, handle_key_event, handle_key_event, handle_key); 1 external calls (matches!).
 
@@ -1221,11 +1229,11 @@ fn is_plain_text_key_event(event: KeyEvent) -> bool
 fn plain(key: KeyCode) -> KeyBinding
 ```
 
-**Purpose**: Convenience constructor for an unmodified key binding.
+**Purpose**: Creates a shortcut with no modifier keys. It is a readable way to say “this action is triggered by this key alone.”
 
-**Data flow**: Accepts a `KeyCode`, calls `KeyBinding::new(key, KeyModifiers::NONE)`, and returns the binding.
+**Data flow**: A key code goes in. The function pairs it with the empty modifier set by calling `KeyBinding::new`. A plain `KeyBinding` comes out.
 
-**Call relations**: Widely used by default keymap and footer-hint code for plain keys.
+**Call relations**: Many UI and default-binding builders call this when defining normal keys such as Enter, Escape, arrows, or single letters. It exists so those definitions are easy to read.
 
 *Call graph*: calls 1 internal fn (new); called by 14 (footer_props, new_with_config, footer_insert_newline_key, history_search_action_key_span, default_bindings, esc_hint_line, new, render_one_pending_steer_with_remapped_interrupt_binding, footer_tips, skills_toggle_hint_line (+4 more)).
 
@@ -1236,11 +1244,11 @@ fn plain(key: KeyCode) -> KeyBinding
 fn alt(key: KeyCode) -> KeyBinding
 ```
 
-**Purpose**: Convenience constructor for an Alt-modified key binding.
+**Purpose**: Creates an Alt-key shortcut. On macOS the UI label later shows this using the Option symbol, because that is the key users recognize.
 
-**Data flow**: Accepts a `KeyCode`, calls `KeyBinding::new(key, KeyModifiers::ALT)`, and returns the binding.
+**Data flow**: A key code goes in. The function calls `KeyBinding::new` with the Alt modifier added. An Alt-based `KeyBinding` comes out.
 
-**Call relations**: Used by default bindings and terminal-specific shortcut selection.
+**Call relations**: Default bindings and shortcut helpers call this for actions reached through Alt combinations, such as agent shortcuts or editing recent queued messages.
 
 *Call graph*: calls 1 internal fn (new); called by 6 (default_bindings, new, queued_message_edit_binding_for_terminal, alt_up_edits_most_recent_queued_message, next_agent_shortcut, previous_agent_shortcut).
 
@@ -1251,11 +1259,11 @@ fn alt(key: KeyCode) -> KeyBinding
 fn shift(key: KeyCode) -> KeyBinding
 ```
 
-**Purpose**: Convenience constructor for a Shift-modified key binding.
+**Purpose**: Creates a Shift-key shortcut. It is used for shortcuts that depend on holding Shift with a key.
 
-**Data flow**: Accepts a `KeyCode`, calls `KeyBinding::new(key, KeyModifiers::SHIFT)`, and returns the binding.
+**Data flow**: A key code goes in. The function calls `KeyBinding::new` with the Shift modifier. A Shift-based `KeyBinding` comes out.
 
-**Call relations**: Used by footer hints, shortcut definitions, and tests covering uppercase compatibility.
+**Call relations**: Footer rendering, queued-message editing shortcuts, and tests call this. Matching later goes through normalization, so Shift+letter can also match terminals that report an uppercase letter instead.
 
 *Call graph*: calls 1 internal fn (new); called by 6 (footer_insert_newline_key, footer_snapshots, render_one_message_with_shift_left_binding, queued_message_edit_binding_for_terminal, shift_letter_binding_does_not_match_plain_lowercase_or_other_uppercase, shifted_letter_binding_matches_uppercase_char_events).
 
@@ -1266,11 +1274,11 @@ fn shift(key: KeyCode) -> KeyBinding
 fn ctrl(key: KeyCode) -> KeyBinding
 ```
 
-**Purpose**: Convenience constructor for a Control-modified key binding.
+**Purpose**: Creates a Ctrl-key shortcut. This is used for many command-style keys in the terminal UI.
 
-**Data flow**: Accepts a `KeyCode`, calls `KeyBinding::new(key, KeyModifiers::CONTROL)`, and returns the binding.
+**Data flow**: A key code goes in. The function calls `KeyBinding::new` with the Control modifier. A Ctrl-based `KeyBinding` comes out.
 
-**Call relations**: Used heavily throughout input handling and tests for Ctrl-key normalization.
+**Call relations**: Input handlers, default binding setup, footer display, and tests call this often. The resulting bindings benefit from the control-character compatibility built into `is_press` and `normalize_key_parts`.
 
 *Call graph*: calls 1 internal fn (new); called by 16 (on_ctrl_c, new_with_config, base_footer_mode_tracks_empty_state_after_quit_hint_expires, default_bindings, footer_snapshots, footer_status_line_truncates_to_keep_mode_indicator, paste_image_shortcut_prefers_ctrl_alt_v_under_wsl, handle_key_event, on_ctrl_c, on_ctrl_d (+6 more)).
 
@@ -1281,11 +1289,11 @@ fn ctrl(key: KeyCode) -> KeyBinding
 fn ctrl_alt(key: KeyCode) -> KeyBinding
 ```
 
-**Purpose**: Convenience constructor for a Control+Alt-modified key binding.
+**Purpose**: Creates a shortcut that requires both Ctrl and Alt. This is useful for combinations that should be distinct from plain Ctrl or plain Alt.
 
-**Data flow**: Accepts a `KeyCode`, calls `KeyBinding::new(key, KeyModifiers::CONTROL.union(KeyModifiers::ALT))`, and returns the binding.
+**Data flow**: A key code goes in. The function combines the Control and Alt modifier flags and passes them to `KeyBinding::new`. A binding requiring both modifiers comes out.
 
-**Call relations**: Used where the TUI needs an explicit Ctrl+Alt shortcut, such as paste-image handling under WSL.
+**Call relations**: The paste-image shortcut tests call this, especially for environments where Ctrl+Alt+V is preferred. It is the two-modifier version of the simpler helper constructors.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (paste_image_shortcut_prefers_ctrl_alt_v_under_wsl).
 
@@ -1296,11 +1304,11 @@ fn ctrl_alt(key: KeyCode) -> KeyBinding
 fn modifiers_to_string(modifiers: KeyModifiers) -> String
 ```
 
-**Purpose**: Formats a modifier set into the ordered textual prefix used by key-hint labels.
+**Purpose**: Turns modifier keys into the text prefix used in shortcut labels. For example, it can produce `ctrl + shift + ` before the main key name.
 
-**Data flow**: Builds a `String`, appends `CTRL_PREFIX` if control is present, `SHIFT_PREFIX` if shift is present, and `ALT_PREFIX` if alt is present, then returns the result.
+**Data flow**: A modifier set goes in. The function checks for Control, Shift, and Alt in that order and appends the matching text prefixes. It returns the completed prefix string.
 
-**Call relations**: Used only by `KeyBinding::display_label`.
+**Call relations**: `KeyBinding::display_label` calls this before adding the main key name. It centralizes label wording, including the platform-specific Alt or Option prefix.
 
 *Call graph*: called by 1 (display_label); 2 external calls (contains, new).
 
@@ -1311,11 +1319,11 @@ fn modifiers_to_string(modifiers: KeyModifiers) -> String
 fn from(binding: &KeyBinding) -> Self
 ```
 
-**Purpose**: Converts a `KeyBinding` reference into a dimmed `ratatui::text::Span` suitable for footer and hint rendering.
+**Purpose**: Converts a key binding into styled text that can be drawn by the TUI. A `Span` is a small piece of terminal text with a style attached.
 
-**Data flow**: Calls `binding.display_label()` to get the text, `key_hint_style()` to get the style, and returns `Span::styled(...)`.
+**Data flow**: A reference to a `KeyBinding` goes in. The function asks the binding for its display label, gets the standard key-hint style from `key_hint_style`, and combines them into a styled `Span`. The styled span comes out.
 
-**Call relations**: Used implicitly wherever key bindings are rendered into UI spans.
+**Call relations**: UI rendering code can rely on this conversion when it needs to show a shortcut hint. It connects the label-making function `display_label` with the visual style from `key_hint_style`.
 
 *Call graph*: calls 2 internal fn (display_label, key_hint_style); 1 external calls (styled).
 
@@ -1326,11 +1334,11 @@ fn from(binding: &KeyBinding) -> Self
 fn key_hint_style() -> Style
 ```
 
-**Purpose**: Defines the shared visual style for rendered key-hint spans.
+**Purpose**: Defines the visual style used for keyboard shortcut hints. It makes them dim so they read as helpful hints rather than primary content.
 
-**Data flow**: Returns `Style::default().dim()`.
+**Data flow**: No input is needed. The function starts from the default terminal style and applies a dim effect. The resulting style comes out.
 
-**Call relations**: Used by the `Span` conversion impl so all key hints share the same subdued appearance.
+**Call relations**: `Span::from` calls this whenever it turns a binding into display text. Keeping the style here makes shortcut hints look consistent across the TUI.
 
 *Call graph*: called by 1 (from); 1 external calls (default).
 
@@ -1341,11 +1349,11 @@ fn key_hint_style() -> Style
 fn has_ctrl_or_alt(mods: KeyModifiers) -> bool
 ```
 
-**Purpose**: Reports whether a modifier set contains a real Ctrl or Alt command modifier, excluding AltGr on Windows.
+**Purpose**: Checks whether a modifier set includes Ctrl or Alt in a way that should count as a command modifier. On Windows it avoids treating AltGr as a command shortcut.
 
-**Data flow**: Checks whether modifiers contain `CONTROL` or `ALT`, then suppresses the result if `is_altgr(mods)` is true. Returns `bool`.
+**Data flow**: A modifier set goes in. The function checks whether Control or Alt is present, then excludes the special AltGr case by calling `is_altgr`. It returns true when the modifiers should be treated as Ctrl/Alt command input.
 
-**Call relations**: Used by input-handling code to distinguish command chords from plain text entry.
+**Call relations**: Text and history input handlers call this while deciding whether a key is normal typing or a command. It relies on `is_altgr` so international keyboard input is not mistaken for shortcuts on Windows.
 
 *Call graph*: calls 1 internal fn (is_altgr); called by 4 (handle_key_event, handle_input_basic_with_time, handle_history_search_key, handle_key_event_at); 1 external calls (contains).
 
@@ -1356,11 +1364,11 @@ fn has_ctrl_or_alt(mods: KeyModifiers) -> bool
 fn is_altgr(_mods: KeyModifiers) -> bool
 ```
 
-**Purpose**: Detects the AltGr modifier combination on Windows and always returns false elsewhere.
+**Purpose**: Detects the AltGr key combination where supported. AltGr is used on many keyboard layouts to type characters such as `@`, `€`, or accented letters, so it should not always behave like a command shortcut.
 
-**Data flow**: On Windows, returns true when both `ALT` and `CONTROL` are present; on non-Windows, ignores the input and returns false.
+**Data flow**: A modifier set goes in. On Windows, the function returns true when both Alt and Control are present, which is how AltGr is commonly reported. On non-Windows systems, it always returns false. It does not change anything.
 
-**Call relations**: Called by `has_ctrl_or_alt` and some input code to avoid misclassifying AltGr text entry as a command chord.
+**Call relations**: `has_ctrl_or_alt` calls this to avoid misclassifying AltGr typing as a Ctrl+Alt command. Other input keymap code may also call it when interpreting keyboard layout behavior.
 
 *Call graph*: called by 2 (input_with_keymap, has_ctrl_or_alt); 1 external calls (contains).
 
@@ -1371,11 +1379,11 @@ fn is_altgr(_mods: KeyModifiers) -> bool
 fn is_press_accepts_press_and_repeat_but_rejects_release()
 ```
 
-**Purpose**: Verifies that binding matching accepts `Press` and `Repeat` events but rejects `Release` and wrong modifiers.
+**Purpose**: Tests that shortcut matching accepts key presses and held-key repeats, but not key releases. It also checks that the wrong modifiers do not match.
 
-**Data flow**: Builds a `ctrl-k` binding and several `KeyEvent` variants, calls `is_press` on each, and asserts the expected booleans.
+**Data flow**: The test builds a Ctrl+K binding and several key events: press, repeat, release, and plain K. It runs `is_press` on each event. The expected before-and-after result is true for press and repeat, false for release and wrong modifiers.
 
-**Call relations**: Direct unit test of `KeyBinding::is_press` event-kind filtering.
+**Call relations**: This test exercises the core behavior of `KeyBinding::is_press` through a binding made with `ctrl`. It protects input handlers from triggering actions when the terminal reports key releases.
 
 *Call graph*: calls 1 internal fn (ctrl); 3 external calls (Char, new, assert!).
 
@@ -1386,11 +1394,11 @@ fn is_press_accepts_press_and_repeat_but_rejects_release()
 fn keybinding_list_ext_matches_any_binding()
 ```
 
-**Purpose**: Checks that slice matching succeeds when any one binding matches and fails otherwise.
+**Purpose**: Tests that a list of alternative shortcuts matches when any one shortcut is pressed. This confirms that one action can have multiple accepted keys.
 
-**Data flow**: Builds a two-binding array, calls `.is_pressed(...)` with matching and non-matching events, and asserts the expected results.
+**Data flow**: The test creates two bindings, plain A and Ctrl+B. It sends matching A and Ctrl+B events, then a non-matching C event. It expects the first two checks to return true and the last to return false.
 
-**Call relations**: Tests the `KeyBindingListExt` implementation over slices.
+**Call relations**: This test covers the slice-level `is_pressed` helper built from `plain` and `ctrl`. It supports callers such as history search that treat several bindings as alternatives for one action.
 
 *Call graph*: calls 2 internal fn (ctrl, plain); 2 external calls (Char, assert!).
 
@@ -1401,11 +1409,11 @@ fn keybinding_list_ext_matches_any_binding()
 fn shifted_letter_binding_matches_uppercase_char_events()
 ```
 
-**Purpose**: Verifies uppercase compatibility for shifted letter bindings.
+**Purpose**: Tests that Shift-letter shortcuts still work when a terminal reports the key as an uppercase character. This protects compatibility across terminal programs.
 
-**Data flow**: Builds `shift-a`, tests it against `Shift+a`, plain uppercase `A`, and uppercase `A` with explicit shift, and asserts all match.
+**Data flow**: The test creates a Shift+A binding. It checks events reported as Shift+a, plain uppercase A, and uppercase A with Shift. Each should match after normalization.
 
-**Call relations**: Exercises the uppercase normalization branch in `normalize_key_parts`.
+**Call relations**: This test verifies the uppercase-letter path in `normalize_key_parts` through the public `is_press` behavior. It ensures callers do not need their own Shift compatibility checks.
 
 *Call graph*: calls 1 internal fn (shift); 2 external calls (Char, assert!).
 
@@ -1416,11 +1424,11 @@ fn shifted_letter_binding_matches_uppercase_char_events()
 fn shift_letter_binding_preserves_other_modifiers_with_uppercase_compat()
 ```
 
-**Purpose**: Checks that uppercase normalization preserves non-shift modifiers such as Control.
+**Purpose**: Tests that uppercase-letter normalization does not lose other modifier keys. For example, Ctrl+Shift+I should still match a terminal report of Ctrl plus uppercase I.
 
-**Data flow**: Builds a binding for `Ctrl+Shift+i`, tests it against an event reporting uppercase `I` with only `CONTROL`, and asserts it matches.
+**Data flow**: The test creates a binding for Ctrl+Shift+I. It sends an event reported as Ctrl with uppercase I. The expected result is a match, showing that normalization adds Shift while keeping Ctrl.
 
-**Call relations**: Covers the interaction between uppercase normalization and additional modifiers.
+**Call relations**: This test calls `KeyBinding::new` directly to build the exact combination. It protects the part of `normalize_key_parts` that adds Shift without wiping out existing modifiers.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (Char, assert!).
 
@@ -1431,11 +1439,11 @@ fn shift_letter_binding_preserves_other_modifiers_with_uppercase_compat()
 fn shift_letter_binding_does_not_match_plain_lowercase_or_other_uppercase()
 ```
 
-**Purpose**: Verifies that shifted-letter compatibility does not over-match unrelated events.
+**Purpose**: Tests that Shift-letter matching is not too loose. A Shift+O binding should not match plain lowercase o or a different uppercase letter.
 
-**Data flow**: Builds `shift-o`, tests it against plain lowercase `o` and uppercase `P`, and asserts both fail.
+**Data flow**: The test creates a Shift+O binding. It checks a plain lowercase o event and an uppercase P event. Both should fail.
 
-**Call relations**: Complements the uppercase-compatibility tests with negative cases.
+**Call relations**: This test uses the `shift` helper and then exercises `is_press`. It guards against normalization accidentally turning nearby or unmodified keys into false matches.
 
 *Call graph*: calls 1 internal fn (shift); 2 external calls (Char, assert!).
 
@@ -1446,11 +1454,11 @@ fn shift_letter_binding_does_not_match_plain_lowercase_or_other_uppercase()
 fn ctrl_letter_binding_matches_c0_control_char_events()
 ```
 
-**Purpose**: Checks that a Ctrl-letter binding matches the corresponding raw C0 control character only when no extra modifiers are present.
+**Purpose**: Tests that a Ctrl-letter binding matches the old-style control character some terminals send. It also checks that adding Alt prevents that fallback match.
 
-**Data flow**: Builds `ctrl-p`, tests it against raw `\u{0010}` with no modifiers and with `ALT`, and asserts only the unmodified event matches.
+**Data flow**: The test creates a Ctrl+P binding. It sends the raw control character for Ctrl+P with no modifiers, expecting a match, then sends the same character with Alt, expecting no match.
 
-**Call relations**: Exercises the C0-control normalization path and its modifier guard.
+**Call relations**: This test verifies the `c0_control_char_to_ctrl_char` path through `normalize_key_parts` and `is_press`. It keeps Ctrl compatibility useful without over-matching modified control characters.
 
 *Call graph*: calls 1 internal fn (ctrl); 2 external calls (Char, assert!).
 
@@ -1461,11 +1469,11 @@ fn ctrl_letter_binding_matches_c0_control_char_events()
 fn ctrl_bindings_match_all_supported_c0_control_char_events()
 ```
 
-**Purpose**: Exhaustively verifies the supported raw C0-to-Ctrl mappings for letters, space, and digits 4–7.
+**Purpose**: Tests the full supported table of old-style Ctrl control characters. It confirms that each recognized raw control code maps to the intended Ctrl shortcut.
 
-**Data flow**: Iterates a table of `(ctrl_char, c0_char)` pairs, asserts `ctrl(ctrl_char)` matches a no-modifier event carrying `c0_char`, and asserts the same raw char with `ALT` does not match.
+**Data flow**: The test walks through pairs such as Ctrl+A to raw code 0x01 and Ctrl+J to line feed. For each pair, it expects the unmodified raw control character to match and the Alt-modified version not to match.
 
-**Call relations**: Broad regression coverage for `c0_control_char_to_ctrl_char` and `normalize_key_parts`.
+**Call relations**: This test gives broad coverage to `c0_control_char_to_ctrl_char` as used by shortcut matching. It acts like a checklist for the terminal compatibility map.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1476,11 +1484,11 @@ fn ctrl_bindings_match_all_supported_c0_control_char_events()
 fn ctrl_binding_does_not_match_ambiguous_c0_escape_or_delete()
 ```
 
-**Purpose**: Verifies that ambiguous raw ESC and DEL characters are not normalized into Ctrl bindings.
+**Purpose**: Tests that ambiguous control characters are deliberately not treated as Ctrl shortcuts. Escape and Delete-like codes can mean other things in terminals, so matching them as Ctrl+[ or Ctrl+? would be risky.
 
-**Data flow**: Tests `ctrl('[')` against raw ESC and `ctrl('?')` against raw DEL, asserting both fail.
+**Data flow**: The test checks Ctrl+[ against the raw Escape character and Ctrl+? against the Delete character. Both comparisons should return false.
 
-**Call relations**: Covers intentionally unsupported control-character cases.
+**Call relations**: This test protects the exclusions in `c0_control_char_to_ctrl_char`. It ensures the compatibility layer stays cautious where terminal meanings are unclear.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1491,11 +1499,11 @@ fn ctrl_binding_does_not_match_ambiguous_c0_escape_or_delete()
 fn history_search_ctrl_bindings_match_c0_control_char_events()
 ```
 
-**Purpose**: Checks the specific Ctrl-R and Ctrl-S bindings used by history search against raw C0 events.
+**Purpose**: Tests specific Ctrl shortcuts used by history search. It makes sure Ctrl+R and Ctrl+S still work when terminals send raw control characters.
 
-**Data flow**: Tests `ctrl('r')` against `\u{0012}` and `ctrl('s')` against `\u{0013}`, asserting both match.
+**Data flow**: The test sends raw control characters corresponding to Ctrl+R and Ctrl+S. It checks them against Ctrl+R and Ctrl+S bindings. Both should match.
 
-**Call relations**: A focused regression test for history-search shortcuts built on the general C0 normalization logic.
+**Call relations**: This test connects the general Ctrl compatibility behavior to an important user-facing feature: history search. It helps prevent regressions in common terminal shortcuts.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1506,11 +1514,11 @@ fn history_search_ctrl_bindings_match_c0_control_char_events()
 fn ctrl_alt_sets_both_modifiers()
 ```
 
-**Purpose**: Verifies that the `ctrl_alt` constructor produces a binding with both modifier bits set.
+**Purpose**: Tests that the `ctrl_alt` helper really creates a binding with both Control and Alt. This keeps shortcut definitions honest and readable.
 
-**Data flow**: Constructs `ctrl_alt('v')`, calls `.parts()`, and asserts the tuple equals `(Char('v'), CONTROL | ALT)`.
+**Data flow**: The test creates Ctrl+Alt+V and asks for its stored parts. It compares the result with the expected key V and the combined Control-plus-Alt modifier set.
 
-**Call relations**: Direct unit test of the convenience constructor.
+**Call relations**: This test checks the helper constructor rather than matching behavior. It supports code paths that define special Ctrl+Alt shortcuts, such as paste-image handling.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1521,20 +1529,24 @@ fn ctrl_alt_sets_both_modifiers()
 fn has_ctrl_or_alt_checks_supported_modifier_combinations()
 ```
 
-**Purpose**: Checks `has_ctrl_or_alt` across none, Ctrl, Alt, and Ctrl+Alt combinations, including the Windows AltGr exception.
+**Purpose**: Tests the rule for detecting Ctrl or Alt command modifiers. It also verifies the Windows-specific AltGr exception.
 
-**Data flow**: Calls `has_ctrl_or_alt` with several modifier sets and asserts expected booleans, with platform-conditional expectations for `CONTROL | ALT`.
+**Data flow**: The test checks no modifiers, Control alone, Alt alone, and Control+Alt together. It expects no modifiers to be false, Control and Alt to be true, and Control+Alt to depend on the platform because Windows treats that combination as possible AltGr.
 
-**Call relations**: Tests the helper used by input handling to distinguish command modifiers from text-entry modifiers.
+**Call relations**: This test covers `has_ctrl_or_alt` and, through it, `is_altgr`. It protects text input code from confusing command shortcuts with normal character entry on international keyboards.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `tui/src/bottom_pane/action_required_title.rs`
 
-`util` · `cross-cutting UI title rendering`
+`domain_logic` · `terminal UI rendering`
 
-This file contains one constant prefix and one generic formatter function for terminal title text. `ACTION_REQUIRED_PREVIEW_PREFIX` provides the standard leading label, and `build_action_required_title_text` assembles the final title from a caller-supplied prefix plus a sequence of `TerminalTitleItem` values. The function starts with the prefix as the first segment, then iterates the provided items in order. It deliberately skips the spinner item and any item present in the `excluded_items` slice, so transient activity indicators or caller-suppressed fields never appear in the action-required title. For each remaining item, it invokes the `value_for` callback; only `Some(String)` results are appended, which lets callers omit items whose current value is unavailable or empty without special-casing the loop. The final output is `parts.join(" | ")`, preserving item order and producing a stable, human-readable title line. The function is generic over both the item source and the value lookup closure, so it can be reused by different title-building paths without owning the source collection type.
+This file is a small helper for the bottom area of the terminal interface. Its job is to create a clear title like an alert banner: it starts with a phrase such as "[ ! ] Action Required", then adds extra pieces of information separated by vertical bars. Think of it like making a short sign for a notice board: the sign always starts with the main warning, then only includes the details that are useful right now.
+
+The important behavior is that it deliberately leaves out some title items. It always skips the spinner item, because a spinning progress marker does not belong in this attention-needed title. It also skips any items the caller says should be excluded. For every remaining item, it asks a caller-provided function to turn that item into display text. If that function says there is no text for an item, the item is ignored.
+
+Without this helper, different parts of the terminal UI might build this title inconsistently, include noisy details, or forget to remove the spinner. This keeps the action-required title compact, predictable, and easy to scan.
 
 #### Function details
 
@@ -1549,24 +1561,26 @@ fn build_action_required_title_text(
 ) -> String
 ```
 
-**Purpose**: Constructs a pipe-separated terminal title string from a prefix and a sequence of `TerminalTitleItem` values. It omits the spinner and any explicitly excluded items, and only includes items whose callback returns a string.
+**Purpose**: Builds one display string for an “action required” title. It starts with a prefix, adds text for allowed title items, skips unwanted items, and joins everything with " | " so the result is easy to read.
 
-**Data flow**: Takes a `prefix: &str`, an `IntoIterator<Item = TerminalTitleItem>`, an exclusion slice, and a mutable `FnMut` that maps each item to `Option<String>` → seeds a `Vec<String>` with `prefix.to_string()` → filters out `TerminalTitleItem::Spinner` and excluded items via `contains` → pushes callback-produced strings for remaining items → returns the joined string with `" | "` separators.
+**Data flow**: It receives a prefix, a sequence of possible title items, a list of items to leave out, and a function that can turn each item into text. It starts a list with the prefix, walks through the items, skips the spinner and anything in the excluded list, asks for text for the remaining items, and appends any text it gets. It returns the final title string made by joining all kept parts with separators.
 
-**Call relations**: This helper is called by higher-level terminal-title composition code when the UI needs an action-required title. It does not delegate to project-local functions; its main role is to centralize the filtering and formatting policy so callers only provide item order and value lookup.
+**Call relations**: When terminal UI code needs the action-required title, this helper is the place that assembles it. Inside, it uses a fresh list to collect the title pieces, checks the excluded-items list to decide what not to show, and then hands back a finished string ready for display.
 
 *Call graph*: 2 external calls (contains, vec!).
 
 
 ### `tui/src/bottom_pane/footer.rs`
 
-`domain_logic` · `cross-cutting rendering during composer display`
+`domain_logic` · `main loop / UI rendering`
 
-This module is the footer formatting engine for the bottom pane. Its central input is `FooterProps`, which carries the current `FooterMode`, hint flags, task-running state, status-line content, active agent label, and a `FooterKeyHints` bundle of resolved key bindings. The file deliberately separates policy from rendering: higher-level widgets choose the mode, while this module computes lines, widths, and fallback layouts.
+The footer is the chat UI’s “bottom signpost.” It tells the user what keys are useful right now, whether they are in a special mode, how much context remains, or whether they need to press a key again to quit. Without this file, the app could still run, but users would lose many of the small prompts that make the terminal interface understandable.
 
-The most important logic is `single_line_footer_layout`. It decides whether the left-side instructional hint and right-side contextual indicator can coexist, and if not, which pieces to drop first. Queue hints are preserved more aggressively than shortcut hints; collaboration mode labels may keep or lose the `(shift+tab to cycle)` suffix depending on width; and when the cycle hint cannot fit, the right-side context may also be suppressed to avoid unstable transitions. Supporting helpers such as `right_aligned_x`, `max_left_width_for_right`, and `can_show_left_with_context` compute exact geometry.
+The file takes a bundle of inputs called `FooterProps`. These inputs are chosen elsewhere by the chat composer and higher-level widgets. This file does not decide whether a task is running or whether quitting is allowed; it trusts the values it is given and focuses on drawing the right text.
 
-Rendering is split between `render_footer_line` for a precomputed single line and `render_footer_from_props` for the canonical mode-to-lines mapping from `footer_from_props_lines`. That mapping covers passive contextual rows, quit reminders, reverse-i-search, shortcut overlays, Esc hints, and draft/empty composer states. The module also defines the shortcut overlay data model (`ShortcutDescriptor`, `ShortcutBinding`, `DisplayCondition`) and the static `SHORTCUTS` table, which adapts entries based on WSL, collaboration modes, shift-enter behavior, and task-running state. Extensive tests snapshot width-collapse behavior, status-line truncation, and shortcut selection.
+A key part of the file is fitting information into one terminal row. Terminal windows can be narrow, so the footer tries the fullest version first, then drops less important pieces. For example, it may keep “Tab to queue message” but hide the right-side context label if space is tight. This is like packing a small suitcase: essentials stay, extras go first.
+
+The file also builds the multi-line shortcut overlay shown after pressing `?`, formats collaboration mode labels, renders passive status lines, and right-aligns contextual indicators. Tests at the bottom use snapshots to make sure the footer looks correct across many states and widths.
 
 #### Function details
 
@@ -1576,11 +1590,11 @@ Rendering is split between `render_footer_line` for a precomputed single line an
 fn default_bindings() -> Self
 ```
 
-**Purpose**: Provides a test-only bundle of standard footer key bindings.
+**Purpose**: Creates the standard set of keyboard hints used in tests. It gives each footer action, such as opening shortcuts or searching history, its usual key combination.
 
-**Data flow**: Constructs a `FooterKeyHints` with concrete `KeyBinding` values for shortcuts toggle, queue, newline, external editor, edit previous, transcript, history search, and reasoning controls → returns the struct.
+**Data flow**: It starts with no inputs. It builds a `FooterKeyHints` value filled with key bindings like `?`, `Tab`, `Ctrl+J`, and `Alt+.`. The result is returned to tests as a ready-made footer key setup.
 
-**Call relations**: Used only in tests to build realistic `FooterProps` without depending on runtime keymap loading.
+**Call relations**: Snapshot and shortcut tests call this when they need realistic default keys. It relies on small key-building helpers such as `plain`, `ctrl`, and `alt` to describe the keys in the same format the real UI uses.
 
 *Call graph*: calls 3 internal fn (alt, ctrl, plain); called by 3 (footer_snapshots, footer_status_line_truncates_to_keep_mode_indicator, paste_image_shortcut_prefers_ctrl_alt_v_under_wsl); 1 external calls (Char).
 
@@ -1591,11 +1605,11 @@ fn default_bindings() -> Self
 fn label(self, show_cycle_hint: bool) -> String
 ```
 
-**Purpose**: Builds the plain-text label for a collaboration mode, optionally appending the cycle hint suffix.
+**Purpose**: Turns a collaboration mode, such as Plan mode, into the text shown to the user. It can also add the “shift+tab to cycle” hint when that reminder should be visible.
 
-**Data flow**: Consumes `self` and `show_cycle_hint` → computes `suffix` as either empty or `" (shift+tab to cycle)"`, matches the enum variant, and returns the formatted `String`.
+**Data flow**: It receives a mode and a yes-or-no flag for the cycle hint. It builds the matching label string, optionally with the hint in parentheses. It returns plain text, not styled terminal output.
 
-**Call relations**: Called by `styled_span` so styling and text generation stay coupled.
+**Call relations**: `styled_span` calls this first so it can get the human-readable label before applying color. This keeps the wording and the styling as two separate steps.
 
 *Call graph*: called by 1 (styled_span); 2 external calls (new, format!).
 
@@ -1606,11 +1620,11 @@ fn label(self, show_cycle_hint: bool) -> String
 fn styled_span(self, show_cycle_hint: bool) -> Span<'static>
 ```
 
-**Purpose**: Converts a collaboration mode indicator into a colored/styled span suitable for footer rendering.
+**Purpose**: Creates the colored piece of terminal text for a collaboration mode label. Different modes get different colors so users can recognize them quickly.
 
-**Data flow**: Consumes `self` and `show_cycle_hint`, gets the label string from `label`, wraps it in `Span::from`, and applies variant-specific styling (`magenta`, `cyan`, or `dim`) → returns `Span<'static>`.
+**Data flow**: It receives a collaboration mode and whether to include the cycle hint. It asks `label` for the text, wraps that text in a terminal span, and applies the mode’s color. The result is a styled span ready to be placed in a footer line.
 
-**Call relations**: Used anywhere the mode indicator is inserted into a footer line, including left-side summary lines and right-side status indicators.
+**Call relations**: Footer-building helpers use this when adding the collaboration mode to either the left footer summary or the right-side status indicator.
 
 *Call graph*: calls 1 internal fn (label); 1 external calls (from).
 
@@ -1625,11 +1639,11 @@ fn toggle_shortcut_mode(
 ) -> FooterMode
 ```
 
-**Purpose**: Toggles between the shortcut overlay and the appropriate base footer mode, while preserving the quit reminder if that transient hint is active.
+**Purpose**: Switches the footer between normal mode and the shortcut help overlay. It also avoids hiding the quit reminder when that reminder is currently active.
 
-**Data flow**: Consumes `current`, `ctrl_c_hint`, and `is_empty` → if `ctrl_c_hint` is true and the current mode is `QuitShortcutReminder`, returns the current mode unchanged; otherwise computes the base mode (`ComposerEmpty` or `ComposerHasDraft`) and toggles between that base mode and `ShortcutOverlay`.
+**Data flow**: It receives the current footer mode, whether a quit reminder is active, and whether the composer is empty. It decides the appropriate normal base mode, then either opens the shortcut overlay or closes it back to the base mode. The returned mode is what the composer should show next.
 
-**Call relations**: Called by higher-level key handling when the user presses the shortcuts toggle key.
+**Call relations**: The shortcut-overlay key handler calls this when the user presses the shortcut-help key. It is part of the small state machine that decides which footer message should appear.
 
 *Call graph*: called by 1 (handle_shortcut_overlay_key); 1 external calls (matches!).
 
@@ -1640,11 +1654,11 @@ fn toggle_shortcut_mode(
 fn esc_hint_mode(current: FooterMode, is_task_running: bool) -> FooterMode
 ```
 
-**Purpose**: Chooses whether pressing Esc should switch the footer into the Esc hint state. Running tasks suppress this transition.
+**Purpose**: Chooses whether pressing Escape should show the “press Esc again” hint. It does not show that hint while a task is running, because Escape may have a different meaning then.
 
-**Data flow**: Consumes `current` and `is_task_running` → returns `current` unchanged when a task is running, otherwise returns `FooterMode::EscHint`.
+**Data flow**: It receives the current footer mode and whether a task is running. If a task is running, it returns the current mode unchanged. Otherwise, it returns `EscHint` so the footer can prompt the user.
 
-**Call relations**: Used by composer key handling paths that prime or show the Esc hint.
+**Call relations**: Several keyboard-event handlers call this when Escape is pressed in different UI situations, such as with file, slash-command, or normal input handling.
 
 *Call graph*: called by 4 (handle_key_event_with_file_popup, handle_key_event_without_popup, set_esc_backtrack_hint, handle_key_event_with_slash_popup).
 
@@ -1655,11 +1669,11 @@ fn esc_hint_mode(current: FooterMode, is_task_running: bool) -> FooterMode
 fn reset_mode_after_activity(current: FooterMode) -> FooterMode
 ```
 
-**Purpose**: Collapses transient footer modes back to the normal idle base mode after user activity. Draft mode also resets to empty mode here.
+**Purpose**: Returns the footer to its normal empty-composer state after user activity makes a temporary hint stale. This prevents old prompts from lingering after the user has moved on.
 
-**Data flow**: Consumes `current` → maps `EscHint`, `ShortcutOverlay`, `QuitShortcutReminder`, `HistorySearch`, and `ComposerHasDraft` to `ComposerEmpty`; leaves other modes unchanged.
+**Data flow**: It receives the current footer mode. If the mode is temporary, such as the shortcut overlay, quit reminder, history search, Esc hint, or draft mode, it returns `ComposerEmpty`. Otherwise, it leaves the mode alone.
 
-**Call relations**: Called by multiple higher-level activity handlers to clear transient instructional states.
+**Call relations**: Input handlers and cleanup routines call this after typing, changing settings, clearing quit hints, or similar activity. It keeps the footer synchronized with the current interaction.
 
 *Call graph*: called by 11 (clear_quit_shortcut_hint, handle_input_basic_with_time, handle_key_event_with_file_popup, handle_key_event_with_mentions_v2_popup, handle_key_event_with_skill_popup, handle_key_event_without_popup, set_esc_backtrack_hint, set_vim_enabled, cancel_history_search, handle_history_search_key (+1 more)).
 
@@ -1670,11 +1684,11 @@ fn reset_mode_after_activity(current: FooterMode) -> FooterMode
 fn footer_height(props: &FooterProps) -> u16
 ```
 
-**Purpose**: Computes how many lines the footer needs for the current props, including multi-line shortcut overlays.
+**Purpose**: Calculates how many terminal rows the footer needs for the current state. Most states need one row, while the shortcut overlay needs several.
 
-**Data flow**: Reads `props.mode` and `props.is_task_running` to derive `show_shortcuts_hint` and `show_queue_hint`, then calls `footer_from_props_lines(...)` and returns the resulting line count as `u16`.
+**Data flow**: It receives `FooterProps`. It decides which hints would be visible, asks `footer_from_props_lines` to build the actual lines, and returns the number of lines as a height.
 
-**Call relations**: Used by rendering/layout code and tests before allocating footer space.
+**Call relations**: Rendering and snapshot-test helpers call this before drawing so they can allocate enough space. It delegates the real text construction to `footer_from_props_lines`.
 
 *Call graph*: calls 1 internal fn (footer_from_props_lines); called by 4 (snapshot_composer_state_with_width, render_footer_with_mode_indicator_and_context, snapshot_footer_with_indicators, snapshot_footer_with_mode_indicator_and_context).
 
@@ -1685,11 +1699,11 @@ fn footer_height(props: &FooterProps) -> u16
 fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'static>)
 ```
 
-**Purpose**: Renders a single already-chosen footer line with the standard left indentation applied.
+**Purpose**: Draws one already-chosen footer line into the terminal buffer. It is used when layout code has already decided exactly what should appear.
 
-**Data flow**: Consumes `area`, `buf`, and `line` → prefixes the line using `prefix_lines` with `FOOTER_INDENT_COLS` spaces on both first and subsequent lines, wraps it in a `Paragraph`, and renders it into `buf`.
+**Data flow**: It receives a screen area, a mutable terminal buffer, and one line of styled text. It adds the standard left indentation, wraps the line in a paragraph widget, and writes it into the buffer. The buffer is changed; nothing meaningful is returned.
 
-**Call relations**: Used when width-collapse logic has already selected a specific single-line footer variant.
+**Call relations**: The main bottom-pane renderer calls this after single-line collapse logic has selected a custom line. It uses `prefix_lines` to apply the same indentation as other footer rendering.
 
 *Call graph*: calls 1 internal fn (prefix_lines); called by 1 (render_with_mask_and_textarea_right_reserve); 2 external calls (new, vec!).
 
@@ -1706,11 +1720,11 @@ fn render_footer_from_props(
     show_sh
 ```
 
-**Purpose**: Renders footer content directly from `FooterProps` and explicit hint flags, without applying single-line collapse decisions.
+**Purpose**: Draws footer content directly from `FooterProps`. This is used when the caller wants the normal mapping from footer mode to text, without extra width-based simplification.
 
-**Data flow**: Consumes `area`, `buf`, `props`, optional collaboration mode indicator, and booleans controlling cycle/shortcut/queue hints → builds the footer lines via `footer_from_props_lines`, prefixes them with the standard indentation, wraps them in a `Paragraph`, and renders them.
+**Data flow**: It receives the drawing area, buffer, footer properties, optional mode indicator, and flags for which hints to show. It builds footer lines with `footer_from_props_lines`, indents them, and writes them into the buffer. The terminal buffer is updated.
 
-**Call relations**: Used by callers when they want the canonical mode-to-lines mapping, or when `single_line_footer_layout` returns `SummaryLeft::Default`.
+**Call relations**: The bottom-pane renderer calls this for straightforward footer states, especially temporary instruction states like shortcut help, Esc hints, and quit reminders.
 
 *Call graph*: calls 2 internal fn (footer_from_props_lines, prefix_lines); called by 1 (render_with_mask_and_textarea_right_reserve); 1 external calls (new).
 
@@ -1721,11 +1735,11 @@ fn render_footer_from_props(
 fn left_fits(area: Rect, left_width: u16) -> bool
 ```
 
-**Purpose**: Checks whether a left-side footer fragment can fit within the footer area when rendered alone.
+**Purpose**: Checks whether a left-side footer message can fit in the available width after indentation. It is a small guard used before drawing text that might be too wide.
 
-**Data flow**: Consumes `area` and `left_width` → subtracts the standard footer indent from `area.width` and returns whether `left_width <= max_width`.
+**Data flow**: It receives a screen area and the width of the left-side content. It subtracts the footer indent from the area width and compares the content width to the remaining space. It returns true if the content fits.
 
-**Call relations**: Used by `single_line_footer_layout` during fallback selection.
+**Call relations**: `single_line_footer_layout` calls this while trying narrower fallback versions of the footer. It helps avoid drawing text that would collide or overflow.
 
 *Call graph*: called by 1 (single_line_footer_layout).
 
@@ -1740,11 +1754,11 @@ fn left_side_line(
 ) -> Line<'static>
 ```
 
-**Purpose**: Builds the left-side single-line footer content from a summary hint state and optional collaboration mode indicator.
+**Purpose**: Builds the left part of the one-line footer, such as “? for shortcuts,” “Tab to queue message,” and the collaboration mode label. It combines the most immediate action hint with optional mode context.
 
-**Data flow**: Consumes optional `collaboration_mode_indicator`, `LeftSideState`, and `FooterKeyHints` → starts with an empty `Line`, appends shortcut or queue hint spans depending on `state.hint`, inserts a dim separator when both hint and mode are present, and appends the styled mode span when requested → returns the composed line.
+**Data flow**: It receives an optional collaboration mode, a small state describing which hint to show, and the available key hints. It creates a styled line, adding separators when both a hint and a mode label are present. It returns the completed line.
 
-**Call relations**: This is the primitive line builder used heavily by `single_line_footer_layout` and indirectly by `footer_from_props_lines` for base composer states.
+**Call relations**: `single_line_footer_layout` uses this repeatedly while testing possible footer versions. `footer_from_props_lines` also uses the same helper so normal rendering and collapsed rendering speak the same visual language.
 
 *Call graph*: called by 1 (single_line_footer_layout); 2 external calls (from, matches!).
 
@@ -1760,11 +1774,11 @@ fn single_line_footer_layout(
     show_shortcuts_hint: bool,
 ```
 
-**Purpose**: Chooses the best-fitting single-line footer variant and whether the right-side context can remain visible. It encodes the module’s width-collapse policy.
+**Purpose**: Chooses the best one-line footer layout for the available terminal width. It decides what to keep, shorten, or hide so important guidance remains visible.
 
-**Data flow**: Consumes `area`, `context_width`, optional collaboration mode indicator, booleans for cycle/shortcut/queue hints, and `key_hints` → builds the default left-side line and width, checks whether it fits with context, then explores fallback states in a priority order: queue variants first when queueing is active, cycle-hint and mode-only variants when collaboration mode is present, and finally no-left-content fallback → returns `(SummaryLeft, show_context)`.
+**Data flow**: It receives the screen area, right-side context width, optional mode label, hint flags, and key hints. It tries the full left footer with right context, then falls back through shorter versions such as dropping shortcut help, shortening queue text, hiding the cycle hint, or hiding the right context. It returns what the left side should be and whether the right context should still be drawn.
 
-**Call relations**: Called by higher-level footer rendering code before deciding whether to use `render_footer_line`, `render_footer_from_props`, and `render_context_right`.
+**Call relations**: The bottom-pane renderer calls this for base composer states. It uses `left_side_line`, `can_show_left_with_context`, and `left_fits` as measuring tools while it searches for the best fit.
 
 *Call graph*: calls 3 internal fn (can_show_left_with_context, left_fits, left_side_line); called by 1 (render_with_mask_and_textarea_right_reserve); 1 external calls (Custom).
 
@@ -1778,11 +1792,11 @@ fn mode_indicator_line(
 ) -> Option<Line<'static>>
 ```
 
-**Purpose**: Wraps an optional collaboration mode indicator into a one-line footer line.
+**Purpose**: Converts an optional collaboration mode into a full footer line. If there is no mode, it returns nothing.
 
-**Data flow**: Consumes `indicator` and `show_cycle_hint` → maps the indicator to `Line::from(vec![indicator.styled_span(show_cycle_hint)])` or returns `None`.
+**Data flow**: It receives an optional mode and a flag for the cycle hint. When a mode is present, it creates a one-span line using that mode’s styled label. When absent, it returns `None`.
 
-**Call relations**: Used by `status_line_right_indicator_line` when building the right-side contextual indicator.
+**Call relations**: `status_line_right_indicator_line` uses this as the first choice for the right-side status indicator. It is a small adapter between mode labels and line-based rendering.
 
 *Call graph*: called by 1 (status_line_right_indicator_line).
 
@@ -1795,11 +1809,11 @@ fn goal_status_indicator_line(
 ) -> Option<Line<'static>>
 ```
 
-**Purpose**: Formats a goal-status indicator into a magenta footer line, including optional usage text where applicable.
+**Purpose**: Formats the current goal state as a short status message. It tells the user whether a goal is being pursued, paused, blocked, limited, completed, or abandoned.
 
-**Data flow**: Consumes `Option<&GoalStatusIndicator>` → returns `None` if absent; otherwise matches the variant, builds the exact label string, wraps it in a magenta `Span`, and returns `Some(Line)`.
+**Data flow**: It receives an optional goal-status indicator. If none is provided, it returns nothing. If one is present, it chooses the right wording, includes usage text when available, colors it, and returns a footer line.
 
-**Call relations**: Used by `status_line_right_indicator_line` as a fallback when no collaboration mode indicator is present.
+**Call relations**: `status_line_right_indicator_line` uses this when there is no collaboration mode to show. It provides a fallback primary indicator for the right side of the status line.
 
 *Call graph*: 3 external calls (from, format!, vec!).
 
@@ -1814,11 +1828,11 @@ fn status_line_right_indicator_line(
     sh
 ```
 
-**Purpose**: Builds the right-side contextual indicator line shown alongside a passive status line. It can combine a primary indicator and an IDE-context marker with a separator.
+**Purpose**: Builds the right-side indicator shown beside a passive status line. It can combine a mode or goal label with an “IDE context” label.
 
-**Data flow**: Consumes optional collaboration mode indicator, optional goal status, `ide_context_active`, and `show_cycle_hint` → chooses a primary line from `mode_indicator_line(...).or_else(goal_status_indicator_line)`, optionally creates an `IDE context` cyan line, then merges the present indicators into one `Line` separated by dim ` · ` spans → returns `Option<Line<'static>>`.
+**Data flow**: It receives optional collaboration mode information, optional goal status, whether IDE context is active, and whether to show the cycle hint. It creates a primary indicator from the mode or goal, optionally creates an IDE context indicator, joins available pieces with a dot separator, and returns the combined line if there is anything to show.
 
-**Call relations**: Used by higher-level footer rendering when the passive status-line layout is active.
+**Call relations**: The footer layout code uses this when a configurable status line is active. It calls `mode_indicator_line` and, when needed, goal-status formatting so the right side summarizes the current environment.
 
 *Call graph*: calls 1 internal fn (mode_indicator_line); called by 1 (mode_indicator_line).
 
@@ -1829,11 +1843,11 @@ fn status_line_right_indicator_line(
 fn side_conversation_context_line(label: &str) -> Line<'static>
 ```
 
-**Purpose**: Formats the active side-conversation label for contextual footer display, with special styling for labels beginning with `Side `.
+**Purpose**: Formats the label for a side conversation so it can appear as contextual footer text. Labels beginning with “Side ” get special emphasis on the word “Side.”
 
-**Data flow**: Consumes `label: &str` → if it starts with `Side `, splits the prefix and rest so `Side` can be bold magenta and the remainder magenta; otherwise returns the whole label as a magenta line.
+**Data flow**: It receives a label string. If the label starts with `Side `, it splits the prefix from the rest and styles them in magenta, making the prefix bold. Otherwise, it styles the whole label in magenta. It returns a line ready to draw.
 
-**Call relations**: Used by higher-level footer rendering when showing side-conversation context.
+**Call relations**: The bottom-pane renderer calls this when it needs to show side-conversation context in the footer.
 
 *Call graph*: called by 1 (render_with_mask_and_textarea_right_reserve); 2 external calls (from, vec!).
 
@@ -1844,11 +1858,11 @@ fn side_conversation_context_line(label: &str) -> Line<'static>
 fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16>
 ```
 
-**Purpose**: Computes the x-coordinate where right-aligned footer content should start, respecting the standard right padding.
+**Purpose**: Finds the x-position where right-aligned footer content should start. It keeps a standard padding from the terminal’s right edge.
 
-**Data flow**: Consumes `area` and `content_width` → returns `None` for empty areas or zero-width content; otherwise subtracts `FOOTER_INDENT_COLS` right padding and either pins to the padded left edge when content is too wide or computes the right-aligned start position.
+**Data flow**: It receives a screen area and the width of the content to draw. If the area or content is empty, it returns nothing. Otherwise, it calculates the starting column, using the left padded edge if the content is too wide. It returns that column.
 
-**Call relations**: Shared geometry helper used by `max_left_width_for_right`, `can_show_left_with_context`, and `render_context_right`.
+**Call relations**: `can_show_left_with_context`, `max_left_width_for_right`, and `render_context_right` all use this shared positioning rule so measuring and drawing agree.
 
 *Call graph*: called by 3 (can_show_left_with_context, max_left_width_for_right, render_context_right); 1 external calls (is_empty).
 
@@ -1859,11 +1873,11 @@ fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16>
 fn max_left_width_for_right(area: Rect, right_width: u16) -> Option<u16>
 ```
 
-**Purpose**: Calculates the maximum left-side width that can coexist with a right-side indicator while preserving the minimum gap.
+**Purpose**: Calculates how wide the left footer text may be while still leaving room for right-aligned context. This is used when the left status line may need truncation.
 
-**Data flow**: Consumes `area` and `right_width` → computes the right indicator’s start x via `right_aligned_x`, derives the left start from the footer indent, subtracts the mandatory one-column gap, and returns the remaining width or zero when the right side crowds the left edge.
+**Data flow**: It receives a screen area and the width of the right-side content. It asks `right_aligned_x` where the right content would begin, then subtracts the left indent and required gap. It returns the maximum safe left width, or nothing if the right side cannot be positioned.
 
-**Call relations**: Used by higher-level rendering to truncate passive status lines so the right-side indicator remains visible.
+**Call relations**: The bottom-pane renderer uses this when a passive status line and right-side indicator must share one row. It helps preserve a visible gap between them.
 
 *Call graph*: calls 1 internal fn (right_aligned_x); called by 1 (render_with_mask_and_textarea_right_reserve).
 
@@ -1874,11 +1888,11 @@ fn max_left_width_for_right(area: Rect, right_width: u16) -> Option<u16>
 fn can_show_left_with_context(area: Rect, left_width: u16, context_width: u16) -> bool
 ```
 
-**Purpose**: Checks whether left-side content of a given width can be shown alongside right-side context without overlap.
+**Purpose**: Checks whether left footer text and right footer context can appear on the same row without touching. It protects the UI from visual overlap.
 
-**Data flow**: Consumes `area`, `left_width`, and `context_width` → if the right side cannot be positioned, returns true; if `left_width` is zero, returns true; otherwise computes the left extent including indent and gap and compares it to the right-side start position.
+**Data flow**: It receives the area, left text width, and right context width. It computes where the right content would start and compares that with the left text’s end plus a small gap. It returns true when both sides can coexist.
 
-**Call relations**: Core fit predicate used by both `single_line_footer_layout` and higher-level rendering/truncation logic.
+**Call relations**: The renderer and `single_line_footer_layout` call this before deciding to draw both sides. It shares the same right-alignment helper used by actual drawing.
 
 *Call graph*: calls 1 internal fn (right_aligned_x); called by 2 (render_with_mask_and_textarea_right_reserve, single_line_footer_layout).
 
@@ -1889,11 +1903,11 @@ fn can_show_left_with_context(area: Rect, left_width: u16, context_width: u16) -
 fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'static>)
 ```
 
-**Purpose**: Draws a right-aligned footer line directly into the buffer span-by-span.
+**Purpose**: Draws a footer context line aligned to the right edge of the terminal area. This is used for context usage, mode labels, IDE context, and similar ambient information.
 
-**Data flow**: Consumes `area`, `buf`, and `line` → early-returns on empty area or missing alignment position; computes the bottom-row y coordinate, then iterates spans, clipping each span to the remaining width and writing it with `buf.set_span` → mutates the buffer only.
+**Data flow**: It receives a screen area, a mutable buffer, and a styled line. It computes the right-aligned start column, then writes each span into the last row of the area, stopping if it reaches the edge. The buffer is updated in place.
 
-**Call relations**: Used by higher-level footer rendering after the left-side content has been chosen.
+**Call relations**: The bottom-pane renderer calls this after deciding that right-side context should be visible. It relies on `right_aligned_x` so the drawn position matches the earlier fit checks.
 
 *Call graph*: calls 1 internal fn (right_aligned_x); called by 1 (render_with_mask_and_textarea_right_reserve); 3 external calls (set_span, width, is_empty).
 
@@ -1904,11 +1918,11 @@ fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'static>)
 fn inset_footer_hint_area(mut area: Rect) -> Rect
 ```
 
-**Purpose**: Applies the standard two-column left inset used for footer hint items.
+**Purpose**: Moves the footer hint drawing area slightly to the right. This gives separate hint items a bit of breathing room from the edge.
 
-**Data flow**: Consumes `area`, and if `area.width > 2`, increments `x` by 2 and shrinks `width` by 2 → returns the adjusted `Rect`.
+**Data flow**: It receives a rectangle. If the rectangle is wider than two columns, it increases its x-position by two and shrinks its width by two. It returns the adjusted rectangle.
 
-**Call relations**: Used by `render_footer_hint_items` and by higher-level rendering code that places footer hint rows.
+**Call relations**: The main renderer and `render_footer_hint_items` use this before drawing compact hint-item rows.
 
 *Call graph*: called by 2 (render_with_mask_and_textarea_right_reserve, render_footer_hint_items).
 
@@ -1919,11 +1933,11 @@ fn inset_footer_hint_area(mut area: Rect) -> Rect
 fn render_footer_hint_items(area: Rect, buf: &mut Buffer, items: &[(String, String)])
 ```
 
-**Purpose**: Renders a compact key/label hint row when there are footer hint items to show.
+**Purpose**: Draws a row of small key-and-label hint items, such as compact footer controls. If there are no items, it draws nothing.
 
-**Data flow**: Consumes `area`, `buf`, and `items` → returns immediately if `items` is empty; otherwise builds a line with `footer_hint_items_line(items)`, insets the area with `inset_footer_hint_area`, and renders the line into the buffer.
+**Data flow**: It receives a screen area, buffer, and a list of key/label pairs. It turns the pairs into one styled line with `footer_hint_items_line`, adjusts the drawing area with `inset_footer_hint_area`, and renders the line into the buffer.
 
-**Call relations**: Used by higher-level footer rendering for auxiliary hint rows.
+**Call relations**: The bottom-pane renderer calls this for footer hint rows outside the main `FooterProps` flow. It shares formatting with `footer_hint_items_width` through `footer_hint_items_line`.
 
 *Call graph*: calls 2 internal fn (footer_hint_items_line, inset_footer_hint_area); called by 1 (render_with_mask_and_textarea_right_reserve).
 
@@ -1939,11 +1953,11 @@ fn footer_from_props_lines(
     show_queue_hint
 ```
 
-**Purpose**: Maps `FooterProps` and explicit hint flags to the canonical footer lines, without width-based collapse. It is the authoritative mode-to-text formatter.
+**Purpose**: Maps the current footer properties to the actual footer text lines. This is the central wording table for footer modes.
 
-**Data flow**: Consumes `props`, optional collaboration mode indicator, and booleans for cycle/shortcut/queue hints → first returns `passive_footer_status_line(props)` when contextual footer content should replace instructions; otherwise matches `props.mode` and returns the appropriate line vector: quit reminder, reverse-i-search prompt, left-side summary line, shortcut overlay lines, Esc hint, or draft-state summary line.
+**Data flow**: It receives `FooterProps`, optional mode information, and hint flags. It first checks whether passive status text should replace instructional hints. If not, it matches the footer mode and builds the right line or lines, such as quit reminders, history search prompt, shortcut overlay, Esc hint, queue hint, or empty-composer shortcut hint. It returns a list of styled lines.
 
-**Call relations**: Called by `footer_height`, `footer_line_width`, and `render_footer_from_props`. It is the central formatting function for footer content.
+**Call relations**: `footer_height`, `footer_line_width`, and `render_footer_from_props` all call this. It hands off shortcut-overlay construction to `shortcut_overlay_lines` and passive context construction to `passive_footer_status_line`.
 
 *Call graph*: calls 2 internal fn (passive_footer_status_line, shortcut_overlay_lines); called by 3 (footer_height, footer_line_width, render_footer_from_props); 1 external calls (vec!).
 
@@ -1954,11 +1968,11 @@ fn footer_from_props_lines(
 fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'static>>
 ```
 
-**Purpose**: Builds the contextual footer row shown when the footer is not occupied by an instructional hint. It can combine the configured status line and active agent label.
+**Purpose**: Builds the calm, contextual footer row shown when no urgent instruction is needed. It can show the configured status line, the active agent label, or both.
 
-**Data flow**: Consumes `props` → returns `None` unless `shows_passive_footer_line(props)` is true; otherwise starts from `props.status_line_value` when enabled, then appends ` · ` and the dimmed `active_agent_label` if present, or uses the agent label alone when no status line exists → returns `Option<Line<'static>>`.
+**Data flow**: It receives `FooterProps`. It first asks `shows_passive_footer_line` whether this mode is allowed to show passive context. If allowed, it starts with the configured status line when enabled, appends the active agent label with a separator when present, and returns the combined line. If not allowed, it returns nothing.
 
-**Call relations**: Used by `footer_from_props_lines` and by higher-level rendering code that reserves a dedicated passive status-line layout.
+**Call relations**: The renderer and `footer_from_props_lines` call this when deciding whether ambient context should replace normal hints. It keeps passive information from hiding important action prompts.
 
 *Call graph*: calls 1 internal fn (shows_passive_footer_line); called by 2 (render_with_mask_and_textarea_right_reserve, footer_from_props_lines); 1 external calls (from).
 
@@ -1969,11 +1983,11 @@ fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'static>>
 fn shows_passive_footer_line(props: &FooterProps) -> bool
 ```
 
-**Purpose**: Determines whether the current footer mode allows contextual information to replace instructional hints.
+**Purpose**: Decides whether the footer is allowed to show ambient context instead of instructions. It permits this only when the composer is idle enough that no urgent hint is needed.
 
-**Data flow**: Consumes `props` → returns true for `ComposerEmpty`, true for `ComposerHasDraft` only when no task is running, and false for all transient instructional modes.
+**Data flow**: It receives `FooterProps`. It returns true for an empty composer, and true for a draft only when no task is running. It returns false for active instructional modes such as history search, quit reminder, shortcut overlay, and Esc hint.
 
-**Call relations**: Used by `passive_footer_status_line` and `uses_passive_footer_status_layout`.
+**Call relations**: `passive_footer_status_line` and `uses_passive_footer_status_layout` call this as their basic permission check.
 
 *Call graph*: called by 2 (passive_footer_status_line, uses_passive_footer_status_layout).
 
@@ -1984,11 +1998,11 @@ fn shows_passive_footer_line(props: &FooterProps) -> bool
 fn uses_passive_footer_status_layout(props: &FooterProps) -> bool
 ```
 
-**Purpose**: Determines whether callers should use the dedicated passive status-line layout path.
+**Purpose**: Says whether the special status-line layout should be used. That layout is only needed when the configurable status line is enabled and passive context is allowed.
 
-**Data flow**: Consumes `props` → returns `props.status_line_enabled && shows_passive_footer_line(props)`.
+**Data flow**: It receives `FooterProps`. It checks the status-line feature flag and calls `shows_passive_footer_line`. It returns true only when both conditions are true.
 
-**Call relations**: Used by higher-level footer rendering to decide whether to reserve/truncate a passive status line separately from the normal summary footer flow.
+**Call relations**: The bottom-pane renderer calls this before choosing the layout path that reserves room for a left status line and right-side indicators.
 
 *Call graph*: calls 1 internal fn (shows_passive_footer_line); called by 1 (render_with_mask_and_textarea_right_reserve).
 
@@ -2004,11 +2018,11 @@ fn footer_line_width(
     show_queue_hint: bool
 ```
 
-**Purpose**: Measures the width of the last line produced by the canonical footer formatter.
+**Purpose**: Measures the width of the footer line that would be produced from the current properties. This lets layout code check fit before drawing.
 
-**Data flow**: Consumes `props`, optional collaboration mode indicator, and hint flags → calls `footer_from_props_lines`, takes the last line if any, and returns its width as `u16`, defaulting to 0.
+**Data flow**: It receives footer properties, optional mode information, and hint flags. It builds the footer lines with `footer_from_props_lines`, looks at the last line, measures its width, and returns that width. If there is no line, it returns zero.
 
-**Call relations**: Used by higher-level rendering to decide whether left and right footer content can coexist.
+**Call relations**: The bottom-pane renderer calls this when deciding whether the left footer content can share a row with right-side context.
 
 *Call graph*: calls 1 internal fn (footer_from_props_lines); called by 1 (render_with_mask_and_textarea_right_reserve).
 
@@ -2019,11 +2033,11 @@ fn footer_line_width(
 fn footer_hint_items_width(items: &[(String, String)]) -> u16
 ```
 
-**Purpose**: Measures the width of a footer hint-items row.
+**Purpose**: Measures how wide a compact footer hint-items row will be. This supports layout decisions before the row is rendered.
 
-**Data flow**: Consumes `items` → returns 0 when empty, otherwise builds the line with `footer_hint_items_line(items)` and returns its width as `u16`.
+**Data flow**: It receives a list of key/label pairs. If the list is empty, it returns zero. Otherwise, it formats the row with `footer_hint_items_line`, measures it, and returns the width.
 
-**Call relations**: Used by higher-level layout code before rendering footer hint items.
+**Call relations**: The bottom-pane renderer calls this alongside `render_footer_hint_items`, and both use the same line-building helper so measuring matches drawing.
 
 *Call graph*: calls 1 internal fn (footer_hint_items_line); called by 1 (render_with_mask_and_textarea_right_reserve).
 
@@ -2034,11 +2048,11 @@ fn footer_hint_items_width(items: &[(String, String)]) -> u16
 fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static>
 ```
 
-**Purpose**: Formats a sequence of `(key, label)` pairs into a single footer hint line with bold keys and spacing between items.
+**Purpose**: Formats compact key-and-label footer items into one styled line. Keys are bold so they stand out from their descriptions.
 
-**Data flow**: Consumes `items` → allocates a spans vector sized for the expected pattern, then for each item pushes a leading space, bold key, plain label, and triple-space separator except after the last item → returns `Line::from(spans)`.
+**Data flow**: It receives key/label pairs. For each pair, it adds spacing, a bold key, and the label text, with wider spacing between items. It returns the completed line.
 
-**Call relations**: Used by both `footer_hint_items_width` and `render_footer_hint_items`.
+**Call relations**: `footer_hint_items_width` uses this for measuring, and `render_footer_hint_items` uses it for drawing. That shared path prevents layout and rendering from disagreeing.
 
 *Call graph*: called by 2 (footer_hint_items_width, render_footer_hint_items); 3 external calls (from, with_capacity, format!).
 
@@ -2049,11 +2063,11 @@ fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static>
 fn quit_shortcut_reminder_line(key: KeyBinding) -> Line<'static>
 ```
 
-**Purpose**: Builds the dimmed `key again to quit` reminder line.
+**Purpose**: Creates the temporary “press this key again to quit” message. This helps prevent accidental exits.
 
-**Data flow**: Consumes `key: KeyBinding` → creates `Line::from(vec![key.into(), " again to quit".into()]).dim()`.
+**Data flow**: It receives the quit key binding. It builds a dim footer line containing the key followed by “again to quit.” The line is returned for rendering.
 
-**Call relations**: Used by `footer_from_props_lines` for `FooterMode::QuitShortcutReminder`.
+**Call relations**: `footer_from_props_lines` uses this when the footer mode is `QuitShortcutReminder`.
 
 *Call graph*: 2 external calls (from, vec!).
 
@@ -2064,11 +2078,11 @@ fn quit_shortcut_reminder_line(key: KeyBinding) -> Line<'static>
 fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static>
 ```
 
-**Purpose**: Builds the Esc hint line, with different wording depending on whether the first Esc has already primed backtracking.
+**Purpose**: Creates the temporary Escape-key hint for editing the previous message. It supports both the first prompt and the “press again” version.
 
-**Data flow**: Consumes `esc_backtrack_hint` → creates a plain Esc key binding and returns either `Esc again to edit previous message` or `Esc Esc to edit previous message`, dimmed.
+**Data flow**: It receives whether the Escape backtrack hint is already primed. It builds a dim line using the Escape key. If primed, it says to press Esc again; otherwise, it shows the two-Escape sequence. The line is returned.
 
-**Call relations**: Used by `footer_from_props_lines` for `FooterMode::EscHint`.
+**Call relations**: `footer_from_props_lines` uses this when the footer mode is `EscHint`.
 
 *Call graph*: calls 1 internal fn (plain); 2 external calls (from, vec!).
 
@@ -2079,11 +2093,11 @@ fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static>
 fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Builds the multi-line shortcut overlay shown after pressing the shortcuts toggle key.
+**Purpose**: Builds the multi-line shortcut help overlay shown after the user asks for help. It lists available keys and adapts some labels to the current environment.
 
-**Data flow**: Consumes `ShortcutsState` → initializes one `Line` slot per shortcut category, iterates the static `SHORTCUTS` descriptors, asks each for an optional overlay entry, stores each returned line in the slot matching its `ShortcutId`, orders the populated lines into a fixed sequence, optionally appends the change-mode line, always appends the transcript line, passes the list to `build_columns`, then adds a blank line and a final `/keymap` customization hint → returns `Vec<Line<'static>>`.
+**Data flow**: It receives a `ShortcutsState` containing platform, task, collaboration-mode, and key-binding details. It walks through the shortcut descriptors, asks each for its display entry, places entries in a fixed order, lays them out in columns, and adds a note about customizing shortcuts with `/keymap`. It returns all overlay lines.
 
-**Call relations**: Called by `footer_from_props_lines` when `FooterMode::ShortcutOverlay` is active.
+**Call relations**: `footer_from_props_lines` calls this for `ShortcutOverlay` mode. It delegates the column layout to `build_columns` and each shortcut’s wording to `ShortcutDescriptor::overlay_entry`.
 
 *Call graph*: calls 1 internal fn (build_columns); called by 1 (footer_from_props_lines); 2 external calls (from, vec!).
 
@@ -2094,11 +2108,11 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>>
 fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Lays out shortcut overlay entries into two padded columns and dims the resulting lines.
+**Purpose**: Arranges shortcut help entries into two readable columns. This keeps the overlay compact while still easy to scan.
 
-**Data flow**: Consumes `entries: Vec<Line<'static>>` → returns empty when there are no entries; otherwise computes the number of rows needed for two columns, pads the entries vector with blank lines to a full rectangle, measures max width per column, adds per-column padding, then emits one combined line per row with inter-column spacing and dim styling.
+**Data flow**: It receives a list of lines. It pads the list so the columns are even, measures the widest entry in each column, then builds row lines with enough spaces between columns. It returns dimmed rows ready for the overlay.
 
-**Call relations**: Used only by `shortcut_overlay_lines` to format the overlay body.
+**Call relations**: `shortcut_overlay_lines` calls this after it has collected and ordered all shortcut entries.
 
 *Call graph*: called by 1 (shortcut_overlay_lines); 3 external calls (from, new, repeat_n).
 
@@ -2109,11 +2123,11 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>>
 fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static>
 ```
 
-**Purpose**: Formats the right-side context usage indicator from either remaining-percent or used-token information.
+**Purpose**: Formats the context-window usage shown in the footer. The context window is the amount of conversation the model can still consider.
 
-**Data flow**: Consumes `percent: Option<i64>` and `used_tokens: Option<i64>` → if percent is present, clamps it to `0..=100` and returns `"{percent}% context left"`; else if used tokens are present, formats them compactly with `format_tokens_compact` and returns `"{used_fmt} used"`; otherwise defaults to `"100% context left"`, always dimmed.
+**Data flow**: It receives either a percent remaining or a token count already used. If percent is present, it clamps it to 0–100 and returns “N% context left.” If token usage is present, it formats the number compactly and returns “N used.” If neither is present, it returns “100% context left.”
 
-**Call relations**: Used by higher-level footer rendering and many tests as the canonical right-side context line.
+**Call relations**: Rendering helpers and tests call this when they need a standard right-side context line. It uses `format_tokens_compact` for readable large token counts.
 
 *Call graph*: called by 6 (right_footer_line_with_context, footer_snapshots, footer_status_line_truncates_to_keep_mode_indicator, snapshot_footer_with_context, snapshot_footer_with_indicators, snapshot_footer_with_mode_indicator); 3 external calls (from, format_tokens_compact, vec!).
 
@@ -2124,11 +2138,11 @@ fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'
 fn matches(&self, state: ShortcutsState) -> bool
 ```
 
-**Purpose**: Checks whether a shortcut binding should be active under the current shortcut-overlay state.
+**Purpose**: Checks whether a shortcut binding should be shown for the current shortcut overlay state. It is a thin wrapper around the binding’s display condition.
 
-**Data flow**: Consumes `self` and `state: ShortcutsState` → delegates to `self.condition.matches(state)` and returns the boolean.
+**Data flow**: It receives the current shortcut state. It asks its `DisplayCondition` whether that state qualifies and returns the yes-or-no answer.
 
-**Call relations**: Used by `ShortcutDescriptor::binding_for` when selecting the appropriate binding variant.
+**Call relations**: `ShortcutDescriptor::binding_for` uses this while scanning possible bindings for one shortcut.
 
 *Call graph*: calls 1 internal fn (matches).
 
@@ -2139,11 +2153,11 @@ fn matches(&self, state: ShortcutsState) -> bool
 fn matches(self, state: ShortcutsState) -> bool
 ```
 
-**Purpose**: Evaluates a display condition against the current shortcut-overlay state.
+**Purpose**: Evaluates a rule for when a shortcut should appear. Examples include always showing it, showing it only under WSL, or showing it only when collaboration modes are enabled.
 
-**Data flow**: Consumes `self` and `state` → returns true or false based on the condition variant and the corresponding state flags (`use_shift_enter_hint`, `is_wsl`, `collaboration_modes_enabled`).
+**Data flow**: It receives a display condition and the current shortcut state. It checks the relevant flag in the state, or returns true for `Always`. The result says whether the shortcut binding is currently valid.
 
-**Call relations**: Called through `ShortcutBinding::matches` during shortcut binding selection.
+**Call relations**: `ShortcutBinding::matches` calls this, and shortcut descriptors depend on it to choose platform- and mode-specific keys.
 
 *Call graph*: called by 1 (matches).
 
@@ -2154,11 +2168,11 @@ fn matches(self, state: ShortcutsState) -> bool
 fn binding_for(&self, state: ShortcutsState) -> Option<&'static ShortcutBinding>
 ```
 
-**Purpose**: Finds the first binding variant for a shortcut descriptor whose display condition matches the current state.
+**Purpose**: Chooses the first key binding for a shortcut that applies in the current state. Some shortcuts have different keys depending on platform or settings.
 
-**Data flow**: Consumes `self` and `state` → iterates `self.bindings`, returns the first `ShortcutBinding` whose `matches(state)` is true, or `None` if none apply.
+**Data flow**: It receives a shortcut descriptor and the current shortcut state. It scans the descriptor’s list of bindings and returns the first one whose condition matches. If none match, it returns nothing.
 
-**Call relations**: Used by `overlay_entry` for descriptors whose key comes from the static binding table rather than `FooterKeyHints`.
+**Call relations**: `ShortcutDescriptor::overlay_entry` calls this for shortcuts whose key is defined directly by the descriptor rather than supplied through customizable key hints.
 
 *Call graph*: called by 1 (overlay_entry); 1 external calls (iter).
 
@@ -2169,11 +2183,11 @@ fn binding_for(&self, state: ShortcutsState) -> Option<&'static ShortcutBinding>
 fn overlay_entry(&self, state: ShortcutsState) -> Option<Line<'static>>
 ```
 
-**Purpose**: Builds one shortcut-overlay line for this descriptor if an applicable key binding exists in the current state.
+**Purpose**: Builds one visible row for the shortcut overlay. It combines the right key with the right explanatory text for the current state.
 
-**Data flow**: Consumes `self` and `state` → resolves the key either from `state.key_hints` or `binding_for(state)`, returns `None` if unavailable, otherwise builds a `Line` from `self.prefix` and the key, then appends descriptor-specific wording: queue text depends on running/queue state, edit-previous wording depends on `esc_backtrack_hint`, quit wording depends on `is_task_running`, and all other descriptors use `self.label` → returns `Some(Line)`.
+**Data flow**: It receives a shortcut descriptor and shortcut state. It chooses the key either from customizable key hints or from `binding_for`. It then builds a line with special wording for queueing/submitting, editing previous messages, and quitting/interruption. If no key applies, it returns nothing.
 
-**Call relations**: Called by `shortcut_overlay_lines` while populating the overlay entries.
+**Call relations**: `shortcut_overlay_lines` calls this for every descriptor in the shortcut list. This function is where each shortcut becomes user-facing help text.
 
 *Call graph*: calls 1 internal fn (binding_for); 2 external calls (from, vec!).
 
@@ -2184,11 +2198,11 @@ fn overlay_entry(&self, state: ShortcutsState) -> Option<Line<'static>>
 fn snapshot_footer(name: &str, props: FooterProps)
 ```
 
-**Purpose**: Test helper that snapshots a footer at width 80 with no collaboration mode indicator.
+**Purpose**: Small test helper that snapshots a normal footer at the standard width. It reduces repeated setup in the footer snapshot tests.
 
-**Data flow**: Consumes `name` and `props` → forwards to `snapshot_footer_with_mode_indicator` with width 80 and `None` indicator.
+**Data flow**: It receives a snapshot name and footer properties. It forwards them to the more general mode-indicator snapshot helper with width 80 and no collaboration mode indicator. The result is a stored snapshot assertion.
 
-**Call relations**: Used by the large footer snapshot test to reduce repetition.
+**Call relations**: `tests::footer_snapshots` calls this for many common footer states. It delegates actual drawing and assertion to `snapshot_footer_with_mode_indicator`.
 
 *Call graph*: 1 external calls (snapshot_footer_with_mode_indicator).
 
@@ -2204,11 +2218,11 @@ fn snapshot_footer_with_context(
     )
 ```
 
-**Purpose**: Test helper that snapshots a footer with a computed context-window line.
+**Purpose**: Test helper that snapshots a footer with a specific context-usage line on the right. This makes it easy to test percent and token display.
 
-**Data flow**: Consumes `name`, `props`, `percent`, and `used_tokens` → builds the context line with `context_window_line` and forwards to `snapshot_footer_with_mode_indicator_and_context`.
+**Data flow**: It receives a snapshot name, footer properties, an optional percent, and optional token usage. It creates the context line with `context_window_line` and forwards everything to the full snapshot helper. The snapshot assertion happens there.
 
-**Call relations**: Used by tests that verify right-side context rendering.
+**Call relations**: `tests::footer_snapshots` calls this for cases where the right-side context text matters.
 
 *Call graph*: calls 1 internal fn (context_window_line); 1 external calls (snapshot_footer_with_mode_indicator_and_context).
 
@@ -2224,11 +2238,11 @@ fn draw_footer_frame(
         ide_contex
 ```
 
-**Purpose**: Central test renderer that reproduces the production footer layout decisions inside a terminal frame.
+**Purpose**: Draws one complete footer frame inside tests. It mirrors the real rendering decisions closely enough to snapshot the final terminal output.
 
-**Data flow**: Consumes a terminal, height, footer props, optional collaboration mode indicator, IDE-context flag, and context line → inside `terminal.draw`, computes hint flags, passive status-line state, left/right widths, truncates passive status lines when needed, chooses between passive-status and summary-footer rendering paths, invokes `single_line_footer_layout`, `render_footer_line`, `render_footer_from_props`, and `render_context_right` as appropriate → writes the footer into the terminal buffer.
+**Data flow**: It receives a test terminal, desired height, footer properties, optional collaboration mode, IDE-context flag, and right context line. Inside a draw call, it computes hint flags, decides whether passive status layout is active, measures left and right content, truncates status text if needed, chooses collapsed single-line layouts when appropriate, and renders left and right footer pieces into the test buffer.
 
-**Call relations**: Shared by all footer snapshot and rendering tests; it exercises the same helper functions that production code uses.
+**Call relations**: All footer snapshot helpers call this before comparing output. It exercises many production helpers together, including height calculation, passive status logic, width checks, collapse layout, and right-side rendering.
 
 *Call graph*: calls 1 internal fn (draw).
 
@@ -2244,11 +2258,11 @@ fn snapshot_footer_with_mode_indicator(
     )
 ```
 
-**Purpose**: Test helper that snapshots a footer with an optional collaboration mode indicator and default context line.
+**Purpose**: Test helper that snapshots a footer with an optional collaboration mode indicator. It uses the default context-window line.
 
-**Data flow**: Consumes `name`, `width`, `props`, and `collaboration_mode_indicator` → builds the default context line with `context_window_line(None, None)` and forwards to `snapshot_footer_with_mode_indicator_and_context`.
+**Data flow**: It receives a snapshot name, width, footer properties, and optional mode indicator. It creates the default context line and forwards the full setup to `snapshot_footer_with_mode_indicator_and_context`. The final snapshot is handled there.
 
-**Call relations**: Used by tests focused on mode-indicator width behavior.
+**Call relations**: `tests::snapshot_footer` and `tests::footer_snapshots` use this for mode-label layout cases.
 
 *Call graph*: calls 1 internal fn (context_window_line); 1 external calls (snapshot_footer_with_mode_indicator_and_context).
 
@@ -2263,11 +2277,11 @@ fn snapshot_footer_with_mode_indicator_and_context(
         collaboration_mode_indicator: Option<CollaborationModeIndicator>,
 ```
 
-**Purpose**: Renders a footer into a `TestBackend` terminal and snapshots the result.
+**Purpose**: Full snapshot helper for footer rendering with custom width, optional mode indicator, and custom right-side context. It is the main snapshot assertion path.
 
-**Data flow**: Consumes `name`, `width`, `props`, optional mode indicator, and `context_line` → computes height from `footer_height`, creates a `Terminal<TestBackend>`, calls `draw_footer_frame`, and snapshot-asserts the backend contents.
+**Data flow**: It receives the snapshot name, terminal width, footer properties, optional mode indicator, and context line. It computes footer height, creates a test terminal, draws the footer frame, and records/asserts the snapshot.
 
-**Call relations**: Core snapshot helper for most footer rendering tests.
+**Call relations**: Other snapshot helpers funnel into this when they need to test exact footer output. It calls `footer_height` and `draw_footer_frame` before the snapshot assertion.
 
 *Call graph*: calls 1 internal fn (footer_height); 4 external calls (new, assert_snapshot!, draw_footer_frame, new).
 
@@ -2282,11 +2296,11 @@ fn render_footer_with_mode_indicator_and_context(
         context_line: Line<
 ```
 
-**Purpose**: Renders a footer into a VT100-backed terminal and returns the screen contents as a string.
+**Purpose**: Renders a footer test frame and returns the terminal contents as a string. Unlike snapshot helpers, this supports direct text assertions.
 
-**Data flow**: Consumes `width`, `props`, optional mode indicator, and `context_line` → computes height, creates a `Terminal<VT100Backend>`, calls `draw_footer_frame`, and returns the terminal screen contents.
+**Data flow**: It receives width, footer properties, optional mode indicator, and context line. It computes height, creates a VT100-style test backend, draws the frame, and returns the screen contents. No snapshot is recorded.
 
-**Call relations**: Used by tests that need string inspection rather than snapshots.
+**Call relations**: `tests::footer_status_line_truncates_to_keep_mode_indicator` calls this so it can check for specific text and ellipsis characters.
 
 *Call graph*: calls 2 internal fn (footer_height, new); 2 external calls (draw_footer_frame, new).
 
@@ -2302,11 +2316,11 @@ fn snapshot_footer_with_indicators(
         ide_context_a
 ```
 
-**Purpose**: Snapshots a footer with collaboration-mode and IDE-context indicators enabled as requested.
+**Purpose**: Test helper for snapshotting the footer with collaboration and IDE-context indicators. It focuses on the right-side indicator row.
 
-**Data flow**: Consumes `name`, `width`, `props`, optional mode indicator, and `ide_context_active` → computes height, renders via `draw_footer_frame`, and snapshot-asserts the backend.
+**Data flow**: It receives a snapshot name, width, footer properties, optional collaboration mode, and whether IDE context is active. It computes height, creates a test terminal, draws the frame with the default context-window line, and asserts the snapshot.
 
-**Call relations**: Used by tests covering right-side indicator combinations.
+**Call relations**: `tests::footer_snapshots` uses this for cases where the footer should show both mode and IDE context indicators.
 
 *Call graph*: calls 2 internal fn (context_window_line, footer_height); 4 external calls (new, assert_snapshot!, draw_footer_frame, new).
 
@@ -2317,11 +2331,11 @@ fn snapshot_footer_with_indicators(
 fn footer_snapshots()
 ```
 
-**Purpose**: Comprehensive snapshot suite covering the major footer modes, width behaviors, status-line interactions, and contextual combinations.
+**Purpose**: Runs a broad set of snapshot tests for the footer’s visual output. These tests protect against accidental changes in wording, spacing, colors, and width behavior.
 
-**Data flow**: Constructs many `FooterProps` variants using `FooterKeyHints::default_bindings`, helper context lines, and optional mode indicators, then snapshots each rendered footer state.
+**Data flow**: It creates many different `FooterProps` combinations: empty composer, shortcut overlay, running task, quit reminder, Esc hint, queue hint, mode indicator, status line, truncation, and active agent label. Each case is passed to one of the snapshot helpers. The output is compared with stored snapshots.
 
-**Call relations**: Acts as the broad regression suite for this module’s rendering policy.
+**Call relations**: This test calls the default key bindings, context formatting, key-building helpers, and the snapshot helper family. It exercises the file’s main rendering paths together.
 
 *Call graph*: calls 4 internal fn (default_bindings, context_window_line, ctrl, shift); 7 external calls (Char, from, snapshot_footer, snapshot_footer_with_context, snapshot_footer_with_indicators, snapshot_footer_with_mode_indicator, snapshot_footer_with_mode_indicator_and_context).
 
@@ -2332,11 +2346,11 @@ fn footer_snapshots()
 fn footer_status_line_truncates_to_keep_mode_indicator()
 ```
 
-**Purpose**: Verifies that a long passive status line is truncated with an ellipsis so the collaboration mode indicator remains visible.
+**Purpose**: Tests that a long status line is shortened so the mode indicator remains visible. This guards an important narrow-width layout promise.
 
-**Data flow**: Builds props with a long status line and a mode indicator, renders the footer to a string, normalizes whitespace, and asserts that `Plan mode` remains visible, the cycle hint is dropped, and an ellipsis appears.
+**Data flow**: It builds footer properties with a long status line and collaboration mode enabled. It renders the footer to a string, collapses whitespace for one check, and asserts that “Plan mode” remains, the longer cycle hint is omitted, and an ellipsis appears. The test passes only if truncation preserves the important indicator.
 
-**Call relations**: Regression-tests the interaction between passive status-line truncation and right-side indicator preservation.
+**Call relations**: It uses `render_footer_with_mode_indicator_and_context` instead of a snapshot so it can make targeted assertions about the rendered text.
 
 *Call graph*: calls 3 internal fn (default_bindings, context_window_line, ctrl); 4 external calls (Char, from, assert!, render_footer_with_mode_indicator_and_context).
 
@@ -2347,11 +2361,11 @@ fn footer_status_line_truncates_to_keep_mode_indicator()
 fn paste_image_shortcut_prefers_ctrl_alt_v_under_wsl()
 ```
 
-**Purpose**: Verifies that the paste-image shortcut chooses Ctrl+Alt+V under WSL and Ctrl+V otherwise.
+**Purpose**: Tests the platform-specific paste-image shortcut choice. Under WSL, plain Ctrl+V is often intercepted by terminals, so the UI should prefer Ctrl+Alt+V.
 
-**Data flow**: Finds the `PasteImage` descriptor in `SHORTCUTS`, determines whether the current platform is probably WSL, computes the expected key, resolves the actual binding via `binding_for`, and asserts equality.
+**Data flow**: It finds the paste-image shortcut descriptor, detects whether the test is running under WSL, builds the expected key for that environment, asks the descriptor for its active binding, and compares the actual key with the expected one.
 
-**Call relations**: Tests the `DisplayCondition::WhenUnderWSL` branch and binding selection logic.
+**Call relations**: This test calls `FooterKeyHints::default_bindings` for a realistic shortcut state and uses `ShortcutDescriptor::binding_for` through the descriptor to verify the condition logic.
 
 *Call graph*: calls 4 internal fn (default_bindings, is_probably_wsl, ctrl, ctrl_alt); 2 external calls (Char, assert_eq!).
 
@@ -2361,11 +2375,13 @@ These files provide the reusable state, constants, row models, tabs, and numbere
 
 ### `tui/src/bottom_pane/popup_consts.rs`
 
-`util` · `rendering`
+`util` · `during popup rendering in the terminal UI`
 
-This small utility module defines one shared constant and three helper functions used across popup-style bottom-pane views. `MAX_POPUP_ROWS` is the global cap on how many rows a popup should try to display, giving different popups a uniform visual footprint. The remaining functions all build `ratatui::text::Line<'static>` values for footer hints.
+Popups in the bottom pane often need the same basic rules: they should not grow too tall, and they should tell the user how to accept or back out. This file is the shared toolbox for that. The constant MAX_POPUP_ROWS sets a common height limit so different popups do not feel randomly sized.
 
-`standard_popup_hint_line` hardcodes the default Enter/Esc wording by composing spans from `key_hint::plain(KeyCode::Enter)` and `key_hint::plain(KeyCode::Esc)`. `standard_popup_hint_line_for_keymap` adapts that same idea to a caller-provided `ListKeymap`: it extracts the primary accept and cancel bindings with `primary_binding` and forwards them to the generic formatter. `accept_cancel_hint_line` is the underlying formatter; it accepts optional `KeyBinding` values and caller-supplied labels for the accept and cancel actions, then chooses among four output shapes: both bindings present, only accept present, only cancel present, or neither present (empty line). The design keeps popup widgets from duplicating string assembly logic and ensures remapped keybindings appear consistently in footer text.
+The rest of the file builds short footer lines for the terminal UI. These lines are made from normal text plus styled key hints, such as Enter or Esc. Think of it like a standard sign at the bottom of every dialog box: “Press Enter to confirm or Esc to go back.” Keeping that sign here avoids each popup inventing its own wording or key display.
+
+The file also supports custom keymaps. A keymap is the user interface’s table of which keys mean which action. If a list-style popup has different accept or cancel keys, this file can build the same kind of footer using those bindings instead of hard-coded Enter and Esc. If one of the keys is missing, the helper gracefully shows only the available instruction. If both are missing, it returns an empty line rather than showing misleading help.
 
 #### Function details
 
@@ -2375,11 +2391,11 @@ This small utility module defines one shared constant and three helper functions
 fn standard_popup_hint_line() -> Line<'static>
 ```
 
-**Purpose**: Builds the default popup footer hint using Enter to confirm and Esc to go back. It is the fixed-key convenience helper for popups that do not need runtime keymap awareness.
+**Purpose**: Builds the default popup footer that tells the user to press Enter to confirm or Esc to go back. It is used when a popup follows the normal key behavior and does not need a custom keymap.
 
-**Data flow**: Creates a `Line<'static>` from a vector of spans containing literal text plus `key_hint::plain(KeyCode::Enter)` and `key_hint::plain(KeyCode::Esc)` converted into spans, then returns that line.
+**Data flow**: It takes no input. It creates a terminal text line made of plain words plus formatted key labels for Enter and Esc, then returns that line for a popup to draw at the bottom.
 
-**Call relations**: Used directly by many popup renderers and setup helpers that want the standard fixed Enter/Esc wording.
+**Call relations**: Popup rendering code calls this when it needs the standard instruction line, such as confirmation popups, feedback prompts, selection views, and search-related UI. It relies on the shared key-hint formatting code so the key names look the same as they do elsewhere in the interface.
 
 *Call graph*: called by 18 (show_replace_thread_goal_confirmation, apply_standard_popup_hint, render, render, feedback_disabled_params, feedback_upload_consent_params, make_selection_view, renders_search_query_line_when_enabled, snapshot_footer_note_wraps, footer_hint (+8 more)); 2 external calls (from, vec!).
 
@@ -2390,11 +2406,11 @@ fn standard_popup_hint_line() -> Line<'static>
 fn standard_popup_hint_line_for_keymap(list_keymap: &ListKeymap) -> Line<'static>
 ```
 
-**Purpose**: Builds the standard confirm/cancel footer hint using the primary bindings from a supplied `ListKeymap`. It adapts popup hints to remapped runtime controls.
+**Purpose**: Builds the usual confirm-and-cancel footer, but using the keys defined by a supplied list keymap instead of assuming Enter and Esc. This matters for configurable controls or screens whose list navigation uses different bindings.
 
-**Data flow**: Takes `list_keymap`, extracts `primary_binding(&list_keymap.accept)` and `primary_binding(&list_keymap.cancel)`, passes those options plus labels `to confirm` and `to go back` into `accept_cancel_hint_line`, and returns the resulting line.
+**Data flow**: It receives a ListKeymap, reads its accept and cancel actions, asks for the primary key binding for each action, and passes those bindings along with the standard labels “to confirm” and “to go back.” It returns the finished terminal text line.
 
-**Call relations**: Used by popup code that wants the standard wording but with keymap-derived bindings instead of hardcoded Enter/Esc.
+**Call relations**: Selection-view setup and the standard hint-building path use this when the popup should reflect the active keymap. It hands the actual sentence construction to accept_cancel_hint_line, keeping this function focused on translating a keymap into the two keys a footer needs.
 
 *Call graph*: calls 2 internal fn (accept_cancel_hint_line, primary_binding); called by 2 (standard_popup_hint_line, selection_view_params).
 
@@ -2410,24 +2426,20 @@ fn accept_cancel_hint_line(
 ) -> Line<'static>
 ```
 
-**Purpose**: Formats a footer hint line for arbitrary optional accept and cancel bindings and labels. It is the generic helper underlying the standard popup hint variants.
+**Purpose**: Creates a popup footer from optional accept and cancel key bindings plus the words that describe what those keys do. It is the flexible helper behind both standard and custom popup instructions.
 
-**Data flow**: Takes optional `accept` and `cancel` bindings plus their labels. It pattern-matches on the `(accept, cancel)` pair and returns a `Line<'static>` containing either both bindings with `Press ... or ...`, only the accept clause, only the cancel clause, or an empty line when neither binding is available.
+**Data flow**: It receives an optional accept key, an accept label, an optional cancel key, and a cancel label. If both keys exist, it returns a line like “Press [accept] ... or [cancel] ...”; if only one exists, it returns a line for just that key; if neither exists, it returns an empty line. It does not change any outside state.
 
-**Call relations**: Called by `standard_popup_hint_line_for_keymap` and other popup-specific footer builders that need custom labels.
+**Call relations**: Higher-level popup code calls this when it already knows which keys should be shown, including approval footers and keymap-based popup hints. This function does the final assembly of the user-facing sentence so callers do not each need to duplicate the same branching logic.
 
 *Call graph*: called by 2 (approval_footer_hint, standard_popup_hint_line_for_keymap); 2 external calls (from, vec!).
 
 
 ### `tui/src/bottom_pane/scroll_state.rs`
 
-`util` · `cross-cutting`
+`domain_logic` · `user input handling and list rendering`
 
-This file provides the `ScrollState` data structure used across many bottom-pane list and popup views. The struct is intentionally minimal—just `selected_idx: Option<usize>` and `scroll_top: usize`—and all mutation methods take the current list length and visible row count as arguments instead of caching them. That design keeps the state reusable across filtered and dynamically sized lists, but it also means callers must immediately re-clamp after changing the visible row set.
-
-The movement API covers single-step wraparound navigation (`move_up_wrap`, `move_down_wrap`), non-wrapping page movement (`page_up_clamped`, `page_down_clamped`), and direct jumps to top or bottom. `clamp_selection` repairs stale selections after filtering, while `ensure_visible` adjusts `scroll_top` so the selected row remains inside the viewport. The private `clear_if_empty` helper is the common guard that resets both selection and scroll when the list becomes empty.
-
-The implementation is careful about edge cases: empty lists clear state instead of leaving invalid indices behind; page size is clamped to at least one row; `ensure_visible` resets scroll when there is no selection or no visible rows; and all index math uses saturating operations or explicit bounds checks. The included tests verify wraparound behavior, page movement, and scroll-window updates.
+Many screens in a terminal interface show a list that is taller than the space available. This file solves the everyday problem of keeping the highlighted row and the scroll position in sync, like moving a bookmark through a long menu while a small window shows only part of the page. The central type, `ScrollState`, stores two pieces of information: the selected row, if there is one, and the first visible row at the top of the scroll window. It does not store the list itself. Instead, callers pass in the current list length and the number of visible rows each time they move around. That matters because lists can change after filtering, searching, or resizing. The helper can then clamp the selection so it never points past the end, clear it when the list is empty, move up or down with wrap-around, page up or down without wrapping, and jump to the top or bottom. The important safety behavior is that empty lists always reset to no selection and scroll position zero. Another key behavior is `ensure_visible`, which nudges the scroll window just enough so the selected row is not hidden above or below the visible area.
 
 #### Function details
 
@@ -2437,11 +2449,11 @@ The implementation is careful about edge cases: empty lists clear state instead 
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a fresh scroll state with no selection and the viewport positioned at the top.
+**Purpose**: Creates a fresh scroll state with no selected row and the view positioned at the top. UI panes use this when they first create a list-like menu.
 
-**Data flow**: Takes no arguments and returns `ScrollState { selected_idx: None, scroll_top: 0 }`.
+**Data flow**: No outside data goes in. It builds a `ScrollState` where `selected_idx` is `None` and `scroll_top` is `0`, then returns that new value.
 
-**Call relations**: This constructor is used broadly by popup and list views when they initialize their local navigation state before any rows are available or selected.
+**Call relations**: Many constructors and setup paths call this when a pane, event view, prompt, or action state needs its own list navigation memory. After creation, other movement and visibility functions update the state as the user navigates.
 
 *Call graph*: called by 17 (action_state, new, new, new, from_entry, open_selected_event, return_to_events, new, new, open_reset_confirmation (+7 more)).
 
@@ -2452,11 +2464,11 @@ fn new() -> Self
 fn reset(&mut self)
 ```
 
-**Purpose**: Clears both selection and scroll position back to the initial state.
+**Purpose**: Clears the current selection and moves the scroll window back to the top. This is useful when the list content changes enough that the old position should no longer be trusted.
 
-**Data flow**: Mutates `self` in place, setting `selected_idx` to `None` and `scroll_top` to `0`; it returns no value.
+**Data flow**: It takes an existing mutable scroll state. It sets the selected row to `None` and sets the top visible row to `0`; it does not return a separate value.
 
-**Call relations**: Callers use this when a view’s contents or mode changes enough that preserving selection would be misleading, such as after prompt or tab changes.
+**Call relations**: Composer text changes, empty prompt setup, and tab switches call this when the old list position should be discarded. Afterward, callers can choose a new valid selection with functions such as `clamp_selection`.
 
 *Call graph*: called by 3 (on_composer_text_change, set_empty_prompt, switch_tab).
 
@@ -2467,11 +2479,11 @@ fn reset(&mut self)
 fn clamp_selection(&mut self, len: usize)
 ```
 
-**Purpose**: Repairs the current selection so it points at a valid row index for the current list length, defaulting to the first row when needed.
+**Purpose**: Makes sure the selected row is valid for the current list length. If there is no selection yet, it selects the first row; if the list is empty, it clears everything.
 
-**Data flow**: Reads `len` and current `selected_idx`. If `clear_if_empty(len)` resets the state, it returns immediately; otherwise it writes `selected_idx = Some(min(current_or_0, len - 1))` and leaves `scroll_top` unchanged.
+**Data flow**: The caller provides the current number of rows. The function first asks `clear_if_empty` whether the list has no rows. If rows exist, it takes the current selected index, defaults it to `0` if missing, and lowers it if needed so it is not beyond the last row.
 
-**Call relations**: This is typically called right after filtering or replacing a row set. It depends on `clear_if_empty` for the empty-list case, and callers often follow it with `ensure_visible` to synchronize scrolling.
+**Call relations**: Filtering and match-updating code calls this after a visible row set changes. It relies on `clear_if_empty` for the empty-list case, then leaves the state ready for later movement or visibility adjustment.
 
 *Call graph*: calls 1 internal fn (clear_if_empty); called by 7 (on_composer_text_change, set_matches, apply_filter, clamp_selection, apply_filter, clamp_selection, apply_filter).
 
@@ -2482,11 +2494,11 @@ fn clamp_selection(&mut self, len: usize)
 fn move_up_wrap(&mut self, len: usize)
 ```
 
-**Purpose**: Moves selection one row upward, wrapping from the first row to the last row.
+**Purpose**: Moves the selection one row upward, wrapping from the first row to the last row. This gives arrow-key navigation the familiar circular menu behavior.
 
-**Data flow**: Reads `len` and current `selected_idx`. If the list is empty, `clear_if_empty` resets state and the function returns. Otherwise it writes a new `selected_idx`: decrement when above zero, wrap to `len - 1` from zero, or choose `0` when there was no prior selection.
+**Data flow**: The caller provides the current row count. If the count is zero, `clear_if_empty` resets the state. Otherwise, the selected row moves from `n` to `n - 1`, from the first row to the last row, or from no selection to the first row.
 
-**Call relations**: List-style views call this for Up-key navigation. It only changes selection; callers usually invoke `ensure_visible` afterward so the scroll window follows the new selection.
+**Call relations**: Higher-level `move_up` operations in several panes call this when the user presses the up key. Those callers commonly follow it with visibility work so the newly selected row can be shown on screen.
 
 *Call graph*: calls 1 internal fn (clear_if_empty); called by 10 (move_up, move_up, move_up, move_up, move_up, skip_disabled_up, move_up, move_up, move_up, move_up).
 
@@ -2497,11 +2509,11 @@ fn move_up_wrap(&mut self, len: usize)
 fn move_down_wrap(&mut self, len: usize)
 ```
 
-**Purpose**: Moves selection one row downward, wrapping from the last row back to the first row.
+**Purpose**: Moves the selection one row downward, wrapping from the last row back to the first row. This supports repeated down-arrow navigation through a menu.
 
-**Data flow**: Reads `len` and current `selected_idx`. If empty, `clear_if_empty` resets state. Otherwise it writes `selected_idx` to the next index when possible, or `0` when at the end or when no selection existed.
+**Data flow**: The caller provides the current row count. If there are no rows, `clear_if_empty` resets the state. Otherwise, the selected row advances by one when possible, or becomes `0` when it was at the end or not yet set.
 
-**Call relations**: This is the Down-key counterpart to `move_up_wrap`. Like the upward version, it is usually paired by callers with `ensure_visible` to update `scroll_top`.
+**Call relations**: Higher-level `move_down` operations and disabled-item skipping code call this during user navigation. The selected index it produces is then used by callers to update what is highlighted and visible.
 
 *Call graph*: calls 1 internal fn (clear_if_empty); called by 10 (move_down, move_down, move_down, move_down, move_down, skip_disabled_down, move_down, move_down, move_down, move_down).
 
@@ -2512,11 +2524,11 @@ fn move_down_wrap(&mut self, len: usize)
 fn page_up_clamped(&mut self, len: usize, visible_rows: usize)
 ```
 
-**Purpose**: Moves selection upward by one viewport-sized page without wrapping past the top.
+**Purpose**: Moves the selection upward by one visible page, stopping at the first row instead of wrapping. This matches normal terminal list behavior for Page Up.
 
-**Data flow**: Reads `len`, `visible_rows`, and current selection. After `clear_if_empty`, it computes `step = max(visible_rows, 1)`, clamps the current selection into range, subtracts `step` with saturation, writes the new `selected_idx`, and then updates `scroll_top` via `ensure_visible(len, visible_rows)`.
+**Data flow**: The caller provides the row count and the number of rows that fit on screen. The function clears the state if the list is empty, chooses a page size of at least one row, moves the selected row upward by that amount without going below zero, then calls `ensure_visible` so the result is on screen.
 
-**Call relations**: Views call this for PageUp-style navigation. Unlike single-step movement, it internally invokes `ensure_visible` because page movement semantics are defined together with viewport adjustment.
+**Call relations**: Pane-level `page_up` actions call this when the user requests a larger upward jump. It uses `clear_if_empty` for safety and hands the final selected row to `ensure_visible` to adjust the scroll window.
 
 *Call graph*: calls 2 internal fn (clear_if_empty, ensure_visible); called by 5 (page_up, page_up, page_up, page_up, page_up).
 
@@ -2527,11 +2539,11 @@ fn page_up_clamped(&mut self, len: usize, visible_rows: usize)
 fn page_down_clamped(&mut self, len: usize, visible_rows: usize)
 ```
 
-**Purpose**: Moves selection downward by one viewport-sized page without wrapping past the bottom.
+**Purpose**: Moves the selection downward by one visible page, stopping at the last row instead of wrapping. This matches normal terminal list behavior for Page Down.
 
-**Data flow**: Reads `len`, `visible_rows`, and current selection. After the empty-list guard, it computes a page step of at least one row, adds it to the current selection, clamps at `len - 1`, writes `selected_idx`, and calls `ensure_visible` to move the scroll window if needed.
+**Data flow**: The caller provides the row count and visible window height. The function clears the state if needed, chooses a page size of at least one row, moves the selection down by that amount without passing the last row, then calls `ensure_visible` to keep the selection in view.
 
-**Call relations**: This is the PageDown counterpart to `page_up_clamped`, used by list views that support page navigation.
+**Call relations**: Pane-level `page_down` actions call this for larger downward jumps. It combines empty-list protection from `clear_if_empty` with final scroll adjustment from `ensure_visible`.
 
 *Call graph*: calls 2 internal fn (clear_if_empty, ensure_visible); called by 5 (page_down, page_down, page_down, page_down, page_down).
 
@@ -2542,11 +2554,11 @@ fn page_down_clamped(&mut self, len: usize, visible_rows: usize)
 fn jump_top(&mut self, len: usize, visible_rows: usize)
 ```
 
-**Purpose**: Selects the first row and scrolls so it is visible.
+**Purpose**: Selects the first row in the list and scrolls so that row can be seen. It is used for a Home-key style jump.
 
-**Data flow**: Reads `len` and `visible_rows`; if the list is empty it resets via `clear_if_empty`. Otherwise it writes `selected_idx = Some(0)` and then calls `ensure_visible(len, visible_rows)` to normalize `scroll_top`.
+**Data flow**: The caller provides the row count and visible window height. If the list is empty, the state is cleared. Otherwise, the selected row becomes `0`, and `ensure_visible` updates `scroll_top` if necessary.
 
-**Call relations**: Views use this for Home-like navigation or explicit jump-to-top commands.
+**Call relations**: Higher-level `jump_top` commands call this when the user wants to go straight to the beginning of a list. It delegates empty-list cleanup to `clear_if_empty` and screen-position cleanup to `ensure_visible`.
 
 *Call graph*: calls 2 internal fn (clear_if_empty, ensure_visible); called by 5 (jump_top, jump_top, jump_top, jump_top, jump_top).
 
@@ -2557,11 +2569,11 @@ fn jump_top(&mut self, len: usize, visible_rows: usize)
 fn jump_bottom(&mut self, len: usize, visible_rows: usize)
 ```
 
-**Purpose**: Selects the last row and scrolls so it is visible.
+**Purpose**: Selects the last row in the list and scrolls so that row can be seen. It is used for an End-key style jump.
 
-**Data flow**: Reads `len` and `visible_rows`; if empty it resets via `clear_if_empty`. Otherwise it writes `selected_idx = Some(len - 1)` and then calls `ensure_visible(len, visible_rows)`.
+**Data flow**: The caller provides the row count and visible window height. If there are no rows, the state is cleared. Otherwise, the selected row becomes `len - 1`, and `ensure_visible` moves the scroll window down if the last row is outside it.
 
-**Call relations**: Views use this for End-like navigation or explicit jump-to-bottom commands.
+**Call relations**: Higher-level `jump_bottom` commands call this when the user wants to go straight to the end of a list. It uses `clear_if_empty` to avoid invalid selection and `ensure_visible` to make the jump visible.
 
 *Call graph*: calls 2 internal fn (clear_if_empty, ensure_visible); called by 5 (jump_bottom, jump_bottom, jump_bottom, jump_bottom, jump_bottom).
 
@@ -2572,11 +2584,11 @@ fn jump_bottom(&mut self, len: usize, visible_rows: usize)
 fn clear_if_empty(&mut self, len: usize) -> bool
 ```
 
-**Purpose**: Shared guard that resets selection and scroll when the current list length is zero.
+**Purpose**: Checks whether the current list has no rows, and if so, resets the scroll state. This private helper keeps all navigation methods from accidentally selecting a row that does not exist.
 
-**Data flow**: Reads `len`; when `len == 0` it mutates `self.selected_idx` to `None` and `self.scroll_top` to `0`, then returns `true`. Otherwise it leaves state unchanged and returns `false`.
+**Data flow**: It receives the current row count. If the count is not zero, it leaves the state unchanged and returns `false`. If the count is zero, it sets the selection to `None`, sets `scroll_top` to `0`, and returns `true`.
 
-**Call relations**: This private helper is the first branch in all selection-mutating methods so they all agree on empty-list behavior.
+**Call relations**: All selection-changing methods call this before doing their own work. It acts like a guard at the door: empty lists are handled once, consistently, before any movement calculation can happen.
 
 *Call graph*: called by 7 (clamp_selection, jump_bottom, jump_top, move_down_wrap, move_up_wrap, page_down_clamped, page_up_clamped).
 
@@ -2587,11 +2599,11 @@ fn clear_if_empty(&mut self, len: usize) -> bool
 fn ensure_visible(&mut self, len: usize, visible_rows: usize)
 ```
 
-**Purpose**: Adjusts `scroll_top` so the selected row lies within the current viewport window.
+**Purpose**: Adjusts the top of the scroll window so the selected row is inside the visible area. It does not change which row is selected; it changes what slice of the list is shown.
 
-**Data flow**: Reads `len`, `visible_rows`, `selected_idx`, and current `scroll_top`. If there are no rows or no visible rows, it resets `scroll_top` to `0`. If a selection exists above the current window it moves `scroll_top` up to the selection; if the selection is below the bottom edge it shifts `scroll_top` down just enough to include it; if there is no selection it resets `scroll_top` to `0`.
+**Data flow**: The caller provides the row count and visible window height. If the list or window is empty, `scroll_top` becomes `0`. If there is a selected row above the current window, `scroll_top` moves up to that row. If the selected row is below the current window, `scroll_top` moves down just enough to include it. If nothing is selected, the view returns to the top.
 
-**Call relations**: Many views call this after movement, filtering, or selection repair. It is also invoked internally by the page and jump methods so those operations leave the viewport consistent.
+**Call relations**: Movement, filtering, text-change, and match-setting paths call this after the selected row may have changed. Page and jump methods call it directly, while simpler up/down callers often call it themselves after moving.
 
 *Call graph*: called by 33 (move_down, move_up, on_composer_text_change, move_down, move_up, move_down, move_up, set_matches, move_down, move_up (+15 more)).
 
@@ -2602,11 +2614,11 @@ fn ensure_visible(&mut self, len: usize, visible_rows: usize)
 fn wrap_navigation_and_visibility()
 ```
 
-**Purpose**: Verifies that wraparound single-step navigation updates selection correctly and that `ensure_visible` keeps the selected row inside the viewport.
+**Purpose**: Checks that up/down navigation wraps correctly and that the selected row remains visible. It protects the expected arrow-key behavior from accidental changes.
 
-**Data flow**: Creates a new `ScrollState`, mutates it through clamp, wrap-up, wrap-down, and visibility updates, and asserts expected `selected_idx` and `scroll_top` values.
+**Data flow**: The test creates a new scroll state, uses a ten-row list with five visible rows, selects an initial row, moves up from the top to the bottom, then moves down back to the top. At each step it compares the state against expected selection and scroll values.
 
-**Call relations**: This test exercises the interaction between `new`, `clamp_selection`, `move_up_wrap`, `move_down_wrap`, and `ensure_visible`.
+**Call relations**: This test calls `ScrollState::new` and then exercises the public navigation and visibility methods together. It verifies the story that real callers rely on: move the selection, then make sure the screen window follows it.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, assert_eq!, panic!).
 
@@ -2617,24 +2629,24 @@ fn wrap_navigation_and_visibility()
 fn page_and_jump_navigation_clamps()
 ```
 
-**Purpose**: Checks that page movement and top/bottom jumps clamp at list edges and produce the expected scroll offsets.
+**Purpose**: Checks that page movement and top/bottom jumps stop at list edges and set the scroll window correctly. It protects the non-wrapping behavior of Page Up, Page Down, Home, and End style actions.
 
-**Data flow**: Builds a fresh state, applies page-down, page-up, jump-top, and jump-bottom operations with a fixed list length and viewport size, and asserts the resulting selection and scroll positions after each step.
+**Data flow**: The test creates a new scroll state, uses a ten-row list with four visible rows, then pages down several times, pages up once, jumps to the top, and jumps to the bottom. After each action it checks both the selected row and the top visible row.
 
-**Call relations**: This test covers the non-wrapping navigation methods and confirms their built-in `ensure_visible` behavior.
+**Call relations**: This test calls `ScrollState::new` and then drives the page and jump methods as a user would. It confirms that those methods cooperate with `ensure_visible` so the selection lands at the expected edge and remains visible.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
 
 ### `tui/src/bottom_pane/selection_popup_common.rs`
 
-`util` · `cross-cutting`
+`domain_logic` · `main loop rendering`
 
-This file is the common rendering core for list-like bottom-pane UIs. Its central data model is `GenericDisplayRow`, a presentation-oriented struct containing the row label, optional prefix spans, fuzzy-match indices, optional shortcut, description, category tag, disabled state, and optional wrap indent. Around that, it defines `ColumnWidthMode` and `ColumnWidthConfig` so callers can choose whether the split between name and description columns is derived from visible rows, all rows, or a fixed 30/70 layout.
+Selection popups all need to solve the same small but tricky visual problem: show a list of choices in a narrow terminal area, keep the selected choice visible, and make names, descriptions, shortcuts, and disabled reasons readable. This file is the common toolbox for that job.
 
-The file also standardizes the popup surface itself: `render_menu_surface` paints a `Block` with `user_message_style`, and `menu_surface_inset` / `menu_surface_padding_height` define the shared inner padding used by overlays. For row content, it can build a single styled line with fuzzy-match bolding and disabled annotations, or wrap rows either through a special two-column path for plain wrapped labels or a general styled-line wrapper that preserves spans and indentation.
+It defines a render-ready row shape, `GenericDisplayRow`, which is already formatted for display rather than tied to any one feature’s data model. A row can have a name, prefix styling, keyboard shortcut, search-match highlighting, a grey description, a category tag, or a disabled reason. The file also defines how the name and description columns are sized: based on visible rows, all rows, or a fixed split.
 
-Rendering logic is careful to keep selection visible even when rows wrap to multiple terminal lines. It first computes an item window from `ScrollState`, then may advance the start index until the selected item actually fits in the line-based viewport. Selected rows are recolored with `accent_style`, disabled rows are dimmed, empty lists render a dim italic placeholder, and single-line mode truncates overflow with an ellipsis. Matching measurement helpers mirror the same wrapping and column-width rules so callers can reserve the correct height.
+The main flow is: reserve the padded menu surface, decide which rows are visible from the scroll state, calculate where the description column should start, build styled terminal lines, wrap them if needed, apply selected or disabled styling, then paint them into the terminal buffer. It also has matching height-measurement functions so callers can ask, “How tall will this popup be?” before rendering it. Without this file, each popup would likely align, wrap, scroll, and highlight rows slightly differently, causing visual bugs and clipped text.
 
 #### Function details
 
@@ -2644,11 +2656,11 @@ Rendering logic is careful to keep selection visible even when rows wrap to mult
 fn new(mode: ColumnWidthMode, name_column_width: Option<usize>) -> Self
 ```
 
-**Purpose**: Constructs an explicit column-width configuration from a mode and optional shared name-column width override.
+**Purpose**: Creates a column-width setting for popup rows. Callers use it when they want to choose how the name column and description column should share horizontal space.
 
-**Data flow**: Takes a `ColumnWidthMode` and `Option<usize>` width override and returns a `ColumnWidthConfig` containing those exact values.
+**Data flow**: It receives a column width mode and an optional preferred name-column width. It stores those two values together and returns a `ColumnWidthConfig` that later rendering or measuring code can follow.
 
-**Call relations**: Callers use this when they need rendering and measurement to share a non-default column policy instead of relying on `Default`.
+**Call relations**: Higher-level height and render code calls this when it needs an explicit column layout choice instead of the default. The resulting config is passed down into the row measuring and drawing path.
 
 *Call graph*: called by 2 (desired_height, render).
 
@@ -2659,11 +2671,11 @@ fn new(mode: ColumnWidthMode, name_column_width: Option<usize>) -> Self
 fn menu_surface_inset(area: Rect) -> Rect
 ```
 
-**Purpose**: Applies the standard vertical and horizontal padding used inside bottom-pane menu surfaces.
+**Purpose**: Shrinks a popup rectangle to leave the standard padding around menu contents. This keeps bottom-pane overlays from drawing text right against their border or edge.
 
-**Data flow**: Takes an outer `Rect`, constructs `Insets::vh(MENU_SURFACE_INSET_V, MENU_SURFACE_INSET_H)`, applies `area.inset(...)`, and returns the inner content rectangle.
+**Data flow**: It receives a terminal rectangle. It applies a fixed vertical and horizontal inset, then returns the smaller rectangle where inner content should be drawn.
 
-**Call relations**: This helper is used by popup renderers and height calculators so they all agree on the same content box inside the shared menu surface.
+**Call relations**: Code that positions cursors, measures popup height, or renders confirmation/input overlays calls this so all menu-like surfaces use the same inner spacing. `render_menu_surface` also calls it after painting the background.
 
 *Call graph*: calls 1 internal fn (vh); called by 7 (cursor_pos, desired_height, cursor_pos_impl, desired_height, unanswered_confirmation_height, desired_height_keeps_spacers_and_preferred_options_visible, render_menu_surface); 1 external calls (inset).
 
@@ -2674,11 +2686,11 @@ fn menu_surface_inset(area: Rect) -> Rect
 fn menu_surface_padding_height() -> u16
 ```
 
-**Purpose**: Returns the total vertical padding contributed by the shared menu surface treatment.
+**Purpose**: Reports how many terminal rows are used by the menu surface’s top and bottom padding. Callers use it when calculating how tall a popup needs to be.
 
-**Data flow**: Computes and returns `MENU_SURFACE_INSET_V * 2` as a `u16` constant.
+**Data flow**: It reads the fixed vertical padding constant, doubles it for top plus bottom, and returns that number.
 
-**Call relations**: Height calculators call this to add top and bottom padding without duplicating the inset constants.
+**Call relations**: Popup height calculations call this so they include the same padding that rendering will actually apply. This helps prevent content from being clipped because measurement and drawing disagree.
 
 *Call graph*: called by 3 (desired_height, desired_height, unanswered_confirmation_height).
 
@@ -2689,11 +2701,11 @@ fn menu_surface_padding_height() -> u16
 fn render_menu_surface(area: Rect, buf: &mut Buffer) -> Rect
 ```
 
-**Purpose**: Paints the shared popup background style and returns the inset rectangle where inner content should be rendered.
+**Purpose**: Paints the shared menu background and returns the padded inner area for content. It gives selection-style overlays a consistent surface color and spacing.
 
-**Data flow**: Receives an outer area and mutable buffer. If `area.is_empty()` it returns the original area unchanged; otherwise it renders a default `Block` styled with `user_message_style()` into the buffer and returns `menu_surface_inset(area)`.
+**Data flow**: It receives an outer rectangle and a mutable terminal buffer. If the rectangle is not empty, it fills that area with the user-message style, then returns the inset rectangle where callers should render the menu’s actual text.
 
-**Call relations**: Overlay renderers call this first so all selection-style popups share the same background and padding before they draw their own content.
+**Call relations**: Popup renderers call this near the start of drawing. It delegates the padding calculation to `menu_surface_inset`, then hands the returned content rectangle back to the caller for the next rendering steps.
 
 *Call graph*: calls 2 internal fn (menu_surface_inset, user_message_style); called by 5 (render, render, render, render_ui_at, render_unanswered_confirmation); 2 external calls (default, is_empty).
 
@@ -2704,11 +2716,11 @@ fn render_menu_surface(area: Rect, buf: &mut Buffer) -> Rect
 fn wrap_styled_line(line: &'a Line<'a>, width: u16) -> Vec<Line<'a>>
 ```
 
-**Purpose**: Wraps a styled `Line` to a target width while preserving span styling and guaranteeing a minimum width of one cell.
+**Purpose**: Wraps a styled line of terminal text to fit a given width while keeping its styling. This is useful when a message may be too long for the available space.
 
-**Data flow**: Takes a borrowed `Line` and `width`, clamps width to at least 1, builds `RtOptions` with empty initial and subsequent indents, passes both to `word_wrap_line`, and returns the resulting wrapped lines.
+**Data flow**: It receives a styled line and a target width. It clamps the width to at least one cell, asks the wrapping helper to split the line without adding indentation, and returns the wrapped lines.
 
-**Call relations**: This helper is used by higher-level overlays when they need wrapped text that preserves styling, such as popup headers and prompts.
+**Call relations**: Height calculation and unanswered-confirmation layout code call this when they need to know or produce the line breaks for styled text. It relies on the shared wrapping system so style spans survive the split.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (desired_height, unanswered_confirmation_layout); 1 external calls (from).
 
@@ -2719,11 +2731,11 @@ fn wrap_styled_line(line: &'a Line<'a>, width: u16) -> Vec<Line<'a>>
 fn line_to_owned(line: Line<'_>) -> Line<'static>
 ```
 
-**Purpose**: Converts a borrowed wrapped line into an owned `'static` line while preserving style and alignment.
+**Purpose**: Turns a styled line that may borrow text into one that owns its text. This makes wrapped lines safe to store or return without depending on the lifetime of the original input.
 
-**Data flow**: Consumes a `Line<'_>`, clones style/alignment metadata, converts each span’s content into owned text, and returns a `Line<'static>`.
+**Data flow**: It receives a `Line` whose spans may refer to borrowed text. It copies each span’s content into owned strings while preserving style and alignment, then returns a fully owned line.
 
-**Call relations**: This private helper supports wrapping paths that need to store or return owned lines after using borrowed wrapping utilities.
+**Call relations**: This helper is used inside `wrap_standard_row` after word wrapping. It bridges between the wrapping helper’s borrowed output and the renderer’s need for self-contained lines.
 
 
 ##### `compute_desc_col`  (lines 139–203)
@@ -2738,11 +2750,11 @@ fn compute_desc_col(
 ) -> usize
 ```
 
-**Purpose**: Determines the column where descriptions should begin for a row list, based on content width and the configured column-width policy.
+**Purpose**: Decides where the description column should start. This keeps option names on the left and explanatory text lined up on the right.
 
-**Data flow**: Reads all rows, the current item window start, visible item count, content width, and `ColumnWidthConfig`. It computes the maximum legal description column, then either returns a fixed 30% split or measures the widest visible/all-row name block—including prefix spans and disabled marker text—applies any explicit width override, adds two spaces of gap, caps the result to preserve at least 30% for descriptions, and returns the chosen column index.
+**Data flow**: It receives all rows, the current starting row, how many rows are considered visible, the available width, and the column-width configuration. It measures row names according to the chosen mode, applies caps so descriptions still have room, and returns a column number.
 
-**Call relations**: This is a core layout primitive used by wrapped rendering, single-line rendering, wrapped-viewport visibility checks, and height measurement so all those paths align descriptions consistently.
+**Call relations**: Rendering, single-line rendering, height measurement, and wrapped-selection adjustment all call this before building row text. Its answer controls how `build_full_line` and wrapping helpers align names and descriptions.
 
 *Call graph*: called by 4 (adjust_start_for_wrapped_selection_visibility, measure_rows_height_inner, render_rows_inner, render_rows_single_line_with_col_width_mode); 1 external calls (iter).
 
@@ -2753,11 +2765,11 @@ fn compute_desc_col(
 fn wrap_indent(row: &GenericDisplayRow, desc_col: usize, max_width: u16) -> usize
 ```
 
-**Purpose**: Computes the indentation to use for continuation lines when a row wraps.
+**Purpose**: Chooses how far continuation lines should be indented when a row wraps. This makes wrapped descriptions line up under the description column instead of starting at the far left.
 
-**Data flow**: Reads the row, description column, and maximum width. It prefers `row.wrap_indent` when present; otherwise it uses `desc_col` when the row has a description or disabled reason, or `0` for plain rows. The result is clamped to at most `max_width - 1`.
+**Data flow**: It receives a row, the chosen description column, and the maximum width. It uses the row’s explicit wrap indent if present, otherwise uses the description column when the row has descriptive or disabled text, and clamps the result so it fits.
 
-**Call relations**: This helper is used by `wrap_standard_row` to keep wrapped continuation lines visually aligned under the intended column.
+**Call relations**: `wrap_standard_row` calls this while preparing word-wrap options. It supplies the indentation that makes multi-line rows readable.
 
 *Call graph*: called by 1 (wrap_standard_row).
 
@@ -2768,11 +2780,11 @@ fn wrap_indent(row: &GenericDisplayRow, desc_col: usize, max_width: u16) -> usiz
 fn should_wrap_name_in_column(row: &GenericDisplayRow) -> bool
 ```
 
-**Purpose**: Detects the narrow special case where a row should use the dedicated two-column wrapping path instead of the general styled-line wrapper.
+**Purpose**: Checks whether a row is simple enough to use the special two-column wrapping layout. This path is meant for plain rows with long names and descriptions.
 
-**Data flow**: Inspects a `GenericDisplayRow` and returns `true` only when it has an explicit wrap indent, has a description, has no disabled reason, no fuzzy-match indices, no shortcut, no category tag, and no prefix spans.
+**Data flow**: It reads the row’s display features. It returns true only when the row has an explicit wrap indent and description, and does not have disabled text, match highlighting, shortcuts, tags, or prefix spans that would complicate two-column wrapping.
 
-**Call relations**: This predicate is consulted by `wrap_row_lines` to decide whether `wrap_two_column_row` can safely preserve a cleaner left/right column layout.
+**Call relations**: `wrap_row_lines` uses this as a gate. If it says yes, the row may be wrapped by `wrap_two_column_row`; otherwise the safer standard wrapping path is used.
 
 *Call graph*: called by 1 (wrap_row_lines).
 
@@ -2783,11 +2795,11 @@ fn should_wrap_name_in_column(row: &GenericDisplayRow) -> bool
 fn wrap_two_column_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Wraps a plain name/description row into multiple lines while keeping the name in a left column and the description in a right column.
+**Purpose**: Wraps a plain row as two side-by-side columns: name on the left, description on the right. This keeps long option labels and long explanations readable without mixing them together.
 
-**Data flow**: Takes a row, description column, and width. If there is no description or no usable description column, it returns an empty vector. Otherwise it computes left and right column widths, wraps the name with optional subsequent indentation using `textwrap`, wraps the description separately, then merges corresponding wrapped lines into `Line<'static>` values with enough spaces inserted so description text starts at `desc_col`, dimming the description spans.
+**Data flow**: It receives a row, description-column position, and width. It wraps the name within the left column and the description within the right column, then combines corresponding lines with spacing between them. If the terminal is too narrow for a valid split, it returns no lines so the caller can fall back.
 
-**Call relations**: This specialized wrapper is attempted first by `wrap_row_lines` for simple two-column rows; tests also call it directly to verify narrow-width fallback behavior.
+**Call relations**: `wrap_row_lines` calls this for rows approved by `should_wrap_name_in_column`. A test also calls it directly to confirm that a one-cell-wide layout returns safely instead of crashing.
 
 *Call graph*: called by 2 (one_cell_width_falls_back_without_panic_for_wrapped_two_column_rows, wrap_row_lines); 5 external calls (from, new, with_capacity, new, wrap).
 
@@ -2798,11 +2810,11 @@ fn wrap_two_column_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> 
 fn wrap_standard_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Wraps a fully styled row line using the generic styled-line wrapping path and a computed continuation indent.
+**Purpose**: Builds a normal full row line and wraps it if it is too wide. This is the general-purpose path for rows with styling, shortcuts, fuzzy-match highlights, disabled text, or tags.
 
-**Data flow**: Builds the complete styled line with `build_full_line`, computes continuation indentation with `wrap_indent`, constructs wrapping options with empty initial indent and a space-filled subsequent indent, wraps via `word_wrap_line`, converts each wrapped line to owned form, and returns the vector.
+**Data flow**: It receives a row, description column, and width. It first builds the styled full line, calculates continuation indentation, wraps the line, converts the result into owned lines, and returns them.
 
-**Call relations**: This is the fallback wrapping path used by `wrap_row_lines` whenever the specialized two-column path is not applicable or produces no output.
+**Call relations**: `wrap_row_lines` calls this whenever the special two-column path is not appropriate or cannot produce output. It depends on `build_full_line` for the row content and `wrap_indent` for continuation spacing.
 
 *Call graph*: calls 3 internal fn (build_full_line, wrap_indent, new); called by 1 (wrap_row_lines); 1 external calls (from).
 
@@ -2813,11 +2825,11 @@ fn wrap_standard_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Ve
 fn wrap_row_lines(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Chooses the appropriate wrapping strategy for a row and returns the rendered lines it would occupy.
+**Purpose**: Chooses the best wrapping strategy for one display row. It hides the difference between the special two-column layout and the standard full-line layout.
 
-**Data flow**: Reads the row, description column, and width. It first checks `should_wrap_name_in_column`; if true it tries `wrap_two_column_row` and returns that result when non-empty. Otherwise it falls back to `wrap_standard_row`.
+**Data flow**: It receives a row, description column, and width. It tries two-column wrapping for simple eligible rows; if that does not apply or returns nothing, it produces standard wrapped lines instead.
 
-**Call relations**: This helper is the common row-to-lines transformation used by wrapped rendering, wrapped viewport visibility checks, and height measurement.
+**Call relations**: Rendering, measuring, and selected-row visibility checks all call this because they need to know how many terminal lines a row will occupy. It coordinates `should_wrap_name_in_column`, `wrap_two_column_row`, and `wrap_standard_row`.
 
 *Call graph*: calls 3 internal fn (should_wrap_name_in_column, wrap_standard_row, wrap_two_column_row); called by 3 (is_selected_visible_in_wrapped_viewport, measure_rows_height_inner, render_rows_inner).
 
@@ -2828,11 +2840,11 @@ fn wrap_row_lines(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<L
 fn apply_row_state_style(lines: &mut [Line<'static>], selected: bool, is_disabled: bool)
 ```
 
-**Purpose**: Applies selection and disabled-state styling to already wrapped row lines.
+**Purpose**: Applies visual state to already-built row lines. Selected rows get the accent style, and disabled rows are dimmed.
 
-**Data flow**: Mutably iterates over a slice of `Line<'static>`. If `selected` is true, it replaces every span style with `accent_style()`. If `is_disabled` is true, it dims each span’s current style. It mutates the lines in place and returns nothing.
+**Data flow**: It receives mutable styled lines plus flags for selected and disabled. It rewrites the style of each span in those lines, first applying the selected accent if needed, then dimming disabled content if needed.
 
-**Call relations**: Wrapped rendering calls this after line wrapping so selection and disabled styling affect every visual line of a multi-line row.
+**Call relations**: `render_rows_inner` calls this just before painting wrapped lines into the buffer. This keeps row construction separate from state-dependent styling.
 
 *Call graph*: called by 1 (render_rows_inner); 1 external calls (iter_mut).
 
@@ -2847,11 +2859,11 @@ fn compute_item_window_start(
 ) -> usize
 ```
 
-**Purpose**: Computes the initial item-based scroll window start index from `ScrollState` and the maximum number of items to consider.
+**Purpose**: Finds which item index should appear first in the visible list. It keeps the selected item inside the item window when possible.
 
-**Data flow**: Reads the full row slice, `state.scroll_top`, optional `state.selected_idx`, and `max_items`. It returns `0` for empty inputs; otherwise it clamps `scroll_top` into range and adjusts it upward or downward so the selected item lies within the item-count window `[start_idx, start_idx + max_items - 1]`.
+**Data flow**: It receives all rows, scroll state, and the maximum number of items to show. It starts from the scroll position, then moves the start upward or downward if the selected item would otherwise fall outside the visible item range.
 
-**Call relations**: This is the first-stage viewport calculation used by `adjust_start_for_wrapped_selection_visibility` before wrapped line heights are considered.
+**Call relations**: `adjust_start_for_wrapped_selection_visibility` calls this as the first pass. That later function refines the answer for rows that may take more than one terminal line.
 
 *Call graph*: called by 1 (adjust_start_for_wrapped_selection_visibility); 2 external calls (is_empty, len).
 
@@ -2869,11 +2881,11 @@ fn is_selected_visible_in_wrapped_viewport(
     viewport_h
 ```
 
-**Purpose**: Checks whether the selected item would actually appear inside a line-based viewport once row wrapping is taken into account.
+**Purpose**: Checks whether the selected item actually appears within the available terminal height after row wrapping. This matters because one item can take several lines.
 
-**Data flow**: Reads the row list, item window start, max items, selected index, description column, width, and viewport height. It simulates rendering from `start_idx`, summing `wrap_row_lines(...).len().max(1)` for each row, always allowing the first row even if it overflows, and returns `true` if it encounters `selected_idx` before the simulated viewport fills.
+**Data flow**: It receives the rows, proposed start index, item limit, selected index, description column, width, and viewport height. It simulates wrapping and counting lines from the start index until the viewport is full, then returns whether the selected row was reached.
 
-**Call relations**: This helper is used by `adjust_start_for_wrapped_selection_visibility` to detect when an item-based scroll window still hides the selected row because earlier rows wrapped taller than one line.
+**Call relations**: `adjust_start_for_wrapped_selection_visibility` calls this while deciding whether it must move the starting item forward. It uses `wrap_row_lines` so its visibility check matches rendering behavior.
 
 *Call graph*: calls 1 internal fn (wrap_row_lines); called by 1 (adjust_start_for_wrapped_selection_visibility); 1 external calls (iter).
 
@@ -2890,11 +2902,11 @@ fn adjust_start_for_wrapped_selection_visibility(
     viewport_height:
 ```
 
-**Purpose**: Advances the item window start until the selected row is visible in the wrapped line viewport.
+**Purpose**: Adjusts the first visible item so the selected row remains visible even when earlier rows wrap onto multiple lines. This avoids the confusing case where the selected item is technically in the item window but pushed below the screen.
 
-**Data flow**: Starts from `compute_item_window_start`, reads `state.selected_idx`, viewport dimensions, and column-width config, and while the selected row remains below the visible wrapped viewport it recomputes `desc_col` for the current start and increments `start_idx`. It returns the corrected start index.
+**Data flow**: It receives rows, scroll state, item limits, width, height, and column settings. It computes an initial item-window start, then repeatedly checks whether the selected row is visible in the line-based viewport and advances the start until it is or cannot advance further.
 
-**Call relations**: Wrapped rendering uses this instead of raw `scroll_top` semantics so selection visibility remains correct even when rows consume multiple terminal lines.
+**Call relations**: `render_rows_inner` calls this before drawing wrapped rows. It combines `compute_item_window_start`, `compute_desc_col`, and `is_selected_visible_in_wrapped_viewport` so scrolling works for both one-line and multi-line rows.
 
 *Call graph*: calls 3 internal fn (compute_desc_col, compute_item_window_start, is_selected_visible_in_wrapped_viewport); called by 1 (render_rows_inner).
 
@@ -2905,11 +2917,11 @@ fn adjust_start_for_wrapped_selection_visibility(
 fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static>
 ```
 
-**Purpose**: Builds the complete styled single-line representation of a row, including prefix spans, fuzzy-match bolding, optional shortcut, padded description, category tag, and disabled annotations.
+**Purpose**: Builds the styled terminal line for one row before wrapping or truncation. It combines the row name, optional prefix, shortcut, description, disabled reason, search-match emphasis, and category tag.
 
-**Data flow**: Reads all presentation fields from a `GenericDisplayRow` plus `desc_col`. It synthesizes a combined description string from `description` and `disabled_reason`, computes how much width the name may occupy before the description column, walks the name character-by-character applying bold style to fuzzy-match indices and truncating with an ellipsis when needed, appends a dim ` (disabled)` marker when applicable, then assembles prefix spans, name spans, optional shortcut spans, gap spaces up to `desc_col`, dimmed description text, and optional dimmed category tag into a final `Line<'static>`.
+**Data flow**: It receives a display row and the description column. It creates styled spans for the name, bolds matched characters if search indices are present, shortens the name if it would collide with the description, adds disabled labels and shortcut text, pads to the description column, then returns one styled line.
 
-**Call relations**: This is the core row formatter used by both `wrap_standard_row` and `render_rows_single_line_with_col_width_mode`, ensuring wrapped and single-line modes share the same textual content and styling rules.
+**Call relations**: `wrap_standard_row` uses this before wrapping, and single-line rendering uses it before truncating. It is the central row assembly step that turns row data into visible terminal text.
 
 *Call graph*: called by 2 (render_rows_single_line_with_col_width_mode, wrap_standard_row); 4 external calls (from, width, with_capacity, format!).
 
@@ -2927,11 +2939,11 @@ fn render_rows_inner(
     column_width: ColumnWidthC
 ```
 
-**Purpose**: Renders wrapped selection rows into a buffer using shared selection, disabled, scrolling, and empty-state behavior.
+**Purpose**: Draws a wrapped selection list into the terminal buffer. It is the shared engine behind the public wrapped row render functions.
 
-**Data flow**: Receives the target area, buffer, all rows, scroll state, max results, empty-message text, and column-width config. It renders a dim italic placeholder when there are no rows, otherwise computes the visible item count, corrects the start index with `adjust_start_for_wrapped_selection_visibility`, computes `desc_col`, wraps each visible row with `wrap_row_lines`, applies selection/disabled styling with `apply_row_state_style`, renders each wrapped line into successive buffer rows until vertical space runs out, and returns the number of terminal lines drawn.
+**Data flow**: It receives a drawing area, buffer, all rows, scroll state, result limit, empty message, and column-width settings. It draws an empty placeholder if needed, chooses the visible start row, computes description alignment, wraps each row, applies selected or disabled styling, paints lines until vertical space runs out, and returns how many terminal lines were drawn.
 
-**Call relations**: This is the shared implementation behind `render_rows` and `render_rows_with_col_width_mode`. Higher-level popups call those wrappers rather than this internal function directly.
+**Call relations**: `render_rows` and `render_rows_with_col_width_mode` delegate to this. It pulls together scrolling, column calculation, wrapping, state styling, and actual buffer rendering.
 
 *Call graph*: calls 4 internal fn (adjust_start_for_wrapped_selection_visibility, apply_row_state_style, compute_desc_col, wrap_row_lines); called by 2 (render_rows, render_rows_with_col_width_mode); 5 external calls (from, is_empty, iter, len, from).
 
@@ -2949,11 +2961,11 @@ fn render_rows(
 ) -> u16
 ```
 
-**Purpose**: Public wrapped-row renderer using the default `ColumnWidthConfig` (`AutoVisible`).
+**Purpose**: Draws wrapped selection rows using the default column-width behavior. This is the convenient entry point for most selection popups.
 
-**Data flow**: Passes its area, buffer, rows, state, max-results limit, and empty-message text into `render_rows_inner` together with `ColumnWidthConfig::default()`, then returns the rendered line count.
+**Data flow**: It receives the drawing area, buffer, rows, scroll state, maximum results, and empty message. It adds the default column configuration and passes everything to the shared renderer, returning the number of terminal lines drawn.
 
-**Call relations**: This is the common entry point used by many overlays and popups that want adaptive visible-row-based description alignment.
+**Call relations**: Many popup render paths call this when they want standard wrapped list behavior. It is a thin wrapper around `render_rows_inner`.
 
 *Call graph*: calls 1 internal fn (render_rows_inner); called by 8 (render, render, render_ref, render_input, render, render_unanswered_confirmation, render_rows_bottom_aligned, selected_rows_use_the_shared_accent_style); 1 external calls (default).
 
@@ -2971,11 +2983,11 @@ fn render_rows_with_col_width_mode(
     column_width
 ```
 
-**Purpose**: Public wrapped-row renderer that accepts an explicit column-width configuration.
+**Purpose**: Draws wrapped selection rows with an explicit column-width configuration. Callers use it when they need stable or fixed column placement instead of the default.
 
-**Data flow**: Forwards all rendering inputs plus the caller-supplied `ColumnWidthConfig` to `render_rows_inner` and returns the rendered line count.
+**Data flow**: It receives the same rendering inputs as `render_rows`, plus a `ColumnWidthConfig`. It forwards them to the shared rendering engine and returns the number of lines drawn.
 
-**Call relations**: Callers use this lower-level variant when they need stable all-row or fixed column alignment instead of the default adaptive mode.
+**Call relations**: Renderers that care about a specific column sizing mode call this. It feeds directly into `render_rows_inner`, which does the real drawing.
 
 *Call graph*: calls 1 internal fn (render_rows_inner); called by 2 (render_ref, render).
 
@@ -2993,11 +3005,11 @@ fn render_rows_single_line(
 ) -> u16
 ```
 
-**Purpose**: Renders rows as exactly one terminal line each, truncating overflow with an ellipsis and using the default column-width policy.
+**Purpose**: Draws selection rows as one terminal line each, without wrapping. This is useful for denser popups where multi-line rows would make the list jump around vertically.
 
-**Data flow**: Delegates to `render_rows_single_line_with_col_width_mode` with `ColumnWidthConfig::default()` and returns the number of lines rendered.
+**Data flow**: It receives the area, buffer, rows, scroll state, result limit, and empty message. It supplies the default column configuration and calls the configurable single-line renderer.
 
-**Call relations**: Dense popups such as mention or skill lists use this wrapper when multi-line row wrapping would create too much vertical churn.
+**Call relations**: Popup renderers call this when they want compact list behavior. It delegates to `render_rows_single_line_with_col_width_mode`.
 
 *Call graph*: calls 1 internal fn (render_rows_single_line_with_col_width_mode); called by 3 (render, render_ref, render); 1 external calls (default).
 
@@ -3014,11 +3026,11 @@ fn render_rows_single_line_with_col_width_mode(
     empty_message: &str,
 ```
 
-**Purpose**: Renders a single-line-per-row list with configurable column-width behavior, selection styling, disabled styling, and ellipsis truncation.
+**Purpose**: Draws rows as single lines with explicit column-width behavior, cutting off overflow with an ellipsis. An ellipsis is the “…” mark that tells the user text continued but did not fit.
 
-**Data flow**: If there are no rows, it renders a dim italic placeholder when space exists and returns 1 or 0 accordingly. Otherwise it computes the visible item count from `max_results`, row count, and area height; derives a start index from `scroll_top` and selection; computes `desc_col`; builds each row line with `build_full_line`; applies accent styling for the selected non-disabled row and dimming for disabled rows; truncates overflow with `truncate_line_with_ellipsis_if_overflow`; renders each line into the buffer; and returns the number of rows drawn.
+**Data flow**: It receives the drawing area, buffer, rows, scroll state, result limit, empty message, and column settings. It handles the empty case, chooses visible rows from the scroll state, computes the description column, builds each full line, applies selected or disabled styling, truncates text that is too wide, renders one line per row, and returns the number of lines drawn.
 
-**Call relations**: This is the implementation behind `render_rows_single_line` and is used by compact list UIs that want stable one-row-per-item rendering.
+**Call relations**: Some render paths call this directly, while `render_rows_single_line` calls it with defaults. It uses `build_full_line`, `compute_desc_col`, and the line-truncation helper to create compact output.
 
 *Call graph*: calls 3 internal fn (build_full_line, compute_desc_col, truncate_line_with_ellipsis_if_overflow); called by 2 (render, render_rows_single_line); 5 external calls (from, is_empty, iter, len, from).
 
@@ -3034,11 +3046,11 @@ fn measure_rows_height(
 ) -> u16
 ```
 
-**Purpose**: Measures how many terminal lines wrapped row rendering would require under the default adaptive column-width policy.
+**Purpose**: Calculates how many terminal rows a wrapped selection list will need using the default column behavior. Callers use this before rendering so they can reserve enough vertical space.
 
-**Data flow**: Forwards the row slice, scroll state, max-results limit, width, and `ColumnWidthConfig::default()` to `measure_rows_height_inner` and returns the resulting height.
+**Data flow**: It receives rows, scroll state, maximum results, and width. It applies the default column configuration, delegates to the shared measurement logic, and returns the required height.
 
-**Call relations**: Popup height calculators call this when they intend to render with `render_rows`, so reserved space matches wrapped rendering semantics.
+**Call relations**: Popup layout and desired-height code call this before drawing. It must match `render_rows` so the measured height agrees with what will actually be rendered.
 
 *Call graph*: calls 1 internal fn (measure_rows_height_inner); called by 9 (action_rows_height, desired_height, render, options_required_height, desired_height, render, options_preferred_height, options_required_height, unanswered_confirmation_height); 1 external calls (default).
 
@@ -3055,11 +3067,11 @@ fn measure_rows_height_with_col_width_mode(
 ) -> u16
 ```
 
-**Purpose**: Measures wrapped row height using an explicit column-width configuration.
+**Purpose**: Calculates wrapped selection-list height with an explicit column-width configuration. This is the measuring companion to the configurable wrapped renderer.
 
-**Data flow**: Passes rows, state, max-results limit, width, and the caller’s `ColumnWidthConfig` into `measure_rows_height_inner` and returns the computed line count.
+**Data flow**: It receives rows, scroll state, maximum results, width, and a column setting. It passes them to the shared measurement function and returns the number of terminal rows needed.
 
-**Call relations**: This is the measurement companion to `render_rows_with_col_width_mode` for callers that need non-default alignment behavior.
+**Call relations**: Layout code that will render with `render_rows_with_col_width_mode` calls this first. Using the same column settings prevents underestimating or overestimating the popup height.
 
 *Call graph*: calls 1 internal fn (measure_rows_height_inner); called by 3 (calculate_required_height, desired_height, render).
 
@@ -3076,11 +3088,11 @@ fn measure_rows_height_inner(
 ) -> u16
 ```
 
-**Purpose**: Internal implementation that computes the wrapped line count for the visible row window without rendering.
+**Purpose**: Performs the actual height calculation for wrapped rows. It estimates the same wrapping and alignment that rendering will use.
 
-**Data flow**: Returns 1 for an empty row set to account for the placeholder line. Otherwise it reduces width by one cell for content safety, computes visible item count and start index from scroll state, derives `desc_col` with `compute_desc_col`, sums `wrap_row_lines(...).len()` for each visible row, and returns at least 1.
+**Data flow**: It receives rows, scroll state, maximum results, width, and column settings. It returns one line for an empty placeholder if there are no rows; otherwise it chooses the visible item window, computes the description column, wraps each visible row, adds up their line counts, and returns at least one row of height.
 
-**Call relations**: This internal helper underpins both public measurement functions and mirrors the same wrapping and column calculations used by wrapped rendering.
+**Call relations**: `measure_rows_height` and `measure_rows_height_with_col_width_mode` both delegate to this. It shares `compute_desc_col` and `wrap_row_lines` with rendering so measurement stays consistent.
 
 *Call graph*: calls 2 internal fn (compute_desc_col, wrap_row_lines); called by 2 (measure_rows_height, measure_rows_height_with_col_width_mode); 3 external calls (is_empty, iter, len).
 
@@ -3091,11 +3103,11 @@ fn measure_rows_height_inner(
 fn one_cell_width_falls_back_without_panic_for_wrapped_two_column_rows()
 ```
 
-**Purpose**: Ensures the specialized two-column wrapping path safely returns no lines instead of panicking when width is too narrow to support a description column.
+**Purpose**: Checks that the two-column wrapping code behaves safely when the available width is only one terminal cell. This protects against crashes in extremely narrow layouts.
 
-**Data flow**: Builds a `GenericDisplayRow` with a long name and description, calls `wrap_two_column_row` with width 1 and `desc_col` 0, and asserts that the returned vector is empty.
+**Data flow**: It creates a row with a long name, description, and wrap indent, then asks `wrap_two_column_row` to wrap it at width one. It expects an empty result, meaning the caller can fall back to another layout instead of panicking.
 
-**Call relations**: This test directly exercises the narrow-width guard in `wrap_two_column_row`.
+**Call relations**: This test calls `wrap_two_column_row` directly. It documents and verifies the narrow-width fallback that `wrap_row_lines` relies on.
 
 *Call graph*: calls 1 internal fn (wrap_two_column_row); 2 external calls (default, assert_eq!).
 
@@ -3106,24 +3118,24 @@ fn one_cell_width_falls_back_without_panic_for_wrapped_two_column_rows()
 fn selected_rows_use_the_shared_accent_style()
 ```
 
-**Purpose**: Verifies that selected rows rendered through the shared row renderer use the common accent styling.
+**Purpose**: Checks that selected rows are drawn with the shared accent style. This ensures popups use the same visual language for the current choice.
 
-**Data flow**: Creates a one-row list and a `ScrollState` selecting that row, renders into a `Buffer` with `render_rows`, reads the style of the first cell, and compares it against `accent_style()`.
+**Data flow**: It builds one row, marks it selected in the scroll state, renders it into a small buffer, then compares the first cell’s style with the expected accent style and confirms bold styling is present.
 
-**Call relations**: This test validates the selection styling path applied during wrapped row rendering.
+**Call relations**: This test calls `render_rows`, which goes through the normal wrapped rendering path. It verifies that selection styling applied by `apply_row_state_style` reaches the terminal buffer.
 
 *Call graph*: calls 2 internal fn (render_rows, accent_style); 6 external calls (empty, default, new, assert!, assert_eq!, vec!).
 
 
 ### `tui/src/bottom_pane/selection_tabs.rs`
 
-`util` · `request handling`
+`domain_logic` · `UI rendering`
 
-This file defines the `SelectionTab` struct and the small set of helpers needed to render a tab strip above selection content. Each tab carries an `id`, a visible `label`, a `header` renderable, and its associated `items`, but this file’s logic is focused specifically on the tab bar itself rather than tab content.
+This file is the small “tab bar” piece of the bottom pane UI. A tab here represents a selectable section, with an id, a visible label, a header to render, and a list of selection items. Without this file, the bottom pane could still have data to show, but it would not have a clear row of labels telling the user which section is active or letting the surrounding UI reserve the right amount of space for those labels.
 
-The core behavior is in `tab_bar_lines`, which converts the tab list into one or more `Line<'static>` values that fit within the available width. It builds each tab as a span sequence from `tab_unit`, measures its display width, inserts a fixed two-space gap between adjacent tabs, and wraps to a new output line whenever adding the next tab would exceed the current row width. Active tabs are rendered as `[label]` using the shared `accent_style`, while inactive tabs are shown as dim plain text without brackets.
+The main work is turning a list of tabs into one or more display lines. If the terminal is wide enough, all tab labels sit on one line with a small gap between them. If the terminal is too narrow, the labels wrap onto additional lines, like words wrapping in a paragraph. The active tab is shown with brackets and the project’s accent color, for example “[Files]”, while inactive tabs are dimmed so they fade into the background.
 
-`tab_bar_height` simply asks how many wrapped lines would be produced, and `render_tab_bar` renders those lines into the provided area, clipping to the area height. Empty tab lists are treated as a zero-height, no-op case. The implementation is intentionally simple and deterministic: wrapping happens only between whole tabs, never inside a label, so tab labels remain visually intact.
+Two public helpers use the same layout calculation. One asks, “How many rows will this tab bar need?” The other actually paints those rows into ratatui’s screen buffer, which is the off-screen drawing area for the terminal UI. This keeps measuring and drawing consistent: the UI does not reserve one shape and then render a different one.
 
 #### Function details
 
@@ -3133,11 +3145,11 @@ The core behavior is in `tab_bar_lines`, which converts the tab list into one or
 fn tab_bar_height(tabs: &[SelectionTab], active_idx: usize, width: u16) -> u16
 ```
 
-**Purpose**: Computes how many terminal rows the tab bar will occupy at a given width.
+**Purpose**: This function tells the rest of the UI how many terminal rows the tab bar will need. It is used before drawing so the bottom pane can reserve enough vertical space, especially when narrow terminals force tabs to wrap.
 
-**Data flow**: Takes the tab slice, active tab index, and width. It returns `0` immediately for an empty tab list; otherwise it builds wrapped lines with `tab_bar_lines`, converts the line count to `u16`, and saturates to `u16::MAX` on conversion failure.
+**Data flow**: It receives the list of tabs, the active tab position, and the available width. If there are no tabs, it returns 0 because nothing should be shown. Otherwise it builds the same wrapped tab lines that rendering will use, counts them, and returns that count as a terminal height.
 
-**Call relations**: Views call this during layout before rendering so they can reserve enough vertical space for the wrapped tab strip.
+**Call relations**: The surrounding bottom-pane layout calls this through desired_height and render when it needs to know how much space the tab strip will occupy. It delegates the real wrapping decision to tab_bar_lines so measuring and drawing stay in sync.
 
 *Call graph*: calls 1 internal fn (tab_bar_lines); called by 2 (desired_height, render); 1 external calls (is_empty).
 
@@ -3153,11 +3165,11 @@ fn render_tab_bar(
 )
 ```
 
-**Purpose**: Draws the wrapped tab bar lines into the target buffer area.
+**Purpose**: This function draws the tab bar into the terminal UI buffer. It is the painting step: it takes the prepared tab labels and places them row by row inside the given screen rectangle.
 
-**Data flow**: Receives the tabs, active index, destination `Rect`, and mutable `Buffer`. It computes the wrapped lines with `tab_bar_lines`, clips them to `area.height`, and renders each line into a one-row rectangle at successive `y` offsets.
+**Data flow**: It receives the tabs, the active tab position, the rectangular area where the bar should appear, and the buffer to draw into. It asks tab_bar_lines to make the wrapped visual lines for the current width, clips them to the available height, and renders each line at the correct y-position. The output is not a returned value; the buffer is changed so the tab bar appears on screen.
 
-**Call relations**: This is the rendering counterpart to `tab_bar_height`; callers typically use both so measurement and drawing share the same wrapping logic.
+**Call relations**: The bottom pane render flow calls this when it is time to draw. It relies on tab_bar_lines for layout and then hands each produced Line to ratatui’s rendering machinery to write into the buffer.
 
 *Call graph*: calls 1 internal fn (tab_bar_lines); called by 1 (render).
 
@@ -3168,11 +3180,11 @@ fn render_tab_bar(
 fn tab_bar_lines(tabs: &[SelectionTab], active_idx: usize, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Builds the tab bar as one or more styled lines, wrapping only between complete tab units.
+**Purpose**: This function turns the tab list into the actual lines of styled text that make up the tab bar. It is where wrapping happens when the available width is too small for all labels on one row.
 
-**Data flow**: Reads the tab slice, active index, and width. For each tab it builds a span vector with `tab_unit`, measures its width, computes whether a two-space gap is needed, starts a new output line if appending the tab would exceed `max_width`, otherwise appends the gap and spans to the current line, and finally returns the accumulated `Vec<Line<'static>>`.
+**Data flow**: It receives the tabs, the active tab position, and the available width. For each tab, it asks tab_unit to create the styled label pieces, measures how wide that label will be, and either adds it to the current line or starts a new line if it would not fit. It returns a vector of ready-to-render text lines.
 
-**Call relations**: Both `tab_bar_height` and `render_tab_bar` depend on this helper so they stay consistent about wrapping and spacing.
+**Call relations**: Both tab_bar_height and render_tab_bar call this so they agree on the tab bar’s shape. For each individual tab, it calls tab_unit to get the visual form of that tab before deciding where it fits.
 
 *Call graph*: calls 1 internal fn (tab_unit); called by 2 (render_tab_bar, tab_bar_height); 4 external calls (from, new, is_empty, iter).
 
@@ -3183,22 +3195,24 @@ fn tab_bar_lines(tabs: &[SelectionTab], active_idx: usize, width: u16) -> Vec<Li
 fn tab_unit(label: &str, active: bool) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Creates the styled span sequence for a single tab label in active or inactive form.
+**Purpose**: This function creates the styled text pieces for one tab label. It makes the active tab stand out and makes inactive tabs visually quieter.
 
-**Data flow**: Takes a label string and `active` flag. If active, it fetches `accent_style()` and returns spans for `[`, the label, and `]` all in that style; otherwise it returns a single dimmed label span.
+**Data flow**: It receives a label and a true-or-false value saying whether this is the active tab. If active, it applies the accent style to an opening bracket, the label, and a closing bracket. If inactive, it turns the label into dim text. It returns those styled pieces as spans that can later be placed into a line.
 
-**Call relations**: This helper is called by `tab_bar_lines` for each tab before width measurement and line assembly.
+**Call relations**: tab_bar_lines calls this once for each tab while building the full tab strip. When a tab is active, this function also calls accent_style to use the shared highlight style for the application.
 
 *Call graph*: calls 1 internal fn (accent_style); called by 1 (tab_bar_lines); 1 external calls (vec!).
 
 
 ### `tui/src/selection_list.rs`
 
-`util` · `rendering`
+`domain_logic` · `rendering`
 
-This file is a compact rendering helper for menu-like lists. It exposes two constructors that return boxed `dyn Renderable` rows built from the render subsystem’s `RowRenderable`. Each row consists of a fixed-width prefix column and a wrapping label column. The prefix is formatted as either `› N. ` for the selected item or `  N. ` for unselected items, where numbering is one-based even though the API accepts a zero-based `index`.
+This file is a small building block for menus and choice lists in the terminal user interface. When the app needs to show several options, each option needs a number, a clear marker for the currently selected item, and readable text even if the label is long. This file turns that information into a renderable row that the rest of the UI can draw.
 
-`selection_option_row` is the simple entrypoint and always renders non-selected rows at normal intensity. `selection_option_row_with_dim` adds a `dim` flag so callers can intentionally de-emphasize unselected options. Styling is straightforward but concrete: selected rows use `Style::default().cyan()`, dim rows use `Style::default().dim()`, and ordinary rows use the default style. The helper measures the prefix width with `UnicodeWidthStr` so the label column starts at the correct visual offset even with non-ASCII glyphs like `›`. The label itself is rendered with a `Paragraph` configured with `Wrap { trim: false }`, preserving internal spacing and allowing long labels to wrap within the remaining width. The result is converted into a boxed renderable for insertion into larger composed layouts.
+Think of it like printing labels for a paper checklist. The selected row gets a special arrow marker, like “› 2.”, while the others line up with spaces so every label starts in the same place. The selected row is colored cyan so it stands out. A row can also be dimmed, which is useful when an option is visible but should look less important or unavailable.
+
+The file also pays attention to character width. Terminal text can contain characters that take different amounts of screen space, so it measures the prefix before laying out the label. The label itself is placed in a paragraph widget that wraps across lines without trimming whitespace. The result is returned as a general Renderable object, so callers do not need to know the layout details.
 
 #### Function details
 
@@ -3212,11 +3226,11 @@ fn selection_option_row(
 ) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds a standard selection row without dimming unselected entries.
+**Purpose**: Creates a normal selectable-list row without dimming. Callers use this when they only need to show whether an option is selected or not.
 
-**Data flow**: Takes an index, label string, and selection flag, forwards them to `selection_option_row_with_dim` with `dim = false`, and returns the boxed `Renderable` it produces.
+**Data flow**: It receives the option’s position, its text label, and whether it is currently selected. It passes those values onward with dimming turned off, then returns the finished renderable row produced by the more flexible helper.
 
-**Call relations**: Menu and prompt renderers call this when they want the default selected/unselected styling without extra de-emphasis.
+**Call relations**: Menu and reference renderers call this when drawing ordinary selection options. It acts as the simple front door and immediately hands the work to selection_option_row_with_dim so the row-building rules stay in one place.
 
 *Call graph*: calls 1 internal fn (selection_option_row_with_dim); called by 4 (render_ref, render_menu, render_ref, render_ref).
 
@@ -3232,11 +3246,11 @@ fn selection_option_row_with_dim(
 ) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds a numbered row renderable with selected, normal, or dim styling and a wrapping label column.
+**Purpose**: Creates a selectable-list row with full control over its appearance, including whether it is selected and whether it should look dimmed. This is the main row-building function in the file.
 
-**Data flow**: Accepts zero-based `index`, owned `label`, `is_selected`, and `dim`. It formats the prefix string using one-based numbering, chooses a `Style` (`cyan`, `dim`, or default), measures prefix display width, creates a `RowRenderable`, pushes the styled prefix as a fixed-width cell, pushes a `Paragraph::new(label).style(style).wrap(Wrap { trim: false })` as the flexible cell, and returns the row boxed as `dyn Renderable`.
+**Data flow**: It receives an index, label text, a selected flag, and a dim flag. It turns the index into a numbered prefix, adds an arrow if the row is selected, chooses the right style, measures the prefix width, and builds a two-part row: fixed-width prefix first, wrapping label second. It returns that row as a Renderable object ready for the terminal UI to draw.
 
-**Call relations**: This is the underlying implementation used directly by some callers and indirectly through `selection_option_row`.
+**Call relations**: This function is used directly by some renderers when they need dimming control, and indirectly through selection_option_row for the common non-dimmed case. It creates the row layout and hands back a generic renderable object so the caller can place it into the larger screen without caring how the row was assembled.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (render_ref, selection_option_row); 4 external calls (new, default, width, format!).
 
@@ -3246,13 +3260,13 @@ This group gathers small formatting and labeling helpers that convert raw domain
 
 ### `tui/src/chatwidget/warnings.rs`
 
-`util` · `cross-cutting`
+`domain_logic` · `request handling`
 
-This file defines `WarningDisplayState`, a minimal state holder with one `HashSet<String>` tracking model slugs for which the fallback-model-metadata warning has already been shown. The warning text pattern is encoded by two string constants: a fixed prefix and suffix surrounding the model slug. Rather than deduplicating all warnings globally, the logic is intentionally narrow and only special-cases this one noisy warning family.
+In the text user interface, warnings can appear while a chat is running. Some warnings are useful once, but annoying if repeated. This file keeps track of one specific kind: a warning that says the app could not find metadata for a model and is using fallback information instead. That matters because fallback metadata may make the app slower or less reliable, so the user should know — but only once per affected model.
 
-`should_display` delegates parsing to `fallback_model_metadata_warning_slug`. If the message does not match the known fallback-model-metadata pattern, the function returns `true` so unrelated warnings are always shown. If the message does match, it inserts the extracted slug into the set and returns whether that insertion was new. That means the first warning for a given model slug is displayed, while subsequent identical-pattern warnings for the same slug are suppressed. Different slugs are tracked independently.
+The central piece is `WarningDisplayState`, which stores a set of model names, also called slugs, that have already triggered this warning. A set is like a guest list: if a name is already on it, adding it again tells you it was not new.
 
-The helper parser itself is deliberately simple: it strips the known prefix and suffix and returns the substring between them as the slug. This design keeps the deduplication rule transparent and avoids accidental suppression of warnings whose text merely resembles the fallback-model-metadata message.
+When a warning message arrives, `should_display` checks whether it matches the exact expected wording for the fallback metadata warning. If it is some other kind of message, the file says yes, show it. If it is the fallback warning, the file extracts the model slug from inside the message and checks whether that slug has been seen before. New slug means show the warning and remember it. Repeated slug means hide it. This keeps the chat UI informative without becoming noisy.
 
 #### Function details
 
@@ -3262,11 +3276,11 @@ The helper parser itself is deliberately simple: it strips the known prefix and 
 fn should_display(&mut self, message: &str) -> bool
 ```
 
-**Purpose**: Determines whether a warning message should be shown, suppressing duplicate fallback-model-metadata warnings for the same model slug. All other warnings pass through unchanged.
+**Purpose**: Decides whether a warning message should be shown in the chat UI. It always allows ordinary warnings, but suppresses repeated fallback-metadata warnings for the same model.
 
-**Data flow**: Takes `&mut self` and `&str message`, parses an optional slug with `fallback_model_metadata_warning_slug`, and returns true when no slug is found or when inserting the slug into `fallback_model_metadata_slugs` succeeds for the first time. It mutates the slug set only for matching fallback-model-metadata warnings.
+**Data flow**: It receives a warning message and reads the stored set of model slugs that have already produced fallback-metadata warnings. It first asks `fallback_model_metadata_warning_slug` whether the message is that special warning and, if so, what model slug it mentions. If the message is not that kind of warning, it returns `true`; if it is, it adds the slug to the set and returns `true` only when that slug was not already present.
 
-**Call relations**: Called by higher-level warning rendering code before appending warning history cells. It delegates pattern extraction to `fallback_model_metadata_warning_slug`.
+**Call relations**: This is the public decision point for this file’s small warning-filtering behavior. When the chat code wants to know whether to display a warning, it calls this method; the method then delegates the message-shape check to `fallback_model_metadata_warning_slug` before deciding whether to show or suppress the warning.
 
 *Call graph*: calls 1 internal fn (fallback_model_metadata_warning_slug).
 
@@ -3277,24 +3291,26 @@ fn should_display(&mut self, message: &str) -> bool
 fn fallback_model_metadata_warning_slug(message: &str) -> Option<&str>
 ```
 
-**Purpose**: Extracts the model slug from the specific fallback-model-metadata warning format. It returns `None` for any message that does not exactly match the expected prefix and suffix.
+**Purpose**: Checks whether a message is exactly the known fallback-metadata warning and, if it is, pulls out the model slug mentioned inside it. This lets the caller recognize repeated warnings for the same model.
 
-**Data flow**: Takes `&str message`, strips the fixed prefix, then strips the fixed suffix from the remainder, and returns the substring between them as `Option<&str>`. It does not mutate state.
+**Data flow**: It receives the full warning text. It tries to remove the expected beginning text and the expected ending text; if both match, whatever remains in the middle is treated as the model slug and returned. If either the beginning or ending does not match, it returns nothing, meaning the message is not this special warning.
 
-**Call relations**: Used only by `WarningDisplayState::should_display` as the parser that identifies which warnings are eligible for slug-based deduplication.
+**Call relations**: This helper is called by `WarningDisplayState::should_display` whenever a warning needs to be classified. It does not decide whether to show anything itself; it only identifies the special warning format and hands the extracted slug back so the display state can make the final choice.
 
 *Call graph*: called by 1 (should_display).
 
 
 ### `tui/src/external_agent_config_migration_model.rs`
 
-`domain_logic` · `prompt model construction`
+`domain_logic` · `migration UI setup and rendering`
 
-This file contains the presentation-oriented model helpers for migration items. `ExternalAgentConfigMigrationGroupModel` stores a group `label`, a static `description`, and the `item_indices` from the original detection list that belong to that group. The grouping function partitions items into three buckets based on `cwd` presence and `ExternalAgentConfigMigrationItemType`: global tools/setup items (`cwd.is_none()` and not sessions), project items (`cwd.is_some()` and not sessions), and chat sessions (`item_type == Sessions`). Empty buckets are omitted entirely.
+When Codex offers to import settings or history from another agent, it may receive many different things: global setup files, project-specific files, server settings, commands, agents, and recent chat sessions. This file is the small translation layer that makes those items understandable for a person looking at the migration screen.
 
-Group labels are computed from the data rather than hard-coded counts. Project groups count distinct `cwd` values with a `BTreeSet`, yielding either `Current project` or `Projects (N)`. Session groups sum `details.sessions.len()` across all session items and label the group `Chat sessions (N)`. Item labels are a direct mapping from protocol enum variants to migration-specific copy such as `Settings (settings.json -> config.toml)`.
+It first sorts migration items into a few human-sized buckets. Items with no project folder become “Tools & setup.” Items tied to a project folder become either “Current project” or “Projects,” depending on how many project folders are involved. Chat history becomes its own “Chat sessions” group. This is like sorting a moving box into labeled piles before asking someone what they want to keep.
 
-Optional detail strings are generated only for item types where listing names is useful. MCP servers, subagents, hooks, commands, and sessions all use `format_counted_details`, which pluralizes the noun and includes up to four names when available. Plugins and simpler one-off item types intentionally return `None`, keeping the UI concise.
+The file also provides display text for individual items. For example, a settings migration is shown as “Settings (settings.json -> config.toml),” and chat history is shown as “Recent chat sessions.” When extra detail is available, it creates compact summaries such as “3 agents: helper, reviewer, planner.” To avoid overwhelming the screen, it only includes up to four names in the summary.
+
+Without this file, the migration UI would still have the raw data, but it would lack the clear grouping and plain labels that make the import process understandable.
 
 #### Function details
 
@@ -3306,11 +3322,11 @@ fn external_agent_config_migration_groups(
 ) -> Vec<ExternalAgentConfigMigrationGroupModel>
 ```
 
-**Purpose**: Partitions detected migration items into user-facing groups for tools/setup, projects, and chat sessions. It also computes count-sensitive group labels and descriptions.
+**Purpose**: Builds the visible groups used by the migration screen, such as tools, projects, and chat sessions. It gives the UI a clean structure so users can review related migration items together.
 
-**Data flow**: It takes a slice of `ExternalAgentConfigMigrationItem`, iterates with indices three times to collect matching item indexes into `tools_and_setup`, `projects`, and `chat_sessions`, then builds a `Vec<ExternalAgentConfigMigrationGroupModel>` containing only non-empty groups. For projects it reads `item.cwd` values to count distinct directories via `BTreeSet`; for sessions it reads `item.details.sessions.len()` and sums them. It returns the assembled group vector without mutating external state.
+**Data flow**: It receives a list of migration items. It scans the list and remembers the positions of items that belong to global tools and setup, project-specific files, or chat sessions. It then creates group objects with a label, a short explanation, and the item positions that belong in that group. The result is a list of groups ready for the UI to display.
 
-**Call relations**: This helper is called from the migration screen/model construction path when the UI needs grouped rows rather than a flat item list. It feeds later rendering code by preserving original item indexes inside each group.
+**Call relations**: This function is called during construction by `new`, when the migration view or model is being prepared. It does not move or change the migration items themselves; it hands back an organized map of which item indices belong under each heading.
 
 *Call graph*: called by 1 (new); 3 external calls (new, iter, format!).
 
@@ -3323,11 +3339,11 @@ fn external_agent_config_migration_item_label(
 ) -> &'static str
 ```
 
-**Purpose**: Maps each migration item type to the exact short label shown in the UI. The labels include migration-specific rename hints where relevant.
+**Purpose**: Returns the short, user-facing name for one migration item. It turns internal item types into labels a person can recognize on the migration screen.
 
-**Data flow**: It takes a single `ExternalAgentConfigMigrationItem`, matches on `item.item_type`, and returns a static string literal such as `Instructions (CLAUDE.md -> AGENTS.md)` or `Recent chat sessions`. It reads only the enum variant and has no side effects.
+**Data flow**: It receives one migration item and looks at its item type. Based on that type, it returns a fixed label such as “Skills,” “MCP servers,” or “Recent chat sessions.” It does not change the item or allocate a custom string; it returns one of the built-in label texts.
 
-**Call relations**: This is a pure lookup helper used by higher-level render-line builders when they need a stable display name for an item.
+**Call relations**: This is a lookup helper for display code. The provided call graph does not show a specific caller, but its role is to supply the label text whenever the UI needs to name an individual migration item.
 
 
 ##### `external_agent_config_migration_item_detail`  (lines 94–135)
@@ -3338,11 +3354,11 @@ fn external_agent_config_migration_item_detail(
 ) -> Option<String>
 ```
 
-**Purpose**: Builds optional secondary detail text for migration items that contain named sub-entities, such as MCP servers or chat sessions. It suppresses details for item types where extra text would be redundant or noisy.
+**Purpose**: Creates an optional extra detail line for migration items that have countable contents, such as agents, hooks, commands, servers, or chat sessions. It keeps the UI informative without making every item verbose.
 
-**Data flow**: It takes an `ExternalAgentConfigMigrationItem`, first reads `item.details.as_ref()?` and returns `None` immediately if details are absent. It then matches on `item.item_type`: for MCP servers, subagents, hooks, commands, and sessions it passes the appropriate noun, count, and iterator of names/titles into `format_counted_details`; for plugins, agents markdown, config, and skills it returns `None`. The result is `Option<String>` with no external writes.
+**Data flow**: It receives one migration item and first checks whether that item includes detailed information. If there are no details, it returns nothing. For item types with useful lists, it counts the entries and collects their names or titles, then asks `format_counted_details` to turn that into a compact sentence. For item types where extra detail is not useful, it returns nothing.
 
-**Call relations**: This function is called by `build_customize_render_lines`, where item rows need optional descriptive subtext. It delegates the common count-plus-name formatting pattern to `format_counted_details`.
+**Call relations**: This function is called by `build_customize_render_lines` while the customization screen is being drawn. It delegates the repeated wording pattern to `format_counted_details`, so the render code can simply receive either a ready-to-show detail string or no detail at all.
 
 *Call graph*: calls 1 internal fn (format_counted_details); called by 1 (build_customize_render_lines).
 
@@ -3357,20 +3373,26 @@ fn format_counted_details(
 ) -> String
 ```
 
-**Purpose**: Formats a count summary with optional example names, producing strings like `3 hooks: a, b, c`. It limits the listed names to the first four entries.
+**Purpose**: Formats a count and a few names into a short readable summary. It is the shared wording helper behind detail lines like “2 hooks: lint, test.”
 
-**Data flow**: It accepts a singular noun, a numeric count, and an iterator of names. It computes a plural suffix from `count`, collects up to four names with `take(4)`, and returns either `"{count} {noun}{suffix}"` when no names are present or `"{count} {noun}{suffix}: ..."` when names exist. It is pure and returns a `String`.
+**Data flow**: It receives a noun, a count, and an iterator of names. It chooses the singular or plural form based on the count, takes up to four names, and then builds the final text. If there are no names, it returns only the count and noun, such as “3 agents.” If names are present, it appends them after a colon.
 
-**Call relations**: This helper is used exclusively by `external_agent_config_migration_item_detail` to keep all count/detail formatting consistent across item types.
+**Call relations**: This helper is called by `external_agent_config_migration_item_detail` for each item type that needs a counted summary. It does the final text formatting so the higher-level function can focus on choosing which list of details to summarize.
 
 *Call graph*: called by 1 (external_agent_config_migration_item_detail); 3 external calls (is_empty, take, format!).
 
 
 ### `tui/src/goal_display.rs`
 
-`util` · `request handling`
+`domain_logic` · `during TUI goal display and goal status updates`
 
-This file is a small presentation helper layer around `codex_app_server_protocol::ThreadGoal` and `ThreadGoalStatus`. It defines the `/goal` command usage string and three formatting helpers that normalize protocol data into concise text. `format_goal_elapsed_seconds` is the core duration formatter: it clamps negative input to zero, then emits seconds under a minute, minutes under an hour, hours with optional remaining minutes under a day, and day/hour/minute triples for multi-day durations. The output is intentionally compact rather than sentence-like, which matters because these strings are embedded in narrow status areas. `goal_status_label` maps each `ThreadGoalStatus` enum variant to the exact lowercase phrase shown to users, including special wording for usage and budget limits. `goal_usage_summary` assembles a sentence-like summary from a `ThreadGoal`, always including the objective and conditionally appending time and token usage only when those values are meaningful. Token counts are delegated to `format_tokens_compact`, so large values render as abbreviated quantities like `63.9K`. The tests lock down the compact formatting boundaries—59s vs 1m, exact-hour suppression of `0m`, and day formatting—as well as the combined summary string for a budget-limited goal.
+This file is a small presentation layer for the TUI, the text-based user interface. Its job is to make goal information understandable at a glance. A “goal” here is an objective attached to a conversation thread, such as completing a task over time. Without this file, other parts of the interface would either show raw numbers like seconds and token counts, or each screen would have to invent its own wording.
+
+The file provides a usage string for the `/goal` command, so the UI can tell users how to use it. It also converts elapsed seconds into compact human labels such as `59s`, `30m`, `1h 30m`, or `2d 23h 42m`. This is like changing a stopwatch reading into the kind of shorthand people expect on a dashboard.
+
+It also maps internal goal states, such as paused or budget-limited, into plain labels. Finally, it builds a one-line summary that includes the goal objective, time used when present, and token use when a token budget exists. Tokens are pieces of text counted by the model; showing them helps users understand spending or limits.
+
+The tests in this file protect the display wording, especially the compact time format and budget summary text.
 
 #### Function details
 
@@ -3380,11 +3402,11 @@ This file is a small presentation helper layer around `codex_app_server_protocol
 fn format_goal_elapsed_seconds(seconds: i64) -> String
 ```
 
-**Purpose**: Formats an elapsed-second count into a compact duration string such as `59s`, `30m`, `2h`, or `2d 23h 42m`. It deliberately suppresses unnecessary units except in the multi-day case, where days, hours, and minutes are always shown together.
+**Purpose**: Turns a number of elapsed seconds into a short label that is easy to read in the terminal. It is used when the UI needs to show how long a goal has been running or how long it took.
 
-**Data flow**: Takes an `i64` second count, clamps it to a non-negative value, converts to `u64`, then branches by magnitude: under 60 returns seconds, under 60 minutes returns minutes, under 24 hours returns hours with optional remaining minutes, and 24 hours or more returns days plus remaining hours and minutes. It returns a newly allocated `String` and does not mutate external state.
+**Data flow**: It receives a signed number of seconds. If the number is negative, it treats it as zero, then chooses the largest useful unit: seconds, minutes, hours, or days. It returns a string such as `0s`, `1m`, `2h`, or `1d 0h 0m`; it does not change any outside data.
 
-**Call relations**: This helper is used by higher-level goal usage renderers when they need a compact elapsed-time fragment. It is called from active and completed goal usage displays so those callers can embed a stable, width-conscious duration string without duplicating threshold logic.
+**Call relations**: When goal information is shown elsewhere, `active_goal_usage` and `completed_goal_usage` call this function to turn raw time into a user-friendly label. This function does the time wording and hands the finished text back to those display builders.
 
 *Call graph*: called by 2 (active_goal_usage, completed_goal_usage); 1 external calls (format!).
 
@@ -3395,11 +3417,11 @@ fn format_goal_elapsed_seconds(seconds: i64) -> String
 fn goal_status_label(status: ThreadGoalStatus) -> &'static str
 ```
 
-**Purpose**: Maps a `ThreadGoalStatus` enum value to the exact human-readable label shown in the TUI. The mapping is fixed and intentionally lowercase except for phrase wording.
+**Purpose**: Converts a goal's internal status value into a short phrase a person can read. For example, it turns the program's `UsageLimited` state into `usage limited`.
 
-**Data flow**: Consumes a `ThreadGoalStatus` by value, matches each variant, and returns a `'static` string slice such as `active`, `paused`, `usage limited`, or `limited by budget`. It performs no allocation and writes no state.
+**Data flow**: It receives a `ThreadGoalStatus`, which is the program's fixed set of possible goal states. It matches that state to a plain text label and returns that label. It does not read or modify anything else.
 
-**Call relations**: This is a pure label lookup used wherever goal status text must be rendered consistently. It sits at the presentation boundary between protocol enums and user-visible wording.
+**Call relations**: This is a simple translation helper for any UI code that needs to show a goal's state. It sits between the protocol-level status value and the human-facing terminal text.
 
 
 ##### `goal_usage_summary`  (lines 44–60)
@@ -3408,11 +3430,11 @@ fn goal_status_label(status: ThreadGoalStatus) -> &'static str
 fn goal_usage_summary(goal: &ThreadGoal) -> String
 ```
 
-**Purpose**: Builds a one-line summary of a goal’s objective and any recorded time or token consumption. It omits empty usage sections so the result stays concise when a goal has not yet consumed resources.
+**Purpose**: Builds a compact one-line summary of a goal, including its objective, elapsed time when available, and token usage when a budget exists. It gives the rest of the TUI a ready-made sentence instead of forcing each caller to assemble the pieces itself.
 
-**Data flow**: Reads a borrowed `&ThreadGoal`, starts a `Vec<String>` with `Objective: ...`, conditionally appends a `Time: ...` sentence when `time_used_seconds > 0`, and conditionally appends a `Tokens: used/budget.` sentence when `token_budget` is `Some`. It formats elapsed time via `format_goal_elapsed_seconds` and token counts via `format_tokens_compact`, then joins the parts with spaces into a single `String`.
+**Data flow**: It receives a `ThreadGoal`, which contains the goal objective, time used, token budget, and token count. It starts with the objective, adds formatted time if time is greater than zero, and adds formatted token use if there is a token budget. It returns one combined string and leaves the goal unchanged.
 
-**Call relations**: This summary is used during goal draft and status updates so callers can show the current objective plus resource usage in one compact message. It centralizes the conditional inclusion rules so both draft-setting and status-setting flows present the same wording.
+**Call relations**: `set_thread_goal_draft` and `set_thread_goal_status` call this function when the interface needs to show updated goal information. This function gathers the important fields, uses compact formatting for time and token counts, and gives those callers a finished summary to display.
 
 *Call graph*: called by 2 (set_thread_goal_draft, set_thread_goal_status); 2 external calls (format!, vec!).
 
@@ -3423,11 +3445,11 @@ fn goal_usage_summary(goal: &ThreadGoal) -> String
 fn format_goal_elapsed_seconds_is_compact()
 ```
 
-**Purpose**: Verifies the duration formatter’s boundary behavior and compact output choices across seconds, minutes, hours, and days. The assertions document the intended user-visible format.
+**Purpose**: Checks that elapsed time is displayed in the compact forms users expect. It protects against accidental changes such as showing `60s` instead of `1m`.
 
-**Data flow**: Calls `format_goal_elapsed_seconds` with representative values including exact thresholds and near-threshold cases, then compares each returned `String` to the expected literal with `assert_eq!`. It only reads local test constants and produces no side effects beyond test pass/fail.
+**Data flow**: It feeds several example second counts into `format_goal_elapsed_seconds`, including seconds, minutes, hours, and days. For each example, it compares the returned text with the exact expected string. The test succeeds only if every formatted result matches.
 
-**Call relations**: This test exercises the main formatting helper directly to prevent regressions in status-line text. It is run in the test suite rather than production flow.
+**Call relations**: This test exercises `format_goal_elapsed_seconds` directly. It acts as a safety net for the display code used by goal usage screens.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3438,11 +3460,11 @@ fn format_goal_elapsed_seconds_is_compact()
 fn test_thread_goal(token_budget: Option<i64>, tokens_used: i64) -> ThreadGoal
 ```
 
-**Purpose**: Constructs a reusable `ThreadGoal` fixture with a long objective and configurable token budget fields. It keeps the summary-formatting test focused on output rather than setup noise.
+**Purpose**: Creates a sample goal object for the tests in this file. It avoids repeating the same setup every time a test needs a realistic goal.
 
-**Data flow**: Accepts `token_budget: Option<i64>` and `tokens_used: i64`, fills a `ThreadGoal` struct with fixed `thread_id`, `objective`, `status`, `time_used_seconds`, and timestamps, and returns the populated value. It does not touch external state.
+**Data flow**: It receives an optional token budget and a token-used count. It combines those values with fixed sample data, such as a thread id, objective, status, and time used, then returns a complete `ThreadGoal` for testing.
 
-**Call relations**: This helper is only used by the summary-formatting test to supply realistic protocol data with controlled token values.
+**Call relations**: The summary-formatting test calls this helper to build a goal with known values. The helper keeps the test focused on the output text rather than on constructing the whole test object by hand.
 
 
 ##### `tests::goal_usage_summary_formats_time_and_budgeted_tokens`  (lines 102–110)
@@ -3451,22 +3473,26 @@ fn test_thread_goal(token_budget: Option<i64>, tokens_used: i64) -> ThreadGoal
 fn goal_usage_summary_formats_time_and_budgeted_tokens()
 ```
 
-**Purpose**: Checks that `goal_usage_summary` includes the objective, compact time, and compact token usage with the expected punctuation. It specifically covers the budgeted-token branch.
+**Purpose**: Checks that a goal summary includes the objective, formatted elapsed time, and compact token usage when a token budget is set. It makes sure the final sentence shown to users stays stable.
 
-**Data flow**: Builds a fixture `ThreadGoal` via `test_thread_goal`, passes it to `goal_usage_summary`, and asserts that the returned `String` exactly matches the expected sentence. It has no side effects outside test evaluation.
+**Data flow**: It creates a sample goal with a token budget and a token count, sends that goal into `goal_usage_summary`, and compares the returned sentence with the expected text. The test does not change external state.
 
-**Call relations**: This test validates the integration of objective text, elapsed-time formatting, and compact token formatting in the summary helper.
+**Call relations**: This test uses `tests::test_thread_goal` to prepare the input and then verifies `goal_usage_summary`. It protects the path used when `set_thread_goal_draft` and `set_thread_goal_status` need a readable usage summary.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `tui/src/skills_helpers.rs`
 
-`util` · `request handling and popup rendering for skill selection`
+`util` · `request handling`
 
-This file contains focused utility functions for turning `codex_core_skills::model::SkillMetadata` into user-facing text and for matching skills against a typed filter. The helpers encode several display conventions that would otherwise be duplicated across widgets. `skill_display_name` prefers an explicit interface-level `display_name`; if absent, it recognizes names in `plugin:skill` form and rewrites them as `skill (plugin)` for readability; otherwise it falls back to the raw `skill.name`. `skill_description` similarly prefers the interface’s `short_description`, then the top-level `short_description`, and finally the full `description`.
+A “skill” here is a capability described by metadata: it has an internal name, and may also have nicer text meant for people. This file is the adapter between that raw metadata and the terminal user interface. Without it, the UI would either show awkward internal names, repeat formatting rules in several places, or search skills in a less helpful way.
 
-For constrained layouts, `truncate_skill_name` applies a shared maximum width constant (`SKILL_NAME_TRUNCATE_LEN = 21`) through the generic `truncate_text` formatter. Filtering is handled by `match_skill`, which first fuzzy-matches the user’s filter against the display name and returns both highlight indices and score when that succeeds. If the display name differs from the canonical skill name, it performs a second fuzzy match against the canonical name; in that fallback case it returns only the score and suppresses indices because the visible text does not correspond to the matched string. This distinction lets callers rank hidden-name matches without drawing misleading highlight positions.
+The first job is choosing what name to show. If a skill provides a dedicated display name, that wins. If not, and the internal name looks like it came from a plugin, such as `plugin:skill`, the helper turns it into a clearer label like `skill (plugin)`. Otherwise it simply uses the stored name.
+
+The second job is choosing a short description. It prefers the interface-specific short description, then the skill’s own short description, and finally falls back to the full description so the UI always has something to show.
+
+The file also keeps skill names from taking too much horizontal space by truncating them to a shared limit. Finally, it supports filtering: when the user types a search string, it first tries to match against the display name, and only falls back to the internal skill name if that is different. Think of it like a shop directory: search the label on the shelf first, then the stockroom code only if needed.
 
 #### Function details
 
@@ -3476,11 +3502,11 @@ For constrained layouts, `truncate_skill_name` applies a shared maximum width co
 fn skill_display_name(skill: &SkillMetadata) -> String
 ```
 
-**Purpose**: Computes the user-visible name for a skill, preferring explicit interface metadata and otherwise prettifying plugin-qualified names. It ensures popup lists show concise, readable labels instead of raw internal identifiers when possible.
+**Purpose**: Chooses the best human-readable name for a skill. It helps the terminal UI avoid showing raw internal identifiers when a clearer display name or plugin-aware label is available.
 
-**Data flow**: Takes `&SkillMetadata`, reads `skill.interface.display_name`, then `skill.name`. If an interface display name exists, it returns that as an owned `String`. Otherwise it checks whether `skill.name` splits into non-empty `plugin_name` and `skill_name` around `:`, formats `"{skill_name} ({plugin_name})"` when it does, and falls back to cloning `skill.name`.
+**Data flow**: It receives one skill’s metadata. It first looks for an explicit display name in the skill’s interface information. If that is missing, it checks whether the internal name is shaped like `plugin:skill` and rewrites it as `skill (plugin)`. If neither special case applies, it returns the original skill name as a new string.
 
-**Call relations**: This helper is used by `mention_items` and `skill_candidate` while constructing visible skill entries. It performs all naming decisions locally and does not delegate to other project code beyond standard formatting.
+**Call relations**: When the UI is building mention items or a skill candidate, it calls this function to get the label users will actually see. This function does the naming decision locally and only uses string formatting when it needs to turn a plugin-qualified name into a friendlier label.
 
 *Call graph*: called by 2 (mention_items, skill_candidate); 1 external calls (format!).
 
@@ -3491,11 +3517,11 @@ fn skill_display_name(skill: &SkillMetadata) -> String
 fn skill_description(skill: &SkillMetadata) -> &str
 ```
 
-**Purpose**: Selects the best short description text to show for a skill, preferring interface-specific metadata over broader fallback fields. It returns a borrowed string slice rather than allocating.
+**Purpose**: Picks the most suitable short explanation for a skill. It makes sure the UI can show a concise description when one exists, while still falling back to the full description if that is all the metadata provides.
 
-**Data flow**: Takes `&SkillMetadata`, reads `skill.interface.short_description`, then `skill.short_description`, then `skill.description`. It returns `&str` pointing into the chosen field and does not mutate any state.
+**Data flow**: It receives one skill’s metadata and reads description fields in priority order: interface short description, then skill short description, then the full description. It returns a borrowed text slice pointing to whichever description was chosen, without making a new copy.
 
-**Call relations**: This function is called by `optional_skill_description` when a UI surface wants explanatory text for a skill. It is a pure selector with no downstream delegation.
+**Call relations**: The optional skill description display asks this function for the text to show. This keeps the fallback rules in one place, so callers do not need to know all the possible metadata fields.
 
 *Call graph*: called by 1 (optional_skill_description).
 
@@ -3506,11 +3532,11 @@ fn skill_description(skill: &SkillMetadata) -> &str
 fn truncate_skill_name(name: &str) -> String
 ```
 
-**Purpose**: Applies the shared skill-name truncation policy used in narrow UI layouts. It centralizes the fixed maximum length so callers stay consistent.
+**Purpose**: Shortens a skill name to the UI’s standard maximum length. This prevents long names from crowding or breaking terminal layouts.
 
-**Data flow**: Takes `&str` name, passes it with `SKILL_NAME_TRUNCATE_LEN` to `truncate_text`, and returns the resulting `String`. It reads only the module constant and writes no state.
+**Data flow**: It receives a name as text and passes it, along with the fixed skill-name length limit, to the shared text truncation helper. It returns the shortened string, or an unchanged equivalent if the name already fits.
 
-**Call relations**: This helper is a leaf wrapper around `truncate_text`. It exists so skill-related callers can use a domain-specific truncation rule without repeating the constant.
+**Call relations**: This function is the skill-specific wrapper around the general text-shortening routine. Other UI code can call it when it needs a name that fits the expected skill-name column or label space.
 
 *Call graph*: calls 1 internal fn (truncate_text).
 
@@ -3525,22 +3551,24 @@ fn match_skill(
 ) -> Option<(Option<Vec<usize>>, i32)>
 ```
 
-**Purpose**: Fuzzy-matches a typed filter against both the visible display name and the canonical skill name, returning ranking information and optional highlight indices. It prefers display-name matches so highlighting aligns with what the user sees.
+**Purpose**: Checks whether a user’s filter text matches a skill, and returns information useful for ranking and highlighting the match. It favors matching the visible display name, but can still find a skill by its internal name.
 
-**Data flow**: Takes `filter`, `display_name`, and `skill_name` as `&str`. It first calls `fuzzy_match(display_name, filter)` and, on success, returns `Some((Some(indices), score))`. If that fails and `display_name != skill_name`, it tries `fuzzy_match(skill_name, filter)` and returns `Some((None, score))` so callers can rank the item without using mismatched highlight positions. If neither match succeeds, it returns `None`.
+**Data flow**: It receives the filter typed by the user, the display name shown in the UI, and the internal skill name. It first runs fuzzy matching on the display name; fuzzy matching means the typed letters can match in order even if they are not next to each other. If that works, it returns the matched character positions and a score. If not, and the display name is different from the internal name, it tries the internal name and returns only the score, with no display-name highlight positions. If neither matches, it returns nothing.
 
-**Call relations**: This function is called by `apply_filter` during skill list filtering. It delegates matching to the shared fuzzy matcher and encodes the two-stage search policy that distinguishes visible-text matches from hidden canonical-name matches.
+**Call relations**: When filtering a list of skills, the filtering code calls this function for each candidate. This helper delegates the actual fuzzy matching to the shared fuzzy-match library, then shapes the result so the caller knows both how strong the match is and whether the visible name can be highlighted.
 
 *Call graph*: called by 1 (apply_filter); 1 external calls (fuzzy_match).
 
 
 ### `tui/src/status/format.rs`
 
-`util` · `cross-cutting during status-card layout and rendering`
+`util` · `status rendering`
 
-This file contains the reusable formatting primitives that the status-card renderer relies on to produce aligned, width-aware terminal output. The central type, `FieldFormatter`, computes a consistent label column from a set of candidate labels using Unicode display widths rather than byte counts, then exposes helpers to build full field lines and continuation lines. Its internal `value_offset` and precomputed `value_indent` ensure wrapped or follow-on lines begin exactly under the value column, regardless of label length.
+The status screen shows many small facts, such as labels on the left and values on the right. This file is the measuring tape and spacing guide for that display. Without it, rows with different label lengths would look uneven, continuation lines would not line up, and text could be cut in the middle in a way that breaks terminal layout.
 
-`from_labels` scans all labels to determine the widest one and derives the spacing budget from the fixed indent plus `":   "` separator. `line` and `full_spans` prepend a dimmed label span to caller-supplied value spans, while `continuation` emits a dimmed indentation span followed by continuation content. Outside the struct, `push_label` maintains an insertion-ordered unique label list backed by a `BTreeSet`, which lets renderers gather optional fields before computing alignment. `line_display_width` sums Unicode widths across spans for layout decisions. `truncate_line_to_width` performs style-preserving truncation at display-column boundaries: it walks spans in order, keeps zero-width spans, stops once the maximum width is reached, and if a span must be cut mid-string it truncates by Unicode scalar width rather than bytes. That behavior is important for terminal correctness with wide characters and mixed styling.
+The main piece is FieldFormatter. It first looks at all labels that may appear, finds the widest one, and uses that width to decide where every value should begin. Think of it like setting a tab stop on a typewriter: once the stop is chosen, every row can line up neatly. It also creates dimmed label spans, meaning the label text is styled to look less prominent than the value.
+
+The file also includes helpers for collecting unique labels, measuring the visible width of a rendered line, and trimming a line so it fits inside a given terminal width. The width logic uses Unicode-aware measurement, because some characters take more than one terminal column and some take none. That matters for names, symbols, and non-English text: the code counts what the user actually sees, not just how many bytes or characters are in the string.
 
 #### Function details
 
@@ -3550,11 +3578,11 @@ This file contains the reusable formatting primitives that the status-card rende
 fn from_labels(labels: impl IntoIterator<Item = S>) -> Self
 ```
 
-**Purpose**: Constructs a formatter whose label column is wide enough for the longest provided label. It precomputes the indentation and value offset used by all later field rendering.
+**Purpose**: Builds a formatter that knows how much space to reserve for labels. Someone uses this before drawing rows so all values start in the same column.
 
-**Data flow**: Takes any iterable of label-like values, converts each to `&str`, measures Unicode display width, finds the maximum, computes indent width from `Self::INDENT`, derives `value_offset = indent + label_width + 1 + 3`, builds a matching `value_indent` string of spaces, and returns `FieldFormatter`.
+**Data flow**: It receives a collection of label strings. It measures each label by its visible terminal width, finds the widest one, combines that with the fixed indent and spacing, and returns a FieldFormatter containing the calculated offsets and indentation string.
 
-**Call relations**: This constructor is called by `display_lines` after all possible labels have been collected. It provides the alignment parameters consumed by `line`, `continuation`, `value_width`, and `full_spans`.
+**Call relations**: The status display setup calls this from display_lines after it has gathered the labels it may need to show. The returned formatter is then used by later row-building code to make the status text line up consistently.
 
 *Call graph*: called by 1 (display_lines); 2 external calls (into_iter, width).
 
@@ -3569,11 +3597,11 @@ fn line(
     ) -> Line<'static>
 ```
 
-**Purpose**: Builds a complete formatted field line from a label and already-prepared value spans. It is the common one-call path for aligned status rows.
+**Purpose**: Creates one complete status line from a label and already-prepared value text. It is used when a row can be shown as a single line.
 
-**Data flow**: Takes `&self`, a static label, and a `Vec<Span<'static>>` for the value. It calls `self.full_spans(label, value_spans)`, wraps the result in `Line::from`, and returns the `Line<'static>`.
+**Data flow**: It takes a label and a list of styled value spans. It asks full_spans to add the correctly padded label span in front, then turns the combined spans into a terminal Line that can be drawn.
 
-**Call relations**: This helper is used by `rate_limit_lines` and other status rendering code whenever a single aligned row is needed. It delegates the actual span assembly to `full_spans`.
+**Call relations**: rate_limit_lines calls this when building rate-limit status output. Internally it relies on full_spans, which does the actual joining of label and value pieces.
 
 *Call graph*: calls 1 internal fn (full_spans); called by 1 (rate_limit_lines); 1 external calls (from).
 
@@ -3584,11 +3612,11 @@ fn line(
 fn continuation(&self, mut spans: Vec<Span<'static>>) -> Line<'static>
 ```
 
-**Purpose**: Formats a continuation line that aligns under the value column rather than repeating the label. It is used for wrapped reset timestamps, details, and other multi-line values.
+**Purpose**: Creates an extra line for a value that continues below the first row. The continuation starts under the value column instead of under the label.
 
-**Data flow**: Takes `&self` and mutable value spans, allocates a new span vector with capacity for one extra span, prepends a dimmed span containing `self.value_indent.clone()`, appends the provided spans, wraps them in `Line::from`, and returns the line.
+**Data flow**: It receives styled spans for the continued text. It creates a dimmed leading blank span using the formatter's saved value indentation, appends the continued text after it, and returns a Line ready for display.
 
-**Call relations**: This helper is used by status rendering code when a field's value wraps onto additional lines. It depends on the offsets computed by `from_labels`.
+**Call relations**: This helper is available for multi-line status output. It fits into the same alignment scheme as normal rows by reusing the formatter's calculated value indentation.
 
 *Call graph*: 3 external calls (from, from, with_capacity).
 
@@ -3599,11 +3627,11 @@ fn continuation(&self, mut spans: Vec<Span<'static>>) -> Line<'static>
 fn value_width(&self, available_inner_width: usize) -> usize
 ```
 
-**Purpose**: Computes how many display columns remain for a field's value inside a given inner width after accounting for indent and label column. This is the width budget used for wrapping and truncation decisions.
+**Purpose**: Calculates how much horizontal room is left for the value part of a row. This helps callers decide when text must be wrapped or shortened.
 
-**Data flow**: Takes `&self` and `available_inner_width`, subtracts `self.value_offset` with saturation, and returns the resulting `usize`. It reads formatter state and writes nothing.
+**Data flow**: It receives the available inner width of the status area. It subtracts the formatter's value starting offset, using safe subtraction so the answer becomes zero instead of underflowing if the screen is too narrow.
 
-**Call relations**: This method is called by `rate_limit_row_lines` and other layout code to decide whether content fits inline or needs wrapping.
+**Call relations**: rate_limit_row_lines calls this while laying out rate-limit rows. The result tells that code how much space the value text has after the label and spacing are accounted for.
 
 *Call graph*: called by 1 (rate_limit_row_lines).
 
@@ -3618,11 +3646,11 @@ fn full_spans(
     ) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Prepends the formatted label span to a value span list without wrapping it into a `Line`. It is useful when callers need to inspect or extend the combined spans before final line creation.
+**Purpose**: Combines a formatted label with the styled value spans for a row. It is the shared helper behind both simple line creation and more custom row layout.
 
-**Data flow**: Takes `&self`, a label string, and mutable value spans. It allocates a vector with room for the label plus values, pushes `self.label_span(label)`, appends the value spans, and returns the combined `Vec<Span<'static>>`.
+**Data flow**: It receives a label and value spans. It creates the label span with label_span, places it first, appends the value spans after it, and returns the full list of spans.
 
-**Call relations**: This helper is used by both `FieldFormatter::line` and `rate_limit_row_lines`. It delegates label formatting to `label_span`.
+**Call relations**: FieldFormatter::line calls this for ordinary rows, and rate_limit_row_lines calls it when it needs the span list directly. It hands label creation off to label_span so spacing stays consistent in one place.
 
 *Call graph*: calls 1 internal fn (label_span); called by 2 (rate_limit_row_lines, line); 1 external calls (with_capacity).
 
@@ -3633,11 +3661,11 @@ fn full_spans(
 fn label_span(&self, label: &str) -> Span<'static>
 ```
 
-**Purpose**: Formats the dimmed label prefix for a field, including indent, colon, and padding up to the shared value column. It ensures all values start in the same column regardless of label length.
+**Purpose**: Builds the left-hand label text with the right amount of padding after it. This is what makes labels such as “id:” and “requests:” still leave values aligned.
 
-**Data flow**: Takes `&self` and a label string, allocates a `String` sized to `self.value_offset`, appends the indent, label, colon, and enough spaces to reach the configured width based on Unicode display width, converts it to a dimmed `Span<'static>`, and returns it.
+**Data flow**: It receives a label string. It starts with the formatter's indent, adds the label and a colon, measures the label's visible width, adds enough spaces to match the widest known label plus fixed spacing, and returns the whole label area as a dimmed styled span.
 
-**Call relations**: This private helper is called by `full_spans` whenever a field line or inline span set is built. It encapsulates the exact label-column formatting policy.
+**Call relations**: full_spans calls this whenever it needs the label part of a status row. The rest of the file depends on this function for the exact spacing convention used in the status display.
 
 *Call graph*: called by 1 (full_spans); 3 external calls (from, with_capacity, width).
 
@@ -3648,11 +3676,11 @@ fn label_span(&self, label: &str) -> Span<'static>
 fn push_label(labels: &mut Vec<String>, seen: &mut BTreeSet<String>, label: &str)
 ```
 
-**Purpose**: Adds a label to an ordered label list only if it has not already been seen. This lets renderers gather optional fields while preserving first-seen order and avoiding duplicates.
+**Purpose**: Adds a label to a list only if it has not already been added. This lets the formatter calculate widths from a clean set of labels without duplicates.
 
-**Data flow**: Takes mutable `labels: Vec<String>`, mutable `seen: BTreeSet<String>`, and `&str` label. It checks `seen.contains(label)` and returns early if present; otherwise it allocates `label.to_string()`, inserts a clone into `seen`, pushes the owned string into `labels`, and returns `()`.
+**Data flow**: It receives a mutable label list, a mutable set of labels already seen, and a label string. If the label is already in the set, it changes nothing. Otherwise it copies the label, records it in the set, and appends it to the label list.
 
-**Call relations**: This helper is called by `collect_rate_limit_labels` and `display_lines` while assembling the complete label set before formatter construction.
+**Call relations**: collect_rate_limit_labels and display_lines call this while gathering labels for the status output. Its job is to keep that gathering step tidy before FieldFormatter::from_labels measures the final label collection.
 
 *Call graph*: called by 2 (collect_rate_limit_labels, display_lines); 2 external calls (contains, insert).
 
@@ -3663,11 +3691,11 @@ fn push_label(labels: &mut Vec<String>, seen: &mut BTreeSet<String>, label: &str
 fn line_display_width(line: &Line<'static>) -> usize
 ```
 
-**Purpose**: Measures the total Unicode display width of a rendered line by summing the widths of all span contents. It is used for fit checks that must respect terminal column width rather than byte length.
+**Purpose**: Measures how wide a rendered line will appear in the terminal. This is different from counting characters because some Unicode characters take extra space or no space.
 
-**Data flow**: Takes `&Line<'static>`, iterates its spans, measures each span's content with `UnicodeWidthStr::width`, sums the widths, and returns the total `usize`. It reads only the line contents.
+**Data flow**: It receives a Line made of styled spans. It walks through each span, measures the visible width of that span's text, adds the widths together, and returns the total display width.
 
-**Call relations**: This helper is used by `rate_limit_row_lines` to decide whether progress bars and reset timestamps fit inline or need to be simplified/wrapped.
+**Call relations**: rate_limit_row_lines calls this while deciding how a row fits in the available space. It supplies the practical, on-screen width needed before wrapping or truncating text.
 
 *Call graph*: called by 1 (rate_limit_row_lines); 1 external calls (iter).
 
@@ -3678,22 +3706,26 @@ fn line_display_width(line: &Line<'static>) -> usize
 fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static>
 ```
 
-**Purpose**: Truncates a styled line to a maximum display width while preserving span styles and respecting Unicode character widths. It avoids splitting by bytes and keeps zero-width spans intact.
+**Purpose**: Cuts a styled terminal line down so it fits within a maximum visible width. It preserves styling on the kept text and avoids splitting based on raw byte length.
 
-**Data flow**: Takes ownership of a `Line<'static>` and a `max_width`. If `max_width` is zero it returns an empty line. Otherwise it walks the input spans in order, converting each span's content to owned text and measuring its display width. Zero-width spans are copied through unchanged. Fully fitting spans are copied whole and advance the used-width counter. For the first partially fitting span, it builds a truncated string character by character using `UnicodeWidthChar::width`, pushes the styled truncated span if non-empty, then stops. It returns a new `Line<'static>` containing the retained spans.
+**Data flow**: It receives a Line and a maximum width. If the width is zero, it returns an empty line. Otherwise it walks through the line's spans in order, keeping whole spans that fit. When a span would be too wide, it copies only the characters that still fit by measuring each character's terminal width, keeps the original style for that shortened text, and returns the trimmed line.
 
-**Call relations**: This helper is used by status rendering after content width has been chosen, ensuring final bordered output does not exceed the computed inner width.
+**Call relations**: This is a general safety helper for terminal rendering. Other layout code can use it after building a styled line to ensure the final output does not overflow the available terminal area.
 
 *Call graph*: 7 external calls (from, styled, new, width, width, new, new).
 
 
 ### `tui/src/status/helpers.rs`
 
-`util` · `cross-cutting status rendering`
+`util` · `status display rendering`
 
-This file is a collection of pure-ish helper functions that normalize status-facing text before higher-level status composition renders it. The path helpers are the most nuanced: `compose_agents_summary` walks a list of `AbsolutePathBuf` agent files and tries to present each path relative to `config.cwd` when possible, falling back to simplified absolute paths. It special-cases files directly inside the cwd, computes `../` prefixes when the parent directory is an ancestor reached by walking upward, and otherwise uses `dunce::simplified` to remove Windows path oddities. `format_directory_display` separately formats arbitrary directories relative to the user’s home directory via `relativize_to_home`, and optionally truncates over-wide paths with `text_formatting::center_truncate_path` using Unicode display width rather than byte length.
+The status area in a terminal user interface has very little room, so raw data cannot be shown exactly as it appears inside the program. This file acts like a label maker for that status area. It chooses friendly names, shortens large numbers, trims long paths, and formats times so a person can quickly understand them.
 
-The remaining helpers shape compact labels for status cards: `compose_model_display` extracts specific model metadata keys (`reasoning effort`, `reasoning summaries`) into normalized detail strings; `plan_type_display_name` remaps protocol `PlanType` variants to product-facing labels such as Business, Enterprise, and Pro Lite; `format_tokens_compact` emits K/M/B/T suffixes with adaptive decimal precision and trims trailing zeroes; and `format_reset_timestamp` shows either `HH:MM` or `HH:MM on D Mon` depending on whether the reset crosses a date boundary relative to the capture time. Tests focus on plan label remapping and agent-path display behavior, especially global-vs-project ordering and absolute-path fallback.
+For example, a model may have extra settings such as reasoning effort or summary behavior. This file turns those into compact phrases like “reasoning high” or “summaries off.” Account plan names are also adjusted so internal plan types become customer-facing labels such as “Business” or “Enterprise.” Token counts are shortened from large raw numbers into forms like “1.2M,” which are much easier to scan.
+
+Path formatting is an important part of the file. Agent instruction files may live in the current project, a parent folder, or somewhere else entirely. The helper tries to show the shortest useful version, such as just the file name when it is in the current directory, or a relative-looking path when possible. Directory display also replaces the user’s home folder with “~” and can truncate long paths to fit a given screen width.
+
+The tests at the bottom check that plan names and agent path summaries stay readable and predictable.
 
 #### Function details
 
@@ -3703,11 +3735,11 @@ The remaining helpers shape compact labels for status cards: `compose_model_disp
 fn normalize_agents_display_path(path: &Path) -> String
 ```
 
-**Purpose**: Converts a filesystem path into a simplified display string using `dunce::simplified` before formatting it for the status UI.
+**Purpose**: This helper turns a path into a cleaner display string for the status view. It removes unnecessary path clutter, such as redundant `.` or `..` parts, before showing the path to the user.
 
-**Data flow**: It takes a `&Path`, reads no external state, simplifies platform-specific path syntax, then returns the path’s display form as an owned `String`.
+**Data flow**: It receives a filesystem path. It asks a path-cleaning library to simplify that path, then converts the simplified path into text. The result is a string ready to place in the status summary.
 
-**Call relations**: It is only used as a fallback inside `compose_agents_summary` when a path cannot be shown as a simple cwd-relative filename or upward `../` path.
+**Call relations**: It is used by `compose_agents_summary` when an agent file cannot be shown as a simple file name or nearby relative path. In that case, this helper provides the fallback readable path.
 
 *Call graph*: called by 1 (compose_agents_summary); 1 external calls (simplified).
 
@@ -3721,11 +3753,11 @@ fn compose_model_display(
 ) -> (String, Vec<String>)
 ```
 
-**Purpose**: Builds the model name plus a list of human-readable reasoning-related detail strings from key/value metadata entries.
+**Purpose**: This function prepares the model name and its most important model settings for display. It keeps the main model name separate from short detail labels, so the status view can show them cleanly.
 
-**Data flow**: It accepts a `model_name` and a slice of `(&str, String)` entries, scans for the exact keys `reasoning effort` and `reasoning summaries`, lowercases and normalizes those values, and returns `(model_name.to_string(), details_vec)`.
+**Data flow**: It receives a model name and a list of setting name/value pairs. It looks for settings called `reasoning effort` and `reasoning summaries`, rewrites them into short human-readable phrases, and returns the original model name plus a list of detail strings.
 
-**Call relations**: It is invoked by higher-level status construction when assembling the model section, and it does not delegate beyond basic formatting.
+**Call relations**: It is called by a `new` function elsewhere when building the status display. It does not draw anything itself; it supplies the text pieces that the larger status component can arrange on screen.
 
 *Call graph*: called by 1 (new); 2 external calls (new, format!).
 
@@ -3736,11 +3768,11 @@ fn compose_model_display(
 fn compose_agents_summary(config: &Config, paths: &[AbsolutePathBuf]) -> String
 ```
 
-**Purpose**: Formats a comma-separated summary of agent file paths, preferring cwd-relative names when possible and readable absolute paths otherwise.
+**Purpose**: This function builds the short text that says which agent instruction files are active. It tries to make each file path understandable without wasting screen space.
 
-**Data flow**: It reads `config.cwd` plus a slice of `AbsolutePathBuf`. For each path it extracts the filename, compares the parent against the cwd, optionally computes repeated `..{sep}` prefixes by walking cwd ancestors, otherwise tries `strip_prefix(&config.cwd)`, and finally falls back to normalized absolute display. It returns `"<none>"` for an empty input or a joined string of all rendered paths.
+**Data flow**: It receives the current configuration, including the current working directory, and a list of absolute paths to agent files. For each path, it decides whether to show only the file name, a path that walks up from the current folder, a path relative to the current folder, or a cleaned full path. It joins all displayed paths with commas, or returns `<none>` if there are no paths.
 
-**Call relations**: This helper is exercised directly by tests in this file and is consumed by status composition code that wants a single agents summary string. Internally it delegates path cleanup to `normalize_agents_display_path`.
+**Call relations**: It calls `normalize_agents_display_path` when it needs a cleaned path string. In the provided call graph it is exercised by `tests::compose_agents_summary_orders_global_before_project_agents`, which checks that the produced summary preserves the expected order.
 
 *Call graph*: calls 1 internal fn (normalize_agents_display_path); called by 1 (compose_agents_summary_orders_global_before_project_agents); 2 external calls (new, format!).
 
@@ -3753,11 +3785,11 @@ fn compose_account_display(
 ) -> Option<StatusAccountDisplay>
 ```
 
-**Purpose**: Passes through an optional `StatusAccountDisplay` by cloning it into owned form.
+**Purpose**: This function passes through account display information in a safe, owned form. It is used when the status view needs its own copy of optional account details.
 
-**Data flow**: It takes `Option<&StatusAccountDisplay>`, clones the inner value when present, and returns `Option<StatusAccountDisplay>` without modifying any shared state.
+**Data flow**: It receives either no account display value or a borrowed account display value. If a value is present, it clones it into a new owned value; if not, it returns nothing.
 
-**Call relations**: It is called from status assembly code that needs an owned account-display payload rather than a borrowed reference.
+**Call relations**: It is called by a `new` function elsewhere while building the status display. Its job is small but useful: it lets the constructed status object keep account display information without borrowing it from the caller.
 
 *Call graph*: called by 1 (new).
 
@@ -3768,11 +3800,11 @@ fn compose_account_display(
 fn plan_type_display_name(plan_type: PlanType) -> String
 ```
 
-**Purpose**: Maps protocol `PlanType` values to the product labels shown in status output, including several explicit remappings.
+**Purpose**: This function converts an internal account plan type into the label users should see. It hides internal naming differences and maps related plan variants to friendly names.
 
-**Data flow**: It takes a `PlanType`, checks `is_team_like`, `is_business_like`, and equality with `PlanType::ProLite`, then returns either a hard-coded label or a title-cased debug-name string.
+**Data flow**: It receives a `PlanType`, which is the program’s internal account-plan category. It checks whether the plan is team-like, business-like, or the special `ProLite` case, and returns labels such as `Business`, `Enterprise`, or `Pro Lite`. For other plans, it turns the internal enum name into simple title case.
 
-**Call relations**: This is a leaf formatter used wherever plan names are rendered; it delegates unknown-case prettification to `title_case`.
+**Call relations**: It uses `title_case` as a fallback for plan names that do not need special remapping. The test `tests::plan_type_display_name_remaps_display_labels` checks the expected labels for many plan types.
 
 *Call graph*: calls 1 internal fn (title_case); 3 external calls (is_business_like, is_team_like, format!).
 
@@ -3783,11 +3815,11 @@ fn plan_type_display_name(plan_type: PlanType) -> String
 fn format_tokens_compact(value: i64) -> String
 ```
 
-**Purpose**: Formats a non-negative token count into a compact K/M/B/T string with adaptive precision.
+**Purpose**: This function makes large token counts short enough for a status line. A token is a chunk of text processed by the model, and raw counts can get too large to read quickly.
 
-**Data flow**: It accepts an `i64`, clamps negatives to zero, chooses a suffix bucket based on magnitude, computes a scaled `f64`, selects 2/1/0 decimals depending on scale, trims trailing zeroes and a trailing decimal point, and returns the compact string.
+**Data flow**: It receives a number of tokens. Negative numbers are treated as zero. Small numbers are returned as-is, while thousands, millions, billions, and trillions are scaled to `K`, `M`, `B`, or `T`. It keeps a sensible number of decimal places and removes unnecessary trailing zeroes.
 
-**Call relations**: It is used by token-usage and context-window span builders so those callers can display large counts in narrow status layouts.
+**Call relations**: It is called by `context_window_spans` and `token_usage_spans`, which need compact token labels for display. This function supplies the short number text, while those callers decide where it appears in the interface.
 
 *Call graph*: called by 2 (context_window_spans, token_usage_spans); 1 external calls (format!).
 
@@ -3798,11 +3830,11 @@ fn format_tokens_compact(value: i64) -> String
 fn format_directory_display(directory: &Path, max_width: Option<usize>) -> String
 ```
 
-**Purpose**: Formats a directory path for display, optionally home-relativizing it and truncating it to a maximum visual width.
+**Purpose**: This function turns a directory path into a friendly, screen-sized label. It prefers `~` for the user’s home folder and can shorten long paths so they fit in the terminal.
 
-**Data flow**: It takes a `&Path` and optional width. It first asks `relativize_to_home` for a home-relative path, converting an empty relative path to `~` and non-empty ones to `~/{rel}`; otherwise it uses the raw display string. If `max_width` is present, it returns an empty string for zero width or center-truncates over-wide paths using Unicode width measurement.
+**Data flow**: It receives a directory path and optionally a maximum display width. First it tries to rewrite the path relative to the home directory, using `~` when possible. Then, if a width limit is provided, it measures the visible width of the text and truncates the middle of the path if it is too long. It returns the final display string.
 
-**Call relations**: It is called by status line rendering code when producing directory rows. It delegates home shortening to `relativize_to_home` and width-aware truncation to `text_formatting::center_truncate_path`.
+**Call relations**: It calls `relativize_to_home` to make home-based paths friendlier and `center_truncate_path` to shorten paths without losing both ends. It is called by `display_lines`, which uses the resulting text as part of the visible status output.
 
 *Call graph*: calls 2 internal fn (relativize_to_home, center_truncate_path); called by 1 (display_lines); 4 external calls (display, new, width, format!).
 
@@ -3813,11 +3845,11 @@ fn format_directory_display(directory: &Path, max_width: Option<usize>) -> Strin
 fn format_reset_timestamp(dt: DateTime<Local>, captured_at: DateTime<Local>) -> String
 ```
 
-**Purpose**: Formats a reset time relative to the snapshot capture date so same-day resets stay compact while later resets include a date.
+**Purpose**: This function formats a reset time in a compact way. It shows just the time if the reset is today, but includes the date if it falls on another day.
 
-**Data flow**: It takes `dt` and `captured_at` as `DateTime<Local>`, formats the time as `%H:%M`, compares `date_naive()` values, and returns either just the time or `"{time} on {day month}"`.
+**Data flow**: It receives the reset date/time and the time when the status information was captured. It formats the reset time as hours and minutes, compares the two calendar dates, and either returns just the time or returns the time plus a short date like `on 5 Jan`.
 
-**Call relations**: This helper is reused by rate-limit display shaping so all reset labels in a draw cycle use the same date-relative convention.
+**Call relations**: The provided call graph does not show a caller, but this helper is designed for status text that needs to say when a quota or usage counter resets. It relies on date comparison and date formatting rather than doing any broader status work itself.
 
 *Call graph*: 3 external calls (date_naive, format, format!).
 
@@ -3828,11 +3860,11 @@ fn format_reset_timestamp(dt: DateTime<Local>, captured_at: DateTime<Local>) -> 
 fn title_case(s: &str) -> String
 ```
 
-**Purpose**: Uppercases the first character of a string and lowercases the remaining ASCII characters.
+**Purpose**: This helper makes a simple title-style word from an internal name. It is used when a plan type does not need a special display label.
 
-**Data flow**: It takes `&str`, returns an empty string for empty input, otherwise splits off the first `char`, lowercases the remainder with ASCII rules, and concatenates the transformed pieces into a new `String`.
+**Data flow**: It receives a string. If it is empty, it returns an empty string. Otherwise it uppercases the first character, lowercases the rest using ASCII rules, and joins them into a new string.
 
-**Call relations**: It is only used by `plan_type_display_name` to prettify fallback enum debug names.
+**Call relations**: It is called by `plan_type_display_name` as the fallback path for ordinary plan names. That keeps the public plan-label function focused on business rules while this helper does the small text transformation.
 
 *Call graph*: called by 1 (plan_type_display_name); 1 external calls (new).
 
@@ -3843,11 +3875,11 @@ fn title_case(s: &str) -> String
 async fn test_config(codex_home: &TempDir, cwd: &TempDir) -> Config
 ```
 
-**Purpose**: Builds a test `Config` with a temporary codex home and cwd for path-formatting tests.
+**Purpose**: This test helper builds a temporary configuration for tests that need a fake Codex home directory and a fake current working directory. It prevents each test from repeating the same setup code.
 
-**Data flow**: It takes two `TempDir` references, feeds their paths into `ConfigBuilder`, awaits `build()`, and returns the resulting `Config` or panics on failure.
+**Data flow**: It receives two temporary directories: one to act as the Codex home and one to act as the current working directory. It feeds those paths into a configuration builder, waits for the configuration to be built, and returns the resulting `Config`.
 
-**Call relations**: It is a shared async fixture for the agent-summary tests in this module.
+**Call relations**: It is called by the async agent-summary tests. Those tests need a realistic `Config` so `compose_agents_summary` can compare agent file paths against the current working directory.
 
 *Call graph*: 2 external calls (path, default).
 
@@ -3858,11 +3890,11 @@ async fn test_config(codex_home: &TempDir, cwd: &TempDir) -> Config
 fn plan_type_display_name_remaps_display_labels()
 ```
 
-**Purpose**: Verifies that each relevant `PlanType` variant renders to the expected user-facing label.
+**Purpose**: This test checks that internal account plan types are shown with the intended user-facing names. It protects against accidentally exposing confusing internal labels in the status view.
 
-**Data flow**: It constructs a table of `(PlanType, expected_str)` pairs, iterates through them, and asserts that `plan_type_display_name` matches each expected string.
+**Data flow**: It creates a list of plan types paired with the display text each one should produce. For each pair, it calls `plan_type_display_name` and compares the result with the expected label.
 
-**Call relations**: This test directly exercises the remapping logic, especially the Business/Enterprise/Pro Lite special cases.
+**Call relations**: This test directly exercises `plan_type_display_name`. If the mapping rules change by mistake, the assertions fail and point developers back to the display-label behavior.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -3873,11 +3905,11 @@ fn plan_type_display_name_remaps_display_labels()
 async fn compose_agents_summary_includes_global_agents_path()
 ```
 
-**Purpose**: Checks that a global agents file outside the cwd is displayed using the same formatting as a standalone directory/path formatter.
+**Purpose**: This test checks that a global agent file outside the current project still appears in the agent summary. It makes sure such paths are not dropped or mistaken for project-local files.
 
-**Data flow**: It creates temporary codex-home and cwd directories, builds a config, constructs a global path under codex-home, calls `compose_agents_summary`, and compares the result to `format_directory_display` on that path.
+**Data flow**: It creates temporary Codex home and current working directories, builds a test configuration, and creates a path for a global agent file. It calls `compose_agents_summary` with that path and compares the result to the normal directory-display formatting for the same path.
 
-**Call relations**: This test validates the absolute-path fallback branch of `compose_agents_summary`.
+**Call relations**: It uses `tests::test_config` for setup and then verifies the path-summary behavior. Although the call graph excerpt lists only external calls for this test, its purpose is to protect `compose_agents_summary` behavior for global agent paths.
 
 *Call graph*: 3 external calls (new, assert_eq!, test_config).
 
@@ -3888,11 +3920,11 @@ async fn compose_agents_summary_includes_global_agents_path()
 async fn compose_agents_summary_names_global_agents_override()
 ```
 
-**Purpose**: Confirms that a global override file path is rendered by name/path rather than omitted or rewritten incorrectly.
+**Purpose**: This test checks that a global override agent file is named correctly in the summary. It covers another global-file case so display behavior remains consistent.
 
-**Data flow**: It creates temp directories and a config, builds an override path under codex-home, runs `compose_agents_summary`, and asserts equality with `format_directory_display` for that path.
+**Data flow**: It creates temporary directories, builds a test configuration, and makes a path named `override.md` under the fake Codex home. It calls the agent-summary formatting path and asserts that the displayed result matches the expected formatted path.
 
-**Call relations**: Like the previous test, it covers non-cwd agent paths, specifically the override naming case.
+**Call relations**: It depends on `tests::test_config` to create a realistic configuration. Like the neighboring global-agent test, it protects the path formatting expectations around `compose_agents_summary`.
 
 *Call graph*: 3 external calls (new, assert_eq!, test_config).
 
@@ -3903,24 +3935,24 @@ async fn compose_agents_summary_names_global_agents_override()
 async fn compose_agents_summary_orders_global_before_project_agents()
 ```
 
-**Purpose**: Ensures the summary preserves input ordering so global agent paths appear before project-local ones when passed in that order.
+**Purpose**: This test checks that the agent summary keeps paths in the order it was given, especially with a global file before a project file. That matters because order can imply priority or simply match the user’s expectations.
 
-**Data flow**: It creates one global and one project path, calls `compose_agents_summary` with both, splits the comma-separated output, and asserts the first entry matches the global path while the second ends with the project filename.
+**Data flow**: It creates a fake global agent path and a fake project agent path, then builds a test configuration. It passes both paths to `compose_agents_summary`, splits the comma-separated result, and checks that the global path appears first, the project path appears second, and there are no extra entries.
 
-**Call relations**: This test exercises the full summary join behavior and confirms no internal sorting reorders the caller-provided path list.
+**Call relations**: This test calls `compose_agents_summary` directly and uses `tests::test_config` for setup. It verifies the larger path-summary function rather than any one small formatting helper.
 
 *Call graph*: calls 1 internal fn (compose_agents_summary); 4 external calls (new, assert!, assert_eq!, test_config).
 
 
 ### `tui/src/status/remote_connection.rs`
 
-`util` · `status snapshot assembly`
+`domain_logic` · `startup and status display`
 
-This module is narrowly focused on the remote-connection section of status output. Its data model is `RemoteConnectionStatus`, a simple pair of `address` and `version` strings. The main function, `remote_connection_status_value`, inspects the current `AppServerTarget` and returns `None` for `Embedded`, because there is no remote endpoint to display. For `LocalDaemon` and `Remote`, it extracts the shared endpoint and formats it according to transport type.
+The text user interface can run against different kinds of app servers: one built into the same process, a local background service, or a remote server. This file answers a simple user-facing question: “Am I connected to something outside this UI, and if so, where and what version is it?”
 
-WebSocket endpoints are sanitized before display: `sanitized_websocket_display_address` parses the raw URL with `url::Url`, clears the username and password, and strips query and fragment components. That removes embedded credentials and tokens from status output while preserving the scheme, host, port, and path. If parsing fails, the caller substitutes the explicit placeholder `<invalid websocket URL>`. Unix-socket endpoints are rendered as `unix://{socket_path}` using the path’s display form.
+If the app is using the embedded server, there is no remote connection to show, so it returns nothing. If the app is connected through a WebSocket, it prepares the WebSocket address for display. Importantly, it removes sensitive or noisy parts first: usernames, passwords, query strings, and URL fragments. That means a URL containing a token is shown like a street address, not like a key left under the doormat. If the app is connected through a Unix socket, it formats the socket path with a `unix://` prefix so the display clearly says what kind of connection it is.
 
-Version formatting is intentionally simple and user-facing: a provided version becomes `v{version}`, while absence becomes `unknown`. The included test covers all three important branches: embedded targets returning `None`, WebSocket sanitization removing secrets and query parameters, and Unix-socket formatting with an unknown version fallback.
+The file also formats the server version. A known version becomes something like `v1.2.3`; a missing version becomes `unknown`. The small test at the bottom checks the main cases: embedded servers show nothing, WebSocket secrets are hidden, and Unix socket paths are displayed correctly.
 
 #### Function details
 
@@ -3933,11 +3965,11 @@ fn remote_connection_status_value(
 ) -> Option<RemoteConnectionStatus>
 ```
 
-**Purpose**: Converts the current app-server target and optional server version into an optional `RemoteConnectionStatus` for display.
+**Purpose**: Builds the connection status that the UI can show to the user. It decides whether there is a remote connection at all, chooses a safe display address, and adds the server version if known.
 
-**Data flow**: It takes `&AppServerTarget` and `Option<&str>`. It pattern-matches the target, returning `None` for `Embedded`; otherwise it formats either a sanitized WebSocket URL or a `unix://` socket path, prefixes the version with `v` when present, substitutes `unknown` when absent, and returns `Some(RemoteConnectionStatus)`.
+**Data flow**: It receives the chosen app server target and an optional server version string. If the target is embedded, it returns no status. If the target points to a WebSocket, it asks `sanitized_websocket_display_address` to clean the URL before showing it. If the target points to a Unix socket, it turns the socket path into a `unix://...` display string. It then changes a version like `1.2.3` into `v1.2.3`, or uses `unknown` when no version was provided, and returns a `RemoteConnectionStatus` containing both pieces of text.
 
-**Call relations**: It is called from the status run path when building the remote-connection section. For WebSocket endpoints it delegates sanitization to `sanitized_websocket_display_address`.
+**Call relations**: The larger run flow calls this when it needs a user-facing status value. Inside, it delegates WebSocket cleanup to `sanitized_websocket_display_address` so that secret-bearing URL details are removed before anything is displayed.
 
 *Call graph*: calls 1 internal fn (sanitized_websocket_display_address); called by 1 (run); 1 external calls (format!).
 
@@ -3948,11 +3980,11 @@ fn remote_connection_status_value(
 fn sanitized_websocket_display_address(raw: &str) -> Option<String>
 ```
 
-**Purpose**: Parses a WebSocket URL and removes credentials, query parameters, and fragments before display.
+**Purpose**: Turns a raw WebSocket URL into a safer display version. It strips out private or distracting parts such as login details, query parameters, and fragments.
 
-**Data flow**: It takes a raw URL string, parses it with `Url::parse`, clears username and password, sets query and fragment to `None`, and returns the sanitized URL string or `None` if parsing fails.
+**Data flow**: It receives a raw URL string. It tries to parse it as a URL; if parsing fails, it returns nothing. If parsing succeeds, it clears the username, password, query string, and fragment, then returns the cleaned URL as text.
 
-**Call relations**: It is only used by `remote_connection_status_value` to avoid leaking auth material in status output.
+**Call relations**: `remote_connection_status_value` calls this only for WebSocket endpoints. Its result becomes the address shown in the remote connection status; if it cannot parse the URL, the caller falls back to the text `<invalid websocket URL>`.
 
 *Call graph*: called by 1 (remote_connection_status_value); 1 external calls (parse).
 
@@ -3963,11 +3995,11 @@ fn sanitized_websocket_display_address(raw: &str) -> Option<String>
 fn remote_connection_status_value_formats_display_value() -> color_eyre::Result<()>
 ```
 
-**Purpose**: Validates embedded omission, WebSocket sanitization, Unix-socket formatting, and version fallback behavior.
+**Purpose**: Checks that the status formatting behaves correctly for the main connection types. It is a safety net so future changes do not accidentally reveal secrets or change the display format.
 
-**Data flow**: It constructs representative `AppServerTarget` values, calls `remote_connection_status_value` for each, and asserts exact equality with the expected `Option<RemoteConnectionStatus>` values.
+**Data flow**: It creates three example situations: an embedded server, a remote WebSocket URL containing credentials and token-like details, and a local Unix socket path. It passes each one into `remote_connection_status_value` and compares the returned value with the expected result. Nothing is changed outside the test; it succeeds only if the formatted output matches exactly.
 
-**Call relations**: This test covers the module’s full public behavior, especially the sanitization contract for remote URLs.
+**Call relations**: This test exercises `remote_connection_status_value` the way the running UI would use it. It also indirectly checks `sanitized_websocket_display_address`, because the WebSocket case must come back with the sensitive parts removed.
 
 *Call graph*: calls 1 internal fn (relative_to_current_dir); 1 external calls (assert_eq!).
 
@@ -3977,13 +4009,13 @@ These files provide focused presentation helpers for chart palettes and reusable
 
 ### `tui/src/chatwidget/tokens/chart/palette.rs`
 
-`util` · `request handling`
+`domain_logic` · `chart rendering`
 
-This module encapsulates all style and glyph decisions for token-activity charts. `TokenActivityPalette` stores five per-level styles for daily heatmap cells, one shared bar style for weekly/cumulative charts, and a `uses_color` flag that determines whether intensity is encoded primarily by color or by glyph choice. `current()` gathers runtime terminal information—default foreground/background RGB values, stdout color level, and a theme-derived activity accent—and passes them into `from_parts()`.
+Token activity charts need to show “nothing happened” versus “some activity happened,” and ideally also show different activity levels. This file is the chart’s paint box. It decides which text styles and small block characters should be used for each cell in the chart.
 
-`from_parts()` is the core constructor. If terminal colors are missing, the theme accent is not RGB, or the terminal only supports `Ansi16`/unknown color levels, it falls back to `fallback()`: empty cells are dim, active cells all share the accent style, and `uses_color` is false. Otherwise it computes a blended gradient. Empty-cell intensity is blended from terminal foreground toward background using a slightly different alpha for light versus dark backgrounds, while active levels blend the accent color toward the background across fixed alpha steps. A separate bar style uses a stronger accent blend. All RGB colors are quantized through `best_color_for_level()` to match terminal capability.
+The main type, `TokenActivityPalette`, stores five styles for activity levels, a separate style for bar charts, and a flag saying whether color can carry the meaning by itself. On terminals with good color support, the chart uses one solid square glyph and changes its color intensity, much like a GitHub contribution graph. On low-color terminals, color is not reliable enough, so the chart switches to different shapes: a hollow square for empty daily cells and a filled square for active ones. For bar views, it uses spaces for empty parts and full block characters for filled parts, so the chart looks like columns.
 
-`for_level()` and `for_bar_level()` expose the chosen styles, while `glyph()` selects between hollow/filled squares for daily charts and spaces/full blocks for bar charts. The design intentionally keeps low-color terminals readable by using glyph differences when color alone would be insufficient.
+The file also connects the chart to the current theme. It tries to find a suitable accent color from syntax-highlight-like theme scopes, blends that color against the terminal background, and then converts it to the best color the terminal can actually display. If anything important is missing, such as terminal background color or a usable RGB theme color, it falls back to a simpler but dependable accent style.
 
 #### Function details
 
@@ -3993,11 +4025,11 @@ This module encapsulates all style and glyph decisions for token-activity charts
 fn current() -> Self
 ```
 
-**Purpose**: Builds a palette from the live terminal environment and current theme accent. It is the runtime entry point used by chart rendering.
+**Purpose**: Builds the palette that should be used right now for the user’s current terminal and theme. Chart drawing code calls this when it needs styles and glyph choices for token activity cells.
 
-**Data flow**: Reads terminal foreground and background RGB values via `default_fg()` and `default_bg()`, reads terminal color capability via `stdout_color_level()`, computes the theme accent style with `theme_activity_style()`, and passes all four inputs into `Self::from_parts(...)`, returning the resulting palette.
+**Data flow**: It reads the terminal’s default foreground color, default background color, detected color capability, and the theme’s activity accent style. It passes those pieces into the palette builder. The result is a `TokenActivityPalette` ready to use for drawing the chart.
 
-**Call relations**: Called by `chart_lines` before rendering chart cells. It delegates all decision-making to `from_parts`, serving mainly as environment collection glue.
+**Call relations**: This is the normal entry point for chart rendering: `chart_lines` asks for the current palette before drawing. It gathers information from `default_fg`, `default_bg`, `stdout_color_level`, and `theme_activity_style`, then hands everything to `TokenActivityPalette::from_parts` to make the final decision.
 
 *Call graph*: calls 4 internal fn (theme_activity_style, default_bg, default_fg, stdout_color_level); called by 1 (chart_lines); 1 external calls (from_parts).
 
@@ -4013,11 +4045,11 @@ fn from_parts(
     ) -> Self
 ```
 
-**Purpose**: Constructs either a blended truecolor/extended-color palette or a fallback accent-only palette from explicit terminal and theme inputs. This is the core palette-selection algorithm.
+**Purpose**: Creates a palette from explicit terminal and theme information. This is the decision-making function that chooses between a rich color-gradient palette and a simpler fallback palette.
 
-**Data flow**: Accepts optional default foreground/background RGB tuples, a `StdoutColorLevel`, and an active accent `Style`. It first extracts an RGB anchor from the accent with `activity_anchor_rgb`; if any required RGB input is missing, or if the color level is `Ansi16` or `Unknown`, it returns `fallback(active_style)`. Otherwise it chooses an empty-cell alpha based on whether the background is light, defines fixed alpha steps, builds five styles with `std::array::from_fn` by blending either foreground or accent against background and quantizing with `best_color_for_level`, computes a separate blended `bar_style`, and returns `TokenActivityPalette { styles, bar_style, uses_color: true }`.
+**Data flow**: It receives optional terminal foreground and background RGB colors, the terminal’s color level, and the theme’s active style. First it checks whether all needed color information is available and whether the terminal can show enough colors. If not, it returns the fallback palette. If yes, it blends the theme accent color with the terminal background at several strengths, converts each blended color to the best displayable terminal color, and stores those styles in the palette. It also prepares a bar-chart style and marks that the palette can rely on color.
 
-**Call relations**: Used by `current` in production and directly by palette tests with controlled inputs. It delegates fallback construction to `fallback` and RGB extraction to `activity_anchor_rgb`.
+**Call relations**: This function is called by `TokenActivityPalette::current` in real use, and by several tests that check different terminal and theme situations. It relies on `activity_anchor_rgb` to get a real RGB accent color, on color blending helpers to create intensity levels, and on `best_color_for_level` to fit those colors to the terminal.
 
 *Call graph*: calls 4 internal fn (activity_anchor_rgb, blend, is_light, best_color_for_level); called by 5 (ansi16_palette_uses_theme_accent_without_green_fallback, missing_terminal_colors_use_theme_accent_fallback, non_rgb_theme_accent_remains_active_fallback, truecolor_palette_blends_empty_cell_for_light_background, truecolor_palette_blends_theme_accent_against_dark_background); 3 external calls (default, matches!, from_fn).
 
@@ -4028,11 +4060,11 @@ fn from_parts(
 fn fallback(active_style: Style) -> Self
 ```
 
-**Purpose**: Builds the low-information palette used when terminal/theme RGB data is insufficient or color capability is too limited. In this mode glyph differences carry most of the chart semantics.
+**Purpose**: Builds a safe palette for terminals or themes where a color gradient cannot be trusted. It makes empty cells dim and active cells use the theme accent style.
 
-**Data flow**: Takes an active accent `Style`, creates `empty_style = Style::default().dim()`, and returns a palette whose level 0 style is dim, levels 1 through 4 all reuse `active_style`, `bar_style` is also `active_style`, and `uses_color` is `false`.
+**Data flow**: It receives the active theme style. It creates a dim default style for empty cells, uses the active style for all non-empty levels and bars, and records that the palette should not rely on color alone. The output is a simple `TokenActivityPalette` that remains readable in limited terminals.
 
-**Call relations**: Called internally by `from_parts` whenever blended color gradients are not viable.
+**Call relations**: This is the backup path used by `TokenActivityPalette::from_parts` when terminal colors are missing, the theme accent is not an RGB color, or the terminal only supports very limited colors. It keeps the chart usable instead of producing misleading or invisible color differences.
 
 *Call graph*: 1 external calls (default).
 
@@ -4043,11 +4075,11 @@ fn fallback(active_style: Style) -> Self
 fn for_level(&self, level: usize) -> Style
 ```
 
-**Purpose**: Returns the style for a daily heatmap intensity level, clamping out-of-range requests to the highest defined level. This keeps callers simple and safe.
+**Purpose**: Returns the text style for a chart cell at a given activity level. It lets the renderer ask, “How should level 0, 1, 2, 3, or 4 look?”
 
-**Data flow**: Takes `&self` and a `usize` level, clamps it with `min(4)`, indexes `self.styles`, and returns the selected `Style` by copy.
+**Data flow**: It receives a numeric level. If the number is higher than the palette’s maximum level, it clamps it down to the highest supported level. It then returns the stored style for that level without changing the palette.
 
-**Call relations**: Used by `legend_line` and by `for_bar_level` when bar cells are empty.
+**Call relations**: Chart helper code such as `legend_line` uses this to style level examples. `TokenActivityPalette::for_bar_level` also calls it for level 0, so empty bar cells match the normal empty-cell style.
 
 *Call graph*: called by 2 (legend_line, for_bar_level).
 
@@ -4058,11 +4090,11 @@ fn for_level(&self, level: usize) -> Style
 fn for_bar_level(&self, level: usize) -> Style
 ```
 
-**Purpose**: Returns the style for a weekly/cumulative bar-chart cell. Empty bar cells reuse level-0 styling, while any filled bar cell uses the shared bar style.
+**Purpose**: Returns the style for a cell in a bar-style chart. Empty bar cells use the normal empty style, while any filled part of the bar uses the dedicated bar style.
 
-**Data flow**: Takes `&self` and a level. If the level is zero it delegates to `self.for_level(0)`; otherwise it returns `self.bar_style`.
+**Data flow**: It receives a bar level. If the level is zero, it asks `TokenActivityPalette::for_level` for the empty-cell style. If the level is above zero, it returns the palette’s stored bar style. The palette itself is not changed.
 
-**Call relations**: Called by chart rendering for non-daily views. It reuses `for_level` for empty cells so empty bars visually match empty daily cells.
+**Call relations**: This function fits into the bar-chart drawing path. It reuses `for_level` for empty space so the chart stays visually consistent, and uses the separate bar style for filled columns so bars have a clear silhouette.
 
 *Call graph*: calls 1 internal fn (for_level).
 
@@ -4073,11 +4105,11 @@ fn for_bar_level(&self, level: usize) -> Style
 fn glyph(&self, view: TokenActivityView, level: usize) -> &'static str
 ```
 
-**Purpose**: Chooses the glyph string for one chart cell based on view, level, and whether the palette can rely on color gradients. Daily charts may use hollow vs filled squares; bar charts use spaces vs full blocks.
+**Purpose**: Chooses the actual character to draw for a chart cell. It decides whether a cell should be a square, a hollow square, a full block, or a space.
 
-**Data flow**: Takes `&self`, a `TokenActivityView`, and a level. For non-daily views it returns a space for level 0 and `BAR_CELL_GLYPH` for nonzero levels. For daily view it returns `ACTIVE_CELL_GLYPH` if `uses_color` is true or the level is nonzero; otherwise it returns `EMPTY_CELL_GLYPH`.
+**Data flow**: It receives the chart view type and the activity level for one cell. For non-daily views, it returns a space for level 0 and a full block for active levels, creating a bar-chart look. For daily views, it returns a filled square when color can show the difference or when the cell is active; otherwise it returns a hollow square for empty cells. The output is a static string slice containing the glyph to print.
 
-**Call relations**: Used by chart rendering and the daily legend. Its behavior is tightly coupled to `uses_color`, which is set by `from_parts`.
+**Call relations**: `legend_line` calls this when it needs example glyphs for the chart legend. The function uses the palette’s `uses_color` setting, which was chosen earlier by `from_parts` or `fallback`, so glyph choice stays in sync with terminal color capability.
 
 *Call graph*: called by 1 (legend_line).
 
@@ -4088,11 +4120,11 @@ fn glyph(&self, view: TokenActivityView, level: usize) -> &'static str
 fn theme_activity_style() -> Style
 ```
 
-**Purpose**: Derives the base accent style for token-activity charts from syntax-highlight scopes, with a fallback to the application accent style. The result is always bolded.
+**Purpose**: Finds the theme style that should represent token activity. It tries theme scopes that are likely to have a pleasant accent color, then falls back to the app’s normal accent style.
 
-**Data flow**: Calls `foreground_style_for_scopes(&["entity.name.type", "support.type", "variable"])`; if a style is found it uses that, otherwise it falls back to `accent_style()`, then applies `.bold()` and returns the resulting `Style`.
+**Data flow**: It asks the highlighting system for a foreground style matching several named scopes, such as type names or variables. If that lookup succeeds, it uses that style; otherwise it uses `accent_style`. It then makes the style bold and returns it.
 
-**Call relations**: Called only by `TokenActivityPalette::current` to seed palette construction with a theme-aware accent.
+**Call relations**: `TokenActivityPalette::current` calls this while building the live palette. This function is the bridge between the general app theme and the token activity chart’s color choices.
 
 *Call graph*: calls 1 internal fn (foreground_style_for_scopes); called by 1 (current).
 
@@ -4103,20 +4135,24 @@ fn theme_activity_style() -> Style
 fn activity_anchor_rgb(style: Style) -> Option<(u8, u8, u8)>
 ```
 
-**Purpose**: Extracts an RGB tuple from a style’s foreground color when possible. Non-RGB colors intentionally return `None` so palette construction can fall back.
+**Purpose**: Extracts a plain RGB color from a style, if the style has one. The palette needs this raw red-green-blue value so it can blend the accent color with the terminal background.
 
-**Data flow**: Takes a `Style`, reads `style.fg`, and matches it: `Color::Rgb(r, g, b)` becomes `Some((r, g, b))`; any other foreground color or missing foreground becomes `None`.
+**Data flow**: It receives a `Style`. It looks at the style’s foreground color. If that foreground is an RGB color, it returns the three color components. If there is no foreground color, or if the foreground uses another kind of terminal color, it returns nothing.
 
-**Call relations**: Used by `from_parts` as the gate for blended palette generation. If it returns `None`, `from_parts` chooses the fallback palette.
+**Call relations**: `TokenActivityPalette::from_parts` calls this before trying to build a color-gradient palette. If this function cannot provide an RGB anchor color, `from_parts` chooses the fallback palette instead.
 
 *Call graph*: called by 1 (from_parts).
 
 
 ### `tui/src/history_cell/base.rs`
 
-`util` · `cross-cutting`
+`domain_logic` · `main loop / transcript rendering`
 
-This file is the foundation of the TUI transcript rendering model. `PlainHistoryCell` is the simplest implementation: it stores a `Vec<Line<'static>>` and returns clones for display, while `raw_lines` strips styling and hyperlinks through `plain_lines`. `WebHyperlinkHistoryCell` is similar but overrides hyperlink-oriented methods so web URLs are annotated via `crate::terminal_hyperlinks::annotate_web_urls`; transcript hyperlink rendering is intentionally identical to viewport hyperlink rendering. `PrefixedWrappedHistoryCell` stores a `Text<'static>` plus separate initial and subsequent prefixes, then wraps the text at render time using `adaptive_wrap_lines` and `RtOptions`. It explicitly returns no lines for width 0, avoiding invalid wrapping behavior in tiny layouts. `CompositeHistoryCell` is the vertical concatenation primitive: it owns boxed child `HistoryCell`s and, for display, hyperlink display, transcript hyperlink output, and raw output alike, iterates children in order, inserts a blank separator only between non-empty parts, and appends each child’s lines. This means empty children disappear cleanly without producing stray blank lines. Together these types let higher-level modules focus on domain wording while reusing consistent wrapping, hyperlink annotation, and multi-part layout behavior.
+The terminal user interface keeps a running history, like a chat transcript or activity log. Each entry in that history must be able to answer a few questions: what lines should be shown on screen, what plain text should be copied or saved, and where any clickable links are. This file provides the basic kinds of history entries used by other parts of the transcript system.
+
+A PlainHistoryCell is the simplest case: it stores already-prepared lines and gives them back. A WebHyperlinkHistoryCell is similar, but it can also scan its text for web addresses and return lines with link information attached, so terminals that support hyperlinks can make URLs clickable. A PrefixedWrappedHistoryCell is for text that needs a label or marker at the start, then a different prefix on wrapped follow-up lines, like a bullet point whose later lines line up neatly. It wraps based on the available terminal width.
+
+CompositeHistoryCell is the “folder” version. It contains several other history cells and presents them as one entry, putting a blank line between non-empty parts. This lets larger transcript items be assembled from small pieces without each caller reimplementing spacing, wrapping, raw text, and hyperlink behavior.
 
 #### Function details
 
@@ -4126,11 +4162,11 @@ This file is the foundation of the TUI transcript rendering model. `PlainHistory
 fn new(lines: Vec<Line<'static>>) -> Self
 ```
 
-**Purpose**: Constructs a plain history cell from already prepared terminal lines. It is the standard container for static, non-wrapping transcript content.
+**Purpose**: Creates a plain history cell from a list of already-built display lines. Other code uses this when it has text that does not need special wrapping or hyperlink detection.
 
-**Data flow**: Consumes a `Vec<Line<'static>>` and stores it directly in a new `PlainHistoryCell`. It returns the cell by value and does not transform the lines.
+**Data flow**: It receives a vector of terminal lines. It stores those lines inside a new PlainHistoryCell and returns that cell; nothing else is changed.
 
-**Call relations**: This constructor is widely used across the TUI wherever callers already have final lines and do not need special hyperlink or wrapping behavior.
+**Call relations**: Many transcript-building helpers call this when they need a simple entry, such as permission decisions, renamed confirmations, fork events, and tests. Later, the history system asks the cell for display or raw lines.
 
 *Call graph*: called by 16 (plain_line_cell, handle_permissions_decision, add_plain_history_lines, rename_confirmation_cell, emit_forked_thread_event, completed_token_activity_refresh_waits_for_active_history_cell, pending_token_activity_refresh_keeps_composer_visible_in_short_viewport, startup_reset_hint_waits_for_active_output_snapshot, new_token_activity_output, new_debug_config_output (+6 more)).
 
@@ -4141,11 +4177,11 @@ fn new(lines: Vec<Line<'static>>) -> Self
 fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the stored lines exactly as they were provided. Width is ignored because this cell does not perform wrapping or reflow.
+**Purpose**: Returns the plain cell's lines for on-screen display. The terminal width is accepted for consistency with other cell types, but this cell does not need it because its lines are already prepared.
 
-**Data flow**: Reads `self.lines`, clones the vector, and returns it. It does not mutate state or inspect the `_width` argument.
+**Data flow**: It reads the stored lines, clones them, and returns the clone. The original cell stays unchanged.
 
-**Call relations**: This method is used by generic history rendering paths such as text extraction, relying on `PlainHistoryCell` to be a transparent container.
+**Call relations**: When display code such as cell_to_text needs to turn a history cell into visible text, it calls this method. This method does not hand off to other helpers because plain cells need no extra formatting.
 
 *Call graph*: called by 1 (cell_to_text).
 
@@ -4156,11 +4192,11 @@ fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Produces an unstyled/plain-text version of the stored lines. It is used for transcript export or comparisons where terminal styling should be removed.
+**Purpose**: Returns a plain-text version of the cell's stored lines. This is useful for transcript export, copying, or any place where styling should not matter.
 
-**Data flow**: Clones `self.lines`, passes them to `plain_lines`, and returns the resulting `Vec<Line<'static>>`. No state is modified.
+**Data flow**: It clones the stored lines, passes them through plain_lines to strip or normalize styling, and returns the resulting plain lines. The stored display version is not changed.
 
-**Call relations**: This is the raw-output counterpart to `display_lines`, used by generic transcript consumers that want plain content.
+**Call relations**: This is part of the shared HistoryCell behavior. It is used when the wider transcript system wants content rather than terminal decoration.
 
 
 ##### `WebHyperlinkHistoryCell::new`  (lines 32–34)
@@ -4169,11 +4205,11 @@ fn raw_lines(&self) -> Vec<Line<'static>>
 fn new(lines: Vec<Line<'static>>) -> Self
 ```
 
-**Purpose**: Constructs a history cell whose stored lines should be scanned for web URLs and exposed as hyperlink metadata. It is a convenience wrapper around plain line storage with hyperlink-aware rendering.
+**Purpose**: Creates a history cell whose text may contain web links. Callers use it when a displayed message should still look like normal text but URLs should be discoverable as hyperlinks.
 
-**Data flow**: Consumes a `Vec<Line<'static>>`, stores it in the `lines` field, and returns the new cell. It performs no transformation at construction time.
+**Data flow**: It receives prepared terminal lines, stores them in a WebHyperlinkHistoryCell, and returns the new cell. It does not scan links yet; that happens only when hyperlink lines are requested.
 
-**Call relations**: This constructor is used by callers that already have final lines but want automatic URL hyperlink annotation during rendering.
+**Call relations**: It is called by feedback_success_cell, which creates a success message that may include a web URL. Later display and transcript methods decide whether to return plain lines or hyperlink-aware lines.
 
 *Call graph*: called by 1 (feedback_success_cell).
 
@@ -4184,11 +4220,11 @@ fn new(lines: Vec<Line<'static>>) -> Self
 fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the stored visible lines without hyperlink metadata. Width is ignored because the cell stores final lines directly.
+**Purpose**: Returns the stored lines for normal screen display, without adding hyperlink metadata. This keeps ordinary rendering simple and unchanged.
 
-**Data flow**: Clones and returns `self.lines`. It does not mutate state or use the `_width` parameter.
+**Data flow**: It reads the stored lines, clones them, and returns the clone. The width parameter is ignored because this cell does not wrap its text here.
 
-**Call relations**: This method serves plain viewport rendering, while hyperlink-aware consumers use the specialized hyperlink methods on the same cell.
+**Call relations**: This method satisfies the normal display part of the HistoryCell behavior. Hyperlink-specific rendering uses a different method in the same cell.
 
 
 ##### `WebHyperlinkHistoryCell::display_hyperlink_lines`  (lines 42–44)
@@ -4197,11 +4233,11 @@ fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Annotates the stored lines with hyperlink metadata for visible rendering. It turns plain URL text into `HyperlinkLine` structures understood by the terminal layer.
+**Purpose**: Returns the cell's display lines with web URLs marked as hyperlinks. In plain terms, it takes visible text and adds hidden link targets where URLs appear.
 
-**Data flow**: Clones `self.lines`, passes them to `crate::terminal_hyperlinks::annotate_web_urls`, and returns the resulting `Vec<HyperlinkLine>`. It does not modify internal state.
+**Data flow**: It clones the stored lines, sends them to annotate_web_urls, and returns the resulting hyperlink-aware lines. The cell itself is not modified.
 
-**Call relations**: This method is the hyperlink-aware rendering path for the cell and is reused directly by `transcript_hyperlink_lines` so transcript and viewport hyperlink behavior stay aligned.
+**Call relations**: When a renderer wants clickable links, it calls this method. It delegates the actual URL finding to annotate_web_urls, keeping this cell focused on history-cell behavior rather than URL parsing.
 
 *Call graph*: calls 1 internal fn (annotate_web_urls); called by 1 (transcript_hyperlink_lines).
 
@@ -4212,11 +4248,11 @@ fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine>
 fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Returns hyperlink-annotated lines for transcript rendering using the same logic as viewport rendering. There is intentionally no separate transcript-specific transformation.
+**Purpose**: Returns hyperlink-aware lines for transcript use. For this cell, transcript hyperlinks are the same as display hyperlinks.
 
-**Data flow**: Accepts a width argument, forwards it to `display_hyperlink_lines`, and returns that result. No state changes occur.
+**Data flow**: It receives the requested width, passes that along to display_hyperlink_lines, and returns whatever that method produces.
 
-**Call relations**: This method simply delegates to `display_hyperlink_lines`, ensuring one hyperlink annotation path for both transcript and on-screen display.
+**Call relations**: This method is the transcript-facing path. It simply reuses display_hyperlink_lines so display and transcript output stay consistent for web links.
 
 *Call graph*: calls 1 internal fn (display_hyperlink_lines).
 
@@ -4227,11 +4263,11 @@ fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Produces plain, unannotated raw lines from the stored content. It strips hyperlink metadata and styling for raw transcript output.
+**Purpose**: Returns the web-link cell as plain text lines, without hyperlink metadata or terminal styling. This is useful when saving or copying the transcript.
 
-**Data flow**: Clones `self.lines`, passes them through `plain_lines`, and returns the resulting vector. It does not mutate the cell.
+**Data flow**: It clones the stored lines, runs them through plain_lines, and returns the cleaned-up plain lines. The hyperlink-capable cell remains unchanged.
 
-**Call relations**: This is the raw-output companion to the cell’s visible and hyperlink-aware rendering methods.
+**Call relations**: This supports the raw-text side of the HistoryCell contract. It intentionally does not call the hyperlink annotation path because raw text should contain only readable text.
 
 
 ##### `PrefixedWrappedHistoryCell::new`  (lines 62–72)
@@ -4244,11 +4280,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a wrapped text cell with distinct prefixes for the first and subsequent visual lines. It is the standard primitive for bullet-like transcript rows that need width-aware wrapping.
+**Purpose**: Creates a history cell for text that should be wrapped to the terminal width and shown with prefixes. This is useful for entries like warnings, approvals, or status messages where the first line has one label and wrapped continuation lines need another indent.
 
-**Data flow**: Accepts any values convertible into `Text<'static>` and `Line<'static>` for the body and prefixes, converts them with `Into`, stores them in the struct, and returns the new cell.
+**Data flow**: It receives text, an initial prefix, and a subsequent-line prefix. It converts each input into the internal text and line types, stores them, and returns a new PrefixedWrappedHistoryCell.
 
-**Call relations**: This constructor is used by many higher-level history-cell factories—approval rows, warnings, and similar one-block messages—so they can share consistent wrapping and indentation behavior.
+**Call relations**: Approval, guardian, warning, and other event-building code call this when they need neatly wrapped transcript text. Later, display_lines uses the stored text and prefixes to format the entry for the current terminal width.
 
 *Call graph*: called by 11 (new_approval_decision_cell, new_guardian_approved_action_request, new_guardian_denied_action_request, new_guardian_denied_patch_request, new_guardian_timed_out_action_request, new_guardian_timed_out_patch_request, new_warning_event, display_lines, prefixed_wrapped_history_cell_does_not_split_url_like_token, prefixed_wrapped_history_cell_height_matches_wrapped_rendering (+1 more)); 1 external calls (into).
 
@@ -4259,11 +4295,11 @@ fn new(
 fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Wraps the stored text to the requested width while applying the configured first-line and continuation prefixes. It gracefully returns no output for zero-width layouts.
+**Purpose**: Formats the cell for the current terminal width, wrapping long text and adding the right prefix to the first and later lines. This keeps messages readable instead of spilling awkwardly across the screen.
 
-**Data flow**: Reads `self.text`, `self.initial_prefix`, and `self.subsequent_prefix`. If `width == 0`, it returns an empty vector. Otherwise it builds `RtOptions` with the width and cloned prefixes, passes them to `adaptive_wrap_lines`, and returns the wrapped `Vec<Line<'static>>`.
+**Data flow**: It receives a width. If the width is zero, it returns no lines. Otherwise, it builds wrapping options using the width and cloned prefixes, passes the stored text into adaptive_wrap_lines, and returns the wrapped lines.
 
-**Call relations**: This is the core rendering behavior that callers rely on after constructing the cell with `new`; it encapsulates all width-sensitive wrapping and indentation.
+**Call relations**: The display system calls this whenever the terminal needs to show the cell. It relies on the wrapping helper to do the line breaking, while this method supplies the prefixes and width rules.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (clone, new).
 
@@ -4274,11 +4310,11 @@ fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the underlying text content as plain raw lines without wrapping prefixes. This preserves semantic content while dropping viewport-specific indentation.
+**Purpose**: Returns the cell's original text as plain lines, without the visual prefixes or wrapping used on screen. This gives exports or copies the content itself rather than the terminal layout.
 
-**Data flow**: Clones `self.text.lines`, passes them to `plain_lines`, and returns the result. It does not inspect width or mutate state.
+**Data flow**: It clones the stored text lines, passes them through plain_lines, and returns the plain result. It does not use terminal width and does not change the cell.
 
-**Call relations**: This raw-output path complements `display_lines`, allowing transcript export to avoid embedding visual wrap prefixes.
+**Call relations**: This method is used through the HistoryCell interface when the transcript system wants raw content. It deliberately avoids the display wrapping path because raw transcript text should not depend on screen width.
 
 *Call graph*: 1 external calls (clone).
 
@@ -4289,11 +4325,11 @@ fn raw_lines(&self) -> Vec<Line<'static>>
 fn new(parts: Vec<Box<dyn HistoryCell>>) -> Self
 ```
 
-**Purpose**: Constructs a history cell that vertically concatenates multiple child cells. It is used when one transcript artifact is naturally composed of several independently rendered parts.
+**Purpose**: Creates a history cell made from several smaller history cells. This lets a complex transcript entry be built like a small stack of blocks.
 
-**Data flow**: Consumes a `Vec<Box<dyn HistoryCell>>`, stores it in `parts`, and returns the new composite cell. It performs no rendering at construction time.
+**Data flow**: It receives a vector of boxed HistoryCell objects, stores them as parts, and returns a CompositeHistoryCell. The child cells keep their own display, raw text, and hyperlink behavior.
 
-**Call relations**: This constructor is used by higher-level modules that want to combine command lines, summaries, and other subcells into one logical transcript entry.
+**Call relations**: Higher-level builders call this for combined outputs such as token activity, unified execution output, status output with rate limits, and hyperlink-preserving test cases. Later, the composite asks each child cell for its own lines.
 
 *Call graph*: called by 4 (new_token_activity_output, new_unified_exec_processes_output, composite_cell_preserves_child_web_links, new_status_output_with_rate_limits_handle).
 
@@ -4304,11 +4340,11 @@ fn new(parts: Vec<Box<dyn HistoryCell>>) -> Self
 fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Renders each child cell’s visible lines and concatenates them with blank separators between non-empty parts. Empty children are skipped without introducing extra spacing.
+**Purpose**: Returns the normal display lines for all child cells as one combined entry. It inserts a blank line between non-empty parts so separate sections remain visually distinct.
 
-**Data flow**: Reads `self.parts`, iterates in order, calls each child’s `display_lines(width)`, and appends non-empty results into an output vector. Before every non-first non-empty child it inserts `Line::from("")`. It returns the assembled `Vec<Line<'static>>`.
+**Data flow**: It receives a terminal width, asks each child for its display lines at that width, skips empty children, adds a blank separator before every non-first non-empty part, and returns the combined list.
 
-**Call relations**: This method is the visible-rendering composition path for composite cells, mirroring the same separator policy used by the hyperlink and raw variants.
+**Call relations**: The terminal display path calls this when it needs to show a composite entry. This method does not format each section itself; it delegates to the child cells and only controls the joining and spacing.
 
 *Call graph*: 2 external calls (from, new).
 
@@ -4319,11 +4355,11 @@ fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Concatenates child hyperlink-rendered lines with blank hyperlink separators between non-empty parts. It preserves each child’s own hyperlink metadata.
+**Purpose**: Returns hyperlink-aware display lines for all child cells as one combined entry. It preserves each child's own link behavior while adding blank lines between sections.
 
-**Data flow**: Iterates `self.parts`, calls `display_hyperlink_lines(width)` on each child, inserts `HyperlinkLine::from("")` between non-empty child outputs, and returns the combined vector.
+**Data flow**: It receives a width, asks each child for hyperlink display lines, skips empty results, inserts a blank hyperlink line between non-empty parts, and returns the combined hyperlink-aware list.
 
-**Call relations**: This is the hyperlink-aware counterpart to `display_lines`, used when transcript rendering needs clickable links across a multi-part cell.
+**Call relations**: When the renderer wants clickable display output for a composite entry, it calls this method. The composite acts like a coordinator: each child supplies its own hyperlink lines, and the composite stitches them together.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (new).
 
@@ -4334,11 +4370,11 @@ fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 ```
 
-**Purpose**: Builds transcript hyperlink output by concatenating each child’s transcript hyperlink lines with blank separators. It preserves transcript-specific hyperlink behavior of each child.
+**Purpose**: Returns hyperlink-aware lines for transcript output across all child cells. It keeps the same section spacing rule as normal display, but uses each child's transcript-specific hyperlink representation.
 
-**Data flow**: Iterates over `self.parts`, calls `transcript_hyperlink_lines(width)` on each child, inserts blank `HyperlinkLine`s between non-empty sections, and returns the assembled vector.
+**Data flow**: It receives a width, asks each child for transcript hyperlink lines, skips empty children, adds blank separators between non-empty parts, and returns the combined result.
 
-**Call relations**: This method mirrors `display_hyperlink_lines` but respects any child-specific distinction between viewport and transcript hyperlink rendering.
+**Call relations**: Transcript export or transcript rendering code calls this when hyperlinks should be preserved. It hands responsibility for each section to the child cells, then combines their answers in order.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (new).
 
@@ -4349,10 +4385,10 @@ fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Concatenates each child’s raw lines with blank separators between non-empty parts. It produces a plain-text composite transcript representation.
+**Purpose**: Returns plain-text lines for all child cells as one combined entry. It keeps blank separators between non-empty sections so the raw transcript still reads clearly.
 
-**Data flow**: Iterates `self.parts`, calls `raw_lines()` on each child, inserts `Line::from("")` between non-empty child outputs, and returns the combined `Vec<Line<'static>>`.
+**Data flow**: It asks each child for raw lines, skips empty children, inserts a blank plain line between non-empty parts, and returns the full plain-text list. No child cell is changed.
 
-**Call relations**: This raw composition path parallels the visible and hyperlink variants so all output modes preserve the same section boundaries.
+**Call relations**: The raw transcript path calls this when a composite entry must be copied, saved, or compared without terminal styling. The composite relies on each child to produce its own raw text, then joins the pieces.
 
 *Call graph*: 2 external calls (from, new).

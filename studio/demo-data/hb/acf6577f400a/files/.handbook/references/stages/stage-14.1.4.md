@@ -1,10 +1,10 @@
 # Permission and elicitation request ingress  `stage-14.1.4`
 
-This stage is the front door for interactive approval and input requests during normal execution. It sits between tools or MCP-facing integrations that need a decision from a user and the downstream session/review machinery that records, routes, and resolves that decision.
+This stage is the front desk for requests that need a human or policy decision. It sits in the main work loop, when the assistant or an outside MCP integration needs permission, confirmation, or extra information before continuing. MCP means “Model Context Protocol,” a way for other tools to connect to Codex.
 
-On the tool side, core/src/tools/handlers/request_permissions.rs implements the request_permissions entrypoint: it interprets a permission request against the active execution environment, normalizes requested permission profiles, submits the request to the session, and returns the approval result as JSON. core/src/tools/handlers/request_user_input.rs does the same for structured user-input prompts, validating that the call is allowed in the current context, normalizing arguments, and serializing the user’s response.
+The permission request handler lets the model ask for broader access, such as using a file or action that is currently blocked. It checks the request, connects it to the correct workspace, and sends it into the session’s approval path. The user input handler does a similar job when the assistant must pause and ask the human a question, then returns the answer as tool output.
 
-On the MCP side, codex-mcp/src/elicitation.rs is the central bridge for elicitation callbacks. It tracks pending requests, applies approval policy, auto-resolves when possible, or emits protocol events that await a later human or reviewer response. mcp-server/src/exec_approval.rs and mcp-server/src/patch_approval.rs are specialized adapters that package shell-execution and patch-approval questions into MCP elicitation requests, then translate the client’s reply back into Codex approval operations.
+For MCP traffic, elicitation decides whether an outside request is safe to accept, must be rejected by policy, or should be forwarded for review. The exec approval code asks an MCP client before running a shell command. The patch approval code asks before applying code edits. Together, these pieces normalize many kinds of “may I?” and “please answer” moments into the same review machinery.
 
 ## Files in this stage
 
@@ -13,11 +13,13 @@ These handlers accept tool-originated permission and user-input requests, normal
 
 ### `core/src/tools/handlers/request_permissions.rs`
 
-`orchestration` · `tool invocation when elevated environment permissions are requested`
+`orchestration` · `request handling`
 
-This file provides the runtime handler for permission-escalation requests originating from tool calls. `RequestPermissionsHandler` exposes the fixed tool name, builds its schema from the shell-spec helpers, and routes execution into `handle_call`. A small helper struct, `RequestPermissionsEnvironmentArgs`, is used to parse only the optional `environment_id` field first, supporting both `environment_id` and `environmentId` spellings.
+This file is the bridge between a model tool call named `request_permissions` and the system that can approve or deny extra access. Without it, the model could not formally ask to expand its sandbox permissions, so any task needing new file or environment access would get stuck or fail in a less clear way.
 
-The main execution path begins by requiring a `ToolPayload::Function`; unsupported payloads become `RespondToModel` errors. It then parses the environment selector, resolves the target environment with `resolve_tool_environment`, and rejects calls when no primary environment is available. Before parsing the full `RequestPermissionsArgs`, it converts the environment's cwd into a host-native absolute path; if the cwd is not native to the Codex host, the handler returns a model-facing error that includes the problematic cwd. That native cwd is then used as the base path for `parse_arguments_with_base_path`, allowing path-bearing permission arguments to be interpreted correctly. The resulting permission list is normalized through `normalize_additional_permissions`, converted into protocol `RequestPermissionProfile` values, and rejected if empty. Finally, the handler awaits `session.request_permissions_for_environment(...)`, passing turn context, call id, normalized args, the chosen environment selection, and the cancellation token. Cancellation before a response becomes a model-facing error; successful responses are serialized with `serde_json::to_string`, and serialization failures are treated as fatal internal errors. The final tool output is plain text containing the JSON response body with success marked true.
+The handler first identifies itself as the `request_permissions` tool and provides the tool’s public shape, which tells the model how to call it. When a call arrives, it accepts only a function-style payload with JSON arguments. It then looks for an optional environment ID, finds the matching tool environment for the current turn, and makes sure that environment has a host-native current directory. This matters because permission paths need to be interpreted relative to a real path on the machine running Codex.
+
+Next, it parses the requested permissions using that current directory as the base. It normalizes them, meaning it turns different but equivalent permission requests into a consistent internal form. It rejects empty requests, because asking for “no permissions” is not useful. Finally, it asks the session to request those permissions for the selected environment, waits for a response unless the operation is cancelled, serializes the response as JSON text, and returns it to the model.
 
 #### Function details
 
@@ -27,11 +29,11 @@ The main execution path begins by requiring a `ToolPayload::Function`; unsupport
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical tool name `request_permissions`. This is the identifier used for dispatching model tool calls.
+**Purpose**: This function gives the handler its public tool name: `request_permissions`. The registry uses this name to match an incoming model tool call to this handler.
 
-**Data flow**: Creates a `ToolName` from the static string via `ToolName::plain` and returns it.
+**Data flow**: It takes the handler itself as input, reads no outside state, and creates a plain tool name value containing `request_permissions`. The output is that tool name, ready for the tool system to compare and register.
 
-**Call relations**: Queried by the tool registry/runtime before execution.
+**Call relations**: When the tool registry asks this handler what it is called, this function answers with the exact name the model will use. It relies on the shared tool-name helper to build the name in the standard format.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -42,11 +44,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the tool specification for permission requests using the shell-spec helpers. The description is supplied dynamically by `request_permissions_tool_description`.
+**Purpose**: This function describes how the `request_permissions` tool should look to the model. It supplies the tool definition and human-readable description used when exposing the tool.
 
-**Data flow**: Calls `request_permissions_tool_description()` to obtain descriptive text, passes that into `create_request_permissions_tool(...)`, and returns the resulting `ToolSpec`.
+**Data flow**: It takes the handler, asks for the standard request-permissions description, and passes that into the tool-spec builder. The output is a complete tool specification that says what arguments the tool accepts and what it is for.
 
-**Call relations**: Used during tool publication so the model sees the correct schema and description.
+**Call relations**: During tool registration or tool listing, the system calls this function so the model can be told how to use `request_permissions`. It delegates the actual wording and schema construction to the shell-spec helpers, keeping this file focused on the handler flow.
 
 *Call graph*: calls 2 internal fn (create_request_permissions_tool, request_permissions_tool_description).
 
@@ -57,11 +59,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async permission-request workflow to the executor trait's boxed future interface. It delegates all real work to `handle_call`.
+**Purpose**: This function is the entry point used when the model actually calls the tool. It starts the real asynchronous work and wraps it in the future type expected by the tool framework.
 
-**Data flow**: Takes a `ToolInvocation`, calls `self.handle_call(invocation)`, boxes the future, and returns it.
+**Data flow**: It receives a full tool invocation, including the session, turn, call ID, payload, and cancellation token. It passes that invocation into `handle_call`, pins the resulting asynchronous task so it can be safely awaited, and returns that task to the caller.
 
-**Call relations**: This is the runtime entrypoint invoked after dispatch.
+**Call relations**: The tool framework calls this when it has matched an incoming tool call to `RequestPermissionsHandler`. This function does not inspect the request itself; it hands everything to `handle_call`, which performs the validation, permission request, and response creation.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -75,24 +77,24 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates payload shape, resolves the target environment, parses and normalizes requested permissions, submits the request for approval, and returns the serialized response. It contains the file's full operational logic.
+**Purpose**: This function performs the actual permission request flow. It validates the model’s arguments, finds the correct environment, normalizes the requested permissions, asks the session for approval, and turns the answer into tool output.
 
-**Data flow**: Reads `session`, `turn`, `cancellation_token`, `call_id`, and `payload` from the invocation; extracts the raw arguments string only from `ToolPayload::Function`, otherwise returns `RespondToModel`; parses `RequestPermissionsEnvironmentArgs` from the arguments; resolves the selected environment with `resolve_tool_environment`; reads the environment cwd and converts it to a native absolute path, mapping conversion failures into model-facing errors; parses full `RequestPermissionsArgs` relative to that base path via `parse_arguments_with_base_path`; normalizes `args.permissions` with `normalize_additional_permissions`, converts each normalized permission into a protocol profile, and rejects an empty permission set; awaits `session.request_permissions_for_environment(&turn, call_id, args, turn_environment.selection(), cancellation_token)` and errors if it returns `None`; serializes the response to JSON text with `serde_json::to_string`, mapping serialization failures to `FunctionCallError::Fatal`; then wraps the JSON string in `FunctionToolOutput::from_text(..., Some(true))` and boxes it.
+**Data flow**: It receives a tool invocation. First it extracts the JSON arguments from the payload and rejects unsupported payload types with a message for the model. It parses any environment ID, resolves the matching environment for the current turn, converts that environment’s current directory into a host-native absolute path, then parses the permission request relative to that path. It normalizes the permissions, rejects an empty permission list, and sends the request to the session along with the turn, call ID, environment selection, and cancellation token. If a response arrives, it serializes that response to JSON text and wraps it as successful tool output. If parsing fails, the environment is missing, the request is empty, or the operation is cancelled, it returns an error message for the model; if response serialization fails, it returns a fatal internal error.
 
-**Call relations**: Called only from `RequestPermissionsHandler::handle`. It delegates argument decoding to the shared parsing helpers and environment lookup to `resolve_tool_environment`, then hands the normalized request to the session's permission-request mechanism.
+**Call relations**: This is called by `RequestPermissionsHandler::handle` after the tool framework receives a `request_permissions` call. It uses shared parsing helpers to understand the JSON, shared environment resolution to choose where the request applies, and shared permission normalization so later code receives a clean permission profile. It then hands the actual approval request to the session, which is the part of the system that can communicate the request and return the decision.
 
 *Call graph*: calls 6 internal fn (from_text, boxed_tool_output, parse_arguments, parse_arguments_with_base_path, resolve_tool_environment, normalize_additional_permissions); called by 1 (handle); 2 external calls (to_string, RespondToModel).
 
 
 ### `core/src/tools/handlers/request_user_input.rs`
 
-`domain_logic` · `tool invocation / request handling`
+`orchestration` · `request handling`
 
-This file defines `RequestUserInputHandler`, a `ToolExecutor<ToolInvocation>` whose behavior is gated by a configured list of allowed `ModeKind` values. The trait methods are thin adapters: `tool_name` returns the shared constant, `spec` delegates to the spec builder with a mode-aware description, and `handle` boxes the async `handle_call` future.
+This file is the bridge between a model tool call named `request_user_input` and the real user-facing session. Its job is to make sure the assistant can ask the person a question only when that is safe and supported. Without this file, the model might call the tool but nothing would connect that request to the session, or worse, non-root helper agents could interrupt the user directly.
 
-The substantive logic lives in `handle_call`. It destructures the incoming `ToolInvocation`, rejects any non-function payload with a model-facing error, and then enforces a key multi-agent invariant: only the root thread may ask the user questions. If `turn.session_source.is_non_root_agent()` is true, the call fails immediately. Next it reads the current collaboration mode from `session.collaboration_mode().await.mode` and asks `request_user_input_unavailable_message` whether the tool is allowed in that mode; disallowed modes also produce a model-facing error.
+The central type is `RequestUserInputHandler`. It knows which collaboration modes allow user input requests. When the tool system asks what tool this handler represents, it gives back the tool name and a tool specification, which is the description and shape of the arguments the model is allowed to send.
 
-For valid calls, the handler parses JSON arguments into `RequestUserInputArgs`, normalizes them via `normalize_request_user_input_args` (which enforces non-empty options and adjusts flags/ranges), and awaits `session.request_user_input(...)`. A cancelled or absent response becomes a recoverable model error; successful responses are serialized with `serde_json::to_string`. Serialization failure is treated as fatal. The final output is wrapped as `FunctionToolOutput::from_text(content, Some(true))`, signaling a successful tool call whose body is the JSON-encoded user response.
+When a call arrives, the handler first confirms the payload is really a function-style tool call. It then blocks calls from non-root agents, because only the main conversation thread is allowed to ask the human directly. Next it checks the current collaboration mode and returns a clear message if this tool is unavailable. If the request is allowed, it parses and normalizes the arguments, asks the session to request input from the user, waits for the answer, serializes that answer as JSON text, and wraps it as normal tool output for the model.
 
 #### Function details
 
@@ -102,11 +104,11 @@ For valid calls, the handler parses JSON arguments into `RequestUserInputArgs`, 
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical tool name for this handler. The name is the plain `request_user_input` identifier used by the registry and model.
+**Purpose**: This tells the tool registry the exact name of the tool this handler serves. The name is how a model tool call is matched to this handler.
 
-**Data flow**: It reads no mutable state beyond the shared constant `REQUEST_USER_INPUT_TOOL_NAME`, passes it to `ToolName::plain`, and returns the resulting `ToolName` value.
+**Data flow**: It reads no outside state from the handler. It takes the fixed `request_user_input` tool name constant, turns it into a plain `ToolName`, and returns that value to the tool system.
 
-**Call relations**: The tool registry calls this when registering or dispatching the handler. `handle_call` also indirectly relies on the same name constant for consistent error messages and invocation identity.
+**Call relations**: When the core tool runtime registers or looks up tools, it calls this method to identify the handler. This method hands the name off by using `plain`, so the rest of the system can compare tool calls against the standard tool name format.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -117,11 +119,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the model-visible tool specification with wording tailored to the handler's allowed collaboration modes. It keeps the runtime policy and prompt text aligned.
+**Purpose**: This builds the public description of the `request_user_input` tool that the model sees. It includes wording based on which collaboration modes are available, so the model gets an accurate idea of when the tool can be used.
 
-**Data flow**: It reads `self.available_modes`, converts them into a descriptive sentence via `request_user_input_tool_description`, then passes that string into `create_request_user_input_tool` and returns the resulting `ToolSpec`.
+**Data flow**: It reads `available_modes` from the handler. It uses those modes to create a human-readable tool description, then wraps that description into a full tool specification and returns it.
 
-**Call relations**: This method is invoked by the tool registration path when exposing the handler to the model. It delegates all schema construction to the companion spec module and only contributes the mode-specific description.
+**Call relations**: The tool registry calls this when it needs to advertise available tools to the model. This method delegates the wording to `request_user_input_tool_description` and the final tool shape to `create_request_user_input_tool`.
 
 *Call graph*: calls 2 internal fn (create_request_user_input_tool, request_user_input_tool_description).
 
@@ -132,11 +134,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation into the boxed future type expected by the `ToolExecutor` trait. It does not perform validation itself.
+**Purpose**: This is the entry point used by the tool system when the model actually calls `request_user_input`. It turns the real work into an asynchronous task, meaning the system can wait for the user without blocking everything else.
 
-**Data flow**: It takes a `ToolInvocation`, calls `self.handle_call(invocation)`, wraps that future with `Box::pin`, and returns it as `codex_tools::ToolExecutorFuture<'_>`.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, conversation turn, call id, and tool payload. It passes that invocation to `handle_call`, boxes the resulting future, and returns it to the tool runtime.
 
-**Call relations**: The tool runtime invokes this entrypoint for each tool call. It exists solely to route execution into `handle_call`, where all actual request processing occurs.
+**Call relations**: The tool runtime calls this after matching a model tool call to this handler. This method does not process the request itself; it hands the invocation to `handle_call`, which performs all validation, user prompting, and output creation.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -150,11 +152,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Processes a `request_user_input` invocation end-to-end: validates payload type and thread origin, checks mode availability, parses and normalizes arguments, waits for the user's answer, and returns it as tool output.
+**Purpose**: This performs the full `request_user_input` workflow: validate the call, check permissions, ask the session to contact the user, and package the user's reply for the model. It is the safety gate and delivery path for this tool.
 
-**Data flow**: It consumes a `ToolInvocation`, extracting `session`, `turn`, `call_id`, and `payload`. From `ToolPayload::Function` it reads the raw JSON `arguments`; any other payload yields `FunctionCallError::RespondToModel`. It reads `turn.session_source` to reject non-root-agent threads, then awaits `session.collaboration_mode()` and checks the current mode against `self.available_modes` using `request_user_input_unavailable_message`. It parses `arguments` into `RequestUserInputArgs` with `parse_arguments`, normalizes them with `normalize_request_user_input_args`, and passes the result to `session.request_user_input(turn.as_ref(), call_id, args).await`. A missing response becomes a model-facing cancellation error. Otherwise it serializes the response with `serde_json::to_string`, converts that string into `FunctionToolOutput::from_text(content, Some(true))`, boxes it with `boxed_tool_output`, and returns it.
+**Data flow**: It receives a `ToolInvocation` and pulls out the session, turn, call id, and payload. If the payload is not a function call, it returns an error message for the model. If the call comes from a non-root agent, it returns an error because only the main thread may ask the user. It then checks the session's current collaboration mode against the handler's available modes. If the mode does not allow user input, it returns the appropriate unavailable message. Otherwise it parses the JSON-like argument text into `RequestUserInputArgs`, normalizes those arguments, sends the request to the session, waits for the user's response, converts that response to JSON text, and returns it as boxed tool output. If the request is cancelled before a response arrives, it reports that back to the model; if response serialization fails, it returns a fatal error.
 
-**Call relations**: This is called only by `handle`. It delegates schema-level parsing and normalization to the spec/helpers module, delegates the actual user interaction to `session.request_user_input`, and translates each failure mode into either a recoverable model response error or a fatal serialization error.
+**Call relations**: This method is called by `RequestUserInputHandler::handle` whenever the model invokes the tool. It relies on `parse_arguments` and `normalize_request_user_input_args` to turn the model's raw arguments into safe structured data, uses `request_user_input_unavailable_message` to enforce mode rules, calls the session's user-input request path to get the actual human response, and finally uses `FunctionToolOutput::from_text` and `boxed_tool_output` to hand the result back in the standard tool-output form.
 
 *Call graph*: calls 5 internal fn (from_text, boxed_tool_output, parse_arguments, normalize_request_user_input_args, request_user_input_unavailable_message); called by 1 (handle); 3 external calls (format!, to_string, RespondToModel).
 
@@ -164,13 +166,13 @@ This bridge tracks MCP elicitation requests, applies approval policy, and routes
 
 ### `codex-mcp/src/elicitation.rs`
 
-`domain_logic` · `interactive request handling`
+`orchestration` · `request handling`
 
-This module encapsulates the state and policy around MCP elicitations. `ElicitationRequestManager` stores a Tokio `Mutex`-protected responder map keyed by `(server_name, RequestId)`, plus standard-mutex-protected approval policy, permission profile, and an `auto_deny` flag that can be changed at runtime. An optional `ElicitationReviewer` hook allows a higher-level reviewer to intercept requests before they are emitted as protocol events.
+An MCP server can sometimes ask Codex to “elicit” something, meaning it wants Codex to ask the user for input, confirmation, or permission. This file is the gatekeeper for those requests. Without it, Codex would have no reliable way to apply approval rules, show the request to the user, and later connect the user’s answer back to the waiting MCP server.
 
-The main entry point is `make_sender`, which returns the `SendElicitation` callback RMCP clients use. The generated async closure first checks the `auto_deny` flag and immediately declines if set. It then snapshots the current approval policy and permission profile; if MCP permission prompts are auto-approved and the elicitation is a form with no requested properties, it auto-accepts with empty JSON content. If policy rejects MCP elicitations entirely, it auto-declines. Next, if a reviewer exists, the closure packages an `ElicitationReviewRequest` and gives the reviewer a chance to return a response directly.
+The main piece is ElicitationRequestManager. It keeps a table of open requests, keyed by server name and request id, with a one-time reply channel for each request. Think of it like a coat-check desk: when a request is sent out for review, the manager keeps the ticket so the eventual answer can be returned to the right waiting server.
 
-Only if none of those fast paths apply does the code serialize the RMCP elicitation into a protocol-layer `ElicitationRequest` enum, create a oneshot channel, store the sender in the responder map, and emit an `EventMsg::ElicitationRequest` with a fixed event ID `mcp_elicitation_request`. Later, `resolve` removes the stored responder and forwards the chosen `ElicitationResponse`; missing requests and send failures become `anyhow` errors. The helper functions make the policy explicit: `elicitation_is_rejected_by_policy` maps `AskForApproval` variants to a boolean, and `can_auto_accept_elicitation` only approves empty form schemas, never URL elicitations.
+When a new elicitation arrives, the manager first checks a global auto-deny switch. If that is on, it declines immediately. Next it checks Codex’s approval policy and permission profile. Some very simple form confirmations can be safely auto-accepted, but URL-based requests and forms asking for specific fields are not auto-accepted. If policy forbids elicitation, the request is declined. If a custom reviewer exists, it gets a chance to answer. Otherwise the request is converted into a Codex protocol event and sent outward, then the manager waits for resolve to deliver the final response.
 
 #### Function details
 
@@ -184,11 +186,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a new elicitation manager with empty pending-request state and initial policy/profile values. It also stores an optional reviewer hook.
+**Purpose**: Creates a new manager for MCP elicitation requests. It stores the current approval policy, permission profile, optional reviewer, and an empty list of requests waiting for answers.
 
-**Data flow**: Consumes an `AskForApproval`, a `PermissionProfile`, and an optional `ElicitationReviewerHandle`; initializes an empty `HashMap` inside an async `Mutex`, wraps the policy, profile, and `auto_deny = false` in `Arc<StdMutex<_>>`, stores the reviewer, and returns the manager.
+**Data flow**: It receives an approval policy, a permission profile, and optionally a reviewer object. It wraps shared state in safe shared containers so different async tasks can read or update it, starts with no pending requests, and sets auto-deny to false. The result is a ready-to-use ElicitationRequestManager.
 
-**Call relations**: Called by `McpConnectionManager::new`, `new_uninitialized_with_permission_profile`, and direct tests that exercise elicitation behavior without a full manager.
+**Call relations**: This is used during setup paths that create Codex MCP support, including normal construction, uninitialized construction with a permission profile, and tests around auto-accept behavior. It prepares the shared state that later functions such as make_sender, resolve, auto_deny, and set_auto_deny rely on.
 
 *Call graph*: called by 4 (new, new_uninitialized_with_permission_profile, disabled_permissions_auto_accept_elicitation_with_empty_form_schema, disabled_permissions_do_not_auto_accept_elicitation_with_requested_fields); 4 external calls (new, new, new, new).
 
@@ -199,11 +201,11 @@ fn new(
 fn auto_deny(&self) -> bool
 ```
 
-**Purpose**: Returns the current blanket auto-deny flag for elicitation requests. Poisoned mutexes fall back to `false`.
+**Purpose**: Reports whether the manager is currently set to automatically reject all elicitation requests. This is useful for checking the current safety mode.
 
-**Data flow**: Locks `self.auto_deny`, copies the contained bool on success, and returns `false` if locking fails.
+**Data flow**: It reads the stored auto-deny flag through a lock, which is a guard that prevents two pieces of code from changing the same value at once. If the flag can be read, it returns that value; if the lock is unavailable because of an error, it safely returns false.
 
-**Call relations**: Exposed through `McpConnectionManager::elicitations_auto_deny` for runtime inspection.
+**Call relations**: This is called by elicitations_auto_deny when the wider system needs to know the current auto-deny setting. The value it returns also matches the flag that make_sender checks before deciding whether to decline new requests immediately.
 
 *Call graph*: called by 1 (elicitations_auto_deny).
 
@@ -214,11 +216,11 @@ fn auto_deny(&self) -> bool
 fn set_auto_deny(&self, auto_deny: bool)
 ```
 
-**Purpose**: Updates the blanket auto-deny flag controlling whether all future elicitation requests are immediately declined. Poisoned mutexes are ignored.
+**Purpose**: Turns automatic rejection of elicitation requests on or off. This lets the rest of Codex quickly stop MCP servers from asking the user for anything.
 
-**Data flow**: Attempts to lock `self.auto_deny`, writes the provided bool into it on success, and returns unit.
+**Data flow**: It receives a boolean value: true means reject all future elicitation requests, false means allow normal policy checks again. It locks the stored flag and replaces the old value with the new one. It does not return a value.
 
-**Call relations**: Exposed through `McpConnectionManager::set_elicitations_auto_deny` for runtime control.
+**Call relations**: This is called by set_elicitations_auto_deny when the broader system changes the elicitation safety setting. Later, make_sender reads this flag for each incoming request, and auto_deny can report the current setting.
 
 *Call graph*: called by 1 (set_elicitations_auto_deny).
 
@@ -234,11 +236,11 @@ async fn resolve(
     ) -> Result<()>
 ```
 
-**Purpose**: Resolves a previously emitted elicitation request by removing its stored responder and sending the chosen response through the oneshot channel. It errors if the request is unknown or the receiver has gone away.
+**Purpose**: Completes a pending elicitation request by sending back the user’s or reviewer’s answer. This is the bridge from an external decision back to the MCP server that is waiting.
 
-**Data flow**: Consumes `server_name`, `RequestId`, and `ElicitationResponse`, locks `self.requests`, removes the responder keyed by `(server_name, id)`, returns an `anyhow!` not-found error if absent, otherwise sends the response through the oneshot sender and maps send failure into an `anyhow!` error.
+**Data flow**: It receives the server name, request id, and the chosen ElicitationResponse. It looks up the matching waiting request in the pending-request table, removes it so it cannot be answered twice, and sends the response through the saved one-time channel. It returns success if the response was delivered, or an error if no matching request exists or the receiver is gone.
 
-**Call relations**: Called by `McpConnectionManager::resolve_elicitation` after a user or reviewer decision arrives.
+**Call relations**: This is called by resolve_elicitation after Codex has received an answer for a previously surfaced request. It pairs with make_sender: make_sender stores the response channel when it emits a request event, and resolve later finds that channel to finish the conversation.
 
 *Call graph*: called by 1 (resolve_elicitation).
 
@@ -253,11 +255,11 @@ fn make_sender(
     ) -> SendElicitation
 ```
 
-**Purpose**: Builds the RMCP-facing elicitation callback that applies policy, optional reviewer interception, event emission, and deferred response tracking. This is the core integration point between RMCP clients and Codex protocol events.
+**Purpose**: Builds the callback that the MCP client uses whenever a server asks for elicitation. This callback applies safety policy, optionally asks a reviewer, emits a Codex event if human input is needed, and waits for the final answer.
 
-**Data flow**: Takes a `server_name` and event sender, clones shared state into a boxed async closure, and returns that closure. When invoked with a request ID and `CreateElicitationRequestParams`, the closure reads `auto_deny`; if true it returns a decline response. Otherwise it snapshots approval policy and permission profile, checks `mcp_permission_prompt_is_auto_approved` plus `can_auto_accept_elicitation` to possibly return an accept response with empty JSON content, checks `elicitation_is_rejected_by_policy` to possibly decline, optionally asks the reviewer and returns any reviewer-provided response, converts the RMCP elicitation into protocol-layer `ElicitationRequest::Form` or `::Url` by serializing metadata/schema as needed, creates a oneshot channel, stores the sender in the pending-request map under `(server_name.clone(), id.clone())`, emits an `EventMsg::ElicitationRequest` carrying a protocol `RequestId` converted from the RMCP numeric-or-string ID, then awaits the oneshot receiver and returns the eventual `ElicitationResponse` or a channel-closed error.
+**Data flow**: It receives a server name and an event sender. It returns a boxed async function. When that returned function is called with a request id and elicitation details, it checks the auto-deny flag, approval policy, and permission profile. It may immediately return a decline, immediately return a safe empty accept, or ask an optional reviewer. If no answer is available yet, it converts the MCP request into Codex’s event format, stores a one-time response channel in the pending-request map, sends an ElicitationRequest event outward, and waits until resolve provides the response.
 
-**Call relations**: This callback is handed to RMCP clients by higher-level startup code. It composes the helper functions `elicitation_is_rejected_by_policy` and `can_auto_accept_elicitation`, and it is the only place pending responders are inserted into the map later consumed by `resolve`.
+**Call relations**: This is the main request-time path for the file. It uses the shared state created by ElicitationRequestManager::new, depends on the policy helper elicitation_is_rejected_by_policy and the safety helper can_auto_accept_elicitation, and creates the waiting entry that ElicitationRequestManager::resolve later completes.
 
 *Call graph*: 1 external calls (new).
 
@@ -268,11 +270,11 @@ fn make_sender(
 fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool
 ```
 
-**Purpose**: Determines whether the current approval policy should reject MCP elicitations outright. Only `Never` and granular configs that disallow MCP elicitations return true.
+**Purpose**: Answers a simple policy question: does the current approval setting forbid MCP elicitation requests? It keeps the policy decision in one small, readable place.
 
-**Data flow**: Matches on `AskForApproval` and returns `true` for `Never`, `false` for `OnFailure`, `OnRequest`, and `UnlessTrusted`, and for `Granular` returns the negation of `granular_config.allows_mcp_elicitations()`.
+**Data flow**: It receives an AskForApproval policy value. For the Never policy it returns true, meaning elicitation should be declined. For most approval modes it returns false, meaning elicitation may continue. For granular approval settings, it asks whether MCP elicitations are allowed and returns true only when they are not.
 
-**Call relations**: Used inside `make_sender` and directly by tests to document policy behavior.
+**Call relations**: This helper is used during the decision flow built by ElicitationRequestManager::make_sender. After auto-accept has been considered, this check decides whether the request must be declined before it can reach a reviewer or user-facing event.
 
 
 ##### `can_auto_accept_elicitation`  (lines 246–256)
@@ -281,11 +283,11 @@ fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool
 fn can_auto_accept_elicitation(elicitation: &CreateElicitationRequestParams) -> bool
 ```
 
-**Purpose**: Determines whether an elicitation is safe to auto-accept without user input. Only form elicitations with no schema properties qualify.
+**Purpose**: Decides whether an elicitation request is simple and safe enough to accept automatically. It is intentionally conservative.
 
-**Data flow**: Matches on `CreateElicitationRequestParams`; for `FormElicitationParams` it reads `requested_schema.properties.is_empty()` and returns that bool, while `UrlElicitationParams` always return `false`.
+**Data flow**: It receives the MCP elicitation details. If the request is a form and the form schema asks for no fields, it returns true, treating it like a plain confirmation. If the form asks for any fields, or if the request is URL-based, it returns false. It does not change anything.
 
-**Call relations**: Used by `make_sender` together with permission auto-approval checks to implement the empty-form fast path.
+**Call relations**: This helper supports ElicitationRequestManager::make_sender during the auto-approval path. Even when the broader permission policy allows automatic approval, this function prevents Codex from auto-accepting requests that ask for actual user data or involve opening or approving a URL.
 
 
 ### Approval-specific MCP ingress
@@ -293,11 +295,13 @@ These adapters construct concrete MCP elicitation requests for execution and pat
 
 ### `mcp-server/src/exec_approval.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This file is the bridge between Codex’s internal execution-approval flow and the MCP client-facing elicitation protocol. It defines the exact JSON payload shape sent in `elicitation/create`: `ExecApprovalElicitRequestParams` includes the human-readable prompt text, an empty object schema in `requestedSchema`, and a set of Codex correlation fields such as `threadId`, tool call/event/call identifiers, the raw command vector, working directory, and parsed command structure. The companion `ExecApprovalResponse` expects only a `decision: ReviewDecision`, even though the comment notes this is not yet fully aligned with the MCP elicitation result schema.
+Codex sometimes wants to run a command on the user’s machine, such as a build command or a file search. That can be risky, so this file creates a checkpoint: it asks the connected MCP client whether the command should be allowed. MCP means Model Context Protocol, a standard way for tools and clients to exchange structured messages.
 
-The request path first renders a shell-safe display string with `shlex::try_join`, falling back to a plain space-joined command if escaping fails, then asks whether Codex may run that command in the given directory. Serialization failure is treated as a client-parameter problem and returned immediately as JSON-RPC `invalid_params`. On success, the file sends an outbound MCP request and receives a oneshot channel for the eventual response. Crucially, response handling is detached onto a Tokio task so the main message-processing loop never blocks waiting for user approval. The response path is conservative: if the oneshot is dropped, it logs and exits; if JSON deserialization fails, it synthesizes a denied decision; then it submits `Op::ExecApproval` back into the `CodexThread`, attaching the approval id and original event id as `turn_id`.
+The main flow is simple. When Codex needs command approval, this file builds a readable message like “Allow Codex to run `...` in `...`?” It also packages extra details, such as the command, working directory, thread id, and Codex event ids, so the client can show useful context and match the answer back to the right tool call. It sends that package as an `elicitation/create` request, which is MCP’s way of asking the client to get input from the user.
+
+The reply is handled asynchronously, meaning the main Codex loop does not have to sit and wait. Think of it like leaving a note with a receptionist and continuing work until the answer comes back. When the answer arrives, the file reads the approval decision and submits it back into Codex as an `ExecApproval` operation. If the response is malformed, it chooses the safer option and denies the command.
 
 #### Function details
 
@@ -312,11 +316,11 @@ async fn handle_exec_approval_request(
     request_id: Reque
 ```
 
-**Purpose**: Constructs the MCP `elicitation/create` request for an execution approval prompt and dispatches it to the client. It packages both user-visible text and Codex correlation metadata, then arranges asynchronous follow-up when the client responds.
+**Purpose**: This starts the approval process for a command Codex wants to run. It prepares a user-facing permission request, sends it to the MCP client, and sets up a background listener for the answer.
 
-**Data flow**: Inputs are the command vector, cwd, outgoing sender, Codex thread handle, JSON-RPC request id, tool/event/call/approval identifiers, parsed command list, and thread id. It derives an escaped command string, formats the approval message, fills an `ExecApprovalElicitRequestParams` struct, serializes it to `serde_json::Value`, and on success sends an outbound request through `OutgoingMessageSender::send_request`; on serialization failure it logs and emits `ErrorData::invalid_params` tied to the original request id. Its side effects are sending either an MCP error or an MCP request, and spawning a Tokio task that waits for the elicitation response.
+**Data flow**: It receives the command, the working folder, Codex identifiers, an outgoing message sender, and the Codex thread to report back to. It turns the command into a readable shell-like string, builds a JSON request containing both the display message and Codex tracking details, and sends that request to the client. If the request cannot be converted to JSON, it sends an error back instead. Otherwise, it returns immediately after spawning a background task that will wait for the client’s response.
 
-**Call relations**: It is invoked from `run_codex_tool_session_inner` when a Codex tool session reaches an execution approval checkpoint. After sending the request, it delegates the eventual reply processing to `on_exec_approval_response` in a spawned task so the caller can continue servicing the agent loop without waiting on user input.
+**Call relations**: This function is called by `run_codex_tool_session_inner` when a Codex tool session reaches a command that needs approval. It sends the MCP `elicitation/create` request through the outgoing message sender, then hands the waiting part to `on_exec_approval_response` so the main agent loop can keep running.
 
 *Call graph*: calls 1 internal fn (on_exec_approval_response); called by 1 (run_codex_tool_session_inner); 8 external calls (invalid_params, clone, error!, format!, json!, to_value, try_join, spawn).
 
@@ -332,24 +336,24 @@ async fn on_exec_approval_response(
 )
 ```
 
-**Purpose**: Waits for the client’s elicitation reply, interprets it as an execution approval decision, and submits that decision back into the running Codex thread. If the reply is malformed, it denies by default.
+**Purpose**: This waits for the client’s answer to the command approval prompt and tells Codex whether the command was approved or denied. It is the return path from the user-facing prompt back into Codex’s internal workflow.
 
-**Data flow**: Inputs are the approval id, event id, a oneshot receiver carrying raw JSON, and the shared `CodexThread`. It awaits the receiver, logs and returns if the request channel failed, otherwise deserializes the JSON into `ExecApprovalResponse`; deserialization errors are logged and replaced with `ReviewDecision::Denied`. It then submits `Op::ExecApproval { id, turn_id: Some(event_id), decision }` to Codex, producing only logging side effects on failure and no return value.
+**Data flow**: It receives an approval id, an event id, a one-time response channel, and the Codex thread. It waits for a JSON value from the client, tries to read it as an `ExecApprovalResponse`, and extracts the approval decision. If waiting fails, it logs the problem and stops. If the response cannot be understood, it logs the problem and treats the decision as denied for safety. It then submits an `ExecApproval` operation to Codex with the original ids and the final decision.
 
-**Call relations**: It is only launched by `handle_exec_approval_request` after an outbound `elicitation/create` request has been sent. Its sole downstream action is the `codex.submit(...)` call that resumes the internal approval workflow with the user’s decision.
+**Call relations**: This function is launched in the background by `handle_exec_approval_request` after the approval prompt has been sent. Its job is to complete that earlier request: once the MCP client replies, it passes the decision back into `CodexThread` so Codex can either run the command or avoid it.
 
 *Call graph*: called by 1 (handle_exec_approval_request); 1 external calls (error!).
 
 
 ### `mcp-server/src/patch_approval.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This file mirrors the execution-approval bridge but for proposed file modifications. `PatchApprovalElicitRequestParams` defines the exact request payload sent to the MCP client: a prompt message, empty `requestedSchema`, `threadId`, Codex correlation identifiers, optional `codex_reason`, optional `codex_grant_root`, and a `HashMap<PathBuf, FileChange>` describing the proposed edits. `PatchApprovalResponse` is the minimal expected reply shape containing only a `ReviewDecision`.
+Codex may prepare changes to files, but it should not always apply them without a human or client saying yes. This file is the bridge for that moment. It packages the proposed file changes, the reason for the change, and several IDs that let the system connect the answer back to the original tool call. Then it sends an MCP request named `elicitation/create`, which means “ask the client to provide a response.” Think of it like handing a permission slip to the user interface: “Codex wants to edit these files; should it proceed?”
 
-`handle_patch_approval_request` assembles a user-facing message from an optional reason plus the fixed question "Allow Codex to apply proposed code changes?". It uses the `call_id` itself as the approval id, serializes the full parameter struct, and if serialization fails sends a JSON-RPC `invalid_params` error tied to the original request id. Otherwise it sends an `elicitation/create` request through `OutgoingMessageSender` and spawns a detached task to await the response.
+The file defines the shape of that permission slip with `PatchApprovalElicitRequestParams`, and the expected answer with `PatchApprovalResponse`. The answer contains a `ReviewDecision`, such as approval or denial.
 
-The response path is slightly stricter than exec approval: if the oneshot receiver fails, it not only logs the failure but also proactively submits `Op::PatchApproval { decision: Denied }` back to Codex so the pending approval cannot hang indefinitely. If deserialization fails, it again defaults to denial. On success, it submits the chosen decision to the `CodexThread`. This conservative-deny behavior is an important invariant: malformed or missing client replies never authorize file changes.
+A key detail is that the file does not wait in place for the user’s answer. After sending the request, it starts a separate asynchronous task. An asynchronous task is work that can continue in the background while the main loop keeps running. When the answer arrives, the task converts it into a Codex operation, `Op::PatchApproval`, and submits it back to the running Codex thread. If anything goes wrong, such as a failed request or unreadable response, the code chooses the safe default: deny the patch.
 
 #### Function details
 
@@ -364,11 +368,11 @@ async fn handle_patch_approval_request(
     outgoing: Arc<OutgoingMessageSe
 ```
 
-**Purpose**: Constructs the MCP `elicitation/create` request for patch approval and sends it to the client. It includes both the human prompt and the structured file-change payload Codex wants reviewed.
+**Purpose**: This function starts the approval process when Codex wants to apply code changes. It builds a clear request for the client, sends it out, and sets up background work to process the eventual answer.
 
-**Data flow**: Inputs are the call id, optional reason, optional grant root, map of changed files to `FileChange`, outgoing sender, Codex thread handle, original request id, tool call id, event id, and thread id. It derives `approval_id` from `call_id`, builds a multi-line message from the optional reason plus the fixed approval question, fills `PatchApprovalElicitRequestParams`, serializes it to JSON, and on failure logs and sends `ErrorData::invalid_params`. On success it sends `elicitation/create` via `OutgoingMessageSender::send_request` and spawns a Tokio task to await the reply.
+**Data flow**: It receives the patch approval details: the approval ID, optional reason, optional project root to grant access to, the proposed file changes, the current Codex thread, the outgoing message sender, and IDs that identify the request and tool call. It turns these into `PatchApprovalElicitRequestParams`, including a user-facing message asking whether Codex may apply the proposed changes. It serializes those parameters into JSON, because MCP messages are sent as structured JSON data. If serialization fails, it sends an error response back through the outgoing message sender and stops. If serialization succeeds, it sends an `elicitation/create` request and receives a one-time channel that will later carry the client's answer. It then starts a background task that will wait for that answer.
 
-**Call relations**: It is called by `run_codex_tool_session_inner` when Codex proposes applying code changes that require review. After dispatching the request, it delegates asynchronous completion to `on_patch_approval_response` so the main session loop remains responsive.
+**Call relations**: This function is called by `run_codex_tool_session_inner` when a Codex tool session reaches a point where patch approval is needed. It does the outward-facing part of the flow: asking the client. It then hands the waiting-and-submitting part to `on_patch_approval_response` so the main Codex agent loop is not blocked while waiting for the user or client to respond.
 
 *Call graph*: calls 1 internal fn (on_patch_approval_response); called by 1 (run_codex_tool_session_inner); 8 external calls (invalid_params, new, clone, error!, format!, json!, to_value, spawn).
 
@@ -383,10 +387,10 @@ async fn on_patch_approval_response(
 )
 ```
 
-**Purpose**: Waits for the client’s patch-approval reply and submits the resulting decision to Codex, defaulting to denial on transport or decoding failure. It explicitly denies on dropped response channels to avoid leaving approvals unresolved.
+**Purpose**: This function finishes the approval process after the client answers the permission request. It converts the client response into a Codex patch-approval operation, using denial as the safe fallback if the response fails or cannot be read.
 
-**Data flow**: Inputs are the approval id, a oneshot receiver of raw JSON, and the shared `CodexThread`. It awaits the receiver; if that fails, it logs and submits `Op::PatchApproval { id: approval_id.clone(), decision: Denied }`, logging again if even that submission fails. If a JSON value arrives, it deserializes to `PatchApprovalResponse`, replacing decode failures with `Denied`, then submits `Op::PatchApproval { id: approval_id, decision }` to Codex. It returns unit and only emits logs on failure paths.
+**Data flow**: It receives the approval ID, a one-time receiver for the JSON response, and the Codex thread to report back to. First it waits for the response. If the request failed before a response arrived, it logs the problem and submits a denied `PatchApproval` operation to Codex. If a response arrives, it tries to read it as a `PatchApprovalResponse`. If that JSON cannot be understood, it logs the problem and treats the decision as denied. Finally, it submits `Op::PatchApproval` to the Codex thread with the approval ID and the chosen decision.
 
-**Call relations**: It is spawned exclusively by `handle_patch_approval_request` after the outbound elicitation request is sent. Its downstream role is to resume the Codex patch workflow with an explicit allow/deny result, even when the client-side request path breaks.
+**Call relations**: This function is launched by `handle_patch_approval_request` in a background asynchronous task. It represents the return trip of the approval flow: after the client has been asked, this function waits for the answer and hands the final decision back to Codex. That lets Codex continue its work knowing whether the patch was approved or denied.
 
 *Call graph*: called by 1 (handle_patch_approval_request); 1 external calls (error!).

@@ -1,8 +1,10 @@
 # Authentication, identity, and account readiness  `stage-5`
 
-This stage sits after basic startup configuration and before most networked work begins: it turns saved credentials, environment-provided secrets, and machine identity into a concrete “who am I, and what am I allowed to use?” runtime state. Its two sub-stages do the heavy lifting. Interactive and persisted login flows acquire, store, revoke, and restore user or service credentials across CLI, TUI, and JSON-RPC entrypoints. Provider and backend auth adaptation then converts those credentials into transport-ready forms such as bearer headers, agent assertions, or AWS SigV4 signatures so downstream clients can call the right backend without duplicating auth rules.
+This stage is the system’s “who are you and what can you use?” checkpoint. It runs during startup, onboarding, account changes, and before network features need permission. First, the interactive and persisted login flows get the user signed in, refresh or store saved tokens, report status, and cleanly log out. They support browser login, device-code login, MCP login, and several safe storage places for secrets.
 
-The directly assigned files provide the core state model that ties those pieces together. login/src/auth/manager.rs is the central auth state machine: it loads auth from storage or environment, selects the active mode, refreshes tokens, and enforces mode restrictions. access_token.rs and personal_access_token.rs distinguish token kinds and enrich personal tokens with whoami account metadata. token_data.rs defines the persisted token payload and parsed JWT claims used by storage and refresh logic. core/src/installation_id.rs supplies a stable per-installation identity, while sandbox_users.rs manages the Windows sandbox’s local accounts and protected credentials for isolated execution.
+Next, provider and backend auth adaptation turns that identity into the right kind of badge for each service. Some requests use ChatGPT tokens, some use provider API keys, some use OAuth, and Amazon Bedrock may need AWS request signing, which proves a request came from a valid AWS identity.
+
+The shared files tie this together. The auth manager loads, saves, refreshes, and rejects bad credentials. Token helpers identify personal tokens or agent identity tokens, validate personal access tokens, and decode ChatGPT ID tokens into plain account facts like email and plan. The installation ID gives this local Codex install a stable name. On Windows, sandbox user setup prepares special accounts so isolated work can run safely.
 
 ## Sub-stages
 
@@ -16,13 +18,15 @@ These files define the main auth state machine and the token representations it 
 
 ### `login/src/auth/manager.rs`
 
-`domain_logic` · `startup auth load, request handling, token refresh, logout, and auth recovery`
+`orchestration` · `startup, request handling, token refresh, logout`
 
-This is the central auth subsystem file. It defines the runtime auth enum `CodexAuth` with variants for API keys, managed ChatGPT OAuth, externally supplied ChatGPT tokens, agent identity JWTs, personal access tokens, and Bedrock API keys. It also defines the persistence-facing helpers around `AuthDotJson`, environment-variable readers, login/logout entry points, token-refresh request/response types, and the `ExternalAuth` abstraction used for externally managed credentials.
+Authentication is the front door of the system: without it, Codex cannot know whether to use an API key, a ChatGPT login, a personal access token, an agent identity token, a Bedrock key, or credentials supplied by another app. This file acts like a reception desk that keeps one current answer to “how are we logged in?” and gives that answer to the rest of the program.
 
-The file’s main orchestration type is `AuthManager`, which caches a single auth snapshot in `CachedAuth`, tracks refresh-failure state scoped to that exact snapshot, exposes a watch channel for auth changes, and serializes refresh attempts with a semaphore. Loading follows a strict precedence order in `load_auth`: optional `CODEX_API_KEY`, ephemeral external-token storage, `CODEX_ACCESS_TOKEN`, then persistent storage unless the configured mode is ephemeral-only. `CodexAuth::from_auth_dot_json` reconstructs the correct runtime variant, including backward-compatible mode inference from populated fields.
+It reads credentials from several places in a strict order. Environment variables can override stored credentials. Temporary, externally supplied ChatGPT tokens are checked before long-lived storage. Persistent storage may be a file or keyring, depending on configuration. The file also enforces rules such as “only ChatGPT login is allowed” or “only this workspace may be used.”
 
-Refresh logic is split between proactive refresh in `auth()`, guarded reload-plus-refresh in `refresh_token()`, direct authority refresh in `refresh_token_from_authority_impl()`, and the `UnauthorizedRecovery` state machine used after 401s. Managed ChatGPT auth reloads only when account IDs match, then refreshes via OAuth and persists new tokens; external ChatGPT auth asks the configured `ExternalAuth` provider for new tokens and writes them to ephemeral storage; external bearer/API-key auth reruns the provider without touching disk. The file also enforces forced login method and workspace restrictions, revokes tokens on logout when requested, and carefully clears both ephemeral and persistent stores so stale credentials do not survive mode changes.
+For ChatGPT logins, access tokens can expire. This file knows when to refresh them, how to call the OAuth token endpoint, how to store the new tokens, and how to avoid two tasks refreshing at once by using a semaphore, which is a small gate that lets only one refresh through at a time.
+
+The `AuthManager` keeps a cached snapshot so every part of the program sees a consistent login state. If a request gets a 401 Unauthorized response, `UnauthorizedRecovery` walks through a small recovery plan: reload saved auth, refresh tokens, or ask an external provider for new credentials.
 
 #### Function details
 
@@ -32,11 +36,11 @@ Refresh logic is split between proactive refresh in `auth()`, guarded reload-plu
 fn eq(&self, other: &Self) -> bool
 ```
 
-**Purpose**: Implements custom equality for `CodexAuth`, comparing some variants by payload and others only by auth mode. This keeps refresh and cache-change semantics intentionally coarse for most auth types.
+**Purpose**: Compares two authentication choices to decide whether they should be treated as the same login. For most modes it compares only the kind of auth, but for personal access tokens and Bedrock API keys it compares the actual stored value wrapper.
 
-**Data flow**: It receives two `CodexAuth` references. For `PersonalAccessToken` and `BedrockApiKey`, it compares the inner structs directly; for all other variants it compares `api_auth_mode()` values and returns that boolean.
+**Data flow**: It receives two `CodexAuth` values. It checks their variants and either compares their concrete token/key records or compares their API-facing auth modes. It returns true when the two auth values are considered equivalent.
 
-**Call relations**: This equality feeds broader auth-change detection in the manager. More exact comparisons for refresh scoping are handled separately by `AuthManager::auths_equal_for_refresh`.
+**Call relations**: This comparison is used when cached auth is updated or compared. It relies on `api_auth_mode` for the broad mode comparison.
 
 *Call graph*: calls 1 internal fn (api_auth_mode); 1 external calls (api_auth_mode).
 
@@ -47,11 +51,11 @@ fn eq(&self, other: &Self) -> bool
 fn access_token_only(access_token: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs an external-auth token bundle containing only a bearer token and no ChatGPT account metadata.
+**Purpose**: Builds an external credential package that contains only an access token. This is useful when the outside provider is supplying something like an API key and no ChatGPT account details are needed.
 
-**Data flow**: It takes any value convertible into `String`, stores it as `access_token`, sets `chatgpt_metadata` to `None`, and returns the new `ExternalAuthTokens`.
+**Data flow**: It takes any value that can become a string. It stores that string as the access token and leaves ChatGPT metadata empty. It returns a new `ExternalAuthTokens` value.
 
-**Call relations**: External bearer providers use this constructor when they supply API-key-style auth rather than ChatGPT account-backed tokens.
+**Call relations**: External auth implementations and tests use this when they provide bare bearer credentials. If this is later used where ChatGPT metadata is required, conversion to ChatGPT auth will fail clearly.
 
 *Call graph*: called by 5 (external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth, refresh, resolve, refresh, resolve); 1 external calls (into).
 
@@ -66,11 +70,11 @@ fn chatgpt(
     ) -> Self
 ```
 
-**Purpose**: Constructs an external-auth token bundle for ChatGPT-backed auth, including account and optional plan metadata.
+**Purpose**: Builds an external credential package for ChatGPT-style auth, including the access token and the account/workspace information Codex needs.
 
-**Data flow**: It accepts an access token, account id, and optional plan string, converts them into owned strings, wraps the account metadata in `ExternalAuthChatgptMetadata`, and returns `ExternalAuthTokens` with both token and metadata populated.
+**Data flow**: It receives an access token, a ChatGPT account id, and an optional plan name. It converts them into owned strings and stores the account details as metadata. It returns a complete `ExternalAuthTokens` value.
 
-**Call relations**: This constructor is used when seeding or refreshing externally managed ChatGPT auth that must later be converted into `AuthDotJson`.
+**Call relations**: External providers use this when refreshing ChatGPT tokens. `AuthDotJson::from_external_access_token` also uses it before turning the data into the normal stored auth shape.
 
 *Call graph*: called by 2 (refresh, from_external_access_token); 1 external calls (into).
 
@@ -81,11 +85,11 @@ fn chatgpt(
 fn chatgpt_metadata(&self) -> Option<&ExternalAuthChatgptMetadata>
 ```
 
-**Purpose**: Exposes the optional ChatGPT metadata attached to an external token bundle.
+**Purpose**: Returns the ChatGPT account details attached to externally supplied tokens, if they exist.
 
-**Data flow**: It reads `self.chatgpt_metadata` and returns it as `Option<&ExternalAuthChatgptMetadata>`.
+**Data flow**: It reads the optional metadata field from an `ExternalAuthTokens` value. It returns a borrowed reference when metadata is present, or nothing when the token is access-token-only.
 
-**Call relations**: `AuthDotJson::from_external_tokens` uses this accessor to reject metadata-less tokens when constructing ChatGPT auth snapshots.
+**Call relations**: `AuthDotJson::from_external_tokens` calls this before it can seed an external ChatGPT auth record.
 
 *Call graph*: called by 1 (from_external_tokens).
 
@@ -96,11 +100,11 @@ fn chatgpt_metadata(&self) -> Option<&ExternalAuthChatgptMetadata>
 fn resolve(&self) -> ExternalAuthFuture<'_, Option<ExternalAuthTokens>>
 ```
 
-**Purpose**: Provides the trait’s default no-op resolution path for external auth providers that cannot synchronously supply cached credentials.
+**Purpose**: Provides a default implementation for external auth providers that do not have immediately available credentials. By default it says, “nothing is ready synchronously.”
 
-**Data flow**: It ignores `self` and returns a boxed async future that resolves to `Ok(None)`.
+**Data flow**: It takes the provider instance and returns an asynchronous result. The default future completes successfully with `None`, meaning no credential was resolved.
 
-**Call relations**: Concrete external-auth implementations may override this; `AuthManager` calls it only when trying to resolve external API-key auth without forcing a refresh.
+**Call relations**: `AuthManager::resolve_external_api_key_auth` calls this for external API-key-style providers. Implementations can override it to supply cached or immediate auth.
 
 *Call graph*: 1 external calls (pin).
 
@@ -111,11 +115,11 @@ fn resolve(&self) -> ExternalAuthFuture<'_, Option<ExternalAuthTokens>>
 fn failed_reason(&self) -> Option<RefreshTokenFailedReason>
 ```
 
-**Purpose**: Extracts the structured permanent failure reason when one exists.
+**Purpose**: Extracts the known reason for a refresh failure when the failure is permanent. Temporary errors, such as network problems, do not have a final reason.
 
-**Data flow**: It matches on `self`, returning `Some(error.reason)` for `Permanent` and `None` for `Transient`.
+**Data flow**: It reads a `RefreshTokenError`. If it wraps a permanent backend error, it returns that reason. If it wraps an I/O-style transient error, it returns nothing.
 
-**Call relations**: Callers use this to distinguish retryable transport failures from terminal refresh-token states such as expired or revoked.
+**Call relations**: Callers can use this to report or branch on why token refresh failed without unpacking the error enum themselves.
 
 
 ##### `Error::from`  (lines 206–211)
@@ -124,11 +128,11 @@ fn failed_reason(&self) -> Option<RefreshTokenFailedReason>
 fn from(err: RefreshTokenError) -> Self
 ```
 
-**Purpose**: Converts `RefreshTokenError` into `std::io::Error`, preserving transient I/O errors and wrapping permanent refresh failures as generic I/O errors.
+**Purpose**: Converts a token refresh error into a standard I/O error so it can pass through APIs that use `std::io::Result`.
 
-**Data flow**: It matches the incoming `RefreshTokenError`; `Permanent` becomes `std::io::Error::other(failed)`, while `Transient` yields the inner `std::io::Error` unchanged.
+**Data flow**: It receives a `RefreshTokenError`. Permanent failures are wrapped as a new generic I/O error, while transient I/O failures are returned as-is. The output is a `std::io::Error`.
 
-**Call relations**: This conversion lets refresh-related code interoperate with APIs that traffic only in `std::io::Result`.
+**Call relations**: This bridges the custom refresh-error type with storage and higher-level code that already uses I/O errors.
 
 *Call graph*: 1 external calls (other).
 
@@ -143,11 +147,11 @@ async fn from_auth_dot_json(
         chatgpt_base_url: Option<&str>,
 ```
 
-**Purpose**: Reconstructs the correct runtime `CodexAuth` variant from a stored `AuthDotJson` payload and surrounding storage configuration.
+**Purpose**: Turns the raw stored auth record into the richer `CodexAuth` value used by the program. It validates that the required credential exists for the selected auth mode.
 
-**Data flow**: It takes the Codex home path, an owned `AuthDotJson`, storage mode preferences, optional ChatGPT base URL, and keyring backend kind. It resolves the effective mode via `auth_dot_json.resolved_mode()`, creates a shared HTTP client, then branches: API-key mode requires `openai_api_key`; agent identity requires `agent_identity` and verifies/loads it; personal access token requires `personal_access_token` and hydrates metadata; Bedrock requires `bedrock_api_key`; ChatGPT and ChatGPTAuthTokens build a `ChatgptAuthState` around the raw JSON and client, with managed ChatGPT additionally creating a storage backend using the payload’s effective storage mode. It returns the constructed `CodexAuth` or an `io::Error` if required fields are missing.
+**Data flow**: It receives the Codex home directory, an `AuthDotJson` payload, storage settings, optional ChatGPT base URL, and keyring choice. It inspects the resolved auth mode, verifies or loads the right credential type, and returns a matching `CodexAuth` variant or an error if required data is missing.
 
-**Call relations**: This is the core deserialization bridge used by `load_auth` and tests. It delegates specialized validation/loading to agent-identity and personal-access-token helpers, while keeping storage-backed ChatGPT auth reconstruction local.
+**Call relations**: `load_auth` uses this after reading credentials from storage. Tests also use it to check refresh failure behavior against a stored auth snapshot.
 
 *Call graph*: calls 2 internal fn (create_client, create_auth_storage); called by 2 (refresh_failure_is_scoped_to_the_matching_auth_snapshot, load_auth); 13 external calls (new, new, to_path_buf, BedrockApiKey, Chatgpt, ChatgptAuthTokens, from_agent_identity_jwt, from_api_key, from_personal_access_token, other (+3 more)).
 
@@ -162,11 +166,11 @@ async fn from_auth_storage(
         keyring_backend_kind: AuthKeyringB
 ```
 
-**Purpose**: Loads auth from storage using the standard precedence rules and returns the reconstructed runtime auth, if any.
+**Purpose**: Loads the current stored login and converts it into a `CodexAuth`, without allowing the Codex API key environment variable to override it.
 
-**Data flow**: It accepts the Codex home path, storage mode, optional ChatGPT base URL, and keyring backend kind, then calls `load_auth` with environment API-key override disabled and no forced workspace restriction. It returns the resulting `Option<CodexAuth>` inside `std::io::Result`.
+**Data flow**: It receives storage location and configuration. It calls the shared auth-loading path with environment override disabled. It returns either no auth, a loaded auth value, or an error.
 
-**Call relations**: Status and CLI-mode readers use this convenience wrapper when they need the current stored auth without constructing a full `AuthManager`.
+**Call relations**: Status and CLI-related code use this when they want to inspect saved auth rather than the full runtime precedence rules.
 
 *Call graph*: calls 1 internal fn (load_auth); called by 5 (run_login_status, load_cli_auth_mode, prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens, missing_auth_json_returns_none, chatgpt_auth_tokens_for_tests).
 
@@ -180,11 +184,11 @@ async fn from_agent_identity_jwt(
     ) -> std::io::Result<Self>
 ```
 
-**Purpose**: Validates an agent identity JWT against backend JWKS and converts it into runtime agent-identity auth.
+**Purpose**: Creates an agent-identity login from a JWT, which is a signed token containing identity claims. It verifies the token before accepting it.
 
-**Data flow**: It takes a JWT string and optional ChatGPT base URL, normalizes the base URL against the default backend, calls `verified_agent_identity_record` to validate and decode the JWT, then asynchronously loads `AgentIdentityAuth` from the resulting record and wraps it in `CodexAuth::AgentIdentity`.
+**Data flow**: It receives the JWT text and an optional ChatGPT backend URL. It normalizes the URL, verifies the JWT against fetched signing keys, converts the claims to a record, loads agent identity auth, and returns it as `CodexAuth`.
 
-**Call relations**: This path is used both when loading stored auth and when interpreting access-token environment variables or login inputs that classify as agent identity JWTs.
+**Call relations**: Remote auth loading and the generic auth loader use this when a credential is classified as an agent identity token.
 
 *Call graph*: calls 2 internal fn (load, verified_agent_identity_record); called by 3 (load_exec_server_remote_auth_provider, assert_agent_identity_plan_alias, load_auth); 1 external calls (AgentIdentity).
 
@@ -195,11 +199,11 @@ async fn from_agent_identity_jwt(
 async fn from_personal_access_token(access_token: &str) -> std::io::Result<Self>
 ```
 
-**Purpose**: Hydrates a personal access token into runtime auth by fetching its account metadata.
+**Purpose**: Creates a login from a personal access token after loading and validating its account information.
 
-**Data flow**: It takes the raw access token string, awaits `PersonalAccessTokenAuth::load(access_token)`, and wraps the result in `CodexAuth::PersonalAccessToken`.
+**Data flow**: It receives the token string. It asks `PersonalAccessTokenAuth` to load it and returns a `CodexAuth::PersonalAccessToken` on success.
 
-**Call relations**: This helper is used by storage loading and direct token login flows whenever a supplied token classifies as a PAT.
+**Call relations**: This is the simple constructor used when code already knows the token is a personal access token.
 
 *Call graph*: calls 1 internal fn (load); 1 external calls (PersonalAccessToken).
 
@@ -210,11 +214,11 @@ async fn from_personal_access_token(access_token: &str) -> std::io::Result<Self>
 fn auth_mode(&self) -> AuthMode
 ```
 
-**Purpose**: Maps the runtime auth variant to the top-level protocol `AuthMode` exposed to the rest of the system.
+**Purpose**: Reports the broad auth category used by this login, such as API key, ChatGPT, agent identity, or personal access token.
 
-**Data flow**: It matches on `self` and returns `ApiKey`, `Chatgpt`, `AgentIdentity`, `PersonalAccessToken`, or `BedrockApiKey`, collapsing both ChatGPT-backed variants into `AuthMode::Chatgpt`.
+**Data flow**: It reads the current `CodexAuth` variant and maps it to the public `AuthMode`. It returns that mode without changing anything.
 
-**Call relations**: Manager APIs and policy checks use this coarser mode when they only care about the broad auth family.
+**Call relations**: Other helper methods use it to answer yes/no questions, and UI or request-building code can use it to describe the current login.
 
 *Call graph*: called by 3 (auth_mode_name, is_api_key_auth, is_personal_access_token_auth).
 
@@ -225,11 +229,11 @@ fn auth_mode(&self) -> AuthMode
 fn api_auth_mode(&self) -> ApiAuthMode
 ```
 
-**Purpose**: Maps the runtime auth variant to the more specific API auth mode, preserving the distinction between managed and external ChatGPT tokens.
+**Purpose**: Reports the more precise API auth mode, including the distinction between stored ChatGPT auth and externally supplied ChatGPT tokens.
 
-**Data flow**: It matches on `self` and returns the corresponding `ApiAuthMode` variant, including `ChatgptAuthTokens` and `BedrockApiKey`.
+**Data flow**: It reads the `CodexAuth` variant and returns the matching protocol-level mode. Nothing is modified.
 
-**Call relations**: This finer-grained mode is used in equality, backend eligibility, and refresh logic where managed and external ChatGPT auth differ.
+**Call relations**: Equality checks, backend selection, and request-building code use this when the exact wire-facing auth type matters.
 
 *Call graph*: called by 4 (build_remote_plugin_detail, eq, is_chatgpt_auth, uses_codex_backend).
 
@@ -240,11 +244,11 @@ fn api_auth_mode(&self) -> ApiAuthMode
 fn is_api_key_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current auth is plain API-key auth.
+**Purpose**: Answers whether this login is an API key login.
 
-**Data flow**: It calls `self.auth_mode()` and compares the result to `AuthMode::ApiKey`.
+**Data flow**: It reads the auth mode and compares it to the API key mode. It returns a boolean.
 
-**Call relations**: Refresh and capability checks use this to short-circuit logic that only applies to token-backed auth.
+**Call relations**: Remote-auth support checks and token-refresh logic use this to skip refresh work that does not apply to API keys.
 
 *Call graph*: calls 1 internal fn (auth_mode); called by 1 (is_supported_exec_server_remote_auth).
 
@@ -255,11 +259,11 @@ fn is_api_key_auth(&self) -> bool
 fn is_personal_access_token_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current auth is a personal access token.
+**Purpose**: Answers whether this login uses a personal access token.
 
-**Data flow**: It calls `self.auth_mode()` and compares the result to `AuthMode::PersonalAccessToken`.
+**Data flow**: It reads the broad auth mode and compares it to the personal-access-token mode. It returns true or false.
 
-**Call relations**: Unauthorized-recovery and refresh code uses this to avoid offering unsupported refresh behavior for PAT auth.
+**Call relations**: Recovery logic uses this to explain that personal access tokens are not refreshed through the ChatGPT OAuth flow.
 
 *Call graph*: calls 1 internal fn (auth_mode).
 
@@ -270,11 +274,11 @@ fn is_personal_access_token_auth(&self) -> bool
 fn is_chatgpt_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether the auth mode belongs to the ChatGPT-backed family.
+**Purpose**: Answers whether this auth value belongs to a ChatGPT account style of login.
 
-**Data flow**: It calls `self.api_auth_mode()` and returns the result of `has_chatgpt_account()` on that mode.
+**Data flow**: It reads the precise API auth mode and asks whether that mode has a ChatGPT account. It returns a boolean.
 
-**Call relations**: Capability checks use this helper when they need to know whether account-backed ChatGPT semantics apply.
+**Call relations**: Remote-auth compatibility checks use this to decide whether ChatGPT-backed auth is acceptable.
 
 *Call graph*: calls 1 internal fn (api_auth_mode); called by 1 (is_supported_exec_server_remote_auth).
 
@@ -285,11 +289,11 @@ fn is_chatgpt_auth(&self) -> bool
 fn uses_codex_backend(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current auth mode targets the Codex backend rather than direct provider auth.
+**Purpose**: Answers whether this credential is meant for the Codex backend rather than a direct provider API.
 
-**Data flow**: It calls `self.api_auth_mode()` and returns `uses_codex_backend()` on that mode.
+**Data flow**: It reads the precise API auth mode and asks that mode whether it uses the Codex backend. It returns a boolean.
 
-**Call relations**: Higher-level feature gating uses this to decide whether backend-dependent functionality is available.
+**Call relations**: Cloud configuration eligibility code uses this to decide whether backend-based features can be enabled.
 
 *Call graph*: calls 1 internal fn (api_auth_mode); called by 1 (cloud_config_eligible_auth).
 
@@ -300,11 +304,11 @@ fn uses_codex_backend(&self) -> bool
 fn is_external_chatgpt_tokens(&self) -> bool
 ```
 
-**Purpose**: Identifies the externally managed ChatGPT-token variant.
+**Purpose**: Answers whether the current auth came from externally managed ChatGPT tokens.
 
-**Data flow**: It pattern-matches `self` against `Self::ChatgptAuthTokens(_)` and returns the boolean result.
+**Data flow**: It checks whether the enum variant is `ChatgptAuthTokens`. It returns true only for that temporary external-token mode.
 
-**Call relations**: The manager uses this to choose external unauthorized-recovery behavior and persistence rules.
+**Call relations**: Unauthorized recovery uses this to choose the external refresh path instead of the normal stored refresh-token path.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -315,11 +319,11 @@ fn is_external_chatgpt_tokens(&self) -> bool
 fn supports_unauthorized_recovery(&self) -> bool
 ```
 
-**Purpose**: Indicates whether 401 recovery steps are meaningful for this auth snapshot.
+**Purpose**: Answers whether a 401 Unauthorized response can trigger an automatic recovery attempt for this auth value.
 
-**Data flow**: It returns true only for `Chatgpt` and `ChatgptAuthTokens` variants via pattern matching.
+**Data flow**: It checks whether the auth is managed ChatGPT auth or external ChatGPT tokens. It returns false for API keys, personal tokens, agent identity, and Bedrock keys.
 
-**Call relations**: `UnauthorizedRecovery` consults this before offering reload/refresh steps.
+**Call relations**: `UnauthorizedRecovery` calls this before offering reload or refresh steps.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -330,11 +334,11 @@ fn supports_unauthorized_recovery(&self) -> bool
 fn api_key(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the raw API key string only for plain API-key auth.
+**Purpose**: Returns the API key string when this auth value is actually API-key-based.
 
-**Data flow**: It matches on `self`; for `ApiKey` it returns `Some(&str)` borrowed from the inner `ApiKeyAuth`, and for all other variants it returns `None`.
+**Data flow**: It inspects the enum variant. For `ApiKey`, it returns a borrowed string slice. For all other modes, it returns nothing.
 
-**Call relations**: Equality and downstream auth-provider construction use this accessor when they need the direct bearer string for API-key auth.
+**Call relations**: Refresh-aware equality uses this to compare two API-key auth snapshots safely.
 
 
 ##### `CodexAuth::get_token_data`  (lines 375–385)
@@ -343,11 +347,11 @@ fn api_key(&self) -> Option<&str>
 fn get_token_data(&self) -> Result<TokenData, std::io::Error>
 ```
 
-**Purpose**: Extracts stored ChatGPT token data from token-backed auth snapshots and errors for other auth types or incomplete state.
+**Purpose**: Returns the full ChatGPT token bundle when token-backed ChatGPT auth is available.
 
-**Data flow**: It calls `get_current_auth_json()`, matches for an `AuthDotJson` containing both `tokens: Some(...)` and `last_refresh: Some(_)`, and returns the `TokenData`; otherwise it returns `std::io::Error::other("Token data is not available.")`.
+**Data flow**: It reads the current in-memory auth JSON snapshot. If it contains token data and a refresh timestamp, it returns the tokens. Otherwise it returns an error saying token data is unavailable.
 
-**Call relations**: `get_token` and other token-backed operations rely on this helper to enforce that only ChatGPT-style auth exposes OAuth token data.
+**Call relations**: `get_token` and login-restriction code use this when they need ChatGPT token details.
 
 *Call graph*: calls 1 internal fn (get_current_auth_json); called by 1 (get_token); 1 external calls (other).
 
@@ -358,11 +362,11 @@ fn get_token_data(&self) -> Result<TokenData, std::io::Error>
 fn get_token(&self) -> Result<String, std::io::Error>
 ```
 
-**Purpose**: Returns the bearer token string appropriate for request authorization when the auth type exposes one.
+**Purpose**: Returns the bearer token or API key string that request code can use for authentication, when that kind of token is exposed.
 
-**Data flow**: For `ApiKey`, it clones and returns the API key. For ChatGPT variants, it calls `get_token_data()` and returns the `access_token`. For `PersonalAccessToken`, it clones the PAT string from the inner auth. For `AgentIdentity` and `BedrockApiKey`, it returns descriptive `io::Error::other(...)` values because those modes do not expose a Codex bearer token.
+**Data flow**: It receives a `CodexAuth`. For API keys it returns the key. For ChatGPT auth it returns the access token from token data. For personal access tokens it returns the token. For agent identity and Bedrock key auth, it returns an error because those modes do not expose a Codex bearer token here.
 
-**Call relations**: Auth-provider construction and request code use this as the generic bearer-token accessor across supported auth families.
+**Call relations**: Auth-provider construction calls this when it needs a raw token string for outgoing requests.
 
 *Call graph*: calls 1 internal fn (get_token_data); called by 1 (auth_provider_from_auth); 1 external calls (other).
 
@@ -373,11 +377,11 @@ fn get_token(&self) -> Result<String, std::io::Error>
 fn get_account_id(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the account/workspace identifier when the auth type carries one.
+**Purpose**: Returns the account or workspace identifier associated with Codex backend auth, when one is available.
 
-**Data flow**: For `AgentIdentity` and `PersonalAccessToken`, it clones the account id from the hydrated auth object. For other variants, it falls back to `get_current_token_data()` and returns the optional `account_id` from token data.
+**Data flow**: It reads account information from agent identity auth, personal access token auth, or ChatGPT token data. It returns an owned string if found.
 
-**Call relations**: Workspace restriction enforcement, identity reporting, and guarded reload logic depend on this accessor.
+**Call relations**: Identity, workspace checks, and unauthorized recovery use this to keep account-sensitive operations tied to the expected account.
 
 *Call graph*: calls 1 internal fn (get_current_token_data); called by 5 (connector_directory_cache_context, auth_identity, global, ensure_unlisted_workspace_target, auth_provider_from_auth).
 
@@ -388,11 +392,11 @@ fn get_account_id(&self) -> Option<String>
 fn is_fedramp_account(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current auth belongs to a FedRAMP account when that claim is available.
+**Purpose**: Answers whether the current account is marked as a FedRAMP account. FedRAMP is a U.S. government security compliance program.
 
-**Data flow**: For `AgentIdentity` and `PersonalAccessToken`, it delegates to the hydrated auth object. For token-backed ChatGPT auth, it checks whether current token data exists and whether `id_token.is_fedramp_account()` is true; otherwise it returns false.
+**Data flow**: It checks the FedRAMP flag from agent identity auth, personal access token auth, or ChatGPT ID token claims. If no claim exists, it returns false.
 
-**Call relations**: Downstream auth-provider and policy code uses this to tailor behavior for FedRAMP accounts.
+**Call relations**: Request auth-provider setup uses this to adjust behavior for FedRAMP accounts.
 
 *Call graph*: calls 1 internal fn (get_current_token_data); called by 1 (auth_provider_from_auth).
 
@@ -403,11 +407,11 @@ fn is_fedramp_account(&self) -> bool
 fn get_account_email(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the account email address when present in the auth payload.
+**Purpose**: Returns the email address associated with the current account when the credential exposes one.
 
-**Data flow**: For `AgentIdentity` and `PersonalAccessToken`, it clones the email from the hydrated auth object. Otherwise it reads `get_current_token_data()` and returns the optional `id_token.email`.
+**Data flow**: It reads the email from agent identity auth, personal access token auth, or ChatGPT token claims. It returns an owned string if available.
 
-**Call relations**: Identity-reporting code uses this helper when displaying or caching account metadata.
+**Call relations**: Callers can use this for display or identity context without knowing which auth mode is active.
 
 *Call graph*: calls 1 internal fn (get_current_token_data).
 
@@ -418,11 +422,11 @@ fn get_account_email(&self) -> Option<String>
 fn get_chatgpt_user_id(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the ChatGPT user identifier when the auth type exposes one.
+**Purpose**: Returns the ChatGPT user id attached to the current login when available.
 
-**Data flow**: For `AgentIdentity` and `PersonalAccessToken`, it clones the hydrated `chatgpt_user_id`. Otherwise it reads `get_current_token_data()` and returns the optional `id_token.chatgpt_user_id`.
+**Data flow**: It reads the user id from agent identity auth, personal access token auth, or ChatGPT token data. It returns the id as a string or nothing.
 
-**Call relations**: Connector and identity contexts use this accessor to associate runtime state with a ChatGPT user.
+**Call relations**: Identity and connector cache code use this to associate data with the correct ChatGPT user.
 
 *Call graph*: calls 1 internal fn (get_current_token_data); called by 3 (connector_directory_cache_context, auth_identity, global).
 
@@ -433,11 +437,11 @@ fn get_chatgpt_user_id(&self) -> Option<String>
 fn account_plan_type(&self) -> Option<AccountPlanType>
 ```
 
-**Purpose**: Derives the high-level account plan classification from the current auth snapshot.
+**Purpose**: Returns the user's plan type, such as Free, Plus, Pro, Team, or an unknown value. This helps product code decide what features or UI should apply.
 
-**Data flow**: For `AgentIdentity` and `PersonalAccessToken`, it returns the hydrated auth’s plan type directly. Otherwise it reads current token data and maps `id_token.chatgpt_plan_type` through `AccountPlanType::from`, defaulting to `AccountPlanType::Unknown` when absent.
+**Data flow**: It reads the plan from agent identity auth, personal access token auth, or ChatGPT ID token claims. If ChatGPT tokens lack a plan, it returns Unknown. If no account plan can be read, it returns nothing.
 
-**Call relations**: Workspace-account checks and feature gating use this normalized plan classification.
+**Call relations**: Workspace checks and cloud-config eligibility use this to understand the account category.
 
 *Call graph*: calls 1 internal fn (get_current_token_data); called by 2 (cloud_config_eligible_auth, is_workspace_account).
 
@@ -448,11 +452,11 @@ fn account_plan_type(&self) -> Option<AccountPlanType>
 fn is_workspace_account(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current account plan corresponds to a workspace-backed account.
+**Purpose**: Answers whether the current account plan represents a workspace-style account.
 
-**Data flow**: It calls `account_plan_type()` and returns whether the resulting plan exists and `is_workspace_account()` is true.
+**Data flow**: It gets the account plan type and asks that plan whether it is a workspace account. It returns false when no plan is known.
 
-**Call relations**: Higher-level account-context code uses this helper to distinguish workspace accounts from personal plans.
+**Call relations**: Connector and global identity context code use this to label or route workspace accounts.
 
 *Call graph*: calls 1 internal fn (account_plan_type); called by 2 (connector_directory_cache_context, global).
 
@@ -463,11 +467,11 @@ fn is_workspace_account(&self) -> bool
 fn get_current_auth_json(&self) -> Option<AuthDotJson>
 ```
 
-**Purpose**: Returns the currently cached raw `AuthDotJson` only for token-backed ChatGPT auth variants.
+**Purpose**: Returns the current in-memory raw auth record for ChatGPT-token-based auth.
 
-**Data flow**: It matches `self`; for `Chatgpt` and `ChatgptAuthTokens` it locks the inner `Mutex<Option<AuthDotJson>>`, clones the stored value, and returns it. For all other variants it returns `None`.
+**Data flow**: It checks whether the auth value is managed ChatGPT auth or external ChatGPT tokens. If so, it locks the shared auth record and clones it. Other auth modes return nothing.
 
-**Call relations**: Token extraction, equality-for-refresh, and logout-with-revoke use this to inspect the exact stored ChatGPT auth snapshot.
+**Call relations**: Token-data helpers and logout-with-revoke use this to inspect the stored ChatGPT token payload.
 
 *Call graph*: called by 2 (get_current_token_data, get_token_data).
 
@@ -478,11 +482,11 @@ fn get_current_auth_json(&self) -> Option<AuthDotJson>
 fn get_current_token_data(&self) -> Option<TokenData>
 ```
 
-**Purpose**: Convenience accessor for the `TokenData` embedded in the current ChatGPT auth snapshot.
+**Purpose**: Returns the current ChatGPT token data, if this auth value has any.
 
-**Data flow**: It calls `get_current_auth_json()` and, if present, returns the `tokens` field from the cloned `AuthDotJson`.
+**Data flow**: It first gets the current auth JSON snapshot. It then extracts the `tokens` field. It returns token data or nothing.
 
-**Call relations**: Account metadata accessors and plan/fedramp checks build on this helper.
+**Call relations**: Account id, email, user id, plan, and FedRAMP helpers all use this shared extraction path.
 
 *Call graph*: calls 1 internal fn (get_current_auth_json); called by 5 (account_plan_type, get_account_email, get_account_id, get_chatgpt_user_id, is_fedramp_account).
 
@@ -493,11 +497,11 @@ fn get_current_token_data(&self) -> Option<TokenData>
 fn create_dummy_chatgpt_auth_for_testing() -> Self
 ```
 
-**Purpose**: Creates a synthetic managed ChatGPT auth snapshot backed by ephemeral storage for tests.
+**Purpose**: Creates a fake ChatGPT login for tests. It lets tests run code paths that require ChatGPT auth without using real credentials.
 
-**Data flow**: It constructs an `AuthDotJson` with `auth_mode: Chatgpt`, fixed token strings, a default `id_token`, `last_refresh: Some(Utc::now())`, and no other credential fields. It creates a default HTTP client, wraps the JSON in `ChatgptAuthState`, allocates a unique dummy storage path using `NEXT_DUMMY_AUTH_ID`, creates ephemeral auth storage there, and returns `CodexAuth::Chatgpt` containing both state and storage.
+**Data flow**: It builds an in-memory auth record with placeholder token values, creates a client and ephemeral storage, assigns a unique dummy storage name, and returns `CodexAuth::Chatgpt`.
 
-**Call relations**: Many tests use this helper to obtain a realistic ChatGPT auth object without hitting real storage or network refresh flows.
+**Call relations**: Many tests use this as a safe stand-in for a real logged-in user.
 
 *Call graph*: calls 3 internal fn (default, create_client, create_auth_storage); called by 139 (capture_file_writes_exact_serialized_request, capture_file_writes_final_batches_as_separate_lines, remote_control_auth_manager, remote_control_auth_manager_with_home, remote_control_auth_manager, guardian_command_execution_notifications_wrap_review_lifecycle, interrupted_subagent_activity_removes_missing_thread_watch, turn_started_omits_active_snapshot_items, effective_mcp_servers_preserve_runtime_servers, expands_cached_remote_plugins_by_loaded_apps (+15 more)); 7 external calls (new, default, new, from, Chatgpt, now, format!).
 
@@ -508,11 +512,11 @@ fn create_dummy_chatgpt_auth_for_testing() -> Self
 fn from_api_key(api_key: &str) -> Self
 ```
 
-**Purpose**: Constructs runtime API-key auth from a raw key string.
+**Purpose**: Creates an API-key auth value from a raw key string.
 
-**Data flow**: It clones the input `&str` into an owned `String` inside `ApiKeyAuth` and returns `CodexAuth::ApiKey`.
+**Data flow**: It receives a string slice, copies it into an owned string, wraps it in `ApiKeyAuth`, and returns `CodexAuth::ApiKey`.
 
-**Call relations**: Environment-variable loading, external bearer resolution, and tests use this as the simplest auth constructor.
+**Call relations**: Environment-variable loading, test setup, and external API-key resolution all use this small constructor.
 
 *Call graph*: called by 65 (refresh_test_state, load_cli_auth_mode, exec_server_remote_auth_accepts_api_key_auth, returns_api_curated_fallback_plugins_for_direct_provider_auth, interrupted_v2_agent_is_lost_after_residency_eviction, residency_slot_reservation_unloads_oldest_idle_v2_agent, new_with_config, list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root, resume_agent_from_rollout_does_not_reopen_v2_descendants, resume_agent_releases_slot_after_resume_failure (+15 more)); 1 external calls (ApiKey).
 
@@ -523,11 +527,11 @@ fn from_api_key(api_key: &str) -> Self
 fn current_auth_json(&self) -> Option<AuthDotJson>
 ```
 
-**Purpose**: Returns the current raw ChatGPT auth snapshot stored inside a managed ChatGPT auth object.
+**Purpose**: Returns a cloned copy of the current raw ChatGPT auth record held by a `ChatgptAuth` value.
 
-**Data flow**: It locks `self.state.auth_dot_json`, clones the `Option<AuthDotJson>`, and returns it.
+**Data flow**: It locks the shared auth JSON slot, clones the optional payload, and returns it.
 
-**Call relations**: Managed ChatGPT refresh logic uses this to inspect current tokens and timestamps.
+**Call relations**: `ChatgptAuth::current_token_data` and proactive-refresh checks use this to inspect the current token state.
 
 *Call graph*: called by 1 (current_token_data).
 
@@ -538,11 +542,11 @@ fn current_auth_json(&self) -> Option<AuthDotJson>
 fn current_token_data(&self) -> Option<TokenData>
 ```
 
-**Purpose**: Returns the current `TokenData` from a managed ChatGPT auth object, if present.
+**Purpose**: Returns the token bundle from a `ChatgptAuth` value, if present.
 
-**Data flow**: It calls `current_auth_json()` and extracts the `tokens` field from the returned `AuthDotJson`.
+**Data flow**: It gets the current auth JSON and extracts its `tokens` field. It returns token data or nothing.
 
-**Call relations**: `AuthManager::refresh_token_from_authority_impl` uses this to obtain the refresh token before contacting the OAuth authority.
+**Call relations**: The token refresh path uses this to find the refresh token before contacting the OAuth service.
 
 *Call graph*: calls 1 internal fn (current_auth_json).
 
@@ -553,11 +557,11 @@ fn current_token_data(&self) -> Option<TokenData>
 fn storage(&self) -> &Arc<dyn AuthStorageBackend>
 ```
 
-**Purpose**: Exposes the storage backend associated with managed ChatGPT auth.
+**Purpose**: Gives access to the storage backend where this ChatGPT auth should be saved.
 
-**Data flow**: It returns a shared reference to the inner `Arc<dyn AuthStorageBackend>`.
+**Data flow**: It borrows the stored `Arc` pointing to the auth storage backend and returns it.
 
-**Call relations**: Token persistence code uses this backend to write refreshed OAuth tokens back to storage.
+**Call relations**: The refresh-and-persist path uses this so refreshed tokens are written back to the same place they came from.
 
 *Call graph*: called by 1 (refresh_and_persist_chatgpt_token).
 
@@ -568,11 +572,11 @@ fn storage(&self) -> &Arc<dyn AuthStorageBackend>
 fn client(&self) -> &CodexHttpClient
 ```
 
-**Purpose**: Exposes the HTTP client associated with managed ChatGPT auth.
+**Purpose**: Gives access to the HTTP client used for ChatGPT token refresh requests.
 
-**Data flow**: It returns a shared reference to the inner `CodexHttpClient` stored in `ChatgptAuthState`.
+**Data flow**: It borrows the stored Codex HTTP client and returns it.
 
-**Call relations**: Refresh code passes this client into the OAuth token-refresh request helper.
+**Call relations**: The ChatGPT refresh path passes this client into the network request helper.
 
 *Call graph*: called by 1 (refresh_and_persist_chatgpt_token).
 
@@ -583,11 +587,11 @@ fn client(&self) -> &CodexHttpClient
 fn read_openai_api_key_from_env() -> Option<String>
 ```
 
-**Purpose**: Reads and trims the legacy `OPENAI_API_KEY` environment variable, ignoring empty values.
+**Purpose**: Reads the legacy `OPENAI_API_KEY` environment variable if it contains a non-empty value.
 
-**Data flow**: It reads `OPENAI_API_KEY_ENV_VAR` from the environment, trims whitespace, converts to `String`, filters out empty strings, and returns `Option<String>`.
+**Data flow**: It looks up the environment variable, trims whitespace, filters out empty strings, and returns the key if present.
 
-**Call relations**: This helper exists alongside Codex-specific env readers, though the main auth-loading precedence in this file uses the Codex-specific variables.
+**Call relations**: This helper is available for code that still needs the OpenAI API key variable rather than the Codex-specific one.
 
 *Call graph*: 1 external calls (var).
 
@@ -598,11 +602,11 @@ fn read_openai_api_key_from_env() -> Option<String>
 fn read_codex_api_key_from_env() -> Option<String>
 ```
 
-**Purpose**: Reads the `CODEX_API_KEY` environment variable as a non-empty trimmed string.
+**Purpose**: Reads the `CODEX_API_KEY` environment variable when it is set to a non-empty value.
 
-**Data flow**: It delegates to `read_non_empty_env_var(CODEX_API_KEY_ENV_VAR)` and returns the resulting `Option<String>`.
+**Data flow**: It delegates to the shared non-empty environment reader. The result is an optional string.
 
-**Call relations**: `load_auth` checks this first when environment API-key override is enabled, giving it highest precedence.
+**Call relations**: `load_auth` uses this first when environment API-key overrides are enabled.
 
 *Call graph*: calls 1 internal fn (read_non_empty_env_var); called by 1 (load_auth).
 
@@ -613,11 +617,11 @@ fn read_codex_api_key_from_env() -> Option<String>
 fn read_codex_access_token_from_env() -> Option<String>
 ```
 
-**Purpose**: Reads the `CODEX_ACCESS_TOKEN` environment variable as a non-empty trimmed string.
+**Purpose**: Reads the `CODEX_ACCESS_TOKEN` environment variable when it is set to a non-empty value.
 
-**Data flow**: It delegates to `read_non_empty_env_var(CODEX_ACCESS_TOKEN_ENV_VAR)` and returns the resulting `Option<String>`.
+**Data flow**: It delegates to the shared non-empty environment reader. The result is an optional token string.
 
-**Call relations**: `load_auth` consults this after ephemeral storage and before persistent storage to support externally supplied access tokens.
+**Call relations**: `load_auth` uses this after checking temporary storage and before falling back to persistent storage.
 
 *Call graph*: calls 1 internal fn (read_non_empty_env_var); called by 1 (load_auth).
 
@@ -628,11 +632,11 @@ fn read_codex_access_token_from_env() -> Option<String>
 fn read_non_empty_env_var(key: &str) -> Option<String>
 ```
 
-**Purpose**: Shared helper for reading, trimming, and rejecting empty environment-variable values.
+**Purpose**: Provides the shared rule for reading environment variables: trim whitespace and ignore empty values.
 
-**Data flow**: It takes an env-var key, reads it with `env::var`, trims whitespace from the value, converts it to `String`, filters out empty strings, and returns `Option<String>`.
+**Data flow**: It receives an environment variable name, reads it, trims the value, and returns `None` if the variable is missing or empty.
 
-**Call relations**: Both Codex-specific env readers use this helper to enforce identical trimming and emptiness rules.
+**Call relations**: The Codex API key and Codex access token readers both use this helper.
 
 *Call graph*: called by 2 (read_codex_access_token_from_env, read_codex_api_key_from_env); 1 external calls (var).
 
@@ -646,11 +650,11 @@ async fn verified_agent_identity_record(
 ) -> std::io::Result<AgentIdentityAuthRecord>
 ```
 
-**Purpose**: Validates an agent identity JWT structurally and cryptographically, then converts its claims into a storage record.
+**Purpose**: Validates an agent identity JWT and converts its claims into the stored record format. This prevents accepting a token before its signature and contents are checked.
 
-**Data flow**: It first checks the JWT shape with `AgentIdentityAuthRecord::from_agent_identity_jwt(jwt)?`, then fetches JWKS using `fetch_agent_identity_jwks(&build_reqwest_client(), chatgpt_base_url)`, decodes and verifies the JWT with `decode_agent_identity_jwt`, and converts the verified claims into `AgentIdentityAuthRecord`.
+**Data flow**: It first parses the JWT enough to confirm it has the expected shape, fetches the public signing keys from the ChatGPT backend, decodes and verifies the JWT, and converts the verified claims into an `AgentIdentityAuthRecord`.
 
-**Call relations**: Agent-identity login and auth loading both delegate to this helper before constructing runtime auth.
+**Call relations**: Agent-identity login creation and access-token login both call this before accepting an agent identity token.
 
 *Call graph*: calls 2 internal fn (build_reqwest_client, from_agent_identity_jwt); called by 2 (from_agent_identity_jwt, login_with_access_token); 2 external calls (decode_agent_identity_jwt, fetch_agent_identity_jwks).
 
@@ -665,11 +669,11 @@ fn logout(
 ) -> std::io::Result<bool>
 ```
 
-**Purpose**: Deletes the auth payload from the selected storage backend and reports whether anything was removed.
+**Purpose**: Deletes the stored auth record from the selected credential store.
 
-**Data flow**: It takes the Codex home path plus storage-selection parameters, creates the corresponding auth storage backend with `create_auth_storage`, and returns `storage.delete()`.
+**Data flow**: It creates the configured auth storage backend for the given Codex home directory and asks it to delete the auth data. It returns whether anything was removed.
 
-**Call relations**: Higher-level logout helpers call this directly or via `logout_all_stores` to clear managed or ephemeral auth.
+**Call relations**: `logout_all_stores` calls this for one or more stores so logout can clear both temporary and persistent credentials.
 
 *Call graph*: calls 1 internal fn (create_auth_storage); called by 1 (logout_all_stores); 1 external calls (to_path_buf).
 
@@ -684,11 +688,11 @@ async fn logout_with_revoke(
 ) -> std::io::Result<bool>
 ```
 
-**Purpose**: Attempts token revocation before clearing all auth stores, tolerating revocation/load failures with warnings.
+**Purpose**: Logs out and also tries to revoke ChatGPT OAuth tokens with the auth service. Revoking is best-effort: local logout still proceeds even if revocation fails.
 
-**Data flow**: It loads raw stored auth via `load_auth_dot_json`; if loading fails it logs a warning and proceeds with `None`. It then calls `revoke_auth_tokens(auth_dot_json.as_ref()).await`, logging but ignoring revocation errors, and finally calls `logout_all_stores` to remove credentials from storage.
+**Data flow**: It tries to load the raw stored auth, passes it to the token revocation helper, logs warnings for failures, then clears all relevant local stores. It returns whether local credentials were removed.
 
-**Call relations**: This is the write-side logout path for callers that want best-effort server-side token revocation in addition to local deletion.
+**Call relations**: This top-level helper is used when callers want a stronger logout than simply deleting local files.
 
 *Call graph*: calls 3 internal fn (load_auth_dot_json, logout_all_stores, revoke_auth_tokens); 1 external calls (warn!).
 
@@ -704,11 +708,11 @@ fn login_with_api_key(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Persists a storage snapshot containing only an OpenAI API key.
+**Purpose**: Saves an API key login into auth storage.
 
-**Data flow**: It takes the Codex home path, raw API key, and storage-selection parameters, constructs an `AuthDotJson` with `auth_mode: Some(ApiKey)`, `openai_api_key` populated, and all other credential fields `None`, then passes it to `save_auth`.
+**Data flow**: It builds an `AuthDotJson` payload containing only the API key and its mode. It then writes that payload using `save_auth`.
 
-**Call relations**: CLI/API-key login flows and tests use this helper; it mirrors the Bedrock login helper but targets the OpenAI API-key field.
+**Call relations**: Login flows call this after the user provides an API key.
 
 *Call graph*: calls 1 internal fn (save_auth).
 
@@ -724,11 +728,11 @@ async fn login_with_access_token(
     chat
 ```
 
-**Purpose**: Persists auth derived from a supplied access token, supporting both personal access tokens and agent identity JWTs.
+**Purpose**: Saves a Codex access token login, after deciding whether the token is a personal access token or an agent identity JWT.
 
-**Data flow**: It classifies the input token with `classify_codex_access_token`. For a PAT, it hydrates `PersonalAccessTokenAuth`, enforces optional workspace restrictions, and builds an `AuthDotJson` with `personal_access_token` set and `auth_mode: None` for rollback compatibility. For an agent identity JWT, it verifies the token against the backend and builds an `AuthDotJson` with `auth_mode: Some(AgentIdentity)` and `agent_identity` set. It then persists the snapshot via `save_auth`.
+**Data flow**: It classifies the token. For a personal access token, it loads the token details and checks workspace restrictions. For an agent identity JWT, it verifies the JWT. It then writes the correct auth payload to storage.
 
-**Call relations**: This is the generic access-token login path used when the caller provides a token string whose exact auth family must be inferred.
+**Call relations**: Login commands use this for token-based login. It shares verification logic with runtime loading so invalid tokens are rejected early.
 
 *Call graph*: calls 5 internal fn (classify_codex_access_token, ensure_personal_access_token_workspace_allowed, save_auth, verified_agent_identity_record, load).
 
@@ -742,11 +746,11 @@ fn ensure_personal_access_token_workspace_allowed(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Rejects a personal access token whose account/workspace id is not in the allowed set.
+**Purpose**: Checks that a personal access token belongs to an allowed workspace when workspace restrictions are configured.
 
-**Data flow**: It takes an optional slice of expected workspace ids and a hydrated `PersonalAccessTokenAuth`, calls `crate::server::ensure_workspace_account_allowed(expected_workspace_ids, auth.account_id())`, and maps any returned message into `std::io::ErrorKind::PermissionDenied`.
+**Data flow**: It receives optional expected workspace ids and a loaded personal access token auth object. It compares the token's account id against the allowed list and converts any violation into a permission-denied I/O error.
 
-**Call relations**: PAT login and PAT loading both call this helper so workspace restrictions are enforced consistently regardless of credential source.
+**Call relations**: Both login and auth loading call this so restricted configurations cannot use the wrong personal access token.
 
 *Call graph*: calls 2 internal fn (account_id, ensure_workspace_account_allowed); called by 2 (load_auth, login_with_access_token).
 
@@ -762,11 +766,11 @@ fn login_with_chatgpt_auth_tokens(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Seeds ephemeral storage with externally managed ChatGPT access tokens and metadata.
+**Purpose**: Stores externally supplied ChatGPT tokens in the temporary in-memory auth store.
 
-**Data flow**: It takes the Codex home path, access token, ChatGPT account id, and optional plan type, constructs an `AuthDotJson` via `AuthDotJson::from_external_access_token`, and saves it using `AuthCredentialsStoreMode::Ephemeral` and the default keyring backend.
+**Data flow**: It receives an access token, account id, and optional plan. It converts them into an external-token auth payload and saves it using ephemeral storage.
 
-**Call relations**: External parent applications use this path to hand ChatGPT auth into Codex without writing managed persistent credentials.
+**Call relations**: External host applications can use this to seed Codex with ChatGPT auth without writing long-lived credentials.
 
 *Call graph*: calls 2 internal fn (default, save_auth); 1 external calls (from_external_access_token).
 
@@ -782,11 +786,11 @@ fn save_auth(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Persists an `AuthDotJson` snapshot using the selected storage backend.
+**Purpose**: Writes an auth payload to the configured credential backend.
 
-**Data flow**: It takes the Codex home path, borrowed auth payload, storage mode, and keyring backend kind, creates the backend with `create_auth_storage`, and calls `storage.save(auth)`.
+**Data flow**: It receives the Codex home path, raw auth payload, storage mode, and keyring backend choice. It creates the correct storage backend and saves the payload there.
 
-**Call relations**: All login helpers and external-auth refresh persistence funnel through this shared write helper.
+**Call relations**: All login paths and external refresh code use this single write path.
 
 *Call graph*: calls 1 internal fn (create_auth_storage); called by 5 (login_with_bedrock_api_key, refresh_external_auth, login_with_access_token, login_with_api_key, login_with_chatgpt_auth_tokens); 1 external calls (to_path_buf).
 
@@ -801,11 +805,11 @@ fn load_auth_dot_json(
 ) -> std::io::Result<Option<AuthDotJson>>
 ```
 
-**Purpose**: Loads the raw stored auth payload from the selected backend without applying environment overrides or runtime reconstruction.
+**Purpose**: Loads the raw stored auth payload without applying environment-variable overrides or converting it into `CodexAuth`.
 
-**Data flow**: It creates the storage backend from the supplied path and storage parameters, then returns `storage.load()` as `std::io::Result<Option<AuthDotJson>>`.
+**Data flow**: It creates the configured storage backend and asks it to load the saved auth record. It returns the raw payload if one exists.
 
-**Call relations**: Maintenance code and tests use this when they need the exact serialized payload rather than a reconstructed `CodexAuth`.
+**Call relations**: Logout with token revocation uses this because it needs the exact stored token data.
 
 *Call graph*: calls 1 internal fn (create_auth_storage); called by 1 (logout_with_revoke); 1 external calls (to_path_buf).
 
@@ -816,11 +820,11 @@ fn load_auth_dot_json(
 async fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()>
 ```
 
-**Purpose**: Checks the currently loaded auth against forced login-method and workspace restrictions, logging the user out with an explanatory error when violated.
+**Purpose**: Checks whether the current login obeys configured restrictions, such as requiring API-key login or limiting ChatGPT login to certain workspaces.
 
-**Data flow**: It loads auth with environment API-key override enabled. If no auth exists, it returns `Ok(())`. If `forced_login_method` is set, it compares the required method against `auth.auth_mode()` and, on mismatch, calls `logout_with_message` with a specific explanation. If `forced_chatgpt_workspace_id` is set, it derives the current workspace/account id from the auth variant, handling token-load failures by logging out, and compares it against the allowed list; mismatches also trigger `logout_with_message`. Otherwise it returns `Ok(())`.
+**Data flow**: It loads the current auth using normal runtime rules. It compares the auth mode against any forced login method, then checks workspace/account ids when configured. If a rule is broken, it logs out all stores and returns an error message explaining why.
 
-**Call relations**: Startup/config enforcement code calls this after configuration is resolved. It depends on `load_auth` for precedence-aware loading and on `logout_with_message` to both clear credentials and surface the reason.
+**Call relations**: Startup or configuration-change code can call this to make sure stale credentials do not violate policy.
 
 *Call graph*: calls 2 internal fn (load_auth, logout_with_message); 1 external calls (format!).
 
@@ -836,11 +840,11 @@ fn logout_with_message(
 ) -> std::io::Result<()
 ```
 
-**Purpose**: Clears auth from all relevant stores and returns an `io::Error` carrying the supplied logout reason.
+**Purpose**: Clears credentials and returns an error containing a human-readable reason for the forced logout.
 
-**Data flow**: It takes the Codex home path, a human-readable message, and storage parameters, calls `logout_all_stores`, and then returns `Err(std::io::Error::other(...))`. If store removal failed, it appends the deletion failure text to the original message.
+**Data flow**: It tries to remove all relevant auth stores. It combines the caller's message with any deletion error. It always returns an I/O error carrying the final message.
 
-**Call relations**: Restriction enforcement uses this helper to force logout while preserving a user-facing explanation of why credentials were invalidated.
+**Call relations**: `enforce_login_restrictions` uses this whenever a configured login rule is violated.
 
 *Call graph*: calls 1 internal fn (logout_all_stores); called by 1 (enforce_login_restrictions); 2 external calls (other, format!).
 
@@ -855,11 +859,11 @@ fn logout_all_stores(
 ) -> std::io::Result<bool>
 ```
 
-**Purpose**: Removes auth from both ephemeral and managed stores so no stale credentials remain active.
+**Purpose**: Clears both temporary and configured persistent auth stores when needed, so logout really removes active auth.
 
-**Data flow**: If the configured storage mode is already `Ephemeral`, it deletes only the ephemeral store. Otherwise it first deletes the ephemeral store using default keyring settings, then deletes the configured managed store, and returns whether either deletion removed something.
+**Data flow**: It checks the configured storage mode. If the mode is already ephemeral, it deletes only the ephemeral store. Otherwise it deletes the ephemeral store first and then the configured store, returning whether either one was removed.
 
-**Call relations**: Both logout paths and forced-logout helpers use this to ensure external ephemeral auth does not survive alongside cleared persistent auth.
+**Call relations**: Manager logout, top-level logout with revocation, and forced logout all use this helper.
 
 *Call graph*: calls 2 internal fn (default, logout); called by 4 (logout, logout_with_revoke, logout_with_message, logout_with_revoke).
 
@@ -875,11 +879,11 @@ async fn load_auth(
     chatgp
 ```
 
-**Purpose**: Implements the full auth-loading precedence order across environment variables, ephemeral external auth, access-token env auth, and persistent storage.
+**Purpose**: Applies the full runtime precedence rules for finding the current login. This is the main loading pipeline for credentials.
 
-**Data flow**: It takes the Codex home path, a flag controlling `CODEX_API_KEY` precedence, storage mode, optional forced workspace ids, optional ChatGPT base URL, and keyring backend kind. It first returns `CodexAuth::from_api_key` if env API-key override is enabled and `CODEX_API_KEY` is set. Next it loads the ephemeral store and, if present, reconstructs auth via `CodexAuth::from_auth_dot_json`, enforcing PAT workspace restrictions when needed. Then it checks `CODEX_ACCESS_TOKEN`, classifies it as PAT or agent identity, hydrates/validates accordingly, and enforces PAT workspace restrictions. If the configured mode is ephemeral-only and nothing has been found, it returns `Ok(None)`. Otherwise it loads the persistent store, reconstructs auth from `AuthDotJson`, enforces PAT workspace restrictions if applicable, and returns the result.
+**Data flow**: It may first accept `CODEX_API_KEY` from the environment. It then checks temporary external auth storage, then `CODEX_ACCESS_TOKEN`, then persistent storage unless the caller requested ephemeral-only auth. It converts raw records to `CodexAuth` and enforces workspace restrictions for personal access tokens.
 
-**Call relations**: This is the central read path used by `AuthManager` construction, reloads, restriction enforcement, and direct storage-loading helpers.
+**Call relations**: Auth manager startup, reloads, restriction checks, and direct storage loading all funnel through this function.
 
 *Call graph*: calls 10 internal fn (default, classify_codex_access_token, from_agent_identity_jwt, from_api_key, from_auth_dot_json, ensure_personal_access_token_workspace_allowed, read_codex_access_token_from_env, read_codex_api_key_from_env, load, create_auth_storage); called by 4 (load_auth_from_storage, new_with_workspace_restriction, from_auth_storage, enforce_login_restrictions); 2 external calls (to_path_buf, PersonalAccessToken).
 
@@ -895,11 +899,11 @@ fn persist_tokens(
 ) -> std::io::Result<AuthDotJson>
 ```
 
-**Purpose**: Updates stored ChatGPT token fields and `last_refresh` in auth storage after a successful refresh.
+**Purpose**: Updates saved ChatGPT token data after a successful refresh.
 
-**Data flow**: It loads the current `AuthDotJson` from the provided storage backend, errors if none exists, ensures a `TokenData` struct is present, optionally parses and replaces the `id_token` claims, overwrites provided `access_token` and `refresh_token` fields, sets `last_refresh` to `Utc::now()`, saves the updated payload back to storage, and returns the updated `AuthDotJson`.
+**Data flow**: It loads the current auth payload from storage, inserts or updates token fields that were returned by the server, parses a new ID token if present, updates the last-refresh timestamp, saves the record, and returns the updated payload.
 
-**Call relations**: Managed ChatGPT refresh uses this helper after receiving new OAuth tokens from the authority.
+**Call relations**: The ChatGPT token refresh flow calls this after receiving new tokens from the OAuth service.
 
 *Call graph*: calls 1 internal fn (parse_chatgpt_jwt_claims); called by 1 (refresh_and_persist_chatgpt_token); 2 external calls (now, other).
 
@@ -913,11 +917,11 @@ async fn request_chatgpt_token_refresh(
 ) -> Result<RefreshResponse, RefreshTokenError>
 ```
 
-**Purpose**: Calls the OAuth refresh-token endpoint and classifies success, permanent refresh-token failures, and transient transport/decoding failures.
+**Purpose**: Calls the ChatGPT OAuth token endpoint to exchange a refresh token for fresh tokens.
 
-**Data flow**: It builds a `RefreshRequest` containing `oauth_client_id()`, grant type `refresh_token`, and the supplied refresh token, then posts JSON to `refresh_token_endpoint()` using the provided `CodexHttpClient`. On success it decodes and returns `RefreshResponse`. On non-success it reads the response body, logs the failure, classifies the body with `classify_refresh_token_failure`, and returns either `RefreshTokenError::Permanent` for unauthorized/known refresh-token failures or `RefreshTokenError::Transient` with a parsed message for other statuses. Transport and JSON-decoding errors are also mapped to transient errors.
+**Data flow**: It builds a refresh request with the OAuth client id and refresh token, sends it with the shared HTTP client, and parses a successful response. On failure it classifies permanent refresh-token problems separately from temporary network or server problems.
 
-**Call relations**: `AuthManager::refresh_and_persist_chatgpt_token` delegates the network portion of managed ChatGPT refresh to this helper.
+**Call relations**: `AuthManager::refresh_and_persist_chatgpt_token` calls this before saving refreshed tokens.
 
 *Call graph*: calls 5 internal fn (post, classify_refresh_token_failure, oauth_client_id, refresh_token_endpoint, try_parse_error_message); called by 1 (refresh_and_persist_chatgpt_token); 5 external calls (other, format!, Permanent, Transient, error!).
 
@@ -928,11 +932,11 @@ async fn request_chatgpt_token_refresh(
 fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError
 ```
 
-**Purpose**: Maps backend refresh-token error codes into structured `RefreshTokenFailedError` values with user-facing messages.
+**Purpose**: Turns an error response body from the OAuth service into a user-facing permanent refresh failure reason.
 
-**Data flow**: It extracts an optional backend code from the response body via `extract_refresh_token_error_code`, lowercases it, maps known codes (`refresh_token_expired`, `refresh_token_reused`, `refresh_token_invalidated`) to specific `RefreshTokenFailedReason` variants, logs a warning for unknown codes, selects the corresponding canned message constant, and returns `RefreshTokenFailedError::new(reason, message)`.
+**Data flow**: It extracts a backend error code from the response body, maps known codes to expired, reused, or revoked refresh-token reasons, logs unknown responses, and returns a structured `RefreshTokenFailedError` with a helpful message.
 
-**Call relations**: The OAuth refresh request helper uses this to decide whether a failed refresh should be treated as permanent and what message should be surfaced.
+**Call relations**: The token refresh HTTP helper uses this when the auth service rejects a refresh request.
 
 *Call graph*: calls 2 internal fn (extract_refresh_token_error_code, new); called by 1 (request_chatgpt_token_refresh); 1 external calls (warn!).
 
@@ -943,11 +947,11 @@ fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError
 fn extract_refresh_token_error_code(body: &str) -> Option<String>
 ```
 
-**Purpose**: Pulls a refresh-token error code out of a JSON response body in several supported shapes.
+**Purpose**: Pulls a refresh-token error code out of a JSON error response.
 
-**Data flow**: It returns `None` for empty bodies or non-object JSON. For object bodies, it first inspects `error`: if that field is an object with a string `code`, it returns that; if `error` itself is a string, it returns it; otherwise it falls back to a top-level string `code` field.
+**Data flow**: It receives the raw response body, ignores empty or non-JSON bodies, then looks for a code in common places such as `error.code`, `error`, or top-level `code`. It returns the code string if found.
 
-**Call relations**: Only `classify_refresh_token_failure` calls this helper to normalize backend error payloads.
+**Call relations**: `classify_refresh_token_failure` uses this to understand backend error responses without depending on one exact JSON shape.
 
 *Call graph*: called by 1 (classify_refresh_token_failure).
 
@@ -958,11 +962,11 @@ fn extract_refresh_token_error_code(body: &str) -> Option<String>
 fn oauth_client_id() -> String
 ```
 
-**Purpose**: Returns the OAuth client id used for token refresh, honoring an environment override when present.
+**Purpose**: Returns the OAuth client id used for ChatGPT token refresh, allowing tests or special environments to override it.
 
-**Data flow**: It reads `CLIENT_ID_OVERRIDE_ENV_VAR`, trims only by emptiness check, and returns the override if non-empty; otherwise it returns the built-in `CLIENT_ID` constant as a `String`.
+**Data flow**: It checks an override environment variable. If it is present and non-empty, that value is returned. Otherwise it returns the built-in client id.
 
-**Call relations**: The refresh-token request builder uses this helper so tests or alternate deployments can override the OAuth client id.
+**Call relations**: The token refresh request builder calls this before contacting the OAuth endpoint.
 
 *Call graph*: called by 2 (request_chatgpt_token_refresh, client_id); 1 external calls (var).
 
@@ -973,11 +977,11 @@ fn oauth_client_id() -> String
 fn refresh_token_endpoint() -> String
 ```
 
-**Purpose**: Returns the OAuth refresh endpoint URL, honoring an environment override.
+**Purpose**: Returns the OAuth refresh-token endpoint URL, with an environment override for testing or alternate deployments.
 
-**Data flow**: It reads `REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR` and returns that value if set; otherwise it returns the default `REFRESH_TOKEN_URL`.
+**Data flow**: It reads the override environment variable. If absent, it returns the default OpenAI auth URL.
 
-**Call relations**: The refresh-token request helper uses this to determine where to send OAuth refresh requests.
+**Call relations**: The token refresh HTTP helper uses this as the destination for refresh requests.
 
 *Call graph*: called by 1 (request_chatgpt_token_refresh); 1 external calls (var).
 
@@ -988,11 +992,11 @@ fn refresh_token_endpoint() -> String
 fn from_external_tokens(external: &ExternalAuthTokens) -> std::io::Result<Self>
 ```
 
-**Purpose**: Converts externally supplied ChatGPT tokens plus metadata into an ephemeral `AuthDotJson` snapshot.
+**Purpose**: Converts externally supplied ChatGPT tokens into the same raw auth format used by Codex storage.
 
-**Data flow**: It requires `external.chatgpt_metadata()` to be present, otherwise returns an error. It parses JWT claims from `external.access_token`, overwrites `chatgpt_account_id` with the supplied metadata account id, derives `chatgpt_plan_type` from metadata or parsed claims or an explicit `Unknown`, constructs `TokenData` with an empty refresh token and matching account id, and returns an `AuthDotJson` with `auth_mode: Some(ChatgptAuthTokens)`, `tokens` populated, `last_refresh: Some(Utc::now())`, and all other credential fields `None`.
+**Data flow**: It requires ChatGPT metadata, parses the access token claims, fills in account id and plan information, builds `TokenData`, marks the auth mode as external ChatGPT tokens, and stamps the current time.
 
-**Call relations**: External ChatGPT login and refresh flows use this helper before saving the resulting auth snapshot into ephemeral storage.
+**Call relations**: External auth refresh uses this before saving temporary auth. It rejects access-token-only external credentials when ChatGPT metadata is required.
 
 *Call graph*: calls 2 internal fn (chatgpt_metadata, parse_chatgpt_jwt_claims); 4 external calls (Unknown, new, now, other).
 
@@ -1007,11 +1011,11 @@ fn from_external_access_token(
     ) -> std::io::Result<Self>
 ```
 
-**Purpose**: Convenience wrapper for building external ChatGPT auth from raw token and metadata strings.
+**Purpose**: Convenience helper that builds external ChatGPT token metadata from plain arguments and converts it to `AuthDotJson`.
 
-**Data flow**: It takes an access token, account id, and optional plan type, constructs `ExternalAuthTokens::chatgpt(...)`, and delegates to `AuthDotJson::from_external_tokens`.
+**Data flow**: It receives an access token, account id, and optional plan. It creates `ExternalAuthTokens::chatgpt` and delegates to `from_external_tokens`.
 
-**Call relations**: `login_with_chatgpt_auth_tokens` uses this helper to seed ephemeral auth from parent-provided ChatGPT credentials.
+**Call relations**: `login_with_chatgpt_auth_tokens` uses this to seed ephemeral ChatGPT auth.
 
 *Call graph*: calls 1 internal fn (chatgpt); 1 external calls (from_external_tokens).
 
@@ -1022,11 +1026,11 @@ fn from_external_access_token(
 fn resolved_mode(&self) -> ApiAuthMode
 ```
 
-**Purpose**: Infers the effective auth mode from explicit `auth_mode` or populated credential fields for backward compatibility.
+**Purpose**: Determines the effective auth mode of a raw auth record, even when older records do not explicitly store a mode.
 
-**Data flow**: It returns `self.auth_mode` when present. Otherwise it checks fields in order: `personal_access_token`, `bedrock_api_key`, `openai_api_key`; if none are set it defaults to `ApiAuthMode::Chatgpt`.
+**Data flow**: It first returns the explicit mode if present. Otherwise it infers personal access token, Bedrock API key, API key, or finally ChatGPT based on which credential fields are populated.
 
-**Call relations**: Auth reconstruction and storage-mode selection rely on this inference so older or partially explicit auth payloads still load correctly.
+**Call relations**: Auth loading and storage-mode selection use this to support backward-compatible auth files.
 
 *Call graph*: called by 1 (storage_mode).
 
@@ -1040,11 +1044,11 @@ fn storage_mode(
     ) -> AuthCredentialsStoreMode
 ```
 
-**Purpose**: Determines which storage mode should be used for a given auth payload when reconstructing managed auth.
+**Purpose**: Chooses which storage mode should be used for this auth record.
 
-**Data flow**: It compares `self.resolved_mode()` to `ApiAuthMode::ChatgptAuthTokens`; external ChatGPT tokens force `AuthCredentialsStoreMode::Ephemeral`, while all other modes return the caller-provided storage mode.
+**Data flow**: It checks the resolved mode. External ChatGPT token records are forced to ephemeral storage; all other records use the caller's configured storage mode.
 
-**Call relations**: `CodexAuth::from_auth_dot_json` uses this to ensure externally managed ChatGPT tokens are always treated as ephemeral even if the caller prefers persistent storage.
+**Call relations**: `CodexAuth::from_auth_dot_json` uses this when creating storage for ChatGPT auth.
 
 *Call graph*: calls 1 internal fn (resolved_mode).
 
@@ -1055,11 +1059,11 @@ fn storage_mode(
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats cached auth state for debugging without dumping full credential contents.
+**Purpose**: Formats cached auth state for debug logs without printing secrets.
 
-**Data flow**: It writes a debug struct containing the current cached auth mode and, if present, the reason of any scoped permanent refresh failure, then finishes the struct.
+**Data flow**: It reads the cached auth mode and permanent refresh-failure reason, then writes only those safe fields into the debug output.
 
-**Call relations**: `AuthManager` debug output includes this representation to summarize auth state safely.
+**Call relations**: `AuthManager` debug formatting includes this, giving useful diagnostics while avoiding token leakage.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1070,11 +1074,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn auth_state_changed(&self) -> Option<bool>
 ```
 
-**Purpose**: Returns whether the last unauthorized-recovery step changed auth state, when that concept applies.
+**Purpose**: Reports whether a recovery step changed the cached auth state.
 
-**Data flow**: It reads and returns the stored `Option<bool>` field.
+**Data flow**: It returns the stored optional boolean. `Some(true)` means auth changed, `Some(false)` means it was checked but unchanged, and `None` means no meaningful step ran.
 
-**Call relations**: Recovery callers inspect this after each step to decide whether retries should proceed with updated credentials.
+**Call relations**: Unauthorized handling code can use this after calling `UnauthorizedRecovery::next` to decide whether retry context changed.
 
 
 ##### `UnauthorizedRecovery::new`  (lines 1314–1336)
@@ -1083,11 +1087,11 @@ fn auth_state_changed(&self) -> Option<bool>
 fn new(manager: Arc<AuthManager>) -> Self
 ```
 
-**Purpose**: Initializes the 401-recovery state machine based on the manager’s current auth and external-auth configuration.
+**Purpose**: Creates a recovery state machine for handling a 401 Unauthorized response.
 
-**Data flow**: It clones the manager `Arc`, snapshots the current cached auth, derives `expected_account_id` from that auth, chooses `UnauthorizedRecoveryMode::External` when external API-key auth is configured or the cached auth is external ChatGPT tokens, otherwise `Managed`, and sets the initial step to `ExternalRefresh` or `Reload` accordingly.
+**Data flow**: It reads the manager's cached auth, remembers the expected account id, chooses managed or external recovery mode, and sets the first step accordingly.
 
-**Call relations**: `AuthManager::unauthorized_recovery` constructs this object when request code wants a stepwise recovery strategy after unauthorized responses.
+**Call relations**: `AuthManager::unauthorized_recovery` constructs this whenever request code wants a controlled retry plan.
 
 *Call graph*: called by 1 (unauthorized_recovery).
 
@@ -1098,11 +1102,11 @@ fn new(manager: Arc<AuthManager>) -> Self
 fn has_next(&self) -> bool
 ```
 
-**Purpose**: Reports whether another recovery step is currently available.
+**Purpose**: Answers whether another recovery step is available.
 
-**Data flow**: It checks several conditions in order: external API-key auth can continue until `Done`; non-refreshable or non-ChatGPT auth returns false; external mode without configured external auth returns false; otherwise it returns whether the current step is not `Done`.
+**Data flow**: It checks whether external API-key auth is still retryable, whether the current auth supports recovery, whether external auth is configured when required, and whether the state machine is already done. It returns a boolean.
 
-**Call relations**: Callers use this before invoking `next`, and `next` itself guards against exhaustion by consulting it.
+**Call relations**: Unauthorized handlers call this before attempting another recovery step, and `next` uses it as its own guard.
 
 *Call graph*: called by 3 (recover_remote_control_auth, handle_unauthorized, next); 1 external calls (matches!).
 
@@ -1113,11 +1117,11 @@ fn has_next(&self) -> bool
 fn unavailable_reason(&self) -> &'static str
 ```
 
-**Purpose**: Explains why unauthorized recovery is unavailable or exhausted using a stable string code.
+**Purpose**: Explains in a compact machine-readable string why recovery is or is not available.
 
-**Data flow**: It inspects external API-key status, current cached auth type, external-auth presence, and current step, returning one of `ready`, `not_refreshable_auth`, `not_chatgpt_auth`, `no_external_auth`, or `recovery_exhausted`.
+**Data flow**: It inspects the current auth, external auth configuration, and current step. It returns labels such as `ready`, `not_chatgpt_auth`, `no_external_auth`, or `recovery_exhausted`.
 
-**Call relations**: Higher-level retry/reporting code uses this to log or surface why no further 401 recovery can be attempted.
+**Call relations**: Callers can log or report this when a 401 cannot be automatically recovered.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1128,11 +1132,11 @@ fn unavailable_reason(&self) -> &'static str
 fn mode_name(&self) -> &'static str
 ```
 
-**Purpose**: Returns a human-readable label for the recovery mode.
+**Purpose**: Returns a short name for the recovery mode: managed or external.
 
-**Data flow**: It matches `self.mode` and returns either `managed` or `external`.
+**Data flow**: It reads the stored recovery mode enum and returns a static string.
 
-**Call relations**: Recovery logging uses this to describe which strategy is active.
+**Call relations**: Remote-control recovery logging uses this to describe which path is being attempted.
 
 *Call graph*: called by 1 (recover_remote_control_auth).
 
@@ -1143,11 +1147,11 @@ fn mode_name(&self) -> &'static str
 fn step_name(&self) -> &'static str
 ```
 
-**Purpose**: Returns a human-readable label for the current recovery step.
+**Purpose**: Returns a short name for the current recovery step.
 
-**Data flow**: It matches `self.step` and returns `reload`, `refresh_token`, `external_refresh`, or `done`.
+**Data flow**: It reads the current step enum and returns strings such as `reload`, `refresh_token`, `external_refresh`, or `done`.
 
-**Call relations**: Recovery logging and diagnostics use this to describe progress through the state machine.
+**Call relations**: Remote-control recovery logging uses this to show progress through the recovery plan.
 
 *Call graph*: called by 1 (recover_remote_control_auth).
 
@@ -1158,11 +1162,11 @@ fn step_name(&self) -> &'static str
 async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError>
 ```
 
-**Purpose**: Executes the current unauthorized-recovery step, advances the state machine, and reports whether auth changed.
+**Purpose**: Runs the next available unauthorized-recovery step.
 
-**Data flow**: It first errors with a permanent `RefreshTokenError` if `has_next()` is false. For `Reload`, it awaits `manager.reload_if_account_id_matches(...)`; changed and unchanged reloads both advance to `RefreshToken` and return `auth_state_changed: Some(true/false)`, while a skipped reload advances to `Done` and returns a permanent account-mismatch error. For `RefreshToken`, it awaits `manager.refresh_token_from_authority()`, advances to `Done`, and reports `Some(true)`. For `ExternalRefresh`, it awaits `manager.refresh_external_auth(Unauthorized)`, advances to `Done`, and reports `Some(true)`. `Done` yields `auth_state_changed: None`.
+**Data flow**: It first checks that a step is available. It may reload auth if the account still matches, refresh a managed ChatGPT token, or ask an external auth provider for new credentials. It advances the state machine and returns whether auth changed, or returns a refresh error.
 
-**Call relations**: Request retry loops call this one step per unauthorized retry. It delegates actual reload and refresh work back into `AuthManager` while owning the sequencing policy.
+**Call relations**: Unauthorized request handlers call this between retries after a 401 response.
 
 *Call graph*: calls 2 internal fn (has_next, new); called by 2 (recover_remote_control_auth, handle_unauthorized); 1 external calls (Permanent).
 
@@ -1173,11 +1177,11 @@ async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenE
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats the manager’s configuration and coarse auth state for debugging.
+**Purpose**: Formats the auth manager for debug logs without exposing secret token values.
 
-**Data flow**: It writes a debug struct containing the Codex home path, cached auth summary, environment-override flag, storage settings, forced workspace restriction, ChatGPT base URL, and whether external auth is configured, then finishes non-exhaustively.
+**Data flow**: It writes configuration fields, cached auth summary, workspace restriction state, base URL, and whether external auth exists. It omits sensitive credential contents.
 
-**Call relations**: This supports diagnostics when the manager is embedded in larger runtime state dumps.
+**Call relations**: Debug logging can use this to inspect manager setup safely.
 
 *Call graph*: calls 1 internal fn (has_external_auth); 1 external calls (debug_struct).
 
@@ -1193,11 +1197,11 @@ async fn new(
         keyr
 ```
 
-**Purpose**: Constructs an auth manager using the provided storage and environment settings, without workspace restriction.
+**Purpose**: Creates an auth manager and loads the initial auth state using the provided settings.
 
-**Data flow**: It takes the Codex home path, env-override flag, storage mode, optional ChatGPT base URL, and keyring backend kind, then delegates to `new_with_workspace_restriction` with `None` for forced workspace ids.
+**Data flow**: It receives storage and URL configuration, then delegates to the constructor that also supports workspace restrictions with no restriction set. It returns a manager with cached auth if loading succeeds.
 
-**Call relations**: Most production and test code uses this as the standard manager constructor.
+**Call relations**: Tests and setup code use this when no forced workspace list is needed.
 
 *Call graph*: called by 12 (auth_manager_with_api_key, auth_manager_with_plan_and_identity, get_bundle_recovers_after_unauthorized_reload, get_bundle_recovers_after_unauthorized_reload_updates_cache_identity, get_bundle_surfaces_auth_recovery_message, get_bundle_unauthorized_without_recovery_uses_generic_message, load_auth_manager, personal_access_token_does_not_offer_unauthorized_recovery, bedrock_only_auth_storage_creates_primary_auth, login_with_bedrock_api_key_replaces_openai_auth (+2 more)); 1 external calls (new_with_workspace_restriction).
 
@@ -1212,11 +1216,11 @@ async fn new_with_workspace_restriction(
         forced_chatgpt_work
 ```
 
-**Purpose**: Constructs an auth manager, eagerly loading initial auth and optionally enforcing workspace restrictions during load.
+**Purpose**: Creates an auth manager while applying an optional list of allowed ChatGPT workspace ids.
 
-**Data flow**: It calls `load_auth` with the supplied configuration and optional forced workspace ids, swallowing load errors into `None`. It creates a watch channel initialized to revision 0, stores the loaded auth in `CachedAuth` with no permanent refresh failure, initializes the refresh semaphore with one permit, and starts with no external auth configured.
+**Data flow**: It attempts to load auth using the full loading pipeline and the workspace restriction. Loading errors are swallowed into an unauthenticated cache. It also creates a watch channel for auth-change notifications and initializes locks and external-auth state.
 
-**Call relations**: This is the real constructor behind `new` and `shared_from_config`; tests also call it directly when they need workspace-restricted loading.
+**Call relations**: The public constructors and config-based constructor use this as the real setup path.
 
 *Call graph*: calls 1 internal fn (load_auth); called by 2 (auth_manager_rejects_env_personal_access_token_workspace_mismatch, auth_manager_rejects_stored_personal_access_token_workspace_mismatch); 3 external calls (new, new, channel).
 
@@ -1227,11 +1231,11 @@ async fn new_with_workspace_restriction(
 fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self>
 ```
 
-**Purpose**: Builds an `Arc<AuthManager>` preloaded with a specific auth snapshot for tests.
+**Purpose**: Builds an `AuthManager` around a supplied auth value for tests.
 
-**Data flow**: It wraps the supplied `CodexAuth` in `CachedAuth`, creates a watch channel, fills the manager with placeholder home/storage settings, a one-permit semaphore, and no external auth, then returns it inside `Arc`.
+**Data flow**: It wraps the provided auth in cached state, fills in dummy paths and default storage settings, creates a watch channel, and returns the manager in an `Arc` shared pointer.
 
-**Call relations**: Tests use this to bypass storage loading and start from a known in-memory auth state.
+**Call relations**: Many tests use this to bypass storage and start with exactly the auth state they need.
 
 *Call graph*: calls 1 internal fn (default); called by 42 (refresh_test_state, model_client_with_counting_attestation, emit_subagent_session_started_includes_fork_lineage_from_session_configuration, guardian_subagent_does_not_inherit_parent_exec_policy_rules, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx, session_new_fails_when_zsh_fork_enabled_without_packaged_zsh, auth_manager_from_auth (+15 more)); 5 external calls (new, from, new, new, channel).
 
@@ -1242,11 +1246,11 @@ fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self>
 fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self>
 ```
 
-**Purpose**: Builds a test manager preloaded with auth and a caller-specified Codex home path.
+**Purpose**: Builds a test auth manager with both a supplied auth value and a specific Codex home path.
 
-**Data flow**: It mirrors `from_auth_for_testing` but stores the provided `codex_home` instead of a placeholder path.
+**Data flow**: It stores the given auth in cache, uses the provided home path, applies default storage settings, and returns the manager in an `Arc`.
 
-**Call relations**: Tests that need both a seeded auth snapshot and a meaningful home directory use this variant.
+**Call relations**: Tests that need real storage paths use this instead of the simpler testing constructor.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (auth_manager_from_auth_with_home); 4 external calls (new, new, new, channel).
 
@@ -1257,11 +1261,11 @@ fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<
 fn external_bearer_only(config: ModelProviderAuthInfo) -> Arc<Self>
 ```
 
-**Purpose**: Constructs a manager configured solely with command-based external bearer auth and no cached managed auth.
+**Purpose**: Creates an auth manager for a custom provider whose bearer token is supplied externally, without normal Codex login state.
 
-**Data flow**: It creates a watch channel, initializes `CachedAuth` with `auth: None`, fills placeholder home/storage settings, and installs `BearerTokenRefresher::new(config)` into `external_auth` as an `Arc<dyn ExternalAuth>`.
+**Data flow**: It creates an unauthenticated cached manager and installs a `BearerTokenRefresher` as the external auth provider. It returns the manager in an `Arc`.
 
-**Call relations**: Provider-auth integrations and tests use this constructor when auth should come exclusively from an external bearer command.
+**Call relations**: Provider-auth setup and tests use this for model providers whose auth comes from an external command.
 
 *Call graph*: calls 2 internal fn (default, new); called by 5 (external_bearer_only_auth_manager_disables_auto_refresh_when_interval_is_zero, external_bearer_only_auth_manager_returns_none_when_command_fails, external_bearer_only_auth_manager_uses_cached_provider_token, unauthorized_recovery_uses_external_refresh_for_bearer_manager, auth_manager_for_provider); 5 external calls (new, from, new, new, channel).
 
@@ -1272,11 +1276,11 @@ fn external_bearer_only(config: ModelProviderAuthInfo) -> Arc<Self>
 fn auth_cached(&self) -> Option<CodexAuth>
 ```
 
-**Purpose**: Returns the current cached auth snapshot without attempting reload or refresh.
+**Purpose**: Returns the currently cached auth snapshot without trying to reload or refresh it.
 
-**Data flow**: It reads the `inner` `RwLock`, clones the optional `CodexAuth`, and returns it, or `None` if the lock is unavailable.
+**Data flow**: It reads the manager's cache lock, clones the optional auth value, and returns it. If the lock cannot be read, it returns nothing.
 
-**Call relations**: Most manager internals use this as the cheap read path before deciding whether more expensive refresh logic is needed.
+**Call relations**: Many manager methods use this when they need a consistent point-in-time auth value.
 
 *Call graph*: called by 9 (auth, auth_mode, get_api_auth_mode, is_external_chatgpt_auth_active, logout_with_revoke, refresh_external_auth, refresh_token, refresh_token_from_authority_impl, reload_if_account_id_matches).
 
@@ -1287,11 +1291,11 @@ fn auth_cached(&self) -> Option<CodexAuth>
 fn auth_change_receiver(&self) -> watch::Receiver<u64>
 ```
 
-**Purpose**: Subscribes to revisions that increment when auth changes in a way relevant to request recovery.
+**Purpose**: Subscribes to notifications that the auth snapshot changed in a way that can affect request recovery.
 
-**Data flow**: It calls `self.auth_change_tx.subscribe()` and returns the resulting `watch::Receiver<u64>`.
+**Data flow**: It creates a receiver from the internal watch channel and returns it to the caller.
 
-**Call relations**: Long-lived request/retry components use this receiver to notice auth changes that may invalidate in-flight assumptions.
+**Call relations**: Code that must react to login changes can hold this receiver and watch the revision number advance.
 
 *Call graph*: 1 external calls (subscribe).
 
@@ -1302,11 +1306,11 @@ fn auth_change_receiver(&self) -> watch::Receiver<u64>
 fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError>
 ```
 
-**Purpose**: Returns a cached permanent refresh failure only when it applies to the exact auth snapshot supplied.
+**Purpose**: Returns a cached permanent refresh failure if it applies to the supplied auth snapshot.
 
-**Data flow**: It reads `inner`, inspects `permanent_refresh_failure`, compares the supplied auth against the stored failure’s auth using `auths_equal_for_refresh`, and returns a cloned `RefreshTokenFailedError` when they match.
+**Data flow**: It reads cached state, checks whether the stored failure belongs to the same refresh-relevant auth value, and returns a cloned error if so.
 
-**Call relations**: Refresh logic uses this to fail fast on repeated attempts against credentials already known to be permanently unrefreshable.
+**Call relations**: The refresh implementation uses this to fail fast after a refresh token is known to be expired, reused, or revoked.
 
 *Call graph*: called by 1 (refresh_token_from_authority_impl).
 
@@ -1317,11 +1321,11 @@ fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFaile
 async fn auth(&self) -> Option<CodexAuth>
 ```
 
-**Purpose**: Returns the current auth snapshot, resolving external API-key auth and proactively refreshing managed ChatGPT auth when needed.
+**Purpose**: Returns the current usable auth, refreshing managed ChatGPT auth proactively when it is near expiry.
 
-**Data flow**: It first awaits `resolve_external_api_key_auth()` and returns that if present. Otherwise it clones `auth_cached()`. If the cached auth exists and `should_refresh_proactively(&auth)` is true, it awaits `refresh_token()`; on refresh failure it logs an error and returns the pre-refresh auth snapshot. On success or when no proactive refresh is needed, it returns the latest `auth_cached()`.
+**Data flow**: It first gives external API-key providers a chance to resolve a token. Otherwise it reads cached auth. If the cached managed ChatGPT token should be refreshed, it attempts refresh and logs errors without hiding the existing auth. It returns the latest cached auth.
 
-**Call relations**: Request paths call this as the main read API. It layers proactive refresh behavior on top of the cached snapshot and external-auth resolution.
+**Call relations**: Request and rate-limit code call this when they need the active credential.
 
 *Call graph*: calls 3 internal fn (auth_cached, refresh_token, resolve_external_api_key_auth); called by 2 (send_track_events, rate_limits_check); 2 external calls (should_refresh_proactively, error!).
 
@@ -1332,11 +1336,11 @@ async fn auth(&self) -> Option<CodexAuth>
 async fn reload(&self) -> bool
 ```
 
-**Purpose**: Forces a fresh load from storage/environment precedence and updates the cached auth snapshot.
+**Purpose**: Reloads auth from storage and updates the manager's cache.
 
-**Data flow**: It logs that auth is reloading, awaits `load_auth_from_storage()`, passes the result to `set_cached_auth`, and returns the boolean indicating whether the auth value changed.
+**Data flow**: It loads auth using the configured storage and environment rules, then passes the result to `set_cached_auth`. It returns whether the high-level auth value changed.
 
-**Call relations**: Logout, token refresh, and explicit reload callers use this to synchronize in-memory auth with storage.
+**Call relations**: Logout and refresh flows call this so the rest of the program immediately sees updated auth.
 
 *Call graph*: calls 2 internal fn (load_auth_from_storage, set_cached_auth); called by 4 (logout, logout_with_revoke, refresh_and_persist_chatgpt_token, refresh_external_auth); 1 external calls (info!).
 
@@ -1350,11 +1354,11 @@ async fn reload_if_account_id_matches(
     ) -> ReloadOutcome
 ```
 
-**Purpose**: Reloads auth only when the newly loaded account id matches the expected current account, preventing cross-account token substitution.
+**Purpose**: Reloads auth only if the stored credentials still belong to the expected account. This avoids switching accounts silently during token recovery.
 
-**Data flow**: If `expected_account_id` is `None`, it logs and returns `ReloadOutcome::Skipped`. Otherwise it loads fresh auth, extracts the new account id, and compares it to the expected one. On mismatch it logs and returns `Skipped`. On match it compares the new auth to the cached auth using `auths_equal_for_refresh`, updates the cache via `set_cached_auth`, and returns `ReloadedChanged` or `ReloadedNoChange` accordingly.
+**Data flow**: It requires an expected account id. It loads fresh auth, extracts its account id, compares it to the expected id, and either updates the cache or skips with a mismatch outcome. It reports whether reload changed auth.
 
-**Call relations**: Managed unauthorized recovery and guarded refresh both use this to safely observe on-disk changes made by another process without accidentally switching accounts.
+**Call relations**: Token refresh and unauthorized recovery use this guard before trusting auth changes from storage.
 
 *Call graph*: calls 3 internal fn (auth_cached, load_auth_from_storage, set_cached_auth); called by 1 (refresh_token); 2 external calls (auths_equal_for_refresh, info!).
 
@@ -1365,11 +1369,11 @@ async fn reload_if_account_id_matches(
 fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool
 ```
 
-**Purpose**: Performs auth equality tuned for refresh scoping, comparing the exact credential snapshot relevant to refresh semantics.
+**Purpose**: Compares two auth snapshots using the fields that matter for token refresh and failure caching.
 
-**Data flow**: It compares two optional auth references. API keys compare by key string; ChatGPT variants compare by full current `AuthDotJson`; agent identity compares by record; personal access token and Bedrock compare by full variant equality; differing modes or presence return false.
+**Data flow**: It receives two optional auth references. It treats matching absence as equal, compares API keys by key, ChatGPT auth by raw auth JSON, agent identity by record, personal tokens and Bedrock keys by their concrete equality, and different modes as unequal.
 
-**Call relations**: This stricter comparison underpins guarded reload decisions and permanent refresh-failure scoping.
+**Call relations**: Reload, change notification, and refresh-failure caching use this stricter comparison.
 
 
 ##### `AuthManager::auths_equal`  (lines 1766–1772)
@@ -1378,11 +1382,11 @@ fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool
 fn auths_equal(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool
 ```
 
-**Purpose**: Performs ordinary cached-auth equality using `CodexAuth`’s `PartialEq` implementation.
+**Purpose**: Compares two optional auth snapshots using normal auth equality.
 
-**Data flow**: It compares two optional auth references, returning true for both `None`, delegating to `a == b` for two `Some` values, and false otherwise.
+**Data flow**: It checks whether both are absent, both present and equal, or different. It returns a boolean.
 
-**Call relations**: `set_cached_auth` uses this coarser equality to decide whether the visible auth value changed.
+**Call relations**: `set_cached_auth` uses this to decide whether the visible auth value changed.
 
 *Call graph*: called by 1 (set_cached_auth).
 
@@ -1397,11 +1401,11 @@ fn record_permanent_refresh_failure_if_unchanged(
     )
 ```
 
-**Purpose**: Caches a permanent refresh failure only if the auth snapshot that failed is still the one currently cached.
+**Purpose**: Caches a permanent refresh failure only if the auth that failed is still the current auth.
 
-**Data flow**: It acquires the `inner` write lock, compares `attempted_auth` against the current cached auth using `auths_equal_for_refresh`, and if they match stores an `AuthScopedRefreshFailure` containing clones of the auth and error.
+**Data flow**: It takes the attempted auth and error, locks cached state for writing, checks that the current auth still matches the attempted snapshot for refresh purposes, and stores the failure if it does.
 
-**Call relations**: `refresh_token_from_authority_impl` calls this after permanent failures so later retries against unchanged credentials can fail immediately.
+**Call relations**: The refresh implementation calls this after permanent failures so later attempts against the same bad token can fail without another network request.
 
 *Call graph*: called by 1 (refresh_token_from_authority_impl); 3 external calls (auths_equal_for_refresh, clone, clone).
 
@@ -1412,11 +1416,11 @@ fn record_permanent_refresh_failure_if_unchanged(
 async fn load_auth_from_storage(&self) -> Option<CodexAuth>
 ```
 
-**Purpose**: Reloads auth using the manager’s stored configuration and current forced workspace restriction.
+**Purpose**: Loads auth using this manager's saved configuration.
 
-**Data flow**: It reads `forced_chatgpt_workspace_id()`, then awaits `load_auth` with the manager’s home path, env-override flag, storage mode, workspace restriction, ChatGPT base URL, and keyring backend kind. Errors are swallowed into `None`.
+**Data flow**: It reads the current forced workspace setting, then calls the shared `load_auth` function with the manager's home path, environment setting, storage mode, base URL, and keyring backend. It returns the loaded auth or nothing.
 
-**Call relations**: Both `reload` and guarded reload use this helper to centralize configuration-aware loading.
+**Call relations**: Reload operations use this instead of repeating the manager's configuration wiring.
 
 *Call graph*: calls 2 internal fn (forced_chatgpt_workspace_id, load_auth); called by 2 (reload, reload_if_account_id_matches).
 
@@ -1427,11 +1431,11 @@ async fn load_auth_from_storage(&self) -> Option<CodexAuth>
 fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool
 ```
 
-**Purpose**: Replaces the cached auth snapshot, clears scoped refresh failures when the refresh-relevant auth changed, and notifies watchers.
+**Purpose**: Updates the manager's cached auth and notifies watchers when the refresh-relevant auth state changes.
 
-**Data flow**: It acquires the `inner` write lock, compares previous and new auth using both `auths_equal` and `auths_equal_for_refresh`, clears `permanent_refresh_failure` when the refresh-relevant auth changed, logs whether the visible auth changed, stores the new auth, and increments the watch revision via `send_modify` when the refresh-relevant auth changed. It returns whether the visible auth changed.
+**Data flow**: It locks cached state, compares old and new auth, clears cached permanent refresh failures if the refresh-relevant auth changed, stores the new auth, and increments the watch-channel revision when needed. It returns whether normal auth equality changed.
 
-**Call relations**: Reload paths funnel through this method so cache updates, failure invalidation, and watcher notifications stay consistent.
+**Call relations**: Reload and guarded reload both use this as the single cache update point.
 
 *Call graph*: calls 1 internal fn (auths_equal); called by 2 (reload, reload_if_account_id_matches); 3 external calls (auths_equal_for_refresh, send_modify, info!).
 
@@ -1442,11 +1446,11 @@ fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool
 fn set_external_auth(&self, external_auth: Arc<dyn ExternalAuth>)
 ```
 
-**Purpose**: Installs or replaces the manager’s external auth provider.
+**Purpose**: Installs an external auth provider into the manager.
 
-**Data flow**: It acquires the `external_auth` write lock and stores `Some(external_auth)`.
+**Data flow**: It locks the external-auth slot for writing and stores the supplied shared provider.
 
-**Call relations**: Integrations can call this at runtime to attach an external auth source used by resolution and refresh flows.
+**Call relations**: Host applications use this to plug in auth that Codex should ask when credentials are externally managed.
 
 
 ##### `AuthManager::clear_external_auth`  (lines 1834–1838)
@@ -1455,11 +1459,11 @@ fn set_external_auth(&self, external_auth: Arc<dyn ExternalAuth>)
 fn clear_external_auth(&self)
 ```
 
-**Purpose**: Removes any configured external auth provider from the manager.
+**Purpose**: Removes any external auth provider from the manager.
 
-**Data flow**: It acquires the `external_auth` write lock and sets the stored value to `None`.
+**Data flow**: It locks the external-auth slot and sets it to empty.
 
-**Call relations**: Callers use this when external auth should no longer participate in auth resolution or unauthorized recovery.
+**Call relations**: Callers use this when external auth is no longer available or should no longer be trusted.
 
 
 ##### `AuthManager::set_forced_chatgpt_workspace_id`  (lines 1840–1846)
@@ -1468,11 +1472,11 @@ fn clear_external_auth(&self)
 fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<Vec<String>>)
 ```
 
-**Purpose**: Updates the manager’s workspace restriction set when it changes.
+**Purpose**: Updates the list of allowed ChatGPT workspace ids used by future loads and external refreshes.
 
-**Data flow**: It acquires the `forced_chatgpt_workspace_id` write lock and replaces the stored `Option<Vec<String>>` only if the new value differs from the current one.
+**Data flow**: It locks the workspace restriction field. If the new value differs from the old one, it replaces it.
 
-**Call relations**: Configuration-sync code can call this so future reloads and external refreshes enforce updated workspace restrictions.
+**Call relations**: Configuration updates can call this before reloading auth or refreshing external auth.
 
 
 ##### `AuthManager::forced_chatgpt_workspace_id`  (lines 1848–1853)
@@ -1481,11 +1485,11 @@ fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<Vec<String>>)
 fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>>
 ```
 
-**Purpose**: Returns the current forced workspace restriction configured on the manager.
+**Purpose**: Returns the current workspace restriction list.
 
-**Data flow**: It reads the `forced_chatgpt_workspace_id` lock, clones the optional vector, and returns it.
+**Data flow**: It reads the workspace restriction lock and clones the optional vector of ids. If the lock cannot be read, it returns nothing.
 
-**Call relations**: Storage reload and external-auth refresh use this to enforce workspace restrictions consistently.
+**Call relations**: Storage loading and external auth refresh use this to enforce workspace restrictions.
 
 *Call graph*: called by 2 (load_auth_from_storage, refresh_external_auth).
 
@@ -1496,11 +1500,11 @@ fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>>
 fn has_external_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether any external auth provider is currently configured.
+**Purpose**: Answers whether an external auth provider is currently configured.
 
-**Data flow**: It calls the private `external_auth()` accessor and returns whether it is `Some`.
+**Data flow**: It reads the external auth slot and returns true if a provider is present.
 
-**Call relations**: Debug formatting and unauthorized-recovery availability checks use this helper.
+**Call relations**: Debug formatting and recovery availability checks use this to describe or validate external-auth behavior.
 
 *Call graph*: calls 1 internal fn (external_auth); called by 1 (fmt).
 
@@ -1511,11 +1515,11 @@ fn has_external_auth(&self) -> bool
 fn is_external_chatgpt_auth_active(&self) -> bool
 ```
 
-**Purpose**: Reports whether the currently cached auth snapshot is externally managed ChatGPT tokens.
+**Purpose**: Answers whether the cached auth currently comes from external ChatGPT tokens.
 
-**Data flow**: It reads `auth_cached()` and returns whether the cached auth exists and `CodexAuth::is_external_chatgpt_tokens` is true.
+**Data flow**: It reads cached auth and asks the auth value whether it is the external ChatGPT token variant. It returns false if there is no cached auth.
 
-**Call relations**: Callers use this to distinguish active external ChatGPT auth from merely having an external provider configured.
+**Call relations**: Callers can use this to tell whether externally managed ChatGPT auth is active.
 
 *Call graph*: calls 1 internal fn (auth_cached).
 
@@ -1526,11 +1530,11 @@ fn is_external_chatgpt_auth_active(&self) -> bool
 fn codex_api_key_env_enabled(&self) -> bool
 ```
 
-**Purpose**: Exposes whether `CODEX_API_KEY` environment override is enabled for this manager.
+**Purpose**: Reports whether this manager allows `CODEX_API_KEY` to override stored auth.
 
-**Data flow**: It returns the stored `enable_codex_api_key_env` boolean.
+**Data flow**: It returns the stored boolean configuration value.
 
-**Call relations**: Configuration/reporting code can inspect this to understand the manager’s auth precedence behavior.
+**Call relations**: Other code can inspect this to understand the manager's auth precedence behavior.
 
 
 ##### `AuthManager::shared`  (lines 1870–1887)
@@ -1544,11 +1548,11 @@ async fn shared(
         k
 ```
 
-**Purpose**: Convenience constructor that returns a newly created manager wrapped in `Arc`.
+**Purpose**: Convenience constructor that creates an auth manager and wraps it in `Arc` so it can be shared across tasks.
 
-**Data flow**: It awaits `Self::new(...)`, wraps the resulting manager in `Arc`, and returns it.
+**Data flow**: It receives the same settings as `new`, awaits manager creation, wraps the result in an atomically reference-counted pointer, and returns it.
 
-**Call relations**: Many long-lived runtime components use this constructor because they share the manager across tasks.
+**Call relations**: Startup and remote-control setup code use this when many components need the same auth manager.
 
 *Call graph*: called by 13 (list_remote_control_clients_recovers_auth_after_unauthorized, list_remote_control_clients_retries_unauthorized_only_once, remote_control_handle_discards_pairing_response_after_auth_change, remote_control_handle_recovers_auth_before_refreshing_pairing, persisted_enable_does_not_follow_auth_to_an_account_without_a_preference, remote_control_start_allows_missing_auth_when_enabled, remote_control_waits_for_account_id_before_enrolling, connect_remote_control_websocket_recovers_after_unauthorized_enrollment, connect_remote_control_websocket_recovers_after_unauthorized_refresh, connect_remote_control_websocket_requires_chatgpt_auth (+3 more)); 2 external calls (new, new).
 
@@ -1562,11 +1566,11 @@ async fn shared_from_config(
     ) -> Arc<Self>
 ```
 
-**Purpose**: Constructs a shared manager from an abstract config provider implementing `AuthManagerConfig`.
+**Purpose**: Creates a shared auth manager from a resolved configuration object.
 
-**Data flow**: It reads codex home, storage mode, keyring backend, forced workspace ids, and ChatGPT base URL from the config trait, passes them into `new_with_workspace_restriction`, wraps the result in `Arc`, and returns it.
+**Data flow**: It asks the config object for the Codex home path, storage mode, keyring backend, workspace restriction, and ChatGPT base URL. It builds the manager with those values and returns it in an `Arc`.
 
-**Call relations**: Startup/orchestration code uses this to build the manager from already-resolved application configuration without coupling `codex-login` to a concrete config type.
+**Call relations**: Main runtime setup code uses this to connect the auth manager to the broader application configuration without making this crate depend on the full config type.
 
 *Call graph*: called by 15 (start_uninitialized, build_test_processor, run_main_with_transport_options, chatgpt_get_request_with_timeout, apps_enabled, connector_auth, build_report, load_exec_server_remote_auth, run_debug_models_command, cached_directory_connectors_for_tool_suggest_with_auth (+5 more)); 7 external calls (new, new_with_workspace_restriction, auth_keyring_backend_kind, chatgpt_base_url, cli_auth_credentials_store_mode, codex_home, forced_chatgpt_workspace_id).
 
@@ -1577,11 +1581,11 @@ async fn shared_from_config(
 fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery
 ```
 
-**Purpose**: Creates a new unauthorized-recovery state machine bound to this manager.
+**Purpose**: Starts a new unauthorized-recovery state machine tied to this manager.
 
-**Data flow**: It clones the manager `Arc` and passes it to `UnauthorizedRecovery::new`, returning the resulting recovery object.
+**Data flow**: It clones the manager's `Arc` pointer and passes it to `UnauthorizedRecovery::new`. It returns the recovery object.
 
-**Call relations**: Request retry code calls this when it receives a 401 and wants to attempt managed or external auth recovery.
+**Call relations**: Request code calls this after a 401 response to get a safe sequence of retry steps.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (clone).
 
@@ -1592,11 +1596,11 @@ fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery
 fn external_auth(&self) -> Option<Arc<dyn ExternalAuth>>
 ```
 
-**Purpose**: Returns a cloned handle to the configured external auth provider, if any.
+**Purpose**: Returns the currently configured external auth provider, if any.
 
-**Data flow**: It reads the `external_auth` lock and clones the inner `Arc<dyn ExternalAuth>` when present.
+**Data flow**: It reads the external-auth lock and clones the shared provider pointer. It returns nothing if no provider is installed or the lock cannot be read.
 
-**Call relations**: Several manager helpers use this private accessor to avoid duplicating lock-handling logic.
+**Call relations**: External auth mode checks, external refresh, and external API-key resolution all use this accessor.
 
 *Call graph*: called by 4 (external_auth_mode, has_external_auth, refresh_external_auth, resolve_external_api_key_auth).
 
@@ -1607,11 +1611,11 @@ fn external_auth(&self) -> Option<Arc<dyn ExternalAuth>>
 fn external_auth_mode(&self) -> Option<AuthMode>
 ```
 
-**Purpose**: Returns the top-level auth mode supplied by the configured external provider, if any.
+**Purpose**: Returns the auth mode supplied by the external auth provider, if one is configured.
 
-**Data flow**: It calls `external_auth()`, then maps the provider through `external_auth.auth_mode()`.
+**Data flow**: It gets the external auth provider and calls its `auth_mode` method. It returns the provider's mode or nothing.
 
-**Call relations**: `has_external_api_key_auth` uses this to detect whether external auth should be treated as API-key-style bearer auth.
+**Call relations**: `has_external_api_key_auth` uses this to identify external API-key providers.
 
 *Call graph*: calls 1 internal fn (external_auth); called by 1 (has_external_api_key_auth).
 
@@ -1622,11 +1626,11 @@ fn external_auth_mode(&self) -> Option<AuthMode>
 fn has_external_api_key_auth(&self) -> bool
 ```
 
-**Purpose**: Reports whether the configured external auth provider supplies API-key-style auth.
+**Purpose**: Answers whether the configured external auth provider supplies API-key-style auth.
 
-**Data flow**: It calls `external_auth_mode()` and compares the result to `Some(AuthMode::ApiKey)`.
+**Data flow**: It reads the external auth mode and compares it with API key mode. It returns a boolean.
 
-**Call relations**: Auth resolution and unauthorized-recovery logic use this to choose the external bearer path.
+**Call relations**: Auth lookup and mode-reporting methods use this so external API-key auth takes precedence.
 
 *Call graph*: calls 1 internal fn (external_auth_mode); called by 3 (auth_mode, get_api_auth_mode, resolve_external_api_key_auth).
 
@@ -1637,11 +1641,11 @@ fn has_external_api_key_auth(&self) -> bool
 async fn resolve_external_api_key_auth(&self) -> Option<CodexAuth>
 ```
 
-**Purpose**: Attempts to resolve current auth from an external API-key provider without touching stored managed auth.
+**Purpose**: Asks an external API-key provider for an immediately available credential.
 
-**Data flow**: It returns `None` immediately unless `has_external_api_key_auth()` is true. Otherwise it clones the external provider, awaits `external_auth.resolve()`, and maps `Ok(Some(tokens))` to `Some(CodexAuth::from_api_key(&tokens.access_token))`; `Ok(None)` yields `None`, and errors are logged and also yield `None`.
+**Data flow**: It first checks that the external provider is API-key-style. It calls the provider's `resolve` future. If a token is returned, it wraps the token as `CodexAuth::ApiKey`; errors are logged and treated as no auth.
 
-**Call relations**: `auth()` calls this first so external bearer auth can override cached managed auth snapshots.
+**Call relations**: `AuthManager::auth` calls this before using cached stored auth.
 
 *Call graph*: calls 3 internal fn (external_auth, has_external_api_key_auth, from_api_key); called by 1 (auth); 1 external calls (error!).
 
@@ -1652,11 +1656,11 @@ async fn resolve_external_api_key_auth(&self) -> Option<CodexAuth>
 async fn refresh_token(&self) -> Result<(), RefreshTokenError>
 ```
 
-**Purpose**: Performs guarded token refresh for the current auth, first reloading from storage when safe and only contacting the authority if the on-disk auth is unchanged.
+**Purpose**: Refreshes managed ChatGPT auth safely, first checking whether another process already updated storage.
 
-**Data flow**: It acquires the one-permit `refresh_lock`, returning a permanent generic refresh error if the semaphore is closed. If the cached auth is API-key or PAT auth, it returns `Ok(())`. Otherwise it derives the expected account id from cached auth and awaits `reload_if_account_id_matches`. A changed reload skips authority refresh and returns `Ok(())`; an unchanged reload delegates to `refresh_token_from_authority_impl`; a skipped reload returns a permanent account-mismatch error.
+**Data flow**: It acquires the refresh semaphore so only one refresh runs at a time. It skips API key and personal access token auth. It remembers the expected account id, reloads only if the account matches, and either skips refresh because auth changed or calls the authority-refresh implementation.
 
-**Call relations**: `auth()` uses this for proactive refresh, and managed unauthorized recovery uses the same guarded semantics indirectly.
+**Call relations**: `AuthManager::auth` calls this for proactive refresh before returning auth.
 
 *Call graph*: calls 4 internal fn (auth_cached, refresh_token_from_authority_impl, reload_if_account_id_matches, new); called by 1 (auth); 3 external calls (acquire, Permanent, info!).
 
@@ -1667,11 +1671,11 @@ async fn refresh_token(&self) -> Result<(), RefreshTokenError>
 async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError>
 ```
 
-**Purpose**: Refreshes the current auth directly from its issuing authority under the manager’s refresh lock.
+**Purpose**: Forces a refresh attempt against the token authority for the current auth.
 
-**Data flow**: It acquires `refresh_lock`, mapping semaphore closure to a permanent generic refresh error, then awaits `refresh_token_from_authority_impl()`.
+**Data flow**: It acquires the refresh semaphore and then delegates to the internal refresh implementation. It returns success or a structured refresh error.
 
-**Call relations**: Unauthorized recovery calls this after a guarded reload step when it wants to force an authority refresh.
+**Call relations**: Unauthorized recovery uses this after reload has not fixed a 401.
 
 *Call graph*: calls 1 internal fn (refresh_token_from_authority_impl); 1 external calls (acquire).
 
@@ -1682,11 +1686,11 @@ async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError>
 async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError>
 ```
 
-**Purpose**: Executes the actual refresh action appropriate for the current auth variant and records permanent failures scoped to the attempted snapshot.
+**Purpose**: Performs the actual authority-specific refresh work for the currently cached auth.
 
-**Data flow**: It logs that refresh is starting, clones `auth_cached()`, and returns `Ok(())` if no auth exists. If a scoped permanent failure already exists for this auth, it returns that immediately. It clones the attempted auth, then matches: `ChatgptAuthTokens` triggers `refresh_external_auth(Unauthorized)`; managed `Chatgpt` extracts current token data and calls `refresh_and_persist_chatgpt_token`; API-key, agent identity, PAT, and Bedrock all return `Ok(())`. If the result is a permanent failure, it records it via `record_permanent_refresh_failure_if_unchanged` before returning.
+**Data flow**: It reads cached auth, checks for a cached permanent failure, and then either refreshes external ChatGPT auth, refreshes managed ChatGPT OAuth tokens, or does nothing for non-refreshable auth modes. Permanent failures are recorded if they still apply to the same auth snapshot.
 
-**Call relations**: Both guarded refresh and direct authority refresh funnel through this implementation so variant-specific refresh behavior and failure caching stay centralized.
+**Call relations**: Both guarded proactive refresh and explicit unauthorized recovery call this after taking the refresh lock.
 
 *Call graph*: calls 5 internal fn (auth_cached, record_permanent_refresh_failure_if_unchanged, refresh_and_persist_chatgpt_token, refresh_external_auth, refresh_failure_for_auth); called by 2 (refresh_token, refresh_token_from_authority); 2 external calls (Permanent, info!).
 
@@ -1697,11 +1701,11 @@ async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenErro
 async fn logout(&self) -> std::io::Result<bool>
 ```
 
-**Purpose**: Deletes auth from all relevant stores and reloads the manager so callers immediately observe an unauthenticated state.
+**Purpose**: Logs out locally and updates the in-memory cache so callers immediately see no saved auth.
 
-**Data flow**: It calls `logout_all_stores` with the manager’s home and storage settings, awaits `self.reload()` regardless of whether anything was removed, and returns the boolean deletion result.
+**Data flow**: It clears all relevant auth stores, then reloads the manager regardless of whether a file was found. It returns whether anything was removed.
 
-**Call relations**: Runtime logout actions use this path when local credential removal is sufficient and token revocation is not required.
+**Call relations**: User-facing logout paths on the manager use this when token revocation is not requested.
 
 *Call graph*: calls 2 internal fn (reload, logout_all_stores).
 
@@ -1712,11 +1716,11 @@ async fn logout(&self) -> std::io::Result<bool>
 async fn logout_with_revoke(&self) -> std::io::Result<bool>
 ```
 
-**Purpose**: Best-effort revokes current token-backed auth, clears all stores, and reloads the manager.
+**Purpose**: Logs out locally and tries to revoke current ChatGPT tokens first.
 
-**Data flow**: It derives the current raw `AuthDotJson` from `auth_cached().and_then(get_current_auth_json)`, attempts `revoke_auth_tokens` and logs any warning, deletes all stores via `logout_all_stores`, reloads the manager, and returns the deletion result.
+**Data flow**: It reads the cached ChatGPT auth JSON if available, asks the revocation helper to revoke those tokens, logs any revocation warning, clears all stores, reloads the cache, and returns whether local credentials were removed.
 
-**Call relations**: This is the manager-level counterpart to the free `logout_with_revoke` helper, using cached auth rather than reloading raw storage first.
+**Call relations**: User-facing logout paths use this when they want best-effort server-side token revocation.
 
 *Call graph*: calls 4 internal fn (auth_cached, reload, logout_all_stores, revoke_auth_tokens); 1 external calls (warn!).
 
@@ -1727,11 +1731,11 @@ async fn logout_with_revoke(&self) -> std::io::Result<bool>
 fn get_api_auth_mode(&self) -> Option<ApiAuthMode>
 ```
 
-**Purpose**: Returns the current specific API auth mode, treating external bearer auth as API-key mode.
+**Purpose**: Returns the precise API auth mode currently active, accounting for external API-key providers.
 
-**Data flow**: If `has_external_api_key_auth()` is true it returns `Some(ApiAuthMode::ApiKey)`; otherwise it maps `auth_cached()` through `CodexAuth::api_auth_mode`.
+**Data flow**: It first checks whether external API-key auth is configured. If so, it returns API key mode. Otherwise it reads cached auth and returns its API auth mode.
 
-**Call relations**: Backend-eligibility checks use this helper when they need the specific auth mode currently in effect.
+**Call relations**: `current_auth_uses_codex_backend` uses this, and callers can use it to understand request authentication style.
 
 *Call graph*: calls 2 internal fn (auth_cached, has_external_api_key_auth); called by 1 (current_auth_uses_codex_backend).
 
@@ -1742,11 +1746,11 @@ fn get_api_auth_mode(&self) -> Option<ApiAuthMode>
 fn auth_mode(&self) -> Option<AuthMode>
 ```
 
-**Purpose**: Returns the current top-level auth mode, treating external bearer auth as API-key mode.
+**Purpose**: Returns the broad auth mode currently active, accounting for external API-key providers.
 
-**Data flow**: If `has_external_api_key_auth()` is true it returns `Some(AuthMode::ApiKey)`; otherwise it maps `auth_cached()` through `CodexAuth::auth_mode`.
+**Data flow**: It first gives external API-key auth precedence. Otherwise it reads cached auth and returns its broad mode.
 
-**Call relations**: UI/status code uses this as the manager’s coarse auth-mode accessor.
+**Call relations**: UI and policy code can use this to describe how the user is logged in.
 
 *Call graph*: calls 2 internal fn (auth_cached, has_external_api_key_auth).
 
@@ -1757,11 +1761,11 @@ fn auth_mode(&self) -> Option<AuthMode>
 fn current_auth_uses_codex_backend(&self) -> bool
 ```
 
-**Purpose**: Reports whether the manager’s current auth mode targets the Codex backend.
+**Purpose**: Answers whether the current auth mode uses the Codex backend.
 
-**Data flow**: It calls `get_api_auth_mode()` and returns whether the resulting mode exists and `uses_codex_backend()` is true.
+**Data flow**: It gets the precise API auth mode and asks that mode whether it uses the Codex backend. It returns false when there is no auth.
 
-**Call relations**: Higher-level runtime code uses this to gate backend-specific features based on current auth.
+**Call relations**: Callers use this to decide whether Codex-backend-only behavior is available.
 
 *Call graph*: calls 1 internal fn (get_api_auth_mode).
 
@@ -1772,11 +1776,11 @@ fn current_auth_uses_codex_backend(&self) -> bool
 fn should_refresh_proactively(auth: &CodexAuth) -> bool
 ```
 
-**Purpose**: Determines whether managed ChatGPT auth should be refreshed before use based on token expiry or stale refresh timestamp.
+**Purpose**: Decides whether managed ChatGPT auth should be refreshed before a request fails.
 
-**Data flow**: It returns false for non-managed-ChatGPT auth. For managed ChatGPT, it reads the current `AuthDotJson`; if an access token exists and `parse_jwt_expiration` yields an expiry, it compares that expiry to `Utc::now() + 5 minutes`. Otherwise it falls back to `last_refresh` and returns true when that timestamp is older than 8 days. Missing auth JSON or timestamps yield false.
+**Data flow**: It only applies to managed ChatGPT auth. If the access token has a readable expiry time, it requests refresh when the token expires within a small window. If no expiry can be read, it falls back to refreshing after a fixed number of days since the last refresh.
 
-**Call relations**: `auth()` uses this helper to decide whether to trigger a proactive refresh before handing out cached auth.
+**Call relations**: `AuthManager::auth` calls this before returning cached auth.
 
 *Call graph*: calls 1 internal fn (parse_jwt_expiration); 3 external calls (now, days, minutes).
 
@@ -1790,11 +1794,11 @@ async fn refresh_external_auth(
     ) -> Result<(), RefreshTokenError>
 ```
 
-**Purpose**: Refreshes auth through the configured external provider, enforcing workspace restrictions and persisting external ChatGPT tokens when necessary.
+**Purpose**: Asks an external auth provider for fresh credentials and stores them when they are ChatGPT tokens.
 
-**Data flow**: It clones the external provider or returns a transient error if none is configured. It snapshots forced workspace ids and previous account id, builds an `ExternalAuthRefreshContext` with the supplied reason, and awaits `external_auth.refresh(context)`. If the provider’s mode is `ApiKey`, it returns `Ok(())` because bearer auth is resolved on demand and not persisted. Otherwise it requires ChatGPT metadata, checks the returned account id against any forced workspace list, converts the refreshed tokens into `AuthDotJson::from_external_tokens`, saves that snapshot to the ephemeral store via `save_auth`, and reloads the manager.
+**Data flow**: It gets the external provider, builds a context with the refresh reason and previous account id, calls the provider's refresh method, and handles the result. API-key external auth needs no local save. ChatGPT external auth must include metadata, must satisfy workspace restrictions, is saved to ephemeral storage, and then the manager reloads.
 
-**Call relations**: External unauthorized recovery and external ChatGPT token refresh both use this path. It bridges the provider-specific refresh result back into the manager’s cached and persisted auth state.
+**Call relations**: Unauthorized recovery and refresh implementation call this for externally managed auth.
 
 *Call graph*: calls 6 internal fn (default, auth_cached, external_auth, forced_chatgpt_workspace_id, reload, save_auth); called by 1 (refresh_token_from_authority_impl); 4 external calls (other, format!, Transient, from_external_tokens).
 
@@ -1809,22 +1813,24 @@ async fn refresh_and_persist_chatgpt_token(
     ) -> Result<(), RefreshTokenError>
 ```
 
-**Purpose**: Refreshes managed ChatGPT OAuth tokens from the authority, writes them to storage, and reloads the manager cache.
+**Purpose**: Refreshes managed ChatGPT OAuth tokens, saves the new tokens, and reloads the manager cache.
 
-**Data flow**: It takes a managed `ChatgptAuth` and a refresh-token string, awaits `request_chatgpt_token_refresh(refresh_token, auth.client())`, then passes the returned optional id/access/refresh tokens into `persist_tokens(auth.storage(), ...)`. After persistence succeeds, it awaits `self.reload()` and returns `Ok(())`.
+**Data flow**: It receives the current ChatGPT auth and refresh token. It requests new tokens from the OAuth endpoint, writes returned token fields to the auth storage backend, then reloads cached auth so future callers see the new access token.
 
-**Call relations**: Managed ChatGPT refresh in `refresh_token_from_authority_impl` delegates to this helper for the network-plus-persistence sequence.
+**Call relations**: The refresh implementation calls this for normal stored ChatGPT logins.
 
 *Call graph*: calls 5 internal fn (reload, client, storage, persist_tokens, request_chatgpt_token_refresh); called by 1 (refresh_token_from_authority_impl).
 
 
 ### `login/src/auth/access_token.rs`
 
-`domain_logic` · `auth load / login token dispatch`
+`domain_logic` · `authentication setup and login`
 
-This file is a tiny but important piece of authentication routing logic. It declares the constant `PERSONAL_ACCESS_TOKEN_PREFIX` as `"at-"`, the internal enum `CodexAccessToken<'a>` with variants `PersonalAccessToken(&'a str)` and `AgentIdentityJwt(&'a str)`, and a single classifier function. The classifier does not parse JWT structure, validate signatures, or inspect claims; it simply checks whether the raw token string starts with the personal-token prefix. Tokens with that prefix are treated as personal access tokens, and everything else is treated as an agent-identity JWT.
+This file solves a small but important authentication problem: the system may receive two different kinds of access token, and later login code needs to treat them differently. A personal access token is recognized because it starts with the fixed text `at-`. Anything else is treated as an agent identity JWT, where JWT means “JSON Web Token,” a compact signed identity token commonly used to prove who or what is making a request.
 
-That design keeps the branching logic cheap and deterministic at the point where login and auth-loading code need to decide which downstream validation path to take. It also means malformed non-`at-` strings are intentionally routed into the JWT path, where later code is responsible for rejecting invalid JWT syntax or signatures. The enum borrows the original token string rather than allocating a new owned copy, so classification is zero-copy and purely structural.
+The file defines one shared prefix, `at-`, and a small enum called `CodexAccessToken` that acts like a label attached to the original token text. It does not rewrite, validate, or decode the token. It simply says, “this looks like a personal token” or “this should be handled as an agent identity token.”
+
+An everyday analogy is sorting mail by envelope color before sending it to different desks. The mail itself is not opened here; it is only routed based on an obvious outside marker. Without this file, the rest of the login flow would have to guess which authentication path to use, or duplicate this prefix rule in multiple places.
 
 #### Function details
 
@@ -1834,24 +1840,24 @@ That design keeps the branching logic cheap and deterministic at the point where
 fn classify_codex_access_token(access_token: &str) -> CodexAccessToken<'_>
 ```
 
-**Purpose**: Classifies a raw access token string as either a personal access token or an agent-identity JWT based on the `at-` prefix.
+**Purpose**: This function looks at a Codex access token string and labels it as either a personal access token or an agent identity JWT. Other login code uses that label to choose the right authentication path.
 
-**Data flow**: Reads the input `&str`, checks `starts_with(PERSONAL_ACCESS_TOKEN_PREFIX)`, and returns either `CodexAccessToken::PersonalAccessToken(access_token)` or `CodexAccessToken::AgentIdentityJwt(access_token)`. It allocates nothing and mutates no state.
+**Data flow**: It receives the token text as input. It checks whether the text begins with `at-`; if it does, it returns the same text wrapped as a `PersonalAccessToken`, and if not, it returns the same text wrapped as an `AgentIdentityJwt`. Nothing is changed or stored; the output is just the original token with a clearer meaning attached.
 
-**Call relations**: Authentication-loading and login flows call this first to choose which validation and persistence path to follow for a supplied access token.
+**Call relations**: When authentication is loaded or a user logs in with an access token, `load_auth` and `login_with_access_token` call this function first to sort the token into the right category. This function then hands back the labeled token so those callers can continue with the correct login behavior.
 
 *Call graph*: called by 2 (load_auth, login_with_access_token); 2 external calls (AgentIdentityJwt, PersonalAccessToken).
 
 
 ### `login/src/auth/personal_access_token.rs`
 
-`domain_logic` · `PAT login/load and account metadata hydration`
+`domain_logic` · `login/auth load`
 
-This file implements the runtime representation for personal access token (PAT) auth. The internal `PersonalAccessTokenMetadata` struct mirrors the JSON returned by the auth API’s `/v1/user-auth-credential/whoami` endpoint: email, ChatGPT user id, ChatGPT account id, raw plan type string, and a FedRAMP boolean. `PersonalAccessTokenAuth` stores both the original access token and the hydrated metadata, and its custom `Debug` implementation deliberately redacts the token while still printing metadata.
+A personal access token is like a spare key: by itself it proves something, but the app still needs to know whose key it is and what account it opens. This file does that lookup. Given a token, it contacts the auth API’s “who am I?” endpoint, sends the token as a bearer token, and expects back metadata such as the user’s email, ChatGPT user ID, account ID, plan type, and whether the account is FedRAMP-related. FedRAMP is a U.S. government security compliance program, so that flag can affect which services are allowed.
 
-The main entry point is `PersonalAccessTokenAuth::load`, which chooses the auth API base URL from `CODEX_AUTHAPI_BASE_URL` when set and non-empty, otherwise falling back to the production constant. It then creates the shared default HTTP client and delegates to `hydrate_personal_access_token`. That helper constructs the full whoami endpoint, sends a GET request with `Authorization: Bearer <token>`, and converts transport failures, non-success statuses, and JSON decoding failures into descriptive `std::io::Error`s. Successful responses are deserialized directly into `PersonalAccessTokenMetadata`; because `email` is a required `String`, malformed responses such as `null` email are rejected during decoding.
+The main public type is `PersonalAccessTokenAuth`. It stores the raw token plus the metadata returned by the server. The token is deliberately hidden in debug output so logs do not accidentally leak a secret. The `load` method chooses which auth API base URL to use: normally production, but an environment variable can override it for testing or special deployments. Then it delegates the actual network request to `hydrate_personal_access_token`.
 
-Once hydrated, the type provides simple accessors for the raw token, account id, ChatGPT user id, email, normalized account plan type, and FedRAMP status. The plan accessor translates the raw backend plan string through `InternalPlanType::from_raw_value` before converting to the account-facing enum used elsewhere in the system.
+Once loaded, the rest of the system can ask this object for the account ID, user ID, email, plan type, token, or FedRAMP status without repeating the HTTP lookup.
 
 #### Function details
 
@@ -1861,11 +1867,11 @@ Once hydrated, the type provides simple accessors for the raw token, account id,
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats PAT auth for debugging while redacting the sensitive token value.
+**Purpose**: This defines how a `PersonalAccessTokenAuth` value appears in debug logs. It shows the account metadata but replaces the actual access token with `"<redacted>"` so a secret is not printed.
 
-**Data flow**: It writes a debug struct named `PersonalAccessTokenAuth`, inserts a literal `"<redacted>"` for `access_token`, includes the full `metadata`, and finishes the struct.
+**Data flow**: It receives the auth object and a formatter used for building debug text. It writes a structured debug view where the token field is hidden and the metadata field is shown. The output is formatted text for logs or debugging, with no change to the auth object itself.
 
-**Call relations**: This debug implementation is used whenever PAT auth appears in logs or test diagnostics, preventing accidental token disclosure.
+**Call relations**: This is used automatically when Rust debug formatting is requested for `PersonalAccessTokenAuth`. Inside, it uses the formatter’s `debug_struct` helper to build the safe debug display.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1876,11 +1882,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 async fn load(access_token: &str) -> std::io::Result<Self>
 ```
 
-**Purpose**: Hydrates a raw personal access token into a fully populated auth object by querying the auth API.
+**Purpose**: This is the main entry point for creating a complete personal-access-token login record from a raw token. It chooses the auth API server, creates an HTTP client, and asks the server for the token’s account metadata.
 
-**Data flow**: It reads `CODEX_AUTHAPI_BASE_URL_ENV_VAR`, trims whitespace and trailing slashes, ignores empty overrides, and falls back to `PROD_AUTHAPI_BASE_URL`. It then creates the shared default HTTP client with `create_client()` and awaits `hydrate_personal_access_token(&client, &authapi_base_url, access_token)`.
+**Data flow**: It takes an access token string. It reads the `CODEX_AUTHAPI_BASE_URL` environment variable; if that variable is missing or empty, it falls back to the production auth API URL. It trims extra slashes from the URL, creates a client, then returns either a filled `PersonalAccessTokenAuth` object or an I/O error explaining what failed.
 
-**Call relations**: PAT login and auth loading call this constructor whenever they need account metadata attached to a raw PAT string.
+**Call relations**: Higher-level login paths call this when they need to authenticate with a personal access token: `from_personal_access_token`, `load_auth`, and `login_with_access_token`. After setup, it hands the actual server lookup to `hydrate_personal_access_token`.
 
 *Call graph*: calls 2 internal fn (create_client, hydrate_personal_access_token); called by 3 (from_personal_access_token, load_auth, login_with_access_token); 1 external calls (var).
 
@@ -1891,11 +1897,11 @@ async fn load(access_token: &str) -> std::io::Result<Self>
 fn access_token(&self) -> &str
 ```
 
-**Purpose**: Returns the raw personal access token string.
+**Purpose**: This returns the stored raw access token. Code uses it when it needs to make later authenticated requests on behalf of the same login.
 
-**Data flow**: It borrows `self.access_token` and returns it as `&str`.
+**Data flow**: It receives an already-loaded `PersonalAccessTokenAuth` object and returns a borrowed view of its token string. It does not copy the token and does not change anything.
 
-**Call relations**: Generic auth-token accessors use this when PAT auth needs to supply a bearer token downstream.
+**Call relations**: This is a simple reader used after `PersonalAccessTokenAuth::load` has built the auth object. No specific caller is shown in the provided call graph, but it exists so other code does not need direct access to the private token field.
 
 
 ##### `PersonalAccessTokenAuth::account_id`  (lines 52–54)
@@ -1904,11 +1910,11 @@ fn access_token(&self) -> &str
 fn account_id(&self) -> &str
 ```
 
-**Purpose**: Returns the ChatGPT account/workspace id associated with the PAT.
+**Purpose**: This returns the ChatGPT account ID associated with the token. That account ID is important for checking whether the token is allowed to use a particular workspace or account-scoped resource.
 
-**Data flow**: It borrows `self.metadata.chatgpt_account_id` and returns it as `&str`.
+**Data flow**: It receives the loaded auth object, reads the `chatgpt_account_id` value from its metadata, and returns it as a borrowed string. The object is left unchanged.
 
-**Call relations**: Workspace restriction enforcement uses this accessor to validate PATs against allowed account ids.
+**Call relations**: `ensure_personal_access_token_workspace_allowed` calls this when it needs to compare the token’s account with an allowed workspace or account. The value ultimately comes from the auth API metadata fetched during loading.
 
 *Call graph*: called by 1 (ensure_personal_access_token_workspace_allowed).
 
@@ -1919,11 +1925,11 @@ fn account_id(&self) -> &str
 fn chatgpt_user_id(&self) -> &str
 ```
 
-**Purpose**: Returns the ChatGPT user id associated with the PAT.
+**Purpose**: This returns the ChatGPT user ID tied to the personal access token. It gives other parts of the system a stable user identifier, separate from the user’s email address.
 
-**Data flow**: It borrows `self.metadata.chatgpt_user_id` and returns it as `&str`.
+**Data flow**: It receives the loaded auth object, reads the `chatgpt_user_id` field from the stored metadata, and returns that string by reference. Nothing is modified.
 
-**Call relations**: Higher-level identity code uses this to expose user identity from PAT auth.
+**Call relations**: This is an accessor for metadata that was fetched by `hydrate_personal_access_token`. No specific caller is shown in the provided call graph, but it is available to any login or account code that needs the user ID.
 
 
 ##### `PersonalAccessTokenAuth::email`  (lines 60–62)
@@ -1932,11 +1938,11 @@ fn chatgpt_user_id(&self) -> &str
 fn email(&self) -> &str
 ```
 
-**Purpose**: Returns the account email address associated with the PAT.
+**Purpose**: This returns the email address reported by the auth API for the token. It is useful for showing the logged-in identity to a person or for account-related checks.
 
-**Data flow**: It borrows `self.metadata.email` and returns it as `&str`.
+**Data flow**: It receives the loaded auth object, reads the `email` field from the metadata, and returns it as a borrowed string. It performs no network request and makes no changes.
 
-**Call relations**: Identity-reporting code uses this accessor when PAT auth is active.
+**Call relations**: This is a read-only view of the metadata collected during token hydration. No specific caller is shown in the provided call graph, but it is meant for code that needs to display or inspect the authenticated identity.
 
 
 ##### `PersonalAccessTokenAuth::plan_type`  (lines 64–66)
@@ -1945,11 +1951,11 @@ fn email(&self) -> &str
 fn plan_type(&self) -> AccountPlanType
 ```
 
-**Purpose**: Converts the raw backend plan string into the public account plan enum.
+**Purpose**: This converts the raw plan type string from the auth API into the project’s account plan type value. That lets the rest of the code work with a known category instead of a loose text string.
 
-**Data flow**: It reads `self.metadata.chatgpt_plan_type`, parses it with `InternalPlanType::from_raw_value`, converts that into `AccountPlanType`, and returns the result.
+**Data flow**: It receives the loaded auth object, reads the `chatgpt_plan_type` string from its metadata, converts that raw string into an internal plan type, then converts it into the account-facing plan type returned by the function. The stored metadata is not changed.
 
-**Call relations**: Account-plan checks elsewhere in the auth manager rely on this normalized representation.
+**Call relations**: This accessor sits between the external auth API format and the rest of the application. It calls `from_raw_value` to interpret the server’s string before handing back a cleaner plan type value.
 
 *Call graph*: 1 external calls (from_raw_value).
 
@@ -1960,11 +1966,11 @@ fn plan_type(&self) -> AccountPlanType
 fn is_fedramp_account(&self) -> bool
 ```
 
-**Purpose**: Reports whether the PAT belongs to a FedRAMP account.
+**Purpose**: This tells callers whether the token belongs to a FedRAMP account. That can matter because government-compliance accounts may have different rules or routing requirements.
 
-**Data flow**: It returns the boolean `self.metadata.chatgpt_account_is_fedramp`.
+**Data flow**: It receives the loaded auth object, reads the boolean `chatgpt_account_is_fedramp` flag from the metadata, and returns `true` or `false`. It does not change anything.
 
-**Call relations**: Backend and policy code uses this to tailor behavior for FedRAMP accounts under PAT auth.
+**Call relations**: This is a direct reader for information fetched during `hydrate_personal_access_token`. No specific caller is shown in the provided call graph, but it is available wherever account policy decisions need that FedRAMP flag.
 
 
 ##### `hydrate_personal_access_token`  (lines 73–108)
@@ -1977,20 +1983,26 @@ async fn hydrate_personal_access_token(
 ) -> std::io::Result<PersonalAccessTokenAuth>
 ```
 
-**Purpose**: Calls the auth API whoami endpoint with a bearer token and constructs `PersonalAccessTokenAuth` from the returned metadata.
+**Purpose**: This performs the actual server check for a personal access token. It asks the auth API who the token belongs to and builds a `PersonalAccessTokenAuth` object from the answer.
 
-**Data flow**: It takes a shared `CodexHttpClient`, an auth API base URL, and the raw access token. It formats the endpoint by appending `WHOAMI_PATH` to the trimmed base URL, sends a GET request with `.bearer_auth(access_token)`, maps transport errors into `io::Error::other(...)`, rejects non-success HTTP statuses with an error containing the status code, deserializes the JSON body into `PersonalAccessTokenMetadata`, maps decode failures into `io::Error::other(...)`, and on success returns `PersonalAccessTokenAuth { access_token: access_token.to_string(), metadata }`.
+**Data flow**: It receives an HTTP client, a base URL for the auth API, and the raw access token. It builds the `whoami` endpoint URL, sends a GET request with the token in the bearer-auth header, checks that the HTTP status means success, then decodes the JSON response into token metadata. On success it returns a new auth object containing both the original token and the metadata; on failure it returns an I/O error with a human-readable reason.
 
-**Call relations**: `PersonalAccessTokenAuth::load` delegates all network I/O and response validation to this helper.
+**Call relations**: `PersonalAccessTokenAuth::load` calls this after choosing the API URL and creating the client. This function is the point where local login state is connected to the remote auth service, using the client’s `get` request builder and wrapping request or decoding failures as standard I/O errors.
 
 *Call graph*: calls 1 internal fn (get); called by 1 (load); 2 external calls (other, format!).
 
 
 ### `login/src/token_data.rs`
 
-`domain_logic` · `auth load, token persistence, refresh checks`
+`data_model` · `auth load, token refresh checks, auth save`
 
-This file centers on two serializable data structures: `TokenData`, which groups `id_token`, `access_token`, `refresh_token`, and optional `account_id`, and `IdTokenInfo`, which stores a flattened subset of useful claims extracted from the ID token plus the original `raw_jwt`. The `id_token` field on `TokenData` uses custom serde hooks so deserialization accepts a JWT string from disk and immediately parses it into `IdTokenInfo`, while serialization writes only `raw_jwt` back out. JWT parsing is intentionally lightweight: `decode_jwt_payload` only validates the three-part `header.payload.signature` shape, base64url-decodes the payload, and deserializes JSON claims; it does not verify signatures. `parse_chatgpt_jwt_claims` then merges top-level `email` with profile email fallback, reads namespaced OpenAI auth claims, falls back from `chatgpt_user_id` to legacy `user_id`, and defaults missing auth metadata to `None`/`false`. `parse_jwt_expiration` separately extracts the standard `exp` claim and converts it to `DateTime<Utc>`, returning `None` if absent or out of range. The helper methods on `IdTokenInfo` normalize `PlanType` into either display names or raw backend values and expose workspace/FedRAMP predicates. Error reporting is explicit via `IdTokenInfoError`, distinguishing malformed JWT structure from base64 and JSON failures.
+This file is the translator between the raw login data stored in auth.json and the rest of the program. The important input is a JWT, which is a compact token string made of three dot-separated parts. Think of it like a sealed boarding pass: the program does not create the flight details, but it can read the printed passenger and account information from the middle section.
+
+The main saved object is TokenData. It stores the access token, refresh token, optional account ID, and an id_token. The id_token is saved on disk as the original JWT string, but inside the program it becomes an IdTokenInfo struct with easier-to-use fields. That conversion is done automatically during JSON loading and saving.
+
+The file also knows how to read two kinds of JWT information. One path reads the standard exp claim, which says when the token expires. Another path reads ChatGPT-specific claims, such as the subscription plan, user ID, workspace account ID, and whether the workspace must use the FedRAMP edge. FedRAMP here means a stricter government-compliance environment.
+
+If this file were missing, the rest of the login system would have to repeatedly decode token strings by hand, and it would be much easier to lose important account details or save the token back incorrectly.
 
 #### Function details
 
@@ -2000,11 +2012,11 @@ This file centers on two serializable data structures: `TokenData`, which groups
 fn get_chatgpt_plan_type(&self) -> Option<String>
 ```
 
-**Purpose**: Converts the optional parsed `chatgpt_plan_type` claim into a user-facing string. Known plans are rendered through the protocol type's display name, while unknown backend values are preserved verbatim.
+**Purpose**: This returns the user's ChatGPT plan as a friendly display string, such as a readable plan name. It is useful when the program wants to show or log the plan in a human-facing way.
 
-**Data flow**: Reads `self.chatgpt_plan_type` → maps `PlanType::Known(plan)` to `plan.display_name().to_string()` and `PlanType::Unknown(s)` to a cloned string → returns `Option<String>` without mutating state.
+**Data flow**: It reads the plan value already stored in IdTokenInfo. If there is no plan, it returns nothing. If the plan is a known plan, it converts it to its display name; if it is an unknown backend value, it keeps that original text.
 
-**Call relations**: Used by callers that need a presentation-friendly plan label after `parse_chatgpt_jwt_claims` has populated `IdTokenInfo`; it is a leaf accessor and delegates only to `PlanType` formatting behavior.
+**Call relations**: This is a convenience method on the parsed token information. Other parts of the program can call it after parse_chatgpt_jwt_claims or JSON loading has filled in IdTokenInfo, so they do not need to understand the internal PlanType shape.
 
 
 ##### `IdTokenInfo::get_chatgpt_plan_type_raw`  (lines 52–57)
@@ -2013,11 +2025,11 @@ fn get_chatgpt_plan_type(&self) -> Option<String>
 fn get_chatgpt_plan_type_raw(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the backend/raw plan identifier string for the parsed ChatGPT plan claim. This preserves exact wire values for known plans and unknown plans alike.
+**Purpose**: This returns the plan value in its raw backend form. It is useful when code needs the exact plan label rather than a nicer display name.
 
-**Data flow**: Reads `self.chatgpt_plan_type` → maps `PlanType::Known(plan)` to `plan.raw_value().to_string()` and `PlanType::Unknown(s)` to a cloned string → returns `Option<String>`.
+**Data flow**: It reads the optional plan from IdTokenInfo. If the plan is absent, it returns nothing. If the plan is known, it returns the plan's raw stored value; if it is unknown, it returns the unknown string unchanged.
 
-**Call relations**: Called after token parsing when code or tests need the canonical raw plan slug rather than a display label; it is a pure accessor over parsed state.
+**Call relations**: This sits alongside the friendlier get_chatgpt_plan_type method. Callers use it when exact token-derived values matter, while the parsed IdTokenInfo still remains the single place where plan data is stored.
 
 
 ##### `IdTokenInfo::is_workspace_account`  (lines 59–64)
@@ -2026,11 +2038,11 @@ fn get_chatgpt_plan_type_raw(&self) -> Option<String>
 fn is_workspace_account(&self) -> bool
 ```
 
-**Purpose**: Determines whether the parsed plan corresponds to a workspace-style account rather than a personal subscription. It only returns true for known plans whose `is_workspace_account()` predicate is true.
+**Purpose**: This answers whether the token belongs to a workspace-style ChatGPT account, such as a business or enterprise account. That matters because workspace accounts can need different routing or account behavior than personal plans.
 
-**Data flow**: Reads `self.chatgpt_plan_type` → pattern-matches for `Some(PlanType::Known(plan))` and evaluates `plan.is_workspace_account()` → returns a boolean.
+**Data flow**: It looks at the parsed plan type inside IdTokenInfo. If the plan is known and that plan is marked as a workspace account, it returns true; otherwise it returns false.
 
-**Call relations**: Used by higher-level auth logic and tests to classify accounts after JWT parsing; it does not call local helpers, only the plan-type predicate embedded in the protocol enum.
+**Call relations**: This is a small decision helper used after token parsing. It relies on the PlanType rules supplied by the shared protocol code, so callers do not have to duplicate the list of which plans count as workspace accounts.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -2041,11 +2053,11 @@ fn is_workspace_account(&self) -> bool
 fn is_fedramp_account(&self) -> bool
 ```
 
-**Purpose**: Exposes whether the selected workspace must route through the FedRAMP edge. It is a direct accessor over the parsed boolean claim.
+**Purpose**: This answers whether the selected ChatGPT workspace must use the FedRAMP edge, a stricter compliance route. It gives the rest of the system a simple yes-or-no flag.
 
-**Data flow**: Reads `self.chatgpt_account_is_fedramp` and returns it unchanged.
+**Data flow**: It reads the chatgpt_account_is_fedramp boolean already parsed from the token and returns that same value. It does not change anything.
 
-**Call relations**: Consumed by callers that need routing or policy decisions based on account type after `IdTokenInfo` has been built.
+**Call relations**: This is a convenience wrapper around a stored field. Code that needs to choose special behavior for FedRAMP accounts can ask IdTokenInfo directly instead of reaching into the field.
 
 
 ##### `decode_jwt_payload`  (lines 117–128)
@@ -2054,11 +2066,11 @@ fn is_fedramp_account(&self) -> bool
 fn decode_jwt_payload(jwt: &str) -> Result<T, IdTokenInfoError>
 ```
 
-**Purpose**: Performs generic JWT payload extraction for any deserializable claim type. It enforces only the basic three-segment JWT shape and then decodes/deserializes the payload segment.
+**Purpose**: This is the shared low-level reader for JWT payloads. It checks that the token has the expected three-part shape, decodes the middle section, and turns the JSON inside into whatever claim type the caller asked for.
 
-**Data flow**: Accepts `jwt: &str` and generic target type `T` → splits on `.` and requires non-empty header, payload, and signature segments → base64url-no-pad decodes the payload bytes → deserializes JSON bytes into `T` with `serde_json::from_slice` → returns `Result<T, IdTokenInfoError>`.
+**Data flow**: It takes a JWT string. It splits it on dots, rejects it if the header, payload, or signature section is missing or empty, base64-decodes the payload section, then parses the resulting JSON into a caller-chosen Rust data shape. It returns either the parsed claims or a clear token parsing error.
 
-**Call relations**: This is the shared parser used by both `parse_chatgpt_jwt_claims` and `parse_jwt_expiration`; those functions choose the concrete claim struct and then apply domain-specific extraction on top of the decoded payload.
+**Call relations**: parse_jwt_expiration and parse_chatgpt_jwt_claims both call this helper so the risky decoding work is kept in one place. After decoding, it hands the parsed JSON claims back to those higher-level functions, which decide what the claims mean.
 
 *Call graph*: called by 2 (parse_chatgpt_jwt_claims, parse_jwt_expiration); 1 external calls (from_slice).
 
@@ -2069,11 +2081,11 @@ fn decode_jwt_payload(jwt: &str) -> Result<T, IdTokenInfoError>
 fn parse_jwt_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>, IdTokenInfoError>
 ```
 
-**Purpose**: Extracts the standard JWT expiration timestamp from a token and converts it into UTC wall-clock time. Missing or invalid-range timestamps become `None` rather than hard errors once payload decoding succeeds.
+**Purpose**: This reads the expiration time from a JWT, if the token contains one. It is used when the login system wants to know whether a token should be refreshed before it stops working.
 
-**Data flow**: Accepts `jwt: &str` → calls `decode_jwt_payload` into `StandardJwtClaims` → reads optional `exp: i64` → converts with `DateTime::<Utc>::from_timestamp(exp, 0)` → returns `Result<Option<DateTime<Utc>>, IdTokenInfoError>`.
+**Data flow**: It takes a JWT string and asks decode_jwt_payload to read the standard exp claim. If exp is present and can be represented as a UTC timestamp, it returns that date and time. If exp is missing or invalid as a timestamp, it returns no expiration value; if the token cannot be decoded, it returns an error.
 
-**Call relations**: Invoked by proactive refresh logic (`should_refresh_proactively`) to decide whether an access token is near expiry; it delegates all JWT decoding/JSON parsing to `decode_jwt_payload`.
+**Call relations**: This is called by should_refresh_proactively when the system is deciding whether to refresh credentials early. It depends on decode_jwt_payload for the common JWT reading step, then narrows the result down to just the expiration time.
 
 *Call graph*: calls 1 internal fn (decode_jwt_payload); called by 1 (should_refresh_proactively).
 
@@ -2084,11 +2096,11 @@ fn parse_jwt_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>, IdTokenInfoE
 fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoError>
 ```
 
-**Purpose**: Parses an ID token into the flattened `IdTokenInfo` structure used throughout login code. It extracts email from either the top-level claim or the namespaced profile object and pulls ChatGPT-specific auth metadata from the OpenAI auth namespace.
+**Purpose**: This turns a raw ChatGPT ID token into the easier-to-use IdTokenInfo structure. It extracts the account and profile details that the rest of the login system needs.
 
-**Data flow**: Accepts `jwt: &str` → calls `decode_jwt_payload` into `IdClaims` → computes `email` from `claims.email` or `claims.profile.email` → if `claims.auth` exists, builds `IdTokenInfo` with plan type, user id (`chatgpt_user_id` falling back to `user_id`), account id, FedRAMP flag, and `raw_jwt`; otherwise builds the same struct with auth-related fields defaulted to `None`/`false` → returns `Result<IdTokenInfo, IdTokenInfoError>`.
+**Data flow**: It takes a JWT string and decodes its payload into ChatGPT-related claims. It chooses an email from the top-level email field or, if that is absent, from the profile section. If an auth section is present, it copies out the plan type, user ID, account ID, FedRAMP flag, and the original token string. If the auth section is missing, it still returns IdTokenInfo with the email and raw token, but leaves the ChatGPT-specific account fields empty or false.
 
-**Call relations**: This is the main claim parser used broadly across auth loading and persistence paths, including auth.json readers/writers, external token import, test helpers, and the serde hook `deserialize_id_token`; it relies on `decode_jwt_payload` for low-level decoding.
+**Call relations**: Many login paths call this when tokens enter or leave the system, including auth file loading, writing ChatGPT auth data, accepting external tokens, persisting tokens, test token helpers, and deserialize_id_token. It uses decode_jwt_payload for the mechanical JWT reading, then packages the meaningful ChatGPT fields for everyone else.
 
 *Call graph*: calls 1 internal fn (decode_jwt_payload); called by 9 (remote_control_auth_dot_json, remote_control_auth_dot_json, write_chatgpt_auth, from_external_tokens, persist_tokens, id_token_with_prefix, deserialize_id_token, chatgpt_auth_tokens_for_tests, write_chatgpt_auth).
 
@@ -2099,11 +2111,11 @@ fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoError>
 fn deserialize_id_token(deserializer: D) -> Result<IdTokenInfo, D::Error>
 ```
 
-**Purpose**: Implements custom serde deserialization for `TokenData.id_token` so the on-disk JSON field remains a JWT string while the in-memory field becomes parsed `IdTokenInfo`.
+**Purpose**: This teaches JSON loading how to read the id_token field. On disk the field is just a raw JWT string, but in memory the program wants the parsed IdTokenInfo form.
 
-**Data flow**: Receives a serde deserializer → deserializes a `String` from input → passes that string to `parse_chatgpt_jwt_claims` → converts any parser error into a serde custom error → returns `IdTokenInfo`.
+**Data flow**: It receives a JSON deserializer, reads the id_token value as a string, then sends that string to parse_chatgpt_jwt_claims. If parsing succeeds, it returns IdTokenInfo; if parsing fails, it reports the problem as a JSON deserialization error.
 
-**Call relations**: Triggered automatically by serde when `TokenData` is deserialized from auth.json or similar sources; it bridges generic string decoding to the domain parser.
+**Call relations**: This function is wired into the TokenData struct through serde, the Rust library used for JSON conversion. It runs automatically when TokenData is loaded from auth.json, and it hands the raw token string to parse_chatgpt_jwt_claims so the rest of the program receives already-parsed token details.
 
 *Call graph*: calls 1 internal fn (parse_chatgpt_jwt_claims); 1 external calls (deserialize).
 
@@ -2114,11 +2126,11 @@ fn deserialize_id_token(deserializer: D) -> Result<IdTokenInfo, D::Error>
 fn serialize_id_token(id_token: &IdTokenInfo, serializer: S) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Implements custom serde serialization for `TokenData.id_token` by writing only the original raw JWT string. This preserves round-tripping without re-encoding claims from the flattened struct.
+**Purpose**: This teaches JSON saving how to write the id_token field back out. Even though the program stores parsed token details in memory, the file should keep the original JWT string.
 
-**Data flow**: Accepts `&IdTokenInfo` and a serde serializer → reads `id_token.raw_jwt` → serializes it as a JSON string via `serialize_str` → returns the serializer result.
+**Data flow**: It receives an IdTokenInfo and a JSON serializer. It takes the raw_jwt string from IdTokenInfo and writes that string as the serialized value. It does not write the expanded email, plan, or account fields separately.
 
-**Call relations**: Triggered automatically when `TokenData` is serialized for auth.json persistence; it complements `deserialize_id_token` so storage format stays compatible with raw-token expectations.
+**Call relations**: This function is wired into TokenData through serde and runs automatically when auth data is saved. It is the mirror image of deserialize_id_token: loading expands the JWT into useful fields, while saving collapses it back to the original token string.
 
 *Call graph*: 1 external calls (serialize_str).
 
@@ -2128,11 +2140,15 @@ This file establishes the stable per-installation identifier used to recognize t
 
 ### `core/src/installation_id.rs`
 
-`domain_logic` · `startup / identity resolution`
+`domain_logic` · `startup`
 
-This file implements the installation ID persistence mechanism used to give one Codex home directory a durable UUID. `resolve_installation_id` first ensures the home directory exists asynchronously, then moves the file work into `tokio::task::spawn_blocking` because it uses synchronous `std::fs` APIs plus file locking. Inside that blocking section it opens or creates `<codex_home>/installation_id` for read/write, applies Unix mode `0o644` on creation, locks the file, and on Unix also repairs permissions if an existing file has drifted from `0644`.
+This file solves a simple but important problem: the program sometimes needs to know “this is the same local installation as before” without asking the user. It does that by keeping a small file named installation_id inside the Codex home directory. The value in that file is a UUID, which is a long random identifier designed to be unique.
 
-The function reads the whole file as text, trims whitespace, and attempts `Uuid::parse_str`. Any valid UUID is normalized through `to_string()`, so uppercase or oddly formatted persisted values are reused but canonicalized in the returned string. Empty or invalid contents trigger regeneration: a fresh `Uuid::new_v4()` is written after truncating the file, seeking back to offset 0, flushing, and `sync_all()` to persist it durably. The tests cover the three important states: first-run generation and persistence, reuse of an existing valid UUID, and rewrite of invalid contents. On Unix, the generation test also asserts the file mode is exactly `0644`.
+The main function, resolve_installation_id, first makes sure the home directory exists. Then it opens or creates the installation_id file. Because file work can block the async runtime, it runs the slow disk operations on a blocking worker thread. Think of this like sending a clerk to the filing cabinet so the main desk can keep helping people.
+
+Once the file is open, the function locks it so two parts of the program do not create or rewrite the ID at the same time. On Unix systems it also makes sure the file permissions are 0644, meaning the owner can edit it and others can read it. If the file already contains a valid UUID, that value is reused and normalized to the standard lowercase format. If the file is empty or invalid, the function creates a new UUID, overwrites the file with it, flushes it, and syncs it to disk so it is safely persisted.
+
+The tests check the three important promises: a new ID is created and saved, an existing valid ID is reused, and bad file contents are replaced.
 
 #### Function details
 
@@ -2142,11 +2158,11 @@ The function reads the whole file as text, trims whitespace, and attempts `Uuid:
 async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String>
 ```
 
-**Purpose**: Resolves the installation UUID stored under the Codex home directory, creating or rewriting the file when necessary. It guarantees the returned string is a valid canonical UUID and that the backing file exists.
+**Purpose**: Finds or creates the stable ID for this Codex installation. Callers use it when they need a persistent identifier that survives across runs.
 
-**Data flow**: Takes `codex_home: &AbsolutePathBuf`, joins it with `INSTALLATION_ID_FILENAME`, and asynchronously creates the directory tree. In a blocking task it opens the file read/write/create, locks it, optionally fixes Unix permissions to `0o644`, reads existing contents, trims them, and tries to parse a UUID. If parsing succeeds, it returns the normalized UUID string; otherwise it generates `Uuid::new_v4()`, truncates and rewrites the file, flushes and syncs it, and returns the new ID.
+**Data flow**: It receives the Codex home directory path. It joins that path with the installation_id filename, creates the directory if needed, then opens or creates the file. It reads the file: if it contains a valid UUID, it returns that UUID in standard form. If the file is missing, empty, or invalid, it creates a new UUID, writes it into the file, forces the write to disk, and returns the new value.
 
-**Call relations**: This is the file’s production entrypoint and is exercised only by the local async tests here. Those tests invoke it under fresh, pre-populated-valid, and pre-populated-invalid filesystem conditions to verify generation, reuse, and rewrite behavior.
+**Call relations**: This function is the central behavior in the file. It uses path joining to choose where the ID lives, async directory creation to prepare the folder, and a blocking task for the actual file locking, reading, and writing. The three test functions call it in different starting conditions to prove it creates, reuses, or repairs the stored ID correctly.
 
 *Call graph*: calls 1 internal fn (join); called by 3 (resolve_installation_id_generates_and_persists_uuid, resolve_installation_id_reuses_existing_uuid, resolve_installation_id_rewrites_invalid_file_contents); 2 external calls (create_dir_all, spawn_blocking).
 
@@ -2157,11 +2173,11 @@ async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String>
 async fn resolve_installation_id_generates_and_persists_uuid()
 ```
 
-**Purpose**: Checks the first-run path where no installation ID file exists yet. It verifies both the returned value and the on-disk file contents, plus Unix permissions when applicable.
+**Purpose**: Checks the first-run case, where no installation ID file exists yet. It proves the function creates a valid UUID and saves exactly that value to disk.
 
-**Data flow**: Creates a temporary directory, derives an absolute Codex home path and the expected persisted file path, then awaits `resolve_installation_id`. It reads the file back as text and asserts it equals the returned ID, asserts the ID parses as a UUID, and on Unix reads metadata permissions and asserts mode `0o644`.
+**Data flow**: It starts with a temporary empty Codex home directory. It calls resolve_installation_id, then reads the installation_id file that should now exist. It checks that the returned string matches the saved file contents and that the string is a valid UUID. On Unix, it also checks that the file permission is 0644.
 
-**Call relations**: Invokes `resolve_installation_id` as the empty-state test case. It validates the side effects that the production function is responsible for: file creation, persistence, and permission normalization.
+**Call relations**: This test calls resolve_installation_id as a real caller would during startup on a fresh installation. It then uses assertions and filesystem metadata to confirm the function fulfilled its persistence and permission promises.
 
 *Call graph*: calls 1 internal fn (resolve_installation_id); 4 external calls (new, assert!, assert_eq!, metadata).
 
@@ -2172,11 +2188,11 @@ async fn resolve_installation_id_generates_and_persists_uuid()
 async fn resolve_installation_id_reuses_existing_uuid()
 ```
 
-**Purpose**: Verifies that an already persisted valid UUID is reused instead of being replaced. It also confirms the returned string is canonicalized even if the file contains uppercase text.
+**Purpose**: Checks the repeat-run case, where an installation ID already exists. It proves the function does not replace a valid existing ID.
 
-**Data flow**: Creates a temp directory, writes an uppercase UUID string into the installation ID file, then awaits `resolve_installation_id`. It parses the original uppercase string with `Uuid::parse_str(...).to_string()` and asserts the resolved value matches that canonical lowercase/hyphenated form.
+**Data flow**: It creates a temporary Codex home directory, writes an existing UUID into the installation_id file, and then calls resolve_installation_id. The function reads that file and returns the same UUID, normalized into the usual lowercase UUID text form. The test compares the result with the parsed original UUID.
 
-**Call relations**: Exercises the valid-existing-file branch of `resolve_installation_id`. The test sets up the file contents directly, then confirms the function reads and normalizes rather than regenerating.
+**Call relations**: This test sets up the file the way a previous run would have left it. By calling resolve_installation_id afterward, it verifies that the main function preserves continuity instead of generating a new identity every time.
 
 *Call graph*: calls 1 internal fn (resolve_installation_id); 4 external calls (new, new_v4, assert_eq!, write).
 
@@ -2187,11 +2203,11 @@ async fn resolve_installation_id_reuses_existing_uuid()
 async fn resolve_installation_id_rewrites_invalid_file_contents()
 ```
 
-**Purpose**: Ensures corrupt or non-UUID file contents are replaced with a newly generated valid UUID. It checks both the returned value and the rewritten file.
+**Purpose**: Checks the repair case, where the installation ID file exists but contains unusable text. It proves the function replaces bad contents with a new valid UUID.
 
-**Data flow**: Creates a temp directory, writes `"not-a-uuid"` into the installation ID file, then awaits `resolve_installation_id`. It asserts the returned string parses as a UUID and that reading the file afterward yields exactly that returned value.
+**Data flow**: It creates a temporary Codex home directory and writes the text not-a-uuid into the installation_id file. It calls resolve_installation_id, which sees the invalid value, generates a new UUID, and rewrites the file. The test checks that the returned value is a valid UUID and that the file now contains exactly that value.
 
-**Call relations**: Covers the invalid-content recovery path in `resolve_installation_id`. It demonstrates that the function does not fail on bad persisted state; instead it repairs the file in place.
+**Call relations**: This test calls resolve_installation_id after deliberately corrupting the saved ID. It confirms the function is resilient: bad local state does not make startup fail as long as a new valid ID can be written.
 
 *Call graph*: calls 1 internal fn (resolve_installation_id); 4 external calls (new, assert!, assert_eq!, write).
 
@@ -2201,13 +2217,13 @@ This file manages the Windows-specific local users, groups, credentials, and mar
 
 ### `windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs`
 
-`domain_logic` · `user provisioning and setup finalization`
+`domain_logic` · `setup`
 
-This module owns the Windows account bootstrap for sandbox execution. It defines the managed local group name `CodexSandboxUsers`, several well-known SID constants, and helpers for creating users/groups through NetAPI calls. `provision_sandbox_users` ensures the group exists, logs the target usernames, generates two random 24-character passwords with `SmallRng`, creates or updates the offline and online local accounts, adds them to the sandbox group, and persists DPAPI-protected credentials as pretty JSON in `sandbox_secrets_dir/codex-home/sandbox_users.json`.
+A sandbox needs accounts with carefully limited rights, rather than running everything as the real user. This file is the setup helper for those accounts on Windows. It creates a local Windows group named CodexSandboxUsers, creates two local users for different sandbox modes, puts those users into the group, and saves their passwords in a protected secrets file. Think of it like making two guest badges, putting them in the right security group, and locking the badge PINs in a safe.
 
-The SID helpers are equally important. `resolve_sid` fast-paths common principals through hard-coded SID strings and otherwise loops on `LookupAccountNameW`, resizing buffers on `ERROR_INSUFFICIENT_BUFFER`. `sid_bytes_from_string`, `lookup_account_name_for_sid`, and `sid_bytes_to_psid` bridge between string SIDs, raw SID bytes, and Win32 PSID pointers used elsewhere in ACL code. Account creation is intentionally idempotent: `ensure_local_user` first tries `NetUserAdd`, then falls back to `NetUserSetInfo` level 1003 to rotate the password if the user already exists, and best-effort adds the account to the localized built-in Users group.
+The file talks directly to Windows account and security APIs. It converts friendly names, like "Users" or "SYSTEM", into SIDs, which are Windows security identifiers: the stable ID numbers Windows uses internally for users and groups. It also builds security settings for the setup marker file so that sandbox users cannot fake or replace it while setup is still running.
 
-The module also manages setup readiness signaling. `prepare_setup_marker` deletes any old marker, resolves the real user SID, builds an SDDL DACL granting only SYSTEM, Administrators, and the real user full access, and creates an empty protected `setup_marker.json`. `commit_setup_marker` later overwrites that file with versioned JSON only after setup succeeds, preserving the restrictive ACL established earlier.
+The main flow is: make sure the sandbox group exists, generate random passwords, create or update the two sandbox users, add them to the group, encrypt the passwords with Windows DPAPI, and write them to JSON. Separately, setup first creates an empty protected marker file, then only after all setup steps succeed writes valid marker contents. That prevents a half-finished setup from looking ready.
 
 #### Function details
 
@@ -2217,11 +2233,11 @@ The module also manages setup readiness signaling. `prepare_setup_marker` delete
 fn ensure_sandbox_users_group(log: &mut dyn Write) -> Result<()>
 ```
 
-**Purpose**: Ensures the managed local sandbox users group exists with the expected comment.
+**Purpose**: Makes sure the dedicated local Windows group for sandbox accounts exists. The group is used as a single label for accounts that belong to the sandbox.
 
-**Data flow**: It takes a log sink and forwards the fixed group name and comment into `ensure_local_group`, returning that result.
+**Data flow**: It receives a log writer. It passes the fixed group name and comment to the lower-level group creation helper, then returns success or the error from that helper.
 
-**Call relations**: This is the first step inside `provision_sandbox_users`, establishing the group before users are added to it.
+**Call relations**: During user provisioning, provision_sandbox_users calls this first so the group is available before any sandbox account is added to it. It delegates the actual Windows group creation work to ensure_local_group.
 
 *Call graph*: calls 1 internal fn (ensure_local_group); called by 1 (provision_sandbox_users).
 
@@ -2232,11 +2248,11 @@ fn ensure_sandbox_users_group(log: &mut dyn Write) -> Result<()>
 fn resolve_sandbox_users_group_sid() -> Result<Vec<u8>>
 ```
 
-**Purpose**: Resolves the sandbox users group name to raw SID bytes.
+**Purpose**: Finds the Windows security identifier, or SID, for the sandbox users group. Other setup steps need this ID when setting access rules, because Windows permissions are based on SIDs rather than display names.
 
-**Data flow**: It calls `resolve_sid` with the fixed `SANDBOX_USERS_GROUP` name and returns the resulting `Vec<u8>`.
+**Data flow**: It takes no input. It looks up the fixed CodexSandboxUsers group name and returns the SID as raw bytes, or an error if Windows cannot resolve it.
 
-**Call relations**: This helper is used by provisioning and ACL setup paths whenever the sandbox group SID is needed for firewall, directory locking, or ACL grants.
+**Call relations**: Provision-only, read-ACL-only, and full setup flows call this when they need to apply or inspect permissions for the sandbox group. It hands the lookup work to resolve_sid.
 
 *Call graph*: calls 1 internal fn (resolve_sid); called by 3 (run_provision_only, run_read_acl_only, run_setup_full).
 
@@ -2252,11 +2268,11 @@ fn provision_sandbox_users(
 ) -> Result<()>
 ```
 
-**Purpose**: Creates or updates both sandbox accounts, ensures group membership, and writes encrypted credentials to disk.
+**Purpose**: Creates or refreshes the two sandbox Windows accounts and stores their new protected passwords. This is the main account-provisioning routine for the sandbox setup.
 
-**Data flow**: It takes `codex_home`, offline and online usernames, and a log sink. It ensures the sandbox group exists, logs the usernames, generates random passwords, ensures each user exists and belongs to the group, writes DPAPI-protected secrets under the sandbox secrets directory, and returns success.
+**Data flow**: It receives the Codex home folder, the two desired usernames, and a log writer. It ensures the sandbox group exists, generates a password for each user, creates or updates each account, adds each account to the sandbox group, then writes the encrypted password records under the Codex home directory. It returns success only after all those steps complete.
 
-**Call relations**: This is called by `provision_and_hide_sandbox_users` in the outer setup module. It delegates per-user work to `ensure_sandbox_user` and persistence to `write_secrets`.
+**Call relations**: provision_and_hide_sandbox_users calls this as part of preparing the sandbox accounts. Inside, it calls ensure_sandbox_users_group, random_password, ensure_sandbox_user for each account, and write_secrets after the accounts are ready.
 
 *Call graph*: calls 4 internal fn (ensure_sandbox_user, ensure_sandbox_users_group, random_password, write_secrets); called by 1 (provision_and_hide_sandbox_users); 2 external calls (format!, log_line).
 
@@ -2267,11 +2283,11 @@ fn provision_sandbox_users(
 fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> Result<()>
 ```
 
-**Purpose**: Ensures a single sandbox user account exists and belongs to the managed sandbox group.
+**Purpose**: Makes one named Windows account usable as a sandbox user. It both creates or updates the account and adds it to the sandbox users group.
 
-**Data flow**: It takes a username, plaintext password, and log sink, calls `ensure_local_user` to create or update the account, then calls `ensure_local_group_member` to add it to `CodexSandboxUsers`, returning `Ok(())` on success.
+**Data flow**: It receives a username, password, and log writer. It first ensures the Windows local user exists with that password, then asks Windows to add that user to the CodexSandboxUsers group. It returns success if both requested operations complete without a fatal error.
 
-**Call relations**: This helper is invoked twice by `provision_sandbox_users`, once for the offline account and once for the online account.
+**Call relations**: provision_sandbox_users calls this once for the offline account and once for the online account. It is a small bridge between ensure_local_user and ensure_local_group_member.
 
 *Call graph*: calls 2 internal fn (ensure_local_group_member, ensure_local_user); called by 1 (provision_sandbox_users).
 
@@ -2282,11 +2298,11 @@ fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> R
 fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Result<()>
 ```
 
-**Purpose**: Creates a local Windows user or updates its password if it already exists, then best-effort adds it to the built-in Users group.
+**Purpose**: Creates a regular local Windows user account, or updates its password if the account already exists. It also tries to make sure the account belongs to the normal Windows Users group.
 
-**Data flow**: It converts the username and password to UTF-16, builds a `USER_INFO_1`, and calls `NetUserAdd`. If creation fails, it constructs `USER_INFO_1003` and calls `NetUserSetInfo` to update the password; if that also fails it logs the code and returns `HelperUserCreateOrUpdateFailed`. Afterward it tries to resolve the localized account name for the well-known Users SID and, if successful, calls `NetLocalGroupAddMembers` to add the user to that group.
+**Data flow**: It receives an account name, a password, and a log writer. It converts the text into Windows wide strings, calls Windows to add the user, and if that fails because the user may already exist, calls Windows again to set the password. Then it resolves the localized name of the built-in Users group and tries to add the account there. It returns success unless creating or updating the account itself fails.
 
-**Call relations**: This is the low-level account mutation primitive used by `ensure_sandbox_user`. It also depends on `lookup_account_name_for_sid` to avoid hard-coding a localized built-in group name.
+**Call relations**: ensure_sandbox_user calls this before adding the account to the sandbox-specific group. It relies on lookup_account_name_for_sid to find the local name of the built-in Users group, because that group can be named differently on non-English Windows systems.
 
 *Call graph*: calls 2 internal fn (lookup_account_name_for_sid, new); called by 1 (ensure_sandbox_user); 10 external calls (new, new, to_wide, format!, null, null_mut, log_line, NetLocalGroupAddMembers, NetUserAdd, NetUserSetInfo).
 
@@ -2297,11 +2313,11 @@ fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Result<
 fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Result<()>
 ```
 
-**Purpose**: Creates a local Windows group if needed and tolerates the standard already-exists statuses.
+**Purpose**: Creates a local Windows group if it does not already exist. Existing-group results are treated as okay, because setup should be safe to run more than once.
 
-**Data flow**: It converts the group name and comment to UTF-16, builds `LOCALGROUP_INFO_1`, calls `NetLocalGroupAdd`, and returns success for `NERR_Success`, `ERROR_ALIAS_EXISTS`, or `NERR_GROUP_EXISTS`. Other statuses are logged and converted into `HelperUsersGroupCreateFailed`.
+**Data flow**: It receives a group name, a comment, and a log writer. It converts the strings into Windows format and calls the Windows group creation API. If Windows says the group already exists, it still returns success; for other failures it writes a log message and returns a setup-specific error.
 
-**Call relations**: This helper underpins `ensure_sandbox_users_group` and keeps group creation idempotent across repeated setup runs.
+**Call relations**: ensure_sandbox_users_group calls this to create the CodexSandboxUsers group. This keeps the public sandbox-group function simple while this function deals with the Windows API result codes.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (ensure_sandbox_users_group); 7 external calls (new, new, to_wide, format!, null, log_line, NetLocalGroupAdd).
 
@@ -2312,11 +2328,11 @@ fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Result<
 fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<()>
 ```
 
-**Purpose**: Adds a named account to a local group, ignoring duplicate-membership errors.
+**Purpose**: Adds a user or other account name to a local Windows group. If Windows reports that the member is already present, this function deliberately ignores that kind of problem so repeated setup runs do not fail.
 
-**Data flow**: It converts the group and member names to UTF-16, builds `LOCALGROUP_MEMBERS_INFO_3`, calls `NetLocalGroupAddMembers`, ignores the returned status, and always returns `Ok(())`.
+**Data flow**: It receives the group name and member name. It converts both names into Windows format and asks Windows to add the member to the group. It does not return the Windows add-member error; it always returns success after making the attempt.
 
-**Call relations**: This is used by `ensure_sandbox_user` after account creation/update to enforce sandbox-group membership.
+**Call relations**: ensure_sandbox_user uses this after the account exists, so the account gains membership in CodexSandboxUsers. ensure_local_user also performs a similar Windows call directly for the built-in Users group.
 
 *Call graph*: called by 1 (ensure_sandbox_user); 4 external calls (new, to_wide, null, NetLocalGroupAddMembers).
 
@@ -2327,11 +2343,11 @@ fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<()>
 fn resolve_sid(name: &str) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Resolves an account or group name into raw SID bytes, with fast paths for several well-known principals.
+**Purpose**: Turns a Windows account or group name into its SID, the internal security ID Windows uses in permissions. It also recognizes a few built-in names directly, such as Administrators and SYSTEM.
 
-**Data flow**: It first checks `well_known_sid_str`; if a known SID string exists it converts that string via `sid_bytes_from_string`. Otherwise it UTF-16 encodes the name and repeatedly calls `LookupAccountNameW`, resizing SID and domain buffers on `ERROR_INSUFFICIENT_BUFFER`, truncating the SID buffer to the returned length on success, and returning the SID bytes.
+**Data flow**: It receives a name. If the name is one of the known built-in accounts or groups, it converts the built-in SID string into bytes. Otherwise, it asks Windows to look up the account name, growing its buffers if Windows says more space is needed. It returns the SID bytes or an error explaining the failed lookup.
 
-**Call relations**: This is a foundational identity helper used throughout setup for real users, sandbox users, built-in principals, and the sandbox group.
+**Call relations**: This is the shared SID lookup tool for setup. It is called by setup flows that set permissions, by resolve_sandbox_users_group_sid for the sandbox group, and by prepare_setup_marker when building the protected marker file permissions. It calls well_known_sid_str and sid_bytes_from_string for built-in names.
 
 *Call graph*: calls 2 internal fn (sid_bytes_from_string, well_known_sid_str); called by 6 (lock_sandbox_dir, run_provision_only, run_read_acl_only, run_setup_full, prepare_setup_marker, resolve_sandbox_users_group_sid); 8 external calls (new, new, anyhow!, to_wide, null, vec!, GetLastError, LookupAccountNameW).
 
@@ -2342,11 +2358,11 @@ fn resolve_sid(name: &str) -> Result<Vec<u8>>
 fn well_known_sid_str(name: &str) -> Option<&'static str>
 ```
 
-**Purpose**: Maps a small set of built-in principal names to fixed SID strings.
+**Purpose**: Maps a small set of common Windows security names to their fixed SID strings. This avoids depending on localized display names for built-in groups and accounts.
 
-**Data flow**: It matches the input name against `Administrators`, `Users`, `Authenticated Users`, `Everyone`, and `SYSTEM`, returning `Some(&'static str)` for those names and `None` otherwise.
+**Data flow**: It receives a friendly name such as "Administrators" or "SYSTEM". If the name is one of the known entries, it returns the matching SID string; otherwise it returns nothing.
 
-**Call relations**: This helper is used only by `resolve_sid` to avoid unnecessary account lookups for common principals.
+**Call relations**: resolve_sid calls this before asking Windows to look up a name. It acts like a shortcut table for built-in identities whose SID values are the same across Windows installations.
 
 *Call graph*: called by 1 (resolve_sid).
 
@@ -2357,11 +2373,11 @@ fn well_known_sid_str(name: &str) -> Option<&'static str>
 fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Converts a string SID into an owned byte vector containing the SID structure.
+**Purpose**: Converts a SID written as text, such as "S-1-5-18", into the raw byte form that Windows security APIs use. This is needed when code starts from a known SID string.
 
-**Data flow**: It UTF-16 encodes the SID string, calls `ConvertStringSidToSidW` to obtain a PSID, queries its length with `GetLengthSid`, allocates an output buffer, copies the SID with `CopySid`, frees the original PSID with `LocalFree`, and returns the copied bytes.
+**Data flow**: It receives a SID string. It asks Windows to parse that string into a SID pointer, checks the SID length, copies the bytes into a Rust vector, frees the Windows-allocated memory, and returns the byte vector. If any Windows call fails, it returns an error.
 
-**Call relations**: This conversion path is used by `resolve_sid` for well-known SID strings.
+**Call relations**: resolve_sid uses this when well_known_sid_str finds a built-in SID. This function is the safe wrapper around the Windows conversion and memory-freeing steps.
 
 *Call graph*: called by 1 (resolve_sid); 9 external calls (new, anyhow!, to_wide, null_mut, vec!, LocalFree, ConvertStringSidToSidW, CopySid, GetLengthSid).
 
@@ -2372,11 +2388,11 @@ fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>>
 fn lookup_account_name_for_sid(sid_str: &str) -> Result<String>
 ```
 
-**Purpose**: Resolves a string SID to the localized account name Windows uses for that principal.
+**Purpose**: Finds the local account or group name that Windows uses for a given SID string. This matters because built-in group names can be translated on different Windows languages.
 
-**Data flow**: It converts the SID string to a PSID, performs a preflight `LookupAccountSidW` to obtain required buffer lengths, allocates UTF-16 name and domain buffers, performs the real lookup, frees the PSID, converts the name buffer to a Rust `String`, trims trailing NULs, and returns the account name.
+**Data flow**: It receives a SID string. It converts the string into a Windows SID, first calls Windows to learn how large the name and domain buffers must be, then calls again to fill those buffers. It returns the account name as a normal Rust string and frees the Windows SID memory.
 
-**Call relations**: This helper is used by `ensure_local_user` to find the localized built-in Users group name before adding the sandbox account to it.
+**Call relations**: ensure_local_user calls this to find the actual local name of the built-in Users group before adding the new account to it. That lets setup work even when the visible group name is not literally "Users".
 
 *Call graph*: called by 1 (ensure_local_user); 11 external calls (new, from_utf16_lossy, anyhow!, to_wide, null, null_mut, vec!, GetLastError, LocalFree, ConvertStringSidToSidW (+1 more)).
 
@@ -2387,11 +2403,11 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String>
 fn sid_bytes_to_psid(sid: &[u8]) -> Result<*mut c_void>
 ```
 
-**Purpose**: Converts raw SID bytes into a heap-allocated Win32 PSID pointer suitable for ACL APIs.
+**Purpose**: Converts stored SID bytes back into a Windows SID pointer. Some Windows APIs require this pointer form rather than a Rust byte vector.
 
-**Data flow**: It converts the SID bytes to a string SID with `string_from_sid_bytes`, UTF-16 encodes that string, calls `ConvertStringSidToSidW`, and returns the resulting `*mut c_void` PSID for the caller to free with `LocalFree`.
+**Data flow**: It receives SID bytes. It first turns them into a SID text string, then asks Windows to convert that text into a SID pointer. It returns the pointer for the caller to use, or an error if conversion fails.
 
-**Call relations**: This bridge is used by read-ACL and full-setup code when passing SIDs into ACL inspection and mutation functions.
+**Call relations**: The read-ACL-only and full setup flows call this when they need to pass a SID into Windows permission APIs. It relies on the shared string_from_sid_bytes helper from the sandbox library.
 
 *Call graph*: called by 2 (run_read_acl_only, run_setup_full); 6 external calls (new, anyhow!, string_from_sid_bytes, to_wide, null_mut, ConvertStringSidToSidW).
 
@@ -2402,11 +2418,11 @@ fn sid_bytes_to_psid(sid: &[u8]) -> Result<*mut c_void>
 fn random_password() -> String
 ```
 
-**Purpose**: Generates a random 24-character password from an alphanumeric-and-symbol alphabet.
+**Purpose**: Generates a fresh random password for a sandbox user account. The password uses letters, numbers, and common symbols.
 
-**Data flow**: It seeds `SmallRng` from entropy, fills a 24-byte buffer, maps each byte modulo the fixed `CHARS` alphabet length to a character, collects the characters into a `String`, and returns it.
+**Data flow**: It takes no input. It fills 24 random bytes using a small random-number generator seeded from the operating system, maps each byte into an allowed password character, and returns the resulting string.
 
-**Call relations**: This helper is called twice by `provision_sandbox_users` to create fresh offline and online account passwords.
+**Call relations**: provision_sandbox_users calls this once for the offline account and once for the online account before creating or updating those users.
 
 *Call graph*: called by 1 (provision_sandbox_users); 1 external calls (from_entropy).
 
@@ -2423,11 +2439,11 @@ fn write_secrets(
 ) -> Result<()>
 ```
 
-**Purpose**: Persists the sandbox usernames and DPAPI-protected passwords into the sandbox secrets directory as versioned JSON.
+**Purpose**: Writes the sandbox usernames and encrypted passwords to a JSON file under the sandbox secrets directory. The passwords are protected with Windows DPAPI, which encrypts data using Windows user or machine protection.
 
-**Data flow**: It derives `sandbox_secrets_dir(codex_home)`, creates it, DPAPI-protects each plaintext password, base64-encodes the encrypted blobs, builds a `SandboxUsersFile` containing `SETUP_VERSION` and both user records, serializes it with `serde_json::to_vec_pretty`, and writes it to `sandbox_users.json`. Directory creation, DPAPI, serialization, and write failures are mapped to specific setup error codes.
+**Data flow**: It receives the Codex home path, both usernames, and both plain passwords. It creates the secrets directory, encrypts each password, base64-encodes the encrypted bytes so they fit cleanly in JSON text, serializes the records, and writes sandbox_users.json. It returns a setup-specific error if directory creation, encryption, serialization, or writing fails.
 
-**Call relations**: This persistence step is called by `provision_sandbox_users` after both accounts have been ensured.
+**Call relations**: provision_sandbox_users calls this only after both accounts have been created or updated. It uses helper functions from the sandbox library to find the secrets directory and protect the password bytes.
 
 *Call graph*: called by 1 (provision_sandbox_users); 5 external calls (dpapi_protect, sandbox_secrets_dir, to_vec_pretty, create_dir_all, write).
 
@@ -2438,11 +2454,11 @@ fn write_secrets(
 fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result<()>
 ```
 
-**Purpose**: Creates an empty protected setup marker file whose ACL allows only SYSTEM, Administrators, and the real user.
+**Purpose**: Creates an empty setup marker file with strict permissions before setup begins. The empty file intentionally does not count as a valid completed setup marker, but it prevents sandbox users from creating or replacing the marker themselves.
 
-**Data flow**: It computes `sandbox_dir(codex_home)/setup_marker.json`, removes any existing file unless it is absent, resolves the real user SID and converts it to a string, builds an SDDL DACL string, converts that to a security descriptor, constructs `SECURITY_ATTRIBUTES`, creates the file with `CreateFileW(CREATE_NEW, GENERIC_WRITE, share=0)`, frees the security descriptor, closes the file handle, and returns success or `HelperSetupMarkerWriteFailed` on any step.
+**Data flow**: It receives the Codex home path and the real user name. It removes any old marker file, resolves the real user's SID, builds a Windows security rule that gives full access only to SYSTEM, Administrators, and the real user, and creates a new empty marker file with those permissions. It returns an error if removal, SID lookup, security descriptor creation, or file creation fails.
 
-**Call relations**: This function is called by `run_setup` before executing provisioning/full setup modes so readiness checks fail while setup is still in progress and sandbox users cannot tamper with the marker.
+**Call relations**: run_setup calls this near the start of setup. Later, if every setup step succeeds, commit_setup_marker writes valid JSON into the same protected file without changing its access rules.
 
 *Call graph*: calls 2 internal fn (resolve_sid, new); called by 1 (run_setup); 11 external calls (new, sandbox_dir, to_wide, format!, remove_file, null_mut, CloseHandle, GetLastError, LocalFree, ConvertStringSecurityDescriptorToSecurityDescriptorW (+1 more)).
 
@@ -2459,21 +2475,23 @@ fn commit_setup_marker(
 ) -> Result<()>
 ```
 
-**Purpose**: Writes the final JSON contents into the already-protected setup marker file after setup succeeds.
+**Purpose**: Writes the final setup marker JSON after setup has succeeded. This marker records enough information for later code to know the sandbox setup is complete and which accounts and proxy settings were used.
 
-**Data flow**: It builds a `SetupMarker` containing `SETUP_VERSION`, usernames, current UTC timestamp, proxy ports, local-binding flag, and empty read/write root arrays, serializes it with `to_vec_pretty`, and writes it to `sandbox_dir(codex_home)/setup_marker.json`, mapping serialization or write failures to `HelperSetupMarkerWriteFailed`.
+**Data flow**: It receives the Codex home path, the offline and online usernames, proxy ports, and whether local binding is allowed. It builds a marker object with the setup version, current UTC timestamp, account names, network settings, and empty read/write root lists, serializes it as pretty JSON, and writes it to setup_marker.json. It returns an error if serialization or writing fails.
 
-**Call relations**: This is called by `run_setup` only after the selected setup mode completes successfully, preserving the ACL established by `prepare_setup_marker`.
+**Call relations**: run_setup calls this at the end of a successful setup. It completes the two-step marker process that prepare_setup_marker started, turning the protected empty placeholder into a valid readiness signal.
 
 *Call graph*: called by 1 (run_setup); 5 external calls (new, now, sandbox_dir, to_vec_pretty, write).
 
 ## 📊 State Registers Touched
 
-- `reg-process-environment` — The process-wide environment and argv/arg0-derived launch context that is sanitized, augmented, and then reused by later startup and runtime code.
-- `reg-effective-config` — The merged, validated effective configuration assembled from managed, cloud, user, project, thread, and CLI layers with provenance.
-- `reg-auth-state` — The active authentication mode and loaded credential state selected from storage or environment, including refresh and mode restrictions.
-- `reg-token-store` — The persisted token payloads, JWT/account metadata, and revocation/restore state backing login and whoami behavior.
-- `reg-installation-identity` — The stable per-installation identity used to distinguish this machine/runtime instance across auth, backend, and telemetry flows.
-- `reg-sandbox-user-credentials` — The Windows sandbox local-account and protected-credential state used to run isolated commands safely.
-- `reg-auth-transport-adapters` — The runtime-ready outbound authentication material derived from auth state, such as bearer headers, agent assertions, or SigV4 signing context, reused by backend clients and transports.
-- `reg-local-secrets-store` — The encrypted local secrets persistence used to retain sensitive integration or runtime secrets across startup and execution flows.
+- `reg-install-home-context` — The discovered Codex home folder, install location, bundled resources, and stable local installation identity.
+- `reg-auth-identity` — The signed-in user or service identity, including account facts such as email, plan, workspace, and login mode.
+- `reg-credential-store` — The saved tokens, API keys, OAuth credentials, MCP tokens, and other secrets used to authenticate later requests.
+- `reg-rate-limit-quota` — The current account limits, credit status, token usage, and reset information used to avoid overusing backend services.
+- `reg-http-network-client` — The shared network client setup, including retries, streaming, cookies, proxy settings, TLS handling, and request failure reporting.
+- `reg-permission-sandbox-policy` — The shared rules for file access, command execution, network access, approvals, and sandbox modes.
+- `reg-mcp-server-sessions` — The configured and connected MCP tool servers, their tools, resources, login state, approval rules, and active sessions.
+- `reg-observability-telemetry` — The shared logs, traces, metrics, analytics facts, rollout tracing, debug captures, and feedback evidence used to understand what happened.
+- `reg-windows-sandbox-readiness` — Prepared Windows sandbox accounts, helper readiness, setup status, and client-visible sandbox availability separate from the policy rules themselves.
+- `reg-attestation-state` — Client or host attestation provider state and generated proof metadata used to attach optional attestation headers to upstream requests.

@@ -1,10 +1,10 @@
 # Exec-mode and scripted session startup  `stage-9.2`
 
-This stage is the startup and one-shot execution path for non-interactive sessions, centered on `codex exec` rather than the interactive TUI main loop. Its job is to assemble enough context to run exactly one scripted request, start the supporting runtime, drive the session until completion, and emit machine-readable or final user-facing output.
+This stage is about starting a one-shot, non-interactive Codex run. Instead of opening a long-running text interface, it prepares one session, feeds in the prompt or resume information, runs the work, and finishes. It is mainly used by scripts, automation, or commands like codex exec, where output must be predictable.
 
-`exec/src/lib.rs` is the primary orchestrator. It turns CLI inputs into runtime configuration, starts the in-process app server, builds the initial prompt or review request, configures JSONL and other output behavior, runs the event loop for the session, and translates core/app-server types into the exec-mode conventions expected by this frontend. In effect, it is the entrypoint that wires together startup, execution, and shutdown for scripted use.
+exec/src/lib.rs is the main driver for this mode. It gathers instructions from command-line flags, config files, standard input, and saved session data. It can start a new request, continue an old session, or run a review. It also arranges output so that normal results can be read safely by other programs, for example as structured JSONL, which means one JSON record per line.
 
-`tui/src/session_resume.rs` supplies the resume/fork metadata needed before that run can begin when an existing session is involved. It resolves thread ID, working directory, and model from the state database when possible, falls back to rollout JSONL parsing otherwise, and guards against cwd mismatches by prompting the user. Together, these pieces ensure exec-mode starts with the right session context and then runs it deterministically to completion.
+tui/src/session_resume.rs supports the resume path. It works out which saved conversation to use, which folder it belonged to, and which model should continue it. If the saved folder is not the user’s current folder, it asks what to do. Together, these pieces make sure a scripted run starts with the right context and can proceed without an interactive work loop.
 
 ## Files in this stage
 
@@ -13,13 +13,13 @@ Determines the saved-session metadata needed before startup so exec can resume o
 
 ### `tui/src/session_resume.rs`
 
-`domain_logic` · `resume/fork preparation`
+`orchestration` · `session resume or fork setup`
 
-This module bridges app-server thread lifecycle data with older local rollout metadata that still matters before a selected thread has been resumed. It defines small deserialization structs for rollout records: `SessionMetadata` captures the original thread ID and cwd from `session_meta`, `TurnContextResumeState` captures later cwd/model updates from `turn_context`, and `RawRecord` is the generic envelope used while scanning the JSONL file. The accumulated result is stored in `RolloutResumeState`, which keeps optional thread ID, cwd, and model.
+When a user resumes a previous session, the app needs more than just the chat history. It also needs to know things like the conversation’s thread ID, which folder the session was working in, and which model was last used. Normally this information comes from the app server’s state database. But before that server has fully resumed a thread, the text UI may need to recover the same details from a local rollout file, which is a line-by-line saved record of earlier session events.
 
-The public helpers all follow the same preference order. `resolve_session_thread_id` uses an already-known UUID string when supplied; otherwise it reads the rollout file and extracts the saved thread ID. `read_session_model` and the internal `read_session_cwd` first consult `StateRuntime::get_thread(thread_id)` and only fall back to rollout parsing when state-db metadata is unavailable. `resolve_cwd_for_resume_or_fork` then compares the current cwd with the historical cwd using normalization-aware path matching; if prompting is allowed and the paths differ, it runs the TUI cwd-selection prompt and returns either the chosen cwd or an explicit exit outcome.
+This file acts like a small “lost-and-found desk” for resume data. It first asks the newer, more reliable state database. If that is unavailable or missing data, it reads the rollout file and looks for useful records. Older session metadata can provide the original thread ID and folder. Later turn-context records can override the folder and model, because they represent the most recent working state.
 
-`read_rollout_resume_state` is tolerant by design. It streams the rollout file line by line with `open_rollout_line_reader`, skips blank lines and malformed JSON, ignores records without payloads, captures the first `session_meta` thread ID/cwd, and lets later `turn_context` records overwrite cwd and model so the latest context wins. If the file contains no parseable records at all, it returns an `io::Error::other` describing the rollout as empty. Tests cover latest-turn-context precedence, fallback to session metadata, and malformed-line skipping.
+The most visible behavior is around the current working directory, or cwd, meaning the folder commands run from. If the saved session folder differs from the user’s current folder, this file can open a prompt in the text UI and let the user choose which folder to continue with. Without this file, resumed sessions could silently use the wrong folder, lose track of their model, or fail to reconnect a local rollout file to the right thread.
 
 #### Function details
 
@@ -32,11 +32,11 @@ async fn resolve_session_thread_id(
 ) -> Option<ThreadId>
 ```
 
-**Purpose**: Determines the thread ID for a saved session from either an already-known UUID string or rollout metadata.
+**Purpose**: This function finds the thread ID to resume. If the caller already has a UUID-shaped ID string, it tries to turn that directly into a thread ID; otherwise it looks inside the rollout file.
 
-**Data flow**: Takes a rollout path and optional `id_str_if_uuid`; if the string is present, attempts `ThreadId::from_string` and returns the parsed ID on success. Otherwise it awaits `read_rollout_resume_state(path)`, ignores errors, and returns the `thread_id` field from the parsed state.
+**Data flow**: It receives a path to a rollout file and, optionally, an ID string. If the string is present, it parses it. If not, it reads the rollout resume state and takes the thread ID found there. It returns either a usable thread ID or nothing if no valid ID can be found.
 
-**Call relations**: The resume picker’s accept path calls this when a selected row has a path but no already-populated thread ID.
+**Call relations**: When key handling needs to resume a selected item, it calls this function to settle the identity question first. This function either uses ThreadId parsing for the direct case or hands off to read_rollout_resume_state when it must recover the ID from saved local records.
 
 *Call graph*: calls 2 internal fn (from_string, read_rollout_resume_state); called by 1 (handle_key).
 
@@ -51,11 +51,11 @@ async fn read_session_model(
 ) -> Option<String>
 ```
 
-**Purpose**: Finds the model associated with a thread, preferring state-db metadata and falling back to rollout metadata.
+**Purpose**: This function finds which model was associated with a saved thread. It prefers the app server’s state database and falls back to the rollout file only if needed.
 
-**Data flow**: Accepts optional `StateRuntime`, `ThreadId`, and optional rollout path. If state DB is present and `get_thread(thread_id)` returns metadata with `model`, it returns that immediately. Otherwise it requires `path`, reads rollout resume state, ignores errors, and returns the parsed `model` field.
+**Data flow**: It receives an optional state database connection, a thread ID, and an optional rollout path. It first asks the state database for the thread metadata and returns its model if present. If that fails or has no model, it reads the rollout file and returns the model recorded in the latest relevant saved turn context. If neither source has a model, it returns nothing.
 
-**Call relations**: Other session-state reconstruction code calls this when it needs the model before or alongside resuming a thread.
+**Call relations**: Code that needs to describe or rebuild session state calls this function when it needs the model name. The function keeps those callers from having to know whether the answer came from the app server state or from the older local rollout record.
 
 *Call graph*: calls 1 internal fn (read_rollout_resume_state); called by 2 (infer_session_for_thread_notification, session_state_for_thread_read).
 
@@ -72,11 +72,11 @@ async fn resolve_cwd_for_resume_or_fork(
     action: CwdPromptActi
 ```
 
-**Purpose**: Determines which cwd should be used when resuming or forking a session, optionally prompting the user if the saved cwd differs from the current cwd.
+**Purpose**: This function decides which folder should be used when resuming or forking a session. If the saved folder and current folder differ, it can ask the user which one they want.
 
-**Data flow**: Reads the historical cwd via `read_session_cwd`; if none exists, returns `ResolveCwdOutcome::Continue(None)`. If prompting is allowed and `cwds_differ(current_cwd, history_cwd)` is true, it awaits `cwd_prompt::run_cwd_selection_prompt` and maps `Current`, `Session`, or `Exit` into `ResolveCwdOutcome`. Otherwise it returns `Continue(Some(history_cwd))` directly.
+**Data flow**: It receives the text UI, optional state database, the current folder, the thread ID, optional rollout path, the type of cwd action, and whether prompting is allowed. It reads the saved session folder. If there is no saved folder, it says to continue without choosing one. If prompting is allowed and the folders differ, it shows a selection prompt and returns the user’s choice or an exit signal. If no prompt is needed, it returns the saved session folder.
 
-**Call relations**: Resume/fork flows call this before launching the resumed session so cwd mismatches can be resolved interactively.
+**Call relations**: The resume and main UI startup paths call this before continuing with an old or forked conversation. It relies on read_session_cwd to find the saved folder, cwds_differ to compare paths fairly, and run_cwd_selection_prompt to involve the user when the choice could matter.
 
 *Call graph*: calls 3 internal fn (run_cwd_selection_prompt, cwds_differ, read_session_cwd); called by 2 (resume_target_session, run_ratatui_app); 2 external calls (to_path_buf, Continue).
 
@@ -91,11 +91,11 @@ async fn read_session_cwd(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Finds the saved cwd for a thread from state DB or rollout metadata, warning when rollout parsing fails.
+**Purpose**: This function finds the saved working folder for a thread. It checks the main state database first, then falls back to the rollout file if necessary.
 
-**Data flow**: If state DB is available and `get_thread(thread_id)` succeeds, returns `metadata.cwd`. Otherwise it requires `path`, awaits `read_rollout_resume_state`, returns `state.cwd` on success, and on error logs a warning including the rollout path and returns `None`.
+**Data flow**: It receives an optional state database connection, a thread ID, and an optional rollout path. If database metadata exists, it returns the cwd from that metadata. Otherwise it reads the rollout file and returns the cwd found there. If the rollout cannot be read, it logs a warning and returns nothing.
 
-**Call relations**: Used internally by `resolve_cwd_for_resume_or_fork` as the source of historical cwd information.
+**Call relations**: resolve_cwd_for_resume_or_fork calls this as its first step, because it cannot compare or prompt about folders until it knows the saved one. This function hides the two-source lookup from the higher-level resume flow.
 
 *Call graph*: calls 1 internal fn (read_rollout_resume_state); called by 1 (resolve_cwd_for_resume_or_fork); 1 external calls (warn!).
 
@@ -106,11 +106,11 @@ async fn read_session_cwd(
 fn cwds_differ(current_cwd: &Path, session_cwd: &Path) -> bool
 ```
 
-**Purpose**: Compares the current cwd and saved session cwd using normalized path semantics.
+**Purpose**: This function answers a simple question: do these two folder paths really point to different places? It compares paths after normalization, so harmless spelling differences do not count as a real difference.
 
-**Data flow**: Passes both paths to `path_utils::paths_match_after_normalization` and returns the negated result.
+**Data flow**: It receives the current folder path and the saved session folder path. It passes them through a path comparison helper that normalizes paths first, then returns true only when they do not match.
 
-**Call relations**: Used before prompting so equivalent paths with superficial differences do not trigger unnecessary cwd selection.
+**Call relations**: The resume folder prompt uses this function to avoid bothering the user when paths only look different on the surface. Configuration rebuild logic also calls it when deciding whether the resumed session’s folder needs special treatment.
 
 *Call graph*: called by 2 (rebuild_config_for_resume_or_fallback, resolve_cwd_for_resume_or_fork); 1 external calls (paths_match_after_normalization).
 
@@ -121,11 +121,11 @@ fn cwds_differ(current_cwd: &Path, session_cwd: &Path) -> bool
 async fn read_rollout_resume_state(path: &Path) -> io::Result<RolloutResumeState>
 ```
 
-**Purpose**: Streams a rollout JSONL file and extracts the latest resumable thread metadata from `session_meta` and `turn_context` records.
+**Purpose**: This function reads a rollout file and extracts the resume details hidden inside it: thread ID, working folder, and model. It is the fallback source used when the app server state is not available or not complete.
 
-**Data flow**: Opens a line reader with `open_rollout_line_reader`, initializes default `RolloutResumeState`, and tracks whether any parseable record was seen. For each non-empty line, it tries to deserialize `RawRecord`; malformed lines are skipped. Records without payload are skipped. The first `session_meta` payload that deserializes into `SessionMetadata` sets `thread_id` and initializes `cwd` if not already set. Every `turn_context` payload that deserializes into `TurnContextResumeState` overwrites `cwd` and `model`. At EOF it returns the accumulated state if any record was seen, otherwise returns `io::Error::other("rollout at ... is empty")`.
+**Data flow**: It receives a path to a rollout file. It opens the file as a line reader, skips blank lines, ignores malformed JSON lines, and looks at recognized record types. A session metadata record can supply the thread ID and original folder. Turn-context records can update the folder and model, with later records winning because the file is read in order. It returns the collected resume state, or an input/output error if the file could not be opened or had no usable records at all.
 
-**Call relations**: This is the fallback metadata reader used by thread-ID, cwd, and model resolution when state-db data is unavailable.
+**Call relations**: The thread ID, model, and cwd lookup functions all call this when they need to recover data from local rollout history. The tests call it directly to prove that it prefers the newest turn context, falls back to session metadata, and tolerates bad lines.
 
 *Call graph*: called by 6 (read_session_cwd, read_session_model, resolve_session_thread_id, rollout_resume_state_falls_back_to_session_meta, rollout_resume_state_prefers_latest_turn_context, rollout_resume_state_skips_malformed_lines); 4 external calls (other, open_rollout_line_reader, format!, default).
 
@@ -140,11 +140,11 @@ fn rollout_line(
     ) -> serde_json::Value
 ```
 
-**Purpose**: Builds one synthetic rollout JSON object for tests.
+**Purpose**: This test helper builds one fake rollout record in the same general shape as the real saved records. It keeps the tests short and focused on behavior instead of JSON construction details.
 
-**Data flow**: Accepts timestamp, item type, and payload JSON, wraps them in a `serde_json::json!` object with keys `timestamp`, `type`, and `payload`, and returns it.
+**Data flow**: It receives a timestamp, a record type, and a payload value. It wraps them into a JSON object that looks like one line of a rollout file. The result is a JSON value ready to be serialized by the test writer helper.
 
-**Call relations**: The rollout parsing tests use it to assemble realistic JSONL fixtures.
+**Call relations**: The rollout resume tests use this helper to create session metadata and turn-context records. It feeds test data into tests::write_rollout_lines, which then writes those records to a temporary rollout file.
 
 *Call graph*: 1 external calls (json!).
 
@@ -155,11 +155,11 @@ fn rollout_line(
 fn write_rollout_lines(path: &Path, lines: &[serde_json::Value]) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a sequence of rollout JSON objects to a file as newline-delimited JSON.
+**Purpose**: This test helper writes fake rollout records to disk as newline-separated JSON. That gives the parser a realistic file to read during tests.
 
-**Data flow**: Serializes each `serde_json::Value` to a string, appends `\n`, accumulates the text in a `String`, and writes it to the supplied path with `std::fs::write`.
+**Data flow**: It receives a file path and a list of JSON values. It serializes each value to one JSON string, adds a newline after each, and writes the combined text to the path. It returns success or a file-writing error.
 
-**Call relations**: Used by the rollout parsing tests to create temporary rollout files.
+**Call relations**: The rollout resume tests call this after building records with tests::rollout_line. Once the file exists, the tests call read_rollout_resume_state to check how the real parser behaves.
 
 *Call graph*: 3 external calls (new, to_string, write).
 
@@ -170,11 +170,11 @@ fn write_rollout_lines(path: &Path, lines: &[serde_json::Value]) -> std::io::Res
 async fn rollout_resume_state_prefers_latest_turn_context() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that later `turn_context` records override earlier cwd/model values while preserving the original thread ID from `session_meta`.
+**Purpose**: This test checks that the rollout reader uses the most recent turn-context record for folder and model. That matters because a session can move or change context after its original metadata was written.
 
-**Data flow**: Creates a temp rollout file containing one `session_meta` and two `turn_context` records, reads it with `read_rollout_resume_state`, and asserts that the returned state contains the thread ID plus the cwd/model from the last `turn_context`.
+**Data flow**: It creates a temporary rollout file containing original session metadata, then two later turn-context records. It reads the file through read_rollout_resume_state and checks that the thread ID comes from the metadata while the cwd and model come from the latest turn context.
 
-**Call relations**: This test documents the parser’s latest-context-wins behavior.
+**Call relations**: This test exercises the main fallback parser directly. It uses the helper functions to build realistic rollout lines, then confirms that read_rollout_resume_state treats later turn-context data as the current state.
 
 *Call graph*: calls 2 internal fn (new, read_rollout_resume_state); 5 external calls (new, assert_eq!, json!, rollout_line, write_rollout_lines).
 
@@ -185,11 +185,11 @@ async fn rollout_resume_state_prefers_latest_turn_context() -> std::io::Result<(
 async fn rollout_resume_state_falls_back_to_session_meta() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that when no `turn_context` exists, the parser still returns thread ID and cwd from `session_meta`.
+**Purpose**: This test checks that session metadata alone is enough to recover the thread ID and folder. That protects older or simpler rollout files that do not contain later turn-context records.
 
-**Data flow**: Writes a rollout file containing only a `session_meta` record, reads it, and asserts that thread ID and cwd are populated while model remains `None`.
+**Data flow**: It creates a temporary rollout file with only one session metadata record. It reads that file through read_rollout_resume_state and verifies that the returned state contains the metadata’s thread ID and cwd, while the model remains absent.
 
-**Call relations**: This covers the fallback path where only initial session metadata is available.
+**Call relations**: This test calls the same rollout parser used by resume code. It proves the fallback path still works when the richer, newer turn-context information is missing.
 
 *Call graph*: calls 2 internal fn (new, read_rollout_resume_state); 5 external calls (new, assert_eq!, json!, rollout_line, write_rollout_lines).
 
@@ -200,11 +200,11 @@ async fn rollout_resume_state_falls_back_to_session_meta() -> std::io::Result<()
 async fn rollout_resume_state_skips_malformed_lines() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that malformed JSON lines do not abort rollout parsing when valid records are also present.
+**Purpose**: This test checks that one bad line in a rollout file does not ruin the whole resume attempt. That is important because saved log-like files can sometimes contain partial or damaged records.
 
-**Data flow**: Writes one valid serialized rollout line followed by malformed JSON, reads the file with `read_rollout_resume_state`, and asserts that the valid thread ID and cwd were still recovered.
+**Data flow**: It writes one valid rollout metadata line followed by malformed JSON. It then reads the file through read_rollout_resume_state and verifies that the valid data is still recovered instead of failing because of the bad trailing line.
 
-**Call relations**: This test documents the parser’s intentionally tolerant line-by-line behavior.
+**Call relations**: This test targets the parser’s tolerance behavior. It confirms that read_rollout_resume_state skips malformed lines and still returns useful state when at least one valid record was seen.
 
 *Call graph*: calls 2 internal fn (new, read_rollout_resume_state); 7 external calls (new, assert_eq!, format!, json!, to_string, write, rollout_line).
 
@@ -214,11 +214,13 @@ Runs the non-interactive exec flow from CLI-derived setup through app-server sta
 
 ### `exec/src/lib.rs`
 
-`orchestration` · `startup, session bootstrap, request handling, shutdown`
+`entrypoint` · `startup through main execution loop and shutdown`
 
-This file is the operational core of the exec crate. It starts by defining small local state types: `InitialOperation` distinguishes a normal user turn from a review run, `StdinPromptBehavior` controls how stdin is interpreted, `RequestIdSequencer` generates monotonically increasing integer JSON-RPC request IDs, and `ExecRunArgs` bundles the fully prepared runtime inputs passed from startup into the session runner. `run_main` is the top-level orchestrator: it unpacks `Cli`, resolves color and tracing behavior, parses `-c` overrides, canonicalizes cwd, loads bootstrap config twice when necessary to fetch cloud config before resolving OSS defaults, builds `ConfigOverrides`, and then constructs the final `Config` with a retry path for `AutoReview` configurations that reject the synthetic headless approval policy. It enforces exec-policy and login restrictions, initializes OTEL/tracing, state DB, environment management, and the in-process app-server client arguments.
+This file is the bridge between a user typing `codex exec ...` and the in-process Codex app server that actually runs the agent. Its first job is setup: read command-line flags, find configuration, choose the model or local OSS provider, enforce login rules, start logging and telemetry, and create the app-server client. Then it starts or resumes a thread, sends either a user prompt or a review request, and watches the server's event stream until the turn finishes.
 
-`run_exec_session` then chooses either human or JSONL output, validates OSS provider readiness, builds the initial prompt or review request, optionally rejects execution outside a git repo, starts or resumes a thread, synthesizes a `SessionConfiguredEvent` directly from thread start/resume responses to avoid waiting for streamed bootstrap events, and sends either `turn/start` or `review/start`. Its main loop multiplexes Ctrl-C interrupts with server events, auto-rejects unsupported interactive server requests, filters notifications to the active thread/turn, backfills missing `turn.items` via `thread/read` when non-ephemeral delivery dropped item events, and asks the event processor whether shutdown should begin. The file also includes concrete protocol-mapping helpers for thread lifecycle params, permission/sandbox selection, resume lookup across state DB and `thread/list`, prompt decoding from UTF-8/UTF-16 with BOM handling, and review-target construction. A key invariant throughout is stdout cleanliness: only final message output or JSONL events go to stdout; diagnostics and fatal setup errors go to stderr, often followed by immediate process exit.
+A key rule shapes the whole file: stdout must stay clean. In normal mode, only the final answer should appear there; in JSON mode, stdout must be valid JSON lines. Warnings, setup messages, and errors go to stderr instead, so shell scripts can safely capture the answer.
+
+The file also deals with headless-command realities. It can read prompts from stdin, including piped files with byte-order marks, reject unsupported interactive approval requests, cancel tool elicitations, respond to Ctrl-C by interrupting the turn, and backfill missing final items if the event stream dropped intermediate updates. Think of it as the conductor for a one-shot train trip: it checks tickets and route rules, starts or resumes the train, relays signals, filters messages for the right passenger, and shuts everything down cleanly at the end.
 
 #### Function details
 
@@ -228,11 +230,11 @@ This file is the operational core of the exec crate. It starts by defining small
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the local request-ID generator used for app-server RPCs during a single exec session. It initializes the sequence at integer ID 1.
+**Purpose**: Creates a fresh counter for request IDs sent to the app server. Each request needs a unique label so replies can be matched back to the request that caused them.
 
-**Data flow**: Takes no arguments and creates `RequestIdSequencer { next: 1 }`. It does not read external state and returns the initialized struct.
+**Data flow**: It takes no input, starts the next ID at 1, and returns a new `RequestIdSequencer` ready to hand out IDs.
 
-**Call relations**: Called when `run_exec_session` is about to begin issuing `thread/start`, `turn/start`, interrupt, unsubscribe, and backfill requests, so all subsequent client requests can use stable incrementing IDs.
+**Call relations**: At the start of an exec session, `run_exec_session` creates one sequencer and keeps using it whenever it sends requests to the in-process app server.
 
 *Call graph*: called by 1 (run_exec_session).
 
@@ -243,11 +245,11 @@ fn new() -> Self
 fn next(&mut self) -> RequestId
 ```
 
-**Purpose**: Allocates the next integer `RequestId` and advances the internal counter. This is the only mutating behavior on the sequencer.
+**Purpose**: Returns the next request ID and advances the counter. This is like taking the next numbered ticket from a dispenser before asking the server for something.
 
-**Data flow**: Reads `self.next`, stores it in a local `id`, increments `self.next`, and returns `RequestId::Integer(id)`. The only state mutation is the increment of the internal counter.
+**Data flow**: It reads the current counter value, wraps it as an integer request ID, increments the stored counter, and returns the wrapped ID.
 
-**Call relations**: Used throughout the session flow whenever exec sends a typed request after startup, including shutdown unsubscribe and turn-completion backfill reads; it provides unique IDs for those delegated client calls.
+**Call relations**: The session loop uses this through helpers such as `maybe_backfill_turn_completed_items` and `request_shutdown` whenever another app-server request needs a fresh ID.
 
 *Call graph*: called by 2 (maybe_backfill_turn_completed_items, request_shutdown); 1 external calls (Integer).
 
@@ -258,11 +260,11 @@ fn next(&mut self) -> RequestId
 fn exec_root_span() -> tracing::Span
 ```
 
-**Purpose**: Creates the root tracing span for an exec invocation with reserved fields for thread and turn IDs. The span is later parented from incoming trace context when available.
+**Purpose**: Creates the top-level tracing span for a `codex exec` run. A tracing span is a named envelope for logs and timing data, useful when debugging or collecting telemetry.
 
-**Data flow**: Takes no inputs and returns a `tracing::Span` named `codex.exec` with `otel.kind="internal"` and empty `thread.id` / `turn.id` fields ready to be recorded later.
+**Data flow**: It takes no input and returns a span named for exec, with empty slots for the thread ID and turn ID that will be filled in later.
 
-**Call relations**: Built by `run_main` before session startup so the rest of the run can be instrumented under a single span, with thread and turn identifiers filled in once the app-server responds.
+**Call relations**: `run_main` creates this span after configuration and telemetry setup, then runs the whole exec session inside it so later logs belong to the same operation.
 
 *Call graph*: called by 1 (run_main); 1 external calls (info_span!).
 
@@ -273,11 +275,11 @@ fn exec_root_span() -> tracing::Span
 fn exec_stderr_env_filter() -> EnvFilter
 ```
 
-**Purpose**: Builds the tracing filter used for stderr logging, defaulting to an exec-specific filter that suppresses OTEL exporter self-noise. It prefers `RUST_LOG` when present.
+**Purpose**: Chooses which log messages are allowed to appear on stderr. By default it keeps noisy telemetry internals quiet unless the user explicitly asks for more logging.
 
-**Data flow**: Reads process environment through `EnvFilter::try_from_default_env`; if absent or invalid, falls back to `EXEC_DEFAULT_LOG_FILTER`, and finally to a plain `error` filter. Returns the resulting `EnvFilter`.
+**Data flow**: It first tries to read logging settings from the environment. If that fails, it uses the file's conservative default filter, and if even that fails it falls back to showing errors only.
 
-**Call relations**: Called during `run_main` while constructing the tracing subscriber's formatting layer so stderr diagnostics remain minimal and do not pollute headless command output.
+**Call relations**: `run_main` uses this when building the stderr logging layer, so diagnostic output does not corrupt stdout.
 
 *Call graph*: called by 1 (run_main); 1 external calls (try_from_default_env).
 
@@ -288,11 +290,11 @@ fn exec_stderr_env_filter() -> EnvFilter
 async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs full CLI startup for `codex exec`: parse-derived option normalization, config loading, policy enforcement, telemetry/tracing setup, app-server client bootstrap, and delegation into the session runner. It is the main library entrypoint used by the binary.
+**Purpose**: Runs the whole `codex exec` command from command-line input to finished session. This is the main entry used by the executable layer.
 
-**Data flow**: Consumes `Cli` and `Arg0DispatchPaths`. It reads CLI flags, environment-derived color support, filesystem state (`cwd`, codex home, config files), cloud config bundle storage, login/auth settings, and telemetry environment. It transforms those into `ConfigOverrides`, a final `Config`, OTEL/tracing layers, `StateDbHandle`, `EnvironmentManager`, and `InProcessClientStartArgs`, then invokes `run_exec_session`. On many fatal setup errors it writes a concrete message to stderr and exits the process; otherwise it returns `anyhow::Result<()>`.
+**Data flow**: It receives parsed CLI arguments and paths to helper executables, reads config and cloud settings, resolves models and permissions, sets up auth, telemetry, logging, state storage, and the in-process app server environment, then passes a packed `ExecRunArgs` object to `run_exec_session`. It returns success or an error, and for some user-facing setup failures it prints to stderr and exits immediately.
 
-**Call relations**: Invoked by `main` after arg0 dispatch and top-level CLI parsing. It delegates config retry logic to `build_exec_config`, bootstrap TOML loading to `load_bootstrap_config_or_exit`, and the actual thread/turn lifecycle to `run_exec_session`; all earlier work exists to prepare those calls with fully resolved runtime state.
+**Call relations**: This is the top-level coordinator. It calls setup helpers such as `load_bootstrap_config_or_exit`, `build_exec_config`, `exec_root_span`, and `exec_stderr_env_filter`, then hands off the actual conversation flow to `run_exec_session`.
 
 *Call graph*: calls 18 internal fn (default, find_codex_home, resolve_oss_provider, install_sqlite_telemetry, record_process_start, from_codex_home, from_env, from_optional_paths, build_exec_config, exec_root_span (+8 more)); 22 external calls (default, new, anyhow!, removed_full_auto_warning, cloud_config_bundle_loader_for_storage, check_execpolicy_for_warnings, resolve_bootstrap_auth_keyring_backend_kind, init_state_db, enforce_login_restrictions, set_parent_from_context (+12 more)).
 
@@ -307,11 +309,11 @@ async fn build_exec_config(
 ) -> std::io::Result<Config>
 ```
 
-**Purpose**: Builds the final `Config` while compensating for a headless-only approval-policy override that is invalid when the resolved reviewer is `AutoReview`. It retries without the synthetic `approval_policy = never` in that specific case.
+**Purpose**: Builds the final configuration while respecting a special exec-mode default: headless runs normally should not pause to ask for approvals. It also backs off that default when auto-review approval behavior needs to be preserved.
 
-**Data flow**: Accepts `ConfigOverrides`, a `preserve_headless_approval_policy` flag, and a `build_config` closure. It first tries `build_config(overrides.clone())`; depending on success/failure and the resolved `approvals_reviewer`, it may call the closure again with `approval_policy: None`. It returns the chosen `Config` or preserves the original I/O error when retry does not justify replacing it.
+**Data flow**: It receives config overrides, a flag saying whether to preserve the headless approval choice, and a config-building function. It tries to build with the exec defaults, may retry without the forced approval policy, and returns the chosen config or the original error.
 
-**Call relations**: Used only by `run_main` after assembling CLI and harness overrides. Its retry path exists because exec defaults to non-interactive approvals, but auto-review configurations must retain their configured approval policy instead of the synthetic headless one.
+**Call relations**: `run_main` uses this after preparing all config inputs. It exists so approval behavior is chosen carefully before any session is started.
 
 *Call graph*: called by 1 (run_main); 1 external calls (clone).
 
@@ -326,11 +328,11 @@ async fn load_bootstrap_config_or_exit(
     loader_overrides: LoaderOverrides,
 ```
 
-**Purpose**: Loads layered `config.toml` state needed during early startup and terminates the process with a formatted error if loading fails. It is intentionally bootstrap-focused and returns the TOML-layer result rather than a full `Config`.
+**Purpose**: Loads the early, partial configuration needed before the full config can be built. If the config is invalid, it prints a readable error and stops the process.
 
-**Data flow**: Takes codex home, optional cwd, parsed CLI key/value overrides, `LoaderOverrides`, strictness, and a `CloudConfigBundleLoader`. It calls `load_config_toml_with_layer_stack`; on success it returns `ConfigTomlLoadResult`. On failure it inspects whether the error wraps `ConfigLoadError`, formats source-aware diagnostics when possible, prints to stderr, and exits.
+**Data flow**: It receives the Codex home path, current working directory, command-line config overrides, loader options, strictness, and cloud config loader. It calls the config loader, returns the loaded TOML-layer result on success, or formats the failure for stderr and exits.
 
-**Call relations**: Called by `run_main` first without cloud config and sometimes again with cloud config available, because OSS provider resolution may require a second bootstrap pass after auth/base-url settings are known.
+**Call relations**: `run_main` calls this during startup, before it knows enough to build the complete runtime configuration.
 
 *Call graph*: calls 1 internal fn (load_config_toml_with_layer_stack); called by 1 (run_main); 2 external calls (eprintln!, exit).
 
@@ -341,11 +343,11 @@ async fn load_bootstrap_config_or_exit(
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs one non-interactive exec session against the in-process app-server: choose output mode, start or resume a thread, send the initial turn or review request, process streamed events, and determine exit status. This is the runtime loop after all startup preparation is complete.
+**Purpose**: Runs one actual exec session: start or resume a thread, send the prompt or review request, process server events, handle interrupts, and print final output. This is the core execution loop.
 
-**Data flow**: Consumes `ExecRunArgs`, reading config, prompt/review inputs, image paths, output schema path, git repo state, and app-server startup args. It constructs an `EventProcessor`, may validate OSS provider readiness, resolves the initial operation into `UserInput` items or a `ReviewRequest`, starts `InProcessAppServerClient`, sends `thread/start` or `thread/resume`, synthesizes `SessionConfiguredEvent`, sends `turn/start` or `review/start`, then loops over Ctrl-C and `client.next_event()`. It mutates `error_seen`, request IDs, and event-processor state; writes warnings/final output through the processor; may send interrupt, thread-read backfill, and unsubscribe requests; and exits with code 1 if a fatal turn/server error was observed.
+**Data flow**: It receives all prepared runtime arguments. It creates the right event processor for human or JSON output, checks local OSS readiness if needed, builds the initial operation, starts the app-server client, starts or resumes a thread, sends a turn or review request, then loops over server events until completion or shutdown. It may write warnings to stderr, print final output through the event processor, shut down the client, and exit with code 1 if a fatal turn error occurred.
 
-**Call relations**: Called by `run_main` once startup has produced a complete `ExecRunArgs`. Inside, it delegates request construction to thread param helpers, resume lookup to `resolve_resume_thread_id`, protocol bootstrap mapping to the `session_configured_from_*` helpers, notification filtering to `should_process_notification`, backfill to `maybe_backfill_turn_completed_items`, unsupported server-request handling to `handle_server_request`, and shutdown unsubscribe to `request_shutdown`.
+**Call relations**: `run_main` hands control to this after setup. Inside, it uses many small helpers for thread parameters, prompt resolution, review conversion, resume lookup, notification filtering, server-request rejection, event backfill, and shutdown.
 
 *Call graph*: calls 20 internal fn (start, new, build_review_request, create_with_ansi, new, handle_server_request, lagged_event_warning_message, load_output_schema, maybe_backfill_turn_completed_items, request_shutdown (+10 more)); called by 1 (run_main); 18 external calls (new, TurnStarted, new, anyhow!, system_bwrap_warning, user_facing_hint, get_git_repo_root, ensure_oss_provider_ready, eprintln!, error! (+8 more)).
 
@@ -356,11 +358,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()>
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams
 ```
 
-**Purpose**: Builds `ThreadStartParams` from the resolved exec configuration, including model/provider, cwd, workspace roots, approval settings, and either a permission-profile selection or a legacy sandbox mode. It encodes the startup thread as a user-originated thread.
+**Purpose**: Turns the resolved Codex config into the app-server parameters needed to start a new thread. It makes sure model, working directory, permissions, sandbox, and small config overrides travel with the request.
 
-**Data flow**: Reads fields from `&Config`: model, provider ID, cwd, workspace roots, approval policy, reviewer, effective permission profile, active permission profile, bypass-hook-trust, and ephemeral flag. It computes `permissions` via `permissions_selection_from_config`; if absent, it computes `sandbox` from the effective permission profile and cwd. It returns a populated `ThreadStartParams` with `thread_source: Some(ThreadSource::User)` and defaults for unspecified fields.
+**Data flow**: It reads fields from `Config`, chooses either a named permission profile or an older sandbox mode, and returns a `ThreadStartParams` value filled for the app server.
 
-**Call relations**: Used by `run_exec_session` when starting a fresh thread. It delegates small pieces of translation to `permissions_selection_from_config`, `sandbox_mode_from_permission_profile`, `approvals_reviewer_override_from_config`, and `thread_config_overrides_from_config`.
+**Call relations**: `run_exec_session` calls this whenever it needs a fresh thread. It relies on `permissions_selection_from_config`, `sandbox_mode_from_permission_profile`, `approvals_reviewer_override_from_config`, and `thread_config_overrides_from_config` to translate specific parts.
 
 *Call graph*: calls 3 internal fn (approvals_reviewer_override_from_config, permissions_selection_from_config, thread_config_overrides_from_config); called by 1 (run_exec_session); 1 external calls (default).
 
@@ -371,11 +373,11 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams
 fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams
 ```
 
-**Purpose**: Builds `ThreadResumeParams` for resuming an existing thread while applying the current exec configuration's model, cwd, approval, permission, and config overrides. It mirrors thread-start behavior but includes the target thread ID.
+**Purpose**: Builds the app-server parameters needed to resume an existing thread with the current exec settings. This lets a resumed run still inherit today's model, directory, and permission choices.
 
-**Data flow**: Consumes `&Config` and a `thread_id: String`. It reads the same config fields as thread-start, computes `permissions` and fallback `sandbox`, and returns `ThreadResumeParams` containing the supplied thread ID plus current lifecycle overrides.
+**Data flow**: It receives the current config and the thread ID to resume, reads the same policy and runtime fields used for new threads, and returns a `ThreadResumeParams` request body.
 
-**Call relations**: Called by `run_exec_session` only on the resume path after `resolve_resume_thread_id` has identified a thread to continue. It shares the same helper translations as `thread_start_params_from_config`.
+**Call relations**: `run_exec_session` calls this after `resolve_resume_thread_id` finds a thread. It shares the same translation helpers used by `thread_start_params_from_config`.
 
 *Call graph*: calls 3 internal fn (approvals_reviewer_override_from_config, permissions_selection_from_config, thread_config_overrides_from_config); called by 1 (run_exec_session); 1 external calls (default).
 
@@ -386,11 +388,11 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
 fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>>
 ```
 
-**Purpose**: Extracts exec-specific thread config overrides that must be sent as arbitrary JSON config values. Currently this only preserves hook-trust bypass.
+**Purpose**: Extracts small thread-level config switches that need to be sent explicitly to the app server. Currently it sends the bypass-hook-trust flag when that option is enabled.
 
-**Data flow**: Reads `config.bypass_hook_trust`; if true, returns `Some(HashMap<String, Value>)` containing `"bypass_hook_trust": true`, otherwise returns `None`.
+**Data flow**: It reads `config.bypass_hook_trust`. If true, it returns a map containing that setting; otherwise it returns nothing.
 
-**Call relations**: Used by both thread lifecycle param builders so start and resume requests carry the same hook-trust override when the CLI/config enabled it.
+**Call relations**: Both thread-start and thread-resume parameter builders call this so the app server sees the same hook-trust choice in either path.
 
 *Call graph*: called by 2 (thread_resume_params_from_config, thread_start_params_from_config).
 
@@ -401,11 +403,11 @@ fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String
 fn permissions_selection_from_config(config: &Config) -> Option<String>
 ```
 
-**Purpose**: Converts the active permission profile, when present, into the string identifier expected by app-server thread lifecycle APIs. It suppresses legacy sandbox translation when a profile is active.
+**Purpose**: Finds the active named permission profile, if one is selected. A permission profile is a named bundle of rules about what the agent may read, write, or run.
 
-**Data flow**: Reads `config.permissions.active_permission_profile()`. If present, maps it through `permission_profile_id_from_active_profile`; otherwise returns `None`.
+**Data flow**: It reads the permissions section of the config, asks for the active profile, converts it to its ID string if present, and returns that ID or nothing.
 
-**Call relations**: Called by both thread-start and thread-resume param builders to decide whether to send a profile selection string or fall back to explicit sandbox mode.
+**Call relations**: The thread parameter builders call this first. If it returns a profile ID, they send that instead of manually translating to a sandbox mode.
 
 *Call graph*: called by 2 (thread_resume_params_from_config, thread_start_params_from_config).
 
@@ -416,11 +418,11 @@ fn permissions_selection_from_config(config: &Config) -> Option<String>
 fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) -> String
 ```
 
-**Purpose**: Extracts the stable profile ID string from an `ActivePermissionProfile`. It intentionally ignores any other metadata on the active profile wrapper.
+**Purpose**: Pulls the plain ID string out of an active permission profile. This is the value the app server needs when selecting a profile by name.
 
-**Data flow**: Consumes `ActivePermissionProfile` by value and returns its `id` field as `String`.
+**Data flow**: It receives an `ActivePermissionProfile`, reads its `id` field, and returns that string.
 
-**Call relations**: Used as the mapping step inside `permissions_selection_from_config`; it isolates the exact selection semantics for tests and future callers.
+**Call relations**: It is used as the conversion step inside `permissions_selection_from_config` when a profile exists.
 
 
 ##### `sandbox_mode_from_permission_profile`  (lines 1105–1128)
@@ -432,11 +434,11 @@ fn sandbox_mode_from_permission_profile(
 ) -> Option<codex_app_server_protocol::SandboxMode>
 ```
 
-**Purpose**: Derives the legacy app-server sandbox mode from a core `PermissionProfile` and cwd when no active permission-profile selection is being sent. The mapping preserves distinctions between disabled, external, and managed profiles.
+**Purpose**: Converts a detailed permission profile into a simpler sandbox mode for older app-server fields. A sandbox is the protective boundary that limits file and network access.
 
-**Data flow**: Reads the provided `PermissionProfile` and `cwd`. For `Disabled`, returns `DangerFullAccess`; for `External`, returns `None`; for `Managed`, inspects filesystem and network sandbox policies to choose `DangerFullAccess`, `WorkspaceWrite`, or `ReadOnly`. It returns `Option<codex_app_server_protocol::SandboxMode>`.
+**Data flow**: It receives a permission profile and current working directory. Disabled permissions become full access, external profiles do not become a sandbox value, and managed profiles are inspected to choose full access, workspace write, or read-only based on file and network rules.
 
-**Call relations**: Called by both thread lifecycle param builders only when `permissions_selection_from_config` returned `None`, providing backward-compatible sandbox semantics for older or profile-less configurations.
+**Call relations**: The thread start and resume builders use this only when they are not sending a named permission profile. It is the compatibility bridge from rich permissions to simpler server settings.
 
 *Call graph*: calls 2 internal fn (file_system_sandbox_policy, network_sandbox_policy).
 
@@ -449,11 +451,11 @@ fn approvals_reviewer_override_from_config(
 ) -> Option<codex_app_server_protocol::ApprovalsReviewer>
 ```
 
-**Purpose**: Converts the resolved core approvals reviewer into the app-server protocol enum wrapper expected on thread lifecycle requests. It always returns `Some(...)`.
+**Purpose**: Converts the configured approvals reviewer into the app-server format. The approvals reviewer controls who, if anyone, can review sensitive actions.
 
-**Data flow**: Reads `config.approvals_reviewer`, converts it with `Into`, and wraps it in `Some`.
+**Data flow**: It reads `config.approvals_reviewer`, converts it to the protocol type, wraps it in `Some`, and returns it.
 
-**Call relations**: Used by both thread-start and thread-resume param builders so the app-server sees the same reviewer mode that exec resolved locally.
+**Call relations**: Both thread parameter builders call this so new and resumed threads use the configured reviewer choice.
 
 *Call graph*: called by 2 (thread_resume_params_from_config, thread_start_params_from_config).
 
@@ -468,11 +470,11 @@ async fn send_request_with_response(
 ) -> Result<T, String>
 ```
 
-**Purpose**: Sends a typed client request to the in-process app-server and annotates any error with the RPC method name. It centralizes the common request/response pattern used throughout exec.
+**Purpose**: Sends a typed request to the in-process app server and turns the typed response back into the caller's expected Rust type. It also adds the method name to errors so failures are easier to understand.
 
-**Data flow**: Takes `&InProcessAppServerClient`, a `ClientRequest`, and a method label. It awaits `client.request_typed(request)` and returns `Result<T, String>`, converting transport/protocol errors into either the raw string or `"{method}: {err}"`.
+**Data flow**: It receives a client, a request, and a human-readable method name. It sends the request through the client, tries to decode the response as the requested type, and returns either the decoded response or a string error.
 
-**Call relations**: This helper is the common outbound RPC path for `run_exec_session`, `resolve_resume_thread_id`, `maybe_backfill_turn_completed_items`, and `request_shutdown`, reducing repeated error formatting around app-server calls.
+**Call relations**: `run_exec_session` uses this for start, resume, turn, review, interrupt, and read requests. `resolve_resume_thread_id` also uses it while searching thread lists.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 2 (resolve_resume_thread_id, run_exec_session).
 
@@ -486,11 +488,11 @@ fn session_configured_from_thread_start_response(
 ) -> Result<SessionConfiguredEvent, String>
 ```
 
-**Purpose**: Builds a local `SessionConfiguredEvent` from a `ThreadStartResponse`, using the response as the authoritative bootstrap payload instead of waiting for a streamed session-configured event. It preserves response-derived review policy and thread metadata.
+**Purpose**: Turns a successful thread-start response into the older `SessionConfiguredEvent` shape used by the output processors. This avoids waiting for a separate streamed startup event.
 
-**Data flow**: Reads fields from `ThreadStartResponse` plus the effective permission profile from `&Config`, then forwards them into `session_configured_from_thread_response`. Returns `Result<SessionConfiguredEvent, String>`.
+**Data flow**: It receives the thread-start response and current config, extracts IDs, model, policy, directory, and permission details, then delegates to the shared session-mapping function.
 
-**Call relations**: Called by `run_exec_session` immediately after `thread/start` succeeds so config summary output and tracing can proceed without startup latency from waiting on later notifications.
+**Call relations**: `run_exec_session` calls this immediately after starting a thread so it can print the effective session configuration and tag telemetry.
 
 *Call graph*: calls 1 internal fn (session_configured_from_thread_response); called by 1 (run_exec_session).
 
@@ -504,11 +506,11 @@ fn session_configured_from_thread_resume_response(
 ) -> Result<SessionConfiguredEvent, String>
 ```
 
-**Purpose**: Builds a local `SessionConfiguredEvent` from a `ThreadResumeResponse` using the same bootstrap shortcut as thread start. It adapts resumed-thread metadata into the core event shape expected by output processors.
+**Purpose**: Turns a successful thread-resume response into the `SessionConfiguredEvent` shape used by the rest of exec. It gives resumed sessions the same bootstrap information as new ones.
 
-**Data flow**: Reads session/thread IDs, parent/source/name/path, model/provider/service tier, approval settings, active permission profile, cwd, and reasoning effort from `ThreadResumeResponse`, combines them with the config's effective permission profile, and returns the mapped `SessionConfiguredEvent` or a validation error string.
+**Data flow**: It receives the resume response and config, extracts thread/session fields and policy details, then delegates to the shared session-mapping function.
 
-**Call relations**: Used by `run_exec_session` on the resume path after `thread/resume`, parallel to the thread-start helper.
+**Call relations**: `run_exec_session` calls this after resuming a thread, parallel to the start-thread path.
 
 *Call graph*: calls 1 internal fn (session_configured_from_thread_response); called by 1 (run_exec_session).
 
@@ -519,11 +521,11 @@ fn session_configured_from_thread_resume_response(
 fn review_target_to_api(target: ReviewTarget) -> ApiReviewTarget
 ```
 
-**Purpose**: Converts the core `ReviewTarget` enum used by exec CLI logic into the app-server protocol's `ReviewTarget` enum. The mapping is variant-for-variant.
+**Purpose**: Converts exec's internal review target into the app-server protocol's review target. The meaning stays the same; only the type changes.
 
-**Data flow**: Consumes a `ReviewTarget` and returns the corresponding `ApiReviewTarget`, preserving branch names, commit SHA/title, or custom instructions.
+**Data flow**: It receives a review target such as uncommitted changes, base branch, commit, or custom instructions, and returns the matching API target with the same data.
 
-**Call relations**: Called by `run_exec_session` only when the initial operation is a review, just before sending `ClientRequest::ReviewStart`.
+**Call relations**: `run_exec_session` calls this when sending a `review/start` request after `build_review_request` has interpreted the CLI review arguments.
 
 *Call graph*: called by 1 (run_exec_session).
 
@@ -539,11 +541,11 @@ fn session_configured_from_thread_response(
     thread
 ```
 
-**Purpose**: Performs the actual field-by-field conversion from app-server thread lifecycle response data into a core `SessionConfiguredEvent`, validating string IDs into typed `SessionId` and `ThreadId`. It is the shared implementation behind both start and resume bootstrap mapping.
+**Purpose**: Builds a complete `SessionConfiguredEvent` from raw thread response fields. It also validates that session and thread IDs are in the expected format.
 
-**Data flow**: Accepts explicit scalar and optional fields for session/thread IDs, parent thread, source, name, rollout path, model/provider/service tier, approval settings, permission profile data, cwd, and reasoning effort. It parses IDs with `SessionId::from_string` and `ThreadId::from_string`, propagates parse failures as descriptive `String`s, and returns a fully populated `SessionConfiguredEvent` with `forked_from_id`, `initial_messages`, and `network_proxy` set to `None`.
+**Data flow**: It receives explicit fields for IDs, names, paths, model, policies, permissions, working directory, and reasoning effort. It parses string IDs into strong ID types, returns an error if parsing fails, and otherwise returns the assembled session event.
 
-**Call relations**: Called by both `session_configured_from_thread_start_response` and `session_configured_from_thread_resume_response` so the two response types share identical validation and event construction.
+**Call relations**: The start-response and resume-response converters both call this so all session bootstrap events are built consistently.
 
 *Call graph*: calls 2 internal fn (from_string, from_string); called by 2 (session_configured_from_thread_resume_response, session_configured_from_thread_start_response).
 
@@ -554,11 +556,11 @@ fn session_configured_from_thread_response(
 fn lagged_event_warning_message(skipped: usize) -> String
 ```
 
-**Purpose**: Formats the warning shown when the in-process event stream reports dropped events due to lag. The message is explicit about the number of skipped events.
+**Purpose**: Creates the warning text shown when the in-process event stream fell behind and dropped events. This tells the user that some progress details may be missing.
 
-**Data flow**: Takes `skipped: usize` and returns a formatted `String` mentioning the dropped count.
+**Data flow**: It receives the number of skipped events and returns a formatted warning string.
 
-**Call relations**: Used by `run_exec_session` when it receives `InProcessServerEvent::Lagged`, before logging and forwarding the warning to the active event processor.
+**Call relations**: `run_exec_session` calls this when the client reports a lagged event stream, then logs and forwards the warning to the event processor.
 
 *Call graph*: called by 1 (run_exec_session); 1 external calls (format!).
 
@@ -573,11 +575,11 @@ fn should_process_notification(
 ) -> bool
 ```
 
-**Purpose**: Filters app-server notifications down to those relevant to the primary thread and active turn, while still allowing global config/deprecation warnings through. It prevents unrelated thread activity from polluting exec output.
+**Purpose**: Decides whether a server notification belongs to the thread and turn this exec run is responsible for. This prevents unrelated background or sub-thread events from polluting the output.
 
-**Data flow**: Reads a `ServerNotification` plus the current `thread_id` and `turn_id`. It pattern-matches notification variants and returns `true` only for globally relevant warnings or notifications whose embedded thread/turn identifiers match the active session, with special handling for optional turn IDs on hook events and optional thread IDs on warnings.
+**Data flow**: It receives a notification plus the current thread ID and turn ID. It allows global warnings and config notices, checks thread and turn IDs for turn-specific messages, and returns true only for messages exec should show.
 
-**Call relations**: Called inside the main event loop in `run_exec_session` after optional backfill. Only notifications passing this predicate are handed to the selected `EventProcessor`.
+**Call relations**: `run_exec_session` calls this for every server notification before handing it to the human or JSON event processor.
 
 *Call graph*: called by 1 (run_exec_session).
 
@@ -593,11 +595,11 @@ async fn maybe_backfill_turn_completed_items(
 )
 ```
 
-**Purpose**: Repairs `TurnCompleted` notifications that arrive with empty `turn.items` by issuing a final `thread/read` against rollout-backed history. This lets exec recover final messages and reconcile in-progress items that may have been dropped under backpressure.
+**Purpose**: Repairs a final turn-completed notification if its item list is empty because earlier item events were dropped. It reads the saved thread history and copies the final turn items back into the notification.
 
-**Data flow**: Takes the thread's `ephemeral` flag, client handle, mutable request-ID sequencer, and mutable `ServerNotification`. It first checks `should_backfill_turn_completed_items`; if the notification is a qualifying `TurnCompleted`, it sends `thread/read` with `include_turns: true`, looks up the matching turn via `turn_items_for_thread`, and mutates `payload.turn.items` in place when found. On request failure it logs a warning and leaves the notification unchanged.
+**Data flow**: It receives whether the thread is ephemeral, the app-server client, request ID counter, and a mutable notification. If backfill is safe and needed, it sends a `thread/read` request, finds the matching turn, and updates the notification's item list; on failure it only logs a warning.
 
-**Call relations**: Invoked by `run_exec_session` before notification filtering/processing so downstream event processors see the best available terminal turn payload. It delegates the eligibility check and turn-item extraction to dedicated helpers.
+**Call relations**: `run_exec_session` calls this before processing each notification. It uses `should_backfill_turn_completed_items`, `RequestIdSequencer::next`, `send_request_with_response`, and `turn_items_for_thread`.
 
 *Call graph*: calls 3 internal fn (next, should_backfill_turn_completed_items, turn_items_for_thread); called by 1 (run_exec_session); 1 external calls (warn!).
 
@@ -611,11 +613,11 @@ fn should_backfill_turn_completed_items(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a `TurnCompleted` notification is eligible for item backfill. The rule is intentionally conservative: only non-ephemeral threads with empty terminal item lists qualify.
+**Purpose**: Checks whether a turn-completed notification is eligible for backfilling. Backfill is only safe for non-ephemeral threads with saved history.
 
-**Data flow**: Reads `thread_ephemeral` and a `ServerNotification`. It returns `true` only when the notification is `ServerNotification::TurnCompleted`, `thread_ephemeral` is false, and `payload.turn.items.is_empty()`.
+**Data flow**: It receives the thread's ephemeral flag and a notification. It returns true only if the notification is a turn completion, the thread is not ephemeral, and the completion currently has no items.
 
-**Call relations**: Used exclusively by `maybe_backfill_turn_completed_items` to avoid unnecessary `thread/read` calls and to skip ephemeral threads that cannot safely recover rollout-backed history.
+**Call relations**: `maybe_backfill_turn_completed_items` calls this before doing any extra server read.
 
 *Call graph*: called by 1 (maybe_backfill_turn_completed_items).
 
@@ -629,11 +631,11 @@ fn turn_items_for_thread(
 ) -> Option<Vec<AppServerThreadItem>>
 ```
 
-**Purpose**: Extracts the item list for a specific turn from an app-server thread snapshot. It is a simple lookup helper used during turn-completion backfill.
+**Purpose**: Finds the saved items for one turn inside a thread history. These items are what exec may copy into a sparse turn-completed event.
 
-**Data flow**: Reads `&AppServerThread` and `turn_id: &str`, scans `thread.turns` for a matching turn ID, and returns `Some(turn.items.clone())` or `None`.
+**Data flow**: It receives a thread object and a turn ID, searches the thread's turns for that ID, and returns a cloned item list if found.
 
-**Call relations**: Called by `maybe_backfill_turn_completed_items` after a successful `thread/read` to splice recovered items into the terminal notification.
+**Call relations**: `maybe_backfill_turn_completed_items` calls this after `thread/read` succeeds.
 
 *Call graph*: called by 1 (maybe_backfill_turn_completed_items).
 
@@ -644,11 +646,11 @@ fn turn_items_for_thread(
 fn all_thread_source_kinds() -> Vec<ThreadSourceKind>
 ```
 
-**Purpose**: Returns the complete set of thread source kinds that exec considers when searching for resumable threads. This broad list ensures resume can find threads created by exec itself and related subagent flows.
+**Purpose**: Returns the full set of thread source categories that resume lookup should search. A source category says where a thread originally came from, such as CLI, VS Code, exec, or sub-agent.
 
-**Data flow**: Takes no inputs and returns a `Vec<ThreadSourceKind>` containing CLI, VS Code, Exec, AppServer, multiple subagent variants, and Unknown.
+**Data flow**: It takes no input and returns a vector containing every relevant `ThreadSourceKind` value.
 
-**Call relations**: Used by `resolve_resume_thread_id` when issuing `thread/list` requests so searches are not accidentally narrowed to only one source kind.
+**Call relations**: `resolve_resume_thread_id` uses this while listing threads so resume-by-last or resume-by-name is not limited to only one source type.
 
 *Call graph*: called by 1 (resolve_resume_thread_id); 1 external calls (vec!).
 
@@ -659,11 +661,11 @@ fn all_thread_source_kinds() -> Vec<ThreadSourceKind>
 async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf
 ```
 
-**Purpose**: Determines the most accurate cwd for a thread by preferring the latest `TurnContext` entry from its rollout file when available, falling back to the thread's stored cwd otherwise. This avoids mismatches when cwd changed during the thread's lifetime.
+**Purpose**: Determines the latest working directory for a thread. It prefers the newest turn context in the rollout file, falling back to the thread's stored directory.
 
-**Data flow**: Reads `thread.path` and `thread.cwd`. If a rollout path exists and `parse_latest_turn_context_cwd` returns a cwd, it returns that path; otherwise it clones and returns `thread.cwd` as `PathBuf`.
+**Data flow**: It receives a thread. If the thread has a history file path and that file contains a recent turn context with a directory, it returns that directory; otherwise it returns the thread's `cwd`.
 
-**Call relations**: Called by `resolve_resume_thread_id` while filtering candidate threads by cwd, especially for `--last` and named-session searches.
+**Call relations**: `resolve_resume_thread_id` uses this when deciding whether a candidate thread belongs to the current directory. It delegates file parsing to `parse_latest_turn_context_cwd`.
 
 *Call graph*: calls 1 internal fn (parse_latest_turn_context_cwd); called by 1 (resolve_resume_thread_id).
 
@@ -674,11 +676,11 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf>
 ```
 
-**Purpose**: Scans a rollout JSONL file from the end to find the most recent `TurnContext` item and extract its cwd. It tolerates blank lines and unrelated or malformed JSONL entries.
+**Purpose**: Reads a thread rollout file and finds the most recent saved working directory. A rollout file is a line-by-line record of thread events.
 
-**Data flow**: Takes a rollout `&Path`, asynchronously reads the file to string, iterates lines in reverse, trims and skips empties, attempts to deserialize each line as `RolloutLine`, and returns `Some(item.cwd)` for the first `RolloutItem::TurnContext` found. Any read or parse failure on individual lines is ignored; total failure yields `None`.
+**Data flow**: It receives a path, reads the file as text, walks lines from the bottom upward, parses JSON lines until it finds a turn-context item, and returns that item's directory. If reading or parsing does not find one, it returns nothing.
 
-**Call relations**: Used only by `latest_thread_cwd` to refine cwd matching during resume lookup.
+**Call relations**: `latest_thread_cwd` calls this as its more accurate source of a thread's current directory.
 
 *Call graph*: called by 1 (latest_thread_cwd); 1 external calls (read_to_string).
 
@@ -689,11 +691,11 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf>
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool
 ```
 
-**Purpose**: Compares the current cwd and a candidate session cwd using normalized path semantics rather than raw string equality. This avoids false mismatches from path formatting differences.
+**Purpose**: Compares two working-directory paths after normalizing them. This avoids false mismatches caused by small path spelling differences.
 
-**Data flow**: Reads two `&Path` values and returns the boolean result of `path_utils::paths_match_after_normalization`.
+**Data flow**: It receives the current directory and a session directory, delegates normalized comparison to path utilities, and returns true if they refer to the same place.
 
-**Call relations**: Called by `resolve_resume_thread_id` whenever resume lookup needs to restrict candidates to the current working directory unless `--all` was requested.
+**Call relations**: `resolve_resume_thread_id` uses this to avoid resuming a thread from a different project unless the user asked to search all directories.
 
 *Call graph*: called by 1 (resolve_resume_thread_id); 1 external calls (paths_match_after_normalization).
 
@@ -709,11 +711,11 @@ async fn resolve_resume_thread_id(
 ) -> anyhow::Result<Option<Strin
 ```
 
-**Purpose**: Finds the thread ID to resume based on `resume` CLI arguments, using a layered strategy across recent-thread listing, exact UUID/session ID handling, state DB title lookup, metadata lookup by name, and finally paginated server-side search. It also enforces cwd scoping unless `--all` is set.
+**Purpose**: Finds which thread should be resumed for the `resume` command. It supports resuming the last matching thread, a UUID-like ID, an exact title from the state database, or a searched thread name.
 
-**Data flow**: Consumes the app-server client, resolved `Config`, optional `StateDbHandle`, and `ResumeArgs`. It first computes optional model-provider filters via `resume_lookup_model_providers`. For `--last`, it pages through `thread/list` sorted by `UpdatedAt`, computes each candidate's latest cwd via `latest_thread_cwd`, and returns the first matching thread ID. For named resumes, it treats a UUID-looking session ID as already-resolved, otherwise queries state DB exact-title lookup, then `find_thread_meta_by_name_str`, then paginated `thread/list` search by term and exact thread name match. It returns `anyhow::Result<Option<String>>`.
+**Data flow**: It receives the app-server client, config, optional state database, and resume arguments. Depending on the arguments, it lists recent threads page by page, checks directories, tries direct UUID parsing, searches the local state database, and finally searches server thread lists by name. It returns the selected thread ID or `None` if no match is found.
 
-**Call relations**: Called by `run_exec_session` only on the resume subcommand before deciding whether to send `thread/resume` or fall back to `thread/start`. It delegates provider filtering, cwd comparison, rollout cwd extraction, and outbound RPCs to dedicated helpers.
+**Call relations**: `run_exec_session` calls this before deciding whether to send `thread/resume` or start a new thread. It uses helpers for provider filtering, source kinds, latest directories, path matching, and app-server requests.
 
 *Call graph*: calls 5 internal fn (all_thread_source_kinds, cwds_match, latest_thread_cwd, resume_lookup_model_providers, send_request_with_response); called by 1 (run_exec_session); 3 external calls (parse_str, Integer, find_thread_meta_by_name_str).
 
@@ -727,11 +729,11 @@ fn resume_lookup_model_providers(
 ) -> Option<Vec<String>>
 ```
 
-**Purpose**: Determines whether resume lookup should be restricted to the current model provider. Only `--last` lookups are narrowed this way.
+**Purpose**: Chooses whether resume lookup should be limited to the current model provider. For `--last`, it narrows the search to the active provider; other lookup modes search more broadly.
 
-**Data flow**: Reads `config.model_provider_id` and `ResumeArgs`. Returns `Some(vec![provider_id])` when `args.last` is true; otherwise returns `None`.
+**Data flow**: It receives config and resume arguments. If `last` is true, it returns a one-item provider list from the current config; otherwise it returns nothing.
 
-**Call relations**: Used by `resolve_resume_thread_id` to shape `thread/list` queries. The narrower filter helps `--last` prefer the most recent thread for the current provider without affecting explicit named-session searches.
+**Call relations**: `resolve_resume_thread_id` calls this before listing threads so last-thread lookup behaves predictably for the active provider.
 
 *Call graph*: called by 1 (resolve_resume_thread_id); 1 external calls (vec!).
 
@@ -742,11 +744,11 @@ fn resume_lookup_model_providers(
 fn canceled_mcp_server_elicitation_response() -> Result<Value, String>
 ```
 
-**Purpose**: Builds the serialized JSON response payload that tells the server an MCP elicitation request was canceled. Exec uses this instead of surfacing interactive elicitation to the user.
+**Purpose**: Builds the standard response that cancels an MCP server elicitation. MCP here means a tool/server integration asking the user for extra input; exec mode is non-interactive, so it cancels instead of prompting.
 
-**Data flow**: Constructs `McpServerElicitationRequestResponse { action: Cancel, content: None, meta: None }`, serializes it to `serde_json::Value`, and returns `Result<Value, String>` with a formatted serialization error on failure.
+**Data flow**: It creates a response object with action `Cancel`, converts it to JSON, and returns that JSON or an encoding error string.
 
-**Call relations**: Called by `handle_server_request` when the app-server asks for MCP elicitation input; the resulting JSON is passed to `resolve_server_request`.
+**Call relations**: `handle_server_request` calls this when the app server asks for MCP elicitation, then resolves the server request with the cancel response.
 
 *Call graph*: called by 1 (handle_server_request); 1 external calls (to_value).
 
@@ -761,11 +763,11 @@ async fn request_shutdown(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Requests thread unsubscription during graceful shutdown so the app-server can stop sending events for the active thread. It wraps the unsubscribe RPC and discards the typed response body.
+**Purpose**: Asks the app server to unsubscribe exec from the current thread. This is the polite shutdown path when the output processor says it is done.
 
-**Data flow**: Takes the client, mutable request-ID sequencer, and active `thread_id`. It builds `ClientRequest::ThreadUnsubscribe` with a fresh request ID, sends it through `send_request_with_response::<ThreadUnsubscribeResponse>`, and maps success to `Ok(())`.
+**Data flow**: It receives the client, request ID counter, and thread ID. It creates a `thread/unsubscribe` request with the next ID, sends it, and returns success once the server acknowledges.
 
-**Call relations**: Called by `run_exec_session` when the event processor returns `CodexStatus::InitiateShutdown`, typically after terminal turn completion or failure.
+**Call relations**: `run_exec_session` calls this when event processing requests shutdown, such as after final output has been produced.
 
 *Call graph*: calls 1 internal fn (next); called by 1 (run_exec_session).
 
@@ -781,11 +783,11 @@ async fn resolve_server_request(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Sends a successful response to a server-initiated request and annotates transport errors with the method name. It is the positive-response counterpart to request rejection.
+**Purpose**: Sends a successful answer back to a pending request that the server made to the client. In exec mode this is mainly used for automatic cancellation responses.
 
-**Data flow**: Consumes the client, `request_id`, serialized response `Value`, and method label. It awaits `client.resolve_server_request` and returns `Result<(), String>` with a formatted failure message if the response could not be delivered.
+**Data flow**: It receives the client, server request ID, JSON value to return, and method name. It asks the client to resolve the request and returns either success or a formatted error.
 
-**Call relations**: Used by `handle_server_request` for the one supported automatic server-request path in exec mode: canceling MCP elicitation requests.
+**Call relations**: `handle_server_request` uses this for MCP elicitation requests after creating a cancel response.
 
 *Call graph*: calls 1 internal fn (resolve_server_request); called by 1 (handle_server_request).
 
@@ -801,11 +803,11 @@ async fn reject_server_request(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Rejects a server-initiated request with a generic JSON-RPC application error explaining why exec mode does not support it. It standardizes the rejection code and formatting.
+**Purpose**: Rejects a server request with a JSON-RPC error. JSON-RPC is a request/response protocol; this sends a structured error instead of a result.
 
-**Data flow**: Takes the client, `request_id`, method label, and human-readable reason. It constructs `JSONRPCErrorError { code: -32000, message: reason, data: None }`, sends it via `client.reject_server_request`, and returns `Result<(), String>` with method-qualified transport errors.
+**Data flow**: It receives the client, request ID, method name, and rejection reason. It wraps the reason in a protocol error object, sends it to the client, and returns success or a formatted failure.
 
-**Call relations**: Called by `handle_server_request` for all unsupported interactive approval/input/auth/attestation request variants.
+**Call relations**: `handle_server_request` uses this for interactive approvals, user-input requests, dynamic tools, token refresh, attestation, and similar features that exec mode cannot support.
 
 *Call graph*: calls 1 internal fn (reject_server_request); called by 1 (handle_server_request).
 
@@ -816,11 +818,11 @@ async fn reject_server_request(
 fn server_request_method_name(request: &ServerRequest) -> String
 ```
 
-**Purpose**: Extracts the JSON-RPC method name string from a `ServerRequest` for logging and rejection messages. It falls back to `unknown` if serialization or field extraction fails.
+**Purpose**: Extracts a readable method name from a server request for error messages. If it cannot find one, it uses `unknown`.
 
-**Data flow**: Serializes `&ServerRequest` to `serde_json::Value`, reads the `method` field as a string if present, and returns that string or `"unknown"`.
+**Data flow**: It receives a server request, serializes it to JSON, looks for a `method` string, and returns that string or a fallback.
 
-**Call relations**: Used at the start of `handle_server_request` so all rejection/error paths can mention the concrete method name without duplicating per-variant literals.
+**Call relations**: `handle_server_request` calls this once before deciding how to answer the request, so rejections mention the relevant method.
 
 *Call graph*: called by 1 (handle_server_request); 1 external calls (to_value).
 
@@ -835,11 +837,11 @@ async fn handle_server_request(
 )
 ```
 
-**Purpose**: Processes server-initiated requests that arrive during exec mode, auto-canceling MCP elicitation and rejecting all other interactive or unsupported request types. It also marks the session as errored if request handling itself fails.
+**Purpose**: Answers requests that the app server sends back to exec while a turn is running. Because exec is headless, it cancels or rejects anything that would require interactive user input.
 
-**Data flow**: Takes the client, a `ServerRequest`, and mutable `error_seen`. It derives the method name, matches the request variant, and either builds a cancel payload via `canceled_mcp_server_elicitation_response` then calls `resolve_server_request`, or calls `reject_server_request` with a variant-specific reason mentioning the relevant thread/conversation ID. If the chosen action returns `Err`, it sets `*error_seen = true` and logs a warning.
+**Data flow**: It receives the client, a server request, and a mutable error flag. It identifies the request type, either resolves MCP elicitation with a cancel response or rejects unsupported approvals and prompts with clear reasons. If answering fails, it marks an error and logs a warning.
 
-**Call relations**: Invoked by `run_exec_session` whenever `client.next_event()` yields `InProcessServerEvent::ServerRequest`. It is intentionally narrow: exec mode does not surface interactive approvals or user-input prompts, so this function terminates those branches immediately.
+**Call relations**: `run_exec_session` calls this whenever the in-process event stream yields a server request instead of a notification.
 
 *Call graph*: calls 4 internal fn (canceled_mcp_server_elicitation_response, reject_server_request, resolve_server_request, server_request_method_name); called by 1 (run_exec_session); 2 external calls (format!, warn!).
 
@@ -850,11 +852,11 @@ async fn handle_server_request(
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value>
 ```
 
-**Purpose**: Reads an optional JSON output schema file from disk and parses it into `serde_json::Value`. Invalid paths or invalid JSON are treated as fatal CLI errors.
+**Purpose**: Reads an optional JSON schema file that constrains the agent's final output shape. A schema is a machine-readable description of what valid JSON output should look like.
 
-**Data flow**: Consumes `Option<PathBuf>`. If `None`, returns `None`. If `Some(path)`, reads the file to string, parses it as JSON, and returns `Some(Value)` on success. Read or parse failures print a path-specific message to stderr and exit the process.
+**Data flow**: It receives an optional path. If there is no path, it returns nothing. If there is a path, it reads the file, parses it as JSON, returns the JSON value on success, or prints an error and exits if reading or parsing fails.
 
-**Call relations**: Called by `run_exec_session` when constructing the initial user turn for both fresh and resumed sessions, so `turn/start` can include `output_schema` when requested.
+**Call relations**: `run_exec_session` calls this when preparing a normal user turn or resume prompt, before sending `turn/start`.
 
 *Call graph*: called by 1 (run_exec_session); 3 external calls (eprintln!, read_to_string, exit).
 
@@ -865,11 +867,11 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value>
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats prompt-decoding failures into actionable user-facing messages that explain the detected encoding problem and suggest converting input to UTF-8. The wording differs for invalid UTF-8, invalid UTF-16, and unsupported UTF-32 BOMs.
+**Purpose**: Turns prompt-decoding errors into helpful messages for users. The messages explain what encoding problem was found and suggest converting input to UTF-8.
 
-**Data flow**: Reads the enum variant and writes a descriptive string into the provided formatter. It returns the standard formatting result.
+**Data flow**: It receives a decode error variant and a formatter, writes the matching human-readable message, and returns the formatting result.
 
-**Call relations**: Used implicitly when `read_prompt_from_stdin` reports decoding failures to stderr after `decode_prompt_bytes` returns an error.
+**Call relations**: This display implementation is used when `read_prompt_from_stdin` reports failures from `decode_prompt_bytes`.
 
 *Call graph*: 1 external calls (write!).
 
@@ -880,11 +882,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn decode_prompt_bytes(input: &[u8]) -> Result<String, PromptDecodeError>
 ```
 
-**Purpose**: Decodes stdin prompt bytes into a `String`, supporting UTF-8 with optional BOM and UTF-16LE/BE with BOM while explicitly rejecting UTF-32 BOMs. It preserves plain UTF-8 behavior for unmarked input.
+**Purpose**: Converts raw stdin bytes into a Rust string while detecting common text encodings. It accepts UTF-8 and UTF-16 with byte-order marks, rejects UTF-32, and gives clear errors for invalid text.
 
-**Data flow**: Takes `&[u8]`, strips a UTF-8 BOM if present, checks for UTF-32LE/BE BOMs and returns `UnsupportedBom` errors, checks for UTF-16LE/BE BOMs and delegates to `decode_utf16`, otherwise attempts `std::str::from_utf8`. It returns `Result<String, PromptDecodeError>`.
+**Data flow**: It receives a byte slice, strips a UTF-8 byte-order mark if present, checks for UTF-32 and UTF-16 markers, delegates UTF-16 decoding when needed, or parses the rest as UTF-8. It returns decoded text or a `PromptDecodeError`.
 
-**Call relations**: Called by `read_prompt_from_stdin` after reading raw stdin bytes. Its explicit BOM handling is what lets exec accept common text-file encodings while still failing clearly on unsupported ones.
+**Call relations**: `read_prompt_from_stdin` calls this after reading all stdin bytes so piped prompts become text safely.
 
 *Call graph*: calls 1 internal fn (decode_utf16); called by 1 (read_prompt_from_stdin); 1 external calls (from_utf8).
 
@@ -899,11 +901,11 @@ fn decode_utf16(
 ) -> Result<String, PromptDecodeError>
 ```
 
-**Purpose**: Decodes BOM-stripped UTF-16 byte input using the supplied endianness decoder and validates both byte alignment and UTF-16 correctness. It is the shared implementation for UTF-16LE and UTF-16BE prompt decoding.
+**Purpose**: Decodes UTF-16 text from raw bytes. UTF-16 stores text in two-byte units, so this function checks that the byte count is valid before converting.
 
-**Data flow**: Consumes the raw byte slice, an encoding label, and a `decode_unit` function. It rejects odd-length input with `InvalidUtf16`, converts each 2-byte chunk into `u16`, then calls `String::from_utf16`, mapping any decoding failure to `InvalidUtf16 { encoding }`.
+**Data flow**: It receives bytes, an encoding label, and a function for turning each two-byte chunk into a number. It rejects odd byte counts, converts chunks into UTF-16 units, and returns the decoded string or an invalid-UTF-16 error.
 
-**Call relations**: Used only by `decode_prompt_bytes` after BOM detection chooses UTF-16LE or UTF-16BE.
+**Call relations**: `decode_prompt_bytes` calls this for UTF-16 little-endian or big-endian input after seeing the matching byte-order mark.
 
 *Call graph*: called by 1 (decode_prompt_bytes); 1 external calls (from_utf16).
 
@@ -914,11 +916,11 @@ fn decode_utf16(
 fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String>
 ```
 
-**Purpose**: Reads prompt text from stdin according to one of three CLI behaviors: required when piped, forced, or optional append-only context. It also emits user guidance and exits on missing/empty/undecodable input when stdin is required.
+**Purpose**: Reads the prompt text from stdin according to the mode chosen by the caller. It supports required piped prompts, forced stdin prompts, and optional extra context appended to a positional prompt.
 
-**Data flow**: Reads terminal status from `stdin().is_terminal()` and branches on `StdinPromptBehavior`. Depending on behavior, it may print guidance, return `None` immediately for optional-terminal stdin, or read all stdin bytes into a buffer. It decodes bytes via `decode_prompt_bytes`, trims to detect empty content, and returns `Some(String)` or exits with a stderr message on fatal cases.
+**Data flow**: It checks whether stdin is a terminal, decides whether to read or exit based on the behavior, reads all bytes, decodes them with `decode_prompt_bytes`, and returns text if non-empty. Empty required input or read/decode errors are printed to stderr and exit the process.
 
-**Call relations**: Called by `resolve_prompt` and `resolve_root_prompt`. Those higher-level helpers decide whether stdin is the primary prompt or extra context; this function performs the actual terminal detection, byte reading, and decoding.
+**Call relations**: `resolve_prompt` uses this for missing or `-` prompts. `resolve_root_prompt` also uses it to optionally append piped context to a normal prompt.
 
 *Call graph*: calls 1 internal fn (decode_prompt_bytes); called by 2 (resolve_prompt, resolve_root_prompt); 4 external calls (new, eprintln!, stdin, exit).
 
@@ -929,11 +931,11 @@ fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String>
 fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String
 ```
 
-**Purpose**: Combines a positional prompt with piped stdin by wrapping the stdin text in a `<stdin>...</stdin>` block appended after a blank line. It ensures the closing tag is on its own line even when stdin lacked a trailing newline.
+**Purpose**: Combines a positional prompt with extra stdin text in a clearly marked block. The markers help the model tell which part came from piped input.
 
-**Data flow**: Takes `prompt: &str` and `stdin_text: &str`, formats `"{prompt}\n\n<stdin>\n{stdin_text}"`, conditionally appends a newline if `stdin_text` did not end with one, then appends `</stdin>`. Returns the combined `String`.
+**Data flow**: It receives the original prompt and stdin text, builds a string containing the prompt, a `<stdin>` section, the stdin contents, and a closing marker, adding a newline if needed.
 
-**Call relations**: Used by `resolve_root_prompt` when a root positional prompt is present and stdin is also piped, preserving both sources of user input in a structured way.
+**Call relations**: `resolve_root_prompt` calls this when the user supplied a prompt argument and also piped additional input.
 
 *Call graph*: called by 1 (resolve_root_prompt); 1 external calls (format!).
 
@@ -944,11 +946,11 @@ fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String
 fn resolve_prompt(prompt_arg: Option<String>) -> String
 ```
 
-**Purpose**: Resolves a prompt argument into concrete text, treating `-` as forced stdin and absence of a positional prompt as legacy 'read stdin if piped' behavior. It guarantees a string result or terminates earlier in stdin-reading helpers.
+**Purpose**: Finds the actual prompt text when a prompt is required. It uses the provided argument unless it is missing or exactly `-`, in which case it reads stdin.
 
-**Data flow**: Consumes `Option<String>`. If it is `Some(p)` and not `"-"`, returns `p`. Otherwise it chooses `StdinPromptBehavior::Forced` for explicit `-` or `RequiredIfPiped` for `None`, calls `read_prompt_from_stdin`, and returns the resulting string.
+**Data flow**: It receives an optional prompt argument. A normal string is returned directly; `-` forces stdin; no argument requires piped stdin. It returns the final prompt or exits through `read_prompt_from_stdin` if no valid prompt is available.
 
-**Call relations**: Called by `run_exec_session` for resume prompts, by `resolve_root_prompt` for fallback behavior, and by `build_review_request` for custom review instructions.
+**Call relations**: `run_exec_session` calls this for resume prompts, `resolve_root_prompt` uses it for stdin-only root prompts, and `build_review_request` uses it for custom review instructions.
 
 *Call graph*: calls 1 internal fn (read_prompt_from_stdin); called by 3 (build_review_request, resolve_root_prompt, run_exec_session); 2 external calls (matches!, unreachable!).
 
@@ -959,11 +961,11 @@ fn resolve_prompt(prompt_arg: Option<String>) -> String
 fn resolve_root_prompt(prompt_arg: Option<String>) -> String
 ```
 
-**Purpose**: Resolves the top-level exec prompt, with special support for appending piped stdin as additional context when a positional prompt is already present. This preserves legacy `codex exec prompt < file` semantics.
+**Purpose**: Resolves the top-level exec prompt, with one extra convenience: if a prompt argument exists and stdin is also piped, stdin becomes additional context instead of replacing the prompt.
 
-**Data flow**: Consumes `Option<String>`. If it is a non-dash prompt, it attempts `read_prompt_from_stdin(StdinPromptBehavior::OptionalAppend)`; when stdin text exists, it combines both via `prompt_with_stdin_context`, otherwise returns the prompt unchanged. If the argument is `None` or `"-"`, it delegates to `resolve_prompt`.
+**Data flow**: It receives an optional prompt argument. A normal prompt may be combined with optional stdin context; `-` or no argument is delegated to `resolve_prompt`. It returns the final text to send to the model.
 
-**Call relations**: Used by `run_exec_session` on the normal non-resume path to build the initial user text item.
+**Call relations**: `run_exec_session` calls this for the usual `codex exec` path when no subcommand supplies its own prompt.
 
 *Call graph*: calls 3 internal fn (prompt_with_stdin_context, read_prompt_from_stdin, resolve_prompt); called by 1 (run_exec_session).
 
@@ -974,10 +976,10 @@ fn resolve_root_prompt(prompt_arg: Option<String>) -> String
 fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest>
 ```
 
-**Purpose**: Constructs a `ReviewRequest` from `ReviewArgs`, enforcing that exactly one review target mode is selected and trimming custom prompt instructions. It supports uncommitted changes, base branch, commit, or custom instructions.
+**Purpose**: Turns review command-line options into a structured review request. It ensures the user clearly picked what should be reviewed.
 
-**Data flow**: Reads `ReviewArgs` fields in priority order: `uncommitted`, `base`, `commit` plus optional title, then `prompt`. For custom prompts it resolves stdin-aware prompt text via `resolve_prompt`, trims whitespace, and rejects empties. It returns `Ok(ReviewRequest { target, user_facing_hint: None })` or an `anyhow` error describing the missing/invalid target.
+**Data flow**: It receives review arguments. It chooses one target from uncommitted changes, base branch, commit, or custom instructions read from the prompt path/stdin. It returns a `ReviewRequest`, or an error if no valid target was supplied or custom instructions are empty.
 
-**Call relations**: Called by `run_exec_session` when the CLI selected the `review` subcommand, before converting the resulting core target with `review_target_to_api` for `review/start`.
+**Call relations**: `run_exec_session` calls this when the selected command is `Review`, then later converts the target with `review_target_to_api` before sending `review/start`.
 
 *Call graph*: calls 1 internal fn (resolve_prompt); called by 1 (run_exec_session); 1 external calls (bail!).

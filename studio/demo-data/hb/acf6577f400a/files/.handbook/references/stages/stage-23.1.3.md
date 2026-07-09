@@ -1,8 +1,8 @@
 # App-server unit tests and shared integration fixtures  `stage-23.1.3`
 
-This stage is the app-server crate’s verification layer: it does not participate in runtime startup or the main request loop directly, but instead codifies expected behavior for the server’s startup configuration, JSON-RPC processing, and persisted session/state handling. The unit-test files lock down core internals: external-agent config migration and import, config-manager read/write semantics, CLI override parsing, tracing propagation through `MessageProcessor`, refresh decisions in the external-agent processor, remote-control validation and JSON-RPC error mapping, and thread lifecycle, summary, pagination, and resume behavior.
+This stage is shared test support for the app server. It is not part of the running product path; it is the safety net used while building and changing the server. The unit tests check important behaviors inside the app-server crate: importing external agent settings without losing or duplicating data, managing config files safely, accepting command-line overrides, keeping tracing links across JSON-RPC requests, refreshing runtime state after config migration, reporting remote-control errors clearly, preserving conversation thread state, and creating summaries from the right user message.
 
-The shared `tests/common` modules provide the reusable infrastructure that larger integration suites depend on. `test_app_server.rs` launches the real binary and drives it over stdin/stdout JSON-RPC, while `lib.rs` exposes that harness alongside fixture builders. Supporting modules create fake auth state, temporary config files, model-cache files, rollout/session histories, canned Responses API SSE streams, and mock HTTP services for analytics and model backends. Finally, `tests/all.rs`, `tests/suite/mod.rs`, and `tests/suite/v2/mod.rs` assemble these pieces into a single organized integration-test tree, grouping end-to-end coverage by feature area and API generation.
+The integration-test helpers act like a small pretend world around the server. They provide fake analytics, authentication files, config files, model lists, saved sessions, and AI service responses, so tests can run without real accounts, networks, or production services. The mock model server and test app-server client let tests start a real server process, send JSON-RPC commands, read replies, and shut it down cleanly. Finally, the suite index files are the test runner’s table of contents, gathering the right test groups so they compile and run together.
 
 ## Files in this stage
 
@@ -11,13 +11,13 @@ These focused crate-level tests validate CLI parsing, configuration services, tr
 
 ### `app-server/src/config/external_agent_config_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This test module builds temporary filesystem layouts that mimic external-agent home directories, repositories, plugin marketplaces, and Codex config targets. The helpers `fixture_paths` and `service_for_paths` standardize creation of isolated roots and a deterministic `ExternalAgentConfigService::new_for_test`, while `import_success` and `assert_single_plugin_raw_error` make result assertions concise.
+These tests act like a safety checklist for the external-agent migration feature. The feature looks at folders and configuration files from another coding assistant, then decides what Codex can import and where it should go. Without this test file, changes to the migration code could silently break important cases, such as overwriting an existing AGENTS.md file, importing a disabled plugin, or losing environment settings.
 
-The tests are broad and concrete. Detection tests verify which `ExternalAgentConfigMigrationItem`s appear for home vs repo scope, including config, skills, `AGENTS.md`, recent sessions, MCP servers, hooks, commands, subagents, and plugins. Import tests verify actual on-disk outputs: merged `config.toml`, generated `hooks.json`, converted command skills, migrated subagent TOML, rewritten markdown branding, and plugin enablement in Codex config. Many edge cases are pinned: invalid home config should not suppress non-plugin repo migrations; invalid local settings are ignored; existing non-empty targets are preserved while empty targets are overwritten; MCP migration respects home/local toggle precedence; plugin detection filters against already configured or unavailable marketplace plugins; relative marketplace paths resolve correctly in both home and repo scopes; and remote plugin imports become pending rather than immediate.
+Each test builds a temporary fake home directory or fake repository. It writes small sample files, such as settings.json, .mcp.json, plugin manifests, command markdown files, or agent definitions. Then it calls the migration service in one of two modes: detect, which only reports what could be migrated, or import, which actually writes Codex files. The tests compare the results against exact expected values.
 
-Because the production file contains many conditional branches and merge rules, these tests are effectively the behavioral contract for migration semantics, especially around preserving existing user state and distinguishing local vs remote plugin sources.
+A recurring theme is careful copying rather than blind copying. The tests check that Codex skips things already present, rewrites old product names to Codex names, ignores invalid optional files when safe, keeps going after one failed item, and records plugin imports that must happen later. In everyday terms, this file makes sure the moving truck labels every box correctly, avoids unpacking over furniture that is already there, and leaves notes for anything that cannot be moved immediately.
 
 #### Function details
 
@@ -27,11 +27,11 @@ Because the production file contains many conditional branches and merge rules, 
 fn fixture_paths() -> (TempDir, PathBuf, PathBuf)
 ```
 
-**Purpose**: Creates a temporary root plus conventional external-agent and Codex home paths beneath it. It is the base filesystem fixture for many tests.
+**Purpose**: Creates a fresh temporary set of paths for tests. This gives each test its own fake external-agent home and fake Codex home so tests do not affect each other.
 
-**Data flow**: Allocates a `TempDir`, derives `<root>/.claude` and `<root>/.codex`, and returns `(TempDir, external_agent_home, codex_home)`.
+**Data flow**: It takes no input. It creates a temporary root directory, then builds two paths inside it: one for the external agent and one for Codex. It returns the temporary directory object plus both paths, so the directory stays alive while the test runs.
 
-**Call relations**: Used by many tests that need isolated home-scope migration fixtures.
+**Call relations**: Many tests call this first, like setting up a clean workbench before trying a migration. It relies on the temporary-directory library to create the folder, then hands the paths to service_for_paths or direct file-writing setup.
 
 *Call graph*: called by 23 (detect_home_infers_external_official_marketplace_when_missing_from_settings, detect_home_lists_config_skills_and_agents_md, detect_home_lists_enabled_plugins_from_settings, detect_home_lists_recent_sessions, detect_home_plugins_uses_local_settings_over_project_settings, detect_home_skips_config_when_target_already_has_supported_fields, detect_home_skips_plugins_with_invalid_marketplace_source, detect_home_skips_plugins_without_marketplace_source, detect_home_skips_skills_when_all_skill_directories_exist, detect_home_supports_relative_external_agent_plugin_marketplace_path (+13 more)); 1 external calls (new).
 
@@ -45,11 +45,11 @@ fn service_for_paths(
 ) -> ExternalAgentConfigService
 ```
 
-**Purpose**: Builds a test-configured `ExternalAgentConfigService` for explicit external-agent and Codex home paths. It hides the `new_for_test` constructor.
+**Purpose**: Builds an ExternalAgentConfigService pointed at test-only folders. Tests use it so the migration code reads and writes inside temporary directories instead of real user files.
 
-**Data flow**: Takes `external_agent_home` and `codex_home` paths → returns `ExternalAgentConfigService::new_for_test(codex_home, external_agent_home)`.
+**Data flow**: It receives two paths: the external-agent home and the Codex home. It passes those paths into the service’s test constructor. It returns a migration service ready to detect or import from those locations.
 
-**Call relations**: Used by nearly every test in this module.
+**Call relations**: Most tests call this after creating fixture paths or repository paths. It hands control to ExternalAgentConfigService::new_for_test, then the test calls methods such as detect, import, import_plugins, or import_skills on the returned service.
 
 *Call graph*: calls 1 internal fn (new_for_test); called by 46 (detect_home_infers_external_official_marketplace_when_missing_from_settings, detect_home_lists_config_skills_and_agents_md, detect_home_lists_enabled_plugins_from_settings, detect_home_lists_recent_sessions, detect_home_plugins_uses_local_settings_over_project_settings, detect_home_skips_config_when_target_already_has_supported_fields, detect_home_skips_plugins_with_invalid_marketplace_source, detect_home_skips_plugins_without_marketplace_source, detect_home_skips_skills_when_all_skill_directories_exist, detect_home_supports_relative_external_agent_plugin_marketplace_path (+15 more)).
 
@@ -60,11 +60,11 @@ fn service_for_paths(
 fn github_plugin_details() -> MigrationDetails
 ```
 
-**Purpose**: Provides a reusable `MigrationDetails` fixture containing one plugin in one marketplace. It simplifies plugin-import tests.
+**Purpose**: Creates a small reusable plugin-migration request for a GitHub-style marketplace. It saves one plugin-related test from repeating the same setup data.
 
-**Data flow**: Constructs `MigrationDetails { plugins: vec![PluginsMigration { marketplace_name: "acme-tools", plugin_names: ["formatter"] }], ..Default::default() }` and returns it.
+**Data flow**: It takes no input. It builds MigrationDetails containing one marketplace named acme-tools and one plugin named formatter. It returns that details object.
 
-**Call relations**: Used by plugin-import tests that need a simple details payload.
+**Call relations**: The plugin validation test calls this when it wants a ready-made request. The helper uses default values for all unrelated migration detail fields.
 
 *Call graph*: called by 1 (import_plugins_defers_marketplace_source_validation_to_add_marketplace); 2 external calls (default, vec!).
 
@@ -79,11 +79,11 @@ fn assert_single_plugin_raw_error(
 )
 ```
 
-**Purpose**: Asserts that a plugin import outcome contains exactly one raw error with the expected failure stage and source plugin ID. It centralizes repetitive plugin-error checks.
+**Purpose**: Checks that a plugin import produced exactly one detailed raw error with the expected stage and source. This keeps plugin failure tests focused and consistent.
 
-**Data flow**: Takes a slice of raw errors, expected failure stage, and expected source → asserts length 1 and checks item type, failure stage, absent error type/cwd, matching source, and non-empty message.
+**Data flow**: It receives a list of raw errors, an expected failure stage, and an expected source string. It checks that there is one error, that it is for plugins, that key fields match, and that the message is not empty. It returns nothing, but fails the test if anything is wrong.
 
-**Call relations**: Used by several plugin-import failure tests.
+**Call relations**: Several plugin error tests call this after import_plugins returns a failure outcome. It uses assertion macros to turn mismatches into clear test failures.
 
 *Call graph*: called by 3 (import_plugins_defers_marketplace_source_validation_to_add_marketplace, import_plugins_infers_external_official_marketplace_when_missing_from_settings, import_plugins_requires_source_marketplace_details); 2 external calls (assert!, assert_eq!).
 
@@ -99,11 +99,11 @@ fn import_success(
 ) -> ExternalAgentConfigImportSuccess
 ```
 
-**Purpose**: Builds an `ExternalAgentConfigImportSuccess` value for concise expected-result assertions. It fills in source and target strings from generic inputs.
+**Purpose**: Builds an expected success record for import tests. It keeps repeated expected-result objects shorter and easier to read.
 
-**Data flow**: Takes item type, optional cwd, source, and target → converts source/target with `Into<String>` and returns the success struct.
+**Data flow**: It receives the migration item type, an optional working directory, a source label, and a target label. It converts the labels into strings and returns an ExternalAgentConfigImportSuccess value.
 
-**Call relations**: Used in expected `item_results` assertions across import tests.
+**Call relations**: Import tests use this helper when comparing the service’s reported successes. It is a small builder that feeds expected values into assertion checks.
 
 *Call graph*: 1 external calls (into).
 
@@ -114,11 +114,11 @@ fn import_success(
 async fn detect_home_lists_config_skills_and_agents_md()
 ```
 
-**Purpose**: Verifies that home-scope detection reports config, skills, and `AgentsMd` migrations when corresponding source artifacts exist and targets are absent.
+**Purpose**: Verifies that home-level detection finds three basic things to migrate: settings, skills, and the external agent’s guidance markdown file.
 
-**Data flow**: Creates home settings, one skill directory, and `CLAUDE.md`, runs `detect(include_home: true)`, and asserts the exact ordered migration items.
+**Data flow**: The test creates fake external-agent settings, a skill folder, and a guidance file. It asks the service to detect home migrations. It expects three migration items describing the source and target paths.
 
-**Call relations**: Exercises `ExternalAgentConfigService::detect` for basic home-scope discovery.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths to prepare a clean service, then checks the detect result with an exact equality assertion.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 5 external calls (assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -129,11 +129,11 @@ async fn detect_home_lists_config_skills_and_agents_md()
 async fn detect_home_lists_recent_sessions()
 ```
 
-**Purpose**: Verifies that home-scope detection reports recent external-agent sessions under the projects directory. It checks session metadata extraction.
+**Purpose**: Checks that recent external-agent session history is detected as something Codex can migrate. This matters because users may want conversation history preserved.
 
-**Data flow**: Creates a repo directory and a recent session JSONL file under `.claude/projects`, runs detection, and asserts a single `Sessions` migration item with the expected `ExternalAgentSessionMigration`.
+**Data flow**: The test creates a fake project folder and a recent JSON-lines session file containing a user message and timestamp. It runs home detection. It expects one Sessions migration item containing the session path, project directory, and title from the first request.
 
-**Call relations**: Exercises the sessions branch of home-scope detection.
+**Call relations**: The async test runner calls it. It uses fixture_paths and service_for_paths, writes session JSON, then exercises the service’s detect flow.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 5 external calls (assert_eq!, now, create_dir_all, write, json!).
 
@@ -144,11 +144,11 @@ async fn detect_home_lists_recent_sessions()
 async fn detect_repo_lists_agents_md_for_each_cwd()
 ```
 
-**Purpose**: Verifies that repo-scoped detection resolves nested cwd values to the same repo root and emits an `AgentsMd` migration item for each supplied cwd. It confirms there is no deduplication across input cwd entries.
+**Purpose**: Confirms that repository detection reports AGENTS.md migration for each requested current working directory. It also covers the case where one requested directory is nested inside the repository.
 
-**Data flow**: Creates a git repo with nested child directory and root `CLAUDE.md`, runs detection with both nested and root cwd values, and asserts two identical `AgentsMd` items differing only by cloned cwd ownership.
+**Data flow**: The test creates a fake Git repository, a nested child folder, and an external-agent guidance file at the repo root. It asks detection to inspect both paths. It expects two migration items, both pointing back to the same repository-level source and target.
 
-**Call relations**: Exercises repo-root resolution and per-cwd iteration in `detect`.
+**Call relations**: The async test runner calls it directly. It sets up paths itself, builds the service with service_for_paths, then compares the returned detection list.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -159,11 +159,11 @@ async fn detect_repo_lists_agents_md_for_each_cwd()
 async fn detect_repo_still_reports_non_plugin_items_when_home_config_is_invalid()
 ```
 
-**Purpose**: Verifies that invalid Codex home config does not suppress non-plugin repo migration detection. Plugin detection may be skipped, but config/skills/agents markdown should still be reported.
+**Purpose**: Makes sure an invalid existing Codex home config does not prevent repository items like config, skills, and AGENTS.md from being detected. This keeps one bad file from hiding unrelated migrations.
 
-**Data flow**: Creates a repo with settings, skills, and `CLAUDE.md`, writes invalid TOML to Codex home config, runs repo detection, and asserts config, skills, and `AgentsMd` items are still returned.
+**Data flow**: The test writes invalid TOML into the Codex config, then creates repository external-agent settings, skills, and guidance. It runs repository detection. It expects the non-plugin migration items to still appear.
 
-**Call relations**: Covers the warning-and-continue behavior around plugin detection in `detect_migrations`.
+**Call relations**: The test runner invokes it. It constructs its own temporary repository and service, then checks that detection continues despite the malformed Codex config.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -174,11 +174,11 @@ async fn detect_repo_still_reports_non_plugin_items_when_home_config_is_invalid(
 async fn detect_repo_lists_mcp_hooks_commands_and_subagents()
 ```
 
-**Purpose**: Verifies repo detection of MCP servers, hooks, commands, and subagents from representative source files. It checks that `MigrationDetails` include the expected named items.
+**Purpose**: Checks that repository detection finds advanced migration items: MCP servers, hooks, custom commands, and subagents. MCP means Model Context Protocol, a way to connect tools or services to the assistant.
 
-**Data flow**: Creates a git repo with `.mcp.json`, hook settings, command markdown, and agent markdown, runs detection, and asserts the four expected migration items and names.
+**Data flow**: The test writes a .mcp.json file, external-agent hook settings, a command markdown file, and a subagent markdown file. It runs repository detection. It expects four migration items, each with names of the discovered objects.
 
-**Call relations**: Exercises multiple repo-scoped detection branches together.
+**Call relations**: The async test runner calls it. The test uses service_for_paths to create the migration service and then verifies that detect summarizes all supported advanced items.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -189,11 +189,11 @@ async fn detect_repo_lists_mcp_hooks_commands_and_subagents()
 async fn detect_repo_skips_hooks_when_only_unsupported_hooks_exist()
 ```
 
-**Purpose**: Verifies that hook detection returns nothing when the source settings contain only unsupported hook forms/events. This prevents offering unusable migrations.
+**Purpose**: Verifies that detection does not offer a hooks migration when every hook is unsupported. This avoids promising users that Codex can import something it will later ignore.
 
-**Data flow**: Creates repo settings with unsupported hook definitions, runs detection, and asserts an empty migration-item list.
+**Data flow**: The test writes hook settings containing unsupported conditions or event types. It runs repository detection. It expects an empty list.
 
-**Call relations**: Exercises hook filtering behavior in detection.
+**Call relations**: The async test runner invokes it. It sets up a minimal repository, calls the service’s detect path through service_for_paths, and asserts there are no migration items.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -204,11 +204,11 @@ async fn detect_repo_skips_hooks_when_only_unsupported_hooks_exist()
 async fn import_repo_migrates_mcp_hooks_commands_and_subagents()
 ```
 
-**Purpose**: End-to-end test that repo import writes supported MCP config, hooks, command skill, and subagent TOML with expected transformations. It validates actual file contents and downstream parseability.
+**Purpose**: Checks the full import path for repository MCP servers, hooks, commands, and subagents. It verifies not just that files are written, but that their content is converted into Codex-supported formats.
 
-**Data flow**: Creates repo source files for MCP, hooks, commands, and agents, runs `import` with four migration items, then reads generated `.codex/config.toml`, `.codex/hooks.json`, `.agents/skills/.../SKILL.md`, and `.codex/agents/researcher.toml` and asserts exact contents and successful parsing into supported config types.
+**Data flow**: The test creates source MCP, hooks, command, and subagent files. It asks the service to import all four item types. Then it reads Codex config, hooks JSON, generated skill markdown, and subagent TOML, and compares them to expected converted content.
 
-**Call relations**: Exercises several import helpers together and validates their on-disk outputs.
+**Call relations**: The async test runner calls it. This is a broad integration-style test that uses service_for_paths, performs an import, and then validates the resulting files with TOML and JSON parsers.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 11 external calls (new, assert!, assert_eq!, format!, create_dir_all, read_to_string, write, from_str, from_value, from_str (+1 more)).
 
@@ -219,11 +219,11 @@ async fn import_repo_migrates_mcp_hooks_commands_and_subagents()
 async fn import_repo_mcp_preserves_existing_same_named_server()
 ```
 
-**Purpose**: Verifies that importing MCP config does not overwrite an existing same-named server in Codex config. Detection should also skip such already-present servers.
+**Purpose**: Ensures MCP import does not overwrite an existing Codex MCP server with the same name. This protects user-edited Codex configuration.
 
-**Data flow**: Creates repo `.mcp.json` and existing `.codex/config.toml` with the same server name, runs detection and import, and asserts detection returns no items and the existing config file remains unchanged.
+**Data flow**: The test writes an external MCP server and an existing Codex config entry with the same server name. Detection should report nothing missing. Import should leave the existing config text unchanged.
 
-**Call relations**: Tests `merge_missing_mcp_servers` behavior through both detection and import.
+**Call relations**: The async test runner invokes it. It uses service_for_paths, first checks detect behavior, then calls import and checks the file was preserved.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -234,11 +234,11 @@ async fn import_repo_mcp_preserves_existing_same_named_server()
 async fn detect_repo_mcp_lists_only_missing_servers()
 ```
 
-**Purpose**: Verifies that MCP detection reports only server names absent from existing Codex config. Existing same-named servers are filtered out.
+**Purpose**: Confirms MCP detection reports only servers that are not already present in Codex config. This prevents duplicate migration suggestions.
 
-**Data flow**: Creates repo `.mcp.json` with two servers and existing config containing one of them, runs detection, and asserts only the missing server appears in `MigrationDetails`.
+**Data flow**: The test writes two external MCP servers and an existing Codex config for one of them. It runs repository detection. It expects a migration item listing only the missing server.
 
-**Call relations**: Exercises MCP detection’s merge-preview logic.
+**Call relations**: The async test runner calls it. It builds the temporary repository, invokes detect through the service, and compares the details list.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -249,11 +249,11 @@ async fn detect_repo_mcp_lists_only_missing_servers()
 async fn import_home_migrates_supported_config_fields_skills_and_agents_md()
 ```
 
-**Purpose**: Verifies home import of supported config fields, skill copying with markdown rewriting, and `AGENTS.md` rewriting. It checks the main happy path for home-scope migration.
+**Purpose**: Tests the main home-level import for supported settings, skills, and guidance markdown. It checks that only supported settings are moved and old product names are rewritten to Codex.
 
-**Data flow**: Creates home settings with env and sandbox fields, one skill `SKILL.md`, and `CLAUDE.md`, runs import for `AgentsMd`, `Config`, and `Skills`, then reads generated files and asserts exact rewritten contents and TOML structure.
+**Data flow**: The test writes external-agent settings with environment variables and sandbox settings, a skill file, and a guidance file. It imports config, skills, and AGENTS.md. It then reads Codex files and checks the expected TOML and rewritten markdown.
 
-**Call relations**: Exercises `import_agents_md`, `import_config`, and `import_skills` together.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then validates the service’s import output by reading the files it created.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 7 external calls (assert_eq!, format!, create_dir_all, read_to_string, write, from_str, vec!).
 
@@ -264,11 +264,11 @@ async fn import_home_migrates_supported_config_fields_skills_and_agents_md()
 async fn import_home_config_uses_local_settings_over_project_settings()
 ```
 
-**Purpose**: Verifies that `settings.local.json` overrides and augments `settings.json` during config import. It checks recursive merge semantics for env and sandbox fields.
+**Purpose**: Verifies that local external-agent settings override project settings during home config import. This matches the usual rule that personal local settings take priority.
 
-**Data flow**: Creates base and local settings files, runs config import, reads generated `config.toml`, parses it, and asserts local values override base ones while base-only keys remain.
+**Data flow**: The test writes both settings.json and settings.local.json with overlapping environment and sandbox values. It imports config. It expects Codex config to contain merged values, with local values winning where they overlap.
 
-**Call relations**: Exercises `effective_external_settings` through `import_config`.
+**Call relations**: The async test runner calls it. It uses fixture_paths and service_for_paths, then parses the produced config.toml and compares it to expected TOML.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 6 external calls (assert_eq!, create_dir_all, read_to_string, write, from_str, vec!).
 
@@ -279,11 +279,11 @@ async fn import_home_config_uses_local_settings_over_project_settings()
 async fn import_home_config_ignores_invalid_local_settings()
 ```
 
-**Purpose**: Verifies that invalid local settings JSON is ignored rather than failing config import. The base settings should still migrate successfully.
+**Purpose**: Checks that a broken optional local settings file does not stop the main settings import. This is important because local files may be hand-edited and malformed.
 
-**Data flow**: Creates valid `settings.json` and invalid `settings.local.json`, runs config import, and asserts the resulting `config.toml` reflects only the base settings.
+**Data flow**: The test writes valid project settings and invalid JSON in settings.local.json. It imports config. It expects Codex config to be created from the valid project settings only.
 
-**Call relations**: Tests the invalid-local-settings branch in `effective_external_settings`.
+**Call relations**: The async test runner invokes it. It uses the shared path helpers and then checks the exact text written to config.toml.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 4 external calls (assert_eq!, create_dir_all, write, vec!).
 
@@ -294,11 +294,11 @@ async fn import_home_config_ignores_invalid_local_settings()
 async fn import_home_skips_empty_config_migration()
 ```
 
-**Purpose**: Verifies that config import records no successes and writes no file when the migrated config would be empty. Unsupported or irrelevant settings should not create a no-op `config.toml`.
+**Purpose**: Ensures importing config does nothing when the external settings contain no supported Codex fields. This avoids creating empty or misleading config files.
 
-**Data flow**: Creates settings that produce no supported migrated fields, runs config import, asserts the returned `item_results` show zero successes/errors, and checks that `config.toml` does not exist.
+**Data flow**: The test writes settings that do not translate into any Codex config entries. It imports a Config item. It expects zero successes, zero errors, and no config.toml file.
 
-**Call relations**: Exercises the empty-migration branch of `import_config` through `import`.
+**Call relations**: The async test runner calls it. It prepares fixture paths, runs the service import, and checks both the reported result and the filesystem.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 6 external calls (assert!, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -309,11 +309,11 @@ async fn import_home_skips_empty_config_migration()
 async fn import_local_plugins_returns_completed_status()
 ```
 
-**Purpose**: Verifies that plugins from a local marketplace source are imported immediately and reported as completed, with Codex config updated to enable the plugin.
+**Purpose**: Tests that a plugin from a local marketplace can be imported immediately and reported as completed. A local marketplace is a plugin collection already available on disk.
 
-**Data flow**: Creates a local marketplace layout and settings enabling one plugin, runs `import` with a `Plugins` migration item, asserts no pending plugin imports, checks the item result contains one success, and verifies `config.toml` contains the enabled plugin stanza.
+**Data flow**: The test creates a fake marketplace manifest, plugin manifest, and external-agent settings enabling the plugin. It imports Plugins. It expects no pending work, one success, and a Codex config entry enabling the plugin.
 
-**Call relations**: Exercises local plugin partitioning and `import_plugins` through the public `import` API.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then validates both the import result object and the written config file.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 8 external calls (assert!, assert_eq!, create_dir_all, read_to_string, write, json!, to_string_pretty, vec!).
 
@@ -324,11 +324,11 @@ async fn import_local_plugins_returns_completed_status()
 async fn import_git_plugins_returns_pending_async_status()
 ```
 
-**Purpose**: Verifies that plugins from a remote/git marketplace source are not imported immediately but instead returned as `pending_plugin_imports`. The item result should remain empty rather than failed.
+**Purpose**: Checks that plugins from a Git marketplace are not imported immediately by this step. Instead, they are returned as pending work that another async process can finish later.
 
-**Data flow**: Creates settings with a remote marketplace source, runs `import` with a `Plugins` migration item, and asserts one pending plugin import, zero item successes/errors, and no config file written.
+**Data flow**: The test writes settings for an enabled plugin whose marketplace source is a Git repository. It imports Plugins. It expects a pending plugin import entry, no immediate successes, and no config file.
 
-**Call relations**: Exercises `partition_plugin_migration_details` and the deferred-plugin behavior in `import`.
+**Call relations**: The async test runner calls it. It exercises the import path through service_for_paths and checks that the service correctly defers network-style work.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 5 external calls (assert!, assert_eq!, create_dir_all, write, vec!).
 
@@ -339,11 +339,11 @@ async fn import_git_plugins_returns_pending_async_status()
 async fn detect_home_skips_config_when_target_already_has_supported_fields()
 ```
 
-**Purpose**: Verifies that config detection returns nothing when existing Codex config already contains all migratable fields from external settings. Detection should only report missing values.
+**Purpose**: Verifies that home detection skips config migration when Codex already has the equivalent supported settings. This avoids suggesting duplicate work.
 
-**Data flow**: Creates home settings and a matching existing `config.toml`, runs detection, and asserts an empty item list.
+**Data flow**: The test writes external settings and a Codex config.toml containing matching sandbox and environment settings. It runs home detection. It expects no migration items.
 
-**Call relations**: Exercises `merge_missing_toml_values` preview logic in detection.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then compares the detect result to an empty list.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -354,11 +354,11 @@ async fn detect_home_skips_config_when_target_already_has_supported_fields()
 async fn detect_home_skips_skills_when_all_skill_directories_exist()
 ```
 
-**Purpose**: Verifies that skills detection returns nothing when every source skill directory already exists in the target skills directory.
+**Purpose**: Checks that skills are not suggested for migration when every source skill directory already exists in the target skills folder.
 
-**Data flow**: Creates matching source and target skill directories, runs detection, and asserts no migration items.
+**Data flow**: The test creates a source skill directory and a matching target skill directory. It runs home detection. It expects no migration items.
 
-**Call relations**: Exercises `count_missing_subdirectories` through home-scope detection.
+**Call relations**: The async test runner calls it. It uses fixture_paths for isolated folders and calls the service’s detect method through service_for_paths.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 2 external calls (assert_eq!, create_dir_all).
 
@@ -369,11 +369,11 @@ async fn detect_home_skips_skills_when_all_skill_directories_exist()
 async fn import_repo_agents_md_rewrites_terms_and_skips_non_empty_targets()
 ```
 
-**Purpose**: Verifies that repo `AgentsMd` import rewrites external-agent branding terms and skips repos whose target `AGENTS.md` is already non-empty. It checks both copy and preserve behaviors in one test.
+**Purpose**: Tests two AGENTS.md rules: rewrite old external-agent names to Codex names, and do not overwrite a target file that already has real content.
 
-**Data flow**: Creates two repos, one with only source markdown and one with both source and non-empty target, runs import for both, asserts per-item results, and checks the copied file is rewritten while the existing target remains unchanged.
+**Data flow**: The test creates one repository with a source guidance file and another with both a source and an existing non-empty AGENTS.md. It imports both. It expects the first target to be written with rewritten terms and the second target to stay unchanged.
 
-**Call relations**: Exercises `import_agents_md` behavior for non-empty targets and text rewriting.
+**Call relations**: The async test runner invokes it. It builds a service with service_for_paths, imports two AgentsMd items, and checks the reported successes plus final file contents.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -384,11 +384,11 @@ async fn import_repo_agents_md_rewrites_terms_and_skips_non_empty_targets()
 async fn import_repo_agents_md_overwrites_empty_targets()
 ```
 
-**Purpose**: Verifies that repo `AgentsMd` import treats whitespace-only targets as empty and overwrites them. This distinguishes empty from non-empty preservation behavior.
+**Purpose**: Confirms that an existing AGENTS.md containing only whitespace is treated as empty and may be replaced. This lets migration fill placeholder files safely.
 
-**Data flow**: Creates repo source markdown and whitespace-only target `AGENTS.md`, runs import, asserts one success result, and checks the target now contains rewritten content.
+**Data flow**: The test writes a source guidance file and a whitespace-only AGENTS.md target. It imports AgentsMd. It expects one success and the target file to contain the rewritten guidance.
 
-**Call relations**: Exercises `is_missing_or_empty_text_file` through `import_agents_md`.
+**Call relations**: The async test runner calls it. It uses service_for_paths to run import and then reads the target file to confirm replacement.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -399,11 +399,11 @@ async fn import_repo_agents_md_overwrites_empty_targets()
 async fn detect_repo_prefers_non_empty_external_agent_agents_source()
 ```
 
-**Purpose**: Verifies that repo detection prefers `.claude/CLAUDE.md` when the root `CLAUDE.md` exists but is empty. Source selection should favor the first non-empty candidate.
+**Purpose**: Checks source selection when a repository has both a root guidance file and an external-agent-folder guidance file. If the root one is empty, detection should prefer the non-empty one.
 
-**Data flow**: Creates an empty root `CLAUDE.md` and a non-empty `.claude/CLAUDE.md`, runs detection, and asserts the migration item points at the non-empty source.
+**Data flow**: The test writes an empty root source and a non-empty source under the external-agent directory. It runs repository detection. It expects the migration item to point at the non-empty source.
 
-**Call relations**: Exercises `find_repo_agents_md_source` through detection.
+**Call relations**: The async test runner invokes it. It uses service_for_paths, creates both possible source files, and validates the chosen source path.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -414,11 +414,11 @@ async fn detect_repo_prefers_non_empty_external_agent_agents_source()
 async fn import_repo_hooks_preserves_disabled_codex_hooks_feature()
 ```
 
-**Purpose**: Verifies that importing hooks writes `hooks.json` without altering an existing Codex config that disables the hooks feature. Hook migration should not rewrite unrelated config.
+**Purpose**: Ensures importing hook definitions does not turn on Codex’s hooks feature if the user explicitly disabled it. The hook file can be written, but the feature flag must be respected.
 
-**Data flow**: Creates repo hook settings and existing `.codex/config.toml` with `features.codex_hooks = false`, runs hook import, asserts one success result, checks config file unchanged, and verifies generated `hooks.json` contents.
+**Data flow**: The test writes external hook settings and a Codex config with codex_hooks set to false. It imports Hooks. It expects hooks.json to be created while config.toml remains unchanged.
 
-**Call relations**: Exercises `import_hooks` while ensuring config preservation.
+**Call relations**: The async test runner calls it. It uses service_for_paths, runs import, then checks both the import result and the two target files.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 7 external calls (new, assert_eq!, create_dir_all, read_to_string, write, from_str, vec!).
 
@@ -429,11 +429,11 @@ async fn import_repo_hooks_preserves_disabled_codex_hooks_feature()
 async fn import_repo_mcp_uses_home_settings_toggles_when_repo_settings_missing()
 ```
 
-**Purpose**: Verifies that repo MCP import falls back to home settings for enabled/disabled server toggles when repo settings are absent. This checks the `mcp_settings` fallback path.
+**Purpose**: Tests MCP server enable/disable rules when a repository has no local external-agent settings. In that case, home-level settings can still block a server.
 
-**Data flow**: Creates repo project MCP config outside repo settings plus home settings disabling one server, runs MCP import, asserts one success result, reads generated config, and checks only the allowed server was migrated.
+**Data flow**: The test writes home settings disabling one server and project-level MCP data containing an allowed and blocked server. It imports MCP config. It expects only the allowed server to appear in Codex config.
 
-**Call relations**: Exercises `mcp_settings` fallback behavior through `import_mcp_server_config`.
+**Call relations**: The async test runner invokes it. It builds paths manually, calls service_for_paths, imports McpServerConfig, and parses the written TOML.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 8 external calls (new, assert_eq!, create_dir_all, read_to_string, write, json!, from_str, vec!).
 
@@ -444,11 +444,11 @@ async fn import_repo_mcp_uses_home_settings_toggles_when_repo_settings_missing()
 async fn import_repo_mcp_uses_local_settings_toggles_over_project_settings()
 ```
 
-**Purpose**: Verifies that repo-local settings override repo project settings for MCP enabled/disabled server toggles. It checks precedence between `settings.json` and `settings.local.json`.
+**Purpose**: Verifies that repository local settings override repository project settings when deciding which MCP servers to import.
 
-**Data flow**: Creates repo `.mcp.json`, repo `settings.json`, and repo `settings.local.json` with conflicting toggles, runs MCP import, reads generated config, and asserts only the locally enabled/non-disabled server remains.
+**Data flow**: The test writes three MCP servers plus project and local enable/disable lists. It imports MCP config. It expects only the server enabled by local settings and not locally disabled to be written.
 
-**Call relations**: Exercises `effective_external_settings` and MCP migration together.
+**Call relations**: The async test runner calls it. It uses service_for_paths, then validates the resulting Codex config.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 7 external calls (new, assert_eq!, create_dir_all, read_to_string, write, from_str, vec!).
 
@@ -459,11 +459,11 @@ async fn import_repo_mcp_uses_local_settings_toggles_over_project_settings()
 async fn import_repo_mcp_ignores_invalid_home_settings_when_repo_settings_missing()
 ```
 
-**Purpose**: Verifies that invalid home settings are ignored when repo MCP import falls back to home settings due to missing repo settings. MCP migration should still proceed from project config.
+**Purpose**: Checks that invalid home settings do not block MCP import when repository settings are missing. The service should fall back safely instead of failing the whole migration.
 
-**Data flow**: Creates repo project MCP config and invalid home settings, runs MCP import, reads generated config, and asserts the expected server was migrated.
+**Data flow**: The test writes malformed home settings and project-level MCP data with one server. It imports MCP config. It expects that server to be written to Codex config.
 
-**Call relations**: Exercises the warning-and-ignore branch in `mcp_settings`.
+**Call relations**: The async test runner invokes it. It exercises the MCP import path and then compares the parsed TOML result.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 8 external calls (new, assert_eq!, create_dir_all, read_to_string, write, json!, from_str, vec!).
 
@@ -474,11 +474,11 @@ async fn import_repo_mcp_ignores_invalid_home_settings_when_repo_settings_missin
 async fn import_repo_uses_non_empty_external_agent_agents_source()
 ```
 
-**Purpose**: Verifies that repo `AgentsMd` import uses `.claude/CLAUDE.md` when the root source exists but is empty. It is the import counterpart to the detection preference test.
+**Purpose**: Confirms that import uses the non-empty external-agent-folder guidance file when the root source file is empty.
 
-**Data flow**: Creates empty root source and non-empty `.claude/CLAUDE.md`, runs import, and asserts the generated `AGENTS.md` contains rewritten content from the non-empty source.
+**Data flow**: The test writes an empty root guidance file and a non-empty guidance file under the external-agent directory. It imports AgentsMd. It expects AGENTS.md to contain the non-empty source content rewritten for Codex.
 
-**Call relations**: Exercises `find_repo_agents_md_source` through `import_agents_md`.
+**Call relations**: The async test runner calls it. It mirrors the earlier detection source-selection test, but checks the actual import result on disk.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 6 external calls (new, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -489,11 +489,11 @@ async fn import_repo_uses_non_empty_external_agent_agents_source()
 async fn import_continues_after_failed_migration_item()
 ```
 
-**Purpose**: Verifies that a failed plugin migration item does not abort later items in the same batch. This is a key batch-import resilience rule.
+**Purpose**: Ensures one failed migration item does not stop later items from being imported. This makes the import process more forgiving for users.
 
-**Data flow**: Creates a repo with source markdown, runs `import` with an invalid `Plugins` item followed by a valid `AgentsMd` item, and asserts the target `AGENTS.md` was still written.
+**Data flow**: The test requests an invalid plugin migration followed by a valid AGENTS.md migration. It runs import. It expects the valid AGENTS.md file to still be created.
 
-**Call relations**: Exercises the plugin-specific continue-on-error behavior in `ExternalAgentConfigService::import`.
+**Call relations**: The async test runner invokes it. It uses service_for_paths and checks that the service continues processing after a bad item.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -504,11 +504,11 @@ async fn import_continues_after_failed_migration_item()
 fn migration_metric_tags_for_skills_include_skills_count()
 ```
 
-**Purpose**: Verifies that migration metric tags include `skills_count` for `Skills` items. It locks down metric tagging semantics.
+**Purpose**: Checks that metrics for a skills migration include the number of skills. Metrics are labels used for reporting what happened during migration.
 
-**Data flow**: Calls `migration_metric_tags(ExternalAgentConfigMigrationItemType::Skills, Some(3))` and asserts the exact returned tag vector.
+**Data flow**: The test calls migration_metric_tags with the Skills item type and a count of 3. It expects two labels: the migration type and the skills count.
 
-**Call relations**: Directly tests the metrics helper.
+**Call relations**: The normal test runner calls it. It directly exercises the metric-tag helper and compares the returned labels.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -519,11 +519,11 @@ fn migration_metric_tags_for_skills_include_skills_count()
 async fn detect_home_lists_enabled_plugins_from_settings()
 ```
 
-**Purpose**: Verifies that home plugin detection groups enabled plugins by marketplace and ignores disabled ones. It checks the basic plugin-detection happy path.
+**Purpose**: Verifies that home detection finds enabled plugins listed in external-agent settings. Disabled plugins should not be included.
 
-**Data flow**: Creates home settings with two enabled plugins and one disabled plugin, runs detection, and asserts a single `Plugins` migration item with sorted plugin names.
+**Data flow**: The test writes settings with two enabled plugins and one disabled plugin, plus marketplace information. It runs home detection. It expects one Plugins migration item containing the two enabled plugin names.
 
-**Call relations**: Exercises `detect_plugin_migration` and `extract_plugin_migration_details` through home detection.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then checks the details returned by detect.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -534,11 +534,11 @@ async fn detect_home_lists_enabled_plugins_from_settings()
 async fn detect_home_plugins_uses_local_settings_over_project_settings()
 ```
 
-**Purpose**: Verifies that local settings override plugin enablement from base settings during detection. Disabled and newly enabled plugins should reflect the merged effective settings.
+**Purpose**: Checks that local plugin settings override project plugin settings during detection. This lets a user’s local choices change which plugins are considered enabled.
 
-**Data flow**: Creates base and local settings with conflicting plugin booleans, runs detection, and asserts the resulting plugin migration item contains the merged enabled set.
+**Data flow**: The test writes project settings enabling two plugins and local settings disabling one while enabling another. It runs detection. It expects the final plugin list after overrides.
 
-**Call relations**: Exercises `effective_external_settings` in plugin detection.
+**Call relations**: The async test runner calls it. It uses the shared path helpers, writes both settings files, and verifies the merged detection result.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -549,11 +549,11 @@ async fn detect_home_plugins_uses_local_settings_over_project_settings()
 async fn detect_repo_skips_plugins_that_are_already_configured_in_codex()
 ```
 
-**Purpose**: Verifies that repo plugin detection excludes plugins already explicitly enabled in Codex home config while still reporting other enabled external-agent plugins.
+**Purpose**: Ensures repository plugin detection skips plugins already enabled in the global Codex config. Only plugins still missing should be suggested.
 
-**Data flow**: Creates repo plugin settings and Codex home config enabling one of them, runs detection, and asserts only the other plugin remains in the migration item.
+**Data flow**: The test writes repository external-agent plugin settings and a Codex config where one plugin is already enabled. It runs repository detection. It expects only the other plugin to appear.
 
-**Call relations**: Exercises configured-plugin filtering in `extract_plugin_migration_details`.
+**Call relations**: The async test runner invokes it. It builds the temporary repository and uses service_for_paths to run detection.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -564,11 +564,11 @@ async fn detect_repo_skips_plugins_that_are_already_configured_in_codex()
 async fn detect_repo_skips_plugins_that_are_disabled_in_codex()
 ```
 
-**Purpose**: Verifies that repo plugin detection also suppresses plugins explicitly disabled in Codex config. Any explicit Codex plugin entry counts as already configured.
+**Purpose**: Checks that a plugin explicitly disabled in Codex is not suggested for migration. This respects the user’s existing Codex choice.
 
-**Data flow**: Creates repo plugin settings and Codex home config with the plugin disabled, runs detection, and asserts no migration items.
+**Data flow**: The test writes external-agent settings enabling a plugin and Codex config disabling the same plugin. It runs detection. It expects no migration items.
 
-**Call relations**: Tests another configured-plugin filtering case.
+**Call relations**: The async test runner calls it. It uses service_for_paths and validates that detection honors the existing disabled flag.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -579,11 +579,11 @@ async fn detect_repo_skips_plugins_that_are_disabled_in_codex()
 async fn detect_repo_skips_plugins_without_explicit_enabled_in_codex()
 ```
 
-**Purpose**: Verifies that repo plugin detection suppresses plugins that already have a Codex config entry even if `enabled` is omitted. Presence of the plugin key alone is treated as configured.
+**Purpose**: Verifies that a plugin already present in Codex config, even without an explicit enabled value, is not suggested again. This avoids duplicate configuration.
 
-**Data flow**: Creates repo plugin settings and Codex home config with an empty plugin table, runs detection, and asserts no migration items.
+**Data flow**: The test writes external-agent settings enabling a plugin and a Codex plugin table for the same plugin with no enabled field. It runs detection. It expects an empty result.
 
-**Call relations**: Covers the implicit-configured case in plugin filtering.
+**Call relations**: The async test runner invokes it. It uses service_for_paths to run repository detection and checks for no suggestions.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -594,11 +594,11 @@ async fn detect_repo_skips_plugins_without_explicit_enabled_in_codex()
 async fn import_plugins_requires_details()
 ```
 
-**Purpose**: Verifies that `import_plugins` rejects missing migration details with an `InvalidData` error. Plugin import cannot proceed without explicit plugin groups.
+**Purpose**: Checks that direct plugin import fails clearly when the migration details are missing. Plugin import needs details because it must know which marketplace and plugin names to process.
 
-**Data flow**: Calls `import_plugins(None, None)` on a test service, expects an error, and asserts its kind and message.
+**Data flow**: The test calls import_plugins with no current directory and no details. It expects an InvalidData error with a specific message.
 
-**Call relations**: Directly tests the validation guard in `ExternalAgentConfigService::import_plugins`.
+**Call relations**: The async test runner calls it. It uses fixture_paths and service_for_paths, then checks the error returned by import_plugins.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 1 external calls (assert_eq!).
 
@@ -609,11 +609,11 @@ async fn import_plugins_requires_details()
 async fn detect_repo_does_not_skip_plugins_only_configured_in_project_codex()
 ```
 
-**Purpose**: Verifies that repo plugin detection only consults Codex home config, not repo-local `.codex/config.toml`, when deciding whether a plugin is already configured. Project-local config should not suppress migration suggestions.
+**Purpose**: Confirms repository plugin detection only uses the global Codex plugin config for skipping, not a project-local Codex config. This distinction matters because plugin configuration is treated as global here.
 
-**Data flow**: Creates repo plugin settings, repo-local Codex config enabling the plugin, and empty Codex home config, runs detection, and asserts the plugin is still reported.
+**Data flow**: The test writes an enabled external plugin and a project-local Codex config containing that plugin. It runs repository detection. It still expects the plugin migration to be suggested.
 
-**Call relations**: Exercises the scope choice in plugin detection.
+**Call relations**: The async test runner invokes it. It creates both global and project Codex folders, then checks the service’s detect result.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -624,11 +624,11 @@ async fn detect_repo_does_not_skip_plugins_only_configured_in_project_codex()
 async fn detect_home_skips_plugins_without_marketplace_source()
 ```
 
-**Purpose**: Verifies that plugin detection returns nothing when enabled plugins reference a marketplace with no known source. Such plugins are not migratable.
+**Purpose**: Verifies that detection skips enabled plugins when their marketplace source is missing. Without a source, Codex does not know where the plugin comes from.
 
-**Data flow**: Creates home settings with an enabled plugin but no `extraKnownMarketplaces`, runs detection, and asserts no items.
+**Data flow**: The test writes settings with an enabled plugin but no marketplace definition. It runs home detection. It expects no migration items.
 
-**Call relations**: Exercises marketplace-source filtering in plugin detection.
+**Call relations**: The async test runner calls it. It uses fixture_paths, service_for_paths, and a direct equality check against an empty list.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -639,11 +639,11 @@ async fn detect_home_skips_plugins_without_marketplace_source()
 async fn detect_home_skips_plugins_with_invalid_marketplace_source()
 ```
 
-**Purpose**: Verifies that plugin detection skips plugins whose marketplace source is invalid/unloadable. Detection should not offer migrations it cannot resolve.
+**Purpose**: Checks that detection skips enabled plugins whose marketplace source is not in a usable form. This prevents offering migrations that cannot be completed.
 
-**Data flow**: Creates home settings with an enabled plugin and an invalid marketplace source, runs detection, and asserts no items.
+**Data flow**: The test writes settings with an enabled plugin and an invalid marketplace source value. It runs home detection. It expects no migration items.
 
-**Call relations**: Exercises source validation in plugin detection.
+**Call relations**: The async test runner invokes it. It follows the same setup pattern as other home detection tests and verifies no plugin migration is reported.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -654,11 +654,11 @@ async fn detect_home_skips_plugins_with_invalid_marketplace_source()
 async fn detect_repo_filters_plugins_against_installed_marketplace()
 ```
 
-**Purpose**: Verifies that repo plugin detection filters enabled plugins against the set of installable plugins exposed by an already configured marketplace, excluding unavailable or missing plugins. It checks integration with marketplace metadata.
+**Purpose**: Tests that repository plugin detection looks at an installed marketplace manifest and filters out unavailable or missing plugins. Only installable plugins should be suggested.
 
-**Data flow**: Creates repo plugin settings, Codex home marketplace config, and a marketplace manifest where one plugin is `NOT_AVAILABLE`, one is available, and one is missing, runs detection, and asserts only the available plugin is reported.
+**Data flow**: The test creates a fake installed marketplace with one unavailable plugin, one available plugin, and no entry for a third requested plugin. It runs repository detection. It expects only the available plugin to be listed.
 
-**Call relations**: Exercises `configured_marketplace_plugins` and plugin filtering together.
+**Call relations**: The async test runner calls it. It builds a more detailed fake marketplace on disk, then checks the detection details from service_for_paths.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -669,11 +669,11 @@ async fn detect_repo_filters_plugins_against_installed_marketplace()
 async fn import_plugins_requires_source_marketplace_details()
 ```
 
-**Purpose**: Verifies that plugin import records marketplace/plugin failures when the requested marketplace is absent from source settings. It checks graceful failure reporting rather than hard abort.
+**Purpose**: Checks the failure path when requested plugin details name a marketplace that cannot be found in source settings. The import should report a structured plugin error.
 
-**Data flow**: Creates settings for one marketplace but requests import details for another, runs `import_plugins`, and asserts failed marketplace/plugin IDs plus one raw error.
+**Data flow**: The test writes settings for one marketplace, then asks to import from a different marketplace. It calls import_plugins. It expects no successes, one failed marketplace, one failed plugin ID, and one raw error.
 
-**Call relations**: Exercises the missing-import-source branch in `import_plugins`.
+**Call relations**: The async test runner invokes it. It uses fixture_paths, service_for_paths, and assert_single_plugin_raw_error to verify the detailed failure.
 
 *Call graph*: calls 3 internal fn (assert_single_plugin_raw_error, fixture_paths, service_for_paths); 5 external calls (default, assert_eq!, create_dir_all, write, vec!).
 
@@ -684,11 +684,11 @@ async fn import_plugins_requires_source_marketplace_details()
 async fn import_plugins_defers_marketplace_source_validation_to_add_marketplace()
 ```
 
-**Purpose**: Verifies that plugin import passes marketplace source validation through to `add_marketplace` rather than rejecting it earlier. A bad local path should surface as an import failure outcome.
+**Purpose**: Verifies that plugin import passes marketplace source validation to the lower-level marketplace-add step. In this case, an invalid local path should fail there and be reported cleanly.
 
-**Data flow**: Creates settings with a relative local marketplace path that does not exist, runs `import_plugins` with matching details, and asserts failed marketplace/plugin IDs plus one raw error.
+**Data flow**: The test writes settings for a local marketplace path that does not contain a valid marketplace. It imports plugin details from github_plugin_details. It expects failed marketplace and plugin IDs plus one raw error.
 
-**Call relations**: Exercises the marketplace-install failure branch in `import_plugins`.
+**Call relations**: The async test runner calls it. It combines fixture_paths, service_for_paths, github_plugin_details, and assert_single_plugin_raw_error.
 
 *Call graph*: calls 4 internal fn (assert_single_plugin_raw_error, fixture_paths, github_plugin_details, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -699,11 +699,11 @@ async fn import_plugins_defers_marketplace_source_validation_to_add_marketplace(
 async fn import_plugins_supports_external_agent_plugin_marketplace_layout()
 ```
 
-**Purpose**: Verifies direct plugin import from an external-agent-style local marketplace layout. Successful import should add the marketplace, install the plugin, and enable it in Codex config.
+**Purpose**: Checks that plugin import understands the external agent’s marketplace folder layout. This lets local plugin collections be migrated even if their manifest directory name differs from Codex’s.
 
-**Data flow**: Creates a local marketplace manifest and plugin manifest under the external-agent layout, runs `import_plugins`, asserts the exact successful `PluginImportOutcome`, and checks `config.toml` contains the enabled plugin stanza.
+**Data flow**: The test creates an external-agent-style marketplace manifest and plugin manifest, then writes settings enabling the plugin. It calls import_plugins. It expects the marketplace and plugin to succeed and Codex config to enable the plugin.
 
-**Call relations**: Exercises the happy path of `import_plugins` for local marketplaces.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then checks the PluginImportOutcome and generated config.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 9 external calls (default, assert!, assert_eq!, create_dir_all, read_to_string, write, json!, to_string_pretty, vec!).
 
@@ -714,11 +714,11 @@ async fn import_plugins_supports_external_agent_plugin_marketplace_layout()
 async fn detect_home_supports_relative_external_agent_plugin_marketplace_path()
 ```
 
-**Purpose**: Verifies that home plugin detection resolves relative marketplace paths in settings and still reports the plugin migration item. It checks source-root-relative path handling.
+**Purpose**: Verifies that home detection accepts a marketplace path written relative to the external-agent home. Relative paths are common in portable settings.
 
-**Data flow**: Creates a relative-path local marketplace under external-agent home, writes settings using `./my-marketplace`, runs detection, and asserts the plugin migration item is returned.
+**Data flow**: The test creates a marketplace under the external-agent home and settings whose marketplace path is ./my-marketplace. It runs home detection. It expects the enabled plugin to be detected.
 
-**Call relations**: Exercises `resolve_external_marketplace_source` through home plugin detection.
+**Call relations**: The async test runner calls it. It sets up real folders under the temporary home and checks the service’s detect output.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 3 external calls (assert_eq!, create_dir_all, write).
 
@@ -729,11 +729,11 @@ async fn detect_home_supports_relative_external_agent_plugin_marketplace_path()
 async fn detect_home_infers_external_official_marketplace_when_missing_from_settings()
 ```
 
-**Purpose**: Verifies that detection infers the official external marketplace source when an enabled plugin references it but settings omit an explicit marketplace definition.
+**Purpose**: Checks that detection can infer the official external marketplace even when it is not listed in extra marketplace settings. This supports a built-in marketplace convention.
 
-**Data flow**: Creates settings enabling one plugin in the official marketplace without `extraKnownMarketplaces`, runs detection, and asserts the plugin migration item is still produced.
+**Data flow**: The test writes settings enabling a plugin from the official marketplace name, but no marketplace source entry. It runs home detection. It expects a Plugins migration item for that official marketplace.
 
-**Call relations**: Exercises official-marketplace inference in `collect_marketplace_import_sources`.
+**Call relations**: The async test runner invokes it. It uses fixture_paths and service_for_paths, then validates that inference happened.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 4 external calls (assert_eq!, format!, create_dir_all, write).
 
@@ -744,11 +744,11 @@ async fn detect_home_infers_external_official_marketplace_when_missing_from_sett
 async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path()
 ```
 
-**Purpose**: Verifies direct plugin import from a home-scoped relative local marketplace path. It is the import counterpart to the relative-path detection test.
+**Purpose**: Tests that direct plugin import, not just detection, works with a marketplace path relative to the external-agent home.
 
-**Data flow**: Creates a relative-path local marketplace under external-agent home, runs `import_plugins`, asserts successful outcome, and checks Codex config enables the plugin.
+**Data flow**: The test creates a relative local marketplace and plugin manifest, writes settings enabling the plugin, and calls import_plugins with matching details. It expects success and a Codex config entry enabling the plugin.
 
-**Call relations**: Exercises relative-path resolution in `import_plugins`.
+**Call relations**: The async test runner calls it. It is the import-side partner to the relative-path detection test and uses service_for_paths to run the plugin import.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 7 external calls (default, assert!, assert_eq!, create_dir_all, read_to_string, write, vec!).
 
@@ -759,11 +759,11 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
 async fn import_plugins_infers_external_official_marketplace_when_missing_from_settings()
 ```
 
-**Purpose**: Verifies that plugin import can infer the official marketplace source from enabled plugin IDs even when settings omit marketplace details. Marketplace addition may succeed while plugin installation still fails if the plugin is unavailable.
+**Purpose**: Checks the import behavior for the inferred official marketplace. The marketplace itself can be accepted, while a specific plugin may still fail if it cannot be installed immediately.
 
-**Data flow**: Creates settings enabling one official-marketplace plugin with no explicit marketplace source, runs `import_plugins`, and asserts marketplace success, plugin failure, and one raw error for the plugin ID.
+**Data flow**: The test writes settings enabling a plugin from the official marketplace without a source entry. It calls import_plugins with details for that plugin. It expects the marketplace to count as succeeded, the plugin ID to fail, and one raw error.
 
-**Call relations**: Exercises official-marketplace inference through `import_plugins`.
+**Call relations**: The async test runner invokes it. It uses fixture_paths, service_for_paths, and assert_single_plugin_raw_error to check the partial outcome.
 
 *Call graph*: calls 3 internal fn (assert_single_plugin_raw_error, fixture_paths, service_for_paths); 6 external calls (default, assert_eq!, format!, create_dir_all, write, vec!).
 
@@ -774,11 +774,11 @@ async fn import_plugins_infers_external_official_marketplace_when_missing_from_s
 async fn detect_repo_supports_project_relative_external_agent_plugin_marketplace_path()
 ```
 
-**Purpose**: Verifies that repo plugin detection resolves relative marketplace paths against the repo root rather than the external-agent home. This is the repo-scoped counterpart to the home relative-path test.
+**Purpose**: Verifies repository detection supports marketplace paths relative to the project root. This matters for repositories that keep plugin marketplaces inside the repo.
 
-**Data flow**: Creates a repo-local marketplace and repo `.claude/settings.json` using `./my-marketplace`, runs detection, and asserts the plugin migration item is returned.
+**Data flow**: The test creates a fake repository, a marketplace folder inside it, and external-agent settings pointing to ./my-marketplace. It runs repository detection. It expects the enabled plugin to be listed.
 
-**Call relations**: Exercises repo-root-relative source resolution in plugin detection.
+**Call relations**: The async test runner calls it. It builds its own repository paths, invokes detect through service_for_paths, and compares the migration item.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 5 external calls (new, assert_eq!, create_dir_all, write, vec!).
 
@@ -789,11 +789,11 @@ async fn detect_repo_supports_project_relative_external_agent_plugin_marketplace
 async fn import_plugins_supports_project_relative_external_agent_plugin_marketplace_path()
 ```
 
-**Purpose**: Verifies direct plugin import from a repo-scoped relative local marketplace path. Successful import should resolve the path against the repo root and enable the plugin.
+**Purpose**: Tests direct plugin import when the marketplace path is relative to a repository rather than the external-agent home.
 
-**Data flow**: Creates a repo-local marketplace and settings, runs `import_plugins(Some(repo_root), ...)`, asserts successful outcome, and checks Codex config enables the plugin.
+**Data flow**: The test creates a repository-local marketplace and plugin manifest, writes repository external-agent settings, and calls import_plugins with the repository path as the current directory. It expects a successful marketplace and plugin import plus an enabled Codex config entry.
 
-**Call relations**: Exercises repo-root-relative source resolution in `import_plugins`.
+**Call relations**: The async test runner invokes it. It is the import-side partner to the project-relative detection test and uses service_for_paths before calling import_plugins.
 
 *Call graph*: calls 1 internal fn (service_for_paths); 8 external calls (default, new, assert!, assert_eq!, create_dir_all, read_to_string, write, vec!).
 
@@ -804,24 +804,24 @@ async fn import_plugins_supports_project_relative_external_agent_plugin_marketpl
 fn import_skills_returns_only_new_skill_directory_names()
 ```
 
-**Purpose**: Verifies that `import_skills` copies only missing skill directories and returns only the names of newly copied directories. Existing targets are skipped silently.
+**Purpose**: Checks that skill import reports only the skills it actually copied. Existing target skill directories should be skipped and not counted as new.
 
-**Data flow**: Creates two source skill directories and one matching existing target directory, calls `import_skills(None)`, and asserts only the missing skill name is returned.
+**Data flow**: The test creates two source skill directories and one matching target directory that already exists. It calls import_skills. It expects the returned list to contain only the newly copied skill name.
 
-**Call relations**: Directly tests the selective-copy behavior of `ExternalAgentConfigService::import_skills`.
+**Call relations**: The normal test runner calls it. It uses fixture_paths and service_for_paths, then directly exercises the service’s import_skills helper.
 
 *Call graph*: calls 2 internal fn (fixture_paths, service_for_paths); 2 external calls (assert_eq!, create_dir_all).
 
 
 ### `app-server/src/config_manager_service_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This file is the regression suite for `config_manager_service.rs`. It builds temporary config directories and test `ConfigManager` instances, then drives the public read/write APIs with realistic protocol payloads. Several tests verify persistence details that are easy to break when editing TOML structurally: nested tables are emitted as explicit `toml_edit::Table`s, comments and key order survive writes, clearing a missing nested path is a no-op, and `Upsert` merges table contents while `Replace` overwrites them.
+The configuration manager is the part of the app server that edits the user's `config.toml` file and combines it with other sources of settings, such as managed company policy, command-line flags, and cloud requirements. This test file checks that those pieces work together in predictable ways. In plain terms, it makes sure the app does not accidentally damage a user's configuration file, accept old configuration formats that are no longer supported, or pretend a setting took effect when a higher-priority policy overrode it.
 
-A large portion of the suite codifies validation and policy invariants. Writes to legacy `profile` and `profiles.*` keys are rejected for both single and batch writes; invalid user values are rejected even when a managed layer would override them; reserved built-in provider IDs cannot be overridden; and enterprise feature requirements can veto writes. Other tests cover optimistic concurrency (`expected_version` mismatch), defaulting writes to the active user config path when `file_path` is omitted, and preserving the selected profile-specific user config path even after a load failure.
+Most tests create a temporary folder, write a small fake config file, build a test-only `ConfigManager`, then ask it to read or edit settings. They then inspect either the file contents, the parsed configuration, or the error that came back. Several tests focus on layering: managed configuration should win over user configuration, and reads should explain where each final value came from. Others focus on write safety: version checks prevent editing an out-of-date file, validation catches invalid values before saving, and special merge rules decide whether nested tables are combined or replaced.
 
-Layering behavior is checked from both read and write sides. Reads must report origins and ordered layers correctly, including managed/session/user precedence. Writes may return `OkOverridden` plus metadata when a managed layer shadows the edited user value. The suite also verifies nested app and MCP-server paths deserialize back into the protocol config shape.
+A useful analogy is a stack of transparent sheets: the final config is what you see when all sheets are placed on top of each other. These tests make sure the top sheets win, and that editing one sheet does not smear or erase the others.
 
 #### Function details
 
@@ -831,11 +831,11 @@ Layering behavior is checked from both read and write sides. Reads must report o
 fn toml_value_to_item_handles_nested_config_tables()
 ```
 
-**Purpose**: Verifies that converting nested TOML config into `toml_edit::Item` produces explicit nested tables rather than collapsing structure. It specifically checks `mcp_servers.docs.http_headers` layout and scalar values.
+**Purpose**: Checks that a parsed TOML configuration can be converted into an editable TOML structure without losing nested tables. This matters because the service edits config files while trying to keep their table structure understandable.
 
-**Data flow**: Builds a TOML string, parses it into `TomlValue`, converts it with `toml_value_to_item`, then inspects the resulting root, `mcp_servers`, `docs`, and `http_headers` tables and asserts explicitness and expected string values.
+**Data flow**: It starts with a small TOML string containing nested `mcp_servers` tables. The test parses that text, converts it into the editable TOML form, then walks through the resulting tables to confirm they are real explicit tables and still contain the expected values. The output is not a returned value; the test passes if all checks hold.
 
-**Call relations**: This is a focused unit test for the conversion helper used during persistence, guarding the table-shape assumptions relied on by write-path edit generation.
+**Call relations**: The test runner calls this function directly. Inside the test, it exercises the TOML parsing path and the `toml_value_to_item` conversion helper, then uses assertions to prove nested config tables survive the trip.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -846,11 +846,11 @@ fn toml_value_to_item_handles_nested_config_tables()
 async fn write_value_preserves_comments_and_order() -> Result<()>
 ```
 
-**Purpose**: Checks that adding a new nested config key updates the file without disturbing existing comments or top-level/table ordering. It protects the comment-preserving behavior of `ConfigEditsBuilder` plus the helper conversions.
+**Purpose**: Verifies that adding a new setting to the config file does not erase comments or reorder existing sections. This is important because users often hand-edit this file and expect it to stay readable.
 
-**Data flow**: Creates a temp `config.toml` with comments and sections, constructs a test `ConfigManager`, performs `write_value` for `features.personality = true`, reads the file back from disk, and compares the full text to the expected commented TOML.
+**Data flow**: It writes a sample `config.toml` with comments and ordered sections into a temporary directory. It creates a test `ConfigManager`, writes `features.personality = true`, then reads the file back and compares the full text against the expected result. The before-and-after story is: one setting is added, while the rest of the file stays exactly as it was.
 
-**Call relations**: Exercises the full write pipeline through `ConfigManager::write_value`, with assertions aimed at persistence fidelity rather than just semantic config equality.
+**Call relations**: The test runner starts this async test. The test uses `ConfigManager::without_managed_config_for_tests` to avoid policy layers, then calls the manager's write path and checks the file system result.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 5 external calls (assert_eq!, json!, read_to_string, write, tempdir).
 
@@ -861,11 +861,11 @@ async fn write_value_preserves_comments_and_order() -> Result<()>
 async fn clear_missing_nested_config_is_noop() -> Result<()>
 ```
 
-**Purpose**: Ensures clearing a nonexistent nested path succeeds without modifying the file or reporting an override. This codifies the no-op semantics of `clear_path` on missing parents.
+**Purpose**: Checks that clearing a nested setting that does not exist leaves the file unchanged. This prevents harmless delete requests from creating empty tables or otherwise modifying the user's file.
 
-**Data flow**: Creates an empty temp config file, calls `write_value` with `features.personality = null`, captures the response, and asserts `WriteStatus::Ok`, `overridden_metadata == None`, and unchanged empty file contents.
+**Data flow**: It creates an empty config file and asks the service to write a JSON null value to `features.personality`, which means “remove this setting.” Since that setting is absent, the service should report success but make no file changes. The test reads the file afterward and expects it to still be empty.
 
-**Call relations**: Covers the deletion branch of the write path and indirectly validates that no persistence occurs when no effective change is detected.
+**Call relations**: The test runner calls this async test. It builds a test config manager with no managed configuration and exercises the write operation in its delete-style behavior.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 3 external calls (assert_eq!, write, tempdir).
 
@@ -876,11 +876,11 @@ async fn clear_missing_nested_config_is_noop() -> Result<()>
 async fn write_value_rejects_legacy_profile_selector() -> Result<()>
 ```
 
-**Purpose**: Confirms that writing the legacy top-level `profile` selector is rejected as a validation error. This preserves the migration away from profile selection inside config contents.
+**Purpose**: Ensures the service rejects writes to the old top-level `profile` setting. This protects users from creating outdated configuration that the newer profile system should no longer use.
 
-**Data flow**: Writes a baseline config file, invokes `write_value` with `key_path = "profile"` and a string value, captures the error, asserts the returned write error code and message substring, and verifies the file remains unchanged.
+**Data flow**: It starts with a simple config containing a model name. The test asks the service to write `profile = "work"`. Instead of changing the file, the service returns a validation error, and the test confirms both the error code and the unchanged file contents.
 
-**Call relations**: Exercises the explicit legacy-key rejection branch inside `ConfigManager::apply_edits` for single-value writes.
+**Call relations**: The test runner invokes this async test. The test uses the no-managed-config constructor, calls the write path, and checks that validation stops the write before anything reaches disk.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 5 external calls (assert!, assert_eq!, json!, write, tempdir).
 
@@ -891,11 +891,11 @@ async fn write_value_rejects_legacy_profile_selector() -> Result<()>
 async fn write_value_rejects_legacy_profile_table() -> Result<()>
 ```
 
-**Purpose**: Confirms that writes under `profiles.*` are rejected as legacy profile-table mutations. It ensures nested legacy profile structures cannot be recreated through the API.
+**Purpose**: Ensures the service rejects writes into the old `profiles` table layout. This keeps the configuration format from drifting back toward a legacy system.
 
-**Data flow**: Creates an empty config file, attempts to write `profiles.work.model`, asserts `ConfigValidationError` and an explanatory message, then checks that the file is still empty.
+**Data flow**: It creates an empty config file, then tries to write `profiles.work.model = "gpt-work"`. The service should return a validation error explaining that legacy profile tables are not allowed, and the file should remain empty.
 
-**Call relations**: Targets the second legacy-profile guard in `ConfigManager::apply_edits`, covering nested path rejection.
+**Call relations**: The test runner calls this async test. It goes through the same write interface a real client would use, proving that the service rejects this outdated path before saving.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 5 external calls (assert!, assert_eq!, json!, write, tempdir).
 
@@ -906,11 +906,11 @@ async fn write_value_rejects_legacy_profile_table() -> Result<()>
 async fn batch_write_rejects_legacy_profile_selector() -> Result<()>
 ```
 
-**Purpose**: Verifies that batch writes fail atomically when any edit targets the legacy `profile` selector, even if earlier edits in the batch are otherwise valid. This protects against partial application.
+**Purpose**: Checks that a batch edit is rejected if any edit in the batch tries to write the legacy `profile` selector. This matters because batch writes must be all-or-nothing; one bad edit should not allow earlier edits to sneak through.
 
-**Data flow**: Creates a config file, submits a `ConfigBatchWriteParams` containing a valid `model` edit and an invalid `profile` edit, expects an error, asserts the validation code/message, and confirms the original file text is unchanged.
+**Data flow**: It begins with `model = "gpt-main"`. The test submits two edits together: one valid model change and one invalid legacy profile write. The service returns a validation error, and the original file is left untouched, showing that the batch did not partially apply.
 
-**Call relations**: Exercises the batch wrapper plus the shared validation path in `apply_edits`, specifically proving that invalid later edits prevent persistence of earlier ones.
+**Call relations**: The test runner starts this async test. It builds a test manager, calls the batch write path, and relies on assertions to confirm that validation protects the whole batch.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 5 external calls (assert!, assert_eq!, write, tempdir, vec!).
 
@@ -921,11 +921,11 @@ async fn batch_write_rejects_legacy_profile_selector() -> Result<()>
 async fn write_value_supports_nested_app_paths() -> Result<()>
 ```
 
-**Purpose**: Checks that writes into the `apps` subtree can first create an app entry and then update a nested approval-mode field, and that the resulting config reads back into the typed `AppsConfig` protocol structure.
+**Purpose**: Verifies that the service can write and later read nested app-specific configuration. This lets clients update one app's settings without replacing the entire app configuration by hand.
 
-**Data flow**: Starts from an empty config file, writes a JSON object to `apps`, writes a string to `apps.app1.default_tools_approval_mode`, then calls `read` and asserts the returned `read.config.apps` equals the expected `AppsConfig`/`AppConfig` structure.
+**Data flow**: It first writes an `apps` object containing `app1`, then writes a deeper value at `apps.app1.default_tools_approval_mode`. Afterward it reads the full configuration and expects `app1` to contain both its original `enabled` value and the newly added approval setting. The output is a parsed config object with the expected nested app data.
 
-**Call relations**: Exercises nested path creation, schema validation, and read-side protocol conversion for the `apps` config domain.
+**Call relations**: The test runner calls this async test. The test creates a no-managed-config manager, uses the write API twice, then hands off to the read API to verify the written data is understood by the normal config loader.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 4 external calls (assert_eq!, json!, write, tempdir).
 
@@ -936,11 +936,11 @@ async fn write_value_supports_nested_app_paths() -> Result<()>
 async fn write_value_supports_custom_mcp_server_default_tool_approval_mode() -> Result<()>
 ```
 
-**Purpose**: Verifies that nested writes under a custom MCP server table are persisted and visible in the read response’s `additional` JSON. This covers config fields that may not map to a dedicated strongly typed protocol field.
+**Purpose**: Checks that custom MCP server settings can include a default tool approval mode. MCP here means Model Context Protocol, a way for the app to connect to external tools or servers.
 
-**Data flow**: Creates a config file with `[mcp_servers.docs]`, writes `mcp_servers.docs.default_tools_approval_mode = "approve"`, asserts the raw file contains the new line, then reads config and checks the nested JSON path under `additional`.
+**Data flow**: It starts with a config containing one custom MCP server named `docs`. The test writes `default_tools_approval_mode = "approve"` under that server, reads the raw file to make sure the setting was written, then reads the parsed config to make sure the value appears in the additional configuration data. The setting goes from a JSON input value to TOML text and then back into parsed JSON-like config data.
 
-**Call relations**: Exercises nested table editing plus read-side passthrough of additional config content.
+**Call relations**: The test runner invokes this async test. It uses the test config manager's write and read paths, checking both the file-level result and the higher-level parsed configuration result.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 6 external calls (assert!, assert_eq!, json!, read_to_string, write, tempdir).
 
@@ -951,11 +951,11 @@ async fn write_value_supports_custom_mcp_server_default_tool_approval_mode() -> 
 async fn read_includes_origins_and_layers()
 ```
 
-**Purpose**: Checks that a read with `include_layers = true` returns the effective config, origin metadata, and ordered layer list with managed config above user and system layers. It tolerates an optional top MDM layer on macOS hosts.
+**Purpose**: Verifies that reading configuration can explain not only the final values, but also where they came from. This is important when a user setting is overridden by a managed policy.
 
-**Data flow**: Creates temp user and managed config files, builds a test manager with managed-config overrides, calls `read`, asserts the effective approval policy, inspects `origins["approval_policy"]`, normalizes away an optional MDM layer, and asserts the remaining layer ordering and source metadata.
+**Data flow**: It writes a user config with one model setting and a managed config with an approval policy. The test reads with `include_layers` enabled, then checks that the final approval policy came from the managed file and that the response includes the expected stack of layers: managed, user, and system. On macOS, it tolerates an extra device-management layer if the local machine provides one.
 
-**Call relations**: Exercises the read path’s origin/layer reporting rather than write behavior, validating how `ConfigLayerStack` is exposed through the protocol.
+**Call relations**: The test runner calls this async test. It builds a `ConfigManager` with `new_for_tests`, a managed config path override, and the default cloud loader, then exercises the read path that reports layer and origin metadata.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, try_from); 6 external calls (assert!, assert_eq!, matches!, write, tempdir, vec!).
 
@@ -966,11 +966,11 @@ async fn read_includes_origins_and_layers()
 async fn write_value_succeeds_when_managed_preferences_expand_home_directory_paths() -> Result<()>
 ```
 
-**Purpose**: On macOS, verifies that managed preferences containing `~`-based writable roots do not break unrelated user config writes. This guards a platform-specific interaction between managed config expansion and write validation.
+**Purpose**: On macOS, checks that writes still work when managed preferences contain paths using `~` for the home directory. This guards against a platform-specific parsing issue in company-managed settings.
 
-**Data flow**: Builds loader overrides with base64-encoded managed preferences TOML containing `writable_roots = ["~/code"]`, writes `model = "updated"` through the service, and asserts success status plus updated file contents.
+**Data flow**: It creates a user config and injects a base64-encoded managed preference containing a writable path like `~/code`. The test then writes a new model value to the user config. The expected result is a successful write and a file containing the updated model.
 
-**Call relations**: Exercises the full write path under a managed-preferences environment that previously could interfere with config loading or validation.
+**Call relations**: The macOS test runner calls this async test only on macOS. It sets up `LoaderOverrides` with managed preferences, constructs the test manager with `new_for_tests`, then confirms the write path can load those preferences and still save the user file.
 
 *Call graph*: calls 3 internal fn (new_for_tests, default, with_managed_config_path_for_tests); 5 external calls (assert_eq!, json!, write, tempdir, vec!).
 
@@ -981,11 +981,11 @@ async fn write_value_succeeds_when_managed_preferences_expand_home_directory_pat
 async fn write_value_reports_override()
 ```
 
-**Purpose**: Checks a case where the user writes the same value that a managed layer already enforces, and confirms the write succeeds without override metadata. This distinguishes true shadowing from convergence with the effective value.
+**Purpose**: Checks behavior when a user writes the same value that a managed layer already enforces. The write should succeed, but the final effective value still belongs to the managed layer.
 
-**Data flow**: Creates user and managed configs for `approval_policy`, performs a write setting the user value to `never`, reads config afterward to confirm the managed origin remains effective, and asserts the write response is `Ok` with `overridden_metadata == None`.
+**Data flow**: It writes a user config with `approval_policy = "on-request"` and a managed config with `approval_policy = "never"`. The test writes `never` to the user file, then reads the combined config and checks that the final value and its origin are still the managed file. The write response is expected to be normal success, without override metadata, because the written value matches the enforced effective value.
 
-**Call relations**: Exercises the subtle branch in override computation where user and effective values match, so the response should not be marked overridden.
+**Call relations**: The test runner invokes this async test. It creates a manager with a managed config override, calls the write path, then calls the read path to inspect the layered result.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, try_from); 6 external calls (assert!, assert_eq!, json!, write, tempdir, vec!).
 
@@ -996,11 +996,11 @@ async fn write_value_reports_override()
 async fn version_conflict_rejected()
 ```
 
-**Purpose**: Verifies optimistic concurrency enforcement by supplying a bogus `expected_version`. The service must reject the write with `ConfigVersionConflict` before mutating the file.
+**Purpose**: Ensures a write is rejected when the caller provides an out-of-date expected file version. This prevents one client from accidentally overwriting another client's changes.
 
-**Data flow**: Creates a user config file, calls `write_value` with `expected_version = Some("sha256:bogus")`, captures the error, and asserts the extracted write error code equals `ConfigVersionConflict`.
+**Data flow**: It starts with a config file containing `model = "user"`. The test tries to write a new model while claiming the expected version is `sha256:bogus`. The service compares that expected version with the real file version, rejects the write, and returns a version conflict error.
 
-**Call relations**: Targets the version-check branch in `ConfigManager::apply_edits`.
+**Call relations**: The test runner calls this async test. It uses the no-managed-config test manager and exercises the write path's optimistic locking check, which is a safety check for concurrent edits.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 4 external calls (assert_eq!, json!, write, tempdir).
 
@@ -1011,11 +1011,11 @@ async fn version_conflict_rejected()
 async fn write_value_defaults_to_user_config_path()
 ```
 
-**Purpose**: Ensures that omitting `file_path` causes writes to target the manager’s resolved default user config file. This is the normal convenience path for clients that do not specify a file explicitly.
+**Purpose**: Checks that if a caller does not provide a file path, the service writes to the normal user config file. This keeps simple clients from needing to know the exact config path.
 
-**Data flow**: Creates an empty default `config.toml`, invokes `write_value` with `file_path: None`, then reads the default file from disk and asserts it contains the new `model` assignment.
+**Data flow**: It creates an empty default `config.toml`, then calls `write_value` with `file_path` set to none. The service chooses the default user config path and writes the model setting there. The test reads the file and confirms it now contains the new model.
 
-**Call relations**: Exercises the path-defaulting logic in `apply_edits` when no explicit target path is provided.
+**Call relations**: The test runner invokes this async test. It builds a no-managed-config manager and confirms the write path can choose its default target file on its own.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 5 external calls (assert!, json!, read_to_string, write, tempdir).
 
@@ -1026,11 +1026,11 @@ async fn write_value_defaults_to_user_config_path()
 async fn write_value_defaults_to_selected_user_config_path()
 ```
 
-**Purpose**: Checks that when the manager is configured with a selected profile-specific user config path, omitted `file_path` writes go to that selected file rather than the main `config.toml`. It protects profile-v2 path selection behavior.
+**Purpose**: Checks that when a specific user config file has been selected, omitted write paths go to that selected file instead of the main config file. This matters for profile-like workflows where different config files may be active.
 
-**Data flow**: Creates both main and selected config files, configures loader overrides with `user_config_path` and `user_config_profile`, performs a write with `file_path: None`, then asserts the selected file changed and the main file did not.
+**Data flow**: It creates a main config with `gpt-main` and a separate selected config file. Loader overrides tell the manager that the selected file is active. The test writes a model without passing a file path, then confirms the selected file changed to `gpt-work` while the main config stayed unchanged.
 
-**Call relations**: Exercises the same default-path branch as the previous test, but under non-default selected-user-config state.
+**Call relations**: The test runner calls this async test. It uses `new_for_tests` with loader overrides for the selected config path, then checks that the write path respects the loader's selected user file.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, from_absolute_path); 5 external calls (assert_eq!, json!, write, tempdir, vec!).
 
@@ -1041,11 +1041,11 @@ async fn write_value_defaults_to_selected_user_config_path()
 async fn load_default_config_preserves_selected_user_config_path_after_load_error()
 ```
 
-**Purpose**: Verifies that a failed load of the selected user config does not erase the manager’s knowledge of which user config file is selected. This protects subsequent fallback/default loads from silently switching paths.
+**Purpose**: Ensures that a failed load of a selected config file does not make the service forget which user config file was selected. This is important for recovery after a broken config file.
 
-**Data flow**: Creates a valid main config and an invalid selected config, configures the manager to use the selected path, calls `load_latest_config` expecting an error, then calls `load_default_config` and asserts the resulting `config_layer_stack.get_user_config_file()` still points to the selected file.
+**Data flow**: It creates a valid main config and an invalid selected config file. Loading the latest config fails because the selected file is not valid TOML. Then the test loads the default config and checks that the config layer stack still records the selected file as the user config file.
 
-**Call relations**: This test reaches beyond the service methods into `ConfigManager` state management, guarding path-selection persistence across load failures.
+**Call relations**: The test runner invokes this async test. It sets up `new_for_tests` with a selected user config override, intentionally triggers a load error, then verifies the default-loading path preserves the selected path information.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, from_absolute_path); 4 external calls (assert_eq!, write, tempdir, vec!).
 
@@ -1056,11 +1056,11 @@ async fn load_default_config_preserves_selected_user_config_path_after_load_erro
 async fn invalid_user_value_rejected_even_if_overridden_by_managed()
 ```
 
-**Purpose**: Ensures user-layer validation happens before considering that a managed layer would override the same setting. Invalid user values must still be rejected and not persisted.
+**Purpose**: Checks that invalid user input is rejected even when a managed setting would override it anyway. This prevents bad values from being saved silently just because they would not currently take effect.
 
-**Data flow**: Creates user and managed config files, attempts to write an invalid `approval_policy = "bogus"`, asserts `ConfigValidationError`, and verifies the user config file remains unchanged.
+**Data flow**: It creates a user config with a model and a managed config that forces `approval_policy = "never"`. The test tries to write the invalid value `approval_policy = "bogus"` to the user file. The service returns a validation error and leaves the user file unchanged.
 
-**Call relations**: Directly validates the design choice in `apply_edits` to validate the standalone user config before validating the effective merged config.
+**Call relations**: The test runner calls this async test. The manager is built with a managed config layer, but the write path still validates the user file contents before saving them.
 
 *Call graph*: calls 3 internal fn (new_for_tests, default, with_managed_config_path_for_tests); 6 external calls (assert_eq!, json!, read_to_string, write, tempdir, vec!).
 
@@ -1071,11 +1071,11 @@ async fn invalid_user_value_rejected_even_if_overridden_by_managed()
 async fn reserved_builtin_provider_override_rejected()
 ```
 
-**Purpose**: Checks that writes attempting to redefine reserved built-in model provider IDs are rejected. This protects invariant provider identities such as `openai`.
+**Purpose**: Ensures users cannot override reserved built-in model provider IDs such as `openai`. This protects built-in provider definitions from being accidentally or maliciously changed through user config.
 
-**Data flow**: Creates a baseline config, attempts to write `model_providers.openai.name`, captures the error, asserts validation code and message fragments mentioning reserved built-in IDs and `openai`, and confirms the file is unchanged.
+**Data flow**: It starts with a simple user config. The test tries to write `model_providers.openai.name = "OpenAI Override"`. The service rejects the write with a validation error mentioning reserved built-in provider IDs, and the original file remains unchanged.
 
-**Call relations**: Exercises schema/business-rule validation reached through `validate_config` and related config deserialization logic.
+**Call relations**: The test runner invokes this async test. It uses the no-managed-config manager and exercises validation in the write path for protected provider names.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 6 external calls (assert!, assert_eq!, json!, read_to_string, write, tempdir).
 
@@ -1086,11 +1086,11 @@ async fn reserved_builtin_provider_override_rejected()
 async fn write_value_rejects_feature_requirement_conflict()
 ```
 
-**Purpose**: Verifies that enterprise feature requirements loaded from cloud config can veto a user write that conflicts with required feature settings. This guards the post-deserialization requirement validation step.
+**Purpose**: Checks that a user cannot write a feature setting that conflicts with an enterprise requirement. This keeps organization-level feature requirements from being weakened by local config edits.
 
-**Data flow**: Creates an empty config, builds a manager with an enterprise requirement forcing `features.personality = true`, attempts to write `false`, asserts `ConfigValidationError` and an explanatory message, and checks the file remains empty.
+**Data flow**: It creates an empty config and a fake cloud configuration bundle that requires `features.personality = true`. The test tries to write `features.personality = false`. The service returns a validation error explaining the conflict, and the file stays empty.
 
-**Call relations**: Exercises `validate_feature_requirements_for_config_toml` through the write path.
+**Call relations**: The test runner calls this async test. It builds the manager with `new_for_tests`, no managed local config, and a cloud fixture that supplies an enterprise requirement, then verifies the write path checks against that requirement.
 
 *Call graph*: calls 3 internal fn (new_for_tests, without_managed_config_for_tests, loader_with_enterprise_requirement); 6 external calls (assert!, assert_eq!, json!, write, tempdir, vec!).
 
@@ -1101,11 +1101,11 @@ async fn write_value_rejects_feature_requirement_conflict()
 async fn read_reports_managed_overrides_user_and_session_flags()
 ```
 
-**Purpose**: Checks that read-side origin reporting correctly attributes the effective value to managed config even when both session flags and user config also set the same key. It also verifies layer ordering among managed, session, and user layers.
+**Purpose**: Verifies the ordering of configuration layers when managed config, command-line session flags, and user config all set the same key. Managed config should win, and the response should show that clearly.
 
-**Data flow**: Creates user and managed config files plus CLI override tuples, builds a manager, calls `read(include_layers = true)`, asserts the effective `model`, checks the origin source, strips an optional top MDM layer, and asserts the remaining layer order is managed, session flags, then user.
+**Data flow**: It writes `model = "user"` in the user file, `model = "system"` in the managed file, and passes a session override of `model = "session"`. The read result should report the final model as `system`, with the origin set to the managed file. The layer list should show managed above session flags above user config, ignoring an extra macOS management layer if present.
 
-**Call relations**: Exercises the read path’s precedence/origin exposure in a three-layer conflict scenario.
+**Call relations**: The test runner invokes this async test. It creates the manager with `new_for_tests`, managed-path overrides, and CLI-style override values, then calls the read path that reports both final values and layer metadata.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, try_from); 5 external calls (assert_eq!, matches!, write, tempdir, vec!).
 
@@ -1116,11 +1116,11 @@ async fn read_reports_managed_overrides_user_and_session_flags()
 async fn write_value_reports_managed_override()
 ```
 
-**Purpose**: Verifies that when a user writes a value that is still shadowed by managed config, the write response is marked `OkOverridden` and includes metadata naming the overriding layer and effective value. This is the positive case for override reporting.
+**Purpose**: Checks that when a user writes a value that is immediately overridden by managed configuration, the write response says so. This helps clients explain why a saved setting is not the setting the app actually uses.
 
-**Data flow**: Creates empty user config and managed config forcing `approval_policy = never`, performs a user write to `on-request`, captures the response, and asserts `status == OkOverridden`, the overriding layer source matches the managed file, and `effective_value` is JSON `"never"`.
+**Data flow**: It creates an empty user config and a managed config forcing `approval_policy = "never"`. The test writes `approval_policy = "on-request"` to the user file. The service saves the user value but returns `OkOverridden`, along with metadata naming the managed layer and showing the effective value is still `never`.
 
-**Call relations**: Exercises `first_overridden_edit`/`compute_override_metadata` through the public write API.
+**Call relations**: The test runner calls this async test. It constructs a manager with a managed config path, calls the write API, and inspects the response metadata that describes the higher-priority override.
 
 *Call graph*: calls 4 internal fn (new_for_tests, default, with_managed_config_path_for_tests, try_from); 5 external calls (assert_eq!, json!, write, tempdir, vec!).
 
@@ -1131,22 +1131,26 @@ async fn write_value_reports_managed_override()
 async fn upsert_merges_tables_replace_overwrites() -> Result<()>
 ```
 
-**Purpose**: Compares `MergeStrategy::Upsert` and `MergeStrategy::Replace` on a nested MCP server table to ensure upsert preserves unrelated nested tables while replace removes them. It is the main behavioral test for merge semantics.
+**Purpose**: Compares two write modes for nested tables: upsert and replace. Upsert should merge new values into an existing table, while replace should remove old nested entries that are not in the new value.
 
-**Data flow**: Writes a base TOML config with nested `env_http_headers` and `http_headers`, constructs a JSON overlay, performs an upsert write and parses the resulting file back into `TomlValue` for equality against the expected merged TOML, then resets the file, performs a replace write, and compares against the expected overwritten TOML.
+**Data flow**: It starts with an MCP server table that has several fields and two nested header tables. First it writes an overlay using the `Upsert` strategy; the result keeps unrelated existing nested data while updating and adding requested fields. Then it resets the file and writes the same overlay using `Replace`; this time the old `env_http_headers` table disappears because it was not part of the replacement value. The test parses the final TOML each time and compares it to the expected structure.
 
-**Call relations**: Exercises the `apply_merge` branch that calls `merge_toml_values` for table-to-table upserts and contrasts it with direct replacement.
+**Call relations**: The test runner invokes this async test. It uses the no-managed-config manager and exercises the write path's two merge strategies, then uses TOML parsing and assertions to confirm the exact table-level behavior.
 
 *Call graph*: calls 1 internal fn (without_managed_config_for_tests); 6 external calls (assert_eq!, json!, read_to_string, write, tempdir, from_str).
 
 
 ### `app-server/src/main_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module exercises the command-line surface of `AppServerArgs`, specifically the path where users supply inline configuration overrides with both the short `-c` form and the long `--config` form. The test constructs a synthetic argv array with a program name, two override arguments, and an unrelated `--listen off` option to ensure normal argument parsing still succeeds in the same invocation. It then inspects the parsed `config_overrides` field and explicitly invokes its override parser, asserting that the result is an ordered `Vec<(String, TomlValue)>` containing the exact keys `model` and `sandbox_mode` with TOML string values.
+This is a small test file for the app server’s startup arguments. Its job is to make sure the command-line interface understands two ways of giving configuration overrides: the short form `-c` and the longer `--config` form. A configuration override is a setting typed on the command line to temporarily replace or add to the normal configuration file, like telling the program which model to use.
 
-The file’s main value is as a regression check on the integration between Clap-derived argument parsing (`Parser::try_parse_from`) and the application’s config override representation. It confirms that multiple override flags accumulate rather than overwrite each other, that quoted TOML string syntax is preserved and decoded into `toml::Value`, and that the parser accepts both short and long flag spellings in one command. By using `pretty_assertions::assert_eq`, failures produce readable structural diffs, which is useful because the assertion compares nested tuple/vector/TOML data rather than plain scalars.
+The test pretends to start the app server with a list of command-line words, much like a real shell command. It includes one override for the model, one override for the sandbox mode, and another option, `--listen off`, to show that normal server options can appear alongside configuration overrides.
+
+After parsing those command-line words into `AppServerArgs`, the test asks the override parser to turn the raw text into structured TOML values. TOML is a common configuration format; here it means the text `model="gpt-5-codex"` becomes the key `model` paired with the string value `gpt-5-codex`.
+
+Finally, the test compares the parsed result with the exact list it expects. If someone later changes the command-line parser and accidentally breaks `-c` or `--config`, this test should fail quickly.
 
 #### Function details
 
@@ -1156,24 +1160,24 @@ The file’s main value is as a regression check on the integration between Clap
 fn app_server_accepts_cli_config_overrides()
 ```
 
-**Purpose**: Builds a representative app-server command line, parses it into `AppServerArgs`, converts the collected config override arguments into TOML-backed key/value pairs, and checks that the parsed overrides exactly match the expected two entries.
+**Purpose**: This test proves that the app server accepts configuration overrides from both `-c` and `--config` command-line flags. It matters because users rely on these flags to change settings at startup without editing a configuration file.
 
-**Data flow**: It feeds a fixed argv slice into `AppServerArgs::try_parse_from`, producing an `AppServerArgs` instance or failing the test with `expect`. From that struct it reads `config_overrides`, calls `parse_overrides()` to transform raw CLI override strings into a `Vec<(String, TomlValue)>`, and compares the result against a literal expected vector containing `model` and `sandbox_mode` string values. The function writes no persistent state; its only outputs are test pass/fail and assertion diagnostics.
+**Data flow**: It starts with a fake command-line argument list, including two configuration overrides and one unrelated server option. The arguments are parsed into `AppServerArgs`, then the stored override strings are parsed into TOML values. The test expects to get back two key-value pairs: `model` set to `gpt-5-codex`, and `sandbox_mode` set to `read-only`; if the result differs, the test fails.
 
-**Call relations**: This function is invoked by the Rust test harness as a `#[test]` case. Within its flow, parsing is delegated first to Clap’s generated `try_parse_from` implementation for `AppServerArgs`, then to the application’s override parser on the parsed field; the final step uses `assert_eq!` to validate the end-to-end result and surface any mismatch.
+**Call relations**: During the test, it calls the command-line parser through `try_parse_from` to mimic real startup parsing. After the overrides are parsed, it uses `assert_eq!` to compare the actual result with the expected one, so this function acts as a safety check around the app server’s command-line configuration path.
 
 *Call graph*: 2 external calls (try_parse_from, assert_eq!).
 
 
 ### `app-server/src/message_processor_tracing_tests.rs`
 
-`test` · `request handling tests`
+`test` · `test execution`
 
-This test file stands up a near-real message-processing stack around `MessageProcessor`, including a temporary Codex home, mock assistant backend, auth/config managers, an `OutgoingMessageSender`, and an in-memory OpenTelemetry exporter. The central helper type is `TracingHarness`, which initializes the processor by sending a real `initialize` request, keeps a per-connection `ConnectionSessionState`, and exposes helpers to submit typed `ClientRequest` values and read typed responses back from the outgoing channel. `RemoteTrace` constructs deterministic remote trace metadata by parsing hex trace/span IDs and formatting a `traceparent` header plus `tracestate`.
+This is a test file for observability: the ability to follow one request as it travels through different parts of the system. It checks tracing, which is like putting numbered luggage tags on work so every later step can be tied back to the original request. Without these tests, the server might still answer clients, but monitoring tools could show broken or misleading request timelines.
 
-The file also provides span-inspection utilities: extracting string attributes from `SpanData`, locating RPC server spans by `rpc.system=jsonrpc` and `rpc.method`, formatting all exported spans for panic messages, and walking parent links to prove ancestry depth. Export polling is explicit: tests repeatedly force-flush the tracer provider and wait until exported spans satisfy a predicate, which avoids races with async span export.
+The file builds a small fake app-server world. It starts a mock responses server, creates a temporary Codex home directory, builds a test configuration, constructs a real MessageProcessor, and captures outgoing messages through an in-memory channel. It also installs an in-memory OpenTelemetry exporter, which records completed spans instead of sending them to an external tracing service.
 
-The two tests verify different propagation paths. One checks `thread/start` both without incoming trace context and with a supplied remote parent, asserting that the server span is remote-parented and has nested internal descendants. The other checks `turn/start`, asserting that the JSON-RPC server span carries the returned `turn.id` attribute and that downstream core work (`codex.op=user_input`) descends from that request span. The `serial` attribute and one-off global tracing initialization avoid cross-test contamination from global subscriber state.
+The tests send initialize, thread/start, and turn/start JSON-RPC requests through the same path a real client would use. Some requests include a W3C trace context, which is the standard HTTP-style format for saying, “this request belongs to this existing trace, and this remote span is its parent.” The assertions then inspect exported spans to confirm that server spans use the remote trace ID, point to the remote parent span, and have internal child spans beneath them. One test also checks that a core “user input” turn span is nested under the app-server request span.
 
 #### Function details
 
@@ -1183,11 +1187,11 @@ The two tests verify different propagation paths. One checks `thread/start` both
 fn new(trace_id: &str, parent_span_id: &str) -> Self
 ```
 
-**Purpose**: Builds a deterministic remote tracing fixture from hex-encoded trace and parent span IDs. It packages both parsed OpenTelemetry IDs and the corresponding `W3cTraceContext` headers used by requests.
+**Purpose**: Creates a small, fake remote tracing context for tests. It turns readable hex strings into real trace and span identifiers, then builds the W3C traceparent header value that a real remote client would send.
 
-**Data flow**: Takes `trace_id` and `parent_span_id` as hex strings, parses them into `TraceId` and `SpanId`, formats a `traceparent` string with sampled flag `01`, adds a fixed `tracestate` of `vendor=value`, and returns a `RemoteTrace` containing all three representations.
+**Data flow**: It receives a trace ID string and a parent span ID string. It parses them into OpenTelemetry IDs, formats them into a traceparent string, adds a simple tracestate value, and returns a RemoteTrace containing both the parsed IDs and the context object to attach to a test request.
 
-**Call relations**: Both tracing tests call this first to create an incoming remote parent context before issuing traced requests, so later assertions can compare exported span IDs against known expected values.
+**Call relations**: The two tracing tests call this when they need to simulate a client that is already partway through a distributed trace. The returned context is passed into the harness request path, and the parsed IDs are later used as the expected values in span assertions.
 
 *Call graph*: called by 2 (thread_start_jsonrpc_span_exports_server_span_and_parents_children, turn_start_jsonrpc_span_parents_core_turn_spans); 3 external calls (from_hex, from_hex, format!).
 
@@ -1198,11 +1202,11 @@ fn new(trace_id: &str, parent_span_id: &str) -> Self
 fn init_test_tracing() -> &'static TestTracing
 ```
 
-**Purpose**: Installs a singleton in-memory OpenTelemetry tracing pipeline for the test process. It ensures all spans emitted by the message processor are captured and queryable.
+**Purpose**: Sets up tracing once for this test process and gives tests access to the in-memory span recorder. It installs the global tracing bridge so Rust tracing events become OpenTelemetry spans.
 
-**Data flow**: Reads and initializes a `OnceLock<TestTracing>`; on first use it creates an `InMemorySpanExporter`, builds an `SdkTracerProvider` with a simple exporter, installs a `TraceContextPropagator`, wires a `tracing_subscriber` registry to a tracing-opentelemetry layer, sets it as the global subscriber, and returns a shared static `TestTracing` reference.
+**Data flow**: It reads or creates a single shared TestTracing value. On first use, it creates an in-memory exporter, builds an OpenTelemetry provider, installs a trace context propagator, connects tracing_subscriber to OpenTelemetry, and returns a static reference to that setup.
 
-**Call relations**: Called only from `TracingHarness::new`, so every harness shares the same global subscriber/provider while each test resets exporter state before making assertions.
+**Call relations**: TracingHarness::new calls this during test setup. The harness then resets and reads the exporter so individual tests can wait for and inspect spans.
 
 *Call graph*: called by 1 (new); 1 external calls (new).
 
@@ -1213,11 +1217,11 @@ fn init_test_tracing() -> &'static TestTracing
 fn request_from_client_request(request: ClientRequest) -> JSONRPCRequest
 ```
 
-**Purpose**: Converts a typed protocol `ClientRequest` enum into the generic `JSONRPCRequest` shape expected by `MessageProcessor::process_request`. It relies on serde round-tripping rather than hand-written mapping.
+**Purpose**: Converts a typed app-server client request into the generic JSON-RPC request shape used by the message processor. This lets tests write requests using safe protocol types while still exercising the real JSON-RPC processing path.
 
-**Data flow**: Consumes a `ClientRequest`, serializes it to `serde_json::Value`, deserializes that value into `JSONRPCRequest`, and returns the converted request or panics if the protocol types diverge.
+**Data flow**: It takes a ClientRequest, serializes it to JSON, then deserializes that JSON into a JSONRPCRequest. The result is the request object that can be given directly to MessageProcessor::process_request.
 
-**Call relations**: Used inside `TracingHarness::request` immediately before attaching optional trace context and dispatching the request into the processor.
+**Call relations**: TracingHarness::request calls this just before sending a request into the processor. That keeps the tests close to real client behavior instead of bypassing protocol conversion.
 
 *Call graph*: called by 1 (request); 2 external calls (from_value, to_value).
 
@@ -1228,11 +1232,11 @@ fn request_from_client_request(request: ClientRequest) -> JSONRPCRequest
 async fn new() -> Result<Self>
 ```
 
-**Purpose**: Constructs a fully initialized integration-test harness around a real `MessageProcessor`. It also performs the mandatory `initialize` handshake so later requests run in an initialized session.
+**Purpose**: Builds a complete test harness around a real MessageProcessor. It prepares the fake server, config, tracing recorder, outgoing message channel, and initialized session needed by the tracing tests.
 
-**Data flow**: Creates a repeating mock responses server and temporary Codex home, builds a test `Config`, constructs the processor plus outgoing receiver, initializes/reset tracing state, creates a fresh `ConnectionSessionState`, then sends a typed `ClientRequest::Initialize` through `self.request` and asserts `session.initialized()` before returning the populated harness.
+**Data flow**: It creates a mock responses server and temporary Codex home, writes and loads test configuration, builds the processor, starts tracing, clears old spans, and creates a fresh connection session. It then sends an initialize request and checks that the session is initialized before returning the ready harness.
 
-**Call relations**: Both top-level tests begin here. Internally it orchestrates `build_test_config`, `build_test_processor`, `init_test_tracing`, and the harness request path so later test logic can focus only on traced operations.
+**Call relations**: Both test cases call this at the start. It relies on build_test_config, build_test_processor, init_test_tracing, and the harness request helper so later test code can focus on the tracing behavior being checked.
 
 *Call graph*: calls 4 internal fn (new, build_test_config, build_test_processor, init_test_tracing); called by 2 (thread_start_jsonrpc_span_exports_server_span_and_parents_children, turn_start_jsonrpc_span_parents_core_turn_spans); 7 external calls (new, default, new, Integer, create_mock_responses_server_repeating_assistant, assert!, rebuild_interest_cache).
 
@@ -1243,11 +1247,11 @@ async fn new() -> Result<Self>
 fn reset_tracing(&self)
 ```
 
-**Purpose**: Clears previously exported spans from the shared in-memory exporter. This lets a test isolate spans produced by a later request.
+**Purpose**: Clears previously recorded spans from the in-memory exporter. Tests use it when setup work created spans that should not count toward the specific behavior being checked.
 
-**Data flow**: Reads the harness’s static `TestTracing` reference and invokes `exporter.reset()`, producing no return value.
+**Data flow**: It reads the harness tracing exporter and resets its stored finished spans. Nothing is returned; the visible change is that later span reads start from a clean slate.
 
-**Call relations**: Used by the turn-start test after thread creation so assertions only inspect spans from the subsequent `turn/start` request.
+**Call relations**: The turn/start test calls this after creating a thread, so the later assertions only consider spans produced by the turn/start request.
 
 
 ##### `TracingHarness::shutdown`  (lines 163–166)
@@ -1256,11 +1260,11 @@ fn reset_tracing(&self)
 async fn shutdown(self)
 ```
 
-**Purpose**: Performs orderly processor teardown at the end of a test. It waits for worker threads and background tasks to finish so no async work leaks into later tests.
+**Purpose**: Cleanly stops the background work started by the MessageProcessor. This prevents leftover test tasks from affecting later tests.
 
-**Data flow**: Consumes the harness, awaits `processor.shutdown_threads()`, then awaits `processor.drain_background_tasks()`, and returns unit.
+**Data flow**: It consumes the harness, asks the processor to shut down thread-related work, then waits for background tasks to finish. It returns when cleanup is complete.
 
-**Call relations**: Called at the end of both tests after span assertions complete.
+**Call relations**: The tests call this near the end after their tracing assertions. It hands cleanup to the MessageProcessor so the test process remains orderly.
 
 
 ##### `TracingHarness::request`  (lines 168–188)
@@ -1269,11 +1273,11 @@ async fn shutdown(self)
 async fn request(&mut self, request: ClientRequest, trace: Option<W3cTraceContext>) -> T
 ```
 
-**Purpose**: Sends one typed client request through the real message processor and waits for the matching typed response on the outgoing channel. It also injects optional incoming trace context into the JSON-RPC envelope.
+**Purpose**: Sends one typed client request through the real message processor and waits for its matching response. It is the main shortcut that makes the tests read like client actions.
 
-**Data flow**: Accepts a `ClientRequest` and optional `W3cTraceContext`; extracts and validates that the request ID is an integer, converts the request to `JSONRPCRequest`, sets `request.trace`, invokes `processor.process_request` with the fixed test connection ID, stdio transport, and shared session, then waits in `read_response` for the matching response and deserializes it to `T`.
+**Data flow**: It takes a ClientRequest and optional trace context. It extracts the integer request ID, converts the request into JSON-RPC form, attaches the trace context, sends it to MessageProcessor::process_request with the test connection and session, then reads the matching response from the outgoing channel and deserializes it into the requested response type.
 
-**Call relations**: This is the harness’s core dispatch path. `TracingHarness::start_thread` uses it, and `TracingHarness::new` uses it for initialization.
+**Call relations**: TracingHarness::start_thread uses this helper, and TracingHarness::new uses it for initialization. The test bodies also use it directly for turn/start, so all requests follow the same processing route.
 
 *Call graph*: calls 2 internal fn (read_response, request_from_client_request); called by 1 (start_thread); 3 external calls (clone, id, panic!).
 
@@ -1288,11 +1292,11 @@ async fn start_thread(
     ) -> ThreadStartResponse
 ```
 
-**Purpose**: Issues a `thread/start` request configured for ephemeral threads and waits for both the RPC response and the follow-up `thread/started` notification. It returns the typed start response once the notification has been observed.
+**Purpose**: Starts a temporary thread in the test server and waits until the server announces that the thread was started. It wraps the request plus the extra notification that thread creation produces.
 
-**Data flow**: Builds `ClientRequest::ThreadStart` with the supplied integer request ID and `ThreadStartParams { ephemeral: Some(true), ..default() }`, sends it through `self.request`, then drains outgoing messages until `read_thread_started_notification` sees a `ServerNotification::ThreadStarted`, finally returning the `ThreadStartResponse`.
+**Data flow**: It receives a request ID and optional trace context. It sends a ThreadStart request through TracingHarness::request, then reads outgoing messages until it sees a thread/started notification, and finally returns the ThreadStartResponse.
 
-**Call relations**: Used by both tracing tests to create threads before asserting span structure around thread startup or later turn startup.
+**Call relations**: Both tests call this to create a thread. The thread/start tracing test uses it as the action under inspection, while the turn/start test uses it as setup before starting a turn.
 
 *Call graph*: calls 2 internal fn (request, read_thread_started_notification); 2 external calls (Integer, default).
 
@@ -1303,11 +1307,11 @@ async fn start_thread(
 async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config>
 ```
 
-**Purpose**: Creates a temporary on-disk config rooted at the test Codex home and pointing at the mock backend server. It mirrors enough real configuration for `MessageProcessor` to boot.
+**Purpose**: Creates a test Codex configuration that points model calls at the mock responses server. This keeps the tests deterministic and independent of real external services.
 
-**Data flow**: Takes a Codex home path and mock server URI, writes a mock responses TOML config with empty overrides and fixed provider/compaction settings, then builds a `codex_core::config::Config` via `ConfigBuilder` using that home directory and returns it.
+**Data flow**: It receives the temporary Codex home path and mock server URL. It writes a mock responses config file there, then builds and returns a Config loaded from that temporary home.
 
-**Call relations**: Called only from `TracingHarness::new` before processor construction.
+**Call relations**: TracingHarness::new calls this before constructing the processor. The resulting Config is passed into build_test_processor so the processor behaves like a real server but talks to the test mock.
 
 *Call graph*: called by 1 (new); 4 external calls (new, to_path_buf, write_mock_responses_config_toml, default).
 
@@ -1323,11 +1327,11 @@ async fn build_test_processor(
 )
 ```
 
-**Purpose**: Assembles the concrete `MessageProcessor` dependency graph used by tracing tests. It wires auth, config management, analytics, outgoing transport, environment management, and session metadata into `MessageProcessorArgs`.
+**Purpose**: Constructs a MessageProcessor with test-safe dependencies. It wires together outgoing messages, auth, config loading, analytics, environment handling, feedback, and other services needed for realistic request processing.
 
-**Data flow**: Consumes an `Arc<Config>`, creates an mpsc channel for outgoing envelopes, builds an `AuthManager`, `ConfigManager`, analytics client, and `OutgoingMessageSender`, then constructs `MessageProcessor::new` with test-friendly dependencies such as `EnvironmentManager::default_for_tests()`, `SessionSource::VSCode`, stdio RPC transport, fixed installation ID, and plugin startup enabled; returns the processor and outgoing receiver.
+**Data flow**: It receives an Arc-wrapped Config. It creates an outgoing channel, auth manager, config manager, analytics client, outgoing sender, environment manager, and MessageProcessor arguments, then returns the processor plus the receiver side of the outgoing channel.
 
-**Call relations**: Called from `TracingHarness::new` to produce the real processor under test.
+**Call relations**: TracingHarness::new calls this during setup. The harness stores the processor for sending requests and stores the receiver so helpers can read responses and notifications.
 
 *Call graph*: calls 8 internal fn (analytics_events_client_from_config, new, new, new, default, default_for_tests, new, shared_from_config); called by 1 (new); 6 external calls (clone, new, new, default, default, channel).
 
@@ -1338,11 +1342,11 @@ async fn build_test_processor(
 fn run_current_thread_test_with_stack(name: &str, future: F) -> Result<()>
 ```
 
-**Purpose**: Runs an async test body on a dedicated current-thread Tokio runtime with an enlarged native thread stack. This avoids stack-size issues in the synchronous `#[test]` case.
+**Purpose**: Runs an async test body on a single-threaded Tokio runtime with a larger stack. This protects a tracing test from stack-size problems while keeping the runtime style controlled.
 
-**Data flow**: Accepts a thread name and future, spawns a new OS thread with a 4 MiB stack, builds a current-thread Tokio runtime inside it, blocks on the boxed future, joins the thread, and returns either the future’s `Result<()>` or an `anyhow!` panic error if the thread panicked.
+**Data flow**: It receives a thread name and future. It spawns a named OS thread with a 4 MB stack, builds a current-thread Tokio runtime inside it, runs the future to completion, and returns either the future result or an error if the thread panicked.
 
-**Call relations**: Used only by the `thread_start_jsonrpc_span_exports_server_span_and_parents_children` test, which is written as a plain `#[test]` rather than `#[tokio::test]`.
+**Call relations**: The thread/start tracing test uses this wrapper instead of a direct tokio test. The wrapper creates the runtime, and the test body inside it builds the harness and performs assertions.
 
 *Call graph*: called by 1 (thread_start_jsonrpc_span_exports_server_span_and_parents_children); 2 external calls (anyhow!, new).
 
@@ -1353,11 +1357,11 @@ fn run_current_thread_test_with_stack(name: &str, future: F) -> Result<()>
 fn span_attr(span: &'a SpanData, key: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Looks up a string-valued OpenTelemetry span attribute by key. It is a small inspection helper for assertions and diagnostics.
+**Purpose**: Looks up a string-valued attribute on a recorded span. Tests use it to find fields such as rpc.method or codex.op without repeating low-level attribute scanning code.
 
-**Data flow**: Reads a `SpanData`’s `attributes` list, finds the first key matching `key`, returns `Some(&str)` only when the value is an OpenTelemetry string, otherwise returns `None`.
+**Data flow**: It receives a SpanData reference and an attribute key. It searches the span attributes for that key, returns the string value if present and actually a string, or returns nothing if the key is missing or not a string.
 
-**Call relations**: Used by the span-finding and formatting helpers and indirectly by both tests to match spans on `rpc.method`, `rpc.system`, `codex.op`, and `turn.id`.
+**Call relations**: The span-finding and formatting helpers use this whenever they need to identify spans by their OpenTelemetry attributes. It is a small shared reader used throughout the assertions.
 
 
 ##### `find_rpc_span_with_trace`  (lines 306–326)
@@ -1371,11 +1375,11 @@ fn find_rpc_span_with_trace(
 ) -> &'a SpanData
 ```
 
-**Purpose**: Finds a JSON-RPC span of a specific kind and method within a specific trace. On failure it panics with a formatted dump of all exported spans.
+**Purpose**: Finds the JSON-RPC span for a specific method, span kind, and trace ID. If the expected span is missing, it produces a detailed failure message.
 
-**Data flow**: Scans a slice of `SpanData`, filtering by `span_kind`, `rpc.system == "jsonrpc"`, `rpc.method == method`, and `trace_id`, then returns the matching span reference or panics with `format_spans(spans)` embedded in the message.
+**Data flow**: It receives a list of spans, the desired span kind, JSON-RPC method name, and trace ID. It searches for a span whose kind, rpc.system, rpc.method, and trace ID all match, then returns that span; if none match, it panics with a formatted list of exported spans.
 
-**Call relations**: Both tests use it to locate the request-level server span they want to validate.
+**Call relations**: Both test cases call this after waiting for spans to appear. It depends on span_attr to inspect attributes and on format_spans to make failures understandable.
 
 *Call graph*: called by 2 (thread_start_jsonrpc_span_exports_server_span_and_parents_children, turn_start_jsonrpc_span_parents_core_turn_spans); 1 external calls (iter).
 
@@ -1391,11 +1395,11 @@ fn find_span_with_trace(
 ) -> &'a SpanData
 ```
 
-**Purpose**: Finds any span in a given trace that satisfies a caller-provided predicate. It is the generic counterpart to `find_rpc_span_with_trace`.
+**Purpose**: Finds any span in a particular trace that matches a caller-supplied condition. This is used for spans that are not simply identified as JSON-RPC method spans.
 
-**Data flow**: Iterates over exported spans, keeps only those whose `span_context.trace_id()` matches `trace_id`, applies the supplied predicate, and returns the first match or panics with a descriptive message plus formatted span dump.
+**Data flow**: It receives spans, a trace ID, a human-readable description, and a predicate function. It returns the first span in that trace accepted by the predicate, or panics with a helpful dump if no match exists.
 
-**Call relations**: Used by the turn-start test to locate the downstream core span marked with `codex.op=user_input`.
+**Call relations**: The turn/start test uses this to find the core user-input span. It complements find_rpc_span_with_trace by allowing more flexible matching.
 
 *Call graph*: called by 1 (turn_start_jsonrpc_span_parents_core_turn_spans); 1 external calls (iter).
 
@@ -1406,11 +1410,11 @@ fn find_span_with_trace(
 fn format_spans(spans: &[SpanData]) -> String
 ```
 
-**Purpose**: Produces a compact multi-line textual summary of exported spans for debugging failed assertions. The output includes identity, hierarchy, and RPC method metadata.
+**Purpose**: Turns a list of exported spans into readable text for assertion failures. This makes test failures explain what spans were actually recorded.
 
-**Data flow**: Maps each `SpanData` to a formatted line containing span name, span ID, kind, parent span ID, trace ID, and `rpc.method` if present, then joins the lines with newlines into a single `String`.
+**Data flow**: It receives spans and maps each one to a line containing the span name, span ID, kind, parent ID, trace ID, and rpc.method if present. It joins those lines into one string.
 
-**Call relations**: Called from panic paths in the span search and ancestry assertion helpers so failures show the full exported span set.
+**Call relations**: Several assertion and search helpers call this only when something expected is missing. It is the diagnostic “receipt” printed when tracing behavior does not match the test.
 
 *Call graph*: 1 external calls (iter).
 
@@ -1425,11 +1429,11 @@ fn span_depth_from_ancestor(
 ) -> Option<usize>
 ```
 
-**Purpose**: Walks parent links from a child span upward to determine whether it descends from a given ancestor and, if so, at what depth. It tolerates missing intermediate spans by stopping the search.
+**Purpose**: Checks whether one span is below another span in the parent-child tree, and how many levels down it is. This verifies that tracing has the right nesting, not just the right trace ID.
 
-**Data flow**: Takes the full span slice plus child and ancestor references, repeatedly follows `parent_span_id` through the exported span list, increments a depth counter, returns `Some(depth)` when the ancestor span ID is reached, and returns `None` if the chain ends or a parent span is absent.
+**Data flow**: It receives all spans, a possible child span, and a possible ancestor span. Starting from the child’s parent ID, it walks upward through matching parent spans until it finds the ancestor or reaches the top or a missing parent. It returns the depth if found, otherwise nothing.
 
-**Call relations**: Used by `assert_span_descends_from` and indirectly by depth-based descendant checks.
+**Call relations**: assert_span_descends_from calls this for a direct descendant check. The minimum-depth assertion also uses the same idea to prove that internal spans exist below a request span.
 
 *Call graph*: called by 1 (assert_span_descends_from); 1 external calls (iter).
 
@@ -1440,11 +1444,11 @@ fn span_depth_from_ancestor(
 fn assert_span_descends_from(spans: &[SpanData], child: &SpanData, ancestor: &SpanData)
 ```
 
-**Purpose**: Asserts that one exported span is somewhere beneath another in the same parent chain. It panics with a span dump if the ancestry relation is absent.
+**Purpose**: Fails the test unless one span is nested somewhere under another span. It is used to prove that work inside the server is attached to the incoming request span.
 
-**Data flow**: Calls `span_depth_from_ancestor`; if it returns `Some(_)`, the function returns normally, otherwise it panics with both span names and `format_spans(spans)`.
+**Data flow**: It receives all spans, a child candidate, and an ancestor candidate. It asks span_depth_from_ancestor whether the ancestor appears in the child’s parent chain; if yes, it returns normally, and if not, it panics with the exported span list.
 
-**Call relations**: Used by the turn-start test to prove that the core `user_input` span is nested under the JSON-RPC `turn/start` server span.
+**Call relations**: The turn/start test uses this to confirm that the core user-input span descends from the JSON-RPC turn/start server span.
 
 *Call graph*: calls 1 internal fn (span_depth_from_ancestor); called by 1 (turn_start_jsonrpc_span_parents_core_turn_spans); 1 external calls (panic!).
 
@@ -1459,11 +1463,11 @@ fn assert_has_internal_descendant_at_min_depth(
 )
 ```
 
-**Purpose**: Checks that a span has at least one internal descendant at or below a requested depth threshold. This verifies that request spans are not leaf-only wrappers.
+**Purpose**: Fails the test unless a request span has an internal child span at least a certain number of levels below it. This checks that tracing context continues through nested server work.
 
-**Data flow**: Scans all spans for one with `SpanKind::Internal`, the same trace ID as `ancestor`, and a computed depth from `ancestor` greater than or equal to `min_depth`; returns on success or panics with a formatted span dump on failure.
+**Data flow**: It receives all spans, an ancestor span, and a minimum depth. It searches for an Internal span in the same trace whose parent chain reaches the ancestor at or below that depth. If it finds one it returns; otherwise it panics with a readable span dump.
 
-**Call relations**: Used by the thread-start test to verify both immediate and deeper nested internal work beneath the request span.
+**Call relations**: The thread/start tracing test uses this after untraced and remotely traced thread/start requests. It proves that the server span is not isolated and that child work is connected underneath it.
 
 *Call graph*: called by 1 (thread_start_jsonrpc_span_exports_server_span_and_parents_children); 2 external calls (iter, panic!).
 
@@ -1477,11 +1481,11 @@ async fn read_response(
 ) -> T
 ```
 
-**Purpose**: Consumes the outgoing envelope stream until it finds the JSON-RPC response for the target request ID on the fixed test connection. It ignores unrelated broadcasts, notifications, and responses for other requests.
+**Purpose**: Waits for the response to a specific test request on the outgoing message channel. It ignores unrelated messages until the matching connection and request ID appear.
 
-**Data flow**: Loops on `outgoing_rx.recv()` under a 5-second timeout, filters for `OutgoingEnvelope::ToConnection` with `connection_id == TEST_CONNECTION_ID`, then for `OutgoingMessage::Response` with matching integer `RequestId`, deserializes `response.result` into `T`, and returns it.
+**Data flow**: It receives the outgoing receiver and a request ID. It repeatedly waits up to five seconds for messages, filters for messages sent to the test connection, filters again for Response messages with the requested ID, then deserializes and returns the response result.
 
-**Call relations**: Called by `TracingHarness::request` after dispatching a request into the processor.
+**Call relations**: TracingHarness::request calls this after sending a request to the processor. This is how the harness turns asynchronous outgoing server messages back into a typed return value for the test.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (request); 4 external calls (Integer, from_value, from_secs, timeout).
 
@@ -1494,11 +1498,11 @@ async fn read_thread_started_notification(
 )
 ```
 
-**Purpose**: Waits until a `thread/started` server notification appears on the outgoing stream, whether targeted to the test connection or broadcast globally. It ignores all other outgoing traffic.
+**Purpose**: Waits until the server emits a thread-started notification. Thread creation sends both a response and a notification, and tests need to know the notification has happened before checking related spans.
 
-**Data flow**: Loops on timed `recv()`, matches either `OutgoingEnvelope::ToConnection` for the test connection or `OutgoingEnvelope::Broadcast`, extracts `OutgoingMessage::AppServerNotification`, checks for `ServerNotification::ThreadStarted(_)`, and returns once found.
+**Data flow**: It receives the outgoing receiver. It waits for messages with a five-second timeout, accepts either a direct-to-connection message for the test connection or a broadcast, filters for app-server notifications, and returns when the notification is ThreadStarted.
 
-**Call relations**: Called by `TracingHarness::start_thread` so tests do not proceed until thread startup side effects have been emitted.
+**Call relations**: TracingHarness::start_thread calls this after reading the thread/start response. It ensures the thread-start flow has reached the notification step before the test continues.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (start_thread); 3 external calls (matches!, from_secs, timeout).
 
@@ -1509,11 +1513,11 @@ async fn read_thread_started_notification(
 async fn wait_for_exported_spans(tracing: &TestTracing, predicate: F) -> Vec<SpanData>
 ```
 
-**Purpose**: Polls the in-memory exporter until a caller-supplied predicate over exported spans becomes true. It force-flushes the tracer provider between polls to make async span completion visible.
+**Purpose**: Polls the in-memory tracing exporter until the expected spans have been recorded. This avoids flaky tests caused by spans being exported slightly after the request finishes.
 
-**Data flow**: Repeatedly yields to the scheduler, calls `provider.force_flush()`, fetches finished spans from the exporter, stores the latest snapshot, evaluates `predicate(&spans)`, and either returns the matching span vector or, after 200 iterations with 50 ms sleeps, panics with the last formatted span dump.
+**Data flow**: It receives the tracing setup and a predicate that describes success. It repeatedly yields, forces the OpenTelemetry provider to flush, reads finished spans from the exporter, checks the predicate, and sleeps briefly between attempts. It returns the spans once the predicate is true or panics after timing out.
 
-**Call relations**: Used directly by both tests and by `wait_for_new_exported_spans` to synchronize assertions with asynchronous tracing/export timing.
+**Call relations**: Both tests use this to wait for their target spans. wait_for_new_exported_spans also builds on it when only spans after a baseline point should be considered.
 
 *Call graph*: called by 3 (thread_start_jsonrpc_span_exports_server_span_and_parents_children, turn_start_jsonrpc_span_parents_core_turn_spans, wait_for_new_exported_spans); 5 external calls (new, panic!, from_millis, yield_now, sleep).
 
@@ -1528,11 +1532,11 @@ async fn wait_for_new_exported_spans(
 ) -> Vec<SpanData>
 ```
 
-**Purpose**: Waits specifically for spans exported after a known baseline length and returns only that suffix. This lets a test isolate spans from a second request without resetting the exporter.
+**Purpose**: Waits for spans created after an earlier baseline count. This helps a test separate a second request’s spans from spans produced by a previous request.
 
-**Data flow**: Accepts a baseline span count and predicate over the new suffix, delegates to `wait_for_exported_spans` with a wrapper predicate requiring `spans.len() > baseline_len`, then drops the baseline prefix and returns the newly exported spans as a `Vec<SpanData>`.
+**Data flow**: It receives tracing setup, the number of spans already present, and a predicate for the new slice. It calls wait_for_exported_spans with a wrapper predicate that requires more spans than the baseline and applies the caller’s check only to the newly added spans. It returns just those new spans.
 
-**Call relations**: Used by the thread-start test after an initial untraced request to inspect only spans produced by the traced second request.
+**Call relations**: The thread/start tracing test uses this after making one untraced request, then sending a second remotely traced request. It lets the assertions focus on the second request.
 
 *Call graph*: calls 1 internal fn (wait_for_exported_spans); called by 1 (thread_start_jsonrpc_span_exports_server_span_and_parents_children).
 
@@ -1543,11 +1547,11 @@ async fn wait_for_new_exported_spans(
 fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Result<()>
 ```
 
-**Purpose**: Verifies that `thread/start` emits a JSON-RPC server span, that untraced requests still produce nested internal work, and that traced requests adopt the supplied remote parent span and trace ID.
+**Purpose**: Tests that a thread/start JSON-RPC request creates a server span and that tracing parent-child relationships are correct. It checks both a normal request and a request that arrives with remote trace context.
 
-**Data flow**: Runs inside `run_current_thread_test_with_stack`; creates a harness, constructs a `RemoteTrace`, starts one untraced thread and waits for a `thread/start` server span to appear, records the baseline span count, starts a second thread with remote trace context, waits for new spans containing both the traced server span and `app_server.thread_start.notify_started`, then asserts span name, remote parent span ID, remote-parent flag, trace ID, non-invalid span ID, and existence of internal descendants at depths 1 and 2 before shutting down.
+**Data flow**: It runs an async test body inside the custom single-thread runtime. The test creates a harness, sends an untraced thread/start request, waits for a server span, and checks that internal child spans exist. It then records the baseline, sends another thread/start request with a remote trace context, waits for new spans in that remote trace, and asserts the server span has the remote parent and useful descendants.
 
-**Call relations**: This is a top-level integration test. It drives the full harness request path and uses the span search/assertion helpers to validate propagation and nesting.
+**Call relations**: This is one of the file’s main tests. It drives the harness, uses RemoteTrace::new to simulate a remote caller, uses waiting helpers to collect spans, uses find_rpc_span_with_trace to locate the request span, and uses descendant assertions to validate the trace tree.
 
 *Call graph*: calls 7 internal fn (new, new, assert_has_internal_descendant_at_min_depth, find_rpc_span_with_trace, run_current_thread_test_with_stack, wait_for_exported_spans, wait_for_new_exported_spans); 3 external calls (assert!, assert_eq!, assert_ne!).
 
@@ -1558,24 +1562,24 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
 async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()>
 ```
 
-**Purpose**: Verifies that a traced `turn/start` request creates a JSON-RPC server span that becomes the ancestor of downstream core turn-processing spans. It also checks that the request span records the returned turn ID.
+**Purpose**: Tests that a turn/start request span becomes the parent of deeper core work for the turn. In plain terms, it verifies that the app-server request and the actual user-input processing appear as one connected trace.
 
-**Data flow**: Creates a harness, starts a thread to obtain `thread_id`, resets tracing, constructs a `RemoteTrace`, sends a `ClientRequest::TurnStart` with text input `hello`, waits for exported spans containing both the traced `turn/start` server span and a span with `codex.op=user_input`, then asserts the server span’s remote parent ID, remote-parent flag, trace ID, `turn.id` attribute equal to the response turn ID, and ancestry from the core turn span to the server span before shutdown.
+**Data flow**: It creates a harness, starts a thread, clears setup spans, builds a remote trace context, and sends a turn/start request with text input. It waits until both the JSON-RPC server span and a core user-input span appear in the remote trace, then checks the server span’s remote parent, turn ID attribute, and that the user-input span descends from the server span.
 
-**Call relations**: This is the second top-level integration test. It depends on the harness and generic span helpers, but focuses on propagation from app-server request handling into deeper core turn execution.
+**Call relations**: This is the second main test in the file. It uses TracingHarness::new and start_thread for setup, sends the turn request through the harness, locates spans with find_rpc_span_with_trace and find_span_with_trace, and verifies nesting with assert_span_descends_from.
 
 *Call graph*: calls 6 internal fn (new, new, assert_span_descends_from, find_rpc_span_with_trace, find_span_with_trace, wait_for_exported_spans); 4 external calls (Integer, assert!, assert_eq!, vec!).
 
 
 ### `app-server/src/request_processors/external_agent_config_processor_tests.rs`
 
-`test` · `test`
+`test` · `test run`
 
-This test file is narrowly focused on `migration_items_need_runtime_refresh`, the helper that decides whether imported external-agent artifacts should invalidate runtime-loaded config, skills, hooks, commands, MCP server config, or plugins. The local `migration_item` helper constructs minimal `ExternalAgentConfigMigrationItem` values with empty description and no cwd/details so each assertion can isolate item type behavior without unrelated fields.
+This is a small test file for the external agent configuration processor. The main idea is simple: some migrated items change how an agent should run, so the runtime needs to reload its sources afterward. Other migrated items, such as saved sessions, do not affect the live runtime and should not force a refresh.
 
-The single test enumerates all currently supported item types relevant to refresh semantics. It asserts that `Config`, `Skills`, `McpServerConfig`, `Hooks`, `Commands`, and `Plugins` return `true`, while `Sessions` returns `false`. That captures an important design boundary in the import system: session migration persists historical thread data but does not alter runtime-loaded extension/config sources, so it should not trigger plugin/skills cache clearing.
+The file builds tiny fake migration items, each with a chosen item type and empty optional details. It then asks the real decision function, `migration_items_need_runtime_refresh`, whether that item should trigger a runtime refresh. Think of it like checking which home repairs require turning the power off: replacing wiring does, repainting a wall does not.
 
-Because the predicate is simple but behaviorally important, this file acts as a regression guard against accidentally broadening or narrowing refresh-triggering item types during future migration feature additions.
+The test confirms that configuration, skills, MCP server configuration, hooks, commands, and plugins all count as runtime-affecting changes. It also confirms that session migrations do not. This matters because refreshing too little can leave the agent using old behavior, while refreshing too often can waste work or interrupt state unnecessarily.
 
 #### Function details
 
@@ -1587,11 +1591,11 @@ fn migration_item(
 ) -> ExternalAgentConfigMigrationItem
 ```
 
-**Purpose**: Creates a minimal migration item with the requested item type for use in predicate tests.
+**Purpose**: This helper creates a minimal `ExternalAgentConfigMigrationItem` for a given kind of migration. It lets the test focus on the item type being checked, without repeating unrelated fields each time.
 
-**Data flow**: Takes an `ExternalAgentConfigMigrationItemType`, constructs `ExternalAgentConfigMigrationItem` with that type, empty `description`, and `None` for `cwd` and `details`, and returns it.
+**Data flow**: It receives one migration item type. It builds a migration item using that type, an empty description, and no working directory or extra details. The result is a simple test object ready to pass into the refresh-decision function.
 
-**Call relations**: Used only by the test in this file to reduce repetition when building one-element slices for `migration_items_need_runtime_refresh`.
+**Call relations**: The test function calls this helper each time it wants to check a different migration type. The helper fills in the boring parts of the item so the test can clearly show which types should or should not cause a runtime refresh.
 
 *Call graph*: 1 external calls (new).
 
@@ -1602,24 +1606,24 @@ fn migration_item(
 fn migration_items_that_update_runtime_sources_trigger_refresh()
 ```
 
-**Purpose**: Asserts the exact set of migration item types that should and should not trigger runtime refresh.
+**Purpose**: This test verifies the rule for deciding whether migrated external agent configuration should cause the runtime to reload. It makes sure runtime-related changes trigger a refresh, while session-only changes do not.
 
-**Data flow**: Builds one-item slices using `migration_item(...)`, calls `migration_items_need_runtime_refresh` for each relevant item type, and asserts expected boolean outcomes.
+**Data flow**: It creates one-item lists for several migration types and passes each list into `migration_items_need_runtime_refresh`. For config, skills, MCP server config, hooks, commands, and plugins, it expects `true`. For sessions, it expects `false`. If any result differs, the test fails.
 
-**Call relations**: Unit test for the helper defined in `external_agent_config_processor.rs`, guarding the import orchestration’s refresh decision.
+**Call relations**: During the test run, this function exercises the production refresh-decision logic through `migration_items_need_runtime_refresh`. It uses `migration_item` to create the sample inputs, then uses assertions to lock in the expected behavior so future code changes do not accidentally alter it.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `app-server/src/request_processors/remote_control_processor/remote_control_processor_tests.rs`
 
-`test` · `test execution`
+`test` · `test run`
 
-This test module exercises the small but important policy decisions in `remote_control_processor.rs`. Two async tests instantiate `RemoteControlRequestProcessor` with `None` for its handle and verify that pairing-related RPCs fail with `INTERNAL_ERROR_CODE` and the exact message stating remote control is unavailable for this app-server. Those tests confirm that subsystem absence is treated differently from invalid client input.
+This is a test file for the remote control request processor. The processor is the part of the app-server that answers remote-control related JSON-RPC requests, such as starting device pairing or checking pairing status. JSON-RPC is a common request-and-response format where failures are returned as structured error objects with a code and message.
 
-The remaining unit tests target pure helper functions. `validate_pairing_status_params` is checked for both invalid shapes: missing both `pairing_code` and `manual_pairing_code`, and supplying both at once. The expected `INVALID_REQUEST_ERROR_CODE` and exact protocol messages are asserted, preserving the API contract clients rely on. Error-mapping helpers are also covered directly: `map_pairing_start_error` must classify `InvalidInput` as invalid request and other failures as internal error, while `map_client_management_error` must downgrade `InvalidInput`, `NotFound`, `PermissionDenied`, and `WouldBlock` to invalid request and leave generic backend failures as internal errors.
+The tests focus on error behavior, which matters because clients need to know whether they made a bad request or whether the server itself could not complete the work. For example, if remote control is not available in this app-server, pairing should fail with an internal server error. If a caller asks for pairing status without any pairing code, that is a bad request and should be reported differently.
 
-Because these tests compare full `JSONRPCErrorError` structs, they protect not just control flow but also exact codes, `data: None`, and message text.
+The file also checks small helper functions that translate lower-level input/output errors into JSON-RPC errors. In plain terms, it verifies the “translator” between system-level failures and client-facing messages. Some errors are user-actionable, like invalid input or missing permissions, so they become invalid-request errors. Other unexpected backend failures become internal errors. These tests protect the contract between the server and its callers: the same situation should always produce the same error shape and message.
 
 #### Function details
 
@@ -1629,11 +1633,11 @@ Because these tests compare full `JSONRPCErrorError` structs, they protect not j
 async fn pairing_start_returns_internal_error_when_remote_control_is_unavailable()
 ```
 
-**Purpose**: Verifies that starting pairing without any configured remote-control handle fails as an internal server error, not as an invalid request. It checks the exact JSON-RPC payload returned to clients.
+**Purpose**: This test checks that starting remote-control pairing fails cleanly when the app-server was created without a remote-control handle. A handle is the connection point to the real remote-control feature; without it, the server cannot do the work.
 
-**Data flow**: Constructs `RemoteControlRequestProcessor::new(None)`, calls `pairing_start(RemoteControlPairingStartParams::default(), None).await`, captures the expected error with `expect_err`, and compares it against a fully populated `JSONRPCErrorError` containing `INTERNAL_ERROR_CODE`, `data: None`, and the fixed unavailable message.
+**Data flow**: The test starts with a request processor built with no remote-control handle and default pairing-start parameters. It asks the processor to start pairing, waits for the result, and expects an error. It then compares that error to the exact JSON-RPC internal-error object that callers should receive.
 
-**Call relations**: This test drives the public `pairing_start` path through `RemoteControlRequestProcessor::handle`’s missing-handle branch, confirming the behavior observed by request dispatchers.
+**Call relations**: During the test run, the async test runner calls this function. The test creates the processor through `new`, uses the default pairing parameters, then checks the final error with `assert_eq!` so a mismatch in code or message fails the test.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (default, assert_eq!).
 
@@ -1644,11 +1648,11 @@ async fn pairing_start_returns_internal_error_when_remote_control_is_unavailable
 async fn pairing_status_returns_internal_error_when_remote_control_is_unavailable()
 ```
 
-**Purpose**: Verifies that querying pairing status without a remote-control handle also fails as an internal error. It ensures the same unavailable-subsystem contract applies to status lookup.
+**Purpose**: This test checks that asking for pairing status also fails with an internal error when remote control is not available. It confirms that the server does not pretend it can check pairing progress without the needed backend connection.
 
-**Data flow**: Builds `RemoteControlRequestProcessor::new(None)`, passes `RemoteControlPairingStatusParams` with only `pairing_code` set, awaits `pairing_status`, extracts the error, and asserts equality with the expected `JSONRPCErrorError` using `INTERNAL_ERROR_CODE` and the unavailable message.
+**Data flow**: The test builds a request processor with no remote-control handle. It sends pairing-status parameters containing a normal pairing code, waits for the call to fail, and compares the returned error with the expected JSON-RPC internal-error object.
 
-**Call relations**: Exercises the `pairing_status` path after parameter validation succeeds, proving that the later `handle()` check still produces the internal-error response when the subsystem is absent.
+**Call relations**: The test runner invokes this function as part of the suite. Inside, the processor is constructed with `new`, the pairing-status request is made, and `assert_eq!` verifies that the outward-facing error matches the intended contract.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -1659,11 +1663,11 @@ async fn pairing_status_returns_internal_error_when_remote_control_is_unavailabl
 fn pairing_status_rejects_missing_pairing_codes()
 ```
 
-**Purpose**: Checks that pairing-status validation rejects requests that provide neither pairing identifier. The test locks down the exact invalid-request message.
+**Purpose**: This test makes sure a pairing-status request is rejected when it contains neither kind of pairing code. Without a code, the server has no way to know which pairing attempt the caller means.
 
-**Data flow**: Calls `validate_pairing_status_params` with both `pairing_code` and `manual_pairing_code` set to `None`, then asserts the returned `Err(JSONRPCErrorError { ... })` matches `INVALID_REQUEST_ERROR_CODE`, `data: None`, and the required-message string.
+**Data flow**: The input is a pairing-status parameter object with both `pairing_code` and `manual_pairing_code` set to missing. The validation function is expected to return an invalid-request JSON-RPC error with a clear message explaining that one of the codes is required.
 
-**Call relations**: Targets the standalone validator used by `RemoteControlRequestProcessor::pairing_status`, covering the no-identifiers branch before any backend interaction.
+**Call relations**: The normal test runner calls this test. The test directly exercises the parameter validation helper and uses `assert_eq!` to lock down the exact error that should be returned before any backend work is attempted.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1674,11 +1678,11 @@ fn pairing_status_rejects_missing_pairing_codes()
 fn pairing_status_rejects_conflicting_pairing_codes()
 ```
 
-**Purpose**: Checks that pairing-status validation rejects requests that provide both identifier fields simultaneously. This preserves the API’s mutual-exclusion rule.
+**Purpose**: This test checks that a pairing-status request is rejected when it supplies both a regular pairing code and a manual pairing code. The request must choose one path so the server does not have to guess which value to trust.
 
-**Data flow**: Invokes `validate_pairing_status_params` with both `pairing_code` and `manual_pairing_code` populated and asserts the returned invalid-request error equals the expected `JSONRPCErrorError` with the conflict message.
+**Data flow**: The test provides parameters containing both code fields. The validation step should return an invalid-request error that says the request accepts either `pairingCode` or `manualPairingCode`, but not both.
 
-**Call relations**: Covers the second invalid branch of the validator used by `pairing_status`, ensuring ambiguous requests are rejected locally.
+**Call relations**: The test runner calls this function during the suite. It focuses only on the validation helper, and `assert_eq!` confirms that conflicting input is stopped early with the expected client-facing error.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1689,11 +1693,11 @@ fn pairing_status_rejects_conflicting_pairing_codes()
 fn pairing_start_maps_invalid_input_to_invalid_request()
 ```
 
-**Purpose**: Confirms that pairing backend failures tagged as `io::ErrorKind::InvalidInput` are exposed to clients as invalid requests. This distinguishes malformed pairing attempts from server faults.
+**Purpose**: This test verifies that an invalid-input failure while starting pairing is reported to the client as an invalid request. That means the problem is treated as something the caller can fix, rather than a hidden server crash.
 
-**Data flow**: Constructs an `io::Error` with kind `InvalidInput` and message `remote control pairing is unavailable`, passes it to `map_pairing_start_error`, and asserts the returned `JSONRPCErrorError` contains `INVALID_REQUEST_ERROR_CODE` and the same message.
+**Data flow**: The input is a simulated input/output error whose kind is `InvalidInput` and whose message says pairing is unavailable. The mapping helper turns that lower-level error into a JSON-RPC error with the invalid-request code and the same readable message.
 
-**Call relations**: Directly tests the helper used by both `pairing_start` and `pairing_status`, pinning down their shared error-classification rule.
+**Call relations**: The test runner invokes this plain unit test. The test calls the pairing-start error mapper directly and uses `assert_eq!` to ensure this specific system error kind is translated into the correct JSON-RPC category.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1704,11 +1708,11 @@ fn pairing_start_maps_invalid_input_to_invalid_request()
 fn pairing_start_maps_backend_failures_to_internal_error()
 ```
 
-**Purpose**: Confirms that non-input pairing failures are treated as internal errors. It protects the fallback branch of pairing error mapping.
+**Purpose**: This test checks that unexpected pairing-start backend failures become internal server errors. This tells the client that the request may have been reasonable, but the server side failed to complete it.
 
-**Data flow**: Creates `io::Error::other("remote control pairing failed")`, feeds it to `map_pairing_start_error`, and asserts the result is a `JSONRPCErrorError` with `INTERNAL_ERROR_CODE`, `data: None`, and the original message.
+**Data flow**: The test creates a generic input/output error with the message `remote control pairing failed`. The pairing-start error mapper converts it into a JSON-RPC internal-error object while preserving the message.
 
-**Call relations**: Complements the previous test by covering the non-`InvalidInput` branch of the helper used in pairing RPCs.
+**Call relations**: The test runner calls this test with the rest of the unit tests. It exercises the same pairing-start mapping helper as the invalid-input test, but covers the fallback path for backend failures, with `assert_eq!` checking the exact result.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1719,11 +1723,11 @@ fn pairing_start_maps_backend_failures_to_internal_error()
 fn client_management_maps_user_actionable_errors_to_invalid_request()
 ```
 
-**Purpose**: Verifies that several client-management `io::ErrorKind` values are intentionally downgraded to invalid requests. This includes transient or permission-related conditions clients can react to.
+**Purpose**: This test verifies that several client-management failures are reported as invalid requests when the user or caller may be able to fix them. Examples include bad input, missing resources, lack of permission, or a temporary would-block condition.
 
-**Data flow**: Iterates over `InvalidInput`, `NotFound`, `PermissionDenied`, and `WouldBlock`, creates an `io::Error` for each with the same message, passes each to `map_client_management_error`, and asserts the returned `JSONRPCErrorError` always uses `INVALID_REQUEST_ERROR_CODE` and preserves the message.
+**Data flow**: The test loops through several input/output error kinds. For each one, it creates an error with the same message, passes it to the client-management error mapper, and expects a JSON-RPC invalid-request error with that message.
 
-**Call relations**: Directly covers the helper shared by `clients_list` and `clients_revoke`, validating all of its special-case branches.
+**Call relations**: The test runner calls this unit test. Inside the loop, the mapping helper is exercised repeatedly, and `assert_eq!` ensures each user-actionable error kind follows the same client-facing rule.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1734,22 +1738,24 @@ fn client_management_maps_user_actionable_errors_to_invalid_request()
 fn client_management_maps_backend_failures_to_internal_error()
 ```
 
-**Purpose**: Verifies that generic client-management backend failures remain internal errors. It protects the default branch of the client-management mapper.
+**Purpose**: This test checks that unexpected client-management failures are reported as internal server errors. It covers the case where the caller’s request is not the main issue; something behind the scenes failed.
 
-**Data flow**: Builds `io::Error::other("client management failed")`, passes it to `map_client_management_error`, and asserts the returned `JSONRPCErrorError` contains `INTERNAL_ERROR_CODE`, `data: None`, and the original message.
+**Data flow**: The test starts with a generic input/output error saying client management failed. The client-management mapper converts it into a JSON-RPC internal-error object with the same message.
 
-**Call relations**: Completes coverage of the helper used by client-management RPCs by checking the catch-all internal-error path.
+**Call relations**: The test runner invokes this function during the suite. It calls the client-management error mapper directly and uses `assert_eq!` to confirm the fallback behavior for backend failures.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `app-server/src/request_processors/thread_processor_tests.rs`
 
-`test` · `test-time regression coverage for thread request handling, resume, and state transitions`
+`test` · `test runs`
 
-This file is a dense test suite for the thread request-processing subsystem rather than production logic. It is organized into three modules: cwd-filter normalization tests, background-terminal pagination tests, and a large behavior suite covering thread summaries, config derivation, resume metadata, dynamic tool validation, and thread state management. The tests construct concrete protocol values such as `ThreadBackgroundTerminal`, `StoredThread`, `ThreadResumeParams`, `ThreadConfigSnapshot`, `Turn`, `ThreadItem`, and `SessionMeta`, then assert exact outputs from production helpers imported from the parent module.
+This is a test file, not production code. It acts like a safety checklist for the thread processor. The thread processor is responsible for several user-visible jobs: listing threads, resuming conversations, reading saved rollout files, tracking which browser or editor connections are subscribed to a thread, and validating tools that an app wants to expose to the model.
 
-A recurring theme is preserving wire-level semantics: timestamps from `StoredThread` keep millisecond precision, while protocol-facing summaries from `ThreadMetadata` are truncated to seconds; agent nickname/role and `forked_from_id` survive rollout/state-db summary paths; and aborted pending server requests resolve waiting callbacks with a structured `turnTransition` error and clear pending-request bookkeeping. The dynamic-tool tests are especially concrete, checking schema sanitization, nullable fields, namespace/name uniqueness, Responses API identifier regex and length limits, and reserved namespaces. Several async tests build temporary rollout files or in-memory managers (`ThreadStateManager`, `OutgoingMessageSender`, `ConfigManager`) to verify listener teardown, subscriber tracking, attestation-capable connection selection, and config precedence between session thread config and request overrides. The helper constructors in this file intentionally minimize boilerplate while keeping assertions on exact protocol payloads.
+The tests are grouped by topic. One group checks that current-working-directory filters keep absolute paths as they are and turn relative paths into full paths based on the server's current folder. Another checks pagination for background terminals, using a process id as the bookmark for the next page. The largest group checks behavior around dynamic tools, summaries, permissions, configuration loading, resume metadata, pending client requests, and thread subscription state.
+
+A useful way to think about this file is as a set of rehearsal scenes. Each test builds a small fake world, such as a saved conversation file or two connected clients, performs one action, and then checks the exact result. Without these tests, small changes in the thread processor could silently break important promises, such as preserving an agent nickname, avoiding duplicate tool names, or cancelling a pending request when a turn is cleaned up.
 
 #### Function details
 
@@ -1759,11 +1765,11 @@ A recurring theme is preserving wire-level semantics: timestamps from `StoredThr
 fn normalize_thread_list_cwd_filter_preserves_absolute_paths()
 ```
 
-**Purpose**: Verifies that a single absolute cwd filter string is accepted unchanged by the normalization helper. The test covers platform-specific absolute path syntax on Windows and non-Windows hosts.
+**Purpose**: Checks that a folder filter that is already an absolute path is not changed. This matters because users may ask for threads from an exact folder, and the server should not reinterpret that path.
 
-**Data flow**: Builds a `String` absolute path based on `cfg!(windows)`, wraps it in `ThreadListCwdFilter::One`, passes it to `normalize_thread_list_cwd_filters`, and compares the returned `Option<Vec<PathBuf>>` to a vector containing the same path.
+**Data flow**: The test starts with one absolute folder path, using the Windows or Unix form depending on the platform. It sends that path into the path-normalizing function and expects to get back the same path wrapped in a list. Nothing else is changed.
 
-**Call relations**: This is a leaf test invoked by the Rust test harness. It exercises the production normalization path for already-absolute inputs and asserts that no rebasing against server cwd occurs.
+**Call relations**: The Rust test runner calls this test. Inside the test, it calls the real normalization function and uses an equality check to prove that absolute paths pass through unchanged.
 
 *Call graph*: 3 external calls (from, assert_eq!, cfg!).
 
@@ -1774,11 +1780,11 @@ fn normalize_thread_list_cwd_filter_preserves_absolute_paths()
 fn normalize_thread_list_cwd_filter_resolves_relative_paths_against_server_cwd() -> std::io::Result<()>
 ```
 
-**Purpose**: Checks that relative cwd filters are resolved against the server process current directory. It confirms the helper returns absolute `PathBuf` values rather than preserving relative strings.
+**Purpose**: Checks that a relative folder filter, such as `repo-b`, is converted into a full path using the server's current working directory. This prevents thread filtering from depending on vague or ambiguous path text.
 
-**Data flow**: Computes an expected absolute path with `AbsolutePathBuf::relative_to_current_dir("repo-b")`, passes `ThreadListCwdFilter::Many(vec!["repo-b"])` into `normalize_thread_list_cwd_filters`, and asserts the normalized result equals `Some(vec![expected])`.
+**Data flow**: The test first computes what `repo-b` should mean from the current directory. It then passes a relative filter into the normalizer and expects the result to be the computed full path. It returns success only if both paths match.
 
-**Call relations**: Run by the test harness to cover the relative-path branch of cwd filter normalization. It complements the absolute-path test by proving the helper consults process cwd when needed.
+**Call relations**: The test runner calls this test. The test uses the absolute-path helper to build the expected answer, then calls the production normalizer to compare actual behavior against that expectation.
 
 *Call graph*: calls 1 internal fn (relative_to_current_dir); 1 external calls (assert_eq!).
 
@@ -1789,11 +1795,11 @@ fn normalize_thread_list_cwd_filter_resolves_relative_paths_against_server_cwd()
 fn terminal(process_id: &str) -> ThreadBackgroundTerminal
 ```
 
-**Purpose**: Creates a deterministic `ThreadBackgroundTerminal` fixture keyed by process id. The helper keeps all nonessential fields stable so pagination assertions can compare full structs.
+**Purpose**: Builds a small fake background terminal record for tests. It lets pagination tests focus on ordering and cursors instead of repeating setup details.
 
-**Data flow**: Accepts a `&str` process id, chooses a platform-specific absolute cwd, and returns a `ThreadBackgroundTerminal` with derived `item_id`, `process_id`, and `command`, plus parsed `AbsolutePathBuf` cwd and `None` for pid/cpu/rss fields.
+**Data flow**: A process id string goes in. The helper creates a terminal object with matching item id, process id, command text, and a fixed absolute current folder. The completed fake terminal record comes out.
 
-**Call relations**: Used only by pagination tests in this module to generate ordered terminal lists and expected page slices without repeating struct literals.
+**Call relations**: This helper is called by the background terminal pagination test whenever it needs sample terminal data. It hands those sample records to the real pagination function.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 2 external calls (cfg!, format!).
 
@@ -1804,11 +1810,11 @@ fn terminal(process_id: &str) -> ThreadBackgroundTerminal
 fn paginates_with_process_id_cursor()
 ```
 
-**Purpose**: Validates cursor-based pagination over background terminals using `process_id` as the anchor. It covers first-page generation, continuation when the anchor item disappeared, normal continuation when it still exists, and invalid cursor rejection.
+**Purpose**: Checks that background terminal pagination uses the process id as a stable cursor, or bookmark. It also checks that a missing cursor is treated as an error.
 
-**Data flow**: Builds several terminal vectors with `terminal`, calls `paginate_background_terminals` with different cursor/limit combinations, and asserts returned `(Vec<ThreadBackgroundTerminal>, Option<String>)` pairs or error status.
+**Data flow**: The test creates five fake terminals, asks for two at a time, and checks that the returned data and next cursor match the expected process ids. It then tries again after removing the cursor's original terminal to confirm pagination can still continue from the next larger item. Finally, it passes a totally missing cursor and expects an error.
 
-**Call relations**: Executed by the test harness to pin down pagination semantics. It specifically documents the fallback behavior when the cursor item is missing from the next snapshot: pagination resumes after the nearest surviving position rather than failing, except for completely unknown cursors.
+**Call relations**: The test runner calls this test. The test repeatedly calls the production `paginate_background_terminals` function with different terminal lists and cursors, then checks the page data and next bookmark.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, paginate_background_terminals, vec!).
 
@@ -1819,11 +1825,11 @@ fn paginates_with_process_id_cursor()
 async fn forked_from_id_from_rollout(path: &Path) -> Option<String>
 ```
 
-**Purpose**: Small async helper that extracts `forked_from_id` from a rollout file's session metadata. It hides the `Result` handling and UUID-to-string conversion needed by the tests.
+**Purpose**: Reads a saved rollout file and extracts the id of the thread it was forked from, if one exists. It is a small helper used by a test that verifies fork history is preserved.
 
-**Data flow**: Takes a rollout `&Path`, awaits `codex_core::read_session_meta_line`, discards errors with `.ok()`, pulls `meta.forked_from_id`, and maps the `ThreadId` to `String`.
+**Data flow**: A path to a rollout file goes in. The helper asks core code to read the session metadata line, looks for `forked_from_id`, converts it to text if found, and returns either that text or nothing.
 
-**Call relations**: Used by the `read_summary_from_rollout_preserves_forked_from_id` test to inspect rollout metadata directly, independent of higher-level summary conversion.
+**Call relations**: The rollout preservation test calls this helper after writing a fake rollout file. The helper delegates the actual file parsing to `read_session_meta_line` and returns just the one field the test cares about.
 
 *Call graph*: 1 external calls (read_session_meta_line).
 
@@ -1839,11 +1845,11 @@ fn dynamic_tool(
     ) -> DynamicToolSpec
 ```
 
-**Purpose**: Builds either a top-level dynamic function tool or a namespaced tool bundle for validation tests. It centralizes the repetitive `DynamicToolFunctionSpec` and namespace wrapper construction.
+**Purpose**: Builds a fake dynamic tool definition for validation tests. A dynamic tool is a tool supplied at runtime, rather than built into the server.
 
-**Data flow**: Accepts optional namespace, tool name, JSON schema, and `defer_loading`; constructs a `DynamicToolFunctionSpec`; then returns `DynamicToolSpec::Function` when no namespace is provided or `DynamicToolSpec::Namespace` containing one `DynamicToolNamespaceTool::Function` otherwise.
+**Data flow**: The caller provides an optional namespace, a tool name, a JSON input schema, and a flag saying whether loading is delayed. The helper builds either a standalone function tool or a namespaced tool containing that function, then returns it.
 
-**Call relations**: Shared fixture helper for the dynamic-tool validation tests. It lets each test vary only the namespace/name/schema constraints relevant to the validation branch under test.
+**Call relations**: Many dynamic-tool validation tests call this helper to create test inputs. It keeps those tests short while still feeding realistic tool definitions into `validate_dynamic_tools`.
 
 *Call graph*: 4 external calls (into, Function, Namespace, vec!).
 
@@ -1854,11 +1860,11 @@ fn dynamic_tool(
 fn validate_dynamic_tools_rejects_unsupported_input_schema()
 ```
 
-**Purpose**: Confirms validation rejects a tool whose input schema uses an unsupported top-level type (`null`). The assertion also checks the error mentions the offending tool name.
+**Purpose**: Checks that a dynamic tool with an unsupported input schema is rejected. This protects the model and server from receiving tool definitions they cannot safely understand.
 
-**Data flow**: Creates a single tool with `dynamic_tool`, calls `validate_dynamic_tools`, expects an error string, and asserts that string contains `my_tool`.
+**Data flow**: The test builds one fake tool whose schema says its input is `null`. It passes that tool to validation and expects an error message that names the bad tool.
 
-**Call relations**: Test-harness entry covering the schema-rejection path in dynamic tool validation.
+**Call relations**: The test runner calls this test. It uses the `dynamic_tool` helper to prepare input, then calls the production validation function and checks the failure text.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -1869,11 +1875,11 @@ fn validate_dynamic_tools_rejects_unsupported_input_schema()
 fn validate_dynamic_tools_accepts_sanitizable_input_schema()
 ```
 
-**Purpose**: Verifies validation accepts a schema that is incomplete but sanitizable by core logic. The concrete case is a schema missing `type` but containing `properties`.
+**Purpose**: Checks that a common but incomplete schema can still be accepted when the core code can clean it up safely. This avoids rejecting reasonable tool definitions just because they omit a detail such as `type`.
 
-**Data flow**: Builds one tool with a minimal object-like schema, passes it to `validate_dynamic_tools`, and expects success.
+**Data flow**: The test builds one tool with a schema that has properties but no explicit type. It sends the tool to validation and expects success.
 
-**Call relations**: Documents that validation is intentionally permissive for schemas core can normalize later, rather than requiring already-canonical JSON Schema.
+**Call relations**: The test runner calls this test. It uses the shared tool builder, then exercises `validate_dynamic_tools` to confirm the production validator allows schemas that can be sanitized.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1884,11 +1890,11 @@ fn validate_dynamic_tools_accepts_sanitizable_input_schema()
 fn validate_dynamic_tools_accepts_nullable_field_schema()
 ```
 
-**Purpose**: Checks that object schemas with nullable property types are accepted. This guards compatibility with `type: ["string", "null"]` field declarations.
+**Purpose**: Checks that a tool schema may allow a field to be either a string or null. This matters because many real tool inputs have optional or nullable values.
 
-**Data flow**: Constructs a tool whose `query` property allows string or null, validates the tool list, and expects no error.
+**Data flow**: The test builds a tool whose `query` field accepts both text and null. It validates the tool and expects no error.
 
-**Call relations**: Covers a schema-shape acceptance case in the dynamic tool validator.
+**Call relations**: The test runner calls this test. It prepares a realistic JSON schema and hands it to `validate_dynamic_tools` through the helper-built tool object.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1899,11 +1905,11 @@ fn validate_dynamic_tools_accepts_nullable_field_schema()
 fn validate_dynamic_tools_accepts_same_name_in_different_namespaces()
 ```
 
-**Purpose**: Ensures duplicate function names are allowed when separated by namespace. The test proves uniqueness is scoped per namespace, not globally.
+**Purpose**: Checks that two tools can share the same function name when they live in different namespaces. A namespace is a named group, like two different apps both having a `search` command.
 
-**Data flow**: Creates two namespaced tools with identical function names but different namespace names, validates the vector, and expects success.
+**Data flow**: The test creates two namespaced tools with the same function name but different namespace names. It validates the list and expects success.
 
-**Call relations**: Exercises namespace-aware duplicate detection in dynamic tool validation.
+**Call relations**: The test runner calls this test. It uses the helper to create both tool groups, then calls the production validator to confirm names only need to be unique inside their own namespace.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1914,11 +1920,11 @@ fn validate_dynamic_tools_accepts_same_name_in_different_namespaces()
 fn validate_dynamic_tools_accepts_responses_compatible_identifiers()
 ```
 
-**Purpose**: Verifies names and namespaces matching the Responses API identifier rules are accepted. The concrete identifiers include mixed case, underscore, and digits.
+**Purpose**: Checks that tool and namespace names using letters, numbers, underscores, and hyphens are accepted. These are the identifier characters supported by the Responses API, the model API used for tool calls.
 
-**Data flow**: Builds a namespaced tool using `Codex-App_2` and `lookup-ticket_2`, validates it, and expects success.
+**Data flow**: The test builds one namespaced tool with names like `Codex-App_2` and `lookup-ticket_2`. It validates the tool list and expects success.
 
-**Call relations**: Pins the accepted identifier character set for Responses-compatible dynamic tools.
+**Call relations**: The test runner calls this test. The test sends a valid identifier example into `validate_dynamic_tools` to prove the naming rule is not too strict.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1929,11 +1935,11 @@ fn validate_dynamic_tools_accepts_responses_compatible_identifiers()
 fn validate_dynamic_tools_rejects_duplicate_name_in_same_namespace()
 ```
 
-**Purpose**: Checks that two functions with the same name inside one namespace are rejected. The error must mention both the namespace and duplicated function name.
+**Purpose**: Checks that a namespace cannot contain two functions with the same name. This prevents ambiguity when the model or server tries to call a tool.
 
-**Data flow**: Constructs a `DynamicToolSpec::Namespace` containing two identical `DynamicToolFunctionSpec` entries, runs `validate_dynamic_tools`, captures the error string, and asserts it contains `codex_app` and `my_tool`.
+**Data flow**: The test builds one namespace containing two identical function definitions. It validates the namespace and expects an error that mentions both the namespace and duplicated function name.
 
-**Call relations**: Covers the duplicate-name rejection branch for namespaced tool bundles.
+**Call relations**: The test runner calls this test. The test constructs the duplicate tool list directly, then calls `validate_dynamic_tools` to verify the production validator catches the conflict.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -1944,11 +1950,11 @@ fn validate_dynamic_tools_rejects_duplicate_name_in_same_namespace()
 fn thread_turns_list_merges_in_progress_active_turn_before_agent_status_running()
 ```
 
-**Purpose**: Verifies turns-list reconstruction appends a live in-progress turn even when thread status is idle and there is no separate running-thread flag. This protects UI visibility of active local state before agent-status propagation catches up.
+**Purpose**: Checks that an in-progress live turn appears in the thread's turn list even when the stored history says the thread is idle. This prevents the user interface from hiding a currently active user message.
 
-**Data flow**: Creates persisted rollout items containing one user message and a separate `Turn` marked `InProgress`, calls `reconstruct_thread_turns_for_turns_list`, and asserts the returned turns end with the active turn.
+**Data flow**: The test creates one persisted user message and one live active turn. It asks the reconstruction function to build the visible turns list and expects the live turn to appear as the last item.
 
-**Call relations**: Regression test for ordering/merge logic in turns-list reconstruction when persisted history and live state coexist.
+**Call relations**: The test runner calls this test. It feeds fake persisted and live turn data into `reconstruct_thread_turns_for_turns_list`, then checks that the reconstructed list includes the active turn.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1959,11 +1965,11 @@ fn thread_turns_list_merges_in_progress_active_turn_before_agent_status_running(
 fn validate_dynamic_tools_rejects_empty_namespace()
 ```
 
-**Purpose**: Confirms an empty namespace string is invalid. The error is expected to mention the namespace problem explicitly.
+**Purpose**: Checks that a dynamic tool namespace cannot be an empty string. Empty group names would make tool names hard to address and error messages unclear.
 
-**Data flow**: Builds a namespaced tool with `Some("")`, validates it, expects an error, and checks the message contains `namespace`.
+**Data flow**: The test creates a tool in an empty namespace, runs validation, and expects an error mentioning the namespace problem.
 
-**Call relations**: Covers namespace-presence validation in the dynamic tool validator.
+**Call relations**: The test runner calls this test. It uses the shared helper to build invalid input, then relies on `validate_dynamic_tools` to reject it.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -1974,11 +1980,11 @@ fn validate_dynamic_tools_rejects_empty_namespace()
 fn validate_dynamic_tools_rejects_reserved_namespace()
 ```
 
-**Purpose**: Checks that reserved internal namespace prefixes are rejected. The concrete reserved value under test is `mcp__server__`.
+**Purpose**: Checks that a namespace pattern reserved for MCP-style tool names is rejected. Reserved names are blocked so user-supplied tools do not collide with server-generated tool naming.
 
-**Data flow**: Creates a namespaced tool using the reserved namespace, validates it, expects failure, and asserts the error mentions `reserved`.
+**Data flow**: The test creates a namespaced tool using a reserved namespace prefix. It validates the list and expects an error that says the namespace is reserved.
 
-**Call relations**: Documents a guardrail preventing collisions with internal MCP namespace conventions.
+**Call relations**: The test runner calls this test. It builds a deliberately reserved namespace and sends it through the production dynamic-tool validator.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -1989,11 +1995,11 @@ fn validate_dynamic_tools_rejects_reserved_namespace()
 fn validate_dynamic_tools_rejects_name_not_supported_by_responses()
 ```
 
-**Purpose**: Ensures tool names outside the Responses API identifier regex are rejected. The test uses a dotted name to trigger the failure.
+**Purpose**: Checks that a tool function name containing a dot is rejected because the Responses API does not allow that form. This avoids sending invalid tool definitions to the model API.
 
-**Data flow**: Builds a tool named `lookup.ticket`, validates it, captures the error, and asserts it mentions the bad name plus the Responses API regex `^[a-zA-Z0-9_-]+$`.
+**Data flow**: The test builds a tool named `lookup.ticket`, validates it, and expects an error that includes the bad name and the allowed name pattern.
 
-**Call relations**: Covers identifier-format validation for top-level tool names.
+**Call relations**: The test runner calls this test. It uses `validate_dynamic_tools` as the gatekeeper and checks that the error explains the Responses API naming rule.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -2004,11 +2010,11 @@ fn validate_dynamic_tools_rejects_name_not_supported_by_responses()
 fn validate_dynamic_tools_rejects_namespace_not_supported_by_responses()
 ```
 
-**Purpose**: Ensures namespaces outside the Responses API identifier regex are rejected. The concrete invalid namespace contains a dot.
+**Purpose**: Checks that namespace names must also follow the Responses API naming rules. A namespace with a dot is rejected for the same reason as a bad tool name.
 
-**Data flow**: Builds a namespaced tool with namespace `codex.app`, validates it, expects an error, and checks for both the bad namespace and the regex guidance.
+**Data flow**: The test builds a tool in namespace `codex.app`, runs validation, and expects an error naming the invalid namespace and showing the allowed pattern.
 
-**Call relations**: Parallel to the invalid-name test, but for namespace validation.
+**Call relations**: The test runner calls this test. It sends invalid namespace input into `validate_dynamic_tools` and checks that the production error is helpful.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -2019,11 +2025,11 @@ fn validate_dynamic_tools_rejects_namespace_not_supported_by_responses()
 fn validate_dynamic_tools_rejects_name_longer_than_responses_limit()
 ```
 
-**Purpose**: Checks the maximum Responses API tool-name length enforcement. The test uses a 129-character name and expects a limit error.
+**Purpose**: Checks that tool names longer than the Responses API limit are rejected. This prevents the server from accepting a tool it could not later send to the model API.
 
-**Data flow**: Generates a long string with `"a".repeat(129)`, validates a tool using it, and asserts the error mentions `at most 128` and includes the offending name.
+**Data flow**: The test creates a 129-character tool name, validates it, and expects an error saying the limit is 128 characters and including the long name.
 
-**Call relations**: Covers length-limit validation for tool names.
+**Call relations**: The test runner calls this test. It uses the shared tool builder and the production validator to confirm the length rule is enforced.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -2034,11 +2040,11 @@ fn validate_dynamic_tools_rejects_name_longer_than_responses_limit()
 fn validate_dynamic_tools_rejects_namespace_fields_over_limits()
 ```
 
-**Purpose**: Verifies namespace metadata length limits for both namespace name and description. It mutates the same tool to test both branches.
+**Purpose**: Checks that namespace names and namespace descriptions obey their length limits. These limits keep dynamic tool metadata compatible with downstream APIs.
 
-**Data flow**: First validates a tool with a 65-character namespace name and asserts the error mentions `at most 64`; then destructures the namespace entry, replaces the name with `tickets`, sets a 1025-character description, revalidates, and asserts the description limit error mentions `at most 1024`.
+**Data flow**: The test first creates a namespace name that is too long and expects validation to fail. It then shortens the name but makes the description too long, validates again, and expects a second failure.
 
-**Call relations**: Exercises multiple namespace field-length checks in one test, using direct mutation of the constructed `DynamicToolSpec::Namespace`.
+**Call relations**: The test runner calls this test. It mutates the same tool definition between validation calls so it can check both namespace-name and namespace-description limits.
 
 *Call graph*: 3 external calls (assert!, unreachable!, vec!).
 
@@ -2049,11 +2055,11 @@ fn validate_dynamic_tools_rejects_namespace_fields_over_limits()
 fn validate_dynamic_tools_rejects_reserved_responses_namespace()
 ```
 
-**Purpose**: Confirms the Responses API reserved namespace `functions` is rejected even though it matches the identifier regex. This distinguishes reserved-word checks from syntax checks.
+**Purpose**: Checks that `functions`, a namespace reserved by the Responses API, cannot be used for dynamic tools. This avoids conflicts with the API's own tool organization.
 
-**Data flow**: Builds a namespaced tool under `functions`, validates it, expects an error, and asserts the message mentions both `functions` and `Responses API`.
+**Data flow**: The test creates a tool under the namespace `functions`, validates it, and expects an error that mentions both the namespace and the Responses API.
 
-**Call relations**: Covers reserved-name validation specific to Responses API semantics.
+**Call relations**: The test runner calls this test. It feeds a reserved Responses namespace into `validate_dynamic_tools` and checks that the validator blocks it.
 
 *Call graph*: 2 external calls (assert!, vec!).
 
@@ -2064,11 +2070,11 @@ fn validate_dynamic_tools_rejects_reserved_responses_namespace()
 fn summary_from_stored_thread_preserves_millisecond_precision()
 ```
 
-**Purpose**: Checks that summaries built from `StoredThread` preserve RFC3339 millisecond precision for created and updated timestamps. This differs from protocol metadata summaries that intentionally round to seconds.
+**Purpose**: Checks that summaries made from stored thread records keep millisecond-level timestamps. This matters when clients sort or display conversations using precise times.
 
-**Data flow**: Parses two RFC3339 timestamps with milliseconds, constructs a concrete `StoredThread`, calls `summary_from_stored_thread`, and asserts `summary.timestamp` and `summary.updated_at` equal the original millisecond strings.
+**Data flow**: The test builds a stored thread with creation and update timestamps containing milliseconds. It converts that record into a summary and expects the timestamp strings to still include `.678` and `.789`.
 
-**Call relations**: Regression test for timestamp formatting in the stored-thread summary path.
+**Call relations**: The test runner calls this test. It constructs a realistic `StoredThread`, passes it to `summary_from_stored_thread`, and checks the resulting summary fields.
 
 *Call graph*: calls 2 internal fn (read_only, from_string); 3 external calls (parse_from_rfc3339, from, assert_eq!).
 
@@ -2079,11 +2085,11 @@ fn summary_from_stored_thread_preserves_millisecond_precision()
 fn requested_permissions_trust_project_uses_permission_profile_intent()
 ```
 
-**Purpose**: Verifies trust-project detection is based on permission-profile intent rather than only exact built-in profile names. It covers disabled/full-access, workspace-write, custom restricted-write, and read-only cases.
+**Purpose**: Checks how the server decides whether requested permissions mean the user is trusting the project. Write-capable profiles count as trust; read-only profiles do not.
 
-**Data flow**: Builds an absolute cwd and several `PermissionProfile` variants, wraps them in `ConfigOverrides` either as typed `permission_profile` or string `default_permissions`, calls `requested_permissions_trust_project`, and asserts true for write/full-access intents and false for read-only intents.
+**Data flow**: The test builds several permission override examples: full access, workspace write, split write rules, and read-only. It asks `requested_permissions_trust_project` about each one and expects true for write-capable settings and false for read-only settings.
 
-**Call relations**: Documents how permission intent is inferred from both explicit runtime profiles and named built-in profiles.
+**Call relations**: The test runner calls this test. It uses permission-profile constructors from protocol code, then calls the production trust-checking function for each case.
 
 *Call graph*: calls 4 internal fn (from_runtime_permissions, read_only, workspace_write, restricted); 3 external calls (assert!, test_path_buf, vec!).
 
@@ -2094,11 +2100,11 @@ fn requested_permissions_trust_project_uses_permission_profile_intent()
 fn config_load_error_marks_cloud_config_bundle_failures_for_relogin()
 ```
 
-**Purpose**: Checks that auth-related cloud config bundle load failures are converted into a JSON-RPC error with structured relogin metadata. The message still remains a generic configuration-load failure.
+**Purpose**: Checks that an authentication failure while loading cloud configuration is reported with enough structured data for the client to ask the user to log in again.
 
-**Data flow**: Wraps a `CloudConfigBundleLoadError` with code `Auth` and status 401 inside `std::io::Error::other`, passes it to `config_load_error`, and asserts the returned error's `data` JSON contains reason, errorCode, action `relogin`, statusCode, and detail.
+**Data flow**: The test wraps a cloud config authentication error in an I/O error, converts it with `config_load_error`, and expects the result to include reason, error code, relogin action, status code, and detail text.
 
-**Call relations**: Covers the branch where config-load errors are annotated for client UX recovery.
+**Call relations**: The test runner calls this test. It creates a specific cloud-config error and verifies that the production error-formatting function turns it into client-friendly JSON data.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, assert_eq!, other).
 
@@ -2109,11 +2115,11 @@ fn config_load_error_marks_cloud_config_bundle_failures_for_relogin()
 fn config_load_error_leaves_non_cloud_config_bundle_failures_unmarked()
 ```
 
-**Purpose**: Ensures ordinary configuration load failures are not decorated with cloud-config metadata. Only the generic failure message should remain.
+**Purpose**: Checks that ordinary configuration load failures are not mislabeled as cloud bundle failures. This prevents clients from showing the wrong recovery action.
 
-**Data flow**: Creates a plain `std::io::Error::other` string error, converts it with `config_load_error`, and asserts `data` is `None` while the message still mentions configuration load failure.
+**Data flow**: The test creates a plain I/O error, sends it to `config_load_error`, and expects no structured data while still expecting a general configuration failure message.
 
-**Call relations**: Negative-control test for cloud-config-specific error enrichment.
+**Call relations**: The test runner calls this test. It exercises the same production error conversion path as cloud failures, but with a non-cloud error.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, other).
 
@@ -2124,11 +2130,11 @@ fn config_load_error_leaves_non_cloud_config_bundle_failures_unmarked()
 fn config_load_error_marks_non_auth_cloud_config_bundle_failures_without_relogin()
 ```
 
-**Purpose**: Checks that non-auth cloud config bundle failures still carry structured metadata, but without a relogin action. The concrete code under test is `RequestFailed`.
+**Purpose**: Checks that a non-authentication cloud configuration failure is marked as a cloud bundle problem but does not ask the user to relogin.
 
-**Data flow**: Builds a `CloudConfigBundleLoadError` with code `RequestFailed`, wraps it in `std::io::Error`, converts it via `config_load_error`, and asserts the returned `data` JSON contains reason, errorCode, and detail only.
+**Data flow**: The test creates a cloud config request-failed error with no HTTP status code. After conversion, it expects structured data with reason, error code, and detail, but no relogin action.
 
-**Call relations**: Covers cloud-config error annotation for recoverable/non-auth failures.
+**Call relations**: The test runner calls this test. It uses `CloudConfigBundleLoadError::new` to create the input and `config_load_error` to check production formatting.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, other).
 
@@ -2139,11 +2145,11 @@ fn config_load_error_marks_non_auth_cloud_config_bundle_failures_without_relogin
 fn config_load_error_marks_invalid_cloud_config_bundle_failures_without_relogin()
 ```
 
-**Purpose**: Verifies invalid-bundle cloud config failures are surfaced with structured metadata but no relogin action. This distinguishes malformed bundle content from authentication problems.
+**Purpose**: Checks that an invalid cloud configuration bundle is reported as such, without suggesting login repair. This helps clients distinguish bad policy data from authentication trouble.
 
-**Data flow**: Creates a `CloudConfigBundleLoadError` with code `InvalidBundle`, wraps it in `std::io::Error`, passes it to `config_load_error`, and asserts the resulting `data` JSON contains reason, errorCode, and detail.
+**Data flow**: The test creates an invalid-bundle error, converts it, and expects structured data containing the cloud bundle reason, invalid-bundle code, and detail message.
 
-**Call relations**: Completes coverage of cloud-config error classification.
+**Call relations**: The test runner calls this test. It feeds an invalid-bundle error through the production error conversion function and checks the client-facing payload.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, other).
 
@@ -2154,11 +2160,11 @@ fn config_load_error_marks_invalid_cloud_config_bundle_failures_without_relogin(
 async fn derive_config_from_params_uses_session_thread_config_model_provider() -> Result<()>
 ```
 
-**Purpose**: Tests config precedence when session thread config defines a model provider and request overrides attempt to replace it. The session-scoped provider and feature flags should win, while unrelated request overrides like `bypass_hook_trust` still apply.
+**Purpose**: Checks that session-level thread configuration wins over request-level overrides for model provider data and feature settings. This protects server-controlled session policy from being accidentally overwritten by a request.
 
-**Data flow**: Creates a temporary config manager with a `StaticThreadConfigLoader` containing a `SessionThreadConfig`, calls `load_with_overrides` with request override JSON and default typed overrides, then asserts the resulting config uses provider id `session`, the session provider definition, disabled plugins from session config, and enabled `bypass_hook_trust` from request overrides.
+**Data flow**: The test creates a temporary config manager with a session model provider and plugin feature disabled. It then loads config with request overrides that try to change the provider and enable plugins. The final config should still use the session provider and keep plugins disabled, while allowing an unrelated bypass setting.
 
-**Call relations**: Async integration-style test for `ConfigManager` behavior as used by thread request processing.
+**Call relations**: The async test runner calls this test. The test builds a real `ConfigManager`, loads configuration through its normal async path, and checks the resulting config object.
 
 *Call graph*: calls 3 internal fn (new, default, new); 11 external calls (new, from, new, new, default, assert!, assert_eq!, default, default, json! (+1 more)).
 
@@ -2169,11 +2175,11 @@ async fn derive_config_from_params_uses_session_thread_config_model_provider() -
 fn collect_resume_override_mismatches_includes_service_tier()
 ```
 
-**Purpose**: Ensures resume mismatch reporting includes `service_tier` differences between the resume request and active thread config snapshot. This helps explain why a resume request cannot exactly reproduce prior settings.
+**Purpose**: Checks that resume diagnostics include service tier mismatches. A service tier is a requested level of model service, such as priority or flex.
 
-**Data flow**: Constructs a `ThreadResumeParams` with requested `service_tier` and a `ThreadConfigSnapshot` with a different active tier, calls `collect_resume_override_mismatches`, and asserts the returned vector contains the expected mismatch string.
+**Data flow**: The test builds a resume request asking for one service tier and a saved config snapshot showing another. It asks the mismatch collector for differences and expects one message describing the requested and active tiers.
 
-**Call relations**: Regression test for mismatch-report completeness in resume validation.
+**Call relations**: The test runner calls this test. It builds both sides of the comparison and sends them to `collect_resume_override_mismatches`, which produces the human-readable mismatch list.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, assert_eq!, test_path_buf).
 
@@ -2187,11 +2193,11 @@ fn test_thread_metadata(
     ) -> Result<ThreadMetadata>
 ```
 
-**Purpose**: Helper that builds a minimally populated `ThreadMetadata` with configurable model and reasoning effort. It standardizes metadata fixtures for summary and resume-merge tests.
+**Purpose**: Builds a small thread metadata object for resume and summary tests. It avoids repeating the same thread id, rollout path, provider, and timestamp setup.
 
-**Data flow**: Parses a fixed `ThreadId`, initializes `ThreadMetadataBuilder` with rollout path and current time, sets `model_provider`, builds metadata with fallback provider `mock_provider`, then overwrites `model` and `reasoning_effort` from arguments before returning it.
+**Data flow**: Optional model and reasoning-effort values go in. The helper creates metadata with a fixed thread id and mock provider, inserts the optional values, and returns the completed metadata or an error if setup fails.
 
-**Call relations**: Shared fixture constructor used by multiple tests that need realistic persisted thread metadata.
+**Call relations**: Several tests call this helper before exercising summary formatting or resume metadata merging. It delegates basic metadata construction to `ThreadMetadataBuilder`.
 
 *Call graph*: calls 2 internal fn (from_string, new); 3 external calls (from, now, default).
 
@@ -2202,11 +2208,11 @@ fn test_thread_metadata(
 fn summary_from_thread_metadata_formats_protocol_timestamps_as_seconds() -> Result<()>
 ```
 
-**Purpose**: Checks that summaries derived from protocol `ThreadMetadata` truncate timestamps to whole seconds. This intentionally differs from the stored-thread summary path.
+**Purpose**: Checks that protocol-facing summaries made from thread metadata format timestamps to whole seconds. This confirms this conversion intentionally differs from stored-thread summaries that keep milliseconds.
 
-**Data flow**: Builds metadata with `test_thread_metadata`, overwrites `created_at` and `updated_at` with millisecond timestamps, calls `summary_from_thread_metadata`, and asserts the resulting strings omit fractional seconds.
+**Data flow**: The test creates metadata, sets creation and update times with milliseconds, converts it to a summary, and expects timestamp strings without the millisecond part.
 
-**Call relations**: Documents the protocol-facing timestamp normalization rule for metadata summaries.
+**Call relations**: The test runner calls this test. It uses `test_thread_metadata` for setup, then calls `summary_from_thread_metadata` and checks the formatted timestamp fields.
 
 *Call graph*: 3 external calls (parse_from_rfc3339, test_thread_metadata, assert_eq!).
 
@@ -2217,11 +2223,11 @@ fn summary_from_thread_metadata_formats_protocol_timestamps_as_seconds() -> Resu
 fn merge_persisted_resume_metadata_prefers_persisted_model_and_reasoning_effort() -> Result<()>
 ```
 
-**Purpose**: Verifies persisted metadata fills in missing resume overrides for model, provider, and reasoning effort. The reasoning effort is inserted into the request-overrides map under `model_reasoning_effort`.
+**Purpose**: Checks that, when resuming a thread with no explicit overrides, the server restores the persisted model, model provider, and reasoning effort. Reasoning effort is the model's requested depth of thinking.
 
-**Data flow**: Starts with empty request and typed overrides, builds persisted metadata containing model and high reasoning effort, calls `merge_persisted_resume_metadata`, and asserts typed overrides now contain model/provider while request overrides contain `model_reasoning_effort: "high"`.
+**Data flow**: The test starts with empty override containers and metadata containing a model and high reasoning effort. After merging, the typed overrides should contain the persisted model and provider, and the raw request overrides should contain high reasoning effort.
 
-**Call relations**: Covers the defaulting branch where persisted resume metadata is adopted because the caller supplied no explicit override.
+**Call relations**: The test runner calls this test. It uses `test_thread_metadata` for persisted data, then calls `merge_persisted_resume_metadata` to verify resume defaults are restored.
 
 *Call graph*: 3 external calls (test_thread_metadata, assert_eq!, default).
 
@@ -2232,11 +2238,11 @@ fn merge_persisted_resume_metadata_prefers_persisted_model_and_reasoning_effort(
 fn merge_persisted_resume_metadata_preserves_explicit_overrides() -> Result<()>
 ```
 
-**Purpose**: Ensures explicit request or typed overrides are not overwritten by persisted metadata. The test covers both model and reasoning effort already being set by the caller.
+**Purpose**: Checks that explicit resume overrides from the request are not overwritten by persisted metadata. User or caller choices should win over old saved settings.
 
-**Data flow**: Initializes request overrides with `model_reasoning_effort = low` and typed overrides with model `gpt-5.2-codex`, merges persisted metadata containing different values, and asserts the explicit values remain unchanged while provider stays unset.
+**Data flow**: The test starts with an explicit low reasoning effort and explicit newer model, while persisted metadata has a different model and high effort. After merging, the explicit values should remain and the persisted provider should not be injected.
 
-**Call relations**: Regression test for override precedence during thread resume.
+**Call relations**: The test runner calls this test. It prepares both explicit request choices and persisted metadata, then checks that `merge_persisted_resume_metadata` respects the explicit choices.
 
 *Call graph*: 5 external calls (default, from, test_thread_metadata, assert_eq!, String).
 
@@ -2247,11 +2253,11 @@ fn merge_persisted_resume_metadata_preserves_explicit_overrides() -> Result<()>
 fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden() -> Result<()>
 ```
 
-**Purpose**: Checks that a request-level `model` override suppresses importing persisted model/provider/reasoning defaults. Persisted metadata should not partially leak in once model selection is explicit.
+**Purpose**: Checks that if the raw request overrides the model, persisted model-related values are not copied in. This avoids mixing a caller-chosen model with an old provider or reasoning setup.
 
-**Data flow**: Starts with request overrides containing `model`, empty typed overrides, merges persisted metadata, and asserts typed overrides remain empty and request overrides are unchanged.
+**Data flow**: The test starts with a raw request model override and no typed overrides. After merging with persisted metadata, the request model remains the only override and no persisted model or provider is added.
 
-**Call relations**: Covers the branch where explicit model selection blocks persisted resume defaults.
+**Call relations**: The test runner calls this test. It passes a request override map and persisted metadata to `merge_persisted_resume_metadata`, then checks the map and typed overrides.
 
 *Call graph*: 5 external calls (from, test_thread_metadata, assert_eq!, default, String).
 
@@ -2262,11 +2268,11 @@ fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden(
 fn merge_persisted_resume_metadata_skips_persisted_values_when_provider_overridden() -> Result<()>
 ```
 
-**Purpose**: Ensures an explicit typed `model_provider` override prevents persisted model/provider defaults from being applied. This avoids mixing a persisted model with a caller-selected provider.
+**Purpose**: Checks that if the caller explicitly chooses a model provider, persisted model settings are not copied in. This keeps resumed configuration internally consistent.
 
-**Data flow**: Starts with typed overrides containing `model_provider = oss`, merges persisted metadata, and asserts provider remains `oss` while model stays unset and no request overrides are added.
+**Data flow**: The test starts with a typed provider override of `oss` and persisted metadata from a mock provider. After merging, the explicit provider remains, no model is copied, and no raw request overrides are added.
 
-**Call relations**: Another precedence test for resume metadata merging.
+**Call relations**: The test runner calls this test. It sets up an explicit provider override, calls `merge_persisted_resume_metadata`, and verifies persisted values are skipped.
 
 *Call graph*: 3 external calls (default, test_thread_metadata, assert_eq!).
 
@@ -2277,11 +2283,11 @@ fn merge_persisted_resume_metadata_skips_persisted_values_when_provider_overridd
 fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_overridden() -> Result<()>
 ```
 
-**Purpose**: Checks that an explicit request override for reasoning effort prevents persisted reasoning effort from being inserted. Persisted model/provider are also skipped in this scenario.
+**Purpose**: Checks that an explicit reasoning-effort override prevents persisted model-related values from being restored. This avoids combining incompatible old and new model settings.
 
-**Data flow**: Initializes request overrides with `model_reasoning_effort = low`, merges persisted metadata containing model and high effort, and asserts no typed overrides are added and the request override remains unchanged.
+**Data flow**: The test starts with a raw reasoning-effort override of low and persisted metadata with a model and high effort. After merging, only the explicit low effort remains; no persisted model or provider is added.
 
-**Call relations**: Covers the reasoning-effort precedence branch in resume metadata merging.
+**Call relations**: The test runner calls this test. It sends the override map and metadata into `merge_persisted_resume_metadata` and checks that the request's reasoning choice wins.
 
 *Call graph*: 5 external calls (from, test_thread_metadata, assert_eq!, default, String).
 
@@ -2292,11 +2298,11 @@ fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_
 fn merge_persisted_resume_metadata_skips_missing_values() -> Result<()>
 ```
 
-**Purpose**: Verifies merge behavior when persisted metadata lacks model and reasoning effort. Only the persisted provider is propagated into typed overrides.
+**Purpose**: Checks behavior when persisted metadata has no model or reasoning effort. The provider can still be restored, but missing fields should not create fake overrides.
 
-**Data flow**: Starts with empty overrides, builds metadata with no model/effort, merges it, and asserts `model` stays `None`, `model_provider` becomes `mock_provider`, and request overrides remain `None`.
+**Data flow**: The test creates metadata with no model and no reasoning effort, then merges it into empty overrides. The provider is copied, while model and raw reasoning overrides remain absent.
 
-**Call relations**: Documents partial propagation semantics for sparse persisted metadata.
+**Call relations**: The test runner calls this test. It relies on `test_thread_metadata` to create sparse metadata, then checks `merge_persisted_resume_metadata` handles missing values cleanly.
 
 *Call graph*: 3 external calls (test_thread_metadata, assert_eq!, default).
 
@@ -2307,11 +2313,11 @@ fn merge_persisted_resume_metadata_skips_missing_values() -> Result<()>
 async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()>
 ```
 
-**Purpose**: Checks that rollout summary extraction falls back to an empty preview when the rollout contains only session metadata and no user message. It also verifies `updated_at` comes from file modification time when available.
+**Purpose**: Checks that reading a rollout file with only session metadata returns an empty preview instead of failing or inventing text. A rollout file is the saved line-by-line record of a conversation.
 
-**Data flow**: Creates a temp rollout file containing one serialized `RolloutLine::SessionMeta`, sets the file mtime to the same parsed timestamp, calls `read_summary_from_rollout`, and compares the full `ConversationSummary` to an expected struct with empty preview and fallback provider.
+**Data flow**: The test writes a temporary rollout file containing one session metadata line and no user message. It sets the file's modified time, reads a summary from the file, and expects an empty preview plus the correct ids, timestamps, path, provider fallback, and defaults.
 
-**Call relations**: Async file-based regression test for the no-preview fallback path in summary extraction.
+**Call relations**: The async test runner calls this test. The test writes a real temporary file, then calls `read_summary_from_rollout`, checking that production file-reading code handles a minimal rollout.
 
 *Call graph*: calls 2 internal fn (default, from_string); 10 external calls (new, new, new, new, assert_eq!, parse_from_rfc3339, format!, write, SessionMeta, new).
 
@@ -2322,11 +2328,11 @@ async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() 
 async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()>
 ```
 
-**Purpose**: Verifies agent nickname and role survive rollout summary extraction and conversion back into an API `Thread`. It also confirms `thread_source` is not inferred from the summary path.
+**Purpose**: Checks that agent nickname and role stored in a rollout file survive summary reading and conversion to a thread object. This matters for subagents that have user-visible identities.
 
-**Data flow**: Writes a rollout containing `SessionMeta` with `SessionSource::SubAgent(ThreadSpawn)` plus top-level `agent_nickname` and `agent_role`, reads a `ConversationSummary`, converts it with `summary_to_thread`, and asserts nickname/role are preserved while `thread_source` is `None`.
+**Data flow**: The test writes session metadata for a subagent with nickname `atlas` and role `explorer`. It reads the rollout summary, converts that summary into a thread, and expects the nickname and role to be present.
 
-**Call relations**: Covers the interaction between summary extraction and `with_thread_spawn_agent_metadata`/`summary_to_thread` behavior.
+**Call relations**: The async test runner calls this test. It exercises `read_summary_from_rollout` and then `summary_to_thread`, proving the identity fields move through both steps.
 
 *Call graph*: calls 3 internal fn (default, from_string, from_absolute_path); 6 external calls (new, SubAgent, assert_eq!, format!, write, SessionMeta).
 
@@ -2337,11 +2343,11 @@ async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()>
 async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()>
 ```
 
-**Purpose**: Checks that rollout session metadata retains `forked_from_id` and that it can be read back directly. This guards against losing fork lineage in persisted rollout headers.
+**Purpose**: Checks that a rollout file keeps track of which thread it was forked from. This is important for showing thread ancestry and resume history.
 
-**Data flow**: Writes a rollout file whose `SessionMeta` includes `forked_from_id`, then calls the local helper `forked_from_id_from_rollout` and asserts it returns the expected thread id string.
+**Data flow**: The test writes a rollout session metadata line containing a `forked_from_id`. It then reads that field back through the helper and expects the same id as text.
 
-**Call relations**: Async metadata-preservation test focused specifically on fork ancestry.
+**Call relations**: The async test runner calls this test. It writes a temporary rollout file and uses `forked_from_id_from_rollout`, which delegates parsing to core session metadata reading.
 
 *Call graph*: calls 2 internal fn (default, from_string); 5 external calls (new, assert_eq!, format!, write, SessionMeta).
 
@@ -2352,11 +2358,11 @@ async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()>
 async fn aborting_pending_request_clears_pending_state() -> Result<()>
 ```
 
-**Purpose**: Verifies that aborting pending server requests for a thread resolves the waiting client callback with a structured turn-transition error and removes pending-request bookkeeping. It also confirms no extra outgoing messages are emitted during cleanup.
+**Purpose**: Checks that aborting pending server-to-client requests resolves the waiting callback with a clear error and removes the request from pending state. This prevents stale requests from hanging after a turn changes.
 
-**Data flow**: Creates an `OutgoingMessageSender`, wraps it in `ThreadScopedOutgoingMessageSender`, sends a `ServerRequestPayload::ToolRequestUserInput`, calls `abort_pending_server_requests`, receives the originally sent outgoing request from the channel, awaits the callback receiver for the aborted response, and asserts the error payload and empty pending-request set.
+**Data flow**: The test creates an outgoing message sender, sends a tool user-input request to one connection, then aborts pending requests. It reads the outgoing request, waits for the callback result, expects a turn-transition error, and confirms there are no pending requests left.
 
-**Call relations**: Integration-style async test for outgoing request lifecycle cleanup when thread state changes invalidate pending client prompts.
+**Call relations**: The async test runner calls this test. It uses real outgoing-message sender objects and calls `abort_pending_server_requests` on the thread-scoped sender to verify cleanup behavior.
 
 *Call graph*: calls 4 internal fn (disabled, new, new, from_string); 7 external calls (new, ToolRequestUserInput, assert!, assert_eq!, panic!, channel, vec!).
 
@@ -2367,11 +2373,11 @@ async fn aborting_pending_request_clears_pending_state() -> Result<()>
 fn summary_from_state_db_metadata_preserves_agent_nickname() -> Result<()>
 ```
 
-**Purpose**: Checks that summaries reconstructed from state-db metadata preserve agent nickname and role through `summary_to_thread`. This mirrors the rollout-based preservation test for the database-backed path.
+**Purpose**: Checks that summaries built from database metadata preserve subagent nickname and role. This covers the database path, separate from the rollout-file path.
 
-**Data flow**: Builds a summary with `summary_from_state_db_metadata` using serialized `SessionSource::SubAgent(ThreadSpawn)` and explicit nickname/role, converts it with `summary_to_thread`, and asserts the resulting `Thread` carries those fields.
+**Data flow**: The test builds state database metadata values, including serialized subagent source, nickname, and role. It converts them into a summary, then into a thread, and expects the nickname and role to remain.
 
-**Call relations**: Regression test for parity between rollout-derived and state-db-derived summary conversion.
+**Call relations**: The test runner calls this test. It exercises `summary_from_state_db_metadata` followed by `summary_to_thread`, proving agent identity is preserved across both conversions.
 
 *Call graph*: calls 2 internal fn (from_string, from_absolute_path); 4 external calls (from, SubAgent, assert_eq!, to_string).
 
@@ -2382,11 +2388,11 @@ fn summary_from_state_db_metadata_preserves_agent_nickname() -> Result<()>
 async fn removing_thread_state_clears_listener_and_active_turn_history() -> Result<()>
 ```
 
-**Purpose**: Verifies removing a thread state cancels its listener task, drops subscriptions, and clears active-turn history. The test checks both the cancellation signal and the newly recreated empty state.
+**Purpose**: Checks that removing a thread's state cancels its listener, removes subscribers, and clears active-turn history. This prevents old live state from leaking into a later use of the same thread id.
 
-**Data flow**: Creates a `ThreadStateManager`, initializes and subscribes a connection, injects a `cancel_tx` and tracked `TurnStarted` event into the thread state, calls `remove_thread_state`, awaits the cancellation receiver, then fetches the thread state again and asserts no subscribers, no cancel handle, and no active turn snapshot remain.
+**Data flow**: The test creates a state manager, registers a connection, subscribes it to a thread, stores a cancel sender, and records a turn-start event. After removing the thread state, it expects the cancel signal to fire, subscriptions to be empty, and active-turn snapshot to be gone.
 
-**Call relations**: Async lifecycle test for full thread-state teardown.
+**Call relations**: The async test runner calls this test. It exercises `ThreadStateManager` methods for connection setup, subscription, event tracking, and full thread-state removal.
 
 *Call graph*: calls 2 internal fn (new, from_string); 6 external calls (default, default, assert!, assert_eq!, channel, TurnStarted).
 
@@ -2397,11 +2403,11 @@ async fn removing_thread_state_clears_listener_and_active_turn_history() -> Resu
 async fn removing_auto_attached_connection_preserves_listener_for_other_connections() -> Result<()>
 ```
 
-**Purpose**: Ensures removing one subscribed connection does not tear down the thread listener while another connection remains subscribed. The listener cancellation channel should stay unresolved.
+**Purpose**: Checks that removing one subscribed connection does not cancel the thread listener while another connection is still subscribed. A thread should stay alive as long as at least one client is watching it.
 
-**Data flow**: Creates a manager, initializes two connections, subscribes both to one thread, installs a `cancel_tx`, removes only `connection_a`, asserts no threads need unloading, checks the cancel receiver does not fire within a short timeout, and verifies `connection_b` remains subscribed.
+**Data flow**: The test creates two connections subscribed to the same thread and attaches a cancel sender to the thread state. It removes one connection, expects no cancel signal, and confirms the other connection remains subscribed.
 
-**Call relations**: Covers partial-unsubscribe behavior in thread listener management.
+**Call relations**: The async test runner calls this test. It drives `ThreadStateManager::remove_connection` and subscription lookup to verify partial disconnect behavior.
 
 *Call graph*: calls 2 internal fn (new, from_string); 4 external calls (default, assert!, assert_eq!, channel).
 
@@ -2412,11 +2418,11 @@ async fn removing_auto_attached_connection_preserves_listener_for_other_connecti
 async fn adding_connection_to_thread_updates_has_connections_watcher() -> Result<()>
 ```
 
-**Purpose**: Checks that the per-thread `has_connections` watch channel flips false when the last subscriber leaves and back to true when another connection is added. This validates watcher continuity across subscriber churn.
+**Purpose**: Checks that a watcher tracking whether a thread has any connections updates when connections are removed and added. This lets other tasks react when a thread becomes watched or unwatched.
 
-**Data flow**: Initializes two connections, subscribes one, obtains a watch receiver from `subscribe_to_has_connections`, unsubscribes the first connection and waits for `changed()`, then adds the second connection and waits for another `changed()`, asserting the watched boolean transitions false then true.
+**Data flow**: The test subscribes one connection, creates a has-connections watcher, and confirms it starts as true. It unsubscribes that connection and waits for the watcher to become false, then adds another connection and waits for it to become true again.
 
-**Call relations**: Async test for the thread-state watch mechanism used by listener/background lifecycle code.
+**Call relations**: The async test runner calls this test. It uses `ThreadStateManager` subscription methods and the watch receiver returned by `subscribe_to_has_connections`.
 
 *Call graph*: calls 2 internal fn (new, from_string); 4 external calls (from_secs, default, assert!, timeout).
 
@@ -2427,11 +2433,11 @@ async fn adding_connection_to_thread_updates_has_connections_watcher() -> Result
 async fn closed_connection_cannot_be_reintroduced_by_auto_subscribe() -> Result<()>
 ```
 
-**Purpose**: Ensures a connection removed from the manager cannot later be auto-subscribed back onto a thread. This prevents stale closed connections from reappearing in subscriber sets.
+**Purpose**: Checks that once a connection is removed, auto-subscribe logic cannot silently bring it back. This prevents closed clients from being treated as active subscribers.
 
-**Data flow**: Initializes a connection, removes it, asserts no threads unload, then attempts `try_ensure_connection_subscribed` and checks it returns `None` and leaves the thread without subscribers.
+**Data flow**: The test initializes one connection, removes it, then tries to auto-subscribe it to a thread. The attempt should return nothing, and the thread should have no subscribers.
 
-**Call relations**: Regression test for connection-liveness checks in auto-subscribe paths.
+**Call relations**: The async test runner calls this test. It exercises `remove_connection`, then calls `try_ensure_connection_subscribed` to make sure the state manager remembers the connection is closed.
 
 *Call graph*: calls 2 internal fn (new, from_string); 3 external calls (default, assert!, assert_eq!).
 
@@ -2442,22 +2448,24 @@ async fn closed_connection_cannot_be_reintroduced_by_auto_subscribe() -> Result<
 async fn first_attestation_capable_connection_for_thread_only_uses_thread_subscribers() -> Result<()>
 ```
 
-**Purpose**: Verifies attestation-capable connection selection is scoped to subscribers of the target thread and returns the earliest attestation-capable subscriber for that thread. Unrelated threads and unsupported subscribers must be ignored.
+**Purpose**: Checks that the server chooses the first attestation-capable connection from the thread's own subscribers, not from unrelated connections. Attestation here means a client can answer a trust or identity challenge.
 
-**Data flow**: Initializes four connections with varying `ConnectionCapabilities`, subscribes them across two threads in a specific order, then queries `first_attestation_capable_connection_for_thread` for each thread and asserts the expected connection ids.
+**Data flow**: The test creates several connections, some able to request attestation and some not, and subscribes them to two different threads. It asks for the first attestation-capable connection for each thread and expects the earliest suitable subscriber for that specific thread.
 
-**Call relations**: Async test for attestation routing logic used when a thread needs a capable client connection.
+**Call relations**: The async test runner calls this test. It drives `ThreadStateManager` connection registration, thread subscription, and attestation-capable lookup to confirm the selection is scoped correctly.
 
 *Call graph*: calls 2 internal fn (new, from_string); 3 external calls (default, assert!, assert_eq!).
 
 
 ### `app-server/src/request_processors/thread_summary_tests.rs`
 
-`test` · `test-time validation of summary preview extraction`
+`test` · `test suite`
 
-This file contains a single targeted test for `extract_conversation_summary`. It constructs a synthetic rollout head as raw JSON values rather than writing a file: the first entry is session metadata, the second is a user message containing AGENTS.md instruction boilerplate, and the third is another user message prefixed with `USER_MESSAGE_BEGIN` followed by the actual prompt text. The test deserializes the first JSON object into `SessionMeta`, calls `extract_conversation_summary`, and asserts the resulting `ConversationSummary` uses `Count to 5` as the preview.
+This test protects a small but important user-facing behavior: when the app builds a short preview of a saved conversation, it should show what the user actually asked for. Some conversation logs can contain earlier instruction blocks, such as AGENTS.md project guidance, stored in the same general shape as user messages. If the summary picked those first, the conversation list could show a confusing preview like project instructions instead of the user’s real request.
 
-The important behavior being pinned down is that preview extraction should prefer the plain user-facing message content after stripping the synthetic prefix marker, rather than surfacing setup/instruction text from earlier user-message-shaped items. The expected summary also checks that timestamp, updated_at, path, provider, cwd, cli version, source, and absent git info are preserved exactly. Because this file isolates one subtle preview-selection rule, it serves as a compact regression guard for thread-list UI quality.
+The test builds a tiny fake conversation log. The first item is session metadata, like the conversation id, time, working folder, command-line version, and model provider. Then it adds two user messages: one that looks like injected project instructions, and one that contains prior context followed by the real user text, marked by USER_MESSAGE_BEGIN. It turns the metadata JSON into a SessionMeta value, asks extract_conversation_summary to produce a ConversationSummary, and compares the result with the exact expected summary.
+
+The key expectation is the preview field: it must be “Count to 5”. That proves the summary logic knows how to skip boilerplate context and instruction text and prefer the plain user message that matters.
 
 #### Function details
 
@@ -2467,11 +2475,11 @@ The important behavior being pinned down is that preview extraction should prefe
 fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()>
 ```
 
-**Purpose**: Verifies that summary preview extraction chooses the plain user prompt content and strips the `USER_MESSAGE_BEGIN` marker, instead of surfacing AGENTS.md instruction text. It asserts the full resulting `ConversationSummary` value.
+**Purpose**: This test proves that conversation summaries choose the real user request as their preview, even when earlier stored messages contain project instructions. It helps prevent misleading conversation titles or previews in the user interface.
 
-**Data flow**: Builds a `conversation_id`, timestamp, path, and a JSON `head` vector containing session metadata plus two user messages; deserializes `SessionMeta` from `head[0]`; calls `extract_conversation_summary`; and compares the returned summary to an expected struct whose preview is `Count to 5`.
+**Data flow**: The test starts with hard-coded sample data: a conversation id, timestamp, fake log path, metadata, an instruction-style user message, and a real user prompt hidden after a marker. It converts the metadata into the same kind of session data the app normally reads, sends all of that into extract_conversation_summary, then checks the returned ConversationSummary against the expected one. The important before-to-after change is that a noisy log becomes a clean summary whose preview is “Count to 5”.
 
-**Call relations**: Executed by the test harness as a focused regression test for `thread_summary::extract_conversation_summary`.
+**Call relations**: During the test, it uses from_string to turn a text id into the app’s ThreadId type, builds the fake log entries, calls the summary-building code under test, and then uses assert_eq! to compare the actual result with the expected result. In the larger flow, this test stands guard over extract_conversation_summary so future changes do not accidentally make instruction blocks appear as the conversation preview.
 
 *Call graph*: calls 1 internal fn (from_string); 3 external calls (from, assert_eq!, vec!).
 
@@ -2483,11 +2491,11 @@ These reusable helpers create the mock auth state, config files, cached models, 
 
 `test` · `test setup`
 
-This small test helper encapsulates the boilerplate for creating a `wiremock::MockServer` that behaves like the analytics ingestion service expected by the app-server. The single async function starts an ephemeral mock server, installs one mock expectation, and returns the running server to the caller.
+Some parts of the app-server appear to send analytics events to an HTTP endpoint. In tests, using the real analytics service would be slow, unreliable, and could leak test data. This file solves that by creating a small mock web server: a pretend server that listens like the real one but returns controlled responses.
 
-The configured mock matches only `POST` requests whose path is exactly `/codex/analytics-events/events`. When such a request arrives, it responds with `ResponseTemplate::new(200)`, meaning tests can point analytics clients at this server without needing to inspect or validate request bodies unless they choose to add more mocks themselves. Because the helper returns the `MockServer`, callers can still query its URI, mount additional expectations, or inspect received requests using `wiremock` APIs.
+The helper starts a `wiremock` mock server, which is a testing tool for faking HTTP services. It then teaches that server one rule: when it receives a POST request to `/codex/analytics-events/events`, reply with HTTP status 200, meaning “OK.” This is like putting a cardboard storefront in front of the application during a rehearsal: the app can walk up and make the request, but nothing real happens behind the scenes.
 
-The design is intentionally minimal: it does not assert headers, payload shape, or call counts. Its purpose is to provide a permissive success endpoint so integration tests involving analytics emission can proceed without external network dependencies or flaky infrastructure.
+The function returns the running mock server to the test. Tests can then point the application’s analytics URL at this server and verify that analytics sending does not fail. Without this helper, each test that needs analytics would have to rebuild the same fake server setup, or risk depending on a real network service.
 
 #### Function details
 
@@ -2497,24 +2505,24 @@ The design is intentionally minimal: it does not assert headers, payload shape, 
 async fn start_analytics_events_server() -> Result<MockServer>
 ```
 
-**Purpose**: Starts a mock analytics server and mounts a single success response for the analytics events POST endpoint. It returns the running `MockServer` so tests can use its address.
+**Purpose**: Starts a fake analytics events HTTP server for tests. It accepts POST requests at the analytics events path and always answers with a successful 200 response.
 
-**Data flow**: Asynchronously starts `MockServer::start()`, builds a `wiremock::Mock` matching `method("POST")` and `path("/codex/analytics-events/events")`, configures it to respond with `ResponseTemplate::new(200)`, mounts it on the server, and returns `Ok(server)`. Errors can propagate through the `anyhow::Result` return type.
+**Data flow**: No input is required. The function creates a new mock server, adds a rule for POST requests to `/codex/analytics-events/events`, and attaches that rule to the server. It returns the running `MockServer`, or an error if setup fails.
 
-**Call relations**: Used by integration tests that need analytics submissions to succeed without contacting a real backend. It delegates all HTTP matching and response behavior to `wiremock` primitives.
+**Call relations**: A test calls this before exercising code that sends analytics events. Inside, it relies on `wiremock` helpers to start the server, describe the expected HTTP method and path, create the success response, and mount that behavior onto the server.
 
 *Call graph*: 5 external calls (given, start, new, method, path).
 
 
 ### `app-server/tests/common/auth_fixtures.rs`
 
-`test` · `test fixture construction and auth setup`
+`test` · `test setup`
 
-This test-support module models the subset of ChatGPT auth state that app-server tests care about. `ChatGptAuthFixture` is a builder for the full persisted auth payload: access token, refresh token, optional account ID, structured ID-token claims, and an optional `last_refresh` override. Its fluent setters mutate and return `Self`, making tests concise when they need only one or two custom fields. `ChatGptIdTokenClaims` is a smaller builder for the JWT claims embedded in the fake ID token, covering `email`, `plan_type`, `chatgpt_user_id`, and `chatgpt_account_id`.
+Many app-server tests need to start from the same situation: “the user is logged in with ChatGPT.” In the real product, that login state lives in an auth.json file and includes tokens, account IDs, plan information, and refresh timing. Creating that by hand in every test would be noisy and easy to get wrong, so this file provides small builder objects that assemble the fake login record consistently.
 
-`encode_id_token` turns those claims into a syntactically valid unsigned JWT string. It constructs a header `{ "alg": "none", "typ": "JWT" }`, builds a JSON payload with top-level `email` plus an OpenAI auth namespace object at `https://api.openai.com/auth` containing the ChatGPT-specific claims, base64url-encodes header/payload/signature using `URL_SAFE_NO_PAD`, and joins the three segments with dots. The helper intentionally emits only claims that are present, so tests can simulate missing metadata.
+The main helper, ChatGptAuthFixture, is like a test recipe card. A test starts with an access token, then optionally fills in details such as a refresh token, email address, plan type, ChatGPT user ID, account ID, or the last time the login was refreshed. ChatGptIdTokenClaims holds the pieces that normally live inside an ID token, which is a signed-looking package of user information.
 
-`write_chatgpt_auth` is the bridge to the real auth persistence path. It encodes and then parses the synthetic ID token via `parse_chatgpt_jwt_claims`, assembles `TokenData`, chooses `last_refresh` from the fixture or defaults to `Some(Utc::now())`, builds a `codex_login::AuthDotJson` with `auth_mode: Some(AuthMode::Chatgpt)` and all non-ChatGPT credential fields unset, and finally calls `save_auth` with the requested `AuthCredentialsStoreMode` and default keyring backend. This means tests exercise the same on-disk auth format and parsing logic as production code rather than bypassing it.
+The file also creates a simple fake JWT, meaning a “JSON Web Token” made of base64-encoded JSON parts. It does not try to be secure; it only needs to look realistic enough for the project’s parser. Finally, write_chatgpt_auth converts the fixture into the project’s normal AuthDotJson structure and saves it using the same save path production code uses. Without this file, tests would duplicate fragile auth setup or need real login flows, making them slower and less reliable.
 
 #### Function details
 
@@ -2524,11 +2532,11 @@ This test-support module models the subset of ChatGPT auth state that app-server
 fn new(access_token: impl Into<String>) -> Self
 ```
 
-**Purpose**: Creates a baseline ChatGPT auth fixture with a caller-supplied access token and sensible defaults for all other fields. It is the starting point for fluent test customization.
+**Purpose**: Creates a new fake ChatGPT authentication fixture with the required access token and sensible defaults for everything else. Tests use this as the starting point before adding only the details they care about.
 
-**Data flow**: Accepts `access_token: impl Into<String>`, converts it into a `String`, sets `refresh_token` to `"refresh-token"`, `account_id` to `None`, `claims` to `ChatGptIdTokenClaims::default()`, `last_refresh` to `None`, and returns the populated `ChatGptAuthFixture`.
+**Data flow**: It takes an access token value, turns it into a string, and stores it. It also fills in a default refresh token, no account ID, default empty ID-token claims, and no explicit last-refresh setting; the result is a ready-to-customize ChatGptAuthFixture.
 
-**Call relations**: Used widely by integration tests that need fake ChatGPT auth state. Tests typically chain the builder setters defined below before passing the fixture to `write_chatgpt_auth`.
+**Call relations**: This is the doorway into the fixture builder. Many authentication and account tests call it first, then optionally chain other builder methods, and eventually pass the finished fixture to write_chatgpt_auth so the fake login can be written to disk.
 
 *Call graph*: called by 100 (get_auth_status_omits_token_after_permanent_refresh_failure, get_auth_status_omits_token_after_proactive_refresh_failure, get_auth_status_returns_token_after_proactive_refresh_recovery, get_account_omits_chatgpt_after_permanent_refresh_failure, get_account_with_chatgpt, get_account_with_chatgpt_missing_plan_claim_returns_unknown, mount_analytics_capture, list_apps_does_not_emit_empty_interim_updates, list_apps_emits_updates_and_returns_after_both_lists_load, list_apps_force_refetch_patches_updates_from_cached_snapshots (+15 more)); 2 external calls (into, default).
 
@@ -2539,11 +2547,11 @@ fn new(access_token: impl Into<String>) -> Self
 fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self
 ```
 
-**Purpose**: Overrides the fixture’s refresh token in builder style. It lets tests simulate different refresh-token values or missing/invalid token scenarios upstream.
+**Purpose**: Replaces the fixture’s default refresh token with a test-specific one. This is useful when a test needs to check how refresh-token storage or refresh behavior works.
 
-**Data flow**: Consumes `self` and `refresh_token: impl Into<String>`, converts the argument, writes it into `self.refresh_token`, and returns the updated fixture.
+**Data flow**: It receives the existing fixture and a new refresh token, converts the token to a string, stores it in the fixture, and returns the updated fixture so more builder calls can follow.
 
-**Call relations**: Called by tests that need non-default refresh-token contents before persisting auth. It is one step in the fluent fixture-building chain.
+**Call relations**: Tests call this after ChatGptAuthFixture::new when the default refresh token is not enough. The chosen value later becomes part of TokenData inside write_chatgpt_auth.
 
 *Call graph*: 1 external calls (into).
 
@@ -2554,11 +2562,11 @@ fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self
 fn account_id(mut self, account_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the optional account ID stored alongside the tokens in the fixture. This allows tests to control account association independently of JWT claims.
+**Purpose**: Adds an account ID to the fake login record. Tests use this when they need the saved auth data to look tied to a specific account.
 
-**Data flow**: Consumes `self` and `account_id: impl Into<String>`, converts the value, stores `Some(...)` in `self.account_id`, and returns the updated fixture.
+**Data flow**: It receives the existing fixture and an account ID, converts the ID to a string, wraps it as a present optional value, stores it, and returns the updated fixture.
 
-**Call relations**: Used by tests that need persisted account IDs in `TokenData`. It complements the claim-level `chatgpt_account_id` setter, which affects the ID token instead.
+**Call relations**: This is part of the fixture-building chain. When write_chatgpt_auth is later called, this account ID is copied into the saved token data.
 
 *Call graph*: 1 external calls (into).
 
@@ -2569,11 +2577,11 @@ fn account_id(mut self, account_id: impl Into<String>) -> Self
 fn plan_type(mut self, plan_type: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT plan type claim inside the fixture’s ID-token claims. It is a convenience wrapper over mutating `self.claims.plan_type`.
+**Purpose**: Sets the ChatGPT plan type claim, such as a paid or free plan label, in the fake ID token. Tests use it to check behavior that depends on the user’s plan.
 
-**Data flow**: Consumes `self` and `plan_type: impl Into<String>`, converts the value, stores `Some(...)` in `self.claims.plan_type`, and returns the updated fixture.
+**Data flow**: It takes the current fixture and a plan type value, turns the value into a string, stores it inside the fixture’s ID-token claims, and returns the fixture.
 
-**Call relations**: Used by tests that need account/plan metadata to appear in parsed JWT claims. It participates in the fluent builder chain before `encode_id_token` consumes the claims.
+**Call relations**: This feeds the claims that encode_id_token later turns into a fake JWT. write_chatgpt_auth then parses that JWT back into the normal token data used by the rest of the auth code.
 
 *Call graph*: 1 external calls (into).
 
@@ -2584,11 +2592,11 @@ fn plan_type(mut self, plan_type: impl Into<String>) -> Self
 fn chatgpt_user_id(mut self, chatgpt_user_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT user ID claim inside the fixture’s ID-token claims. This lets tests control user identity metadata extracted from the token.
+**Purpose**: Sets the ChatGPT user ID claim inside the fake ID token. Tests use this when identity-specific behavior needs a known user value.
 
-**Data flow**: Consumes `self` and `chatgpt_user_id: impl Into<String>`, converts it, stores `Some(...)` in `self.claims.chatgpt_user_id`, and returns the updated fixture.
+**Data flow**: It takes a user ID value, converts it to a string, stores it in the fixture’s claims, and returns the modified fixture for further chaining.
 
-**Call relations**: Used by tests that need parsed ChatGPT user IDs. It is another fluent convenience around the nested claims struct.
+**Call relations**: This method is one of the optional fixture customizers. Its value is later included by encode_id_token and then consumed through write_chatgpt_auth as if it came from a real ChatGPT login token.
 
 *Call graph*: 1 external calls (into).
 
@@ -2599,11 +2607,11 @@ fn chatgpt_user_id(mut self, chatgpt_user_id: impl Into<String>) -> Self
 fn chatgpt_account_id(mut self, chatgpt_account_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT account ID claim inside the fixture’s ID-token claims. It controls the token-derived account identifier rather than the persisted token-data field.
+**Purpose**: Sets the ChatGPT account ID claim inside the fake ID token. This lets tests distinguish account identity from other identifiers stored in auth data.
 
-**Data flow**: Consumes `self` and `chatgpt_account_id: impl Into<String>`, converts it, stores `Some(...)` in `self.claims.chatgpt_account_id`, and returns the updated fixture.
+**Data flow**: It receives the current fixture and an account ID claim value, converts the value to a string, places it in the fixture’s claims, and returns the updated fixture.
 
-**Call relations**: Used by tests that need the JWT to carry account metadata. It is distinct from `ChatGptAuthFixture::account_id`, which sets `TokenData.account_id` directly.
+**Call relations**: Tests can chain this onto ChatGptAuthFixture::new. Later, encode_id_token packs the value into the fake token that write_chatgpt_auth saves through the normal auth path.
 
 *Call graph*: 1 external calls (into).
 
@@ -2614,11 +2622,11 @@ fn chatgpt_account_id(mut self, chatgpt_account_id: impl Into<String>) -> Self
 fn email(mut self, email: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the email claim inside the fixture’s ID-token claims. This allows tests to simulate authenticated identities with or without email metadata.
+**Purpose**: Adds an email address to the fake ID token claims. Tests use it when account display or identity behavior depends on an email being present.
 
-**Data flow**: Consumes `self` and `email: impl Into<String>`, converts it, stores `Some(...)` in `self.claims.email`, and returns the updated fixture.
+**Data flow**: It takes an email-like value, converts it to a string, stores it in the fixture’s claims, and returns the modified fixture.
 
-**Call relations**: Used by tests that inspect account identity derived from JWT claims. It is part of the fluent fixture builder.
+**Call relations**: This supplies data for encode_id_token. Once write_chatgpt_auth writes the fixture, the rest of the app can read the fake email through the same parsing code it uses for real tokens.
 
 *Call graph*: 1 external calls (into).
 
@@ -2629,11 +2637,11 @@ fn email(mut self, email: impl Into<String>) -> Self
 fn last_refresh(mut self, last_refresh: Option<DateTime<Utc>>) -> Self
 ```
 
-**Purpose**: Overrides the fixture’s `last_refresh` field, including the ability to set it explicitly to `None`. This lets tests model fresh, stale, or absent refresh timestamps.
+**Purpose**: Sets the saved “last refreshed” time for the fake login. Tests use this to simulate fresh, stale, missing, or deliberately unset refresh history.
 
-**Data flow**: Consumes `self` and `last_refresh: Option<DateTime<Utc>>`, wraps it in `Some(last_refresh)` to distinguish explicit override from defaulting, stores it in `self.last_refresh`, and returns the updated fixture.
+**Data flow**: It receives an optional timestamp. It stores that choice inside another optional wrapper so the fixture can tell the difference between “the test did not say” and “the test explicitly wants no timestamp,” then returns the fixture.
 
-**Call relations**: Used by tests that need precise control over refresh timing semantics before persisting auth. `write_chatgpt_auth` later interprets `None` in this wrapper as “use current time” only when no override was supplied.
+**Call relations**: This value is read by write_chatgpt_auth. If a test did not call this method, write_chatgpt_auth uses the current time; if a test did call it, the explicit choice is saved.
 
 
 ##### `ChatGptAuthFixture::claims`  (lines 74–77)
@@ -2642,11 +2650,11 @@ fn last_refresh(mut self, last_refresh: Option<DateTime<Utc>>) -> Self
 fn claims(mut self, claims: ChatGptIdTokenClaims) -> Self
 ```
 
-**Purpose**: Replaces the entire nested ID-token claims struct in one step. It is useful when tests build claims separately with `ChatGptIdTokenClaims`.
+**Purpose**: Replaces all ID-token claims on the fixture at once. This is useful when a test has already built a complete ChatGptIdTokenClaims object and wants to use it directly.
 
-**Data flow**: Consumes `self` and a `ChatGptIdTokenClaims`, assigns it to `self.claims`, and returns the updated fixture. No other fields are changed.
+**Data flow**: It takes the current fixture and a full claims object, swaps the fixture’s existing claims for the supplied one, and returns the updated fixture.
 
-**Call relations**: Used by tests that prefer constructing claims via the dedicated claims builder and then injecting them wholesale. It bypasses the individual convenience setters.
+**Call relations**: This is a shortcut around setting claims one by one. write_chatgpt_auth later passes these claims to encode_id_token, so the saved auth file reflects exactly the claims the test supplied.
 
 
 ##### `ChatGptIdTokenClaims::new`  (lines 89–91)
@@ -2655,11 +2663,11 @@ fn claims(mut self, claims: ChatGptIdTokenClaims) -> Self
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty claims builder with all optional fields unset. It is the starting point for fluent claim construction.
+**Purpose**: Creates an empty set of fake ChatGPT ID-token claims. Tests use it as a clean starting point when they want to build claims separately from the full auth fixture.
 
-**Data flow**: Returns `Self::default()`, producing a `ChatGptIdTokenClaims` with all fields `None`. No inputs or side effects.
+**Data flow**: It takes no input and returns a ChatGptIdTokenClaims value where email, plan type, ChatGPT user ID, and ChatGPT account ID are all absent.
 
-**Call relations**: Used by tests that want to build claim sets independently of `ChatGptAuthFixture`. The resulting claims are later consumed by `encode_id_token` or inserted into a fixture via `claims`.
+**Call relations**: Several tests call this directly, then use the claim builder methods to add only the fields needed for that test. The completed claims can be passed into ChatGptAuthFixture::claims or encoded through the fixture-writing path.
 
 *Call graph*: called by 8 (account_read_refresh_token_is_noop_in_external_mode, external_auth_refresh_error_fails_turn, external_auth_refresh_invalid_access_token_fails_turn, external_auth_refresh_mismatched_workspace_fails_turn, external_auth_refreshes_on_unauthorized, login_account_chatgpt_device_code_succeeds_and_notifies, set_auth_token_cancels_active_chatgpt_login, set_auth_token_updates_account_and_notifies); 1 external calls (default).
 
@@ -2670,11 +2678,11 @@ fn new() -> Self
 fn email(mut self, email: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the email claim in builder style. It supports concise construction of token claims for tests.
+**Purpose**: Sets the email field on a standalone claims object. This lets tests build a fake ID token payload with a known email address.
 
-**Data flow**: Consumes `self` and `email: impl Into<String>`, converts and stores `Some(...)` in `self.email`, then returns the updated claims struct.
+**Data flow**: It receives a claims object and an email value, converts the value to a string, stores it as the email claim, and returns the updated claims object.
 
-**Call relations**: Used in fluent claim-building chains before the claims are encoded into a JWT or attached to a fixture.
+**Call relations**: This is usually chained after ChatGptIdTokenClaims::new. The resulting claims can be placed into a ChatGptAuthFixture, where encode_id_token later includes the email in the fake JWT payload.
 
 *Call graph*: 1 external calls (into).
 
@@ -2685,11 +2693,11 @@ fn email(mut self, email: impl Into<String>) -> Self
 fn plan_type(mut self, plan_type: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT plan type claim in builder style. It controls the `chatgpt_plan_type` value placed under the OpenAI auth namespace.
+**Purpose**: Sets the plan type on a standalone claims object. Tests use this to simulate different ChatGPT subscription or entitlement states.
 
-**Data flow**: Consumes `self` and `plan_type: impl Into<String>`, converts and stores `Some(...)` in `self.plan_type`, then returns the updated claims struct.
+**Data flow**: It takes a claims object and a plan type value, converts the value to a string, stores it as the plan-type claim, and returns the updated claims object.
 
-**Call relations**: Used by tests that need plan metadata in the parsed ID token. It feeds directly into `encode_id_token`’s payload construction.
+**Call relations**: This belongs to the claims-building chain. When those claims are encoded by encode_id_token, the plan type is placed under the auth-specific part of the fake token.
 
 *Call graph*: 1 external calls (into).
 
@@ -2700,11 +2708,11 @@ fn plan_type(mut self, plan_type: impl Into<String>) -> Self
 fn chatgpt_user_id(mut self, chatgpt_user_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT user ID claim in builder style. It controls one of the namespaced auth claims encoded into the fake JWT.
+**Purpose**: Sets the ChatGPT user ID on a standalone claims object. Tests use it when they need the fake token to identify a particular ChatGPT user.
 
-**Data flow**: Consumes `self` and `chatgpt_user_id: impl Into<String>`, converts and stores `Some(...)` in `self.chatgpt_user_id`, then returns the updated claims struct.
+**Data flow**: It receives a claims object and a user ID value, converts the value to a string, stores it as the ChatGPT user ID claim, and returns the updated claims object.
 
-**Call relations**: Used by tests that need token-derived user identity. It is consumed later by `encode_id_token`.
+**Call relations**: This method is used while preparing claims for a fake login. Those claims can then be attached to a ChatGptAuthFixture and written through write_chatgpt_auth.
 
 *Call graph*: 1 external calls (into).
 
@@ -2715,11 +2723,11 @@ fn chatgpt_user_id(mut self, chatgpt_user_id: impl Into<String>) -> Self
 fn chatgpt_account_id(mut self, chatgpt_account_id: impl Into<String>) -> Self
 ```
 
-**Purpose**: Sets the ChatGPT account ID claim in builder style. It controls the namespaced account identifier encoded into the fake JWT.
+**Purpose**: Sets the ChatGPT account ID on a standalone claims object. This helps tests create tokens that represent a specific ChatGPT account.
 
-**Data flow**: Consumes `self` and `chatgpt_account_id: impl Into<String>`, converts and stores `Some(...)` in `self.chatgpt_account_id`, then returns the updated claims struct.
+**Data flow**: It takes a claims object and an account ID value, converts the value to a string, stores it as the ChatGPT account ID claim, and returns the updated claims object.
 
-**Call relations**: Used by tests that need token-derived account metadata. It contributes to the payload assembled by `encode_id_token`.
+**Call relations**: This is another claim-building step. The value becomes part of the fake JWT when encode_id_token is called during auth fixture writing.
 
 *Call graph*: 1 external calls (into).
 
@@ -2730,11 +2738,11 @@ fn chatgpt_account_id(mut self, chatgpt_account_id: impl Into<String>) -> Self
 fn encode_id_token(claims: &ChatGptIdTokenClaims) -> Result<String>
 ```
 
-**Purpose**: Builds a syntactically valid unsigned JWT string from the provided ChatGPT ID-token claims. It is the core helper that turns structured test claims into the raw token format consumed by production parsing code.
+**Purpose**: Turns the chosen fake claims into a JWT-shaped string that the project’s normal token parser can read. It is not meant for real security; it is a test prop that looks like the real object.
 
-**Data flow**: Accepts `&ChatGptIdTokenClaims`. It creates a JSON header with `alg: none` and `typ: JWT`, builds a mutable payload map containing optional top-level `email` and an optional nested object at `https://api.openai.com/auth` with `chatgpt_plan_type`, `chatgpt_user_id`, and `chatgpt_account_id` when present, serializes header and payload to bytes with `serde_json::to_vec`, base64url-encodes them plus a fixed `b"signature"` using `URL_SAFE_NO_PAD`, and returns `Ok(format!("{header}.{payload}.{signature}"))`. Serialization failures are wrapped with `anyhow::Context`.
+**Data flow**: It reads the optional fields in ChatGptIdTokenClaims, builds a JSON header and JSON payload, adds only the fields that are present, base64-encodes the header, payload, and a dummy signature, and returns a three-part token string. If JSON serialization fails, it returns an error with context about which part failed.
 
-**Call relations**: Called by `write_chatgpt_auth` before parsing the token back through production claim parsing. It intentionally mirrors JWT structure closely enough for `parse_chatgpt_jwt_claims` to consume it.
+**Call relations**: write_chatgpt_auth calls this before saving auth data. The token it produces is immediately passed to the real parse_chatgpt_jwt_claims function, which proves the fake token has the same shape the production auth code expects.
 
 *Call graph*: called by 1 (write_chatgpt_auth); 5 external calls (format!, json!, new, Object, to_vec).
 
@@ -2749,20 +2757,24 @@ fn write_chatgpt_auth(
 ) -> Result<()>
 ```
 
-**Purpose**: Persists a complete fake ChatGPT auth configuration into the test Codex home directory using the real auth-writing path. It bridges fixture builders to on-disk state consumed by integration tests.
+**Purpose**: Writes a complete fake ChatGPT auth.json for a test. It converts the friendly fixture into the same auth structure the application normally stores after login.
 
-**Data flow**: Accepts `codex_home: &Path`, a `ChatGptAuthFixture`, and an `AuthCredentialsStoreMode`. It calls `encode_id_token(&fixture.claims)` to get a raw JWT, parses it with `parse_chatgpt_jwt_claims`, builds `TokenData` from the parsed ID token plus fixture access/refresh/account fields, resolves `last_refresh` from `fixture.last_refresh` or defaults to `Some(Utc::now())`, constructs an `AuthDotJson` with `auth_mode: Some(AuthMode::Chatgpt)` and all unrelated credential fields `None`, then calls `save_auth(codex_home, &auth, cli_auth_credentials_store_mode, AuthKeyringBackendKind::default())`. Errors are propagated with contextual messages.
+**Data flow**: It takes a Codex home directory path, a finished ChatGptAuthFixture, and a choice of credential storage mode. It encodes and parses the fake ID token, combines it with the access token, refresh token, account ID, and last-refresh time, builds an AuthDotJson record marked as ChatGPT auth, and saves it to the configured auth storage. On failure, it returns an error that says whether parsing or writing failed.
 
-**Call relations**: Used by integration tests to seed realistic auth state before exercising account/auth flows. It deliberately routes through production parsing and persistence helpers (`parse_chatgpt_jwt_claims`, `save_auth`) so tests cover the same formats and code paths as the real application.
+**Call relations**: This is the final step after tests build a ChatGptAuthFixture. It calls encode_id_token to create the fake token, parse_chatgpt_jwt_claims to turn it into normal token data, and save_auth to write it using the same storage path as the real application.
 
 *Call graph*: calls 3 internal fn (encode_id_token, default, parse_chatgpt_jwt_claims); 1 external calls (save_auth).
 
 
 ### `app-server/tests/common/config.rs`
 
-`config` · `test setup`
+`test` · `test setup`
 
-This file contains two concrete config writers used by integration tests to materialize a minimal but valid `config.toml` in a temporary Codex home directory. The main helper assembles the file in three explicit phases: it first converts a `BTreeMap<Feature, bool>` into TOML entries under `[features]` by looking up each feature’s stable config key in the global `FEATURES` registry and panicking if a feature lacks a key; it then builds a provider block for `[model_providers.<id>]`, choosing the provider display name and optionally emitting `requires_openai_auth = true`; finally it writes a full config containing fixed test defaults such as `model = "mock-model"`, `approval_policy = "never"`, `sandbox_mode = "read-only"`, `wire_api = "responses"`, and retry counts of zero. A special case emits `openai_base_url` when the provider id is literally `openai`, matching code paths that still consult that legacy top-level setting. The second helper is a narrower variant for tests that need `chatgpt_base_url` present while still routing model traffic to a mock provider. Both functions overwrite `config.toml` directly and return plain `std::io::Result<()>`, leaving parsing/validation to the server under test.
+Tests often need the app to believe it is talking to a real model provider, while actually sending requests to a local mock server. This file is a small test helper that writes that fake setup into `config.toml`, the configuration file the app normally reads at startup. Without it, many tests would have to duplicate long configuration strings, and small differences between tests could cause confusing failures.
+
+The main helper, `write_mock_responses_config_toml`, builds a complete config file in three parts. First it turns a map of feature flags into the `[features]` section, using the project’s known feature list to translate each feature into its config-file name. Then it writes a model provider section that points at the test server’s `/v1` endpoint and disables retries, so failures happen immediately and tests stay predictable. It can also mark the provider as requiring OpenAI-style authentication when a test needs that behavior. Finally it writes the assembled text to `config.toml` under the test’s temporary Codex home directory.
+
+The second helper is a simpler variant for tests that specifically need a `chatgpt_base_url` setting. Both functions are like printing a fake ID badge for the app: the app reads it and behaves as if it were in a real environment, but everything points to controlled test services.
 
 #### Function details
 
@@ -2777,11 +2789,11 @@ fn write_mock_responses_config_toml(
     requires_openai_auth: Option<bool>,
 ```
 
-**Purpose**: Writes a complete test `config.toml` that selects a mock model provider backed by a supplied mock server URI, with configurable feature flags, compaction limit, provider id, and optional OpenAI-auth requirement.
+**Purpose**: This function writes a full test `config.toml` file that points the app at a mock Responses API server. Tests use it when they need control over feature flags, provider identity, authentication behavior, compaction settings, and the compact prompt.
 
-**Data flow**: It takes the target CODEX_HOME path, mock server base URI, a `BTreeMap<Feature, bool>`, numeric auto-compact limit, optional `requires_openai_auth`, provider id, and compact prompt text. It copies the feature map into a local sorted map, resolves each `Feature` to its TOML key via `FEATURES`, formats the `[features]` entries, derives provider-specific lines such as `requires_openai_auth` and optional top-level `openai_base_url`, then writes the assembled TOML string to `codex_home/config.toml`.
+**Data flow**: It receives the test Codex home folder, the mock server URL, feature flag values, token compaction settings, optional authentication requirements, the provider ID, and a compact prompt. It turns those inputs into TOML text: feature entries, a model provider block, optional OpenAI-specific lines, and general app settings. The result is a `config.toml` file written to disk; on success it returns `Ok(())`, and on a file-writing problem it returns an I/O error.
 
-**Call relations**: This helper is invoked by tests that need a realistic app-server configuration without hand-authoring TOML. It does not delegate to other local helpers; instead it directly performs the full config assembly and final filesystem write in one place.
+**Call relations**: During test setup, a test calls this helper before starting or exercising the app. Inside, it uses standard library tools to build ordered maps, join the `config.toml` path under the temporary home directory, format the TOML text, and write it to disk. The app later reads that file as if it were normal user configuration, so the test can steer the app toward the mock server.
 
 *Call graph*: 6 external calls (new, join, new, format!, matches!, write).
 
@@ -2796,20 +2808,24 @@ fn write_mock_responses_config_toml_with_chatgpt_base_url(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a smaller test `config.toml` variant that includes `chatgpt_base_url` while still configuring a mock Responses provider.
+**Purpose**: This function writes a simpler test `config.toml` file for cases that need to set `chatgpt_base_url`. It still points the model provider at a mock Responses API server, but focuses on testing ChatGPT base URL configuration.
 
-**Data flow**: It receives the CODEX_HOME path, mock server URI, and a ChatGPT base URL string. It joins `config.toml` onto the home directory, interpolates those values into a fixed TOML template with `model_provider = "mock_provider"` and a single `[model_providers.mock_provider]` block, and writes the resulting text to disk.
+**Data flow**: It receives the test Codex home folder, the mock server URL, and the ChatGPT base URL to place in the config. It formats those values into a fixed TOML template and writes that text to `config.toml` in the given home directory. It returns success if the file was written, or an I/O error if writing failed.
 
-**Call relations**: Tests use this variant when they specifically need the ChatGPT base URL setting present. Unlike the more general writer, it skips feature blocks and auth-condition logic and goes straight to formatting and writing the file.
+**Call relations**: A test calls this helper when it needs the app to start with a custom ChatGPT base URL. The function does not call project-specific helpers; it simply builds the path, formats the config text, and writes it. After that, the app’s normal configuration loading code can read the file and follow the fake URLs supplied by the test.
 
 *Call graph*: 3 external calls (join, format!, write).
 
 
 ### `app-server/tests/common/mock_model_server.rs`
 
-`io_transport` · `test setup and mocked request handling`
+`test` · `test setup and request handling`
 
-This file builds lightweight HTTP servers that mimic the `/v1/responses` endpoint expected by the app server. The sequence-based helpers start a mock server from `core_test_support::responses::start_mock_server`, then mount a `wiremock::Mock` matching `POST` requests whose path ends in `/responses`. The response behavior is implemented by the local `SeqResponder`, which stores a `Vec<String>` of prebuilt SSE bodies and an `AtomicUsize` call counter. Its `Respond` implementation increments the counter with `Ordering::SeqCst`, indexes into the vector by call number, and panics if a request arrives after the supplied sequence is exhausted; this makes over-consumption visible in tests. One constructor also sets `.expect(num_calls as u64)` so wiremock verifies the exact number of requests, while the `_unchecked` variant omits that expectation for tests where extra or fewer calls are acceptable. The repeating-assistant helper skips the custom responder entirely: it constructs a single SSE transcript containing `response_created`, one assistant message, and `completed`, then mounts that same body for every matching request. All helpers return the running `MockServer`, allowing tests to inject its URI into config fixtures.
+Tests often need the app to talk to something that looks like the real model service, but using the real service would be slow, costly, unreliable, and hard to control. This file builds a local mock server: a small pretend web server that accepts the same kind of request the app would send to the model API and replies with canned data.
+
+The mock server listens for POST requests whose path ends in `/responses`, which is the endpoint the app expects to call. For tests that need a story with several steps, `SeqResponder` works like a queue at a ticket counter: each incoming request gets the next response from the list. An atomic counter is used so the count stays safe even if requests arrive from more than one task at the same time.
+
+There are two sequence helpers. One checks that the server was called exactly as many times as there are prepared responses, which is useful when a test wants to prove a precise interaction happened. The other skips that call-count check, which is useful when the exact number of requests is not the point of the test. A third helper always returns the same assistant message as a streaming response, which keeps simple tests short and readable.
 
 #### Function details
 
@@ -2819,11 +2835,11 @@ This file builds lightweight HTTP servers that mimic the `/v1/responses` endpoin
 async fn create_mock_responses_server_sequence(responses: Vec<String>) -> MockServer
 ```
 
-**Purpose**: Starts a mock HTTP server that serves the provided SSE response bodies in order and asserts that exactly that many `/responses` calls occur.
+**Purpose**: Starts a fake responses API server that returns a different prepared response for each request, in the order given. It also tells the test framework to expect exactly that many calls, so extra or missing calls can make the test fail.
 
-**Data flow**: It takes a `Vec<String>` of prebuilt response bodies, starts a mock server, records `responses.len()` as the expected call count, wraps the vector and a zeroed `AtomicUsize` in `SeqResponder`, mounts a POST `/responses` mock using that responder, and returns the configured `MockServer`.
+**Data flow**: It receives a list of response bodies as strings. It starts a mock server, wraps the list in a `SeqResponder` with a fresh call counter, and registers that responder for POST requests ending in `/responses`. It returns the running mock server for the test to point the app at.
 
-**Call relations**: Tests call this when they need deterministic multi-turn or multi-request model behavior and want wiremock to fail if the app server under- or over-calls the endpoint. It delegates per-request body selection to `SeqResponder::respond`.
+**Call relations**: A test calls this during setup when it wants to simulate a known sequence of model replies. It relies on the shared test support code to start the mock server, then uses wiremock's request matching to connect matching requests to `SeqResponder::respond`, which supplies the next response during the test.
 
 *Call graph*: calls 1 internal fn (start_mock_server); 4 external calls (new, given, method, path_regex).
 
@@ -2834,11 +2850,11 @@ async fn create_mock_responses_server_sequence(responses: Vec<String>) -> MockSe
 async fn create_mock_responses_server_sequence_unchecked(responses: Vec<String>) -> MockServer
 ```
 
-**Purpose**: Starts the same sequential mock Responses server but without enforcing an exact request count.
+**Purpose**: Starts the same kind of fake responses API server as the checked version, but without enforcing how many times it must be called. This is useful when the test only cares what responses are available, not the exact request count.
 
-**Data flow**: It accepts a vector of SSE bodies, starts a mock server, constructs `SeqResponder` with an atomic call counter and the supplied responses, mounts the POST `/responses` mock, and returns the server. Unlike the checked variant, it does not attach a wiremock `.expect(...)` constraint.
+**Data flow**: It receives a list of response strings. It starts a mock server, creates a `SeqResponder` with those strings and a zeroed counter, and mounts it for POST requests ending in `/responses`. It returns the mock server to the caller.
 
-**Call relations**: This is used by tests that still need ordered responses but do not want wiremock’s request-count assertion. It shares the same responder implementation as the checked constructor, so exhausting the sequence still panics inside `SeqResponder::respond`.
+**Call relations**: A test uses this during setup when request count is flexible or checked somewhere else. Once mounted, matching requests are passed to `SeqResponder::respond`, which turns each stored string into the streaming response format expected by the app.
 
 *Call graph*: calls 1 internal fn (start_mock_server); 4 external calls (new, given, method, path_regex).
 
@@ -2849,11 +2865,11 @@ async fn create_mock_responses_server_sequence_unchecked(responses: Vec<String>)
 fn respond(&self, _: &wiremock::Request) -> ResponseTemplate
 ```
 
-**Purpose**: Selects the next response body from the stored sequence and wraps it as an SSE HTTP response template.
+**Purpose**: Returns the next prepared mock model response for a request. It is the small piece that makes a mock server behave like a sequence of model replies instead of always returning the same answer.
 
-**Data flow**: On each incoming request, it atomically increments `num_calls` and uses the previous value as an index into `self.responses`. It expects that element to exist, clones the selected `String`, converts it with `responses::sse_response`, and returns the resulting `ResponseTemplate`.
+**Data flow**: It ignores the request contents and uses an atomic counter to find which call number this is. It looks up the matching response string from its stored list, fails the test if no response exists for that call, wraps the string as a server-sent events response, and returns it. Server-sent events are a streaming web format where data is sent as a series of events rather than one plain block.
 
-**Call relations**: Wiremock invokes this method for each matched POST `/responses` request mounted by the sequence server constructors. It is the core sequencing mechanism those helpers rely on to turn a static vector into stateful per-call behavior.
+**Call relations**: Wiremock calls this whenever a request matches the mock rule created by one of the sequence server helpers. It hands the selected response body to the shared response-building helper so the app receives data in the same streaming shape it expects from the real model API.
 
 *Call graph*: calls 1 internal fn (sse_response); 1 external calls (fetch_add).
 
@@ -2864,20 +2880,24 @@ fn respond(&self, _: &wiremock::Request) -> ResponseTemplate
 async fn create_mock_responses_server_repeating_assistant(message: &str) -> MockServer
 ```
 
-**Purpose**: Starts a mock Responses server that always returns the same assistant message transcript for every request.
+**Purpose**: Starts a fake responses API server that always returns the same assistant message. It is a convenience helper for tests that do not need multiple different replies.
 
-**Data flow**: It takes a message string, starts a mock server, builds one SSE body containing `response_created`, `assistant_message`, and `completed` events, mounts that body as the response for POST requests ending in `/responses`, and returns the server.
+**Data flow**: It receives a message string. It starts a mock server, builds a streaming response body containing a response-created event, an assistant-message event with that text, and a completed event, then registers that same response for every POST request ending in `/responses`. It returns the running mock server.
 
-**Call relations**: Tests use this simpler helper when they only care that every model call yields the same assistant output. It bypasses `SeqResponder` and delegates SSE formatting to `core_test_support::responses` helpers.
+**Call relations**: A test calls this during setup when it just needs the app to receive a normal-looking assistant reply. It uses the shared test response builders to create realistic streaming events, then wiremock serves that response whenever the app calls the mocked `/responses` endpoint.
 
 *Call graph*: calls 3 internal fn (sse, sse_response, start_mock_server); 4 external calls (given, vec!, method, path_regex).
 
 
 ### `app-server/tests/common/models_cache.rs`
 
-`config` · `test setup`
+`test` · `test setup`
 
-This file exists to short-circuit model discovery during integration tests. The private `preset_to_info` function maps a `codex_protocol::openai_models::ModelPreset` into a fully populated `ModelInfo`, filling in many fields with deterministic test defaults rather than leaving them absent. It preserves preset-derived identity and picker metadata such as `slug`, `display_name`, reasoning effort settings, service tiers, upgrade info, and visibility, while hard-coding values like `shell_type = ConfigShellToolType::ShellCommand`, `base_instructions = "base instructions"`, `supports_reasoning_summaries = false`, `truncation_policy = TruncationPolicyConfig::bytes(10_000)`, `context_window = Some(272_000)`, and `effective_context_window_percent = 95`. `write_models_cache` pulls the stable bundled preset list from `all_model_presets()`, filters to `show_in_picker`, assigns ascending integer priorities based on list order, converts each preset, and forwards to the writer. `write_models_cache_with_models` then serializes a cache object containing `fetched_at` as current UTC time, `etag: null`, the whole client version from `client_version_to_whole()`, and the supplied models, writing pretty-printed JSON to `models_cache.json` under the provided CODEX_HOME. The freshness timestamp is intentional: tests want the cache treated as current so no network fetch occurs.
+The app normally needs a `models_cache.json` file that says which AI models are available, how they should be shown, and what features they support. In real use, that file may be refreshed from a remote service. In tests, making network calls would be slow and unreliable, so this file writes a ready-made cache into the test Codex home directory instead. Think of it like placing a printed menu on the table before a restaurant test starts, so the waiter does not need to call headquarters to ask what dishes exist.
+
+The helper starts from bundled model presets, which are stable built-in descriptions used by the test environment. It keeps only the models meant to appear in the model picker, converts each preset into the fuller `ModelInfo` shape expected by the cache, and assigns a priority so the ordering is predictable. It then writes a JSON file named `models_cache.json` with a current timestamp, the current client version, no network tag, and the chosen model list.
+
+A second helper lets tests provide their own exact model list. That is useful when a test needs to prove behavior with a special model setup instead of the default bundled catalog.
 
 #### Function details
 
@@ -2887,11 +2907,11 @@ This file exists to short-circuit model discovery during integration tests. The 
 fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo
 ```
 
-**Purpose**: Transforms one bundled `ModelPreset` into the richer `ModelInfo` structure used in the persisted models cache.
+**Purpose**: This function turns a compact `ModelPreset` into the fuller `ModelInfo` record that the cache file expects. Tests use it so built-in model presets can be written in the same shape as models that would normally come from the model service.
 
-**Data flow**: It reads fields from a borrowed `ModelPreset` plus an explicit `priority` integer, clones or maps those preset values into a new `ModelInfo`, fills all remaining fields with fixed defaults or empty collections, and returns the constructed `ModelInfo` by value.
+**Data flow**: It receives one model preset and a numeric priority. It copies over user-facing details like the model id, display name, description, service tiers, upgrade information, and availability, fills in test-safe defaults for many feature flags, sets visibility based on whether the preset should appear in the picker, and returns a complete `ModelInfo` object ready to serialize into JSON.
 
-**Call relations**: This is an internal conversion step used by `write_models_cache` while building a cache from bundled presets. It does not perform I/O; its sole role is to normalize preset data into the cache schema expected downstream.
+**Call relations**: It is used inside the default cache-writing path when `write_models_cache` builds a list of cache models from bundled presets. While building that record, it asks helper code for a byte-based truncation policy and the default input types, so the resulting model description has the fields the rest of the app expects.
 
 *Call graph*: calls 2 internal fn (bytes, default_input_modalities); 2 external calls (default, new).
 
@@ -2902,11 +2922,11 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo
 fn write_models_cache(codex_home: &Path) -> std::io::Result<()>
 ```
 
-**Purpose**: Builds a fresh `models_cache.json` from the bundled catalog’s picker-visible presets and writes it into the test CODEX_HOME.
+**Purpose**: This function writes a normal test model cache using the project’s bundled model presets. A test calls it when it wants the model manager to find a fresh local cache and avoid network refreshes.
 
-**Data flow**: It takes the CODEX_HOME path, reads all bundled presets via `all_model_presets()`, filters to those with `show_in_picker`, enumerates them to assign ascending priorities, converts each with `preset_to_info`, collects the resulting `Vec<ModelInfo>`, and passes that vector to `write_models_cache_with_models`.
+**Data flow**: It receives the path to the test Codex home directory. It reads all built-in model presets, filters out any that should not be shown in the model picker, converts the remaining presets into full model records with stable ordering priorities, and then passes that model list to `write_models_cache_with_models`. The final visible result is a `models_cache.json` file in the given directory.
 
-**Call relations**: Tests call this when they want a realistic default model catalog without hand-specifying models. It is a convenience wrapper over `write_models_cache_with_models`, supplying the model list derived from bundled presets.
+**Call relations**: This is the convenient high-level helper for ordinary tests. It calls `all_model_presets` to get the stable built-in catalog, uses `preset_to_info` during conversion, and then hands the finished list to `write_models_cache_with_models`, which does the actual file writing.
 
 *Call graph*: calls 2 internal fn (write_models_cache_with_models, all_model_presets).
 
@@ -2920,20 +2940,24 @@ fn write_models_cache_with_models(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Serializes an explicit list of `ModelInfo` entries into the on-disk cache file format used by model-loading code.
+**Purpose**: This function writes a `models_cache.json` file using an exact list of models supplied by the test. It is the lower-level helper for tests that need custom model availability instead of the default bundled list.
 
-**Data flow**: It accepts the CODEX_HOME path and a `Vec<ModelInfo>`, computes `models_cache.json` under that directory, captures `Utc::now()` as `fetched_at`, reads the current whole client version, builds a JSON object with `fetched_at`, `etag`, `client_version`, and `models`, pretty-prints it, and writes the resulting string to disk.
+**Data flow**: It receives the test Codex home directory and a list of `ModelInfo` records. It creates the path `models_cache.json`, records the current time as the fetch time, reads the current client version, builds a JSON object with those values plus the supplied models, formats it as readable JSON text, and writes it to disk. It returns success or an input/output error if the file cannot be created or written.
 
-**Call relations**: This function is the final I/O sink for both custom-model tests and the higher-level `write_models_cache` wrapper. It centralizes the exact cache schema and freshness metadata so all tests produce the same file shape.
+**Call relations**: The default helper `write_models_cache` calls this after preparing a standard model list. Tests can also call it directly when they need special models. Inside, it uses standard path, time, JSON formatting, and file-writing utilities to produce the cache file that the model manager will later read instead of fetching from the network.
 
 *Call graph*: called by 1 (write_models_cache); 6 external calls (join, now, client_version_to_whole, json!, to_string_pretty, write).
 
 
 ### `app-server/tests/common/responses.rs`
 
-`util` · `test setup`
+`test` · `test setup and simulated response handling`
 
-This helper module produces serialized server-sent event bodies, not parsed protocol structs. Each function returns an `anyhow::Result<String>` containing a complete SSE stream assembled with `core_test_support::responses::sse(...)`. The streams all follow the same high-level shape: a `response_created` event, one synthetic payload event representing either an assistant message or a tool/function call, and a terminal `completed` event. The shell-command helper is careful about argument encoding: it joins a `Vec<String>` command into a shell-escaped string with `shlex::try_join`, then embeds that plus optional `workdir` and `timeout_ms` into a JSON object serialized as the tool call’s `arguments` string. The exec-command helper intentionally emits a different schema (`cmd` and `yield_time_ms`) and chooses a platform-specific command line using `cfg!(windows)` so tests remain portable. The remaining builders hard-code representative payloads for apply-patch, request-user-input, and request-permissions flows, including nested question/option and filesystem permission structures. Because these helpers return raw SSE text, they are composable with the mock server utilities that simply replay supplied strings over HTTP.
+Tests often need a believable reply from the outside AI service without actually calling that service. This file provides small builders that create those fake replies in the same server-sent events format the app normally receives. Server-sent events, or SSE, are a streaming text format where a server sends a sequence of named events over one connection, like a live ticker tape.
+
+Each helper follows the same pattern. It creates a response-started event, adds one meaningful event in the middle, and then creates a completed event. The middle event might say “call the shell_command tool,” “show this final assistant message,” “apply this patch,” “ask the user a question,” or “request file permissions.” The helpers use shared event-building functions from core_test_support::responses so tests get consistent, realistic event strings.
+
+A key detail is that tool calls carry their arguments as a JSON string. For example, the shell command helper turns a list of command words into a safely quoted command line, then stores it inside JSON. This matters because the app code being tested expects exactly that shape. Without these helpers, many tests would need to hand-write fragile SSE text, making them harder to read and easier to break.
 
 #### Function details
 
@@ -2948,11 +2972,11 @@ fn create_shell_command_sse_response(
 ) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript that asks the client to execute the `shell_command` tool with a shell-escaped command string and optional working directory and timeout.
+**Purpose**: Builds a fake streaming response that tells the app to run the shell_command tool. Tests use it when they need to check how the app reacts to an AI-requested shell command.
 
-**Data flow**: It takes a command vector, optional `&Path` workdir, optional timeout in milliseconds, and a tool call id. It shell-joins the command parts, serializes a JSON arguments object containing `command`, `workdir`, and `timeout_ms`, wraps that in `response_created` → `function_call(shell_command)` → `completed` events, and returns the final SSE string.
+**Data flow**: It receives a command as separate words, an optional working directory, an optional timeout, and a tool-call id. It safely joins the command words into one shell-style command string, places that plus the optional settings into JSON, and wraps the result in a three-event SSE response: response created → shell_command function call → response completed. It returns the finished SSE text, or an error if the command cannot be quoted or the JSON cannot be made.
 
-**Call relations**: Tests use this helper when they want the mock model to trigger the app server’s shell-command tool path. It delegates event formatting to `core_test_support::responses` and propagates failures from shell joining or JSON serialization.
+**Call relations**: This helper is called by tests that need a shell command response. Inside, it relies on external JSON creation and string serialization, uses shlex-style joining so command words are quoted correctly, and hands the final event list to the shared sse builder from core_test_support::responses.
 
 *Call graph*: calls 1 internal fn (sse); 4 external calls (json!, to_string, try_join, vec!).
 
@@ -2963,11 +2987,11 @@ fn create_shell_command_sse_response(
 fn create_final_assistant_message_sse_response(message: &str) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript containing a single final assistant message.
+**Purpose**: Builds a fake streaming response containing a normal final assistant message. Tests use it when they want the simulated AI to answer with text instead of asking to run a tool.
 
-**Data flow**: It accepts a message string, creates three events—response created, assistant message with fixed ids, and completed—and returns the serialized SSE body.
+**Data flow**: It receives the message text. It places that text into an assistant-message event between a response-created event and a response-completed event, then turns the event list into one SSE string. The output is ready for a test to feed into the app as if it came from the AI service.
 
-**Call relations**: This is the simplest response fixture and is commonly paired with mock model servers when tests only need a normal assistant completion rather than a tool call.
+**Call relations**: Tests call this when the expected flow is a plain assistant reply. The function delegates the event formatting to the shared sse helper and uses response event builders from core_test_support::responses.
 
 *Call graph*: calls 1 internal fn (sse); 1 external calls (vec!).
 
@@ -2981,11 +3005,11 @@ fn create_apply_patch_sse_response(
 ) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript that requests an apply-patch shell command via the heredoc-based helper event.
+**Purpose**: Builds a fake streaming response that asks the app to apply a patch. This is useful for tests that check code-editing behavior without needing a real AI model to produce the patch.
 
-**Data flow**: It takes patch content and a tool call id, creates an event sequence with `response_created`, `ev_apply_patch_shell_command_call_via_heredoc`, and `completed`, and returns the serialized SSE string.
+**Data flow**: It receives patch text and a tool-call id. It wraps the patch in an apply-patch shell-command event, adds the usual response-created and response-completed events around it, and returns the whole sequence as SSE text.
 
-**Call relations**: Tests use this to drive patch-application flows through the app server. It relies on the shared responses helper to encode the specialized apply-patch event shape.
+**Call relations**: Tests call this when they need the app to see an apply-patch request. The helper uses a specialized event builder from core_test_support::responses for the heredoc-style patch command, then passes all events to the shared sse formatter.
 
 *Call graph*: calls 1 internal fn (sse); 1 external calls (vec!).
 
@@ -2996,11 +3020,11 @@ fn create_apply_patch_sse_response(
 fn create_exec_command_sse_response(call_id: &str) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript that invokes the legacy `exec_command` tool with a portable demo command.
+**Purpose**: Builds a fake streaming response that calls the exec_command tool with a simple “echo hi” command. It chooses a Windows or Unix-style command so the test response matches the operating system running the test.
 
-**Data flow**: It takes a tool call id, chooses either `cmd.exe /d /c echo hi` on Windows or `/bin/sh -c echo hi` elsewhere, collects those pieces into a command vector, serializes a JSON arguments object with `cmd` and `yield_time_ms: 500`, wraps it in response-created/function-call/completed events, and returns the SSE body.
+**Data flow**: It receives a tool-call id. It checks the platform: on Windows it uses cmd.exe, and elsewhere it uses /bin/sh. It builds a command string, adds a yield_time_ms value to JSON arguments, and wraps those arguments in a function-call event for exec_command. The final output is a response-created event, the exec_command call, and a response-completed event as one SSE string.
 
-**Call relations**: This helper is used by tests covering the `exec_command` tool path and intentionally hides platform differences behind `cfg!(windows)` so assertions can remain stable across OSes.
+**Call relations**: Tests call this to simulate an exec_command request. The function uses platform detection, JSON building, and shared response helpers, then hands the event sequence to the common sse formatter.
 
 *Call graph*: calls 1 internal fn (sse); 5 external calls (cfg!, json!, to_string, once, vec!).
 
@@ -3011,11 +3035,11 @@ fn create_exec_command_sse_response(call_id: &str) -> anyhow::Result<String>
 fn create_request_user_input_sse_response(call_id: &str) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript that asks the client to answer a structured `request_user_input` prompt.
+**Purpose**: Builds a fake streaming response that asks the app to request input from the user. It models a confirmation question with Yes and No choices.
 
-**Data flow**: It takes a tool call id, serializes a fixed JSON payload containing one question with id `confirm_path`, header `Confirm`, prompt text, and two labeled options, then emits that payload as a `function_call(request_user_input)` between response-created and completed events.
+**Data flow**: It receives a tool-call id. It creates JSON arguments describing one question, including its id, title, wording, and two selectable options. It then places that JSON string into a request_user_input function-call event and wraps it with response-created and response-completed events. The result is SSE text for a test to consume.
 
-**Call relations**: Tests use this fixture to exercise interactive user-input request handling. The function hard-codes a representative nested schema so callers do not need to construct the JSON manually.
+**Call relations**: Tests call this when they need to exercise the user-question path. The helper creates the expected JSON shape and relies on core_test_support::responses to build and serialize the SSE events.
 
 *Call graph*: calls 1 internal fn (sse); 3 external calls (json!, to_string, vec!).
 
@@ -3026,20 +3050,24 @@ fn create_request_user_input_sse_response(call_id: &str) -> anyhow::Result<Strin
 fn create_request_permissions_sse_response(call_id: &str) -> anyhow::Result<String>
 ```
 
-**Purpose**: Builds an SSE transcript that asks the client for filesystem write permissions via the `request_permissions` tool.
+**Purpose**: Builds a fake streaming response that asks the app for file-system write permissions. Tests use it to check how permission requests are surfaced and processed.
 
-**Data flow**: It takes a tool call id, serializes a fixed JSON object with a reason string and a `permissions.file_system.write` array containing `.` and `../shared`, wraps it in response-created/function-call/completed events, and returns the SSE string.
+**Data flow**: It receives a tool-call id. It creates JSON arguments with a reason and a permissions object asking for write access to two paths: the current directory and ../shared. It wraps that JSON in a request_permissions function-call event, surrounded by response-created and response-completed events, and returns the complete SSE string.
 
-**Call relations**: This helper supports tests around permission escalation and approval UX. Like the user-input helper, it centralizes a realistic nested payload shape so mock model setup stays concise.
+**Call relations**: Tests call this when they want to simulate an AI permission request. The function prepares the permission-request JSON, then uses shared response event builders and the common sse formatter to produce the final fake stream.
 
 *Call graph*: calls 1 internal fn (sse); 3 external calls (json!, to_string, vec!).
 
 
 ### `app-server/tests/common/rollout.rs`
 
-`io_transport` · `test setup and persisted-session fixture creation`
+`test` · `test setup`
 
-This module writes realistic rollout files in the directory layout the app server expects: `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread>.jsonl`. `rollout_path` derives that path directly from the filename timestamp string by slicing year, month, and day components. The public constructors are layered wrappers around a single internal writer, `create_fake_rollout_with_source_and_parent_thread_id`, which generates a fresh UUID, converts it into a `ThreadId`, creates parent directories, builds a `SessionMeta` and `SessionMetaLine`, and writes three JSONL records: a `session_meta` envelope, a `response_item` representing the initial user message, and an `event_msg` of type `user_message`. The helper also parses the RFC3339 timestamp and sets the file’s modified time to match, which matters for code paths that sort or filter sessions by filesystem metadata. Variants expose different knobs: `create_fake_rollout` defaults `SessionSource::Cli`; `create_fake_parented_rollout_with_source` injects `parent_thread_id`; `create_fake_rollout_with_token_usage` appends a fourth `event_msg` carrying a nontrivial `TokenCountEvent` so resume/fork tests can verify replay of total vs. last usage counters; and `create_fake_rollout_with_text_elements` writes a custom `text_elements` array and `local_images: []` in the user-message event. All functions return the generated thread/session UUID string for later requests.
+A rollout file is a JSON Lines file: each line is a separate JSON record, like one row in a logbook. The app stores these under CODEX_HOME/sessions/YYYY/MM/DD/, with the date taken from the filename timestamp. This file gives tests a quick way to build those logbooks with just enough realistic data to exercise the real loading code.
+
+Most helpers create a new random thread ID, build a session metadata line, add a user message, and write the result to disk. Some variants let a test choose extra details, such as the session source, Git information, a parent thread ID for fork-like relationships, or richer message text elements. One helper appends a saved token-count event so tests can confirm that token totals are restored from history instead of being recalculated or lost.
+
+The important idea is that these helpers do not mock the reader directly. They create files in the same shape and location the app expects in normal use. That makes tests closer to real life: if the storage layout, JSON shape, or timestamp handling breaks, tests can catch it.
 
 #### Function details
 
@@ -3049,11 +3077,11 @@ This module writes realistic rollout files in the directory layout the app serve
 fn rollout_path(codex_home: &Path, filename_ts: &str, thread_id: &str) -> PathBuf
 ```
 
-**Purpose**: Computes the canonical rollout JSONL path for a given CODEX_HOME, filename timestamp, and thread id.
+**Purpose**: Builds the exact filesystem path where a rollout file should live. Tests use it so they write and read files in the same date-based folder layout as the real app.
 
-**Data flow**: It takes the home directory, a timestamp string in `YYYY-MM-DDThh-mm-ss` filename form, and a thread id string. It slices year/month/day substrings from the timestamp and joins them into `codex_home/sessions/<year>/<month>/<day>/rollout-<timestamp>-<thread_id>.jsonl`, returning that `PathBuf`.
+**Data flow**: It receives a CODEX_HOME directory, a filename timestamp, and a thread ID. It slices the timestamp into year, month, and day, then combines those pieces into CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread_id>.jsonl. It returns that path without creating anything on disk.
 
-**Call relations**: The internal rollout writer and the token-usage appender both call this helper so path derivation stays consistent. It is pure path construction with no filesystem access.
+**Call relations**: The main rollout-writing helper calls this when it needs to decide where to create a fake session file. The token-usage helper calls it later to find the file it just created so it can append one more event.
 
 *Call graph*: called by 2 (create_fake_rollout_with_source_and_parent_thread_id, create_fake_rollout_with_token_usage); 2 external calls (join, format!).
 
@@ -3071,11 +3099,11 @@ fn create_fake_rollout(
 ) -> Result<String>
 ```
 
-**Purpose**: Creates a minimal rollout file using `SessionSource::Cli` and no parent thread id.
+**Purpose**: Creates the simplest useful fake rollout file for tests. It assumes the session came from the command-line interface and leaves more specialized options to lower-level helpers.
 
-**Data flow**: It accepts CODEX_HOME, filename timestamp, RFC3339 metadata timestamp, preview text, optional model provider, and optional `GitInfo`. It forwards those values plus `SessionSource::Cli` to `create_fake_rollout_with_source` and returns the generated thread id string.
+**Data flow**: It receives the fake home directory, timestamps, preview text, optional model provider, and optional Git information. It passes all of that along with a default session source of CLI. It returns the newly generated thread ID as a string, or an error if file creation or data conversion fails.
 
-**Call relations**: This is the simplest public entry point for tests that only need a basic persisted session. `create_fake_rollout_with_token_usage` builds on it before appending an extra token-count event.
+**Call relations**: This is a convenience wrapper. Tests can call it when they do not care about the session source or parent relationship. The token-usage helper also starts here, then adds a token-count event after the basic file exists.
 
 *Call graph*: calls 1 internal fn (create_fake_rollout_with_source); called by 1 (create_fake_rollout_with_token_usage).
 
@@ -3092,11 +3120,11 @@ fn create_fake_rollout_with_token_usage(
 ) -> Result<String>
 ```
 
-**Purpose**: Creates a minimal rollout and then appends a persisted token-usage event with deliberately asymmetric counters.
+**Purpose**: Creates a fake rollout file that includes saved token usage. This lets resume and fork tests check that the app replays past token counts correctly when reopening a session.
 
-**Data flow**: It takes CODEX_HOME, filename timestamp, RFC3339 timestamp, preview text, and optional model provider. It first creates the base rollout via `create_fake_rollout`, then constructs an `EventMsg::TokenCount(TokenCountEvent)` containing `TokenUsageInfo` with distinct `total_token_usage` and `last_token_usage` values plus `model_context_window`, serializes that payload, reads the existing rollout file, appends a new JSONL line with the same timestamp and `type: "event_msg"`, writes the combined contents back, and returns the thread id.
+**Data flow**: It first creates a normal fake rollout and receives its thread ID. Then it builds a token-count event with deliberately different total and last-turn numbers, including cached and reasoning token fields. It finds the rollout file, reads its existing contents, appends one more JSON line for the token event, writes the file back, and returns the same thread ID.
 
-**Call relations**: Resume and fork tests call this variant when they need replayable usage state already persisted on disk. It depends on `create_fake_rollout` for the initial file and `rollout_path` to reopen the same file for appending.
+**Call relations**: It builds on create_fake_rollout instead of duplicating the whole session file setup. After that, it uses rollout_path to locate the generated file and adds the extra event that token replay tests need.
 
 *Call graph*: calls 2 internal fn (create_fake_rollout, rollout_path); 5 external calls (format!, write, json!, TokenCount, to_value).
 
@@ -3114,11 +3142,11 @@ fn create_fake_rollout_with_source(
     source
 ```
 
-**Purpose**: Creates a minimal rollout while allowing the caller to choose the `SessionSource` recorded in session metadata.
+**Purpose**: Creates a fake rollout while letting the caller choose where the session claims to have come from. This is useful when tests need to distinguish command-line sessions from other sources.
 
-**Data flow**: It receives the same inputs as `create_fake_rollout` plus a `SessionSource`, forwards them to `create_fake_rollout_with_source_and_parent_thread_id` with `parent_thread_id` set to `None`, and returns the generated thread id.
+**Data flow**: It receives the same basic rollout details plus a session source value. It forwards those inputs to the shared internal creator with no parent thread ID. It returns the generated thread ID string, or an error if setup fails.
 
-**Call relations**: This is a thin wrapper used by `create_fake_rollout` and by tests that care about source-specific behavior but not parentage. The actual file creation is delegated to the internal writer.
+**Call relations**: This is another convenience wrapper around the central file-writing function. create_fake_rollout calls it with the default CLI source, while tests can call it directly when they need a different source.
 
 *Call graph*: calls 1 internal fn (create_fake_rollout_with_source_and_parent_thread_id); called by 1 (create_fake_rollout).
 
@@ -3135,11 +3163,11 @@ fn create_fake_parented_rollout_with_source(
     git_info: Option<GitInfo>,
 ```
 
-**Purpose**: Creates a minimal rollout with both an explicit `SessionSource` and an explicit parent thread id.
+**Purpose**: Creates a fake rollout that records a parent thread ID. Tests use this when they need a session to look like it belongs under, or was derived from, another thread.
 
-**Data flow**: It takes CODEX_HOME, timestamps, preview text, optional model provider, optional `GitInfo`, a `SessionSource`, and a `ThreadId` parent. It forwards all of that to `create_fake_rollout_with_source_and_parent_thread_id` with `Some(parent_thread_id)` and returns the generated child thread id.
+**Data flow**: It receives normal rollout details, a chosen source, and a parent thread ID. It passes those values to the shared internal creator, wrapping the parent ID as present. It returns the new child thread ID string, or an error if writing the file fails.
 
-**Call relations**: Tests that verify fork lineage or parent-child thread relationships use this wrapper. It exists to expose parent-thread control without duplicating the JSONL-writing logic.
+**Call relations**: This function is the parent-aware public wrapper. It hands the real work to create_fake_rollout_with_source_and_parent_thread_id, which knows how to place the parent ID into the session metadata.
 
 *Call graph*: calls 1 internal fn (create_fake_rollout_with_source_and_parent_thread_id).
 
@@ -3156,11 +3184,11 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
     git_info: Option
 ```
 
-**Purpose**: Implements the actual rollout fixture writer: generates ids, creates directories, writes the JSONL records, and aligns file modification time with the supplied timestamp.
+**Purpose**: Does the main work of creating a minimal rollout file. It is the shared helper behind the simpler public helpers, because all of them need the same file format and metadata structure.
 
-**Data flow**: It takes CODEX_HOME, filename timestamp, RFC3339 timestamp, preview text, optional model provider, optional `GitInfo`, a `SessionSource`, and an optional parent `ThreadId`. It generates a UUID, converts it to a `ThreadId`, computes the rollout path, creates parent directories, builds a `SessionMeta` and `SessionMetaLine`, serializes three JSON lines (`session_meta`, initial user `response_item`, and `event_msg` user_message), writes them to the file, parses the RFC3339 timestamp into UTC, sets the file’s modified time via `FileTimes`, and returns the UUID string.
+**Data flow**: It receives the fake home directory, timestamps, preview text, optional provider and Git details, a session source, and an optional parent thread ID. It generates a new UUID, converts it into a thread ID, computes the rollout path, creates the date directory, builds three JSON lines, and writes them to disk. The lines describe session metadata, a user message as a response item, and the same user message as an event. It also sets the file modification time from the metadata timestamp, then returns the generated UUID string.
 
-**Call relations**: Both `create_fake_rollout_with_source` and `create_fake_parented_rollout_with_source` funnel into this function, making it the central implementation for most rollout fixtures. It also relies on `rollout_path` so naming and directory layout match the app server’s expectations.
+**Call relations**: create_fake_rollout_with_source and create_fake_parented_rollout_with_source both delegate to this function. It calls rollout_path so all callers share the same storage layout, then uses protocol types such as SessionMeta and SessionMetaLine so the fake file looks like a real app file.
 
 *Call graph*: calls 2 internal fn (rollout_path, from_string); called by 2 (create_fake_parented_rollout_with_source, create_fake_rollout_with_source); 9 external calls (new, from, new_v4, parse_from_rfc3339, create_dir_all, write, json!, to_value, new).
 
@@ -3177,11 +3205,11 @@ fn create_fake_rollout_with_text_elements(
     model_provider: Optio
 ```
 
-**Purpose**: Creates a rollout whose user-message event includes caller-supplied `text_elements` and an empty `local_images` array.
+**Purpose**: Creates a fake rollout whose user-message event includes structured text elements. Tests use this when plain preview text is not enough and they need to check richer message content.
 
-**Data flow**: It takes CODEX_HOME, timestamps, preview text, a `Vec<serde_json::Value>` of text elements, optional model provider, and optional `GitInfo`. It generates a UUID and `ThreadId`, manually derives the `sessions/YYYY/MM/DD` directory from the filename timestamp, creates that directory, builds `SessionMeta` with `SessionSource::Cli`, serializes three JSONL lines similar to the main writer but with `text_elements` embedded in the `event_msg` payload, writes the file, and returns the UUID string.
+**Data flow**: It receives the fake home directory, timestamps, preview text, a list of JSON text elements, optional model provider, and optional Git information. It generates a new thread ID, creates the dated sessions directory, builds a rollout file with session metadata, a response item, and a user-message event containing the supplied text elements and an empty image list. It writes the JSON Lines file and returns the generated thread ID string.
 
-**Call relations**: Tests use this specialized variant when they need richer user-message payloads than the standard plain-text rollout helper provides. It duplicates some of the internal writer’s logic rather than delegating, because the event payload shape differs.
+**Call relations**: This function is separate from the central helper because it needs a slightly different user-message payload. It follows the same overall pattern as the other rollout creators, so tests still get a realistic file in the expected sessions folder.
 
 *Call graph*: calls 1 internal fn (from_string); 8 external calls (join, from, new_v4, format!, create_dir_all, write, json!, to_value).
 
@@ -3191,9 +3219,13 @@ This layer assembles the shared fixtures into the exported support surface and t
 
 ### `app-server/tests/common/lib.rs`
 
-`orchestration` · `cross-cutting test support`
+`test` · `test setup and test response checking`
 
-This module is the public surface of the `tests/common` support package. Its main job is organization: it declares the internal helper modules (`analytics_server`, `auth_fixtures`, `config`, `mock_model_server`, `models_cache`, `responses`, `rollout`, `test_app_server`) and then re-exports the pieces that test files actually consume, so suites can depend on a single `app_test_support` namespace instead of importing each helper module directly. The exports cover auth fixtures and token encoding, config writers, temporary-path helpers from `core_test_support`, mock Responses API servers, model-cache writers, SSE response constructors, rollout/session fixture builders, and the `TestAppServer` process harness plus a few constants. The only local behavior is `to_response`, a small deserialization bridge for JSON-RPC responses: tests often receive a `JSONRPCResponse` whose `result` field is an untyped JSON value, and this helper converts that payload into a concrete protocol response type implementing `DeserializeOwned`. That keeps test bodies concise and centralizes the two-step serde conversion pattern used throughout the suite.
+App server tests need a lot of repeated setup: fake authentication, mock model servers, canned server responses, temporary paths, rollout files, and a test app server wrapper. This file acts like the front desk for that test support code. Instead of every test knowing which helper lives in which internal module, tests can import from this single common library.
+
+Most of the file is made of `pub use` lines. In plain terms, those re-export helper functions and types from nearby test modules so other tests can use them directly. This keeps test files shorter and makes the support code feel like one organized kit rather than many separate drawers.
+
+The one local function, `to_response`, solves a common testing problem with JSON-RPC responses. JSON-RPC is a standard message shape for calling methods over JSON. A response contains a generic `result` field, but each test usually wants that result as a specific Rust type. `to_response` converts the generic result into normal JSON, then reads it back as the requested type. It is a small bridge between “the server sent a generic JSON answer” and “the test wants a concrete value it can check.”
 
 #### Function details
 
@@ -3203,22 +3235,24 @@ This module is the public surface of the `tests/common` support package. Its mai
 fn to_response(response: JSONRPCResponse) -> anyhow::Result<T>
 ```
 
-**Purpose**: Converts a `JSONRPCResponse`’s untyped `result` payload into a concrete response struct requested by the caller.
+**Purpose**: This function converts the `result` part of a JSON-RPC response into the specific Rust type the test expects. It is useful when a test receives a generic server reply but wants to make clear assertions about its contents.
 
-**Data flow**: It takes ownership of a `JSONRPCResponse`, serializes `response.result` into a generic `serde_json::Value`, then deserializes that value into type parameter `T: DeserializeOwned`. On success it returns `Ok(T)`; any serialization or deserialization failure is propagated as `anyhow::Error`.
+**Data flow**: It takes a `JSONRPCResponse` as input and reads its `result` field. First it turns that result into a plain JSON value, then it asks `serde_json` to decode that JSON into the requested type `T`. If both conversions work, it returns the typed value; if not, it returns an error explaining that the response did not match the expected shape.
 
-**Call relations**: Many integration tests call this immediately after `TestAppServer` returns a JSON-RPC response, using it as the final decoding step from transport-level protocol objects into typed assertions. It delegates entirely to serde conversion functions and contains no protocol branching of its own.
+**Call relations**: Tests call on this helper after they get a JSON-RPC reply from the test app server. Inside, it hands the conversion work to `serde_json::to_value` and `serde_json::from_value`, which are the standard serialization and deserialization tools used to move between Rust values and JSON.
 
 *Call graph*: 2 external calls (from_value, to_value).
 
 
 ### `app-server/tests/common/test_app_server.rs`
 
-`orchestration` · `entire integration-test run`
+`test` · `integration test setup, request/response handling, and teardown`
 
-This is the central process-and-protocol driver used by the app-server test suite. `TestAppServer` owns a spawned Tokio `Child`, optional piped stdin, buffered stdout reader, an atomic integer request-id counter, and a `VecDeque<JSONRPCMessage>` used to buffer out-of-order messages while waiting for a specific response or notification. Construction flows through layered helpers: convenience constructors choose whether managed config is disabled, whether plugin startup tasks run, whether extra env vars or CLI args are injected, and optionally which executable path to launch. The core constructor configures `CODEX_HOME`, `RUST_LOG`, an isolated managed-config path under the temp home, removes the internal originator override env var, pipes stdio, spawns the process with `kill_on_drop(true)`, and forwards child stderr lines to the test process’s stderr for visibility.
+This file is test infrastructure. Instead of testing the app server by calling internal Rust functions, tests can launch the actual codex-app-server binary and speak to it the same way a real client would: one JSON message per line through standard input and output. JSON-RPC is a simple request and response format; here it is the contract between the test and the server.
 
-On the protocol side, `initialize*` performs the JSON-RPC handshake and sends the `initialized` notification after validating the response id. The many `send_*_request` methods are thin typed wrappers that serialize params and call the shared `send_request`, which increments `next_request_id`, builds a `JSONRPCRequest`, and writes newline-delimited JSON. Reading is more sophisticated: `read_stream_until_message` first searches buffered messages, then keeps reading stdout until a predicate matches, buffering everything else. Specialized readers unwrap requests, responses, errors, or notifications and validate shape. `interrupt_turn_and_wait_for_aborted` handles races where a terminal `turn/completed` notification may already be buffered before the interrupt response arrives. Finally, `Drop` performs bounded synchronous cleanup—close stdin, poll for graceful exit, then kill and poll again—to reduce flaky leaked-child reports in test runners.
+The main type, TestAppServer, is like a remote control for a temporary server. It starts the process in an isolated test home directory, sets environment variables so the test is not affected by the developer machine, and optionally disables slow plugin startup work. It then offers many small send_* methods for protocol features such as login, threads, turns, files, plugins, remote control, and configuration. Most of those methods simply turn typed Rust parameters into JSON and pass them to one shared request sender.
+
+The other half of the file reads the server stream. Because messages can arrive in any order, unmatched messages are saved in a small buffer, like putting letters back in a tray until the test asks for them. The Drop cleanup is important: tests spawn real processes, so this helper closes input, gives the server a chance to exit, and kills it if needed. Without this file, integration tests would repeat fragile process and protocol plumbing everywhere.
 
 #### Function details
 
@@ -3228,11 +3262,11 @@ On the protocol side, `initialize*` performs the JSON-RPC handshake and sends th
 async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus>
 ```
 
-**Purpose**: Waits asynchronously for the spawned app-server child process to exit and returns its `ExitStatus`.
+**Purpose**: Waits until the child app server process exits. Tests use it when they expect the server to stop and need the operating system exit status.
 
-**Data flow**: It reads the `process` field, awaits `Child::wait()`, and returns the resulting `std::io::Result<ExitStatus>` without modifying other harness state.
+**Data flow**: It reads the stored child process handle, waits asynchronously for that process to finish, and returns the exit status or an input/output error.
 
-**Call relations**: Tests call this when they intentionally expect the server process to terminate. It is a direct wrapper over the child-process wait primitive.
+**Call relations**: This is a direct process-level helper. It hands off to Tokio's child-process wait operation rather than using the JSON-RPC message flow.
 
 *Call graph*: 1 external calls (wait).
 
@@ -3243,11 +3277,11 @@ async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus>
 async fn new(codex_home: &Path) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts `codex-app-server` with the standard test defaults, including disabling plugin startup tasks.
+**Purpose**: Starts a standard test app server with plugin startup tasks disabled. This is the default constructor for most integration tests.
 
-**Data flow**: It takes a CODEX_HOME path and forwards it with no env overrides and the single `DISABLE_PLUGIN_STARTUP_TASKS_ARG` CLI argument to `new_with_env_and_args`, returning the constructed harness.
+**Data flow**: It receives a test CODEX_HOME path, adds the default test argument that skips plugin startup work, and returns a ready TestAppServer connected to the new process.
 
-**Call relations**: This is the default constructor used by many integration tests. It delegates all actual process setup to `new_with_env_and_args`.
+**Call relations**: Many tests call this as their first step. It delegates the real setup to TestAppServer::new_with_env_and_args so all process launching stays in one place.
 
 *Call graph*: called by 417 (get_auth_status_with_api_key, get_auth_status_with_api_key_no_include_token, get_auth_status_with_api_key_refresh_requested, get_auth_status_with_api_key_when_auth_not_required, login_api_key_rejected_when_forced_chatgpt, get_conversation_summary_by_relative_rollout_path_resolves_from_codex_home, get_conversation_summary_by_thread_id_reads_rollout, initialized_mcp, test_fuzzy_file_search_accepts_cancellation_token, test_fuzzy_file_search_sorts_and_includes_indices (+15 more)); 1 external calls (new_with_env_and_args).
 
@@ -3258,11 +3292,11 @@ async fn new(codex_home: &Path) -> anyhow::Result<Self>
 async fn new_without_managed_config(codex_home: &Path) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server while forcing managed configuration off for the child process.
+**Purpose**: Starts the server while disabling managed configuration. Tests use it when they need configuration to come only from the test setup.
 
-**Data flow**: It takes CODEX_HOME and calls `new_with_env` with `CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG=1`, returning the resulting harness.
+**Data flow**: It receives a test home path, adds an environment variable that turns off managed config, and returns a connected TestAppServer.
 
-**Call relations**: Tests that need isolation from managed-config behavior use this convenience constructor. It layers one fixed env override on top of the standard startup path.
+**Call relations**: Tests for workspace policy, threads, plugins, and related behavior call this when host or managed config would make results unpredictable. It reuses TestAppServer::new_with_env.
 
 *Call graph*: called by 19 (list_apps_returns_empty_when_workspace_codex_plugins_disabled, experimental_feature_list_marks_apps_and_plugins_disabled_by_workspace_policy, experimental_feature_list_resolves_thread_project_config, skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disabled, thread_fork_tracks_thread_initialized_analytics, thread_goal_get_rejects_unmaterialized_thread, thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal, thread_goal_set_edits_objective_without_resetting_usage, thread_goal_set_persists_resumable_stopped_statuses, thread_goal_set_preserves_budget_limited_same_objective (+9 more)); 1 external calls (new_with_env).
 
@@ -3276,11 +3310,11 @@ async fn new_without_managed_config_with_env(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server with managed config disabled plus additional caller-specified environment overrides.
+**Purpose**: Starts the server with managed config disabled plus extra test-specific environment changes. This lets a test combine isolation with custom conditions.
 
-**Data flow**: It takes CODEX_HOME and a slice of `(key, Option<value>)` overrides, prepends the managed-config-disable pair to a local vector, extends it with the caller’s overrides, and passes the combined slice to `new_with_env`.
+**Data flow**: It takes a home path and environment overrides, prepends the managed-config-disable variable, and produces a connected server process.
 
-**Call relations**: This is a convenience wrapper for tests that need both managed-config isolation and custom environment shaping. It delegates process creation to `new_with_env`.
+**Call relations**: Plugin tests use this when they need both disabled managed config and extra environment settings. It builds the environment list and hands it to TestAppServer::new_with_env.
 
 *Call graph*: called by 2 (plugin_list_returns_empty_when_workspace_codex_plugins_disabled, plugin_list_reuses_cached_workspace_codex_plugins_setting); 2 external calls (new_with_env, vec!).
 
@@ -3291,11 +3325,11 @@ async fn new_without_managed_config_with_env(
 async fn new_with_plugin_startup_tasks(codex_home: &Path) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server without suppressing plugin startup tasks.
+**Purpose**: Starts the server without suppressing plugin startup tasks. Tests use it when startup plugin behavior is exactly what they want to inspect.
 
-**Data flow**: It takes CODEX_HOME and forwards empty env overrides and an empty args list to `new_with_env_and_args`, returning the harness.
+**Data flow**: It receives a home path, passes no extra environment values and no skip-startup argument, and returns a connected TestAppServer.
 
-**Call relations**: Tests covering plugin startup behavior use this constructor instead of the default `new`, which disables those tasks.
+**Call relations**: Startup-cache tests call this to exercise the real startup path. It delegates to TestAppServer::new_with_env_and_args.
 
 *Call graph*: called by 1 (plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request); 1 external calls (new_with_env_and_args).
 
@@ -3309,11 +3343,11 @@ async fn new_with_env_and_plugin_startup_tasks(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server with caller-provided environment overrides and plugin startup tasks enabled.
+**Purpose**: Starts the server with custom environment values while leaving plugin startup tasks enabled. This supports tests of startup behavior under special settings.
 
-**Data flow**: It takes CODEX_HOME and env overrides, then calls `new_with_env_and_args` with those overrides and no extra CLI args.
+**Data flow**: It receives a home path and environment overrides, keeps the command-line argument list empty, and returns a connected server process.
 
-**Call relations**: This combines the custom-env and plugin-startup-enabled variants into one convenience entry point.
+**Call relations**: Tests that verify startup synchronization call this. It forwards all process setup to TestAppServer::new_with_env_and_args.
 
 *Call graph*: called by 1 (app_server_startup_sync_downloads_remote_installed_plugin_bundles); 1 external calls (new_with_env_and_args).
 
@@ -3324,11 +3358,11 @@ async fn new_with_env_and_plugin_startup_tasks(
 async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server with additional CLI arguments while still including the default plugin-startup suppression flag.
+**Purpose**: Starts the server with extra command-line arguments, while still disabling plugin startup tasks by default. Tests use it to check command-line modes.
 
-**Data flow**: It takes CODEX_HOME and a slice of extra args, prepends `DISABLE_PLUGIN_STARTUP_TASKS_ARG` into a local vector, appends the caller args, and forwards the combined list to `new_with_env_and_args`.
+**Data flow**: It receives a home path and argument slice, adds the test skip-startup argument before the supplied arguments, and returns a connected TestAppServer.
 
-**Call relations**: Tests use this when they need to exercise command-line switches but still want the usual plugin-startup behavior disabled.
+**Call relations**: Remote-control and plugin-install tests call this when the command line matters. It delegates to TestAppServer::new_with_env_and_args.
 
 *Call graph*: called by 4 (plugin_install_returns_invalid_request_for_disallowed_product_plugin, listen_off_exits_without_persisted_remote_control_enable, listen_off_honors_persisted_remote_control_enable, listen_off_ignores_persisted_enable_when_disabled_by_requirements); 2 external calls (new_with_env_and_args, vec!).
 
@@ -3342,11 +3376,11 @@ async fn new_with_env(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts the server with caller-specified environment overrides and the standard plugin-startup suppression flag.
+**Purpose**: Starts the server with custom environment variables and the normal test startup shortcut. Tests use it to simulate authentication, network, or feature settings.
 
-**Data flow**: It takes CODEX_HOME and env overrides, then forwards them plus `[DISABLE_PLUGIN_STARTUP_TASKS_ARG]` to `new_with_env_and_args`.
+**Data flow**: It receives a home path and a list of environment variables to set or remove, adds the default skip-plugin-startup argument, and returns a connected server.
 
-**Call relations**: This is the main constructor for tests that need to set or remove environment variables in the child process.
+**Call relations**: Authentication and external-mode tests call this heavily. It hands the combined setup to TestAppServer::new_with_env_and_args.
 
 *Call graph*: called by 83 (get_auth_status_no_auth, get_auth_status_omits_token_after_permanent_refresh_failure, get_auth_status_omits_token_after_proactive_refresh_failure, get_auth_status_returns_token_after_proactive_refresh_recovery, get_auth_status_with_personal_access_token_omits_token, account_read_refresh_token_is_noop_in_external_mode, external_auth_refresh_error_fails_turn, external_auth_refresh_invalid_access_token_fails_turn, external_auth_refresh_mismatched_workspace_fails_turn, external_auth_refreshes_on_unauthorized (+15 more)); 1 external calls (new_with_env_and_args).
 
@@ -3361,11 +3395,11 @@ async fn new_with_program_and_env(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts a caller-specified executable path instead of the default cargo-built `codex-app-server`, while applying env overrides and default test args.
+**Purpose**: Starts a chosen server program path with custom environment variables. This is useful when a test needs a specific executable rather than the default cargo-built one.
 
-**Data flow**: It takes CODEX_HOME, a program path, and env overrides, then forwards them plus `[DISABLE_PLUGIN_STARTUP_TASKS_ARG]` to `new_with_program_env_and_args`.
+**Data flow**: It receives a home path, executable path, and environment overrides, adds the normal test startup shortcut, and returns a connected TestAppServer.
 
-**Call relations**: Specialized tests use this to launch alternate binaries or wrappers while reusing the same JSON-RPC harness.
+**Call relations**: Special process tests call this, then it delegates to TestAppServer::new_with_program_env_and_args for the actual launch.
 
 *Call graph*: called by 1 (create_zsh_test_mcp_process); 1 external calls (new_with_program_env_and_args).
 
@@ -3380,11 +3414,11 @@ async fn new_with_env_and_args(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Resolves the `codex-app-server` binary path from Cargo and starts it with explicit env overrides and CLI args.
+**Purpose**: Finds the codex-app-server test binary and starts it with the requested environment and arguments.
 
-**Data flow**: It takes CODEX_HOME, env overrides, and args, resolves the executable path via `codex_utils_cargo_bin::cargo_bin("codex-app-server")`, adds context if lookup fails, and passes everything to `new_with_program_env_and_args`.
+**Data flow**: It receives a home path, environment overrides, and command-line arguments, locates the binary built by Cargo, and returns the launched TestAppServer.
 
-**Call relations**: Most public constructors funnel through this helper. It separates binary discovery from the lower-level process-spawn logic.
+**Call relations**: Most public constructors funnel through this helper. It then calls TestAppServer::new_with_program_env_and_args, which performs the low-level process setup.
 
 *Call graph*: 2 external calls (new_with_program_env_and_args, cargo_bin).
 
@@ -3400,11 +3434,11 @@ async fn new_with_program_env_and_args(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Performs the actual child-process setup: configures stdio, environment, working directory, stderr forwarding, and initializes harness state.
+**Purpose**: Performs the real child-process setup for the test server. It creates the process, wires up input and output pipes, and prepares stderr logging.
 
-**Data flow**: It takes CODEX_HOME, an executable path, env overrides, and args. It builds a `tokio::process::Command`, pipes stdin/stdout/stderr, sets current dir and key env vars (`CODEX_HOME`, `RUST_LOG`, isolated managed-config path), removes the internal originator override env var, applies args and per-key overrides/removals, spawns the child with `kill_on_drop(true)`, extracts stdin and stdout handles, wraps stdout in `BufReader`, spawns a background task to echo child stderr lines to test stderr, and returns a `TestAppServer` with `next_request_id` zeroed and an empty pending-message deque.
+**Data flow**: It takes a home path, program path, environment overrides, and arguments. It builds a command with isolated CODEX_HOME and config paths, spawns the process, stores stdin and stdout, forwards stderr to the test log, and returns a TestAppServer.
 
-**Call relations**: All constructors ultimately delegate here. It is the only place that touches process-launch details and establishes the transport channels later used by send/read helpers.
+**Call relations**: All constructors ultimately call this. Later send and read methods depend on the stdin and stdout handles created here, and Drop later cleans up the stored process.
 
 *Call graph*: 8 external calls (new, new, join, piped, new, new, eprintln!, spawn).
 
@@ -3415,11 +3449,11 @@ async fn new_with_program_env_and_args(
 async fn initialize(&mut self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Runs the standard initialize handshake using a default client identity and asserts that the result is a JSON-RPC response rather than an error.
+**Purpose**: Runs the normal startup handshake with default test client information. Tests call it before using server features that require initialization.
 
-**Data flow**: It constructs a `ClientInfo` with `DEFAULT_CLIENT_NAME`, title `None`, and version `0.1.0`, passes it to `initialize_with_client_info`, checks that the returned `JSONRPCMessage` is `Response`, and returns `Ok(())`.
+**Data flow**: It sends an initialize request with the default client name and version, checks that the server replied with a response, and returns success.
 
-**Call relations**: Most tests call this immediately after constructing the harness. It delegates the actual handshake to `initialize_with_client_info` and panics only if the returned message shape is impossible under its own expectations.
+**Call relations**: It is the simple public path into the initialization chain. It calls TestAppServer::initialize_with_client_info, which continues through the lower-level initialization helpers.
 
 *Call graph*: calls 1 internal fn (initialize_with_client_info); 1 external calls (unreachable!).
 
@@ -3433,11 +3467,11 @@ async fn initialize_with_client_info(
     ) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Runs initialize using caller-supplied client metadata and default capabilities that enable the experimental API.
+**Purpose**: Runs initialization while letting the test choose the client name, title, or version. It still enables the experimental API by default.
 
-**Data flow**: It takes a `ClientInfo`, wraps it in `InitializeParams` together with `Some(InitializeCapabilities { experimental_api: true, ..Default::default() })`, and forwards to `initialize_with_capabilities`.
+**Data flow**: It receives client information, pairs it with default capabilities that include experimental support, and returns the server's initialize response or error message.
 
-**Call relations**: This is the customizable variant behind `initialize`. It exists for tests that need to vary client identity while keeping the usual capability set.
+**Call relations**: TestAppServer::initialize calls this for the normal case. It delegates to TestAppServer::initialize_with_capabilities.
 
 *Call graph*: calls 1 internal fn (initialize_with_capabilities); called by 1 (initialize); 1 external calls (default).
 
@@ -3452,11 +3486,11 @@ async fn initialize_with_capabilities(
     ) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Runs initialize with explicit client info and optional capability set.
+**Purpose**: Runs initialization with caller-supplied capability flags. Capabilities tell the server what kinds of features the client understands.
 
-**Data flow**: It takes a `ClientInfo` and optional `InitializeCapabilities`, packages them into `InitializeParams`, and forwards to `initialize_with_params`.
+**Data flow**: It receives client information and optional capabilities, wraps them into initialize parameters, and returns the server's response or error.
 
-**Call relations**: This is the last typed wrapper before the raw initialize request is sent.
+**Call relations**: It is called by TestAppServer::initialize_with_client_info and passes the completed parameter object to TestAppServer::initialize_with_params.
 
 *Call graph*: calls 1 internal fn (initialize_with_params); called by 1 (initialize_with_client_info).
 
@@ -3470,11 +3504,11 @@ async fn initialize_with_params(
     ) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Sends the `initialize` request, validates the matching response or error id, and sends the `initialized` notification on success.
+**Purpose**: Sends the actual initialize JSON-RPC request and validates that the matching reply comes back. It also sends the final initialized notification required by the protocol.
 
-**Data flow**: It takes `InitializeParams`, serializes them to `serde_json::Value`, sends a request with method `initialize`, reads one JSON-RPC message from stdout, and matches on its variant. For a `Response`, it verifies the id equals the sent integer request id, sends `ClientNotification::Initialized`, and returns the response wrapped as `JSONRPCMessage`; for an `Error`, it verifies the id and returns it; for `Notification` or `Request`, it bails with an error.
+**Data flow**: It converts initialize parameters to JSON, sends an initialize request, reads one server message, checks that the response or error id matches the request id, sends the initialized notification on success, and returns the message.
 
-**Call relations**: All initialize entry points delegate here. It is the only place that performs the full handshake sequencing and id validation.
+**Call relations**: This is the bottom of the initialization flow. It uses TestAppServer::send_request, TestAppServer::read_jsonrpc_message, and TestAppServer::send_notification.
 
 *Call graph*: calls 3 internal fn (read_jsonrpc_message, send_notification, send_request); called by 1 (initialize_with_capabilities); 5 external calls (bail!, Error, Response, Integer, to_value).
 
@@ -3488,11 +3522,11 @@ async fn send_get_auth_status_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends a typed `getAuthStatus` JSON-RPC request.
+**Purpose**: Sends a request asking the server for the current authentication status.
 
-**Data flow**: It takes `GetAuthStatusParams`, serializes them to JSON, and forwards method name plus params to `send_request`, returning the numeric request id.
+**Data flow**: It receives typed auth-status parameters, converts them to JSON, sends getAuthStatus, and returns the numeric request id so the test can wait for the reply.
 
-**Call relations**: Auth tests call this before waiting for a matching response with the generic stream readers.
+**Call relations**: Tests call this helper, and it delegates the common message writing to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3506,11 +3540,11 @@ async fn send_get_conversation_summary_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends a typed `getConversationSummary` request.
+**Purpose**: Asks the server for a conversation summary.
 
-**Data flow**: It serializes `GetConversationSummaryParams` and passes them to `send_request`, returning the assigned request id.
+**Data flow**: It receives summary lookup parameters, converts them to JSON, sends getConversationSummary, and returns the request id.
 
-**Call relations**: Tests that inspect persisted rollout summaries use this wrapper instead of constructing raw JSON manually.
+**Call relations**: Conversation-summary tests use this wrapper; it hands the actual JSON-RPC sending to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3521,11 +3555,11 @@ async fn send_get_conversation_summary_request(
 async fn send_get_account_rate_limits_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/rateLimits/read` with no params.
+**Purpose**: Asks the server to read account rate-limit information.
 
-**Data flow**: It calls `send_request` with the fixed method name and `None` params, returning the request id.
+**Data flow**: It sends account/rateLimits/read with no parameters and returns the request id.
 
-**Call relations**: This is a no-payload convenience wrapper over the generic request sender.
+**Call relations**: Tests use it as a named shortcut. The shared TestAppServer::send_request does the actual write.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -3539,11 +3573,11 @@ async fn send_consume_account_rate_limit_reset_credit_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/rateLimitResetCredit/consume` with typed params.
+**Purpose**: Asks the server to consume a rate-limit reset credit for an account.
 
-**Data flow**: It serializes `ConsumeAccountRateLimitResetCreditParams`, sends the request, and returns the request id.
+**Data flow**: It receives reset-credit parameters, serializes them to JSON, sends account/rateLimitResetCredit/consume, and returns the request id.
 
-**Call relations**: Higher-level test helpers call this when exercising reset-credit consumption flows.
+**Call relations**: Higher-level test helper send_consume_reset_credit calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (send_consume_reset_credit); 1 external calls (to_value).
 
@@ -3557,11 +3591,11 @@ async fn send_add_credits_nudge_email_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/sendAddCreditsNudgeEmail` with typed params.
+**Purpose**: Requests that the server send an add-credits nudge email.
 
-**Data flow**: It serializes `SendAddCreditsNudgeEmailParams`, forwards them to `send_request`, and returns the request id.
+**Data flow**: It converts the email-request parameters to JSON, sends account/sendAddCreditsNudgeEmail, and returns the request id.
 
-**Call relations**: Used by tests covering account-related nudging behavior.
+**Call relations**: Tests call this wrapper when checking account-credit behavior. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3575,11 +3609,11 @@ async fn send_get_account_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/read` with typed params.
+**Purpose**: Asks the server to read account details.
 
-**Data flow**: It serializes `GetAccountParams`, sends the request, and returns the request id.
+**Data flow**: It receives account-read parameters, serializes them, sends account/read, and returns the request id.
 
-**Call relations**: Provides a typed wrapper for account-read tests.
+**Call relations**: Account tests use this named wrapper, which forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3595,11 +3629,11 @@ async fn send_chatgpt_auth_tokens_login_request(
     ) -> anyhow::Result
 ```
 
-**Purpose**: Sends `account/login/start` using the `ChatgptAuthTokens` login variant.
+**Purpose**: Starts login using already available ChatGPT authentication tokens.
 
-**Data flow**: It takes an access token, ChatGPT account id, and optional plan type, constructs `LoginAccountParams::ChatgptAuthTokens`, serializes it, sends the request, and returns the request id.
+**Data flow**: It receives an access token, ChatGPT account id, and optional plan type, builds the login parameter object, sends account/login/start, and returns the request id.
 
-**Call relations**: Tests use this when they want to simulate login via already-issued ChatGPT auth tokens rather than API key or device-code flows.
+**Call relations**: Login tests use this for token-based ChatGPT login. The final write goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3613,11 +3647,11 @@ async fn send_feedback_upload_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `feedback/upload` with typed params.
+**Purpose**: Sends a feedback upload request to the server.
 
-**Data flow**: It serializes `FeedbackUploadParams`, forwards them to `send_request`, and returns the request id.
+**Data flow**: It serializes feedback parameters, sends feedback/upload, and returns the request id.
 
-**Call relations**: A straightforward typed request wrapper for feedback-upload tests.
+**Call relations**: Feedback tests call this wrapper; TestAppServer::send_request performs the shared JSON-RPC send.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3631,11 +3665,11 @@ async fn send_thread_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/start` with typed params.
+**Purpose**: Requests creation of a new conversation thread.
 
-**Data flow**: It serializes `ThreadStartParams`, sends the request, and returns the request id.
+**Data flow**: It converts thread-start parameters to JSON, sends thread/start, and returns the request id.
 
-**Call relations**: Many higher-level thread-start helpers in tests build on this low-level sender before waiting for responses and notifications.
+**Call relations**: Many higher-level test helpers for starting threads and turns call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 9 (start_thread, start_thread, start_turn, start_plan_mode_turn, start_default_thread, start_thread, start_thread, start_thread, run_environment_selection_case); 1 external calls (to_value).
 
@@ -3649,11 +3683,11 @@ async fn send_thread_resume_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/resume` with typed params.
+**Purpose**: Requests that the server resume an existing thread.
 
-**Data flow**: It serializes `ThreadResumeParams`, sends the request, and returns the request id.
+**Data flow**: It serializes resume parameters, sends thread/resume, and returns the request id.
 
-**Call relations**: Used by tests that reopen persisted threads.
+**Call relations**: Thread-resume tests use this wrapper, and the common send path is TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3667,11 +3701,11 @@ async fn send_thread_fork_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/fork` with typed params.
+**Purpose**: Requests a new thread fork from an existing thread.
 
-**Data flow**: It serializes `ThreadForkParams`, sends the request, and returns the request id.
+**Data flow**: It converts fork parameters to JSON, sends thread/fork, and returns the request id.
 
-**Call relations**: Fork-related test helpers call this before reading the corresponding response.
+**Call relations**: The fork_fake_rollout_thread helper calls this. It hands the message to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (fork_fake_rollout_thread); 1 external calls (to_value).
 
@@ -3685,11 +3719,11 @@ async fn send_thread_archive_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/archive` with typed params.
+**Purpose**: Requests that a thread be archived.
 
-**Data flow**: It serializes `ThreadArchiveParams`, sends the request, and returns the request id.
+**Data flow**: It serializes archive parameters, sends thread/archive, and returns the request id.
 
-**Call relations**: A typed wrapper for archive operations.
+**Call relations**: Thread archive tests call this named helper; it delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3703,11 +3737,11 @@ async fn send_thread_delete_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/delete` with typed params.
+**Purpose**: Requests deletion of a thread.
 
-**Data flow**: It serializes `ThreadDeleteParams`, sends the request, and returns the request id.
+**Data flow**: It converts delete parameters to JSON, sends thread/delete, and returns the request id.
 
-**Call relations**: Used by tests that verify deletion behavior.
+**Call relations**: Thread deletion tests use this wrapper, which uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3721,11 +3755,11 @@ async fn send_thread_set_name_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/name/set` with typed params.
+**Purpose**: Requests a name change for a thread.
 
-**Data flow**: It serializes `ThreadSetNameParams`, sends the request, and returns the request id.
+**Data flow**: It serializes name-setting parameters, sends thread/name/set, and returns the request id.
 
-**Call relations**: Supports tests around thread naming.
+**Call relations**: Thread metadata tests call this, and it forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3739,11 +3773,11 @@ async fn send_thread_metadata_update_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/metadata/update` with typed params.
+**Purpose**: Requests an update to a thread's metadata, meaning extra descriptive information stored with the thread.
 
-**Data flow**: It serializes `ThreadMetadataUpdateParams`, sends the request, and returns the request id.
+**Data flow**: It converts metadata update parameters to JSON, sends thread/metadata/update, and returns the request id.
 
-**Call relations**: Used when tests need to mutate thread metadata.
+**Call relations**: Tests use this wrapper when checking thread metadata behavior. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3757,11 +3791,11 @@ async fn send_thread_settings_update_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/settings/update` with typed params.
+**Purpose**: Requests a change to settings for a thread.
 
-**Data flow**: It serializes `ThreadSettingsUpdateParams`, sends the request, and returns the request id.
+**Data flow**: It serializes settings parameters, sends thread/settings/update, and returns the request id.
 
-**Call relations**: Higher-level helpers use this to exercise settings updates.
+**Call relations**: The send_thread_settings_update helper calls this. It delegates the wire work to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (send_thread_settings_update); 1 external calls (to_value).
 
@@ -3775,11 +3809,11 @@ async fn send_thread_unsubscribe_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/unsubscribe` with typed params.
+**Purpose**: Requests that the client stop receiving updates for a thread.
 
-**Data flow**: It serializes `ThreadUnsubscribeParams`, sends the request, and returns the request id.
+**Data flow**: It converts unsubscribe parameters to JSON, sends thread/unsubscribe, and returns the request id.
 
-**Call relations**: A typed wrapper for unsubscribe flows.
+**Call relations**: Thread subscription tests call this wrapper. The actual JSON-RPC write is shared through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3793,11 +3827,11 @@ async fn send_thread_unarchive_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/unarchive` with typed params.
+**Purpose**: Requests that an archived thread be restored.
 
-**Data flow**: It serializes `ThreadUnarchiveParams`, sends the request, and returns the request id.
+**Data flow**: It serializes unarchive parameters, sends thread/unarchive, and returns the request id.
 
-**Call relations**: Used by tests that restore archived threads.
+**Call relations**: Thread archive-state tests use this wrapper; it hands off to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3811,11 +3845,11 @@ async fn send_thread_compact_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/compact/start` with typed params.
+**Purpose**: Starts a thread compaction operation, which reduces stored context for a thread.
 
-**Data flow**: It serializes `ThreadCompactStartParams`, sends the request, and returns the request id.
+**Data flow**: It converts compaction parameters to JSON, sends thread/compact/start, and returns the request id.
 
-**Call relations**: Supports compaction-related tests.
+**Call relations**: Compaction tests use this and then wait for response or notifications through the read helpers. Sending goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3829,11 +3863,11 @@ async fn send_thread_shell_command_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/shellCommand` with typed params.
+**Purpose**: Requests a shell command associated with a thread.
 
-**Data flow**: It serializes `ThreadShellCommandParams`, sends the request, and returns the request id.
+**Data flow**: It serializes shell-command parameters, sends thread/shellCommand, and returns the request id.
 
-**Call relations**: Used when tests invoke shell-command behavior through the thread API.
+**Call relations**: Tests for thread shell behavior call this wrapper, which delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3847,11 +3881,11 @@ async fn send_thread_rollback_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/rollback` with typed params.
+**Purpose**: Requests that a thread roll back to an earlier point.
 
-**Data flow**: It serializes `ThreadRollbackParams`, sends the request, and returns the request id.
+**Data flow**: It converts rollback parameters to JSON, sends thread/rollback, and returns the request id.
 
-**Call relations**: A typed wrapper for rollback tests.
+**Call relations**: Rollback tests call this named helper. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3865,11 +3899,11 @@ async fn send_thread_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/list` with typed params.
+**Purpose**: Asks the server for a list of threads.
 
-**Data flow**: It serializes `ThreadListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes listing parameters, sends thread/list, and returns the request id.
 
-**Call relations**: List-thread helpers call this before reading and decoding the response.
+**Call relations**: Helpers such as list_threads, list_threads_for_parent, and list_threads_with_sort call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 3 (list_threads, list_threads_for_parent, list_threads_with_sort); 1 external calls (to_value).
 
@@ -3883,11 +3917,11 @@ async fn send_thread_search_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/search` with typed params.
+**Purpose**: Asks the server to search threads.
 
-**Data flow**: It serializes `ThreadSearchParams`, sends the request, and returns the request id.
+**Data flow**: It converts search parameters to JSON, sends thread/search, and returns the request id.
 
-**Call relations**: Used by tests covering thread search.
+**Call relations**: Search tests use this wrapper, and the message is written by TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3901,11 +3935,11 @@ async fn send_thread_loaded_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/loaded/list` with typed params.
+**Purpose**: Asks which threads are currently loaded by the server.
 
-**Data flow**: It serializes `ThreadLoadedListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes loaded-list parameters, sends thread/loaded/list, and returns the request id.
 
-**Call relations**: A typed wrapper for loaded-thread listing.
+**Call relations**: Tests call this when checking in-memory thread state. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3919,11 +3953,11 @@ async fn send_thread_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/read` with typed params.
+**Purpose**: Asks the server to read one thread's data.
 
-**Data flow**: It serializes `ThreadReadParams`, sends the request, and returns the request id.
+**Data flow**: It converts read parameters to JSON, sends thread/read, and returns the request id.
 
-**Call relations**: Read-thread helpers use this before waiting for the matching response.
+**Call relations**: The read_thread_with_turns helper calls this. It forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (read_thread_with_turns); 1 external calls (to_value).
 
@@ -3937,11 +3971,11 @@ async fn send_thread_turns_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/turns/list` with typed params.
+**Purpose**: Asks the server for the list of turns in a thread. A turn is one exchange or unit of work in a conversation.
 
-**Data flow**: It serializes `ThreadTurnsListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes turn-list parameters, sends thread/turns/list, and returns the request id.
 
-**Call relations**: Used by tests that inspect turn lists.
+**Call relations**: The read_single_turn_items_view helper calls this. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (read_single_turn_items_view); 1 external calls (to_value).
 
@@ -3955,11 +3989,11 @@ async fn send_thread_turns_items_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/turns/items/list` with typed params.
+**Purpose**: Asks the server for the items inside thread turns.
 
-**Data flow**: It serializes `ThreadTurnsItemsListParams`, sends the request, and returns the request id.
+**Data flow**: It converts item-list parameters to JSON, sends thread/turns/items/list, and returns the request id.
 
-**Call relations**: A typed wrapper for turn-item listing.
+**Call relations**: Tests use this wrapper when they need detailed turn contents. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3973,11 +4007,11 @@ async fn send_list_models_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `model/list` with typed params.
+**Purpose**: Asks the server which models are available.
 
-**Data flow**: It serializes `ModelListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes model-list parameters, sends model/list, and returns the request id.
 
-**Call relations**: Used by model-listing tests.
+**Call relations**: Model-list tests call this wrapper; TestAppServer::send_request handles the common send mechanics.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -3991,11 +4025,11 @@ async fn send_model_provider_capabilities_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `modelProvider/capabilities/read` with typed params.
+**Purpose**: Asks what a model provider can do, such as supported features or limits.
 
-**Data flow**: It serializes `ModelProviderCapabilitiesReadParams`, sends the request, and returns the request id.
+**Data flow**: It converts provider-capability parameters to JSON, sends modelProvider/capabilities/read, and returns the request id.
 
-**Call relations**: Supports tests that inspect provider capability metadata.
+**Call relations**: Capability tests use this named helper, which forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4009,11 +4043,11 @@ async fn send_experimental_feature_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `experimentalFeature/list` with typed params.
+**Purpose**: Asks the server to list experimental features.
 
-**Data flow**: It serializes `ExperimentalFeatureListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes feature-list parameters, sends experimentalFeature/list, and returns the request id.
 
-**Call relations**: Used by tests around experimental feature visibility.
+**Call relations**: Experimental-feature tests call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4027,11 +4061,11 @@ async fn send_permission_profile_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `permissionProfile/list` with typed params.
+**Purpose**: Asks the server for available permission profiles, which describe what actions are allowed.
 
-**Data flow**: It serializes `PermissionProfileListParams`, sends the request, and returns the request id.
+**Data flow**: It converts permission-profile parameters to JSON, sends permissionProfile/list, and returns the request id.
 
-**Call relations**: A typed wrapper for permission-profile listing.
+**Call relations**: Permission tests use this wrapper. The actual write goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4045,11 +4079,11 @@ async fn send_experimental_feature_enablement_set_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `experimentalFeature/enablement/set` with typed params.
+**Purpose**: Requests that an experimental feature be enabled or disabled.
 
-**Data flow**: It serializes `ExperimentalFeatureEnablementSetParams`, sends the request, and returns the request id.
+**Data flow**: It serializes enablement parameters, sends experimentalFeature/enablement/set, and returns the request id.
 
-**Call relations**: Higher-level helpers use this to toggle experimental features during tests.
+**Call relations**: The set_experimental_feature_enablement helper calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (set_experimental_feature_enablement); 1 external calls (to_value).
 
@@ -4060,11 +4094,11 @@ async fn send_experimental_feature_enablement_set_request(
 async fn send_remote_control_enable_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/enable` with no params.
+**Purpose**: Requests persistent remote-control enablement.
 
-**Data flow**: It calls `send_request` with the fixed method and `None`, returning the request id.
+**Data flow**: It sends remoteControl/enable with no parameters and returns the request id.
 
-**Call relations**: A convenience wrapper for persisted remote-control enablement.
+**Call relations**: Remote-control tests use this shortcut, which relies on TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -4075,11 +4109,11 @@ async fn send_remote_control_enable_request(&mut self) -> anyhow::Result<i64>
 async fn send_remote_control_ephemeral_enable_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/enable` with `{ "ephemeral": true }` to request runtime-only enablement.
+**Purpose**: Requests remote-control enablement for only the current runtime session.
 
-**Data flow**: It constructs a small JSON object with `ephemeral: true`, sends it via `send_request`, and returns the request id.
+**Data flow**: It builds JSON with ephemeral set to true, sends remoteControl/enable, and returns the request id.
 
-**Call relations**: Used by tests that distinguish ephemeral from persisted remote-control state.
+**Call relations**: Remote-control tests call this when they do not want the setting persisted. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (json!).
 
@@ -4090,11 +4124,11 @@ async fn send_remote_control_ephemeral_enable_request(&mut self) -> anyhow::Resu
 async fn send_remote_control_disable_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/disable` with no params.
+**Purpose**: Requests persistent remote-control disablement.
 
-**Data flow**: It calls `send_request` with the fixed method and no params, returning the request id.
+**Data flow**: It sends remoteControl/disable with no parameters and returns the request id.
 
-**Call relations**: A convenience wrapper for persisted disablement.
+**Call relations**: Remote-control tests use this shortcut. The message is sent by TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -4105,11 +4139,11 @@ async fn send_remote_control_disable_request(&mut self) -> anyhow::Result<i64>
 async fn send_remote_control_ephemeral_disable_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/disable` with `{ "ephemeral": true }` for runtime-only disablement.
+**Purpose**: Requests remote-control disablement for only the current runtime session.
 
-**Data flow**: It constructs the ephemeral JSON payload, sends it, and returns the request id.
+**Data flow**: It builds JSON with ephemeral set to true, sends remoteControl/disable, and returns the request id.
 
-**Call relations**: Used by tests that verify temporary disable behavior.
+**Call relations**: Remote-control tests call this for temporary disable behavior. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (json!).
 
@@ -4120,11 +4154,11 @@ async fn send_remote_control_ephemeral_disable_request(&mut self) -> anyhow::Res
 async fn send_remote_control_status_read_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/status/read` with no params.
+**Purpose**: Asks the server for the current remote-control status.
 
-**Data flow**: It calls `send_request` with the fixed method and `None`, returning the request id.
+**Data flow**: It sends remoteControl/status/read with no parameters and returns the request id.
 
-**Call relations**: A no-payload wrapper for status reads.
+**Call relations**: Status tests call this wrapper, which delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -4138,11 +4172,11 @@ async fn send_remote_control_pairing_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/pairing/start` with typed params.
+**Purpose**: Starts remote-control pairing, the process of linking another client.
 
-**Data flow**: It serializes `RemoteControlPairingStartParams`, sends the request, and returns the request id.
+**Data flow**: It serializes pairing-start parameters, sends remoteControl/pairing/start, and returns the request id.
 
-**Call relations**: Used by pairing-flow tests.
+**Call relations**: Pairing tests use this helper and then wait for responses through the stream-reading helpers.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4156,11 +4190,11 @@ async fn send_remote_control_pairing_status_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/pairing/status` with typed params.
+**Purpose**: Asks for the status of a remote-control pairing attempt.
 
-**Data flow**: It serializes `RemoteControlPairingStatusParams`, sends the request, and returns the request id.
+**Data flow**: It converts pairing-status parameters to JSON, sends remoteControl/pairing/status, and returns the request id.
 
-**Call relations**: A typed wrapper for pairing-status polling.
+**Call relations**: Pairing tests call this after starting pairing. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4174,11 +4208,11 @@ async fn send_remote_control_clients_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/client/list` with typed params.
+**Purpose**: Asks the server for paired remote-control clients.
 
-**Data flow**: It serializes `RemoteControlClientsListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes client-list parameters, sends remoteControl/client/list, and returns the request id.
 
-**Call relations**: Used by tests that inspect paired clients.
+**Call relations**: Remote-control client tests use this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4192,11 +4226,11 @@ async fn send_remote_control_clients_revoke_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `remoteControl/client/revoke` with typed params.
+**Purpose**: Requests that a remote-control client be revoked.
 
-**Data flow**: It serializes `RemoteControlClientsRevokeParams`, sends the request, and returns the request id.
+**Data flow**: It converts revoke parameters to JSON, sends remoteControl/client/revoke, and returns the request id.
 
-**Call relations**: A typed wrapper for client revocation.
+**Call relations**: Remote-control revoke tests call this. The actual send goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4207,11 +4241,11 @@ async fn send_remote_control_clients_revoke_request(
 async fn send_apps_list_request(&mut self, params: AppsListParams) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `app/list` with typed params.
+**Purpose**: Asks the server for the list of available apps.
 
-**Data flow**: It serializes `AppsListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes app-list parameters, sends app/list, and returns the request id.
 
-**Call relations**: Used directly and by cache-warming helpers that need to trigger app discovery.
+**Call relations**: The warm_app_directory_cache helper calls this. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (warm_app_directory_cache); 1 external calls (to_value).
 
@@ -4225,11 +4259,11 @@ async fn send_mcp_resource_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `mcpServer/resource/read` with typed params.
+**Purpose**: Requests a resource from an MCP server. MCP is a tool/resource protocol used by connected services.
 
-**Data flow**: It serializes `McpResourceReadParams`, sends the request, and returns the request id.
+**Data flow**: It converts resource-read parameters to JSON, sends mcpServer/resource/read, and returns the request id.
 
-**Call relations**: Supports MCP resource-read tests.
+**Call relations**: MCP resource tests use this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4243,11 +4277,11 @@ async fn send_mcp_server_tool_call_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `mcpServer/tool/call` with typed params.
+**Purpose**: Requests a tool call on an MCP server.
 
-**Data flow**: It serializes `McpServerToolCallParams`, sends the request, and returns the request id.
+**Data flow**: It serializes tool-call parameters, sends mcpServer/tool/call, and returns the request id.
 
-**Call relations**: Used by tests that invoke MCP tools through the server.
+**Call relations**: MCP tool tests call this helper and use the read helpers to inspect the result.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4261,11 +4295,11 @@ async fn send_skills_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `skills/list` with typed params.
+**Purpose**: Asks the server to list available skills.
 
-**Data flow**: It serializes `SkillsListParams`, sends the request, and returns the request id.
+**Data flow**: It converts skill-list parameters to JSON, sends skills/list, and returns the request id.
 
-**Call relations**: A typed wrapper for skills listing.
+**Call relations**: Skill tests use this wrapper, which forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4279,11 +4313,11 @@ async fn send_skills_extra_roots_set_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `skills/extraRoots/set` with typed params.
+**Purpose**: Sets extra filesystem roots where the server should look for skills.
 
-**Data flow**: It serializes `SkillsExtraRootsSetParams`, sends the request, and returns the request id.
+**Data flow**: It serializes extra-root parameters, sends skills/extraRoots/set, and returns the request id.
 
-**Call relations**: Used by tests that alter skill search roots.
+**Call relations**: Skill discovery tests call this. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4297,11 +4331,11 @@ async fn send_hooks_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `hooks/list` with typed params.
+**Purpose**: Asks the server to list configured hooks. Hooks are actions that run at specific moments.
 
-**Data flow**: It serializes `HooksListParams`, sends the request, and returns the request id.
+**Data flow**: It converts hook-list parameters to JSON, sends hooks/list, and returns the request id.
 
-**Call relations**: A typed wrapper for hook-listing tests.
+**Call relations**: Hook tests call this wrapper. The common send path is TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4315,11 +4349,11 @@ async fn send_marketplace_add_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `marketplace/add` with typed params.
+**Purpose**: Requests that a marketplace item be added.
 
-**Data flow**: It serializes `MarketplaceAddParams`, sends the request, and returns the request id.
+**Data flow**: It serializes marketplace-add parameters, sends marketplace/add, and returns the request id.
 
-**Call relations**: Used by marketplace-add tests.
+**Call relations**: Marketplace tests use this helper; TestAppServer::send_request writes the message.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4333,11 +4367,11 @@ async fn send_marketplace_remove_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `marketplace/remove` with typed params.
+**Purpose**: Requests that a marketplace item be removed.
 
-**Data flow**: It serializes `MarketplaceRemoveParams`, sends the request, and returns the request id.
+**Data flow**: It converts remove parameters to JSON, sends marketplace/remove, and returns the request id.
 
-**Call relations**: A typed wrapper for marketplace removal.
+**Call relations**: Marketplace tests call this named wrapper, which delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4351,11 +4385,11 @@ async fn send_marketplace_upgrade_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `marketplace/upgrade` with typed params.
+**Purpose**: Requests an upgrade for a marketplace item.
 
-**Data flow**: It serializes `MarketplaceUpgradeParams`, sends the request, and returns the request id.
+**Data flow**: It serializes upgrade parameters, sends marketplace/upgrade, and returns the request id.
 
-**Call relations**: Higher-level marketplace-upgrade helpers build on this sender.
+**Call relations**: The send_marketplace_upgrade helper calls this. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (send_marketplace_upgrade); 1 external calls (to_value).
 
@@ -4369,11 +4403,11 @@ async fn send_plugin_install_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/install` with typed params.
+**Purpose**: Requests installation of a plugin.
 
-**Data flow**: It serializes `PluginInstallParams`, sends the request, and returns the request id.
+**Data flow**: It converts plugin-install parameters to JSON, sends plugin/install, and returns the request id.
 
-**Call relations**: Used directly and by remote-plugin-install helpers.
+**Call relations**: The send_remote_plugin_install_request helper calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (send_remote_plugin_install_request); 1 external calls (to_value).
 
@@ -4387,11 +4421,11 @@ async fn send_plugin_uninstall_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/uninstall` with typed params.
+**Purpose**: Requests removal of a plugin.
 
-**Data flow**: It serializes `PluginUninstallParams`, sends the request, and returns the request id.
+**Data flow**: It serializes uninstall parameters, sends plugin/uninstall, and returns the request id.
 
-**Call relations**: A typed wrapper for uninstall tests.
+**Call relations**: Plugin tests use this wrapper, and the shared sender writes the JSON-RPC message.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4405,11 +4439,11 @@ async fn send_plugin_list_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/list` with typed params.
+**Purpose**: Asks the server to list plugins.
 
-**Data flow**: It serializes `PluginListParams`, sends the request, and returns the request id.
+**Data flow**: It converts plugin-list parameters to JSON, sends plugin/list, and returns the request id.
 
-**Call relations**: Used by plugin-listing tests.
+**Call relations**: Plugin listing tests call this helper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4423,11 +4457,11 @@ async fn send_plugin_installed_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/installed` with typed params.
+**Purpose**: Asks the server which plugins are installed.
 
-**Data flow**: It serializes `PluginInstalledParams`, sends the request, and returns the request id.
+**Data flow**: It serializes installed-plugin parameters, sends plugin/installed, and returns the request id.
 
-**Call relations**: A typed wrapper for installed-plugin queries.
+**Call relations**: Plugin state tests use this wrapper. It hands off to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4441,11 +4475,11 @@ async fn send_plugin_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/read` with typed params.
+**Purpose**: Requests detailed information about a plugin.
 
-**Data flow**: It serializes `PluginReadParams`, sends the request, and returns the request id.
+**Data flow**: It converts plugin-read parameters to JSON, sends plugin/read, and returns the request id.
 
-**Call relations**: Used by plugin-read tests.
+**Call relations**: Plugin detail tests call this. The common send function writes the message.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4459,11 +4493,11 @@ async fn send_plugin_skill_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `plugin/skill/read` with typed params.
+**Purpose**: Requests detailed information about a skill provided by a plugin.
 
-**Data flow**: It serializes `PluginSkillReadParams`, sends the request, and returns the request id.
+**Data flow**: It serializes plugin-skill parameters, sends plugin/skill/read, and returns the request id.
 
-**Call relations**: A typed wrapper for plugin-skill reads.
+**Call relations**: Plugin skill tests use this wrapper; it delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4477,11 +4511,11 @@ async fn send_list_mcp_server_status_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `mcpServerStatus/list` with typed params.
+**Purpose**: Asks for the status of configured MCP servers.
 
-**Data flow**: It serializes `ListMcpServerStatusParams`, sends the request, and returns the request id.
+**Data flow**: It converts status-list parameters to JSON, sends mcpServerStatus/list, and returns the request id.
 
-**Call relations**: Higher-level helpers use this to inspect MCP server status names and metadata.
+**Call relations**: The mcp_server_names helper calls this. It forwards to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (mcp_server_names); 1 external calls (to_value).
 
@@ -4496,11 +4530,11 @@ async fn send_raw_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends an arbitrary JSON-RPC request method with caller-supplied raw params for protocol-level validation tests.
+**Purpose**: Sends a JSON-RPC request with raw JSON parameters. Tests use it when they intentionally want malformed or unusual input.
 
-**Data flow**: It takes a method string and optional `serde_json::Value`, forwards them directly to `send_request`, and returns the request id.
+**Data flow**: It receives a method name and optional raw JSON parameters, sends them unchanged, and returns the request id.
 
-**Call relations**: This bypasses typed protocol structs when tests intentionally want malformed or edge-case payloads.
+**Call relations**: Protocol validation tests use this to bypass typed parameter construction. It still relies on TestAppServer::send_request for writing.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -4514,11 +4548,11 @@ async fn send_list_collaboration_modes_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `collaborationMode/list` with typed params.
+**Purpose**: Asks the server for available collaboration modes.
 
-**Data flow**: It serializes `CollaborationModeListParams`, sends the request, and returns the request id.
+**Data flow**: It serializes collaboration-mode parameters, sends collaborationMode/list, and returns the request id.
 
-**Call relations**: A typed wrapper for collaboration-mode listing.
+**Call relations**: Collaboration tests call this wrapper. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4532,11 +4566,11 @@ async fn send_mock_experimental_method_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `mock/experimentalMethod` with typed params.
+**Purpose**: Sends a mock experimental request used by tests of experimental API behavior.
 
-**Data flow**: It serializes `MockExperimentalMethodParams`, sends the request, and returns the request id.
+**Data flow**: It converts mock parameters to JSON, sends mock/experimentalMethod, and returns the request id.
 
-**Call relations**: Used by tests that exercise experimental-method plumbing.
+**Call relations**: Experimental protocol tests use this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4550,11 +4584,11 @@ async fn send_thread_memory_mode_set_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the experimental v2 `thread/memoryMode/set` request.
+**Purpose**: Requests a memory-mode change for a thread.
 
-**Data flow**: It serializes `ThreadMemoryModeSetParams`, sends the request, and returns the request id.
+**Data flow**: It serializes memory-mode parameters, sends thread/memoryMode/set, and returns the request id.
 
-**Call relations**: Supports tests around memory-mode changes.
+**Call relations**: Thread memory tests call this wrapper, and TestAppServer::send_request sends the JSON-RPC request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4568,11 +4602,11 @@ async fn send_turn_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `turn/start` request.
+**Purpose**: Starts a new turn in a thread.
 
-**Data flow**: It serializes `TurnStartParams`, sends the request, and returns the request id.
+**Data flow**: It converts turn-start parameters to JSON, sends turn/start, and returns the request id.
 
-**Call relations**: Many turn-driving helpers call this before waiting for turn lifecycle notifications.
+**Call relations**: Helpers such as send_turn_and_wait, start_turn, and start_plan_mode_turn call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 6 (send_turn_and_wait, start_turn, start_plan_mode_turn, materialize_thread_rollout, start_text_turn, run_environment_selection_case); 1 external calls (to_value).
 
@@ -4586,11 +4620,11 @@ async fn send_thread_inject_items_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/inject_items` request.
+**Purpose**: Injects items into a thread, usually to set up a test state.
 
-**Data flow**: It serializes `ThreadInjectItemsParams`, sends the request, and returns the request id.
+**Data flow**: It serializes injection parameters, sends thread/inject_items, and returns the request id.
 
-**Call relations**: Used by tests that inject items into a thread.
+**Call relations**: Tests use this to seed thread contents. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4604,11 +4638,11 @@ async fn send_command_exec_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `command/exec` request.
+**Purpose**: Requests execution of a command through the newer command API.
 
-**Data flow**: It serializes `CommandExecParams`, sends the request, and returns the request id.
+**Data flow**: It converts command-exec parameters to JSON, sends command/exec, and returns the request id.
 
-**Call relations**: A typed wrapper for command execution tests.
+**Call relations**: Command execution tests call this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4622,11 +4656,11 @@ async fn send_process_spawn_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `process/spawn` request.
+**Purpose**: Requests that the server spawn a process.
 
-**Data flow**: It serializes `ProcessSpawnParams`, sends the request, and returns the request id.
+**Data flow**: It serializes process-spawn parameters, sends process/spawn, and returns the request id.
 
-**Call relations**: Used by tests that exercise lower-level process APIs.
+**Call relations**: Process API tests use this helper, with responses and notifications read later through stream helpers.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4640,11 +4674,11 @@ async fn send_process_write_stdin_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `process/writeStdin` request.
+**Purpose**: Writes input to a spawned process through the server.
 
-**Data flow**: It serializes `ProcessWriteStdinParams`, sends the request, and returns the request id.
+**Data flow**: It converts stdin-write parameters to JSON, sends process/writeStdin, and returns the request id.
 
-**Call relations**: A typed wrapper for writing to spawned processes.
+**Call relations**: Process interaction tests call this after spawning a process. It sends through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4658,11 +4692,11 @@ async fn send_process_resize_pty_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `process/resizePty` request.
+**Purpose**: Requests a resize of a process pseudo-terminal. A pseudo-terminal is a terminal-like interface for interactive programs.
 
-**Data flow**: It serializes `ProcessResizePtyParams`, sends the request, and returns the request id.
+**Data flow**: It serializes resize parameters, sends process/resizePty, and returns the request id.
 
-**Call relations**: Used by PTY-resize tests.
+**Call relations**: Interactive process tests use this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4676,11 +4710,11 @@ async fn send_process_kill_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `process/kill` request.
+**Purpose**: Requests termination of a spawned process.
 
-**Data flow**: It serializes `ProcessKillParams`, sends the request, and returns the request id.
+**Data flow**: It converts kill parameters to JSON, sends process/kill, and returns the request id.
 
-**Call relations**: A typed wrapper for process termination tests.
+**Call relations**: Process lifecycle tests call this. The common sender writes the message.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4694,11 +4728,11 @@ async fn send_command_exec_write_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `command/exec/write` request.
+**Purpose**: Writes input to a running command execution.
 
-**Data flow**: It serializes `CommandExecWriteParams`, sends the request, and returns the request id.
+**Data flow**: It serializes command-write parameters, sends command/exec/write, and returns the request id.
 
-**Call relations**: Used by tests that stream input into command executions.
+**Call relations**: Command execution tests use this after starting a command. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4712,11 +4746,11 @@ async fn send_command_exec_resize_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `command/exec/resize` request.
+**Purpose**: Requests a terminal resize for a running command execution.
 
-**Data flow**: It serializes `CommandExecResizeParams`, sends the request, and returns the request id.
+**Data flow**: It converts resize parameters to JSON, sends command/exec/resize, and returns the request id.
 
-**Call relations**: A typed wrapper for command-exec PTY resizing.
+**Call relations**: Command terminal tests call this wrapper. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4730,11 +4764,11 @@ async fn send_command_exec_terminate_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `command/exec/terminate` request.
+**Purpose**: Requests termination of a running command execution.
 
-**Data flow**: It serializes `CommandExecTerminateParams`, sends the request, and returns the request id.
+**Data flow**: It serializes termination parameters, sends command/exec/terminate, and returns the request id.
 
-**Call relations**: Used by tests that terminate command executions.
+**Call relations**: Command lifecycle tests call this. The request goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4748,11 +4782,11 @@ async fn send_turn_interrupt_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `turn/interrupt` request.
+**Purpose**: Requests that an in-flight turn be interrupted.
 
-**Data flow**: It serializes `TurnInterruptParams`, sends the request, and returns the request id.
+**Data flow**: It converts interrupt parameters to JSON, sends turn/interrupt, and returns the request id.
 
-**Call relations**: The cleanup helper `interrupt_turn_and_wait_for_aborted` uses this as its first step.
+**Call relations**: TestAppServer::interrupt_turn_and_wait_for_aborted calls this as the first cleanup step for a running turn.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (interrupt_turn_and_wait_for_aborted); 1 external calls (to_value).
 
@@ -4766,11 +4800,11 @@ async fn send_thread_realtime_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/realtime/start` request.
+**Purpose**: Starts a realtime session for a thread.
 
-**Data flow**: It serializes `ThreadRealtimeStartParams`, sends the request, and returns the request id.
+**Data flow**: It serializes realtime-start parameters, sends thread/realtime/start, and returns the request id.
 
-**Call relations**: Used by realtime-session startup helpers.
+**Call relations**: The start_webrtc_realtime_with_codex_responses_as_items helper calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (start_webrtc_realtime_with_codex_responses_as_items); 1 external calls (to_value).
 
@@ -4784,11 +4818,11 @@ async fn send_thread_realtime_append_audio_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/realtime/appendAudio` request.
+**Purpose**: Adds audio data to a realtime thread session.
 
-**Data flow**: It serializes `ThreadRealtimeAppendAudioParams`, sends the request, and returns the request id.
+**Data flow**: It converts audio parameters to JSON, sends thread/realtime/appendAudio, and returns the request id.
 
-**Call relations**: Realtime append-audio helpers call this.
+**Call relations**: The append_audio helper calls this during realtime tests. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (append_audio); 1 external calls (to_value).
 
@@ -4802,11 +4836,11 @@ async fn send_thread_realtime_append_text_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/realtime/appendText` request.
+**Purpose**: Adds text to a realtime thread session.
 
-**Data flow**: It serializes `ThreadRealtimeAppendTextParams`, sends the request, and returns the request id.
+**Data flow**: It serializes text parameters, sends thread/realtime/appendText, and returns the request id.
 
-**Call relations**: Realtime append-text helpers call this.
+**Call relations**: The append_text helper calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (append_text); 1 external calls (to_value).
 
@@ -4820,11 +4854,11 @@ async fn send_thread_realtime_append_speech_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/realtime/appendSpeech` request.
+**Purpose**: Adds speech input metadata or content to a realtime thread session.
 
-**Data flow**: It serializes `ThreadRealtimeAppendSpeechParams`, sends the request, and returns the request id.
+**Data flow**: It converts speech parameters to JSON, sends thread/realtime/appendSpeech, and returns the request id.
 
-**Call relations**: Realtime append-speech helpers call this.
+**Call relations**: The append_speech helper calls this during realtime tests. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (append_speech); 1 external calls (to_value).
 
@@ -4838,11 +4872,11 @@ async fn send_thread_realtime_stop_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `thread/realtime/stop` request.
+**Purpose**: Stops a realtime thread session.
 
-**Data flow**: It serializes `ThreadRealtimeStopParams`, sends the request, and returns the request id.
+**Data flow**: It serializes stop parameters, sends thread/realtime/stop, and returns the request id.
 
-**Call relations**: Used by realtime-stop tests.
+**Call relations**: Realtime tests call this when ending a session. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4856,11 +4890,11 @@ async fn send_thread_realtime_list_voices_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `thread/realtime/listVoices` with typed params.
+**Purpose**: Asks the realtime API which voices are available.
 
-**Data flow**: It serializes `ThreadRealtimeListVoicesParams`, sends the request, and returns the request id.
+**Data flow**: It converts list-voices parameters to JSON, sends thread/realtime/listVoices, and returns the request id.
 
-**Call relations**: A typed wrapper for realtime voice-list queries.
+**Call relations**: Realtime voice tests use this wrapper, which writes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4876,11 +4910,11 @@ async fn interrupt_turn_and_wait_for_aborted(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs deterministic cleanup of an in-flight turn by sending `turn/interrupt` and waiting for both the interrupt response and a terminal `turn/completed` notification, tolerating races where completion is already buffered.
+**Purpose**: Cleanly interrupts a running turn and waits until the server confirms that the turn is finished. This prevents flaky tests caused by background work leaking into teardown.
 
-**Data flow**: It takes thread id, turn id, and a read timeout. It sends `turn/interrupt`, waits up to the timeout for the matching response, and if that times out checks `pending_turn_completed_notification` to treat an already-buffered terminal notification as success. It then waits similarly for a `turn/completed` notification, again accepting a buffered matching completion on timeout, and returns `Ok(())` once terminal cleanup is confirmed.
+**Data flow**: It receives a thread id, turn id, and timeout. It sends turn/interrupt, waits for the interrupt response, then waits for a turn/completed notification, accepting an already buffered matching completion if a race happened.
 
-**Call relations**: Tests call this at teardown after intentionally leaving work in flight. It orchestrates `send_turn_interrupt_request`, `read_stream_until_response_message`, `read_stream_until_notification_message`, and the buffered-message predicate helper to avoid flaky races.
+**Call relations**: Tests call this during cleanup for intentionally in-flight turns. It uses TestAppServer::send_turn_interrupt_request, TestAppServer::read_stream_until_response_message, TestAppServer::read_stream_until_notification_message, and TestAppServer::pending_turn_completed_notification.
 
 *Call graph*: calls 4 internal fn (pending_turn_completed_notification, read_stream_until_notification_message, read_stream_until_response_message, send_turn_interrupt_request); 2 external calls (Integer, timeout).
 
@@ -4894,11 +4928,11 @@ async fn send_turn_steer_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `turn/steer` request.
+**Purpose**: Sends steering input to an active turn, meaning extra guidance while work is running.
 
-**Data flow**: It serializes `TurnSteerParams`, sends the request, and returns the request id.
+**Data flow**: It serializes steering parameters, sends turn/steer, and returns the request id.
 
-**Call relations**: Used by tests that steer an active turn.
+**Call relations**: Turn-steering tests use this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4912,11 +4946,11 @@ async fn send_review_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends the v2 `review/start` request.
+**Purpose**: Starts a review operation through the server.
 
-**Data flow**: It serializes `ReviewStartParams`, sends the request, and returns the request id.
+**Data flow**: It converts review-start parameters to JSON, sends review/start, and returns the request id.
 
-**Call relations**: A typed wrapper for review-start flows.
+**Call relations**: Review tests call this helper and then read the server response or notifications.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4930,11 +4964,11 @@ async fn send_windows_sandbox_setup_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `windowsSandbox/setupStart` with typed params.
+**Purpose**: Starts Windows sandbox setup through the server.
 
-**Data flow**: It serializes `WindowsSandboxSetupStartParams`, sends the request, and returns the request id.
+**Data flow**: It serializes sandbox setup parameters, sends windowsSandbox/setupStart, and returns the request id.
 
-**Call relations**: Used by Windows sandbox setup tests.
+**Call relations**: Windows sandbox tests use this wrapper. It sends through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4948,11 +4982,11 @@ async fn send_config_read_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `config/read` with typed params.
+**Purpose**: Asks the server to read configuration values.
 
-**Data flow**: It serializes `ConfigReadParams`, sends the request, and returns the request id.
+**Data flow**: It converts config-read parameters to JSON, sends config/read, and returns the request id.
 
-**Call relations**: Higher-level config-read helpers use this sender.
+**Call relations**: The read_config helper calls this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (read_config); 1 external calls (to_value).
 
@@ -4963,11 +4997,11 @@ async fn send_config_read_request(
 async fn send_config_requirements_read_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `configRequirements/read` with no params.
+**Purpose**: Asks the server to read configuration requirements.
 
-**Data flow**: It calls `send_request` with the fixed method and `None`, returning the request id.
+**Data flow**: It sends configRequirements/read with no parameters and returns the request id.
 
-**Call relations**: A convenience wrapper for requirements reads.
+**Call relations**: Configuration requirement tests call this shortcut. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -4981,11 +5015,11 @@ async fn send_config_value_write_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `config/value/write` with typed params.
+**Purpose**: Requests writing one configuration value.
 
-**Data flow**: It serializes `ConfigValueWriteParams`, sends the request, and returns the request id.
+**Data flow**: It serializes config-write parameters, sends config/value/write, and returns the request id.
 
-**Call relations**: Used by config mutation tests.
+**Call relations**: Configuration write tests call this wrapper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -4999,11 +5033,11 @@ async fn send_config_batch_write_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `config/batchWrite` with typed params.
+**Purpose**: Requests writing several configuration values at once.
 
-**Data flow**: It serializes `ConfigBatchWriteParams`, sends the request, and returns the request id.
+**Data flow**: It converts batch-write parameters to JSON, sends config/batchWrite, and returns the request id.
 
-**Call relations**: A typed wrapper for batch config writes.
+**Call relations**: Batch configuration tests use this helper. The common sender writes the request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5017,11 +5051,11 @@ async fn send_fs_read_file_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/readFile` with typed params.
+**Purpose**: Asks the server to read a file.
 
-**Data flow**: It serializes `FsReadFileParams`, sends the request, and returns the request id.
+**Data flow**: It serializes file-read parameters, sends fs/readFile, and returns the request id.
 
-**Call relations**: Used by filesystem read tests.
+**Call relations**: Filesystem tests call this wrapper and read the response through the stream helpers.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5035,11 +5069,11 @@ async fn send_fs_write_file_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/writeFile` with typed params.
+**Purpose**: Asks the server to write a file.
 
-**Data flow**: It serializes `FsWriteFileParams`, sends the request, and returns the request id.
+**Data flow**: It converts file-write parameters to JSON, sends fs/writeFile, and returns the request id.
 
-**Call relations**: A typed wrapper for file-write tests.
+**Call relations**: Filesystem write tests use this helper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5053,11 +5087,11 @@ async fn send_fs_create_directory_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/createDirectory` with typed params.
+**Purpose**: Asks the server to create a directory.
 
-**Data flow**: It serializes `FsCreateDirectoryParams`, sends the request, and returns the request id.
+**Data flow**: It serializes create-directory parameters, sends fs/createDirectory, and returns the request id.
 
-**Call relations**: Used by directory-creation tests.
+**Call relations**: Filesystem tests call this wrapper. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5071,11 +5105,11 @@ async fn send_fs_get_metadata_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/getMetadata` with typed params.
+**Purpose**: Asks the server for metadata about a filesystem path, such as whether it is a file or directory.
 
-**Data flow**: It serializes `FsGetMetadataParams`, sends the request, and returns the request id.
+**Data flow**: It converts metadata parameters to JSON, sends fs/getMetadata, and returns the request id.
 
-**Call relations**: A typed wrapper for metadata queries.
+**Call relations**: Filesystem metadata tests call this helper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5089,11 +5123,11 @@ async fn send_fs_read_directory_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/readDirectory` with typed params.
+**Purpose**: Asks the server to list a directory.
 
-**Data flow**: It serializes `FsReadDirectoryParams`, sends the request, and returns the request id.
+**Data flow**: It serializes directory-read parameters, sends fs/readDirectory, and returns the request id.
 
-**Call relations**: Used by directory-listing tests.
+**Call relations**: Filesystem listing tests use this wrapper. The common sender writes the request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5104,11 +5138,11 @@ async fn send_fs_read_directory_request(
 async fn send_fs_remove_request(&mut self, params: FsRemoveParams) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/remove` with typed params.
+**Purpose**: Asks the server to remove a file or directory.
 
-**Data flow**: It serializes `FsRemoveParams`, sends the request, and returns the request id.
+**Data flow**: It converts remove parameters to JSON, sends fs/remove, and returns the request id.
 
-**Call relations**: A typed wrapper for remove operations.
+**Call relations**: Filesystem removal tests call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5119,11 +5153,11 @@ async fn send_fs_remove_request(&mut self, params: FsRemoveParams) -> anyhow::Re
 async fn send_fs_copy_request(&mut self, params: FsCopyParams) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/copy` with typed params.
+**Purpose**: Asks the server to copy a file or directory.
 
-**Data flow**: It serializes `FsCopyParams`, sends the request, and returns the request id.
+**Data flow**: It serializes copy parameters, sends fs/copy, and returns the request id.
 
-**Call relations**: Used by filesystem copy tests.
+**Call relations**: Filesystem copy tests use this wrapper. It sends through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5134,11 +5168,11 @@ async fn send_fs_copy_request(&mut self, params: FsCopyParams) -> anyhow::Result
 async fn send_fs_watch_request(&mut self, params: FsWatchParams) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/watch` with typed params.
+**Purpose**: Asks the server to watch a filesystem path for changes.
 
-**Data flow**: It serializes `FsWatchParams`, sends the request, and returns the request id.
+**Data flow**: It converts watch parameters to JSON, sends fs/watch, and returns the request id.
 
-**Call relations**: A typed wrapper for watch registration.
+**Call relations**: Filesystem watch tests call this and then wait for notifications through the read helpers.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5152,11 +5186,11 @@ async fn send_fs_unwatch_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fs/unwatch` with typed params.
+**Purpose**: Asks the server to stop watching a filesystem path.
 
-**Data flow**: It serializes `FsUnwatchParams`, sends the request, and returns the request id.
+**Data flow**: It serializes unwatch parameters, sends fs/unwatch, and returns the request id.
 
-**Call relations**: Used by watch-removal tests.
+**Call relations**: Filesystem watch tests use this to clean up watched paths. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5167,11 +5201,11 @@ async fn send_fs_unwatch_request(
 async fn send_logout_account_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/logout` with no params.
+**Purpose**: Requests account logout.
 
-**Data flow**: It calls `send_request` with the fixed method and `None`, returning the request id.
+**Data flow**: It sends account/logout with no parameters and returns the request id.
 
-**Call relations**: A convenience wrapper for logout tests.
+**Call relations**: Login and account tests use this shortcut. It relies on TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request).
 
@@ -5185,11 +5219,11 @@ async fn send_login_account_api_key_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/login/start` using the raw API-key login payload shape.
+**Purpose**: Starts account login using an API key.
 
-**Data flow**: It takes an API key string, builds `{ "type": "apiKey", "apiKey": <key> }`, sends it via `send_request`, and returns the request id.
+**Data flow**: It receives an API key string, builds the JSON shape expected by account/login/start, sends it, and returns the request id.
 
-**Call relations**: Auth tests and helper functions use this to log in with an API key before asserting later auth status.
+**Call relations**: Login helpers such as login_with_api_key_via_request and login_with_api_key call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 4 (login_with_api_key_via_request, login_with_api_key, login_with_api_key, login_with_api_key); 1 external calls (json!).
 
@@ -5200,11 +5234,11 @@ async fn send_login_account_api_key_request(
 async fn send_login_account_chatgpt_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/login/start` requesting ChatGPT login.
+**Purpose**: Starts the normal ChatGPT login flow.
 
-**Data flow**: It builds `{ "type": "chatgpt" }`, sends it, and returns the request id.
+**Data flow**: It builds JSON that names the chatgpt login type, sends account/login/start, and returns the request id.
 
-**Call relations**: Used by tests that initiate ChatGPT login flows.
+**Call relations**: ChatGPT login tests call this wrapper. The actual write goes through TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (json!).
 
@@ -5215,11 +5249,11 @@ async fn send_login_account_chatgpt_request(&mut self) -> anyhow::Result<i64>
 async fn send_login_account_chatgpt_device_code_request(&mut self) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/login/start` requesting ChatGPT device-code login.
+**Purpose**: Starts ChatGPT device-code login, where a user completes login using a code on another device or browser.
 
-**Data flow**: It builds `{ "type": "chatgptDeviceCode" }`, sends it, and returns the request id.
+**Data flow**: It builds JSON for the chatgptDeviceCode login type, sends account/login/start, and returns the request id.
 
-**Call relations**: A convenience wrapper for device-code login tests.
+**Call relations**: Device-code login tests use this helper. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (json!).
 
@@ -5233,11 +5267,11 @@ async fn send_cancel_login_account_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `account/login/cancel` with typed params.
+**Purpose**: Requests cancellation of an in-progress login.
 
-**Data flow**: It serializes `CancelLoginAccountParams`, sends the request, and returns the request id.
+**Data flow**: It serializes cancel-login parameters, sends account/login/cancel, and returns the request id.
 
-**Call relations**: Used by tests that cancel in-progress login flows.
+**Call relations**: Login cancellation tests call this wrapper. It uses TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (to_value).
 
@@ -5253,11 +5287,11 @@ async fn send_fuzzy_file_search_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fuzzyFileSearch` with query, roots, and an optional cancellation token.
+**Purpose**: Runs a fuzzy file search, which finds files matching an approximate query rather than an exact path.
 
-**Data flow**: It takes a query string, root paths, and optional token, builds a JSON object with `query` and `roots`, conditionally inserts `cancellationToken`, sends it via `send_request`, and returns the request id.
+**Data flow**: It receives a query, root directories, and an optional cancellation token, builds JSON parameters, sends fuzzyFileSearch, and returns the request id.
 
-**Call relations**: This is the one-shot fuzzy-search request path, distinct from the session-based start/update/stop helpers.
+**Call relations**: File-search tests call this directly. It delegates the final message write to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); 1 external calls (json!).
 
@@ -5272,11 +5306,11 @@ async fn send_fuzzy_file_search_session_start_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fuzzyFileSearch/sessionStart` with a session id and roots.
+**Purpose**: Starts a stateful fuzzy file search session.
 
-**Data flow**: It builds a JSON object containing `sessionId` and `roots`, sends it, and returns the request id.
+**Data flow**: It receives a session id and roots, builds JSON parameters, sends fuzzyFileSearch/sessionStart, and returns the request id.
 
-**Call relations**: The higher-level `start_fuzzy_file_search_session` helper uses this before waiting for the response.
+**Call relations**: TestAppServer::start_fuzzy_file_search_session calls this before waiting for the matching response.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (start_fuzzy_file_search_session); 1 external calls (json!).
 
@@ -5291,11 +5325,11 @@ async fn start_fuzzy_file_search_session(
     ) -> anyhow::Result<JSONRPCResponse>
 ```
 
-**Purpose**: Starts a fuzzy-file-search session and waits for the matching JSON-RPC response.
+**Purpose**: Starts a fuzzy search session and waits for its response in one step.
 
-**Data flow**: It takes a session id and roots, sends the session-start request, wraps the numeric id in `RequestId::Integer`, waits until `read_stream_until_response_message` returns the matching response, and returns that `JSONRPCResponse`.
+**Data flow**: It sends the session-start request, turns the returned numeric id into a JSON-RPC request id, waits until that response arrives, and returns the response.
 
-**Call relations**: This is a convenience orchestration helper over the lower-level send and read primitives for session-based fuzzy search.
+**Call relations**: Search-session tests use this convenience helper. It combines TestAppServer::send_fuzzy_file_search_session_start_request with TestAppServer::read_stream_until_response_message.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_fuzzy_file_search_session_start_request); 1 external calls (Integer).
 
@@ -5310,11 +5344,11 @@ async fn send_fuzzy_file_search_session_update_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fuzzyFileSearch/sessionUpdate` with a session id and query.
+**Purpose**: Updates the query for an existing fuzzy file search session.
 
-**Data flow**: It builds a JSON object with `sessionId` and `query`, sends it, and returns the request id.
+**Data flow**: It receives a session id and query, builds JSON, sends fuzzyFileSearch/sessionUpdate, and returns the request id.
 
-**Call relations**: Used directly and by `update_fuzzy_file_search_session`.
+**Call relations**: TestAppServer::update_fuzzy_file_search_session and tests for missing sessions call this. It delegates to TestAppServer::send_request.
 
 *Call graph*: calls 1 internal fn (send_request); called by 2 (update_fuzzy_file_search_session, assert_update_request_fails_for_missing_session); 1 external calls (json!).
 
@@ -5329,11 +5363,11 @@ async fn update_fuzzy_file_search_session(
     ) -> anyhow::Result<JSONRPCResponse>
 ```
 
-**Purpose**: Updates a fuzzy-file-search session and waits for the matching response.
+**Purpose**: Updates a fuzzy search session and waits for the server response.
 
-**Data flow**: It takes a session id and query, sends the update request, waits for the response with the corresponding integer request id, and returns the `JSONRPCResponse`.
+**Data flow**: It sends the session-update request, waits for the response with the same id, and returns that response.
 
-**Call relations**: This is the response-waiting convenience wrapper over `send_fuzzy_file_search_session_update_request`.
+**Call relations**: Search-session tests use this convenience helper. It combines TestAppServer::send_fuzzy_file_search_session_update_request with TestAppServer::read_stream_until_response_message.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_fuzzy_file_search_session_update_request); 1 external calls (Integer).
 
@@ -5347,11 +5381,11 @@ async fn send_fuzzy_file_search_session_stop_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Sends `fuzzyFileSearch/sessionStop` with a session id.
+**Purpose**: Requests that a fuzzy file search session stop.
 
-**Data flow**: It builds `{ "sessionId": <id> }`, sends it, and returns the request id.
+**Data flow**: It receives a session id, builds JSON parameters, sends fuzzyFileSearch/sessionStop, and returns the request id.
 
-**Call relations**: Used directly and by `stop_fuzzy_file_search_session`.
+**Call relations**: TestAppServer::stop_fuzzy_file_search_session calls this before waiting for the response.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (stop_fuzzy_file_search_session); 1 external calls (json!).
 
@@ -5365,11 +5399,11 @@ async fn stop_fuzzy_file_search_session(
     ) -> anyhow::Result<JSONRPCResponse>
 ```
 
-**Purpose**: Stops a fuzzy-file-search session and waits for the matching response.
+**Purpose**: Stops a fuzzy search session and waits for confirmation.
 
-**Data flow**: It takes a session id, sends the stop request, waits for the response with the corresponding integer request id, and returns the `JSONRPCResponse`.
+**Data flow**: It sends the stop request, waits for the response with the same id, and returns that response.
 
-**Call relations**: This is the response-waiting convenience wrapper over `send_fuzzy_file_search_session_stop_request`.
+**Call relations**: Search-session tests use this as a cleanup and assertion helper. It combines TestAppServer::send_fuzzy_file_search_session_stop_request with TestAppServer::read_stream_until_response_message.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_fuzzy_file_search_session_stop_request); 1 external calls (Integer).
 
@@ -5384,11 +5418,11 @@ async fn send_request(
     ) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Allocates the next integer request id, wraps the method and params in a `JSONRPCRequest`, and writes it to the child process.
+**Purpose**: Builds and sends one JSON-RPC request, assigning it a unique numeric id.
 
-**Data flow**: It takes a method string and optional JSON params, increments `next_request_id` with relaxed atomic ordering, constructs `JSONRPCMessage::Request(JSONRPCRequest { id, method, params, trace: None })`, sends it via `send_jsonrpc_message`, and returns the numeric request id.
+**Data flow**: It receives a method name and optional JSON parameters, increments the next request id, wraps everything into a JSON-RPC request message, writes it to the server, and returns the id.
 
-**Call relations**: Nearly every typed `send_*_request` helper funnels through this function, making it the central request-construction path.
+**Call relations**: Almost every send_* helper funnels into this function. It hands the finished message to TestAppServer::send_jsonrpc_message.
 
 *Call graph*: calls 1 internal fn (send_jsonrpc_message); called by 104 (initialize_with_params, send_add_credits_nudge_email_request, send_apps_list_request, send_cancel_login_account_request, send_chatgpt_auth_tokens_login_request, send_command_exec_request, send_command_exec_resize_request, send_command_exec_terminate_request, send_command_exec_write_request, send_config_batch_write_request (+15 more)); 3 external calls (fetch_add, Request, Integer).
 
@@ -5403,11 +5437,11 @@ async fn send_response(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes a JSON-RPC response message back to the child process, typically when the server has issued a request to the test harness.
+**Purpose**: Sends a JSON-RPC response back to the server. This is needed when the server asks the test client for something.
 
-**Data flow**: It takes a `RequestId` and result JSON value, wraps them in `JSONRPCResponse`, converts that to `JSONRPCMessage::Response`, sends it via `send_jsonrpc_message`, and returns success or error.
+**Data flow**: It receives a request id and JSON result, wraps them in a response message, and writes it to stdin.
 
-**Call relations**: Tests that emulate client-side handling of server-initiated requests use this helper after reading a `ServerRequest`.
+**Call relations**: Helpers such as respond_to_refresh_request use this after reading a server request. It delegates to TestAppServer::send_jsonrpc_message.
 
 *Call graph*: calls 1 internal fn (send_jsonrpc_message); called by 1 (respond_to_refresh_request); 1 external calls (Response).
 
@@ -5422,11 +5456,11 @@ async fn send_error(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes a JSON-RPC error message back to the child process.
+**Purpose**: Sends a JSON-RPC error response back to the server.
 
-**Data flow**: It takes a `RequestId` and `JSONRPCErrorError`, wraps them in `JSONRPCError`, converts that to `JSONRPCMessage::Error`, sends it via `send_jsonrpc_message`, and returns success or error.
+**Data flow**: It receives a request id and error object, wraps them into an error message, and writes it to the server.
 
-**Call relations**: Used when tests need to reject a server-initiated request instead of responding successfully.
+**Call relations**: Tests can use this when simulating a client-side failure in response to a server request. It delegates to TestAppServer::send_jsonrpc_message.
 
 *Call graph*: calls 1 internal fn (send_jsonrpc_message); 1 external calls (Error).
 
@@ -5440,11 +5474,11 @@ async fn send_notification(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Serializes a typed `ClientNotification` enum into the generic JSON-RPC notification envelope and writes it to the child process.
+**Purpose**: Sends a client notification, which is a JSON-RPC message that does not expect a response.
 
-**Data flow**: It takes a `ClientNotification`, converts it to `serde_json::Value`, extracts the `method` string and optional `params` field from that value, constructs `JSONRPCMessage::Notification(JSONRPCNotification { ... })`, and sends it via `send_jsonrpc_message`.
+**Data flow**: It receives a typed notification, converts it to JSON, extracts the method and optional parameters, writes the notification message, and returns success or an error if the shape is invalid.
 
-**Call relations**: The initialize handshake uses this to send `initialized`, and tests can use it for other client-originated notifications.
+**Call relations**: Initialization uses this to send the initialized notification after the server accepts initialize. The final write goes through TestAppServer::send_jsonrpc_message.
 
 *Call graph*: calls 1 internal fn (send_jsonrpc_message); called by 1 (initialize_with_params); 2 external calls (Notification, to_value).
 
@@ -5455,11 +5489,11 @@ async fn send_notification(
 async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs the actual transport write of one newline-delimited JSON-RPC message to the child’s stdin.
+**Purpose**: Writes one JSON-RPC message to the server process. It is the lowest-level output path in this helper.
 
-**Data flow**: It takes a `JSONRPCMessage`, logs it to stderr, checks that `stdin` is still present, serializes the message to a JSON string, writes the bytes plus a trailing newline to the child stdin, flushes, and returns success or an error if stdin is closed or serialization/write fails.
+**Data flow**: It receives a JSON-RPC message, serializes it as one JSON line, writes it to child stdin, adds a newline, flushes the pipe, and returns success. If stdin is already closed, it reports an error.
 
-**Call relations**: All request, response, error, and notification senders delegate here, making it the single outbound transport primitive.
+**Call relations**: TestAppServer::send_request, TestAppServer::send_response, TestAppServer::send_error, and TestAppServer::send_notification all rely on this function.
 
 *Call graph*: called by 4 (send_error, send_notification, send_request, send_response); 3 external calls (bail!, eprintln!, to_string).
 
@@ -5470,11 +5504,11 @@ async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Res
 async fn read_jsonrpc_message(&mut self) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Reads one line from the child’s stdout and deserializes it as a `JSONRPCMessage`.
+**Purpose**: Reads one JSON-RPC message from the server process.
 
-**Data flow**: It allocates a local `String`, reads one line into it from the buffered stdout reader, parses that line with `serde_json::from_str::<JSONRPCMessage>`, logs the parsed message to stderr, and returns it.
+**Data flow**: It reads one line from child stdout, parses that line as a JSON-RPC message, logs it for test debugging, and returns the parsed message.
 
-**Call relations**: This is the single inbound transport primitive used by the higher-level stream-reading helpers.
+**Call relations**: Initialization and the stream-scanning helper use this whenever they need the next raw message from the server.
 
 *Call graph*: called by 2 (initialize_with_params, read_stream_until_message); 3 external calls (read_line, new, eprintln!).
 
@@ -5485,11 +5519,11 @@ async fn read_jsonrpc_message(&mut self) -> anyhow::Result<JSONRPCMessage>
 async fn read_stream_until_request_message(&mut self) -> anyhow::Result<ServerRequest>
 ```
 
-**Purpose**: Consumes the message stream until the next server-initiated JSON-RPC request appears, buffering all non-request messages.
+**Purpose**: Reads messages until the server sends a request to the client.
 
-**Data flow**: It logs entry, calls `read_stream_until_message` with a predicate matching `JSONRPCMessage::Request(_)`, unwraps the resulting message as a `JSONRPCRequest`, converts it into a typed `ServerRequest` with `try_into()`, and returns that typed request.
+**Data flow**: It scans the stream for the next request message, buffers unrelated messages, converts the JSON-RPC request into the typed ServerRequest form, and returns it.
 
-**Call relations**: Tests that need to answer server-originated requests use this helper. It relies on the generic buffered stream scanner to preserve unrelated messages for later.
+**Call relations**: The respond_to_refresh_request helper uses this when the server asks the client for refreshed authentication. It relies on TestAppServer::read_stream_until_message.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 1 (respond_to_refresh_request); 2 external calls (eprintln!, unreachable!).
 
@@ -5503,11 +5537,11 @@ async fn read_stream_until_response_message(
     ) -> anyhow::Result<JSONRPCResponse>
 ```
 
-**Purpose**: Consumes the stream until it finds a response or error carrying the specified request id, then unwraps it as a successful `JSONRPCResponse`.
+**Purpose**: Reads messages until it finds the response for a specific request id.
 
-**Data flow**: It takes a `RequestId`, logs entry, calls `read_stream_until_message` with a predicate comparing `message_request_id(message)` to the target id, unwraps the matched message as `JSONRPCMessage::Response`, and returns the response.
+**Data flow**: It receives a request id, scans current buffered and incoming messages until one has that id, expects it to be a response, and returns the response.
 
-**Call relations**: Most tests pair a `send_*_request` call with this helper to await the corresponding response while buffering unrelated notifications.
+**Call relations**: Many higher-level helpers call this after sending a request. It relies on TestAppServer::read_stream_until_message, which preserves unrelated messages for later.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 37 (interrupt_turn_and_wait_for_aborted, start_fuzzy_file_search_session, stop_fuzzy_file_search_session, update_fuzzy_file_search_session, login_with_api_key_via_request, fork_fake_rollout_thread, send_turn_and_wait, start_thread, mcp_server_names, start_thread (+15 more)); 2 external calls (eprintln!, unreachable!).
 
@@ -5521,11 +5555,11 @@ async fn read_stream_until_error_message(
     ) -> anyhow::Result<JSONRPCError>
 ```
 
-**Purpose**: Consumes the stream until it finds a message with the specified request id and unwraps it as a JSON-RPC error.
+**Purpose**: Reads messages until it finds an error for a specific request id.
 
-**Data flow**: It takes a `RequestId`, scans the stream with the same id-based predicate used for responses, unwraps the matched message as `JSONRPCMessage::Error`, and returns the error object.
+**Data flow**: It receives a request id, scans buffered and incoming messages for that id, expects the matching message to be an error, and returns it.
 
-**Call relations**: Tests expecting failures use this instead of the response reader.
+**Call relations**: Error assertion helpers call this when a request should fail. It uses TestAppServer::read_stream_until_message.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 4 (assert_update_request_fails_for_missing_session, expect_error_message, read_error_response, assert_remote_control_disabled_by_requirements); 1 external calls (unreachable!).
 
@@ -5539,11 +5573,11 @@ async fn read_stream_until_notification_message(
     ) -> anyhow::Result<JSONRPCNotification>
 ```
 
-**Purpose**: Consumes the stream until it finds a notification with the specified method name, buffering everything else.
+**Purpose**: Reads messages until it finds a notification with a specific method name.
 
-**Data flow**: It takes a method string, logs entry, calls `read_stream_until_message` with a predicate matching `JSONRPCMessage::Notification` whose `method` equals the target, unwraps the result as `JSONRPCNotification`, and returns it.
+**Data flow**: It receives a notification method string, scans buffered and incoming messages, returns the matching notification, and stores non-matching messages for future reads.
 
-**Call relations**: Many lifecycle-oriented tests use this to wait for notifications such as `turn/completed` or cache-update events.
+**Call relations**: Many wait helpers use this for events such as turn completion, command output, and app-list updates. It delegates scanning to TestAppServer::read_stream_until_message.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 25 (interrupt_turn_and_wait_for_aborted, assert_no_session_updates_for, read_app_list_updated_notification, read_command_exec_delta, wait_for_context_compaction_completed, wait_for_context_compaction_started, wait_for_turn_completed, wait_for_dynamic_tool_completed, wait_for_dynamic_tool_started, maybe_fs_changed_notification (+15 more)); 2 external calls (eprintln!, unreachable!).
 
@@ -5558,11 +5592,11 @@ async fn read_stream_until_matching_notification(
     ) -> anyhow::Result<JSONRPCNotification>
 ```
 
-**Purpose**: Consumes the stream until it finds a notification satisfying an arbitrary caller-supplied predicate.
+**Purpose**: Reads messages until it finds a notification accepted by a caller-supplied test.
 
-**Data flow**: It takes a human-readable description and a predicate over `&JSONRPCNotification`, logs entry, scans with `read_stream_until_message`, unwraps the matched message as a notification, and returns it.
+**Data flow**: It receives a human description and a predicate function, scans notifications until the predicate returns true, and returns that notification while buffering others.
 
-**Call relations**: This is the flexible notification-waiting variant used when matching requires inspecting notification params rather than just the method name.
+**Call relations**: Helpers such as wait_for_session_completed and wait_for_session_updated use this when matching needs more than just a method name.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 2 (wait_for_session_completed, wait_for_session_updated); 2 external calls (eprintln!, unreachable!).
 
@@ -5573,11 +5607,11 @@ async fn read_stream_until_matching_notification(
 async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Returns the next available message from either the pending buffer or the live stream, regardless of type.
+**Purpose**: Reads the next available message, considering both buffered messages and new stream input.
 
-**Data flow**: It calls `read_stream_until_message` with a predicate that always returns true and returns the resulting `JSONRPCMessage`.
+**Data flow**: It asks the stream scanner for any message at all and returns the first one it can provide.
 
-**Call relations**: Collection-style test helpers use this when they want to inspect the raw message stream without filtering.
+**Call relations**: Collection helpers use this when they want to inspect the raw flow of messages. It is a thin wrapper over TestAppServer::read_stream_until_message.
 
 *Call graph*: calls 1 internal fn (read_stream_until_message); called by 4 (collect_turn_notifications, collect_cyber_policy_error_and_validate_no_reroute, collect_model_verification_notifications_and_validate_no_warning_item, collect_turn_notifications_and_validate_no_warning_item).
 
@@ -5588,11 +5622,11 @@ async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage>
 fn clear_message_buffer(&mut self)
 ```
 
-**Purpose**: Drops all buffered non-consumed messages accumulated by prior filtered reads.
+**Purpose**: Discards messages that were saved for later. Tests use it when old messages are no longer relevant.
 
-**Data flow**: It mutably accesses `pending_messages` and clears the deque in place.
+**Data flow**: It clears the pending message queue in place and returns nothing.
 
-**Call relations**: Tests call this when they intentionally want to ignore stale buffered messages before observing a new phase of activity.
+**Call relations**: The run_environment_selection_case helper calls this before checking a later phase so older buffered messages do not affect the assertion.
 
 *Call graph*: called by 1 (run_environment_selection_case); 1 external calls (clear).
 
@@ -5603,11 +5637,11 @@ fn clear_message_buffer(&mut self)
 fn pending_notification_methods(&self) -> Vec<String>
 ```
 
-**Purpose**: Returns the method names of all currently buffered notification messages.
+**Purpose**: Reports the method names of notifications currently buffered.
 
-**Data flow**: It iterates over `pending_messages`, filters to `JSONRPCMessage::Notification`, clones each notification’s `method`, collects them into a `Vec<String>`, and returns that vector.
+**Data flow**: It looks through the pending message queue, keeps only notifications, copies their method names, and returns them as a list.
 
-**Call relations**: This is an inspection/debugging helper for tests that need to assert what notifications have already been buffered.
+**Call relations**: Tests can use this for debugging or assertions about what arrived out of order. It does not read from the process.
 
 *Call graph*: 1 external calls (iter).
 
@@ -5618,11 +5652,11 @@ fn pending_notification_methods(&self) -> Vec<String>
 async fn read_stream_until_message(&mut self, predicate: F) -> anyhow::Result<JSONRPCMessage>
 ```
 
-**Purpose**: Implements buffered stream scanning: return the first message matching a predicate, preserving all earlier non-matching messages for later reads.
+**Purpose**: Scans the server message stream until a caller-supplied condition matches. It is the core reader that makes out-of-order messages manageable.
 
-**Data flow**: It takes a predicate over `&JSONRPCMessage`. It first tries `take_pending_message` to satisfy the predicate from the existing buffer; if none matches, it loops reading fresh messages with `read_jsonrpc_message`, returning immediately on the first match and otherwise pushing each non-matching message onto `pending_messages`.
+**Data flow**: It first checks buffered messages for a match. If none match, it repeatedly reads new messages; matching messages are returned and non-matching messages are pushed into the pending queue.
 
-**Call relations**: All specialized read helpers delegate to this function. It is the core mechanism that lets tests wait for one message type without losing interleaved notifications or responses.
+**Call relations**: All specialized read helpers call this. It uses TestAppServer::take_pending_message for the buffer and TestAppServer::read_jsonrpc_message for new input.
 
 *Call graph*: calls 2 internal fn (read_jsonrpc_message, take_pending_message); called by 6 (read_next_message, read_stream_until_error_message, read_stream_until_matching_notification, read_stream_until_notification_message, read_stream_until_request_message, read_stream_until_response_message); 1 external calls (push_back).
 
@@ -5633,11 +5667,11 @@ async fn read_stream_until_message(&mut self, predicate: F) -> anyhow::Result<JS
 fn take_pending_message(&mut self, predicate: &F) -> Option<JSONRPCMessage>
 ```
 
-**Purpose**: Searches the buffered message deque for the first entry matching a predicate and removes it if found.
+**Purpose**: Removes and returns the first buffered message that matches a condition.
 
-**Data flow**: It takes a predicate reference, scans `pending_messages` for the first matching position, removes and returns that message if present, or returns `None` otherwise.
+**Data flow**: It receives a predicate, searches the pending message queue, removes the matching message if found, and returns it; otherwise it returns nothing.
 
-**Call relations**: Only `read_stream_until_message` calls this, using it to prefer already-buffered messages before reading more from stdout.
+**Call relations**: TestAppServer::read_stream_until_message calls this before reading from stdout so already-buffered messages are not missed.
 
 *Call graph*: called by 1 (read_stream_until_message); 2 external calls (iter, remove).
 
@@ -5648,11 +5682,11 @@ fn take_pending_message(&mut self, predicate: &F) -> Option<JSONRPCMessage>
 fn pending_turn_completed_notification(&self, thread_id: &str, turn_id: &str) -> bool
 ```
 
-**Purpose**: Checks whether the buffered message deque already contains a `turn/completed` notification for a specific thread id and turn id.
+**Purpose**: Checks whether a matching turn/completed notification is already buffered. This helps cleanup tolerate race conditions.
 
-**Data flow**: It iterates over `pending_messages`, filters to notifications with method `turn/completed`, extracts their params, attempts to deserialize each into `TurnCompletedNotification`, and returns true if any payload’s `thread_id` and `turn.id` match the supplied strings.
+**Data flow**: It receives a thread id and turn id, searches buffered notifications, parses turn/completed payloads, and returns true only if one matches both ids.
 
-**Call relations**: The interrupt cleanup helper uses this to tolerate races where the terminal completion notification arrives before or during timeout handling.
+**Call relations**: TestAppServer::interrupt_turn_and_wait_for_aborted calls this when a timeout might simply mean the completion notification already arrived while waiting for another message.
 
 *Call graph*: called by 1 (interrupt_turn_and_wait_for_aborted); 1 external calls (iter).
 
@@ -5663,11 +5697,11 @@ fn pending_turn_completed_notification(&self, thread_id: &str, turn_id: &str) ->
 fn message_request_id(message: &JSONRPCMessage) -> Option<&RequestId>
 ```
 
-**Purpose**: Extracts the `RequestId` from a request, response, or error message, returning `None` for notifications.
+**Purpose**: Extracts the request id from any JSON-RPC message type that has one.
 
-**Data flow**: It pattern-matches on a borrowed `JSONRPCMessage` and returns a borrowed reference to the embedded id for request/response/error variants or `None` for notifications.
+**Data flow**: It receives a message, returns the id for requests, responses, or errors, and returns nothing for notifications because notifications do not have ids.
 
-**Call relations**: The response and error readers use this helper inside their stream predicates to match messages by request id.
+**Call relations**: Response and error readers use this through TestAppServer::read_stream_until_message to find messages belonging to a specific request.
 
 
 ##### `TestAppServer::drop`  (lines 1622–1662)
@@ -5676,11 +5710,11 @@ fn message_request_id(message: &JSONRPCMessage) -> Option<&RequestId>
 fn drop(&mut self)
 ```
 
-**Purpose**: Performs bounded synchronous child-process cleanup to reduce flaky leaked-process reports when the harness is dropped.
+**Purpose**: Cleans up the child app server process when the test helper goes away. This reduces flaky test failures from leftover processes.
 
-**Data flow**: On drop, it closes stdin by taking and dropping it, polls `process.try_wait()` for up to 200 ms to allow graceful EOF-driven shutdown, calls `start_kill()` if the child is still alive, then polls `try_wait()` for up to 5 seconds with short sleeps until the OS reports exit or an error occurs.
+**Data flow**: It closes stdin to request graceful shutdown, polls briefly for exit, asks the operating system to kill the process if needed, then waits up to a short limit for the process to be reported as exited.
 
-**Call relations**: This runs automatically at test teardown for every `TestAppServer`. It complements Tokio’s best-effort `kill_on_drop(true)` with explicit synchronous waiting because `Drop` cannot be async.
+**Call relations**: Rust calls this automatically when TestAppServer is dropped. It complements the launch code in TestAppServer::new_with_program_env_and_args and protects the rest of the test suite from leaked child processes.
 
 *Call graph*: 6 external calls (start_kill, try_wait, sleep, from_millis, from_secs, now).
 
@@ -5692,24 +5726,32 @@ These top-level test modules collect the shared harness into the compiled integr
 
 `test` · `test run`
 
-This file is the integration-test entry module for the app server. The crate-level attribute `#![allow(clippy::expect_used)]` relaxes linting for the test binary, acknowledging that tests often use `expect` for concise failure messages and setup assertions. The remaining content is a single `mod suite;` declaration, accompanied by a comment explaining the structure: this binary aggregates submodules located under `tests/suite/`.
+This file is intentionally small, but it plays an important organizing role. In Rust, each file under `tests/` can become a separate integration test program. Here, the project chooses to have one integration test binary instead of many separate ones. Think of it like a table of contents: this file does not contain the test chapters itself, but it tells Rust where to find them.
 
-The practical effect is that Cargo builds one integration test target containing all of the suite’s nested modules rather than many unrelated top-level test binaries. That can simplify shared setup patterns, reduce duplication in imports and helpers, and make it easier to organize tests by feature area under a common namespace. There is no runtime logic beyond Rust’s normal test harness discovery, but this file determines compilation boundaries and test organization. When `cargo test` runs for this target, the Rust test harness traverses the module tree rooted here, discovers `#[test]` and async test functions in descendant modules, and executes them according to the harness configuration. The file is therefore active only in test builds and serves as the structural root of the server’s integration coverage.
+The line `mod suite;` brings in the `suite` module, whose code lives under `tests/suite/`. That is where the actual test cases are kept. When the test command runs, Rust compiles this file, follows that module link, and includes the suite tests in the resulting test binary.
+
+The `#![allow(clippy::expect_used)]` line relaxes one lint rule for this test binary. Clippy is Rust’s extra code checker, and `expect` is a way to say “this should succeed, and if it does not, stop with this message.” Production code may avoid that style, but tests often use it because a failed setup step should immediately fail the test with a clear reason.
+
+Without this file, the grouped integration test suite would not be pulled into this specific test binary.
 
 
 ### `app-server/tests/suite/mod.rs`
 
-`test` · `test run`
+`test` · `test discovery and test compilation`
 
-This file is a pure test-suite module manifest. It declares five child modules: `auth`, `conversation_summary`, `fuzzy_file_search`, `strict_config`, and `v2`. Each declaration tells the Rust test harness and compiler to include the corresponding source file or directory as part of the single integration-test binary rooted at `tests/all.rs`.
+This file does not contain test logic itself. Instead, it names several test modules: authentication, conversation summaries, fuzzy file search, strict configuration, and version 2 API behavior. In Rust, a `mod` line is like putting a labeled folder into the test suite. Without these lines, the test files may still exist on disk, but the test runner would not know to include them from this suite entry point.
 
-Its role is organizational rather than behavioral. By separating broad test domains at this level, the suite can keep older or cross-cutting tests distinct from the much larger `v2` API surface, while still compiling everything into one coherent test crate. The `v2` module is especially significant because it acts as a second-level index for a large number of endpoint- and feature-specific tests. This file therefore defines the first layer of taxonomy for integration coverage: authentication behavior, conversation summarization, fuzzy file search behavior, strict configuration validation, and the versioned API suite. There are no functions, fixtures, or assertions here, but the module boundaries it establishes affect compile-time inclusion, namespace paths for shared helpers, and how developers navigate the test corpus when adding or debugging coverage.
+Its job is important because it keeps the test suite organized. Each feature area can have its own file with focused tests, while this file gathers them into one place. A newcomer can read it as a quick map of what parts of the app server are covered by this particular suite. It is active only when tests are being compiled or run; it has no effect on the normal app server at runtime.
 
 
 ### `app-server/tests/suite/v2/mod.rs`
 
-`test` · `test run`
+`test` · `test discovery and compilation`
 
-This file is the module manifest for the app server’s `v2` integration tests. It declares a long list of child modules covering account operations, analytics, app listing, attestation, client metadata, collaboration mode listing, compaction, config RPC, websocket connection handling, dynamic tools, executor behavior, experimental APIs, external-agent configuration, filesystem operations, hooks, image generation, initialization, marketplace actions, MCP resources and tools, memory reset, model APIs, permission profiles, planning, plugin lifecycle operations, process execution, rate limits, realtime conversation, remote control, review flows, safety checks, skills, sleep, thread lifecycle operations, turn control, web search, and Windows sandbox setup.
+This file does not contain test code itself. Instead, it gathers many separate test modules under one shared test suite, much like the contents page of a handbook points readers to each chapter. Each `mod` line names another Rust file in the same test area, such as tests for accounts, plugins, threads, permissions, web search, rate limits, and websocket behavior.
 
-Several modules are gated with `#[cfg(...)]`, which is the key behavior in this file. Unix-only tests such as `command_exec` and `connection_handling_websocket_unix` compile only on Unix platforms; `executor_mcp` is excluded on Windows; `remote_thread_store` appears only in debug builds. Those conditions prevent unsupported tests from compiling or running in incompatible environments while preserving a single canonical suite definition. There is no executable test logic here, but this file is the authoritative inventory of v2 integration coverage and the place where platform-specific test topology is encoded. During test compilation, Rust uses these declarations and cfg guards to decide exactly which feature modules become part of the test binary on the current target.
+Its main job is to make sure those test files are compiled and run as part of the version 2 app-server tests. Without this file, many of the test files could exist on disk but never be included in the test build, meaning important behavior might stop being checked.
+
+A few entries are guarded by `cfg` conditions, which are compile-time rules. For example, Unix-only tests are included only on Unix-like systems, non-Windows executor tests are skipped on Windows, and one remote thread store test is included only in debug builds. This prevents tests from being compiled where the required platform feature does not exist.
+
+So this file matters because it defines the shape of the test suite. It does not test features directly, but it decides which feature tests are part of the run.

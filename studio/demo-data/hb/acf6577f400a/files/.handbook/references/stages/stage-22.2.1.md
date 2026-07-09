@@ -1,10 +1,10 @@
 # Generic string, formatting, truncation, and templating utilities  `stage-22.2.1`
 
-This stage is cross-cutting presentation infrastructure used throughout startup, steady-state execution, and user-facing output paths whenever the system needs to turn internal values into safe, compact, readable text. It sits below higher-level CLI, protocol, transport, and TUI code, giving them consistent formatting and truncation behavior.
+This stage is shared behind-the-scenes support for making text safe, short, and easy to read across the project. It is like a set of measuring cups and labels used by many kitchens, not the main cooking itself.
 
-At its core, utils/string exposes shared string helpers: UTF-8-safe slicing, metric-tag sanitization, UUID extraction, markdown location normalization, JSON emission with non-ASCII escaped for ASCII-only transports, and middle truncation by byte or approximate token budget. That truncation foundation is extended by utils/output-truncation for plain text and structured function-output items, while tools/response_history applies similar budgeting to conversation history by trimming to recent user turns and capping assistant-output tokens.
+The string utilities clean and convert text safely. They can produce ASCII-only JSON for places that may reject Unicode, shorten long strings without breaking emoji or non-English characters, and prepare safe metric tags or terminal-friendly code links. Number and elapsed-time formatters turn raw values into labels people can scan, like “12,000”, “12K”, or “1m 15s”. CLI helpers display environment variable names without leaking their values, and build copy-safe “resume” commands for old threads.
 
-For presentation, protocol/num_format renders grouped or compact numbers, utils/elapsed formats durations, utils/cli formats redacted environment-variable displays and standardized codex resume hints, and core/web_search produces concise summaries of search actions. utils/template supplies strict placeholder-based text templating with explicit errors. tui/text_formatting adds TUI-oriented shaping such as grapheme-safe truncation, path shortening, JSON compaction, capitalization, and English list joining.
+Several tools keep text from overwhelming the system. Output truncation preserves useful beginning and ending context, while response-history trimming keeps conversations within a reusable size budget. The strict template helper fills placeholders such as “{{ name }}” and catches missing or mistaken fields. Web search formatting and TUI text helpers turn actions, paths, JSON, and long tool output into compact readable labels for narrow displays.
 
 ## Files in this stage
 
@@ -13,13 +13,15 @@ These files define the shared string helper surface, including ASCII-safe JSON e
 
 ### `utils/string/src/json.rs`
 
-`io_transport` · `serialization/output`
+`util` · `cross-cutting`
 
-This file customizes `serde_json` string emission rather than reimplementing JSON serialization wholesale. The private `AsciiJsonFormatter` implements `serde_json::ser::Formatter`, overriding only `write_string_fragment`. That method scans each string fragment by `char_indices`, writes contiguous ASCII spans directly to the output writer, and rewrites every non-ASCII scalar value into one or two UTF-16 code units using `encode_utf16`, formatting each code unit as a lowercase `\uXXXX` escape. This means ordinary JSON escaping remains under `serde_json`’s control, while the formatter only adds ASCII enforcement for string contents.
+Normal JSON can contain characters from many languages, such as Japanese text, Turkish letters, or emoji. That is usually fine, but some transport channels are safest when every byte is plain ASCII, the small character set used by older English-only systems. This file solves that problem by serializing JSON normally while changing any non-ASCII character inside strings into JSON escape sequences like `\u6771`.
 
-The public `to_ascii_json_string` function serializes any `T: Serialize` into a `Vec<u8>` using `serde_json::Serializer::with_formatter` and the custom formatter, then converts the resulting bytes into a `String`. The final `String::from_utf8` should succeed because the formatter emits only ASCII and `serde_json` itself writes valid UTF-8, but the code still maps any unexpected UTF-8 conversion failure into a `serde_json::Error` with `io::ErrorKind::InvalidData`.
+The key idea is like writing an international address on a form that only accepts basic letters: the meaning is preserved, but the writing is converted into an allowed form. The JSON is still valid JSON, and when another program reads it back, it gets the original Unicode text again.
 
-The included test demonstrates several important properties at once: object keys and values containing non-ASCII text are escaped, supplementary-plane characters like emoji become surrogate-pair escapes, the resulting string is entirely ASCII, and parsing the serialized output back with `serde_json::from_str` reconstructs the original JSON value exactly.
+The file defines a custom JSON formatter, `AsciiJsonFormatter`, for `serde_json`, the Rust JSON library. `serde_json` already knows how to serialize structs, maps, numbers, booleans, and so on. This formatter only steps in when a piece of a string is being written. It copies ordinary ASCII text as-is, and replaces each non-ASCII character with one or two `\uXXXX` escape codes, as JSON expects.
+
+The public function `to_ascii_json_string` is the simple entry point: give it any serializable value, and it returns a JSON string that is guaranteed to be ASCII if serialization succeeds. The included test proves both sides: the output contains only escaped ASCII text, and parsing it back produces the original data.
 
 #### Function details
 
@@ -29,11 +31,11 @@ The included test demonstrates several important properties at once: object keys
 fn write_string_fragment(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
 ```
 
-**Purpose**: Writes one JSON string fragment to the serializer output while escaping every non-ASCII character as UTF-16 `\uXXXX` sequences. It preserves ASCII runs verbatim for efficiency.
+**Purpose**: This function writes part of a JSON string while making sure any non-ASCII character is escaped. It lets the normal JSON serializer keep control of the overall JSON format, while this function only changes unsafe string characters into safe `\uXXXX` text.
 
-**Data flow**: It takes a mutable writer and a `fragment: &str`, scans the fragment by character boundaries, writes any ASCII byte ranges directly with `write_all`, and for each non-ASCII `char` encodes it into one or two UTF-16 code units and writes each as `\u{code_unit:04x}`. It returns `io::Result<()>` and mutates only the provided writer.
+**Data flow**: It receives a writable output destination and a fragment of string text. It scans the fragment character by character, writes unchanged ASCII stretches directly, and turns each non-ASCII character into UTF-16 code units written as JSON Unicode escapes. The output destination gains only ASCII bytes for this fragment, and the function reports success or any write error.
 
-**Call relations**: This method is invoked by `serde_json` during string serialization when `AsciiJsonFormatter` is installed. It deliberately leaves all non-string JSON formatting to the serializer and only customizes string-fragment emission.
+**Call relations**: This function is called by `serde_json` through the custom formatter whenever string content is being emitted. It relies on ordinary writing operations to copy safe bytes and to write escape sequences, then hands control back to the serializer so the rest of the JSON can continue normally.
 
 *Call graph*: 2 external calls (write_all, write!).
 
@@ -44,11 +46,11 @@ fn write_string_fragment(&mut self, writer: &mut W, fragment: &str) -> io::Resul
 fn to_ascii_json_string(value: &T) -> serde_json::Result<String>
 ```
 
-**Purpose**: Serializes any `serde::Serialize` value into a JSON string whose string contents are ASCII-safe via Unicode escapes. It is the public entry point for callers that need JSON over ASCII-only channels.
+**Purpose**: This is the public helper callers use when they need JSON text that is valid JSON and ASCII-only. A caller gives it any value that can be serialized, and it returns a JSON string with non-ASCII string content escaped.
 
-**Data flow**: It takes a serializable `value`, creates a `Vec<u8>` buffer and a `serde_json::Serializer` configured with `AsciiJsonFormatter`, calls `value.serialize(&mut serializer)?`, then converts the byte buffer into a `String` with `String::from_utf8`. On UTF-8 conversion failure it wraps the error as `serde_json::Error::io(...)`; otherwise it returns the serialized JSON string.
+**Data flow**: It starts with the input value and an empty byte buffer. It creates a JSON serializer using `AsciiJsonFormatter`, asks the value to serialize itself into that serializer, then converts the collected bytes into a Rust `String`. On success, the result is JSON text; if serialization or byte-to-string conversion fails, it returns a JSON error.
 
-**Call relations**: This function is called by tests and by any higher-level code needing ASCII-safe JSON output. It delegates structural serialization to `serde_json` and character escaping policy to `AsciiJsonFormatter::write_string_fragment`.
+**Call relations**: Higher-level code calls this when it needs ASCII-safe JSON. In this file, the test calls it with a payload containing Japanese text, a Turkish character, and an emoji. Internally it hands the actual JSON writing to `serde_json`, with `AsciiJsonFormatter` providing the special string escaping behavior.
 
 *Call graph*: called by 1 (to_ascii_json_string_escapes_non_ascii_strings); 4 external calls (from_utf8, serialize, new, with_formatter).
 
@@ -59,24 +61,24 @@ fn to_ascii_json_string(value: &T) -> serde_json::Result<String>
 fn to_ascii_json_string_escapes_non_ascii_strings()
 ```
 
-**Purpose**: Validates that ASCII-safe serialization escapes non-ASCII keys and values, preserves JSON semantics, and produces output that remains parseable. It covers BMP characters and surrogate-pair emoji escapes.
+**Purpose**: This test checks that `to_ascii_json_string` really escapes non-ASCII characters without changing the meaning of the JSON. It guards against regressions where Unicode text might accidentally be emitted directly or escaped incorrectly.
 
-**Data flow**: The test defines custom `Serialize` implementations for nested payload structs containing non-ASCII path, label, and emoji strings, serializes them with `to_ascii_json_string`, asserts the exact escaped JSON string, checks `is_ascii()` and absence of raw non-ASCII substrings, parses the result back into `serde_json::Value`, and compares it to the expected JSON value.
+**Data flow**: It builds a small custom serializable payload containing a map key with Japanese characters, a label with a Turkish dotless letter, and an emoji. It serializes that payload using `to_ascii_json_string`, checks that the exact output uses JSON Unicode escapes and contains only ASCII, then parses the output back into JSON and compares it with the expected original value.
 
-**Call relations**: It exercises the full public API through `to_ascii_json_string`, indirectly driving `AsciiJsonFormatter::write_string_fragment` via `serde_json`’s serializer.
+**Call relations**: The test is the direct caller of `to_ascii_json_string` in this file. After receiving the serialized text, it uses assertions and JSON parsing to verify both the byte-level requirement, meaning ASCII-only output, and the data-level requirement, meaning the JSON still represents the same value.
 
 *Call graph*: calls 1 internal fn (to_ascii_json_string); 4 external calls (assert!, assert_eq!, json!, from_str).
 
 
 ### `utils/string/src/truncate.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting text/output preparation`
 
-This module provides the actual truncation logic re-exported by the string crate. The public entry points are `truncate_middle_chars`, which truncates to a byte budget while reporting removed character count in the marker, and `truncate_middle_with_token_budget`, which converts an approximate token budget into bytes and reports the original approximate token count when truncation occurs. Both route through the private `truncate_with_byte_estimate`.
+This file solves a common display problem: sometimes the program has a long piece of text, such as command output or a log, but only has room to show part of it. Instead of simply chopping off the end, it keeps a slice from the start and a slice from the end, then places a clear message in the middle saying how much was removed. This is like folding a long receipt so you can still read the header and the final total.
 
-The truncation algorithm preserves a prefix and suffix of the original string and inserts a marker like `…21 chars truncated…` or `…8 tokens truncated…` in the middle. It is careful about UTF-8 boundaries: `split_budget` divides the byte budget between left and right sides, and `split_string` walks `char_indices` to choose the largest prefix within the left budget and the earliest suffix starting within the right-side tail target, counting removed characters in between. If the budgets overlap, `split_string` clamps the suffix start so the output never duplicates overlapping bytes. Empty strings and zero budgets are handled explicitly, with zero budget producing only the truncation marker.
+The code has two public ways to truncate. One works with a byte limit and reports removed characters. The other works with an approximate token budget, where a token is a rough chunk of text used by language models; this file estimates one token as about four bytes. The estimate is intentionally simple and fast, not exact.
 
-Approximate token accounting is intentionally simple and byte-based: `APPROX_BYTES_PER_TOKEN` is fixed at 4, `approx_token_count` rounds string length up to that granularity, `approx_bytes_for_tokens` multiplies tokens by 4 with saturation, and `approx_tokens_from_byte_count` performs the inverse rounded-up conversion. `removed_units` chooses whether the marker count is based on removed characters or approximate removed tokens, and `assemble_truncated_output` preallocates enough capacity for prefix, marker, and suffix before concatenating them.
+The main internal routine checks for easy cases first: empty text, zero budget, or text that already fits. If truncation is needed, it splits the available space between the left and right sides, finds safe cut points at real character boundaries, counts what was removed, builds the marker text, and joins everything together. The most important safety detail is that it walks through characters rather than slicing blindly by byte position, because Rust strings are UTF-8 and some characters use more than one byte.
 
 #### Function details
 
@@ -86,11 +88,11 @@ Approximate token accounting is intentionally simple and byte-based: `APPROX_BYT
 fn truncate_middle_chars(s: &str, max_bytes: usize) -> String
 ```
 
-**Purpose**: Truncates a string to a byte budget by preserving the beginning and end and inserting a marker that reports removed character count. It is the simpler public truncation API.
+**Purpose**: Shortens a string to a maximum byte budget while preserving the start and end. The marker in the middle says how many characters were removed.
 
-**Data flow**: It takes `s: &str` and `max_bytes: usize`, passes them to `truncate_with_byte_estimate` with `use_tokens` set to `false`, and returns the resulting `String`.
+**Data flow**: It receives the original text and a maximum number of bytes. It passes those to the shared truncation routine with character-count reporting turned on, and returns the resulting string.
 
-**Call relations**: This is a thin wrapper over `truncate_with_byte_estimate`, used when callers want character-count wording in the truncation marker rather than token-based wording.
+**Call relations**: This is the simple public entry point for character-based truncation. It delegates all real work to truncate_with_byte_estimate, which performs the safe splitting and marker creation.
 
 *Call graph*: calls 1 internal fn (truncate_with_byte_estimate).
 
@@ -101,11 +103,11 @@ fn truncate_middle_chars(s: &str, max_bytes: usize) -> String
 fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (String, Option<u64>)
 ```
 
-**Purpose**: Truncates a string according to an approximate token budget and reports the original approximate token count when truncation actually happened. It is intended for LLM-style token budgeting without exact tokenization.
+**Purpose**: Shortens text to fit an approximate token budget, while still keeping both the beginning and the end. It also tells the caller the estimated original token count when truncation actually happened.
 
-**Data flow**: It takes `s` and `max_tokens`. It returns `(String::new(), None)` for empty input, returns the original string and `None` when the string length already fits within `approx_bytes_for_tokens(max_tokens)`, otherwise truncates via `truncate_with_byte_estimate(..., use_tokens = true)`, computes `total_tokens` from `approx_token_count(s)` converted to `u64`, and returns either `(truncated, None)` if no change occurred or `(truncated, Some(total_tokens))` if truncation did occur.
+**Data flow**: It receives text and a maximum number of approximate tokens. Empty text becomes an empty string with no truncation note. If the text already fits the estimated byte budget, it is returned unchanged. Otherwise, the token budget is converted into an approximate byte budget, the text is truncated, and the original token count is estimated and returned if the text changed.
 
-**Call relations**: This public API orchestrates the token-budget path by delegating byte conversion to `approx_bytes_for_tokens`, truncation to `truncate_with_byte_estimate`, and token counting to `approx_token_count`.
+**Call relations**: This is the public entry point for callers that think in tokens rather than bytes, such as code preparing text for a language-model prompt. It uses approx_bytes_for_tokens to turn the budget into bytes, truncate_with_byte_estimate to do the actual trimming, and approx_token_count to report the original size.
 
 *Call graph*: calls 3 internal fn (approx_bytes_for_tokens, approx_token_count, truncate_with_byte_estimate); 2 external calls (new, try_from).
 
@@ -116,11 +118,11 @@ fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (String, Opt
 fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> String
 ```
 
-**Purpose**: Performs the core middle-truncation algorithm for both byte-budget and token-budget modes. It computes preserved prefix/suffix slices, the truncation marker, and the final assembled output.
+**Purpose**: This is the central worker that decides whether a string needs shortening and, if so, builds the final shortened version. It can label the removed middle either as characters or as approximate tokens.
 
-**Data flow**: It takes `s`, `max_bytes`, and `use_tokens`. It returns an empty `String` for empty input, returns only a formatted marker when `max_bytes == 0`, returns `s.to_string()` when the input already fits, otherwise computes total bytes/chars, splits the budget with `split_budget`, splits the string with `split_string`, computes removed units with `removed_units`, formats the marker with `format_truncation_marker`, assembles the final string with `assemble_truncated_output`, and returns it.
+**Data flow**: It receives text, a maximum byte budget, and a choice of whether the marker should talk about tokens or characters. It returns early for empty text, zero budget, or text that already fits. When truncation is needed, it splits the byte budget between the front and back, extracts safe prefix and suffix slices, calculates the removed amount, creates the marker, and returns prefix plus marker plus suffix.
 
-**Call relations**: This private function is the shared implementation behind `truncate_middle_chars` and `truncate_middle_with_token_budget`. It delegates all sub-decisions—budget splitting, UTF-8-safe slicing, removed-count calculation, marker formatting, and final concatenation—to dedicated helpers.
+**Call relations**: Both public truncation functions call this routine so they share the same behavior. It coordinates the helper functions: split_budget divides the space, split_string finds safe slices, removed_units chooses the right count, format_truncation_marker writes the middle message, and assemble_truncated_output joins the final text.
 
 *Call graph*: calls 5 internal fn (assemble_truncated_output, format_truncation_marker, removed_units, split_budget, split_string); called by 2 (truncate_middle_chars, truncate_middle_with_token_budget); 1 external calls (new).
 
@@ -131,11 +133,11 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
 fn approx_token_count(text: &str) -> usize
 ```
 
-**Purpose**: Estimates token count from byte length using a fixed 4-bytes-per-token heuristic. It rounds up so any nonzero remainder counts as another token.
+**Purpose**: Estimates how many tokens a piece of text contains using the file’s simple rule of about four bytes per token. This is useful when the program needs a quick size estimate rather than an exact tokenizer.
 
-**Data flow**: It takes `text: &str`, reads `text.len()`, applies saturating arithmetic to compute `(len + 3) / 4`, and returns the resulting `usize`.
+**Data flow**: It receives text, reads its byte length, rounds that length up to the nearest four-byte group, and returns the resulting token estimate.
 
-**Call relations**: This helper is used by `truncate_middle_with_token_budget` to report the original approximate token count when truncation occurs.
+**Call relations**: truncate_middle_with_token_budget calls this after truncation so it can tell the caller roughly how large the original text was. It does not call other project code; it is a small calculation helper.
 
 *Call graph*: called by 1 (truncate_middle_with_token_budget).
 
@@ -146,11 +148,11 @@ fn approx_token_count(text: &str) -> usize
 fn approx_bytes_for_tokens(tokens: usize) -> usize
 ```
 
-**Purpose**: Converts an approximate token budget into a byte budget using the same fixed 4-bytes-per-token heuristic. It saturates on overflow.
+**Purpose**: Converts an approximate token limit into an approximate byte limit. It uses the same four-bytes-per-token rule as the rest of this file.
 
-**Data flow**: It takes `tokens: usize`, multiplies by `APPROX_BYTES_PER_TOKEN` with `saturating_mul`, and returns the resulting byte budget.
+**Data flow**: It receives a token count, multiplies it by the approximate bytes per token, and returns the byte budget. The multiplication is saturating, meaning it avoids overflowing if the number is extremely large.
 
-**Call relations**: This helper is used by `truncate_middle_with_token_budget` both for the early-fit check and for the actual truncation budget.
+**Call relations**: truncate_middle_with_token_budget uses this before truncating, because the underlying truncation routine works with byte budgets. This function is the bridge from token-based thinking to byte-based slicing.
 
 *Call graph*: called by 1 (truncate_middle_with_token_budget).
 
@@ -161,11 +163,11 @@ fn approx_bytes_for_tokens(tokens: usize) -> usize
 fn approx_tokens_from_byte_count(bytes: usize) -> u64
 ```
 
-**Purpose**: Estimates how many tokens correspond to a byte count using the same rounded-up 4-byte heuristic. It is the inverse-style helper for removed-byte accounting.
+**Purpose**: Estimates how many tokens a number of bytes represents. It rounds upward so that any leftover bytes still count as another token-sized chunk.
 
-**Data flow**: It takes `bytes: usize`, casts to `u64`, computes `(bytes + 3) / 4` with saturation, and returns the result as `u64`.
+**Data flow**: It receives a byte count, converts it to a 64-bit number, divides by the four-byte token estimate with rounding up, and returns the approximate token count.
 
-**Call relations**: This helper is called by `removed_units` when token-based truncation markers need to describe how many approximate tokens were removed.
+**Call relations**: removed_units calls this when the truncation marker needs to report removed tokens instead of removed characters. It keeps token-count math in one place.
 
 *Call graph*: called by 1 (removed_units).
 
@@ -176,11 +178,11 @@ fn approx_tokens_from_byte_count(bytes: usize) -> u64
 fn split_string(s: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &str, &str)
 ```
 
-**Purpose**: Splits a string into a preserved prefix and suffix under separate byte budgets while counting how many whole characters are removed between them. It respects UTF-8 boundaries and avoids overlapping output slices.
+**Purpose**: Finds the safe beginning and ending pieces to keep from a string. Its main job is to avoid cutting in the middle of a UTF-8 character.
 
-**Data flow**: It takes `s`, `beginning_bytes`, and `end_bytes`. For empty input it returns `(0, "", "")`; otherwise it computes the target tail start, walks `s.char_indices()`, extends `prefix_end` while characters fit in the prefix budget, marks `suffix_start` once indices reach the tail region, counts removed middle characters, clamps `suffix_start` to at least `prefix_end`, slices `before` and `after` from `s`, and returns `(removed_chars, before, after)`.
+**Data flow**: It receives the original text, a byte budget for the beginning, and a byte budget for the end. It walks character by character, chooses the last safe prefix boundary within the beginning budget, chooses the first safe suffix boundary near the end, counts the characters skipped in the middle, and returns the removed character count plus the two string slices to keep.
 
-**Call relations**: This helper is called only by `truncate_with_byte_estimate`. It encapsulates the UTF-8-aware slicing logic that determines exactly what content survives on each side of the truncation marker.
+**Call relations**: truncate_with_byte_estimate calls this once it knows how much room to give the prefix and suffix. The slices it returns are later combined with the marker by assemble_truncated_output.
 
 *Call graph*: called by 1 (truncate_with_byte_estimate).
 
@@ -191,11 +193,11 @@ fn split_string(s: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &s
 fn split_budget(budget: usize) -> (usize, usize)
 ```
 
-**Purpose**: Divides a total byte budget between the left and right preserved portions of a truncated string. It gives the extra byte, when odd, to the right side.
+**Purpose**: Divides the available byte budget between the beginning and the end of the string. It gives about half to each side, with any odd extra byte going to the end.
 
-**Data flow**: It takes `budget: usize`, computes `left = budget / 2`, and returns `(left, budget - left)`.
+**Data flow**: It receives one total budget number. It calculates the left half and returns that plus the remaining amount for the right side.
 
-**Call relations**: This helper is used by `truncate_with_byte_estimate` before calling `split_string`, keeping budget partitioning separate from string slicing.
+**Call relations**: truncate_with_byte_estimate calls this before asking split_string for the actual prefix and suffix. It keeps the policy of “show both ends” simple and consistent.
 
 *Call graph*: called by 1 (truncate_with_byte_estimate).
 
@@ -206,11 +208,11 @@ fn split_budget(budget: usize) -> (usize, usize)
 fn format_truncation_marker(use_tokens: bool, removed_count: u64) -> String
 ```
 
-**Purpose**: Builds the human-readable marker inserted between preserved prefix and suffix. The wording changes depending on whether truncation is measured in chars or approximate tokens.
+**Purpose**: Creates the visible message that sits between the kept beginning and ending text. The message says either how many tokens or how many characters were removed.
 
-**Data flow**: It takes `use_tokens` and `removed_count`, formats either `…{removed_count} tokens truncated…` or `…{removed_count} chars truncated…`, and returns the resulting `String`.
+**Data flow**: It receives a flag saying whether to talk about tokens and a count of removed units. It formats a string such as “... tokens truncated ...” or “... chars truncated ...” using an ellipsis character.
 
-**Call relations**: This helper is called by `truncate_with_byte_estimate` after removed-unit calculation so marker wording stays centralized and consistent.
+**Call relations**: truncate_with_byte_estimate calls this after it has calculated what was removed. The returned marker is then inserted between the prefix and suffix.
 
 *Call graph*: called by 1 (truncate_with_byte_estimate); 1 external calls (format!).
 
@@ -221,11 +223,11 @@ fn format_truncation_marker(use_tokens: bool, removed_count: u64) -> String
 fn removed_units(use_tokens: bool, removed_bytes: usize, removed_chars: usize) -> u64
 ```
 
-**Purpose**: Chooses the numeric quantity reported in the truncation marker based on mode: removed characters for char mode or approximate removed tokens for token mode. It also handles integer conversion safely.
+**Purpose**: Chooses the number that should appear in the truncation marker. It reports either approximate tokens removed or characters removed, depending on how the caller wants to describe the truncation.
 
-**Data flow**: It takes `use_tokens`, `removed_bytes`, and `removed_chars`. In token mode it returns `approx_tokens_from_byte_count(removed_bytes)`; otherwise it converts `removed_chars` to `u64`, falling back to `u64::MAX` on overflow.
+**Data flow**: It receives a choice between token mode and character mode, plus the removed byte count and removed character count. In token mode it converts bytes to approximate tokens; in character mode it converts the character count into the marker’s numeric type. The result is a 64-bit count suitable for display.
 
-**Call relations**: This helper is used by `truncate_with_byte_estimate` to decouple marker accounting from the slicing algorithm.
+**Call relations**: truncate_with_byte_estimate calls this just before creating the marker. When token reporting is needed, it hands the byte count to approx_tokens_from_byte_count; otherwise it uses the character count gathered by split_string.
 
 *Call graph*: calls 1 internal fn (approx_tokens_from_byte_count); called by 1 (truncate_with_byte_estimate); 1 external calls (try_from).
 
@@ -236,11 +238,11 @@ fn removed_units(use_tokens: bool, removed_bytes: usize, removed_chars: usize) -
 fn assemble_truncated_output(prefix: &str, suffix: &str, marker: &str) -> String
 ```
 
-**Purpose**: Concatenates the preserved prefix, truncation marker, and preserved suffix into the final output string. It preallocates capacity to avoid unnecessary reallocations.
+**Purpose**: Builds the final shortened string from the kept beginning, the marker, and the kept ending. It is the last step of the truncation process.
 
-**Data flow**: It takes `prefix`, `suffix`, and `marker`, allocates a `String` with capacity equal to the combined lengths plus one extra byte, pushes the three parts in order, and returns the assembled string.
+**Data flow**: It receives three string pieces: prefix, suffix, and marker. It creates a new string with enough space for them, appends the prefix, then the marker, then the suffix, and returns the combined result.
 
-**Call relations**: This is the final assembly step called by `truncate_with_byte_estimate` once all truncation decisions have been made.
+**Call relations**: truncate_with_byte_estimate calls this after all decisions have been made. It does not decide what to keep or what to report; it simply puts the prepared pieces together.
 
 *Call graph*: called by 1 (truncate_with_byte_estimate); 1 external calls (with_capacity).
 
@@ -249,11 +251,11 @@ fn assemble_truncated_output(prefix: &str, suffix: &str, marker: &str) -> String
 
 `util` · `cross-cutting`
 
-This module is the crate root for `utils/string`. It re-exports the JSON serializer helper and the truncation utilities from sibling modules, then defines a handful of independent string helpers used elsewhere in the system.
+This file gathers string utilities that are useful across the project. Some of the tools are defined here, and others are re-exported from nearby modules so callers can import them from one simple place. In everyday terms, it is like a shared drawer of text-safe scissors, labels, and format converters.
 
-`take_bytes_at_char_boundary` is a low-level UTF-8-safe slicer: given a byte budget, it returns either the original `&str` or the longest prefix whose end lands on a character boundary. It walks `char_indices` and never returns an invalid UTF-8 slice. `sanitize_metric_tag_value` converts arbitrary text into a metrics-safe tag value by preserving only ASCII alphanumerics plus `.`, `_`, `-`, and `/`, replacing everything else with `_`, trimming leading/trailing underscores, and falling back to `"unspecified"` if the result is empty or contains no ASCII alphanumeric characters. It also caps the final string at 256 bytes by slicing the already-ASCII sanitized string.
+The file solves several practical problems. Rust strings are stored as bytes, but human characters can take more than one byte. `take_bytes_at_char_boundary` makes sure text is shortened only between complete characters, so the result is still valid text. `sanitize_metric_tag_value` turns arbitrary user or system text into a safe metric tag value, replacing characters that monitoring systems may reject and falling back to `unspecified` when nothing meaningful remains. `find_uuids` scans text for UUIDs, which are standard unique ID strings. `normalize_markdown_hash_location_suffix` converts Markdown-style source links like `#L74C3-L76C9` into the more familiar terminal format `:74:3-76:9`.
 
-`find_uuids` lazily initializes a compiled `regex_lite::Regex` in a `OnceLock` and returns every substring matching the canonical 8-4-4-4-12 hexadecimal UUID pattern. `normalize_markdown_hash_location_suffix` converts GitHub-style fragments like `#L74C3-L76C9` into terminal-friendly `:74:3-76:9` syntax. It strips the leading `#`, splits optional ranges on `-`, parses each point with the private `parse_markdown_hash_location_point`, and rebuilds the normalized suffix. Parsing is intentionally permissive about numeric validation: it only enforces the `L...` and optional `C...` shape, returning `None` when the fragment does not match that structure.
+The tests at the bottom act as examples and safeguards. They check that UUID searching, tag cleanup, and location conversion behave correctly, including edge cases such as non-ASCII characters and invalid tag values.
 
 #### Function details
 
@@ -263,11 +265,11 @@ This module is the crate root for `utils/string`. It re-exports the JSON seriali
 fn take_bytes_at_char_boundary(s: &str, maxb: usize) -> &str
 ```
 
-**Purpose**: Returns the longest prefix of a string that fits within a byte limit without cutting through a UTF-8 code point. It is a safe alternative to raw byte slicing.
+**Purpose**: Returns the beginning of a string without going over a requested byte limit, while making sure it never cuts through the middle of a character. This matters for non-English text and emoji, where one visible character can use several bytes.
 
-**Data flow**: It takes `s: &str` and `maxb: usize`. If `s.len() <= maxb`, it returns `s` unchanged; otherwise it iterates `s.char_indices()`, tracks the last character end offset not exceeding `maxb`, and returns `&s[..last_ok]`.
+**Data flow**: It receives a string slice and a maximum byte count. If the whole string already fits, it returns it unchanged. Otherwise it walks character by character, remembers the last byte position that ended cleanly after a full character, and returns the prefix up to that safe point.
 
-**Call relations**: This is a standalone helper intended for callers that need byte-budgeted prefixes while preserving UTF-8 validity. It does not delegate to other local functions.
+**Call relations**: This is a standalone utility for any code that needs a byte-sized preview or prefix of text. It does not call other project functions; callers use it when they need shortening that keeps the string valid.
 
 
 ##### `sanitize_metric_tag_value`  (lines 30–51)
@@ -276,11 +278,11 @@ fn take_bytes_at_char_boundary(s: &str, maxb: usize) -> &str
 fn sanitize_metric_tag_value(value: &str) -> String
 ```
 
-**Purpose**: Transforms arbitrary input into a metric tag value restricted to ASCII alphanumerics plus `.`, `_`, `-`, and `/`. It also normalizes degenerate results to `"unspecified"` and enforces a maximum length.
+**Purpose**: Turns any text into a safe metric tag value. Metric tags are labels sent to monitoring systems, and those systems often reject spaces, punctuation, or empty-looking values.
 
-**Data flow**: It takes `value: &str`, maps each character to itself if allowed or to `'_'` otherwise, collects the result into `sanitized`, trims leading and trailing underscores into `trimmed`, and then returns either `"unspecified"`, `trimmed.to_string()`, or the first 256 bytes of `trimmed` as a new `String`.
+**Data flow**: It receives a text value. It replaces every character that is not an ASCII letter, digit, dot, underscore, hyphen, or slash with an underscore. Then it removes underscores from the beginning and end, checks whether anything useful is left, returns `unspecified` if not, and otherwise limits the result to 256 characters.
 
-**Call relations**: This helper is used wherever external strings must satisfy metric tag validation rules. Its logic is self-contained and relies on the invariant that the post-mapping string is ASCII, making the final byte truncation safe.
+**Call relations**: This function stands on its own as a cleanup step before sending labels to metrics or monitoring code. The tests call it with awkward values to show that it replaces bad characters and avoids producing empty or meaningless tags.
 
 
 ##### `find_uuids`  (lines 55–65)
@@ -289,11 +291,11 @@ fn sanitize_metric_tag_value(value: &str) -> String
 fn find_uuids(s: &str) -> Vec<String>
 ```
 
-**Purpose**: Finds all substrings in the input that match the canonical hexadecimal UUID textual form. It returns each match as an owned `String` in encounter order.
+**Purpose**: Finds UUIDs inside a larger piece of text. A UUID is a common 36-character unique identifier, written as groups of hexadecimal characters separated by hyphens.
 
-**Data flow**: It takes `s: &str`, initializes or reuses a static `OnceLock<regex_lite::Regex>` containing the UUID pattern, runs `find_iter(s)`, converts each match to `String`, collects them into a `Vec<String>`, and returns it.
+**Data flow**: It receives a string to scan. The first time it runs, it builds and stores a regular expression, which is a search pattern for UUID-shaped text. It then searches the input, copies every matching UUID into a new list, and returns that list of strings.
 
-**Call relations**: This is a reusable extraction helper for any code that needs to scan free-form text for UUIDs. It encapsulates regex compilation behind `OnceLock` so repeated calls reuse the same compiled pattern.
+**Call relations**: This function uses the external regular-expression constructor `new` to create its UUID search pattern once and reuse it later. The tests call it to confirm it finds multiple UUIDs, skips invalid lookalikes, and works correctly when non-ASCII characters appear nearby.
 
 *Call graph*: 1 external calls (new).
 
@@ -304,11 +306,11 @@ fn find_uuids(s: &str) -> Vec<String>
 fn normalize_markdown_hash_location_suffix(suffix: &str) -> Option<String>
 ```
 
-**Purpose**: Converts markdown-style line or line-column fragments into a colon-based terminal location suffix. It supports both single points and ranges.
+**Purpose**: Converts a Markdown-style code location suffix into a format that is easier to use in terminals and editor-like output. For example, it can turn `#L74C3-L76C9` into `:74:3-76:9`.
 
-**Data flow**: It takes `suffix: &str`, strips a leading `#`, splits the remainder once on `-` into start and optional end fragments, parses each point with `parse_markdown_hash_location_point`, then builds and returns `Some(String)` in the form `:line[:column][-line[:column]]`; any parse failure returns `None`.
+**Data flow**: It receives a suffix string. It first requires the string to start with `#`; if not, it gives back `None`, meaning it could not convert it. It then separates a start point and optional end point, asks `parse_markdown_hash_location_point` to read each point, and builds a new string using colons for line and column numbers. If any required piece cannot be parsed in the expected shape, it returns `None`; otherwise it returns the normalized suffix.
 
-**Call relations**: This is the public normalization entry point and delegates point-shape parsing to `parse_markdown_hash_location_point`. Callers use it when translating markdown anchor syntax into terminal/editor-friendly location strings.
+**Call relations**: This function is the public converter for source-location suffixes. It relies on `parse_markdown_hash_location_point` for the smaller job of reading one `L...C...` point, and uses the standard string-building conversion `from` while assembling the result. The location-format tests call it for both a single point and a range.
 
 *Call graph*: calls 1 internal fn (parse_markdown_hash_location_point); 1 external calls (from).
 
@@ -319,11 +321,11 @@ fn normalize_markdown_hash_location_suffix(suffix: &str) -> Option<String>
 fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>)>
 ```
 
-**Purpose**: Parses one markdown location point of the form `Lline` or `LlineCcolumn`. It extracts the line and optional column substrings without validating that they are numeric.
+**Purpose**: Reads one Markdown-style location point such as `L74` or `L74C3`. It extracts the line number and, when present, the column number.
 
-**Data flow**: It takes `point: &str`, requires and strips a leading `'L'`, then splits once on `'C'`. It returns `Some((line, Some(column)))`, `Some((line, None))`, or `None` if the leading `L` is missing.
+**Data flow**: It receives one point string. It requires the string to begin with `L`; if that marker is missing, it returns `None`. After the `L`, it looks for `C`: if found, the text before `C` becomes the line and the text after it becomes the column; if not found, the whole remainder becomes the line with no column.
 
-**Call relations**: This private helper is called only from `normalize_markdown_hash_location_suffix`. It isolates the fragment-shape parsing so the public function can focus on range handling and output formatting.
+**Call relations**: This is a small helper used by `normalize_markdown_hash_location_suffix`. The larger converter calls it once for the start point and, for ranges, once more for the end point, so the parsing rules stay in one place.
 
 *Call graph*: called by 1 (normalize_markdown_hash_location_suffix).
 
@@ -334,11 +336,11 @@ fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>
 fn find_uuids_finds_multiple()
 ```
 
-**Purpose**: Checks that UUID extraction returns multiple valid UUID substrings from one input string. It verifies ordering and exact match boundaries.
+**Purpose**: Checks that UUID searching can find more than one valid UUID in the same input string.
 
-**Data flow**: The test defines an input containing two UUIDs embedded in surrounding text and asserts that `find_uuids(input)` returns a two-element vector with those exact UUID strings.
+**Data flow**: It creates a sample string containing two UUIDs mixed with other text. It calls `find_uuids` and compares the returned list with the two expected UUID strings.
 
-**Call relations**: It exercises the positive path of `find_uuids`, confirming the regex finds repeated matches in one scan.
+**Call relations**: This test supports `find_uuids` by showing the normal success path. It uses the external `assert_eq!` test macro to fail loudly if the returned list is not exactly right.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -349,11 +351,11 @@ fn find_uuids_finds_multiple()
 fn find_uuids_ignores_invalid()
 ```
 
-**Purpose**: Verifies that malformed UUID-like text does not produce false-positive matches. It protects the regex against overmatching invalid shapes.
+**Purpose**: Checks that UUID searching does not accept text that only partly looks like a UUID.
 
-**Data flow**: The test passes a nonconforming UUID-like string to `find_uuids` and asserts that the returned vector is empty.
+**Data flow**: It creates an invalid UUID-like string, passes it to `find_uuids`, and expects an empty list back.
 
-**Call relations**: It covers the negative path of `find_uuids`, complementing the multiple-match test.
+**Call relations**: This test guards against false positives in `find_uuids`. It uses `assert_eq!` to compare the actual result with an empty vector.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -364,11 +366,11 @@ fn find_uuids_ignores_invalid()
 fn find_uuids_handles_non_ascii_without_overlap()
 ```
 
-**Purpose**: Checks that UUID matching works correctly in the presence of preceding non-ASCII characters and stops at the canonical UUID length. It guards against byte/character indexing issues and overlong matches.
+**Purpose**: Checks that UUID searching still works correctly when non-ASCII text, such as an emoji, appears near the UUID.
 
-**Data flow**: The test supplies a string beginning with an emoji followed by an overlong hexadecimal run and asserts that `find_uuids` returns only the first canonical-length UUID substring.
+**Data flow**: It builds an input string containing an emoji followed by a UUID plus extra trailing characters. It calls `find_uuids` and expects only the valid UUID-length part to be returned.
 
-**Call relations**: It exercises `find_uuids` on mixed Unicode input, validating that regex matching remains correct without overlap into trailing hex characters.
+**Call relations**: This test protects `find_uuids` around Unicode text and nearby extra characters. It uses `assert_eq!` to verify the search result exactly.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -379,11 +381,11 @@ fn find_uuids_handles_non_ascii_without_overlap()
 fn sanitize_metric_tag_value_trims_and_fills_unspecified()
 ```
 
-**Purpose**: Verifies that a sanitized value containing no ASCII alphanumeric characters falls back to `"unspecified"`. It covers the degenerate-output branch.
+**Purpose**: Checks that a metric tag value made only of non-meaningful allowed punctuation does not survive as an empty or useless label.
 
-**Data flow**: The test passes `"///"` to `sanitize_metric_tag_value` and asserts that the returned string is `"unspecified"`.
+**Data flow**: It passes `///` into `sanitize_metric_tag_value`. After trimming and validation, the expected output is `unspecified`.
 
-**Call relations**: It targets the post-trimming validation logic in `sanitize_metric_tag_value`.
+**Call relations**: This test documents an important fallback behavior of `sanitize_metric_tag_value`. It uses `assert_eq!` to make sure the fallback word is returned.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -394,11 +396,11 @@ fn sanitize_metric_tag_value_trims_and_fills_unspecified()
 fn sanitize_metric_tag_value_replaces_invalid_chars()
 ```
 
-**Purpose**: Checks that invalid metric-tag characters are replaced with underscores and trimmed appropriately. It demonstrates the normal sanitization path.
+**Purpose**: Checks that invalid characters in a metric tag value are replaced with underscores and then cleaned up at the edges.
 
-**Data flow**: The test passes `"bad value!"` to `sanitize_metric_tag_value` and asserts that the result is `"bad_value"`.
+**Data flow**: It passes `bad value!` into `sanitize_metric_tag_value`. The space and exclamation mark are replaced with underscores, the trailing underscore is trimmed away, and the expected result is `bad_value`.
 
-**Call relations**: It exercises the character-mapping and trimming behavior of `sanitize_metric_tag_value`.
+**Call relations**: This test demonstrates the common cleanup path for `sanitize_metric_tag_value`. It uses `assert_eq!` to compare the cleaned value with the expected safe tag.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -409,11 +411,11 @@ fn sanitize_metric_tag_value_replaces_invalid_chars()
 fn normalize_markdown_hash_location_suffix_converts_single_location()
 ```
 
-**Purpose**: Verifies conversion of a single markdown line-column fragment into colon syntax. It covers the simplest successful normalization case.
+**Purpose**: Checks that a single Markdown-style line and column marker is converted into terminal-style notation.
 
-**Data flow**: The test calls `normalize_markdown_hash_location_suffix("#L74C3")` and asserts that it returns `Some(":74:3".to_string())`.
+**Data flow**: It passes `#L74C3` into `normalize_markdown_hash_location_suffix` and expects `Some(":74:3")` back.
 
-**Call relations**: It exercises the single-point path through `normalize_markdown_hash_location_suffix` and `parse_markdown_hash_location_point`.
+**Call relations**: This test covers the single-location path through `normalize_markdown_hash_location_suffix`, which in turn uses `parse_markdown_hash_location_point`. It uses `assert_eq!` to verify the exact converted string.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -424,11 +426,11 @@ fn normalize_markdown_hash_location_suffix_converts_single_location()
 fn normalize_markdown_hash_location_suffix_converts_ranges()
 ```
 
-**Purpose**: Verifies conversion of a markdown range fragment into colon-based range syntax. It confirms that both endpoints are parsed and formatted correctly.
+**Purpose**: Checks that a Markdown-style range with start and end positions is converted correctly.
 
-**Data flow**: The test calls `normalize_markdown_hash_location_suffix("#L74C3-L76C9")` and asserts that it returns `Some(":74:3-76:9".to_string())`.
+**Data flow**: It passes `#L74C3-L76C9` into `normalize_markdown_hash_location_suffix` and expects `Some(":74:3-76:9")` back.
 
-**Call relations**: It exercises the range-handling branch in `normalize_markdown_hash_location_suffix`, including two calls to `parse_markdown_hash_location_point`.
+**Call relations**: This test covers the range path through `normalize_markdown_hash_location_suffix`, where the helper parser is used for both endpoints. It uses `assert_eq!` to confirm the final range format.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -438,11 +440,13 @@ These utilities format values and user-facing text into concise, readable displa
 
 ### `protocol/src/num_format.rs`
 
-`util` · `cross-cutting formatting`
+`util` · `cross-cutting`
 
-This utility module wraps ICU decimal formatting behind a small API tailored to Codex UI needs. `make_local_formatter` tries to discover the current system locale via `sys_locale::get_locale`, parse it into an ICU `Locale`, and build a `DecimalFormatter`; any failure returns `None`. `make_en_us_formatter` is the guaranteed fallback and intentionally panics only if the hard-coded `en-US` locale is somehow invalid. `formatter()` stores the chosen formatter in a `OnceLock`, so locale detection and formatter construction happen at most once per process.
+This file is about making numbers easier for people to read. A raw number like 123456789 is precise, but it is hard to scan quickly. This code can display it as "123,456,789" with the right separator for the user's region, or as "123M" when a compact summary is better.
 
-Two public formatting styles are exposed. `format_with_separators` renders an `i64` with locale-aware grouping separators, such as commas in `en-US`. `format_si_suffix` renders counts with three significant figures and base-10 suffixes `K`, `M`, and `G`. The internal `format_si_suffix_with_formatter` clamps negative inputs to zero, uses a closure to scale and round values to 0, 1, or 2 fractional digits depending on magnitude, and chooses the first unit where the rounded value stays below 1000. Values above `1000G` are rendered as whole gigas with grouped separators. The test suite fixes the exact thresholds and rounding behavior around boundaries like `999_500 -> 1.00M` and `999_950_000 -> 1.00G`.
+The file first builds a decimal formatter, which is an object from the ICU library that knows how to write numbers for a particular language and region. For example, some locales use commas between thousands, while others use spaces or periods. The code tries to detect the computer's current locale. If that fails, it uses "en-US" as a safe default. The chosen formatter is stored once in a `OnceLock`, which is like putting a shared tool on a workbench: it is created the first time someone needs it, then reused after that.
+
+There are two public helpers. `format_with_separators` keeps the full number but adds grouping separators. `format_si_suffix` shortens non-negative counts to about three significant figures using base-10 suffixes: K for thousands, M for millions, and G for billions. Very large values above 1000G stay in G rather than introducing a larger unit. The test checks the boundary cases where rounding changes one suffix into the next.
 
 #### Function details
 
@@ -452,11 +456,11 @@ Two public formatting styles are exposed. `format_with_separators` renders an `i
 fn make_local_formatter() -> Option<DecimalFormatter>
 ```
 
-**Purpose**: Attempts to build an ICU decimal formatter for the current system locale. Any locale lookup, parse, or formatter-construction failure yields `None`.
+**Purpose**: This function tries to create a number formatter that matches the user's current system locale. Someone uses it when they want numbers to look natural for the person running the program.
 
-**Data flow**: Calls `sys_locale::get_locale()`, parses the resulting locale string into `Locale`, then calls `DecimalFormatter::try_new` with default options. It returns `Some(DecimalFormatter)` on success or `None` if any step fails.
+**Data flow**: It starts with no input. It asks the operating system for the current locale, tries to parse that locale into ICU's locale format, and then asks ICU to build a decimal formatter with default options. If any step fails, it returns nothing; if all steps work, it returns a ready-to-use formatter.
 
-**Call relations**: Used only by `formatter()` during one-time formatter initialization. It is the preferred path before falling back to `en-US`.
+**Call relations**: This is part of the setup path for the shared formatter. `formatter` calls it when the program first needs number formatting, and if it cannot produce a local formatter, `formatter` falls back to the built-in US English formatter.
 
 *Call graph*: 3 external calls (try_new, default, get_locale).
 
@@ -467,11 +471,11 @@ fn make_local_formatter() -> Option<DecimalFormatter>
 fn make_en_us_formatter() -> DecimalFormatter
 ```
 
-**Purpose**: Builds a guaranteed fallback decimal formatter for the hard-coded `en-US` locale. It uses `expect` because failure would indicate a programming or ICU configuration error, not user input.
+**Purpose**: This function creates a guaranteed fallback number formatter for US English. It is used when the program cannot detect or use the user's own locale.
 
-**Data flow**: Parses the string `"en-US"` into `Locale`, constructs a `DecimalFormatter` with default options, and returns it. It panics if either parse or formatter creation fails.
+**Data flow**: It starts with the fixed locale text `en-US`, parses it, and builds an ICU decimal formatter with default options. Because `en-US` is expected to always be valid, failures are treated as impossible programmer or library errors and cause the program to stop rather than silently continue.
 
-**Call relations**: Called by `formatter()` when local formatter creation fails, and directly by the test to ensure deterministic `en-US` output.
+**Call relations**: The shared `formatter` uses this when local formatter creation fails. The test `tests::kmg` also calls it directly so the expected outputs are stable, because US English formatting always uses commas and periods in the tested way.
 
 *Call graph*: called by 1 (kmg); 2 external calls (try_new, default).
 
@@ -482,11 +486,11 @@ fn make_en_us_formatter() -> DecimalFormatter
 fn formatter() -> &'static DecimalFormatter
 ```
 
-**Purpose**: Returns the process-wide cached decimal formatter, initializing it on first use. It prefers the system locale and falls back to `en-US`.
+**Purpose**: This function provides one shared decimal formatter for the rest of the file. It avoids rebuilding the formatter every time a number is printed.
 
-**Data flow**: Uses a static `OnceLock<DecimalFormatter>` and `get_or_init` to either return the existing formatter or initialize it with `make_local_formatter().unwrap_or_else(make_en_us_formatter)`. It returns a shared `'static` reference.
+**Data flow**: It receives no input. The first time it is called, it creates a formatter by trying the user's locale and then falling back to US English. It stores that formatter in a `OnceLock`, a one-time storage cell, and returns a shared reference to it. Later calls simply return the same stored formatter.
 
-**Call relations**: Called by both public formatting functions. It centralizes lazy initialization and caching so formatting calls stay cheap after the first use.
+**Call relations**: `format_with_separators` and `format_si_suffix` call this whenever they need locale-aware number formatting. It is the small central doorway between the public formatting helpers and the formatter-building functions.
 
 *Call graph*: called by 2 (format_si_suffix, format_with_separators); 1 external calls (new).
 
@@ -497,11 +501,11 @@ fn formatter() -> &'static DecimalFormatter
 fn format_with_separators(n: i64) -> String
 ```
 
-**Purpose**: Formats an integer with locale-aware grouping separators. It is the simple public API for full numeric rendering without SI suffixes.
+**Purpose**: This public function writes a whole number with locale-aware digit grouping, such as turning `12345` into `12,345` in US English. It is useful wherever the program wants an exact number that is easier to read.
 
-**Data flow**: Accepts `n: i64`, obtains the cached formatter via `formatter()`, converts `n` into `icu_decimal::input::Decimal`, formats it, converts the formatted value to `String`, and returns it.
+**Data flow**: It takes an `i64`, which is a signed 64-bit whole number. It gets the shared formatter, converts the number into ICU's decimal input type, formats it, and returns the result as a `String`. It does not change any outside data except possibly causing the shared formatter to be created on first use.
 
-**Call relations**: Used by higher-level UI formatting such as credit-amount display. It delegates all locale selection and caching to `formatter()`.
+**Call relations**: Other parts of the project, such as `format_credit_amount`, call this when they need readable full-size numbers. Internally it relies on `formatter` for the locale-specific rules.
 
 *Call graph*: calls 1 internal fn (formatter); called by 1 (format_credit_amount); 1 external calls (from).
 
@@ -512,11 +516,11 @@ fn format_with_separators(n: i64) -> String
 fn format_with_separators_with_formatter(n: i64, formatter: &DecimalFormatter) -> String
 ```
 
-**Purpose**: Formats an integer with a caller-supplied decimal formatter. This is the internal deterministic helper used by tests and by the large-number fallback in SI formatting.
+**Purpose**: This helper formats a whole number with separators using a formatter supplied by the caller. It exists so code that already has a specific formatter, especially internal code or tests, can avoid using the global shared one.
 
-**Data flow**: Accepts `n: i64` and `&DecimalFormatter`, converts `n` into `Decimal`, formats it, converts the result to `String`, and returns it. It mutates no state.
+**Data flow**: It takes a number and a reference to a decimal formatter. It converts the number into ICU's decimal representation, asks the supplied formatter to turn it into text, and returns that text as a `String`.
 
-**Call relations**: Used by `format_si_suffix_with_formatter` for the `>1000G` fallback path. It avoids re-fetching the global formatter when one is already available.
+**Call relations**: This is used inside `format_si_suffix_with_formatter` for the special case of extremely large values above 1000G. There, the code still wants grouped digits, but it must use the same formatter that the suffix-formatting path is already using.
 
 *Call graph*: 2 external calls (from, format).
 
@@ -527,11 +531,11 @@ fn format_with_separators_with_formatter(n: i64, formatter: &DecimalFormatter) -
 fn format_si_suffix_with_formatter(n: i64, formatter: &DecimalFormatter) -> String
 ```
 
-**Purpose**: Formats an integer using `K`, `M`, or `G` suffixes with roughly three significant figures, using a caller-supplied formatter for locale-aware decimal punctuation. It also clamps negative inputs to zero.
+**Purpose**: This helper shortens a non-negative count into a compact form with K, M, or G while using a caller-provided formatter for the number part. It is the main logic behind compact token-count display.
 
-**Data flow**: Accepts `n: i64` and `&DecimalFormatter`, clamps `n` with `n.max(0)`, returns a plain formatted integer if `n < 1000`, otherwise defines a local `format_scaled` closure that scales, rounds, and formats with a chosen number of fractional digits. It iterates through `(1_000, "K")`, `(1_000_000, "M")`, and `(1_000_000_000, "G")`, selecting 2, 1, or 0 fractional digits based on rounded magnitude thresholds, and returns the suffixed string. If all units exceed 999 after rounding, it formats rounded whole gigas with separators and appends `G`.
+**Data flow**: It takes a signed whole number and a formatter. Negative inputs are first clamped up to zero, so they display as `0` rather than a negative compact count. Numbers below 1000 are formatted normally. Larger numbers are divided by 1,000, 1,000,000, or 1,000,000,000, rounded to roughly three significant figures, formatted with the supplied formatter, and then given the matching suffix. If the number is above 1000G, it stays in G and the whole-G value is formatted with separators.
 
-**Call relations**: Called by the public `format_si_suffix` and by the test through a deterministic `en-US` formatter. It contains the module’s main rounding and threshold logic.
+**Call relations**: `format_si_suffix` calls this with the shared formatter for normal public use. The test calls it through a small local closure with an explicit US English formatter so the rounding and suffix rules can be checked without depending on the machine's locale.
 
 *Call graph*: called by 1 (format_si_suffix); 3 external calls (from, format, format!).
 
@@ -542,11 +546,11 @@ fn format_si_suffix_with_formatter(n: i64, formatter: &DecimalFormatter) -> Stri
 fn format_si_suffix(n: i64) -> String
 ```
 
-**Purpose**: Public API for compact SI-suffix formatting using the cached locale-aware formatter. It is intended for token counts and similar large counters.
+**Purpose**: This public function formats token counts or similar large counts into a short readable form, such as `1.20K` or `123M`. It is meant for places where a compact summary matters more than showing every digit.
 
-**Data flow**: Accepts `n: i64`, obtains the cached formatter via `formatter()`, passes both to `format_si_suffix_with_formatter`, and returns the resulting `String`.
+**Data flow**: It takes an `i64` count. It gets the shared locale-aware formatter, passes both the count and formatter to `format_si_suffix_with_formatter`, and returns the resulting string. On first use, it may also trigger creation of the shared formatter.
 
-**Call relations**: Used by callers that want compact count formatting without managing formatter state. It delegates all real work to the formatter-specific helper.
+**Call relations**: This is the public wrapper around the suffix-formatting logic. It keeps callers simple: they do not need to know about ICU formatters, locale detection, or the rounding rules.
 
 *Call graph*: calls 2 internal fn (format_si_suffix_with_formatter, formatter).
 
@@ -557,11 +561,11 @@ fn format_si_suffix(n: i64) -> String
 fn kmg()
 ```
 
-**Purpose**: Verifies the exact `K`/`M`/`G` formatting thresholds, rounding, and fallback behavior under a deterministic `en-US` locale. It documents the intended compact-number output contract.
+**Purpose**: This test checks that compact K, M, and G formatting works at important boundary values. It protects against accidental changes to rounding, suffix choice, and formatting above 1000G.
 
-**Data flow**: Builds an `en-US` formatter with `make_en_us_formatter`, defines a local closure that calls `format_si_suffix_with_formatter`, and asserts expected outputs for a range of values from `0` through `1_234_000_000_000`.
+**Data flow**: It creates a US English formatter, wraps `format_si_suffix_with_formatter` in a small helper closure, and feeds it many representative numbers. For each input, it compares the output string against the expected text. The test produces no returned value; it passes if every comparison matches and fails otherwise.
 
-**Call relations**: Run by the test harness as the sole regression suite for this module’s SI-formatting behavior.
+**Call relations**: The test calls `make_en_us_formatter` directly so its expectations are not affected by the developer's computer locale. It exercises `format_si_suffix_with_formatter`, which is the core logic used by the public `format_si_suffix` function.
 
 *Call graph*: calls 1 internal fn (make_en_us_formatter); 1 external calls (assert_eq!).
 
@@ -570,11 +574,7 @@ fn kmg()
 
 `util` · `cross-cutting`
 
-This utility crate exposes `format_duration` and keeps the actual formatting rules in a private helper, `format_elapsed_millis`. The public function converts a `Duration` to whole milliseconds using `as_millis()` and casts that value to `i64`, then delegates to the helper. The helper applies three display regimes: durations under one second are rendered as integer milliseconds like `250ms`; durations from one second up to but not including one minute are rendered as seconds with exactly two decimal places like `1.50s`; and durations of one minute or more are rendered as `Xm YYs`, where seconds are zero-padded to two digits.
-
-One subtle consequence of the implementation is that values just below one minute can round up in the seconds format, so `59_999ms` becomes `60.00s` rather than switching to minute formatting. Once the input reaches `60_000ms`, the branch changes and the output becomes `1m 00s`. Hours are not given a separate unit; they continue accumulating into the minute count, so one hour prints as `60m 00s`.
-
-The tests cover subsecond formatting, zero, second-range formatting and rounding, minute formatting, and the exact spacing/padding used at one hour.
+Computers often measure time in raw units that are precise but awkward for people to read. This file solves that small but common problem: it takes a `Duration` (Rust's standard type for a length of time) and formats it in a compact way for logs, status messages, or user-facing output. The rule is simple. Very short times stay in milliseconds, because "250ms" is clearer than "0.25s". Times under a minute are shown as seconds with two decimal places, such as "1.50s". Times of a minute or more are shown as minutes plus two-digit seconds, such as "3m 05s". The public doorway is `format_duration`, which accepts the standard `Duration` type. It converts that duration into a millisecond count, then passes the number to a private helper, `format_elapsed_millis`, where the actual formatting choices are made. The tests act like examples and guardrails. They check the important boundaries: zero, less than one second, seconds below a minute, exactly one minute, and one hour. One subtle behavior is that 59.999 seconds is formatted as "60.00s" because the seconds display rounds to two decimal places, even though the rule choice is still based on the original millisecond count.
 
 #### Function details
 
@@ -584,11 +584,11 @@ The tests cover subsecond formatting, zero, second-range formatting and rounding
 fn format_duration(duration: Duration) -> String
 ```
 
-**Purpose**: Public entry point that converts a `Duration` into the crate's compact elapsed-time string format. It normalizes the input to milliseconds and delegates the actual formatting rules to a private helper.
+**Purpose**: This is the public function other code uses when it wants to show an elapsed time in a friendly compact form. It accepts Rust's standard `Duration` value, so callers do not need to think about raw milliseconds themselves.
 
-**Data flow**: It takes `duration: Duration`, reads `duration.as_millis()`, casts the result to `i64`, passes that millisecond count to `format_elapsed_millis`, and returns the resulting `String`. It does not mutate external state.
+**Data flow**: A `Duration` goes in. The function reads its total length in milliseconds, turns that into a whole-number millisecond value, and passes it to the formatter helper. A finished string such as "250ms", "1.50s", or "1m 15s" comes out.
 
-**Call relations**: This is the exported API used by all tests in the file. It exists mainly as a typed wrapper around `format_elapsed_millis` for callers that already have `Duration` values.
+**Call relations**: This function is the safe front door for the file. Code outside the file calls it with a normal Rust duration; it then hands the simplified millisecond count to `format_elapsed_millis`, which makes the display decision.
 
 *Call graph*: calls 1 internal fn (format_elapsed_millis); 1 external calls (as_millis).
 
@@ -599,11 +599,11 @@ fn format_duration(duration: Duration) -> String
 fn format_elapsed_millis(millis: i64) -> String
 ```
 
-**Purpose**: Implements the actual elapsed-time formatting policy based on a millisecond count. It chooses among millisecond, decimal-second, and minute/second output forms.
+**Purpose**: This private helper contains the formatting rules. It decides whether a time should be shown as milliseconds, seconds, or minutes plus seconds.
 
-**Data flow**: It takes `millis: i64`. If `millis < 1000`, it returns `"{millis}ms"`; else if `millis < 60_000`, it divides by `1000.0` and formats with two decimal places as seconds; otherwise it computes `minutes = millis / 60_000` and `seconds = (millis % 60_000) / 1000`, then returns `"{minutes}m {seconds:02}s"`.
+**Data flow**: A whole-number millisecond count goes in. If it is below 1000, the function writes it as milliseconds. If it is below 60000, it converts the number to seconds and keeps two decimal places. Otherwise, it splits the value into minutes and remaining seconds. The result is a formatted text string.
 
-**Call relations**: This helper is called only by `format_duration`. Keeping it private isolates the formatting logic while allowing the public API to stay `Duration`-based.
+**Call relations**: This helper is called by `format_duration` after the public function has converted a `Duration` into milliseconds. It does not call back into project code; it only uses Rust's formatting machinery to build the final text.
 
 *Call graph*: called by 1 (format_duration); 1 external calls (format!).
 
@@ -614,11 +614,11 @@ fn format_elapsed_millis(millis: i64) -> String
 fn test_format_duration_subsecond()
 ```
 
-**Purpose**: Verifies millisecond formatting for durations below one second, including the zero-duration edge case. It ensures no decimal seconds are used in this range.
+**Purpose**: This test checks that times shorter than one second are displayed as plain milliseconds. It also confirms that a zero-length duration is handled cleanly.
 
-**Data flow**: The test creates `Duration` values from 250 ms and 0 ms, passes each to `format_duration`, and asserts the returned strings are `"250ms"` and `"0ms"` respectively.
+**Data flow**: The test creates durations of 250 milliseconds and 0 milliseconds. It sends each one through `format_duration` and compares the returned text with the expected strings "250ms" and "0ms". If either string is different, the test fails.
 
-**Call relations**: It exercises the first branch of `format_elapsed_millis` through the public `format_duration` API.
+**Call relations**: This test exercises the public `format_duration` function from the outside, like normal project code would. It protects the first formatting branch, where short durations should not be converted into seconds.
 
 *Call graph*: 2 external calls (from_millis, assert_eq!).
 
@@ -629,11 +629,11 @@ fn test_format_duration_subsecond()
 fn test_format_duration_seconds()
 ```
 
-**Purpose**: Checks formatting in the one-second to under-one-minute range, including rounding behavior near the upper boundary. This locks in the two-decimal seconds representation.
+**Purpose**: This test checks the middle range: durations from one second up to just under one minute. It makes sure they are shown as seconds with exactly two decimal places.
 
-**Data flow**: The test constructs durations of 1,500 ms and 59,999 ms, calls `format_duration`, and asserts outputs `"1.50s"` and `"60.00s"`.
+**Data flow**: The test creates durations of 1500 milliseconds and 59999 milliseconds. It passes them to `format_duration` and checks that the output is "1.50s" and "60.00s". The second case confirms the rounding behavior near one minute.
 
-**Call relations**: It covers the middle branch of `format_elapsed_millis`, including the notable case where formatting rounds up to `60.00s` without switching branches.
+**Call relations**: This test calls the same public function that real callers use. It guards the seconds-formatting path inside `format_elapsed_millis`, reached through `format_duration`.
 
 *Call graph*: 2 external calls (from_millis, assert_eq!).
 
@@ -644,11 +644,11 @@ fn test_format_duration_seconds()
 fn test_format_duration_minutes()
 ```
 
-**Purpose**: Verifies minute/second formatting for durations at or above one minute. It checks normal values, exact minute boundaries, and long durations that continue counting in minutes.
+**Purpose**: This test checks that durations of one minute or longer are displayed as minutes plus two-digit seconds. It covers ordinary, exact-boundary, and longer examples.
 
-**Data flow**: The test creates durations of 75,000 ms, 60,000 ms, and 3,601,000 ms, passes them to `format_duration`, and asserts `"1m 15s"`, `"1m 00s"`, and `"60m 01s"`.
+**Data flow**: The test builds durations for 75 seconds, exactly 60 seconds, and 3601 seconds. Each duration goes through `format_duration`, and the returned strings are compared with "1m 15s", "1m 00s", and "60m 01s". The test changes nothing outside itself; it only verifies results.
 
-**Call relations**: It exercises the final branch of `format_elapsed_millis`, confirming zero-padded seconds and the absence of a separate hour unit.
+**Call relations**: This test reaches the minutes-formatting branch through the public `format_duration` function. It helps ensure that the helper keeps seconds padded with a leading zero when needed.
 
 *Call graph*: 2 external calls (from_millis, assert_eq!).
 
@@ -659,22 +659,26 @@ fn test_format_duration_minutes()
 fn test_format_duration_one_hour_has_space()
 ```
 
-**Purpose**: Checks the exact formatting of a one-hour duration, especially the presence of the space between minutes and seconds. This is a narrow regression-style assertion on output shape.
+**Purpose**: This test confirms the exact formatting of a one-hour duration. In particular, it checks that the output includes a space between the minutes part and the seconds part.
 
-**Data flow**: The test creates a duration of 3,600,000 ms, calls `format_duration`, and asserts the string is `"60m 00s"`.
+**Data flow**: The test creates a duration of 3600000 milliseconds, sends it to `format_duration`, and expects the string "60m 00s". If the spacing or number format changes, the comparison fails.
 
-**Call relations**: It reinforces the minute-format branch and specifically guards the spacing/padding convention for large durations.
+**Call relations**: This test is another outside-style check of `format_duration`. It focuses on a presentation detail in the minutes-and-seconds output so that future edits do not accidentally change the visible format.
 
 *Call graph*: 2 external calls (from_millis, assert_eq!).
 
 
 ### `utils/cli/src/format_env_display.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting CLI display`
 
-This file contains a single formatting helper plus unit tests that pin down its output shape. `format_env_display` accepts two sources of environment information: an optional `HashMap<String, String>` of explicit key/value pairs and a slice of variable names that should be referenced symbolically. The function never emits real values; every entry is rendered as `NAME=*****`. When a map is present, it first collects and sorts the entries by key so output is deterministic regardless of `HashMap` iteration order, then appends the redacted key/value renderings. It separately appends any names from `env_vars` in their original slice order, also redacted. The two sources are concatenated into a single comma-separated list.
+Command-line tools often need to show a summary of the environment they will pass to another command. The problem is that environment values can contain secrets, such as tokens, passwords, or private paths. This file solves that by printing the variable names but replacing every value with stars. Think of it like a receipt that lists the items bought but blacks out the credit card number.
 
-A notable invariant is that empty inputs collapse to a single `-` sentinel rather than an empty string, which makes absence explicit in user-facing output. Another subtle design choice is that map entries and `env_vars` are not deduplicated against each other; if the same variable appears in both inputs, both redacted entries will be shown. The tests verify the empty case, sorted map formatting, plain variable-name formatting, and combined output ordering.
+The main helper, `format_env_display`, accepts two sources of environment information. One is a map of explicit key-value pairs, where both the variable name and value are already known. The other is a list of variable names that should be forwarded from the current environment. In both cases, the displayed value is always `*****`.
+
+For stable output, the explicit map entries are sorted by variable name before being printed. That matters because maps do not naturally keep a predictable order, and unpredictable output makes logs and tests harder to read. Variables from the list keep the order they were given. If there is nothing to show, the function returns `-`, a compact way to say “no environment variables.”
+
+The rest of the file is a small test suite that checks the empty case, sorting, list formatting, and combining both input sources.
 
 #### Function details
 
@@ -687,11 +691,11 @@ fn format_env_display(
 ) -> String
 ```
 
-**Purpose**: Builds a redacted display string for environment configuration from an optional map of concrete variables and a list of variable names. It guarantees deterministic ordering for map entries and returns `-` when there is nothing to show.
+**Purpose**: Builds a safe display string for environment variables. It keeps the variable names visible but hides every value, so logs or command previews do not leak secrets.
 
-**Data flow**: It takes `env: Option<&HashMap<String, String>>` and `env_vars: &[S]` where `S: AsRef<str>`. It initializes an empty `Vec<String>`, optionally reads all map entries, sorts them by key, transforms each pair into `key=*****`, then appends `env_vars` rendered as `name=*****`. If the accumulated parts vector is empty it returns `"-"`; otherwise it joins the parts with `", "` and returns the resulting `String`.
+**Data flow**: It receives an optional map of environment variable names to values, plus a list of variable names. If a map is present, it reads its entries, sorts them by name, and turns each one into `NAME=*****`. It then adds the listed variable names in their given order, also as `NAME=*****`. If nothing was added, it returns `-`; otherwise it returns all parts joined with commas.
 
-**Call relations**: This is the file's primary exported helper and is exercised directly by all four tests. Its internal flow is self-contained: it performs collection, sorting, redaction, and final string assembly without delegating to other project-local functions.
+**Call relations**: This is the file’s useful helper. The test functions call it with different inputs to prove its behavior. Inside, it relies on standard collection operations such as creating a list of parts, checking whether inputs are empty, and iterating through values.
 
 *Call graph*: 3 external calls (is_empty, iter, new).
 
@@ -702,11 +706,11 @@ fn format_env_display(
 fn returns_dash_when_empty()
 ```
 
-**Purpose**: Verifies that the formatter emits the explicit `-` placeholder when both the map and variable-name list are empty. It covers both `None` and an empty `HashMap` as the map input.
+**Purpose**: Checks that the display uses `-` when there are no environment variables to show. This protects the simple “nothing configured” case from becoming an empty or confusing string.
 
-**Data flow**: The test constructs an empty slice of `String` and an empty `HashMap<String, String>`, passes them into `format_env_display`, and compares the returned `String` against `"-"` in both cases. It does not mutate shared state.
+**Data flow**: It starts with an empty variable list and then tries two inputs: no map at all, and an empty map. In both cases it sends those inputs to `format_env_display` and expects the result to be `-`.
 
-**Call relations**: This test invokes the exported formatter in the no-data paths to confirm the fallback branch that returns the dash sentinel.
+**Call relations**: The Rust test runner calls this test during the test suite. The test exercises `format_env_display` and uses standard assertion support to compare the actual text with the expected text.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -717,11 +721,11 @@ fn returns_dash_when_empty()
 fn formats_sorted_env_pairs()
 ```
 
-**Purpose**: Checks that explicit environment pairs are rendered in key-sorted order rather than insertion order. This locks in deterministic output for user-visible displays.
+**Purpose**: Checks that explicit environment pairs are shown in a predictable sorted order. This matters because ordinary maps can store entries in an order that is not useful for stable output.
 
-**Data flow**: The test builds a `HashMap` with keys inserted as `B` then `A`, calls `format_env_display(Some(&env), &[] as &[String])`, and asserts that the returned string is `"A=*****, B=*****"`. The values `one` and `two` are intentionally ignored by the formatter.
+**Data flow**: It creates a map with two variables inserted in reverse alphabetical order. It passes that map to `format_env_display` with no extra variable list. The expected output is `A=*****, B=*****`, proving that the helper sorted by variable name and hid both values.
 
-**Call relations**: It exercises the branch where `env` is present and `env_vars` is empty, specifically validating the sort-before-format behavior.
+**Call relations**: The Rust test runner calls this test. The test builds sample input, asks `format_env_display` to format it, and uses an assertion to confirm that the sorting and masking behavior are correct.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -732,11 +736,11 @@ fn formats_sorted_env_pairs()
 fn formats_env_vars_with_dollar_prefix()
 ```
 
-**Purpose**: Confirms that symbolic environment-variable names are rendered as redacted assignments in the order provided. Despite the test name, the output uses bare names rather than a `$` prefix.
+**Purpose**: Checks that a plain list of environment variable names is formatted safely. Even when only names are supplied, the display still uses masked placeholder values.
 
-**Data flow**: The test creates a `Vec<String>` containing `TOKEN` and `PATH`, calls `format_env_display(None, &vars)`, and asserts that the result is `"TOKEN=*****, PATH=*****"`. No map input is supplied.
+**Data flow**: It creates a list containing `TOKEN` and `PATH`. It passes that list to `format_env_display` without an explicit map. The result should be `TOKEN=*****, PATH=*****`, keeping the input order and showing no real values.
 
-**Call relations**: It covers the path where only `env_vars` contributes output, ensuring the helper formats names directly from the slice.
+**Call relations**: The Rust test runner calls this test. The test uses a small vector of names, calls `format_env_display`, and compares the returned string with the expected display text.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -747,24 +751,26 @@ fn formats_env_vars_with_dollar_prefix()
 fn combines_env_pairs_and_vars()
 ```
 
-**Purpose**: Verifies that explicit map entries and symbolic variable names are combined into one comma-separated display string. It also confirms the relative ordering: sorted map entries first, then listed variable names.
+**Purpose**: Checks that the helper can combine explicit environment values and forwarded variable names in one display string. This covers the realistic case where both kinds of environment input are used together.
 
-**Data flow**: The test constructs a one-entry `HashMap` with `HOME`, a one-element variable list containing `TOKEN`, calls `format_env_display(Some(&env), &vars)`, and asserts the combined string `"HOME=*****, TOKEN=*****"`.
+**Data flow**: It creates a map containing `HOME` and a separate list containing `TOKEN`. It passes both to `format_env_display`. The expected output is `HOME=*****, TOKEN=*****`, showing the map entry first and the listed variable after it, with both values hidden.
 
-**Call relations**: This test drives the mixed-input path, validating how the formatter concatenates the two independently generated groups.
+**Call relations**: The Rust test runner calls this test as part of the suite. The test supplies both input paths to `format_env_display` and uses an assertion to make sure the combined output is correct.
 
 *Call graph*: 3 external calls (new, assert_eq!, vec!).
 
 
 ### `utils/cli/src/resume_command.rs`
 
-`util` · `request handling`
+`util` · `request handling / user-facing CLI message formatting`
 
-This file provides two small formatting helpers for resume-related UX. `resume_command` chooses a concrete resume target by preferring a non-empty thread name over a `ThreadId`; if neither exists, it returns `None`. Once a target is chosen, it shell-escapes it with `shlex_join` so names containing spaces or quotes become safe copy-pasteable commands. It also detects targets beginning with `-` and inserts `--` before the escaped argument so the target cannot be misparsed as another CLI flag.
+When Codex wants to point a user back to an earlier conversation, it needs to show a clear instruction such as `codex resume my-thread`. This file keeps that wording in one shared place so different parts of the command-line tool do not invent slightly different, possibly unsafe versions.
 
-`resume_hint` is slightly stricter: it requires a `ThreadId` up front and returns `None` if the ID is absent, even if a name exists. With both name and ID available, it emits a picker-oriented instruction of the form `codex resume, then select NAME (ID)`, reflecting flows where the user resumes into a selector UI. If only the ID is available, it falls back to `resume_command(None, Some(thread_id))` to produce a direct command.
+The main job is choosing the best “resume target.” If a non-empty thread name is available, it uses that because it is friendlier for humans. If not, it falls back to the thread ID, which is a unique identifier. If neither exists, it returns nothing because there is no honest command to show.
 
-The tests cover precedence rules, missing-target behavior, shell quoting for spaces and embedded quotes, the `--` safeguard for dash-prefixed names, and the distinction between direct commands and picker hints.
+It also protects against shell confusion. A shell is the program that reads typed commands. Some names need special treatment: names with spaces must be quoted, and names starting with `-` could be mistaken for command options. The file uses shell-style quoting and adds `--` before dash-starting targets, which means “stop reading options; what follows is a value.”
+
+There is a second helper for hints. If both a name and ID exist, it tells the user to run `codex resume` and pick the named item, showing the ID for clarity. If only an ID is useful, it gives the direct command.
 
 #### Function details
 
@@ -774,11 +780,11 @@ The tests cover precedence rules, missing-target behavior, shell quoting for spa
 fn resume_command(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Option<String>
 ```
 
-**Purpose**: Constructs a concrete `codex resume ...` shell command from either a thread name or a thread ID. It prefers a non-empty name, shell-quotes the chosen target, and inserts `--` when the target starts with a dash.
+**Purpose**: Builds a copyable `codex resume ...` command from a thread name or thread ID. It prefers a readable name when one is available, but falls back to the ID so the command can still target the right thread.
 
-**Data flow**: It takes `thread_name: Option<&str>` and `thread_id: Option<ThreadId>`. It filters out empty names, converts a surviving name to `String`, otherwise converts the `ThreadId` to text, yielding an optional target. For a present target it computes `needs_double_dash` from `starts_with('-')`, escapes the single argument with `shlex_join(&[target])`, and returns either `Some("codex resume -- {escaped}")` or `Some("codex resume {escaped}")`; if no target exists it returns `None`.
+**Data flow**: It receives an optional thread name and an optional thread ID. It ignores an empty name, chooses the name if possible, otherwise turns the ID into text, then shell-quotes the chosen target so spaces or quotes are safe. If the target begins with `-`, it inserts `--` so the target is not mistaken for an option. It returns the finished command text, or `None` if there is no target at all.
 
-**Call relations**: This helper is called directly by tests and by `resume_hint` when only an ID-based direct command should be shown. It is the lower-level formatter that encapsulates target selection and shell-safe command rendering.
+**Call relations**: This is the core formatter for this file. `resume_hint` calls it when it needs a direct resume command, and the tests call it in several situations to confirm that names, IDs, missing targets, and tricky shell characters all produce the expected output.
 
 *Call graph*: called by 5 (resume_hint, formats_thread_id_when_name_is_missing, prefers_name_over_id, quotes_thread_names_when_needed, returns_none_without_a_resume_target).
 
@@ -789,11 +795,11 @@ fn resume_command(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Opt
 fn resume_hint(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Option<String>
 ```
 
-**Purpose**: Builds a higher-level resume hint string that either names the selectable thread alongside its ID or falls back to a direct resume command by ID. It refuses to produce any hint unless a thread ID is available.
+**Purpose**: Builds a short instruction for resuming a thread when Codex wants to show a helpful hint rather than always giving a direct command. It requires a thread ID so the hint can identify the exact thread.
 
-**Data flow**: It accepts `thread_name: Option<&str>` and `thread_id: Option<ThreadId>`. Using `?`, it immediately returns `None` if `thread_id` is absent. It then filters out empty names; with a non-empty name it formats `"codex resume, then select {thread_name} ({thread_id})"`, otherwise it delegates to `resume_command(None, Some(thread_id))` and returns that result.
+**Data flow**: It receives an optional thread name and optional thread ID. If there is no ID, it returns `None`. If there is a non-empty name, it creates text telling the user to run `codex resume` and then select that named thread, with the ID shown in parentheses. If there is no usable name, it asks `resume_command` to build a direct command using the ID.
 
-**Call relations**: This function sits above `resume_command`: callers use it when they want user guidance rather than always a direct command. In the no-name case it intentionally reuses `resume_command` so ID formatting and escaping stay consistent.
+**Call relations**: This function sits one level above `resume_command`: it decides whether the friendlier picker-style hint is appropriate, and delegates to `resume_command` for the direct-command case. The hint-related tests call it to check the named-thread wording, the ID-only fallback, and the rule that an ID is required.
 
 *Call graph*: calls 1 internal fn (resume_command); called by 3 (resume_hint_names_picker_item_with_id, resume_hint_requires_thread_id, resume_hint_uses_direct_id_command_without_name); 1 external calls (format!).
 
@@ -804,11 +810,11 @@ fn resume_hint(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Option
 fn prefers_name_over_id()
 ```
 
-**Purpose**: Checks that a non-empty thread name wins over a provided thread ID when building a resume command. This preserves friendlier commands when both identifiers are known.
+**Purpose**: Checks that `resume_command` uses the thread name when both a name and an ID are available. This protects the user-friendly behavior where names win over less readable IDs.
 
-**Data flow**: The test parses a fixed UUID string into `ThreadId`, calls `resume_command(Some("my-thread"), Some(thread_id))`, and asserts that the result is `Some("codex resume my-thread".to_string())`.
+**Data flow**: The test creates a sample thread ID, passes both that ID and the name `my-thread` into `resume_command`, and compares the result with the expected command. The output should be `codex resume my-thread`, showing that the ID was not used.
 
-**Call relations**: It exercises the name-precedence branch of `resume_command`, confirming that the ID is ignored when a usable name exists.
+**Call relations**: This test directly exercises `resume_command` in the case where both possible targets exist. It supports the larger formatting flow by locking in the priority rule used before any hint or command is shown to a user.
 
 *Call graph*: calls 2 internal fn (from_string, resume_command); 1 external calls (assert_eq!).
 
@@ -819,11 +825,11 @@ fn prefers_name_over_id()
 fn formats_thread_id_when_name_is_missing()
 ```
 
-**Purpose**: Verifies that the command formatter falls back to the thread ID when no thread name is supplied. This ensures resume remains possible without a human-readable name.
+**Purpose**: Checks that `resume_command` still produces a useful command when there is no thread name. This matters because an ID may be the only reliable way to find a saved thread.
 
-**Data flow**: The test constructs a `ThreadId` from a UUID string, calls `resume_command(None, Some(thread_id))`, and compares the returned `Option<String>` to the expected `codex resume <uuid>` string.
+**Data flow**: The test creates a sample thread ID, calls `resume_command` with no name and that ID, then compares the result with a command containing the ID text. The before state is “only an ID is known”; the after state is a complete `codex resume <id>` command.
 
-**Call relations**: It covers the fallback path in `resume_command` where the ID becomes the sole resume target.
+**Call relations**: This test calls `resume_command` directly to verify its fallback path. That same fallback is also used indirectly by `resume_hint` when it cannot name a picker item.
 
 *Call graph*: calls 2 internal fn (from_string, resume_command); 1 external calls (assert_eq!).
 
@@ -834,11 +840,11 @@ fn formats_thread_id_when_name_is_missing()
 fn returns_none_without_a_resume_target()
 ```
 
-**Purpose**: Confirms that no command string is produced when both the thread name and thread ID are absent. This prevents emitting malformed or misleading commands.
+**Purpose**: Checks that `resume_command` does not invent a command when it has neither a thread name nor a thread ID. This prevents Codex from showing misleading instructions.
 
-**Data flow**: The test calls `resume_command(None, None)` and asserts that the return value is `None`.
+**Data flow**: The test passes no name and no ID into `resume_command`. It expects `None`, meaning there is no command text to display.
 
-**Call relations**: It validates the early no-target outcome of `resume_command`.
+**Call relations**: This test covers the “nothing to work with” edge case for `resume_command`. It helps ensure callers can safely treat `None` as “do not show a resume command.”
 
 *Call graph*: calls 1 internal fn (resume_command); 1 external calls (assert_eq!).
 
@@ -849,11 +855,11 @@ fn returns_none_without_a_resume_target()
 fn quotes_thread_names_when_needed()
 ```
 
-**Purpose**: Checks the shell-safety rules for unusual thread names, including dash-prefixed names, names with spaces, and names containing quotes. It locks in the exact command strings users can copy and paste.
+**Purpose**: Checks that `resume_command` formats awkward thread names safely for a shell. It covers names that look like options, contain spaces, or contain quote characters.
 
-**Data flow**: The test calls `resume_command` three times with different `thread_name` values and no ID, then asserts the outputs: `codex resume -- -starts-with-dash`, `codex resume 'two words'`, and `codex resume "quote'case"` respectively.
+**Data flow**: The test calls `resume_command` several times with special thread names. Each input name is turned into a command string, and the test compares that string with the expected safe shell form, including `--` for a dash-starting name and quotes where needed.
 
-**Call relations**: It exercises the escaping and `--` insertion logic inside `resume_command`, covering the branches that depend on target contents.
+**Call relations**: This test directly protects the shell-safety behavior inside `resume_command`. Without it, a future change could accidentally produce commands that the user’s shell reads differently from what Codex intended.
 
 *Call graph*: calls 1 internal fn (resume_command); 1 external calls (assert_eq!).
 
@@ -864,11 +870,11 @@ fn quotes_thread_names_when_needed()
 fn resume_hint_names_picker_item_with_id()
 ```
 
-**Purpose**: Verifies that `resume_hint` emits picker-oriented guidance when both a thread name and ID are available. The hint includes both identifiers so the user can disambiguate selections.
+**Purpose**: Checks that `resume_hint` uses the friendlier picker-style wording when both a thread name and ID are present. The hint tells the user what to select and still includes the exact ID for confidence.
 
-**Data flow**: The test parses a UUID into `ThreadId`, calls `resume_hint(Some("my-thread"), Some(thread_id))`, and asserts that the returned string is `codex resume, then select my-thread (<uuid>)`.
+**Data flow**: The test creates a sample thread ID, passes it with the name `my-thread` into `resume_hint`, and compares the result with the expected sentence. The output is not a direct `codex resume my-thread` command; it is an instruction to run `codex resume` and select the named item.
 
-**Call relations**: It covers the named-thread branch of `resume_hint`, where the function formats its own descriptive message instead of delegating.
+**Call relations**: This test calls `resume_hint` for the named-thread path. It confirms the higher-level hint behavior that sits above the direct command formatter.
 
 *Call graph*: calls 2 internal fn (from_string, resume_hint); 1 external calls (assert_eq!).
 
@@ -879,11 +885,11 @@ fn resume_hint_names_picker_item_with_id()
 fn resume_hint_uses_direct_id_command_without_name()
 ```
 
-**Purpose**: Checks that `resume_hint` falls back to a direct ID-based command when no thread name is available. This keeps the hint actionable even without a display name.
+**Purpose**: Checks that `resume_hint` falls back to a direct ID-based command when there is no thread name. This keeps the hint useful even when no friendly label is available.
 
-**Data flow**: The test parses a UUID into `ThreadId`, calls `resume_hint(None, Some(thread_id))`, and asserts that the result matches the direct `codex resume <uuid>` command string.
+**Data flow**: The test creates a sample thread ID and calls `resume_hint` without a name. `resume_hint` then relies on the command-building path, and the test expects the final text to be `codex resume <id>`.
 
-**Call relations**: It drives the branch where `resume_hint` delegates to `resume_command` because there is no non-empty name to mention.
+**Call relations**: This test exercises the connection between `resume_hint` and `resume_command`. It proves that the hint helper delegates to the direct command formatter when it cannot produce a picker-style named hint.
 
 *Call graph*: calls 2 internal fn (from_string, resume_hint); 1 external calls (assert_eq!).
 
@@ -894,22 +900,24 @@ fn resume_hint_uses_direct_id_command_without_name()
 fn resume_hint_requires_thread_id()
 ```
 
-**Purpose**: Confirms that `resume_hint` returns `None` if the thread ID is missing, even when a thread name is present. This enforces the function's requirement that hints be anchored to a concrete resumable thread.
+**Purpose**: Checks that `resume_hint` refuses to produce a hint without a thread ID. This avoids showing a hint that names something but cannot identify the exact saved thread.
 
-**Data flow**: The test calls `resume_hint(Some("my-thread"), None)` and asserts that the result is `None`.
+**Data flow**: The test passes a thread name but no ID into `resume_hint`. The expected result is `None`, so no hint text is produced.
 
-**Call relations**: It validates the early-return `?` behavior in `resume_hint` that rejects name-only inputs.
+**Call relations**: This test covers the guard at the start of `resume_hint`. It complements the other hint tests by showing that the helper needs an ID before it will take either the named-picker path or the direct-command path.
 
 *Call graph*: calls 1 internal fn (resume_hint); 1 external calls (assert_eq!).
 
 
 ### `core/src/web_search.rs`
 
-`util` · `request formatting / display rendering`
+`domain_logic` · `request handling`
 
-This file is a small formatting utility around `codex_protocol::models::WebSearchAction`. Its internal helper, `search_action_detail`, resolves the display text for search actions that may contain either `query: Option<String>` or `queries: Option<Vec<String>>`. The logic prefers a non-empty singular `query`; otherwise it looks at the first entry in `queries`, defaulting to the empty string if nothing is present. When multiple queries exist and the first query is non-empty, it appends `" ..."` to signal truncation rather than listing every query.
+This file solves a small but important presentation problem: web search actions are stored as structured data, but people need to see them as simple text. Without this conversion, logs or user-facing status messages might show empty, confusing, or overly technical details.
 
-`web_search_action_detail` then pattern-matches the action enum and applies action-specific formatting. `Search` delegates to the helper above. `OpenPage` returns the URL or an empty string. `FindInPage` combines `pattern` and `url` into one of four concrete strings: `'<pattern>' in <url>`, `'<pattern>'`, `<url>`, or empty, depending on which optional fields are present. `Other` intentionally renders as empty. Finally, `web_search_detail` adds one more fallback layer for callers that already have a raw query string: it computes the action-derived detail when an action exists, but if that detail is empty it returns the provided `query` argument instead. This keeps downstream UI or logging code from showing blank detail text when the structured action lacks enough information.
+The main idea is to pick the best available description for each kind of web action. For a search, the code prefers a single query if one exists. If there are several queries instead, it shows the first one and adds an ellipsis when there is more than one, like writing “cats ...” to hint that more searches are included. For opening a page, it shows the URL. For finding text within a page, it combines the search pattern and the page URL when both are present, or falls back to whichever one exists.
+
+The file is careful about missing information. Many fields are optional, so it returns an empty string when there is truly nothing useful to show. The public helper `web_search_detail` adds one more fallback: if the action itself cannot provide a detail, it uses the original query text instead. In everyday terms, this file is like the caption writer for web search activity.
 
 #### Function details
 
@@ -919,11 +927,11 @@ This file is a small formatting utility around `codex_protocol::models::WebSearc
 fn search_action_detail(query: &Option<String>, queries: &Option<Vec<String>>) -> String
 ```
 
-**Purpose**: Chooses the best display string for a search action from either a single query or a list of queries.
+**Purpose**: This helper chooses the best short label for a search request. It prefers a single non-empty query, but can also summarize a list of queries when the action contains more than one.
 
-**Data flow**: Takes `&Option<String>` and `&Option<Vec<String>>`. It clones and returns the singular query if present and non-empty; otherwise it inspects the optional query list, clones the first element or defaults to `""`, and if there are multiple queries and the first is non-empty it returns `"<first> ..."`, else just the first string.
+**Data flow**: It receives an optional single query and an optional list of queries. First it checks whether the single query exists and is not empty; if so, that becomes the result. Otherwise it looks at the query list, takes the first item if there is one, and adds “ ...” when the list has more than one non-empty item. It returns the chosen text as a new string and does not change the inputs.
 
-**Call relations**: This is a private helper used only by `web_search_action_detail` for the `WebSearchAction::Search` branch, keeping the query-selection rules in one place.
+**Call relations**: This is the search-specific piece used by `web_search_action_detail`. When the larger formatter sees a `Search` action, it hands the query fields to this helper so the search case stays separate from page-opening and find-in-page formatting.
 
 *Call graph*: called by 1 (web_search_action_detail).
 
@@ -934,11 +942,11 @@ fn search_action_detail(query: &Option<String>, queries: &Option<Vec<String>>) -
 fn web_search_action_detail(action: &WebSearchAction) -> String
 ```
 
-**Purpose**: Formats a `WebSearchAction` into a concise detail string tailored to the specific action variant.
+**Purpose**: This function turns one structured `WebSearchAction` into the short text a person should see for it. It covers searching, opening a page, finding text in a page, and unknown or unsupported action types.
 
-**Data flow**: Consumes `&WebSearchAction` and pattern-matches it. For `Search` it delegates to `search_action_detail`; for `OpenPage` it clones the optional URL or returns empty; for `FindInPage` it combines optional `pattern` and `url` into a formatted string according to which values are present; for `Other` it returns an empty `String`.
+**Data flow**: It receives a web search action. It looks at which kind of action it is: for a search, it asks `search_action_detail` to summarize the query; for an open-page action, it returns the URL or an empty string; for find-in-page, it combines the pattern and URL when available; for an unknown action, it returns an empty string. The output is always a plain string suitable for display.
 
-**Call relations**: It is called by `parse_turn_item`, which needs a readable summary of web-search-related actions. Internally it delegates only the search-query selection logic to `search_action_detail`.
+**Call relations**: This is called by `parse_turn_item`, which likely needs readable text while turning lower-level conversation or event data into something the rest of the system can use. Inside, it delegates the search-query case to `search_action_detail` and builds combined text for find-in-page actions when needed.
 
 *Call graph*: calls 1 internal fn (search_action_detail); called by 1 (parse_turn_item); 2 external calls (new, format!).
 
@@ -949,11 +957,11 @@ fn web_search_action_detail(action: &WebSearchAction) -> String
 fn web_search_detail(action: Option<&WebSearchAction>, query: &str) -> String
 ```
 
-**Purpose**: Returns the best available web-search detail, preferring structured action detail but falling back to a raw query string.
+**Purpose**: This function gives callers a reliable display string for a web search step, even when the structured action is missing or has no useful detail. It falls back to the raw query text so the user still sees something meaningful.
 
-**Data flow**: Accepts `Option<&WebSearchAction>` and a fallback `&str` query. It maps the action through `web_search_action_detail`, defaults to `""` when no action exists, and returns either that detail if non-empty or `query.to_string()` otherwise.
+**Data flow**: It receives an optional web search action and a plain query string. If an action is present, it converts that action into display text; if that text is empty, or if there is no action, it uses the provided query string instead. It returns the final text and does not modify anything.
 
-**Call relations**: This is a public convenience wrapper for callers that may or may not have a structured action object. It sits above `web_search_action_detail` as the final fallback layer.
+**Call relations**: No specific caller is shown in the provided call facts, but this acts as a convenience wrapper around the action-detail formatting path. It is useful at the point where code wants one final label and does not want to repeat the fallback rule itself.
 
 
 ### Text shaping and truncation workflows
@@ -961,13 +969,15 @@ These files apply reusable formatting and budget-enforcement logic to larger tex
 
 ### `tui/src/text_formatting.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting during terminal rendering and tests`
 
-This file is a utility module for turning arbitrary text into forms that fit terminal rendering constraints. `capitalize_first` uppercases only the first Unicode scalar and leaves the remainder untouched. `format_and_truncate_tool_result` is tailored for tool output: it computes an approximate grapheme budget from `max_lines * line_width`, subtracting one grapheme per line as a fudge factor because terminal cell width and grapheme count do not perfectly align, then prefers compacted JSON if the input parses as JSON.
+A terminal screen is a cramped space, and text is not as simple as “one character equals one cell.” Emojis, accented letters, wide characters, JSON blobs, and long paths can all display badly if they are cut or wrapped carelessly. This file is the TUI’s text-polishing toolbox.
 
-`format_json_compact` is the most specialized routine. It parses input into `serde_json::Value`, pretty-prints it, then walks the characters while tracking `in_string` and `escape_next` state. Outside strings it removes newlines and most indentation whitespace, but preserves a single space after `:` and `,` when the next token is not `}` or `]`. The result is a single-line JSON form that still contains whitespace Ratatui can wrap on.
+It provides helpers for common display tasks: capitalizing the first letter, shortening long text safely, making JSON compact but still wrappable, shortening paths while preserving useful beginning and ending folders, and joining words in readable English. The most important idea is that the code tries to preserve meaning while respecting space. For example, a path is shortened like a map route: keep the starting point and destination, replace the middle with an ellipsis when needed.
 
-`truncate_text` truncates by grapheme boundaries using `unicode_segmentation`, adding `...` only when at least three graphemes are available. `center_truncate_path` is width-aware rather than byte-aware: it splits on the platform path separator, preserves leading/trailing/root semantics, tries combinations of left and right segments with a Unicode ellipsis in the middle, and front-truncates individual segments when necessary using display-cell widths from `unicode_width`. `proper_join` formats human-readable lists without an Oxford comma. The test module exercises empty inputs, emoji and combining marks, invalid JSON, Windows-style paths, long segments, and preview-friendly wrapping behavior.
+The file also pays attention to Unicode. It truncates by graphemes, meaning user-visible characters, rather than raw bytes. That avoids cutting an emoji or accented character in half. For terminal width, it uses display-width calculations so wide characters are counted more realistically.
+
+The tests at the bottom lock down edge cases: tiny limits, emojis, combining accents, JSON formats, Windows-style paths, and natural-language joins. Without these helpers, the interface would show messy wrapping, broken characters, overly tall JSON, or unhelpfully chopped paths.
 
 #### Function details
 
@@ -977,11 +987,11 @@ This file is a utility module for turning arbitrary text into forms that fit ter
 fn capitalize_first(input: &str) -> String
 ```
 
-**Purpose**: Uppercases the first character of a string and leaves the remainder unchanged. Empty input returns an empty `String`.
+**Purpose**: Turns the first character of a piece of text into uppercase while leaving the rest untouched. This is useful for small display labels that should start like a sentence or title.
 
-**Data flow**: Reads `input: &str`, pulls the first `char` from `input.chars()`, converts that char with `to_uppercase().collect::<String>()`, appends the untouched remainder via `chars.as_str()`, and returns the new string; if there is no first char, it returns `String::new()`.
+**Data flow**: It receives a string. It looks at the first character; if there is one, it uppercases that character and appends the remaining original text after it. If the input is empty, it returns an empty string.
 
-**Call relations**: This is a standalone helper with no internal callers listed here. It performs all logic locally and does not depend on other functions in the module.
+**Call relations**: This is a standalone formatting helper. Other display code can call it when it needs a friendlier label, and it only relies on ordinary string construction.
 
 *Call graph*: 1 external calls (new).
 
@@ -996,11 +1006,11 @@ fn format_and_truncate_tool_result(
 ) -> String
 ```
 
-**Purpose**: Prepares tool output for narrow terminal display by compacting JSON when possible and then truncating to an approximate grapheme budget derived from line count and width. It is tuned for Ratatui’s limited wrapping behavior.
+**Purpose**: Prepares a tool result for display inside a limited terminal area. If the result is JSON, it first makes it compact and easier to wrap, then shortens it to fit the available space.
 
-**Data flow**: Takes raw `text`, `max_lines`, and `line_width`; computes `max_graphemes = (max_lines * line_width).saturating_sub(max_lines)`. It tries `format_json_compact(text)` first and passes either the compact JSON or the original text into `truncate_text`, returning the resulting `String`.
+**Data flow**: It receives raw text plus a maximum number of lines and a line width. It estimates how many visible character groups can fit, tries to reformat the text as compact JSON, and then sends either the formatted JSON or the original text through safe truncation. It returns the display-ready string.
 
-**Call relations**: Used where tool results must fit bounded UI regions. It orchestrates the two lower-level helpers in this file: JSON normalization first, grapheme-safe truncation second.
+**Call relations**: When the TUI needs to show tool output, this function acts as the coordinator. It asks format_json_compact to improve JSON and then hands the final text to truncate_text so the result does not overflow the display area.
 
 *Call graph*: calls 2 internal fn (format_json_compact, truncate_text).
 
@@ -1011,11 +1021,11 @@ fn format_and_truncate_tool_result(
 fn format_json_compact(text: &str) -> Option<String>
 ```
 
-**Purpose**: Converts valid JSON into a single-line representation that still contains strategic spaces after separators so Ratatui can wrap it cleanly. Invalid JSON yields `None` instead of altering the input.
+**Purpose**: Turns valid JSON into a single-line format that is still readable and can wrap at spaces in the terminal. It returns nothing if the text is not valid JSON.
 
-**Data flow**: Parses `text` with `serde_json::from_str::<Value>`; on failure returns `None`. On success it pretty-prints the value, then scans the characters while maintaining `in_string` and `escape_next` flags, dropping newlines and indentation outside strings and inserting a single space after `:` or `,` when appropriate. It returns `Some(compacted_json)`.
+**Data flow**: It receives text and tries to parse it as JSON. If parsing works, it creates pretty JSON, then removes line breaks and extra indentation while carefully preserving spaces and escape characters inside quoted strings. It returns the compact JSON string wrapped in Some; invalid JSON becomes None.
 
-**Call relations**: Called by tool-result formatting and other display helpers that want wrap-friendly JSON. Its behavior is validated by multiple unit tests covering objects, arrays, primitives, whitespace-heavy input, and invalid JSON.
+**Call relations**: This function is used by display code that shows tool approval values and by format_and_truncate_tool_result before truncation. Its tests call it with objects, arrays, primitives, whitespace-heavy JSON, compact JSON, and invalid JSON to make sure it behaves predictably.
 
 *Call graph*: called by 10 (format_tool_approval_display_param_value, format_and_truncate_tool_result, test_format_json_compact_already_compact, test_format_json_compact_array, test_format_json_compact_empty_array, test_format_json_compact_empty_object, test_format_json_compact_invalid_json, test_format_json_compact_nested_object, test_format_json_compact_simple_object, test_format_json_compact_with_whitespace); 3 external calls (new, matches!, to_string_pretty).
 
@@ -1026,11 +1036,11 @@ fn format_json_compact(text: &str) -> Option<String>
 fn truncate_text(text: &str, max_graphemes: usize) -> String
 ```
 
-**Purpose**: Truncates text by grapheme cluster count rather than bytes or scalar values, avoiding splits inside emoji or combining-character sequences. When space permits, it reserves three graphemes for an ASCII ellipsis `...`.
+**Purpose**: Shortens text to a maximum number of graphemes, which are user-visible character groups. This avoids cutting through characters like emojis or letters made from multiple Unicode pieces.
 
-**Data flow**: Takes `text` and `max_graphemes`, iterates `text.grapheme_indices(true)` to detect whether the string exceeds the limit, and either returns the original text, a prefix plus `...`, or the first `max_graphemes` graphemes when the limit is below three. It returns a new `String` in all cases.
+**Data flow**: It receives text and a grapheme limit. If the text fits, it returns the original text. If it is too long and the limit is at least three, it keeps enough text to add three dots within the limit. For very small limits, it simply returns the first visible character groups without dots.
 
-**Call relations**: This is a widely reused low-level formatter used by summaries, prompts, rows, and tool displays elsewhere in the TUI. `format_and_truncate_tool_result` composes it after optional JSON compaction, and the test suite here exercises many boundary conditions.
+**Call relations**: Many parts of the TUI rely on this as the safe text cutter, including summaries, prompts, row building, status spans, and tool display formatting. The tests exercise normal strings, empty input, tiny limits, emojis, combining marks, exact limits, and very long strings.
 
 *Call graph*: called by 25 (activity_summary, bounded_summary, format_tool_approval_display_param_value, build_rows, error_summary_spans, prompt_line, status_summary_spans, dense_column_text, push_footer_part, render_comfortable_session_lines (+15 more)); 1 external calls (format!).
 
@@ -1041,11 +1051,11 @@ fn truncate_text(text: &str, max_graphemes: usize) -> String
 fn center_truncate_path(path: &str, max_width: usize) -> String
 ```
 
-**Purpose**: Shrinks a path-like string to a target display width while preserving as much leading and trailing path structure as possible. It prefers a middle ellipsis and only front-truncates individual segments when necessary.
+**Purpose**: Shortens a file path to fit a given terminal width while keeping useful context from both the start and the end. It uses a single ellipsis in the middle when possible, and can shorten an individual long folder or file name if needed.
 
-**Data flow**: Consumes `path` and `max_width`, first short-circuiting for zero width or already-fitting paths. It splits the path on `MAIN_SEPARATOR`, tracks leading/trailing separators, generates candidate `(left_count, right_count)` segment combinations, assembles candidates with an inserted `…` when middle segments are omitted, measures display width with `UnicodeWidthStr`, and iteratively front-truncates selected segments using a helper closure based on `UnicodeWidthChar`. It returns the first fitting candidate or a final front-truncated whole-path fallback.
+**Data flow**: It receives a path-like string and a maximum display width. If the path already fits, it returns it unchanged. Otherwise it splits the path into segments, tries combinations of leading and trailing segments, inserts an ellipsis for skipped middle parts, and measures the display width. If a segment is still too long, it front-truncates that segment with an ellipsis. It returns the best fitting path it can produce.
 
-**Call relations**: Used by directory/path display formatting elsewhere in the TUI and covered by dedicated tests for Unix-like paths, Windows-like paths, and oversized single segments. It encapsulates all width-aware path truncation logic locally.
+**Call relations**: Directory display code calls this when showing paths in the TUI. The function uses Unicode display-width checks so terminal cells, not just byte counts, guide the shortening. Tests cover paths that fit, long Unix-like paths, Windows-style paths, and a path with one very long segment.
 
 *Call graph*: called by 6 (format_directory_inner, format_directory_display, test_center_truncate_doesnt_truncate_short_path, test_center_truncate_handles_long_segment, test_center_truncate_truncates_long_path, test_center_truncate_truncates_long_windows_path); 4 external calls (new, width, new, min).
 
@@ -1056,11 +1066,11 @@ fn center_truncate_path(path: &str, max_width: usize) -> String
 fn proper_join(items: &[T]) -> String
 ```
 
-**Purpose**: Joins a slice of strings into simple English list text using `and` and comma separators. It intentionally omits the Oxford comma in lists of three or more items.
+**Purpose**: Joins a list of words or phrases using ordinary English punctuation. It makes lists read naturally in messages, such as “apple, banana and cherry.”
 
-**Data flow**: Reads `items: &[T]` where `T: AsRef<str>`, branches on `items.len()`, and returns either an empty string, the sole item, a two-item `"a and b"` string, or a comma-separated prefix followed by ` and {last}`.
+**Data flow**: It receives a slice of string-like items. For no items it returns an empty string, for one item it returns that item, for two it inserts “and,” and for three or more it adds commas between earlier items plus “and” before the last. It returns the completed sentence fragment.
 
-**Call relations**: This is a standalone presentation helper. It is validated by the local `test_proper_join` unit test.
+**Call relations**: This is a standalone helper for human-readable messages. Its test checks empty, one-item, two-item, and longer lists.
 
 *Call graph*: 4 external calls (new, iter, len, format!).
 
@@ -1071,11 +1081,11 @@ fn proper_join(items: &[T]) -> String
 fn test_truncate_text()
 ```
 
-**Purpose**: Verifies that truncation beyond the limit produces a shortened prefix plus ellipsis for ordinary ASCII text.
+**Purpose**: Checks that ordinary text is shortened with dots when the limit is smaller than the text. It protects the basic truncation behavior users see in the interface.
 
-**Data flow**: Creates a sample string, calls `truncate_text` with a limit of 8 graphemes, and asserts that the returned string is `Hello...`.
+**Data flow**: It starts with “Hello, world!” and asks truncate_text for eight graphemes. It expects the result to be “Hello...”, proving the dots are included within the limit.
 
-**Call relations**: This test exercises the main truncation path where the input exceeds the limit and the limit is large enough to reserve three graphemes for `...`.
+**Call relations**: The test runner calls this during the test suite. It directly exercises truncate_text and compares the result with an assertion.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1086,11 +1096,11 @@ fn test_truncate_text()
 fn test_truncate_empty_string()
 ```
 
-**Purpose**: Checks that truncating an empty string returns an empty string rather than panicking or adding punctuation.
+**Purpose**: Checks that truncating an empty string stays empty. This prevents special-case display bugs when there is no text to show.
 
-**Data flow**: Passes `""` into `truncate_text` with a positive limit and asserts the result is still empty.
+**Data flow**: It sends an empty string and a limit of five into truncate_text. It expects an empty string back.
 
-**Call relations**: This test covers the empty-input edge case of `truncate_text`.
+**Call relations**: The test runner calls this as part of validation. It uses truncate_text and verifies the result with an equality assertion.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1101,11 +1111,11 @@ fn test_truncate_empty_string()
 fn test_truncate_max_graphemes_zero()
 ```
 
-**Purpose**: Confirms that a zero grapheme budget yields an empty result.
+**Purpose**: Checks behavior when the allowed size is zero. This matters because some terminal areas can effectively have no room.
 
-**Data flow**: Calls `truncate_text("Hello", 0)` and asserts the returned string is empty.
+**Data flow**: It sends “Hello” with a zero-grapheme limit into truncate_text. It expects the returned string to be empty.
 
-**Call relations**: This test covers the smallest possible truncation budget for `truncate_text`.
+**Call relations**: The test runner invokes this edge-case test. It calls truncate_text and confirms the exact output.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1116,11 +1126,11 @@ fn test_truncate_max_graphemes_zero()
 fn test_truncate_max_graphemes_one()
 ```
 
-**Purpose**: Confirms that a one-grapheme budget returns exactly the first grapheme with no ellipsis.
+**Purpose**: Checks behavior when only one visible character group is allowed. It ensures tiny spaces do not receive an ellipsis that would exceed the limit.
 
-**Data flow**: Calls `truncate_text("Hello", 1)` and asserts the result is `H`.
+**Data flow**: It sends “Hello” with a limit of one into truncate_text. It expects only “H” back.
 
-**Call relations**: This test validates the branch where `max_graphemes < 3`, so no `...` is appended.
+**Call relations**: This is run by the test framework. It focuses on truncate_text’s small-limit branch and verifies it with an assertion.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1131,11 +1141,11 @@ fn test_truncate_max_graphemes_one()
 fn test_truncate_max_graphemes_two()
 ```
 
-**Purpose**: Confirms that a two-grapheme budget returns the first two graphemes with no ellipsis.
+**Purpose**: Checks behavior when two visible character groups are allowed. It confirms that the function returns raw leading text instead of dots for very small limits.
 
-**Data flow**: Calls `truncate_text("Hello", 2)` and asserts the result is `He`.
+**Data flow**: It sends “Hello” with a limit of two into truncate_text. It expects “He”.
 
-**Call relations**: This test covers another `max_graphemes < 3` boundary for `truncate_text`.
+**Call relations**: The test runner calls this. It exercises truncate_text and checks the output exactly.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1146,11 +1156,11 @@ fn test_truncate_max_graphemes_two()
 fn test_truncate_max_graphemes_three_boundary()
 ```
 
-**Purpose**: Checks the exact boundary where the entire budget is consumed by the ellipsis marker.
+**Purpose**: Checks the boundary where the function starts using three dots. It makes sure a three-character limit becomes exactly an ellipsis-style marker.
 
-**Data flow**: Calls `truncate_text("Hello", 3)` and asserts the result is `...`.
+**Data flow**: It sends “Hello” with a limit of three into truncate_text. It expects “...”.
 
-**Call relations**: This test validates the `max_graphemes >= 3` truncation branch at its smallest value.
+**Call relations**: This test is called by the test runner. It validates the transition point in truncate_text’s truncation rules.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1161,11 +1171,11 @@ fn test_truncate_max_graphemes_three_boundary()
 fn test_truncate_text_shorter_than_limit()
 ```
 
-**Purpose**: Ensures text shorter than the grapheme limit is returned unchanged.
+**Purpose**: Checks that short text is not changed when there is plenty of space. This protects against unnecessary shortening.
 
-**Data flow**: Calls `truncate_text("Hi", 10)` and asserts the original string is preserved.
+**Data flow**: It sends “Hi” with a limit of ten into truncate_text. It expects “Hi” back unchanged.
 
-**Call relations**: This test covers the no-truncation path of `truncate_text`.
+**Call relations**: The test runner executes this case. It confirms truncate_text leaves fitting text alone.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1176,11 +1186,11 @@ fn test_truncate_text_shorter_than_limit()
 fn test_truncate_text_exact_length()
 ```
 
-**Purpose**: Ensures text exactly at the grapheme limit is not modified.
+**Purpose**: Checks that text exactly at the limit is not shortened. This avoids losing information when the text already fits.
 
-**Data flow**: Calls `truncate_text("Hello", 5)` and asserts the result remains `Hello`.
+**Data flow**: It sends “Hello” with a limit of five into truncate_text. It expects “Hello” back unchanged.
 
-**Call relations**: This test covers the exact-fit path of `truncate_text`.
+**Call relations**: This test is run by the test framework. It verifies truncate_text’s exact-fit behavior.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1191,11 +1201,11 @@ fn test_truncate_text_exact_length()
 fn test_truncate_emoji()
 ```
 
-**Purpose**: Verifies grapheme-aware truncation with emoji sequences, including the boundary where only ellipsis fits and where one emoji plus ellipsis fits.
+**Purpose**: Checks that emojis are counted as whole visible characters rather than raw bytes. This prevents broken emoji display after truncation.
 
-**Data flow**: Calls `truncate_text` on an emoji string with limits 3 and 4, then asserts the outputs are `...` and `👋...` respectively.
+**Data flow**: It sends a sequence of emojis into truncate_text with limits of three and four. It expects either just dots or one emoji followed by dots, showing that no emoji is split apart.
 
-**Call relations**: This test demonstrates why `truncate_text` uses grapheme clusters instead of bytes or chars.
+**Call relations**: The test runner calls this Unicode-focused test. It uses truncate_text and equality assertions to guard emoji-safe behavior.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1206,11 +1216,11 @@ fn test_truncate_emoji()
 fn test_truncate_unicode_combining_characters()
 ```
 
-**Purpose**: Checks that combining-character sequences are not split incorrectly during truncation.
+**Purpose**: Checks that letters with combining marks are treated as complete visible characters. This protects accented text from being cut in the middle.
 
-**Data flow**: Passes a string containing combining marks into `truncate_text` with a limit of 2 graphemes and asserts the full text is preserved.
+**Data flow**: It sends text made from base letters plus combining marks into truncate_text with a limit of two graphemes. It expects the full two visible characters back.
 
-**Call relations**: This test validates Unicode grapheme correctness in `truncate_text`.
+**Call relations**: This test is run with the rest of the suite. It directly validates truncate_text’s grapheme-based cutting.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1221,11 +1231,11 @@ fn test_truncate_unicode_combining_characters()
 fn test_truncate_very_long_text()
 ```
 
-**Purpose**: Confirms truncation behavior on large inputs and verifies the final string length stays within the requested grapheme budget for simple ASCII.
+**Purpose**: Checks that very long text is shortened correctly and stays within the requested length. This protects the terminal from oversized strings.
 
-**Data flow**: Builds a 1000-character `a` string, truncates it to 10 graphemes, and asserts both the textual result and resulting length.
+**Data flow**: It creates one thousand “a” characters, truncates them to ten graphemes, and expects seven “a” characters followed by three dots. It also checks the resulting byte length for this plain ASCII case.
 
-**Call relations**: This test covers performance-adjacent long-input behavior and the expected `7 chars + 3 dots` output shape.
+**Call relations**: The test runner invokes this stress-style case. It calls truncate_text and confirms both the visible result and its length.
 
 *Call graph*: calls 1 internal fn (truncate_text); 1 external calls (assert_eq!).
 
@@ -1236,11 +1246,11 @@ fn test_truncate_very_long_text()
 fn test_format_json_compact_simple_object()
 ```
 
-**Purpose**: Verifies compact formatting of a simple JSON object with spaces after separators.
+**Purpose**: Checks that a simple JSON object becomes compact but readable. It verifies spaces are added after separators in the expected way.
 
-**Data flow**: Calls `format_json_compact` on a small object literal, unwraps the `Option`, and asserts the exact compact string.
+**Data flow**: It sends a small object with extra spaces into format_json_compact. It unwraps the successful result and expects a single-line object with consistent spacing.
 
-**Call relations**: This test covers the basic successful parse-and-compact path of `format_json_compact`.
+**Call relations**: The test framework calls this. It exercises format_json_compact’s normal object path and compares the output.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1251,11 +1261,11 @@ fn test_format_json_compact_simple_object()
 fn test_format_json_compact_nested_object()
 ```
 
-**Purpose**: Checks that nested objects are compacted into a single line while preserving readable separator spacing.
+**Purpose**: Checks that nested JSON objects are compacted without losing their structure. This matters because tool output often contains nested data.
 
-**Data flow**: Passes nested JSON into `format_json_compact`, unwraps the result, and compares it to the expected single-line nested form.
+**Data flow**: It sends JSON with objects inside objects into format_json_compact. It expects one compact line that still keeps braces, keys, and values in the right places.
 
-**Call relations**: This test validates recursive/nested structure handling in `format_json_compact`.
+**Call relations**: The test runner invokes this. It calls format_json_compact and uses an assertion to guard nested formatting.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1266,11 +1276,11 @@ fn test_format_json_compact_nested_object()
 fn test_center_truncate_doesnt_truncate_short_path()
 ```
 
-**Purpose**: Ensures a path already within the width budget is returned unchanged.
+**Purpose**: Checks that a path which already fits is returned unchanged. This prevents needless ellipses in readable paths.
 
-**Data flow**: Constructs a path using the platform separator, calls `center_truncate_path` with a wide limit, and asserts equality with the original path.
+**Data flow**: It builds a platform-appropriate path and passes it to center_truncate_path with a generous width. It expects the same path back.
 
-**Call relations**: This test covers the early-return no-truncation branch of `center_truncate_path`.
+**Call relations**: The test runner calls this case. It uses path formatting, center_truncate_path, and an equality assertion.
 
 *Call graph*: calls 1 internal fn (center_truncate_path); 2 external calls (assert_eq!, format!).
 
@@ -1281,11 +1291,11 @@ fn test_center_truncate_doesnt_truncate_short_path()
 fn test_center_truncate_truncates_long_path()
 ```
 
-**Purpose**: Verifies that long multi-segment paths are center-truncated with a middle ellipsis while preserving both prefix and suffix segments.
+**Purpose**: Checks that a long path is shortened by keeping useful beginning and ending segments. It verifies the middle is replaced by an ellipsis.
 
-**Data flow**: Builds a long path, calls `center_truncate_path` with a constrained width, and asserts the expected `prefix/…/suffix` form.
+**Data flow**: It builds a long path, gives center_truncate_path a narrower width, and expects a result that keeps the early folders and the final folders with an ellipsis between them.
 
-**Call relations**: This test exercises the candidate-combination logic in `center_truncate_path`.
+**Call relations**: The test framework runs this to validate the main path-shortening behavior. It calls center_truncate_path and checks the exact formatted result.
 
 *Call graph*: calls 1 internal fn (center_truncate_path); 2 external calls (assert_eq!, format!).
 
@@ -1296,11 +1306,11 @@ fn test_center_truncate_truncates_long_path()
 fn test_center_truncate_truncates_long_windows_path()
 ```
 
-**Purpose**: Checks center truncation on a Windows-style path shape, preserving drive/prefix and filename suffix.
+**Purpose**: Checks that Windows-style paths also shorten in a useful way. This matters because the project may run on different operating systems.
 
-**Data flow**: Constructs a long path with a drive-like prefix and many segments, truncates it, and asserts the expected ellipsis-preserving result.
+**Data flow**: It builds a long path beginning with a drive-like segment, passes it to center_truncate_path, and expects the start plus the final path parts to remain visible.
 
-**Call relations**: This test validates that `center_truncate_path` works across platform-style path structures.
+**Call relations**: The test runner invokes this platform-conscious case. It uses format-style path construction, calls center_truncate_path, and verifies the output.
 
 *Call graph*: calls 1 internal fn (center_truncate_path); 2 external calls (assert_eq!, format!).
 
@@ -1311,11 +1321,11 @@ fn test_center_truncate_truncates_long_windows_path()
 fn test_center_truncate_handles_long_segment()
 ```
 
-**Purpose**: Verifies fallback front-truncation of an individual oversized segment when preserving whole segments cannot fit.
+**Purpose**: Checks that a single very long path segment can be shortened from the front. This keeps the ending of a filename or folder name visible when that is the most useful part.
 
-**Data flow**: Builds a path with one extremely long segment, calls `center_truncate_path`, and asserts the result contains a leading ellipsis inside that segment.
+**Data flow**: It builds a short path with one extremely long segment, asks center_truncate_path to fit it into a small width, and expects the segment to start with an ellipsis followed by its ending.
 
-**Call relations**: This test covers the segment-level front-truncation branch of `center_truncate_path`.
+**Call relations**: This test is run by the test framework. It directly exercises center_truncate_path’s per-segment fallback behavior.
 
 *Call graph*: calls 1 internal fn (center_truncate_path); 2 external calls (assert_eq!, format!).
 
@@ -1326,11 +1336,11 @@ fn test_center_truncate_handles_long_segment()
 fn test_format_json_compact_array()
 ```
 
-**Purpose**: Verifies compact formatting of arrays containing primitives and nested objects.
+**Purpose**: Checks that JSON arrays are compacted cleanly. It verifies mixed array contents such as numbers, objects, and strings stay readable.
 
-**Data flow**: Calls `format_json_compact` on an array literal, unwraps the result, and asserts the exact compact output.
+**Data flow**: It sends an array with extra spaces into format_json_compact. It expects a single-line array with spaces after commas where helpful.
 
-**Call relations**: This test extends `format_json_compact` coverage to array syntax.
+**Call relations**: The test runner calls this. It validates format_json_compact for array-shaped JSON.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1341,11 +1351,11 @@ fn test_format_json_compact_array()
 fn test_format_json_compact_already_compact()
 ```
 
-**Purpose**: Ensures already-compact JSON is normalized only as needed, such as inserting a space after a colon.
+**Purpose**: Checks that already compact JSON is normalized into the project’s preferred readable spacing. It prevents cramped JSON from being shown without wrap-friendly spaces.
 
-**Data flow**: Passes compact JSON into `format_json_compact`, unwraps the result, and asserts the normalized compact form.
+**Data flow**: It sends a compact object into format_json_compact. It expects the same structure but with a space after the colon.
 
-**Call relations**: This test checks idempotent-ish behavior of `format_json_compact` on already concise input.
+**Call relations**: The test runner invokes this. It calls format_json_compact and compares the normalized output.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1356,11 +1366,11 @@ fn test_format_json_compact_already_compact()
 fn test_format_json_compact_with_whitespace()
 ```
 
-**Purpose**: Checks that heavily indented multiline JSON is collapsed into a single wrap-friendly line.
+**Purpose**: Checks that heavily indented, multi-line JSON becomes a compact single line. This protects terminal space when tool output is pretty-printed.
 
-**Data flow**: Supplies multiline JSON text to `format_json_compact`, unwraps the result, and asserts the expected compact string.
+**Data flow**: It sends a multi-line object containing an array into format_json_compact. It expects one line with the same data and readable separator spacing.
 
-**Call relations**: This test validates whitespace stripping outside strings in `format_json_compact`.
+**Call relations**: The test framework calls this. It confirms format_json_compact removes outside-string whitespace while preserving JSON meaning.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1371,11 +1381,11 @@ fn test_format_json_compact_with_whitespace()
 fn test_format_json_compact_invalid_json()
 ```
 
-**Purpose**: Ensures invalid JSON input is rejected rather than partially rewritten.
+**Purpose**: Checks that invalid JSON is rejected instead of being reformatted incorrectly. This lets callers safely fall back to displaying the original text.
 
-**Data flow**: Calls `format_json_compact` on malformed JSON and asserts the result is `None`.
+**Data flow**: It sends malformed JSON into format_json_compact. It expects no formatted string to be returned.
 
-**Call relations**: This test covers the parse-failure early return of `format_json_compact`.
+**Call relations**: The test runner executes this negative case. It calls format_json_compact and asserts that the result is None.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert!).
 
@@ -1386,11 +1396,11 @@ fn test_format_json_compact_invalid_json()
 fn test_format_json_compact_empty_object()
 ```
 
-**Purpose**: Verifies that an empty object remains `{}` after compaction.
+**Purpose**: Checks that an empty JSON object stays as a simple empty object. It guards a small but common edge case.
 
-**Data flow**: Calls `format_json_compact("{}")`, unwraps the result, and asserts it equals `{}`.
+**Data flow**: It sends “{}” into format_json_compact. It expects “{}” back.
 
-**Call relations**: This test covers a minimal valid-object case for `format_json_compact`.
+**Call relations**: The test framework runs this. It calls format_json_compact and verifies the exact result.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1401,11 +1411,11 @@ fn test_format_json_compact_empty_object()
 fn test_format_json_compact_empty_array()
 ```
 
-**Purpose**: Verifies that an empty array remains `[]` after compaction.
+**Purpose**: Checks that an empty JSON array stays as a simple empty array. It prevents unnecessary spacing or changes.
 
-**Data flow**: Calls `format_json_compact("[]")`, unwraps the result, and asserts it equals `[]`.
+**Data flow**: It sends “[]” into format_json_compact. It expects “[]” back.
 
-**Call relations**: This test covers a minimal valid-array case for `format_json_compact`.
+**Call relations**: The test runner calls this. It validates format_json_compact on another empty JSON shape.
 
 *Call graph*: calls 1 internal fn (format_json_compact); 1 external calls (assert_eq!).
 
@@ -1416,11 +1426,11 @@ fn test_format_json_compact_empty_array()
 fn test_format_json_compact_primitive_values()
 ```
 
-**Purpose**: Checks that primitive JSON values are accepted and returned in their expected textual form.
+**Purpose**: Checks that JSON values that are not objects or arrays, such as numbers, booleans, null, and strings, are accepted and preserved. This matters because valid JSON can be a single primitive value.
 
-**Data flow**: Calls `format_json_compact` on numeric, boolean, null, and string literals and asserts each unwrapped result.
+**Data flow**: It feeds primitive JSON values through the compact formatter and compares each returned value with the expected plain form. The values should not gain object-style spacing or extra structure.
 
-**Call relations**: This test broadens `format_json_compact` coverage beyond arrays and objects.
+**Call relations**: The test runner invokes this set of assertions. It protects format_json_compact’s behavior for primitive JSON values.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1431,20 +1441,24 @@ fn test_format_json_compact_primitive_values()
 fn test_proper_join()
 ```
 
-**Purpose**: Verifies English list joining across empty, singleton, pair, and longer lists.
+**Purpose**: Checks that lists of different lengths are joined in readable English. It makes sure user-facing messages do not contain awkward punctuation.
 
-**Data flow**: Constructs several input slices and vectors, calls `proper_join` on each, and asserts the exact returned strings.
+**Data flow**: It creates empty and non-empty example lists and passes them through proper_join. It expects the correct empty string, single item, two-item “and” form, and comma-separated longer forms.
 
-**Call relations**: This test locks down the punctuation and conjunction rules implemented by `proper_join`.
+**Call relations**: The test runner calls this. It validates the standalone proper_join helper using equality assertions.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `utils/output-truncation/src/lib.rs`
 
-`domain_logic` · `cross-cutting`
+`util` · `cross-cutting during tool output preparation`
 
-This file contains the production truncation logic used to shrink tool or exec output before it is surfaced elsewhere. The simplest path is `truncate_text`, which dispatches on `TruncationPolicy`: byte budgets use `truncate_middle_chars`, while token budgets use `truncate_middle_with_token_budget` and keep only the truncated string component. `formatted_truncate_text` wraps that raw truncation with a warning header that records the original approximate token count and original line count, but only when the content exceeds the policy’s byte budget; otherwise it returns the original string unchanged. For structured outputs, `formatted_truncate_text_content_items_with_policy` extracts only `InputText` segments, joins them with newline separators, and if truncation is needed replaces all text items with a single warning-prefixed `InputText` while appending any `InputImage` and `EncryptedContent` items unchanged. The sibling `truncate_function_output_items_with_policy` instead preserves item boundaries as much as possible: it walks items in order, spends a remaining byte/token budget only on text items, truncates the first over-budget text item into a snippet, omits later text items once the budget is exhausted, and appends a summary marker like `[omitted N text items ...]`. Non-text items never consume budget and are always preserved. Finally, `approx_tokens_from_byte_count_i64` is a small adapter that clamps non-positive inputs to zero and saturates conversions between signed and unsigned sizes.
+Large command results can overwhelm a conversation, exceed model limits, or make logs hard to read. This file is the project’s shared toolkit for trimming that output safely and consistently. Think of it like a careful editor: if the text already fits, it leaves it alone; if it is too long, it cuts from the middle so the reader can still see how the output starts and ends.
+
+The main idea is a `TruncationPolicy`, which says whether the limit is measured in bytes, meaning raw text size, or in tokens, meaning an approximate model-sized word-piece count. Simple text can be shortened directly with `truncate_text`, or shortened with a warning header using `formatted_truncate_text`. That header tells the reader that content was removed and gives the original estimated token count and line count.
+
+The file also works with structured tool output items. Some items are text, while others are images or encrypted content. The truncation helpers avoid damaging images and encrypted data. One helper combines all text into a single readable block before truncating it and then appends the non-text items unchanged. Another helper walks item by item, spending a shared budget on text while always keeping images and encrypted content. This matters because output sent to a model must be small enough to fit, but should still be honest about what was omitted.
 
 #### Function details
 
@@ -1454,11 +1468,11 @@ This file contains the production truncation logic used to shrink tool or exec o
 fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String
 ```
 
-**Purpose**: Returns either the original text or a warning-prefixed truncated version that includes original token and line counts.
+**Purpose**: Shortens a plain text string only if it is larger than the allowed size, and adds a clear warning when shortening happens. Someone would use this when showing command output to a user or model and they need the reader to know that the text is incomplete.
 
-**Data flow**: It takes a content string and `TruncationPolicy`. If `content.len()` is within `policy.byte_budget()`, it returns `content.to_string()`. Otherwise it computes `approx_token_count(content)`, counts lines with `content.lines().count()`, obtains the truncated body from `truncate_text`, and formats a warning header plus the truncated body into a new `String`.
+**Data flow**: It receives the original text and a truncation policy. First it checks the policy’s byte budget; if the text already fits, it returns the text unchanged. If the text is too large, it estimates the original token count, counts the original lines, asks `truncate_text` to make a shorter version, and returns a new string with a warning header followed by the shortened content.
 
-**Call relations**: This helper is used directly by callers that want human-readable truncation context and is also reused by `formatted_truncate_text_content_items_with_policy` after text segments are merged.
+**Call relations**: This is a friendly wrapper around `truncate_text`. It calls the lower-level truncation function only after deciding the output is too large, and it adds human-readable context using the token estimate and line count before handing the shortened text back to its caller.
 
 *Call graph*: calls 2 internal fn (byte_budget, truncate_text); 2 external calls (approx_token_count, format!).
 
@@ -1469,11 +1483,11 @@ fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String
 fn truncate_text(content: &str, policy: TruncationPolicy) -> String
 ```
 
-**Purpose**: Performs the core middle-truncation of a single text string according to either a byte or token budget.
+**Purpose**: Cuts a text string down according to the chosen limit, without adding any warning text. It is the core text-shortening helper used when callers want just the shortened content.
 
-**Data flow**: It takes a content string and `TruncationPolicy`. For `Bytes(bytes)` it calls `truncate_middle_chars(content, bytes)`; for `Tokens(tokens)` it calls `truncate_middle_with_token_budget(content, tokens)` and returns only the string portion of that result.
+**Data flow**: It receives text and a policy. If the policy is byte-based, it uses a character-aware middle-truncation helper so the output fits roughly within that byte size. If the policy is token-based, it uses a token-budget helper that estimates how much text can fit. It returns the shortened string.
 
-**Call relations**: This is the low-level truncation primitive used by both `formatted_truncate_text` and `truncate_function_output_items_with_policy`. It delegates the actual truncation algorithm to shared string utilities.
+**Call relations**: This function sits underneath the higher-level helpers. `formatted_truncate_text` calls it when it needs a shortened body for a warning-wrapped message, and `truncate_function_output_items_with_policy` calls it when one text item is too large for the remaining shared budget.
 
 *Call graph*: called by 2 (formatted_truncate_text, truncate_function_output_items_with_policy); 2 external calls (truncate_middle_chars, truncate_middle_with_token_budget).
 
@@ -1487,11 +1501,11 @@ fn formatted_truncate_text_content_items_with_policy(
 ) -> (Vec<FunctionCallOutputContentItem>, Option<usize>)
 ```
 
-**Purpose**: Merges all text content items, truncates them as one combined block if needed, and preserves non-text items after the merged text.
+**Purpose**: Shortens structured function-call output by combining all text pieces into one readable block, while keeping images and encrypted content intact. It also reports the original token count when truncation was needed.
 
-**Data flow**: It takes a slice of `FunctionCallOutputContentItem` and a policy. It collects `InputText` strings, ignoring `InputImage` and `EncryptedContent`. If there are no text segments, or if the newline-joined combined text fits within `policy.byte_budget()`, it returns `(items.to_vec(), None)`. Otherwise it computes the original token count, creates a new output vector whose first item is a single `InputText` containing `formatted_truncate_text(&combined, policy)`, then appends cloned image and encrypted items in original order. It returns that vector plus `Some(original_token_count)`.
+**Data flow**: It receives a list of output content items and a policy. It gathers only the text items, leaving image and encrypted items aside. If there is no text, or the combined text fits the byte budget, it returns a copy of the original items and no token count. If the combined text is too large, it estimates its token count, creates one warning-wrapped shortened text item, then appends copies of the original non-text items. The result is the new item list plus the original token count.
 
-**Call relations**: This function is for callers that prefer one consolidated warning-bearing text block rather than per-item truncation. It delegates the actual text shortening to `formatted_truncate_text` and preserves non-text payloads explicitly.
+**Call relations**: This helper is used when the caller wants one formatted, easy-to-read truncated text block rather than many separately shortened text fragments. Internally it relies on the same counting and formatting approach as `formatted_truncate_text`, and it preserves non-text content so later parts of the system still receive images or encrypted payloads.
 
 *Call graph*: calls 1 internal fn (byte_budget); 5 external calls (new, iter, to_vec, approx_token_count, vec!).
 
@@ -1505,11 +1519,11 @@ fn truncate_function_output_items_with_policy(
 ) -> Vec<FunctionCallOutputContentItem>
 ```
 
-**Purpose**: Applies a byte or token budget incrementally across text items while preserving non-text items and reporting how many later text items were omitted.
+**Purpose**: Applies one shared size budget across a list of function output items. It spends that budget only on text, keeps images and encrypted content, and adds a short note if some text items had to be skipped.
 
-**Data flow**: It takes a slice of content items and a policy, initializes an output vector and remaining budget from either `byte_budget()` or `token_budget()`, and iterates items in order. Text items consume budget based on byte length or `approx_token_count`; fully fitting text is cloned unchanged, the first over-budget text is truncated with `truncate_text` under the remaining budget, and once budget reaches zero later text items are omitted and counted. `InputImage` and `EncryptedContent` items are always cloned through unchanged. If any text items were omitted, it appends a final `InputText` summary marker.
+**Data flow**: It receives content items and a policy. It starts with a remaining budget, measured either in bytes or estimated tokens. For each text item, it checks whether the full text fits; if so, it copies it and subtracts its cost. If it does not fit, it truncates that one text item to whatever budget remains, then stops allowing more text. Image and encrypted items are copied through unchanged. If later text items are omitted, it appends a final text note such as an omitted-item count.
 
-**Call relations**: This function is the item-preserving alternative to `formatted_truncate_text_content_items_with_policy`. It relies on `truncate_text` for the partial-snippet case and on token-count helpers when operating under token budgets.
+**Call relations**: This is the item-by-item truncation path. It calls `truncate_text` when a single text item needs to be squeezed into the last bit of available space, and it uses token or byte counting to decide how much of the budget remains as it walks through the output.
 
 *Call graph*: calls 3 internal fn (byte_budget, token_budget, truncate_text); 6 external calls (with_capacity, len, approx_token_count, format!, Bytes, Tokens).
 
@@ -1520,20 +1534,20 @@ fn truncate_function_output_items_with_policy(
 fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64
 ```
 
-**Purpose**: Converts a signed byte count into an approximate signed token count with clamping and saturation.
+**Purpose**: Converts a byte count into an approximate token count using signed 64-bit integers, which are common in APIs and configuration values. It protects callers from negative values and number sizes that are too large to convert safely.
 
-**Data flow**: It takes an `i64` byte count. Non-positive values return `0`. Positive values are converted to `usize` with saturation to `usize::MAX`, passed to `approx_tokens_from_byte_count`, then converted back to `i64` with saturation to `i64::MAX`.
+**Data flow**: It receives a byte count as an `i64`. If the value is zero or negative, it returns zero. Otherwise it converts the number to an unsigned size, clamps impossible conversions to the largest available value, calls the shared byte-to-token estimate helper, and converts the result back to `i64`, again using a safe maximum if needed.
 
-**Call relations**: This is a small adapter for APIs that traffic in signed integers. It delegates the actual approximation to the re-exported string utility.
+**Call relations**: This is a small compatibility helper around the exported `approx_tokens_from_byte_count` utility. It does not drive truncation itself, but it gives other code a safe way to ask, in token terms, what a byte-sized limit roughly means.
 
 *Call graph*: 3 external calls (approx_tokens_from_byte_count, try_from, try_from).
 
 
 ### `tools/src/response_history.rs`
 
-`util` · `cross-cutting history preparation`
+`util` · `cross-cutting`
 
-This module operates directly on conversation history represented as `codex_protocol::models::ResponseItem`. `retain_tail_from_last_n_user_messages` is a structural slicer: if asked to retain zero user messages it clears the vector immediately; if there is no user message at all it also clears the vector. Otherwise it first truncates away everything after the latest user message, intentionally dropping any assistant output that followed that user turn, then walks backward through the remaining items to find the earliest user message among the last `user_message_count` user turns and drains everything before it. The result is a contiguous suffix beginning at a retained user message and ending exactly at the latest user message. `truncate_assistant_output_text_to_token_budget` is content-aware rather than turn-aware. It scans items in order, only touching `ResponseItem::Message` values whose `role` is `assistant`, and within those messages only `ContentItem::OutputText` entries. It spends a single shared `remaining_budget` across all assistant output text segments; once the budget is exhausted, later output-text segments are removed, and assistant messages emptied by that removal are dropped entirely. If a segment would exceed the remaining budget, it is truncated in place with `truncate_text(..., TruncationPolicy::Tokens(...))` and consumes the rest of the budget. The tests build minimal synthetic messages to demonstrate both the tail-retention boundary and cross-item truncation behavior.
+Long conversations can grow too large to send back into a model or store comfortably. This file provides two small cleanup tools for a list of response items, where each item is a message or another piece of model conversation data. The first tool keeps the tail of the conversation starting from the earliest of the last chosen number of user messages. It also cuts away anything after the latest user message, so later assistant text is not carried forward as if it were part of the prompt. The second tool limits assistant output text across the whole list. A token is a rough chunk of text used for model size limits, so this function treats the budget like a spending limit: each assistant output spends some of the remaining allowance, and once the allowance is gone, later assistant text is removed. If one assistant message is too long, it is shortened rather than thrown away entirely. Non-assistant messages and non-text content are left alone. The tests at the bottom build simple fake messages and prove the two main behaviors: keeping the right conversation tail, and sharing one text budget across multiple assistant messages.
 
 #### Function details
 
@@ -1546,11 +1560,11 @@ fn retain_tail_from_last_n_user_messages(
 )
 ```
 
-**Purpose**: Shrinks a response-history vector so it contains only the contiguous span from the earliest of the last N user messages through the latest user message. It deliberately excludes any items after that latest user turn.
+**Purpose**: Keeps only the recent part of a response history, measured by user messages. This is useful when the system wants enough recent context to understand the current conversation, but not the entire older history.
 
-**Data flow**: Takes `&mut Vec<ResponseItem>` plus `user_message_count`. If the count is zero, it clears the vector and returns. Otherwise it searches backward for the last item where `ResponseItem::is_user_message` is true; if none exists, it clears the vector. With a latest user index found, it truncates the vector to `latest_user_idx + 1`, then scans backward over user messages, takes the last `user_message_count` of them, computes the earliest retained user index, and drains all earlier items. It mutates the input vector in place and returns `()`.
+**Data flow**: It receives a mutable list of response items and a number of user messages to keep. If the number is zero, or if there are no user messages at all, it empties the list. Otherwise, it first removes anything after the latest user message, then finds the earliest user message among the last requested user messages, and removes everything before that point. The same list is changed in place; it does not return a new list.
 
-**Call relations**: Production code can call this as a preprocessing step before handing history to downstream consumers; in this file it is exercised by `tests::retains_tail_through_latest_user_message`. The function is self-contained and delegates only to standard iterator and vector operations.
+**Call relations**: In this file it is exercised by tests::retains_tail_through_latest_user_message, which builds a sample conversation with old and recent turns and checks that only the intended recent tail remains. In normal use, this helper would be called before reusing or sending conversation history, so older context does not keep growing forever.
 
 *Call graph*: called by 1 (retains_tail_through_latest_user_message).
 
@@ -1564,11 +1578,11 @@ fn truncate_assistant_output_text_to_token_budget(
 )
 ```
 
-**Purpose**: Applies one shared token budget across all assistant output-text content in a history vector, truncating or removing assistant text once the budget is exhausted. Non-assistant items and non-output content are preserved unchanged.
+**Purpose**: Shortens assistant output text so all assistant text together fits within one maximum token budget. This helps keep stored or reused model output from becoming too large.
 
-**Data flow**: Accepts `&mut Vec<ResponseItem>` and `max_tokens`, initializes `remaining_budget`, and then retains/mutates items in place. For each `ResponseItem::Message`, it skips non-assistant roles; for assistant messages it retains/mutates each `ContentItem`, preserving non-`OutputText` entries, dropping `OutputText` entries when budget is zero, keeping whole text when `approx_token_count(text)` fits, or replacing `text` with `truncate_text(text, TruncationPolicy::Tokens(remaining_budget))` when only a prefix fits. After processing a message, it removes the whole message if its `content` becomes empty. It returns `()` after mutating the vector.
+**Data flow**: It receives a mutable list of response items and a maximum token count. It walks through the items in order, ignores anything that is not an assistant message, and looks only at assistant output text. Each kept text item uses part of the remaining budget. If a text item is larger than what is left, the function replaces it with a shortened version. Once the budget is used up, later assistant output text items are removed, and assistant messages with no content left are removed too. The list is modified in place.
 
-**Call relations**: This helper is validated by `tests::truncates_assistant_output_text_across_items`, which demonstrates budget sharing across multiple assistant messages. It delegates token estimation and truncation mechanics to `approx_token_count` and `truncate_text` from the output-truncation utility crate.
+**Call relations**: In this file it is checked by tests::truncates_assistant_output_text_across_items, which creates assistant text before and after a small budget and verifies that the first text is shortened and later over-budget assistant text disappears. The helper relies on the truncation utilities approx_token_count and truncate_text to estimate size and perform the actual shortening.
 
 *Call graph*: called by 1 (truncates_assistant_output_text_across_items).
 
@@ -1579,11 +1593,11 @@ fn truncate_assistant_output_text_to_token_budget(
 fn message(role: &str, text: &str) -> ResponseItem
 ```
 
-**Purpose**: Constructs a minimal `ResponseItem::Message` fixture for tests, choosing input or output content shape based on the role. It keeps the tests concise while still producing realistic protocol values.
+**Purpose**: Builds a simple test message with the requested role and text. It lets the tests describe conversations clearly without repeating the full response item structure each time.
 
-**Data flow**: Takes a `role` string and `text` string slice. Builds a `ResponseItem::Message` with `id`, `phase`, and `metadata` set to `None`; if the role is `assistant`, it wraps the text in `ContentItem::OutputText`, otherwise in `ContentItem::InputText`. Returns the assembled `ResponseItem`.
+**Data flow**: It takes a role such as "user" or "assistant" and a text string. It creates a ResponseItem::Message with that role. Assistant messages receive output text, while all other roles receive input text. It returns the constructed message for use in test vectors.
 
-**Call relations**: This helper is called by both test functions in the nested `tests` module to build expected and actual histories. It does not participate in production call flow.
+**Call relations**: The two test functions call this helper whenever they need sample conversation items. It hides the setup details so the tests can focus on the behavior being checked.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1594,11 +1608,11 @@ fn message(role: &str, text: &str) -> ResponseItem
 fn retains_tail_through_latest_user_message()
 ```
 
-**Purpose**: Demonstrates that retaining the last two user messages keeps the contiguous span from the earlier retained user turn through the latest user turn and drops later assistant output. It serves as the executable specification for the tail-retention helper.
+**Purpose**: Tests that recent-history trimming keeps the correct slice of a conversation. It proves that old messages are removed, the requested number of recent user turns is respected, and assistant content after the latest user message is not kept.
 
-**Data flow**: Builds a mixed sequence of system, user, and assistant messages with `tests::message`, mutably passes it to `retain_tail_from_last_n_user_messages` with count `2`, and then asserts that the vector now contains only `previous user`, `previous assistant`, and `current user`.
+**Data flow**: It starts with a sample list containing system, user, and assistant messages, including an assistant message after the current user message. It calls retain_tail_from_last_n_user_messages with a request to keep two user messages. It then compares the changed list with the expected shorter list.
 
-**Call relations**: The test harness invokes this test, and it directly exercises `retain_tail_from_last_n_user_messages`. Its expected vector captures the function’s key boundary choice: stop at the latest user message rather than including following assistant items.
+**Call relations**: This test calls tests::message to build the sample data, then calls retain_tail_from_last_n_user_messages to perform the real work. Finally, it uses an assertion to confirm the helper changed the list exactly as intended.
 
 *Call graph*: calls 1 internal fn (retain_tail_from_last_n_user_messages); 2 external calls (assert_eq!, vec!).
 
@@ -1609,11 +1623,11 @@ fn retains_tail_through_latest_user_message()
 fn truncates_assistant_output_text_across_items()
 ```
 
-**Purpose**: Checks that assistant output truncation spends a shared budget across messages, truncates the first oversized assistant text, and removes later assistant output once no budget remains. It also confirms user messages survive untouched.
+**Purpose**: Tests that assistant output text shares one total token budget across multiple messages. It checks that overlong text is shortened and later assistant text is removed once the budget has been spent.
 
-**Data flow**: Creates a long assistant string, builds a history containing user and assistant messages, calls `truncate_assistant_output_text_to_token_budget` with a budget of `2`, and asserts that the first assistant message now contains `truncate_text(..., Tokens(2))` while the second assistant message has been removed entirely.
+**Data flow**: It creates a long assistant message, another assistant message that should fall after the budget, and user messages around them. It calls truncate_assistant_output_text_to_token_budget with a very small budget. It then compares the result with a list where the first assistant text is shortened using the same truncation rule, the later assistant message is gone, and user messages remain.
 
-**Call relations**: This test is run by the test harness and directly validates `truncate_assistant_output_text_to_token_budget`. It relies on the same `truncate_text` helper as production code to compute the expected truncated string.
+**Call relations**: This test uses tests::message to create the conversation, then calls truncate_assistant_output_text_to_token_budget to apply the budget. It also calls truncate_text directly to build the expected shortened text, making sure the test expects the same truncation style as the production helper.
 
 *Call graph*: calls 1 internal fn (truncate_assistant_output_text_to_token_budget); 2 external calls (assert_eq!, vec!).
 
@@ -1623,13 +1637,15 @@ This file provides the stage's standalone templating engine for parsing and rend
 
 ### `utils/template/src/lib.rs`
 
-`domain_logic` · `rendering`
+`util` · `cross-cutting text and prompt rendering`
 
-This module provides a deliberately small templating system with strict validation. Parsing produces a `Template` containing two synchronized representations: `segments`, a `Vec<Segment>` of `Literal(String)` and `Placeholder(String)` pieces in source order, and `placeholders`, a `BTreeSet<String>` of unique placeholder names for validation and deterministic iteration. The parser supports `{{ name }}` interpolation plus `{{{{` and `}}}}` escapes for literal `{{` and `}}`.
+This file is a lightweight template engine, meant for prompts and other text assets where the project wants predictable replacement and clear errors. Think of it like a mail-merge tool: a template is a letter with blanks, and rendering fills each blank with a value.
 
-`Template::parse` scans the source string by byte cursor. It flushes preceding literal text with `push_literal` whenever it encounters an escape or placeholder start. `{{{{` and `}}}}` become literal delimiter segments; `{{` triggers `parse_placeholder`, which trims surrounding whitespace inside the placeholder and rejects empty placeholders, nested `{{`, unmatched `}}`, and unterminated placeholders with byte-accurate error positions. A bare `}}` outside a placeholder is also rejected immediately.
+The syntax is deliberately tiny. A placeholder is written as `{{ name }}`. If the text needs to contain the characters `{{` or `}}` literally, it uses `{{{{` or `}}}}`. The parser reads the source text from left to right and breaks it into two kinds of pieces: literal text and placeholders. It also records the set of placeholder names, sorted and without duplicates.
 
-Rendering is intentionally strict in both directions. `build_variable_map` first consumes the provided variables into a `BTreeMap<String, String>`, rejecting duplicate names. `Template::render` then checks that every placeholder has a value and that no extra variable names were supplied. Only after both validations pass does it iterate `segments`, copying literals directly and substituting placeholder values from the map. The free `render` function is a convenience wrapper that parses and renders in one call, wrapping parse and render failures into the umbrella `TemplateError`. The tests cover reuse of parsed templates, sorted unique placeholder enumeration, multiline and adjacent placeholders, delimiter escaping, and every parse/render error variant.
+The strictness is important. Rendering fails if a needed value is missing, if the caller supplies an unused value, or if the same value name is supplied twice. This prevents quiet mistakes, such as a misspelled variable silently leaving a prompt wrong. Parsing also rejects empty placeholders, nested placeholders, stray closing braces, and unfinished placeholders.
+
+The public `Template` type is for parsing once and rendering many times. The public `render` function is a convenience for one-off use: parse a template, render it, and return one combined error type if anything goes wrong.
 
 #### Function details
 
@@ -1639,11 +1655,11 @@ Rendering is intentionally strict in both directions. `build_variable_map` first
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats parse errors into precise human-readable messages that include the byte offset of the offending delimiter or placeholder. Each variant explains the exact structural problem in the template source.
+**Purpose**: Turns a template parsing problem into a clear human-readable message. This is what users or logs see when the template text itself is malformed.
 
-**Data flow**: It reads the `TemplateParseError` variant and associated `start` field from `self`, writes the corresponding message into the formatter `f`, and returns `fmt::Result`.
+**Data flow**: It receives a specific parse error, such as an empty placeholder or an unmatched closing delimiter, plus a formatter to write into. It writes a sentence that includes the byte position where the problem was found. Nothing else is changed.
 
-**Call relations**: This formatter is used whenever parse errors are displayed directly or through `TemplateError`. It is purely diagnostic and does not participate in parsing logic.
+**Call relations**: Rust’s error-display machinery calls this when a `TemplateParseError` needs to be printed. It uses formatting output to describe the exact parse problem in plain text.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1654,11 +1670,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats rendering errors for duplicate, extra, or missing variable values. The messages name the specific placeholder or variable involved.
+**Purpose**: Turns a rendering problem into a clear human-readable message. This explains mistakes in the values supplied for a valid template.
 
-**Data flow**: It reads the `TemplateRenderError` variant and its `name` field, writes the appropriate message into `f`, and returns `fmt::Result`.
+**Data flow**: It receives a render error, such as a duplicate, extra, or missing value, and writes a message into the formatter. The output names the value that caused the problem.
 
-**Call relations**: This is used when render-time validation fails, either directly or wrapped inside `TemplateError`.
+**Call relations**: Rust’s error-display machinery calls this when a `TemplateRenderError` is shown to a caller or written to logs. It relies on formatting output to produce the message.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1669,11 +1685,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Delegates formatting of the umbrella template error to the underlying parse or render error. It preserves the more specific message text from the wrapped error.
+**Purpose**: Prints the combined template error type by delegating to the more specific error inside it. This keeps parse and render errors wrapped together without losing their helpful wording.
 
-**Data flow**: It matches on `self` and calls `fmt` on the contained `TemplateParseError` or `TemplateRenderError`, returning that `fmt::Result`.
+**Data flow**: It receives either a parse error wrapper or a render error wrapper. It forwards the formatter to the contained error, so the final text is the same message the specific error would have produced.
 
-**Call relations**: This sits above the specific error types and is used by the convenience `render` API, which can fail in either phase.
+**Call relations**: This is used when the convenience `render` function returns `TemplateError` and someone prints it. It hands the display work to `TemplateParseError::fmt` or `TemplateRenderError::fmt` depending on what went wrong.
 
 
 ##### `TemplateError::source`  (lines 89–94)
@@ -1682,11 +1698,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn source(&self) -> Option<&(dyn Error + 'static)>
 ```
 
-**Purpose**: Exposes the wrapped parse or render error as the causal source for standard error chaining. It lets callers inspect the underlying failure category through the `Error` trait.
+**Purpose**: Exposes the underlying cause of a combined template error. This lets error-reporting tools show the original parse or render error beneath the wrapper.
 
-**Data flow**: It matches on `self` and returns `Some(err)` as `&(dyn Error + 'static)` for either wrapped variant.
+**Data flow**: It receives a `TemplateError`. If the wrapper contains a parse error, it returns that parse error as the source; if it contains a render error, it returns that render error instead.
 
-**Call relations**: This supports generic error-reporting infrastructure when `TemplateError` is propagated from the top-level `render` helper.
+**Call relations**: Rust’s standard error system calls this when building an error chain. It connects the public combined error back to the specific inner error.
 
 
 ##### `TemplateError::from`  (lines 104–106)
@@ -1695,11 +1711,11 @@ fn source(&self) -> Option<&(dyn Error + 'static)>
 fn from(value: TemplateRenderError) -> Self
 ```
 
-**Purpose**: Converts a specific parse or render error into the umbrella `TemplateError` enum. It is the glue that allows `?` and `map_err(Into::into)` to work across phases.
+**Purpose**: Converts specific parse or render errors into the combined `TemplateError` type. This makes it easier for callers to return one error type from operations that can fail in either phase.
 
-**Data flow**: It takes either a `TemplateParseError` or `TemplateRenderError` value and wraps it in `TemplateError::Parse` or `TemplateError::Render`, returning the new enum value.
+**Data flow**: It receives either a parsing error or a rendering error. It wraps that value as `TemplateError::Parse` or `TemplateError::Render` and returns the wrapper.
 
-**Call relations**: These conversions are used by the free `render` function and any other code that wants to collapse phase-specific errors into one return type.
+**Call relations**: The convenience `render` path uses this style of conversion after parsing or rendering fails. It creates the combined error variants that `TemplateError::fmt` and `TemplateError::source` later inspect.
 
 *Call graph*: 2 external calls (Parse, Render).
 
@@ -1710,11 +1726,11 @@ fn from(value: TemplateRenderError) -> Self
 fn parse(source: &str) -> Result<Self, TemplateParseError>
 ```
 
-**Purpose**: Parses template source into reusable literal and placeholder segments while collecting the unique placeholder names. It enforces the templating syntax strictly and reports byte-accurate parse errors.
+**Purpose**: Reads raw template text and turns it into a reusable `Template`. It also checks that the placeholder syntax is valid before anyone tries to render it.
 
-**Data flow**: It takes `source: &str`, initializes empty `BTreeSet<String>` and `Vec<Segment>`, then scans with `cursor` and `literal_start`. On `{{{{` or `}}}}` it flushes preceding literal text via `push_literal`, inserts literal delimiter text, advances the cursor, and resets `literal_start`. On `{{` it flushes preceding literal text, parses the placeholder with `parse_placeholder`, inserts the placeholder name into the set, pushes `Segment::Placeholder`, and advances. On bare `}}` it returns `UnmatchedClosingDelimiter`. Otherwise it advances by one UTF-8 character. At the end it flushes the trailing literal and returns `Template { placeholders, segments }`.
+**Data flow**: It takes a source string and scans through it from left to right. Literal text is saved as literal segments, placeholders are parsed and saved by name, and escaped delimiters become ordinary text. If the syntax is invalid, it returns a parse error; otherwise it returns a `Template` containing its ordered placeholder set and segment list.
 
-**Call relations**: This is the main parse entry used by the free `render` helper, tests, and other code that wants reusable compiled templates. It delegates literal coalescing to `push_literal` and placeholder-body parsing/validation to `parse_placeholder`.
+**Call relations**: This is the main entry into the reusable template flow. It calls `push_literal` to store ordinary text cleanly and `parse_placeholder` when it sees `{{`. It is used by the one-shot `render` function, by embedded-template parsing code elsewhere, and by tests that check both valid and invalid templates.
 
 *Call graph*: calls 2 internal fn (parse_placeholder, push_literal); called by 13 (parse_embedded_template, parse_embedded_template, parse_embedded_template, render, parse_errors_when_closing_delimiter_is_unmatched, parse_errors_when_placeholder_is_empty, parse_errors_when_placeholder_is_nested, parse_errors_when_placeholder_is_unterminated, parsed_templates_can_be_reused, placeholders_are_sorted_and_unique (+3 more)); 3 external calls (new, new, Placeholder).
 
@@ -1725,11 +1741,11 @@ fn parse(source: &str) -> Result<Self, TemplateParseError>
 fn placeholders(&self) -> impl ExactSizeIterator<Item = &str>
 ```
 
-**Purpose**: Returns an iterator over the template’s unique placeholder names as `&str`. Because the names are stored in a `BTreeSet`, iteration order is sorted.
+**Purpose**: Returns the names of all placeholders used by a parsed template. The names are unique and sorted, which makes them easy to inspect or compare.
 
-**Data flow**: It borrows `self.placeholders`, iterates over the set, maps each `String` to `&str` with `String::as_str`, and returns the resulting exact-size iterator.
+**Data flow**: It reads the template’s stored placeholder set. It turns the stored strings into borrowed string slices and returns an iterator over them without changing the template.
 
-**Call relations**: This accessor is used by callers and tests that need to inspect the template schema without rendering. It reads the parse result but does not mutate template state.
+**Call relations**: Callers use this after `Template::parse` when they need to know what values a template expects. The test for sorted and unique placeholders checks this behavior directly.
 
 *Call graph*: 1 external calls (iter).
 
@@ -1740,11 +1756,11 @@ fn placeholders(&self) -> impl ExactSizeIterator<Item = &str>
 fn render(&self, variables: I) -> Result<String, TemplateRenderError>
 ```
 
-**Purpose**: Renders a parsed template with a supplied variable set, rejecting duplicate inputs, missing placeholders, and unused extra variables before producing output. It is intentionally strict so template/data mismatches fail loudly.
+**Purpose**: Fills a parsed template with actual values. It is strict: every placeholder must have exactly one value, and no unused values are allowed.
 
-**Data flow**: It takes an iterable of `(K, V)` pairs, converts it into a `BTreeMap<String, String>` via `build_variable_map`, checks every placeholder in `self.placeholders` exists in the map, checks every provided variable name is actually used by the template, then iterates `self.segments`. Literal segments are appended directly to a `String`; placeholder segments look up the corresponding value in the map and append it. It returns `Ok(rendered)` or a `TemplateRenderError`.
+**Data flow**: It receives a collection of name-value pairs. First it builds a map and rejects duplicate names. Then it checks for missing template placeholders and extra supplied names. Finally it walks the stored template segments, copying literal text and replacing placeholders with their values, and returns the finished string.
 
-**Call relations**: This is the main rendering engine used by higher-level prompt/template code and by the free `render` wrapper. It delegates duplicate detection and string ownership normalization to `build_variable_map`, then performs its own strict missing/extra validation before substitution.
+**Call relations**: This is called after a template has already been parsed. Higher-level prompt code such as `render_memory_extensions_block` and `render_review_prompt` call it when they need to produce final text. It calls `build_variable_map` before assembling the output.
 
 *Call graph*: calls 1 internal fn (build_variable_map); called by 2 (render_memory_extensions_block, render_review_prompt); 5 external calls (contains, contains_key, get, keys, new).
 
@@ -1755,11 +1771,11 @@ fn render(&self, variables: I) -> Result<String, TemplateRenderError>
 fn render(template: &str, variables: I) -> Result<String, TemplateError>
 ```
 
-**Purpose**: Convenience function that parses and renders a template in one call, returning a unified error type. It is suitable for one-off rendering when template reuse is unnecessary.
+**Purpose**: Provides a simple one-call way to render a template string. It is useful when the caller does not need to keep a parsed template for reuse.
 
-**Data flow**: It takes a template source string and variables iterable, calls `Template::parse(template)?`, then calls `.render(variables)` on the parsed template and maps any render error into `TemplateError` before returning the final `Result<String, TemplateError>`.
+**Data flow**: It takes raw template text and a set of variables. It parses the text into a `Template`, then renders that template with the variables. A parse failure or render failure comes back as one combined `TemplateError` type.
 
-**Call relations**: This top-level helper orchestrates the full parse-then-render flow. It is used by tests and by callers that do not need to keep a parsed `Template` around.
+**Call relations**: This function sits on top of `Template::parse` and the parsed template’s render operation. The tests use it to confirm ordinary replacement, escaped delimiters, multiline templates, and error wrapping.
 
 *Call graph*: calls 1 internal fn (parse); called by 5 (render_function_wraps_parse_errors, render_function_wraps_render_errors, render_replaces_placeholders_with_and_without_whitespace, render_supports_literal_delimiter_escapes, render_supports_multiline_templates_and_adjacent_placeholders).
 
@@ -1770,11 +1786,11 @@ fn render(template: &str, variables: I) -> Result<String, TemplateError>
 fn push_literal(segments: &mut Vec<Segment>, literal: &str)
 ```
 
-**Purpose**: Appends literal text to the segment list while skipping empty literals and merging adjacent literal segments. It keeps the parsed representation compact.
+**Purpose**: Adds ordinary text to the template’s internal segment list. It avoids creating empty pieces and joins neighboring literal pieces together.
 
-**Data flow**: It takes a mutable `Vec<Segment>` and a `literal: &str`. If the literal is empty it returns immediately; otherwise it either appends to the last `Segment::Literal` in place or pushes a new `Segment::Literal(literal.to_string())`.
+**Data flow**: It receives the current segment list and a slice of literal text. If the text is empty, it does nothing. If the last segment is already literal text, it appends to that segment; otherwise it creates a new literal segment.
 
-**Call relations**: This helper is called repeatedly from `Template::parse` whenever the scanner crosses into or out of placeholders or escaped delimiters. It centralizes literal coalescing so the parser does not emit fragmented adjacent literals.
+**Call relations**: `Template::parse` calls this whenever it has found ordinary text or an escaped delimiter. It keeps the parsed template tidy so rendering can later walk fewer, cleaner pieces.
 
 *Call graph*: called by 1 (parse); 1 external calls (Literal).
 
@@ -1785,11 +1801,11 @@ fn push_literal(segments: &mut Vec<Segment>, literal: &str)
 fn parse_placeholder(source: &str, start: usize) -> Result<(String, usize), TemplateParseError>
 ```
 
-**Purpose**: Parses the contents of one `{{ ... }}` placeholder starting at a known opening delimiter. It trims surrounding whitespace and rejects empty, nested, or unterminated placeholders.
+**Purpose**: Parses one placeholder that starts with `{{`. It extracts the placeholder name and finds where parsing should continue afterward.
 
-**Data flow**: It takes the full `source` and the byte index `start` of the opening `{{`, sets `placeholder_start` after the delimiter, then scans forward by UTF-8 characters. Encountering another `{{` before `}}` returns `NestedPlaceholder`; encountering `}}` trims the substring between delimiters and returns `EmptyPlaceholder` if blank or otherwise returns `(placeholder.to_string(), next_cursor)`; reaching the end without `}}` returns `UnterminatedPlaceholder`.
+**Data flow**: It receives the full template source and the byte position where a placeholder begins. It scans until it finds the matching `}}`, trims whitespace around the name, and returns the name plus the next cursor position. If it finds a nested `{{`, an empty name, or no closing `}}`, it returns the appropriate parse error.
 
-**Call relations**: This helper is called only from `Template::parse` when the scanner sees `{{`. It isolates placeholder-body validation and cursor advancement from the outer parse loop.
+**Call relations**: `Template::parse` calls this only after it has recognized the start of a placeholder. The result becomes a placeholder segment and is also recorded in the template’s placeholder set.
 
 *Call graph*: called by 1 (parse).
 
@@ -1802,11 +1818,11 @@ fn build_variable_map(
 ) -> Result<BTreeMap<String, String>, TemplateRenderError>
 ```
 
-**Purpose**: Consumes the caller-provided variable pairs into an owned map while rejecting duplicate names. It normalizes all keys and values to owned `String`s for rendering.
+**Purpose**: Turns supplied render values into a lookup table keyed by name. It also catches duplicate value names before rendering starts.
 
-**Data flow**: It takes an iterable of `(K, V)` where both sides implement `AsRef<str>`, creates a `BTreeMap<String, String>`, inserts each pair after converting both name and value to owned strings, and returns `DuplicateValue` if an insertion replaces an existing entry; otherwise it returns the completed map.
+**Data flow**: It receives any iterable collection of name-value pairs. It copies each name and value into a sorted map. If inserting a name would replace an existing one, it returns a duplicate-value error; otherwise it returns the completed map.
 
-**Call relations**: This helper is called by `Template::render` before any placeholder validation or substitution. It separates duplicate detection and ownership conversion from the rest of the rendering logic.
+**Call relations**: `Template::render` calls this as its first step. The map it returns is then used to check for missing or extra values and to look up replacements while building the final string.
 
 *Call graph*: called by 1 (render); 1 external calls (new).
 
@@ -1817,11 +1833,11 @@ fn build_variable_map(
 fn render_replaces_placeholders_with_and_without_whitespace()
 ```
 
-**Purpose**: Verifies that placeholders render correctly whether or not whitespace appears inside the delimiters, and that repeated placeholders reuse the same value. It demonstrates the basic happy path of the one-shot API.
+**Purpose**: Checks that placeholders are replaced correctly whether or not there is whitespace inside the braces. It also verifies that repeated placeholders reuse the same supplied value.
 
-**Data flow**: The test calls the free `render` function with a template containing `{{ name }}` and `{{place}}`, unwraps the result, and asserts the final rendered string matches the expected interpolation.
+**Data flow**: It gives the one-shot `render` function a greeting template and values for `name` and `place`. It expects the returned string to contain the substituted values in every matching location.
 
-**Call relations**: It exercises the full parse-and-render pipeline through the top-level `render` helper.
+**Call relations**: The test runner calls this during the test suite. It exercises the public `render` helper and compares the result with the expected text.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (assert_eq!).
 
@@ -1832,11 +1848,11 @@ fn render_replaces_placeholders_with_and_without_whitespace()
 fn parsed_templates_can_be_reused()
 ```
 
-**Purpose**: Checks that a parsed `Template` can be rendered multiple times with different variable sets. It validates the separation between parse-time structure and render-time data.
+**Purpose**: Checks that a parsed `Template` can be rendered more than once with different values. This matters for callers that want to parse once and avoid repeating that work.
 
-**Data flow**: The test parses `"{{greeting}}, {{ name }}!"` once, then calls `template.render(...)` twice with different values and asserts both rendered outputs.
+**Data flow**: It parses a greeting template once. Then it renders that same parsed template with two different sets of values and checks that each output matches the corresponding values.
 
-**Call relations**: It exercises `Template::parse` followed by repeated `Template::render` calls on the same compiled template.
+**Call relations**: The test runner calls this as part of the suite. It uses `Template::parse` first, then the template’s render method, showing the reusable-template path.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1847,11 +1863,11 @@ fn parsed_templates_can_be_reused()
 fn placeholders_are_sorted_and_unique()
 ```
 
-**Purpose**: Verifies that placeholder enumeration removes duplicates and yields names in sorted order. It documents the `BTreeSet`-backed behavior of `Template::placeholders`.
+**Purpose**: Checks that a template reports each placeholder name once and in sorted order. This makes placeholder inspection predictable.
 
-**Data flow**: The test parses a template containing placeholders `b`, `a`, and `b` again, collects `template.placeholders()` into a `Vec<_>`, and asserts it equals `["a", "b"]`.
+**Data flow**: It parses a template containing `b`, `a`, and `b` again. It collects the placeholder iterator into a list and compares it to `a`, then `b`.
 
-**Call relations**: It exercises `Template::parse` and `Template::placeholders`, specifically the unique/sorted placeholder metadata path rather than rendering.
+**Call relations**: The test runner calls this test. It goes through `Template::parse` and then uses `Template::placeholders` to verify the stored placeholder set behavior.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1862,11 +1878,11 @@ fn placeholders_are_sorted_and_unique()
 fn render_supports_multiline_templates_and_adjacent_placeholders()
 ```
 
-**Purpose**: Checks that rendering works across newlines and with placeholders placed directly adjacent to each other. It validates that no separator text is implicitly inserted.
+**Purpose**: Checks that rendering works across line breaks and when two placeholders are directly next to each other. This protects common prompt-formatting cases.
 
-**Data flow**: The test calls the free `render` helper on a two-line template containing `{{first}}{{second}}` adjacency and asserts the output is `"Line 1: AB\nLine 2: C"`.
+**Data flow**: It passes a two-line template with adjacent placeholders to `render`, along with three values. It expects a string where the first two values touch each other and the line break is preserved.
 
-**Call relations**: It exercises the normal parse/render flow with multiline literals and back-to-back placeholder segments.
+**Call relations**: The test runner calls this test. It exercises the public `render` helper and confirms that parsing and rendering do not depend on spaces or single-line input.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (assert_eq!).
 
@@ -1877,11 +1893,11 @@ fn render_supports_multiline_templates_and_adjacent_placeholders()
 fn render_supports_literal_delimiter_escapes()
 ```
 
-**Purpose**: Verifies that `{{{{` and `}}}}` are parsed as literal `{{` and `}}` rather than placeholder delimiters. It documents the escape syntax supported by the parser.
+**Purpose**: Checks that users can include literal `{{` and `}}` text in a template. Without this, delimiter characters could only mean placeholders.
 
-**Data flow**: The test renders a template containing escaped delimiters plus one real placeholder and asserts the output contains literal braces and the substituted value in the expected positions.
+**Data flow**: It sends a template containing `{{{{` and `}}}}` escapes plus a real placeholder to `render`. It expects the escapes to become literal braces and the placeholder to be replaced.
 
-**Call relations**: It exercises the escape-handling branches in `Template::parse` through the top-level `render` helper.
+**Call relations**: The test runner calls this test. It verifies the escape-handling path in `Template::parse` through the public `render` function.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (assert_eq!).
 
@@ -1892,11 +1908,11 @@ fn render_supports_literal_delimiter_escapes()
 fn parse_errors_when_placeholder_is_empty()
 ```
 
-**Purpose**: Checks that a placeholder containing only whitespace is rejected as empty. It validates one parse error variant and its byte offset.
+**Purpose**: Checks that an empty placeholder is rejected. This prevents templates from containing blanks that cannot be matched to a meaningful value name.
 
-**Data flow**: The test calls `Template::parse("Hello, {{   }}.")`, unwraps the error, and asserts it equals `TemplateParseError::EmptyPlaceholder { start: 7 }`.
+**Data flow**: It tries to parse text containing `{{   }}`. It expects parsing to fail with an `EmptyPlaceholder` error at the correct starting position.
 
-**Call relations**: It exercises the empty-placeholder branch in `parse_placeholder` via `Template::parse`.
+**Call relations**: The test runner calls this test. It directly exercises `Template::parse`, which calls `parse_placeholder` to detect the empty name.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1907,11 +1923,11 @@ fn parse_errors_when_placeholder_is_empty()
 fn parse_errors_when_placeholder_is_unterminated()
 ```
 
-**Purpose**: Checks that a placeholder missing its closing `}}` is rejected with the correct error and start offset. It validates EOF handling during placeholder parsing.
+**Purpose**: Checks that a placeholder without a closing `}}` is rejected. This catches accidental unfinished template syntax.
 
-**Data flow**: The test parses `"Hello, {{ name."`, unwraps the error, and asserts it equals `TemplateParseError::UnterminatedPlaceholder { start: 7 }`.
+**Data flow**: It tries to parse text where `{{ name` never closes. It expects an `UnterminatedPlaceholder` error at the placeholder’s start.
 
-**Call relations**: It exercises the unterminated-placeholder path in `parse_placeholder` through `Template::parse`.
+**Call relations**: The test runner calls this test. It verifies the error path from `Template::parse` through `parse_placeholder`.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1922,11 +1938,11 @@ fn parse_errors_when_placeholder_is_unterminated()
 fn parse_errors_when_placeholder_is_nested()
 ```
 
-**Purpose**: Checks that a placeholder body containing another `{{` is rejected as nested syntax. It enforces the engine’s intentionally simple non-nesting grammar.
+**Purpose**: Checks that placeholders cannot contain another `{{` inside them. This keeps the template language simple and avoids ambiguous parsing.
 
-**Data flow**: The test parses `"Hello, {{ outer {{ inner }} }}."`, unwraps the error, and asserts it equals `TemplateParseError::NestedPlaceholder { start: 7 }`.
+**Data flow**: It parses text with `{{ outer {{ inner }} }}`. It expects a `NestedPlaceholder` error pointing to the outer placeholder start.
 
-**Call relations**: It exercises the nested-placeholder detection branch in `parse_placeholder`.
+**Call relations**: The test runner calls this test. It confirms that `parse_placeholder`, reached from `Template::parse`, rejects nested opening delimiters.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1937,11 +1953,11 @@ fn parse_errors_when_placeholder_is_nested()
 fn parse_errors_when_closing_delimiter_is_unmatched()
 ```
 
-**Purpose**: Checks that a bare `}}` outside any placeholder is rejected immediately. It validates the parser’s unmatched-closing-delimiter error path.
+**Purpose**: Checks that a stray closing `}}` is rejected. This helps catch typos where a template has closing braces without an opening placeholder.
 
-**Data flow**: The test parses `"Hello, }} world."`, unwraps the error, and asserts it equals `TemplateParseError::UnmatchedClosingDelimiter { start: 7 }`.
+**Data flow**: It tries to parse text containing `}}` outside any placeholder. It expects an `UnmatchedClosingDelimiter` error at that position.
 
-**Call relations**: It exercises the explicit unmatched-`}}` branch in `Template::parse`.
+**Call relations**: The test runner calls this test. It exercises the direct unmatched-closing check inside `Template::parse`.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1952,11 +1968,11 @@ fn parse_errors_when_closing_delimiter_is_unmatched()
 fn render_errors_when_placeholder_is_missing()
 ```
 
-**Purpose**: Verifies that rendering fails when a required placeholder has no supplied value. It documents strict missing-variable validation.
+**Purpose**: Checks that rendering fails when a template needs a value that was not supplied. This prevents incomplete output from being produced silently.
 
-**Data flow**: The test parses `"Hello, {{ name }}."`, calls `template.render` with an empty vector, and asserts the result is `Err(TemplateRenderError::MissingValue { name: "name".to_string() })`.
+**Data flow**: It parses a template needing `name`, then renders it with no values. It expects a `MissingValue` error naming `name`.
 
-**Call relations**: It exercises the missing-placeholder validation loop in `Template::render` after successful parsing.
+**Call relations**: The test runner calls this test. It uses `Template::parse` and then the template’s render method to verify strict missing-value checking.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1967,11 +1983,11 @@ fn render_errors_when_placeholder_is_missing()
 fn render_errors_when_extra_value_is_provided()
 ```
 
-**Purpose**: Verifies that rendering fails when the caller supplies a variable not used by the template. It documents strict rejection of extra inputs.
+**Purpose**: Checks that rendering fails when the caller supplies a value the template does not use. This catches misspelled or stale variable names.
 
-**Data flow**: The test parses `"Hello, {{ name }}."`, renders with `name` plus an unused `unused` variable, and asserts the result is `Err(TemplateRenderError::ExtraValue { name: "unused".to_string() })`.
+**Data flow**: It parses a template needing only `name`, then renders with both `name` and `unused`. It expects an `ExtraValue` error for `unused`.
 
-**Call relations**: It exercises the extra-variable validation loop in `Template::render`.
+**Call relations**: The test runner calls this test. It exercises the extra-value validation inside the parsed template’s render method.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1982,11 +1998,11 @@ fn render_errors_when_extra_value_is_provided()
 fn render_errors_when_duplicate_value_is_provided()
 ```
 
-**Purpose**: Checks that duplicate variable names in the input iterable are rejected before rendering begins. It validates duplicate detection in variable-map construction.
+**Purpose**: Checks that rendering fails when the same variable name is supplied twice. This avoids unclear situations where one value might silently override another.
 
-**Data flow**: The test parses `"Hello, {{ name }}."`, renders with two `name` entries, and asserts the result is `Err(TemplateRenderError::DuplicateValue { name: "name".to_string() })`.
+**Data flow**: It parses a template needing `name`, then renders with two different entries both named `name`. It expects a `DuplicateValue` error.
 
-**Call relations**: It exercises `build_variable_map` through `Template::render`, specifically the duplicate-insert error path.
+**Call relations**: The test runner calls this test. It verifies the duplicate detection performed by `build_variable_map`, reached through the template’s render method.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (assert_eq!).
 
@@ -1997,11 +2013,11 @@ fn render_errors_when_duplicate_value_is_provided()
 fn render_function_wraps_parse_errors()
 ```
 
-**Purpose**: Verifies that the one-shot `render` helper wraps parse failures in `TemplateError::Parse`. It documents the error-shaping behavior of the convenience API.
+**Purpose**: Checks that the one-shot `render` helper wraps parsing failures in `TemplateError::Parse`. This gives callers one error type without hiding what went wrong.
 
-**Data flow**: The test calls the free `render` function on an invalid template with otherwise irrelevant variables, unwraps the error, and asserts it equals `TemplateError::Parse(TemplateParseError::UnmatchedClosingDelimiter { start: 7 })`.
+**Data flow**: It calls `render` with a malformed template containing an unmatched closing delimiter. It expects the returned error to be the combined parse-error wrapper with the original parse details inside.
 
-**Call relations**: It exercises the parse phase of the top-level `render` helper and the `From<TemplateParseError> for TemplateError` conversion.
+**Call relations**: The test runner calls this test. It exercises the public `render` helper and confirms its parse-error conversion behavior.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (assert_eq!).
 
@@ -2012,10 +2028,10 @@ fn render_function_wraps_parse_errors()
 fn render_function_wraps_render_errors()
 ```
 
-**Purpose**: Verifies that the one-shot `render` helper wraps render-time validation failures in `TemplateError::Render`. It documents the second half of the convenience API’s error contract.
+**Purpose**: Checks that the one-shot `render` helper wraps rendering failures in `TemplateError::Render`. This confirms render-time problems are reported through the combined error type.
 
-**Data flow**: The test calls the free `render` function on a valid template with only an extra variable, unwraps the error, and asserts it equals `TemplateError::Render(TemplateRenderError::MissingValue { name: "name".to_string() })`.
+**Data flow**: It calls `render` with a valid template needing `name` but supplies only `extra`. It expects a combined render-error wrapper containing a missing-value error for `name`.
 
-**Call relations**: It exercises the successful parse plus failing render path through the top-level `render` helper and the `From<TemplateRenderError> for TemplateError` conversion.
+**Call relations**: The test runner calls this test. It exercises the public `render` helper and confirms its render-error conversion behavior.
 
 *Call graph*: calls 1 internal fn (render); 1 external calls (assert_eq!).

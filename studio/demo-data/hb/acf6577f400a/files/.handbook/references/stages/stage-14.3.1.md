@@ -1,10 +1,6 @@
 # MCP runtime, resources, and session integration  `stage-14.3.1`
 
-This stage is the cross-cutting MCP integration layer that sits between session startup and the main tool/resource execution path. It turns configured or plugin-declared MCP servers into live session connections, exposes their tools and resources to the model, and keeps auth, approvals, and refresh behavior coherent as the session evolves.
-
-At the boundary, ext/mcp and app-server/extensions register MCP-backed extensions for hosted Apps and executor plugins, while executor_plugin/provider loads plugin MCP declarations. codex-mcp is the subsystem facade; its server, mcp/mod, codex_apps, and tools modules materialize effective server configs, preserve routing/diagnostic metadata, apply Apps-specific cache and connector rules, and normalize tool identities for safe model exposure. connection_manager is the runtime hub: it owns active MCP clients, aggregates tools/resources, routes calls and auth elicitation, and supports refresh; resource_client gives session code a stable handle across manager swaps.
-
-Core integration then adapts MCP into the tool runtime. session/mcp refreshes managers and wires elicitation and approval flow, mcp_tool_exposure decides direct visibility, tools/handlers/mcp and mcp_tool_call execute MCP tools end-to-end, mcp_openai_file rewrites file arguments, the mcp_resource handlers implement list/read resource tools, auth_elicitation interprets connector auth failures, and mcp_skill_dependencies installs required MCP servers when skills demand them.
+This stage is the bridge between Codex and MCP, the Model Context Protocol, which lets outside programs offer tools, files, and other resources to the assistant. It is mostly behind-the-scenes support used during session startup and the main work loop. The app-server and ext/mcp files register MCP as an extension, discover MCP servers from plugins, and pass extension events to the right client. The codex-mcp library defines what an MCP server is, builds usable server configs, supports hosted Codex Apps, and keeps user app-tool caches separate. Its connection manager is the switchboard: it starts servers, checks readiness, collects tools and resources, and routes calls. Resource clients and handlers let the model list templates, list resources, and read one resource in a consistent way. Tool preparation code filters and renames tools, limits what the model sees, adapts file inputs, and uploads local files when a tool expects hosted files. Tool-call code checks permissions, asks for approval, records results, and reports back. Session and skill-dependency code connect MCP servers to each user session, refresh them when needed, and handle login prompts safely.
 
 ## Files in this stage
 
@@ -13,13 +9,15 @@ These files register MCP-backed extensions and load executor-plugin server decla
 
 ### `app-server/src/extensions.rs`
 
-`orchestration` · `startup wiring and runtime extension event forwarding`
+`orchestration` · `startup and extension event handling`
 
-This file is the integration layer between the app server and the extension ecosystem. `ThreadExtensionDependencies` bundles the concrete services extensions may need: auth, analytics, optional state DB, thread manager access, goal service, environment manager, executor skill provider, and thread-store access. `thread_extensions` consumes those dependencies and builds an `ExtensionRegistry<Config>` with a specific installation set: goals (only when a state DB is available, and gated by the `Goals` feature flag), guardian, memories, MCP plus executor plugins, web search, image generation, and skills with both executor and orchestrator providers. The resulting registry is wrapped in `Arc` for shared use.
+Extensions are optional pieces of capability, such as goals, guardian agents, memory, web search, image generation, MCP tools, and skills. This file is the app server's switchboard for those pieces. Without it, those extensions would not be registered with the server, and events coming from extensions would not reliably reach the user interface or the active thread stream.
 
-The file also defines `AppServerExtensionEventSink`, an `ExtensionEventSink` implementation that currently understands `EventMsg::ThreadGoalUpdated`. When such an event arrives, it first tries to route it through the thread’s listener command channel using `ThreadStateManager`, preserving FIFO ordering with other listener commands like goal-cleared events. If no listener is registered or the channel is closed, it falls back to spawning an async task that sends a `ServerNotification::ThreadGoalUpdated` through `OutgoingMessageSender`. Unsupported extension events are dropped with a debug log.
+The main setup function builds an extension registry. A registry is like a list of plug-ins the server knows how to use. It receives shared dependencies such as authentication, analytics, the thread manager, the environment manager, and skill providers. Some extensions are always installed. The goals extension is installed only when a state database is available, and it also checks the runtime feature flag before enabling goal behavior.
 
-Finally, `guardian_agent_spawner` closes over a weak `ThreadManager` and returns an `AgentSpawner` closure that upgrades the weak reference and calls `spawn_subagent`, failing with `CodexErr::UnsupportedOperation` if the manager has already been dropped.
+The file also defines an event sink. An event sink is a place where extensions send updates. The important supported event here is a thread goal update. If a live listener exists for that thread, the update is sent into that listener's command queue so ordering is preserved. If there is no listener, the update is sent as a normal server notification instead. Unsupported extension events are intentionally ignored, with a debug log.
+
+Finally, the file provides a small adapter that lets the guardian extension start subagents through the thread manager.
 
 #### Function details
 
@@ -32,11 +30,11 @@ fn thread_extensions(
 ) -> Arc<ExtensionRegistry<Config>>
 ```
 
-**Purpose**: Builds and returns the configured extension registry for app-server threads. It installs the supported extensions and supplies each one with the dependencies and feature/config adapters it needs.
+**Purpose**: Builds the app server's extension registry: the collection of plug-ins the server can use for goals, guardian agents, memory, MCP, web search, image generation, and skills. It gathers the shared services each extension needs and installs them in one place.
 
-**Data flow**: Consumes a guardian `AgentSpawner` and `ThreadExtensionDependencies`, destructures the dependency bundle, creates an `ExtensionRegistryBuilder::<Config>` with the provided event sink, conditionally installs the goal extension when `state_db` is present, installs guardian/memories/MCP/web-search/image-generation/skills extensions, constructs `SkillProviders` with executor and orchestrator providers, and returns `Arc::new(builder.build())`.
+**Data flow**: It receives a guardian agent spawner and a bundle of dependencies, including authentication, analytics, state storage, thread access, environment access, skill providers, and an event sink. It creates a registry builder, conditionally adds the goals extension if a state database is present, then adds the other extensions and their configuration hooks. It returns a shared, finished extension registry wrapped in an Arc, meaning many parts of the server can safely hold a reference to it.
 
-**Call relations**: Used during thread subsystem setup to assemble the extension stack once. It delegates actual extension registration to each extension crate’s `install...` function and supplies feature/config closures where required.
+**Call relations**: This is the setup hub for extensions. During server startup, higher-level server construction code calls it to assemble the registry. It hands the registry builder to each extension's install function, so each extension can add its own behavior. The event sink supplied here is what later lets extensions report updates back into the app server.
 
 *Call graph*: calls 2 internal fn (new, new); 11 external calls (new, with_event_sink, install_with_backend, install, install, install, install_executor_plugins, install, global, install_with_providers (+1 more)).
 
@@ -50,11 +48,11 @@ fn app_server_extension_event_sink(
 ) -> Arc<dyn ExtensionEventSink>
 ```
 
-**Purpose**: Constructs the app-server-specific implementation of `ExtensionEventSink`. It packages the outgoing notification sender and thread-state manager into a trait object suitable for the extension registry.
+**Purpose**: Creates the app server's event sink for extensions. Extensions use this object as their mailbox for reporting events back to the server.
 
-**Data flow**: Takes `Arc<OutgoingMessageSender>` and `ThreadStateManager`, constructs `AppServerExtensionEventSink { outgoing, thread_state_manager }`, wraps it in `Arc`, and returns it as `Arc<dyn ExtensionEventSink>`.
+**Data flow**: It receives an outgoing message sender and a thread state manager. It stores both inside an AppServerExtensionEventSink and returns it as a shared ExtensionEventSink object, hiding the concrete type behind the interface extensions expect.
 
-**Call relations**: Called during extension wiring and directly by the module test to obtain the sink implementation exercised there.
+**Call relations**: This is called when wiring the extension system together, and the test in this file calls it directly to verify behavior. The sink it creates is later used by extensions when they emit events, which are processed by AppServerExtensionEventSink::emit.
 
 *Call graph*: called by 1 (app_server_event_sink_uses_listener_fifo_for_goal_updates_and_clears); 1 external calls (new).
 
@@ -65,11 +63,11 @@ fn app_server_extension_event_sink(
 fn emit(&self, event: Event)
 ```
 
-**Purpose**: Handles extension events by routing supported goal-update events either through the thread listener command channel or, as a fallback, as an outgoing server notification. Unsupported events are dropped with debug logging.
+**Purpose**: Receives an event from an extension and decides how the app server should deliver it. Its main job is to preserve the right order for thread goal updates when a live thread listener is active.
 
-**Data flow**: Consumes `&self` and an `Event`. It matches on `event.msg`. For `EventMsg::ThreadGoalUpdated`, it extracts `thread_id`, `turn_id`, and converts the core goal into protocol `ThreadGoal`. It queries `thread_state_manager.current_listener_command_tx(thread_id)`; if present, it builds `ThreadListenerCommand::EmitThreadGoalUpdated` and tries to send it. On successful send it returns early. If the channel is absent or closed, it logs a warning when closed, clones `self.outgoing`, and spawns an async task that sends `ServerNotification::ThreadGoalUpdated(ThreadGoalUpdatedNotification { ... })`. For all other messages it emits a debug log and does nothing else.
+**Data flow**: It takes an extension event. If the event says a thread goal changed, it extracts the thread id, turn id, and goal data, then looks for the current listener command channel for that thread. If a listener exists and accepts the message, it sends a ThreadListenerCommand into that listener queue and stops. If no listener is available, or the listener channel is closed, it starts an asynchronous task that sends a ThreadGoalUpdated server notification through the outgoing message sender. If the event is not a supported kind, it logs that the event was dropped.
 
-**Call relations**: Invoked by extension code through the `ExtensionEventSink` trait. Its listener-channel fast path is designed to preserve ordering with other thread listener events; the spawned notification path is the fallback when no listener is active.
+**Call relations**: Extensions call this method when they have something to report. For goal updates, it first tries to hand the update to ThreadStateManager's current listener queue, because that keeps the update in order with other thread-stream messages. If that route is unavailable, it falls back to OutgoingMessageSender so the client still receives a notification.
 
 *Call graph*: calls 1 internal fn (current_listener_command_tx); 5 external calls (clone, ThreadGoalUpdated, spawn, debug!, warn!).
 
@@ -82,11 +80,11 @@ fn guardian_agent_spawner(
 ) -> impl AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr>
 ```
 
-**Purpose**: Creates the closure used by the guardian extension to spawn subagents from an existing thread. The closure safely handles the case where the `ThreadManager` has already been dropped.
+**Purpose**: Creates an adapter that lets the guardian extension start a subagent through the server's ThreadManager. A subagent is a new thread-like worker started from an existing thread.
 
-**Data flow**: Takes a `Weak<ThreadManager>` and returns a closure implementing `AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr>`. Each invocation clones the weak pointer, upgrades it inside an async block, returns `CodexErr::UnsupportedOperation("thread manager dropped")` if upgrade fails, otherwise awaits `thread_manager.spawn_subagent(forked_from_thread_id, options)` and returns that result.
+**Data flow**: It receives a weak reference to the ThreadManager, which means it does not keep the manager alive by itself. The returned spawner is later given a source thread id and start options. When used, it tries to upgrade the weak reference into a live ThreadManager. If the manager is gone, it returns an error. If it is still available, it asks the manager to spawn the subagent and returns the newly created thread result.
 
-**Call relations**: Passed into `thread_extensions`, which installs it into the guardian extension so guardian-triggered subagent creation can call back into the app server’s thread manager.
+**Call relations**: thread_extensions passes this spawner into the guardian extension during installation. Later, when the guardian extension needs to start an agent, it uses this adapter instead of knowing ThreadManager details directly. This keeps guardian code separated from the app server's thread implementation.
 
 
 ##### `tests::app_server_event_sink_uses_listener_fifo_for_goal_updates_and_clears`  (lines 185–229)
@@ -95,11 +93,11 @@ fn guardian_agent_spawner(
 async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_and_clears()
 ```
 
-**Purpose**: Verifies that goal-update extension events are delivered through the listener command channel in FIFO order relative to other listener commands, rather than being reordered through the outgoing notification path.
+**Purpose**: Checks that goal update events are delivered through the live listener queue, and that their order is preserved. This matters because the user interface may receive several thread-related messages in sequence, and goal changes should not jump ahead or fall behind incorrectly.
 
-**Data flow**: Creates an outgoing sender, a fresh `ThreadStateManager`, a thread ID, and an unbounded listener command channel; registers the sender with the manager; builds the sink; emits two synthetic goal-update events; manually sends `EmitThreadGoalCleared`; then receives three commands with a timeout, records observed turn IDs/clear marker, and asserts the exact order `turn-1`, `turn-2`, `cleared`.
+**Data flow**: The test creates a fake outgoing sender, a fresh thread state manager, a thread id, and a listener command channel. It registers the listener channel for that thread, builds the event sink, then emits two goal update events and manually sends a goal-cleared command into the same queue. It reads three commands back from the queue and confirms they arrive as turn-1, turn-2, then cleared.
 
-**Call relations**: Exercises `app_server_extension_event_sink` and `AppServerExtensionEventSink::emit`, specifically the listener-channel fast path and its ordering guarantees.
+**Call relations**: This test calls app_server_extension_event_sink to build the same kind of sink used by the real server. It then drives AppServerExtensionEventSink::emit with sample goal update events made by tests::thread_goal_updated_event. The test proves that emit prefers the listener command channel over the fallback outgoing notification path.
 
 *Call graph*: calls 5 internal fn (disabled, app_server_extension_event_sink, new, new, default); 9 external calls (new, from_secs, new, thread_goal_updated_event, assert_eq!, channel, unbounded_channel, panic!, timeout).
 
@@ -110,22 +108,24 @@ async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_and_clears()
 fn thread_goal_updated_event(thread_id: ThreadId, turn_id: &str) -> Event
 ```
 
-**Purpose**: Builds a synthetic core `Event` carrying a `ThreadGoalUpdatedEvent` for use in tests. It centralizes the verbose event construction needed by the sink test.
+**Purpose**: Builds a sample thread goal update event for the test. It keeps the test readable by hiding the detailed event fields in one helper.
 
-**Data flow**: Takes a `ThreadId` and `&str` turn ID, constructs `Event { id, msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent { ... }) }` with a populated `CoreThreadGoal`, and returns it.
+**Data flow**: It receives a thread id and a turn id string. It creates an Event whose message is ThreadGoalUpdated, filling in a sample active goal with objective text, token counts, timing, and timestamps. It returns that event to the caller.
 
-**Call relations**: Used only by the module test to generate realistic extension events for `AppServerExtensionEventSink::emit`.
+**Call relations**: The ordering test calls this helper twice to create two distinct goal update events. Those events are then passed to the event sink, exercising the same branch of AppServerExtensionEventSink::emit that real extension goal updates would use.
 
 *Call graph*: 1 external calls (ThreadGoalUpdated).
 
 
 ### `ext/mcp/src/lib.rs`
 
-`orchestration` · `startup / extension registry setup`
+`orchestration` · `startup and MCP server discovery`
 
-This crate entry file is the integration layer for MCP extension behavior. It defines `HostedPluginRuntimeExtension`, an `McpServerContributor<Config>` that controls the reserved hosted Apps MCP server named by `CODEX_APPS_MCP_SERVER_NAME`. Its `contribute()` method reads the runtime `Config`: when the Apps feature flag is disabled, it emits `McpServerContribution::Remove` for that reserved name so any configured server is stripped out; when enabled, it emits `McpServerContribution::Set` with a config produced by `hosted_plugin_runtime_mcp_server_config()` using `chatgpt_base_url` and the optional `apps_mcp_product_sku`. This makes the hosted runtime an overlay supplied by extensions rather than hard-coded manager logic.
+MCP means Model Context Protocol, a way for the app to talk to extra tool servers in a standard shape. This file is like a small switchboard: it registers pieces that can add or remove MCP servers depending on the current configuration.
 
-The public functions are registration hooks. `install()` adds the hosted-runtime contributor to an `ExtensionRegistryBuilder`. `install_executor_plugins()` adds the `SelectedExecutorPluginMcpContributor`, constructing it with an `Arc<EnvironmentManager>` so it can resolve selected executor plugins and discover their MCP declarations. `initialize_executor_plugin_thread_data()` seeds per-thread extension data by delegating to `executor_plugin::seed_thread_state()`. Together, these functions let the host opt into either or both MCP contribution mechanisms while keeping the actual contribution logic in dedicated modules.
+The first piece, `HostedPluginRuntimeExtension`, contributes the hosted plugin runtime server. It checks the app configuration to see whether the Apps feature is turned on. If Apps are off, it tells the system to remove the MCP server with the standard Codex Apps server name. If Apps are on, it builds a server configuration using the ChatGPT base URL and an optional product SKU, then tells the registry to set that server up.
+
+The public `install` function adds this contributor to the extension registry so the rest of the program can ask it for MCP server contributions later. The file also exposes two helper functions for executor plugins, which are plugins selected for a particular thread of work. One function registers their MCP discovery contributor, and the other seeds per-thread data so that discovery can know which executor plugins are active. Without this file, the app would not reliably add, update, or remove these MCP servers based on feature flags and selected plugins.
 
 #### Function details
 
@@ -135,11 +135,11 @@ The public functions are registration hooks. `install()` adds the hosted-runtime
 fn id(&self) -> &'static str
 ```
 
-**Purpose**: Returns the stable identifier for the hosted Apps MCP contributor.
+**Purpose**: This gives the hosted plugin runtime contributor a stable name. The name lets the extension system identify which contributor is speaking.
 
-**Data flow**: It returns the static string `"hosted_plugin_runtime"`.
+**Data flow**: Nothing is taken in beyond the contributor itself. It returns the fixed text identifier `hosted_plugin_runtime`, and it does not change any state.
 
-**Call relations**: The extension framework uses this identifier when tracking or debugging registered MCP contributors.
+**Call relations**: The extension registry can ask this contributor for its identity when organizing MCP server contributors. It is the simple name tag used before the more important contribution step happens.
 
 
 ##### `HostedPluginRuntimeExtension::contribute`  (lines 19–38)
@@ -151,11 +151,11 @@ fn contribute(
     ) -> ExtensionFuture<'a, Vec<McpServerContribution>>
 ```
 
-**Purpose**: Adds or removes the reserved hosted Apps MCP server based on feature flags and current configuration.
+**Purpose**: This decides what should happen to the hosted plugin runtime MCP server for the current configuration. It either removes the server when Apps are disabled, or provides the server settings when Apps are enabled.
 
-**Data flow**: It receives an `McpServerContributionContext<Config>`, boxes an async block, reads `context.config()`, and derives the reserved server name from `CODEX_APPS_MCP_SERVER_NAME`. If `config.features.enabled(Feature::Apps)` is false, it returns a one-element vector containing `McpServerContribution::Remove { name }`. Otherwise it returns a one-element vector containing `McpServerContribution::Set { name, config: Box::new(hosted_plugin_runtime_mcp_server_config(&config.chatgpt_base_url, config.apps_mcp_product_sku.as_deref())) }`.
+**Data flow**: It receives a contribution context and reads the app configuration from it. It builds the standard MCP server name, checks whether the Apps feature is enabled, and then returns a future that produces a list of contributions: either a removal instruction or a set-this-server-up instruction with a generated server configuration.
 
-**Call relations**: This is invoked by the MCP manager when assembling runtime contributions. It is registered by `install()`.
+**Call relations**: The extension system calls this when collecting MCP server definitions. Inside that moment, this function reads configuration, chooses the correct action, and hands back the contribution list that the registry will use to update the available MCP servers.
 
 *Call graph*: calls 1 internal fn (config); 2 external calls (pin, vec!).
 
@@ -166,11 +166,11 @@ fn contribute(
 fn install(builder: &mut ExtensionRegistryBuilder<Config>)
 ```
 
-**Purpose**: Registers the hosted Apps MCP contributor with an extension registry builder.
+**Purpose**: This registers the hosted plugin runtime MCP contributor with the extension registry. Someone uses it during setup so the contributor is available later when MCP servers are gathered.
 
-**Data flow**: It takes a mutable `ExtensionRegistryBuilder<Config>`, wraps `HostedPluginRuntimeExtension` in an `Arc`, and passes it to `builder.mcp_server_contributor(...)`.
+**Data flow**: It receives a mutable registry builder. It creates a shared pointer to `HostedPluginRuntimeExtension` and adds it to the builder, changing the builder so it now knows about this MCP server contributor.
 
-**Call relations**: Hosts call this during startup when they want the extension-managed hosted Apps MCP overlay enabled.
+**Call relations**: Startup code calls this while assembling the extension system. After this registration, the registry can later call `HostedPluginRuntimeExtension::id` and `HostedPluginRuntimeExtension::contribute` when it needs the MCP server list.
 
 *Call graph*: calls 1 internal fn (mcp_server_contributor); 1 external calls (new).
 
@@ -184,11 +184,11 @@ fn install_executor_plugins(
 )
 ```
 
-**Purpose**: Registers the contributor that discovers MCP servers from thread-selected executor plugins.
+**Purpose**: This registers MCP discovery for executor plugins selected for a thread of work. It connects the extension registry to an environment manager so plugin-provided MCP servers can be found when needed.
 
-**Data flow**: It takes a mutable `ExtensionRegistryBuilder<Config>` and an `Arc<EnvironmentManager>`, constructs `executor_plugin::SelectedExecutorPluginMcpContributor::new(environment_manager)`, wraps it in an `Arc`, and registers it with `builder.mcp_server_contributor(...)`.
+**Data flow**: It receives a mutable registry builder and a shared environment manager. It creates a `SelectedExecutorPluginMcpContributor` using that environment manager, wraps it in a shared pointer, and adds it to the builder, changing the builder so it can discover MCP servers from selected executor plugins.
 
-**Call relations**: This setup hook is used by tests and runtime code that want selected executor plugins to contribute MCP servers.
+**Call relations**: Setup code calls this alongside other extension installation steps. From then on, when the registry gathers MCP server contributions, it can call into the executor-plugin contributor created here; that contributor uses the environment manager to understand the runtime environment for the selected plugins.
 
 *Call graph*: calls 2 internal fn (mcp_server_contributor, new); 1 external calls (new).
 
@@ -201,24 +201,26 @@ fn initialize_executor_plugin_thread_data(
 )
 ```
 
-**Purpose**: Seeds the per-thread extension data required for selected-executor-plugin MCP snapshot caching.
+**Purpose**: This prepares the per-thread data used to discover MCP servers from selected executor plugins. In plain terms, it puts the right starting information into a thread-specific snapshot before discovery happens.
 
-**Data flow**: It takes a mutable `ExtensionDataInit` and forwards it to `executor_plugin::seed_thread_state(thread_init)`. It returns no value.
+**Data flow**: It receives an extension data initializer. It passes that initializer to `executor_plugin::seed_thread_state`, which fills in the thread-local starting state needed later; the function itself returns nothing.
 
-**Call relations**: Callers must invoke this during thread initialization before the executor-plugin contributor’s `contribute()` method runs.
+**Call relations**: Thread setup code calls this before executor-plugin MCP discovery depends on thread-specific information. It hands off the actual seeding work to `seed_thread_state`, so the contributor installed by `install_executor_plugins` can later read a prepared snapshot instead of starting from empty data.
 
 *Call graph*: calls 1 internal fn (seed_thread_state).
 
 
 ### `ext/mcp/src/executor_plugin/provider.rs`
 
-`io_transport` · `plugin MCP discovery`
+`domain_logic` · `plugin resolution / config load`
 
-This provider isolates the mechanics of reading `.mcp.json`-style declarations from executor plugins. `ExecutorPluginMcpProvider::load()` is a thin adapter from `ResolvedExecutorPlugin` to the lower-level loader: it extracts the plugin’s environment-root location and passes the plugin descriptor, root path, and executor file system into `load_from_file_system()`.
+Executor plugins can declare extra MCP servers. MCP, or Model Context Protocol, is a way for tools and services to expose capabilities to the main application. This file is the small bridge between a selected plugin and those MCP declarations.
 
-`load_from_file_system()` contains the real policy. It derives the plugin’s `environment_id` and selected-root ID, then chooses the config path from `manifest().paths.mcp_servers` when explicitly declared, or falls back to `<plugin_root>/.mcp.json` and marks that path as default. The file is always read through the executor’s `ExecutorFileSystem` via `PathUri`, never directly from the host file system. A missing default file is treated as “no MCP servers” and returns an empty vector; any other read failure becomes `ExecutorPluginMcpProviderError::ReadConfig` with plugin ID and path attached. Successful text is parsed by `parse_plugin_mcp_config()` with `PluginMcpServerPlacement::Environment { environment_id }`, and parse failures become `ParseConfig`.
+The provider first finds the plugin's MCP config file. If the plugin manifest names a specific file, it uses that. Otherwise it looks for a default file called `.mcp.json` in the plugin root. If that default file is missing, that is treated as normal: the plugin simply has no MCP servers.
 
-The parsed result may contain recoverable per-server errors; those are logged and ignored. Finally, only `McpServerTransportConfig::Stdio` servers are retained. `StreamableHttp` servers are explicitly warned about and dropped, because executor plugins are only allowed to contribute environment-bound stdio MCP servers. The returned vector preserves the parsed server names and adjusted configs.
+When a file is found, the provider reads it through the executor's file system, not directly from the host disk. That matters because executor plugins may live inside a controlled environment, and the executor knows how to read from that environment safely. The file contents are then parsed as plugin MCP configuration, with paths interpreted relative to the plugin root and tagged as belonging to the plugin's environment.
+
+Invalid individual server entries are not fatal. They are logged as warnings and skipped, like ignoring one bad line in a larger address book. However, failing to read the chosen config file or failing to parse the overall JSON produces a clear error that includes the plugin id and path. Finally, the file filters the parsed servers so only stdio transports remain; HTTP MCP servers are warned about and ignored.
 
 #### Function details
 
@@ -231,11 +233,11 @@ async fn load(
     ) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpProviderError>
 ```
 
-**Purpose**: Loads MCP server declarations for a resolved executor plugin by delegating to the file-system-based loader with the plugin’s environment root and executor file system.
+**Purpose**: Loads the MCP server declarations for one resolved executor plugin. It is the public-facing method for this provider inside the module, giving callers a list of usable server names and configurations.
 
-**Data flow**: It takes a `&ResolvedExecutorPlugin`, pattern-matches `plugin.plugin().location()` to obtain the environment `root`, then calls `load_from_file_system(plugin.plugin(), root, plugin.file_system()).await`. It returns either the loaded `(name, McpServerConfig)` pairs or an `ExecutorPluginMcpProviderError`.
+**Data flow**: It receives a resolved executor plugin. From that plugin it reads the plugin location, the plugin metadata, and the executor-owned file system. It then passes those pieces to the lower-level loader. The result is either a list of stdio MCP server configurations or an error explaining why the plugin's MCP config could not be read or parsed.
 
-**Call relations**: This method is called by `SelectedExecutorPluginMcpContributor::resolve_snapshot()` after a selected root has been resolved to a bound executor plugin.
+**Call relations**: This function is called during snapshot resolution, when the system is gathering the plugin-provided resources that should be active. It does not do the detailed file lookup itself; after getting the plugin root and file system, it hands the real work to `load_from_file_system`.
 
 *Call graph*: calls 3 internal fn (file_system, plugin, load_from_file_system); called by 1 (resolve_snapshot).
 
@@ -250,11 +252,11 @@ async fn load_from_file_system(
 ) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpP
 ```
 
-**Purpose**: Reads, parses, validates, and filters a plugin MCP config file using the executor’s file-system abstraction.
+**Purpose**: Reads, parses, and filters one plugin's MCP configuration file. It is where the file decides which MCP servers from a plugin are valid for executor use.
 
-**Data flow**: It accepts a `ResolvedPlugin`, its root path, and a `dyn ExecutorFileSystem`. It reads the plugin location to obtain `environment_id`, reads `selected_root_id()` for error reporting and policy binding, and chooses either the manifest-declared MCP config path or `plugin_root.join(DEFAULT_MCP_CONFIG_FILE)`. That absolute path is converted to `PathUri` and read with `read_file_text(..., None).await`. If the file is missing and it was the default path, the function returns `Ok(Vec::new())`; otherwise read failures become `ExecutorPluginMcpProviderError::ReadConfig`. The text is parsed with `parse_plugin_mcp_config(plugin_root.as_path(), &contents, PluginMcpServerPlacement::Environment { environment_id })`; parse failures become `ParseConfig`. It logs each recoverable parsed error, then consumes `parsed.servers`, keeping only entries whose `transport` is `McpServerTransportConfig::Stdio` and warning away `StreamableHttp` entries. The collected stdio servers are returned.
+**Data flow**: It takes a resolved plugin, the plugin's root directory, and an executor file system. It chooses the MCP config path from the plugin manifest, or falls back to `.mcp.json` under the plugin root. It converts that path into a URI, reads the text through the executor file system, parses the JSON as plugin MCP configuration, logs and skips invalid entries, removes HTTP-based servers, and returns only the accepted stdio server configurations. If the chosen file cannot be read, or the JSON cannot be parsed, it returns an error with the plugin id and path.
 
-**Call relations**: This is the core loader used by `ExecutorPluginMcpProvider::load()` and directly exercised by provider tests to verify executor-only reads, missing-default behavior, and parse-error reporting.
+**Call relations**: This helper is called by `ExecutorPluginMcpProvider::load` after that method has unpacked the resolved plugin. Inside the larger flow, it sits between plugin resolution and MCP server startup: it turns a plugin's declared config file into the concrete server configs that later code can launch or connect to.
 
 *Call graph*: calls 7 internal fn (read_file_text, location, manifest, selected_root_id, as_path, join, from_abs_path); called by 1 (load); 3 external calls (new, parse_plugin_mcp_config, warn!).
 
@@ -264,20 +266,26 @@ These files define the MCP crate surface, runtime server/config models, Apps-spe
 
 ### `codex-mcp/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting API surface`
 
-This crate root defines the MCP package's external API by gathering a large set of types and helper functions from internal modules and exposing them at the top level. The exports reveal the subsystem's major responsibilities: connection lifecycle (`McpConnectionManager`), tool visibility and metadata (`tool_is_model_visible`, `ToolInfo`, `declared_openai_file_input_param_names`), elicitation and review flows (`ElicitationReviewer`, `ElicitationReviewRequest`, handles and auth-elicitation builders), resource access and caching (`McpResourceClient`, cache keys, paged reads, `read_mcp_resource`), runtime context and sandbox state, catalog construction and conflict resolution for MCP servers, plugin configuration parsing, OAuth scope discovery and auth-status computation, and effective server resolution from configured sources. It also exposes constants and provenance helpers for Codex Apps integration, plus snapshot/status types used to inspect server health and capabilities. Internally, some modules are crate-private while others remain private to the root, indicating a deliberate separation between implementation detail and supported API. This file does not implement MCP behavior itself; instead it is the compatibility boundary that lets the rest of the workspace treat the crate as a single MCP toolkit rather than importing from many submodules directly.
+This file does not contain the main MCP logic itself. Instead, it acts like a reception desk or public index for the crate. MCP stands for Model Context Protocol, a way for the system to talk to external tools, resources, and servers in a structured way. The real work lives in smaller modules such as connection management, server configuration, resource reading, authentication prompts, OAuth login support, tool metadata, and Codex Apps integration.
+
+The important job here is to re-export selected names from those internal modules. In Rust, re-exporting means making something available from this crate’s top level, so callers can write a simpler import path instead of knowing the exact internal file layout. For example, outside code can use public types like McpConnectionManager, McpConfig, ResolvedMcpServer, or McpResourceClient without caring which module defines them.
+
+The file also declares which modules exist and which are public only inside this crate. Some modules are kept private, meaning their details can change without breaking outside users. Without this file, the rest of the project would either have to know the library’s internal structure or would be unable to access the MCP features at all. It is mainly about keeping the public API tidy and stable.
 
 
 ### `codex-mcp/src/server.rs`
 
-`data_model` · `startup and MCP server setup; later reused during tool routing and diagnostics`
+`data_model` · `server setup and later request/tool handling`
 
-This file is a compact domain-model layer for MCP server instances. `EffectiveMcpServer` wraps the launch strategy in the internal `McpServerLaunch` enum; today the only variant is `Configured(Box<McpServerConfig>)`, which preserves the original config while allowing the runtime representation to evolve later without changing callers. The accessor methods intentionally expose only selected semantics from the underlying config: whether the server is enabled, whether it is required, and the original config when the launch mode is configuration-backed.
+An MCP server is an external tool server that Codex can talk to. This file is like the label and instruction card attached to each such server: it says how the server should be started, whether it is active, and what safety rules apply when its tools are used.
 
-The second half of the file preserves metadata that remains relevant after a server process or transport has been established. `McpServerOrigin` reduces transport configuration into a stable diagnostic label: either literal `stdio` or the parsed HTTP origin string derived from a `StreamableHttp` URL. Invalid URLs are tolerated by returning `None`, so telemetry can degrade gracefully instead of failing launch.
+The central type is `EffectiveMcpServer`. It wraps the final launch plan for a server. Right now that launch plan is a configured server from the user or app configuration, but the wrapper leaves room for runtime-added kinds later.
 
-`McpServerMetadata` captures behavior flags and tool approval policy in a launch-independent form. Its `From<&EffectiveMcpServer>` implementation extracts `supports_parallel_tool_calls`, computes origin from transport, hard-codes `pollutes_memory: true`, copies the default approval mode, and builds a per-tool approval map only for tools that explicitly override approval. `tool_approval_mode` then resolves a tool’s effective policy by checking the per-tool map first, then the server default, then `AppToolApproval`’s default value.
+The file also records the server's transport origin. A transport is the way Codex talks to the server. For a local process using standard input and output, the origin is simply `stdio`. For an HTTP server, the code parses the URL and stores only the origin, such as scheme, host, and port. That is useful for metrics and diagnostics without keeping unnecessary URL details.
+
+Finally, `McpServerMetadata` stores facts that must survive after the server has been launched. This includes whether the server can affect memory, whether it supports parallel tool calls, and which tool approval policy applies. Tool approval can be set per tool, or fall back to a default, or finally to the normal default if nothing was configured.
 
 #### Function details
 
@@ -287,11 +295,11 @@ The second half of the file preserves metadata that remains relevant after a ser
 fn configured(config: McpServerConfig) -> Self
 ```
 
-**Purpose**: Constructs an `EffectiveMcpServer` whose launch strategy is the boxed `McpServerConfig` supplied by configuration loading. It is the canonical constructor for the current runtime form.
+**Purpose**: Creates an `EffectiveMcpServer` from a server configuration. Someone uses this when a server from configuration needs to become the runtime version that the rest of the MCP system works with.
 
-**Data flow**: Consumes an owned `McpServerConfig` argument, wraps it in `McpServerLaunch::Configured(Box<_>)`, and returns a new `EffectiveMcpServer` value. It does not mutate external state.
+**Data flow**: It takes a `McpServerConfig`, puts it inside the `Configured` launch plan, and returns a new `EffectiveMcpServer` containing that plan. The original configuration becomes owned by the new server object.
 
-**Call relations**: Used by tests that need a concrete runtime server object from config input, including cases that verify launch behavior and metadata preservation. Downstream code later inspects the stored launch variant through `launch()` or config-specific accessors.
+**Call relations**: Tests call this when they need a realistic configured MCP server, such as checking behavior around local runtime failures or tool approval metadata. Later code can inspect the object through methods like `launch` or convert it into metadata.
 
 *Call graph*: called by 2 (no_local_runtime_fails_local_stdio_but_keeps_local_http_server, server_metadata_preserves_tool_approval_policy); 2 external calls (new, Configured).
 
@@ -302,11 +310,11 @@ fn configured(config: McpServerConfig) -> Self
 fn launch(&self) -> &McpServerLaunch
 ```
 
-**Purpose**: Exposes the internal launch strategy enum by shared reference so other runtime code can branch on how this server should be contacted or started.
+**Purpose**: Gives internal code access to the server's launch plan. This is used when another part of the system needs to know how to actually start or interpret the server.
 
-**Data flow**: Reads `self.launch` and returns `&McpServerLaunch` without cloning or transforming it.
+**Data flow**: It reads the `launch` field from the `EffectiveMcpServer` and returns a shared reference to it. Nothing is copied or changed.
 
-**Call relations**: Called by code that needs to build an RMCP client and by `McpServerMetadata::from`, both of which pattern-match on the launch variant to derive transport or metadata details.
+**Call relations**: The MCP client creation path calls this when deciding how to connect to or start the server. The metadata conversion also calls it so it can copy the important long-lived facts from the launch configuration.
 
 *Call graph*: called by 2 (make_rmcp_client, from).
 
@@ -317,11 +325,11 @@ fn launch(&self) -> &McpServerLaunch
 fn configured_config(&self) -> Option<&McpServerConfig>
 ```
 
-**Purpose**: Returns the underlying `McpServerConfig` when this effective server came directly from configuration.
+**Purpose**: Returns the original configuration if this effective server came from configuration. This is a safe way for setup code to look back at the configured details without assuming every future server type will be configured.
 
-**Data flow**: Matches on `self.launch`; for `Configured`, it dereferences the boxed config and returns `Some(&McpServerConfig)`. With the current enum shape this always succeeds, but the `Option` leaves room for future non-configured launch modes.
+**Data flow**: It checks the launch plan. If it is `Configured`, it returns a shared reference to the stored `McpServerConfig`; otherwise it would return `None`, though the current code only has the configured case.
 
-**Call relations**: Used by construction logic elsewhere that wants direct access to the original config only when available, without exposing the launch enum to every caller.
+**Call relations**: Server setup code calls this while building or registering MCP servers. It keeps callers from reaching directly into the internal launch enum.
 
 *Call graph*: called by 1 (new).
 
@@ -332,11 +340,11 @@ fn configured_config(&self) -> Option<&McpServerConfig>
 fn enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether the configured MCP server is enabled according to its source configuration.
+**Purpose**: Answers whether this server is turned on. This lets higher-level code skip servers that exist in configuration but should not be used.
 
-**Data flow**: Matches on `self.launch`, reads `config.enabled` from the boxed `McpServerConfig`, and returns that boolean.
+**Data flow**: It looks inside the configured server settings and returns the `enabled` flag. It does not change the server.
 
-**Call relations**: This is a leaf accessor used by higher-level orchestration code to decide whether a configured server should participate in startup or tool listing.
+**Call relations**: This is a simple query method meant for orchestration code that decides which effective MCP servers should participate in a run.
 
 
 ##### `EffectiveMcpServer::required`  (lines 42–46)
@@ -345,11 +353,11 @@ fn enabled(&self) -> bool
 fn required(&self) -> bool
 ```
 
-**Purpose**: Reports whether the configured MCP server is marked required, which higher layers can use to decide whether startup failures are fatal.
+**Purpose**: Answers whether this server is required for the run. A required server is one whose failure may need to be treated more seriously than an optional server.
 
-**Data flow**: Matches on `self.launch`, reads `config.required`, and returns the boolean value.
+**Data flow**: It looks inside the configured server settings and returns the `required` flag. It does not change anything.
 
-**Call relations**: Another leaf accessor for orchestration logic that distinguishes optional from mandatory MCP integrations.
+**Call relations**: This supports startup and error-handling decisions elsewhere in the MCP flow, where the program may need to distinguish optional helper servers from required ones.
 
 
 ##### `McpServerOrigin::as_str`  (lines 57–62)
@@ -358,11 +366,11 @@ fn required(&self) -> bool
 fn as_str(&self) -> &str
 ```
 
-**Purpose**: Converts the origin enum into the stable string form used in metrics and diagnostics.
+**Purpose**: Turns a stored server origin into plain text. This is useful for logging, metrics, or diagnostics where the origin needs to be reported.
 
-**Data flow**: Reads `self`; returns the literal `"stdio"` for `Stdio`, or the borrowed inner origin string for `StreamableHttp(String)`.
+**Data flow**: It reads the origin value. For a standard-input/output server it returns the fixed text `stdio`; for an HTTP server it returns the stored origin string.
 
-**Call relations**: Serves as the final formatting step after origin has been derived from transport configuration and stored in metadata.
+**Call relations**: Other diagnostic or reporting code can call this after metadata has preserved the origin. It does not start servers or parse anything; it only presents the already-stored value.
 
 
 ##### `McpServerOrigin::from_transport`  (lines 64–72)
@@ -371,11 +379,11 @@ fn as_str(&self) -> &str
 fn from_transport(transport: &McpServerTransportConfig) -> Option<Self>
 ```
 
-**Purpose**: Derives a diagnostic origin from transport configuration, collapsing full transport details into either `stdio` or an HTTP origin string.
+**Purpose**: Extracts a compact origin from the server's transport configuration. In plain terms, it records where the server is reached from without keeping the whole connection description.
 
-**Data flow**: Takes `&McpServerTransportConfig`; for `StreamableHttp`, parses the configured URL and, if parsing succeeds, returns `Some(StreamableHttp(parsed.origin().ascii_serialization()))`; for `Stdio`, returns `Some(Stdio)`. If URL parsing fails, it returns `None`.
+**Data flow**: It takes a transport configuration. If the transport is HTTP, it parses the URL and returns the URL origin, such as protocol plus host and port; if parsing fails, it returns `None`. If the transport is standard input/output, it returns the `Stdio` origin.
 
-**Call relations**: Invoked during `McpServerMetadata::from` so metadata retains a transport-origin label after launch. It delegates URL normalization to `url::Url::parse` and intentionally treats malformed HTTP URLs as missing origin metadata rather than as a hard error.
+**Call relations**: The metadata-building function calls this while converting an effective server into long-lived metadata. It hands back just enough origin information for later metrics and diagnostics.
 
 *Call graph*: called by 1 (from); 2 external calls (StreamableHttp, parse).
 
@@ -386,11 +394,11 @@ fn from_transport(transport: &McpServerTransportConfig) -> Option<Self>
 fn tool_approval_mode(&self, tool_name: &str) -> AppToolApproval
 ```
 
-**Purpose**: Computes the effective approval mode for a specific tool name using per-tool overrides, then server default, then the global default.
+**Purpose**: Finds the approval rule for a specific tool on this MCP server. This matters because some tools may need explicit user approval, while others may follow a default policy.
 
-**Data flow**: Reads `self.tool_approval_modes`, `self.default_tools_approval_mode`, and the `tool_name` argument. It looks up the tool-specific mode, falls back to the optional default mode, then falls back to `AppToolApproval::default()`, returning the resolved enum value.
+**Data flow**: It receives a tool name, checks whether that exact tool has its own approval mode, and returns it if found. If not, it returns the server-wide default approval mode. If neither is set, it returns the normal default approval value.
 
-**Call relations**: Used wherever tool execution policy needs to be decided from persisted server metadata rather than from the original config structure.
+**Call relations**: Tool-calling code can use this when deciding whether a requested MCP tool call is allowed immediately or needs approval. It turns the stored policy map into a single clear answer for one tool.
 
 
 ##### `McpServerMetadata::from`  (lines 96–114)
@@ -399,24 +407,24 @@ fn tool_approval_mode(&self, tool_name: &str) -> AppToolApproval
 fn from(server: &EffectiveMcpServer) -> Self
 ```
 
-**Purpose**: Builds the semantic metadata snapshot that should remain available after an `EffectiveMcpServer` has been launched.
+**Purpose**: Builds the long-lived metadata record for an effective MCP server. This copies the facts that still matter after launch, so later code does not need to keep digging through the original configuration.
 
-**Data flow**: Reads the server via `launch()`, matches the `Configured` variant, and constructs `McpServerMetadata` by copying `supports_parallel_tool_calls`, `default_tools_approval_mode`, and collecting explicit per-tool `approval_mode` values from `config.tools` into a `HashMap<String, AppToolApproval>`. It also computes `origin` through `McpServerOrigin::from_transport` and sets `pollutes_memory` to `true`.
+**Data flow**: It receives an `EffectiveMcpServer`, reads its launch configuration, and creates a `McpServerMetadata` value. It sets memory-pollution behavior, extracts the transport origin, copies the parallel-tool-call setting, copies the default tool approval mode, and builds a map of per-tool approval modes from the configured tools.
 
-**Call relations**: Called during manager/server setup and in tests that verify approval policy preservation. It depends on `launch()` to inspect the runtime server and delegates transport summarization to `from_transport()`.
+**Call relations**: Server setup code and tests call this when they need the runtime metadata attached to a server. Inside, it calls `EffectiveMcpServer::launch` to inspect the launch plan and `McpServerOrigin::from_transport` to preserve the server's origin in a compact form.
 
 *Call graph*: calls 2 internal fn (launch, from_transport); called by 2 (new, server_metadata_preserves_tool_approval_policy).
 
 
 ### `codex-mcp/src/codex_apps.rs`
 
-`domain_logic` · `startup cache load and tool normalization`
+`domain_logic` · `startup and MCP tool refresh`
 
-This module contains the logic that only applies to the host-owned `codex_apps` MCP server. `CodexAppsToolsCacheKey` captures the authenticated user scope using optional account ID, optional ChatGPT user ID, and a workspace-account flag; `codex_apps_tools_cache_key` derives that key from `CodexAuth`. `CodexAppsToolsCacheContext` then turns the key into stable cache file paths by JSON-serializing the key, hashing it with SHA-1, and placing the resulting `<hash>.json` under separate tools and server-info cache directories inside `codex_home`. This isolates caches per authenticated user without exposing raw identifiers in filenames.
+Codex Apps are exposed to the model through MCP, the Model Context Protocol, which is a way for the host to offer tools and resources to the model. This file is the bridge for the special “Codex Apps” MCP server. Without it, the system could show stale or unsafe tools, mix one user's cached tools with another user's tools, or expose awkward connector-prefixed names to the model.
 
-The normalization helpers strip connector-specific prefixes only for the host-owned apps server. `normalize_codex_apps_tool_title` removes a literal `<connector_name>_` prefix from display titles when present. `normalize_codex_apps_callable_name` sanitizes names first, then strips sanitized connector-name or connector-ID prefixes if doing so leaves a non-empty suffix. `normalize_codex_apps_callable_namespace` appends a sanitized connector name to the server namespace using `server__connector` form.
+The file does three main jobs. First, it builds a cache key from the signed-in user’s identity. That key is hashed and used as part of the disk filename, like putting each user's papers into a separate labeled folder without exposing the label itself. Second, it reads and writes two JSON cache files: one for the available tools, and one for MCP server information. Each cache includes a schema version, so old cache formats can be ignored safely instead of being misread. Third, it cleans up Codex Apps tool names. Connector names and IDs can be embedded in raw tool names; the normalization functions remove those prefixes and sanitize names so they are safe and predictable for model-visible calls.
 
-Caching is intentionally defensive. `write_cached_codex_apps_tools_if_needed` only runs for the apps server and, when a cache context exists, writes both filtered tools and server info, warning but not failing if server-info persistence breaks, and emits a cache-write duration metric. Startup loaders return `None` for non-apps servers and suppress invalid or missing caches. Tool-cache reads distinguish `Hit`, `Missing`, and `Invalid`, reject schema-version mismatches, and always filter disallowed connector IDs both on write and read. Server-info caching is versioned separately so newer server-info cache entries survive legacy or invalid tool-cache files. The file’s invariants are: cache only for the host-owned apps server, scope by user, never trust stale schema versions, and never expose blocked connectors from disk.
+A safety check runs both when saving and loading tools: tools from connector IDs that are not allowed are removed. This means even an old disk cache cannot reintroduce a connector that policy no longer permits.
 
 #### Function details
 
@@ -426,11 +434,11 @@ Caching is intentionally defensive. `write_cached_codex_apps_tools_if_needed` on
 fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCacheKey
 ```
 
-**Purpose**: Derives the per-user cache key for Codex Apps from optional authentication state. It captures enough identity to isolate caches across users and workspace contexts.
+**Purpose**: Builds the user-specific key used to separate Codex Apps tool caches. It records the account ID, ChatGPT user ID, and whether the account is a workspace account when authentication information is available.
 
-**Data flow**: Takes `Option<&CodexAuth>`, reads account ID and ChatGPT user ID via `CodexAuth` accessors when present, computes `is_workspace_account` with `is_some_and`, and returns a `CodexAppsToolsCacheKey` containing those values.
+**Data flow**: It receives optional authentication details. It pulls out the user and account identifiers it can find, plus the workspace-account flag, and returns a small cache-key object. If there is no authentication, the fields that depend on it are empty or false.
 
-**Call relations**: Called by higher-level MCP status and resource-reading flows before constructing a `CodexAppsToolsCacheContext` for startup cache access.
+**Call relations**: Other parts of the MCP flow call this when they need a cache identity, such as while collecting server status or reading MCP resources. The returned key is later used by the cache context to decide which disk file belongs to this user.
 
 *Call graph*: called by 2 (collect_mcp_server_status_snapshot_with_detail, read_mcp_resource).
 
@@ -441,11 +449,11 @@ fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCacheKe
 fn tools_cache_path(&self) -> PathBuf
 ```
 
-**Purpose**: Returns the disk path for the current user’s cached Codex Apps tool list. It delegates path construction to the shared hashing helper.
+**Purpose**: Returns the disk path where this user's Codex Apps tool list should be cached. This keeps callers from needing to know the cache directory layout.
 
-**Data flow**: Reads `self`, passes the tools cache directory constant into `cache_path_in`, and returns the resulting `PathBuf`.
+**Data flow**: It reads the cache context, which contains the Codex home directory and user cache key. It asks the shared path-building helper to place the file under the tools-cache directory, then returns that path.
 
-**Call relations**: Used by `load_cached_codex_apps_tools` and `write_cached_codex_apps_tools` so both read and write target the same per-user file.
+**Call relations**: Tool cache loading and writing call this before touching the filesystem. It hands the path-building work to `CodexAppsToolsCacheContext::cache_path_in` so tools and server-info caches use the same naming scheme.
 
 *Call graph*: calls 1 internal fn (cache_path_in); called by 2 (load_cached_codex_apps_tools, write_cached_codex_apps_tools).
 
@@ -456,11 +464,11 @@ fn tools_cache_path(&self) -> PathBuf
 fn server_info_cache_path(&self) -> PathBuf
 ```
 
-**Purpose**: Returns the disk path for the current user’s cached Codex Apps server-info payload. It parallels the tools cache path but uses a separate directory.
+**Purpose**: Returns the disk path where this user's Codex Apps MCP server information should be cached. It mirrors the tool-cache path logic, but uses a separate cache directory.
 
-**Data flow**: Reads `self`, passes the server-info cache directory constant into `cache_path_in`, and returns the resulting `PathBuf`.
+**Data flow**: It reads the same cache context used for tools. It passes the server-info cache directory name to the shared helper and returns the resulting user-specific JSON file path.
 
-**Call relations**: Used by `load_cached_codex_apps_server_info` and `write_cached_codex_apps_server_info`.
+**Call relations**: Server-info cache loading and writing call this before reading or writing. Like the tools path function, it delegates the shared hashing and path assembly to `CodexAppsToolsCacheContext::cache_path_in`.
 
 *Call graph*: calls 1 internal fn (cache_path_in); called by 2 (load_cached_codex_apps_server_info, write_cached_codex_apps_server_info).
 
@@ -471,11 +479,11 @@ fn server_info_cache_path(&self) -> PathBuf
 fn cache_path_in(&self, cache_dir: &str) -> PathBuf
 ```
 
-**Purpose**: Builds a stable per-user cache filename inside a chosen cache directory by hashing the serialized user key. This avoids raw user identifiers in the filesystem path.
+**Purpose**: Builds a stable, user-specific cache file path inside a chosen cache directory. It hides the raw user details by hashing them before using them in the filename.
 
-**Data flow**: Takes a cache directory name, serializes `self.user_key` to JSON with `serde_json::to_string`, falls back to an empty string on serialization failure, hashes that JSON with `sha1_hex`, joins `self.codex_home`, the cache directory, and `<hash>.json`, and returns the resulting `PathBuf`.
+**Data flow**: It takes a cache directory name, serializes the user cache key to JSON, hashes that JSON into a short hexadecimal string, and joins the Codex home directory, cache directory, and hash-based filename into one path.
 
-**Call relations**: This private helper underpins both cache-path accessors so tools and server-info caches share the same user-scoping scheme.
+**Call relations**: `tools_cache_path` and `server_info_cache_path` both call this so the two caches are scoped in exactly the same way. It calls `sha1_hex` to turn the serialized user key into the filename-safe hash.
 
 *Call graph*: calls 1 internal fn (sha1_hex); called by 2 (server_info_cache_path, tools_cache_path); 3 external calls (join, format!, to_string).
 
@@ -490,11 +498,11 @@ fn normalize_codex_apps_tool_title(
 ) -> String
 ```
 
-**Purpose**: Normalizes a tool title for the host-owned apps server by removing a connector-name prefix when present. Non-apps servers and missing connector names are left untouched.
+**Purpose**: Cleans up the human-facing title of a Codex Apps tool by removing a connector-name prefix when it is present. For non-Codex-Apps servers, it leaves the title unchanged.
 
-**Data flow**: Inputs are `server_name`, optional `connector_name`, and the original title `value`. If the server is not `CODEX_APPS_MCP_SERVER_NAME`, it returns `value.to_string()`. Otherwise it trims and validates `connector_name`, builds `<connector_name>_`, strips that prefix from `value` if present and non-empty after stripping, and returns either the stripped suffix or the original title.
+**Data flow**: It receives a server name, optional connector name, and title value. If the server is the Codex Apps MCP server and the connector name is non-empty, it removes a matching `connector_` prefix from the title. It returns either the shortened title or the original value.
 
-**Call relations**: Used during Codex Apps tool normalization so model-visible titles do not redundantly repeat the connector name.
+**Call relations**: This is used as part of presenting app tools in a clearer form. It does not call into the cache system; it is a name-cleanup step for Codex Apps metadata.
 
 *Call graph*: 1 external calls (format!).
 
@@ -510,11 +518,11 @@ fn normalize_codex_apps_callable_name(
 ) -> String
 ```
 
-**Purpose**: Normalizes a model-callable tool name for the host-owned apps server by sanitizing it and removing connector-name or connector-ID prefixes. This produces shorter, connector-local callable names while preserving uniqueness rules elsewhere.
+**Purpose**: Turns a raw Codex Apps tool name into the cleaner name the model should call. It sanitizes unsafe characters and removes connector-name or connector-ID prefixes when they are only serving as redundant labels.
 
-**Data flow**: Takes `server_name`, raw `tool_name`, optional `connector_id`, and optional `connector_name`. For non-apps servers it returns the original tool name. For apps, it sanitizes `tool_name`, then tries to sanitize and strip a non-empty connector name prefix; if that fails, it tries the sanitized connector ID prefix; if stripping would yield an empty string or no prefix matches, it returns the sanitized tool name.
+**Data flow**: It receives the server name, raw tool name, optional connector ID, and optional connector name. For non-Codex-Apps servers it returns the original tool name. For Codex Apps, it sanitizes the tool name, then tries to strip a sanitized connector name prefix, then a sanitized connector ID prefix. The result is the callable name returned to the rest of the system.
 
-**Call relations**: This helper is part of the Codex Apps naming pipeline and relies on `sanitize_name` from the plugin utility crate for consistent model-safe identifiers.
+**Call relations**: This function sits in the metadata-normalization path for tools from the Codex Apps MCP server. It relies on `sanitize_name` to make names safe before comparing or returning them.
 
 *Call graph*: calls 1 internal fn (sanitize_name).
 
@@ -528,11 +536,11 @@ fn normalize_codex_apps_callable_namespace(
 ) -> String
 ```
 
-**Purpose**: Builds the model-visible namespace for a Codex Apps tool, optionally extending the server namespace with a sanitized connector name. Other servers keep their original namespace.
+**Purpose**: Creates the namespace used for Codex Apps callable tools. For Codex Apps, it includes the connector name so tools from different connectors can be separated cleanly.
 
-**Data flow**: Consumes `server_name` and optional `connector_name`. If the server is the apps server and a connector name exists, it returns `format!("{}__{}", server_name, sanitize_name(connector_name))`; otherwise it returns `server_name.to_string()`.
+**Data flow**: It receives a server name and optional connector name. If the server is the Codex Apps MCP server and a connector name exists, it sanitizes that connector name and returns a combined namespace like `server__connector`. Otherwise, it returns the server name unchanged.
 
-**Call relations**: Used alongside callable-name normalization so tools from different connectors under the shared apps server can be namespaced distinctly.
+**Call relations**: This complements callable-name normalization. Together, the namespace and callable name give the model a safe, organized way to refer to a tool.
 
 *Call graph*: 1 external calls (format!).
 
@@ -548,11 +556,11 @@ fn write_cached_codex_apps_tools_if_needed(
 )
 ```
 
-**Purpose**: Writes Codex Apps tools and server-info caches only when the current server is the host-owned apps server and a cache context is available. It also records cache-write latency and downgrades server-info write failures to warnings.
+**Purpose**: Writes Codex Apps tool and server-info caches, but only when the current server is the special Codex Apps MCP server and a cache context is available. It also records how long the cache write took.
 
-**Data flow**: Inputs are `server_name`, optional cache context, `&McpServerInfo`, and a slice of `ToolInfo`. If the server name is not the apps server, it returns immediately. Otherwise, when a cache context exists, it records `Instant::now()`, calls `write_cached_codex_apps_tools`, attempts `write_cached_codex_apps_server_info` and logs a warning on error, then emits `MCP_TOOLS_CACHE_WRITE_DURATION_METRIC` with the elapsed duration.
+**Data flow**: It receives the server name, optional cache context, current server information, and current tools. If the server is not Codex Apps, it does nothing. If caching is possible, it writes the tool list, tries to write server information, logs a warning if that second write fails, and emits a duration metric.
 
-**Call relations**: Called after successful tool refreshes and server startup flows so the latest filtered tools and presentation metadata are persisted for future startup snapshots.
+**Call relations**: This is called after a Codex Apps tool refresh or during server startup flows that have fresh tool data. It hands the actual disk writes to `write_cached_codex_apps_tools` and `write_cached_codex_apps_server_info`, then reports timing through `emit_duration`.
 
 *Call graph*: calls 3 internal fn (write_cached_codex_apps_server_info, write_cached_codex_apps_tools, emit_duration); called by 4 (hard_refresh_codex_apps_tools_cache, codex_apps_server_info_cache_survives_legacy_tools_cache_write, startup_cached_codex_apps_tools_loads_from_disk_cache, start_server_task); 2 external calls (now, warn!).
 
@@ -566,11 +574,11 @@ fn load_startup_cached_codex_apps_tools_snapshot(
 ) -> Option<Vec<ToolInfo>>
 ```
 
-**Purpose**: Loads a startup snapshot of cached Codex Apps tools when available and valid. It hides the internal `Hit/Missing/Invalid` distinction from callers by returning `Option<Vec<ToolInfo>>`.
+**Purpose**: Loads a cached Codex Apps tool list for startup use, if it is valid and belongs to the Codex Apps server. This lets the system have a quick snapshot before or while live tool discovery happens.
 
-**Data flow**: Takes `server_name` and optional cache context. It returns `None` immediately for non-apps servers or absent context. Otherwise it calls `load_cached_codex_apps_tools` and maps `Hit(tools)` to `Some(tools)` while collapsing `Missing` and `Invalid` to `None`.
+**Data flow**: It receives the server name and optional cache context. If the server is not Codex Apps, or no context exists, it returns nothing. Otherwise it loads the disk cache and returns the tools only when the cache is a valid hit.
 
-**Call relations**: Used during startup and tests to provide speculative tool listings without blocking on live server initialization.
+**Call relations**: Startup code calls this when creating or initializing the MCP tool view. It delegates the real cache read and validation to `load_cached_codex_apps_tools`.
 
 *Call graph*: calls 1 internal fn (load_cached_codex_apps_tools); called by 3 (startup_cached_codex_apps_tools_loads_from_disk_cache, startup_cached_codex_apps_tools_loads_without_server_info_cache, new).
 
@@ -584,11 +592,11 @@ fn load_startup_cached_codex_apps_server_info(
 ) -> Option<McpServerInfo>
 ```
 
-**Purpose**: Loads cached Codex Apps server presentation metadata for startup use. It is gated to the host-owned apps server and absent cache contexts return `None`.
+**Purpose**: Loads cached MCP server information for the Codex Apps server during startup. This gives the system previously known server metadata when a valid cache exists.
 
-**Data flow**: Consumes `server_name` and optional cache context. It returns `None` for non-apps servers; otherwise it unwraps the context and delegates to `load_cached_codex_apps_server_info`, returning that `Option<McpServerInfo>`.
+**Data flow**: It receives the server name and optional cache context. It returns nothing unless the server is Codex Apps and the context is present. Then it asks the server-info cache reader for the saved data and returns that result.
 
-**Call relations**: Used during startup and tests so UI-facing server info can be shown from disk cache before live initialization completes.
+**Call relations**: Startup code calls this alongside the cached tools snapshot. It hands off to `load_cached_codex_apps_server_info`, which performs the filesystem read and version check.
 
 *Call graph*: calls 1 internal fn (load_cached_codex_apps_server_info); called by 3 (startup_cached_codex_apps_tools_loads_from_disk_cache, startup_cached_codex_apps_tools_loads_without_server_info_cache, new).
 
@@ -601,11 +609,11 @@ fn read_cached_codex_apps_tools(
 ) -> Option<Vec<ToolInfo>>
 ```
 
-**Purpose**: Test-only convenience wrapper that reads the cached tools file and returns tools only on a valid cache hit. It hides the internal invalid/missing distinction.
+**Purpose**: Provides a test-only convenience wrapper that returns cached tools only when the cache is valid. It hides the more detailed hit, missing, or invalid status from tests that only care whether tools are available.
 
-**Data flow**: Takes a cache context, calls `load_cached_codex_apps_tools`, and maps `Hit(tools)` to `Some(tools)` while returning `None` for `Missing` and `Invalid`.
+**Data flow**: It receives a cache context, calls the normal tool-cache loader, and converts a valid hit into a tool list. Missing or invalid caches become `None`.
 
-**Call relations**: Used only by tests that inspect cache overwrite, user scoping, filtering, and invalid-cache behavior.
+**Call relations**: Tests call this to check cache behavior such as filtering, overwriting, and per-user scoping. It relies on `load_cached_codex_apps_tools`, so tests exercise the same read path used by real startup code.
 
 *Call graph*: calls 1 internal fn (load_cached_codex_apps_tools); called by 3 (codex_apps_tools_cache_filters_disallowed_connectors, codex_apps_tools_cache_is_overwritten_by_last_write, codex_apps_tools_cache_is_scoped_per_user).
 
@@ -618,11 +626,11 @@ fn load_cached_codex_apps_tools(
 ) -> CachedCodexAppsToolsLoad
 ```
 
-**Purpose**: Reads and validates the on-disk Codex Apps tools cache, distinguishing missing files from invalid cache contents. Valid cache hits are filtered through the connector allow-list before being returned.
+**Purpose**: Reads the Codex Apps tools cache from disk and decides whether it is usable. It distinguishes between a missing file, a broken or outdated file, and a valid cache hit.
 
-**Data flow**: Takes a cache context, computes the tools cache path, reads bytes from disk, returns `Missing` on `NotFound`, `Invalid` on other read errors, deserializes `CodexAppsToolsDiskCache` from JSON, returns `Invalid` on parse failure or schema-version mismatch, filters `cache.tools` with `filter_disallowed_codex_apps_tools`, and returns `CachedCodexAppsToolsLoad::Hit(filtered_tools)`.
+**Data flow**: It gets the tool-cache path from the cache context, reads the JSON file, parses it, checks the schema version, filters out tools from disallowed connectors, and returns a status: hit with tools, missing, or invalid.
 
-**Call relations**: This is the core tools-cache reader used by startup snapshot loading, test helpers, and live tool-listing code that wants to reuse disk cache.
+**Call relations**: Startup loading, test helpers, and tool-listing paths call this when they want cached tools. It uses `CodexAppsToolsCacheContext::tools_cache_path` to find the file and `filter_disallowed_codex_apps_tools` to enforce connector policy even on cached data.
 
 *Call graph*: calls 2 internal fn (tools_cache_path, filter_disallowed_codex_apps_tools); called by 3 (load_startup_cached_codex_apps_tools_snapshot, read_cached_codex_apps_tools, listed_tools); 3 external calls (Hit, from_slice, read).
 
@@ -636,11 +644,11 @@ fn write_cached_codex_apps_tools(
 )
 ```
 
-**Purpose**: Persists a filtered Codex Apps tool list to the per-user disk cache. Failures to create directories, serialize JSON, or write the file are silently ignored.
+**Purpose**: Saves the current Codex Apps tool list to this user's disk cache. Before saving, it removes tools from connectors that are not allowed.
 
-**Data flow**: Takes a cache context and a slice of `ToolInfo`, computes the tools cache path, creates parent directories if possible, clones and filters the tools with `filter_disallowed_codex_apps_tools`, serializes `CodexAppsToolsDiskCache { schema_version, tools }` to pretty JSON, and writes the bytes to disk. It returns unit and does not report errors.
+**Data flow**: It receives a cache context and a list of tools. It finds the cache path, creates the parent directory if needed, filters the tools, wraps them with the current cache schema version, serializes that data as pretty JSON, and writes it to disk. If directory creation or serialization fails, it quietly gives up.
 
-**Call relations**: Called by `write_cached_codex_apps_tools_if_needed` and directly by tests that verify overwrite, scoping, and filtering behavior.
+**Call relations**: `write_cached_codex_apps_tools_if_needed` calls this after fresh tools have been discovered. Tests also call it directly to verify overwrites, filtering, and per-user separation. It depends on `tools_cache_path` for the location and `filter_disallowed_codex_apps_tools` for safety.
 
 *Call graph*: calls 2 internal fn (tools_cache_path, filter_disallowed_codex_apps_tools); called by 4 (write_cached_codex_apps_tools_if_needed, codex_apps_tools_cache_filters_disallowed_connectors, codex_apps_tools_cache_is_overwritten_by_last_write, codex_apps_tools_cache_is_scoped_per_user); 4 external calls (to_vec, to_vec_pretty, create_dir_all, write).
 
@@ -653,11 +661,11 @@ fn load_cached_codex_apps_server_info(
 ) -> Option<McpServerInfo>
 ```
 
-**Purpose**: Reads the cached Codex Apps server-info payload from disk and validates its schema version. Invalid or missing cache files simply return `None`.
+**Purpose**: Reads cached MCP server information for Codex Apps from disk, if it exists and matches the expected cache format. Invalid, unreadable, or outdated data is ignored.
 
-**Data flow**: Takes a cache context, reads bytes from `server_info_cache_path`, deserializes `CodexAppsServerInfoDiskCache`, checks that `schema_version` matches the current constant, and returns `Some(server_info)` only on success.
+**Data flow**: It receives a cache context, reads the server-info cache path, parses the JSON, checks the schema version, and returns the saved server information only if everything is valid. Otherwise it returns nothing.
 
-**Call relations**: Used by startup cache loading so presentation metadata can be restored independently of the tools cache.
+**Call relations**: `load_startup_cached_codex_apps_server_info` calls this during startup. It uses `server_info_cache_path` to find the right per-user file.
 
 *Call graph*: calls 1 internal fn (server_info_cache_path); called by 1 (load_startup_cached_codex_apps_server_info); 2 external calls (from_slice, read).
 
@@ -671,11 +679,11 @@ fn write_cached_codex_apps_server_info(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Persists `McpServerInfo` for the host-owned apps server with contextual error messages. Unlike the tools-cache writer, it returns structured errors so callers can log them.
+**Purpose**: Writes MCP server information for Codex Apps to this user's disk cache. Unlike the tool-cache writer, it reports detailed errors to its caller.
 
-**Data flow**: Takes a cache context and `&McpServerInfo`, computes the server-info cache path, creates parent directories with `with_context` error messages, serializes `CodexAppsServerInfoDiskCache { schema_version, server_info: server_info.clone() }` to pretty JSON with contextual serialization errors, writes the bytes with a contextual path-specific error, and returns `anyhow::Result<()>`.
+**Data flow**: It receives a cache context and server information. It builds the cache path, creates the parent directory, wraps a clone of the server information with the current schema version, serializes it as pretty JSON, writes it to disk, and returns success or an error explaining what failed.
 
-**Call relations**: Called only by `write_cached_codex_apps_tools_if_needed`, which intentionally logs failures as warnings instead of failing the surrounding tool-refresh flow.
+**Call relations**: `write_cached_codex_apps_tools_if_needed` calls this after writing the tool cache. If this function returns an error, the caller logs a warning but keeps going, because failure to cache server info should not stop the main MCP flow.
 
 *Call graph*: calls 1 internal fn (server_info_cache_path); called by 1 (write_cached_codex_apps_tools_if_needed); 4 external calls (clone, to_vec_pretty, create_dir_all, write).
 
@@ -686,11 +694,11 @@ fn write_cached_codex_apps_server_info(
 fn filter_disallowed_codex_apps_tools(tools: Vec<ToolInfo>) -> Vec<ToolInfo>
 ```
 
-**Purpose**: Removes tools whose `connector_id` is present but not allowed by the connector allow-list. Tools without a connector ID are retained.
+**Purpose**: Removes tools whose connector ID is not allowed by the connector policy. Tools with no connector ID are kept.
 
-**Data flow**: Consumes a `Vec<ToolInfo>`, iterates through it, checks each `tool.connector_id.as_deref()`, keeps entries with no connector ID or with IDs accepted by `is_connector_id_allowed`, collects the survivors into a new `Vec<ToolInfo>`, and returns it.
+**Data flow**: It receives a list of tool descriptions. It checks each tool’s optional connector ID against the allow-list rule and collects only the tools that pass. The returned list is safe to expose or save.
 
-**Call relations**: Applied on both cache reads and writes, and also by uncached live listing code, so blocked connectors never leak through either fresh or persisted tool inventories.
+**Call relations**: The cache loader calls this so old cached data cannot bypass current policy. The cache writer calls it so disallowed tools are not stored. The uncached tool-listing path also uses it before returning tools to a client.
 
 *Call graph*: called by 3 (load_cached_codex_apps_tools, write_cached_codex_apps_tools, list_tools_for_client_uncached).
 
@@ -701,22 +709,20 @@ fn filter_disallowed_codex_apps_tools(tools: Vec<ToolInfo>) -> Vec<ToolInfo>
 fn sha1_hex(s: &str) -> String
 ```
 
-**Purpose**: Computes the lowercase hexadecimal SHA-1 digest of a string. It is used to derive opaque cache filenames from serialized user keys.
+**Purpose**: Creates a hexadecimal SHA-1 hash of a string. Here it is used to turn a serialized user cache key into a compact filename.
 
-**Data flow**: Takes `&str`, creates a `Sha1` hasher, updates it with the string’s UTF-8 bytes, finalizes the digest, formats it as lowercase hex, and returns the resulting `String`.
+**Data flow**: It receives a string, feeds its bytes into a SHA-1 hasher, finalizes the hash, and returns the hash as lowercase hexadecimal text.
 
-**Call relations**: Called only by `CodexAppsToolsCacheContext::cache_path_in` as part of per-user cache path generation.
+**Call relations**: `CodexAppsToolsCacheContext::cache_path_in` calls this while building cache paths. That lets cache filenames be stable for the same user key without placing raw account or user IDs directly in the path.
 
 *Call graph*: called by 1 (cache_path_in); 2 external calls (new, format!).
 
 
 ### `codex-mcp/src/connection_manager.rs`
 
-`orchestration` · `startup and request handling`
+`orchestration` · `startup, request handling, and teardown`
 
-This module is the runtime coordinator for MCP connectivity. `McpConnectionManager` stores `AsyncManagedClient`s keyed by server name, per-server metadata, the list of required servers, plugin provenance, Codex Apps feature flags, and an `ElicitationRequestManager`. Its async constructor clones the effective server map, computes required enabled servers, emits a `Starting` event for each enabled server, prepares a per-user `CodexAppsToolsCacheContext` only for the host-owned apps server, chooses a runtime auth provider only when Codex-backed auth should be injected and no bearer-token env var is configured, constructs each `AsyncManagedClient`, and spawns startup tasks that await client initialization and emit `Ready`, `Cancelled`, or formatted `Failed` updates. A second task aggregates all startup outcomes into one `McpStartupComplete` event.
-
-The manager then provides the session-facing API. `validate_required_servers` waits for all required clients and aggregates failures into one error. `list_all_tools` iterates all clients, relying on each client’s `listed_tools()` behavior to use startup snapshots when available, enriches each `ToolInfo` with server metadata, and normalizes names for model visibility. `hard_refresh_codex_apps_tools_cache` bypasses in-process caches for the apps server, records fetch/list metrics, rewrites disk caches, filters disabled tools, rewrites input schemas for model-visible file parameters, and normalizes names. Resource and template listing fan out concurrently across servers with pagination and duplicate-cursor detection, logging per-server failures instead of failing the whole aggregation. Direct per-server operations (`call_tool`, `list_resources`, `read_resource`, etc.) all resolve a ready client through `client_by_name` and attach contextual errors. The file also contains startup-error formatting helpers that special-case GitHub PAT guidance, auth-required login hints, and startup-timeout configuration hints.
+MCP, or Model Context Protocol, is a way for Codex to connect to outside tool providers. This file keeps those connections in one place so the rest of Codex does not need to know how each server starts, fails, times out, or returns tools. Think of it like a reception desk in a building with many specialist offices: Codex asks the desk for available services, and the desk routes each request to the right office. The main type, McpConnectionManager, owns a map of server names to running asynchronous clients. During startup it creates a client for each enabled server, sends progress events such as starting, ready, failed, or cancelled, and later sends one final startup summary. It also remembers server metadata, such as where a server came from, whether its tools can run in parallel, and how approval should work. During normal use it can list all tools, resources, and resource templates across servers; call a specific tool; read a resource; and answer questions about server status. It also supports user elicitation, meaning a server can ask Codex to ask the user for a decision or input. Without this file, every caller would need to duplicate server startup, error reporting, routing, filtering, caching, and shutdown behavior.
 
 #### Function details
 
@@ -726,11 +732,11 @@ The manager then provides the session-facing API. `validate_required_servers` wa
 fn tool_is_model_visible(tool: &ToolInfo) -> bool
 ```
 
-**Purpose**: Determines whether a tool should be exposed in model-facing declarations based on MCP UI visibility metadata. Tools without visibility metadata remain visible by default.
+**Purpose**: Decides whether a tool should be shown to the language model. Some MCP tools include UI visibility metadata; this function hides tools from the model unless that metadata explicitly says the model may see them.
 
-**Data flow**: Reads `tool.tool.meta`, drills into `ui.visibility` as a JSON array, and returns `true` if metadata is absent or if any array element equals the string `model`; otherwise returns `false`.
+**Data flow**: It receives one ToolInfo value and reads its optional metadata. If there is no visibility list, it returns true; if there is a visibility list, it returns true only when the list contains the word "model".
 
-**Call relations**: This helper is part of the tool-normalization pipeline used elsewhere in the MCP subsystem to hide tools that are not explicitly model-visible.
+**Call relations**: This is a small policy helper for filtering model-facing tool declarations. It stands apart from the manager methods and encodes the MCP apps visibility rule in one place.
 
 
 ##### `McpConnectionManager::new`  (lines 120–281)
@@ -743,11 +749,11 @@ async fn new(
         auth_entries: Hash
 ```
 
-**Purpose**: Constructs and starts the session’s MCP connection manager, spawning initialization for every enabled server and wiring startup-status event emission, auth injection, elicitation handling, and Codex Apps cache context setup.
+**Purpose**: Builds a fully active connection manager from the configured MCP servers. It starts every enabled server client, records metadata, and sends startup progress events so the rest of Codex can tell users what is happening.
 
-**Data flow**: Inputs include the effective server map, OAuth/keyring settings, auth status entries, approval policy, submit/event plumbing, cancellation token, permission profile, runtime context, Codex home path, Codex Apps cache key, feature flags, client elicitation capability, tool provenance, optional auth, and optional reviewer. It computes sorted required enabled server names, initializes maps and a `JoinSet`, creates an `ElicitationRequestManager`, wraps tool provenance in `Arc`, derives an optional Codex-backed auth provider, clones the server map, and for each enabled server stores metadata, emits a `Starting` update, optionally builds a `CodexAppsToolsCacheContext`, decides whether runtime auth should be injected, constructs an `AsyncManagedClient`, stores it, and spawns a task that awaits startup, maps the outcome to `Ready`/`Cancelled`/formatted `Failed`, emits a final per-server update, and returns `(server_name, outcome)`. After the loop it returns a manager containing the client map and shared state, and separately spawns a task that joins all startup tasks and sends one `McpStartupComplete` event summarizing ready, cancelled, and failed servers.
+**Data flow**: It receives server configuration, authentication settings, approval policy, event sender, runtime context, cache information, and other startup options. It creates an AsyncManagedClient for each enabled server, stores it by server name, launches background tasks that wait for startup results, emits per-server updates, and returns a manager ready for later calls.
 
-**Call relations**: This is the main runtime entry into the file, called by session setup and MCP refresh flows. It delegates event emission to `emit_update`, startup error wording to `mcp_init_error_display`, and client creation to `AsyncManagedClient::new`.
+**Call relations**: This is the main construction path used by higher-level setup flows such as server refresh, host-owned Codex Apps installation, resource reads, and status collection. Inside its startup tasks it uses emit_update to report state changes and mcp_init_error_display to turn startup failures into helpful user-facing messages.
 
 *Call graph*: calls 6 internal fn (emit_update, mcp_init_error_display, new, new, from, value); called by 7 (no_local_runtime_fails_local_stdio_but_keeps_local_http_server, collect_mcp_server_status_snapshot_with_detail, read_mcp_resource, list_accessible_connectors_from_mcp_tools_with_mcp_manager, install_host_owned_codex_apps_manager, refresh_mcp_servers_inner, new); 15 external calls (clone, new, child_token, clone, clone, new, new, clone, clone, send (+5 more)).
 
@@ -758,11 +764,11 @@ async fn new(
 async fn validate_required_servers(&self) -> Result<()>
 ```
 
-**Purpose**: Waits for all required servers to finish startup and returns a single aggregated error if any required server is missing or failed. It is intended to run after the manager has already been made reachable for elicitation handling.
+**Purpose**: Waits for all servers marked as required and fails the session if any of them did not start. This protects Codex from continuing when a configured must-have tool source is missing.
 
-**Data flow**: Reads `self.required_servers` and `self.clients`, iterates required names inside an instrumented async block, clones each async client if present, awaits `client()`, accumulates `McpStartupFailure` entries for missing clients or startup errors using `startup_outcome_error_message`, and returns `Ok(())` if none failed. Otherwise it formats all failures into one semicolon-separated string and returns `Err(anyhow!(...))`.
+**Data flow**: It reads the manager’s required server list, looks up each client, waits for its startup result, and collects failures. If there are no failures it returns success; otherwise it returns one combined error message listing every failed required server.
 
-**Call relations**: Called by higher-level session initialization after `new`. It depends on `startup_outcome_error_message` to collapse `StartupOutcomeError` into user-facing text.
+**Call relations**: This is meant to run after the manager has been made reachable to request handlers, because startup may need user input. It calls startup_outcome_error_message to simplify individual startup errors before combining them.
 
 *Call graph*: calls 1 internal fn (startup_outcome_error_message); 4 external calls (new, anyhow!, format!, info_span!).
 
@@ -777,11 +783,11 @@ fn new_uninitialized_with_permission_profile(
     ) -> Self
 ```
 
-**Purpose**: Builds a manager with no clients but with elicitation policy state initialized. This is primarily for tests and contexts that need manager behavior without live MCP startup.
+**Purpose**: Creates an empty manager with no MCP server connections, but with elicitation policy state already set up. This is useful in tests or sessions where MCP is not active but code still expects a manager object.
 
-**Data flow**: Takes approval policy, permission profile, and the prefixing flag; initializes empty client and metadata maps, an empty required-server list, default tool provenance, `host_owned_codex_apps_enabled = false`, stores the prefix flag, creates an `ElicitationRequestManager` from the provided policy/profile with no reviewer, creates a fresh cancellation token, and returns the manager.
+**Data flow**: It receives an approval policy, a permission profile, and the tool-name prefix setting. It builds empty maps and lists, creates a fresh elicitation request manager, creates a cancellation token, and returns a manager with no clients.
 
-**Call relations**: Used by tests and helper constructors that need a lightweight manager shell without invoking `McpConnectionManager::new`.
+**Call relations**: This is called by test and session helper paths, and by the test-only new_uninitialized wrapper. It shares the same elicitation setup idea as the real constructor but skips all network or process startup.
 
 *Call graph*: calls 2 internal fn (new, value); called by 3 (new, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx); 6 external calls (new, new, new, new, default, clone).
 
@@ -792,11 +798,11 @@ fn new_uninitialized_with_permission_profile(
 fn has_servers(&self) -> bool
 ```
 
-**Purpose**: Reports whether the manager currently owns any MCP clients. It is a simple emptiness check over the client map.
+**Purpose**: Answers whether this manager currently knows about any MCP servers. Callers can use it to skip MCP-related work when there are no configured clients.
 
-**Data flow**: Reads `self.clients.is_empty()` and returns the negation as `bool`.
+**Data flow**: It reads the internal client map and returns true if the map is not empty, otherwise false. It does not change anything.
 
-**Call relations**: Used by callers that need to know whether MCP functionality is present at all.
+**Call relations**: This is a simple query used by surrounding code that needs to branch between MCP-enabled and MCP-free behavior.
 
 
 ##### `McpConnectionManager::contains_server`  (lines 354–356)
@@ -805,11 +811,11 @@ fn has_servers(&self) -> bool
 fn contains_server(&self, server_name: &str) -> bool
 ```
 
-**Purpose**: Checks whether a named server exists in the manager’s client map. It does not wait for startup or inspect readiness.
+**Purpose**: Checks whether a server name is registered in this manager. It is a quick way to reject or route requests before trying to start or use a client.
 
-**Data flow**: Looks up `server_name` in `self.clients` and returns `bool` from `contains_key`.
+**Data flow**: It receives a server name, looks for that key in the internal client map, and returns a boolean. The manager state is unchanged.
 
-**Call relations**: Used internally and by tests for presence checks distinct from readiness.
+**Call relations**: This crate-private helper supports code that needs to know whether a named MCP server belongs to this manager.
 
 
 ##### `McpConnectionManager::shutdown`  (lines 359–364)
@@ -818,11 +824,11 @@ fn contains_server(&self, server_name: &str) -> bool
 async fn shutdown(&self)
 ```
 
-**Purpose**: Cancels startup and shuts down all managed clients, including terminating stdio-backed server processes. It is the explicit teardown path for the manager.
+**Purpose**: Stops all MCP clients owned by the manager. This is the explicit cleanup path for cancelling startup work and terminating any server processes behind the clients.
 
-**Data flow**: Calls `self.startup_cancellation_token.cancel()`, then iterates `self.clients.values()` and awaits each client’s `shutdown()`. It returns unit.
+**Data flow**: It cancels the startup cancellation token, then walks through every stored client and asks it to shut down. It returns after those shutdown requests complete.
 
-**Call relations**: Called during session teardown and by tests that verify pending startup/tool listing is cancelled cleanly.
+**Call relations**: This is used during teardown. It mirrors the automatic cleanup in McpConnectionManager::drop, but because it is async it can wait for each client’s shutdown work.
 
 *Call graph*: 1 external calls (cancel).
 
@@ -833,11 +839,11 @@ async fn shutdown(&self)
 fn server_origin(&self, server_name: &str) -> Option<&str>
 ```
 
-**Purpose**: Returns the origin string recorded in server metadata for a named server, if any. This is presentation metadata rather than transport access.
+**Purpose**: Returns a human-readable origin for a server, if one is known. The origin explains where the server came from, such as a plugin or configuration source.
 
-**Data flow**: Looks up `server_name` in `self.server_metadata`, reads `metadata.origin`, converts it with `McpServerOrigin::as_str`, and returns `Option<&str>`.
+**Data flow**: It receives a server name, looks up stored server metadata, and returns the origin string if present. If the server or origin is missing, it returns nothing.
 
-**Call relations**: Used by downstream presentation and provenance consumers that need to display where a server came from.
+**Call relations**: Other parts of Codex can use this when presenting tools or status to users, so server results can be tied back to where they came from.
 
 
 ##### `McpConnectionManager::server_pollutes_memory`  (lines 373–377)
@@ -846,11 +852,11 @@ fn server_origin(&self, server_name: &str) -> Option<&str>
 fn server_pollutes_memory(&self, server_name: &str) -> bool
 ```
 
-**Purpose**: Reports whether a server is considered memory-polluting according to its metadata. Missing metadata defaults to `true`.
+**Purpose**: Tells callers whether a server should be treated as affecting conversation memory. If metadata is missing, it takes the cautious default and says yes.
 
-**Data flow**: Looks up `server_name` in `self.server_metadata` and returns `metadata.pollutes_memory` when present, otherwise `true` via `is_none_or`.
+**Data flow**: It receives a server name, reads that server’s metadata, and returns the stored pollutes_memory flag. If there is no metadata entry, it returns true.
 
-**Call relations**: Used by higher-level logic that decides whether interactions with a server should be treated as polluting conversational memory.
+**Call relations**: This is a policy query for higher-level conversation logic that needs to decide how MCP server activity should affect memory.
 
 
 ##### `McpConnectionManager::plugin_id_for_mcp_server_name`  (lines 379–382)
@@ -859,11 +865,11 @@ fn server_pollutes_memory(&self, server_name: &str) -> bool
 fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str>
 ```
 
-**Purpose**: Returns the plugin ID associated with a server name according to collected tool provenance. This links runtime server names back to plugin ownership.
+**Purpose**: Finds the plugin identifier associated with an MCP server name, if that server came from a plugin. This connects low-level server names back to plugin-level identity.
 
-**Data flow**: Delegates the lookup to `self.tool_plugin_provenance.plugin_id_for_mcp_server_name(server_name)` and returns `Option<&str>`.
+**Data flow**: It receives a server name and asks the stored ToolPluginProvenance mapping for the matching plugin ID. It returns that ID as text when available.
 
-**Call relations**: Used by callers that need plugin provenance after the manager has been constructed.
+**Call relations**: This delegates to the provenance object created during manager setup. Callers use it when they need plugin context for an MCP server.
 
 
 ##### `McpConnectionManager::is_selected_plugin_mcp_server`  (lines 384–387)
@@ -872,11 +878,11 @@ fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str>
 fn is_selected_plugin_mcp_server(&self, server_name: &str) -> bool
 ```
 
-**Purpose**: Reports whether a server name belongs to a selected-plugin MCP server rather than another source. It delegates to stored provenance.
+**Purpose**: Checks whether a server belongs to the currently selected plugin set. This lets Codex distinguish plugin-provided MCP servers from other configured servers.
 
-**Data flow**: Calls `self.tool_plugin_provenance.is_selected_plugin_mcp_server(server_name)` and returns the resulting `bool`.
+**Data flow**: It receives a server name and asks the provenance mapping whether that server is selected. It returns true or false without changing state.
 
-**Call relations**: Used by runtime logic that treats selected-plugin servers specially.
+**Call relations**: Like plugin_id_for_mcp_server_name, this is a small wrapper around ToolPluginProvenance so callers do not need direct access to that internal object.
 
 
 ##### `McpConnectionManager::tool_approval_mode`  (lines 389–398)
@@ -889,11 +895,11 @@ fn tool_approval_mode(
     ) -> codex_config::AppToolApproval
 ```
 
-**Purpose**: Returns the effective approval mode for a specific tool on a specific server using stored server metadata. Missing metadata falls back to the config default.
+**Purpose**: Returns the approval rule for a particular tool on a particular server. Approval rules decide whether a user must approve a tool before it runs.
 
-**Data flow**: Looks up `server_name` in `self.server_metadata`, calls `metadata.tool_approval_mode(tool_name)` when present, and otherwise returns `AppToolApproval::default()`.
+**Data flow**: It receives a server name and tool name, looks up the server metadata, and asks that metadata for the tool’s approval mode. If the server metadata is missing, it returns the default approval mode.
 
-**Call relations**: Used by higher-level approval flows when deciding how a tool invocation should be gated.
+**Call relations**: This gives tool-running code a single place to ask how cautious it should be before invoking an MCP tool.
 
 
 ##### `McpConnectionManager::is_host_owned_codex_apps_server`  (lines 400–402)
@@ -902,11 +908,11 @@ fn tool_approval_mode(
 fn is_host_owned_codex_apps_server(&self, server_name: &str) -> bool
 ```
 
-**Purpose**: Checks whether a given server name is the special host-owned Codex Apps server and whether that feature is enabled. This gates apps-specific behavior.
+**Purpose**: Checks whether a server is the special Codex Apps MCP server owned by the host. This matters because that server may use special authentication and cache behavior.
 
-**Data flow**: Reads `self.host_owned_codex_apps_enabled` and compares `server_name` to `CODEX_APPS_MCP_SERVER_NAME`, returning the conjunction.
+**Data flow**: It receives a server name and compares it with the known Codex Apps server name, while also checking whether host-owned Codex Apps support is enabled. It returns true only when both conditions match.
 
-**Call relations**: Used by callers that need to branch into Codex Apps–specific logic only when the feature is active.
+**Call relations**: Startup code in McpConnectionManager::new gives the Codex Apps server special treatment; this query lets later code recognize the same special case.
 
 
 ##### `McpConnectionManager::set_approval_policy`  (lines 404–408)
@@ -915,11 +921,11 @@ fn is_host_owned_codex_apps_server(&self, server_name: &str) -> bool
 fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>)
 ```
 
-**Purpose**: Updates the approval policy used by the shared elicitation request manager. The update is best-effort and ignored if the mutex is poisoned.
+**Purpose**: Updates the approval policy used for future elicitation decisions. An elicitation is when an MCP server asks Codex to ask the user for input or permission.
 
-**Data flow**: Takes a constrained approval policy, locks `self.elicitation_requests.approval_policy`, writes `approval_policy.value()` into it on success, and returns unit.
+**Data flow**: It receives a constrained approval policy, extracts its value, locks the shared policy storage, and replaces the old policy if the lock succeeds. It does not return a result.
 
-**Call relations**: Called when session approval settings change after manager construction so future elicitation requests use the new policy.
+**Call relations**: This changes the policy inside the ElicitationRequestManager that was created during construction, so later elicitation requests follow the newest approval setting.
 
 *Call graph*: calls 1 internal fn (value).
 
@@ -930,11 +936,11 @@ fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>)
 fn set_permission_profile(&self, permission_profile: PermissionProfile)
 ```
 
-**Purpose**: Updates the permission profile used by the elicitation request manager. This affects future auto-approval decisions.
+**Purpose**: Updates the permission profile used when deciding whether elicitation is allowed. A permission profile describes what kinds of actions the session permits.
 
-**Data flow**: Locks `self.elicitation_requests.permission_profile`, writes the provided `PermissionProfile` into it on success, and returns unit.
+**Data flow**: It receives a PermissionProfile, locks the shared profile storage, and stores the new value if the lock succeeds. Nothing is returned.
 
-**Call relations**: Used when the session’s permission profile changes dynamically.
+**Call relations**: This supports live policy changes after the manager has been created. Later elicitation checks read the updated profile through the same shared request manager.
 
 
 ##### `McpConnectionManager::elicitations_auto_deny`  (lines 416–418)
@@ -943,11 +949,11 @@ fn set_permission_profile(&self, permission_profile: PermissionProfile)
 fn elicitations_auto_deny(&self) -> bool
 ```
 
-**Purpose**: Reports whether the manager is currently configured to auto-decline all elicitation requests. It simply exposes the underlying request-manager flag.
+**Purpose**: Reports whether elicitation requests are currently being denied automatically. This is useful when Codex should avoid interrupting the user or when permissions disallow prompts.
 
-**Data flow**: Delegates to `self.elicitation_requests.auto_deny()` and returns the resulting `bool`.
+**Data flow**: It reads the auto-deny flag from the elicitation request manager and returns it as a boolean. It does not change state.
 
-**Call relations**: Used by callers that need to inspect current elicitation behavior.
+**Call relations**: This delegates to ElicitationRequestManager::auto_deny, keeping elicitation state behind the manager interface.
 
 *Call graph*: calls 1 internal fn (auto_deny).
 
@@ -958,11 +964,11 @@ fn elicitations_auto_deny(&self) -> bool
 fn set_elicitations_auto_deny(&self, auto_deny: bool)
 ```
 
-**Purpose**: Enables or disables blanket auto-denial of elicitation requests. This is a runtime switch over the shared request manager.
+**Purpose**: Turns automatic denial of elicitation requests on or off. When enabled, server requests for user input are rejected instead of being shown for review.
 
-**Data flow**: Passes the provided `bool` into `self.elicitation_requests.set_auto_deny(auto_deny)` and returns unit.
+**Data flow**: It receives a boolean and passes it into the elicitation request manager. The stored auto-deny setting is updated for future requests.
 
-**Call relations**: Used by higher-level session controls to suppress interactive elicitation handling.
+**Call relations**: This delegates to ElicitationRequestManager::set_auto_deny and affects future calls that flow through the elicitation system.
 
 *Call graph*: calls 1 internal fn (set_auto_deny).
 
@@ -978,11 +984,11 @@ async fn resolve_elicitation(
     ) -> Result<()>
 ```
 
-**Purpose**: Resolves a pending elicitation request for a specific server and request ID by forwarding the response to the stored responder. It is the manager-facing entry point for user decisions.
+**Purpose**: Completes a pending elicitation request with the user’s or reviewer’s response. This lets a waiting MCP server continue after Codex has gathered the needed answer.
 
-**Data flow**: Consumes `server_name`, `RequestId`, and `ElicitationResponse`, forwards them to `self.elicitation_requests.resolve(...).await`, and returns the resulting `Result<()>`.
+**Data flow**: It receives the server name, request ID, and response. It passes those to the elicitation request manager, which matches them to a waiting request and returns success or an error.
 
-**Call relations**: Called by external request-handling code after a user or reviewer responds to an elicitation event.
+**Call relations**: This is the response path for elicitation requests created by MCP clients. It delegates the matching and completion work to ElicitationRequestManager::resolve.
 
 *Call graph*: calls 1 internal fn (resolve).
 
@@ -993,11 +999,11 @@ async fn resolve_elicitation(
 async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool
 ```
 
-**Purpose**: Waits up to a timeout for a named server to finish startup successfully. Missing servers, startup failures, and timeouts all return `false`.
+**Purpose**: Waits for one named server to become ready, but only for a limited amount of time. It gives callers a simple true-or-false readiness check.
 
-**Data flow**: Looks up the async client by name; if absent returns `false`. Otherwise wraps `async_managed_client.client()` in `tokio::time::timeout(timeout, ...)` and returns `true` only for `Ok(Ok(_))`, `false` for startup errors or timeout expiry.
+**Data flow**: It receives a server name and timeout duration. If the server is unknown it returns false; otherwise it waits for the client startup future until the timeout expires and returns true only if startup succeeds.
 
-**Call relations**: Used by tests and runtime code that need a bounded readiness probe rather than full startup validation.
+**Call relations**: This is a targeted readiness helper for code that needs one server before continuing. It uses Tokio’s timeout mechanism rather than waiting forever.
 
 *Call graph*: 1 external calls (timeout).
 
@@ -1008,11 +1014,11 @@ async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> b
 async fn list_all_tools(&self) -> Vec<ToolInfo>
 ```
 
-**Purpose**: Aggregates tools from all managed servers, enriching them with server metadata and normalizing names for model use. It relies on each async client to use cached startup snapshots when live startup is still pending or has failed.
+**Purpose**: Collects tools from every MCP server and prepares their names for model use. This is how Codex builds the combined tool list it can offer to the language model.
 
-**Data flow**: Creates an output `Vec<ToolInfo>`, iterates `self.clients`, reads each client’s cached-snapshot presence and startup-complete flag for tracing, awaits `managed_client.listed_tools()`, skips servers returning `None`, maps each returned tool through `self.with_server_metadata`, extends the aggregate vector, then passes the full list into `normalize_tools_for_model_with_prefix` using `self.prefix_mcp_tool_names` and returns the normalized vector.
+**Data flow**: It loops over all clients, asks each one for its listed tools, attaches server metadata to each tool, and skips servers that cannot provide tools. It then normalizes tool names, optionally adding prefixes, and returns one vector of ToolInfo values.
 
-**Call relations**: Called by higher-level connector/tool listing flows. It delegates actual per-client listing behavior to `AsyncManagedClient::listed_tools` and final naming to `normalize_tools_for_model_with_prefix`.
+**Call relations**: This is called by connector-listing code. Inside the flow it uses with_server_metadata to add presentation and execution details, then hands the whole collection to normalize_tools_for_model_with_prefix.
 
 *Call graph*: calls 1 internal fn (normalize_tools_for_model_with_prefix); called by 1 (list_accessible_and_enabled_connectors_from_manager); 3 external calls (new, trace!, trace_span!).
 
@@ -1023,11 +1029,11 @@ async fn list_all_tools(&self) -> Vec<ToolInfo>
 async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<Vec<ToolInfo>>
 ```
 
-**Purpose**: Force-refreshes the host-owned Codex Apps tool list by bypassing in-process caches, then rewrites disk caches and returns the freshly normalized model-visible tools. Existing cache contents are left untouched if the refresh fails.
+**Purpose**: Forces a fresh tool list from the special Codex Apps MCP server and updates its cache only if the refresh succeeds. This is useful when cached tools may be stale.
 
-**Data flow**: Looks up the Codex Apps async client, awaits a ready `ManagedClient`, records list and fetch start times, calls `list_tools_for_client_uncached` with the raw RMCP client, timeout, and optional server instructions, emits uncached-fetch duration, writes tools and server info to disk via `write_cached_codex_apps_tools_if_needed`, emits overall list duration tagged as cache miss, filters the tools through the client’s `tool_filter`, rewrites each tool’s schema with `tool_with_model_visible_input_schema`, enriches each with `with_server_metadata`, normalizes names with `normalize_tools_for_model_with_prefix`, and returns the resulting `Vec<ToolInfo>`.
+**Data flow**: It finds and awaits the Codex Apps client, fetches tools directly from the server without using the in-memory cache, records timing metrics, writes the refreshed cache if appropriate, filters disabled tools, adjusts their model-visible schemas, adds server metadata, normalizes names, and returns the new list.
 
-**Call relations**: Used by explicit refresh flows for the apps server. It composes uncached RMCP listing, disk-cache persistence, tool filtering, schema rewriting, and model-name normalization.
+**Call relations**: This follows the same output-shaping path as list_all_tools but bypasses normal cached listing. It calls list_tools_for_client_uncached for the fresh server request and write_cached_codex_apps_tools_if_needed to persist the result.
 
 *Call graph*: calls 5 internal fn (write_cached_codex_apps_tools_if_needed, list_tools_for_client_uncached, emit_duration, filter_tools, normalize_tools_for_model_with_prefix); 1 external calls (now).
 
@@ -1038,11 +1044,11 @@ async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<Vec<ToolInfo>>
 async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>>
 ```
 
-**Purpose**: Lists resources from every ready server concurrently and aggregates them into a map keyed by server name. Per-server failures are logged and omitted rather than aborting the whole operation.
+**Purpose**: Asks every ready MCP server for its resources and returns them grouped by server name. Resources are items such as files, documents, or other readable context exposed by a server.
 
-**Data flow**: Creates a `JoinSet`, iterates `self.clients`, awaits each ready `ManagedClient`, clones the RMCP client and timeout, and spawns a task that repeatedly calls `list_resources` with pagination params, accumulates `Resource`s, detects duplicate cursors as an error, and returns either `(server_name, Ok(resources))` or `(server_name, Err(err))`. The outer function then joins tasks, inserts successful results into a `HashMap<String, Vec<Resource>>`, logs warnings for per-server errors or task panics, and returns the aggregated map.
+**Data flow**: It snapshots the client map, waits for each usable client, and starts parallel tasks that page through each server’s resource list using cursors. Successful results are inserted into a map; failures are logged and omitted.
 
-**Call relations**: This is the cross-server resource aggregation API. It parallels `list_all_resource_templates` but targets concrete resources.
+**Call relations**: This is an aggregate version of list_resources. It performs many server requests at once and includes a guard against duplicate cursors so a misbehaving server cannot cause an endless pagination loop.
 
 *Call graph*: 5 external calls (new, new, new, anyhow!, warn!).
 
@@ -1053,11 +1059,11 @@ async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>>
 async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>>
 ```
 
-**Purpose**: Lists resource templates from every ready server concurrently and aggregates them by server name. Like resource listing, it tolerates per-server failures and logs them.
+**Purpose**: Asks every ready MCP server for resource templates and returns them grouped by server name. A resource template describes a pattern for resources that can be requested later.
 
-**Data flow**: Creates a `JoinSet`, iterates ready clients, clones each RMCP client and timeout, and spawns a task that repeatedly calls `list_resource_templates` with pagination, accumulates `ResourceTemplate`s, errors on duplicate cursors, and returns `(server_name, Result<Vec<ResourceTemplate>, _>)`. The outer loop joins tasks, inserts successes into a `HashMap`, logs warnings for failures or panics, and returns the map.
+**Data flow**: It walks through clients, starts parallel tasks for servers that are ready, and each task repeatedly asks for the next page of templates until there is no cursor left. It collects successes into a map and logs any server or task failures.
 
-**Call relations**: This is the template counterpart to `list_all_resources`, sharing the same concurrency and duplicate-cursor safeguards.
+**Call relations**: This mirrors list_all_resources but calls the resource-template endpoint instead. It also protects against duplicate cursors to avoid looping forever on bad pagination data.
 
 *Call graph*: 5 external calls (new, new, new, anyhow!, warn!).
 
@@ -1074,11 +1080,11 @@ async fn call_tool(
     ) -> Result<CallToolResult>
 ```
 
-**Purpose**: Invokes a specific tool on a specific server after checking that the tool is enabled by the server’s filter. It converts the RMCP result into the protocol-layer `CallToolResult` shape used by Codex.
+**Purpose**: Runs one specific tool on one specific MCP server. It enforces the server’s tool filter first, so disabled tools cannot be called through this path.
 
-**Data flow**: Inputs are server name, tool name, optional JSON arguments, and optional JSON meta. It resolves a ready `ManagedClient` via `client_by_name`, rejects disabled tools with an `anyhow!` error if `tool_filter.allows(tool)` is false, calls the RMCP client’s `call_tool`, adds context on failure, converts each returned content item to `serde_json::Value` with a string fallback on serialization failure, preserves `structured_content` and `is_error`, converts `meta` to JSON if possible, and returns `Result<CallToolResult>`.
+**Data flow**: It receives a server name, tool name, optional arguments, and optional metadata. It gets the matching client, checks whether the tool is allowed, sends the tool call with the configured timeout, converts the returned content into protocol-friendly JSON values, and returns a CallToolResult.
 
-**Call relations**: Used by request handlers for direct tool invocation. It depends on `client_by_name` for readiness/error handling and on the per-server `ToolFilter` to enforce configured tool restrictions.
+**Call relations**: This is one of the main request-handling paths. It uses client_by_name to find the right server client, then delegates the actual MCP tool call to that client.
 
 *Call graph*: calls 1 internal fn (client_by_name); 1 external calls (anyhow!).
 
@@ -1092,11 +1098,11 @@ async fn server_supports_sandbox_state_meta_capability(
     ) -> Result<bool>
 ```
 
-**Purpose**: Reports whether a named server advertises support for sandbox-state metadata capability. It is a thin accessor over the resolved managed client.
+**Purpose**: Reports whether a server says it supports sandbox-state metadata. That capability lets Codex know whether sandbox-related state can be included in calls to that server.
 
-**Data flow**: Resolves a ready `ManagedClient` with `client_by_name`, reads `server_supports_sandbox_state_meta_capability`, wraps it in `Ok`, and returns `Result<bool>`.
+**Data flow**: It receives a server name, gets the corresponding managed client, reads the stored capability flag, and returns it. If the server cannot be found or the client failed to start, it returns an error.
 
-**Call relations**: Used by callers that need to tailor requests based on server capability support.
+**Call relations**: This uses client_by_name just like the tool and resource request methods, but only reads a capability value from the ready client.
 
 *Call graph*: calls 1 internal fn (client_by_name).
 
@@ -1111,11 +1117,11 @@ async fn list_resources(
     ) -> Result<ListResourcesResult>
 ```
 
-**Purpose**: Lists resources from one specific server with optional pagination parameters. It adds contextual error text naming the server.
+**Purpose**: Lists resources from one chosen MCP server. This is the direct, single-server version of resource discovery.
 
-**Data flow**: Resolves a ready `ManagedClient` via `client_by_name`, reads its timeout, calls `managed.client.list_resources(params, timeout).await`, adds `resources/list failed for` context on error, and returns the `ListResourcesResult`.
+**Data flow**: It receives a server name and optional pagination parameters. It gets the managed client, reads its timeout, sends the resources/list request, and returns either the server’s page of resources or an error with server context.
 
-**Call relations**: This is the single-server counterpart to `list_all_resources`.
+**Call relations**: This is used when callers already know which server they want. It relies on client_by_name to locate a ready client before sending the MCP request.
 
 *Call graph*: calls 1 internal fn (client_by_name).
 
@@ -1130,11 +1136,11 @@ async fn list_resource_templates(
     ) -> Result<ListResourceTemplatesResult>
 ```
 
-**Purpose**: Lists resource templates from one specific server with optional pagination parameters. It clones the underlying client handle and adds contextual errors.
+**Purpose**: Lists resource templates from one chosen MCP server. Templates describe resource URI patterns or discoverable resource shapes.
 
-**Data flow**: Resolves a ready `ManagedClient`, clones `managed.client`, reads the timeout, calls `list_resource_templates(params, timeout).await`, adds `resources/templates/list failed for` context on error, and returns the `ListResourceTemplatesResult`.
+**Data flow**: It receives a server name and optional pagination parameters. It gets the managed client, clones the underlying client handle, sends the resource-template list request with the configured timeout, and returns the result or a contextual error.
 
-**Call relations**: This is the single-server counterpart to `list_all_resource_templates`.
+**Call relations**: This is the direct counterpart to list_all_resource_templates. It uses client_by_name, then hands the request to the underlying MCP client.
 
 *Call graph*: calls 1 internal fn (client_by_name).
 
@@ -1149,11 +1155,11 @@ async fn read_resource(
     ) -> Result<ReadResourceResult>
 ```
 
-**Purpose**: Reads one resource from a specific server and includes the resource URI in any error context. It is the direct resource-fetch API.
+**Purpose**: Reads one resource from one MCP server. This retrieves the actual content for a resource identified by the request parameters.
 
-**Data flow**: Resolves a ready `ManagedClient`, clones the RMCP client, reads the timeout, clones `params.uri` for error reporting, calls `read_resource(params, timeout).await`, adds `resources/read failed for` context including the URI, and returns the `ReadResourceResult`.
+**Data flow**: It receives a server name and read-resource parameters, including a URI. It gets the managed client, sends the read request with the configured timeout, and returns the resource contents or an error that includes the server and URI.
 
-**Call relations**: Used by request handlers that need to fetch a concrete MCP resource from a chosen server.
+**Call relations**: This is the read step that typically follows resource discovery. Like other single-server operations, it starts by calling client_by_name.
 
 *Call graph*: calls 1 internal fn (client_by_name).
 
@@ -1164,11 +1170,11 @@ async fn read_resource(
 async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo>
 ```
 
-**Purpose**: Returns presentation metadata for all servers without blocking on clients that are still starting. It prefers live server info when startup is complete and falls back to cached server info otherwise.
+**Purpose**: Returns presentation information for servers without unnecessarily waiting on servers that are still starting. Cached information is used when live information is not yet available.
 
-**Data flow**: Creates an output `HashMap<String, McpServerInfo>`, iterates `self.clients`, checks each client’s `startup_complete` atomic flag, and if startup is incomplete inserts `cached_server_info` when present and continues. For completed startups it awaits `client.client()`: on success it inserts `managed_client.server_info`; on failure it falls back to `cached_server_info` if available. It returns the assembled map.
+**Data flow**: It loops over clients. If a client has not completed startup, it inserts cached server info if present; if startup has completed, it tries to get the live managed client and uses live server info, falling back to cache on error.
 
-**Call relations**: Called by status-snapshot code and tested specifically for non-blocking behavior while startup is pending or failed.
+**Call relations**: This is called by status snapshot collection code. It is designed for UI/status paths where showing the best available information quickly is better than blocking on a slow startup.
 
 *Call graph*: called by 1 (collect_mcp_server_status_snapshot_from_manager); 1 external calls (new).
 
@@ -1179,11 +1185,11 @@ async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo>
 fn with_server_metadata(&self, mut tool: ToolInfo) -> ToolInfo
 ```
 
-**Purpose**: Copies server-level metadata onto a `ToolInfo` so aggregated tool listings carry origin and parallel-call capability. Missing metadata forces conservative defaults.
+**Purpose**: Adds stored server metadata to a ToolInfo value. This gives each tool important context such as whether parallel calls are supported and what origin should be shown.
 
-**Data flow**: Consumes a mutable `ToolInfo`. If `self.server_metadata` lacks an entry for `tool.server_name`, it sets `supports_parallel_tool_calls = false` and `server_origin = None` and returns the tool. Otherwise it copies `supports_parallel_tool_calls` and stringifies `origin` into `tool.server_origin`, then returns the modified tool.
+**Data flow**: It receives a ToolInfo, looks up metadata using the tool’s server name, and writes metadata-derived fields into the tool. If metadata is missing, it marks parallel calls unsupported and clears the origin.
 
-**Call relations**: Used by `list_all_tools` and `hard_refresh_codex_apps_tools_cache` before final name normalization so every returned tool carries server metadata.
+**Call relations**: list_all_tools and hard_refresh_codex_apps_tools_cache use this before returning tools. It keeps metadata enrichment in one small shared step.
 
 
 ##### `McpConnectionManager::client_by_name`  (lines 813–820)
@@ -1192,11 +1198,11 @@ fn with_server_metadata(&self, mut tool: ToolInfo) -> ToolInfo
 async fn client_by_name(&self, name: &str) -> Result<ManagedClient>
 ```
 
-**Purpose**: Resolves a named server to a ready `ManagedClient` or returns a contextual error if the server is unknown or startup failed. It centralizes client lookup and readiness waiting.
+**Purpose**: Finds a ready managed client for a server name or returns a clear error. This is the common lookup gate before making single-server MCP requests.
 
-**Data flow**: Looks up `name` in `self.clients`, returns an `anyhow!` unknown-server error if absent, otherwise awaits `client()` on the async client and adds `failed to get client` context on error, returning `Result<ManagedClient>`.
+**Data flow**: It receives a server name, checks the internal client map, waits for that AsyncManagedClient to produce a ManagedClient, and returns it. Unknown servers and failed startups become errors.
 
-**Call relations**: This helper underpins direct per-server operations such as `call_tool`, `list_resources`, `list_resource_templates`, `read_resource`, and capability checks.
+**Call relations**: call_tool, list_resources, list_resource_templates, read_resource, and server_supports_sandbox_state_meta_capability all call this so they share the same lookup and startup-error behavior.
 
 *Call graph*: called by 5 (call_tool, list_resource_templates, list_resources, read_resource, server_supports_sandbox_state_meta_capability).
 
@@ -1211,11 +1217,11 @@ fn new_uninitialized(
     ) -> Self
 ```
 
-**Purpose**: Test-only wrapper that builds an uninitialized manager from constrained approval and permission-profile values. It unwraps the constrained permission profile before delegating.
+**Purpose**: Creates an empty manager for tests using a constrained permission profile. It is a test-only convenience wrapper around the more general uninitialized constructor.
 
-**Data flow**: Takes constrained approval policy and constrained permission profile plus the prefix flag, calls `permission_profile.get()`, forwards the values to `new_uninitialized_with_permission_profile`, and returns the manager.
+**Data flow**: It receives an approval policy, a constrained permission profile, and the prefix setting. It extracts the permission profile value and passes everything to new_uninitialized_with_permission_profile, returning the resulting empty manager.
 
-**Call relations**: Used extensively by tests in `connection_manager_tests.rs` to create a manager shell with no live startup.
+**Call relations**: Many tests call this to build a manager without starting real MCP servers. It keeps test setup short while reusing the real empty-manager construction logic.
 
 *Call graph*: calls 1 internal fn (get); called by 9 (list_all_tools_accepts_canonical_namespaced_tool_names, list_all_tools_adds_server_metadata_to_cached_tools, list_all_tools_applies_legacy_mcp_prefix_by_default, list_all_tools_blocks_while_client_is_pending_without_cached_tool_info_snapshot, list_all_tools_does_not_block_when_cached_tool_info_snapshot_is_empty, list_all_tools_uses_cached_tool_info_snapshot_when_client_startup_fails, list_all_tools_uses_cached_tool_info_snapshot_while_client_is_pending, list_available_server_infos_uses_cache_while_client_is_pending, shutdown_cancels_pending_tool_listing); 1 external calls (new_uninitialized_with_permission_profile).
 
@@ -1226,11 +1232,11 @@ fn new_uninitialized(
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures startup cancellation and client-map cleanup when the manager is dropped. This is a safety net for teardown paths that do not call `shutdown` explicitly.
+**Purpose**: Performs last-resort cleanup when the manager is destroyed. It cancels startup work and removes client references.
 
-**Data flow**: On mutable drop, calls `self.startup_cancellation_token.cancel()` and clears `self.clients`.
+**Data flow**: When Rust drops the manager, this method cancels the startup cancellation token and clears the client map. It does not await async shutdown work.
 
-**Call relations**: Runs automatically at object destruction; it complements but does not replace the explicit async `shutdown` method.
+**Call relations**: This complements the explicit async shutdown method. If callers forget to call shutdown, drop still signals cancellation, but shutdown is the fuller cleanup path.
 
 *Call graph*: 1 external calls (cancel).
 
@@ -1245,11 +1251,11 @@ async fn emit_update(
 ) -> Result<(), async_channel::SendError<Event>>
 ```
 
-**Purpose**: Sends one MCP startup-update event over the async event channel. It wraps the update in the outer `Event` envelope with the provided submit ID.
+**Purpose**: Sends one MCP startup status update through the event channel. This lets the rest of Codex report per-server progress to the user or UI.
 
-**Data flow**: Takes `submit_id`, `&Sender<Event>`, and `McpStartupUpdateEvent`, constructs `Event { id: submit_id.to_string(), msg: EventMsg::McpStartupUpdate(update) }`, sends it asynchronously, and returns the channel send result.
+**Data flow**: It receives a submit ID, an event sender, and an update payload. It wraps the update in an Event with the submit ID and sends it through the async channel, returning the send result.
 
-**Call relations**: Called by `McpConnectionManager::new` before startup begins and again when each server’s startup outcome is known.
+**Call relations**: McpConnectionManager::new calls this before starting each server and again after each startup attempt finishes. It centralizes the event shape for startup updates.
 
 *Call graph*: called by 1 (new); 2 external calls (send, McpStartupUpdate).
 
@@ -1264,11 +1270,11 @@ fn mcp_init_error_display(
 ) -> String
 ```
 
-**Purpose**: Formats startup failures into user-facing guidance, with special cases for GitHub PAT configuration, auth-required login prompts, and startup-timeout hints. Generic failures fall back to the formatted underlying error.
+**Purpose**: Turns a raw MCP startup error into a message a user can act on. It gives special guidance for common cases such as missing login, GitHub MCP token setup, or startup timeout.
 
-**Data flow**: Inputs are `server_name`, optional `McpAuthStatusEntry`, and `&StartupOutcomeError`. It inspects the entry’s transport config to detect the GitHub Copilot MCP URL with no bearer token or headers and returns a PAT setup message in that case. Otherwise it checks `is_mcp_client_auth_required_error` to return a `codex mcp login` hint, checks `is_mcp_client_startup_timeout_error` to compute the effective startup timeout from config or `DEFAULT_STARTUP_TIMEOUT` and return a config hint, and otherwise formats `MCP client for ... failed to start: {err:#}`.
+**Data flow**: It receives the server name, optional authentication/config entry, and startup error. It checks for known patterns and returns a tailored string; if none match, it returns a general failure message containing the original error.
 
-**Call relations**: Used by `McpConnectionManager::new` when converting startup failures into `McpStartupStatus::Failed` event payloads.
+**Call relations**: McpConnectionManager::new uses this when a startup task fails before sending the failure update. It calls is_mcp_client_auth_required_error and is_mcp_client_startup_timeout_error to recognize common error categories.
 
 *Call graph*: calls 2 internal fn (is_mcp_client_auth_required_error, is_mcp_client_startup_timeout_error); called by 1 (new); 1 external calls (format!).
 
@@ -1279,11 +1285,11 @@ fn mcp_init_error_display(
 fn startup_outcome_error_message(error: StartupOutcomeError) -> String
 ```
 
-**Purpose**: Converts a `StartupOutcomeError` into a plain message string without extra context. It is used when aggregating required-server failures.
+**Purpose**: Converts a startup outcome error into a short message for required-server validation. It separates cancellation from ordinary startup failure text.
 
-**Data flow**: Matches on the error: `Cancelled` becomes `MCP startup cancelled`, and `Failed { error }` returns the contained error string.
+**Data flow**: It receives a StartupOutcomeError by value. Cancelled becomes the fixed message "MCP startup cancelled"; a failed outcome returns its stored error string.
 
-**Call relations**: Called by `validate_required_servers` after awaiting required clients.
+**Call relations**: validate_required_servers calls this while building its combined error message for all required servers that did not initialize.
 
 *Call graph*: called by 1 (validate_required_servers).
 
@@ -1294,11 +1300,11 @@ fn startup_outcome_error_message(error: StartupOutcomeError) -> String
 fn is_mcp_client_auth_required_error(error: &StartupOutcomeError) -> bool
 ```
 
-**Purpose**: Detects whether a startup failure string indicates missing authentication. The check is substring-based.
+**Purpose**: Detects whether a startup error appears to mean authentication is required. This helps produce a login-focused message instead of a vague startup failure.
 
-**Data flow**: Matches `StartupOutcomeError::Failed { error }`, checks whether `error.contains("Auth required")`, and returns the resulting `bool`; all other variants return `false`.
+**Data flow**: It receives a startup error reference. If the error is a failed outcome whose text contains "Auth required", it returns true; otherwise it returns false.
 
-**Call relations**: Used only by `mcp_init_error_display` to choose the login-hint message.
+**Call relations**: mcp_init_error_display calls this as one of its known-error checks before choosing the final user-facing startup message.
 
 *Call graph*: called by 1 (mcp_init_error_display); 1 external calls (contains).
 
@@ -1309,22 +1315,26 @@ fn is_mcp_client_auth_required_error(error: &StartupOutcomeError) -> bool
 fn is_mcp_client_startup_timeout_error(error: &StartupOutcomeError) -> bool
 ```
 
-**Purpose**: Detects whether a startup failure string represents a timeout during request or handshake. The check is based on known substrings from underlying client errors.
+**Purpose**: Detects whether a startup error looks like a timeout. This lets Codex suggest changing the configured startup timeout rather than reporting a generic failure.
 
-**Data flow**: Matches `StartupOutcomeError::Failed { error }`, returns true if the string contains `request timed out` or `timed out handshaking with MCP server`, and false otherwise.
+**Data flow**: It receives a startup error reference. If the failed error text mentions a request timeout or a timed-out MCP handshake, it returns true; otherwise it returns false.
 
-**Call relations**: Used only by `mcp_init_error_display` to choose the startup-timeout guidance message.
+**Call relations**: mcp_init_error_display calls this after the authentication check. When it returns true, the displayed message includes the timeout value and an example config setting.
 
 *Call graph*: called by 1 (mcp_init_error_display); 1 external calls (contains).
 
 
 ### `codex-mcp/src/resource_client.rs`
 
-`orchestration` · `request handling`
+`io_transport` · `request handling`
 
-This file defines a narrow resource-only facade over `McpConnectionManager`. `McpResourceClient` stores `Arc<ArcSwap<McpConnectionManager>>` rather than a fixed manager snapshot, which means every operation loads the current manager at call time and transparently follows startup or refresh replacements. The companion `McpResourceClientCacheKey` is an opaque identity built from a `Weak<McpConnectionManager>`; equality is pointer-based, so caches can cheaply detect when the published manager instance has changed.
+MCP, or Model Context Protocol, lets Codex talk to external servers that can provide tools and resources. This file is the resource-facing doorway into those servers. A resource might be something like a file, document, or other named piece of context that an MCP server advertises.
 
-The public API is intentionally small. `has_server` checks whether the current manager knows about a named server without waiting for startup. `list_resources` optionally wraps a caller-supplied cursor into `PaginatedRequestParams`, delegates to the manager, and converts each returned `rmcp::model::Resource` into the protocol-layer `Resource` type. `read_resource` similarly delegates a URI read and converts each `rmcp::model::ResourceContents` item into `ResourceContent`. Both conversions go through JSON serialization/deserialization with `anyhow::Context` labels, so failures carry concrete messages like "failed to serialize MCP resource" or "failed to convert MCP resource content". The custom `Debug` implementation intentionally hides the internal manager handle by emitting a non-exhaustive struct, keeping logs stable and avoiding accidental exposure of implementation details.
+The central type is `McpResourceClient`. It does not hold a fixed connection manager directly. Instead, it holds a shared, replaceable pointer to the current `McpConnectionManager`. That matters because the manager can be swapped during startup or refresh, and this client should automatically use the newest one. Think of it like keeping the address of the front desk, not the name of one staff member; if staffing changes, you still ask the current front desk.
+
+The client can check whether a server name is known, list resources one page at a time, and read the contents of a specific resource URI. Pagination means a server can return a long list in chunks, with a cursor that says where to continue next time.
+
+The file also defines plain result structs for a page of resources and for read contents. Two helper functions translate resource data from the external `rmcp` library’s shapes into Codex’s own protocol shapes, adding useful error context if conversion fails.
 
 #### Function details
 
@@ -1334,11 +1344,11 @@ The public API is intentionally small. `has_server` checks whether the current m
 fn eq(&self, other: &Self) -> bool
 ```
 
-**Purpose**: Compares two cache keys by the identity of the underlying manager allocation. It does not inspect manager contents.
+**Purpose**: Compares two cache keys to see whether they point to the same underlying MCP connection manager. This lets callers know whether cached resource data still belongs to the currently published manager.
 
-**Data flow**: Reads the inner `Weak<McpConnectionManager>` from `self` and `other` and returns the result of `ptr_eq`, indicating whether both keys point at the same published manager instance.
+**Data flow**: It receives two cache keys, each holding a weak reference to a manager. It compares the identity of those references, not the manager’s contents. It returns `true` if both keys refer to the same manager allocation, and `false` otherwise.
 
-**Call relations**: This equality implementation supports cache invalidation logic outside this file by making manager replacement observable through pointer identity.
+**Call relations**: This supports the equality behavior for `McpResourceClientCacheKey`. The key itself is produced by `McpResourceClient::cache_key`, so equality is used when outside code wants to tell whether the client’s manager identity has changed.
 
 
 ##### `McpResourceClient::fmt`  (lines 52–56)
@@ -1347,11 +1357,11 @@ fn eq(&self, other: &Self) -> bool
 fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats `McpResourceClient` for debugging without exposing internal state. It emits a non-exhaustive debug struct named `McpResourceClient`.
+**Purpose**: Provides a safe debug printout for `McpResourceClient`. It identifies the value as an MCP resource client without exposing internal connection-manager details.
 
-**Data flow**: Reads `self` only to satisfy the trait signature, writes a `debug_struct("McpResourceClient")` with `finish_non_exhaustive()` into the provided formatter, and returns the formatting result.
+**Data flow**: It receives a formatter from Rust’s debug-printing system. It writes a non-exhaustive debug structure named `McpResourceClient`, meaning the output is intentionally brief and may omit fields. It returns the normal formatting result.
 
-**Call relations**: This custom formatter keeps logs concise and avoids printing the internal `ArcSwap` manager handle.
+**Call relations**: Rust calls this when someone formats the client with debug output. Inside, it hands the formatting work to the standard debug-structure builder through `debug_struct`.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -1362,11 +1372,11 @@ fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn new(manager: Arc<ArcSwap<McpConnectionManager>>) -> Self
 ```
 
-**Purpose**: Constructs a resource client backed by a replaceable shared manager publication handle. The client will always consult the latest published manager.
+**Purpose**: Creates a resource client that uses the session’s shared, replaceable MCP connection manager. Callers use this when they need an object that can list and read MCP resources.
 
-**Data flow**: Consumes `Arc<ArcSwap<McpConnectionManager>>` and stores it in `Self { manager }`, returning the new `McpResourceClient`.
+**Data flow**: It receives a shared pointer to an `ArcSwap`, which is a thread-safe holder for a replaceable shared value. It stores that pointer inside a new `McpResourceClient`. The returned client will later load the current manager whenever it makes a request.
 
-**Call relations**: This constructor is used by higher-level session setup code that owns the shared manager publication.
+**Call relations**: This is the construction point for the client and is called by a higher-level `new` function elsewhere in the system. After construction, the other methods on `McpResourceClient` use the stored manager handle to answer resource requests.
 
 *Call graph*: called by 1 (new).
 
@@ -1377,11 +1387,11 @@ fn new(manager: Arc<ArcSwap<McpConnectionManager>>) -> Self
 fn cache_key(&self) -> McpResourceClientCacheKey
 ```
 
-**Purpose**: Returns an opaque identity for the currently published manager. The key changes when the `ArcSwap` publishes a different manager instance.
+**Purpose**: Returns an identity token for the manager currently used by this client. This is useful for caches: if the token changes, cached resource information may belong to an old manager and should not be trusted blindly.
 
-**Data flow**: Loads the current `Arc<McpConnectionManager>` from `self.manager`, downgrades it to `Weak<McpConnectionManager>`, wraps it in `McpResourceClientCacheKey`, and returns that key.
+**Data flow**: It loads the currently published manager from the replaceable holder. Then it turns the strong shared pointer into a weak pointer, which remembers identity without keeping the manager alive by itself. It wraps that weak pointer in `McpResourceClientCacheKey` and returns it.
 
-**Call relations**: This helper supports external memoization layers that need to invalidate cached resource data when the manager changes.
+**Call relations**: Callers use this before or after resource work when they need to detect manager replacement. It relies on `downgrade` to make the weak identity reference, and `McpResourceClientCacheKey::eq` later compares these keys by pointer identity.
 
 *Call graph*: 1 external calls (downgrade).
 
@@ -1392,11 +1402,11 @@ fn cache_key(&self) -> McpResourceClientCacheKey
 async fn has_server(&self, server: &str) -> bool
 ```
 
-**Purpose**: Checks whether the current manager contains a named server. It is a cheap existence probe and does not imply startup success.
+**Purpose**: Checks whether the current connection manager knows about a server with the given name. It is a quick presence check, not a promise that the server has started successfully.
 
-**Data flow**: Loads the current manager from `ArcSwap`, calls `contains_server(server)`, and returns the resulting boolean.
+**Data flow**: It receives a server name as text. It loads the current manager and asks whether that manager contains the server. It returns `true` or `false` and does not wait for any server startup work.
 
-**Call relations**: This is a direct pass-through to manager state, intended for callers that need to gate resource UI or requests on server presence.
+**Call relations**: This is used by code that wants to decide whether it makes sense to ask a named MCP server for resources. It fits before calls such as `list_resources` or `read_resource`, but it does not itself perform those calls.
 
 
 ##### `McpResourceClient::list_resources`  (lines 78–99)
@@ -1409,11 +1419,11 @@ async fn list_resources(
     ) -> Result<McpResourcePage>
 ```
 
-**Purpose**: Lists one page of resources from a named MCP server and converts them into protocol-layer resource values. It preserves the server-provided pagination cursor.
+**Purpose**: Asks a named MCP server for one page of resources it advertises. It supports continuing through long lists by accepting an optional cursor from a previous page.
 
-**Data flow**: Reads `server` and optional `cursor`. If a cursor is present it builds `PaginatedRequestParams::default().with_cursor(Some(cursor))`; otherwise it uses `None`. It loads the current manager, awaits `list_resources(server, params)`, maps each returned RMCP resource through `resource_from_rmcp`, collects them into `Vec<Resource>`, and returns `McpResourcePage { resources, next_cursor: result.next_cursor }`.
+**Data flow**: It receives a server name and, optionally, a cursor string. If a cursor is present, it builds paginated request parameters with that cursor. It loads the current connection manager, asks that manager to list resources from the server, converts each returned `rmcp` resource into Codex’s `Resource` type, and returns a `McpResourcePage` containing the converted resources plus the next cursor, if the server provided one. If the server call or conversion fails, it returns an error.
 
-**Call relations**: This method delegates transport and protocol interaction to `McpConnectionManager`, while this file owns the conversion into public resource types.
+**Call relations**: This is the main path for resource discovery. Higher-level code calls it when it wants to show or use available MCP resources. It delegates the actual server request to the current `McpConnectionManager`, then hands each raw resource to `resource_from_rmcp` so the rest of Codex sees the project’s own protocol type.
 
 
 ##### `McpResourceClient::read_resource`  (lines 102–114)
@@ -1422,11 +1432,11 @@ async fn list_resources(
 async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult>
 ```
 
-**Purpose**: Reads one resource URI from a named MCP server and converts the returned contents into protocol-layer `ResourceContent` values.
+**Purpose**: Reads the contents of one resource from a named MCP server. Callers use it after they know the resource URI they want.
 
-**Data flow**: Reads `server` and `uri`, loads the current manager, constructs `ReadResourceRequestParams::new(uri.to_string())`, awaits `read_resource`, maps each returned RMCP content item through `resource_content_from_rmcp`, collects them into `Vec<ResourceContent>`, and returns `McpResourceReadResult { contents }`.
+**Data flow**: It receives a server name and a resource URI. It creates read-resource request parameters from the URI, loads the current connection manager, and asks that manager to read the resource. It converts each returned content item into Codex’s `ResourceContent` type and returns them inside `McpResourceReadResult`. If the read or conversion fails, it returns an error.
 
-**Call relations**: Like `list_resources`, this method is a thin facade over `McpConnectionManager` plus local type conversion.
+**Call relations**: This is the main path for fetching actual resource data after discovery. It creates the external request parameter object with `new`, sends the request through the current `McpConnectionManager`, and then uses `resource_content_from_rmcp` to translate the reply into the type used by Codex.
 
 *Call graph*: 1 external calls (new).
 
@@ -1437,11 +1447,11 @@ async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceRead
 fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource>
 ```
 
-**Purpose**: Converts one RMCP resource into the protocol-layer `Resource` type with contextual error messages. It uses JSON as the compatibility bridge between the two models.
+**Purpose**: Converts a resource object from the external `rmcp` library into Codex’s own `Resource` type. This keeps the rest of the code from depending directly on the external library’s data shape.
 
-**Data flow**: Consumes `rmcp::model::Resource`, serializes it to `serde_json::Value` with context `failed to serialize MCP resource`, then calls `Resource::from_mcp_value(value)` with context `failed to convert MCP resource`, returning the resulting `anyhow::Result<Resource>`.
+**Data flow**: It receives an `rmcp` resource. It first serializes that resource into generic JSON data, then asks Codex’s `Resource::from_mcp_value` to build a `Resource` from that JSON. It returns the converted resource or an error with context explaining whether serialization or conversion failed.
 
-**Call relations**: This helper is used by `McpResourceClient::list_resources` for per-item conversion.
+**Call relations**: This helper is used by `McpResourceClient::list_resources` for every resource returned by the connection manager. It calls `to_value` to make generic JSON and `from_mcp_value` to turn that JSON into the Codex protocol model.
 
 *Call graph*: calls 1 internal fn (from_mcp_value); 1 external calls (to_value).
 
@@ -1452,24 +1462,26 @@ fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource>
 fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent>
 ```
 
-**Purpose**: Converts one RMCP resource-content payload into the protocol-layer `ResourceContent` type. It also uses JSON as the conversion boundary and annotates failures.
+**Purpose**: Converts resource content from the external `rmcp` library into Codex’s own `ResourceContent` type. This makes read results consistent with the rest of the project’s protocol objects.
 
-**Data flow**: Consumes `rmcp::model::ResourceContents`, serializes it to JSON with context `failed to serialize MCP resource content`, then deserializes that value into `ResourceContent` with context `failed to convert MCP resource content`, returning the result.
+**Data flow**: It receives one `rmcp` resource-content item. It serializes it into generic JSON, then deserializes that JSON into `ResourceContent`. It returns the converted content or an error that says whether serialization or conversion failed.
 
-**Call relations**: This helper is used by `McpResourceClient::read_resource` for per-content conversion.
+**Call relations**: This helper is used by `McpResourceClient::read_resource` for each content item returned by a server. It relies on standard JSON conversion helpers, `to_value` and `from_value`, to bridge between the external type and Codex’s internal protocol type.
 
 *Call graph*: 2 external calls (from_value, to_value).
 
 
 ### `codex-mcp/src/mcp/mod.rs`
 
-`orchestration` · `config-derived server setup and MCP snapshot/request handling`
+`orchestration` · `cross-cutting: active during MCP setup, resource reads, status snapshots, and tool discovery`
 
-This module is the public MCP surface for the crate. It starts by re-exporting auth helpers from `auth.rs`, then defines core runtime-facing types: `McpSnapshotDetail` controls whether snapshots include resources, `McpConfig` carries long-lived MCP settings copied from the root application config, `ToolPluginProvenance` maps connector IDs and MCP server names back to plugin display names and IDs, and `McpServerStatusSnapshot` is the normalized aggregate returned to callers. The file also owns constants for the built-in apps server and tool-name qualification.
+MCP, the Model Context Protocol, lets Codex talk to outside tool servers. This file is the central control panel for that feature. It gathers long-lived MCP settings into McpConfig, filters the configured servers into the servers that should actually run, and builds helper objects that explain where tools came from, such as which plugin supplied them.
 
-A major responsibility here is deriving the effective server map. `configured_mcp_servers` pulls registrations from the resolved catalog, `host_owned_codex_apps_enabled` gates the built-in apps server on both config and ChatGPT-backed auth, and `effective_mcp_servers_from_configured` removes that server when runtime auth is unavailable without synthesizing anything new. For runtime operations, `read_mcp_resource` and `collect_mcp_server_status_snapshot_with_detail` both compute auth statuses first, create an `McpConnectionManager` with approval policy, runtime context, cache key, plugin provenance, and cancellation token, then perform the requested read or snapshot and cancel the manager afterward.
+A key job here is deciding whether the special ChatGPT-hosted “Codex apps” MCP server should be present. It is only kept when the config enables it and the current login uses the Codex backend. Without this check, Codex could try to use a hosted app server when the user is not authenticated for it.
 
-The module also contains several normalization helpers that are easy to miss: tool names are sanitized to Responses API constraints without lowercasing; ChatGPT base URLs are rewritten to legacy `/backend-api/wham/apps` or `/api/codex/apps` forms depending on host/path; and RMCP tool/resource/resource-template values are serialized through JSON and converted into protocol-layer types, logging and dropping only the malformed entries rather than failing the whole snapshot.
+The file also creates standard server configs for hosted app and plugin MCP endpoints, including URL shaping and optional product headers. It contains safety helpers too, such as cleaning tool names so they fit the Responses API naming rules, and deciding when permission prompts can be automatically approved.
+
+For live work, it builds an McpConnectionManager, asks it to read a resource or list tools/resources, converts raw MCP library data into Codex protocol types, and then cancels the temporary manager. Think of it as a dispatcher: it does not implement every tool, but it decides which tool stations are open, connects to them, and packages their answers for the rest of Codex.
 
 #### Function details
 
@@ -1479,11 +1491,11 @@ The module also contains several normalization helpers that are easy to miss: to
 fn include_resources(self) -> bool
 ```
 
-**Purpose**: Returns whether a snapshot request should include resources and resource templates. Only `Full` snapshots include them.
+**Purpose**: This small helper says whether a status snapshot should include MCP resources and resource templates, or only tools and authentication. It lets callers request a lighter snapshot when resources are not needed.
 
-**Data flow**: Consumes `self` by value and returns a boolean computed from whether the enum variant is `Full`.
+**Data flow**: It receives the snapshot detail setting. If the setting is Full, it returns true; if it is ToolsAndAuthOnly, it returns false. It does not change anything else.
 
-**Call relations**: This helper is used inside snapshot collection to decide whether to call the manager's resource-listing APIs or substitute empty maps.
+**Call relations**: The snapshot collector uses this decision before asking the connection manager to list resources and resource templates. It keeps the heavier resource queries out of snapshots that only need tools and auth state.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1494,11 +1506,11 @@ fn include_resources(self) -> bool
 fn qualified_mcp_tool_name_prefix(server_name: &str) -> String
 ```
 
-**Purpose**: Builds the model-visible prefix for tools from one MCP server. The prefix uses the legacy `mcp__{server}__` shape and sanitizes disallowed characters.
+**Purpose**: This builds the standard prefix Codex uses when exposing a server's MCP tools to the model. The prefix includes the MCP marker and the server name, then cleans the result so it is safe for the Responses API.
 
-**Data flow**: Reads `server_name`, formats `mcp__{server_name}__`, passes that string through `sanitize_responses_api_tool_name`, and returns the sanitized prefix.
+**Data flow**: It takes a server name, forms a string like an MCP namespace prefix, passes that string through the tool-name sanitizer, and returns the cleaned prefix.
 
-**Call relations**: This helper delegates the character-level cleanup to `sanitize_responses_api_tool_name` so callers get a Responses-API-safe namespace prefix.
+**Call relations**: It hands off to sanitize_responses_api_tool_name because server names can contain characters the API does not allow. Other tool-normalizing code can then use this prefix when presenting MCP tools to the model.
 
 *Call graph*: calls 1 internal fn (sanitize_responses_api_tool_name); 1 external calls (format!).
 
@@ -1513,11 +1525,11 @@ fn mcp_permission_prompt_is_auto_approved(
 ) -> bool
 ```
 
-**Purpose**: Determines whether an MCP permission prompt should be treated as already approved instead of shown to the user. It combines per-tool approval mode, global approval policy, and the active permission profile.
+**Purpose**: This decides whether Codex can skip showing a permission prompt for an MCP action and treat it as approved. It protects the user by only allowing auto-approval under specific policy and sandbox conditions.
 
-**Data flow**: Reads `approval_policy`, a borrowed `PermissionProfile`, and `McpPermissionPromptAutoApproveContext`. It returns true immediately when `tool_approval_mode` is `Some(AppToolApproval::Approve)`. Otherwise it rejects all policies except `AskForApproval::Never`, then returns true for `PermissionProfile::Disabled` and `External`, and for `Managed` only when the file-system sandbox policy grants full disk write access.
+**Data flow**: It reads the global approval policy, the current permission profile, and an extra context value for app tool approval mode. If the app explicitly says approve, it returns true. Otherwise, it only returns true when prompts are globally disabled and the permission profile is either disabled, external, or a managed profile with full disk write access.
 
-**Call relations**: This is pure policy logic used by higher-level MCP prompting flows. It does not delegate further because the approval decision is encoded entirely in the passed enums and profile.
+**Call relations**: This is used by MCP approval flows to decide whether a prompt should be shown or silently accepted. It depends on policy objects rather than calling other helpers, so the decision stays clear and local.
 
 
 ##### `ToolPluginProvenance::plugin_display_names_for_connector_id`  (lines 159–164)
@@ -1526,11 +1538,11 @@ fn mcp_permission_prompt_is_auto_approved(
 fn plugin_display_names_for_connector_id(&self, connector_id: &str) -> &[String]
 ```
 
-**Purpose**: Looks up plugin display names associated with an app connector ID. Missing connector IDs produce an empty slice rather than an allocation.
+**Purpose**: This looks up the human-readable plugin names associated with an app connector ID. It is used when Codex wants to explain where a connector-backed tool came from.
 
-**Data flow**: Reads `self.plugin_display_names_by_connector_id`, performs a map lookup by `connector_id`, converts the stored `Vec<String>` to `&[String]` when present, and otherwise returns a shared empty slice.
+**Data flow**: It receives a connector ID string, checks the stored map, and returns a slice of plugin display names. If there is no match, it returns an empty slice rather than failing.
 
-**Call relations**: This accessor is used when annotating tools that carry connector metadata so the session can attribute them to plugins.
+**Call relations**: The with_app_plugin_sources flow calls this when attaching plugin source information to app tools. The data it reads is prepared earlier by ToolPluginProvenance::from_config.
 
 *Call graph*: called by 1 (with_app_plugin_sources).
 
@@ -1541,11 +1553,11 @@ fn plugin_display_names_for_connector_id(&self, connector_id: &str) -> &[String]
 fn plugin_display_names_for_mcp_server_name(&self, server_name: &str) -> &[String]
 ```
 
-**Purpose**: Looks up plugin display names associated with an MCP server name. It is the fallback attribution path for tools without connector IDs.
+**Purpose**: This looks up which plugin display names are tied to a particular MCP server name. It helps user-facing views say that a tool or server was supplied by a plugin.
 
-**Data flow**: Reads `self.plugin_display_names_by_mcp_server_name`, returns the stored vector as a slice when present, or `&[]` when absent.
+**Data flow**: It receives an MCP server name, reads the stored server-to-plugin-name map, and returns the matching names. If none are known, it returns an empty slice.
 
-**Call relations**: This accessor is consumed by tool-annotation logic when provenance is attached at the server level rather than connector level.
+**Call relations**: This is part of the provenance object built from configuration. Other MCP presentation code can call it when it needs to show plugin attribution for a server.
 
 
 ##### `ToolPluginProvenance::plugin_id_for_mcp_server_name`  (lines 173–177)
@@ -1554,11 +1566,11 @@ fn plugin_display_names_for_mcp_server_name(&self, server_name: &str) -> &[Strin
 fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str>
 ```
 
-**Purpose**: Returns the plugin ID associated with an MCP server name, if one was recorded from catalog attribution. It exposes IDs as `&str` borrowed from internal `String` storage.
+**Purpose**: This returns the stable plugin ID for an MCP server, when Codex knows one. The ID is useful for internal tracking, while display names are better for users.
 
-**Data flow**: Reads `self.plugin_ids_by_mcp_server_name`, looks up `server_name`, and maps the stored `String` to `&str` with `String::as_str`.
+**Data flow**: It receives a server name, looks in the stored map of server names to plugin IDs, and returns either the matching string or no value.
 
-**Call relations**: This is a read-only accessor for callers that need stable plugin identity rather than display names.
+**Call relations**: It reads information assembled by ToolPluginProvenance::from_config. Callers use it when they need the plugin's identity rather than just its display name.
 
 
 ##### `ToolPluginProvenance::is_selected_plugin_mcp_server`  (lines 179–181)
@@ -1567,11 +1579,11 @@ fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str>
 fn is_selected_plugin_mcp_server(&self, server_name: &str) -> bool
 ```
 
-**Purpose**: Reports whether a server name belongs to the set of selected plugin MCP servers. This distinguishes selected-plugin registrations from unrelated local summaries.
+**Purpose**: This tells whether a server came from a selected plugin MCP registration. That matters when Codex needs to distinguish selected plugin servers from other configured servers.
 
-**Data flow**: Checks membership of `server_name` in `self.selected_plugin_mcp_server_names` and returns the boolean result.
+**Data flow**: It receives a server name and checks whether that name is present in the stored selected-plugin set. It returns true or false and does not modify the set.
 
-**Call relations**: This helper supports provenance-sensitive logic that treats selected plugin servers specially.
+**Call relations**: The selected set is filled by ToolPluginProvenance::from_config. This helper gives the rest of the MCP code a simple yes-or-no question to ask.
 
 
 ##### `ToolPluginProvenance::from_config`  (lines 183–231)
@@ -1580,11 +1592,11 @@ fn is_selected_plugin_mcp_server(&self, server_name: &str) -> bool
 fn from_config(config: &McpConfig) -> Self
 ```
 
-**Purpose**: Builds plugin provenance indexes from `McpConfig`. It merges connector-level plugin summaries with MCP-server-level catalog attributions, then sorts and deduplicates display-name lists.
+**Purpose**: This builds the lookup tables that explain which plugins contributed which connectors and MCP servers. It turns raw configuration and catalog attribution into fast, tidy provenance data.
 
-**Data flow**: Reads `config.plugin_capability_summaries` to populate `plugin_display_names_by_connector_id`, then reads `config.mcp_server_catalog.plugin_attributions_by_server_name()` to populate `plugin_display_names_by_mcp_server_name` and `plugin_ids_by_mcp_server_name`. It extends `selected_plugin_mcp_server_names` from `selected_plugin_server_names()`, sorts and deduplicates every display-name vector in both maps, and returns the assembled `ToolPluginProvenance`.
+**Data flow**: It reads plugin capability summaries and the resolved MCP server catalog from McpConfig. It fills maps for connector IDs, server names, plugin IDs, and selected plugin server names, then sorts and removes duplicate display names. It returns a completed ToolPluginProvenance value.
 
-**Call relations**: This constructor is wrapped by `tool_plugin_provenance`. It intentionally trusts catalog attribution for MCP server names instead of joining arbitrary local plugin summaries, which the tests in `mod_tests.rs` verify.
+**Call relations**: tool_plugin_provenance calls this as the public wrapper. The resulting object is passed into McpConnectionManager creation for resource reads and snapshot collection, so later tool listings can carry source information.
 
 *Call graph*: called by 1 (tool_plugin_provenance); 2 external calls (default, vec!).
 
@@ -1595,11 +1607,11 @@ fn from_config(config: &McpConfig) -> Self
 fn host_owned_codex_apps_enabled(config: &McpConfig, auth: Option<&CodexAuth>) -> bool
 ```
 
-**Purpose**: Determines whether the built-in host-owned `codex_apps` MCP server should be active. It requires both config enablement and runtime auth that uses the Codex backend.
+**Purpose**: This decides whether the ChatGPT-hosted Codex apps MCP server should be available. It requires both configuration approval and a compatible Codex login.
 
-**Data flow**: Reads `config.apps_enabled` and the optional `CodexAuth`; returns true only when apps are enabled and `auth.is_some_and(CodexAuth::uses_codex_backend)`.
+**Data flow**: It reads the apps_enabled flag from McpConfig and checks whether an optional auth object exists and uses the Codex backend. It returns true only when both conditions are met.
 
-**Call relations**: This gate is consulted when deriving effective servers and when constructing managers for reads and snapshots so the built-in apps server only appears in authenticated sessions.
+**Call relations**: effective_mcp_servers_from_configured uses this to remove the built-in apps server when it should not run. read_mcp_resource and collect_mcp_server_status_snapshot_with_detail also pass the result into the connection manager.
 
 *Call graph*: called by 3 (collect_mcp_server_status_snapshot_with_detail, effective_mcp_servers_from_configured, read_mcp_resource).
 
@@ -1610,11 +1622,11 @@ fn host_owned_codex_apps_enabled(config: &McpConfig, auth: Option<&CodexAuth>) -
 fn configured_mcp_servers(config: &McpConfig) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Returns the configured MCP server map from the resolved catalog. It is the raw, auth-agnostic server set.
+**Purpose**: This returns the MCP servers that are configured in the resolved server catalog. It is the starting list before auth-based filtering is applied.
 
-**Data flow**: Reads `config.mcp_server_catalog` and returns the `HashMap<String, McpServerConfig>` produced by `configured_servers()`.
+**Data flow**: It reads the server catalog from McpConfig and asks it for configured servers. It returns a map from logical server name to server configuration.
 
-**Call relations**: This is the first step in `effective_mcp_servers`, separating catalog extraction from auth gating.
+**Call relations**: effective_mcp_servers calls this first, then hands the map to effective_mcp_servers_from_configured so the runtime view can be adjusted for authentication.
 
 *Call graph*: called by 1 (effective_mcp_servers).
 
@@ -1628,11 +1640,11 @@ fn effective_mcp_servers(
 ) -> HashMap<String, EffectiveMcpServer>
 ```
 
-**Purpose**: Builds the runtime-visible MCP server map from config and optional auth. It starts from configured servers and applies auth-based filtering.
+**Purpose**: This produces the MCP server list Codex should actually use right now. It starts with configured servers and then applies runtime checks such as whether hosted apps are allowed for the current login.
 
-**Data flow**: Calls `configured_mcp_servers(config)` to obtain the raw map, then passes that map plus `config` and `auth` into `effective_mcp_servers_from_configured`, returning the filtered `HashMap<String, EffectiveMcpServer>`.
+**Data flow**: It receives config and optional auth. It gets the configured server map, passes it along with config and auth to effective_mcp_servers_from_configured, and returns the filtered map of effective servers.
 
-**Call relations**: This is the public entry point used by snapshot collection and resource reads before they create a connection manager.
+**Call relations**: read_mcp_resource and collect_mcp_server_status_snapshot_with_detail call this before opening MCP connections. It is the common doorway for turning configuration into a usable runtime server list.
 
 *Call graph*: calls 2 internal fn (configured_mcp_servers, effective_mcp_servers_from_configured); called by 2 (collect_mcp_server_status_snapshot_with_detail, read_mcp_resource).
 
@@ -1647,11 +1659,11 @@ fn effective_mcp_servers_from_configured(
 ) -> HashMap<String, EffectiveMcpServer>
 ```
 
-**Purpose**: Converts a concrete configured server map into the auth-gated runtime view. It wraps each config in `EffectiveMcpServer::configured` and removes the built-in apps server when host-owned apps are not enabled.
+**Purpose**: This converts an already-built server map into the runtime server view. Its main special rule is to remove the host-owned Codex apps server when the current config or login does not permit it.
 
-**Data flow**: Consumes a `HashMap<String, McpServerConfig>`, maps each `(name, server)` to `(name, EffectiveMcpServer::configured(server))`, and collects into a new `HashMap`. It then checks `host_owned_codex_apps_enabled(config, auth)` and removes `CODEX_APPS_MCP_SERVER_NAME` when false before returning the map.
+**Data flow**: It receives a map of configured servers, wraps each one as an EffectiveMcpServer, checks whether host-owned apps are enabled, and removes the codex_apps entry if not. It returns the resulting server map.
 
-**Call relations**: This function is called only by `effective_mcp_servers`. Its design explicitly avoids synthesizing missing compatibility servers; it only filters and wraps what was already materialized.
+**Call relations**: effective_mcp_servers calls this after gathering configured servers. It calls host_owned_codex_apps_enabled to enforce the auth gate for the hosted apps server.
 
 *Call graph*: calls 1 internal fn (host_owned_codex_apps_enabled); called by 1 (effective_mcp_servers).
 
@@ -1662,11 +1674,11 @@ fn effective_mcp_servers_from_configured(
 fn tool_plugin_provenance(config: &McpConfig) -> ToolPluginProvenance
 ```
 
-**Purpose**: Builds the session's plugin provenance lookup tables from `McpConfig`. It is a small public wrapper around the internal constructor.
+**Purpose**: This is a small public wrapper that builds plugin provenance information from MCP config. It gives other code one simple call for attribution data.
 
-**Data flow**: Reads `config` and returns `ToolPluginProvenance::from_config(config)`.
+**Data flow**: It receives McpConfig, passes it to ToolPluginProvenance::from_config, and returns the resulting provenance object.
 
-**Call relations**: This helper is used by both snapshot collection and direct resource reads when constructing an `McpConnectionManager`.
+**Call relations**: read_mcp_resource and collect_mcp_server_status_snapshot_with_detail call this before creating an McpConnectionManager. The manager then has the plugin source information it needs while working with tools.
 
 *Call graph*: calls 1 internal fn (from_config); called by 2 (collect_mcp_server_status_snapshot_with_detail, read_mcp_resource).
 
@@ -1683,11 +1695,11 @@ async fn read_mcp_resource(
 ) -> anyhow::Result<ReadResourceResult>
 ```
 
-**Purpose**: Reads one resource URI from one MCP server using a short-lived connection manager. It narrows the effective server set to the requested server, computes auth statuses, constructs the manager, performs the read, and cancels the manager afterward.
+**Purpose**: This reads one resource URI from one MCP server. It creates a short-lived MCP connection manager, asks for the resource, and then shuts the manager down.
 
-**Data flow**: Reads `config`, optional `auth`, `runtime_context`, `server`, and `uri`. It derives effective servers, computes whether host-owned apps are enabled, retains only the named server in the map, computes auth statuses for that reduced set, creates an unused event channel and cancellation token, then awaits `McpConnectionManager::new(...)` with approval policy, cache key, provenance, auth, and runtime context. It calls `manager.read_resource(server, ReadResourceRequestParams::new(uri))`, cancels the token, and returns the resulting `ReadResourceResult` or propagated error.
+**Data flow**: It receives config, optional auth, runtime context, a server name, and a resource URI. It builds the current effective server map, keeps only the requested server, computes auth status, creates an event channel and cancellation token, starts an McpConnectionManager, asks it to read the resource, cancels the temporary manager, and returns the read result or an error.
 
-**Call relations**: This function is a direct orchestration path for one-off resource reads. It depends on `effective_mcp_servers`, `host_owned_codex_apps_enabled`, `compute_auth_statuses`, and `tool_plugin_provenance` to prepare the manager, then delegates the actual protocol operation to `McpConnectionManager`.
+**Call relations**: This function pulls together many helpers: effective_mcp_servers chooses available servers, host_owned_codex_apps_enabled applies hosted-app rules, compute_auth_statuses prepares login state, codex_apps_tools_cache_key supplies the apps cache key, and tool_plugin_provenance adds plugin attribution. It hands the actual network/protocol work to McpConnectionManager::new and then to the manager's read_resource method.
 
 *Call graph*: calls 7 internal fn (codex_apps_tools_cache_key, new, compute_auth_statuses, effective_mcp_servers, host_owned_codex_apps_enabled, tool_plugin_provenance, default); 4 external calls (new, new, new, unbounded).
 
@@ -1703,11 +1715,11 @@ async fn collect_mcp_server_status_snapshot_with_detail(
     detail: McpSnapshotDet
 ```
 
-**Purpose**: Collects a normalized snapshot of available MCP servers, tools, optional resources, and auth statuses. It creates a short-lived connection manager over the effective server set and converts manager outputs into protocol-layer structures.
+**Purpose**: This collects a snapshot of MCP server status for reporting or UI use. The snapshot can include server info, tools, auth states, and optionally resources and resource templates.
 
-**Data flow**: Reads `config`, optional `auth`, `submit_id`, `runtime_context`, and `detail`. It derives effective servers and provenance, returns an all-empty `McpServerStatusSnapshot` immediately when no servers exist, otherwise computes auth status entries, captures server names, creates an event channel and cancellation token, constructs `McpConnectionManager::new(...)`, then awaits `collect_mcp_server_status_snapshot_from_manager(...)`. Afterward it cancels the token and returns the snapshot.
+**Data flow**: It receives config, optional auth, a submit ID, runtime context, and a detail level. It builds the effective server map, returns an empty snapshot if there are no servers, computes auth statuses, creates a temporary connection manager, asks a helper to gather the snapshot data, cancels the manager, and returns the snapshot.
 
-**Call relations**: This is the main snapshot orchestration entry point. It prepares all manager dependencies itself, then delegates the actual listing and conversion work to `collect_mcp_server_status_snapshot_from_manager`.
+**Call relations**: This is the high-level snapshot flow. It uses effective_mcp_servers, host_owned_codex_apps_enabled, compute_auth_statuses, codex_apps_tools_cache_key, and tool_plugin_provenance to set up the manager, then delegates the actual listing and conversion work to collect_mcp_server_status_snapshot_from_manager.
 
 *Call graph*: calls 8 internal fn (codex_apps_tools_cache_key, new, compute_auth_statuses, collect_mcp_server_status_snapshot_from_manager, effective_mcp_servers, host_owned_codex_apps_enabled, tool_plugin_provenance, default); 4 external calls (new, new, new, unbounded).
 
@@ -1718,11 +1730,11 @@ async fn collect_mcp_server_status_snapshot_with_detail(
 fn sanitize_responses_api_tool_name(name: &str) -> String
 ```
 
-**Purpose**: Rewrites a tool name so it satisfies the Responses API character restriction `^[a-zA-Z0-9_-]+$`. It preserves ASCII alphanumerics and underscores and replaces every other character with `_`.
+**Purpose**: This cleans a tool name so it follows the Responses API rule that names contain only letters, numbers, and underscores. It prevents user-controlled MCP server or tool names from breaking API requests.
 
-**Data flow**: Reads `name`, allocates a `String` with matching capacity, iterates over characters, pushes the original character when it is ASCII alphanumeric or `_`, otherwise pushes `_`. If the result is empty it returns `_`; otherwise it returns the sanitized string.
+**Data flow**: It receives a name string, walks through each character, keeps ASCII letters, digits, and underscores, and replaces everything else with an underscore. If the result would be empty, it returns a single underscore.
 
-**Call relations**: This helper is used by `qualified_mcp_tool_name_prefix` and other tool-normalization code to ensure model-visible names are protocol-safe without changing case.
+**Call relations**: qualified_mcp_tool_name_prefix calls this when building MCP tool prefixes. Tool-normalizing code also calls it when preparing final tool names for the model.
 
 *Call graph*: called by 2 (qualified_mcp_tool_name_prefix, normalize_tools_for_model_with_prefix); 1 external calls (with_capacity).
 
@@ -1733,11 +1745,11 @@ fn sanitize_responses_api_tool_name(name: &str) -> String
 fn codex_apps_mcp_bearer_token_env_var() -> Option<String>
 ```
 
-**Purpose**: Determines whether the built-in apps server should reference the `CODEX_CONNECTORS_TOKEN` environment variable. It treats non-empty and non-Unicode values as present, but ignores missing or whitespace-only values.
+**Purpose**: This checks whether the environment variable for a Codex connectors bearer token should be used. A bearer token is a secret string sent with HTTP requests to prove authorization.
 
-**Data flow**: Reads process environment variable `CODEX_CONNECTORS_TOKEN`. It returns `Some("CODEX_CONNECTORS_TOKEN".to_string())` when the variable exists and is non-empty after trimming, or when it exists but is not valid Unicode; it returns `None` when absent or present but blank.
+**Data flow**: It reads the CODEX_CONNECTORS_TOKEN environment variable. If it is present and not blank, or present but not valid Unicode, it returns the variable name so the transport can read it later. If it is missing or blank, it returns no value.
 
-**Call relations**: This helper is called by `mcp_server_config_for_url` so generated built-in server configs can advertise bearer-token auth only when the ambient token variable is meaningfully present.
+**Call relations**: mcp_server_config_for_url calls this while building HTTP transport config for hosted MCP servers. The result tells the transport where to find an optional authorization token.
 
 *Call graph*: called by 1 (mcp_server_config_for_url); 1 external calls (var).
 
@@ -1748,11 +1760,11 @@ fn codex_apps_mcp_bearer_token_env_var() -> Option<String>
 fn normalize_codex_apps_base_url(base_url: &str) -> String
 ```
 
-**Purpose**: Normalizes a base URL for ChatGPT-hosted MCP endpoints. It strips trailing slashes and appends `/backend-api` for ChatGPT hosts that do not already include that path.
+**Purpose**: This standardizes ChatGPT base URLs before MCP endpoint paths are added. It removes trailing slashes and adds the backend API path for known ChatGPT hosts when needed.
 
-**Data flow**: Consumes `base_url` as `&str`, trims trailing `/`, then checks whether it starts with `https://chatgpt.com` or `https://chat.openai.com` and lacks `/backend-api`. In that case it returns a formatted `{base_url}/backend-api`; otherwise it returns the trimmed base URL unchanged.
+**Data flow**: It receives a base URL string, trims trailing slash characters, and, for chatgpt.com or chat.openai.com URLs without /backend-api, appends /backend-api. It returns the normalized URL.
 
-**Call relations**: This helper feeds both built-in URL constructors so they can preserve explicit paths while still supporting legacy ChatGPT host defaults.
+**Call relations**: codex_apps_mcp_url_for_base_url and hosted_plugin_runtime_mcp_server_config both call this before constructing their final MCP endpoint URLs.
 
 *Call graph*: called by 2 (codex_apps_mcp_url_for_base_url, hosted_plugin_runtime_mcp_server_config); 1 external calls (format!).
 
@@ -1763,11 +1775,11 @@ fn normalize_codex_apps_base_url(base_url: &str) -> String
 fn codex_apps_mcp_url_for_base_url(base_url: &str) -> String
 ```
 
-**Purpose**: Builds the default MCP endpoint URL for the host-owned apps server from a base URL. It preserves existing `/backend-api` or `/api/codex` paths and chooses the legacy `wham/apps` suffix when appropriate.
+**Purpose**: This builds the exact HTTP URL for the ChatGPT-hosted Codex apps MCP server. It adapts to different base URL shapes so callers can provide either a root URL or an API URL.
 
-**Data flow**: Normalizes `base_url`, then branches: if it contains `/backend-api`, it uses suffix `wham/apps`; if it contains `/api/codex`, it uses suffix `apps`; otherwise it appends `/api/codex` first and then suffix `apps`. It returns the final formatted URL string.
+**Data flow**: It receives a base URL, normalizes it, chooses the right default path based on whether the URL already contains /backend-api or /api/codex, and returns the final apps MCP URL.
 
-**Call relations**: This helper is used by `codex_apps_mcp_server_config` to derive the built-in apps endpoint from the root ChatGPT base URL.
+**Call relations**: codex_apps_mcp_server_config calls this first, then uses the URL to build a full McpServerConfig.
 
 *Call graph*: calls 1 internal fn (normalize_codex_apps_base_url); called by 1 (codex_apps_mcp_server_config); 1 external calls (format!).
 
@@ -1781,11 +1793,11 @@ fn codex_apps_mcp_server_config(
 ) -> McpServerConfig
 ```
 
-**Purpose**: Constructs the built-in `codex_apps` MCP server configuration for the host-owned apps endpoint. It resolves the endpoint URL and delegates the common config assembly.
+**Purpose**: This creates the full MCP server configuration for the ChatGPT-hosted Codex apps server. It hides the URL and transport details behind a simple function.
 
-**Data flow**: Reads `chatgpt_base_url` and optional `apps_mcp_product_sku`, computes the endpoint with `codex_apps_mcp_url_for_base_url`, passes that URL and SKU into `mcp_server_config_for_url`, and returns the resulting `McpServerConfig`.
+**Data flow**: It receives the ChatGPT base URL and an optional product SKU. It builds the apps MCP URL, passes that URL and SKU to mcp_server_config_for_url, and returns the completed server config.
 
-**Call relations**: This is the public constructor for the built-in apps server config and shares its low-level assembly logic with the hosted plugin runtime variant.
+**Call relations**: It uses codex_apps_mcp_url_for_base_url for the endpoint and mcp_server_config_for_url for the shared HTTP server settings.
 
 *Call graph*: calls 2 internal fn (codex_apps_mcp_url_for_base_url, mcp_server_config_for_url).
 
@@ -1799,11 +1811,11 @@ fn hosted_plugin_runtime_mcp_server_config(
 ) -> McpServerConfig
 ```
 
-**Purpose**: Constructs the ChatGPT-hosted plugin runtime MCP server configuration served by plugin-service. It normalizes the base URL and targets the `/ps/mcp` endpoint.
+**Purpose**: This creates the full MCP server configuration for the hosted plugin runtime served by plugin-service. It is similar to the apps server config, but points at the plugin runtime path.
 
-**Data flow**: Reads `chatgpt_base_url` and optional SKU, normalizes the base URL, ensures it contains either `/backend-api` or `/api/codex` by appending `/api/codex` when needed, formats `{base_url}/ps/mcp`, and passes that URL into `mcp_server_config_for_url`.
+**Data flow**: It receives the ChatGPT base URL and optional product SKU. It normalizes the base URL, ensures it has an API base when needed, appends /ps/mcp, and passes the final URL to mcp_server_config_for_url.
 
-**Call relations**: This is a sibling of `codex_apps_mcp_server_config`, differing only in endpoint path selection before delegating to the shared config builder.
+**Call relations**: It shares the same lower-level config builder as the apps server. normalize_codex_apps_base_url prepares the base URL, and mcp_server_config_for_url fills in transport defaults.
 
 *Call graph*: calls 2 internal fn (mcp_server_config_for_url, normalize_codex_apps_base_url); 1 external calls (format!).
 
@@ -1814,11 +1826,11 @@ fn hosted_plugin_runtime_mcp_server_config(
 fn mcp_server_config_for_url(url: String, apps_mcp_product_sku: Option<&str>) -> McpServerConfig
 ```
 
-**Purpose**: Builds a standard enabled streamable-HTTP `McpServerConfig` for a given URL. It injects the optional product SKU header, optional bearer-token env var, default environment ID, and standard timeout/default flags.
+**Purpose**: This builds a standard HTTP-based McpServerConfig for a hosted MCP endpoint. It centralizes defaults such as timeout, environment ID, enabled state, and optional product headers.
 
-**Data flow**: Consumes a URL string and optional SKU. It creates `http_headers` as `Some(HashMap::from([("X-OpenAI-Product-Sku", sku)]))` when a SKU is present, calls `codex_apps_mcp_bearer_token_env_var()` for `bearer_token_env_var`, and returns a fully populated `McpServerConfig` with `StreamableHttp { url, bearer_token_env_var, http_headers, env_http_headers: None }`, enabled=true, required=false, startup timeout 30 seconds, no OAuth/scopes/tool filters, and an empty `tools` map.
+**Data flow**: It receives a URL and optional product SKU. If a SKU is provided, it creates an HTTP header for it. It also checks whether a bearer-token environment variable is available, then returns an McpServerConfig using streamable HTTP transport and default hosted-server settings.
 
-**Call relations**: This shared constructor is used by both built-in server config helpers so they stay structurally identical apart from URL and optional SKU header.
+**Call relations**: codex_apps_mcp_server_config and hosted_plugin_runtime_mcp_server_config both call this so they get the same transport behavior. It calls codex_apps_mcp_bearer_token_env_var to wire in optional token-based authorization.
 
 *Call graph*: calls 1 internal fn (codex_apps_mcp_bearer_token_env_var); called by 2 (codex_apps_mcp_server_config, hosted_plugin_runtime_mcp_server_config); 2 external calls (from_secs, new).
 
@@ -1829,11 +1841,11 @@ fn mcp_server_config_for_url(url: String, apps_mcp_product_sku: Option<&str>) ->
 fn protocol_tool_from_rmcp_tool(name: &str, tool: &rmcp::model::Tool) -> Option<Tool>
 ```
 
-**Purpose**: Converts an RMCP tool definition into the protocol-layer `Tool` type used by snapshots. Serialization or conversion failures are logged and dropped.
+**Purpose**: This converts a tool object from the rmcp library's format into Codex's protocol format. If conversion fails, it logs a warning and skips that tool instead of crashing the whole snapshot.
 
-**Data flow**: Reads a tool name and borrowed `rmcp::model::Tool`, serializes the RMCP tool to `serde_json::Value`, then calls `Tool::from_mcp_value`. On success it returns `Some(Tool)`; on serialization or conversion error it logs a warning containing the tool name and returns `None`.
+**Data flow**: It receives a tool name and an rmcp tool. It serializes the tool to JSON, asks Codex's Tool type to read that JSON, and returns the converted tool on success. On serialization or conversion failure, it logs what went wrong and returns no tool.
 
-**Call relations**: This helper is used while assembling snapshot tool maps in `collect_mcp_server_status_snapshot_from_manager`, allowing malformed tools to be skipped without aborting the whole snapshot.
+**Call relations**: collect_mcp_server_status_snapshot_from_manager calls this for each listed MCP tool. This keeps the snapshot builder working even if one server returns a malformed or unsupported tool description.
 
 *Call graph*: calls 1 internal fn (from_mcp_value); called by 1 (collect_mcp_server_status_snapshot_from_manager); 2 external calls (to_value, warn!).
 
@@ -1846,11 +1858,11 @@ fn auth_statuses_from_entries(
 ) -> HashMap<String, McpAuthStatus>
 ```
 
-**Purpose**: Strips `McpAuthStatusEntry` values down to the plain `McpAuthStatus` map needed in snapshots. It discards the cloned config payloads.
+**Purpose**: This extracts the public authentication status values from richer internal auth status entries. It prepares auth data for the final snapshot shape.
 
-**Data flow**: Reads a `HashMap<String, McpAuthStatusEntry>`, iterates over entries, clones each server name, copies `entry.auth_status`, and collects the pairs into a new `HashMap<String, McpAuthStatus>`.
+**Data flow**: It receives a map from server name to auth status entry. For each entry, it copies the server name and the entry's auth_status field into a new map, then returns that map.
 
-**Call relations**: This helper is called only by `collect_mcp_server_status_snapshot_from_manager` when finalizing the snapshot structure.
+**Call relations**: collect_mcp_server_status_snapshot_from_manager calls this while assembling the final McpServerStatusSnapshot. It strips the data down to what the snapshot needs.
 
 *Call graph*: called by 1 (collect_mcp_server_status_snapshot_from_manager).
 
@@ -1863,11 +1875,11 @@ fn convert_mcp_resources(
 ) -> HashMap<String, Vec<Resource>>
 ```
 
-**Purpose**: Converts RMCP resource lists into protocol-layer `Resource` lists keyed by server name. Individual malformed resources are logged and omitted.
+**Purpose**: This converts resource descriptions from the rmcp library into Codex protocol Resource objects. Bad individual resources are logged and left out, so one broken resource does not ruin the whole list.
 
-**Data flow**: Consumes `HashMap<String, Vec<rmcp::model::Resource>>`. For each server it serializes each RMCP resource to JSON, attempts `Resource::from_mcp_value`, and collects successful conversions. On conversion failure it inspects the serialized object for `uri` and `name` fields to enrich the warning log; on serialization failure it logs a generic warning. It returns a new `HashMap<String, Vec<Resource>>`.
+**Data flow**: It receives a map of server names to rmcp resources. For each resource, it serializes it to JSON and asks Codex's Resource type to parse it. Successful resources are collected under the same server name; failed ones are skipped after a warning that tries to include the URI and name.
 
-**Call relations**: This conversion step is part of snapshot assembly in `collect_mcp_server_status_snapshot_from_manager`, isolating lossy resource normalization from the orchestration code.
+**Call relations**: collect_mcp_server_status_snapshot_from_manager calls this after listing resources from the connection manager. The converted map goes directly into the returned status snapshot.
 
 *Call graph*: called by 1 (collect_mcp_server_status_snapshot_from_manager).
 
@@ -1880,11 +1892,11 @@ fn convert_mcp_resource_templates(
 ) -> HashMap<String, Vec<ResourceTemplate>>
 ```
 
-**Purpose**: Converts RMCP resource-template lists into protocol-layer `ResourceTemplate` lists keyed by server name. It logs and drops only the malformed templates.
+**Purpose**: This converts rmcp resource templates into Codex protocol ResourceTemplate objects. A resource template is a pattern for resource URIs, like a form with blanks to fill in.
 
-**Data flow**: Consumes `HashMap<String, Vec<rmcp::model::ResourceTemplate>>`. For each template it serializes to JSON, attempts `ResourceTemplate::from_mcp_value`, and collects successes. On conversion failure it extracts `uriTemplate` or `uri_template` plus `name` from the serialized object when possible for warning context; serialization failures are also logged. It returns a new `HashMap<String, Vec<ResourceTemplate>>`.
+**Data flow**: It receives a map of server names to rmcp resource templates. It serializes each template to JSON, parses it into Codex's ResourceTemplate type, and collects successful conversions. If a template cannot be converted, it logs a warning with the template URI and name when possible, then skips it.
 
-**Call relations**: This helper mirrors `convert_mcp_resources` and is used during snapshot finalization.
+**Call relations**: collect_mcp_server_status_snapshot_from_manager calls this after listing resource templates. The resulting map is placed in the final snapshot alongside tools, resources, server info, and auth status.
 
 *Call graph*: called by 1 (collect_mcp_server_status_snapshot_from_manager).
 
@@ -1898,11 +1910,11 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     server_
 ```
 
-**Purpose**: Queries an already constructed `McpConnectionManager` for tools, optional resources, resource templates, and server info, then converts everything into an `McpServerStatusSnapshot`. It is the low-level snapshot assembler used after manager setup is complete.
+**Purpose**: This gathers status information from an already-created MCP connection manager and packages it into an McpServerStatusSnapshot. It is the lower-level worker behind the public snapshot function.
 
-**Data flow**: Reads a borrowed manager, auth status entries, server names, and `detail`. It concurrently awaits `list_all_tools`, conditional `list_all_resources`, and conditional `list_all_resource_templates` with `tokio::join!`, then separately awaits `list_available_server_infos`. It converts each listed tool through `protocol_tool_from_rmcp_tool` and groups successful results into `HashMap<String, HashMap<String, Tool>>` by server and tool name. Finally it converts resources and templates with the dedicated helpers, derives plain auth statuses with `auth_statuses_from_entries`, and returns a populated `McpServerStatusSnapshot`.
+**Data flow**: It receives a connection manager, auth status entries, the server names to report, and a detail setting. It asks the manager for tools, and, when requested, resources and resource templates. It also asks for available server info. Then it converts raw tools and resources into Codex protocol types, builds maps by server, converts auth entries into simple statuses, and returns the final snapshot.
 
-**Call relations**: This function is called by `collect_mcp_server_status_snapshot_with_detail` after the connection manager has been created. It delegates all type conversion to helper functions so the orchestration layer stays focused on manager lifecycle.
+**Call relations**: collect_mcp_server_status_snapshot_with_detail creates the manager and calls this helper. This function calls the manager's listing methods, uses protocol_tool_from_rmcp_tool for tools, convert_mcp_resources and convert_mcp_resource_templates for resource data, and auth_statuses_from_entries for auth data.
 
 *Call graph*: calls 5 internal fn (list_available_server_infos, auth_statuses_from_entries, convert_mcp_resource_templates, convert_mcp_resources, protocol_tool_from_rmcp_tool); called by 1 (collect_mcp_server_status_snapshot_with_detail); 2 external calls (new, join!).
 
@@ -1912,15 +1924,13 @@ These files shape MCP tools for model visibility, adapt them into the core tool 
 
 ### `codex-mcp/src/tools.rs`
 
-`domain_logic` · `tool discovery, cache refresh, and model-facing tool list generation`
+`domain_logic` · `tool discovery and tool listing`
 
-This module sits between raw MCP protocol tool definitions and the names/schema fragments exposed to the model. `ToolInfo` preserves both worlds at once: raw routing fields such as `server_name` and `tool.name`, plus model-visible `callable_namespace` and `callable_name`, optional connector metadata, and telemetry fields like `server_origin` and `supports_parallel_tool_calls`. `canonical_tool_name` converts the visible namespace/name pair into a `codex_protocol::ToolName`.
+MCP servers can publish tools with raw names and schemas that are valid for the server, but not always safe or clear for the model-facing API. This file is the translation desk between those two worlds. It keeps the original server and tool names so calls can still be routed back correctly, while creating clean model-visible names that fit API limits and do not collide with one another. Think of it like assigning public display names to people at a conference while keeping their legal names in the registration system.
 
-Filtering is explicit and per-server. `ToolFilter::from_config` converts `enabled_tools` and `disabled_tools` lists from `McpServerConfig` into `HashSet`s, and `allows` implements the invariant documented above the type: an allowlist, if present, must contain the tool, and the denylist always wins.
+The central data type is `ToolInfo`, which stores both the raw MCP details and the model-facing namespace and tool name. `ToolFilter` applies per-server allow and block lists, so a configuration can expose only certain tools. The schema helpers look for metadata that says a parameter is an OpenAI file input, then rewrite that part of the tool schema so the model is told to provide an absolute local file path.
 
-Schema shaping is narrowly targeted. `declared_openai_file_input_param_names` reads `meta["openai/fileParams"]` as a string array. `tool_with_model_visible_input_schema` clones the tool only when such parameters exist, then rewrites matching property schemas so the model sees plain string or string-array file path inputs with appended guidance text, while the cached/raw tool remains untouched.
-
-The largest routine, `normalize_tools_for_model_with_prefix`, sanitizes namespaces and names, optionally prepends the legacy `mcp__` prefix, drops exact duplicate raw identities with a warning, detects collisions introduced by sanitization, appends SHA-1-derived suffixes where needed, sorts deterministically by raw identity, and finally enforces the 64-byte API limit through `unique_callable_parts`. That helper repeatedly hashes/truncates namespace and tool parts until the concatenated visible name is unique and short enough.
+The largest job here is name normalization. MCP tool names may contain invalid characters, duplicate each other after cleanup, or be too long. The code sanitizes names, optionally adds the older `mcp__` prefix, detects collisions, appends short SHA-1 hash suffixes when needed, trims names to the 64-byte limit, and sorts the result for stable output.
 
 #### Function details
 
@@ -1930,11 +1940,11 @@ The largest routine, `normalize_tools_for_model_with_prefix`, sanitizes namespac
 fn canonical_tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Builds the canonical namespaced tool identifier used by protocol and search/spec generation code from the model-visible namespace and name stored on `ToolInfo`.
+**Purpose**: Builds the standard full tool name from the model-visible namespace and tool name. This gives other parts of the system one consistent label to use when referring to a tool.
 
-**Data flow**: Reads `self.callable_namespace` and `self.callable_name`, clones both strings, passes them to `ToolName::namespaced`, and returns the resulting `ToolName`.
+**Data flow**: It reads `callable_namespace` and `callable_name` from one `ToolInfo` value, combines them through `ToolName::namespaced`, and returns a `ToolName`. It does not change the tool information.
 
-**Call relations**: Called when downstream code needs a stable combined tool identifier, including tool spec creation and search text generation. It delegates the actual identifier construction to `ToolName::namespaced`.
+**Call relations**: When other code needs a stable tool label, such as while naming a tool, building MCP search text, or creating a tool specification, it calls this method. This method hands the two visible name parts to the shared `namespaced` constructor so the format stays consistent.
 
 *Call graph*: calls 1 internal fn (namespaced); called by 3 (tool_name, build_mcp_search_text, create_tool_spec).
 
@@ -1947,11 +1957,11 @@ fn declared_openai_file_input_param_names(
 ) -> Vec<String>
 ```
 
-**Purpose**: Extracts the list of parameter names declared in tool metadata as OpenAI file-path inputs.
+**Purpose**: Finds which tool parameters have been marked as file-input parameters. These are parameters where the model should provide a local file path rather than ordinary free-form text.
 
-**Data flow**: Accepts `Option<&Map<String, JsonValue>>`. If absent, it returns an empty `Vec<String>`. Otherwise it reads the `openai/fileParams` entry, requires it to be an array, keeps only non-empty string elements, converts them to owned `String`s, and returns them.
+**Data flow**: It receives optional metadata from a tool. If the metadata contains an `openai/fileParams` array, it keeps the non-empty string entries and returns them as a list of parameter names. If the metadata is missing or malformed, it returns an empty list.
 
-**Call relations**: Used only by `tool_with_model_visible_input_schema` to decide whether schema masking is necessary and which properties should be rewritten.
+**Call relations**: `tool_with_model_visible_input_schema` calls this first to decide whether any schema rewriting is needed. If this function returns no names, the later masking step can be skipped.
 
 *Call graph*: called by 1 (tool_with_model_visible_input_schema); 1 external calls (new).
 
@@ -1962,11 +1972,11 @@ fn declared_openai_file_input_param_names(
 fn from_config(cfg: &McpServerConfig) -> Self
 ```
 
-**Purpose**: Builds a runtime filter from an MCP server’s configured enabled/disabled tool lists.
+**Purpose**: Turns a server configuration into a simple filter object that can answer whether each tool should be exposed. It captures both an optional allow list and a block list.
 
-**Data flow**: Reads `cfg.enabled_tools` and `cfg.disabled_tools` from `&McpServerConfig`, clones listed tool names into `HashSet<String>` collections, stores the allowlist as `Option<HashSet<_>>`, defaults the denylist to empty when absent, and returns a `ToolFilter`.
+**Data flow**: It reads `enabled_tools` and `disabled_tools` from an `McpServerConfig`. Enabled tools become an optional set, disabled tools become a set or an empty set, and the function returns a `ToolFilter` containing those rules.
 
-**Call relations**: Provides the filter object consumed later by `filter_tools`; it is the bridge from static config to runtime filtering semantics.
+**Call relations**: This is the setup step for filtering. Once configuration has been converted into a `ToolFilter`, later code can call `allows` for each tool name instead of repeatedly reading the raw configuration.
 
 
 ##### `ToolFilter::allows`  (lines 105–113)
@@ -1975,11 +1985,11 @@ fn from_config(cfg: &McpServerConfig) -> Self
 fn allows(&self, tool_name: &str) -> bool
 ```
 
-**Purpose**: Evaluates whether a raw MCP tool name passes the configured allowlist/denylist rules.
+**Purpose**: Answers the practical question: should this named tool be available? A tool is allowed only if it is in the allow list when one exists, and it is not in the block list.
 
-**Data flow**: Reads `self.enabled`, `self.disabled`, and the `tool_name` argument. If an allowlist exists and does not contain the name, it returns `false`; otherwise it returns `true` only if the denylist does not contain the name.
+**Data flow**: It receives a tool name. It first checks the optional enabled set; if that set exists and the name is absent, it returns `false`. Otherwise it checks the disabled set and returns `false` for blocked names or `true` for allowed names.
 
-**Call relations**: Called from `filter_tools` for each candidate tool. Its short-circuit structure encodes the documented precedence: allowlist gate first, denylist veto second.
+**Call relations**: `filter_tools` uses this rule while walking through discovered tools. This method is the small decision point that turns configuration rules into keep-or-drop choices.
 
 
 ##### `tool_with_model_visible_input_schema`  (lines 119–132)
@@ -1988,11 +1998,11 @@ fn allows(&self, tool_name: &str) -> bool
 fn tool_with_model_visible_input_schema(tool: &Tool) -> Tool
 ```
 
-**Purpose**: Produces a model-facing clone of a tool whose input schema hides raw file-upload schema details behind simple file path parameters.
+**Purpose**: Creates the version of a tool schema that should be shown to the model, especially for file inputs. It preserves the raw tool for execution but changes the visible schema so file parameters are described as absolute local file paths.
 
-**Data flow**: Takes `&Tool`, reads `tool.meta` to collect file parameter names via `declared_openai_file_input_param_names`, and returns `tool.clone()` unchanged if none are declared. Otherwise it clones the tool, clones `tool.input_schema` into a mutable `JsonValue::Object`, rewrites matching properties through `mask_input_schema_for_file_path_params`, and if the result remains an object stores it back into `tool.input_schema` as a new `Arc` before returning the modified clone.
+**Data flow**: It takes a tool definition and reads its metadata. If no file parameters are declared, it returns a clone of the tool unchanged. If file parameters exist, it clones the tool, edits the input schema for those parameters, and returns the modified clone.
 
-**Call relations**: Used at manager return boundaries and tested directly for both no-op and masking behavior. It delegates metadata extraction and per-property schema rewriting to helper functions so cached/raw tool definitions remain untouched.
+**Call relations**: This is called at boundaries where tools are returned for model use, including tests that verify both unchanged and masked cases. It first asks `declared_openai_file_input_param_names` which fields matter, then passes the schema to `mask_input_schema_for_file_path_params` to rewrite those fields.
 
 *Call graph*: calls 2 internal fn (declared_openai_file_input_param_names, mask_input_schema_for_file_path_params); called by 2 (tool_with_model_visible_input_schema_leaves_tools_without_file_params_unchanged, tool_with_model_visible_input_schema_masks_file_params); 3 external calls (new, Object, clone).
 
@@ -2003,11 +2013,11 @@ fn tool_with_model_visible_input_schema(tool: &Tool) -> Tool
 fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<ToolInfo>
 ```
 
-**Purpose**: Applies a `ToolFilter` to a list of `ToolInfo` values using each tool’s raw MCP name.
+**Purpose**: Removes tools that are not allowed by a `ToolFilter`. This is how per-server configuration changes the actual tool list that gets exposed.
 
-**Data flow**: Consumes `Vec<ToolInfo>` and borrows a `ToolFilter`; iterates through the vector, keeps only entries where `filter.allows(&tool.tool.name)` is true, and returns the filtered vector.
+**Data flow**: It receives a list of `ToolInfo` values and a filter. It checks each tool's raw MCP name against the filter and returns a new list containing only the allowed tools.
 
-**Call relations**: Called during cache refresh, server startup, and tool listing flows after tools have been discovered. It delegates the actual policy decision to `ToolFilter::allows`.
+**Call relations**: Tool listing and cache refresh paths call this before exposing tools, including server startup and listed-tool flows. It relies on `ToolFilter::allows` for the yes-or-no decision for each tool.
 
 *Call graph*: called by 4 (hard_refresh_codex_apps_tools_cache, filter_tools_applies_per_server_filters, listed_tools, start_server_task).
 
@@ -2021,11 +2031,11 @@ fn normalize_tools_for_model_with_prefix(
 ) -> Vec<ToolInfo>
 ```
 
-**Purpose**: Transforms raw `ToolInfo` entries into a deterministic, sanitized, collision-free set of model-visible tool names and namespaces that satisfy API naming limits.
+**Purpose**: Converts raw tool records into model-safe tool records with clean, unique, length-limited visible names. This is what prevents two different MCP tools from accidentally looking identical to the model.
 
-**Data flow**: Consumes any iterator of `ToolInfo` plus a `prefix_mcp_tool_names` flag. It first builds raw namespace/tool identity strings, drops exact duplicate raw identities while logging a warning, sanitizes namespace and tool names, and stores intermediate `CallableToolCandidate`s. It then detects namespace collisions after sanitization and appends namespace hash suffixes, detects tool-name collisions within each namespace and appends tool hash suffixes, sorts candidates by raw identity for deterministic output, and finally runs `unique_callable_parts` with a shared `used_names` set to enforce uniqueness and the 64-byte limit. The returned `Vec<ToolInfo>` contains the original tool metadata with `tool.callable_namespace` and `tool.callable_name` rewritten to the final visible values.
+**Data flow**: It receives tool records and a flag saying whether to add the legacy `mcp__` prefix. For each tool, it builds raw identities, skips exact duplicates, sanitizes namespace and tool names, detects namespace and tool-name collisions, adds hash suffixes where needed, sorts the results for stable output, and finally ensures every full model name is unique and within the maximum length. It returns the normalized list.
 
-**Call relations**: Used by tool-listing and cache-refresh paths, and heavily exercised by normalization tests. It delegates sanitization to `sanitize_responses_api_tool_name`, prefix handling to `callable_namespace_with_prefix`, collision suffixing to `append_hash_suffix`/`append_namespace_hash_suffix`, and final length-safe uniqueness to `unique_callable_parts`.
+**Call relations**: This function is used when refreshing cached tools and listing all tools, and it is heavily tested for duplicate names, invalid characters, long names, and collision cases. It coordinates the smaller helpers: sanitizing names, adding prefixes, appending hashes, and fitting names under the API limit.
 
 *Call graph*: calls 5 internal fn (sanitize_responses_api_tool_name, append_hash_suffix, append_namespace_hash_suffix, callable_namespace_with_prefix, unique_callable_parts); called by 9 (hard_refresh_codex_apps_tools_cache, list_all_tools, test_normalize_tools_disambiguates_sanitized_namespace_collisions, test_normalize_tools_disambiguates_sanitized_tool_name_collisions, test_normalize_tools_duplicated_names_skipped, test_normalize_tools_keeps_hyphenated_mcp_tools_callable, test_normalize_tools_long_names_same_server, test_normalize_tools_sanitizes_invalid_characters, test_normalize_tools_short_non_duplicated_names); 6 external calls (new, new, new, new, format!, warn!).
 
@@ -2036,11 +2046,11 @@ fn normalize_tools_for_model_with_prefix(
 fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) -> String
 ```
 
-**Purpose**: Applies the historical `mcp__` prefix to a sanitized namespace when requested, without double-prefixing names that already have it.
+**Purpose**: Adds the legacy MCP namespace prefix when requested. It avoids adding the prefix twice if the namespace already starts with it.
 
-**Data flow**: Reads the `namespace` string and `prefix_mcp_tool_names` flag. It returns the namespace unchanged if prefixing is disabled or the namespace already starts with `mcp__`; otherwise it returns a newly formatted prefixed string.
+**Data flow**: It receives a namespace and a boolean flag. If prefixing is disabled, or the namespace already begins with `mcp__`, it returns the namespace unchanged. Otherwise it returns a new string with `mcp__` in front.
 
-**Call relations**: Called during normalization before collision detection so prefixed namespaces participate in the same uniqueness logic as all other visible names.
+**Call relations**: `normalize_tools_for_model_with_prefix` calls this after sanitizing each namespace. It is the small compatibility step that keeps older naming behavior available without reintroducing the old full naming format.
 
 *Call graph*: called by 1 (normalize_tools_for_model_with_prefix); 1 external calls (format!).
 
@@ -2051,11 +2061,11 @@ fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) 
 fn mask_input_schema_for_file_path_params(input_schema: &mut JsonValue, file_params: &[String])
 ```
 
-**Purpose**: Rewrites selected properties inside a JSON Schema object so declared file parameters appear as simple file path inputs.
+**Purpose**: Finds the schema entries for parameters that should be treated as file paths and rewrites only those entries. This makes file-related inputs clearer to the model without changing unrelated parameters.
 
-**Data flow**: Takes a mutable `JsonValue` expected to be an object schema and a slice of file parameter names. It navigates to `schema.properties`, returns early if the structure is missing or not object-shaped, then for each named field looks up the property schema and passes it to `mask_input_property_schema`.
+**Data flow**: It receives a mutable JSON schema and a list of parameter names. It looks inside the schema's `properties` object, finds matching fields, and passes each matching field schema to `mask_input_property_schema`. If the schema does not have the expected shape, it leaves it unchanged.
 
-**Call relations**: Invoked only by `tool_with_model_visible_input_schema` after that function has cloned the schema into mutable JSON. It delegates the actual property rewrite to `mask_input_property_schema`.
+**Call relations**: `tool_with_model_visible_input_schema` calls this after identifying file parameters. This function then delegates the actual per-field rewrite to `mask_input_property_schema`.
 
 *Call graph*: calls 1 internal fn (mask_input_property_schema); called by 1 (tool_with_model_visible_input_schema); 1 external calls (as_object_mut).
 
@@ -2066,11 +2076,11 @@ fn mask_input_schema_for_file_path_params(input_schema: &mut JsonValue, file_par
 fn mask_input_property_schema(schema: &mut JsonValue)
 ```
 
-**Purpose**: Collapses an individual property schema into either a string or array-of-strings file path parameter while preserving or augmenting human-readable description text.
+**Purpose**: Rewrites one parameter schema so it clearly asks for an absolute local file path. It keeps the schema simple and prevents the model from thinking it should upload or construct a complex object.
 
-**Data flow**: Accepts `&mut JsonValue`; if it is not an object, it returns immediately. Otherwise it reads any existing `description`, appends a fixed guidance sentence unless already present, detects array-ness from `type == "array"` or presence of `items`, clears the original object entirely, then writes back only `description` plus either `type: "string"` or `type: "array"` with `items: {"type":"string"}`.
+**Data flow**: It receives one JSON schema value. If the value is an object, it reads or creates a description, appends file-path guidance if needed, detects whether the original looked like an array, clears the old details, and writes back either a string schema or an array-of-strings schema with the improved description.
 
-**Call relations**: Called for each matching file parameter by `mask_input_schema_for_file_path_params`. Its destructive rewrite is intentional: model-visible schemas should not expose the original richer upload/file schema shape.
+**Call relations**: `mask_input_schema_for_file_path_params` calls this for each declared file parameter found in a tool's input schema. It is the final step that changes the visible schema text and type.
 
 *Call graph*: called by 1 (mask_input_schema_for_file_path_params); 4 external calls (String, as_object_mut, format!, json!).
 
@@ -2081,11 +2091,11 @@ fn mask_input_property_schema(schema: &mut JsonValue)
 fn sha1_hex(s: &str) -> String
 ```
 
-**Purpose**: Computes the lowercase hexadecimal SHA-1 digest of an input string for deterministic suffix generation.
+**Purpose**: Computes a SHA-1 hash as hexadecimal text. Here, the hash is used as a compact fingerprint for a raw tool identity when names need to be disambiguated.
 
-**Data flow**: Creates a `Sha1` hasher, feeds it the UTF-8 bytes of `s`, finalizes the digest, formats it as lowercase hex, and returns the resulting `String`.
+**Data flow**: It receives a string, feeds its bytes into a SHA-1 hasher, finalizes the hash, and returns the hash as lowercase hexadecimal text.
 
-**Call relations**: Used only by `callable_name_hash_suffix` as the primitive hash function behind collision and truncation suffixes.
+**Call relations**: `callable_name_hash_suffix` calls this when it needs a stable short fingerprint. The hash then becomes part of a tool or namespace name to separate otherwise-colliding names.
 
 *Call graph*: called by 1 (callable_name_hash_suffix); 2 external calls (new, format!).
 
@@ -2096,11 +2106,11 @@ fn sha1_hex(s: &str) -> String
 fn callable_name_hash_suffix(raw_identity: &str) -> String
 ```
 
-**Purpose**: Builds the standard short hash suffix appended to visible tool names and namespaces when disambiguation is required.
+**Purpose**: Creates the short hash suffix used in model-visible names. This gives two similar-looking tools a small, stable difference based on their raw identity.
 
-**Data flow**: Takes a raw identity string, computes its SHA-1 hex via `sha1_hex`, slices the first `CALLABLE_NAME_HASH_LEN` characters, prefixes them with `_`, and returns that suffix string.
+**Data flow**: It receives a raw identity string, hashes it with `sha1_hex`, keeps the configured leading part of the hash, prefixes it with an underscore, and returns that suffix.
 
-**Call relations**: Called by `fit_callable_parts_with_hash`, which uses the suffix while shortening names to fit API limits.
+**Call relations**: `fit_callable_parts_with_hash` uses this when shortening names, and other hash-appending helpers depend on the same suffix format. This keeps all disambiguation suffixes consistent.
 
 *Call graph*: calls 1 internal fn (sha1_hex); called by 1 (fit_callable_parts_with_hash); 1 external calls (format!).
 
@@ -2111,11 +2121,11 @@ fn callable_name_hash_suffix(raw_identity: &str) -> String
 fn append_hash_suffix(value: &str, raw_identity: &str) -> String
 ```
 
-**Purpose**: Appends the standard hash suffix directly to an existing visible name.
+**Purpose**: Adds a short identity-based hash suffix to a name. This is used when a cleaned-up name would otherwise collide with another cleaned-up name.
 
-**Data flow**: Reads `value` and `raw_identity`, computes the suffix through `callable_name_hash_suffix`, concatenates them, and returns the new string.
+**Data flow**: It receives a visible name and the raw identity it represents. It builds a hash suffix from the raw identity and returns the original name followed by that suffix.
 
-**Call relations**: Used both for direct tool-name collision handling in normalization and as the fallback path in `append_namespace_hash_suffix`.
+**Call relations**: `normalize_tools_for_model_with_prefix` calls this for colliding tool names. `append_namespace_hash_suffix` also uses it when a namespace does not need special delimiter handling.
 
 *Call graph*: called by 2 (append_namespace_hash_suffix, normalize_tools_for_model_with_prefix); 1 external calls (format!).
 
@@ -2126,11 +2136,11 @@ fn append_hash_suffix(value: &str, raw_identity: &str) -> String
 fn append_namespace_hash_suffix(namespace: &str, raw_identity: &str) -> String
 ```
 
-**Purpose**: Adds a hash suffix to a namespace while preserving a trailing MCP delimiter when present.
+**Purpose**: Adds a hash suffix to a namespace while preserving a trailing namespace delimiter when one is present. This keeps names readable and still separates colliding namespaces.
 
-**Data flow**: Reads `namespace` and `raw_identity`. If the namespace ends with `MCP_TOOL_NAME_DELIMITER` (`"__"`), it strips that suffix, inserts the hash suffix before it, and reattaches the delimiter; otherwise it delegates to `append_hash_suffix` and returns that result.
+**Data flow**: It receives a namespace and raw namespace identity. If the namespace ends with the MCP delimiter, it inserts the hash before that delimiter. Otherwise it simply appends the hash suffix to the namespace. The result is a disambiguated namespace string.
 
-**Call relations**: Called during namespace collision resolution inside `normalize_tools_for_model_with_prefix` so namespaced forms that intentionally end with the delimiter keep that shape after disambiguation.
+**Call relations**: `normalize_tools_for_model_with_prefix` calls this when two different raw namespaces sanitize to the same visible namespace. It calls `append_hash_suffix` for the simpler case without a trailing delimiter.
 
 *Call graph*: calls 1 internal fn (append_hash_suffix); called by 1 (normalize_tools_for_model_with_prefix); 1 external calls (format!).
 
@@ -2141,11 +2151,11 @@ fn append_namespace_hash_suffix(namespace: &str, raw_identity: &str) -> String
 fn truncate_name(value: &str, max_len: usize) -> String
 ```
 
-**Purpose**: Truncates a string by Unicode scalar count rather than byte count.
+**Purpose**: Shortens a name to a maximum number of characters. It is used when a model-visible name must fit within the API length limit.
 
-**Data flow**: Reads `value`, takes at most `max_len` characters via `.chars().take(max_len)`, collects them into a new `String`, and returns it.
+**Data flow**: It receives a string and a maximum character count. It takes characters from the start up to that count and returns the shortened string.
 
-**Call relations**: Used by `fit_callable_parts_with_hash` when either the tool name or namespace must be shortened to satisfy the maximum visible-name length.
+**Call relations**: `fit_callable_parts_with_hash` calls this when either the tool name or namespace needs to be cut down to make room for a hash suffix and the required delimiter space.
 
 *Call graph*: called by 1 (fit_callable_parts_with_hash).
 
@@ -2161,11 +2171,11 @@ fn fit_callable_parts_with_hash(
 ) -> (String, String)
 ```
 
-**Purpose**: Produces a namespace/tool-name pair that fits within the global length limit by attaching a hash suffix and truncating the tool name first, then the namespace if necessary.
+**Purpose**: Builds namespace and tool-name parts that fit within the maximum allowed model name length while still including a hash. This is the fallback when the original visible name is too long or already used.
 
-**Data flow**: Accepts namespace, tool name, raw identity, and reserved length. It computes the hash suffix, calculates how much room remains under `MAX_TOOL_NAME_LENGTH`, and if the tool portion can still hold some prefix plus suffix, returns the original namespace with a truncated tool prefix plus suffix. Otherwise it truncates the namespace to the remaining space and returns that truncated namespace with the suffix alone as the tool name.
+**Data flow**: It receives a namespace, tool name, raw identity, and reserved length. It creates a hash suffix, calculates how much space remains, and either truncates the tool name to make room for the suffix or, if space is very tight, truncates the namespace and uses the suffix as the tool name. It returns the adjusted pair.
 
-**Call relations**: Called from `unique_callable_parts` whenever the plain concatenated name is too long or already used. It encapsulates the file’s length-budget policy.
+**Call relations**: `unique_callable_parts` calls this whenever the straightforward namespace-plus-tool-name cannot be used. This helper does the careful length budgeting so the caller can focus on uniqueness.
 
 *Call graph*: calls 2 internal fn (callable_name_hash_suffix, truncate_name); called by 1 (unique_callable_parts); 1 external calls (format!).
 
@@ -2182,22 +2192,24 @@ fn unique_callable_parts(
 ) -> (String, String)
 ```
 
-**Purpose**: Finds a final namespace/tool-name pair that is both unique among already-used visible names and short enough for the API limit.
+**Purpose**: Chooses final model-visible namespace and tool-name parts that are both unique and short enough. It is the last guardrail before normalized tools are returned.
 
-**Data flow**: Reads the proposed namespace, tool name, raw identity, mutable `used_names` set, and reserved length. If the plain concatenation fits and is unused, it inserts that combined name into `used_names` and returns the original parts. Otherwise it loops with an incrementing attempt counter, deriving a hash input from `raw_identity` plus the attempt number, calling `fit_callable_parts_with_hash`, and inserting the resulting concatenation into `used_names` once a unique candidate is found; it then returns that pair.
+**Data flow**: It receives candidate namespace and tool-name strings, the raw identity, a shared set of already-used full names, and reserved length. It first tries the plain combined name. If that is too long or already taken, it repeatedly asks `fit_callable_parts_with_hash` for a hashed version, changing the hash input on later attempts until it finds an unused name. It records the chosen full name and returns the two final parts.
 
-**Call relations**: This is the final arbitration step in `normalize_tools_for_model_with_prefix`, after earlier passes have already handled obvious collisions. The retry loop ensures deterministic progress even if a hashed candidate itself collides.
+**Call relations**: `normalize_tools_for_model_with_prefix` calls this for each candidate after collision detection and sorting. This function hands back the exact namespace and tool name that are written into the final `ToolInfo`.
 
 *Call graph*: calls 1 internal fn (fit_callable_parts_with_hash); called by 1 (normalize_tools_for_model_with_prefix); 1 external calls (format!).
 
 
 ### `core/src/mcp_tool_exposure.rs`
 
-`domain_logic` · `tool inventory construction before model tool exposure`
+`domain_logic` · `tool list preparation`
 
-This file contains the production logic that turns the full discovered MCP tool inventory into an `McpToolExposure` split: `direct_tools` that are injected into the model-visible tool list immediately, and optional `deferred_tools` that remain discoverable only through search. The central function first gathers all non-Codex-Apps MCP tools that are model-visible, then optionally adds Codex Apps tools that belong to currently available connectors and are enabled by `AppToolPolicyEvaluator` against the current `ConfigLayerStack`.
+MCP tools are outside capabilities that the model can call, a bit like tools in a toolbox. If the toolbox is small, it is fine to lay every tool on the table. If it is huge, showing everything at once can confuse the model and waste space, so this file decides whether to expose tools directly or defer them so they can be found through search.
 
-The design intentionally treats Codex Apps differently from ordinary MCP servers. Non-app tools are filtered only by server name and `tool_is_model_visible`. Codex Apps tools must also have a `connector_id`, correspond to one of the supplied `connectors::AppInfo` entries, and pass per-tool policy evaluation using connector ID, tool name/title, and destructive/open-world hints from annotations. After building this effective tool set, `build_mcp_tool_exposure` decides whether to defer it wholesale: deferral happens only when search is enabled and either the `ToolSearchAlwaysDeferMcpTools` feature is on or the effective tool count reaches `DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD` (100). If deferral is not needed, all effective tools are returned as `direct_tools`; otherwise `direct_tools` is emptied and `deferred_tools` is populated only when non-empty.
+The main entry point builds a filtered list of tools that are safe and appropriate for the model to know about. It first includes normal MCP tools, but only if they are marked as visible to the model. It then separately considers tools from the special Codex apps MCP server. Those app tools get extra checks: the connected app must be one of the allowed connectors, the tool must name its connector, it must be model-visible, and a policy evaluator must say the tool is enabled under the current configuration.
+
+After filtering, the file decides how to present the tools. If tool search is enabled and either a feature flag says to always defer MCP tools or there are at least 100 tools, the tools are placed in the deferred bucket. Otherwise, they are returned as direct tools. This protects the model from a long, noisy tool list while preserving access through search.
 
 #### Function details
 
@@ -2212,11 +2224,11 @@ fn build_mcp_tool_exposure(
 ) -> McpToolExposure
 ```
 
-**Purpose**: Builds the final direct-versus-deferred MCP tool exposure set from all discovered MCP tools, optional connector inventory, config, and search-tool availability.
+**Purpose**: This function makes the final decision about which MCP tools the model sees immediately and which ones are saved for later discovery through tool search. It is used when the system is building the model's available tool set.
 
-**Data flow**: Reads `all_mcp_tools`, `connectors`, `config.features`, and `search_tool_enabled`. It starts with non-Codex-Apps visible tools, optionally extends that list with allowed Codex Apps tools, computes `should_defer` based on search enablement plus either the always-defer feature or the threshold count, and returns `McpToolExposure { direct_tools, deferred_tools }` accordingly.
+**Data flow**: It receives the full MCP tool list, optional app connector information, the current configuration, and whether tool search is enabled. It filters out tools that should not be visible, adds allowed Codex app tools when connector data is available, then checks the feature settings and the number of tools. It returns a `McpToolExposure` value with either a direct tool list, a deferred tool list, or both arranged according to that decision.
 
-**Call relations**: Called by the broader tool-building flow after MCP discovery. It delegates the actual filtering to `filter_non_codex_apps_mcp_tools_only` and `filter_codex_apps_mcp_tools`, then performs the final policy of whether the resulting effective set is exposed directly or deferred to search.
+**Call relations**: When `built_tools` is assembling the tools for a run, it calls this function to decide how MCP tools should be exposed. This function delegates the two filtering jobs to `filter_non_codex_apps_mcp_tools_only` and `filter_codex_apps_mcp_tools`, then combines their results and applies the deferral rule.
 
 *Call graph*: calls 2 internal fn (filter_codex_apps_mcp_tools, filter_non_codex_apps_mcp_tools_only); called by 1 (built_tools); 1 external calls (new).
 
@@ -2227,11 +2239,11 @@ fn build_mcp_tool_exposure(
 fn filter_non_codex_apps_mcp_tools_only(mcp_tools: &[McpToolInfo]) -> Vec<McpToolInfo>
 ```
 
-**Purpose**: Selects only model-visible MCP tools that do not belong to the special Codex Apps server.
+**Purpose**: This function selects ordinary MCP tools that are not from the special Codex apps server and are allowed to be shown to the model. It keeps unrelated or hidden tools out of the direct candidate list.
 
-**Data flow**: Iterates over `mcp_tools`, keeps entries whose `server_name` is not `CODEX_APPS_MCP_SERVER_NAME` and for which `tool_is_model_visible(tool)` is true, clones those `McpToolInfo` values, and returns them as a `Vec`.
+**Data flow**: It receives a slice of MCP tool descriptions. It looks through each tool, keeps only tools whose server is not the Codex apps MCP server and whose metadata says the model may see them, then returns cloned copies of the matching tools as a new list.
 
-**Call relations**: Used as the first stage inside `build_mcp_tool_exposure` to gather ordinary MCP tools before any connector-aware filtering is applied.
+**Call relations**: `build_mcp_tool_exposure` calls this first to gather the baseline set of visible non-app MCP tools. Its output becomes part of the candidate tool list that may later be shown directly or deferred for search.
 
 *Call graph*: called by 1 (build_mcp_tool_exposure); 1 external calls (iter).
 
@@ -2246,26 +2258,26 @@ fn filter_codex_apps_mcp_tools(
 ) -> Vec<McpToolInfo>
 ```
 
-**Purpose**: Filters Codex Apps MCP tools down to those that are model-visible, belong to currently allowed connectors, and are enabled by app-tool policy.
+**Purpose**: This function selects MCP tools that come from Codex apps, but only when the connected app and the current policy allow them. It is the extra safety gate for app-provided tools.
 
-**Data flow**: Builds a `HashSet<&str>` of allowed connector IDs from `connectors`, constructs an `AppToolPolicyEvaluator` from `config.config_layer_stack`, then iterates `mcp_tools`. For each tool it rejects non-Codex-Apps servers, hidden tools, tools lacking `connector_id`, and tools whose connector is absent from the allowed set. For remaining tools it evaluates policy using connector ID, tool name/title, and destructive/open-world hints from annotations; only `enabled` tools are cloned into the returned vector.
+**Data flow**: It receives all MCP tools, the list of available app connectors, and the current configuration. It builds a quick lookup of allowed connector IDs, creates a policy evaluator from the configuration layers, then checks each tool from the Codex apps server. A tool is kept only if it is model-visible, has a connector ID, belongs to an allowed connector, and passes the app tool policy check using details such as the tool name, title, and hints about destructive or open-ended behavior. It returns cloned copies of the app tools that pass all checks.
 
-**Call relations**: Called only from `build_mcp_tool_exposure` when connector inventory is available, providing the Codex Apps-specific half of the effective exposure set.
+**Call relations**: `build_mcp_tool_exposure` calls this when connector information is available, so app tools can be added to the same exposure decision as other MCP tools. This function hands policy-approved app tools back to the main builder, which then decides whether they appear directly or through tool search.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (build_mcp_tool_exposure); 2 external calls (iter, iter).
 
 
 ### `core/src/tools/handlers/mcp.rs`
 
-`io_transport` · `request handling`
+`domain_logic` · `tool registration and tool-call handling`
 
-The central type is `McpHandler`, which stores the original `codex_mcp::ToolInfo` plus a prebuilt `ToolSpec`. Construction uses `create_tool_spec`, converting the MCP tool schema with `mcp_tool_to_responses_api_tool` and always exposing it as a single-tool `ToolSpec::Namespace(ResponsesApiNamespace)` under `tool_info.callable_namespace`. The namespace description prefers a nonblank `namespace_description`; otherwise it falls back to `Tools for working with {connector_name}.` when a connector name exists.
+This file is the adapter between external MCP tools and Codex’s internal tool system. Without it, a tool exposed by an MCP server might exist, but Codex would not know how to name it, show it to the model, call it, record telemetry for it, or let pre- and post-tool hooks inspect it.
 
-Execution metadata is richer than for most handlers. `supports_parallel_tool_calls` returns true either when the server explicitly opted in or when the MCP tool annotations carry `read_only_hint: true`. `search_info` builds a source label from connector name or server name and indexes a synthesized search text from `build_mcp_search_text`, which concatenates flattened tool names, callable names, server metadata, plugin display names, and sorted input-schema property names.
+The central type is `McpHandler`. It keeps two things: the original MCP tool information and a converted `ToolSpec`, which is the shape Codex uses when telling the model what tools are available. Think of it like a travel plug adapter: the outside tool keeps its own shape, but this file makes it fit Codex’s socket.
 
-For hooks, `hook_tool_name` derives a legacy-prefixed name like `mcp__filesystem__read_file` by joining namespace and tool name with `__`, trimming redundant underscores, and ensuring the `mcp__` prefix is present even for builtin-looking namespaces. `pre_tool_use_payload` parses raw JSON arguments with `mcp_hook_tool_input`, `with_updated_hook_input` rewrites function arguments by serializing updated JSON back into the invocation payload, and `post_tool_use_payload` asks the output object for normalized hook input/response values.
+When a tool call arrives, the handler checks that the call is a normal function-style call with JSON arguments. It then forwards the call to the MCP execution layer, measures how long it took, and wraps the result in Codex’s standard tool-output format.
 
-`handle_call` accepts only function payloads, times the call with `Instant`, delegates to `handle_mcp_tool_call`, and wraps the returned MCP result plus normalized tool input, elapsed wall time, original-image-detail capability, and truncation policy into `McpToolOutput`. The file's tests focus on hook naming, payload rewriting, and parallel-call policy.
+The file also standardizes names for hooks. MCP hook names are given an `mcp__` prefix and combine namespace plus tool name with `__`, so they do not collide with built-in tools. It also builds searchable text from the tool’s name, description, server, connector, plugin labels, and parameter names, so tool discovery can find the right external tool. The tests lock down these naming, rewriting, post-hook, and parallel-call rules.
 
 #### Function details
 
@@ -2275,11 +2287,11 @@ For hooks, `hook_tool_name` derives a legacy-prefixed name like `mcp__filesystem
 fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error>
 ```
 
-**Purpose**: Constructs an MCP runtime handler from discovered `ToolInfo` and precomputes its advertised tool spec.
+**Purpose**: Creates a new MCP tool handler from raw MCP tool information. It also prepares the tool description that Codex will later show to the model.
 
-**Data flow**: Takes ownership of `ToolInfo`, calls `create_tool_spec(&tool_info)` which may fail with `serde_json::Error`, and on success returns `McpHandler { tool_info, spec }`.
+**Data flow**: It receives a `ToolInfo` record from MCP discovery. It passes that record into `create_tool_spec` to convert the MCP description into Codex’s internal tool specification. If conversion succeeds, it returns an `McpHandler` holding both the original MCP information and the converted spec; if the JSON schema cannot be converted, it returns that error.
 
-**Call relations**: It is used during MCP runtime-tool registration and in tests. All later metadata and execution methods rely on the stored `tool_info` and prebuilt `spec` created here.
+**Call relations**: This is called when MCP runtime tools are added, and also by tests that build sample handlers. It delegates the format conversion to `create_tool_spec`, then the resulting handler is used later for naming, searching, hook payloads, and actual tool execution.
 
 *Call graph*: calls 1 internal fn (create_tool_spec); called by 7 (mcp_post_tool_use_payload_uses_prefixed_tool_name_args_and_result, mcp_pre_tool_use_payload_keeps_builtin_like_tool_names_namespaced, mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args, mcp_updated_input_rewrites_builtin_like_tool_names_as_mcp, search_info_uses_connector_name_for_output_namespace_description, search_info_uses_mcp_tool_metadata_and_parameter_names, add_mcp_runtime_tools).
 
@@ -2290,11 +2302,11 @@ fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error>
 fn hook_tool_name(&self) -> HookToolName
 ```
 
-**Purpose**: Builds the normalized hook-visible tool name for this MCP tool, preserving MCP identity even for builtin-like namespaces.
+**Purpose**: Builds the safe, standardized name used when this MCP tool is reported to hook code. Hooks are extension points that can inspect or modify tool activity before or after a call.
 
-**Data flow**: Calls `self.tool_name()` to get the canonical `ToolName`, passes it through `join_tool_name`, then `ensure_mcp_prefix`, and finally wraps the resulting string in `HookToolName::new`.
+**Data flow**: It reads the handler’s canonical tool name, joins the namespace and name into one string, makes sure the string starts with `mcp__`, and wraps it as a `HookToolName`. The output is a hook-facing name such as `mcp__filesystem__read_file`.
 
-**Call relations**: This helper is used by `handle_call`, `pre_tool_use_payload`, and `post_tool_use_payload` so all hook and execution paths agree on the same MCP-prefixed name.
+**Call relations**: This helper is used before a tool call, after a tool call, and during the actual MCP call. It relies on `McpHandler::tool_name`, `join_tool_name`, and `ensure_mcp_prefix` so all hook-related paths use the same naming rule.
 
 *Call graph*: calls 4 internal fn (tool_name, ensure_mcp_prefix, join_tool_name, new); called by 3 (handle_call, post_tool_use_payload, pre_tool_use_payload).
 
@@ -2305,11 +2317,11 @@ fn hook_tool_name(&self) -> HookToolName
 fn join_tool_name(tool_name: &ToolName) -> String
 ```
 
-**Purpose**: Flattens a possibly namespaced `ToolName` into a single string separated by the MCP delimiter `__`.
+**Purpose**: Combines a tool namespace and tool name into one readable MCP-style name. This avoids ambiguity when different MCP servers or namespaces offer tools with similar names.
 
-**Data flow**: Reads `tool_name.namespace` and `tool_name.name`; if a namespace exists it trims trailing underscores from the namespace and leading underscores from the name, formats `{namespace}__{name}`, otherwise it returns the bare tool name clone.
+**Data flow**: It receives a `ToolName`. If the name has a namespace, it trims extra underscores at the boundary and returns `namespace__name`; if there is no namespace, it returns just the tool name.
 
-**Call relations**: It is an internal naming helper called by `McpHandler::hook_tool_name` before prefix normalization.
+**Call relations**: It is called only by `McpHandler::hook_tool_name`. It supplies the middle step in the hook-name pipeline before `ensure_mcp_prefix` adds the MCP marker if needed.
 
 *Call graph*: called by 1 (hook_tool_name); 1 external calls (format!).
 
@@ -2320,11 +2332,11 @@ fn join_tool_name(tool_name: &ToolName) -> String
 fn ensure_mcp_prefix(name: &str) -> String
 ```
 
-**Purpose**: Guarantees that a flattened MCP hook name starts with the legacy `mcp__` prefix.
+**Purpose**: Makes sure a hook tool name is clearly marked as coming from MCP. This protects against confusing an external MCP tool with a built-in Codex tool that has a similar name.
 
-**Data flow**: Reads `name: &str`; if it already starts with `mcp__`, returns it as an owned `String`, otherwise prepends the prefix and returns the new string.
+**Data flow**: It receives a name string. If the name already starts with `mcp__`, it returns it unchanged; otherwise, it adds `mcp__` to the front and returns the new string.
 
-**Call relations**: This is the second naming-normalization step inside `McpHandler::hook_tool_name`.
+**Call relations**: It is called by `McpHandler::hook_tool_name` after namespace and tool name have been joined. Tests cover the important edge case where a namespace already looks like it has the MCP prefix.
 
 *Call graph*: called by 1 (hook_tool_name); 1 external calls (format!).
 
@@ -2335,11 +2347,11 @@ fn ensure_mcp_prefix(name: &str) -> String
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical namespaced tool name derived from the MCP `ToolInfo`.
+**Purpose**: Returns the canonical Codex name for this MCP tool. A canonical name is the normalized name used internally so the same tool is not referred to in several incompatible ways.
 
-**Data flow**: Calls `self.tool_info.canonical_tool_name()` and returns the resulting `ToolName`.
+**Data flow**: It reads `tool_info` stored in the handler and asks it for its canonical tool name. It returns that `ToolName` value without changing other state.
 
-**Call relations**: It is part of the `ToolExecutor` interface and is also used internally by `hook_tool_name`.
+**Call relations**: The tool registry calls this through the `ToolExecutor` interface when it needs to identify the tool. `McpHandler::hook_tool_name` also calls it before producing the hook-facing name.
 
 *Call graph*: calls 1 internal fn (canonical_tool_name); called by 1 (hook_tool_name).
 
@@ -2350,11 +2362,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the precomputed MCP tool specification advertised to the model.
+**Purpose**: Returns the Codex tool specification for this MCP tool. This is the description and input shape that can be advertised to the model.
 
-**Data flow**: Clones `self.spec` and returns the clone.
+**Data flow**: It reads the stored `ToolSpec`, clones it, and returns the clone. Nothing inside the handler is changed.
 
-**Call relations**: This is consumed directly by the registry and indirectly by `search_info` when building searchable metadata.
+**Call relations**: The tool registry calls this through the `ToolExecutor` interface when building the available-tool list. `McpHandler::search_info` also uses it when constructing searchable metadata.
 
 *Call graph*: called by 1 (search_info); 1 external calls (clone).
 
@@ -2365,11 +2377,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Determines whether this MCP tool may be invoked concurrently based on server opt-in or read-only annotations.
+**Purpose**: Decides whether this MCP tool may safely run at the same time as other tool calls. Parallel calls are allowed when the server explicitly allows them or when the tool says it is read-only.
 
-**Data flow**: Reads `self.tool_info.supports_parallel_tool_calls`; if false, it inspects `self.tool_info.tool.annotations.read_only_hint` and returns true only when that hint is present and true. Returns the final boolean.
+**Data flow**: It reads two pieces of metadata: the server-level `supports_parallel_tool_calls` flag and the tool annotation called `read_only_hint`. If either says parallel use is safe, it returns `true`; otherwise it returns `false`.
 
-**Call relations**: The scheduler consults this method before parallel dispatch. Tests cover the server-opt-in and read-only-hint branches.
+**Call relations**: The tool runtime can ask this before scheduling calls concurrently. The tests check that read-only tools are allowed, writable or unannotated tools are not, and a server-level opt-in overrides that.
 
 
 ##### `McpHandler::search_info`  (lines 89–113)
@@ -2378,11 +2390,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Builds search metadata for the MCP tool, including a source label and synthesized search text from MCP metadata.
+**Purpose**: Builds information that helps Codex find this tool during tool search. It gathers human-friendly words from the MCP tool, server, connector, and schema.
 
-**Data flow**: Chooses `source_name` from nonblank `connector_name` or trimmed `server_name`, optionally builds `ToolSearchSourceInfo` with that name and a nonblank `namespace_description`, then calls `ToolSearchInfo::from_spec(build_mcp_search_text(&self.tool_info), self.spec(), source_info)` and returns the result.
+**Data flow**: It chooses a source name from the connector name if present, otherwise the server name. It optionally includes a source description, builds search text with `build_mcp_search_text`, combines that with the tool spec, and returns a `ToolSearchInfo` if the spec can support it.
 
-**Call relations**: This method is used when indexing tools for search. It delegates text synthesis to `build_mcp_search_text` and uses `spec` for the structural tool description.
+**Call relations**: This is called by the tool registry or search layer when tools need to be indexed or discovered. It calls `McpHandler::spec` for the advertised shape and `build_mcp_search_text` for the bag of searchable words.
 
 *Call graph*: calls 3 internal fn (spec, build_mcp_search_text, from_spec).
 
@@ -2393,11 +2405,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async MCP execution path into the boxed future required by the tool-executor trait.
+**Purpose**: Starts handling one MCP tool invocation in the async tool-executor interface. It is the public entry point for running this handler’s tool.
 
-**Data flow**: Takes a `ToolInvocation`, creates the future from `self.handle_call(invocation)`, pins it, and returns it.
+**Data flow**: It receives a `ToolInvocation`, calls `handle_call` with it, and boxes the resulting asynchronous work so the broader tool system can store and await it uniformly.
 
-**Call relations**: The registry invokes this trait method; all actual MCP execution happens in `handle_call`.
+**Call relations**: The tool registry calls this through the `ToolExecutor` interface when the model asks to run the MCP tool. It immediately hands the real work to `McpHandler::handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -2411,11 +2423,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes one MCP tool call by validating payload shape, delegating to the MCP call helper, and packaging the result with runtime metadata.
+**Purpose**: Actually runs an MCP tool call and wraps its answer in Codex’s standard output type. It also records elapsed time and carries output settings needed by later formatting.
 
-**Data flow**: Destructures `ToolInvocation` to read `session`, `turn`, `call_id`, and `payload`. It requires `ToolPayload::Function { arguments }`, otherwise returns `FunctionCallError::RespondToModel`. It records `Instant::now()`, awaits `handle_mcp_tool_call(Arc::clone(&session), &turn, call_id.clone(), self.tool_info.server_name.clone(), self.tool_info.tool.name.to_string(), self.hook_tool_name(), arguments)`, then wraps the returned `result.result` and `result.tool_input` into `McpToolOutput` together with elapsed wall time, `can_request_original_image_detail(&turn.model_info)`, and `turn.truncation_policy`, boxes it, and returns it.
+**Data flow**: It receives a full `ToolInvocation`, pulls out the session, turn, call id, and payload, and requires the payload to be function arguments. If the payload is not supported, it returns an error message for the model. Otherwise it starts a timer, calls `handle_mcp_tool_call` with the server name, tool name, hook name, and raw arguments, waits for the MCP result, then returns a boxed `McpToolOutput` containing the result, rewritten input, elapsed time, image-detail support, and truncation policy.
 
-**Call relations**: It is called only by `handle`. Its main delegation is to `handle_mcp_tool_call`, which performs the actual MCP transport and normalization.
+**Call relations**: `McpHandler::handle` calls this whenever the tool is run. It calls into `handle_mcp_tool_call`, which is the lower layer that talks to the MCP server, and then uses `boxed_tool_output` so the rest of Codex can treat the result like any other tool output.
 
 *Call graph*: calls 3 internal fn (handle_mcp_tool_call, boxed_tool_output, hook_tool_name); called by 1 (handle); 4 external calls (clone, now, can_request_original_image_detail, RespondToModel).
 
@@ -2429,11 +2441,11 @@ fn telemetry_tags(
     ) -> futures::future::BoxFuture<'a, ToolTelemetryTags>
 ```
 
-**Purpose**: Supplies MCP-specific telemetry tags identifying the server and, when present, its origin.
+**Purpose**: Produces labels for logging and metrics about this MCP tool. Telemetry tags help operators answer questions like which MCP server a tool call came from.
 
-**Data flow**: Builds a vector starting with `("mcp_server", self.tool_info.server_name.clone())`, conditionally pushes `("mcp_server_origin", origin.clone())` when `server_origin` exists, and returns it from a boxed async future.
+**Data flow**: It reads the MCP server name and optional server origin from `tool_info`. It returns an async result containing key-value pairs such as `mcp_server` and, when available, `mcp_server_origin`.
 
-**Call relations**: This `CoreToolRuntime` hook is consumed by telemetry/reporting paths around tool execution.
+**Call relations**: The core tool runtime calls this around tool execution when recording telemetry. It does not call the MCP server; it only reports metadata already stored in the handler.
 
 *Call graph*: 2 external calls (pin, vec!).
 
@@ -2444,11 +2456,11 @@ fn telemetry_tags(
 fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload>
 ```
 
-**Purpose**: Builds the hook payload emitted before an MCP tool runs, using the normalized MCP-prefixed hook name and parsed arguments.
+**Purpose**: Builds the payload sent to pre-tool hooks before an MCP tool runs. This gives hook code a clear tool name and a parsed version of the tool input.
 
-**Data flow**: Reads `invocation.payload`; if it is not `ToolPayload::Function`, returns `None`. Otherwise it constructs `PreToolUsePayload { tool_name: self.hook_tool_name(), tool_input: mcp_hook_tool_input(arguments) }` and returns `Some(...)`.
+**Data flow**: It looks at the invocation payload. If the payload is function arguments, it converts the raw argument string into JSON using `mcp_hook_tool_input`, pairs it with the standardized MCP hook name, and returns a `PreToolUsePayload`. If the payload is not function-shaped, it returns nothing.
 
-**Call relations**: This hook is called by generic pre-tool-use machinery. It delegates argument normalization to `mcp_hook_tool_input`.
+**Call relations**: The core runtime calls this before tool execution when hooks are enabled. It uses `McpHandler::hook_tool_name` for consistent naming and `mcp_hook_tool_input` so hooks can inspect JSON arguments as structured data when possible.
 
 *Call graph*: calls 2 internal fn (hook_tool_name, mcp_hook_tool_input).
 
@@ -2463,11 +2475,11 @@ fn with_updated_hook_input(
     ) -> Result<ToolInvocation, FunctionCallError>
 ```
 
-**Purpose**: Applies hook-driven argument rewriting to an MCP invocation by replacing its function-argument JSON string.
+**Purpose**: Applies input changes made by a pre-tool hook. If a hook rewrites the MCP tool input, this function turns that rewritten JSON back into the invocation format used by the executor.
 
-**Data flow**: Takes ownership of a `ToolInvocation` and `updated_input: Value`. If the payload is `ToolPayload::Function`, it serializes `updated_input` with `serde_json::to_string` and stores the resulting string back into `invocation.payload`; serialization failures become `FunctionCallError::RespondToModel`. For any non-function payload it returns a `RespondToModel` error naming the tool and unsupported payload. On success it returns the modified invocation.
+**Data flow**: It receives the original `ToolInvocation` and a new JSON value. If the original payload was function arguments, it serializes the new JSON to a string and replaces the invocation’s arguments with that string. If serialization fails, or if the payload type cannot be rewritten, it returns an error for the model.
 
-**Call relations**: This `CoreToolRuntime` hook is used when pre-tool hooks rewrite MCP inputs before execution. It does not call execution itself; it prepares the invocation that `handle` will later consume.
+**Call relations**: The runtime calls this after a pre-tool hook asks to modify the input. It does not run the tool itself; it returns an updated invocation that can then continue into `McpHandler::handle`.
 
 *Call graph*: 3 external calls (format!, to_string, RespondToModel).
 
@@ -2482,11 +2494,11 @@ fn post_tool_use_payload(
     ) -> Option<PostToolUsePayload>
 ```
 
-**Purpose**: Builds the hook payload emitted after an MCP tool finishes, using normalized input and response values from the output object.
+**Purpose**: Builds the payload sent to post-tool hooks after an MCP tool finishes. This lets hook code see both what was sent and what came back.
 
-**Data flow**: Checks that `invocation.payload` is function-shaped; otherwise returns `None`. It then asks `result.post_tool_use_response(&invocation.call_id, &invocation.payload)` for the hook-visible response and `result.post_tool_use_input(&invocation.payload)` for the normalized input; if either returns `None`, this method returns `None`. Otherwise it constructs and returns `Some(PostToolUsePayload { tool_name: self.hook_tool_name(), tool_use_id: invocation.call_id.clone(), tool_input, tool_response })`.
+**Data flow**: It checks that the invocation used function arguments. It then asks the tool output to produce a hook-friendly input and response for this call id and payload. If both are available, it returns a `PostToolUsePayload` with the MCP hook name, tool-use id, input, and response.
 
-**Call relations**: This is the post-execution counterpart to `pre_tool_use_payload`. It is called by generic hook machinery after `handle_call` has produced a `ToolOutput`.
+**Call relations**: The runtime calls this after tool execution. It uses `McpHandler::hook_tool_name` for stable hook naming and relies on the `ToolOutput` object to translate the actual result into the post-hook format.
 
 *Call graph*: calls 3 internal fn (hook_tool_name, post_tool_use_input, post_tool_use_response).
 
@@ -2497,11 +2509,11 @@ fn post_tool_use_payload(
 fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
 ```
 
-**Purpose**: Translates MCP `ToolInfo` into the namespaced `ToolSpec` exposed to the model.
+**Purpose**: Converts MCP tool metadata into the tool specification format used by Codex’s Responses API tool list. This is what makes an external MCP tool presentable to the model.
 
-**Data flow**: Reads `tool_info`, derives the canonical `ToolName`, converts the MCP tool schema with `mcp_tool_to_responses_api_tool`, computes a namespace description from nonblank `namespace_description` or a connector-name fallback, and returns `ToolSpec::Namespace(ResponsesApiNamespace { name: tool_info.callable_namespace.clone(), description, tools: vec![ResponsesApiNamespaceTool::Function(tool)] })`.
+**Data flow**: It receives a `ToolInfo`, gets the canonical tool name, converts the MCP tool definition into a Responses API function tool, chooses a namespace description from the MCP namespace description or connector name, and returns a `ToolSpec::Namespace` containing that one function tool.
 
-**Call relations**: This helper is called only by `McpHandler::new` so spec construction is centralized and testable.
+**Call relations**: `McpHandler::new` calls this during handler construction. It depends on `mcp_tool_to_responses_api_tool` for the detailed schema conversion, then wraps the converted tool in the namespace structure Codex expects.
 
 *Call graph*: calls 1 internal fn (canonical_tool_name); called by 1 (new); 3 external calls (mcp_tool_to_responses_api_tool, Namespace, vec!).
 
@@ -2512,11 +2524,11 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
 fn mcp_hook_tool_input(raw_arguments: &str) -> Value
 ```
 
-**Purpose**: Parses raw MCP argument text into the JSON value exposed to hook handlers, with graceful fallback for empty or non-JSON input.
+**Purpose**: Turns raw MCP argument text into the form hooks should see. Hooks work best with structured JSON, but this function preserves non-JSON text instead of failing.
 
-**Data flow**: Reads `raw_arguments: &str`; if trimming yields empty text, returns `Value::Object(Map::new())`. Otherwise it attempts `serde_json::from_str(raw_arguments)` and returns the parsed value on success; on parse failure it falls back to `Value::String(raw_arguments.to_string())`.
+**Data flow**: It receives the raw argument string. If it is empty or only whitespace, it returns an empty JSON object. If it parses as JSON, it returns that JSON value. If parsing fails, it returns the original text as a JSON string.
 
-**Call relations**: It is used by `McpHandler::pre_tool_use_payload` so hooks see structured JSON when possible but still receive the original raw text when parsing fails.
+**Call relations**: `McpHandler::pre_tool_use_payload` calls this before a tool runs. It keeps hook input forgiving: malformed or plain-text arguments still reach hooks as data rather than causing the hook payload to disappear.
 
 *Call graph*: called by 1 (pre_tool_use_payload); 3 external calls (new, Object, from_str).
 
@@ -2527,11 +2539,11 @@ fn mcp_hook_tool_input(raw_arguments: &str) -> Value
 fn build_mcp_search_text(info: &ToolInfo) -> String
 ```
 
-**Purpose**: Synthesizes a broad search string for an MCP tool from names, descriptions, plugin labels, and input-schema property names.
+**Purpose**: Collects searchable words for an MCP tool. It helps search match a user’s intent against names, descriptions, server labels, plugin names, and parameter names.
 
-**Data flow**: Reads `ToolInfo`, derives the canonical `ToolName`, extracts and sorts property names from `tool.input_schema["properties"]` when present, seeds a parts vector with flattened tool name, callable name, raw tool name, and server name, conditionally appends nonblank title, description, connector name, and namespace description, extends with trimmed nonempty `plugin_display_names`, then appends the sorted schema property names and joins everything with spaces into one `String`.
+**Data flow**: It receives a `ToolInfo`, extracts the canonical and callable names, raw MCP tool name, server name, optional title, optional description, connector name, namespace description, plugin display names, and input-schema property names. It sorts the property names, filters out empty text, joins everything with spaces, and returns one search string.
 
-**Call relations**: This helper is called by `McpHandler::search_info` to improve discoverability beyond the raw tool spec.
+**Call relations**: `McpHandler::search_info` calls this when building the tool’s search metadata. Separate search tests use it indirectly to verify that MCP metadata and parameter names make the tool discoverable.
 
 *Call graph*: calls 1 internal fn (canonical_tool_name); called by 1 (search_info); 1 external calls (vec!).
 
@@ -2542,11 +2554,11 @@ fn build_mcp_search_text(info: &ToolInfo) -> String
 async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args()
 ```
 
-**Purpose**: Verifies that pre-tool hook payloads for normal MCP tools use the `mcp__...` prefixed hook name and parsed JSON arguments.
+**Purpose**: Checks that a normal MCP tool produces the expected pre-hook payload. It proves that the hook name gets the `mcp__` prefix and that JSON arguments stay structured.
 
-**Data flow**: Builds a function payload containing JSON arguments, creates a session/turn and an `McpHandler`, constructs a `ToolInvocation`, calls `handler.pre_tool_use_payload(...)`, and asserts equality with the expected `PreToolUsePayload` containing `HookToolName::new("mcp__memory__create_entities")` and the parsed JSON object.
+**Data flow**: The test builds a JSON function payload, creates a fake session and turn, constructs a handler for a sample `memory.create_entities` tool, and asks for the pre-tool payload. It compares the result with the exact expected hook name and parsed JSON input.
 
-**Call relations**: This test exercises `McpHandler::new`, `hook_tool_name`, and `mcp_hook_tool_input` through the public pre-hook API.
+**Call relations**: This test calls `McpHandler::new` and then exercises `pre_tool_use_payload`. It protects the naming and input-parsing behavior used by runtime pre-tool hooks.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, new); 3 external calls (assert_eq!, tool_info, json!).
 
@@ -2557,11 +2569,11 @@ async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args()
 async fn mcp_pre_tool_use_payload_keeps_builtin_like_tool_names_namespaced()
 ```
 
-**Purpose**: Checks that namespaces already resembling built-in names still remain MCP-prefixed rather than collapsing into a built-in hook name.
+**Purpose**: Checks that an MCP namespace that already starts with `mcp__` is not mangled or mistaken for a built-in tool. This avoids name collisions in hook handling.
 
-**Data flow**: Creates a payload and handler for namespace `mcp__foo` and tool `exec_command`, builds an invocation, calls `pre_tool_use_payload`, and asserts the hook name is `mcp__foo__exec_command` with the parsed JSON input preserved.
+**Data flow**: The test creates a function payload and a handler whose namespace is `mcp__foo`. It asks for the pre-tool payload and expects the hook name `mcp__foo__exec_command` with the original JSON input.
 
-**Call relations**: This test specifically covers the underscore trimming and prefix-preservation logic in `join_tool_name` and `ensure_mcp_prefix`.
+**Call relations**: This test uses `McpHandler::new` and `pre_tool_use_payload`. It specifically protects the interaction between `join_tool_name` and `ensure_mcp_prefix` for names that already look MCP-prefixed.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, new); 3 external calls (assert_eq!, tool_info, json!).
 
@@ -2572,11 +2584,11 @@ async fn mcp_pre_tool_use_payload_keeps_builtin_like_tool_names_namespaced()
 async fn mcp_updated_input_rewrites_builtin_like_tool_names_as_mcp()
 ```
 
-**Purpose**: Verifies that hook-driven input rewriting preserves function payload shape for builtin-like MCP tool names.
+**Purpose**: Checks that hook-rewritten input works even for MCP tools with names that look like built-in tool names. The important point is that the invocation remains a function-style MCP call with updated arguments.
 
-**Data flow**: Creates a handler and invocation for namespace `mcp__foo`, calls `with_updated_hook_input(..., json!({"message":"rewritten"}))`, unwraps the returned invocation, pattern-matches its payload as `ToolPayload::Function`, and asserts the serialized argument string matches the rewritten JSON.
+**Data flow**: The test creates an invocation with JSON arguments, calls `with_updated_hook_input` with replacement JSON, then inspects the returned invocation. The output should contain the rewritten JSON string as the function arguments.
 
-**Call relations**: This test targets `McpHandler::with_updated_hook_input` and ensures MCP tools remain function-shaped after rewriting.
+**Call relations**: This test constructs a handler with `McpHandler::new` and then exercises `with_updated_hook_input`. It protects the path where pre-tool hooks change arguments before `McpHandler::handle` runs.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, new, new, namespaced); 7 external calls (new, new, assert_eq!, tool_info, json!, panic!, new).
 
@@ -2587,11 +2599,11 @@ async fn mcp_updated_input_rewrites_builtin_like_tool_names_as_mcp()
 async fn mcp_post_tool_use_payload_uses_prefixed_tool_name_args_and_result()
 ```
 
-**Purpose**: Checks that post-tool hook payloads include the normalized MCP-prefixed name, rewritten tool input, and structured MCP result.
+**Purpose**: Checks that post-tool hooks receive the right MCP hook name, tool input, call id, and response after an MCP tool finishes. This makes sure hooks can audit both sides of the tool call.
 
-**Data flow**: Constructs a function payload, an `McpToolOutput` containing MCP content and structured content, a session/turn, handler, and invocation, then calls `handler.post_tool_use_payload(&invocation, &output)` and asserts equality with the expected `PostToolUsePayload`.
+**Data flow**: The test builds a sample function payload and a sample `McpToolOutput` containing text content and structured content. It creates a handler and invocation, asks for the post-tool payload, and compares it to the expected JSON input and response.
 
-**Call relations**: This test exercises the post-hook path, relying on `McpHandler::post_tool_use_payload` plus `McpToolOutput`'s hook serialization behavior.
+**Call relations**: This test calls `McpHandler::new` and then exercises `post_tool_use_payload`. It verifies that the handler cooperates correctly with `McpToolOutput`’s post-hook formatting methods.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, new, new, namespaced); 9 external calls (new, from_millis, new, assert_eq!, tool_info, json!, Bytes, new, vec!).
 
@@ -2602,11 +2614,11 @@ async fn mcp_post_tool_use_payload_uses_prefixed_tool_name_args_and_result()
 fn mcp_read_only_hint_supports_parallel_calls_without_server_opt_in()
 ```
 
-**Purpose**: Verifies that a read-only MCP tool is treated as safe for parallel execution even when the server-level opt-in flag is false.
+**Purpose**: Checks that a tool marked read-only can run in parallel even when the MCP server did not explicitly opt in. Read-only means the tool should not change outside state, so concurrent calls are safer.
 
-**Data flow**: Builds `ToolInfo`, sets `tool.annotations.read_only(true)`, constructs an `McpHandler`, calls `supports_parallel_tool_calls`, and asserts the result is true.
+**Data flow**: The test creates sample MCP tool information, marks its annotations as read-only, builds a handler, and asserts that `supports_parallel_tool_calls` returns true.
 
-**Call relations**: This test covers the annotation-based branch of `McpHandler::supports_parallel_tool_calls`.
+**Call relations**: This test exercises the scheduling-safety rule in `McpHandler::supports_parallel_tool_calls`. It guards the behavior that read-only MCP annotations are trusted for parallel execution.
 
 *Call graph*: 3 external calls (assert!, tool_info, new).
 
@@ -2617,11 +2629,11 @@ fn mcp_read_only_hint_supports_parallel_calls_without_server_opt_in()
 fn mcp_parallel_calls_require_read_only_hint_or_server_opt_in()
 ```
 
-**Purpose**: Checks the negative and positive cases for MCP parallel-call eligibility.
+**Purpose**: Checks the negative and positive cases for parallel MCP calls. A tool should not run in parallel unless it is read-only or the server explicitly says parallel calls are supported.
 
-**Data flow**: Creates three `ToolInfo` variants: one without annotations, one explicitly writable, and one with `supports_parallel_tool_calls = true`. It constructs handlers for each and asserts the first two return false from `supports_parallel_tool_calls` while the server-opt-in case returns true.
+**Data flow**: The test creates three sample tools: one with no read-only hint, one marked writable, and one with server-level parallel support. It builds handlers for each and asserts that only the server-opt-in case allows parallel calls.
 
-**Call relations**: This test complements the previous one by covering the remaining branches of the parallel-call policy.
+**Call relations**: This test focuses on `McpHandler::supports_parallel_tool_calls`. Together with the read-only test, it documents the full rule used by the runtime scheduler.
 
 *Call graph*: 3 external calls (assert!, tool_info, new).
 
@@ -2632,24 +2644,24 @@ fn mcp_parallel_calls_require_read_only_hint_or_server_opt_in()
 fn tool_info(server_name: &str, callable_namespace: &str, tool_name: &str) -> ToolInfo
 ```
 
-**Purpose**: Builds minimal synthetic `ToolInfo` values for MCP handler tests.
+**Purpose**: Builds small fake `ToolInfo` records for the tests in this file. It saves each test from repeating the same MCP setup details.
 
-**Data flow**: Accepts `server_name`, `callable_namespace`, and `tool_name`, then returns a `ToolInfo` populated with those values, `supports_parallel_tool_calls: false`, no origin/connector metadata, empty plugin display names, and an `rmcp::model::Tool` created from a minimal raw object schema.
+**Data flow**: It receives a server name, callable namespace, and tool name. It returns a `ToolInfo` with those fields filled in, parallel calls disabled, no connector metadata, no plugin names, and a minimal object-shaped input schema.
 
-**Call relations**: All MCP tests in this file use this helper to avoid repeating boilerplate `ToolInfo` construction.
+**Call relations**: The tests call this helper before constructing an `McpHandler`. It is test-only scaffolding and is not used by production code.
 
 *Call graph*: 5 external calls (new, new, new_with_raw, object, json!).
 
 
 ### `core/src/mcp_tool_call.rs`
 
-`orchestration` · `MCP tool request handling`
+`orchestration` · `request handling`
 
-This is the main MCP tool-call orchestration module. `handle_mcp_tool_call` parses JSON arguments, looks up tool metadata, derives approval policy from app policy, selected-plugin catalog state, or config/plugin defaults, emits a started event, and either short-circuits blocked calls or routes through approval handling before execution. Approval is layered: auto-approval policy can bypass prompting, remembered session approvals can skip future prompts, permission hooks can allow or deny, guardian review can mediate, and otherwise the code builds either a legacy `RequestUserInput` prompt or an MCP elicitation form enriched with connector/tool metadata and display-friendly parameters.
+MCP, or Model Context Protocol, is the way Codex talks to outside tools and app connectors. This file is the traffic controller for one MCP tool call. Without it, a model could ask an external tool to run, but Codex would not have a consistent place to check safety rules, ask the user or guardian for permission, attach useful metadata, call the server, and show the result in the conversation.
 
-Once approved, `handle_approved_mcp_tool_call` optionally marks thread memory as polluted for external-context servers, rewrites declared Codex Apps file arguments via `mcp_openai_file`, builds request metadata including turn metadata, Codex Apps meta, plugin ID, thread ID, and optional sandbox state, then executes the tool under a tracing span. Results are sanitized for models without image input support, optionally trigger Codex Apps auth elicitation and tool-cache refresh, and are truncated before persistence into rollout events to avoid multi-megabyte stored payloads. The module emits start/completion `TurnItem::McpToolCall` events, records metrics and span attributes, and tracks Codex App usage analytics.
+The flow starts by turning the tool arguments into JSON and looking up details about the tool, such as its connector name, title, safety hints, and whether it can accept OpenAI file inputs. It then decides whether the tool is enabled and whether approval is needed. Approval can come from policy, remembered choices, hooks, a guardian review service, or a user prompt.
 
-The file also owns approval persistence. Session approvals are stored in-memory keyed by server/connector/tool; persistent approvals are written back into project config, user config, app connector config, or plugin config depending on where the MCP server originates. Numerous helpers normalize approval responses, derive fallback prompt text, extract metadata such as UI resource URIs and declared OpenAI file params, and decide whether tool annotations imply approval is required.
+If the call is allowed, the file prepares request metadata, adds thread and sandbox information when supported, rewrites file arguments if needed, and sends the request to the MCP server. It also protects the model from unsupported image results, trims huge results before saving them as events, and emits start/completion updates so the UI can show progress. Around all of this it records metrics, tracing details, and app-usage analytics. In short, this file is the checkpoint, dispatcher, and logbook for MCP tool execution.
 
 #### Function details
 
@@ -2666,11 +2678,11 @@ async fn handle_mcp_tool_call(
     argume
 ```
 
-**Purpose**: Runs the top-level MCP tool-call state machine from raw argument string through approval and eventual execution or skip. It is the public entrypoint for handling one MCP tool invocation.
+**Purpose**: This is the main entry for running one MCP tool call. It parses the requested arguments, gathers tool metadata, applies app and approval policy, and either skips, asks for approval, or runs the tool.
 
-**Data flow**: Inputs are `Arc<Session>`, `Arc<TurnContext>`, `call_id`, `server`, `tool_name`, `hook_tool_name`, and raw `arguments: String`. It parses `arguments` into optional `JsonValue`, returning an immediate error `CallToolResult` on invalid JSON; builds an `McpInvocation`; looks up metadata; computes item metadata and approval mode; blocks disabled Codex Apps tools via `notify_mcp_tool_call_skip`; emits a started event; optionally requests approval; on accept delegates to `handle_approved_mcp_tool_call`; on decline/cancel emits a skipped completion and metrics; otherwise executes directly. Returns `HandledMcpToolCall { result, tool_input }`.
+**Data flow**: It receives the session, current turn, call id, server name, tool name, hook name, and raw argument text. It turns the arguments into JSON, looks up metadata and policy, sends a “started” event when appropriate, asks for approval if needed, and returns both the tool result and the JSON input that was actually considered.
 
-**Call relations**: Called by the higher-level call dispatcher `handle_call`. It delegates metadata lookup, approval routing, execution, skip notification, and metrics emission to helpers throughout this file.
+**Call relations**: The higher-level call handler calls this when the model asks for an MCP tool. This function then delegates to metadata lookup, approval decision logic, skip notification, metrics recording, or the approved-call path depending on what policy and user decisions say.
 
 *Call graph*: calls 9 internal fn (default, new, custom_mcp_tool_approval_mode, emit_mcp_call_metrics, handle_approved_mcp_tool_call, lookup_mcp_tool_metadata, maybe_request_mcp_tool_approval, notify_mcp_tool_call_skip, notify_mcp_tool_call_started); called by 1 (handle_call); 6 external calls (Object, error!, format!, from_error_text, from_result, new).
 
@@ -2687,11 +2699,11 @@ async fn handle_approved_mcp_tool_call(
     item_m
 ```
 
-**Purpose**: Executes an already-approved MCP tool call, including argument rewriting, request-meta construction, tracing, completion notification, analytics, and metrics. It is the post-approval execution path.
+**Purpose**: This runs a tool call after it has already been approved or determined not to need approval. It prepares the request, executes it, records timing and telemetry, and emits the final conversation event.
 
-**Data flow**: Accepts `Session`, `TurnContext`, `call_id`, `McpInvocation`, optional approval metadata, and item metadata. It may mark thread memory polluted, captures connector/server-origin info, starts a timer, rewrites declared OpenAI file arguments, derives `tool_input` from rewritten or original arguments, builds request metadata, executes the tool inside an instrumented span via `execute_mcp_tool_call`, records span telemetry from the result, warns on errors, computes duration, emits completion with a truncated event-safe result, tracks Codex App usage, emits metrics, and returns `HandledMcpToolCall`.
+**Data flow**: It receives the session, turn, call id, invocation details, metadata, and event metadata. It may mark memory as polluted by external context, rewrites file arguments, builds request metadata, calls the MCP server, records span telemetry, truncates the event copy of the result, tracks app usage, emits metrics, and returns the final result plus the tool input used.
 
-**Call relations**: Reached only from `handle_mcp_tool_call` after approval or when no approval is needed. It delegates file rewriting to `mcp_openai_file`, execution to `execute_mcp_tool_call`, event emission to notify helpers, and analytics/metrics to dedicated helpers.
+**Call relations**: It is called by the main MCP tool handler once permission is settled. Inside, it hands off the actual server call to execute_mcp_tool_call and then reports completion through notify_mcp_tool_call_completed.
 
 *Call graph*: calls 10 internal fn (rewrite_mcp_tool_arguments_for_openai_files, build_mcp_tool_call_request_meta, emit_mcp_call_metrics, execute_mcp_tool_call, maybe_mark_thread_memory_mode_polluted, maybe_track_codex_app_used, mcp_tool_call_span, notify_mcp_tool_call_completed, record_mcp_result_span_telemetry, truncate_mcp_tool_result_for_event); called by 1 (handle_mcp_tool_call); 4 external calls (now, current, from_result, warn!).
 
@@ -2709,11 +2721,11 @@ fn emit_mcp_call_metrics(
 )
 ```
 
-**Purpose**: Records the standard MCP call counter and optional duration metric with sanitized tags. It centralizes metric emission for both successful and skipped/error flows.
+**Purpose**: This records count and duration measurements for MCP calls. These measurements help operators understand how often tools are used, which tools fail, and how long calls take.
 
-**Data flow**: Takes `turn_context`, `status`, `tool_name`, optional `connector_id`, optional `connector_name`, and optional `Duration`. It builds tag pairs with `mcp_call_metric_tags`, converts them to `(&str, &str)` references, increments `MCP_CALL_COUNT_METRIC`, and if duration is present records `MCP_CALL_DURATION_METRIC`.
+**Data flow**: It receives the turn context, status, tool and connector labels, and optionally a duration. It builds safe metric tags, increments the call counter, and records elapsed time when provided. It does not return a value.
 
-**Call relations**: Called from both `handle_mcp_tool_call` and `handle_approved_mcp_tool_call` after a final status is known. It depends on `mcp_call_metric_tags` for consistent tag construction.
+**Call relations**: The main handler uses it for skipped or rejected calls, and the approved-call path uses it after execution. It relies on mcp_call_metric_tags to format labels safely.
 
 *Call graph*: calls 1 internal fn (mcp_call_metric_tags); called by 2 (handle_approved_mcp_tool_call, handle_mcp_tool_call).
 
@@ -2729,11 +2741,11 @@ fn mcp_call_metric_tags(
 ) -> Vec<(&'static str, String)>
 ```
 
-**Purpose**: Builds sanitized metric tags for MCP call telemetry. It always includes status and tool name, and conditionally includes non-empty connector identifiers.
+**Purpose**: This prepares the labels attached to MCP metrics. It cleans tool and connector names so they are safe to send to the metrics system.
 
-**Data flow**: Inputs are `status`, `tool_name`, optional `connector_id`, and optional `connector_name`. It sanitizes each included value with `sanitize_metric_tag_value`, pushes mandatory `status` and `tool` tags into a vector, conditionally appends `connector_id` and `connector_name`, and returns `Vec<(&'static str, String)>`.
+**Data flow**: It receives a status, tool name, and optional connector id and name. It sanitizes each non-empty value and returns a list of metric tag name/value pairs.
 
-**Call relations**: Used only by `emit_mcp_call_metrics` to keep metric tagging logic in one place.
+**Call relations**: emit_mcp_call_metrics calls this before sending counters and durations. It is a small helper that keeps metric labeling consistent.
 
 *Call graph*: called by 1 (emit_mcp_call_metrics); 2 external calls (sanitize_metric_tag_value, vec!).
 
@@ -2748,11 +2760,11 @@ fn mcp_tool_call_span(
 ) -> Span
 ```
 
-**Purpose**: Creates the tracing span used around MCP tool execution, pre-populated with RPC, server, connector, tool, conversation, and telemetry fields. It standardizes observability for MCP calls.
+**Purpose**: This creates a tracing span, which is a timed log envelope for one MCP tool call. It gives observability tools enough information to connect a slow or failed call to a server, connector, session, and turn.
 
-**Data flow**: Accepts `Session`, `TurnContext`, and `McpToolCallSpanFields`. It derives a transport label from `server_origin`, creates an `info_span!` with fixed OpenTelemetry-style fields plus empty placeholders for server address/port and result telemetry, calls `record_server_fields` to fill host/port when possible, and returns the `Span`.
+**Data flow**: It receives the session, turn context, and span fields such as server, tool, call id, origin, and connector details. It creates a span with these attributes, records server host and port when the origin is a URL, and returns the span.
 
-**Call relations**: Constructed by `handle_approved_mcp_tool_call` immediately before `execute_mcp_tool_call` is instrumented. It delegates URL parsing details to `record_server_fields`.
+**Call relations**: handle_approved_mcp_tool_call wraps the actual MCP call in this span. record_server_fields fills in network address details after the span is created.
 
 *Call graph*: calls 1 internal fn (record_server_fields); called by 1 (handle_approved_mcp_tool_call); 1 external calls (info_span!).
 
@@ -2763,11 +2775,11 @@ fn mcp_tool_call_span(
 fn record_server_fields(span: &Span, url: Option<&str>)
 ```
 
-**Purpose**: Extracts host and port from a server-origin URL and records them onto an existing tracing span. It silently ignores absent or unparsable URLs.
+**Purpose**: This extracts a server address and port from a URL and stores them on a tracing span. That makes network-related traces easier to search and group.
 
-**Data flow**: Takes a `Span` and optional URL string. If the URL is present and `Url::parse` succeeds, it records `server.address` from `host_str()` and `server.port` from `port_or_known_default()` when available.
+**Data flow**: It receives a span and an optional URL string. If the URL parses cleanly, it records the host and known port on the span; otherwise it quietly does nothing.
 
-**Call relations**: Called only by `mcp_tool_call_span` to enrich the span with network endpoint fields.
+**Call relations**: mcp_tool_call_span calls this while setting up tracing for an MCP request. It is intentionally forgiving because tracing should not break tool execution.
 
 *Call graph*: called by 1 (mcp_tool_call_span); 2 external calls (record, parse).
 
@@ -2778,11 +2790,11 @@ fn record_server_fields(span: &Span, url: Option<&str>)
 fn record_mcp_result_span_telemetry(span: &Span, result: Option<&CallToolResult>)
 ```
 
-**Purpose**: Copies selected telemetry fields embedded in an MCP tool result’s `_meta` into tracing span attributes. It currently records target ID and whether a server-side user flow was triggered.
+**Purpose**: This copies selected telemetry hints from an MCP tool result onto the tracing span. For example, a tool can report which remote target it touched or whether it triggered a user flow on the server side.
 
-**Data flow**: Accepts a `Span` and optional `&CallToolResult`. It drills through `result.meta` → object → `codex/telemetry` → `span`, then if present records a truncated `target_id` string under `codex.mcp.target.id` and a boolean `did_trigger_server_user_flow` under `codex.mcp.server_user_flow.triggered`.
+**Data flow**: It receives a span and an optional successful tool result. It looks inside the result metadata for a known telemetry object, truncates long target ids, records supported fields on the span, and returns nothing.
 
-**Call relations**: Called by `handle_approved_mcp_tool_call` after execution completes but before completion notification. It uses `truncate_str_to_char_boundary` to keep target IDs bounded.
+**Call relations**: handle_approved_mcp_tool_call calls this right after execute_mcp_tool_call finishes. It uses truncate_str_to_char_boundary to shorten text without cutting a character in half.
 
 *Call graph*: calls 1 internal fn (truncate_str_to_char_boundary); called by 1 (handle_approved_mcp_tool_call); 1 external calls (record).
 
@@ -2793,11 +2805,11 @@ fn record_mcp_result_span_telemetry(span: &Span, result: Option<&CallToolResult>
 fn truncate_str_to_char_boundary(value: &str, max_chars: usize) -> &str
 ```
 
-**Purpose**: Returns a prefix of a string limited to a maximum number of Unicode scalar positions without cutting through a UTF-8 codepoint. It is a safe truncation helper for span attributes.
+**Purpose**: This shortens a string to a maximum number of characters without producing invalid text. It matters for Unicode text, where one visible character may use multiple bytes.
 
-**Data flow**: Takes `value: &str` and `max_chars: usize`, finds the byte index of the `max_chars`-th character with `char_indices().nth(max_chars)`, and returns either the prefix up to that byte index or the original string if shorter.
+**Data flow**: It receives a string slice and a maximum character count. If the string is longer, it returns a slice ending at a valid character boundary; otherwise it returns the original string.
 
-**Call relations**: Used only by `record_mcp_result_span_telemetry` when recording bounded target IDs.
+**Call relations**: record_mcp_result_span_telemetry uses it before writing tool-provided target ids into tracing data.
 
 *Call graph*: called by 1 (record_mcp_result_span_telemetry).
 
@@ -2814,11 +2826,11 @@ async fn execute_mcp_tool_call(
     metadata: Option<
 ```
 
-**Purpose**: Builds final request metadata, invokes the MCP tool through the session, sanitizes the result for model capabilities, and optionally triggers Codex Apps auth elicitation. It is the direct execution wrapper around `Session::call_tool`.
+**Purpose**: This performs the actual MCP server request. It adds required metadata, calls the tool, cleans the result for the current model, and may trigger an authentication prompt for Codex Apps.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `call_id`, `McpInvocation`, optional rewritten arguments, optional metadata, and optional request meta. It injects thread ID into meta, augments meta with sandbox state when supported, starts an MCP call trace, adds trace metadata, awaits `sess.call_tool(...)`, maps transport errors into strings, sanitizes image blocks out of the result when the model lacks image input support, then passes the result through `maybe_request_codex_apps_auth_elicitation` and returns `Result<CallToolResult, String>`.
+**Data flow**: It receives the session, turn, call id, invocation, rewritten arguments, tool metadata, and request metadata. It adds the thread id, sandbox state, and rollout tracing metadata, calls the server, removes unsupported content such as images for text-only models, possibly asks for app authentication, and returns either a tool result or an error string.
 
-**Call relations**: Called only by `handle_approved_mcp_tool_call`. It delegates metadata augmentation, result sanitization, and auth-elicitation follow-up to helpers in this file.
+**Call relations**: handle_approved_mcp_tool_call calls this inside the tracing span. It delegates metadata additions to helper functions and finishes by handing Codex Apps auth cases to maybe_request_codex_apps_auth_elicitation.
 
 *Call graph*: calls 4 internal fn (augment_mcp_tool_request_meta_with_sandbox_state, maybe_request_codex_apps_auth_elicitation, sanitize_mcp_tool_result_for_model, with_mcp_tool_call_thread_id_meta); called by 1 (handle_approved_mcp_tool_call); 1 external calls (call_tool).
 
@@ -2835,11 +2847,11 @@ async fn maybe_request_codex_apps_auth_elicitation(
     result:
 ```
 
-**Purpose**: Detects Codex Apps auth-failure results that should trigger a user-facing connector-auth elicitation, requests that elicitation, and rewrites the result if the user completes auth. It only applies to host-owned Codex Apps servers and when the feature/policy allow it.
+**Purpose**: This detects when a Codex Apps tool failed because the user needs to authenticate a connector, then asks the client to guide the user through that login or install flow.
 
-**Data flow**: Accepts `Session`, `TurnContext`, `call_id`, `server`, optional metadata, and a `CallToolResult`. It returns early unless the server is a host-owned Codex Apps server, the `AuthElicitation` feature is enabled, and approval policy permits MCP elicitations. It derives connector info and install URL, asks `build_auth_elicitation_plan` whether the result warrants elicitation, sends `request_mcp_server_elicitation` if so, and if the response action is `Accept`, refreshes Codex Apps tools/connectors and returns `auth_elicitation_completed_result(&plan.auth_failure, result.meta)`; otherwise it returns the original result.
+**Data flow**: It receives the session, turn, call id, server name, metadata, and original tool result. If the server is a host-owned Codex Apps server, the feature is enabled, and approval policy allows prompts, it builds an authentication elicitation request. If the user accepts, it refreshes app tools and returns a special completed-auth result; otherwise it returns the original result.
 
-**Call relations**: Called by `execute_mcp_tool_call` after a successful raw tool call. It delegates cache refresh to `refresh_codex_apps_after_connector_auth` and plan construction to `codex_mcp` helpers.
+**Call relations**: execute_mcp_tool_call calls this after a tool result comes back. If authentication succeeds, it calls refresh_codex_apps_after_connector_auth so connector caches reflect the newly authorized state.
 
 *Call graph*: calls 1 internal fn (refresh_codex_apps_after_connector_auth); called by 1 (execute_mcp_tool_call); 4 external calls (String, auth_elicitation_completed_result, build_auth_elicitation_plan, request_mcp_server_elicitation).
 
@@ -2850,11 +2862,11 @@ async fn maybe_request_codex_apps_auth_elicitation(
 async fn refresh_codex_apps_after_connector_auth(sess: &Session, turn_context: &TurnContext)
 ```
 
-**Purpose**: Refreshes the Codex Apps tools cache and connector accessibility cache after a connector-auth flow succeeds. It keeps subsequent tool metadata and connector lists in sync with the newly authenticated state.
+**Purpose**: This refreshes Codex Apps tool and connector information after the user authorizes a connector. It keeps the local view of available apps in sync with the server.
 
-**Data flow**: Takes `Session` and `TurnContext`, asks the MCP connection manager for a hard refresh of the Codex Apps tools cache, and on success fetches current auth and calls `connectors::refresh_accessible_connectors_cache_from_mcp_tools(&turn_context.config, auth.as_ref(), &mcp_tools)`. On failure it logs a warning.
+**Data flow**: It receives the session and turn context. It asks the MCP connection manager for a fresh tools cache, then refreshes the accessible connectors cache using current authentication. On failure it logs a warning and leaves existing cache data in place.
 
-**Call relations**: Used only by `maybe_request_codex_apps_auth_elicitation` after the user accepts and completes an auth elicitation.
+**Call relations**: maybe_request_codex_apps_auth_elicitation calls this only after the user accepts an authentication flow.
 
 *Call graph*: calls 1 internal fn (refresh_accessible_connectors_cache_from_mcp_tools); called by 1 (maybe_request_codex_apps_auth_elicitation); 1 external calls (warn!).
 
@@ -2870,11 +2882,11 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
 ) -> anyhow::Result<Option<ser
 ```
 
-**Purpose**: Adds serialized sandbox-state metadata to an MCP tool request when the target server advertises support for that capability. It lets capable servers understand the caller’s sandbox context.
+**Purpose**: This adds sandbox information to a tool request when the MCP server says it understands that metadata. A sandbox is a restricted execution environment; sharing its state lets compatible tools respect Codex’s safety limits.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `server`, and optional JSON `meta`. It asynchronously checks whether the server supports sandbox-state meta capability; if not, returns the original meta. Otherwise it serializes a `SandboxState` containing permission profile, sandbox policy, Linux sandbox executable, deprecated sandbox cwd, and legacy-Landlock flag. It inserts that value into an existing object meta map or creates a new object map if meta was `None`, leaving non-object meta unchanged, and returns `anyhow::Result<Option<JsonValue>>`.
+**Data flow**: It receives the session, turn context, server name, and optional request metadata. It checks whether the server supports sandbox-state metadata, serializes the current permission profile, sandbox policy, working directory, and related flags, inserts them into the metadata object, and returns the updated metadata.
 
-**Call relations**: Called by `execute_mcp_tool_call` before the actual tool invocation. It depends on MCP connection-manager capability probing and on `TurnContext` sandbox-related state.
+**Call relations**: execute_mcp_tool_call uses this before sending the server request. If the server does not support the capability, the metadata is passed through unchanged.
 
 *Call graph*: calls 2 internal fn (permission_profile, sandbox_policy); called by 1 (execute_mcp_tool_call); 3 external calls (new, Object, to_value).
 
@@ -2889,11 +2901,11 @@ async fn maybe_mark_thread_memory_mode_polluted(
 )
 ```
 
-**Purpose**: Marks the thread’s memory mode as polluted when external-context MCP servers are used and config requests disabling memories in that case. It is a side-effect guard around memory safety policy.
+**Purpose**: This marks a conversation thread as unsuitable for normal memory behavior if a tool brings in external context and the configuration says that should disable memories. This prevents outside data from being accidentally treated as user memory.
 
-**Data flow**: Accepts `Session`, `TurnContext`, and `server`. It checks `turn_context.config.memories.disable_on_external_context`, asks the MCP connection manager whether the server pollutes memory, and if so awaits `state_db::mark_thread_memory_mode_polluted(...)` with reason `"mcp_tool_call"`.
+**Data flow**: It receives the session, turn context, and server name. It checks configuration and server metadata; if both indicate risk, it records a polluted-memory marker in the state database.
 
-**Call relations**: Called at the start of `handle_approved_mcp_tool_call` before execution. It does not affect the tool result directly; it updates persistent thread state.
+**Call relations**: handle_approved_mcp_tool_call calls this before running the external tool, so the thread state is updated as soon as risky external context is used.
 
 *Call graph*: calls 1 internal fn (mark_thread_memory_mode_polluted); called by 1 (handle_approved_mcp_tool_call).
 
@@ -2907,11 +2919,11 @@ fn sanitize_mcp_tool_result_for_model(
 ) -> Result<CallToolResult, String>
 ```
 
-**Purpose**: Removes image content blocks from MCP tool results when the current model cannot accept image input. It preserves all non-image content and metadata.
+**Purpose**: This removes image blocks from tool results when the current model cannot accept image input. It replaces each image with a plain text note instead of sending unsupported content onward.
 
-**Data flow**: Takes `supports_image_input: bool` and `Result<CallToolResult, String>`. If image input is supported it returns the result unchanged. Otherwise, on `Ok(call_tool_result)` it maps each `content` block: blocks whose `type` is `"image"` become a text block with a fixed omission message, all others are cloned unchanged; `structured_content`, `is_error`, and `meta` are preserved. Errors pass through unchanged.
+**Data flow**: It receives a flag saying whether the model supports images and a tool result or error. If image input is supported, it returns the result unchanged. Otherwise, for successful results, it scans content blocks and replaces image blocks with explanatory text.
 
-**Call relations**: Called by `execute_mcp_tool_call` immediately after `Session::call_tool` succeeds. It is the model-capability adaptation layer before any auth elicitation logic.
+**Call relations**: execute_mcp_tool_call uses this immediately after the MCP server responds, before the result is returned to the model.
 
 *Call graph*: called by 1 (execute_mcp_tool_call).
 
@@ -2924,11 +2936,11 @@ fn truncate_mcp_tool_result_for_event(
 ) -> Result<CallToolResult, String>
 ```
 
-**Purpose**: Shrinks MCP tool results before they are persisted in turn events so rollout storage does not retain multi-megabyte payloads. It preserves a useful preview while dropping bulky structured data.
+**Purpose**: This makes sure the event copy of an MCP result is not enormous. It preserves a useful preview while avoiding multi-megabyte conversation records.
 
-**Data flow**: Accepts `&Result<CallToolResult, String>`. For `Ok`, it serializes the whole result to JSON; if within `MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES`, it clones and returns it unchanged. If too large, it truncates the serialized string with `truncate_text(Bytes(...))` and returns a replacement `CallToolResult` containing a single text block preview, preserving `is_error` but dropping `structured_content` and `meta`. For `Err`, it truncates the error string to the same byte budget.
+**Data flow**: It receives either a successful tool result or an error string. If the serialized result or error fits within the byte budget, it returns it unchanged; otherwise it replaces it with a truncated text preview.
 
-**Call relations**: Used by `handle_approved_mcp_tool_call` and `notify_mcp_tool_call_skip` right before emitting completion events. It affects only the event copy, not the actual returned tool result.
+**Call relations**: handle_approved_mcp_tool_call uses it before emitting completion events, and notify_mcp_tool_call_skip uses it for skipped-call errors.
 
 *Call graph*: called by 2 (handle_approved_mcp_tool_call, notify_mcp_tool_call_skip); 4 external calls (truncate_text, Bytes, to_string, vec!).
 
@@ -2945,11 +2957,11 @@ async fn notify_mcp_tool_call_started(
 )
 ```
 
-**Purpose**: Emits the in-progress `TurnItem::McpToolCall` event for a tool invocation. It converts invocation data and item metadata into the protocol item shape expected by the session.
+**Purpose**: This tells the session that an MCP tool call has begun. That allows the UI or event log to show the call as in progress.
 
-**Data flow**: Takes `Session`, `TurnContext`, `call_id`, `McpInvocation`, and `McpToolCallItemMetadata`. It destructures the invocation, builds `TurnItem::McpToolCall(McpToolCallItem { ... status: InProgress, result: None, error: None, duration: None })`, using `JsonValue::Null` when arguments are absent, and awaits `sess.emit_turn_item_started(turn_context, &item)`.
+**Data flow**: It receives the session, turn context, call id, invocation details, and item metadata. It builds a turn item with in-progress status and emits a started event. It does not return a value.
 
-**Call relations**: Called by `handle_mcp_tool_call` for normal execution and by `notify_mcp_tool_call_skip` when a skipped call had not already been started.
+**Call relations**: handle_mcp_tool_call calls this for normal calls, and notify_mcp_tool_call_skip calls it when a skipped call had not already been announced.
 
 *Call graph*: called by 2 (handle_mcp_tool_call, notify_mcp_tool_call_skip); 2 external calls (McpToolCall, emit_turn_item_started).
 
@@ -2966,11 +2978,11 @@ async fn notify_mcp_tool_call_completed(
     duration:
 ```
 
-**Purpose**: Emits the terminal `TurnItem::McpToolCall` event with completed or failed status, result/error payload, and duration. It is the completion counterpart to the started-event helper.
+**Purpose**: This tells the session that an MCP tool call is finished. It records whether the call completed, failed with a tool-level error, or failed with a local error message.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `call_id`, `McpInvocation`, item metadata, `duration`, and `Result<CallToolResult, String>`. It maps the result into `(status, result, error)`, treating `Ok` with `is_error == true` as `Failed`, then builds a completed `McpToolCallItem` carrying arguments, metadata, status, optional result, optional `McpToolCallError`, and duration, and emits it via `sess.emit_turn_item_completed`.
+**Data flow**: It receives the session, turn context, call id, invocation, metadata, duration, and result. It converts that into a completed turn item with status, result or error, and elapsed time, then emits it to the session.
 
-**Call relations**: Called by `handle_approved_mcp_tool_call` after execution and by `notify_mcp_tool_call_skip` for blocked/declined/cancelled calls.
+**Call relations**: handle_approved_mcp_tool_call calls it after real execution, and notify_mcp_tool_call_skip calls it to close out blocked, rejected, or canceled calls.
 
 *Call graph*: called by 2 (handle_approved_mcp_tool_call, notify_mcp_tool_call_skip); 2 external calls (McpToolCall, emit_turn_item_completed).
 
@@ -2986,11 +2998,11 @@ async fn maybe_track_codex_app_used(
 )
 ```
 
-**Purpose**: Sends analytics when a Codex Apps MCP tool is used, classifying the invocation as explicit or implicit based on connector selection. Non-Codex-Apps servers are ignored.
+**Purpose**: This records analytics when a Codex Apps tool is used. It distinguishes tools the user explicitly selected from tools the model chose implicitly.
 
-**Data flow**: Accepts `Session`, `TurnContext`, `server`, and `tool_name`. If `server` is not `CODEX_APPS_MCP_SERVER_NAME`, it returns. Otherwise it looks up connector/app metadata, fetches the session’s selected connector IDs, derives `InvocationType::Explicit` when the connector was explicitly selected and `Implicit` otherwise, builds tracking context from model/thread/turn IDs, and calls `analytics_events_client.track_app_used(...)`.
+**Data flow**: It receives the session, turn context, server name, and tool name. If the server is Codex Apps, it looks up connector metadata, compares the connector to the user’s selected connectors, builds tracking context, and sends an app-used event.
 
-**Call relations**: Called at the end of `handle_approved_mcp_tool_call` after completion notification. It depends on `lookup_mcp_app_usage_metadata` and session connector-selection state.
+**Call relations**: handle_approved_mcp_tool_call calls this after a successful or attempted approved call. It uses lookup_mcp_app_usage_metadata to find connector details.
 
 *Call graph*: calls 1 internal fn (lookup_mcp_app_usage_metadata); called by 1 (handle_approved_mcp_tool_call); 2 external calls (build_track_events_context, get_connector_selection).
 
@@ -3006,11 +3018,11 @@ async fn custom_mcp_tool_approval_mode(
 ) -> AppToolApproval
 ```
 
-**Purpose**: Resolves the approval mode for a non-Codex-Apps MCP tool from user/project config first and active plugin config second, defaulting otherwise. It is the fallback approval-policy resolver.
+**Purpose**: This finds the approval setting for a non-Codex-Apps MCP tool. It checks user configuration first, then active plugin configuration, and falls back to the default policy.
 
-**Data flow**: Takes `Session`, `TurnContext`, `server`, and `tool_name`. It inspects the effective config layer stack for a deserializable `mcp_servers` table, looks up the named server and tool-specific or default approval mode, and returns it if found. Otherwise it loads active plugins for the current config input, searches for a plugin MCP server with the same name, and returns that tool-specific or default approval mode, falling back to `AppToolApproval::default()`.
+**Data flow**: It receives the session, turn context, server name, and tool name. It reads effective configuration for server-level or tool-level approval settings; if none are present, it inspects active plugins. It returns an AppToolApproval value.
 
-**Call relations**: Called by `handle_mcp_tool_call` when the server is neither Codex Apps nor a selected-plugin registration with catalog-provided approval mode.
+**Call relations**: handle_mcp_tool_call uses this when the tool is not a Codex Apps tool and not a selected-plugin tool with catalog approval policy.
 
 *Call graph*: called by 1 (handle_mcp_tool_call).
 
@@ -3026,11 +3038,11 @@ fn build_mcp_tool_call_request_meta(
 ) -> Option<serde_json::Value>
 ```
 
-**Purpose**: Builds the base JSON metadata object attached to an MCP tool request, including turn metadata, Codex Apps meta, call ID, and plugin ID. It omits the object entirely when no fields are present.
+**Purpose**: This builds the metadata object sent alongside an MCP tool call. Metadata is extra context for the server, such as turn information, Codex Apps call id, or plugin id.
 
-**Data flow**: Inputs are `TurnContext`, `server`, `call_id`, and optional approval metadata. It starts an empty JSON map, optionally inserts current turn metadata under `X_CODEX_TURN_METADATA_HEADER`, for Codex Apps clones `metadata.codex_apps_meta` and inserts `call_id` under `MCP_TOOL_CODEX_APPS_META_KEY`, optionally inserts `plugin_id`, and returns `Some(JsonValue::Object(map))` only if the map is non-empty.
+**Data flow**: It receives the turn context, server name, call id, and optional tool metadata. It adds current turn metadata when available, Codex Apps metadata for app calls, and plugin id when known. It returns a JSON object or nothing if no metadata is needed.
 
-**Call relations**: Called by `handle_approved_mcp_tool_call` before execution. Its output is further augmented by `with_mcp_tool_call_thread_id_meta` and `augment_mcp_tool_request_meta_with_sandbox_state`.
+**Call relations**: handle_approved_mcp_tool_call calls this before execute_mcp_tool_call, which then adds thread and sandbox metadata.
 
 *Call graph*: calls 1 internal fn (effective_reasoning_effort); called by 1 (handle_approved_mcp_tool_call); 3 external calls (new, Object, String).
 
@@ -3044,11 +3056,11 @@ fn with_mcp_tool_call_thread_id_meta(
 ) -> Option<serde_json::Value>
 ```
 
-**Purpose**: Ensures the outgoing MCP request metadata contains the current thread ID. It can add the field to an existing object or create a new object when metadata is absent.
+**Purpose**: This adds the conversation thread id to MCP request metadata. That lets a server connect a tool request back to the conversation it belongs to.
 
-**Data flow**: Accepts optional JSON `meta` and `thread_id`. If `meta` is an object, it inserts `threadId`; if `meta` is `None`, it creates a new object containing only `threadId`; any other JSON type is returned unchanged.
+**Data flow**: It receives optional JSON metadata and a thread id string. If the metadata is an object or absent, it inserts the thread id and returns the updated object. If the metadata is some other JSON type, it leaves it unchanged.
 
-**Call relations**: Called by `execute_mcp_tool_call` as the first metadata augmentation step before sandbox-state insertion and trace metadata.
+**Call relations**: execute_mcp_tool_call uses this as the first metadata augmentation step before adding sandbox and trace data.
 
 *Call graph*: called by 1 (execute_mcp_tool_call); 3 external calls (new, Object, String).
 
@@ -3059,11 +3071,11 @@ fn with_mcp_tool_call_thread_id_meta(
 fn is_mcp_tool_approval_question_id(question_id: &str) -> bool
 ```
 
-**Purpose**: Recognizes whether a question ID belongs to the MCP tool approval prompt namespace. It is a small identifier classifier used by approval-related flows.
+**Purpose**: This checks whether a question id belongs to an MCP tool approval prompt. Other parts of the system can use it to recognize these approval questions.
 
-**Data flow**: Takes `question_id: &str`, strips the `MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX`, and returns `true` only when the remaining suffix exists and starts with an underscore.
+**Data flow**: It receives a question id string. It checks for the expected prefix followed by an underscore and returns true or false.
 
-**Call relations**: Used by external approval-handling code paths to identify MCP tool approval prompts generated by this module.
+**Call relations**: This is a small public helper for approval-related paths that need to identify MCP approval questions without parsing the whole prompt.
 
 
 ##### `mcp_tool_approval_prompt_options`  (lines 1147–1157)
@@ -3076,11 +3088,11 @@ fn mcp_tool_approval_prompt_options(
 ) ->
 ```
 
-**Purpose**: Computes which approval prompt persistence options should be offered to the user. It derives session and persistent rememberability from the presence of approval keys and feature enablement.
+**Purpose**: This decides which “remember my choice” options should appear in an approval prompt. It keeps the prompt honest by only showing session or persistent choices when they can actually be applied.
 
-**Data flow**: Accepts optional session and persistent `McpToolApprovalKey` references plus a `tool_call_mcp_elicitation_enabled` flag. Returns `McpToolApprovalPromptOptions { allow_session_remember, allow_persistent_approval }`, where persistent approval additionally requires the elicitation feature to be enabled.
+**Data flow**: It receives optional session and persistent approval keys plus a feature flag for MCP elicitation. It returns two booleans: whether session remembering is allowed and whether permanent approval is allowed.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` after approval keys are computed and before building the prompt or elicitation request.
+**Call relations**: maybe_request_mcp_tool_approval calls this before building either a user-input prompt or MCP elicitation request.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval).
 
@@ -3097,11 +3109,11 @@ async fn maybe_request_mcp_tool_approval(
     metada
 ```
 
-**Purpose**: Determines whether approval is needed for an MCP tool call and, if so, obtains a decision through remembered approvals, hooks, guardian review, MCP elicitation, or legacy user-input prompting. It is the approval engine for this module.
+**Purpose**: This decides whether an MCP tool call needs permission and, if so, obtains a decision. Permission can come from policy, remembered approvals, hooks, guardian review, MCP elicitation, or a direct user prompt.
 
-**Data flow**: Inputs are `Arc<Session>`, `Arc<TurnContext>`, `call_id`, `McpInvocation`, `HookToolName`, optional metadata, and `approval_mode`. It resolves the approvals reviewer, checks auto-approval policy, computes whether annotations require approval, derives session/persistent approval keys, short-circuits on remembered session approval, runs permission hooks, checks feature flags, optionally routes to guardian and converts the review result, otherwise builds prompt options, question ID, optional rendered template and display params, constructs either an MCP elicitation request or `RequestUserInputArgs`, parses and normalizes the response into `McpToolApprovalDecision`, applies persistence/session side effects, and returns `Some(decision)` or `None` when no approval was needed.
+**Data flow**: It receives the session, turn, call id, invocation, hook tool name, metadata, and approval mode. It checks auto-approval policy, tool safety hints, remembered session approvals, permission hooks, guardian routing, feature flags, and user responses. It returns no decision when approval is unnecessary, or a concrete accept, decline, or cancel decision when permission was requested.
 
-**Call relations**: Called by `handle_mcp_tool_call` after the started event is emitted. It orchestrates many helpers in this file: reviewer selection, approval-key derivation, guardian request building, prompt rendering, response parsing, and persistence application.
+**Call relations**: handle_mcp_tool_call calls this after emitting the started event. This function coordinates many helpers: it builds approval keys, review requests, prompts, parses responses, normalizes decisions, and applies remembered or persistent approvals.
 
 *Call graph*: calls 16 internal fn (run_permission_request_hooks, render_mcp_tool_approval_template, apply_mcp_tool_approval_decision, build_guardian_mcp_tool_review_request, build_mcp_tool_approval_elicitation_request, build_mcp_tool_approval_question, mcp_approvals_reviewer, mcp_tool_approval_decision_from_guardian, mcp_tool_approval_is_remembered, mcp_tool_approval_prompt_options (+6 more)); called by 1 (handle_mcp_tool_call); 8 external calls (String, mcp_permission_prompt_is_auto_approved, clone, new_guardian_review_id, review_approval_request, routes_approval_to_guardian_with_reviewer, format!, vec!).
 
@@ -3116,11 +3128,11 @@ fn mcp_approvals_reviewer(
 ) -> ApprovalsReviewer
 ```
 
-**Purpose**: Resolves which approvals reviewer policy applies to an MCP tool call, taking connector identity into account for Codex Apps tools. It is a thin adapter over connector approval policy logic.
+**Purpose**: This chooses who should review an MCP approval request. The reviewer may depend on configuration, server name, and connector id.
 
-**Data flow**: Accepts `TurnContext`, `server_name`, and optional metadata, then calls `connectors::mcp_approvals_reviewer(turn_context.config.as_ref(), server_name, metadata.and_then(|m| m.connector_id.as_deref()))` and returns `ApprovalsReviewer`.
+**Data flow**: It receives the turn context, server name, and optional tool metadata. It extracts the connector id when present and asks the connector approval logic for the configured reviewer.
 
-**Call relations**: Used by `maybe_request_mcp_tool_approval` and other approval-related compatibility paths to decide whether approval should route through guardian.
+**Call relations**: maybe_request_mcp_tool_approval uses it to decide whether to route approval through guardian review. Another auto-review path also uses it for compatibility with user-input approval prompts.
 
 *Call graph*: calls 1 internal fn (mcp_approvals_reviewer); called by 2 (maybe_auto_review_mcp_request_user_input, maybe_request_mcp_tool_approval).
 
@@ -3135,11 +3147,11 @@ fn session_mcp_tool_approval_key(
 ) -> Option<McpToolApprovalKey>
 ```
 
-**Purpose**: Builds the in-memory approval key used for session-scoped remembered approvals when the tool’s approval mode allows auto-approval after first consent. Codex Apps tools without a connector ID are intentionally excluded.
+**Purpose**: This builds the key used to remember an approval for the current session. The key identifies a server, optional connector, and tool.
 
-**Data flow**: Takes `McpInvocation`, optional metadata, and `approval_mode`. If `approval_mode` is not `AppToolApproval::Auto`, returns `None`. Otherwise it extracts optional `connector_id`, rejects Codex Apps invocations lacking a connector ID, and returns `Some(McpToolApprovalKey { server, connector_id, tool_name })`.
+**Data flow**: It receives an invocation, metadata, and approval mode. If the approval mode supports remembered automatic approvals, it returns a key; otherwise it returns nothing. For Codex Apps, it refuses to create a key when no connector id is known.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` and reused by `persistent_mcp_tool_approval_key`. Its output controls whether session remember options are offered and checked.
+**Call relations**: maybe_request_mcp_tool_approval uses it before checking or storing session approvals. persistent_mcp_tool_approval_key reuses the same logic for permanent approvals.
 
 *Call graph*: called by 2 (maybe_request_mcp_tool_approval, persistent_mcp_tool_approval_key).
 
@@ -3154,11 +3166,11 @@ fn persistent_mcp_tool_approval_key(
 ) -> Option<McpToolApprovalKey>
 ```
 
-**Purpose**: Builds the key used for persistent approval storage. In the current design it is identical to the session approval key.
+**Purpose**: This builds the key used for saving a tool approval into configuration. In this file it follows the same rules as the session approval key.
 
-**Data flow**: Accepts the same inputs as `session_mcp_tool_approval_key` and simply returns that function’s result.
+**Data flow**: It receives an invocation, metadata, and approval mode, then returns the same kind of key that session_mcp_tool_approval_key would return.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` when persistent approval is allowed for the server. It exists as a separate helper so persistent-key semantics can diverge later if needed.
+**Call relations**: maybe_request_mcp_tool_approval calls this when permanent remembering is allowed for the server. It delegates the key-building details to session_mcp_tool_approval_key.
 
 *Call graph*: calls 1 internal fn (session_mcp_tool_approval_key); called by 1 (maybe_request_mcp_tool_approval).
 
@@ -3173,11 +3185,11 @@ fn build_guardian_mcp_tool_review_request(
 ) -> GuardianApprovalRequest
 ```
 
-**Purpose**: Converts an MCP invocation and its metadata into the `GuardianApprovalRequest::McpToolCall` payload expected by guardian review. It preserves connector and annotation context for policy evaluation.
+**Purpose**: This packages an MCP tool call into the shape expected by the guardian review system. The guardian can then approve or deny the call with the relevant context.
 
-**Data flow**: Inputs are `call_id`, `McpInvocation`, and optional metadata. It clones server, tool name, arguments, connector fields, tool title/description, and maps `ToolAnnotations` into `GuardianMcpAnnotations`, then returns `GuardianApprovalRequest::McpToolCall { ... }`.
+**Data flow**: It receives the call id, invocation, and optional metadata. It copies server, tool, arguments, connector details, tool descriptions, and safety hints into a GuardianApprovalRequest value.
 
-**Call relations**: Used by `maybe_request_mcp_tool_approval` when approval is routed to guardian, and by compatibility paths that auto-review MCP prompts.
+**Call relations**: maybe_request_mcp_tool_approval uses this when approval is routed to guardian. A compatibility auto-review path also uses it to produce the same review payload.
 
 *Call graph*: called by 2 (maybe_auto_review_mcp_request_user_input, maybe_request_mcp_tool_approval).
 
@@ -3192,11 +3204,11 @@ async fn mcp_tool_approval_decision_from_guardian(
 ) -> McpToolApprovalDecision
 ```
 
-**Purpose**: Maps guardian `ReviewDecision` values into this module’s `McpToolApprovalDecision` enum, including user-facing rejection and timeout messages. It normalizes guardian semantics for the rest of the approval flow.
+**Purpose**: This converts a guardian review result into the local MCP approval decision type. It also turns denials and timeouts into user-facing messages.
 
-**Data flow**: Accepts `Session`, `review_id`, and `ReviewDecision`. Approved variants map to `Accept`, `ApprovedForSession` maps to `AcceptForSession`, `Denied` maps to `Decline` with `guardian_rejection_message`, `TimedOut` maps to `Decline` with `guardian_timeout_message()`, and `Abort` maps to `Decline { message: None }`.
+**Data flow**: It receives the session, review id, and guardian review decision. Approved decisions become accept decisions, session approval becomes accept-for-session, denials include a rejection message, timeouts include a timeout message, and abort becomes a decline without a message.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` after guardian review completes. Its output is then passed into `apply_mcp_tool_approval_decision`.
+**Call relations**: maybe_request_mcp_tool_approval calls this after guardian review completes, before applying remembered approval behavior.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval); 2 external calls (guardian_rejection_message, guardian_timeout_message).
 
@@ -3212,11 +3224,11 @@ async fn lookup_mcp_tool_metadata(
 ) -> Option<McpToolApprovalMetadata>
 ```
 
-**Purpose**: Finds MCP tool metadata needed for approval prompts, analytics, UI resource linking, and OpenAI file-argument rewriting. It joins MCP tool inventory with connector metadata when the server is Codex Apps.
+**Purpose**: This finds descriptive and policy-relevant information for one MCP tool. That metadata is used for approval prompts, analytics, app UI display, and request preparation.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `server`, and `tool_name`. It queries the MCP connection manager for plugin ID and full tool inventory, finds the matching tool entry, optionally resolves connector descriptions from cached or freshly listed accessible connectors for Codex Apps, extracts annotations, connector fields, tool title/description, UI resource URI via `get_mcp_app_resource_uri`, Codex Apps meta object, and declared OpenAI file input params via `openai_file_input_params_for_server`, then returns `Some(McpToolApprovalMetadata)` or `None` if the tool is not found.
+**Data flow**: It receives the session, turn context, server name, and tool name. It lists known tools, finds the matching one, gathers plugin id, connector id and name, descriptions, annotations, UI resource URI, Codex Apps metadata, and allowed OpenAI file parameters. It returns a metadata object or nothing if the tool is not found.
 
-**Call relations**: Called by `handle_mcp_tool_call` before approval/execution and by approval compatibility paths. It delegates specific metadata extraction to `get_mcp_app_resource_uri` and `openai_file_input_params_for_server`.
+**Call relations**: handle_mcp_tool_call calls this near the start of tool handling. A compatibility auto-review path also uses it, and this function delegates URI and file-parameter extraction to smaller helpers.
 
 *Call graph*: calls 4 internal fn (list_accessible_connectors_from_mcp_tools, list_cached_accessible_connectors_from_mcp_tools, get_mcp_app_resource_uri, openai_file_input_params_for_server); called by 2 (maybe_auto_review_mcp_request_user_input, handle_mcp_tool_call).
 
@@ -3230,11 +3242,11 @@ fn openai_file_input_params_for_server(
 ) -> Option<Vec<String>>
 ```
 
-**Purpose**: Extracts declared OpenAI file-input parameter names from tool metadata, but only for the Codex Apps MCP server. Custom MCP servers are intentionally prevented from using this upload path.
+**Purpose**: This decides whether a tool may accept OpenAI file inputs. It only allows this for the built-in Codex Apps MCP server, not arbitrary custom MCP servers.
 
-**Data flow**: Accepts `server` and optional metadata map. If `server == CODEX_APPS_MCP_SERVER_NAME`, it computes `declared_openai_file_input_param_names(meta)` and returns `Some(Vec<String>)` only when the resulting list is non-empty; otherwise returns `None`.
+**Data flow**: It receives a server name and optional tool metadata. If the server is Codex Apps, it extracts declared file-input parameter names and returns them when non-empty; otherwise it returns nothing.
 
-**Call relations**: Used by `lookup_mcp_tool_metadata` to populate `McpToolApprovalMetadata.openai_file_input_params`, which later drives argument rewriting in `handle_approved_mcp_tool_call`.
+**Call relations**: lookup_mcp_tool_metadata calls this while building metadata. Later, handle_approved_mcp_tool_call uses that metadata when rewriting file arguments.
 
 *Call graph*: called by 1 (lookup_mcp_tool_metadata); 1 external calls (declared_openai_file_input_param_names).
 
@@ -3247,11 +3259,11 @@ fn get_mcp_app_resource_uri(
 ) -> Option<String>
 ```
 
-**Purpose**: Extracts the best available UI/resource URI from MCP tool metadata using several legacy and compatibility keys. It supports multiple metadata layouts.
+**Purpose**: This extracts the UI resource URI for an MCP app tool from tool metadata. The URI can point the client to an app-specific display resource or output template.
 
-**Data flow**: Accepts optional metadata map and searches in order: `meta["ui"]["resourceUri"]`, flat `ui/resourceUri`, then `openai/outputTemplate`, returning the first string found as `Some(String)`.
+**Data flow**: It receives optional tool metadata. It checks several supported metadata locations in priority order and returns the first string URI it finds.
 
-**Call relations**: Called by `lookup_mcp_tool_metadata` to populate `mcp_app_resource_uri` on approval metadata and emitted turn items.
+**Call relations**: lookup_mcp_tool_metadata calls this when preparing item metadata that will be included in MCP tool call events.
 
 *Call graph*: called by 1 (lookup_mcp_tool_metadata).
 
@@ -3266,11 +3278,11 @@ async fn lookup_mcp_app_usage_metadata(
 ) -> Option<McpAppUsageMetadata>
 ```
 
-**Purpose**: Finds connector/app identity for analytics tracking of Codex Apps tool usage. It is a lightweight inventory lookup separate from approval metadata.
+**Purpose**: This finds connector information needed for Codex Apps usage analytics. It maps a server and tool name back to connector id and app name.
 
-**Data flow**: Takes `Session`, `server`, and `tool_name`, lists all tools from the MCP connection manager, finds the matching tool entry, and returns `Some(McpAppUsageMetadata { connector_id, app_name: connector_name })` or `None`.
+**Data flow**: It receives the session, server name, and tool name. It lists all known tools, finds the matching tool, and returns connector id and connector name if found.
 
-**Call relations**: Used only by `maybe_track_codex_app_used` after a successful tool call.
+**Call relations**: maybe_track_codex_app_used calls this before sending an app-used analytics event.
 
 *Call graph*: called by 1 (maybe_track_codex_app_used).
 
@@ -3287,11 +3299,11 @@ fn build_mcp_tool_approval_question(
     question_ov
 ```
 
-**Purpose**: Constructs the legacy `RequestUserInputQuestion` for approving an MCP tool call, including the appropriate set of allow/remember/cancel options. It also applies any rendered question override.
+**Purpose**: This builds the plain user-facing approval question for an MCP tool call. It includes the allowed answer choices, such as allow, allow for session, allow permanently, or cancel.
 
-**Data flow**: Inputs are `question_id`, `server`, `tool_name`, optional `connector_name`, `prompt_options`, and optional `question_override`. It chooses the question text from the override or `build_mcp_tool_approval_fallback_message`, normalizes it to end with a single `?`, builds the options vector starting with Allow and conditionally adding session/persistent remember options before Cancel, and returns a populated `RequestUserInputQuestion` with fixed header `"Approve app tool call?"`.
+**Data flow**: It receives the question id, server, tool, connector name, prompt options, and optional custom question text. It chooses the question wording, appends a question mark, builds answer options based on what remembering is allowed, and returns a RequestUserInputQuestion.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` before either legacy prompting or MCP elicitation. It delegates fallback wording to `build_mcp_tool_approval_fallback_message`.
+**Call relations**: maybe_request_mcp_tool_approval calls this before either direct user input or MCP elicitation. When no custom wording is supplied, it uses build_mcp_tool_approval_fallback_message.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval); 2 external calls (format!, vec!).
 
@@ -3306,11 +3318,11 @@ fn build_mcp_tool_approval_fallback_message(
 ) -> String
 ```
 
-**Purpose**: Generates the default approval question text when no connector-specific template is available. It chooses a human-readable actor string based on connector name and server type.
+**Purpose**: This creates a default approval sentence when no template supplies one. It tries to name the actor clearly, using the connector name, “this app,” or the MCP server name.
 
-**Data flow**: Accepts `server`, `tool_name`, and optional `connector_name`. It trims and uses a non-empty connector name when present; otherwise it uses `"this app"` for Codex Apps or `format!("the {server} MCP server")` for other servers. It returns `format!("Allow {actor} to run tool \"{tool_name}\"?")`.
+**Data flow**: It receives the server name, tool name, and optional connector name. It picks the best readable actor label and returns a sentence asking whether that actor may run the tool.
 
-**Call relations**: Used only by `build_mcp_tool_approval_question` as the fallback wording path.
+**Call relations**: build_mcp_tool_approval_question uses this as the fallback prompt text.
 
 *Call graph*: 1 external calls (format!).
 
@@ -3325,11 +3337,11 @@ fn build_mcp_tool_approval_elicitation_request(
 ) -> McpServerElicitationRequestParams
 ```
 
-**Purpose**: Builds the MCP server elicitation request payload for tool approval when the richer elicitation path is enabled. It wraps approval metadata and an empty object schema into the app-server protocol shape.
+**Purpose**: This builds an MCP elicitation request for tool approval. An elicitation is a structured request sent to the client to ask the user for input.
 
-**Data flow**: Accepts `Session`, `TurnContext`, and `McpToolApprovalElicitationRequest`. It chooses the message from `message_override` or the question text, builds metadata with `build_mcp_tool_approval_elicitation_meta`, and returns `McpServerElicitationRequestParams` containing thread/turn IDs, server name, and a `Form` request with empty object schema properties.
+**Data flow**: It receives the session, turn context, and approval elicitation details. It chooses the message text, builds metadata describing the tool and approval choices, creates an empty form schema, and returns request parameters for the MCP server elicitation channel.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` when `Feature::ToolCallMcpElicitation` is enabled. It delegates metadata assembly to `build_mcp_tool_approval_elicitation_meta`.
+**Call relations**: maybe_request_mcp_tool_approval uses this when the tool-call MCP elicitation feature is enabled. It relies on build_mcp_tool_approval_elicitation_meta for the rich metadata.
 
 *Call graph*: calls 1 internal fn (build_mcp_tool_approval_elicitation_meta); called by 1 (maybe_request_mcp_tool_approval); 1 external calls (new).
 
@@ -3344,11 +3356,11 @@ fn build_mcp_tool_approval_elicitation_meta(
     tool_params_display: Option<&[RenderedMc
 ```
 
-**Purpose**: Assembles the structured metadata attached to an MCP approval elicitation, including persistence options, connector/tool descriptors, and tool parameters. This metadata drives richer approval UIs.
+**Purpose**: This builds the metadata attached to an MCP tool approval elicitation. The metadata tells the client what kind of approval this is, what tool and connector are involved, and which persistence choices are available.
 
-**Data flow**: Inputs are `server`, optional approval metadata, optional `tool_params`, optional display params, and `prompt_options`. It creates a JSON map, inserts approval kind and persistence metadata according to allowed remember modes, conditionally inserts tool title/description, connector source/id/name/description for Codex Apps, raw tool params, and serialized display params when conversion succeeds. Returns `Some(JsonValue::Object(meta))` unless the map is empty.
+**Data flow**: It receives server, metadata, tool parameters, display parameters, and prompt options. It fills a JSON object with approval kind, persistence choices, tool title and description, connector details for Codex Apps, raw parameters, and display-ready parameters. It returns the JSON object when non-empty.
 
-**Call relations**: Used only by `build_mcp_tool_approval_elicitation_request`. Its output is consumed by the app-server/UI side of MCP approval elicitation.
+**Call relations**: build_mcp_tool_approval_elicitation_request calls this while constructing the elicitation request that maybe_request_mcp_tool_approval sends to the client.
 
 *Call graph*: called by 1 (build_mcp_tool_approval_elicitation_request); 5 external calls (new, Object, String, json!, to_value).
 
@@ -3361,11 +3373,11 @@ fn build_mcp_tool_approval_display_params(
 ) -> Option<Vec<crate::mcp_tool_approval_templates::RenderedMcpToolApprovalParam>>
 ```
 
-**Purpose**: Builds a simple sorted display-parameter list from raw tool arguments when no connector-specific template supplied a richer ordering or labels. It is the generic fallback for approval UIs.
+**Purpose**: This turns raw tool arguments into a sorted list of display rows for an approval prompt. It gives the UI a simple name, display name, and value for each argument.
 
-**Data flow**: Accepts optional `tool_params` JSON, requires it to be an object, maps each `(name, value)` pair into `RenderedMcpToolApprovalParam { name, value, display_name: name }`, sorts the vector by `name`, and returns `Some(Vec<...>)`.
+**Data flow**: It receives optional JSON tool parameters. If they are a JSON object, it converts each field into a rendered approval parameter, sorts them by name, and returns the list; otherwise it returns nothing.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` when `render_mcp_tool_approval_template` did not provide `tool_params_display`.
+**Call relations**: maybe_request_mcp_tool_approval uses this when no custom approval template already provided display parameters.
 
 
 ##### `parse_mcp_tool_approval_elicitation_response`  (lines 1758–1794)
@@ -3377,11 +3389,11 @@ fn parse_mcp_tool_approval_elicitation_response(
 ) -> McpToolApprovalDecision
 ```
 
-**Purpose**: Converts an MCP elicitation response into an `McpToolApprovalDecision`, honoring explicit persistence metadata and falling back to legacy answer parsing when needed. It bridges the elicitation protocol to the internal approval enum.
+**Purpose**: This interprets the user’s answer from the MCP elicitation approval path. It supports accept, decline, cancel, and metadata that says whether the approval should be remembered.
 
-**Data flow**: Takes optional `ElicitationResponse` and `question_id`. Missing response becomes `Cancel`. `Accept` first checks response meta for `persist=session` or `persist=always`, returning `AcceptForSession` or `AcceptAndRemember` respectively; otherwise it converts elicitation content into a `RequestUserInputResponse` with `request_user_input_response_from_elicitation_content`, parses that with `parse_mcp_tool_approval_response`, and treats a parsed `Cancel` as plain `Accept`. `Decline` maps to `Decline { message: None }`, and `Cancel` maps to `Cancel`.
+**Data flow**: It receives an optional elicitation response and the question id. Missing responses become cancel. Accept responses may become session or permanent approvals based on metadata, or fall back to parsing embedded question answers. Decline and cancel map directly to local decisions.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` after `request_mcp_server_elicitation`. It delegates content conversion and legacy answer parsing to two helpers.
+**Call relations**: maybe_request_mcp_tool_approval calls this after requesting MCP server elicitation. It uses request_user_input_response_from_elicitation_content and parse_mcp_tool_approval_response for compatibility with older answer formats.
 
 *Call graph*: calls 2 internal fn (parse_mcp_tool_approval_response, request_user_input_response_from_elicitation_content); called by 1 (maybe_request_mcp_tool_approval).
 
@@ -3394,11 +3406,11 @@ fn request_user_input_response_from_elicitation_content(
 ) -> Option<RequestUserInputResponse>
 ```
 
-**Purpose**: Converts elicitation form content into the legacy `RequestUserInputResponse` shape so existing answer-parsing logic can be reused. It supports string and string-array answers per question.
+**Purpose**: This converts elicitation response content into the older RequestUserInputResponse shape. It acts like an adapter between two prompt formats.
 
-**Data flow**: Accepts optional JSON `content`. `None` becomes an empty `RequestUserInputResponse`. Otherwise it requires an object, iterates entries, converts string values into one-element answer vectors and array values into vectors of string elements, skips unsupported value types, collects them into a `HashMap<String, RequestUserInputAnswer>`, and returns `Some(RequestUserInputResponse { answers })`.
+**Data flow**: It receives optional JSON content. Missing content becomes an empty answer set; object content is read field by field, accepting string answers or arrays of string answers, and converted into a response map.
 
-**Call relations**: Used only by `parse_mcp_tool_approval_elicitation_response` to reuse `parse_mcp_tool_approval_response`.
+**Call relations**: parse_mcp_tool_approval_elicitation_response calls this when an accepted elicitation response carries answers in the compatibility format.
 
 *Call graph*: called by 1 (parse_mcp_tool_approval_elicitation_response); 1 external calls (new).
 
@@ -3412,11 +3424,11 @@ fn parse_mcp_tool_approval_response(
 ) -> McpToolApprovalDecision
 ```
 
-**Purpose**: Interprets a legacy `RequestUserInputResponse` for an MCP approval question and maps it to an internal approval decision. It recognizes synthetic decline, session remember, persistent remember, plain allow, and cancel.
+**Purpose**: This interprets the answer from the direct user-input approval prompt. It turns selected labels into the local approval decision enum.
 
-**Data flow**: Inputs are optional `RequestUserInputResponse` and `question_id`. Missing response, missing question entry, or no recognized answer yields `Cancel`. Otherwise it inspects the answer strings in priority order: synthetic decline token, `Allow for this session`, `Allow and don't ask me again`, `Allow`, else `Cancel`.
+**Data flow**: It receives an optional user-input response and a question id. Missing response, missing answer, or unrecognized answer becomes cancel. Known labels become decline, accept-for-session, accept-and-remember, or accept.
 
-**Call relations**: Called directly by `maybe_request_mcp_tool_approval` for legacy prompts and indirectly by `parse_mcp_tool_approval_elicitation_response` for elicitation content fallback.
+**Call relations**: maybe_request_mcp_tool_approval uses this for the direct prompt path. parse_mcp_tool_approval_elicitation_response also uses it for elicitation responses that contain old-style prompt answers.
 
 *Call graph*: called by 2 (maybe_request_mcp_tool_approval, parse_mcp_tool_approval_elicitation_response).
 
@@ -3430,11 +3442,11 @@ fn normalize_approval_decision_for_mode(
 ) -> McpToolApprovalDecision
 ```
 
-**Purpose**: Downgrades remembered-approval decisions to plain accept when the tool’s approval mode is `Prompt`, where persistence should not be honored. It enforces approval-mode semantics after parsing.
+**Purpose**: This removes remembered-approval choices when the approval mode does not allow them. In prompt-only mode, “allow for session” and “allow and remember” are treated as a plain one-time allow.
 
-**Data flow**: Accepts an `McpToolApprovalDecision` and `approval_mode`. If mode is `AppToolApproval::Prompt` and the decision is `AcceptForSession` or `AcceptAndRemember`, it returns `Accept`; otherwise it returns the original decision.
+**Data flow**: It receives a decision and the configured approval mode. If the mode is prompt-only and the decision asks to remember, it returns a plain accept; otherwise it returns the original decision.
 
-**Call relations**: Applied by `maybe_request_mcp_tool_approval` after parsing either elicitation or legacy prompt responses and before persistence side effects are applied.
+**Call relations**: maybe_request_mcp_tool_approval calls this after parsing user or elicitation responses, before applying the decision.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval); 1 external calls (matches!).
 
@@ -3445,11 +3457,11 @@ fn normalize_approval_decision_for_mode(
 async fn mcp_tool_approval_is_remembered(sess: &Session, key: &McpToolApprovalKey) -> bool
 ```
 
-**Purpose**: Checks whether a session-scoped approval key has already been remembered as approved for this session. It is the in-memory approval cache lookup.
+**Purpose**: This checks whether a matching MCP tool approval has already been remembered for the session. It avoids asking the user again for the same approved tool.
 
-**Data flow**: Takes `Session` and `McpToolApprovalKey`, locks `sess.services.tool_approvals`, and returns `true` only when the stored decision for that key is `ReviewDecision::ApprovedForSession`.
+**Data flow**: It receives the session and approval key. It locks the in-memory approval store, looks up the key, and returns true only when it was approved for the session.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` before prompting so repeated calls can auto-accept within the session.
+**Call relations**: maybe_request_mcp_tool_approval calls this before running hooks or prompts.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval); 1 external calls (matches!).
 
@@ -3460,11 +3472,11 @@ async fn mcp_tool_approval_is_remembered(sess: &Session, key: &McpToolApprovalKe
 async fn remember_mcp_tool_approval(sess: &Session, key: McpToolApprovalKey)
 ```
 
-**Purpose**: Stores a session-scoped remembered approval in the in-memory approval cache. It records the decision as approved-for-session.
+**Purpose**: This stores a session-level approval for an MCP tool. It lets future matching calls proceed without another approval prompt during the same session.
 
-**Data flow**: Accepts `Session` and an `McpToolApprovalKey`, locks `sess.services.tool_approvals`, and inserts `ReviewDecision::ApprovedForSession` for that key.
+**Data flow**: It receives the session and approval key. It locks the approval store and writes an approved-for-session decision under that key.
 
-**Call relations**: Used by `apply_mcp_tool_approval_decision` and as a fallback in `maybe_persist_mcp_tool_approval` when persistence fails or is unavailable.
+**Call relations**: apply_mcp_tool_approval_decision calls it for session approvals, and maybe_persist_mcp_tool_approval uses it as a fallback or final session cache after persistence.
 
 *Call graph*: called by 2 (apply_mcp_tool_approval_decision, maybe_persist_mcp_tool_approval).
 
@@ -3480,11 +3492,11 @@ async fn apply_mcp_tool_approval_decision(
     persist
 ```
 
-**Purpose**: Applies the side effects of an approval decision, such as remembering it for the session or persisting it to config. Non-accepting decisions have no side effects.
+**Purpose**: This applies the side effects of an approval decision. In practice, that means remembering approvals for this session or saving them permanently when the user chose that.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, a decision reference, and optional session/persistent approval keys. `AcceptForSession` remembers the session key if present. `AcceptAndRemember` prefers persistent storage via `maybe_persist_mcp_tool_approval` when a persistent key exists, otherwise falls back to remembering the session key. Plain `Accept`, `Decline`, and `Cancel` do nothing.
+**Data flow**: It receives the session, turn context, decision, and optional session and persistent keys. Session approvals are stored in memory. Permanent approvals are written to configuration when possible, otherwise remembered in memory. Declines, cancels, and one-time accepts do not change approval storage.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` after guardian, elicitation, or legacy prompt decisions are obtained.
+**Call relations**: maybe_request_mcp_tool_approval calls this after a guardian, elicitation, or user prompt decision is known.
 
 *Call graph*: calls 2 internal fn (maybe_persist_mcp_tool_approval, remember_mcp_tool_approval); called by 1 (maybe_request_mcp_tool_approval).
 
@@ -3499,11 +3511,11 @@ async fn maybe_persist_mcp_tool_approval(
 )
 ```
 
-**Purpose**: Attempts to persist an approval decision into config for future runs, then reloads user config and remembers the approval for the current session. On failure it logs and falls back to session-only memory.
+**Purpose**: This tries to save a permanent MCP tool approval into the user or project configuration. If saving fails, it still remembers the approval for the current session.
 
-**Data flow**: Accepts `Session`, `TurnContext`, and an approval `key`. It branches by server type: Codex Apps approvals persist via `persist_codex_app_tool_approval` using connector ID, while other servers use `persist_non_app_mcp_tool_approval`. If persistence fails it logs an error and remembers the approval only in-session. On success it reloads the user config layer and then remembers the approval in-session as well.
+**Data flow**: It receives the session, turn context, and approval key. It chooses the right persistence path for Codex Apps versus other MCP servers, writes the config edit, reloads user configuration on success, and stores a session approval. On errors it logs the failure and falls back to session memory.
 
-**Call relations**: Called only by `apply_mcp_tool_approval_decision` for `AcceptAndRemember`. It delegates actual config edits to the persistence helpers below.
+**Call relations**: apply_mcp_tool_approval_decision calls this for “allow and don’t ask me again.” It delegates actual config edits to app-specific or non-app persistence helpers.
 
 *Call graph*: calls 3 internal fn (persist_codex_app_tool_approval, persist_non_app_mcp_tool_approval, remember_mcp_tool_approval); called by 1 (apply_mcp_tool_approval_decision); 2 external calls (reload_user_config_layer, error!).
 
@@ -3518,11 +3530,11 @@ async fn persist_codex_app_tool_approval(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes a persistent approval for a Codex Apps connector tool into config under the `apps.<connector>.tools.<tool>.approval_mode` path. It stores the mode as `approve`.
+**Purpose**: This writes a permanent approval for a Codex Apps connector tool into configuration. It sets that app tool’s approval mode to approve.
 
-**Data flow**: Takes `config`, `connector_id`, and `tool_name`, builds a `ConfigEditsBuilder::for_config(config)` edit setting the nested path to `value("approve")`, applies it asynchronously, and returns `anyhow::Result<()>`.
+**Data flow**: It receives the config, connector id, and tool name. It builds a config edit at the apps connector tool path and applies it asynchronously, returning success or an error.
 
-**Call relations**: Used by `maybe_persist_mcp_tool_approval` for Codex Apps approvals.
+**Call relations**: maybe_persist_mcp_tool_approval calls this when the approval key belongs to the Codex Apps server.
 
 *Call graph*: called by 1 (maybe_persist_mcp_tool_approval); 3 external calls (for_config, value, vec!).
 
@@ -3537,11 +3549,11 @@ async fn persist_custom_mcp_tool_approval(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Test-only helper that persists approval for a custom MCP server using the same config-location resolution as production code. It errors if the server is not configured.
+**Purpose**: This test-only helper writes approval for a custom MCP tool. It is compiled for tests and helps exercise the same config-editing path used in production.
 
-**Data flow**: Accepts `config`, `server`, and `tool_name`, resolves an optional builder with `custom_mcp_tool_approval_config_builder`, bails if absent, and otherwise delegates to `persist_custom_mcp_tool_approval_with`.
+**Data flow**: It receives config, server name, and tool name. It finds the right config editor for that server, fails if the server is not configured, and writes the tool approval setting.
 
-**Call relations**: Compiled only in tests and used by test code to exercise persistence behavior without going through the full approval flow.
+**Call relations**: Test code can call this directly. It uses custom_mcp_tool_approval_config_builder and persist_custom_mcp_tool_approval_with to share production behavior.
 
 *Call graph*: calls 2 internal fn (custom_mcp_tool_approval_config_builder, persist_custom_mcp_tool_approval_with); 1 external calls (bail!).
 
@@ -3557,11 +3569,11 @@ async fn persist_non_app_mcp_tool_approval(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Persists approval for a non-Codex-Apps MCP tool either into project/user MCP config or into the owning plugin’s config section. It errors when the server cannot be located in either place.
+**Purpose**: This writes a permanent approval for a non-Codex-Apps MCP tool. It supports servers configured directly by the user or supplied by enabled plugins.
 
-**Data flow**: Inputs are `Session`, `config`, `server`, and `tool_name`. It first asks `custom_mcp_tool_approval_config_builder` for a project/user config builder and, if present, delegates to `persist_custom_mcp_tool_approval_with`. Otherwise it loads active plugins for the current config input, finds one whose `mcp_servers` contains the server, and if found applies a config edit under `plugins.<plugin_config_name>.mcp_servers.<server>.tools.<tool>.approval_mode = "approve"`. If neither path exists it returns an error.
+**Data flow**: It receives the session, config, server name, and tool name. It first looks for a direct custom MCP config location; if found, it writes there. Otherwise it searches active plugins and writes the approval under the plugin’s server config. If neither exists, it returns an error.
 
-**Call relations**: Called by `maybe_persist_mcp_tool_approval` for non-app servers. It relies on config-location helpers and plugin discovery to choose the correct persistence target.
+**Call relations**: maybe_persist_mcp_tool_approval calls this for all non-app MCP servers. It uses helper functions to choose and apply the correct config edit.
 
 *Call graph*: calls 2 internal fn (custom_mcp_tool_approval_config_builder, persist_custom_mcp_tool_approval_with); called by 1 (maybe_persist_mcp_tool_approval); 5 external calls (bail!, plugins_config_input, for_config, value, vec!).
 
@@ -3575,11 +3587,11 @@ fn custom_mcp_tool_approval_config_builder(
 ) -> anyhow::Result<Option<ConfigEditsBuilder>>
 ```
 
-**Purpose**: Chooses the config file location where a custom MCP server approval should be persisted, preferring project config over user config. It returns no builder when the server is not configured in either place.
+**Purpose**: This chooses where a custom MCP tool approval should be written. It prefers the project configuration if the server is defined there, otherwise it uses user configuration when the server is defined by the user.
 
-**Data flow**: Accepts `config` and `server`. If `project_mcp_tool_approval_config_folder(config, server)` returns a folder, it returns `Some(ConfigEditsBuilder::new(&folder))`. Otherwise it checks `user_mcp_server_is_configured(config, server)?` and returns `Some(ConfigEditsBuilder::for_config(config))` only when true.
+**Data flow**: It receives config and server name. It checks project layers for that server, then checks user configuration, and returns a ConfigEditsBuilder for the right location or nothing if the server is not configured.
 
-**Call relations**: Used by both `persist_custom_mcp_tool_approval` and `persist_non_app_mcp_tool_approval` to resolve where edits should be written.
+**Call relations**: persist_custom_mcp_tool_approval and persist_non_app_mcp_tool_approval call this before writing direct MCP server approval settings.
 
 *Call graph*: calls 3 internal fn (new, project_mcp_tool_approval_config_folder, user_mcp_server_is_configured); called by 2 (persist_custom_mcp_tool_approval, persist_non_app_mcp_tool_approval).
 
@@ -3594,11 +3606,11 @@ async fn persist_custom_mcp_tool_approval_with(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Applies the actual config edit that marks a custom MCP tool as approved. It writes under the standard `mcp_servers.<server>.tools.<tool>.approval_mode` path.
+**Purpose**: This performs the actual config edit for a custom MCP server tool approval. It sets the tool’s approval mode to approve.
 
-**Data flow**: Takes a `ConfigEditsBuilder`, `server`, and `tool_name`, adds a single `ConfigEdit::SetPath` setting the nested approval mode to `value("approve")`, applies it asynchronously, and returns `anyhow::Result<()>`.
+**Data flow**: It receives a prepared config edit builder, server name, and tool name. It builds the path under mcp_servers, adds the approval_mode value, applies the edit, and returns success or an error.
 
-**Call relations**: Called by both custom-server persistence helpers once the correct config builder has been chosen.
+**Call relations**: persist_custom_mcp_tool_approval and persist_non_app_mcp_tool_approval call this after deciding which config file or folder should be edited.
 
 *Call graph*: called by 2 (persist_custom_mcp_tool_approval, persist_non_app_mcp_tool_approval); 3 external calls (with_edits, value, vec!).
 
@@ -3609,11 +3621,11 @@ async fn persist_custom_mcp_tool_approval_with(
 fn user_mcp_server_is_configured(config: &Config, server: &str) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Checks whether a named MCP server exists in the effective user config layer. It is used to decide whether user config is a valid persistence target.
+**Purpose**: This checks whether a given MCP server is present in the user’s configuration. It helps decide whether permanent approval can be written to the user config.
 
-**Data flow**: Accepts `config` and `server`, extracts the `mcp_servers` table from `effective_user_config`, deserializes it into `HashMap<String, codex_config::types::McpServerConfig>`, and returns whether the map contains the server name. Missing `mcp_servers` yields `Ok(false)`.
+**Data flow**: It receives config and server name. It reads the effective user config’s mcp_servers table, deserializes it into server configs, and returns whether the server is present.
 
-**Call relations**: Called by `custom_mcp_tool_approval_config_builder` when no project config layer contains the server.
+**Call relations**: custom_mcp_tool_approval_config_builder calls this after checking project configuration.
 
 *Call graph*: called by 1 (custom_mcp_tool_approval_config_builder); 1 external calls (deserialize).
 
@@ -3627,11 +3639,11 @@ fn project_mcp_tool_approval_config_folder(
 ) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Finds the highest-priority project config layer that defines the named MCP server and returns that layer’s config folder. It lets persistent approvals be written back to the project that owns the server definition.
+**Purpose**: This finds the project configuration folder that defines a given MCP server. Writing approval there keeps project-defined MCP settings with the project.
 
-**Data flow**: Accepts `config` and `server`, iterates `config.config_layer_stack.layers_high_to_low()`, keeps only `ConfigLayerSource::Project` layers, attempts to deserialize each layer’s `mcp_servers` table, and returns `layer.config_folder()` for the first layer whose server map contains the target server.
+**Data flow**: It receives config and server name. It scans configuration layers from high to low, considers only project layers, deserializes their mcp_servers table, and returns the folder for the first layer containing the server.
 
-**Call relations**: Used by `custom_mcp_tool_approval_config_builder` to prefer project-local persistence over user-global persistence.
+**Call relations**: custom_mcp_tool_approval_config_builder calls this before falling back to user configuration.
 
 *Call graph*: called by 1 (custom_mcp_tool_approval_config_builder).
 
@@ -3642,11 +3654,11 @@ fn project_mcp_tool_approval_config_folder(
 fn requires_mcp_tool_approval(annotations: Option<&ToolAnnotations>) -> bool
 ```
 
-**Purpose**: Determines whether tool annotations imply that approval is required by default. Destructive or open-world tools require approval; explicitly read-only tools do not.
+**Purpose**: This decides whether a tool’s safety annotations require approval. It treats destructive or open-world tools cautiously, and lets clearly read-only tools avoid prompts.
 
-**Data flow**: Accepts optional `ToolAnnotations`. If `destructive_hint == Some(true)`, returns `true`. Otherwise if `read_only_hint` is true, returns `false`. In all other cases it returns `destructive_hint.unwrap_or(true) || open_world_hint.unwrap_or(true)`.
+**Data flow**: It receives optional tool annotations. A destructive hint forces approval; a read-only hint can avoid approval; missing or uncertain destructive/open-world hints default toward requiring approval.
 
-**Call relations**: Called by `maybe_request_mcp_tool_approval` before prompting logic. It combines annotation hints into the baseline approval requirement.
+**Call relations**: maybe_request_mcp_tool_approval calls this after checking global auto-approval policy and before deciding whether to prompt.
 
 *Call graph*: called by 1 (maybe_request_mcp_tool_approval).
 
@@ -3663,24 +3675,26 @@ async fn notify_mcp_tool_call_skip(
     message: Strin
 ```
 
-**Purpose**: Emits the correct started/completed event sequence for a tool call that is blocked, declined, or cancelled, and returns the skip reason as an error result. It keeps skipped calls visible in turn history.
+**Purpose**: This records a tool call that was not run, such as one blocked by policy, declined by the user, or canceled. It still emits lifecycle events so the conversation history shows what happened.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `call_id`, `McpInvocation`, item metadata, skip `message`, and `already_started`. If the call was not already started it emits a started event. It then emits a completed event with zero duration and a truncated event-safe error result via `truncate_mcp_tool_result_for_event(&Err(message.clone()))`, and finally returns `Err(message)`.
+**Data flow**: It receives the session, turn context, call id, invocation, metadata, message, and whether a started event already happened. It emits a started event if needed, emits a completed event with zero duration and a truncated error result, and returns the error message as a failed result.
 
-**Call relations**: Called by `handle_mcp_tool_call` for app-policy blocks and for decline/cancel approval outcomes. It delegates event emission to the notify helpers and truncation to `truncate_mcp_tool_result_for_event`.
+**Call relations**: handle_mcp_tool_call calls this for disabled tools, declined approvals, and canceled approvals. It uses the same start and completion notification helpers as real tool calls.
 
 *Call graph*: calls 3 internal fn (notify_mcp_tool_call_completed, notify_mcp_tool_call_started, truncate_mcp_tool_result_for_event); called by 1 (handle_mcp_tool_call); 2 external calls (clone, clone).
 
 
 ### `core/src/mcp_openai_file.rs`
 
-`domain_logic` · `MCP tool execution`
+`domain_logic` · `tool execution`
 
-This module is narrowly focused on execution-time argument rewriting for MCP tools that declare OpenAI file inputs. The top-level `rewrite_mcp_tool_arguments_for_openai_files` is intentionally conservative: if no file-param declaration exists, if arguments are absent, or if the arguments payload is not a JSON object, it returns the original value unchanged. When declarations are present, it clones the argument object, fetches the current auth from the session, and rewrites only the named fields.
+Some Apps SDK-style MCP tools say, through metadata, that certain arguments are files. The model or caller may provide those arguments as local paths, such as "report.csv". But the downstream tool expects a richer object that points to a file already uploaded to OpenAI storage. This file is the bridge between those two worlds.
 
-`rewrite_argument_value_for_openai_files` supports exactly two shapes for a declared field: a single string path or an array of string paths. Any other shape, or any mixed-type array, yields `Ok(None)` so the caller leaves that field untouched rather than partially rewriting it. Actual upload work happens in `build_uploaded_argument_value`. That function enforces several invariants before any upload: ChatGPT/Codex-backed auth must exist, a primary turn environment must be available, the environment cwd must resolve to an absolute native path, the target path must exist and be a file, and its size must not exceed `OPENAI_FILE_UPLOAD_LIMIT_BYTES`. It reads metadata first so oversized files are rejected before streaming contents. Successful uploads return the downstream Apps-compatible JSON object containing `download_url`, `file_id`, `mime_type`, `file_name`, `uri`, and `file_size_bytes`.
+At tool execution time, it looks only at the argument names that were explicitly declared as file inputs. For each one, it checks whether the value is a single path string or a list of path strings. It then finds the file inside the primary turn environment, checks that it is really a file, rejects it if it is larger than the allowed upload size, reads its contents, uploads it to OpenAI file storage, and replaces the original path with an object containing the uploaded file ID, download URL, MIME type, name, URI, and size.
 
-The tests use a temporary environment cwd plus `wiremock` to verify scalar and array rewrites, upload request shapes, oversized-file rejection, no-op behavior when declarations are absent, and surfaced error messages for missing files.
+A useful analogy is a coat check: the tool should not receive the coat itself or just the coat’s location at home. This file takes the coat, checks it in, and gives the tool the claim ticket it knows how to use.
+
+The file is careful not to rewrite undeclared arguments, malformed values, or calls with no file metadata. It also requires ChatGPT-style authentication, because uploading to OpenAI storage needs that account context.
 
 #### Function details
 
@@ -3695,11 +3709,11 @@ async fn rewrite_mcp_tool_arguments_for_openai_files(
 ) ->
 ```
 
-**Purpose**: Rewrites only the declared MCP tool argument fields that represent file inputs, uploading referenced files and replacing those fields with provided-file payloads. It preserves the original arguments when no rewrite is needed or possible.
+**Purpose**: This is the main entry point for rewriting MCP tool arguments that contain file paths. It only acts when the tool metadata says which argument names are file inputs; otherwise it leaves the arguments untouched.
 
-**Data flow**: Accepts a `Session`, `TurnContext`, optional JSON arguments, and optional slice of declared file-input field names. If declarations are absent it returns the original `arguments_value`; if arguments are absent it returns `Ok(None)`; if arguments are not a JSON object it returns them unchanged. Otherwise it fetches auth from `sess.services.auth_manager`, clones the argument map, iterates declared field names, calls `rewrite_argument_value_for_openai_files` for each present field, inserts any rewritten values, and returns either the original JSON or a new `JsonValue::Object`.
+**Data flow**: It receives the current session, the current turn context, the original JSON arguments, and the list of argument names that should be treated as files. If there is no file list, no arguments, or the arguments are not a JSON object, it returns the original value. Otherwise it gets the current authentication, checks each declared file field, asks the lower-level rewrite function to upload and convert that value, and returns a new JSON object only if something changed.
 
-**Call relations**: Called from MCP tool execution in `handle_approved_mcp_tool_call`, and directly by tests. It delegates per-field logic to `rewrite_argument_value_for_openai_files` and only performs object-level orchestration.
+**Call relations**: During an approved MCP tool call, handle_approved_mcp_tool_call calls this function before sending arguments onward to the tool. For each declared file argument, it hands the value to rewrite_argument_value_for_openai_files, which does the single-value or array-specific work. The tests call it both to confirm that undeclared file parameters are ignored and to confirm that upload failures are reported clearly.
 
 *Call graph*: calls 1 internal fn (rewrite_argument_value_for_openai_files); called by 3 (openai_file_argument_rewrite_requires_declared_file_params, rewrite_mcp_tool_arguments_for_openai_files_surfaces_upload_failures, handle_approved_mcp_tool_call); 1 external calls (Object).
 
@@ -3715,11 +3729,11 @@ async fn rewrite_argument_value_for_openai_files(
 ) -> Result<Option<JsonValue>, String>
 ```
 
-**Purpose**: Rewrites one declared argument value if it is a string path or an array of string paths. Unsupported shapes are treated as non-rewritable rather than hard errors.
+**Purpose**: This function rewrites one argument value if it looks like a file path or a list of file paths. It is used so the main argument-rewriting function does not need to know the details of single-file versus multi-file inputs.
 
-**Data flow**: Takes `turn_context`, optional `CodexAuth`, the `field_name`, and a JSON `value`. For `JsonValue::String`, it uploads one file via `build_uploaded_argument_value` and wraps the result in `Some`. For `JsonValue::Array`, it allocates a result vector, requires every element to be a string path, uploads each with its array index for contextualized errors, and returns `Some(JsonValue::Array(...))`. For any other JSON type it returns `Ok(None)`.
+**Data flow**: It receives the turn context, optional authentication, the argument name, and the JSON value for that argument. If the value is a string, it treats it as one file path and asks build_uploaded_argument_value to upload it. If the value is an array, it requires every item to be a string path, uploads each one, and returns an array of uploaded-file objects. If the value is anything else, or if an array contains a non-string item, it returns no rewrite.
 
-**Call relations**: Invoked by the top-level rewrite function for each declared field, and directly by scalar/array rewrite tests. It delegates all filesystem and upload work to `build_uploaded_argument_value`.
+**Call relations**: rewrite_mcp_tool_arguments_for_openai_files calls this when it finds a declared file argument. This function then delegates each actual file upload to build_uploaded_argument_value. The scalar-path and array-path tests call it directly to verify both supported shapes.
 
 *Call graph*: calls 1 internal fn (build_uploaded_argument_value); called by 3 (rewrite_mcp_tool_arguments_for_openai_files, rewrite_argument_value_for_openai_files_rewrites_array_paths, rewrite_argument_value_for_openai_files_rewrites_scalar_path); 2 external calls (Array, with_capacity).
 
@@ -3736,11 +3750,11 @@ async fn build_uploaded_argument_value(
 ) -> Result<JsonValue, String
 ```
 
-**Purpose**: Reads a file from the primary turn environment, uploads it to OpenAI file storage, and returns the Apps-compatible JSON descriptor for that uploaded file. It also produces contextualized, field-specific error messages.
+**Purpose**: This function does the real file upload work for one path. It verifies the caller is allowed to upload, finds and checks the file in the turn environment, sends it to OpenAI file storage, and builds the JSON object that the downstream Apps tool expects.
 
-**Data flow**: Inputs are `turn_context`, optional auth, `field_name`, optional array `index`, and `file_path`. It first builds an error-context closure, then rejects missing auth or non-Codex-backed auth. It fetches the primary turn environment, resolves the environment cwd to an absolute native path, joins the relative or provided file path, converts it to `PathUri`, obtains filesystem metadata, rejects non-files and files larger than `OPENAI_FILE_UPLOAD_LIMIT_BYTES`, opens a read stream, derives a filename from the resolved path, converts auth with `auth_provider_from_auth`, and calls `upload_openai_file` using the trimmed `chatgpt_base_url`. On success it returns a JSON object with `download_url`, `file_id`, `mime_type`, `file_name`, `uri`, and `file_size_bytes`.
+**Data flow**: It receives the turn context, optional authentication, the argument name, an optional array index, and a file path string. It first prepares error messages that mention the exact argument, and array index if relevant. It rejects missing or non-ChatGPT authentication. Then it finds the primary turn environment, resolves the file path relative to that environment’s current directory, checks file metadata, rejects directories and oversized files, reads the file stream, uploads it using the configured ChatGPT base URL and auth, and returns a JSON object with the uploaded file’s download URL, file ID, MIME type, file name, URI, and byte size.
 
-**Call relations**: This is the heavy-lifting helper used by `rewrite_argument_value_for_openai_files` and exercised directly by upload and oversized-file tests. It bridges turn-environment filesystem access to the external OpenAI upload API.
+**Call relations**: rewrite_argument_value_for_openai_files calls this once for each path it needs to convert. Internally it relies on path conversion helpers to identify the file, the environment filesystem to inspect and read it, an auth conversion helper to prepare upload credentials, and upload_openai_file to perform the network upload. The tests call it directly to prove a normal upload works and that an oversized file is rejected before reading.
 
 *Call graph*: calls 1 internal fn (from_abs_path); called by 3 (rewrite_argument_value_for_openai_files, build_uploaded_argument_value_rejects_oversized_file_before_reading, build_uploaded_argument_value_uploads_environment_file); 4 external calls (upload_openai_file, auth_provider_from_auth, format!, json!).
 
@@ -3751,11 +3765,11 @@ async fn build_uploaded_argument_value(
 fn set_primary_environment_cwd(turn_context: &mut TurnContext, cwd: &Path)
 ```
 
-**Purpose**: Replaces the primary turn environment’s cwd with a supplied absolute path so tests can resolve relative file arguments against a temporary directory. It also disables the permission profile for the test context.
+**Purpose**: This test helper changes the primary test environment’s current working directory. Tests use it so relative file paths like "file_report.csv" point at temporary files created during the test.
 
-**Data flow**: Accepts mutable `TurnContext` and `cwd: &Path`, converts the path to `AbsolutePathBuf`, sets `turn_context.permission_profile` to `PermissionProfile::Disabled`, grabs the first mutable turn environment, and overwrites it with a new `TurnEnvironment` preserving environment ID, environment handle, and shell while swapping in `PathUri::from_abs_path(&cwd)`.
+**Data flow**: It receives a mutable turn context and a filesystem path. It converts the path into the project’s absolute-path type, disables permission restrictions for the test context, takes the first turn environment as the primary one, and replaces it with a new environment record that has the same identity, filesystem, and shell but a different current directory.
 
-**Call relations**: Used by the upload-related tests before calling the rewrite helpers. It prepares the test `TurnContext` so file lookups happen in the temporary directory created by each test.
+**Call relations**: The upload-related tests call this helper after creating temporary files. It prepares the turn context so build_uploaded_argument_value can resolve relative paths through the normal environment lookup path rather than using hard-coded absolute paths.
 
 *Call graph*: calls 3 internal fn (new, try_from, from_abs_path); 1 external calls (clone).
 
@@ -3766,11 +3780,11 @@ fn set_primary_environment_cwd(turn_context: &mut TurnContext, cwd: &Path)
 async fn openai_file_argument_rewrite_requires_declared_file_params()
 ```
 
-**Purpose**: Verifies that the top-level rewrite function is a no-op when no `openai/fileParams` declaration is provided. This protects ordinary MCP arguments from accidental rewriting.
+**Purpose**: This test confirms that file rewriting is opt-in. A tool argument that looks like a file path is not uploaded unless the tool metadata explicitly marks that argument as a file input.
 
-**Data flow**: Creates a session and turn context, builds an arguments object containing a `file` path, calls `rewrite_mcp_tool_arguments_for_openai_files` with `openai_file_input_params` set to `None`, awaits success, and asserts the returned JSON equals the original arguments.
+**Data flow**: It creates a test session and turn context, builds JSON arguments containing a file-like path, and calls rewrite_mcp_tool_arguments_for_openai_files with no declared file parameters. The output is expected to be exactly the same JSON that went in.
 
-**Call relations**: Directly exercises the early-return branch in `rewrite_mcp_tool_arguments_for_openai_files`. It confirms the declaration gate is mandatory before any upload logic runs.
+**Call relations**: This test calls the main rewriting function directly. It protects the larger MCP tool flow from accidentally uploading or changing ordinary string arguments just because they happen to look like paths.
 
 *Call graph*: calls 2 internal fn (rewrite_mcp_tool_arguments_for_openai_files, make_session_and_context); 3 external calls (new, assert_eq!, json!).
 
@@ -3781,11 +3795,11 @@ async fn openai_file_argument_rewrite_requires_declared_file_params()
 async fn build_uploaded_argument_value_uploads_environment_file()
 ```
 
-**Purpose**: Checks the full happy path for reading a local environment file and uploading it through the OpenAI file API. It validates both outbound HTTP interactions and the returned rewritten JSON payload.
+**Purpose**: This test proves that one real file in the turn environment can be uploaded and converted into the expected uploaded-file JSON shape. It uses a fake HTTP server so no real OpenAI service is contacted.
 
-**Data flow**: Starts a `wiremock::MockServer`, installs mocks for file creation, upload PUT, and upload completion endpoints, creates a session/turn context plus dummy ChatGPT auth, writes `file_report.csv` into a temp directory, points the primary environment cwd there, rewrites `chatgpt_base_url` to the mock server, then calls `build_uploaded_argument_value`. It asserts the returned JSON contains the expected download URL, file ID, MIME type, file name, sediment URI, and byte size.
+**Data flow**: It starts a mock server that expects the upload negotiation, the file upload request, and the final uploaded confirmation request. It creates a temporary CSV file, points the turn environment at that directory, changes the test configuration to use the mock server, and calls build_uploaded_argument_value. The result is compared with the exact JSON object expected from the mocked upload response.
 
-**Call relations**: Invokes `build_uploaded_argument_value` directly to test the end-to-end upload path. The mock server stands in for the external API that the production helper delegates to via `upload_openai_file`.
+**Call relations**: This test exercises build_uploaded_argument_value directly. The mock server stands in for upload_openai_file’s network calls, letting the test verify both local file handling and the final JSON returned to rewrite_argument_value_for_openai_files.
 
 *Call graph*: calls 3 internal fn (build_uploaded_argument_value, make_session_and_context, create_dummy_chatgpt_auth_for_testing); 10 external calls (new, given, start, new, assert_eq!, set_primary_environment_cwd, format!, json!, tempdir, write).
 
@@ -3796,11 +3810,11 @@ async fn build_uploaded_argument_value_uploads_environment_file()
 async fn build_uploaded_argument_value_rejects_oversized_file_before_reading()
 ```
 
-**Purpose**: Ensures oversized files are rejected based on metadata before any content streaming or upload attempt occurs. It verifies the error message includes the size information.
+**Purpose**: This test checks the safety limit that prevents files larger than OpenAI’s upload limit from being read and uploaded. It matters because large files could waste memory, time, or network bandwidth.
 
-**Data flow**: Creates a session/turn context and dummy auth, creates a sparse file larger than `OPENAI_FILE_UPLOAD_LIMIT_BYTES`, sets the primary environment cwd to the temp directory, calls `build_uploaded_argument_value`, expects an error, and asserts the error text mentions that the file is too large and includes the oversized byte count.
+**Data flow**: It creates a temporary sparse file whose recorded size is one byte over the upload limit, prepares a turn context that points at that directory, and calls build_uploaded_argument_value. Instead of returning uploaded-file JSON, the function must return an error that mentions the file is too large and includes the oversized byte count.
 
-**Call relations**: Targets the size-check branch inside `build_uploaded_argument_value`. It demonstrates the function’s design choice to inspect metadata first and fail early.
+**Call relations**: This test calls build_uploaded_argument_value directly because the size check happens inside that function. It verifies an important early-exit path used by all higher-level rewriting flows.
 
 *Call graph*: calls 3 internal fn (build_uploaded_argument_value, make_session_and_context, create_dummy_chatgpt_auth_for_testing); 4 external calls (assert!, set_primary_environment_cwd, create, tempdir).
 
@@ -3811,11 +3825,11 @@ async fn build_uploaded_argument_value_rejects_oversized_file_before_reading()
 async fn rewrite_argument_value_for_openai_files_rewrites_scalar_path()
 ```
 
-**Purpose**: Verifies that a single string file path is rewritten into one uploaded-file descriptor. It covers the scalar branch of the per-field rewrite helper.
+**Purpose**: This test confirms that a single string file path is rewritten into one uploaded-file object. It covers the common case where a tool argument accepts one file.
 
-**Data flow**: Sets up the same mock upload sequence as the direct upload test, creates a temp file and environment cwd, rewrites `chatgpt_base_url`, then calls `rewrite_argument_value_for_openai_files` with `field_name = "file"` and a JSON string path. It asserts the result is `Some(...)` containing the expected uploaded-file JSON object.
+**Data flow**: It creates a mock upload server, a temporary file, a test turn context whose working directory contains that file, and a ChatGPT-style test auth value. It calls rewrite_argument_value_for_openai_files with a JSON string path. The expected output is a JSON object containing the mocked uploaded file details.
 
-**Call relations**: Calls `rewrite_argument_value_for_openai_files` directly rather than the top-level object rewriter. It validates that the helper delegates correctly to `build_uploaded_argument_value` for scalar values.
+**Call relations**: This test calls rewrite_argument_value_for_openai_files directly, which then calls build_uploaded_argument_value. It proves that the middle layer correctly recognizes a scalar string as a file path and returns the uploaded result in the shape the main rewriter will insert into tool arguments.
 
 *Call graph*: calls 3 internal fn (rewrite_argument_value_for_openai_files, make_session_and_context, create_dummy_chatgpt_auth_for_testing); 10 external calls (new, given, start, new, assert_eq!, set_primary_environment_cwd, format!, json!, tempdir, write).
 
@@ -3826,11 +3840,11 @@ async fn rewrite_argument_value_for_openai_files_rewrites_scalar_path()
 async fn rewrite_argument_value_for_openai_files_rewrites_array_paths()
 ```
 
-**Purpose**: Verifies that an array of string file paths is rewritten element-by-element into an array of uploaded-file descriptors. It covers indexed error context and repeated uploads.
+**Purpose**: This test confirms that an argument containing a list of file paths is rewritten into a list of uploaded-file objects. It covers tools that accept multiple files in one argument.
 
-**Data flow**: Creates a mock server with separate mocked create/upload/complete flows for `one.csv` and `two.csv`, writes both files into a temp directory, sets the primary environment cwd, rewrites `chatgpt_base_url`, then calls `rewrite_argument_value_for_openai_files` with `field_name = "files"` and a JSON array of two paths. It asserts the result is `Some(JsonValue::Array(...))` containing two uploaded-file descriptor objects in order.
+**Data flow**: It creates two temporary CSV files and a mock server with separate expected upload flows for each one. It points the turn context at the temporary directory, configures uploads to go to the mock server, and calls rewrite_argument_value_for_openai_files with a JSON array of two path strings. The output must be a JSON array with one uploaded-file object for each input path, in the same order.
 
-**Call relations**: Exercises the array branch of `rewrite_argument_value_for_openai_files`. It indirectly validates repeated calls to `build_uploaded_argument_value` and preservation of array ordering.
+**Call relations**: This test exercises the array branch of rewrite_argument_value_for_openai_files. That function calls build_uploaded_argument_value once per path, so the test verifies that multi-file arguments are uploaded item by item and then handed back as a single rewritten array.
 
 *Call graph*: calls 3 internal fn (rewrite_argument_value_for_openai_files, make_session_and_context, create_dummy_chatgpt_auth_for_testing); 10 external calls (new, given, start, new, assert_eq!, set_primary_environment_cwd, format!, json!, tempdir, write).
 
@@ -3841,11 +3855,11 @@ async fn rewrite_argument_value_for_openai_files_rewrites_array_paths()
 async fn rewrite_mcp_tool_arguments_for_openai_files_surfaces_upload_failures()
 ```
 
-**Purpose**: Checks that the top-level rewrite function propagates upload failures instead of silently swallowing them when a declared file field cannot be processed. It ensures callers receive actionable context.
+**Purpose**: This test ensures that upload errors are not hidden. If a declared file argument points to a missing file, the main rewrite function should fail with a useful message instead of silently passing bad arguments onward.
 
-**Data flow**: Creates a session and turn context, injects dummy ChatGPT auth into the session’s auth manager, calls `rewrite_mcp_tool_arguments_for_openai_files` with an arguments object pointing to a definitely missing file and a declaration naming the `file` field, expects an error, and asserts the message contains both `failed to upload` and the field name.
+**Data flow**: It creates a test session and turn context, installs dummy ChatGPT-style authentication, and calls rewrite_mcp_tool_arguments_for_openai_files with a declared file parameter whose path does not exist. The function is expected to return an error, and the test checks that the message mentions both an upload failure and the affected field.
 
-**Call relations**: This test covers the error-propagation path from `build_uploaded_argument_value` through `rewrite_argument_value_for_openai_files` up to the top-level object rewrite function.
+**Call relations**: This test calls the same main function used by handle_approved_mcp_tool_call. It verifies that errors from build_uploaded_argument_value travel upward through rewrite_argument_value_for_openai_files and reach the caller clearly enough to explain why the MCP tool call cannot proceed.
 
 *Call graph*: calls 4 internal fn (rewrite_mcp_tool_arguments_for_openai_files, make_session_and_context, auth_manager_from_auth, create_dummy_chatgpt_auth_for_testing); 2 external calls (assert!, json!).
 
@@ -3857,11 +3871,13 @@ These files define the MCP resource tool specs, shared helper layer, and the con
 
 `config` · `tool registration`
 
-This file contains three pure constructor functions that build `codex_tools::ToolSpec::Function` values for MCP resource operations. Each function assembles a `BTreeMap<String, JsonSchema>` of parameter definitions, using `JsonSchema::string` with human-readable descriptions that explain how the model should supply each field.
+MCP, or Model Context Protocol, is a way for external servers to offer useful context to a language model, such as files, database schemas, or app-specific data. This file does not actually contact those servers. Instead, it builds the “menu entries” for three tools: one to list available resources, one to list resource templates, and one to read a chosen resource.
 
-`create_list_mcp_resources_tool` and `create_list_mcp_resource_templates_tool` both define two optional string properties: `server`, which scopes the request to one MCP server when present, and `cursor`, which carries opaque pagination state from a previous call. Both mark `strict: false`, omit `defer_loading`, use `JsonSchema::object(..., None, Some(false.into()))` so no fields are required and additional properties are disallowed, and leave `output_schema` unset.
+Each function creates a ToolSpec, which is a structured description of a tool. Think of it like a form attached to a button: it says the button’s name, explains what it does, and describes which fields the user or model may fill in. The fields are described with JSON Schema, a common way to say “this input should be a string” or “these fields are required.”
 
-`create_read_mcp_resource_tool` differs in two important ways: it defines `server` and `uri` as required fields by passing `Some(vec![...])` to `JsonSchema::object`, and its field descriptions explicitly tie valid values back to `list_mcp_resources` output. Across all three builders, the descriptions are intentionally rich and model-facing, emphasizing MCP resources as preferred context sources over web search. Because handlers call these functions directly from their `spec()` methods, any change here immediately changes the tool contract presented to the model.
+The two listing tools accept an optional server name and an optional cursor. A cursor is a paging token, like a bookmark for “continue from here” when there are too many results to return at once. The read tool is stricter in spirit: it requires both the server name and the resource URI, because reading needs an exact target.
+
+Without this file, the broader tool system would not know how to present MCP resource operations to the model, even if the lower-level MCP support existed.
 
 #### Function details
 
@@ -3871,11 +3887,11 @@ This file contains three pure constructor functions that build `codex_tools::Too
 fn create_list_mcp_resources_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the `ToolSpec` for the `list_mcp_resources` function tool, including its optional `server` and `cursor` parameters and descriptive guidance.
+**Purpose**: Creates the definition for the `list_mcp_resources` tool. This tool lets the model ask which concrete resources are available from one MCP server or from all configured MCP servers.
 
-**Data flow**: It creates a `BTreeMap` with two string-schema entries, wraps that map in `JsonSchema::object` with no required fields and `additionalProperties` disabled, then embeds the schema and fixed metadata into a `ResponsesApiTool` and returns `ToolSpec::Function(...)`. It reads no external state and writes nothing.
+**Data flow**: It starts with no runtime input. It builds a small input description containing two optional string fields: `server`, to narrow the search to one MCP server, and `cursor`, to continue a paged listing. It wraps those fields, along with the tool name and human-readable description, into a ToolSpec and returns it.
 
-**Call relations**: This builder is called by the `spec` method of `ListMcpResourcesHandler`. It does not invoke runtime logic; its role is to provide the declarative contract consumed during tool publication.
+**Call relations**: The broader tool specification builder, `spec`, calls this when assembling the set of tools the model may use. Inside, it relies on helper constructors for string fields, object schemas, a map of properties, and the final function-style tool wrapper so the returned value fits the common tool format.
 
 *Call graph*: calls 2 internal fn (object, string); called by 1 (spec); 2 external calls (from, Function).
 
@@ -3886,11 +3902,11 @@ fn create_list_mcp_resources_tool() -> ToolSpec
 fn create_list_mcp_resource_templates_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the `ToolSpec` for the `list_mcp_resource_templates` function tool with optional `server` and `cursor` arguments.
+**Purpose**: Creates the definition for the `list_mcp_resource_templates` tool. This tool lets the model discover parameterized resource templates, which are resources that need extra values before they can be read.
 
-**Data flow**: It constructs a `BTreeMap` of parameter schemas, creates an object schema with no required fields and no extra properties, packages that into a `ResponsesApiTool` with the fixed tool name and long-form description, and returns it as `ToolSpec::Function`. No mutable state is touched.
+**Data flow**: It starts with no runtime input. It creates an input shape with optional `server` and `cursor` string fields, then combines that shape with the tool’s name and explanation. The result is returned as a ToolSpec that the rest of the system can advertise to the model.
 
-**Call relations**: Used by `ListMcpResourceTemplatesHandler::spec` to expose the tool interface. It is a pure schema factory and does not participate in request execution.
+**Call relations**: The `spec` builder calls this while preparing the available tool list. This function hands back a ready-made tool description, using the shared schema and tool wrapper helpers so it matches the same format as the other tools.
 
 *Call graph*: calls 2 internal fn (object, string); called by 1 (spec); 2 external calls (from, Function).
 
@@ -3901,24 +3917,24 @@ fn create_list_mcp_resource_templates_tool() -> ToolSpec
 fn create_read_mcp_resource_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the `ToolSpec` for reading a specific MCP resource, requiring both the server name and resource URI.
+**Purpose**: Creates the definition for the `read_mcp_resource` tool. This tool is used when the model already knows exactly which MCP server and resource URI it wants to read.
 
-**Data flow**: It creates a `BTreeMap` for `server` and `uri`, then calls `JsonSchema::object` with an explicit required-field vector containing both names and `additionalProperties` disabled. That schema is inserted into a `ResponsesApiTool` with fixed metadata and returned as `ToolSpec::Function`.
+**Data flow**: It starts with no runtime input. It builds an input description with two string fields: `server` and `uri`. Unlike the listing tools, it marks both fields as required, because the system cannot read a resource without knowing both where to ask and what to ask for. It returns the completed ToolSpec.
 
-**Call relations**: Called by `ReadMcpResourceHandler::spec`. Its required-field configuration is what makes the read tool stricter than the list tools at the schema level.
+**Call relations**: The `spec` builder calls this during tool setup, alongside the listing tool definitions. The intended flow is that the model first uses the listing tool to discover valid resources, then uses this read tool with the returned server name and URI.
 
 *Call graph*: calls 2 internal fn (object, string); called by 1 (spec); 3 external calls (from, Function, vec!).
 
 
 ### `core/src/tools/handlers/mcp_resource.rs`
 
-`util` · `request handling`
+`domain_logic` · `request handling`
 
-This file is the support layer behind the MCP resource handlers re-exported from its submodules. It defines deserializable argument structs for listing resources (`ListResourcesArgs`), listing templates (`ListResourceTemplatesArgs`), and reading a resource (`ReadResourceArgs`). Optional `server` and `cursor` fields default to `None`, allowing empty argument payloads to mean "all servers" or "first page".
+MCP, or Model Context Protocol, lets this program ask external servers for resources such as files, documents, or templates. This file is the common toolbox used by the MCP resource handlers. Without it, each handler would need to invent its own way to parse arguments, label which server a resource came from, report progress, and format results back to the model.
 
-For output shaping, `ResourceWithServer` and `ResourceTemplateWithServer` flatten `rmcp::model::Resource` and `ResourceTemplate` while adding an explicit `server` field. `ListResourcesPayload` and `ListResourceTemplatesPayload` each support two construction modes: `from_single_server`, which preserves the server name and `next_cursor` from the MCP result, and `from_all_servers`, which accepts a `HashMap` keyed by server, sorts entries by server name for deterministic output, flattens all resources/templates into one vector, and clears pagination because cross-server aggregation cannot expose a single cursor. `ReadResourcePayload` similarly flattens `ReadResourceResult` alongside `server` and `uri`.
+The file defines small input shapes for the three resource actions: list resources, list resource templates, and read a resource. It also defines output shapes that attach a server name to every returned resource. That matters because a request can ask all connected MCP servers at once; the answer must still say where each item came from, like putting return addresses on letters from several mailboxes.
 
-The file also standardizes MCP-style turn-item publication. `emit_tool_call_begin` emits an in-progress `TurnItem::McpToolCall`; `emit_tool_call_end` converts either a successful `CallToolResult` or an error string into a completed/failed `McpToolCallItem`, treating `CallToolResult.is_error == true` as failure even when transport succeeded. `serialize_function_output` JSON-serializes any `Serialize` payload, truncates it with `truncate_text` using the turn's `TruncationPolicy * 1.2`, and wraps it as `FunctionToolOutput`. Parsing helpers distinguish empty/null arguments from real JSON values and provide both strict (`parse_args`) and defaulting (`parse_args_with_default`) deserialization paths. String normalizers trim whitespace and turn blank required fields into `RespondToModel` errors.
+For list results, it can build a payload from one server, preserving that server’s pagination cursor, or from many servers, sorting server names so the output is stable and predictable. For tool-call reporting, it creates “started” and “completed” turn items so the user interface or logs can show that an MCP action is running, succeeded, or failed. Finally, it includes helper functions to clean up string arguments, parse JSON arguments, serialize responses, and trim long output so too much resource data is not injected into the model context.
 
 #### Function details
 
@@ -3928,11 +3944,11 @@ The file also standardizes MCP-style turn-item publication. `emit_tool_call_begi
 fn new(server: String, resource: Resource) -> Self
 ```
 
-**Purpose**: Constructs a serializable resource wrapper that records which MCP server supplied the resource.
+**Purpose**: Creates a resource record that also says which MCP server it came from. This is used when results from one or more servers need to be combined without losing their source.
 
-**Data flow**: Takes ownership of a `server: String` and `resource: Resource`, stores them in `ResourceWithServer`, and returns the wrapper.
+**Data flow**: It receives a server name and one resource object. It stores both together in a new wrapper object. The output is the same resource information, now tagged with its server.
 
-**Call relations**: It is used when building aggregated or single-server list payloads so each serialized resource carries its origin server.
+**Call relations**: When list results are gathered across servers, ListResourcesPayload::from_all_servers calls this to attach the server name to each resource before returning the combined list. Tests also call it to confirm the server field is serialized correctly.
 
 *Call graph*: called by 2 (from_all_servers, resource_with_server_serializes_server_field).
 
@@ -3943,11 +3959,11 @@ fn new(server: String, resource: Resource) -> Self
 fn new(server: String, template: ResourceTemplate) -> Self
 ```
 
-**Purpose**: Constructs a serializable resource-template wrapper that records the source MCP server.
+**Purpose**: Creates a resource-template record that also says which MCP server supplied it. This keeps templates from different servers distinguishable after they are merged.
 
-**Data flow**: Takes `server: String` and `template: ResourceTemplate`, stores them in `ResourceTemplateWithServer`, and returns the wrapper.
+**Data flow**: It receives a server name and one resource template. It puts them into a wrapper object. The output is the template data plus its source server.
 
-**Call relations**: It is used by the resource-template payload builders to annotate each template with its server.
+**Call relations**: ListResourceTemplatesPayload::from_all_servers uses this while combining template results from multiple servers. Tests also call it to make sure the server field appears in serialized output.
 
 *Call graph*: called by 2 (from_all_servers, template_with_server_serializes_server_field).
 
@@ -3958,11 +3974,11 @@ fn new(server: String, template: ResourceTemplate) -> Self
 fn from_single_server(server: String, result: ListResourcesResult) -> Self
 ```
 
-**Purpose**: Builds the list-resources response payload for a request scoped to one server, preserving pagination.
+**Purpose**: Builds the response body for a resource-list request aimed at one MCP server. It keeps the server name and any pagination cursor returned by that server.
 
-**Data flow**: Consumes a `server: String` and `ListResourcesResult`, maps each `result.resources` entry into `ResourceWithServer::new(server.clone(), resource)`, collects them, and returns `ListResourcesPayload { server: Some(server), resources, next_cursor: result.next_cursor }`.
+**Data flow**: It receives the server name and that server’s list response. It wraps every resource with the server name, copies over the next cursor if one exists, and returns a payload ready to serialize. The original list response is consumed and turned into the handbook-style output shape used by this tool.
 
-**Call relations**: Single-server list handlers call this when the request names a specific server and the MCP result's cursor can be forwarded directly.
+**Call relations**: The resource-list handler’s handle_call flow calls this when the request targets a specific server. A test also calls it to verify that the next cursor is copied into the final payload.
 
 *Call graph*: called by 2 (handle_call, list_resources_payload_from_single_server_copies_next_cursor).
 
@@ -3973,11 +3989,11 @@ fn from_single_server(server: String, result: ListResourcesResult) -> Self
 fn from_all_servers(resources_by_server: HashMap<String, Vec<Resource>>) -> Self
 ```
 
-**Purpose**: Builds a deterministic cross-server list-resources payload by flattening resources from multiple servers.
+**Purpose**: Builds one combined resource-list response from several MCP servers. It sorts servers by name first, so repeated runs produce a predictable order.
 
-**Data flow**: Consumes `HashMap<String, Vec<Resource>>`, converts it into a vector of `(server, resources)` pairs, sorts that vector by server name, then iterates through each server and each resource to push `ResourceWithServer::new(server.clone(), resource)` into one flat `resources` vector. Returns `ListResourcesPayload { server: None, resources, next_cursor: None }`.
+**Data flow**: It receives a map from server names to resource lists. It turns the map into sorted server entries, walks through each server’s resources, wraps each resource with its server name, and returns one payload with no single-server cursor. The result is a flat list where every item still carries its origin.
 
-**Call relations**: Handlers use this branch when listing across all servers. It intentionally drops pagination because there is no single combined cursor across multiple MCP backends.
+**Call relations**: The resource-list handler’s handle_call flow calls this when the request asks across all servers. Inside, it calls ResourceWithServer::new for each resource. A test also exercises it to confirm the combined output is sorted by server.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (handle_call, list_resources_payload_from_all_servers_is_sorted); 1 external calls (new).
 
@@ -3988,11 +4004,11 @@ fn from_all_servers(resources_by_server: HashMap<String, Vec<Resource>>) -> Self
 fn from_single_server(server: String, result: ListResourceTemplatesResult) -> Self
 ```
 
-**Purpose**: Builds the list-resource-templates response payload for one server while preserving the server cursor.
+**Purpose**: Builds the response body for a resource-template listing from one MCP server. It preserves both the server name and the server’s pagination cursor.
 
-**Data flow**: Consumes a `server: String` and `ListResourceTemplatesResult`, maps each template into `ResourceTemplateWithServer::new(server.clone(), template)`, collects them, and returns `ListResourceTemplatesPayload { server: Some(server), resource_templates, next_cursor: result.next_cursor }`.
+**Data flow**: It receives a server name and that server’s template-list response. It wraps each template with the server name, copies any next cursor, and returns a payload ready to send back as tool output.
 
-**Call relations**: Resource-template handlers call this when the request is scoped to a single server.
+**Call relations**: The resource-template listing handler’s handle_call flow calls this when the request is for one named server.
 
 *Call graph*: called by 1 (handle_call).
 
@@ -4003,11 +4019,11 @@ fn from_single_server(server: String, result: ListResourceTemplatesResult) -> Se
 fn from_all_servers(templates_by_server: HashMap<String, Vec<ResourceTemplate>>) -> Self
 ```
 
-**Purpose**: Builds a deterministic cross-server resource-template payload by flattening templates from all servers.
+**Purpose**: Builds one combined template-list response from multiple MCP servers. It keeps the output stable by sorting server names before flattening their template lists.
 
-**Data flow**: Consumes `HashMap<String, Vec<ResourceTemplate>>`, converts it to a vector of entries, sorts by server name, flattens each template into `ResourceTemplateWithServer::new(server.clone(), template)`, and returns `ListResourceTemplatesPayload { server: None, resource_templates, next_cursor: None }`.
+**Data flow**: It receives a map from server names to template lists. It sorts the server entries, wraps every template with its server name, and returns a single payload containing all templates. Because this is an all-server response, it does not include a pagination cursor for one particular server.
 
-**Call relations**: Handlers use this when aggregating templates across all MCP servers, again intentionally omitting pagination.
+**Call relations**: The resource-template listing handler’s handle_call flow calls this for all-server requests. Inside, it calls ResourceTemplateWithServer::new for each template so no template loses its source.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (handle_call); 1 external calls (new).
 
@@ -4018,11 +4034,11 @@ fn from_all_servers(templates_by_server: HashMap<String, Vec<ResourceTemplate>>)
 fn call_tool_result_from_content(content: &str, success: Option<bool>) -> CallToolResult
 ```
 
-**Purpose**: Wraps plain text content into the MCP `CallToolResult` shape expected by MCP tool-call turn items.
+**Purpose**: Turns plain text into the standard MCP tool-result shape. This is useful when an internal resource operation needs to be reported as if it were a normal MCP tool call.
 
-**Data flow**: Takes `content: &str` and `success: Option<bool>`, constructs `CallToolResult` with one text content item, `structured_content: None`, `is_error` set to the negation of `success` when provided, and `meta: None`, then returns it.
+**Data flow**: It receives text content and an optional success flag. It creates a result whose content is a single text item, leaves structured content empty, and sets the error marker to the opposite of success when success is known. The output is a CallToolResult object.
 
-**Call relations**: This helper is used by MCP resource handlers when they need to publish a textual result through the same turn-item structure as ordinary MCP tool calls.
+**Call relations**: No direct caller is shown in the provided call facts. It is a small adapter for code that needs to present resource output using the same result format as other MCP tool calls.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4038,11 +4054,11 @@ async fn emit_tool_call_begin(
 )
 ```
 
-**Purpose**: Publishes an in-progress `McpToolCall` turn item for an MCP resource operation.
+**Purpose**: Announces that an MCP resource-related tool call has started. This lets the session record or display an in-progress action instead of leaving the user guessing.
 
-**Data flow**: Accepts `&Arc<Session>`, `&TurnContext`, `call_id`, and `McpInvocation { server, tool, arguments }`. It builds `TurnItem::McpToolCall(McpToolCallItem)` with the given identifiers, `arguments.unwrap_or(Value::Null)`, no app resource URI or plugin id, `status: InProgress`, and no result/error/duration, then awaits `session.emit_turn_item_started(turn, &item)`.
+**Data flow**: It receives the current session, turn context, call id, and invocation details such as server, tool name, and arguments. It builds a turn item with status set to in progress, then sends that started item through the session. The visible side effect is that the current turn now knows this MCP call has begun.
 
-**Call relations**: Resource handlers call this before contacting MCP so the UI/event stream reflects that the operation has started.
+**Call relations**: No direct caller is shown in the provided call facts. Inside, it builds a McpToolCall turn item, which is then emitted through the session as the beginning of a tool-call lifecycle.
 
 *Call graph*: 1 external calls (McpToolCall).
 
@@ -4060,11 +4076,11 @@ async fn emit_tool_call_end(
 )
 ```
 
-**Purpose**: Publishes the completed or failed `McpToolCall` turn item for an MCP resource operation.
+**Purpose**: Announces that an MCP resource-related tool call has finished, either successfully or with a failure. It records the final result, error message, and how long the call took.
 
-**Data flow**: Accepts session, turn, call id, invocation metadata, elapsed `Duration`, and `Result<CallToolResult, String>`. It maps `Ok(result)` with `result.is_error == true` to failed status with embedded result, plain `Ok(result)` to completed status, and `Err(message)` to failed status with `McpToolCallError { message }`. It then reconstructs a `TurnItem::McpToolCall(McpToolCallItem)` using invocation fields, `arguments.unwrap_or(Value::Null)`, the derived status/result/error, and `duration: Some(duration)`, and emits it with `session.emit_turn_item_completed`.
+**Data flow**: It receives the session, turn context, call id, original invocation, duration, and either a tool result or an error string. It decides whether the final status is completed or failed, packages the result or error into a turn item, includes the elapsed time, and emits that completed item through the session. The session’s record of the turn changes from an unfinished action to a finished one.
 
-**Call relations**: Handlers call this after the MCP resource operation finishes so the event stream records both success and failure uniformly.
+**Call relations**: No direct caller is shown in the provided call facts. It completes the lifecycle started by emit_tool_call_begin by building a final McpToolCall turn item and handing it to the session.
 
 *Call graph*: 1 external calls (McpToolCall).
 
@@ -4075,11 +4091,11 @@ async fn emit_tool_call_end(
 fn normalize_optional_string(input: Option<String>) -> Option<String>
 ```
 
-**Purpose**: Trims an optional string and treats blank values as absent.
+**Purpose**: Cleans up an optional text field by trimming whitespace and treating blank text as missing. This prevents values like "   " from being accepted as meaningful input.
 
-**Data flow**: Takes `Option<String>`, and for `Some(value)` trims whitespace into a new `String`; if the trimmed string is empty it returns `None`, otherwise `Some(trimmed)`. `None` stays `None`.
+**Data flow**: It receives either no string or a string that may contain extra spaces. If there is a string, it trims it. If the trimmed result is empty, it returns no value; otherwise it returns the cleaned string.
 
-**Call relations**: This helper is used by `normalize_required_string` and can also support argument normalization in resource handlers.
+**Call relations**: normalize_required_string calls this when it needs the same cleanup behavior but also wants to reject missing or blank values.
 
 *Call graph*: called by 1 (normalize_required_string).
 
@@ -4090,11 +4106,11 @@ fn normalize_optional_string(input: Option<String>) -> Option<String>
 fn normalize_required_string(field: &str, value: String) -> Result<String, FunctionCallError>
 ```
 
-**Purpose**: Validates that a required string field is present and nonblank after trimming.
+**Purpose**: Cleans up a required text field and returns a user-facing error if it is missing or blank. This is used for arguments where the tool cannot continue without a real value.
 
-**Data flow**: Accepts a field name and raw `String`, passes `Some(value)` into `normalize_optional_string`, and returns the trimmed string on success. If normalization yields `None`, it returns `FunctionCallError::RespondToModel(format!("{field} must be provided"))`.
+**Data flow**: It receives the field name and the raw string value. It passes the value through normalize_optional_string. If a cleaned value remains, it returns that value; if not, it creates a FunctionCallError telling the model that the named field must be provided.
 
-**Call relations**: Resource handlers use this when required MCP arguments such as server or URI must not be empty.
+**Call relations**: It builds on normalize_optional_string so optional and required string fields follow the same whitespace rules. When validation fails, it returns a RespondToModel error, meaning the problem should be reported back in language the model can act on.
 
 *Call graph*: calls 1 internal fn (normalize_optional_string); 2 external calls (format!, RespondToModel).
 
@@ -4108,11 +4124,11 @@ fn serialize_function_output(
 ) -> Result<FunctionToolOutput, FunctionCallError>
 ```
 
-**Purpose**: Serializes a structured payload into the bounded text form used for function-tool outputs in MCP resource handlers.
+**Purpose**: Converts a response payload into the text output expected from a function tool, while limiting its size. This matters because resource lists or resource contents can be large, and very large output can crowd the model’s context.
 
-**Data flow**: Accepts any `payload: T` where `T: Serialize` and a `TruncationPolicy`. It serializes the payload with `serde_json::to_string`, mapping failures to `FunctionCallError::RespondToModel`, truncates the resulting string with `truncate_text(&content, truncation_policy * 1.2)`, wraps it in `FunctionToolOutput::from_text(content, Some(true))`, and returns that output.
+**Data flow**: It receives any serializable payload and a truncation policy, which is a size limit rule. It converts the payload to JSON text, reports a model-facing error if that fails, trims the JSON text to a bounded length, and wraps the final text as a successful FunctionToolOutput.
 
-**Call relations**: Resource handlers call this after building payload structs so their responses match the bounded text behavior of regular MCP tool outputs.
+**Call relations**: The provided call facts do not list a caller, but this is the shared final packaging step for resource handlers. It calls JSON serialization, then truncate_text to keep output under control, and finally FunctionToolOutput::from_text to produce the tool response.
 
 *Call graph*: calls 1 internal fn (from_text); 2 external calls (truncate_text, to_string).
 
@@ -4123,11 +4139,11 @@ fn serialize_function_output(
 fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError>
 ```
 
-**Purpose**: Parses raw function-argument text into an optional JSON value, treating empty or explicit null as no arguments.
+**Purpose**: Turns a raw argument string into optional JSON. It accepts empty or JSON null input as “no arguments,” which gives callers a simple way to distinguish absent input from real input.
 
-**Data flow**: Reads `raw_args: &str`; if trimming yields empty text it returns `Ok(None)`. Otherwise it parses JSON with `serde_json::from_str`, mapping parse errors to `FunctionCallError::RespondToModel`. If the parsed value is `Value::Null`, it returns `Ok(None)`; otherwise `Ok(Some(value))`.
+**Data flow**: It receives a raw string. If the string is blank, it returns no value. Otherwise it parses the string as JSON; parse errors become model-facing function-call errors. If the parsed JSON is null it returns no value, and for any other JSON it returns that value.
 
-**Call relations**: Resource handlers use this as the first stage of argument processing before deserializing into typed structs.
+**Call relations**: No direct caller is shown in the provided call facts. It is the first parsing step for code that starts with raw text arguments before converting them into a specific argument structure.
 
 *Call graph*: 1 external calls (from_str).
 
@@ -4138,11 +4154,11 @@ fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError>
 fn parse_args(arguments: Option<Value>) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Deserializes a present JSON argument value into a typed argument struct and errors when no value is available.
+**Purpose**: Converts already-parsed JSON into a specific Rust argument type. It is used when arguments are required and must match the expected shape.
 
-**Data flow**: Accepts `Option<Value>` for some `T: DeserializeOwned`. If `Some(value)`, it calls `serde_json::from_value(value)` and maps failures to `FunctionCallError::RespondToModel`; if `None`, it returns `RespondToModel("failed to parse function arguments: expected value")`.
+**Data flow**: It receives optional JSON. If JSON is present, it tries to deserialize it into the requested type; if the shape is wrong, it returns a model-facing error explaining the parse failure. If no JSON is present, it returns a model-facing error saying an argument value was expected.
 
-**Call relations**: This is the strict deserialization path and is also reused by `parse_args_with_default` when arguments are present.
+**Call relations**: parse_args_with_default calls this when JSON was supplied and should be interpreted normally. It relies on JSON deserialization to do the detailed shape checking.
 
 *Call graph*: called by 1 (parse_args_with_default); 2 external calls (from_value, RespondToModel).
 
@@ -4153,24 +4169,24 @@ fn parse_args(arguments: Option<Value>) -> Result<T, FunctionCallError>
 fn parse_args_with_default(arguments: Option<Value>) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Deserializes typed arguments when present, but falls back to `T::default()` when the call omitted arguments entirely.
+**Purpose**: Converts optional JSON into a specific argument type, but uses that type’s default value when no arguments were provided. This is useful for list commands where all fields are optional.
 
-**Data flow**: Accepts `Option<Value>` for `T: DeserializeOwned + Default`; if `Some(value)` it delegates to `parse_args(Some(value))`, otherwise it returns `Ok(T::default())`.
+**Data flow**: It receives optional JSON. If JSON is present, it hands it to parse_args for normal validation and conversion. If no JSON is present, it returns the default instance of the requested type.
 
-**Call relations**: Handlers use this for argument structs like list operations where an empty payload is valid and should mean default options.
+**Call relations**: It is a softer version of parse_args for handlers that can run with empty arguments. The provided call facts show it delegates to parse_args when there is input and otherwise calls the type’s default constructor.
 
 *Call graph*: calls 1 internal fn (parse_args); 1 external calls (default).
 
 
 ### `core/src/tools/handlers/mcp_resource/list_mcp_resource_templates.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This file defines `ListMcpResourceTemplatesHandler`, a `ToolExecutor<ToolInvocation>` for the `list_mcp_resource_templates` function tool. The lightweight trait methods expose the stable tool name, return the JSON-schema-backed `ToolSpec`, declare that calls may run in parallel, and forward execution into the async implementation.
+This handler is the bridge between a model tool call and the MCP resource-template system. MCP means Model Context Protocol: a way for Codex to talk to external or internal services that expose tools and resources. A resource template is like a reusable address pattern for data, such as a URL shape with placeholders.
 
-The core logic lives in `handle_call`. It destructures `ToolInvocation` to obtain the session, turn metadata, call id, and payload, and immediately rejects any non-`ToolPayload::Function` payload with a model-facing `FunctionCallError`. It parses the raw JSON argument string twice: first into a generic JSON value via `parse_arguments`, then into `ListResourceTemplatesArgs` via `parse_args_with_default`, allowing omitted fields while still validating shape. Both `server` and `cursor` are normalized so empty strings become absent.
+When the model calls `list_mcp_resource_templates`, this file checks that the call has normal function-style arguments, parses those arguments, and decides whether the request is for one named MCP server or for every connected server. If a server is named, it can also accept a pagination cursor, which is like a bookmark saying “continue from where the last page stopped.” If no server is named, it gathers templates from all servers, but it rejects cursors because one bookmark only makes sense for one specific server.
 
-The handler constructs an `McpInvocation` record for begin/end event emission, defaulting the telemetry server name to `codex` when no specific server was requested. If a server is provided, it optionally builds `PaginatedRequestParams` with the cursor and calls `session.list_resource_templates`; the result is wrapped with `ListResourceTemplatesPayload::from_single_server`. Without a server, it forbids `cursor` entirely and instead queries `session.services.mcp_connection_manager.load_full().list_all_resource_templates()` and wraps the merged map with `from_all_servers`. Afterward it serializes the payload under the turn’s truncation policy, emits a success or failure end event including elapsed time and summarized content, and returns boxed tool output. A notable invariant is that pagination cursors are only meaningful for single-server listing, never for the all-servers aggregate path.
+The handler also records the start and end of the tool call, including how long it took and whether it succeeded. Finally, it turns the result into the standard tool-output format that Codex can send back to the model. Without this file, the model could not discover available MCP resource templates through this built-in tool.
 
 #### Function details
 
@@ -4180,11 +4196,11 @@ The handler constructs an `McpInvocation` record for begin/end event emission, d
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the externally visible tool identifier `list_mcp_resource_templates`. This is the name used for registration and dispatch.
+**Purpose**: Returns the public name of this tool: `list_mcp_resource_templates`. This is the name the rest of the tool system uses to match an incoming tool call to this handler.
 
-**Data flow**: It reads no mutable state and constructs a `ToolName` from the fixed string literal via `ToolName::plain`. It returns that `ToolName` without side effects.
+**Data flow**: It takes no outside data beyond the handler itself. It creates a plain tool name from the fixed text `list_mcp_resource_templates` and returns that name.
 
-**Call relations**: The runtime calls this as part of tool registration and lookup. It does not branch further; it only delegates to the `ToolName` constructor so the handler can be matched to incoming tool calls.
+**Call relations**: The tool registry calls this when it needs to identify which handler owns a tool call. It uses `plain` to wrap the human-readable name in the project’s `ToolName` type.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4195,11 +4211,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Supplies the schema and descriptive metadata for the tool. The returned spec tells the model which arguments are accepted and how the tool should be described.
+**Purpose**: Returns the formal description of the tool, including what arguments it accepts. This description is what tells the model how to call the tool correctly.
 
-**Data flow**: It takes no inputs beyond `&self`, reads no handler state, and returns the `ToolSpec` produced by `create_list_mcp_resource_templates_tool()`. No state is mutated.
+**Data flow**: It takes the handler as input, asks `create_list_mcp_resource_templates_tool` to build the tool specification, and returns that specification unchanged.
 
-**Call relations**: The tool registry invokes this when exposing tool capabilities. It delegates all schema construction to the shared spec builder in `mcp_resource_spec`, keeping the handler and schema definition synchronized.
+**Call relations**: The tool system calls this when it advertises available tools to the model. This function hands off the actual specification-building work to `create_list_mcp_resource_templates_tool` so the handler does not duplicate schema details.
 
 *Call graph*: calls 1 internal fn (create_list_mcp_resource_templates_tool).
 
@@ -4210,11 +4226,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Declares that multiple invocations of this handler may execute concurrently. This reflects that listing MCP templates is treated as a read-only operation.
+**Purpose**: Says that this tool is safe to run at the same time as other tool calls. That matters because listing templates only reads information; it does not edit shared state.
 
-**Data flow**: It ignores inputs and returns the constant boolean `true`. It neither reads nor writes any external state.
+**Data flow**: It receives no meaningful input besides the handler and always returns `true`. Nothing else is changed.
 
-**Call relations**: The runtime consults this before scheduling tool calls. There are no downstream calls; it is a pure capability flag used by orchestration code.
+**Call relations**: The runtime asks this before deciding whether it may schedule this tool alongside others. By returning `true`, the handler allows the broader tool runner to do concurrent work when useful.
 
 
 ##### `ListMcpResourceTemplatesHandler::handle`  (lines 42–44)
@@ -4223,11 +4239,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation into the boxed future type required by the `ToolExecutor` trait. It is the trait entrypoint for actual execution.
+**Purpose**: Starts the real asynchronous work for one tool invocation. It wraps the internal handler logic in the future type expected by the tool runtime.
 
-**Data flow**: It receives a `ToolInvocation`, moves it into `self.handle_call(invocation)`, pins the resulting future with `Box::pin`, and returns that boxed future. It does not inspect or transform the invocation itself.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn information, call id, and raw payload from the model. It passes that invocation into `handle_call`, pins the resulting asynchronous task so it can be safely driven by the runtime, and returns it.
 
-**Call relations**: The tool runtime calls this when dispatching a tool invocation. Its only job is to forward control into `ListMcpResourceTemplatesHandler::handle_call` in the trait-compatible form.
+**Call relations**: The tool executor calls this when the model invokes `list_mcp_resource_templates`. This function is a small adapter: it does not perform the listing itself, but hands the work to `handle_call` in the shape the runtime expects.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4241,24 +4257,24 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes the full list-resource-templates operation: validate payload type, parse and normalize arguments, choose single-server versus all-server listing, emit MCP telemetry, serialize the result, and surface any errors in model-facing form.
+**Purpose**: Carries out the full `list_mcp_resource_templates` request. It parses the model’s arguments, asks one MCP server or all MCP servers for resource templates, records begin/end events, and returns a formatted tool result.
 
-**Data flow**: Input is a `ToolInvocation` containing `session`, `turn`, `call_id`, and `payload`. It extracts the raw function argument string, parses it into JSON and then `ListResourceTemplatesArgs`, normalizes optional `server` and `cursor`, and builds an `McpInvocation` record. It writes begin/end telemetry through `emit_tool_call_begin` and `emit_tool_call_end`, reads MCP data either from `session.list_resource_templates(server, params)` or from `session.services.mcp_connection_manager.load_full().list_all_resource_templates()`, transforms those results into `ListResourceTemplatesPayload`, serializes with `serialize_function_output`, converts serialized body items to plain text for telemetry with `function_call_output_content_items_to_text`, and returns either boxed tool output or a `FunctionCallError`. It also measures elapsed time with `Instant` for end-event reporting.
+**Data flow**: It starts with a `ToolInvocation` containing the current session, turn, call id, and payload. It accepts only function-call payloads, parses the JSON-like arguments into `server` and `cursor`, cleans up empty optional strings, and builds an `McpInvocation` record for logging. If a server is supplied, it optionally turns the cursor into pagination parameters and asks that server for templates. If no server is supplied, it refuses any cursor and asks the MCP connection manager for templates from all servers. The raw template data is wrapped into a response payload, serialized into standard tool output, converted to text for logging, and returned as boxed tool output. If anything fails, it reports an error back to the model and records the failed end event.
 
-**Call relations**: This function is invoked only by `ListMcpResourceTemplatesHandler::handle`. On the single-server path it delegates to the session’s MCP list API and payload constructor `from_single_server`; on the aggregate path it delegates to the connection manager and `from_all_servers`. In both success and failure cases it funnels through end-event emission so telemetry is recorded regardless of outcome.
+**Call relations**: This is called by `handle` whenever the tool actually runs. At the start it calls `emit_tool_call_begin` so the session can observe that the MCP tool request began. For a single server it uses the session’s `list_resource_templates` path and wraps the answer with `from_single_server`; for all servers it goes through the MCP connection manager and wraps the answer with `from_all_servers`. At the end it calls `serialize_function_output`, uses `function_call_output_content_items_to_text` and `call_tool_result_from_content` to prepare a readable event result, emits `emit_tool_call_end`, and finally returns `boxed_tool_output` to the runtime.
 
 *Call graph*: calls 4 internal fn (boxed_tool_output, from_all_servers, from_single_server, function_call_output_content_items_to_text); called by 1 (handle); 10 external calls (now, clone, call_tool_result_from_content, emit_tool_call_begin, emit_tool_call_end, normalize_optional_string, parse_args_with_default, parse_arguments, serialize_function_output, RespondToModel).
 
 
 ### `core/src/tools/handlers/mcp_resource/list_mcp_resources.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This file mirrors the resource-template handler but for actual resources. `ListMcpResourcesHandler` implements `ToolExecutor<ToolInvocation>` and exposes the fixed tool name `list_mcp_resources`, the corresponding schema from `mcp_resource_spec`, and a `true` parallelism flag because the operation is read-only.
+This handler is the bridge between a model tool call and the MCP resource system. MCP, or Model Context Protocol, is a way for Codex to talk to outside services that expose useful data as “resources.” Without this file, the model could have a tool definition for listing resources, but no code would actually turn that request into a query against MCP servers.
 
-`handle_call` performs the real work. It unpacks the invocation, requires `ToolPayload::Function`, and converts the raw argument string into a parsed JSON value and then a typed `ListResourcesArgs`. The optional `server` and `cursor` fields are normalized so blank strings do not accidentally count as meaningful values. It then creates an `McpInvocation` object used solely for begin/end event reporting, defaulting the telemetry server field to `codex` when no explicit server was requested.
+The flow is like a receptionist handling a directory request. First, the handler checks that the incoming tool call is the right kind of payload and reads its JSON arguments. The arguments may name a specific server and may include a cursor, which is a bookmark used for paginated results. Empty strings are normalized away so they do not act like real values.
 
-Execution splits into two branches. When `server` is present, the handler optionally creates `PaginatedRequestParams` carrying the cursor and calls `session.list_resources(&server_name, params)`. The returned page is wrapped by `ListResourcesPayload::from_single_server`, preserving `next_cursor` and annotating each resource with its server. When `server` is absent, the handler rejects any provided cursor because cross-server aggregation has no coherent pagination contract; otherwise it asks `session.services.mcp_connection_manager.load_full().list_all_resources().await` for all resources and wraps them with `from_all_servers`. Finally, it serializes the payload under the turn’s truncation policy, extracts text for telemetry summaries, emits a completion event with duration and success/error status, and returns boxed output or propagates the error.
+If a server is provided, the handler asks the current session to list resources on that server, passing the cursor when present. If no server is provided, it asks the MCP connection manager for resources from every server, but it rejects a cursor in that case because a cursor only makes sense for one server’s paginated list. Around the actual work, it emits “tool call started” and “tool call ended” events, including timing and success or error details. Finally, it serializes the result into the standard tool output format that can be sent back to the model.
 
 #### Function details
 
@@ -4268,11 +4284,11 @@ Execution splits into two branches. When `server` is present, the handler option
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical tool name `list_mcp_resources` used by the registry and model-facing tool calls.
+**Purpose**: Returns the public name of this tool: `list_mcp_resources`. The tool registry uses this name to match a model’s requested tool call to this handler.
 
-**Data flow**: It constructs and returns a `ToolName` from a fixed string literal. No state is read or modified.
+**Data flow**: It takes no outside data beyond the handler itself. It creates a plain tool name from the text `list_mcp_resources` and returns that name to the caller.
 
-**Call relations**: Called by registration/dispatch code to identify this handler. It only delegates to `ToolName::plain`.
+**Call relations**: When the tool system is building or checking its registry, it calls this method to identify the handler. This method delegates the small job of wrapping the text name to `plain`.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4283,11 +4299,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Provides the JSON-schema tool specification for listing MCP resources. This defines the optional `server` and `cursor` arguments and the descriptive text shown to the model.
+**Purpose**: Returns the formal description of the tool, including what arguments the model is allowed to provide. This is what tells the model how to call `list_mcp_resources` correctly.
 
-**Data flow**: It reads no state and returns the `ToolSpec` built by `create_list_mcp_resources_tool()`. There are no side effects.
+**Data flow**: It takes no input other than the handler. It calls `create_list_mcp_resources_tool`, receives the tool specification, and returns it unchanged.
 
-**Call relations**: Used by the tool registry when publishing available tools. It delegates schema construction to the shared spec helper so the handler stays aligned with the declared interface.
+**Call relations**: The registry or tool advertisement flow calls this when it needs to show available tools to the model. The actual specification is built elsewhere by `create_list_mcp_resources_tool`, while this handler simply supplies it.
 
 *Call graph*: calls 1 internal fn (create_list_mcp_resources_tool).
 
@@ -4298,11 +4314,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Signals that this listing tool can safely run in parallel with other tool calls.
+**Purpose**: Says that this tool may be run at the same time as other tool calls. Listing resources is treated as safe to do concurrently.
 
-**Data flow**: It returns the constant `true` and touches no external state.
+**Data flow**: It reads no input and changes no state. It simply returns `true`, meaning parallel execution is allowed.
 
-**Call relations**: Consulted by orchestration code before scheduling execution. It has no downstream calls.
+**Call relations**: The tool runtime checks this before deciding whether multiple tool calls can run side by side. This handler does not hand off to any other function here because the answer is fixed.
 
 
 ##### `ListMcpResourcesHandler::handle`  (lines 42–44)
@@ -4311,11 +4327,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the async resource-listing implementation in the boxed future type expected by the executor trait.
+**Purpose**: Starts the asynchronous work for one `list_mcp_resources` request. It wraps the real handler logic in a future, which is a value representing work that will finish later.
 
-**Data flow**: It takes a `ToolInvocation`, passes it unchanged into `self.handle_call(invocation)`, pins the future, and returns it. No parsing or mutation occurs here.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn information, call id, and payload from the model. It passes that invocation into `handle_call`, pins the resulting future so the runtime can safely poll it, and returns that future to the tool executor.
 
-**Call relations**: This is the trait-level execution entrypoint. It exists solely to route control into `ListMcpResourcesHandler::handle_call`.
+**Call relations**: The tool runtime calls this when the model invokes `list_mcp_resources`. This method is a thin entry point: it immediately hands the real work to `handle_call` and returns the asynchronous task to the runtime.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4329,24 +4345,24 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Runs the complete list-resources workflow, including payload-type validation, argument parsing, pagination handling, MCP session access, telemetry emission, and final output packaging.
+**Purpose**: Performs the full `list_mcp_resources` operation: read the model’s arguments, query MCP resources, report start and finish events, and return a model-readable result or error.
 
-**Data flow**: It consumes a `ToolInvocation`, extracts `session`, `turn`, `call_id`, and `payload`, and requires `ToolPayload::Function { arguments }`. It parses the argument string, deserializes `ListResourcesArgs`, normalizes optional `server` and `cursor`, and builds an `McpInvocation` for telemetry. It writes a begin event, measures elapsed time, then either calls `session.list_resources` with optional `PaginatedRequestParams` and wraps the page via `ListResourcesPayload::from_single_server`, or reads all resources from `session.services.mcp_connection_manager.load_full().list_all_resources()` and wraps them via `from_all_servers`. It serializes the payload with `serialize_function_output`, derives plain text from the output body for telemetry, emits an end event with success or error details, and returns boxed tool output or a `FunctionCallError`.
+**Data flow**: It receives a `ToolInvocation` and pulls out the session, turn, call id, and payload. It expects a function-call payload containing argument text; if it gets another kind of payload, it returns an error meant to be shown to the model. It parses the arguments into `ListResourcesArgs`, cleans up optional `server` and `cursor` values, and records an `McpInvocation` for logging. Before querying anything, it emits a begin event and starts a timer. If a server name is present, it asks the session for that server’s resources, optionally using the cursor as a pagination bookmark. If no server is present, it asks the MCP connection manager for resources from all servers, but rejects a cursor because there is no single server list to continue. The raw resource data is wrapped into a `ListResourcesPayload`, serialized into standard tool output, converted to text for event reporting, and returned as boxed tool output. If querying or serialization fails, it emits an end event with the error and returns that error.
 
-**Call relations**: Invoked by `ListMcpResourcesHandler::handle`. It delegates to session MCP APIs on the single-server path and to the connection manager on the aggregate path, then to serialization and telemetry helpers on both success and failure paths so completion is always recorded.
+**Call relations**: This is called only by `handle`, after the tool runtime has chosen this handler for the request. It relies on shared helper functions to parse arguments, normalize optional strings, emit begin and end events, convert MCP results into payloads, serialize the final response, and package the output. It also calls into the session and MCP connection manager, which are the parts that actually talk to the available MCP servers.
 
 *Call graph*: calls 4 internal fn (boxed_tool_output, from_all_servers, from_single_server, function_call_output_content_items_to_text); called by 1 (handle); 10 external calls (now, clone, call_tool_result_from_content, emit_tool_call_begin, emit_tool_call_end, normalize_optional_string, parse_args_with_default, parse_arguments, serialize_function_output, RespondToModel).
 
 
 ### `core/src/tools/handlers/mcp_resource/read_mcp_resource.rs`
 
-`domain_logic` · `request handling`
+`io_transport` · `tool invocation`
 
-This file defines `ReadMcpResourceHandler`, the executor for the `read_mcp_resource` tool. As with the list handlers, the trait implementation is thin: it publishes the fixed tool name, returns the schema from `create_read_mcp_resource_tool`, marks the tool as parallel-safe, and boxes the async execution future.
+This file is the bridge between a model request like “read this MCP resource” and the actual MCP server call that fetches the resource. Without it, the tool may be advertised to the model, but there would be no code to check the request, contact the right server, and return the result in the format the rest of the system expects.
 
-The substantive logic is in `handle_call`. After destructuring `ToolInvocation`, it insists on `ToolPayload::Function` and rejects any other payload variant with a `RespondToModel` error. It parses the raw JSON argument string using `parse_arguments`, then deserializes into `ReadResourceArgs` with `parse_args`, which expects the required fields to be present. `normalize_required_string` is applied to both `server` and `uri`, so empty strings are rejected even if the JSON field exists.
+The main piece is `ReadMcpResourceHandler`. It tells the tool registry its name, describes its input shape, says it is safe to run in parallel with other tool calls, and then performs the work when invoked. The work happens in a careful sequence. First, it accepts only normal function-style tool input. Then it parses the JSON-like arguments and requires two important fields: the MCP server name and the resource URI, which is the resource’s address. Next, it emits a “tool call began” event, like writing a start line in an activity log, and records the start time.
 
-For observability, the handler constructs an `McpInvocation` containing the exact server, tool name, and original parsed arguments, emits a begin event, and starts an `Instant` timer. It then calls `session.read_resource(&server, ReadResourceRequestParams::new(uri.clone()))`. Any transport or server error is rewritten into a model-facing `FunctionCallError` with the prefix `resources/read failed`. On success it builds a `ReadResourcePayload` containing the server, URI, and raw `ReadResourceResult`. The remainder of the flow matches the list handlers: serialize under the turn’s truncation policy, derive plain text for telemetry, emit an end event with duration and success/error status, and return boxed output. The key invariant here is that both `server` and `uri` are mandatory and normalized before any MCP request is attempted.
+It then asks the current session to read the resource from the named server. If that succeeds, it wraps the server response together with the server and URI, serializes it into the standard tool-output format, emits a matching “tool call ended” event, and returns the output. If anything fails, it still emits the end event with the error, so observers get a complete story of what happened.
 
 #### Function details
 
@@ -4356,11 +4372,11 @@ For observability, the handler constructs an `McpInvocation` containing the exac
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registered tool name `read_mcp_resource`.
+**Purpose**: This function gives the handler its public tool name: `read_mcp_resource`. The tool registry uses this name to match a model’s requested tool call to this handler.
 
-**Data flow**: It creates a `ToolName` from the fixed string literal and returns it. No state is read or written.
+**Data flow**: It takes no outside input beyond the handler itself. It creates a plain tool name from the fixed text `read_mcp_resource` and returns that name to the caller.
 
-**Call relations**: Used by the tool registry and dispatcher to identify this handler. It only delegates to `ToolName::plain`.
+**Call relations**: When the tool system is registering or looking up available tools, it asks this handler for its name. This function delegates the small job of building the `ToolName` value to `plain`.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4371,11 +4387,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Provides the tool specification describing the required `server` and `uri` arguments for reading a resource.
+**Purpose**: This function returns the formal description of the `read_mcp_resource` tool. That description tells the model and runtime what arguments the tool expects.
 
-**Data flow**: It returns the `ToolSpec` produced by `create_read_mcp_resource_tool()` and has no side effects.
+**Data flow**: It takes the handler as input, calls the helper that builds the read-resource tool specification, and returns that specification. It does not read or change any runtime state.
 
-**Call relations**: Called during tool publication and discovery. It delegates schema construction to the shared spec module.
+**Call relations**: The tool registry calls this when it needs to advertise or validate the tool. It hands off the actual construction of the specification to `create_read_mcp_resource_tool`, keeping this handler focused on execution.
 
 *Call graph*: calls 1 internal fn (create_read_mcp_resource_tool).
 
@@ -4386,11 +4402,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Declares that resource reads may execute concurrently with other tool calls.
+**Purpose**: This function says that multiple calls to this tool may run at the same time. That matters because reading resources from MCP servers does not require this handler to hold exclusive shared state.
 
-**Data flow**: It returns `true` without consulting or mutating any state.
+**Data flow**: It receives only the handler and returns `true`. Nothing else is read or changed.
 
-**Call relations**: Read by scheduling/orchestration code to determine concurrency behavior. It has no downstream calls.
+**Call relations**: The runtime uses this answer when deciding whether it can run this tool alongside other tool calls. By returning true, the handler allows the broader tool executor to schedule it concurrently when appropriate.
 
 
 ##### `ReadMcpResourceHandler::handle`  (lines 42–44)
@@ -4399,11 +4415,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Converts the async read implementation into the boxed future form required by `ToolExecutor`.
+**Purpose**: This is the standard entry point the tool runtime calls when the model invokes `read_mcp_resource`. It turns the real async work into the boxed future shape expected by the shared tool interface.
 
-**Data flow**: It accepts a `ToolInvocation`, forwards it unchanged to `self.handle_call(invocation)`, pins the future, and returns it.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn information, call ID, and raw tool arguments. It passes that invocation to `handle_call`, pins the asynchronous task so it can be safely driven by the runtime, and returns the future.
 
-**Call relations**: This is the trait entrypoint used by the runtime. It simply hands execution off to `ReadMcpResourceHandler::handle_call`.
+**Call relations**: The tool runtime calls `handle` after matching a tool request to this handler. `handle` immediately hands the detailed work to `handle_call`, acting like a small adapter between the common executor interface and this handler’s own logic.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4417,11 +4433,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Performs the end-to-end read-resource operation: validate payload type, parse and normalize required arguments, invoke the MCP read API, serialize the result, and emit begin/end telemetry.
+**Purpose**: This function performs the full read-resource operation. It validates the model’s arguments, asks the chosen MCP server for the resource, records begin/end events, and returns either a clean tool result or an error the model can understand.
 
-**Data flow**: It consumes a `ToolInvocation`, extracts session context and the raw function arguments, parses them into JSON and then `ReadResourceArgs`, and normalizes `server` and `uri` as required non-empty strings. It builds an `McpInvocation`, emits a begin event, times the operation, calls `session.read_resource` with `ReadResourceRequestParams::new(uri.clone())`, wraps the successful response into `ReadResourcePayload`, serializes that payload with `serialize_function_output`, converts output body items to text for telemetry, emits an end event with duration and success/error details, and returns boxed tool output or a `FunctionCallError`.
+**Data flow**: It starts with a `ToolInvocation` containing the session, turn, call ID, and payload. It accepts only function-call payloads, parses the argument text, extracts and checks the required `server` and `uri` fields, and builds an `McpInvocation` record for logging. It emits a begin event and notes the current time. Then it calls the session’s `read_resource` method with the server name and URI. On success, it packages the result into a `ReadResourcePayload`, serializes that into the standard tool-output format, extracts readable text for logging, emits a successful end event with the elapsed time, and returns the boxed output. On failure at the server-call or serialization step, it emits an end event with the error message and returns the error.
 
-**Call relations**: Called by `ReadMcpResourceHandler::handle`. It delegates outward to the session’s MCP read API for the actual fetch and to shared serialization/telemetry helpers for consistent reporting on both success and failure.
+**Call relations**: `handle` is the only listed caller of this function. Inside the larger flow, `handle_call` coordinates several helpers: argument parsers turn raw text into structured input, `emit_tool_call_begin` and `emit_tool_call_end` create observability events, the session performs the actual MCP resource read, serialization converts the response into model-facing output, and `boxed_tool_output` wraps the final result for the generic tool system.
 
 *Call graph*: calls 2 internal fn (boxed_tool_output, function_call_output_content_items_to_text); called by 1 (handle); 11 external calls (now, new, clone, call_tool_result_from_content, emit_tool_call_begin, emit_tool_call_end, normalize_required_string, parse_args, parse_arguments, serialize_function_output (+1 more)).
 
@@ -4431,11 +4447,13 @@ These files handle auth-elicitation decoding, session-side MCP refresh and appro
 
 ### `codex-mcp/src/auth_elicitation.rs`
 
-`domain_logic` · `tool-call error handling`
+`domain_logic` · `request handling`
 
-This module defines the data structures and constants used to recognize Codex Apps authentication failures embedded in `CallToolResult.meta`. The central parser, `connector_auth_failure_from_tool_result`, is intentionally strict: it only accepts results marked `is_error == Some(true)`, requires nested JSON objects under `_codex_apps.connector_auth_failure`, requires `is_auth_failure: true`, requires a non-empty trusted `connector_id` argument, and rejects metadata whose connector ID disagrees with that trusted ID. It also requires an install URL from the caller rather than trusting metadata for that field. Optional string fields such as `auth_reason`, `link_id`, `error_code`, and `error_action` are normalized through `string_auth_failure_field`, which trims whitespace and drops empty strings.
+Some Codex tools depend on outside apps, such as calendar or drive connectors. If one of those apps needs the user to sign in again, the raw tool response contains structured metadata, not a friendly next step. This file is the translator between that raw metadata and the auth prompt Codex can show to the user.
 
-Once parsed, `build_auth_elicitation_plan` pairs the validated failure with a user-facing elicitation payload. `build_auth_elicitation` serializes a nested metadata object using `CodexAppsConnectorAuthFailureMeta`, preserving optional fields only when present, and computes both a human message and a deterministic `elicitation_id`. Message text varies by `auth_reason`, distinguishing upgrade, reauthentication, missing-link, and generic sign-in cases. `auth_elicitation_completed_result` produces the follow-up `CallToolResult` that tells the caller authentication was accepted and the tool call should be retried. The inline tests document the trust boundary: connector name may be supplied by trusted caller context, but connector identity must match trusted metadata expectations.
+It first checks whether a tool result is truly an authentication failure. It does not trust every field in the result blindly: the caller must provide the expected connector id, name, and install URL, and the file rejects results where the connector id is missing or does not match. That matters because the prompt may send a user to a login or install page, so the destination should come from trusted context, not only from the failing tool.
+
+Once a failure is accepted, the file builds a small plan: the parsed failure details plus an “elicitation,” meaning a request asking the user to take action. The elicitation includes a message such as “Reconnect Google Calendar,” the URL to open, and a stable id based on the original tool call. It also has helpers for the result returned after the user accepts the auth request, telling the system to retry the original tool call.
 
 #### Function details
 
@@ -4450,11 +4468,11 @@ fn connector_auth_failure_from_tool_result(
 ) -> Option<CodexAppsConnect
 ```
 
-**Purpose**: Extracts a validated `CodexAppsConnectorAuthFailure` from a tool result’s nested metadata when the result represents an auth failure for a trusted connector. It rejects non-errors, malformed metadata, missing trusted connector identity, mismatches, and missing install URLs.
+**Purpose**: This function inspects a tool result and decides whether it represents a trusted connector authentication failure. It returns a clean, typed record of the failure only when the result is an error, the expected metadata is present, and the connector id matches the trusted connector id supplied by the caller.
 
-**Data flow**: Inputs are a `&CallToolResult`, optional trusted `connector_id`, optional trusted `connector_name`, and optional `install_url`. The function reads `result.is_error` and walks `result.meta` through `_codex_apps` and `connector_auth_failure` JSON objects, checks `is_auth_failure`, normalizes optional string fields via `string_auth_failure_field`, trims and validates the trusted connector ID, compares any metadata connector ID against that trusted ID, derives a connector name from the trusted name or connector ID, and returns `Some(CodexAppsConnectorAuthFailure)` or `None`. It does not mutate external state.
+**Data flow**: It receives the raw tool result, an optional expected connector id, an optional trusted connector name, and an optional install URL. It checks the result step by step, reads the nested metadata, trims text fields, rejects missing or mismatched connector ids, and fills in optional details such as the reason, link id, error code, HTTP status code, and suggested action. The output is either a `CodexAppsConnectorAuthFailure` ready for prompting the user, or `None` if the result should not become an auth prompt.
 
-**Call relations**: It is the parser used by `build_auth_elicitation_plan` and is also exercised directly by the payload-building test. The function delegates repeated optional-string extraction to `string_auth_failure_field` so all metadata fields share the same trim-and-empty-drop behavior.
+**Call relations**: This is the gatekeeper for the auth flow. `build_auth_elicitation_plan` calls it before creating any user-facing prompt, and the tests call it directly to prove that trusted metadata is accepted and unsafe or incomplete metadata is rejected. It uses `string_auth_failure_field` to pull optional text fields out of the metadata without accepting blank strings.
 
 *Call graph*: calls 1 internal fn (string_auth_failure_field); called by 2 (build_auth_elicitation_plan, builds_url_elicitation_payload).
 
@@ -4471,11 +4489,11 @@ fn build_auth_elicitation_plan(
 ) -> Option<CodexApps
 ```
 
-**Purpose**: Builds the full auth-elicitation plan only when a tool result can be parsed into a trusted auth failure. The returned plan bundles both the parsed failure details and the user-facing elicitation payload.
+**Purpose**: This function builds the full plan for asking the user to authenticate a connector. It combines the parsed failure information with the prompt payload that can be shown to the user.
 
-**Data flow**: Takes a call ID, tool result, optional trusted connector ID and name, and optional install URL. It first invokes `connector_auth_failure_from_tool_result`; on `None` it returns `None`. On success it passes the parsed failure into `build_auth_elicitation` and returns `Some(CodexAppsAuthElicitationPlan { auth_failure, elicitation })`.
+**Data flow**: It receives the original call id, the tool result, trusted connector details, and the install URL. First it asks `connector_auth_failure_from_tool_result` to validate and parse the failure. If that succeeds, it passes the parsed failure to `build_auth_elicitation` and returns both pieces together as a `CodexAppsAuthElicitationPlan`; if parsing fails, it returns `None`.
 
-**Call relations**: This is the module’s orchestration helper: callers use it when they want parsing and payload construction in one step. The test `tests::builds_auth_elicitation_plan` covers the successful path.
+**Call relations**: This is the small orchestration step inside this file. It is used when the system wants one answer to the question, “Should I ask the user to reconnect, and if so, what exactly should I send?” The test `tests::builds_auth_elicitation_plan` exercises this path end to end.
 
 *Call graph*: calls 2 internal fn (build_auth_elicitation, connector_auth_failure_from_tool_result); called by 1 (builds_auth_elicitation_plan).
 
@@ -4489,11 +4507,11 @@ fn build_auth_elicitation(
 ) -> CodexAppsAuthElicitation
 ```
 
-**Purpose**: Constructs the protocol-neutral auth-elicitation payload from a validated auth-failure record. It serializes machine-readable metadata and computes the message, URL, and elicitation identifier shown to the client.
+**Purpose**: This function creates the actual auth prompt payload from an already validated auth failure. The payload includes machine-readable metadata, a human-readable message, the URL to open, and a unique prompt id.
 
-**Data flow**: Accepts a `call_id` and `&CodexAppsConnectorAuthFailure`. It builds a JSON `meta` object under `_codex_apps.connector_auth_failure` using `CodexAppsConnectorAuthFailureMeta`, computes `message` with `auth_elicitation_message`, clones `install_url` into `url`, computes `elicitation_id` with `auth_elicitation_id`, and returns a `CodexAppsAuthElicitation`.
+**Data flow**: It receives a call id and a parsed `CodexAppsConnectorAuthFailure`. It copies the trusted connector details into a JSON metadata object, chooses the right message with `auth_elicitation_message`, copies the install URL as the link the user should visit, and creates an id with `auth_elicitation_id`. The output is a `CodexAppsAuthElicitation` that another part of the system can send to the user interface.
 
-**Call relations**: It is called by `build_auth_elicitation_plan` after parsing succeeds. It delegates message wording and ID formatting to dedicated helpers so payload shape and wording logic remain separate.
+**Call relations**: `build_auth_elicitation_plan` calls this after the failure has passed validation. Inside, it delegates the wording to `auth_elicitation_message` and the identifier format to `auth_elicitation_id`, keeping those small choices separate and easy to test.
 
 *Call graph*: calls 2 internal fn (auth_elicitation_id, auth_elicitation_message); called by 1 (build_auth_elicitation_plan); 1 external calls (json!).
 
@@ -4507,11 +4525,11 @@ fn auth_elicitation_completed_result(
 ) -> CallToolResult
 ```
 
-**Purpose**: Creates the `CallToolResult` sent after the user accepts an authentication elicitation. The result is intentionally marked as an error so the caller knows to retry the original tool call rather than treat this as normal tool output.
+**Purpose**: This function creates the tool result used after the user accepts the authentication request. It tells the surrounding system that authentication was requested and accepted, and that the original tool call should be retried.
 
-**Data flow**: Takes a validated auth-failure record and optional metadata. It formats a single text content item mentioning `auth_failure.connector_name`, sets `structured_content` to `None`, `is_error` to `Some(true)`, preserves the provided `meta`, and returns the assembled `CallToolResult`.
+**Data flow**: It receives the parsed auth failure and optional metadata. It builds a `CallToolResult` containing a short text message naming the connector, marks the result as an error, leaves structured content empty, and attaches the supplied metadata. The output is a tool-style result that communicates “try again now” rather than returning normal tool data.
 
-**Call relations**: This helper is used by higher-level auth-elicitation flows after acceptance; within this file it stands alone as the completion payload counterpart to `build_auth_elicitation`.
+**Call relations**: This helper is separate from the prompt-building path. It is meant for the later part of the auth flow, after the user has responded to the elicitation. It does not call the parser because it assumes the auth failure has already been recognized.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -4522,11 +4540,11 @@ fn auth_elicitation_completed_result(
 fn auth_elicitation_id(call_id: &str) -> String
 ```
 
-**Purpose**: Generates a deterministic elicitation identifier from an MCP call ID. The prefix namespaces these IDs to Codex Apps auth flows.
+**Purpose**: This function turns a tool call id into the id used for the matching authentication prompt. It gives auth prompts a predictable prefix so they can be recognized as Codex app auth requests.
 
-**Data flow**: Consumes `&str call_id`, interpolates it into `codex_apps_auth_{call_id}`, and returns the resulting `String`.
+**Data flow**: It receives the original call id as text. It prefixes it with `codex_apps_auth_` and returns the combined string. Nothing else is read or changed.
 
-**Call relations**: It is called only by `build_auth_elicitation` so all auth elicitations use the same stable ID format.
+**Call relations**: `build_auth_elicitation` calls this while assembling the prompt payload. It is a small naming helper, like putting a labeled tag on the prompt so later code can connect it back to the tool call.
 
 *Call graph*: called by 1 (build_auth_elicitation); 1 external calls (format!).
 
@@ -4540,11 +4558,11 @@ fn string_auth_failure_field(
 ) -> Option<String>
 ```
 
-**Purpose**: Reads an optional string field from the auth-failure metadata map and normalizes it. Whitespace-only values are discarded.
+**Purpose**: This helper reads an optional text field from the auth failure metadata. It filters out missing, non-text, or blank values so the rest of the file does not have to repeat those checks.
 
-**Data flow**: Takes a JSON object map and a key, looks up the value, converts it to `&str` if possible, trims it, filters out empty strings, clones the remaining text into a `String`, and returns `Option<String>`.
+**Data flow**: It receives the JSON object holding auth failure metadata and the key to look up. It gets the value, accepts it only if it is a string, trims surrounding whitespace, rejects it if it is empty, and returns the cleaned string. If any step fails, it returns `None`.
 
-**Call relations**: This helper is called repeatedly by `connector_auth_failure_from_tool_result` to keep parsing of optional metadata fields consistent and concise.
+**Call relations**: `connector_auth_failure_from_tool_result` uses this helper for fields such as auth reason, connector id, link id, error code, and error action. This keeps the parser’s main logic focused on deciding whether the failure is trustworthy.
 
 *Call graph*: called by 1 (connector_auth_failure_from_tool_result); 1 external calls (get).
 
@@ -4555,11 +4573,11 @@ fn string_auth_failure_field(
 fn auth_elicitation_message(auth_failure: &CodexAppsConnectorAuthFailure) -> String
 ```
 
-**Purpose**: Chooses the user-facing auth prompt text based on the failure reason. Different reasons produce more specific reconnect or sign-in instructions.
+**Purpose**: This function chooses the user-facing sentence for an auth prompt. It makes the message more specific when the metadata explains why authentication is needed.
 
-**Data flow**: Reads `auth_failure.auth_reason` and `auth_failure.connector_name`. It matches known reasons like `oauth_upgrade_required`, `reauthentication_required`, and `missing_link`, formats the corresponding sentence, and returns the message `String`.
+**Data flow**: It receives a parsed auth failure. It looks at `auth_reason` and the connector name, then returns a sentence such as asking the user to reconnect, restore access, sign in for a missing link, or simply sign in to continue. It does not change any data.
 
-**Call relations**: It is called by `build_auth_elicitation` to separate wording policy from payload assembly.
+**Call relations**: `build_auth_elicitation` calls this while creating the prompt. This keeps the prompt-building code from being cluttered with wording rules, and it makes the user-facing behavior easy to adjust.
 
 *Call graph*: called by 1 (build_auth_elicitation); 1 external calls (format!).
 
@@ -4570,11 +4588,11 @@ fn auth_elicitation_message(auth_failure: &CodexAppsConnectorAuthFailure) -> Str
 fn auth_failure_result() -> CallToolResult
 ```
 
-**Purpose**: Builds a representative `CallToolResult` containing nested Codex Apps auth-failure metadata for unit tests. The metadata includes both trusted and untrusted-looking fields so parsing behavior can be checked precisely.
+**Purpose**: This test helper builds a realistic fake tool result that represents a connector authentication failure. The tests use it as their sample input instead of repeating the same JSON setup each time.
 
-**Data flow**: Creates and returns a `CallToolResult` with one text content item, `is_error: Some(true)`, and a nested JSON `meta` object under `_codex_apps.connector_auth_failure` containing auth reason, connector ID, connector name, link ID, error code, HTTP status, and action.
+**Data flow**: It creates a `CallToolResult` with text content, marks it as an error, and fills the metadata with connector auth failure fields such as connector id, reason, link id, and error details. The output is that ready-made result for test cases to inspect or pass into the production functions.
 
-**Call relations**: This fixture is consumed by the parsing and plan-building tests to avoid duplicating the nested metadata shape.
+**Call relations**: The test cases use this helper as the shared fixture, like a prepared sample form. It supports tests that parse auth failures, build prompt payloads, and build a full auth elicitation plan.
 
 *Call graph*: 2 external calls (json!, vec!).
 
@@ -4585,11 +4603,11 @@ fn auth_failure_result() -> CallToolResult
 fn parses_auth_failure_from_trusted_connector_metadata()
 ```
 
-**Purpose**: Verifies that valid auth-failure metadata plus trusted connector context produces a fully populated `CodexAppsConnectorAuthFailure`. It also confirms that the trusted connector name overrides any untrusted metadata name.
+**Purpose**: This test proves that a well-formed authentication failure is parsed correctly when the caller supplies trusted connector information. It also checks that the trusted connector name and install URL are used in the parsed result.
 
-**Data flow**: Calls `connector_auth_failure_from_tool_result` with the fixture result, trusted connector ID and name, and install URL, then compares the returned struct against an explicit expected value containing all parsed optional fields.
+**Data flow**: It builds or uses the sample auth failure result, passes it with the expected connector id, trusted display name, and install URL into the parser, and compares the returned value to the exact expected `CodexAppsConnectorAuthFailure`. The visible outcome is a passing or failing assertion.
 
-**Call relations**: This test exercises the parser’s successful path and documents the trust model around connector identity and display name.
+**Call relations**: This test focuses on the happy path for `connector_auth_failure_from_tool_result`. It protects the main auth flow by checking that valid metadata becomes the clean internal record that later prompt-building functions depend on.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4600,11 +4618,11 @@ fn parses_auth_failure_from_trusted_connector_metadata()
 fn rejects_missing_or_mismatched_connector_ids()
 ```
 
-**Purpose**: Checks that parsing fails when the caller does not supply a trusted connector ID or supplies one that disagrees with metadata. This prevents auth prompts from being generated for ambiguous or spoofed connectors.
+**Purpose**: This test proves the parser does not create an auth prompt when the trusted connector id is absent or does not match the metadata. That protects users from being sent to the wrong connector’s authentication page.
 
-**Data flow**: Invokes `connector_auth_failure_from_tool_result` twice with the fixture result: once with `connector_id` absent and once with a mismatched ID. It asserts that both calls return `None`.
+**Data flow**: It sends the sample auth failure result through the parser twice: once without a connector id and once with a different connector id. In both cases it expects `None`, meaning the raw result is not accepted as a usable auth failure.
 
-**Call relations**: This test covers the parser’s early rejection branches that enforce trusted connector identity.
+**Call relations**: This test exercises the safety checks inside `connector_auth_failure_from_tool_result`. It is the guardrail test for the trust boundary between untrusted tool metadata and the user-facing auth prompt.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4615,11 +4633,11 @@ fn rejects_missing_or_mismatched_connector_ids()
 fn builds_url_elicitation_payload()
 ```
 
-**Purpose**: Verifies the exact auth-elicitation payload built from a parsed auth failure. It checks nested metadata, reason-specific message text, URL propagation, and deterministic elicitation ID formatting.
+**Purpose**: This test checks that a parsed auth failure becomes the exact prompt payload expected by the rest of the system. It verifies the metadata, message, URL, and prompt id together.
 
-**Data flow**: Parses the fixture result into an auth-failure struct using `connector_auth_failure_from_tool_result`, then passes that struct to `build_auth_elicitation` with `call_123` and asserts equality with a fully spelled-out `CodexAppsAuthElicitation` value.
+**Data flow**: It starts with the sample auth failure result, parses it with trusted connector information, then passes the parsed failure into `build_auth_elicitation`. It compares the returned `CodexAppsAuthElicitation` to an expected value containing the reconnect message, install URL, nested metadata, and generated id.
 
-**Call relations**: This test covers the payload-construction path after successful parsing and indirectly validates `auth_elicitation_message` and `auth_elicitation_id`.
+**Call relations**: This test follows the main path from raw failure to user prompt, using `connector_auth_failure_from_tool_result` first and then checking `build_auth_elicitation`. It also indirectly covers the message and id helpers because their output appears in the final payload.
 
 *Call graph*: calls 1 internal fn (connector_auth_failure_from_tool_result); 2 external calls (assert_eq!, auth_failure_result).
 
@@ -4630,20 +4648,26 @@ fn builds_url_elicitation_payload()
 fn builds_auth_elicitation_plan()
 ```
 
-**Purpose**: Checks that the combined plan builder returns both the parsed auth failure and the elicitation payload together. It focuses on the integration between parsing and payload assembly.
+**Purpose**: This test checks the convenience function that produces both the parsed failure and the prompt in one step. It ensures the combined plan contains the trusted connector name and the expected prompt id.
 
-**Data flow**: Calls `build_auth_elicitation_plan` with the fixture result and trusted connector context, unwraps the returned plan, and asserts selected fields on both `plan.auth_failure` and `plan.elicitation`.
+**Data flow**: It passes the sample auth failure result, call id, connector id, connector name, and install URL into `build_auth_elicitation_plan`. It unwraps the returned plan and asserts selected fields from both halves: the parsed auth failure and the generated elicitation.
 
-**Call relations**: This test exercises the top-level helper that composes `connector_auth_failure_from_tool_result` and `build_auth_elicitation`.
+**Call relations**: This test covers the top-level flow in this file. It confirms that `build_auth_elicitation_plan` correctly calls the parser and then the prompt builder, so callers can rely on one function for the common auth-prompt path.
 
 *Call graph*: calls 1 internal fn (build_auth_elicitation_plan); 2 external calls (assert_eq!, auth_failure_result).
 
 
 ### `core/src/session/mcp.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `startup, config refresh, and MCP request handling`
 
-This module extends `Session` with MCP-facing operations and defines the Guardian reviewer used for MCP elicitations. `GuardianMcpElicitationReviewer` stores a `Weak<Session>` so reviewer callbacks do not keep sessions alive; its `review` method upgrades the weak pointer and delegates to `review_guardian_mcp_elicitation`. Session methods expose runtime MCP config and server maps, create reviewer handles, proxy resource/template reads and tool calls to the current `McpConnectionManager`, and manage startup cancellation tokens. The most involved request path is `request_mcp_server_elicitation`: it short-circuits to an automatic accept when the connection manager is in auto-deny mode, otherwise converts MCP form or URL elicitation requests into protocol `ElicitationRequest` values, registers a oneshot sender in the active turn’s pending elicitation map keyed by server name and request id, emits an `EventMsg::ElicitationRequest`, records plugin-install telemetry when metadata indicates a tool-install suggestion, and waits for the response. `resolve_elicitation` first tries to satisfy a pending active-turn oneshot and falls back to the connection manager if the request is no longer tracked there. Refresh logic parses a deferred `McpServerRefreshConfig`, computes effective servers and auth statuses, derives runtime cwd from the primary turn environment when possible, rotates the startup cancellation token, constructs a fresh `McpConnectionManager`, preserves the previous auto-deny flag, and swaps it into session services. The Guardian review helpers inspect elicitation metadata for an explicit approval-request opt-in, require `mcp_tool_call` approval kind and empty form schemas, extract connector/tool metadata and JSON object arguments, build `GuardianApprovalRequest::McpToolCall`, and map Guardian `ReviewDecision` values back into MCP `ElicitationResponse` objects with standardized auto-review metadata and optional denial messages.
+MCP, or Model Context Protocol, lets Codex talk to outside servers that expose tools, resources, and prompts. This file is the session-level bridge to those servers. Without it, a session could not refresh its MCP connections, call MCP tools, read MCP resources, or ask the user or Guardian to approve MCP requests.
+
+The file has two main jobs. First, it offers simple session methods such as listing resources, reading a resource, calling a tool, and rebuilding the MCP connection manager when configuration changes. Think of this as replacing and reconnecting a power strip when the set of plugged-in devices changes.
+
+Second, it deals with “elicitations,” which are questions an MCP server asks the client. Some elicitations are ordinary user prompts. Others are approval requests, such as “may I run this tool?” For those, this file can send the request to the frontend, wait for a reply, or route it through Guardian for automatic safety review. It carefully records pending requests so the answer can be matched back to the right server and request id.
+
+A notable detail is that malformed or unsupported Guardian approval requests are declined safely instead of guessed at. The file also records telemetry for plugin-install suggestions, so the product can know when those prompts were shown.
 
 #### Function details
 
@@ -4653,11 +4677,11 @@ This module extends `Session` with MCP-facing operations and defines the Guardia
 fn new(session: &Arc<Session>) -> Self
 ```
 
-**Purpose**: Creates a reviewer wrapper that holds only a weak reference to the session.
+**Purpose**: Creates a Guardian-backed reviewer object for one session. It stores only a weak reference to the session, so the reviewer does not keep the whole session alive by accident.
 
-**Data flow**: Accepts `&Arc<Session>`, downgrades it with `Arc::downgrade`, stores the resulting `Weak<Session>` in `GuardianMcpElicitationReviewer`, and returns the new struct.
+**Data flow**: It receives a shared session pointer. It turns that into a weak pointer, which is like keeping an address without owning the house, and returns a reviewer containing that weak pointer.
 
-**Call relations**: Called by `Session::mcp_elicitation_reviewer` when a reviewer handle is needed for MCP connection-manager setup. Using a weak pointer avoids reviewer callbacks extending session lifetime.
+**Call relations**: Session::mcp_elicitation_reviewer calls this when the MCP layer needs a reviewer handle. The reviewer later uses the saved weak session reference when Guardian review is requested.
 
 *Call graph*: called by 1 (mcp_elicitation_reviewer); 1 external calls (downgrade).
 
@@ -4671,11 +4695,11 @@ fn review(
     ) -> BoxFuture<'static, anyhow::Result<Option<ElicitationResponse>>>
 ```
 
-**Purpose**: Implements the `ElicitationReviewer` trait by asynchronously delegating Guardian review to the live session if it still exists.
+**Purpose**: Implements the actual review hook used by the MCP system. When an MCP server asks for approval, this tries to find the live session and, if possible, sends the request through Guardian.
 
-**Data flow**: Clones the stored weak session pointer, returns a boxed future, upgrades the weak pointer inside that future, returns `Ok(None)` if the session is gone, otherwise awaits `review_guardian_mcp_elicitation(session, request)` and returns its result.
+**Data flow**: It receives an MCP elicitation review request. It upgrades the weak session reference into a live session if the session still exists; if not, it returns no answer. If the session is alive, it passes the request to review_guardian_mcp_elicitation and returns that result.
 
-**Call relations**: This trait method is invoked by MCP infrastructure when an elicitation requires review. It is the adapter from the generic reviewer interface into this module’s session-aware Guardian logic.
+**Call relations**: The MCP library calls this through the ElicitationReviewer interface. It hands the real work to review_guardian_mcp_elicitation, which checks whether Guardian should review the request and builds the final MCP response.
 
 *Call graph*: calls 1 internal fn (review_guardian_mcp_elicitation); 2 external calls (pin, clone).
 
@@ -4686,11 +4710,11 @@ fn review(
 async fn runtime_mcp_config(&self, config: &Config) -> McpConfig
 ```
 
-**Purpose**: Computes the effective MCP runtime configuration for the current thread from the session’s MCP manager and initialization state.
+**Purpose**: Builds the MCP configuration that should be used right now for this session and thread. This matters because runtime configuration can include session-specific or thread-specific additions.
 
-**Data flow**: Borrows `self` and a `Config`, then awaits `self.services.mcp_manager.runtime_config_for_thread(config, &self.services.mcp_thread_init)` and returns the resulting `McpConfig`.
+**Data flow**: It receives the current Config. It asks the MCP manager to combine that config with MCP thread initialization state. It returns the resulting McpConfig.
 
-**Call relations**: Used by `runtime_mcp_servers` and `refresh_mcp_servers_inner` as the starting point for effective MCP server computation.
+**Call relations**: Session::runtime_mcp_servers and Session::refresh_mcp_servers_inner call this before they need the effective MCP setup. It is the first step before choosing which servers should exist.
 
 *Call graph*: called by 2 (refresh_mcp_servers_inner, runtime_mcp_servers).
 
@@ -4704,11 +4728,11 @@ async fn runtime_mcp_servers(
     ) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Returns the configured MCP servers derived from the session’s effective runtime MCP config.
+**Purpose**: Returns the MCP servers that are configured for this session at runtime. It gives callers the concrete server map rather than the broader MCP configuration.
 
-**Data flow**: Awaits `self.runtime_mcp_config(config)`, passes the resulting config to `codex_mcp::configured_mcp_servers`, and returns the resulting `HashMap<String, McpServerConfig>`.
+**Data flow**: It receives the current Config. It first builds the runtime MCP config, then extracts the configured MCP servers from it, and returns them keyed by server name.
 
-**Call relations**: This is a convenience wrapper over `runtime_mcp_config` for callers that need the server map directly.
+**Call relations**: This is a convenience wrapper around Session::runtime_mcp_config. It hands the resulting config to the MCP helper that extracts server definitions.
 
 *Call graph*: calls 1 internal fn (runtime_mcp_config); 1 external calls (configured_mcp_servers).
 
@@ -4719,11 +4743,11 @@ async fn runtime_mcp_servers(
 fn mcp_elicitation_reviewer(self: &Arc<Self>) -> ElicitationReviewerHandle
 ```
 
-**Purpose**: Builds an `ElicitationReviewerHandle` backed by the session’s Guardian reviewer implementation.
+**Purpose**: Creates a reviewer handle that the MCP connection manager can use when a server asks for approval. The reviewer connects MCP approval questions back to this session’s Guardian flow.
 
-**Data flow**: Creates a `GuardianMcpElicitationReviewer` with `GuardianMcpElicitationReviewer::new(self)`, wraps it in `Arc`, and returns it as the trait-object handle.
+**Data flow**: It receives the session as a shared Arc pointer. It creates a GuardianMcpElicitationReviewer and wraps it in a shared reviewer handle. The output is something the MCP system can store and call later.
 
-**Call relations**: Used by session handlers when refreshing MCP servers or processing turns that may need elicitation review.
+**Call relations**: This calls GuardianMcpElicitationReviewer::new. The resulting handle is passed into MCP setup so later MCP elicitation reviews can reach Guardian through GuardianMcpElicitationReviewer::review.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (new).
 
@@ -4739,11 +4763,11 @@ async fn request_mcp_server_elicitation(
     ) -> McpServerElicitat
 ```
 
-**Purpose**: Sends an MCP elicitation request to the client for the active turn, tracks a pending response channel, and optionally records plugin-install telemetry.
+**Purpose**: Sends an MCP server’s question to the client side and waits for an answer. This is how a server can ask the user for form input, a URL action, or approval during an active turn.
 
-**Data flow**: Reads the connection manager’s `elicitations_auto_deny` flag and, if true, returns an immediate accepted `ElicitationResponse` with empty JSON content and `sent = false`. Otherwise it clones `server_name`, converts the incoming MCP request into protocol `codex_protocol::approvals::ElicitationRequest`, serializing form schemas with `serde_json::to_value` and aborting with a warning on serialization failure. It creates a oneshot channel, inserts the sender into the active turn’s pending elicitation map under `(server_name, request_id)`, warns if an entry was overwritten, converts the RMCP request id into protocol `RequestId`, builds `EventMsg::ElicitationRequest`, derives optional plugin-install telemetry metadata from the event, marks user input requested during the turn, sends the event, records telemetry if applicable, awaits the oneshot receiver, and returns `McpServerElicitationOutcome { response, sent: true }`.
+**Data flow**: It receives the current turn context, a request id, and the server’s elicitation parameters. If the connection manager is set to auto-deny elicitations, it returns an automatic accept-shaped response without sending anything. Otherwise it converts the MCP request into the project’s event format, stores a one-time response channel in the active turn state, sends an event to the client, optionally records plugin-install telemetry, then waits for the response channel and returns the answer plus a flag saying the request was sent.
 
-**Call relations**: Called by MCP execution flows when a server asks the client for approval or input. It coordinates active-turn state, protocol event emission, and eventual response delivery.
+**Call relations**: This is called when an MCP server initiates an elicitation. It uses plugin_install_elicitation_telemetry_metadata to recognize install-suggestion prompts. Later, Session::resolve_elicitation supplies the answer by finding the stored response channel.
 
 *Call graph*: calls 1 internal fn (plugin_install_elicitation_telemetry_metadata); 8 external calls (Integer, String, clone, channel, ElicitationRequest, json!, to_value, warn!).
 
@@ -4759,11 +4783,11 @@ async fn resolve_elicitation(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Resolves a pending MCP elicitation either by satisfying the active turn’s waiting oneshot or by forwarding the response to the connection manager.
+**Purpose**: Delivers a user or client answer back to the waiting MCP elicitation request. It matches the answer to the original server name and request id.
 
-**Data flow**: Locks `active_turn`, removes any pending elicitation sender matching `(server_name, id)` from the active turn state, and if found sends the provided `ElicitationResponse` through that oneshot, mapping send failure into an `anyhow` error. If no active-turn entry exists, it delegates to `self.services.mcp_connection_manager.load_full().resolve_elicitation(server_name, id, response).await`.
+**Data flow**: It receives a server name, request id, and response. It first looks in the active turn’s pending elicitations. If it finds a waiting channel, it sends the response there. If not, it forwards the response to the MCP connection manager, which may know about a request outside the active turn state.
 
-**Call relations**: Called from the session handler that processes client elicitation responses. It bridges the protocol response back to whichever component is currently waiting for it.
+**Call relations**: This completes the flow started by Session::request_mcp_server_elicitation. It is the return path from the frontend or caller back to the MCP machinery.
 
 
 ##### `Session::list_resources`  (lines 247–257)
@@ -4776,11 +4800,11 @@ async fn list_resources(
     ) -> anyhow::Result<ListResourcesResult>
 ```
 
-**Purpose**: Proxies an MCP list-resources request to the current connection manager.
+**Purpose**: Asks an MCP server what resources it offers. Resources are external items, such as files or data objects, that the server can expose to Codex.
 
-**Data flow**: Accepts a server name and optional pagination params, forwards them to `mcp_connection_manager.load_full().list_resources(server, params).await`, and returns the result.
+**Data flow**: It receives a server name and optional pagination information. It forwards both to the current MCP connection manager. It returns either the server’s resource list or an error.
 
-**Call relations**: This is a direct session façade over the MCP transport layer for resource enumeration.
+**Call relations**: This is a thin session-level doorway into the MCP connection manager. Higher-level session code can call it without needing to know how MCP connections are stored.
 
 
 ##### `Session::list_resource_templates`  (lines 259–269)
@@ -4793,11 +4817,11 @@ async fn list_resource_templates(
     ) -> anyhow::Result<ListResourceTemplatesResult>
 ```
 
-**Purpose**: Proxies an MCP list-resource-templates request to the current connection manager.
+**Purpose**: Asks an MCP server for resource templates, which are patterns for resources that can be filled in later. This lets the client discover resource shapes, not just fixed resource items.
 
-**Data flow**: Accepts a server name and optional pagination params, forwards them to `mcp_connection_manager.load_full().list_resource_templates(server, params).await`, and returns the result.
+**Data flow**: It receives a server name and optional pagination information. It forwards the request to the current MCP connection manager and returns the result or error.
 
-**Call relations**: Like `list_resources`, this method exposes MCP transport functionality through the session.
+**Call relations**: Like the other resource methods, it keeps callers talking to Session while the connection manager does the actual MCP communication.
 
 
 ##### `Session::read_resource`  (lines 271–281)
@@ -4810,11 +4834,11 @@ async fn read_resource(
     ) -> anyhow::Result<ReadResourceResult>
 ```
 
-**Purpose**: Proxies an MCP read-resource request to the current connection manager.
+**Purpose**: Reads a specific resource from an MCP server. This is the session’s public path for fetching the content behind a resource reference.
 
-**Data flow**: Accepts a server name and `ReadResourceRequestParams`, forwards them to `mcp_connection_manager.load_full().read_resource(server, params).await`, and returns the result.
+**Data flow**: It receives a server name and read parameters describing which resource to fetch. It passes them to the MCP connection manager. It returns the resource contents or an error.
 
-**Call relations**: Used by higher-level session or tool flows that need MCP resource contents.
+**Call relations**: This method sits between session callers and the MCP connection manager. It does not interpret the resource itself; it delegates the server conversation.
 
 
 ##### `Session::call_tool`  (lines 283–295)
@@ -4829,11 +4853,11 @@ async fn call_tool(
     ) -> anyhow::Result<CallToolResu
 ```
 
-**Purpose**: Proxies an MCP tool invocation to the current connection manager.
+**Purpose**: Calls a named tool on an MCP server. Tools are actions exposed by the server, and this method is the session-level entry point for invoking them.
 
-**Data flow**: Accepts server name, tool name, optional JSON arguments, and optional JSON metadata; forwards them to `mcp_connection_manager.load_full().call_tool(server, tool, arguments, meta).await`; and returns the call result.
+**Data flow**: It receives the server name, tool name, optional JSON arguments, and optional metadata. It forwards these to the MCP connection manager. It returns the tool result or an error.
 
-**Call relations**: This is the session-level entry for MCP tool execution.
+**Call relations**: Higher-level code calls this when it wants an MCP tool execution. The MCP connection manager performs the actual request to the external server.
 
 
 ##### `Session::refresh_mcp_servers_inner`  (lines 297–368)
@@ -4847,11 +4871,11 @@ async fn refresh_mcp_servers_inner(
         key
 ```
 
-**Purpose**: Builds and installs a fresh `McpConnectionManager` from resolved runtime config, auth state, turn context, and optional elicitation reviewer.
+**Purpose**: Rebuilds the MCP connection manager using a fresh server configuration. This is the central routine that reconnects MCP servers after configuration, authentication, or environment details change.
 
-**Data flow**: Reads auth and config from session services, computes runtime MCP config and tool-plugin provenance, derives effective servers and host-owned app enablement, computes auth statuses, derives runtime cwd from the primary turn environment or falls back to the legacy turn cwd, creates `McpRuntimeContext`, rotates and stores a new startup `CancellationToken` after canceling the old one, constructs `McpConnectionManager::new(...)` with server/auth/approval/permission/runtime parameters, copies the previous manager’s `elicitations_auto_deny` flag into the refreshed manager, and stores the new manager in `self.services.mcp_connection_manager`.
+**Data flow**: It receives the turn context, server definitions, credential storage settings, keyring choice, and an optional elicitation reviewer. It reads current authentication and runtime MCP config, computes effective servers and auth statuses, chooses the working directory, cancels any older MCP startup attempt, creates a new cancellation token, builds a new McpConnectionManager, preserves the old auto-deny setting, and stores the new manager in session services.
 
-**Call relations**: This is the shared implementation behind both deferred and immediate MCP refresh paths. It is called by `refresh_mcp_servers_if_requested` and `refresh_mcp_servers_now`.
+**Call relations**: Session::refresh_mcp_servers_if_requested and Session::refresh_mcp_servers_now both call this so the complicated rebuild logic lives in one place. It also calls Session::runtime_mcp_config to get the current MCP settings and provides the optional reviewer used for Guardian approval flow.
 
 *Call graph*: calls 4 internal fn (new, new, runtime_mcp_config, permission_profile); called by 2 (refresh_mcp_servers_if_requested, refresh_mcp_servers_now); 3 external calls (new, new, tool_plugin_provenance).
 
@@ -4866,11 +4890,11 @@ async fn refresh_mcp_servers_if_requested(
     )
 ```
 
-**Purpose**: Consumes any pending serialized MCP refresh config from session state, parses it, and refreshes MCP servers if parsing succeeds.
+**Purpose**: Refreshes MCP servers only if some other part of the system has queued a refresh request. It is a safe checkpoint that turns pending JSON-like refresh data into real typed settings.
 
-**Data flow**: Takes and clears `pending_mcp_server_refresh_config`; if absent it returns. Otherwise it destructures the JSON-valued `McpServerRefreshConfig`, deserializes `mcp_servers`, `OAuthCredentialsStoreMode`, and `AuthKeyringBackendKind` from those JSON values with warning-and-return on parse failure, then calls `refresh_mcp_servers_inner(...)` with the parsed values and optional reviewer.
+**Data flow**: It checks and removes the pending refresh config from the session. If nothing is pending, it does nothing. If data is present, it tries to parse server configs, OAuth credential storage mode, and keyring backend kind. If parsing succeeds, it calls Session::refresh_mcp_servers_inner; if parsing fails, it logs a warning and stops.
 
-**Call relations**: Called during turn setup from session handlers after user input or review startup. It turns a previously queued refresh request into an actual connection-manager rebuild.
+**Call relations**: This is called when the session reaches a point where it can apply queued MCP changes. It hands successful refreshes to Session::refresh_mcp_servers_inner.
 
 *Call graph*: calls 1 internal fn (refresh_mcp_servers_inner); 1 external calls (warn!).
 
@@ -4886,11 +4910,11 @@ async fn refresh_mcp_servers_now(
         keyri
 ```
 
-**Purpose**: Immediately refreshes MCP servers using already parsed configuration values.
+**Purpose**: Immediately refreshes MCP servers from already-parsed configuration values. Use this when the caller already has valid server and authentication settings ready.
 
-**Data flow**: Accepts a turn context, concrete server map, store mode, keyring backend kind, and optional reviewer, then forwards them directly to `refresh_mcp_servers_inner(...).await`.
+**Data flow**: It receives the turn context, server map, credential storage mode, keyring backend kind, and optional reviewer. It passes them directly to Session::refresh_mcp_servers_inner and waits for the rebuild to finish.
 
-**Call relations**: This is the eager counterpart to `refresh_mcp_servers_if_requested`, used when the caller already has parsed refresh inputs.
+**Call relations**: This is the direct refresh path. It shares the actual rebuild work with Session::refresh_mcp_servers_if_requested by calling Session::refresh_mcp_servers_inner.
 
 *Call graph*: calls 1 internal fn (refresh_mcp_servers_inner).
 
@@ -4901,11 +4925,11 @@ async fn refresh_mcp_servers_now(
 async fn mcp_startup_cancellation_token(&self) -> CancellationToken
 ```
 
-**Purpose**: Returns the current MCP startup cancellation token for tests.
+**Purpose**: Returns the current cancellation token used for MCP startup work. This exists only in tests, so tests can inspect or coordinate startup cancellation behavior.
 
-**Data flow**: Locks `self.services.mcp_startup_cancellation_token`, clones the stored `CancellationToken`, and returns it.
+**Data flow**: It locks the session’s stored MCP startup cancellation token, clones it, and returns the clone. It does not change the token.
 
-**Call relations**: Compiled only in tests to let test code observe token rotation and cancellation behavior.
+**Call relations**: Because it is test-only, production flow does not call it. It supports tests around Session::refresh_mcp_servers_inner and Session::cancel_mcp_startup behavior.
 
 
 ##### `Session::cancel_mcp_startup`  (lines 449–455)
@@ -4914,11 +4938,11 @@ async fn mcp_startup_cancellation_token(&self) -> CancellationToken
 async fn cancel_mcp_startup(&self)
 ```
 
-**Purpose**: Cancels the current MCP startup token, signaling in-progress MCP startup work to stop.
+**Purpose**: Cancels any MCP server startup work that is currently using the session’s startup cancellation token. This is useful when the session should stop trying to connect old MCP servers.
 
-**Data flow**: Locks `self.services.mcp_startup_cancellation_token` and calls `cancel()` on the stored token.
+**Data flow**: It locks the stored cancellation token and calls cancel on it. Nothing is returned, but tasks watching that token can notice cancellation and stop.
 
-**Call relations**: Used by session control flows that need to abort MCP startup work, such as teardown or refresh replacement.
+**Call relations**: This is a manual stop signal for MCP startup. Session::refresh_mcp_servers_inner also cancels and replaces the token when it starts a new refresh, so old startup work does not race with new startup work.
 
 
 ##### `review_guardian_mcp_elicitation`  (lines 458–507)
@@ -4930,11 +4954,11 @@ async fn review_guardian_mcp_elicitation(
 ) -> anyhow::Result<Option<ElicitationResponse>>
 ```
 
-**Purpose**: Runs Guardian auto-review for an MCP elicitation request when the active turn and reviewer routing indicate Guardian should handle it.
+**Purpose**: Decides whether an MCP elicitation should be reviewed by Guardian and, if so, runs that review. It turns Guardian’s decision into the accept, decline, or cancel response expected by MCP.
 
-**Data flow**: Fetches the active turn context and returns `Ok(None)` if there is none. It computes the effective approvals reviewer using connector-aware config, checks whether approval should route to Guardian, and if not returns `Ok(None)`. It then classifies the request with `guardian_elicitation_review_request`: `NotRequested` returns `Ok(None)`, `Decline(reason)` logs a warning and returns an immediate decline response without message, and `ApprovalRequest` triggers Guardian review by generating a review id, calling `crate::guardian::review_approval_request(...)`, then converting the resulting `ReviewDecision` into an `ElicitationResponse` with `mcp_elicitation_response_from_guardian_decision`.
+**Data flow**: It receives the session and an MCP review request. It finds the active turn, determines the configured approvals reviewer for the server and connector, checks whether this request should route to Guardian, converts valid metadata into a Guardian approval request, and either declines unsafe unsupported requests or asks Guardian for a decision. It returns an optional MCP elicitation response.
 
-**Call relations**: Called from `GuardianMcpElicitationReviewer::review`. It is the top-level policy engine that decides whether and how Guardian participates in MCP elicitation review.
+**Call relations**: GuardianMcpElicitationReviewer::review calls this. It uses elicitation_connector_id and guardian_elicitation_review_request to understand the request, then uses mcp_elicitation_response_from_guardian_decision to translate Guardian’s result back to MCP.
 
 *Call graph*: calls 5 internal fn (mcp_approvals_reviewer, elicitation_connector_id, guardian_elicitation_review_request, mcp_elicitation_decline_without_message, mcp_elicitation_response_from_guardian_decision); called by 1 (review); 4 external calls (new_guardian_review_id, review_approval_request, routes_approval_to_guardian_with_reviewer, warn!).
 
@@ -4947,11 +4971,11 @@ fn guardian_elicitation_review_request(
 ) -> GuardianElicitationReview
 ```
 
-**Purpose**: Inspects an MCP elicitation request’s metadata and schema to decide whether it requests Guardian review, should be declined as unsupported, or can be converted into a `GuardianApprovalRequest::McpToolCall`.
+**Purpose**: Parses an MCP elicitation and decides whether it is a valid Guardian approval request. It is the gatekeeper that refuses incomplete, malformed, or unsupported approval metadata.
 
-**Data flow**: Matches the elicitation shape: URL elicitations are declined only if they explicitly request approval review, otherwise ignored; form elicitations expose metadata and optional schema. It requires metadata to exist, `codex_request_type` to equal approval-request, `codex_approval_kind` to equal `mcp_tool_call`, and the requested schema to have no properties. It extracts a non-empty `tool_name`, validates `tool_params` as either an object or absent (defaulting absent to `{}`), and builds `GuardianElicitationReview::ApprovalRequest(Box::new(GuardianApprovalRequest::McpToolCall { ... }))` with synthesized id, server, tool metadata, connector metadata, and arguments. Any unsupported shape returns `Decline(...)`; missing opt-in returns `NotRequested`.
+**Data flow**: It receives an elicitation review request. It checks whether the request is a form elicitation, whether its metadata says it is an approval request for an MCP tool call, whether the form schema is empty, and whether the needed tool fields are present and well-formed. It returns one of three outcomes: no Guardian review needed, decline immediately, or a built GuardianApprovalRequest.
 
-**Call relations**: Used only by `review_guardian_mcp_elicitation`. It encapsulates the metadata contract that MCP servers must satisfy to opt into Guardian review.
+**Call relations**: review_guardian_mcp_elicitation calls this before involving Guardian. It relies on meta_requests_approval_request, metadata_str, and metadata_owned_string to read metadata safely.
 
 *Call graph*: calls 3 internal fn (meta_requests_approval_request, metadata_owned_string, metadata_str); called by 1 (review_guardian_mcp_elicitation); 6 external calls (new, new, Object, ApprovalRequest, Decline, format!).
 
@@ -4962,11 +4986,11 @@ fn guardian_elicitation_review_request(
 fn elicitation_connector_id(elicitation: &CreateElicitationRequestParams) -> Option<&str>
 ```
 
-**Purpose**: Extracts the connector id string from either form or URL elicitation metadata.
+**Purpose**: Extracts the connector id from an MCP elicitation’s metadata, if one is present. The connector id helps choose the correct approval reviewer settings.
 
-**Data flow**: Matches the elicitation variant, accesses its optional `meta`, and if present returns the string value for `CONNECTOR_ID_KEY` via `metadata_str`; otherwise returns `None`.
+**Data flow**: It receives either a form or URL elicitation. It looks inside its optional metadata map for the connector id key and returns the string if found.
 
-**Call relations**: Called by `review_guardian_mcp_elicitation` when computing connector-aware approvals reviewer routing.
+**Call relations**: review_guardian_mcp_elicitation calls this before deciding whether the request routes to Guardian. It is a small helper for the approval-routing step.
 
 *Call graph*: called by 1 (review_guardian_mcp_elicitation).
 
@@ -4977,11 +5001,11 @@ fn elicitation_connector_id(elicitation: &CreateElicitationRequestParams) -> Opt
 fn meta_requests_approval_request(meta: &Option<Meta>) -> bool
 ```
 
-**Purpose**: Checks whether elicitation metadata explicitly marks the request type as an approval request.
+**Purpose**: Checks whether a metadata block says the elicitation is an approval request. This is used to distinguish ordinary MCP prompts from permission questions.
 
-**Data flow**: Reads the optional `Meta`, extracts the underlying map, looks up `REQUEST_TYPE_KEY` with `metadata_str`, compares it to `REQUEST_TYPE_APPROVAL_REQUEST`, and returns the boolean result.
+**Data flow**: It receives optional metadata. It looks for the request-type field and compares it with the known approval-request value. It returns true only for that exact match.
 
-**Call relations**: Used by `guardian_elicitation_review_request` to distinguish unsupported opt-in URL requests from ordinary non-reviewed elicitations.
+**Call relations**: guardian_elicitation_review_request uses this especially for URL elicitations, where Guardian approval review is not supported and approval-looking URL requests are declined.
 
 *Call graph*: called by 1 (guardian_elicitation_review_request).
 
@@ -4992,11 +5016,11 @@ fn meta_requests_approval_request(meta: &Option<Meta>) -> bool
 fn metadata_str(meta: &'a Map<String, Value>, key: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Looks up a metadata key and returns its string value if present and JSON-string typed.
+**Purpose**: Reads a string value from a JSON metadata map. It avoids treating non-string values as valid text.
 
-**Data flow**: Reads `meta.get(key)` from the `serde_json::Map<String, Value>` and applies `Value::as_str`, returning `Option<&str>`.
+**Data flow**: It receives a metadata map and a key. It looks up the key and returns the value only if it is a JSON string. Otherwise it returns nothing.
 
-**Call relations**: This is the primitive metadata accessor used throughout Guardian review parsing and plugin-install telemetry extraction.
+**Call relations**: guardian_elicitation_review_request, metadata_owned_string, and plugin_install_elicitation_telemetry_metadata use this as their basic safe reader for metadata fields.
 
 *Call graph*: called by 3 (guardian_elicitation_review_request, metadata_owned_string, plugin_install_elicitation_telemetry_metadata); 1 external calls (get).
 
@@ -5007,11 +5031,11 @@ fn metadata_str(meta: &'a Map<String, Value>, key: &str) -> Option<&'a str>
 fn metadata_owned_string(meta: &Map<String, Value>, key: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts, trims, validates non-emptiness, and clones a metadata string value.
+**Purpose**: Reads a non-empty trimmed string from metadata and returns an owned copy. This filters out missing, blank, or whitespace-only values.
 
-**Data flow**: Calls `metadata_str(meta, key)`, trims whitespace, filters out empty strings, converts the remaining `&str` into an owned `String`, and returns it as `Option<String>`.
+**Data flow**: It receives a metadata map and key. It uses metadata_str to get a string, trims surrounding whitespace, rejects empty text, and returns a new String if valid.
 
-**Call relations**: Used by `guardian_elicitation_review_request` and `plugin_install_elicitation_telemetry_metadata` when metadata must be preserved beyond the borrowed map.
+**Call relations**: guardian_elicitation_review_request uses this to build a clean Guardian approval request. plugin_install_elicitation_telemetry_metadata uses it to collect telemetry fields.
 
 *Call graph*: calls 1 internal fn (metadata_str); called by 2 (guardian_elicitation_review_request, plugin_install_elicitation_telemetry_metadata).
 
@@ -5024,11 +5048,11 @@ fn plugin_install_elicitation_telemetry_metadata(
 ) -> Option<PluginInstallElicitationTelemetryMetadata>
 ```
 
-**Purpose**: Recognizes plugin-install tool-suggestion elicitation events and extracts telemetry fields for them.
+**Purpose**: Detects whether an outgoing elicitation is a plugin-install suggestion and extracts the fields needed for telemetry. This lets the session record that such a prompt was shown.
 
-**Data flow**: Pattern-matches the `EventMsg` as `ElicitationRequest` containing a form request with object metadata, checks that `codex_approval_kind` is `tool_suggestion` and `suggest_type` is `install`, then extracts non-empty `tool_type`, `tool_id`, and `tool_name` via `metadata_owned_string` and returns them in `PluginInstallElicitationTelemetryMetadata`; otherwise returns `None`.
+**Data flow**: It receives an event. It only continues if the event is an elicitation request with form metadata. It checks that the approval kind is a tool suggestion and the suggestion action is install. If so, it reads tool type, tool id, and tool name, and returns them together; otherwise it returns nothing.
 
-**Call relations**: Called by `Session::request_mcp_server_elicitation` immediately before sending the event so plugin-install prompts can be recorded in telemetry.
+**Call relations**: Session::request_mcp_server_elicitation calls this just before sending the event. If metadata is returned, that session method records plugin-install elicitation telemetry.
 
 *Call graph*: calls 2 internal fn (metadata_owned_string, metadata_str); called by 1 (request_mcp_server_elicitation).
 
@@ -5039,11 +5063,11 @@ fn plugin_install_elicitation_telemetry_metadata(
 fn mcp_elicitation_request_id(id: &RequestId) -> String
 ```
 
-**Purpose**: Formats an RMCP request id into a plain string for logging and synthesized Guardian request ids.
+**Purpose**: Turns an MCP request id into plain text. MCP ids may be numbers or strings, and this helper gives logging and Guardian ids one consistent format.
 
-**Data flow**: Matches `RequestId` as either `NumberOrString::String` or `NumberOrString::Number` and returns `to_string()` of the contained value.
+**Data flow**: It receives a request id that can be either a string or a number. It converts whichever form it has into a String and returns it.
 
-**Call relations**: Used by Guardian review helpers when constructing stable identifiers and warning messages.
+**Call relations**: This helper is used inside Guardian elicitation review code to build readable ids and warning messages for MCP approval requests.
 
 
 ##### `mcp_elicitation_response_from_guardian_decision`  (lines 648–660)
@@ -5056,11 +5080,11 @@ async fn mcp_elicitation_response_from_guardian_decision(
 ) -> ElicitationResponse
 ```
 
-**Purpose**: Converts a Guardian review decision into an MCP elicitation response, fetching a session-specific rejection message when needed.
+**Purpose**: Converts Guardian’s review decision into an MCP elicitation response, including a detailed denial message when Guardian denied the request.
 
-**Data flow**: If the decision is `ReviewDecision::Denied`, it awaits `crate::guardian::guardian_rejection_message(session, review_id)` to obtain a denial message; otherwise it uses `None`. It then delegates to `mcp_elicitation_response_from_guardian_decision_parts(decision, denial_message)` and returns the resulting `ElicitationResponse`.
+**Data flow**: It receives the session, a Guardian review id, and the Guardian decision. If the decision is denied, it asks Guardian for the rejection message. It then passes the decision and optional message to mcp_elicitation_response_from_guardian_decision_parts and returns the MCP response.
 
-**Call relations**: Called by `review_guardian_mcp_elicitation` after Guardian review completes. It adds session-aware denial messaging on top of the pure decision mapping helper.
+**Call relations**: review_guardian_mcp_elicitation calls this after Guardian finishes reviewing. It delegates the decision-to-response mapping to mcp_elicitation_response_from_guardian_decision_parts.
 
 *Call graph*: calls 1 internal fn (mcp_elicitation_response_from_guardian_decision_parts); called by 1 (review_guardian_mcp_elicitation); 1 external calls (guardian_rejection_message).
 
@@ -5074,11 +5098,11 @@ fn mcp_elicitation_response_from_guardian_decision_parts(
 ) -> ElicitationResponse
 ```
 
-**Purpose**: Maps each `ReviewDecision` variant to the corresponding MCP `ElicitationResponse` shape and metadata.
+**Purpose**: Maps each possible Guardian decision to the MCP action that should be sent back to the server. This is where “approved,” “denied,” “timed out,” and “aborted” become protocol responses.
 
-**Data flow**: Matches on `ReviewDecision`: approvals become `Accept` with empty JSON content and auto-review metadata; `Denied` becomes a decline with the provided or default denial message; `TimedOut` becomes a decline with `guardian_timeout_message()`; and `Abort` becomes `Cancel` with auto-review metadata. It returns the constructed `ElicitationResponse`.
+**Data flow**: It receives a Guardian decision and an optional denial message. Approval-like decisions become an Accept response with empty content and automatic-review metadata. Denied and timed-out decisions become Decline responses with a message. Abort becomes a Cancel response.
 
-**Call relations**: Used by `mcp_elicitation_response_from_guardian_decision` and tested directly in `mcp_tests.rs`. It is the pure mapping layer from Guardian outcomes to MCP protocol responses.
+**Call relations**: mcp_elicitation_response_from_guardian_decision calls this after preparing any denial text. It uses mcp_elicitation_auto_meta and mcp_elicitation_decline_with_message to build consistent response bodies.
 
 *Call graph*: calls 2 internal fn (mcp_elicitation_auto_meta, mcp_elicitation_decline_with_message); called by 1 (mcp_elicitation_response_from_guardian_decision); 2 external calls (guardian_timeout_message, json!).
 
@@ -5089,11 +5113,11 @@ fn mcp_elicitation_response_from_guardian_decision_parts(
 fn mcp_elicitation_decline_with_message(message: String) -> ElicitationResponse
 ```
 
-**Purpose**: Builds a decline response that includes both an auto-review marker and a human-readable denial message in metadata.
+**Purpose**: Builds an MCP decline response that includes a human-readable reason. This is used when the server should be told why the request was refused.
 
-**Data flow**: Constructs and returns `ElicitationResponse { action: Decline, content: None, meta: Some(json!({ "message": message, "approvals_reviewer": ApprovalsReviewer::AutoReview })) }`.
+**Data flow**: It receives a message string. It creates an ElicitationResponse with Decline as the action, no content, and metadata containing the message plus a note that the approvals reviewer was automatic.
 
-**Call relations**: Called by `mcp_elicitation_response_from_guardian_decision_parts` for denied and timed-out decisions.
+**Call relations**: mcp_elicitation_response_from_guardian_decision_parts calls this for Guardian denial and timeout cases. It standardizes the shape of decline responses that include explanations.
 
 *Call graph*: called by 1 (mcp_elicitation_response_from_guardian_decision_parts); 1 external calls (json!).
 
@@ -5104,11 +5128,11 @@ fn mcp_elicitation_decline_with_message(message: String) -> ElicitationResponse
 fn mcp_elicitation_decline_without_message() -> ElicitationResponse
 ```
 
-**Purpose**: Builds a decline response that carries only the standardized auto-review metadata.
+**Purpose**: Builds an MCP decline response without a custom explanation. This is used for safe automatic rejection when the code does not want to expose or invent a message.
 
-**Data flow**: Returns `ElicitationResponse { action: Decline, content: None, meta: Some(mcp_elicitation_auto_meta()) }`.
+**Data flow**: It creates an ElicitationResponse with Decline as the action, no content, and standard automatic-review metadata. It returns that response.
 
-**Call relations**: Used by `review_guardian_mcp_elicitation` when an elicitation opted into Guardian review but had an unsupported shape that should be declined before full review.
+**Call relations**: review_guardian_mcp_elicitation calls this when an elicitation must be declined before Guardian review. It uses mcp_elicitation_auto_meta for the shared metadata.
 
 *Call graph*: calls 1 internal fn (mcp_elicitation_auto_meta); called by 1 (review_guardian_mcp_elicitation).
 
@@ -5119,24 +5143,24 @@ fn mcp_elicitation_decline_without_message() -> ElicitationResponse
 fn mcp_elicitation_auto_meta() -> serde_json::Value
 ```
 
-**Purpose**: Constructs the standard metadata object marking an elicitation response as produced by auto-review.
+**Purpose**: Creates the standard metadata saying the MCP elicitation response came from automatic approval review. This keeps accept, decline, and cancel responses labeled consistently.
 
-**Data flow**: Returns `serde_json::json!({ "approvals_reviewer": ApprovalsReviewer::AutoReview })`.
+**Data flow**: It takes no input. It returns a small JSON value containing the approvals reviewer marker set to AutoReview.
 
-**Call relations**: Shared by the decline-without-message helper and the decision-mapping helper to keep auto-review metadata consistent.
+**Call relations**: mcp_elicitation_decline_without_message and mcp_elicitation_response_from_guardian_decision_parts call this when building MCP responses. It is the common stamp placed on automatically reviewed elicitation replies.
 
 *Call graph*: called by 2 (mcp_elicitation_decline_without_message, mcp_elicitation_response_from_guardian_decision_parts); 1 external calls (json!).
 
 
 ### `core/src/mcp_skill_dependencies.rs`
 
-`domain_logic` · `skill resolution / pre-tool setup`
+`orchestration` · `during skill setup in a conversation turn`
 
-This module automates MCP dependency installation for skills that declare MCP tool requirements. The top-level flow starts in `maybe_prompt_and_install_mcp_dependencies`, which first restricts the feature to first-party originators, then checks the feature flag and whether any skills were mentioned. It computes currently installed runtime MCP servers, derives missing dependencies from skill metadata, filters out dependencies already prompted about in this session, and asks the user whether to install them unless approval policy auto-approves MCP prompts.
+Some skills need outside tool servers, called MCP servers. MCP means Model Context Protocol: a standard way for Codex to talk to external tools. This file is the bridge between “the user picked a skill” and “the required tool server is actually available.” Without it, a skill could be selected but then fail later because its needed MCP server was missing.
 
-Dependency matching is based on canonical transport-specific keys rather than display names. `canonical_mcp_server_key` and `canonical_mcp_dependency_key` normalize stdio dependencies by command and HTTP dependencies by URL, so duplicates across skills or naming differences collapse correctly. `collect_missing_mcp_dependencies` uses those keys to skip already installed servers and deduplicate repeated requirements, while logging malformed dependency declarations instead of failing the whole flow.
+The flow starts by checking whether this client is allowed to use the feature, whether the feature flag is enabled, and whether any mentioned skills declare MCP tool dependencies. It compares those declared dependencies with the MCP servers already known to the current session. To avoid duplicate work, it gives each dependency a stable “canonical” key based on its transport type and URL or command, much like identifying a shop by its address instead of its display name.
 
-If installation proceeds, `maybe_install_mcp_dependencies` loads global MCP servers from disk, inserts only truly absent entries, persists the updated map with `ConfigEditsBuilder::replace_mcp_servers`, and then attempts OAuth login for each newly added server when supported. It resolves scopes, retries without scopes when discovery suggests that workaround, and logs failures without aborting the rest of installation. Finally it refreshes an in-memory config clone with the newly installed servers and asks the session to refresh active MCP connections so the current turn can use them immediately.
+If something is missing, the file may ask the user whether to install it, unless the current permission settings allow automatic approval. If the user agrees, it loads the global MCP server configuration, adds only the missing servers, writes the updated config back to disk, and tries OAuth login for servers that support it. OAuth is the browser-style sign-in flow used to grant access. Finally, it refreshes the session so the newly added servers can be used right away.
 
 #### Function details
 
@@ -5151,11 +5175,11 @@ async fn maybe_prompt_and_install_mcp_dependencies(
     elicitat
 ```
 
-**Purpose**: Coordinates the full prompt-before-install flow for skill-declared MCP dependencies. It exits early for unsupported clients, disabled features, no mentioned skills, no missing dependencies, or dependencies already prompted about this session.
+**Purpose**: This is the top-level gatekeeper for installing missing MCP dependencies for mentioned skills. It decides whether the feature is allowed, finds missing servers, asks the user if needed, and starts installation only when appropriate.
 
-**Data flow**: Takes `Session`, `TurnContext`, a `CancellationToken`, the slice of `mentioned_skills`, and optional `ElicitationReviewerHandle`. It reads the current originator and feature flags, clones config, fetches installed runtime MCP servers from the session, computes missing dependencies with `collect_missing_mcp_dependencies`, filters them through `filter_prompted_mcp_dependencies`, and if `should_install_mcp_dependencies` returns true, calls `maybe_install_mcp_dependencies` with the original skill list.
+**Data flow**: It receives the current session, turn context, cancellation token, the list of mentioned skills, and an optional reviewer used later for MCP prompts. It reads the client originator, feature settings, installed runtime MCP servers, and the set of dependencies already prompted about in this session. It turns the skill list into a map of missing MCP server configs, filters out ones the user was already asked about, asks whether to install them, and, if the answer is yes, passes control to the installer. It returns nothing; its effect is deciding whether installation happens.
 
-**Call relations**: Called from skill-building flow when skills have been identified. It delegates dependency discovery to `collect_missing_mcp_dependencies`, user prompting to `should_install_mcp_dependencies`, and actual persistence/login/refresh work to `maybe_install_mcp_dependencies`.
+**Call relations**: This function is called when skills and plugins are being built. It first uses the dependency collector to discover gaps, then the prompt filter to avoid repeated questions, then the user-permission step to get approval, and finally hands off to maybe_install_mcp_dependencies to make the actual config changes.
 
 *Call graph*: calls 6 internal fn (collect_missing_mcp_dependencies, filter_prompted_mcp_dependencies, maybe_install_mcp_dependencies, should_install_mcp_dependencies, is_first_party_originator, originator); called by 1 (build_skills_and_plugins); 2 external calls (is_empty, runtime_mcp_servers).
 
@@ -5171,11 +5195,11 @@ async fn maybe_install_mcp_dependencies(
     elicitation_reviewer: Optio
 ```
 
-**Purpose**: Installs missing MCP server configs for mentioned skills into global config, performs OAuth login for newly added servers when supported, and refreshes the session’s MCP server set. It is the side-effecting half of the dependency flow.
+**Purpose**: This function performs the actual installation of missing MCP servers for the selected skills. It adds new server definitions to the global config, signs in to servers that need OAuth, and refreshes the session so the new servers become available.
 
-**Data flow**: Inputs are `Session`, `TurnContext`, `config`, `mentioned_skills`, and optional elicitation reviewer. It rechecks feature gating, computes installed and missing dependencies, loads global MCP servers from `codex_home`, inserts absent missing servers into that map while tracking which were newly added, persists the updated map with `ConfigEditsBuilder`, then for each added server probes `oauth_login_support`, resolves scopes, attempts `perform_oauth_login`, optionally retries without scopes, and logs failures. Afterward it clones `config`, merges the persisted servers into `refresh_config.mcp_servers`, computes refreshed runtime servers, and calls `sess.refresh_mcp_servers_now(...)`.
+**Data flow**: It receives the session, turn context, current config, mentioned skills, and an optional elicitation reviewer. It re-checks whether installation should run, reads the currently active MCP servers, computes what is missing, loads the global MCP server config from the user’s Codex home, inserts missing servers that are not already present, and writes the updated config back. For each newly added server, it checks whether OAuth login is supported, resolves which permission scopes to request, and tries to log in. At the end, it builds a refreshed config and asks the session to reload MCP servers. It returns nothing; it changes persisted config and the running session state.
 
-**Call relations**: Invoked only after prompting logic decides installation should proceed. It depends on `collect_missing_mcp_dependencies` for the desired additions, `load_global_mcp_servers` and `ConfigEditsBuilder` for persistence, and session refresh APIs to make the new servers active immediately.
+**Call relations**: This is called after maybe_prompt_and_install_mcp_dependencies has decided installation is allowed. It uses collect_missing_mcp_dependencies to know what to add, relies on the config-editing layer to save changes, uses OAuth helpers to authenticate where needed, and then calls into the session to refresh MCP servers immediately.
 
 *Call graph*: calls 2 internal fn (new, collect_missing_mcp_dependencies); called by 1 (maybe_prompt_and_install_mcp_dependencies); 12 external calls (new, auth_keyring_backend_kind, clone, is_empty, load_global_mcp_servers, oauth_login_support, resolve_oauth_scopes, should_retry_without_scopes, perform_oauth_login, refresh_mcp_servers_now (+2 more)).
 
@@ -5191,11 +5215,11 @@ async fn should_install_mcp_dependencies(
 ) -> bool
 ```
 
-**Purpose**: Determines whether missing skill MCP dependencies should be installed now, either by auto-approval policy or by explicit user choice. It also records that the current missing set has been prompted about.
+**Purpose**: This function decides whether missing MCP servers should be installed now. It either accepts automatically under permissive settings or asks the user a clear install-or-skip question.
 
-**Data flow**: Accepts `Session`, `TurnContext`, the `missing` dependency map, and a `CancellationToken`. It first checks `mcp_permission_prompt_is_auto_approved`; if true, returns `true`. Otherwise it formats the missing server names, builds a single `RequestUserInputQuestion` with Install/Continue-anyway options, sends `request_user_input`, and races that future against cancellation with `tokio::select!`. It interprets the response to decide whether Install was chosen, computes canonical keys for all missing dependencies, records them via `sess.record_mcp_dependency_prompted`, and returns the boolean install decision.
+**Data flow**: It receives the session, turn context, a map of missing server configs, and a cancellation token. It first checks whether the current permission policy allows automatic approval. If not, it formats the missing server names into a readable list, sends a user-input request with two choices, and waits for either the answer or cancellation. It records that these dependencies were already prompted about, then returns true only if the user chose the install option.
 
-**Call relations**: Called by `maybe_prompt_and_install_mcp_dependencies` after missing dependencies are filtered. It delegates display formatting to `format_missing_mcp_dependencies` and uses session prompting APIs to obtain or synthesize a response.
+**Call relations**: maybe_prompt_and_install_mcp_dependencies calls this after finding missing, not-yet-prompted dependencies. It uses format_missing_mcp_dependencies to make the prompt readable, sends the question through the session’s user-input path, and records prompted keys so the same question is not repeated later in the same session.
 
 *Call graph*: calls 2 internal fn (format_missing_mcp_dependencies, permission_profile); called by 1 (maybe_prompt_and_install_mcp_dependencies); 7 external calls (default, mcp_permission_prompt_is_auto_approved, record_mcp_dependency_prompted, request_user_input, format!, select!, vec!).
 
@@ -5209,11 +5233,11 @@ async fn filter_prompted_mcp_dependencies(
 ) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Removes missing dependencies that the session has already prompted the user about. This prevents repeated prompts for the same canonical MCP server within one session.
+**Purpose**: This function removes missing MCP dependencies that the user has already been asked about during the current session. It prevents repeated prompts for the same server after the user has chosen to skip.
 
-**Data flow**: Takes `Session` and the `missing` map, awaits `sess.mcp_dependency_prompted()` to get the set of canonical keys, and if that set is empty returns `missing.clone()`. Otherwise it filters `missing` by recomputing each dependency’s canonical server key and collecting only entries not present in the prompted set.
+**Data flow**: It receives the session and the current map of missing MCP server configs. It reads the session’s stored set of already prompted dependency keys. If none exist, it returns the original missing map. Otherwise, it builds and returns a new map containing only missing servers whose canonical key has not already been recorded.
 
-**Call relations**: Used by `maybe_prompt_and_install_mcp_dependencies` between dependency discovery and prompting. It relies on the same canonicalization logic as installation and prompt recording so repeated names map consistently.
+**Call relations**: maybe_prompt_and_install_mcp_dependencies calls this before asking the user anything. It relies on the same canonical key style used elsewhere, so a server is recognized consistently even if names vary.
 
 *Call graph*: called by 1 (maybe_prompt_and_install_mcp_dependencies); 1 external calls (mcp_dependency_prompted).
 
@@ -5224,11 +5248,11 @@ async fn filter_prompted_mcp_dependencies(
 fn format_missing_mcp_dependencies(missing: &HashMap<String, McpServerConfig>) -> String
 ```
 
-**Purpose**: Formats the missing dependency names into a stable, human-readable comma-separated list for the prompt text. It sorts names to keep prompt wording deterministic.
+**Purpose**: This function turns the missing MCP server names into a short, readable comma-separated list for the user prompt.
 
-**Data flow**: Accepts `&HashMap<String, McpServerConfig>`, clones the keys into a `Vec<String>`, sorts them, joins them with `", "`, and returns the resulting `String`.
+**Data flow**: It receives a map whose keys are MCP server names. It copies the names, sorts them so the order is stable and easy to scan, joins them with commas, and returns the resulting string.
 
-**Call relations**: Called only by `should_install_mcp_dependencies` to build the user-facing prompt sentence.
+**Call relations**: should_install_mcp_dependencies uses this when building the question shown to the user. Its output becomes the human-readable server list in the install prompt.
 
 *Call graph*: called by 1 (should_install_mcp_dependencies).
 
@@ -5239,11 +5263,11 @@ fn format_missing_mcp_dependencies(missing: &HashMap<String, McpServerConfig>) -
 fn canonical_mcp_key(transport: &str, identifier: &str, fallback: &str) -> String
 ```
 
-**Purpose**: Builds a canonical key string for an MCP server or dependency from transport type and transport-specific identifier. It falls back to a provided name when the identifier is blank.
+**Purpose**: This helper creates a stable identifier for an MCP server or dependency from its connection type and main address-like value. The goal is to compare servers by what they actually connect to, not just by a friendly name.
 
-**Data flow**: Takes `transport`, `identifier`, and `fallback` strings. It trims `identifier`; if empty it returns `fallback.to_string()`, otherwise it returns `format!("mcp__{transport}__{identifier}")`.
+**Data flow**: It receives a transport label, an identifier such as a URL or command, and a fallback name. It trims the identifier. If the identifier is empty, it returns the fallback. Otherwise, it returns a combined key in the form that includes the transport and identifier.
 
-**Call relations**: This is the shared primitive used by both `canonical_mcp_server_key` and `canonical_mcp_dependency_key` so installed servers and skill dependencies normalize to the same namespace.
+**Call relations**: canonical_mcp_server_key and canonical_mcp_dependency_key both call this so installed servers and skill-declared dependencies are normalized in the same way. That shared normalization lets collect_missing_mcp_dependencies compare them reliably.
 
 *Call graph*: called by 2 (canonical_mcp_dependency_key, canonical_mcp_server_key); 1 external calls (format!).
 
@@ -5254,11 +5278,11 @@ fn canonical_mcp_key(transport: &str, identifier: &str, fallback: &str) -> Strin
 fn canonical_mcp_server_key(name: &str, config: &McpServerConfig) -> String
 ```
 
-**Purpose**: Computes the canonical identity key for an installed `McpServerConfig` based on its transport details. It lets installed servers be compared against skill dependency declarations independent of display name.
+**Purpose**: This function creates the stable comparison key for an already configured MCP server. It looks at how the server is reached: by a local command or by an HTTP URL.
 
-**Data flow**: Accepts a server `name` and `config`. For `McpServerTransportConfig::Stdio` it uses the command string with transport `stdio`; for `StreamableHttp` it uses the URL with transport `streamable_http`; both cases delegate to `canonical_mcp_key` and return the resulting `String`.
+**Data flow**: It receives a server name and its full MCP server config. If the server uses stdio, meaning Codex starts or talks to a local command through standard input and output, it uses the command as the identifier. If the server uses streamable HTTP, meaning Codex talks to it over a web URL, it uses the URL. It returns the canonical key produced from that information.
 
-**Call relations**: Used when building the installed-key set in `collect_missing_mcp_dependencies` and when recording prompted dependencies. It mirrors the dependency-side canonicalization logic.
+**Call relations**: collect_missing_mcp_dependencies uses this indirectly to build the set of installed server keys. filter_prompted_mcp_dependencies and should_install_mcp_dependencies also depend on this key style when deciding whether a dependency has already been shown to the user.
 
 *Call graph*: calls 1 internal fn (canonical_mcp_key).
 
@@ -5269,11 +5293,11 @@ fn canonical_mcp_server_key(name: &str, config: &McpServerConfig) -> String
 fn canonical_mcp_dependency_key(dependency: &SkillToolDependency) -> Result<String, String>
 ```
 
-**Purpose**: Computes the canonical identity key for a skill-declared MCP dependency. It validates that the dependency includes the transport-specific field required for its transport.
+**Purpose**: This function creates the stable comparison key for an MCP dependency declared by a skill. It also validates that the dependency includes the needed URL or command for its transport type.
 
-**Data flow**: Takes a `SkillToolDependency`, reads `dependency.transport` defaulting to `streamable_http`, and branches case-insensitively. For HTTP it requires `dependency.url`; for stdio it requires `dependency.command`; each successful branch delegates to `canonical_mcp_key` using `dependency.value` as fallback. Unsupported transports or missing required fields return `Err(String)`.
+**Data flow**: It receives one skill tool dependency. It reads the dependency transport, defaulting to streamable HTTP if none is given. For streamable HTTP, it requires a URL; for stdio, it requires a command. It returns a canonical key when the dependency is valid, or an error message when required information is missing or the transport type is unsupported.
 
-**Call relations**: Called by `collect_missing_mcp_dependencies` before deduplication and installation decisions. Its output must align with `canonical_mcp_server_key` so installed and declared dependencies compare correctly.
+**Call relations**: collect_missing_mcp_dependencies calls this for each MCP tool dependency found in a skill. If this function returns an error, the collector logs a warning and skips that dependency instead of trying to install something incomplete.
 
 *Call graph*: calls 1 internal fn (canonical_mcp_key); called by 1 (collect_missing_mcp_dependencies); 1 external calls (format!).
 
@@ -5286,11 +5310,11 @@ fn mcp_dependency_to_server_config(
 ) -> Result<McpServerConfig, String>
 ```
 
-**Purpose**: Converts a skill-declared MCP dependency into a concrete `McpServerConfig` suitable for insertion into global config. It fills in sensible defaults for all non-transport fields.
+**Purpose**: This function converts a skill’s MCP dependency declaration into a real MCP server configuration that can be saved in the user’s global config.
 
-**Data flow**: Accepts a `SkillToolDependency`, defaults transport to `streamable_http`, and constructs either a `McpServerTransportConfig::StreamableHttp` using the declared URL or a `McpServerTransportConfig::Stdio` using the declared command. In both cases it returns an enabled `McpServerConfig` with default environment ID, no OAuth/scopes/tool filters, empty `tools`, and unset timeout/approval fields. Missing required URL/command or unsupported transport returns `Err(String)`.
+**Data flow**: It receives one skill tool dependency. It checks whether the dependency is streamable HTTP or stdio. For HTTP, it requires a URL and builds an enabled server config using that URL. For stdio, it requires a command and builds an enabled server config using that command. It fills in safe default values for optional settings. It returns the completed config or an error message if the dependency is missing required information or uses an unsupported transport.
 
-**Call relations**: Used by `collect_missing_mcp_dependencies` after canonicalization succeeds. It translates declarative skill metadata into the persisted config objects that `maybe_install_mcp_dependencies` writes to disk.
+**Call relations**: collect_missing_mcp_dependencies calls this after it has decided a dependency is not already installed. The resulting config is later used by maybe_install_mcp_dependencies when adding the missing server to global configuration.
 
 *Call graph*: called by 1 (collect_missing_mcp_dependencies); 3 external calls (new, new, format!).
 
@@ -5304,10 +5328,10 @@ fn collect_missing_mcp_dependencies(
 ) -> HashMap<String, McpServerConfig>
 ```
 
-**Purpose**: Scans mentioned skills for MCP tool dependencies, removes ones already installed or duplicated, and returns the remaining dependencies as installable server configs keyed by dependency display name. It is the module’s dependency discovery engine.
+**Purpose**: This function scans the mentioned skills and finds which MCP server dependencies are not currently installed. It is the main comparison step between what skills need and what the session already has.
 
-**Data flow**: Inputs are `mentioned_skills` and the currently `installed` server map. It builds `installed_keys` by canonicalizing each installed server, initializes `missing` and `seen_canonical_keys`, then iterates skills, skips those without dependencies, iterates dependency tools, ignores non-`mcp` tool types, computes each dependency’s canonical key, logs and skips malformed declarations, skips already installed or already seen canonical keys, converts the dependency to `McpServerConfig`, logs and skips conversion failures, and finally inserts `tool.value.clone()` mapped to the config into `missing` while recording the canonical key as seen. Returns the `HashMap<String, McpServerConfig>`.
+**Data flow**: It receives the mentioned skill metadata and the map of installed MCP servers. It first turns installed servers into canonical keys. Then it walks each skill’s declared tool dependencies, ignores non-MCP tools, validates and canonicalizes each MCP dependency, skips anything already installed or already seen in this scan, converts each remaining dependency into an MCP server config, and collects those into a map keyed by the dependency’s display value. It returns that map of missing servers. Invalid dependency entries are skipped with warnings rather than stopping the whole process.
 
-**Call relations**: Called by both `maybe_prompt_and_install_mcp_dependencies` and `maybe_install_mcp_dependencies`. It depends on `canonical_mcp_dependency_key` and `mcp_dependency_to_server_config` to normalize and materialize dependencies, and it is the source of truth for what counts as 'missing'.
+**Call relations**: maybe_prompt_and_install_mcp_dependencies uses this to decide whether there is anything worth prompting about. maybe_install_mcp_dependencies uses it again before editing config, so installation is based on the latest runtime state. It depends on the canonical key and config-conversion helpers to avoid duplicates and build installable server definitions.
 
 *Call graph*: calls 2 internal fn (canonical_mcp_dependency_key, mcp_dependency_to_server_config); called by 2 (maybe_install_mcp_dependencies, maybe_prompt_and_install_mcp_dependencies); 3 external calls (new, new, warn!).

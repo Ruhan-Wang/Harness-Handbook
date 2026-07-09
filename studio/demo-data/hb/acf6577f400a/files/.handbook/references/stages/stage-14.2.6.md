@@ -1,10 +1,6 @@
 # Windows sandbox provisioning and process-launch internals  `stage-14.2.6`
 
-This stage is the Windows-specific execution substrate that sits between higher-level command orchestration and the actual sandboxed child process. It covers both provisioning time and launch time: creating or refreshing the sandbox identity, preparing security state, then starting a process and wiring its I/O back to the caller.
-
-At the top, lib.rs exposes the crate API, while unified_exec/mod.rs chooses between two launch paths. The elevated backend uses elevated.rs plus elevated_impl.rs, runner_client.rs, and runner_pipe.rs to start a separate helper runner, negotiate over named pipes, and present the result as a normal SpawnedProcess. The legacy backend in legacy.rs launches directly with restricted tokens, either through ordinary pipes or ConPTY for interactive sessions.
-
-Setup and identity management are driven by setup.rs and identity.rs, with setup_error.rs defining structured failure reporting. spawn_prep.rs translates requested permissions into concrete launch prerequisites. Security primitives come from token.rs, acl.rs, deny_read_acl.rs, audit.rs, hide_users.rs, firewall.rs, filter_specs.rs, and setup_runtime_bin.rs, which together manage tokens, filesystem ACLs, account visibility, runtime access, and outbound-network restrictions. Finally, process.rs, desktop.rs, proc_thread_attr.rs, conpty, and stdio_bridge.rs perform low-level process creation, desktop/pseudoconsole attachment, and stdio forwarding, while tui/src/windows_sandbox.rs lets the UI select and diagnose these modes.
+This stage is the Windows-only machinery that prepares a safe “guest room” for commands and then starts them inside it. The public entry points choose the right sandbox path: the newer elevated runner or the older legacy runner, while the TUI asks for the requested sandbox level. Setup code creates or refreshes sandbox Windows users, stores and checks their identity, reports setup errors, hides those users from normal Windows screens, and fixes access to bundled runtime tools. Permission code edits Windows access-control lists, which are file permission rules, to allow workspace writes, deny reads to sensitive paths, and reduce risky “Everyone can write” folders. Token and desktop code decide what powers and screen environment the child process gets. Firewall and WFP rule code block or narrow network access. Spawn preparation turns the requested read, write, and network policy into these concrete Windows settings. Process-launch code then creates the command with the right user, environment, pipes, and optional ConPTY fake terminal. The elevated runner uses locked-down named pipes to talk to its child, and the stdio bridge connects the sandboxed program back to the user’s terminal until it exits.
 
 ## Files in this stage
 
@@ -13,13 +9,15 @@ These files define the crate-facing and TUI-facing entrypoints that choose a san
 
 ### `windows-sandbox-rs/src/lib.rs`
 
-`orchestration` · `crate initialization, API surface, and process launch paths`
+`orchestration` · `cross-cutting; active when sandbox setup or sandboxed command execution is requested`
 
-This file is primarily the crate façade. At the top it defines `WindowsSandboxCancellationToken`, a clonable wrapper around `Arc<dyn Fn() -> bool + Send + Sync>` used by capture backends to poll for cancellation without committing to a specific async/runtime primitive. The crate then conditionally declares many Windows-only modules and re-exports a large public API: ACL helpers, capability SID functions, setup entry points, IPC frame types, helper materialization, identity functions, logging, token creation, and both legacy and elevated sandbox execution functions.
+This file is like the reception desk for the Windows sandbox crate. Most of the real work lives in smaller modules, but this file decides which modules exist on Windows, re-exports the pieces other crates are allowed to use, and supplies the main capture functions. Without it, callers would have to know the crate’s internal layout, and non-Windows builds would fail instead of giving a controlled “not available” error.
 
-Inside the Windows-only `windows_impl` submodule, the file also contains the legacy capture backend that launches a process directly with restricted tokens and inherited pipes rather than through the elevated command-runner IPC path. `wait_for_process` supports timeout-only waiting or timeout-plus-cancellation polling in 50 ms slices. `setup_stdio_pipes` creates inheritable stdin/stdout/stderr pipes with the correct handle inheritance flags for child process startup.
+The file also defines a small cancellation token. That token is a shared callback: when long-running sandbox work is waiting for a child process, it can ask, “has someone requested that I stop?” This keeps cancellation separate from the sandbox code itself.
 
-`run_windows_sandbox_capture_with_filesystem_overrides` is the main legacy implementation: it prepares a spawn context, rejects permission profiles that require elevated deny-read semantics, computes capability roots and security tokens, applies ACL rules, creates the child process with redirected stdio, drains stdout/stderr on background threads, waits for exit/timeout/cancellation, terminates the process if needed, joins readers, logs success/failure, and returns a `CaptureResult`. `run_windows_sandbox_capture` is a convenience wrapper with no extra deny overrides, and `run_windows_sandbox_legacy_preflight` applies ACL setup ahead of time for workspace-write sessions. Non-Windows builds export stub functions that simply error.
+On Windows, the `windows_impl` section prepares and runs a command in a restricted environment. It checks the permission profile, prepares security rules, creates pipes for standard input, output, and error, starts the process with a restricted Windows token, waits for it to finish, and collects its output. If the command times out or is cancelled, it terminates the process. It also logs success or failure.
+
+On other operating systems, the `stub` section keeps the API shape the same but returns an error saying the Windows sandbox only works on Windows.
 
 #### Function details
 
@@ -29,11 +27,11 @@ Inside the Windows-only `windows_impl` submodule, the file also contains the leg
 fn new(is_cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self
 ```
 
-**Purpose**: Constructs a cancellation token from an arbitrary predicate closure. This lets callers plug in their own cancellation state without exposing synchronization details to the sandbox crate.
+**Purpose**: Creates a cancellation token from a caller-provided yes/no function. Code that is waiting on sandbox work can later call the token to find out whether it should stop early.
 
-**Data flow**: It takes any `'static` closure implementing `Fn() -> bool + Send + Sync`, wraps it in an `Arc`, stores it in `WindowsSandboxCancellationToken`, and returns the new token.
+**Data flow**: It receives a function that returns `true` when cancellation has been requested. It stores that function inside shared reference-counted storage, so cloned tokens all ask the same question. It returns a new `WindowsSandboxCancellationToken` ready to pass into sandbox capture code.
 
-**Call relations**: It is used by callers and tests to create tokens consumed later by `is_cancelled`, `wait_for_process`, and elevated cancellation polling. The token itself is intentionally lightweight and cloneable.
+**Call relations**: This constructor is used by cancellation-focused tests such as `legacy_capture_cancellation_is_not_reported_as_timeout`. In normal flow, the token it creates is passed down to the process-waiting code so the wait can end because of cancellation rather than only because the process exits or times out.
 
 *Call graph*: called by 1 (legacy_capture_cancellation_is_not_reported_as_timeout); 1 external calls (new).
 
@@ -44,11 +42,11 @@ fn new(is_cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self
 fn is_cancelled(&self) -> bool
 ```
 
-**Purpose**: Evaluates the stored cancellation predicate and reports whether cancellation has been requested. It is the uniform polling API used by sandbox execution code.
+**Purpose**: Asks the token whether someone has requested cancellation. This gives long-running sandbox code a simple way to stop politely.
 
-**Data flow**: It takes `&self`, invokes the boxed closure stored in `is_cancelled`, and returns the resulting `bool`. No state is mutated.
+**Data flow**: It reads the stored cancellation callback, calls it, and returns the boolean answer. It does not change the token or the outside world.
 
-**Call relations**: It is called by waiting and cancellation helper code in both legacy and elevated backends. This method is the only behavior exposed by the token after construction.
+**Call relations**: The waiting path uses this kind of check while a sandboxed process is running. That lets the larger capture flow distinguish a user-requested stop from a normal timeout.
 
 
 ##### `WindowsSandboxCancellationToken::fmt`  (lines 32–35)
@@ -57,11 +55,11 @@ fn is_cancelled(&self) -> bool
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Implements `Debug` for the cancellation token without exposing the internal closure. The output is intentionally non-exhaustive.
+**Purpose**: Provides a safe debug display for the cancellation token. It identifies the token type without trying to print the hidden callback inside it.
 
-**Data flow**: It takes `&self` and a formatter, creates a debug struct named `WindowsSandboxCancellationToken`, marks it non-exhaustive, and returns the formatter result.
+**Data flow**: It receives a Rust debug formatter and writes a non-exhaustive debug structure name into it. The stored cancellation function is deliberately not shown.
 
-**Call relations**: This is used implicitly by Rust formatting and diagnostics. It avoids leaking closure internals while still making the type printable in logs or test failures.
+**Call relations**: Rust’s debug-printing machinery calls this when someone formats the token with `{:?}`. It uses the formatter’s `debug_struct` helper so logs and test failures can mention the token without exposing implementation details.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -76,11 +74,11 @@ fn wait_for_process(
     ) -> WaitOutcome
 ```
 
-**Purpose**: Waits for a child process to exit, time out, or be cancelled, using either a single blocking wait or a polling loop depending on whether a cancellation token is present. It abstracts the wait policy for the legacy backend.
+**Purpose**: Waits for a Windows process to finish, while also respecting an optional timeout and optional cancellation token. It turns several possible waiting outcomes into a simple result: exited, timed out, or cancelled.
 
-**Data flow**: It takes a process `HANDLE`, optional timeout in milliseconds, and an optional cancellation token reference. Without cancellation it converts the timeout to a `u32` or `INFINITE`, calls `WaitForSingleObject` once, and returns `WaitOutcome::TimedOut` on `WAIT_TIMEOUT` or `Exited` otherwise. With cancellation it computes an optional deadline, loops checking `cancellation.is_cancelled()`, waits in at-most-50-ms slices, returns `Cancelled` if the token fires, `TimedOut` if the deadline expires, or `Exited` once `WaitForSingleObject` reports completion.
+**Data flow**: It receives a Windows process handle, an optional timeout in milliseconds, and an optional cancellation token. If there is no cancellation token, it performs one Windows wait call for either the timeout or forever. If cancellation is available, it waits in short slices, checking cancellation between waits and stopping when the deadline passes. It returns a `WaitOutcome` telling the caller what happened.
 
-**Call relations**: It is called by `windows_impl::run_windows_sandbox_capture_with_filesystem_overrides` after the child process has been launched. Its polling behavior mirrors the elevated backend's cancellation responsiveness while staying in the legacy direct-process model.
+**Call relations**: The main capture routine calls this after starting the sandboxed process. Its answer decides whether the capture flow reads the real exit code or terminates the process because it ran too long or was cancelled.
 
 *Call graph*: 3 external calls (from_millis, now, WaitForSingleObject).
 
@@ -91,11 +89,11 @@ fn wait_for_process(
 fn setup_stdio_pipes() -> io::Result<PipeHandles>
 ```
 
-**Purpose**: Creates three anonymous pipes for child stdin, stdout, and stderr and marks the correct ends inheritable for process creation. It packages the raw Win32 handle setup needed before launching the child.
+**Purpose**: Creates the three communication pipes used to connect the parent program to the sandboxed child process: standard input, standard output, and standard error. A pipe is like a one-way tube for bytes.
 
-**Data flow**: It allocates six `HANDLE` variables, calls `CreatePipe` three times, and then calls `SetHandleInformation` to mark the child's stdin read end and stdout/stderr write ends as inheritable. On any Win32 failure it converts `GetLastError()` into an `io::Error`; on success it returns the three `(read, write)` handle pairs.
+**Data flow**: It asks Windows to create three pipe pairs. It marks the pipe ends that the child process must inherit, meaning the child can use them after it starts. If any Windows call fails, it converts the Windows error into a normal Rust I/O error. On success, it returns all six pipe handles.
 
-**Call relations**: It is used only by `windows_impl::run_windows_sandbox_capture_with_filesystem_overrides` before `create_process_as_user`. The returned handles are then split between parent and child responsibilities.
+**Call relations**: The capture flow calls this just before launching the sandboxed process. The returned handles are split between parent and child so the parent can collect output while the child runs with its usual input/output streams connected.
 
 *Call graph*: 5 external calls (from_raw_os_error, null_mut, GetLastError, SetHandleInformation, CreatePipe).
 
@@ -111,11 +109,11 @@ fn run_windows_sandbox_capture(
         cwd: &Path
 ```
 
-**Purpose**: Provides the simple legacy capture API without explicit filesystem deny overrides. It forwards all work to the more general override-aware implementation.
+**Purpose**: Runs a command through the Windows sandbox capture path using the normal filesystem rules. This is the simpler public entry point for callers that do not need extra read/write deny overrides.
 
-**Data flow**: It takes permission profile, workspace roots, `codex_home`, command, cwd, environment map, timeout, cancellation token, and desktop flag, then calls `run_windows_sandbox_capture_with_filesystem_overrides` with empty additional deny-read and deny-write slices and returns its `CaptureResult`.
+**Data flow**: It receives a permission profile, workspace roots, Codex home path, command, working directory, environment variables, optional timeout, optional cancellation token, and desktop choice. It forwards all of that to the more general capture function with empty extra deny-read and deny-write lists. It returns the captured exit code, output, error output, and timeout flag.
 
-**Call relations**: This is the public convenience entry point for the legacy backend. It exists so most callers do not need to pass empty override lists explicitly.
+**Call relations**: Callers use this when they want the standard sandbox behavior. Internally, it hands off immediately to `windows_impl::run_windows_sandbox_capture_with_filesystem_overrides`, which contains the full preparation, launch, wait, and collection flow.
 
 *Call graph*: 1 external calls (run_windows_sandbox_capture_with_filesystem_overrides).
 
@@ -130,11 +128,11 @@ fn run_windows_sandbox_capture_with_filesystem_overrides(
         command: Vec<S
 ```
 
-**Purpose**: Runs a command under the legacy Windows sandbox backend using restricted tokens, ACL preparation, redirected stdio pipes, timeout/cancellation handling, and in-memory output capture. It is the main non-elevated execution path in the crate root.
+**Purpose**: Runs a command in the legacy Windows sandbox backend and captures its result. It is the main worker in this file: it prepares permissions, launches the restricted process, waits for it, gathers output, and records success or failure.
 
-**Data flow**: It takes the full launch configuration plus additional deny-read and deny-write path slices. The function converts override paths from `AbsolutePathBuf` to `Vec<PathBuf>`, prepares a common spawn context with `prepare_legacy_spawn_context`, extracts permissions/current dir/log dir/write-capability mode, and rejects profiles that require elevated deny-read semantics or restricted read-only access. It computes capability roots with `legacy_session_capability_roots`, prepares security tokens/SIDs with `prepare_legacy_session_security`, grants null-device access for workspace-write mode, and applies ACL rules with `apply_legacy_session_acl_rules`. It then creates stdio pipes via `setup_stdio_pipes`, launches the child with `create_process_as_user`, closes the parent-side handles that should not remain open, spawns two reader threads that repeatedly `ReadFile` stdout and stderr into `Vec<u8>`, waits for process completion via `wait_for_process`, and either reads the exit code or terminates the process on timeout/cancellation. After closing process/thread/token handles and joining reader threads, it receives the buffered stdout/stderr from channels, maps timeout to exit code `192` (`128 + 64`), logs success or failure, and returns `CaptureResult { exit_code, stdout, stderr, timed_out }`.
+**Data flow**: It receives the requested permissions, workspace roots, Codex home, command, working directory, environment map, timeout, cancellation token, extra paths to deny reading or writing, and whether to use a private desktop. It converts override paths, prepares the spawn context, rejects permission combinations this legacy backend cannot enforce, computes capability roots, prepares Windows security tokens and access rules, creates standard I/O pipes, launches the process, and starts reader threads for stdout and stderr. Then it waits. If the process exits, it reads the exit code; if it times out or is cancelled, it terminates the process. Finally it closes Windows handles, gathers captured bytes, logs success or failure, and returns a `CaptureResult`.
 
-**Call relations**: This function is called by the simpler `run_windows_sandbox_capture` wrapper and serves callers that still use the legacy backend. It orchestrates spawn preparation, ACL application, process creation, waiting, forced termination, and output collection by delegating to many lower-level modules.
+**Call relations**: This function is reached either directly by callers needing filesystem overrides or indirectly through `windows_impl::run_windows_sandbox_capture`. It relies on preparation helpers such as `prepare_legacy_spawn_context`, `prepare_legacy_session_security`, `legacy_session_capability_roots`, `allow_null_device_for_workspace_write`, and `apply_legacy_session_acl_rules`, then hands process creation to `create_process_as_user`. After the process finishes, it reports through `log_success` or `log_failure`.
 
 *Call graph*: calls 8 internal fn (log_failure, log_success, create_process_as_user, allow_null_device_for_workspace_write, apply_legacy_session_acl_rules, legacy_session_capability_roots, prepare_legacy_session_security, prepare_legacy_spawn_context); 11 external calls (bail!, format!, matches!, spawn, is_empty, iter, setup_stdio_pipes, wait_for_process, CloseHandle, GetExitCodeProcess (+1 more)).
 
@@ -150,11 +148,11 @@ fn run_windows_sandbox_legacy_preflight(
         env_map: &H
 ```
 
-**Purpose**: Performs the ACL preflight needed for legacy workspace-write sessions without actually launching a process. It is a preparatory step that ensures capability-based ACLs are in place.
+**Purpose**: Performs the filesystem permission setup needed before using the legacy sandbox path, without actually running a command. This is a preparation check for cases where write-capability access rules must already be in place.
 
-**Data flow**: It takes a permission profile, workspace roots, `codex_home`, cwd, and environment map. The function tries to resolve `ResolvedWindowsSandboxPermissions`; unsupported profiles simply return `Ok(())`. If the permissions do not use write capabilities for the cwd it also returns early. Otherwise it ensures `codex_home` exists, computes capability roots from the cwd/env, derives write-root capability SID strings with `root_capability_sids`, and applies ACL rules with `apply_legacy_session_acl_rules` using only those write-root SIDs and no readonly SID.
+**Data flow**: It receives a permission profile, workspace roots, Codex home path, current working directory, and environment map. It first tries to resolve the profile into Windows sandbox permissions; unsupported profiles are treated as needing no preflight. If the current directory does not require write capabilities, it also exits successfully. Otherwise it ensures Codex home exists, computes the relevant capability roots and security identifiers, applies the needed access-control rules, and returns success or an error.
 
-**Call relations**: It is called by higher-level preflight code before a legacy session may be launched. Its role is narrower than full capture: it only prepares filesystem ACL state and exits.
+**Call relations**: Setup or launch code can call this before legacy sandbox execution. It uses permission resolution to decide whether work is needed, then calls helpers such as `ensure_codex_home_exists`, `legacy_session_capability_roots`, `root_capability_sids`, and `apply_legacy_session_acl_rules` to prepare the filesystem.
 
 *Call graph*: calls 5 internal fn (try_from_permission_profile_for_workspace_roots, ensure_codex_home_exists, apply_legacy_session_acl_rules, legacy_session_capability_roots, root_capability_sids); 1 external calls (to_path_buf).
 
@@ -165,11 +163,11 @@ fn run_windows_sandbox_legacy_preflight(
 fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile
 ```
 
-**Purpose**: Builds a workspace-write `PermissionProfile` with a specified network policy for use in tests. It centralizes the exact profile construction used by the network-block assertions.
+**Purpose**: Builds a test permission profile that allows workspace writes while varying the network policy. It keeps several tests from repeating the same setup code.
 
-**Data flow**: It takes a `NetworkSandboxPolicy` and returns `PermissionProfile::workspace_write_with(&[], network_policy, false, false)`. No external state is read or written.
+**Data flow**: It receives a test network policy, passes it into the project’s workspace-write permission profile constructor, and returns the resulting `PermissionProfile`.
 
-**Call relations**: It is a local test helper used by the network-block tests below. By constructing profiles in one place, the tests stay focused on permission interpretation rather than profile syntax.
+**Call relations**: The network-blocking tests call this helper to create profiles with either restricted or enabled network access. It delegates profile construction to `workspace_write_with` so the tests use the same profile-building path as production code.
 
 *Call graph*: calls 1 internal fn (workspace_write_with).
 
@@ -180,11 +178,11 @@ fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile
 fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool
 ```
 
-**Purpose**: Resolves a permission profile into Windows sandbox permissions and asks whether network blocking should be applied. It is a test helper for policy interpretation.
+**Purpose**: Answers, for a test permission profile, whether Windows sandbox permissions would apply a network block. It turns the permission-resolution step into a simple boolean check for tests.
 
-**Data flow**: It takes a `PermissionProfile`, converts it with `ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(permission_profile, &[])`, unwraps the result, and returns `should_apply_network_block()` from the resolved permissions.
+**Data flow**: It receives a permission profile, resolves it into Windows-specific sandbox permissions using an empty workspace-root list, and asks the resolved permissions whether the network block should be applied. It returns that yes/no answer.
 
-**Call relations**: It is used by the three network-policy tests to avoid repeating resolution boilerplate. This helper keeps the assertions focused on expected boolean outcomes.
+**Call relations**: The network policy tests use this helper before making assertions. It exercises the same permission-resolution function used by sandbox preparation, so the tests check behavior close to the real flow.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots).
 
@@ -195,11 +193,11 @@ fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool
 fn applies_network_block_when_access_is_disabled()
 ```
 
-**Purpose**: Asserts that a workspace-write profile with restricted network policy results in network blocking. It verifies one expected permission interpretation.
+**Purpose**: Checks that a workspace-write profile with restricted network access causes the Windows sandbox to block the network.
 
-**Data flow**: The test constructs a restricted workspace profile via `workspace_profile(NetworkSandboxPolicy::Restricted)`, passes it to `should_apply_network_block`, and asserts that the result is true.
+**Data flow**: It creates a workspace-write profile whose network policy is restricted, asks whether a network block should be applied, and asserts that the answer is true.
 
-**Call relations**: It depends on the two local test helpers above. This test documents the intended mapping from restricted network policy to sandbox enforcement.
+**Call relations**: This test protects the intended behavior of permission resolution. If the sandbox ever stopped blocking network access for a restricted workspace profile, this test would fail.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -210,11 +208,11 @@ fn applies_network_block_when_access_is_disabled()
 fn skips_network_block_when_access_is_allowed()
 ```
 
-**Purpose**: Asserts that a workspace-write profile with enabled network policy does not trigger network blocking. It verifies the permissive branch of policy interpretation.
+**Purpose**: Checks that a workspace-write profile with enabled network access does not ask the Windows sandbox to block the network.
 
-**Data flow**: The test constructs an enabled workspace profile, evaluates it with `should_apply_network_block`, and asserts that the result is false.
+**Data flow**: It creates a workspace-write profile whose network policy is enabled, asks whether a network block should be applied, and asserts that the answer is false.
 
-**Call relations**: It complements the restricted-policy test and uses the same local helpers. Together they pin down the expected behavior of `should_apply_network_block()`.
+**Call relations**: This test complements the restricted-network test. Together they make sure the network policy switch is honored in both directions.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -225,11 +223,11 @@ fn skips_network_block_when_access_is_allowed()
 fn applies_network_block_for_read_only()
 ```
 
-**Purpose**: Asserts that a read-only permission profile still results in network blocking. This captures a policy rule independent of workspace-write mode.
+**Purpose**: Checks that read-only sandbox profiles apply the Windows network block. This confirms that read-only mode remains conservative about outside access.
 
-**Data flow**: The test creates `PermissionProfile::read_only()`, passes it to `should_apply_network_block`, and asserts that the result is true.
+**Data flow**: It creates a read-only permission profile, checks whether the resolved Windows sandbox permissions would block the network, and asserts that they would.
 
-**Call relations**: It extends the network-policy coverage beyond workspace-write profiles. The test ensures read-only mode remains treated as network-restricted.
+**Call relations**: This test uses the same helper as the workspace network tests. It makes sure read-only permission handling continues to feed into the network-blocking decision correctly.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -240,11 +238,11 @@ fn applies_network_block_for_read_only()
 fn legacy_preflight_skips_profiles_without_managed_filesystem_permissions()
 ```
 
-**Purpose**: Verifies that legacy preflight is a no-op for permission profiles that do not map to managed filesystem permissions. Unsupported profiles should not fail preflight.
+**Purpose**: Checks that legacy preflight does nothing, successfully, for permission profiles that the Windows sandbox does not manage as filesystem-restricted profiles.
 
-**Data flow**: The test iterates over `PermissionProfile::Disabled` and `PermissionProfile::External { network: Restricted }`, calls `run_windows_sandbox_legacy_preflight` with empty roots and trivial paths/env, and asserts that each call succeeds.
+**Data flow**: It loops over unsupported or externally managed permission profiles, passes each into `run_windows_sandbox_legacy_preflight` with empty roots, simple placeholder paths, and an empty environment, and expects success. The important result is that no unnecessary ACL setup error is produced.
 
-**Call relations**: It directly exercises the early-return branch in `run_windows_sandbox_legacy_preflight` when permission resolution fails or is irrelevant. This keeps preflight tolerant for unsupported profile kinds.
+**Call relations**: This test calls the legacy preflight function directly. It protects the early-return behavior where unsupported profiles are not treated as failures, because they do not need this legacy filesystem preparation.
 
 *Call graph*: 3 external calls (new, new, run_windows_sandbox_legacy_preflight).
 
@@ -260,11 +258,11 @@ fn run_windows_sandbox_capture(
         _cwd:
 ```
 
-**Purpose**: Provides the non-Windows stub for the legacy capture API. It makes unsupported-platform behavior explicit at runtime.
+**Purpose**: Provides the same capture function on non-Windows builds, but always reports that the feature is unavailable. This lets the crate compile on other operating systems without pretending the sandbox can run there.
 
-**Data flow**: It accepts the full legacy capture argument list but ignores all inputs and immediately returns an error via `bail!` stating that the Windows sandbox is only available on Windows.
+**Data flow**: It receives the same inputs as the Windows capture function but ignores them. It immediately returns an error saying the Windows sandbox is only available on Windows.
 
-**Call relations**: This function is exported only on non-Windows targets. It is the terminal implementation for callers that compile against the crate cross-platform.
+**Call relations**: On non-Windows targets, the public `run_windows_sandbox_capture` export points here instead of to the real Windows implementation. Callers get a clear runtime error rather than missing symbols or platform-specific compile failures.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -280,22 +278,24 @@ fn run_windows_sandbox_legacy_preflight(
         _env_ma
 ```
 
-**Purpose**: Provides the non-Windows stub for legacy ACL preflight. Like the capture stub, it fails immediately on unsupported platforms.
+**Purpose**: Provides the legacy preflight function on non-Windows builds, but always reports that the feature is unavailable.
 
-**Data flow**: It accepts the preflight arguments, ignores them, and returns a `bail!` error indicating that the Windows sandbox is only available on Windows.
+**Data flow**: It receives the same setup inputs as the Windows preflight function but does not inspect them. It immediately returns an error saying the Windows sandbox is only available on Windows.
 
-**Call relations**: It is the non-Windows counterpart to `windows_impl::run_windows_sandbox_legacy_preflight`. No further work is delegated.
+**Call relations**: On non-Windows targets, the public legacy preflight export points here. This preserves the library API across platforms while making the platform limitation explicit when someone tries to use it.
 
 *Call graph*: 1 external calls (bail!).
 
 
 ### `windows-sandbox-rs/src/unified_exec/mod.rs`
 
-`orchestration` · `session spawn dispatch`
+`orchestration` · `process launch / request handling`
 
-This module is intentionally small: it exposes a single request struct, `WindowsSandboxSessionRequest<'a>`, that bundles all fully resolved launch inputs needed by either backend. The struct carries the permission profile, workspace roots, codex-home path, command vector, cwd, environment map, selected `WindowsSandboxLevel`, proxy enforcement flag, timeout, optional read/write root overrides, deny-path overrides, TTY and stdin-open flags, and whether to use a private desktop.
+This module is a thin routing layer for Windows sandbox launches. A sandbox is a controlled place to run a command, with limits on what files it can read or write and how it can interact with the system. Without this file, callers would need to know whether to use the older restricted-token path or the newer elevated helper path, and they would have to pass the same long set of settings to the right backend themselves.
 
-The main dispatcher, `spawn_windows_sandbox_session_for_level`, chooses the elevated backend whenever proxy enforcement is enabled or the configured sandbox level is `WindowsSandboxLevel::Elevated`; otherwise it chooses the legacy backend. The two remaining public functions are thin forwarding wrappers that preserve a stable module-level API while delegating directly into `backends::legacy` and `backends::elevated`. In tests, several shared backend helpers are re-exported from `windows_common` so the test module can exercise them without reaching into private backend paths. The design keeps backend selection logic centralized while leaving all token, ACL, process, and IPC details in sibling modules.
+The main idea is simple: collect every detail needed to launch the session in one request, then pick the correct backend. The request includes the command to run, the working folder, environment variables, workspace folders, permission rules, timeout, terminal settings, and extra read/write allow or deny lists.
+
+There are two launch styles. The legacy style starts the process directly with Windows restrictions. The elevated style goes through an elevated command runner, which is also used when proxy enforcement is required. This file does not implement those Windows mechanics itself. Instead, it acts like a reception desk: it reads the request, decides which specialist should handle it, and forwards the exact information to that backend. The result is always the same kind of object, a `SpawnedProcess`, so higher-level code can treat both launch paths uniformly.
 
 #### Function details
 
@@ -307,11 +307,11 @@ async fn spawn_windows_sandbox_session_for_level(
 ) -> Result<SpawnedProcess>
 ```
 
-**Purpose**: Selects the appropriate Windows sandbox backend for a fully specified request and awaits the resulting session spawn.
+**Purpose**: Chooses the right Windows sandbox launch path for a fully prepared request. It sends the command to the elevated backend when elevation or proxy enforcement is needed, otherwise it uses the legacy backend.
 
-**Data flow**: Consumes a `WindowsSandboxSessionRequest<'_>`. It reads `proxy_enforced` and `windows_sandbox_level`; if either requires the elevated path, it forwards all relevant fields into `spawn_windows_sandbox_session_elevated_for_permission_profile(...).await`, otherwise it forwards the legacy-compatible subset into `spawn_windows_sandbox_session_legacy(...).await`. It returns the resulting `Result<SpawnedProcess>` unchanged.
+**Data flow**: It receives a `WindowsSandboxSessionRequest`, which already contains the command, folders, permissions, environment variables, terminal choices, and sandbox level. It checks whether proxy enforcement is on or the requested sandbox level is elevated. Based on that choice, it passes the request fields to the matching spawn function and returns the spawned process or an error.
 
-**Call relations**: This is the module's main public dispatcher. It sits above both backend wrapper functions and encodes the policy that proxy enforcement forces the elevated backend regardless of the nominal sandbox level.
+**Call relations**: This is the main entry point in this file for callers that do not want to choose a backend themselves. During launch, it calls the elevated wrapper when the request needs the elevated runner, or the legacy wrapper when the simpler restricted-token path is enough.
 
 *Call graph*: calls 2 internal fn (spawn_windows_sandbox_session_elevated_for_permission_profile, spawn_windows_sandbox_session_legacy); 1 external calls (matches!).
 
@@ -327,11 +327,11 @@ async fn spawn_windows_sandbox_session_legacy(
     cwd: &Path,
 ```
 
-**Purpose**: Public wrapper that forwards a legacy-compatible launch request into the legacy backend implementation.
+**Purpose**: Starts a Windows sandbox session through the legacy backend. This path is for cases where the process can be launched directly with the older Windows restriction approach.
 
-**Data flow**: Accepts the legacy backend's argument set—permission profile, workspace roots, codex home, command, cwd, env map, timeout, deny-path overrides, TTY flag, stdin-open flag, and desktop choice—and simply awaits `backends::legacy::spawn_windows_sandbox_session_legacy(...)`, returning its `Result<SpawnedProcess>`.
+**Data flow**: It receives the permission profile, workspace roots, Codex home path, command, current folder, environment map, timeout, extra deny lists, and terminal/stdin/private-desktop settings. It does not change those settings itself; it forwards them to the legacy backend and returns whatever spawned process or error that backend produces.
 
-**Call relations**: It is called by `spawn_windows_sandbox_session_for_level` when the request does not require elevation. Its role is API surface stabilization rather than adding logic of its own.
+**Call relations**: This function is called by `spawn_windows_sandbox_session_for_level` when the request does not require the elevated path. It is a stable public wrapper around the backend-specific legacy implementation, keeping callers insulated from the backend module layout.
 
 *Call graph*: calls 1 internal fn (spawn_windows_sandbox_session_legacy); called by 1 (spawn_windows_sandbox_session_for_level).
 
@@ -346,22 +346,26 @@ async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
     command: Vec<Str
 ```
 
-**Purpose**: Public wrapper that forwards a full elevated launch request into the elevated backend implementation.
+**Purpose**: Starts a Windows sandbox session through the elevated backend. This path is used when the sandbox level asks for elevation or when proxy rules must be enforced.
 
-**Data flow**: Accepts the elevated backend's full argument set, including proxy enforcement and read/write root overrides, then awaits `backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(...)` and returns the resulting `Result<SpawnedProcess>`.
+**Data flow**: It receives the command, permission profile, workspace and Codex paths, environment variables, proxy flag, timeout, optional read/write root overrides, deny lists, and terminal settings. It passes those values to the elevated backend, which performs the actual elevated runner setup, then returns the resulting spawned process or error.
 
-**Call relations**: It is called by `spawn_windows_sandbox_session_for_level` whenever elevation is required. Like the legacy wrapper, it mainly exposes the backend through the module's public API.
+**Call relations**: This function is called by `spawn_windows_sandbox_session_for_level` when the request needs the elevated command-runner path. Like the legacy wrapper, it hides the backend-specific details and gives the rest of the code one consistent way to receive a `SpawnedProcess`.
 
 *Call graph*: calls 1 internal fn (spawn_windows_sandbox_session_elevated_for_permission_profile); called by 1 (spawn_windows_sandbox_session_for_level).
 
 
 ### `windows-sandbox-rs/src/unified_exec/backends/elevated.rs`
 
-`orchestration` · `sandbox session spawn and runner handshake`
+`orchestration` · `process spawn and request handling`
 
-This backend is used when the Windows sandbox must run through the elevated command-runner path, either because the sandbox level explicitly requests it or because proxy enforcement requires it. The file first resolves permission inputs into `ResolvedWindowsSandboxPermissions`, then asks `prepare_elevated_spawn_context_for_permissions` to build the elevated environment: sandbox home, capability SID strings, credentials, and optional log directory. From that it constructs an `ipc_framed::SpawnRequest` carrying command, cwd, env, permission profile, workspace roots, codex-home paths, capability SIDs, timeout, TTY mode, stdin-open flag, and desktop choice.
+This file is the bridge between “we want to run this command safely” and “there is now a live sandboxed process we can talk to.” It is used for the elevated Windows sandbox path, where the program needs special sandbox login credentials and prepared Windows permissions before launching the runner process.
 
-Runner startup is intentionally offloaded to `spawn_runner_transport_task`, which wraps the blocking handshake in `tokio::task::spawn_blocking`. If the first handshake fails with stale sandbox credentials, the backend refreshes credentials with `refresh_logon_sandbox_creds` and retries once. After a successful transport handshake, the code converts the transport into read/write files and wires them into the shared Windows IPC helpers: a blocking frame writer, a stdin-to-`Message::Stdin` encoder, a stdout reader that decodes `Message::Output` and `Message::Exit`, and an optional resize closure for TTY sessions. Termination is implemented by sending a framed `Message::Terminate`. Finally, everything is wrapped into a `ProcessDriver` and normalized into a `SpawnedProcess` via `finish_driver_spawn`, which also closes stdin immediately when streaming input was disabled.
+The main flow first translates a user-facing permission profile into concrete Windows sandbox rules. It then prepares an elevated launch context: where the sandbox home directory is, what credentials to use, what environment variables the command should see, and what files or folders should be readable or writable. After that it builds a spawn request, which is a detailed instruction packet for the sandbox runner.
+
+Starting the runner includes a handshake over pipes, meaning the parent process and runner agree on how they will exchange framed messages. If that handshake fails because the sandbox credentials are stale, the file refreshes the credentials and tries once more. This matters because Windows logon credentials can expire or become invalid while the rest of the application is still running.
+
+Once the runner is alive, the file wires up the communication channels: input goes to the runner, output and errors come back, exit status is reported once, and a terminate message can be sent later. If the session uses a terminal, it also installs a resizer so terminal size changes can be forwarded.
 
 #### Function details
 
@@ -377,11 +381,11 @@ async fn spawn_runner_transport_task(
 ) -> Result<Runne
 ```
 
-**Purpose**: Runs the blocking runner transport handshake on a dedicated blocking thread and converts join failures into `anyhow` errors.
+**Purpose**: This helper starts the sandbox runner transport without blocking the async runtime. In plain terms, it moves a slow, Windows-specific startup handshake onto a worker thread so other async tasks can keep running.
 
-**Data flow**: Takes owned `PathBuf`s for `codex_home` and `cwd`, `SandboxCreds`, optional `logs_base_dir`, and a `SpawnRequest`. It moves them into `tokio::task::spawn_blocking`, calls `spawn_runner_transport(&codex_home, &cwd, &sandbox_creds, logs_base_dir.as_deref(), spawn_request)`, awaits the blocking task, maps task-join failure into an `anyhow` error string, and returns the resulting `RunnerTransport`.
+**Data flow**: It receives the real Codex home path, the working directory, sandbox credentials, an optional log directory, and a spawn request. It passes those into the lower-level runner transport startup code on a blocking worker thread. If the worker succeeds, it returns a live RunnerTransport; if the worker task itself fails, it turns that into a clear error saying the runner handshake task failed.
 
-**Call relations**: This helper is called by `spawn_windows_sandbox_session_elevated_for_permission_profile` for the initial runner handshake and for the stale-credentials retry path. It isolates the synchronous transport setup from the async orchestration function.
+**Call relations**: The main elevated spawn function calls this when it is ready to contact the sandbox runner. This helper hands off to the lower-level transport creation code, then gives the finished communication transport back to the main flow so input, output, and termination wiring can be built around it.
 
 *Call graph*: called by 1 (spawn_windows_sandbox_session_elevated_for_permission_profile); 1 external calls (spawn_blocking).
 
@@ -396,24 +400,26 @@ async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
     command: Vec<Str
 ```
 
-**Purpose**: Builds and launches an elevated Windows sandbox session backed by the runner IPC protocol. It resolves permissions, prepares elevated context, retries on stale credentials, and returns a live `SpawnedProcess` abstraction.
+**Purpose**: This is the main routine for launching an elevated Windows sandbox session from a permission profile. It prepares permissions and credentials, starts the sandbox runner, and returns a SpawnedProcess object that the caller can interact with like a normal running process.
 
-**Data flow**: Receives the full launch request: permission profile, workspace roots, codex home, command, cwd, mutable environment map, proxy flag, timeout, root overrides, deny-path overrides, TTY flag, stdin-open flag, and desktop choice. It converts deny-path overrides into owned `PathBuf` vectors, resolves permissions, prepares elevated spawn context, and assembles a `SpawnRequest`. It then attempts `spawn_runner_transport_task`; if the error matches `is_stale_sandbox_creds_error`, it refreshes credentials and retries once. After obtaining the transport, it splits it into pipe files, creates Tokio channels for stdin/stdout/stderr and exit, starts the shared pipe writer/stdin writer/stdout reader helpers, builds a terminate closure that sends `Message::Terminate`, optionally builds a resize closure for TTY mode, wraps everything in `ProcessDriver`, and returns `finish_driver_spawn(...)`.
+**Data flow**: It starts with human-level launch inputs: the permission profile, workspace roots, command, working directory, environment variables, sandbox overrides, terminal settings, and timeout. It converts the permission profile into concrete Windows sandbox permissions, prepares an elevated launch context, and builds a spawn request for the runner. It then opens the runner transport, retrying once with refreshed credentials if the old credentials are detected as stale. After the transport is open, it splits the connection into read and write sides, creates channels for stdin, stdout, stderr, exit status, termination, and optional terminal resizing, and returns a SpawnedProcess connected to all of those pieces.
 
-**Call relations**: This is the elevated backend entrypoint invoked by the higher-level unified-exec dispatcher. It orchestrates permission resolution and spawn preparation before delegating stream framing to `windows_common` helpers and transport creation to `spawn_runner_transport_task`.
+**Call relations**: This function is the central story for this backend. It calls the permission resolver first, then the elevated spawn preparation code, then the transport helper that performs the runner handshake. If credentials are stale, it calls the credential refresh path before trying the transport again. After startup, it delegates pipe writing, stdin forwarding, stdout and stderr reading, terminal resizing, and final process-driver packaging to the shared Windows backend helpers. The supplied call graph records this function as the caller context for the elevated session flow.
 
 *Call graph*: calls 10 internal fn (is_stale_sandbox_creds_error, refresh_logon_sandbox_creds, try_from_permission_profile_for_workspace_roots, prepare_elevated_spawn_context_for_permissions, spawn_runner_transport_task, finish_driver_spawn, make_runner_resizer, start_runner_pipe_writer, start_runner_stdin_writer, start_runner_stdout_reader); called by 1 (spawn_windows_sandbox_session_elevated_for_permission_profile); 6 external calls (new, clone, to_path_buf, clone, iter, to_vec).
 
 
 ### `windows-sandbox-rs/src/unified_exec/backends/legacy.rs`
 
-`orchestration` · `sandbox session spawn, process supervision, and teardown`
+`orchestration` · `process launch through process teardown`
 
-This file contains the direct-process backend used when the sandbox can run without the elevated runner. Its top-level flow first prepares a legacy spawn context, rejects unsupported cases up front (restricted read-only mode and deny-read overrides), computes capability roots, prepares legacy token/security state, allows null-device access when workspace-write capabilities are in use, and applies ACL rules to relevant filesystem paths.
+This file is the “old route” for running a command inside the Windows sandbox. Its job is to take a requested command, prepare a safer Windows security setup for it, start it, stream its input and output, and report when it exits. Without this file, the legacy backend would not be able to run commands at all.
 
-Process creation is split by `tty`. For TTY sessions, `spawn_legacy_process` calls `spawn_conpty_process_as_user`, captures the ConPTY handle for later resizing, starts one output reader thread on the PTY output pipe, and starts an input writer task that normalizes LF to CRLF. For non-TTY sessions, it calls `spawn_process_with_pipes`, requires separate stderr handles/channels, starts independent stdout and stderr reader threads, and combines them under a join thread. Input writing is handled by a blocking Tokio task that drains a Tokio channel and writes all bytes to the Windows handle with `WriteFile`, closing the handle when done.
+The file supports two styles of process. If the command needs a terminal, it uses ConPTY, Windows’ pseudo-terminal feature, which makes a program think it is talking to a real console. If not, it uses ordinary pipes for standard input, standard output, and standard error. In both cases, the code creates background workers: one side reads bytes coming out of the process and broadcasts them to listeners, while another side writes bytes sent by the caller into the process.
 
-A detached wait thread enforces optional timeout via `WaitForSingleObject`; on timeout it calls `TerminateProcess`. That thread also drops ConPTY ownership, closes the token handle, and calls `finalize_exit`, which waits for process completion, joins output readers, sends the exit code, closes remaining process/thread handles, and logs success or failure. The returned `ProcessDriver` includes a terminator closure and, for TTY sessions, a resizer closure that calls `ResizePseudoConsole`.
+Before the process starts, the main function prepares legacy access-control rules. These are Windows permission rules that try to limit where the process can write. This backend cannot enforce every modern restriction, so it refuses requests that need restricted read access or deny-read overrides.
+
+After launch, another thread waits for the process to finish or times it out and kills it. It then closes Windows handles, releases the terminal owner, joins output-reader threads, sends the exit code, and writes a success or failure log. Think of it as a launch supervisor: it opens the room, connects the microphones, watches the clock, and locks the room afterward.
 
 #### Function details
 
@@ -431,11 +437,11 @@ fn spawn_legacy_process(
     std
 ```
 
-**Purpose**: Launches the actual sandboxed process under the legacy backend, choosing either ConPTY or ordinary pipes based on `tty`. It packages all handles and background workers needed for later supervision.
+**Purpose**: Starts the actual Windows child process for the legacy backend. It chooses between a terminal-style launch using ConPTY and a pipe-style launch for ordinary non-terminal commands.
 
-**Data flow**: Accepts a restricted token handle, command/cwd/env, desktop and TTY flags, stdin-open flag, stdout/stderr broadcast senders, a stdin `mpsc::Receiver<Vec<u8>>`, and optional log directory. In TTY mode it calls `spawn_conpty_process_as_user`, extracts PTY input/output handles, starts `spawn_output_reader` for PTY output and `spawn_input_writer` with newline normalization, and returns `LegacyProcessHandles` containing the process info, ConPTY handle/owner, writer task, and token handle. In non-TTY mode it calls `spawn_process_with_pipes`, validates that separate stderr plumbing exists, starts stdout and stderr readers plus a join thread, starts `spawn_input_writer` without normalization, and returns the assembled handle bundle including any desktop object.
+**Data flow**: It receives a Windows user token, the command, working directory, environment variables, desktop choice, terminal mode, input/output channels, and optional log location. If terminal mode is requested, it starts the process through ConPTY, starts one output reader, and creates an input writer that normalizes terminal newlines. If terminal mode is not requested, it starts the process with separate pipes, starts readers for stdout and stderr, and creates an input writer for stdin. It returns a bundle of raw Windows process handles, background worker handles, terminal ownership if any, the token, and private desktop ownership if any.
 
-**Call relations**: This helper is called only by `spawn_windows_sandbox_session_legacy` after security preparation succeeds. It delegates the OS-specific spawn mechanics to either `spawn_conpty_process_as_user` or `spawn_process_with_pipes` and standardizes their outputs for the rest of the backend.
+**Call relations**: The main session function calls this after security preparation is complete. This function then hands off to either spawn_conpty_process_as_user or spawn_process_with_pipes to do the low-level Windows launch, and it uses spawn_output_reader and spawn_input_writer to connect the new process to the rest of the program.
 
 *Call graph*: calls 4 internal fn (spawn_conpty_process_as_user, spawn_process_with_pipes, spawn_input_writer, spawn_output_reader); called by 1 (spawn_windows_sandbox_session_legacy); 2 external calls (bail!, spawn).
 
@@ -449,11 +455,11 @@ fn spawn_output_reader(
 ) -> std::thread::JoinHandle<()>
 ```
 
-**Purpose**: Starts a thread that reads bytes from a Windows handle and republishes each chunk onto a Tokio broadcast channel.
+**Purpose**: Starts a background thread that continuously reads output bytes from a Windows handle and sends them to anyone listening. This is how stdout or stderr from the child process becomes available to the caller.
 
-**Data flow**: Takes a raw `HANDLE` and a `broadcast::Sender<Vec<u8>>`, then calls `read_handle_loop(output_read, move |chunk| { let _ = output_tx.send(chunk.to_vec()); })`. Each incoming borrowed chunk is copied into an owned `Vec<u8>` before broadcast.
+**Data flow**: It receives a Windows read handle and a broadcast channel. The background reader pulls chunks of bytes from the handle, copies each chunk, and sends it through the channel. It returns the thread handle so the caller can later wait for the reader to finish.
 
-**Call relations**: It is used by `spawn_legacy_process` for PTY output and for non-TTY stdout/stderr pipes. Its role is to bridge blocking Windows handle reads into the channel-based `ProcessDriver` interface.
+**Call relations**: spawn_legacy_process calls this once for terminal output, or twice for non-terminal output where stdout and stderr are separate. Internally it relies on read_handle_loop, which performs the repeated low-level reading.
 
 *Call graph*: calls 1 internal fn (read_handle_loop); called by 1 (spawn_legacy_process).
 
@@ -468,11 +474,11 @@ fn spawn_input_writer(
 ) -> tokio::task::JoinHandle<()>
 ```
 
-**Purpose**: Starts a blocking task that drains stdin chunks from a Tokio channel and writes them to an optional Windows handle, optionally normalizing TTY newlines.
+**Purpose**: Starts a background task that writes caller-provided input into the child process. It is the bridge from the program’s input channel to the process’s stdin or terminal input.
 
-**Data flow**: Accepts an `Option<HANDLE>`, an `mpsc::Receiver<Vec<u8>>`, and a `normalize_newlines` flag. Inside `spawn_blocking`, it tracks `previous_was_cr`, repeatedly receives chunks with `blocking_recv`, skips writes entirely if the handle is absent, optionally transforms bytes through `normalize_windows_tty_input`, and writes them with `write_all_handle`. On write failure it breaks the loop, and at the end closes the input handle with `CloseHandle` if one existed.
+**Data flow**: It receives an optional Windows write handle, a channel of byte chunks, and a flag saying whether terminal newline cleanup is needed. As byte chunks arrive, it optionally converts line endings into the form Windows terminal programs expect, then writes all bytes to the handle. When the input channel closes or writing fails, it closes the write handle if one exists.
 
-**Call relations**: It is called by `spawn_legacy_process` in both TTY and non-TTY branches. It delegates actual partial-write handling to `write_all_handle` and is the sink behind the session's stdin channel.
+**Call relations**: spawn_legacy_process creates this task for both ConPTY and pipe-based processes. In terminal mode it uses newline normalization so interactive programs behave naturally; in pipe mode it writes the bytes as-is. The actual complete write is done by write_all_handle.
 
 *Call graph*: called by 1 (spawn_legacy_process); 1 external calls (spawn_blocking).
 
@@ -483,11 +489,11 @@ fn spawn_input_writer(
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()>
 ```
 
-**Purpose**: Performs a complete write of a byte slice to a Windows handle, retrying until all bytes are consumed or an error occurs.
+**Purpose**: Writes an entire byte buffer to a Windows handle, retrying until every byte has been accepted. This avoids silently losing part of the caller’s input.
 
-**Data flow**: Takes a raw `HANDLE` and a borrowed byte slice. It loops while bytes remain, calling `WriteFile` with the current slice and a mutable `written` count. If `WriteFile` fails it returns an `anyhow` error containing `GetLastError`; if it reports success but writes zero bytes it bails; otherwise it advances the slice by the number of bytes written and eventually returns `Ok(())`.
+**Data flow**: It receives a Windows handle and a slice of bytes. It calls the Windows WriteFile function, checks how many bytes were written, and keeps going with the remaining bytes until none are left. It returns success if everything was written, or an error if Windows reports a failure or claims success while writing zero bytes.
 
-**Call relations**: This is the low-level write primitive used only by `spawn_input_writer`. It encapsulates the partial-write semantics of `WriteFile` so the higher-level writer task can treat each stdin chunk as all-or-nothing.
+**Call relations**: This is the low-level helper used by the input-writing path. spawn_input_writer depends on it so that each input chunk sent to the child process is fully delivered before moving to the next chunk.
 
 *Call graph*: 5 external calls (anyhow!, bail!, null_mut, GetLastError, WriteFile).
 
@@ -503,11 +509,11 @@ fn finalize_exit(
     logs_base_dir: Opti
 ```
 
-**Purpose**: Completes process shutdown bookkeeping after the wait thread decides the process is done or has been terminated. It publishes the exit code, closes handles, joins output readers, and records success/failure logs.
+**Purpose**: Finishes the process lifetime after the child has ended or been killed. It collects the exit code, waits for output readers to stop, reports the exit code, closes handles, and writes a success or failure log.
 
-**Data flow**: Receives the exit-code oneshot sender, an `Arc<Mutex<Option<HANDLE>>>` for the process handle, the thread handle, the output-reader join handle, optional log directory, and the original command vector. It locks the process handle, waits indefinitely with `WaitForSingleObject`, reads the exit code with `GetExitCodeProcess`, joins the output thread, sends the exit code over the oneshot, closes the thread handle if valid, takes and closes the process handle if still present, and finally calls `log_success` for exit code 0 or `log_failure` with `exit code {exit_code}` otherwise.
+**Data flow**: It receives the one-time exit-code sender, the shared process handle, the process thread handle, the output reader thread, optional log location, and the command. It waits for the process handle, reads the Windows exit code, joins the output-reading thread, sends the exit code to the caller, closes the thread and process handles, and logs the command as successful or failed.
 
-**Call relations**: It is invoked from the detached supervision thread created by `spawn_windows_sandbox_session_legacy` after timeout handling, ConPTY cleanup, and token-handle cleanup. It is the final teardown step before the session's exit receiver resolves.
+**Call relations**: The wait thread created by spawn_windows_sandbox_session_legacy calls this at the end of the process. It uses Windows wait and exit-code calls to learn what happened, then calls log_success or log_failure so the run is recorded.
 
 *Call graph*: calls 2 internal fn (log_failure, log_success); 6 external calls (join, send, format!, CloseHandle, GetExitCodeProcess, WaitForSingleObject).
 
@@ -518,11 +524,11 @@ fn finalize_exit(
 fn resize_conpty_handle(hpc: &Arc<StdMutex<Option<HANDLE>>>, size: TerminalSize) -> Result<()>
 ```
 
-**Purpose**: Resizes an active ConPTY pseudo-console to the requested terminal dimensions.
+**Purpose**: Changes the size of a running ConPTY terminal. This lets an interactive command adapt when the user’s terminal window changes size.
 
-**Data flow**: Takes an `Arc<StdMutex<Option<HANDLE>>>` holding the ConPTY handle and a `TerminalSize`. It locks the mutex, errors if the lock is poisoned or the handle has already been cleared, then calls `ResizePseudoConsole` with a `COORD { X: cols as i16, Y: rows as i16 }`. It returns `Ok(())` on HRESULT 0 and an `anyhow` error otherwise.
+**Data flow**: It receives a shared, lock-protected optional ConPTY handle and a requested terminal size in rows and columns. It locks the handle, errors if there is no terminal attached, then calls Windows ResizePseudoConsole with the new dimensions. It returns success or an error message from the resize attempt.
 
-**Call relations**: This helper is wrapped into the `ProcessDriver.resizer` closure by `spawn_windows_sandbox_session_legacy` only for TTY sessions. It gives callers a backend-neutral resize API while preserving ConPTY-specific state internally.
+**Call relations**: spawn_windows_sandbox_session_legacy installs this function as the process driver’s resize callback when the process was launched with a terminal. Later, whoever owns the SpawnedProcess can trigger it to resize the underlying Windows pseudo-console.
 
 *Call graph*: 2 external calls (anyhow!, ResizePseudoConsole).
 
@@ -538,24 +544,26 @@ async fn spawn_windows_sandbox_session_legacy(
     cwd: &Path,
 ```
 
-**Purpose**: Top-level legacy backend entrypoint that prepares security, launches the process, supervises timeout/termination, and returns a unified `SpawnedProcess`.
+**Purpose**: Creates a complete legacy Windows sandbox session and returns a controllable spawned process. This is the main doorway in this file: it prepares permissions, starts the command, wires input/output, sets up termination, and exposes the result to the caller.
 
-**Data flow**: Accepts the full legacy launch request: permission profile, workspace roots, codex home, command, cwd, mutable env map, timeout, deny-path overrides, TTY flag, stdin-open flag, and desktop choice. It calls `prepare_legacy_spawn_context`, rejects unsupported permission combinations, converts deny-write overrides to `PathBuf`s, computes capability roots, prepares token/security state, enables null-device access if needed, and applies ACL rules. It then creates stdin/stdout/stderr/exit channels, calls `spawn_legacy_process`, and on spawn failure closes `security.h_token` before returning the error. On success it wraps the process handle and optional ConPTY handle in `Arc<Mutex<Option<HANDLE>>>`, spawns a supervision thread that waits with timeout, terminates on timeout, clears the ConPTY handle, drops ConPTY ownership, closes the token handle, and calls `finalize_exit`. It also builds a terminator closure that calls `TerminateProcess`, optionally builds a resizer closure via `resize_conpty_handle`, constructs a `ProcessDriver`, and returns `finish_driver_spawn(driver, stdin_open)`.
+**Data flow**: It receives the permission profile, workspace paths, Codex home path, command, working directory, environment, timeout, extra deny paths, terminal and stdin settings, and desktop setting. It first prepares the command context and rejects features this legacy backend cannot safely support, such as restricted read access and deny-read overrides. It computes legacy capability roots, prepares a restricted token and security identifiers, applies access-control rules, and creates channels for stdin, stdout, stderr, and exit status. It then calls spawn_legacy_process. After launch, it stores the process and terminal handles behind locks, creates a waiter thread that handles timeout and cleanup, builds a terminator callback, builds an optional terminal resizer, and returns a SpawnedProcess through finish_driver_spawn.
 
-**Call relations**: This is the backend entrypoint called by the unified-exec dispatcher for non-elevated sessions. It orchestrates all helpers in this file plus the spawn-preparation and ACL/token modules to produce the same session abstraction as the elevated backend.
+**Call relations**: This function is the top-level coordinator for the legacy backend. It calls the spawn-preparation helpers to set up Windows permissions, calls spawn_legacy_process to actually start the command, and passes the finished ProcessDriver to finish_driver_spawn so the rest of the system can interact with the process in a backend-neutral way. The call graph records this as the function reached for legacy Windows sandbox session spawning.
 
 *Call graph*: calls 7 internal fn (allow_null_device_for_workspace_write, apply_legacy_session_acl_rules, legacy_session_capability_roots, prepare_legacy_session_security, prepare_legacy_spawn_context, spawn_legacy_process, finish_driver_spawn); called by 1 (spawn_windows_sandbox_session_legacy); 9 external calls (clone, new, new, new, bail!, spawn, is_empty, iter, CloseHandle).
 
 
 ### `tui/src/windows_sandbox.rs`
 
-`domain_logic` · `permission setup and sandbox readiness handling`
+`orchestration` · `startup, permission changes, and Windows sandbox setup`
 
-This module is a thin adapter around configuration and the `codex_windows_sandbox` crate while setup still runs in the local TUI process. `level_from_config` is the cross-platform decision function: it inspects `config.permissions.windows_sandbox_mode` first, mapping explicit TOML values to `WindowsSandboxLevel::{Elevated, RestrictedToken}`. If no explicit mode is set, it falls back to feature flags, preferring `Feature::WindowsSandboxElevated`, then `Feature::WindowsSandbox`, and otherwise disabling sandboxing. That precedence means explicit config overrides feature defaults.
+The Windows sandbox is a safety layer that can limit what commands are allowed to touch on the machine. This file exists because parts of that setup still run inside the local TUI process, rather than entirely on a remote app server. In plain terms, it is a small adapter between the user-facing TUI configuration and the Windows-specific sandbox machinery.
 
-The remaining helpers are platform-gated. On Windows, `sandbox_setup_is_complete` is re-exported directly from `codex_windows_sandbox`; on non-Windows builds, a stub always returns `false`, making readiness checks safely pessimistic. `run_elevated_setup` resolves a `PermissionProfile` plus workspace roots into concrete sandbox permissions and invokes the external elevated setup routine with `proxy_enforced: false` and default root overrides. `elevated_setup_failure_details` and `elevated_setup_failure_metric_name` inspect an `anyhow::Error` for structured setup-failure information, extracting a sanitized code/message pair for telemetry and distinguishing user-canceled helper launches from generic failures.
+First, it translates configuration and feature flags into a simple sandbox level: disabled, restricted, or elevated. That lets the rest of the TUI ask one question — “what sandbox mode are we in?” — without knowing all the details of config files and feature switches.
 
-`grant_read_root_non_elevated` performs strict local validation before refreshing sandbox setup with one extra readable root: the path must be absolute, exist, and be a directory. It canonicalizes the path before passing it onward and returns that canonical path, ensuring callers and downstream setup logic operate on a normalized directory identity.
+On Windows, the file also forwards setup work to the `codex_windows_sandbox` library. It can check whether setup is complete, run an elevated setup step, turn setup failures into safe metric labels, and refresh permissions when the user grants an extra read-only folder. On non-Windows systems, the readiness check simply says setup is not complete, because the Windows sandbox does not apply there.
+
+An important detail is that `grant_read_root_non_elevated` is careful before changing permissions: it rejects paths that are not absolute, do not exist, or are not directories. Like a security guard checking an address before adding it to an access list, it validates the folder before asking the sandbox system to allow it.
 
 #### Function details
 
@@ -565,11 +573,11 @@ The remaining helpers are platform-gated. On Windows, `sandbox_setup_is_complete
 fn level_from_config(config: &Config) -> WindowsSandboxLevel
 ```
 
-**Purpose**: Determines the effective Windows sandbox level from explicit configuration and feature flags.
+**Purpose**: This function turns the app’s configuration into one clear Windows sandbox level. It gives the rest of the TUI a simple answer instead of making every caller understand config file values and feature flags.
 
-**Data flow**: It reads `config.permissions.windows_sandbox_mode` and `config.features`. Explicit `Elevated` maps to `WindowsSandboxLevel::Elevated`, explicit `Unelevated` maps to `RestrictedToken`. If no explicit mode is set, it checks whether `Feature::WindowsSandboxElevated` or `Feature::WindowsSandbox` is enabled and returns the corresponding level; otherwise it returns `Disabled`.
+**Data flow**: It takes the current `Config`. It first looks for an explicit Windows sandbox mode in the permissions settings. If that is present, it uses it. If not, it checks feature flags to decide whether elevated or restricted sandboxing is enabled. It returns a `WindowsSandboxLevel`, such as elevated, restricted-token, or disabled.
 
-**Call relations**: This function is consulted broadly by runtime flows that need to know the active sandbox policy, including startup, command dispatch, permission UI, and setup-required checks.
+**Call relations**: This is the common decision point used by many parts of the TUI flow. Startup, event handling, permission popups, command dispatch, built-in command flags, and elevated setup checks call it when they need to know which sandbox behavior should apply.
 
 *Call graph*: called by 11 (run, propagate_windows_sandbox_turn_context, handle_event, open_permissions_popup, permission_mode_actions, builtin_command_flags, dispatch_command, elevated_windows_sandbox_setup_required, maybe_prompt_windows_sandbox_enable, new (+1 more)).
 
@@ -580,11 +588,11 @@ fn level_from_config(config: &Config) -> WindowsSandboxLevel
 fn sandbox_setup_is_complete(_codex_home: &Path) -> bool
 ```
 
-**Purpose**: Reports whether Windows sandbox setup has already been completed for the given Codex home, or always false on non-Windows builds.
+**Purpose**: This function answers whether the Windows sandbox setup has already been completed for the given Codex home folder. On non-Windows platforms, it always returns `false` because this Windows-specific setup is not available there.
 
-**Data flow**: On Windows targets this name re-exports the implementation from `codex_windows_sandbox`. On non-Windows targets, the local stub ignores `_codex_home` and returns `false`.
+**Data flow**: It receives a path to the Codex home directory. On Windows, this name is re-exported from the Windows sandbox library, so the real check is done there. On non-Windows systems, the input is ignored and the result is simply `false`.
 
-**Call relations**: This helper gives higher-level code a uniform symbol to call regardless of platform, with non-Windows builds taking the conservative no-setup-complete path.
+**Call relations**: This wrapper gives the TUI one place to ask about sandbox readiness without scattering operating-system checks throughout the code. When compiled for Windows it hands that question to the sandbox library; otherwise it provides a safe no-op answer.
 
 
 ##### `run_elevated_setup`  (lines 46–67)
@@ -599,11 +607,11 @@ fn run_elevated_setup(
 ) -> a
 ```
 
-**Purpose**: Builds resolved sandbox permissions from the current permission profile and invokes the elevated Windows sandbox setup flow.
+**Purpose**: This function starts the Windows sandbox setup that needs elevated rights. Elevated rights mean the setup may require higher system permission, like an administrator-approved helper, to prepare the sandbox safely.
 
-**Data flow**: It takes a `PermissionProfile`, workspace roots, command working directory, environment map, and Codex home path. It first calls `ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots` to derive concrete permissions, then passes those permissions plus the other inputs into `codex_windows_sandbox::run_elevated_setup` inside a `SandboxSetupRequest` with `proxy_enforced: false` and `SetupRootOverrides::default()`. It returns `anyhow::Result<()>`.
+**Data flow**: It receives the current permission profile, workspace folders, the command’s working directory, environment variables, and the Codex home directory. It converts the permission profile plus workspace roots into the exact sandbox permissions needed. Then it builds a setup request and passes it to the Windows sandbox library. It returns success if setup finishes, or an error if permission resolution or setup fails.
 
-**Call relations**: This Windows-only helper is the TUI-owned bridge into the external elevated setup implementation while setup still happens locally rather than over RPC.
+**Call relations**: Callers use this when the chosen sandbox level requires elevated preparation. This function does not do the low-level Windows work itself; it translates TUI-side information into the sandbox library’s setup request, using `try_from_permission_profile_for_workspace_roots`, `run_elevated_setup`, and the default setup-root overrides.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots); 2 external calls (run_elevated_setup, default).
 
@@ -614,11 +622,11 @@ fn run_elevated_setup(
 fn elevated_setup_failure_details(err: &anyhow::Error) -> Option<(String, String)>
 ```
 
-**Purpose**: Extracts a telemetry-friendly failure code and sanitized message from an elevated setup error when structured setup metadata is present.
+**Purpose**: This function extracts safe, structured details from an elevated sandbox setup error. It is mainly useful for reporting or metrics, where the code wants a stable error code and a cleaned-up message.
 
-**Data flow**: It takes `&anyhow::Error`, calls `codex_windows_sandbox::extract_setup_failure`, and if that succeeds returns `Some((failure.code.as_str().to_string(), sanitize_setup_metric_tag_value(&failure.message)))`. If no structured setup failure is embedded, it returns `None`.
+**Data flow**: It receives an error. It asks the Windows sandbox library whether that error contains a known setup failure. If not, it returns nothing. If yes, it returns the failure code as text and a sanitized version of the message, meaning the message is cleaned so it is safer to use as a metric tag.
 
-**Call relations**: This helper is used by error-reporting paths that want richer metrics or logs for elevated setup failures without exposing raw unsanitized messages.
+**Call relations**: After elevated setup fails, reporting code can call this helper to turn a raw error into metric-friendly details. It delegates the actual failure extraction and message sanitizing to the Windows sandbox library.
 
 *Call graph*: 2 external calls (extract_setup_failure, sanitize_setup_metric_tag_value).
 
@@ -629,11 +637,11 @@ fn elevated_setup_failure_details(err: &anyhow::Error) -> Option<(String, String
 fn elevated_setup_failure_metric_name(err: &anyhow::Error) -> &'static str
 ```
 
-**Purpose**: Chooses the metric name to emit for an elevated setup error, distinguishing user cancellation from other failures.
+**Purpose**: This function chooses the metric name to record for an elevated setup failure. It separates a user-canceled helper launch from other setup failures, so dashboards can tell cancellation apart from real breakage.
 
-**Data flow**: It inspects the provided `anyhow::Error` with `extract_setup_failure`. If a structured failure exists and its code is `SetupErrorCode::OrchestratorHelperLaunchCanceled`, it returns `"codex.windows_sandbox.elevated_setup_canceled"`; otherwise it returns `"codex.windows_sandbox.elevated_setup_failure"`.
+**Data flow**: It receives an error. It checks whether the Windows sandbox library can extract a setup failure from it, and whether the failure code means the orchestrator helper launch was canceled. If so, it returns the cancellation metric name. Otherwise, it returns the general elevated setup failure metric name.
 
-**Call relations**: This helper complements `elevated_setup_failure_details` in telemetry/reporting flows by collapsing detailed failure information into one of two metric buckets.
+**Call relations**: This is used after setup errors when the TUI or telemetry layer needs to record what happened. It relies on the sandbox library to identify known setup failures, then makes the final naming decision locally.
 
 *Call graph*: 1 external calls (extract_setup_failure).
 
@@ -649,11 +657,11 @@ fn grant_read_root_non_elevated(
     codex_home: &Pa
 ```
 
-**Purpose**: Validates and grants one additional readable directory root through the non-elevated sandbox refresh path.
+**Purpose**: This function adds an extra read-only folder to the Windows sandbox permissions without running the full elevated setup path. It is used when a user grants the sandbox permission to read another folder.
 
-**Data flow**: It takes the current `PermissionProfile`, workspace roots, command cwd, environment map, Codex home, and a candidate `read_root`. It first validates that `read_root` is absolute, exists, and is a directory, returning `anyhow::bail!` errors otherwise. It then canonicalizes the directory with `dunce::canonicalize`, calls `run_setup_refresh_with_extra_read_roots` with a one-element vector containing that canonical path and `proxy_enforced` set to false, and returns the canonicalized `PathBuf` on success.
+**Data flow**: It receives the current permission profile, workspace roots, command working directory, environment variables, Codex home, and the folder to grant. It first checks that the folder path is absolute, exists, and is a directory. If any check fails, it returns an error. If the path is valid, it canonicalizes it, meaning it resolves it to a clean standard path, then asks the Windows sandbox library to refresh setup with that extra read root. It returns the canonical folder path on success.
 
-**Call relations**: This Windows-only helper is used when the running TUI needs to extend sandbox read access without going through the elevated setup path, and its preflight checks ensure downstream setup receives a normalized, valid directory.
+**Call relations**: This helper fits into permission-update flows. When the TUI needs to grant read access to a new folder, this function performs the local safety checks, then hands the refreshed permission request to `run_setup_refresh_with_extra_read_roots` in the Windows sandbox library.
 
 *Call graph*: 7 external calls (exists, is_absolute, is_dir, bail!, run_setup_refresh_with_extra_read_roots, canonicalize, vec!).
 
@@ -663,15 +671,15 @@ These files establish setup-time state, identity, errors, and the low-level ACL 
 
 ### `windows-sandbox-rs/src/setup_error.rs`
 
-`data_model` · `error reporting and metrics emission`
+`domain_logic` · `sandbox setup error handling`
 
-This file is the error model for setup orchestration and the elevated helper. `SetupErrorCode` enumerates both orchestrator-side failures (payload serialization, elevation checks, helper launch, stale or missing reports) and helper-side failures (user provisioning, DPAPI, firewall, ACL locking, and unknown fallback). `as_str` provides stable snake_case identifiers intended for metric tags.
+Setting up the Windows sandbox needs elevated permissions, creates local users, writes secret files, configures firewall rules, and locks down folders. Many things can fail, and some failures happen in a separate elevated helper process. This file is the common error notebook for that whole setup path.
 
-`SetupErrorReport` is the serialized on-disk form written to `CODEX_HOME/.sandbox/setup_error.json`, while `SetupFailure` is the in-memory error type exposed through `anyhow`. The helper constructors make it easy to create structured failures directly (`SetupFailure::new`, `failure`) or reconstruct them from a persisted report (`from_report`). `extract_failure` lets tests and callers recover the typed failure from an `anyhow::Error`.
+It starts by listing known setup error codes, such as “failed to create the sandbox directory” or “failed to add the firewall rule.” These codes are stable machine-readable labels, which makes them useful for logs and metrics. A `SetupFailure` pairs one of those codes with a human-readable message, like a labeled incident report.
 
-The file also owns report-file I/O. `setup_error_path` centralizes the location, `clear_setup_error_report` removes stale reports while treating missing files as success, `write_setup_error_report` ensures the sandbox directory exists and writes pretty JSON, and `read_setup_error_report` returns `Ok(None)` when the file is absent but adds path context to real read/parse failures.
+The file also lets the elevated helper write a structured JSON report at `codex_home/.sandbox/setup_error.json`. The normal, non-elevated process can later read that file and turn it back into a `SetupFailure`. This matters because a helper process may fail after it has already been launched, and without this report the caller would only know that “something failed.”
 
-Finally, metric sanitization is intentionally privacy-aware. `sanitize_setup_metric_tag_value` first redacts username path segments from the message using `USERNAME` and `USER`, replacing matching path components with `<user>`, then passes the result through the generic metric-tag sanitizer. The redaction logic preserves separators and handles both Windows and non-Windows case sensitivity rules.
+Finally, it protects privacy when sending error messages as metric tags. Before a message is used in metrics, it replaces path pieces that look like the current username with `<user>`, then applies general metric-tag cleanup. In everyday terms, it keeps the error useful while removing names from paths.
 
 #### Function details
 
@@ -681,11 +689,11 @@ Finally, metric sanitization is intentionally privacy-aware. `sanitize_setup_met
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Maps each structured setup error code to its stable snake_case string representation. These strings are intended for logs, display, and metric tags.
+**Purpose**: Turns a setup error code into its stable text label. This is useful when the code needs to appear in logs, display text, JSON-like reports, or metric tags.
 
-**Data flow**: Reads `self`, matches every enum variant, and returns the corresponding `&'static str` literal.
+**Data flow**: It receives one `SetupErrorCode` value, matches it against the known list of setup failures, and returns the matching lowercase string such as `helper_firewall_rule_verify_failed`. It does not change any stored data.
 
-**Call relations**: Display formatting and metrics code rely on this mapping whenever a structured setup failure needs a stable textual code.
+**Call relations**: This is the bridge from the internal enum value to readable text. `SetupFailure::fmt` relies on it when turning a full failure into a message people can read.
 
 
 ##### `SetupFailure::new`  (lines 127–132)
@@ -694,11 +702,11 @@ fn as_str(self) -> &'static str
 fn new(code: SetupErrorCode, message: impl Into<String>) -> Self
 ```
 
-**Purpose**: Constructs a typed setup failure from a code and message. It is the primary in-memory error constructor.
+**Purpose**: Builds a complete setup failure from a known error code and a message. Other setup code uses it whenever it wants to report a failure in the project’s standard format.
 
-**Data flow**: Takes a `SetupErrorCode` and any `message` convertible into `String`, converts the message with `Into<String>`, stores both fields in `SetupFailure`, and returns it.
+**Data flow**: It takes a `SetupErrorCode` and any message-like value, converts the message into a `String`, and returns a `SetupFailure` holding both pieces. Nothing is written to disk or sent elsewhere.
 
-**Call relations**: Many setup and helper paths construct failures through this method directly or indirectly via `failure` and `from_report`.
+**Call relations**: This is the main constructor used across setup work, including firewall configuration, sandbox user provisioning, local group setup, and the setup program’s main path. Higher-level helpers also call it through `failure` and `from_report` so all failures end up in the same shape.
 
 *Call graph*: called by 11 (configure_offline_sandbox_network, configure_rule, ensure_offline_outbound_block, ensure_offline_proxy_allowlist, validate_local_policy_modify_result, provision_and_hide_sandbox_users, real_main, ensure_local_group, ensure_local_user, prepare_setup_marker (+1 more)); 1 external calls (into).
 
@@ -709,11 +717,11 @@ fn new(code: SetupErrorCode, message: impl Into<String>) -> Self
 fn from_report(report: SetupErrorReport) -> Self
 ```
 
-**Purpose**: Reconstructs a typed setup failure from a persisted JSON error report. It bridges on-disk helper reports back into in-memory errors.
+**Purpose**: Turns a saved setup error report back into a normal `SetupFailure`. This is used when the main process reads an error report written by the elevated helper.
 
-**Data flow**: Takes `SetupErrorReport`, extracts its `code` and `message`, forwards them to `SetupFailure::new`, and returns the resulting `SetupFailure`.
+**Data flow**: It takes a `SetupErrorReport`, copies out its code and message, and feeds them into `SetupFailure::new`. The output is a `SetupFailure` that can be returned like any other setup error.
 
-**Call relations**: `report_helper_failure` uses this when a helper wrote a structured `setup_error.json` report.
+**Call relations**: When `report_helper_failure` finds a helper-written report, it calls this function so the caller sees a normal setup failure rather than raw report data.
 
 *Call graph*: called by 1 (report_helper_failure); 1 external calls (new).
 
@@ -724,11 +732,11 @@ fn from_report(report: SetupErrorReport) -> Self
 fn metric_message(&self) -> String
 ```
 
-**Purpose**: Produces a sanitized version of the failure message suitable for use as a metric tag. It removes sensitive home-path details before generic tag sanitization.
+**Purpose**: Produces a safe version of the failure message for metrics. It keeps the message useful for grouping failures, but removes sensitive username path pieces and applies metric formatting cleanup.
 
-**Data flow**: Reads `self.message`, passes it to `sanitize_setup_metric_tag_value`, and returns the sanitized `String`.
+**Data flow**: It reads the `message` inside the `SetupFailure`, passes it through `sanitize_setup_metric_tag_value`, and returns the cleaned string. The original failure is not changed.
 
-**Call relations**: Metrics emission code calls this on structured failures before attaching the message as a tag.
+**Call relations**: This is used when setup failures are turned into metric fields. It hands the privacy and formatting work to `sanitize_setup_metric_tag_value`.
 
 *Call graph*: calls 1 internal fn (sanitize_setup_metric_tag_value).
 
@@ -739,11 +747,11 @@ fn metric_message(&self) -> String
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats a setup failure for human-readable display as `<code>: <message>`. It gives `anyhow` and logs a concise textual representation.
+**Purpose**: Defines how a `SetupFailure` is shown as plain text. The output includes both the machine-readable code and the human-readable message.
 
-**Data flow**: Reads `self.code.as_str()` and `self.message`, writes them into the formatter with `write!`, and returns the formatting result.
+**Data flow**: It reads the failure’s code and message, converts the code with `SetupErrorCode::as_str`, and writes text in the form `code: message` into the formatter supplied by Rust’s display system.
 
-**Call relations**: This implementation is used automatically whenever `SetupFailure` is displayed or wrapped inside `anyhow::Error`.
+**Call relations**: This is called automatically when a `SetupFailure` is displayed, logged, or wrapped into a broader error message. It depends on `SetupErrorCode::as_str` for the code label.
 
 *Call graph*: 1 external calls (write!).
 
@@ -754,11 +762,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn failure(code: SetupErrorCode, message: impl Into<String>) -> anyhow::Error
 ```
 
-**Purpose**: Convenience constructor that wraps a `SetupFailure` inside `anyhow::Error`. It is the standard way setup code returns structured failures through `anyhow` APIs.
+**Purpose**: Creates a standard `anyhow::Error` from a setup error code and message. `anyhow::Error` is a general-purpose error wrapper used so different error types can move through the same result pipeline.
 
-**Data flow**: Takes a `SetupErrorCode` and message, constructs `SetupFailure::new(code, message)`, wraps it with `anyhow::Error::new`, and returns the `anyhow::Error`.
+**Data flow**: It takes a setup error code and message, builds a `SetupFailure` with them, wraps that failure inside an `anyhow::Error`, and returns the wrapped error.
 
-**Call relations**: Setup orchestration code calls this in many failure branches so callers can still use `anyhow::Result` while preserving typed setup failure information.
+**Call relations**: Higher-level setup flows such as elevated provisioning, launching the setup executable, reporting helper failure, and verifying completion use this when they need to return a setup-specific failure through the broader error system.
 
 *Call graph*: calls 1 internal fn (new); called by 4 (report_helper_failure, run_elevated_provisioning_setup, run_setup_exe, verify_setup_completed); 1 external calls (new).
 
@@ -769,11 +777,11 @@ fn failure(code: SetupErrorCode, message: impl Into<String>) -> anyhow::Error
 fn extract_failure(err: &anyhow::Error) -> Option<&SetupFailure>
 ```
 
-**Purpose**: Attempts to recover a typed `SetupFailure` from an `anyhow::Error`. It is mainly used by tests and structured error handling.
+**Purpose**: Checks whether a general `anyhow::Error` is really one of this file’s `SetupFailure` errors. This lets callers recover the structured code and message after the error has been wrapped.
 
-**Data flow**: Takes `&anyhow::Error`, calls `downcast_ref::<SetupFailure>()`, and returns `Option<&SetupFailure>`.
+**Data flow**: It receives a reference to a general error, tries to look inside it for a `SetupFailure`, and returns either a reference to that failure or `None` if the error is some other kind.
 
-**Call relations**: Tests use this to assert exact setup failure codes and messages after helper-report decoding or completion checks.
+**Call relations**: Tests around helper failure reporting use this to confirm that the right structured setup failure was produced, especially when reading or clearing the helper’s report succeeds or fails.
 
 *Call graph*: called by 2 (report_helper_failure_ignores_setup_error_report_when_clear_failed, report_helper_failure_uses_setup_error_report_when_clear_succeeded).
 
@@ -784,11 +792,11 @@ fn extract_failure(err: &anyhow::Error) -> Option<&SetupFailure>
 fn setup_error_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the canonical path to the helper-to-orchestrator setup error report file. It centralizes the `setup_error.json` location.
+**Purpose**: Builds the exact path where the setup error JSON report lives. This keeps all readers and writers using the same location.
 
-**Data flow**: Takes `codex_home: &Path`, appends `.sandbox` and `setup_error.json`, and returns the resulting `PathBuf`.
+**Data flow**: It takes the `codex_home` folder path, appends `.sandbox`, then appends `setup_error.json`, and returns that full path. It does not touch the file system.
 
-**Call relations**: All report-file I/O helpers call this before reading, writing, or deleting the report.
+**Call relations**: The clear, read, and write functions all call this first, so a report is always removed, saved, and loaded from the same place.
 
 *Call graph*: called by 3 (clear_setup_error_report, read_setup_error_report, write_setup_error_report); 1 external calls (join).
 
@@ -799,11 +807,11 @@ fn setup_error_path(codex_home: &Path) -> PathBuf
 fn clear_setup_error_report(codex_home: &Path) -> Result<()>
 ```
 
-**Purpose**: Deletes any existing setup error report, treating a missing file as success. It is used to avoid confusing stale helper reports with fresh failures.
+**Purpose**: Deletes any old setup error report before a new setup attempt. This prevents a stale failure from being mistaken for the result of the current run.
 
-**Data flow**: Takes `codex_home`, computes the report path with `setup_error_path`, calls `fs::remove_file`, returns `Ok(())` on success or `NotFound`, and otherwise returns the filesystem error annotated with `with_context("remove <path>")`.
+**Data flow**: It builds the report path with `setup_error_path`, tries to remove that file, and treats “file not found” as success because there is simply nothing to clear. Other delete errors are returned with context that names the path.
 
-**Call relations**: Setup orchestrator launch paths call this before and after helper execution to manage report freshness.
+**Call relations**: Setup launch and refresh flows call this before running setup work. If clearing succeeds, later error reporting can trust that any report found was written by the latest helper run.
 
 *Call graph*: calls 1 internal fn (setup_error_path); called by 2 (run_setup_exe, run_setup_refresh_inner); 1 external calls (remove_file).
 
@@ -814,11 +822,11 @@ fn clear_setup_error_report(codex_home: &Path) -> Result<()>
 fn write_setup_error_report(codex_home: &Path, report: &SetupErrorReport) -> Result<()>
 ```
 
-**Purpose**: Writes a structured setup error report to disk for the orchestrator to consume after helper failure. It ensures the sandbox directory exists first.
+**Purpose**: Saves a structured setup failure report for another process to read later. This is how the elevated helper can explain a failure back to the orchestrating process.
 
-**Data flow**: Takes `codex_home` and `&SetupErrorReport`, creates `codex_home/.sandbox` with `create_dir_all`, computes the report path with `setup_error_path`, serializes the report with `serde_json::to_vec_pretty`, writes the bytes with `fs::write`, and returns `Ok(())` or a contextualized error.
+**Data flow**: It takes `codex_home` and a `SetupErrorReport`, makes sure the `.sandbox` folder exists, converts the report to pretty JSON bytes, and writes those bytes to `setup_error.json`. It returns success or an error with path context.
 
-**Call relations**: Tests call this directly, and the elevated helper side uses the same function when persisting structured failure reports.
+**Call relations**: Helper-failure reporting tests call this to set up realistic report files. In the real flow, it pairs with `read_setup_error_report`, which reads the helper’s written report after the helper exits.
 
 *Call graph*: calls 1 internal fn (setup_error_path); called by 2 (report_helper_failure_ignores_setup_error_report_when_clear_failed, report_helper_failure_uses_setup_error_report_when_clear_succeeded); 4 external calls (join, create_dir_all, write, to_vec_pretty).
 
@@ -829,11 +837,11 @@ fn write_setup_error_report(codex_home: &Path, report: &SetupErrorReport) -> Res
 fn read_setup_error_report(codex_home: &Path) -> Result<Option<SetupErrorReport>>
 ```
 
-**Purpose**: Reads and parses the structured setup error report if it exists. It distinguishes absence from actual read or parse failures.
+**Purpose**: Reads the helper’s saved setup error report, if one exists. It allows the caller to learn the real setup failure instead of only seeing that the helper process failed.
 
-**Data flow**: Takes `codex_home`, computes the report path with `setup_error_path`, reads bytes with `fs::read`, returns `Ok(None)` on `NotFound`, otherwise parses `SetupErrorReport` from JSON with `serde_json::from_slice`, and returns `Ok(Some(report))` or a contextualized error.
+**Data flow**: It builds the report path, reads the file if present, and returns `Ok(None)` if the file is missing. If bytes are found, it parses them as a `SetupErrorReport` and returns `Ok(Some(report))`; read or parse problems become errors with file context.
 
-**Call relations**: `report_helper_failure` calls this after a helper exits nonzero to recover a structured failure when available.
+**Call relations**: `report_helper_failure` calls this after the helper exits badly. If a report is available, the caller can turn it into a `SetupFailure`; if not, it falls back to a less specific helper-exit error.
 
 *Call graph*: calls 1 internal fn (setup_error_path); called by 1 (report_helper_failure); 1 external calls (read).
 
@@ -844,11 +852,11 @@ fn read_setup_error_report(codex_home: &Path) -> Result<Option<SetupErrorReport>
 fn sanitize_setup_metric_tag_value(value: &str) -> String
 ```
 
-**Purpose**: Sanitizes a setup error message for metric-tag use by first redacting home-path usernames and then applying generic metric-tag sanitization. It is the public metrics-facing sanitizer.
+**Purpose**: Cleans a setup error message so it can be safely used as a metric tag. A metric tag is a short label attached to telemetry so failures can be counted and grouped.
 
-**Data flow**: Takes `value: &str`, calls `redact_home_paths(value)`, passes the result to `sanitize_metric_tag_value`, and returns the sanitized string.
+**Data flow**: It takes a raw message, first calls `redact_home_paths` to replace username path segments with `<user>`, then passes the result into the shared `sanitize_metric_tag_value` cleanup function. It returns the final metric-safe string.
 
-**Call relations**: `SetupFailure::metric_message` and metrics emission code call this before attaching setup messages to telemetry.
+**Call relations**: `SetupFailure::metric_message` uses this for failure messages, and setup metric emission uses it directly when preparing telemetry.
 
 *Call graph*: calls 1 internal fn (redact_home_paths); called by 2 (metric_message, emit_wfp_setup_metric); 1 external calls (sanitize_metric_tag_value).
 
@@ -859,11 +867,11 @@ fn sanitize_setup_metric_tag_value(value: &str) -> String
 fn redact_home_paths(value: &str) -> String
 ```
 
-**Purpose**: Collects likely local usernames from the environment and redacts matching path segments in a message. It prepares setup messages for safe metric export.
+**Purpose**: Finds the current user names known from environment variables and removes them from path-like text. This helps avoid leaking a person’s Windows or Unix username in metrics.
 
-**Data flow**: Takes `value: &str`, initializes an empty `Vec<String>`, conditionally pushes non-empty `USERNAME` and `USER` environment values while avoiding case-insensitive duplicates, then calls `redact_username_segments(value, &usernames)` and returns the result.
+**Data flow**: It reads the `USERNAME` and `USER` environment variables, ignores empty values, avoids duplicates that differ only by letter case, and passes the collected names plus the original message to `redact_username_segments`. It returns the redacted message.
 
-**Call relations**: This private helper is only used by `sanitize_setup_metric_tag_value`.
+**Call relations**: This is the privacy step inside `sanitize_setup_metric_tag_value`. It delegates the actual path-segment replacement to `redact_username_segments`.
 
 *Call graph*: calls 1 internal fn (redact_username_segments); called by 1 (sanitize_setup_metric_tag_value); 2 external calls (new, var).
 
@@ -874,11 +882,11 @@ fn redact_home_paths(value: &str) -> String
 fn redact_username_segments(value: &str, usernames: &[String]) -> String
 ```
 
-**Purpose**: Replaces any path segment equal to one of the supplied usernames with `<user>`, preserving separators and non-path text. It is the core redaction algorithm.
+**Purpose**: Replaces path pieces that exactly match known usernames with `<user>`. It is careful to only replace whole path segments, not every matching word inside a larger string.
 
-**Data flow**: Takes `value: &str` and `usernames: &[String]`. If the username list is empty it returns `value.to_string()`. Otherwise it splits the string into path-like segments and separator characters on `\` and `/`, compares each segment against the usernames using case-insensitive matching on Windows and exact matching elsewhere, replaces matching segments with `<user>`, then reconstructs and returns the redacted string.
+**Data flow**: It receives a text value and a list of usernames. It splits the text around `/` and `\` path separators, checks each segment against the usernames, replaces matching segments with `<user>`, then stitches the text back together with the original separators.
 
-**Call relations**: This helper is called by `redact_home_paths` and directly by tests that validate redaction behavior.
+**Call relations**: `redact_home_paths` uses this during metric sanitization. The test functions call it directly to prove it redacts expected path segments, leaves unrelated paths alone, and handles repeated occurrences.
 
 *Call graph*: called by 4 (redact_home_paths, sanitize_tag_value_leaves_unknown_segments, sanitize_tag_value_redacts_multiple_occurrences, sanitize_tag_value_redacts_username_segments); 4 external calls (new, new, cfg!, take).
 
@@ -889,11 +897,11 @@ fn redact_username_segments(value: &str, usernames: &[String]) -> String
 fn sanitize_tag_value_redacts_username_segments()
 ```
 
-**Purpose**: Verifies that username path segments are replaced with `<user>` in multiple path prefixes. It checks the basic redaction behavior.
+**Purpose**: Checks that username-looking path segments are replaced with `<user>`. This protects the privacy behavior from accidental changes.
 
-**Data flow**: Builds a username list and a message containing two user-home paths, calls `redact_username_segments`, and asserts the expected redacted string.
+**Data flow**: It creates a sample message containing Windows paths with `Alice` and `Bob`, calls `redact_username_segments` with those names, and asserts that both names were replaced while the rest of the paths stayed the same.
 
-**Call relations**: This test directly exercises the segment-replacement logic in `redact_username_segments`.
+**Call relations**: This test exercises the core redaction helper directly. It supports the higher-level metric-sanitizing path by proving the username replacement works on realistic Windows-style paths.
 
 *Call graph*: calls 1 internal fn (redact_username_segments); 2 external calls (assert_eq!, vec!).
 
@@ -904,11 +912,11 @@ fn sanitize_tag_value_redacts_username_segments()
 fn sanitize_tag_value_leaves_unknown_segments()
 ```
 
-**Purpose**: Verifies that path segments not matching any supplied username are left unchanged. It checks that redaction is selective rather than blanket.
+**Purpose**: Checks that the redaction code does not change unrelated path text. This matters because over-redacting would make error messages less useful.
 
-**Data flow**: Builds a single-username list and a message with no matching username segment, calls `redact_username_segments`, and asserts the original message is returned.
+**Data flow**: It creates a sample path that does not include the listed username, calls `redact_username_segments`, and asserts that the returned message exactly matches the original.
 
-**Call relations**: This test covers the non-matching branch in `redact_username_segments`.
+**Call relations**: This test guards the helper used by `redact_home_paths`. It confirms that only known username segments are changed.
 
 *Call graph*: calls 1 internal fn (redact_username_segments); 2 external calls (assert_eq!, vec!).
 
@@ -919,24 +927,24 @@ fn sanitize_tag_value_leaves_unknown_segments()
 fn sanitize_tag_value_redacts_multiple_occurrences()
 ```
 
-**Purpose**: Verifies that repeated occurrences of the same username segment are all redacted. It checks that the algorithm scans the full string rather than stopping after one replacement.
+**Purpose**: Checks that the same username is redacted every time it appears. This prevents a message with two paths from leaking the username in the second path.
 
-**Data flow**: Builds a username list and a message containing the same username in two paths, calls `redact_username_segments`, and asserts both occurrences become `<user>`.
+**Data flow**: It creates a message with two paths containing `Alice`, calls `redact_username_segments`, and asserts that both occurrences become `<user>`.
 
-**Call relations**: This test validates repeated-match handling in `redact_username_segments`.
+**Call relations**: This test directly supports the redaction helper used in metric cleanup. It proves the helper scans the whole message, not just the first match.
 
 *Call graph*: calls 1 internal fn (redact_username_segments); 2 external calls (assert_eq!, vec!).
 
 
 ### `windows-sandbox-rs/src/setup.rs`
 
-`orchestration` · `setup refresh, provisioning, and elevated helper launch`
+`orchestration` · `startup and sandbox setup refresh`
 
-This file is the main setup orchestrator for the Windows sandbox. It defines path conventions (`sandbox_dir`, `sandbox_bin_dir`, `sandbox_secrets_dir`, marker and secrets file locations), request/override structs, serialized payload types, and the logic that launches the external setup helper either elevated or non-elevated. The top-level refresh functions first try to resolve a `PermissionProfile` into `ResolvedWindowsSandboxPermissions`; unsupported profiles are intentionally skipped rather than treated as errors. Supported requests are converted into an `ElevationPayload` containing usernames, cwd, codex home, read/write roots, deny lists, proxy/firewall settings, telemetry settings, and mode flags.
+Windows cannot safely sandbox a command just by asking nicely; it needs real operating-system setup: special local users, folders for sandbox state, access control lists (Windows file permission rules), and firewall settings. This file builds that setup request and launches the helper program that can apply it, using administrator rights when needed.
 
-A large portion of the file is devoted to root computation and filtering. Read roots come from helper binaries, optional Windows platform defaults, readable policy roots, writable roots when full-disk read is granted, and selected `USERPROFILE` children. Write roots are canonicalized, deduplicated, expanded if they point at the whole user profile, then filtered to remove sensitive profile exclusions, SSH-config dependency roots, and anything under `CODEX_HOME`, `.sandbox`, `.sandbox-bin`, or `.sandbox-secrets`. This prevents capability write access from reaching sandbox control state or user secrets.
+The flow is like packing a work order for a locksmith. First, the file decides which sandbox identity should be used: an offline user when networking is blocked or forced through a proxy, or an online user when direct networking is allowed. Then it gathers the folders the sandbox may read or write. It is careful to include helper binaries the sandbox needs, Windows system folders when appropriate, and workspace folders, while excluding sensitive places such as SSH keys, cloud credentials, Codex’s own sandbox state, and other secret-bearing profile folders.
 
-Network identity is derived from permissions plus `proxy_enforced`, producing offline/online behavior and optional loopback proxy allowlists parsed from environment variables. Helper launch paths clear stale `setup_error.json`, run the helper, and on failure prefer a structured report from that file over a generic exit-code error. `run_setup_exe` handles both direct execution and UAC elevation via `ShellExecuteExW`, while `verify_setup_completed` ensures the helper did not exit successfully before writing the expected setup artifacts. The extensive tests focus on root filtering, proxy parsing, helper lookup, and error-report precedence.
+It serializes this plan into a payload, base64-encodes it, and starts `codex-windows-sandbox-setup.exe`. For full setup it may use Windows’ “run as administrator” path; for refreshes it deliberately avoids elevation. It also records and reads structured setup errors so callers get useful failure messages instead of just “the helper failed.” The tests at the bottom lock down the important safety behavior: proxy parsing, path filtering, helper lookup, and error reporting.
 
 #### Function details
 
@@ -946,11 +954,11 @@ Network identity is derived from permissions plus `proxy_enforced`, producing of
 fn sandbox_dir(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the root directory under `CODEX_HOME` where sandbox control state is stored. This is the canonical `.sandbox` location used throughout setup and ACL code.
+**Purpose**: Returns the main hidden folder under Codex home where sandbox state is stored. Other setup code uses this as the shared place for markers, logs, and control files.
 
-**Data flow**: Takes `codex_home: &Path`, appends `.sandbox` with `join`, and returns the resulting `PathBuf`.
+**Data flow**: It receives the Codex home path → appends `.sandbox` → returns that full path without touching the disk.
 
-**Call relations**: Many setup and ACL paths call this to locate logs, markers, deny-read state, and protected directories. Other path helpers build on it.
+**Call relations**: Many setup paths start here: marker files, logging, elevated setup, refresh setup, credential setup, and write-root filtering all call it when they need the sandbox state directory.
 
 *Call graph*: called by 8 (sync_persistent_deny_read_acls, require_logon_sandbox_creds, filter_sensitive_write_roots, run_elevated_provisioning_setup, run_elevated_setup, run_setup_exe, run_setup_refresh_inner, setup_marker_path); 1 external calls (join).
 
@@ -961,11 +969,11 @@ fn sandbox_dir(codex_home: &Path) -> PathBuf
 fn sandbox_bin_dir(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the directory under `CODEX_HOME` that stores helper binaries used by the sandbox. It identifies a write-protected subtree.
+**Purpose**: Returns the folder under Codex home that holds sandbox helper binaries. This matters because the sandbox should not be allowed to overwrite its own tools.
 
-**Data flow**: Takes `codex_home: &Path`, appends `.sandbox-bin`, and returns the `PathBuf`.
+**Data flow**: It receives the Codex home path → appends `.sandbox-bin` → returns the resulting path.
 
-**Call relations**: This helper is mainly used by write-root filtering to ensure capability writes never include helper binaries.
+**Call relations**: The sensitive-write filter calls this while removing protected Codex-controlled folders from writable sandbox roots.
 
 *Call graph*: called by 1 (filter_sensitive_write_roots); 1 external calls (join).
 
@@ -976,11 +984,11 @@ fn sandbox_bin_dir(codex_home: &Path) -> PathBuf
 fn sandbox_secrets_dir(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the directory under `CODEX_HOME` that stores sandbox secrets such as user credentials. It marks another write-protected subtree.
+**Purpose**: Returns the hidden folder under Codex home where sandbox secrets are kept. This separates secret material from ordinary workspace files.
 
-**Data flow**: Takes `codex_home: &Path`, appends `.sandbox-secrets`, and returns the `PathBuf`.
+**Data flow**: It receives the Codex home path → appends `.sandbox-secrets` → returns the resulting path.
 
-**Call relations**: It is used by secret-file path helpers and by sensitive write-root filtering.
+**Call relations**: The sandbox user file path is built from this, and the sensitive-write filter uses it to make sure sandboxed commands cannot modify stored secrets.
 
 *Call graph*: called by 2 (filter_sensitive_write_roots, sandbox_users_path); 1 external calls (join).
 
@@ -991,11 +999,11 @@ fn sandbox_secrets_dir(codex_home: &Path) -> PathBuf
 fn setup_marker_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the path to the setup marker JSON file that records completed provisioning state. The marker is used to verify setup completion and detect drift.
+**Purpose**: Builds the path to the JSON file that records whether sandbox setup is current. The marker lets later runs avoid unnecessary setup work.
 
-**Data flow**: Takes `codex_home: &Path`, calls `sandbox_dir(codex_home)`, appends `setup_marker.json`, and returns the resulting path.
+**Data flow**: It receives Codex home → asks `sandbox_dir` for the state folder → appends `setup_marker.json` → returns the file path.
 
-**Call relations**: Marker-loading code uses this helper to find the persisted setup marker under the sandbox directory.
+**Call relations**: Marker-loading code calls this when checking whether the installed sandbox setup matches the current expected version and settings.
 
 *Call graph*: calls 1 internal fn (sandbox_dir); called by 1 (load_marker).
 
@@ -1006,11 +1014,11 @@ fn setup_marker_path(codex_home: &Path) -> PathBuf
 fn sandbox_users_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Builds the path to the JSON file containing sandbox user records and encrypted passwords. It centralizes the location of persisted sandbox credentials.
+**Purpose**: Builds the path to the JSON file that stores sandbox user records. Those records include encrypted passwords for the special sandbox accounts.
 
-**Data flow**: Takes `codex_home: &Path`, calls `sandbox_secrets_dir(codex_home)`, appends `sandbox_users.json`, and returns the path.
+**Data flow**: It receives Codex home → asks `sandbox_secrets_dir` for the secrets folder → appends `sandbox_users.json` → returns the file path.
 
-**Call relations**: Credential-loading and cleanup code uses this helper whenever it needs to read or remove the sandbox users file.
+**Call relations**: User-loading and cleanup code call this when reading or removing the saved sandbox account information.
 
 *Call graph*: calls 1 internal fn (sandbox_secrets_dir); called by 4 (load_users, remove_sandbox_users_file, remove_sandbox_users_file_deletes_existing_file, remove_sandbox_users_file_ignores_missing_file).
 
@@ -1027,11 +1035,11 @@ fn run_setup_refresh(
     pro
 ```
 
-**Purpose**: Performs a non-elevating setup refresh for a permission profile when that profile is enforceable by the Windows sandbox. Unsupported profiles are silently skipped.
+**Purpose**: Refreshes sandbox setup for a normal permission profile, when that profile can be enforced by the Windows sandbox. If the profile is not one this subsystem controls, it quietly does nothing.
 
-**Data flow**: Takes a permission profile, workspace roots, command cwd, environment map, codex home, and `proxy_enforced`. It attempts to resolve permissions with `try_from_permission_profile_for_workspace_roots`; if resolution fails it returns `Ok(())`, otherwise it constructs a `SandboxSetupRequest` and passes it with default overrides to `run_setup_refresh_inner`.
+**Data flow**: It receives a permission profile, workspace roots, command folder, environment variables, Codex home, and proxy setting → converts the profile into resolved Windows sandbox permissions → if successful, builds a setup request and passes it to the inner refresh runner → returns success or a setup error.
 
-**Call relations**: This is the common refresh entry used by callers that want setup state updated opportunistically. It delegates all real payload construction and helper execution to `run_setup_refresh_inner`.
+**Call relations**: This is a public refresh entry used by higher-level code before sandboxed work. It delegates all real payload building and helper launching to `run_setup_refresh_inner`.
 
 *Call graph*: calls 2 internal fn (try_from_permission_profile_for_workspace_roots, run_setup_refresh_inner); 1 external calls (default).
 
@@ -1045,11 +1053,11 @@ fn run_setup_refresh_with_overrides(
 ) -> Result<()>
 ```
 
-**Purpose**: Runs setup refresh using an already-built request plus explicit root overrides. It is the direct override-capable wrapper around the inner refresh implementation.
+**Purpose**: Refreshes setup using an already-built request plus explicit root overrides. It is useful when a caller has a more exact read/write plan than the default permission resolver.
 
-**Data flow**: Takes `SandboxSetupRequest` and `SetupRootOverrides`, forwards both unchanged to `run_setup_refresh_inner`, and returns its result.
+**Data flow**: It receives a sandbox setup request and override settings → forwards both unchanged to the inner refresh routine → returns whatever that routine reports.
 
-**Call relations**: Credential orchestration uses this when it has already resolved permissions and computed custom root sets. It exists to bypass the profile-resolution step in `run_setup_refresh`.
+**Call relations**: Credential setup calls this path when it needs to refresh sandbox rules with custom roots, while `run_setup_refresh_inner` performs the actual helper invocation.
 
 *Call graph*: calls 1 internal fn (run_setup_refresh_inner); called by 1 (require_logon_sandbox_creds).
 
@@ -1065,11 +1073,11 @@ fn run_setup_refresh_with_extra_read_roots(
     code
 ```
 
-**Purpose**: Runs setup refresh while augmenting the computed readable roots with additional caller-supplied paths. It is used when setup needs temporary extra read access beyond the permission profile.
+**Purpose**: Refreshes setup while adding extra readable folders to the normal readable set. This is a convenience for cases where the sandbox must temporarily see additional files.
 
-**Data flow**: Takes a permission profile, workspace roots, cwd, env map, codex home, extra read roots, and `proxy_enforced`. It resolves permissions, returns `Ok(())` if unsupported, computes baseline read roots with `gather_read_roots`, extends them with `extra_read_roots`, constructs a `SandboxSetupRequest`, and calls `run_setup_refresh_inner` with overrides that set the full read-root list, disable automatic platform-default re-addition, and force an empty write-root override.
+**Data flow**: It receives the profile, workspace roots, command folder, environment, Codex home, extra read roots, and proxy flag → resolves permissions → gathers the usual read roots → appends the extras → calls the inner refresh with explicit read roots and no write roots → returns success or error.
 
-**Call relations**: This wrapper is used by callers that need a split policy for setup refresh. It delegates root gathering to `gather_read_roots` and execution to `run_setup_refresh_inner`.
+**Call relations**: This public helper feeds `run_setup_refresh_inner`. Tests verify it skips unsupported profiles instead of trying to launch setup.
 
 *Call graph*: calls 3 internal fn (try_from_permission_profile_for_workspace_roots, gather_read_roots, run_setup_refresh_inner); 1 external calls (new).
 
@@ -1083,11 +1091,11 @@ fn run_setup_refresh_inner(
 ) -> Result<()>
 ```
 
-**Purpose**: Builds a refresh payload, launches the setup helper without elevation, and translates helper failures into structured setup errors when possible. It is the core implementation behind all refresh entry points.
+**Purpose**: Builds and launches a non-elevated refresh request for the setup helper. Refreshes update sandbox rules but must not trigger a Windows administrator prompt.
 
-**Data flow**: Takes a `SandboxSetupRequest` and `SetupRootOverrides`. It first rejects non-enforceable permissions, computes `(read_roots, write_roots)` via `build_payload_roots`, computes deny lists via `build_payload_deny_read_paths` and `build_payload_deny_write_paths`, derives `SandboxNetworkIdentity` and `OfflineProxySettings`, constructs an `ElevationPayload` with `refresh_only: true`, serializes it to JSON bytes and base64, finds the helper executable with `find_setup_exe`, computes log paths, clears any stale setup error report, spawns the helper with `Command::new(...).status()` and null stdio, logs launch and failure notes, and on non-success uses `report_helper_failure` to prefer a structured `setup_error.json` report. On success it clears the error report again and returns `Ok(())`.
+**Data flow**: It receives a setup request and root overrides → checks that the requested permissions are enforceable → builds read, write, deny-read, and deny-write paths → chooses online or offline identity and proxy settings → serializes the payload to JSON and base64 → starts the setup helper without elevation → clears or reads structured error reports → returns success or a detailed error.
 
-**Call relations**: All refresh wrappers funnel into this function. It delegates root computation, proxy extraction, helper lookup, logging, and failure decoding to specialized helpers before performing the actual helper process launch.
+**Call relations**: All refresh entry points call this. It relies on path-building helpers, network identity helpers, setup-executable lookup, logging, and `report_helper_failure` when the helper exits unsuccessfully.
 
 *Call graph*: calls 11 internal fn (current_log_file_path, log_note, from_permissions, build_payload_deny_read_paths, build_payload_deny_write_paths, build_payload_roots, find_setup_exe, offline_proxy_settings_from_env, report_helper_failure, sandbox_dir (+1 more)); called by 3 (run_setup_refresh, run_setup_refresh_with_extra_read_roots, run_setup_refresh_with_overrides); 7 external calls (null, bail!, new, format!, to_vec, current_dir, var).
 
@@ -1098,11 +1106,11 @@ fn run_setup_refresh_inner(
 fn version_matches(&self) -> bool
 ```
 
-**Purpose**: Checks whether a persisted setup marker was written by the current setup schema version. It is a simple compatibility gate.
+**Purpose**: Checks whether a saved setup marker was written by the setup version this code expects. This prevents stale sandbox configuration from being trusted after setup rules change.
 
-**Data flow**: Reads `self.version`, compares it to `SETUP_VERSION`, and returns the boolean result.
+**Data flow**: It reads the marker’s stored version → compares it with `SETUP_VERSION` → returns true if they match and false otherwise.
 
-**Call relations**: Marker validation code uses this to decide whether existing setup artifacts can be reused or must be regenerated.
+**Call relations**: Marker-checking code uses this when deciding whether existing setup can be reused or must be rebuilt.
 
 
 ##### `SetupMarker::request_mismatch_reason`  (lines 286–306)
@@ -1115,11 +1123,11 @@ fn request_mismatch_reason(
     ) -> Option<String>
 ```
 
-**Purpose**: Explains whether an existing setup marker's stored offline firewall settings differ from the currently desired request. It only reports drift when the sandbox should use the offline identity.
+**Purpose**: Explains why an existing offline sandbox setup no longer matches the desired proxy firewall settings. It returns no reason when the online identity is used, because those offline firewall settings are irrelevant.
 
-**Data flow**: Takes a `SandboxNetworkIdentity` and `&OfflineProxySettings`. If the identity does not use offline mode it returns `None`. Otherwise it compares `self.proxy_ports` and `self.allow_local_binding` against the desired settings; if both match it returns `None`, else it returns a formatted string describing stored versus desired values.
+**Data flow**: It receives the chosen network identity and desired offline proxy settings → if the identity is online, returns nothing → otherwise compares stored proxy ports and local-binding permission with the desired values → returns a human-readable mismatch message only when they differ.
 
-**Call relations**: Setup drift-detection code calls this after loading a marker to decide whether a refresh is needed. It depends on `uses_offline_identity` to suppress irrelevant proxy drift for online identity.
+**Call relations**: Credential/setup readiness code can call this after loading a marker to decide whether setup must be refreshed because proxy-related firewall rules changed.
 
 *Call graph*: calls 1 internal fn (uses_offline_identity); 1 external calls (format!).
 
@@ -1130,11 +1138,11 @@ fn request_mismatch_reason(
 fn version_matches(&self) -> bool
 ```
 
-**Purpose**: Checks whether the persisted sandbox users file matches the current setup schema version. It guards reuse of stored credentials.
+**Purpose**: Checks whether the saved sandbox user records belong to the current setup format. This protects callers from using outdated account credentials.
 
-**Data flow**: Reads `self.version`, compares it to `SETUP_VERSION`, and returns a boolean.
+**Data flow**: It reads the saved user file version → compares it with `SETUP_VERSION` → returns true for a match and false otherwise.
 
-**Call relations**: Credential-loading code uses this to reject stale or incompatible sandbox user records.
+**Call relations**: User-loading code uses this after reading `sandbox_users.json` to decide whether the stored sandbox accounts are usable.
 
 
 ##### `is_elevated`  (lines 329–359)
@@ -1143,11 +1151,11 @@ fn version_matches(&self) -> bool
 fn is_elevated() -> Result<bool>
 ```
 
-**Purpose**: Determines whether the current process is running with administrator membership sufficient for elevated setup operations. It uses Windows SID APIs rather than shell heuristics.
+**Purpose**: Detects whether the current process is running with administrator rights. The setup code needs this before deciding whether to ask Windows for elevation.
 
-**Data flow**: Allocates the Administrators group SID with `AllocateAndInitializeSid`, checks current-token membership with `CheckTokenMembership`, frees the SID with `FreeSid`, and returns `Ok(true/false)` based on the membership flag. If SID allocation or membership checking fails, it returns an `anyhow` error containing the Win32 error code.
+**Data flow**: It asks Windows to create the built-in Administrators group identifier → checks whether the current process token belongs to that group → frees the Windows identifier → returns true or false, or an error if the Windows calls fail.
 
-**Call relations**: Both elevated setup entry points call this before deciding whether to require or request elevation. It delegates the actual privilege check to Win32 security APIs.
+**Call relations**: `run_elevated_setup` uses this to decide whether to launch the helper with a UAC prompt, and provisioning setup uses it to require that the caller already be elevated.
 
 *Call graph*: called by 2 (run_elevated_provisioning_setup, run_elevated_setup); 5 external calls (anyhow!, null_mut, AllocateAndInitializeSid, CheckTokenMembership, FreeSid).
 
@@ -1158,11 +1166,11 @@ fn is_elevated() -> Result<bool>
 fn canonical_existing(paths: &[PathBuf]) -> Vec<PathBuf>
 ```
 
-**Purpose**: Filters a path list down to existing paths and canonicalizes each one when possible. It normalizes root lists before they are sent to setup or used for filtering.
+**Purpose**: Keeps only paths that exist and normalizes them to their real filesystem spelling when possible. This reduces duplicate or misleading paths before they are sent to the setup helper.
 
-**Data flow**: Takes `&[PathBuf]`, iterates over each path, drops non-existent entries, canonicalizes existing ones with `dunce::canonicalize` falling back to the original path on canonicalization failure, collects the results, and returns `Vec<PathBuf>`.
+**Data flow**: It receives a list of paths → drops any path that does not exist → canonicalizes each remaining path, falling back to the original if canonicalization fails → returns the cleaned list.
 
-**Call relations**: Most root-gathering and override-processing helpers call this before deduplication or payload assembly so setup only sees concrete existing paths.
+**Call relations**: Read-root and write-root gatherers call this before building setup payloads, so the helper receives stable folder names.
 
 *Call graph*: called by 5 (build_payload_roots, effective_write_roots_for_permissions, gather_full_read_roots_for_permissions, gather_read_roots, gather_write_roots_for_permissions); 1 external calls (iter).
 
@@ -1173,11 +1181,11 @@ fn canonical_existing(paths: &[PathBuf]) -> Vec<PathBuf>
 fn profile_read_roots(user_profile: &Path) -> Vec<PathBuf>
 ```
 
-**Purpose**: Enumerates top-level readable entries under a user profile while excluding configured sensitive directories such as `.ssh` and cloud credential folders. It avoids granting broad profile-root access directly.
+**Purpose**: Turns a whole Windows user profile into a safer list of top-level readable entries. It avoids common secret folders like `.ssh`, `.aws`, and `.kube`.
 
-**Data flow**: Takes `user_profile: &Path`, attempts `std::fs::read_dir`; on failure it returns a single-element vector containing the profile root itself. On success it maps entries to `(file_name, path)`, filters out names matching `USERPROFILE_ROOT_EXCLUSIONS` case-insensitively, collects the remaining child paths, and returns them.
+**Data flow**: It receives the user profile path → tries to list its immediate children → filters out configured sensitive child names case-insensitively → returns the remaining child paths; if listing fails, it falls back to returning the profile path itself.
 
-**Call relations**: This helper is used when expanding or gathering profile-related read roots. Other filtering helpers build on its notion of which top-level profile entries are safe to expose.
+**Call relations**: Full-read gathering and user-profile expansion call this when a broad profile path needs to be split into safer pieces. Tests verify both exclusion and fallback behavior.
 
 *Call graph*: called by 4 (expand_user_profile_root_for, gather_full_read_roots_for_permissions, profile_read_roots_excludes_configured_top_level_entries, profile_read_roots_falls_back_to_profile_root_when_enumeration_fails); 2 external calls (read_dir, vec!).
 
@@ -1188,11 +1196,11 @@ fn profile_read_roots(user_profile: &Path) -> Vec<PathBuf>
 fn gather_helper_read_roots(codex_home: &Path) -> Vec<PathBuf>
 ```
 
-**Purpose**: Ensures the helper binary directory exists and returns it as a mandatory readable root. This guarantees the elevated helper can access its own support binaries.
+**Purpose**: Ensures the sandbox helper binary directory exists and includes it in readable roots. The sandbox needs to read helper tools even when user files are tightly restricted.
 
-**Data flow**: Takes `codex_home: &Path`, computes `helper_bin_dir(codex_home)`, attempts to create it with `create_dir_all`, wraps it in a one-element vector, and returns that vector.
+**Data flow**: It receives Codex home → computes the helper binary directory → creates it if needed → returns a one-item list containing that directory.
 
-**Call relations**: Both full-read and restricted-read root gathering include this helper root, and override-based payload construction preserves it explicitly.
+**Call relations**: Both normal and full read-root gathering use this, and payload building preserves it even when callers provide explicit read-root overrides.
 
 *Call graph*: calls 1 internal fn (helper_bin_dir); called by 3 (build_payload_roots, gather_full_read_roots_for_permissions, gather_read_roots); 2 external calls (create_dir_all, vec!).
 
@@ -1208,11 +1216,11 @@ fn gather_full_read_roots_for_permissions(
 ) -> Vec<PathBuf>
 ```
 
-**Purpose**: Builds the broader legacy read-root set used when the permission profile grants full-disk read access. It preserves platform defaults and writable roots as readable.
+**Purpose**: Builds the readable folder list for a policy that allows broad disk reading. It still constructs a concrete set of roots the helper can apply.
 
-**Data flow**: Takes command cwd, resolved permissions, env map, and codex home. It starts with `gather_helper_read_roots`, appends `WINDOWS_PLATFORM_DEFAULT_READ_ROOTS`, appends filtered `USERPROFILE` children if the environment variable exists, pushes `command_cwd`, appends each writable root from `permissions.writable_roots_for_cwd(command_cwd, env_map)`, canonicalizes existing paths with `canonical_existing`, and returns the result.
+**Data flow**: It receives the command folder, resolved permissions, environment, and Codex home → starts with helper and Windows platform folders → adds safe user-profile children if `USERPROFILE` is available → adds the command folder and writable roots → keeps only existing canonical paths → returns the list.
 
-**Call relations**: This function is called by `gather_read_roots` when `has_full_disk_read_access` is true. It combines helper, platform, profile, cwd, and writable-root inputs into one payload-ready list.
+**Call relations**: `gather_read_roots` calls this when permissions say full disk read access is allowed. A test checks that legacy Windows platform roots remain included.
 
 *Call graph*: calls 4 internal fn (writable_roots_for_cwd, canonical_existing, gather_helper_read_roots, profile_read_roots); called by 2 (gather_read_roots, full_read_roots_preserve_legacy_platform_defaults); 3 external calls (new, to_path_buf, var).
 
@@ -1228,11 +1236,11 @@ fn gather_read_roots(
 ) -> Vec<PathBuf>
 ```
 
-**Purpose**: Computes the readable roots that should be sent to setup for a given permission set and cwd. It switches between restricted-read and full-read behavior based on the resolved permissions.
+**Purpose**: Builds the normal readable folder list for the sandbox from the resolved permission policy. This is the main path for deciding what the sandbox can see.
 
-**Data flow**: Takes command cwd, permissions, env map, and codex home. If `permissions.has_full_disk_read_access()` is true, it returns `gather_full_read_roots_for_permissions(...)`. Otherwise it starts with `gather_helper_read_roots`, optionally appends `WINDOWS_PLATFORM_DEFAULT_READ_ROOTS` when `permissions.include_platform_defaults()` is true, appends `permissions.readable_roots_for_cwd(command_cwd)`, canonicalizes existing paths with `canonical_existing`, and returns the vector.
+**Data flow**: It receives the command folder, permissions, environment, and Codex home → if full disk read is allowed, delegates to the full-read gatherer → otherwise starts with helper roots, optionally adds Windows platform folders, adds permission-derived readable roots, canonicalizes existing paths → returns the readable roots.
 
-**Call relations**: This is the main read-root computation used by setup refresh and payload building. It delegates policy-specific queries to `ResolvedWindowsSandboxPermissions` and broad-read handling to `gather_full_read_roots_for_permissions`.
+**Call relations**: Payload building and extra-read refresh call this. Tests verify it includes the helper directory and keeps writable workspace roots readable.
 
 *Call graph*: calls 6 internal fn (has_full_disk_read_access, include_platform_defaults, readable_roots_for_cwd, canonical_existing, gather_full_read_roots_for_permissions, gather_helper_read_roots); called by 4 (build_payload_roots, run_setup_refresh_with_extra_read_roots, gather_read_roots_includes_helper_bin_dir, workspace_write_roots_remain_readable).
 
@@ -1247,11 +1255,11 @@ fn gather_write_roots_for_permissions(
 ) -> Vec<PathBuf>
 ```
 
-**Purpose**: Computes canonical, deduplicated writable roots from resolved permissions for a specific cwd and environment. It strips non-existent paths and preserves first-seen order among canonicalized roots.
+**Purpose**: Builds the initial writable folder list from the resolved permission policy. It removes duplicate paths after normalizing them.
 
-**Data flow**: Takes permissions, command cwd, and env map. It collects `root.root` from `permissions.writable_roots_for_cwd(command_cwd, env_map)`, canonicalizes existing paths with `canonical_existing`, then inserts each into a `HashSet` to deduplicate while pushing unique roots into an output vector, which it returns.
+**Data flow**: It receives permissions, command folder, and environment → asks permissions for writable roots relative to that command → canonicalizes existing paths → keeps the first occurrence of each unique path → returns the deduplicated list.
 
-**Call relations**: This helper feeds `effective_write_roots_for_permissions` when no explicit write-root override is supplied.
+**Call relations**: `effective_write_roots_for_permissions` calls this when no explicit write-root override is provided.
 
 *Call graph*: calls 2 internal fn (writable_roots_for_cwd, canonical_existing); called by 1 (effective_write_roots_for_permissions); 2 external calls (new, new).
 
@@ -1267,11 +1275,11 @@ fn effective_write_roots_for_setup(
     write_roots_override:
 ```
 
-**Purpose**: Thin wrapper that computes the final filtered write roots used by setup payload construction. It exists to give setup code a semantically named entry point.
+**Purpose**: Provides the final writable roots that should be used in a setup payload. It is a small wrapper with a name that makes the setup use case clear.
 
-**Data flow**: Takes permissions, cwd, env map, codex home, and an optional write-root override slice, forwards them to `effective_write_roots_for_permissions`, and returns the resulting vector.
+**Data flow**: It receives permissions, command folder, environment, Codex home, and optional write-root override → passes them to the shared effective-write-root routine → returns the filtered writable roots.
 
-**Call relations**: `build_payload_roots` calls this to obtain write roots before assembling the final read/write payload pair.
+**Call relations**: `build_payload_roots` calls this before pairing writable roots with readable roots.
 
 *Call graph*: calls 1 internal fn (effective_write_roots_for_permissions); called by 1 (build_payload_roots).
 
@@ -1287,11 +1295,11 @@ fn effective_write_roots_for_permissions(
     write_roots_ove
 ```
 
-**Purpose**: Applies all write-root normalization and safety filters to either caller-supplied overrides or permission-derived writable roots. It is the definitive write-root filtering pipeline.
+**Purpose**: Computes the final safe writable roots for sandbox permissions. It starts from requested writable folders, then removes broad or sensitive locations that should never be writable.
 
-**Data flow**: Takes permissions, cwd, env map, codex home, and optional override roots. It chooses roots from `canonical_existing(override)` when overrides are present or from `gather_write_roots_for_permissions` otherwise, then passes the list through `expand_user_profile_root`, `filter_user_profile_root`, `filter_user_profile_root_exclusions`, `filter_ssh_config_dependency_roots`, and finally `filter_sensitive_write_roots`, returning the filtered vector.
+**Data flow**: It receives permissions, command folder, environment, Codex home, and optional override roots → uses override roots or permission-derived roots → expands a whole user profile into child entries → removes the profile root, configured secret profile children, SSH config dependency folders, and protected Codex sandbox folders → returns the safe writable list.
 
-**Call relations**: This function is used by setup payload construction, elevated spawn preparation, capability-root derivation, and world-writable checks. It delegates each stage of normalization and exclusion to focused helpers.
+**Call relations**: Setup payload construction calls this through `effective_write_roots_for_setup`, and other sandbox-spawn code uses it when applying capability restrictions at runtime.
 
 *Call graph*: calls 7 internal fn (canonical_existing, expand_user_profile_root, filter_sensitive_write_roots, filter_ssh_config_dependency_roots, filter_user_profile_root, filter_user_profile_root_exclusions, gather_write_roots_for_permissions); called by 5 (apply_capability_denies_for_world_writable_for_permissions, run_windows_sandbox_capture_for_permission_profile, effective_write_roots_for_setup, legacy_session_capability_roots, prepare_elevated_spawn_context_for_permissions).
 
@@ -1305,11 +1313,11 @@ fn from_permissions(
     ) -> Self
 ```
 
-**Purpose**: Chooses whether the sandbox should run with the offline or online identity based on network policy and explicit proxy enforcement. Offline identity is used whenever networking is restricted or externally forced off.
+**Purpose**: Chooses whether the sandbox should use the offline or online Windows account. Offline is used when networking is disabled or when proxy enforcement is active.
 
-**Data flow**: Takes resolved permissions and `proxy_enforced: bool`. It returns `Offline` if `proxy_enforced` is true or `permissions.network_policy().is_enabled()` is false; otherwise it returns `Online`.
+**Data flow**: It receives resolved permissions and a proxy-enforced flag → checks the network policy → returns `Offline` if proxy enforcement is on or networking is disabled, otherwise returns `Online`.
 
-**Call relations**: Setup refresh, elevated setup, and credential orchestration call this before deriving firewall/proxy settings. It depends on `ResolvedWindowsSandboxPermissions::network_policy` for the policy check.
+**Call relations**: Credential setup, elevated setup, and refresh setup call this before deciding proxy firewall settings and which sandbox account should be prepared.
 
 *Call graph*: calls 1 internal fn (network_policy); called by 3 (require_logon_sandbox_creds, run_elevated_setup, run_setup_refresh_inner).
 
@@ -1320,11 +1328,11 @@ fn from_permissions(
 fn uses_offline_identity(self) -> bool
 ```
 
-**Purpose**: Reports whether a `SandboxNetworkIdentity` value represents the offline identity. It is a convenience predicate used in drift and proxy-setting logic.
+**Purpose**: Answers whether a chosen network identity is the offline sandbox account. This keeps offline-specific checks readable.
 
-**Data flow**: Matches `self` against `Self::Offline` and returns the boolean result.
+**Data flow**: It receives the identity value → checks whether it is `Offline` → returns true or false.
 
-**Call relations**: This predicate is used by `SetupMarker::request_mismatch_reason` and `offline_proxy_settings_from_env` to gate offline-only behavior.
+**Call relations**: Proxy setting extraction and setup-marker mismatch checking call this so they only care about proxy firewall rules for offline sandboxes.
 
 *Call graph*: called by 2 (request_mismatch_reason, offline_proxy_settings_from_env); 1 external calls (matches!).
 
@@ -1338,11 +1346,11 @@ fn offline_proxy_settings_from_env(
 ) -> OfflineProxySettings
 ```
 
-**Purpose**: Extracts the subset of proxy-related environment settings that matter for offline sandbox firewall configuration. It ignores proxy variables entirely when the online identity is selected.
+**Purpose**: Extracts the proxy firewall settings needed for an offline sandbox. If the sandbox is online, it intentionally ignores proxy environment variables.
 
-**Data flow**: Takes `env_map` and a `SandboxNetworkIdentity`. If `uses_offline_identity()` is false, it returns `OfflineProxySettings { proxy_ports: vec![], allow_local_binding: false }`. Otherwise it computes `proxy_ports` with `proxy_ports_from_env(env_map)` and sets `allow_local_binding` when `CODEX_NETWORK_ALLOW_LOCAL_BINDING` exists in the map with value `"1"`.
+**Data flow**: It receives environment variables and the chosen network identity → if not offline, returns no ports and no local binding → if offline, parses loopback proxy ports and reads `CODEX_NETWORK_ALLOW_LOCAL_BINDING=1` → returns those settings.
 
-**Call relations**: Setup payload builders call this after choosing network identity so the helper can configure firewall exceptions only when needed.
+**Call relations**: Credential setup, elevated setup, and refresh setup call this when preparing payloads or comparing existing setup.
 
 *Call graph*: calls 2 internal fn (uses_offline_identity, proxy_ports_from_env); called by 3 (require_logon_sandbox_creds, run_elevated_setup, run_setup_refresh_inner); 1 external calls (vec!).
 
@@ -1353,11 +1361,11 @@ fn offline_proxy_settings_from_env(
 fn proxy_ports_from_env(env_map: &HashMap<String, String>) -> Vec<u16>
 ```
 
-**Purpose**: Parses loopback proxy ports from a fixed set of proxy environment variables and returns them sorted and deduplicated. It ignores non-loopback proxies and malformed values.
+**Purpose**: Finds local proxy ports mentioned in common proxy environment variables. Sorting and deduplication make the resulting firewall request stable.
 
-**Data flow**: Takes `env_map`, iterates over `PROXY_ENV_KEYS`, looks up each key, passes any value to `loopback_proxy_port_from_url`, inserts successful ports into a `BTreeSet`, then collects the set into a sorted `Vec<u16>`.
+**Data flow**: It receives an environment map → checks known proxy variable names → parses each value for a loopback proxy port → stores ports in sorted set order → returns a sorted list of unique ports.
 
-**Call relations**: This helper is only used by `offline_proxy_settings_from_env` to derive firewall allowlist ports from environment variables.
+**Call relations**: `offline_proxy_settings_from_env` calls this only for offline sandbox identity. Tests cover duplicate and mixed-case proxy variables.
 
 *Call graph*: calls 1 internal fn (loopback_proxy_port_from_url); called by 1 (offline_proxy_settings_from_env); 1 external calls (new).
 
@@ -1368,11 +1376,11 @@ fn proxy_ports_from_env(env_map: &HashMap<String, String>) -> Vec<u16>
 fn loopback_proxy_port_from_url(url: &str) -> Option<u16>
 ```
 
-**Purpose**: Extracts a nonzero port from a proxy URL only when the host is a recognized loopback address. It supports `localhost`, `127.0.0.1`, and IPv6 `::1` forms, including credentials in the authority.
+**Purpose**: Parses a proxy URL and returns its port only if it points to the local machine. This avoids opening firewall paths for remote proxy hosts.
 
-**Data flow**: Takes `url: &str`, trims it, splits on `://` to isolate the authority, strips any path and optional `user@` prefix, then parses either bracketed IPv6 `[::1]:port` or host:port. It returns `Some(port)` only for loopback hosts with a nonzero `u16` port; otherwise it returns `None`.
+**Data flow**: It receives a URL string → extracts the authority part after `://` → strips optional user credentials → accepts `localhost`, `127.0.0.1`, or IPv6 `::1` → parses a nonzero port → returns that port or nothing.
 
-**Call relations**: `proxy_ports_from_env` calls this for each proxy variable value to decide whether that variable contributes a firewall allowlist port.
+**Call relations**: `proxy_ports_from_env` calls this for each proxy environment value. Tests check common valid forms and rejected non-loopback or malformed values.
 
 *Call graph*: called by 1 (proxy_ports_from_env).
 
@@ -1383,11 +1391,11 @@ fn loopback_proxy_port_from_url(url: &str) -> Option<u16>
 fn quote_arg(arg: &str) -> String
 ```
 
-**Purpose**: Quotes a single command-line argument using Windows escaping rules suitable for passing a base64 payload through `ShellExecuteExW`. It preserves literal backslashes and embedded quotes correctly.
+**Purpose**: Quotes a command-line argument using Windows command-line escaping rules. This is needed so the base64 payload is passed to the helper as one exact argument.
 
-**Data flow**: Takes `arg: &str`, returns it unchanged if no quoting is needed, otherwise builds a quoted string by scanning characters, counting backslashes, doubling them before quotes or at the end, escaping embedded quotes, and surrounding the result with double quotes.
+**Data flow**: It receives an argument string → if no quoting is needed, returns it unchanged → otherwise wraps it in quotes and escapes backslashes and quotation marks correctly → returns the safe command-line text.
 
-**Call relations**: `run_setup_exe` uses this when constructing the elevated helper's parameter string for `ShellExecuteExW`.
+**Call relations**: `run_setup_exe` uses this when launching the elevated helper through Windows ShellExecute, which expects parameters as a single string.
 
 *Call graph*: called by 1 (run_setup_exe); 1 external calls (from).
 
@@ -1398,11 +1406,11 @@ fn quote_arg(arg: &str) -> String
 fn find_setup_exe() -> PathBuf
 ```
 
-**Purpose**: Locates the setup helper executable, preferring a packaged resource adjacent to the current executable and falling back to a bare filename. It abstracts deployment layout differences.
+**Purpose**: Locates the setup helper executable. It first looks beside the current packaged executable, then falls back to a plain filename.
 
-**Data flow**: Attempts `std::env::current_exe()`, passes that path to `find_setup_exe_for_current_exe`, and if a packaged helper is found returns it; otherwise it returns `PathBuf::from(SETUP_EXE_FILENAME)`.
+**Data flow**: It asks the operating system for the current executable path → tries to resolve the bundled setup helper near it → if found, returns that path → otherwise returns `codex-windows-sandbox-setup.exe`.
 
-**Call relations**: Both refresh and elevated helper launch paths call this before spawning the setup helper. It delegates package-relative lookup to `find_setup_exe_for_current_exe`.
+**Call relations**: Both refresh and full setup use this before launching the helper. It delegates package-layout knowledge to `find_setup_exe_for_current_exe`.
 
 *Call graph*: calls 1 internal fn (find_setup_exe_for_current_exe); called by 2 (run_setup_exe, run_setup_refresh_inner); 2 external calls (from, current_exe).
 
@@ -1413,11 +1421,11 @@ fn find_setup_exe() -> PathBuf
 fn find_setup_exe_for_current_exe(exe: &Path) -> Option<PathBuf>
 ```
 
-**Purpose**: Resolves the setup helper path relative to the current executable's packaged layout. It encapsulates the resource-directory lookup policy.
+**Purpose**: Looks up the setup helper relative to a known current executable path. This supports packaged installs where helper binaries live in a resources directory.
 
-**Data flow**: Takes `exe: &Path`, calls `bundled_executable_path_for_exe(exe, SETUP_EXE_FILENAME)`, and returns the resulting `Option<PathBuf>`.
+**Data flow**: It receives an executable path → asks the helper-materialization module for the bundled path to `codex-windows-sandbox-setup.exe` → returns that path if it exists according to that lookup.
 
-**Call relations**: This helper is used by `find_setup_exe` and directly by a test that verifies package resource lookup.
+**Call relations**: `find_setup_exe` calls this in normal operation, and a test verifies the expected package resource layout.
 
 *Call graph*: calls 1 internal fn (bundled_executable_path_for_exe); called by 2 (find_setup_exe, setup_exe_lookup_checks_package_resource_dir_for_bin_exe).
 
@@ -1432,11 +1440,11 @@ fn report_helper_failure(
 ) -> anyhow::Error
 ```
 
-**Purpose**: Converts a helper process failure into the most informative structured error available, preferring a freshly written `setup_error.json` report when safe to trust it. It is the bridge between helper exit status and orchestrator-facing errors.
+**Purpose**: Turns a failed setup-helper exit into a useful structured error. If the helper wrote a fresh error report, this function prefers that detailed report.
 
-**Data flow**: Takes `codex_home`, a `cleared_report` flag, and an optional exit code. It formats a generic exit-detail string. If `cleared_report` is false, it immediately returns `failure(OrchestratorHelperExitNonzero, exit_detail)`. Otherwise it calls `read_setup_error_report(codex_home)` and returns either `anyhow::Error::new(SetupFailure::from_report(report))`, a generic nonzero-exit failure when no report exists, or a report-read failure when reading the report itself fails.
+**Data flow**: It receives Codex home, whether the old report was cleared before launch, and the helper exit code → if clearing failed, returns a generic nonzero-exit error to avoid trusting stale data → otherwise reads `setup_error.json` → returns the helper’s reported failure, a generic exit failure, or a report-read failure.
 
-**Call relations**: Both `run_setup_refresh_inner` and `run_setup_exe` call this after a helper exits unsuccessfully. It delegates report parsing to `read_setup_error_report` and structured error construction to `SetupFailure::from_report`/`failure`.
+**Call relations**: Refresh setup and full setup call this whenever the helper exits unsuccessfully. Tests verify both fresh-report and stale-report behavior.
 
 *Call graph*: calls 3 internal fn (from_report, failure, read_setup_error_report); called by 2 (run_setup_exe, run_setup_refresh_inner); 2 external calls (new, format!).
 
@@ -1447,11 +1455,11 @@ fn report_helper_failure(
 fn verify_setup_completed(codex_home: &Path) -> Result<()>
 ```
 
-**Purpose**: Checks that the helper actually produced the expected setup artifacts after reporting success. It guards against false-positive helper exits.
+**Purpose**: Checks that a supposedly successful helper run actually left the expected setup artifacts behind. This catches silent or partial helper failures.
 
-**Data flow**: Takes `codex_home`, calls `sandbox_setup_is_complete(codex_home)`, returns `Ok(())` if true, otherwise returns `failure(OrchestratorHelperIncomplete, ...)`.
+**Data flow**: It receives Codex home → asks identity/setup code whether sandbox setup is complete → returns success if complete, otherwise returns a structured incomplete-setup error.
 
-**Call relations**: `run_setup_exe` calls this after both elevated and non-elevated helper execution paths succeed at the process level.
+**Call relations**: `run_setup_exe` calls this after helper success. A test confirms missing artifacts are treated as failure.
 
 *Call graph*: calls 2 internal fn (sandbox_setup_is_complete, failure); called by 2 (run_setup_exe, setup_completion_requires_ready_artifacts).
 
@@ -1466,11 +1474,11 @@ fn run_setup_exe(
 ) -> Result<()>
 ```
 
-**Purpose**: Launches the setup helper either directly or via UAC elevation, waits for completion, and validates the resulting setup state. It is the shared helper-execution engine for full setup and provisioning-only setup.
+**Purpose**: Launches the setup helper with the prepared payload, either normally or through Windows administrator elevation. It waits for the helper and validates that setup really completed.
 
-**Data flow**: Takes an `ElevationPayload`, `needs_elevation`, and `codex_home`. It serializes the payload to JSON, base64-encodes it, clears any stale setup error report, and branches: if `needs_elevation` is false, it spawns the helper with `Command`, hidden window flags, and null stdio, checks exit status, calls `report_helper_failure` on nonzero exit, verifies setup completion, clears the error report, and returns. If `needs_elevation` is true, it converts the exe path, quoted payload, and `runas` verb to UTF-16, fills `SHELLEXECUTEINFOW` with `SEE_MASK_NOCLOSEPROCESS`, calls `ShellExecuteExW`, maps `ERROR_CANCELLED` specially, waits for the process with `WaitForSingleObject`, reads the exit code with `GetExitCodeProcess`, closes the process handle, reports helper failure on nonzero exit, verifies setup completion, clears the error report, and returns `Ok(())` on success.
+**Data flow**: It receives a payload, a flag saying whether elevation is needed, and Codex home → serializes and base64-encodes the payload → clears old error reports → if no elevation is needed, runs the helper hidden as a child process → if elevation is needed, uses Windows ShellExecute with the `runas` verb and waits for that process → on nonzero exit, reads helper error details → on zero exit, verifies setup completion and clears reports → returns success or a structured error.
 
-**Call relations**: This function is called by `run_elevated_setup` and `run_elevated_provisioning_setup`. It delegates helper lookup, argument quoting, report clearing, failure decoding, and completion verification to dedicated helpers.
+**Call relations**: `run_elevated_setup` and provisioning setup call this after building their payloads. It uses executable lookup, argument quoting, logging, helper-failure reporting, and completion verification.
 
 *Call graph*: calls 9 internal fn (log_note, find_setup_exe, quote_arg, report_helper_failure, sandbox_dir, verify_setup_completed, clear_setup_error_report, failure, to_wide); called by 2 (run_elevated_provisioning_setup, run_elevated_setup); 7 external calls (null, new, format!, to_string, zeroed, CloseHandle, GetLastError).
 
@@ -1484,11 +1492,11 @@ fn run_elevated_setup(
 ) -> Result<()>
 ```
 
-**Purpose**: Builds a full setup payload from resolved permissions and launches the setup helper, requesting elevation only when the current process is not already elevated. It is the main full-provisioning entry point.
+**Purpose**: Performs the full sandbox setup path for normal use. It builds the complete setup payload and asks for administrator elevation only if the current process does not already have it.
 
-**Data flow**: Takes a `SandboxSetupRequest` and `SetupRootOverrides`. It rejects unenforceable permissions, ensures `sandbox_dir(codex_home)` exists, computes read/write roots and deny lists via `build_payload_roots`, `build_payload_deny_read_paths`, and `build_payload_deny_write_paths`, derives network identity and offline proxy settings, constructs an `ElevationPayload` with telemetry settings and `refresh_only: false`, determines `needs_elevation` by negating `is_elevated()`, and passes the payload to `run_setup_exe`.
+**Data flow**: It receives a setup request and root overrides → checks permission enforceability → creates the sandbox state directory → builds read/write and deny paths → chooses network identity and offline proxy settings → fills an elevation payload with account names, folders, telemetry settings, and user name → checks current elevation → launches the setup helper through `run_setup_exe` → returns success or error.
 
-**Call relations**: Credential orchestration calls this when full setup may be required. It delegates all root and proxy computation to helpers and all process-launch behavior to `run_setup_exe`.
+**Call relations**: Higher-level credential/setup code calls this when the machine needs full sandbox preparation. It combines most helpers in this file into one setup operation.
 
 *Call graph*: calls 8 internal fn (from_permissions, build_payload_deny_read_paths, build_payload_deny_write_paths, build_payload_roots, is_elevated, offline_proxy_settings_from_env, run_setup_exe, sandbox_dir); called by 1 (require_logon_sandbox_creds); 4 external calls (bail!, global_statsig_metrics_settings, var, create_dir_all).
 
@@ -1499,11 +1507,11 @@ fn run_elevated_setup(
 fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Result<()>
 ```
 
-**Purpose**: Runs a provisioning-only setup flow that creates sandbox users and related baseline state without filesystem root payloads. It requires the caller to already be elevated.
+**Purpose**: Runs a provisioning-only setup mode for pre-creating sandbox resources. Unlike normal setup, it requires the caller to already be running as administrator.
 
-**Data flow**: Takes `codex_home` and `real_user`. It ensures `sandbox_dir(codex_home)` exists, checks `is_elevated()` and returns `OrchestratorElevationRequired` if false, constructs an `ElevationPayload` with empty read/write/deny roots, empty proxy settings, telemetry settings, `mode: ProvisionOnly`, and `refresh_only: false`, then calls `run_setup_exe` with `needs_elevation` forced to false.
+**Data flow**: It receives Codex home and the real user name → creates the sandbox directory → checks administrator status → if not elevated, returns an elevation-required error → builds a minimal provisioning payload with no read/write roots → runs the helper without requesting elevation → returns success or error.
 
-**Call relations**: This entry point is used for provisioning-only scenarios where elevation must already be present. It shares helper execution with `run_setup_exe` but bypasses permission-derived root computation.
+**Call relations**: This is a specialized entry point for provisioning flows. It shares the same helper launcher as full setup but uses `SetupMode::ProvisionOnly`.
 
 *Call graph*: calls 4 internal fn (is_elevated, run_setup_exe, sandbox_dir, failure); 4 external calls (to_path_buf, new, global_statsig_metrics_settings, create_dir_all).
 
@@ -1517,11 +1525,11 @@ fn build_payload_roots(
 ) -> (Vec<PathBuf>, Vec<PathBuf>)
 ```
 
-**Purpose**: Computes the final read-root and write-root lists sent to the setup helper, applying overrides and all profile/user-profile/sensitive-path filtering. It is the central payload root assembler.
+**Purpose**: Builds the read and write root lists that go into the setup-helper payload. It also makes sure a folder is not redundantly listed as read-only when it is already writable.
 
-**Data flow**: Takes a `SandboxSetupRequest` and `SetupRootOverrides`. It computes `write_roots` via `effective_write_roots_for_setup`. For read roots, if an explicit override exists it starts from `gather_helper_read_roots`, optionally adds platform defaults depending on `read_roots_include_platform_defaults`, extends with the override list, and canonicalizes existing paths; otherwise it calls `gather_read_roots`. It then passes read roots through `expand_user_profile_root`, `filter_user_profile_root`, `filter_user_profile_root_exclusions`, and `filter_ssh_config_dependency_roots`, removes any read root that is also present in the write-root set, and returns `(read_roots, write_roots)`.
+**Data flow**: It receives a setup request and overrides → computes final write roots → uses explicit read roots if supplied, while still preserving helper and optional platform roots, or gathers reads from permissions otherwise → expands and filters user-profile paths and SSH-related sensitive paths → removes any read root that is also a write root → returns `(read_roots, write_roots)`.
 
-**Call relations**: Both refresh and elevated setup payload builders call this before constructing `ElevationPayload`. It delegates write-root computation and each filtering stage to specialized helpers.
+**Call relations**: Both refresh and elevated setup call this before creating payloads. Several tests confirm override behavior and matching with effective write roots.
 
 *Call graph*: calls 8 internal fn (canonical_existing, effective_write_roots_for_setup, expand_user_profile_root, filter_ssh_config_dependency_roots, filter_user_profile_root, filter_user_profile_root_exclusions, gather_helper_read_roots, gather_read_roots); called by 5 (run_elevated_setup, run_setup_refresh_inner, build_payload_roots_preserves_helper_roots_when_read_override_is_provided, build_payload_roots_replaces_full_read_policy_when_read_override_is_provided, effective_write_roots_match_payload_filtering_for_overrides).
 
@@ -1535,11 +1543,11 @@ fn build_payload_deny_write_paths(
 ) -> Vec<PathBuf>
 ```
 
-**Purpose**: Combines explicit deny-write paths with deny paths derived from permission-based allow/deny computation. It ensures setup receives both caller carveouts and policy-protected children.
+**Purpose**: Builds the list of paths that must not be writable even inside otherwise writable roots. This protects nested sensitive folders such as repository metadata or Codex control folders.
 
-**Data flow**: Takes a `SandboxSetupRequest` and optional explicit deny-write paths. It computes `AllowDenyPaths` with `compute_allow_paths_for_permissions`, canonicalizes each explicit deny path with `canonicalize_path`, extends that vector with the computed `allow_deny_paths.deny` set, and returns the combined `Vec<PathBuf>`.
+**Data flow**: It receives the setup request and optional explicit deny-write paths → computes deny paths implied by the permission policy → canonicalizes explicit deny paths → appends policy deny paths → returns the combined list.
 
-**Call relations**: Refresh and elevated setup both call this when building helper payloads. It delegates policy-derived deny computation to `compute_allow_paths_for_permissions`.
+**Call relations**: Refresh and elevated setup include this list in the helper payload so the helper can apply more precise write blocks.
 
 *Call graph*: calls 1 internal fn (compute_allow_paths_for_permissions); called by 2 (run_elevated_setup, run_setup_refresh_inner).
 
@@ -1550,11 +1558,11 @@ fn build_payload_deny_write_paths(
 fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Returns the explicit deny-read paths exactly as configured, without canonicalization. This preserves lexical spellings so the ACL layer can reason about reparse-point aliases.
+**Purpose**: Builds the list of paths that must not be readable. It preserves the caller’s spelling instead of canonicalizing, because the access-control layer may need both visible and resolved path forms.
 
-**Data flow**: Takes `Option<Vec<PathBuf>>`, unwraps it to an empty vector when absent, and returns the resulting vector unchanged.
+**Data flow**: It receives optional explicit deny-read paths → returns that list or an empty list if none was provided.
 
-**Call relations**: Both setup payload builders call this for deny-read paths. Unlike deny-write handling, it intentionally performs no additional computation.
+**Call relations**: Refresh and elevated setup pass this directly into the setup payload. A test confirms explicit paths, including missing future paths, are preserved.
 
 *Call graph*: called by 2 (run_elevated_setup, run_setup_refresh_inner).
 
@@ -1565,11 +1573,11 @@ fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>)
 fn expand_user_profile_root(roots: Vec<PathBuf>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Expands any root equal to the current `USERPROFILE` into its top-level children. It avoids granting broad profile-root access directly when a more granular expansion is possible.
+**Purpose**: Replaces a whole `USERPROFILE` root with its top-level children when possible. This avoids granting broad access to sensitive profile folders by accident.
 
-**Data flow**: Takes `roots: Vec<PathBuf>`, reads `USERPROFILE` from the environment, and if present calls `expand_user_profile_root_for(roots, Path::new(&user_profile))`; otherwise it returns the input roots unchanged.
+**Data flow**: It receives a root list → reads the `USERPROFILE` environment variable → if unavailable, returns the list unchanged → otherwise delegates to `expand_user_profile_root_for` → returns the expanded list.
 
-**Call relations**: Both read-root and write-root filtering pipelines call this before removing the profile root itself.
+**Call relations**: Payload root building and effective write-root calculation call this before later filters remove secret profile children.
 
 *Call graph*: calls 1 internal fn (expand_user_profile_root_for); called by 2 (build_payload_roots, effective_write_roots_for_permissions); 2 external calls (new, var).
 
@@ -1580,11 +1588,11 @@ fn expand_user_profile_root(roots: Vec<PathBuf>) -> Vec<PathBuf>
 fn expand_user_profile_root_for(roots: Vec<PathBuf>, user_profile: &Path) -> Vec<PathBuf>
 ```
 
-**Purpose**: Replaces any root matching a specific user-profile path with the profile's readable child entries, then deduplicates by canonical path key. It is the testable core of profile-root expansion.
+**Purpose**: Performs user-profile expansion for a specific profile path. This makes the behavior testable without relying on the process environment.
 
-**Data flow**: Takes `roots` and `user_profile`. It computes the canonical key for the profile, iterates over roots, replacing any root whose canonical key matches the profile key with `profile_read_roots(user_profile)` and leaving others unchanged, then sorts by canonical key and deduplicates adjacent entries with the same canonical key before returning the expanded vector.
+**Data flow**: It receives roots and a user profile path → compares paths using canonical path keys → replaces any root equal to the profile with the profile’s top-level entries → sorts and deduplicates by canonical key → returns the expanded roots.
 
-**Call relations**: This helper is called by `expand_user_profile_root` and directly by tests. It delegates child enumeration to `profile_read_roots`.
+**Call relations**: `expand_user_profile_root` calls this in production, and tests call it directly to verify profile-root replacement.
 
 *Call graph*: calls 2 internal fn (canonical_path_key, profile_read_roots); called by 1 (expand_user_profile_root); 1 external calls (new).
 
@@ -1595,11 +1603,11 @@ fn expand_user_profile_root_for(roots: Vec<PathBuf>, user_profile: &Path) -> Vec
 fn filter_user_profile_root(mut roots: Vec<PathBuf>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Removes any root equal to the current `USERPROFILE` itself. It is used after expansion so payloads contain children rather than the broad profile root.
+**Purpose**: Removes the whole user profile root from a root list. The setup code prefers individual profile children so sensitive top-level folders can be excluded.
 
-**Data flow**: Takes `roots: Vec<PathBuf>`, reads `USERPROFILE`, computes its canonical key, retains only roots whose canonical key differs from that profile key, and returns the filtered vector. If `USERPROFILE` is unavailable, it returns the input unchanged.
+**Data flow**: It receives roots → reads `USERPROFILE` → if unavailable, returns roots unchanged → otherwise computes the profile’s canonical key and removes exact matches → returns the filtered list.
 
-**Call relations**: Both read-root and write-root pipelines call this after profile-root expansion.
+**Call relations**: Both read-root payload construction and effective write-root calculation call this after expansion as a safety net.
 
 *Call graph*: calls 1 internal fn (canonical_path_key); called by 2 (build_payload_roots, effective_write_roots_for_permissions); 2 external calls (new, var).
 
@@ -1610,11 +1618,11 @@ fn filter_user_profile_root(mut roots: Vec<PathBuf>) -> Vec<PathBuf>
 fn filter_user_profile_root_exclusions(mut roots: Vec<PathBuf>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Removes roots that fall under configured sensitive top-level user-profile exclusions such as `.ssh`, `.aws`, and `.docker`. It prevents setup payloads from granting access to known secret-bearing directories.
+**Purpose**: Removes roots that live under configured sensitive user-profile folders. Examples include SSH, cloud, Kubernetes, Docker, and package-manager credential directories.
 
-**Data flow**: Takes `roots: Vec<PathBuf>`, reads `USERPROFILE`, and retains only roots for which `is_user_profile_root_exclusion(root, user_profile)` is false. If `USERPROFILE` is unavailable, it returns the input unchanged.
+**Data flow**: It receives roots → reads `USERPROFILE` → if unavailable, returns roots unchanged → otherwise removes any path identified by `is_user_profile_root_exclusion` → returns the filtered list.
 
-**Call relations**: This helper is part of both read-root and write-root filtering pipelines and delegates the actual exclusion test to `is_user_profile_root_exclusion`.
+**Call relations**: Read and write root preparation call this to prevent broad profile permissions from exposing credential folders.
 
 *Call graph*: called by 2 (build_payload_roots, effective_write_roots_for_permissions); 2 external calls (new, var).
 
@@ -1625,11 +1633,11 @@ fn filter_user_profile_root_exclusions(mut roots: Vec<PathBuf>) -> Vec<PathBuf>
 fn is_user_profile_root_exclusion(root: &Path, user_profile: &Path) -> bool
 ```
 
-**Purpose**: Checks whether a path lies under the current user profile and its first child segment matches one of the configured excluded top-level names. It performs the case-insensitive exclusion test used by profile filtering.
+**Purpose**: Checks whether a path is inside one of the configured sensitive top-level user-profile folders. It is the yes/no test behind profile exclusion filtering.
 
-**Data flow**: Takes `root` and `user_profile`, computes canonical path keys for both, derives the profile prefix, strips that prefix from the root key, extracts the first non-empty child segment, and returns true if that child matches any entry in `USERPROFILE_ROOT_EXCLUSIONS` case-insensitively.
+**Data flow**: It receives a candidate root and user profile path → converts both to comparable canonical keys → finds the first child name under the profile → compares it case-insensitively with the exclusion list → returns true if it should be blocked.
 
-**Call relations**: This predicate is used by `filter_user_profile_root_exclusions` and directly by tests that validate exclusion behavior.
+**Call relations**: The profile exclusion filter uses this logic, and tests call it directly to confirm that folders like `.ssh` and `.tsh` are blocked while ordinary folders are not.
 
 *Call graph*: calls 1 internal fn (canonical_path_key); 1 external calls (format!).
 
@@ -1640,11 +1648,11 @@ fn is_user_profile_root_exclusion(root: &Path, user_profile: &Path) -> bool
 fn filter_ssh_config_dependency_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Removes roots that correspond to files or directories referenced by SSH config under the user profile. It prevents writable or readable payload roots from accidentally exposing SSH keys and included config trees.
+**Purpose**: Removes roots that are referenced by SSH configuration, such as included config files or identity key locations. This prevents sandbox access to SSH secrets even when they sit outside `.ssh`.
 
-**Data flow**: Takes `roots: Vec<PathBuf>`, reads `USERPROFILE`, computes dependency paths with `ssh_config_dependency_paths(user_profile)`, retains only roots for which `is_ssh_config_dependency_root(root, user_profile, &dependency_paths)` is false, and returns the filtered vector. If `USERPROFILE` is unavailable, it returns the input unchanged.
+**Data flow**: It receives roots → reads `USERPROFILE` → if unavailable, returns roots unchanged → gathers SSH config dependency paths → removes any root whose top-level profile child matches a dependency’s top-level child → returns the filtered list.
 
-**Call relations**: Both read-root and write-root filtering pipelines call this after profile-root filtering. It delegates dependency discovery to `ssh_config_dependency_paths` and matching to `is_ssh_config_dependency_root`.
+**Call relations**: Read and write root preparation call this after general profile exclusions. It uses SSH dependency discovery from another module.
 
 *Call graph*: calls 1 internal fn (ssh_config_dependency_paths); called by 2 (build_payload_roots, effective_write_roots_for_permissions); 2 external calls (new, var).
 
@@ -1659,11 +1667,11 @@ fn is_ssh_config_dependency_root(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a root shares the same top-level user-profile child as any SSH config dependency path. This broad child-name comparison lets the filter block entire sensitive roots, not just exact files.
+**Purpose**: Checks whether a root corresponds to a top-level user-profile child used by SSH configuration dependencies. This catches paths related to keys or included config files.
 
-**Data flow**: Takes `root`, `user_profile`, and a slice of dependency paths. It derives the root's top-level child name with `user_profile_child_name`; if absent it returns false. Otherwise it returns true when any dependency path yields the same child name case-insensitively.
+**Data flow**: It receives a root, user profile, and dependency paths → extracts the root’s first child under the profile → compares it with each dependency’s first child under the profile → returns true if any match case-insensitively.
 
-**Call relations**: This predicate is used by `filter_ssh_config_dependency_roots` and directly by tests. It relies on `user_profile_child_name` for normalized child extraction.
+**Call relations**: `filter_ssh_config_dependency_roots` uses this predicate while trimming root lists. Tests call it directly with synthetic SSH config dependencies.
 
 *Call graph*: calls 1 internal fn (user_profile_child_name); 1 external calls (iter).
 
@@ -1674,11 +1682,11 @@ fn is_ssh_config_dependency_root(
 fn user_profile_child_name(path: &Path, user_profile: &Path) -> Option<String>
 ```
 
-**Purpose**: Extracts the first path segment under the user profile from a given path, using canonical path keys. It is a normalization helper for profile-relative filtering.
+**Purpose**: Extracts the first path segment under a user profile. For example, it turns a path under `C:\Users\me\.keys\id` into `.keys`.
 
-**Data flow**: Takes `path` and `user_profile`, computes canonical keys, strips the profile prefix from the path key, splits the remainder on `/`, returns the first non-empty segment as `Some(String)`, or `None` if the path is not under the profile.
+**Data flow**: It receives a path and user profile → canonicalizes both into comparable string keys → removes the profile prefix from the path → returns the first non-empty child segment, or nothing if the path is outside the profile.
 
-**Call relations**: This helper is only used by `is_ssh_config_dependency_root` to compare roots and dependency paths at the top-level child granularity.
+**Call relations**: `is_ssh_config_dependency_root` uses this for both candidate roots and dependency paths so it can compare top-level profile children.
 
 *Call graph*: calls 1 internal fn (canonical_path_key); called by 1 (is_ssh_config_dependency_root); 1 external calls (format!).
 
@@ -1689,11 +1697,11 @@ fn user_profile_child_name(path: &Path, user_profile: &Path) -> Option<String>
 fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> Vec<PathBuf>
 ```
 
-**Purpose**: Removes write roots that would grant capability write access to `CODEX_HOME` itself or any sandbox control subdirectory. It enforces tamper resistance for sandbox state and helper binaries.
+**Purpose**: Removes Codex-controlled folders from writable roots. This stops sandboxed commands from tampering with sandbox state, helper binaries, or stored secrets.
 
-**Data flow**: Takes `roots: Vec<PathBuf>` and `codex_home`. It computes canonical keys and prefixes for `codex_home`, `sandbox_dir(codex_home)`, `sandbox_bin_dir(codex_home)`, and `sandbox_secrets_dir(codex_home)`, then retains only roots whose canonical key is not equal to or nested under any of those protected locations. It returns the filtered vector.
+**Data flow**: It receives writable roots and Codex home → computes canonical keys for Codex home, `.sandbox`, `.sandbox-bin`, and `.sandbox-secrets` plus their descendants → removes any root equal to or inside those protected areas → returns the remaining roots.
 
-**Call relations**: This is the final stage of `effective_write_roots_for_permissions`. Tests also call it directly to verify that expanded profile roots still cannot include protected Codex directories.
+**Call relations**: `effective_write_roots_for_permissions` calls this as the final safety filter. It depends on the path helpers for the protected folder locations.
 
 *Call graph*: calls 4 internal fn (canonical_path_key, sandbox_bin_dir, sandbox_dir, sandbox_secrets_dir); called by 1 (effective_write_roots_for_permissions); 1 external calls (format!).
 
@@ -1704,11 +1712,11 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
 fn canonical_windows_platform_default_roots() -> Vec<PathBuf>
 ```
 
-**Purpose**: Builds the canonicalized form of the hard-coded Windows platform default read roots for assertions. It keeps tests independent of path spelling differences.
+**Purpose**: Builds the normalized version of the default Windows read roots for assertions. It keeps tests consistent with production canonicalization.
 
-**Data flow**: Iterates over `WINDOWS_PLATFORM_DEFAULT_READ_ROOTS`, canonicalizes each path when possible, falls back to `PathBuf::from(path)` otherwise, collects the results, and returns them.
+**Data flow**: It reads the constant list of platform roots → canonicalizes each when possible → returns the resulting vector.
 
-**Call relations**: Several tests use this helper when asserting whether platform defaults were included or excluded from computed read roots.
+**Call relations**: Several tests use this helper when checking whether platform roots are present or absent in generated read-root lists.
 
 
 ##### `tests::setup_completion_requires_ready_artifacts`  (lines 1134–1143)
@@ -1717,11 +1725,11 @@ fn canonical_windows_platform_default_roots() -> Vec<PathBuf>
 fn setup_completion_requires_ready_artifacts()
 ```
 
-**Purpose**: Verifies that helper success is not enough unless the expected setup artifacts actually exist. It checks the failure code returned by `verify_setup_completed`.
+**Purpose**: Checks that setup is not considered complete when required artifacts are missing. This protects against false success after a helper run.
 
-**Data flow**: Creates a temporary codex home, calls `verify_setup_completed`, captures the error, extracts the structured failure, and asserts the code is `OrchestratorHelperIncomplete`.
+**Data flow**: It creates a temporary Codex home → calls `verify_setup_completed` → expects an error → checks that the error code is the incomplete-setup code.
 
-**Call relations**: This test directly exercises the post-helper validation guard in `verify_setup_completed`.
+**Call relations**: This test exercises the same completion check that `run_setup_exe` uses after the helper exits successfully.
 
 *Call graph*: calls 1 internal fn (verify_setup_completed); 2 external calls (new, assert_eq!).
 
@@ -1735,11 +1743,11 @@ fn permissions_for(
     ) -> ResolvedWindowsSandboxPermissions
 ```
 
-**Purpose**: Resolves a permission profile with workspace roots for use in setup tests. It is a small test-only convenience wrapper.
+**Purpose**: Creates resolved Windows sandbox permissions for tests. It hides the conversion boilerplate so each test can focus on root behavior.
 
-**Data flow**: Takes a permission profile and workspace roots, calls `ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots`, unwraps success with `expect`, and returns the resolved permissions.
+**Data flow**: It receives a permission profile and workspace roots → converts them with the production resolver → returns the resolved permissions or fails the test.
 
-**Call relations**: Many setup tests use this helper before calling root-gathering or payload-building functions.
+**Call relations**: Many root-building tests call this before invoking read/write root functions.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots).
 
@@ -1750,11 +1758,11 @@ fn permissions_for(
 fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Creates a one-element workspace-root vector from an absolute path for tests. It reduces repeated conversion boilerplate.
+**Purpose**: Wraps one absolute filesystem path as the workspace-root list expected by the permission resolver. It is a small test convenience.
 
-**Data flow**: Converts `root: &Path` to `AbsolutePathBuf` and returns it inside a `Vec`.
+**Data flow**: It receives a root path → converts it to an absolute workspace root type → returns a one-item vector.
 
-**Call relations**: Multiple tests call this before resolving permissions.
+**Call relations**: Permission-related tests use this before calling `permissions_for`.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1769,11 +1777,11 @@ fn workspace_write_profile(
     ) -> PermissionProfile
 ```
 
-**Purpose**: Constructs a workspace-write permission profile with configurable writable roots and tmpdir exclusions for tests. It centralizes test profile creation.
+**Purpose**: Builds a workspace-write permission profile for tests. It lets tests vary writable roots and temporary-directory exclusions without repeating profile construction.
 
-**Data flow**: Takes writable roots, network policy, and tmpdir exclusion flags, calls `PermissionProfile::workspace_write_with`, and returns the resulting profile.
+**Data flow**: It receives writable roots and two exclusion flags → creates a workspace-write profile with restricted networking → returns that profile.
 
-**Call relations**: Tests use this helper to generate profiles for write-root and deny-path scenarios.
+**Call relations**: Write-root tests call this, then pass the result to `permissions_for`.
 
 *Call graph*: calls 1 internal fn (workspace_write_with).
 
@@ -1784,11 +1792,11 @@ fn workspace_write_profile(
 fn report_helper_failure_uses_setup_error_report_when_clear_succeeded()
 ```
 
-**Purpose**: Checks that helper failure reporting prefers a structured `setup_error.json` report when the orchestrator successfully cleared stale reports before launch. It validates report precedence.
+**Purpose**: Verifies that a fresh helper error report is used when the helper fails. This ensures users see the real helper-side reason.
 
-**Data flow**: Writes a `SetupErrorReport` under a temporary codex home, calls `report_helper_failure` with `cleared_report = true`, extracts the resulting `SetupFailure`, and asserts it matches the report contents.
+**Data flow**: It writes a setup error report in a temporary Codex home → calls `report_helper_failure` with `cleared_report` true → extracts the structured failure → asserts it matches the report contents.
 
-**Call relations**: This test exercises the successful-report-read branch in `report_helper_failure`.
+**Call relations**: This test covers the error-report branch used by both refresh and elevated setup after helper failure.
 
 *Call graph*: calls 2 internal fn (extract_failure, write_setup_error_report); 3 external calls (new, assert_eq!, report_helper_failure).
 
@@ -1799,11 +1807,11 @@ fn report_helper_failure_uses_setup_error_report_when_clear_succeeded()
 fn report_helper_failure_ignores_setup_error_report_when_clear_failed()
 ```
 
-**Purpose**: Checks that a potentially stale `setup_error.json` is ignored when the orchestrator could not clear reports before launch. It validates the safety guard against reusing old helper reports.
+**Purpose**: Verifies that stale setup reports are ignored when the old report could not be cleared. This prevents misleading errors from previous runs.
 
-**Data flow**: Writes a `SetupErrorReport`, calls `report_helper_failure` with `cleared_report = false`, extracts the resulting `SetupFailure`, and asserts it is the generic `OrchestratorHelperExitNonzero` failure rather than the report contents.
+**Data flow**: It writes a report that should be considered stale → calls `report_helper_failure` with `cleared_report` false → checks that the returned failure is a generic nonzero-exit error.
 
-**Call relations**: This test targets the early stale-report bypass branch in `report_helper_failure`.
+**Call relations**: This protects the safety logic inside `report_helper_failure`.
 
 *Call graph*: calls 2 internal fn (extract_failure, write_setup_error_report); 3 external calls (new, assert_eq!, report_helper_failure).
 
@@ -1814,11 +1822,11 @@ fn report_helper_failure_ignores_setup_error_report_when_clear_failed()
 fn setup_refresh_skips_profiles_without_managed_filesystem_permissions()
 ```
 
-**Purpose**: Verifies that refresh entry points quietly no-op for unsupported profiles instead of failing. It covers both the plain and extra-read-roots refresh wrappers.
+**Purpose**: Checks that refresh setup quietly skips permission profiles this Windows sandbox setup code does not manage. Unsupported profiles should not accidentally launch setup.
 
-**Data flow**: Creates temporary workspace and codex-home paths, iterates over `PermissionProfile::Disabled` and `PermissionProfile::External`, and asserts that both `run_setup_refresh` and `run_setup_refresh_with_extra_read_roots` return success.
+**Data flow**: It creates temporary workspace and Codex home paths → tries disabled and external profiles → calls both refresh entry points → expects success without setup work.
 
-**Call relations**: This test validates the `let Ok(permissions) = ... else { return Ok(()); }` behavior in the refresh wrappers.
+**Call relations**: This test covers the early-return behavior in `run_setup_refresh` and `run_setup_refresh_with_extra_read_roots`.
 
 *Call graph*: 7 external calls (new, new, create_dir_all, run_setup_refresh, run_setup_refresh_with_extra_read_roots, vec!, workspace_roots_for).
 
@@ -1829,11 +1837,11 @@ fn setup_refresh_skips_profiles_without_managed_filesystem_permissions()
 fn loopback_proxy_url_parsing_supports_common_forms()
 ```
 
-**Purpose**: Verifies that loopback proxy URL parsing accepts common IPv4, localhost, and IPv6-with-credentials forms. It checks the positive parsing cases.
+**Purpose**: Confirms that local proxy URLs in common formats are parsed correctly. This includes localhost, IPv4 loopback, and IPv6 loopback with credentials.
 
-**Data flow**: Calls `loopback_proxy_port_from_url` with representative URLs and asserts the expected ports are returned.
+**Data flow**: It passes several proxy URL strings to the parser → compares returned ports with expected values.
 
-**Call relations**: This test directly exercises the accepted branches in `loopback_proxy_port_from_url`.
+**Call relations**: This test directly exercises `loopback_proxy_port_from_url`, which feeds offline firewall proxy settings.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1844,11 +1852,11 @@ fn loopback_proxy_url_parsing_supports_common_forms()
 fn setup_exe_lookup_checks_package_resource_dir_for_bin_exe()
 ```
 
-**Purpose**: Verifies that setup helper lookup resolves a packaged helper from the resource directory adjacent to the main executable. It checks deployment-layout awareness.
+**Purpose**: Verifies that the setup helper can be found in the packaged resources directory when Codex runs from a package bin directory.
 
-**Data flow**: Creates a fake package layout with `bin/codex.exe` and `resources/codex-windows-sandbox-setup.exe`, calls `find_setup_exe_for_current_exe`, and asserts the returned path is the resource helper path.
+**Data flow**: It creates a fake package layout with bin and resources folders → writes fake executable files → calls `find_setup_exe_for_current_exe` → asserts the resource helper path is returned.
 
-**Call relations**: This test targets the package-relative lookup logic delegated through `bundled_executable_path_for_exe`.
+**Call relations**: This test protects the helper lookup used by `find_setup_exe` before launching setup.
 
 *Call graph*: calls 1 internal fn (find_setup_exe_for_current_exe); 4 external calls (new, assert_eq!, create_dir_all, write).
 
@@ -1859,11 +1867,11 @@ fn setup_exe_lookup_checks_package_resource_dir_for_bin_exe()
 fn loopback_proxy_url_parsing_rejects_non_loopback_and_zero_port()
 ```
 
-**Purpose**: Verifies that proxy URL parsing rejects non-loopback hosts, zero ports, and strings without a URL scheme. It checks the negative parsing cases.
+**Purpose**: Confirms that proxy parsing rejects remote hosts, zero ports, and strings without a URL scheme. This avoids opening firewall rules for invalid proxy settings.
 
-**Data flow**: Calls `loopback_proxy_port_from_url` with invalid inputs and asserts each returns `None`.
+**Data flow**: It passes invalid or unsafe proxy strings to the parser → expects no port to be returned.
 
-**Call relations**: This test covers the rejection branches in `loopback_proxy_port_from_url`.
+**Call relations**: This directly tests the defensive side of `loopback_proxy_port_from_url`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1874,11 +1882,11 @@ fn loopback_proxy_url_parsing_rejects_non_loopback_and_zero_port()
 fn proxy_ports_from_env_dedupes_and_sorts()
 ```
 
-**Purpose**: Checks that proxy ports extracted from environment variables are deduplicated and sorted, and that non-loopback proxies are ignored. It validates the aggregate parsing behavior.
+**Purpose**: Checks that proxy ports from environment variables are unique and sorted. Stable output prevents unnecessary setup churn.
 
-**Data flow**: Builds an environment map with duplicate loopback proxies and one non-loopback proxy, calls `proxy_ports_from_env`, and asserts the result is the sorted unique vector `[1081, 8080]`.
+**Data flow**: It builds an environment map with duplicate local proxy ports, one different local port, and one remote proxy → calls `proxy_ports_from_env` → expects only sorted local ports.
 
-**Call relations**: This test exercises `proxy_ports_from_env` together with `loopback_proxy_port_from_url`.
+**Call relations**: This test covers the helper used by `offline_proxy_settings_from_env`.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -1889,11 +1897,11 @@ fn proxy_ports_from_env_dedupes_and_sorts()
 fn offline_proxy_settings_ignore_proxy_env_when_online_identity_selected()
 ```
 
-**Purpose**: Verifies that proxy environment variables do not affect setup payloads when the online identity is selected. It checks the early-return branch in offline proxy extraction.
+**Purpose**: Verifies that online sandboxes ignore offline proxy firewall settings. Proxy environment variables should not affect online identity setup.
 
-**Data flow**: Builds an environment map containing proxy and local-binding variables, calls `offline_proxy_settings_from_env` with `SandboxNetworkIdentity::Online`, and asserts the result has empty ports and `allow_local_binding = false`.
+**Data flow**: It builds an environment map with proxy and local-binding settings → calls `offline_proxy_settings_from_env` with online identity → expects empty ports and local binding false.
 
-**Call relations**: This test targets the identity gate in `offline_proxy_settings_from_env`.
+**Call relations**: This test covers the online branch of `offline_proxy_settings_from_env`.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -1904,11 +1912,11 @@ fn offline_proxy_settings_ignore_proxy_env_when_online_identity_selected()
 fn offline_proxy_settings_capture_proxy_ports_and_local_binding_for_offline_identity()
 ```
 
-**Purpose**: Verifies that offline identity captures loopback proxy ports and the local-binding flag from the environment. It checks the positive extraction path.
+**Purpose**: Verifies that offline sandboxes capture proxy ports and the local-binding flag from the environment. These values become firewall setup inputs.
 
-**Data flow**: Builds an environment map with loopback proxy URLs and `CODEX_NETWORK_ALLOW_LOCAL_BINDING=1`, calls `offline_proxy_settings_from_env` with `Offline`, and asserts the expected `OfflineProxySettings` value.
+**Data flow**: It builds an environment map with two loopback proxy URLs and `CODEX_NETWORK_ALLOW_LOCAL_BINDING=1` → calls `offline_proxy_settings_from_env` with offline identity → expects both ports and local binding true.
 
-**Call relations**: This test exercises `offline_proxy_settings_from_env` and its delegation to `proxy_ports_from_env`.
+**Call relations**: This test covers the offline branch used by refresh and elevated setup payload construction.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -1919,11 +1927,11 @@ fn offline_proxy_settings_capture_proxy_ports_and_local_binding_for_offline_iden
 fn setup_marker_request_mismatch_reason_ignores_proxy_drift_for_online_identity()
 ```
 
-**Purpose**: Verifies that marker drift detection ignores stored-versus-desired proxy differences when the online identity is in use. It prevents unnecessary refreshes for online sandboxes.
+**Purpose**: Checks that proxy-setting differences do not force a mismatch when the online identity is selected. Offline firewall settings are irrelevant in that case.
 
-**Data flow**: Constructs a `SetupMarker` and desired `OfflineProxySettings`, calls `request_mismatch_reason` with `SandboxNetworkIdentity::Online`, and asserts the result is `None`.
+**Data flow**: It creates a marker with one set of proxy settings and a desired set with different values → calls `request_mismatch_reason` with online identity → expects no mismatch reason.
 
-**Call relations**: This test covers the early-return branch in `SetupMarker::request_mismatch_reason`.
+**Call relations**: This test protects the online early-return in `SetupMarker::request_mismatch_reason`.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1934,11 +1942,11 @@ fn setup_marker_request_mismatch_reason_ignores_proxy_drift_for_online_identity(
 fn setup_marker_request_mismatch_reason_reports_offline_firewall_drift()
 ```
 
-**Purpose**: Verifies that marker drift detection reports a detailed mismatch string when offline firewall settings have changed. It checks the formatted drift message.
+**Purpose**: Checks that changed offline proxy firewall settings are reported as a setup mismatch. This tells callers why setup needs refreshing.
 
-**Data flow**: Constructs a `SetupMarker` and differing desired `OfflineProxySettings`, calls `request_mismatch_reason` with `Offline`, and asserts the returned string matches the expected formatted description.
+**Data flow**: It creates a marker and different desired offline settings → calls `request_mismatch_reason` with offline identity → expects a detailed mismatch message.
 
-**Call relations**: This test exercises the mismatch-reporting branch in `SetupMarker::request_mismatch_reason`.
+**Call relations**: This test covers the comparison path in `SetupMarker::request_mismatch_reason`.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1949,11 +1957,11 @@ fn setup_marker_request_mismatch_reason_reports_offline_firewall_drift()
 fn profile_read_roots_excludes_configured_top_level_entries()
 ```
 
-**Purpose**: Verifies that `profile_read_roots` omits configured sensitive top-level profile entries while keeping ordinary files and directories. It checks case-insensitive exclusion behavior.
+**Purpose**: Verifies that profile read expansion leaves ordinary files and folders but removes configured sensitive folders. This is central to not exposing credentials.
 
-**Data flow**: Creates a temporary user profile containing allowed entries and excluded directories such as `.ssh`, `.tsh`, and `.AWS`, calls `profile_read_roots`, collects the result into a set, and asserts only the allowed entries remain.
+**Data flow**: It creates a temporary profile with allowed and excluded children → calls `profile_read_roots` → compares the returned set with only the allowed entries.
 
-**Call relations**: This test directly validates the filtering logic inside `profile_read_roots`.
+**Call relations**: This test directly checks `profile_read_roots`, which is used by full-read gathering and profile expansion.
 
 *Call graph*: calls 1 internal fn (profile_read_roots); 4 external calls (new, assert_eq!, create_dir_all, write).
 
@@ -1964,11 +1972,11 @@ fn profile_read_roots_excludes_configured_top_level_entries()
 fn profile_read_roots_falls_back_to_profile_root_when_enumeration_fails()
 ```
 
-**Purpose**: Verifies that `profile_read_roots` returns the profile root itself when directory enumeration fails. It checks the fallback behavior for missing or unreadable profiles.
+**Purpose**: Checks the fallback behavior when a profile directory cannot be listed. The function should still return something usable instead of failing setup.
 
-**Data flow**: Creates a missing profile path, calls `profile_read_roots`, and asserts the result is a single-element vector containing that path.
+**Data flow**: It points at a missing profile directory → calls `profile_read_roots` → expects the missing profile path itself as the only root.
 
-**Call relations**: This test covers the error fallback branch in `profile_read_roots`.
+**Call relations**: This covers the error-tolerant branch of `profile_read_roots`.
 
 *Call graph*: calls 1 internal fn (profile_read_roots); 2 external calls (new, assert_eq!).
 
@@ -1979,11 +1987,11 @@ fn profile_read_roots_falls_back_to_profile_root_when_enumeration_fails()
 fn is_user_profile_root_exclusion_blocks_configured_children()
 ```
 
-**Purpose**: Verifies that profile exclusion detection matches configured sensitive children under the user profile but not unrelated paths. It checks nested-path handling.
+**Purpose**: Verifies that sensitive profile children are recognized even when the root points inside them. Ordinary profile folders and unrelated roots should not be blocked.
 
-**Data flow**: Creates a temporary user profile with ordinary and excluded child paths, calls `is_user_profile_root_exclusion` on several examples, and asserts the expected true/false outcomes.
+**Data flow**: It creates a temporary profile with documents, app data, `.ssh`, `.tsh`, and another root → calls the exclusion predicate on each → checks true only for configured sensitive children.
 
-**Call relations**: This test directly exercises the canonical-key and first-child matching logic in `is_user_profile_root_exclusion`.
+**Call relations**: This tests the predicate used by `filter_user_profile_root_exclusions`.
 
 *Call graph*: 3 external calls (new, assert!, create_dir_all).
 
@@ -1994,11 +2002,11 @@ fn is_user_profile_root_exclusion_blocks_configured_children()
 fn is_ssh_config_dependency_root_blocks_config_dependencies()
 ```
 
-**Purpose**: Verifies that roots corresponding to SSH config dependencies are recognized and blocked while unrelated roots are not. It checks dependency discovery plus top-level-child matching.
+**Purpose**: Verifies that paths referenced by SSH config are treated as sensitive roots. This catches keys or included config files outside the usual `.ssh` folder.
 
-**Data flow**: Creates a user profile with `.ssh/config` referencing an identity file and included config, computes dependency paths with `ssh_config_dependency_paths`, calls `is_ssh_config_dependency_root` on several roots, and asserts the expected results.
+**Data flow**: It writes an SSH config with an identity file and included config → gathers dependency paths → calls the dependency-root predicate on several roots → expects dependency-related roots to be blocked.
 
-**Call relations**: This test validates the interaction between SSH dependency discovery and root filtering logic.
+**Call relations**: This tests `is_ssh_config_dependency_root`, which is used by SSH dependency filtering.
 
 *Call graph*: 5 external calls (new, assert!, create_dir_all, write, ssh_config_dependency_paths).
 
@@ -2009,11 +2017,11 @@ fn is_ssh_config_dependency_root_blocks_config_dependencies()
 fn expand_user_profile_root_for_replaces_profile_root_with_children()
 ```
 
-**Purpose**: Verifies that expanding a profile root replaces it with its child entries while preserving unrelated roots. It checks the core profile-root expansion behavior.
+**Purpose**: Checks that a whole profile root is replaced by its children while unrelated roots are kept. This supports safer, more precise profile access.
 
-**Data flow**: Creates a temporary user profile with child directories and another unrelated root, calls `expand_user_profile_root_for` on a vector containing the profile root and the unrelated root, collects the result into a set, and asserts it equals the expected children plus the unrelated root.
+**Data flow**: It creates a temporary profile with child folders and another root → calls `expand_user_profile_root_for` with the profile and other root → compares the resulting set with the children plus other root.
 
-**Call relations**: This test directly exercises `expand_user_profile_root_for` and its use of `profile_read_roots`.
+**Call relations**: This test covers the core behavior behind `expand_user_profile_root`.
 
 *Call graph*: 5 external calls (new, assert_eq!, create_dir_all, expand_user_profile_root_for, vec!).
 
@@ -2024,11 +2032,11 @@ fn expand_user_profile_root_for_replaces_profile_root_with_children()
 fn expanded_write_roots_still_drop_protected_codex_home()
 ```
 
-**Purpose**: Verifies that even after expanding a user profile root, protected Codex home paths are still removed from write roots. It checks the interaction between profile expansion and sensitive-root filtering.
+**Purpose**: Verifies that even after expanding a user profile, Codex home is not left writable. This protects sandbox control files from tampering.
 
-**Data flow**: Creates a user profile containing `CodexHome` and `Documents`, expands the profile root with `expand_user_profile_root_for`, removes the profile root itself and excluded children, passes the result through `filter_sensitive_write_roots`, and asserts only `Documents` remains.
+**Data flow**: It creates a profile containing Codex home and Documents → expands the profile root → removes the profile root and sensitive exclusions → applies `filter_sensitive_write_roots` → expects only Documents to remain.
 
-**Call relations**: This test validates that `filter_sensitive_write_roots` still protects Codex state after earlier expansion/filtering stages.
+**Call relations**: This combines profile expansion with the final sensitive-write-root filter.
 
 *Call graph*: 7 external calls (new, assert_eq!, create_dir_all, canonical_path_key, expand_user_profile_root_for, filter_sensitive_write_roots, vec!).
 
@@ -2039,11 +2047,11 @@ fn expanded_write_roots_still_drop_protected_codex_home()
 fn gather_read_roots_includes_helper_bin_dir()
 ```
 
-**Purpose**: Verifies that computed read roots always include the helper binary directory. It checks the mandatory helper-root behavior.
+**Purpose**: Checks that readable roots always include the helper binary directory. Without this, sandboxed commands might not be able to run required helper tools.
 
-**Data flow**: Creates temporary codex-home and workspace paths, resolves a read-only permission profile, calls `gather_read_roots`, canonicalizes `helper_bin_dir(codex_home)`, and asserts the helper path is present in the result.
+**Data flow**: It creates temporary Codex and workspace folders → resolves read-only permissions → calls `gather_read_roots` → asserts the canonical helper directory is present.
 
-**Call relations**: This test exercises `gather_read_roots` and its delegation to `gather_helper_read_roots`.
+**Call relations**: This protects the `gather_helper_read_roots` inclusion inside `gather_read_roots`.
 
 *Call graph*: calls 3 internal fn (read_only, helper_bin_dir, gather_read_roots); 7 external calls (new, new, assert!, canonicalize, create_dir_all, permissions_for, workspace_roots_for).
 
@@ -2054,11 +2062,11 @@ fn gather_read_roots_includes_helper_bin_dir()
 fn workspace_write_roots_remain_readable()
 ```
 
-**Purpose**: Verifies that writable roots are also included in the readable root set for workspace-write scenarios. It preserves the legacy expectation that writable locations remain readable.
+**Purpose**: Verifies that writable workspace roots are also included in readable roots where needed. A command generally must read files it is allowed to write.
 
-**Data flow**: Creates codex-home, workspace, and an extra writable root, resolves a workspace-write profile, calls `gather_read_roots`, canonicalizes the writable root, and asserts it is present in the read-root list.
+**Data flow**: It creates a workspace and extra writable root → builds workspace-write permissions → calls `gather_read_roots` → asserts the writable root is included.
 
-**Call relations**: This test covers the path where `gather_read_roots` includes writable roots through permission-derived readable roots.
+**Call relations**: This covers read-root behavior for permission-derived writable roots.
 
 *Call graph*: calls 1 internal fn (gather_read_roots); 9 external calls (new, new, assert!, canonicalize, create_dir_all, vec!, permissions_for, workspace_roots_for, workspace_write_profile).
 
@@ -2069,11 +2077,11 @@ fn workspace_write_roots_remain_readable()
 fn build_payload_roots_preserves_helper_roots_when_read_override_is_provided()
 ```
 
-**Purpose**: Verifies that explicit read-root overrides replace policy-derived readable roots but still preserve helper roots and optionally platform defaults. It checks override semantics.
+**Purpose**: Checks that explicit read-root overrides do not remove required helper roots. It also verifies optional platform defaults are included when requested.
 
-**Data flow**: Creates codex-home, workspace, and a readable root, resolves a read-only profile, calls `build_payload_roots` with a read-root override and `read_roots_include_platform_defaults = true`, canonicalizes expected helper/workspace/readable paths, and asserts helper and readable roots are present, cwd is absent, write roots are empty, and all canonical platform defaults are included.
+**Data flow**: It creates temporary roots → calls `build_payload_roots` with an explicit readable root and platform-default inclusion → asserts helper and explicit roots are present, command cwd is not added automatically, write roots are empty, and platform defaults are present.
 
-**Call relations**: This test directly exercises the override branch in `build_payload_roots`.
+**Call relations**: This tests the override branch of `build_payload_roots`.
 
 *Call graph*: calls 3 internal fn (read_only, helper_bin_dir, build_payload_roots); 9 external calls (new, new, assert!, assert_eq!, canonicalize, create_dir_all, vec!, permissions_for, workspace_roots_for).
 
@@ -2084,11 +2092,11 @@ fn build_payload_roots_preserves_helper_roots_when_read_override_is_provided()
 fn build_payload_roots_replaces_full_read_policy_when_read_override_is_provided()
 ```
 
-**Purpose**: Verifies that explicit read-root overrides suppress automatic inclusion of platform defaults when the corresponding flag is false. It checks the stricter override mode.
+**Purpose**: Checks that explicit read roots replace the normal legacy read set when platform defaults are not requested. This gives callers precise control.
 
-**Data flow**: Creates codex-home, workspace, and a readable root, resolves a read-only profile, calls `build_payload_roots` with a read-root override and `read_roots_include_platform_defaults = false`, and asserts helper and readable roots are present, cwd is absent, write roots are empty, and canonical platform defaults are absent.
+**Data flow**: It creates temporary roots → calls `build_payload_roots` with explicit read roots and no platform defaults → asserts helper and explicit roots are present, command cwd and platform roots are not automatically added, and write roots are empty.
 
-**Call relations**: This test covers the same override branch in `build_payload_roots` with platform-default inclusion disabled.
+**Call relations**: This protects the precise-override behavior in `build_payload_roots`.
 
 *Call graph*: calls 3 internal fn (read_only, helper_bin_dir, build_payload_roots); 9 external calls (new, new, assert!, assert_eq!, canonicalize, create_dir_all, vec!, permissions_for, workspace_roots_for).
 
@@ -2099,11 +2107,11 @@ fn build_payload_roots_replaces_full_read_policy_when_read_override_is_provided(
 fn effective_write_roots_match_payload_filtering_for_overrides()
 ```
 
-**Purpose**: Verifies that direct effective-write-root computation matches the write roots embedded in payload construction when overrides are supplied. It also checks that protected Codex paths are removed.
+**Purpose**: Verifies that the public effective-write-root helper and payload builder apply the same filtering to overridden write roots. This prevents mismatch between setup and runtime behavior.
 
-**Data flow**: Creates codex-home, workspace, extra root, and sandbox root, resolves a workspace-write profile, builds an override list including allowed and forbidden roots, computes `effective_write_roots_for_setup`, computes payload roots via `build_payload_roots`, canonicalizes expected and forbidden paths, and asserts the two write-root results match, include workspace and extra root, and exclude codex-home and sandbox root.
+**Data flow**: It creates workspace, extra, Codex home, and sandbox-root folders → supplies all as write overrides → computes effective write roots and payload write roots → asserts they match and exclude protected Codex folders.
 
-**Call relations**: This test validates consistency between `effective_write_roots_for_setup` and `build_payload_roots`.
+**Call relations**: This connects `effective_write_roots_for_setup`, `build_payload_roots`, and `filter_sensitive_write_roots`.
 
 *Call graph*: calls 1 internal fn (build_payload_roots); 12 external calls (new, new, assert!, assert_eq!, canonicalize, create_dir_all, effective_write_roots_for_setup, sandbox_dir, vec!, permissions_for (+2 more)).
 
@@ -2114,11 +2122,11 @@ fn effective_write_roots_match_payload_filtering_for_overrides()
 fn effective_write_roots_use_runtime_workspace_roots_for_workspace_root()
 ```
 
-**Purpose**: Verifies that effective write-root computation resolves symbolic workspace-root permissions to the actual runtime workspace root. It checks workspace-root materialization through the setup filtering pipeline.
+**Purpose**: Checks that workspace-write permissions use the runtime workspace root rather than just the command’s subdirectory. This gives the sandbox write access to the intended workspace scope.
 
-**Data flow**: Creates codex-home, workspace root, and nested command cwd, resolves a workspace-write profile, calls `effective_write_roots_for_setup` without overrides, and asserts the result is the canonical workspace root.
+**Data flow**: It creates a workspace root with a command subdirectory → builds workspace-write permissions → calls `effective_write_roots_for_setup` → expects the canonical workspace root.
 
-**Call relations**: This test exercises `effective_write_roots_for_setup` together with permission resolution and write-root filtering.
+**Call relations**: This tests permission-derived write-root gathering through the effective-write-root path.
 
 *Call graph*: 8 external calls (new, new, assert_eq!, create_dir_all, effective_write_roots_for_setup, permissions_for, workspace_roots_for, workspace_write_profile).
 
@@ -2129,11 +2137,11 @@ fn effective_write_roots_use_runtime_workspace_roots_for_workspace_root()
 fn payload_deny_write_paths_merge_explicit_and_protected_children()
 ```
 
-**Purpose**: Verifies that deny-write payload construction merges explicit deny paths with deny paths derived from protected children such as `.git` and `.codex` under writable roots. It checks deny-path aggregation.
+**Purpose**: Verifies that deny-write paths include both caller-specified paths and protected paths computed from permissions. This keeps sensitive nested folders blocked.
 
-**Data flow**: Creates codex-home, workspace, extra writable root, protected child directories, and an explicit deny path, resolves a workspace-write profile, builds a `SandboxSetupRequest`, calls `build_payload_deny_write_paths`, and asserts the resulting set contains the canonical protected children plus the explicit deny path.
+**Data flow**: It creates workspace and extra writable roots with protected child folders plus an explicit deny path → builds permissions and a setup request → calls `build_payload_deny_write_paths` → compares the result as a set.
 
-**Call relations**: This test directly exercises `build_payload_deny_write_paths` and its delegation to `compute_allow_paths_for_permissions`.
+**Call relations**: This tests the merge behavior used by refresh and elevated setup payloads.
 
 *Call graph*: 9 external calls (new, new, assert_eq!, create_dir_all, build_payload_deny_write_paths, vec!, permissions_for, workspace_roots_for, workspace_write_profile).
 
@@ -2144,11 +2152,11 @@ fn payload_deny_write_paths_merge_explicit_and_protected_children()
 fn full_read_roots_preserve_legacy_platform_defaults()
 ```
 
-**Purpose**: Verifies that full-read root gathering still includes the legacy Windows platform default roots. It checks backward-compatible behavior for broad-read profiles.
+**Purpose**: Checks that full-read root gathering still includes the default Windows platform folders. This preserves expected compatibility for broad-read policies.
 
-**Data flow**: Creates codex-home and workspace, resolves a read-only profile, calls `gather_full_read_roots_for_permissions`, and asserts all canonical platform default roots are present.
+**Data flow**: It creates temporary Codex and workspace folders → resolves read-only permissions → calls `gather_full_read_roots_for_permissions` → asserts all canonical platform defaults are present.
 
-**Call relations**: This test directly validates `gather_full_read_roots_for_permissions`.
+**Call relations**: This directly exercises the full-read gatherer used through `gather_read_roots`.
 
 *Call graph*: calls 2 internal fn (read_only, gather_full_read_roots_for_permissions); 6 external calls (new, new, assert!, create_dir_all, permissions_for, workspace_roots_for).
 
@@ -2159,24 +2167,26 @@ fn full_read_roots_preserve_legacy_platform_defaults()
 fn build_payload_deny_read_paths_preserves_explicit_paths()
 ```
 
-**Purpose**: Verifies that deny-read payload construction preserves explicit path spellings for both existing and missing paths. It checks the no-canonicalization design choice.
+**Purpose**: Verifies that deny-read paths are returned exactly as provided, including paths that do not exist yet. This supports access-control planning for future files or path aliases.
 
-**Data flow**: Creates an existing file path and a missing future path, calls `build_payload_deny_read_paths(Some(vec![...]))`, and asserts the returned vector exactly matches the input order and spelling.
+**Data flow**: It creates one existing path and one missing path → calls `build_payload_deny_read_paths` with both → expects the same paths in the same order.
 
-**Call relations**: This test targets the intentionally trivial behavior of `build_payload_deny_read_paths`.
+**Call relations**: This protects the intentionally simple behavior of `build_payload_deny_read_paths`.
 
 *Call graph*: 3 external calls (new, assert_eq!, write).
 
 
 ### `windows-sandbox-rs/src/identity.rs`
 
-`domain_logic` · `sandbox setup validation and credential acquisition before launch`
+`orchestration` · `before sandbox launch and during credential refresh after login failure`
 
-This file bridges persistent setup artifacts and runtime process launch. It defines an internal `SandboxIdentity` and the public `SandboxCreds`, then provides helpers to inspect setup readiness and decode stored credentials. Setup state is split across a marker file and a users file; `sandbox_setup_is_complete` checks both for existence and version compatibility. `load_marker` and `load_users` read JSON from paths derived by `setup_marker_path` and `sandbox_users_path`, returning `Ok(None)` on missing files or parse/read failures while emitting `debug_log` diagnostics instead of hard errors.
+The Windows sandbox needs a real Windows user account to log in as. This file is the gatekeeper for that identity. It looks in the project’s Codex home folder for setup artifacts: a marker file that says what setup was performed, and a users file that stores the sandbox accounts. Think of these files like a reservation card and a locked key box: the marker says the room was prepared, and the users file holds the key needed to enter it.
 
-Passwords are stored encrypted and base64-encoded. `decode_password` base64-decodes the stored blob, decrypts it with DPAPI via `dpapi::unprotect`, and converts the result to UTF-8. `select_identity` combines marker validation, users-file validation, network-mode selection (`offline` vs `online` record), and password decoding into an optional runtime identity.
+The file first checks whether the setup files exist and match the current expected version. If they do, it chooses either the offline or online sandbox account depending on the requested permissions and proxy settings. The saved password is base64-decoded and then decrypted with Windows DPAPI, the Data Protection API, which is Windows’ built-in way to protect secrets on disk.
 
-The main entry point, `require_logon_sandbox_creds`, computes the exact read/write roots needed for the current command, derives the desired `SandboxNetworkIdentity` from permissions and proxy enforcement, and compares that against the setup marker's recorded request. If setup is missing, version-mismatched, or proxy/network settings differ, it logs why setup is required and runs `run_elevated_setup` with explicit root overrides. Regardless of whether elevated setup was needed, it always runs `run_setup_refresh_with_overrides` afterward to refresh ACLs for the current roots. If credentials still cannot be selected, it returns a hard error instructing the caller to rerun setup with elevation. `refresh_logon_sandbox_creds` is the stale-credential recovery path: it deletes the users file and reruns the full credential requirement flow.
+If anything is missing, outdated, or mismatched, this file asks the setup helper to run again with elevation, meaning administrator-level permission. After that, it always asks the setup helper to refresh file access rules for the current command’s read and write paths. This is important because the sandbox identity may be valid, but the set of folders it is allowed to touch can change from run to run.
+
+It also has a recovery path for failed logins: delete the saved users file and force setup to produce fresh credentials.
 
 #### Function details
 
@@ -2186,11 +2196,11 @@ The main entry point, `require_logon_sandbox_creds`, computes the exact read/wri
 fn sandbox_setup_is_complete(codex_home: &Path) -> bool
 ```
 
-**Purpose**: Performs a coarse readiness check for sandbox setup artifacts under `codex_home`. It verifies that both the setup marker and users file exist and match the current setup version.
+**Purpose**: This is a quick readiness check for callers that only need to know whether sandbox setup appears to be present and current. It does not do the deeper runtime checks for network and proxy settings.
 
-**Data flow**: It takes `codex_home`, calls `load_marker` and checks `version_matches()` on the returned marker, then calls `load_users` and checks `version_matches()` on the returned users file. It returns `true` only if both checks succeed; otherwise it returns `false`.
+**Data flow**: It receives the Codex home folder path. It reads the setup marker and users records from disk through helper functions, checks whether both match the expected setup version, and returns true only when both look current. It does not change any files.
 
-**Call relations**: It is called by setup-verification code that wants a quick readiness signal without performing full runtime validation. Unlike `require_logon_sandbox_creds`, it does not inspect proxy settings or refresh ACLs.
+**Call relations**: A higher-level setup verification flow calls this when it wants a simple yes-or-no answer. Internally, it relies on the same marker and users files that the later credential-loading path uses more carefully.
 
 *Call graph*: called by 1 (verify_setup_completed); 1 external calls (matches!).
 
@@ -2201,11 +2211,11 @@ fn sandbox_setup_is_complete(codex_home: &Path) -> bool
 fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>>
 ```
 
-**Purpose**: Reads and parses the sandbox setup marker JSON file, degrading parse and read failures into `None` while emitting debug diagnostics. This keeps callers resilient to missing or corrupted setup state.
+**Purpose**: This reads the sandbox setup marker file, which records what kind of setup was last completed. If the file is missing, unreadable, or malformed, it quietly reports that no usable marker is available and writes a debug note.
 
-**Data flow**: It takes `codex_home`, computes the marker path with `setup_marker_path`, and attempts `fs::read_to_string`. Missing files become `Ok(None)`; successful reads are parsed as `SetupMarker` with `serde_json::from_str`, returning `Some(marker)` on success. Parse failures and non-NotFound read failures are logged with `debug_log` and converted to `Ok(None)`.
+**Data flow**: It receives the Codex home path, turns that into the marker file path, and tries to read JSON text from disk. If the text parses into a setup marker, it returns it. If the file is absent or unusable, it returns no marker instead of stopping the whole program, while logging details for debugging.
 
-**Call relations**: It is used by both `sandbox_setup_is_complete`, `select_identity`, and `require_logon_sandbox_creds`. Its tolerant behavior lets higher-level logic decide whether to trigger setup rather than failing immediately on malformed state.
+**Call relations**: Both the identity-selection path and the main credential-requirement path call this first, because the marker tells them whether the saved setup can be trusted. It hands back the marker data that later code checks for version and request compatibility.
 
 *Call graph*: calls 2 internal fn (debug_log, setup_marker_path); called by 2 (require_logon_sandbox_creds, select_identity); 2 external calls (format!, read_to_string).
 
@@ -2216,11 +2226,11 @@ fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>>
 fn load_users(codex_home: &Path) -> Result<Option<SandboxUsersFile>>
 ```
 
-**Purpose**: Reads and parses the sandbox users JSON file containing online/offline account records. Like `load_marker`, it treats missing or malformed state as absent and logs debug details.
+**Purpose**: This reads the file that contains the sandbox user records. Those records include the usernames and protected passwords for the online and offline sandbox identities.
 
-**Data flow**: It takes `codex_home`, computes the users-file path with `sandbox_users_path`, and reads it as a string. A missing file returns `Ok(None)` immediately; other read failures are debug-logged and also return `Ok(None)`. Successful reads are parsed as `SandboxUsersFile`; parse success returns `Ok(Some(users))`, while parse failure logs and returns `Ok(None)`.
+**Data flow**: It receives the Codex home path, builds the users file path, and reads the JSON file from disk. If reading or parsing succeeds, it returns the users data. If the file is missing, unreadable, or invalid, it logs a debug message when useful and returns no users data.
 
-**Call relations**: It is called by `sandbox_setup_is_complete` and `select_identity`. This helper isolates the file-format boundary so credential selection can focus on version and network-mode logic.
+**Call relations**: The identity-selection function calls this after the setup marker has been accepted. It supplies the raw user record that will later be chosen and decrypted.
 
 *Call graph*: calls 2 internal fn (debug_log, sandbox_users_path); called by 1 (select_identity); 2 external calls (format!, read_to_string).
 
@@ -2231,11 +2241,11 @@ fn load_users(codex_home: &Path) -> Result<Option<SandboxUsersFile>>
 fn remove_sandbox_users_file(codex_home: &Path, reason: &str) -> Result<()>
 ```
 
-**Purpose**: Deletes the persisted sandbox users file, typically to force regeneration after stale or invalid credentials are detected. Missing files are treated as already-clean state.
+**Purpose**: This deletes the saved sandbox users file, usually because the stored login details failed and should no longer be trusted. Missing files are treated as already cleaned up, not as an error.
 
-**Data flow**: It takes `codex_home` and a textual reason, computes the users-file path with `sandbox_users_path`, logs a debug message naming the file being deleted, and calls `fs::remove_file`. Successful deletion and `NotFound` both return `Ok(())`; other filesystem errors are returned with path context.
+**Data flow**: It receives the Codex home path and a human-readable reason. It logs why the file is being deleted, builds the users file path, and attempts to remove it from disk. On success or if the file was already gone, it returns normally; on other deletion problems, it returns an error with the file path attached.
 
-**Call relations**: It is used by `refresh_logon_sandbox_creds` as the first step in stale-credential recovery, and is covered by tests for both existing and missing files. The debug log preserves the reason for deletion without surfacing it to normal logs.
+**Call relations**: The credential refresh flow calls this before asking for credentials again, forcing the later setup path to recreate usable user data. The tests call it directly to prove that it deletes an existing file and ignores an already-missing one.
 
 *Call graph*: calls 2 internal fn (debug_log, sandbox_users_path); called by 3 (refresh_logon_sandbox_creds, remove_sandbox_users_file_deletes_existing_file, remove_sandbox_users_file_ignores_missing_file); 2 external calls (format!, remove_file).
 
@@ -2246,11 +2256,11 @@ fn remove_sandbox_users_file(codex_home: &Path, reason: &str) -> Result<()>
 fn decode_password(record: &SandboxUserRecord) -> Result<String>
 ```
 
-**Purpose**: Decodes and decrypts a stored sandbox password from a `SandboxUserRecord`. It converts the persisted base64+DPAPI representation into a plain Rust `String`.
+**Purpose**: This turns a stored sandbox password back into plain text so it can be used for logon. The password is stored in two protective layers: base64 text encoding and Windows DPAPI encryption.
 
-**Data flow**: It takes a user record, base64-decodes `record.password`, decrypts the resulting bytes with `dpapi::unprotect`, converts the decrypted bytes from UTF-8 into a `String`, and returns that string. Any decode, decrypt, or UTF-8 conversion failure is propagated as an error.
+**Data flow**: It receives one sandbox user record. It decodes the password field from base64 text into bytes, asks DPAPI to decrypt those bytes, then converts the result into a UTF-8 string. The returned value is the usable password, or an error if any step fails.
 
-**Call relations**: It is called only by `select_identity` after the correct online/offline user record has been chosen. This keeps cryptographic decoding separate from setup-state selection logic.
+**Call relations**: The identity-selection function calls this only after it has chosen either the online or offline user record. This keeps password decryption limited to the single identity actually needed for the upcoming sandbox run.
 
 *Call graph*: calls 1 internal fn (unprotect); called by 1 (select_identity); 1 external calls (from_utf8).
 
@@ -2264,11 +2274,11 @@ fn select_identity(
 ) -> Result<Option<SandboxIdentity>>
 ```
 
-**Purpose**: Selects the appropriate sandbox account record for the requested network identity and returns decrypted credentials if setup artifacts are present and version-compatible. It returns `None` when setup state is absent or incompatible.
+**Purpose**: This chooses the correct sandbox account, online or offline, from the saved setup files and returns its username and decrypted password. It refuses to use saved data unless both the marker and users file match the current setup version.
 
-**Data flow**: It takes a `SandboxNetworkIdentity` and `codex_home`, loads the marker and users file, and requires both to exist and report `version_matches()`. It then chooses either `users.offline` or `users.online` based on the requested network identity, decrypts the chosen password with `decode_password`, and returns `Ok(Some(SandboxIdentity { username, password }))`; any missing/incompatible setup state yields `Ok(None)`.
+**Data flow**: It receives the desired network identity and the Codex home path. It reads and checks the setup marker, then reads and checks the users file. It selects the matching user record, decrypts that record’s password, and returns a sandbox identity. If the setup files are missing or out of date, it returns no identity rather than using unsafe stale data.
 
-**Call relations**: It is called by `require_logon_sandbox_creds` both before and after setup execution. It depends on `load_marker`, `load_users`, and `decode_password` to collapse persistent setup state into runtime credentials.
+**Call relations**: The main credential function calls this after deciding which network identity is needed. It depends on the marker loader, users loader, and password decoder, and it hands back the internal identity that is later exposed as public sandbox credentials.
 
 *Call graph*: calls 3 internal fn (decode_password, load_marker, load_users); called by 1 (require_logon_sandbox_creds).
 
@@ -2284,11 +2294,11 @@ fn require_logon_sandbox_creds(
     read_roots_override: Opti
 ```
 
-**Purpose**: Ensures that valid sandbox logon credentials exist for the current permission set and filesystem roots, running elevated setup if necessary and always refreshing ACLs for the current request. It is the main credential-acquisition entry point used before sandbox launch.
+**Purpose**: This is the main function that guarantees usable sandbox login credentials before a sandbox run. If the saved setup is missing, stale, or does not match the requested permissions, it runs setup and then returns fresh credentials.
 
-**Data flow**: It takes resolved permissions, command cwd, environment map, `codex_home`, optional read/write root overrides, deny-path overrides, and a proxy-enforced flag. The function computes `needed_read` and `needed_write` roots from overrides or `gather_read_roots`/`gather_write_roots_for_permissions`, derives `SandboxNetworkIdentity::from_permissions`, and computes desired offline proxy settings from the environment. It then loads the setup marker and checks for version or request mismatches; if the marker is missing, incompatible, or the selected identity cannot be loaded, it records a setup reason, logs that setup is required, and calls `run_elevated_setup` with a `SandboxSetupRequest` plus `SetupRootOverrides` containing the exact roots and deny lists. Afterward it retries `select_identity`. Regardless of whether elevated setup ran, it calls `run_setup_refresh_with_overrides` to refresh ACLs for the current roots. Finally it converts the selected identity into public `SandboxCreds` or returns an error if credentials are still unavailable.
+**Data flow**: It receives the resolved sandbox permissions, the command working folder, environment variables, Codex home path, optional read and write folder overrides, denied paths, and whether proxy rules are enforced. It works out which folders the sandbox must read or write, chooses the needed network identity, checks whether the existing setup marker matches that request, and tries to load the matching saved identity. If setup is needed, it logs the reason and runs the elevated setup helper. Whether setup was newly run or already present, it refreshes access rules for the current folders. Finally, it returns a public username and password pair, or an error if no valid identity can be produced.
 
-**Call relations**: It is called by elevated capture and other spawn-preparation paths whenever a sandboxed process must log on as a sandbox user. It orchestrates marker/users loading, identity selection, setup triggering, and ACL refresh, delegating root computation to setup helpers and persistence checks to `load_marker`/`select_identity`.
+**Call relations**: Sandbox launch preparation calls this when it needs credentials to start a restricted Windows session. It coordinates many other pieces: marker loading, identity selection, network identity choice, proxy-derived settings, elevated setup, and non-elevated access-rule refresh. The refresh function also calls it after deleting stale users.
 
 *Call graph*: calls 8 internal fn (load_marker, select_identity, log_note, from_permissions, offline_proxy_settings_from_env, run_elevated_setup, run_setup_refresh_with_overrides, sandbox_dir); called by 3 (run_windows_sandbox_capture_for_permission_profile, refresh_logon_sandbox_creds, prepare_elevated_spawn_context_for_permissions); 2 external calls (to_vec, format!).
 
@@ -2304,11 +2314,11 @@ fn refresh_logon_sandbox_creds(
     read_roots_override: Opti
 ```
 
-**Purpose**: Forces regeneration of sandbox credentials after a login failure by deleting the persisted users file and rerunning the normal credential requirement flow. It is the stale-credential recovery path.
+**Purpose**: This is the recovery path for a sandbox login failure. It throws away the saved users file and then runs the normal credential requirement flow again, forcing credentials to be recreated or reselected.
 
-**Data flow**: It takes the same arguments as `require_logon_sandbox_creds`, calls `remove_sandbox_users_file(codex_home, "sandbox user login failed")`, then immediately calls `require_logon_sandbox_creds` with the original arguments and returns its `SandboxCreds` result.
+**Data flow**: It receives the same inputs as the main credential function. First it deletes the sandbox users file with a reason saying the login failed. Then it passes all the original permission, folder, environment, and proxy information into the normal credential function. The output is a fresh username and password pair, or an error if refresh cannot succeed.
 
-**Call relations**: It is invoked by higher-level launch code when a runner transport failure is recognized as stale sandbox credentials. Its only job is to invalidate cached user records and delegate back to the main credential-acquisition routine.
+**Call relations**: The elevated sandbox session launcher calls this after a login attempt fails. It uses the file-deletion helper to invalidate stale credentials, then hands control back to the main credential orchestration function.
 
 *Call graph*: calls 2 internal fn (remove_sandbox_users_file, require_logon_sandbox_creds); called by 1 (spawn_windows_sandbox_session_elevated_for_permission_profile).
 
@@ -2319,11 +2329,11 @@ fn refresh_logon_sandbox_creds(
 fn remove_sandbox_users_file_deletes_existing_file()
 ```
 
-**Purpose**: Verifies that deleting the sandbox users file removes an existing file from disk. It covers the successful deletion branch.
+**Purpose**: This test proves that the cleanup helper really deletes a users file when one exists. It protects the recovery path from leaving stale credentials behind.
 
-**Data flow**: The test creates a temporary `codex_home`, computes the users-file path, creates parent directories, writes a dummy file, calls `remove_sandbox_users_file`, and asserts that the file no longer exists.
+**Data flow**: It creates a temporary Codex home folder, builds the expected users file path, creates the parent folder, writes a dummy users file, and calls the deletion helper. Afterward, it checks that the file no longer exists.
 
-**Call relations**: It directly exercises `remove_sandbox_users_file` with a present file. This test ensures stale-credential recovery can actually clear persisted user state.
+**Call relations**: This test calls the same deletion helper used by credential refresh. It sets up a small fake filesystem situation so the helper’s normal success path can be checked without touching real sandbox data.
 
 *Call graph*: calls 2 internal fn (remove_sandbox_users_file, sandbox_users_path); 4 external calls (new, assert!, create_dir_all, write).
 
@@ -2334,22 +2344,26 @@ fn remove_sandbox_users_file_deletes_existing_file()
 fn remove_sandbox_users_file_ignores_missing_file()
 ```
 
-**Purpose**: Verifies that deleting the sandbox users file succeeds even when the file is absent. It covers the `NotFound` branch.
+**Purpose**: This test proves that deleting a missing users file is treated as success. That matters because cleanup should be safe to run even when another step already removed the stale file.
 
-**Data flow**: The test creates a temporary `codex_home`, computes the expected users-file path, calls `remove_sandbox_users_file` without creating the file, and asserts that the path still does not exist.
+**Data flow**: It creates a temporary Codex home folder but does not create the users file. It calls the deletion helper and then checks that the file is still absent. The expected result is no error.
 
-**Call relations**: It validates the idempotent cleanup behavior relied on by `refresh_logon_sandbox_creds`. This prevents stale-credential recovery from failing just because the users file was already missing.
+**Call relations**: This test calls the cleanup helper directly to verify its forgiving behavior. That behavior is important for the credential refresh flow, which should not fail just because there was nothing to delete.
 
 *Call graph*: calls 2 internal fn (remove_sandbox_users_file, sandbox_users_path); 2 external calls (new, assert!).
 
 
 ### `windows-sandbox-rs/src/acl.rs`
 
-`domain_logic` · `sandbox setup, ACL enforcement, and permission repair`
+`domain_logic` · `sandbox permission setup, checks, and cleanup`
 
-This file is the low-level ACL manipulation core for the Windows sandbox implementation. It wraps Win32 security APIs such as `GetSecurityInfo`, `GetNamedSecurityInfoW`, `SetEntriesInAclW`, `SetNamedSecurityInfoW`, and `SetSecurityInfo`, translating them into `anyhow::Result`-based Rust helpers. The code works directly with raw `ACL` pointers, ACE headers, SID pointers (`*mut c_void`), and manually managed security descriptors that must be released with `LocalFree`.
+Windows protects files, folders, and some devices with an ACL, an access-control list. A DACL is the part of that list that says who is allowed or denied access. Each entry is an ACE, like a line on a guest list: “this user may write” or “this user may not read.” The user or group is identified by a SID, a Windows security identifier.
 
-A major design choice is to separate read-only inspection from mutation. Inspection helpers iterate ACEs with `GetAclInformation` and `GetAce`, skip `INHERIT_ONLY_ACE` entries because they do not apply to the current object, and compare ACE SIDs with `EqualSid`. `dacl_mask_allows` additionally maps generic access bits through a `GENERIC_MAPPING` before testing masks, which avoids false negatives when ACEs use generic file rights. Mutation helpers first avoid unnecessary rewrites by checking whether the desired ACE is already present, then build `EXPLICIT_ACCESS_W` entries and merge them into a new DACL with `SetEntriesInAclW`. Error paths consistently free allocated DACL/security-descriptor memory before returning. The file also includes special handling for the `NUL` device as a kernel object so redirected stdio remains usable under restricted tokens.
+This file is the sandbox’s low-level toolbox for those permission lists. It can fetch a path’s DACL, scan it to see whether a SID already has a needed permission, add allow entries, add deny entries, revoke entries, and give the sandbox user access to the Windows NUL device used for output redirection.
+
+A key idea is avoiding duplicate work. Before adding a permission, the code usually checks whether a matching ACE already exists. It also ignores “inherit-only” entries, because those apply only to children of a folder, not to the folder or file being checked right now.
+
+Most functions are marked unsafe because they pass raw pointers to Windows APIs. The file is careful to free Windows-allocated security descriptors with LocalFree and to close handles after use. If these calls were wrong, the sandbox could leak resources or, worse, give the sandboxed process too much or too little access.
 
 #### Function details
 
@@ -2359,11 +2373,11 @@ A major design choice is to separate read-only inspection from mutation. Inspect
 fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)>
 ```
 
-**Purpose**: Opens a filesystem path for `READ_CONTROL` and retrieves its DACL and backing security descriptor via the handle-based security API.
+**Purpose**: Opens an existing file or directory and asks Windows for its DACL, the list of allow and deny rules. Other code uses this when it needs to inspect permissions before deciding whether to change them.
 
-**Data flow**: Accepts a `&Path`, converts it to UTF-16 with `to_wide`, opens the path with `CreateFileW` using backup semantics so directories work, then calls `GetSecurityInfo` for `DACL_SECURITY_INFORMATION`. It returns `Ok((p_dacl, p_sd))` on success, where `p_sd` must later be freed with `LocalFree`; on failure it closes the handle and returns an `anyhow` error describing the path and Win32 status code.
+**Data flow**: It receives a filesystem path. It turns that path into the wide-character text format Windows APIs expect, opens the object with permission to read its security information, asks Windows for the DACL and its security descriptor, closes the file handle, and returns pointers to those Windows-owned structures. The caller must later free the returned security descriptor.
 
-**Call relations**: Used by `path_mask_allows` and `ensure_allow_mask_aces_with_inheritance_impl` as the shared DACL-fetch primitive before either inspecting or modifying ACL state.
+**Call relations**: This is the front door for permission inspection in this file. path_mask_allows uses it for a one-off permission check, and ensure_allow_mask_aces_with_inheritance_impl uses it before deciding whether it needs to add new allow entries.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 2 (ensure_allow_mask_aces_with_inheritance_impl, path_mask_allows); 5 external calls (anyhow!, null_mut, CloseHandle, GetSecurityInfo, CreateFileW).
 
@@ -2379,11 +2393,11 @@ fn dacl_mask_allows(
 ) -> bool
 ```
 
-**Purpose**: Scans a DACL for non-inherit-only allow ACEs matching any of the supplied SIDs and tests whether they grant the requested access mask.
+**Purpose**: Looks through a DACL and answers: does any of these SIDs already have the requested allowed permission bits? It can require either all requested bits or just any one of them.
 
-**Data flow**: Takes a raw `ACL` pointer, a slice of SID pointers, a desired mask, and a `require_all_bits` flag. It reads ACL size information, iterates ACEs, filters to `ACCESS_ALLOWED_ACE_TYPE`, skips inherit-only ACEs, computes the ACE SID pointer from the ACE layout, compares against the provided SIDs, maps generic rights to concrete file rights with `MapGenericMask`, and returns `true` if either all requested bits or any requested bit is present according to the flag; otherwise it returns `false`.
+**Data flow**: It receives a DACL pointer, a list of SID pointers, a desired permission mask, and a flag saying whether all bits are required. It reads each access entry in the DACL, skips entries that are not allow entries or that only apply to child objects, compares the entry’s SID with the provided SIDs, expands generic Windows permission names into concrete file permissions, and returns true if a matching allow entry is strong enough.
 
-**Call relations**: Called by `path_mask_allows` for path-based checks and by `ensure_allow_mask_aces_with_inheritance_impl` to avoid adding redundant allow ACEs.
+**Call relations**: path_mask_allows calls this after fetching a DACL for a path. ensure_allow_mask_aces_with_inheritance_impl calls it before adding permissions, so it does not rewrite the ACL when the needed allow rule is already present.
 
 *Call graph*: called by 2 (ensure_allow_mask_aces_with_inheritance_impl, path_mask_allows); 7 external calls (is_null, zeroed, null_mut, EqualSid, GetAce, GetAclInformation, MapGenericMask).
 
@@ -2399,11 +2413,11 @@ fn path_mask_allows(
 ) -> Result<bool>
 ```
 
-**Purpose**: Convenience wrapper that fetches a path’s DACL, checks it with `dacl_mask_allows`, and frees the returned security descriptor.
+**Purpose**: Provides a safe-looking path-level wrapper around the lower-level DACL scan. It answers whether a path grants certain permissions to any of the given SIDs.
 
-**Data flow**: Accepts a path, SID slice, desired mask, and `require_all_bits`. It calls `fetch_dacl_handle`, passes the returned DACL into `dacl_mask_allows`, frees the security descriptor with `LocalFree` if non-null, and returns `Result<bool>`.
+**Data flow**: It receives a path, SIDs, a desired permission mask, and the “all bits or any bit” choice. It fetches the path’s DACL, asks dacl_mask_allows to inspect it, frees the Windows security descriptor, and returns the yes-or-no result or an error if the DACL could not be fetched.
 
-**Call relations**: Used by higher-level audit code to test whether a path is world-writable without exposing raw ACL pointer management to callers.
+**Call relations**: Higher-level code such as path_has_world_write_allow uses this when it wants a simple permission question answered for a path. Internally, this function ties together fetch_dacl_handle and dacl_mask_allows and takes care of freeing the Windows allocation afterward.
 
 *Call graph*: calls 2 internal fn (dacl_mask_allows, fetch_dacl_handle); called by 1 (path_has_world_write_allow); 1 external calls (LocalFree).
 
@@ -2414,11 +2428,11 @@ fn path_mask_allows(
 fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
 ```
 
-**Purpose**: Checks whether a DACL already contains an applicable allow ACE for one SID that includes `FILE_GENERIC_WRITE`.
+**Purpose**: Checks whether one SID already has an allow entry that includes write permission. This is used to avoid adding another write allow entry when one is already effective.
 
-**Data flow**: Takes a DACL pointer and SID pointer, reads ACL metadata, iterates ACEs, filters to allow ACEs that are not inherit-only, extracts the ACE SID, compares it with `EqualSid`, and returns `true` if the ACE mask includes `FILE_GENERIC_WRITE`.
+**Data flow**: It receives a DACL pointer and one SID pointer. It reads the DACL entries, keeps only allow entries that apply to the current object, compares each entry’s SID to the requested SID, and returns true if the matching entry includes Windows’ generic file write permission.
 
-**Call relations**: Used by `add_allow_ace` as a fast pre-check to skip rewriting the DACL when the target SID already has write-capable access.
+**Call relations**: add_allow_ace calls this before changing a path’s ACL. If this check says write access is already present, add_allow_ace skips the more expensive ACL rewrite.
 
 *Call graph*: called by 1 (add_allow_ace); 6 external calls (is_null, zeroed, null_mut, EqualSid, GetAce, GetAclInformation).
 
@@ -2429,11 +2443,11 @@ fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
 fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
 ```
 
-**Purpose**: Checks whether a DACL already contains an applicable deny ACE for one SID that blocks write-like or delete-like operations.
+**Purpose**: Checks whether one SID already has a deny entry that blocks writing, appending, changing attributes, or deleting. It helps prevent duplicate deny rules.
 
-**Data flow**: Accepts a DACL pointer and SID pointer, computes a composite deny-write mask including generic write, write data, append, EA, attributes, delete, and delete-child rights, then scans deny ACEs for a matching SID and overlapping mask bits. It returns `true` on the first match, otherwise `false`.
+**Data flow**: It receives a DACL pointer and a SID pointer. It builds a combined set of write-related deny bits, scans deny entries that apply to the current object, compares SIDs, and returns true if the matching deny entry blocks any of those write-like actions.
 
-**Call relations**: Reached through `DenyAceKind::already_present` when `add_deny_ace` is deciding whether a write-deny ACE needs to be added.
+**Call relations**: DenyAceKind::already_present calls this when the requested deny type is Write. add_deny_ace then uses that answer to decide whether it needs to add a new deny ACE.
 
 *Call graph*: called by 1 (already_present); 6 external calls (is_null, zeroed, null_mut, EqualSid, GetAce, GetAclInformation).
 
@@ -2444,11 +2458,11 @@ fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
 fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
 ```
 
-**Purpose**: Checks whether a DACL already contains an applicable deny ACE for one SID that blocks read access.
+**Purpose**: Checks whether one SID already has a deny entry that blocks reading. It is the read-side counterpart to the write-deny check.
 
-**Data flow**: Accepts a DACL pointer and SID pointer, builds a deny-read mask from `FILE_GENERIC_READ | GENERIC_READ_MASK`, scans deny ACEs that are not inherit-only, compares ACE SIDs to the target SID, and returns whether any matching ACE denies those read bits.
+**Data flow**: It receives a DACL pointer and a SID pointer. It scans the DACL for deny entries that apply to the current object, compares each entry’s SID with the requested SID, and returns true if a matching entry denies generic read access.
 
-**Call relations**: Reached through `DenyAceKind::already_present` when `add_deny_ace` is handling the read-deny case.
+**Call relations**: DenyAceKind::already_present calls this when the requested deny type is Read. add_deny_ace uses the result so read-deny rules are only added when missing.
 
 *Call graph*: called by 1 (already_present); 6 external calls (is_null, zeroed, null_mut, EqualSid, GetAce, GetAclInformation).
 
@@ -2464,11 +2478,11 @@ fn ensure_allow_mask_aces_with_inheritance_impl(
 ) -> Result<bool>
 ```
 
-**Purpose**: Ensures each supplied SID has an allow ACE with a specific mask and inheritance flags on a filesystem path, adding only the missing entries.
+**Purpose**: Makes sure every given SID has an allow entry with a requested permission mask and chosen inheritance behavior. It returns whether it actually had to add anything.
 
-**Data flow**: Takes a path, SID slice, allow mask, and inheritance flags. It fetches the current DACL, builds a `Vec<EXPLICIT_ACCESS_W>` only for SIDs that `dacl_mask_allows` says do not already have the full mask, merges those entries into a new ACL with `SetEntriesInAclW`, writes the new DACL back with `SetNamedSecurityInfoW`, frees any allocated ACL/security-descriptor memory, and returns `Ok(true)` if at least one ACE was added, `Ok(false)` if nothing was needed, or an error if ACL merge/write fails.
+**Data flow**: It receives a path, a list of SIDs, a permission mask, and inheritance flags that say whether child files or folders should receive the rule. It fetches the current DACL, checks each SID with dacl_mask_allows, builds Windows explicit-access entries only for SIDs that are missing the required permission, merges those entries into a new DACL, writes the new DACL back to the path, frees temporary Windows memory, and returns true if new entries were written.
 
-**Call relations**: This is the real implementation behind the public allow-ensuring wrappers; `ensure_allow_mask_aces_with_inheritance` delegates directly to it.
+**Call relations**: ensure_allow_mask_aces_with_inheritance is the public wrapper that calls this implementation. This function is where the real work happens: it combines fetching, checking, building ACL entries, and writing the result back to Windows.
 
 *Call graph*: calls 3 internal fn (dacl_mask_allows, fetch_dacl_handle, to_wide); called by 1 (ensure_allow_mask_aces_with_inheritance); 6 external calls (new, anyhow!, null_mut, LocalFree, SetEntriesInAclW, SetNamedSecurityInfoW).
 
@@ -2484,11 +2498,11 @@ fn ensure_allow_mask_aces_with_inheritance(
 ) -> Result<bool>
 ```
 
-**Purpose**: Public unsafe wrapper that exposes the inheritance-aware allow-ACE ensuring operation.
+**Purpose**: Public wrapper for ensuring allow entries with caller-specified inheritance. It exists so other code can ask for a permission rule and control whether that rule flows down to children.
 
-**Data flow**: Passes its path, SID slice, allow mask, and inheritance flags straight through to `ensure_allow_mask_aces_with_inheritance_impl` and returns the resulting `Result<bool>`.
+**Data flow**: It receives a path, SIDs, a permission mask, and inheritance flags. It passes them unchanged into ensure_allow_mask_aces_with_inheritance_impl and returns that function’s result.
 
-**Call relations**: Called by `ensure_allow_mask_aces` to provide the lower-level variant where callers choose inheritance explicitly.
+**Call relations**: ensure_allow_mask_aces calls this with the standard file-and-folder inheritance flags. This wrapper keeps the public unsafe API small while leaving the detailed work in the implementation function.
 
 *Call graph*: calls 1 internal fn (ensure_allow_mask_aces_with_inheritance_impl); called by 1 (ensure_allow_mask_aces).
 
@@ -2503,11 +2517,11 @@ fn ensure_allow_mask_aces(
 ) -> Result<bool>
 ```
 
-**Purpose**: Ensures each supplied SID has an allow ACE with the requested mask using standard container and object inheritance.
+**Purpose**: Ensures allow entries for a set of SIDs using the normal inheritance behavior for folders. In practice, it means the permission can apply not only to the target folder but also to files and folders created underneath it.
 
-**Data flow**: Accepts a path, SID slice, and allow mask, then calls `ensure_allow_mask_aces_with_inheritance` with `CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE` and returns its result.
+**Data flow**: It receives a path, SIDs, and a permission mask. It adds the standard “inherit to child folders” and “inherit to child files” flags, calls ensure_allow_mask_aces_with_inheritance, and returns whether anything was added.
 
-**Call relations**: Acts as the common public helper for inherited filesystem allow ACEs and is used by `ensure_allow_write_aces`.
+**Call relations**: ensure_allow_write_aces uses this to request a preselected write-capable permission set. This function is the convenience layer for the common inheritable-permission case.
 
 *Call graph*: calls 1 internal fn (ensure_allow_mask_aces_with_inheritance); called by 1 (ensure_allow_write_aces).
 
@@ -2518,11 +2532,11 @@ fn ensure_allow_mask_aces(
 fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Result<bool>
 ```
 
-**Purpose**: Ensures each supplied SID has the file-access mask defined by `WRITE_ALLOW_MASK` on the target path.
+**Purpose**: Ensures that the given SIDs have the sandbox’s standard write-capable access to a path. This is useful when preparing a workspace or directory that the sandboxed process must be able to use.
 
-**Data flow**: Takes a path and SID slice, forwards them to `ensure_allow_mask_aces` with the constant `WRITE_ALLOW_MASK`, and returns whether any ACEs were added.
+**Data flow**: It receives a path and SIDs. It supplies the file’s predefined write-allow mask, delegates to ensure_allow_mask_aces, and returns whether any ACL entry was added.
 
-**Call relations**: Provides a semantic convenience wrapper for callers that want the crate’s standard write-capable allow set rather than an arbitrary mask.
+**Call relations**: This is the simplest “make this writable for these identities” helper in the file. It hands off all checking and writing to ensure_allow_mask_aces.
 
 *Call graph*: calls 1 internal fn (ensure_allow_mask_aces).
 
@@ -2533,11 +2547,11 @@ fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Result<bool>
 fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 ```
 
-**Purpose**: Adds an inherited allow ACE granting read, write, and execute rights to one SID on a path if a write-capable allow ACE is not already present.
+**Purpose**: Adds an allow entry that grants read, write, and execute access to one SID on a path, unless write access is already present. This supports older or simpler sandbox setup flows that need one direct allow rule.
 
-**Data flow**: Accepts a path and SID pointer, fetches the named object’s DACL with `GetNamedSecurityInfoW`, checks `dacl_has_write_allow_for_sid`, and if absent constructs one `EXPLICIT_ACCESS_W` with `SET_ACCESS` and inherited RXW permissions. It merges that ACE into a new DACL, writes it back with `SetNamedSecurityInfoW`, frees temporary ACL/security-descriptor allocations, and returns `Ok(true)` if it added access, `Ok(false)` if access already existed or the write-back path did not mark an addition, or an error if the initial security query failed.
+**Data flow**: It receives a path and a SID. It reads the path’s current DACL, checks whether the SID already has write access, and if not, creates an explicit allow entry for read/write/execute with inheritance to children. It merges that entry into a new DACL, writes the DACL back to the path, frees temporary Windows memory, and returns whether it added the rule.
 
-**Call relations**: Used by legacy ACL-application flows that need to grant a capability or user SID write-capable access to a path.
+**Call relations**: apply_legacy_session_acl_rules calls this during legacy sandbox permission setup. Inside this file, it relies on dacl_has_write_allow_for_sid to avoid unnecessary ACL rewrites and then uses Windows ACL APIs to apply the new rule.
 
 *Call graph*: calls 2 internal fn (dacl_has_write_allow_for_sid, to_wide); called by 1 (apply_legacy_session_acl_rules); 7 external calls (anyhow!, zeroed, null_mut, LocalFree, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW).
 
@@ -2548,11 +2562,11 @@ fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 ```
 
-**Purpose**: Adds an inherited deny ACE that blocks write-like operations for one SID on a path.
+**Purpose**: Adds a deny rule that blocks one SID from writing to a path. It is a small, readable entry point for the write-deny case.
 
-**Data flow**: Takes a path and SID pointer and forwards them to `add_deny_ace` with `DenyAceKind::Write`, returning the resulting `Result<bool>`.
+**Data flow**: It receives a path and a SID. It calls add_deny_ace with the Write deny kind and returns whether that lower-level function added a new deny entry.
 
-**Call relations**: Called by multiple higher-level enforcement paths, including world-writable audit remediation and workspace protection logic, as the write-deny convenience entrypoint.
+**Call relations**: Higher-level permission code calls this when it needs to protect workspace subdirectories, enforce world-writable safeguards, or apply legacy session rules. It delegates the shared deny-rule construction to add_deny_ace.
 
 *Call graph*: calls 1 internal fn (add_deny_ace); called by 3 (apply_capability_denies_for_world_writable_for_permissions, apply_legacy_session_acl_rules, protect_workspace_subdir).
 
@@ -2563,11 +2577,11 @@ fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 fn mask(self) -> u32
 ```
 
-**Purpose**: Maps a deny-ACE kind to the exact access mask that should be denied.
+**Purpose**: Translates a deny kind, Read or Write, into the exact Windows permission bits that should be denied. This keeps the meaning of each deny type in one place.
 
-**Data flow**: Consumes `self` and returns a `u32` mask: read denies use `FILE_GENERIC_READ | GENERIC_READ_MASK`, while write denies include generic write plus write-data, append, EA, attributes, delete, and delete-child bits.
+**Data flow**: It receives the enum value. For Read, it returns read-related bits; for Write, it returns write, append, attribute-change, and delete-related bits. It does not change anything outside itself.
 
-**Call relations**: Used inside `add_deny_ace` to populate `EXPLICIT_ACCESS_W.grfAccessPermissions` for the deny ACE being created.
+**Call relations**: add_deny_ace calls this when building the explicit Windows ACL entry. The enum value chosen by add_deny_read_ace or add_deny_write_ace determines which mask is produced.
 
 *Call graph*: called by 1 (add_deny_ace).
 
@@ -2578,11 +2592,11 @@ fn mask(self) -> u32
 fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void) -> bool
 ```
 
-**Purpose**: Checks whether the corresponding deny ACE already exists for a SID in a given DACL.
+**Purpose**: Checks whether the requested read-deny or write-deny rule already exists for a SID. This prevents adding duplicate deny entries.
 
-**Data flow**: Accepts `self`, a DACL pointer, and a SID pointer, dispatching to either `dacl_has_read_deny_for_sid` or `dacl_has_write_deny_for_sid` and returning that boolean result.
+**Data flow**: It receives the deny kind, a DACL pointer, and a SID pointer. If the kind is Read, it asks dacl_has_read_deny_for_sid; if the kind is Write, it asks dacl_has_write_deny_for_sid. It returns the yes-or-no answer.
 
-**Call relations**: Called by `add_deny_ace` before mutating the DACL so duplicate deny ACEs are not added.
+**Call relations**: add_deny_ace calls this before constructing a new deny ACE. It routes the shared deny flow to the correct specialized scanner for read or write.
 
 *Call graph*: calls 2 internal fn (dacl_has_read_deny_for_sid, dacl_has_write_deny_for_sid); called by 1 (add_deny_ace).
 
@@ -2593,11 +2607,11 @@ fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void) -> bool
 fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool>
 ```
 
-**Purpose**: Shared implementation for adding inherited read- or write-deny ACEs to a path when the deny is not already present.
+**Purpose**: Adds an inheritable deny entry for either read or write access, unless that deny entry is already present. Deny entries are important because Windows evaluates them so they can override broader allow rules.
 
-**Data flow**: Accepts a path, SID pointer, and `DenyAceKind`. It fetches the current DACL with `GetNamedSecurityInfoW`, checks `kind.already_present`, and if absent builds a trustee and `EXPLICIT_ACCESS_W` using `DENY_ACCESS`, `kind.mask()`, and inherited flags. It merges the deny ACE with `SetEntriesInAclW`, writes the new DACL with `SetNamedSecurityInfoW`, frees temporary allocations, and returns whether a deny ACE was added.
+**Data flow**: It receives a path, a SID, and a deny kind. It reads the current DACL, checks whether the matching deny rule already exists, builds a trustee for the SID, chooses the right permission mask from the deny kind, creates a deny explicit-access entry, merges it into a new DACL, writes the DACL back to the path, frees Windows allocations, and returns whether it added the rule.
 
-**Call relations**: This is the common mutation path behind both `add_deny_read_ace` and `add_deny_write_ace`.
+**Call relations**: add_deny_write_ace and add_deny_read_ace are the public, clearer wrappers that call this. Inside, it uses DenyAceKind::already_present for the duplicate check and DenyAceKind::mask for the exact Windows permission bits.
 
 *Call graph*: calls 3 internal fn (already_present, mask, to_wide); called by 2 (add_deny_read_ace, add_deny_write_ace); 7 external calls (anyhow!, zeroed, null_mut, LocalFree, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW).
 
@@ -2608,11 +2622,11 @@ fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<boo
 fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 ```
 
-**Purpose**: Adds an inherited deny ACE that blocks read access for one SID on a path.
+**Purpose**: Adds a deny rule that blocks one SID from reading a path. The rule is inheritable, so when it is placed on a directory it can also protect files and directories created below it.
 
-**Data flow**: Takes a path and SID pointer and delegates to `add_deny_ace` with `DenyAceKind::Read`, returning the resulting `Result<bool>`.
+**Data flow**: It receives a path and a SID. It calls add_deny_ace with the Read deny kind and returns whether a new deny entry was added.
 
-**Call relations**: Used by callers that need explicit read denial; it relies on `add_deny_ace` for ordering and inheritance behavior.
+**Call relations**: This is the read-deny entry point for callers. It hands the common ACL editing work to add_deny_ace, while making the caller’s intent clear.
 
 *Call graph*: calls 1 internal fn (add_deny_ace).
 
@@ -2623,11 +2637,11 @@ fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 fn revoke_ace(path: &Path, psid: *mut c_void)
 ```
 
-**Purpose**: Removes ACEs associated with a SID from a path’s DACL using `REVOKE_ACCESS` semantics, ignoring failures after the initial query.
+**Purpose**: Removes access entries for one SID from a path. This is used when the sandbox needs to undo or synchronize earlier permission changes.
 
-**Data flow**: Accepts a path and SID pointer, fetches the current DACL, constructs an `EXPLICIT_ACCESS_W` with zero permissions and access mode `4` (`REVOKE_ACCESS`), merges it into a new DACL with `SetEntriesInAclW`, attempts to write the result back with `SetNamedSecurityInfoW`, and frees any allocated ACL/security-descriptor memory. It returns no value and silently exits on query failure.
+**Data flow**: It receives a path and a SID. It reads the current DACL, builds a revoke-access entry for that SID, asks Windows to merge that revocation into a new DACL, writes the new DACL back to the path, and frees any temporary Windows memory. It does not return an error; if a Windows call fails, it simply stops or ignores the write failure.
 
-**Call relations**: Invoked by higher-level deny-read synchronization code when previously applied ACEs need to be removed.
+**Call relations**: apply_deny_read_acls and sync_persistent_deny_read_acls call this when maintaining read-deny ACL state. Unlike the add functions, this one is a cleanup-style helper and quietly exits on failure.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 2 (apply_deny_read_acls, sync_persistent_deny_read_acls); 6 external calls (zeroed, null_mut, LocalFree, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW).
 
@@ -2638,24 +2652,24 @@ fn revoke_ace(path: &Path, psid: *mut c_void)
 fn allow_null_device(psid: *mut c_void)
 ```
 
-**Purpose**: Grants a SID read/write/execute access to the `NUL` device object so redirected stdio continues to work under restricted tokens.
+**Purpose**: Grants a SID access to the Windows NUL device, a special sink/source often used when redirecting standard output or error. Without this, a sandboxed process might fail when its output is redirected to NUL.
 
-**Data flow**: Accepts a SID pointer, opens `\\.\NUL` with enough rights to read and modify its DACL, retrieves the kernel-object DACL with `GetSecurityInfo`, constructs a non-inherited `EXPLICIT_ACCESS_W` granting generic read/write/execute, merges it with `SetEntriesInAclW`, writes it back with `SetSecurityInfo`, frees temporary allocations, and closes the device handle. If opening or querying fails, it returns early without error reporting.
+**Data flow**: It receives a SID. It opens the special \\.\NUL device with rights to read and change its security information, reads its DACL, builds an allow entry for read/write/execute for that SID, merges it into a new DACL, writes the new DACL back to the device object, frees temporary security data, and closes the device handle.
 
-**Call relations**: Called during sandboxed process setup so capability or sandbox-user SIDs can interact with the null device used for stdout/stderr redirection.
+**Call relations**: Sandbox startup paths such as run_windows_sandbox_capture_for_permission_profile, allow_null_device_for_workspace_write, apply_legacy_session_acl_rules, and prepare_elevated_spawn_context_for_permissions call this when they need output redirection to work under a restricted identity. It uses handle-based Windows security APIs because NUL is a kernel device rather than an ordinary file path.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 4 (run_windows_sandbox_capture_for_permission_profile, allow_null_device_for_workspace_write, apply_legacy_session_acl_rules, prepare_elevated_spawn_context_for_permissions); 8 external calls (zeroed, null_mut, CloseHandle, LocalFree, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, CreateFileW).
 
 
 ### `windows-sandbox-rs/src/token.rs`
 
-`domain_logic` · `sandbox token construction and Windows security setup`
+`domain_logic` · `process launch / sandbox setup`
 
-This file is the core Windows security-token utility layer for the sandbox. It wraps a set of low-level `windows_sys` calls to inspect process tokens, construct restricted tokens, and prepare them so sandboxed processes can still create IPC objects. The code works heavily with raw `HANDLE`s and SID pointers, so most functions are `unsafe` and document ownership expectations explicitly.
+On Windows, a process runs with a token: a bundle of identity and permission information, like a security badge. This file takes an existing token and creates a more limited badge for sandboxed work. Without this, a sandboxed process could either have too much power, which is unsafe, or too little power, which would make normal things like PowerShell pipelines and inter-process communication fail.
 
-The SID helpers cover three cases: creating the well-known Everyone SID (`world_sid`), converting string SIDs via `ConvertStringSidToSidW`, and owning such allocations through `LocalSid`, whose `Drop` frees the SID with `LocalFree`. Token inspection helpers query `TokenGroups` to find the logon SID, including a fallback through `TokenLinkedToken`, and query `TokenUser` to copy the token's user SID. `get_current_token_for_restriction` opens the current process token with all rights needed for duplication and adjustment.
+The file works mostly with SIDs, or security identifiers. A SID is Windows’ way of naming a user, group, logon session, or special capability. The code can make common SIDs such as “Everyone,” convert SID strings into Windows SID objects, and copy the current user or logon SID out of a token.
 
-Token creation flows through `create_token_with_caps_from`. It requires at least one capability SID, gathers the logon SID and Everyone SID, builds a `SID_AND_ATTRIBUTES` array in a deliberate order (capabilities, extra restricting SIDs, logon, everyone), and calls `CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED`. After creation it installs a permissive default DACL granting `GENERIC_ALL` to logon/everyone/capability SIDs so sandboxed processes can create pipes and similar objects, then re-enables `SeChangeNotifyPrivilege`. Thin wrappers expose readonly and workspace-write variants, with optional inclusion of the token user SID for elevated sandbox accounts.
+The main path creates a restricted token with one or more capability SIDs. It also adds the current logon SID and the Everyone SID as restricting SIDs, then asks Windows to produce a token with most privileges disabled. After that, it sets a permissive default DACL. A DACL is an access list attached to newly created objects; here it helps sandboxed processes create pipes and other communication objects without being blocked unexpectedly. Finally, it re-enables one harmless but important privilege, SeChangeNotifyPrivilege, which Windows commonly needs for directory traversal.
 
 #### Function details
 
@@ -2665,11 +2679,11 @@ Token creation flows through `create_token_with_caps_from`. It requires at least
 fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()>
 ```
 
-**Purpose**: Builds and applies a default DACL on a token that grants broad access to a supplied set of SID principals. This is specifically used so restricted sandbox processes can create IPC objects without access-denied failures.
+**Purpose**: Sets the default access list on a token so new objects created by the sandboxed process can be used by the intended SIDs. This prevents confusing access-denied failures when child processes create pipes or other communication objects.
 
-**Data flow**: Takes a token `HANDLE` and a slice of raw SID pointers. If the slice is empty it returns success immediately. Otherwise it maps each SID into an `EXPLICIT_ACCESS_W`, calls `SetEntriesInAclW` to allocate a new ACL, wraps that ACL pointer in a `TokenDefaultDaclInfo`, and passes it to `SetTokenInformation(TokenDefaultDacl)`. On failure it reads `GetLastError`, frees the ACL with `LocalFree` if allocated, and returns an `anyhow` error; on success it still frees the ACL allocation before returning `Ok(())`.
+**Data flow**: It receives a token handle and a list of SID pointers. If the list is empty, nothing changes. Otherwise it turns those SIDs into Windows access-list entries granting broad access, asks Windows to build a new DACL from them, attaches that DACL to the token, frees the temporary Windows-allocated memory, and returns success or an error.
 
-**Call relations**: It is called only from `create_token_with_caps_from` after `CreateRestrictedToken` succeeds. Its role is post-processing the new token so later child-process creation and pipe setup work under the restricted security context.
+**Call relations**: This is used after a restricted token has been created. create_token_with_caps_from calls it to make the new token practical for real sandboxed programs, especially programs that need to create communication objects.
 
 *Call graph*: called by 1 (create_token_with_caps_from); 8 external calls (anyhow!, is_empty, iter, null_mut, GetLastError, LocalFree, SetEntriesInAclW, SetTokenInformation).
 
@@ -2680,11 +2694,11 @@ fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()>
 fn world_sid() -> Result<Vec<u8>>
 ```
 
-**Purpose**: Allocates and returns the binary bytes of the well-known Everyone SID. The returned `Vec<u8>` can then be passed to Win32 APIs via its mutable pointer.
+**Purpose**: Creates the Windows SID for the built-in “Everyone” group. This SID is used when the restricted token needs to recognize broadly shared access rules.
 
-**Data flow**: Performs the standard two-call `CreateWellKnownSid` pattern: first with a null output pointer to discover the required size, then with a `Vec<u8>` buffer of that size to populate the SID. If the second call fails it returns an `anyhow` error containing `GetLastError`; otherwise it returns the filled byte vector.
+**Data flow**: It first asks Windows how many bytes are needed for the Everyone SID, allocates a byte buffer of that size, then asks Windows to fill the buffer. It returns the SID bytes or an error if Windows cannot create it.
 
-**Call relations**: It is used when constructing restricted tokens and anywhere else the code needs an Everyone SID in raw form. In this file, `create_token_with_caps_from` depends on it to add Everyone as a restricting SID and DACL principal.
+**Call relations**: create_token_with_caps_from uses this SID as part of the restricted token’s limiting identity set. Other security checks, such as path_has_world_write_allow, also use it when they need to compare access rules against Everyone.
 
 *Call graph*: called by 2 (path_has_world_write_allow, create_token_with_caps_from); 4 external calls (anyhow!, null_mut, vec!, CreateWellKnownSid).
 
@@ -2695,11 +2709,11 @@ fn world_sid() -> Result<Vec<u8>>
 fn convert_string_sid_to_sid(s: &str) -> Option<*mut c_void>
 ```
 
-**Purpose**: Converts a textual SID such as `S-1-...` into a Win32-allocated SID pointer. The function leaves ownership with the caller, who must free it with `LocalFree`.
+**Purpose**: Turns a textual SID, such as one read from configuration or generated elsewhere, into the raw Windows SID pointer that Windows security APIs expect.
 
-**Data flow**: Accepts a Rust `&str`, converts it to a wide string with `to_wide`, calls the imported `ConvertStringSidToSidW`, and returns `Some(*mut c_void)` on success or `None` on failure. It initializes the output pointer to null before the call.
+**Data flow**: It receives a SID string, converts the text into Windows wide-character form, and calls the Windows conversion function. On success it returns a pointer allocated by Windows; on failure it returns nothing. The caller must later free that pointer.
 
-**Call relations**: This is the raw conversion primitive used by `LocalSid::from_string`. Higher-level code prefers the `LocalSid` wrapper so the allocation is automatically released.
+**Call relations**: LocalSid::from_string wraps this lower-level function so the rest of the code can use converted SIDs safely without remembering to free them by hand.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 1 (from_string); 1 external calls (null_mut).
 
@@ -2710,11 +2724,11 @@ fn convert_string_sid_to_sid(s: &str) -> Option<*mut c_void>
 fn from_string(sid: &str) -> Result<Self>
 ```
 
-**Purpose**: Creates an owning `LocalSid` wrapper from a textual SID string. It turns conversion failure into a descriptive `anyhow` error.
+**Purpose**: Creates a LocalSid owner from a SID string. This gives the project a safer Rust wrapper around a Windows-allocated SID.
 
-**Data flow**: Takes `&str`, calls `convert_string_sid_to_sid`, and if a non-null SID pointer is returned wraps it in `LocalSid { psid }`. If conversion fails it returns `Err(anyhow!("invalid SID string: ..."))`.
+**Data flow**: It receives text, asks convert_string_sid_to_sid to convert it, and either stores the returned pointer inside a LocalSid or reports that the string was invalid. The result is an object that owns the SID memory.
 
-**Call relations**: This constructor is the safe-ish entrypoint used by higher-level sandbox setup code when capability or ACL SIDs are configured as strings. It delegates all parsing/allocation to `convert_string_sid_to_sid` and relies on `Drop` for cleanup.
+**Call relations**: Higher-level sandbox setup code calls this when it needs capability or account SIDs for spawning sandboxed processes. It hides the raw conversion step behind a small ownership type.
 
 *Call graph*: calls 1 internal fn (convert_string_sid_to_sid); called by 5 (spawn_ipc_process, run_windows_sandbox_capture_for_permission_profile, prepare_elevated_spawn_context_for_permissions, prepare_legacy_session_security, root_capability_sids).
 
@@ -2725,11 +2739,11 @@ fn from_string(sid: &str) -> Result<Self>
 fn as_ptr(&self) -> *mut c_void
 ```
 
-**Purpose**: Exposes the wrapped SID pointer for passing into Win32 APIs that require raw SID addresses.
+**Purpose**: Returns the raw Windows SID pointer stored inside a LocalSid. This is needed because Windows API calls work with raw pointers rather than Rust-owned wrapper objects.
 
-**Data flow**: Reads `self.psid` and returns it unchanged as `*mut c_void`. It does not transfer ownership or mutate state.
+**Data flow**: It reads the stored pointer from the LocalSid and gives it back unchanged. It does not allocate, free, or modify anything.
 
-**Call relations**: This accessor supports callers that need to feed a `LocalSid` into token-creation or ACL APIs while keeping ownership with the wrapper.
+**Call relations**: Code that has built a LocalSid uses this when passing the SID into token-creation or access-control functions. The LocalSid still owns the memory; this only lends out the address.
 
 
 ##### `LocalSid::drop`  (lines 160–166)
@@ -2738,11 +2752,11 @@ fn as_ptr(&self) -> *mut c_void
 fn drop(&mut self)
 ```
 
-**Purpose**: Releases the SID allocation owned by `LocalSid` using `LocalFree`. It prevents leaks from `ConvertStringSidToSidW` allocations.
+**Purpose**: Frees the Windows memory owned by a LocalSid when the Rust object goes away. This prevents leaking memory allocated by Windows SID conversion.
 
-**Data flow**: On drop, checks whether `self.psid` is non-null and, if so, calls `LocalFree(self.psid as HLOCAL)`. It writes no Rust-visible state beyond object destruction.
+**Data flow**: When the LocalSid is being destroyed, it checks whether its pointer is non-null. If so, it calls Windows LocalFree on that pointer. Nothing is returned.
 
-**Call relations**: This destructor is the cleanup half of `LocalSid::from_string`. It is triggered automatically when higher-level sandbox setup code lets a `LocalSid` go out of scope.
+**Call relations**: This runs automatically as part of Rust cleanup. It balances the allocation done by convert_string_sid_to_sid and used through LocalSid::from_string.
 
 *Call graph*: 2 external calls (is_null, LocalFree).
 
@@ -2753,11 +2767,11 @@ fn drop(&mut self)
 fn get_current_token_for_restriction() -> Result<HANDLE>
 ```
 
-**Purpose**: Opens the current process token with the access rights required to duplicate and adjust it into a restricted primary token.
+**Purpose**: Opens the current process’s token with the rights needed to create a restricted child token. It is the starting point when the sandbox is based on the currently running process.
 
-**Data flow**: Computes a `desired` access mask combining duplicate, query, assign-primary, adjust-default, adjust-session-id, and adjust-privileges rights. It calls the imported `OpenProcessToken(GetCurrentProcess(), desired, &mut h)` and returns the resulting `HANDLE` on success or an `anyhow` error with `GetLastError` on failure.
+**Data flow**: It builds a requested-access mask containing token rights such as duplicate, query, assign, and adjust. It asks Windows to open the current process token with those rights. On success it returns a token handle; on failure it returns an error. The caller must close the handle.
 
-**Call relations**: This is the starting point for flows that derive sandbox tokens from the current process token. In this file it is used by `create_readonly_token_with_cap`, and elsewhere by desktop/ACL preparation code that needs the current token.
+**Call relations**: Sandbox setup code calls this before granting desktop access, preparing legacy session security, or creating a readonly token from the current process. create_readonly_token_with_cap also uses it before handing the token to the shared creation path.
 
 *Call graph*: called by 4 (grant_desktop_access, allow_null_device_for_workspace_write, prepare_legacy_session_security, create_readonly_token_with_cap); 2 external calls (anyhow!, GetCurrentProcess).
 
@@ -2768,11 +2782,11 @@ fn get_current_token_for_restriction() -> Result<HANDLE>
 fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Extracts the logon SID from a token, copying it into owned bytes. It also falls back to a linked token when the SID is not present on the original token.
+**Purpose**: Finds and copies the logon SID from a token. The logon SID identifies the current sign-in session and is useful for allowing the sandbox to interact with session-owned objects without giving it the full user identity.
 
-**Data flow**: Accepts a token `HANDLE` and first runs an inner scanner over `TokenGroups`: it queries the required buffer size, fills a `Vec<u8>`, manually accounts for alignment of the trailing `SID_AND_ATTRIBUTES` array, and searches for an entry whose attributes include `SE_GROUP_LOGON_ID`. When found, it uses `GetLengthSid` and `CopySid` to return an owned SID byte vector. If not found, it queries token class 19 (`TokenLinkedToken`), reads the linked token handle from the returned buffer, scans that token the same way, closes the linked handle with `CloseHandle`, and returns the copied SID or an error if neither token contains one.
+**Data flow**: It receives a token handle and asks Windows for the token’s groups. It scans those groups for the special logon-session marker, copies that SID into a Rust byte buffer, and returns it. If the SID is not on the token, it tries the linked token, which Windows may provide for elevated or filtered accounts. If neither has it, it returns an error.
 
-**Call relations**: It is a prerequisite for restricted-token creation because the logon SID is always appended to the restricting SID list. `create_token_with_caps_from` calls it directly, and other security setup code uses it when granting desktop or device access.
+**Call relations**: create_token_with_caps_from uses this SID as one of the restricting SIDs and as part of the default DACL. Desktop and device-access setup code also calls it when it needs to grant access specifically to the current logon session.
 
 *Call graph*: called by 3 (grant_desktop_access, allow_null_device_for_workspace_write, create_token_with_caps_from); 6 external calls (anyhow!, null_mut, read_unaligned, vec!, CloseHandle, GetTokenInformation).
 
@@ -2783,11 +2797,11 @@ fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>>
 fn get_user_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>>
 ```
 
-**Purpose**: Copies the token's primary user SID into an owned byte buffer. This is used when the restricted token should also be constrained by the token user identity.
+**Purpose**: Copies the user SID from a token. This is used when the sandbox token must also include the token’s user identity as an extra restricting SID, especially for a dedicated sandbox account.
 
-**Data flow**: Queries `TokenUser` size, allocates a `Vec<u8>`, fills it with `GetTokenInformation`, reads a `TOKEN_USER` structure from the buffer, obtains the SID length with `GetLengthSid`, allocates an output vector of that size, and copies the SID with `CopySid`. It returns detailed `anyhow` errors for zero sizes, failed queries, zero SID length, or failed copies.
+**Data flow**: It receives a token handle, asks Windows how large the TokenUser data is, allocates a buffer, and reads the user information into it. It then measures and copies the user SID into its own byte buffer and returns those bytes. If any Windows call fails, it returns an error.
 
-**Call relations**: It is called by the `*_with_caps_and_user_from` wrappers before they delegate to `create_token_with_caps_from`. Those wrappers use the returned bytes to supply an extra restricting SID pointer.
+**Call relations**: The token-creation variants with “and_user” call this before delegating to create_token_with_caps_from. That lets those variants add the token user SID while reusing the same core restricted-token builder.
 
 *Call graph*: called by 2 (create_readonly_token_with_caps_and_user_from, create_workspace_write_token_with_caps_and_user_from); 7 external calls (anyhow!, null_mut, read_unaligned, vec!, CopySid, GetLengthSid, GetTokenInformation).
 
@@ -2798,11 +2812,11 @@ fn get_user_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>>
 fn enable_single_privilege(h_token: HANDLE, name: &str) -> Result<()>
 ```
 
-**Purpose**: Looks up one named privilege and enables it on a token. The implementation is used to restore `SeChangeNotifyPrivilege` after creating a restricted token.
+**Purpose**: Enables one named Windows privilege on a token. In this file it is used to restore SeChangeNotifyPrivilege, a common privilege needed for normal directory traversal.
 
-**Data flow**: Takes a token `HANDLE` and privilege name `&str`, converts the name to UTF-16 with `to_wide`, resolves its `LUID` via `LookupPrivilegeValueW`, fills a zeroed `TOKEN_PRIVILEGES` with one enabled privilege entry, and calls `AdjustTokenPrivileges`. It checks both the API return value and the post-call `GetLastError`, returning `Ok(())` only when both indicate success.
+**Data flow**: It receives a token handle and a privilege name. It asks Windows for the internal numeric ID of that privilege, builds a small privilege-change request, and applies it to the token. It returns success only if Windows reports that the privilege was actually adjusted.
 
-**Call relations**: This is a post-processing helper called only by `create_token_with_caps_from`. It exists because the restricted-token flags disable privileges broadly, but the sandbox still needs directory traversal semantics provided by `SeChangeNotifyPrivilege`.
+**Call relations**: create_token_with_caps_from calls this at the end of token creation. Most privileges are removed for safety, but this one is restored so ordinary file-system navigation does not break.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 1 (create_token_with_caps_from); 7 external calls (anyhow!, zeroed, null, null_mut, GetLastError, AdjustTokenPrivileges, LookupPrivilegeValueW).
 
@@ -2815,11 +2829,11 @@ fn create_readonly_token_with_cap(
 ) -> Result<(HANDLE, *mut c_void)>
 ```
 
-**Purpose**: Convenience wrapper that derives a readonly restricted token from the current process token using a single capability SID.
+**Purpose**: Creates a restricted token from the current process using one capability SID. It is a convenience path for older or simpler sandbox setup code that only has a single capability.
 
-**Data flow**: Calls `get_current_token_for_restriction()` to open the base token, passes that handle and the capability SID pointer to `create_readonly_token_with_cap_from`, closes the base handle with `CloseHandle`, and returns the resulting `(HANDLE, *mut c_void)` pair.
+**Data flow**: It opens the current process token, passes that token and the capability SID to create_readonly_token_with_cap_from, closes the temporary base token, and returns the new restricted token plus the same capability pointer. If any step fails, it returns an error.
 
-**Call relations**: This wrapper is used when callers want the common current-process case without manually opening a base token. It delegates all actual token construction to `create_readonly_token_with_cap_from`.
+**Call relations**: prepare_legacy_session_security calls this when it needs a readonly sandbox token. This function is a wrapper that takes care of opening and closing the current token before handing off to the shared builder.
 
 *Call graph*: calls 2 internal fn (create_readonly_token_with_cap_from, get_current_token_for_restriction); called by 1 (prepare_legacy_session_security); 1 external calls (CloseHandle).
 
@@ -2833,11 +2847,11 @@ fn create_readonly_token_with_cap_from(
 ) -> Result<(HANDLE, *mut c_void)>
 ```
 
-**Purpose**: Creates a readonly restricted token from a supplied base token and one capability SID, preserving the capability pointer in the return value.
+**Purpose**: Creates a restricted token from an already-open base token using one capability SID. It exists for callers that already have the base token and do not want this function to open the current process token itself.
 
-**Data flow**: Accepts a base token `HANDLE` and a capability SID pointer, calls `create_token_with_caps_from(base_token, &[psid_capability], &[])`, and returns the new token handle together with the original capability pointer.
+**Data flow**: It receives a base token handle and one capability SID pointer. It wraps that single SID as a one-item list, calls the shared token builder, and returns the new token together with the original capability pointer.
 
-**Call relations**: It is the implementation behind `create_readonly_token_with_cap`. Its only job is adapting the single-capability API shape to the general multi-capability constructor.
+**Call relations**: create_readonly_token_with_cap calls this after opening the current token. This function then delegates the real work to create_token_with_caps_from.
 
 *Call graph*: calls 1 internal fn (create_token_with_caps_from); called by 1 (create_readonly_token_with_cap).
 
@@ -2851,11 +2865,11 @@ fn create_workspace_write_token_with_caps_from(
 ) -> Result<HANDLE>
 ```
 
-**Purpose**: Creates a restricted token that includes one or more capability SIDs for workspace-write scenarios, without adding the token user SID as an extra restricting SID.
+**Purpose**: Creates a restricted token that includes several capability SIDs for workspace-write scenarios. Despite the name difference, it uses the same core restricted-token machinery as the readonly variants.
 
-**Data flow**: Takes a base token handle and a slice of capability SID pointers, then directly returns the result of `create_token_with_caps_from(base_token, psid_capabilities, &[])`.
+**Data flow**: It receives a base token and a list of capability SID pointers. It passes them to the shared token builder without adding any extra restricting SIDs, and returns the resulting token or an error.
 
-**Call relations**: This is a thin semantic wrapper over the shared constructor, used by legacy session security setup when write-capability roots are represented as capability SIDs.
+**Call relations**: prepare_legacy_session_security uses this when setting up a token that should be allowed to write in the workspace according to the provided capabilities. The detailed Windows token construction is handled by create_token_with_caps_from.
 
 *Call graph*: calls 1 internal fn (create_token_with_caps_from); called by 1 (prepare_legacy_session_security).
 
@@ -2869,11 +2883,11 @@ fn create_workspace_write_token_with_caps_and_user_from(
 ) -> Result<HANDLE>
 ```
 
-**Purpose**: Creates a workspace-write restricted token that includes capability SIDs and also restricts by the base token's user SID. This is intended for elevated backends where the token user is the dedicated sandbox account.
+**Purpose**: Creates a restricted workspace-write token that includes both capability SIDs and the token user SID. This is meant for the elevated sandbox backend, where the user may be a dedicated sandbox account rather than the real signed-in user.
 
-**Data flow**: Reads the base token's user SID bytes via `get_user_sid_bytes`, takes a mutable pointer into that buffer, and passes the capability SID slice plus a one-element extra-restricting-SID slice to `create_token_with_caps_from`. It returns the new token handle.
+**Data flow**: It receives a base token and capability SID pointers. It copies the user SID out of the base token, uses that SID as an extra restricting SID, then calls the shared token builder. The output is a new restricted token or an error.
 
-**Call relations**: This wrapper extends the shared constructor with one extra restricting SID. It is chosen by callers that need the sandbox account's user SID to participate in access checks.
+**Call relations**: This is a specialized wrapper around create_token_with_caps_from. It first calls get_user_sid_bytes so the core builder can include the sandbox account identity in the token’s restriction set.
 
 *Call graph*: calls 2 internal fn (create_token_with_caps_from, get_user_sid_bytes).
 
@@ -2887,11 +2901,11 @@ fn create_readonly_token_with_caps_from(
 ) -> Result<HANDLE>
 ```
 
-**Purpose**: Creates a readonly restricted token from a base token and multiple capability SIDs.
+**Purpose**: Creates a restricted token from an existing base token using multiple capability SIDs. It is the multi-capability version of the readonly token path.
 
-**Data flow**: Accepts a base token handle and a slice of capability SID pointers, then forwards them to `create_token_with_caps_from` with no extra restricting SIDs.
+**Data flow**: It receives a base token and a list of capability SID pointers. It forwards them to the shared token builder with no extra user SID, then returns the new restricted token or an error.
 
-**Call relations**: This is another semantic wrapper around the common constructor, used when readonly access is represented by multiple capability SIDs rather than a single one.
+**Call relations**: This function is a thin public entry into create_token_with_caps_from for callers that already have all needed capabilities and do not need the user SID added.
 
 *Call graph*: calls 1 internal fn (create_token_with_caps_from).
 
@@ -2905,11 +2919,11 @@ fn create_readonly_token_with_caps_and_user_from(
 ) -> Result<HANDLE>
 ```
 
-**Purpose**: Creates a readonly restricted token that includes capability SIDs and the base token's user SID as an additional restricting SID.
+**Purpose**: Creates a restricted readonly token that includes multiple capability SIDs plus the token user SID. This supports elevated sandbox setups that run under a dedicated sandbox account.
 
-**Data flow**: Obtains owned user SID bytes from `get_user_sid_bytes(base_token)`, converts the buffer to a raw SID pointer, and calls `create_token_with_caps_from(base_token, psid_capabilities, &[psid_user])`. It returns the resulting token handle.
+**Data flow**: It receives a base token and capability SID pointers. It copies the user SID from the base token, adds that copied SID to the extra restricting list, and calls the shared token builder. It returns the new restricted token or an error.
 
-**Call relations**: Like the workspace-write variant, this wrapper exists for elevated-account scenarios. It delegates all heavy lifting to `get_user_sid_bytes` and `create_token_with_caps_from`.
+**Call relations**: Like the workspace-write “and_user” variant, this function prepares the user SID with get_user_sid_bytes and then relies on create_token_with_caps_from for the actual restricted-token creation.
 
 *Call graph*: calls 2 internal fn (create_token_with_caps_from, get_user_sid_bytes).
 
@@ -2924,24 +2938,24 @@ fn create_token_with_caps_from(
 ) -> Result<HANDLE>
 ```
 
-**Purpose**: Constructs the actual restricted token used by the sandbox, combining capability SIDs with mandatory restricting SIDs and token post-processing. It is the central token-creation routine in this file.
+**Purpose**: Builds the actual restricted Windows token used by the sandbox. This is the central routine that combines capabilities, optional extra SIDs, the logon SID, and the Everyone SID into a safer token.
 
-**Data flow**: Takes a base token handle, a non-empty slice of capability SID pointers, and a slice of extra restricting SID pointers. It errors immediately if no capabilities are provided. It then copies the base token's logon SID via `get_logon_sid_bytes`, creates the Everyone SID via `world_sid`, allocates a `Vec<SID_AND_ATTRIBUTES>` sized for capabilities + extras + logon + everyone, and fills it in that exact order. It calls `CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED`, then builds a DACL SID list containing logon, everyone, and all capabilities, applies it with `set_default_dacl`, enables `SeChangeNotifyPrivilege` with `enable_single_privilege`, and returns the new token `HANDLE`.
+**Data flow**: It receives a base token, a list of capability SID pointers, and optional extra restricting SID pointers. It rejects an empty capability list, copies the logon SID, creates the Everyone SID, and arranges all SIDs in the order expected by this sandbox design. It then asks Windows to create a restricted token with major privileges disabled, sets the token’s default DACL so created objects are usable, enables SeChangeNotifyPrivilege, and returns the new token handle.
 
-**Call relations**: All public token-construction wrappers funnel into this function. It is the point where SID discovery, restricted-token creation, DACL setup, and privilege restoration are combined into one coherent sandbox token build step.
+**Call relations**: All public token-creation variants eventually call this function. It in turn calls get_logon_sid_bytes, world_sid, set_default_dacl, and enable_single_privilege to assemble the token and make it usable for sandboxed child processes.
 
 *Call graph*: calls 4 internal fn (enable_single_privilege, get_logon_sid_bytes, set_default_dacl, world_sid); called by 5 (create_readonly_token_with_cap_from, create_readonly_token_with_caps_and_user_from, create_readonly_token_with_caps_from, create_workspace_write_token_with_caps_and_user_from, create_workspace_write_token_with_caps_from); 8 external calls (with_capacity, anyhow!, is_empty, iter, len, null, vec!, CreateRestrictedToken).
 
 
 ### `windows-sandbox-rs/src/deny_read_acl.rs`
 
-`domain_logic` · `sandbox setup / ACL application`
+`domain_logic` · `sandbox setup and permission synchronization`
 
-This file implements the low-level path preparation and one-shot ACL application logic for deny-read sandbox rules. Its central design choice is to preserve two views of a denied path: the exact lexical path the policy named, and, for existing paths, the canonicalized target returned by path normalization. That dual representation prevents bypass through reparse points while still allowing future missing paths to be materialized and denied under the originally configured spelling.
+This file is about protecting secrets from a sandboxed command. In Windows, file permissions are stored in an ACL, or access control list, which is like a guest list saying who may read, write, or enter a file or folder. This code adds a deny-read ACE, meaning an access control entry that explicitly says “this sandbox identity may not read here.”
 
-`plan_deny_read_acl_paths` builds the ordered path list, deduplicating with a normalized string key produced by `lexical_path_key`. The key lowercases, converts backslashes to slashes, and trims trailing separators, so equivalent Windows spellings collapse to one entry. `apply_deny_read_acls` then walks the planned list, creating missing paths as directories before applying the deny ACE. This is intentional: a sandboxed process should not be able to create a previously absent denied path and immediately read it before ACLs exist.
+The first job is planning. A user may configure a path such as `secret.env`. If that path already exists, it might also have a real resolved location, for example through a shortcut-like Windows feature called a reparse point. So the planner keeps both the written path and the canonical, resolved path. If the path does not exist yet, it still keeps the written path, because the sandbox must not be able to create that path later and then read it.
 
-The function tracks which ACEs were newly added during the current call. If any later path fails during directory creation or ACE insertion, it revokes only those newly added ACEs and returns the original error, avoiding partial deny state from a failed one-shot setup. The returned vector is the deduplicated set of paths actually targeted during this invocation, regardless of whether an ACE was newly inserted or already present.
+The second job is applying the plan. For missing denied paths, the code creates directories first, then applies the deny-read rule. This is defensive: it turns “future forbidden place” into a real place with permissions already attached. If any permission update fails, the file revokes every deny rule it added during this call before returning the error. That makes the operation all-or-nothing, like rolling back a failed transaction.
 
 #### Function details
 
@@ -2951,11 +2965,11 @@ The function tracks which ACEs were newly added during the current call. If any 
 fn plan_deny_read_acl_paths(paths: &[PathBuf]) -> Vec<PathBuf>
 ```
 
-**Purpose**: Builds the concrete path list that should receive deny-read ACLs from a policy-supplied slice of paths. For each input it preserves the original lexical path and, if the path already exists, also includes its canonicalized target path.
+**Purpose**: Builds the exact list of paths that should receive deny-read permissions. It keeps the path as configured, and also adds the resolved real path when the target already exists, so the sandbox cannot bypass the rule by reaching the same object another way.
 
-**Data flow**: It takes a slice of `PathBuf` inputs, iterates in order, and feeds each candidate through `push_planned_path` with a shared `HashSet` of normalized keys. Existing paths are additionally passed through `canonicalize_path`; the function returns a `Vec<PathBuf>` containing unique planned ACL targets in insertion order.
+**Data flow**: It receives a list of paths. For each one, it adds the original path to a planned list if it has not already seen an equivalent spelling. If the path exists on disk, it also asks for the canonical path, meaning the fully resolved real location, and adds that too if it is not a duplicate. It returns the final ordered list of paths to protect.
 
-**Call relations**: This is the planning phase used by `apply_deny_read_acls` before any filesystem mutation occurs. The canonical-target inclusion is also exercised directly by the canonicalization-focused test to verify that existing paths expand into both lexical and resolved forms.
+**Call relations**: This is the planning step used by `apply_deny_read_acls` before any Windows permissions are changed. It relies on `push_planned_path` to avoid duplicates and on `canonicalize_path` when an existing path needs its real resolved target included. The test `tests::plan_includes_existing_canonical_targets` calls it directly to prove that existing paths get both forms.
 
 *Call graph*: calls 2 internal fn (push_planned_path, canonicalize_path); called by 2 (apply_deny_read_acls, plan_includes_existing_canonical_targets); 2 external calls (new, new).
 
@@ -2966,11 +2980,11 @@ fn plan_deny_read_acl_paths(paths: &[PathBuf]) -> Vec<PathBuf>
 fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf)
 ```
 
-**Purpose**: Conditionally appends a path to an output list only if its normalized lexical key has not been seen yet. It is the shared deduplication helper for both planning and applied-path reporting.
+**Purpose**: Adds one path to a plan only if an equivalent path has not already been added. This prevents the same permission rule from being applied twice just because a path is written with different slashes or letter casing.
 
-**Data flow**: It receives mutable references to the destination `Vec<PathBuf>` and `HashSet<String>`, plus a candidate `PathBuf`. It computes the key with `lexical_path_key`; if insertion into `seen` succeeds, it pushes the original `PathBuf` into `planned`, otherwise it leaves both collections unchanged.
+**Data flow**: It receives the growing planned path list, a set of already-seen path keys, and a path to consider. It turns the path into a normalized text key using `lexical_path_key`. If that key is new, it records the key and appends the path to the list. If the key was already present, it leaves the list unchanged.
 
-**Call relations**: Both `plan_deny_read_acl_paths` and `apply_deny_read_acls` route path accumulation through this helper so they use identical equivalence rules. It does not delegate beyond key generation, making it the single gate for duplicate suppression.
+**Call relations**: This is the small deduplication helper used during planning by `plan_deny_read_acl_paths` and again by `apply_deny_read_acls` when building the list of paths that were actually processed. It delegates the question of “what counts as the same path spelling” to `lexical_path_key`.
 
 *Call graph*: calls 1 internal fn (lexical_path_key); called by 2 (apply_deny_read_acls, plan_deny_read_acl_paths).
 
@@ -2981,11 +2995,11 @@ fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, pat
 fn lexical_path_key(path: &Path) -> String
 ```
 
-**Purpose**: Normalizes a path into a case-insensitive, separator-normalized string key suitable for Windows-style lexical deduplication. It intentionally ignores canonical filesystem identity and focuses on equivalent textual spellings.
+**Purpose**: Creates a simple comparison key for a path so paths that differ only by slash style, trailing slash, or letter case are treated as the same. This matters on Windows, where paths are usually not case-sensitive and backslashes and forward slashes can both appear.
 
-**Data flow**: It reads a `&Path`, converts it with `to_string_lossy`, replaces backslashes with forward slashes, trims trailing `/`, lowercases ASCII characters, and returns the resulting `String`. It writes no external state.
+**Data flow**: It receives a path. It converts it to text, changes backslashes into forward slashes, removes trailing slashes, and lowercases the result. It returns that cleaned-up string as the key used for duplicate checks.
 
-**Call relations**: This helper underpins deduplication in `push_planned_path` and is also reused by persistent ACL reconciliation code in another file so stored and newly applied paths compare under the same lexical rules.
+**Call relations**: This helper is called by `push_planned_path` whenever this file needs to avoid adding the same path twice. It is also used by `sync_persistent_deny_read_acls` elsewhere in the project, so persistent deny-read synchronization can compare paths in the same consistent way.
 
 *Call graph*: called by 2 (push_planned_path, sync_persistent_deny_read_acls); 1 external calls (to_string_lossy).
 
@@ -2996,11 +3010,11 @@ fn lexical_path_key(path: &Path) -> String
 fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<PathBuf>>
 ```
 
-**Purpose**: Applies deny-read ACEs to all planned paths for a sandbox principal, creating missing directories first and rolling back newly added ACEs if any step fails. It is the transactional-ish execution layer over the path plan.
+**Purpose**: Applies deny-read Windows permissions to all planned paths for the sandbox identity. It is careful to create missing paths first and to undo any new deny rules if a later path fails.
 
-**Data flow**: It accepts desired `paths` and an unsafe raw SID pointer `psid`. It first derives `planned` paths via `plan_deny_read_acl_paths`, then for each path: creates the directory tree if absent, calls `add_deny_read_ace`, records paths whose ACE was newly added, and accumulates a deduplicated `applied` list via `push_planned_path`. On any error it iterates `added_in_this_call` and invokes `revoke_ace` for rollback, then returns the error; otherwise it returns `Ok(Vec<PathBuf>)` of all targeted paths.
+**Data flow**: It receives configured paths and a raw SID pointer, which identifies the Windows user or group being denied. First it calls `plan_deny_read_acl_paths` to decide every path that needs protection. For each planned path, it creates the path as a directory if it does not exist, then calls `add_deny_read_ace` to add the deny-read permission. It remembers which paths received a newly added rule. If a later step fails, it calls `revoke_ace` on those newly changed paths and returns the error. If everything succeeds, it returns the deduplicated list of paths it applied or checked.
 
-**Call relations**: This function is invoked by persistent-state synchronization when a sandbox session needs deny-read ACLs enforced. It delegates planning to `plan_deny_read_acl_paths`, uses the ACL layer for insertion and rollback, and serves as the boundary where filesystem creation and ACL mutation actually happen.
+**Call relations**: This is the action step called by `sync_persistent_deny_read_acls` when the wider system wants deny-read policy reflected in Windows ACLs. It starts with `plan_deny_read_acl_paths`, uses `push_planned_path` to report processed paths without duplicates, hands each path to `add_deny_read_ace`, and calls `revoke_ace` only as rollback after a failure.
 
 *Call graph*: calls 3 internal fn (revoke_ace, plan_deny_read_acl_paths, push_planned_path); called by 1 (sync_persistent_deny_read_acls); 2 external calls (new, new).
 
@@ -3011,11 +3025,11 @@ fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<Path
 fn plan_preserves_missing_paths()
 ```
 
-**Purpose**: Verifies that planning does not discard a missing path just because it cannot be canonicalized through existence. The test protects the invariant that future denied paths remain represented lexically.
+**Purpose**: Checks that a path which does not exist yet is still included in the deny-read plan. This protects against the case where a sandboxed command creates a forbidden file or folder during its run and then tries to read it.
 
-**Data flow**: It creates a temporary directory, constructs a non-existent child path, calls the planner with a one-element slice, and asserts that the returned vector contains exactly that original path. It only reads temporary filesystem state and performs no persistent writes.
+**Data flow**: The test creates a temporary directory and forms a child path that is deliberately missing. It passes that missing path to `plan_deny_read_acl_paths`. The expected result is a one-item list containing exactly that missing path.
 
-**Call relations**: This test exercises the missing-path branch of `plan_deny_read_acl_paths`, specifically the absence of canonical-target expansion when `exists()` is false.
+**Call relations**: This test exercises the planning behavior directly. It supports the promise that `apply_deny_read_acls` can later materialize missing denied paths before applying permissions.
 
 *Call graph*: 2 external calls (new, assert_eq!).
 
@@ -3026,24 +3040,24 @@ fn plan_preserves_missing_paths()
 fn plan_includes_existing_canonical_targets()
 ```
 
-**Purpose**: Checks that an existing path expands into both its original lexical spelling and its canonicalized target. This confirms the anti-aliasing behavior around reparse-point or normalized access paths.
+**Purpose**: Checks that an existing path produces a plan containing both the configured path and its canonical resolved path. This matters because a sandbox should not be able to read the same file through an alternate resolved location.
 
-**Data flow**: It creates a temp file, calls `plan_deny_read_acl_paths`, collects the result into a `HashSet<PathBuf>`, builds an expected set from the original path plus `dunce::canonicalize`, and asserts equality. The test writes one file to establish existence before planning.
+**Data flow**: The test creates a temporary file, writes content to it so it exists, then passes its path to `plan_deny_read_acl_paths`. It independently computes the canonical path and compares sets, not order, to confirm both the original and canonical paths are present.
 
-**Call relations**: This test directly validates the canonicalization branch inside `plan_deny_read_acl_paths`, ensuring the planner emits both forms for existing objects.
+**Call relations**: This test calls `plan_deny_read_acl_paths`, which in turn calls the path-planning helpers and canonicalization logic. It verifies the behavior that `apply_deny_read_acls` relies on before changing real Windows permissions.
 
 *Call graph*: calls 1 internal fn (plan_deny_read_acl_paths); 5 external calls (new, assert_eq!, canonicalize, write, from_ref).
 
 
 ### `windows-sandbox-rs/src/audit.rs`
 
-`domain_logic` · `sandbox preflight and ACL hardening`
+`domain_logic` · `sandbox preflight/setup`
 
-This module is the sandbox’s defensive audit pass against unexpectedly permissive filesystem ACLs. It first builds a prioritized candidate list of directories to inspect: the command CWD, TEMP/TMP, user-profile roots, PATH entries, and finally broad system roots like `C:/` and `C:/Windows`. Candidate collection canonicalizes paths and deduplicates them so later scans and logs are stable.
+On Windows, a folder can sometimes be writable by “Everyone,” meaning almost any local user or process may write there. That is dangerous for a sandbox because the sandbox might be meant to write only in a workspace, but Windows permissions could quietly allow writes somewhere else. This file acts like a preflight safety inspector: before or during sandbox setup, it looks at likely places the process might touch, such as the current working directory, temporary folders, user folders, PATH folders, and a few system roots.
 
-The audit itself is intentionally bounded. `audit_everyone_writable` checks immediate children of the CWD first to catch workspace issues quickly, then scans each candidate root and one directory level beneath it. It skips symlinks/reparse points, caps per-directory enumeration and total checked items, and aborts after a short wall-clock limit. ACL readability failures are treated as non-world-writable but logged at debug level. Paths are deduplicated by a canonical path key before being added to the flagged list.
+The scan is deliberately fast and shallow. It checks the current directory’s immediate child folders first, then checks a wider list of candidate roots and one level of children. It stops after a short time or after enough items have been checked, so it does not turn startup into a full disk crawl. It also avoids symlinks and some noisy Windows directories.
 
-If anything is flagged, the remediation path persists capability SID state under `codex_home`, determines which capability SIDs are active for the current permission mode, skips flagged paths that are inside approved writable roots, and applies write-deny ACEs to the remaining paths. Failures to apply denies are logged but do not abort the overall setup. The result is a best-effort hardening pass rather than a strict blocker.
+If it finds world-writable folders, it logs them. Then, when Windows sandbox enforcement is available, it adds deny entries to those folders for the sandbox capability identity. An access control entry, or ACE, is a Windows permission rule; here the added rule says “this sandbox identity may not write here.” The file is careful not to deny writes inside approved workspace write roots, because those are intentionally allowed.
 
 #### Function details
 
@@ -3053,11 +3067,11 @@ If anything is flagged, the remediation path persists capability SID state under
 fn unique_push(set: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>, p: PathBuf)
 ```
 
-**Purpose**: Canonicalizes a candidate path and appends it to an output list only if it has not already been seen.
+**Purpose**: Adds a path to a list only if it can be turned into an absolute, real path and has not already been added. This keeps the scan list tidy and avoids checking the same folder twice under slightly different names.
 
-**Data flow**: Takes a mutable `HashSet<PathBuf>`, mutable `Vec<PathBuf>`, and a candidate `PathBuf`. If `canonicalize()` succeeds and the canonical path is newly inserted into the set, it clones that canonical path into the output vector; otherwise it does nothing.
+**Data flow**: It receives a set of already-seen paths, an output list, and a candidate path. It asks the operating system for the path’s canonical form, meaning the cleaned-up absolute location. If that succeeds and the canonical path is new, it records it in the set and appends it to the output list.
 
-**Call relations**: Used exclusively by `gather_candidates` to keep the candidate scan order deterministic while removing duplicates.
+**Call relations**: This is a helper used by gather_candidates whenever a possible scan location is discovered. It does not decide which folders matter; it simply makes sure the chosen folders are valid and unique before the audit uses them.
 
 *Call graph*: called by 1 (gather_candidates); 1 external calls (canonicalize).
 
@@ -3068,11 +3082,11 @@ fn unique_push(set: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>, p: PathBuf)
 fn gather_candidates(cwd: &Path, env: &std::collections::HashMap<String, String>) -> Vec<PathBuf>
 ```
 
-**Purpose**: Builds the ordered list of filesystem roots that the world-writable audit should inspect.
+**Purpose**: Builds the list of folders that the audit should inspect first. It focuses on places most likely to matter for a running process: the current folder, temporary folders, user folders, PATH entries, and basic system roots.
 
-**Data flow**: Accepts the command CWD and an environment map. It initializes a dedupe set and output vector, then pushes the CWD, TEMP/TMP from the provided map or process environment, `USERPROFILE`, `PUBLIC`, each non-empty PATH entry split with Windows path semantics, and finally `C:/` and `C:/Windows`; each insertion goes through `unique_push` so only canonical existing paths survive.
+**Data flow**: It starts with the current working directory and an environment map. It reads TEMP, TMP, PATH, and some user-related environment variables, falling back to the real process environment where needed. Each discovered path is normalized and deduplicated through unique_push, and the finished list of candidate folders comes out in priority order.
 
-**Call relations**: Called by `audit_everyone_writable` during the broader scan and directly by the unit test that verifies PATH splitting behavior.
+**Call relations**: audit_everyone_writable calls this after it has already checked the current directory’s immediate children. The test tests::gathers_path_entries_by_list_separator also calls it to confirm PATH is split correctly into separate folders.
 
 *Call graph*: calls 1 internal fn (unique_push); called by 2 (audit_everyone_writable, gathers_path_entries_by_list_separator); 7 external calls (new, new, to_path_buf, from, new, split_paths, var_os).
 
@@ -3083,11 +3097,11 @@ fn gather_candidates(cwd: &Path, env: &std::collections::HashMap<String, String>
 fn path_has_world_write_allow(path: &Path) -> Result<bool>
 ```
 
-**Purpose**: Checks whether the Everyone/World SID has any write-like allow bits on a path.
+**Purpose**: Checks whether a specific path grants write-like permissions to the Windows Everyone identity. In plain terms, it asks: “Can the general public write here?”
 
-**Data flow**: Creates a `LocalSid` for the world SID via `world_sid()`, converts it to a raw SID pointer, builds a write mask from `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_EA`, and `FILE_WRITE_ATTRIBUTES`, and calls `path_mask_allows` with `require_all_bits = false`. It returns `Result<bool>`.
+**Data flow**: It receives a path. It creates the Windows security identifier, or SID, for Everyone, then builds a set of write permission bits such as writing data, appending data, changing extended attributes, and changing file attributes. It passes that information to the lower-level ACL checker and returns true or false.
 
-**Call relations**: Used internally by the audit closure in `audit_everyone_writable` as the ACL predicate for flagging paths.
+**Call relations**: audit_everyone_writable uses this through a small wrapper that catches errors. The actual permission lookup is handed off to path_mask_allows, while world_sid supplies the Windows identity being tested.
 
 *Call graph*: calls 2 internal fn (path_mask_allows, world_sid).
 
@@ -3102,11 +3116,11 @@ fn audit_everyone_writable(
 ) -> Result<Vec<PathBuf>>
 ```
 
-**Purpose**: Performs a time- and size-bounded scan for world-writable directories and logs either the flagged paths or a success summary.
+**Purpose**: Performs the actual world-writable folder audit and returns the folders that fail the check. It is meant to catch dangerous write access quickly without scanning the whole machine.
 
-**Data flow**: Accepts the command CWD, environment map, and optional log directory. It records start time, tracks flagged paths, seen canonical keys, and a checked counter, defines a closure that wraps `path_has_world_write_allow` with debug logging on ACL-read errors, scans immediate CWD child directories first, then scans candidate roots and one level of children while enforcing item and time limits, skipping symlinks and selected noisy Windows subdirectories. It logs a detailed failure note with all flagged paths or a success note with counts and duration, and returns the flagged `Vec<PathBuf>`.
+**Data flow**: It receives the current working directory, an environment map, and an optional log location. It first scans immediate child directories of the current directory, then scans candidate folders from gather_candidates and one level of children under each. For every folder, it checks whether Everyone has write permission, records each failing path once using a canonical key, logs either success or failure, and returns the list of flagged folders.
 
-**Call relations**: Invoked by `apply_world_writable_scan_and_denies_for_permissions` as the discovery phase before any deny ACEs are applied.
+**Call relations**: apply_world_writable_scan_and_denies_for_permissions calls this as the first step in the audit-and-protect flow. Inside the scan it relies on gather_candidates to choose likely roots, path_has_world_write_allow to ask Windows about permissions, canonical_path_key to avoid duplicate reports, and logging helpers to record what happened.
 
 *Call graph*: calls 3 internal fn (gather_candidates, log_note, canonical_path_key); called by 1 (apply_world_writable_scan_and_denies_for_permissions); 7 external calls (from_secs, new, now, new, new, format!, read_dir).
 
@@ -3121,11 +3135,11 @@ fn apply_world_writable_scan_and_denies_for_permissions(
     permissions: &ResolvedWindowsSandboxPermiss
 ```
 
-**Purpose**: Runs the world-writable audit and, if anything is flagged, attempts best-effort deny remediation for the active permission configuration.
+**Purpose**: Runs the audit and, if risky folders are found, attempts to add protective deny rules for the sandbox capability identity. It is the public wrapper for the full “scan, then protect” operation.
 
-**Data flow**: Accepts `codex_home`, CWD, environment map, resolved permissions, and optional log directory. It calls `audit_everyone_writable`; if the returned list is empty it exits successfully, otherwise it calls `apply_capability_denies_for_world_writable_for_permissions` and logs any remediation failure without propagating it.
+**Data flow**: It receives the Codex home directory, current working directory, environment map, resolved sandbox permissions, and optional log location. It calls audit_everyone_writable to get the flagged folders. If none are found, it returns successfully; if some are found, it asks apply_capability_denies_for_world_writable_for_permissions to add deny rules and logs any failure from that protection step without turning it into a hard failure.
 
-**Call relations**: This is the public orchestration entry for the audit/remediation sequence, sequencing discovery first and deny application second.
+**Call relations**: This function ties together detection and mitigation. A higher-level setup path can call it without needing to know the details of Windows ACLs, capability SIDs, or workspace exceptions.
 
 *Call graph*: calls 3 internal fn (apply_capability_denies_for_world_writable_for_permissions, audit_everyone_writable, log_note); 1 external calls (format!).
 
@@ -3141,11 +3155,11 @@ fn apply_capability_denies_for_world_writable_for_permissions(
     env_map: &std::c
 ```
 
-**Purpose**: Persists capability SID state, determines the active capability SIDs for the current permission mode, and applies write-deny ACEs to flagged paths outside approved writable roots.
+**Purpose**: Adds Windows deny-write permission rules to the flagged world-writable folders for the active sandbox identity, while preserving intentionally allowed workspace writes. This is the mitigation part of the file.
 
-**Data flow**: Accepts `codex_home`, the flagged paths, resolved permissions, CWD, environment map, and optional log directory. It returns early on an empty flagged list, ensures `codex_home` exists, loads or creates capability SIDs, writes them to the capability SID file as JSON, exits early if the permissions are not enforceable by the Windows sandbox, then computes either workspace-write capability SIDs and effective write roots or the readonly capability SID. For each flagged path not contained in any active workspace write root, it calls `add_deny_write_ace` for each active SID and logs success or failure per path.
+**Data flow**: It receives the Codex home directory, the flagged paths, resolved permissions, the current working directory, the environment map, and optional logging location. It ensures the Codex home exists, loads or creates the capability SIDs, writes them to disk, and checks whether the current permission mode can be enforced through Windows sandbox rules. It then chooses the active sandbox identities: either workspace write capability SIDs for approved write roots, or the readonly capability SID. For each flagged path outside approved workspace roots, it tries to add a deny-write ACE and logs whether that succeeded or failed.
 
-**Call relations**: Called only after a non-empty audit result; it is the remediation engine behind `apply_world_writable_scan_and_denies_for_permissions`.
+**Call relations**: apply_world_writable_scan_and_denies_for_permissions calls this after the audit finds risky folders. This function coordinates with the capability module to get SIDs, the setup module to compute allowed write roots, and the ACL module to actually change Windows permissions.
 
 *Call graph*: calls 7 internal fn (add_deny_write_ace, cap_sid_file, load_or_create_cap_sids, log_note, is_enforceable_by_windows_sandbox, uses_write_capabilities_for_cwd, effective_write_roots_for_permissions); called by 1 (apply_world_writable_scan_and_denies_for_permissions); 7 external calls (is_empty, new, format!, to_string, create_dir_all, write, vec!).
 
@@ -3156,24 +3170,24 @@ fn apply_capability_denies_for_world_writable_for_permissions(
 fn gathers_path_entries_by_list_separator()
 ```
 
-**Purpose**: Verifies that PATH entries separated by semicolons are split into distinct audit candidates, including paths with spaces.
+**Purpose**: Checks that gather_candidates correctly treats a Windows PATH string as several separate folders, including a folder whose name contains a space. This protects against a subtle bug where PATH entries could be misread as one long path.
 
-**Data flow**: Creates a temporary directory tree with three subdirectories, constructs an environment map containing a semicolon-separated PATH string, calls `gather_candidates`, canonicalizes the expected directories, and asserts each appears in the candidate list.
+**Data flow**: The test creates a temporary directory with three child folders, builds an environment map whose PATH contains those folders separated by semicolons, and calls gather_candidates. It canonicalizes the expected folders and asserts that all three appear in the returned candidate list.
 
-**Call relations**: Exercises `gather_candidates` directly to pin down Windows PATH parsing behavior used by the audit scan.
+**Call relations**: This test exercises gather_candidates directly. It does not run the full audit or touch Windows ACL rules; it focuses on making sure the candidate-building step sees PATH entries the way Windows users expect.
 
 *Call graph*: calls 1 internal fn (gather_candidates); 5 external calls (new, assert!, format!, create_dir_all, tempdir).
 
 
 ### `windows-sandbox-rs/src/hide_users.rs`
 
-`domain_logic` · `sandbox setup and first sandbox-user login`
+`domain_logic` · `after user creation and during sandbox command execution`
 
-This file contains two user-facing operations. `hide_newly_created_users` updates the Winlogon `SpecialAccounts\UserList` registry key under `HKEY_LOCAL_MACHINE`, writing a `REG_DWORD` value of `0` for each username so those accounts are hidden from the Windows logon screen. The function is intentionally best-effort: an empty username list is ignored, and any top-level failure is logged with `log_note` rather than returned.
+This file exists to make temporary sandbox users less visible on the host machine. When a sandbox creates Windows user accounts, those accounts could otherwise show up on the Windows login screen. Also, once one of those users logs in, Windows creates a profile folder for it under the usual user-profile area, where it may be visible in File Explorer. This file tries to hide both things.
 
-The second operation, `hide_current_user_profile_dir`, is meant to run inside the command-runner after the sandbox user has actually logged in, because Windows only creates a profile directory on first logon. It reads `USERPROFILE`, checks that the directory exists, and then calls `hide_directory` to add `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`. Logging is one-time-ish by design: success is logged only when attributes actually changed, not when the directory was already hidden.
+It has two main jobs. First, after new sandbox users are created, it writes entries under Windows’ Winlogon “SpecialAccounts UserList” registry key. In plain terms, the registry is a Windows settings database, and this particular setting tells the login screen not to list specific users. Each username is written with a value of 0, meaning “do not show this account.”
 
-The lower-level helpers encapsulate Win32 details. `create_userlist_key` creates or opens the registry path with `KEY_WRITE`, converting Rust strings to UTF-16 via `to_wide` and formatting Win32 status codes with `format_last_error`. `hide_users_in_winlogon` iterates usernames, writes each registry value, logs per-user failures, and always closes the registry handle. `hide_directory` reads current file attributes, errors on `INVALID_FILE_ATTRIBUTES`, computes the new attribute mask, and only calls `SetFileAttributesW` when a change is needed.
+Second, when code is running as a sandbox user, it looks up that user’s USERPROFILE folder. If the folder exists, it adds the Windows HIDDEN and SYSTEM file attributes. That is like putting the folder behind a “do not show in normal browsing” curtain. The operation is best-effort: failures are logged, but they do not stop the rest of the sandbox work. This is important because hiding users is cosmetic and cleanup-oriented, not the core job of running commands safely.
 
 #### Function details
 
@@ -3183,11 +3197,11 @@ The lower-level helpers encapsulate Win32 details. `create_userlist_key` creates
 fn hide_newly_created_users(usernames: &[String], log_base: &Path)
 ```
 
-**Purpose**: Attempts to hide a batch of newly created sandbox usernames from the Windows logon UI. It treats the operation as best-effort and only logs failures.
+**Purpose**: This is the public entry point for hiding newly created sandbox user accounts from the Windows login screen. If there are no usernames, it does nothing; if Windows registry work fails, it records a note instead of crashing the run.
 
-**Data flow**: It takes a slice of usernames and a log directory path. If the username slice is empty it returns immediately; otherwise it calls `hide_users_in_winlogon`, and if that returns an error it formats a note and writes it to the sandbox log. It returns no value and does not propagate errors.
+**Data flow**: It receives a list of usernames and a log location. If the list is empty, the story ends there. Otherwise it asks the registry-writing helper to hide those users; if that helper returns an error, it turns the error into a readable log message.
 
-**Call relations**: This is the top-level batch API for account hiding. It delegates all registry work to `hide_users_in_winlogon` and exists to keep setup flows resilient even when hiding fails.
+**Call relations**: This function is the safe wrapper around the lower-level registry work. It calls hide_users_in_winlogon to do the actual Windows setting change, and it calls log_note only when that lower-level step fails.
 
 *Call graph*: calls 2 internal fn (hide_users_in_winlogon, log_note); 1 external calls (format!).
 
@@ -3198,11 +3212,11 @@ fn hide_newly_created_users(usernames: &[String], log_base: &Path)
 fn hide_current_user_profile_dir(log_base: &Path)
 ```
 
-**Purpose**: Hides the current process user's profile directory by setting hidden/system attributes once the directory exists. It is intended to run as the sandbox user after first logon has materialized the profile.
+**Purpose**: This hides the profile folder of the sandbox user that is currently running. Windows only creates that folder after the user first logs in, so this function is meant to run at command-execution time, when the folder is likely to exist.
 
-**Data flow**: It takes a log directory path, reads `USERPROFILE` from the process environment, converts it to a `PathBuf`, and returns early if the variable is absent or the directory does not exist. It then calls `hide_directory`; on `Ok(true)` it logs that the profile directory was hidden, on `Ok(false)` it does nothing, and on `Err` it logs the failure with the directory path.
+**Data flow**: It reads the USERPROFILE environment variable, which points to the current user’s profile folder. If the variable is missing or the folder is not present, it stops quietly. If the folder exists, it asks hide_directory to add hidden/system attributes; when that actually changes the folder, it logs a one-time note, and when it fails, it logs the failure.
 
-**Call relations**: This function is called from command-runner-side flows where the sandbox user context is active. It delegates the actual attribute manipulation to `hide_directory` and intentionally suppresses errors into logs.
+**Call relations**: This function sits above the file-attribute helper. It calls hide_directory for the Windows file attribute change, and uses log_note to record either a successful first-time hide or an error.
 
 *Call graph*: calls 2 internal fn (hide_directory, log_note); 3 external calls (from, format!, var_os).
 
@@ -3213,11 +3227,11 @@ fn hide_current_user_profile_dir(log_base: &Path)
 fn hide_users_in_winlogon(usernames: &[String], log_base: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Writes per-user `UserList` registry values that hide accounts from the Winlogon UI. It logs individual write failures but still attempts all usernames.
+**Purpose**: This writes the Windows login-screen settings that make specific user accounts not appear in the user list. It is lower-level than hide_newly_created_users because it directly opens a registry key and writes values.
 
-**Data flow**: It takes a username slice and log directory path, opens or creates the `USERLIST_KEY_PATH` registry key via `create_userlist_key`, then for each username converts it to UTF-16 with `to_wide`, prepares a `u32` value of `0`, and calls `RegSetValueExW` with `REG_DWORD`. Nonzero status codes are formatted and logged per username. After the loop it closes the registry key with `RegCloseKey` and returns `Ok(())` unless key creation itself failed.
+**Data flow**: It receives usernames and a log location. First it creates or opens the needed Winlogon registry key. Then, for each username, it converts the name into the wide-character text format expected by Windows, writes a registry value of 0 for that user, and logs any per-user write failure. At the end it closes the registry key and reports overall success if the key could be opened.
 
-**Call relations**: It is called only by `hide_newly_created_users`. This function contains the per-user iteration and partial-failure behavior, while `create_userlist_key` encapsulates the registry-open step.
+**Call relations**: hide_newly_created_users calls this when there are users to hide. This function calls create_userlist_key to get access to the right registry location, then calls the Windows RegSetValueExW function for each username, and finally calls RegCloseKey so the opened registry handle is not left open.
 
 *Call graph*: calls 3 internal fn (create_userlist_key, log_note, to_wide); called by 1 (hide_newly_created_users); 5 external calls (new, format!, size_of_val, RegCloseKey, RegSetValueExW).
 
@@ -3228,11 +3242,11 @@ fn hide_users_in_winlogon(usernames: &[String], log_base: &Path) -> anyhow::Resu
 fn create_userlist_key() -> anyhow::Result<HKEY>
 ```
 
-**Purpose**: Creates or opens the Winlogon `SpecialAccounts\UserList` registry key with write access. It converts Win32 status failures into contextual `anyhow` errors.
+**Purpose**: This opens, or creates if missing, the Windows registry key where hidden-login-user settings are stored. Other code needs this key before it can tell Windows which users not to show on the sign-in screen.
 
-**Data flow**: It takes no arguments, converts the constant registry path to UTF-16 with `to_wide`, initializes an `HKEY` output variable, and calls `RegCreateKeyExW` against `HKEY_LOCAL_MACHINE` with `REG_OPTION_NON_VOLATILE` and `KEY_WRITE`. On success it returns the opened `HKEY`; on failure it returns an error string containing the status code and formatted system error.
+**Data flow**: It starts with the fixed registry path for Winlogon’s SpecialAccounts UserList. It converts that path into Windows’ expected wide-character format, asks Windows to create/open the key with write permission, and returns the opened registry handle. If Windows refuses or fails, it returns an error message that includes the Windows error text.
 
-**Call relations**: It is a private helper used by `hide_users_in_winlogon` before any per-user registry writes occur. By isolating key creation, it keeps the caller focused on value updates and logging.
+**Call relations**: hide_users_in_winlogon calls this before writing any username values. This function is the single place in the file that uses RegCreateKeyExW, keeping the registry-opening step separate from the loop that writes user entries.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 1 (hide_users_in_winlogon); 3 external calls (anyhow!, null_mut, RegCreateKeyExW).
 
@@ -3243,22 +3257,24 @@ fn create_userlist_key() -> anyhow::Result<HKEY>
 fn hide_directory(path: &Path) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Sets the hidden and system attributes on a directory if they are not already present, and reports whether it changed anything. It is the low-level filesystem primitive behind profile-directory hiding.
+**Purpose**: This adds the Windows HIDDEN and SYSTEM attributes to a folder, but only if they are not already set. It returns whether it actually changed anything, so callers can avoid noisy repeated logs.
 
-**Data flow**: It takes a directory path, converts it to UTF-16 with `to_wide`, and calls `GetFileAttributesW`. If attributes cannot be read it fetches `GetLastError`, formats the error, and returns an `anyhow` failure. Otherwise it ORs in `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`; if the result equals the original attributes it returns `Ok(false)`, and if not it calls `SetFileAttributesW`, returning `Ok(true)` on success or a formatted error on failure.
+**Data flow**: It receives a filesystem path. It converts the path into the text format Windows APIs expect, reads the folder’s current attributes, and builds a new attribute set that includes HIDDEN and SYSTEM. If those attributes were already present, it returns false. If not, it asks Windows to save the new attributes and returns true when successful; any Windows failure becomes a readable error.
 
-**Call relations**: It is called only by `hide_current_user_profile_dir`. The boolean return lets the caller suppress repetitive success logs when the directory was already hidden.
+**Call relations**: hide_current_user_profile_dir calls this after finding the current user’s profile folder. This function does the direct Windows file-attribute calls: GetFileAttributesW to read the current state, GetLastError to explain failures, and SetFileAttributesW to apply the hidden/system flags.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 1 (hide_current_user_profile_dir); 4 external calls (anyhow!, GetLastError, GetFileAttributesW, SetFileAttributesW).
 
 
 ### `windows-sandbox-rs/src/bin/setup_main/win/setup_runtime_bin.rs`
 
-`domain_logic` · `setup refresh`
+`domain_logic` · `Windows sandbox setup`
 
-This module contains a single targeted helper used only during refresh-style setup. It locates the per-user runtime cache directory where the desktop app copies bundled Windows binaries before launching `codex.exe`: `%LOCALAPPDATA%\OpenAI\Codex\bin`, with a fallback derived from `%USERPROFILE%\AppData\Local` if `LOCALAPPDATA` is unset. If that directory does not exist, the helper exits quietly.
+Codex Desktop copies some Windows runtime binaries into a fixed cache folder under the current user's LocalAppData directory. A sandboxed process may run as a restricted Windows group, so it cannot assume it has the same folder access as the normal user. This file checks that specific cache folder and, if it exists, gives the sandbox group permission to read files and execute programs inside it.
 
-When the directory is present, it checks whether the sandbox users group PSID already has `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` on the directory using `path_mask_allows`. ACL inspection failures are treated as soft refresh errors: the function appends a formatted message to the caller-owned `refresh_errors` vector, logs a continuing warning through the parent module’s `log_line`, and proceeds as though access were missing. If access is absent, it logs that it is granting read/execute, then calls `ensure_allow_mask_aces_with_inheritance` with both object and container inheritance flags so the permission propagates through the runtime tree. Grant failures are likewise appended to `refresh_errors` and logged rather than immediately aborting. This design matches the broader refresh semantics in `run_setup_full`, where multiple ACL repairs are attempted and only summarized as a hard failure at the end.
+The key Windows idea here is an access control entry, or ACE: a rule on a file or folder saying who may do what. The function first finds LocalAppData, falling back to USERPROFILE/AppData/Local if needed. If it cannot find the folder, or if the expected Codex runtime bin folder is not present, it quietly does nothing. That is intentional because not every install layout needs this folder.
+
+If the folder exists, the code checks whether the sandbox group already has read and execute rights. If the check fails, it records the error and continues as if access is missing. If access is missing, it logs what it is about to do and asks the shared Windows sandbox library to add an inherited allow rule, meaning the permission should apply to files and subfolders too. Any failure is logged and saved for the larger setup routine to report, but the function still returns normally so setup can keep going.
 
 #### Function details
 
@@ -3272,22 +3288,26 @@ fn ensure_codex_app_runtime_bin_readable(
 ) -> Result<()>
 ```
 
-**Purpose**: Repairs read/execute access for the sandbox group on the cached Codex runtime binary directory if needed.
+**Purpose**: This function ensures the Windows sandbox user group can read and execute Codex Desktop's cached runtime binaries. It is used during setup so later sandboxed Codex runs do not fail simply because Windows folder permissions block needed executables.
 
-**Data flow**: It takes the sandbox-group PSID, a mutable `Vec<String>` of refresh errors, and a log sink. It resolves the LocalAppData path, derives `OpenAI\Codex\bin`, returns early if the environment or directory is absent, checks the current ACL mask for read/execute, logs and records any inspection failure, grants inherited read/execute ACEs when access is missing, and records/logs any grant failure before returning `Ok(())`.
+**Data flow**: It receives a Windows security identifier for the sandbox group, a list where setup warnings can be collected, and a log writer. It looks up the user's LocalAppData path, builds the expected OpenAI/Codex/bin folder path, and skips work if that folder is absent. If the folder exists, it checks whether the sandbox group already has read-and-run access. When access is missing, it writes a log message and tries to add an inherited Windows permission rule for the sandbox group. Errors from checking or changing permissions are turned into human-readable messages, added to the shared error list, and written to the log.
 
-**Call relations**: This helper is called only from `run_setup_full` when `payload.refresh_only` is true, complementing the delegated read-root ACL refresh with a repair for the desktop runtime cache.
+**Call relations**: The broader setup flow calls this from run_setup_full while preparing the Windows sandbox environment. Inside this step, it asks path_mask_allows to inspect the existing folder permissions. If the sandbox group needs access, it hands the folder, group identifier, and permission mask to ensure_allow_mask_aces_with_inheritance, which performs the actual Windows access-control update. It uses log_line to leave a setup trail whenever the permission check or repair needs attention.
 
 *Call graph*: called by 1 (run_setup_full); 5 external calls (ensure_allow_mask_aces_with_inheritance, path_mask_allows, format!, var_os, log_line).
 
 
 ### `windows-sandbox-rs/src/bin/setup_main/win/firewall.rs`
 
-`io_transport` · `setup network configuration`
+`domain_logic` · `sandbox setup`
 
-This module encapsulates all firewall-specific setup behind COM calls to `INetFwPolicy2`, `INetFwRules`, and `INetFwRule3`. It defines stable internal rule names and friendly descriptions for three block rules: a non-loopback outbound block, a loopback UDP block, and a loopback TCP block whose remote-port scope can be narrowed to the complement of allowed proxy ports. The central design choice is fail-closed behavior: when transitioning into proxy-only mode, it first installs broad loopback blocks and only then narrows TCP ports; when transitioning back to unrestricted local binding, it removes legacy overlapping rules so stale exceptions do not remain.
+This file is the sandbox’s network gatekeeper on Windows. Its job is to set firewall rules for a special “offline” Windows user, identified by a SID, which is Windows’ stable ID for an account. Without these rules, code running as that user could still make outbound network connections, which would break the promise of an offline sandbox.
 
-Both public entrypoints initialize COM apartment threading, create the firewall policy object, verify via `LocalPolicyModifyState` that local rule edits actually take effect for all active profiles, and then mutate the rules collection. `ensure_block_rule` is idempotent: it looks up an existing rule by stable name, creates one if absent, and always reapplies all fields. `configure_rule` writes description, direction, action, enabled state, profiles, protocol, remote scope, and `LocalUserAuthorizedList`, then reads back the user scope to ensure the expected offline SID was actually stored. Errors are consistently wrapped as `SetupFailure` with firewall-specific codes so callers can distinguish COM initialization, policy ineffectiveness, rule creation, and verification failures.
+The file talks to Windows Firewall through COM, the Windows object system used by many system APIs. First it initializes COM, opens the firewall policy, and checks that local firewall edits will actually take effect. That check matters because company or group policy can override local firewall rules; if that happens, this setup fails instead of pretending the sandbox is protected.
+
+It then creates or updates named firewall rules. The names are stable, so running setup again updates the same rules instead of creating duplicates. One rule blocks non-loopback outbound traffic. Other rules control loopback traffic, meaning traffic back to the same machine, like 127.0.0.1. In proxy-only mode, it blocks most loopback TCP ports while leaving selected proxy ports open by blocking the complement of those ports. This is like locking every door in a hallway except the one approved service door.
+
+The file also verifies that each rule really applies to the offline user and writes timestamped log messages when rules are configured or removed.
 
 #### Function details
 
@@ -3302,11 +3322,11 @@ fn ensure_offline_proxy_allowlist(
 ) -> Result<()>
 ```
 
-**Purpose**: Configures loopback-only firewall behavior for the offline sandbox user, optionally allowing only specific proxy ports or removing loopback restrictions when local binding is allowed.
+**Purpose**: Sets up the firewall behavior for local proxy access while the sandbox is offline. It either removes loopback-blocking rules when local binding is allowed, or blocks loopback traffic except for the approved proxy ports.
 
-**Data flow**: It takes the offline SID string, a slice of allowed proxy ports, the `allow_local_binding` flag, and a log sink. It builds a `LocalUserAuthorizedList` SDDL string, initializes COM, opens the firewall policy and rules collection, optionally removes legacy/proxy loopback rules when local binding is enabled, otherwise ensures UDP and broad TCP loopback block rules exist, removes the legacy allow rule, optionally narrows the TCP block to the complement of allowed proxy ports, uninitializes COM, and returns success or a structured firewall failure.
+**Data flow**: It receives the offline user SID, a list of proxy ports, a flag saying whether local binding is allowed, and a log writer. It builds a Windows firewall user-scope string from the SID, opens the firewall policy through COM, checks that local rules will work, then adds, updates, or removes the relevant loopback rules. It returns success if the firewall ended in the intended state, or a setup error if Windows refused any step.
 
-**Call relations**: This function is called from `configure_offline_sandbox_network` before the broader non-loopback outbound block is installed. Internally it relies on policy-effectiveness checks, rule removal, block-rule creation, and port-complement calculation.
+**Call relations**: The broader network setup calls this when configuring the offline sandbox. Inside this setup step, it prepares Windows COM, works with the firewall policy and rule collection, and finishes by uninitializing COM so the setup helper leaves the Windows API state clean.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (configure_offline_sandbox_network); 4 external calls (new, format!, CoInitializeEx, CoUninitialize).
 
@@ -3317,11 +3337,11 @@ fn ensure_offline_proxy_allowlist(
 fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> Result<()>
 ```
 
-**Purpose**: Installs the per-user firewall rule that blocks all non-loopback outbound traffic for the offline sandbox account.
+**Purpose**: Creates or updates the main firewall rule that blocks the offline sandbox user from making outbound connections to non-loopback network addresses. This is the core protection that makes the sandbox offline.
 
-**Data flow**: It takes the offline SID string and log sink, constructs the same local-user SDDL scope, initializes COM, opens the firewall policy and rules collection, verifies local policy effectiveness, ensures the non-loopback block rule exists with protocol `ANY` and the configured remote-address literal, uninitializes COM, and returns a `Result<()>`.
+**Data flow**: It receives the offline user SID and a log writer. It turns the SID into the firewall’s user-scope format, initializes COM, opens the Windows Firewall policy, checks that rule edits are effective, and installs a block rule for all outbound IP traffic except loopback ranges. It returns success after the rule is configured, or a setup failure with a specific error code if the firewall cannot be changed safely.
 
-**Call relations**: This is the second firewall step invoked by `configure_offline_sandbox_network`. It delegates actual rule creation/update to `ensure_block_rule` after the policy check.
+**Call relations**: The higher-level offline network configuration calls this as part of sandbox setup. It relies on Windows Firewall COM objects during that setup window and then uninitializes COM before returning.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (configure_offline_sandbox_network); 4 external calls (new, format!, CoInitializeEx, CoUninitialize).
 
@@ -3336,11 +3356,11 @@ fn remove_rule_if_present(
 ) -> Result<()>
 ```
 
-**Purpose**: Deletes a named firewall rule if it already exists and logs the removal.
+**Purpose**: Deletes an old or unwanted firewall rule if it exists. This keeps stale exceptions from lingering when the sandbox changes modes.
 
-**Data flow**: It receives the `INetFwRules` collection, an internal rule name, and a log sink. It converts the name to `BSTR`, probes `rules.Item`, removes the rule if found, logs a timestamped removal line, and otherwise returns success without modification.
+**Data flow**: It receives the firewall rule collection, the internal rule name, and a log writer. It asks Windows Firewall whether a rule with that name exists; if so, it removes it and writes a log line. If the rule is absent, it leaves everything unchanged and returns success.
 
-**Call relations**: This helper is used during proxy/local-binding transitions inside `ensure_offline_proxy_allowlist` to clean up overlapping or legacy rules without treating absence as an error.
+**Call relations**: The proxy allowlist setup uses this when switching modes so older overlapping rules do not weaken the sandbox. When it removes something, it hands the human-readable audit message to log_line.
 
 *Call graph*: calls 1 internal fn (log_line); 4 external calls (from, Item, Remove, format!).
 
@@ -3351,11 +3371,11 @@ fn remove_rule_if_present(
 fn ensure_local_policy_rules_take_effect(policy: &INetFwPolicy2) -> Result<()>
 ```
 
-**Purpose**: Queries Windows Firewall policy state to ensure local rule modifications are effective.
+**Purpose**: Checks whether local Windows Firewall rule changes will actually apply on the current machine. This prevents a false sense of safety when local rules are ignored by policy.
 
-**Data flow**: It takes an `INetFwPolicy2`, invokes the COM vtable method `LocalPolicyModifyState` into a mutable `NET_FW_MODIFY_STATE`, and passes both the HRESULT and returned state into `validate_local_policy_modify_result`.
+**Data flow**: It receives an open firewall policy object. It asks Windows for the local policy modify state, then passes both the raw Windows result and the reported modify state to a validator. It returns success only if local firewall edits are effective for all current profiles.
 
-**Call relations**: Both public firewall entrypoints call this before mutating rules so setup fails early when Group Policy or partial-profile coverage would make local edits ineffective.
+**Call relations**: The two public setup functions call this before creating rules. It delegates the judgment of the Windows answer to validate_local_policy_modify_result so the policy-checking rules stay in one place.
 
 *Call graph*: calls 1 internal fn (validate_local_policy_modify_result); 3 external calls (default, as_raw, vtable).
 
@@ -3369,11 +3389,11 @@ fn validate_local_policy_modify_result(
 ) -> Result<()>
 ```
 
-**Purpose**: Interprets the `LocalPolicyModifyState` HRESULT and modify-state enum and converts ineffective-policy cases into setup failures.
+**Purpose**: Interprets Windows’ answer about whether local firewall edits are effective. It turns low-level Windows status values into clear setup success or failure.
 
-**Data flow**: It takes the raw COM `HRESULT` and `NET_FW_MODIFY_STATE`. If the HRESULT is an error it returns `HelperFirewallPolicyAccessFailed`; if it is not exactly `S_OK` it returns `HelperFirewallPolicyIneffective`; if the modify state is not `NET_FW_MODIFY_STATE_OK` it also returns `HelperFirewallPolicyIneffective`; otherwise it returns success.
+**Data flow**: It receives a Windows HRESULT, which is a success-or-error code, and a firewall modify-state value. If the query failed, if the answer only covers some active profiles, or if Windows says local edits are overridden, it returns a setup error. Only a clean success result with an OK modify state becomes success.
 
-**Call relations**: This validator is called by `ensure_local_policy_rules_take_effect` and directly by tests that exercise effective, group-policy-override, and partial-profile cases.
+**Call relations**: ensure_local_policy_rules_take_effect uses this during real setup. The unit tests also call it directly to prove that effective policy is accepted and group-policy or partial-profile cases are rejected.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (ensure_local_policy_rules_take_effect, local_policy_modify_state_rejects_ineffective_policy, local_policy_modify_state_rejects_partial_profile_coverage); 3 external calls (is_err, new, format!).
 
@@ -3388,11 +3408,11 @@ fn ensure_block_rule(
 ) -> Result<()>
 ```
 
-**Purpose**: Creates or updates a single firewall block rule described by `BlockRuleSpec` and logs the final configured scope.
+**Purpose**: Creates a firewall block rule if it is missing, or updates the existing rule if it is already present. This makes setup repeatable: running it twice should leave one correct rule, not duplicates.
 
-**Data flow**: It takes the rules collection, a rule spec, and a log sink. It looks up an existing rule by internal name and casts it to `INetFwRule3`, or creates a new `NetFwRule`, sets its name, fully configures it before adding it, then always reapplies configuration to keep the operation idempotent, logs protocol/remote-address/remote-port/user-scope details, and returns success.
+**Data flow**: It receives the firewall rule collection, a rule specification, and a log writer. It looks up the rule by its stable internal name. If found, it casts it to the richer rule interface; if missing, it creates a new Windows Firewall rule, names it, configures it, and adds it. Then it configures the rule again to guarantee every field matches the current desired state and writes a log line describing the result.
 
-**Call relations**: This is the main mutation primitive used by both public firewall setup functions. It delegates field assignment and verification to `configure_rule`.
+**Call relations**: The outbound block setup and proxy-loopback setup use this as their rule creation/update workhorse. It hands the detailed rule fields to configure_rule and sends the final audit message to log_line.
 
 *Call graph*: calls 2 internal fn (configure_rule, log_line); 5 external calls (from, Add, Item, format!, CoCreateInstance).
 
@@ -3403,11 +3423,11 @@ fn ensure_block_rule(
 fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()>
 ```
 
-**Purpose**: Writes all non-name properties for a firewall rule and verifies that the expected offline SID was persisted in the local-user scope.
+**Purpose**: Fills in the common settings for a firewall block rule, such as description, direction, action, enabled state, profiles, network scope, and user scope. It also verifies that the rule really targets the intended offline user.
 
-**Data flow**: It takes an `INetFwRule3` and a `BlockRuleSpec`, sets description, outbound direction, block action, enabled state, all profiles, network scope, and `LocalUserAuthorizedList`, then reads back `LocalUserAuthorizedList`, converts it to a string, and checks that it contains `spec.offline_sid`. It returns a verification failure if the read-back does not match.
+**Data flow**: It receives a Windows firewall rule object and the desired rule specification. It writes the friendly description, marks the rule as outbound, sets the action to block, enables it for all profiles, applies protocol/address/port limits, and sets the authorized local user list. Then it reads the user list back from Windows and checks that the offline SID appears there. It returns an error if any setting fails or the verification does not match.
 
-**Call relations**: This function is called only by `ensure_block_rule`, both before adding a new rule and again afterward for idempotent updates.
+**Call relations**: ensure_block_rule calls this whenever it creates or updates a rule. configure_rule delegates the network-specific parts to configure_rule_network_scope, then performs the user-scope read-back check before control returns to the rule setup flow.
 
 *Call graph*: calls 2 internal fn (configure_rule_network_scope, new); called by 1 (ensure_block_rule); 10 external calls (from, LocalUserAuthorizedList, SetAction, SetDescription, SetDirection, SetEnabled, SetLocalUserAuthorizedList, SetProfiles, new, format!).
 
@@ -3418,11 +3438,11 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()>
 fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()>
 ```
 
-**Purpose**: Applies protocol, remote-address, and optional remote-port scope to a firewall rule.
+**Purpose**: Sets the protocol, remote addresses, and optional remote ports for a firewall rule. This decides what kind of network traffic the rule applies to.
 
-**Data flow**: It takes an `INetFwRule3` and a `BlockRuleSpec`, sets the protocol, writes either the provided remote-address literal or `*`, and if `remote_ports` is present writes that port expression as well. It returns any COM setter failure as a structured setup error.
+**Data flow**: It receives a firewall rule and a rule specification. It writes the protocol number, writes either the supplied remote address range or a wildcard for all addresses, and writes remote ports if the specification includes them. It returns success only if Windows accepts those network-scope values.
 
-**Call relations**: This helper is called from `configure_rule` and is also exercised directly by tests that validate the production address and port literals against Firewall COM.
+**Call relations**: configure_rule calls this while building the complete firewall rule. The production-scope unit test also exercises this part directly to confirm that the address and port strings used by real rules are acceptable to Windows Firewall.
 
 *Call graph*: called by 1 (configure_rule); 4 external calls (from, SetProtocol, SetRemoteAddresses, SetRemotePorts).
 
@@ -3433,11 +3453,11 @@ fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) ->
 fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String>
 ```
 
-**Purpose**: Builds the comma-separated complement of allowed proxy ports across the TCP port range for use in the loopback TCP block rule.
+**Purpose**: Builds the list of TCP loopback ports that should be blocked when only certain proxy ports are allowed. In plain terms, it takes the allowed ports and returns everything else.
 
-**Data flow**: It takes a slice of `u16` proxy ports, filters out zero, sorts and deduplicates them, then walks from port 1 through `u16::MAX`, emitting blocked single ports or ranges via `port_range_string` for every gap not explicitly allowed. It returns `None` only if no blocked ranges remain; otherwise it returns the joined range string.
+**Data flow**: It receives a list of proxy ports. It removes zero, sorts the remaining ports, removes duplicates, and walks through the full valid port range from 1 to 65535. For every gap between allowed ports, it creates a blocked range string. It returns a comma-separated list of blocked ranges, or None if there is nothing to block.
 
-**Call relations**: This helper is used when configuring the narrowed loopback TCP block rule and is covered by the COM-acceptance test for production rule scopes.
+**Call relations**: The proxy-only firewall setup uses this idea to narrow the broad loopback TCP block so approved proxy ports remain usable. The production firewall scope test also calls it to build the same kind of port complement used by real setup.
 
 *Call graph*: calls 1 internal fn (port_range_string); called by 1 (production_firewall_rule_network_scopes_are_accepted_by_firewall_com); 2 external calls (new, from).
 
@@ -3448,11 +3468,11 @@ fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String>
 fn port_range_string(start: u32, end: u32) -> String
 ```
 
-**Purpose**: Formats either a single port or an inclusive port range in the syntax expected by Firewall COM.
+**Purpose**: Formats one blocked port or a continuous blocked port range in the form Windows Firewall expects.
 
-**Data flow**: It takes `start` and `end` as `u32`; if they are equal it returns the decimal port string, otherwise it returns `start-end`.
+**Data flow**: It receives a start port and an end port. If they are the same, it returns just that one number as text; otherwise it returns text like “1000-2000”.
 
-**Call relations**: This is a small formatting helper used only by `blocked_loopback_tcp_remote_ports`.
+**Call relations**: blocked_loopback_tcp_remote_ports calls this while turning gaps between allowed proxy ports into firewall-ready range strings.
 
 *Call graph*: called by 1 (blocked_loopback_tcp_remote_ports); 1 external calls (format!).
 
@@ -3463,11 +3483,11 @@ fn port_range_string(start: u32, end: u32) -> String
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()>
 ```
 
-**Purpose**: Writes a timestamped firewall log line to the provided writer.
+**Purpose**: Writes one timestamped message to the setup log. This gives operators a simple record of firewall changes made during setup.
 
-**Data flow**: It takes a mutable `Write` sink and message string, prepends the current UTC timestamp, writes one line, and returns any I/O error directly.
+**Data flow**: It receives a writable log destination and a message. It gets the current UTC time, formats it as a standard timestamp, writes the timestamp and message as one line, and returns any write error to the caller.
 
-**Call relations**: This local logger is used by `ensure_block_rule` and `remove_rule_if_present` so firewall mutations leave an audit trail in the setup log.
+**Call relations**: ensure_block_rule uses this after configuring a rule, and remove_rule_if_present uses it after deleting a rule. It is the small shared logging tool for this file’s firewall operations.
 
 *Call graph*: called by 2 (ensure_block_rule, remove_rule_if_present); 2 external calls (now, writeln!).
 
@@ -3478,11 +3498,11 @@ fn log_line(log: &mut dyn Write, msg: &str) -> Result<()>
 fn configured_remote_address_literals_are_accepted_by_firewall_com()
 ```
 
-**Purpose**: Verifies that the hard-coded remote-address literals used by production rules are accepted by Firewall COM.
+**Purpose**: Checks that the hard-coded remote address strings in this file are accepted by the real Windows Firewall COM API. This catches mistakes in firewall address syntax before they break setup.
 
-**Data flow**: It initializes COM, creates temporary `INetFwRule3` objects, attempts to set and read back each candidate remote-address string, uninitializes COM, and asserts that every candidate succeeds.
+**Data flow**: The test initializes COM, tries to create temporary firewall rule objects, sets each candidate remote-address string, and asks Windows to read it back. It then uninitializes COM and asserts that every candidate was accepted.
 
-**Call relations**: This test guards against shipping invalid address-scope literals that would make runtime firewall setup fail.
+**Call relations**: This test exercises the same Windows Firewall API that production setup uses. It does not add persistent project rules; it focuses on whether Windows accepts the address literals this file relies on.
 
 *Call graph*: 3 external calls (assert!, CoInitializeEx, CoUninitialize).
 
@@ -3493,11 +3513,11 @@ fn configured_remote_address_literals_are_accepted_by_firewall_com()
 fn production_firewall_rule_network_scopes_are_accepted_by_firewall_com()
 ```
 
-**Purpose**: Verifies that the exact protocol/address/port combinations used by production block rules are accepted by Firewall COM.
+**Purpose**: Checks that the real network scopes used by the production firewall rules are valid according to Windows Firewall. This includes loopback UDP blocking, loopback TCP blocking with proxy-port exceptions, and non-loopback outbound blocking.
 
-**Data flow**: It initializes COM, constructs representative `BlockRuleSpec` values including a computed blocked-port complement, creates temporary firewall rule objects, applies `configure_rule_network_scope` to each, uninitializes COM, and asserts success for all specs.
+**Data flow**: The test initializes COM, builds representative rule specifications, computes the blocked TCP port ranges for a sample proxy port, creates temporary firewall rule objects, and applies only the network-scope settings. It uninitializes COM and asserts that every production-style scope was accepted.
 
-**Call relations**: This test directly exercises the network-scope configuration helper with the same shapes used by the real setup flow.
+**Call relations**: This test calls blocked_loopback_tcp_remote_ports to mirror the proxy-port complement logic and calls configure_rule_network_scope to verify the actual Windows-facing scope writer.
 
 *Call graph*: calls 1 internal fn (blocked_loopback_tcp_remote_ports); 3 external calls (assert!, CoInitializeEx, CoUninitialize).
 
@@ -3508,11 +3528,11 @@ fn production_firewall_rule_network_scopes_are_accepted_by_firewall_com()
 fn local_policy_modify_state_accepts_effective_policy()
 ```
 
-**Purpose**: Checks that an `S_OK` result with `NET_FW_MODIFY_STATE_OK` is treated as effective policy.
+**Purpose**: Confirms that the policy validator accepts the good case: Windows reports success and says local firewall modifications are effective.
 
-**Data flow**: It calls `validate_local_policy_modify_result` with the effective combination and asserts that the result is `Ok`.
+**Data flow**: The test passes a successful Windows result and an OK modify state into validate_local_policy_modify_result. It asserts that the result is success.
 
-**Call relations**: This is the positive-path unit test for the policy validator.
+**Call relations**: This is a direct unit test for the policy-checking rule used by ensure_local_policy_rules_take_effect during real firewall setup.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3523,11 +3543,11 @@ fn local_policy_modify_state_accepts_effective_policy()
 fn local_policy_modify_state_rejects_ineffective_policy()
 ```
 
-**Purpose**: Checks that a Group Policy override state is rejected as ineffective.
+**Purpose**: Confirms that setup fails when Windows says group policy overrides local firewall changes. That protects the sandbox from being configured with rules that will not actually work.
 
-**Data flow**: It calls `validate_local_policy_modify_result` with `S_OK` and `NET_FW_MODIFY_STATE_GP_OVERRIDE`, extracts the resulting `SetupFailure`, and asserts the error code is `HelperFirewallPolicyIneffective`.
+**Data flow**: The test passes a successful query result together with a group-policy override modify state. It expects an error, extracts the project’s setup failure type, and checks that the error code says the firewall policy is ineffective.
 
-**Call relations**: This test covers one of the fail-fast policy checks used before firewall rule mutation.
+**Call relations**: This test calls validate_local_policy_modify_result directly to prove the same guard used in real setup rejects overridden local firewall policy.
 
 *Call graph*: calls 1 internal fn (validate_local_policy_modify_result); 1 external calls (assert_eq!).
 
@@ -3538,20 +3558,24 @@ fn local_policy_modify_state_rejects_ineffective_policy()
 fn local_policy_modify_state_rejects_partial_profile_coverage()
 ```
 
-**Purpose**: Checks that `S_FALSE` partial-profile coverage is rejected even when the modify state itself is OK.
+**Purpose**: Confirms that setup fails when Windows only guarantees the policy answer for some active firewall profiles, not all of them. The sandbox requires protection across the active profiles, not just part of them.
 
-**Data flow**: It calls `validate_local_policy_modify_result` with `S_FALSE` and `NET_FW_MODIFY_STATE_OK`, extracts the `SetupFailure`, and asserts the ineffective-policy error code.
+**Data flow**: The test passes the Windows partial-success result together with an otherwise OK modify state. It expects an error, extracts the setup failure, and checks that the error code marks the firewall policy as ineffective.
 
-**Call relations**: This test covers the validator branch that rejects non-uniform profile applicability.
+**Call relations**: This test calls validate_local_policy_modify_result directly to cover the partial-profile case that ensure_local_policy_rules_take_effect must reject during real setup.
 
 *Call graph*: calls 1 internal fn (validate_local_policy_modify_result); 1 external calls (assert_eq!).
 
 
 ### `windows-sandbox-rs/src/wfp/filter_specs.rs`
 
-`data_model` · `request handling`
+`data_model` · `sandbox network filter setup`
 
-This file is a compact data-definition module for WFP rule construction. It imports the specific WFP layer GUID constants for IPv4/IPv6 connect authorization and resource assignment, the Winsock protocol numbers for ICMP and ICMPv6, and the `GUID` type used as stable filter keys. The core model consists of `ConditionSpec`, an internal enum describing the supported condition shapes (`User`, `Protocol(u8)`, and `RemotePort(u16)`), and `FilterSpec`, a struct bundling a filter’s unique GUID, human-readable name and description, target WFP layer, and the slice of conditions that should be attached when materializing the filter. `FILTER_SPECS` is a static slice of concrete filter definitions. It includes paired IPv4/IPv6 rules for blocking ICMP at both connect and resource-assignment layers, plus port-based outbound blocks for DNS on ports 53 and 853 and SMB on ports 445 and 139. Every listed filter includes the `User` condition, indicating the rules are scoped to the sandbox account rather than globally. A notable design note is the explicit omission of NAME_RESOLUTION_CACHE filters because validation returned `FWP_E_OUT_OF_BOUNDS`; that comment captures an implementation constraint future maintainers would otherwise miss. The GUIDs are hard-coded to keep filter identity stable across runs and updates.
+This file is not code that runs by itself. It is a table of rule descriptions for the Windows Filtering Platform, or WFP, which is Windows’ built-in system for allowing or blocking network activity. Think of it like a checklist handed to a security guard: each entry says which doorway to watch, who the rule applies to, and what kind of traffic should be stopped.
+
+The main data type is `FilterSpec`, which describes one firewall-style rule. Each rule has a stable Windows identifier, a short name, a human-readable description, the WFP layer where the rule should be installed, and a list of conditions. The conditions say what must match before the rule applies: the sandbox user, a network protocol such as ICMP for ping, or a remote port such as 53 for DNS.
+
+`FILTER_SPECS` lists the actual rules. It blocks ICMP for both IPv4 and IPv6, which prevents ping-like traffic. It blocks DNS on port 53 and DNS-over-TLS on port 853, again for both IPv4 and IPv6. It also blocks SMB ports 445 and 139, which are commonly used for Windows file sharing. One comment notes that name-resolution-cache filters were deliberately left out because Windows rejected the simple static versions during validation.
 
 
 ### Spawn preparation and elevated runner plumbing
@@ -3559,15 +3583,13 @@ These files bridge resolved sandbox permissions into launch-ready state and impl
 
 ### `windows-sandbox-rs/src/spawn_prep.rs`
 
-`orchestration` · `spawn preparation before process creation`
+`orchestration` · `startup before launching a sandboxed command`
 
-This file assembles all pre-launch state for sandboxed execution. `SpawnContext` captures resolved permissions, cwd, log directory, and whether writable-root capabilities are needed; `ElevatedSpawnContext` carries the sandbox base path, logs directory, acquired sandbox credentials, and capability SID strings; `LegacySessionSecurity` packages the restricted token and capability SID objects used by the legacy ACL-based path.
+Before a sandboxed command can run, the program has to do several careful setup steps. This file is that staging area. It turns a user-facing permission profile into concrete Windows rules, prepares environment variables, creates or loads special Windows security identifiers called SIDs (labels Windows uses to grant or deny access), and applies file access control rules.
 
-`prepare_spawn_context_common` resolves the permission profile against runtime workspace roots, normalizes environment variables (`NUL`, pager, optional PATH inheritance, optional Git safe.directory injection), ensures `CODEX_HOME` and `.sandbox` exist, starts logging, and computes whether write capabilities are required. `prepare_legacy_spawn_context` adds the offline-network environment rewrite when the resolved permissions disable networking.
+There are two paths here. The “legacy” path runs the command using a restricted token and changes access control lists, or ACLs, on files and folders. An ACL is like a guest list on a folder: it says which identities may read or write there. The “elevated” path prepares credentials for a separate sandbox user and collects the capability SIDs that user should receive.
 
-For the legacy token path, `prepare_legacy_session_security` either creates a read-only restricted token from the stored readonly capability SID or computes per-root capability SIDs and creates a workspace-write token carrying those capabilities. `legacy_session_capability_roots` and `root_capability_sids` derive the active writable roots and their SID strings, filtering through the same effective-write-root logic used by setup.
-
-`apply_legacy_session_acl_rules` is the main ACL mutator: it computes allow/deny paths, ensures explicit deny-write carveouts exist before launch, grants allow ACEs to either the readonly SID or the most specific matching root capability, applies deny-write ACEs to overlapping root capabilities, persists deny-read ACL state, allows access to the null device for all relevant SIDs, and protects `.codex`/agents directories when the command cwd is itself a writable workspace root. `prepare_elevated_spawn_context_for_permissions` mirrors the environment setup, computes effective write roots and deny paths, ensures sandbox credentials/setup via `require_logon_sandbox_creds`, chooses capability SIDs, and pre-allows the null device for the selected capability.
+The file also handles practical details that would otherwise cause confusing failures: it makes sure the Codex home and sandbox log directory exist, sets pager programs to non-interactive behavior, normalizes the Windows null device, optionally inherits PATH, and can add the current folder as a safe Git directory. Network blocking for legacy sessions is enforced by rewriting proxy-related environment variables. Without this file, sandbox launches would be inconsistent: commands might write where they should not, fail to access allowed folders, leak network access, or fail because required temporary/log folders and security labels were missing.
 
 #### Function details
 
@@ -3582,11 +3604,11 @@ fn prepare_spawn_context_common(
     env_map: &mut HashMap<String, String>,
 ```
 
-**Purpose**: Builds the shared spawn context used by both legacy and elevated launch paths. It resolves permissions, normalizes the environment, ensures sandbox directories exist, starts logging, and records whether write capabilities are needed.
+**Purpose**: Builds the shared launch context used by sandbox startup paths. It resolves the permission profile, prepares safe environment defaults, creates the sandbox log area, starts logging, and records whether this run needs workspace-write capabilities.
 
-**Data flow**: Takes a permission profile, workspace roots, codex home, cwd, mutable environment map, command argv, and `SpawnPrepOptions`. It resolves permissions with `ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots`, mutates `env_map` via `normalize_null_device_env`, `ensure_non_interactive_pager`, optional `inherit_path_env`, and optional `inject_git_safe_directory`, ensures `codex_home` exists, creates `codex_home/.sandbox`, sets `logs_base_dir` to that path, calls `log_start(command, logs_base_dir)`, computes `uses_write_capabilities` from `permissions.uses_write_capabilities_for_cwd(cwd, env_map)`, and returns `SpawnContext` containing the resolved permissions and derived state.
+**Data flow**: It receives a permission profile, workspace roots, Codex home path, current directory, environment map, command text, and setup options. It turns the profile into concrete permissions, edits the environment map for safe defaults, ensures needed directories exist, logs the command start, checks whether the current run needs write-capability security, and returns a SpawnContext with those results.
 
-**Call relations**: This is the common foundation for `prepare_legacy_spawn_context` and is also exercised directly by tests. It delegates permission resolution and each environment/setup side effect to specialized helpers.
+**Call relations**: This is the common first stage for legacy preparation and is also exercised directly by tests. Higher-level code calls it when it wants all ordinary spawn setup but not the legacy-only network rewrite.
 
 *Call graph*: calls 7 internal fn (ensure_non_interactive_pager, inherit_path_env, normalize_null_device_env, log_start, try_from_permission_profile_for_workspace_roots, ensure_codex_home_exists, inject_git_safe_directory); called by 2 (prepare_legacy_spawn_context, common_spawn_env_keeps_network_env_unchanged); 3 external calls (join, to_path_buf, create_dir_all).
 
@@ -3602,11 +3624,11 @@ fn prepare_legacy_spawn_context(
     env_map: &mut HashMap<String, String>,
 ```
 
-**Purpose**: Builds the legacy spawn context and applies the offline-network environment rewrite when the resolved permissions require network blocking. It is the legacy-path wrapper around the common preparation logic.
+**Purpose**: Prepares the basic context for the legacy sandbox launch path. It adds one legacy-specific step: if the permission profile says network access should be blocked, it rewrites the environment so common network clients are sent to a dead local proxy.
 
-**Data flow**: Takes the same inputs as `prepare_spawn_context_common`, calls that helper to obtain `SpawnContext`, checks `common.permissions.should_apply_network_block()`, conditionally mutates `env_map` with `apply_no_network_to_env`, and returns the context.
+**Data flow**: It receives the same launch information as the common preparation function. It first gets a SpawnContext from prepare_spawn_context_common, then may mutate the environment map to mark no-network mode and block proxy-based traffic, and finally returns the same context.
 
-**Call relations**: Legacy session launch and capture flows call this before token creation and process spawn. It delegates all shared setup to `prepare_spawn_context_common` and only adds the network-blocking branch.
+**Call relations**: Legacy sandbox launchers call this before they create tokens and ACL rules. It depends on the common setup function for ordinary preparation and then hands a ready SpawnContext back to the legacy session flow.
 
 *Call graph*: calls 2 internal fn (apply_no_network_to_env, prepare_spawn_context_common); called by 3 (legacy_spawn_env_applies_offline_network_rewrite, spawn_windows_sandbox_session_legacy, run_windows_sandbox_capture_with_filesystem_overrides).
 
@@ -3622,11 +3644,11 @@ fn prepare_legacy_session_security(
 ) -> Result<LegacySessionSecurity
 ```
 
-**Purpose**: Creates the restricted token and capability SID state needed for a legacy sandbox session. It chooses between a single readonly capability and per-root writable capabilities.
+**Purpose**: Creates the Windows security token and capability SIDs needed for a legacy sandbox session. In plain terms, it gives the future process a restricted identity that can only use the allowed file permissions.
 
-**Data flow**: Takes `uses_write_capabilities`, `codex_home`, `cwd`, and an iterator of capability roots. It loads stored capability SID strings with `load_or_create_cap_sids`. In the write-capability branch, it computes `write_root_sids` with `root_capability_sids`, bails if none exist, obtains a base token with `get_current_token_for_restriction`, collects raw SID pointers from the root SIDs, creates a restricted token with `create_workspace_write_token_with_caps_from`, closes the base token, and returns a `LegacySessionSecurity` containing the new token and root SIDs. In the readonly branch, it parses the readonly SID string into `LocalSid`, creates a readonly restricted token with `create_readonly_token_with_cap`, and returns `LegacySessionSecurity` containing the token, readonly SID object, readonly SID string, and an empty write-root SID list.
+**Data flow**: It takes whether write capabilities are needed, the Codex home, current directory, and candidate writable roots. If write capabilities are needed, it creates root-specific capability SIDs and builds a restricted token containing them. If not, it loads the shared read-only capability SID and builds a read-only token. It returns a LegacySessionSecurity object containing the token handle and the SIDs needed later for ACL changes.
 
-**Call relations**: Legacy spawn and capture paths call this after deciding whether write capabilities are needed and computing capability roots. It delegates SID loading, SID parsing, and token creation to the token/capability modules.
+**Call relations**: Legacy launch code calls this after it knows what kind of sandbox it is starting. It calls into token and capability helpers, then later apply_legacy_session_acl_rules uses the SIDs it produced to edit file permissions.
 
 *Call graph*: calls 6 internal fn (load_or_create_cap_sids, root_capability_sids, from_string, create_readonly_token_with_cap, create_workspace_write_token_with_caps_from, get_current_token_for_restriction); called by 2 (spawn_windows_sandbox_session_legacy, run_windows_sandbox_capture_with_filesystem_overrides); 3 external calls (new, bail!, CloseHandle).
 
@@ -3642,11 +3664,11 @@ fn legacy_session_capability_roots(
 ) -> Vec<PathBuf>
 ```
 
-**Purpose**: Computes the root paths whose capability SIDs should be active for a legacy session. It uses effective write-root filtering when the permissions require writable capabilities.
+**Purpose**: Chooses which folders should receive capability SIDs in a legacy session. This matters because a workspace-write sandbox should only get write labels for the effective writable roots, not every path that happened to be allowed.
 
-**Data flow**: Takes resolved permissions, current directory, environment map, and codex home. It computes `allow_paths` from `compute_allow_paths_for_permissions(...).allow`. If `permissions.uses_write_capabilities_for_cwd(current_dir, env_map)` is true, it passes those allow paths as an override into `effective_write_roots_for_permissions` and returns the filtered result; otherwise it returns the raw allow paths.
+**Data flow**: It reads resolved permissions, the current directory, environment variables, and Codex home. It computes allowed paths first. If the run uses write capabilities, it narrows and adjusts those paths into effective write roots; otherwise it simply returns the allowed paths.
 
-**Call relations**: Legacy spawn, capture, and preflight code call this before generating root capability SIDs. It delegates allow/deny computation and effective write-root filtering to shared helpers.
+**Call relations**: Legacy launch and preflight code use this before creating security tokens. Tests check that it chooses runtime workspace roots correctly and excludes internal Codex sandbox folders when appropriate.
 
 *Call graph*: calls 3 internal fn (compute_allow_paths_for_permissions, uses_write_capabilities_for_cwd, effective_write_roots_for_permissions); called by 5 (legacy_capability_roots_use_effective_write_roots, legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_root, spawn_windows_sandbox_session_legacy, run_windows_sandbox_capture_with_filesystem_overrides, run_windows_sandbox_legacy_preflight).
 
@@ -3661,11 +3683,11 @@ fn root_capability_sids(
 ) -> Result<Vec<RootCapabilitySid>>
 ```
 
-**Purpose**: Converts a set of writable root paths into concrete capability SID objects and strings, deduplicated by canonical path. It produces the per-root SID inventory used by tokens and ACLs.
+**Purpose**: Turns a set of writable root folders into Windows capability SIDs tied to those roots. It also removes duplicate roots so the sandbox does not receive repeated or stale security labels.
 
-**Data flow**: Takes `codex_home`, `cwd`, and an iterator of allowed root paths. It collects roots into a vector, sorts them by `canonicalize_path`, deduplicates adjacent canonical duplicates, then for each root computes a SID string with `workspace_write_cap_sid_for_root`, parses it into `LocalSid::from_string`, wraps the root, SID object, and SID string into `RootCapabilitySid`, and returns the vector.
+**Data flow**: It receives Codex home, current directory, and a list of allowed root paths. It sorts and deduplicates the roots using canonical paths, asks the capability system for the SID string for each root, converts each string into a LocalSid, and returns RootCapabilitySid records containing the root, SID object, and SID text.
 
-**Call relations**: This helper is used by both legacy and elevated spawn preparation, as well as tests and preflight checks. It delegates SID-string derivation to the capability module and SID parsing to `LocalSid`.
+**Call relations**: Both legacy and elevated preparation call this when workspace-write mode is active. Tests use it to confirm that only active writable roots become capabilities.
 
 *Call graph*: calls 2 internal fn (workspace_write_cap_sid_for_root, from_string); called by 5 (prepare_elevated_spawn_context_for_permissions, prepare_legacy_session_security, legacy_deny_path_includes_nested_active_root_sid, root_capability_sids_only_include_active_roots, run_windows_sandbox_legacy_preflight); 2 external calls (into_iter, with_capacity).
 
@@ -3679,11 +3701,11 @@ fn matching_root_capability(
 ) -> Option<&'a RootCapabilitySid>
 ```
 
-**Purpose**: Finds the most specific writable-root capability whose root contains a given path. It chooses the capability SID that should receive an allow ACE for that path.
+**Purpose**: Finds the best write-capability SID for a particular path. If several writable roots contain the path, it picks the most specific one, like choosing the closest matching folder rule rather than a broad parent rule.
 
-**Data flow**: Takes `path` and a slice of `RootCapabilitySid`, filters to roots where `workspace_write_root_contains_path(&root_sid.root, path)` is true, selects the maximum by `workspace_write_root_specificity(&root_sid.root)`, and returns `Option<&RootCapabilitySid>`.
+**Data flow**: It takes a path and a list of root capability records. It filters to roots that contain the path, compares how specific those roots are, and returns the best matching record if one exists.
 
-**Call relations**: `apply_legacy_session_acl_rules` uses this when granting allow ACEs in workspace-write mode so nested writable roots win over broader parents.
+**Call relations**: apply_legacy_session_acl_rules uses this when granting access to allowed paths and when deciding whether the current directory is a workspace root that needs extra protection.
 
 *Call graph*: called by 1 (apply_legacy_session_acl_rules); 1 external calls (iter).
 
@@ -3697,11 +3719,11 @@ fn deny_root_capabilities_for_path(
 ) -> Vec<&'a RootCapabilitySid>
 ```
 
-**Purpose**: Determines which writable-root capabilities should receive a deny-write ACE for a protected path. It narrows to overlapping roots when possible and falls back to all roots otherwise.
+**Purpose**: Decides which write-capability SIDs should be denied write access to a protected path. It is careful with nested writable roots, so a deny rule reaches every relevant capability that could touch the protected area.
 
-**Data flow**: Takes `path` and a slice of `RootCapabilitySid`, collects all roots where `workspace_write_root_overlaps_path(&root_sid.root, path)` is true, and returns that subset if non-empty; otherwise it returns references to all root SIDs.
+**Data flow**: It receives a path and all root capability records. It finds capabilities whose roots overlap that path. If there are overlaps, it returns only those relevant capabilities; if none overlap, it returns all capabilities so the deny rule is broad enough.
 
-**Call relations**: `apply_legacy_session_acl_rules` uses this when applying deny-write ACEs so protected paths are denied to every relevant capability, including nested active roots.
+**Call relations**: apply_legacy_session_acl_rules calls this while adding deny-write ACL entries. A test checks the important nested-root case, where both a workspace root and a nested active root must be denied.
 
 *Call graph*: called by 2 (apply_legacy_session_acl_rules, legacy_deny_path_includes_nested_active_root_sid); 1 external calls (iter).
 
@@ -3712,11 +3734,11 @@ fn deny_root_capabilities_for_path(
 fn allow_null_device_for_workspace_write(is_workspace_write: bool)
 ```
 
-**Purpose**: Ensures the current logon SID can access the null device when workspace-write mode is active. It is a compatibility fix for sandboxed processes that expect `NUL` to be usable.
+**Purpose**: Allows the Windows null device for workspace-write sessions. The null device is a special discard target, similar to throwing output into a trash can, and many command-line programs expect it to work.
 
-**Data flow**: Takes `is_workspace_write: bool`. If false, it returns immediately. Otherwise it obtains the current token with `get_current_token_for_restriction`, extracts the logon SID bytes with `get_logon_sid_bytes`, casts the bytes to a PSID pointer, calls `allow_null_device(psid)`, and closes the token handle with `CloseHandle`.
+**Data flow**: It receives a flag saying whether the session uses workspace-write capabilities. If not, it does nothing. If yes, it gets the current token, extracts the logon SID bytes from it, grants that SID access to the null device, and closes the token handle.
 
-**Call relations**: Legacy spawn and capture flows call this as an extra compatibility step when using workspace-write capabilities. It delegates SID extraction and null-device ACL mutation to lower-level helpers.
+**Call relations**: Legacy launch paths call this as a small compatibility step before running commands. It relies on token helpers to find the current logon SID and on ACL helper code to grant null-device access.
 
 *Call graph*: calls 3 internal fn (allow_null_device, get_current_token_for_restriction, get_logon_sid_bytes); called by 2 (spawn_windows_sandbox_session_legacy, run_windows_sandbox_capture_with_filesystem_overrides); 1 external calls (CloseHandle).
 
@@ -3732,11 +3754,11 @@ fn apply_legacy_session_acl_rules(
     additional_deny_read_p
 ```
 
-**Purpose**: Applies filesystem ACL allow/deny rules for a legacy sandbox session based on resolved permissions, explicit carveouts, and the active capability SIDs. It is the main ACL mutation routine before launching a legacy sandboxed process.
+**Purpose**: Applies the actual file and folder access rules for a legacy sandbox session. It grants access where the sandbox is allowed, denies writes to protected paths, optionally denies reads to sensitive paths, and protects internal workspace folders.
 
-**Data flow**: Takes resolved permissions, codex home, current dir, env map, slices of additional deny-read and deny-write paths, and `LegacyAclSids`. It computes `AllowDenyPaths` from `compute_allow_paths_for_permissions`, ensures each explicit deny-write path exists by creating directories when missing, inserts those paths into the deny set, then in an unsafe block grants allow ACEs: either every allowed path gets `add_allow_ace` for the readonly SID, or each allowed path gets an allow ACE for the most specific matching root capability from `matching_root_capability`. It then applies `add_deny_write_ace` for each deny path against every relevant root capability from `deny_root_capabilities_for_path`. If deny-read paths were supplied, it persists deny-read ACL state with `sync_persistent_deny_read_acls`, using either the readonly SID string or each root capability SID string. It calls `allow_null_device` for every write-root SID and optional readonly SID. Finally, if write-root capabilities exist and the current dir is itself the root of a writable workspace capability, it canonicalizes the cwd and protects `.codex` and agents directories via `protect_workspace_codex_dir` and `protect_workspace_agents_dir`. It returns `Ok(())` or propagates contextual filesystem/setup errors.
+**Data flow**: It receives resolved permissions, important paths, environment variables, extra deny-read and deny-write lists, and the SIDs created for this session. It computes allow and deny paths, creates explicit deny-write directories if needed, adds allow ACL entries for the right SID, adds deny-write ACL entries for relevant write capabilities, syncs persistent deny-read ACLs, grants null-device access, and protects .codex and agent folders when the command starts at the workspace root.
 
-**Call relations**: Legacy session launch, capture, and preflight flows call this after token and capability preparation. It delegates path computation, ACE application, persistent deny-read syncing, and workspace-directory protection to specialized modules.
+**Call relations**: Legacy launch and preflight flows call this after session security has been prepared. It uses matching_root_capability and deny_root_capabilities_for_path to pick the correct SID for each file rule, and it delegates the low-level ACL edits to ACL helper functions.
 
 *Call graph*: calls 11 internal fn (add_allow_ace, add_deny_write_ace, allow_null_device, compute_allow_paths_for_permissions, sync_persistent_deny_read_acls, canonicalize_path, deny_root_capabilities_for_path, matching_root_capability, is_command_cwd_root, protect_workspace_agents_dir (+1 more)); called by 3 (spawn_windows_sandbox_session_legacy, run_windows_sandbox_capture_with_filesystem_overrides, run_windows_sandbox_legacy_preflight); 3 external calls (is_empty, bail!, create_dir_all).
 
@@ -3752,11 +3774,11 @@ fn prepare_elevated_spawn_context_for_permissions(
     command: &[
 ```
 
-**Purpose**: Prepares the environment, setup state, sandbox credentials, and capability SID list needed for the elevated sandbox spawn path. It coordinates setup refresh/provisioning with the final capability selection used at launch time.
+**Purpose**: Prepares the launch context for the elevated sandbox path, where a separate sandbox user account is used. It sets up environment defaults, computes read/write restrictions, asks for suitable sandbox credentials, and gathers the capability SIDs the process should carry.
 
-**Data flow**: Takes resolved permissions, codex home, cwd, mutable env map, command argv, optional read/write-root overrides, deny-read and deny-write overrides, and `proxy_enforced`. It mutates `env_map` with `normalize_null_device_env`, `ensure_non_interactive_pager`, `inherit_path_env`, and `inject_git_safe_directory`; ensures `codex_home/.sandbox` exists via `ensure_codex_home_exists`; starts logging; computes `uses_write_capabilities`; computes `AllowDenyPaths` from `compute_allow_paths_for_permissions`; derives candidate write roots and deny-write paths; if write capabilities are needed, computes `effective_write_roots_for_permissions` and uses them as the setup write-root override; calls `require_logon_sandbox_creds` with the resolved permissions, overrides, deny paths, and proxy flag to ensure setup/users are ready; loads capability SID strings with `load_or_create_cap_sids`; chooses either the first effective write-root SID list from `root_capability_sids` or the readonly SID from stored caps; parses the selected SID into `LocalSid`, calls `allow_null_device` for that SID, and returns `ElevatedSpawnContext { sandbox_base, logs_base_dir, sandbox_creds, cap_sids }`.
+**Data flow**: It receives already resolved permissions, paths, the environment map, command text, optional read/write root overrides, deny lists, and whether a proxy enforces networking. It edits the environment, creates the sandbox log area, computes allowed and denied paths, derives effective write roots if workspace-write mode is active, requests sandbox logon credentials with those restrictions, loads capability SID data, chooses either root-specific write capabilities or the read-only capability, grants null-device access, and returns an ElevatedSpawnContext.
 
-**Call relations**: The elevated session spawn path calls this before process creation. It delegates environment normalization, write-root filtering, credential/setup orchestration, capability SID derivation, and null-device ACL adjustment to shared helpers.
+**Call relations**: The elevated sandbox launcher calls this as its setup step. It brings together environment helpers, permission calculators, credential setup, capability loading, and null-device ACL setup into one ready-to-launch package.
 
 *Call graph*: calls 14 internal fn (allow_null_device, compute_allow_paths_for_permissions, load_or_create_cap_sids, ensure_non_interactive_pager, inherit_path_env, normalize_null_device_env, require_logon_sandbox_creds, log_start, uses_write_capabilities_for_cwd, ensure_codex_home_exists (+4 more)); called by 1 (spawn_windows_sandbox_session_elevated_for_permission_profile); 5 external calls (join, is_empty, new, bail!, vec!).
 
@@ -3772,11 +3794,11 @@ fn workspace_profile(
     ) -> Permissi
 ```
 
-**Purpose**: Constructs a workspace-write permission profile with configurable network policy and tmpdir exclusions for spawn-preparation tests. It reduces repeated profile-building boilerplate.
+**Purpose**: Creates a workspace-write permission profile for tests. It lets tests quickly vary the network policy and writable-root settings without repeating setup code.
 
-**Data flow**: Takes network policy, writable roots, and tmpdir exclusion flags, calls `PermissionProfile::workspace_write_with`, and returns the resulting profile.
+**Data flow**: It receives a network policy, writable roots, and two booleans about temporary-directory exclusions. It passes those values into the permission-profile constructor and returns the resulting test profile.
 
-**Call relations**: Several tests use this helper before resolving permissions or preparing spawn contexts.
+**Call relations**: Several tests call this helper before resolving permissions or checking capability-root behavior. It keeps the test cases focused on what they are trying to prove.
 
 *Call graph*: calls 1 internal fn (workspace_write_with).
 
@@ -3787,11 +3809,11 @@ fn workspace_profile(
 fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Builds a one-element workspace-root vector from an absolute path for tests. It keeps test setup concise.
+**Purpose**: Builds the workspace-root list used by tests from a single filesystem path. It ensures the test path is treated as an absolute workspace root.
 
-**Data flow**: Converts `root: &Path` into `AbsolutePathBuf` and returns it inside a `Vec`.
+**Data flow**: It receives a path, converts it into an AbsolutePathBuf, wraps it in a one-item vector, and returns that vector.
 
-**Call relations**: Tests use this helper before calling permission resolution or spawn-preparation functions.
+**Call relations**: Tests use this helper before calling preparation or permission-resolution functions that expect workspace roots in the project’s absolute-path type.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -3802,11 +3824,11 @@ fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf>
 fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool
 ```
 
-**Purpose**: Resolves a permission profile and returns whether it should trigger the offline-network environment rewrite. It is a test-only convenience wrapper.
+**Purpose**: Checks whether a permission profile resolves to a setup that should block network access. It gives network-related tests a short way to ask the production permission resolver the same question launch code would ask.
 
-**Data flow**: Takes a permission profile, resolves it with `ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(permission_profile, &[])`, unwraps success, calls `.should_apply_network_block()`, and returns the boolean.
+**Data flow**: It receives a permission profile, resolves it with no workspace roots, asks the resolved permissions whether network blocking applies, and returns that boolean.
 
-**Call relations**: The first two tests use this helper to assert network-blocking decisions without constructing full spawn contexts.
+**Call relations**: The network-policy tests call this helper to verify the intended behavior for default workspace-write and explicitly network-enabled profiles.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots).
 
@@ -3817,11 +3839,11 @@ fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool
 fn no_network_env_rewrite_applies_for_workspace_write()
 ```
 
-**Purpose**: Verifies that the default workspace-write profile requests network blocking. It checks the restricted-network default.
+**Purpose**: Verifies that the default workspace-write profile requests network blocking. This protects the expectation that workspace-write sandboxes are offline unless configured otherwise.
 
-**Data flow**: Calls `should_apply_network_block(&PermissionProfile::workspace_write())` and asserts the result is true.
+**Data flow**: It builds the default workspace-write profile, asks whether network blocking should apply, and asserts that the answer is true.
 
-**Call relations**: This test exercises the network-policy interpretation in `ResolvedWindowsSandboxPermissions` through the test helper.
+**Call relations**: This test covers the permission-resolution decision that prepare_legacy_spawn_context later uses to decide whether to rewrite network environment variables.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3832,11 +3854,11 @@ fn no_network_env_rewrite_applies_for_workspace_write()
 fn no_network_env_rewrite_skips_when_network_access_is_allowed()
 ```
 
-**Purpose**: Verifies that a workspace-write profile with enabled network access does not request the offline-network rewrite. It checks the enabled-network branch.
+**Purpose**: Verifies that network blocking is not applied when the profile explicitly allows network access. This prevents the sandbox from unexpectedly breaking network-allowed commands.
 
-**Data flow**: Builds a workspace profile with `NetworkSandboxPolicy::Enabled`, calls `should_apply_network_block`, and asserts the result is false.
+**Data flow**: It builds a workspace-write test profile with network access enabled, asks whether network blocking should apply, and asserts that the answer is false.
 
-**Call relations**: This test validates the opposite branch of the network-blocking predicate.
+**Call relations**: This test complements the default-blocking test and checks the condition used by the legacy spawn preparation path.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -3847,11 +3869,11 @@ fn no_network_env_rewrite_skips_when_network_access_is_allowed()
 fn legacy_spawn_env_applies_offline_network_rewrite()
 ```
 
-**Purpose**: Verifies that legacy spawn preparation rewrites the environment for offline networking when the permissions require it. It checks the side effects on proxy-related environment variables.
+**Purpose**: Checks that legacy spawn preparation actually rewrites the environment for an offline sandbox. It proves that the permission decision becomes concrete environment changes.
 
-**Data flow**: Creates temporary codex-home and cwd directories, an empty environment map, and workspace roots, calls `prepare_legacy_spawn_context` with `PermissionProfile::workspace_write()`, then asserts `SBX_NONET_ACTIVE=1` and `HTTP_PROXY=http://127.0.0.1:9` are present in `env_map`.
+**Data flow**: It creates temporary Codex home and current-directory folders, starts with an empty environment map, prepares a legacy workspace-write context, and then asserts that no-network marker and proxy variables were added.
 
-**Call relations**: This test exercises `prepare_legacy_spawn_context` and its conditional call to `apply_no_network_to_env`.
+**Call relations**: This test calls prepare_legacy_spawn_context, which calls the common setup and then the network rewrite helper. It verifies the legacy-only behavior that common setup deliberately does not perform.
 
 *Call graph*: calls 2 internal fn (workspace_write, prepare_legacy_spawn_context); 4 external calls (new, new, assert_eq!, workspace_roots_for).
 
@@ -3862,11 +3884,11 @@ fn legacy_spawn_env_applies_offline_network_rewrite()
 fn common_spawn_env_keeps_network_env_unchanged()
 ```
 
-**Purpose**: Verifies that the common spawn-preparation path does not itself rewrite network environment variables. It checks that only the legacy wrapper adds offline-network mutation.
+**Purpose**: Checks that the shared preparation function does not rewrite network proxy settings. This is important because only the legacy path should apply that particular no-network environment trick.
 
-**Data flow**: Creates temporary codex-home and cwd directories, initializes `env_map` with an existing `HTTP_PROXY`, calls `prepare_spawn_context_common` with Git safe-directory injection enabled, asserts `context.uses_write_capabilities` is true, and checks that `SBX_NONET_ACTIVE` is absent and `HTTP_PROXY` remains unchanged.
+**Data flow**: It creates temporary folders and an environment map with an existing HTTP proxy, runs prepare_spawn_context_common, then asserts that the no-network marker was not added and the proxy value stayed unchanged. It also checks that the resulting context uses write capabilities.
 
-**Call relations**: This test directly exercises `prepare_spawn_context_common` and contrasts its behavior with `prepare_legacy_spawn_context`.
+**Call relations**: This test calls the common preparation function directly. It protects the split between shared setup and legacy-specific network blocking.
 
 *Call graph*: calls 2 internal fn (workspace_write, prepare_spawn_context_common); 5 external calls (from, new, assert!, assert_eq!, workspace_roots_for).
 
@@ -3877,11 +3899,11 @@ fn common_spawn_env_keeps_network_env_unchanged()
 fn legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_root()
 ```
 
-**Purpose**: Verifies that legacy capability-root computation resolves symbolic workspace-root permissions to the actual runtime workspace root. It checks the integration with effective write-root filtering.
+**Purpose**: Verifies that legacy capability roots use the actual runtime workspace root when the command runs inside a workspace subdirectory. This keeps write permission attached to the right top-level workspace rather than only the current subfolder.
 
-**Data flow**: Creates codex-home, workspace root, and nested command cwd, resolves a workspace-write profile with runtime workspace roots, calls `legacy_session_capability_roots`, and asserts the result is the canonical workspace root.
+**Data flow**: It creates temporary Codex and workspace directories, resolves a workspace-write profile, calls legacy_session_capability_roots for a command current directory inside the workspace, and asserts that the returned root is the canonical workspace root.
 
-**Call relations**: This test exercises `legacy_session_capability_roots` and its delegation to `effective_write_roots_for_permissions` when write capabilities are active.
+**Call relations**: This test exercises legacy_session_capability_roots and the permission resolver together. It confirms the launch path will create capability SIDs for the intended workspace root.
 
 *Call graph*: calls 2 internal fn (try_from_permission_profile_for_workspace_roots, legacy_session_capability_roots); 6 external calls (new, new, assert_eq!, create_dir_all, workspace_profile, workspace_roots_for).
 
@@ -3892,11 +3914,11 @@ fn legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_roo
 fn root_capability_sids_only_include_active_roots()
 ```
 
-**Purpose**: Verifies that root capability SID generation only includes currently active writable roots and not stale or generic workspace capability SIDs. It checks canonical deduplication and per-root SID derivation.
+**Purpose**: Verifies that root_capability_sids returns SIDs only for roots supplied to the current run. It prevents old or unrelated capability SIDs from being accidentally included.
 
-**Data flow**: Creates codex-home, workspace, active root, and stale root, precomputes SID strings for each root and the generic workspace capability, calls `root_capability_sids` with only workspace and active root, collects the returned SID strings, and asserts the active and workspace-root SIDs are present while the stale and generic workspace capability SIDs are absent.
+**Data flow**: It creates temporary Codex, workspace, active-root, and stale-root directories. It computes expected SIDs for several roots, calls root_capability_sids with only the workspace and active root, and asserts that those two are present while the stale and generic workspace capability SIDs are absent.
 
-**Call relations**: This test directly validates `root_capability_sids` and its use of `workspace_write_cap_sid_for_root`.
+**Call relations**: This test directly covers root_capability_sids, which both legacy and elevated preparation rely on when workspace-write mode is active.
 
 *Call graph*: calls 3 internal fn (load_or_create_cap_sids, workspace_write_cap_sid_for_root, root_capability_sids); 5 external calls (new, assert!, assert_eq!, create_dir_all, vec!).
 
@@ -3907,11 +3929,11 @@ fn root_capability_sids_only_include_active_roots()
 fn legacy_deny_path_includes_nested_active_root_sid()
 ```
 
-**Purpose**: Verifies that deny-write targeting for a protected path includes both the enclosing workspace root capability and any nested active writable root capability that overlaps the path. It checks overlap-based deny selection.
+**Purpose**: Verifies that deny-write rules include both a parent workspace capability and a nested active-root capability when a protected path overlaps both. This closes a subtle hole where a nested writable root might otherwise bypass a deny rule.
 
-**Data flow**: Creates codex-home, workspace, a protected `.codex` directory, a nested writable root inside it, and an unrelated root, computes root capability SIDs, calls `deny_root_capabilities_for_path(&protected_dir, &root_sids)`, collects SID strings, and asserts the workspace and nested-root SIDs are included while the unrelated SID is not.
+**Data flow**: It creates a workspace, a protected directory, a nested writable root under that protected area, and an unrelated root. It builds capability records, asks deny_root_capabilities_for_path which SIDs should be denied for the protected directory, and asserts that the workspace and nested SIDs are returned but the unrelated SID is not.
 
-**Call relations**: This test directly exercises `deny_root_capabilities_for_path` and the overlap logic used by `apply_legacy_session_acl_rules`.
+**Call relations**: This test focuses on deny_root_capabilities_for_path, the helper used by apply_legacy_session_acl_rules when adding deny-write ACL entries.
 
 *Call graph*: calls 3 internal fn (workspace_write_cap_sid_for_root, deny_root_capabilities_for_path, root_capability_sids); 5 external calls (new, assert!, assert_eq!, create_dir_all, vec!).
 
@@ -3922,24 +3944,26 @@ fn legacy_deny_path_includes_nested_active_root_sid()
 fn legacy_capability_roots_use_effective_write_roots()
 ```
 
-**Purpose**: Verifies that legacy capability-root computation uses the filtered effective write roots rather than raw writable roots, excluding protected Codex paths. It checks consistency with setup write-root filtering.
+**Purpose**: Verifies that legacy capability roots are based on effective write roots, not every configured writable path. In particular, internal Codex home and sandbox directories should not become writable capabilities for the command.
 
-**Data flow**: Creates codex-home, workspace, active root, and sandbox root, resolves a workspace-write profile whose writable roots include active root plus forbidden Codex paths, calls `legacy_session_capability_roots`, canonicalizes expected and forbidden paths, and asserts workspace and active root are present while codex-home and sandbox root are absent.
+**Data flow**: It creates temporary workspace, Codex home, active-root, and sandbox-root directories, builds a profile listing several writable roots, resolves permissions, calls legacy_session_capability_roots, and asserts that the workspace and active root are included while Codex home and the sandbox directory are excluded.
 
-**Call relations**: This test validates that `legacy_session_capability_roots` delegates to `effective_write_roots_for_permissions` in workspace-write mode.
+**Call relations**: This test protects the behavior of legacy_session_capability_roots and effective_write_roots_for_permissions in the legacy launch flow.
 
 *Call graph*: calls 2 internal fn (try_from_permission_profile_for_workspace_roots, legacy_session_capability_roots); 7 external calls (new, new, assert!, create_dir_all, vec!, workspace_profile, workspace_roots_for).
 
 
 ### `windows-sandbox-rs/src/elevated_impl.rs`
 
-`orchestration` · `sandbox process launch and output capture`
+`orchestration` · `command execution`
 
-This file defines the request object for elevated capture, then splits behavior into a Windows-only implementation and a non-Windows stub. `ElevatedSandboxProfileCaptureRequest` bundles everything the elevated backend needs in one struct: the `PermissionProfile`, workspace roots, command/cwd/env, timeout and cancellation, desktop mode, proxy policy, and explicit filesystem override lists for read/write allow and deny roots.
+This file exists so Codex can run a user command with Windows sandbox limits instead of giving it normal full access to the machine. Think of it like sending a worker into a locked room with a written pass: the pass says which folders can be read or written, and the worker reports back with stdout, stderr, and an exit code.
 
-On Windows, the main routine first resolves `ResolvedWindowsSandboxPermissions` from the permission profile and workspace roots, converts deny overrides from `AbsolutePathBuf` to plain `PathBuf`, and normalizes the environment for Windows execution (`/dev/null` → `NUL`, pager defaults, inherited `PATH`, Git safe-directory injection). It ensures a writable `.sandbox` log/home area under `codex_home`, logs command start, and obtains sandbox logon credentials via `require_logon_sandbox_creds`, with a retry path through `refresh_logon_sandbox_creds` if the runner reports stale credentials.
+The main request type, ElevatedSandboxProfileCaptureRequest, gathers everything needed for that run: the permission profile, workspace folders, current directory, environment variables, timeout, cancellation token, and optional overrides for readable or writable paths.
 
-Before launch it computes capability SIDs: either per-write-root capability SIDs for workspace-write mode or the readonly capability SID otherwise, and grants the chosen SID access to the null device. It then builds an IPC `SpawnRequest`, starts the runner transport, optionally spawns a polling cancellation thread that writes a `Message::Terminate` frame, and enters a framed-message loop. `SpawnReady` is ignored, `Output` frames are base64-decoded and appended to stdout/stderr buffers by `OutputStream`, `Exit` ends successfully, and `Error` or any unexpected message aborts. After cleanup it logs success/failure based on exit code and returns `CaptureResult` with collected bytes and timeout state.
+On Windows, the main function turns the permission profile into concrete Windows sandbox permissions, prepares the environment, creates a sandbox log area, gets or refreshes sandbox login credentials, and builds capability SIDs. A SID is a Windows security identifier, like a named badge that access-control lists can recognize. The file also grants access to the Windows null device when needed, so redirected input or output can work safely.
+
+It then starts a sandbox runner process and talks to it through framed IPC, meaning messages are sent in clear packets over a pipe. The runner sends output chunks and finally an exit message. This file collects those chunks, watches for cancellation, logs success or failure, and returns a CaptureResult. On non-Windows systems, the same public function exists but immediately reports that Windows sandboxing is unavailable.
 
 #### Function details
 
@@ -3952,11 +3976,11 @@ fn spawn_cancel_writer(
     ) -> Result<Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>>
 ```
 
-**Purpose**: Starts an auxiliary thread that watches an optional `WindowsSandboxCancellationToken` and, once cancellation is requested, sends a framed terminate message to the runner pipe. If no token is supplied, it returns `None` and no thread is created.
+**Purpose**: This helper starts a small background thread that watches for a cancellation request. If cancellation happens, it sends a terminate message to the sandbox runner through the pipe, so the command can be stopped instead of continuing to run.
 
-**Data flow**: It takes a writable `File` handle for the IPC pipe and an optional cancellation token. The function clones the file handle, allocates an `Arc<AtomicBool>` completion flag, and spawns a thread that polls `cancellation.is_cancelled()` every 50 ms using `park_timeout`; on cancellation it writes a `FramedMessage { version: 1, message: Message::Terminate { ... } }` to the pipe. It returns `Ok(Some((JoinHandle, done_flag)))` for later shutdown coordination, or `Ok(None)` when cancellation is absent.
+**Data flow**: It receives the writable end of the runner pipe and an optional cancellation token. If there is no token, it returns nothing to watch. If there is a token, it clones the pipe handle, creates a shared done flag, and starts a thread that checks the token every 50 milliseconds. When cancellation is seen, the thread writes a terminate frame to the runner. The function returns the thread handle and done flag so the caller can cleanly stop the watcher later.
 
-**Call relations**: It is invoked only by `windows_impl::run_windows_sandbox_capture_for_permission_profile` after the runner transport has been established and before the IPC read loop begins. Its sole downstream action is writing the terminate frame into the same runner IPC channel so the helper can stop cooperatively instead of being killed externally.
+**Call relations**: The main sandbox capture function calls this after the runner has been started and the IPC pipe is available. While the main function reads output and exit messages from the runner, this helper sits beside it as a safety cord. When the main run finishes, the caller sets the done flag, wakes the thread, and joins it so no background thread is left behind.
 
 *Call graph*: 5 external calls (clone, new, new, try_clone, spawn).
 
@@ -3969,11 +3993,11 @@ fn run_windows_sandbox_capture_for_permission_profile(
     ) -> Result<CaptureResult>
 ```
 
-**Purpose**: Runs a command through the elevated Windows sandbox backend by preparing permissions and credentials, launching the command-runner helper over framed IPC, and collecting stdout/stderr until exit. It is the core elevated capture implementation used on Windows.
+**Purpose**: This is the main Windows implementation for running a command under the sandbox user and collecting its result. It takes a friendly permission profile and turns it into a real sandboxed process run, including setup, execution, output capture, cancellation, logging, and error handling.
 
-**Data flow**: It consumes an `ElevatedSandboxProfileCaptureRequest`, destructures all fields, derives `ResolvedWindowsSandboxPermissions`, converts deny override slices into owned `Vec<PathBuf>`, and mutates `env_map` with Windows-safe defaults. It creates/uses `codex_home/.sandbox` for logs and helper state, logs command start, and obtains `SandboxCreds`. It reads or creates capability SID state, computes either readonly or per-write-root capability SIDs, converts the first SID string into `LocalSid`, and grants that SID null-device access. It then builds a `SpawnRequest` containing command, cwd, cloned env, cloned permission profile, workspace roots, sandbox home paths, capability SIDs, timeout, and desktop settings. After spawning the runner transport—retrying once with refreshed credentials if the first failure matches stale-credential detection—it reads framed messages from the pipe, base64-decodes output payloads into `stdout`/`stderr` byte buffers, and stops on `Exit`, `Error`, EOF, decode failure, or unexpected message. Finally it stops the cancellation thread if present, drops the write pipe, logs success or failure from the exit code, and returns `CaptureResult { exit_code, stdout, stderr, timed_out }`.
+**Data flow**: It receives one request containing the command, working directory, environment, permission profile, workspace roots, timeout, cancellation token, and path overrides. First it resolves the permission profile into concrete Windows permissions, cleans and augments the environment, prepares a writable sandbox log/home area, and obtains sandbox credentials. It then loads or creates capability SIDs, grants needed access to the null device, builds a spawn request for the runner, and starts communication with that runner. As framed messages come back, it decodes stdout and stderr chunks into byte buffers, waits for the exit message, records whether the process timed out, logs success or failure, and returns a CaptureResult containing exit code, stdout, stderr, and timeout status.
 
-**Call relations**: This function is the public Windows export from the file and is called by higher-level elevated sandbox execution paths. It delegates environment shaping to `normalize_null_device_env`, `ensure_non_interactive_pager`, `inherit_path_env`, and `inject_git_safe_directory`; setup/credential work to `require_logon_sandbox_creds` and possibly `refresh_logon_sandbox_creds`; capability and ACL preparation to `load_or_create_cap_sids`, `workspace_write_cap_sid_for_root`, `effective_write_roots_for_permissions`, `LocalSid::from_string`, and `allow_null_device`; transport startup to `spawn_runner_transport`; cancellation support to `spawn_cancel_writer`; and framed IPC parsing to `read_frame`, `decode_bytes`, and message matching.
+**Call relations**: This function is the central coordinator for the Windows path. It calls permission resolution, environment preparation, credential setup, capability setup, access-control setup, runner spawning, IPC reading and writing, and logging helpers in sequence. If starting the runner fails because sandbox credentials are stale, it refreshes those credentials and tries once more. During execution it calls the cancellation helper so a caller-requested stop can be forwarded to the runner.
 
 *Call graph*: calls 12 internal fn (allow_null_device, load_or_create_cap_sids, ensure_non_interactive_pager, inherit_path_env, normalize_null_device_env, require_logon_sandbox_creds, log_start, try_from_permission_profile_for_workspace_roots, ensure_codex_home_exists, inject_git_safe_directory (+2 more)); 2 external calls (bail!, vec!).
 
@@ -3986,31 +4010,39 @@ fn run_windows_sandbox_capture_for_permission_profile(
     ) -> Result<CaptureResult>
 ```
 
-**Purpose**: Provides the non-Windows placeholder for the elevated capture API. It exists so the crate compiles cross-platform while making it explicit that this backend is Windows-only.
+**Purpose**: This is the non-Windows fallback for the same public API. It exists so the crate can compile on other operating systems while clearly saying that this feature only works on Windows.
 
-**Data flow**: It accepts the same request type as the Windows implementation but ignores it entirely. The function immediately returns an error via `bail!` stating that the Windows sandbox is only available on Windows.
+**Data flow**: It receives the same sandbox capture request shape as the Windows implementation, but it does not inspect or use it. Instead, it immediately returns an error explaining that the Windows sandbox is only available on Windows.
 
-**Call relations**: This version is exported only when the target OS is not Windows. It does not delegate further work and serves as the terminal branch for unsupported platforms.
+**Call relations**: This function is exported only when the code is built for a non-Windows target. It stands in place of the real Windows implementation, so callers get a clear runtime error instead of missing symbols or accidental unsupported behavior.
 
 *Call graph*: 1 external calls (bail!).
 
 
 ### `windows-sandbox-rs/src/elevated/mod.rs`
 
-`orchestration` · `startup`
+`orchestration` · `compile-time module organization`
 
-This module file is a structural entry point for the `elevated` portion of the Windows sandbox crate. It does not contain executable logic; instead, it declares three crate-visible submodules: `ipc_framed`, `runner_client`, and `runner_pipe`. Together, those names indicate the elevated subsystem is split into transport framing, client-side coordination, and named-pipe or pipe-based process communication concerns. By placing these declarations in `mod.rs` and marking them `pub(crate)`, the crate exposes the elevated subsystem internally while keeping it hidden from external consumers. The file’s main role is to define the namespace boundary and compilation unit layout so other crate modules can refer to `crate::elevated::...` components consistently. This separation is especially useful in a sandboxing context where elevated helpers often require distinct IPC protocols and process-launch paths from ordinary execution. There are no invariants or state transitions in this file itself; the design choice here is organizational: keep elevated-runner plumbing cohesive and explicitly internal to the crate.
+This is a small module index file. In Rust, a `mod.rs` file works a bit like a table of contents for a folder: it does not do the work itself, but it makes the files inside the folder visible to the rest of the program.
+
+Here, it declares three internal modules: `ipc_framed`, `runner_client`, and `runner_pipe`. The `pub(crate)` wording means these modules can be used anywhere inside this Rust crate, but they are not exposed as part of a public library interface. In plain terms, they are shared building blocks for this project, not something outside users are meant to call directly.
+
+The names suggest this folder is about talking to an elevated runner process: `ipc` means inter-process communication, which is how separate programs or processes exchange messages; `framed` usually means messages are wrapped with clear boundaries so the receiver knows where one message ends and the next begins; `runner_client` likely contains the client-side code that asks the elevated runner to do work; and `runner_pipe` likely uses Windows pipes, a standard way for processes to communicate.
+
+Without this file, those modules would not be connected under the `elevated` namespace, and other parts of the crate would not be able to refer to them through this organized path.
 
 
 ### `windows-sandbox-rs/src/elevated/runner_client.rs`
 
-`orchestration` · `elevated runner startup and handshake`
+`io_transport` · `sandbox runner startup and pipe handshake`
 
-This file is the parent-side driver for the elevated runner process. It owns the logic for spawning `codex-command-runner.exe` with `CreateProcessWithLogonW`, connecting the two named pipes used for framed IPC, sending the initial `SpawnRequest`, and waiting for a `SpawnReady` acknowledgment. The public transport surface is `RunnerTransport`, which wraps the write and read pipe `File`s and exposes helpers for the startup handshake.
+This file is the bridge between the main program and a helper process called the runner. The runner is launched under sandbox credentials, meaning it runs as a separate Windows user with limited permissions. Without this file, the program could not reliably start commands inside that sandboxed account, and failed launches could leave behind stray runner processes.
 
-A key concern here is avoiding hangs and leaked helper processes. `connect_pipe_with_timeout` performs each blocking pipe connection on a helper thread, duplicates that thread’s handle back to the parent, and waits up to `RUNNER_PIPE_CONNECT_TIMEOUT`. If the timeout expires, it attempts `CancelSynchronousIo` on the specific helper thread; if cancellation cannot be confirmed, it still returns a timeout error and relies on later pipe-handle cleanup to unwind the blocked connect. `try_take_completed_connect_result` handles the race where the helper thread may have just finished as the timeout fires.
+The file first creates a pair of Windows named pipes. A named pipe is like a private phone line between two programs on the same machine. One pipe is used to send messages to the runner, and the other is used to read messages back. It then finds the runner executable, builds a Windows command line, and starts it with `CreateProcessWithLogonW`, which is the Windows call for launching a program as a specific user.
 
-After process creation, `spawn_runner_transport` keeps the runner process handle alive through both pipe connection and framed startup. Any failure in spawning, connecting, sending the request, or receiving `spawn_ready` triggers aggressive cleanup: terminate the runner process if it exists, close raw handles, and drop partially built transport state. `wait_for_complete_frame` uses `PeekNamedPipe` polling to ensure a full frame is buffered before `read_frame`, preventing indefinite blocking while waiting for the runner’s first response. The file also defines `RunnerLogonError` and a classifier helper that recognizes stale sandbox credentials specifically by `ERROR_LOGON_FAILURE`.
+Startup is treated carefully. The code waits for the runner to connect to both pipes, but uses timeouts so a stuck connection does not freeze the parent forever. After the pipes connect, it sends the initial spawn request and waits for a `SpawnReady` reply. If anything goes wrong before that point, it closes pipe handles and terminates the runner process so there is no orphan helper left running.
+
+It also marks logon failures in a recognizable way, so higher-level code can tell when saved sandbox credentials have gone stale.
 
 #### Function details
 
@@ -4020,11 +4052,11 @@ After process creation, `spawn_runner_transport` keeps the runner process handle
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats a runner logon failure as a human-readable message containing the Win32 error code. It gives the custom error type a stable display string.
+**Purpose**: This turns a Windows logon-launch failure into a readable error message. It keeps the raw Windows error code visible so callers can decide what kind of failure happened.
 
-**Data flow**: It reads `self.code` and writes `"CreateProcessWithLogonW failed: {code}"` into the provided formatter, returning the formatter result. It mutates no external state.
+**Data flow**: It receives a `RunnerLogonError` containing a numeric Windows error code and a formatter to write into. It writes a short message that includes that code. The result is text that can be shown in logs or wrapped inside a larger error.
 
-**Call relations**: This method is used implicitly when `RunnerLogonError` is wrapped into `anyhow::Error` and later displayed by callers or logs.
+**Call relations**: This is used automatically when `RunnerLogonError` is displayed as an error. `spawn_runner_transport` creates this error when Windows refuses to launch the runner with the supplied sandbox username and password.
 
 *Call graph*: 1 external calls (write!).
 
@@ -4035,11 +4067,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn is_stale_sandbox_creds_error(err: &anyhow::Error) -> bool
 ```
 
-**Purpose**: Detects whether an `anyhow::Error` originated from a runner logon failure specifically caused by invalid credentials. It distinguishes stale sandbox credentials from other launch failures.
+**Purpose**: This checks whether an error means the saved sandbox login details no longer work. Higher-level code can use this to know when it should recreate or refresh the sandbox user credentials.
 
-**Data flow**: It takes a borrowed `anyhow::Error`, attempts `downcast_ref::<RunnerLogonError>()`, checks whether the embedded code equals `ERROR_LOGON_FAILURE`, and returns a boolean. It reads no global state.
+**Data flow**: It receives a general error value, looks inside it for a `RunnerLogonError`, and checks whether the stored Windows error code is `ERROR_LOGON_FAILURE`. It returns `true` only for that specific failed-login case, and `false` for other errors.
 
-**Call relations**: This classifier is called by elevated session startup code higher up the stack to decide whether a launch failure should trigger credential refresh or a different recovery path.
+**Call relations**: It is called by `spawn_windows_sandbox_session_elevated_for_permission_profile` after runner startup fails. That caller can then treat bad credentials differently from ordinary pipe, process, or setup failures.
 
 *Call graph*: called by 1 (spawn_windows_sandbox_session_elevated_for_permission_profile).
 
@@ -4050,11 +4082,11 @@ fn is_stale_sandbox_creds_error(err: &anyhow::Error) -> bool
 fn send_spawn_request(&mut self, request: SpawnRequest) -> Result<()>
 ```
 
-**Purpose**: Wraps a `SpawnRequest` in the framed protocol envelope and writes it to the runner’s outbound pipe. It is the first message sent after pipe connection succeeds.
+**Purpose**: This sends the first instruction to the runner telling it what command or session setup it should prepare. It wraps the request in the project’s framed message format so the runner can decode it safely.
 
-**Data flow**: It takes mutable access to `self` and an owned `SpawnRequest`, constructs a `FramedMessage` with the current `IPC_PROTOCOL_VERSION` and `Message::SpawnRequest`, then writes it to `self.pipe_write` via `write_frame`, returning the resulting `Result<()>`.
+**Data flow**: It takes a `SpawnRequest`, adds the current IPC protocol version, labels it as a `SpawnRequest` message, and writes it to the outgoing pipe. The main visible result is bytes sent to the runner; if writing fails, an error comes back.
 
-**Call relations**: This method is called during `spawn_runner_transport` after both named pipes are connected. It delegates serialization and framing to the IPC module.
+**Call relations**: During runner startup, `spawn_runner_transport` uses this after both pipes have connected. It hands the finished message to `write_frame`, which does the low-level job of writing one complete framed message to the pipe.
 
 *Call graph*: calls 1 internal fn (write_frame); 1 external calls (new).
 
@@ -4065,11 +4097,11 @@ fn send_spawn_request(&mut self, request: SpawnRequest) -> Result<()>
 fn read_spawn_ready(&mut self) -> Result<()>
 ```
 
-**Purpose**: Waits for and validates the runner’s initial acknowledgment frame. It accepts only `SpawnReady`, converts runner-side `Error` frames into local errors, and rejects any other message type.
+**Purpose**: This waits for the runner to confirm that it received the spawn request and is ready. It protects startup from moving on too early or hanging forever.
 
-**Data flow**: It takes mutable access to `self`, first calls `wait_for_complete_frame` on `self.pipe_read` with the startup timeout, then reads one frame with `read_frame`. If EOF occurs it returns an error about the pipe closing early; otherwise it pattern-matches the message and returns `Ok(())` for `SpawnReady`, an `anyhow` error containing the runner message for `Error`, or an `anyhow` error describing the unexpected variant.
+**Data flow**: It reads from the incoming pipe. First it waits until a complete framed message is available, then decodes that frame. If the message is `SpawnReady`, it returns success. If the runner reports an error, closes the pipe, or sends an unexpected message, it returns an explanatory error.
 
-**Call relations**: This method is the second half of the startup handshake in `spawn_runner_transport`, immediately following `send_spawn_request`.
+**Call relations**: It is used in the startup handshake after `send_spawn_request`. It relies on `wait_for_complete_frame` to avoid blocking forever on a partial message, and then calls `read_frame` to decode the actual message.
 
 *Call graph*: calls 2 internal fn (read_frame, wait_for_complete_frame); 1 external calls (anyhow!).
 
@@ -4080,11 +4112,11 @@ fn read_spawn_ready(&mut self) -> Result<()>
 fn into_files(self) -> (File, File)
 ```
 
-**Purpose**: Consumes the transport wrapper and returns the underlying write and read pipe files. It hands ownership of the established IPC channel to later stages.
+**Purpose**: This gives back the two pipe files owned by the transport. Someone would use it when they need direct access to the raw read and write streams after startup has completed.
 
-**Data flow**: It takes ownership of `self` and returns a tuple `(File, File)` containing `pipe_write` and `pipe_read`. No additional transformation occurs.
+**Data flow**: It consumes the `RunnerTransport`, taking ownership of its write pipe and read pipe. It returns those two `File` objects as a pair, so the caller becomes responsible for using and eventually closing them.
 
-**Call relations**: Callers use this after startup succeeds and they want direct access to the connected pipe files rather than the handshake-oriented wrapper.
+**Call relations**: This is a handoff point after the transport has done its startup job. Instead of sending a protocol message itself, it transfers the connected pipe objects to later code that will continue communication with the runner.
 
 
 ##### `try_take_completed_connect_result`  (lines 105–124)
@@ -4098,11 +4130,11 @@ fn try_take_completed_connect_result(
 ) ->
 ```
 
-**Purpose**: Checks whether the helper thread performing a blocking pipe connect has already finished and, if so, retrieves its reported result. It resolves timeout races without blocking indefinitely.
+**Purpose**: This checks whether a helper thread that was connecting a pipe has already finished. It is used during timeout handling to avoid cancelling work that actually completed just in time.
 
-**Data flow**: It takes mutable access to the optional join handle, the receiver carrying the connect result, the duplicated helper thread `HANDLE`, and a pipe label. It polls the thread with `WaitForSingleObject(..., 0)`; if the thread is still running it returns `Ok(None)`. If finished, it joins the thread if present, receives the reported `Result<()>` from the channel, and returns `Ok(Some(result))`, or an error if the thread exited before sending.
+**Data flow**: It receives the optional helper thread, a channel where that thread reports its result, the Windows handle for that thread, and a human-readable pipe label. It asks Windows whether the thread has finished. If not, it returns `None`. If it has, it joins the thread, reads the reported result from the channel, and returns it.
 
-**Call relations**: This helper is used only inside `connect_pipe_with_timeout` on timeout paths and race windows where the helper thread may have completed just as cancellation logic begins.
+**Call relations**: `connect_pipe_with_timeout` calls this when a pipe connection appears to have timed out. The function acts like checking whether someone arrived just as you were about to leave; if the connection already completed, the caller can use that result instead of treating it as a timeout.
 
 *Call graph*: calls 1 internal fn (recv); called by 1 (connect_pipe_with_timeout); 1 external calls (WaitForSingleObject).
 
@@ -4117,11 +4149,11 @@ fn connect_pipe_with_timeout(
 ) -> Result<()>
 ```
 
-**Purpose**: Connects one server-side named pipe to the runner process with a bounded wait and cancellation strategy. It isolates the blocking `ConnectNamedPipe` call on a helper thread so the parent can time out safely.
+**Purpose**: This waits for the runner process to connect to one named pipe, but only for a limited time. It prevents startup from hanging forever if the runner crashes, never starts, or connects incorrectly.
 
-**Data flow**: It takes a pipe handle, expected runner PID, and pipe label. It spawns a named helper thread that duplicates its own thread handle back to the parent, then calls `connect_pipe` and sends the result over a channel. The parent receives the duplicated thread handle, waits up to `RUNNER_PIPE_CONNECT_TIMEOUT` for the result, joins the thread on normal completion, uses `try_take_completed_connect_result` to resolve races, attempts `CancelSynchronousIo` on timeout, closes the duplicated thread handle, and returns either the connect result or a contextual timeout/cancellation error.
+**Data flow**: It receives a pipe handle, the process ID expected to connect, and a label such as `pipe-in` or `pipe-out`. It starts a helper thread to do the blocking pipe connection. The main thread waits for the result with a timeout. If the connection succeeds, it returns success. If time runs out, it tries to cancel the blocking Windows call and returns a timeout error.
 
-**Call relations**: This function is called twice by `spawn_runner_transport`, once for each pipe direction. It delegates the actual pipe handshake and PID verification to `connect_pipe` from `runner_pipe`.
+**Call relations**: `spawn_runner_transport` calls this once for each pipe during startup. It uses `try_take_completed_connect_result` in racey moments where the timeout and successful connection may happen almost together, and it calls Windows cancellation and handle-closing functions to clean up safely.
 
 *Call graph*: calls 1 internal fn (try_take_completed_connect_result); 7 external calls (anyhow!, format!, sync_channel, new, CloseHandle, GetLastError, CancelSynchronousIo).
 
@@ -4138,11 +4170,11 @@ fn spawn_runner_transport(
 ) -> Result<RunnerTransport>
 ```
 
-**Purpose**: Creates the named pipes, launches the elevated runner process under sandbox credentials, completes pipe connection and framed startup, and returns a ready-to-use transport. It is the main parent-side entrypoint for elevated runner startup.
+**Purpose**: This is the main setup routine for creating a working connection to the sandbox runner. It creates pipes, launches the runner as the sandbox user, waits for both sides to connect, sends the first request, and returns a ready-to-use `RunnerTransport`.
 
-**Data flow**: It takes `codex_home`, `cwd`, sandbox credentials, optional log directory, and a `SpawnRequest`. It generates pipe names with `pipe_pair`, creates server pipes with `create_named_pipe`, resolves the runner executable with `find_runner_exe`, builds a quoted command line and UTF-16 strings, initializes `STARTUPINFOW` and `PROCESS_INFORMATION`, temporarily sets process error mode, calls `CreateProcessWithLogonW`, and on success records the runner PID. It then connects both pipes via `connect_pipe_with_timeout`, closes the thread handle from process creation, converts connected pipe handles into `File`s, sends the spawn request and waits for spawn-ready through `RunnerTransport`, terminates and cleans up the runner on any failure, closes the process handle once startup is fully complete, and returns the transport.
+**Data flow**: It takes paths for the project home and working directory, sandbox username and password, an optional log directory, and the initial spawn request. It creates two named pipes, builds the runner command line, converts strings into the wide-character form Windows expects, and launches the runner with those credentials. It then connects both pipes, wraps the raw pipe handles as `File` objects, sends the spawn request, waits for `SpawnReady`, and returns the transport. On failure, it closes handles and may terminate the runner so nothing is left behind.
 
-**Call relations**: This is the orchestration hub for the elevated path. It ties together pipe creation, helper executable lookup, Win32 process creation, timeout-managed pipe connection, and the framed IPC handshake methods on `RunnerTransport`.
+**Call relations**: This is the central flow in the file. It calls pipe helpers such as `pipe_pair`, `create_named_pipe`, and `find_runner_exe`, Windows launch functions, `connect_pipe_with_timeout` for the pipe handshake, and the `RunnerTransport` methods for the protocol handshake.
 
 *Call graph*: calls 4 internal fn (create_named_pipe, find_runner_exe, pipe_pair, to_wide); 9 external calls (from_raw_handle, format!, null, zeroed, CloseHandle, GetLastError, SetErrorMode, CreateProcessWithLogonW, TerminateProcess).
 
@@ -4153,11 +4185,11 @@ fn spawn_runner_transport(
 fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()>
 ```
 
-**Purpose**: Polls a named pipe until an entire framed message is buffered or a timeout expires. It prevents `read_frame` from blocking on a partial startup response.
+**Purpose**: This waits until a full framed message is available on the read pipe before trying to decode it. That matters because pipe data can arrive in pieces, and reading too early could block or fail at an awkward point.
 
-**Data flow**: It takes a borrowed `File` and a timeout `Duration`, obtains the raw pipe handle, computes a deadline, and loops calling `PeekNamedPipe` into a 4-byte length buffer. If four bytes are available it decodes the frame length, checks for overflow when adding the header size, and returns success once `total_available` covers the whole frame; otherwise it sleeps for `RUNNER_SPAWN_READY_POLL_INTERVAL` until the deadline, returning contextual errors on `PeekNamedPipe` failure or timeout.
+**Data flow**: It receives the read pipe and a timeout. It repeatedly peeks at the pipe without consuming data, first checking whether the four-byte message length is present, then checking whether the whole message body has arrived. If the full frame appears before the deadline, it returns success. If the pipe fails or the deadline passes, it returns an error.
 
-**Call relations**: This helper is called only by `RunnerTransport::read_spawn_ready` before `read_frame`, specifically for the startup handshake where bounded waiting is important.
+**Call relations**: `RunnerTransport::read_spawn_ready` calls this before `read_frame`. It is the waiting room for incoming messages: it does not interpret the message, but it makes sure the complete package is there before the decoder opens it.
 
 *Call graph*: called by 1 (read_spawn_ready); 8 external calls (as_raw_handle, now, anyhow!, null_mut, sleep, from_le_bytes, GetLastError, PeekNamedPipe).
 
@@ -4168,24 +4200,24 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()>
 fn stale_sandbox_creds_error_recognizes_logon_failures()
 ```
 
-**Purpose**: Verifies that only `ERROR_LOGON_FAILURE` is classified as stale sandbox credentials, while other runner launch errors are not. It protects the error-classification contract used by higher-level recovery logic.
+**Purpose**: This test proves that only a Windows logon failure is treated as stale sandbox credentials. It guards against accidentally classifying unrelated launch errors as password or account problems.
 
-**Data flow**: It constructs two `anyhow::Error` values wrapping `RunnerLogonError` with different codes, maps them through `is_stale_sandbox_creds_error`, and asserts the resulting boolean array equals `[true, false]`.
+**Data flow**: It builds two sample errors: one with `ERROR_LOGON_FAILURE` and one with `ERROR_NOT_FOUND`. It runs both through `is_stale_sandbox_creds_error` and checks that the answers are `true` and `false` respectively.
 
-**Call relations**: This test directly exercises `is_stale_sandbox_creds_error` against representative `RunnerLogonError` values.
+**Call relations**: The test exercises the public credential-error helper used by higher-level sandbox startup code. It does not start a runner or touch real pipes; it focuses only on the error-recognition rule.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `windows-sandbox-rs/src/elevated/runner_pipe.rs`
 
-`io_transport` · `elevated runner IPC setup`
+`io_transport` · `elevated runner startup and IPC setup`
 
-This file contains the parent-side named-pipe primitives used to establish IPC with the elevated command runner. It is narrowly focused on Windows pipe setup and security. `find_runner_exe` resolves the helper executable path, preferring the materialized helper under `.sandbox-bin` while preserving a fallback strategy encapsulated elsewhere.
+This file is part of the elevated Windows sandbox path. When the main program needs a helper process to run commands inside the sandbox, the parent and helper need a safe way to talk. On Windows, this code uses named pipes, which are like private mailbox slots that two processes can open by name.
 
-`pipe_pair` generates a unique base pipe name using a random `u128` nonce and returns two related names suffixed with `-in` and `-out`, giving the parent separate channels for writing to and reading from the runner. `create_named_pipe` then creates one server-side pipe with a DACL that grants generic all access only to the sandbox user. To do that, it resolves the sandbox username to SID bytes, converts those bytes back into a SID string, embeds that SID into an SDDL string of the form `D:(A;;GA;;;SID)`, converts the SDDL into a security descriptor, and passes it through `SECURITY_ATTRIBUTES` to `CreateNamedPipeW`. The temporary security descriptor is always freed with `LocalFree`.
+The important problem here is trust. The parent process is elevated, so it must not accidentally accept messages from some other process pretending to be the runner. This file helps prevent that in three ways. First, it creates hard-to-guess pipe names with random data. Second, it gives each pipe a Windows access rule, called a DACL, that allows only the sandbox user account to connect. A DACL is simply a permission list attached to the pipe. Third, after a process connects, it asks Windows for that client process ID and checks it against the runner process ID the parent expected.
 
-`connect_pipe` performs the actual server-side connection handshake. It tolerates the `ERROR_PIPE_CONNECTED` case where the client connected before `ConnectNamedPipe` ran, then calls `GetNamedPipeClientProcessId` and rejects the connection if the client PID does not match the runner process the parent just spawned. That PID check is an important integrity guard against another local process racing to connect to the pipe first.
+The file also knows how to locate the runner executable before launch. Together, these helpers are the setup plumbing for the communication channel: find the helper program, create two secure pipe endpoints, wait for the runner to connect, then prove the connection came from the right process.
 
 #### Function details
 
@@ -4195,11 +4227,11 @@ This file contains the parent-side named-pipe primitives used to establish IPC w
 fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf
 ```
 
-**Purpose**: Resolves the filesystem path of the elevated command runner executable. It delegates helper selection and materialization policy to the helper-launch subsystem.
+**Purpose**: Finds the executable file for the elevated command runner. It prefers the copied helper placed under the sandbox helper area, but can fall back to the older lookup method if needed.
 
-**Data flow**: It takes `codex_home` and an optional log directory, passes them with `HelperExecutable::CommandRunner` to `resolve_helper_for_launch`, and returns the resulting `PathBuf`. It performs no additional transformation.
+**Data flow**: It receives the project home directory and, optionally, a log directory. It passes those along with the specific helper type, `CommandRunner`, to the shared helper-resolution code. The result is a filesystem path pointing to the runner program that should be launched.
 
-**Call relations**: This helper is called by `spawn_runner_transport` before process creation so the parent knows which runner binary to launch.
+**Call relations**: When `spawn_runner_transport` is preparing to start the elevated runner, it calls this function to learn which executable to launch. This function delegates the real lookup rules to `resolve_helper_for_launch`, so the pipe setup code does not need to know every place the helper might live.
 
 *Call graph*: calls 1 internal fn (resolve_helper_for_launch); called by 1 (spawn_runner_transport).
 
@@ -4210,11 +4242,11 @@ fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf
 fn pipe_pair() -> (String, String)
 ```
 
-**Purpose**: Generates a unique pair of named-pipe paths for one runner session. The two names share a random base and differ only by direction suffix.
+**Purpose**: Creates two unique Windows named-pipe paths: one for input and one for output. These names are used as the private communication channels between the parent and the runner.
 
-**Data flow**: It seeds a `SmallRng` from entropy, generates a random `u128` nonce, formats a base string under `\\.\pipe\codex-runner-{nonce:x}`, appends `-in` and `-out`, and returns the two `String`s.
+**Data flow**: It starts with a fresh random number from the operating system-backed random generator. It formats that number into a pipe name such as a `codex-runner-...` base name, then returns two strings made from that base: one ending in `-in` and one ending in `-out`.
 
-**Call relations**: This function is used by `spawn_runner_transport` to allocate fresh pipe names before creating the server-side pipe handles.
+**Call relations**: `spawn_runner_transport` calls this while building the transport for a new runner session. The returned names are later used when creating the server-side pipes and when telling the runner which pipe names to open.
 
 *Call graph*: called by 1 (spawn_runner_transport); 2 external calls (from_entropy, format!).
 
@@ -4225,11 +4257,11 @@ fn pipe_pair() -> (String, String)
 fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io::Result<HANDLE>
 ```
 
-**Purpose**: Creates a server-side named pipe whose security descriptor allows only the sandbox user to connect. It is the security-sensitive pipe-construction primitive for the elevated path.
+**Purpose**: Creates one Windows named pipe and attaches permissions so only the sandbox user can connect to it. This is the security gate that keeps unrelated local processes from using the parent-runner channel.
 
-**Data flow**: It takes the pipe name, desired access flags, and sandbox username. It resolves the username to SID bytes with `resolve_sid`, converts those bytes to a SID string with `string_from_sid_bytes`, formats an SDDL DACL granting `GA` to that SID, converts the SDDL to a security descriptor with `ConvertStringSecurityDescriptorToSecurityDescriptorW`, fills a `SECURITY_ATTRIBUTES` pointing at that descriptor, creates the pipe with `CreateNamedPipeW`, frees the descriptor with `LocalFree`, and returns either the `HANDLE` or an `io::Error` derived from the relevant Win32 error code.
+**Data flow**: It receives a pipe name, an access direction such as inbound or outbound, and the sandbox user name. It looks up that user’s Windows SID, which is the stable security identifier Windows uses internally, converts it into text, builds a permission string that grants that user access, and asks Windows to turn that string into a security descriptor. It then creates the named pipe with byte-stream behavior and fixed buffer sizes. On success it returns a Windows handle to the pipe; on failure it returns an I/O error with the Windows error code. It also frees the temporary security descriptor after the pipe is created.
 
-**Call relations**: This function is called by `spawn_runner_transport` for both the inbound and outbound server pipes before the runner process is launched.
+**Call relations**: `spawn_runner_transport` calls this after pipe names have been generated. This function relies on `resolve_sid`, `string_from_sid_bytes`, and `to_wide` to translate Rust strings and user names into the Windows forms needed by the operating system calls. It then hands back a pipe handle that later code can wait on and use for communication.
 
 *Call graph*: calls 3 internal fn (resolve_sid, string_from_sid_bytes, to_wide); called by 1 (spawn_runner_transport); 7 external calls (from_raw_os_error, format!, null_mut, GetLastError, LocalFree, ConvertStringSecurityDescriptorToSecurityDescriptorW, CreateNamedPipeW).
 
@@ -4240,11 +4272,11 @@ fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io::Res
 fn connect_pipe(h: HANDLE, expected_runner_pid: u32) -> io::Result<()>
 ```
 
-**Purpose**: Waits for a client to connect to a server-side named pipe and verifies that the client process is the expected runner. It closes the race where an unrelated process could connect first.
+**Purpose**: Waits for the runner process to connect to a named pipe, then verifies that the connected client is really the expected runner. This prevents a wrong or malicious process from slipping into the communication channel.
 
-**Data flow**: It takes a pipe `HANDLE` and expected runner PID, calls `ConnectNamedPipe`, tolerates the specific already-connected error code 535, then queries the connected client PID with `GetNamedPipeClientProcessId`. It returns success only if that PID equals `expected_runner_pid`; otherwise it returns an `io::Error`, using `PermissionDenied` for PID mismatch.
+**Data flow**: It receives an already-created pipe handle and the process ID of the runner that the parent expects. It calls Windows to wait for a client connection. If Windows reports that the client connected just before the wait call, it accepts that normal race condition. It then asks Windows for the connected client’s process ID. If the ID matches the expected runner ID, it returns success. If the pipe fails or the client process ID is different, it returns an error.
 
-**Call relations**: This function is invoked indirectly by `spawn_runner_transport` through `connect_pipe_with_timeout`, which wraps it in a helper thread and timeout/cancellation logic.
+**Call relations**: This is the final handshake step after the parent has created a server-side pipe and launched the runner. It calls Windows pipe APIs directly: `ConnectNamedPipe` to wait for the connection and `GetNamedPipeClientProcessId` to identify who connected. The function does not hand off to another project function; its job is to turn the low-level Windows result into a clear success or failure for the caller.
 
 *Call graph*: 7 external calls (from_raw_os_error, new, format!, null_mut, GetLastError, ConnectNamedPipe, GetNamedPipeClientProcessId).
 
@@ -4256,11 +4288,13 @@ These files handle the concrete Windows process creation details, desktop and st
 
 `io_transport` · `process launch and output capture`
 
-This file centers on launching a process under a supplied user token with Windows-specific startup configuration. `CreatedProcess` packages the returned `PROCESS_INFORMATION`, the startup info actually used, and the `LaunchDesktop` guard that keeps any private desktop alive for the child. `make_env_block` converts a `HashMap<String, String>` into the double-NUL-terminated UTF-16 environment block format required by `CreateProcessAsUserW`, sorting variables case-insensitively first to match Windows expectations.
+Windows process launching has many sharp edges: arguments must be turned into one command-line string, environment variables must be packed in a special format, input and output handles must be safe for the child process to inherit, and some restricted processes need an explicit desktop to start correctly. This file gathers those details in one place.
 
-`create_process_as_user` is the main unsafe entry point. It converts argv into a Windows command line, materializes the environment block, prepares desktop selection, and then branches on whether explicit stdio handles were supplied. In the explicit-stdio branch it builds `STARTUPINFOEXW`, marks the provided handles inheritable, constructs a `ProcThreadAttributeList`, installs the inherited handle list, and sets `EXTENDED_STARTUPINFO_PRESENT`. In the default-stdio branch it uses plain `STARTUPINFOW` and `ensure_inheritable_stdio` to inherit the current console handles. Both branches call `CreateProcessAsUserW`, log a detailed diagnostic message on failure, and return a simplified `anyhow!` error outward.
+The central path is `create_process_as_user`. It takes a Windows user token, command arguments, a working folder, environment variables, optional standard input/output handles, and desktop settings. It prepares everything in the form Windows expects, then calls `CreateProcessAsUserW`, the Windows function that starts a process as another user. If something fails, it records useful debugging details.
 
-`spawn_process_with_pipes` layers anonymous pipe creation and cleanup around that primitive, carefully closing the parent or child ends depending on success, `StdinMode`, and `StderrMode`. `read_handle_loop` then provides asynchronous draining of a pipe handle until EOF, invoking a caller callback for each chunk and closing the handle in the reader thread.
+The file also supports pipe-based launching. Think of pipes like hoses connected to the child process: one hose can feed input in, and others can carry output and errors back out. `spawn_process_with_pipes` creates those hoses, gives the correct ends to the child, closes the ends the parent should not keep, and returns the handles the caller needs.
+
+Finally, `read_handle_loop` starts a background thread that keeps reading from one of those output handles until the child closes it.
 
 #### Function details
 
@@ -4270,11 +4304,11 @@ This file centers on launching a process under a supplied user token with Window
 fn make_env_block(env: &HashMap<String, String>) -> Vec<u16>
 ```
 
-**Purpose**: Converts an environment map into the UTF-16, double-NUL-terminated block format expected by Windows process creation APIs. It also sorts entries in a Windows-friendly order.
+**Purpose**: This function turns a normal map of environment variables into the special block of text that Windows expects when starting a process. Without this conversion, the new process would not receive its intended environment correctly.
 
-**Data flow**: Takes `&HashMap<String, String>`, clones entries into a vector of `(String, String)`, sorts by uppercase key then original key, formats each pair as `key=value`, converts each string with `to_wide`, removes the trailing NUL from each converted string, appends an entry terminator `0`, and finally appends a second trailing `0`. It returns the assembled `Vec<u16>` environment block.
+**Data flow**: It receives key-value pairs such as `PATH` and `TEMP`. It sorts them in a Windows-friendly order, converts each `key=value` string into wide characters, meaning UTF-16 text used by many Windows APIs, separates entries with zero characters, and ends the whole block with an extra zero. It returns that finished UTF-16 environment block.
 
-**Call relations**: This helper is called before process creation in both standard and ConPTY-related launch paths. Its output is passed directly as the `lpEnvironment` buffer to `CreateProcessAsUserW`.
+**Call relations**: When a process is about to be started, `create_process_as_user` calls this to prepare the child’s environment. A related ConPTY launch path also calls it, so both normal and console-backed launches can pass environment variables to Windows in the required shape.
 
 *Call graph*: calls 1 internal fn (to_wide); called by 2 (spawn_conpty_process_as_user, create_process_as_user); 2 external calls (new, format!).
 
@@ -4285,11 +4319,11 @@ fn make_env_block(env: &HashMap<String, String>) -> Vec<u16>
 fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()>
 ```
 
-**Purpose**: Marks the current process's standard handles inheritable and copies them into a `STARTUPINFOW` structure. It prepares the plain-startup path where no custom pipe handles are supplied.
+**Purpose**: This function makes the current process’s standard input, standard output, and standard error handles available to a child process. It is used when the caller has not supplied custom pipes or handles.
 
-**Data flow**: Takes `&mut STARTUPINFOW`, iterates over `STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`, and `STD_ERROR_HANDLE`, fetches each with `GetStdHandle`, validates that it is neither null nor `INVALID_HANDLE_VALUE`, sets `HANDLE_FLAG_INHERIT` via `SetHandleInformation`, then sets `STARTF_USESTDHANDLES` and writes the three handles into `si`. It returns `Ok(())` or an `anyhow` error containing the failing Win32 error code.
+**Data flow**: It receives a mutable Windows startup information structure. It asks Windows for the current standard handles, marks each one as inheritable so the child can use it, then writes those handles into the startup information and sets the flag that says standard handles are being provided. On success it changes the startup information in place; on failure it returns an error.
 
-**Call relations**: It is only used by `create_process_as_user` in the branch where the caller did not provide explicit stdio handles. That branch delegates stdio preparation here before invoking `CreateProcessAsUserW`.
+**Call relations**: `create_process_as_user` calls this in the simpler launch path where no custom standard input/output handles were provided. It hands Windows startup information that is ready for `CreateProcessAsUserW`, so the child process connects to the same console streams as the parent.
 
 *Call graph*: called by 1 (create_process_as_user); 3 external calls (anyhow!, SetHandleInformation, GetStdHandle).
 
@@ -4306,11 +4340,11 @@ fn create_process_as_user(
     stdio: Option<(HANDLE, HANDLE, HANDLE)
 ```
 
-**Purpose**: Launches a child process under a supplied primary token, with optional custom stdio handles and optional private-desktop routing. It is the core Windows spawn primitive for the sandbox.
+**Purpose**: This is the main process-launching function. It starts a new Windows process using a supplied user token, which is a Windows handle proving which user/security context the child should run as.
 
-**Data flow**: Inputs are the token handle, argv slice, cwd path, environment map, optional log directory, optional `(stdin, stdout, stderr)` handles, and a private-desktop flag. It builds a quoted command line with `argv_to_command_line`, converts strings and cwd to UTF-16 with `to_wide`, builds the environment block with `make_env_block`, prepares desktop state with `LaunchDesktop::prepare`, zero-initializes `PROCESS_INFORMATION`, then branches: with `stdio`, it fills `STARTUPINFOEXW`, marks the supplied handles inheritable, creates a `ProcThreadAttributeList`, installs the inherited handle list, and calls `CreateProcessAsUserW` with `EXTENDED_STARTUPINFO_PRESENT`; without `stdio`, it fills `STARTUPINFOW`, calls `ensure_inheritable_stdio`, and launches without extended startup info. On failure it reads `GetLastError`, formats a detailed debug message including cwd, command, env length, startup flags, and creation flags, writes that via `logging::debug_log`, and returns an `anyhow` error; on success it returns `CreatedProcess` containing the process info, startup info, and desktop guard.
+**Data flow**: It receives the user token, command arguments, working directory, environment map, optional logging directory, optional standard input/output/error handles, and a choice about using a private desktop. It turns the arguments into a Windows command line, converts paths and environment data into Windows UTF-16 form, prepares the launch desktop, fills in Windows startup structures, and calls `CreateProcessAsUserW`. If custom handles are supplied, it also builds a limited inherited-handle list so the child gets only the intended handles. It returns a `CreatedProcess` containing the Windows process information, startup information, and desktop guard; if launch fails, it logs details and returns an error.
 
-**Call relations**: This function is invoked by `spawn_process_with_pipes` and by higher-level sandbox execution flows that already have token and environment state prepared. It delegates desktop setup, environment formatting, stdio inheritance, and optional attribute-list construction to helpers before making the final Win32 process creation call.
+**Call relations**: Higher-level code calls this when it needs a sandboxed command to actually begin running. `spawn_process_with_pipes` calls it after creating pipe handles, while another sandbox capture flow calls it directly. Inside, it relies on helpers such as `make_env_block`, `ensure_inheritable_stdio`, desktop preparation, command-line formatting, and error logging before handing the final request to Windows.
 
 *Call graph*: calls 6 internal fn (prepare, debug_log, ensure_inheritable_stdio, make_env_block, argv_to_command_line, to_wide); called by 2 (spawn_process_with_pipes, run_windows_sandbox_capture_with_filesystem_overrides); 10 external calls (anyhow!, format!, zeroed, null, null_mut, new, vec!, GetLastError, SetHandleInformation, CreateProcessAsUserW).
 
@@ -4328,11 +4362,11 @@ fn spawn_process_with_pipes(
     use_private_de
 ```
 
-**Purpose**: Creates anonymous pipes for child stdio, launches the child with those handles, and returns the parent-side handles needed to feed stdin and read stdout/stderr. It encapsulates the handle choreography and cleanup rules around pipe-based spawning.
+**Purpose**: This function starts a process whose input and output are connected to anonymous pipes, so the parent program can write to the child and read what it prints. It is useful when the sandbox needs to capture output instead of letting it go straight to the parent console.
 
-**Data flow**: Takes token, argv, cwd, env map, `StdinMode`, `StderrMode`, private-desktop flag, and optional log directory. It allocates stdin and stdout pipes unconditionally and a stderr pipe only when `StderrMode::Separate`, cleaning up already-created handles if any `CreatePipe` call fails. It chooses the child's stderr handle as either `out_w` or `err_w`, calls `create_process_as_user` with `(in_r, out_w, stderr_handle)`, closes all pipe handles on spawn failure, and on success closes the child-side ends in the parent (`in_r`, `out_w`, and maybe `err_w`), optionally closes `in_w` when stdin should be closed, and returns `PipeSpawnHandles` with the process info, optional writable stdin handle, stdout read handle, optional stderr read handle, and retained desktop guard.
+**Data flow**: It receives the same basic launch details as `create_process_as_user`, plus choices for whether stdin should stay open and whether stderr should be merged with stdout or kept separate. It creates pipe pairs for stdin and stdout, and optionally stderr. It passes the child-side pipe ends into `create_process_as_user`, then closes the child-side handles in the parent so ownership is clean. It returns the process information plus the parent-side handles for writing input and reading output. If anything fails, it closes any handles it already opened before returning the error.
 
-**Call relations**: This is the higher-level convenience wrapper used by legacy process-spawn code that wants captured output. It delegates actual child creation to `create_process_as_user` after preparing inheritable pipe handles.
+**Call relations**: `spawn_legacy_process` calls this when it wants a traditional pipe-based child process. This function does the setup work, delegates the actual Windows process creation to `create_process_as_user`, and then hands back only the handles the caller should keep using.
 
 *Call graph*: calls 1 internal fn (create_process_as_user); called by 1 (spawn_legacy_process); 5 external calls (anyhow!, matches!, null_mut, CloseHandle, CreatePipe).
 
@@ -4343,24 +4377,26 @@ fn spawn_process_with_pipes(
 fn read_handle_loop(handle: HANDLE, mut on_chunk: F) -> std::thread::JoinHandle<()>
 ```
 
-**Purpose**: Starts a background thread that continuously reads bytes from a Windows handle until EOF or read failure, forwarding each chunk to a callback. It is the streaming side of pipe-based output capture.
+**Purpose**: This function starts a background reader for a Windows handle, usually the read end of a pipe connected to a child process’s output. It lets the rest of the program keep running while output is collected piece by piece.
 
-**Data flow**: Takes a `HANDLE` and an `FnMut(&[u8])` callback. It spawns a thread, allocates an 8 KiB stack buffer, repeatedly calls `ReadFile` into that buffer, stops when `ReadFile` fails or returns zero bytes, invokes `on_chunk` with the valid slice for each successful read, and finally closes the handle with `CloseHandle`; the function returns the thread `JoinHandle<()>` immediately.
+**Data flow**: It receives a handle and a callback function called `on_chunk`. It starts a new thread, repeatedly reads up to 8192 bytes from the handle, and passes each non-empty chunk of bytes to the callback. When reading fails or reaches end-of-file, it stops the loop and closes the handle. It returns the thread handle so the caller can track or join that background work.
 
-**Call relations**: This helper is called by output-reader orchestration after `spawn_process_with_pipes` returns readable pipe handles. It delegates all actual I/O to the spawned thread so the caller can continue coordinating process execution.
+**Call relations**: `spawn_output_reader` calls this after a process has been launched with readable output handles. This function takes over the low-level reading loop and hands each piece of output upward through the callback.
 
 *Call graph*: called by 1 (spawn_output_reader); 1 external calls (spawn).
 
 
 ### `windows-sandbox-rs/src/desktop.rs`
 
-`io_transport` · `process launch setup`
+`domain_logic` · `process launch setup`
 
-This file encapsulates the Windows desktop object setup used when a sandboxed process should run on an isolated desktop instead of the default interactive one. `LaunchDesktop` is the public wrapper: it either points startup info at `Winsta0\Default` or creates a `PrivateDesktop` and exposes the fully qualified desktop name as a mutable UTF-16 pointer suitable for Win32 process startup structures.
+On Windows, a “desktop” is not just the visible screen background. It is also a container for windows, menus, input hooks, and other user-interface objects. Putting an untrusted program on a separate desktop is like giving it its own locked room: it can draw windows there, but it is less able to interfere with windows on the user’s normal desktop.
 
-`PrivateDesktop::create` generates a random desktop name, converts it to UTF-16, and calls `CreateDesktopW` with a locally defined `DESKTOP_ALL_ACCESS` mask assembled from the individual desktop rights constants. On failure it logs the Win32 error and returns an `anyhow` error. On success it immediately calls `grant_desktop_access`; if ACL setup fails, it closes the desktop handle before propagating the error.
+This file prepares that room before a sandboxed process is launched. If private desktop mode is off, it simply points the new process at the standard desktop, `Winsta0\Default`. If private desktop mode is on, it creates a new desktop with a random name, gives the current logon session permission to use it, and returns the desktop name in the format Windows expects during process startup.
 
-`grant_desktop_access` obtains the current token intended for restriction, extracts the logon SID bytes, closes the token handle, builds a single `EXPLICIT_ACCESS_W` trustee pointing at that SID, creates a DACL with `SetEntriesInAclW`, and applies it to the desktop object with `SetSecurityInfo`. It frees the ACL buffer with `LocalFree` regardless of `SetSecurityInfo` success. `PrivateDesktop` implements `Drop` to close the desktop handle, so `LaunchDesktop` keeps the desktop alive simply by owning the private desktop object for the duration of process startup and execution.
+A key detail is permissions. Creating the desktop is not enough; the restricted process must still be allowed to create windows and interact with objects on that desktop. The `grant_desktop_access` helper edits the desktop’s access list, which is Windows’ record of who may do what. If anything fails, the file writes debug logs when possible and returns an error instead of launching into a broken desktop.
+
+The private desktop is automatically closed when its owner object is dropped, so callers do not have to remember to clean it up manually.
 
 #### Function details
 
@@ -4370,11 +4406,11 @@ This file encapsulates the Windows desktop object setup used when a sandboxed pr
 fn prepare(use_private_desktop: bool, logs_base_dir: Option<&Path>) -> Result<Self>
 ```
 
-**Purpose**: Constructs the desktop-launch context for a child process, either targeting the default desktop or creating a new private desktop and startup name. It is the public entry for callers preparing Win32 startup info.
+**Purpose**: This prepares the desktop setting that will be passed to Windows when starting the sandboxed process. It either creates a new private desktop for isolation or selects the normal default desktop.
 
-**Data flow**: It takes a `use_private_desktop` flag and optional log directory path. If the flag is true, it calls `PrivateDesktop::create`, formats `Winsta0\{name}`, converts that string with `to_wide`, and returns a `LaunchDesktop` holding the private desktop plus UTF-16 startup name; otherwise it returns a `LaunchDesktop` with no private desktop and a UTF-16 `Winsta0\Default` name.
+**Data flow**: It receives a yes-or-no choice for private desktop use and an optional folder for debug logs. If private mode is requested, it asks `PrivateDesktop::create` to make a new desktop, then builds a Windows-style desktop name like `Winsta0\<private-name>`. If private mode is not requested, it builds `Winsta0\Default`. The result is a `LaunchDesktop` object that keeps any private desktop alive and stores the startup name in Windows’ wide-character string format.
 
-**Call relations**: This function is invoked by both direct process creation and ConPTY-based launch paths when they need a desktop name for `STARTUPINFO`. It delegates actual desktop object creation and ACL setup to `PrivateDesktop::create` only when isolation is requested.
+**Call relations**: This is called during process creation by `spawn_conpty_process_as_user` and `create_process_as_user`, before the child process is started. When private mode is needed, it hands the hard work to `PrivateDesktop::create`; otherwise it only converts the default desktop name with `to_wide`.
 
 *Call graph*: calls 2 internal fn (create, to_wide); called by 2 (spawn_conpty_process_as_user, create_process_as_user); 1 external calls (format!).
 
@@ -4385,11 +4421,11 @@ fn prepare(use_private_desktop: bool, logs_base_dir: Option<&Path>) -> Result<Se
 fn startup_info_desktop(&self) -> *mut u16
 ```
 
-**Purpose**: Exposes the stored desktop name buffer as a mutable UTF-16 pointer for Win32 APIs. It is a thin adapter from Rust-owned storage to the raw pointer shape expected by startup structures.
+**Purpose**: This gives callers the raw desktop-name pointer that Windows needs in its process startup settings. It is the bridge between the safe Rust object and the low-level Windows API field.
 
-**Data flow**: It reads `self.startup_name`, takes its internal pointer with `as_ptr`, casts it to `*mut u16`, and returns it. It does not allocate or mutate state.
+**Data flow**: It reads the already-prepared desktop name stored inside `LaunchDesktop`. It returns a mutable pointer to that wide-character buffer, without changing the object. The caller can place that pointer into Windows startup information so the child process opens on the chosen desktop.
 
-**Call relations**: Callers use this after `LaunchDesktop::prepare` when filling process startup structures; it depends on the `LaunchDesktop` instance staying alive so the backing buffer remains valid.
+**Call relations**: After `LaunchDesktop::prepare` has built the desktop choice, process-launch code can call this when filling in Windows startup data. It does not call other project functions; it simply exposes the prepared value in the form Windows expects.
 
 
 ##### `PrivateDesktop::create`  (lines 90–125)
@@ -4398,11 +4434,11 @@ fn startup_info_desktop(&self) -> *mut u16
 fn create(logs_base_dir: Option<&Path>) -> Result<Self>
 ```
 
-**Purpose**: Creates a uniquely named desktop object and grants the current logon SID full access to it. It wraps Win32 desktop creation with cleanup and debug logging on failure.
+**Purpose**: This creates a brand-new private Windows desktop and makes it usable by the restricted process. It is used when the sandbox wants stronger separation from the normal user desktop.
 
-**Data flow**: It takes an optional log directory, seeds a `SmallRng`, generates a random `u128` suffix for the desktop name, converts the name to UTF-16, and calls `CreateDesktopW`. If the returned handle is zero it reads `GetLastError`, logs a formatted message, and returns an error; otherwise it calls `grant_desktop_access`, closes the desktop on ACL failure, and on success returns `PrivateDesktop { handle, name }`.
+**Data flow**: It takes an optional log folder. It generates a random desktop name, converts that name into Windows’ wide-character format, and calls `CreateDesktopW` to make the desktop with full desktop permissions. If creation fails, it logs the Windows error and returns an error. If creation succeeds, it calls `grant_desktop_access` to set the access rules. If that permission step fails, it closes the desktop and returns the error. On success, it returns a `PrivateDesktop` containing the desktop handle and name.
 
-**Call relations**: This constructor is called only from `LaunchDesktop::prepare` when private-desktop mode is enabled. It delegates security descriptor modification to `grant_desktop_access` and relies on `Drop` for eventual handle cleanup.
+**Call relations**: `LaunchDesktop::prepare` calls this when private desktop mode is enabled. This function talks directly to Windows to create the desktop, uses `grant_desktop_access` to fix permissions, and uses `debug_log` when Windows reports a problem.
 
 *Call graph*: calls 3 internal fn (grant_desktop_access, debug_log, to_wide); called by 1 (prepare); 8 external calls (from_entropy, anyhow!, format!, null, null_mut, GetLastError, CloseDesktop, CreateDesktopW).
 
@@ -4413,11 +4449,11 @@ fn create(logs_base_dir: Option<&Path>) -> Result<Self>
 fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> Result<()>
 ```
 
-**Purpose**: Builds and applies a DACL granting the current logon SID full access to the newly created desktop object. This makes the desktop usable by the intended sandboxed logon session.
+**Purpose**: This gives the current logon session permission to use the newly created private desktop. Without this step, the sandboxed process might be pointed at a desktop that exists but cannot actually create or use windows there.
 
-**Data flow**: It accepts the desktop handle and optional log directory. It obtains a token via `get_current_token_for_restriction`, extracts mutable SID bytes with `get_logon_sid_bytes`, closes the token handle, constructs a one-entry `EXPLICIT_ACCESS_W` array whose trustee points at the SID buffer, calls `SetEntriesInAclW` to allocate an updated ACL, applies that ACL with `SetSecurityInfo`, frees the ACL buffer with `LocalFree` if non-null, and returns `Ok(())` or an `anyhow` error after logging failures.
+**Data flow**: It receives the desktop handle and an optional log folder. It gets the current process token, extracts the logon session identifier from it, and closes the token handle when done. It then builds a Windows access-control entry granting full desktop access to that logon session. It asks Windows to turn that entry into an access list, applies that list to the desktop, frees the temporary access-list memory, and returns success. If either Windows permission call fails, it logs the failure and returns an error.
 
-**Call relations**: This unsafe helper is called by `PrivateDesktop::create` immediately after desktop creation. It is the security-setup phase that turns a raw desktop handle into one accessible by the sandbox principal.
+**Call relations**: `PrivateDesktop::create` calls this immediately after creating the desktop. It relies on token helpers, `get_current_token_for_restriction` and `get_logon_sid_bytes`, to identify who should receive access, and it relies on Windows security APIs to apply the updated permissions.
 
 *Call graph*: calls 3 internal fn (debug_log, get_current_token_for_restriction, get_logon_sid_bytes); called by 1 (create); 7 external calls (anyhow!, format!, null_mut, CloseHandle, LocalFree, SetEntriesInAclW, SetSecurityInfo).
 
@@ -4428,24 +4464,26 @@ fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> Result<(
 fn drop(&mut self)
 ```
 
-**Purpose**: Closes the owned desktop handle when the private desktop object is dropped. It provides RAII cleanup for the Win32 desktop resource.
+**Purpose**: This cleans up the private desktop when the `PrivateDesktop` object goes away. It prevents the Windows desktop handle from being leaked.
 
-**Data flow**: It mutably borrows `self`, checks whether `self.handle` is nonzero, and calls `CloseDesktop` inside an unsafe block. It returns no value and ignores close errors.
+**Data flow**: It reads the stored Windows desktop handle. If the handle is nonzero, it calls Windows’ `CloseDesktop` function. It does not return a value, and it ignores close errors because cleanup is happening during object destruction.
 
-**Call relations**: This destructor runs automatically when the `LaunchDesktop` owning the private desktop goes out of scope, ensuring desktop handles are not leaked on normal or error paths.
+**Call relations**: Rust calls this automatically when the `PrivateDesktop` inside `LaunchDesktop` is dropped. It is the final cleanup step for desktops created by `PrivateDesktop::create`.
 
 *Call graph*: 1 external calls (CloseDesktop).
 
 
 ### `windows-sandbox-rs/src/proc_thread_attr.rs`
 
-`io_transport` · `process launch setup`
+`io_transport` · `process startup setup and cleanup`
 
-This file provides a single RAII-style wrapper, `ProcThreadAttributeList`, around the opaque Windows `LPPROC_THREAD_ATTRIBUTE_LIST` structure used with `STARTUPINFOEXW`. The wrapper owns the raw backing memory as a `Vec<u8>` because the Win32 API requires the caller to first query the required byte size, then allocate a buffer of exactly that size, then initialize the list in place. `new` performs that two-step initialization and converts Win32 failures into `io::Error` using `GetLastError`.
+When Windows starts a process, some advanced options cannot be passed as simple arguments. They must be packed into a special “process/thread attribute list,” which is like an envelope of extra instructions handed to Windows at process creation time. This file builds and owns that envelope.
 
-A subtle but important design choice is the `handle_list: Option<Vec<HANDLE>>` field. When `set_handle_list` installs `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, Windows stores a pointer to the caller-provided handle array rather than copying it immediately into Rust-owned storage. Keeping the vector inside the struct guarantees the pointed-to memory remains alive until process creation finishes and the attribute list is dropped. `set_pseudoconsole` similarly writes the pseudoconsole handle attribute using the constant attribute ID for `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`.
+The main type, `ProcThreadAttributeList`, keeps the raw byte buffer that Windows requires. Creating it is a two-step Windows ritual: first ask Windows how large the buffer must be, then allocate that many bytes and initialize it for real. If Windows reports a problem, the file turns that into a normal Rust `io::Error` so callers can handle it cleanly.
 
-`as_mut_ptr` centralizes the cast from the byte buffer to `LPPROC_THREAD_ATTRIBUTE_LIST`, and `Drop` always calls `DeleteProcThreadAttributeList` on that pointer. The invariant is that any successfully constructed instance has an initialized attribute list in `buffer`, and any installed handle list must outlive the list itself.
+After creation, the caller can add two kinds of instructions. `set_pseudoconsole` attaches a Windows pseudoconsole, which is a terminal-like object used to run console programs behind the scenes. `set_handle_list` tells Windows exactly which operating-system handles the child process is allowed to inherit. The handle list is stored inside the struct so the memory stays alive while the attribute list may still need it.
+
+Finally, when the struct is dropped, it calls the matching Windows cleanup function. This matters because the attribute list is a native Windows resource; without cleanup, the program could leak operating-system memory or leave process-startup state in a bad shape.
 
 #### Function details
 
@@ -4455,11 +4493,11 @@ A subtle but important design choice is the `handle_list: Option<Vec<HANDLE>>` f
 fn new(attr_count: u32) -> io::Result<Self>
 ```
 
-**Purpose**: Allocates and initializes a Windows process/thread attribute list for a specified number of attributes. It performs the required Win32 size-probe call before creating the backing buffer.
+**Purpose**: Creates a new Windows process/thread attribute list with room for a requested number of attributes. Callers use this before starting a child process that needs special startup options.
 
-**Data flow**: Takes `attr_count` as the number of attributes the caller intends to store. It first calls `InitializeProcThreadAttributeList` with a null pointer to obtain the required byte size, allocates `buffer: Vec<u8>` of that size, then calls the initializer again on the real buffer; on failure it reads `GetLastError` and returns `io::Error`, and on success returns `ProcThreadAttributeList { buffer, handle_list: None }`.
+**Data flow**: It receives the number of attributes the caller plans to add. It first asks Windows how many bytes are needed, allocates a byte buffer of that size, then asks Windows to initialize that buffer as an attribute list. On success it returns a `ProcThreadAttributeList` with an empty stored handle list; on failure it returns an `io::Error` built from Windows’ last error code.
 
-**Call relations**: This constructor is used by higher-level process spawning code before attaching extended startup attributes. After creation, callers typically populate the list through `set_handle_list` or `set_pseudoconsole`, and later pass `as_mut_ptr` into `STARTUPINFOEXW`.
+**Call relations**: This is the starting point for the flow in this file. After a caller has this object, they can call `set_pseudoconsole` or `set_handle_list` to fill it with startup instructions, and later pass its pointer to process-creation code elsewhere.
 
 *Call graph*: 5 external calls (from_raw_os_error, null_mut, vec!, GetLastError, InitializeProcThreadAttributeList).
 
@@ -4470,11 +4508,11 @@ fn new(attr_count: u32) -> io::Result<Self>
 fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST
 ```
 
-**Purpose**: Exposes the internal byte buffer as the Win32 attribute-list pointer type expected by process creation APIs. It is the single cast point from Rust-owned storage to `LPPROC_THREAD_ATTRIBUTE_LIST`.
+**Purpose**: Gives Windows APIs access to the underlying attribute list memory. It is a small bridge from the safe Rust struct to the raw pointer shape expected by Windows.
 
-**Data flow**: Reads `self.buffer.as_mut_ptr()` and casts it to `LPPROC_THREAD_ATTRIBUTE_LIST`. It does not mutate logical state and returns the raw pointer for FFI calls.
+**Data flow**: It reads the struct’s internal byte buffer and converts the buffer’s address into the Windows `LPPROC_THREAD_ATTRIBUTE_LIST` pointer type. It does not allocate, copy, or change the buffer; it only exposes its address in the form Windows requires.
 
-**Call relations**: This helper is invoked internally whenever the wrapper needs to pass the list to Win32: both attribute update methods use it before calling `UpdateProcThreadAttribute`, and `drop` uses it before calling `DeleteProcThreadAttributeList`.
+**Call relations**: This helper is used whenever the file needs to talk to Windows about the attribute list. `set_pseudoconsole` and `set_handle_list` use it before updating the list, and `drop` uses it before asking Windows to delete the list.
 
 *Call graph*: called by 3 (drop, set_handle_list, set_pseudoconsole).
 
@@ -4485,11 +4523,11 @@ fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST
 fn set_pseudoconsole(&mut self, hpc: isize) -> io::Result<()>
 ```
 
-**Purpose**: Adds the pseudoconsole handle attribute to an initialized attribute list so a child process can be attached to a ConPTY session. It writes the `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` entry using the supplied handle value.
+**Purpose**: Adds a pseudoconsole to the attribute list so a new child process can be connected to that console-like object. This is useful for running command-line programs through a controlled terminal interface.
 
-**Data flow**: Takes `hpc: isize`, obtains the list pointer via `as_mut_ptr`, casts the handle to `*mut c_void`, and calls `UpdateProcThreadAttribute` with the pseudoconsole attribute ID and a payload size equal to `size_of::<HANDLE>()`. It returns `Ok(())` on success or an `io::Error` built from `GetLastError` on failure.
+**Data flow**: It receives a pseudoconsole handle value. It gets the raw attribute-list pointer, then calls Windows’ `UpdateProcThreadAttribute` with the special pseudoconsole attribute key and the handle value. If Windows accepts the update, it returns `Ok(())`; if Windows rejects it, it returns an `io::Error` based on the Windows error code.
 
-**Call relations**: This method is called by process-launch paths that need ConPTY integration. It delegates the actual attribute installation to `UpdateProcThreadAttribute` after obtaining the raw list pointer from `as_mut_ptr`.
+**Call relations**: This function is called after `ProcThreadAttributeList::new` has created the list and before the list is handed to process-creation code. It relies on `as_mut_ptr` to reach the native Windows buffer, then hands the real update work to Windows’ `UpdateProcThreadAttribute` function.
 
 *Call graph*: calls 1 internal fn (as_mut_ptr); 4 external calls (from_raw_os_error, null_mut, GetLastError, UpdateProcThreadAttribute).
 
@@ -4500,11 +4538,11 @@ fn set_pseudoconsole(&mut self, hpc: isize) -> io::Result<()>
 fn set_handle_list(&mut self, handles: Vec<HANDLE>) -> io::Result<()>
 ```
 
-**Purpose**: Installs the explicit inherited-handle list used by `CreateProcessAsUserW` with extended startup info. It also preserves the handle array inside the struct so the Win32 attribute continues to reference valid memory.
+**Purpose**: Adds the exact set of handles that a child process may inherit. A handle is an operating-system reference to something like a file, pipe, or console; limiting inheritance helps keep the child process from receiving access it should not have.
 
-**Data flow**: Consumes `handles: Vec<HANDLE>`, stores it into `self.handle_list`, then borrows that stored vector mutably, obtains the attribute-list pointer via `as_mut_ptr`, and calls `UpdateProcThreadAttribute` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, the vector's raw pointer, and the byte size of the slice. It returns `Ok(())` on success; if the internal option is unexpectedly empty it returns `io::Error::other`, and if Win32 rejects the update it returns an OS error from `GetLastError`.
+**Data flow**: It receives a vector of Windows handles and stores that vector inside the struct. Then it gets the raw attribute-list pointer and passes Windows a pointer to the stored handle array plus the array’s byte size. If the Windows update succeeds, the attribute list now contains the handle-inheritance instruction; if it fails, the function returns an `io::Error`.
 
-**Call relations**: This is used by the process-spawning code path that passes custom stdio pipe handles to a child. It depends on `as_mut_ptr` for the list pointer and exists specifically to support the extended-startup branch in process creation.
+**Call relations**: Like `set_pseudoconsole`, this is used after the list has been created and before starting the child process. It calls `as_mut_ptr` to get the Windows-facing pointer, then asks `UpdateProcThreadAttribute` to attach the handle-list attribute.
 
 *Call graph*: calls 1 internal fn (as_mut_ptr); 6 external calls (from_raw_os_error, other, size_of_val, null_mut, GetLastError, UpdateProcThreadAttribute).
 
@@ -4515,22 +4553,26 @@ fn set_handle_list(&mut self, handles: Vec<HANDLE>) -> io::Result<()>
 fn drop(&mut self)
 ```
 
-**Purpose**: Releases Win32-managed bookkeeping associated with an initialized attribute list when the Rust wrapper goes out of scope. It completes the RAII contract started by `new`.
+**Purpose**: Cleans up the Windows attribute list when the Rust object goes away. This prevents native Windows resources from being left behind.
 
-**Data flow**: Reads the internal buffer pointer through `as_mut_ptr` and passes it to `DeleteProcThreadAttributeList`. It returns no value and writes no Rust-visible state, but frees native resources associated with the list.
+**Data flow**: It takes the existing struct during destruction, gets the raw pointer to its internal attribute list, and passes that pointer to Windows’ `DeleteProcThreadAttributeList`. It does not return a value; its effect is cleanup.
 
-**Call relations**: This destructor runs automatically after callers finish process creation and the wrapper leaves scope. It relies on `as_mut_ptr` to recover the native pointer and delegates cleanup to the Win32 API.
+**Call relations**: This runs automatically when `ProcThreadAttributeList` falls out of use. It calls `as_mut_ptr` to find the native list, then hands cleanup to `DeleteProcThreadAttributeList`, completing the lifecycle that began in `ProcThreadAttributeList::new`.
 
 *Call graph*: calls 1 internal fn (as_mut_ptr); 1 external calls (DeleteProcThreadAttributeList).
 
 
 ### `windows-sandbox-rs/src/conpty/mod.rs`
 
-`io_transport` · `sandbox process launch`
+`io_transport` · `process launch and terminal I/O setup`
 
-This module isolates the Windows pseudoconsole plumbing needed to launch sandboxed processes with a PTY. The central type, `ConptyInstance`, owns an optional `PsuedoCon`, the writable input pipe handle, the readable output pipe handle, and an optional `LaunchDesktop` that keeps any private desktop alive for the process lifetime. Its `Drop` implementation closes the raw pipe handles if they are valid and then drops the pseudoconsole object.
+Some programs behave differently when they are connected to a real terminal instead of plain input and output streams. On Windows, ConPTY is the operating system feature that provides this “pretend console.” This file hides the awkward Windows setup needed to use it.
 
-There are two usage levels. `create_conpty` is a lower-level constructor that creates a `RawConPty` with caller-specified dimensions and returns a `ConptyInstance` holding the extracted handles. `spawn_conpty_process_as_user` is the main high-level entrypoint: it quotes and joins `argv` into a Windows command line, builds a UTF-16 environment block from the provided map, initializes `STARTUPINFOEXW` with invalid stdio handles and an optional private desktop, creates a default 80x24 ConPTY, allocates a `ProcThreadAttributeList`, attaches the pseudoconsole handle through `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, and finally calls `CreateProcessAsUserW` with `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT`. On failure it reports the numeric Win32 error, formatted message, cwd, command line, and environment-block length, which is especially useful when debugging token or desktop issues. On success it returns both the `PROCESS_INFORMATION` and the still-owned `ConptyInstance` so the caller can hand off or extract the PTY pipe handles.
+The main job is to build a ConPTY with two pipe ends: one pipe lets the parent send keyboard input to the child process, and the other lets the parent read the child’s screen output. Think of it like setting up an intercom: one wire carries what you type in, and another carries what the program says back.
+
+The file also knows how to start a sandboxed process with that ConPTY attached. To do that, it builds a Windows command line, prepares the environment variables, optionally prepares a private desktop, creates the ConPTY, places the ConPTY handle into a special process-startup attribute list, and then calls Windows’ `CreateProcessAsUserW` to launch the child under a supplied user token.
+
+`ConptyInstance` owns the ConPTY and pipe handles. Its cleanup code closes the remaining pipe handles when the instance is dropped, which prevents handle leaks. The `take_*` methods deliberately hand pipe ownership to someone else by removing the handle from the instance so it will not be closed twice.
 
 #### Function details
 
@@ -4540,11 +4582,11 @@ There are two usage levels. `create_conpty` is a lower-level constructor that cr
 fn drop(&mut self)
 ```
 
-**Purpose**: Closes the ConPTY backing pipe handles and drops the pseudoconsole when the instance is destroyed.
+**Purpose**: Cleans up the operating-system handles owned by a `ConptyInstance` when it is no longer needed. This matters because Windows handles are finite resources, and leaking them can leave pipes or pseudo-terminals open after the process using them is gone.
 
-**Data flow**: It reads `input_write` and `output_read`, closes each with `CloseHandle` if nonzero and not `INVALID_HANDLE_VALUE`, then takes and drops the optional `PsuedoCon`. It returns no value.
+**Data flow**: It starts with a `ConptyInstance` that may still own an input pipe handle, an output pipe handle, and a ConPTY object. It checks whether each pipe handle looks valid, closes any valid ones with Windows’ `CloseHandle`, then takes and drops the ConPTY object. After this, those resources are released unless they were previously handed off with a `take_*` method.
 
-**Call relations**: This destructor runs automatically after callers finish with a spawned PTY session or a standalone created ConPTY, preventing handle leaks.
+**Call relations**: This runs automatically when Rust drops a `ConptyInstance`, including instances created by `create_conpty` or `spawn_conpty_process_as_user`. It directly hands the final cleanup step to the Windows `CloseHandle` call for the pipe handles.
 
 *Call graph*: 1 external calls (CloseHandle).
 
@@ -4555,11 +4597,11 @@ fn drop(&mut self)
 fn raw_handle(&self) -> Option<HANDLE>
 ```
 
-**Purpose**: Returns the raw pseudoconsole handle if the instance still owns one.
+**Purpose**: Returns the raw Windows handle for the ConPTY, if the instance still owns one. Callers use this when they need to pass the pseudo-console handle into lower-level Windows setup code.
 
-**Data flow**: It reads the optional `pseudoconsole`, maps it through `raw_handle()`, casts that to `HANDLE`, and returns `Option<HANDLE>`.
+**Data flow**: It reads the optional ConPTY object stored inside the instance. If it is present, it extracts its raw operating-system handle and returns it; if the ConPTY has already been removed, it returns nothing.
 
-**Call relations**: This accessor exposes the underlying pseudoconsole handle for callers that need to inspect or pass it onward without taking ownership.
+**Call relations**: This is a small access point for code that needs the underlying Windows handle. In this file, `spawn_conpty_process_as_user` gets the raw handle directly from the ConPTY object before storing it, while this method provides the same kind of access for other callers.
 
 
 ##### `ConptyInstance::take_input_write`  (lines 63–65)
@@ -4568,11 +4610,11 @@ fn raw_handle(&self) -> Option<HANDLE>
 fn take_input_write(&mut self) -> HANDLE
 ```
 
-**Purpose**: Transfers ownership of the PTY input pipe’s write handle out of the instance.
+**Purpose**: Hands the writable input pipe handle to another owner. This is used when another part of the program will be responsible for writing user input into the child process’s terminal.
 
-**Data flow**: It replaces `self.input_write` with `0` and returns the previous `HANDLE`.
+**Data flow**: It starts with the input-write handle stored in the instance. It replaces that stored handle with zero, then returns the original handle to the caller. Afterward, the instance no longer treats that handle as something it should close.
 
-**Call relations**: Callers use this when they want to manage the PTY input stream handle themselves after creation or spawn.
+**Call relations**: This supports the larger ConPTY flow by letting code outside this file take over the child process’s input pipe. It uses Rust’s `replace` operation so ownership is moved cleanly and the cleanup code will not close the same handle later.
 
 *Call graph*: 1 external calls (replace).
 
@@ -4583,11 +4625,11 @@ fn take_input_write(&mut self) -> HANDLE
 fn take_output_read(&mut self) -> HANDLE
 ```
 
-**Purpose**: Transfers ownership of the PTY output pipe’s read handle out of the instance.
+**Purpose**: Hands the readable output pipe handle to another owner. This is used when another part of the program will be responsible for reading terminal output from the child process.
 
-**Data flow**: It replaces `self.output_read` with `0` and returns the previous `HANDLE`.
+**Data flow**: It starts with the output-read handle stored in the instance. It swaps that stored value to zero and returns the original handle. From then on, the instance no longer owns that output handle and will not close it during cleanup.
 
-**Call relations**: Callers use this when they want to manage the PTY output stream handle themselves after creation or spawn.
+**Call relations**: This fits the ConPTY setup by allowing the terminal output stream to be passed to whatever code will monitor or forward the child process’s output. Like `take_input_write`, it relies on `replace` to prevent double-closing the handle.
 
 *Call graph*: 1 external calls (replace).
 
@@ -4598,11 +4640,11 @@ fn take_output_read(&mut self) -> HANDLE
 fn create_conpty(cols: i16, rows: i16) -> Result<ConptyInstance>
 ```
 
-**Purpose**: Creates a standalone ConPTY with caller-specified dimensions and returns an owning wrapper around its handles.
+**Purpose**: Creates a standalone ConPTY and returns it wrapped in a `ConptyInstance`. This is the lower-level building block for callers that need a pseudo-terminal but do not want this file to start a process for them.
 
-**Data flow**: It takes terminal column and row counts, constructs a `RawConPty`, extracts the pseudoconsole and pipe handles with `into_handles`, converts the pipe handles into raw `HANDLE`s, stores them in a new `ConptyInstance`, and returns it.
+**Data flow**: It receives a requested terminal size as columns and rows. It asks the ConPTY helper library to create a raw ConPTY with backing pipes, splits that raw object into the pseudo-console and its input/output pipe handles, converts those pipe handles into raw Windows handles, and returns a `ConptyInstance` that owns them.
 
-**Call relations**: This lower-level constructor is available for callers that need a ConPTY without immediately spawning a process through the higher-level helper.
+**Call relations**: This function calls the ConPTY library’s `new` constructor to do the actual Windows pseudo-terminal creation. It is separate from `spawn_conpty_process_as_user` so other process-launch paths can reuse the same terminal-creation primitive.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -4620,24 +4662,24 @@ fn spawn_conpty_process_as_user(
 ) ->
 ```
 
-**Purpose**: Launches a process under a supplied user token with a ConPTY attached and optional private desktop isolation.
+**Purpose**: Starts a new process as a specified Windows user and attaches it to a ConPTY. This is the main entry point when the sandbox wants a terminal-backed process, such as for interactive command-line tools.
 
-**Data flow**: It takes a user token handle, argument vector, working directory, environment map, desktop-isolation flag, and optional logs directory. It quotes and joins the arguments into a command line, converts it and the cwd to UTF-16, builds an environment block, prepares `STARTUPINFOEXW`, prepares a `LaunchDesktop`, creates a default `RawConPty`, wraps it in `ConptyInstance`, allocates and populates a `ProcThreadAttributeList` with the pseudoconsole handle, calls `CreateProcessAsUserW`, and returns `(PROCESS_INFORMATION, ConptyInstance)` on success or a detailed `anyhow!` error on failure.
+**Data flow**: It receives a user token, command arguments, a working directory, environment variables, and desktop options. It turns the argument list into a Windows-safe command line, builds a Windows environment block, prepares startup information, optionally prepares a private desktop, creates an 80 by 24 ConPTY, and places the ConPTY handle into a special startup attribute list. It then calls `CreateProcessAsUserW`. On success, it returns the new process information together with the `ConptyInstance`; on failure, it returns an error message with the Windows error, working directory, command, and environment size.
 
-**Call relations**: This is the main shared PTY spawn path and is called by `spawn_legacy_process` when a sandboxed command needs terminal semantics.
+**Call relations**: This function is called by `spawn_legacy_process` when that launch path needs a PTY-backed process. Inside, it delegates environment formatting to `make_env_block`, string conversion to `to_wide`, desktop preparation to `LaunchDesktop::prepare`, ConPTY creation to the ConPTY library’s `new`, and final process creation to the Windows API. The returned `ConptyInstance` keeps the terminal resources alive after the child process starts.
 
 *Call graph*: calls 4 internal fn (new, prepare, make_env_block, to_wide); called by 1 (spawn_legacy_process); 7 external calls (anyhow!, zeroed, null, null_mut, new, GetLastError, CreateProcessAsUserW).
 
 
 ### `utils/pty/src/win/procthreadattr.rs`
 
-`generated` · `Windows process creation setup`
+`io_transport` · `Windows command spawning`
 
-This small vendored helper encapsulates the awkward Win32 `PROC_THREAD_ATTRIBUTE_LIST` lifecycle behind a safe-ish Rust struct. The underlying storage is just a `Vec<u8>`, but `with_capacity` follows the required two-call Win32 pattern: first call `InitializeProcThreadAttributeList` with a null pointer to discover the required byte count, then allocate a buffer of exactly that size, and finally call the initializer again with the real pointer. Failures are converted into `anyhow::Error` via `ensure!` and `IoError::last_os_error()`.
+On Windows, starting a program inside a pseudo-terminal is not just a matter of launching the program. Windows needs a special “process thread attribute list,” which is a small block of system-owned setup data passed in when the child process is created. Think of it like an envelope of instructions handed to Windows at process launch time. This file builds and cleans up that envelope.
 
-Once allocated, `as_mut_ptr` exposes the buffer as an `LPPROC_THREAD_ATTRIBUTE_LIST` for Win32 APIs. `set_pty` uses `UpdateProcThreadAttribute` to install the `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute, passing the `HPCON` pseudoconsole handle and its size. This is the key step that causes a subsequently created process to attach to the ConPTY instance.
+The main type, ProcThreadAttributeList, owns the memory for that Windows attribute list. Creating it is awkward because the Windows API first has to be asked how much memory it needs, then that exact amount of memory must be allocated, and then the API is called again to initialize it. This wrapper hides that two-step dance.
 
-The struct owns cleanup as well: `Drop` always calls `DeleteProcThreadAttributeList` on the current pointer. The design keeps all pointer casting and manual buffer sizing localized to one file, so the rest of the Windows spawn code can treat pseudoconsole attribute setup as a normal Rust object rather than a sequence of raw Win32 calls.
+Once the list exists, set_pty adds the important instruction: connect the new process to a specific pseudo-console handle, called an HPCON. A handle is an operating-system reference to something Windows owns, in this case the pseudo-terminal. The file also includes cleanup code so Windows is told to delete the attribute list when the Rust object is dropped. This matters because the code uses raw Windows pointers, where forgetting cleanup or passing the wrong pointer can cause leaks or process-launch failures.
 
 #### Function details
 
@@ -4647,11 +4689,11 @@ The struct owns cleanup as well: `Drop` always calls `DeleteProcThreadAttributeL
 fn with_capacity(num_attributes: DWORD) -> Result<Self, Error>
 ```
 
-**Purpose**: Allocates and initializes a process-thread attribute list capable of holding a specified number of attributes. It performs the standard Win32 size-discovery call before allocating the backing buffer.
+**Purpose**: Creates a new Windows process attribute list with room for a chosen number of attributes. It is used before starting a child process so Windows has a properly prepared place to store launch instructions.
 
-**Data flow**: Takes `num_attributes: DWORD`, calls `InitializeProcThreadAttributeList(null_mut(), ...)` to fill `bytes_required`, allocates a `Vec<u8>` with that capacity and unsafely sets its length, casts the buffer pointer to `LPPROC_THREAD_ATTRIBUTE_LIST`, calls `InitializeProcThreadAttributeList` again on the real buffer, and returns `Ok(Self { data })` or an `anyhow::Error` if initialization failed.
+**Data flow**: It receives the number of attributes the caller wants. It asks Windows how many bytes are needed, allocates a byte buffer of that size, then asks Windows to initialize that buffer as a process attribute list. If Windows reports failure, it returns an error; otherwise it returns a ProcThreadAttributeList that owns the prepared memory.
 
-**Call relations**: This constructor is called by Windows pseudoconsole spawn code before setting attributes such as the attached PTY handle.
+**Call relations**: When spawn_command is preparing to launch a process, it calls this function to create the attribute list. This function stays focused on making the list valid; later steps, such as attaching the pseudo-terminal, add the actual launch instruction.
 
 *Call graph*: called by 1 (spawn_command); 3 external calls (with_capacity, ensure!, null_mut).
 
@@ -4662,11 +4704,11 @@ fn with_capacity(num_attributes: DWORD) -> Result<Self, Error>
 fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST
 ```
 
-**Purpose**: Returns the backing buffer as a mutable Win32 attribute-list pointer. It is the low-level accessor used by both mutation and cleanup code.
+**Purpose**: Gives the Windows API a raw mutable pointer to the attribute list memory. This is needed because the Windows functions do not understand Rust’s safe Vec wrapper directly.
 
-**Data flow**: Borrows `&mut self`, casts `self.data.as_mut_slice().as_mut_ptr()` to `LPPROC_THREAD_ATTRIBUTE_LIST`, and returns that pointer.
+**Data flow**: It reads the internal byte buffer owned by ProcThreadAttributeList and converts the start of that buffer into the pointer type Windows expects. It does not create new data; it simply exposes the existing memory in the form required by the operating system.
 
-**Call relations**: This helper is used internally by `set_pty` and `Drop` so pointer conversion logic is not duplicated.
+**Call relations**: set_pty calls this when updating the list with the pseudo-console instruction. drop also calls it when handing the list back to Windows for cleanup.
 
 *Call graph*: called by 2 (drop, set_pty).
 
@@ -4677,11 +4719,11 @@ fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST
 fn set_pty(&mut self, con: HPCON) -> Result<(), Error>
 ```
 
-**Purpose**: Associates a pseudoconsole handle with the attribute list so a subsequently created process will attach to that ConPTY. It writes the `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute.
+**Purpose**: Adds the instruction that the new process should use a particular Windows pseudo-console. This is the step that actually connects the future child process to the terminal-like session.
 
-**Data flow**: Takes `con: HPCON`, obtains the attribute-list pointer via `as_mut_ptr()`, calls `UpdateProcThreadAttribute` with the pseudoconsole attribute constant, the handle value, and `mem::size_of::<HPCON>()`, and returns `Ok(())` or an `anyhow::Error` built from `last_os_error()` if the update fails.
+**Data flow**: It receives an HPCON, which is a Windows handle referring to a pseudo-console. It gets a raw pointer to the attribute list, passes that pointer and the console handle to Windows, and asks Windows to store the pseudo-console attribute there. If Windows rejects the update, it returns an error; otherwise the list is ready to be used during process creation.
 
-**Call relations**: Windows spawn code calls this after `with_capacity` and before process creation to bind the child to a ConPTY session.
+**Call relations**: After an attribute list has been created, this function is called to put the pseudo-terminal connection into it. It relies on as_mut_ptr to hand the list to the Windows API in the required raw-pointer form.
 
 *Call graph*: calls 1 internal fn (as_mut_ptr); 2 external calls (ensure!, null_mut).
 
@@ -4692,22 +4734,24 @@ fn set_pty(&mut self, con: HPCON) -> Result<(), Error>
 fn drop(&mut self)
 ```
 
-**Purpose**: Releases the Win32 attribute-list resources when the wrapper is dropped. It ensures the corresponding `DeleteProcThreadAttributeList` cleanup always runs.
+**Purpose**: Cleans up the Windows attribute list when the Rust object goes out of scope. This prevents the low-level Windows setup data from being left behind.
 
-**Data flow**: Borrows `&mut self`, obtains the raw pointer with `as_mut_ptr()`, passes it to `DeleteProcThreadAttributeList`, and returns `()`.
+**Data flow**: When the ProcThreadAttributeList is no longer needed, Rust automatically calls this function. It converts the owned buffer into the raw pointer Windows expects and tells Windows to delete the attribute list contents. Nothing is returned; the cleanup happens as a side effect.
 
-**Call relations**: Rust invokes this automatically when the attribute-list wrapper goes out of scope, completing the lifecycle started by `with_capacity`.
+**Call relations**: This is called automatically by Rust’s ownership system rather than by normal application code. It uses as_mut_ptr to pass the correct memory address to Windows during cleanup.
 
 *Call graph*: calls 1 internal fn (as_mut_ptr).
 
 
 ### `windows-sandbox-rs/src/stdio_bridge.rs`
 
-`io_transport` · `interactive session I/O forwarding and shutdown drain`
+`io_transport` · `active during a Windows sandbox session, from process start until exit`
 
-This file is the outer stdio adapter used when a sandbox session should behave like a normal child process attached to the caller's console. The main async entrypoint, `forward_sandbox_session_stdio`, takes a `codex_utils_pty::SpawnedProcess`, wraps its `session` in an `Arc`, and starts three background forwarding threads: one reads from this process's `stdin` and pushes byte chunks into the session's writer channel, while two others consume the session's `stdout_rx` and `stderr_rx` Tokio channels and write those chunks to `std::io::stdout()` and `std::io::stderr()`.
+A sandboxed process cannot automatically read from this wrapper process’s keyboard input or write directly back to its screen. This file acts like a set of temporary pipes between the outside terminal and the sandbox session. Without it, an interactive sandboxed command could sit waiting for input that never arrives, or produce output that the user never sees.
 
-A oneshot channel is used to detect local stdin EOF. When the input thread finishes, an async task calls `session.close_stdin()` so the sandboxed child sees end-of-input. Exit handling races the child exit receiver against `tokio::signal::ctrl_c()`: on Ctrl-C, the code requests sandbox termination and then still waits for the real exit code, defaulting to `-1` if the channel closes unexpectedly. After exit, it aborts the stdin-close helper task and waits up to five seconds for stdout/stderr forwarders to drain remaining tail output, intentionally avoiding indefinite hangs from rare EOF issues. The helper threads are detached by dropping their `JoinHandle`s immediately; they continue running independently.
+The main function starts three background forwarding jobs. One reads this process’s standard input, meaning what the user types or what another command pipes in, and sends those bytes into the sandbox. Two others read the sandbox’s standard output and standard error, meaning normal messages and error messages, and write them back to this process’s terminal streams.
+
+It also watches for two important endings. If outside input reaches end-of-file, it closes the sandbox child’s input too, like telling the child program “there is no more to read.” If the user presses Ctrl-C, it asks the sandbox session to terminate, instead of leaving the child running. After the sandbox exits, it waits briefly for any final output to drain, but only up to five seconds so the wrapper does not hang forever because of a stuck pipe.
 
 #### Function details
 
@@ -4717,11 +4761,11 @@ A oneshot channel is used to detect local stdin EOF. When the input thread finis
 async fn forward_sandbox_session_stdio(spawned: SpawnedProcess) -> i32
 ```
 
-**Purpose**: Connects the caller's console streams to a sandbox session and waits for the session to finish. It also translates local EOF and Ctrl-C into sandbox-side stdin closure and termination requests.
+**Purpose**: Runs the whole input/output bridge for one sandbox session. It forwards terminal input into the sandbox, forwards sandbox output back to the terminal, reacts to Ctrl-C, and finally returns the sandboxed process’s exit code.
 
-**Data flow**: Consumes a `SpawnedProcess`, extracting its `session`, `stdout_rx`, `stderr_rx`, and `exit_rx`. It creates a oneshot pair for stdin EOF notification, spawns one input-forwarding thread and two output-forwarding threads, then spawns an async task that waits for stdin EOF and calls `session.close_stdin()`. It selects between the process exit receiver and `tokio::signal::ctrl_c()`, possibly calling `session.request_terminate()`, then waits briefly for output drain and returns the final `i32` exit code, using `-1` if the exit channel yields no code.
+**Data flow**: It receives a SpawnedProcess, which contains the sandbox session plus channels for its output and exit status. It starts helper threads for stdin, stdout, and stderr, then waits until either the sandbox reports an exit code or the user presses Ctrl-C. On input end, it closes the sandbox child’s stdin; on Ctrl-C, it requests termination. Before returning, it gives stdout and stderr up to five seconds to finish writing any remaining data, then returns the exit code or -1 if the exit result could not be read.
 
-**Call relations**: This is the file's top-level API. It drives both helper spawners unconditionally when a sandbox session is being attached to stdio, and its control flow is centered on coordinating their lifetime with the session exit path.
+**Call relations**: This is the coordinator for the file. It calls spawn_input_forwarder when it needs a thread to copy outside input into the sandbox, and it calls spawn_output_forwarder twice, once for normal output and once for error output. The helper threads do the blocking reading and writing work while this async function waits for session exit, Ctrl-C, and final output draining.
 
 *Call graph*: calls 2 internal fn (spawn_input_forwarder, spawn_output_forwarder); 11 external calls (clone, new, from_secs, channel, stderr, stdin, stdout, current, select!, spawn (+1 more)).
 
@@ -4736,11 +4780,11 @@ fn spawn_input_forwarder(
 ) -> std::thread::JoinHandle<()>
 ```
 
-**Purpose**: Starts a blocking thread that reads bytes from a `Read` source and forwards them into the sandbox session's stdin channel. It reports EOF exactly once through a oneshot sender when the loop ends.
+**Purpose**: Starts a background thread that copies bytes from some input source into the sandbox child’s stdin channel. It is used so slow or blocking terminal reads do not freeze the async control flow.
 
-**Data flow**: Takes a generic `R: Read + Send + 'static`, an `mpsc::Sender<Vec<u8>>`, and a `oneshot::Sender<()>`. Inside the thread it repeatedly reads up to 8 KiB into a fixed buffer, clones the read slice into a `Vec<u8>`, and sends it with `blocking_send`. It retries interrupted reads, logs other I/O errors to stderr, stops on EOF or channel closure, then sends the EOF notification and returns via thread completion.
+**Data flow**: It takes an input reader, a sending channel connected to the sandbox writer, and a one-time signal used to announce end-of-input. The thread repeatedly reads chunks of up to 8 KB. Each chunk is sent into the sandbox. If reading reaches end-of-file, sending fails, or an unrecoverable read error happens, the loop stops. At the end, it sends the one-time signal so the main bridge can close stdin for the sandbox child.
 
-**Call relations**: It is invoked only by `forward_sandbox_session_stdio` to watch the parent process's stdin. Its sole downstream effect is feeding the session writer channel and triggering the async stdin-close task once input ends.
+**Call relations**: forward_sandbox_session_stdio calls this once for this process’s stdin. The thread it creates feeds user input into the sandbox while the main function continues watching for process exit or Ctrl-C. When the thread notices input is finished, it notifies the main function through the one-shot signal.
 
 *Call graph*: called by 1 (forward_sandbox_session_stdio); 1 external calls (spawn).
 
@@ -4755,10 +4799,10 @@ fn spawn_output_forwarder(
 ) -> (std::thread::JoinHandle<()>, oneshot::Receiver<()>)
 ```
 
-**Purpose**: Starts a blocking thread that drains a Tokio `mpsc::Receiver<Vec<u8>>` and writes each chunk to a blocking `Write` sink. It also exposes a oneshot completion signal so callers can wait for output draining.
+**Purpose**: Starts a background thread that copies output chunks from the sandbox to a chosen output stream, such as stdout or stderr. It keeps terminal writing separate from the async session watcher.
 
-**Data flow**: Accepts a Tokio runtime `Handle`, an `mpsc::Receiver<Vec<u8>>`, and a generic `W: Write + Send + 'static`. The thread uses `tokio_runtime.block_on(output_rx.recv())` to synchronously receive chunks, writes each chunk with `write_all`, flushes after every chunk, logs write/flush failures to stderr, and sends `()` on a oneshot sender when the receive loop ends or breaks. It returns both the thread `JoinHandle` and the completion receiver.
+**Data flow**: It receives a Tokio runtime handle, a channel that yields output chunks from the sandbox, and a writer. The new thread waits for chunks from the channel, writes each chunk fully to the writer, and flushes so the user sees the text promptly. If writing or flushing fails, it prints an error and stops. When the channel closes or the thread stops, it sends a done signal back to the caller.
 
-**Call relations**: It is called twice by `forward_sandbox_session_stdio`, once for stdout and once for stderr. The returned completion receivers are used during post-exit draining so the wrapper can give buffered output a chance to reach the console.
+**Call relations**: forward_sandbox_session_stdio calls this twice: one thread writes sandbox stdout to this process’s stdout, and another writes sandbox stderr to this process’s stderr. The returned done signal lets the main bridge wait briefly after the sandbox exits, giving final output a chance to appear before the wrapper returns.
 
 *Call graph*: called by 1 (forward_sandbox_session_stdio); 2 external calls (channel, spawn).

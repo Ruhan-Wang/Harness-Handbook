@@ -1,10 +1,8 @@
 # Patch application engine and patch-execution adapters  `stage-14.2.3`
 
-This stage is the execution bridge between a model-emitted patch request and actual filesystem changes. It sits in the tool/runtime path: after a patch-like command is produced, but before and during mutation of files, enforcing syntax, safety, approval, and sandbox rules.
+This stage is the editing engine for the system. It is used during the main work loop when the assistant wants to change files. First, apply_patch_spec defines the “apply_patch” tool: its name, description, and the exact patch format the assistant must use. The parser and streaming_parser read that patch text. The normal parser waits for the whole patch and turns it into clear actions like add, delete, update, or move a file. The streaming parser can understand the patch while it is still arriving, so progress can be shown early.
 
-At the front, core/src/tools/handlers/apply_patch_spec.rs declares the freeform tool grammar the model can call, and core/src/tools/handlers/apply_patch.rs turns that call into a vetted operation, parsing input, deriving permissions, emitting hook payloads, and streaming progress. core/src/apply_patch.rs is the policy gate: it decides whether a request is rejected, translated into protocol-level file edits, or sent to runtime execution, with or without approval. core/src/tools/runtimes/apply_patch.rs then adapts that vetted request to the generic runtime framework, constructing sandboxed execution and returning structured results.
-
-The apply-patch crate provides the patch engine itself. streaming_parser.rs incrementally recognizes hunks from streamed text; parser.rs builds validated ApplyPatchArgs and tolerates heredoc-wrapped input; invocation.rs understands command-line and shell-wrapper forms; lib.rs computes replacements, applies hunks, writes files, emits diffs, and tracks partial failures. git-utils/src/apply.rs complements this with a git-backed unified-diff applicator for cases that rely on system git behavior.
+The invocation code decides whether some command text is truly an apply_patch request, not just an ordinary shell command. The core apply-patch library then performs the actual file edits and records what succeeded or failed. The core handlers and runtime adapters act like safety gates: they validate the request, check policy, ask for user approval if needed, choose the right sandboxed environment, run the edit, and report results. For Git-based patches, git-utils applies them through Git and explains which files applied, skipped, or conflicted.
 
 ## Files in this stage
 
@@ -13,11 +11,13 @@ These files define the external apply_patch tool surface and orchestrate a reque
 
 ### `core/src/tools/handlers/apply_patch_spec.rs`
 
-`config` · `tool registration and schema advertisement`
+`config` · `tool registration`
 
-This file contains the model-facing specification for `apply_patch`. Rather than a JSON function schema, it exposes a `ToolSpec::Freeform` whose format is a Lark grammar loaded from the adjacent `apply_patch.lark` file at compile time via `include_str!`. The single factory function, `create_apply_patch_freeform_tool`, optionally rewrites the grammar's `start` rule when multi-environment support is enabled: it inserts an optional `environment_id` production and defines that production as a line beginning with `*** Environment ID: ` followed by a filename token and newline.
+This file is like the instruction card for a special editing tool. The project needs a safe, predictable way for an AI model to say, “change this file like so,” without wrapping the edit in ordinary JSON or free text that might be hard to parse. To do that, it builds a `ToolSpec`, meaning a tool description that can be registered with the larger tool system.
 
-The returned `FreeformTool` always uses the same tool name and description, explicitly telling models not to wrap the patch in JSON. Its `FreeformToolFormat` fixes `type` to `grammar`, `syntax` to `lark`, and supplies the chosen grammar definition string. This design keeps the runtime parser and the model-visible syntax tightly aligned while allowing a small, targeted grammar variation based on turn capabilities.
+The important ingredient is a Lark grammar. A grammar is a set of rules that says what text is valid, much like a form template says which fields must appear and in what order. The grammar text is loaded from the neighboring `apply_patch.lark` file at compile time. This file then uses that grammar as the accepted format for the `apply_patch` tool.
+
+There is one optional twist: some runs may need an environment ID included in the patch. If requested, the function slightly rewrites the grammar so an optional `*** Environment ID: ...` line is allowed near the start. Without this file, the system would not have a clear, reusable specification for exposing file editing as a custom freeform tool.
 
 #### Function details
 
@@ -27,24 +27,26 @@ The returned `FreeformTool` always uses the same tool name and description, expl
 fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpec
 ```
 
-**Purpose**: Builds the freeform tool specification for `apply_patch`, optionally extending the grammar to accept an environment-id header.
+**Purpose**: Builds the official specification for the `apply_patch` tool. Callers use it when they want to offer the model a file-editing tool whose input must follow the patch grammar.
 
-**Data flow**: It takes `include_environment_id: bool`, chooses either the raw embedded grammar or a modified version with an inserted `environment_id` rule, then returns `ToolSpec::Freeform(FreeformTool { ... })` containing the fixed name/description and a `FreeformToolFormat` with the selected grammar definition.
+**Data flow**: It receives one choice: whether patches may include an environment ID. It reads the built-in Lark grammar text, optionally inserts the extra environment-ID rule, then packages the final grammar together with the tool name and description. The result is a `ToolSpec::Freeform`, which means the tool accepts raw text in a specific grammar rather than JSON.
 
-**Call relations**: Called by `ApplyPatchHandler::spec` so the runtime advertises syntax that matches whether multi-environment patch targeting is enabled.
+**Call relations**: When the broader tool specification setup asks for the apply-patch tool, this function creates the finished tool description. It hands that description to `ToolSpec::Freeform`, which wraps the freeform tool details so the rest of the system can register and present it consistently.
 
 *Call graph*: called by 1 (spec); 1 external calls (Freeform).
 
 
 ### `core/src/tools/handlers/apply_patch.rs`
 
-`orchestration` · `tool invocation, patch verification, approval/runtime execution, and streaming progress`
+`orchestration` · `request handling`
 
-This file is the main execution engine for patch application. `ApplyPatchHandler` exposes the tool under the freeform name `apply_patch`, optionally allowing explicit environment selection. Its `handle_call` path accepts only `ToolPayload::Custom`, parses the raw patch text with `codex_apply_patch`, optionally validates an embedded environment id, resolves the target `TurnEnvironment`, converts its cwd to a host-native `AbsolutePathBuf`, and verifies the patch against the selected filesystem plus sandbox context. Once verified, it computes affected absolute paths and any extra write permissions needed outside the current sandbox using `effective_patch_permissions`, which merges granted session/turn permissions with the turn’s base filesystem policy.
+This file exists so the assistant can safely edit files by sending a patch, instead of running arbitrary commands. A patch is like a marked-up set of instructions: add this file, delete that file, replace these lines. Without this handler, the system would not know how to verify those instructions, apply them in the right workspace, or tell the user what changed.
 
-Execution then splits in two. If `apply_patch::apply_patch` returns `InternalApplyPatchInvocation::Output`, the patch can be completed immediately and the textual result is returned. If it returns `DelegateToRuntime`, the file converts changes into protocol `FileChange` values, emits begin/finish events through `ToolEmitter`, constructs an `ApplyPatchRequest`, and runs `ApplyPatchRuntime` through `ToolOrchestrator`, preserving committed deltas even on failure. The same core flow is reused by `intercept_apply_patch` for exec-like command interception.
+The main piece is `ApplyPatchHandler`. It registers the `apply_patch` tool, accepts the raw patch text, parses it, checks which environment it should affect, and verifies the patch against that environment’s filesystem. It then works out whether the patch needs extra write access. If the change can be applied directly, it returns the result. If it must go through the normal tool runtime, it builds an `ApplyPatchRequest`, starts progress events, runs the patch through the tool orchestrator, and finishes with a clear response.
 
-The file also defines `ApplyPatchArgumentDiffConsumer`, which incrementally parses streamed patch text with `StreamingPatchParser` and emits throttled `PatchApplyUpdatedEvent`s every 500ms at most, buffering the latest pending event until completion. Helper functions convert parsed hunks into protocol changes, format update hunks as unified-diff-like progress text, collect both source and move-destination paths for approval accounting, and synthesize hook payloads before and after tool use. Important constraints are enforced explicitly: unsupported payload kinds, malformed/non-apply_patch input, unavailable environment selection, and host-incompatible cwd projections all become model-visible errors.
+The file also supports streaming progress while the model is still writing the patch. `ApplyPatchArgumentDiffConsumer` reads patch text in small pieces and turns recognizable hunks into “file X is being added/updated/deleted” events. It buffers these updates so the UI is not flooded.
+
+A second entry point, `intercept_apply_patch`, catches shell-like commands that are actually apply-patch commands and routes them through the same safe path.
 
 #### Function details
 
@@ -54,11 +56,11 @@ The file also defines `ApplyPatchArgumentDiffConsumer`, which incrementally pars
 fn new(multi_environment: bool) -> Self
 ```
 
-**Purpose**: Constructs an `ApplyPatchHandler` configured for either single-environment or multi-environment turns.
+**Purpose**: Creates an `ApplyPatchHandler` and records whether this turn may choose among multiple environments. This matters because a patch may need to target a specific workspace only when that feature is allowed.
 
-**Data flow**: It takes a `bool` flag, stores it in the handler's `multi_environment` field, and returns the new struct. No external state is read or mutated.
+**Data flow**: It receives a true-or-false `multi_environment` setting → stores that setting inside the handler → returns a ready-to-register handler.
 
-**Call relations**: Called by higher-level tool registration code such as `add_core_utility_tools` to choose whether environment ids may appear in patch input.
+**Call relations**: The core tool registration flow calls this when adding built-in utility tools. After that, the returned handler is used whenever the `apply_patch` tool is offered or invoked.
 
 *Call graph*: called by 1 (add_core_utility_tools).
 
@@ -74,11 +76,11 @@ fn consume_diff(
     ) -> Option<EventMsg>
 ```
 
-**Purpose**: Consumes a streamed patch-text delta and, when the feature flag is enabled, converts it into an optional patch-progress event.
+**Purpose**: Consumes a newly streamed piece of patch text and may turn it into a progress event. It only does this when the apply-patch streaming feature is enabled for the current turn.
 
-**Data flow**: It reads the turn's feature set, the `call_id`, and the incoming diff chunk. If `Feature::ApplyPatchStreamingEvents` is disabled it returns `None`; otherwise it forwards the chunk to `push_delta` and wraps any resulting `PatchApplyUpdatedEvent` as `EventMsg::PatchApplyUpdated`.
+**Data flow**: It receives the current turn, the tool call id, and a text fragment → checks whether streaming patch events are enabled → passes the fragment to `push_delta` → returns a patch progress event if enough useful information is available.
 
-**Call relations**: Invoked by the tool framework while arguments stream in. It delegates parsing/throttling to `push_delta` and suppresses all output when the feature gate is off.
+**Call relations**: The tool runtime calls this while the model is still producing the tool argument. It delegates the real parsing and throttling work to `push_delta`, then wraps any result as a protocol event.
 
 *Call graph*: calls 1 internal fn (push_delta).
 
@@ -89,11 +91,11 @@ fn consume_diff(
 fn finish(&mut self) -> Result<Option<EventMsg>, FunctionCallError>
 ```
 
-**Purpose**: Finalizes streamed patch parsing and emits any buffered final progress event.
+**Purpose**: Finishes streaming patch-progress parsing after all patch text has arrived. It gives the system one last chance to send a buffered update.
 
-**Data flow**: It consumes no new diff text; instead it asks `finish_update_on_complete` to close the parser, then maps any returned patch event into `EventMsg::PatchApplyUpdated`. Parse-finalization errors become `FunctionCallError` values.
+**Data flow**: It receives no new patch text → asks `finish_update_on_complete` to close the parser and collect any pending event → returns that event wrapped for the protocol, or an error if the patch stream cannot be parsed.
 
-**Call relations**: Called by the framework after argument streaming ends. It is the terminal counterpart to `consume_diff`.
+**Call relations**: The tool runtime calls this at the end of argument streaming. It hands the completion work to `finish_update_on_complete` so parsing errors and final buffered updates are handled in one place.
 
 *Call graph*: calls 1 internal fn (finish_update_on_complete).
 
@@ -104,11 +106,11 @@ fn finish(&mut self) -> Result<Option<EventMsg>, FunctionCallError>
 fn push_delta(&mut self, call_id: String, delta: &str) -> Option<PatchApplyUpdatedEvent>
 ```
 
-**Purpose**: Feeds incremental patch text into the streaming parser, converts newly recognized hunks into protocol changes, and rate-limits emitted updates.
+**Purpose**: Parses one more piece of streamed patch text and decides whether to emit a progress update now or hold it briefly. The short delay avoids sending too many nearly identical UI updates.
 
-**Data flow**: It takes a `call_id` and raw patch-text `delta`, pushes the delta into `self.parser`, ignores parser errors and empty hunk batches by returning `None`, converts parsed hunks into a `HashMap<PathBuf, FileChange>`, and builds a `PatchApplyUpdatedEvent`. It reads and updates `self.last_sent_at` and `self.pending`: if the last send was within the 500ms buffer interval it stores the newest event in `pending`; otherwise it clears pending, records the current time, and returns the event immediately.
+**Data flow**: It receives a call id and a patch-text fragment → feeds the fragment into the streaming parser → converts any newly understood hunks into file-change messages → either returns an event immediately or stores it as pending if the last event was sent too recently.
 
-**Call relations**: Used by `consume_diff` for each streamed chunk. It depends on `convert_apply_patch_hunks_to_protocol` to translate parser output into UI/protocol-facing change summaries.
+**Call relations**: `consume_diff` calls this whenever new tool-argument text arrives. It uses the hunk-to-protocol conversion helper and the current time to produce progress updates at a controlled pace.
 
 *Call graph*: calls 2 internal fn (push_delta, convert_apply_patch_hunks_to_protocol); called by 1 (consume_diff); 1 external calls (now).
 
@@ -121,11 +123,11 @@ fn finish_update_on_complete(
     ) -> Result<Option<PatchApplyUpdatedEvent>, FunctionCallError>
 ```
 
-**Purpose**: Completes the streaming parser, surfaces parse errors, and flushes the last buffered patch-progress event if one exists.
+**Purpose**: Closes the streaming patch parser and returns the last buffered progress update, if one exists. It turns parser problems into an error message that can be shown to the model.
 
-**Data flow**: It calls `self.parser.finish()`, mapping parser failures into `RespondToModel` errors. Then it takes `self.pending`, updates `self.last_sent_at` if an event was flushed, and returns `Ok(Some(event))` or `Ok(None)`.
+**Data flow**: It receives the consumer’s current parser state → tells the parser there is no more input → converts any parse failure into a tool error → takes the pending event, updates the send time if needed, and returns the event.
 
-**Call relations**: Called only by `finish`. It ensures buffered updates are not lost when the final chunk arrived inside the throttling window.
+**Call relations**: `finish` calls this when argument streaming is complete. Its result becomes the final patch-progress event, if the consumer had been holding one back because of throttling.
 
 *Call graph*: calls 1 internal fn (finish); called by 1 (finish); 1 external calls (now).
 
@@ -136,11 +138,11 @@ fn finish_update_on_complete(
 fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, FileChange>
 ```
 
-**Purpose**: Transforms parsed patch hunks into protocol-level file-change summaries keyed by source path.
+**Purpose**: Turns parsed patch hunks into the project’s standard file-change format. A hunk is one piece of a patch, such as “add this file” or “replace these lines.”
 
-**Data flow**: It iterates over a slice of `Hunk`, derives each hunk's source path, maps add/delete/update variants into `FileChange::Add`, `FileChange::Delete`, or `FileChange::Update`, and collects the pairs into a `HashMap<PathBuf, FileChange>`. Update hunks use formatted chunk text and preserve any move destination.
+**Data flow**: It receives a list of parsed hunks → inspects each hunk’s kind and path → builds a map from file path to a protocol `FileChange` describing add, delete, or update → returns that map for progress reporting.
 
-**Call relations**: Called by `ApplyPatchArgumentDiffConsumer::push_delta` to turn parser output into event payloads suitable for clients.
+**Call relations**: `push_delta` uses this after the streaming parser recognizes meaningful patch pieces. The converted changes are then placed into a `PatchApplyUpdatedEvent` for the UI or client.
 
 *Call graph*: called by 1 (push_delta); 1 external calls (iter).
 
@@ -151,11 +153,11 @@ fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, Fil
 fn hunk_source_path(hunk: &Hunk) -> &Path
 ```
 
-**Purpose**: Returns the primary path associated with any parsed patch hunk variant.
+**Purpose**: Finds the main source path for any kind of patch hunk. This lets other code treat add, delete, and update hunks in a uniform way.
 
-**Data flow**: It pattern-matches a `Hunk` and returns a borrowed `&Path` from the variant's `path` field. It performs no allocation or mutation.
+**Data flow**: It receives one hunk → matches whether it is an add, delete, or update → returns the path stored inside that hunk.
 
-**Call relations**: Used by `convert_apply_patch_hunks_to_protocol` to normalize path extraction across add, delete, and update hunks.
+**Call relations**: This is a small local helper for code that needs to describe patch hunks by file path. It keeps the path-picking rule in one place instead of repeating it for every hunk type.
 
 
 ##### `format_update_chunks_for_progress`  (lines 170–200)
@@ -164,11 +166,11 @@ fn hunk_source_path(hunk: &Hunk) -> &Path
 fn format_update_chunks_for_progress(chunks: &[codex_apply_patch::UpdateFileChunk]) -> String
 ```
 
-**Purpose**: Renders update-file chunks into a compact unified-diff-like string for progress reporting.
+**Purpose**: Builds a simple unified-diff-style text summary for file updates. A unified diff is the familiar format where removed lines start with `-` and added lines start with `+`.
 
-**Data flow**: It takes a slice of `UpdateFileChunk`, appends chunk headers (`@@` plus optional context), prefixes old lines with `-`, new lines with `+`, appends newlines throughout, and emits `*** End of File` markers when `is_end_of_file` is set. The return value is the accumulated `String`.
+**Data flow**: It receives update chunks → writes optional context headers, old lines, new lines, and an end-of-file marker into one string → returns that string for progress display.
 
-**Call relations**: Called from `convert_apply_patch_hunks_to_protocol` when building `FileChange::Update` progress payloads.
+**Call relations**: The hunk conversion path uses this kind of formatting when an update needs to be shown in protocol form. Its output is meant for progress reporting, not for re-parsing as the full original patch.
 
 *Call graph*: 1 external calls (new).
 
@@ -179,11 +181,11 @@ fn format_update_chunks_for_progress(chunks: &[codex_apply_patch::UpdateFileChun
 fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Collects all absolute filesystem paths touched by a verified patch action, including rename destinations.
+**Purpose**: Collects every absolute file path that a patch action may touch. This includes both original paths and move destinations.
 
-**Data flow**: It reads the action's cwd and iterates over `action.changes()`. For each changed path it resolves the source path against cwd and pushes it into a vector; for update changes with `move_path`, it also resolves and includes the destination path. It returns the accumulated `Vec<AbsolutePathBuf>`.
+**Data flow**: It receives a verified patch action with a current working directory → walks through all planned changes → resolves each relative path against that working directory → returns the absolute paths that may need approval or permission checks.
 
-**Call relations**: Called by `effective_patch_permissions` to determine which paths need approval and permission accounting.
+**Call relations**: `effective_patch_permissions` calls this before calculating sandbox access. The returned paths become the concrete files or destinations used for permission decisions.
 
 *Call graph*: calls 2 internal fn (changes, to_abs_path); called by 1 (effective_patch_permissions); 1 external calls (new).
 
@@ -194,11 +196,11 @@ fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf>
 fn to_abs_path(cwd: &AbsolutePathBuf, path: &Path) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Resolves a patch-relative path against the action cwd into an absolute path wrapper.
+**Purpose**: Resolves a patch path against the current working directory to produce an absolute path. This removes ambiguity about where the patch will write.
 
-**Data flow**: It takes the cwd and a `&Path`, calls `AbsolutePathBuf::resolve_path_against_base`, wraps the result in `Some`, and returns it.
+**Data flow**: It receives a base directory and a path from the patch → resolves the patch path against the base → returns the absolute path.
 
-**Call relations**: A tiny helper used by `file_paths_for_action` for both source and move-destination path resolution.
+**Call relations**: `file_paths_for_action` calls this for each path mentioned by a patch action. It is the small conversion step that turns patch-local paths into filesystem paths the sandbox can reason about.
 
 *Call graph*: calls 1 internal fn (resolve_path_against_base); called by 1 (file_paths_for_action).
 
@@ -213,11 +215,11 @@ fn write_permissions_for_paths(
 ) -> Option<Additi
 ```
 
-**Purpose**: Computes an additional-permissions profile granting write access only for touched directories that are not already writable under the current sandbox policy.
+**Purpose**: Figures out which parent directories need extra write permission before the patch can be applied. It only asks for permissions that the current sandbox policy does not already allow.
 
-**Data flow**: It takes affected absolute file paths, the effective filesystem sandbox policy, and cwd. It maps each file to its parent directory (or itself if parentless), filters out directories already writable according to `can_write_path_with_cwd`, deduplicates them with `BTreeSet`, converts them into protocol path values, and if any remain builds an `AdditionalPermissionProfile` with `FileSystemPermissions::from_read_write_roots`. The profile is normalized and returned as `Some`; if no extra writes are needed or conversion fails, it returns `None`.
+**Data flow**: It receives target file paths, the current filesystem sandbox policy, and the working directory → turns each file into its parent directory → filters out directories already writable → builds and normalizes an additional permission profile → returns that profile, or nothing if no extra access is needed.
 
-**Call relations**: Called by `effective_patch_permissions` after path collection. Its output feeds `apply_granted_turn_permissions` so runtime execution can request only the missing write roots.
+**Call relations**: `effective_patch_permissions` calls this after it knows the patch’s target paths and current sandbox policy. Its result is passed into the permission-granting flow so the patch can be approved safely when needed.
 
 *Call graph*: calls 2 internal fn (from_read_write_roots, normalize_additional_permissions); called by 1 (effective_patch_permissions); 3 external calls (default, iter, vec!).
 
@@ -228,11 +230,11 @@ fn write_permissions_for_paths(
 fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String>
 ```
 
-**Purpose**: Extracts the raw freeform patch text from a tool payload for hook integration.
+**Purpose**: Extracts the raw patch text from an apply-patch tool payload. Hooks use this text as a command-shaped input.
 
-**Data flow**: It pattern-matches `ToolPayload`; for `Custom { input }` it clones and returns the input string, otherwise it returns `None`.
+**Data flow**: It receives a generic tool payload → if the payload is the custom freeform apply-patch kind, it clones the input text → otherwise it returns nothing.
 
-**Call relations**: Used by `pre_tool_use_payload` and indirectly by post-tool hook generation to preserve the exact patch command text.
+**Call relations**: `pre_tool_use_payload` calls this before a tool runs, and related hook code also relies on the same idea when building hook payloads. It is the adapter between the tool’s internal payload shape and hook input.
 
 *Call graph*: called by 1 (pre_tool_use_payload).
 
@@ -250,11 +252,11 @@ async fn effective_patch_permissions(
     Vec<AbsolutePathBuf>
 ```
 
-**Purpose**: Derives the touched paths, merged effective permissions, and resulting filesystem sandbox policy for a verified patch in a specific environment.
+**Purpose**: Computes the real permissions that should apply to this patch after combining the sandbox, session grants, turn grants, and any new write access the patch needs. This is the safety gate before editing files.
 
-**Data flow**: Inputs are the session, turn, environment id, verified `ApplyPatchAction`, and cwd. It computes touched file paths, asynchronously reads granted session and turn permissions for the environment, merges them, derives the effective filesystem sandbox policy from the turn base policy plus grants, computes any extra write permissions needed for the touched paths, and passes those through `apply_granted_turn_permissions`. It returns a tuple of `(file_paths, effective_additional_permissions, file_system_sandbox_policy)`.
+**Data flow**: It receives the session, turn, environment id, verified patch action, and working directory → collects target paths → merges already granted permissions → builds the effective sandbox policy → asks for or applies any missing write permissions → returns the target paths, effective extra permissions, and final sandbox policy.
 
-**Call relations**: Called by both `ApplyPatchHandler::handle_call` and `intercept_apply_patch` before actual patch execution. It is the shared permission-accounting step for direct tool calls and intercepted shell commands.
+**Call relations**: Both `handle_call` and `intercept_apply_patch` call this after a patch has been verified. They then use its returned policy and permission information when deciding whether to apply directly or delegate to the runtime.
 
 *Call graph*: calls 7 internal fn (file_system_sandbox_policy, apply_granted_turn_permissions, file_paths_for_action, write_permissions_for_paths, effective_file_system_sandbox_policy, merge_permission_profiles, as_path); called by 2 (handle_call, intercept_apply_patch); 2 external calls (granted_session_permissions, granted_turn_permissions).
 
@@ -265,11 +267,11 @@ async fn effective_patch_permissions(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registered plain tool name `apply_patch`.
+**Purpose**: Reports the public name of this tool: `apply_patch`. The registry uses this name to match tool calls to the handler.
 
-**Data flow**: It constructs and returns a `ToolName` from a fixed string literal, with no side effects.
+**Data flow**: It receives the handler → constructs the plain tool name `apply_patch` → returns it.
 
-**Call relations**: Queried by the tool registry so this executor can be exposed under the correct name.
+**Call relations**: The tool registry calls this as part of registering or identifying the handler. Later, invocations using that name are routed back to this handler.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -280,11 +282,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the freeform grammar-based tool specification for patch input, optionally including environment-id syntax.
+**Purpose**: Builds the tool description that tells the model how `apply_patch` may be called. The description changes depending on whether multiple environments can be selected.
 
-**Data flow**: It reads `self.multi_environment`, passes that flag into the spec factory, and returns the resulting `ToolSpec`.
+**Data flow**: It reads the handler’s `multi_environment` setting → asks the apply-patch spec builder to create the freeform tool definition → returns that definition.
 
-**Call relations**: Called during tool registration/introspection; it delegates schema construction to `create_apply_patch_freeform_tool`.
+**Call relations**: The tool registry asks for this spec when advertising available tools. It delegates the exact schema and wording to `create_apply_patch_freeform_tool`.
 
 *Call graph*: calls 1 internal fn (create_apply_patch_freeform_tool).
 
@@ -295,11 +297,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the executor trait to the async patch-handling implementation by boxing the future from `handle_call`.
+**Purpose**: Starts handling an `apply_patch` invocation in the asynchronous tool system. It wraps the real work in a future so the caller can await it.
 
-**Data flow**: It consumes a `ToolInvocation`, creates a pinned boxed future around `self.handle_call(invocation)`, and returns it.
+**Data flow**: It receives a `ToolInvocation` → calls `handle_call` with that invocation → pins the future in the form expected by the tool executor interface → returns the future.
 
-**Call relations**: This is the trait entrypoint invoked by the tool framework; all substantive work is delegated to `ApplyPatchHandler::handle_call`.
+**Call relations**: The tool executor framework calls this when the model invokes `apply_patch`. The actual parsing, permission checks, runtime delegation, and output creation happen in `handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -313,11 +315,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Parses, verifies, authorizes, and executes a freeform patch tool invocation, either inline or through the apply-patch runtime/orchestrator.
+**Purpose**: Runs the full apply-patch workflow for a direct `apply_patch` tool call. It validates the patch, selects the environment, checks permissions, applies the change, emits events, and returns the tool result.
 
-**Data flow**: From `ToolInvocation` it reads session, turn, diff tracker, call id, tool name, and payload. It requires `ToolPayload::Custom`, parses the patch text, validates optional environment selection, resolves the target environment and cwd, verifies the patch against the filesystem and sandbox, computes effective permissions, and then either returns immediate textual output from `apply_patch::apply_patch` or constructs protocol changes, emits begin/finish events, runs `ApplyPatchRuntime` via `ToolOrchestrator`, and wraps the final text in `ApplyPatchToolOutput` and `boxed_tool_output`. It writes externally through filesystem patch application, event emission, and possibly approval/runtime side effects.
+**Data flow**: It receives a full tool invocation → extracts the raw patch text → parses and verifies it → resolves the target environment and working directory → computes permissions → either applies the patch directly or sends an `ApplyPatchRequest` through the orchestrator/runtime → returns boxed tool output or an error message for the model.
 
-**Call relations**: Called by `ApplyPatchHandler::handle`. It is the main direct-tool execution path and shares permission logic with `intercept_apply_patch`; on the delegated branch it coordinates `ToolEmitter`, `ToolEventCtx`, `ApplyPatchRequest`, `ToolOrchestrator`, and `ApplyPatchRuntime`.
+**Call relations**: `handle` calls this for normal tool invocations. During the flow it calls helpers such as `require_environment_id` and `effective_patch_permissions`, may call the internal apply-patch path, and may hand execution to `ToolOrchestrator` and `ApplyPatchRuntime` while `ToolEmitter` reports begin and finish events.
 
 *Call graph*: calls 11 internal fn (apply_patch, convert_apply_patch_to_protocol, from_text, boxed_tool_output, apply_patch_for_environment, new, effective_patch_permissions, require_environment_id, resolve_tool_environment, new (+1 more)); called by 1 (handle); 5 external calls (parse_patch, verify_apply_patch_args, format!, RespondToModel, trace!).
 
@@ -328,11 +330,11 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this runtime accepts only custom/freeform payloads.
+**Purpose**: Checks whether a payload is the freeform custom kind that this handler understands. This prevents the handler from accepting structured payloads meant for some other tool.
 
-**Data flow**: It inspects the provided `ToolPayload` and returns `true` only for `ToolPayload::Custom { .. }`.
+**Data flow**: It receives a generic tool payload → tests whether it is `ToolPayload::Custom` → returns true if it can be handled and false otherwise.
 
-**Call relations**: Used by the core runtime before dispatch so JSON function payloads are rejected before reaching patch parsing.
+**Call relations**: The core tool runtime uses this when deciding whether an invocation belongs to this handler. If it matches, later steps can safely expect raw patch text.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -343,11 +345,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>>
 ```
 
-**Purpose**: Provides a streaming argument consumer that can parse partial patch text into progress events.
+**Purpose**: Creates a streaming patch-progress consumer for this tool. This allows the system to show partial patch updates while the model is still producing the patch.
 
-**Data flow**: It allocates a default `ApplyPatchArgumentDiffConsumer`, boxes it as a `dyn ToolArgumentDiffConsumer`, and returns it inside `Some`.
+**Data flow**: It receives the handler → creates a default `ApplyPatchArgumentDiffConsumer` with an empty streaming parser and no pending event → returns it boxed behind the common consumer interface.
 
-**Call relations**: The tool framework calls this when it wants incremental argument-diff handling for `apply_patch`; the returned consumer drives `PatchApplyUpdated` events.
+**Call relations**: The core tool runtime calls this when it wants to watch incoming tool-argument text. The returned consumer’s `consume_diff` and `finish` methods handle the live progress reporting.
 
 *Call graph*: 1 external calls (default).
 
@@ -358,11 +360,11 @@ fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>>
 fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload>
 ```
 
-**Purpose**: Builds the hook payload sent before tool execution, preserving the raw patch text as a command-shaped input.
+**Purpose**: Builds the payload sent to pre-tool-use hooks before an apply-patch call runs. A hook is custom code that can inspect or modify tool use at certain points.
 
-**Data flow**: It reads `invocation.payload`, extracts the patch string with `apply_patch_payload_command`, and if present returns `PreToolUsePayload` containing `HookToolName::apply_patch()` and JSON `{ "command": <patch> }`.
+**Data flow**: It receives the invocation → extracts the raw patch command from the payload → wraps it in JSON under `command` with the apply-patch hook tool name → returns that hook payload, or nothing if the payload is not suitable.
 
-**Call relations**: Invoked by hook infrastructure before execution. It depends on `apply_patch_payload_command` to ignore unsupported payload kinds.
+**Call relations**: The core runtime calls this before running the tool. It relies on `apply_patch_payload_command` to get the raw patch text that hook code expects.
 
 *Call graph*: calls 1 internal fn (apply_patch_payload_command).
 
@@ -377,11 +379,11 @@ fn with_updated_hook_input(
     ) -> Result<ToolInvocation, FunctionCallError>
 ```
 
-**Purpose**: Applies hook-modified command input back onto a tool invocation by replacing the freeform patch payload.
+**Purpose**: Applies changes made by a hook back onto the tool invocation. If a hook rewrites the patch command, this function replaces the invocation’s patch text with the updated version.
 
-**Data flow**: It takes a mutable `ToolInvocation` and a JSON value, extracts the updated patch string via `updated_hook_command`, and if the invocation currently has `ToolPayload::Custom` replaces its `input` with the new patch text. It returns the updated invocation or a `FunctionCallError` if the hook payload is invalid.
+**Data flow**: It receives an invocation and updated JSON hook input → extracts the updated command text with `updated_hook_command` → if the original payload was custom patch text, replaces it → returns the modified invocation.
 
-**Call relations**: Used in the hook round-trip after pre-tool hooks have had a chance to rewrite the patch command.
+**Call relations**: The hook flow calls this after a pre-tool-use hook has had a chance to edit the input. The returned invocation is what the normal apply-patch execution path then sees.
 
 *Call graph*: calls 1 internal fn (updated_hook_command).
 
@@ -396,11 +398,11 @@ fn post_tool_use_payload(
     ) -> Option<PostToolUsePayload>
 ```
 
-**Purpose**: Builds the hook payload emitted after tool execution, pairing the original patch command with the tool's serialized response.
+**Purpose**: Builds the payload sent to post-tool-use hooks after an apply-patch call finishes. It includes both what was requested and what response the tool produced.
 
-**Data flow**: It reads the invocation call id and payload plus the `ToolOutput`, asks the output for a post-tool-use response, re-extracts the patch command, and returns a `PostToolUsePayload` containing hook name, tool-use id, JSON command input, and the response payload.
+**Data flow**: It receives the original invocation and the tool output → asks the output for its hook-friendly response → extracts the original patch command → builds JSON containing the tool name, call id, input command, and response → returns it if all pieces are available.
 
-**Call relations**: Called by hook infrastructure after execution. It complements `pre_tool_use_payload` and depends on the output object supporting `post_tool_use_response` for this invocation.
+**Call relations**: The core runtime calls this after the tool finishes. It lets hook code observe the result of the same apply-patch action that `handle_call` executed.
 
 *Call graph*: calls 2 internal fn (apply_patch, post_tool_use_response); 1 external calls (json!).
 
@@ -417,11 +419,11 @@ async fn intercept_apply_patch(
     turn: Arc<Turn
 ```
 
-**Purpose**: Detects and executes `apply_patch` commands embedded in exec-like command arrays, reusing the same verification, permission, and runtime logic as the direct tool handler.
+**Purpose**: Detects when a shell-like command is actually an `apply_patch` command and safely reroutes it through the apply-patch machinery. If the command is not apply-patch, it leaves it alone.
 
-**Data flow**: Inputs are a command argv slice, cwd, filesystem, target environment, session/turn context, optional diff tracker, call id, and tool name. It verifies whether the argv represents a valid apply_patch command under the current sandbox; if not parseable as apply_patch it returns `Ok(None)`. For verified patches it computes effective permissions, executes inline or delegates through `ApplyPatchRuntime` and `ToolOrchestrator`, emits begin/finish events, and returns `Ok(Some(FunctionToolOutput))`. Correctness errors become `RespondToModel` failures.
+**Data flow**: It receives command words, filesystem context, environment, session, turn, optional diff tracker, call id, and tool name → tries to parse and verify the command as apply-patch → if it is not apply-patch, returns `None` → if it is valid, computes permissions and applies or delegates the patch → returns a function-tool output wrapped in `Some`.
 
-**Call relations**: Called by exec-like command handling (`run_exec_like`) and also referenced from the direct handler path. It is the interception counterpart to `ApplyPatchHandler::handle_call`, sharing the same delegated runtime flow.
+**Call relations**: Exec-like command handling calls this before running a command normally. When interception succeeds, it follows the same permission and runtime path as `handle_call`, including `effective_patch_permissions`, patch conversion, event emission, and orchestrated runtime execution.
 
 *Call graph*: calls 10 internal fn (apply_patch, convert_apply_patch_to_protocol, from_text, apply_patch_for_environment, new, effective_patch_permissions, new, new, plain, from_abs_path); called by 2 (run_exec_like, handle_call); 4 external calls (maybe_parse_apply_patch_verified, format!, RespondToModel, trace!).
 
@@ -435,24 +437,24 @@ fn require_environment_id(
 ) -> Result<Option<String>, FunctionCallError>
 ```
 
-**Purpose**: Validates whether an environment id parsed from patch input is allowed in the current turn configuration.
+**Purpose**: Enforces whether a patch is allowed to name a specific environment. This protects simpler turns from silently accepting environment selection when that feature is disabled.
 
-**Data flow**: It takes an optional parsed environment id and a boolean `allow_environment_id`. If an id is present while selection is disallowed, it returns a `RespondToModel` error; otherwise it returns `Ok(Some(id.to_string()))` or `Ok(None)`.
+**Data flow**: It receives an optional parsed environment id and a true-or-false flag saying whether environment ids are allowed → rejects the request if an id was supplied but not allowed → otherwise returns the id as an owned string, or returns nothing if no id was supplied.
 
-**Call relations**: Called by `ApplyPatchHandler::handle_call` before environment resolution. It isolates the policy check that gates multi-environment patch targeting.
+**Call relations**: `handle_call` calls this right after parsing the patch. Its result guides environment resolution before any filesystem verification or file editing happens.
 
 *Call graph*: called by 1 (handle_call); 1 external calls (RespondToModel).
 
 
 ### `core/src/apply_patch.rs`
 
-`domain_logic` · `tool-call interception and runtime delegation`
+`orchestration` · `request handling`
 
-This module wraps patch application in the same approval model used by other tools. `InternalApplyPatchInvocation` distinguishes two execution modes: `Output`, used when the call should terminate immediately with a `FunctionCallError`, and `DelegateToRuntime`, used when the runtime should realize the patch through the selected environment filesystem. The delegated form carries an `ApplyPatchRuntimeInvocation` containing the original `ApplyPatchAction`, whether the approval was automatic, and the `ExecApprovalRequirement` the runtime should enforce.
+This file is a gatekeeper for file edits. When the model proposes a patch, the system cannot simply write it to disk. It must first ask: is this allowed by the current sandbox rules, the user’s approval settings, and the working directory? Without this step, the assistant could make file changes in places it should not touch, or ask for approval inconsistently.
 
-`apply_patch` is the policy gate. It calls `assess_patch_safety` with the patch action, the current turn’s approval policy, permission profile, filesystem sandbox policy, patch cwd, and Windows sandbox level. If the result is `SafetyCheck::AutoApprove`, it delegates to runtime with `ExecApprovalRequirement::Skip` and marks `auto_approved` as the inverse of `user_explicitly_approved`, preserving whether the user had already approved the action. If the result is `AskUser`, it still delegates, but with `ExecApprovalRequirement::NeedsApproval` so the runtime can handle prompting and cached approvals consistently with shell execution. If the result is `Reject`, it returns `Output(Err(FunctionCallError::RespondToModel(...)))` with a concrete `patch rejected: ...` message.
+The main function, `apply_patch`, sends the proposed edit to the safety checker. A sandbox is a set of limits around what files or commands a tool may use, like a fenced work area. The safety checker returns one of three answers. If the patch is safe, this file tells the runtime to apply it. If the patch needs approval, it still passes the work to the runtime, but marks that user approval is required. If the patch is rejected, it returns an error message that can be shown back to the model.
 
-`convert_apply_patch_to_protocol` is a pure adapter that walks `ApplyPatchAction::changes()` and converts each `ApplyPatchFileChange` into the protocol `FileChange` enum, preserving add/delete contents and update diffs plus optional move paths while keying the result by owned `PathBuf`.
+The file also includes a translator, `convert_apply_patch_to_protocol`. The patch library has its own way of describing added, deleted, and updated files. The wider Codex protocol uses another shape for the same information. This function copies the patch into that protocol form so other parts of the system can report or process the file changes consistently.
 
 #### Function details
 
@@ -466,11 +468,11 @@ async fn apply_patch(
 ) -> InternalApplyPatchInvocation
 ```
 
-**Purpose**: Evaluates an `ApplyPatchAction` against the current turn’s approval and sandbox policy and decides whether to reject it immediately or hand it to the runtime with the correct approval requirement.
+**Purpose**: This function decides whether a proposed file patch may proceed, must ask the user first, or must be rejected. It is used when an `apply_patch` request is intercepted or handled as part of a tool call.
 
-**Data flow**: Takes `&TurnContext`, `&FileSystemSandboxPolicy`, and an owned `ApplyPatchAction`. It reads approval policy, permission profile, action cwd, and Windows sandbox level, passes them to `assess_patch_safety`, then maps `SafetyCheck::AutoApprove` to `InternalApplyPatchInvocation::DelegateToRuntime` with `ExecApprovalRequirement::Skip`, `SafetyCheck::AskUser` to `DelegateToRuntime` with `NeedsApproval`, and `SafetyCheck::Reject { reason }` to `Output(Err(FunctionCallError::RespondToModel(format!("patch rejected: {reason}"))))`.
+**Data flow**: It receives the current turn context, the active filesystem sandbox policy, and the patch action itself. It reads the user’s approval policy, permission profile, sandbox settings, working directory, and Windows sandbox level, then passes all of that to the safety checker. The result becomes either a runtime instruction to apply the patch, a runtime instruction that first requires approval, or an error message saying the patch was rejected.
 
-**Call relations**: Tool-call handlers invoke this when they detect an `apply_patch` request. It delegates all policy analysis to `assess_patch_safety` and leaves actual patch execution to the runtime when delegation is chosen.
+**Call relations**: When `handle_call` or `intercept_apply_patch` sees an `apply_patch` request, they call this function to make the safety decision. This function hands the decision to `assess_patch_safety`; if the patch can continue, it returns a `DelegateToRuntime` value so the runtime can actually perform the filesystem work. If the patch is unsafe, it returns an `Output` error using `RespondToModel`, so the model gets a clear rejection message instead of silently failing.
 
 *Call graph*: calls 2 internal fn (assess_patch_safety, permission_profile); called by 2 (handle_call, intercept_apply_patch); 4 external calls (DelegateToRuntime, Output, format!, RespondToModel).
 
@@ -483,22 +485,24 @@ fn convert_apply_patch_to_protocol(
 ) -> HashMap<PathBuf, FileChange>
 ```
 
-**Purpose**: Converts an internal `ApplyPatchAction` into the protocol-level `HashMap<PathBuf, FileChange>` representation used by downstream runtime or reporting code.
+**Purpose**: This function translates a patch from the internal patch library’s format into the project’s shared protocol format for file changes. It makes added, deleted, and updated files understandable to the rest of the system.
 
-**Data flow**: Reads `action.changes()`, preallocates a `HashMap` sized to the number of changes, matches each `ApplyPatchFileChange`, clones the relevant content/diff/move-path fields into the corresponding `FileChange::{Add,Delete,Update}` variant, inserts each under `path.to_path_buf()`, and returns the completed map.
+**Data flow**: It receives an `ApplyPatchAction`, reads each changed path and its change type, and builds a new map from file paths to protocol-level `FileChange` values. Added files carry their new content, deleted files carry the removed content, and updated files carry the text diff and any rename or move target. The returned map is a clean protocol-friendly summary of the patch.
 
-**Call relations**: Callers use this after deciding to process or delegate a patch so they can expose the patch in the protocol’s file-change schema.
+**Call relations**: After `handle_call` or `intercept_apply_patch` has an apply-patch action, they call this function when they need to describe the patch in protocol terms. The function gets the raw change list from the action through `changes`, prepares enough space for the result map, and hands back a converted view that other components can use without knowing the patch library’s internal types.
 
 *Call graph*: calls 1 internal fn (changes); called by 2 (handle_call, intercept_apply_patch); 1 external calls (with_capacity).
 
 
 ### `core/src/tools/runtimes/apply_patch.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling`
 
-This file defines the concrete runtime for the `apply_patch` tool and the request/output types that surround it. `ApplyPatchRequest` packages everything needed to execute a patch: the selected `TurnEnvironment`, the `ApplyPatchAction` containing patch text and cwd, the absolute file list used for approval caching, a `changes` map used when prompting for approval, and approval-policy fields such as `ExecApprovalRequirement`, optional `AdditionalPermissionProfile`, and a `permissions_preapproved` shortcut. `ApplyPatchRuntime` itself is stateful only in one place: it accumulates an `AppliedPatchDelta` in `committed_delta`, appending each run’s delta so callers can inspect the total set of committed edits across retries/escalations.
+This file is the runtime for the patch-editing tool. A patch is a compact set of text changes, like instructions saying “replace these lines in this file with those lines.” Earlier parts of the system inspect the patch and decide whether it is allowed. This runtime takes over after that: it turns the decision into a real file change, while still respecting approvals and sandbox limits.
 
-The runtime participates in two framework traits. As `Sandboxable`, it prefers automatic sandboxing and explicitly allows escalation after failure. As `Approvable`, it overrides the normal exec-approval path because patch approval is decided upstream by patch-safety assessment; it derives cache keys from `(environment_id, path)`, can route approval through Guardian review when a review id is present, honors preapproved permissions only on the first attempt, and otherwise requests patch approval from the session, optionally through `with_cached_approval`. For execution, `run` builds a `FileSystemSandboxContext` from the active `SandboxAttempt`, invokes `codex_apply_patch::apply_patch` against the turn environment filesystem, captures stdout/stderr bytes into strings, converts success/failure into an `ExecToolCallOutput`, appends the returned or partial delta, and upgrades likely sandbox-denial failures into a structured `SandboxErr::Denied`. A notable invariant is that even failed patch attempts may contribute a delta via `failure.into_parts().1`, preserving partial filesystem effects for downstream accounting.
+The main type, `ApplyPatchRuntime`, keeps a running record of the patch changes that have actually been committed. It also implements the common tool interfaces used by the orchestrator, which is the part of the program that coordinates tool calls. Through those interfaces it says: “I prefer to run in a sandbox if possible,” “if the sandbox blocks me, it is okay to try a higher-permission path,” and “use the patch-specific approval flow, not the generic command approval flow.”
+
+When a patch runs, the runtime gets the filesystem from the current turn environment. This matters because the same code can work for local and remote environments. It builds a filesystem sandbox context when needed, runs `codex_apply_patch::apply_patch`, captures standard output and error text, records the resulting file-change delta, and converts everything into the normal execution-output shape. If the patch failed in a way that looks like the sandbox denied access, it reports a sandbox-denied error so the orchestrator can react appropriately.
 
 #### Function details
 
@@ -508,11 +512,11 @@ The runtime participates in two framework traits. As `Sandboxable`, it prefers a
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a fresh runtime with no accumulated patch delta. It is the standard entry for creating the stateful executor instance used by the orchestrator or tests.
+**Purpose**: Creates a fresh patch runtime with no committed changes recorded yet. Code uses this when it is about to handle an `apply_patch` tool call or test the runtime’s behavior.
 
-**Data flow**: Takes no arguments beyond the implicit type context, delegates to `Default` for `ApplyPatchRuntime`, and returns a value whose `committed_delta` starts empty. It does not read or write external state.
+**Data flow**: Nothing is passed in. The function builds the default `ApplyPatchRuntime`, whose stored patch delta starts empty, and returns it to the caller.
 
-**Call relations**: Called by higher-level tool dispatch such as `handle_call` and `intercept_apply_patch`, and by tests that verify approval, sandbox cwd, and permission payload behavior. It does not orchestrate anything itself beyond creating the runtime object later consumed by approval and execution flows.
+**Call relations**: Higher-level tool handling code, such as the apply-patch interception and call-handling paths, creates this runtime before asking it for approval information or before running a patch. Tests also create it to check approval keys, permission payloads, sandbox working directories, and approval-policy behavior.
 
 *Call graph*: called by 6 (handle_call, intercept_apply_patch, approval_keys_include_environment_id, permission_request_payload_uses_apply_patch_hook_name_and_aliases, sandbox_cwd_uses_patch_action_cwd, wants_no_sandbox_approval_granular_respects_sandbox_flag); 1 external calls (default).
 
@@ -523,11 +527,11 @@ fn new() -> Self
 fn committed_delta(&self) -> &AppliedPatchDelta
 ```
 
-**Purpose**: Exposes the runtime’s accumulated `AppliedPatchDelta` as a shared reference. This lets callers inspect all patch effects recorded so far without cloning.
+**Purpose**: Returns the runtime’s record of file changes that have been committed so far. This lets other code inspect what the patch runtime has already applied.
 
-**Data flow**: Reads `self.committed_delta` and returns `&AppliedPatchDelta`. It performs no transformation and does not mutate runtime state.
+**Data flow**: It reads the `committed_delta` stored inside the runtime and gives back a shared reference to it. It does not copy the data and does not change anything.
 
-**Call relations**: Used as an accessor after one or more runs to observe the runtime’s persistent delta state. It is a leaf helper around the state that `run` updates.
+**Call relations**: This is a small viewing window into the runtime’s internal change log. After `ApplyPatchRuntime::run` appends newly applied changes, callers can use this function to see the accumulated result.
 
 
 ##### `ApplyPatchRuntime::build_guardian_review_request`  (lines 77–87)
@@ -539,11 +543,11 @@ fn build_guardian_review_request(
     ) -> GuardianApprovalRequest
 ```
 
-**Purpose**: Builds the patch-specific `GuardianApprovalRequest` payload sent when approval is delegated to Guardian review. The request includes the call id, cwd, touched files, and raw patch text so the reviewer sees full patch context.
+**Purpose**: Builds the request sent to the Guardian review system when a patch needs human or policy review. It packages the patch, working directory, files, and call id into the shape Guardian expects.
 
-**Data flow**: Consumes `req` and `call_id` by reading `req.action.cwd`, `req.file_paths`, and `req.action.patch`, cloning those values into a `GuardianApprovalRequest::ApplyPatch` with `id` set from `call_id`. It returns the assembled enum value and writes no state.
+**Data flow**: It takes the patch request and the tool call id. From the request it copies the current directory, affected file paths, and patch text, then returns a `GuardianApprovalRequest::ApplyPatch` value.
 
-**Call relations**: Invoked from `start_approval_async` only when the approval context already carries a `guardian_review_id`, meaning approval should be resolved through the Guardian review path instead of the normal session patch-approval prompt. Tests also call it to verify the review payload contains the expected patch context.
+**Call relations**: During approval, `ApplyPatchRuntime::start_approval_async` uses this when a Guardian review id is present. The resulting request is handed to `review_approval_request`, which performs the actual review flow.
 
 *Call graph*: called by 2 (start_approval_async, guardian_review_request_includes_patch_context).
 
@@ -557,11 +561,11 @@ fn file_system_sandbox_context_for_attempt(
     ) -> Option<FileSystemSandboxContext>
 ```
 
-**Purpose**: Translates the current generic `SandboxAttempt` plus request-specific extra permissions into the concrete filesystem sandbox context expected by the patch executor. It suppresses sandbox context entirely when the attempt explicitly runs with `SandboxType::None`.
+**Purpose**: Builds the filesystem sandbox settings for one attempt to apply a patch. A sandbox is a safety boundary that limits what files the patch can touch.
 
-**Data flow**: Reads `attempt.sandbox` and returns `None` immediately for unsandboxed execution. Otherwise it combines `attempt.permissions` with `req.additional_permissions` via `effective_permission_profile`, then constructs and returns `Some(FileSystemSandboxContext)` carrying the effective permissions, the attempt’s sandbox cwd, and Windows/landlock flags copied from the attempt.
+**Data flow**: It receives the patch request and the current sandbox attempt. If the attempt is not sandboxed, it returns nothing. Otherwise it combines the attempt’s permission profile with any extra permissions requested for this patch, then returns a `FileSystemSandboxContext` containing the allowed permissions, working directory, and platform-specific sandbox settings.
 
-**Call relations**: Used by `run` to derive the exact filesystem restrictions passed into `codex_apply_patch::apply_patch`. Tests exercise it to confirm the active attempt, not some static request property, determines the sandbox context.
+**Call relations**: The patch-running path uses this before calling the lower-level patch applier, so the applier knows what filesystem limits to enforce. Tests also check that the context reflects the active attempt rather than some unrelated default.
 
 *Call graph*: calls 1 internal fn (effective_permission_profile); called by 1 (file_system_sandbox_context_uses_active_attempt).
 
@@ -572,11 +576,11 @@ fn file_system_sandbox_context_for_attempt(
 fn sandbox_preference(&self) -> SandboxablePreference
 ```
 
-**Purpose**: Declares that this runtime prefers automatic sandbox selection by the framework. It does not force a specific sandbox mode itself.
+**Purpose**: Tells the orchestrator that this runtime should use the system’s automatic sandbox choice. In plain terms, the runtime is saying, “sandbox me when that is the right policy, but let the shared tool system decide the exact mode.”
 
-**Data flow**: Reads no inputs other than `self` and returns the constant `SandboxablePreference::Auto`. It has no side effects.
+**Data flow**: It reads no request data and returns `SandboxablePreference::Auto`. Nothing inside the runtime changes.
 
-**Call relations**: Consumed by the generic sandboxing/orchestration layer when deciding how to execute the tool. It is part of the runtime’s trait contract rather than local control flow.
+**Call relations**: The orchestrator asks this as part of preparing a tool execution. The answer feeds into the shared sandboxing machinery that decides how restrictive the first execution attempt should be.
 
 
 ##### `ApplyPatchRuntime::escalate_on_failure`  (lines 113–115)
@@ -585,11 +589,11 @@ fn sandbox_preference(&self) -> SandboxablePreference
 fn escalate_on_failure(&self) -> bool
 ```
 
-**Purpose**: Signals that a failed sandboxed patch attempt should be eligible for escalation and retry. This is important because patch application may fail solely due to sandbox restrictions.
+**Purpose**: Says that if a sandboxed patch attempt fails, the orchestrator may try again with broader permission when policy allows it. This is useful when a patch is safe but the first sandbox was too strict.
 
-**Data flow**: Returns the constant boolean `true` and does not inspect or mutate any state.
+**Data flow**: It takes no extra information and returns `true`. It does not change the runtime.
 
-**Call relations**: Read by the surrounding sandbox orchestration logic after failures to decide whether to attempt a less restrictive execution path. It complements `run`, which specifically classifies likely sandbox denials.
+**Call relations**: The shared tool runner checks this after a failed sandboxed attempt. Combined with sandbox-denied detection in `ApplyPatchRuntime::run`, it helps the orchestrator decide whether asking for more access or retrying makes sense.
 
 
 ##### `ApplyPatchRuntime::approval_keys`  (lines 121–130)
@@ -598,11 +602,11 @@ fn escalate_on_failure(&self) -> bool
 fn approval_keys(&self, req: &ApplyPatchRequest) -> Vec<Self::ApprovalKey>
 ```
 
-**Purpose**: Computes the cache keys used to reuse prior patch approvals on a per-environment, per-file basis. Including `environment_id` prevents approvals from leaking across different turn environments even for the same path.
+**Purpose**: Creates cache keys for patch approval, one per file being changed. These keys let the system remember that a particular file in a particular environment was already approved, instead of asking repeatedly for the same thing.
 
-**Data flow**: Reads `req.turn_environment.environment_id` and iterates over `req.file_paths`, cloning each absolute path into an `ApplyPatchApprovalKey { environment_id, path }`. It returns a `Vec<ApplyPatchApprovalKey>` and does not mutate runtime state.
+**Data flow**: It reads the request’s environment id and list of absolute file paths. For each path, it creates an `ApplyPatchApprovalKey` containing that environment id and path, then returns the full list.
 
-**Call relations**: Called by `start_approval_async` before entering the cached-approval path. Its output feeds `with_cached_approval`, which decides whether the user must be prompted again for the same environment/file combination.
+**Call relations**: `ApplyPatchRuntime::start_approval_async` calls this before using cached approval. The environment id is included so approval for a file in one workspace is not accidentally reused for a different workspace.
 
 *Call graph*: called by 1 (start_approval_async).
 
@@ -617,11 +621,11 @@ fn start_approval_async(
     ) -> BoxFuture<'a, ReviewDecision>
 ```
 
-**Purpose**: Implements the full asynchronous approval decision tree for patch execution, including Guardian review, preapproved permissions, retry prompts with reasons, and cached patch approval requests. It is the patch-specific override that ensures the orchestrator uses patch approval semantics instead of generic exec approval.
+**Purpose**: Starts the approval process for a patch and returns the final review decision. It chooses between Guardian review, preapproval, retry approval, and cached normal patch approval.
 
-**Data flow**: Reads the request, approval context, session, turn, call id, retry reason, optional guardian review id, and cloned `changes`. It first computes approval keys from `approval_keys`; if a Guardian review id exists, it builds a `GuardianApprovalRequest` with `build_guardian_review_request` and awaits `review_approval_request`. Otherwise, if `permissions_preapproved` is true and there is no retry reason, it returns `ReviewDecision::Approved` immediately. If there is a retry reason, it asks the session for patch approval with that reason and awaits the returned receiver, defaulting on channel failure. In the normal first-attempt path, it wraps the same session approval request in `with_cached_approval` keyed as `apply_patch`, returning the resulting `ReviewDecision`.
+**Data flow**: It receives the patch request plus approval context such as the session, turn, call id, retry reason, and optional Guardian review id. It gathers approval keys and patch changes, then launches an asynchronous approval task. The task returns a `ReviewDecision`, usually approved or denied, after asking the right approval source.
 
-**Call relations**: Invoked by the generic approval framework whenever this tool needs an approval decision before execution or escalation. Depending on context, it delegates either to Guardian review or to `session.request_patch_approval`, and uses `with_cached_approval` only for the non-retry, non-Guardian path so repeated approvals can be skipped safely.
+**Call relations**: The orchestrator calls this when a patch needs permission before execution. If Guardian review is active, it builds a Guardian request and hands it to `review_approval_request`. If permissions were already preapproved and this is not a retry, it immediately approves. If this is a retry, it asks the session for patch approval with the retry reason. Otherwise it wraps the session approval request in `with_cached_approval` so repeated approvals can be reused safely.
 
 *Call graph*: calls 3 internal fn (approval_keys, build_guardian_review_request, with_cached_approval); 2 external calls (pin, review_approval_request).
 
@@ -632,11 +636,11 @@ fn start_approval_async(
 fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool
 ```
 
-**Purpose**: Determines whether the runtime should ask for approval before running without a sandbox under the current `AskForApproval` policy. The logic treats most interactive or failure-based policies as requiring approval, while respecting granular sandbox-specific configuration.
+**Purpose**: Decides whether this patch runtime wants the user to be asked before running without a sandbox. Running without a sandbox means the patch has fewer filesystem safety limits, so the approval policy matters.
 
-**Data flow**: Consumes an `AskForApproval` enum and pattern-matches it. It returns `false` for `Never`, delegates `Granular` to `granular_config.allows_sandbox_approval()`, and returns `true` for `OnFailure`, `OnRequest`, and `UnlessTrusted`.
+**Data flow**: It receives the current approval policy. For `Never`, it returns false. For granular approval, it follows the granular setting for sandbox approval. For on-failure, on-request, and unless-trusted policies, it returns true.
 
-**Call relations**: Used by the approval/sandbox orchestration layer when deciding whether an unsandboxed retry needs explicit user approval. Tests cover the granular-policy branch to ensure sandbox flags are honored.
+**Call relations**: The orchestrator consults this when a patch might need to run outside the sandbox. This function translates the broad approval policy into the patch runtime’s yes-or-no preference for that specific situation.
 
 
 ##### `ApplyPatchRuntime::exec_approval_requirement`  (lines 197–202)
@@ -648,11 +652,11 @@ fn exec_approval_requirement(
     ) -> Option<ExecApprovalRequirement>
 ```
 
-**Purpose**: Overrides the generic exec approval requirement with the patch-specific requirement already computed upstream. This prevents the orchestrator from substituting the global exec policy for a tool whose approval was assessed by patch-safety logic.
+**Purpose**: Returns the approval requirement that was already computed for this patch. This prevents the generic command-execution approval rules from overriding the patch-specific safety decision made earlier.
 
-**Data flow**: Reads `req.exec_approval_requirement`, clones it, wraps it in `Some`, and returns it. It does not mutate any state.
+**Data flow**: It reads `exec_approval_requirement` from the patch request, clones it, wraps it in `Some`, and returns it. It does not change the request or runtime.
 
-**Call relations**: Queried by the generic approval framework before execution. Its role is to redirect approval handling back to the patch-specific path represented by `start_approval_async`.
+**Call relations**: The shared tool orchestration asks for this while deciding whether approval is needed. This runtime deliberately supplies the upstream patch assessment result, so the approval flow matches the patch review rather than treating the patch like an ordinary shell command.
 
 
 ##### `ApplyPatchRuntime::permission_request_payload`  (lines 204–212)
@@ -664,11 +668,11 @@ fn permission_request_payload(
     ) -> Option<PermissionRequestPayload>
 ```
 
-**Purpose**: Builds the structured permission-request payload shown when the system needs to ask for elevated permissions for this tool. It identifies the tool using the `apply_patch` hook name and includes the patch text as the command-like input.
+**Purpose**: Builds the permission-request description shown or sent when this patch asks for extra access. It labels the request as `apply_patch` and includes the patch text as the command-like input.
 
-**Data flow**: Reads `req.action.patch`, constructs a `PermissionRequestPayload` with `tool_name` set from `HookToolName::apply_patch()` and `tool_input` set to JSON `{ "command": req.action.patch }`, and returns it inside `Some`. It writes no state.
+**Data flow**: It reads the patch text from the request. It creates a `PermissionRequestPayload` with the apply-patch hook name and a JSON object containing the patch text, then returns it.
 
-**Call relations**: Consumed by the sandbox/approval UI path when a permission prompt must describe what `apply_patch` is trying to do. Tests verify that the hook name and aliasing are correct.
+**Call relations**: The approval and hook machinery uses this payload when it needs to explain what permission is being requested. By using the apply-patch hook name, it connects the request to patch-specific policy or integrations rather than generic execution handling.
 
 *Call graph*: calls 1 internal fn (apply_patch); 1 external calls (json!).
 
@@ -679,11 +683,11 @@ fn permission_request_payload(
 fn sandbox_cwd(&self, req: &'a ApplyPatchRequest) -> Option<&'a AbsolutePathBuf>
 ```
 
-**Purpose**: Supplies the working directory that sandbox setup should treat as the tool’s cwd. For patch application, this is exactly the cwd embedded in the `ApplyPatchAction`.
+**Purpose**: Tells the sandboxing system which directory should be treated as the patch’s working directory. This keeps relative paths in the patch anchored in the same place the patch author intended.
 
-**Data flow**: Reads `req.action.cwd` and returns `Some(&AbsolutePathBuf)` referencing that path. It performs no allocation or mutation.
+**Data flow**: It receives the patch request and returns a reference to `req.action.cwd`. It does not allocate new data or change anything.
 
-**Call relations**: Called by the generic tool runtime framework while preparing sandbox attempts. Tests verify that it points at the patch action’s cwd rather than some other environment path.
+**Call relations**: Before running the tool, the shared sandbox setup asks for this directory. The returned path becomes the sandbox working directory used for the patch attempt.
 
 
 ##### `ApplyPatchRuntime::run`  (lines 220–267)
@@ -697,11 +701,11 @@ async fn run(
     ) -> Result<ApplyPatchRuntimeOutput, ToolError>
 ```
 
-**Purpose**: Executes the patch against the turn environment filesystem under the current sandbox attempt, captures textual output, records the resulting delta, and converts sandbox-denied failures into a structured tool error. It is the core operational path of the file.
+**Purpose**: Actually applies the patch and turns the result into normal tool output. It is the point where an approved patch becomes real file changes.
 
-**Data flow**: Reads the request’s turn environment, patch text, cwd, and optional extra permissions, plus the active `SandboxAttempt`. It records `Instant::now()`, obtains the filesystem from `req.turn_environment.environment`, derives an optional `FileSystemSandboxContext` via `file_system_sandbox_context_for_attempt`, and passes patch/cwd/output buffers/filesystem/sandbox into `codex_apply_patch::apply_patch`. After awaiting the result, it decodes stdout and stderr from collected bytes, computes `failed` and `exit_code`, extracts either the successful delta or the partial delta from the failure, and appends that delta into `self.committed_delta`. It then builds an `ExecToolCallOutput` with stdout, stderr, concatenated aggregated output, elapsed duration, and `timed_out: false`. If the run failed and `is_likely_sandbox_denied` says the output matches a sandbox denial for the current sandbox type, it returns `Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { ... })))`; otherwise it returns `Ok(ApplyPatchRuntimeOutput { exec_output, delta: self.committed_delta.clone() })`.
+**Data flow**: It receives the patch request, the current sandbox attempt, and tool context. It notes the start time, gets the right filesystem from the turn environment, builds sandbox settings when needed, and calls the lower-level patch applier with the patch text and working directory. It captures stdout and stderr, turns them into strings, records whether the patch succeeded, appends the resulting file-change delta to the runtime’s committed delta, and returns an `ApplyPatchRuntimeOutput` containing execution output and the accumulated delta. If the failure looks like the sandbox blocked access, it returns a sandbox-denied error instead.
 
-**Call relations**: Invoked by the generic tool execution framework after approval and sandbox selection are complete. It delegates actual patch application to `codex_apply_patch::apply_patch`, uses `file_system_sandbox_context_for_attempt` to align execution with the chosen attempt, and feeds failure classification back into the orchestrator so escalation-on-failure can distinguish sandbox denials from ordinary patch errors.
+**Call relations**: The orchestrator calls this after approval and sandbox setup are complete. This function hands the actual editing work to `codex_apply_patch::apply_patch`, then reports back in the common execution-output format used by other tools. Its sandbox-denied error is important because the surrounding tool runner can use that signal to decide whether a retry or escalation path is appropriate.
 
 *Call graph*: calls 3 internal fn (append, is_likely_sandbox_denied, new); 10 external calls (new, now, file_system_sandbox_context_for_attempt, from_utf8_lossy, new, clone, apply_patch, Codex, format!, Sandbox).
 
@@ -711,15 +715,15 @@ These files turn raw patch text or invocation syntax into validated structured p
 
 ### `apply-patch/src/streaming_parser.rs`
 
-`domain_logic` · `incremental patch parsing during tool input streaming`
+`domain_logic` · `while patch text is streaming, then final validation at completion`
 
-This module defines `StreamingPatchParser`, a stateful line-oriented parser for the apply-patch format. The parser stores a partial `line_buffer`, a monotonically increasing `line_number`, and a `StreamingParserState` containing the current mode, accumulated `Vec<Hunk>`, and optional `environment_id`. Modes track whether parsing has not started, is between hunks, is inside add/delete/update hunks, or has already seen `*** End Patch`.
+A normal patch parser usually waits until it has the whole patch. This file is different: it reads small pieces of text, remembers unfinished lines, and emits the patch hunks it has fully understood so far. That matters when patch text is streamed from another process or model response, because the rest of the system can see progress without waiting for the final byte.
 
-`push_delta` accepts arbitrary text fragments, appends characters until newline boundaries, strips a single trailing `\r` from completed lines, increments the line counter, and feeds each complete line into `process_line`. `finish` handles a final unterminated line, allows a trailing `*** End Patch` without newline, and rejects inputs that never reached `EndedPatch`.
+The main type, StreamingPatchParser, works like a careful reader with a bookmark. It keeps a line buffer for text that has arrived but has not yet ended with a newline, a line number for useful error messages, and a state that says where it is in the patch: before the start marker, inside an add/delete/update section, or after the end marker.
 
-`process_line` is the core state machine. In `StartedPatch`, only environment ID lines, hunk headers, or end-patch are accepted. Add-file hunks collect only `+` lines into a single `contents` string. Delete-file hunks accept no body. Update-file hunks support an optional leading `*** Move to:` before any chunks, explicit `@@` or `@@ context` chunk headers, bare empty lines as context, ordinary context/add/remove lines, and `*** End of File` markers that set `UpdateFileChunk::is_end_of_file`. The parser carefully distinguishes true hunk headers from indented lines that merely look like markers, and it validates that update hunks are not empty and that empty chunks are rejected before another header or EOF. After `*** End Patch`, only whitespace-only trailing lines are tolerated.
+The parser recognizes patch headers such as “begin patch,” “add file,” “delete file,” “update file,” “move to,” context markers, and “end patch.” For added files it collects lines that start with “+”. For updated files it builds chunks containing old lines, new lines, and unchanged context lines. It also accepts an optional environment ID near the top of the patch.
 
-The extensive tests cover streaming by partial lines and single characters, environment ID handling, CRLF behavior, EOF markers, final-line-without-newline handling, and many exact error cases.
+A key safety rule is that update sections cannot be empty. The parser checks this before moving to another section or ending the patch, so malformed patches fail early with a clear message.
 
 #### Function details
 
@@ -729,11 +733,11 @@ The extensive tests cover streaming by partial lines and single characters, envi
 fn environment_id(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the parsed environment ID, if one has been seen in the patch preamble.
+**Purpose**: Returns the optional environment ID that was read from the patch header. Callers use this when a patch says which environment it is meant for.
 
-**Data flow**: It reads `self.state.environment_id`, converts the internal `Option<String>` to `Option<&str>` with `as_deref`, and returns that borrowed view without mutation.
+**Data flow**: It reads the parser’s saved environment ID, if one has been seen. It returns a borrowed text value when present, or nothing when the patch did not include one. It does not change the parser.
 
-**Call relations**: This accessor is used after parsing completes so wrapper code such as `parse_patch_text` can include the environment ID in `ApplyPatchArgs`.
+**Call relations**: This is a simple lookup method. After incoming text has been fed through the parser, other code can ask this method whether an environment ID was discovered.
 
 
 ##### `StreamingPatchParser::ensure_update_hunk_is_not_empty`  (lines 53–82)
@@ -742,11 +746,11 @@ fn environment_id(&self) -> Option<&str>
 fn ensure_update_hunk_is_not_empty(&self, line: &str) -> Result<(), ParseError>
 ```
 
-**Purpose**: Validates that the current update hunk has at least one non-empty chunk before another header or patch end is accepted.
+**Purpose**: Checks that the current update-file section actually contains changed or context lines. This prevents an update header from being accepted as a real patch when it has no body.
 
-**Data flow**: It inspects the last accumulated hunk and current parser mode. If the last hunk is an `UpdateFile` with no chunks, it returns `InvalidHunkError` using the stored update hunk start line; if the last chunk exists but both `old_lines` and `new_lines` are empty, it returns either an end-of-patch-specific or unexpected-line-specific error based on the supplied `line`. Otherwise it returns `Ok(())`.
+**Data flow**: It receives the current line being considered, then looks at the parser’s latest hunk and current mode. If the latest update hunk has no chunks, or its newest chunk has no old or new lines, it returns a parse error with a useful line number. If the update has real content, it returns success and changes nothing.
 
-**Call relations**: This guard is called from `handle_hunk_headers_and_end_patch` whenever a new header or `*** End Patch` would terminate the current update hunk, and from `finish` when the final unterminated line is the end marker.
+**Call relations**: This guard is used before the parser accepts a new hunk header or the final end marker in StreamingPatchParser::handle_hunk_headers_and_end_patch. StreamingPatchParser::finish also uses it when the final buffered line is an end marker, so incomplete updates are rejected at the end too.
 
 *Call graph*: called by 2 (finish, handle_hunk_headers_and_end_patch); 1 external calls (format!).
 
@@ -757,11 +761,11 @@ fn ensure_update_hunk_is_not_empty(&self, line: &str) -> Result<(), ParseError>
 fn handle_hunk_headers_and_end_patch(&mut self, trimmed: &str) -> Result<bool, ParseError>
 ```
 
-**Purpose**: Recognizes top-level control lines—environment ID, hunk headers, and end-patch—and updates parser state accordingly.
+**Purpose**: Looks for patch-level control lines: environment ID, end of patch, add file, delete file, and update file. It starts new hunks or closes the patch when one of those lines appears.
 
-**Data flow**: It takes a trimmed line, checks for an environment ID only while in `StartedPatch`, validates uniqueness and non-emptiness, and stores it in `self.state.environment_id`. It also recognizes `END_PATCH_MARKER`, add/delete/update hunk headers, calls `ensure_update_hunk_is_not_empty` before transitioning away from an update hunk, pushes the corresponding `Hunk` variant into `self.state.hunks`, updates `self.state.mode`, and returns `Ok(true)` when it consumed the line; otherwise `Ok(false)`.
+**Data flow**: It receives a trimmed line of patch text. If the line is an environment ID, it records it after checking it is present only once and not empty. If the line is an end marker or a new hunk header, it first checks that any current update hunk is not empty, then updates the parser state and adds the right hunk object. It returns true when it consumed the line as a header or end marker, and false when the line is ordinary hunk content.
 
-**Call relations**: This helper is invoked from `process_line` in several modes to centralize header recognition. It is the mechanism by which the parser transitions between hunk bodies and top-level patch structure.
+**Call relations**: StreamingPatchParser::process_line calls this whenever a line might be a structural marker. This keeps the header-recognition rules in one place, while process_line can focus on what is valid inside each current mode.
 
 *Call graph*: calls 1 internal fn (ensure_update_hunk_is_not_empty); called by 1 (process_line); 4 external calls (from, new, new, matches!).
 
@@ -772,11 +776,11 @@ fn handle_hunk_headers_and_end_patch(&mut self, trimmed: &str) -> Result<bool, P
 fn push_delta(&mut self, delta: &str) -> Result<Vec<Hunk>, ParseError>
 ```
 
-**Purpose**: Consumes an arbitrary text fragment, emits completed lines into the parser state machine, and returns the hunks parsed so far.
+**Purpose**: Feeds a new piece of streamed patch text into the parser. It is the main method used while data is still arriving.
 
-**Data flow**: It iterates over `delta.chars()`, appending non-newline characters to `self.line_buffer`. On each `\n`, it takes the buffered line, strips one trailing `\r` if present, increments `self.line_number`, and passes the line to `process_line`. After processing all characters it returns a clone of `self.state.hunks`.
+**Data flow**: It receives a text fragment, which may contain many lines, one full line, or only part of a line. It adds characters to an internal line buffer until it sees a newline. Each complete line is removed from the buffer, normalized for Windows-style line endings, counted, and passed to StreamingPatchParser::process_line. It returns a clone of the hunks parsed so far, or an error if the new text breaks the patch format.
 
-**Call relations**: This is the incremental ingestion API used by higher-level streaming code and tests. It delegates all syntax decisions to `process_line` while preserving partial-line state across calls.
+**Call relations**: This is the streaming entry point for the parser. As each fragment arrives, it delegates complete lines to StreamingPatchParser::process_line and keeps incomplete trailing text for a later call.
 
 *Call graph*: calls 1 internal fn (process_line); called by 1 (push_delta); 1 external calls (take).
 
@@ -787,11 +791,11 @@ fn push_delta(&mut self, delta: &str) -> Result<Vec<Hunk>, ParseError>
 fn finish(&mut self) -> Result<Vec<Hunk>, ParseError>
 ```
 
-**Purpose**: Finalizes parsing after the last input fragment, processing any unterminated final line and enforcing that the patch ended correctly.
+**Purpose**: Finalizes parsing after no more text will arrive. It validates that the patch really ended with the required end marker.
 
-**Data flow**: If `self.line_buffer` is non-empty, it takes that line, increments `line_number`, and either treats a trimmed end marker specially or sends the line through `process_line`. It then checks that `self.state.mode` is `EndedPatch`; if not, it returns `InvalidPatchError` for a missing end marker. On success it returns a clone of the accumulated hunks.
+**Data flow**: It first checks whether the line buffer still contains a final line without a newline. If so, it processes that line or treats it as the end marker. Then it verifies that the parser reached the ended state. On success it returns the parsed hunks; on failure it returns an error saying the patch must end with “*** End Patch”.
 
-**Call relations**: Called after the last `push_delta` by wrapper code such as `parse_patch_text` or streaming completion logic. It complements `push_delta` by handling the common case where the final line lacks a trailing newline.
+**Call relations**: This is called by the completion path, noted as finish_update_on_complete in the call graph. It uses StreamingPatchParser::process_line for ordinary final content and StreamingPatchParser::ensure_update_hunk_is_not_empty when the last buffered line is the end marker.
 
 *Call graph*: calls 2 internal fn (ensure_update_hunk_is_not_empty, process_line); called by 1 (finish_update_on_complete); 2 external calls (matches!, take).
 
@@ -802,11 +806,11 @@ fn finish(&mut self) -> Result<Vec<Hunk>, ParseError>
 fn process_line(&mut self, line: &str) -> Result<(), ParseError>
 ```
 
-**Purpose**: Implements the parser state machine for every complete line of patch input.
+**Purpose**: Interprets one complete line according to where the parser currently is in the patch. This is the core state machine: it decides what each line means and whether it is valid.
 
-**Data flow**: It receives a raw line, derives `trimmed` and sometimes `trim_end()` variants, and branches on `self.state.mode`. Depending on mode it may validate the begin marker, delegate header recognition to `handle_hunk_headers_and_end_patch`, append add-file contents, reject invalid delete-file bodies, parse update-file move directives and chunk headers, append context/add/remove lines into `UpdateFileChunk` vectors, mark EOF chunks, or emit precise `InvalidPatchError` / `InvalidHunkError` values with `self.line_number`. It mutates parser mode, hunk vectors, chunk contents, and environment ID as needed and otherwise returns `Ok(())`.
+**Data flow**: It receives one full line. It trims or preserves parts of the line depending on context, then checks the current parser mode. Before the patch starts, it only accepts the begin marker. In add-file mode, it appends “+” lines to the new file contents. In delete-file mode, it only allows the next header or the end marker. In update-file mode, it records move targets, chunk headers, context lines, added lines, removed lines, and end-of-file markers. It updates the parser’s stored hunks and mode, or returns a detailed parse error.
 
-**Call relations**: This is the central parser routine called by both `push_delta` and `finish`. It relies on `handle_hunk_headers_and_end_patch` for shared header transitions and embodies all line-level grammar and validation rules.
+**Call relations**: StreamingPatchParser::push_delta calls this for every completed incoming line, and StreamingPatchParser::finish calls it for a final line without a newline. It calls StreamingPatchParser::handle_hunk_headers_and_end_patch first when a line might start a new section or end the patch.
 
 *Call graph*: calls 1 internal fn (handle_hunk_headers_and_end_patch); called by 2 (finish, push_delta); 4 external calls (from, new, new, format!).
 
@@ -817,11 +821,11 @@ fn process_line(&mut self, line: &str) -> Result<(), ParseError>
 fn test_streaming_patch_parser_streams_complete_lines_before_end_patch()
 ```
 
-**Purpose**: Verifies that partial input only affects parser output once complete lines arrive and that multiple hunk types stream correctly.
+**Purpose**: Checks that the parser reports hunks as soon as complete lines are available, even before the final end marker arrives. It also checks add, update-with-move, delete, and multiple hunk cases.
 
-**Data flow**: It creates fresh parsers, feeds patch fragments in pieces, inspects the `Vec<Hunk>` returned by `push_delta`, and asserts that only completed lines contribute to visible parsed hunks.
+**Data flow**: The test creates fresh parsers, feeds them partial patch strings, and compares the returned hunks with expected structured results. It confirms that an incomplete line is not parsed until its newline arrives, while completed hunks appear immediately.
 
-**Call relations**: This test exercises the incremental contract of `push_delta`, especially buffering behavior across fragmented input.
+**Call relations**: This test calls the public streaming method on StreamingPatchParser. It supports the bigger streaming flow by proving that callers can safely observe progress before the patch is finished.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -832,11 +836,11 @@ fn test_streaming_patch_parser_streams_complete_lines_before_end_patch()
 fn test_streaming_patch_parser_environment_id_mode()
 ```
 
-**Purpose**: Checks successful environment ID capture and rejection of duplicate or empty environment ID declarations.
+**Purpose**: Checks the optional environment ID feature. It verifies that a valid ID is stored, while duplicate or blank IDs are rejected.
 
-**Data flow**: It pushes patches containing valid, repeated, and blank `*** Environment ID:` lines, then asserts either parsed hunks plus `environment_id()` output or the exact `InvalidPatchError`.
+**Data flow**: The test feeds patches containing environment ID lines into new parsers. It then compares parsed hunks and reads back the saved environment ID, or checks that the right parse errors are returned.
 
-**Call relations**: This test targets the environment-ID branch inside `handle_hunk_headers_and_end_patch` and the accessor used after parsing.
+**Call relations**: This test exercises the path where StreamingPatchParser::process_line delegates header-like lines to StreamingPatchParser::handle_hunk_headers_and_end_patch, which records or rejects the environment ID.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -847,11 +851,11 @@ fn test_streaming_patch_parser_environment_id_mode()
 fn test_streaming_patch_parser_large_patch_split_by_character()
 ```
 
-**Purpose**: Stress-tests character-by-character streaming on a large mixed patch and ensures hunk counts only grow monotonically.
+**Purpose**: Checks that the parser still works when a large patch arrives one character at a time. This simulates the most fragmented possible stream.
 
-**Data flow**: It iterates over every character of a long patch, calling `push_delta` with one-character strings, tracking returned hunk counts, and asserting both monotonic growth and the final sequence of hunk operation kinds.
+**Data flow**: The test sends each character of a multi-file patch through the parser separately. It records when the number of parsed hunks increases, then confirms the hunk count never goes backward and the final hunk types match the patch.
 
-**Call relations**: This test validates that the parser is safe for highly fragmented streamed tool input and that intermediate snapshots remain consistent.
+**Call relations**: This test stresses StreamingPatchParser::push_delta and its line buffer. It proves the parser does not depend on receiving neat line-sized chunks from its caller.
 
 *Call graph*: 4 external calls (new, default, assert!, assert_eq!).
 
@@ -862,11 +866,11 @@ fn test_streaming_patch_parser_large_patch_split_by_character()
 fn test_streaming_patch_parser_keeps_indented_update_markers_as_context_lines()
 ```
 
-**Purpose**: Ensures that lines beginning with a space and then a marker-looking string are treated as update context, not as new hunk headers.
+**Purpose**: Checks that a marker-looking line inside an update is treated as normal content when it is indented with a leading space. This matters because real file content may contain text that resembles patch headers.
 
-**Data flow**: It parses an update hunk containing a context line ` *** Update File: b.txt`, then asserts that this text is preserved in both `old_lines` and `new_lines` of the current chunk rather than splitting the hunk.
+**Data flow**: The test feeds an update patch where “*** Update File” appears with a leading space inside the changed content. It expects that text to be stored as an unchanged context line rather than starting a new file update.
 
-**Call relations**: This test covers a subtle branch in `process_line` where raw line prefixes, not trimmed content alone, determine whether a line is diff content or a structural marker.
+**Call relations**: This test protects the distinction made in StreamingPatchParser::process_line between real headers and update content. It shows why preserving the leading character of update lines is important.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -877,11 +881,11 @@ fn test_streaming_patch_parser_keeps_indented_update_markers_as_context_lines()
 fn test_streaming_patch_parser_preserves_bare_empty_update_lines()
 ```
 
-**Purpose**: Verifies that a completely empty line inside an update hunk is preserved as an empty context line.
+**Purpose**: Checks that an empty line inside an update hunk is treated as an empty context line. This keeps the streaming parser compatible with the normal parser’s more forgiving behavior.
 
-**Data flow**: It parses an update patch with a blank line between two context lines and asserts that both `old_lines` and `new_lines` contain `String::new()` at the corresponding position.
+**Data flow**: The test sends an update containing a blank line between two context lines. It expects the parsed old and new line lists to include an empty string in that position.
 
-**Call relations**: This test documents the parser’s lenient handling of bare empty lines in update hunks, matching the non-streaming parser behavior.
+**Call relations**: This test focuses on StreamingPatchParser::process_line in update mode. It guards the rule that a bare empty line can be meaningful file content, not just whitespace to ignore.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -892,11 +896,11 @@ fn test_streaming_patch_parser_preserves_bare_empty_update_lines()
 fn test_streaming_patch_parser_ignores_empty_lines_after_end_of_file()
 ```
 
-**Purpose**: Checks that blank lines after `*** End of File` do not invalidate the current update hunk before patch end.
+**Purpose**: Checks that blank lines after an end-of-file marker inside an update do not cause an error. This allows a little harmless spacing before the patch end marker.
 
-**Data flow**: It parses a patch containing an EOF marker followed by an empty line and asserts successful parsing with `is_end_of_file: true` on the chunk.
+**Data flow**: The test feeds an update hunk with an added line, an end-of-file marker, then an empty line before the patch ends. It expects the update chunk to be accepted and marked as ending at the file end.
 
-**Call relations**: This test exercises the update-mode logic that permits empty lines after EOF markers but still requires the next non-empty line to be a new chunk header or patch end.
+**Call relations**: This test covers a special branch in StreamingPatchParser::process_line for update mode after an end-of-file marker. It makes sure only empty lines are ignored there, while other unexpected content would still fail.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -907,11 +911,11 @@ fn test_streaming_patch_parser_ignores_empty_lines_after_end_of_file()
 fn test_streaming_patch_parser_matches_line_ending_behavior()
 ```
 
-**Purpose**: Confirms that CRLF input is normalized correctly while preserving embedded carriage returns that are part of actual line content.
+**Purpose**: Checks how the streaming parser treats Windows-style line endings. It ensures normal carriage-return-plus-newline endings are stripped correctly, while an extra carriage return that is part of the content is preserved.
 
-**Data flow**: It feeds patches using `\r\n` line endings, including one line ending with an extra literal `\r` before newline, and asserts the resulting chunk contents preserve only the intended embedded carriage return.
+**Data flow**: The test feeds two patches with carriage returns. In the normal case, parsed lines contain clean text. In the extra-carriage-return case, the extra character remains in the removed line as expected.
 
-**Call relations**: This test validates the `push_delta` logic that strips at most one trailing `\r` from each completed line.
+**Call relations**: This test exercises the newline handling in StreamingPatchParser::push_delta before lines are passed to StreamingPatchParser::process_line. It protects compatibility with patches produced on different operating systems.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -922,11 +926,11 @@ fn test_streaming_patch_parser_matches_line_ending_behavior()
 fn test_streaming_patch_parser_finish_processes_final_line_without_newline()
 ```
 
-**Purpose**: Ensures `finish` correctly handles a final patch line that was never terminated by `\n`.
+**Purpose**: Checks that finishing the parser handles a final line even when the stream did not end with a newline. Many text streams can end this way, so the parser must not lose that last line.
 
-**Data flow**: It pushes patches whose last line lacks a newline, then calls `finish` and asserts successful final hunk output for both add-file and update-file cases.
+**Data flow**: The test feeds patches whose final end marker lacks a trailing newline. It first observes the hunks returned during streaming, then calls finish and expects the same valid hunks back.
 
-**Call relations**: This test covers the handoff between `push_delta` buffering and `finish` finalization.
+**Call relations**: This test targets StreamingPatchParser::finish. It proves finish drains the leftover line buffer and recognizes the end marker correctly.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -937,11 +941,11 @@ fn test_streaming_patch_parser_finish_processes_final_line_without_newline()
 fn test_streaming_patch_parser_finish_requires_end_patch()
 ```
 
-**Purpose**: Verifies that finalization fails when the patch never reaches `*** End Patch`.
+**Purpose**: Checks that finish rejects a patch that never ends with the required end marker. Without this, a cut-off patch could be mistaken for a complete one.
 
-**Data flow**: It pushes an incomplete patch, calls `finish`, and asserts the specific `InvalidPatchError` about the missing last line marker.
+**Data flow**: The test feeds a patch that starts adding a file but stops before “*** End Patch”. Streaming returns the partial add hunk, but finish returns an invalid-patch error.
 
-**Call relations**: This test targets the final mode check in `finish`.
+**Call relations**: This test covers the final validation in StreamingPatchParser::finish. It distinguishes progress reporting during streaming from accepting a completed patch.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -952,11 +956,11 @@ fn test_streaming_patch_parser_finish_requires_end_patch()
 fn test_streaming_patch_parser_rejects_content_after_end_patch()
 ```
 
-**Purpose**: Checks that non-whitespace content after `*** End Patch` is rejected while trailing blank/whitespace-only lines are allowed.
+**Purpose**: Checks that non-empty text after the end marker is rejected, while blank whitespace after the end is allowed. This keeps the end marker meaningful without being too strict about trailing blank lines.
 
-**Data flow**: It parses one patch with extra text after the end marker and another with only whitespace after it, asserting failure in the first case and success in the second.
+**Data flow**: The test feeds one patch with an extra content line after the end marker and expects an error. It feeds another patch with only whitespace after the end marker and expects the parsed add hunk to remain valid.
 
-**Call relations**: This test exercises the `EndedPatch` branch of `process_line`.
+**Call relations**: This test exercises the ended state in StreamingPatchParser::process_line. It confirms that once the patch is closed, only empty trailing lines are acceptable.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
@@ -967,24 +971,26 @@ fn test_streaming_patch_parser_rejects_content_after_end_patch()
 fn test_streaming_patch_parser_returns_errors()
 ```
 
-**Purpose**: Covers a broad set of malformed inputs and pins the exact parser diagnostics and line numbers.
+**Purpose**: Checks many malformed patch cases and their exact errors. These cases make sure users get clear feedback when patch text is wrong or incomplete.
 
-**Data flow**: It constructs many invalid patches—bad first line, invalid hunk headers, add/delete body errors, empty update hunks, empty chunks, misplaced markers, and malformed update content—feeds them through `push_delta`, and asserts exact `ParseError` values.
+**Data flow**: The test creates fresh parsers for bad inputs: missing begin marker, invalid headers, invalid add/delete content, empty update hunks, empty chunks, repeated context markers, and unexpected update lines. Each input is compared against the expected parse error and line number.
 
-**Call relations**: This is the comprehensive negative test suite for the state machine, validating the error branches in `process_line`, `handle_hunk_headers_and_end_patch`, and `ensure_update_hunk_is_not_empty`.
+**Call relations**: This test covers the error paths across StreamingPatchParser::push_delta, StreamingPatchParser::process_line, StreamingPatchParser::handle_hunk_headers_and_end_patch, and StreamingPatchParser::ensure_update_hunk_is_not_empty. It protects the parser’s safety checks as a group.
 
 *Call graph*: 2 external calls (default, assert_eq!).
 
 
 ### `apply-patch/src/parser.rs`
 
-`domain_logic` · `patch parsing before application`
+`domain_logic` · `apply_patch request parsing`
 
-This module is the front door for patch parsing. It declares the marker constants for the patch language, the `ParseError` enum used across parsing, the `Hunk` enum for add/delete/update operations, and `UpdateFileChunk` for the per-chunk contents of update hunks. `Hunk::path()` deliberately reports the move destination for rename-style update hunks, while `resolve_path()` resolves either relative or absolute paths against a provided `AbsolutePathBuf` working directory.
+This parser is the front door for the apply-patch format. A patch is just text, but the rest of the program needs a clear list of actions. This file checks that the text starts and ends with the expected patch markers, then breaks the patch into “hunks,” meaning separate file changes. A hunk can add a file, delete a file, or update a file, including moving it to a new path.
 
-The main parser entrypoint, `parse_patch`, selects strict versus lenient boundary handling via the compile-time `PARSE_IN_STRICT_MODE` flag, currently forcing lenient mode. `parse_patch_text` trims the incoming text, splits it into lines, validates the outer `*** Begin Patch` / `*** End Patch` framing, reconstructs normalized patch text with `\n`, and then feeds that text into `StreamingPatchParser`. The streaming parser performs the real grammar validation and hunk construction; this wrapper extracts the final hunks and optional environment ID and packages them into `ApplyPatchArgs` with `workdir: None`.
+The file also defines the main shapes of parsed data. `Hunk` describes the kind of file operation. `UpdateFileChunk` describes one replacement area inside an updated file: optional nearby context, old lines to find, new lines to insert, and whether the change belongs at the end of the file.
 
-The strict boundary helpers enforce exact first/last markers after trimming surrounding whitespace. Lenient mode first tries strict parsing unchanged, then recognizes heredoc wrappers like `<<EOF`, `<<'EOF'`, or `<<"EOF"` with a closing line ending in `EOF`, strips those wrapper lines, and re-runs strict validation on the inner patch. Tests in this file pin down empty patches, empty update hunks, move hunks, omitted initial `@@` headers, EOF markers, absolute paths, path resolution, heredoc leniency, and environment ID validation.
+One important detail is lenient parsing. Some callers accidentally pass a shell-style heredoc wrapper, like `<<'EOF' ... EOF`, as literal text. In normal shell use, that wrapper would be stripped by the shell. Here, it may arrive untouched. Lenient mode recognizes a small set of these wrappers, removes them, and then parses the real patch inside. Think of it like opening an envelope before reading the letter.
+
+This file does not check the real filesystem. It only decides whether the patch text makes sense and converts it into instructions another part of the program can carry out.
 
 #### Function details
 
@@ -994,11 +1000,11 @@ The strict boundary helpers enforce exact first/last markers after trimming surr
 fn resolve_path(&self, cwd: &AbsolutePathBuf) -> AbsolutePathBuf
 ```
 
-**Purpose**: Computes the absolute filesystem path affected by a hunk relative to a supplied current working directory.
+**Purpose**: This turns the path inside a hunk into an absolute path, using the current working directory when the patch used a relative path. Someone would use it when they are ready to connect a parsed patch instruction to a real file location.
 
-**Data flow**: It reads `self` and a base `cwd: &AbsolutePathBuf`. For update hunks it uses the original update path field, while add/delete hunks use `Hunk::path()`; it then passes that path into `AbsolutePathBuf::resolve_path_against_base` and returns the resolved absolute path.
+**Data flow**: It receives a hunk and a current working directory. It first decides which path the hunk refers to: for ordinary add/delete/update actions it uses the hunk path, while for an update with a move destination it resolves the original update path. It then combines that path with the working directory if needed, and returns an absolute path.
 
-**Call relations**: This helper is used when later application logic needs a concrete filesystem target. Internally it depends on `Hunk::path()` for non-update cases and delegates final normalization to the absolute-path utility crate.
+**Call relations**: After parsing has produced hunks, later apply logic can call this to find the concrete file path. Inside this method, it asks `Hunk::path` for the path in the add/delete cases, then delegates the final relative-versus-absolute decision to `resolve_path_against_base`.
 
 *Call graph*: calls 2 internal fn (path, resolve_path_against_base).
 
@@ -1009,11 +1015,11 @@ fn resolve_path(&self, cwd: &AbsolutePathBuf) -> AbsolutePathBuf
 fn path(&self) -> &Path
 ```
 
-**Purpose**: Returns the logical path associated with a hunk, preferring the move destination for rename/update hunks.
+**Purpose**: This returns the main path a hunk affects. For a rename-style update, it reports the destination path, because that is the file path the hunk should be considered to affect after the move.
 
-**Data flow**: It pattern-matches on `self`. `AddFile` and `DeleteFile` return their stored `path`; `UpdateFile` returns `move_path` when present, otherwise the original `path`, and yields a borrowed `&Path`.
+**Data flow**: It receives a hunk and inspects its variant. Add and delete hunks return their stored path. Update hunks return the move destination if there is one; otherwise they return the original update path. Nothing is changed.
 
-**Call relations**: This is the canonical path accessor for callers that care about the file’s post-patch identity. `Hunk::resolve_path()` calls it for add/delete hunks, while update hunks bypass it when they need the source path instead.
+**Call relations**: This is a small helper used by `Hunk::resolve_path` when an absolute path is needed. It centralizes the rule for which path represents each kind of hunk, especially the special case of moved files.
 
 *Call graph*: called by 1 (resolve_path).
 
@@ -1024,11 +1030,11 @@ fn path(&self) -> &Path
 fn parse_patch(patch: &str) -> Result<ApplyPatchArgs, ParseError>
 ```
 
-**Purpose**: Public convenience entrypoint that parses a patch string into `ApplyPatchArgs` using the crate’s configured strictness mode.
+**Purpose**: This is the public parsing entry for patch text. It chooses the parser’s tolerance level and returns structured `ApplyPatchArgs`, which are the parsed instructions used by apply-patch.
 
-**Data flow**: It accepts `patch: &str`, selects `ParseMode::Lenient` or `ParseMode::Strict` from the `PARSE_IN_STRICT_MODE` constant, and forwards both to `parse_patch_text`. It returns either parsed `ApplyPatchArgs` or a `ParseError`.
+**Data flow**: It receives raw patch text. It chooses strict or lenient mode based on the file-level setting, then passes the text to `parse_patch_text`. The result is either parsed patch arguments or a clear parse error.
 
-**Call relations**: This is the parser API used by patch-application code and parser-focused tests. It exists mainly to hide the internal `ParseMode` choice and route all callers through `parse_patch_text`.
+**Call relations**: This is the function other parts of the apply-patch flow call when they need to understand patch text. It is called by application paths such as `apply_patch`, `maybe_parse_apply_patch`, and related verification or test flows, and it hands the real parsing work to `parse_patch_text`.
 
 *Call graph*: calls 1 internal fn (parse_patch_text); called by 10 (apply_patch, maybe_parse_apply_patch, maybe_parse_apply_patch_verified, test_unified_diff_insert_at_eof, test_unified_diff_last_line_replacement, test_unified_diff, test_unified_diff_first_line_replacement, test_unified_diff_insert_at_eof, test_unified_diff_interleaved_changes, test_unified_diff_last_line_replacement).
 
@@ -1039,11 +1045,11 @@ fn parse_patch(patch: &str) -> Result<ApplyPatchArgs, ParseError>
 fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, ParseError>
 ```
 
-**Purpose**: Validates patch framing, normalizes the text, streams it through the incremental parser, and assembles the final `ApplyPatchArgs` value.
+**Purpose**: This does the main conversion from patch text into `ApplyPatchArgs`. It checks the outer patch markers, feeds the inner text into the streaming parser, and packages the parsed hunks with the original normalized patch text.
 
-**Data flow**: It takes raw patch text plus a `ParseMode`. After `trim()` and `lines()` collection, it chooses either strict or lenient boundary checking to obtain the slice containing actual patch lines. It joins those lines with `\n`, constructs a default `StreamingPatchParser`, feeds the normalized patch via `push_delta`, finalizes with `finish`, reads `environment_id()` from the parser, and returns `ApplyPatchArgs { hunks, patch, workdir: None, environment_id }`.
+**Data flow**: It receives patch text and a parse mode. First it trims the whole input and splits it into lines. In strict mode it requires the first and last patch markers directly; in lenient mode it may also unwrap a simple heredoc wrapper. It rejoins the accepted lines, sends them through `StreamingPatchParser`, collects hunks and an optional environment ID, and returns an `ApplyPatchArgs` value. If any step fails, it returns a `ParseError`.
 
-**Call relations**: This function is the core bridge between outer text validation and the streaming grammar parser. `parse_patch` invokes it, and it in turn delegates framing checks to the boundary helpers and structural parsing to `StreamingPatchParser`.
+**Call relations**: `parse_patch` calls this after choosing the mode. This function uses `check_patch_boundaries_strict` or `check_patch_boundaries_lenient` to guard the outside of the patch before handing the contents to the streaming parser, which understands the hunks themselves.
 
 *Call graph*: calls 2 internal fn (check_patch_boundaries_lenient, check_patch_boundaries_strict); called by 1 (parse_patch); 1 external calls (default).
 
@@ -1054,11 +1060,11 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
 fn check_patch_boundaries_strict(lines: &'a [&'a str]) -> Result<&'a [&'a str], ParseError>
 ```
 
-**Purpose**: Extracts the first and last lines from a candidate patch and enforces exact begin/end markers.
+**Purpose**: This checks that the patch text begins with `*** Begin Patch` and ends with `*** End Patch`. It protects the parser from reading random text as if it were a patch.
 
-**Data flow**: It receives a borrowed slice of line slices, derives `first_line` and `last_line` for empty, single-line, or multi-line inputs, calls `check_start_and_end_lines_strict`, and on success returns the original line slice unchanged.
+**Data flow**: It receives a slice of text lines. It picks out the first and last line, including the empty and one-line edge cases, and asks `check_start_and_end_lines_strict` to validate them. If they are valid, it returns the same line slice unchanged; otherwise it returns a parse error.
 
-**Call relations**: This is the baseline framing validator used directly by `parse_patch_text` in strict mode and as the first attempt inside lenient mode before heredoc fallback.
+**Call relations**: `parse_patch_text` uses this directly in strict mode. `check_patch_boundaries_lenient` also uses it first, because lenient mode still prefers a normal patch when the input already has the right markers.
 
 *Call graph*: calls 1 internal fn (check_start_and_end_lines_strict); called by 2 (check_patch_boundaries_lenient, parse_patch_text).
 
@@ -1071,11 +1077,11 @@ fn check_patch_boundaries_lenient(
 ) -> Result<&'a [&'a str], ParseError>
 ```
 
-**Purpose**: Accepts either a normal patch or a heredoc-wrapped patch argument and returns the inner patch lines when valid.
+**Purpose**: This accepts normal patch text, and also accepts one common mistaken wrapper around patch text: a literal heredoc such as `<<EOF` at the start and `EOF` at the end. It exists so apply-patch can still work when a caller sends what was meant to be shell syntax as plain text.
 
-**Data flow**: It takes the original line slice and first tries `check_patch_boundaries_strict`; if that succeeds it returns immediately. Otherwise it preserves the original parse error, checks for a first line equal to `<<EOF`, `<<'EOF'`, or `<<"EOF"`, a last line ending in `EOF`, and at least four total lines; if those conditions hold it slices out the inner lines and re-validates them strictly, otherwise it returns the original strict error.
+**Data flow**: It receives the original input lines. First it tries the strict boundary check. If that succeeds, it returns those lines. If strict checking fails, it looks for a supported heredoc opening line, a closing line ending in `EOF`, and enough lines to contain a real patch. When that wrapper is present, it removes the first and last lines and then strictly checks the inner patch. If not, it returns the original strict-mode error.
 
-**Call relations**: Used only by `parse_patch_text` in lenient mode. Its control flow is intentionally conservative: heredoc stripping is a fallback, not the primary parse path, so ordinary malformed patches still report the original strict framing error when no wrapper pattern matches.
+**Call relations**: `parse_patch_text` calls this when lenient parsing is enabled. This function calls back into `check_patch_boundaries_strict` so that even unwrapped heredoc contents must still be a real apply-patch patch.
 
 *Call graph*: calls 1 internal fn (check_patch_boundaries_strict); called by 1 (parse_patch_text).
 
@@ -1089,11 +1095,11 @@ fn check_start_and_end_lines_strict(
 ) -> Result<(), ParseError>
 ```
 
-**Purpose**: Produces the specific invalid-patch error for missing or incorrect outer patch markers.
+**Purpose**: This performs the exact marker check for the first and last patch lines. It also creates helpful error messages that tell the caller whether the beginning or ending marker is wrong.
 
-**Data flow**: It accepts optional references to the first and last lines, trims surrounding whitespace on each when present, compares them against `BEGIN_PATCH_MARKER` and `END_PATCH_MARKER`, and returns `Ok(())` only when both match. Otherwise it constructs `InvalidPatchError` with either the first-line or last-line diagnostic string.
+**Data flow**: It receives optional references to the first and last lines. It trims whitespace around each marker line, then compares them to the required begin and end strings. If both match, it returns success. If the first line is wrong, it returns an error about the first line. Otherwise it returns an error about the last line.
 
-**Call relations**: This is the lowest-level framing check called by `check_patch_boundaries_strict`. It centralizes the exact error messages that tests and CLI behavior rely on.
+**Call relations**: `check_patch_boundaries_strict` calls this after finding the first and last lines. Its errors travel back through strict or lenient boundary checking and eventually back to `parse_patch_text` or `parse_patch`.
 
 *Call graph*: called by 1 (check_patch_boundaries_strict); 1 external calls (from).
 
@@ -1104,11 +1110,11 @@ fn check_start_and_end_lines_strict(
 fn test_parse_patch()
 ```
 
-**Purpose**: Exercises the parser across malformed framing, empty patches, add/delete/update hunks, move hunks, hunk sequencing, and omitted initial context headers.
+**Purpose**: This test checks the parser’s basic behavior across bad patches, empty patches, add/delete/update hunks, moved files, and update hunks with or without explicit context headers.
 
-**Data flow**: It feeds multiple literal patch strings into `parse_patch_text` in strict mode and compares returned `ApplyPatchArgs` or `ParseError` values against explicit expected structures and messages.
+**Data flow**: It feeds several patch strings into `parse_patch_text` in strict mode. For each one, it compares the returned parsed hunks or errors with the expected result. The test does not produce runtime output unless an assertion fails.
 
-**Call relations**: This test directly validates the top-level parser wrapper rather than the streaming parser internals, ensuring the public parse behavior matches the documented patch format.
+**Call relations**: This test exercises the main parsing path beneath `parse_patch_text`. It confirms that the lower-level boundary checks and hunk parsing work together for common valid and invalid inputs.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1119,11 +1125,11 @@ fn test_parse_patch()
 fn test_parse_patch_preserves_end_of_file_marker()
 ```
 
-**Purpose**: Verifies that an `*** End of File` marker is preserved as `is_end_of_file: true` in the parsed update chunk.
+**Purpose**: This test makes sure an update chunk marked as applying at the end of a file keeps that meaning after parsing.
 
-**Data flow**: It constructs a patch string containing an update hunk followed by `*** End of File`, calls `parse_patch`, and asserts that the returned `ApplyPatchArgs` contains one `UpdateFileChunk` with `new_lines` set and `is_end_of_file` enabled.
+**Data flow**: It builds a patch containing `*** End of File`, passes it to `parse_patch`, and expects an `ApplyPatchArgs` result whose update chunk has `is_end_of_file` set to true. If that flag is lost, the assertion fails.
 
-**Call relations**: This test covers the integration between the parser wrapper and `StreamingPatchParser` for EOF-sensitive hunks.
+**Call relations**: This test goes through the public `parse_patch` entry rather than only `parse_patch_text`, so it checks the normal path used by callers. It protects the contract between the text marker and later apply logic that needs to know the change belongs at file end.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1134,11 +1140,11 @@ fn test_parse_patch_preserves_end_of_file_marker()
 fn test_parse_patch_accepts_relative_and_absolute_hunk_paths()
 ```
 
-**Purpose**: Confirms that parsed hunk paths preserve both relative paths and already-absolute filesystem paths.
+**Purpose**: This test confirms that hunk paths may be either relative paths, like `relative-add.py`, or absolute paths, like `/tmp/.../file.py`.
 
-**Data flow**: It creates temporary absolute paths, interpolates them into a patch string alongside a relative add path, parses in strict mode, and asserts that the resulting `Hunk` values contain the expected `PathBuf`s unchanged.
+**Data flow**: It creates temporary absolute paths, formats them into a patch, and parses the patch in strict mode. It then compares the parsed hunks with the expected paths and line changes.
 
-**Call relations**: This test documents that parsing itself does not reject or rewrite absolute paths; later resolution logic decides how to interpret them.
+**Call relations**: This test supports the parsing layer’s path behavior. It checks that `parse_patch_text` preserves the paths written in the patch instead of rejecting absolute paths or rewriting them too early.
 
 *Call graph*: 3 external calls (assert_eq!, format!, tempdir).
 
@@ -1149,11 +1155,11 @@ fn test_parse_patch_accepts_relative_and_absolute_hunk_paths()
 fn test_hunk_resolve_path_accepts_relative_and_absolute_paths()
 ```
 
-**Purpose**: Checks that `Hunk::resolve_path` joins relative paths to the provided cwd and leaves absolute paths untouched.
+**Purpose**: This test verifies that `Hunk::resolve_path` turns relative paths into paths under the chosen working directory, while leaving already absolute paths alone.
 
-**Data flow**: It builds a temporary cwd plus separate absolute paths, constructs representative add/delete/update hunks, calls `resolve_path` for each, and compares the returned `AbsolutePathBuf` to the expected joined or preserved path.
+**Data flow**: It creates temporary directories for a working directory and absolute test paths. It builds several add, delete, and update hunks, calls `resolve_path` on each, and compares the result to the expected absolute path.
 
-**Call relations**: This test targets the `Hunk` helper methods rather than parsing, validating the path invariant relied on by filesystem application code.
+**Call relations**: This test focuses on `Hunk::resolve_path` and indirectly on `Hunk::path`. It protects the later file-application stage from receiving wrong file locations after parsing.
 
 *Call graph*: 5 external calls (from, new, new, assert_eq!, tempdir).
 
@@ -1164,11 +1170,11 @@ fn test_hunk_resolve_path_accepts_relative_and_absolute_paths()
 fn test_parse_patch_lenient()
 ```
 
-**Purpose**: Verifies heredoc leniency behavior for accepted wrappers, rejected mismatched quotes, and missing closing patch markers.
+**Purpose**: This test checks the special lenient parsing behavior for heredoc-wrapped patch text. It ensures valid wrappers are accepted in lenient mode but still rejected in strict mode.
 
-**Data flow**: It prepares a valid patch and several heredoc-wrapped variants, parses each under both strict and lenient modes, and asserts either successful `ApplyPatchArgs` reconstruction or the exact expected `InvalidPatchError`.
+**Data flow**: It starts with a valid patch, wraps it in several heredoc styles, and parses each wrapper in both strict and lenient modes. It expects strict mode to reject the wrapper, lenient mode to accept supported wrappers, and malformed or incomplete wrappers to produce clear errors.
 
-**Call relations**: This test specifically exercises the fallback path in `check_patch_boundaries_lenient`, proving that lenient mode broadens accepted input without changing strict-mode behavior.
+**Call relations**: This test exercises `parse_patch_text` with both parse modes and specifically protects `check_patch_boundaries_lenient`. It documents the compatibility behavior added for callers that accidentally pass shell heredoc syntax as literal text.
 
 *Call graph*: 3 external calls (assert_eq!, format!, vec!).
 
@@ -1179,20 +1185,24 @@ fn test_parse_patch_lenient()
 fn test_parse_patch_environment_id_preamble()
 ```
 
-**Purpose**: Ensures the optional environment ID preamble is captured when non-empty and rejected when blank.
+**Purpose**: This test checks that an optional environment ID line after the begin marker is parsed and stored, and that an empty environment ID is rejected.
 
-**Data flow**: It parses one patch containing `*** Environment ID: remote` and another with only whitespace after the marker, asserting either a populated `environment_id` in `ApplyPatchArgs` or an `InvalidPatchError`.
+**Data flow**: It sends one patch with `*** Environment ID: remote` and expects the returned `ApplyPatchArgs` to contain `environment_id: Some("remote")`. It then sends a patch with only spaces after the environment ID marker and expects an invalid-patch error.
 
-**Call relations**: This test covers parser support for the environment preamble that is actually interpreted by `StreamingPatchParser` and surfaced through `parse_patch_text`.
+**Call relations**: This test runs through `parse_patch_text`, including the streaming parser that reads the preamble. It protects the small but important link between patch text and the environment selection information used by callers.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `apply-patch/src/invocation.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `command/request handling before applying a patch`
 
-This module recognizes whether an argv vector corresponds to an explicit `apply_patch` invocation and, if so, turns it into verified `ApplyPatchAction` data. It first classifies shell executables by basename (`bash`, `zsh`, `sh`, `powershell`, `pwsh`, `cmd`) and accepted flags, including optional PowerShell `-NoProfile`. `parse_shell_script` extracts the embedded script from shell argv forms, and `extract_apply_patch_from_shell` currently routes all supported shells through a conservative Tree-sitter Bash parser. The core parser, `maybe_parse_apply_patch`, accepts either direct `apply_patch <patch>` / `applypatch <patch>` argv or shell heredoc forms like `apply_patch <<'EOF' ... EOF` and `cd <path> && apply_patch <<'EOF' ... EOF`; anything else becomes `NotApplyPatch`, while shell or patch parsing failures are preserved distinctly. `maybe_parse_apply_patch_verified` adds correctness checks that reject implicit raw patch bodies passed without an explicit `apply_patch` command, then verifies parsed args against an absolute cwd and an `ExecutorFileSystem`. Verification resolves relative paths against either the provided cwd or a shell-extracted workdir, reads existing file contents for delete/update hunks, computes unified diffs for updates, resolves move destinations against the effective cwd, and returns either a fully populated `ApplyPatchAction` or a structured correctness/I/O error. The embedded tests cover shell classification, heredoc matching strictness, quoted `cd` paths, ignored malformed shell forms, EOF diff generation, cwd-relative resolution, move-path rebasing, and verification behavior for unreadable destinations and symlink deletes.
+This file sits at the doorway between command execution and patch application. Users or models may ask to run `apply_patch` directly, or they may wrap it inside a shell command such as `bash -lc "apply_patch <<'PATCH' ... PATCH"`. This file decides whether the command is one of those supported forms, pulls out the patch body, parses it, and then verifies it against the current filesystem.
+
+The code is deliberately conservative. For shell heredocs, it uses Tree-sitter, a parser library that reads shell text as a structured tree rather than as loose strings. That matters because shell syntax can be tricky. The file only accepts simple top-level forms like `apply_patch <<...` or `cd path && apply_patch <<...`; extra commands before or after are rejected. This is like accepting a package only if the label is exactly where expected, not hidden inside other instructions.
+
+After parsing, verification resolves relative file paths against the working directory, reads existing files for deletes and updates, and builds a map of planned file changes. It also rejects “implicit invocation,” where raw patch text is passed without the `apply_patch` command, so accidental patches are reported as errors instead of silently applied.
 
 #### Function details
 
@@ -1202,11 +1212,11 @@ This module recognizes whether an argv vector corresponds to an explicit `apply_
 fn classify_shell_name(shell: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes a shell executable path to a lowercase basename without extension. It is the first step in recognizing supported shell wrappers around `apply_patch`.
+**Purpose**: Turns a shell executable path into a simple lowercase shell name, such as `bash` from `/bin/bash` or `powershell` from `powershell.exe`. This lets later code recognize shells without caring about full paths or file extensions.
 
-**Data flow**: Takes a shell path string, constructs a `Path`, extracts `file_stem`, converts it to UTF-8 if possible, lowercases it with `to_ascii_lowercase`, and returns `Option<String>`. Invalid or stemless paths yield `None`.
+**Data flow**: It receives a shell string → treats it like a filesystem path, takes the filename stem, converts it to text, and lowercases it → returns the normalized name if that was possible, or nothing if it could not read a name.
 
-**Call relations**: This helper is called by both `classify_shell` and `can_skip_flag`. It isolates path normalization so shell recognition logic can match on simple names.
+**Call relations**: This is the small cleanup step used by `classify_shell` and `can_skip_flag` before they decide whether an argument list looks like a supported shell command.
 
 *Call graph*: called by 2 (can_skip_flag, classify_shell); 1 external calls (new).
 
@@ -1217,11 +1227,11 @@ fn classify_shell_name(shell: &str) -> Option<String>
 fn classify_shell(shell: &str, flag: &str) -> Option<ApplyPatchShell>
 ```
 
-**Purpose**: Maps a normalized shell name plus its execution flag to an `ApplyPatchShell` variant when the argv shape is one of the supported shell-script forms. It encodes the accepted shell/flag combinations.
+**Purpose**: Decides whether a shell name and its command flag represent a supported shell invocation. It recognizes Unix-style shells, PowerShell, and Windows `cmd` only with the expected flags.
 
-**Data flow**: Accepts a shell path and flag string, calls `classify_shell_name`, and matches the lowercase name plus flag: Unix shells require `-lc` or `-c`, PowerShell variants require `-Command` case-insensitively, and `cmd` requires `/c`. It returns `Some(ApplyPatchShell)` on a recognized combination or `None` otherwise.
+**Data flow**: It receives the shell program and the flag that should mean “run this script” → normalizes the shell name and checks the flag → returns the matching shell kind or nothing if the pair is not trusted.
 
-**Call relations**: This helper is used by `parse_shell_script` after argv destructuring. It centralizes shell-type recognition for later heredoc extraction.
+**Call relations**: `parse_shell_script` calls this after it has found a likely shell command. Its answer tells later code which extraction path to use.
 
 *Call graph*: calls 1 internal fn (classify_shell_name); called by 1 (parse_shell_script).
 
@@ -1232,11 +1242,11 @@ fn classify_shell(shell: &str, flag: &str) -> Option<ApplyPatchShell>
 fn can_skip_flag(shell: &str, flag: &str) -> bool
 ```
 
-**Purpose**: Recognizes optional shell flags that may appear before the actual script-execution flag and should be ignored for parsing purposes. Currently this only supports PowerShell `-NoProfile`.
+**Purpose**: Recognizes a harmless extra PowerShell flag, `-NoProfile`, that may appear before the real command flag. This keeps PowerShell support flexible without accepting arbitrary extra flags.
 
-**Data flow**: Takes a shell path and candidate flag, normalizes the shell name with `classify_shell_name`, and returns `true` only when the shell is `pwsh` or `powershell` and the flag equals `-noprofile` case-insensitively. Otherwise it returns `false`.
+**Data flow**: It receives a shell program and a flag → normalizes the shell name and checks whether the shell is PowerShell and the flag is `-NoProfile` → returns true only for that allowed case.
 
-**Call relations**: This helper is called by `parse_shell_script` when matching four-argument shell invocations. It allows the parser to accept PowerShell argv with an extra profile-suppression flag.
+**Call relations**: `parse_shell_script` uses this when an argument list has four parts instead of three, so it can still accept `powershell -NoProfile -Command ...`.
 
 *Call graph*: calls 1 internal fn (classify_shell_name); called by 1 (parse_shell_script).
 
@@ -1247,11 +1257,11 @@ fn can_skip_flag(shell: &str, flag: &str) -> bool
 fn parse_shell_script(argv: &[String]) -> Option<(ApplyPatchShell, &str)>
 ```
 
-**Purpose**: Extracts the embedded script string from supported shell argv layouts and identifies the shell family used to run it. It converts raw argv into `(ApplyPatchShell, &str)` when possible.
+**Purpose**: Looks at a command argument list and determines whether it is a supported shell running a single script string. It extracts both the shell type and the script text.
 
-**Data flow**: Accepts `&[String]` and pattern-matches either `[shell, flag, script]` or `[shell, skip_flag, flag, script]`. In the three-argument case it calls `classify_shell`; in the four-argument case it first checks `can_skip_flag` and then calls `classify_shell`. On success it returns the shell enum plus a borrowed `&str` view of the script argument; otherwise `None`.
+**Data flow**: It receives the full command arguments → checks either `shell flag script` or the PowerShell `shell skip_flag flag script` shape → returns the shell kind plus script text, or nothing if the shape is not supported.
 
-**Call relations**: This helper is used by both `maybe_parse_apply_patch` and `maybe_parse_apply_patch_verified`. It is the shared argv-shape recognizer for shell-wrapped patch invocations.
+**Call relations**: `maybe_parse_apply_patch` uses it to find heredoc-style patch commands. `maybe_parse_apply_patch_verified` also uses it early to catch raw patch text hidden as a shell script.
 
 *Call graph*: calls 2 internal fn (can_skip_flag, classify_shell); called by 2 (maybe_parse_apply_patch, maybe_parse_apply_patch_verified).
 
@@ -1265,11 +1275,11 @@ fn extract_apply_patch_from_shell(
 ) -> std::result::Result<(String, Option<String>), ExtractHeredocError>
 ```
 
-**Purpose**: Dispatches shell-script extraction to the concrete parser for the recognized shell family. At present all supported shells reuse the Bash/Tree-sitter extraction logic.
+**Purpose**: Routes shell script extraction to the parser that can recognize the supported `apply_patch` heredoc form. At present, all supported shell kinds use the same Bash-style extraction logic.
 
-**Data flow**: Accepts an `ApplyPatchShell` and script string, matches the shell variant, and calls `extract_apply_patch_from_bash(script)` for Unix, PowerShell, and Cmd. It returns either `(patch_body, optional_workdir)` or an `ExtractHeredocError`.
+**Data flow**: It receives a shell kind and script text → chooses the extraction routine for that shell → returns the heredoc patch body and optional working directory, or an extraction error.
 
-**Call relations**: This helper is called by `maybe_parse_apply_patch` after `parse_shell_script` succeeds. It exists as an abstraction point for future shell-specific parsers even though all variants currently share one implementation.
+**Call relations**: `maybe_parse_apply_patch` calls this after `parse_shell_script` identifies a shell script. It hands off to `extract_apply_patch_from_bash` for the actual syntax checking.
 
 *Call graph*: calls 1 internal fn (extract_apply_patch_from_bash); called by 1 (maybe_parse_apply_patch).
 
@@ -1280,11 +1290,11 @@ fn extract_apply_patch_from_shell(
 fn maybe_parse_apply_patch(argv: &[String]) -> MaybeApplyPatch
 ```
 
-**Purpose**: Determines whether argv explicitly invokes `apply_patch` and, if so, parses it into structured patch args or a precise parse error. It distinguishes direct invocation, shell heredoc invocation, malformed patch bodies, and definitely unrelated commands.
+**Purpose**: Determines whether a command is an `apply_patch` invocation and, if so, parses the patch into structured arguments. It supports both direct calls and carefully limited shell heredocs.
 
-**Data flow**: Accepts `&[String]` and first checks for direct two-argument forms `[cmd, body]` where `cmd` is `apply_patch` or `applypatch`; those bodies are parsed with `parse_patch` into `MaybeApplyPatch::Body` or `PatchParseError`. Otherwise it calls `parse_shell_script`; if that succeeds, it extracts the heredoc body and optional workdir with `extract_apply_patch_from_shell`, parses the body with `parse_patch`, and if successful mutates `source.workdir` to the extracted workdir before returning `Body`. A `CommandDidNotStartWithApplyPatch` shell error is downgraded to `NotApplyPatch`, other shell extraction failures become `ShellParseError`, and unrecognized argv shapes become `NotApplyPatch`.
+**Data flow**: It receives command arguments → first checks `apply_patch <body>` or `applypatch <body>` → otherwise checks for a supported shell script and extracts a heredoc body → parses the patch text → returns parsed patch arguments, a parse error, a shell extraction error, or “not apply_patch.”
 
-**Call relations**: This is the main parser entry point used by `maybe_parse_apply_patch_verified` and many unit tests. It delegates shell-shape recognition and heredoc extraction, then delegates patch syntax parsing to `parse_patch`.
+**Call relations**: This is the main recognizer used by the verified path and by many tests. It relies on `parse_shell_script`, `extract_apply_patch_from_shell`, and `parse_patch` to move from raw command text to structured patch data.
 
 *Call graph*: calls 3 internal fn (extract_apply_patch_from_shell, parse_shell_script, parse_patch); called by 5 (maybe_parse_apply_patch_verified, assert_match_args, test_heredoc_applypatch, test_literal, test_literal_applypatch); 3 external calls (Body, PatchParseError, ShellParseError).
 
@@ -1300,11 +1310,11 @@ async fn maybe_parse_apply_patch_verified(
 ) -> Mayb
 ```
 
-**Purpose**: Adds correctness and filesystem verification on top of syntactic `apply_patch` parsing. It rejects implicit raw patch bodies and returns either a verified action, a shell parse error, a correctness error, or `NotApplyPatch`.
+**Purpose**: Combines recognition with safety checks, producing a verified patch action only when the command was explicit and the patch can be checked against the filesystem. It prevents raw patch text from being treated as a command by accident.
 
-**Data flow**: Takes argv, an absolute cwd, an `ExecutorFileSystem`, and optional sandbox context. It first checks two implicit-invocation cases: a single argv element that itself parses as a patch body, or a shell script argument that parses directly as a patch body; either yields `MaybeApplyPatchVerified::CorrectnessError(ImplicitInvocation)`. Otherwise it calls `maybe_parse_apply_patch`; `Body(args)` is passed to `verify_apply_patch_args`, `ShellParseError` is preserved, `PatchParseError` is converted into `CorrectnessError`, and `NotApplyPatch` is returned unchanged.
+**Data flow**: It receives command arguments, the absolute current directory, a filesystem interface, and an optional sandbox context → rejects single raw patch bodies and raw patch shell scripts as implicit invocation errors → parses normal invocations → verifies parsed patch arguments → returns a verified action, a specific error, or “not apply_patch.”
 
-**Call relations**: This function is the public verified entry point re-exported by the crate and used by tests. It sits above `maybe_parse_apply_patch` and below consumers that need a filesystem-checked `ApplyPatchAction`.
+**Call relations**: This is the higher-level entry used when the executor is deciding what to do with a command. It calls `maybe_parse_apply_patch` for recognition and `verify_apply_patch_args` when a real patch has been found.
 
 *Call graph*: calls 4 internal fn (maybe_parse_apply_patch, parse_shell_script, verify_apply_patch_args, parse_patch); called by 4 (test_apply_patch_resolves_move_path_with_effective_cwd, test_apply_patch_should_resolve_absolute_paths_in_cwd, test_delete_symlink_still_verifies, test_unreadable_destinations_still_verify); 2 external calls (CorrectnessError, ShellParseError).
 
@@ -1320,11 +1330,11 @@ async fn verify_apply_patch_args(
 ) -> MaybeApp
 ```
 
-**Purpose**: Resolves parsed patch hunks against the filesystem and produces an `ApplyPatchAction` describing concrete absolute-path changes. It verifies readability and computes update diffs before any patch is applied.
+**Purpose**: Checks parsed patch instructions against the actual filesystem and turns them into a concrete set of file changes. This is where relative paths become absolute and update/delete operations are backed by existing file contents.
 
-**Data flow**: Consumes `ApplyPatchArgs`, absolute cwd, filesystem, and optional sandbox. It computes `effective_cwd` by joining any parsed `workdir` onto the provided cwd, then iterates over each `Hunk`. `AddFile` hunks become `ApplyPatchFileChange::Add` entries keyed by resolved absolute path. `DeleteFile` hunks read existing file text through `ExecutorFileSystem::read_file_text`; read failures become `CorrectnessError(IoError { context: "Failed to read ..." })`, while successes become `Delete { content }`. `UpdateFile` hunks call `unified_diff_from_chunks` to derive `unified_diff` and new content; failures become correctness errors, and successes become `Update { unified_diff, move_path: resolved optional destination, new_content }`. After all hunks are processed it returns `MaybeApplyPatchVerified::Body(ApplyPatchAction { changes, patch, cwd: effective_cwd })`.
+**Data flow**: It receives parsed patch arguments, the current directory, a filesystem interface, and optional sandbox information → computes the effective working directory, then walks each patch hunk → for added files it records new content; for deleted files it reads the existing content; for updated files it computes the new content and a unified diff → returns a verified patch action or a correctness error.
 
-**Call relations**: This verifier is called only by `maybe_parse_apply_patch_verified`. It delegates diff computation to `unified_diff_from_chunks` and filesystem reads to the injected `ExecutorFileSystem`.
+**Call relations**: `maybe_parse_apply_patch_verified` calls this after parsing succeeds. It calls filesystem reading for deletes and `unified_diff_from_chunks` for updates, then packages everything as an `ApplyPatchAction`.
 
 *Call graph*: calls 2 internal fn (read_file_text, from_abs_path); called by 1 (maybe_parse_apply_patch_verified); 6 external calls (new, IoError, Body, CorrectnessError, unified_diff_from_chunks, format!).
 
@@ -1337,11 +1347,11 @@ fn extract_apply_patch_from_bash(
 ) -> std::result::Result<(String, Option<String>), ExtractHeredocError>
 ```
 
-**Purpose**: Conservatively parses a shell script with Tree-sitter Bash to extract an `apply_patch` heredoc body and optional leading `cd` workdir only when the entire script matches one of two allowed top-level forms. It is intentionally strict to avoid misinterpreting arbitrary shell code as a patch invocation.
+**Purpose**: Safely extracts a heredoc patch body, and possibly a leading `cd` directory, from a very restricted shell script shape. It rejects scripts that contain extra commands or more complicated shell behavior.
 
-**Data flow**: Accepts the raw script source, lazily initializes a static `Query` over the Bash grammar that matches either a lone redirected `apply_patch` command or `cd <path> && apply_patch` with a heredoc, then creates a `Parser`, loads the Bash language, parses the source into a syntax tree, and runs the query over the root node. For each match it scans captures named `heredoc`, `cd_path`, and `cd_raw_string`, decoding UTF-8 text from source bytes, trimming the heredoc's trailing newline, and stripping surrounding single quotes from raw-string cd paths. If a match yields a heredoc body it returns `(body, optional_cd_path)`; if parsing fails it returns the corresponding `ExtractHeredocError`, and if no allowed form matches it returns `CommandDidNotStartWithApplyPatch`.
+**Data flow**: It receives shell script text → parses it with Tree-sitter Bash into a syntax tree → runs a strict query looking only for `apply_patch <<...` or `cd path && apply_patch <<...` as the entire top-level script → returns the heredoc body and optional directory, or a clear extraction error.
 
-**Call relations**: This helper is called by `extract_apply_patch_from_shell` for all currently supported shell families. It is the core syntax recognizer that enforces the module's conservative shell-matching policy.
+**Call relations**: `extract_apply_patch_from_shell` calls this for all currently supported shell kinds. Its result feeds back into `maybe_parse_apply_patch`, which then parses the extracted patch body.
 
 *Call graph*: called by 1 (extract_apply_patch_from_shell); 3 external calls (new, new, new).
 
@@ -1352,11 +1362,11 @@ fn extract_apply_patch_from_bash(
 fn wrap_patch(body: &str) -> String
 ```
 
-**Purpose**: Builds a complete patch string by surrounding a supplied body with `*** Begin Patch` and `*** End Patch`. It keeps test fixtures concise.
+**Purpose**: Builds a complete patch string around a smaller patch body for tests. This keeps test cases focused on the part being changed.
 
-**Data flow**: Takes a patch body string slice, interpolates it into the wrapper format, and returns the resulting `String`.
+**Data flow**: It receives the middle lines of a patch → adds the standard begin and end markers → returns a full patch string.
 
-**Call relations**: This helper is used by multiple unit tests in the module when constructing patch text for parsing or verification.
+**Call relations**: Several update-related tests call this before sending the patch to `parse_patch` or the verified invocation path.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1367,11 +1377,11 @@ fn wrap_patch(body: &str) -> String
 fn strs_to_strings(strs: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Converts a slice of `&str` into owned `String` values for argv fixtures. It reduces repetitive `.to_string()` calls in tests.
+**Purpose**: Converts a list of string slices into owned `String` values for test command arguments. Rust command argument lists in these tests use owned strings.
 
-**Data flow**: Maps each input string slice through `ToString::to_string` and collects the results into `Vec<String>`.
+**Data flow**: It receives borrowed string values → clones each one into an owned string → returns a vector of strings.
 
-**Call relations**: This helper underpins the shell-argv fixture builders and several direct parsing tests.
+**Call relations**: The shell argument helper functions and literal invocation tests use this to build realistic `argv` arrays.
 
 
 ##### `tests::args_bash`  (lines 412–414)
@@ -1380,11 +1390,11 @@ fn strs_to_strings(strs: &[&str]) -> Vec<String>
 fn args_bash(script: &str) -> Vec<String>
 ```
 
-**Purpose**: Constructs a `bash -lc <script>` argv vector for heredoc parsing tests. It standardizes the Unix shell fixture shape.
+**Purpose**: Creates test arguments for running a script through `bash -lc`. This gives tests a consistent way to simulate Bash heredoc commands.
 
-**Data flow**: Takes a script string slice and returns `vec!["bash", "-lc", script]` converted to owned strings via `strs_to_strings`.
+**Data flow**: It receives script text → combines it with `bash` and `-lc` → returns a vector of command arguments.
 
-**Call relations**: Used by assertion helpers and multiple heredoc tests to exercise the Bash shell-wrapper path.
+**Call relations**: Assertion helpers and heredoc tests call this before passing arguments to `maybe_parse_apply_patch`.
 
 *Call graph*: 1 external calls (strs_to_strings).
 
@@ -1395,11 +1405,11 @@ fn args_bash(script: &str) -> Vec<String>
 fn args_powershell(script: &str) -> Vec<String>
 ```
 
-**Purpose**: Constructs a `powershell.exe -Command <script>` argv vector for shell-wrapper tests. It exercises PowerShell classification while still using the shared heredoc parser.
+**Purpose**: Creates test arguments for running a script through Windows PowerShell with `-Command`. It checks that PowerShell-style invocation is recognized.
 
-**Data flow**: Builds the three-element argv slice and converts it to `Vec<String>` with `strs_to_strings`.
+**Data flow**: It receives script text → combines it with `powershell.exe` and `-Command` → returns command arguments.
 
-**Call relations**: Used by PowerShell heredoc tests.
+**Call relations**: The PowerShell heredoc test uses this, then sends the result through the common match assertion helper.
 
 *Call graph*: 1 external calls (strs_to_strings).
 
@@ -1410,11 +1420,11 @@ fn args_powershell(script: &str) -> Vec<String>
 fn args_powershell_no_profile(script: &str) -> Vec<String>
 ```
 
-**Purpose**: Constructs a `powershell.exe -NoProfile -Command <script>` argv vector to test optional skip-flag handling. It specifically covers `can_skip_flag` behavior.
+**Purpose**: Creates test arguments for PowerShell when `-NoProfile` is included before `-Command`. This tests the one optional flag the production parser allows.
 
-**Data flow**: Builds the four-element argv slice and converts it to owned strings with `strs_to_strings`.
+**Data flow**: It receives script text → builds `powershell.exe -NoProfile -Command <script>` → returns command arguments.
 
-**Call relations**: Used by the no-profile PowerShell heredoc test.
+**Call relations**: The no-profile PowerShell test uses this to confirm `parse_shell_script` accepts that extra flag.
 
 *Call graph*: 1 external calls (strs_to_strings).
 
@@ -1425,11 +1435,11 @@ fn args_powershell_no_profile(script: &str) -> Vec<String>
 fn args_pwsh(script: &str) -> Vec<String>
 ```
 
-**Purpose**: Constructs a `pwsh -NoProfile -Command <script>` argv vector for PowerShell Core parsing tests. It covers both shell-name normalization and skip-flag handling.
+**Purpose**: Creates test arguments for modern PowerShell, `pwsh`, including `-NoProfile`. This ensures both PowerShell executable names are accepted.
 
-**Data flow**: Builds the argv slice and converts it to `Vec<String>` via `strs_to_strings`.
+**Data flow**: It receives script text → builds `pwsh -NoProfile -Command <script>` → returns command arguments.
 
-**Call relations**: Used by the `pwsh` heredoc test.
+**Call relations**: The `pwsh` heredoc test uses this before calling the shared assertion helper.
 
 *Call graph*: 1 external calls (strs_to_strings).
 
@@ -1440,11 +1450,11 @@ fn args_pwsh(script: &str) -> Vec<String>
 fn args_cmd(script: &str) -> Vec<String>
 ```
 
-**Purpose**: Constructs a `cmd.exe /c <script>` argv vector for shell-wrapper parsing tests. It exercises the Cmd classification branch.
+**Purpose**: Creates test arguments for Windows `cmd.exe /c`. This checks that the command recognizer understands the Windows command shell form.
 
-**Data flow**: Builds the three-element argv slice and converts it to owned strings with `strs_to_strings`.
+**Data flow**: It receives script text → combines it with `cmd.exe` and `/c` → returns command arguments.
 
-**Call relations**: Used by the cmd heredoc-with-cd test.
+**Call relations**: The `cmd` heredoc-with-`cd` test uses this and then verifies the parsed working directory.
 
 *Call graph*: 1 external calls (strs_to_strings).
 
@@ -1455,11 +1465,11 @@ fn args_cmd(script: &str) -> Vec<String>
 fn heredoc_script(prefix: &str) -> String
 ```
 
-**Purpose**: Builds a canonical heredoc shell script containing an `apply_patch` invocation, optionally prefixed by caller-supplied shell text such as `cd foo && `. It is the main positive/negative fixture generator for shell parsing tests.
+**Purpose**: Builds a standard test script that runs `apply_patch` with a heredoc containing a simple add-file patch. A caller can provide a prefix such as `cd foo && `.
 
-**Data flow**: Interpolates the provided prefix before `apply_patch <<'PATCH'`, inserts a simple add-file patch body, and returns the full script string.
+**Data flow**: It receives a script prefix → places that prefix before `apply_patch <<'PATCH'` and a fixed patch body → returns the full shell script string.
 
-**Call relations**: Used by many heredoc matching and non-matching tests, often through `assert_match` or `assert_not_match`.
+**Call relations**: Most heredoc acceptance and rejection tests use this helper so only the shell prefix changes from test to test.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1470,11 +1480,11 @@ fn heredoc_script(prefix: &str) -> String
 fn heredoc_script_ps(prefix: &str, suffix: &str) -> String
 ```
 
-**Purpose**: Builds a heredoc script with both a prefix and suffix around the `apply_patch` invocation. It is used to test rejection of extra trailing commands.
+**Purpose**: Builds a standard heredoc script with both a configurable prefix and suffix. It is used to test that trailing extra commands are rejected.
 
-**Data flow**: Formats a script string containing the prefix, the canonical heredoc patch body, and the suffix appended after the heredoc terminator.
+**Data flow**: It receives prefix and suffix text → wraps the fixed add-file patch between them around the heredoc command → returns the full script string.
 
-**Call relations**: Used by the test that ensures `cd ... && apply_patch ... && echo done` does not match.
+**Call relations**: The test for `cd ... && apply_patch ... && echo done` uses this to add a forbidden suffix.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1485,11 +1495,11 @@ fn heredoc_script_ps(prefix: &str, suffix: &str) -> String
 fn expected_single_add() -> Vec<Hunk>
 ```
 
-**Purpose**: Returns the parsed `Hunk` vector expected from the canonical single-file add patch used in many parsing tests. It avoids repeating the same hunk literal.
+**Purpose**: Returns the expected parsed hunk for the standard test patch that adds file `foo` with `hi`. This avoids repeating the same expected value.
 
-**Data flow**: Constructs and returns `vec![Hunk::AddFile { path: "foo", contents: "hi\n" }]`.
+**Data flow**: It takes no input → constructs one add-file hunk → returns it in a vector.
 
-**Call relations**: Used by `assert_match_args` to compare parsed results against the canonical expected hunk list.
+**Call relations**: `assert_match_args` compares parser output against this expected hunk in many heredoc tests.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1500,11 +1510,11 @@ fn expected_single_add() -> Vec<Hunk>
 fn assert_match_args(args: Vec<String>, expected_workdir: Option<&str>)
 ```
 
-**Purpose**: Asserts that a given argv vector parses as `MaybeApplyPatch::Body` with the canonical single-add hunk and an expected optional workdir. It is the core positive assertion helper for shell parsing tests.
+**Purpose**: Checks that a command argument list is recognized as an `apply_patch` request with the expected working directory and standard add-file patch.
 
-**Data flow**: Calls `maybe_parse_apply_patch(&args)`, pattern-matches the result as `Body(ApplyPatchArgs { hunks, workdir, .. })`, and asserts `workdir.as_deref()` equals the expected workdir and `hunks` equals `expected_single_add()`. Any other parse result triggers `panic!` with the unexpected value.
+**Data flow**: It receives command arguments and an expected optional workdir → calls `maybe_parse_apply_patch` → compares the parsed workdir and hunks to expected values, or fails the test.
 
-**Call relations**: Used by `assert_match` and many direct shell-wrapper tests. It sits directly on top of the parser under test.
+**Call relations**: Many shell-specific tests call this after building arguments with helpers such as `args_bash`, `args_cmd`, or `args_powershell`.
 
 *Call graph*: calls 1 internal fn (maybe_parse_apply_patch); 2 external calls (assert_eq!, panic!).
 
@@ -1515,11 +1525,11 @@ fn assert_match_args(args: Vec<String>, expected_workdir: Option<&str>)
 fn assert_match(script: &str, expected_workdir: Option<&str>)
 ```
 
-**Purpose**: Convenience wrapper that asserts a Bash heredoc script matches and yields the expected workdir. It hides argv construction for positive Bash tests.
+**Purpose**: Convenience helper for Bash tests that should successfully match an `apply_patch` heredoc. It hides the repeated Bash argument setup.
 
-**Data flow**: Builds Bash argv with `args_bash(script)` and forwards it to `assert_match_args` with the expected workdir.
+**Data flow**: It receives script text and an expected workdir → wraps the script as `bash -lc` arguments → delegates the actual checking to `assert_match_args`.
 
-**Call relations**: Used by several positive heredoc tests involving plain or `cd`-prefixed Bash scripts.
+**Call relations**: Heredoc tests use this when they only need the standard Bash form.
 
 *Call graph*: 2 external calls (args_bash, assert_match_args).
 
@@ -1530,11 +1540,11 @@ fn assert_match(script: &str, expected_workdir: Option<&str>)
 fn assert_not_match(script: &str)
 ```
 
-**Purpose**: Asserts that a Bash heredoc-like script is rejected as `NotApplyPatch`. It is the negative counterpart to `assert_match`.
+**Purpose**: Checks that a Bash script is not accepted as an `apply_patch` invocation. This guards against accidentally accepting unsafe or ambiguous shell forms.
 
-**Data flow**: Builds Bash argv with `args_bash(script)`, calls `maybe_parse_apply_patch`, and uses `assert_matches!` to require `MaybeApplyPatch::NotApplyPatch`.
+**Data flow**: It receives script text → wraps it as `bash -lc` arguments → calls `maybe_parse_apply_patch` and asserts the result is `NotApplyPatch`.
 
-**Call relations**: Used by the many strictness tests that ensure malformed or extra-command shell scripts are ignored.
+**Call relations**: Negative shell-syntax tests use this for cases like semicolons, pipes, extra commands, or extra arguments.
 
 *Call graph*: 2 external calls (args_bash, assert_matches!).
 
@@ -1545,11 +1555,11 @@ fn assert_not_match(script: &str)
 async fn test_implicit_patch_single_arg_is_error()
 ```
 
-**Purpose**: Verifies that a raw patch body passed as the only argv element is treated as an implicit invocation correctness error rather than silently parsed. It protects the explicit-command contract.
+**Purpose**: Confirms that passing raw patch text as the only command argument is treated as an explicit error, not as a patch to apply.
 
-**Data flow**: Constructs a one-element argv vector containing a valid patch body, creates a temp directory and absolute cwd, calls `maybe_parse_apply_patch_verified`, and asserts the result is `MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)`.
+**Data flow**: It builds one raw patch argument and a temporary working directory → calls the verified parser → expects an `ImplicitInvocation` correctness error.
 
-**Call relations**: This async unit test exercises the early implicit-invocation guard in `maybe_parse_apply_patch_verified`.
+**Call relations**: This exercises the early raw-patch guard in `maybe_parse_apply_patch_verified`.
 
 *Call graph*: 3 external calls (assert_matches!, tempdir, vec!).
 
@@ -1560,11 +1570,11 @@ async fn test_implicit_patch_single_arg_is_error()
 async fn test_implicit_patch_bash_script_is_error()
 ```
 
-**Purpose**: Verifies that a shell script argument consisting solely of a raw patch body is also rejected as an implicit invocation. It covers the shell-script variant of the same correctness rule.
+**Purpose**: Confirms that raw patch text inside a shell script argument is also rejected as implicit invocation. This prevents shell wrapping from bypassing the explicit command requirement.
 
-**Data flow**: Builds Bash argv whose script string is itself a valid patch body, creates a temp cwd, calls `maybe_parse_apply_patch_verified`, and asserts the same `ImplicitInvocation` correctness error.
+**Data flow**: It builds `bash -lc <raw patch>` arguments and a temporary directory → calls the verified parser → expects an `ImplicitInvocation` error.
 
-**Call relations**: This test complements the single-arg implicit invocation test by exercising the `parse_shell_script` branch.
+**Call relations**: This covers the shell-script raw-patch check inside `maybe_parse_apply_patch_verified`.
 
 *Call graph*: 3 external calls (args_bash, assert_matches!, tempdir).
 
@@ -1575,11 +1585,11 @@ async fn test_implicit_patch_bash_script_is_error()
 async fn test_literal()
 ```
 
-**Purpose**: Checks direct `apply_patch <patch>` parsing for the canonical command name. It validates the simplest non-shell invocation path.
+**Purpose**: Verifies the direct command form `apply_patch <patch body>`. It proves the simplest supported invocation parses into the expected add-file hunk.
 
-**Data flow**: Builds a two-element argv vector with `apply_patch` and a valid add-file patch body, calls `maybe_parse_apply_patch`, pattern-matches `Body`, and asserts the parsed hunks equal a single `Hunk::AddFile` for `foo` with `hi\n` contents. Any other result panics.
+**Data flow**: It builds direct command arguments → calls `maybe_parse_apply_patch` → checks that the parsed hunk adds `foo` with `hi`.
 
-**Call relations**: This unit test directly exercises the direct-command branch of `maybe_parse_apply_patch`.
+**Call relations**: This directly tests the first branch of `maybe_parse_apply_patch`.
 
 *Call graph*: calls 1 internal fn (maybe_parse_apply_patch); 3 external calls (strs_to_strings, assert_eq!, panic!).
 
@@ -1590,11 +1600,11 @@ async fn test_literal()
 async fn test_literal_applypatch()
 ```
 
-**Purpose**: Checks direct parsing for the alternate command name `applypatch`. It ensures both accepted command spellings behave identically.
+**Purpose**: Verifies the alternate direct command name `applypatch`. This keeps compatibility with both accepted command spellings.
 
-**Data flow**: Builds argv with `applypatch` and a valid patch body, calls `maybe_parse_apply_patch`, and asserts the parsed hunks match the canonical single-add expectation.
+**Data flow**: It builds direct `applypatch` arguments → calls `maybe_parse_apply_patch` → checks the same expected add-file hunk.
 
-**Call relations**: This test complements `test_literal` by covering the alternate accepted command token.
+**Call relations**: This tests the shared direct-invocation command list used by `maybe_parse_apply_patch`.
 
 *Call graph*: calls 1 internal fn (maybe_parse_apply_patch); 3 external calls (strs_to_strings, assert_eq!, panic!).
 
@@ -1605,11 +1615,11 @@ async fn test_literal_applypatch()
 async fn test_heredoc()
 ```
 
-**Purpose**: Verifies that a plain Bash heredoc `apply_patch` script is recognized and parsed successfully. It is the baseline shell-wrapper positive case.
+**Purpose**: Checks that a plain Bash heredoc invoking `apply_patch` is accepted.
 
-**Data flow**: Builds the canonical heredoc script with no prefix and passes it to `assert_match` expecting no workdir.
+**Data flow**: It builds the standard heredoc script with no prefix → calls the Bash match helper → expects no working directory override.
 
-**Call relations**: This test uses the shared positive assertion helper over the Bash shell path.
+**Call relations**: This tests the normal successful path through `parse_shell_script`, `extract_apply_patch_from_bash`, and `parse_patch`.
 
 *Call graph*: 2 external calls (assert_match, heredoc_script).
 
@@ -1620,11 +1630,11 @@ async fn test_heredoc()
 async fn test_heredoc_non_login_shell()
 ```
 
-**Purpose**: Verifies that `bash -c` is accepted in addition to `bash -lc`. It covers the alternate Unix shell flag recognized by `classify_shell`.
+**Purpose**: Checks that `bash -c` is accepted as well as `bash -lc`. This allows both common Bash command flags.
 
-**Data flow**: Builds the canonical heredoc script, constructs argv `['bash', '-c', script]`, and passes it to `assert_match_args` expecting no workdir.
+**Data flow**: It builds a standard heredoc script and wraps it as `bash -c` arguments → calls the shared match assertion → expects a normal parsed patch.
 
-**Call relations**: This test specifically exercises the `-c` branch in shell classification.
+**Call relations**: This specifically covers the flag handling in `classify_shell`.
 
 *Call graph*: 3 external calls (assert_match_args, heredoc_script, strs_to_strings).
 
@@ -1635,11 +1645,11 @@ async fn test_heredoc_non_login_shell()
 async fn test_heredoc_applypatch()
 ```
 
-**Purpose**: Verifies that the alternate command name `applypatch` is recognized inside a heredoc shell script. It extends alternate-name support to shell parsing.
+**Purpose**: Checks that the heredoc form also accepts the alternate command name `applypatch`.
 
-**Data flow**: Builds Bash argv containing a heredoc script whose command token is `applypatch`, calls `maybe_parse_apply_patch`, pattern-matches `Body`, and asserts `workdir == None` and the parsed hunks equal the canonical single-add hunk.
+**Data flow**: It builds a Bash heredoc using `applypatch` → calls `maybe_parse_apply_patch` → verifies the parsed hunk and absence of workdir.
 
-**Call relations**: This test directly exercises shell parsing without the assertion helper because it checks both hunks and workdir explicitly.
+**Call relations**: This exercises the command-name check inside the Tree-sitter query used by `extract_apply_patch_from_bash`.
 
 *Call graph*: calls 1 internal fn (maybe_parse_apply_patch); 3 external calls (strs_to_strings, assert_eq!, panic!).
 
@@ -1650,11 +1660,11 @@ async fn test_heredoc_applypatch()
 async fn test_powershell_heredoc()
 ```
 
-**Purpose**: Verifies that a PowerShell `-Command` wrapper is accepted and parsed through the shared heredoc extractor. It covers shell-name normalization for `powershell.exe`.
+**Purpose**: Checks that a PowerShell `-Command` wrapper can carry the supported heredoc patch form.
 
-**Data flow**: Builds the canonical heredoc script, wraps it with `args_powershell`, and passes the argv to `assert_match_args` expecting no workdir.
+**Data flow**: It builds the standard heredoc script → wraps it with PowerShell arguments → verifies it parses as the standard add-file patch.
 
-**Call relations**: This test exercises the PowerShell classification branch while still relying on the Bash-based heredoc parser.
+**Call relations**: This confirms `parse_shell_script` recognizes PowerShell and that extraction is routed through the common heredoc parser.
 
 *Call graph*: 3 external calls (args_powershell, assert_match_args, heredoc_script).
 
@@ -1665,11 +1675,11 @@ async fn test_powershell_heredoc()
 async fn test_powershell_heredoc_no_profile()
 ```
 
-**Purpose**: Verifies that PowerShell invocations with `-NoProfile` are accepted. It specifically covers the optional skip-flag logic.
+**Purpose**: Checks that PowerShell with `-NoProfile` before `-Command` still works. This protects the allowed optional-flag path.
 
-**Data flow**: Builds the canonical heredoc script, wraps it with `args_powershell_no_profile`, and asserts successful parsing with no workdir.
+**Data flow**: It builds a heredoc script → wraps it as `powershell.exe -NoProfile -Command` → verifies the parsed patch matches expectations.
 
-**Call relations**: This test targets the `can_skip_flag` path in `parse_shell_script`.
+**Call relations**: This test relies on `can_skip_flag` allowing exactly that extra PowerShell flag.
 
 *Call graph*: 3 external calls (args_powershell_no_profile, assert_match_args, heredoc_script).
 
@@ -1680,11 +1690,11 @@ async fn test_powershell_heredoc_no_profile()
 async fn test_pwsh_heredoc()
 ```
 
-**Purpose**: Verifies that `pwsh -NoProfile -Command` is accepted and parsed. It covers PowerShell Core naming plus skip-flag handling.
+**Purpose**: Checks that `pwsh`, the newer PowerShell executable name, is accepted.
 
-**Data flow**: Builds the canonical heredoc script, wraps it with `args_pwsh`, and asserts successful parsing with no workdir.
+**Data flow**: It builds a heredoc script → wraps it as `pwsh -NoProfile -Command` → verifies the standard parsed patch.
 
-**Call relations**: This test complements the Windows PowerShell tests with the `pwsh` executable name.
+**Call relations**: This covers the `pwsh` branch in shell classification.
 
 *Call graph*: 3 external calls (args_pwsh, assert_match_args, heredoc_script).
 
@@ -1695,11 +1705,11 @@ async fn test_pwsh_heredoc()
 async fn test_cmd_heredoc_with_cd()
 ```
 
-**Purpose**: Verifies that a `cmd.exe /c` wrapper containing `cd foo && apply_patch <<...` is recognized and yields `workdir = Some("foo")`. It covers the Cmd shell classification branch plus workdir extraction.
+**Purpose**: Checks that a Windows `cmd.exe /c` script with `cd foo && apply_patch` records `foo` as the workdir.
 
-**Data flow**: Builds a heredoc script prefixed with `cd foo && `, wraps it with `args_cmd`, and asserts successful parsing with expected workdir `foo`.
+**Data flow**: It builds a heredoc script with a leading `cd foo && ` → wraps it in `cmd.exe /c` arguments → verifies parsing succeeds and workdir is `foo`.
 
-**Call relations**: This test exercises both shell classification for Cmd and the `cd`-capture branch of the Tree-sitter query.
+**Call relations**: This combines `cmd` classification with the heredoc extractor’s `cd`-plus-apply form.
 
 *Call graph*: 3 external calls (args_cmd, assert_match_args, heredoc_script).
 
@@ -1710,11 +1720,11 @@ async fn test_cmd_heredoc_with_cd()
 async fn test_heredoc_with_leading_cd()
 ```
 
-**Purpose**: Verifies that a Bash heredoc script prefixed by `cd foo &&` is recognized and records the workdir. It is the positive Unix counterpart to the cmd test.
+**Purpose**: Checks that Bash accepts the safe working-directory form `cd foo && apply_patch`.
 
-**Data flow**: Builds the prefixed heredoc script and passes it to `assert_match` expecting `Some("foo")`.
+**Data flow**: It builds a heredoc script prefixed with `cd foo && ` → calls the Bash match helper → expects the parsed workdir to be `foo`.
 
-**Call relations**: This test uses the shared positive helper to cover the `cd` variant of the Bash query.
+**Call relations**: This tests the second accepted Tree-sitter query pattern in `extract_apply_patch_from_bash`.
 
 *Call graph*: 2 external calls (assert_match, heredoc_script).
 
@@ -1725,11 +1735,11 @@ async fn test_heredoc_with_leading_cd()
 async fn test_cd_with_semicolon_is_ignored()
 ```
 
-**Purpose**: Ensures `cd foo; apply_patch ...` does not match because only `&&` is allowed between `cd` and `apply_patch`. It enforces the strict connector rule.
+**Purpose**: Confirms that `cd foo; apply_patch` is rejected. A semicolon means “run the next command regardless,” which is not the strict safe form this parser allows.
 
-**Data flow**: Builds a heredoc script prefixed with `cd foo; ` and asserts `maybe_parse_apply_patch` returns `NotApplyPatch` via `assert_not_match`.
+**Data flow**: It builds a script using `cd foo; ` before the heredoc → asserts the command is not recognized as apply_patch.
 
-**Call relations**: This negative test exercises the query's refusal to match semicolon-separated commands.
+**Call relations**: This protects the requirement that the connector between `cd` and `apply_patch` must be `&&`.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1740,11 +1750,11 @@ async fn test_cd_with_semicolon_is_ignored()
 async fn test_cd_or_apply_patch_is_ignored()
 ```
 
-**Purpose**: Ensures `cd bar || apply_patch ...` is ignored. It prevents alternate shell control-flow operators from being misinterpreted as the supported `cd && apply_patch` form.
+**Purpose**: Confirms that `cd bar || apply_patch` is rejected. The parser does not allow fallback-style shell logic.
 
-**Data flow**: Builds a heredoc script prefixed with `cd bar || ` and asserts non-match with `assert_not_match`.
+**Data flow**: It builds a script using `cd bar || ` before the heredoc → asserts it does not match.
 
-**Call relations**: This test covers another negative connector case in the shell query.
+**Call relations**: This checks that `extract_apply_patch_from_bash` accepts only the strict `cd path && apply_patch` shape.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1755,11 +1765,11 @@ async fn test_cd_or_apply_patch_is_ignored()
 async fn test_cd_pipe_apply_patch_is_ignored()
 ```
 
-**Purpose**: Ensures `cd bar | apply_patch ...` is ignored. It prevents pipeline syntax from matching the strict allowed form.
+**Purpose**: Confirms that piping from `cd` into `apply_patch` is rejected. A pipe is not a valid way to set the working directory.
 
-**Data flow**: Builds a heredoc script prefixed with `cd bar | ` and asserts `NotApplyPatch`.
+**Data flow**: It builds a script using `cd bar | ` before the heredoc → asserts it is not recognized.
 
-**Call relations**: This is another negative strictness test for shell parsing.
+**Call relations**: This guards the Tree-sitter query against accepting shell operators other than `&&`.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1770,11 +1780,11 @@ async fn test_cd_pipe_apply_patch_is_ignored()
 async fn test_cd_single_quoted_path_with_spaces()
 ```
 
-**Purpose**: Verifies that a single-quoted `cd 'foo bar' && apply_patch ...` path is captured correctly. It covers raw-string path extraction and quote stripping.
+**Purpose**: Checks that a single-quoted `cd` path containing spaces is accepted and unquoted correctly.
 
-**Data flow**: Builds the prefixed heredoc script and asserts successful parsing with expected workdir `foo bar`.
+**Data flow**: It builds `cd 'foo bar' && apply_patch ...` → parses it → expects the workdir value `foo bar`.
 
-**Call relations**: This test exercises the `cd_raw_string` capture handling in `extract_apply_patch_from_bash`.
+**Call relations**: This tests the raw-string capture path in `extract_apply_patch_from_bash`.
 
 *Call graph*: 2 external calls (assert_match, heredoc_script).
 
@@ -1785,11 +1795,11 @@ async fn test_cd_single_quoted_path_with_spaces()
 async fn test_cd_double_quoted_path_with_spaces()
 ```
 
-**Purpose**: Verifies that a double-quoted `cd "foo bar" && apply_patch ...` path is captured correctly. It covers string-content path extraction.
+**Purpose**: Checks that a double-quoted `cd` path containing spaces is accepted.
 
-**Data flow**: Builds the prefixed heredoc script and asserts successful parsing with expected workdir `foo bar`.
+**Data flow**: It builds `cd "foo bar" && apply_patch ...` → parses it → expects the workdir value `foo bar`.
 
-**Call relations**: This test exercises the `cd_path` capture branch for quoted strings.
+**Call relations**: This tests the string-content capture path in the heredoc extraction query.
 
 *Call graph*: 2 external calls (assert_match, heredoc_script).
 
@@ -1800,11 +1810,11 @@ async fn test_cd_double_quoted_path_with_spaces()
 async fn test_echo_and_apply_patch_is_ignored()
 ```
 
-**Purpose**: Ensures a script beginning with `echo foo &&` before `apply_patch` does not match. It enforces that only the allowed top-level forms are recognized.
+**Purpose**: Confirms that `echo foo && apply_patch` is not mistaken for the safe `cd && apply_patch` form.
 
-**Data flow**: Builds a heredoc script prefixed with `echo foo && ` and asserts `NotApplyPatch`.
+**Data flow**: It builds a script prefixed with `echo foo && ` → asserts it is not recognized.
 
-**Call relations**: This negative test validates that unrelated leading commands prevent a match.
+**Call relations**: This ensures the extractor specifically requires `cd` before `&&`, not just any command.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1815,11 +1825,11 @@ async fn test_echo_and_apply_patch_is_ignored()
 async fn test_apply_patch_with_arg_is_ignored()
 ```
 
-**Purpose**: Ensures `apply_patch foo <<'PATCH' ...` is ignored because the heredoc form must not include extra positional arguments. It enforces the exact command shape.
+**Purpose**: Confirms that heredoc `apply_patch` with an extra positional argument is rejected. The supported heredoc command takes no normal arguments.
 
-**Data flow**: Constructs a script string with an extra `foo` argument before the heredoc redirect and asserts non-match with `assert_not_match`.
+**Data flow**: It builds `apply_patch foo <<'PATCH' ...` → asserts the script is not recognized.
 
-**Call relations**: This test covers the query's restriction to a bare command name before the heredoc redirect.
+**Call relations**: This protects the strict direct heredoc pattern in `extract_apply_patch_from_bash`.
 
 *Call graph*: 1 external calls (assert_not_match).
 
@@ -1830,11 +1840,11 @@ async fn test_apply_patch_with_arg_is_ignored()
 async fn test_double_cd_then_apply_patch_is_ignored()
 ```
 
-**Purpose**: Ensures `cd foo && cd bar && apply_patch ...` is ignored. It prevents multi-command prefixes from matching the single-`cd` allowed form.
+**Purpose**: Confirms that chained directory changes like `cd foo && cd bar && apply_patch` are rejected. The parser only accepts one simple optional `cd`.
 
-**Data flow**: Builds the doubly-prefixed heredoc script and asserts `NotApplyPatch`.
+**Data flow**: It builds a script with two `cd` commands before the heredoc → asserts it is not recognized.
 
-**Call relations**: This negative test validates the whole-script strictness of the Tree-sitter query.
+**Call relations**: This keeps `extract_apply_patch_from_bash` from accepting more complex shell command lists.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1845,11 +1855,11 @@ async fn test_double_cd_then_apply_patch_is_ignored()
 async fn test_cd_two_args_is_ignored()
 ```
 
-**Purpose**: Ensures `cd foo bar && apply_patch ...` is ignored because only one positional `cd` argument is allowed. It enforces the exact `cd` argument shape.
+**Purpose**: Confirms that `cd` with two arguments is rejected. The supported form allows exactly one path argument.
 
-**Data flow**: Builds the invalid `cd`-with-two-args heredoc script and asserts non-match.
+**Data flow**: It builds `cd foo bar && apply_patch ...` → asserts it does not match.
 
-**Call relations**: This test covers the query's restriction on `cd` argument count.
+**Call relations**: This tests the strict `cd` argument shape in the Tree-sitter query.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1860,11 +1870,11 @@ async fn test_cd_two_args_is_ignored()
 async fn test_cd_then_apply_patch_then_extra_is_ignored()
 ```
 
-**Purpose**: Ensures trailing commands after a valid-looking `cd && apply_patch` heredoc cause the whole script to be ignored. It enforces that the matched statement be the only top-level statement.
+**Purpose**: Confirms that extra commands after the heredoc invocation are rejected. The patch command must be the whole top-level script.
 
-**Data flow**: Builds a script with prefix `cd bar && ` and suffix ` && echo done` using `heredoc_script_ps`, then asserts `NotApplyPatch`.
+**Data flow**: It builds `cd bar && apply_patch ... && echo done` → asserts it is not recognized.
 
-**Call relations**: This negative test targets the query anchors that forbid trailing commands.
+**Call relations**: This protects the query anchors in `extract_apply_patch_from_bash`, which require no trailing command.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script_ps).
 
@@ -1875,11 +1885,11 @@ async fn test_cd_then_apply_patch_then_extra_is_ignored()
 async fn test_echo_then_cd_and_apply_patch_is_ignored()
 ```
 
-**Purpose**: Ensures preceding commands before `cd ... && apply_patch` prevent a match. It validates the query anchors that forbid leading top-level statements.
+**Purpose**: Confirms that commands before a valid-looking `cd && apply_patch` sequence cause rejection. The file only accepts a single top-level patch command.
 
-**Data flow**: Builds a script prefixed with `echo foo; cd bar && ` and asserts non-match.
+**Data flow**: It builds `echo foo; cd bar && apply_patch ...` → asserts it is not recognized.
 
-**Call relations**: This test complements the trailing-command rejection case by covering leading-command rejection.
+**Call relations**: This tests the leading anchor behavior in the heredoc extraction query.
 
 *Call graph*: 2 external calls (assert_not_match, heredoc_script).
 
@@ -1890,11 +1900,11 @@ async fn test_echo_then_cd_and_apply_patch_is_ignored()
 async fn test_unified_diff_last_line_replacement()
 ```
 
-**Purpose**: Verifies unified-diff generation for replacing the last line of a file. It checks EOF-sensitive diff formatting.
+**Purpose**: Checks that replacing the last line of a file produces the correct unified diff and new content. A unified diff is a standard text format showing removed and added lines.
 
-**Data flow**: Creates a temp file `last.txt` with three lines, builds and parses an update patch replacing `baz` with `BAZ`, extracts the update chunks, computes an absolute path, calls `unified_diff_from_chunks`, and asserts the returned `ApplyPatchFileUpdate` equals the expected unified diff, original content, and new content.
+**Data flow**: It creates a temporary file → builds and parses an update patch that changes the final line → calls `unified_diff_from_chunks` → compares the resulting diff, original content, and new content to expected values.
 
-**Call relations**: This async unit test exercises the verifier-side diff computation used by `verify_apply_patch_args`.
+**Call relations**: Although the diff function lives outside this file, this test supports `verify_apply_patch_args`, which depends on that diff result for update hunks.
 
 *Call graph*: calls 1 internal fn (parse_patch); 7 external calls (wrap_patch, assert_eq!, unified_diff_from_chunks, format!, write, panic!, tempdir).
 
@@ -1905,11 +1915,11 @@ async fn test_unified_diff_last_line_replacement()
 async fn test_unified_diff_insert_at_eof()
 ```
 
-**Purpose**: Verifies unified-diff generation for inserting a line at end-of-file. It covers the `*** End of File` chunk semantics.
+**Purpose**: Checks that inserting a line at the end of a file produces the correct diff and final content.
 
-**Data flow**: Creates a temp file `insert.txt`, builds and parses an update patch that appends `quux`, extracts chunks, computes the absolute path, calls `unified_diff_from_chunks`, and asserts the returned diff and contents match the expected EOF insertion result.
+**Data flow**: It creates a temporary file → builds and parses a patch with an end-of-file insertion → calls `unified_diff_from_chunks` → compares the result to the expected diff and content.
 
-**Call relations**: This test complements the last-line replacement case by covering pure EOF insertion.
+**Call relations**: This covers another update case used by `verify_apply_patch_args` when turning patch chunks into verified file changes.
 
 *Call graph*: calls 1 internal fn (parse_patch); 7 external calls (wrap_patch, assert_eq!, unified_diff_from_chunks, format!, write, panic!, tempdir).
 
@@ -1920,11 +1930,11 @@ async fn test_unified_diff_insert_at_eof()
 async fn test_apply_patch_should_resolve_absolute_paths_in_cwd()
 ```
 
-**Purpose**: Verifies that verification resolves relative patch paths against the provided cwd and reads the correct file contents from that directory. It guards against accidentally resolving relative paths elsewhere.
+**Purpose**: Verifies that relative patch paths are resolved against the provided current directory, not some unrelated process directory.
 
-**Data flow**: Creates a temp session directory and a file `source.txt` inside it, builds direct `apply_patch` argv updating that relative path, calls `maybe_parse_apply_patch_verified` with the session directory as absolute cwd, and asserts the result is `MaybeApplyPatchVerified::Body` containing an `ApplyPatchAction` whose `changes` map keys the session file path and whose update change contains the expected unified diff and new content.
+**Data flow**: It creates a temporary session directory and file → builds a direct update patch for a relative path → calls `maybe_parse_apply_patch_verified` with that directory as cwd → checks that the resulting action points to the correct absolute file and contains the expected diff.
 
-**Call relations**: This test exercises the verified parsing path end-to-end, including cwd-relative resolution and diff computation.
+**Call relations**: This tests the path resolution behavior inside `verify_apply_patch_args` through the public verified parser.
 
 *Call graph*: calls 2 internal fn (maybe_parse_apply_patch_verified, from_absolute_path); 4 external calls (assert_eq!, write, tempdir, vec!).
 
@@ -1935,11 +1945,11 @@ async fn test_apply_patch_should_resolve_absolute_paths_in_cwd()
 async fn test_apply_patch_resolves_move_path_with_effective_cwd()
 ```
 
-**Purpose**: Verifies that when a shell heredoc includes `cd <worktree> && apply_patch`, both the source path and `*** Move to:` destination are resolved against that effective cwd. It checks move-path rebasing under shell-extracted workdirs.
+**Purpose**: Checks that rename destinations are resolved against the effective working directory, including a `cd` from the shell script.
 
-**Data flow**: Creates a temp session directory with subdirectory `alt`, writes `old.txt` there, builds a patch that updates and moves it to `renamed.txt`, wraps that patch in a Bash script prefixed by `cd alt &&`, and calls `maybe_parse_apply_patch_verified` with the session directory as cwd. It extracts the resulting `ApplyPatchAction`, asserts `action.cwd` equals the `alt` directory, looks up the source-path change in `action.changes()`, and asserts the `Update` variant's `move_path` equals `alt/renamed.txt`.
+**Data flow**: It creates a session directory with an `alt` subdirectory and source file → builds a shell heredoc patch that runs after `cd alt` and moves the file → calls `maybe_parse_apply_patch_verified` → checks that both action cwd and move destination are inside `alt`.
 
-**Call relations**: This test specifically exercises the interaction between shell workdir extraction in `maybe_parse_apply_patch` and path resolution in `verify_apply_patch_args`.
+**Call relations**: This exercises `maybe_parse_apply_patch_verified`, heredoc workdir extraction, and the move-path logic in `verify_apply_patch_args` together.
 
 *Call graph*: calls 2 internal fn (maybe_parse_apply_patch_verified, from_absolute_path); 8 external calls (wrap_patch, assert_eq!, format!, create_dir_all, write, panic!, tempdir, vec!).
 
@@ -1950,11 +1960,11 @@ async fn test_apply_patch_resolves_move_path_with_effective_cwd()
 async fn test_unreadable_destinations_still_verify()
 ```
 
-**Purpose**: Verifies that verification succeeds even when an add destination or move destination already exists as unreadable binary data. Verification should describe the intended change without requiring destination text readability.
+**Purpose**: Confirms that adding over, or moving to, a destination that contains unreadable text bytes does not block verification. The verifier does not need to read destination contents for those operations.
 
-**Data flow**: Creates a temp directory, writes unreadable bytes to `binary.dat`, prepares one add-file argv targeting that path and one move/update argv moving `source.txt` to that path, and for each argv calls `maybe_parse_apply_patch_verified` with the temp cwd. It asserts each result matches `MaybeApplyPatchVerified::Body(_)`.
+**Data flow**: It creates a temporary directory with a binary-looking destination file and a readable source file → tries an add patch and a move patch → calls `maybe_parse_apply_patch_verified` for each → expects both to produce verified actions.
 
-**Call relations**: This test covers a permissive verification edge case in `verify_apply_patch_args`, especially around destination overwrite handling.
+**Call relations**: This protects `verify_apply_patch_args` from doing unnecessary reads of add or move destinations.
 
 *Call graph*: calls 2 internal fn (maybe_parse_apply_patch_verified, from_absolute_path); 4 external calls (assert!, write, tempdir, vec!).
 
@@ -1965,11 +1975,11 @@ async fn test_unreadable_destinations_still_verify()
 async fn test_delete_symlink_still_verifies()
 ```
 
-**Purpose**: Verifies that deleting a symlink still passes verification. The verifier should describe the delete action even if later delta exactness during application may be inexact.
+**Purpose**: On Unix systems, checks that deleting a symbolic link can still be verified. A symbolic link is a filesystem entry that points to another file.
 
-**Data flow**: On Unix, creates a temp directory, writes a target file, creates a symlink `link.txt` to it, builds direct `apply_patch` argv deleting `link.txt`, calls `maybe_parse_apply_patch_verified`, and asserts the result is `MaybeApplyPatchVerified::Body(_)`.
+**Data flow**: It creates a target file and a symlink to it → builds a delete patch for the link → calls `maybe_parse_apply_patch_verified` → expects a verified action.
 
-**Call relations**: This test exercises verification behavior for symlink deletes, complementing application-time tests in `lib.rs` that track exactness.
+**Call relations**: This tests the delete path in `verify_apply_patch_args`, which reads the file text through the filesystem abstraction before recording the delete.
 
 *Call graph*: calls 2 internal fn (maybe_parse_apply_patch_verified, from_absolute_path); 4 external calls (assert!, write, tempdir, vec!).
 
@@ -1979,9 +1989,13 @@ These files perform the actual patch application work, either through the native
 
 ### `apply-patch/src/lib.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `during apply_patch execution`
 
-This crate root defines the public patch-application data model and the functions that actually mutate files. `ApplyPatchError`, `IoError`, `ApplyPatchArgs`, `ApplyPatchFileChange`, `MaybeApplyPatchVerified`, `ApplyPatchAction`, `AppliedPatchDelta`, `AppliedPatchChange`, `AppliedPatchFileChange`, and `ApplyPatchFailure` capture parse/verification errors, intended actions, and the exact-or-inexact textual mutations that were definitely committed before success or failure. `apply_patch` parses raw patch text with `parse_patch`, prints human-readable parse errors to stderr, and delegates to `apply_hunks`. `apply_hunks` applies parsed hunks through `apply_hunks_to_files`, prints a git-style summary on success, and wraps any failure together with the accumulated delta. The file-application loop resolves each hunk path against an absolute cwd, reads prior contents when needed, writes added or updated files, removes deleted or moved sources, and carefully downgrades delta exactness when metadata or content cannot be read reliably or when a write/remove may have had side effects before failing. Update hunks are transformed by `derive_new_contents_from_chunks`, which reads the original file, splits it into lines, computes replacement spans with `compute_replacements` using `seek_sequence`, and applies them in reverse order with `apply_replacements`. Unified diffs are generated from original and derived contents via `similar::TextDiff`. Helper functions enforce non-directory deletes, retry writes after creating missing parent directories, and detect whether failed removals were side-effect free. The extensive tests cover add/delete/update/move behavior, mixed relative and absolute paths, multi-chunk updates, EOF insertions, Unicode punctuation matching, unified-diff formatting, partial-failure delta reporting, and inexactness for unreadable destinations or symlink deletes.
+This file is the “do the work” layer for applying Codex-style patches. A patch is a small text recipe that says things like “add this file,” “delete that file,” or “replace these lines with those lines.” Without this file, the system could parse patch text but would not actually change files safely or explain what happened.
+
+The main flow is simple. `apply_patch` first asks the parser to understand the patch text. If the patch is malformed, it prints a clear error. If parsing succeeds, `apply_hunks` sends the parsed pieces, called hunks, to the filesystem worker. Each hunk is then applied one by one: added files are written, deleted files are removed, and updated files are read, edited in memory, then written back. Relative paths are resolved against the chosen working directory.
+
+The file is careful about failures. If a later step fails after an earlier file was already changed, it returns an `ApplyPatchFailure` containing a delta: a record of changes that definitely happened. The delta can be “exact” or “inexact.” Inexact means the code cannot fully prove what changed, for example after a write error or when dealing with symlinks or unreadable content. This is like a repair log that says, “Here is what I know I changed, and here is whether I am completely sure.”
 
 #### Function details
 
@@ -1991,11 +2005,11 @@ This crate root defines the public patch-application data model and the function
 fn from(err: &std::io::Error) -> Self
 ```
 
-**Purpose**: Converts a borrowed `std::io::Error` into an owned `ApplyPatchError::IoError` with generic context. It preserves the original error kind and message while avoiding lifetime issues.
+**Purpose**: Converts a standard input/output error into this crate’s patch-specific error type. This lets the rest of the patch code speak in one shared error language.
 
-**Data flow**: Accepts `&std::io::Error`, constructs a new owned `std::io::Error` from `err.kind()` and `err.to_string()`, wraps it in `IoError { context: "I/O error" }`, and returns `ApplyPatchError::IoError`.
+**Data flow**: It receives a borrowed `std::io::Error`, copies its kind and message into a new error value, wraps that in `IoError`, and returns `ApplyPatchError::IoError`.
 
-**Call relations**: This conversion is used by `apply_hunks` when turning write-to-stdout/stderr failures or downcasted I/O failures into the crate's error type.
+**Call relations**: When `apply_hunks` needs to turn a low-level filesystem or printing problem into a patch failure, it calls this conversion so the caller receives the same kind of error shape as other patch problems.
 
 *Call graph*: called by 1 (apply_hunks); 4 external calls (IoError, kind, new, to_string).
 
@@ -2006,11 +2020,11 @@ fn from(err: &std::io::Error) -> Self
 fn eq(&self, other: &Self) -> bool
 ```
 
-**Purpose**: Defines equality for `IoError` based on context string and rendered source error text rather than exact `std::io::Error` identity. This makes tests stable across reconstructed I/O errors.
+**Purpose**: Compares two wrapped input/output errors for tests and equality checks. It treats two errors as equal when their human context and displayed source message match.
 
-**Data flow**: Compares `self.context` to `other.context` and `self.source.to_string()` to `other.source.to_string()`, returning a boolean.
+**Data flow**: It reads the `context` strings and converts each underlying source error to text, then returns true if both pieces match.
 
-**Call relations**: This method underlies `PartialEq` for `IoError`, enabling equality assertions on higher-level error values in tests.
+**Call relations**: This supports equality for `ApplyPatchError`, which is useful when tests or callers need to compare errors without relying on hidden operating-system error internals.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -2021,11 +2035,11 @@ fn eq(&self, other: &Self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether a verified patch action contains no file changes. It is a simple convenience query over the internal changes map.
+**Purpose**: Answers whether a parsed patch action would change no files. Callers use this to avoid approving or running a patch that has nothing to do.
 
-**Data flow**: Reads `self.changes.is_empty()` and returns the boolean result without mutation.
+**Data flow**: It reads the internal map of planned file changes and returns true if that map has no entries.
 
-**Call relations**: This method is used by downstream safety-assessment logic outside this file to detect no-op patch actions.
+**Call relations**: Safety-checking code such as `assess_patch_safety` calls this after parsing an apply_patch command, before deciding how to treat it.
 
 *Call graph*: called by 1 (assess_patch_safety).
 
@@ -2036,11 +2050,11 @@ fn is_empty(&self) -> bool
 fn changes(&self) -> &HashMap<PathBuf, ApplyPatchFileChange>
 ```
 
-**Purpose**: Exposes the verified patch action's absolute-path change map for inspection. It provides read-only access to the planned file mutations.
+**Purpose**: Exposes the planned file changes from a parsed patch action. This is used by code that needs to inspect paths, show changes, or decide whether the patch is allowed.
 
-**Data flow**: Returns `&HashMap<PathBuf, ApplyPatchFileChange>` referencing `self.changes`.
+**Data flow**: It receives the action object, reads its internal `changes` map, and returns a shared reference to it without modifying anything.
 
-**Call relations**: This accessor is used by downstream protocol conversion and policy checks, and by tests that inspect verified actions.
+**Call relations**: Protocol conversion, writable-path checks, and path collection call this to look inside an already parsed `ApplyPatchAction` without taking ownership of it.
 
 *Call graph*: called by 3 (convert_apply_patch_to_protocol, is_write_patch_constrained_to_writable_paths, file_paths_for_action).
 
@@ -2051,11 +2065,11 @@ fn changes(&self) -> &HashMap<PathBuf, ApplyPatchFileChange>
 fn new_add_for_test(path: &AbsolutePathBuf, content: String) -> Self
 ```
 
-**Purpose**: Constructs a synthetic single-file add action for tests without going through parsing. It fabricates both the patch text and the internal change map from an absolute path and content.
+**Purpose**: Builds a small fake patch action that represents adding one file. It exists only to make tests concise.
 
-**Data flow**: Accepts an absolute path and content string, extracts the filename and parent directory, formats a minimal patch string referencing that filename, builds a `HashMap` mapping the full path to `ApplyPatchFileChange::Add { content }`, and returns `ApplyPatchAction { changes, cwd: parent, patch }`.
+**Data flow**: It receives an absolute path and file content, builds a patch text string around the file name, creates a one-entry change map, sets the working directory to the file’s parent, and returns an `ApplyPatchAction`.
 
-**Call relations**: This helper is used only by tests in other parts of the system that need a ready-made `ApplyPatchAction` fixture.
+**Call relations**: Many tests call this helper when they need a ready-made add-file action for approval, sandbox, or protocol behavior, instead of writing full parsing setup each time.
 
 *Call graph*: calls 2 internal fn (parent, to_path_buf); called by 14 (convert_apply_patch_maps_add_variant, explicit_read_only_subpaths_prevent_auto_approval_for_external_sandbox, explicit_unreadable_paths_prevent_auto_approval_for_external_sandbox, external_sandbox_auto_approves_in_on_request, granular_sandbox_approval_false_rejects_out_of_root_patch, granular_with_all_flags_true_matches_on_request_for_out_of_root_patch, missing_project_dot_codex_config_requires_approval, read_only_policy_rejects_patch_with_read_only_reason, approval_keys_include_environment_id, file_system_sandbox_context_uses_active_attempt (+4 more)); 3 external calls (from, format!, file_name).
 
@@ -2066,11 +2080,11 @@ fn new_add_for_test(path: &AbsolutePathBuf, content: String) -> Self
 fn new(changes: Vec<AppliedPatchChange>, exact: bool) -> Self
 ```
 
-**Purpose**: Creates an `AppliedPatchDelta` from an ordered list of committed changes and an exactness flag. It is the internal constructor for delta values.
+**Purpose**: Creates a record of file changes that were actually committed, along with whether that record is complete and reliable.
 
-**Data flow**: Consumes a `Vec<AppliedPatchChange>` and `bool exact`, stores them in `Self { changes, exact }`, and returns the new delta.
+**Data flow**: It receives a list of committed changes and a boolean named `exact`, stores both, and returns a new `AppliedPatchDelta`.
 
-**Call relations**: Used internally by `empty` and by tests that assert exact delta contents.
+**Call relations**: Other constructors and tests use this as the basic way to assemble a delta, especially when they need to state whether the delta is exact.
 
 
 ##### `AppliedPatchDelta::empty`  (lines 195–197)
@@ -2079,11 +2093,11 @@ fn new(changes: Vec<AppliedPatchChange>, exact: bool) -> Self
 fn empty() -> Self
 ```
 
-**Purpose**: Constructs an empty, exact delta representing no committed changes. It is the default starting state before patch application begins.
+**Purpose**: Creates a delta that says no file changes have happened yet. It starts as exact because there is nothing uncertain to report.
 
-**Data flow**: Calls `AppliedPatchDelta::new(Vec::new(), true)` and returns the result.
+**Data flow**: It creates an empty list of changes, marks it exact, and returns that as an `AppliedPatchDelta`.
 
-**Call relations**: Used by `ApplyPatchFailure::without_delta`, `apply_hunks`, and the `Default` impl.
+**Call relations**: `apply_hunks` uses this at the start of patch application, and `ApplyPatchFailure::without_delta` uses it when an error happened before any file mutation.
 
 *Call graph*: called by 2 (without_delta, apply_hunks); 2 external calls (new, new).
 
@@ -2094,11 +2108,11 @@ fn empty() -> Self
 fn changes(&self) -> &[AppliedPatchChange]
 ```
 
-**Purpose**: Returns the ordered list of committed file changes recorded in the delta. It preserves application order for downstream consumers.
+**Purpose**: Returns the list of committed file changes stored in a delta. This lets callers inspect what actually happened.
 
-**Data flow**: Returns a slice reference `&[AppliedPatchChange]` over `self.changes`.
+**Data flow**: It reads the internal change list and returns it as a shared slice, without changing the delta.
 
-**Call relations**: Used by downstream tracking logic outside this file to inspect committed mutations.
+**Call relations**: Tracking code such as `track_delta` uses this after patch application to update higher-level state from the known file mutations.
 
 *Call graph*: called by 1 (track_delta).
 
@@ -2109,11 +2123,11 @@ fn changes(&self) -> &[AppliedPatchChange]
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether the delta contains no committed changes. It is a convenience query over the internal change list.
+**Purpose**: Answers whether the delta contains no committed file changes. This helps callers skip work when nothing happened.
 
-**Data flow**: Returns `self.changes.is_empty()`.
+**Data flow**: It checks the internal change list and returns true if it has no entries.
 
-**Call relations**: Used by downstream tracker logic to distinguish no-op deltas from partial or full mutations.
+**Call relations**: State-tracking code such as `tracker_update_for_known_delta` calls this before deciding whether there is any patch result to record.
 
 *Call graph*: called by 1 (tracker_update_for_known_delta).
 
@@ -2124,11 +2138,11 @@ fn is_empty(&self) -> bool
 fn is_exact(&self) -> bool
 ```
 
-**Purpose**: Reports whether the delta is known to exactly describe all committed textual mutations. It distinguishes precise deltas from best-effort ones after unreadable files or uncertain failures.
+**Purpose**: Answers whether the delta is a complete and trustworthy description of what changed. A false result means something may have happened that the code cannot prove.
 
-**Data flow**: Returns the stored `self.exact` boolean.
+**Data flow**: It reads the `exact` flag and returns it.
 
-**Call relations**: Used by downstream tracker logic and tests that assert exactness behavior.
+**Call relations**: Patch-tracking code calls this when deciding whether it can confidently use the delta, or whether it must treat the result more cautiously.
 
 *Call graph*: called by 2 (tracker_update_for_known_delta, track_delta).
 
@@ -2139,11 +2153,11 @@ fn is_exact(&self) -> bool
 fn append(&mut self, other: Self)
 ```
 
-**Purpose**: Appends another committed delta to this one while preserving aggregate exactness. It supports accumulation across multiple patch-application phases.
+**Purpose**: Adds another later delta onto this one. It preserves the order of changes and keeps the combined record exact only if both parts were exact.
 
-**Data flow**: Extends `self.changes` with `other.changes` and updates `self.exact` by logical-AND with `other.exact`.
+**Data flow**: It receives another delta, appends that delta’s changes to this delta’s list, combines the exactness flags with logical “and,” and updates this delta in place.
 
-**Call relations**: Used by higher-level orchestration outside this file when combining deltas from multiple operations.
+**Call relations**: A higher-level `run` flow calls this when patch work is committed in pieces and the caller needs one combined record at the end.
 
 *Call graph*: called by 1 (run).
 
@@ -2154,11 +2168,11 @@ fn append(&mut self, other: Self)
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default empty exact delta. It makes `AppliedPatchDelta` usable with generic default-based APIs.
+**Purpose**: Provides the normal default value for a delta: no changes, exactly known.
 
-**Data flow**: Delegates to `AppliedPatchDelta::empty()` and returns that value.
+**Data flow**: It creates and returns the same value as `AppliedPatchDelta::empty`.
 
-**Call relations**: This trait impl is used implicitly where a default delta is needed.
+**Call relations**: Rust code that asks for a default delta automatically gets the same starting state used by the patch application flow.
 
 *Call graph*: 1 external calls (empty).
 
@@ -2169,11 +2183,11 @@ fn default() -> Self
 fn new(error: ApplyPatchError, delta: AppliedPatchDelta) -> Self
 ```
 
-**Purpose**: Constructs a patch-application failure from an error and the delta committed before that error was observed. It is the main failure wrapper constructor.
+**Purpose**: Creates a patch failure that includes both the error and any file changes that definitely happened before the error was seen.
 
-**Data flow**: Consumes an `ApplyPatchError` and `AppliedPatchDelta`, stores them in `Self { error, delta }`, and returns the failure.
+**Data flow**: It receives an `ApplyPatchError` and an `AppliedPatchDelta`, stores both together, and returns an `ApplyPatchFailure`.
 
-**Call relations**: Used by `apply_hunks` when wrapping either summary-print failures or filesystem/application failures.
+**Call relations**: `apply_hunks` uses this when printing or filesystem work fails, so callers do not lose track of already committed changes.
 
 *Call graph*: called by 1 (apply_hunks).
 
@@ -2184,11 +2198,11 @@ fn new(error: ApplyPatchError, delta: AppliedPatchDelta) -> Self
 fn without_delta(error: ApplyPatchError) -> Self
 ```
 
-**Purpose**: Constructs a failure with an empty exact delta for errors that occur before any file mutation could have happened. It is used for parse-time and early stderr-write failures.
+**Purpose**: Creates a patch failure for problems that happened before any file changes were made. This is common for parse errors.
 
-**Data flow**: Calls `AppliedPatchDelta::empty()` and `ApplyPatchFailure::new(error, empty_delta)` to produce the failure.
+**Data flow**: It receives an error, creates an empty exact delta, combines them, and returns an `ApplyPatchFailure`.
 
-**Call relations**: Used by `apply_patch` when parse errors occur before hunk application begins.
+**Call relations**: `apply_patch` calls this when the patch text cannot be parsed or when reporting the parse error itself fails.
 
 *Call graph*: calls 1 internal fn (empty); called by 1 (apply_patch); 1 external calls (new).
 
@@ -2199,11 +2213,11 @@ fn without_delta(error: ApplyPatchError) -> Self
 fn delta(&self) -> &AppliedPatchDelta
 ```
 
-**Purpose**: Returns the committed delta associated with a failure. It lets callers inspect what definitely changed before the error.
+**Purpose**: Lets callers inspect the committed-change record inside a failure. This is important because a failed patch may still have changed files.
 
-**Data flow**: Returns `&AppliedPatchDelta` referencing `self.delta`.
+**Data flow**: It reads the stored delta and returns a shared reference to it.
 
-**Call relations**: Used by tests and downstream callers that need partial-commit information after failure.
+**Call relations**: Tests and recovery code use this after an error to see whether anything was written, deleted, or left uncertain.
 
 
 ##### `ApplyPatchFailure::into_parts`  (lines 271–273)
@@ -2212,11 +2226,11 @@ fn delta(&self) -> &AppliedPatchDelta
 fn into_parts(self) -> (ApplyPatchError, AppliedPatchDelta)
 ```
 
-**Purpose**: Consumes the failure and returns its error and delta separately. It is useful when callers want ownership of both pieces.
+**Purpose**: Splits a failure into its two useful pieces: the error and the committed-change delta. This is useful when the caller wants to handle each separately.
 
-**Data flow**: Moves out `self.error` and `self.delta` and returns them as a tuple.
+**Data flow**: It takes ownership of the failure, extracts its stored error and delta, and returns them as a pair.
 
-**Call relations**: Available to downstream consumers; not used internally in this file.
+**Call relations**: This is the ownership-taking counterpart to `delta`; callers can use it when they are done with the failure wrapper and need the raw pieces.
 
 
 ##### `apply_patch`  (lines 277–313)
@@ -2231,11 +2245,11 @@ async fn apply_patch(
     sandbox: Option<&File
 ```
 
-**Purpose**: Parses raw patch text, prints parse diagnostics to stderr on failure, and applies the resulting hunks on success. It is the main public entry point for patch application.
+**Purpose**: Applies a raw patch string to the filesystem and writes user-facing success or error messages. This is the main public entry point for doing patch work.
 
-**Data flow**: Accepts patch text, absolute cwd, mutable stdout/stderr writers, filesystem, and optional sandbox. It calls `parse_patch`; on `InvalidPatchError` or `InvalidHunkError` it writes a human-readable message to stderr and returns `ApplyPatchFailure::without_delta(ParseError)`. On successful parse it extracts `source.hunks` and delegates to `apply_hunks`, returning that result.
+**Data flow**: It receives patch text, a working directory, output streams, a filesystem interface, and an optional sandbox. It parses the patch into hunks; on parse failure it writes a clear message to stderr and returns a failure. On success it passes the hunks to `apply_hunks` and returns the resulting delta.
 
-**Call relations**: This is the primary public API used by the standalone executable and many tests. It sits above parsing and below the actual hunk-application engine in `apply_hunks`.
+**Call relations**: Tests call this directly, and production code can use it as the high-level operation. It hands parsing to `parse_patch` and hands actual file mutation to `apply_hunks`.
 
 *Call graph*: calls 3 internal fn (without_delta, apply_hunks, parse_patch); called by 14 (test_add_file_hunk_creates_file_with_contents, test_apply_patch_fails_on_write_error, test_apply_patch_hunks_accept_relative_and_absolute_paths, test_delete_file_hunk_removes_file, test_delete_symlink_returns_inexact_delta, test_failed_move_returns_committed_destination_delta, test_multiple_update_chunks_apply_to_single_file, test_pure_addition_chunk_followed_by_removal, test_unified_diff_interleaved_changes, test_unreadable_destinations_return_inexact_delta (+4 more)); 2 external calls (ParseError, writeln!).
 
@@ -2252,11 +2266,11 @@ async fn apply_hunks(
     sandbox: Option<&F
 ```
 
-**Purpose**: Applies already-parsed hunks, prints a success summary on stdout, and wraps any failure together with the accumulated committed delta. It is the parsed-hunk counterpart to `apply_patch`.
+**Purpose**: Applies already parsed patch hunks and prints the final summary or error. It is the bridge between parsed patch data and filesystem changes.
 
-**Data flow**: Accepts a hunk slice, cwd, stdout/stderr writers, filesystem, and sandbox. It initializes `delta = AppliedPatchDelta::empty()`, calls `apply_hunks_to_files`, and on success passes the returned `AffectedPaths` to `print_summary`; summary-write failures are wrapped with the current delta. On application failure it writes the error message to stderr, converts the underlying error into `ApplyPatchError` either by downcasting to `std::io::Error` or wrapping it in `IoError { context: msg, source: std::io::Error::other(error) }`, and returns `ApplyPatchFailure::new(error, delta)`.
+**Data flow**: It starts an empty delta, calls `apply_hunks_to_files` to mutate files, then prints a summary to stdout if successful. If anything fails, it writes the error text to stderr, wraps the error with the delta collected so far, and returns a failure.
 
-**Call relations**: Called by `apply_patch` after parsing succeeds. It delegates filesystem mutation to `apply_hunks_to_files` and user-facing output to `print_summary`.
+**Call relations**: `apply_patch` calls this after parsing. It delegates the actual add, delete, update, and move work to `apply_hunks_to_files`, then uses `print_summary` for the human-readable report.
 
 *Call graph*: calls 5 internal fn (empty, from, new, apply_hunks_to_files, print_summary); called by 1 (apply_patch); 3 external calls (IoError, other, writeln!).
 
@@ -2273,11 +2287,11 @@ async fn apply_hunks_to_files(
 ) -> a
 ```
 
-**Purpose**: Performs the actual filesystem mutations for each parsed hunk while recording affected paths and committed delta information. It is the core mutation loop of the patch engine.
+**Purpose**: Performs the actual file operations described by parsed hunks. This is where files are created, deleted, edited, or moved.
 
-**Data flow**: Accepts hunks, cwd, filesystem, sandbox, and a mutable `AppliedPatchDelta`. It rejects an empty hunk list with `No files were modified.`. For each hunk it resolves the absolute path and user-facing patch path. `AddFile` reads any overwritten destination text with `read_optional_file_text_for_delta`, writes the new file with `write_file_with_missing_parent_retry`, records an `AppliedPatchChange::Add`, and pushes the patch path into `added`. `DeleteFile` notes delta-support metadata, reads existing text if possible, rejects directories via `ensure_not_directory`, removes the file, downgrades exactness if removal may have had side effects, records a `Delete` change when content was readable, and pushes the patch path into `deleted`. `UpdateFile` derives original and new contents with `derive_new_contents_from_chunks`; for moves it resolves the destination against cwd, reads any overwritten destination text, writes the destination, tentatively records an add, removes the source, then rewrites that delta entry into an `Update { move_path, old_content, overwritten_move_content, new_content }`; for in-place updates it writes the new contents directly and records an `Update` change. Any write failure marks `delta.exact = false` before returning the error. On success it returns `AffectedPaths { added, modified, deleted }`.
+**Data flow**: It receives hunks, a working directory, a filesystem, optional sandbox information, and a mutable delta. For each hunk it resolves the path, reads old content when needed, writes new content, removes deleted or moved files, records committed changes in the delta, and returns lists of added, modified, and deleted paths.
 
-**Call relations**: This internal async function is called only by `apply_hunks`. It delegates path/content helpers to `derive_new_contents_from_chunks`, `ensure_not_directory`, `read_optional_file_text_for_delta`, `note_existing_path_delta_support`, `remove_failure_was_side_effect_free`, and `write_file_with_missing_parent_retry`.
+**Call relations**: `apply_hunks` calls this as the core worker. It relies on helpers such as `derive_new_contents_from_chunks`, `ensure_not_directory`, `read_optional_file_text_for_delta`, and `remove_failure_was_side_effect_free` to keep the operation accurate and safe.
 
 *Call graph*: calls 8 internal fn (derive_new_contents_from_chunks, ensure_not_directory, note_existing_path_delta_support, read_optional_file_text_for_delta, remove_failure_was_side_effect_free, read_file_text, resolve_path_against_base, from_abs_path); called by 1 (apply_hunks); 5 external calls (new, bail!, is_empty, remove, try_write!).
 
@@ -2292,11 +2306,11 @@ async fn ensure_not_directory(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Rejects delete or move-source operations when the target path is a directory. It prevents file-oriented patch hunks from operating on directories.
+**Purpose**: Checks that a path is not a directory before code tries to delete it as a file. This prevents a file patch from accidentally removing directories.
 
-**Data flow**: Converts the absolute path to `PathUri`, fetches metadata through `ExecutorFileSystem::get_metadata`, and returns an `io::ErrorKind::InvalidInput` error with message `path is a directory` if `metadata.is_directory` is true; otherwise returns `Ok(())`.
+**Data flow**: It receives an absolute path, asks the filesystem for metadata, and returns success if the path is not a directory. If it is a directory, it returns an input error.
 
-**Call relations**: Called by `apply_hunks_to_files` before deleting files or removing move sources.
+**Call relations**: `apply_hunks_to_files` calls this before deleting a file or removing the original file during a move.
 
 *Call graph*: calls 1 internal fn (from_abs_path); called by 1 (apply_hunks_to_files); 2 external calls (new, get_metadata).
 
@@ -2312,11 +2326,11 @@ async fn remove_failure_was_side_effect_free(
 ) -> bool
 ```
 
-**Purpose**: Best-effort checks whether a failed remove operation left the file contents unchanged. It helps decide whether delta exactness can be preserved after a removal error.
+**Purpose**: Checks whether a failed remove operation appears to have left the file untouched. This helps decide whether the delta is still exact.
 
-**Data flow**: Accepts a path, optional expected content, filesystem, and sandbox. If expected content is present, it rereads the file text and returns `true` only if the read succeeds and the content still matches; if no expected content is available it returns `false`.
+**Data flow**: It receives a path and the content that was expected to be there. If expected content is available, it rereads the file and returns true only if the content still matches. If there is no expected content, it returns false.
 
-**Call relations**: Used by `apply_hunks_to_files` when a delete or move-source removal fails after earlier reads, to decide whether `delta.exact` should remain true.
+**Call relations**: `apply_hunks_to_files` uses this after a delete or move-remove failure. If the file no longer matches what was expected, the accumulated delta becomes uncertain.
 
 *Call graph*: calls 2 internal fn (read_file_text, from_abs_path); called by 1 (apply_hunks_to_files).
 
@@ -2332,11 +2346,11 @@ async fn read_optional_file_text_for_delta(
 ) -> Option<String>
 ```
 
-**Purpose**: Reads existing destination text for delta tracking while tolerating missing files and downgrading exactness on unreadable paths. It is used before overwriting add or move destinations.
+**Purpose**: Reads an existing file’s text when possible so the delta can record what was overwritten. Missing files are allowed.
 
-**Data flow**: Calls `note_existing_path_delta_support` to update exactness based on metadata, converts the path to `PathUri`, and attempts `read_file_text`. A successful read returns `Some(content)`, `NotFound` returns `None`, and any other error sets `*exact = false` and returns `None`.
+**Data flow**: It receives a path, filesystem, sandbox, and a mutable exactness flag. It first checks whether the path type can be tracked exactly, then tries to read text. It returns the text, returns `None` for not found, and marks the delta inexact for other read problems.
 
-**Call relations**: Called by `apply_hunks_to_files` before add-file writes and move-destination writes.
+**Call relations**: `apply_hunks_to_files` calls this before adding a file or writing a move destination, so the delta can say whether previous content was overwritten.
 
 *Call graph*: calls 3 internal fn (note_existing_path_delta_support, read_file_text, from_abs_path); called by 1 (apply_hunks_to_files).
 
@@ -2352,11 +2366,11 @@ async fn note_existing_path_delta_support(
 )
 ```
 
-**Purpose**: Updates the delta exactness flag based on whether an existing path is a regular non-symlink file whose contents can be tracked precisely. It marks exactness false for directories, symlinks, and metadata errors other than not-found.
+**Purpose**: Checks whether a path is a normal file that the delta system can describe exactly. Non-files, symlinks, and metadata errors make the delta less certain.
 
-**Data flow**: Converts the path to `PathUri`, fetches metadata, and leaves `exact` unchanged only when metadata says the path is a regular file and not a symlink or when the path is absent. Any other metadata shape or error sets `*exact = false`.
+**Data flow**: It receives a path, filesystem, sandbox, and exactness flag. It reads metadata; normal non-symlink files and missing paths keep the flag unchanged, while unusual paths or metadata errors set exactness to false.
 
-**Call relations**: Called by both `apply_hunks_to_files` and `read_optional_file_text_for_delta` before content reads or overwrites.
+**Call relations**: `apply_hunks_to_files` calls this before delete and update operations, and `read_optional_file_text_for_delta` calls it before reading possible overwritten content.
 
 *Call graph*: calls 1 internal fn (from_abs_path); called by 2 (apply_hunks_to_files, read_optional_file_text_for_delta); 1 external calls (get_metadata).
 
@@ -2372,11 +2386,11 @@ async fn write_file_with_missing_parent_retry(
 ) -> anyhow::Resu
 ```
 
-**Purpose**: Writes a file, creating missing parent directories on a first `NotFound` failure. It smooths over add and move operations that target paths in not-yet-created directories.
+**Purpose**: Writes a file, and if the parent directories are missing, creates them and tries again. This makes add-file and move-destination patches work even for new folders.
 
-**Data flow**: Converts the absolute path to `PathUri` and first attempts `fs.write_file`. If it succeeds, returns `Ok(())`. If it fails with `io::ErrorKind::NotFound`, it computes the parent path, creates that directory recursively with `fs.create_directory`, then retries `write_file`; both operations add contextual error messages mentioning the target path. Any other initial write error is returned with `Failed to write file ...` context.
+**Data flow**: It receives a filesystem, absolute path, bytes to write, and optional sandbox. It first tries to write. If the path is missing because parent folders do not exist, it creates those folders recursively and retries the write. It returns success or a contextual error.
 
-**Call relations**: Called by `apply_hunks_to_files` for add-file writes and move-destination writes. It encapsulates the create-parent-and-retry pattern.
+**Call relations**: `apply_hunks_to_files` uses this when adding a new file or writing the destination of a moved update.
 
 *Call graph*: calls 2 internal fn (parent, from_abs_path); 2 external calls (create_directory, write_file).
 
@@ -2392,11 +2406,11 @@ async fn derive_new_contents_from_chunks(
 ) -> std::res
 ```
 
-**Purpose**: Reads the original file and computes the full new file contents implied by update chunks without writing anything. It is the shared engine behind in-place updates, moves, and unified-diff generation.
+**Purpose**: Calculates what an updated file should look like after applying its patch chunks. It edits text in memory before anything is written back.
 
-**Data flow**: Accepts an absolute path, update chunks, filesystem, and sandbox. It reads the original file text, wrapping read failures in `ApplyPatchError::IoError` with `Failed to read file to update ...` context. It splits the original contents on `\n` into `Vec<String>`, removes the trailing empty element if present to align line counts with diff behavior, computes replacement spans with `compute_replacements`, applies them with `apply_replacements`, ensures the resulting line vector ends with an empty string so the final content has a trailing newline, joins lines back with `\n`, and returns `AppliedPatch { original_contents, new_contents }`.
+**Data flow**: It receives the file path, update chunks, filesystem, and sandbox. It reads the original file text, splits it into lines, computes the needed replacements, applies them, restores a trailing newline if needed, and returns both original and new content.
 
-**Call relations**: Called by `apply_hunks_to_files` for update hunks and by `unified_diff_from_chunks_with_context` for diff generation. It delegates matching logic to `compute_replacements` and splice application to `apply_replacements`.
+**Call relations**: `apply_hunks_to_files` calls this before writing an update, and diff-generation code calls it before showing what the update would change.
 
 *Call graph*: calls 5 internal fn (apply_replacements, compute_replacements, read_file_text, as_path, from_abs_path); called by 2 (apply_hunks_to_files, unified_diff_from_chunks_with_context); 1 external calls (new).
 
@@ -2411,11 +2425,11 @@ fn compute_replacements(
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError>
 ```
 
-**Purpose**: Translates parsed update chunks into concrete replacement operations over the original file's line vector. It is responsible for locating context and old-line sequences, including EOF-sensitive fallback behavior.
+**Purpose**: Finds the exact line ranges in a file that each patch chunk should replace. It turns patch instructions into concrete edit positions.
 
-**Data flow**: Accepts original lines, the file path for error messages, and update chunks. It maintains a `line_index` cursor and an output vector of `(start_index, old_len, new_lines)` replacements. For chunks with `change_context`, it uses `seek_sequence` to find that context line at or after `line_index`, advancing the cursor or returning `ComputeReplacements("Failed to find context ...")`. For pure additions (`old_lines.is_empty()`), it schedules insertion at EOF or before a trailing empty line. For replacement/removal chunks, it searches for `old_lines` with `seek_sequence`; if not found and the pattern ends with an empty string sentinel, it retries without that trailing empty line and similarly trims `new_lines`' trailing empty line. On success it records the replacement and advances `line_index`; on failure it returns `ComputeReplacements("Failed to find expected lines in ...")`. Finally it sorts replacements by start index and returns them.
+**Data flow**: It receives original lines, the file path for error messages, and update chunks. It searches forward through the file for context and old lines, builds replacement records of start position, old length, and new lines, sorts them, and returns them. If expected text cannot be found, it returns a clear patch error.
 
-**Call relations**: Called only by `derive_new_contents_from_chunks`. It depends on `seek_sequence::seek_sequence` for fuzzy location of context and old-line patterns.
+**Call relations**: `derive_new_contents_from_chunks` calls this before `apply_replacements`. It uses `seek_sequence` to locate matching text, including special handling for end-of-file newline cases.
 
 *Call graph*: calls 1 internal fn (seek_sequence); called by 1 (derive_new_contents_from_chunks); 4 external calls (new, ComputeReplacements, format!, from_ref).
 
@@ -2429,11 +2443,11 @@ fn apply_replacements(
 ) -> Vec<String>
 ```
 
-**Purpose**: Applies computed replacement spans to a line vector to produce the updated file contents. It performs the actual splice logic after matching is complete.
+**Purpose**: Applies prepared line replacements to a list of file lines. It is the final in-memory edit step.
 
-**Data flow**: Consumes a mutable `Vec<String>` of original lines and a slice of replacements. It iterates over replacements in reverse order, removes `old_len` lines starting at `start_idx`, then inserts each `new_segment` line at the same position in order. It returns the modified line vector.
+**Data flow**: It receives the original lines and replacement records. It walks replacements from the end of the file toward the start, removes the old lines, inserts the new lines, and returns the edited line list.
 
-**Call relations**: Called only by `derive_new_contents_from_chunks` after `compute_replacements` has produced sorted replacement spans.
+**Call relations**: `derive_new_contents_from_chunks` calls this after `compute_replacements` has located all edit positions. Applying edits backward prevents earlier edits from shifting later positions.
 
 *Call graph*: called by 1 (derive_new_contents_from_chunks).
 
@@ -2449,11 +2463,11 @@ async fn unified_diff_from_chunks(
 ) -> std::result::Re
 ```
 
-**Purpose**: Computes a one-line-context unified diff and resulting contents for update chunks. It is the convenience wrapper used by most callers.
+**Purpose**: Builds a standard unified diff for an update patch using a default amount of surrounding context. A unified diff is the familiar `-old` and `+new` text format used by many tools.
 
-**Data flow**: Accepts path, chunks, filesystem, and sandbox, then delegates to `unified_diff_from_chunks_with_context` with `context = 1` and returns its result.
+**Data flow**: It receives a path, update chunks, filesystem, and sandbox, then calls the context-aware version with a context radius of one line and returns the resulting file update description.
 
-**Call relations**: Used by verification code in `invocation.rs` and by multiple tests. It is a thin wrapper over the more general context-parameterized function.
+**Call relations**: Tests call this to verify diff output. It is a convenience wrapper around `unified_diff_from_chunks_with_context`.
 
 *Call graph*: calls 1 internal fn (unified_diff_from_chunks_with_context); called by 5 (test_unified_diff, test_unified_diff_first_line_replacement, test_unified_diff_insert_at_eof, test_unified_diff_interleaved_changes, test_unified_diff_last_line_replacement).
 
@@ -2469,11 +2483,11 @@ async fn unified_diff_from_chunks_with_context(
     sandbox: Option<&FileSystemSand
 ```
 
-**Purpose**: Computes a unified diff with configurable context radius from update chunks without mutating the filesystem. It pairs the diff text with original and resulting file contents.
+**Purpose**: Builds a standard unified diff for an update patch, with the caller choosing how many unchanged surrounding lines to include.
 
-**Data flow**: Calls `derive_new_contents_from_chunks` to obtain original and new contents, constructs a `similar::TextDiff` from those strings, renders a unified diff with the requested context radius, and returns `ApplyPatchFileUpdate { unified_diff, original_content, content }`.
+**Data flow**: It receives a path, chunks, context size, filesystem, and sandbox. It computes original and new contents with `derive_new_contents_from_chunks`, asks the diff library to compare them line by line, and returns the diff plus both full contents.
 
-**Call relations**: Called by `unified_diff_from_chunks`. It shares the same content-derivation engine used by actual patch application.
+**Call relations**: `unified_diff_from_chunks` calls this with the default context. It shares the same update calculation as actual patch application, so previews match what would be written.
 
 *Call graph*: calls 1 internal fn (derive_new_contents_from_chunks); called by 1 (unified_diff_from_chunks); 1 external calls (from_lines).
 
@@ -2487,11 +2501,11 @@ fn print_summary(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a git-style summary of added, modified, and deleted files after successful patch application. It is the user-facing success output formatter.
+**Purpose**: Writes the success message that lists which files were added, modified, and deleted. It uses a short git-like format: `A`, `M`, and `D`.
 
-**Data flow**: Accepts `AffectedPaths` and a mutable writer, writes `Success. Updated the following files:` followed by one `A path`, `M path`, or `D path` line for each path in the corresponding vectors, and returns `std::io::Result<()>`.
+**Data flow**: It receives grouped affected paths and an output writer. It writes a success header, then one line per added, modified, and deleted path, and returns any write error.
 
-**Call relations**: Called by `apply_hunks` after `apply_hunks_to_files` succeeds. It is the final stdout step of successful application.
+**Call relations**: `apply_hunks` calls this only after file application succeeds, so users get a compact report of completed work.
 
 *Call graph*: called by 1 (apply_hunks); 1 external calls (writeln!).
 
@@ -2502,11 +2516,11 @@ fn print_summary(
 fn wrap_patch(body: &str) -> String
 ```
 
-**Purpose**: Builds a complete patch string from a body for unit tests in this module. It keeps test fixtures concise and readable.
+**Purpose**: Creates a complete patch text around a test body. It saves each test from repeating the begin and end markers.
 
-**Data flow**: Interpolates the supplied body between `*** Begin Patch` and `*** End Patch` and returns the resulting `String`.
+**Data flow**: It receives the middle body of a patch, adds `*** Begin Patch` before it and `*** End Patch` after it, and returns the full string.
 
-**Call relations**: Used throughout the module's tests when constructing patch text.
+**Call relations**: Most tests call this helper before passing patch text to `apply_patch` or `parse_patch`.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2517,11 +2531,11 @@ fn wrap_patch(body: &str) -> String
 async fn test_add_file_hunk_creates_file_with_contents()
 ```
 
-**Purpose**: Verifies that an add-file hunk creates the file, writes the expected contents, and prints the correct success summary with no stderr output. It is the baseline add-path application test.
+**Purpose**: Checks that an add-file patch creates the file, writes the expected contents, and prints the right success message.
 
-**Data flow**: Creates a temp directory and target path, builds an add-file patch, allocates stdout/stderr buffers, calls `apply_patch`, then decodes the buffers and asserts stdout equals `Success...\nA <path>\n`, stderr is empty, and the created file contains `ab\ncd\n`.
+**Data flow**: It creates a temporary directory, builds an add-file patch, runs `apply_patch`, reads stdout, stderr, and the new file, then asserts that all match expectations.
 
-**Call relations**: This async unit test exercises the full public `apply_patch` entry point on the add-file path.
+**Call relations**: This test exercises the public `apply_patch` path and, through it, the add-file branch inside `apply_hunks_to_files`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 7 external calls (from_utf8, new, wrap_patch, assert_eq!, format!, read_to_string, tempdir).
 
@@ -2532,11 +2546,11 @@ async fn test_add_file_hunk_creates_file_with_contents()
 async fn test_apply_patch_hunks_accept_relative_and_absolute_paths()
 ```
 
-**Purpose**: Verifies that add, delete, and update hunks work with both relative and absolute file paths in the same patch. It also checks the summary preserves the patch's original path spelling.
+**Purpose**: Checks that patches can mix relative and absolute paths for add, delete, and update operations.
 
-**Data flow**: Creates a temp directory and several files, builds a patch containing relative and absolute add/delete/update hunks, runs `apply_patch`, then asserts the resulting filesystem state for all six files and checks stdout lists relative paths as relative and absolute paths as absolute in the expected order, with empty stderr.
+**Data flow**: It creates several files, builds one patch containing relative and absolute path operations, applies it, then verifies new files, removed files, updated contents, and the printed summary.
 
-**Call relations**: This test exercises path resolution and summary formatting across mixed path styles.
+**Call relations**: This test drives `apply_patch` through all main hunk types and confirms that path resolution against the working directory works correctly.
 
 *Call graph*: calls 1 internal fn (apply_patch); 7 external calls (new, wrap_patch, assert!, assert_eq!, format!, write, tempdir).
 
@@ -2547,11 +2561,11 @@ async fn test_apply_patch_hunks_accept_relative_and_absolute_paths()
 async fn test_delete_file_hunk_removes_file()
 ```
 
-**Purpose**: Verifies that a delete-file hunk removes the target file and prints the correct delete summary. It is the baseline delete-path application test.
+**Purpose**: Checks that a delete-file patch removes an existing file and reports it as deleted.
 
-**Data flow**: Creates a temp file, builds a delete patch, runs `apply_patch`, decodes stdout/stderr, asserts stdout lists `D <path>`, stderr is empty, and the file no longer exists.
+**Data flow**: It creates a file, builds a delete patch, applies it, then checks stdout, stderr, and that the file no longer exists.
 
-**Call relations**: This test covers the delete branch of `apply_hunks_to_files` through the public API.
+**Call relations**: This test exercises `apply_patch`, especially the delete branch of `apply_hunks_to_files` and the summary printing for deleted files.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 8 external calls (from_utf8, new, wrap_patch, assert!, assert_eq!, format!, write, tempdir).
 
@@ -2562,11 +2576,11 @@ async fn test_delete_file_hunk_removes_file()
 async fn test_update_file_hunk_modifies_content()
 ```
 
-**Purpose**: Verifies that an update-file hunk rewrites file contents in place and prints the correct modified summary. It is the baseline update-path application test.
+**Purpose**: Checks that an update patch replaces matching lines in an existing file.
 
-**Data flow**: Creates a temp file with `foo\nbar\n`, builds an update patch replacing `bar` with `baz`, runs `apply_patch`, decodes stdout/stderr, asserts stdout lists `M <path>`, stderr is empty, and the file now contains `foo\nbaz\n`.
+**Data flow**: It writes an original file, builds a patch replacing one line, applies it, and verifies the final file content and printed output.
 
-**Call relations**: This test exercises the in-place update branch of `apply_hunks_to_files`.
+**Call relations**: This test drives `apply_patch` through `derive_new_contents_from_chunks`, `compute_replacements`, and `apply_replacements`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 8 external calls (from_utf8, new, wrap_patch, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2577,11 +2591,11 @@ async fn test_update_file_hunk_modifies_content()
 async fn test_update_file_hunk_can_move_file()
 ```
 
-**Purpose**: Verifies that an update hunk with `*** Move to:` writes the destination, removes the source, and reports the destination as modified. It covers move semantics.
+**Purpose**: Checks that an update patch can also move the file to a new path while changing its contents.
 
-**Data flow**: Creates source and destination paths, writes source contents, builds a move/update patch, runs `apply_patch`, decodes stdout/stderr, asserts stdout lists `M <dest>`, stderr is empty, source no longer exists, and destination contains the updated content.
+**Data flow**: It creates a source file, builds an update-with-move patch, applies it, then confirms the source is gone, the destination exists, and the summary reports the moved file as modified.
 
-**Call relations**: This test exercises the move branch inside update handling.
+**Call relations**: This test exercises the move branch inside `apply_hunks_to_files`, including writing the destination and removing the original.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 9 external calls (from_utf8, new, wrap_patch, assert!, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2592,11 +2606,11 @@ async fn test_update_file_hunk_can_move_file()
 async fn test_failed_move_returns_committed_destination_delta()
 ```
 
-**Purpose**: Verifies that if a move writes the destination successfully but fails removing the source, the returned failure includes a committed delta describing the destination write. It checks partial-commit reporting for move failures.
+**Purpose**: Checks that if a move fails after writing the destination, the failure still reports that committed destination write.
 
-**Data flow**: On Unix, creates locked source and writable destination directories, writes the source file, removes write permission from the source directory, builds a move patch, and runs `apply_patch`, expecting an error. After restoring permissions, it asserts stderr mentions failure to remove the original source, `failure.delta()` equals an exact delta containing one `AppliedPatchChange::Add` for the destination with `line2\n`, and the source and destination files contain the expected old/new contents respectively.
+**Data flow**: On Unix, it makes the source directory read-only, applies a move patch that can write the destination but cannot remove the source, then inspects the failure delta and filesystem state.
 
-**Call relations**: This test exercises failure handling in `apply_hunks_to_files` and `apply_hunks`, especially the move-source removal error path.
+**Call relations**: This test verifies the partial-failure story in `apply_patch`, especially `ApplyPatchFailure::delta` and the move error path in `apply_hunks_to_files`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 9 external calls (new, wrap_patch, assert!, assert_eq!, from_mode, create_dir, set_permissions, write, tempdir).
 
@@ -2607,11 +2621,11 @@ async fn test_failed_move_returns_committed_destination_delta()
 async fn test_multiple_update_chunks_apply_to_single_file()
 ```
 
-**Purpose**: Verifies that multiple update chunks within one hunk can modify separate regions of a file and still produce a single modified summary entry. It checks chunk sequencing and summary deduplication by hunk.
+**Purpose**: Checks that one file can be updated by multiple separate chunks and still be listed once in the summary.
 
-**Data flow**: Creates a four-line file, builds an update patch with two separate `@@` chunks, runs `apply_patch`, decodes stdout/stderr, asserts stdout lists one `M <path>` line, stderr is empty, and the file contents reflect both replacements.
+**Data flow**: It writes a four-line file, builds a patch with two change chunks, applies it, then checks the final content and output.
 
-**Call relations**: This test exercises `compute_replacements` and `apply_replacements` across multiple chunks in one file.
+**Call relations**: This test exercises repeated replacement calculation in `compute_replacements` through the public `apply_patch` call.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 8 external calls (from_utf8, new, wrap_patch, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2622,11 +2636,11 @@ async fn test_multiple_update_chunks_apply_to_single_file()
 async fn test_update_file_hunk_interleaved_changes()
 ```
 
-**Purpose**: Verifies a more complex update hunk containing replacements in different regions plus an EOF append. It checks that non-adjacent edits are all applied correctly and summarized once.
+**Purpose**: Checks a more complex update with replacements and an end-of-file addition spread across the file.
 
-**Data flow**: Creates a six-line file, builds a patch replacing `b`, replacing `e`, and appending `g` at EOF, runs `apply_patch`, decodes stdout/stderr, asserts the expected single modified summary and empty stderr, and checks the final file contents include all three edits.
+**Data flow**: It creates a six-line file, applies a patch that changes two lines and appends one line, then verifies the final file and summary.
 
-**Call relations**: This test stresses `compute_replacements` with interleaved chunk types and EOF handling.
+**Call relations**: This test stresses `compute_replacements` and `apply_replacements` with non-adjacent edits and end-of-file handling.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 8 external calls (from_utf8, new, wrap_patch, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2637,11 +2651,11 @@ async fn test_update_file_hunk_interleaved_changes()
 async fn test_pure_addition_chunk_followed_by_removal()
 ```
 
-**Purpose**: Verifies that a pure-addition chunk followed by a later removal/replacement chunk applies correctly without panicking or misordering edits. It covers a historically tricky replacement ordering case.
+**Purpose**: Checks that a pure insertion chunk can be combined with a later removal/replacement chunk without corrupting line positions.
 
-**Data flow**: Creates a three-line file, builds a patch whose first chunk adds two lines and whose second chunk replaces two existing lines, runs `apply_patch`, and asserts the final file contents equal the expected merged result.
+**Data flow**: It writes a three-line file, applies a patch that inserts lines and replaces later content, then reads the file and checks the final order.
 
-**Call relations**: This test specifically exercises replacement ordering in `compute_replacements` and reverse application in `apply_replacements`.
+**Call relations**: This test protects the interaction between `compute_replacements` and backward application in `apply_replacements`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 7 external calls (new, wrap_patch, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2652,11 +2666,11 @@ async fn test_pure_addition_chunk_followed_by_removal()
 async fn test_update_line_with_unicode_dash()
 ```
 
-**Purpose**: Verifies that a patch authored with ASCII punctuation can match and replace a line containing typographic Unicode dash characters. It protects fuzzy matching behavior expected by the parser/matcher stack.
+**Purpose**: Checks that matching can handle common Unicode dash characters when the patch uses plain ASCII dashes. This prevents visually similar punctuation from making a patch fail.
 
-**Data flow**: Creates a file whose comment contains EN DASH and NON-BREAKING HYPHEN, builds a patch using plain ASCII hyphens in the old line, runs `apply_patch`, and asserts the file now contains the replacement line, stdout lists the file as modified, and stderr is empty.
+**Data flow**: It writes a line containing Unicode dash punctuation, applies a patch whose old line uses ordinary hyphens, then verifies that the line was replaced and no error was printed.
 
-**Call relations**: This test exercises the matching behavior used by `compute_replacements` through the public application path.
+**Call relations**: This test reaches `seek_sequence` through `compute_replacements`, confirming that fuzzy text matching works during `apply_patch`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 8 external calls (from_utf8, new, wrap_patch, assert_eq!, format!, read_to_string, write, tempdir).
 
@@ -2667,11 +2681,11 @@ async fn test_update_line_with_unicode_dash()
 async fn test_unified_diff()
 ```
 
-**Purpose**: Verifies unified-diff generation for a multi-chunk update. It checks that the diff text, original content, and new content all match expectations.
+**Purpose**: Checks that diff preview output is correct for a file with two separate line replacements.
 
-**Data flow**: Creates a four-line file, builds and parses a two-chunk update patch, extracts the chunks, computes the absolute path, calls `unified_diff_from_chunks`, and asserts the returned `ApplyPatchFileUpdate` equals the expected diff and contents.
+**Data flow**: It writes a file, parses a patch, extracts update chunks, calls `unified_diff_from_chunks`, and compares the returned diff, original content, and new content to expected values.
 
-**Call relations**: This test exercises the diff-generation API independently of filesystem mutation.
+**Call relations**: This test covers the diff-preview path, which shares update calculation with real patch application but does not write the file.
 
 *Call graph*: calls 2 internal fn (parse_patch, unified_diff_from_chunks); 6 external calls (wrap_patch, assert_eq!, format!, write, panic!, tempdir).
 
@@ -2682,11 +2696,11 @@ async fn test_unified_diff()
 async fn test_unified_diff_first_line_replacement()
 ```
 
-**Purpose**: Verifies unified-diff generation when replacing the first line of a file. It covers start-of-file diff formatting.
+**Purpose**: Checks that diff preview output is correct when the first line of a file is replaced.
 
-**Data flow**: Creates a three-line file, builds and parses a patch replacing `foo` with `FOO`, extracts chunks, calls `unified_diff_from_chunks`, and asserts the returned diff and contents match the expected first-line replacement output.
+**Data flow**: It writes a file, parses a patch that changes the first line, calls `unified_diff_from_chunks`, and checks the compact diff result.
 
-**Call relations**: This test complements the last-line and EOF insertion diff tests.
+**Call relations**: This test guards boundary behavior in `compute_replacements` and diff generation near the start of a file.
 
 *Call graph*: calls 2 internal fn (parse_patch, unified_diff_from_chunks); 6 external calls (wrap_patch, assert_eq!, format!, write, panic!, tempdir).
 
@@ -2697,11 +2711,11 @@ async fn test_unified_diff_first_line_replacement()
 async fn test_unified_diff_last_line_replacement()
 ```
 
-**Purpose**: Verifies unified-diff generation when replacing the last line of a file. It covers end-of-file replacement formatting.
+**Purpose**: Checks that diff preview output is correct when the last line of a file is replaced.
 
-**Data flow**: Creates a three-line file, builds and parses a patch replacing `baz` with `BAZ`, extracts chunks, calls `unified_diff_from_chunks`, and asserts the expected diff and contents.
+**Data flow**: It writes a file, parses a patch that changes the final line, calls `unified_diff_from_chunks`, and compares the returned update description to the expected one.
 
-**Call relations**: This test exercises the same API as the first-line replacement test but at EOF.
+**Call relations**: This test guards end-of-file matching in `compute_replacements` and the unified diff rendering.
 
 *Call graph*: calls 2 internal fn (parse_patch, unified_diff_from_chunks); 6 external calls (wrap_patch, assert_eq!, format!, write, panic!, tempdir).
 
@@ -2712,11 +2726,11 @@ async fn test_unified_diff_last_line_replacement()
 async fn test_unified_diff_insert_at_eof()
 ```
 
-**Purpose**: Verifies unified-diff generation for appending a line at EOF. It covers `*** End of File` handling in diff output.
+**Purpose**: Checks that diff preview output is correct when a patch inserts a line at the end of a file.
 
-**Data flow**: Creates a three-line file, builds and parses an EOF insertion patch, extracts chunks, calls `unified_diff_from_chunks`, and asserts the expected diff and resulting contents.
+**Data flow**: It writes a file, parses an end-of-file insertion patch, calls `unified_diff_from_chunks`, and checks the returned diff and final content.
 
-**Call relations**: This test complements the replacement diff tests with a pure insertion case.
+**Call relations**: This test exercises the pure-addition and end-of-file paths in `compute_replacements` through the diff-preview function.
 
 *Call graph*: calls 2 internal fn (parse_patch, unified_diff_from_chunks); 6 external calls (wrap_patch, assert_eq!, format!, write, panic!, tempdir).
 
@@ -2727,11 +2741,11 @@ async fn test_unified_diff_insert_at_eof()
 async fn test_unified_diff_interleaved_changes()
 ```
 
-**Purpose**: Verifies unified-diff generation and actual application for interleaved multi-chunk changes in one file. It checks consistency between diff computation and mutation.
+**Purpose**: Checks that a complex patch produces the right unified diff and also applies correctly to disk.
 
-**Data flow**: Creates a six-line file, builds and parses a patch replacing `b`, replacing `e`, and appending `g`, extracts chunks, computes `unified_diff_from_chunks`, and asserts the expected diff and contents. It then runs `apply_patch` with the same patch and asserts the file contents match the diff-derived result.
+**Data flow**: It writes a file, parses a patch with interleaved edits, verifies `unified_diff_from_chunks`, then runs `apply_patch` and checks the actual file content.
 
-**Call relations**: This test bridges the diff-generation and application paths to ensure they agree on the resulting content.
+**Call relations**: This test ties together preview and execution, confirming that `unified_diff_from_chunks` and `apply_patch` agree because both use `derive_new_contents_from_chunks`.
 
 *Call graph*: calls 4 internal fn (apply_patch, parse_patch, unified_diff_from_chunks, from_absolute_path); 8 external calls (new, wrap_patch, assert_eq!, format!, read_to_string, write, panic!, tempdir).
 
@@ -2742,11 +2756,11 @@ async fn test_unified_diff_interleaved_changes()
 async fn test_apply_patch_fails_on_write_error()
 ```
 
-**Purpose**: Verifies that a write failure during patch application yields a failure whose delta is marked inexact. It covers the `try_write!` exactness downgrade path.
+**Purpose**: Checks that write failures produce an inexact delta. This matters because a failed write may still have partially changed a file.
 
-**Data flow**: On Unix, creates a locked directory with no write permission, builds an add-file patch targeting that directory, runs `apply_patch` expecting an error, restores permissions, and asserts `!failure.delta().is_exact()`.
+**Data flow**: On Unix, it makes a directory unwritable, tries to add a file there, expects `apply_patch` to fail, restores permissions, and asserts that the failure delta is not exact.
 
-**Call relations**: This test exercises write-error handling in `apply_hunks_to_files`, specifically the macro path that marks exactness false before returning.
+**Call relations**: This test covers the write-error path in `apply_hunks_to_files`, including the code that marks the delta uncertain.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 7 external calls (new, wrap_patch, assert!, from_mode, create_dir, set_permissions, tempdir).
 
@@ -2757,11 +2771,11 @@ async fn test_apply_patch_fails_on_write_error()
 async fn test_unreadable_destinations_return_inexact_delta()
 ```
 
-**Purpose**: Verifies that overwriting unreadable binary destinations succeeds but yields an inexact delta because prior textual contents could not be captured. It covers add and move-destination overwrite cases.
+**Purpose**: Checks that overwriting unreadable or non-text destination content makes the delta inexact. The code cannot accurately record overwritten text it cannot read.
 
-**Data flow**: Creates a temp directory, writes `source.txt`, computes cwd, and for each of two patches—adding `binary.dat` and moving `source.txt` to `binary.dat`—writes unreadable bytes to `binary.dat`, runs `apply_patch`, and asserts the returned delta is not exact.
+**Data flow**: It creates binary destination content, applies patches that overwrite it by add or move, and asserts that each successful delta is marked not exact.
 
-**Call relations**: This test exercises `read_optional_file_text_for_delta` and metadata-based exactness downgrades during successful application.
+**Call relations**: This test exercises `read_optional_file_text_for_delta` and its exactness behavior through `apply_patch`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 5 external calls (new, wrap_patch, assert!, write, tempdir).
 
@@ -2772,24 +2786,26 @@ async fn test_unreadable_destinations_return_inexact_delta()
 async fn test_delete_symlink_returns_inexact_delta()
 ```
 
-**Purpose**: Verifies that deleting a symlink succeeds but yields an inexact delta because the path is not a regular non-symlink file. It covers exactness semantics for symlink deletes.
+**Purpose**: Checks that deleting a symlink is reported with an inexact delta. Symlinks are special filesystem entries, not ordinary file contents.
 
-**Data flow**: On Unix, creates a target file and symlink, builds a delete patch for the symlink, runs `apply_patch`, and asserts the returned delta is not exact.
+**Data flow**: On Unix, it creates a target file and a symlink, applies a delete patch to the symlink, and asserts that the returned delta is not exact.
 
-**Call relations**: This test exercises `note_existing_path_delta_support` on symlink metadata during the delete path.
+**Call relations**: This test reaches `note_existing_path_delta_support` through the delete branch of `apply_hunks_to_files`.
 
 *Call graph*: calls 2 internal fn (apply_patch, from_absolute_path); 5 external calls (new, wrap_patch, assert!, write, tempdir).
 
 
 ### `git-utils/src/apply.rs`
 
-`domain_logic` · `patch application / preflight validation`
+`io_transport` · `patch application / request handling`
 
-This file wraps `git apply` as a concrete patch-application service. The main API, `apply_git_patch`, accepts an `ApplyGitRequest` containing the repository working directory, diff text, and flags for revert and preflight. It first resolves the repository root with `git rev-parse --show-toplevel`, writes the diff into a temporary `patch.diff`, and keeps the temp directory alive for the duration of the command. For non-preflight reverts it stages existing paths referenced by the patch before applying, which avoids index/worktree mismatches when reversing changes.
+A unified diff is a patch format that says, line by line, how files should change. This file is the bridge between that patch text and a real Git working tree. Without it, callers would have to write patch files themselves, run `git apply` correctly, and guess from raw terminal output what happened.
 
-Command construction is explicit: the normal path uses `git apply --3way`, optionally `-R`, and may prepend extra `-c key=value` pairs from the `CODEX_APPLY_GIT_CFG` environment variable. Preflight instead runs `git apply --check` and never mutates the worktree. Both paths render a shell-like command string for logs and parse stdout/stderr into `applied_paths`, `skipped_paths`, and `conflicted_paths`, deduplicated and sorted.
+The main flow starts with `apply_git_patch`. It first finds the repository root, writes the patch text to a temporary file, then builds a `git apply` command. It can run in preflight mode, which is like asking “would this work?” using `git apply --check`, without touching files. It can also reverse a patch, and for real reversions it first stages existing paths as a best-effort way to avoid Git index mismatches.
 
-The parser is substantial: it recognizes many `git apply` status and error formats, tracks the last path mentioned by `Checking patch ...`, unquotes C-style escaped paths, and enforces precedence `conflicted > applied > skipped`. Supporting helpers parse `diff --git` headers, normalize `/dev/null` cases, and unescape quoted path tokens so staging and diagnostics work with spaces, tabs, and quoted filenames.
+After Git runs, the file does not just return raw text. It scans both standard output and standard error for known Git messages, using regular expressions, and groups paths into applied, skipped, and conflicted. Think of it like reading a mechanic’s handwritten notes and turning them into three neat checklists.
+
+The file also contains tests that create temporary Git repositories and verify common cases: adding files, conflicts, missing files, reversing patches, dry runs, and quoted path names.
 
 #### Function details
 
@@ -2799,11 +2815,11 @@ The parser is substantial: it recognizes many `git apply` status and error forma
 fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult>
 ```
 
-**Purpose**: Executes the full patch-application workflow: locate repo root, write the diff to a temp file, optionally stage paths for revert, run `git apply` or `git apply --check`, and return structured results.
+**Purpose**: Applies, checks, or reverses a patch in a Git repository. This is the main entry point callers use when they have diff text and want Git to try it safely and report what happened.
 
-**Data flow**: Consumes `ApplyGitRequest { cwd, diff, revert, preflight }`. It resolves `git_root`, writes `diff` to a temp patch file, optionally calls `stage_paths` when reverting for real, builds git config overrides from `CODEX_APPLY_GIT_CFG`, renders a log command string, runs git via `run_git`, parses stdout/stderr with `parse_git_apply_output`, sorts/deduplicates the three path vectors, and returns `ApplyGitResult` containing exit code, parsed paths, raw stdout/stderr, and the rendered command.
+**Data flow**: It receives an `ApplyGitRequest` containing a working directory, diff text, and flags for reverse or preflight mode. It finds the Git root, writes the diff to a temporary patch file, optionally stages paths for a real reverse operation, runs the right `git apply` command, parses Git’s output into path lists, and returns an `ApplyGitResult` with the exit code, output text, command string, and categorized paths.
 
-**Call relations**: This is the file’s public entrypoint and orchestrates all helpers in the module. Tests invoke it directly for add, conflict, missing-index, revert, and preflight scenarios.
+**Call relations**: The tests call this function to exercise real Git behavior. Inside, it coordinates the helper functions: `resolve_git_root` finds where to run Git, `write_temp_patch` creates the patch file, `stage_paths` prepares reverse application when needed, `render_command_for_log` records a readable command, `run_git` executes Git, and `parse_git_apply_output` turns Git’s messages into structured results.
 
 *Call graph*: calls 6 internal fn (parse_git_apply_output, render_command_for_log, resolve_git_root, run_git, stage_paths, write_temp_patch); called by 6 (apply_add_success, apply_modify_conflict, apply_modify_skipped_missing_index, apply_then_revert_success, preflight_blocks_partial_changes, revert_preflight_does_not_stage_index); 3 external calls (new, var, vec!).
 
@@ -2814,11 +2830,11 @@ fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult>
 fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Finds the top-level repository directory for a working directory using `git rev-parse --show-toplevel`.
+**Purpose**: Finds the top-level folder of the Git repository for a given starting directory. This matters because patch paths are normally relative to the repository root, not whatever subfolder the caller happened to be in.
 
-**Data flow**: Runs `git rev-parse --show-toplevel` in `cwd`, inspects the exit code, and on success trims stdout into a `PathBuf`. On nonzero exit it constructs an `io::Error` containing the exit code and stderr text.
+**Data flow**: It receives a path, runs `git rev-parse --show-toplevel` there, and reads Git’s output. If Git succeeds, it returns the repository root path; if not, it returns an input/output error explaining that the directory is not inside a Git repository.
 
-**Call relations**: Called first by `apply_git_patch` so all subsequent git commands and path staging operate from the repository root rather than an arbitrary subdirectory.
+**Call relations**: It is called at the start of `apply_git_patch` so every later Git command runs from a stable, correct location.
 
 *Call graph*: called by 1 (apply_git_patch); 5 external calls (from, from_utf8_lossy, new, other, format!).
 
@@ -2829,11 +2845,11 @@ fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf>
 fn write_temp_patch(diff: &str) -> io::Result<(tempfile::TempDir, PathBuf)>
 ```
 
-**Purpose**: Creates a temporary directory and writes the unified diff text into `patch.diff` inside it.
+**Purpose**: Writes the patch text into a temporary file so the `git apply` command can read it. Git expects a file path here, so this function turns an in-memory string into something Git can consume.
 
-**Data flow**: Takes `&str diff`, creates a `tempfile::TempDir`, joins `patch.diff`, writes the diff bytes to disk, and returns `(TempDir, PathBuf)`.
+**Data flow**: It receives diff text, creates a temporary directory, writes the text to `patch.diff` inside that directory, and returns both the directory guard and the patch path. Keeping the directory object alive keeps the file from being deleted too early.
 
-**Call relations**: Used by `apply_git_patch` before invoking `git apply`; the returned tempdir is intentionally kept alive until the function returns.
+**Call relations**: It is called by `apply_git_patch` before Git is run. The returned path is then included in the command arguments passed to `run_git`.
 
 *Call graph*: called by 1 (apply_git_patch); 2 external calls (write, tempdir).
 
@@ -2844,11 +2860,11 @@ fn write_temp_patch(diff: &str) -> io::Result<(tempfile::TempDir, PathBuf)>
 fn run_git(cwd: &Path, git_cfg: &[String], args: &[String]) -> io::Result<(i32, String, String)>
 ```
 
-**Purpose**: Runs the `git` binary with optional `-c` config fragments and arbitrary arguments, returning exit code plus decoded stdout/stderr.
+**Purpose**: Runs the `git` program with chosen configuration flags and arguments. It is the small wrapper that actually crosses from this Rust code into the external Git command-line tool.
 
-**Data flow**: Consumes `cwd`, `git_cfg`, and `args`; builds a `std::process::Command`, appends all config parts and args, executes it in `cwd`, converts stdout/stderr from bytes with `String::from_utf8_lossy`, and returns `(code, stdout, stderr)` where missing status codes become `-1`.
+**Data flow**: It receives a working directory, optional Git configuration arguments, and normal Git arguments. It starts the Git process, waits for it to finish, converts its output from bytes into strings, and returns the exit code, standard output, and standard error.
 
-**Call relations**: This is the low-level process runner used by `apply_git_patch` for both preflight and real apply paths.
+**Call relations**: It is called by `apply_git_patch` for both dry-run checks and real patch application. Its raw text output is later handed to `parse_git_apply_output`.
 
 *Call graph*: called by 1 (apply_git_patch); 2 external calls (from_utf8_lossy, new).
 
@@ -2859,11 +2875,11 @@ fn run_git(cwd: &Path, git_cfg: &[String], args: &[String]) -> io::Result<(i32, 
 fn quote_shell(s: &str) -> String
 ```
 
-**Purpose**: Produces a shell-safe representation of one argument for logging.
+**Purpose**: Formats one command part safely for a human-readable shell command string. It is for logs, not for actually running the command.
 
-**Data flow**: Checks whether all characters are simple ASCII shell-safe characters; if so returns the string unchanged, otherwise wraps it in single quotes and escapes embedded single quotes.
+**Data flow**: It receives a string. If the string contains only simple shell-safe characters, it returns it unchanged; otherwise it wraps it in single quotes and escapes embedded single quotes.
 
-**Call relations**: Used only by `render_command_for_log` to make the logged command readable and copy-pastable.
+**Call relations**: It is called by `render_command_for_log`, which uses it on the directory, Git configuration pieces, and Git arguments before building the log string.
 
 *Call graph*: called by 1 (render_command_for_log); 1 external calls (format!).
 
@@ -2874,11 +2890,11 @@ fn quote_shell(s: &str) -> String
 fn render_command_for_log(cwd: &Path, git_cfg: &[String], args: &[String]) -> String
 ```
 
-**Purpose**: Formats the git invocation as a shell-like `(cd ... && git ...)` string for diagnostics and logs.
+**Purpose**: Builds a readable version of the Git command that was or will be run. This helps users and logs show exactly what was attempted.
 
-**Data flow**: Quotes `cwd`, each config fragment, and each argument with `quote_shell`, joins them into a command line, and returns the formatted string.
+**Data flow**: It receives the repository directory, Git configuration arguments, and command arguments. It quotes each piece for display, joins them into a `git ...` command, wraps it in a `(cd ... && ...)` form, and returns that string.
 
-**Call relations**: Called by `apply_git_patch` in both preflight and real-apply branches so callers can inspect the exact command shape.
+**Call relations**: It is called by `apply_git_patch` before running either the preflight or real command. It relies on `quote_shell` so paths with spaces or special characters are shown safely.
 
 *Call graph*: calls 1 internal fn (quote_shell); called by 1 (apply_git_patch); 2 external calls (new, format!).
 
@@ -2889,11 +2905,11 @@ fn render_command_for_log(cwd: &Path, git_cfg: &[String], args: &[String]) -> St
 fn extract_paths_from_patch(diff_text: &str) -> Vec<String>
 ```
 
-**Purpose**: Extracts all file paths mentioned in `diff --git` headers from a unified diff, normalized and deduplicated.
+**Purpose**: Reads a patch and collects the file paths mentioned in its `diff --git` headers. This is useful when the code needs to know which files a patch concerns before actually applying it.
 
-**Data flow**: Iterates trimmed diff lines, keeps only those starting with `diff --git `, parses the two header paths with `parse_diff_git_paths`, normalizes each side with `normalize_diff_path` (`a/`, `b/`, `/dev/null` handling), inserts them into a `BTreeSet`, and returns the sorted collected paths.
+**Data flow**: It receives patch text, scans each line for `diff --git`, parses the two paths from that header, removes Git’s `a/` and `b/` prefixes, ignores `/dev/null`, deduplicates the results, and returns a sorted list of paths.
 
-**Call relations**: Used by `stage_paths` to determine which files might need staging before a revert. Tests also exercise quoted and escaped header handling through this function.
+**Call relations**: It is used by `stage_paths` to decide which files may need staging before a reverse apply. Several tests call it directly to confirm quoted paths, `/dev/null`, and escaped characters are interpreted correctly.
 
 *Call graph*: calls 2 internal fn (normalize_diff_path, parse_diff_git_paths); called by 4 (stage_paths, extract_paths_handles_quoted_headers, extract_paths_ignores_dev_null_header, extract_paths_unescapes_c_style_in_quoted_headers); 1 external calls (new).
 
@@ -2904,11 +2920,11 @@ fn extract_paths_from_patch(diff_text: &str) -> Vec<String>
 fn parse_diff_git_paths(line: &str) -> Option<(String, String)>
 ```
 
-**Purpose**: Parses the two path tokens that follow `diff --git` in a header line.
+**Purpose**: Splits the path portion of a `diff --git` line into the old path and new path. It understands that paths may be quoted, so a space inside a filename is not mistaken for a separator.
 
-**Data flow**: Creates a peekable char iterator over the line, reads the first and second tokens with `read_diff_git_token`, and returns them as `(String, String)` if both are present.
+**Data flow**: It receives the text after `diff --git`, reads one path token, then reads a second path token. If both are present, it returns them as a pair; otherwise it returns nothing.
 
-**Call relations**: A helper for `extract_paths_from_patch`; it delegates token-level quoting and escaping rules to `read_diff_git_token`.
+**Call relations**: It is called by `extract_paths_from_patch` whenever that function finds a `diff --git` header. It delegates the careful token reading to `read_diff_git_token`.
 
 *Call graph*: calls 1 internal fn (read_diff_git_token); called by 1 (extract_paths_from_patch).
 
@@ -2919,11 +2935,11 @@ fn parse_diff_git_paths(line: &str) -> Option<(String, String)>
 fn read_diff_git_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String>
 ```
 
-**Purpose**: Reads one possibly quoted path token from a `diff --git` header, preserving escaped content and decoding quoted C-style strings.
+**Purpose**: Reads one file path token from a Git diff header. It handles plain paths and quoted paths, including escaped characters inside quotes.
 
-**Data flow**: Consumes leading whitespace from the peekable iterator, detects optional opening quote (`'` or `"`), then accumulates characters until the matching quote or next whitespace. Inside quoted mode it preserves backslash escapes in the intermediate buffer, then returns either the raw token or `unescape_c_string(&out)` for quoted tokens. If no token is present, it returns `None`.
+**Data flow**: It receives a character iterator positioned near a path. It skips leading whitespace, detects whether the path is quoted, gathers characters until the token ends, unescapes quoted text when needed, and returns the path string if one was found.
 
-**Call relations**: Used twice by `parse_diff_git_paths` to parse both sides of a diff header.
+**Call relations**: It is called twice by `parse_diff_git_paths`: once for the old path and once for the new path. When it sees quoted text, it hands the contents to `unescape_c_string`.
 
 *Call graph*: calls 1 internal fn (unescape_c_string); called by 1 (parse_diff_git_paths); 4 external calls (next, peek, new, matches!).
 
@@ -2934,11 +2950,11 @@ fn read_diff_git_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> 
 fn normalize_diff_path(raw: &str, prefix: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes one raw diff-header path by removing side prefixes and filtering out null-file markers.
+**Purpose**: Cleans up a raw path from a diff header so it becomes a normal repository-relative path. It also filters out Git’s special `/dev/null` marker, which means a file is being created or deleted rather than referring to a real path.
 
-**Data flow**: Trims the input, rejects empty strings, `/dev/null`, and `<prefix>dev/null`, strips the provided side prefix if present, rejects an empty remainder, and returns the normalized path string.
+**Data flow**: It receives a raw path and an expected prefix such as `a/` or `b/`. It trims whitespace, rejects empty values and `/dev/null`, removes the prefix if present, and returns the cleaned path if anything remains.
 
-**Call relations**: Called by `extract_paths_from_patch` for both the `a/` and `b/` sides of each parsed header.
+**Call relations**: It is called by `extract_paths_from_patch` after `parse_diff_git_paths` has separated the two header paths.
 
 *Call graph*: called by 1 (extract_paths_from_patch); 1 external calls (format!).
 
@@ -2949,11 +2965,11 @@ fn normalize_diff_path(raw: &str, prefix: &str) -> Option<String>
 fn unescape_c_string(input: &str) -> String
 ```
 
-**Purpose**: Decodes common C-style backslash escapes used in quoted git path output.
+**Purpose**: Turns backslash escape sequences into their real characters. This is needed because Git may print paths in a C-style quoted form, such as `hello\tworld.txt` for a filename containing a tab.
 
-**Data flow**: Walks the input string character by character, copying ordinary characters and translating escapes such as `\n`, `\t`, quotes, backslash, and up to three-digit octal sequences into Unicode scalar values when possible. It returns the decoded `String`.
+**Data flow**: It receives a string that may contain backslash escapes. It walks character by character, translating known escapes like newline, tab, quotes, backslash, and octal byte values, then returns the decoded string.
 
-**Call relations**: Used when parsing quoted diff-header tokens and when unquoting paths extracted from `git apply` output.
+**Call relations**: It is used by `read_diff_git_token` for quoted diff headers. The output parser also uses the same behavior inside its local path-cleaning helper when Git reports quoted paths.
 
 *Call graph*: called by 1 (read_diff_git_token); 2 external calls (with_capacity, from_u32).
 
@@ -2964,11 +2980,11 @@ fn unescape_c_string(input: &str) -> String
 fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()>
 ```
 
-**Purpose**: Best-effort stages only the patch-referenced files that currently exist on disk, to prepare for non-preflight revert application.
+**Purpose**: Best-effort stages the existing files mentioned by a patch before a real reverse apply. This helps Git avoid index mismatch problems when undoing changes.
 
-**Data flow**: Extracts candidate paths from the diff with `extract_paths_from_patch`, joins each against `git_root`, keeps only those whose `symlink_metadata` succeeds, and if any remain runs `git add -- <paths...>` in `git_root`. It ignores the command’s exit status and always returns `Ok(())` unless process spawning itself fails.
+**Data flow**: It receives the repository root and diff text. It extracts paths from the patch, keeps only those that currently exist on disk, runs `git add --` on that list, and returns success even if Git’s staging command itself reports failure.
 
-**Call relations**: Called only by `apply_git_patch` when `revert` is true and `preflight` is false. Its intentionally non-fatal behavior reflects the comment that staging is only a best-effort compatibility step.
+**Call relations**: It is called by `apply_git_patch` only for real reverse operations, not for preflight checks. It uses `extract_paths_from_patch` to know which files are relevant.
 
 *Call graph*: calls 1 internal fn (extract_paths_from_patch); called by 1 (apply_git_patch); 5 external calls (new, join, new, new, symlink_metadata).
 
@@ -2982,11 +2998,11 @@ fn parse_git_apply_output(
 ) -> (Vec<String>, Vec<String>, Vec<String>)
 ```
 
-**Purpose**: Parses stdout and stderr from `git apply` into three deduplicated path groups: applied, skipped, and conflicted.
+**Purpose**: Reads Git’s patch-application messages and turns them into three clear groups: applied files, skipped files, and conflicted files. This saves callers from having to understand many different Git error and warning phrases.
 
-**Data flow**: Combines non-empty stdout/stderr with newlines, iterates trimmed lines, and matches them against a large set of lazily compiled case-insensitive regexes. It tracks `last_seen_path` from `Checking patch ...`, inserts normalized/unquoted paths into `BTreeSet`s via the nested `add` helper, updates precedence as lines imply success, conflict, or skip states, then removes lower-priority classifications in a final pass and returns three vectors.
+**Data flow**: It receives standard output and standard error from Git, combines them, and scans line by line. It matches known messages such as clean application, conflicts, rejected hunks, missing index entries, binary patch failures, and skipped patches, then returns three sorted path lists with conflicts taking priority over applied or skipped.
 
-**Call relations**: Used by `apply_git_patch` for both preflight and real apply. It is the module’s main interpretation layer for git’s human-oriented diagnostics.
+**Call relations**: It is called by `apply_git_patch` after Git finishes, and one test calls it directly to check quoted path decoding. Its regular expression patterns are built with `regex_ci` so matching ignores letter case.
 
 *Call graph*: called by 2 (apply_git_patch, parse_output_unescapes_quoted_paths); 2 external calls (new, new).
 
@@ -2997,11 +3013,11 @@ fn parse_git_apply_output(
 fn regex_ci(pat: &str) -> Regex
 ```
 
-**Purpose**: Compiles a case-insensitive regex pattern and panics immediately if the pattern is invalid.
+**Purpose**: Creates a case-insensitive regular expression. This keeps Git message matching flexible when capitalization differs.
 
-**Data flow**: Prefixes the pattern with `(?i)`, calls `Regex::new`, and unwraps with a panic message on failure.
+**Data flow**: It receives a pattern string, adds the case-insensitive marker, compiles it, and returns the compiled regular expression. If the pattern is invalid, it panics because that would be a programmer error in a hard-coded pattern.
 
-**Call relations**: Used only to initialize the static regexes inside `parse_git_apply_output`.
+**Call relations**: It supports the pattern definitions used by `parse_git_apply_output`, where many Git output phrases are recognized.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -3012,11 +3028,11 @@ fn regex_ci(pat: &str) -> Regex
 fn env_lock() -> &'static Mutex<()>
 ```
 
-**Purpose**: Provides a global mutex used by tests that mutate process-wide git-related environment or rely on serialized git command execution.
+**Purpose**: Provides a shared lock for tests that touch process-wide environment or Git state. The lock makes those tests run one at a time where needed.
 
-**Data flow**: Initializes a `OnceLock<Mutex<()>>` on first use and returns a shared reference to the mutex.
+**Data flow**: It creates a global mutex, which is a lock that allows only one holder at a time, the first time it is requested. Later calls return the same lock.
 
-**Call relations**: Acquired by integration-style tests before invoking `apply_git_patch` to avoid cross-test interference.
+**Call relations**: The integration-style tests call this before creating repositories and running Git commands, reducing the chance that parallel tests interfere with each other.
 
 *Call graph*: 1 external calls (new).
 
@@ -3027,11 +3043,11 @@ fn env_lock() -> &'static Mutex<()>
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String)
 ```
 
-**Purpose**: Runs an arbitrary command in a repository directory and returns exit code plus decoded stdout/stderr for test setup and assertions.
+**Purpose**: Runs a command inside a test repository and captures its result. It is a test helper for invoking Git setup commands and checks.
 
-**Data flow**: Builds a `Command` from `args[0]` and `args[1..]`, executes it in `cwd`, and converts outputs to owned UTF-8-lossy strings.
+**Data flow**: It receives a working directory and a list of command arguments. It starts the command, captures its exit code, standard output, and standard error, converts output to strings, and returns all three.
 
-**Call relations**: Used by test helpers and scenarios to initialize repositories, commit files, and inspect git state around `apply_git_patch`.
+**Call relations**: Test setup and verification functions call this helper, especially `tests::init_repo`, `tests::apply_modify_conflict`, `tests::apply_then_revert_success`, and `tests::revert_preflight_does_not_stage_index`.
 
 *Call graph*: 2 external calls (from_utf8_lossy, new).
 
@@ -3042,11 +3058,11 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String)
 fn init_repo() -> tempfile::TempDir
 ```
 
-**Purpose**: Creates a temporary git repository with minimal user identity configured for commits.
+**Purpose**: Creates a temporary Git repository for tests. This lets each test run against a fresh sandbox instead of depending on the developer’s real repository.
 
-**Data flow**: Creates a tempdir, runs `git init`, `git config user.email`, and `git config user.name` in the root, then returns the tempdir.
+**Data flow**: It creates a temporary directory, runs `git init`, configures a minimal username and email for commits, and returns the temporary directory object that keeps the repository alive.
 
-**Call relations**: Shared setup helper for the patch-application tests.
+**Call relations**: Most patch-application tests call this before calling `apply_git_patch`. It uses `tests::run` to execute the Git setup commands.
 
 *Call graph*: 2 external calls (run, tempdir).
 
@@ -3057,11 +3073,11 @@ fn init_repo() -> tempfile::TempDir
 fn read_file_normalized(path: &Path) -> String
 ```
 
-**Purpose**: Reads a file and normalizes CRLF to LF so content assertions are platform-stable.
+**Purpose**: Reads a test file and normalizes Windows-style line endings to Unix-style line endings. This keeps assertions stable across operating systems.
 
-**Data flow**: Reads the file to string and replaces `\r\n` with `\n`.
+**Data flow**: It receives a file path, reads the file into a string, replaces `\r\n` with `\n`, and returns the normalized text.
 
-**Call relations**: Used by tests that verify file contents after apply and revert operations.
+**Call relations**: The apply-and-revert tests call this after patch operations to confirm the file contents changed, or did not change, as expected.
 
 *Call graph*: 1 external calls (read_to_string).
 
@@ -3072,11 +3088,11 @@ fn read_file_normalized(path: &Path) -> String
 fn extract_paths_handles_quoted_headers()
 ```
 
-**Purpose**: Verifies that quoted `diff --git` headers with spaces produce the expected normalized path.
+**Purpose**: Checks that path extraction works when Git diff headers quote filenames containing spaces. This protects support for common filenames like `hello world.txt`.
 
-**Data flow**: Builds a diff string with quoted header paths, calls `extract_paths_from_patch`, and asserts the resulting vector.
+**Data flow**: It builds a small diff with quoted paths, passes it to `extract_paths_from_patch`, and asserts that the returned list contains the unquoted filename once.
 
-**Call relations**: Exercises the header parser and normalization helpers.
+**Call relations**: The test runner calls this test. It exercises `extract_paths_from_patch`, which in turn relies on the lower-level diff path parsing helpers.
 
 *Call graph*: calls 1 internal fn (extract_paths_from_patch); 1 external calls (assert_eq!).
 
@@ -3087,11 +3103,11 @@ fn extract_paths_handles_quoted_headers()
 fn extract_paths_ignores_dev_null_header()
 ```
 
-**Purpose**: Checks that `/dev/null`-style paths are excluded when extracting patch paths.
+**Purpose**: Checks that path extraction ignores Git’s `/dev/null` marker. This matters for new or deleted files, where one side of the diff is not a real file path.
 
-**Data flow**: Constructs a diff involving `a/dev/null`, calls `extract_paths_from_patch`, and asserts only the real file path remains.
+**Data flow**: It builds a diff whose old side points at `a/dev/null` and whose new side is `ok.txt`, runs `extract_paths_from_patch`, and asserts that only `ok.txt` is returned.
 
-**Call relations**: Covers `normalize_diff_path` behavior for null-file markers.
+**Call relations**: The test runner calls this test to protect the filtering done by `normalize_diff_path` through the public path extraction function.
 
 *Call graph*: calls 1 internal fn (extract_paths_from_patch); 1 external calls (assert_eq!).
 
@@ -3102,11 +3118,11 @@ fn extract_paths_ignores_dev_null_header()
 fn extract_paths_unescapes_c_style_in_quoted_headers()
 ```
 
-**Purpose**: Ensures quoted diff-header paths with C-style escapes are decoded correctly.
+**Purpose**: Checks that escaped characters in quoted diff paths are decoded correctly. This protects filenames containing special characters such as tabs.
 
-**Data flow**: Creates a diff whose quoted header contains `\t`, calls `extract_paths_from_patch`, and asserts the resulting path contains a literal tab.
+**Data flow**: It builds a diff with a quoted path containing `\t`, calls `extract_paths_from_patch`, and asserts that the result contains an actual tab character in the filename.
 
-**Call relations**: Exercises `read_diff_git_token` and `unescape_c_string` together.
+**Call relations**: The test runner calls this test. It exercises the path extraction chain, including `read_diff_git_token` and `unescape_c_string`.
 
 *Call graph*: calls 1 internal fn (extract_paths_from_patch); 1 external calls (assert_eq!).
 
@@ -3117,11 +3133,11 @@ fn extract_paths_unescapes_c_style_in_quoted_headers()
 fn parse_output_unescapes_quoted_paths()
 ```
 
-**Purpose**: Verifies that quoted paths in `git apply` error output are unescaped before classification.
+**Purpose**: Checks that Git error output with quoted, escaped paths is reported as the real filename. This keeps user-facing skipped-path lists accurate.
 
-**Data flow**: Passes a synthetic stderr line to `parse_git_apply_output` and asserts the skipped-path vector contains the decoded filename.
+**Data flow**: It passes a simulated Git error message to `parse_git_apply_output`. It then asserts that no paths were applied or conflicted, and that the skipped list contains the decoded path.
 
-**Call relations**: Targets the nested path-unquoting logic inside the output parser.
+**Call relations**: The test runner calls this test directly against the output parser, without running Git.
 
 *Call graph*: calls 1 internal fn (parse_git_apply_output); 1 external calls (assert_eq!).
 
@@ -3132,11 +3148,11 @@ fn parse_output_unescapes_quoted_paths()
 fn apply_add_success()
 ```
 
-**Purpose**: Checks that applying a patch which adds a new file succeeds and creates the file.
+**Purpose**: Verifies that applying a patch which creates a new file succeeds. It covers the simplest successful patch path.
 
-**Data flow**: Initializes a repo, builds an add-file diff, calls `apply_git_patch`, and asserts exit code 0 plus file existence.
+**Data flow**: It locks the test environment, creates a temporary repository, builds a new-file diff, calls `apply_git_patch`, and checks that Git returned success and the file now exists.
 
-**Call relations**: End-to-end success test for the main apply path.
+**Call relations**: The test runner calls this test. It uses `tests::env_lock` and `tests::init_repo`, then exercises the main `apply_git_patch` flow.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 4 external calls (assert!, assert_eq!, env_lock, init_repo).
 
@@ -3147,11 +3163,11 @@ fn apply_add_success()
 fn apply_modify_conflict()
 ```
 
-**Purpose**: Checks that applying a patch conflicting with local unstaged edits returns a nonzero exit code.
+**Purpose**: Verifies that a patch reports failure when it conflicts with local changes. This confirms the code does not pretend a conflicting edit applied cleanly.
 
-**Data flow**: Seeds and commits a file, edits it locally, applies a conflicting patch via `apply_git_patch`, and asserts the exit code is nonzero.
+**Data flow**: It creates a repository, commits a seed file, changes that file locally, then tries to apply a patch that changes the same line differently. It calls `apply_git_patch` and asserts that Git returns a non-zero exit code.
 
-**Call relations**: Exercises the `--3way` conflict path and parser under failure.
+**Call relations**: The test runner calls this test. It uses the repository helpers and Git command helper, then checks the main patch application function under a conflict case.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 5 external calls (assert_ne!, env_lock, init_repo, run, write).
 
@@ -3162,11 +3178,11 @@ fn apply_modify_conflict()
 fn apply_modify_skipped_missing_index()
 ```
 
-**Purpose**: Verifies that modifying a file absent from the index fails as expected.
+**Purpose**: Verifies behavior when a patch tries to modify a file Git does not know about. This is a common failure mode for patches that do not match the repository.
 
-**Data flow**: Initializes a repo, constructs a patch against a nonexistent tracked file, runs `apply_git_patch`, and asserts a nonzero exit code.
+**Data flow**: It creates an empty temporary repository, builds a diff that modifies `ghost.txt`, calls `apply_git_patch`, and asserts that Git returns a non-zero exit code.
 
-**Call relations**: Covers skip/error handling for missing-index scenarios.
+**Call relations**: The test runner calls this test. It uses `tests::env_lock` and `tests::init_repo`, then exercises `apply_git_patch` on a missing-file scenario.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 3 external calls (assert_ne!, env_lock, init_repo).
 
@@ -3177,11 +3193,11 @@ fn apply_modify_skipped_missing_index()
 fn apply_then_revert_success()
 ```
 
-**Purpose**: Ensures a patch can be applied and then successfully reverted back to the original content.
+**Purpose**: Verifies that a patch can be applied and then reversed successfully. This protects the special reverse-apply path, including its staging step.
 
-**Data flow**: Creates and commits a file, applies a forward patch, verifies content, then calls `apply_git_patch` again with `revert = true` and checks the file returns to its original text.
+**Data flow**: It creates and commits a file, applies a patch that changes its content, confirms the new content, then calls `apply_git_patch` again with reverse mode and confirms the original content is restored.
 
-**Call relations**: Exercises both normal apply and revert logic, including the staging step before revert.
+**Call relations**: The test runner calls this test. It uses Git setup helpers, `apply_git_patch` for both forward and reverse operations, and `tests::read_file_normalized` to check file contents.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 6 external calls (assert_eq!, env_lock, init_repo, read_file_normalized, run, write).
 
@@ -3192,11 +3208,11 @@ fn apply_then_revert_success()
 fn revert_preflight_does_not_stage_index()
 ```
 
-**Purpose**: Confirms that revert preflight uses `--check` only and does not stage files or modify the working tree.
+**Purpose**: Verifies that a reverse preflight check does not stage files or change the working tree. Dry runs must be safe and leave no hidden Git index changes behind.
 
-**Data flow**: Creates and commits a repo state, applies and commits a forward patch, snapshots cached diff state, runs `apply_git_patch` with `revert = true, preflight = true`, then compares staged state and file contents before and after.
+**Data flow**: It creates a repository, applies and commits a change, records the staged-file list, runs `apply_git_patch` in reverse preflight mode, then confirms the staged-file list and file contents are unchanged.
 
-**Call relations**: Validates the branch in `apply_git_patch` that skips `stage_paths` during preflight.
+**Call relations**: The test runner calls this test. It specifically checks the branch in `apply_git_patch` where reverse mode and preflight mode combine, ensuring `stage_paths` is not used there.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 6 external calls (assert_eq!, env_lock, init_repo, read_file_normalized, run, write).
 
@@ -3207,10 +3223,10 @@ fn revert_preflight_does_not_stage_index()
 fn preflight_blocks_partial_changes()
 ```
 
-**Purpose**: Checks that preflight prevents partial application of a mixed-validity multi-file patch and that non-preflight does not use `--check`.
+**Purpose**: Verifies that preflight mode prevents partial changes when a multi-file patch would fail. This ensures the safety check really checks the whole patch before any file is modified.
 
-**Data flow**: Builds a diff with one valid add and one invalid modify, runs `apply_git_patch` once with `preflight = true` and once without, then asserts file absence and command-string contents accordingly.
+**Data flow**: It creates a repository and builds a patch with one valid new file and one invalid modification. It first runs `apply_git_patch` in preflight mode and confirms no file was created, then runs without preflight and confirms the logged command no longer contains `--check`.
 
-**Call relations**: Covers the distinction between dry-run validation and real apply command construction.
+**Call relations**: The test runner calls this test. It exercises the preflight branch of `apply_git_patch` and compares it with the normal apply branch.
 
 *Call graph*: calls 1 internal fn (apply_git_patch); 4 external calls (assert!, assert_ne!, env_lock, init_repo).

@@ -1,8 +1,10 @@
 # App-level event dispatch and thread routing  `stage-10.1.1`
 
-This stage is the TUI’s central orchestration layer inside the main event loop. It sits between raw input, app-server traffic, and thread-specific UI state, deciding what happens next and ensuring expensive work is pushed off the UI thread. `event_dispatch.rs` is the hub: it consumes queued `AppEvent`s and turns them into concrete actions such as UI mutations, server calls, config updates, thread switches, and shutdown. UI code feeds that hub through `app_event_sender.rs`, which provides a typed way to emit events and common `AppCommand`s, while `app_command.rs` defines the command vocabulary for thread operations, approvals, settings changes, and utility actions.
+This stage is the TUI’s main traffic system during normal use. It sits between the user, the screen, the app server, and multiple chat threads. app_event_sender gives other UI code a simple way to send actions into the main loop. app_command defines the allowed kinds of actions, so messages have clear meaning. event_dispatch is the central switchboard: it receives each event and sends it to the right handler.
 
-On the input side, `input.rs` handles app-wide keybindings before delegating to lower-level widgets. On the server side, `app_server_events.rs` translates incoming `AppServerEvent`s into TUI updates and thread-aware queues, and `app_server_requests.rs` tracks outstanding RPCs so user approvals or dismissals can be matched back to protocol request IDs. `thread_routing.rs` coordinates per-thread channels, buffering, replay, and thread-scoped command submission, with `pending_interactive_replay.rs` ensuring only still-unresolved prompts are replayed after thread switches. `background_requests.rs` runs slow RPCs and writes asynchronously, and `frame_requester.rs` coalesces redraw requests into rate-limited frame notifications.
+User key presses go through input, which handles global shortcuts such as switching threads, opening views, clearing the screen, or backing out with Escape. frame_requester asks for screen redraws in a careful way, combining repeated requests so the UI does not waste work.
+
+Messages from the app server go through app_server_events. Server requests that need a later user answer are tracked by app_server_requests. pending_interactive_replay remembers which prompts are still unresolved when a thread is replayed. thread_routing keeps events and actions tied to the correct conversation thread. background_requests runs slower server queries off to the side, then returns their results as normal app events.
 
 ## Files in this stage
 
@@ -11,13 +13,15 @@ These files define how app events enter the TUI and get routed into concrete app
 
 ### `tui/src/app_event_sender.rs`
 
-`util` · `cross-cutting`
+`orchestration` · `cross-cutting during TUI event handling`
 
-This file defines `AppEventSender`, a thin convenience wrapper around `tokio::sync::mpsc::UnboundedSender<AppEvent>`. Its main job is to centralize two behaviors that would otherwise be duplicated across widgets and handlers: converting common user actions into the right `AppEvent` shape, and recording inbound events to the session log before they enter the app loop.
+The TUI and the app core communicate through an event channel, which is like a mailbox: different parts of the interface drop messages into it, and the main app loop reads them later. This file wraps that mailbox in `AppEventSender`, a small helper that turns common user-facing actions into the right `AppEvent` messages.
 
-The core method is `send`, which logs every non-`AppEvent::CodexOp` event via `session_log::log_inbound_app_event` and then attempts to enqueue it on the unbounded channel. Channel send failures are intentionally swallowed after emitting a `tracing::error!`, reflecting that the UI often cannot recover meaningfully once the receiver side is gone. The remaining methods are narrowly scoped helpers that package specific `AppCommand`s into either `AppEvent::CodexOp` or `AppEvent::SubmitThreadOp`, depending on whether the command targets the currently active thread or an explicit `ThreadId`.
+Its main job is to keep event sending uniform. Before most events are sent, they are also written to the session log so a session can be replayed later with high detail. One important exception is `CodexOp` events, because those are logged elsewhere when they are submitted; logging them here too would create duplicates.
 
-A subtle but important invariant is the logging rule in `send`: raw app events are logged here, but `CodexOp` events are excluded because operation submission is logged at the point where the command is created. That avoids duplicate replay records while still preserving high-fidelity session reconstruction.
+Most methods are convenience shortcuts. For example, `interrupt` builds an interrupt command and sends it. Approval-related methods, such as `exec_approval` and `patch_approval`, include a `thread_id` so the answer goes back to the correct conversation thread. The elicitation method is similar, but for prompts coming from an MCP server, where an external tool asks the user for a decision or extra information.
+
+If sending fails, the file does not crash the interface. It records an error instead. That makes this sender a safe bridge between UI actions and the app’s central event processing.
 
 #### Function details
 
@@ -27,11 +31,11 @@ A subtle but important invariant is the logging rule in `send`: raw app events a
 fn new(app_event_tx: UnboundedSender<AppEvent>) -> Self
 ```
 
-**Purpose**: Constructs an `AppEventSender` from an existing unbounded app-event channel sender.
+**Purpose**: Creates an `AppEventSender` around an existing app event channel. Other parts of the TUI use this so they can send app events without directly touching the raw channel.
 
-**Data flow**: It takes an `UnboundedSender<AppEvent>` and stores it in the `app_event_tx` field of a new `AppEventSender`, returning that wrapper by value. No side effects occur.
+**Data flow**: It receives an `UnboundedSender<AppEvent>`, which is the mailbox used to send events to the app loop. It stores that sender inside a new `AppEventSender` and returns the wrapper.
 
-**Call relations**: This is the entry point used wherever code needs a typed event sender, including app startup and many tests/snapshots. Callers create the wrapper once and then use its helper methods instead of interacting with the raw channel directly.
+**Call relations**: Startup and setup code, including `run`, creates this wrapper and passes it into many UI helpers and tests. After that, those callers use the wrapper’s higher-level methods instead of constructing and sending raw channel messages themselves.
 
 *Call graph*: called by 345 (run, render_skill_load_warning_cells, accepted_model_migration_persists_target_default_reasoning_effort, auth_suggestion_with_reason_snapshot, declined_tool_suggestion_resolves_elicitation_decline, enable_suggestion_with_reason_snapshot, enable_tool_suggestion_resolves_elicitation_after_enable, generic_url_elicitation_confirmation_snapshot, generic_url_elicitation_resolves_without_connector_refresh, generic_url_elicitation_snapshot (+15 more)).
 
@@ -42,11 +46,11 @@ fn new(app_event_tx: UnboundedSender<AppEvent>) -> Self
 fn send(&self, event: AppEvent)
 ```
 
-**Purpose**: Logs an inbound app event when appropriate and forwards it to the app loop channel, tolerating receiver shutdown.
+**Purpose**: Sends one app event into the main event channel, while also recording most incoming events in the session log. This is the central doorway used by the other methods in this file.
 
-**Data flow**: It accepts an `AppEvent`. If the event is not `AppEvent::CodexOp(_)`, it reads the event value to pass it to `session_log::log_inbound_app_event`. It then attempts `self.app_event_tx.send(event)`. On error, it writes a tracing error log and returns `()`. It does not propagate send failures.
+**Data flow**: It takes an `AppEvent`. If the event is not a `CodexOp`, it writes the event to the session log for replay. Then it tries to place the event into the channel. If the channel is closed or sending otherwise fails, it logs an error and returns without panicking.
 
-**Call relations**: This is the common sink behind nearly every helper in this file and is also called directly by higher-level app code when emitting one-off events. It delegates to session logging first, then to the Tokio channel, and intentionally suppresses channel errors so callers do not need to handle them.
+**Call relations**: Many parts of the TUI call this when they need to report something to the app loop, such as startup work, configuration warnings, or direct UI events. The convenience methods in this file also call it after they have wrapped a user action into the correct `AppEvent` shape.
 
 *Call graph*: calls 1 internal fn (log_inbound_app_event); called by 53 (handle_tui_event, send_world_writable_scan_failed, spawn_startup_thread_start, apply_accepted_model_migration, emit_project_config_warnings, emit_skill_load_warnings, emit_system_bwrap_warning, handle_model_migration_prompt_if_needed, compact, exec_approval (+15 more)); 3 external calls (send, matches!, error!).
 
@@ -57,11 +61,11 @@ fn send(&self, event: AppEvent)
 fn interrupt(&self)
 ```
 
-**Purpose**: Submits an interrupt command for the active thread through the app event bus.
+**Purpose**: Requests that the current Codex operation be interrupted. This is used when the user presses an interrupt key or otherwise asks the assistant to stop what it is doing.
 
-**Data flow**: It reads no external state beyond `self`, constructs `AppCommand::interrupt()`, wraps it in `AppEvent::CodexOp`, and forwards it through `send`. It returns `()`.
+**Data flow**: It takes no extra input. It creates an interrupt `AppCommand`, wraps it as a `CodexOp` event, and sends that event through the shared sender.
 
-**Call relations**: This helper is invoked from keyboard handling paths such as Ctrl-C. It delegates all actual delivery and logging behavior to `send`, keeping key handlers free of event-construction details.
+**Call relations**: Keyboard handling code, such as `handle_key_event` and `on_ctrl_c`, calls this when the user signals interruption. This method then hands the request to `send`, which delivers it to the app loop.
 
 *Call graph*: calls 1 internal fn (send); called by 2 (handle_key_event, on_ctrl_c); 2 external calls (interrupt, CodexOp).
 
@@ -72,11 +76,11 @@ fn interrupt(&self)
 fn interrupt_and_restore_prompt_if_no_output(&self)
 ```
 
-**Purpose**: Submits the specialized interrupt command that restores the composer prompt when the interrupted turn produced no visible output.
+**Purpose**: Requests an interrupt, with the extra instruction to restore the prompt if nothing was produced. This supports a smoother user experience when stopping work before any visible output appears.
 
-**Data flow**: It constructs `AppCommand::interrupt_and_restore_prompt_if_no_output()`, wraps it in `AppEvent::CodexOp`, and sends it via `send`. No state is mutated locally.
+**Data flow**: It takes no extra input. It builds a special interrupt command, wraps it in a `CodexOp` event, and sends it to the app event channel.
 
-**Call relations**: This is used by interrupt flows that need rollback-to-composer semantics rather than a plain stop. It sits one layer above `send`, packaging the exact command variant expected by the app loop.
+**Call relations**: This is part of the interruption flow and is called by higher-level interrupt handling. It delegates final delivery to `send`, just like the simpler interrupt method.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (interrupt); 2 external calls (interrupt_and_restore_prompt_if_no_output, CodexOp).
 
@@ -87,11 +91,11 @@ fn interrupt_and_restore_prompt_if_no_output(&self)
 fn compact(&self)
 ```
 
-**Purpose**: Requests thread compaction through the standard app-command path.
+**Purpose**: Asks the app to compact the conversation or working context. In plain terms, this is a request to shrink or summarize accumulated state so the session can continue more efficiently.
 
-**Data flow**: It creates `AppCommand::compact()`, wraps it as `AppEvent::CodexOp`, and enqueues it with `send`, returning `()`. No local state changes.
+**Data flow**: It takes no arguments. It creates a compact command, wraps it as a `CodexOp` event, and sends it through the app event channel.
 
-**Call relations**: This is a convenience wrapper for callers that want compaction without manually constructing the nested event and command types. It relies on `send` for logging and channel delivery.
+**Call relations**: When some UI path decides compaction is needed, this method provides the standard command-building step. It relies on `send` to deliver the command to the main app loop.
 
 *Call graph*: calls 1 internal fn (send); 2 external calls (compact, CodexOp).
 
@@ -102,11 +106,11 @@ fn compact(&self)
 fn set_thread_name(&self, name: String)
 ```
 
-**Purpose**: Packages a thread-renaming request as a codex operation event.
+**Purpose**: Requests a rename for the current conversation thread. This lets the UI send a human-readable thread name into the app core.
 
-**Data flow**: It takes a `String` name, builds `AppCommand::set_thread_name(name)`, wraps it in `AppEvent::CodexOp`, and forwards it through `send`. Ownership of the name moves into the command.
+**Data flow**: It receives a `String` containing the new name. It puts that name into a set-thread-name command, wraps the command as a `CodexOp`, and sends it.
 
-**Call relations**: Used by UI flows that rename the current thread. It delegates the actual submission mechanics to `send` and the eventual RPC translation to downstream app-command handling.
+**Call relations**: Callers use this when a thread title changes or needs to be set. The method converts that intent into the app’s command format and passes it to `send`.
 
 *Call graph*: calls 1 internal fn (send); 2 external calls (set_thread_name, CodexOp).
 
@@ -117,11 +121,11 @@ fn set_thread_name(&self, name: String)
 fn review(&self, target: ReviewTarget)
 ```
 
-**Purpose**: Starts a review operation for the given `ReviewTarget` on the active thread.
+**Purpose**: Starts a review action for a specified target. The target describes what should be reviewed, such as a piece of work or code-related output.
 
-**Data flow**: It consumes a `ReviewTarget`, constructs `AppCommand::review(target)`, wraps it in `AppEvent::CodexOp`, and sends it. It returns `()`.
+**Data flow**: It receives a `ReviewTarget`. It builds a review command for that target, wraps it in a `CodexOp` event, and sends it to the app loop.
 
-**Call relations**: This helper is used by review UI actions to enter the normal command-submission pipeline. It does not perform review logic itself; it only packages the request for the app loop.
+**Call relations**: This method is the TUI’s shortcut for launching review work. It prepares the correct command and lets `send` handle logging and channel delivery.
 
 *Call graph*: calls 1 internal fn (send); 2 external calls (review, CodexOp).
 
@@ -132,11 +136,11 @@ fn review(&self, target: ReviewTarget)
 fn list_skills(&self, cwds: Vec<PathBuf>, force_reload: bool)
 ```
 
-**Purpose**: Requests a skills refresh/listing for one or more working directories, optionally forcing reload.
+**Purpose**: Asks the app to list available skills for one or more working directories. It can also force the skill list to be refreshed instead of using cached information.
 
-**Data flow**: It takes `cwds: Vec<PathBuf>` and `force_reload: bool`, builds `AppCommand::list_skills(cwds, force_reload)`, wraps it in `AppEvent::CodexOp`, and sends it. The vector is moved into the command.
+**Data flow**: It receives a list of directory paths and a `force_reload` flag. It builds a list-skills command with those values, wraps it as a `CodexOp`, and sends it through the event channel.
 
-**Call relations**: Called when UI flows need the app-command path to refresh visible skills state. It delegates event emission to `send` and leaves actual RPC execution to later app-server handling.
+**Call relations**: This is called during close-related UI flow when skill information needs to be requested. The method packages the request and passes it through `send` for delivery.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (close); 2 external calls (list_skills, CodexOp).
 
@@ -147,11 +151,11 @@ fn list_skills(&self, cwds: Vec<PathBuf>, force_reload: bool)
 fn user_input_answer(&self, id: String, response: ToolRequestUserInputResponse)
 ```
 
-**Purpose**: Submits a response to a tool-request user-input prompt back to the active thread.
+**Purpose**: Sends the user’s answer to a tool or app prompt that was waiting for input. This is how typed answers from the UI get back to the request that asked for them.
 
-**Data flow**: It takes a prompt `id` and a `ToolRequestUserInputResponse`, constructs `AppCommand::user_input_answer(id, response)`, wraps it in `AppEvent::CodexOp`, and sends it. Ownership of both arguments moves into the command.
+**Data flow**: It receives an input request ID and a structured response. It creates a user-input-answer command linking that response to the ID, wraps it as a `CodexOp`, and sends it.
 
-**Call relations**: Used by answer-submission paths for elicitation/user-input prompts. It packages the response into the same command pipeline as other active-thread operations.
+**Call relations**: Answer-submission code, such as `submit_answers` and `submit_empty_auto_resolution`, calls this after collecting or deciding on a response. The method forwards that answer into the main event flow.
 
 *Call graph*: calls 1 internal fn (send); called by 2 (submit_answers, submit_empty_auto_resolution); 2 external calls (user_input_answer, CodexOp).
 
@@ -167,11 +171,11 @@ fn exec_approval(
     )
 ```
 
-**Purpose**: Submits an execution-approval decision to a specific thread rather than whichever thread is currently focused.
+**Purpose**: Sends the user’s decision about whether a command execution should be allowed. This is used when the app asks for confirmation before running something potentially important or risky.
 
-**Data flow**: It takes `thread_id`, approval `id`, and a `CommandExecutionApprovalDecision`, constructs `AppCommand::exec_approval(id, None, decision)`, wraps that in `AppEvent::SubmitThreadOp { thread_id, op }`, and sends it. It returns `()`.
+**Data flow**: It receives the target thread ID, the approval request ID, and the user’s decision. It builds an execution-approval command, places it inside a `SubmitThreadOp` event so it goes to the right thread, and sends it.
 
-**Call relations**: This is called from execution-approval UI handlers. Unlike active-thread helpers, it targets an explicit thread via `SubmitThreadOp`, ensuring the decision reaches the correct thread even if focus changed before the user responded.
+**Call relations**: `handle_exec_decision` calls this after the user chooses whether to approve command execution. This method turns that choice into a thread-specific event and hands it to `send`.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (handle_exec_decision); 1 external calls (exec_approval).
 
@@ -187,11 +191,11 @@ fn request_permissions_response(
     )
 ```
 
-**Purpose**: Submits a permissions-request response to a specific thread.
+**Purpose**: Sends the user’s response to a permissions request. This is used when the app needs to know whether it may use certain capabilities or access.
 
-**Data flow**: It accepts `thread_id`, request `id`, and a `RequestPermissionsResponse`, builds `AppCommand::request_permissions_response(id, response)`, wraps it in `AppEvent::SubmitThreadOp`, and sends it. No local state is modified.
+**Data flow**: It receives the thread ID, the permissions request ID, and the response. It builds a permissions-response command, wraps it in a `SubmitThreadOp` event for that thread, and sends it.
 
-**Call relations**: Used by permission-decision handlers when the response must be correlated with a particular thread. It delegates transport and logging to `send` while preserving explicit thread routing.
+**Call relations**: `handle_permissions_decision` calls this after the UI has a permissions decision. The method packages the answer for the correct thread and sends it onward.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (handle_permissions_decision); 1 external calls (request_permissions_response).
 
@@ -207,11 +211,11 @@ fn patch_approval(
     )
 ```
 
-**Purpose**: Submits a file-change approval decision for a specific thread.
+**Purpose**: Sends the user’s decision about whether a proposed file change should be applied. This protects the user from silent edits by requiring an explicit approval path.
 
-**Data flow**: It takes `thread_id`, approval `id`, and a `FileChangeApprovalDecision`, constructs `AppCommand::patch_approval(id, decision)`, wraps it in `AppEvent::SubmitThreadOp`, and sends it. It returns `()`.
+**Data flow**: It receives the thread ID, the patch approval request ID, and the user’s decision. It builds a patch-approval command, wraps it in a thread-targeted event, and sends it through the channel.
 
-**Call relations**: This helper is used by patch-approval UI flows. Like other explicit-thread approval helpers, it ensures the decision is delivered to the originating thread regardless of current UI focus.
+**Call relations**: `handle_patch_decision` calls this after the user approves or rejects a file change. The method routes that decision back to the correct conversation thread through `send`.
 
 *Call graph*: calls 1 internal fn (send); called by 1 (handle_patch_decision); 1 external calls (patch_approval).
 
@@ -228,11 +232,11 @@ fn resolve_elicitation(
         content:
 ```
 
-**Purpose**: Packages an MCP/server elicitation resolution, including optional structured content and metadata, for a specific thread.
+**Purpose**: Answers an elicitation request from an MCP server. An elicitation is a prompt from an external tool or server asking the user to choose an action, provide content, or confirm something.
 
-**Data flow**: It takes `thread_id`, `server_name`, `request_id`, `decision`, optional JSON `content`, and optional JSON `meta`; constructs `AppCommand::resolve_elicitation(...)`; wraps it in `AppEvent::SubmitThreadOp`; and sends it. All owned inputs move into the command.
+**Data flow**: It receives the thread ID, server name, server request ID, the user’s decision, and optional JSON content and metadata. It builds a resolve-elicitation command with all of that information, wraps it in a thread-specific event, and sends it.
 
-**Call relations**: Called by elicitation resolution paths, including explicit decisions, cancellation, and answer submission. It bridges UI responses into the thread-specific command pipeline so downstream app-server code can answer the pending server request.
+**Call relations**: Elicitation-related flows call this when the user responds, cancels, or submits answers, including `handle_elicitation_decision`, `dispatch_cancel`, and another higher-level `resolve_elicitation` path. This method is the final packaging step before the response enters the main app loop.
 
 *Call graph*: calls 1 internal fn (send); called by 4 (resolve_elicitation, handle_elicitation_decision, dispatch_cancel, submit_answers); 1 external calls (resolve_elicitation).
 
@@ -241,11 +245,7 @@ fn resolve_elicitation(
 
 `orchestration` · `main loop`
 
-This file provides the redraw scheduling mechanism used throughout the TUI. `FrameRequester` is the lightweight handle cloned by widgets and background tasks; internally it just owns an `mpsc::UnboundedSender<Instant>` carrying requested draw times. `FrameRequester::new` creates that channel, constructs a private `FrameScheduler`, spawns its `run` loop on Tokio, and returns the sender side. Immediate and delayed redraws are represented uniformly as absolute `Instant`s via `schedule_frame` and `schedule_frame_in`.
-
-`FrameScheduler` owns the receiver, the broadcast sender used by the main event loop, and a `FrameRateLimiter`. Its `run` loop maintains `next_deadline: Option<Instant>`. Each iteration computes a sleep target: either the earliest pending deadline or a far-future sentinel (`ONE_YEAR`) when idle. Inside `tokio::select!`, incoming requests are clamped through the rate limiter and merged into `next_deadline` by taking the earlier of the existing and new deadlines. The scheduler intentionally does not emit immediately on receipt; instead it loops so multiple requests before the deadline collapse into one notification. When the sleep branch fires and a deadline was pending, it clears `next_deadline`, marks the emission time in the limiter, and sends a single `()` on the draw broadcast channel.
-
-The tests cover immediate scheduling, delayed scheduling, coalescing of repeated or mixed requests, and the 120 FPS cap inherited from `FrameRateLimiter`.
+A terminal screen should redraw when something changes, but not every tiny change should cause its own full redraw. Without this file, animations, typing, status updates, and background events could either feel stale or flood the app with too many redraws. The file solves that with a small “request desk” model. Widgets and background tasks hold a clone of `FrameRequester`, which is like a button they can press to say “please draw soon” or “please draw after this delay.” Those requests are sent to a background `FrameScheduler` task through a channel, which is a safe queue for messages between asynchronous tasks. The scheduler keeps only the earliest needed draw time, so three requests for nearly the same moment become one draw notification. When the chosen time arrives, it broadcasts a simple signal to the main TUI event loop, which is the part that actually redraws the screen. It also uses `FrameRateLimiter` to avoid sending draw signals faster than 120 frames per second. The tests use paused virtual time so they can prove the timing behavior without waiting in real time.
 
 #### Function details
 
@@ -255,11 +255,11 @@ The tests cover immediate scheduling, delayed scheduling, coalescing of repeated
 fn new(draw_tx: broadcast::Sender<()>) -> Self
 ```
 
-**Purpose**: Creates a frame-request handle and starts the background scheduler task that will emit draw notifications.
+**Purpose**: Creates a redraw requester that other parts of the TUI can clone and use. It also starts the private scheduler task that turns many requested draw times into broadcast redraw signals.
 
-**Data flow**: Consumes a `broadcast::Sender<()>`, creates an unbounded MPSC channel of `Instant`, constructs `FrameScheduler::new(rx, draw_tx)`, spawns `scheduler.run()` on Tokio, and returns `FrameRequester { frame_schedule_tx: tx }`.
+**Data flow**: It takes a broadcast sender that the main TUI event loop listens to. It creates an internal message queue, gives the receiving end to a new `FrameScheduler`, starts that scheduler in the background, and returns a `FrameRequester` holding the sending end of the queue.
 
-**Call relations**: Called during `Tui::new` and by tests. It is the public entrypoint that wires request producers to the scheduler actor.
+**Call relations**: This is the setup point for the requester/scheduler pair. Production code and the tests create a requester with it; it immediately hands the queue receiver and draw broadcaster to `FrameScheduler::new`, then starts `FrameScheduler::run` so later calls to `schedule_frame` or `schedule_frame_in` have somewhere to go.
 
 *Call graph*: calls 1 internal fn (new); called by 9 (new, test_coalesces_mixed_immediate_and_delayed_requests, test_coalesces_multiple_requests_into_single_draw, test_limits_draw_notifications_to_120fps, test_multiple_delayed_requests_coalesce_to_earliest, test_rate_limit_clamps_early_delayed_requests, test_rate_limit_does_not_delay_future_draws, test_schedule_frame_immediate_triggers_once, test_schedule_frame_in_triggers_at_delay); 2 external calls (unbounded_channel, spawn).
 
@@ -270,11 +270,11 @@ fn new(draw_tx: broadcast::Sender<()>) -> Self
 fn schedule_frame(&self)
 ```
 
-**Purpose**: Requests a redraw as soon as possible.
+**Purpose**: Asks the TUI to redraw as soon as it reasonably can. This is used when something visible has changed now, such as input, selection, size, or animation state.
 
-**Data flow**: Captures `Instant::now()`, sends it on `frame_schedule_tx`, ignores send failure, and returns `()`. If the scheduler has exited, the request is silently dropped.
+**Data flow**: It reads the current time, sends that time into the scheduler’s queue, and returns without waiting. The function does not redraw itself; it only places a request for the scheduler to process.
 
-**Call relations**: Widely called across the TUI whenever state changes require repaint. The scheduler later coalesces and rate-limits these requests.
+**Call relations**: Many UI actions call this when they need the screen refreshed. The request travels to `FrameScheduler::run`, where it may be combined with other requests and delayed slightly if the frame-rate limit says a draw just happened.
 
 *Call graph*: called by 33 (handle_draw_size_change, pick_random_variant, schedule_next_frame, request_redraw, request_redraw, handle_key, select, set_highlight, back_to_summary, customize (+15 more)); 2 external calls (now, send).
 
@@ -285,11 +285,11 @@ fn schedule_frame(&self)
 fn schedule_frame_in(&self, dur: Duration)
 ```
 
-**Purpose**: Requests a redraw after a specified delay.
+**Purpose**: Asks the TUI to redraw after a chosen delay. This is useful for timers, animations, paste bursts, or background work that knows the next visible update should happen later.
 
-**Data flow**: Captures `Instant::now() + dur`, sends that absolute deadline on `frame_schedule_tx`, ignores send failure, and returns `()`. The delay is converted immediately into an `Instant`.
+**Data flow**: It takes a duration, adds it to the current time to make a target draw time, and sends that target into the scheduler’s queue. It returns immediately after queuing the request.
 
-**Call relations**: Used by animations, delayed UI updates, and other code that wants a future repaint rather than an immediate one.
+**Call relations**: Callers use this when the next redraw should happen in the future instead of right now. `FrameScheduler::run` receives the requested time, applies the frame-rate limit if needed, and decides whether this request should become the next draw deadline.
 
 *Call graph*: called by 8 (handle_draw_size_change, schedule_next_frame, request_redraw_in, handle_paste_burst_tick, render, render_continue_in_browser, schedule_next_frame, render); 2 external calls (now, send).
 
@@ -300,11 +300,11 @@ fn schedule_frame_in(&self, dur: Duration)
 fn test_dummy() -> Self
 ```
 
-**Purpose**: Creates a no-op requester for tests that need a `FrameRequester` value without a running scheduler.
+**Purpose**: Creates a fake requester for tests that need a `FrameRequester` value but do not want a real scheduler or real redraws. It is only compiled for tests.
 
-**Data flow**: Creates an unbounded channel, discards the receiver, stores the sender in `FrameRequester`, and returns it.
+**Data flow**: It creates an internal queue and keeps only the sending side inside a `FrameRequester`; the receiving side is discarded. Any redraw requests sent to this dummy go nowhere.
 
-**Call relations**: Used by many unrelated tests elsewhere in the crate to satisfy dependencies on a frame requester without spawning async infrastructure.
+**Call relations**: Many UI tests call this when they are testing other behavior and redraw scheduling is not the focus. It avoids starting `FrameScheduler::run`, so those tests can supply a harmless stand-in.
 
 *Call graph*: called by 135 (enqueue_primary_thread_session_replays_turns_before_initial_prompt_submit, height_shrink_schedules_resize_reflow, replace_chat_widget_reseeds_collab_agent_metadata_for_replay, composer_shown_after_denied_while_task_running, ctrl_c_cancels_history_search_without_clearing_draft_or_showing_quit_hint, ctrl_c_on_modal_consumes_without_showing_quit_hint, drain_pending_submission_state_clears_remote_image_urls, esc_interrupts_running_task_when_no_popup, esc_release_after_dismissing_agent_picker_does_not_interrupt_task, esc_routes_to_handle_key_event_when_requested (+15 more)); 1 external calls (unbounded_channel).
 
@@ -315,11 +315,11 @@ fn test_dummy() -> Self
 fn new(receiver: mpsc::UnboundedReceiver<Instant>, draw_tx: broadcast::Sender<()>) -> Self
 ```
 
-**Purpose**: Constructs the internal scheduler state from a request receiver and draw broadcast sender.
+**Purpose**: Builds the private scheduler that receives requested draw times and later notifies the TUI event loop. It also creates the frame-rate limiter used to avoid drawing too often.
 
-**Data flow**: Stores the provided `receiver` and `draw_tx`, initializes `rate_limiter` with `FrameRateLimiter::default()`, and returns `Self`.
+**Data flow**: It takes the receiving end of the request queue and the broadcast sender for draw notifications. It stores both, adds a default `FrameRateLimiter`, and returns the scheduler object ready to run.
 
-**Call relations**: Called only by `FrameRequester::new` before the scheduler task is spawned.
+**Call relations**: `FrameRequester::new` calls this during setup. The returned scheduler is then passed to the background task that runs `FrameScheduler::run`.
 
 *Call graph*: called by 1 (new); 1 external calls (default).
 
@@ -330,11 +330,11 @@ fn new(receiver: mpsc::UnboundedReceiver<Instant>, draw_tx: broadcast::Sender<()
 async fn run(mut self)
 ```
 
-**Purpose**: Runs the scheduler actor loop, merging requested draw times into one earliest pending deadline and emitting draw notifications when due.
+**Purpose**: Runs the background scheduling loop that turns many redraw requests into a single timed redraw signal. It keeps the UI responsive while avoiding repeated, unnecessary redraws.
 
-**Data flow**: Owns `self` asynchronously. It keeps `next_deadline: Option<Instant>`, computes a sleep target from that or a one-year sentinel, pins a `sleep_until`, and `select!`s between incoming request times and the deadline. Received times are clamped via `rate_limiter.clamp_deadline` and merged into `next_deadline` using `min`; channel closure breaks the loop. When the deadline fires and one was pending, it clears `next_deadline`, records the emission with `mark_emitted(target)`, sends `()` on `draw_tx`, and continues.
+**Data flow**: It waits for either a new requested draw time or for the current draw deadline to arrive. For each incoming request, it clamps the requested time through the frame-rate limiter and keeps the earliest pending deadline. When that deadline arrives, it clears the pending deadline, records that a draw was emitted, and broadcasts a draw notification. If all request senders are gone, it exits.
 
-**Call relations**: Spawned once per `FrameRequester::new`. It is the sole consumer of frame requests and the sole producer of draw broadcast notifications.
+**Call relations**: This task is started by `FrameRequester::new` and then lives behind the scenes. `schedule_frame` and `schedule_frame_in` feed it requested times; it hands off only the final redraw signal to the main TUI event loop through the broadcast channel.
 
 *Call graph*: 4 external calls (from_secs, pin!, select!, sleep_until).
 
@@ -345,11 +345,11 @@ async fn run(mut self)
 async fn test_schedule_frame_immediate_triggers_once()
 ```
 
-**Purpose**: Tests that one immediate frame request produces exactly one draw notification.
+**Purpose**: Checks that one immediate redraw request produces exactly one draw notification. It protects against both missing the redraw and accidentally sending duplicates.
 
-**Data flow**: Creates a requester and draw receiver under paused Tokio time, schedules an immediate frame, advances time slightly, awaits one successful draw receive, then asserts a second receive times out.
+**Data flow**: The test creates a broadcast channel and requester, asks for an immediate frame, advances paused test time slightly, then reads from the draw receiver. It expects one successful notification and then no second notification.
 
-**Call relations**: Covers the simplest scheduler path from immediate request to single emitted draw.
+**Call relations**: This test exercises `FrameRequester::new` and `FrameRequester::schedule_frame` through the real scheduler. It confirms the basic path from requester to scheduler to broadcast receiver works once.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -360,11 +360,11 @@ async fn test_schedule_frame_immediate_triggers_once()
 async fn test_schedule_frame_in_triggers_at_delay()
 ```
 
-**Purpose**: Tests that delayed frame requests do not fire early and do fire once after the requested delay.
+**Purpose**: Checks that a delayed redraw does not happen before its requested delay and does happen after it. This proves delayed scheduling respects time.
 
-**Data flow**: Schedules a frame 50 ms in the future, advances time by 30 ms and asserts no draw arrives, then advances past the deadline, asserts one draw arrives, and confirms no second draw follows.
+**Data flow**: The test schedules a frame 50 milliseconds in the future, advances time by less than that and expects no notification, then advances past the delay and expects one notification. It also checks that no extra notification follows.
 
-**Call relations**: Validates delayed scheduling behavior in `FrameScheduler::run`.
+**Call relations**: This test drives `FrameRequester::schedule_frame_in` and observes the scheduler through the broadcast channel. It verifies that `FrameScheduler::run` waits until the requested deadline instead of firing immediately.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -375,11 +375,11 @@ async fn test_schedule_frame_in_triggers_at_delay()
 async fn test_coalesces_multiple_requests_into_single_draw()
 ```
 
-**Purpose**: Tests that several immediate requests before the deadline collapse into one draw notification.
+**Purpose**: Checks that several immediate redraw requests made together become one draw notification. This protects the app from wasting work when many UI parts ask for a redraw at once.
 
-**Data flow**: Schedules three immediate frames, advances time enough for processing, receives one draw successfully, and asserts no second draw arrives.
+**Data flow**: The test sends three immediate frame requests, advances paused time enough for the scheduler to act, and reads from the draw channel. It expects one notification and then no more for that batch.
 
-**Call relations**: Exercises the scheduler’s decision to defer emission until the sleep branch so multiple requests can merge.
+**Call relations**: This test uses `FrameRequester::schedule_frame` repeatedly to feed the scheduler. It confirms `FrameScheduler::run` combines pending requests instead of broadcasting once per request.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -390,11 +390,11 @@ async fn test_coalesces_multiple_requests_into_single_draw()
 async fn test_coalesces_mixed_immediate_and_delayed_requests()
 ```
 
-**Purpose**: Tests that an immediate request and a later delayed request coalesce to the earlier immediate deadline.
+**Purpose**: Checks that an immediate redraw and a later redraw request made together are merged into one immediate draw. This matters because the earlier draw will already refresh the screen.
 
-**Data flow**: Schedules a delayed frame at 100 ms and then an immediate frame, advances time slightly, asserts one draw arrives promptly, and confirms no later second draw appears from the delayed request.
+**Data flow**: The test first schedules a delayed frame, then schedules an immediate frame, advances time slightly, and expects one draw notification. It then waits past the original delayed time and expects no second notification.
 
-**Call relations**: Covers merging logic where `next_deadline` keeps the minimum of pending deadlines.
+**Call relations**: This test combines `FrameRequester::schedule_frame_in` and `FrameRequester::schedule_frame`. It verifies that `FrameScheduler::run` chooses the earliest pending deadline and treats the later request as covered by the earlier draw.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -405,11 +405,11 @@ async fn test_coalesces_mixed_immediate_and_delayed_requests()
 async fn test_limits_draw_notifications_to_120fps()
 ```
 
-**Purpose**: Tests that back-to-back immediate requests are separated by at least `MIN_FRAME_INTERVAL`.
+**Purpose**: Checks that the scheduler does not emit redraw notifications faster than the configured maximum rate. This prevents rapid updates from overworking the terminal renderer.
 
-**Data flow**: Schedules and receives one immediate draw, schedules another immediate draw, advances time by only 1 ms and asserts no draw arrives, then advances by `MIN_FRAME_INTERVAL` and asserts the second draw arrives.
+**Data flow**: The test triggers one draw and receives it, then immediately requests another. It advances time by a very small amount and expects no draw yet, then advances by the minimum frame interval and expects the second draw.
 
-**Call relations**: Validates integration between `FrameScheduler` and `FrameRateLimiter`.
+**Call relations**: This test uses the public requester API but is really checking the scheduler’s use of `FrameRateLimiter`. It proves `FrameScheduler::run` delays too-early requests rather than broadcasting them immediately.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -420,11 +420,11 @@ async fn test_limits_draw_notifications_to_120fps()
 async fn test_rate_limit_clamps_early_delayed_requests()
 ```
 
-**Purpose**: Tests that even delayed requests are clamped forward when their requested time is still too soon after the last emitted frame.
+**Purpose**: Checks that even delayed requests are pushed back if they would still happen too soon after the last draw. This keeps the frame-rate limit consistent for all kinds of requests.
 
-**Data flow**: Emits one draw, schedules another for 1 ms later, advances half the minimum interval and asserts no draw, then advances enough to pass the clamp point and asserts the draw arrives.
+**Data flow**: The test emits an initial draw, then schedules another draw only 1 millisecond later. It advances time partway through the minimum allowed interval and expects no notification, then advances enough time and expects the draw.
 
-**Call relations**: Covers the case where `schedule_frame_in` still lands inside the rate-limit window.
+**Call relations**: This test drives `FrameRequester::schedule_frame_in` after an earlier draw has been emitted. It verifies that `FrameScheduler::run` asks the frame-rate limiter to clamp an overly early deadline.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -435,11 +435,11 @@ async fn test_rate_limit_clamps_early_delayed_requests()
 async fn test_rate_limit_does_not_delay_future_draws()
 ```
 
-**Purpose**: Tests that requests already far enough in the future are not delayed beyond their own deadline by the rate limiter.
+**Purpose**: Checks that the rate limiter does not unnecessarily delay a redraw that is already far enough in the future. This protects legitimate timers and animations from being made late.
 
-**Data flow**: Emits one immediate draw, schedules another 50 ms later, advances to just before 50 ms and asserts no draw, then advances to the deadline and asserts the draw arrives.
+**Data flow**: The test emits one draw, then schedules another 50 milliseconds later. It advances to just before that time and expects no draw, then advances to the target time and expects the notification.
 
-**Call relations**: Confirms `clamp_deadline` uses `max(requested, min_allowed)` rather than always adding the minimum interval.
+**Call relations**: This test confirms the cooperation between `FrameRequester::schedule_frame_in`, `FrameScheduler::run`, and the frame-rate limiter. It shows that clamping only affects requests that are too close to the previous draw.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
@@ -450,24 +450,24 @@ async fn test_rate_limit_does_not_delay_future_draws()
 async fn test_multiple_delayed_requests_coalesce_to_earliest()
 ```
 
-**Purpose**: Tests that several delayed requests merge into a single draw at the earliest requested deadline.
+**Purpose**: Checks that several delayed redraw requests are merged and the earliest requested time wins. This avoids extra redraws for later requests that are already covered by the first refresh.
 
-**Data flow**: Schedules delayed draws at 100, 20, and 120 ms, advances to just before the earliest and asserts no draw, then advances past it, receives one draw, and confirms no later draws arrive from the superseded deadlines.
+**Data flow**: The test schedules draws at several future delays, advances time to before the earliest one and expects no notification, then advances past the earliest and expects one notification. It waits longer and expects no additional notifications for the later requests.
 
-**Call relations**: Exercises the scheduler’s `cur.min(draw_at)` merge rule for multiple future requests.
+**Call relations**: This test feeds multiple `schedule_frame_in` requests into the scheduler. It verifies that `FrameScheduler::run` keeps the minimum pending deadline and drops the rest of the batch after one broadcast.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from_millis, assert!, channel, advance).
 
 
 ### `tui/src/app/event_dispatch.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `main loop / event handling`
 
-This file is the heart of the app’s single-threaded control flow. `App::handle_event` is an exhaustive async match over `AppEvent`, and nearly every subsystem feeds into it: session lifecycle (`NewSession`, `ClearUi`, resume picker, fork, archive/delete), transcript consolidation, overlays, plugin and marketplace flows, MCP inventory, rate limits and token usage, feedback, permissions and approvals, feature flags, memory settings, Windows sandbox setup, keymap editing, status line and terminal title persistence, syntax theme selection, and many more. The method’s role is intentionally orchestration-heavy: it rarely contains deep business logic itself, instead delegating to focused helpers and submodules while preserving ordering guarantees in the main loop.
+The TUI app works by sending itself named events, such as “open the session picker,” “submit this message,” “show the diff,” “save this setting,” or “exit now.” This file is where those events are sorted and routed. Think of it like a train station signal box: many trains arrive on one track, and this code sends each one to the right platform.
 
-Several branches encode subtle sequencing rules. `/clear` and clear-and-submit both clear terminal state, reset transcript state, and then start a fresh session. Plugin/hook enablement completion branches consult pending-write maps to coalesce rapid toggles and replay only the latest desired state. Rate-limit and token-activity completion branches may defer history insertion until no transient stream cell blocks usage-card insertion. Windows sandbox setup branches enforce requirement checks before setup, spawn blocking setup work, persist the resulting mode, and then patch live turn context and permission profile state. Persistence branches for model, personality, service tier, approvals reviewer, plan-mode effort, and keymap edits all update runtime state only after durable config writes succeed.
+The main piece is `App::handle_event`. It looks at the incoming `AppEvent` and then updates the screen, talks to the app server, writes configuration, starts background work, or asks smaller app modules to do focused jobs. The file intentionally keeps most detailed behavior elsewhere, so this central dispatcher stays mostly responsible for “what should happen next?” rather than “how exactly is this feature implemented?”
 
-Outside the giant dispatcher, `apply_keymap_capture` and `apply_keymap_clear` compute edited keymap configs, validate them into a `RuntimeKeymap`, persist the corresponding config edit, and then update both app and widget state or surface conflicts/errors. `refresh_plugin_mentions_after_config_write` is a tiny helper that refreshes mention candidates and submits `reload_user_config`. `handle_exit_mode` implements the two exit policies, including a two-second timeout for graceful thread shutdown in `ShutdownFirst`. `archive_current_thread` and `delete_current_thread` enforce that a real, non-side thread exists before calling the corresponding app-server RPC and exiting on success.
+It also contains a few local helper actions that are tightly tied to dispatching: saving or clearing keyboard shortcuts, refreshing plugin mentions after config changes, shutting down cleanly, and archiving or deleting the current conversation thread. Without this file, user actions and background responses would arrive but not reliably reach the parts of the app that can act on them.
 
 #### Function details
 
@@ -482,11 +482,11 @@ async fn handle_event(
     ) -> Result<AppRunControl>
 ```
 
-**Purpose**: Dispatches every `AppEvent` variant to the appropriate app behavior and returns whether the main loop should continue or exit. It is the central coordinator for UI actions, background completions, config persistence, thread lifecycle, and app-server interactions.
+**Purpose**: This is the app’s main event router. Whenever the terminal app receives an `AppEvent`, this function decides whether to update the chat view, call the app server, open a popup, write settings, start background work, or exit.
 
-**Data flow**: Consumes a mutable `App`, mutable `tui::Tui`, mutable `AppServerSession`, and one `AppEvent`. Depending on the variant it may mutate transcript state, chat-widget state, config, overlays, pending-write maps, thread/session state, or telemetry; call into app-server RPCs; launch background tasks; persist config edits; enqueue further `AppEvent`s; or return `AppRunControl::Exit(...)`. Most branches return `Ok(AppRunControl::Continue)` after side effects, while explicit exit/archive/delete/fatal branches return an exit control value.
+**Data flow**: It takes the current app state, the terminal UI object, the app-server session, and one event. It reads the event’s details, changes app state or screen state as needed, may send requests to the app server, may queue new events, and finally returns whether the app should keep running or stop. Most events end with “continue”; exit, archive, delete, and some thread-switching paths can return an exit or other run-control result.
 
-**Call relations**: This method is invoked by the app’s main event loop for every queued event. It delegates specialized work to many helpers across the app, including background request launchers, config persistence helpers, thread/session handlers, and the local helpers `apply_keymap_capture`, `apply_keymap_clear`, `refresh_plugin_mentions_after_config_write`, `handle_exit_mode`, `archive_current_thread`, and `delete_current_thread`.
+**Call relations**: The main run loop feeds events into this function. Inside, it acts as the dispatcher for many smaller features: session resume, message submission, plugin loading, rate-limit display, Windows sandbox setup, keymap editing, approval screens, theme changes, and more. When a task is too specific, it hands off to helper functions such as `App::apply_keymap_capture`, `App::apply_keymap_clear`, `App::handle_exit_mode`, `App::archive_current_thread`, and `App::delete_current_thread`.
 
 *Call graph*: calls 32 internal fn (from, status_line_items_edit, status_line_use_colors_edit, syntax_theme_edit, terminal_title_items_edit, active, from_config, apply_keymap_capture, apply_keymap_clear, archive_current_thread (+15 more)); 37 external calls (new, now, from, new, personality_label, reasoning_label_for, spawn_world_writable_scan, new, override_turn_context, new (+15 more)).
 
@@ -503,11 +503,11 @@ async fn apply_keymap_capture(
     )
 ```
 
-**Purpose**: Applies a requested key binding edit, validates the resulting runtime keymap, persists the config change, and updates the keymap UI. It also handles conflict-resolution flows when the edited keymap cannot be materialized directly.
+**Purpose**: This saves a newly chosen keyboard shortcut. It checks whether the new shortcut is valid, turns it into the app’s runtime shortcut map, writes it to configuration, and updates the visible shortcut picker.
 
-**Data flow**: Accepts keymap `context`, `action`, `key`, and edit `intent`. It computes an edit outcome via `crate::keymap_setup::keymap_with_edit`; on error it shows a chat-widget error and returns. If the outcome is unchanged it shows an info message and returns. Otherwise it attempts `RuntimeKeymap::from_config(&keymap_config)`; if that fails, it builds conflict-selection params and opens the selection view. If runtime validation succeeds, it persists the binding edit with `ConfigEditsBuilder`, and on success updates `self.config.tui_keymap`, `self.keymap`, the chat widget’s keymap state, returns to the keymap picker, and shows the success message; on persistence failure it logs and reports an error.
+**Data flow**: It receives a shortcut context, an action name, the pressed key, and the user’s editing intent. It combines that with the current saved keymap, tries to produce a new keymap, checks whether the runtime keymap can be built without conflicts, writes the change to config, and then updates both the in-memory app state and the chat widget. If anything goes wrong, it shows an error or a conflict-selection view instead of saving.
 
-**Call relations**: Called only from `App::handle_event` for `AppEvent::KeymapCaptured`. It delegates edit computation to `keymap_setup` helpers and persistence to `ConfigEditsBuilder`.
+**Call relations**: This is called by `App::handle_event` when a key-capture event arrives from the UI. It uses the keymap setup code to decide what the edited shortcut should look like, uses config-editing code to persist it, and then returns control to the keymap picker so the user sees the updated shortcut immediately.
 
 *Call graph*: calls 4 internal fn (keymap_bindings_edit, from_config, build_keymap_conflict_params, keymap_with_edit); called by 1 (handle_event); 3 external calls (for_config, format!, error!).
 
@@ -518,11 +518,11 @@ async fn apply_keymap_capture(
 fn refresh_plugin_mentions_after_config_write(&mut self)
 ```
 
-**Purpose**: Triggers the two runtime actions needed after plugin-related config changes: refresh mention candidates and reload user config in the active session.
+**Purpose**: This tells the UI and the running agent that plugin-related configuration has changed. It is used after installing, uninstalling, enabling, disabling, or otherwise changing plugins so autocomplete-style plugin mentions do not become stale.
 
-**Data flow**: Calls `self.chat_widget.refresh_plugin_mentions()` and submits `AppCommand::reload_user_config()` through `self.chat_widget.submit_op(...)`. It returns no value.
+**Data flow**: It reads no outside input besides the current app object. It asks the chat widget to refresh plugin mentions, then submits an app command telling the agent side to reload the user configuration. The visible result is that plugin references in the UI and backend behavior can catch up with the latest config.
 
-**Call relations**: Used from multiple plugin/marketplace success branches inside `App::handle_event` after config-affecting operations complete.
+**Call relations**: This helper is called by `App::handle_event` after successful plugin or marketplace configuration writes. It bridges the user-facing chat widget and the backend command stream, making sure both sides learn about the same configuration change.
 
 *Call graph*: called by 1 (handle_event); 1 external calls (reload_user_config).
 
@@ -533,11 +533,11 @@ fn refresh_plugin_mentions_after_config_write(&mut self)
 async fn apply_keymap_clear(&mut self, context: String, action: String)
 ```
 
-**Purpose**: Removes a custom key binding for one action, validates the resulting runtime keymap, persists the removal, and updates the keymap UI. It is the inverse of `apply_keymap_capture`.
+**Purpose**: This removes a custom keyboard shortcut for a given action. It restores that action to whatever the default or remaining keymap says, saves the removal, and refreshes the shortcut UI.
 
-**Data flow**: Accepts `context` and `action`, computes a new keymap config via `crate::keymap_setup::keymap_without_custom_binding`, validates it with `RuntimeKeymap::from_config`, persists a `keymap_binding_clear_edit` through `ConfigEditsBuilder`, and on success updates `self.config.tui_keymap`, `self.keymap`, the chat widget’s keymap state, returns to the keymap picker, and shows an info message. Any computation, validation, or persistence error is surfaced through the chat widget, with persistence failures also logged.
+**Data flow**: It receives the shortcut context and action name. It builds a keymap with the custom binding removed, checks that this keymap can run, writes a config edit that clears the binding, updates the app’s stored config and runtime keymap, and shows a confirmation message. If the removal or reload fails, it leaves the old state in place and shows an error.
 
-**Call relations**: Called only from `App::handle_event` for `AppEvent::KeymapCleared`.
+**Call relations**: This is called by `App::handle_event` when the user chooses to clear a shortcut. It relies on keymap setup code to compute the cleaned keymap and config-editing code to save it, then hands the updated map back to the chat widget so the picker stays in sync.
 
 *Call graph*: calls 3 internal fn (keymap_binding_clear_edit, from_config, keymap_without_custom_binding); called by 1 (handle_event); 3 external calls (for_config, format!, error!).
 
@@ -552,11 +552,11 @@ async fn handle_exit_mode(
     ) -> AppRunControl
 ```
 
-**Purpose**: Implements the app’s two exit policies: immediate exit or best-effort graceful shutdown of the current thread before exiting. It also suppresses agent failover during an intentional shutdown-first exit.
+**Purpose**: This decides how the app should quit. It supports a graceful shutdown that first asks the current thread to stop, and an immediate shutdown that exits without waiting.
 
-**Data flow**: Accepts mutable `App`, mutable `AppServerSession`, and an `ExitMode`. For `ShutdownFirst`, it records `pending_shutdown_exit_thread_id` from the active/chat-widget thread, waits up to `SHUTDOWN_FIRST_EXIT_TIMEOUT` for `shutdown_current_thread(app_server)` if a thread exists, logs a warning on timeout, clears the pending shutdown marker, and returns `AppRunControl::Exit(ExitReason::UserRequested)`. For `Immediate`, it clears the marker and returns the same exit reason without waiting.
+**Data flow**: It receives the app-server session and an exit mode. For graceful shutdown, it records which thread is being intentionally stopped, waits briefly for the current thread to shut down, and then clears that marker. For immediate shutdown, it skips the wait. In both cases it returns a run-control value telling the outer app loop to exit because the user requested it.
 
-**Call relations**: Called from `App::handle_event` for `AppEvent::Exit` and after successful logout. It delegates the actual graceful shutdown to `shutdown_current_thread` elsewhere in the app.
+**Call relations**: This is called by `App::handle_event` for exit and logout paths. It hands off to the current-thread shutdown logic when graceful exit is requested, but it also protects the UI from hanging forever by using a short timeout before returning the final exit instruction.
 
 *Call graph*: called by 1 (handle_event); 3 external calls (timeout, warn!, Exit).
 
@@ -570,11 +570,11 @@ async fn archive_current_thread(
     ) -> AppRunControl
 ```
 
-**Purpose**: Archives the current thread through the app server and exits the app on success. It rejects the operation when no thread exists or when the user is in a side conversation.
+**Purpose**: This archives the active conversation thread and exits the app if the archive succeeds. Archiving is a way to hide or retire a saved chat without deleting it.
 
-**Data flow**: Determines the current thread ID from `active_thread_id` or `chat_widget.thread_id()`. If absent, it adds an error message and returns `Continue`. If the thread is a side thread, it adds a side-conversation-specific error and returns `Continue`. Otherwise it awaits `app_server.thread_archive(thread_id)` and returns `Exit(UserRequested)` on success or reports `Failed to archive current thread: {err}` and returns `Continue` on failure.
+**Data flow**: It looks for the current thread id from app state or the chat widget. If no thread exists yet, or if the user is inside a side conversation where archiving is not allowed, it shows an explanatory error and keeps the app running. Otherwise it asks the app server to archive the thread; success returns an exit instruction, while failure shows an error and continues.
 
-**Call relations**: Called from `App::handle_event` for `AppEvent::ArchiveCurrentThread`.
+**Call relations**: This is called by `App::handle_event` when the archive command event arrives. It is deliberately small: the dispatcher chooses this path, this helper checks whether archiving is allowed, and the app server performs the actual archive operation.
 
 *Call graph*: calls 1 internal fn (thread_archive); called by 1 (handle_event); 2 external calls (format!, Exit).
 
@@ -588,11 +588,11 @@ async fn delete_current_thread(
     ) -> AppRunControl
 ```
 
-**Purpose**: Deletes the current thread through the app server and exits the app on success. Like archiving, it is unavailable before a thread exists and inside side conversations.
+**Purpose**: This deletes the active conversation thread and exits the app if the delete succeeds. It is the destructive counterpart to archiving, so it first checks that there is a normal current thread to delete.
 
-**Data flow**: Finds the current thread ID from `active_thread_id` or `chat_widget.thread_id()`. If none exists, it reports that a thread must start first; if the thread is a side conversation, it reports that `/delete` is unavailable there. Otherwise it awaits `app_server.thread_delete(thread_id)` and returns `Exit(UserRequested)` on success or reports `Failed to delete current thread: {err}` and returns `Continue` on failure.
+**Data flow**: It reads the current thread id from app state or the chat widget. If there is no thread, or if the active conversation is a side thread where deletion is blocked, it adds an error message and returns “continue.” If deletion is allowed, it asks the app server to delete the thread; success returns an exit instruction, and failure reports the problem to the user.
 
-**Call relations**: Called from `App::handle_event` for `AppEvent::DeleteCurrentThread`.
+**Call relations**: This is called by `App::handle_event` when the delete command event is dispatched. The helper keeps the safety checks near the server request, while the actual removal is delegated to the app server.
 
 *Call graph*: calls 1 internal fn (thread_delete); called by 1 (handle_event); 2 external calls (format!, Exit).
 
@@ -602,9 +602,13 @@ These files describe the app-wide command language and the top-level keyboard ha
 
 ### `tui/src/app_command.rs`
 
-`data_model` · `cross-cutting command construction and dispatch`
+`data_model` · `cross-cutting`
 
-This file is primarily a typed command model. `AppCommand` is a large serialized enum spanning user-turn submission, interrupt behavior, approval responses, MCP elicitation resolution, permission responses, thread rollback, review start, thread naming, shell commands, config reload, and context overrides. The `UserTurn` and `OverrideTurnContext` variants carry the richest payloads: cwd, approval policy, optional reviewer/profile overrides, model, reasoning effort/summary, service tier, collaboration mode, personality, and optional JSON schema for final output. `InterruptBehavior` is a small companion enum that distinguishes a normal interrupt from one that should restore the prompt if no output was produced. The impl block is intentionally thin: each method is a constructor that returns a specific variant with the right field defaults, such as `user_turn` forcing `approvals_reviewer: None` and `thread_rollback` wrapping a `u32` count. The only behavioral helper is `is_review`, which pattern-matches the enum to identify review commands. Finally, `impl From<&AppCommand> for AppCommand` clones a borrowed command into an owned one, supporting generic APIs elsewhere that accept `Into<AppCommand>` for replay bookkeeping. This file contains almost no control flow; its value is in centralizing the exact shape of commands that thread routing and replay logic understand.
+Think of this file as the order pad for the TUI, the text-based user interface. When a user submits a prompt, approves a shell command, asks for a review, reloads settings, or interrupts current work, the interface needs to package that intent in a form the app can safely understand. `AppCommand` is that package: an enum, meaning a value that can be exactly one of several named choices, each with the extra details that choice needs.
+
+The file does not execute the commands itself. Instead, it defines the messages that another part of the app will receive and act on. For example, a `UserTurn` carries the user’s input, current folder, model settings, approval rules, and collaboration options. An `ExecApproval` carries a decision about whether a proposed command may run. A `ReloadUserConfig` needs no extra data because the request itself is enough.
+
+Most functions here are small constructor helpers. They make it easy and consistent for other code to create the right `AppCommand` value without spelling out the enum fields every time. There is also a small check for whether a command is a review request, and a clone-based conversion from a borrowed command to an owned one.
 
 #### Function details
 
@@ -614,11 +618,11 @@ This file is primarily a typed command model. `AppCommand` is a large serialized
 fn interrupt() -> Self
 ```
 
-**Purpose**: Constructs the standard interrupt command. This variant requests interruption without any prompt-restoration special case.
+**Purpose**: Creates a command that asks the app to interrupt whatever it is currently doing. This is the normal stop request, like pressing a stop button.
 
-**Data flow**: It takes no arguments and returns `AppCommand::Interrupt { behavior: InterruptBehavior::Default }`.
+**Data flow**: It takes no input. It creates an `AppCommand::Interrupt` value with the default interrupt behavior. The output is that command value, ready to be sent to the app’s command-processing path.
 
-**Call relations**: Used by UI code that wants to stop the current turn through the normal interrupt path.
+**Call relations**: Other TUI code can call this when the user asks to stop ongoing work. This function only builds the message; a later command receiver is responsible for noticing the interrupt and actually stopping work.
 
 
 ##### `AppCommand::interrupt_and_restore_prompt_if_no_output`  (lines 120–124)
@@ -627,11 +631,11 @@ fn interrupt() -> Self
 fn interrupt_and_restore_prompt_if_no_output() -> Self
 ```
 
-**Purpose**: Constructs an interrupt command that asks downstream logic to restore the prompt if the interrupted turn produced no output. This supports a more forgiving UX for early interruptions.
+**Purpose**: Creates an interrupt command with a gentler display behavior: if nothing was produced yet, the prompt should be restored. This helps the interface feel clean when a cancellation happens early.
 
-**Data flow**: It takes no arguments and returns `AppCommand::Interrupt { behavior: InterruptBehavior::RestorePromptIfNoOutput }`.
+**Data flow**: It takes no input. It returns an `AppCommand::Interrupt` value whose behavior is `RestorePromptIfNoOutput`. Nothing else is changed at creation time.
 
-**Call relations**: Used by interrupt flows that need the alternate post-interrupt prompt behavior.
+**Call relations**: This is used by UI code that wants cancellation to preserve or restore the prompt when there is no visible output. The command-processing side later decides how to apply that behavior.
 
 
 ##### `AppCommand::clean_background_terminals`  (lines 126–128)
@@ -640,11 +644,11 @@ fn interrupt_and_restore_prompt_if_no_output() -> Self
 fn clean_background_terminals() -> Self
 ```
 
-**Purpose**: Constructs the command that asks the backend to clean background terminals for the current thread. It carries no additional payload.
+**Purpose**: Creates a command asking the app to clean up background terminal sessions. This is useful when leftover command windows or terminal tasks should be cleared away.
 
-**Data flow**: It returns the unit-like variant `AppCommand::CleanBackgroundTerminals`.
+**Data flow**: It takes no input and returns the `CleanBackgroundTerminals` command. No cleanup happens inside this function; it only creates the request.
 
-**Call relations**: Submitted through thread-routing command dispatch when the user invokes terminal cleanup.
+**Call relations**: A caller uses this to tell the main app flow that terminal cleanup is needed. The receiving side performs the actual cleanup when it processes the command.
 
 
 ##### `AppCommand::run_user_shell_command`  (lines 130–132)
@@ -653,11 +657,11 @@ fn clean_background_terminals() -> Self
 fn run_user_shell_command(command: String) -> Self
 ```
 
-**Purpose**: Constructs a command to run a user-specified shell command in the current thread context. The payload is the raw command string.
+**Purpose**: Creates a command to run a shell command typed or chosen by the user. A shell command is text that the operating system command line can execute.
 
-**Data flow**: It takes a `String` and returns `AppCommand::RunUserShellCommand { command }`.
+**Data flow**: It receives the command text as a string. It wraps that text in `AppCommand::RunUserShellCommand` and returns it. The command is not executed here.
 
-**Call relations**: Used by shell-command UI actions before thread-routing maps it to `thread_shell_command` RPC.
+**Call relations**: UI code can call this after the user requests a direct shell action. The returned command is handed to the app’s command runner, which later decides how and whether to execute it.
 
 
 ##### `AppCommand::user_turn`  (lines 135–162)
@@ -671,11 +675,11 @@ fn user_turn(
         model: String,
 ```
 
-**Purpose**: Constructs a user-turn submission command with all turn-start parameters except an explicit approvals reviewer. It is the main command used for sending prompt/input items to the backend.
+**Purpose**: Creates the command for a normal user turn: the user has submitted input and the app should respond. It bundles the prompt content together with the working folder, approval policy, model choice, reasoning settings, and related options.
 
-**Data flow**: It takes `items`, `cwd`, `approval_policy`, optional `active_permission_profile`, `model`, optional `effort`, optional `summary`, optional nested `service_tier`, optional final-output JSON schema, optional `collaboration_mode`, and optional `personality`. It returns `AppCommand::UserTurn` with those fields plus `approvals_reviewer: None`.
+**Data flow**: It receives the user input items, current working directory, approval policy, optional permission profile, model name, optional reasoning and summary settings, optional service tier, optional final-output JSON schema, collaboration mode, and personality. It places those values into `AppCommand::UserTurn`, sets `approvals_reviewer` to `None`, and returns the completed command.
 
-**Call relations**: Created by chat submission paths and later consumed by thread-routing logic, which may steer an active turn or start a new one.
+**Call relations**: This is one of the central message builders for the TUI. A prompt submission flow can call it to package everything the app needs for the next assistant response; later processing code reads the fields to start the turn under the right settings.
 
 
 ##### `AppCommand::override_turn_context`  (lines 165–193)
@@ -688,11 +692,11 @@ fn override_turn_context(
         permission_profile: Option<Permi
 ```
 
-**Purpose**: Constructs a command that overrides thread/turn context settings such as cwd, approvals, permissions, model, and collaboration settings. This packages a broad set of optional overrides into one variant.
+**Purpose**: Creates a command that changes the settings used for future or current turns, such as folder, approvals, permissions, sandbox level, model, or personality. It is like updating the instructions on the app’s clipboard before more work continues.
 
-**Data flow**: It takes optional values for cwd, approval policy, approvals reviewer, permission profile, active permission profile, Windows sandbox level, model, nested optional effort, summary, nested optional service tier, collaboration mode, and personality, and returns `AppCommand::OverrideTurnContext` containing those exact fields.
+**Data flow**: It receives many optional values. Each `Option` says either “change this setting to this value” or “leave this setting alone.” It returns an `AppCommand::OverrideTurnContext` containing those requested changes.
 
-**Call relations**: Used by settings/context UI flows and later translated by thread-routing into a thread-settings update RPC.
+**Call relations**: Configuration or UI flows can call this when the user changes context. The command receiver later applies only the supplied overrides and leaves missing fields unchanged.
 
 
 ##### `AppCommand::exec_approval`  (lines 195–205)
@@ -705,11 +709,11 @@ fn exec_approval(
     ) -> Self
 ```
 
-**Purpose**: Constructs a command that answers a command-execution approval request. It carries the approval id, optional turn id, and chosen decision.
+**Purpose**: Creates a response to a request for permission to run a command. It records which approval request is being answered, which turn it may belong to, and the user’s decision.
 
-**Data flow**: It takes `id`, `turn_id`, and `decision`, and returns `AppCommand::ExecApproval { id, turn_id, decision }`.
+**Data flow**: It takes an approval request id, an optional turn id, and a command-execution decision. It returns an `AppCommand::ExecApproval` carrying those values.
 
-**Call relations**: Used when the user approves or denies an execution request; thread-routing may resolve it against a pending app-server request.
+**Call relations**: When the app asks the user whether a shell command may run, UI code can call this after the user answers. The approval-processing side later matches the id to the waiting request.
 
 
 ##### `AppCommand::patch_approval`  (lines 207–209)
@@ -718,11 +722,11 @@ fn exec_approval(
 fn patch_approval(id: String, decision: FileChangeApprovalDecision) -> Self
 ```
 
-**Purpose**: Constructs a command that answers a file-change approval request. The payload is the item id and chosen patch decision.
+**Purpose**: Creates a response to a request for permission to change files. It records the request id and whether the change was accepted or rejected.
 
-**Data flow**: It takes `id` and `decision` and returns `AppCommand::PatchApproval { id, decision }`.
+**Data flow**: It takes the file-change approval id and the decision. It wraps them in `AppCommand::PatchApproval` and returns that command.
 
-**Call relations**: Used by patch approval UI and later consumed by request-resolution logic.
+**Call relations**: A file-edit approval prompt can call this when the user decides. The receiving app logic later uses the id to continue or cancel the pending file change.
 
 
 ##### `AppCommand::resolve_elicitation`  (lines 211–225)
@@ -736,11 +740,11 @@ fn resolve_elicitation(
         meta: Option<Value>,
 ```
 
-**Purpose**: Constructs a command that resolves an MCP server elicitation request. It carries server identity, request id, decision, and optional structured content/meta payloads.
+**Purpose**: Creates a command that answers an elicitation request from an MCP server. In plain terms, an external tool server asked the user for extra information, and this command carries the user’s answer or decision back.
 
-**Data flow**: It takes `server_name`, `request_id`, `decision`, optional `content`, and optional `meta`, and returns `AppCommand::ResolveElicitation { ... }`.
+**Data flow**: It receives the server name, request id, chosen action, optional content, and optional metadata. It returns an `AppCommand::ResolveElicitation` containing that response package.
 
-**Call relations**: Used by MCP elicitation UI and by auto-decline paths for unsupported URL elicitation requests.
+**Call relations**: When a connected tool server needs user input, the UI can collect the answer and call this function. Later, the app-server communication layer can route the response back to the right server request.
 
 
 ##### `AppCommand::user_input_answer`  (lines 227–229)
@@ -749,11 +753,11 @@ fn resolve_elicitation(
 fn user_input_answer(id: String, response: ToolRequestUserInputResponse) -> Self
 ```
 
-**Purpose**: Constructs a command that answers a tool/user-input request. The payload is the request id and typed response object.
+**Purpose**: Creates a command that answers a tool’s request for user input. It ties the response to the request id that was waiting for it.
 
-**Data flow**: It takes `id` and `response` and returns `AppCommand::UserInputAnswer { id, response }`.
+**Data flow**: It takes an id and a structured user-input response. It returns an `AppCommand::UserInputAnswer` with both pieces.
 
-**Call relations**: Used by interactive request handling when the user responds to a tool's input prompt.
+**Call relations**: UI code can call this after the user fills in or chooses an answer for a tool prompt. The command receiver later uses the id to wake up the waiting tool request.
 
 
 ##### `AppCommand::request_permissions_response`  (lines 231–236)
@@ -765,11 +769,11 @@ fn request_permissions_response(
     ) -> Self
 ```
 
-**Purpose**: Constructs a command that answers a permissions request. It packages the request id and the chosen permission response.
+**Purpose**: Creates a command that answers a permissions request. This is used when something asks for a broader permission decision and the user or system responds.
 
-**Data flow**: It takes `id` and `response` and returns `AppCommand::RequestPermissionsResponse { id, response }`.
+**Data flow**: It takes the request id and the permissions response. It returns an `AppCommand::RequestPermissionsResponse` carrying that answer.
 
-**Call relations**: Used by permissions approval UI before request-resolution logic sends the answer to the backend.
+**Call relations**: A permissions prompt or policy flow can call this after a decision is made. The app’s permission-handling code later matches the response to the original request.
 
 
 ##### `AppCommand::reload_user_config`  (lines 238–240)
@@ -778,11 +782,11 @@ fn request_permissions_response(
 fn reload_user_config() -> Self
 ```
 
-**Purpose**: Constructs the command that asks the backend to reload user configuration. It has no payload.
+**Purpose**: Creates a command asking the app to reload the user’s configuration. This lets changes to settings be picked up without inventing a separate message shape.
 
-**Data flow**: It returns the unit-like variant `AppCommand::ReloadUserConfig`.
+**Data flow**: It takes no input and returns `AppCommand::ReloadUserConfig`. The configuration is not read here; this only creates the reload request.
 
-**Call relations**: Submitted through thread-routing, which maps it to `reload_user_config()` on the app server.
+**Call relations**: UI code can call this after the user asks to refresh settings. The actual config-loading code runs later when the command is processed.
 
 
 ##### `AppCommand::list_skills`  (lines 242–244)
@@ -791,11 +795,11 @@ fn reload_user_config() -> Self
 fn list_skills(cwds: Vec<PathBuf>, force_reload: bool) -> Self
 ```
 
-**Purpose**: Constructs a command to list or refresh skills for one or more working directories. It carries the cwd list and a force-reload flag.
+**Purpose**: Creates a command asking the app to list available skills for one or more working folders. A skill is a reusable capability or instruction set the app can discover.
 
-**Data flow**: It takes `cwds: Vec<PathBuf>` and `force_reload: bool`, and returns `AppCommand::ListSkills { cwds, force_reload }`.
+**Data flow**: It takes a list of current working directories and a `force_reload` flag. It returns `AppCommand::ListSkills` with those values, telling the receiver where to look and whether cached information should be ignored.
 
-**Call relations**: Used by skills-refresh UI and later dispatched to the app server's skills-list RPC.
+**Call relations**: A UI action for showing skills can call this. The later command handler performs the actual skill lookup or reload.
 
 
 ##### `AppCommand::compact`  (lines 246–248)
@@ -804,11 +808,11 @@ fn list_skills(cwds: Vec<PathBuf>, force_reload: bool) -> Self
 fn compact() -> Self
 ```
 
-**Purpose**: Constructs the command that starts thread compaction. It carries no additional data.
+**Purpose**: Creates a command asking the app to compact the conversation or working context. This usually means reducing stored context so the session can continue with less clutter.
 
-**Data flow**: It returns `AppCommand::Compact`.
+**Data flow**: It takes no input and returns `AppCommand::Compact`. No compaction happens here.
 
-**Call relations**: Used by compaction UI and dispatched by thread-routing to `thread_compact_start`.
+**Call relations**: The TUI can call this when the user requests compaction. The command-processing flow later performs the actual shrinking or summarizing work.
 
 
 ##### `AppCommand::set_thread_name`  (lines 250–252)
@@ -817,11 +821,11 @@ fn compact() -> Self
 fn set_thread_name(name: String) -> Self
 ```
 
-**Purpose**: Constructs a command to rename the current thread. The payload is the new thread name.
+**Purpose**: Creates a command to rename the current thread or conversation. The name is stored as part of the command.
 
-**Data flow**: It takes `name: String` and returns `AppCommand::SetThreadName { name }`.
+**Data flow**: It receives the new name as a string. It returns `AppCommand::SetThreadName` containing that name.
 
-**Call relations**: Used by thread-renaming UI before thread-routing maps it to `thread_set_name`.
+**Call relations**: A rename action in the interface can call this. The app later applies the new name to the conversation or thread state.
 
 
 ##### `AppCommand::shutdown`  (lines 255–257)
@@ -830,11 +834,11 @@ fn set_thread_name(name: String) -> Self
 fn shutdown() -> Self
 ```
 
-**Purpose**: Constructs the shutdown command variant. This is currently marked dead-code tolerant but remains part of the command model.
+**Purpose**: Creates a command asking the app to shut down. It is marked as currently unused by the compiler annotation, but it defines the message shape for a shutdown request.
 
-**Data flow**: It takes no arguments and returns `AppCommand::Shutdown`.
+**Data flow**: It takes no input and returns `AppCommand::Shutdown`. It does not stop the program by itself.
 
-**Call relations**: Available for shutdown flows even if not currently exercised in all builds.
+**Call relations**: If a shutdown flow uses it, this function would create the message and the command receiver would perform the actual teardown. The file marks it as allowed dead code, meaning it may not be called in the current build.
 
 
 ##### `AppCommand::thread_rollback`  (lines 259–261)
@@ -843,11 +847,11 @@ fn shutdown() -> Self
 fn thread_rollback(num_turns: u32) -> Self
 ```
 
-**Purpose**: Constructs a rollback command targeting the last `num_turns` user turns. This is the command emitted by backtrack logic.
+**Purpose**: Creates a command to roll back a conversation by a given number of turns. A turn is one exchange or step in the conversation history.
 
-**Data flow**: It takes `num_turns: u32` and returns `AppCommand::ThreadRollback { num_turns }`.
+**Data flow**: It takes the number of turns to roll back. It returns `AppCommand::ThreadRollback` with that number.
 
-**Call relations**: Used by backtrack and cancelled-turn edit flows, then dispatched by thread-routing to the rollback RPC.
+**Call relations**: A history or undo-style UI action can call this. The app’s thread-state logic later removes or rewinds the requested amount.
 
 
 ##### `AppCommand::review`  (lines 263–265)
@@ -856,11 +860,11 @@ fn thread_rollback(num_turns: u32) -> Self
 fn review(target: ReviewTarget) -> Self
 ```
 
-**Purpose**: Constructs a command to start a review thread for a given target. The payload is the backend `ReviewTarget`.
+**Purpose**: Creates a command asking the app to review a target. The target describes what should be reviewed, such as code or another reviewable item.
 
-**Data flow**: It takes `target` and returns `AppCommand::Review { target }`.
+**Data flow**: It receives a `ReviewTarget` and returns `AppCommand::Review` containing it. The review itself does not happen here.
 
-**Call relations**: Used by review-start UI and later dispatched to `review_start` in thread-routing.
+**Call relations**: A review-starting UI path can call this to package the target. Later, command processing recognizes it as a review request and starts the review workflow.
 
 
 ##### `AppCommand::approve_guardian_denied_action`  (lines 267–269)
@@ -869,11 +873,11 @@ fn review(target: ReviewTarget) -> Self
 fn approve_guardian_denied_action(event: GuardianAssessmentEvent) -> Self
 ```
 
-**Purpose**: Constructs a command that approves a previously guardian-denied action. The payload is the recorded guardian assessment event.
+**Purpose**: Creates a command that approves an action previously denied by the guardian safety or policy layer. It carries the original assessment event so the app knows exactly what is being reconsidered.
 
-**Data flow**: It takes `event: GuardianAssessmentEvent` and returns `AppCommand::ApproveGuardianDeniedAction { event }`.
+**Data flow**: It receives a `GuardianAssessmentEvent`. It returns `AppCommand::ApproveGuardianDeniedAction` with that event attached.
 
-**Call relations**: Used by guardian-approval UI and dispatched by thread-routing to the corresponding app-server RPC.
+**Call relations**: When the guardian blocks something and the user or reviewer chooses to approve it anyway, UI code can call this. The receiving logic later uses the event details to continue the denied action in a controlled way.
 
 
 ##### `AppCommand::is_review`  (lines 271–273)
@@ -882,11 +886,11 @@ fn approve_guardian_denied_action(event: GuardianAssessmentEvent) -> Self
 fn is_review(&self) -> bool
 ```
 
-**Purpose**: Reports whether a command is the `Review` variant. This is the only behavioral predicate on the command enum.
+**Purpose**: Checks whether this command is specifically a review request. This is a convenience test for code that needs to treat review commands differently.
 
-**Data flow**: It pattern-matches `self` against `Self::Review { .. }` and returns the resulting boolean.
+**Data flow**: It reads the current `AppCommand` value by reference. It uses Rust’s pattern-matching check, `matches!`, to see whether the value is the `Review` variant. It returns `true` for review commands and `false` for all others.
 
-**Call relations**: Used by callers that need to special-case review commands without destructuring the full enum.
+**Call relations**: Code that has a general `AppCommand` can call this before deciding how to route or display it. Internally it only calls the standard `matches!` macro and does not hand work off elsewhere.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -897,22 +901,24 @@ fn is_review(&self) -> bool
 fn from(value: &AppCommand) -> Self
 ```
 
-**Purpose**: Clones a borrowed `AppCommand` into an owned one for APIs that accept `Into<AppCommand>`. This supports generic replay bookkeeping helpers.
+**Purpose**: Creates an owned `AppCommand` from a borrowed one by cloning it. This is useful when code has a reference but needs its own separate command value.
 
-**Data flow**: It takes `&AppCommand`, clones it, and returns the owned `AppCommand`.
+**Data flow**: It receives a borrowed `AppCommand`. It calls `clone` to copy the command and all of its stored data, then returns the copied command.
 
-**Call relations**: Used implicitly by generic code such as thread-event replay bookkeeping that accepts borrowed or owned commands interchangeably.
+**Call relations**: This implements Rust’s standard `From<&AppCommand> for AppCommand` conversion. Any code using that conversion gets a fresh owned command; the original borrowed command is left unchanged.
 
 *Call graph*: 1 external calls (clone).
 
 
 ### `tui/src/app/input.rs`
 
-`orchestration` · `main loop request handling for keyboard events and UI mode transitions`
+`orchestration` · `main loop / key input handling`
 
-This module extends `App` with the global input policy that coordinates terminal state, overlays, side conversations, and composer editing. The largest routine, `handle_key_event`, first reserves certain key combinations for agent navigation and side-return shortcuts when no overlay or modal is active and the composer is empty, deliberately avoiding stealing Option/Alt word-motion keys from text editing on terminals without enhanced keyboard reporting. It then gates app-level shortcuts behind `app_keymap_shortcuts_available`, which requires both `overlay.is_none()` and `chat_widget.no_modal_or_popup_active()`. From there it toggles vim mode, fast mode, and raw output; opens the transcript overlay by entering the alternate screen and constructing `Overlay::new_transcript`; and requests external-editor launch only when the bottom pane is free and the editor state is `Closed`.
+This file is the keyboard traffic controller for the terminal user interface. The chat composer itself knows how to edit text, but some key presses mean bigger app actions: open a full transcript view, clear the terminal, toggle display modes, jump between agent conversations, or send the draft to an outside text editor. Without this layer, those global shortcuts would either not work or would accidentally interfere with normal typing.
 
-External editor support is split into request, launch, and reset phases. Launch resolves `$VISUAL`/`$EDITOR`, temporarily restores terminal state with `tui.with_restored`, seeds the editor with pending composer text, trims trailing whitespace from the edited result, and reports failures into history. Esc handling is nuanced: in normal backtrack mode with an empty composer it primes or advances backtracking, but in side conversations it instead emits `SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE`; otherwise Esc is forwarded to the widget so modals, popups, or vim insert mode can consume it. Ctrl-L clearing also resets app UI state and queues header redraws after a successful terminal clear. A small test confirms that opening the keymap debug view disables these app-level shortcuts.
+The main idea is to check the app’s current state before deciding what a key means. For example, Alt+Left can mean “move one word left” while typing, but when the draft is empty it can mean “switch to the previous agent thread.” The file protects the typing experience by only using those shortcuts when it is safe. It also blocks app-level shortcuts while an overlay, modal, or popup is open, so the visible UI gets first chance to respond.
+
+The external editor flow is also here. The app finds the user’s editor command from environment settings, temporarily restores the terminal so the editor can run normally, then brings the edited text back into the composer. Another important part is Escape handling: in a very specific normal state, Escape starts or advances “backtracking,” which lets the user revisit earlier messages. In other states, Escape is passed to the chat widget so popups, Vim-style editing, or other controls can use it.
 
 #### Function details
 
@@ -922,11 +928,11 @@ External editor support is split into request, launch, and reset phases. Launch 
 async fn launch_external_editor(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Runs the configured external editor against the current composer draft and applies the edited text back into the chat widget. It also reports missing-editor and launch failures as history error events and always restores the editor UI state afterward.
+**Purpose**: This opens the user’s chosen external text editor so they can edit the current draft outside the terminal chat box. It matters because longer prompts are often easier to write in a full editor than in a single-line composer.
 
-**Data flow**: Reads editor configuration via `external_editor::resolve_editor_command`, current draft text via `chat_widget.composer_text_with_pending`, and terminal restoration support from `tui`. On success it invokes `external_editor::run_editor` inside `tui.with_restored(tui::RestoreMode::KeepRaw, ...)`, trims trailing whitespace from the returned text, and writes it back with `chat_widget.apply_external_edit`. On failure it appends a `history_cell::new_error_event` to chat history. In all early-return and post-run paths it calls `reset_external_editor_state` and schedules a frame through `tui.frame_requester()`.
+**Data flow**: It starts by looking up the editor command from the user’s environment, such as VISUAL or EDITOR. If no editor is configured, it writes an error into the chat history and closes the editor state. If an editor is found, it takes the current composer text as the starting content, temporarily restores the terminal to a normal state, runs the editor, then trims trailing whitespace from the returned text and puts it back into the chat composer. It always asks the UI to redraw afterward.
 
-**Call relations**: Called after the app has already entered the requested external-editor state elsewhere in the app flow. It delegates command resolution and editor execution to the external-editor subsystem, then hands the resulting text or error back to `chat_widget`; `reset_external_editor_state` is its cleanup step regardless of outcome.
+**Call relations**: This is the second half of the external editor story. A key press first calls App::request_external_editor_launch to mark that an editor should open; then this function does the actual work. It uses App::reset_external_editor_state when setup fails or after the editor returns, so the footer and internal state do not stay stuck in an “editor opening” state.
 
 *Call graph*: calls 2 internal fn (reset_external_editor_state, resolve_editor_command); 4 external calls (frame_requester, with_restored, format!, new_error_event).
 
@@ -937,11 +943,11 @@ async fn launch_external_editor(&mut self, tui: &mut tui::Tui)
 fn request_external_editor_launch(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Marks the external editor as requested and updates the footer hint so the UI reflects the pending launch. It does not actually spawn the editor.
+**Purpose**: This marks the external editor as requested and updates the footer hint so the user sees that the app is about to leave the normal composer flow. It does not open the editor itself; it prepares the UI for that next step.
 
-**Data flow**: Mutates `chat_widget` by setting `ExternalEditorState::Requested` and installing a footer hint override containing `EXTERNAL_EDITOR_HINT`, then schedules a redraw through `tui.frame_requester().schedule_frame()`. It returns no value.
+**Data flow**: It changes the chat widget’s external editor state from closed to requested, sets a temporary footer message, and asks the terminal UI to draw another frame. Nothing is returned, but the visible UI and chat widget state are changed.
 
-**Call relations**: Invoked from `App::handle_key_event` when the external-editor keybinding is pressed and the app is in a state where launching is allowed. It prepares visible UI state so a later async phase can perform the actual editor launch.
+**Call relations**: App::handle_key_event calls this when the configured external-editor shortcut is pressed and the app is in a safe state for launching one. The actual editor launch is handled later by App::launch_external_editor.
 
 *Call graph*: called by 1 (handle_key_event); 2 external calls (frame_requester, vec!).
 
@@ -952,11 +958,11 @@ fn request_external_editor_launch(&mut self, tui: &mut tui::Tui)
 fn reset_external_editor_state(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Returns the external-editor UI state to normal after a launch attempt completes or aborts. It clears both the state flag and the temporary footer hint.
+**Purpose**: This returns the app to its normal state after an external editor attempt finishes or fails. It clears the special footer hint so the user is not left with stale information.
 
-**Data flow**: Writes `ExternalEditorState::Closed` into `chat_widget`, removes the footer hint override by passing `None`, and schedules a frame via the TUI frame requester. It has no return value.
+**Data flow**: It sets the chat widget’s external editor state back to closed, removes the footer override, and requests a new UI frame. It does not produce a value, but it cleans up visible and internal editor state.
 
-**Call relations**: Used by `App::launch_external_editor` on all completion paths, including missing-editor and runtime-error cases. It is the common cleanup routine that restores the normal bottom-pane presentation.
+**Call relations**: App::launch_external_editor calls this after resolving the editor fails and after the editor process finishes. It is the cleanup step that keeps the external-editor workflow from leaving the app half-open.
 
 *Call graph*: called by 1 (launch_external_editor); 1 external calls (frame_requester).
 
@@ -972,11 +978,11 @@ fn apply_raw_output_mode(
     )
 ```
 
-**Purpose**: Toggles raw-output transcript rendering and immediately reflows the transcript so the visible history matches the new mode. It optionally emits the widget-level notification associated with the toggle.
+**Purpose**: This turns raw output display on or off. Raw output mode means the transcript is shown closer to the original unprocessed text, which can help users inspect exactly what came back.
 
-**Data flow**: Consumes `enabled` and `notify` flags, updates raw-output mode through either `chat_widget.set_raw_output_mode_and_notify` or `chat_widget.set_raw_output_mode`, then calls `self.reflow_transcript_now(tui)`. If reflow fails it logs a warning and appends an error message to the chat widget; regardless, it schedules a frame. It returns nothing.
+**Data flow**: It receives the desired enabled-or-disabled value and a flag saying whether to notify the user. It updates the chat widget’s raw output setting, then immediately tries to reflow the transcript, meaning it recalculates how the text should wrap and fit on screen. If that redraw work fails, it logs a warning and shows an error in the chat. Finally it asks the UI to repaint.
 
-**Call relations**: Called from `App::handle_key_event` when the raw-output keybinding is pressed. It bridges a simple keybinding into both widget state mutation and transcript layout recomputation.
+**Call relations**: App::handle_key_event calls this when the raw-output shortcut is pressed. This function then coordinates with the chat widget for the mode change and with the transcript redraw path so the screen matches the new setting right away.
 
 *Call graph*: called by 1 (handle_key_event); 3 external calls (frame_requester, format!, warn!).
 
@@ -992,11 +998,11 @@ async fn handle_key_event(
     )
 ```
 
-**Purpose**: Implements the app-wide keyboard dispatch tree, deciding which keys trigger global actions and which should be forwarded to the chat widget. It encodes precedence rules for agent switching, side-return, overlays, backtracking, terminal clearing, and ordinary text input.
+**Purpose**: This is the central decision point for keyboard input in the app. It decides whether a key press should trigger an app-wide action, switch agent threads, control backtracking, or simply be passed to the chat widget for normal typing and editing.
 
-**Data flow**: Reads `overlay`, `enhanced_keys_supported`, composer contents, modal/popup state, keymap bindings, backtrack state, and various chat-widget capability predicates. Depending on the key event, it may asynchronously fetch adjacent thread IDs and switch agents, return from a side conversation, toggle vim/fast/raw-output modes, enter the transcript overlay after `tui.enter_alt_screen()`, request external-editor launch, clear terminal UI and reset app state, confirm a primed backtrack selection, or forward the event to `chat_widget.handle_key_event`. It mutates app fields such as `overlay` and backtrack state, updates widget state, may log warnings and add error messages, and schedules redraws when UI changes occur.
+**Data flow**: It receives the terminal UI, the app server session, and one key event. It checks the current screen state, the composer text, active overlays or popups, and the configured keymap. Depending on those facts, it may switch to a neighboring agent thread, return from a side conversation, toggle Vim mode, toggle fast mode, toggle raw output, open the transcript overlay, request an external editor, clear the terminal UI, confirm a backtrack selection, reject a side backtrack, or forward the key to the chat widget. Its output is mostly changes to app state and screen state rather than a returned value.
 
-**Call relations**: This is the central keyboard entrypoint used by the app event loop. It calls helper predicates like `app_keymap_shortcuts_available`, `should_handle_backtrack_esc`, and `should_reject_side_backtrack_esc` to keep the branching readable, and delegates concrete actions to methods such as `apply_raw_output_mode`, `request_external_editor_launch`, `reject_side_backtrack_esc`, transcript overlay construction, and chat-widget key handling.
+**Call relations**: This function is called during normal input handling whenever the terminal reports a key event. It uses small helper functions in this file, such as App::app_keymap_shortcuts_available, App::should_handle_backtrack_esc, App::should_reject_side_backtrack_esc, App::reject_side_backtrack_esc, App::request_external_editor_launch, and App::apply_raw_output_mode, to keep each decision readable. When a key belongs to the lower-level chat interface, it hands the event off to the chat widget instead of consuming it.
 
 *Call graph*: calls 7 internal fn (app_keymap_shortcuts_available, apply_raw_output_mode, reject_side_backtrack_esc, request_external_editor_launch, should_handle_backtrack_esc, should_reject_side_backtrack_esc, new_transcript); 5 external calls (enter_alt_screen, frame_requester, format!, matches!, warn!).
 
@@ -1007,11 +1013,11 @@ async fn handle_key_event(
 fn should_handle_backtrack_esc(&self, key_event: KeyEvent) -> bool
 ```
 
-**Purpose**: Determines whether an Esc key event should be interpreted as main-thread backtrack priming/advancement instead of being passed through. The predicate is intentionally strict so Esc keeps its normal meaning in side conversations and vim insert mode.
+**Purpose**: This answers whether Escape should be used for the app’s main backtracking feature. Backtracking is only allowed when the user is in the normal main conversation, the composer is empty, and Escape is not needed for Vim-style insert-mode behavior.
 
-**Data flow**: Reads chat-widget state: whether a side conversation is active, whether the widget is in normal backtrack mode, whether the composer is empty, and whether vim insert mode wants to consume this Esc. It returns a boolean and mutates nothing.
+**Data flow**: It reads the chat widget’s state: whether a side conversation is active, whether the app is in normal backtrack mode, whether the composer is empty, and whether Vim insert mode should receive Escape instead. It returns true only when all conditions say the app should treat Escape as a backtrack command.
 
-**Call relations**: Called from `App::handle_key_event` inside the Esc-specific branch. It acts as the gate before `handle_backtrack_esc_key` is allowed to run.
+**Call relations**: App::handle_key_event calls this during Escape-key handling. If it returns true, the main input flow advances or primes backtracking instead of sending Escape to the chat widget.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -1022,11 +1028,11 @@ fn should_handle_backtrack_esc(&self, key_event: KeyEvent) -> bool
 fn should_reject_side_backtrack_esc(&self, key_event: KeyEvent) -> bool
 ```
 
-**Purpose**: Determines whether Esc should explicitly reject backtrack behavior in a side conversation and show the unavailable message. It mirrors the main backtrack predicate but requires side-conversation activity.
+**Purpose**: This answers whether Escape looks like a backtrack attempt inside a side conversation, where that action is not allowed. It lets the app give a clear error instead of silently doing nothing.
 
-**Data flow**: Reads side-conversation status, normal backtrack mode, composer emptiness, and vim insert-mode Esc handling from `chat_widget`, then returns `true` only when all conditions indicate a side-edit backtrack attempt should be rejected. It writes no state.
+**Data flow**: It checks whether a side conversation is active, the app is in normal backtrack mode, the composer is empty, and Vim insert mode does not need Escape. If those are all true, it returns true to signal that this Escape press should be rejected as an unavailable side-conversation backtrack.
 
-**Call relations**: Used by `App::handle_key_event` after `should_handle_backtrack_esc` fails in the Esc branch. A true result causes `reject_side_backtrack_esc` to run instead of forwarding Esc to the widget.
+**Call relations**: App::handle_key_event calls this after checking the main backtrack case. If it returns true, App::handle_key_event calls App::reject_side_backtrack_esc to reset backtrack state and show the user a message.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -1037,11 +1043,11 @@ fn should_reject_side_backtrack_esc(&self, key_event: KeyEvent) -> bool
 fn reject_side_backtrack_esc(&mut self)
 ```
 
-**Purpose**: Cancels any primed backtrack state and emits the fixed error message explaining that editing previous turns is unavailable from a side conversation. It provides explicit user feedback instead of silently ignoring Esc.
+**Purpose**: This tells the user that editing a previous message is not available from the current side conversation. It also clears any partially prepared backtrack state so the app is not left in a confusing mode.
 
-**Data flow**: Mutates app backtrack state via `reset_backtrack_state` and appends `SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE.to_string()` to the chat widget's error messages. It returns no value.
+**Data flow**: It resets the app’s backtrack state, then adds a fixed error message to the chat widget. It returns nothing, but it changes both internal state and the visible chat history.
 
-**Call relations**: Called only from `App::handle_key_event` when Esc is pressed in a side conversation under backtrack-eligible conditions. It is the side-conversation rejection path paired with `should_reject_side_backtrack_esc`.
+**Call relations**: App::handle_key_event calls this when App::should_reject_side_backtrack_esc says the user pressed Escape in a side conversation where backtracking is not supported.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -1052,11 +1058,11 @@ fn reject_side_backtrack_esc(&mut self)
 fn app_keymap_shortcuts_available(&self) -> bool
 ```
 
-**Purpose**: Reports whether app-level keybindings should currently be active. It disables them whenever an overlay, modal, or popup would make global shortcuts unsafe or confusing.
+**Purpose**: This checks whether app-wide keyboard shortcuts are currently allowed. It prevents global shortcuts from stealing keys while an overlay, modal, or popup is open.
 
-**Data flow**: Reads `self.overlay` and `chat_widget.no_modal_or_popup_active()` and returns a boolean. It has no side effects.
+**Data flow**: It reads whether an overlay is active and asks the chat widget whether any modal or popup is active. It returns true only when the main app is clear to receive global shortcuts.
 
-**Call relations**: Queried by `App::handle_key_event` before processing most global shortcuts. The test module also calls it directly to verify that opening the keymap debug view suppresses app-level bindings.
+**Call relations**: App::handle_key_event uses this before applying shortcuts such as toggling modes, opening the transcript, launching the editor, or clearing the terminal. The test in this file also checks this rule when the keymap view is open.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -1067,11 +1073,11 @@ fn app_keymap_shortcuts_available(&self) -> bool
 fn refresh_status_line(&mut self)
 ```
 
-**Purpose**: Forwards a status-line refresh request to the chat widget. It exists as a narrow app-level wrapper.
+**Purpose**: This refreshes the status line shown by the chat widget. The status line is the small area that tells the user about current mode, state, or hints.
 
-**Data flow**: Calls `self.chat_widget.refresh_status_line()` and returns unit. No other state is read or written here.
+**Data flow**: It simply asks the chat widget to refresh its status line. It does not take extra input or return a value; the effect is an updated piece of UI state.
 
-**Call relations**: Used by higher-level app flow outside this file when the status line needs recomputation. It delegates all actual work to the widget.
+**Call relations**: This is a small forwarding method on App. Other parts of the app can call it when something changes that should be reflected in the chat widget’s status line.
 
 
 ##### `tests::app_keymap_shortcuts_are_disabled_while_keymap_view_is_active`  (lines 291–299)
@@ -1080,11 +1086,11 @@ fn refresh_status_line(&mut self)
 async fn app_keymap_shortcuts_are_disabled_while_keymap_view_is_active()
 ```
 
-**Purpose**: Verifies that opening the keymap debug view disables app-level shortcut handling. This protects the invariant that modal/keymap UI owns keyboard input while visible.
+**Purpose**: This test confirms that app-wide shortcuts are turned off while the keymap debug view is open. That protects the keymap screen from having its own keys accidentally interpreted as global app commands.
 
-**Data flow**: Builds a test app with `make_test_app().await`, asserts that `app_keymap_shortcuts_available()` is initially true, clones the app keymap, opens the keymap debug view on `chat_widget`, and asserts the predicate becomes false. It mutates only the test-local app instance.
+**Data flow**: It creates a test app, first checks that app shortcuts are available, then opens the keymap debug view in the chat widget. After that, it checks that App::app_keymap_shortcuts_available returns false.
 
-**Call relations**: Run by the async Tokio test harness. It directly exercises the helper predicate rather than going through full key dispatch, isolating the shortcut-availability rule.
+**Call relations**: The test exercises the helper used by App::handle_key_event. It proves that when a popup-like keymap view is active, the main keyboard dispatcher should not treat key presses as app-level shortcuts.
 
 *Call graph*: calls 1 internal fn (make_test_app); 1 external calls (assert!).
 
@@ -1094,13 +1100,13 @@ These files bridge protocol-level app-server traffic into TUI-managed events, pe
 
 ### `tui/src/app/app_server_events.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `main loop event handling`
 
-This file implements the top-level app-server event handlers on `App`. `refresh_mcp_startup_expected_servers_from_config` derives the list of enabled MCP server names from `self.config.mcp_servers` and pushes that expectation into the chat widget, so startup progress can be interpreted against current config. `handle_app_server_event` is the outer dispatcher for `AppServerEvent`: lag notifications trigger a warning plus MCP startup recovery, server notifications and requests are delegated to dedicated async handlers, and disconnection both surfaces an error in the UI and emits `AppEvent::FatalExitRequest`.
+The TUI talks to an app server that can send many kinds of events: notifications, requests that need an answer, account updates, connector lists, plugin/config changes, and disconnection warnings. This file is the traffic director for those events. Without it, the terminal app could miss important server messages, show stale account or connector information, leave permission requests hanging, or fail to tell the user when the server connection has died.
 
-`handle_server_notification_event` first intercepts several notification types with app-wide side effects before any thread routing occurs. It resolves pending app-server requests when `ServerRequestResolved` arrives, refreshes MCP startup expectations on `McpServerStatusUpdated`, updates rolling rate-limit/account display state, and performs a multi-step config/plugin refresh after `ExternalAgentConfigImportCompleted`—including disk reload, plugin mention refresh, `reload_user_config`, plugin list fetch, and optional completion messaging. `AppListUpdated` is also consumed directly into a `ConnectorsSnapshot`.
+The main entry point is `App::handle_app_server_event`. It looks at the broad event type first. If the event stream fell behind, it resets the expected MCP startup state. MCP servers are external tool servers the app may start and connect to. If the server disconnected, it shows an error and asks the app to exit. Otherwise, it sends notifications and requests to more focused helper functions.
 
-All remaining notifications are classified by `server_notification_thread_target`. Thread-targeted notifications are enqueued either to the primary thread or a side thread depending on `self.primary_thread_id`; invalid IDs are logged and dropped; app-scoped MCP startup notices are currently ignored with a debug log; and global notifications are handed directly to `chat_widget.handle_server_notification`. `handle_server_request_event` mirrors this structure for requests: it first records or rejects unsupported requests via `pending_app_server_requests.note_server_request`, then extracts a thread ID with `server_request_thread_id`, warns on threadless requests, and enqueues the request to the primary or side-thread queue.
+Notifications are mostly one-way updates from the server. Some affect the whole app, such as account state, rate limits, connector lists, or imported external-agent configuration. Others belong to a particular conversation thread, so this file finds the right destination and queues them there. Requests are different: the server is asking the UI/user to do something or decide something. This file records pending requests, rejects unsupported ones, and routes supported ones to the correct thread. In short, it is like a mailroom: it opens each envelope enough to know where it belongs, then delivers it to the right desk.
 
 #### Function details
 
@@ -1110,11 +1116,11 @@ All remaining notifications are classified by `server_notification_thread_target
 fn refresh_mcp_startup_expected_servers_from_config(&mut self)
 ```
 
-**Purpose**: Recomputes which MCP servers should be considered expected during startup based on the current config. It keeps the chat widget’s startup-progress UI aligned with enabled server definitions.
+**Purpose**: This updates the chat UI with the list of MCP servers that the current configuration says should be enabled at startup. It helps the UI know which tool servers it is still waiting for or should display during startup.
 
-**Data flow**: Reads `self.config.mcp_servers.get()`, filters entries whose `enabled` flag is true, collects their names into `Vec<String>`, and passes that vector to `self.chat_widget.set_mcp_startup_expected_servers`. It returns no value and updates only widget state.
+**Data flow**: It reads the app configuration, looks through the configured MCP servers, keeps only the ones marked enabled, and collects their names. It then gives that list to the chat widget, replacing the widget's idea of the expected startup servers.
 
-**Call relations**: This helper is called when the app-server event stream lags and when MCP status notifications arrive, so startup expectations are refreshed whenever config or event ordering may have changed.
+**Call relations**: This is used when the event stream has lagged and when the server reports MCP status changes. In both cases, the app may no longer trust its old startup picture, so the broader event handlers call this function to rebuild the UI's expected-server list from the source of truth: the current config.
 
 *Call graph*: called by 2 (handle_app_server_event, handle_server_notification_event).
 
@@ -1129,11 +1135,11 @@ async fn handle_app_server_event(
     )
 ```
 
-**Purpose**: Acts as the outer dispatcher for all `AppServerEvent` values arriving from the app-server session. It translates transport-level events into app actions, warnings, and follow-up handlers.
+**Purpose**: This is the first stop for each event received from the app server. It decides whether the event is a notification, a request, a lag warning, or a disconnection, and then starts the right response.
 
-**Data flow**: Consumes an `AppServerEvent` plus references to the current `AppServerSession`. For `Lagged`, it logs the skipped count, refreshes expected MCP servers, and tells the chat widget to finish startup after lag; for `ServerNotification` and `ServerRequest`, it awaits the corresponding internal handler; for `Disconnected`, it logs, adds an error message, and sends `AppEvent::FatalExitRequest(message)` through `app_event_tx`.
+**Data flow**: It receives the current app-server session and one server event. If events were skipped because the UI fell behind, it logs a warning and resets MCP startup state. If the event is a notification, it passes the notification to the notification handler. If it is a request, it passes the request to the request handler. If the server disconnected, it shows the user an error and sends a fatal-exit request into the app's event channel.
 
-**Call relations**: This method is invoked by the main app loop whenever a new app-server event is received. It delegates detailed notification/request processing to `App::handle_server_notification_event` and `App::handle_server_request_event`.
+**Call relations**: This function is the dispatcher for this file. When the app's event loop receives an `AppServerEvent`, it calls here, and this function either deals with the event immediately or hands it to `App::handle_server_notification_event` or `App::handle_server_request_event` for more detailed routing.
 
 *Call graph*: calls 3 internal fn (handle_server_notification_event, handle_server_request_event, refresh_mcp_startup_expected_servers_from_config); 2 external calls (FatalExitRequest, warn!).
 
@@ -1148,11 +1154,11 @@ async fn handle_server_notification_event(
     )
 ```
 
-**Purpose**: Processes a single `ServerNotification`, applying app-wide side effects first and then routing thread-bound notifications into the correct queue. It is the main notification bridge from protocol events to TUI state.
+**Purpose**: This processes one-way updates from the app server and makes sure they change the right part of the terminal UI. Some notifications update global UI state, while others are delivered to a specific conversation thread.
 
-**Data flow**: Takes ownership of a `ServerNotification`. It may resolve and dismiss pending requests, refresh MCP startup expectations, update rate-limit snapshots, update account/auth display state, or perform external-agent-config import follow-up work including config reload, plugin mention refresh, `reload_user_config`, plugin list fetch, and optional info messaging. If not returned early, it classifies the notification with `server_notification_thread_target`; thread-targeted notifications are enqueued to the primary or side-thread queue based on `self.primary_thread_id`, invalid IDs are logged and dropped, app-scoped notifications are ignored, and global notifications are forwarded to `self.chat_widget.handle_server_notification`.
+**Data flow**: It receives the app-server session and a server notification. First it checks for special notification types: resolved server requests are dismissed from the UI, MCP status changes refresh startup expectations, rate-limit snapshots update rate-limit display, account updates refresh the displayed account and plan state, imported external-agent config triggers config reload and plugin refresh, and connector-list updates refresh connector data. If none of those special cases apply, it asks which thread the notification belongs to. Thread-specific notifications are queued for the primary thread or another thread. Invalid or app-scoped notifications may be ignored with a log message. Global notifications are passed directly to the chat widget.
 
-**Call relations**: Called only from `App::handle_app_server_event` for `AppServerEvent::ServerNotification`. It depends on `server_notification_thread_target` for routing and on several other app methods for queueing, config refresh, and plugin/account UI updates.
+**Call relations**: It is called by `App::handle_app_server_event` whenever a server notification arrives. During its work it relies on helper logic such as `server_notification_thread_target` to decide where the message belongs, `status_account_display_from_auth_mode` to turn login details into user-facing account text, and session/config helpers when an external-agent import finishes.
 
 *Call graph*: calls 4 internal fn (server_notification_thread_target, refresh_mcp_startup_expected_servers_from_config, consume_external_agent_config_import_completion, status_account_display_from_auth_mode); called by 1 (handle_app_server_event); 4 external calls (reload_user_config, matches!, debug!, warn!).
 
@@ -1167,11 +1173,11 @@ async fn handle_server_request_event(
     )
 ```
 
-**Purpose**: Records, rejects, and routes incoming app-server requests to the appropriate thread queue. It ensures unsupported requests are rejected promptly and supported ones are correlated before delivery.
+**Purpose**: This processes requests from the app server that may need attention from the UI or user. It records supported requests, rejects unsupported ones, and delivers valid thread-specific requests to the right conversation.
 
-**Data flow**: Consumes a `ServerRequest` and first passes a shared reference to `self.pending_app_server_requests.note_server_request`. If that returns an `UnsupportedAppServerRequest`, it logs, shows the message in the chat widget, asynchronously rejects the RPC via `reject_app_server_request`, and returns. Otherwise it extracts a thread ID with `server_request_thread_id`; missing IDs are warned and ignored, while valid IDs are used to enqueue the request to the primary thread or a side thread depending on `self.primary_thread_id`, with enqueue failures logged.
+**Data flow**: It receives the app-server session and a server request. It first asks the pending-request tracker to note the request; if that tracker says the request is unsupported, the function warns, shows an error, and sends a rejection back to the server. If the request is supported, it extracts the thread ID. Requests without a thread are ignored with a warning. Requests with a thread ID are queued either for the primary thread or for another matching thread, and any queueing failure is logged.
 
-**Call relations**: This method is called from `App::handle_app_server_event` for `AppServerEvent::ServerRequest`. It relies on `PendingAppServerRequests` to maintain request correlation and on `server_request_thread_id` to decide whether and where the request can be delivered.
+**Call relations**: It is called by `App::handle_app_server_event` whenever the incoming app-server event is a request. It uses `server_request_thread_id` to decide where the request belongs, and it hands the request off to the app's thread queues so the appropriate conversation can show or answer it.
 
 *Call graph*: calls 1 internal fn (server_request_thread_id); called by 1 (handle_app_server_event); 1 external calls (warn!).
 
@@ -1180,11 +1186,11 @@ async fn handle_server_request_event(
 
 `domain_logic` · `request handling`
 
-This module contains both a small `App` helper for rejecting unsupported requests and the core `PendingAppServerRequests` state machine. `App::reject_app_server_request` wraps `AppServerSession::reject_server_request` with a fixed JSON-RPC error shape (`code: -32000`) and a user-visible reason string.
+The app server can ask the terminal UI for several kinds of decisions: approve a command, approve a file change, grant permissions, answer a tool’s question, or respond to an MCP elicitation request. These requests arrive with app-server request IDs, while the rest of the UI often talks in terms of item IDs, approval IDs, turn IDs, or server names. This file is the small “claim ticket desk” between those two worlds: it records each incoming ticket, then later uses the ticket to send the right answer back.
 
-`PendingAppServerRequests` stores pending requests in several maps keyed by the identifier the UI will later use: command approvals by approval/item ID, file changes by item ID, permissions by item ID, user-input requests as FIFO `VecDeque`s per `turn_id`, and MCP elicitation requests by `(server_name, request_id)`. `note_server_request` is the ingestion point: it records supported requests, validates permission paths early via `CoreRequestPermissionProfile::try_from` so invalid filesystem paths can be rejected before UI delivery, and returns `UnsupportedAppServerRequest` for unsupported variants like dynamic tool calls and legacy approval APIs.
+The main type, `PendingAppServerRequests`, stores separate lookup tables for each request kind. When a server request arrives, `note_server_request` records it if the TUI supports that request. Some unsupported requests are returned with a clear rejection message instead of being stored. Permission requests get an extra safety check so invalid filesystem paths are rejected early, before the server is left waiting.
 
-`take_resolution` converts an `AppCommand` into an optional `AppServerRequestResolution` by removing the matching pending entry and serializing the appropriate protocol response type with `serde_json::to_value`. The mapping is concrete: exec approvals become `CommandExecutionRequestApprovalResponse`, patch approvals become `FileChangeRequestApprovalResponse`, permission responses convert granted permissions and scope, user-input answers pop the oldest request for a turn, and MCP elicitation resolutions serialize action/content/meta. `resolve_notification` performs the inverse correlation when the server later emits `ServerRequestResolved`, removing the matching pending entry and returning a `ResolvedAppServerRequest` so the UI can dismiss the right prompt. Helper methods preserve FIFO semantics for same-turn user-input requests and clean up empty queues. The extensive tests cover serialization, unsupported-request rejection, permission-path validation, FIFO ordering, and notification correlation.
+When the user or UI produces an `AppCommand`, `take_resolution` looks for a matching pending request, removes it, and turns the answer into the JSON shape the app server protocol expects. If the app server later reports that a request was resolved elsewhere, `resolve_notification` removes the matching pending entry so the UI does not keep showing stale work. User-input requests are queued per turn, so multiple questions in the same turn are answered in first-in, first-out order.
 
 #### Function details
 
@@ -1199,11 +1205,11 @@ async fn reject_app_server_request(
     ) -> std::result::Result<(), String
 ```
 
-**Purpose**: Sends a JSON-RPC rejection back to the app server for a request the TUI cannot or will not handle. It standardizes the error code and wraps transport failures in a user-readable string.
+**Purpose**: Sends a formal rejection back to the app server for a request the TUI cannot or will not satisfy. It wraps the human-readable reason in the JSON-RPC error format, which is the request/response error format used by the app server protocol.
 
-**Data flow**: Accepts an `AppServerSession`, a protocol `request_id`, and a rejection `reason`. It constructs `JSONRPCErrorError { code: -32000, message: reason, data: None }`, awaits `app_server_client.reject_server_request`, and returns `Ok(())` on success or `Err("failed to reject app-server request: ...")` on failure.
+**Data flow**: It receives an app-server session, the request ID to reject, and a reason string. It builds an error object with a generic server error code and that reason, sends it through the session, and returns success or a plain error message if sending fails.
 
-**Call relations**: This helper is called from `App::handle_server_request_event` when `PendingAppServerRequests::note_server_request` reports an unsupported request. It delegates the actual RPC transmission to the app-server session.
+**Call relations**: This is used when earlier request-checking code decides a server request is unsupported or invalid. It hands the actual network/protocol reply off to `reject_server_request`, keeping this file focused on translating the TUI’s decision into the app server’s expected rejection shape.
 
 *Call graph*: calls 1 internal fn (reject_server_request).
 
@@ -1214,11 +1220,11 @@ async fn reject_app_server_request(
 fn clear(&mut self)
 ```
 
-**Purpose**: Drops all tracked pending app-server requests. It resets every correlation map and queue to an empty state.
+**Purpose**: Forgets every app-server request currently waiting for a UI response. This is useful when the session is reset or the UI must discard old pending work.
 
-**Data flow**: Mutably borrows `self` and clears `exec_approvals`, `file_change_approvals`, `permissions_approvals`, `user_inputs`, and `mcp_requests`. It returns no value.
+**Data flow**: It takes the current pending-request store and empties all of its internal lookup tables and queues. Nothing is returned; after it runs, there are no remembered approvals, permission requests, user-input prompts, or MCP elicitation requests.
 
-**Call relations**: This is a local state-reset helper used when the app needs to discard all pending request bookkeeping, such as during broader session resets elsewhere in the app.
+**Call relations**: This is a housekeeping method for the owner of `PendingAppServerRequests`. It does not call other helpers because each stored category can simply be cleared directly.
 
 
 ##### `PendingAppServerRequests::note_server_request`  (lines 88–171)
@@ -1230,11 +1236,11 @@ fn note_server_request(
     ) -> Option<UnsupportedAppServerRequest>
 ```
 
-**Purpose**: Registers a newly arrived `ServerRequest` in the appropriate pending map or rejects it as unsupported. It is the authoritative ingestion point for request correlation state.
+**Purpose**: Records a newly arrived app-server request so a later UI action can be matched back to it. If the request is not supported by the TUI, it returns a rejection message instead of storing it.
 
-**Data flow**: Reads a `&ServerRequest`, matches its variant, and inserts the protocol `request_id` into one of several maps keyed by approval ID, item ID, turn ID queue, or MCP `(server_name, request_id)` pair. For permissions requests it first validates `params.permissions` via `CoreRequestPermissionProfile::try_from`; validation failure returns `Some(UnsupportedAppServerRequest)` with a formatted localization error instead of recording the request. Unsupported variants like `DynamicToolCall`, `AttestationGenerate`, `ApplyPatchApproval`, and `ExecCommandApproval` return `Some(UnsupportedAppServerRequest)` with fixed messages; supported variants return `None`.
+**Data flow**: It receives a `ServerRequest` from the app server. For supported approval, permission, user-input, and MCP requests, it saves the app-server request ID under the ID that the UI will later use. For permission requests, it first checks that requested filesystem paths can be understood locally. It returns `None` when the request was accepted for tracking, or an `UnsupportedAppServerRequest` containing the original request ID and a message when the request should be rejected.
 
-**Call relations**: Called by `App::handle_server_request_event` before any request is routed to a thread. Its output determines whether the request is delivered to the UI or immediately rejected through `App::reject_app_server_request`.
+**Call relations**: This is the intake point for pending work. Later, `take_resolution` uses the records created here to answer requests, while `resolve_notification` can remove them if the app server says they were resolved elsewhere. It calls the permission conversion check for permission requests because bad paths must be rejected before the UI delivery path loses the clean app-server rejection route.
 
 *Call graph*: 2 external calls (try_from, format!).
 
@@ -1248,11 +1254,11 @@ fn take_resolution(
     ) -> Result<Option<AppServerRequestResolution>, String>
 ```
 
-**Purpose**: Consumes a user-originated `AppCommand` and, if it corresponds to a pending app-server request, produces the serialized protocol response payload to send back. It also removes the matched pending entry so the request cannot be resolved twice.
+**Purpose**: Turns a UI-side decision into the exact response needed by the matching app-server request. It also removes the request from the pending list so it cannot be answered twice.
 
-**Data flow**: Accepts any `T: Into<AppCommand>`, converts it, and matches the resulting command. For exec, patch, permissions, user-input, and MCP elicitation commands, it removes the corresponding pending request from the relevant map or queue, serializes the concrete response struct into `serde_json::Value`, and returns `Ok(Some(AppServerRequestResolution { request_id, result }))`. Serialization failures become `Err(String)`. Commands unrelated to app-server requests return `Ok(None)`.
+**Data flow**: It receives something that can become an `AppCommand`, such as an approval decision or a user-input answer. It converts that input into an `AppCommand`, looks in the appropriate pending-request table, removes the matching request if found, and serializes the response into JSON. It returns either no match, a ready-to-send `AppServerRequestResolution`, or an error string if response serialization fails.
 
-**Call relations**: This method is used by higher-level command submission code when the user answers an approval or elicitation prompt. It delegates turn-based user-input lookup to `pop_user_input_request_for_turn` and relies on the pending maps populated by `note_server_request`.
+**Call relations**: This is the main outgoing bridge from UI actions back to the app server. It relies on entries previously recorded by `note_server_request`. For user input, it calls `pop_user_input_request_for_turn` so multiple prompts for the same turn are answered in arrival order.
 
 *Call graph*: calls 1 internal fn (pop_user_input_request_for_turn); 1 external calls (into).
 
@@ -1266,11 +1272,11 @@ fn resolve_notification(
     ) -> Option<ResolvedAppServerRequest>
 ```
 
-**Purpose**: Matches a `ServerRequestResolved` notification back to the pending request it completes and returns a UI-facing description of what was resolved. It also removes the request from tracking state.
+**Purpose**: Removes a pending request when the app server notifies the TUI that the request has already been resolved. This prevents the UI from continuing to show a prompt that no longer needs an answer.
 
-**Data flow**: Takes a borrowed protocol `request_id`, scans each pending collection for a matching stored request ID, removes the first match found, and returns a typed `ResolvedAppServerRequest` describing the resolved exec approval, file-change approval, permissions approval, user-input call ID, or MCP elicitation key. If no pending entry matches, it returns `None`.
+**Data flow**: It receives an app-server request ID. It searches all pending categories for that ID, removes the matching record if one exists, and returns a small description of what was removed, such as an exec approval ID or user-input call ID. If no pending request matches, it returns nothing.
 
-**Call relations**: Called from `App::handle_server_notification_event` when a `ServerNotification::ServerRequestResolved` arrives. It uses `remove_user_input_request` for the queued user-input case and lets the caller dismiss the corresponding UI prompt.
+**Call relations**: This is the cleanup path for server-side resolution events. It complements `take_resolution`: `take_resolution` removes a request because the TUI is answering it, while this method removes a request because the server says it is done. For user-input requests, it calls `remove_user_input_request` to search inside the per-turn queues.
 
 *Call graph*: calls 1 internal fn (remove_user_input_request).
 
@@ -1281,11 +1287,11 @@ fn resolve_notification(
 fn contains_server_request(&self, request: &ServerRequest) -> bool
 ```
 
-**Purpose**: Checks whether a given `ServerRequest` is already represented in pending state. It supports deduplication and replay logic by answering whether the request is known.
+**Purpose**: Checks whether a server request is already known to the pending-request tracker. This helps avoid treating duplicate or already-accounted-for requests as new work.
 
-**Data flow**: Reads `&self` and `&ServerRequest`, then searches the relevant map values or queued user-input entries for the request’s `request_id`. For unsupported or legacy request variants it returns `true` unconditionally, treating them as effectively known/non-deliverable. It does not mutate state.
+**Data flow**: It receives a `ServerRequest` and compares its request ID with the IDs stored in the matching pending category. For queued user-input requests, it searches through all per-turn queues. It returns `true` if the request is considered present or already accounted for, and `false` if a supported trackable request is not found.
 
-**Call relations**: This helper is used by surrounding replay and buffering code to avoid reintroducing duplicate pending requests after thread event replays or queue reconstruction.
+**Call relations**: This is a read-only helper used by surrounding request-handling code before deciding what to do with a server request. Unlike `note_server_request`, it does not store, remove, reject, or serialize anything.
 
 
 ##### `PendingAppServerRequests::pop_user_input_request_for_turn`  (lines 360–376)
@@ -1297,11 +1303,11 @@ fn pop_user_input_request_for_turn(
     ) -> Option<PendingUserInputRequest>
 ```
 
-**Purpose**: Removes the oldest pending user-input request for a given turn. It enforces FIFO semantics when multiple tool questions are queued on the same turn.
+**Purpose**: Takes the oldest pending user-input request for a given turn. This matters because the same turn can ask more than one question, and answers should be matched in the same order the questions arrived.
 
-**Data flow**: Looks up `self.user_inputs[turn_id]`, pops the front `PendingUserInputRequest` from its `VecDeque`, removes the entire map entry if the queue becomes empty, and returns the popped request or `None` if no queue exists.
+**Data flow**: It receives a turn ID, finds the queue of user-input requests for that turn, and removes the front entry. If the queue becomes empty, it removes the queue itself. It returns the removed pending request, or nothing if that turn has no waiting input request.
 
-**Call relations**: This private helper is called by `PendingAppServerRequests::take_resolution` when handling `AppCommand::UserInputAnswer`, ensuring repeated answers for the same turn resolve requests in arrival order.
+**Call relations**: This private helper is called by `take_resolution` when the UI sends a `UserInputAnswer`. It keeps the first-in, first-out behavior in one place so the main resolution code does not need to know the queue details.
 
 *Call graph*: called by 1 (take_resolution).
 
@@ -1315,11 +1321,11 @@ fn remove_user_input_request(
     ) -> Option<PendingUserInputRequest>
 ```
 
-**Purpose**: Finds and removes a pending user-input request by protocol `request_id` regardless of which turn queue contains it. It supports reverse correlation from server resolution notifications.
+**Purpose**: Removes a specific pending user-input request by its app-server request ID, even though user-input requests are grouped by turn. This is needed when the server identifies the resolved request by request ID rather than by turn.
 
-**Data flow**: Searches all `user_inputs` queues to find the `(turn_id, index)` of the first pending entry whose `request_id` matches, removes that entry from the queue, deletes the queue map entry if it becomes empty, and returns the removed `PendingUserInputRequest` or `None`.
+**Data flow**: It receives an app-server request ID, searches every turn’s queue for a matching pending user-input request, removes that one entry, and deletes the turn queue if it becomes empty. It returns the removed request, or nothing if no match exists.
 
-**Call relations**: This private helper is used by `PendingAppServerRequests::resolve_notification` to translate a `ServerRequestResolved` notification into a `ResolvedAppServerRequest::UserInput` carrying the original `item_id`.
+**Call relations**: This private helper is called by `resolve_notification`. It handles the more expensive search needed for server resolution notifications, while normal UI answers use `pop_user_input_request_for_turn` instead.
 
 *Call graph*: called by 1 (resolve_notification).
 
@@ -1330,11 +1336,11 @@ fn remove_user_input_request(
 fn resolves_exec_approval_through_app_server_request_id()
 ```
 
-**Purpose**: Verifies that a recorded command-execution approval request can be resolved from an `AppCommand::ExecApproval` into the original app-server `request_id` and serialized decision payload.
+**Purpose**: Checks that a command-execution approval request is recorded and later resolved using the original app-server request ID. This protects the basic approval round trip for commands.
 
-**Data flow**: Creates a default `PendingAppServerRequests`, records a `CommandExecutionRequestApproval` with explicit approval ID, calls `take_resolution` with an accept decision, and asserts the returned `AppServerRequestResolution` contains `RequestId::Integer(41)` and JSON `{ "decision": "accept" }`.
+**Data flow**: The test creates an empty pending-request tracker, records a command approval request with app-server request ID 41 and approval ID `approval-1`, then sends an accept decision for that approval ID. It expects the produced resolution to target request ID 41 and contain JSON saying the decision was accepted.
 
-**Call relations**: This test exercises the `note_server_request` and `take_resolution` path for exec approvals, documenting the approval-ID keying behavior.
+**Call relations**: This test exercises `note_server_request` followed by `take_resolution` for the command-approval path. It confirms that the UI-facing approval ID is correctly linked back to the app-server request ID.
 
 *Call graph*: 3 external calls (Integer, assert_eq!, default).
 
@@ -1345,11 +1351,11 @@ fn resolves_exec_approval_through_app_server_request_id()
 fn rejects_permissions_with_paths_that_cannot_be_localized()
 ```
 
-**Purpose**: Checks that invalid permission paths are rejected immediately instead of being recorded as pending. It covers the early validation branch for permissions requests.
+**Purpose**: Checks that permission requests with invalid filesystem paths are rejected immediately instead of being stored as pending. This prevents the app server from waiting forever for a request the UI cannot safely present or answer.
 
-**Data flow**: Builds a permissions payload containing a relative filesystem path, confirms core localization fails, wraps it in `ServerRequest::PermissionsRequestApproval`, passes it to `note_server_request`, and asserts the result is `Some(UnsupportedAppServerRequest)` with the formatted localization error message.
+**Data flow**: The test builds a permission request containing a relative path, which cannot be localized as an absolute filesystem path. It records the request and expects an `UnsupportedAppServerRequest` with the same request ID and a message explaining the path-localization failure.
 
-**Call relations**: This test targets the duplicate-validation logic in `note_server_request` that exists specifically to preserve a clean rejection path before UI delivery.
+**Call relations**: This test focuses on the validation branch inside `note_server_request`. It confirms that the permission conversion check runs before the request is added to the pending permission approvals table.
 
 *Call graph*: calls 1 internal fn (try_from); 7 external calls (Integer, from, try_from, assert_eq!, cfg!, default, vec!).
 
@@ -1360,11 +1366,11 @@ fn rejects_permissions_with_paths_that_cannot_be_localized()
 fn resolves_permissions_and_user_input_through_app_server_request_id()
 ```
 
-**Purpose**: Validates both permission-response serialization and user-input response serialization, including conversion of granted permissions back into protocol form. It also confirms each response resolves to the correct original request ID.
+**Purpose**: Checks two important resolution paths: permission approval and tool user input. It verifies that both are matched back to their app-server request IDs and serialized into the protocol shape the server expects.
 
-**Data flow**: Records a permissions approval request and a tool user-input request, then calls `take_resolution` first with `AppCommand::RequestPermissionsResponse` and then with `AppCommand::UserInputAnswer`. It asserts the returned request IDs are 7 and 8 respectively and deserializes the JSON payloads back into protocol response structs to verify exact contents.
+**Data flow**: The test records one permission request and one user-input request. It then submits a permission response with network and filesystem grants, expecting a response tied to request ID 7, and submits a user-input answer for the turn, expecting a response tied to request ID 8. It also decodes the JSON responses to prove their contents are correct.
 
-**Call relations**: This test covers two branches of `take_resolution`: permission approvals, which invoke granted-permission conversion, and user-input answers, which consume the oldest queued request for a turn.
+**Call relations**: This test covers `note_server_request` and `take_resolution` for permission approvals and user-input answers. For user input, it indirectly checks `pop_user_input_request_for_turn`, because the answer is matched by turn ID.
 
 *Call graph*: calls 1 internal fn (from_read_write_roots); 5 external calls (assert_eq!, cfg!, once, default, vec!).
 
@@ -1375,11 +1381,11 @@ fn resolves_permissions_and_user_input_through_app_server_request_id()
 fn correlates_mcp_elicitation_server_request_with_resolution()
 ```
 
-**Purpose**: Ensures MCP elicitation requests are keyed and resolved by `(server_name, request_id)` and serialized with action, content, and `_meta`. It protects the MCP-specific correlation path.
+**Purpose**: Checks that an MCP elicitation request is tracked using both the MCP server name and the app-server request ID. MCP here means Model Context Protocol, a way for external tools or servers to ask for structured input.
 
-**Data flow**: Records an `McpServerElicitationRequest`, resolves it with `AppCommand::ResolveElicitation`, and asserts the resulting `AppServerRequestResolution` carries the original integer request ID and JSON containing `action`, `content`, and `_meta`.
+**Data flow**: The test records an MCP elicitation request from server `example` with request ID 12. It then sends an accept decision with content and metadata, and expects the resulting app-server response to use request ID 12 and contain the matching JSON fields.
 
-**Call relations**: This test exercises the MCP branch of both `note_server_request` and `take_resolution`, documenting the custom `McpRequestKey` behavior.
+**Call relations**: This test exercises the MCP branch of `note_server_request` and `take_resolution`. It confirms that the compound key used for MCP requests points back to the correct app-server request.
 
 *Call graph*: 4 external calls (Integer, assert_eq!, json!, default).
 
@@ -1390,11 +1396,11 @@ fn correlates_mcp_elicitation_server_request_with_resolution()
 fn rejects_dynamic_tool_calls_as_unsupported()
 ```
 
-**Purpose**: Confirms that dynamic tool calls are not accepted by the TUI request tracker. The test locks in the exact unsupported-message text.
+**Purpose**: Checks that dynamic tool calls are clearly rejected because this TUI does not support them yet. This keeps unsupported features from being silently ignored.
 
-**Data flow**: Creates a `DynamicToolCall` request, passes it to `note_server_request`, unwraps the returned `UnsupportedAppServerRequest`, and asserts both the request ID and rejection message match expectations.
+**Data flow**: The test sends a dynamic tool call request into the pending tracker. It expects `note_server_request` to return an unsupported-request object with the same request ID and the fixed message saying dynamic tool calls are not available in the TUI yet.
 
-**Call relations**: This test covers one of the explicit unsupported branches in `note_server_request` that causes `App::handle_server_request_event` to reject the RPC.
+**Call relations**: This test covers one of the unsupported branches in `note_server_request`. It supports the flow where calling code can pass the returned rejection to `App::reject_app_server_request`.
 
 *Call graph*: 4 external calls (Integer, assert_eq!, json!, default).
 
@@ -1405,11 +1411,11 @@ fn rejects_dynamic_tool_calls_as_unsupported()
 fn does_not_mark_chatgpt_auth_refresh_as_unsupported()
 ```
 
-**Purpose**: Verifies that ChatGPT auth-token refresh requests are not treated as unsupported even though they are not thread-routed here. This preserves compatibility with app-scoped auth flows.
+**Purpose**: Checks that a ChatGPT authentication-token refresh request is not treated as an unsupported TUI request. The TUI does not track it here, but this code also should not reject it.
 
-**Data flow**: Creates a `ChatgptAuthTokensRefresh` request, passes it to `note_server_request`, and asserts the result is `None`.
+**Data flow**: The test creates an authentication-refresh server request and passes it to `note_server_request`. It expects `None`, meaning no pending UI approval was recorded and no unsupported rejection was requested.
 
-**Call relations**: This test documents the special-case branch in `note_server_request` where the request is neither recorded in a pending map nor rejected.
+**Call relations**: This test documents the special case in `note_server_request` for authentication refreshes. It distinguishes that request type from truly unsupported request types such as dynamic tool calls.
 
 *Call graph*: 2 external calls (assert_eq!, default).
 
@@ -1420,11 +1426,11 @@ fn does_not_mark_chatgpt_auth_refresh_as_unsupported()
 fn resolves_patch_approval_through_app_server_request_id()
 ```
 
-**Purpose**: Checks that file-change approval requests are correlated by item ID and serialized into the expected cancel/accept payload. It covers the patch-approval branch of the resolution logic.
+**Purpose**: Checks that a file-change approval request, also represented in the UI as a patch approval, resolves back to the correct app-server request ID.
 
-**Data flow**: Records a `FileChangeRequestApproval`, resolves it with `AppCommand::PatchApproval { decision: Cancel }`, and asserts the returned request ID is 13 with JSON `{ "decision": "cancel" }`.
+**Data flow**: The test records a file-change request with item ID `patch-1` and app-server request ID 13. It then sends a cancel decision for `patch-1` and expects a resolution for request ID 13 with JSON saying the decision was canceled.
 
-**Call relations**: This test exercises the file-change branch of `note_server_request` and `take_resolution`.
+**Call relations**: This test exercises the file-change branch of `note_server_request` and the patch-approval branch of `take_resolution`. It proves the UI’s patch ID is correctly connected to the server’s request ID.
 
 *Call graph*: 2 external calls (assert_eq!, default).
 
@@ -1435,11 +1441,11 @@ fn resolves_patch_approval_through_app_server_request_id()
 fn resolve_notification_returns_resolved_exec_request()
 ```
 
-**Purpose**: Verifies that a server-side resolution notification removes a pending exec approval and returns the corresponding UI-facing resolved value exactly once.
+**Purpose**: Checks that when the app server reports a command approval as resolved, the pending tracker removes it and reports which UI approval ID was affected.
 
-**Data flow**: Records a command-execution approval request, calls `resolve_notification` with its request ID, asserts it returns `Some(ResolvedAppServerRequest::ExecApproval { ... })`, then calls again and asserts `None` because the entry was removed.
+**Data flow**: The test records a command approval request, then calls `resolve_notification` with that request ID. It expects a resolved exec-approval result containing `approval-1`, and a second call with the same request ID returns nothing because the entry was already removed.
 
-**Call relations**: This test covers the exec-approval branch of `resolve_notification` and confirms the method is destructive.
+**Call relations**: This test exercises `note_server_request` followed by `resolve_notification` for command approvals. It confirms that server-side cleanup is one-time and removes stale pending state.
 
 *Call graph*: 2 external calls (assert_eq!, default).
 
@@ -1450,11 +1456,11 @@ fn resolve_notification_returns_resolved_exec_request()
 fn resolve_notification_returns_resolved_mcp_request()
 ```
 
-**Purpose**: Checks that `resolve_notification` can recover MCP elicitation metadata from a resolved request ID. It ensures the server name and request ID are preserved in the returned enum.
+**Purpose**: Checks that server-side resolution notifications also work for MCP elicitation requests. The UI needs to know which MCP prompt disappeared so it can stop showing it.
 
-**Data flow**: Records an MCP elicitation request, calls `resolve_notification` with request ID 12, and asserts it returns `ResolvedAppServerRequest::McpElicitation { server_name: "example", request_id: 12 }`.
+**Data flow**: The test records an MCP elicitation request from server `example` with request ID 12. It then calls `resolve_notification` with request ID 12 and expects a resolved MCP result containing the server name and request ID.
 
-**Call relations**: This test exercises the MCP branch of `resolve_notification`, which scans `mcp_requests` for a matching stored request ID.
+**Call relations**: This test covers the MCP branch of `resolve_notification`. It confirms that the MCP request key stored by `note_server_request` can be found and removed by app-server request ID.
 
 *Call graph*: 2 external calls (assert_eq!, default).
 
@@ -1465,11 +1471,11 @@ fn resolve_notification_returns_resolved_mcp_request()
 fn resolve_notification_returns_resolved_user_input_item_id()
 ```
 
-**Purpose**: Ensures a resolved user-input request maps back to the original tool call/item ID rather than only the turn ID. That is the identifier the UI needs to dismiss the right prompt.
+**Purpose**: Checks that a server-side notification for a user-input request returns the tool call ID that the UI understands. This lets the UI clear the correct prompt.
 
-**Data flow**: Records a `ToolRequestUserInput` request, calls `resolve_notification` with its request ID, and asserts the result is `ResolvedAppServerRequest::UserInput { call_id: "tool-1" }`.
+**Data flow**: The test records a tool user-input request with request ID 8 and item ID `tool-1`. It then resolves by request ID 8 and expects a user-input result containing call ID `tool-1`.
 
-**Call relations**: This test covers the user-input branch of `resolve_notification`, which delegates queue removal to `remove_user_input_request`.
+**Call relations**: This test exercises `resolve_notification` for user input and indirectly tests `remove_user_input_request`. It shows how the tracker translates from app-server request ID back to the UI’s tool call ID.
 
 *Call graph*: 4 external calls (Integer, new, assert_eq!, default).
 
@@ -1480,11 +1486,11 @@ fn resolve_notification_returns_resolved_user_input_item_id()
 fn same_turn_user_input_answers_resolve_app_server_requests_fifo()
 ```
 
-**Purpose**: Verifies FIFO ordering for multiple pending user-input requests on the same turn. It prevents later prompts from being answered before earlier ones when both share a turn ID.
+**Purpose**: Checks that multiple user-input requests in the same turn are answered in first-in, first-out order. This prevents a later answer from accidentally being sent to an earlier question, or vice versa.
 
-**Data flow**: Records two `ToolRequestUserInput` requests for `turn-1` with request IDs 8 and 9, then calls `take_resolution` twice with `AppCommand::UserInputAnswer { id: "turn-1" }`. It asserts the first returned resolution uses request ID 8 and the second uses request ID 9.
+**Data flow**: The test records two user-input requests for the same turn, with request IDs 8 and 9. It sends two answers for that turn and expects the first answer to resolve request ID 8 and the second answer to resolve request ID 9.
 
-**Call relations**: This test specifically validates the queue behavior implemented by `pop_user_input_request_for_turn`, which `take_resolution` uses for user-input answers.
+**Call relations**: This test focuses on the queue behavior used by `take_resolution`. It indirectly verifies `pop_user_input_request_for_turn`, which removes the oldest queued request for a turn each time an answer arrives.
 
 *Call graph*: 5 external calls (Integer, new, new, assert_eq!, default).
 
@@ -1494,13 +1500,13 @@ These files manage per-thread state, route thread-scoped commands and events, an
 
 ### `tui/src/app/pending_interactive_replay.rs`
 
-`domain_logic` · `cross-cutting during event buffering, snapshot creation, thread switching, and prompt resolution`
+`domain_logic` · `request handling, thread snapshot replay, and thread teardown`
 
-This module implements the state machine behind interactive prompt replay filtering. `PendingInteractiveReplayState` stores several parallel indexes: fast membership sets keyed by approval/item/request identity, per-turn `HashMap<String, Vec<String>>` queues for prompt cleanup on turn completion, and `pending_requests_by_request_id` so server-side resolution notifications can remove the exact pending request. `ElicitationRequestKey` combines MCP `server_name` with app-server `RequestId`, because request IDs alone are not the only semantic discriminator used elsewhere.
+The TUI keeps a buffer of recent thread events so it can rebuild the screen when the user switches between threads or agents. Most events can be replayed exactly as they happened. Interactive prompts are different: an approval request, a form-like elicitation, or a tool asking the user a question should only be replayed if it is still waiting for an answer. This file is the bookkeeping for that rule.
 
-State enters through `note_server_request`, which recognizes five interactive `ServerRequest` variants: command execution approval, file change approval, MCP elicitation, tool user input, and permissions approval. Each inserts into the relevant set and turn queue, and records a `PendingInteractiveRequest` enum in the request-ID map. State leaves through three channels: outbound user actions in `note_outbound_op`, inbound notifications in `note_server_notification`, and buffer eviction in `note_evicted_server_request`. The outbound path mirrors protocol semantics carefully: `UserInputAnswer` identifies a turn rather than a prompt call ID, so removal is FIFO from that turn's queue; `ExecApproval` may use `approval_id` instead of `item_id`; `Shutdown` clears everything. Notification handling also clears all prompts tied to a completed turn and wipes state on thread close.
+It works like a checklist at a front desk. When the server asks for something interactive, the prompt is added to the checklist. When the user answers, the server says the request is resolved, the turn ends, the thread closes, or the old event is evicted from the buffer, the prompt is crossed off. Later, when the event buffer is turned into a snapshot, this state decides whether each prompt should still be included.
 
-The replay decision itself is `should_replay_snapshot_request`, which returns true only if the corresponding prompt identity is still present in the relevant pending set; noninteractive requests always replay. Helper methods expose whether a thread still has pending approvals or pending user input, and internal cleanup helpers keep the set/map invariants aligned so no stale prompt survives in one index after removal from another. The extensive tests drive this indirectly through `ThreadEventStore`, validating replay retention and removal across outbound answers, server resolutions, turn completion, and thread closure.
+The code tracks several prompt types separately: command approvals, file-change approvals, MCP elicitations, permission requests, and user-input requests. It stores both quick lookup sets and per-turn queues. The per-turn queues matter because some answers identify only the turn, not the exact prompt; in that case the oldest waiting prompt for that turn is removed first. The tests at the bottom prove the important behaviors: pending prompts stay visible, answered prompts vanish, multiple queued prompts are handled in order, and closing a thread clears everything.
 
 #### Function details
 
@@ -1510,11 +1516,11 @@ The replay decision itself is `should_replay_snapshot_request`, which returns tr
 fn new(server_name: String, request_id: AppServerRequestId) -> Self
 ```
 
-**Purpose**: Constructs the composite key used to identify a pending MCP elicitation by both server name and request ID. This avoids ambiguous lookups when replay-filtering elicitation prompts.
+**Purpose**: Builds a small identifier for an MCP elicitation request. It combines the server name with the server request id, because the request id alone is not enough to clearly describe which elicitation is being tracked.
 
-**Data flow**: Consumes a `String` server name and an `AppServerRequestId`, stores them into a new `ElicitationRequestKey`, and returns it. It has no side effects.
+**Data flow**: It receives a server name and a request id. It puts both values into a new key object. The result is used as a stable label for adding, finding, or removing that elicitation from the pending set.
 
-**Call relations**: Used wherever elicitation prompts are inserted, removed, or checked: outbound resolution, inbound request tracking, eviction cleanup, and replay filtering all create this key to address the `elicitation_requests` set consistently.
+**Call relations**: The pending-state code calls this whenever it sees, resolves, evicts, or checks an elicitation request. It gives those flows a shared way to talk about the same prompt.
 
 *Call graph*: called by 4 (note_evicted_server_request, note_outbound_op, note_server_request, should_replay_snapshot_request).
 
@@ -1525,11 +1531,11 @@ fn new(server_name: String, request_id: AppServerRequestId) -> Self
 fn op_can_change_state(op: T) -> bool
 ```
 
-**Purpose**: Reports whether a given outbound app command is one of the command types that can alter pending interactive replay state. It acts as a cheap prefilter before doing full state updates.
+**Purpose**: Quickly answers whether an outgoing app command might change the pending-prompt checklist. This lets higher-level code avoid unnecessary work for commands that cannot resolve or clear prompts.
 
-**Data flow**: Accepts any `T: Into<AppCommand>`, converts it into an `AppCommand`, pattern-matches against the interactive-resolution variants plus `Shutdown`, and returns a boolean. It reads no internal state and writes none.
+**Data flow**: It receives something that can be turned into an AppCommand. It converts it, checks whether it is one of the prompt-resolving or shutdown commands, and returns true or false.
 
-**Call relations**: Called by higher-level buffering logic before deciding whether to route an outbound operation into `note_outbound_op`. It encapsulates the list of command variants that matter to this module.
+**Call relations**: The outer thread event store calls this through its own helper before deciding whether an outgoing operation might affect replay state. It does not change anything itself; it is only a filter.
 
 *Call graph*: called by 1 (op_can_change_pending_replay_state); 2 external calls (into, matches!).
 
@@ -1540,11 +1546,11 @@ fn op_can_change_state(op: T) -> bool
 fn note_outbound_op(&mut self, op: T)
 ```
 
-**Purpose**: Applies the effect of an outbound user/app command that resolves or clears pending interactive prompts. It removes matching entries from all relevant indexes so resolved prompts stop replaying.
+**Purpose**: Updates the pending-prompt checklist after the TUI sends an answer or shutdown command outward. This prevents prompts the user already answered from being replayed later.
 
-**Data flow**: Consumes an operation convertible into `AppCommand`, matches on the concrete variant, and mutates the pending sets, per-turn maps, and `pending_requests_by_request_id`. `ExecApproval` removes by approval ID and optional turn ID; `PatchApproval` and `RequestPermissionsResponse` remove by item ID; `ResolveElicitation` removes the composite elicitation key; `UserInputAnswer` pops the oldest queued call ID for the specified turn and removes that prompt; `Shutdown` calls `clear()`. It returns unit.
+**Data flow**: It receives an outgoing AppCommand. If the command accepts or rejects an approval, resolves an elicitation, answers a permission request, answers a user-input prompt, or shuts down, it removes the matching pending entries. For user-input answers, it removes the oldest queued prompt for that turn because the answer names the turn rather than the exact prompt.
 
-**Call relations**: Invoked by the surrounding thread-event store when outbound operations are recorded. It delegates repeated map cleanup to `remove_call_id_from_turn_map` and `remove_call_id_from_turn_map_entry`, and uses `ElicitationRequestKey::new` for elicitation identity.
+**Call relations**: The surrounding event store calls this when an operation leaves the UI. It uses helper removal functions for per-turn lists, uses ElicitationRequestKey::new for elicitation lookup, and calls clear when shutdown means no pending prompt should remain.
 
 *Call graph*: calls 2 internal fn (new, clear); called by 1 (note_outbound_op); 3 external calls (remove_call_id_from_turn_map, remove_call_id_from_turn_map_entry, into).
 
@@ -1555,11 +1561,11 @@ fn note_outbound_op(&mut self, op: T)
 fn note_server_request(&mut self, request: &ServerRequest)
 ```
 
-**Purpose**: Registers a newly buffered interactive server request as pending. It populates both replay-membership sets and request-ID bookkeeping so later resolutions can remove the prompt accurately.
+**Purpose**: Records a new interactive request from the server as pending. This is how the replay system learns that a prompt should be shown again if the thread view is rebuilt before it is answered.
 
-**Data flow**: Reads a borrowed `ServerRequest`, matches the interactive variants, and inserts identifiers into the corresponding `HashSet`s and per-turn `HashMap<String, Vec<String>>` queues. It also inserts a `PendingInteractiveRequest` enum into `pending_requests_by_request_id`, using `approval_id` when present for command execution approvals and `ElicitationRequestKey::new` for MCP requests. Noninteractive requests are ignored.
+**Data flow**: It receives a ServerRequest. If the request is one of the interactive types, it stores its id in the right lookup set, records it under its turn when applicable, and stores a request-id mapping so a later server resolution can remove it.
 
-**Call relations**: Called by the thread-event store when a request enters the buffer. It is the primary state-ingest path that later cleanup methods rely on.
+**Call relations**: The thread event store calls this when a request is pushed into the event buffer. It creates elicitation keys through ElicitationRequestKey::new and creates PendingInteractiveRequest records so later notifications and outbound answers can find the same prompt.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (push_request); 1 external calls (Elicitation).
 
@@ -1570,11 +1576,11 @@ fn note_server_request(&mut self, request: &ServerRequest)
 fn note_server_notification(&mut self, notification: &ServerNotification)
 ```
 
-**Purpose**: Updates pending prompt state in response to server notifications such as item start, turn completion, request resolution, or thread closure. It removes prompts that are no longer actionable even if no outbound command was observed locally.
+**Purpose**: Updates pending prompts when the server sends a lifecycle notification. It clears prompts that are no longer valid because work started, a turn completed, a request was resolved, or the thread closed.
 
-**Data flow**: Consumes a borrowed `ServerNotification` and mutates internal indexes according to variant. `ItemStarted` removes matching exec/file-change approvals by item ID; `TurnCompleted` clears all prompt categories tied to that turn; `ServerRequestResolved` removes the exact pending request by request ID; `ThreadClosed` clears all state. Other notifications are ignored.
+**Data flow**: It receives a ServerNotification. Depending on the notification type, it removes individual approval ids, clears all prompts tied to a completed turn, removes a request by request id, or clears the entire state.
 
-**Call relations**: Called by the thread-event store when notifications are buffered. It delegates category-specific cleanup to `clear_exec_approval_turn`, `clear_patch_approval_turn`, `clear_request_permissions_turn`, `clear_request_user_input_turn`, `remove_request`, and the generic turn-map removal helper.
+**Call relations**: The event store calls this when a notification is pushed. This function hands off to the turn-clearing helpers, remove_request, clear, and the shared call-id removal helper so all internal lookup tables stay in sync.
 
 *Call graph*: calls 6 internal fn (clear, clear_exec_approval_turn, clear_patch_approval_turn, clear_request_permissions_turn, clear_request_user_input_turn, remove_request); called by 1 (push_notification); 1 external calls (remove_call_id_from_turn_map).
 
@@ -1585,11 +1591,11 @@ fn note_server_notification(&mut self, notification: &ServerNotification)
 fn note_evicted_server_request(&mut self, request: &ServerRequest)
 ```
 
-**Purpose**: Removes pending-state bookkeeping for an interactive request that has been evicted from the bounded event buffer. This prevents replay state from claiming a prompt exists when its source event is no longer retained.
+**Purpose**: Forgets a pending prompt when the original request event falls out of the replay buffer. If the event can no longer be replayed, the pending-state checklist must not keep pointing to it.
 
-**Data flow**: Reads a borrowed `ServerRequest`, removes the corresponding identifiers from the relevant pending sets and per-turn maps, handles FIFO-map cleanup for user-input and permissions requests, and finally prunes `pending_requests_by_request_id` by retaining only entries that do not match the evicted request according to `request_matches_server_request`. It returns unit.
+**Data flow**: It receives the server request being evicted. It removes that request’s identifiers from the relevant sets and per-turn lists, then removes matching request-id records from the pending map.
 
-**Call relations**: Called by the thread-event store when pushing a request or notification causes older buffered requests to be dropped. It uses `ElicitationRequestKey::new` for elicitation removal and `remove_call_id_from_turn_map_entry` where turn-specific deletion is available.
+**Call relations**: The event store calls this when adding new events forces old requests out, and also from notification-related buffer maintenance. It uses ElicitationRequestKey::new and removal helpers to keep all indexes consistent.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (push_notification, push_request); 1 external calls (remove_call_id_from_turn_map_entry).
 
@@ -1600,11 +1606,11 @@ fn note_evicted_server_request(&mut self, request: &ServerRequest)
 fn should_replay_snapshot_request(&self, request: &ServerRequest) -> bool
 ```
 
-**Purpose**: Decides whether a buffered server request should be included when replaying a thread snapshot. Interactive requests replay only if their identity is still marked pending; all other requests replay unconditionally.
+**Purpose**: Decides whether a request from the event buffer should be included in a replay snapshot. For interactive prompts, it says yes only if the prompt is still pending.
 
-**Data flow**: Reads a borrowed `ServerRequest` and checks the appropriate pending set: exec approvals by `approval_id` or fallback `item_id`, patch approvals by `item_id`, elicitation requests by composite key, user-input requests by `item_id`, and permissions approvals by `item_id`. It returns a boolean and mutates nothing.
+**Data flow**: It receives a ServerRequest. For tracked prompt types, it checks the matching pending set; for other request types, it returns true because ordinary requests can be replayed normally.
 
-**Call relations**: Used during snapshot filtering to suppress stale prompts after thread switches. It relies on the state previously maintained by `note_server_request`, `note_outbound_op`, `note_server_notification`, and `note_evicted_server_request`.
+**Call relations**: Snapshot-building code uses this as the final gate before replaying buffered requests. It uses ElicitationRequestKey::new to check MCP elicitations by their combined server-name and request-id key.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -1615,11 +1621,11 @@ fn should_replay_snapshot_request(&self, request: &ServerRequest) -> bool
 fn has_pending_thread_approvals(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current buffered thread still has any unresolved approval-like prompts. User-input prompts are intentionally excluded from this aggregate.
+**Purpose**: Reports whether the current thread has unresolved approval-like prompts. This helps the UI show that a thread still needs user attention.
 
-**Data flow**: Reads the emptiness of `exec_approval_call_ids`, `patch_approval_call_ids`, `elicitation_requests`, and `request_permissions_call_ids`, combines them with OR logic, and returns a boolean. No state changes occur.
+**Data flow**: It reads the sets for command approvals, file-change approvals, elicitations, and permission requests. If any of them is non-empty, it returns true; user-input questions are intentionally not counted here.
 
-**Call relations**: Queried by higher-level UI logic such as thread pending-status indicators. It summarizes several internal collections into one approval-focused signal.
+**Call relations**: Higher-level status helpers call this when building pending-status indicators. It is a read-only view of the state maintained by the request, notification, eviction, and outbound-operation paths.
 
 *Call graph*: called by 2 (has_pending_thread_approvals, side_parent_pending_status).
 
@@ -1630,11 +1636,11 @@ fn has_pending_thread_approvals(&self) -> bool
 fn has_pending_thread_user_input(&self) -> bool
 ```
 
-**Purpose**: Reports whether any unresolved `request_user_input` prompts remain pending for the thread. It is separate from approval status because the UI treats these prompts differently.
+**Purpose**: Reports whether the current thread has unresolved user-input questions. This is separate from approvals because the UI may display or prioritize them differently.
 
-**Data flow**: Checks whether `request_user_input_call_ids` is empty and returns the negated result. It does not mutate state.
+**Data flow**: It checks the set of pending user-input call ids. It returns true if at least one question is still waiting for an answer.
 
-**Call relations**: Used by higher-level pending-status logic alongside `has_pending_thread_approvals` to distinguish user-input prompts from approvals.
+**Call relations**: The side-panel pending-status flow calls this alongside the approval check. It depends on the same bookkeeping updated when requests arrive and answers or resolutions happen.
 
 *Call graph*: called by 1 (side_parent_pending_status).
 
@@ -1645,11 +1651,11 @@ fn has_pending_thread_user_input(&self) -> bool
 fn clear_request_user_input_turn(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Removes all pending user-input prompts associated with a completed or otherwise cleared turn. It keeps both the per-turn queue and global membership set in sync.
+**Purpose**: Removes all pending user-input questions for one completed turn. Once a turn is complete, old unanswered questions from that turn should not be replayed.
 
-**Data flow**: Takes a `turn_id`, removes that turn's queued call IDs from `request_user_input_call_ids_by_turn_id`, deletes each from `request_user_input_call_ids`, and prunes matching `PendingInteractiveRequest::RequestUserInput` entries from `pending_requests_by_request_id`. It returns unit.
+**Data flow**: It receives a turn id. It removes the queued call ids for that turn, deletes those ids from the main user-input set, and drops matching records from the request-id map.
 
-**Call relations**: Called from `note_server_notification` when a turn completes. It is the turn-scoped bulk cleanup path for user-input prompts.
+**Call relations**: note_server_notification calls this when it receives a TurnCompleted notification. It is one of several turn-specific cleanup helpers used to clear stale prompts.
 
 *Call graph*: called by 1 (note_server_notification).
 
@@ -1660,11 +1666,11 @@ fn clear_request_user_input_turn(&mut self, turn_id: &str)
 fn clear_request_permissions_turn(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Clears all pending permissions-approval prompts for a specific turn. This ensures completed turns cannot leave stale permission requests behind.
+**Purpose**: Removes all pending permission requests for one completed turn. This keeps permission prompts from surviving after the turn they belonged to has finished.
 
-**Data flow**: Removes the turn's queued item IDs from `request_permissions_call_ids_by_turn_id`, deletes each from `request_permissions_call_ids`, and retains only nonmatching entries in `pending_requests_by_request_id`. It returns unit.
+**Data flow**: It receives a turn id. It removes all permission request ids stored for that turn, deletes them from the quick lookup set, and removes matching pending request records.
 
-**Call relations**: Invoked by `note_server_notification` on turn completion. It is the permissions counterpart to the other turn-clearing helpers.
+**Call relations**: note_server_notification calls this during turn completion cleanup. It mirrors the other per-turn clear helpers for different prompt types.
 
 *Call graph*: called by 1 (note_server_notification).
 
@@ -1675,11 +1681,11 @@ fn clear_request_permissions_turn(&mut self, turn_id: &str)
 fn clear_exec_approval_turn(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Clears all pending command-execution approvals tied to a given turn. It is used when a turn completes and any remaining approvals should no longer replay.
+**Purpose**: Removes all pending command-execution approvals for one completed turn. A command approval tied to a finished turn is no longer a live prompt.
 
-**Data flow**: Removes the turn's approval IDs from `exec_approval_call_ids_by_turn_id`, deletes them from `exec_approval_call_ids`, and prunes matching `PendingInteractiveRequest::ExecApproval` entries from `pending_requests_by_request_id`. It returns unit.
+**Data flow**: It receives a turn id. It removes the stored command approval ids for that turn, deletes each from the main approval set, and removes matching request-id records.
 
-**Call relations**: Called by `note_server_notification` for `TurnCompleted`. It bulk-removes exec approvals instead of requiring individual resolution events.
+**Call relations**: note_server_notification calls this when the server says a turn completed. It keeps command-approval replay state aligned with turn lifecycle.
 
 *Call graph*: called by 1 (note_server_notification).
 
@@ -1690,11 +1696,11 @@ fn clear_exec_approval_turn(&mut self, turn_id: &str)
 fn clear_patch_approval_turn(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Clears all pending file-change approvals associated with a turn. This prevents stale patch prompts from surviving after turn completion.
+**Purpose**: Removes all pending file-change approvals for one completed turn. This stops old patch approvals from being replayed after their turn ends.
 
-**Data flow**: Removes the turn's item IDs from `patch_approval_call_ids_by_turn_id`, deletes them from `patch_approval_call_ids`, and prunes matching `PendingInteractiveRequest::PatchApproval` entries from `pending_requests_by_request_id`. It returns unit.
+**Data flow**: It receives a turn id. It removes the file-change ids queued under that turn, deletes them from the main patch-approval set, and drops matching pending request records.
 
-**Call relations**: Used by `note_server_notification` when a turn completes. It mirrors the exec-approval turn cleanup for patch approvals.
+**Call relations**: note_server_notification calls this during turn completion handling. It works alongside the command, permission, and user-input turn cleanup helpers.
 
 *Call graph*: called by 1 (note_server_notification).
 
@@ -1708,11 +1714,11 @@ fn remove_call_id_from_turn_map(
     )
 ```
 
-**Purpose**: Deletes a call/item ID from every turn queue in a `HashMap<String, Vec<String>>`, dropping any turn entries that become empty. It is the generic cleanup helper when the turn is not known or not trusted.
+**Purpose**: Removes a prompt id from every per-turn queue in a map. This is useful when the code knows the prompt id but may not know which turn list contains it.
 
-**Data flow**: Mutably borrows a turn-to-call-ID map and a target `call_id`, retains only queued IDs not equal to the target within each vector, and retains only nonempty vectors in the map. It returns unit.
+**Data flow**: It receives a map from turn ids to lists of prompt ids, plus the prompt id to remove. It scans every list, removes that id wherever it appears, and deletes any turn entries left empty.
 
-**Call relations**: Used by outbound and notification cleanup paths for prompt types where removal is keyed by call ID alone. It centralizes the retain-and-prune pattern shared across maps.
+**Call relations**: Several cleanup paths use this helper after item-started notifications or outbound approvals. It is a small internal tool that keeps per-turn queues tidy.
 
 
 ##### `PendingInteractiveReplayState::remove_call_id_from_turn_map_entry`  (lines 451–466)
@@ -1725,11 +1731,11 @@ fn remove_call_id_from_turn_map_entry(
     )
 ```
 
-**Purpose**: Deletes a call/item ID from one known turn queue and removes the turn entry if it becomes empty. It is a more targeted variant of the generic map cleanup helper.
+**Purpose**: Removes a prompt id from one known turn’s queue. This is the faster, more precise version used when both the turn id and prompt id are known.
 
-**Data flow**: Mutably borrows a turn map, a `turn_id`, and a `call_id`; if the turn exists, it retains only queued IDs not equal to the target and then removes the whole turn entry if the vector is empty. It returns unit.
+**Data flow**: It receives a per-turn map, a turn id, and a prompt id. It edits only that turn’s list, removes the prompt id, and removes the whole turn entry if its list becomes empty.
 
-**Call relations**: Called from several precise cleanup paths, including outbound exec approval removal, eviction handling, and request-ID-based removal. It avoids scanning unrelated turns when the owning turn is known.
+**Call relations**: Outbound handling, eviction handling, and remove_request call this when they can identify the exact turn. It helps keep the quick lookup sets and per-turn queues in agreement.
 
 
 ##### `PendingInteractiveReplayState::clear`  (lines 468–479)
@@ -1738,11 +1744,11 @@ fn remove_call_id_from_turn_map_entry(
 fn clear(&mut self)
 ```
 
-**Purpose**: Resets all pending interactive replay state to empty. It is the full teardown path used on shutdown or thread closure.
+**Purpose**: Erases all pending interactive replay state. This is used when the thread is closed or the app shuts down, when no old prompt should remain active.
 
-**Data flow**: Clears every `HashSet`, every per-turn `HashMap`, and `pending_requests_by_request_id`, leaving the struct in its default empty state. It returns unit.
+**Data flow**: It reads no outside data. It clears every set, every per-turn map, and the request-id mapping, leaving the state as if no prompts had ever been recorded.
 
-**Call relations**: Called by `note_outbound_op` for `Shutdown` and by `note_server_notification` for `ThreadClosed`. It is the broadest cleanup operation in the module.
+**Call relations**: note_outbound_op calls this for shutdown, and note_server_notification calls it when a thread closes. It is the full reset path for this file.
 
 *Call graph*: called by 2 (note_outbound_op, note_server_notification).
 
@@ -1753,11 +1759,11 @@ fn clear(&mut self)
 fn remove_request(&mut self, request_id: &AppServerRequestId)
 ```
 
-**Purpose**: Removes one pending interactive request by app-server request ID and cleans up all secondary indexes associated with it. This is the canonical response to `ServerRequestResolved` notifications.
+**Purpose**: Removes one pending prompt by the server’s request id. This handles the case where the server explicitly says a request has been resolved.
 
-**Data flow**: Looks up and removes the `PendingInteractiveRequest` from `pending_requests_by_request_id`; if absent, it returns early. Otherwise it matches the removed enum and deletes the corresponding approval/item/composite key from the relevant pending set and per-turn map using `remove_call_id_from_turn_map_entry` where applicable. It returns unit.
+**Data flow**: It receives a request id. It looks up the stored PendingInteractiveRequest, removes it from the request-id map, then removes the matching id or key from the prompt-specific sets and per-turn queues.
 
-**Call relations**: Called from `note_server_notification` when the server reports a request resolved. It translates request-ID identity back into the concrete prompt identifiers stored in the other indexes.
+**Call relations**: note_server_notification calls this for ServerRequestResolved notifications. It delegates per-turn queue cleanup to remove_call_id_from_turn_map_entry when the prompt type has a turn.
 
 *Call graph*: called by 1 (note_server_notification); 1 external calls (remove_call_id_from_turn_map_entry).
 
@@ -1771,11 +1777,11 @@ fn request_matches_server_request(
     ) -> bool
 ```
 
-**Purpose**: Checks whether an internal `PendingInteractiveRequest` record corresponds to a concrete `ServerRequest`. It is used to prune request-ID bookkeeping when the original buffered request is evicted.
+**Purpose**: Checks whether a stored pending prompt describes the same prompt as a specific server request. This is used when an event is evicted and the code needs to remove its matching pending record.
 
-**Data flow**: Reads a borrowed `PendingInteractiveRequest` and `ServerRequest`, pattern-matches compatible variant pairs, and compares turn IDs plus approval/item IDs or elicitation server/request identity as appropriate. It returns `true` only for an exact semantic match and mutates nothing.
+**Data flow**: It receives a PendingInteractiveRequest and a ServerRequest. It compares the relevant fields for that prompt type, such as turn id, item id, approval id, server name, and request id, then returns true or false.
 
-**Call relations**: Used by `note_evicted_server_request` inside a `retain` call over `pending_requests_by_request_id`. It bridges between the enum stored internally and the protocol request object being removed from the buffer.
+**Call relations**: note_evicted_server_request uses this as a matching test while pruning the request-id map. It centralizes the comparison rules so eviction cleanup removes the right pending entry.
 
 
 ##### `tests::request_user_input_request`  (lines 592–603)
@@ -1784,11 +1790,11 @@ fn request_matches_server_request(
 fn request_user_input_request(call_id: &str, turn_id: &str) -> ServerRequest
 ```
 
-**Purpose**: Builds a `ServerRequest::ToolRequestUserInput` fixture for replay-state tests. It provides a concise way to vary call ID and turn ID.
+**Purpose**: Builds a test server request for a tool asking the user for input. It keeps the tests short and focused on behavior instead of setup details.
 
-**Data flow**: Accepts `call_id` and `turn_id` strings, constructs a `ToolRequestUserInputParams` with fixed thread ID and empty questions, wraps it in `ServerRequest::ToolRequestUserInput` with integer request ID 1, and returns the request. No external state is touched.
+**Data flow**: It receives a call id and turn id. It creates a ToolRequestUserInput server request with those values and fixed test defaults, then returns it.
 
-**Call relations**: Used by multiple tests that verify pending user-input prompts are retained or removed under different resolution paths.
+**Call relations**: Many tests call this helper before pushing a user-input request into the ThreadEventStore. It supplies the event that the pending replay state should track or drop.
 
 *Call graph*: 2 external calls (Integer, new).
 
@@ -1803,11 +1809,11 @@ fn exec_approval_request(
     ) -> ServerRequest
 ```
 
-**Purpose**: Builds a command-execution approval request fixture with optional distinct `approval_id`. It lets tests cover both item-ID and approval-ID resolution semantics.
+**Purpose**: Builds a test server request for approving command execution. It lets tests cover command approval replay without repeating the full request structure each time.
 
-**Data flow**: Consumes a call ID, optional approval ID, and turn ID; constructs `CommandExecutionRequestApprovalParams` with fixed thread ID, command, cwd, and timestamps; wraps them in `ServerRequest::CommandExecutionRequestApproval` with integer request ID 2; and returns the request.
+**Data flow**: It receives a call id, an optional approval id, and a turn id. It creates a CommandExecutionRequestApproval with test defaults such as a sample command and working directory, then returns it.
 
-**Call relations**: Used by tests that validate exec approval replay removal after outbound approval, server resolution, turn completion, and thread closure.
+**Call relations**: Approval-related tests call this helper before pushing requests into the store. The pending replay code then uses its ids to decide whether the approval should remain in snapshots.
 
 *Call graph*: 2 external calls (Integer, test_path_buf).
 
@@ -1818,11 +1824,11 @@ fn exec_approval_request(
 fn patch_approval_request(call_id: &str, turn_id: &str) -> ServerRequest
 ```
 
-**Purpose**: Builds a file-change approval request fixture for tests. It isolates the protocol boilerplate for patch approval scenarios.
+**Purpose**: Builds a test server request for approving a file change. It provides a compact way for tests to create patch approval prompts.
 
-**Data flow**: Accepts a call ID and turn ID, constructs `FileChangeRequestApprovalParams` with fixed thread ID and timestamps, wraps them in `ServerRequest::FileChangeRequestApproval` with integer request ID 3, and returns the request.
+**Data flow**: It receives a call id and turn id. It fills a FileChangeRequestApproval with those values and fixed test defaults, then returns it.
 
-**Call relations**: Used by tests covering patch approval removal and turn-completion cleanup.
+**Call relations**: Patch-approval tests call this helper before pushing the request into the event store. It creates the prompt that later outbound approvals or turn completion should remove.
 
 *Call graph*: 1 external calls (Integer).
 
@@ -1833,11 +1839,11 @@ fn patch_approval_request(call_id: &str, turn_id: &str) -> ServerRequest
 fn elicitation_request(server_name: &str, request_id: &str, turn_id: &str) -> ServerRequest
 ```
 
-**Purpose**: Builds an MCP elicitation request fixture with a string request ID and simple form schema. It supports tests for pending elicitation replay behavior.
+**Purpose**: Builds a test MCP elicitation request, which is a server asking the user for structured information or confirmation. It gives tests a realistic elicitation prompt to track.
 
-**Data flow**: Consumes server name, request ID string, and turn ID; constructs `McpServerElicitationRequestParams` with a form request and empty object schema; wraps them in `ServerRequest::McpServerElicitationRequest` using `AppServerRequestId::String`; and returns the request.
+**Data flow**: It receives a server name, request id, and turn id. It creates a form-style elicitation request with a simple message and empty schema, then returns it.
 
-**Call relations**: Used by the elicitation-resolution test to verify that outbound `ResolveElicitation` removes the prompt from replay.
+**Call relations**: The elicitation resolution test uses this helper to add a pending elicitation to the store. The outbound ResolveElicitation command should then remove it from replay snapshots.
 
 *Call graph*: 2 external calls (String, new).
 
@@ -1848,11 +1854,11 @@ fn elicitation_request(server_name: &str, request_id: &str, turn_id: &str) -> Se
 fn turn_completed(turn_id: &str) -> ServerNotification
 ```
 
-**Purpose**: Builds a `ServerNotification::TurnCompleted` fixture for a given turn. It lets tests trigger bulk cleanup of prompts tied to that turn.
+**Purpose**: Builds a test notification saying a turn has completed. Tests use it to check that prompts tied to a finished turn are cleaned up.
 
-**Data flow**: Accepts a turn ID, constructs a `Turn` with completed status and fixed timing fields, wraps it in `TurnCompletedNotification`, then in `ServerNotification::TurnCompleted`, and returns the notification.
+**Data flow**: It receives a turn id. It creates a TurnCompleted notification with that id and basic completed-turn metadata, then returns it.
 
-**Call relations**: Used by tests that verify pending approvals are dropped when a turn completes.
+**Call relations**: Turn-completion tests push this notification into the store after adding pending prompts. That triggers the production cleanup path in note_server_notification.
 
 *Call graph*: 2 external calls (TurnCompleted, new).
 
@@ -1863,11 +1869,11 @@ fn turn_completed(turn_id: &str) -> ServerNotification
 fn thread_closed() -> ServerNotification
 ```
 
-**Purpose**: Builds a `ServerNotification::ThreadClosed` fixture. It supports tests for full pending-state reset on thread closure.
+**Purpose**: Builds a test notification saying the thread has closed. It lets tests verify that closing a thread clears all pending prompt state.
 
-**Data flow**: Constructs `ThreadClosedNotification` with fixed thread ID, wraps it in `ServerNotification::ThreadClosed`, and returns it. No state is mutated.
+**Data flow**: It takes no input. It returns a ThreadClosed notification for the fixed test thread id.
 
-**Call relations**: Used by the thread-closure test to drive the `clear()` path indirectly through the event store.
+**Call relations**: The thread-close test pushes this notification after adding a pending request. The production notification path should then clear the state.
 
 *Call graph*: 1 external calls (ThreadClosed).
 
@@ -1878,11 +1884,11 @@ fn thread_closed() -> ServerNotification
 fn request_resolved(request_id: AppServerRequestId) -> ServerNotification
 ```
 
-**Purpose**: Builds a `ServerNotification::ServerRequestResolved` fixture for a specific request ID. It is the test helper for request-ID-based cleanup.
+**Purpose**: Builds a test notification saying a specific server request was resolved. Tests use it to simulate the server confirming that a prompt is no longer pending.
 
-**Data flow**: Consumes an `AppServerRequestId`, wraps it in `ServerRequestResolvedNotification` with fixed thread ID, then in `ServerNotification::ServerRequestResolved`, and returns the notification.
+**Data flow**: It receives a request id. It wraps that id in a ServerRequestResolved notification for the fixed test thread and returns it.
 
-**Call relations**: Used by tests that verify server-side resolution removes pending user-input and exec-approval prompts from snapshots.
+**Call relations**: Several tests push this notification after adding a pending request. It exercises remove_request through the normal notification flow.
 
 *Call graph*: 1 external calls (ServerRequestResolved).
 
@@ -1893,11 +1899,11 @@ fn request_resolved(request_id: AppServerRequestId) -> ServerNotification
 fn thread_event_snapshot_keeps_pending_request_user_input()
 ```
 
-**Purpose**: Verifies that an unresolved `request_user_input` prompt remains present in a thread snapshot. This is the baseline retention case for pending interactive replay.
+**Purpose**: Checks that an unanswered user-input request is still present when the thread snapshot is built. This protects the basic rule that live prompts must replay.
 
-**Data flow**: Creates a `ThreadEventStore`, pushes one user-input request fixture, snapshots the store, asserts there is exactly one event, and pattern-matches that it is the expected `ToolRequestUserInput` request with item ID `call-1`.
+**Data flow**: It creates a ThreadEventStore, pushes one user-input request, then asks for a snapshot. It verifies that the snapshot contains that request with the expected item id.
 
-**Call relations**: Run by the test harness to confirm that pending prompts are not over-filtered. It exercises this module indirectly through `ThreadEventStore::push_request` and `snapshot()`.
+**Call relations**: The test uses request_user_input_request to create the event and then relies on the store’s push and snapshot paths to call the pending replay logic.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, assert_eq!, request_user_input_request).
 
@@ -1908,11 +1914,11 @@ fn thread_event_snapshot_keeps_pending_request_user_input()
 fn thread_event_snapshot_drops_resolved_request_user_input_after_user_answer()
 ```
 
-**Purpose**: Checks that answering a user-input prompt via outbound operation removes it from future snapshot replay. It validates the FIFO turn-based removal logic for `UserInputAnswer`.
+**Purpose**: Checks that a user-input prompt disappears from replay after the user answers it. This prevents answered questions from popping up again after a thread switch.
 
-**Data flow**: Creates a store, pushes one user-input request, records an outbound `Op::UserInputAnswer` for the same turn with empty answers, snapshots the store, and asserts the snapshot event list is empty.
+**Data flow**: It creates a store, pushes a user-input request, records an outbound UserInputAnswer for the same turn, then builds a snapshot. It expects the snapshot to be empty.
 
-**Call relations**: Exercises the `note_outbound_op` path indirectly through the event store. It specifically covers the case where the outbound answer identifies only the turn, not the prompt call ID.
+**Call relations**: The test drives the normal outbound-operation path, which calls note_outbound_op and removes the oldest queued user-input prompt for that turn.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, assert!, request_user_input_request).
 
@@ -1923,11 +1929,11 @@ fn thread_event_snapshot_drops_resolved_request_user_input_after_user_answer()
 fn thread_event_snapshot_drops_resolved_request_user_input_after_server_resolution()
 ```
 
-**Purpose**: Verifies that a server-side request-resolution notification removes a pending user-input prompt from replay. This covers cleanup without a local outbound answer.
+**Purpose**: Checks that a user-input prompt disappears when the server says the request was resolved. This covers resolution that comes from the server rather than directly from the local answer path.
 
-**Data flow**: Creates a store, pushes one user-input request, pushes a `ServerRequestResolved` notification for request ID 1, snapshots the store, and asserts no remaining event is a `ToolRequestUserInput` request.
+**Data flow**: It pushes a user-input request, pushes a ServerRequestResolved notification for that request id, then snapshots the store. It verifies no user-input request remains in the replay events.
 
-**Call relations**: Drives the `remove_request` path indirectly via `note_server_notification`. It complements the outbound-answer test with the server-notification resolution path.
+**Call relations**: The test uses request_resolved to exercise note_server_notification and remove_request through the store’s notification path.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (Integer, assert!, request_resolved, request_user_input_request).
 
@@ -1938,11 +1944,11 @@ fn thread_event_snapshot_drops_resolved_request_user_input_after_server_resoluti
 fn thread_event_snapshot_drops_resolved_exec_approval_after_outbound_approval_id()
 ```
 
-**Purpose**: Checks that an exec approval prompt keyed by explicit `approval_id` disappears after the corresponding outbound approval command. It verifies that approval ID, not just item ID, is honored.
+**Purpose**: Checks that a command approval is removed from replay after the UI sends a decision using the approval id. This matters because command approvals can have an approval id separate from the item id.
 
-**Data flow**: Creates a store, pushes an exec approval request with `approval_id = Some("approval-1")`, records an outbound `Op::ExecApproval` using that approval ID and turn ID, snapshots the store, and asserts the snapshot is empty.
+**Data flow**: It pushes a command approval request with approval id "approval-1", sends an outbound ExecApproval decision for that id, then snapshots. It expects no replay events.
 
-**Call relations**: Exercises the exec-approval branch of `note_outbound_op` through the event store. It specifically covers the alternate identifier path where `approval_id` differs from `item_id`.
+**Call relations**: The test uses exec_approval_request and then exercises note_outbound_op through the store. It confirms the production code removes the approval by the correct identifier.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert!, exec_approval_request).
 
@@ -1953,11 +1959,11 @@ fn thread_event_snapshot_drops_resolved_exec_approval_after_outbound_approval_id
 fn thread_event_snapshot_drops_resolved_exec_approval_after_server_resolution()
 ```
 
-**Purpose**: Verifies that a server request-resolution notification removes a pending exec approval prompt from replay. It covers request-ID-based cleanup for command approvals.
+**Purpose**: Checks that a command approval is removed when the server reports the request resolved. This ensures server-side resolution also cleans up approval prompts.
 
-**Data flow**: Creates a store, pushes an exec approval request with explicit approval ID, pushes a `ServerRequestResolved` notification for request ID 2, snapshots the store, and asserts no remaining event is a command-execution approval request.
+**Data flow**: It pushes a command approval request, then pushes a resolved notification for that request id. The snapshot is checked to make sure no command approval request remains.
 
-**Call relations**: Indirectly tests `remove_request` for `PendingInteractiveRequest::ExecApproval`. It complements the outbound-approval test with the server-driven resolution path.
+**Call relations**: The test drives the notification path with request_resolved, which should call remove_request and update the pending replay state.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (Integer, assert!, exec_approval_request, request_resolved).
 
@@ -1968,11 +1974,11 @@ fn thread_event_snapshot_drops_resolved_exec_approval_after_server_resolution()
 fn thread_event_snapshot_drops_answered_request_user_input_for_multi_prompt_turn()
 ```
 
-**Purpose**: Ensures that when multiple user-input prompts occur in the same turn over time, answering one removes only the oldest queued prompt. It validates FIFO semantics across sequential prompt arrival.
+**Purpose**: Checks that when a turn has multiple user-input prompts over time, answering one does not erase a later new prompt. It protects the first-in, first-out behavior for turn-based answers.
 
-**Data flow**: Creates a store, pushes `call-1` for `turn-1`, records one outbound `UserInputAnswer` for that turn, then pushes `call-2` for the same turn, snapshots the store, and asserts exactly one remaining event exists and it is `call-2`.
+**Data flow**: It pushes one user-input prompt, sends an answer for the turn, then pushes a second prompt for the same turn. The snapshot should contain only the second prompt.
 
-**Call relations**: Exercises the queue behavior in `note_outbound_op` indirectly. It proves that answering a turn does not wipe later prompts for that same turn.
+**Call relations**: The test uses request_user_input_request twice and drives the outbound answer path between them. It confirms note_outbound_op removes only the oldest queued prompt.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert!, assert_eq!, request_user_input_request).
 
@@ -1983,11 +1989,11 @@ fn thread_event_snapshot_drops_answered_request_user_input_for_multi_prompt_turn
 fn thread_event_snapshot_keeps_newer_request_user_input_pending_when_same_turn_has_queue()
 ```
 
-**Purpose**: Verifies FIFO removal when multiple user-input prompts are already queued for the same turn before an answer arrives. Only the oldest prompt should be consumed.
+**Purpose**: Checks that if two user-input prompts are already queued for the same turn, one answer removes only the older one. The newer unanswered prompt must still replay.
 
-**Data flow**: Creates a store, pushes `call-1` and `call-2` for the same turn, records one outbound `UserInputAnswer`, snapshots the store, and asserts the only remaining prompt is `call-2`.
+**Data flow**: It pushes two user-input requests for the same turn, sends one UserInputAnswer, then snapshots. It verifies only the second request remains.
 
-**Call relations**: Another indirect test of the turn-queue logic in `note_outbound_op`. It covers the case where multiple prompts are pending simultaneously rather than sequentially.
+**Call relations**: This test directly exercises the per-turn queue behavior inside note_outbound_op. It proves that user-input answers are matched in queue order.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert!, assert_eq!, request_user_input_request).
 
@@ -1998,11 +2004,11 @@ fn thread_event_snapshot_keeps_newer_request_user_input_pending_when_same_turn_h
 fn thread_event_snapshot_drops_resolved_patch_approval_after_outbound_approval()
 ```
 
-**Purpose**: Checks that a file-change approval prompt is removed from replay after the outbound patch approval command is sent. It validates patch approval cleanup.
+**Purpose**: Checks that a file-change approval is removed after the user sends an approval decision. This prevents resolved patch prompts from reappearing.
 
-**Data flow**: Creates a store, pushes one patch approval request, records an outbound `Op::PatchApproval` accepting that item ID, snapshots the store, and asserts the snapshot is empty.
+**Data flow**: It pushes a patch approval request, sends an outbound PatchApproval decision for that id, then snapshots. It expects the snapshot to be empty.
 
-**Call relations**: Indirectly exercises the patch-approval branch of `note_outbound_op` through the event store.
+**Call relations**: The test uses patch_approval_request and then exercises the outbound-operation cleanup path in the pending replay state.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert!, patch_approval_request).
 
@@ -2013,11 +2019,11 @@ fn thread_event_snapshot_drops_resolved_patch_approval_after_outbound_approval()
 fn thread_event_snapshot_drops_pending_approvals_when_turn_completes()
 ```
 
-**Purpose**: Verifies that unresolved exec and patch approvals tied to a turn are dropped once the server reports that turn completed. This ensures stale prompts do not replay after completion.
+**Purpose**: Checks that pending command and file-change approvals are cleared when their turn completes. A finished turn should not keep stale approval prompts alive.
 
-**Data flow**: Creates a store, pushes one exec approval and one patch approval for `turn-1`, pushes a `TurnCompleted` notification for that turn, snapshots the store, and asserts no remaining event is either approval request type.
+**Data flow**: It pushes one command approval and one patch approval for the same turn, then pushes a TurnCompleted notification. The snapshot is checked to ensure neither approval request remains.
 
-**Call relations**: Indirectly tests the turn-clearing helpers invoked by `note_server_notification`. It covers bulk cleanup rather than individual resolution.
+**Call relations**: The test uses turn_completed to drive note_server_notification, which should call the turn cleanup helpers for command and patch approvals.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert!, exec_approval_request, patch_approval_request, turn_completed).
 
@@ -2028,11 +2034,11 @@ fn thread_event_snapshot_drops_pending_approvals_when_turn_completes()
 fn thread_event_snapshot_drops_resolved_elicitation_after_outbound_resolution()
 ```
 
-**Purpose**: Checks that an MCP elicitation prompt is removed from replay after an outbound elicitation resolution command. It validates composite-key cleanup for elicitation requests.
+**Purpose**: Checks that an MCP elicitation prompt is removed after the UI sends a resolution. This prevents already answered server elicitations from replaying.
 
-**Data flow**: Creates a store, pushes one elicitation request, records an outbound `Op::ResolveElicitation` with matching server name and request ID, snapshots the store, and asserts the snapshot is empty.
+**Data flow**: It pushes an elicitation request, sends an outbound ResolveElicitation command with the same server name and request id, then snapshots. It expects no replay events.
 
-**Call relations**: Indirectly exercises the elicitation branch of `note_outbound_op`, including `ElicitationRequestKey` matching.
+**Call relations**: The test uses elicitation_request and drives the outbound-operation path. It confirms elicitation matching uses the combined server name and request id.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (String, assert!, elicitation_request).
 
@@ -2043,11 +2049,11 @@ fn thread_event_snapshot_drops_resolved_elicitation_after_outbound_resolution()
 fn thread_event_store_reports_pending_thread_approvals()
 ```
 
-**Purpose**: Verifies the aggregate approval-status signal exposed by the event store. It confirms that pending exec approvals set the flag and outbound approval clears it.
+**Purpose**: Checks the public pending-approval indicator on the thread event store. It should be false when no approval is waiting, true after an approval request, and false again after the approval is answered.
 
-**Data flow**: Creates a store, asserts `has_pending_thread_approvals()` is initially false, pushes an exec approval request, asserts the flag becomes true, records an outbound `ExecApproval`, and asserts the flag returns to false.
+**Data flow**: It creates a store, reads the pending approval status, pushes a command approval request, reads the status again, then sends an approval decision and reads the status a final time.
 
-**Call relations**: Indirectly tests `PendingInteractiveReplayState::has_pending_thread_approvals` through the store's public API.
+**Call relations**: The test exercises the store-level wrapper around has_pending_thread_approvals while using the normal request and outbound-operation paths to change the state.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, exec_approval_request).
 
@@ -2058,11 +2064,11 @@ fn thread_event_store_reports_pending_thread_approvals()
 fn request_user_input_does_not_count_as_pending_thread_approval()
 ```
 
-**Purpose**: Ensures that `request_user_input` prompts do not contribute to the approval-status aggregate. This preserves the intended distinction between approvals and user-input prompts.
+**Purpose**: Checks that user-input questions are not counted as approval prompts. This keeps the UI from labeling ordinary questions as approvals.
 
-**Data flow**: Creates a store, pushes one user-input request, and asserts `has_pending_thread_approvals()` remains false.
+**Data flow**: It pushes a user-input request into a new store and then checks the pending approval status. The expected result is false.
 
-**Call relations**: Indirectly validates the scope of `has_pending_thread_approvals`, confirming that only approval-like categories are counted.
+**Call relations**: The test uses request_user_input_request and the store-level approval status call. It confirms has_pending_thread_approvals deliberately excludes user-input prompts.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, request_user_input_request).
 
@@ -2073,20 +2079,24 @@ fn request_user_input_does_not_count_as_pending_thread_approval()
 fn thread_event_snapshot_drops_pending_requests_when_thread_closes()
 ```
 
-**Purpose**: Verifies that closing a thread clears pending interactive requests so none replay afterward. It covers the full-state reset path.
+**Purpose**: Checks that closing a thread clears pending requests from replay. Once a thread is closed, no old prompt from it should remain visible.
 
-**Data flow**: Creates a store, pushes one exec approval request, pushes a `ThreadClosed` notification, snapshots the store, and asserts no remaining event is a command-execution approval request.
+**Data flow**: It pushes a command approval request, then pushes a ThreadClosed notification. The snapshot is checked to ensure no command approval request remains.
 
-**Call relations**: Indirectly exercises the `clear()` path triggered by `note_server_notification` on thread closure.
+**Call relations**: The test uses thread_closed to drive the notification path, which should call clear and empty all pending interactive replay state.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, exec_approval_request, thread_closed).
 
 
 ### `tui/src/app/thread_routing.rs`
 
-`orchestration` · `main loop, thread switching, and app-server event routing`
+`orchestration` · `main loop, thread switching, request handling, shutdown`
 
-This is the main orchestration layer for multi-thread behavior. It maintains `thread_event_channels`, the currently active receiver, and the relationship between visible thread state and backend subscriptions. Activation paths move an `mpsc::Receiver<ThreadBufferedEvent>` out of a `ThreadEventChannel`, mark the store active, and later stash the receiver plus captured composer state back into the channel when switching away. Incoming notifications and requests are buffered into each thread's `ThreadEventStore`, optionally forwarded live to the active receiver, and used to refresh badges such as pending approvals and side-parent status. The module also infers session snapshots for newly seen threads from `ThreadStarted` notifications, refreshes incomplete snapshots by calling `resume_thread`, and replays `ThreadEventSnapshot` contents into the chat widget when the user switches threads. On the command side, `submit_thread_op` first tries to resolve pending app-server requests, then dispatches supported `AppCommand` variants to concrete RPCs such as `turn_start`, `turn_steer`, `turn_interrupt`, rollback, review start, shell command execution, and thread settings updates. Several branches contain race recovery: interrupt and steer retry once when the server reports a different active turn than the local cache. The file also defines startup gating helpers, same-thread resume suppression, failover from unexpectedly closed non-primary threads back to the primary thread, and local message-history append/lookup tasks. Overall, it is where thread-local stores, app-server RPCs, and chat-widget replay/rendering are stitched into one coherent event loop.
+The TUI can show and work with more than one conversation thread, such as a main chat plus agent or review threads. This file makes that possible without mixing their messages, approvals, history, or shutdown events. Think of it like a train station switchboard: each thread has its own track, incoming server events are routed onto the right track, and only the currently visible track is played live on screen.
+
+The file creates and stores per-thread event channels, marks one thread as active, saves the user’s input when switching away, and replays buffered messages when switching back. It also turns backend requests, such as command approvals or file-change approvals, into UI prompts the user can answer. When the user submits something, interrupts a turn, rolls back, starts a review, or changes settings, this file decides whether that action resolves a pending server request or must be sent as a new command to the app server.
+
+It also protects important edge cases. If an inactive thread needs approval, the UI can still surface it. If a non-primary agent thread closes unexpectedly, the app tries to return the user to the main thread. If cached session details are incomplete before replay, it refreshes them from the server.
 
 #### Function details
 
@@ -2096,11 +2106,11 @@ This is the main orchestration layer for multi-thread behavior. It maintains `th
 async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession)
 ```
 
-**Purpose**: Unsubscribes the currently displayed thread from the app server and stops its listener task. It also clears any pending rollback guard because thread switching invalidates in-flight backtrack assumptions.
+**Purpose**: Stops listening to the thread currently shown in the chat. This is used when leaving or replacing a thread so the app does not keep receiving live events for something the user is no longer viewing.
 
-**Data flow**: It reads `self.chat_widget.thread_id()`, and if present sets `self.backtrack.pending_rollback = None`, awaits `app_server.thread_unsubscribe(thread_id)`, logs a warning on failure, and then calls `abort_thread_event_listener(thread_id)`. It returns no value.
+**Data flow**: It reads the current thread id from the chat widget. If one exists, it clears any pending rollback state, asks the app server to unsubscribe from that thread, logs a warning if that fails, and then aborts the local listener task for that thread.
 
-**Call relations**: Used during thread switches or teardown. It delegates backend unsubscription to `AppServerSession` and local task cleanup to `abort_thread_event_listener`.
+**Call relations**: When a thread is being shut down from the TUI side, this function coordinates the server unsubscribe and then hands local cleanup to App::abort_thread_event_listener.
 
 *Call graph*: calls 2 internal fn (abort_thread_event_listener, thread_unsubscribe); 1 external calls (warn!).
 
@@ -2111,11 +2121,11 @@ async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession)
 fn abort_thread_event_listener(&mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Stops the background task responsible for listening to one thread's live events. It is a pure local cleanup operation.
+**Purpose**: Cancels the background task that listens for events for one thread. This prevents old listener tasks from continuing to feed events after a thread has been left.
 
-**Data flow**: It removes the join handle for `thread_id` from `self.thread_event_listener_tasks`; if one existed, it calls `abort()` on the handle. No value is returned.
+**Data flow**: It receives a thread id, looks up the listener task stored for that id, removes it from the app’s task map, and aborts it if found. It returns nothing.
 
-**Call relations**: Called by `shutdown_current_thread` and other cleanup paths when a thread should no longer have a live listener.
+**Call relations**: App::shutdown_current_thread calls this after asking the server to unsubscribe, so both remote and local event flow are stopped together.
 
 *Call graph*: called by 1 (shutdown_current_thread).
 
@@ -2126,11 +2136,11 @@ fn abort_thread_event_listener(&mut self, thread_id: ThreadId)
 fn abort_all_thread_event_listeners(&mut self)
 ```
 
-**Purpose**: Aborts every registered thread event listener task. This is the bulk cleanup variant used when the app is tearing down or resetting routing state.
+**Purpose**: Cancels every background thread event listener known to the app. This is useful during broader cleanup, such as app shutdown.
 
-**Data flow**: It drains `self.thread_event_listener_tasks`, iterates over the removed handles, and aborts each one. It mutates only the task map and returns nothing.
+**Data flow**: It drains the map of listener tasks, taking ownership of each task handle, and aborts each one. Afterward, no listener handles remain stored in the app.
 
-**Call relations**: This is a top-level cleanup helper for broader shutdown/reset flows rather than single-thread switching.
+**Call relations**: This is a bulk cleanup helper for the same kind of listener task that App::abort_thread_event_listener cancels one at a time.
 
 
 ##### `App::ensure_thread_channel`  (lines 38–42)
@@ -2139,11 +2149,11 @@ fn abort_all_thread_event_listeners(&mut self)
 fn ensure_thread_channel(&mut self, thread_id: ThreadId) -> &mut ThreadEventChannel
 ```
 
-**Purpose**: Returns the `ThreadEventChannel` for a thread, creating one on demand with the standard capacity. It is the canonical entry point for lazily materializing per-thread routing state.
+**Purpose**: Makes sure a conversation thread has a local event channel and storage area. Without this, incoming events for a thread would have nowhere safe to wait.
 
-**Data flow**: It indexes `self.thread_event_channels` by `thread_id` and inserts `ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY)` if absent, then returns a mutable reference to the channel.
+**Data flow**: It takes a thread id, checks whether a channel already exists for it, and creates a new buffered channel if not. It returns a mutable reference to that channel.
 
-**Call relations**: Called by notification/request/session enqueue paths and review-start handling whenever routing code needs a channel/store for a thread id.
+**Call relations**: Several routing paths call this before adding notifications, requests, history results, primary sessions, or review-thread state, so later code can assume the channel exists.
 
 *Call graph*: called by 5 (enqueue_primary_thread_session, enqueue_thread_history_entry_response, enqueue_thread_notification, enqueue_thread_request, try_submit_active_thread_op_via_app_server).
 
@@ -2154,11 +2164,11 @@ fn ensure_thread_channel(&mut self, thread_id: ThreadId) -> &mut ThreadEventChan
 async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool)
 ```
 
-**Purpose**: Marks a thread store as active or inactive. This flag controls whether buffered events should also be forwarded live through the channel receiver.
+**Purpose**: Marks a thread’s stored event state as active or inactive. The active flag decides whether new buffered events should also be sent immediately to the visible UI receiver.
 
-**Data flow**: It looks up the channel for `thread_id`, locks `channel.store`, and writes `store.active = active` if the channel exists. It returns `()`.
+**Data flow**: It receives a thread id and a true-or-false active value. If that thread has a channel, it locks the thread’s store and updates the active flag.
 
-**Call relations**: Used by activation and deactivation paths around thread switches so enqueue logic knows whether to live-send events.
+**Call relations**: App::activate_thread_channel uses it when a thread becomes visible, and App::clear_active_thread uses it when the current thread is no longer visible.
 
 *Call graph*: called by 2 (activate_thread_channel, clear_active_thread).
 
@@ -2169,11 +2179,11 @@ async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool)
 async fn activate_thread_channel(&mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Promotes a thread channel to be the app's active live receiver. It transfers ownership of the channel receiver into `self.active_thread_rx` and refreshes approval badges.
+**Purpose**: Makes a thread the current live thread, but only if no other thread is already active. It connects the thread’s receiver so the UI can drain live events from it.
 
-**Data flow**: If `self.active_thread_id` is already set, it returns early. Otherwise it marks the thread active via `set_thread_active`, takes the optional receiver out of the channel if present, stores `Some(thread_id)` in `self.active_thread_id`, assigns the receiver to `self.active_thread_rx`, and awaits `refresh_pending_thread_approvals()`.
+**Data flow**: It takes a thread id, returns early if another active thread already exists, marks the requested thread active, moves that thread’s receiver into the app’s active receiver slot, records the active id, and refreshes the pending-approval indicator.
 
-**Call relations**: Called when the primary thread session is first installed and by thread-switch flows elsewhere. It depends on `ensure_thread_channel` having already created the channel.
+**Call relations**: App::enqueue_primary_thread_session calls this when the primary session is first installed. It uses App::set_thread_active and then App::refresh_pending_thread_approvals to keep UI state consistent.
 
 *Call graph*: calls 2 internal fn (refresh_pending_thread_approvals, set_thread_active); called by 1 (enqueue_primary_thread_session).
 
@@ -2184,11 +2194,11 @@ async fn activate_thread_channel(&mut self, thread_id: ThreadId)
 async fn store_active_thread_receiver(&mut self)
 ```
 
-**Purpose**: Detaches the current active receiver and saves it back into the thread channel along with captured composer/input state. This preserves per-thread draft input across thread switches.
+**Purpose**: Parks the current thread’s live receiver back in its channel before switching away. It also saves the draft input state so the user can return without losing what they typed.
 
-**Data flow**: It reads `self.active_thread_id`; if absent it returns. It captures `input_state` from `chat_widget.capture_thread_input_state()`, looks up the active channel, takes `self.active_thread_rx`, locks the store, sets `store.active = false`, stores `store.input_state = input_state`, and if a receiver was taken, puts it back into `channel.receiver`.
+**Data flow**: It reads the active thread id and captures the chat widget’s input state. It then moves the active receiver back into that thread’s channel, marks the store inactive, saves the input state, and leaves the app without an active receiver.
 
-**Call relations**: Used during thread-switch orchestration before another thread is activated, so the old thread can later be replayed with its saved input state.
+**Call relations**: This supports thread switching by preserving the live event pipe and text-entry state before another thread is activated or replayed.
 
 
 ##### `App::activate_thread_for_replay`  (lines 82–92)
@@ -2200,11 +2210,11 @@ async fn activate_thread_for_replay(
     ) -> Option<(mpsc::Receiver<ThreadBufferedEvent>, ThreadEventSnapshot)>
 ```
 
-**Purpose**: Detaches a thread's receiver and returns it together with a replay snapshot, preparing that thread to become visible. Unlike `activate_thread_channel`, it also hands the caller the snapshot needed to rebuild the UI.
+**Purpose**: Prepares a thread to be replayed on screen. It gives the caller both the live receiver and a snapshot of stored past events.
 
-**Data flow**: It looks up the channel for `thread_id`, returns `None` if missing or if the receiver is already absent, locks the store, sets `store.active = true`, computes `store.snapshot()`, and returns `Some((receiver, snapshot))`.
+**Data flow**: It receives a thread id, finds that thread’s channel, takes its receiver, marks its store active, snapshots stored session, turns, buffered events, and input state, and returns the receiver plus snapshot. If anything is missing, it returns nothing.
 
-**Call relations**: Used by thread-switch code that needs both live event delivery and a replayable snapshot before swapping the visible thread.
+**Call relations**: This is used by thread-switching code outside this file before replaying a thread with App::replay_thread_snapshot.
 
 
 ##### `App::clear_active_thread`  (lines 94–100)
@@ -2213,11 +2223,11 @@ async fn activate_thread_for_replay(
 async fn clear_active_thread(&mut self)
 ```
 
-**Purpose**: Clears the app's notion of an active thread and drops the active receiver. It also recomputes pending-approval badges because the active/inactive partition changed.
+**Purpose**: Forgets which thread is currently active. This is used when a live event stream disconnects or a thread switch needs to leave no active thread temporarily.
 
-**Data flow**: If `self.active_thread_id.take()` yields an id, it marks that thread inactive via `set_thread_active`. It then sets `self.active_thread_rx = None` and awaits `refresh_pending_thread_approvals()`. No value is returned.
+**Data flow**: It takes the current active thread id if present, marks that thread inactive, clears the active receiver, and refreshes the pending-approval display.
 
-**Call relations**: Called when a receiver disconnects, rollback handling drains a dead channel, or failover logic cannot keep the current thread active.
+**Call relations**: App::drain_active_thread_events, App::handle_active_thread_event, and App::handle_thread_rollback_response call this when the active receiver is no longer usable or the visible thread must be cleared.
 
 *Call graph*: calls 2 internal fn (refresh_pending_thread_approvals, set_thread_active); called by 3 (drain_active_thread_events, handle_active_thread_event, handle_thread_rollback_response).
 
@@ -2228,11 +2238,11 @@ async fn clear_active_thread(&mut self)
 async fn note_thread_outbound_op(&mut self, thread_id: ThreadId, op: &AppCommand)
 ```
 
-**Purpose**: Records an outbound command against a specific thread's replay store so pending interactive state can be updated. It is a thin wrapper around the store-level bookkeeping.
+**Purpose**: Records that the user sent an operation for a particular thread. This helps the replay buffer know which pending approval or request state may have changed.
 
-**Data flow**: It looks up the channel for `thread_id`; if absent it returns. Otherwise it locks the store and calls `store.note_outbound_op(op)`. It mutates only replay bookkeeping and returns `()`.
+**Data flow**: It receives a thread id and an app command. If the thread channel exists, it locks that thread’s store and lets the store update its outbound-operation bookkeeping.
 
-**Call relations**: Used after successful command submission or request resolution, either directly or via `note_active_thread_outbound_op`.
+**Call relations**: App::submit_thread_op and App::try_resolve_app_server_request call this after successfully sending or resolving commands that can affect pending replay state. App::note_active_thread_outbound_op uses it for the active thread.
 
 *Call graph*: called by 3 (note_active_thread_outbound_op, submit_thread_op, try_resolve_app_server_request).
 
@@ -2243,11 +2253,11 @@ async fn note_thread_outbound_op(&mut self, thread_id: ThreadId, op: &AppCommand
 async fn note_active_thread_outbound_op(&mut self, op: &AppCommand)
 ```
 
-**Purpose**: Conditionally records an outbound command for the currently active thread, but only if that command can affect pending replay state. This avoids unnecessary locking for unrelated commands.
+**Purpose**: Records an outbound operation for the active thread, but only when that operation can affect replayed pending-request state.
 
-**Data flow**: It first checks `ThreadEventStore::op_can_change_pending_replay_state(op)` and returns early if false. It then reads `self.active_thread_id`; if present, it forwards the op to `note_thread_outbound_op(thread_id, op).await`.
+**Data flow**: It receives an app command, first checks whether the command type matters for pending replay state, then reads the active thread id and records the operation for that thread if possible.
 
-**Call relations**: Called by higher-level command paths that operate on the active thread and want replay bookkeeping updated only when relevant.
+**Call relations**: This is a convenience wrapper around App::note_thread_outbound_op. It relies on ThreadEventStore::op_can_change_pending_replay_state to avoid unnecessary bookkeeping.
 
 *Call graph*: calls 2 internal fn (op_can_change_pending_replay_state, note_thread_outbound_op).
 
@@ -2258,11 +2268,11 @@ async fn note_active_thread_outbound_op(&mut self, op: &AppCommand)
 async fn active_turn_id_for_thread(&self, thread_id: ThreadId) -> Option<String>
 ```
 
-**Purpose**: Reads the cached active turn id for a thread from its event store. This supports interrupt and steer decisions without a fresh server read.
+**Purpose**: Looks up the currently running turn for a thread. A turn is one assistant work cycle, and its id is needed for actions like interrupting or steering that work.
 
-**Data flow**: It looks up the channel for `thread_id`, locks the store, calls `store.active_turn_id()`, clones the borrowed id into an owned `String`, and returns `Option<String>`.
+**Data flow**: It receives a thread id, finds the thread channel, locks its store, copies the active turn id if one exists, and returns it.
 
-**Call relations**: Used by `try_submit_active_thread_op_via_app_server` when deciding whether to interrupt/steer an existing turn or start a new one.
+**Call relations**: App::try_submit_active_thread_op_via_app_server calls this before sending interrupt or user-turn steering commands to the app server.
 
 *Call graph*: called by 1 (try_submit_active_thread_op_via_app_server).
 
@@ -2273,11 +2283,11 @@ async fn active_turn_id_for_thread(&self, thread_id: ThreadId) -> Option<String>
 fn thread_label(&self, thread_id: ThreadId) -> String
 ```
 
-**Purpose**: Computes the human-facing label for a thread, using agent metadata when available and falling back to main-thread or short-id labels otherwise. This label is shown in approval prompts and footer context.
+**Purpose**: Builds a human-friendly name for a thread. This keeps prompts and pickers from showing only long internal thread ids.
 
-**Data flow**: It compares `thread_id` to `self.primary_thread_id` to choose a fallback (`Main [default]` or `Agent (<short id>)`), then checks `self.agent_navigation` for metadata. If metadata exists it formats a label with `format_agent_picker_item_name`; if that result is the generic `Agent`, it appends the short id, otherwise it returns the formatted label. If no metadata exists it returns the fallback.
+**Data flow**: It receives a thread id, checks whether it is the primary thread, chooses a fallback label such as main or agent plus a short id, then prefers stored agent nickname or role metadata when available.
 
-**Call relations**: Called when converting server requests into thread-scoped interactive UI requests and when aggregating pending-thread approval labels.
+**Call relations**: App::interactive_request_for_thread_request uses this label when building approval prompts so the user can tell which thread is asking.
 
 *Call graph*: called by 1 (interactive_request_for_thread_request); 3 external calls (format!, chars, to_string).
 
@@ -2288,11 +2298,11 @@ fn thread_label(&self, thread_id: ThreadId) -> String
 fn current_displayed_thread_id(&self) -> Option<ThreadId>
 ```
 
-**Purpose**: Returns the thread whose transcript the user is effectively looking at. It prefers `active_thread_id` but falls back to the chat widget's thread id during transitions.
+**Purpose**: Returns the thread the user is actually looking at. It accounts for short transition moments where the app’s active-thread bookkeeping and the chat widget may briefly disagree.
 
-**Data flow**: It reads `self.active_thread_id` and, if absent, `self.chat_widget.thread_id()`, returning the first `Some(ThreadId)` found. No mutation occurs.
+**Data flow**: It reads the app’s active thread id first. If that is missing, it falls back to the chat widget’s thread id, then returns the result.
 
-**Call relations**: Used by UI synchronization and stale-thread guards in other modules so rendering follows what is actually on screen.
+**Call relations**: App::sync_active_agent_label uses this to make footer labels follow the visible transcript rather than a half-completed switch.
 
 *Call graph*: called by 1 (sync_active_agent_label).
 
@@ -2306,11 +2316,11 @@ fn ignore_same_thread_resume(
     ) -> bool
 ```
 
-**Purpose**: Detects and short-circuits resume requests that target the already active thread. Instead of reattaching, it emits an informational message and reports that the request was ignored.
+**Purpose**: Stops a resume action when the requested session is already being viewed. This avoids doing a pointless reload and gives the user a clear message instead.
 
-**Data flow**: It compares `self.active_thread_id` to `target_session.thread_id`; if they differ it returns false. On a match it adds an info message `Already viewing <display label>.` to the chat widget and returns true.
+**Data flow**: It receives a resume target, compares its thread id with the active thread id, and returns false if they differ. If they match, it adds an informational message to the chat widget and returns true.
 
-**Call relations**: Called by resume orchestration before doing any backend work. Tests in `startup.rs` lock down both the active-thread and inactive-thread-visible cases.
+**Call relations**: Resume-selection code can call this before attempting a switch or reload, using the true result as a signal that the request has already been handled.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2321,11 +2331,11 @@ fn ignore_same_thread_resume(
 fn sync_active_agent_label(&mut self)
 ```
 
-**Purpose**: Updates the footer's active-agent label to match the currently displayed thread and then refreshes related side-thread UI. It hides redundant labels in single-thread situations via `agent_navigation` policy.
+**Purpose**: Updates the footer area with the label for the currently viewed agent thread. It hides unnecessary labeling when there is only one thread.
 
-**Data flow**: It computes a label from `self.agent_navigation.active_agent_label(self.current_displayed_thread_id(), self.primary_thread_id)`, writes that label into `chat_widget.set_active_agent_label`, and then calls `self.sync_side_thread_ui()`. It returns no value.
+**Data flow**: It asks the agent-navigation state for a label using the displayed thread id and primary thread id, sends that label to the chat widget, and then synchronizes side-thread UI state.
 
-**Call relations**: Triggered after local agent-navigation metadata changes, especially from collaboration notifications cached by `cache_collab_receiver_threads_for_notification`.
+**Call relations**: App::cache_collab_receiver_threads_for_notification calls this when new collaboration activity changes what agent label should be shown.
 
 *Call graph*: calls 1 internal fn (current_displayed_thread_id); called by 1 (cache_collab_receiver_threads_for_notification).
 
@@ -2336,11 +2346,11 @@ fn sync_active_agent_label(&mut self)
 async fn thread_cwd(&self, thread_id: ThreadId) -> Option<AbsolutePathBuf>
 ```
 
-**Purpose**: Returns the cached working directory for a thread from its session snapshot. This is used when building approval UIs that need a cwd context.
+**Purpose**: Finds the working directory for a thread. The working directory is the folder that file operations and patches are relative to.
 
-**Data flow**: It looks up the channel for `thread_id`, locks the store, and maps `store.session.as_ref()` to a cloned `cwd`, returning `Option<AbsolutePathBuf>`.
+**Data flow**: It receives a thread id, finds the channel, locks the store, reads the stored session if any, clones its working directory, and returns it.
 
-**Call relations**: Called by `interactive_request_for_thread_request` when constructing patch approval requests.
+**Call relations**: App::interactive_request_for_thread_request uses this when preparing file-change approval prompts, falling back to the global config directory if the thread has no stored session.
 
 *Call graph*: called by 1 (interactive_request_for_thread_request).
 
@@ -2356,11 +2366,11 @@ async fn thread_file_change_changes(
     ) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>>
 ```
 
-**Purpose**: Looks up the file diff associated with a file-change approval request in a thread's store. It is an async wrapper around the store's synchronous search helper.
+**Purpose**: Retrieves the detailed file changes tied to a file-approval request. This lets the UI show what a patch would actually change.
 
-**Data flow**: It finds the channel for `thread_id`, locks the store, calls `store.file_change_changes(turn_id, item_id)`, and returns the resulting optional vector of `FileUpdateChange`s.
+**Data flow**: It receives a thread id, turn id, and item id. It locks the thread store and asks it for the saved file-update changes matching those identifiers, returning the list if found.
 
-**Call relations**: Used only while converting `ServerRequest::FileChangeRequestApproval` into a displayable `ApprovalRequest::ApplyPatch`.
+**Call relations**: App::interactive_request_for_thread_request calls this while converting a backend file-change approval into a user-facing patch approval prompt.
 
 *Call graph*: called by 1 (interactive_request_for_thread_request).
 
@@ -2375,11 +2385,11 @@ async fn interactive_request_for_thread_request(
     ) -> std::io::Result<Option<ThreadInteractiveRequest>>
 ```
 
-**Purpose**: Transforms selected app-server requests into TUI-native interactive request models for approvals, MCP elicitation forms, or app-link views. Unsupported requests return `None`.
+**Purpose**: Converts a raw app-server request into something the TUI can show and ask the user about. It covers approvals for commands, patches, permissions, and external tool elicitation.
 
-**Data flow**: Inputs are a `thread_id` and borrowed `ServerRequest`. It first computes `thread_label = Some(self.thread_label(thread_id))`. For command-exec approvals it builds `ApprovalRequest::Exec`, deriving the approval id, splitting the command string, and synthesizing default decisions when the server omitted them. For file-change approvals it fetches cwd and file changes asynchronously and builds `ApprovalRequest::ApplyPatch`. For MCP elicitation it first tries `AppLinkViewParams::from_url_app_server_request`, then `McpServerElicitationFormRequest::from_app_server_request`, then falls back to a generic approval-style MCP prompt for form requests; URL requests that cannot be rendered are auto-declined by sending a resolve event through `app_event_tx` and returning `None`. For permissions approvals it localizes permissions via `try_into()`, returning an `io::Error` on localization failure, and otherwise builds `ApprovalRequest::Permissions`. Other request variants yield `Ok(None)`.
+**Data flow**: It receives a thread id and server request. It adds a thread label, copies relevant request fields, looks up extra context such as working directory or patch details when needed, and returns a typed interactive request or nothing if the request does not need UI treatment.
 
-**Call relations**: Called when surfacing pending inactive-thread requests and when enqueueing a request for an inactive thread. It bridges raw protocol requests into the chat widget's interactive UI types.
+**Call relations**: App::enqueue_thread_request uses this for inactive threads, and App::surface_pending_inactive_thread_interactive_requests uses it when replaying stored pending requests. It calls App::thread_label, App::thread_cwd, and App::thread_file_change_changes to make prompts understandable.
 
 *Call graph*: calls 5 internal fn (thread_cwd, thread_file_change_changes, thread_label, from_url_app_server_request, from_app_server_request); called by 2 (enqueue_thread_request, surface_pending_inactive_thread_interactive_requests); 3 external calls (AppLink, Approval, McpServerElicitation).
 
@@ -2390,11 +2400,11 @@ async fn interactive_request_for_thread_request(
 fn push_thread_interactive_request(&mut self, request: ThreadInteractiveRequest)
 ```
 
-**Purpose**: Routes a prepared thread-interactive request into the appropriate chat-widget UI surface. Patch approvals also trigger a transcript preview for inactive threads.
+**Purpose**: Places an interactive request into the chat UI. Depending on the request type, it opens an app-link view, shows an approval card, or shows a form-style elicitation request.
 
-**Data flow**: It matches on `ThreadInteractiveRequest`: `AppLink` opens an app-link view, `Approval` first calls `render_inactive_patch_preview(&request)` and then pushes the approval request into the chat widget, and `McpServerElicitation` pushes the elicitation request into the widget. It returns `()`.
+**Data flow**: It receives a prepared interactive request. It may add a patch preview first, then sends the request to the appropriate chat widget method.
 
-**Call relations**: Used after `interactive_request_for_thread_request` succeeds, both for newly arrived inactive-thread requests and for replaying pending inactive requests.
+**Call relations**: App::enqueue_thread_request and App::surface_pending_inactive_thread_interactive_requests call this after converting server requests into user-facing prompts. It delegates patch-preview display to App::render_inactive_patch_preview.
 
 *Call graph*: calls 1 internal fn (render_inactive_patch_preview); called by 2 (enqueue_thread_request, surface_pending_inactive_thread_interactive_requests).
 
@@ -2405,11 +2415,11 @@ fn push_thread_interactive_request(&mut self, request: ThreadInteractiveRequest)
 fn render_inactive_patch_preview(&mut self, request: &ApprovalRequest)
 ```
 
-**Purpose**: Adds a history-cell patch preview when an approval request for an inactive thread includes file changes and a thread label. This gives the user immediate context before opening the approval UI.
+**Purpose**: Adds a patch preview to chat history for an inactive thread’s file-change approval. This gives the user visible context before deciding on the approval.
 
-**Data flow**: It pattern-matches the request; only `ApprovalRequest::ApplyPatch` is relevant. If `thread_label` is `None` or `changes` is empty it returns. Otherwise it creates a patch history cell with `history_cell::new_patch_event(changes.clone(), cwd)` and appends it to chat history via `chat_widget.add_to_history`.
+**Data flow**: It receives an approval request and only continues if it is an apply-patch approval with a thread label and non-empty changes. It creates a patch history cell and appends it to the chat history.
 
-**Call relations**: Called only from `push_thread_interactive_request` before the approval request is shown.
+**Call relations**: App::push_thread_interactive_request calls this before pushing approval requests, so inactive-thread patch approvals are not shown as context-free prompts.
 
 *Call graph*: called by 1 (push_thread_interactive_request); 1 external calls (new_patch_event).
 
@@ -2420,11 +2430,11 @@ fn render_inactive_patch_preview(&mut self, request: &ApprovalRequest)
 async fn pending_inactive_thread_requests(&self) -> Vec<(ThreadId, ServerRequest)>
 ```
 
-**Purpose**: Collects all replayable pending requests from inactive threads. The active thread is excluded because its requests are already handled directly in the visible UI.
+**Purpose**: Collects pending server requests from threads that are not currently active. This lets the app surface important approvals even when the user is viewing another thread.
 
-**Data flow**: It clones `(ThreadId, Arc<Mutex<ThreadEventStore>>)` pairs out of `self.thread_event_channels`, iterates them, skips `self.active_thread_id`, locks each store, calls `store.pending_replay_requests()`, and extends a result vector with `(thread_id, request)` tuples. The vector is returned.
+**Data flow**: It copies thread ids and shared store handles, skips the active thread, locks each remaining store, extracts requests that are pending for replay, and returns them paired with their thread ids.
 
-**Call relations**: Used by `surface_pending_inactive_thread_interactive_requests` to rebuild approval/input prompts for background threads.
+**Call relations**: App::surface_pending_inactive_thread_interactive_requests calls this first, then converts each raw request into UI prompts.
 
 *Call graph*: called by 1 (surface_pending_inactive_thread_interactive_requests); 1 external calls (new).
 
@@ -2437,11 +2447,11 @@ async fn surface_pending_inactive_thread_interactive_requests(
     ) -> Result<()>
 ```
 
-**Purpose**: Pushes all currently pending interactive requests from inactive threads into the visible UI, unless a side-parent thread is already active. This is how background approvals bubble into the main view.
+**Purpose**: Shows pending interactive requests from inactive threads, unless the UI is already focused on a side-parent flow. This keeps important approvals from being hidden in background threads.
 
-**Data flow**: It first checks `self.active_side_parent_thread_id()` and returns `Ok(())` if one exists. Otherwise it awaits `pending_inactive_thread_requests()`, converts each request with `interactive_request_for_thread_request`, and for each `Some(...)` result calls `push_thread_interactive_request`. Errors from request conversion are propagated.
+**Data flow**: It checks whether a side-parent thread is active, then gathers pending inactive requests. For each one, it converts the raw server request into an interactive UI request and pushes it into the chat if applicable.
 
-**Call relations**: Called by higher-level UI refresh flows when the app needs to surface background-thread work. It composes the inactive-request collector, request conversion, and widget insertion.
+**Call relations**: It ties together App::pending_inactive_thread_requests, App::interactive_request_for_thread_request, and App::push_thread_interactive_request.
 
 *Call graph*: calls 3 internal fn (interactive_request_for_thread_request, pending_inactive_thread_requests, push_thread_interactive_request).
 
@@ -2456,11 +2466,11 @@ async fn submit_active_thread_op(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits an `AppCommand` against the currently active thread, or reports that no active thread exists. It is the convenience wrapper used by most UI-originated commands.
+**Purpose**: Submits a user operation for the currently active thread. If no thread is active, it reports that problem in the chat instead of sending a command to nowhere.
 
-**Data flow**: It reads `self.active_thread_id`; if absent it adds an error message to the chat widget and returns `Ok(())`. Otherwise it forwards to `submit_thread_op(app_server, thread_id, op).await` and returns that result.
+**Data flow**: It receives the app server and command, reads the active thread id, and either shows an error or forwards the command and thread id to App::submit_thread_op.
 
-**Call relations**: This is the active-thread entry point above the more general `submit_thread_op`.
+**Call relations**: This is the active-thread entry point for command submission. App::submit_thread_op does the detailed routing work.
 
 *Call graph*: calls 1 internal fn (submit_thread_op).
 
@@ -2476,11 +2486,11 @@ async fn submit_thread_op(
     ) -> Result<()>
 ```
 
-**Purpose**: Logs, resolves, or submits a thread-scoped command and then updates local replay/badge state when appropriate. It is the central command-dispatch wrapper for thread operations.
+**Purpose**: Routes a user command for a specific thread. It first tries to use the command as an answer to a pending server request, then tries to send it as a real app-server operation.
 
-**Data flow**: It takes a target `thread_id` and owned `AppCommand`, logs it via `session_log::log_outbound_op`, then first awaits `try_resolve_app_server_request`; if that returns true, submission is complete. Otherwise it awaits `try_submit_active_thread_op_via_app_server`; if that returns true and the op can change pending replay state, it records the op with `note_thread_outbound_op`, refreshes pending approvals, and refreshes side-parent status. If neither path handled the command, it adds a `Not available in TUI yet for thread ...` error and returns `Ok(())`.
+**Data flow**: It logs the outgoing command, checks whether it resolves a pending request, then checks whether the app server supports this command. On success it updates thread replay bookkeeping and status indicators when needed; on failure it adds an error message to the chat.
 
-**Call relations**: Called by `submit_active_thread_op` and indirectly by many UI actions. It orchestrates request-resolution shortcuts, concrete app-server RPC submission, and local bookkeeping refreshes.
+**Call relations**: App::submit_active_thread_op calls this for the visible thread. It coordinates App::try_resolve_app_server_request, App::try_submit_active_thread_op_via_app_server, App::note_thread_outbound_op, App::refresh_pending_thread_approvals, and App::refresh_side_parent_status_from_store.
 
 *Call graph*: calls 7 internal fn (op_can_change_pending_replay_state, note_thread_outbound_op, refresh_pending_thread_approvals, refresh_side_parent_status_from_store, try_resolve_app_server_request, try_submit_active_thread_op_via_app_server, log_outbound_op); called by 1 (submit_active_thread_op); 1 external calls (format!).
 
@@ -2491,11 +2501,11 @@ async fn submit_thread_op(
 fn append_message_history_entry(&self, thread_id: ThreadId, text: String)
 ```
 
-**Purpose**: Persists a prompt text into the local cross-session message history asynchronously. Failures are logged but do not block the UI.
+**Purpose**: Saves a submitted prompt into the local message history. This makes it available across sessions for later recall.
 
-**Data flow**: It builds a `codex_message_history::HistoryConfig` from the chat widget's codex-home and history config, then spawns a Tokio task that awaits `codex_message_history::append_entry(&text, thread_id, &history_config)`. If that async append fails, the task logs a warning with the thread id and error.
+**Data flow**: It receives a thread id and text, builds history configuration from the chat widget config, then spawns a background task to append the entry. If writing fails, the background task logs a warning.
 
-**Call relations**: Used after user submissions so prompt text can later be recalled independently of server-side thread history.
+**Call relations**: This runs independently of the main UI path so disk history writing does not block the TUI.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (append_entry, spawn, warn!).
 
@@ -2511,11 +2521,11 @@ async fn lookup_message_history_entry(
     ) -> Result<()>
 ```
 
-**Purpose**: Fetches one local message-history entry for a thread and sends the result back into the app event loop. The actual lookup runs off the async runtime's blocking pool.
+**Purpose**: Looks up one local message-history entry for a thread. This supports history navigation, such as asking for an older prompt by offset.
 
-**Data flow**: It constructs a `HistoryConfig`, clones `app_event_tx`, and spawns an async task. That task runs `codex_message_history::lookup(log_id, offset, &history_config)` inside `spawn_blocking`, converts join failure into a warning and `None`, then sends `AppEvent::ThreadHistoryEntryResponse { thread_id, event: HistoryLookupResponse { offset, log_id, entry: entry_opt.map(|e| e.text) } }` through `app_event_tx`. The outer function returns `Ok(())` immediately.
+**Data flow**: It receives a thread id, offset, and log id, builds history configuration, and spawns work that performs the lookup off the main async task. It sends the found text, or no entry, back through the app event channel.
 
-**Call relations**: Called when the UI requests local prompt-history recall. It bridges blocking disk lookup back into the app's event-driven thread routing.
+**Call relations**: The result re-enters the normal event system as AppEvent::ThreadHistoryEntryResponse, which can later be enqueued to the relevant thread.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (spawn, spawn_blocking).
 
@@ -2531,11 +2541,11 @@ async fn try_submit_active_thread_op_via_app_server(
     ) -> Result<bool>
 ```
 
-**Purpose**: Implements the concrete app-server RPC mapping for supported `AppCommand` variants. It contains the detailed control flow for interrupts, turn steering/start, rollback, review creation, settings overrides, and several utility commands.
+**Purpose**: Sends supported thread commands to the app server. It knows how to interrupt, steer or start turns, list skills, compact, rename, roll back, start reviews, clean terminals, run shell commands, reload config, change turn context, and approve guarded actions.
 
-**Data flow**: It matches on `op`. `Interrupt` uses `active_turn_id_for_thread`; if a turn id exists it calls `turn_interrupt`, retrying once when `active_turn_interrupt_race` reports a mismatched active turn, otherwise it falls back to `startup_interrupt`. `UserTurn` first tries to steer an existing active turn with `turn_steer`; non-steerable-turn errors are converted into queueing or an error message, missing-turn races clear the cached active turn and fall through to starting a new turn, and expected-turn mismatches may update the cached active turn and retry once. Starting a new turn computes approvals reviewer and permissions override from config and calls `turn_start`. Other handled variants call their corresponding RPCs: `skills_list`, `thread_compact_start`, `thread_set_name`, `thread_rollback` plus local rollback handling, `review_start` plus creation/updating of a review thread channel's `active_turn_id`, `thread_background_terminals_clean`, `thread_shell_command`, `reload_user_config`, `sync_override_turn_context_settings`, and `thread_approve_guardian_denied_action`. It returns `Ok(true)` when a variant was handled, `Ok(false)` for unsupported commands, or propagates errors for failed RPCs.
+**Data flow**: It receives a thread id and command, matches the command type, gathers any needed local state such as active turn id, permissions, or config, calls the matching app-server method, updates local stores for cases like review or rollback, and returns true if the command was handled.
 
-**Call relations**: This function is called only from `submit_thread_op`. It is the main delegation point from abstract `AppCommand` values to concrete app-server methods and local post-processing.
+**Call relations**: App::submit_thread_op calls this after checking pending request resolution. It uses helpers such as App::active_turn_id_for_thread, App::ensure_thread_channel, App::handle_skills_list_result, and App::handle_thread_rollback_response as needed for individual command types.
 
 *Call graph*: calls 18 internal fn (from_string, active_turn_id_for_thread, ensure_thread_channel, handle_skills_list_result, handle_thread_rollback_response, reload_user_config, review_start, skills_list, startup_interrupt, thread_approve_guardian_denied_action (+8 more)); called by 1 (submit_thread_op); 3 external calls (clone, turn_permissions_override_from_config, unreachable!).
 
@@ -2549,11 +2559,11 @@ fn turn_permissions_override_from_config(
         runtime_permission_profile_override: Option<&PermissionP
 ```
 
-**Purpose**: Determines what permission override, if any, should be sent when starting a turn. It preserves server snapshot settings unless the active profile or a matching runtime override requires an explicit override.
+**Purpose**: Decides what permission information to send when starting a new turn. This protects server-side permission snapshots while still honoring explicit local overrides.
 
-**Data flow**: It takes the current `Config`, an optional `ActivePermissionProfile`, and an optional runtime `PermissionProfile` override. If an active profile exists, it returns `TurnPermissionsOverride::ActiveProfile(active_profile.clone())`. Otherwise it computes the effective permission profile from config, materializes any runtime override against workspace roots, and if that override equals the effective profile returns `LegacySandbox(effective_permission_profile)`; in all other cases it returns `Preserve`.
+**Data flow**: It receives the app config, an optional active permission profile, and an optional runtime override. If an active profile exists, it returns that. If a runtime override matches the effective local profile after workspace-root expansion, it sends the legacy sandbox profile. Otherwise it asks the server to preserve its current permission state.
 
-**Call relations**: Used inside the `UserTurn` branch of `try_submit_active_thread_op_via_app_server` to decide how much permission state to send to the backend.
+**Call relations**: App::try_submit_active_thread_op_via_app_server uses this while starting a user turn. The tests in this file focus on this decision logic.
 
 *Call graph*: 2 external calls (ActiveProfile, LegacySandbox).
 
@@ -2568,11 +2578,11 @@ fn handle_skills_list_result(
     )
 ```
 
-**Purpose**: Normalizes the result of a skills-list RPC into either a successful response handler call or a logged/displayed error. It keeps the command-submission path concise.
+**Purpose**: Processes the result of asking the app server for available skills. It either forwards the successful response or reports the failure to the user.
 
-**Data flow**: It matches on `result: Result<SkillsListResponse>`. On success it forwards the response to `handle_skills_list_response`. On error it logs a warning with `failure_message` and the formatted error, then adds an error message with the same text to the chat widget.
+**Data flow**: It receives a result and failure-message prefix. On success, it calls App::handle_skills_list_response. On error, it logs a warning and adds an error message to the chat widget.
 
-**Call relations**: Called from the `ListSkills` branch of `try_submit_active_thread_op_via_app_server`.
+**Call relations**: App::try_submit_active_thread_op_via_app_server calls this after the skills-list server request completes.
 
 *Call graph*: calls 1 internal fn (handle_skills_list_response); called by 1 (try_submit_active_thread_op_via_app_server); 2 external calls (format!, warn!).
 
@@ -2588,11 +2598,11 @@ async fn try_resolve_app_server_request(
     ) -> Result<bool>
 ```
 
-**Purpose**: Checks whether an outbound command should resolve a pending app-server interactive request instead of being submitted as a normal thread operation. Successful resolutions also update replay bookkeeping and badges.
+**Purpose**: Checks whether a user command is actually an answer to a pending app-server request, such as an approval decision. If so, it sends that answer back to the server.
 
-**Data flow**: It asks `self.pending_app_server_requests.take_resolution(op)` for a resolution, converting any internal error into an eyre error. If there is no resolution it returns `Ok(false)`. Otherwise it awaits `app_server.resolve_server_request(resolution.request_id, resolution.result)`. On success, if the op can change pending replay state, it records the op with `note_thread_outbound_op`, refreshes pending approvals, and refreshes side-parent status, then returns `Ok(true)`. On RPC failure it adds an error message naming the thread and returns `Ok(false)`.
+**Data flow**: It receives the app server, thread id, and command. It asks the pending-request tracker whether the command resolves anything. If yes, it sends the resolution to the server, updates replay and status bookkeeping on success, and shows an error message if the server rejects it.
 
-**Call relations**: This is the first branch inside `submit_thread_op`, allowing approval/input responses to short-circuit normal command submission.
+**Call relations**: App::submit_thread_op calls this before trying to submit the command as a new thread operation. It uses App::note_thread_outbound_op, App::refresh_pending_thread_approvals, and App::refresh_side_parent_status_from_store after successful resolution.
 
 *Call graph*: calls 5 internal fn (op_can_change_pending_replay_state, note_thread_outbound_op, refresh_pending_thread_approvals, refresh_side_parent_status_from_store, resolve_server_request); called by 1 (submit_thread_op); 1 external calls (format!).
 
@@ -2603,11 +2613,11 @@ async fn try_resolve_app_server_request(
 async fn refresh_pending_thread_approvals(&mut self)
 ```
 
-**Purpose**: Recomputes the list of inactive threads that currently have pending approvals and pushes their labels into the chat widget. The active thread and active side-parent thread are excluded.
+**Purpose**: Updates the UI list of background threads that have pending approvals. This gives the user a visible signal that another thread needs attention.
 
-**Data flow**: It captures `side_parent_thread_id`, clones `(ThreadId, Arc<Mutex<ThreadEventStore>>)` pairs from `self.thread_event_channels`, iterates them, skips the active and side-parent threads, locks each store, and collects thread ids whose store reports `has_pending_thread_approvals()`. It sorts those ids by string form, maps them through `thread_label`, and passes the resulting labels to `chat_widget.set_pending_thread_approvals`.
+**Data flow**: It gathers thread stores, skips the active thread and active side-parent thread, checks each store for pending approvals, sorts the thread ids, converts them to display labels, and sends that list to the chat widget.
 
-**Call relations**: Called after activation changes, request/notification enqueueing, and outbound operations that may resolve approvals.
+**Call relations**: This is called after thread activation, clearing, new requests or notifications, command submission, and request resolution so the footer or status area stays current.
 
 *Call graph*: called by 6 (activate_thread_channel, clear_active_thread, enqueue_thread_notification, enqueue_thread_request, submit_thread_op, try_resolve_app_server_request); 1 external calls (new).
 
@@ -2618,11 +2628,11 @@ async fn refresh_pending_thread_approvals(&mut self)
 async fn refresh_side_parent_status_from_store(&mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Synchronizes one thread's side-parent pending status from its event store into the side-thread UI state. It clears the status when no pending input or approval remains.
+**Purpose**: Refreshes the side-parent status indicator from a thread’s stored state. A side-parent status tells the UI whether a related background thread is waiting, working, or needs action.
 
-**Data flow**: It looks up the channel for `thread_id`; if absent it returns. Otherwise it locks the store, reads `store.side_parent_pending_status()`, and then either calls `set_side_parent_status(thread_id, Some(status))` or `clear_side_parent_action_status(thread_id)` depending on whether a status was present.
+**Data flow**: It receives a thread id, locks that thread’s store, asks for its side-parent pending status, and either sets or clears the side-parent status in the app.
 
-**Call relations**: Called after outbound operations and request resolutions that may change pending interactive state for a side thread.
+**Call relations**: App::submit_thread_op and App::try_resolve_app_server_request call this after outbound operations that may change what a side thread is waiting for.
 
 *Call graph*: called by 2 (submit_thread_op, try_resolve_app_server_request).
 
@@ -2637,11 +2647,11 @@ async fn enqueue_thread_notification(
     ) -> Result<()>
 ```
 
-**Purpose**: Buffers a server notification into the target thread store, optionally forwards it live to the active receiver, updates cached session/settings metadata, and refreshes approval/side-parent UI state. It is the main ingress path for thread notifications.
+**Purpose**: Routes a server notification into the correct thread’s buffer and, if that thread is active, into its live event channel. Notifications are backend updates such as turn started, token usage changed, settings changed, or thread closed.
 
-**Data flow**: It first drops `ThreadSettingsUpdated` notifications for unknown non-primary threads once a primary thread exists, avoiding spurious channel creation. For settings updates it applies the settings to cached session state. It then tries to infer a session snapshot from the notification, ensures a thread channel, clones the sender and store, locks the store to install inferred session if missing, pushes the notification into the store, and captures `(guard.active, guard.side_parent_pending_status())`. If the thread is active it tries `sender.try_send(Notification(notification))`, falling back to a spawned async `send` on full channels and logging on closed channels. Finally it updates side-parent status either from pending status or from `SideParentStatusChange::for_notification`, refreshes pending approvals, and returns `Ok(())`.
+**Data flow**: It receives a thread id and notification. It may ignore irrelevant settings updates, applies settings to cached session state, infers session state from thread-start notifications, ensures a channel exists, stores the notification, sends it live if the thread is active, updates side-parent status, and refreshes pending-approval indicators.
 
-**Call relations**: Called by primary-thread enqueue wrappers and by startup/session replay flows. It composes session inference, store buffering, live delivery, and UI badge maintenance.
+**Call relations**: App::enqueue_primary_thread_notification and App::enqueue_primary_thread_session call this for primary-thread events. It uses App::ensure_thread_channel, App::infer_session_for_thread_notification, and App::refresh_pending_thread_approvals.
 
 *Call graph*: calls 4 internal fn (for_notification, ensure_thread_channel, infer_session_for_thread_notification, refresh_pending_thread_approvals); called by 2 (enqueue_primary_thread_notification, enqueue_primary_thread_session); 6 external calls (clone, clone, matches!, spawn, warn!, Notification).
 
@@ -2655,11 +2665,11 @@ fn cache_collab_receiver_threads_for_notification(
     )
 ```
 
-**Purpose**: Locally records thread ids referenced by collaboration notifications so the agent picker and footer can mention them without blocking on backend reads. It also records sub-agent activity summaries when available.
+**Purpose**: Locally remembers agent threads mentioned by collaboration notifications. This lets the picker and footer show those threads quickly without waiting for extra server reads.
 
-**Data flow**: It first checks whether the notification contains sub-agent activity display data; if so it records that activity in `agent_navigation`, calls `sync_active_agent_label`, and returns. Otherwise it extracts receiver thread ids, skips any marked not-found, parses each id with `ThreadId::from_string`, logs and skips invalid ids, ignores ids already present in `agent_navigation`, and inserts missing ones via `upsert_agent_picker_thread(..., is_closed = false)`.
+**Data flow**: It receives a notification, first checks for a displayable sub-agent activity item and records it if present. Otherwise it extracts receiver thread ids, skips missing or invalid ones, and creates placeholder agent-picker entries for new valid threads.
 
-**Call relations**: Called from `handle_thread_event_now` before the notification is rendered, so local navigation metadata stays ahead of or in sync with visible collaboration events.
+**Call relations**: App::handle_thread_event_now calls this before rendering live notifications, so navigation metadata is updated as collaboration events arrive. It calls App::sync_active_agent_label when activity changes the visible label.
 
 *Call graph*: calls 2 internal fn (from_string, sync_active_agent_label); called by 1 (handle_thread_event_now); 1 external calls (warn!).
 
@@ -2674,11 +2684,11 @@ async fn infer_session_for_thread_notification(
     ) -> Option<ThreadSessionState>
 ```
 
-**Purpose**: Synthesizes a `ThreadSessionState` for a newly seen thread from a `ThreadStarted` notification plus the primary session template. This avoids an immediate backend read on the hot notification path.
+**Purpose**: Builds session state from a thread-started notification when the app has enough primary-session information to clone from. This fills in metadata for newly discovered agent or review threads.
 
-**Data flow**: It returns `None` unless the notification is `ServerNotification::ThreadStarted` and `self.primary_session_configured` exists. Starting from a clone of the primary session, it rewrites `thread_id`, `thread_name`, `model_provider_id`, cwd/workspace-root retargeting, and `rollout_path`; it then tries `read_session_model(self.state_db.as_deref(), thread_id, rollout_path.as_deref()).await` to fill `session.model`, clearing the model if a rollout path exists but no model is found. It clears `message_history`, updates agent-navigation metadata from the notification, and returns `Some(session)`.
+**Data flow**: It receives a thread id and notification, returns nothing unless the notification says a thread started, clones the primary session configuration, replaces thread-specific fields such as id, name, provider, working directory, model, and rollout path, updates the agent picker, and returns the new session state.
 
-**Call relations**: Used by `enqueue_thread_notification` so a thread can have a minimally useful session snapshot before any explicit resume/read call.
+**Call relations**: App::enqueue_thread_notification calls this before storing notifications so a thread’s store can gain session context as soon as the server announces the thread.
 
 *Call graph*: calls 1 internal fn (read_session_model); called by 1 (enqueue_thread_notification).
 
@@ -2693,11 +2703,11 @@ async fn enqueue_thread_request(
     ) -> Result<()>
 ```
 
-**Purpose**: Buffers a server request into the target thread store, optionally forwards it live, and may immediately surface an interactive UI prompt when the request belongs to an inactive thread. It also updates side-parent and approval badges.
+**Purpose**: Routes a server request into the correct thread’s buffer and optionally shows it immediately. Requests are things that expect a user answer, such as approvals.
 
-**Data flow**: If the target thread is inactive, it first tries to convert the request into a `ThreadInteractiveRequest` via `interactive_request_for_thread_request`. It then ensures a channel, clones sender/store, locks the store to `push_request(request.clone())`, and captures `(guard.active, guard.side_parent_pending_status())`. If active, it tries to send `ThreadBufferedEvent::Request` through the channel with the same full/closed fallback behavior as notifications. If inactive and no side-parent thread is active, it pushes any converted interactive request directly into the UI. It then sets side-parent status from either the store-derived pending status or `SideParentStatus::for_request(&request)`, refreshes pending approvals, and returns `Ok(())`.
+**Data flow**: It receives a thread id and request. If the thread is inactive, it tries to build a user-facing interactive request first. It then stores the raw request, sends it live if the thread is active, otherwise may push the interactive prompt into the current UI, updates side-parent status, and refreshes pending approvals.
 
-**Call relations**: Called by primary-thread request wrappers and replay/session setup. It is the request-side counterpart to `enqueue_thread_notification`.
+**Call relations**: App::enqueue_primary_thread_request and App::enqueue_primary_thread_session call this for primary-thread requests. It relies on App::interactive_request_for_thread_request, App::push_thread_interactive_request, App::ensure_thread_channel, and App::refresh_pending_thread_approvals.
 
 *Call graph*: calls 5 internal fn (for_request, ensure_thread_channel, interactive_request_for_thread_request, push_thread_interactive_request, refresh_pending_thread_approvals); called by 2 (enqueue_primary_thread_request, enqueue_primary_thread_session); 5 external calls (clone, clone, spawn, warn!, Request).
 
@@ -2712,11 +2722,11 @@ async fn enqueue_thread_history_entry_response(
     ) -> Result<()>
 ```
 
-**Purpose**: Buffers a local message-history lookup response into a thread and forwards it live if that thread is active. It uses the same bounded-buffer eviction semantics as other thread events.
+**Purpose**: Routes a message-history lookup result into a thread’s buffer and live channel if active. This keeps history navigation responses tied to the thread that requested them.
 
-**Data flow**: It ensures a channel, clones sender/store, locks the store, pushes `ThreadBufferedEvent::HistoryEntryResponse(event.clone())` onto `guard.buffer`, evicts the oldest event if over capacity, and if the evicted event was a request informs `pending_interactive_replay.note_evicted_server_request`. It records whether the store is active, then if active tries to send the history-response event through the channel with full/closed fallback logging. It returns `Ok(())`.
+**Data flow**: It receives a thread id and history response, ensures the thread channel exists, appends the response to the store buffer, evicts old buffered events if over capacity, records any evicted pending request, and sends the response live if the thread is active.
 
-**Call relations**: Called when asynchronous local history lookups complete and by primary-thread session setup when draining pending primary events.
+**Call relations**: App::enqueue_primary_thread_session calls this when replaying pending primary events that arrived before the primary thread was fully set up.
 
 *Call graph*: calls 1 internal fn (ensure_thread_channel); called by 1 (enqueue_primary_thread_session); 5 external calls (clone, spawn, warn!, HistoryEntryResponse, clone).
 
@@ -2731,11 +2741,11 @@ async fn enqueue_primary_thread_session(
     ) -> Result<()>
 ```
 
-**Purpose**: Installs the primary thread session and initial turns, activates its channel, replays history into the chat widget, and drains any notifications/requests that arrived before the primary thread was configured. This is the key startup attachment path.
+**Purpose**: Installs the primary thread session and replays its saved turns into the UI. This is the point where the main conversation becomes known and visible.
 
-**Data flow**: It takes a `ThreadSessionState` and `Vec<Turn>`, stores `primary_thread_id` and `primary_session_configured`, upserts the primary thread into agent navigation, ensures a channel, locks its store to `set_session(session.clone(), turns.clone())`, activates the channel, suppresses initial user-message submission, and hands the session to `chat_widget.handle_thread_session`. If there are turns, it emits begin/end replay-buffer app events around `chat_widget.replay_thread_turns(turns, ReplayKind::ResumeInitialMessages)`. It then drains `self.pending_primary_events` and re-enqueues each buffered notification, request, history response, or feedback event through the normal per-thread enqueue functions. Finally it unsuppresses initial submission and asks the chat widget to submit any pending initial user message.
+**Data flow**: It receives session state and past turns, records the primary thread id and configured session, updates the agent picker, stores the session and turns, activates the thread channel, suppresses premature initial-message sending, renders the session and turn history, drains pending primary events into the normal per-thread routes, then re-enables initial-message submission.
 
-**Call relations**: Called during startup once the primary thread is known. It ties together channel activation, transcript replay, and deferred-event draining.
+**Call relations**: This function calls App::ensure_thread_channel, App::activate_thread_channel, App::enqueue_thread_notification, App::enqueue_thread_request, and App::enqueue_thread_history_entry_response to move from startup buffering into normal thread routing.
 
 *Call graph*: calls 5 internal fn (activate_thread_channel, enqueue_thread_history_entry_response, enqueue_thread_notification, enqueue_thread_request, ensure_thread_channel); 2 external calls (take, clone).
 
@@ -2749,11 +2759,11 @@ async fn enqueue_primary_thread_notification(
     ) -> Result<()>
 ```
 
-**Purpose**: Routes a notification to the primary thread if it exists, or buffers it in `pending_primary_events` until startup finishes configuring the primary thread. This prevents early notifications from being lost.
+**Purpose**: Accepts a notification for the primary thread even before the primary thread id is known. This prevents early backend notifications from being lost during startup.
 
-**Data flow**: If `self.primary_thread_id` is `Some(thread_id)`, it forwards to `enqueue_thread_notification(thread_id, notification).await`. Otherwise it pushes `ThreadBufferedEvent::Notification(notification)` onto `self.pending_primary_events` and returns `Ok(())`.
+**Data flow**: It receives a notification. If the primary thread id exists, it routes the notification normally; otherwise it stores it in a pending primary-events queue.
 
-**Call relations**: Used by startup-time event ingestion before `enqueue_primary_thread_session` has attached the primary thread.
+**Call relations**: Once App::enqueue_primary_thread_session establishes the primary thread, it drains these pending events through App::enqueue_thread_notification.
 
 *Call graph*: calls 1 internal fn (enqueue_thread_notification); 1 external calls (Notification).
 
@@ -2767,11 +2777,11 @@ async fn enqueue_primary_thread_request(
     ) -> Result<()>
 ```
 
-**Purpose**: Routes a request to the primary thread if configured, or buffers it until the primary thread session is installed. It is the request-side startup buffer.
+**Purpose**: Accepts a request for the primary thread even before the primary thread id is known. This preserves early approvals or prompts that arrive during startup.
 
-**Data flow**: If `self.primary_thread_id` exists it forwards to `enqueue_thread_request(thread_id, request).await`; otherwise it pushes `ThreadBufferedEvent::Request(request)` into `self.pending_primary_events` and returns `Ok(())`.
+**Data flow**: It receives a request. If the primary thread id exists, it routes the request normally; otherwise it stores it in the pending primary-events queue.
 
-**Call relations**: Paired with `enqueue_primary_thread_notification` for startup buffering of primary-thread requests.
+**Call relations**: App::enqueue_primary_thread_session later drains the queued request through App::enqueue_thread_request.
 
 *Call graph*: calls 1 internal fn (enqueue_thread_request); 1 external calls (Request).
 
@@ -2787,11 +2797,11 @@ async fn refresh_snapshot_session_if_needed(
         snapshot: &mut ThreadEvent
 ```
 
-**Purpose**: Refreshes a thread snapshot from the app server before replay when the cached snapshot is incomplete and the thread is not replay-only. This fills in missing model/path data for inferred sessions.
+**Purpose**: Refreshes incomplete thread session details before replaying a snapshot. This helps avoid showing stale or missing model and rollout information after switching threads.
 
-**Data flow**: It checks `should_refresh_snapshot_session(thread_id, is_replay_only, snapshot)` and returns early if false. Otherwise it awaits `app_server.resume_thread(self.config.clone(), thread_id)`. On success it calls `apply_refreshed_snapshot_thread(thread_id, started, snapshot).await`; on failure it logs a warning with the thread id and error.
+**Data flow**: It receives the app server, thread id, a replay-only flag, and a mutable snapshot. If App::should_refresh_snapshot_session says refresh is needed, it asks the server to resume the thread and applies the fresh session and turns to the snapshot; failures are logged but do not stop the UI.
 
-**Call relations**: Used during thread-switch replay preparation. It delegates the decision to `should_refresh_snapshot_session` and the state update to `apply_refreshed_snapshot_thread`.
+**Call relations**: It coordinates App::should_refresh_snapshot_session, the server resume call, and App::apply_refreshed_snapshot_thread before the snapshot is replayed elsewhere.
 
 *Call graph*: calls 3 internal fn (apply_refreshed_snapshot_thread, should_refresh_snapshot_session, resume_thread); 1 external calls (warn!).
 
@@ -2807,11 +2817,11 @@ fn should_refresh_snapshot_session(
     ) -> bool
 ```
 
-**Purpose**: Decides whether a replay snapshot is incomplete enough to justify a backend refresh. Replay-only channels and side threads are intentionally excluded.
+**Purpose**: Decides whether a thread snapshot’s session data is too incomplete to replay as-is. It avoids unnecessary server calls for replay-only work or side threads.
 
-**Data flow**: It returns true only when `is_replay_only` is false, the thread id is not present in `self.side_threads`, and `snapshot.session` is absent or has an empty/whitespace model or missing `rollout_path`. It reads state only and does not mutate anything.
+**Data flow**: It receives a thread id, replay-only flag, and snapshot. It returns true only when this is not replay-only, the thread is not a side thread, and the snapshot has no session or lacks important fields such as model or rollout path.
 
-**Call relations**: Called by `refresh_snapshot_session_if_needed` before issuing a potentially expensive `resume_thread` RPC.
+**Call relations**: App::refresh_snapshot_session_if_needed calls this before contacting the app server.
 
 *Call graph*: called by 1 (refresh_snapshot_session_if_needed).
 
@@ -2827,11 +2837,11 @@ async fn apply_refreshed_snapshot_thread(
     )
 ```
 
-**Purpose**: Applies a freshly resumed thread snapshot to both the persistent store and the in-flight replay snapshot. It also prunes buffered events that should not survive the refresh.
+**Purpose**: Applies freshly fetched session and turn data to both the stored thread channel and the snapshot about to be replayed.
 
-**Data flow**: It destructures `AppServerStartedThread` into `session` and `turns`. If a channel exists for `thread_id`, it locks the store, calls `store.set_session(session.clone(), turns.clone())`, and then `store.rebase_buffer_after_session_refresh()`. It writes `snapshot.session = Some(session)`, `snapshot.turns = turns`, and retains only `ThreadEventStore::event_survives_session_refresh` in `snapshot.events`.
+**Data flow**: It receives a thread id, server-started-thread data, and a mutable snapshot. It updates the thread store if present, rebases the buffered events after the session refresh, writes the fresh session and turns into the snapshot, and removes snapshot events that should not survive the refresh.
 
-**Call relations**: Called only from `refresh_snapshot_session_if_needed` after a successful backend refresh.
+**Call relations**: App::refresh_snapshot_session_if_needed calls this after a successful server resume.
 
 *Call graph*: called by 1 (refresh_snapshot_session_if_needed).
 
@@ -2842,11 +2852,11 @@ async fn apply_refreshed_snapshot_thread(
 async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()>
 ```
 
-**Purpose**: Non-blockingly drains all currently queued live events from the active thread receiver and applies them immediately. If the receiver has disconnected, it clears the active thread.
+**Purpose**: Pulls all currently available live events from the active thread receiver and renders them immediately. This is part of the TUI’s main event loop.
 
-**Data flow**: It takes `self.active_thread_rx`, returning early if absent. It loops on `rx.try_recv()`: each event is passed to `handle_thread_event_now`, `Empty` breaks, and `Disconnected` marks a flag. If not disconnected it stores the receiver back into `self.active_thread_rx`; otherwise it awaits `clear_active_thread()`. If `self.backtrack_render_pending` is true it schedules a frame via `tui.frame_requester().schedule_frame()`. It returns `Ok(())`.
+**Data flow**: It takes the active receiver if present, repeatedly reads events without waiting, sends each to App::handle_thread_event_now, restores the receiver if still connected, or clears the active thread if disconnected. It also schedules a redraw when backtrack rendering is pending.
 
-**Call relations**: Called from the main event loop to process live thread traffic without awaiting on the channel.
+**Call relations**: This is the fast path for normal live event handling. It calls App::handle_thread_event_now for each event and App::clear_active_thread if the channel has closed.
 
 *Call graph*: calls 2 internal fn (clear_active_thread, handle_thread_event_now); 1 external calls (frame_requester).
 
@@ -2860,11 +2870,11 @@ fn active_non_primary_shutdown_target(
     ) -> Option<(ThreadId, ThreadId)>
 ```
 
-**Purpose**: Determines whether a `ThreadClosed` notification from the active thread should trigger failover back to the primary thread. User-requested shutdown completions are explicitly excluded.
+**Purpose**: Detects when the currently active non-primary thread has closed unexpectedly and the app should try to switch back to the primary thread.
 
-**Data flow**: It returns `None` unless the notification is `ServerNotification::ThreadClosed`, both `active_thread_id` and `primary_thread_id` are set, the active thread is not `pending_shutdown_exit_thread_id`, and the active thread differs from the primary. In the eligible case it returns `Some((active_thread_id, primary_thread_id))`.
+**Data flow**: It receives a notification and checks that it is a thread-closed notification, that there is an active and primary thread, that the active thread is not the one intentionally shutting down for exit, and that active differs from primary. It returns the closed active id and primary id when failover is needed.
 
-**Call relations**: Used by `handle_active_thread_event` before normal event handling so unexpected side-thread death can be handled as a routing transition.
+**Call relations**: App::handle_active_thread_event calls this before normal event handling so unexpected agent-thread deaths can trigger failover instead of simply rendering a close event.
 
 *Call graph*: called by 1 (handle_active_thread_event); 1 external calls (matches!).
 
@@ -2879,11 +2889,11 @@ fn replay_thread_snapshot(
     )
 ```
 
-**Purpose**: Rebuilds the visible chat state from a `ThreadEventSnapshot`, including session metadata, turns, buffered events, and saved input state. It suppresses noisy notices when replay contains pending interactive requests.
+**Purpose**: Rebuilds the chat screen from a stored thread snapshot when the user switches threads. It restores session info, input text, past turns, and buffered events.
 
-**Data flow**: It refreshes MCP startup expectations, decides whether to emit begin/end replay-buffer app events based on whether turns or events exist, and computes `suppress_replay_notices` from `replay_filter::snapshot_has_pending_interactive_request(&snapshot)`. If a session exists, it routes it to `handle_side_thread_session`, `handle_thread_session_quiet`, or `handle_thread_session` depending on side-thread membership and suppression mode. It suppresses queue autosend, restores saved input state, replays turns with `ReplayKind::ThreadSnapshot`, iterates buffered events and skips notice events when suppression is active, forwarding the rest to `handle_thread_event_replay`. It then ends buffering, unsuppresses autosend and initial submission, submits any pending initial message, optionally sends the next queued input, and refreshes the status line.
+**Data flow**: It receives a snapshot and a flag saying whether to resume the restored input queue. It may mark replay buffering, restores session and input state, replays turns, replays buffered events while optionally hiding duplicate notices, ends buffering, re-enables queued input behavior, optionally sends the next queued input, and refreshes the status line.
 
-**Call relations**: Called during thread switches after a snapshot has been prepared, and works in tandem with `activate_thread_for_replay` and optional snapshot refresh.
+**Call relations**: Thread-switching code prepares snapshots with functions such as App::activate_thread_for_replay, and this function renders them by calling App::handle_thread_event_replay for each stored event.
 
 *Call graph*: calls 3 internal fn (event_is_notice, snapshot_has_pending_interactive_request, handle_thread_event_replay).
 
@@ -2894,11 +2904,11 @@ fn replay_thread_snapshot(
 fn should_wait_for_initial_session(session_selection: &SessionSelection) -> bool
 ```
 
-**Purpose**: Defines which startup session selections require the app to wait for primary-session configuration before processing active-thread events. Only fresh-start and exit selections are gated.
+**Purpose**: Decides whether startup should wait for the initial session to be configured. Fresh starts and exits need that wait state; resumed sessions do not follow the same path.
 
-**Data flow**: It pattern-matches `session_selection` and returns true for `SessionSelection::StartFresh` or `SessionSelection::Exit`, false otherwise.
+**Data flow**: It receives the session selection and returns true for start-fresh or exit selections, false otherwise.
 
-**Call relations**: Used by startup orchestration and covered by dedicated tests in `tests/startup.rs`.
+**Call relations**: Startup orchestration code can use this small decision helper to control when active thread events are allowed to be processed.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -2913,11 +2923,11 @@ fn should_prompt_for_paused_goal_after_startup_resume(
     ) -> bool
 ```
 
-**Purpose**: Determines whether startup resume should trigger a paused-goal prompt. The prompt is reserved for quiet resumes with no initial prompt text and no startup images.
+**Purpose**: Decides whether to ask the user about a paused goal after resuming a session. It only does so when there is no new prompt text or image input already supplied.
 
-**Data flow**: It returns true only when `session_selection` matches `SessionSelection::Resume(_)`, `initial_prompt.is_none()`, and `initial_images.is_empty()`. It reads inputs only.
+**Data flow**: It receives the session selection, optional initial prompt, and initial image paths. It returns true only for resume selections with no prompt and no images.
 
-**Call relations**: Consulted by startup/resume flow before calling `maybe_prompt_resume_paused_goal_after_resume`; tests in `startup.rs` define the exact gate.
+**Call relations**: Startup resume flow can call this to avoid prompting when the user already provided new input.
 
 *Call graph*: 2 external calls (is_empty, matches!).
 
@@ -2931,11 +2941,11 @@ fn should_handle_active_thread_events(
     ) -> bool
 ```
 
-**Purpose**: Combines startup waiting state and receiver presence into the final decision about whether active-thread events may be drained. It is a tiny but explicit startup gate.
+**Purpose**: Decides whether live active-thread events should be processed right now. It prevents event handling while startup is still waiting for the initial session setup.
 
-**Data flow**: It returns `has_active_thread_receiver && !waiting_for_initial_session_configured`. No state is read beyond the arguments.
+**Data flow**: It receives whether startup is waiting and whether an active receiver exists. It returns true only when a receiver exists and startup is not waiting.
 
-**Call relations**: Used by startup event-loop logic and validated by startup tests.
+**Call relations**: The main loop can use this as a clear gate before draining or handling active-thread events.
 
 
 ##### `App::should_stop_waiting_for_initial_session`  (lines 1373–1378)
@@ -2947,11 +2957,11 @@ fn should_stop_waiting_for_initial_session(
     ) -> bool
 ```
 
-**Purpose**: Determines when the startup waiting gate can be lifted. Waiting stops as soon as a primary thread id exists.
+**Purpose**: Decides when startup can stop waiting for initial session configuration. Once the primary thread id exists, the initial session is considered available.
 
-**Data flow**: It returns `waiting_for_initial_session_configured && primary_thread_id.is_some()`. It has no side effects.
+**Data flow**: It receives the current waiting flag and optional primary thread id. It returns true only if the app was waiting and a primary thread id has now been set.
 
-**Call relations**: Used by startup orchestration to transition from initial buffering to normal active-thread event handling.
+**Call relations**: Startup orchestration code can use this alongside App::should_handle_active_thread_events to move from startup mode into normal event handling.
 
 
 ##### `App::handle_skills_list_response`  (lines 1381–1387)
@@ -2960,11 +2970,11 @@ fn should_stop_waiting_for_initial_session(
 fn handle_skills_list_response(&mut self, response: SkillsListResponse)
 ```
 
-**Purpose**: Processes a successful skills-list response by extracting newly active load warnings and forwarding the full response to the chat widget. It keeps warning emission centralized.
+**Purpose**: Applies a successful skills-list response to the UI and emits any newly active skill-load warnings. Skills are reusable capabilities loaded from the current workspace.
 
-**Data flow**: It clones the current cwd from the chat widget config, computes `errors_for_cwd(&cwd, &response)`, filters them through `self.skill_load_warnings.newly_active_errors(&errors)`, emits those warnings via `emit_skill_load_warnings(&self.app_event_tx, &errors)`, and then calls `chat_widget.handle_skills_list_response(response)`.
+**Data flow**: It receives the skills response, reads the current working directory from config, extracts errors relevant to that directory, filters to newly active warnings, emits warning events, and passes the response to the chat widget.
 
-**Call relations**: Called only from `handle_skills_list_result` after a successful backend skills-list RPC.
+**Call relations**: App::handle_skills_list_result calls this on successful server responses.
 
 *Call graph*: called by 1 (handle_skills_list_result).
 
@@ -2980,11 +2990,11 @@ async fn handle_thread_rollback_response(
     )
 ```
 
-**Purpose**: Applies server-confirmed rollback state to the thread store, drains any stale queued live events for the active thread, and then completes local backtrack handling. This keeps replay state and transcript trimming aligned with the rollback.
+**Purpose**: Updates local state after the app server rolls a thread back by one or more turns. Rollback removes recent conversation work and must also clear stale live events.
 
-**Data flow**: It looks up the channel for `thread_id`, locks the store, and calls `store.apply_thread_rollback(response)`. If the rolled-back thread is active and `self.active_thread_rx` exists, it temporarily takes the receiver and drains/discards all queued events until empty or disconnected; on disconnect it clears the active thread, otherwise it stores the receiver back. Finally it calls `handle_backtrack_rollback_succeeded(num_turns)`.
+**Data flow**: It receives the thread id, number of turns, and rollback response. It applies the rollback to the thread store, drains and discards any queued live events for that active thread, clears the active thread if the receiver disconnected, and marks the backtrack operation as succeeded.
 
-**Call relations**: Invoked from the `ThreadRollback` branch of `try_submit_active_thread_op_via_app_server` after a successful rollback RPC.
+**Call relations**: App::try_submit_active_thread_op_via_app_server calls this after a successful rollback command. It may call App::clear_active_thread if the active receiver is gone.
 
 *Call graph*: calls 1 internal fn (clear_active_thread); called by 1 (try_submit_active_thread_op_via_app_server).
 
@@ -2995,11 +3005,11 @@ async fn handle_thread_rollback_response(
 fn handle_thread_event_now(&mut self, event: ThreadBufferedEvent)
 ```
 
-**Purpose**: Immediately applies one buffered thread event to the visible UI and related local caches. It is used for live event draining rather than replay.
+**Purpose**: Renders one live event from the active thread immediately. This is used for events arriving while the user is watching that thread.
 
-**Data flow**: It first computes `needs_refresh` for `TurnStarted` and `ThreadTokenUsageUpdated` notifications. It then matches the event: notifications are passed through `cache_collab_receiver_threads_for_notification` and `chat_widget.handle_server_notification(..., None)`; requests are only forwarded to `chat_widget.handle_server_request(..., None)` if `pending_app_server_requests.contains_server_request(&request)` still holds; history responses go to `chat_widget.handle_history_entry_response`; feedback submissions go to `handle_feedback_thread_event`. If `needs_refresh` is true it calls `refresh_status_line()`.
+**Data flow**: It receives a buffered event. Notifications update collaboration cache and go to the chat widget, requests are shown if still pending, history responses update history navigation, and feedback events go to feedback handling. Some notifications also trigger a status-line refresh.
 
-**Call relations**: Called by `drain_active_thread_events` and `handle_active_thread_event`. It is the live-event counterpart to `handle_thread_event_replay`.
+**Call relations**: App::drain_active_thread_events and App::handle_active_thread_event call this for live handling. It calls App::cache_collab_receiver_threads_for_notification before rendering notifications.
 
 *Call graph*: calls 1 internal fn (cache_collab_receiver_threads_for_notification); called by 2 (drain_active_thread_events, handle_active_thread_event); 1 external calls (matches!).
 
@@ -3010,11 +3020,11 @@ fn handle_thread_event_now(&mut self, event: ThreadBufferedEvent)
 fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent)
 ```
 
-**Purpose**: Replays one buffered thread event into the chat widget using replay semantics. Unlike live handling, it always forwards requests because the snapshot has already been filtered.
+**Purpose**: Renders one stored event while replaying a thread snapshot. It tells the chat widget that these events are historical replay, not brand-new live events.
 
-**Data flow**: It matches the `ThreadBufferedEvent` and forwards notifications and requests to the chat widget with `Some(ReplayKind::ThreadSnapshot)`, history responses to `handle_history_entry_response`, and feedback submissions to `handle_feedback_thread_event`. It returns `()`.
+**Data flow**: It receives a buffered event and forwards it to the appropriate chat widget or feedback handler, tagging server notifications and requests with thread-snapshot replay context.
 
-**Call relations**: Used only by `replay_thread_snapshot` while rebuilding the visible thread from a snapshot.
+**Call relations**: App::replay_thread_snapshot calls this for each buffered event that survives replay filtering.
 
 *Call graph*: called by 1 (replay_thread_snapshot).
 
@@ -3030,11 +3040,11 @@ async fn handle_active_thread_event(
     ) -> Result<()>
 ```
 
-**Purpose**: Processes a live event from the active thread while enforcing shutdown-intent routing. Unexpected side-thread shutdowns trigger failover to the primary thread before normal event handling.
+**Purpose**: Handles one event from the active thread with extra shutdown safety. It distinguishes user-requested exits from unexpected agent-thread deaths.
 
-**Data flow**: It first computes whether this event is the completion of a user-requested shutdown by checking for `ThreadClosed` on `self.pending_shutdown_exit_thread_id == self.active_thread_id`. If the event is a notification and `active_non_primary_shutdown_target(notification)` returns `(closed_thread_id, primary_thread_id)`, it marks the closed thread as closed in the picker, discards side-thread state if needed, attempts to switch back to the primary thread via `select_agent_thread` or `select_agent_thread_and_discard_side`, and then emits either an info message on success or clears the active thread plus emits an error on failure; in that case it returns early. Otherwise, if the event completed the tracked shutdown, it clears `pending_shutdown_exit_thread_id`, forwards the event to `handle_thread_event_now`, and schedules a frame if `backtrack_render_pending` is set.
+**Data flow**: It receives the TUI, app server, and event. It checks whether a tracked shutdown has completed, detects unexpected non-primary thread closure and tries to switch back to the primary thread, clears the shutdown marker when appropriate, otherwise renders the event normally, and schedules a redraw if needed.
 
-**Call relations**: Called by the main event loop for active-thread events that need shutdown-aware routing rather than simple immediate handling.
+**Call relations**: This is the safer active-event path when individual events are processed with access to the TUI and app server. It calls App::active_non_primary_shutdown_target, may call App::clear_active_thread, and otherwise delegates rendering to App::handle_thread_event_now.
 
 *Call graph*: calls 3 internal fn (active_non_primary_shutdown_target, clear_active_thread, handle_thread_event_now); 3 external calls (frame_requester, format!, matches!).
 
@@ -3045,11 +3055,11 @@ async fn handle_active_thread_event(
 async fn config_with_workspace_profile() -> Config
 ```
 
-**Purpose**: Builds a test `Config` whose default permissions use the built-in workspace profile. This fixture supports permission-override tests.
+**Purpose**: Builds a test configuration that uses the built-in workspace permission profile. This gives the permission tests a realistic config without touching a real user home directory.
 
-**Data flow**: It creates a temporary directory, feeds its path plus a `ConfigOverrides` with `default_permissions = Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())` into `ConfigBuilder`, awaits `build()`, and returns the resulting `Config`.
+**Data flow**: It creates a temporary directory, sets it as the Codex home, applies a default workspace permission override, builds the config asynchronously, and returns it.
 
-**Call relations**: Used by the permission-override tests in this module to create a consistent baseline configuration.
+**Call relations**: The three permission tests call this helper before checking App::turn_permissions_override_from_config.
 
 *Call graph*: 3 external calls (default, default, tempdir).
 
@@ -3060,11 +3070,11 @@ async fn config_with_workspace_profile() -> Config
 async fn turn_permissions_use_active_profile_when_available()
 ```
 
-**Purpose**: Verifies that an active permission profile takes precedence over all other permission override logic. The result should be `TurnPermissionsOverride::ActiveProfile`.
+**Purpose**: Checks that an active permission profile wins when starting a turn. This confirms the app sends the explicitly active profile rather than falling back to older behavior.
 
-**Data flow**: It awaits `config_with_workspace_profile()`, extracts `active_permission_profile`, calls `App::turn_permissions_override_from_config(&config, active_permission_profile.as_ref(), None)`, and asserts equality with an `ActiveProfile` built from the workspace profile id.
+**Data flow**: It builds the workspace-profile config, extracts the active permission profile, calls App::turn_permissions_override_from_config, and asserts that the result is an active-profile override.
 
-**Call relations**: This test directly exercises the first branch of `turn_permissions_override_from_config`.
+**Call relations**: This test covers the first branch of App::turn_permissions_override_from_config.
 
 *Call graph*: 2 external calls (assert_eq!, config_with_workspace_profile).
 
@@ -3075,11 +3085,11 @@ async fn turn_permissions_use_active_profile_when_available()
 async fn turn_permissions_preserve_server_snapshot_without_local_override()
 ```
 
-**Purpose**: Checks that when there is no active profile and no runtime override, the app preserves the server's existing permission snapshot instead of sending a local override. This avoids unnecessary churn.
+**Purpose**: Checks that the app preserves the server’s permission snapshot when there is no local runtime override. This prevents the TUI from accidentally overwriting server-side permission state.
 
-**Data flow**: It builds a workspace-profile config, mutates `config.permissions` to `PermissionProfile::read_only()`, calls `turn_permissions_override_from_config` with no active profile and no runtime override, and asserts the result is `TurnPermissionsOverride::Preserve`.
+**Data flow**: It builds a config, changes its permission profile to read-only, calls App::turn_permissions_override_from_config with no active profile and no runtime override, and asserts that the result is preserve.
 
-**Call relations**: This test covers the default/no-override branch of the permission override helper.
+**Call relations**: This test covers the safe default branch of App::turn_permissions_override_from_config.
 
 *Call graph*: calls 1 internal fn (read_only); 2 external calls (assert_eq!, config_with_workspace_profile).
 
@@ -3090,11 +3100,11 @@ async fn turn_permissions_preserve_server_snapshot_without_local_override()
 async fn turn_permissions_send_legacy_sandbox_for_local_override()
 ```
 
-**Purpose**: Verifies that when a runtime permission override matches the effective local profile, the app sends a legacy sandbox override to the server. This preserves compatibility with server-side snapshot semantics.
+**Purpose**: Checks that an explicit local runtime permission override is sent using the legacy sandbox form. This keeps older server behavior working when the user has changed permissions locally.
 
-**Data flow**: It builds a workspace-profile config, sets the config permission profile to `workspace_write`, captures the effective permission profile, calls `turn_permissions_override_from_config` with that runtime override, and asserts the result is `TurnPermissionsOverride::LegacySandbox(effective_permission_profile)`.
+**Data flow**: It builds a config, sets a workspace-write permission profile, computes the effective profile, calls App::turn_permissions_override_from_config with that runtime override, and asserts that the legacy sandbox override is returned.
 
-**Call relations**: This test covers the branch where a runtime override should be materialized and sent explicitly.
+**Call relations**: This test covers the local-override branch of App::turn_permissions_override_from_config.
 
 *Call graph*: calls 1 internal fn (workspace_write); 2 external calls (assert_eq!, config_with_workspace_profile).
 
@@ -3104,13 +3114,13 @@ This file offloads network and disk-heavy work into spawned tasks and returns th
 
 ### `tui/src/app/background_requests.rs`
 
-`io_transport` · `cross-cutting`
+`orchestration` · `cross-cutting background request handling`
 
-This module is the app’s asynchronous request toolbox. The `App` methods at the top are thin orchestration wrappers: they clone an `AppServerRequestHandle`, capture any needed context such as cwd, thread ID, feature flags, or request IDs, spawn a Tokio task, await a helper RPC function, normalize errors into strings, and send a typed `AppEvent` back to the main loop. That pattern is used for MCP inventory, account rate limits and token activity, rate-limit reset credits and consumption, add-credit nudges, startup skills, connectors, plugins, hooks, marketplace operations, plugin install/uninstall/detail, plugin mention refresh, hook trust writes, and feedback uploads.
+The terminal UI needs many things from the app server: plugin lists, skill metadata, MCP server inventory, account usage, rate limits, connector lists, marketplace changes, hook settings, and feedback uploads. Any of these can take time. If the app waited directly, typing and rendering could stall. This file is the app's "runner in the background": it clones a request handle, starts an async task, waits for the server response, turns errors into user-friendly text, and sends an `AppEvent` back to the main event loop.
 
-Several methods contain important local policy. `mcp_inventory_request_thread_id` only forwards a thread ID when it is the active thread and not a closed agent thread, preventing stale agent context from leaking into inventory requests. `set_plugin_enabled` and `set_hook_enabled` coalesce repeated toggles by storing `pending_*_writes`; if a write is already in flight, only the latest desired state is queued, and completion handlers can spawn a follow-up write if needed. `handle_mcp_inventory_result` ignores results for non-visible threads, clears loading indicators in both widget and transcript overlay, and renders either an error, an empty-state cell, or a full MCP tools cell.
+Most functions follow the same pattern. An `App` method gathers context from the current screen, such as the current working directory or thread id. It then spawns a task with `tokio::spawn` (start this work separately). A helper function builds the actual typed app-server request. When the answer arrives, the task sends one event back. The UI then handles that event on its normal single-threaded path, which avoids two tasks changing screen state at once.
 
-The lower half contains the actual RPC helpers. Each constructs a unique `RequestId::String` using `Uuid`, issues a typed `ClientRequest`, and wraps failures with context. Plugin helpers also hide CLI-only marketplaces (`openai-bundled`), split remote plugin catalogs into labeled sections with tailored next-step error messages, and normalize relative marketplace-add sources against the current cwd while preserving `#ref` or `@ref` suffixes. Feedback helpers package thread ID, optional rollout logs, and turn tags into `FeedbackUploadParams`. Test-only code converts flat `McpServerStatus` responses into per-server maps for MCP subsystem assertions.
+The file also includes small policy decisions: timeouts for account data, hiding plugin marketplaces meant only for the command-line flow, adding next-step advice to remote plugin errors, queueing rapid enable/disable writes so only the latest choice matters, and routing feedback results back to the thread where feedback was submitted.
 
 #### Function details
 
@@ -3125,11 +3135,11 @@ fn fetch_mcp_inventory(
     )
 ```
 
-**Purpose**: Starts a background fetch of MCP server inventory and routes the result back as `AppEvent::McpInventoryLoaded`. It optionally scopes the request to the currently active thread when that thread is still eligible.
+**Purpose**: Starts a background load of MCP server inventory, which is the list of external tool servers and what tools or resources they provide. It keeps the UI responsive while the inventory is fetched.
 
-**Data flow**: Reads an `AppServerSession`, desired `McpServerStatusDetail`, and optional `ThreadId`; derives a request-scoped thread ID via `mcp_inventory_request_thread_id`, clones the request handle and event sender, spawns a task that awaits `fetch_all_mcp_server_statuses`, converts any error to `String`, and sends `AppEvent::McpInventoryLoaded { result, detail, thread_id }`.
+**Data flow**: It receives the app-server session, the amount of detail wanted, and an optional thread id. It chooses whether that thread id should be included, starts a background task, fetches all pages of MCP status data, converts any error to text, and sends an `McpInventoryLoaded` event back to the app.
 
-**Call relations**: Triggered from the central event dispatcher when `AppEvent::FetchMcpInventory` arrives. It delegates thread-ID filtering to `App::mcp_inventory_request_thread_id` and the actual paginated RPC loop to `fetch_all_mcp_server_statuses`.
+**Call relations**: This is the App-level launcher. Before calling `fetch_all_mcp_server_statuses`, it asks `App::mcp_inventory_request_thread_id` whether the request should be tied to the current thread, then the spawned task reports back through the app event channel.
 
 *Call graph*: calls 3 internal fn (mcp_inventory_request_thread_id, fetch_all_mcp_server_statuses, request_handle); 1 external calls (spawn).
 
@@ -3140,11 +3150,11 @@ fn fetch_mcp_inventory(
 fn mcp_inventory_request_thread_id(&self, thread_id: Option<ThreadId>) -> Option<ThreadId>
 ```
 
-**Purpose**: Determines whether an MCP inventory request should include a thread ID. It suppresses thread scoping for inactive or closed agent threads.
+**Purpose**: Decides whether an MCP inventory request should include a thread id. It avoids asking the server for thread-specific MCP data when that thread is no longer active or has been closed.
 
-**Data flow**: Takes `Option<ThreadId>` and returns the same ID only if it matches `self.active_thread_id` and `self.agent_navigation` either has no entry or reports `is_closed == false`; otherwise it returns `None`.
+**Data flow**: It takes an optional thread id and compares it with the app's active thread and agent navigation state. It returns the same id only if the thread is still the active, open one; otherwise it returns nothing.
 
-**Call relations**: Used only by `App::fetch_mcp_inventory` to avoid sending stale thread context to the app server.
+**Call relations**: This is a guard used by `App::fetch_mcp_inventory` before the background request starts. Its job is to prevent stale thread context from leaking into the server request.
 
 *Call graph*: called by 1 (fetch_mcp_inventory).
 
@@ -3159,11 +3169,11 @@ fn refresh_rate_limits(
     )
 ```
 
-**Purpose**: Fetches account rate limits in the background and reports completion through `AppEvent::RateLimitsLoaded`. It applies a timeout only for post-consume refreshes, where responsiveness matters most.
+**Purpose**: Starts a background refresh of the user's account rate limits. This lets startup, status commands, and reset-credit flows get fresh quota information without blocking the UI.
 
-**Data flow**: Captures a request handle, event sender, and `RateLimitRefreshOrigin`, spawns a task, builds the future from `fetch_account_rate_limits`, and either awaits it directly or wraps it in `tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, ...)` for `ResetConsume`. The task converts transport/timeouts into `String` and sends `AppEvent::RateLimitsLoaded { origin, result }`.
+**Data flow**: It takes the app-server session and a reason for the refresh. It calls the account rate-limit helper in a spawned task, adds a timeout for reset-credit-related refreshes, turns errors into strings, and sends a `RateLimitsLoaded` event with the original reason attached.
 
-**Call relations**: Called from the event dispatcher for `AppEvent::RefreshRateLimits`. The resulting event is later consumed in `App::handle_event` to update snapshots, status cards, and reset-credit UI.
+**Call relations**: This method launches `fetch_account_rate_limits`. The completion event lets later UI code know whether the request came from startup, a `/status` command, or a reset-credit action.
 
 *Call graph*: calls 2 internal fn (fetch_account_rate_limits, request_handle); 2 external calls (spawn, timeout).
 
@@ -3178,11 +3188,11 @@ fn refresh_token_activity(
     )
 ```
 
-**Purpose**: Starts a timed background fetch of token-usage activity for the `/usage` UI. It ensures the request cannot hang indefinitely.
+**Purpose**: Starts a background fetch of recent token usage for an account. Token usage can be slow to retrieve, so this protects the terminal from hanging.
 
-**Data flow**: Clones the request handle and event sender, spawns a task, wraps `fetch_account_token_activity` in `TOKEN_ACTIVITY_FETCH_TIMEOUT`, maps timeout or RPC errors to strings, and sends `AppEvent::TokenActivityLoaded { request_id, result }`.
+**Data flow**: It receives a server session and request id, starts a timed background request, and sends either the token activity response or an error string in `TokenActivityLoaded`.
 
-**Call relations**: Invoked from the event dispatcher when token activity is requested. The completion event is later used to settle or defer insertion of the usage history cell.
+**Call relations**: This is the App wrapper around `fetch_account_token_activity`. The request id is carried back so the UI can match the answer to the card or command that asked for it.
 
 *Call graph*: calls 2 internal fn (fetch_account_token_activity, request_handle); 2 external calls (spawn, timeout).
 
@@ -3197,11 +3207,11 @@ fn refresh_rate_limit_reset_credits(
     )
 ```
 
-**Purpose**: Fetches the current rate-limit reset credit summary in the background. It is used by the reset-credit popup flow.
+**Purpose**: Loads the account's available rate-limit reset credits in the background. These credits are used to reset a quota limit when allowed.
 
-**Data flow**: Captures request handle and sender, spawns a task, wraps `fetch_rate_limit_reset_credits` in `RATE_LIMIT_RESET_REQUEST_TIMEOUT`, converts timeout/RPC failures to strings, and emits `AppEvent::RateLimitResetCreditsLoaded { request_id, result }`.
+**Data flow**: It takes a request id and app-server session, runs a timed request for reset-credit summary data, converts timeout or server errors to text, and sends `RateLimitResetCreditsLoaded`.
 
-**Call relations**: Started from `AppEvent::OpenRateLimitResetCredits`; the resulting event is handled in the main dispatcher to populate the popup.
+**Call relations**: This method launches `fetch_rate_limit_reset_credits`. The result flows back through the event queue rather than updating UI state directly.
 
 *Call graph*: calls 2 internal fn (fetch_rate_limit_reset_credits, request_handle); 2 external calls (spawn, timeout).
 
@@ -3217,11 +3227,11 @@ fn consume_rate_limit_reset_credit(
     )
 ```
 
-**Purpose**: Consumes one reset credit asynchronously and reports the result back to the UI. It preserves the idempotency key in the completion event so the popup can correlate the response.
+**Purpose**: Starts the server request that spends one rate-limit reset credit. The idempotency key helps the server avoid double-spending if the same operation is retried.
 
-**Data flow**: Clones request handle and sender, spawns a task, wraps `consume_rate_limit_reset_credit_request(request_handle, idempotency_key.clone())` in a timeout, maps errors to strings, and sends `AppEvent::RateLimitResetCreditConsumed { request_id, idempotency_key, result }`.
+**Data flow**: It receives a request id and idempotency key, sends the consume request in a timed background task, and returns the original key plus the server result in a `RateLimitResetCreditConsumed` event.
 
-**Call relations**: Triggered by `AppEvent::ConsumeRateLimitResetCredit`. On success, the event dispatcher follows up with a rate-limit refresh to show the updated credit balance.
+**Call relations**: This is the App-level launcher for `consume_rate_limit_reset_credit_request`. The event handler can later use the idempotency key to connect the server answer to the user's attempted action.
 
 *Call graph*: calls 2 internal fn (consume_rate_limit_reset_credit_request, request_handle); 2 external calls (spawn, timeout).
 
@@ -3236,11 +3246,11 @@ fn send_add_credits_nudge_email(
     )
 ```
 
-**Purpose**: Launches the add-credits nudge email RPC without blocking the UI. It reports only success or failure status back to the chat widget.
+**Purpose**: Asks the server to send an email nudging the user to add more credits. It runs in the background because sending email depends on the server.
 
-**Data flow**: Clones request handle and sender, spawns a task, awaits `send_add_credits_nudge_email(request_handle, credit_type)`, stringifies any error, and sends `AppEvent::AddCreditsNudgeEmailFinished { result }`.
+**Data flow**: It receives the credit type, sends a request through the app server, converts any failure to text, and posts `AddCreditsNudgeEmailFinished` when done.
 
-**Call relations**: Started from the event dispatcher after the chat widget marks the request as in progress. The completion event is consumed to finish the request UI.
+**Call relations**: This App method calls the free helper `send_add_credits_nudge_email` inside a spawned task. The helper does the server call; this method connects it to the app event loop.
 
 *Call graph*: calls 2 internal fn (send_add_credits_nudge_email, request_handle); 1 external calls (spawn).
 
@@ -3251,11 +3261,11 @@ fn send_add_credits_nudge_email(
 fn refresh_startup_skills(&mut self, app_server: &AppServerSession)
 ```
 
-**Purpose**: Begins the initial skills-list fetch after startup without delaying the first frame. It lets the UI become interactive before skill metadata arrives.
+**Purpose**: Loads skill metadata during startup without delaying the first visible screen. Skills can later be used for mentions and the skills UI.
 
-**Data flow**: Captures request handle, event sender, and current config cwd, spawns a task, awaits `fetch_skills_list`, formats any error with alternate debug formatting, and sends `AppEvent::SkillsListLoaded { result }`.
+**Data flow**: It reads the current working directory from config, starts a background skills-list request, formats any rich error into text, and sends `SkillsListLoaded`.
 
-**Call relations**: Used during startup orchestration. The main event loop later handles `SkillsListLoaded` through the normal skills-result path.
+**Call relations**: This startup path calls `fetch_skills_list`. Unlike user-requested refreshes, it is intentionally fire-and-forget so the first frame can render quickly.
 
 *Call graph*: calls 2 internal fn (fetch_skills_list, request_handle); 1 external calls (spawn).
 
@@ -3270,11 +3280,11 @@ fn fetch_connectors_list(
     )
 ```
 
-**Purpose**: Fetches the connectors/app list in the background, optionally forcing a refetch. It includes the currently displayed thread ID string when available.
+**Purpose**: Fetches the list of connected apps or connectors from the server. It can force a fresh fetch and can include the currently displayed thread for context.
 
-**Data flow**: Reads `self.current_displayed_thread_id()`, converts it to `Option<String>`, clones request handle and sender, spawns a task, awaits `fetch_connectors_list(request_handle, force_refetch, thread_id)`, stringifies errors, and sends `AppEvent::ConnectorsLoaded { result, is_final: true }`.
+**Data flow**: It reads the current displayed thread id, starts a background apps-list request, wraps the server data into a connectors snapshot, and sends `ConnectorsLoaded` marked as final.
 
-**Call relations**: Called from `AppEvent::FetchConnectorsList`. It delegates the actual RPC to the free `fetch_connectors_list` helper and the UI update to the later completion event.
+**Call relations**: This App launcher calls the free `fetch_connectors_list` helper. The helper talks to the server; this method preserves UI context and sends the answer back as an event.
 
 *Call graph*: calls 2 internal fn (fetch_connectors_list, request_handle); 1 external calls (spawn).
 
@@ -3285,11 +3295,11 @@ fn fetch_connectors_list(
 fn fetch_plugins_list(&mut self, app_server: &AppServerSession, cwd: PathBuf)
 ```
 
-**Purpose**: Loads the plugin list and, if successful, follows up with additional remote plugin sections. It also marks the plugin UI as loading immediately.
+**Purpose**: Loads the plugin menu data for a working directory, then optionally loads extra remote plugin sections. It also tells the chat widget immediately that plugin loading has started.
 
-**Data flow**: Calls `self.chat_widget.on_plugins_list_fetch_started(cwd.clone())`, captures request handle, sender, cwd, and feature flags for plugin sharing and remote plugins, then spawns a task. The task awaits `fetch_plugins_list`, sends `AppEvent::PluginsLoaded`, and if that succeeded, awaits `fetch_additional_plugin_remote_sections` and sends `AppEvent::PluginRemoteSectionsLoaded` with marketplaces and section errors.
+**Data flow**: It receives a directory, records that plugin loading began, reads feature flags for plugin sharing and remote plugins, fetches the main plugin list, sends `PluginsLoaded`, and if that succeeded fetches extra remote sections and sends `PluginRemoteSectionsLoaded`.
 
-**Call relations**: Started from several UI flows, including explicit plugin refreshes and post-config-import refreshes. It delegates base list loading to the free `fetch_plugins_list` helper and remote-section fan-out to `fetch_additional_plugin_remote_sections`.
+**Call relations**: This method first calls the free `fetch_plugins_list`. On success, it continues with `fetch_additional_plugin_remote_sections`, so the UI can show local plugin data quickly and remote sections when ready.
 
 *Call graph*: calls 3 internal fn (fetch_additional_plugin_remote_sections, fetch_plugins_list, request_handle); 2 external calls (clone, spawn).
 
@@ -3300,11 +3310,11 @@ fn fetch_plugins_list(&mut self, app_server: &AppServerSession, cwd: PathBuf)
 fn fetch_hooks_list(&mut self, app_server: &AppServerSession, cwd: PathBuf)
 ```
 
-**Purpose**: Fetches hook configuration data for a given cwd in the background. The result is returned as a single `HooksLoaded` event.
+**Purpose**: Loads configured hooks for a working directory in the background. Hooks are user or workspace actions that can run around Codex activity.
 
-**Data flow**: Clones request handle and sender, spawns a task, awaits `crate::hooks_rpc::fetch_hooks_list(request_handle, cwd.clone())`, stringifies errors, and sends `AppEvent::HooksLoaded { cwd, result }`.
+**Data flow**: It receives a directory, clones it for the eventual event, calls the hooks RPC helper, converts errors to strings, and sends `HooksLoaded`.
 
-**Call relations**: Triggered by `AppEvent::FetchHooksList` and consumed later by the chat widget’s hooks UI.
+**Call relations**: This method delegates the server request to `fetch_hooks_list` from the hooks RPC module. It exists here to connect that request to the app's background-event pattern.
 
 *Call graph*: calls 2 internal fn (request_handle, fetch_hooks_list); 2 external calls (clone, spawn).
 
@@ -3320,11 +3330,11 @@ fn fetch_plugin_detail(
     )
 ```
 
-**Purpose**: Loads detailed metadata for one plugin asynchronously. It is used when opening or refreshing a plugin detail view.
+**Purpose**: Fetches detailed information for one plugin. This is used when the user opens or inspects a plugin rather than just seeing it in a list.
 
-**Data flow**: Captures request handle, sender, cwd, and `PluginReadParams`, spawns a task, awaits the free `fetch_plugin_detail` RPC helper, maps errors to strings, and sends `AppEvent::PluginDetailLoaded { cwd, result }`.
+**Data flow**: It takes the working directory and plugin read parameters, sends the read request in a background task, converts any error to text, and emits `PluginDetailLoaded`.
 
-**Call relations**: Started from `AppEvent::FetchPluginDetail` and also after successful installs when the detail view should refresh.
+**Call relations**: This App method wraps the free `fetch_plugin_detail` helper. It keeps the directory alongside the result so the UI can ignore or place the result correctly.
 
 *Call graph*: calls 2 internal fn (fetch_plugin_detail, request_handle); 1 external calls (spawn).
 
@@ -3340,11 +3350,11 @@ fn fetch_marketplace_add(
     )
 ```
 
-**Purpose**: Adds a plugin marketplace source in the background and reports the result with enough context to update the originating UI. It preserves both cwd and source string for the completion event.
+**Purpose**: Adds a plugin marketplace, such as a local folder or remote source, without blocking the UI. A marketplace is a catalog where plugins can be found.
 
-**Data flow**: Clones request handle and sender, captures `cwd` and `source` for both request and event payloads, spawns a task, awaits the free `fetch_marketplace_add` helper, rewrites any error as `Failed to add marketplace: ...`, and sends `AppEvent::MarketplaceAddLoaded { cwd, source, result }`.
+**Data flow**: It receives the current directory and source string, preserves copies for the event, asks the server to add the marketplace, formats failure as a clear message, and sends `MarketplaceAddLoaded`.
 
-**Call relations**: Triggered by `AppEvent::FetchMarketplaceAdd`. The completion event may cause a plugin list refresh if the add succeeded in the currently viewed cwd.
+**Call relations**: This method calls the free `fetch_marketplace_add` helper. The helper prepares the server request; this method ties it to the current screen and app event flow.
 
 *Call graph*: calls 2 internal fn (fetch_marketplace_add, request_handle); 2 external calls (clone, spawn).
 
@@ -3361,11 +3371,11 @@ fn fetch_marketplace_remove(
     )
 ```
 
-**Purpose**: Removes a marketplace asynchronously and returns the result along with display metadata for the confirmation/loading UI. It keeps the user-facing marketplace name available even after the request completes.
+**Purpose**: Removes a plugin marketplace in the background. It keeps both the internal name and display name so the UI can show a useful result.
 
-**Data flow**: Captures request handle, sender, cwd, marketplace name, and display name, spawns a task, awaits `fetch_marketplace_remove`, maps errors to `Failed to remove marketplace: ...`, and sends `AppEvent::MarketplaceRemoveLoaded` with all original context plus the result.
+**Data flow**: It receives the directory, marketplace name, and display name, sends the remove request, formats any failure, and emits `MarketplaceRemoveLoaded` with identifying details.
 
-**Call relations**: Started from `AppEvent::FetchMarketplaceRemove`; successful completion can trigger plugin mention refresh and plugin list reload.
+**Call relations**: This App launcher calls `fetch_marketplace_remove`. It carries user-facing names through the async boundary for later UI messages.
 
 *Call graph*: calls 2 internal fn (fetch_marketplace_remove, request_handle); 2 external calls (clone, spawn).
 
@@ -3381,11 +3391,11 @@ fn fetch_marketplace_upgrade(
     )
 ```
 
-**Purpose**: Runs a marketplace upgrade in the background, either for one marketplace or all marketplaces. It reports completion with the cwd so the plugin UI can refresh appropriately.
+**Purpose**: Requests an upgrade of one marketplace or all marketplaces. This can update plugin catalogs without freezing the terminal.
 
-**Data flow**: Clones request handle and sender, captures cwd and optional marketplace name, spawns a task, awaits `fetch_marketplace_upgrade`, maps errors to `Failed to upgrade marketplace: ...`, and sends `AppEvent::MarketplaceUpgradeLoaded { cwd, result }`.
+**Data flow**: It takes the directory and optional marketplace name, runs the upgrade request in the background, formats errors, and sends `MarketplaceUpgradeLoaded`.
 
-**Call relations**: Triggered by `AppEvent::FetchMarketplaceUpgrade`. The completion handler may refresh plugin mentions if marketplace contents changed.
+**Call relations**: This method delegates to the free `fetch_marketplace_upgrade` helper and posts the result back through the event channel.
 
 *Call graph*: calls 2 internal fn (fetch_marketplace_upgrade, request_handle); 2 external calls (clone, spawn).
 
@@ -3402,11 +3412,11 @@ fn fetch_plugin_install(
         plugin_display_name: Str
 ```
 
-**Purpose**: Installs a plugin asynchronously from either a local or remote marketplace location. It preserves enough context for the completion handler to refresh both list and detail views.
+**Purpose**: Installs a plugin from a local or remote marketplace. It runs asynchronously because installation may involve file or network work on the server side.
 
-**Data flow**: Captures request handle, sender, cwd, `PluginLocation`, plugin name, and display name, spawns a task, awaits `fetch_plugin_install`, maps errors to `Failed to install plugin: ...`, and sends `AppEvent::PluginInstallLoaded` with the original context and result.
+**Data flow**: It receives the directory, plugin location, plugin name, and display name. It sends an install request, preserves copies of identifying data, and emits `PluginInstallLoaded` with success or a formatted failure.
 
-**Call relations**: Started from `AppEvent::FetchPluginInstall`. The completion event may refresh plugin mentions, plugin lists, and plugin detail depending on success and current cwd.
+**Call relations**: This App method calls `fetch_plugin_install`. It keeps enough context for the UI to update the right plugin row and show the correct display name.
 
 *Call graph*: calls 2 internal fn (fetch_plugin_install, request_handle); 3 external calls (clone, spawn, clone).
 
@@ -3423,11 +3433,11 @@ fn fetch_plugin_uninstall(
     )
 ```
 
-**Purpose**: Uninstalls a plugin in the background and reports the result with cwd and display metadata. It supports the uninstall confirmation/loading flow.
+**Purpose**: Uninstalls a plugin in the background. It avoids blocking the interface while the server removes the plugin.
 
-**Data flow**: Clones request handle and sender, captures cwd, plugin ID, and display name, spawns a task, awaits `fetch_plugin_uninstall`, maps errors to `Failed to uninstall plugin: ...`, and sends `AppEvent::PluginUninstallLoaded { cwd, plugin_id, plugin_display_name, result }`.
+**Data flow**: It receives the directory, plugin id, and display name, sends an uninstall request, and emits `PluginUninstallLoaded` with either the response or an error message.
 
-**Call relations**: Triggered by `AppEvent::FetchPluginUninstall`; successful completion can refresh plugin mentions and the plugin list.
+**Call relations**: This method wraps the free `fetch_plugin_uninstall` helper and routes the result back through the event loop.
 
 *Call graph*: calls 2 internal fn (fetch_plugin_uninstall, request_handle); 2 external calls (clone, spawn).
 
@@ -3444,11 +3454,11 @@ fn set_plugin_enabled(
     )
 ```
 
-**Purpose**: Queues or starts a plugin-enabled config write while coalescing rapid repeated toggles. It ensures only one write per plugin is in flight at a time.
+**Purpose**: Records a user's request to enable or disable a plugin, while avoiding overlapping writes for the same plugin. If a write is already in progress, it remembers only the latest desired value.
 
-**Data flow**: Checks `self.pending_plugin_enabled_writes` for `plugin_id`. If a write is already pending, it stores `Some(enabled)` as the queued desired state and returns. Otherwise it inserts `None` to mark an in-flight write and calls `spawn_plugin_enabled_write`.
+**Data flow**: It checks the pending-write map for the plugin id. If a write is already active, it stores the new desired setting for later; otherwise it marks a write as active and starts `spawn_plugin_enabled_write`.
 
-**Call relations**: Called from the event dispatcher for `AppEvent::SetPluginEnabled`. Completion handling in `App::handle_event` consults the same pending map to decide whether to apply the result or immediately launch a follow-up write.
+**Call relations**: This function is the queueing front door. It calls `App::spawn_plugin_enabled_write` only when no write for that plugin is currently running.
 
 *Call graph*: calls 1 internal fn (spawn_plugin_enabled_write).
 
@@ -3465,11 +3475,11 @@ fn spawn_plugin_enabled_write(
     )
 ```
 
-**Purpose**: Performs the actual asynchronous plugin-enabled config write and emits a completion event. It is separated from `set_plugin_enabled` so retries can reuse the same spawn logic.
+**Purpose**: Actually starts the background config write that enables or disables a plugin. It is separated from `set_plugin_enabled` so queued follow-up writes can reuse it.
 
-**Data flow**: Clones request handle and sender, captures cwd, plugin ID, and enabled flag, spawns a task, awaits `write_plugin_enabled`, maps success to `()` and errors to `Failed to update plugin config: ...`, and sends `AppEvent::PluginEnabledSet { cwd, plugin_id, enabled, result }`.
+**Data flow**: It takes the directory, plugin id, and desired enabled flag, sends a config write request, maps success to an empty result, formats errors, and sends `PluginEnabledSet`.
 
-**Call relations**: Called initially by `App::set_plugin_enabled` and again by the event dispatcher when a queued plugin toggle must be replayed after an earlier write completes.
+**Call relations**: This is called by `App::set_plugin_enabled`. It delegates the server write to `write_plugin_enabled` and reports completion through the app event channel.
 
 *Call graph*: calls 2 internal fn (write_plugin_enabled, request_handle); called by 1 (set_plugin_enabled); 2 external calls (clone, spawn).
 
@@ -3485,11 +3495,11 @@ fn set_hook_enabled(
     )
 ```
 
-**Purpose**: Queues or starts a hook-enabled config write with the same coalescing strategy used for plugins. It prevents overlapping writes for the same hook key.
+**Purpose**: Records a user's request to enable or disable a hook while avoiding overlapping config writes for the same hook. Rapid toggles are collapsed to the latest choice.
 
-**Data flow**: Looks up `self.pending_hook_enabled_writes[key]`; if present, replaces it with `Some(enabled)` and returns. Otherwise inserts `None` and calls `spawn_hook_enabled_write`.
+**Data flow**: It checks whether a write for the hook key is already pending. If so, it stores the new desired value; if not, it marks the hook as pending and starts `spawn_hook_enabled_write`.
 
-**Call relations**: Triggered by `AppEvent::SetHookEnabled`. The completion branch in the event dispatcher uses the pending map to decide whether to apply the result or launch another write.
+**Call relations**: This is the queueing layer for hook enablement. It calls `App::spawn_hook_enabled_write` only when the hook has no active write.
 
 *Call graph*: calls 1 internal fn (spawn_hook_enabled_write).
 
@@ -3505,11 +3515,11 @@ fn spawn_hook_enabled_write(
     )
 ```
 
-**Purpose**: Runs the asynchronous hook-enabled config write and emits `HookEnabledSet`. It formats config errors through the shared config-error helper.
+**Purpose**: Starts the background config write that enables or disables a hook. It reports formatted configuration errors that are easier for users to understand.
 
-**Data flow**: Clones request handle and sender, captures hook key and enabled flag, spawns a task, awaits `write_hook_enabled`, maps success to `()`, formats failures as `Failed to update hook config: ...`, and sends `AppEvent::HookEnabledSet { key, enabled, result }`.
+**Data flow**: It receives a hook key and enabled flag, sends a batch config write, converts success to an empty result, formats failures, and emits `HookEnabledSet`.
 
-**Call relations**: Called by `App::set_hook_enabled` and by the event dispatcher when a queued hook toggle needs to be replayed.
+**Call relations**: This is called by `App::set_hook_enabled`. It uses `write_hook_enabled` for the app-server request and sends completion back as an app event.
 
 *Call graph*: calls 2 internal fn (write_hook_enabled, request_handle); called by 1 (set_hook_enabled); 1 external calls (spawn).
 
@@ -3525,11 +3535,11 @@ fn trust_hook(
     )
 ```
 
-**Purpose**: Writes trust for a single hook hash in the background. It reports only success or a formatted config error.
+**Purpose**: Marks one hook as trusted for its current content hash. This is a safety step so changed hook code is not silently accepted.
 
-**Data flow**: Clones request handle and sender, spawns a task, awaits `write_hook_trust(request_handle, key, current_hash)`, maps success to `()`, formats failures as `Failed to trust hook: ...`, and sends `AppEvent::HookTrusted { result }`.
+**Data flow**: It takes the hook key and current hash, asks the server to write that trust decision, formats config-related errors, and sends `HookTrusted`.
 
-**Call relations**: Started from `AppEvent::TrustHook`; the completion event is handled centrally to surface any error.
+**Call relations**: This App method delegates to `write_hook_trust` from the hooks RPC module. It follows the same background-event pattern as other writes.
 
 *Call graph*: calls 2 internal fn (request_handle, write_hook_trust); 1 external calls (spawn).
 
@@ -3544,11 +3554,11 @@ fn trust_hooks(
     )
 ```
 
-**Purpose**: Writes trust updates for multiple hooks in one background operation. It is the batch counterpart to `trust_hook`.
+**Purpose**: Marks several hooks as trusted in one background request. This is useful when the user accepts multiple trust updates at once.
 
-**Data flow**: Clones request handle and sender, spawns a task, awaits `write_hook_trusts(request_handle, updates)`, maps success to `()`, formats failures as `Failed to trust hooks: ...`, and sends `AppEvent::HookTrusted { result }`.
+**Data flow**: It receives a list of trust updates, sends them through the hooks RPC helper, formats any configuration error, and emits `HookTrusted`.
 
-**Call relations**: Triggered by `AppEvent::TrustHooks`; the same `HookTrusted` completion path handles both single and batch trust writes.
+**Call relations**: This method calls `write_hook_trusts` from the hooks RPC module and reports the single combined result through the app event queue.
 
 *Call graph*: calls 2 internal fn (request_handle, write_hook_trusts); 1 external calls (spawn).
 
@@ -3559,11 +3569,11 @@ fn trust_hooks(
 fn refresh_plugin_mentions(&mut self, app_server: &AppServerSession)
 ```
 
-**Purpose**: Refreshes the lightweight plugin-mention candidate list used by the chat UI. If the Plugins feature is disabled, it immediately clears mention candidates instead of making an RPC.
+**Purpose**: Refreshes the plugin names available for mention suggestions. If plugins are disabled, it immediately tells the UI there are no plugin mention candidates.
 
-**Data flow**: Reads current cwd, request handle, sender, and feature flags. If `Feature::Plugins` is disabled, it sends `AppEvent::PluginMentionsLoaded { plugins: None }` synchronously and returns. Otherwise it spawns a task that awaits `fetch_plugin_mentions`, sends `PluginMentionsLoaded { plugins: Some(plugins) }` on success, and logs a warning on failure without emitting an error event.
+**Data flow**: It reads the current directory and plugin feature flag. If plugins are off, it sends `PluginMentionsLoaded` with no plugins; otherwise it fetches mention data in the background and sends it on success, logging a warning on failure.
 
-**Call relations**: Called from explicit refresh events and after config/plugin changes. It delegates the actual mention extraction to `plugin_mentions::fetch_plugin_mentions`.
+**Call relations**: This method calls `fetch_plugin_mentions` only when the plugin feature is enabled. Unlike many other requests, failed mention refreshes are just logged because they should not interrupt the user.
 
 *Call graph*: calls 2 internal fn (fetch_plugin_mentions, request_handle); 2 external calls (spawn, warn!).
 
@@ -3580,11 +3590,11 @@ fn submit_feedback(
         include_logs:
 ```
 
-**Purpose**: Packages feedback metadata and uploads it asynchronously. It preserves the originating thread so success/failure can be routed back into the correct transcript.
+**Purpose**: Uploads user feedback, optionally with logs, without blocking the chat UI. It remembers the thread where feedback was submitted so the result can appear in the right place.
 
-**Data flow**: Reads the current thread ID and, if `include_logs` is true, the rollout path from `chat_widget`; builds `FeedbackUploadParams` via `build_feedback_upload_params`; clones request handle and sender; spawns a task that awaits `fetch_feedback_upload`, maps success to the returned feedback thread ID string, stringifies errors, and sends `AppEvent::FeedbackSubmitted { origin_thread_id, category, include_logs, result }`.
+**Data flow**: It gathers the current thread id and optional rollout log path, builds upload parameters, sends the feedback upload request in a background task, extracts the returned thread id on success, and emits `FeedbackSubmitted`.
 
-**Call relations**: Triggered by `AppEvent::SubmitFeedback`. The completion event is handled by `App::handle_feedback_submitted`, which either inserts feedback status into the current transcript or enqueues it for another thread.
+**Call relations**: This method first uses `build_feedback_upload_params`, then calls `fetch_feedback_upload`. The later event is handled by `App::handle_feedback_submitted`.
 
 *Call graph*: calls 3 internal fn (build_feedback_upload_params, fetch_feedback_upload, request_handle); 1 external calls (spawn).
 
@@ -3595,11 +3605,11 @@ fn submit_feedback(
 fn handle_feedback_thread_event(&mut self, event: FeedbackThreadEvent)
 ```
 
-**Purpose**: Renders the final feedback-upload outcome into chat history for the current thread. Success produces a specialized success cell; failure produces a generic error event.
+**Purpose**: Displays the result of a feedback upload in chat history. Success gets a friendly confirmation cell; failure gets an error cell.
 
-**Data flow**: Consumes a `FeedbackThreadEvent`. On `Ok(thread_id)` it builds a success history cell with `feedback_success_cell` using category, include-logs flag, returned thread ID, and audience, then adds it to history. On `Err(err)` it formats `Failed to upload feedback: {err}` and inserts an error history cell.
+**Data flow**: It receives a feedback event containing category, log choice, audience, and result. If successful, it appends a success message with the feedback thread id; otherwise it appends an error message.
 
-**Call relations**: Called by `App::handle_feedback_submitted` when the feedback originated from the currently active/global context rather than another thread’s buffered event stream.
+**Call relations**: This is called by `App::handle_feedback_submitted` when the feedback result should be shown immediately in the current UI instead of being routed through a thread buffer.
 
 *Call graph*: called by 1 (handle_feedback_submitted); 3 external calls (feedback_success_cell, format!, new_error_event).
 
@@ -3614,11 +3624,11 @@ async fn enqueue_thread_feedback_event(
     )
 ```
 
-**Purpose**: Buffers a feedback result into another thread’s event channel and replay store. It preserves feedback notifications for inactive threads and handles bounded-buffer eviction bookkeeping.
+**Purpose**: Stores a feedback result for a specific thread and sends it to that thread if the thread is active. This keeps feedback messages attached to the conversation where they belong.
 
-**Data flow**: Ensures a thread channel exists, clones its sender and store, locks the store, pushes `ThreadBufferedEvent::FeedbackSubmission(event.clone())` into the buffer, evicts the oldest entry if capacity is exceeded, and if the evicted entry was a buffered request, records that eviction in `pending_interactive_replay`. It then checks whether the thread channel is active; if so, it tries `sender.try_send`, falls back to spawning an async `send` on `Full`, and logs warnings on closed channels.
+**Data flow**: It finds or creates the thread channel, pushes the feedback event into that thread's buffer, evicts old buffered items if over capacity, and if the channel is active tries to send the event immediately or spawns a send if the channel is full.
 
-**Call relations**: Called by `App::handle_feedback_submitted` when feedback belongs to a non-current thread. It mirrors the buffering behavior used for other per-thread events so replay state stays consistent.
+**Call relations**: This is called by `App::handle_feedback_submitted` when feedback came from a known thread. It uses thread buffering so inactive or background threads still receive their feedback result later.
 
 *Call graph*: called by 1 (handle_feedback_submitted); 5 external calls (clone, spawn, warn!, clone, FeedbackSubmission).
 
@@ -3634,11 +3644,11 @@ async fn handle_feedback_submitted(
         result: Result<String, String
 ```
 
-**Purpose**: Routes a completed feedback upload either to the current transcript or to the originating thread’s buffered event stream. It centralizes the thread-aware delivery decision.
+**Purpose**: Turns the completed feedback upload event into a thread-specific UI event. It decides whether to enqueue it for a thread or show it immediately.
 
-**Data flow**: Builds a `FeedbackThreadEvent` from `origin_thread_id`, category, include-logs flag, current `self.feedback_audience`, and the upload result. If `origin_thread_id` is `Some`, it awaits `enqueue_thread_feedback_event`; otherwise it calls `handle_feedback_thread_event` directly.
+**Data flow**: It receives the original thread id, feedback category, log flag, and upload result. It builds a `FeedbackThreadEvent` with the current audience setting, then either enqueues it for that thread or passes it directly to the display helper.
 
-**Call relations**: Invoked by the main event dispatcher when `AppEvent::FeedbackSubmitted` arrives from the background upload task.
+**Call relations**: This is the completion handler for the event sent by `App::submit_feedback`. It calls `App::enqueue_thread_feedback_event` for known threads and `App::handle_feedback_thread_event` when no thread id was available.
 
 *Call graph*: calls 2 internal fn (enqueue_thread_feedback_event, handle_feedback_thread_event).
 
@@ -3654,11 +3664,11 @@ fn handle_mcp_inventory_result(
     )
 ```
 
-**Purpose**: Finalizes the MCP inventory loading UI and renders the result into history if it still applies to the currently displayed thread. It handles stale results, errors, empty inventories, and populated inventories distinctly.
+**Purpose**: Updates the chat after an MCP inventory request finishes. It removes loading indicators and shows either an error, an empty-state message, or the inventory listing.
 
-**Data flow**: Accepts `Result<Vec<McpServerStatus>, String>`, detail level, and optional thread ID. If the result is for a non-visible thread, it returns immediately. Otherwise it clears MCP loading indicators in both chat widget and transcript overlay, then on error adds `Failed to load MCP inventory: ...`; on an empty status list inserts `history_cell::empty_mcp_output()`; and on success inserts `history_cell::new_mcp_tools_output_from_statuses(&statuses, detail)`.
+**Data flow**: It receives the fetched statuses, requested detail level, and optional thread id. If the result belongs to another displayed thread, it ignores it; otherwise it clears loading cells, handles errors, handles an empty list, or appends the rendered MCP tools output.
 
-**Call relations**: Called from the event dispatcher on `AppEvent::McpInventoryLoaded`. It relies on `clear_committed_mcp_inventory_loading` to remove any committed loading cell before rendering the final state.
+**Call relations**: This is the UI-side counterpart to `App::fetch_mcp_inventory`. It calls `App::clear_committed_mcp_inventory_loading` before adding the final inventory output.
 
 *Call graph*: calls 1 internal fn (clear_committed_mcp_inventory_loading); 3 external calls (format!, empty_mcp_output, new_mcp_tools_output_from_statuses).
 
@@ -3669,11 +3679,11 @@ fn handle_mcp_inventory_result(
 fn clear_committed_mcp_inventory_loading(&mut self)
 ```
 
-**Purpose**: Removes the most recent committed MCP inventory loading cell from the transcript and overlay. It keeps the transcript consistent once a fetch settles.
+**Purpose**: Removes a committed MCP inventory loading cell from transcript history. This prevents the spinner-like loading entry from staying visible after the real result arrives.
 
-**Data flow**: Searches `self.transcript_cells` from the end for a cell whose dynamic type is `history_cell::McpInventoryLoadingCell`; if found, removes it and, if the current overlay is a transcript overlay, replaces the overlay’s cells with the updated transcript clone.
+**Data flow**: It searches the transcript cells from the end for an MCP inventory loading cell. If found, it removes that cell and refreshes the transcript overlay if one is open.
 
-**Call relations**: Used by `App::handle_mcp_inventory_result` immediately before inserting the final MCP inventory output.
+**Call relations**: This is called by `App::handle_mcp_inventory_result` as cleanup before the final MCP inventory message is shown.
 
 *Call graph*: called by 1 (handle_mcp_inventory_result).
 
@@ -3688,11 +3698,11 @@ async fn fetch_all_mcp_server_statuses(
 ) -> Result<Vec<McpServerStatus>>
 ```
 
-**Purpose**: Fetches all pages of MCP server status data from the app server. It loops until `next_cursor` is absent and concatenates all returned `data` entries.
+**Purpose**: Fetches every page of MCP server status data from the app server. It hides pagination from callers so they receive one complete list.
 
-**Data flow**: Takes an `AppServerRequestHandle`, detail level, and optional `ThreadId`; converts the thread ID to `Option<String>`, initializes `cursor = None` and `statuses = Vec::new()`, then repeatedly issues `ClientRequest::McpServerStatusList` with a fresh string request ID, `limit: Some(100)`, the current cursor, detail, and thread ID. Each response’s `data` is appended to `statuses`; `next_cursor` drives the loop; the final vector is returned or an eyre-wrapped error is propagated.
+**Data flow**: It receives a request handle, detail level, and optional thread id. It repeatedly sends `McpServerStatusList` requests with a cursor, appends each page of data, and stops when the server provides no next cursor, returning the combined statuses.
 
-**Call relations**: Called only by `App::fetch_mcp_inventory` inside a spawned task. It encapsulates the pagination logic so the app method only has to launch the background work.
+**Call relations**: This helper is called by `App::fetch_mcp_inventory` inside a background task. It is the low-level server conversation behind the MCP inventory UI.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_mcp_inventory); 3 external calls (new, String, format!).
 
@@ -3705,11 +3715,11 @@ async fn fetch_account_rate_limits(
 ) -> Result<GetAccountRateLimitsResponse>
 ```
 
-**Purpose**: Issues the typed RPC to read account rate limits. It is the low-level transport helper behind rate-limit refreshes.
+**Purpose**: Asks the app server for the account's current rate limits. The result includes quota information used by status and reset-credit flows.
 
-**Data flow**: Builds a unique string `RequestId`, sends `ClientRequest::GetAccountRateLimits { params: None }` through `request_handle.request_typed`, and returns the typed `GetAccountRateLimitsResponse` or a wrapped error.
+**Data flow**: It receives a request handle, creates a unique request id, sends a typed account rate-limits request, and returns the server response or a wrapped error.
 
-**Call relations**: Used by `App::refresh_rate_limits` and indirectly by reset-credit refresh flows.
+**Call relations**: This helper is called by `App::refresh_rate_limits`. The App method decides timeout behavior and event routing.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (refresh_rate_limits); 2 external calls (String, format!).
 
@@ -3722,11 +3732,11 @@ async fn fetch_account_token_activity(
 ) -> Result<codex_app_server_protocol::GetAccountTokenUsageResponse>
 ```
 
-**Purpose**: Reads account token-usage activity from the app server. It is the transport helper for the `/usage` token activity view.
+**Purpose**: Asks the app server for account token usage activity. This supports UI views that explain recent usage.
 
-**Data flow**: Constructs a unique request ID, sends `ClientRequest::GetAccountTokenUsage { params: None }`, and returns the typed token-usage response or a wrapped error.
+**Data flow**: It takes a request handle, creates a unique request id, sends a token-usage request, and returns either the usage response or an error with context.
 
-**Call relations**: Called by `App::refresh_token_activity` inside a timeout-wrapped background task.
+**Call relations**: This helper is launched by `App::refresh_token_activity`, which adds a timeout and sends the final event.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (refresh_token_activity); 2 external calls (String, format!).
 
@@ -3739,11 +3749,11 @@ async fn fetch_rate_limit_reset_credits(
 ) -> Result<RateLimitResetCreditsSummary>
 ```
 
-**Purpose**: Extracts the `rate_limit_reset_credits` field from the account rate-limits response and errors if the field is absent. It narrows a broader response into the specific summary needed by the reset-credit UI.
+**Purpose**: Extracts the reset-credit summary from the account rate-limits response. It treats missing reset-credit data as an error because the caller specifically asked for it.
 
-**Data flow**: Sends `ClientRequest::GetAccountRateLimits`, awaits a `GetAccountRateLimitsResponse`, then returns `response.rate_limit_reset_credits` if present or constructs an eyre error stating the response omitted `rateLimitResetCredits`.
+**Data flow**: It sends an account rate-limits request, receives the full rate-limit response, and returns the `rate_limit_reset_credits` field if present; otherwise it returns a descriptive error.
 
-**Call relations**: Used by `App::refresh_rate_limit_reset_credits`; unlike `fetch_account_rate_limits`, it enforces the presence of the reset-credit subfield.
+**Call relations**: This helper is called by `App::refresh_rate_limit_reset_credits`. It reuses the rate-limits endpoint rather than a separate reset-credit endpoint.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (refresh_rate_limit_reset_credits); 2 external calls (String, format!).
 
@@ -3757,11 +3767,11 @@ async fn consume_rate_limit_reset_credit_request(
 ) -> Result<ConsumeAccountRateLimitResetCreditResponse>
 ```
 
-**Purpose**: Performs the RPC that consumes one rate-limit reset credit. It is the transport helper behind the consume-credit popup flow.
+**Purpose**: Sends the request that spends one rate-limit reset credit. The idempotency key helps make the operation safe to retry.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::ConsumeAccountRateLimitResetCredit` with `ConsumeAccountRateLimitResetCreditParams { idempotency_key }`, and returns the typed consume response or a wrapped error.
+**Data flow**: It receives a request handle and key, creates a unique request id, sends `ConsumeAccountRateLimitResetCredit`, and returns the server response or an error with context.
 
-**Call relations**: Called by `App::consume_rate_limit_reset_credit` inside a timeout-wrapped spawned task.
+**Call relations**: This helper is called by `App::consume_rate_limit_reset_credit`, which adds a timeout and event reporting.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (consume_rate_limit_reset_credit); 2 external calls (String, format!).
 
@@ -3775,11 +3785,11 @@ async fn send_add_credits_nudge_email(
 ) -> Result<codex_app_server_protocol::AddCreditsNudgeEmailStatus>
 ```
 
-**Purpose**: Sends the add-credits nudge email request and returns only the resulting status enum. It hides the full response wrapper from callers.
+**Purpose**: Requests that the server send an add-credits nudge email and returns the email status. It is the low-level server call behind the App method with the same name.
 
-**Data flow**: Creates a unique request ID, sends `ClientRequest::SendAddCreditsNudgeEmail` with `SendAddCreditsNudgeEmailParams { credit_type }`, awaits the typed response, and returns `response.status` or a wrapped error.
+**Data flow**: It receives a request handle and credit type, sends `SendAddCreditsNudgeEmail`, and returns only the response status field.
 
-**Call relations**: Used by `App::send_add_credits_nudge_email` in the background task launched from the event dispatcher.
+**Call relations**: This free helper is called by `App::send_add_credits_nudge_email`. The App method turns the result into an app event.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (send_add_credits_nudge_email); 2 external calls (String, format!).
 
@@ -3793,11 +3803,11 @@ async fn fetch_skills_list(
 ) -> Result<SkillsListResponse>
 ```
 
-**Purpose**: Loads the skills list for a single cwd with `force_reload: true`. It is specifically tuned for startup refresh behavior.
+**Purpose**: Loads the list of skills for a working directory. Skills metadata feeds mention suggestions and skills-related UI.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::SkillsList` with `SkillsListParams { cwds: vec![cwd], force_reload: true }`, and returns the typed `SkillsListResponse` or a wrapped error.
+**Data flow**: It receives a request handle and directory, sends `SkillsList` with that directory and `force_reload` enabled, and returns the server's skills list response.
 
-**Call relations**: Called by `App::refresh_startup_skills` so startup can fetch skills metadata without borrowing the full session across first-frame rendering.
+**Call relations**: This helper is used by `App::refresh_startup_skills`, which runs it in the background during startup.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (refresh_startup_skills); 3 external calls (String, format!, vec!).
 
@@ -3812,11 +3822,11 @@ async fn fetch_connectors_list(
 ) -> Result<ConnectorsSnapshot>
 ```
 
-**Purpose**: Reads the connectors/app list from the app server and repackages it into the TUI’s `ConnectorsSnapshot`. It supports optional thread scoping and force-refetch behavior.
+**Purpose**: Loads app connector data from the server and wraps it in the UI's snapshot type. Connectors represent external apps available to the session.
 
-**Data flow**: Creates a unique request ID, sends `ClientRequest::AppsList` with `AppsListParams { cursor: None, limit: None, thread_id, force_refetch }`, awaits `AppsListResponse`, and returns `ConnectorsSnapshot { connectors: response.data }` or a wrapped error.
+**Data flow**: It receives a request handle, a force-refresh flag, and optional thread id. It sends `AppsList`, then returns a `ConnectorsSnapshot` containing the response data.
 
-**Call relations**: Used by `App::fetch_connectors_list` in a spawned task and by no other helper in this file.
+**Call relations**: This helper is called by `App::fetch_connectors_list`. The App method supplies the current thread context and posts the result to the event loop.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_connectors_list); 2 external calls (String, format!).
 
@@ -3830,11 +3840,11 @@ async fn fetch_plugins_list(
 ) -> Result<PluginListResponse>
 ```
 
-**Purpose**: Loads the base plugin list and removes marketplaces that should stay hidden in the CLI. It is the canonical plugin-list transport helper for the TUI.
+**Purpose**: Loads the main plugin list for a directory and removes marketplaces that should not be shown in this UI. It gives callers a cleaned-up plugin list.
 
-**Data flow**: Calls `request_plugin_list(request_handle, cwd)`, wraps any failure with plugin-menu-specific context, mutably filters the returned `PluginListResponse` through `hide_cli_only_plugin_marketplaces`, and returns the cleaned response.
+**Data flow**: It receives a request handle and directory, calls `request_plugin_list`, removes hidden command-line-only marketplaces from the response, and returns the filtered response.
 
-**Call relations**: Called by `App::fetch_plugins_list` before any remote-section fan-out. It delegates the actual RPC to `request_plugin_list`.
+**Call relations**: This helper is called by `App::fetch_plugins_list`. It delegates the raw request to `request_plugin_list` and the filtering to `hide_cli_only_plugin_marketplaces`.
 
 *Call graph*: calls 2 internal fn (hide_cli_only_plugin_marketplaces, request_plugin_list); called by 1 (fetch_plugins_list).
 
@@ -3850,11 +3860,11 @@ async fn fetch_additional_plugin_remote_sections(
 ) -> (Vec<PluginMarke
 ```
 
-**Purpose**: Loads extra remote plugin marketplace sections such as OpenAI curated, workspace, and shared-with-me, collecting both successful marketplace entries and per-section error messages with actionable guidance.
+**Purpose**: Loads extra remote plugin sections such as workspace plugins and shared plugins. It also creates user-facing section errors when a remote catalog cannot be loaded.
 
-**Data flow**: Builds a list of section descriptors based on `plugin_sharing_enabled` and `remote_plugin_enabled`, pre-populating a synthetic error for disabled sharing when needed. For each section it calls `request_plugin_list_for_kinds`, hides CLI-only marketplaces on success and extends the aggregate marketplace list, or formats the error with `plugin_remote_section_error_message` and pushes a `PluginRemoteSectionError { section_id, label, message }`. It returns `(marketplaces, section_errors)`.
+**Data flow**: It receives feature flags, builds the list of remote sections to try, fetches each section by marketplace kind, filters hidden marketplaces, appends successful marketplaces, and records helpful error messages for failures or disabled sharing.
 
-**Call relations**: Called only by `App::fetch_plugins_list` after the base plugin list succeeds. It relies on `request_plugin_list_for_kinds`, `hide_cli_only_plugin_marketplaces`, and the error-message helpers to build the remote sections payload.
+**Call relations**: This helper is called after the main plugin list succeeds in `App::fetch_plugins_list`. It uses `request_plugin_list_for_kinds`, `hide_cli_only_plugin_marketplaces`, `plugin_remote_section_error_message`, and `plugin_sharing_disabled_remote_section_error`.
 
 *Call graph*: calls 4 internal fn (hide_cli_only_plugin_marketplaces, plugin_remote_section_error_message, plugin_sharing_disabled_remote_section_error, request_plugin_list_for_kinds); called by 1 (fetch_plugins_list); 5 external calls (clone, new, clone, format!, vec!).
 
@@ -3865,11 +3875,11 @@ async fn fetch_additional_plugin_remote_sections(
 fn plugin_remote_section_error_message(label: &str, err: &str) -> String
 ```
 
-**Purpose**: Appends a concrete next-step hint to a remote plugin section error when one can be inferred from the error text. Otherwise it returns the original error unchanged.
+**Purpose**: Adds a concrete next step to a remote plugin section error when the file recognizes the problem. This turns raw server errors into advice users can act on.
 
-**Data flow**: Accepts a section label and raw error string, computes a hint via `plugin_remote_section_error_next_step`, and returns either `err.to_string()` if the hint is empty or `format!("{err} {next_step}")`.
+**Data flow**: It receives a section label and error text, asks for a matching next-step sentence, and returns either the original error or the error plus that sentence.
 
-**Call relations**: Used by `fetch_additional_plugin_remote_sections` to turn raw remote-catalog failures into user-facing section errors.
+**Call relations**: This helper is used by `fetch_additional_plugin_remote_sections` when a remote plugin section fails. It delegates the pattern matching to `plugin_remote_section_error_next_step`.
 
 *Call graph*: calls 1 internal fn (plugin_remote_section_error_next_step); called by 1 (fetch_additional_plugin_remote_sections); 1 external calls (format!).
 
@@ -3880,11 +3890,11 @@ fn plugin_remote_section_error_message(label: &str, err: &str) -> String
 fn plugin_remote_section_error_next_step(label: &str, err: &str) -> &'static str
 ```
 
-**Purpose**: Maps common remote plugin catalog failure substrings to short remediation advice. It encodes the TUI’s heuristics for turning backend/auth/workspace errors into actionable guidance.
+**Purpose**: Chooses a helpful next-step sentence for common remote plugin failures. Examples include signing in, switching workspaces, asking an admin, updating Codex, or trying again later.
 
-**Data flow**: Lowercases the incoming error string and checks it against a sequence of substring patterns covering API-key auth, missing authentication, disabled plugin sharing, workspace mismatch, 404/not found, stale builds, transient service/request failures, admin disablement, and a shared-with-me-specific disabled-plugin case. It returns a static hint string or `""` if no heuristic matches.
+**Data flow**: It lowercases the error text, checks it for known phrases, and returns a static advice string or an empty string if no advice matches.
 
-**Call relations**: Called only by `plugin_remote_section_error_message` as the decision table behind user-facing next-step text.
+**Call relations**: This function is called only by `plugin_remote_section_error_message`, which attaches the returned advice to the visible error.
 
 *Call graph*: called by 1 (plugin_remote_section_error_message).
 
@@ -3895,11 +3905,11 @@ fn plugin_remote_section_error_next_step(label: &str, err: &str) -> &'static str
 fn plugin_sharing_disabled_remote_section_error() -> PluginRemoteSectionError
 ```
 
-**Purpose**: Constructs the synthetic error entry shown when plugin sharing is disabled locally, so the shared-with-me section can still render a meaningful explanation.
+**Purpose**: Builds the standard error shown for the "Shared with me" plugin section when plugin sharing is disabled. This makes the missing section explicit instead of silently omitting it.
 
-**Data flow**: Returns a fixed `PluginRemoteSectionError` with `section_id = "shared-with-me"`, label `"Shared with me"`, and a message instructing the user to enable plugin sharing.
+**Data flow**: It takes no input and returns a `PluginRemoteSectionError` with the shared-with-me section id, label, and a message explaining that plugin sharing must be enabled.
 
-**Call relations**: Used by `fetch_additional_plugin_remote_sections` when the feature flag disables shared plugin loading before any RPC is attempted.
+**Call relations**: This helper is used by `fetch_additional_plugin_remote_sections` when the plugin sharing feature flag is off.
 
 *Call graph*: called by 1 (fetch_additional_plugin_remote_sections).
 
@@ -3910,11 +3920,11 @@ fn plugin_sharing_disabled_remote_section_error() -> PluginRemoteSectionError
 fn hide_cli_only_plugin_marketplaces(response: &mut PluginListResponse)
 ```
 
-**Purpose**: Filters plugin marketplace results to remove marketplaces that should not appear in the TUI. Currently it hides the `openai-bundled` marketplace.
+**Purpose**: Removes plugin marketplaces that should not appear in the terminal UI's plugin menu. Currently it hides the `openai-bundled` marketplace.
 
-**Data flow**: Mutably borrows a `PluginListResponse` and retains only marketplaces whose `name` is not contained in the `CLI_HIDDEN_PLUGIN_MARKETPLACES` slice.
+**Data flow**: It receives a mutable plugin list response and filters its marketplace list in place, keeping only marketplaces whose names are not in the hidden list.
 
-**Call relations**: Called by both plugin-list fetch helpers and covered by a dedicated unit test to lock in the hidden-marketplace policy.
+**Call relations**: This helper is used after plugin-list responses in `fetch_plugins_list` and `fetch_additional_plugin_remote_sections`. A unit test also calls it to verify the filtering behavior.
 
 *Call graph*: called by 3 (fetch_additional_plugin_remote_sections, fetch_plugins_list, hide_cli_only_plugin_marketplaces_removes_openai_bundled).
 
@@ -3928,11 +3938,11 @@ async fn request_plugin_list(
 ) -> Result<PluginListResponse>
 ```
 
-**Purpose**: Requests the plugin list without restricting marketplace kinds. It is a convenience wrapper around the more general helper.
+**Purpose**: Requests the default plugin list for a directory. It is a convenience wrapper for the more general marketplace-kind request helper.
 
-**Data flow**: Forwards `request_handle` and `cwd` to `request_plugin_list_with_marketplace_kinds` with `None` for `marketplace_kinds`, returning the resulting `PluginListResponse` or error.
+**Data flow**: It receives a request handle and directory, passes them to `request_plugin_list_with_marketplace_kinds` with no marketplace-kind filter, and returns that result.
 
-**Call relations**: Used by `fetch_plugins_list` and by plugin-mention fetching code elsewhere in the app.
+**Call relations**: This helper is called by `fetch_plugins_list` and also by plugin mention loading elsewhere. It funnels default plugin-list requests into the shared request builder.
 
 *Call graph*: calls 1 internal fn (request_plugin_list_with_marketplace_kinds); called by 2 (fetch_plugins_list, fetch_plugin_mentions).
 
@@ -3947,11 +3957,11 @@ async fn request_plugin_list_for_kinds(
 ) -> Result<PluginListResponse>
 ```
 
-**Purpose**: Requests the plugin list restricted to a specific set of marketplace kinds. It supports the remote-section fan-out logic.
+**Purpose**: Requests plugin listings limited to particular marketplace kinds. This is used for remote plugin sections that should be loaded separately.
 
-**Data flow**: Passes `request_handle`, `cwd`, and `Some(marketplace_kinds)` to `request_plugin_list_with_marketplace_kinds` and returns the resulting response or error.
+**Data flow**: It receives a request handle, directory, and marketplace-kind list, then calls `request_plugin_list_with_marketplace_kinds` with that filter.
 
-**Call relations**: Called by `fetch_additional_plugin_remote_sections` for each remote section.
+**Call relations**: This helper is called by `fetch_additional_plugin_remote_sections`. It shares the actual app-server request code with `request_plugin_list`.
 
 *Call graph*: calls 1 internal fn (request_plugin_list_with_marketplace_kinds); called by 1 (fetch_additional_plugin_remote_sections).
 
@@ -3966,11 +3976,11 @@ async fn request_plugin_list_with_marketplace_kinds(
 ) -> Result<PluginList
 ```
 
-**Purpose**: Performs the underlying plugin-list RPC, validating that cwd is absolute and optionally restricting marketplace kinds. It is the shared transport implementation for all plugin-list reads.
+**Purpose**: Builds and sends the actual plugin-list request to the app server. It can request all marketplaces or only selected kinds.
 
-**Data flow**: Converts `cwd: PathBuf` into `AbsolutePathBuf` with `try_from`, builds a unique request ID, sends `ClientRequest::PluginList` with `PluginListParams { cwds: Some(vec![cwd]), marketplace_kinds }`, and returns the typed `PluginListResponse` or a wrapped error.
+**Data flow**: It receives a request handle, directory, and optional marketplace-kind filter. It first requires the directory to be an absolute path, then sends `PluginList` with a unique request id and returns the response.
 
-**Call relations**: This private helper is called by both `request_plugin_list` and `request_plugin_list_for_kinds`.
+**Call relations**: This is the shared low-level helper used by both `request_plugin_list` and `request_plugin_list_for_kinds`.
 
 *Call graph*: calls 2 internal fn (request_typed, try_from); called by 2 (request_plugin_list, request_plugin_list_for_kinds); 3 external calls (String, format!, vec!).
 
@@ -3984,11 +3994,11 @@ async fn fetch_plugin_detail(
 ) -> Result<PluginReadResponse>
 ```
 
-**Purpose**: Reads detailed plugin metadata for a specific plugin request. It is the low-level transport helper behind plugin detail views.
+**Purpose**: Sends the server request to read detailed data for a plugin. It is the low-level helper behind the App method with the same name.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::PluginRead { request_id, params }`, and returns the typed `PluginReadResponse` or a wrapped error.
+**Data flow**: It receives a request handle and plugin read parameters, creates a unique request id, sends `PluginRead`, and returns the plugin detail response or an error.
 
-**Call relations**: Called by `App::fetch_plugin_detail` in a spawned task.
+**Call relations**: This helper is called by `App::fetch_plugin_detail`, which wraps it in a background task and sends an event.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_plugin_detail); 2 external calls (String, format!).
 
@@ -4003,11 +4013,11 @@ async fn fetch_marketplace_add(
 ) -> Result<MarketplaceAddResponse>
 ```
 
-**Purpose**: Adds a marketplace source after normalizing cwd and resolving relative local paths in the source string. It preserves git-style `#ref` or `@ref` suffixes while resolving local paths.
+**Purpose**: Sends the server request to add a plugin marketplace. It also normalizes relative local paths before sending them.
 
-**Data flow**: Converts `cwd` to `AbsolutePathBuf`, rewrites `source` through `marketplace_add_source_for_request(cwd.as_path(), source)`, builds a unique request ID, sends `ClientRequest::MarketplaceAdd` with `MarketplaceAddParams { source, ref_name: None, sparse_paths: None }`, and returns the typed response or a wrapped error.
+**Data flow**: It receives a request handle, current directory, and source string. It requires the directory to be absolute, rewrites relative local sources against that directory, sends `MarketplaceAdd`, and returns the server response.
 
-**Call relations**: Used by `App::fetch_marketplace_add`; it delegates source normalization to `marketplace_add_source_for_request`.
+**Call relations**: This helper is called by `App::fetch_marketplace_add`. It uses `marketplace_add_source_for_request` to prepare the source string.
 
 *Call graph*: calls 3 internal fn (request_typed, marketplace_add_source_for_request, try_from); called by 1 (fetch_marketplace_add); 3 external calls (as_path, String, format!).
 
@@ -4018,11 +4028,11 @@ async fn fetch_marketplace_add(
 fn marketplace_add_source_for_request(cwd: &std::path::Path, source: String) -> String
 ```
 
-**Purpose**: Resolves relative local marketplace sources against the current cwd while leaving remote identifiers and home-relative paths untouched. It also preserves trailing branch/tag suffixes.
+**Purpose**: Turns relative local marketplace paths into absolute paths while leaving remote-looking sources alone. This prevents the server from interpreting `./marketplace` without knowing the user's current directory.
 
-**Data flow**: Splits the incoming `source` into a base and optional `#...` or `@...` suffix using `rsplit_once`. If the base is `.`/`..` or starts with `./`, `../`, `.\`, or `..\`, it resolves the base against `cwd` via `AbsolutePathBuf::resolve_path_against_base`, converts it back to a string, reattaches any suffix, and returns the resolved path. Otherwise it returns the original source unchanged.
+**Data flow**: It receives the current directory and source string. It separates any branch or ref suffix like `#main` or `@tag`, resolves relative local path forms against the directory, restores the suffix, and otherwise returns the original source.
 
-**Call relations**: Called by `fetch_marketplace_add` and covered by a unit test that checks relative-path resolution and suffix preservation.
+**Call relations**: This helper is used by `fetch_marketplace_add` and tested directly by `tests::marketplace_add_source_for_request_resolves_relative_local_paths`.
 
 *Call graph*: calls 1 internal fn (resolve_path_against_base); called by 2 (fetch_marketplace_add, marketplace_add_source_for_request_resolves_relative_local_paths); 2 external calls (format!, matches!).
 
@@ -4036,11 +4046,11 @@ async fn fetch_marketplace_remove(
 ) -> Result<MarketplaceRemoveResponse>
 ```
 
-**Purpose**: Performs the marketplace removal RPC. It is the transport helper behind the remove-marketplace flow.
+**Purpose**: Sends the server request to remove a plugin marketplace by name.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::MarketplaceRemove { params: MarketplaceRemoveParams { marketplace_name } }`, and returns the typed `MarketplaceRemoveResponse` or a wrapped error.
+**Data flow**: It receives a request handle and marketplace name, creates a unique request id, sends `MarketplaceRemove`, and returns the response or an error.
 
-**Call relations**: Called by `App::fetch_marketplace_remove`.
+**Call relations**: This helper is called by `App::fetch_marketplace_remove`, which preserves UI labels and reports completion through an event.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_marketplace_remove); 2 external calls (String, format!).
 
@@ -4054,11 +4064,11 @@ async fn fetch_marketplace_upgrade(
 ) -> Result<MarketplaceUpgradeResponse>
 ```
 
-**Purpose**: Performs the marketplace upgrade RPC for one marketplace or all marketplaces. It is the transport helper behind upgrade actions.
+**Purpose**: Sends the server request to upgrade one marketplace or all marketplaces. Upgrading refreshes marketplace content known to the plugin system.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::MarketplaceUpgrade { params: MarketplaceUpgradeParams { marketplace_name } }`, and returns the typed `MarketplaceUpgradeResponse` or a wrapped error.
+**Data flow**: It receives a request handle and optional marketplace name, creates a unique request id, sends `MarketplaceUpgrade`, and returns the response.
 
-**Call relations**: Called by `App::fetch_marketplace_upgrade`.
+**Call relations**: This helper is called by `App::fetch_marketplace_upgrade`, which runs it in the background.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_marketplace_upgrade); 2 external calls (String, format!).
 
@@ -4073,11 +4083,11 @@ async fn fetch_plugin_install(
 ) -> Result<PluginInstallResponse>
 ```
 
-**Purpose**: Performs the plugin install RPC after converting `PluginLocation` into exactly one request location field. It supports both local-path and remote-marketplace installs.
+**Purpose**: Sends the server request to install a plugin from the chosen location. The location may be a local marketplace path or a remote marketplace name.
 
-**Data flow**: Builds a unique request ID, calls `location.into_request_params()` to obtain `(marketplace_path, remote_marketplace_name)`, sends `ClientRequest::PluginInstall` with those fields plus `plugin_name`, and returns the typed install response or a wrapped error.
+**Data flow**: It receives a request handle, plugin location, and plugin name. It converts the location into exactly the request fields the server expects, sends `PluginInstall`, and returns the install response.
 
-**Call relations**: Called by `App::fetch_plugin_install`; the location conversion behavior is covered by a unit test in this file.
+**Call relations**: This helper is called by `App::fetch_plugin_install`. It relies on `PluginLocation::into_request_params` to express local versus remote install sources.
 
 *Call graph*: calls 2 internal fn (request_typed, into_request_params); called by 1 (fetch_plugin_install); 2 external calls (String, format!).
 
@@ -4091,11 +4101,11 @@ async fn fetch_plugin_uninstall(
 ) -> Result<PluginUninstallResponse>
 ```
 
-**Purpose**: Performs the plugin uninstall RPC. It is the low-level transport helper for uninstall actions.
+**Purpose**: Sends the server request to uninstall a plugin by id.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::PluginUninstall { params: PluginUninstallParams { plugin_id } }`, and returns the typed uninstall response or a wrapped error.
+**Data flow**: It receives a request handle and plugin id, creates a unique request id, sends `PluginUninstall`, and returns the server response or a wrapped error.
 
-**Call relations**: Called by `App::fetch_plugin_uninstall`.
+**Call relations**: This helper is called by `App::fetch_plugin_uninstall`, which adds UI context and event delivery.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (fetch_plugin_uninstall); 2 external calls (String, format!).
 
@@ -4110,11 +4120,11 @@ async fn write_plugin_enabled(
 ) -> Result<ConfigWriteResponse>
 ```
 
-**Purpose**: Writes plugin enablement into config via a single-value upsert. It targets the `plugins.{plugin_id}` key path with a JSON object containing the enabled flag.
+**Purpose**: Writes the enabled or disabled state for one plugin into configuration through the app server. It uses an upsert write, meaning it creates or updates the setting.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::ConfigValueWrite` with `ConfigValueWriteParams { key_path: format!("plugins.{plugin_id}"), value: json!({"enabled": enabled}), merge_strategy: Upsert, file_path: None, expected_version: None }`, and returns the typed `ConfigWriteResponse` or a wrapped error.
+**Data flow**: It receives a request handle, plugin id, and enabled flag. It builds a config key like `plugins.<id>`, writes JSON containing the enabled value, and returns the config write response.
 
-**Call relations**: Called by `App::spawn_plugin_enabled_write` as the actual config-write transport.
+**Call relations**: This helper is called by `App::spawn_plugin_enabled_write`, after `App::set_plugin_enabled` decides a write should start.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (spawn_plugin_enabled_write); 3 external calls (String, format!, json!).
 
@@ -4129,11 +4139,11 @@ async fn write_hook_enabled(
 ) -> Result<ConfigWriteResponse>
 ```
 
-**Purpose**: Writes hook enablement into config via a batch edit that updates `hooks.state`. It requests a user-config reload after the write.
+**Purpose**: Writes the enabled or disabled state for one hook into configuration. It uses a batch config write and asks the app server to reload user config afterward.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::ConfigBatchWrite` with one `ConfigEdit` targeting `hooks.state` and a nested JSON object `{ key: { "enabled": enabled } }`, plus `reload_user_config: true`, and returns the typed `ConfigWriteResponse` or a wrapped error.
+**Data flow**: It receives a request handle, hook key, and enabled flag. It sends a config batch edit under `hooks.state` with the new value and returns the write response.
 
-**Call relations**: Called by `App::spawn_hook_enabled_write`.
+**Call relations**: This helper is called by `App::spawn_hook_enabled_write`, after `App::set_hook_enabled` decides a write should start.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (spawn_hook_enabled_write); 3 external calls (String, format!, vec!).
 
@@ -4149,11 +4159,11 @@ fn build_feedback_upload_params(
     turn_id: Option<String>,
 ```
 
-**Purpose**: Constructs the protocol payload for feedback uploads from current thread/log context and user selections. It decides whether rollout logs and turn tags should be included.
+**Purpose**: Builds the structured feedback upload request from UI choices. It decides which optional pieces, such as logs and turn id tags, should be included.
 
-**Data flow**: Accepts optional origin thread ID, optional rollout path, feedback category, optional reason, optional turn ID, and `include_logs`. It converts the category to a classification string via `feedback_classification`, stringifies the thread ID if present, includes `extra_log_files` only when logs are requested, builds `tags` as a one-entry `BTreeMap` containing `turn_id` when provided, and returns a `FeedbackUploadParams` struct.
+**Data flow**: It receives the originating thread id, optional rollout log path, category, optional reason, optional turn id, and log-inclusion flag. It converts the category to a classification string, includes thread id and tags when present, includes log files only when logs are requested, and returns `FeedbackUploadParams`.
 
-**Call relations**: Used by `App::submit_feedback` and covered by tests that verify inclusion and omission of rollout paths and thread IDs.
+**Call relations**: This helper is called by `App::submit_feedback` before the server upload. Unit tests call it to check both log-including and log-omitting cases.
 
 *Call graph*: called by 3 (submit_feedback, build_feedback_upload_params_includes_thread_id_and_rollout_path, build_feedback_upload_params_omits_rollout_path_without_logs); 1 external calls (feedback_classification).
 
@@ -4167,11 +4177,11 @@ async fn fetch_feedback_upload(
 ) -> Result<FeedbackUploadResponse>
 ```
 
-**Purpose**: Performs the feedback upload RPC. It is the transport helper behind the feedback submission flow.
+**Purpose**: Sends the feedback upload request to the app server. It is the low-level request helper behind feedback submission.
 
-**Data flow**: Builds a unique request ID, sends `ClientRequest::FeedbackUpload { request_id, params }`, and returns the typed `FeedbackUploadResponse` or a wrapped error.
+**Data flow**: It receives a request handle and prepared feedback parameters, creates a unique request id, sends `FeedbackUpload`, and returns the upload response or an error.
 
-**Call relations**: Called by `App::submit_feedback` inside a spawned task.
+**Call relations**: This helper is called by `App::submit_feedback`, which extracts the returned thread id and posts a completion event.
 
 *Call graph*: calls 1 internal fn (request_typed); called by 1 (submit_feedback); 2 external calls (String, format!).
 
@@ -4182,11 +4192,11 @@ async fn fetch_feedback_upload(
 fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -> McpInventoryMaps
 ```
 
-**Purpose**: Converts flat `McpServerStatus` records into the per-server maps used by MCP-related tests. It prefixes tool names with `mcp__{server}__{tool}` and preserves per-server resources, templates, and auth status.
+**Purpose**: Converts MCP status responses into maps used by older or in-process MCP code during tests. The production TUI renders directly from the status list, so this helper is test-only.
 
-**Data flow**: Consumes `Vec<McpServerStatus>`, initializes four maps, then for each status inserts a converted auth status, stores `resources` and `resource_templates` under the server name, and inserts each tool into the tools map under a prefixed composite key. It returns the tuple `(tools, resources, resource_templates, auth_statuses)`.
+**Data flow**: It receives a list of server statuses. For each server it records auth status, resources, resource templates, and inserts each tool under a combined key like `mcp__server__tool`, then returns all four maps.
 
-**Call relations**: This helper is compiled only for tests and is exercised by `tests::mcp_inventory_maps_prefix_tool_names_by_server`.
+**Call relations**: This test-only helper is called by `tests::mcp_inventory_maps_prefix_tool_names_by_server` to verify the conversion and tool-name prefixing.
 
 *Call graph*: called by 1 (mcp_inventory_maps_prefix_tool_names_by_server); 2 external calls (new, format!).
 
@@ -4197,11 +4207,11 @@ fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -> McpInvent
 fn test_absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Creates an `AbsolutePathBuf` fixture from a string path for plugin-marketplace tests. It keeps test setup concise.
+**Purpose**: Creates an absolute path value for tests. It keeps repeated test setup short and explicit.
 
-**Data flow**: Converts the input `&str` into `PathBuf`, then into `AbsolutePathBuf` with `try_from`, panicking if the path is not absolute.
+**Data flow**: It receives a path string, turns it into a `PathBuf`, converts it to an `AbsolutePathBuf`, and fails the test if the path is not absolute.
 
-**Call relations**: Used by tests that need stable absolute marketplace paths.
+**Call relations**: Several plugin marketplace tests use this helper when they need an absolute marketplace path.
 
 *Call graph*: calls 1 internal fn (try_from); 1 external calls (from).
 
@@ -4212,11 +4222,11 @@ fn test_absolute_path(path: &str) -> AbsolutePathBuf
 fn marketplace_add_source_for_request_resolves_relative_local_paths()
 ```
 
-**Purpose**: Verifies that relative local marketplace sources are resolved against cwd while remote identifiers and `~` paths are left unchanged. It also checks suffix preservation for `#main`.
+**Purpose**: Checks that relative marketplace paths are resolved against the current directory, while remote-style and home-relative strings are left unchanged.
 
-**Data flow**: Builds a platform-specific cwd, calls `marketplace_add_source_for_request` with several source strings, asserts the resolved local path is absolute and equals `cwd.join(...)`, and asserts remote and home-relative inputs are returned unchanged.
+**Data flow**: It creates a platform-appropriate current directory, calls `marketplace_add_source_for_request` with several source forms, and asserts the expected resolved or unchanged strings.
 
-**Call relations**: This test directly covers the path-normalization helper used by `fetch_marketplace_add`.
+**Call relations**: This test directly protects the path-normalizing behavior used by `fetch_marketplace_add`.
 
 *Call graph*: calls 1 internal fn (marketplace_add_source_for_request); 4 external calls (from, assert!, assert_eq!, cfg!).
 
@@ -4227,11 +4237,11 @@ fn marketplace_add_source_for_request_resolves_relative_local_paths()
 fn hide_cli_only_plugin_marketplaces_removes_openai_bundled()
 ```
 
-**Purpose**: Checks that the CLI-specific marketplace filter removes `openai-bundled` while leaving other marketplaces intact.
+**Purpose**: Verifies that the hidden command-line-only plugin marketplace is removed from plugin list responses.
 
-**Data flow**: Constructs a `PluginListResponse` with two marketplaces, mutably passes it to `hide_cli_only_plugin_marketplaces`, and asserts only the non-hidden marketplace remains.
+**Data flow**: It builds a plugin list with `openai-bundled` and another marketplace, calls `hide_cli_only_plugin_marketplaces`, and asserts that only the visible marketplace remains.
 
-**Call relations**: This test locks in the filtering policy implemented by `hide_cli_only_plugin_marketplaces`.
+**Call relations**: This test covers the filtering helper used by `fetch_plugins_list` and `fetch_additional_plugin_remote_sections`.
 
 *Call graph*: calls 1 internal fn (hide_cli_only_plugin_marketplaces); 3 external calls (new, assert_eq!, vec!).
 
@@ -4242,11 +4252,11 @@ fn hide_cli_only_plugin_marketplaces_removes_openai_bundled()
 fn plugin_location_request_params_select_exactly_one_location()
 ```
 
-**Purpose**: Verifies that `PluginLocation` converts into request parameters with exactly one of `marketplace_path` or `remote_marketplace_name` populated.
+**Purpose**: Checks that plugin install locations translate into the correct request fields. Local installs should use a path, and remote installs should use a marketplace name.
 
-**Data flow**: Creates both `PluginLocation::Local` and `PluginLocation::Remote`, calls `into_request_params()` on each, and asserts the returned tuples contain the expected `Some/None` combinations.
+**Data flow**: It creates a local absolute path, converts both local and remote `PluginLocation` values into request parameters, and asserts that exactly one of the two location fields is set in each case.
 
-**Call relations**: This test documents the conversion relied on by `fetch_plugin_install`.
+**Call relations**: This test protects the location conversion used by `fetch_plugin_install` before it sends an install request.
 
 *Call graph*: 2 external calls (assert_eq!, test_absolute_path).
 
@@ -4257,11 +4267,11 @@ fn plugin_location_request_params_select_exactly_one_location()
 fn plugin_remote_section_error_message_adds_concrete_next_steps()
 ```
 
-**Purpose**: Checks that representative remote plugin errors receive the intended remediation hints. It validates the heuristic mapping from backend/auth/workspace failures to user guidance.
+**Purpose**: Verifies that common remote plugin errors get helpful next-step advice. This keeps user-facing remote section failures actionable.
 
-**Data flow**: Iterates over labeled `(section, err, next_step)` cases, calls `plugin_remote_section_error_message`, and asserts the returned string equals the original error plus the expected hint.
+**Data flow**: It defines several section labels, raw errors, and expected advice strings. For each case it calls `plugin_remote_section_error_message` and asserts that the advice is appended.
 
-**Call relations**: This test covers the combined behavior of `plugin_remote_section_error_message` and `plugin_remote_section_error_next_step`.
+**Call relations**: This test covers `plugin_remote_section_error_message` and, through it, the matching rules in `plugin_remote_section_error_next_step`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4272,11 +4282,11 @@ fn plugin_remote_section_error_message_adds_concrete_next_steps()
 fn plugin_sharing_disabled_remote_section_error_targets_shared_with_me()
 ```
 
-**Purpose**: Verifies the synthetic disabled-sharing error targets the shared-with-me section with the exact expected message.
+**Purpose**: Checks that the disabled-sharing error points to the correct remote plugin section. The section should be `Shared with me`.
 
-**Data flow**: Calls `plugin_sharing_disabled_remote_section_error()` and asserts the returned `PluginRemoteSectionError` matches the fixed section ID, label, and message.
+**Data flow**: It calls `plugin_sharing_disabled_remote_section_error` and compares the whole returned error object to the expected id, label, and message.
 
-**Call relations**: This test documents the fallback error object inserted by `fetch_additional_plugin_remote_sections` when plugin sharing is disabled.
+**Call relations**: This test protects the error object inserted by `fetch_additional_plugin_remote_sections` when plugin sharing is off.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4287,11 +4297,11 @@ fn plugin_sharing_disabled_remote_section_error_targets_shared_with_me()
 fn mcp_inventory_maps_prefix_tool_names_by_server()
 ```
 
-**Purpose**: Ensures the test-only MCP inventory map conversion prefixes tool keys by server and preserves per-server resource/template/auth entries.
+**Purpose**: Verifies that MCP tools are keyed with their server name when converted into maps. This avoids collisions when different servers expose tools with the same name.
 
-**Data flow**: Builds two `McpServerStatus` fixtures, calls `mcp_inventory_maps_from_statuses`, sorts resource/template keys for stable comparison, and asserts the tool key list, resource/template server names, and auth status map contents are correct.
+**Data flow**: It builds sample MCP statuses, calls `mcp_inventory_maps_from_statuses`, sorts map keys where needed, and asserts that tools, resources, templates, and auth statuses are recorded as expected.
 
-**Call relations**: This test exercises the test-only conversion helper used to validate MCP inventory shaping.
+**Call relations**: This test covers the test-only MCP conversion helper `mcp_inventory_maps_from_statuses`.
 
 *Call graph*: calls 1 internal fn (mcp_inventory_maps_from_statuses); 2 external calls (assert_eq!, vec!).
 
@@ -4302,11 +4312,11 @@ fn mcp_inventory_maps_prefix_tool_names_by_server()
 async fn mcp_inventory_omits_thread_id_for_closed_agent_thread()
 ```
 
-**Purpose**: Verifies that MCP inventory requests stop carrying a thread ID once the corresponding agent thread is marked closed. This prevents stale closed-agent context from affecting inventory reads.
+**Purpose**: Checks that MCP inventory requests stop including a thread id after the agent thread is closed. This prevents stale thread-specific requests.
 
-**Data flow**: Creates a test app, sets `active_thread_id`, inserts an open agent-navigation entry, asserts `mcp_inventory_request_thread_id(Some(thread_id))` returns `Some(thread_id)`, marks the agent thread closed, and asserts the helper now returns `None`.
+**Data flow**: It creates a test app, marks a new thread as active and open, verifies the id is accepted, then marks the thread closed and verifies the helper returns no id.
 
-**Call relations**: This test directly covers the gating logic in `App::mcp_inventory_request_thread_id`, which is used by `App::fetch_mcp_inventory`.
+**Call relations**: This test covers `App::mcp_inventory_request_thread_id`, which is used by `App::fetch_mcp_inventory`.
 
 *Call graph*: calls 2 internal fn (new, make_test_app); 1 external calls (assert_eq!).
 
@@ -4317,11 +4327,11 @@ async fn mcp_inventory_omits_thread_id_for_closed_agent_thread()
 fn build_feedback_upload_params_includes_thread_id_and_rollout_path()
 ```
 
-**Purpose**: Checks that feedback upload params include thread ID, rollout log path, reason, and turn tag when logs are requested and metadata is present.
+**Purpose**: Verifies that feedback upload parameters include thread id, reason, turn id tag, and rollout log path when logs are requested.
 
-**Data flow**: Creates a thread ID and rollout path, calls `build_feedback_upload_params` with `include_logs = true`, and asserts the returned struct contains the expected classification, reason, thread ID string, `turn_id` tag, `include_logs = true`, and `extra_log_files = Some(vec![rollout_path])`.
+**Data flow**: It creates a thread id and rollout path, builds feedback parameters with logs enabled, and asserts that all expected fields are present.
 
-**Call relations**: This test documents the positive inclusion behavior of `build_feedback_upload_params`.
+**Call relations**: This test covers the log-including branch of `build_feedback_upload_params`, used by `App::submit_feedback`.
 
 *Call graph*: calls 2 internal fn (new, build_feedback_upload_params); 2 external calls (from, assert_eq!).
 
@@ -4332,10 +4342,10 @@ fn build_feedback_upload_params_includes_thread_id_and_rollout_path()
 fn build_feedback_upload_params_omits_rollout_path_without_logs()
 ```
 
-**Purpose**: Verifies that feedback upload params omit rollout logs and optional metadata when logs are not requested. It covers the negative branch of the payload builder.
+**Purpose**: Verifies that feedback upload parameters do not attach log files when the user chose not to include logs.
 
-**Data flow**: Calls `build_feedback_upload_params` with no thread ID, no reason, no turn ID, and `include_logs = false`, then asserts the returned struct has the expected classification, `None` metadata fields, `include_logs = false`, and `extra_log_files = None`.
+**Data flow**: It builds feedback parameters with a rollout path available but logs disabled, then asserts that optional reason, thread id, tags, and extra log files are absent as expected.
 
-**Call relations**: This test complements the previous feedback test by covering the omission path in `build_feedback_upload_params`.
+**Call relations**: This test covers the privacy-sensitive log-omitting branch of `build_feedback_upload_params`.
 
 *Call graph*: calls 1 internal fn (build_feedback_upload_params); 2 external calls (from, assert_eq!).

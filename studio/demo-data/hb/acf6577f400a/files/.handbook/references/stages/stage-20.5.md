@@ -1,8 +1,6 @@
 # Feedback capture, debug artifacts, and log persistence  `stage-20.5`
 
-This stage is cross-cutting diagnostics and persistence infrastructure: it sits alongside normal request handling and UI execution, capturing evidence about what happened without becoming part of the critical path. At its center, feedback/src/lib.rs assembles in-memory feedback records—logs, request/auth tags, and optional attachments—and exposes tracing layers and writers so other components can feed data into feedback uploads transparently. feedback_diagnostics.rs and app-server/src/request_processors/feedback_doctor_report.rs contribute optional attachments: narrow proxy-environment diagnostics and a best-effort, redacted doctor report with low-cardinality tags.
-
-To keep captured artifacts safe, response-debug-context/src/lib.rs extracts only non-sensitive HTTP error metadata such as request IDs, Cloudflare ray IDs, and auth failure details, while secrets/src/sanitizer.rs redacts obvious credentials before anything is logged or shown. Several file-backed capture paths preserve raw artifacts for later inspection: responses-api-proxy/src/dump.rs snapshots proxied traffic, analytics/src/analytics_capture.rs records analytics payloads, and tui/src/session_log.rs writes JSONL session activity. Finally, state/src/log_db.rs and state/src/runtime/logs.rs persist tracing events into SQLite with batching, retention, querying, and feedback-log extraction, turning transient runtime telemetry into durable debug history.
+This stage is shared behind-the-scenes support for troubleshooting. It captures clues when something goes wrong, makes them safe to keep or send, and stores them for later inspection. The feedback library gathers recent Codex logs and context into a user feedback report, then packages it for Sentry, an error-reporting service. Feedback diagnostics add network clues, such as proxy settings, and the doctor report can run a diagnostic command and attach only valid JSON results. Response debug context extracts safe details from failed API replies and turns errors into short messages without exposing private response bodies. The secret sanitizer is the safety screen: it removes likely API keys, bearer tokens, and similar credentials before text is logged or shared. Several parts persist raw evidence locally. The response proxy can dump HTTP exchanges as JSON while hiding sensitive headers. Analytics capture writes events as one JSON line per record. The TUI session log records interface traffic when explicitly enabled. Finally, the log database layers collect live tracing logs into SQLite, then store, trim, and read them so debugging data stays useful without growing forever.
 
 ## Files in this stage
 
@@ -11,13 +9,15 @@ These files build the feedback capture pipeline, enrich it with optional diagnos
 
 ### `feedback/src/lib.rs`
 
-`orchestration` · `cross-cutting logging, feedback consent, and upload`
+`domain_logic` · `cross-cutting during runtime; snapshot and upload during feedback reporting`
 
-This file is the feedback subsystem’s core orchestration and storage layer. `CodexFeedback` owns an `Arc<FeedbackInner>` containing two mutex-protected stores: a byte `RingBuffer` for captured logs and a `BTreeMap<String, String>` for structured tags. It exposes two tracing integrations: `logger_layer()` builds a `tracing_subscriber::fmt` layer that writes full-fidelity logs into the ring buffer regardless of ambient `RUST_LOG`, while `metadata_layer()` installs a custom `FeedbackMetadataLayer` filtered to the `feedback_tags` target so selected tracing events become upload tags.
+This file is the feedback box for Codex. While the program runs, it keeps a rolling copy of log text in memory, like a dashboard camera that only remembers the last few minutes. That means feedback can include recent clues without growing forever or writing everything to disk. It also listens for special structured log events called feedback tags, which are key/value facts such as model name, authentication state, or request details.
 
-Structured request/auth telemetry is emitted through `emit_feedback_request_tags` and `emit_feedback_request_tags_with_auth_env`. Both first normalize optional fields into a `FeedbackRequestSnapshot`, converting absent values to empty strings and booleans/integers to strings where needed, then log them as debug fields on a `feedback_tags` event. `FeedbackTagsVisitor` later captures those fields into strings, and `FeedbackMetadataLayer::on_event` merges them into the bounded tag map, preserving existing keys once `MAX_FEEDBACK_TAGS` is reached.
+The main type, CodexFeedback, owns shared feedback state. It can create a logging layer that writes log lines into a fixed-size ring buffer, and a metadata layer that picks up special feedback tag events. Later, snapshot() freezes the current logs, tags, diagnostics, and thread id into a FeedbackSnapshot.
 
-`CodexFeedback::snapshot` freezes the current ring buffer bytes and tags, collects environment-based `FeedbackDiagnostics`, and assigns a thread identifier, generating a synthetic `no-active-thread-...` ID when none is active. The resulting `FeedbackSnapshot` can be saved to a temp file or uploaded directly. `upload_feedback` constructs a Sentry client from the hard-coded DSN, derives upload tags while protecting reserved keys, chooses event severity from the classification, optionally attaches the reason as an exception payload, and appends attachments in a fixed order: logs, in-memory extras, connectivity diagnostics, then file-backed extras. File-backed attachment read failures are logged and skipped rather than aborting the upload. The ring buffer itself is intentionally simple: it keeps only the newest `max` bytes, dropping from the front or replacing the whole buffer with the trailing slice when a single write exceeds capacity.
+A FeedbackSnapshot can be saved to a temporary file or uploaded to Sentry, an external error and feedback collection service. Uploads include a classification such as bug or good result, a human-readable reason if present, protected reserved tags such as thread id and CLI version, and optional attachments. Attachments may be in-memory diagnostics, captured logs, or files read from disk. If a file attachment cannot be read, it is skipped and a warning is logged instead of failing the whole report.
+
+The file also includes tests for the rolling buffer, tag collection, attachment gating, and reserved upload tags.
 
 #### Function details
 
@@ -27,11 +27,11 @@ Structured request/auth telemetry is emitted through `emit_feedback_request_tags
 fn from_tags(tags: &'a FeedbackRequestTags<'a>) -> Self
 ```
 
-**Purpose**: Normalizes optional request/auth telemetry fields into a snapshot with concrete string values suitable for tracing and upload tags.
+**Purpose**: This converts request and authentication feedback fields into a safer, upload-ready snapshot. Optional values are turned into empty strings so later logging can record a complete set of fields without checking every value again.
 
-**Data flow**: Reads a borrowed `FeedbackRequestTags`, copies required fields directly, replaces missing optional `&str` fields with `""`, and converts optional booleans and integers into strings via `to_string()` or empty strings when absent. It returns a `FeedbackRequestSnapshot` borrowing the original string slices where possible.
+**Data flow**: It receives a FeedbackRequestTags value with borrowed text, booleans, numbers, and optional fields. It copies references where possible and turns optional booleans or numbers into strings. The result is a FeedbackRequestSnapshot where every field has a concrete value ready to be emitted as structured feedback metadata.
 
-**Call relations**: Used by both request-tag emission functions so they share one normalization policy before logging structured metadata.
+**Call relations**: When request feedback tags need to be emitted, both emit_feedback_request_tags and emit_feedback_request_tags_with_auth_env call this first. It acts as the cleanup step before those functions hand the data to the tracing system.
 
 *Call graph*: called by 2 (emit_feedback_request_tags, emit_feedback_request_tags_with_auth_env).
 
@@ -42,11 +42,11 @@ fn from_tags(tags: &'a FeedbackRequestTags<'a>) -> Self
 fn emit_feedback_request_tags(tags: &FeedbackRequestTags<'_>)
 ```
 
-**Purpose**: Emits a structured tracing event containing request/auth metadata for later capture by the feedback metadata layer.
+**Purpose**: This records request and authentication details as special feedback tags. These tags are not ordinary user-facing logs; they are structured facts saved for a future feedback upload.
 
-**Data flow**: Takes `&FeedbackRequestTags`, builds a normalized `FeedbackRequestSnapshot` via `from_tags`, and logs a `tracing::info!` event targeted at `FEEDBACK_TAGS_TARGET` with each field recorded through `tracing::field::debug`.
+**Data flow**: It receives request tag data, converts it into a snapshot with defaults for missing fields, then emits a tracing event using the special feedback_tags target. The output is not a return value; the metadata layer can later catch this event and store the fields.
 
-**Call relations**: Called by request/auth code paths that want feedback uploads to include structured request context; the event is later consumed by `FeedbackMetadataLayer::on_event`.
+**Call relations**: Callers use this when they want request context to follow a future feedback report. It calls FeedbackRequestSnapshot::from_tags, then hands the fields to the tracing system, where FeedbackMetadataLayer::on_event can collect them.
 
 *Call graph*: calls 1 internal fn (from_tags); 1 external calls (info!).
 
@@ -60,11 +60,11 @@ fn emit_feedback_request_tags_with_auth_env(
 )
 ```
 
-**Purpose**: Emits the same structured request/auth metadata as `emit_feedback_request_tags`, plus safe buckets describing auth-related environment configuration.
+**Purpose**: This records request and authentication details plus safe information about authentication-related environment variables. It helps diagnose login and API-key problems without uploading secret values.
 
-**Data flow**: Builds a `FeedbackRequestSnapshot` from `tags`, reads fields from `AuthEnvTelemetry`, converts optional booleans to strings where needed, and logs one `feedback_tags` tracing event containing both request fields and auth-env fields.
+**Data flow**: It receives request tags and an AuthEnvTelemetry value describing whether certain environment settings are present or enabled. It snapshots the request tags, adds safe environment buckets, and emits everything as a structured tracing event. Nothing is returned; the event can be captured later as feedback metadata.
 
-**Call relations**: Used when the caller has additional auth-environment telemetry available and wants it attached to feedback alongside request metadata.
+**Call relations**: This is the richer version of emit_feedback_request_tags. It calls FeedbackRequestSnapshot::from_tags, then sends the combined request and environment facts to tracing for FeedbackMetadataLayer::on_event to store.
 
 *Call graph*: calls 1 internal fn (from_tags); 1 external calls (info!).
 
@@ -75,11 +75,11 @@ fn emit_feedback_request_tags_with_auth_env(
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default feedback collector using the standard ring-buffer capacity.
+**Purpose**: This creates a standard feedback collector when code asks for the default value. It uses the normal log memory limit.
 
-**Data flow**: Delegates directly to `CodexFeedback::new()` and returns the resulting instance.
+**Data flow**: It takes no input. It delegates to CodexFeedback::new and returns a ready-to-use CodexFeedback instance.
 
-**Call relations**: Implements `Default` so callers and tests can construct feedback capture without specifying capacity.
+**Call relations**: This exists so CodexFeedback can be created through Rust's usual Default pattern. The real setup work is handed off to CodexFeedback::new.
 
 *Call graph*: 1 external calls (new).
 
@@ -90,11 +90,11 @@ fn default() -> Self
 fn new() -> Self
 ```
 
-**Purpose**: Creates a feedback collector with the default maximum log-buffer size.
+**Purpose**: This creates the normal feedback collector used by the application. It keeps up to the default number of recent log bytes in memory.
 
-**Data flow**: Calls `with_capacity(DEFAULT_MAX_BYTES)` and returns the resulting `CodexFeedback`.
+**Data flow**: It takes no input. It calls CodexFeedback::with_capacity with the default maximum size and returns a collector with an empty ring buffer and empty metadata tags.
 
-**Call relations**: This is the normal constructor used throughout the application and tests.
+**Call relations**: Startup and test helpers call this when they need feedback capture. It delegates to CodexFeedback::with_capacity so the capacity choice stays in one place.
 
 *Call graph*: called by 30 (runtime_start_args_forward_environment_manager, runtime_start_args_use_remote_thread_config_loader_when_configured, start_test_client_with_capacity, start_test_client_with_capacity, build_test_processor, run_main_with_transport_options, get_conversation_summary_by_thread_id_reads_pathless_store_thread, mcp_resource_read_returns_error_for_unknown_thread, start_in_process_client, thread_list_includes_store_thread_without_rollout_path (+15 more)); 1 external calls (with_capacity).
 
@@ -105,11 +105,11 @@ fn new() -> Self
 fn with_capacity(max_bytes: usize) -> Self
 ```
 
-**Purpose**: Creates a feedback collector with a caller-specified ring-buffer size.
+**Purpose**: This creates a feedback collector with a custom memory limit for stored logs. It is mainly useful for tests or special cases that need a smaller or larger rolling buffer.
 
-**Data flow**: Allocates a new `FeedbackInner` with `FeedbackInner::new(max_bytes)`, wraps it in `Arc`, and stores it in `CodexFeedback`.
+**Data flow**: It receives the maximum number of bytes to keep. It builds a shared FeedbackInner containing a ring buffer of that size and an empty tag map, then returns a CodexFeedback wrapper around it.
 
-**Call relations**: Used by tests that need small deterministic capacities to exercise ring-buffer eviction behavior.
+**Call relations**: CodexFeedback::new calls this with the standard limit, and the ring buffer test calls it with a tiny limit to prove old log bytes are dropped correctly. It relies on FeedbackInner::new for the actual shared state.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (ring_buffer_drops_front_when_full); 1 external calls (new).
 
@@ -120,11 +120,11 @@ fn with_capacity(max_bytes: usize) -> Self
 fn make_writer(&self) -> FeedbackMakeWriter
 ```
 
-**Purpose**: Returns a `MakeWriter` adapter that writes tracing output into this feedback collector’s ring buffer.
+**Purpose**: This creates a writer that log formatting code can write into. The writer sends bytes into the in-memory feedback buffer instead of a file or terminal.
 
-**Data flow**: Clones the inner `Arc<FeedbackInner>` into a `FeedbackMakeWriter` and returns it.
+**Data flow**: It reads the shared feedback state from the CodexFeedback object and returns a FeedbackMakeWriter that can create individual FeedbackWriter values later. The underlying log buffer is shared, not copied.
 
-**Call relations**: Consumed by `logger_layer()` and any other tracing setup that needs a writer factory.
+**Call relations**: CodexFeedback::logger_layer calls this when building the tracing layer. The returned object is used by tracing-subscriber whenever it needs a fresh writer for a log event.
 
 *Call graph*: called by 1 (logger_layer).
 
@@ -135,11 +135,11 @@ fn make_writer(&self) -> FeedbackMakeWriter
 fn logger_layer(&self) -> impl Layer<S> + Send + Sync + 'static
 ```
 
-**Purpose**: Builds a tracing subscriber layer that captures formatted logs into the feedback ring buffer at full verbosity.
+**Purpose**: This builds a logging layer that captures full-detail logs into the feedback buffer. It ignores the user's normal log filtering so a feedback report can contain the clues needed to debug a problem.
 
-**Data flow**: Creates a `tracing_subscriber::fmt::layer()`, configures it with `self.make_writer()`, system-time timestamps, no ANSI, no target field, and a `Targets` filter whose default level is `TRACE`, then returns the configured layer.
+**Data flow**: It takes the feedback collector, creates a writer for it, and configures a tracing-subscriber formatting layer with timestamps, no color codes, no target text, and trace-level capture. The output is a layer that application startup code can install into the tracing system.
 
-**Call relations**: Installed during application initialization so feedback snapshots contain complete logs independent of user logging configuration.
+**Call relations**: Initialization code uses this to connect normal logging to feedback capture. It calls CodexFeedback::make_writer, and then later FeedbackMakeWriter::make_writer and FeedbackWriter::write do the actual byte storage.
 
 *Call graph*: calls 1 internal fn (make_writer); 2 external calls (new, layer).
 
@@ -150,11 +150,11 @@ fn logger_layer(&self) -> impl Layer<S> + Send + Sync + 'static
 fn metadata_layer(&self) -> impl Layer<S> + Send + Sync + 'static
 ```
 
-**Purpose**: Builds a tracing layer that captures structured `feedback_tags` events into the feedback tag map.
+**Purpose**: This builds a tracing layer that listens only for feedback tag events. It collects structured facts that should be attached to a future feedback upload.
 
-**Data flow**: Constructs `FeedbackMetadataLayer { inner: self.inner.clone() }` and applies a `Targets` filter that only accepts the `FEEDBACK_TAGS_TARGET` target at `TRACE` level.
+**Data flow**: It takes the shared feedback state and wraps it in a FeedbackMetadataLayer. It applies a filter so only events with the special feedback_tags target are seen. The result is a layer that can be installed alongside other tracing layers.
 
-**Call relations**: Installed alongside `logger_layer()` so request/auth metadata emitted through `emit_feedback_request_tags*` is retained for uploads.
+**Call relations**: Startup code installs this so calls such as emit_feedback_request_tags can be captured. When a matching event arrives, FeedbackMetadataLayer::on_event stores the fields.
 
 *Call graph*: 1 external calls (new).
 
@@ -165,11 +165,11 @@ fn metadata_layer(&self) -> impl Layer<S> + Send + Sync + 'static
 fn snapshot(&self, session_id: Option<ThreadId>) -> FeedbackSnapshot
 ```
 
-**Purpose**: Freezes the current captured logs, tags, and environment diagnostics into an immutable upload-ready snapshot.
+**Purpose**: This freezes the current feedback state into a standalone report object. It captures the recent logs, current tags, diagnostics from the environment, and the active thread id if there is one.
 
-**Data flow**: Locks the ring-buffer mutex and copies bytes via `snapshot_bytes()`, locks the tags mutex and clones the `BTreeMap`, collects `FeedbackDiagnostics::collect_from_env()`, and computes `thread_id` from the optional `ThreadId` argument or a generated `no-active-thread-<new id>` fallback. It returns a `FeedbackSnapshot` containing all of that data.
+**Data flow**: It receives an optional ThreadId. It locks the log buffer and copies its bytes, locks the tag map and clones it, collects diagnostics from the environment, and chooses either the provided thread id or a generated no-active-thread id. It returns a FeedbackSnapshot containing all of that.
 
-**Call relations**: Called when opening feedback consent or preparing an upload response so the mutable live collector becomes a stable point-in-time artifact.
+**Call relations**: Feedback upload and consent flows call this when they need a report. It reads from FeedbackInner's ring buffer and tag map, then hands the frozen data to methods such as save_to_temp_file and upload_feedback.
 
 *Call graph*: calls 2 internal fn (collect_from_env, new); called by 2 (upload_feedback_response, open_feedback_consent).
 
@@ -180,11 +180,11 @@ fn snapshot(&self, session_id: Option<ThreadId>) -> FeedbackSnapshot
 fn new(max_bytes: usize) -> Self
 ```
 
-**Purpose**: Initializes the shared mutable state behind `CodexFeedback`.
+**Purpose**: This creates the shared internal storage behind CodexFeedback. It holds both recent log bytes and feedback tags, each protected by a mutex, which is a lock that stops two tasks from changing the same data at once.
 
-**Data flow**: Creates a `RingBuffer::new(max_bytes)` wrapped in `Mutex`, creates an empty `BTreeMap<String, String>` wrapped in `Mutex`, and returns `FeedbackInner`.
+**Data flow**: It receives a maximum byte size. It creates a RingBuffer with that capacity and an empty ordered map for tags, wraps both in mutexes, and returns the internal state object.
 
-**Call relations**: Used only by `CodexFeedback::with_capacity` during collector construction.
+**Call relations**: CodexFeedback::with_capacity calls this while creating a feedback collector. Other parts of the file then share this inner state through Arc, a thread-safe shared pointer.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (with_capacity); 2 external calls (new, new).
 
@@ -195,11 +195,11 @@ fn new(max_bytes: usize) -> Self
 fn make_writer(&'a self) -> Self::Writer
 ```
 
-**Purpose**: Creates a concrete writer instance for one tracing write stream.
+**Purpose**: This produces an actual writer for one logging operation. The writer knows how to append bytes to the shared feedback buffer.
 
-**Data flow**: Clones the shared `Arc<FeedbackInner>` into a new `FeedbackWriter` and returns it.
+**Data flow**: It receives the reusable writer factory and clones its shared feedback pointer. It returns a FeedbackWriter that points at the same underlying ring buffer.
 
-**Call relations**: Called by tracing subscriber infrastructure whenever it needs a writer for log formatting.
+**Call relations**: The tracing-subscriber logging layer calls this whenever it needs somewhere to write formatted log text. The returned FeedbackWriter then sends the bytes to FeedbackWriter::write.
 
 
 ##### `FeedbackWriter::write`  (lines 280–284)
@@ -208,11 +208,11 @@ fn make_writer(&'a self) -> Self::Writer
 fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 ```
 
-**Purpose**: Appends formatted log bytes into the shared feedback ring buffer.
+**Purpose**: This appends log bytes to the rolling in-memory feedback buffer. It reports success for all bytes it was given unless the buffer lock is unusable.
 
-**Data flow**: Locks `self.inner.ring`, maps lock poisoning to `io::ErrorKind::Other`, pushes the provided byte slice into the `RingBuffer` via `push_bytes`, and returns `Ok(buf.len())`.
+**Data flow**: It receives a byte slice from the logging system. It locks the shared ring buffer, pushes the bytes into it, drops old bytes if needed, and returns the number of bytes accepted. If the lock is poisoned, it returns an I/O error.
 
-**Call relations**: This is the sink used by the tracing fmt layer configured in `logger_layer()`.
+**Call relations**: Writers created by FeedbackMakeWriter::make_writer use this during log capture. It hands the actual storage work to RingBuffer::push_bytes.
 
 
 ##### `FeedbackWriter::flush`  (lines 286–288)
@@ -221,11 +221,11 @@ fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 fn flush(&mut self) -> io::Result<()>
 ```
 
-**Purpose**: Implements a no-op flush for the in-memory feedback writer.
+**Purpose**: This satisfies the standard writer interface. Because the feedback writer stores bytes immediately in memory, there is nothing extra to flush.
 
-**Data flow**: Ignores all state and returns `Ok(())`.
+**Data flow**: It receives a mutable writer reference and does no work. It returns success.
 
-**Call relations**: Required by the `Write` trait; tracing may call it, but there is no buffered OS resource to flush.
+**Call relations**: The logging system may call this because all writers are expected to support flushing. In this implementation it is a no-op because FeedbackWriter::write already stores the data.
 
 
 ##### `RingBuffer::new`  (lines 297–302)
@@ -234,11 +234,11 @@ fn flush(&mut self) -> io::Result<()>
 fn new(capacity: usize) -> Self
 ```
 
-**Purpose**: Creates an empty byte ring buffer with a fixed maximum capacity.
+**Purpose**: This creates an empty fixed-size byte buffer. It is used to remember only the most recent logs.
 
-**Data flow**: Stores the requested `capacity` in `max` and allocates a `VecDeque<u8>` with that capacity.
+**Data flow**: It receives a capacity in bytes. It creates an empty VecDeque, which is a double-ended queue, with room for that many bytes, and stores the maximum size beside it. The result is an empty RingBuffer.
 
-**Call relations**: Used by `FeedbackInner::new` to back log capture.
+**Call relations**: FeedbackInner::new calls this when setting up feedback storage. Later, FeedbackWriter::write fills it through RingBuffer::push_bytes.
 
 *Call graph*: called by 1 (new); 1 external calls (with_capacity).
 
@@ -249,11 +249,11 @@ fn new(capacity: usize) -> Self
 fn len(&self) -> usize
 ```
 
-**Purpose**: Returns the current number of bytes stored in the ring buffer.
+**Purpose**: This reports how many bytes are currently stored in the ring buffer. It is used to decide whether new bytes will overflow the limit.
 
-**Data flow**: Reads `self.buf.len()` and returns it.
+**Data flow**: It reads the buffer length and returns that number. It does not change the buffer.
 
-**Call relations**: Used internally by `push_bytes` when deciding whether eviction is needed.
+**Call relations**: RingBuffer::push_bytes calls this before adding new data. That lets push_bytes calculate how many old bytes must be removed.
 
 *Call graph*: called by 1 (push_bytes); 1 external calls (len).
 
@@ -264,11 +264,11 @@ fn len(&self) -> usize
 fn push_bytes(&mut self, data: &[u8])
 ```
 
-**Purpose**: Appends bytes while preserving only the newest `max` bytes of log data.
+**Purpose**: This adds new bytes while keeping only the newest data within the fixed capacity. If too much arrives, older bytes are discarded from the front.
 
-**Data flow**: Mutably borrows the buffer and first returns early for empty input. If the incoming slice length is at least `self.max`, it clears the buffer and keeps only the trailing `self.max` bytes from the new slice. Otherwise it computes `needed = self.len() + data.len()`, pops `to_drop = needed - self.max` bytes from the front if necessary, then extends the deque with the new bytes.
+**Data flow**: It receives a slice of bytes. If the slice is empty, it does nothing. If the slice alone is larger than the buffer capacity, it clears the buffer and keeps only the tail end of the slice. Otherwise, it removes just enough old bytes to make room, then appends the new bytes.
 
-**Call relations**: Called by `FeedbackWriter::write`; it is the core retention policy for captured logs.
+**Call relations**: FeedbackWriter::write calls this whenever a log line is captured. RingBuffer::snapshot_bytes later copies out the kept bytes for a feedback snapshot.
 
 *Call graph*: calls 1 internal fn (len); 3 external calls (clear, extend, pop_front).
 
@@ -279,11 +279,11 @@ fn push_bytes(&mut self, data: &[u8])
 fn snapshot_bytes(&self) -> Vec<u8>
 ```
 
-**Purpose**: Copies the current ring-buffer contents into a contiguous `Vec<u8>`.
+**Purpose**: This copies the current contents of the ring buffer into a regular byte vector. It gives snapshot code a stable copy of the logs.
 
-**Data flow**: Iterates over `self.buf`, copies each byte, collects them into a `Vec<u8>`, and returns it.
+**Data flow**: It reads the bytes in their stored order from oldest kept byte to newest kept byte. It returns a Vec<u8> containing those bytes and does not change the buffer.
 
-**Call relations**: Used by `CodexFeedback::snapshot` to freeze log contents for upload or temp-file persistence.
+**Call relations**: CodexFeedback::snapshot calls this after locking the ring buffer. The copied bytes become part of a FeedbackSnapshot.
 
 *Call graph*: 1 external calls (iter).
 
@@ -294,11 +294,11 @@ fn snapshot_bytes(&self) -> Vec<u8>
 fn as_bytes(&self) -> &[u8]
 ```
 
-**Purpose**: Exposes the captured log bytes as a borrowed slice.
+**Purpose**: This exposes the captured log bytes inside a feedback snapshot. It is a read-only view, so callers can inspect or write the logs without taking ownership of them.
 
-**Data flow**: Returns `&self.bytes`.
+**Data flow**: It receives a FeedbackSnapshot reference and returns a byte slice pointing at its stored log bytes. Nothing is copied or changed.
 
-**Call relations**: Used by `save_to_temp_file` and tests that need direct access to the captured log payload.
+**Call relations**: FeedbackSnapshot::save_to_temp_file calls this when writing the captured logs to disk. Tests also use it to check what the ring buffer saved.
 
 *Call graph*: called by 1 (save_to_temp_file).
 
@@ -309,11 +309,11 @@ fn as_bytes(&self) -> &[u8]
 fn feedback_diagnostics(&self) -> &FeedbackDiagnostics
 ```
 
-**Purpose**: Returns the diagnostics object associated with this snapshot.
+**Purpose**: This exposes the diagnostic information collected with the snapshot. Callers can inspect those diagnostics before deciding what to show or upload.
 
-**Data flow**: Returns `&self.feedback_diagnostics` without cloning.
+**Data flow**: It receives a FeedbackSnapshot reference and returns a reference to its FeedbackDiagnostics value. The snapshot is not changed.
 
-**Call relations**: Allows callers to inspect diagnostics separately from upload assembly.
+**Call relations**: This is a simple access point for code that needs diagnostics collected by CodexFeedback::snapshot. It does not call other helpers.
 
 
 ##### `FeedbackSnapshot::with_feedback_diagnostics`  (lines 396–399)
@@ -322,11 +322,11 @@ fn feedback_diagnostics(&self) -> &FeedbackDiagnostics
 fn with_feedback_diagnostics(mut self, feedback_diagnostics: FeedbackDiagnostics) -> Self
 ```
 
-**Purpose**: Replaces the snapshot’s diagnostics payload and returns the modified snapshot.
+**Purpose**: This replaces the diagnostics inside a snapshot and returns the modified snapshot. It is useful for tests or callers that already computed diagnostics another way.
 
-**Data flow**: Consumes `self`, overwrites `self.feedback_diagnostics` with the provided `FeedbackDiagnostics`, and returns the updated snapshot.
+**Data flow**: It receives a snapshot by value and a FeedbackDiagnostics value. It swaps the snapshot's diagnostics for the provided one and returns the snapshot.
 
-**Call relations**: Used mainly in tests to inject deterministic diagnostics instead of environment-derived ones.
+**Call relations**: Tests use this to create controlled snapshots with or without diagnostics. Later methods such as feedback_diagnostics_attachment_text and feedback_attachments read the updated diagnostics.
 
 
 ##### `FeedbackSnapshot::feedback_diagnostics_attachment_text`  (lines 401–407)
@@ -335,11 +335,11 @@ fn with_feedback_diagnostics(mut self, feedback_diagnostics: FeedbackDiagnostics
 fn feedback_diagnostics_attachment_text(&self, include_logs: bool) -> Option<String>
 ```
 
-**Purpose**: Returns the diagnostics attachment body only when logs/diagnostics are allowed to be included.
+**Purpose**: This decides whether diagnostic text should be attached to feedback and, if so, creates that text. Diagnostics are only included when logs are also allowed.
 
-**Data flow**: If `include_logs` is false, returns `None` immediately. Otherwise delegates to `self.feedback_diagnostics.attachment_text()`.
+**Data flow**: It receives a boolean saying whether logs may be included. If logs are not included, it returns None. If logs are included, it asks the FeedbackDiagnostics object for attachment text and returns that optional text.
 
-**Call relations**: Called by `feedback_attachments` so diagnostics obey the same consent gate as logs.
+**Call relations**: FeedbackSnapshot::feedback_attachments calls this while building upload attachments. This keeps the consent rule in one place: diagnostics travel with log permission.
 
 *Call graph*: calls 1 internal fn (attachment_text); called by 1 (feedback_attachments).
 
@@ -350,11 +350,11 @@ fn feedback_diagnostics_attachment_text(&self, include_logs: bool) -> Option<Str
 fn save_to_temp_file(&self) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Writes the captured log bytes to a temporary file named from the snapshot thread ID.
+**Purpose**: This writes the captured logs to a temporary file. It is useful when feedback logs need to be handed to another process or shown as a file path.
 
-**Data flow**: Reads the system temp directory, formats `codex-feedback-<thread_id>.log`, joins it into a path, writes `self.as_bytes()` to that path with `fs::write`, and returns the resulting `PathBuf`.
+**Data flow**: It builds a filename using the snapshot's thread id inside the system temporary directory. It writes the snapshot's log bytes to that path and returns the path if successful, or an I/O error if writing fails.
 
-**Call relations**: Used when feedback workflows need a file-backed log artifact instead of an in-memory upload.
+**Call relations**: It calls FeedbackSnapshot::as_bytes to get the log contents. It is separate from upload_feedback because saving locally and uploading to Sentry are different uses of the same snapshot.
 
 *Call graph*: calls 1 internal fn (as_bytes); 3 external calls (format!, write, temp_dir).
 
@@ -365,11 +365,11 @@ fn save_to_temp_file(&self) -> io::Result<PathBuf>
 fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()>
 ```
 
-**Purpose**: Builds and sends a Sentry envelope containing the feedback event plus optional attachments.
+**Purpose**: This sends a feedback report to Sentry. It builds the event, tags it with useful context, adds allowed attachments, sends it, and waits briefly for the upload to finish.
 
-**Data flow**: Creates a Sentry `Client` from `SENTRY_DSN`, derives merged tags via `upload_tags`, maps `classification` to a Sentry `Level`, creates an envelope and event title using `display_classification`, optionally adds an exception payload containing `reason`, appends attachments from `feedback_attachments`, sends the envelope, flushes with `UPLOAD_TIMEOUT_SECS`, and returns `Ok(())` or an error if DSN parsing fails.
+**Data flow**: It receives upload options such as classification, reason, tags, whether logs may be included, attachments, session source, and optional replacement log bytes. It creates a Sentry client, builds upload tags, chooses an error or info severity, creates a Sentry envelope with one event and any attachments, sends it, flushes for up to the timeout, and returns success or an error from setup.
 
-**Call relations**: This is the top-level upload path invoked after user consent. It orchestrates tag generation, event construction, attachment assembly, and transport.
+**Call relations**: Feedback flows call this after user consent and snapshot creation. It calls FeedbackSnapshot::upload_tags to prepare tags, display_classification for the title, and FeedbackSnapshot::feedback_attachments to gather files and buffers.
 
 *Call graph*: calls 2 internal fn (feedback_attachments, upload_tags); 11 external calls (new, default, from_str, from_secs, new, Attachment, Event, from, from_config, format! (+1 more)).
 
@@ -386,11 +386,11 @@ fn upload_tags(
     )
 ```
 
-**Purpose**: Merges reserved upload metadata, caller-supplied tags, and captured feedback tags into the final Sentry tag map.
+**Purpose**: This builds the final tag map sent with a feedback upload. It protects important reserved fields so callers cannot accidentally replace the real thread id, classification, CLI version, session source, or reason.
 
-**Data flow**: Starts a `BTreeMap` with reserved keys `thread_id`, `classification`, and `cli_version`, then conditionally inserts `session_source` and `reason`. It defines a reserved-key list and merges `client_tags` first, skipping reserved keys and preserving first-writer wins via `Entry::Vacant`; it then merges `self.tags` with the same reserved-key and vacancy rules. The final map is returned.
+**Data flow**: It receives the classification, optional reason, optional caller-provided tags, and optional session source. It starts with reserved tags from the snapshot and package version, adds session source and reason when present, then fills in non-reserved tags from client tags and snapshot tags without overwriting existing keys. It returns the final ordered map.
 
-**Call relations**: Called by `upload_feedback` so event metadata is deterministic and reserved fields cannot be overridden by callers or captured tracing tags.
+**Call relations**: FeedbackSnapshot::upload_feedback calls this before building the Sentry event. The upload tag test checks that reserved fields stay trustworthy while useful custom tags are preserved.
 
 *Call graph*: called by 1 (upload_feedback); 3 external calls (from, from, env!).
 
@@ -406,11 +406,11 @@ fn feedback_attachments(
         logs_override:
 ```
 
-**Purpose**: Builds the ordered list of Sentry attachments for one feedback upload.
+**Purpose**: This builds the list of files and buffers to attach to a feedback upload. It respects the log-inclusion choice and skips unreadable file attachments instead of stopping the whole upload.
 
-**Data flow**: Starts with an empty vector. If `include_logs` is true, it pushes `codex-logs.log` using `logs_override` or `self.bytes`. It then clones each in-memory `extra_attachments` into Sentry attachments, optionally adds the diagnostics attachment from `feedback_diagnostics_attachment_text(include_logs)`, and finally iterates `extra_attachment_paths`, reading each file from disk. Read failures emit a warning and skip that attachment; successful reads choose either `attachment_filename_override`, the path basename, or `extra-log.log` as filename. It returns the assembled vector.
+**Data flow**: It receives whether logs may be included, in-memory attachments, file-backed attachment paths, and optional replacement log bytes. It adds codex-logs.log if allowed, copies in-memory attachments, adds diagnostic text if allowed and available, then reads each path-backed file and attaches it with either an override name or its file name. It returns a vector of Sentry attachment objects.
 
-**Call relations**: Used by `upload_feedback`; it encapsulates consent gating, attachment ordering, and best-effort handling of file-backed artifacts.
+**Call relations**: FeedbackSnapshot::upload_feedback calls this when filling the Sentry envelope. It calls FeedbackSnapshot::feedback_diagnostics_attachment_text for diagnostics and logs a warning if a path-backed attachment cannot be read.
 
 *Call graph*: calls 1 internal fn (feedback_diagnostics_attachment_text); called by 1 (upload_feedback); 5 external calls (from, new, iter, read, warn!).
 
@@ -421,11 +421,11 @@ fn feedback_attachments(
 fn display_classification(classification: &str) -> String
 ```
 
-**Purpose**: Maps internal feedback classification codes to human-readable title text.
+**Purpose**: This turns an internal feedback classification code into a friendly label. It makes Sentry event titles easier for humans to read.
 
-**Data flow**: Matches the input string and returns `Bug`, `Bad result`, `Good result`, `Safety check`, or `Other` as a new `String`.
+**Data flow**: It receives a classification string such as bug or bad_result. It matches known values to labels like Bug or Bad result, and returns Other for anything unknown.
 
-**Call relations**: Used by `upload_feedback` when constructing the Sentry event title.
+**Call relations**: FeedbackSnapshot::upload_feedback uses this while composing the Sentry event title. It is a small formatting helper with no side effects.
 
 
 ##### `FeedbackMetadataLayer::on_event`  (lines 627–648)
@@ -434,11 +434,11 @@ fn display_classification(classification: &str) -> String
 fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>)
 ```
 
-**Purpose**: Consumes `feedback_tags` tracing events and merges their fields into the shared feedback tag map.
+**Purpose**: This catches special feedback tag tracing events and stores their fields for later upload. It enforces a maximum number of distinct tags so feedback metadata cannot grow without limit.
 
-**Data flow**: Checks `event.metadata().target()` and returns early unless it equals `FEEDBACK_TAGS_TARGET`. It records the event into a fresh `FeedbackTagsVisitor`; if no tags were captured it returns. Otherwise it locks `self.inner.tags` and inserts each `(key, value)`, but if the map already has `MAX_FEEDBACK_TAGS` distinct keys it only allows updates to existing keys and skips new ones.
+**Data flow**: It receives a tracing event. If the event target is not feedback_tags, it ignores it. Otherwise it records the event fields into a FeedbackTagsVisitor, locks the shared tag map, and inserts or updates each tag, skipping new keys once the tag limit has been reached.
 
-**Call relations**: Runs inside the tracing subscriber pipeline created by `metadata_layer()`, turning emitted request/auth events into uploadable tags.
+**Call relations**: The tracing system calls this for events seen by the metadata layer made by CodexFeedback::metadata_layer. It uses FeedbackTagsVisitor to turn event fields into strings, and CodexFeedback::snapshot later copies the stored tags.
 
 *Call graph*: 3 external calls (default, metadata, record).
 
@@ -449,11 +449,11 @@ fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'
 fn record_i64(&mut self, field: &tracing::field::Field, value: i64)
 ```
 
-**Purpose**: Captures signed integer tracing fields as string tags.
+**Purpose**: This records a signed integer field from a feedback tag event. It stores the number as text so all tags share one simple string format.
 
-**Data flow**: Reads the field name and integer value, converts the value to `String`, and inserts it into `self.tags` under the field name.
+**Data flow**: It receives a tracing field and an i64 value. It uses the field name as the tag key, converts the number to a string, and inserts it into the visitor's tag map.
 
-**Call relations**: Called by tracing’s field-recording machinery when `FeedbackMetadataLayer` records an event.
+**Call relations**: Tracing calls this through event.record when FeedbackMetadataLayer::on_event is reading an event. The collected tag map is then merged into the shared feedback tags.
 
 *Call graph*: 1 external calls (name).
 
@@ -464,11 +464,11 @@ fn record_i64(&mut self, field: &tracing::field::Field, value: i64)
 fn record_u64(&mut self, field: &tracing::field::Field, value: u64)
 ```
 
-**Purpose**: Captures unsigned integer tracing fields as string tags.
+**Purpose**: This records an unsigned integer field from a feedback tag event. It converts the value to text for consistent tag storage.
 
-**Data flow**: Converts the `u64` value to string and inserts it into `self.tags` keyed by the field name.
+**Data flow**: It receives a field and a u64 value. It stores the field name and stringified value in the visitor's tag map.
 
-**Call relations**: Part of the visitor implementation used during metadata capture.
+**Call relations**: Tracing may call this while FeedbackMetadataLayer::on_event records an event. The resulting key/value pair can later appear in upload tags.
 
 *Call graph*: 1 external calls (name).
 
@@ -479,11 +479,11 @@ fn record_u64(&mut self, field: &tracing::field::Field, value: u64)
 fn record_bool(&mut self, field: &tracing::field::Field, value: bool)
 ```
 
-**Purpose**: Captures boolean tracing fields as string tags.
+**Purpose**: This records a true-or-false field from a feedback tag event. It makes boolean context available as ordinary string tags.
 
-**Data flow**: Converts the boolean to `"true"` or `"false"` and inserts it under the field name.
+**Data flow**: It receives a field and a boolean value. It stores the field name with the value converted to true or false text.
 
-**Call relations**: Used when request/auth metadata includes booleans such as auth-header presence or connection reuse.
+**Call relations**: Tracing calls this during FeedbackMetadataLayer::on_event when an event contains a boolean field. This is how fields like cached = true become feedback tags.
 
 *Call graph*: 1 external calls (name).
 
@@ -494,11 +494,11 @@ fn record_bool(&mut self, field: &tracing::field::Field, value: bool)
 fn record_f64(&mut self, field: &tracing::field::Field, value: f64)
 ```
 
-**Purpose**: Captures floating-point tracing fields as string tags.
+**Purpose**: This records a floating-point number field from a feedback tag event. It converts the number into text for later upload.
 
-**Data flow**: Converts the `f64` to string and stores it in `self.tags` under the field name.
+**Data flow**: It receives a field and an f64 value. It stores the field name and the value's string form in the visitor's tag map.
 
-**Call relations**: Completes numeric field support for generic tracing events.
+**Call relations**: Tracing calls this through the Visit interface while FeedbackMetadataLayer::on_event is collecting event fields. The stored value can then be copied into the shared tag map.
 
 *Call graph*: 1 external calls (name).
 
@@ -509,11 +509,11 @@ fn record_f64(&mut self, field: &tracing::field::Field, value: f64)
 fn record_str(&mut self, field: &tracing::field::Field, value: &str)
 ```
 
-**Purpose**: Captures string tracing fields directly as owned string tags.
+**Purpose**: This records a text field from a feedback tag event. It is the direct path for string metadata such as model names or request ids.
 
-**Data flow**: Copies the field name and string value into `self.tags`.
+**Data flow**: It receives a field and a string slice. It copies the field name and value into the visitor's tag map.
 
-**Call relations**: Used for most textual request/auth metadata emitted through `feedback_tags` events.
+**Call relations**: Tracing calls this when FeedbackMetadataLayer::on_event records string fields. The visitor later hands these tags back to the metadata layer for storage.
 
 *Call graph*: 1 external calls (name).
 
@@ -524,11 +524,11 @@ fn record_str(&mut self, field: &tracing::field::Field, value: &str)
 fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug)
 ```
 
-**Purpose**: Captures arbitrary debug-formatted tracing fields as string tags.
+**Purpose**: This records any field that is supplied in debug form. Debug form means Rust's general-purpose printable representation, used when a value does not have a more specific visitor method.
 
-**Data flow**: Formats the debug value with `format!("{value:?}")` and inserts it under the field name.
+**Data flow**: It receives a field and a value that can be formatted for debugging. It formats the value with debug formatting and stores it under the field name in the visitor's tag map.
 
-**Call relations**: Acts as the fallback path for fields emitted with `tracing::field::debug(...)` in the request-tag helpers.
+**Call relations**: The emit_feedback_request_tags functions intentionally emit many fields using debug formatting, so tracing may call this while FeedbackMetadataLayer::on_event collects them. The result becomes ordinary string metadata.
 
 *Call graph*: 2 external calls (name, format!).
 
@@ -539,11 +539,11 @@ fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::
 fn ring_buffer_drops_front_when_full()
 ```
 
-**Purpose**: Verifies that the ring buffer retains only the newest bytes once capacity is exceeded.
+**Purpose**: This test proves that the log buffer keeps the newest bytes when it runs out of space. It protects the dashboard-camera behavior of the feedback log.
 
-**Data flow**: Creates a small-capacity `CodexFeedback`, writes ten bytes through its writer, snapshots it, decodes the bytes as UTF-8, and asserts only the trailing eight bytes remain.
+**Data flow**: It creates a feedback collector with room for only eight bytes, writes ten bytes through the feedback writer, takes a snapshot, and checks that the stored bytes are the final eight characters. The test passes only if the oldest two bytes were dropped.
 
-**Call relations**: Exercises `FeedbackWriter`, `RingBuffer::push_bytes`, and snapshotting together.
+**Call relations**: The test calls CodexFeedback::with_capacity to force a tiny buffer and exercises the same writer path used by logging. It verifies RingBuffer::push_bytes indirectly through the public feedback flow.
 
 *Call graph*: calls 1 internal fn (with_capacity); 1 external calls (assert_eq!).
 
@@ -554,11 +554,11 @@ fn ring_buffer_drops_front_when_full()
 fn metadata_layer_records_tags_from_feedback_target()
 ```
 
-**Purpose**: Checks that `feedback_tags` tracing events are captured into snapshot tags.
+**Purpose**: This test proves that the metadata layer captures fields from feedback tag events. It checks that both string and boolean fields are saved as tags.
 
-**Data flow**: Creates a feedback collector, installs its `metadata_layer()` as the default subscriber, emits a `tracing::info!` event targeted at `FEEDBACK_TAGS_TARGET`, snapshots the collector, and asserts the expected tag values are present.
+**Data flow**: It creates a feedback collector, installs its metadata layer as the active tracing subscriber, emits a feedback_tags event with model and cached fields, then snapshots the collector. It checks that the snapshot's tag map contains model = gpt-5 and cached = true.
 
-**Call relations**: End-to-end test of `emit`-style metadata capture through the tracing layer.
+**Call relations**: The test uses CodexFeedback::metadata_layer and a tracing info event to drive FeedbackMetadataLayer::on_event and FeedbackTagsVisitor. It confirms that CodexFeedback::snapshot can later see the collected tags.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert_eq!, info!, registry).
 
@@ -569,11 +569,11 @@ fn metadata_layer_records_tags_from_feedback_target()
 fn feedback_attachments_gate_connectivity_diagnostics()
 ```
 
-**Purpose**: Verifies attachment ordering and confirms connectivity diagnostics are included only when logs are included and diagnostics are non-empty.
+**Purpose**: This test checks how upload attachments are assembled, especially that diagnostics are included only when logs are included and only when diagnostics exist. It also checks extra in-memory and file-backed attachments.
 
-**Data flow**: Creates a temp file for an extra path-backed attachment, builds a snapshot with injected diagnostics, calls `feedback_attachments` with logs, one in-memory doctor-report attachment, and one path-backed attachment, then asserts filenames and buffers in order. It also builds a snapshot with empty diagnostics and asserts only the log attachment remains. Finally it removes the temp file.
+**Data flow**: It writes a temporary extra attachment file, creates a snapshot with a known diagnostic, builds attachments with logs enabled and a log override, and checks the filenames and byte contents. Then it creates a snapshot without diagnostics and checks that only the log attachment remains. Finally it removes the temporary file.
 
-**Call relations**: Exercises the attachment assembly policy in `FeedbackSnapshot::feedback_attachments`.
+**Call relations**: The test calls CodexFeedback::new, FeedbackSnapshot::with_feedback_diagnostics, and FeedbackSnapshot::feedback_attachments. It protects the consent-related attachment behavior used by FeedbackSnapshot::upload_feedback.
 
 *Call graph*: calls 2 internal fn (new, new); 8 external calls (assert_eq!, default, format!, remove_file, write, temp_dir, from_ref, vec!).
 
@@ -584,24 +584,26 @@ fn feedback_attachments_gate_connectivity_diagnostics()
 fn upload_tags_include_client_tags_and_preserve_reserved_fields()
 ```
 
-**Purpose**: Checks that upload tag merging preserves reserved fields from the snapshot/upload call while still accepting non-reserved client and captured tags.
+**Purpose**: This test proves that upload tags include useful custom fields but do not let callers overwrite reserved fields. Reserved fields are important because they identify what session and version the report really came from.
 
-**Data flow**: Constructs a `FeedbackSnapshot` with preexisting tags, a separate `client_tags` map containing both reserved and non-reserved keys, calls `upload_tags`, and asserts reserved keys come from the snapshot or method arguments while non-reserved keys from client tags and snapshot tags are retained.
+**Data flow**: It builds a snapshot with some deliberately wrong reserved tag values plus valid custom tags, then builds client tags with more wrong reserved values and useful extras. It calls upload_tags for a bug report and checks that reserved values come from the trusted inputs while non-reserved tags are kept.
 
-**Call relations**: Directly validates the merge and precedence rules implemented in `FeedbackSnapshot::upload_tags`.
+**Call relations**: The test exercises FeedbackSnapshot::upload_tags directly. It confirms the tag rules that FeedbackSnapshot::upload_feedback relies on before sending a Sentry event.
 
 *Call graph*: 4 external calls (new, new, assert_eq!, default).
 
 
 ### `feedback/src/feedback_diagnostics.rs`
 
-`util` · `feedback snapshot and upload preparation`
+`domain_logic` · `feedback submission`
 
-This file defines the small data model used to attach connectivity diagnostics to feedback reports. `FeedbackDiagnostics` is a wrapper around a `Vec<FeedbackDiagnostic>`, where each diagnostic has a `headline` and a list of detail lines. The only built-in collector today is proxy-environment inspection: `collect_from_env` reads the process environment and delegates to the generic `collect_from_pairs`, which accepts any iterable of key/value pairs for easy testing.
+When a user reports a connectivity problem, the support team needs hints about what might be interfering with network traffic. One common cause is a proxy: a server or setting that routes web requests through another place, often used by companies or VPN-like setups. This file looks for well-known proxy environment variables, such as HTTP_PROXY and HTTPS_PROXY, and records any that are present.
 
-`collect_from_pairs` first normalizes the input into a `HashMap<String, String>`, then scans the fixed `PROXY_ENV_VARS` list in a stable order. For each present variable it records a detail line of the exact form `KEY = value`. If at least one proxy variable is present, it emits a single `FeedbackDiagnostic` with the headline warning that proxy environment variables may affect connectivity. Missing variables are ignored entirely; present-but-empty or whitespace-containing values are preserved verbatim rather than sanitized or validated.
+The main type, FeedbackDiagnostics, is a small container for one or more FeedbackDiagnostic items. Each item has a headline, which explains the issue in human language, and detail lines, which show the exact environment variables found. If no relevant variables are found, the diagnostics stay empty and no attachment text is produced.
 
-The formatting path is equally simple. `attachment_text` returns `None` when there are no diagnostics, otherwise it renders a plaintext report beginning with `Connectivity diagnostics`, followed by blank line separation, bullet headlines, and indented bullet details. This makes the attachment deterministic and human-readable while avoiding any parsing complexity.
+The file can collect diagnostics directly from the running process environment, or from a supplied list of key-value pairs. That second path makes the behavior easy to test without changing the real computer environment. It also formats the diagnostics into plain text headed "Connectivity diagnostics", suitable for saving as the feedback attachment named by FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.
+
+An important detail is that values are reported exactly as found. The code does not validate, trim, or hide passwords or tokens inside proxy URLs. That makes the diagnostics faithful, but it also means callers must be careful about user consent before uploading them.
 
 #### Function details
 
@@ -611,11 +613,11 @@ The formatting path is equally simple. `attachment_text` returns `None` when the
 fn new(diagnostics: Vec<FeedbackDiagnostic>) -> Self
 ```
 
-**Purpose**: Constructs a diagnostics container from an explicit list of diagnostic entries.
+**Purpose**: Creates a FeedbackDiagnostics value from diagnostics that were already built elsewhere. This is useful when another part of the feedback flow already knows what diagnostic messages should be shown or attached.
 
-**Data flow**: Consumes a `Vec<FeedbackDiagnostic>` and stores it directly in the returned `FeedbackDiagnostics`.
+**Data flow**: It receives a list of FeedbackDiagnostic records. It stores that list inside a new FeedbackDiagnostics object and returns it without changing the records.
 
-**Call relations**: Used by higher-level feedback tests and callers that already have diagnostics assembled and just need the wrapper type.
+**Call relations**: Several feedback consent and attachment flows call this when they need a ready-made diagnostics object for display, gating, or snapshot testing. It does not call out to any other logic; it is the simple doorway for packaging existing diagnostic data.
 
 *Call graph*: called by 4 (feedback_attachments_gate_connectivity_diagnostics, should_show_feedback_connectivity_details_only_for_non_good_result_with_diagnostics, feedback_good_result_consent_popup_includes_connectivity_diagnostics_filename, feedback_upload_consent_popup_snapshot).
 
@@ -626,11 +628,11 @@ fn new(diagnostics: Vec<FeedbackDiagnostic>) -> Self
 fn collect_from_env() -> Self
 ```
 
-**Purpose**: Builds diagnostics from the current process environment.
+**Purpose**: Collects connectivity diagnostics from the current process environment. Someone would use this when preparing real feedback from a running Codex session.
 
-**Data flow**: Calls `std::env::vars()` to obtain environment key/value pairs, passes them to `collect_from_pairs`, and returns the resulting `FeedbackDiagnostics`.
+**Data flow**: It reads all environment variables from the operating system, then passes those key-value pairs into the shared collection routine. The result is a FeedbackDiagnostics object containing any proxy-related findings.
 
-**Call relations**: Invoked by feedback snapshot creation so uploads automatically include environment-derived connectivity hints.
+**Call relations**: The snapshot flow calls this to capture the real environment state. This function delegates the actual filtering and formatting work to FeedbackDiagnostics::collect_from_pairs so the same rules are used for real runs and tests.
 
 *Call graph*: called by 1 (snapshot); 2 external calls (collect_from_pairs, vars).
 
@@ -641,11 +643,11 @@ fn collect_from_env() -> Self
 fn collect_from_pairs(pairs: I) -> Self
 ```
 
-**Purpose**: Scans arbitrary key/value pairs for known proxy environment variables and turns them into one diagnostic entry when present.
+**Purpose**: Builds diagnostics from a supplied set of environment-style key-value pairs. It looks only for known proxy variable names and reports them as possible causes of connectivity trouble.
 
-**Data flow**: Consumes an iterable of `(K, V)` pairs, converts keys and values into owned `String`s, collects them into a `HashMap`, then iterates `PROXY_ENV_VARS` in order. For each present key it formats `"{key} = {value}"` into `proxy_details`. If that vector is non-empty, it pushes one `FeedbackDiagnostic` with a fixed headline and those details. It returns `FeedbackDiagnostics { diagnostics }`.
+**Data flow**: It takes incoming pairs, converts keys and values into strings, and puts them in a lookup table. It checks the known proxy variable names in a fixed order. For every matching variable, it creates a detail line like "HTTP_PROXY = value". If at least one detail exists, it returns a FeedbackDiagnostics object with one warning-style diagnostic; otherwise it returns an empty one.
 
-**Call relations**: This is the core collector used by `collect_from_env` and all tests; the generic input shape makes it easy to test without mutating real environment state.
+**Call relations**: FeedbackDiagnostics::collect_from_env uses this after reading the real environment. The test functions also call it directly with fake variables, which lets them verify the rules without depending on the developer machine running the tests.
 
 *Call graph*: called by 4 (collect_from_pairs_ignores_absent_values, collect_from_pairs_preserves_whitespace_and_empty_values, collect_from_pairs_reports_raw_values_and_attachment, collect_from_pairs_reports_values_verbatim); 2 external calls (into_iter, new).
 
@@ -656,11 +658,11 @@ fn collect_from_pairs(pairs: I) -> Self
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether any diagnostics were collected.
+**Purpose**: Answers whether there are any diagnostics to show or upload. Callers use it to avoid showing empty connectivity sections.
 
-**Data flow**: Reads `self.diagnostics.is_empty()` and returns the boolean.
+**Data flow**: It reads the stored diagnostics list. If the list has no items, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Used by feedback consent logic to decide whether connectivity details should be shown or omitted.
+**Call relations**: Feedback upload consent code and connectivity-detail display logic call this before deciding whether diagnostics should appear. It acts like a quick yes-or-no check before the rest of the feedback UI does more work.
 
 *Call graph*: called by 2 (feedback_upload_consent_params, should_show_feedback_connectivity_details).
 
@@ -671,11 +673,11 @@ fn is_empty(&self) -> bool
 fn diagnostics(&self) -> &[FeedbackDiagnostic]
 ```
 
-**Purpose**: Exposes the collected diagnostics as an immutable slice.
+**Purpose**: Gives read-only access to the collected diagnostic records. This lets other feedback code display or inspect the messages without taking ownership of them.
 
-**Data flow**: Returns `&self.diagnostics` without cloning or mutation.
+**Data flow**: It receives the FeedbackDiagnostics object by reference, reads its internal list, and returns a read-only slice of that same list. Nothing is copied or modified.
 
-**Call relations**: Allows callers to inspect individual diagnostics when building UI or consent parameters.
+**Call relations**: The feedback upload consent parameter builder calls this when it needs the actual diagnostic headlines and details. This function keeps the stored data protected while still making it available for presentation.
 
 *Call graph*: called by 1 (feedback_upload_consent_params).
 
@@ -686,11 +688,11 @@ fn diagnostics(&self) -> &[FeedbackDiagnostic]
 fn attachment_text(&self) -> Option<String>
 ```
 
-**Purpose**: Formats the collected diagnostics into the plaintext attachment body used for feedback uploads.
+**Purpose**: Formats the diagnostics as plain text for a feedback attachment. It returns no text when there is nothing useful to attach.
 
-**Data flow**: If `self.diagnostics` is empty, returns `None`. Otherwise it builds a `Vec<String>` starting with `Connectivity diagnostics` and a blank line, appends `- {headline}` for each diagnostic, then appends `  - {detail}` for each detail line, joins with newlines, and returns `Some(String)`.
+**Data flow**: It first checks whether the diagnostics list is empty. If it is empty, it returns None. Otherwise it builds lines beginning with "Connectivity diagnostics", adds each diagnostic headline as a bullet, adds each detail as an indented bullet, joins the lines with newline characters, and returns that text.
 
-**Call relations**: Called by feedback upload assembly to create the in-memory diagnostics attachment only when there is something to send.
+**Call relations**: The feedback diagnostics attachment code calls this when it needs the body of the diagnostic attachment. This function turns the structured records created earlier into the human-readable file content that can travel with a feedback report.
 
 *Call graph*: called by 1 (feedback_diagnostics_attachment_text); 2 external calls (format!, vec!).
 
@@ -701,11 +703,11 @@ fn attachment_text(&self) -> Option<String>
 fn collect_from_pairs_reports_raw_values_and_attachment()
 ```
 
-**Purpose**: Verifies proxy variables are reported in deterministic order and rendered into the expected attachment text.
+**Purpose**: Checks that proxy variables are reported with their exact raw values and that the attachment text is formatted as expected. It confirms that even sensitive-looking URL parts are not hidden by this code.
 
-**Data flow**: Calls `collect_from_pairs` with mixed-case proxy keys and raw values, then asserts both the structured `FeedbackDiagnostics` value and the exact `attachment_text()` output.
+**Data flow**: It supplies fake HTTPS, lowercase http, and lowercase all-proxy variables to FeedbackDiagnostics::collect_from_pairs. It then compares the returned diagnostics and the generated attachment text against exact expected strings.
 
-**Call relations**: Exercises the main collection and formatting path end-to-end.
+**Call relations**: The test runner calls this during automated testing. It exercises FeedbackDiagnostics::collect_from_pairs and attachment_text together, proving that collection order and final text formatting match the intended feedback attachment behavior.
 
 *Call graph*: calls 1 internal fn (collect_from_pairs); 1 external calls (assert_eq!).
 
@@ -716,11 +718,11 @@ fn collect_from_pairs_reports_raw_values_and_attachment()
 fn collect_from_pairs_ignores_absent_values()
 ```
 
-**Purpose**: Checks that no diagnostics are produced when no proxy variables are present.
+**Purpose**: Checks that no diagnostics are produced when no relevant environment variables are present. This protects users from seeing or uploading an empty diagnostics attachment.
 
-**Data flow**: Passes an empty vector into `collect_from_pairs`, then asserts the result equals `FeedbackDiagnostics::default()` and `attachment_text()` is `None`.
+**Data flow**: It passes an empty list of pairs into FeedbackDiagnostics::collect_from_pairs. It expects the result to equal the default empty diagnostics object and expects attachment_text to return None.
 
-**Call relations**: Covers the empty-input branch of the collector and formatter.
+**Call relations**: The test runner calls this as part of the file’s automated checks. It focuses on the quiet path used when there are no proxy clues to report.
 
 *Call graph*: calls 1 internal fn (collect_from_pairs); 2 external calls (new, assert_eq!).
 
@@ -731,11 +733,11 @@ fn collect_from_pairs_ignores_absent_values()
 fn collect_from_pairs_preserves_whitespace_and_empty_values()
 ```
 
-**Purpose**: Ensures proxy values are preserved verbatim rather than trimmed or normalized.
+**Purpose**: Checks that proxy values are preserved exactly, including surrounding spaces. This documents that the diagnostics are a raw report, not cleaned-up or interpreted settings.
 
-**Data flow**: Collects diagnostics from a single `HTTP_PROXY` pair containing leading and trailing spaces, then asserts the stored detail line includes the whitespace exactly.
+**Data flow**: It passes a fake HTTP_PROXY value containing leading and trailing spaces into FeedbackDiagnostics::collect_from_pairs. It then verifies that the resulting detail line keeps those spaces intact.
 
-**Call relations**: Protects the design choice to report raw environment values without sanitization.
+**Call relations**: The test runner calls this to guard against future changes that might trim or normalize values. It supports the broader rule that this file reports what it sees.
 
 *Call graph*: calls 1 internal fn (collect_from_pairs); 1 external calls (assert_eq!).
 
@@ -746,11 +748,11 @@ fn collect_from_pairs_preserves_whitespace_and_empty_values()
 fn collect_from_pairs_reports_values_verbatim()
 ```
 
-**Purpose**: Confirms that even syntactically invalid proxy values are reported exactly as provided.
+**Purpose**: Checks that even invalid-looking proxy values are still reported exactly. The diagnostics are meant to show environment state, not decide whether the state is correct.
 
-**Data flow**: Passes `HTTP_PROXY = "not a valid proxy"` into `collect_from_pairs` and asserts the resulting diagnostic detail contains that exact string.
+**Data flow**: It passes HTTP_PROXY with the value "not a valid proxy" into FeedbackDiagnostics::collect_from_pairs. It verifies that the output includes that same text unchanged in the detail line.
 
-**Call relations**: Reinforces that this module is diagnostic/reporting-only and does not validate proxy syntax.
+**Call relations**: The test runner calls this during automated testing. It reinforces that FeedbackDiagnostics::collect_from_pairs does not parse or reject proxy values; it simply records them for feedback context.
 
 *Call graph*: calls 1 internal fn (collect_from_pairs); 1 external calls (assert_eq!).
 
@@ -759,11 +761,11 @@ fn collect_from_pairs_reports_values_verbatim()
 
 `domain_logic` · `feedback upload`
 
-This module intentionally runs doctor as an external subprocess instead of linking doctor internals into the app-server. `doctor_feedback_report` chooses the executable from `config.codex_self_exe` or falls back to `std::env::current_exe()`, then launches `codex doctor --json` with `kill_on_drop(true)` and a fixed 25-second timeout. Any spawn failure, timeout, missing JSON output, or JSON parse failure is logged with `tracing::warn!` and results in `None`, allowing feedback upload to continue without an attachment.
+When a user sends feedback, the system can include extra diagnostic information, much like attaching a mechanic’s inspection sheet when reporting a car problem. This file creates that attachment by running `codex doctor --json`, which is Codex’s own health-check command in a machine-readable form.
 
-The parser is defensive about stdout shape: it searches for the first `{` and parses from there, tolerating any leading non-JSON text. If parsing succeeds, it pretty-prints the JSON for upload, falling back to the raw JSON bytes if pretty serialization somehow fails. The returned `DoctorFeedbackReport` contains both the attachment metadata (`codex-doctor-report.json`, `application/json`) and a tag map derived from the report.
+The important rule is that feedback must still work even if the doctor report fails. So this code treats the report as “best effort.” It tries to find the Codex executable, starts it as a separate process, waits up to 25 seconds, and then accepts the output only if it contains valid JSON. If the command cannot run, takes too long, or prints invalid data, the file logs a warning and returns nothing. That prevents a diagnostic helper from breaking the main feedback path.
 
-`doctor_report_tags` extracts `overallStatus`, counts `ok`, `warning`, and `fail` statuses across checks, and records comma-joined ids for warning/failing checks. It supports both current object-shaped `checks` and older array-shaped reports through `check_values`. Tag values are truncated to 256 Unicode scalar values with an ellipsis to keep Sentry tag cardinality and size bounded. The included test verifies the summary/count behavior on a representative report.
+When the JSON is valid, the file pretty-prints it into a feedback attachment named like the standard doctor report. It also extracts small summary labels called Sentry tags. Sentry is an error-reporting service, and tags help group reports without storing large or highly variable data. The tags include the overall doctor status, counts of checks that passed, warned, or failed, and shortened lists of warning or failed check IDs.
 
 #### Function details
 
@@ -773,11 +775,11 @@ The parser is defensive about stdout shape: it searches for the first `{` and pa
 async fn doctor_feedback_report(config: &Config) -> Option<DoctorFeedbackReport>
 ```
 
-**Purpose**: Runs the configured Codex executable as `doctor --json`, parses its JSON output, and returns a feedback attachment plus derived tags when successful.
+**Purpose**: This is the main entry point for building the optional doctor-report attachment. It runs the Codex diagnostic command, checks that the result is usable JSON, and packages it for a feedback upload.
 
-**Data flow**: Takes `&Config`, selects an executable from `config.codex_self_exe` or `current_exe()`, builds a `tokio::process::Command` with `doctor --json` and `kill_on_drop(true)`, awaits `command.output()` under `timeout(DOCTOR_FEEDBACK_REPORT_TIMEOUT, ...)`, and logs/returns `None` on spawn or timeout failure. On success it decodes stdout lossily, finds the first `{`, trims and parses JSON into `serde_json::Value`, logs/returns `None` if no JSON or invalid JSON is found, pretty-serializes the report bytes, computes tags with `doctor_report_tags`, and returns `Some(DoctorFeedbackReport { attachment, tags })`.
+**Data flow**: It takes the current configuration, looks for the Codex executable path, and starts that executable with `doctor --json`. It waits for the process with a timeout, reads the command’s output, finds and parses the JSON, and then creates two outputs: a JSON attachment and a map of short summary tags. If any step fails, it returns no report and leaves the feedback upload free to continue without it.
 
-**Call relations**: Called by `upload_feedback_response` when assembling feedback uploads. It delegates tag extraction to `doctor_report_tags` and keeps all doctor failures non-fatal by returning `None`.
+**Call relations**: The feedback upload flow calls this when preparing a response. After it successfully parses the doctor JSON, it hands the parsed report to `doctor_report_tags` to make compact Sentry-friendly labels, then returns both the labels and the attachment to the caller.
 
 *Call graph*: calls 1 internal fn (doctor_report_tags); called by 1 (upload_feedback_response); 6 external calls (from_utf8_lossy, new, from_str, to_vec_pretty, timeout, warn!).
 
@@ -788,11 +790,11 @@ async fn doctor_feedback_report(config: &Config) -> Option<DoctorFeedbackReport>
 fn doctor_report_tags(report: &Value) -> BTreeMap<String, String>
 ```
 
-**Purpose**: Summarizes a doctor JSON report into low-cardinality tags suitable for feedback/Sentry metadata.
+**Purpose**: This function turns a full doctor JSON report into a small set of searchable summary tags. The goal is to keep useful diagnostic clues without attaching large or overly detailed values as tags.
 
-**Data flow**: Takes `&serde_json::Value`, initializes a `BTreeMap<String, String>`, optionally inserts `doctor_overall_status`, iterates checks via `check_values`, counts `ok`/`warning`/`fail` statuses, collects warning and failing check ids, inserts count tags, and inserts comma-joined warning/failing check lists after passing them through `truncate_tag_value`; returns the completed tag map.
+**Data flow**: It receives parsed JSON. It reads the overall status, walks through the report’s checks, counts how many are `ok`, `warning`, or `fail`, and collects the IDs of warning and failed checks. It returns a sorted map of tag names to string values, shortening long values so they stay within the tag length limit.
 
-**Call relations**: Used by `doctor_feedback_report` for production feedback uploads and by the unit test to verify summarization behavior.
+**Call relations**: It is used by `doctor_feedback_report` after the doctor command has produced valid JSON. The unit test also calls it directly to prove that it summarizes statuses correctly. While building the tags, it asks `check_values` how to iterate through the checks and uses `truncate_tag_value` before storing tag values that might be too long.
 
 *Call graph*: calls 2 internal fn (check_values, truncate_tag_value); called by 2 (doctor_feedback_report, doctor_report_tags_summarize_status_counts); 3 external calls (new, get, new).
 
@@ -803,11 +805,11 @@ fn doctor_report_tags(report: &Value) -> BTreeMap<String, String>
 fn check_values(checks: &Value) -> Box<dyn Iterator<Item = &Value> + '_>
 ```
 
-**Purpose**: Provides a uniform iterator over doctor checks regardless of whether the JSON report stores them as an array or an object map.
+**Purpose**: This helper lets the tag-building code read doctor checks from both old and new JSON layouts. It hides the difference between a list of checks and an object keyed by check name.
 
-**Data flow**: Consumes `&Value checks`, returns a boxed iterator over `values.iter()` for `Value::Array`, over `values.values()` for `Value::Object`, or an empty iterator for any other JSON shape.
+**Data flow**: It receives the `checks` part of the JSON report. If that value is an array, it returns an iterator over the array items; if it is an object, it returns an iterator over the object’s values; otherwise, it returns an empty iterator. Nothing is changed in the original JSON.
 
-**Call relations**: Called only by `doctor_report_tags` to abstract over old and new doctor report formats.
+**Call relations**: Only `doctor_report_tags` calls this helper. That lets the main tag-building function stay focused on counting statuses instead of caring which report format produced the checks.
 
 *Call graph*: called by 1 (doctor_report_tags); 2 external calls (new, empty).
 
@@ -818,11 +820,11 @@ fn check_values(checks: &Value) -> Box<dyn Iterator<Item = &Value> + '_>
 fn truncate_tag_value(value: &str) -> String
 ```
 
-**Purpose**: Limits tag values to `MAX_DOCTOR_TAG_VALUE_LEN` characters, appending `...` when truncation is necessary.
+**Purpose**: This helper makes sure a tag value is not too long. Long values are shortened and marked with `...` so error-tracking tags stay within the expected size.
 
-**Data flow**: Takes `&str`, counts Unicode scalar values with `chars().count()`, returns the original string if within the limit, otherwise collects the first `MAX_DOCTOR_TAG_VALUE_LEN - 3` characters into a prefix and returns `format!("{prefix}...")`.
+**Data flow**: It receives a text value. If the value is already short enough, it returns it unchanged as a new string. If it is too long, it keeps the allowed prefix, adds an ellipsis, and returns that shortened string.
 
-**Call relations**: Used by `doctor_report_tags` for overall status and comma-joined check-id lists so generated tags stay bounded.
+**Call relations**: It is called by `doctor_report_tags` when storing the overall status and the comma-separated lists of failed or warning check IDs. This keeps the tags safe and predictable before they are returned to the feedback upload path.
 
 *Call graph*: called by 1 (doctor_report_tags); 1 external calls (format!).
 
@@ -833,11 +835,11 @@ fn truncate_tag_value(value: &str) -> String
 fn doctor_report_tags_summarize_status_counts()
 ```
 
-**Purpose**: Verifies that doctor report tag extraction produces the expected counts and check-id summaries for mixed-status reports.
+**Purpose**: This test checks that doctor-report JSON is summarized into the expected tags. It protects the counting and check-ID extraction behavior from accidental changes.
 
-**Data flow**: Builds a JSON report with one ok, one warning, and one fail check, calls `doctor_report_tags`, constructs the expected `BTreeMap`, and asserts equality.
+**Data flow**: It builds a sample JSON report with one passing check, one warning check, and one failing check. It sends that report into `doctor_report_tags`, then compares the returned map against the exact tag set that should come out.
 
-**Call relations**: Unit test for `doctor_report_tags`, covering object-shaped `checks` and the count/list aggregation logic.
+**Call relations**: The test calls `doctor_report_tags` directly, without running the external doctor command. This keeps the test focused on the summary logic rather than process launching, timeouts, or JSON output from the real CLI.
 
 *Call graph*: calls 1 internal fn (doctor_report_tags); 3 external calls (from, assert_eq!, json!).
 
@@ -847,13 +849,13 @@ These utilities sanitize sensitive values and extract response metadata so later
 
 ### `response-debug-context/src/lib.rs`
 
-`util` · `error handling, logging, telemetry enrichment`
+`util` · `cross-cutting error reporting`
 
-This library is a small error-inspection utility focused on two outputs: a structured `ResponseDebugContext` and short telemetry strings. `ResponseDebugContext` stores four optional fields: `request_id`, `cf_ray`, `auth_error`, and `auth_error_code`. The extraction logic only operates on `TransportError::Http`; all other transport variants return the default empty context.
+When a request to the API fails, the raw error can contain two very different kinds of information: helpful tracking details, and private or unsafe details. This file separates those. It looks at HTTP response headers, which are small name-value labels returned with a response, and extracts identifiers such as a request ID, Cloudflare ray ID, and authorization error code. These are useful when asking support or checking logs, much like writing down a receipt number after a failed purchase.
 
-`extract_response_debug_context` uses a local closure to read string headers from an optional `HeaderMap`, preferring `x-request-id` and falling back to `x-oai-request-id`. It also reads `cf-ray` and `x-openai-authorization-error`. The most specialized path is `x-error-json`: the header value is expected to be base64-encoded JSON, which is decoded, parsed as `serde_json::Value`, and traversed at `error.code`. Any failure in decoding, parsing, or field lookup quietly yields `None`, so malformed debug headers never turn into hard errors.
+The main type, ResponseDebugContext, is a small bundle of optional fields. The extraction code only fills fields when the error is an HTTP transport error and the expected headers are present. It also understands one special header, x-error-json, which contains base64-encoded JSON. Base64 is a text-safe wrapping format; JSON is a common structured text format. The code decodes that header and reads an error.code value if it exists.
 
-The telemetry helpers intentionally collapse rich error objects into short labels. For HTTP transport errors they emit only `http <status>` and ignore headers/body entirely, preventing accidental inclusion of sensitive payloads in logs or metrics. Non-HTTP transport and API variants preserve only coarse-grained messages such as `timeout`, `quota exceeded`, or the underlying string for network/build/stream errors. The tests emphasize both behaviors: identity-header extraction and omission of secret-bearing HTTP bodies.
+The other half of the file creates short telemetry strings for errors. For HTTP failures, it records only the status code, such as "http 401", and deliberately leaves out the response body. This matters because a body might contain secrets, tokens, or user data. Tests in the file lock in both behaviors: useful debug details are kept, and sensitive body text is not reported.
 
 #### Function details
 
@@ -863,11 +865,11 @@ The telemetry helpers intentionally collapse rich error objects into short label
 fn extract_response_debug_context(transport: &TransportError) -> ResponseDebugContext
 ```
 
-**Purpose**: Builds a `ResponseDebugContext` from HTTP transport error headers, including decoding the encoded authorization error payload when present. Non-HTTP transport errors produce an empty context.
+**Purpose**: This function reads an HTTP transport error and gathers safe debugging clues from its headers. Someone would use it after a failed network request to capture IDs and authorization hints without keeping the whole response.
 
-**Data flow**: Takes `&TransportError`. It starts from `ResponseDebugContext::default()`, pattern-matches for `TransportError::Http { headers, .. }`, and returns the default immediately for other variants. For HTTP errors it reads string header values from the optional header map, fills `request_id` from `x-request-id` or `x-oai-request-id`, fills `cf_ray` and `auth_error`, and computes `auth_error_code` by base64-decoding `x-error-json`, parsing JSON, and extracting `error.code` as a string. It returns the populated context without mutating external state.
+**Data flow**: It receives a TransportError. If that error is not an HTTP response, it returns an empty ResponseDebugContext. If it is an HTTP response, it reads the headers, copies request ID and Cloudflare ray values when present, copies the authorization error header when present, and tries to decode the x-error-json header to find an error code. The result is a ResponseDebugContext with only the fields it could safely find.
 
-**Call relations**: This is the primary extractor used directly by callers that already have a `TransportError`, and indirectly by `extract_response_debug_context_from_api_error`. Tests invoke it with synthetic HTTP headers to verify fallback and decoding behavior.
+**Call relations**: This is the core extractor. extract_response_debug_context_from_api_error calls it when a broader ApiError turns out to contain a transport error. The test tests::extract_response_debug_context_decodes_identity_headers also calls it to prove that the expected headers are turned into the expected debug context.
 
 *Call graph*: called by 2 (extract_response_debug_context_from_api_error, extract_response_debug_context_decodes_identity_headers); 1 external calls (default).
 
@@ -878,11 +880,11 @@ fn extract_response_debug_context(transport: &TransportError) -> ResponseDebugCo
 fn extract_response_debug_context_from_api_error(error: &ApiError) -> ResponseDebugContext
 ```
 
-**Purpose**: Adapts the transport-level extractor to the broader `ApiError` enum. It only extracts context from the transport variant and otherwise returns an empty structure.
+**Purpose**: This function is a convenience wrapper for callers that have an ApiError instead of a lower-level TransportError. It gives them the same debug context when the API error came from transport, and an empty context otherwise.
 
-**Data flow**: Takes `&ApiError`, matches on the variant, forwards `ApiError::Transport(transport)` to `extract_response_debug_context(transport)`, and returns `ResponseDebugContext::default()` for all other API errors.
+**Data flow**: It receives an ApiError. If the error is the Transport variant, it passes the contained TransportError into extract_response_debug_context and returns that result. For every other kind of API error, it returns a default, empty ResponseDebugContext.
 
-**Call relations**: This is the convenience entry point for code that handles `ApiError` rather than `TransportError`. It delegates all actual header parsing to `extract_response_debug_context`.
+**Call relations**: This function sits one level above extract_response_debug_context. It decides whether the broader API error has the right kind of inner error to inspect, then hands that inner error to the lower-level extractor.
 
 *Call graph*: calls 1 internal fn (extract_response_debug_context); 1 external calls (default).
 
@@ -893,11 +895,11 @@ fn extract_response_debug_context_from_api_error(error: &ApiError) -> ResponseDe
 fn telemetry_transport_error_message(error: &TransportError) -> String
 ```
 
-**Purpose**: Converts a `TransportError` into a short, telemetry-safe message string. HTTP errors are reduced to status code only so bodies and headers never leak into metrics/log labels.
+**Purpose**: This function turns a low-level transport error into a short message suitable for telemetry, which is operational reporting. It is careful not to include HTTP response bodies, because those bodies may contain private data.
 
-**Data flow**: Takes `&TransportError` and matches variants: `Http` becomes `format!("http {}", status.as_u16())`; `RetryLimit`, `Timeout`, `Network(err)`, and `Build(err)` become fixed strings or the contained error string. It returns the constructed `String` and writes no state.
+**Data flow**: It receives a TransportError. For HTTP errors, it keeps only the numeric status code and formats it as text like "http 401". For retry limits and timeouts, it returns fixed plain-language messages. For network and request-building errors, it returns the existing error text. The output is a single String.
 
-**Call relations**: Used by `telemetry_api_error_message` for the transport branch. The tests rely on it to confirm that HTTP body contents are omitted while non-HTTP details are preserved.
+**Call relations**: This is the transport-specific formatter. telemetry_api_error_message calls it whenever an ApiError contains a TransportError, so the same privacy rule is used whether code starts from the low-level or high-level error type.
 
 *Call graph*: called by 1 (telemetry_api_error_message); 1 external calls (format!).
 
@@ -908,11 +910,11 @@ fn telemetry_transport_error_message(error: &TransportError) -> String
 fn telemetry_api_error_message(error: &ApiError) -> String
 ```
 
-**Purpose**: Produces a compact telemetry label for any `ApiError`, preserving only coarse category information. It distinguishes transport, API-status, stream, and several semantic error variants.
+**Purpose**: This function turns a higher-level API error into a short telemetry message. It gives operators enough information to classify the failure without copying full server responses or sensitive details.
 
-**Data flow**: Takes `&ApiError` and matches variants. `ApiError::Transport` delegates to `telemetry_transport_error_message`; `Api { status, .. }` becomes `api error <status>`; stream/build-like string variants return their contained text; semantic variants such as `ContextWindowExceeded`, `QuotaExceeded`, `UsageNotIncluded`, `Retryable`, `RateLimit`, `InvalidRequest`, `CyberPolicy`, and `ServerOverloaded` map to fixed strings. It returns a `String`.
+**Data flow**: It receives an ApiError. If the error wraps a TransportError, it sends that inner error to telemetry_transport_error_message. For API status errors, it keeps the status code. For known categories such as quota exceeded, rate limit, invalid request, or server overloaded, it returns a fixed label. For stream errors, it returns the stream error text. The output is a concise String.
 
-**Call relations**: This is the top-level telemetry formatter for API-layer failures. It delegates transport formatting downward so HTTP sanitization logic stays centralized in `telemetry_transport_error_message`.
+**Call relations**: This is the broader error formatter used when code is working with ApiError values. It delegates transport-specific cases to telemetry_transport_error_message and formats the other API-level cases itself.
 
 *Call graph*: calls 1 internal fn (telemetry_transport_error_message); 1 external calls (format!).
 
@@ -923,11 +925,11 @@ fn telemetry_api_error_message(error: &ApiError) -> String
 fn extract_response_debug_context_decodes_identity_headers()
 ```
 
-**Purpose**: Verifies that HTTP headers are extracted into `ResponseDebugContext`, including fallback request ID handling and base64-decoded authorization error codes. It exercises the happy path for all supported debug headers.
+**Purpose**: This test proves that the extractor can read the important identity and authorization headers from an HTTP error. It also checks that the base64-wrapped JSON error code is decoded correctly.
 
-**Data flow**: Builds an `http::HeaderMap` with `x-oai-request-id`, `cf-ray`, `x-openai-authorization-error`, and `x-error-json`, wraps it in `TransportError::Http`, passes that to `extract_response_debug_context`, and asserts the returned struct equals the expected populated `ResponseDebugContext`.
+**Data flow**: The test builds a fake set of HTTP headers containing a request ID, Cloudflare ray ID, authorization error, and encoded JSON error code. It wraps those headers in a simulated unauthorized HTTP transport error, sends that error into extract_response_debug_context, and compares the returned ResponseDebugContext with the exact expected values.
 
-**Call relations**: This test directly targets `extract_response_debug_context` to prove the header-reading and nested JSON decoding logic works end to end.
+**Call relations**: The test harness runs this function during testing. Inside the test, it calls extract_response_debug_context and uses assertions to make sure the core extraction behavior does not accidentally change.
 
 *Call graph*: calls 1 internal fn (extract_response_debug_context); 3 external calls (new, from_static, assert_eq!).
 
@@ -938,11 +940,11 @@ fn extract_response_debug_context_decodes_identity_headers()
 fn telemetry_error_messages_omit_http_bodies()
 ```
 
-**Purpose**: Checks that telemetry formatting for HTTP failures uses only the status code and never includes the response body. This guards against accidental leakage of sensitive server messages.
+**Purpose**: This test protects the privacy rule for telemetry: HTTP response bodies must not appear in telemetry messages. It uses a fake body containing secret-looking text to make the risk obvious.
 
-**Data flow**: Constructs a `TransportError::Http` containing a secret-bearing JSON body, then compares `telemetry_transport_error_message(&transport)` and `telemetry_api_error_message(&ApiError::Transport(transport))` against the expected `"http 401"` string.
+**Data flow**: The test creates an HTTP transport error with status 401 and a response body that says a secret token leaked. It checks that the transport-level telemetry message is only "http 401", and that the API-level wrapper produces the same safe message. The dangerous body text does not come out.
 
-**Call relations**: This test validates the sanitization contract of both telemetry helpers, especially the delegation path from `telemetry_api_error_message` into `telemetry_transport_error_message`.
+**Call relations**: The test harness runs this during testing. Its assertions guard the formatting behavior so future changes do not accidentally include HTTP bodies in telemetry output.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -953,22 +955,24 @@ fn telemetry_error_messages_omit_http_bodies()
 fn telemetry_error_messages_preserve_non_http_details()
 ```
 
-**Purpose**: Confirms that non-HTTP transport and stream errors keep their original textual detail instead of being collapsed to generic labels. It distinguishes the privacy rule for HTTP from the behavior for local/client-side failures.
+**Purpose**: This test checks the other side of the telemetry rule: non-HTTP error details, such as network or stream failure text, are still kept. These messages are usually the useful error itself, not a server response body.
 
-**Data flow**: Creates `TransportError::Network`, `TransportError::Build`, and `ApiError::Stream` values with explicit strings, passes them through the telemetry helpers, and asserts the returned messages equal those original strings.
+**Data flow**: The test creates sample network, build, and stream errors with simple text messages. It then checks that the telemetry helpers return those same messages. The before-and-after story is that ordinary local error text stays visible for debugging.
 
-**Call relations**: This test complements the HTTP-body omission test by showing that only HTTP responses are aggressively sanitized; other variants intentionally preserve their message text.
+**Call relations**: The test harness runs this during testing. It constructs representative Network, Build, and Stream errors and uses assertions to make sure the telemetry helpers still preserve useful non-HTTP details.
 
 *Call graph*: 4 external calls (assert_eq!, Stream, Build, Network).
 
 
 ### `secrets/src/sanitizer.rs`
 
-`util` · `cross-cutting logging and display sanitization`
+`util` · `cross-cutting`
 
-This file is a focused utility for scrubbing sensitive substrings from arbitrary text. It defines four `LazyLock<Regex>` statics: one for OpenAI-style keys beginning with `sk-`, one for AWS access key IDs beginning with `AKIA`, one for case-insensitive `Bearer <token>` headers, and one for assignment-like patterns such as `api_key=...`, `token: ...`, `secret=...`, or `password=...`. The regexes are compiled once on first use through `compile_regex`, which panics immediately if a pattern is invalid; the accompanying test exists specifically to force that compilation path.
+This file is a simple secret scrubber. Its job is to look through a piece of text and replace things that look like private credentials with a safe placeholder. Without it, logs, error messages, or other copied text could accidentally include real keys that let someone access paid services or private systems.
 
-`redact_secrets` applies the regexes in sequence to an owned `String`, replacing matched values with fixed placeholders. The replacement strings preserve some surrounding structure where useful: bearer tokens keep the `Bearer ` prefix, and assignment-like matches preserve the key name, separator, and optional opening quote while replacing only the value. This is intentionally heuristic rather than exhaustive; it aims to catch common accidental leaks in logs without claiming full secret detection coverage.
+It uses regular expressions, which are search patterns for text, to recognize several common secret shapes: OpenAI-style keys, AWS access key IDs, bearer tokens used in web authentication, and assignments such as `api_key = ...` or `password: ...`. The patterns are stored in `LazyLock` values, meaning each pattern is compiled only when it is first needed and then reused. That is like keeping a stencil after making it once, instead of cutting a new stencil every time.
+
+The main function, `redact_secrets`, runs the input text through these patterns one after another. When it finds a match, it replaces the sensitive part with `[REDACTED_SECRET]`, while preserving useful surrounding words like `Bearer` or `password =`. This is intentionally “best effort”: it catches common formats, but it cannot prove that every possible secret has been removed. A small test exists to make sure the patterns are valid and can be loaded without crashing.
 
 #### Function details
 
@@ -978,11 +982,11 @@ This file is a focused utility for scrubbing sensitive substrings from arbitrary
 fn redact_secrets(input: String) -> String
 ```
 
-**Purpose**: Runs a sequence of regex-based redactions over an input string and returns a sanitized copy. It targets several common secret formats rather than attempting full semantic parsing.
+**Purpose**: This function takes a string and returns a safer version with likely secrets hidden. It is meant for any place that needs to display or record text without exposing credentials.
 
-**Data flow**: It takes ownership of an input `String`, applies `replace_all` with `OPENAI_KEY_REGEX`, `AWS_ACCESS_KEY_ID_REGEX`, `BEARER_TOKEN_REGEX`, and `SECRET_ASSIGNMENT_REGEX` in order, and returns the final redacted `String`.
+**Data flow**: It receives the original text as input. It checks that text against several known secret patterns in order, replacing matches with `[REDACTED_SECRET]` or, for bearer tokens, `Bearer [REDACTED_SECRET]`. It returns a new string containing the redacted text and does not change anything outside the function.
 
-**Call relations**: The test module invokes it to force lazy regex initialization; in production it serves as the top-level sanitization helper for any caller that wants best-effort secret scrubbing.
+**Call relations**: In normal use, other parts of the system would call this before printing, logging, or otherwise sharing text that may contain secrets. In this file’s test flow, `tests::load_regex` calls it once with a simple string to force the regular expression patterns to load and prove they are valid.
 
 *Call graph*: called by 1 (load_regex).
 
@@ -993,11 +997,11 @@ fn redact_secrets(input: String) -> String
 fn compile_regex(pattern: &str) -> Regex
 ```
 
-**Purpose**: Compiles one regex pattern and fails fast if the pattern is invalid. This keeps the static regex definitions concise while surfacing mistakes immediately.
+**Purpose**: This helper turns a text search pattern into a compiled regular expression that can be reused efficiently. If a pattern is written incorrectly, it stops the program immediately with a clear error, because that would be a programmer mistake.
 
-**Data flow**: It takes a pattern `&str`, calls `Regex::new`, returns the compiled `Regex` on success, or panics with the pattern and error details on failure.
+**Data flow**: It receives a pattern string. It asks the regex library to compile that pattern. If compilation works, it returns the compiled matcher; if compilation fails, it panics with an error message explaining which pattern was invalid.
 
-**Call relations**: It is used only by the `LazyLock` static initializers so regex compilation happens once per process on first access.
+**Call relations**: The file’s lazily initialized secret patterns call this helper when they are first used. It hands back ready-to-use regular expressions to `redact_secrets`, which then uses them to find and replace likely credentials.
 
 *Call graph*: 2 external calls (new, panic!).
 
@@ -1008,11 +1012,11 @@ fn compile_regex(pattern: &str) -> Regex
 fn load_regex()
 ```
 
-**Purpose**: Forces all lazy regex statics to compile so invalid patterns fail during tests instead of at runtime. It is a smoke test for regex initialization.
+**Purpose**: This test checks that all secret-matching patterns can be compiled successfully. It is not testing a particular redaction result; it is guarding against broken pattern syntax being committed.
 
-**Data flow**: The test passes a trivial string into `redact_secrets` and ignores the result; the important side effect is triggering each `LazyLock` and therefore `compile_regex`.
+**Data flow**: It starts with the harmless string `secret`, passes it into `redact_secrets`, and ignores the returned text. The important effect is that calling `redact_secrets` forces the lazy regular expressions to compile, so any invalid pattern would cause the test to fail.
 
-**Call relations**: It covers the panic-on-invalid-pattern behavior indirectly by exercising the top-level redaction function.
+**Call relations**: During the test run, this function calls `redact_secrets` specifically to exercise the pattern-loading path. That in turn causes the lazy regex setup to use `compile_regex`, catching mistakes early before the sanitizer is used in real output paths.
 
 *Call graph*: calls 1 internal fn (redact_secrets).
 
@@ -1022,13 +1026,15 @@ These components persist ad hoc debug captures for proxied traffic and analytics
 
 ### `responses-api-proxy/src/dump.rs`
 
-`io_transport` · `request forwarding diagnostics, response streaming, post-read cleanup`
+`io_transport` · `request handling and debug dumping`
 
-This file implements optional exchange dumping for the responses API proxy. `ExchangeDumper` owns a dump directory and an `AtomicU64` sequence counter. `new` ensures the directory exists, and `dump_request` allocates a unique filename prefix from the sequence plus current UNIX timestamp in milliseconds. It writes a `*-request.json` file immediately, containing the HTTP method, URL path, redacted headers, and a body represented as parsed JSON when valid or as a lossy UTF-8 string otherwise.
+This file is like a flight recorder for the proxy. When the proxy sends a request onward and receives a response back, this code can write both sides of that exchange into a dump directory. Without it, a developer trying to understand what the proxy actually sent or received would have to rely on logs or reproduce the problem by hand.
 
-The returned `ExchangeDump` carries only the future response path. `tee_response_body` turns that into a `ResponseBodyDump<R>`, a generic wrapper around any `Read` implementation. As the proxy streams bytes from upstream to downstream, `ResponseBodyDump::read` forwards reads unchanged while accumulating the bytes in memory. When EOF is reached—or if the wrapper is dropped before EOF—`write_dump_if_needed` serializes a `ResponseDump` with status, redacted response headers, and the captured body. A `dump_written` flag guarantees the response file is emitted at most once.
+The main piece is `ExchangeDumper`. It creates the dump folder, gives each exchange a unique numbered filename, and writes the request file immediately. It stores the method, URL, headers, and body. If the body is valid JSON, it keeps it as JSON; otherwise it saves it as readable text as best it can.
 
-Header redaction is intentionally broad for secrets: exact case-insensitive `authorization` and any header whose lowercase name contains `cookie` are replaced with `[REDACTED]`. There are two `HeaderDump` conversions, one for `tiny_http::Header` and one for reqwest header pairs, so both inbound requests and upstream responses use the same redaction policy. Dump-writing failures during response capture are non-fatal and only reported to stderr, preserving proxy behavior even when diagnostics fail.
+The response is saved later through `ExchangeDump` and `ResponseBodyDump`. `ResponseBodyDump` wraps the real response body reader. As callers read the response normally, this wrapper copies the bytes into memory too, like putting carbon paper under a form. When the stream reaches the end, or if the wrapper is dropped before that, it writes the response dump file.
+
+A very important safety detail is header redaction. Any `authorization` header or anything with `cookie` in its name is replaced with `[REDACTED]`, so debug dumps do not casually leak credentials.
 
 #### Function details
 
@@ -1038,11 +1044,11 @@ Header redaction is intentionally broad for secrets: exact case-insensitive `aut
 fn new(dump_dir: PathBuf) -> io::Result<Self>
 ```
 
-**Purpose**: Initializes a dumper rooted at a directory and resets the sequence counter to 1. It guarantees the dump directory exists before any request is processed.
+**Purpose**: Creates a new dumper tied to a folder on disk. It also makes sure that folder exists before any request or response files are written there.
 
-**Data flow**: Takes `dump_dir: PathBuf`, calls `fs::create_dir_all(&dump_dir)`, and returns `Ok(ExchangeDumper { dump_dir, next_sequence: AtomicU64::new(1) })` or the underlying `io::Error`.
+**Data flow**: It receives a folder path. It creates that folder and any missing parent folders, then returns an `ExchangeDumper` that remembers the folder and starts numbering exchanges from 1. If the folder cannot be created, it returns an input/output error instead.
 
-**Call relations**: Constructed by proxy setup code before request handling begins, and by tests that verify dump contents. Its output is later used by `ExchangeDumper::dump_request` for per-exchange files.
+**Call relations**: The test cases call this first to set up dumping. In normal use, other proxy code would do the same before calling `ExchangeDumper::dump_request` for each exchange.
 
 *Call graph*: called by 2 (dump_request_writes_redacted_headers_and_json_body, response_body_dump_streams_body_and_writes_response_file); 2 external calls (new, create_dir_all).
 
@@ -1059,11 +1065,11 @@ fn dump_request(
     ) -> io::Result<ExchangeDump>
 ```
 
-**Purpose**: Serializes the inbound request to a JSON file and prepares the matching response dump path. It is the entry point for capturing a full request/response exchange.
+**Purpose**: Writes the request side of an HTTP exchange to a JSON file and prepares a matching response dump file path. Someone uses this when a request is about to be forwarded and they want a durable record of what was sent.
 
-**Data flow**: Reads `method`, `url`, `headers`, and raw `body`. It atomically fetches and increments `next_sequence`, computes a timestamp-based filename prefix, builds `*-request.json` and `*-response.json` paths under `dump_dir`, constructs a `RequestDump` with `method.as_str()`, cloned URL, `headers.iter().map(HeaderDump::from).collect()`, and `dump_body(body)`, writes it via `write_json_dump`, and returns `ExchangeDump { response_path }`.
+**Data flow**: It receives the HTTP method, URL, request headers, and raw body bytes. It picks the next sequence number, adds the current time, builds request and response filenames, converts the request into a safe JSON-friendly shape, redacts sensitive headers, and writes the request file. It returns an `ExchangeDump` containing the future response file path.
 
-**Call relations**: Called from the proxy’s request-forwarding path before the upstream request is sent. It delegates body normalization to `dump_body` and file serialization to `write_json_dump`; the returned `ExchangeDump` is later consumed by `ExchangeDump::tee_response_body`.
+**Call relations**: This is the first half of the dump flow. It calls `dump_body` to make the body readable and `write_json_dump` to write the file. The returned `ExchangeDump` is then used to wrap and record the response through `ExchangeDump::tee_response_body`.
 
 *Call graph*: calls 2 internal fn (dump_body, write_json_dump); 6 external calls (fetch_add, iter, as_str, join, now, format!).
 
@@ -1079,11 +1085,11 @@ fn tee_response_body(
     ) -> ResponseBodyDump<R>
 ```
 
-**Purpose**: Wraps an upstream response body reader so the proxy can stream bytes to the client while simultaneously recording them for a response dump file. It binds response metadata up front and defers file writing until the body is consumed or dropped.
+**Purpose**: Wraps a response body so it can be read normally while also being copied for the response dump. This lets the proxy keep streaming the response without needing a separate second read.
 
-**Data flow**: Consumes `self`, takes `status`, a reqwest `HeaderMap`, and a generic `response_body: R`. It returns `ResponseBodyDump<R>` populated with the original reader, stored `response_path`, numeric status, converted/redacted headers, an empty byte buffer, and `dump_written = false`.
+**Data flow**: It takes the response status code, response headers, and the original response body reader. It turns the headers into dump-safe header records, stores an empty buffer for body bytes, and returns a `ResponseBodyDump` wrapper around the original reader.
 
-**Call relations**: Used by the proxy only when request dumping is enabled. The returned wrapper participates in downstream I/O through its `Read` impl and eventually calls `ResponseBodyDump::write_dump_if_needed`.
+**Call relations**: This starts the second half of the exchange dump. It is used after `ExchangeDumper::dump_request` has returned an `ExchangeDump`, and it hands control to `ResponseBodyDump::read`, which copies bytes as the response is consumed.
 
 *Call graph*: 2 external calls (iter, new).
 
@@ -1094,11 +1100,11 @@ fn tee_response_body(
 fn write_dump_if_needed(&mut self)
 ```
 
-**Purpose**: Materializes the response JSON dump exactly once, regardless of whether the body reached EOF or the wrapper was dropped early. It treats dump failures as diagnostic-only and never propagates them to the caller.
+**Purpose**: Writes the response JSON file once, and only once. It exists so the response is saved whether the stream is fully read or the wrapper is dropped early.
 
-**Data flow**: Mutably borrows `self`, checks `dump_written`, and returns immediately if already true. Otherwise it flips the flag, builds a `ResponseDump { status, headers: std::mem::take(&mut self.headers), body: dump_body(&self.body) }`, and attempts `write_json_dump(&self.response_path, &response_dump)`. On error it prints a message to stderr including the target path.
+**Data flow**: It checks whether the dump has already been written. If not, it marks it as written, builds a response record from the status, headers, and bytes collected so far, converts the body into JSON or text with `dump_body`, and writes the file with `write_json_dump`. If writing fails, it prints an error message instead of interrupting the response flow.
 
-**Call relations**: This is the shared finalization path invoked by both `ResponseBodyDump::read` at EOF and `ResponseBodyDump::drop` during cleanup, ensuring one response file per exchange.
+**Call relations**: `ResponseBodyDump::read` calls this when it reaches the end of the response stream. `ResponseBodyDump::drop` also calls it as a safety net when the wrapper goes away.
 
 *Call graph*: calls 2 internal fn (dump_body, write_json_dump); called by 2 (drop, read); 2 external calls (eprintln!, take).
 
@@ -1109,11 +1115,11 @@ fn write_dump_if_needed(&mut self)
 fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>
 ```
 
-**Purpose**: Implements streaming tee behavior for response bodies: it forwards bytes from the wrapped reader while buffering them for later dumping. EOF triggers immediate dump finalization.
+**Purpose**: Reads bytes from the real response body while secretly saving a copy for the dump file. It makes the wrapper behave like a normal reader to the rest of the proxy.
 
-**Data flow**: Takes `&mut self` and an output buffer `buf`. It reads from `self.response_body` into `buf`; if `bytes_read == 0`, it calls `write_dump_if_needed()` and returns `Ok(0)`. Otherwise it appends the newly read slice to `self.body` and returns the byte count unchanged.
+**Data flow**: It receives a caller-provided buffer. It asks the wrapped response body to fill that buffer. If bytes were read, it appends those bytes to its internal copy and returns the byte count. If zero bytes were read, meaning the stream ended, it writes the response dump if needed and returns zero.
 
-**Call relations**: This method is exercised by the proxy when tiny_http drains the upstream response body. It delegates final dump emission to `write_dump_if_needed` once the stream ends.
+**Call relations**: Callers read from `ResponseBodyDump` just as they would read from the original response stream. When reading reaches the end, this function hands off to `ResponseBodyDump::write_dump_if_needed` to persist the collected response.
 
 *Call graph*: calls 1 internal fn (write_dump_if_needed); 1 external calls (read).
 
@@ -1124,11 +1130,11 @@ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>
 fn drop(&mut self)
 ```
 
-**Purpose**: Ensures a response dump is still written even if the body reader is abandoned before EOF. This makes diagnostics robust against partial reads or early connection teardown.
+**Purpose**: Acts as a cleanup safety net that writes the response dump when the wrapper is destroyed. This prevents losing the response record if the caller stops reading before the stream naturally ends.
 
-**Data flow**: On drop, mutably borrows `self` and calls `write_dump_if_needed()`. It returns no value and ignores any dump-write failure beyond the stderr logging inside that helper.
+**Data flow**: It receives the existing `ResponseBodyDump` as it is being cleaned up. It does not return anything. It simply asks `write_dump_if_needed` to save whatever response bytes have been collected so far.
 
-**Call relations**: Acts as the fallback finalizer for `ResponseBodyDump` when normal `Read`-driven EOF handling does not occur.
+**Call relations**: Rust calls this automatically when the wrapper goes out of scope. It uses the same write path as `ResponseBodyDump::read`, so the response file is produced either at end-of-stream or during cleanup.
 
 *Call graph*: calls 1 internal fn (write_dump_if_needed).
 
@@ -1139,11 +1145,11 @@ fn drop(&mut self)
 fn from(header: (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)) -> Self
 ```
 
-**Purpose**: Converts reqwest response headers into serializable `HeaderDump` records while applying the same secret-redaction policy used for request headers. It preserves non-secret values as lossy UTF-8 strings.
+**Purpose**: Converts a response header into the simple name-and-value form used in dump files, while hiding secrets. This keeps dumps useful without exposing tokens or cookies.
 
-**Data flow**: Takes a tuple `(&HeaderName, &HeaderValue)`, reads the lowercase-ish header name via `as_str()`, checks `should_redact_header(name)`, and either stores `[REDACTED]` or `String::from_utf8_lossy(header.1.as_bytes()).into_owned()`. It returns `HeaderDump { name: name.to_string(), value }`.
+**Data flow**: It receives a header name and value from the response library. It checks the name with `should_redact_header`. If the header is sensitive, it stores `[REDACTED]`; otherwise it converts the raw header bytes into a readable string. It returns a `HeaderDump` with the safe name and value.
 
-**Call relations**: Used by `ExchangeDump::tee_response_body` when capturing upstream response metadata. It relies on `should_redact_header` to decide whether to hide the value.
+**Call relations**: This conversion is used when response headers are collected for `ExchangeDump::tee_response_body`. It relies on `should_redact_header` to decide which values must not be written plainly.
 
 *Call graph*: calls 1 internal fn (should_redact_header); 1 external calls (from_utf8_lossy).
 
@@ -1154,11 +1160,11 @@ fn from(header: (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)) -
 fn should_redact_header(name: &str) -> bool
 ```
 
-**Purpose**: Defines which headers are considered sensitive enough to redact in dumps. It catches both authorization credentials and any cookie-related header names.
+**Purpose**: Decides whether a header value is too sensitive to write into a dump file. It currently treats authorization headers and cookie-related headers as secret.
 
-**Data flow**: Takes `name: &str`, compares it case-insensitively to `authorization`, and also checks whether `name.to_ascii_lowercase()` contains `"cookie"`. It returns `true` for sensitive names and `false` otherwise.
+**Data flow**: It receives a header name as text. It compares it case-insensitively with `authorization` and also checks whether the lowercase name contains `cookie`. It returns `true` when the value should be replaced with `[REDACTED]`, otherwise `false`.
 
-**Call relations**: Called by both `HeaderDump` conversion implementations so request and response dumps share one redaction rule.
+**Call relations**: `HeaderDump::from` calls this before storing header values. That makes this function the central rule for keeping credentials out of request and response dumps.
 
 *Call graph*: called by 1 (from).
 
@@ -1169,11 +1175,11 @@ fn should_redact_header(name: &str) -> bool
 fn dump_body(body: &[u8]) -> Value
 ```
 
-**Purpose**: Normalizes raw body bytes into a JSON value suitable for dump files. It preserves structured JSON bodies as JSON and falls back to a string for everything else.
+**Purpose**: Turns raw body bytes into something that can be placed in a JSON dump. It preserves real JSON bodies as structured JSON and falls back to readable text for other bodies.
 
-**Data flow**: Takes `body: &[u8]`, attempts `serde_json::from_slice(body)`, and returns that parsed `Value` on success. If parsing fails, it returns `Value::String(String::from_utf8_lossy(body).into_owned())`.
+**Data flow**: It receives a byte slice. It first tries to parse those bytes as JSON. If parsing works, it returns that JSON value. If parsing fails, it converts the bytes into a string, replacing invalid text as needed, and returns that string as a JSON value.
 
-**Call relations**: Used by both `ExchangeDumper::dump_request` and `ResponseBodyDump::write_dump_if_needed` so request and response bodies are rendered consistently.
+**Call relations**: `ExchangeDumper::dump_request` uses this for request bodies, and `ResponseBodyDump::write_dump_if_needed` uses it for response bodies. This keeps both dump files consistent and readable.
 
 *Call graph*: called by 2 (dump_request, write_dump_if_needed); 1 external calls (from_slice).
 
@@ -1184,11 +1190,11 @@ fn dump_body(body: &[u8]) -> Value
 fn write_json_dump(path: &PathBuf, dump: &impl Serialize) -> io::Result<()>
 ```
 
-**Purpose**: Serializes a dump structure as pretty-printed JSON with a trailing newline and writes it to disk. It converts serialization failures into `io::ErrorKind::InvalidData`.
+**Purpose**: Writes a dump record to disk as pretty-printed JSON. It is the shared file-writing step for both request and response dumps.
 
-**Data flow**: Takes a `path: &PathBuf` and any `Serialize` value. It runs `serde_json::to_vec_pretty(dump)`, maps serialization errors into `io::Error`, appends `\n`, and writes the bytes with `fs::write(path, bytes)`, returning `io::Result<()>`.
+**Data flow**: It receives a file path and any serializable dump object. It converts the object into nicely formatted JSON bytes, adds a final newline, and writes those bytes to the given path. It returns success or an input/output error.
 
-**Call relations**: This is the common file-output primitive used by both request dumping and response finalization.
+**Call relations**: `ExchangeDumper::dump_request` calls this to save the request file. `ResponseBodyDump::write_dump_if_needed` calls it to save the response file.
 
 *Call graph*: called by 2 (dump_request, write_dump_if_needed); 2 external calls (write, to_vec_pretty).
 
@@ -1199,11 +1205,11 @@ fn write_json_dump(path: &PathBuf, dump: &impl Serialize) -> io::Result<()>
 fn dump_request_writes_redacted_headers_and_json_body()
 ```
 
-**Purpose**: Verifies that request dumps are written immediately, preserve JSON body structure, and redact authorization/cookie headers while leaving ordinary headers intact. It also checks the response dump filename suffix convention.
+**Purpose**: Checks that request dumping writes the expected JSON and hides sensitive request headers. It protects against accidentally leaking authorization or cookie values in debug files.
 
-**Data flow**: Creates a temporary dump directory, constructs an `ExchangeDumper`, builds several `tiny_http::Header` values including sensitive and non-sensitive names, calls `dump_request`, reads the generated `-request.json` file, parses it as JSON, and asserts exact equality with the expected structure. It then inspects `exchange_dump.response_path` and removes the temp directory.
+**Data flow**: It creates a temporary dump folder, builds a dumper, prepares a POST request with several headers and a JSON body, and asks the dumper to write it. It then reads the produced request file and compares it with the expected JSON, including redacted secrets and preserved non-secret headers. Finally, it removes the temporary folder.
 
-**Call relations**: This test exercises `ExchangeDumper::new`, `ExchangeDumper::dump_request`, header redaction, body parsing via `dump_body`, and the request/response filename pairing.
+**Call relations**: This test exercises `ExchangeDumper::new` and the request side of the dump flow. It also uses helper functions to create a test directory and find the generated request dump file.
 
 *Call graph*: calls 1 internal fn (new); 7 external calls (assert!, assert_eq!, read_to_string, remove_dir_all, dump_file_with_suffix, test_dump_dir, vec!).
 
@@ -1214,11 +1220,11 @@ fn dump_request_writes_redacted_headers_and_json_body()
 fn response_body_dump_streams_body_and_writes_response_file()
 ```
 
-**Purpose**: Checks that the response wrapper both streams bytes through unchanged and writes a redacted response dump after reading completes. It covers the `Read` implementation and EOF-triggered finalization.
+**Purpose**: Checks that response dumping does not interfere with reading the response body and still writes a safe response dump. It proves the wrapper behaves like a normal stream while recording a copy.
 
-**Data flow**: Creates a temp dumper and request dump, builds a reqwest `HeaderMap` with content type plus sensitive authorization and cookie headers, wraps a `Cursor` body using `tee_response_body`, reads it into a `String`, then reads the generated `-response.json` file and asserts both the streamed body and dumped JSON match expectations. Finally it deletes the temp directory.
+**Data flow**: It creates a temporary dumper, writes a matching request dump, builds response headers with both safe and sensitive values, and wraps a small response body. It reads the wrapped body into a string, then reads the response dump file and compares it with the expected status, headers, and body. Sensitive response headers must be redacted.
 
-**Call relations**: This test drives `ExchangeDump::tee_response_body`, `ResponseBodyDump::read`, `ResponseBodyDump::write_dump_if_needed`, and response-side header redaction end to end.
+**Call relations**: This test covers the full response path that starts after `ExchangeDumper::dump_request`. It uses `ExchangeDump::tee_response_body`, then reading the wrapper triggers `ResponseBodyDump::read` and the response dump write.
 
 *Call graph*: calls 2 internal fn (new, new); 8 external calls (new, from_static, new, assert_eq!, read_to_string, remove_dir_all, dump_file_with_suffix, test_dump_dir).
 
@@ -1229,11 +1235,11 @@ fn response_body_dump_streams_body_and_writes_response_file()
 fn test_dump_dir() -> std::path::PathBuf
 ```
 
-**Purpose**: Creates a unique temporary directory for dump-related tests. It avoids collisions by combining process ID with an atomic test-local sequence number.
+**Purpose**: Creates a unique temporary folder for one test run. This keeps tests from overwriting each other’s dump files.
 
-**Data flow**: Fetches and increments `NEXT_TEST_DIR`, builds a path under `std::env::temp_dir()` using `format!`, creates the directory with `fs::create_dir_all`, and returns the resulting `PathBuf`.
+**Data flow**: It increments a shared test counter, combines that counter with the current process ID, and builds a folder path under the system temporary directory. It creates the folder and returns the path.
 
-**Call relations**: Used by both dump tests as shared setup for isolated filesystem state.
+**Call relations**: The dump-related tests call this before creating an `ExchangeDumper`. It gives each test an isolated place to write files.
 
 *Call graph*: 3 external calls (format!, create_dir_all, temp_dir).
 
@@ -1244,26 +1250,26 @@ fn test_dump_dir() -> std::path::PathBuf
 fn dump_file_with_suffix(dump_dir: &std::path::Path, suffix: &str) -> std::path::PathBuf
 ```
 
-**Purpose**: Finds the single dump file in a directory whose path ends with a given suffix. It enforces the expectation that each test creates exactly one matching file.
+**Purpose**: Finds the one dump file in a test folder that ends with a requested suffix, such as `-request.json` or `-response.json`. It makes the tests independent of the timestamped filename prefix.
 
-**Data flow**: Reads directory entries from `dump_dir`, maps them to paths, filters by `ends_with(suffix)`, collects and sorts the matches, asserts there is exactly one, and returns that path.
+**Data flow**: It receives a dump directory and a filename suffix. It reads all files in the directory, keeps only paths whose names end with that suffix, sorts them, checks that there is exactly one match, and returns that path.
 
-**Call relations**: Used by the tests to locate generated `-request.json` and `-response.json` files without depending on the timestamped filename prefix.
+**Call relations**: The tests use this after dumping an exchange so they can read the generated file without knowing its sequence number or timestamp.
 
 *Call graph*: 2 external calls (assert_eq!, read_dir).
 
 
 ### `analytics/src/analytics_capture.rs`
 
-`io_transport` · `debug analytics delivery`
+`io_transport` · `analytics capture setup and event writing`
 
-This file is a small I/O utility used when analytics delivery is redirected from the network into a local capture file. The exported constant `ANALYTICS_EVENTS_CAPTURE_FILE_ENV_VAR` names the environment variable checked elsewhere to enable this mode.
+This file is a small recording tool for analytics events. When a capture file is configured through the `CODEX_ANALYTICS_EVENTS_CAPTURE_FILE` environment variable, the analytics system can save every outgoing event request to disk. That is useful for debugging, testing, or auditing what the program would have reported.
 
-The implementation is intentionally minimal and append-only. `initialize` simply opens the target file through `open_capture_file` and drops the handle, which has the side effect of creating the file if it does not already exist. `append_payload` serializes a `TrackEventsRequest` to JSON bytes, converts any serde failure into `io::ErrorKind::InvalidData`, appends a trailing newline so each request occupies one JSONL line, then reopens the file in append mode, writes the bytes, and flushes them.
+The file works like a notebook where each analytics request is written on a new line. First, `initialize` checks that the notebook can be opened, creating it if it does not exist. Later, `append_payload` turns an event request into JSON, adds a newline, opens the same file in append mode, writes the line, and flushes it so the data is pushed out promptly.
 
-`open_capture_file` encapsulates the file-opening policy. It uses `OpenOptions` with `create(true)` and `append(true)` so writes never truncate prior captured payloads. On Unix builds it additionally sets mode `0o600`, ensuring the capture file is readable and writable only by the current user. The function returns a `std::fs::File`, leaving all higher-level error handling to callers in the analytics client.
+The helper `open_capture_file` centralizes the file-opening rules. It always opens the file for appending and creates it if missing. On Unix systems, it also sets the file permissions to `0600`, meaning only the current user can read or write it. That matters because analytics payloads may contain details that should not be visible to other users on the same machine.
 
-There is no buffering, rotation, or locking logic here; the design assumes low-volume debug capture where one serialized request per line is sufficient and durability after each append is desirable.
+Without this file, the project would lose this simple local record of analytics traffic, making it harder to verify what was captured or diagnose analytics behavior.
 
 #### Function details
 
@@ -1273,11 +1279,11 @@ There is no buffering, rotation, or locking logic here; the design assumes low-v
 fn initialize(path: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Creates or opens the analytics capture file so capture mode can be enabled before any payloads are written.
+**Purpose**: This function makes sure the analytics capture file can be opened before events are written to it. It is a lightweight readiness check that also creates the file if it does not already exist.
 
-**Data flow**: Accepts a filesystem `Path`, calls `open_capture_file(path)`, discards the returned `File` with `drop`, and returns the resulting `io::Result<()>`.
+**Data flow**: It receives a file path. It asks `open_capture_file` to open or create that path using the project’s capture-file rules, then immediately drops the opened file because it only needed to confirm access. It returns success if the file is usable, or an input/output error if the operating system refuses the operation.
 
-**Call relations**: Called during analytics destination setup when a capture file path is configured. It delegates all file-opening policy to `open_capture_file`.
+**Call relations**: When higher-level setup code builds analytics settings from a base URL and capture-file option, it calls `initialize` to confirm the capture destination is valid. `initialize` delegates the real file-opening work to `open_capture_file` so setup and later writes use the same rules.
 
 *Call graph*: calls 1 internal fn (open_capture_file); called by 1 (from_base_url_and_capture_file).
 
@@ -1288,11 +1294,11 @@ fn initialize(path: &Path) -> io::Result<()>
 fn append_payload(path: &Path, payload: &TrackEventsRequest) -> io::Result<()>
 ```
 
-**Purpose**: Appends one serialized analytics request as a single newline-terminated JSONL record to the capture file.
+**Purpose**: This function records one analytics request in the capture file. It writes the request as a single JSON line, which makes the file easy for both humans and tools to read one event batch at a time.
 
-**Data flow**: Takes a `&Path` and `&TrackEventsRequest`, serializes the payload with `serde_json::to_vec`, maps serialization failures into `io::ErrorKind::InvalidData`, pushes a trailing `\n`, opens the file with `open_capture_file`, writes all bytes, flushes the file, and returns `io::Result<()>`.
+**Data flow**: It receives a file path and a `TrackEventsRequest`, which is the analytics payload to save. It converts the payload to JSON bytes, adds a newline byte, opens the capture file for appending, writes the bytes, and flushes the file so the write is pushed out. It returns success when the line is safely written, or an input/output style error if JSON conversion or file writing fails.
 
-**Call relations**: Invoked by the analytics client’s debug capture path instead of network delivery. It relies on `open_capture_file` for append/create semantics and secure permissions.
+**Call relations**: When the analytics layer decides to capture a track-events request locally, it calls `append_payload`. This function uses JSON serialization to turn the request into stored text, then calls `open_capture_file` so every write uses the same create, append, and permission behavior.
 
 *Call graph*: calls 1 internal fn (open_capture_file); called by 1 (capture_track_events_request); 1 external calls (to_vec).
 
@@ -1303,11 +1309,11 @@ fn append_payload(path: &Path, payload: &TrackEventsRequest) -> io::Result<()>
 fn open_capture_file(path: &Path) -> io::Result<File>
 ```
 
-**Purpose**: Builds the `OpenOptions` used for analytics capture files and opens the target path in append mode.
+**Purpose**: This helper opens the capture file in the exact way analytics recording needs: create it if missing, add new data to the end, and keep it private on Unix-like systems.
 
-**Data flow**: Creates `OpenOptions`, enables `create(true)` and `append(true)`, conditionally sets Unix mode `0o600`, opens the provided path, and returns `io::Result<File>`.
+**Data flow**: It receives a file path. It builds file-opening options, sets them to create the file and append to it, and on Unix sets permissions so only the owner can access it. It then asks the operating system to open the file and returns the opened file object or an error.
 
-**Call relations**: This private helper is shared by both `initialize` and `append_payload`, ensuring they use identical file-creation and permission behavior.
+**Call relations**: Both setup and event-writing paths rely on this helper. `initialize` uses it to test that the file is available, while `append_payload` uses it just before writing each captured payload. Keeping this in one place prevents the setup path and write path from accidentally using different file rules.
 
 *Call graph*: called by 2 (append_payload, initialize); 1 external calls (new).
 
@@ -1317,11 +1323,15 @@ These files provide the local logging backends, from TUI session JSONL capture t
 
 ### `tui/src/session_log.rs`
 
-`util` · `cross-cutting`
+`io_transport` · `startup, request handling, shutdown`
 
-This module provides lightweight structured logging for TUI sessions. Logging is globally owned by `LOGGER`, a `LazyLock<SessionLogger>` whose `SessionLogger` contains a `OnceLock<Mutex<File>>`. That design means the logger object always exists, but the file is opened at most once and all writes are serialized through a mutex. `open` creates parent directories, truncates any existing file, and on Unix sets mode `0o600` before storing the file handle. `write_json_line` is intentionally best-effort: if logging was never enabled it returns immediately, and if the mutex is poisoned it recovers the inner file handle rather than disabling logging. Serialization, write, newline, and flush failures are reported with `tracing::warn!` but do not propagate.
+This file is like a black box recorder for the terminal user interface. Most of the time it does nothing. If the user sets CODEX_TUI_RECORD_SESSION to a true-like value, it opens a log file and writes one JSON object per line. JSON is a common text format for structured data, and the “one object per line” style makes the file easy to scan, process, or replay later.
 
-`maybe_init` is the activation gate. It checks `CODEX_TUI_RECORD_SESSION` for truthy values (`1`, `true`, `TRUE`, `yes`, `YES`), chooses a path from `CODEX_TUI_SESSION_LOG_PATH` or a timestamped file under `config.log_dir`, opens the logger, and writes a `session_start` header record containing cwd and model/provider context. During runtime, `log_inbound_app_event` records selected `AppEvent` variants with custom payloads—such as history-cell line counts, file-search query/result counts, and pet preview/selection success flags—while collapsing noisier variants to just their debug variant name. `log_outbound_op` wraps arbitrary serializable `AppCommand`s in a standard envelope, and `log_session_end` emits a final lifecycle marker. Timestamps are RFC3339 with millisecond precision for readability and machine parsing.
+The logger first decides where to write the file. A user can provide CODEX_TUI_SESSION_LOG_PATH, or the code creates a timestamped file inside the configured log directory. On Unix systems it creates the file with private permissions, so only the owner can read and write it. That matters because session logs may contain paths, model names, user actions, or other context.
+
+After opening the file, it writes a session_start record with basic context such as the working directory and model provider. During the run, inbound AppEvent values are summarized as records going “to_tui”, while outbound AppCommand values are written as records going “from_tui”. At shutdown it writes session_end.
+
+The actual file handle is stored globally behind a mutex, which is a lock that stops two parts of the program writing to the file at the same time. If logging was not enabled or opening failed, all later logging calls quietly return.
 
 #### Function details
 
@@ -1331,11 +1341,11 @@ This module provides lightweight structured logging for TUI sessions. Logging is
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an unopened session logger with no file handle initialized yet.
+**Purpose**: Creates an empty session logger that does not yet point at a file. This is the starting state used by the global logger before session recording is enabled.
 
-**Data flow**: Creates a `SessionLogger` whose `file` field is a fresh `OnceLock<Mutex<File>>` and returns it.
+**Data flow**: Nothing is passed in. The function builds a SessionLogger whose file slot is empty. The result is a logger that can later be opened exactly once with a real file.
 
-**Call relations**: Used once by the global `LOGGER` lazy initializer.
+**Call relations**: This is used when the global LOGGER is first created. Later, startup code can ask that logger to open a file, and all logging functions share that same logger.
 
 *Call graph*: 1 external calls (new).
 
@@ -1346,11 +1356,11 @@ fn new() -> Self
 fn open(&self, path: PathBuf) -> std::io::Result<()>
 ```
 
-**Purpose**: Opens the JSONL log file, creating parent directories and storing the handle exactly once.
+**Purpose**: Opens the session log file and prepares it for writing. It also creates any missing parent folders so recording does not fail just because the log directory does not exist.
 
-**Data flow**: Takes a `PathBuf`, configures `OpenOptions` for create/truncate/write, creates the parent directory tree if needed, applies Unix mode `0o600` when compiled on Unix, opens the file, stores it in `self.file` via `get_or_init(|| Mutex::new(file))`, and returns `std::io::Result<()>`.
+**Data flow**: It receives a file path. It sets up file-opening options to create or replace the file, makes the parent directory if needed, applies private file permissions on Unix, then opens the file and stores it behind a lock. It returns success or an input/output error if the file cannot be prepared.
 
-**Call relations**: Called from `maybe_init` after environment-based logging has been enabled and a path chosen.
+**Call relations**: maybe_init calls this during startup after recording has been enabled and a path has been chosen. Once this succeeds, later logging calls can find the file through the shared LOGGER and append JSON lines to it.
 
 *Call graph*: 4 external calls (get_or_init, new, parent, create_dir_all).
 
@@ -1361,11 +1371,11 @@ fn open(&self, path: PathBuf) -> std::io::Result<()>
 fn write_json_line(&self, value: serde_json::Value)
 ```
 
-**Purpose**: Serializes one JSON value and appends it as a single line to the session log file.
+**Purpose**: Writes one JSON record to the session log as a single line. This is the common final step for all session records, whether they describe startup, an incoming event, an outgoing command, or shutdown.
 
-**Data flow**: If no file has been opened, returns immediately. Otherwise it locks the file mutex, recovering from poisoning if necessary, serializes the `serde_json::Value` to a string, writes the bytes, writes a trailing newline, flushes the file, and logs warnings on serialization/write/flush errors.
+**Data flow**: It receives a JSON value. If no file has been opened, it returns without doing anything. If a file exists, it locks the file, turns the JSON value into text, writes that text, writes a newline, and flushes the file so the record is actually pushed out. If serialization or writing fails, it logs a warning instead of crashing the app.
 
-**Call relations**: All higher-level logging helpers funnel through this method after constructing their JSON payloads.
+**Call relations**: maybe_init, log_inbound_app_event, log_session_end, and write_record all hand their prepared JSON records to this function. It is the narrow doorway where structured session information becomes bytes in the log file.
 
 *Call graph*: 3 external calls (get, to_string, warn!).
 
@@ -1376,11 +1386,11 @@ fn write_json_line(&self, value: serde_json::Value)
 fn is_enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether session logging has been initialized with an open file.
+**Purpose**: Checks whether session recording is active. Callers use it to avoid doing extra work when no log file was opened.
 
-**Data flow**: Checks whether `self.file.get()` is `Some(_)` and returns that boolean.
+**Data flow**: It reads the logger’s file slot. If a file has been stored there, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Inbound/outbound/session-end logging helpers use this as a cheap guard before building payloads.
+**Call relations**: The public logging functions call this before building records. That keeps normal runs cheap, because when recording is off they return immediately.
 
 *Call graph*: 1 external calls (get).
 
@@ -1391,11 +1401,11 @@ fn is_enabled(&self) -> bool
 fn now_ts() -> String
 ```
 
-**Purpose**: Generates the current timestamp string for log records.
+**Purpose**: Creates a readable timestamp for each log entry. The timestamp uses RFC3339 format, a standard date-and-time format that tools can parse easily.
 
-**Data flow**: Reads `chrono::Utc::now()` and formats it as RFC3339 with millisecond precision and a `Z` suffix.
+**Data flow**: It reads the current UTC time from the system clock. It formats that time with millisecond precision and returns it as a string.
 
-**Call relations**: Used by initialization and all record-writing helpers so every log line carries a consistent timestamp format.
+**Call relations**: Every record-building function uses this timestamp helper so all session log lines share the same time format.
 
 *Call graph*: 1 external calls (now).
 
@@ -1406,11 +1416,11 @@ fn now_ts() -> String
 fn maybe_init(config: &Config)
 ```
 
-**Purpose**: Conditionally enables session logging from environment variables and writes the initial session-start metadata record.
+**Purpose**: Turns session logging on at application startup if the right environment variable is set. It chooses the log file path, opens the file, and writes the first header record.
 
-**Data flow**: Reads `CODEX_TUI_RECORD_SESSION` and interprets a small set of truthy strings; if disabled, returns. Otherwise it chooses a path from `CODEX_TUI_SESSION_LOG_PATH` or constructs `session-<UTC timestamp>.jsonl` under `config.log_dir`, opens the global logger, logs an error and returns on failure, then builds a JSON header containing timestamp, direction `meta`, kind `session_start`, cwd, model, provider ID, and provider name, and writes it.
+**Data flow**: It receives the application Config, which includes things like the log directory, current working directory, and model information. It reads environment variables to decide whether recording is enabled and where the file should go. If enabled and the file opens successfully, it writes a session_start JSON record containing useful context. If recording is off or opening fails, it leaves logging disabled.
 
-**Call relations**: Called during TUI startup before normal event processing begins.
+**Call relations**: run_ratatui_app calls this early in the terminal app’s life. After it succeeds, later calls from event sending, command submission, and shutdown can all add records to the same session log.
 
 *Call graph*: called by 1 (run_ratatui_app); 5 external calls (from, format!, json!, var, error!).
 
@@ -1421,11 +1431,11 @@ fn maybe_init(config: &Config)
 fn log_inbound_app_event(event: &AppEvent)
 ```
 
-**Purpose**: Records selected inbound `AppEvent`s from the app/core side into the session log.
+**Purpose**: Records an event that is being delivered into the terminal interface. It captures the kind of event and, for some events, a small safe summary such as a query string or match count.
 
-**Data flow**: Returns immediately if logging is disabled. Otherwise it matches the `AppEvent` and constructs variant-specific JSON: simple lifecycle markers for `NewSession` and `ClearUi`, history-cell line counts for `InsertHistoryCell`, query and match counts for file search events, request/result metadata for pet preview/selection events, and for all other variants a generic record containing the debug variant name before any payload tuple/struct formatting. Each record is written via `LOGGER.write_json_line`.
+**Data flow**: It receives an AppEvent. If logging is off, it returns immediately. Otherwise it matches the event type, builds a JSON record marked as going “to_tui”, adds the timestamp and relevant summary fields, then writes that record to the log. For many less important or noisy events, it records only the variant name rather than the full contents.
 
-**Call relations**: The app-event delivery path calls this whenever an event is sent toward the TUI.
+**Call relations**: send calls this when events move into the TUI. This gives the session log one side of the conversation: what the rest of the app told the interface to show or react to.
 
 *Call graph*: called by 1 (send); 1 external calls (json!).
 
@@ -1436,11 +1446,11 @@ fn log_inbound_app_event(event: &AppEvent)
 fn log_outbound_op(op: &AppCommand)
 ```
 
-**Purpose**: Records an outbound `AppCommand` sent from the TUI.
+**Purpose**: Records a command sent out from the terminal interface. This shows what the user interface asked the rest of the application to do.
 
-**Data flow**: Checks `LOGGER.is_enabled()` and, if true, passes direction `from_tui`, kind `op`, and the serializable command object to `write_record`.
+**Data flow**: It receives an AppCommand. If no log file is open, it returns. If logging is active, it passes the command to write_record with labels saying the direction is “from_tui” and the kind is “op”.
 
-**Call relations**: Command submission paths call this so outbound operations are logged in the same JSONL stream as inbound events.
+**Call relations**: submit_thread_op and submit_op call this when the TUI submits work outward. It delegates the actual JSON wrapping to write_record, so outbound command logging uses the same shape each time.
 
 *Call graph*: calls 1 internal fn (write_record); called by 2 (submit_thread_op, submit_op).
 
@@ -1451,11 +1461,11 @@ fn log_outbound_op(op: &AppCommand)
 fn log_session_end()
 ```
 
-**Purpose**: Writes the final session-end marker when the TUI shuts down.
+**Purpose**: Writes the final record showing that the recorded session ended. This gives log readers a clear closing marker.
 
-**Data flow**: If logging is enabled, constructs a JSON object with current timestamp, direction `meta`, and kind `session_end`, then writes it as one line.
+**Data flow**: It checks whether logging is active. If so, it builds a small JSON object with the current timestamp, a meta direction, and the kind session_end, then writes it as one line. It does not return any data.
 
-**Call relations**: Called during TUI teardown to bracket the earlier `session_start` header.
+**Call relations**: run_ratatui_app calls this near shutdown. Together with maybe_init’s session_start record, it brackets the useful part of the session log.
 
 *Call graph*: called by 1 (run_ratatui_app); 1 external calls (json!).
 
@@ -1466,24 +1476,24 @@ fn log_session_end()
 fn write_record(dir: &str, kind: &str, obj: &T)
 ```
 
-**Purpose**: Wraps an arbitrary serializable payload in the standard session-log envelope.
+**Purpose**: Wraps any serializable object in the standard session-log shape. It is used when the full payload should be included rather than only a hand-written summary.
 
-**Data flow**: Accepts a direction string, kind string, and `Serialize` payload reference, builds a JSON object containing timestamp, direction, kind, and `payload`, and writes it through `LOGGER.write_json_line`.
+**Data flow**: It receives a direction label, a kind label, and an object that can be converted to JSON. It builds a JSON record containing the current timestamp, those labels, and the object as the payload. It then sends that record to the logger for writing.
 
-**Call relations**: Currently used by `log_outbound_op` to avoid duplicating the common envelope structure.
+**Call relations**: log_outbound_op calls this to record AppCommand values. This helper keeps outbound records consistent and leaves the actual file writing to SessionLogger::write_json_line.
 
 *Call graph*: called by 1 (log_outbound_op); 1 external calls (json!).
 
 
 ### `state/src/log_db.rs`
 
-`io_transport` · `cross-cutting`
+`io_transport` · `cross-cutting during runtime logging`
 
-This module is the state crate’s tracing-to-SQLite sink. `LogDbLayer` owns a bounded Tokio MPSC sender and a per-process UUID string; `start` and `start_with_config` create the queue, normalize queue settings, and spawn `run_inserter`, which batches `LogEntry` values and flushes them either when `batch_size` is reached, when a periodic interval ticks, when an explicit flush command arrives, or when the channel closes. Queue overflow is intentionally lossy: `try_send` drops new entries if the queue is full so `Layer::on_event` stays non-blocking.
+This file is the bridge between Rust tracing events and the project’s local log database. A tracing event is a structured log message: it can include a level, text, file location, and extra fields such as a thread id. Instead of writing each event directly to SQLite, which could slow the application, this file puts log entries into a bounded queue and lets a background task write them in batches. Think of it like dropping letters into an outgoing mail tray: the caller does not wait for every letter to be delivered, but a postal worker periodically takes a stack and sends them.
 
-The layer also tracks span-local logging context. `on_new_span` records initial span fields into `SpanLogContext`, storing the span name, formatted fields, and an optional `thread_id` extracted by `SpanFieldVisitor`. `on_record` updates that context when span fields change, appending newly recorded fields and replacing the stored thread ID if one is newly provided. `on_event` filters out noisy OpenTelemetry SDK TRACE/DEBUG timer events, extracts the event message and optional thread ID with `MessageVisitor`, falls back to `event_thread_id` by walking the current span scope, builds a human-readable `feedback_log_body` by concatenating span names/fields plus event fields, timestamps the event from `SystemTime`, and enqueues a `LogEntry`.
+The main piece is `LogDbLayer`, a tracing subscriber layer. It watches spans, which are named sections of work, remembers useful span fields, and then combines that context with each event. It also creates a feedback-style log body that matches the normal text formatter closely enough that logs can later be queried by thread and shown in a familiar shape.
 
-Formatting helpers reuse `tracing_subscriber`’s `DefaultFields` so stored feedback logs match the standard formatter shape. `current_process_log_uuid` memoizes a `pid:<pid>:<uuid>` identifier in a `OnceLock`, allowing rows from one process to be correlated. Tests cover queue overflow, explicit flush semantics, batch and interval flushing, and parity between SQLite feedback logs and the normal tracing formatter output.
+The queue is deliberately bounded. If ordinary log events arrive faster than the database writer can accept them, new log entries may be dropped rather than blocking the running program. Explicit flush requests are different: they wait until accepted queued entries have been written. The file also filters out very noisy low-level OpenTelemetry timer messages to avoid filling the database with unhelpful logs.
 
 #### Function details
 
@@ -1493,11 +1503,11 @@ Formatting helpers reuse `tracing_subscriber`’s `DefaultFields` so stored feed
 fn default() -> Self
 ```
 
-**Purpose**: Provides the standard queue capacity, batch size, and flush interval for the log sink. These defaults balance low logging overhead with periodic persistence.
+**Purpose**: Provides the standard queue settings for log database writing. These defaults decide how many log commands can wait, how many entries are written at once, and how often buffered logs are written even if the batch is not full.
 
-**Data flow**: It constructs and returns `LogSinkQueueConfig { queue_capacity: 512, batch_size: 128, flush_interval: 2s }` using the module constants.
+**Data flow**: It takes no input. It returns a `LogSinkQueueConfig` filled with the file’s built-in capacity, batch size, and flush interval.
 
-**Call relations**: It is used by `LogDbLayer::start` so callers who do not care about tuning get the standard inserter behavior.
+**Call relations**: When normal logging is started without custom settings, `LogDbLayer::start` asks this function for the default configuration before building the background writer.
 
 *Call graph*: called by 1 (start).
 
@@ -1508,11 +1518,11 @@ fn default() -> Self
 fn normalized(self) -> Self
 ```
 
-**Purpose**: Sanitizes a queue configuration so invalid zero values become usable runtime settings. It prevents degenerate channels, batches, or timers.
+**Purpose**: Makes a queue configuration safe to use. It prevents impossible settings such as a zero-capacity queue, a zero-size batch, or a zero-time flush interval.
 
-**Data flow**: It consumes `self`, replaces `queue_capacity` and `batch_size` with at least `1`, replaces a zero `flush_interval` with `LOG_FLUSH_INTERVAL`, and returns the normalized config.
+**Data flow**: It receives a proposed `LogSinkQueueConfig`. It raises capacity and batch size to at least 1, replaces a zero flush interval with the default interval, and returns the corrected configuration.
 
-**Call relations**: Called by `LogDbLayer::start_with_config` before creating the channel and background inserter.
+**Call relations**: Custom startup goes through this function inside `LogDbLayer::start_with_config`, so the rest of the logging code can assume the configuration is usable.
 
 *Call graph*: called by 1 (start_with_config); 1 external calls (is_zero).
 
@@ -1523,11 +1533,11 @@ fn normalized(self) -> Self
 fn start(state_db: std::sync::Arc<StateRuntime>) -> LogDbLayer
 ```
 
-**Purpose**: Convenience free function that starts a `LogDbLayer` with default queue settings. It gives callers a short API surface for the common case.
+**Purpose**: Starts log capture for a given state database using the standard settings. It is a small convenience wrapper for callers that do not need custom queue behavior.
 
-**Data flow**: It takes `Arc<StateRuntime>`, forwards it to `LogDbLayer::start`, and returns the resulting layer.
+**Data flow**: It receives the shared `StateRuntime`, which knows how to write to the state databases. It passes that runtime into `LogDbLayer::start` and returns the resulting logging layer.
 
-**Call relations**: Tests and external callers use this wrapper instead of naming the inherent constructor directly.
+**Call relations**: Application setup and several tests call this top-level helper when they want a ready-to-use tracing layer backed by SQLite.
 
 *Call graph*: calls 1 internal fn (start); called by 3 (tool_call_logs_include_thread_id, flush_persists_logs_for_query, sqlite_feedback_logs_match_feedback_formatter_shape).
 
@@ -1538,11 +1548,11 @@ fn start(state_db: std::sync::Arc<StateRuntime>) -> LogDbLayer
 fn clone(&self) -> Self
 ```
 
-**Purpose**: Clones the log layer so it can be installed in subscriber pipelines or moved into async tasks while sharing the same queue. Both the sender and process UUID are duplicated by value.
+**Purpose**: Creates another handle to the same logging layer. This lets the layer be installed in tracing while another copy is kept for actions such as flushing.
 
-**Data flow**: It clones `self.sender` and `self.process_uuid` and returns a new `LogDbLayer` containing those clones.
+**Data flow**: It reads the existing sender and process id string, clones them, and returns a new `LogDbLayer` that talks to the same background queue.
 
-**Call relations**: Cloned layers still feed the same background inserter; tests use cloning when installing the layer and later calling `flush`.
+**Call relations**: Tracing setup code can clone the layer before installing it, so later code still has a handle that can request a flush.
 
 *Call graph*: 1 external calls (clone).
 
@@ -1553,11 +1563,11 @@ fn clone(&self) -> Self
 fn start(state_db: std::sync::Arc<StateRuntime>) -> Self
 ```
 
-**Purpose**: Constructs a log layer using the default queue configuration. It is the inherent constructor behind the free `start` function.
+**Purpose**: Builds a `LogDbLayer` with the standard queue settings. This is the normal constructor for database-backed logging.
 
-**Data flow**: It takes `Arc<StateRuntime>`, obtains `LogSinkQueueConfig::default()`, forwards both to `Self::start_with_config`, and returns the resulting layer.
+**Data flow**: It receives the shared state runtime, fetches the default queue configuration, and passes both into `LogDbLayer::start_with_config`. The result is a layer ready to receive tracing events.
 
-**Call relations**: This method is called by the free `start` wrapper and is the default construction path for production use.
+**Call relations**: The public `start` helper delegates here, keeping the simple startup path short while the configurable startup path holds the real setup work.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (start); 1 external calls (start_with_config).
 
@@ -1571,11 +1581,11 @@ fn start_with_config(
     ) -> Self
 ```
 
-**Purpose**: Constructs a log layer with caller-specified queue settings and starts the background inserter task. It is the configurable entry point for tuning batching behavior.
+**Purpose**: Builds a `LogDbLayer` with caller-provided queue and flushing settings. Tests and specialized callers use this to force small batches or short flush intervals.
 
-**Data flow**: It takes `Arc<StateRuntime>` and a `LogSinkQueueConfig`, normalizes the config, creates an MPSC channel with the configured capacity, spawns `run_inserter(state_db, receiver, config)`, computes a process UUID string via `current_process_log_uuid()`, and returns `LogDbLayer { sender, process_uuid }`.
+**Data flow**: It receives the shared state runtime and a queue configuration. It normalizes the configuration, creates a bounded message channel, starts the background inserter task, assigns a stable id for this process, and returns the layer that sends work into that channel.
 
-**Call relations**: This is the foundational constructor used by `LogDbLayer::start`; tests call it directly to verify batch-size and flush-interval behavior.
+**Call relations**: This is the main setup point. Constructors feed into it, and it hands the receiving side of the queue to `run_inserter`, which performs the actual database writes.
 
 *Call graph*: calls 3 internal fn (normalized, current_process_log_uuid, run_inserter); called by 2 (configured_batch_size_flushes_without_explicit_flush, configured_flush_interval_persists_buffered_logs); 2 external calls (channel, spawn).
 
@@ -1586,11 +1596,11 @@ fn start_with_config(
 fn try_send(&self, entry: LogEntry)
 ```
 
-**Purpose**: Attempts to enqueue a log entry without blocking and silently drops it if the queue is full or closed. This keeps tracing event handling lightweight.
+**Purpose**: Attempts to put one finished log entry onto the background queue without waiting. It protects the application from being slowed down by a full log queue.
 
-**Data flow**: It takes ownership of a `LogEntry`, boxes it into `LogDbCommand::Entry`, and calls `self.sender.try_send(...)`, discarding the result.
+**Data flow**: It receives a `LogEntry`. It wraps it as an `Entry` command and tries to send it immediately; if the queue is full or closed, the entry is silently discarded.
 
-**Call relations**: It is called from `on_event` after a `LogEntry` has been assembled. Queue-drop behavior is validated by tests.
+**Call relations**: `LogDbLayer::on_event` calls this after converting a tracing event into a database row. This is why ordinary logging stays non-blocking.
 
 *Call graph*: called by 1 (on_event); 3 external calls (new, try_send, Entry).
 
@@ -1606,11 +1616,11 @@ fn on_new_span(
     )
 ```
 
-**Purpose**: Captures initial span metadata and stores it in the span’s extensions for later event enrichment. It records both formatted fields and an optional `thread_id` field.
+**Purpose**: Records useful context when a new tracing span starts. A span is a named block of work, and this function saves its name, formatted fields, and any `thread_id` field for later log events.
 
-**Data flow**: It creates a default `SpanFieldVisitor`, records the span attributes into it, looks up the span in the subscriber context, and inserts a `SpanLogContext` containing the span name, `format_fields(attrs)`, and any extracted `thread_id` into the span’s extensions.
+**Data flow**: It receives span attributes, the span id, and tracing context. It scans the attributes, formats them as text, and stores a `SpanLogContext` inside the span if the span can be found.
 
-**Call relations**: This tracing-layer callback seeds the per-span context later read by `on_record`, `event_thread_id`, and `format_feedback_log_body`.
+**Call relations**: Tracing calls this automatically when code enters a new span. Later, `on_event` uses the stored span context indirectly through helper functions to build richer log rows.
 
 *Call graph*: calls 1 internal fn (format_fields); 3 external calls (record, span, default).
 
@@ -1626,11 +1636,11 @@ fn on_record(
     )
 ```
 
-**Purpose**: Updates stored span logging context when additional fields are recorded on an existing span. It preserves accumulated formatted fields and can fill in a thread ID later.
+**Purpose**: Updates saved span context when fields are added to an existing span. This keeps later log events from using stale span information.
 
-**Data flow**: It records the incoming `Record` into a fresh `SpanFieldVisitor`, looks up the span, and mutably accesses its extensions. If a `SpanLogContext` already exists, it replaces `thread_id` when the visitor found one and appends the newly formatted fields with `append_fields`; otherwise it inserts a new `SpanLogContext` built from the span metadata name, `format_fields(values)`, and the visitor’s thread ID.
+**Data flow**: It receives the span id, newly recorded field values, and tracing context. It extracts any new `thread_id`, appends new formatted fields to the saved span text, or creates span context if none was saved yet.
 
-**Call relations**: This callback complements `on_new_span` by handling dynamic span field updates before later events consult the stored context.
+**Call relations**: Tracing calls this when span fields change. It works with `append_fields` and `format_fields` so later event formatting sees the latest span data.
 
 *Call graph*: calls 2 internal fn (append_fields, format_fields); 3 external calls (span, record, default).
 
@@ -1641,11 +1651,11 @@ fn on_record(
 fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>)
 ```
 
-**Purpose**: Transforms a tracing event into a `LogEntry`, enriches it with span-derived context, and enqueues it for asynchronous database insertion. It is the core event-capture path of the layer.
+**Purpose**: Converts a live tracing event into a `LogEntry` for the database. It gathers the message, level, target, source location, thread context, process id, and feedback-style body.
 
-**Data flow**: It reads event metadata, immediately returns for noisy `opentelemetry_sdk` TRACE/DEBUG events, records event fields into a default `MessageVisitor`, derives `thread_id` from the event fields or `event_thread_id`, builds `feedback_log_body` with `format_feedback_log_body`, computes the current wall-clock timestamp from `SystemTime::now().duration_since(UNIX_EPOCH)` with a zero fallback on clock skew, constructs a `LogEntry` containing level, target, optional message, feedback body, thread/process IDs, module path, file, and line, and passes it to `try_send`.
+**Data flow**: It receives a tracing event and context. It skips noisy low-level OpenTelemetry debug and trace events, extracts message and thread fields, looks at surrounding spans for thread and formatting context, adds the current timestamp, builds a `LogEntry`, and tries to queue it.
 
-**Call relations**: This tracing callback is invoked by the subscriber for every event. It depends on `MessageVisitor`, `event_thread_id`, and `format_feedback_log_body`, and hands off persistence to the queue via `try_send`.
+**Call relations**: Tracing calls this for each log event seen by the layer. After preparing the row, it hands the entry to `try_send`, which passes it toward the background inserter if there is queue space.
 
 *Call graph*: calls 2 internal fn (try_send, format_feedback_log_body); 5 external calls (now, matches!, metadata, record, default).
 
@@ -1656,11 +1666,11 @@ fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_
 fn flush(&self) -> impl Future<Output = ()> + Send + '_
 ```
 
-**Purpose**: Requests that the background inserter persist all entries accepted before the flush command and waits for acknowledgement. It provides a synchronization point for tests and orderly shutdown paths.
+**Purpose**: Waits until log entries already accepted before the flush request have been processed by the background writer. Callers use it in tests or before reading logs to make buffered data visible.
 
-**Data flow**: It creates a oneshot channel, asynchronously sends `LogDbCommand::Flush(tx)` on the MPSC sender, and if that send succeeds awaits the reply receiver, ignoring the reply payload itself.
+**Data flow**: It creates a one-time reply channel, sends a `Flush` command to the background queue, and waits for the reply. If the command cannot be sent because the queue is gone, it simply returns.
 
-**Call relations**: This method is exposed both directly and through the `LogWriter` trait implementation. Tests use it to ensure queued logs are visible to queries.
+**Call relations**: Code that needs durable, queryable logs calls this on a cloned layer. The background inserter receives the flush command, writes the current buffer, and replies.
 
 *Call graph*: 3 external calls (send, channel, Flush).
 
@@ -1671,11 +1681,11 @@ fn flush(&self) -> impl Future<Output = ()> + Send + '_
 fn record_field(&mut self, field: &Field, value: String)
 ```
 
-**Purpose**: Captures a span field value when the field name is `thread_id` and no thread ID has been recorded yet. It is the shared sink for all typed `Visit` callbacks on spans.
+**Purpose**: Looks at one span field and remembers it if it is the first `thread_id` field seen. This gives events inside the span a thread identity even if the event itself does not include one.
 
-**Data flow**: It takes a `Field` and a stringified value, checks `field.name()`, and if the name is `thread_id` and `self.thread_id` is currently `None`, stores `Some(value)`.
+**Data flow**: It receives a field description and the field value as text. If the field is named `thread_id` and no thread id has already been stored, it saves that value.
 
-**Call relations**: All `Visit` methods on `SpanFieldVisitor` delegate here after converting their typed values to strings.
+**Call relations**: All typed `SpanFieldVisitor` recording methods convert their values to text and call this shared helper, so thread-id extraction behaves the same for numbers, strings, booleans, errors, and debug values.
 
 *Call graph*: called by 7 (record_bool, record_debug, record_error, record_f64, record_i64, record_str, record_u64); 1 external calls (name).
 
@@ -1686,11 +1696,11 @@ fn record_field(&mut self, field: &Field, value: String)
 fn record_i64(&mut self, field: &Field, value: i64)
 ```
 
-**Purpose**: Records an `i64` span field by stringifying it and forwarding to `record_field`. It allows numeric thread IDs to be captured uniformly.
+**Purpose**: Accepts a signed integer span field and lets the visitor check whether it is a `thread_id`. This supports thread ids written as integer fields.
 
-**Data flow**: It takes a field and `i64`, converts the value with `to_string()`, and passes both to `record_field`.
+**Data flow**: It receives the field and an `i64` value, converts the number to text, and passes it to `record_field`. It changes the visitor only if the field name is `thread_id` and no thread id was already saved.
 
-**Call relations**: This is one of the typed `Visit` hooks used when tracing records integer span fields.
+**Call relations**: Tracing calls this through the `Visit` interface while span fields are being scanned. It funnels the work into the common `record_field` path.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1701,11 +1711,11 @@ fn record_i64(&mut self, field: &Field, value: i64)
 fn record_u64(&mut self, field: &Field, value: u64)
 ```
 
-**Purpose**: Records a `u64` span field through the common thread-ID extraction path. It supports unsigned numeric field values.
+**Purpose**: Accepts an unsigned integer span field and checks whether it represents a `thread_id`.
 
-**Data flow**: It stringifies the `u64` value and forwards it with the field to `record_field`.
+**Data flow**: It receives the field and a `u64` value, turns the value into text, and gives it to `record_field`. The visitor may then store it as the span thread id.
 
-**Call relations**: Like the other typed visitor methods, it feeds `record_field` during span attribute and record processing.
+**Call relations**: This is one of the typed entry points used by tracing field recording, all sharing the same thread-id detection logic.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1716,11 +1726,11 @@ fn record_u64(&mut self, field: &Field, value: u64)
 fn record_bool(&mut self, field: &Field, value: bool)
 ```
 
-**Purpose**: Records a boolean span field through the common extraction path. It exists to satisfy the `Visit` trait for all primitive field types.
+**Purpose**: Accepts a boolean span field and checks whether it is named `thread_id`. This keeps extraction generic across field types.
 
-**Data flow**: It converts the boolean to a string and forwards it to `record_field` with the field metadata.
+**Data flow**: It receives the field and a true-or-false value, converts the value to text, and passes it to `record_field`. The stored thread id changes only if appropriate.
 
-**Call relations**: Used indirectly when tracing spans contain boolean fields.
+**Call relations**: Tracing can call this while recording span attributes. It delegates the real decision to `record_field`.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1731,11 +1741,11 @@ fn record_bool(&mut self, field: &Field, value: bool)
 fn record_f64(&mut self, field: &Field, value: f64)
 ```
 
-**Purpose**: Records an `f64` span field through the common extraction path. It supports floating-point field values in spans.
+**Purpose**: Accepts a floating-point span field and checks whether it is the span’s `thread_id`.
 
-**Data flow**: It stringifies the float and passes it to `record_field`.
+**Data flow**: It receives the field and a decimal number, converts the number to text, and passes it to `record_field`. The visitor may save the value as a thread id.
 
-**Call relations**: Another typed `Visit` adapter used by `on_new_span` and `on_record`.
+**Call relations**: It is part of the visitor interface used during span recording and shares behavior with the other typed record methods.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1746,11 +1756,11 @@ fn record_f64(&mut self, field: &Field, value: f64)
 fn record_str(&mut self, field: &Field, value: &str)
 ```
 
-**Purpose**: Records a string span field through the common extraction path. This is the most common path for textual `thread_id` fields.
+**Purpose**: Accepts a string span field and checks whether it is the `thread_id`. This is likely the common case for thread ids.
 
-**Data flow**: It clones the `&str` into an owned `String` and forwards it to `record_field`.
+**Data flow**: It receives the field and string value, copies the value into owned text, and passes it to `record_field`. If it is the first `thread_id`, the visitor stores it.
 
-**Call relations**: Used whenever tracing records string-valued span fields.
+**Call relations**: Tracing calls this for string span fields. It feeds the common field-inspection helper used by `on_new_span` and `on_record`.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1761,11 +1771,11 @@ fn record_str(&mut self, field: &Field, value: &str)
 fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static))
 ```
 
-**Purpose**: Records an error-valued span field by converting it to a string and forwarding it. It keeps thread-ID extraction generic across field types.
+**Purpose**: Accepts an error-valued span field and checks whether it is named `thread_id`. Although unusual, this keeps the visitor complete for all tracing field types.
 
-**Data flow**: It takes a trait-object error reference, calls `to_string()`, and passes the result to `record_field`.
+**Data flow**: It receives the field and error value, converts the error to text, and passes it to `record_field`. The visitor may save that text as the thread id.
 
-**Call relations**: Part of the `Visit` implementation used by span recording callbacks.
+**Call relations**: Tracing calls this through the visitor interface when a span field is an error. The actual filtering remains centralized in `record_field`.
 
 *Call graph*: calls 1 internal fn (record_field); 1 external calls (to_string).
 
@@ -1776,11 +1786,11 @@ fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'stat
 fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug)
 ```
 
-**Purpose**: Records a debug-formatted span field through the common extraction path. It is the fallback for arbitrary debug-printable values.
+**Purpose**: Accepts any span field recorded only in debug form and checks whether it is the `thread_id`. Debug form means the value is turned into developer-readable text.
 
-**Data flow**: It formats the debug value with `format!("{value:?}")` and forwards the resulting string to `record_field`.
+**Data flow**: It receives the field and debug-printable value, formats the value as text, and sends it to `record_field`. The visitor stores it only if the field name matches and no thread id exists yet.
 
-**Call relations**: This fallback visitor method ensures `thread_id` can still be captured from debug-only fields.
+**Call relations**: This catches span fields whose exact type does not have a more specific visitor method, while still reusing the same thread-id extraction rule.
 
 *Call graph*: calls 1 internal fn (record_field); 1 external calls (format!).
 
@@ -1794,11 +1804,11 @@ fn event_thread_id(
 ) -> Option<String>
 ```
 
-**Purpose**: Finds the most specific thread ID available from the current event’s span scope. It walks from root to leaf and keeps the latest span context that has a thread ID.
+**Purpose**: Finds the best thread id for an event by looking through the spans around it. This lets an event inherit a thread id from its surrounding work context.
 
-**Data flow**: It takes an event and subscriber context, initializes `thread_id` to `None`, obtains `ctx.event_scope(event)`, iterates spans from root, reads each span’s extensions, and whenever a `SpanLogContext` with `Some(thread_id)` is found, clones it into the local variable. It returns the final `Option<String>`.
+**Data flow**: It receives an event and tracing context. It walks the event’s span stack from the outermost span inward, remembers any stored span thread id it finds, and returns the last matching thread id or nothing.
 
-**Call relations**: Called by `on_event` when the event itself did not carry a `thread_id` field, allowing span-scoped thread IDs to propagate into log rows.
+**Call relations**: `on_event` uses this when the event itself did not include a `thread_id`. The span data it reads was stored earlier by `on_new_span` or updated by `on_record`.
 
 *Call graph*: 1 external calls (event_scope).
 
@@ -1812,11 +1822,11 @@ fn format_feedback_log_body(
 ) -> String
 ```
 
-**Purpose**: Builds the human-readable feedback-log string that mirrors tracing formatter output by combining span context and event fields. It is what gets stored in `feedback_log_body` for later retrieval.
+**Purpose**: Builds the human-readable log body stored for feedback logs. It combines span names and fields with the event fields so database logs resemble the normal text output.
 
-**Data flow**: It starts with an empty `String`, walks the event scope from root if present, and for each span appends either the stored span name plus `{formatted_fields}` from `SpanLogContext` or the raw metadata name, followed by `:`. If any span context was added, it appends a separating space, then appends `format_fields(event)` for the event’s own fields. The final string is returned.
+**Data flow**: It receives an event and tracing context. It walks surrounding spans, adds each span name and formatted fields, then appends the event’s formatted fields, and returns the final string.
 
-**Call relations**: This helper is called by `on_event` when constructing each `LogEntry`, and tests compare its persisted output against the standard tracing formatter shape.
+**Call relations**: `on_event` calls this while creating each `LogEntry`. It uses `format_fields` for consistent field text and relies on span context saved earlier.
 
 *Call graph*: calls 1 internal fn (format_fields); called by 1 (on_event); 2 external calls (event_scope, new).
 
@@ -1827,11 +1837,11 @@ fn format_feedback_log_body(
 fn format_fields(fields: R) -> String
 ```
 
-**Purpose**: Formats tracing fields using `tracing_subscriber`’s default field formatter and returns the resulting field string. It keeps stored span/event formatting aligned with normal subscriber output.
+**Purpose**: Turns structured tracing fields into the standard text form used by the tracing formatter. This avoids inventing a separate database-only log format.
 
-**Data flow**: It takes any `RecordFields`, creates a `DefaultFields` formatter and an empty `FormattedFields<DefaultFields>`, asks the formatter to write into the formatted buffer, and returns the resulting `formatted.fields` string.
+**Data flow**: It receives any value that can record tracing fields. It asks the default tracing field formatter to write those fields into a string and returns that string.
 
-**Call relations**: Used by `on_new_span`, `on_record`, and `format_feedback_log_body` whenever fields need to be rendered into the same textual shape as tracing’s formatter.
+**Call relations**: Span creation, span updates, and feedback body formatting all call this so stored database logs line up with regular formatted logs.
 
 *Call graph*: called by 3 (on_new_span, on_record, format_feedback_log_body); 3 external calls (default, new, new).
 
@@ -1842,11 +1852,11 @@ fn format_fields(fields: R) -> String
 fn append_fields(fields: &mut String, values: &Record<'_>)
 ```
 
-**Purpose**: Appends newly recorded span fields onto an existing formatted field string using tracing’s default field formatter semantics. It preserves prior formatting while incorporating updates.
+**Purpose**: Adds newly recorded span fields to the existing formatted field string for that span. It preserves the formatter’s normal way of joining old and new fields.
 
-**Data flow**: It takes a mutable `String` and a `Record`, moves the existing string out with `std::mem::take`, wraps it in `FormattedFields<DefaultFields>`, calls `DefaultFields::add_fields` to append the new record’s fields, and writes the updated formatted string back into `*fields`.
+**Data flow**: It receives a mutable field string and new recorded values. It temporarily takes the old string, asks the default formatter to add the new values, and puts the updated string back.
 
-**Call relations**: Called by `on_record` when a span already has `SpanLogContext` and receives additional recorded fields.
+**Call relations**: `on_record` calls this when span fields are updated after the span was created, keeping the saved span context current for future events.
 
 *Call graph*: called by 1 (on_record); 3 external calls (default, new, take).
 
@@ -1857,11 +1867,11 @@ fn append_fields(fields: &mut String, values: &Record<'_>)
 fn current_process_log_uuid() -> &'static str
 ```
 
-**Purpose**: Returns a stable per-process identifier used to tag all log rows emitted by the current process. The value is computed once and cached globally.
+**Purpose**: Creates and returns a stable identifier for this running process’s logs. The id includes the process id and a random UUID so log rows from different runs can be distinguished.
 
-**Data flow**: It accesses a `static OnceLock<String>`, initializing it on first use by reading the current process ID, generating a random `Uuid::new_v4()`, formatting `pid:<pid>:<uuid>`, and returning a shared `&'static str` reference to the stored string.
+**Data flow**: On first use, it reads the operating-system process id, creates a random UUID, combines them into a string, and stores it. Later calls return the same stored string.
 
-**Call relations**: It is called by `LogDbLayer::start_with_config` so every layer instance in the same process shares the same process UUID.
+**Call relations**: `LogDbLayer::start_with_config` uses this once when building a layer, and every `LogEntry` produced by that layer carries the same process identifier.
 
 *Call graph*: called by 1 (start_with_config); 1 external calls (new).
 
@@ -1876,11 +1886,11 @@ async fn run_inserter(
 )
 ```
 
-**Purpose**: Runs the background task that drains queued log commands, batches entries, and flushes them to the database on size, time, explicit flush, or shutdown boundaries. It is the persistence engine behind the layer.
+**Purpose**: Runs the background task that writes queued log entries into SQLite in batches. It is the worker that turns queued log commands into database rows.
 
-**Data flow**: It takes `Arc<StateRuntime>`, an MPSC receiver of `LogDbCommand`, and normalized config. It allocates a buffer with `batch_size` capacity, creates a periodic ticker for `flush_interval`, consumes the immediate first tick, and enters a `tokio::select!` loop. On `Entry`, it pushes the boxed entry into the buffer and flushes when the batch size is reached. On `Flush(reply)`, it flushes immediately and acknowledges via the oneshot sender. On channel closure, it flushes remaining entries and exits. On ticker ticks, it flushes whatever is buffered.
+**Data flow**: It receives the shared state runtime, the receiving side of the command queue, and the queue configuration. It collects entries in memory, writes them when the batch fills, when the timer ticks, when a flush command arrives, or when the sender closes, and replies to flush requests after writing.
 
-**Call relations**: Spawned by `LogDbLayer::start_with_config`, it delegates actual database insertion to the `flush` helper.
+**Call relations**: `LogDbLayer::start_with_config` starts this task. `try_send` supplies entry commands, `LogDbLayer::flush` supplies flush commands, and this function hands actual database writes to the file-level `flush` helper.
 
 *Call graph*: called by 1 (start_with_config); 3 external calls (with_capacity, select!, interval).
 
@@ -1891,11 +1901,11 @@ async fn run_inserter(
 async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>)
 ```
 
-**Purpose**: Persists the current buffered batch of log entries to the state runtime if any are pending. It is intentionally best-effort and ignores insertion errors.
+**Purpose**: Writes the current in-memory batch of log entries to the state runtime’s log database. It is the final step before logs become queryable from SQLite.
 
-**Data flow**: It takes a `&StateRuntime` and mutable `Vec<LogEntry>`. If the buffer is empty it returns immediately; otherwise it moves all entries out with `split_off(0)`, awaits `state_db.insert_logs(entries.as_slice())`, and discards the result.
+**Data flow**: It receives the state runtime and a mutable buffer of `LogEntry` values. If the buffer is empty it does nothing; otherwise it removes all current entries from the buffer and asks the runtime to insert them.
 
-**Call relations**: This helper is called by `run_inserter` on all flush triggers: batch full, timer tick, explicit flush command, and receiver shutdown.
+**Call relations**: The background inserter calls this whenever it needs to persist buffered logs: full batches, timer ticks, explicit flush commands, and shutdown all go through this helper.
 
 *Call graph*: 1 external calls (insert_logs).
 
@@ -1906,11 +1916,11 @@ async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>)
 fn record_field(&mut self, field: &Field, value: String)
 ```
 
-**Purpose**: Captures the first `message` and first `thread_id` fields seen on an event. It is the shared sink for all typed event-field visitor callbacks.
+**Purpose**: Extracts the two event fields this layer especially cares about: `message` and `thread_id`. It keeps the first value seen for each.
 
-**Data flow**: It takes a field and stringified value, stores `Some(value.clone())` into `self.message` if the field name is `message` and no message has been captured yet, and stores `Some(value)` into `self.thread_id` if the field name is `thread_id` and no thread ID has been captured yet.
+**Data flow**: It receives a field and its value as text. If the field is `message`, it saves a copy as the event message; if the field is `thread_id`, it saves it as the event’s direct thread id.
 
-**Call relations**: All typed `Visit` methods on `MessageVisitor` delegate here, and `on_event` relies on the captured fields to populate `LogEntry`.
+**Call relations**: All typed `MessageVisitor` record methods call this helper after converting their value to text, so event extraction is consistent regardless of field type.
 
 *Call graph*: called by 7 (record_bool, record_debug, record_error, record_f64, record_i64, record_str, record_u64); 1 external calls (name).
 
@@ -1921,11 +1931,11 @@ fn record_field(&mut self, field: &Field, value: String)
 fn record_i64(&mut self, field: &Field, value: i64)
 ```
 
-**Purpose**: Records an `i64` event field through the common message/thread-ID extraction path. It supports numeric event fields.
+**Purpose**: Accepts a signed integer event field and checks whether it is the message or thread id. This supports structured logs where those fields are numeric.
 
-**Data flow**: It stringifies the integer and forwards it with the field metadata to `record_field`.
+**Data flow**: It receives the field and integer value, converts the value to text, and passes it to `record_field`. The visitor may then store it as the event message or thread id.
 
-**Call relations**: Used indirectly by `on_event` when tracing records integer-valued event fields.
+**Call relations**: Tracing calls this while recording an event into `MessageVisitor`; the shared helper performs the actual selection.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1936,11 +1946,11 @@ fn record_i64(&mut self, field: &Field, value: i64)
 fn record_u64(&mut self, field: &Field, value: u64)
 ```
 
-**Purpose**: Records a `u64` event field through the common extraction path. It supports unsigned numeric event fields.
+**Purpose**: Accepts an unsigned integer event field and checks whether it should become the stored message or thread id.
 
-**Data flow**: It converts the value to a string and passes it to `record_field`.
+**Data flow**: It receives the field and number, converts the number to text, and passes it to `record_field`. The visitor updates only the relevant saved value.
 
-**Call relations**: Part of the `Visit` implementation used by `on_event`.
+**Call relations**: This is one typed entry point in the tracing visitor interface used by `on_event`.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1951,11 +1961,11 @@ fn record_u64(&mut self, field: &Field, value: u64)
 fn record_bool(&mut self, field: &Field, value: bool)
 ```
 
-**Purpose**: Records a boolean event field through the common extraction path. It exists to satisfy the full `Visit` trait surface.
+**Purpose**: Accepts a boolean event field and checks whether it is named `message` or `thread_id`.
 
-**Data flow**: It stringifies the boolean and forwards it to `record_field`.
+**Data flow**: It receives the field and boolean value, turns the value into text, and passes it to `record_field`. The visitor may save that text in its message or thread id slot.
 
-**Call relations**: Used indirectly during event recording in `on_event`.
+**Call relations**: Tracing can call this during event recording, and it delegates to the common extraction rule.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1966,11 +1976,11 @@ fn record_bool(&mut self, field: &Field, value: bool)
 fn record_f64(&mut self, field: &Field, value: f64)
 ```
 
-**Purpose**: Records a floating-point event field through the common extraction path. It supports arbitrary numeric event fields.
+**Purpose**: Accepts a floating-point event field and checks whether it is the message or thread id.
 
-**Data flow**: It converts the float to a string and forwards it to `record_field`.
+**Data flow**: It receives the field and decimal value, converts it to text, and passes it to `record_field`. The visitor stores the value only if the field name matches.
 
-**Call relations**: Another typed visitor adapter used by `on_event`.
+**Call relations**: It is part of the visitor implementation used by `on_event` to inspect structured log fields.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1981,11 +1991,11 @@ fn record_f64(&mut self, field: &Field, value: f64)
 fn record_str(&mut self, field: &Field, value: &str)
 ```
 
-**Purpose**: Records a string event field through the common extraction path. This is the usual path for textual messages and thread IDs.
+**Purpose**: Accepts a string event field and checks whether it is the log message or thread id. This is the common path for normal log messages.
 
-**Data flow**: It clones the `&str` into an owned `String` and passes it to `record_field`.
+**Data flow**: It receives the field and string value, copies the value into owned text, and sends it to `record_field`. The visitor may save it as `message` or `thread_id`.
 
-**Call relations**: Used by `on_event` when tracing records string-valued event fields.
+**Call relations**: `on_event` records events into this visitor, and tracing calls this for string fields produced by ordinary log macros.
 
 *Call graph*: calls 1 internal fn (record_field).
 
@@ -1996,11 +2006,11 @@ fn record_str(&mut self, field: &Field, value: &str)
 fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static))
 ```
 
-**Purpose**: Records an error-valued event field by converting it to a string and forwarding it. It keeps extraction generic across field types.
+**Purpose**: Accepts an error event field and checks whether it should be stored as the message or thread id. This keeps event scanning complete for error values.
 
-**Data flow**: It calls `to_string()` on the error trait object and passes the result to `record_field`.
+**Data flow**: It receives the field and error value, converts the error to text, and passes it to `record_field`. The visitor saves it only for the names it recognizes.
 
-**Call relations**: Part of the `Visit` implementation used during event recording.
+**Call relations**: Tracing calls this when an event contains an error field; the same central extraction helper decides what to keep.
 
 *Call graph*: calls 1 internal fn (record_field); 1 external calls (to_string).
 
@@ -2011,11 +2021,11 @@ fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'stat
 fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug)
 ```
 
-**Purpose**: Records a debug-formatted event field through the common extraction path. It is the fallback for arbitrary debug-printable values.
+**Purpose**: Accepts a debug-form event field and checks whether it is the message or thread id. Debug form is used when a value is recorded as developer-readable text.
 
-**Data flow**: It formats the debug value with `format!("{value:?}")` and forwards the string to `record_field`.
+**Data flow**: It receives the field and debug-printable value, formats the value into text, and passes it to `record_field`. The visitor may save that text as the event message or thread id.
 
-**Call relations**: This fallback visitor method is used by `on_event` for fields without a more specific typed callback.
+**Call relations**: This catches event fields without a more specific visitor method while keeping `on_event`’s extraction behavior consistent.
 
 *Call graph*: calls 1 internal fn (record_field); 1 external calls (format!).
 
@@ -2026,11 +2036,11 @@ fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug)
 fn temp_codex_home() -> std::path::PathBuf
 ```
 
-**Purpose**: Creates a unique temporary CODEX_HOME path for log database tests. It avoids collisions between test runs by embedding a random UUID.
+**Purpose**: Creates a unique temporary directory path for a test run. This keeps test databases separate so one test’s logs do not affect another test.
 
-**Data flow**: It reads `std::env::temp_dir()`, appends a formatted `codex-state-log-db-<uuid>` directory name, and returns the resulting `PathBuf`.
+**Data flow**: It reads the system temporary directory, appends a random UUID-based folder name, and returns the path. It does not create the directory itself.
 
-**Call relations**: Most integration-style tests in this module call it before initializing `StateRuntime`.
+**Call relations**: The database-related tests call this before initializing `StateRuntime`, then remove the directory at the end of the test.
 
 *Call graph*: 2 external calls (format!, temp_dir).
 
@@ -2041,11 +2051,11 @@ fn temp_codex_home() -> std::path::PathBuf
 async fn wait_for_log_count(runtime: &StateRuntime, expected: usize) -> Vec<crate::LogRow>
 ```
 
-**Purpose**: Polls the runtime until the expected number of log rows are visible or a timeout expires. It smooths over asynchronous batch insertion in tests.
+**Purpose**: Polls the test database until it contains the expected number of log rows. This accounts for the fact that log insertion happens in a background task.
 
-**Data flow**: It takes a runtime and expected count, computes a deadline two seconds in the future, repeatedly queries logs with `LogQuery::default()`, returns the rows once `rows.len() == expected`, otherwise asserts the deadline has not passed and sleeps 10 ms before retrying.
+**Data flow**: It receives a state runtime and an expected count. It repeatedly queries logs until the count matches or a two-second deadline is reached, sleeping briefly between tries, and returns the rows when successful.
 
-**Call relations**: Batch- and interval-flush tests use it to wait for the background inserter to persist rows without relying on fixed sleeps alone.
+**Call relations**: Batch and interval tests use this helper after emitting logs, because those logs may not be visible immediately.
 
 *Call graph*: 7 external calls (assert!, default, query_logs, from_millis, from_secs, now, sleep).
 
@@ -2056,11 +2066,11 @@ async fn wait_for_log_count(runtime: &StateRuntime, expected: usize) -> Vec<crat
 fn test_entry(message: &str) -> LogEntry
 ```
 
-**Purpose**: Builds a representative `LogEntry` fixture with caller-supplied message text. It centralizes consistent field values for queue-behavior tests.
+**Purpose**: Builds a simple `LogEntry` with predictable values for queue behavior tests. It avoids repeating boilerplate row data in those tests.
 
-**Data flow**: It takes a message string slice and returns a `LogEntry` populated with fixed timestamp, level, target, thread/process IDs, module/file/line, and both `message` and `feedback_log_body` set from the input.
+**Data flow**: It receives a message string. It returns a `LogEntry` whose message and feedback body use that string and whose other fields are fixed test values.
 
-**Call relations**: Queue-focused tests call it before passing entries to `LogDbLayer::try_send`.
+**Call relations**: Queue-focused tests call this to create entries for `LogDbLayer::try_send` without needing a full tracing subscriber or database runtime.
 
 
 ##### `tests::SharedWriter::snapshot`  (lines 528–531)
@@ -2069,11 +2079,11 @@ fn test_entry(message: &str) -> LogEntry
 fn snapshot(&self) -> String
 ```
 
-**Purpose**: Returns the accumulated bytes written by the shared test writer as a UTF-8 string. It lets tests compare tracing formatter output against persisted feedback logs.
+**Purpose**: Reads all bytes written to the shared test writer as a UTF-8 string. Tests use it to compare normal formatted logs with logs saved in SQLite.
 
-**Data flow**: It locks the internal `Mutex<Vec<u8>>`, clones the bytes, converts them with `String::from_utf8`, and returns the resulting string.
+**Data flow**: It locks the shared byte buffer, clones the bytes, converts them to text, and returns the resulting string.
 
-**Call relations**: Used by the formatter-shape test after tracing output has been captured through the custom writer.
+**Call relations**: The feedback-format test writes normal tracing output into `SharedWriter`, then calls this method to compare that output with database feedback logs.
 
 *Call graph*: 1 external calls (from_utf8).
 
@@ -2084,11 +2094,11 @@ fn snapshot(&self) -> String
 fn make_writer(&'a self) -> Self::Writer
 ```
 
-**Purpose**: Creates a writer guard that appends into the shared byte buffer. It implements `MakeWriter` so the tracing formatter can write into test-owned memory.
+**Purpose**: Creates a write guard for the shared in-memory test writer. This lets tracing’s formatter write output into a buffer instead of the terminal.
 
-**Data flow**: It clones the internal `Arc<Mutex<Vec<u8>>>` and returns `SharedWriterGuard { bytes }`.
+**Data flow**: It receives the shared writer by reference, clones the shared byte-buffer handle, and returns a `SharedWriterGuard` that writes into the same buffer.
 
-**Call relations**: This method is invoked by tracing’s formatting layer when the test subscriber emits formatted logs.
+**Call relations**: Tracing’s formatting layer calls this when it needs somewhere to write a log line during the feedback-format test.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2099,11 +2109,11 @@ fn make_writer(&'a self) -> Self::Writer
 fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 ```
 
-**Purpose**: Appends written bytes into the shared in-memory buffer and reports all bytes as consumed. It is the concrete sink behind the test formatter writer.
+**Purpose**: Appends formatted log bytes to the shared in-memory buffer used by tests.
 
-**Data flow**: It locks the shared byte vector, extends it with the provided `buf`, and returns `Ok(buf.len())`.
+**Data flow**: It receives a byte slice, locks the shared buffer, appends the bytes, and reports that all bytes were written.
 
-**Call relations**: Tracing’s formatting layer calls this through the `io::Write` trait while tests capture formatter output.
+**Call relations**: The tracing formatter uses this through Rust’s standard writing interface when the feedback-format test captures normal log output.
 
 
 ##### `tests::SharedWriterGuard::flush`  (lines 557–559)
@@ -2112,11 +2122,11 @@ fn write(&mut self, buf: &[u8]) -> io::Result<usize>
 fn flush(&mut self) -> io::Result<()>
 ```
 
-**Purpose**: Implements a no-op flush for the in-memory test writer. There is no buffered state beyond the shared byte vector itself.
+**Purpose**: Satisfies the writer interface for the in-memory test writer. Since the writer stores bytes immediately, flushing has no extra work to do.
 
-**Data flow**: It ignores its receiver state and returns `Ok(())`.
+**Data flow**: It receives the writer guard and returns success without changing anything.
 
-**Call relations**: This satisfies the `io::Write` contract for the custom test writer.
+**Call relations**: The tracing formatter may call this as part of normal writing. The no-op behavior is correct because there is no external file or stream to flush.
 
 
 ##### `tests::sqlite_feedback_logs_match_feedback_formatter_shape`  (lines 563–618)
@@ -2125,11 +2135,11 @@ fn flush(&mut self) -> io::Result<()>
 async fn sqlite_feedback_logs_match_feedback_formatter_shape()
 ```
 
-**Purpose**: Verifies that feedback logs stored in SQLite have the same structural formatting as logs emitted by the standard tracing formatter. It checks the correctness of `format_feedback_log_body` and related span formatting helpers.
+**Purpose**: Checks that feedback logs stored in SQLite have the same shape as the normal formatted tracing output. This protects users from seeing two different log formats for the same events.
 
-**Data flow**: The test creates a temporary runtime, a `SharedWriter`, and a `LogDbLayer`, installs both a normal formatting layer and the DB layer into a subscriber, emits threadless and thread-scoped logs, explicitly flushes the DB layer, captures formatter output from the writer, queries feedback logs for `thread-1` from SQLite, strips timestamps from both outputs, and asserts equality. It then removes the temporary CODEX_HOME directory.
+**Data flow**: It creates a temporary runtime, installs both a normal formatting layer and the database layer, emits logs inside and outside a thread-tagged span, flushes the database layer, then compares the stored feedback logs with the captured formatted output after ignoring timestamps.
 
-**Call relations**: It exercises the full path from tracing spans/events through `on_new_span`, `on_event`, queue flushing, SQLite persistence, and feedback-log retrieval.
+**Call relations**: This test exercises `start`, span tracking, event formatting, flushing, and feedback-log querying together as one end-to-end flow.
 
 *Call graph*: calls 2 internal fn (start, init); 11 external calls (from_utf8, new, assert_eq!, default, temp_codex_home, remove_dir_all, debug!, info_span!, trace!, layer (+1 more)).
 
@@ -2140,11 +2150,11 @@ async fn sqlite_feedback_logs_match_feedback_formatter_shape()
 async fn flush_persists_logs_for_query()
 ```
 
-**Purpose**: Checks that calling `flush` makes buffered logs visible to subsequent database queries. It validates the explicit flush command path.
+**Purpose**: Verifies that an explicit flush makes a buffered log visible to database queries. This confirms the flush command is useful for callers that need immediate consistency.
 
-**Data flow**: The test initializes a runtime and layer, installs the layer in a subscriber, emits one `tracing::info!` event, awaits `layer.flush()`, drops the subscriber guard, queries logs from the runtime, and asserts that exactly one row exists with message `buffered-log`. It then removes the temporary directory.
+**Data flow**: It creates a runtime and layer, installs the layer, emits one log, calls `flush`, queries logs, and checks that exactly one row with the expected message exists.
 
-**Call relations**: It directly validates `LogDbLayer::flush` and the `run_inserter` handling of `LogDbCommand::Flush`.
+**Call relations**: This test covers the path from tracing event to queue to flush command to SQLite row, using the public `start` helper.
 
 *Call graph*: calls 2 internal fn (start, init); 7 external calls (new, assert_eq!, temp_codex_home, default, remove_dir_all, info!, registry).
 
@@ -2155,11 +2165,11 @@ async fn flush_persists_logs_for_query()
 async fn configured_batch_size_flushes_without_explicit_flush()
 ```
 
-**Purpose**: Verifies that reaching the configured batch size triggers persistence even without an explicit flush call. It tests the size-based flush branch in the inserter loop.
+**Purpose**: Verifies that reaching the configured batch size writes logs even without an explicit flush. This proves the background writer does not rely only on manual flushing.
 
-**Data flow**: The test starts a layer with `batch_size: 2` and a long flush interval, emits one log and confirms no rows are yet persisted, emits a second log, waits for two rows with `wait_for_log_count`, and asserts the stored messages are the two emitted messages in order. It then cleans up the temporary directory.
+**Data flow**: It starts a layer with batch size two and a long timer interval, emits one log and confirms it is not written yet, emits a second log, waits for two rows, and checks their messages.
 
-**Call relations**: It exercises `LogDbLayer::start_with_config`, `run_inserter`’s batch threshold logic, and asynchronous persistence visibility.
+**Call relations**: This test uses `LogDbLayer::start_with_config` and `wait_for_log_count` to exercise the batch-full branch of the background inserter.
 
 *Call graph*: calls 2 internal fn (start_with_config, init); 10 external calls (new, assert_eq!, temp_codex_home, wait_for_log_count, from_millis, from_secs, remove_dir_all, sleep, info!, registry).
 
@@ -2170,11 +2180,11 @@ async fn configured_batch_size_flushes_without_explicit_flush()
 async fn configured_flush_interval_persists_buffered_logs()
 ```
 
-**Purpose**: Checks that the periodic flush timer persists buffered logs even when the batch size is not reached. It validates the time-based flush branch.
+**Purpose**: Verifies that the timer-based flush writes logs even when the batch is not full. This prevents low-volume logs from sitting in memory forever.
 
-**Data flow**: The test starts a layer with a large batch size and a 10 ms flush interval, waits one tick so the startup tick is consumed, emits one log, waits for one persisted row with `wait_for_log_count`, asserts the message matches, and removes the temporary directory.
+**Data flow**: It starts a layer with a short flush interval and large batch size, emits one log, waits until one row appears in the database, and checks the message.
 
-**Call relations**: It targets `run_inserter`’s ticker-driven flush behavior and the startup-tick consumption logic.
+**Call relations**: This test exercises the timed branch of `run_inserter`, again using `start_with_config` to make the behavior happen quickly.
 
 *Call graph*: calls 2 internal fn (start_with_config, init); 9 external calls (new, assert_eq!, temp_codex_home, wait_for_log_count, from_millis, remove_dir_all, sleep, info!, registry).
 
@@ -2185,11 +2195,11 @@ async fn configured_flush_interval_persists_buffered_logs()
 async fn event_queue_drops_new_entries_when_full()
 ```
 
-**Purpose**: Ensures that `try_send` drops new log entries when the bounded queue is full instead of blocking. This preserves the non-blocking contract of `on_event`.
+**Purpose**: Checks that ordinary log entries are dropped when the bounded queue is full. This confirms logging will not block application work under pressure.
 
-**Data flow**: The test creates a channel of capacity 1, constructs a `LogDbLayer` around its sender, calls `try_send` twice with different test entries, receives the first queued command and asserts its message, then asserts that no second command is available.
+**Data flow**: It creates a queue with room for one command, builds a layer around it, tries to send two test entries, then confirms only the first entry is waiting in the receiver.
 
-**Call relations**: It directly validates the lossy queue semantics implemented by `LogDbLayer::try_send`.
+**Call relations**: This test directly exercises `LogDbLayer::try_send` and the queue policy without involving tracing or SQLite.
 
 *Call graph*: 5 external calls (assert!, assert_eq!, channel, panic!, test_entry).
 
@@ -2200,24 +2210,26 @@ async fn event_queue_drops_new_entries_when_full()
 async fn flush_waits_for_queue_capacity_and_receiver_processing()
 ```
 
-**Purpose**: Verifies that `flush` waits not only for queue space but also for the receiver to process the flush command and acknowledge it. It checks the synchronization semantics of explicit flushing under backpressure.
+**Purpose**: Checks that a flush waits until earlier queued entries and the flush command itself are processed. This protects callers who depend on `flush` as a synchronization point.
 
-**Data flow**: The test creates a capacity-1 channel and a layer using its sender, enqueues one entry to fill the queue, spawns a task awaiting `layer.flush()`, confirms the task is blocked, manually receives the queued entry from the channel, then receives the flush command, confirms the task is still blocked until the reply sender is used, sends the reply, and finally asserts the flush task completes within one second.
+**Data flow**: It fills a one-item queue with a test entry, starts a task that calls `flush`, confirms the task waits, manually receives the entry and then the flush command, sends the flush reply, and confirms the task completes.
 
-**Call relations**: It exercises `LogDbLayer::flush` together with the command ordering and acknowledgement behavior expected from `run_inserter`.
+**Call relations**: This test focuses on the command-queue contract between `LogDbLayer::flush` and the background receiver, without starting the real inserter.
 
 *Call graph*: 10 external calls (assert!, assert_eq!, channel, panic!, test_entry, from_millis, from_secs, spawn, sleep, timeout).
 
 
 ### `state/src/runtime/logs.rs`
 
-`io_transport` · `cross-cutting logging, startup cleanup, and log/feedback retrieval`
+`io_transport` · `startup, log writing, log querying, feedback collection, tests`
 
-This file adds log persistence methods to `StateRuntime` using `self.logs_pool`, separate from the main state database. `insert_log` is a thin wrapper over `insert_logs`, which batches inserts with `QueryBuilder`. Each row stores timestamps, level/target metadata, optional thread and process identifiers, source location fields, and an `estimated_bytes` value derived from the persisted `feedback_log_body` (or legacy `message` fallback) plus selected metadata lengths. Inserts run inside a transaction and immediately call `prune_logs_after_insert` before commit.
+This file is the logbook for StateRuntime. When the app writes log entries, this code saves them to a separate SQLite database, which is a small file-based database. It also decides what old log lines must be removed so the logbook does not become too large.
 
-Retention is partitioned, not global. Thread-scoped rows (`thread_id IS NOT NULL`) are capped independently per thread id; threadless rows are capped independently per `process_uuid`, with `NULL process_uuid` treated as its own partition. The pruning method first cheaply identifies only partitions over the byte or row limit, then uses window functions (`SUM(...) OVER`, `ROW_NUMBER() OVER`) ordered newest-first to delete every row beyond the retained suffix. Because pruning shares the insert transaction, callers never see “inserted but not yet pruned” rows.
+The main write path is simple: accept one or many LogEntry records, insert them into the logs table, estimate how much visible text each row adds, then prune older rows in the same database transaction. A transaction is like writing on a receipt before handing it over: outsiders either see the whole finished change or none of it. Pruning is done per conversation thread, and also for logs that are not tied to a thread but are tied to a process. This prevents one noisy thread or process from crowding out everything else.
 
-Read APIs include `query_logs`, which builds optional filters for levels, timestamps, module/file substrings, thread/threadless selection, `after_id`, and body substring search; `max_log_id`; and feedback-log extraction. `query_feedback_logs_for_threads` merges requested thread rows with threadless rows from each thread’s latest associated process, bounds SQL results by cumulative estimated bytes, formats lines with RFC3339 timestamps, then enforces an exact whole-line byte cap in memory before returning UTF-8 bytes in chronological order. Startup maintenance deletes rows older than `LOG_RETENTION_DAYS` and runs a passive WAL checkpoint.
+The read side supports ordinary log searches with filters such as time range, level, file, thread, and text search. It also formats feedback logs as plain text bytes, keeping the newest useful slice within the retention budget. Startup maintenance removes logs older than ten days and asks SQLite to checkpoint its write-ahead log, which helps keep disk files tidy without blocking normal work.
+
+The bottom half of the file is tests. They protect important promises: logs use the dedicated database, old schemas migrate correctly, pruning obeys size and row limits, and feedback output includes the right lines in the right order.
 
 #### Function details
 
@@ -2227,11 +2239,11 @@ Read APIs include `query_logs`, which builds optional filters for levels, timest
 async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()>
 ```
 
-**Purpose**: Convenience wrapper that inserts a single `LogEntry` by delegating to the batch insert path. It avoids duplicating insert logic.
+**Purpose**: This is the convenience path for saving a single log entry. Callers use it when they have one LogEntry and do not want to build a one-item list themselves.
 
-**Data flow**: Takes `&LogEntry`, wraps it with `std::slice::from_ref`, and forwards to `insert_logs`, returning that result.
+**Data flow**: It receives one LogEntry by reference, wraps that one entry as a tiny slice, and passes it into the batch insert path. It returns success or the database error reported by that shared insert path.
 
-**Call relations**: Used by callers with one log entry; all real work happens in `StateRuntime::insert_logs`.
+**Call relations**: This function is a small front door into StateRuntime::insert_logs. It does no database work itself; it hands the single entry to the batch writer so all log insertion follows the same rules.
 
 *Call graph*: calls 1 internal fn (insert_logs); 1 external calls (from_ref).
 
@@ -2242,11 +2254,11 @@ async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()>
 async fn insert_logs(&self, entries: &[LogEntry]) -> anyhow::Result<()>
 ```
 
-**Purpose**: Batch-inserts log rows into the dedicated logs database and prunes any affected partitions before commit. Empty batches are a no-op.
+**Purpose**: This saves a batch of log entries into the logs database and immediately enforces the retention limits. Without it, new logs would not be persisted, and noisy logs could grow the database without bounds.
 
-**Data flow**: Consumes a slice of `LogEntry`; if empty, returns immediately. Otherwise it opens a transaction on `self.logs_pool`, builds one multi-row `INSERT INTO logs (...)` statement with `QueryBuilder`, computes `feedback_log_body` fallback and `estimated_bytes` per entry, executes the insert, calls `prune_logs_after_insert(entries, &mut tx)`, commits, and returns `()`.
+**Data flow**: It receives a list of LogEntry values. If the list is empty, it does nothing. Otherwise it opens a database transaction, builds one multi-row INSERT statement, chooses the feedback-visible body for each row, estimates each row’s visible byte size, writes the rows, asks the pruning helper to remove excess old rows, commits the transaction, and returns success or an error.
 
-**Call relations**: This is the main write path for persisted logs. `StateRuntime::insert_log` delegates here, and this method in turn delegates retention enforcement to `StateRuntime::prune_logs_after_insert`.
+**Call relations**: StateRuntime::insert_log calls this for the single-log case. After inserting, it calls StateRuntime::prune_logs_after_insert before committing, so readers never see a state where fresh rows were added but old over-budget rows were not yet removed.
 
 *Call graph*: calls 1 internal fn (prune_logs_after_insert); called by 1 (insert_log); 2 external calls (new, is_empty).
 
@@ -2261,11 +2273,11 @@ async fn prune_logs_after_insert(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Enforces per-thread and per-threadless-process retention budgets immediately after insertion, deleting older rows beyond byte or row caps. It runs inside the caller’s transaction so retention is atomic with insertion.
+**Purpose**: This trims old log rows after new ones are inserted, keeping each thread or threadless process within size and row-count budgets. It is the safeguard that keeps the log database from becoming an unbounded pile of old messages.
 
-**Data flow**: Reads the inserted `entries` to collect affected thread ids, threadless process UUIDs, and whether any threadless null-process rows were inserted. For each affected partition type, it first queries which partitions exceed `LOG_PARTITION_SIZE_LIMIT_BYTES` or `LOG_PARTITION_ROW_LIMIT`, then issues window-function `DELETE` statements that remove rows whose newest-first cumulative bytes or row number exceed the cap. It writes only through the provided mutable `SqliteConnection` transaction.
+**Data flow**: It receives the just-inserted entries and the open SQLite transaction. It looks only at the thread IDs and process IDs touched by those entries, checks whether those partitions are over the byte or row limit, and deletes the oldest rows beyond the budget. It treats thread logs, threadless logs with a process UUID, and threadless logs with no process UUID as separate buckets.
 
-**Call relations**: Called only by `StateRuntime::insert_logs`. Its partition-specific pruning logic is what guarantees readers never observe over-budget partitions after a successful insert.
+**Call relations**: Only StateRuntime::insert_logs calls this, and it runs inside the same transaction as the insert. It uses SQL window calculations to count from newest to oldest, keeping the newest allowed rows and deleting the rest.
 
 *Call graph*: called by 1 (insert_logs); 2 external calls (new, iter).
 
@@ -2276,11 +2288,11 @@ async fn prune_logs_after_insert(
 async fn delete_logs_before(&self, cutoff_ts: i64) -> anyhow::Result<u64>
 ```
 
-**Purpose**: Deletes all log rows older than a Unix-second cutoff and returns how many rows were removed. This is used for coarse age-based retention.
+**Purpose**: This deletes every log row older than a given timestamp. It is used for broad time-based cleanup, separate from the per-thread and per-process size caps.
 
-**Data flow**: Consumes `cutoff_ts`, executes `DELETE FROM logs WHERE ts < ?` against `self.logs_pool`, and returns `rows_affected()` as `u64`.
+**Data flow**: It receives a cutoff timestamp in seconds. It sends a DELETE query to the logs database for rows whose timestamp is earlier than the cutoff, then returns how many rows SQLite says were removed.
 
-**Call relations**: This is a maintenance helper invoked by `StateRuntime::run_logs_startup_maintenance`.
+**Call relations**: StateRuntime::run_logs_startup_maintenance calls this during startup cleanup. It is the focused database action behind the higher-level maintenance routine.
 
 *Call graph*: called by 1 (run_logs_startup_maintenance); 1 external calls (query).
 
@@ -2291,11 +2303,11 @@ async fn delete_logs_before(&self, cutoff_ts: i64) -> anyhow::Result<u64>
 async fn run_logs_startup_maintenance(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Performs startup cleanup on the logs database by deleting rows older than the configured retention window and issuing a passive WAL checkpoint. It intentionally avoids blocking foreground work.
+**Purpose**: This performs housekeeping on the logs database when the runtime starts. It removes logs older than the configured retention period and nudges SQLite to tidy its write-ahead log without delaying foreground work.
 
-**Data flow**: Computes a cutoff timestamp as `Utc::now() - LOG_RETENTION_DAYS`, returns early if that subtraction fails, calls `delete_logs_before(cutoff.timestamp())`, then executes `PRAGMA wal_checkpoint(PASSIVE)` on `self.logs_pool`. Returns `()`.
+**Data flow**: It reads the current UTC time, subtracts ten days, and uses that as the cutoff for StateRuntime::delete_logs_before. After deletion, it runs a passive SQLite checkpoint, which copies safe pending database changes from the write-ahead log into the main database file without waiting on busy readers or writers.
 
-**Call relations**: This is the startup maintenance entry point for the logs subsystem, delegating age-based deletion to `StateRuntime::delete_logs_before`.
+**Call relations**: This routine calls StateRuntime::delete_logs_before for age-based cleanup, then runs the SQLite maintenance command directly. It is meant to be invoked by startup code, not by each log write.
 
 *Call graph*: calls 1 internal fn (delete_logs_before); 3 external calls (now, days, query).
 
@@ -2306,11 +2318,11 @@ async fn run_logs_startup_maintenance(&self) -> anyhow::Result<()>
 async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>>
 ```
 
-**Purpose**: Returns persisted log rows matching optional filters and ordering. It exposes the general-purpose log browsing API.
+**Purpose**: This reads log rows for display or inspection, using optional filters from a LogQuery. It is the general-purpose search path for persisted logs.
 
-**Data flow**: Consumes `&LogQuery`, builds a `SELECT` over log columns with `QueryBuilder`, calls `push_log_filters` to append predicates, adds ascending or descending `ORDER BY id`, optional `LIMIT`, fetches `Vec<LogRow>` from `self.logs_pool`, and returns them.
+**Data flow**: It receives a LogQuery describing filters such as level, time range, module, file, thread, search text, order, and limit. It builds a SELECT statement, adds filter clauses with push_log_filters, applies ordering and an optional limit, runs the query, and returns matching LogRow values.
 
-**Call relations**: This is the main read API for logs. It delegates all predicate construction to `push_log_filters` so `max_log_id` can share the same filtering semantics.
+**Call relations**: This function relies on push_log_filters to keep filtering rules shared with StateRuntime::max_log_id. It is called by code that wants actual log rows, while max_log_id uses the same filters to find a boundary ID.
 
 *Call graph*: calls 1 internal fn (push_log_filters); 1 external calls (new).
 
@@ -2324,11 +2336,11 @@ async fn query_feedback_logs_for_threads(
     ) -> anyhow::Result<Vec<u8>>
 ```
 
-**Purpose**: Builds a merged feedback-log stream for one or more threads, including threadless rows from each thread’s latest associated process, and returns it as UTF-8 bytes capped to the retention budget. The output is chronological whole lines.
+**Purpose**: This gathers feedback-ready log text for one or more conversation threads. It includes the requested thread logs plus relevant threadless process logs, then returns a byte buffer suitable for attaching or sending as feedback context.
 
-**Data flow**: Consumes a slice of thread-id strings; returns empty bytes immediately if the slice is empty. Otherwise it builds a CTE-based SQL query that materializes requested threads, finds each thread’s latest non-null `process_uuid`, selects matching feedback rows from both thread-scoped and relevant threadless logs, computes newest-first cumulative estimated bytes, and fetches only rows within the byte budget. It then formats each row with `format_feedback_log_line`, applies an exact whole-line byte cap in memory, reverses to chronological order, and returns the concatenated bytes.
+**Data flow**: It receives a list of thread ID strings. If the list is empty, it returns empty bytes. Otherwise it asks SQLite for the newest feedback-visible rows within the retention budget, including threadless rows from the latest process associated with each requested thread. It formats each row into a timestamped line, stops before exceeding the byte budget, reverses the newest-first query result back into chronological order, and returns the combined UTF-8 bytes.
 
-**Call relations**: This is the heavy-duty feedback export path. `StateRuntime::query_feedback_logs` is a single-thread wrapper around it, and it relies on `format_feedback_log_line` for output shape.
+**Call relations**: StateRuntime::query_feedback_logs calls this for the one-thread case. This function calls format_feedback_log_line for the final human-readable line shape and uses SQL to do the first round of bounding before applying an exact whole-line byte cap in Rust.
 
 *Call graph*: calls 1 internal fn (format_feedback_log_line); called by 1 (query_feedback_logs); 4 external calls (new, new, with_capacity, try_from).
 
@@ -2339,11 +2351,11 @@ async fn query_feedback_logs_for_threads(
 async fn query_feedback_logs(&self, thread_id: &str) -> anyhow::Result<Vec<u8>>
 ```
 
-**Purpose**: Convenience wrapper that fetches feedback logs for exactly one thread. It preserves the same merged thread/threadless semantics as the multi-thread API.
+**Purpose**: This is the one-thread shortcut for collecting feedback logs. Callers use it when feedback is tied to a single conversation thread.
 
-**Data flow**: Takes `thread_id`, constructs a one-element slice reference, and delegates to `query_feedback_logs_for_threads`, returning its byte vector.
+**Data flow**: It receives one thread ID, places it into a one-item list, and passes that list to StateRuntime::query_feedback_logs_for_threads. It returns the byte buffer or error from that shared multi-thread path.
 
-**Call relations**: Used by callers that only need one thread’s feedback stream; all logic lives in `StateRuntime::query_feedback_logs_for_threads`.
+**Call relations**: This function is a small wrapper around StateRuntime::query_feedback_logs_for_threads, ensuring single-thread and multi-thread feedback export follow the same inclusion and size rules.
 
 *Call graph*: calls 1 internal fn (query_feedback_logs_for_threads).
 
@@ -2354,11 +2366,11 @@ async fn query_feedback_logs(&self, thread_id: &str) -> anyhow::Result<Vec<u8>>
 async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64>
 ```
 
-**Purpose**: Returns the maximum log row id matching the same optional filters used by `query_logs`. Empty result sets yield `0`.
+**Purpose**: This finds the largest database ID among logs matching a query. It is useful for polling or pagination, where a caller needs to know the newest log currently available under the same filters.
 
-**Data flow**: Consumes `&LogQuery`, builds `SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1`, appends predicates via `push_log_filters`, fetches one row, extracts optional `max_id`, and returns `max_id.unwrap_or(0)`.
+**Data flow**: It receives a LogQuery, builds a SELECT MAX(id) query, applies the same filters used by query_logs, runs it, and returns the maximum ID. If no row matches, it returns 0.
 
-**Call relations**: This shares filter-building logic with `StateRuntime::query_logs` through `push_log_filters`, making it suitable for incremental polling based on `after_id`.
+**Call relations**: Like StateRuntime::query_logs, it calls push_log_filters so both functions agree on what a filter means. Instead of returning rows, it returns only the highest matching ID.
 
 *Call graph*: calls 1 internal fn (push_log_filters); 1 external calls (new).
 
@@ -2374,11 +2386,11 @@ fn format_feedback_log_line(
 ) -> String
 ```
 
-**Purpose**: Formats one feedback log row into the exported line shape with timestamp, right-aligned level, body text, and exactly one trailing newline. It falls back to a raw `secs.nanosZ` string if the timestamp is invalid.
+**Purpose**: This turns one stored feedback log row into a single plain-text line. It gives feedback exports a stable, readable format with timestamp, level, and message body.
 
-**Data flow**: Consumes `ts`, `ts_nanos`, `level`, and `feedback_log_body`; converts nanos to `u32` with fallback, tries `DateTime::<Utc>::from_timestamp`, formats either RFC3339 micros or a fallback string, appends level and body, ensures the result ends with `\n`, and returns the `String`.
+**Data flow**: It receives seconds, nanoseconds, a log level, and the feedback body text. It converts the time into an RFC 3339 timestamp when possible, falls back to a raw timestamp string if needed, builds a line with the level right-aligned, and ensures the line ends with exactly at least one newline.
 
-**Call relations**: Called by `StateRuntime::query_feedback_logs_for_threads` for every exported row. Dedicated tests pin down its exact output shape.
+**Call relations**: StateRuntime::query_feedback_logs_for_threads calls this while assembling the feedback byte buffer. The tests also check it directly because small formatting changes would affect feedback output.
 
 *Call graph*: called by 1 (query_feedback_logs_for_threads); 3 external calls (from_timestamp, format!, try_from).
 
@@ -2389,11 +2401,11 @@ fn format_feedback_log_line(
 fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery)
 ```
 
-**Purpose**: Appends all optional `LogQuery` predicates to a `QueryBuilder<Sqlite>`, including level, time range, module/file substring, thread/threadless selection, id cursor, and body substring search. It centralizes query semantics for multiple read APIs.
+**Purpose**: This adds the WHERE-clause pieces for a LogQuery to a SQL query builder. It keeps all log filtering rules in one place so different reads interpret queries the same way.
 
-**Data flow**: Reads fields from `query` and mutates the provided `builder` by pushing SQL fragments and bound values. It delegates module/file substring handling to `push_like_filters` and directly emits predicates for levels, timestamps, thread filters, `after_id`, and `INSTR` search over `feedback_log_body`.
+**Data flow**: It receives a mutable SQL query builder and a LogQuery. It appends conditions for levels, time range, module substring, file substring, thread IDs, optional threadless logs, minimum ID, and body text search. It changes the builder in place and returns nothing.
 
-**Call relations**: Used by both `StateRuntime::query_logs` and `StateRuntime::max_log_id` so those APIs stay consistent.
+**Call relations**: StateRuntime::query_logs and StateRuntime::max_log_id both call this. For substring filters on module and file columns, it delegates to push_like_filters.
 
 *Call graph*: calls 1 internal fn (push_like_filters); called by 2 (max_log_id, query_logs); 3 external calls (push, push_bind, separated).
 
@@ -2404,11 +2416,11 @@ fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery)
 fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: &[String])
 ```
 
-**Purpose**: Adds one or more `%...%` `LIKE` predicates for a specific column, OR-ing multiple filter strings together. Empty filter lists leave the query unchanged.
+**Purpose**: This adds one or more SQL LIKE substring checks for a single column. It is used when a query wants logs whose module path or file name contains certain text.
 
-**Data flow**: Consumes a mutable builder, a column name, and a slice of filter strings; if non-empty, it appends `AND (...)` with one `column LIKE '%' || ? || '%'` clause per filter joined by `OR`.
+**Data flow**: It receives a query builder, a column name, and a list of filter strings. If the list is empty, it leaves the builder unchanged. Otherwise it appends an AND group where the column may match any of the provided substrings.
 
-**Call relations**: This is a small helper used only by `push_log_filters` for `module_path` and `file` substring matching.
+**Call relations**: push_log_filters calls this for module_path and file filters. It is a helper that keeps the repeated SQL pattern out of the larger filter-building function.
 
 *Call graph*: called by 1 (push_log_filters); 1 external calls (push).
 
@@ -2419,11 +2431,11 @@ fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: 
 async fn open_db_pool(path: &Path) -> SqlitePool
 ```
 
-**Purpose**: Opens a raw `SqlitePool` against a specific logs database path for test inspection. It bypasses runtime wrappers so tests can inspect schema and row counts directly.
+**Purpose**: This test helper opens a SQLite connection pool for an existing database file. Tests use it to inspect the log database directly.
 
-**Data flow**: Consumes a filesystem `Path`, builds `SqliteConnectOptions` with `create_if_missing(false)`, connects, and returns the pool.
+**Data flow**: It receives a filesystem path, builds SQLite connection options for that path without creating a missing file, opens the pool, and returns it. If opening fails, the test fails immediately.
 
-**Call relations**: Used by helper and migration tests that need direct database access outside `StateRuntime`.
+**Call relations**: Tests such as tests::log_row_count and the migration and auto-vacuum checks call this helper when they need direct database access outside StateRuntime.
 
 *Call graph*: 2 external calls (new, connect_with).
 
@@ -2434,11 +2446,11 @@ async fn open_db_pool(path: &Path) -> SqlitePool
 async fn log_row_count(path: &Path) -> i64
 ```
 
-**Purpose**: Counts rows in the `logs` table at a given database path. It is a small test helper for verifying which database received inserted rows.
+**Purpose**: This test helper counts how many rows are in the logs table. It gives tests a quick way to confirm that inserts landed in the expected database.
 
-**Data flow**: Opens a pool with `open_db_pool`, runs `SELECT COUNT(*) FROM logs`, closes the pool, and returns the count.
+**Data flow**: It receives a database path, opens a pool with tests::open_db_pool, runs SELECT COUNT(*) FROM logs, closes the pool, and returns the count.
 
-**Call relations**: Used by the dedicated-log-database test to confirm inserts land in the logs DB file.
+**Call relations**: tests::insert_logs_use_dedicated_log_database calls this after writing a log through StateRuntime, so the test can verify the dedicated logs database contains the row.
 
 *Call graph*: 1 external calls (open_db_pool).
 
@@ -2449,11 +2461,11 @@ async fn log_row_count(path: &Path) -> i64
 async fn insert_logs_use_dedicated_log_database()
 ```
 
-**Purpose**: Verifies that persisted logs are written to the separate logs database rather than the main state database. It checks this by counting rows in the logs DB file directly.
+**Purpose**: This test proves that log writes go to the separate logs database, not some other runtime database. That matters because logs have their own schema and cleanup rules.
 
-**Data flow**: Initializes a runtime, inserts one `LogEntry`, computes the logs DB path, counts rows there with `log_row_count`, asserts the count is one, and removes the temp directory.
+**Data flow**: It creates a temporary runtime home, initializes StateRuntime, inserts one log entry, opens the expected logs database path, counts rows, checks that exactly one row exists, and removes the temporary directory.
 
-**Call relations**: This test covers the basic write path and the architectural separation of the logs database.
+**Call relations**: The test runner calls this test. It exercises StateRuntime::insert_logs through a real initialized runtime and uses tests::log_row_count to inspect the database file.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (assert_eq!, logs_db_path, log_row_count, remove_dir_all).
 
@@ -2464,11 +2476,11 @@ async fn insert_logs_use_dedicated_log_database()
 async fn init_migrates_message_only_logs_db_to_feedback_log_body_schema()
 ```
 
-**Purpose**: Checks that runtime initialization migrates an older logs schema using `message` into the newer `feedback_log_body` schema without losing data. It also verifies the resulting column and index layout.
+**Purpose**: This test checks that an old logs database using the former message column is upgraded to the newer feedback_log_body schema. It protects users who already have older local log databases.
 
-**Data flow**: Creates an old-schema logs DB with a custom migrator, inserts a legacy row into the old `message` column, initializes `StateRuntime`, queries logs through the runtime to confirm the body is readable, then directly inspects `pragma_table_info` and `pragma_index_list` to assert the migrated schema.
+**Data flow**: It creates a temporary old-style logs database, applies only the first migration, inserts a legacy row, initializes StateRuntime, queries logs through the runtime, and verifies the legacy text appears in the new message field. It also checks the final column and index names.
 
-**Call relations**: This test validates compatibility between runtime initialization and historical logs database formats.
+**Call relations**: The test runner calls this test. It uses StateRuntime::init to trigger migrations and StateRuntime::query_logs to confirm migrated data remains readable.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 12 external calls (Owned, new, connect_with, now, assert_eq!, logs_db_path, query, default, open_db_pool, create_dir_all (+2 more)).
 
@@ -2479,11 +2491,11 @@ async fn init_migrates_message_only_logs_db_to_feedback_log_body_schema()
 async fn init_configures_logs_db_with_incremental_auto_vacuum()
 ```
 
-**Purpose**: Verifies that the logs database is configured with incremental auto-vacuum. This pins down a storage-maintenance setting expected at initialization time.
+**Purpose**: This test verifies that the logs database is configured to reclaim freed pages incrementally. That setting helps keep disk usage under control after pruning deletes rows.
 
-**Data flow**: Initializes a runtime, opens the logs DB directly, reads `PRAGMA auto_vacuum`, asserts it equals `2`, closes the pool, and removes the temp directory.
+**Data flow**: It creates a temporary runtime, initializes StateRuntime, opens the logs database directly, reads SQLite’s auto_vacuum setting, checks that it is the incremental mode value, closes the pool, and removes the temporary directory.
 
-**Call relations**: This test covers initialization-time database configuration rather than runtime log operations.
+**Call relations**: The test runner calls this test. It relies on StateRuntime::init to create and configure the database, and tests::open_db_pool to inspect the SQLite setting.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (assert_eq!, logs_db_path, open_db_pool, remove_dir_all).
 
@@ -2494,11 +2506,11 @@ async fn init_configures_logs_db_with_incremental_auto_vacuum()
 fn format_feedback_log_line_matches_feedback_formatter_shape()
 ```
 
-**Purpose**: Asserts the exact textual shape of a formatted feedback log line for a normal timestamp and body. It protects downstream consumers that expect this format.
+**Purpose**: This test locks down the normal formatting of one feedback log line. It makes sure timestamps, log level spacing, message text, and newline behavior stay stable.
 
-**Data flow**: Calls `format_feedback_log_line` with fixed inputs and compares the returned string to the expected RFC3339-micros line with newline.
+**Data flow**: It calls format_feedback_log_line with a known timestamp, level, and message, then compares the returned string to the expected text.
 
-**Call relations**: This is a unit test for the standalone formatter used by feedback-log export.
+**Call relations**: The test runner calls this test. It directly protects format_feedback_log_line, which is used by feedback log export.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2509,11 +2521,11 @@ fn format_feedback_log_line_matches_feedback_formatter_shape()
 fn format_feedback_log_line_preserves_existing_trailing_newline()
 ```
 
-**Purpose**: Checks that formatting does not duplicate a newline when the body already ends with one. The output should still contain exactly one trailing newline.
+**Purpose**: This test checks that formatting does not add an extra blank line when the feedback body already ends with a newline.
 
-**Data flow**: Calls `format_feedback_log_line` with a body ending in `\n` and asserts the returned string has the expected single newline.
+**Data flow**: It calls format_feedback_log_line with message text that already has a trailing newline and checks that the result has only the expected single line ending.
 
-**Call relations**: This complements the previous formatter test by covering the newline-normalization edge case.
+**Call relations**: The test runner calls this test. It covers a small but visible behavior of format_feedback_log_line used by feedback exports.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2524,11 +2536,11 @@ fn format_feedback_log_line_preserves_existing_trailing_newline()
 async fn query_logs_with_search_matches_rendered_body_substring()
 ```
 
-**Purpose**: Verifies that `query_logs` search filtering matches substrings in the persisted feedback body. It ensures search is applied to `feedback_log_body`, not just legacy message text.
+**Purpose**: This test confirms that log search looks inside the feedback-visible body, not just the older message fallback. Users searching logs should find the text they would actually see.
 
-**Data flow**: Initializes a runtime, inserts two log rows with different bodies, queries with `LogQuery { search: Some("foo=2"), .. }`, and asserts only the matching row is returned.
+**Data flow**: It initializes a temporary runtime, inserts two logs with different feedback bodies, queries with a search string that matches only one body, checks that one row comes back with the expected message, and removes the temporary directory.
 
-**Call relations**: This test exercises the `INSTR(COALESCE(feedback_log_body, ''), ?)` predicate emitted by `push_log_filters`.
+**Call relations**: The test runner calls this test. It exercises StateRuntime::insert_logs and StateRuntime::query_logs, including the search clause built by push_log_filters.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert_eq!, remove_dir_all).
 
@@ -2539,11 +2551,11 @@ async fn query_logs_with_search_matches_rendered_body_substring()
 async fn query_logs_filters_level_set_without_rewriting_stored_level()
 ```
 
-**Purpose**: Checks that level filtering is case-insensitive on query input via `UPPER(level)` but preserves the original stored level strings in results. Filtering should not normalize stored data.
+**Purpose**: This test checks that level filtering is case-insensitive while preserving the original stored level text. For example, a stored lowercase warn should still be returned as warn.
 
-**Data flow**: Inserts rows with mixed-case levels, queries with `levels_upper = ["WARN", "ERROR"]`, maps returned rows to `(level, message)`, and asserts only the warn/error rows are returned with original casing intact.
+**Data flow**: It inserts logs with several levels, including mixed case, queries for WARN and ERROR, and compares the returned levels and messages to the expected rows.
 
-**Call relations**: This test targets the level-filter branch in `push_log_filters`.
+**Call relations**: The test runner calls this test. It exercises StateRuntime::query_logs and the level filtering added by push_log_filters.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (default, assert_eq!, remove_dir_all, vec!).
 
@@ -2554,11 +2566,11 @@ async fn query_logs_filters_level_set_without_rewriting_stored_level()
 async fn insert_logs_prunes_old_rows_when_thread_exceeds_size_limit()
 ```
 
-**Purpose**: Verifies per-thread byte-budget pruning: when two large rows exceed the thread partition limit, only the newest retained suffix remains. Older rows are deleted immediately after insert.
+**Purpose**: This test proves that a thread that exceeds its byte budget loses older rows first. It protects the rule that the newest useful thread logs are kept.
 
-**Data flow**: Inserts two ~6 MiB thread-scoped rows for the same thread, queries that thread’s logs, and asserts only one row remains and it is the newer timestamp.
+**Data flow**: It inserts two large log entries for the same thread whose combined estimated size is too large, queries that thread, and checks that only the newer row remains.
 
-**Call relations**: This exercises the thread-partition branch of `StateRuntime::prune_logs_after_insert`.
+**Call relations**: The test runner calls this test. It exercises StateRuntime::insert_logs and the thread branch of StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (default, assert_eq!, remove_dir_all, vec!).
 
@@ -2569,11 +2581,11 @@ async fn insert_logs_prunes_old_rows_when_thread_exceeds_size_limit()
 async fn insert_logs_prunes_single_thread_row_when_it_exceeds_size_limit()
 ```
 
-**Purpose**: Checks that an oversized single thread-scoped row is pruned entirely when it alone exceeds the partition byte cap. The partition may end up empty.
+**Purpose**: This test checks the edge case where one thread log row is larger than the entire partition budget. Such a row must be deleted rather than allowed to break the cap.
 
-**Data flow**: Inserts one ~11 MiB thread-scoped row, queries that thread’s logs, and asserts the result set is empty.
+**Data flow**: It inserts one oversized row for a thread, queries that thread, and confirms no rows remain.
 
-**Call relations**: This covers the edge case where the newest row itself is too large to retain under the strict cap.
+**Call relations**: The test runner calls this test. It focuses on the strict size enforcement inside StateRuntime::prune_logs_after_insert after StateRuntime::insert_logs writes the row.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (default, assert!, remove_dir_all, vec!).
 
@@ -2584,11 +2596,11 @@ async fn insert_logs_prunes_single_thread_row_when_it_exceeds_size_limit()
 async fn insert_logs_prunes_threadless_rows_per_process_uuid_only()
 ```
 
-**Purpose**: Verifies that threadless retention is partitioned by `process_uuid` and does not interfere with thread-scoped rows from the same process. Only the over-budget threadless partition should be pruned.
+**Purpose**: This test verifies that logs without a thread are pruned by process UUID and do not delete thread-scoped logs from the same process. It keeps the separate budget rules honest.
 
-**Data flow**: Inserts two large threadless rows for `proc-1` plus one large thread-scoped row for the same process, queries with both thread and threadless inclusion, sorts timestamps, and asserts the retained rows are the newest threadless row and the thread-scoped row.
+**Data flow**: It inserts two large threadless logs for one process and one thread log for the same process, queries thread plus threadless logs, and checks that the older threadless row was removed while the thread row remains.
 
-**Call relations**: This targets the threadless-per-process pruning branch in `StateRuntime::prune_logs_after_insert`.
+**Call relations**: The test runner calls this test. It exercises the threadless-with-process branch of StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (default, assert_eq!, remove_dir_all, vec!).
 
@@ -2599,11 +2611,11 @@ async fn insert_logs_prunes_threadless_rows_per_process_uuid_only()
 async fn insert_logs_prunes_single_threadless_process_row_when_it_exceeds_size_limit()
 ```
 
-**Purpose**: Checks that an oversized single threadless row with a non-null process UUID is pruned entirely. No threadless rows should remain for that process.
+**Purpose**: This test checks that one oversized threadless log with a process UUID is removed. The process-level budget should be just as strict as the thread budget.
 
-**Data flow**: Inserts one ~11 MiB threadless row for `proc-oversized`, queries threadless logs, and asserts the result set is empty.
+**Data flow**: It inserts one oversized threadless process log, queries threadless logs, and confirms the result is empty.
 
-**Call relations**: This covers the oversized-single-row edge case for non-null threadless process partitions.
+**Call relations**: The test runner calls this test. It verifies StateRuntime::insert_logs and StateRuntime::prune_logs_after_insert for oversized process-partition rows.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert!, remove_dir_all).
 
@@ -2614,11 +2626,11 @@ async fn insert_logs_prunes_single_threadless_process_row_when_it_exceeds_size_l
 async fn insert_logs_prunes_threadless_rows_with_null_process_uuid()
 ```
 
-**Purpose**: Verifies that threadless rows with `NULL process_uuid` are retained under their own independent partition budget. Over-budget null-process rows are pruned without affecting other process partitions.
+**Purpose**: This test verifies that threadless logs with no process UUID still have their own retention bucket. Without this, anonymous threadless logs could grow unchecked.
 
-**Data flow**: Inserts two large threadless null-process rows and one small threadless row for `proc-1`, queries threadless logs, sorts timestamps, and asserts only the newest null-process row plus the `proc-1` row remain.
+**Data flow**: It inserts two large threadless logs with no process UUID and one small threadless log with a process UUID, queries threadless logs, and checks that only the newer null-process row plus the separate process row remain.
 
-**Call relations**: This exercises the special null-process branch in `StateRuntime::prune_logs_after_insert`.
+**Call relations**: The test runner calls this test. It exercises the null-process branch of StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert_eq!, remove_dir_all).
 
@@ -2629,11 +2641,11 @@ async fn insert_logs_prunes_threadless_rows_with_null_process_uuid()
 async fn insert_logs_prunes_single_threadless_null_process_row_when_it_exceeds_limit()
 ```
 
-**Purpose**: Checks that a single oversized threadless row with `NULL process_uuid` is pruned entirely. The null-process partition may become empty.
+**Purpose**: This test checks that one oversized threadless log without a process UUID is removed. It protects the strict cap for the null-process bucket.
 
-**Data flow**: Inserts one ~11 MiB threadless null-process row, queries threadless logs, and asserts no rows are returned.
+**Data flow**: It inserts one very large threadless log with no process UUID, queries threadless logs, and confirms no row remains.
 
-**Call relations**: This is the null-process analogue of the oversized-single-row pruning tests.
+**Call relations**: The test runner calls this test. It covers the oversized-row case in the null-process branch of StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert!, remove_dir_all).
 
@@ -2644,11 +2656,11 @@ async fn insert_logs_prunes_single_threadless_null_process_row_when_it_exceeds_l
 async fn insert_logs_prunes_old_rows_when_thread_exceeds_row_limit()
 ```
 
-**Purpose**: Verifies per-thread row-count pruning independent of byte size. When a thread exceeds the row cap, the oldest rows are deleted and the newest 1000 remain.
+**Purpose**: This test proves that thread logs are also capped by row count, not only by byte size. It keeps a flood of tiny messages from accumulating forever.
 
-**Data flow**: Builds and inserts 1001 small thread-scoped rows for one thread, queries them back, and asserts there are 1000 rows spanning timestamps 2 through 1001.
+**Data flow**: It inserts 1,001 small rows for one thread, queries that thread, and checks that 1,000 rows remain, starting from the second timestamp through the newest timestamp.
 
-**Call relations**: This covers the `ROW_NUMBER() > LOG_PARTITION_ROW_LIMIT` pruning condition for thread partitions.
+**Call relations**: The test runner calls this test. It exercises the row-count part of StateRuntime::prune_logs_after_insert for thread partitions.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (default, assert_eq!, remove_dir_all, vec!).
 
@@ -2659,11 +2671,11 @@ async fn insert_logs_prunes_old_rows_when_thread_exceeds_row_limit()
 async fn insert_logs_prunes_old_threadless_rows_when_process_exceeds_row_limit()
 ```
 
-**Purpose**: Checks row-count pruning for threadless partitions keyed by non-null `process_uuid`. Only the newest 1000 rows for that process should remain.
+**Purpose**: This test confirms that threadless logs for a process UUID obey the row-count limit. Tiny process logs should be trimmed just like large ones.
 
-**Data flow**: Inserts 1001 threadless rows for `proc-row-limit`, queries threadless logs, filters to that process, and asserts timestamps 2 through 1001 remain.
+**Data flow**: It inserts 1,001 threadless rows for one process, queries threadless logs, filters the result to that process, and checks that the oldest row was removed while the newest 1,000 remain.
 
-**Call relations**: This exercises row-limit pruning in the threadless non-null process branch.
+**Call relations**: The test runner calls this test. It exercises the process UUID row-count pruning path in StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert_eq!, remove_dir_all).
 
@@ -2674,11 +2686,11 @@ async fn insert_logs_prunes_old_threadless_rows_when_process_exceeds_row_limit()
 async fn insert_logs_prunes_old_threadless_null_process_rows_when_row_limit_exceeded()
 ```
 
-**Purpose**: Verifies row-count pruning for the special threadless `NULL process_uuid` partition. The oldest null-process row should be dropped once the cap is exceeded.
+**Purpose**: This test checks row-count pruning for threadless logs that have no process UUID. It ensures the anonymous bucket also cannot grow forever.
 
-**Data flow**: Inserts 1001 threadless null-process rows, queries threadless logs, filters to rows with `process_uuid.is_none()`, and asserts timestamps 2 through 1001 remain.
+**Data flow**: It inserts 1,001 threadless rows with no process UUID, queries threadless logs, filters to rows still lacking a process UUID, and checks that the newest 1,000 remain.
 
-**Call relations**: This covers the row-limit path in the null-process pruning branch.
+**Call relations**: The test runner calls this test. It exercises the null-process row-count pruning path in StateRuntime::prune_logs_after_insert.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (default, assert_eq!, remove_dir_all).
 
@@ -2689,11 +2701,11 @@ async fn insert_logs_prunes_old_threadless_null_process_rows_when_row_limit_exce
 async fn query_feedback_logs_returns_newest_lines_within_limit_in_order()
 ```
 
-**Purpose**: Checks that feedback-log export returns chronological lines for a thread’s retained feedback rows. The output should be concatenated in oldest-to-newest order even though SQL fetches newest-first.
+**Purpose**: This test checks that feedback log export returns the selected lines in chronological reading order. Even though selection favors newest rows, the final text should read oldest to newest.
 
-**Data flow**: Inserts three thread-scoped rows, calls `query_feedback_logs("thread-1")`, decodes the bytes as UTF-8, and compares the result to the concatenation of three `format_feedback_log_line` outputs in chronological order.
+**Data flow**: It inserts three logs for one thread, requests feedback logs for that thread, converts the returned bytes to text, and compares them to three formatted lines in timestamp order.
 
-**Call relations**: This test validates both the SQL selection and the final reverse-order assembly in `StateRuntime::query_feedback_logs_for_threads`.
+**Call relations**: The test runner calls this test. It exercises StateRuntime::query_feedback_logs, which delegates to StateRuntime::query_feedback_logs_for_threads and uses format_feedback_log_line.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -2704,11 +2716,11 @@ async fn query_feedback_logs_returns_newest_lines_within_limit_in_order()
 async fn query_feedback_logs_excludes_oversized_newest_row()
 ```
 
-**Purpose**: Verifies that if the newest retained candidate line alone exceeds the byte budget, feedback export returns nothing rather than a partial line or older suffix. The in-memory exact cap is strict.
+**Purpose**: This test verifies that feedback export refuses a newest row that is larger than the byte budget. It should return nothing rather than include a partial or over-budget line.
 
-**Data flow**: Inserts one small and one oversized newer row for the same thread, calls `query_feedback_logs`, and asserts the returned byte vector is empty.
+**Data flow**: It inserts a small older row and an oversized newer row for one thread, asks for feedback logs, and checks that the returned byte buffer is empty.
 
-**Call relations**: This targets the exact whole-line byte-cap loop in `StateRuntime::query_feedback_logs_for_threads`.
+**Call relations**: The test runner calls this test. It exercises the size-bounding behavior in StateRuntime::query_feedback_logs_for_threads through the single-thread wrapper.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -2719,11 +2731,11 @@ async fn query_feedback_logs_excludes_oversized_newest_row()
 async fn query_feedback_logs_includes_threadless_rows_from_same_process()
 ```
 
-**Purpose**: Checks that feedback export for a thread includes threadless rows from that thread’s latest associated process UUID, but not from other processes. This is the intended merged feedback view.
+**Purpose**: This test confirms that feedback for a thread includes threadless logs from the same process. Those logs can contain important context even though they are not tied to the thread ID.
 
-**Data flow**: Inserts threadless and thread-scoped rows across two processes, queries feedback logs for `thread-1`, decodes the bytes, and asserts the output contains the thread row plus threadless rows from `proc-1` only.
+**Data flow**: It inserts threadless and thread-scoped logs for one process plus an unrelated threadless log for another process, exports feedback for the thread, and checks that only the same-process context is included.
 
-**Call relations**: This exercises the `latest_processes` and merged `feedback_logs` CTE logic in `StateRuntime::query_feedback_logs_for_threads`.
+**Call relations**: The test runner calls this test. It exercises the process-context logic inside StateRuntime::query_feedback_logs_for_threads.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -2734,11 +2746,11 @@ async fn query_feedback_logs_includes_threadless_rows_from_same_process()
 async fn query_feedback_logs_excludes_threadless_rows_from_prior_processes()
 ```
 
-**Purpose**: Verifies that when a thread has logs in multiple processes over time, feedback export includes threadless rows only from the latest process, not older ones. Process association is intentionally latest-only.
+**Purpose**: This test checks that threadless feedback context comes from the latest process associated with the thread, not from older processes. That prevents stale process-wide noise from being attached to current feedback.
 
-**Data flow**: Inserts thread and threadless rows for `thread-1` in an old process and a new process, queries feedback logs, decodes the bytes, and asserts only the thread row from the old process plus the thread and threadless rows from the new process appear.
+**Data flow**: It inserts thread logs for the same thread across an old and new process, plus threadless logs for both processes. It exports feedback and checks that the old thread-scoped row remains but old-process threadless context is excluded, while new-process threadless context is included.
 
-**Call relations**: This pins down the semantics of the `latest_processes` subquery used during feedback export.
+**Call relations**: The test runner calls this test. It focuses on the latest-process lookup inside StateRuntime::query_feedback_logs_for_threads.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -2749,11 +2761,11 @@ async fn query_feedback_logs_excludes_threadless_rows_from_prior_processes()
 async fn query_feedback_logs_keeps_newest_suffix_across_thread_and_threadless_logs()
 ```
 
-**Purpose**: Checks that the feedback export byte budget is applied across the merged thread and threadless stream, keeping the newest suffix regardless of source. Older thread-scoped lines may be dropped in favor of newer threadless lines.
+**Purpose**: This test verifies that feedback export applies one combined byte budget across thread and threadless logs, keeping the newest suffix that fits. It prevents older context from crowding out newer, more relevant context.
 
-**Data flow**: Inserts one older thread-scoped ~1 MiB row and two newer threadless rows totaling near the budget, exports feedback logs, decodes them, and asserts the older thread marker is absent while both newer threadless markers remain.
+**Data flow**: It inserts an older thread log and two newer large threadless logs for the same process, exports feedback, converts bytes to text, and checks that the older marker is absent while the newer markers are present.
 
-**Call relations**: This test validates the newest-first cumulative-byte selection across the merged feedback stream.
+**Call relations**: The test runner calls this test. It exercises the combined ordering and byte cap in StateRuntime::query_feedback_logs_for_threads.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 5 external calls (from_utf8, assert!, assert_eq!, format!, remove_dir_all).
 
@@ -2764,11 +2776,11 @@ async fn query_feedback_logs_keeps_newest_suffix_across_thread_and_threadless_lo
 async fn query_feedback_logs_for_threads_merges_requested_threads_and_threadless_rows()
 ```
 
-**Purpose**: Verifies the multi-thread feedback API merges rows from all requested threads plus threadless rows from each requested thread’s latest process. Unrequested threads and their threadless rows are excluded.
+**Purpose**: This test checks multi-thread feedback export. It should merge logs for the requested threads and include threadless rows from their associated processes, while ignoring unrequested threads.
 
-**Data flow**: Inserts thread-scoped and threadless rows for three processes, calls `query_feedback_logs_for_threads(&["thread-1", "thread-2"])`, decodes the bytes, and asserts the output contains thread-1, thread-2, and threadless rows for proc-1 and proc-2 only.
+**Data flow**: It inserts logs for three threads and threadless logs for three processes, requests feedback for only the first two threads, and compares the returned text to the expected four lines.
 
-**Call relations**: This covers the multi-thread variant of the feedback export logic.
+**Call relations**: The test runner calls this test. It directly exercises StateRuntime::query_feedback_logs_for_threads with more than one thread ID.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -2779,10 +2791,10 @@ async fn query_feedback_logs_for_threads_merges_requested_threads_and_threadless
 async fn query_feedback_logs_for_threads_returns_empty_for_empty_thread_list()
 ```
 
-**Purpose**: Checks the fast-path behavior for an empty thread list. No SQL work should be needed and the result should be empty bytes.
+**Purpose**: This test confirms that asking for feedback logs with no thread IDs returns an empty result. It avoids unnecessary SQL work and gives callers a predictable answer.
 
-**Data flow**: Initializes a runtime, calls `query_feedback_logs_for_threads(&[])`, and asserts the returned vector is empty.
+**Data flow**: It initializes a temporary runtime, calls StateRuntime::query_feedback_logs_for_threads with an empty slice, checks that the returned bytes are empty, and removes the temporary directory.
 
-**Call relations**: This test covers the explicit early return at the top of `StateRuntime::query_feedback_logs_for_threads`.
+**Call relations**: The test runner calls this test. It protects the early-return path in StateRuntime::query_feedback_logs_for_threads.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).

@@ -1,10 +1,12 @@
 # Extension-backed tool runtimes and namespaces  `stage-14.3.3`
 
-This stage sits in the per-turn tool setup and execution path, bridging the core runtime to extension-backed, deferred, and specialized namespaces that are not hardwired into the minimal core. Its center is spec_plan.rs, which decides which tools exist for the current turn and publishes both the dispatch registry and the model-visible specs; hosted_spec.rs fills in hosted-model tool descriptors such as web search and image generation.
+This stage is shared support for the model’s “extra hands.” On each turn, spec_plan builds the tool menu and the router that runs the chosen tool. hosted_spec adds provider-side abilities like web search or image creation. Dynamic-tool files adapt tools supplied during the conversation, while extension_tools lets installed extensions behave like built-in tools and report progress.
 
-Several adapters make non-core tools behave like native ones. dynamic.rs and tools/src/dynamic_tool.rs expose thread-scoped dynamic tools and round-trip their calls through session events. extension_tools.rs runs extension-provided executors, while tool_search.rs plus tool_search_spec.rs index deferred tools and expose synthetic discovery. view_image, get_context_remaining, and the small spec files define focused built-ins like image inspection, plan updates, new-context, and agent-jobs schemas.
+Several helper tools make the menu easier to use: tool_search lets the model find hidden tools by text, view_image loads an image file for inspection, get_context_remaining reports remaining conversation space, and small spec files describe plan updates, new contexts, and worker-agent jobs.
 
-Code-mode spans code-mode/src and core/src/tools/code_mode/*: it creates the restricted JS runtime, exposes callbacks, and maps exec/wait tool calls into code-cell lifecycle events. The extension crates then supply concrete namespaces: web search, image generation, goals, memories, and skills, each registering availability, schemas, execution, and output shaping. Together these parts let the planner assemble a turn-specific toolbox that the model can discover, call, and extend safely.
+Code mode is the long-running script area. Its runtime prepares a safe JavaScript world, callbacks let scripts talk back to Rust, and execute/wait tools start, monitor, or stop script cells.
+
+The extension registry is the sign-up sheet. Web search, image generation, goals, memories, and skills plug into it. Memories safely list, read, search, and write local notes. Skills gather packages from the host, executor, orchestrator, or remote service, then expose safe list and read tools.
 
 ## Files in this stage
 
@@ -13,13 +15,13 @@ These files build the per-turn tool plan and provide the core adapters and specs
 
 ### `core/src/tools/spec_plan.rs`
 
-`orchestration` · `startup / turn setup when building the tool router`
+`orchestration` · `per-turn tool setup`
 
-This file is the tool-planning hub for a turn. It defines `PlannedTools`, a mutable accumulator of runtime handlers and hosted-only specs, and `CoreToolPlanContext`, which packages the turn context plus MCP, extension, dynamic-tool, and tool-search inputs. `build_tool_router` and `build_tool_specs_and_registry` drive the overall flow: gather tool sources, append a deferred-tool search executor when needed, prepend code-mode wrapper tools, then build both the dispatch `ToolRegistry` and the model-visible `ToolSpec` list.
+A model can only call tools that are both advertised to it and registered on the backend. This file keeps those two worlds in sync. It looks at the current turn settings, model abilities, feature flags, authentication, environment access, and installed tool sources, then builds two things: a list of tool descriptions the model may see, and a registry of tool runtimes that can actually execute calls.
 
-The planner contains many feature gates and exposure rules. Shell tools are selected based on environment availability, model shell type, and whether unified exec is enabled; in unified-exec mode the legacy shell tool remains registered but hidden for dispatch compatibility. Hosted web search and image generation are emitted only when provider capabilities, feature flags, and extension-tool availability warrant them. Collaboration tools vary by multi-agent version, namespace-tool support, thread-depth limits, and worker-session source. MCP tools, dynamic tools, and extension tools are adapted into core runtimes, with duplicate-name suppression and warnings for invalid or conflicting tools.
+The main flow starts with `build_tool_router`. It gathers all possible sources: shell execution, file patching, image viewing, planning, user-input requests, MCP server tools and resources, extension tools, dynamic tools, web search, image generation, and collaboration tools for sub-agents. Each tool is added with an exposure level, which means whether the model sees it directly, only through search, only through code mode, or not at all.
 
-Several helpers shape the final model-visible surface. `spec_for_model_request` augments nested tools for code mode, `merge_into_namespaces` coalesces namespace specs and fills default descriptions, and `build_code_mode_executors` synthesizes the code-mode execute/wait tools from the currently enabled runtime specs. `MultiAgentV2NamespaceOverride` wraps handlers so V2 multi-agent tools can be exposed under a configurable namespace while delegating all runtime behavior to the underlying handler.
+It also has special rules. In code mode, many normal tools are wrapped as nested tools behind the code-mode executor. Namespace tools are merged so related tools appear under one named group. Multi-agent version 2 tools can be moved into a configured namespace. Duplicate names are skipped so one tool name cannot point to two different implementations. Without this file, the model might see tools it cannot run, miss tools it should have, or be offered unsafe or unsupported tools for the current session.
 
 #### Function details
 
@@ -29,11 +31,11 @@ Several helpers shape the final model-visible surface. `spec_for_model_request` 
 fn add(&mut self, handler: T)
 ```
 
-**Purpose**: Adds a concrete core runtime handler to the planned runtime list by boxing it behind `Arc<dyn CoreToolRuntime>`. It is the standard insertion path for most built-in handlers.
+**Purpose**: Adds a normal tool runtime to the growing plan. A runtime is the executable side of a tool: the code that will run if the model calls that tool.
 
-**Data flow**: Takes an owned handler implementing `CoreToolRuntime + 'static`, wraps it in `Arc::new`, and pushes it into `self.runtimes`.
+**Data flow**: It receives a concrete tool handler, wraps it in shared ownership so it can be stored with other tool types, and appends it to the planned runtime list. The plan is changed; nothing is returned.
 
-**Call relations**: Used throughout the planner when adding shell, utility, collaboration, MCP, dynamic, and extension-adapted tools.
+**Call relations**: The tool-source builders use this when they decide a built-in, MCP, dynamic, or extension-backed tool should be part of the turn. Later, the registry builder reads this list to create the executable tool registry.
 
 *Call graph*: called by 7 (add_collaboration_tools, add_core_utility_tools, add_dynamic_tools, add_mcp_resource_tools, add_mcp_runtime_tools, add_shell_tools, append_extension_tool_executors); 1 external calls (new).
 
@@ -44,11 +46,11 @@ fn add(&mut self, handler: T)
 fn add_arc(&mut self, handler: PlannedRuntime)
 ```
 
-**Purpose**: Adds an already boxed runtime handler to the planned runtime list. This avoids re-wrapping handlers that were already constructed as trait objects.
+**Purpose**: Adds a tool runtime that has already been wrapped for shared ownership. This is used when another helper has already prepared or decorated the handler.
 
-**Data flow**: Takes a `PlannedRuntime` (`Arc<dyn CoreToolRuntime>`) and pushes it into `self.runtimes`.
+**Data flow**: It takes an already shared tool runtime and appends it directly to the planned runtime list. The plan grows by one runtime.
 
-**Call relations**: Used when adding prewrapped handlers such as tool-search executors and namespace-overridden multi-agent handlers.
+**Call relations**: Collaboration planning uses this for multi-agent tools that may have namespace or exposure wrappers. Tool search also uses it when it reuses or creates a cached search handler.
 
 *Call graph*: called by 2 (add_collaboration_tools, append_tool_search_executor).
 
@@ -59,11 +61,11 @@ fn add_arc(&mut self, handler: PlannedRuntime)
 fn add_with_exposure(&mut self, handler: T, exposure: ToolExposure)
 ```
 
-**Purpose**: Adds a runtime handler while overriding its exposure level. This is how the planner marks tools as hidden, deferred, or direct-model-only without changing the handler implementation.
+**Purpose**: Adds a tool while explicitly setting how visible it should be to the model. This separates “the backend can run it” from “the model should see it directly.”
 
-**Data flow**: Takes a concrete handler and a `ToolExposure`, wraps the handler in `Arc`, passes it through `override_tool_exposure`, and pushes the resulting runtime into `self.runtimes`.
+**Data flow**: It receives a handler and an exposure setting, wraps the handler with that exposure, then stores it in the planned runtime list. The output is an updated plan.
 
-**Call relations**: Called by helper methods and planning branches that need to register hidden legacy tools, deferred collaboration tools, or direct-model-only utilities.
+**Call relations**: Higher-level planners call this when a tool needs special visibility, such as deferred search-only tools, model-only tools, or hidden dispatch helpers. It relies on the registry exposure wrapper before the final registry is built.
 
 *Call graph*: calls 1 internal fn (override_tool_exposure); called by 4 (add_dispatch_only, add_collaboration_tools, add_core_utility_tools, add_mcp_runtime_tools); 1 external calls (new).
 
@@ -74,11 +76,11 @@ fn add_with_exposure(&mut self, handler: T, exposure: ToolExposure)
 fn add_dispatch_only(&mut self, handler: T)
 ```
 
-**Purpose**: Registers a handler for dispatch but hides it from the model-visible tool list. It is a convenience wrapper for `ToolExposure::Hidden`.
+**Purpose**: Adds a tool that can be called by the backend router but should not be advertised directly to the model. This is useful for backwards compatibility or internal dispatch.
 
-**Data flow**: Takes a concrete handler and forwards it to `add_with_exposure(handler, ToolExposure::Hidden)`.
+**Data flow**: It receives a handler, marks it as hidden through `add_with_exposure`, and leaves it available in the runtime list but not in the visible tool list.
 
-**Call relations**: Used by `add_shell_tools` to keep the legacy shell tool available for dispatch while unified exec is model-visible.
+**Call relations**: Shell planning uses this to keep the legacy shell command implementation registered when the newer unified exec tool is the one shown to the model.
 
 *Call graph*: calls 1 internal fn (add_with_exposure); called by 1 (add_shell_tools).
 
@@ -89,11 +91,11 @@ fn add_dispatch_only(&mut self, handler: T)
 fn add_hosted_spec(&mut self, spec: ToolSpec)
 ```
 
-**Purpose**: Adds a hosted-only `ToolSpec` that has no corresponding local runtime handler. This is used for provider-hosted tools such as hosted web search or image generation.
+**Purpose**: Adds a provider-hosted tool description that the model provider runs itself, rather than a local runtime this process executes.
 
-**Data flow**: Pushes the provided `ToolSpec` into `self.hosted_specs`.
+**Data flow**: It takes a tool specification and appends it to the hosted-spec list. No executable runtime is added because the provider owns execution.
 
-**Call relations**: Called from `add_tool_sources` for each hosted model tool spec returned by `hosted_model_tool_specs`.
+**Call relations**: The tool-source collector uses this for hosted web search or image generation specs. The final builder later mixes these descriptions into the model-visible list.
 
 *Call graph*: called by 1 (add_tool_sources).
 
@@ -104,11 +106,11 @@ fn add_hosted_spec(&mut self, spec: ToolSpec)
 fn runtimes(&self) -> &[PlannedRuntime]
 ```
 
-**Purpose**: Returns the currently accumulated runtime handlers as a slice. This lets later planning phases inspect already-added tools without taking ownership.
+**Purpose**: Gives read-only access to the tool runtimes already planned. Helpers use this to inspect what has been added so far.
 
-**Data flow**: Returns `&self.runtimes`.
+**Data flow**: It reads the internal runtime list and returns it as a slice, without changing the plan.
 
-**Call relations**: Used by extension-tool planning, deferred-tool search planning, and code-mode executor synthesis.
+**Call relations**: Search, extension, and code-mode helpers use this snapshot to avoid name clashes, find deferred tools, or wrap existing tools for code mode.
 
 *Call graph*: called by 3 (append_extension_tool_executors, append_tool_search_executor, prepend_code_mode_executors).
 
@@ -123,11 +125,11 @@ fn build_tool_router(
 ) -> ToolRouter
 ```
 
-**Purpose**: Builds the final `ToolRouter` for a turn by producing both the registry and the model-visible specs, then combining them. It is the top-level entry point for tool planning.
+**Purpose**: Builds the final `ToolRouter`, the object that both advertises tools to the model and routes tool calls to the right executor. This is the public entry point of this file.
 
-**Data flow**: Takes `TurnContext`, `ToolRouterParams`, and a `ToolSearchHandlerCache`, calls `build_tool_specs_and_registry`, then passes the resulting registry and specs to `ToolRouter::from_parts` and returns the router.
+**Data flow**: It receives the turn context, externally supplied tool parameters, and a cache for the search tool. It asks for visible specs and a registry, then combines them into a router.
 
-**Call relations**: Called by higher-level turn setup (`from_turn_context`) to create the dispatch/router object used during tool invocation.
+**Call relations**: The broader turn setup calls this when preparing a model request. It delegates the real planning work to `build_tool_specs_and_registry` and then hands the result to `ToolRouter::from_parts`.
 
 *Call graph*: calls 2 internal fn (from_parts, build_tool_specs_and_registry); called by 1 (from_turn_context).
 
@@ -142,11 +144,11 @@ fn build_tool_specs_and_registry(
 ) -> (Vec<ToolSpec>, ToolRegistry)
 ```
 
-**Purpose**: Runs the full planning pipeline that gathers tool sources, adds search and code-mode wrappers, and produces both model-visible specs and the dispatch registry. It is the main orchestration function in this file.
+**Purpose**: Creates the complete tool plan for the turn, then turns that plan into model-facing descriptions and an executable registry.
 
-**Data flow**: Destructures `ToolRouterParams`, builds a default agent-type description string, constructs `CoreToolPlanContext` including wait-timeout options from `wait_agent_timeout_options`, initializes `PlannedTools::default()`, calls `add_tool_sources`, `append_tool_search_executor`, and `prepend_code_mode_executors`, then calls `build_model_visible_specs_and_registry` and returns its `(Vec<ToolSpec>, ToolRegistry)` result.
+**Data flow**: It unpacks supplied MCP, extension, dynamic, and discoverable tools; builds a planning context from the current turn; gathers all tool sources; adds search and code-mode tools when needed; and returns the final visible specs plus registry.
 
-**Call relations**: Invoked by `build_tool_router`; it delegates source collection to `add_tool_sources`, deferred search insertion to `append_tool_search_executor`, and code-mode wrapping to `prepend_code_mode_executors`.
+**Call relations**: This is called by `build_tool_router`. It orchestrates the main phases: source collection, optional search insertion, optional code-mode insertion, and final registry/spec construction.
 
 *Call graph*: calls 5 internal fn (add_tool_sources, append_tool_search_executor, build_model_visible_specs_and_registry, prepend_code_mode_executors, wait_agent_timeout_options); called by 1 (build_tool_router); 3 external calls (default, build, new).
 
@@ -160,11 +162,11 @@ fn build_model_visible_specs_and_registry(
 ) -> (Vec<ToolSpec>, ToolRegistry)
 ```
 
-**Purpose**: Converts the accumulated planned runtimes and hosted specs into the final model-visible tool spec list and dispatch registry. It deduplicates tool names, applies exposure rules, merges namespaces, and filters namespace specs when unsupported.
+**Purpose**: Converts the planned tools into the two final products: what the model sees and what the backend can run.
 
-**Data flow**: Consumes `PlannedTools`, iterates over `runtimes`, tracks seen tool names in a `HashSet`, skips duplicates, reads each runtime’s exposure and spec, filters out hidden-by-code-mode-only tools, transforms visible specs through `spec_for_model_request`, and appends hosted specs. It builds a `ToolRegistry` from all runtimes, merges namespace specs with `merge_into_namespaces`, filters namespace specs out when `namespace_tools_enabled(turn_context)` is false, and returns `(model_visible_specs, registry)`.
+**Data flow**: It walks through planned runtimes, skips duplicate tool names, checks each tool’s exposure, optionally adjusts specs for code mode, adds hosted specs, merges namespace groups, filters unsupported namespace specs, and builds a `ToolRegistry` from all runtimes.
 
-**Call relations**: Called at the end of `build_tool_specs_and_registry`; it depends on `spec_for_model_request`, `merge_into_namespaces`, and code-mode visibility helpers.
+**Call relations**: This is the final phase after all tools have been collected. It uses helper rules for code-mode hiding and namespace merging before returning to `build_tool_specs_and_registry`.
 
 *Call graph*: calls 4 internal fn (from_tools, is_hidden_by_code_mode_only, merge_into_namespaces, spec_for_model_request); called by 1 (build_tool_specs_and_registry); 2 external calls (new, new).
 
@@ -180,11 +182,11 @@ fn spec_for_model_request(
 ) -> ToolSpec
 ```
 
-**Purpose**: Adjusts a runtime’s `ToolSpec` before exposing it to the model, primarily by augmenting nested tools for code mode when appropriate. It leaves specs unchanged outside those conditions.
+**Purpose**: Adjusts an individual tool description before it is sent to the model. Its main job is to mark eligible tools so code mode can call them as nested tools.
 
-**Data flow**: Consumes `TurnContext`, a `ToolExposure`, a `ToolName`, and a `ToolSpec`. If the turn is in `CodeMode` or `CodeModeOnly`, the exposure is not `DirectModelOnly`, the tool is not excluded from code mode, and the spec name is recognized as a code-mode nested tool, it returns `codex_tools::augment_tool_spec_for_code_mode(spec)`; otherwise it returns the original spec.
+**Data flow**: It receives the turn context, tool exposure, tool name, and original spec. If the turn is in code mode and the tool is allowed to be nested, it returns an augmented spec; otherwise it returns the original spec unchanged.
 
-**Call relations**: Used by `build_model_visible_specs_and_registry` for each directly exposed runtime spec.
+**Call relations**: The final spec builder calls this for each directly visible runtime. It consults code-mode exclusion rules so configured namespaces are not accidentally exposed through code mode.
 
 *Call graph*: calls 2 internal fn (is_excluded_from_code_mode, name); called by 1 (build_model_visible_specs_and_registry); 3 external calls (is_code_mode_nested_tool, augment_tool_spec_for_code_mode, matches!).
 
@@ -195,11 +197,11 @@ fn spec_for_model_request(
 fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec>
 ```
 
-**Purpose**: Computes the hosted provider-side tool specs that should be exposed for the current turn, such as hosted web search and hosted image generation. It suppresses hosted tools when responses-lite or standalone extension tools make them unnecessary.
+**Purpose**: Chooses provider-hosted tools, such as hosted web search or hosted image generation, that should be included in the model request. Hosted means the model provider runs the tool, not this local process.
 
-**Data flow**: Reads provider capabilities, model info, feature flags, extension executors, and web-search config from `CoreToolPlanContext`. It returns an empty vector immediately for responses-lite. Otherwise it determines whether standalone web search is available, derives an optional hosted web-search mode/config, calls `create_web_search_tool`, conditionally pushes the result, then conditionally pushes `create_image_generation_tool("png")` when image generation is enabled and no standalone extension tool is available. Returns the collected `Vec<ToolSpec>`.
+**Data flow**: It reads model capabilities, provider capabilities, feature flags, web-search configuration, image-generation availability, and extension availability. It returns a list of hosted tool specs to advertise, or an empty list when hosted tools are not appropriate.
 
-**Call relations**: Called by `add_tool_sources`; it depends on `standalone_web_search_enabled`, `image_generation_tool_enabled`, and `standalone_image_generation_available`.
+**Call relations**: The source collector calls this after adding local runtimes. It avoids adding hosted web or image tools when a standalone extension version should be used instead.
 
 *Call graph*: calls 5 internal fn (create_image_generation_tool, create_web_search_tool, image_generation_tool_enabled, standalone_image_generation_available, standalone_web_search_enabled); called by 1 (add_tool_sources); 1 external calls (new).
 
@@ -210,11 +212,11 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec>
 fn search_tool_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Reports whether the current model supports the deferred-tool search tool. This is a simple capability gate.
+**Purpose**: Answers whether this model supports the tool-search feature. Tool search lets the model discover deferred tools instead of seeing every possible tool up front.
 
-**Data flow**: Reads `turn_context.model_info.supports_search_tool` and returns it.
+**Data flow**: It reads the model information in the turn context and returns a boolean yes-or-no result.
 
-**Call relations**: Used by collaboration-tool exposure logic, code-mode deferred guidance, extension-tool reservation, and deferred search-tool insertion.
+**Call relations**: Several planners use this gate before adding deferred collaboration tools, code-mode guidance for deferred tools, extension name reservations, or the search executor itself.
 
 *Call graph*: called by 5 (built_tools, add_collaboration_tools, append_extension_tool_executors, append_tool_search_executor, build_code_mode_executors).
 
@@ -225,11 +227,11 @@ fn search_tool_enabled(turn_context: &TurnContext) -> bool
 fn tool_suggest_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether plugin/tool suggestion features should be enabled for the turn. It requires three feature flags to be on simultaneously.
+**Purpose**: Answers whether plugin suggestion and installation tools should be available. It requires several feature flags to be on together.
 
-**Data flow**: Reads the current feature set from `turn_context.features.get()` and returns true only when `ToolSuggest`, `Apps`, and `Plugins` are all enabled.
+**Data flow**: It reads the active feature set and returns true only when tool suggestion, apps, and plugins are all enabled.
 
-**Call relations**: Used by `add_core_utility_tools` to decide whether to expose plugin discovery and install-request tools.
+**Call relations**: Core utility planning uses this before exposing tools that list installable plugins and request plugin installation. Other callers can use it to report what tools would be built.
 
 *Call graph*: called by 2 (built_tools, add_core_utility_tools).
 
@@ -240,11 +242,11 @@ fn tool_suggest_enabled(turn_context: &TurnContext) -> bool
 fn namespace_tools_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Reports whether the provider supports namespace-style tool specs. This controls namespace merging and whether namespace-only tools are exposed.
+**Purpose**: Checks whether the provider supports namespace-style tools, where related tools are grouped under names like `web.run`. This matters because not every model API accepts that shape.
 
-**Data flow**: Reads `turn_context.provider.capabilities().namespace_tools` and returns it.
+**Data flow**: It reads the provider capability from the turn context and returns a boolean.
 
-**Call relations**: Used across planning for namespace filtering, standalone web/image extension visibility, collaboration namespacing, and deferred search-tool insertion.
+**Call relations**: Tool search, standalone web search, standalone image generation, and multi-agent namespacing all depend on this check before creating namespace-based tool specs.
 
 *Call graph*: called by 5 (add_collaboration_tools, append_extension_tool_executors, append_tool_search_executor, standalone_image_generation_model_visible, standalone_web_search_enabled).
 
@@ -255,11 +257,11 @@ fn namespace_tools_enabled(turn_context: &TurnContext) -> bool
 fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Checks whether the turn is configured for multi-agent V2. This selects the collaboration-tool family and timeout source.
+**Purpose**: Checks whether the session is using the version 2 multi-agent tool set. Version 2 has different tool names, timeout settings, and optional namespacing.
 
-**Data flow**: Returns whether `turn_context.multi_agent_version == MultiAgentVersion::V2`.
+**Data flow**: It reads the multi-agent version in the turn context and returns true only for version 2.
 
-**Call relations**: Used by collaboration-tool planning and wait-timeout selection.
+**Call relations**: Collaboration planning uses this to choose between old and new sub-agent tools. Timeout planning uses it to choose between configured v2 timeout values and legacy defaults.
 
 *Call graph*: called by 2 (add_collaboration_tools, wait_agent_timeout_options).
 
@@ -270,11 +272,11 @@ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether collaboration/sub-agent tools should be available in the current turn. For V1 it enforces the thread spawn depth limit; for V2 it is always enabled; for disabled mode it is off.
+**Purpose**: Decides whether sub-agent collaboration tools are allowed in this turn. For version 1, it also prevents spawning agents too deeply, like stopping a chain of assistants from nesting forever.
 
-**Data flow**: Matches on `turn_context.multi_agent_version`. Returns false for `Disabled`, true for `V2`, and for `V1` computes the next thread spawn depth from `turn_context.session_source`, compares it against `turn_context.config.agent_max_depth` using `exceeds_thread_spawn_depth_limit`, and returns the negated overflow result.
+**Data flow**: It reads the multi-agent version, session source, and configured depth limit. It returns false when collaboration is disabled or when a version 1 spawn would exceed the depth limit; version 2 is allowed directly.
 
-**Call relations**: Used by `add_collaboration_tools` and by `agent_jobs_tools_enabled`.
+**Call relations**: Collaboration tool planning calls this before adding any agent tools. Agent-job planning also depends on it, because CSV-based agent jobs are built on top of collaboration support.
 
 *Call graph*: called by 2 (add_collaboration_tools, agent_jobs_tools_enabled); 2 external calls (exceeds_thread_spawn_depth_limit, next_thread_spawn_depth).
 
@@ -285,11 +287,11 @@ fn collab_tools_enabled(turn_context: &TurnContext) -> bool
 fn agent_jobs_tools_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether CSV-based agent-job tools should be exposed. They require both the `SpawnCsv` feature and collaboration tools to be enabled.
+**Purpose**: Decides whether CSV-based agent job tools should be available. These tools let a turn spawn many sub-agent tasks from tabular input.
 
-**Data flow**: Reads the `SpawnCsv` feature flag and combines it with `collab_tools_enabled(turn_context)`.
+**Data flow**: It reads the `SpawnCsv` feature flag and the general collaboration permission. It returns true only when both are allowed.
 
-**Call relations**: Used by `add_collaboration_tools` and `agent_jobs_worker_tools_enabled`.
+**Call relations**: The collaboration planner uses this before adding the CSV spawning tool. The worker-tool check builds on it to decide whether a sub-agent can report a job result.
 
 *Call graph*: calls 1 internal fn (collab_tools_enabled); called by 2 (add_collaboration_tools, agent_jobs_worker_tools_enabled).
 
@@ -300,11 +302,11 @@ fn agent_jobs_tools_enabled(turn_context: &TurnContext) -> bool
 fn agent_jobs_worker_tools_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether worker-only agent-job tools should be exposed in the current session. They are only available inside sub-agent sessions whose label starts with `agent_job:`.
+**Purpose**: Decides whether the current session is an agent-job worker that should be able to report a result. It looks for sub-agent sessions labeled as agent jobs.
 
-**Data flow**: Calls `agent_jobs_tools_enabled(turn_context)` and additionally matches `turn_context.session_source` against `SessionSource::SubAgent(SubAgentSource::Other(label))` with `label.starts_with("agent_job:")`.
+**Data flow**: It checks that agent-job tools are enabled, then examines the session source label. It returns true only for sub-agents whose label starts with the agent-job prefix.
 
-**Call relations**: Used by `add_collaboration_tools` to decide whether to add `ReportAgentJobResultHandler`.
+**Call relations**: The collaboration planner uses this to add the result-reporting tool only inside worker sub-agents, not in normal parent sessions.
 
 *Call graph*: calls 1 internal fn (agent_jobs_tools_enabled); called by 1 (add_collaboration_tools); 1 external calls (matches!).
 
@@ -315,11 +317,11 @@ fn agent_jobs_worker_tools_enabled(turn_context: &TurnContext) -> bool
 fn image_generation_tool_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether hosted image generation should be considered at all for the turn. It requires runtime support plus the `ImageGeneration` feature flag.
+**Purpose**: Checks whether hosted image generation should be offered as a feature. It requires both runtime support and the image-generation feature flag.
 
-**Data flow**: Calls `image_generation_runtime_enabled(turn_context)` and combines it with `turn_context.features.get().enabled(Feature::ImageGeneration)`.
+**Data flow**: It first asks whether the runtime conditions are met, then checks the feature set. It returns a boolean.
 
-**Call relations**: Used by `hosted_model_tool_specs`.
+**Call relations**: Hosted tool planning uses this before adding the provider-hosted image generation spec. Standalone image generation has a separate visibility path.
 
 *Call graph*: calls 1 internal fn (image_generation_runtime_enabled); called by 1 (hosted_model_tool_specs).
 
@@ -330,11 +332,11 @@ fn image_generation_tool_enabled(turn_context: &TurnContext) -> bool
 fn image_generation_runtime_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Checks whether the runtime/provider/model combination can support image generation. It requires Codex-backed auth, provider capability, and image input modality support.
+**Purpose**: Checks whether the current session is technically able to use image generation. This includes authentication, provider support, and model support for image input.
 
-**Data flow**: Reads `turn_context.auth_manager`, provider capabilities, and `turn_context.model_info.input_modalities`, returning true only when auth uses the Codex backend, the provider supports image generation, and image input is supported.
+**Data flow**: It reads the auth manager, provider capabilities, and model input modalities. It returns true only when the user is on the right backend, the provider supports image generation, and the model can work with images.
 
-**Call relations**: Used by both hosted and standalone image-generation visibility helpers.
+**Call relations**: Both hosted image generation and standalone image generation use this as their base safety check before exposing image-generation tools.
 
 *Call graph*: called by 2 (image_generation_tool_enabled, standalone_image_generation_model_visible).
 
@@ -345,11 +347,11 @@ fn image_generation_runtime_enabled(turn_context: &TurnContext) -> bool
 fn standalone_image_generation_model_visible(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether the standalone extension-based image generation tool should be visible to the model. It depends on runtime support, namespace-tool support, responses-lite behavior, and the `ImageGenExt` feature flag.
+**Purpose**: Decides whether the standalone image-generation extension should be visible to the model. This is separate from hosted image generation.
 
-**Data flow**: Returns false immediately if `image_generation_runtime_enabled` or `namespace_tools_enabled` is false. If responses-lite is enabled, returns true. Otherwise returns whether `Feature::ImageGenExt` is enabled.
+**Data flow**: It first requires image-generation runtime support and namespace-tool support. It then allows visibility for Responses Lite models or when the image-generation extension feature flag is enabled.
 
-**Call relations**: Used by extension-tool planning and by `standalone_image_generation_available`.
+**Call relations**: Extension planning uses this to decide whether to include the standalone image tool. Hosted planning uses the related availability check to avoid advertising both hosted and standalone versions unnecessarily.
 
 *Call graph*: calls 2 internal fn (image_generation_runtime_enabled, namespace_tools_enabled); called by 2 (append_extension_tool_executors, standalone_image_generation_available).
 
@@ -363,11 +365,11 @@ fn standalone_image_generation_available(
 ) -> bool
 ```
 
-**Purpose**: Checks whether a standalone extension executor for image generation is both model-visible and actually present. This suppresses the hosted fallback when the extension tool can serve the role.
+**Purpose**: Checks whether the standalone image-generation tool is both allowed and actually present among extension executors.
 
-**Data flow**: Calls `standalone_image_generation_model_visible(turn_context)` and, if true, scans `extension_tools` for an executor whose tool name is `image_gen.imagegen`.
+**Data flow**: It verifies model visibility rules, then scans extension executors for the configured `image_gen.imagegen` tool name. It returns true only when both conditions are met.
 
-**Call relations**: Used by `hosted_model_tool_specs` to decide whether to emit hosted image generation.
+**Call relations**: Hosted tool planning calls this so it can skip hosted image generation when the standalone extension is ready and visible.
 
 *Call graph*: calls 1 internal fn (standalone_image_generation_model_visible); called by 1 (hosted_model_tool_specs).
 
@@ -378,11 +380,11 @@ fn standalone_image_generation_available(
 fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOptions
 ```
 
-**Purpose**: Selects the timeout bounds used by wait-agent tools. V2 uses configurable values from turn config; older modes use fixed defaults.
+**Purpose**: Chooses timeout limits for waiting on sub-agents. Timeouts protect the system from waiting forever.
 
-**Data flow**: If `multi_agent_v2_enabled(turn_context)` is true, returns `WaitAgentTimeoutOptions` populated from `turn_context.config.multi_agent_v2`; otherwise returns one populated from `DEFAULT_WAIT_TIMEOUT_MS`, `MIN_WAIT_TIMEOUT_MS`, and `MAX_WAIT_TIMEOUT_MS`.
+**Data flow**: It reads the turn context. For multi-agent v2, it returns configured default, minimum, and maximum timeouts; otherwise it returns legacy constants.
 
-**Call relations**: Called during `build_tool_specs_and_registry` to populate `CoreToolPlanContext`.
+**Call relations**: The main planning setup computes this once and stores it in the planning context. Collaboration tools then use it when constructing wait-agent handlers.
 
 *Call graph*: calls 1 internal fn (multi_agent_v2_enabled); called by 1 (build_tool_specs_and_registry).
 
@@ -396,11 +398,11 @@ fn agent_type_description(
 ) -> String
 ```
 
-**Purpose**: Builds the descriptive text for agent-type selection in spawn-agent tools, falling back to a default description when no configured roles produce output. This keeps spawn-agent specs informative even without custom roles.
+**Purpose**: Builds the text that explains what kinds of sub-agents can be spawned. If custom roles do not produce any text, it falls back to a default description.
 
-**Data flow**: Calls `crate::agent::role::spawn_tool_spec::build(&turn_context.config.agent_roles)`. If the resulting string is empty, returns `default_agent_type_description.to_string()`, otherwise returns the generated description.
+**Data flow**: It reads configured agent roles and a prebuilt default description. It returns the custom description when available, otherwise the default string.
 
-**Call relations**: Used by `add_collaboration_tools` when constructing both V1 and V2 spawn-agent handlers.
+**Call relations**: Collaboration planning uses this when creating spawn-agent tools, so the model gets accurate guidance about available agent types.
 
 *Call graph*: called by 1 (add_collaboration_tools); 1 external calls (build).
 
@@ -415,11 +417,11 @@ fn is_hidden_by_code_mode_only(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a tool should be hidden from the model-visible spec list in `CodeModeOnly` because it is represented through the synthesized code-mode wrapper instead. This prevents duplicate nested-tool exposure.
+**Purpose**: Decides whether a tool should be hidden from the normal visible list because code mode is the only public tool surface. In that mode, nested tools are reached through code mode instead of shown separately.
 
-**Data flow**: Checks whether `turn_context.tool_mode == ToolMode::CodeModeOnly`, exposure is not `DirectModelOnly`, and the tool’s code-mode name is recognized as a nested code-mode tool via `codex_tools::code_mode_name_for_tool_name` and `codex_code_mode::is_code_mode_nested_tool`.
+**Data flow**: It reads the turn’s tool mode, the tool exposure, and the tool name translated into its code-mode form. It returns true when the tool should not be directly advertised.
 
-**Call relations**: Used by `build_model_visible_specs_and_registry` when filtering directly exposed runtime specs.
+**Call relations**: The final model-visible spec builder calls this while walking planned runtimes. It prevents duplicate or confusing exposure when code mode is meant to be the only direct entry point.
 
 *Call graph*: called by 1 (build_model_visible_specs_and_registry); 2 external calls (is_code_mode_nested_tool, code_mode_name_for_tool_name).
 
@@ -430,11 +432,11 @@ fn is_hidden_by_code_mode_only(
 fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) -> bool
 ```
 
-**Purpose**: Checks whether a tool’s namespace is explicitly excluded from code mode by configuration. This lets deployments suppress entire namespaces from code-mode wrappers.
+**Purpose**: Checks whether a tool’s namespace has been configured as excluded from code mode. This gives configuration a way to keep whole groups of tools out of code-mode nesting.
 
-**Data flow**: Reads `tool_name.namespace` and returns true when it exists and is contained in `turn_context.config.code_mode.excluded_tool_namespaces`.
+**Data flow**: It looks at the tool’s namespace, if any, and compares it with the configured excluded namespace set. It returns true for excluded namespaces and false otherwise.
 
-**Call relations**: Used by `spec_for_model_request` and `build_code_mode_executors`.
+**Call relations**: Code-mode executor construction and per-tool spec adjustment both call this before adding or augmenting tools for code mode.
 
 *Call graph*: called by 2 (build_code_mode_executors, spec_for_model_request).
 
@@ -448,11 +450,11 @@ fn build_code_mode_executors(
 ) -> Vec<Arc<dyn CoreToolRuntime>>
 ```
 
-**Purpose**: Synthesizes the code-mode execute and wait handlers from the currently planned runtime specs. It collects nested tool specs, computes namespace descriptions, determines whether deferred-tool guidance should be shown, and sorts enabled tools for stable presentation.
+**Purpose**: Builds the special executors that power code mode. Code mode is a wrapper tool that can call other tools from inside a code-oriented interface.
 
-**Data flow**: If the turn is not in `CodeMode` or `CodeModeOnly`, returns an empty vector. Otherwise it iterates over the provided executors, skipping `DirectModelOnly`, `Hidden`, and code-mode-excluded tools. It collects each executor’s spec into `code_mode_nested_tool_specs`; non-deferred specs also go into `exec_prompt_tool_specs`, while deferred specs may set `deferred_tools_available` if search-tool guidance is enabled and the spec yields code-mode exec prompt definitions. It computes namespace descriptions with `code_mode_namespace_descriptions`, collects and sorts enabled tool definitions with `collect_code_mode_exec_prompt_tool_definitions` and `compare_code_mode_tools`, then returns two boxed runtimes: `CodeModeExecuteHandler::new(create_code_mode_tool(...), code_mode_nested_tool_specs)` and `CodeModeWaitHandler`.
+**Data flow**: It receives the turn context and the already planned runtimes. If the turn is not in code mode, it returns no executors. Otherwise it filters out hidden, direct-model-only, and excluded tools; collects nested tool specs; builds the code-mode tool definition; sorts the enabled nested tools; and returns the code execute and wait handlers.
 
-**Call relations**: Called by `prepend_code_mode_executors` after all ordinary runtimes have been planned.
+**Call relations**: The code-mode prepender calls this after normal tool collection. Its output is inserted at the front of the runtime list so code mode becomes available alongside or instead of normal tools.
 
 *Call graph*: calls 3 internal fn (code_mode_namespace_descriptions, is_excluded_from_code_mode, search_tool_enabled); called by 1 (prepend_code_mode_executors); 5 external calls (new, collect_code_mode_exec_prompt_tool_definitions, matches!, once, vec!).
 
@@ -463,11 +465,11 @@ fn build_code_mode_executors(
 fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec>
 ```
 
-**Purpose**: Merges multiple namespace `ToolSpec`s with the same namespace name into a single namespace spec, sorts tools within each namespace, and fills in default namespace descriptions when missing. This normalizes the final model-visible tool surface.
+**Purpose**: Combines separate namespace tool specs with the same namespace name into one group. This keeps the model request tidy and avoids repeated namespace blocks.
 
-**Data flow**: Consumes a vector of `ToolSpec`. It iterates through specs, tracking namespace names to indices in a `BTreeMap`. When encountering a duplicate namespace, it appends tools into the existing namespace and prefers a non-empty description if the existing one is blank. Non-namespace specs are pushed through unchanged. After merging, it iterates over merged namespace specs, sorts their `tools` by function name, and fills blank descriptions using `default_namespace_description`. Returns the merged vector.
+**Data flow**: It receives a list of tool specs. It merges namespace specs by name, preserves or fills descriptions, sorts tools inside each namespace by function name, and returns the cleaned-up list.
 
-**Call relations**: Used by `build_model_visible_specs_and_registry` before namespace filtering.
+**Call relations**: The final visible-spec builder calls this before sending specs onward. It is especially important because tools can come from many sources but still belong to the same namespace.
 
 *Call graph*: called by 1 (build_model_visible_specs_and_registry); 5 external calls (new, with_capacity, default_namespace_description, Namespace, unreachable!).
 
@@ -480,11 +482,11 @@ fn code_mode_namespace_descriptions(
 ) -> BTreeMap<String, codex_code_mode::ToolNamespaceDescription>
 ```
 
-**Purpose**: Extracts namespace names and descriptions from a set of tool specs for use in code-mode tool ordering and prompt generation. It preserves the first non-empty description seen for each namespace.
+**Purpose**: Extracts namespace descriptions from tool specs so code mode can present grouped tools clearly. Namespaces are like folders for related tools.
 
-**Data flow**: Iterates over `specs`, filters `ToolSpec::Namespace`, inserts or updates entries in a `BTreeMap<String, ToolNamespaceDescription>`, and returns the map.
+**Data flow**: It scans the provided specs, keeps only namespace specs, records each namespace name and description, and fills in a description when a later spec has one. It returns a map keyed by namespace name.
 
-**Call relations**: Called by `build_code_mode_executors`, and its output is later used by `compare_code_mode_tools`.
+**Call relations**: The code-mode builder uses this map when sorting and describing nested tools inside the code-mode prompt.
 
 *Call graph*: called by 1 (build_code_mode_executors); 1 external calls (new).
 
@@ -495,11 +497,11 @@ fn code_mode_namespace_descriptions(
 fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Runs the source-collection phase of planning by adding all core, MCP, collaboration, extension, dynamic, and hosted tools into `PlannedTools`. It is the central fan-out point for tool-source assembly.
+**Purpose**: Collects every category of tool that might be available for the turn. It is the central checklist for tool sources.
 
-**Data flow**: Calls `add_shell_tools`, `add_mcp_resource_tools`, `add_core_utility_tools`, `add_collaboration_tools`, `add_mcp_runtime_tools`, `add_extension_tools`, and `add_dynamic_tools` in sequence, then iterates over `hosted_model_tool_specs(context)` and pushes each hosted spec with `add_hosted_spec`.
+**Data flow**: It receives the planning context and mutable planned-tools container. It calls helpers for shell, MCP resources, core utilities, collaboration, MCP runtimes, extensions, dynamic tools, and hosted provider specs, adding each allowed tool to the plan.
 
-**Call relations**: Called by `build_tool_specs_and_registry` before deferred search and code-mode wrappers are added.
+**Call relations**: The main planner calls this before adding search or code-mode wrappers. Each helper handles one source family so this function stays as the top-level assembly line.
 
 *Call graph*: calls 9 internal fn (add_hosted_spec, add_collaboration_tools, add_core_utility_tools, add_dynamic_tools, add_extension_tools, add_mcp_resource_tools, add_mcp_runtime_tools, add_shell_tools, hosted_model_tool_specs); called by 1 (build_tool_specs_and_registry).
 
@@ -510,11 +512,11 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
 fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether the standalone extension-based web search tool should be considered visible. It requires namespace-tool support and either responses-lite mode or the `StandaloneWebSearch` feature flag.
+**Purpose**: Checks whether the standalone extension-style web search tool may be used. This is different from provider-hosted web search.
 
-**Data flow**: Returns true when `namespace_tools_enabled(turn_context)` is true and either `turn_context.model_info.use_responses_lite` is true or `Feature::StandaloneWebSearch` is enabled.
+**Data flow**: It reads namespace-tool support, model type, and the standalone web-search feature flag. It returns true when namespace tools are supported and either Responses Lite is in use or the feature is enabled.
 
-**Call relations**: Used by hosted web-search suppression and extension-tool filtering.
+**Call relations**: Hosted search planning uses this to avoid adding hosted search when standalone search is available. Extension planning uses it to decide whether to keep or skip the `web.run` extension.
 
 *Call graph*: calls 1 internal fn (namespace_tools_enabled); called by 2 (append_extension_tool_executors, hosted_model_tool_specs).
 
@@ -525,11 +527,11 @@ fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool
 fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds the shell-related tool handlers appropriate for the current environment mode, model shell configuration, and feature flags. It chooses between unified exec, legacy shell command, or no shell tool at all.
+**Purpose**: Adds command-execution tools when the session has an execution environment. These are the tools that let the model run shell commands or write to a running process.
 
-**Data flow**: Reads environment mode, feature flags, login-shell permission, and whether multiple environments are active. If the environment mode has no environment, it returns early. It builds `ShellCommandHandlerOptions`, then matches `shell_type_for_model_and_features`. For `UnifiedExec`, it adds `ExecCommandHandler` configured with shell/environment-id options, adds `WriteStdinHandler`, and registers `ShellCommandHandler` as hidden dispatch-only. For disabled shell type it adds nothing. For default/local/shell-command modes it adds a visible `ShellCommandHandler`.
+**Data flow**: It reads environment availability, permission settings, feature flags, shell backend choice, model preferences, and whether multiple environments are present. Depending on the configured shell type, it adds unified exec, stdin writing, legacy shell dispatch, or the standard shell command tool.
 
-**Call relations**: Called by `add_tool_sources`; it is the planner branch that wires shell and unified-exec handlers into the runtime set.
+**Call relations**: The source collector calls this early. It may add a hidden legacy shell runtime so old-style calls can still be routed while the model sees the newer unified exec tool.
 
 *Call graph*: calls 5 internal fn (new, new, add, add_dispatch_only, unified_exec_should_include_shell_parameter); called by 1 (add_tool_sources); 3 external calls (shell_command_backend_for_features, shell_type_for_model_and_features, matches!).
 
@@ -540,11 +542,11 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
 fn unified_exec_should_include_shell_parameter(turn_context: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether the unified-exec tool spec should expose an explicit shell parameter. The parameter is omitted for local zsh-fork-only setups but retained when any remote environment is present.
+**Purpose**: Decides whether the unified exec tool should expose a shell parameter. This is needed except in a specific local zsh-fork setup unless remote environments are present.
 
-**Data flow**: Returns true unless `turn_context.unified_exec_shell_mode` is `UnifiedExecShellMode::ZshFork(_)` and all turn environments are local; in that zsh-fork-local-only case it returns false.
+**Data flow**: It reads the unified shell mode and the turn’s environments. It returns false only for the special local zsh-fork mode with no remote environment; otherwise it returns true.
 
-**Call relations**: Used by `add_shell_tools` when constructing `ExecCommandHandlerOptions`.
+**Call relations**: Shell planning uses this while constructing unified exec options, so the tool schema matches what the backend can safely and meaningfully accept.
 
 *Call graph*: called by 1 (add_shell_tools); 1 external calls (matches!).
 
@@ -555,11 +557,11 @@ fn unified_exec_should_include_shell_parameter(turn_context: &TurnContext) -> bo
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds the generic MCP resource browsing tools when MCP tools are present for the turn. These are separate from runtime wrappers for individual MCP tools.
+**Purpose**: Adds tools for browsing and reading MCP resources when MCP tools are present. MCP is a protocol that lets external servers provide tools and resources.
 
-**Data flow**: Checks whether `context.mcp_tools.is_some()`. If so, adds `ListMcpResourcesHandler`, `ListMcpResourceTemplatesHandler`, and `ReadMcpResourceHandler` to `planned_tools`.
+**Data flow**: It checks whether MCP tool information exists in the planning context. If so, it adds list-resources, list-resource-templates, and read-resource handlers to the plan.
 
-**Call relations**: Called by `add_tool_sources`.
+**Call relations**: The source collector calls this before adding individual MCP runtime tools. These resource helpers give the model a way to inspect MCP-provided data.
 
 *Call graph*: calls 1 internal fn (add); called by 1 (add_tool_sources).
 
@@ -570,11 +572,11 @@ fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds the non-shell core utility tools controlled by feature flags and environment availability, including planning, permission requests, token-budget tools, sleep, plugin suggestion/install, apply-patch, test sync, and image viewing.
+**Purpose**: Adds built-in utility tools such as planning, permission requests, token-budget helpers, sleep, plugin installation requests, patch application, test sync, and image viewing.
 
-**Data flow**: Always adds `PlanHandler`. Conditionally adds `RequestUserInputHandler` as direct-model-only, `RequestPermissionsHandler`, `NewContextWindowHandler` and `GetContextRemainingHandler`, `SleepHandler`, plugin discovery/install handlers when `tool_suggest_enabled` and discoverable tools exist, `ApplyPatchHandler` when an environment exists and the model supports apply-patch, `TestSyncHandler` when explicitly listed in experimental supported tools, and `ViewImageHandler` when an environment exists. It computes environment-id inclusion and image-detail capability from turn context where needed.
+**Data flow**: It reads feature flags, model abilities, environment availability, and configuration. It always adds the planning tool, then conditionally adds each utility only when the current turn supports it.
 
-**Call relations**: Called by `add_tool_sources`; it is the main source of miscellaneous built-in utility handlers.
+**Call relations**: The source collector calls this as the main built-in utility phase. Several of these tools are direct-model-only or environment-dependent, so this function sets the right exposure and options before final registry construction.
 
 *Call graph*: calls 7 internal fn (new, new, new, new, add, add_with_exposure, tool_suggest_enabled); called by 1 (add_tool_sources); 4 external calls (can_request_original_image_detail, collect_request_plugin_install_entries, request_user_input_available_modes, matches!).
 
@@ -585,11 +587,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds multi-agent collaboration tools and CSV agent-job tools according to multi-agent version, namespace support, exposure rules, and worker-session context. It encapsulates the most complex feature-gated planning branch in the file.
+**Purpose**: Adds tools for working with sub-agents and agent jobs. These tools let the model spawn, message, wait for, interrupt, list, or close other agent sessions depending on the enabled multi-agent version.
 
-**Data flow**: Checks `collab_tools_enabled(turn_context)`. For V2, it computes exposure, optional namespace override, and agent-type description, then adds namespace-overridden `SpawnAgentHandlerV2`, `SendMessageHandlerV2`, `FollowupTaskHandlerV2`, `WaitAgentHandlerV2`, `InterruptAgentHandler`, and `ListAgentsHandlerV2`, each wrapped with `override_tool_exposure`. For V1, it computes exposure based on search/namespace support and adds `SpawnAgentHandler`, `SendInputHandler`, `ResumeAgentHandler`, `WaitAgentHandler`, and `CloseAgentHandler`. Independently, if `agent_jobs_tools_enabled` it adds `SpawnAgentsOnCsvHandler`, and if `agent_jobs_worker_tools_enabled` it also adds `ReportAgentJobResultHandler`.
+**Data flow**: It reads collaboration eligibility, multi-agent version, namespace support, configured agent roles, available models, timeout options, and feature flags. It adds either v2 multi-agent tools, v1 multi-agent tools, CSV job spawning, and, for worker agents, result reporting.
 
-**Call relations**: Called by `add_tool_sources`; it delegates namespace wrapping to `multi_agent_v2_handler` and uses several feature helpers to choose the exact collaboration surface.
+**Call relations**: The source collector calls this after core tools. It uses many small gatekeeping helpers so agent tools appear only in sessions where they are supported and safe.
 
 *Call graph*: calls 12 internal fn (override_tool_exposure, add, add_arc, add_with_exposure, agent_jobs_tools_enabled, agent_jobs_worker_tools_enabled, agent_type_description, collab_tools_enabled, multi_agent_v2_enabled, multi_agent_v2_handler (+2 more)); called by 1 (add_tool_sources); 4 external calls (new, new, new, new).
 
@@ -600,11 +602,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
 fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds runtime handlers for concrete MCP tools, including deferred MCP tools, while skipping invalid tool specs with warnings. It adapts external MCP metadata into executable handlers.
+**Purpose**: Adds executable handlers for MCP tools supplied by external MCP servers. It also supports deferred MCP tools, which are discoverable through search rather than shown directly.
 
-**Data flow**: If `context.mcp_tools` is present, iterates over each `ToolInfo`, calls `McpHandler::new(tool.clone())`, and either adds the handler or logs a warning. It repeats the same for `context.deferred_mcp_tools`, but adds successful handlers with `ToolExposure::Deferred`.
+**Data flow**: It iterates over immediate and deferred MCP tool descriptions. For each one, it tries to build an `McpHandler`; successful handlers are added with normal or deferred exposure, while failures are logged and skipped.
 
-**Call relations**: Called by `add_tool_sources` after generic MCP resource tools are added.
+**Call relations**: The source collector calls this after collaboration tools. Later, the search-tool builder can expose deferred MCP tools through tool search.
 
 *Call graph*: calls 3 internal fn (new, add, add_with_exposure); called by 1 (add_tool_sources); 1 external calls (warn!).
 
@@ -615,11 +617,11 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
 fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds handlers for dynamic tools supplied at runtime, supporting both top-level functions and namespaced function tools. Invalid dynamic tool specs are logged and skipped.
+**Purpose**: Adds tools that are defined dynamically at runtime rather than compiled into the program. These can be plain functions or functions inside namespaces.
 
-**Data flow**: Iterates over `context.dynamic_tools`. For `DynamicToolSpec::Function`, it calls `DynamicToolHandler::new(tool)` and adds the handler if present, otherwise logs an error. For `DynamicToolSpec::Namespace`, it iterates over namespace tools, calls `DynamicToolHandler::new_in_namespace(namespace, tool)` for each function tool, and adds or logs error accordingly.
+**Data flow**: It walks through dynamic tool specs. For each function, it tries to create a dynamic handler; for each namespace, it creates handlers for its functions. Valid handlers are added, and conversion failures are logged.
 
-**Call relations**: Called by `add_tool_sources` to incorporate runtime-provided dynamic tools into the plan.
+**Call relations**: The source collector calls this after extensions. The final namespace merger may later group dynamic namespace specs with other tools in the same namespace.
 
 *Call graph*: calls 3 internal fn (new, new_in_namespace, add); called by 1 (add_tool_sources); 1 external calls (error!).
 
@@ -630,11 +632,11 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
 fn add_extension_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools)
 ```
 
-**Purpose**: Adds extension-contributed tool executors into the planned runtime set. The actual adaptation and filtering logic lives in `append_extension_tool_executors`.
+**Purpose**: Adds tools provided by extensions. Extensions have already produced executors elsewhere; this function adapts them into the core runtime plan.
 
-**Data flow**: Forwards `context.turn_context`, `context.extension_tool_executors`, and `planned_tools` to `append_extension_tool_executors`.
+**Data flow**: It passes the turn context, extension executors, and planned-tools container to the lower-level appender. The plan may gain extension-backed runtimes.
 
-**Call relations**: Called by `add_tool_sources`.
+**Call relations**: The source collector calls this as the extension phase. The actual filtering for duplicates, web search, and image generation happens in `append_extension_tool_executors`.
 
 *Call graph*: calls 1 internal fn (append_extension_tool_executors); called by 1 (add_tool_sources).
 
@@ -648,11 +650,11 @@ fn append_tool_search_executor(
 )
 ```
 
-**Purpose**: Adds the deferred-tool search executor when search tools and namespace tools are supported and at least one deferred runtime exposes searchable metadata. This creates the synthetic tool that helps the model discover deferred tools.
+**Purpose**: Adds the tool-search executor when there are deferred tools for the model to discover. This prevents the visible tool list from becoming too large while still making tools reachable.
 
-**Data flow**: Checks `search_tool_enabled(turn_context)` and `namespace_tools_enabled(turn_context)`; returns early if either is false. Otherwise it scans `planned_tools.runtimes()` for handlers with `ToolExposure::Deferred`, collects their `search_info()` values, returns early if none exist, obtains or builds a cached handler from `context.tool_search_handler_cache`, and adds it via `add_arc`.
+**Data flow**: It checks that search and namespace tools are supported, then scans planned runtimes for deferred tools with search metadata. If any exist, it gets or builds a cached search handler and adds it to the plan.
 
-**Call relations**: Called by `build_tool_specs_and_registry` after ordinary tool sources are added but before code-mode wrappers are prepended.
+**Call relations**: The main planner calls this after all normal tool sources have been added. It depends on deferred tools already being present, especially deferred collaboration or MCP tools.
 
 *Call graph*: calls 4 internal fn (add_arc, runtimes, namespace_tools_enabled, search_tool_enabled); called by 1 (build_tool_specs_and_registry).
 
@@ -666,11 +668,11 @@ fn prepend_code_mode_executors(
 )
 ```
 
-**Purpose**: Prepends the synthesized code-mode execute/wait handlers ahead of all other runtimes. This ensures code-mode wrapper tools are available and ordered first in the runtime list.
+**Purpose**: Inserts code-mode executors at the front of the runtime list when code mode is active. Prepending makes code mode part of the planned runtime set before final specs are built.
 
-**Data flow**: Calls `build_code_mode_executors(turn_context, planned_tools.runtimes())` and splices the resulting vector into the front of `planned_tools.runtimes`.
+**Data flow**: It reads current runtimes, builds any needed code-mode executors from them, and splices those executors into the beginning of the planned runtime list.
 
-**Call relations**: Called by `build_tool_specs_and_registry` after all ordinary runtimes and deferred search handlers have been planned.
+**Call relations**: The main planner calls this after search insertion. The final registry/spec builder then treats code-mode executors like other runtimes, while hiding or augmenting nested tools as needed.
 
 *Call graph*: calls 2 internal fn (runtimes, build_code_mode_executors); called by 1 (build_tool_specs_and_registry).
 
@@ -685,11 +687,11 @@ fn append_extension_tool_executors(
 )
 ```
 
-**Purpose**: Adapts extension executors into core runtimes while enforcing visibility rules, duplicate-name suppression, and special handling for standalone web search and image generation. It is the main integration point for extension-contributed tools.
+**Purpose**: Filters and adds extension-provided tool executors while avoiding name collisions and unsupported standalone tools. It keeps the tool namespace clean.
 
-**Data flow**: Returns early if `executors` is empty. Otherwise it builds a `reserved_tool_names` set from existing planned runtime names, plus code-mode public/wait tool names when in code mode, plus the search tool name when deferred search will be added. It computes standalone web-search visibility and whether web search mode is enabled. Then it iterates over cloned extension executors, skipping `web.run` when standalone web search is disabled or web search mode is off, skipping `image_gen.imagegen` when standalone image generation is not model-visible, warning and skipping duplicates already in `reserved_tool_names`, and otherwise wrapping each executor in `ExtensionToolAdapter::new` and adding it.
+**Data flow**: It builds a set of reserved tool names from already planned tools, plus names reserved for code mode or tool search when applicable. It then scans extension executors, skips disabled standalone web or image tools, skips duplicate names with a warning, and wraps accepted executors in an extension adapter.
 
-**Call relations**: Called by `add_extension_tools`; it depends on current planned runtimes and several visibility helpers to avoid conflicts with core or hosted tools.
+**Call relations**: Extension planning calls this after built-in tools have been planned. This order lets built-in tools claim names first, so extensions cannot accidentally override core behavior.
 
 *Call graph*: calls 9 internal fn (new, add, runtimes, namespace_tools_enabled, search_tool_enabled, standalone_image_generation_model_visible, standalone_web_search_enabled, namespaced, plain); called by 1 (add_extension_tools); 2 external calls (matches!, warn!).
 
@@ -703,11 +705,11 @@ fn multi_agent_v2_handler(
 ) -> Arc<dyn CoreToolRuntime>
 ```
 
-**Purpose**: Wraps a V2 multi-agent handler in an optional namespace override. This lets the planner expose V2 collaboration tools either directly or under a configured namespace without changing handler internals.
+**Purpose**: Optionally wraps a multi-agent v2 handler so it appears under a configured namespace. This lets deployments rename or group the v2 agent tools.
 
-**Data flow**: Takes a concrete `CoreToolRuntime` handler and an optional namespace string. If a namespace is provided, returns `Arc::new(MultiAgentV2NamespaceOverride { handler: Arc::new(handler), namespace: namespace.to_string() })`; otherwise returns `Arc::new(handler)`.
+**Data flow**: It receives a handler and an optional namespace. If a namespace is provided, it returns a wrapper that rewrites the tool name and spec; otherwise it returns the handler unchanged as a shared runtime.
 
-**Call relations**: Used by `add_collaboration_tools` when constructing the V2 collaboration tool set.
+**Call relations**: The collaboration planner uses this for every v2 multi-agent tool before applying the chosen exposure. The wrapper delegates actual execution back to the original handler.
 
 *Call graph*: called by 1 (add_collaboration_tools); 1 external calls (new).
 
@@ -718,11 +720,11 @@ fn multi_agent_v2_handler(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Rewrites the wrapped handler’s tool name into the configured namespace while preserving the original function name. This changes only the exposed name, not behavior.
+**Purpose**: Returns the wrapped multi-agent tool’s name with the configured namespace applied. This changes how the tool is identified to the model and registry.
 
-**Data flow**: Reads `self.namespace` and `self.handler.tool_name().name`, constructs `ToolName::namespaced(self.namespace.clone(), ...)`, and returns it.
+**Data flow**: It reads the configured namespace and the inner handler’s plain tool name, then produces a namespaced tool name using the same inner name.
 
-**Call relations**: Called by registry/spec-building code whenever the wrapped V2 handler’s tool name is needed.
+**Call relations**: The registry and duplicate-name checks call this through the tool-executor interface. It makes the wrapper look like a namespaced tool while preserving the underlying behavior.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -733,11 +735,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Wraps a function-style tool spec from the underlying handler into a namespace spec with the fixed multi-agent V2 namespace description. Non-function specs are passed through unchanged.
+**Purpose**: Returns the wrapped multi-agent tool’s model-facing description with the configured namespace applied. If the inner tool is a plain function, it is placed inside a namespace group.
 
-**Data flow**: Calls `self.handler.spec()`. If it is `ToolSpec::Function(tool)`, returns `ToolSpec::Namespace(ResponsesApiNamespace { name: self.namespace.clone(), description: MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string(), tools: vec![ResponsesApiNamespaceTool::Function(tool)] })`; otherwise returns the original spec.
+**Data flow**: It asks the inner handler for its spec. Function specs are wrapped into a namespace spec with the multi-agent description; non-function specs are returned as-is.
 
-**Call relations**: Used during model-visible spec construction for namespace-overridden V2 handlers.
+**Call relations**: The final visible-spec builder calls this through the runtime interface. Namespace merging may later combine this spec with other tools in the same namespace.
 
 *Call graph*: 2 external calls (Namespace, vec!).
 
@@ -748,11 +750,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> ToolExposure
 ```
 
-**Purpose**: Delegates exposure reporting to the wrapped handler. Namespace overriding does not change whether the tool is direct, deferred, hidden, or direct-model-only.
+**Purpose**: Reports the wrapped handler’s visibility setting. The wrapper does not change whether the tool is direct, hidden, or otherwise exposed.
 
-**Data flow**: Returns `self.handler.exposure()`.
+**Data flow**: It asks the inner handler for its exposure and returns that value unchanged.
 
-**Call relations**: Queried during planning and registry/spec construction just like any other runtime.
+**Call relations**: The final spec builder uses this value when deciding whether the namespaced v2 tool should be shown to the model.
 
 
 ##### `MultiAgentV2NamespaceOverride::supports_parallel_tool_calls`  (lines 993–995)
@@ -761,11 +763,11 @@ fn exposure(&self) -> ToolExposure
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Delegates parallel-call capability to the wrapped handler. The namespace wrapper is behaviorally transparent in this respect.
+**Purpose**: Reports whether the wrapped handler supports being called in parallel with other tools. The namespace wrapper does not alter that execution property.
 
-**Data flow**: Returns `self.handler.supports_parallel_tool_calls()`.
+**Data flow**: It forwards the question to the inner handler and returns the same boolean answer.
 
-**Call relations**: Used wherever the runtime system inspects tool concurrency support.
+**Call relations**: The tool registry can use this through the executor interface when deciding how tool calls may be scheduled.
 
 
 ##### `MultiAgentV2NamespaceOverride::search_info`  (lines 997–999)
@@ -774,11 +776,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Delegates deferred-search metadata to the wrapped handler. Namespace wrapping does not alter searchability metadata.
+**Purpose**: Returns search metadata for the wrapped handler, if the inner handler has any. Search metadata helps the tool-search tool describe deferred tools.
 
-**Data flow**: Returns `self.handler.search_info()`.
+**Data flow**: It asks the inner handler for optional search information and returns it unchanged.
 
-**Call relations**: Allows namespace-overridden handlers to participate in deferred-tool search planning if applicable.
+**Call relations**: The search-executor builder can call this while scanning deferred runtimes. The namespace wrapper does not invent new search information.
 
 
 ##### `MultiAgentV2NamespaceOverride::handle`  (lines 1001–1003)
@@ -787,11 +789,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Delegates actual tool invocation handling to the wrapped handler. The wrapper changes naming/spec exposure only.
+**Purpose**: Runs the wrapped tool call by delegating to the original multi-agent handler. The wrapper only changes naming and specification, not execution.
 
-**Data flow**: Takes a `ToolInvocation`, forwards it to `self.handler.handle(invocation)`, and returns the resulting future.
+**Data flow**: It receives a tool invocation and passes it straight to the inner handler. The returned future represents the eventual tool result.
 
-**Call relations**: Used at runtime when a namespaced V2 tool is invoked through the registry.
+**Call relations**: When the router dispatches a namespaced v2 multi-agent call, this method hands the work to the real handler that knows how to spawn, message, wait for, or list agents.
 
 
 ##### `MultiAgentV2NamespaceOverride::matches_kind`  (lines 1007–1009)
@@ -800,11 +802,11 @@ fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<
 fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool
 ```
 
-**Purpose**: Delegates payload-kind matching to the wrapped handler. Namespace wrapping does not affect dispatch matching logic.
+**Purpose**: Checks whether an incoming tool payload belongs to the wrapped handler’s kind of tool call. The namespace wrapper delegates the decision.
 
-**Data flow**: Forwards the provided `ToolPayload` reference to `self.handler.matches_kind(payload)` and returns the boolean result.
+**Data flow**: It receives a tool payload, asks the inner handler whether it matches, and returns that answer.
 
-**Call relations**: Used by dispatch/runtime matching through the `CoreToolRuntime` trait.
+**Call relations**: The registry uses this as part of routing or payload matching. The wrapper keeps compatibility with the inner handler’s existing matching logic.
 
 
 ##### `MultiAgentV2NamespaceOverride::create_diff_consumer`  (lines 1011–1015)
@@ -815,11 +817,11 @@ fn create_diff_consumer(
     ) -> Option<Box<dyn crate::tools::registry::ToolArgumentDiffConsumer>>
 ```
 
-**Purpose**: Delegates diff-consumer creation to the wrapped handler. The wrapper does not alter argument-diff behavior.
+**Purpose**: Creates an optional helper for consuming streaming argument differences, if the wrapped handler supports that. This is useful for tools that process tool-call arguments as they arrive.
 
-**Data flow**: Returns `self.handler.create_diff_consumer()`.
+**Data flow**: It asks the inner handler for a diff consumer and returns the same optional object.
 
-**Call relations**: Used by tooling that inspects or consumes argument diffs for tool calls.
+**Call relations**: The tool registry can call this through the core runtime interface. The namespace wrapper preserves the inner handler’s streaming behavior.
 
 
 ##### `compare_code_mode_tools`  (lines 1018–1030)
@@ -831,11 +833,11 @@ fn compare_code_mode_tools(
     namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescrip
 ```
 
-**Purpose**: Defines the stable ordering for code-mode tool definitions. Tools are sorted first by namespace name, then by underlying tool name, then by display name.
+**Purpose**: Defines a stable order for tools shown inside code mode. A predictable order makes generated prompts easier to read and test.
 
-**Data flow**: Reads two `ToolDefinition`s and the namespace-description map, derives optional namespace names via `code_mode_namespace_name`, compares those, then compares `left.tool_name.name` vs `right.tool_name.name`, then `left.name` vs `right.name`, and returns the resulting `Ordering`.
+**Data flow**: It receives two code-mode tool definitions and the namespace-description map. It compares namespace names first, then underlying tool names, then displayed names, and returns their ordering.
 
-**Call relations**: Used by `build_code_mode_executors` when sorting enabled code-mode tool definitions.
+**Call relations**: The code-mode builder uses this while sorting nested tool definitions before creating the code-mode tool spec.
 
 *Call graph*: calls 1 internal fn (code_mode_namespace_name).
 
@@ -849,24 +851,26 @@ fn code_mode_namespace_name(
 ) -> Option<&'a str>
 ```
 
-**Purpose**: Looks up the canonical namespace name for a code-mode tool definition using the namespace-description map. It returns `None` for non-namespaced tools or unknown namespaces.
+**Purpose**: Finds the display namespace name for a code-mode tool, if it belongs to a known namespace. This helps code-mode sorting group related tools.
 
-**Data flow**: Reads `tool.tool_name.namespace`, looks it up in `namespace_descriptions`, maps the found description to `name.as_str()`, and returns `Option<&str>`.
+**Data flow**: It reads the tool’s optional namespace and looks it up in the namespace-description map. It returns the namespace name when found, otherwise no value.
 
-**Call relations**: Called by `compare_code_mode_tools` as part of code-mode tool ordering.
+**Call relations**: The code-mode comparison helper calls this for each tool it sorts. It is a small lookup helper used only for ordering code-mode nested tools.
 
 *Call graph*: called by 1 (compare_code_mode_tools).
 
 
 ### `core/src/tools/hosted_spec.rs`
 
-`domain_logic` · `tool spec construction during model/tool setup`
+`domain_logic` · `tool setup before hosted model requests`
 
-This file is a small adapter between configuration types in `codex_protocol` and runtime tool specifications in `codex_tools`. It defines `WebSearchToolOptions<'a>`, a compact input bundle containing an optional `WebSearchMode`, an optional borrowed `WebSearchConfig`, and the desired `WebSearchToolType`. The constant `WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES` captures the only multi-modal content-type list this module emits: `"text"` and `"image"`.
+Hosted models can be given “tools,” meaning extra capabilities outside ordinary text generation. This file is a small translator for two of those tools: image generation and web search. Without it, the system would not have a clear, consistent way to describe these abilities to the model.
 
-`create_image_generation_tool` is straightforward: it wraps the caller-provided output format string into `ToolSpec::ImageGeneration`, cloning into an owned `String` because tool specs are owned values.
+For image generation, the file simply records the desired output format, such as a particular image file type, inside a tool specification.
 
-`create_web_search_tool` contains the real policy translation. It first maps `WebSearchMode` to `external_web_access`: `Cached` becomes `Some(false)`, `Live` becomes `Some(true)`, and both `Disabled` and missing mode short-circuit to `None` via `?`, meaning no web-search tool should be advertised at all. It then derives `search_content_types`: plain text search leaves the field unset, while `TextAndImage` materializes a `Vec<String>` from the constant array. Finally it constructs `ToolSpec::WebSearch`, copying optional nested config fields only when `web_search_config` exists. `filters` and `user_location` are cloned and converted with `Into`, while `search_context_size` is copied directly. The design intentionally distinguishes “tool absent” from “tool present with restrictive fields,” which matters to callers deciding whether hosted models may invoke search.
+For web search, it is more selective. It first looks at the configured search mode. If search is disabled or not set, it returns nothing, which means no web search tool should be offered. If search is cached, it allows search without live external web access. If search is live, it marks external web access as allowed. It then adds optional details from the web search configuration, such as filters, user location, and the amount of search context to request.
+
+It also supports two web search “shapes”: text-only search, or text plus image results. In the second case it explicitly says that both text and image content may be returned. In everyday terms, this file is like filling out an order form for the model’s allowed equipment: only the tools that are permitted, and only with the settings the user asked for.
 
 #### Function details
 
@@ -876,11 +880,11 @@ This file is a small adapter between configuration types in `codex_protocol` and
 fn create_image_generation_tool(output_format: &str) -> ToolSpec
 ```
 
-**Purpose**: Creates the hosted image-generation tool spec with the exact output format requested by the caller. It is the one-step conversion from a borrowed format string to an owned `ToolSpec::ImageGeneration`.
+**Purpose**: This function creates the description for an image generation tool. It is used when the system wants to let a hosted model produce images in a specific output format.
 
-**Data flow**: Reads `output_format: &str` → converts it to `String` with `to_string()` → returns `ToolSpec::ImageGeneration { output_format }`. It does not read or mutate any external state.
+**Data flow**: It receives an output format as text. It copies that format into a new `ToolSpec::ImageGeneration` value. The result is a ready-to-use tool description; it does not change any outside state.
 
-**Call relations**: This helper is used when hosted model tool specs are assembled and an image-generation capability should be included. It does not delegate further; its role in the flow is to produce the final enum variant directly for the caller.
+**Call relations**: When `hosted_model_tool_specs` is assembling the full set of tools for a hosted model, it calls this function for the image-generation case. This function returns the finished image tool description so that caller can include it with the model request.
 
 *Call graph*: called by 1 (hosted_model_tool_specs).
 
@@ -891,22 +895,26 @@ fn create_image_generation_tool(output_format: &str) -> ToolSpec
 fn create_web_search_tool(options: WebSearchToolOptions<'_>) -> Option<ToolSpec>
 ```
 
-**Purpose**: Builds an optional hosted web-search tool spec from mode, config, and tool-type inputs. It suppresses the tool entirely when search is disabled or unspecified, and otherwise preserves configured filters, user location, context size, and content-type capabilities.
+**Purpose**: This function creates the description for a web search tool, but only if web search is actually enabled. It also carries through the important limits and preferences, such as whether live web access is allowed and whether image results are allowed.
 
-**Data flow**: Consumes `WebSearchToolOptions` by value, reading `web_search_mode`, optional borrowed `web_search_config`, and `web_search_tool_type` → maps mode to a required `external_web_access` boolean, returning early with `None` for disabled/absent modes → maps tool type to either no `search_content_types` or a `Vec<String>` containing `"text"` and `"image"` → clones and converts optional `filters` and `user_location` from `WebSearchConfig`, copies `search_context_size`, and returns `Some(ToolSpec::WebSearch { ... })`.
+**Data flow**: It receives `WebSearchToolOptions`, which include the chosen search mode, optional detailed search settings, and whether the search tool should support text only or text plus images. It first turns the search mode into a simple yes/no choice for external web access; if search is disabled or missing, it stops and returns `None`. Otherwise, it gathers optional filters, location, context size, and content-type choices, then returns a `ToolSpec::WebSearch` containing those settings.
 
-**Call relations**: The hosted model tool-spec builder invokes this when deciding whether to expose web search. Inside the function, control flow is dominated by the early-return mode check; after that it delegates only to standard cloning/conversion of nested config fields so the caller receives a fully formed `ToolSpec` or no tool at all.
+**Call relations**: When `hosted_model_tool_specs` is deciding what tools to offer a hosted model, it calls this function for web search. If the configuration says search should not be available, this function hands back nothing; if search is allowed, it hands back the complete web search tool description for inclusion in the hosted model setup.
 
 *Call graph*: called by 1 (hosted_model_tool_specs).
 
 
 ### `core/src/tools/handlers/dynamic.rs`
 
-`io_transport` · `request handling`
+`orchestration` · `request handling`
 
-This file defines `DynamicToolHandler`, a runtime adapter for tools described by `codex_protocol::dynamic_tools`. Construction starts from a `DynamicToolFunctionSpec`, optionally paired with a `DynamicToolNamespaceSpec`, and produces both a canonical `ToolName` and a `ToolSpec`. Namespaced tools are exposed as `ToolSpec::Namespace(ResponsesApiNamespace)` containing a single `ResponsesApiNamespaceTool::Function`; non-namespaced tools become `ToolSpec::Function`. Namespace descriptions are normalized so blank descriptions fall back to `default_namespace_description`, and `tool.defer_loading` is translated into `ToolExposure::Deferred` versus `Direct`.
+Dynamic tools are tools that are not built into Codex ahead of time. They are provided by the current thread, so Codex needs a safe adapter that can describe them to the model and relay calls to whoever owns the tool. This file is that adapter.
 
-Execution only accepts `ToolPayload::Function`; any other payload becomes `FunctionCallError::RespondToModel`. The JSON argument string is parsed with the shared `parse_arguments` helper, then `request_dynamic_tool` performs the actual bridge to the outside world. That helper atomically locks `session.active_turn`, inserts a oneshot sender into the turn state's pending dynamic-tool map keyed by `call_id`, warns if an existing entry is overwritten, emits a `DynamicToolCallRequest` event, waits for the paired response, and always emits a matching `DynamicToolCallResponse` event recording completion time, duration, echoed arguments, and either returned content or a cancellation error. Returned `DynamicToolResponse.content_items` are converted into `FunctionCallOutputContentItem`s and wrapped as `FunctionToolOutput`, preserving the protocol `success` flag.
+The main type, DynamicToolHandler, stores three things: the tool’s name, the tool description shown to the model, and whether the tool is available immediately or loaded later. It can create handlers for a standalone tool or for a tool inside a namespace, which is like putting related tools in a named folder.
+
+When the model invokes a dynamic tool, the handler first checks that the call is a normal function-style tool call and parses the JSON arguments. It then calls request_dynamic_tool. That helper registers a one-time waiting slot for the response, sends a DynamicToolCallRequest event through the session, waits for a reply, and finally emits a matching response event for logging and timing. An everyday analogy is a receptionist: the handler writes down who is waiting, sends the request to the right room, waits for the answer, and records when the answer came back.
+
+If the call is cancelled before a response arrives, the handler reports that clearly instead of pretending the tool succeeded.
 
 #### Function details
 
@@ -916,11 +924,11 @@ Execution only accepts `ToolPayload::Function`; any other payload becomes `Funct
 fn new(tool: &DynamicToolFunctionSpec) -> Option<Self>
 ```
 
-**Purpose**: Builds a handler for a top-level dynamic function tool with no namespace wrapper. It is the simple constructor used when the dynamic tool spec is already standalone.
+**Purpose**: Creates a handler for a dynamic tool that is not inside a namespace. This is used when Codex is adding tools supplied by the current thread and needs to make one available to the model.
 
-**Data flow**: Reads a `&DynamicToolFunctionSpec` and forwards it with `None` namespace context into the shared constructor logic. Returns `Some(DynamicToolHandler)` when the tool can be converted into a responses API tool, otherwise `None` if conversion fails.
+**Data flow**: It receives a dynamic tool description. It passes that description along with no namespace information into the shared builder, then returns either a ready DynamicToolHandler or nothing if the tool description cannot be converted into the internal tool format.
 
-**Call relations**: It is invoked while dynamic tools are being added to the runtime from thread state. Rather than duplicating setup, it delegates all naming, spec creation, and exposure selection to `DynamicToolHandler::from_parts`.
+**Call relations**: During dynamic tool setup, add_dynamic_tools calls this for standalone tools. This function keeps that setup simple by handing the real construction work to DynamicToolHandler::from_parts.
 
 *Call graph*: called by 1 (add_dynamic_tools); 1 external calls (from_parts).
 
@@ -934,11 +942,11 @@ fn new_in_namespace(
     ) -> Option<Self>
 ```
 
-**Purpose**: Builds a handler for a dynamic function that should be exposed inside a namespace. It preserves namespace metadata while still producing a single executable handler instance.
+**Purpose**: Creates a handler for a dynamic tool that belongs to a named namespace. A namespace groups tools under a shared name, like a folder label, so the model can understand where the tool comes from.
 
-**Data flow**: Consumes references to a `DynamicToolNamespaceSpec` and `DynamicToolFunctionSpec`, passes both into the shared constructor path, and returns an optional handler. The namespace name and description become part of the resulting `ToolName` and `ToolSpec` if construction succeeds.
+**Data flow**: It receives both the namespace description and the tool description. It forwards both to the shared builder, which creates the correct named tool identity and model-facing specification, then returns the finished handler if conversion succeeds.
 
-**Call relations**: It is called during dynamic-tool registration when the source protocol groups tools under a namespace. Like the plain constructor, it funnels all real work into `DynamicToolHandler::from_parts`.
+**Call relations**: During dynamic tool setup, add_dynamic_tools calls this for tools that come packaged inside a namespace. It relies on DynamicToolHandler::from_parts so namespaced and non-namespaced tools are built consistently.
 
 *Call graph*: called by 1 (add_dynamic_tools); 1 external calls (from_parts).
 
@@ -952,11 +960,11 @@ fn from_parts(
     ) -> Option<Self>
 ```
 
-**Purpose**: Performs the actual translation from protocol dynamic-tool metadata into the core runtime representation. It computes the canonical tool name, converts the function schema, wraps it in a namespace when needed, and derives exposure mode from `defer_loading`.
+**Purpose**: Builds the actual DynamicToolHandler from a tool description and optional namespace. This is the central constructor that decides the tool’s name, its model-visible description, and whether it should be exposed immediately or deferred.
 
-**Data flow**: Reads the function spec and optional namespace spec, constructs a `ToolName` from namespace/name components, converts the function via `dynamic_tool_to_responses_api_tool`, and then builds either `ToolSpec::Function` or `ToolSpec::Namespace`. For namespaced tools it also normalizes blank namespace descriptions using `default_namespace_description`; finally it returns a populated `DynamicToolHandler` with `ToolExposure::Deferred` or `Direct`.
+**Data flow**: It takes the raw dynamic tool definition, and possibly a namespace definition. It creates a ToolName, converts the dynamic tool into the Responses API tool format used elsewhere, wraps it either as a standalone function or inside a namespace, fills in a default namespace description if needed, and sets the exposure mode from the tool’s defer_loading flag. If conversion fails, it returns nothing.
 
-**Call relations**: This is the common constructor behind both public constructors. It does not call into execution paths; its role is to prepare immutable metadata later surfaced by `tool_name`, `spec`, `search_info`, and `handle_call`.
+**Call relations**: DynamicToolHandler::new and DynamicToolHandler::new_in_namespace both route through this function. The rest of the handler methods later return the name, specification, and exposure values that this function prepared.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (default_namespace_description, dynamic_tool_to_responses_api_tool, Function, Namespace, vec!).
 
@@ -967,11 +975,11 @@ fn from_parts(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the handler's canonical `ToolName` for registry lookups and invocation routing.
+**Purpose**: Returns the stored name of this dynamic tool. Other parts of the tool system use this name to identify which tool the model is trying to call.
 
-**Data flow**: Reads `self.tool_name`, clones it, and returns the clone without mutating state.
+**Data flow**: It reads the handler’s stored ToolName and returns a copy of it. The handler itself is unchanged.
 
-**Call relations**: It is part of the `ToolExecutor` interface and is used by the registry and by downstream code that needs the exact dynamic tool identifier.
+**Call relations**: This is part of the ToolExecutor interface, meaning the broader tool registry can ask any tool handler what name it represents. For dynamic tools, the value was created earlier by DynamicToolHandler::from_parts.
 
 *Call graph*: 1 external calls (clone).
 
@@ -982,11 +990,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the immutable tool specification that should be advertised to the model and search system.
+**Purpose**: Returns the model-facing tool specification. This is the description and shape of the tool that tells the model what the tool is called and what arguments it accepts.
 
-**Data flow**: Reads `self.spec`, clones it, and returns the clone.
+**Data flow**: It reads the handler’s stored ToolSpec and returns a copy. Nothing else changes.
 
-**Call relations**: It is used directly by the runtime and indirectly by `DynamicToolHandler::search_info`, which needs a fresh `ToolSpec` to derive searchable metadata.
+**Call relations**: The tool system calls this through the ToolExecutor interface when it needs to present available tools. DynamicToolHandler::search_info also calls it to build searchable metadata for this tool.
 
 *Call graph*: called by 1 (search_info); 1 external calls (clone).
 
@@ -997,11 +1005,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> ToolExposure
 ```
 
-**Purpose**: Reports whether the dynamic tool should be exposed immediately or only through deferred loading.
+**Purpose**: Reports whether the dynamic tool should be shown directly or treated as deferred. Deferred means the tool exists but may be loaded or surfaced later instead of being immediately available.
 
-**Data flow**: Reads the stored `ToolExposure` enum from `self.exposure` and returns it by value.
+**Data flow**: It reads the exposure value saved in the handler and returns it. The handler is not modified.
 
-**Call relations**: This is consumed by the tool registry when deciding how the tool appears to the model; it does not delegate further.
+**Call relations**: This is another part of the ToolExecutor interface. The value comes from DynamicToolHandler::from_parts, which bases it on the dynamic tool’s defer_loading setting.
 
 
 ##### `DynamicToolHandler::search_info`  (lines 97–105)
@@ -1010,11 +1018,11 @@ fn exposure(&self) -> ToolExposure
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Builds search metadata so dynamic tools can participate in tool discovery with a labeled source. It tags them as coming from the current Codex thread.
+**Purpose**: Creates search metadata for this dynamic tool so it can be discovered or described as part of the current thread’s available tools. It labels the source as “Dynamic tools” and explains that they come from the current Codex thread.
 
-**Data flow**: Calls `self.spec()` to obtain the current `ToolSpec`, then feeds that plus a `ToolSearchSourceInfo { name: "Dynamic tools", description: Some("Tools provided by the current Codex thread.") }` into `ToolSearchInfo::from_tool_spec`. Returns the resulting optional search record.
+**Data flow**: It asks the handler for its ToolSpec, combines that with a source name and description, and returns optional ToolSearchInfo. If the specification cannot produce search information, the result is empty.
 
-**Call relations**: This method is reached when the runtime indexes tools for search. It depends on `spec` for the structural description and delegates the actual indexing logic to `ToolSearchInfo::from_tool_spec`.
+**Call relations**: The wider tool system calls this when building searchable tool listings. It uses DynamicToolHandler::spec rather than reading the stored field directly, keeping it aligned with the standard ToolExecutor behavior.
 
 *Call graph*: calls 2 internal fn (spec, from_tool_spec).
 
@@ -1025,11 +1033,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async execution method into the boxed future shape required by the `ToolExecutor` trait.
+**Purpose**: Starts execution of a dynamic tool call in the async tool system. It wraps the real work in a future, which is a promise that the result will be available later.
 
-**Data flow**: Takes ownership of a `ToolInvocation`, creates the future from `self.handle_call(invocation)`, pins it in a `Box`, and returns that executor future.
+**Data flow**: It receives a ToolInvocation containing the session, turn, call id, and payload. It passes that invocation to DynamicToolHandler::handle_call and returns a pinned future so the executor can await it safely.
 
-**Call relations**: The registry invokes this trait method when dispatching a tool call. It is only a thin wrapper around `DynamicToolHandler::handle_call`.
+**Call relations**: The tool runtime calls this when the model invokes the dynamic tool. This function is the standard ToolExecutor entry point and immediately delegates to DynamicToolHandler::handle_call for the actual request-and-response flow.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1043,11 +1051,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes one dynamic tool invocation by validating payload shape, parsing JSON arguments, waiting for the external dynamic-tool response, and converting that response into a standard function-tool output.
+**Purpose**: Performs one dynamic tool invocation from the model’s point of view. It validates the call, parses the arguments, sends the request to the dynamic tool provider, and turns the provider’s answer into normal tool output.
 
-**Data flow**: Destructures `ToolInvocation` to read `session`, `turn`, `call_id`, and `payload`. If `payload` is not `ToolPayload::Function`, it returns `FunctionCallError::RespondToModel`; otherwise it parses the argument string into `serde_json::Value` with `parse_arguments`, calls `request_dynamic_tool` with session/turn/call metadata and the cloned `ToolName`, then maps a missing response to a cancellation error. On success it converts `DynamicToolResponse { content_items, success }` into a `Vec<FunctionCallOutputContentItem>`, wraps it with `FunctionToolOutput::from_content`, boxes it, and returns it.
+**Data flow**: It receives a ToolInvocation. It extracts the session, turn context, call id, and payload. If the payload is not a function-style call, it returns an error message for the model. Otherwise it parses the argument string as JSON, calls request_dynamic_tool with the session details and tool name, waits for a DynamicToolResponse, converts returned content items into function-call output items, and returns boxed tool output with the success flag. If the response never arrives, it returns a clear cancellation error.
 
-**Call relations**: It is called exclusively by `handle`. Its central delegation is to `request_dynamic_tool`, which performs the event-based request/response exchange; after that it only performs output adaptation.
+**Call relations**: DynamicToolHandler::handle calls this whenever the model invokes the tool. This function then hands the cross-thread request work to request_dynamic_tool and packages that result back into the common output format used by the rest of the tool system.
 
 *Call graph*: calls 4 internal fn (from_content, boxed_tool_output, request_dynamic_tool, parse_arguments); called by 1 (handle); 2 external calls (clone, RespondToModel).
 
@@ -1064,22 +1072,24 @@ async fn request_dynamic_tool(
 ) -> Option<DynamicToolResponse>
 ```
 
-**Purpose**: Bridges a dynamic tool call through the session event stream and waits for the matching asynchronous response. It also emits a completion event whether the call succeeds or is cancelled.
+**Purpose**: Sends a dynamic tool call request through the active session and waits for the matching response. It also records a response event afterward, including timing and error information, so the conversation history has both sides of the tool call.
 
-**Data flow**: Accepts `&Session`, `&TurnContext`, `call_id`, `ToolName`, and parsed JSON `arguments`. It splits the tool name into `namespace` and `tool`, clones the turn id, creates a oneshot channel, then locks `session.active_turn` and the active turn's `turn_state` to register the sender under the `call_id`; if an entry already existed it logs a warning. It records start timestamps, emits `EventMsg::DynamicToolCallRequest` containing call id, turn id, namespace, tool, arguments, and `started_at_ms`, awaits the oneshot receiver, then emits `EventMsg::DynamicToolCallResponse` with completion timestamp, duration, echoed request fields, and either returned `content_items`/`success` or an error string with `success: false`. Finally it returns `Option<DynamicToolResponse>` from the receiver outcome.
+**Data flow**: It receives the session, turn context, call id, tool name, and parsed JSON arguments. It splits the tool name into namespace and tool parts, creates a one-time response channel, registers that channel in the active turn state under the call id, sends a DynamicToolCallRequest event, and waits for the response channel to receive a DynamicToolResponse. Then it sends a DynamicToolCallResponse event: either with returned content and success status, or with an error message if the waiting channel was cancelled. It returns the response if one arrived, or nothing if it did not.
 
-**Call relations**: This helper is invoked by `DynamicToolHandler::handle_call` after argument parsing. It is the transport boundary between core execution and whatever component fulfills pending dynamic tool calls by resolving the registered oneshot sender.
+**Call relations**: DynamicToolHandler::handle_call calls this after parsing the model’s arguments. The session’s event system carries the request to the outside dynamic tool provider, and some other part of the active turn later uses the registered pending call id to deliver the response back through the one-time channel.
 
 *Call graph*: calls 1 internal fn (now_unix_timestamp_ms); called by 1 (handle_call); 8 external calls (now, clone, new, send_event, channel, DynamicToolCallRequest, DynamicToolCallResponse, warn!).
 
 
 ### `tools/src/dynamic_tool.rs`
 
-`domain_logic` · `tool definition ingestion`
+`domain_logic` · `tool loading`
 
-This file contains a single translation function that bridges `codex_protocol::dynamic_tools::DynamicToolFunctionSpec` into the local `ToolDefinition` type used elsewhere in the tools subsystem. Its work is intentionally minimal and explicit: it clones the external tool’s `name` and `description`, preserves the `defer_loading` flag unchanged, and derives the internal `input_schema` by passing `tool.input_schema` into `parse_tool_input_schema`. That schema conversion is the only fallible step, so the function returns `Result<ToolDefinition, serde_json::Error>` and uses `?` to propagate any parsing failure directly to its caller without adding wrapping context.
+Dynamic tools are tools whose details are not hard-coded ahead of time. Instead, another part of the system provides a description of the tool: its name, what it does, what input shape it expects, and whether it should be loaded later instead of right away. This file takes that outside-facing description and converts it into a `ToolDefinition`, which is the internal record used by the tools subsystem.
 
-A notable design choice is that `output_schema` is always set to `None` here, which means dynamic tool specs handled by this adapter currently contribute only input-shape information to the internal model. The function performs no validation beyond whatever `parse_tool_input_schema` enforces, and it does not mutate global state or cache results; it is a pure data-mapping step from borrowed input to an owned internal struct. The file also conditionally includes a dedicated test module from `dynamic_tool_tests.rs`, keeping the implementation itself compact while still supporting focused verification of this conversion behavior.
+The main job here is careful translation. Most fields are copied across directly, such as the tool name and description. The input schema needs extra work: a schema is a machine-readable description of what inputs are allowed, like a form template that says which fields exist and what kind of values they accept. This file delegates that conversion to `parse_tool_input_schema`, so invalid schema data can be rejected cleanly. If that parsing fails, the error is returned to the caller instead of creating a broken tool definition.
+
+One notable detail is that dynamic tools created here do not get an output schema; `output_schema` is always set to `None`. In other words, this conversion currently records what the tool accepts as input, but not a formal description of what it returns.
 
 #### Function details
 
@@ -1091,20 +1101,24 @@ fn parse_dynamic_tool(
 ) -> Result<ToolDefinition, serde_json::Error>
 ```
 
-**Purpose**: Builds a `ToolDefinition` from a borrowed `DynamicToolFunctionSpec`, translating protocol fields into the crate’s internal tool metadata shape. It also parses the external input schema into the internal schema representation and fails if that conversion is invalid JSON/schema data.
+**Purpose**: Converts a protocol-level dynamic tool description into the internal `ToolDefinition` used by the tools system. Someone would use this when a tool is discovered or supplied at runtime and needs to be made usable by the rest of the project.
 
-**Data flow**: Input is `&DynamicToolFunctionSpec`. The function reads `tool.name`, `tool.description`, `tool.input_schema`, and `tool.defer_loading`; clones the string fields into owned values; sends `&tool.input_schema` to `parse_tool_input_schema`; then assembles and returns a new `ToolDefinition` with `output_schema: None`. On schema parse failure it returns the propagated `serde_json::Error`; it writes no external state.
+**Data flow**: It receives a `DynamicToolFunctionSpec`, which contains the tool’s public details. It copies the name and description, parses the input schema into the internal expected format, leaves the output schema empty, and preserves the deferred-loading flag. If the input schema cannot be parsed, it returns a JSON parsing error instead of a tool definition.
 
-**Call relations**: This function is invoked when the system needs to ingest a dynamic tool definition from the protocol layer into the internal tools model. In that flow it delegates the only nontrivial transformation—the input schema conversion—to `parse_tool_input_schema`, relying on that helper for validation and normalization before completing the `ToolDefinition` construction.
+**Call relations**: When dynamic tool information needs to become a real internal tool definition, this function is the conversion point. During that conversion it calls `parse_tool_input_schema` to do the specialized work of understanding the tool’s input schema, then wraps the parsed result together with the other copied fields.
 
 *Call graph*: 1 external calls (parse_tool_input_schema).
 
 
 ### `tools/src/tool_search.rs`
 
-`domain_logic` · `tool registration and discovery indexing`
+`domain_logic` · `tool loading and search indexing`
 
-This file contains the logic that turns a `ToolSpec` into `ToolSearchInfo`, the structure used to register deferred tools for later discovery. `ToolSearchEntry` pairs a generated `search_text` string with a `LoadableToolSpec`, and `ToolSearchInfo` optionally adds `ToolSearchSourceInfo` describing where the tool came from. `from_tool_spec` is the convenience entry point: it derives default search text from the spec and then delegates to `from_spec`. `from_spec` performs the important deferred-spec transformation. Function tools are rewritten with `defer_loading = Some(true)` and `output_schema = None`; namespace tools get the same treatment for every contained function, and if the namespace description is blank it is replaced with `default_namespace_description(&namespace.name)`. Tool kinds that are not meant to participate in deferred search (`ToolSearch`, `ImageGeneration`, `WebSearch`, `Freeform`) return `None`. Search text generation is recursive and concrete: function names are indexed both as-is and with underscores replaced by spaces, descriptions are included, and parameter schemas are traversed through descriptions, property names, nested properties, array items, and `any_of` variants. `push_search_part` trims and drops empty fragments so the final joined string is dense, stable, and free of duplicate whitespace.
+This file is about making tools discoverable. A tool may be a single function, or it may be a namespace, which is a named group of related functions. To search those tools well, the system needs a plain text summary containing the words a user or model might look for. This file builds that summary from visible metadata: tool names, descriptions, parameter names, and parameter descriptions.
+
+It also changes the tool definition before storing it as a search result. For function tools, it marks them for deferred loading, meaning the full details can be fetched only if needed, like keeping a catalog card instead of carrying the whole manual. It removes output schemas from these lightweight entries, which keeps search results smaller. For namespaces, it does the same for every function inside the namespace, and fills in a default namespace description if the original one is blank.
+
+Not every tool type is suitable as a searchable, loadable tool entry here. Built-in search tools, image generation tools, web search tools, and freeform tools can contribute text for matching in some cases, but this file does not turn them into `ToolSearchInfo` outputs. The result is a compact search record: text to search against, the trimmed-down tool to return if matched, and optional information about where the tool came from.
 
 #### Function details
 
@@ -1117,11 +1131,11 @@ fn from_tool_spec(
     ) -> Option<Self>
 ```
 
-**Purpose**: Creates searchable metadata from a `ToolSpec` using automatically derived search text. It is the high-level entry point used by default executor search behavior.
+**Purpose**: This is the convenient entry point for turning a normal tool definition into a searchable tool record. It first creates the default search text from the tool's visible metadata, then asks the lower-level builder to package the tool for search.
 
-**Data flow**: It takes ownership of a `ToolSpec` and optional `ToolSearchSourceInfo`, computes `search_text` by calling `default_tool_search_text(&spec)`, then passes that text, the original spec, and the source info into `Self::from_spec`. It returns the resulting `Option<ToolSearchInfo>`.
+**Data flow**: It receives a `ToolSpec`, which is the system's description of a tool, plus optional source information saying where that tool came from. It reads the tool's names, descriptions, and schema text to make one search string, then passes that string and the original tool into `ToolSearchInfo::from_spec`. The result is either a finished `ToolSearchInfo` or nothing if this kind of tool should not become a loadable search entry.
 
-**Call relations**: This function is called by default `ToolExecutor::search_info` implementations and by tests that validate the generated search corpus.
+**Call relations**: Higher-level code such as `search_info` calls this when it has a tool definition and wants the usual search text generated automatically. It relies on `default_tool_search_text` to gather searchable words, then hands off to `ToolSearchInfo::from_spec` to do the actual packaging and filtering.
 
 *Call graph*: calls 1 internal fn (default_tool_search_text); called by 3 (search_info, search_info, default_search_text_uses_model_visible_namespace_metadata_once); 1 external calls (from_spec).
 
@@ -1136,11 +1150,11 @@ fn from_spec(
     ) -> Option<Self>
 ```
 
-**Purpose**: Builds a `ToolSearchInfo` from explicit search text plus a tool spec, rewriting eligible specs into deferred-loadable form. It rejects tool kinds that should not be indexed as deferred tools.
+**Purpose**: This builds a searchable tool record when the caller already has the search text. It also trims and adjusts the tool definition so it is safe and lightweight to return from search.
 
-**Data flow**: It takes a `search_text` string, a `ToolSpec`, and optional source info. For `ToolSpec::Function`, it mutates the owned tool spec to set `defer_loading = Some(true)` and `output_schema = None`, then wraps it in `LoadableToolSpec::Function`; for `ToolSpec::Namespace`, it fills an empty description with `default_namespace_description(&namespace.name)`, iterates through each contained `ResponsesApiNamespaceTool::Function`, and sets each function's `defer_loading` and `output_schema` similarly before wrapping in `LoadableToolSpec::Namespace`. For `ToolSearch`, `ImageGeneration`, `WebSearch`, and `Freeform`, it returns `None`. Otherwise it returns `Some(ToolSearchInfo { entry: ToolSearchEntry { search_text, output }, source_info })`.
+**Data flow**: It receives search text, a tool definition, and optional source information. If the tool is a single function, it marks that function for deferred loading and removes its output schema. If the tool is a namespace, it fills in a default description when needed, then marks each function inside for deferred loading and removes each output schema. It returns a `ToolSearchInfo` containing the search text, the prepared tool output, and the source information. If the input is a tool type this file does not package for deferred loading, it returns nothing.
 
-**Call relations**: This is the core transformation used by `from_tool_spec` and by callers that already have custom search text but still need the canonical deferred spec rewrite.
+**Call relations**: `ToolSearchInfo::from_tool_spec` calls this after generating default text, while other code such as `multi_agent_tool_search_info` can call it directly when it wants to provide custom search text. Inside, it uses the project’s default namespace description helper when a namespace has no useful description, then wraps the prepared result as either a function or namespace loadable tool.
 
 *Call graph*: called by 2 (search_info, multi_agent_tool_search_info); 3 external calls (default_namespace_description, Function, Namespace).
 
@@ -1151,11 +1165,11 @@ fn from_spec(
 fn default_tool_search_text(spec: &ToolSpec) -> String
 ```
 
-**Purpose**: Derives the default free-text search corpus for a tool spec by concatenating names, descriptions, and schema metadata. The exact fields included depend on the `ToolSpec` variant.
+**Purpose**: This creates the default text used to match a search query against a tool. It collects the words that best describe the tool, such as names, descriptions, parameter names, and parameter descriptions.
 
-**Data flow**: It creates a mutable `Vec<String>` accumulator, matches on the borrowed `ToolSpec`, and appends relevant fragments: function tools delegate to `append_function_search_text`; namespaces add namespace name and description and then each contained function's search text; tool-search specs add only their description; image-generation and web-search specs add fixed phrases; freeform tools add name, description, and syntax. It joins the accumulated parts with spaces and returns the resulting `String`.
+**Data flow**: It receives a tool definition and starts with an empty list of text pieces. For a function, it asks `append_function_search_text` to add function-specific words. For a namespace, it adds the namespace name and description, then adds text for every function in the namespace. For special tool types, it adds the most relevant description or fixed phrase, such as "web search" or "image generation". Empty pieces are ignored, and the remaining pieces are joined into one space-separated string.
 
-**Call relations**: This helper is called by `ToolSearchInfo::from_tool_spec` to generate search text automatically before deferred-spec conversion.
+**Call relations**: `ToolSearchInfo::from_tool_spec` calls this when no custom search text was supplied. It coordinates the smaller helpers: `push_search_part` keeps the text clean, and `append_function_search_text` digs into function details.
 
 *Call graph*: calls 2 internal fn (append_function_search_text, push_search_part); called by 1 (from_tool_spec); 1 external calls (new).
 
@@ -1166,11 +1180,11 @@ fn default_tool_search_text(spec: &ToolSpec) -> String
 fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>)
 ```
 
-**Purpose**: Adds a function tool's searchable fragments to an existing parts vector. It indexes both machine-oriented and humanized forms of the function name plus description and parameter schema text.
+**Purpose**: This adds the searchable words for one function-style tool. It includes both the exact function name and a more human-looking version where underscores become spaces, so a name like `get_weather` can match words like "get weather."
 
-**Data flow**: It borrows a `ResponsesApiTool` and a mutable `Vec<String>`, pushes `tool.name`, a version of the name with underscores replaced by spaces, and `tool.description`, then delegates to `append_schema_search_text(&tool.parameters, parts)` to recursively include schema metadata. It returns no value and mutates only the provided vector.
+**Data flow**: It receives a function tool and a growing list of text pieces. It adds the function name, the underscore-separated name converted into normal words, and the function description. Then it looks through the function's parameter schema, which describes the inputs the function accepts, and adds searchable text from there too. It changes the provided list in place and does not return a separate value.
 
-**Call relations**: This helper is used by `default_tool_search_text` for both standalone function specs and functions nested inside namespaces.
+**Call relations**: `default_tool_search_text` calls this for standalone functions and for each function inside a namespace. This helper then delegates schema details to `append_schema_search_text`, while using `push_search_part` to avoid adding blank text.
 
 *Call graph*: calls 2 internal fn (append_schema_search_text, push_search_part); called by 1 (default_tool_search_text).
 
@@ -1181,11 +1195,11 @@ fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>)
 fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>)
 ```
 
-**Purpose**: Recursively extracts searchable text from a JSON schema tree. It includes schema descriptions, property names, nested property schemas, array item schemas, and `any_of` variants.
+**Purpose**: This pulls searchable words out of a JSON schema, which is a structured description of what input data a tool accepts. This helps searches match not only a tool's title, but also the names and descriptions of its input fields.
 
-**Data flow**: It borrows a `JsonSchema` and mutable parts vector. If `schema.description` exists, it pushes that text; if `schema.properties` exists, it iterates each `(name, schema)` pair, pushes the property name, and recurses into the property's schema; if `schema.items` exists, it recurses into the item schema; if `schema.any_of` exists, it recurses into each variant. It mutates only the provided vector and returns no value.
+**Data flow**: It receives a schema and the shared list of text pieces. It adds the schema's description if present. If the schema has named properties, it adds each property name and then examines that property's schema too. If the schema describes array items, it examines the item schema. If the schema offers several allowed shapes through `any_of`, it examines each variant. The result is a fuller list of search words built by walking through nested input descriptions.
 
-**Call relations**: This recursive helper is called from `append_function_search_text` to ensure parameter schemas contribute meaningful search terms.
+**Call relations**: `append_function_search_text` calls this when it reaches a function's parameters. The function is recursive, meaning it calls the same kind of logic on nested schemas so deeply nested input fields are still searchable. It uses `push_search_part` whenever it finds a possible text fragment.
 
 *Call graph*: calls 1 internal fn (push_search_part); called by 1 (append_function_search_text).
 
@@ -1196,24 +1210,26 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>)
 fn push_search_part(parts: &mut Vec<String>, part: String)
 ```
 
-**Purpose**: Adds a candidate search fragment to the accumulator only if it contains non-whitespace content. It centralizes trimming and empty-string suppression.
+**Purpose**: This small helper adds one piece of text to the search-text list only if it contains real content. It prevents stray spaces and blank descriptions from polluting the final search string.
 
-**Data flow**: It takes a mutable `Vec<String>` and an owned `String`, trims the string to `&str`, and if the trimmed text is non-empty pushes a newly allocated `String` copy into the vector. It returns no value.
+**Data flow**: It receives the growing list of search text pieces and one candidate string. It trims whitespace from the candidate, checks whether anything is left, and appends the cleaned text only when it is not empty. It updates the list in place and returns no value.
 
-**Call relations**: All search-text builders delegate here so whitespace normalization and empty-part filtering are applied consistently across names, descriptions, and schema fragments.
+**Call relations**: `default_tool_search_text`, `append_function_search_text`, and `append_schema_search_text` all use this whenever they want to add a possible search phrase. It acts like a small quality gate so the rest of the file can collect text freely without worrying about blank values.
 
 *Call graph*: called by 3 (append_function_search_text, append_schema_search_text, default_tool_search_text).
 
 
 ### `core/src/tools/handlers/extension_tools.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `tool invocation and turn event publication`
 
-The production code centers on `ExtensionToolAdapter`, a thin wrapper around `Arc<dyn codex_tools::ToolExecutor<codex_tools::ToolCall>>`. Most trait methods simply forward metadata such as `tool_name`, `spec`, exposure, parallel-call support, and search info to the underlying extension executor. The important translation happens in `handle`, which converts a core `ToolInvocation` into an extension `ToolCall` via `to_extension_call` before delegating execution.
+Extensions live outside the core system, but the core tool registry expects tools to follow its own shape. This file is the adapter between those two worlds. It is like a travel plug: the extension tool keeps its own interface, while the core sees something it knows how to call.
 
-`to_extension_call` snapshots conversation history from `session.clone_history().await.into_raw_items()`, copies turn identifiers and model/truncation settings, and builds a `Vec<ToolEnvironment>` from the turn's environments. For each environment it resolves a native absolute cwd, skips non-native paths, computes additional sandbox permissions with `apply_granted_turn_permissions`, and derives a `file_system_sandbox_context` from the turn. It also installs a `CoreTurnItemEmitter` built from weak references to the session and turn so extensions can emit progress items without extending their lifetimes.
+The main wrapper is `ExtensionToolAdapter`. Most of its methods simply ask the wrapped extension executor for its name, specification, visibility, and search metadata. The important step happens when a tool is actually run. The adapter turns a core `ToolInvocation` into an extension-facing `ToolCall`. That new call includes the turn id, call id, model name, tool payload, conversation history, and the available working environments.
 
-`CoreTurnItemEmitter` converts `ExtensionTurnItem` into protocol `TurnItem`s. `emit_started` publishes the item immediately if both weak refs still upgrade. `emit_completed` first runs `finalize_turn_item` with `TurnItemContributorPolicy::Run(turn.extension_data.as_ref())` and plan-mode awareness, then emits the completed item. `extension_turn_item` intentionally clears `saved_path` on image-generation items so core finalization owns artifact publication. The tests exercise hook payload generation, weak-reference scoping, history/environment transfer, contributor execution, and image artifact finalization.
+While building the environment list, the file also applies any sandbox permissions granted for this turn. A sandbox is a safety boundary around file access. This matters because extensions need enough context to work, but they should not silently receive broader file access than the core intended.
+
+The file also defines `CoreTurnItemEmitter`, which extensions use to announce started and completed turn items. Completed items are finalized by core before publication, so image outputs can be saved in the expected place and extension contributors can add their data. Tests verify the adapter, event emission, permission-scoped environment data, and image finalization behavior.
 
 #### Function details
 
@@ -1223,11 +1239,11 @@ The production code centers on `ExtensionToolAdapter`, a thin wrapper around `Ar
 fn new(executor: Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>) -> Self
 ```
 
-**Purpose**: Wraps an extension executor trait object so it can be registered as a core runtime tool.
+**Purpose**: Creates a core-facing wrapper around an extension-provided tool executor. This is used when extension tools are added to the core tool registry.
 
-**Data flow**: Takes an `Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>`, stores it as the tuple field of `ExtensionToolAdapter`, and returns the adapter.
+**Data flow**: It receives a shared pointer to an extension executor. It stores that executor inside `ExtensionToolAdapter`, so later core code can call it through the normal core tool interface. The result is the adapter object.
 
-**Call relations**: It is used both in production registration code and in tests that exercise the adapter behavior. After construction, all runtime calls flow through the adapter's `ToolExecutor<ToolInvocation>` implementation.
+**Call relations**: It is used by tests that build sample extension tools, and by `append_extension_tool_executors` when real extension executors are attached to the core registry.
 
 *Call graph*: called by 4 (exposes_generic_hook_payloads, image_generation_publication_is_finalized_by_core, passes_turn_fields_and_scoped_turn_item_emitter_to_extension_call, append_extension_tool_executors).
 
@@ -1238,11 +1254,11 @@ fn new(executor: Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Forwards the extension executor's canonical tool name into the core runtime.
+**Purpose**: Returns the tool name that the wrapped extension executor declares. The core uses this name to identify which tool is being called.
 
-**Data flow**: Reads the wrapped executor from `self.0`, calls its `tool_name`, and returns that `ToolName`.
+**Data flow**: It reads no new data of its own. It asks the stored extension executor for its tool name and returns that value unchanged.
 
-**Call relations**: This is part of the metadata surface consumed by the registry; it does not transform the value.
+**Call relations**: No direct caller is shown in the graph, because this is part of the shared tool executor interface. In practice, the tool registry asks for this when cataloging or matching tools.
 
 
 ##### `ExtensionToolAdapter::spec`  (lines 39–41)
@@ -1251,11 +1267,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Forwards the extension executor's advertised tool specification.
+**Purpose**: Returns the public description of the extension tool, including its expected input shape. The model and the core use this specification to know how the tool can be called.
 
-**Data flow**: Calls `self.0.spec()` and returns the resulting `ToolSpec`.
+**Data flow**: It asks the wrapped extension executor for its specification and passes the answer back without changing it.
 
-**Call relations**: The registry and model-facing tool listing use this method directly; the adapter adds no extra wrapping here.
+**Call relations**: No direct caller is shown in the graph, but this method is part of the tool executor contract used when the core exposes tools.
 
 
 ##### `ExtensionToolAdapter::exposure`  (lines 43–45)
@@ -1264,11 +1280,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> crate::tools::registry::ToolExposure
 ```
 
-**Purpose**: Reports the extension tool's exposure mode exactly as declared by the wrapped executor.
+**Purpose**: Reports how the extension tool should be exposed to the rest of the system. This helps decide whether and how the tool is available for use.
 
-**Data flow**: Calls `self.0.exposure()` and returns the resulting core `ToolExposure`.
+**Data flow**: It reads the exposure setting from the wrapped extension executor and returns it unchanged.
 
-**Call relations**: This is a straight pass-through used during tool registration and advertisement.
+**Call relations**: No direct caller is shown in the graph. It exists so the core registry can treat extension tools like any other registered tool.
 
 
 ##### `ExtensionToolAdapter::supports_parallel_tool_calls`  (lines 47–49)
@@ -1277,11 +1293,11 @@ fn exposure(&self) -> crate::tools::registry::ToolExposure
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Preserves the extension executor's declaration about whether concurrent calls are safe.
+**Purpose**: Says whether this extension tool can safely run at the same time as other tool calls. This prevents unsafe parallel work when a tool is not designed for it.
 
-**Data flow**: Calls `self.0.supports_parallel_tool_calls()` and returns the boolean result.
+**Data flow**: It asks the wrapped extension executor whether parallel calls are supported and returns that boolean answer.
 
-**Call relations**: The scheduler consults this through the adapter when deciding whether multiple invocations may run at once.
+**Call relations**: No direct caller is shown in the graph. It is part of the executor interface that the core runtime can consult before scheduling tool work.
 
 
 ##### `ExtensionToolAdapter::search_info`  (lines 51–53)
@@ -1290,11 +1306,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn search_info(&self) -> Option<ToolSearchInfo>
 ```
 
-**Purpose**: Exposes any extension-provided search metadata without modification.
+**Purpose**: Returns optional search-related metadata for the extension tool. This lets tools that can be discovered or used through search describe that capability.
 
-**Data flow**: Calls `self.0.search_info()` and returns the optional `ToolSearchInfo`.
+**Data flow**: It requests search information from the wrapped extension executor. If the executor has none, the result is empty; otherwise the metadata is returned unchanged.
 
-**Call relations**: This lets extension tools participate in tool search using their own metadata generation.
+**Call relations**: No direct caller is shown in the graph. It is a passthrough hook for core registry and discovery behavior.
 
 
 ##### `ExtensionToolAdapter::handle`  (lines 55–57)
@@ -1303,11 +1319,11 @@ fn search_info(&self) -> Option<ToolSearchInfo>
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Converts a core invocation into an extension call object and then runs the wrapped extension executor.
+**Purpose**: Runs an extension tool from a core tool invocation. This is the main bridge from core execution into extension execution.
 
-**Data flow**: Accepts a `ToolInvocation`, asynchronously awaits `to_extension_call(&invocation)` to build a `codex_tools::ToolCall`, passes that into `self.0.handle(...)`, awaits the extension result, and returns the boxed future.
+**Data flow**: It receives a `ToolInvocation` from the core. It first converts that invocation into an extension `ToolCall` with `to_extension_call`, then gives that call to the wrapped extension executor. The result is the extension tool's output or error.
 
-**Call relations**: This is the adapter's main execution entrypoint. It is invoked by the core registry and delegates first to `to_extension_call` for shape conversion, then to the extension executor for actual tool logic.
+**Call relations**: When the core asks the adapter to run a tool, this method calls `to_extension_call` to translate the request, then hands the translated call to the extension executor.
 
 *Call graph*: calls 1 internal fn (to_extension_call); 1 external calls (pin).
 
@@ -1318,11 +1334,11 @@ fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Restricts this adapter to function-style payloads only.
+**Purpose**: Checks whether this adapter should accept a given tool payload. Extension tools here are only matched to normal function-style tool calls.
 
-**Data flow**: Reads a `&ToolPayload` and returns `true` only when it matches `ToolPayload::Function { .. }`.
+**Data flow**: It receives a core `ToolPayload`. It checks whether the payload is the `Function` variant and returns true only in that case.
 
-**Call relations**: This `CoreToolRuntime` hook is consulted before execution so non-function payloads are not routed to extension executors.
+**Call relations**: This is part of the `CoreToolRuntime` interface. The graph shows it using a match check; registry code can use it to avoid sending unsupported payload kinds to extension tools.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1333,11 +1349,11 @@ fn matches_kind(&self, payload: &ToolPayload) -> bool
 fn extension_turn_item(item: ExtensionTurnItem) -> TurnItem
 ```
 
-**Purpose**: Maps extension-emitted turn items into protocol `TurnItem`s, with one core-specific normalization for image generation.
+**Purpose**: Converts an extension turn item into the core protocol's turn item format. It also prevents extensions from directly claiming a saved image path.
 
-**Data flow**: Consumes an `ExtensionTurnItem`; `WebSearch` is wrapped directly as `TurnItem::WebSearch`, while `ImageGeneration` is converted after mutating `saved_path` to `None`. Returns the resulting `TurnItem`.
+**Data flow**: It receives an `ExtensionTurnItem`. Web search items are wrapped as core web search items. Image generation items are wrapped too, but their `saved_path` is cleared first so the core can decide where saved image artifacts belong.
 
-**Call relations**: Both `CoreTurnItemEmitter::emit_started` and `CoreTurnItemEmitter::emit_completed` call this helper before publishing items. Clearing `saved_path` ensures core finalization, not the extension, determines the public artifact path.
+**Call relations**: Both `CoreTurnItemEmitter::emit_started` and `CoreTurnItemEmitter::emit_completed` call this before publishing extension-created turn items through the core session.
 
 *Call graph*: called by 2 (emit_completed, emit_started); 2 external calls (ImageGeneration, WebSearch).
 
@@ -1348,11 +1364,11 @@ fn extension_turn_item(item: ExtensionTurnItem) -> TurnItem
 fn emit_started(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'a>
 ```
 
-**Purpose**: Publishes an extension-generated start event into the session if the originating session and turn still exist.
+**Purpose**: Publishes a 'this item has started' event from an extension tool into the core session. This lets users see progress such as a web search beginning.
 
-**Data flow**: Takes an `ExtensionTurnItem`, upgrades `Weak<Session>` and `Weak<TurnContext>`; if either upgrade fails it returns early. Otherwise it converts the item with `extension_turn_item` and awaits `session.emit_turn_item_started(turn.as_ref(), &item)`.
+**Data flow**: It receives an extension turn item. It tries to upgrade weak references to the live session and turn; if either has already gone away, it does nothing. Otherwise it converts the item to a core turn item and asks the session to emit the started event.
 
-**Call relations**: Extensions call this through the `TurnItemEmitter` trait embedded in their `ToolCall`. It is the lightweight start-side counterpart to `emit_completed` and intentionally does no finalization.
+**Call relations**: Extension tools call this through the `TurnItemEmitter` they receive in their tool call. It uses `extension_turn_item` before handing the event to the session.
 
 *Call graph*: calls 1 internal fn (extension_turn_item); 2 external calls (pin, upgrade).
 
@@ -1363,11 +1379,11 @@ fn emit_started(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'a>
 fn emit_completed(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'a>
 ```
 
-**Purpose**: Publishes a completed extension turn item after running core-side finalization and contributor hooks.
+**Purpose**: Publishes a 'this item has completed' event from an extension tool, after core has had a chance to finish and normalize the item. This is important for things like saving generated images and running extension contributors.
 
-**Data flow**: Accepts an `ExtensionTurnItem`, upgrades weak session/turn references and returns early if either is gone. It converts the item with `extension_turn_item`, then calls `finalize_turn_item(session, turn, TurnItemContributorPolicy::Run(turn.extension_data.as_ref()), &mut item, turn.collaboration_mode.mode == ModeKind::Plan)` to apply contributor mutations and plan-mode adjustments, and finally emits the finalized item with `session.emit_turn_item_completed`.
+**Data flow**: It receives an extension turn item and upgrades weak session and turn references. If the session or turn is gone, it exits quietly. Otherwise it converts the item, finalizes it with core rules and extension contributor data, then emits the completed item through the session.
 
-**Call relations**: Extensions invoke this when a turn item finishes. It delegates to `finalize_turn_item` specifically so core retains control over contributor execution and artifact publication before the completed event is sent.
+**Call relations**: Extension tools call this through their emitter. It calls `extension_turn_item` for conversion and `finalize_turn_item` before publication, using the turn's extension data through the `Run` contributor policy.
 
 *Call graph*: calls 2 internal fn (finalize_turn_item, extension_turn_item); 3 external calls (pin, upgrade, Run).
 
@@ -1378,11 +1394,11 @@ fn emit_completed(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'
 async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall
 ```
 
-**Purpose**: Builds the extension-facing `ToolCall` object from a core invocation, including history, environments, sandbox context, and a scoped turn-item emitter.
+**Purpose**: Builds the extension-facing call object from the core's tool invocation. This is where the extension receives the context it needs without bypassing core safety rules.
 
-**Data flow**: Reads the `ToolInvocation` by reference. It clones conversation history from `invocation.session.clone_history().await.into_raw_items()` into `ConversationHistory`, allocates an environments vector sized to the turn's environment count, and for each turn environment tries to resolve an absolute native cwd; environments with non-native cwd are skipped. For each retained environment it awaits `apply_granted_turn_permissions(...)` to compute additional permissions, derives `file_system_sandbox_context` from the turn, and pushes a `ToolEnvironment` containing environment id, cwd, filesystem handle, and sandbox context. It then returns `ExtensionToolCall` populated with turn id, call id, tool name, model slug, truncation policy, cloned payload, the built history and environments, and an `Arc<CoreTurnItemEmitter>` holding downgraded session/turn refs.
+**Data flow**: It reads the invocation's session history, turn information, environments, model name, call id, tool name, payload, and sandbox settings. For each usable environment, it applies turn-granted permissions, builds a filesystem sandbox context, and packages that into a `ToolEnvironment`. It returns a complete extension `ToolCall` with a `CoreTurnItemEmitter` attached.
 
-**Call relations**: This helper is called only by `ExtensionToolAdapter::handle`. It is the key translation layer between core runtime state and the extension API's execution contract.
+**Call relations**: `ExtensionToolAdapter::handle` calls this before invoking the wrapped extension executor. It calls `apply_granted_turn_permissions` so extension environments reflect permissions granted during the current turn.
 
 *Call graph*: calls 2 internal fn (apply_granted_turn_permissions, new); called by 1 (handle); 3 external calls (downgrade, new, with_capacity).
 
@@ -1393,11 +1409,11 @@ async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Provides a fixed plain tool name for the stub executor used in tests.
+**Purpose**: Provides a fixed tool name for a simple test extension executor. The name lets tests treat it like a real registered extension tool.
 
-**Data flow**: Constructs and returns `ToolName::plain("extension_echo")`.
+**Data flow**: It takes no input beyond the test executor. It returns the plain tool name `extension_echo`.
 
-**Call relations**: Test adapter instances use this metadata when verifying hook payload generation and invocation routing.
+**Call relations**: This supports `tests::exposes_generic_hook_payloads`, where the adapter is checked against a basic extension tool.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -1408,11 +1424,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Defines a strict function schema for the stub extension tool used in tests.
+**Purpose**: Defines the test tool's input contract: an object with a required string message. This lets the test verify that extension tool metadata can pass through the adapter.
 
-**Data flow**: Builds a `ToolSpec::Function` containing a `ResponsesApiTool` named `extension_echo`, with a parsed JSON schema requiring a string `message` property and forbidding additional properties. Returns that spec.
+**Data flow**: It builds a JSON schema, parses it into the tool schema format, and returns a function-style tool specification named `extension_echo`.
 
-**Call relations**: The test harness uses this to ensure the adapter exposes normal function-tool metadata from extension executors.
+**Call relations**: It belongs to the stub executor used by `tests::exposes_generic_hook_payloads`.
 
 *Call graph*: 3 external calls (parse_tool_input_schema, json!, Function).
 
@@ -1423,11 +1439,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Implements a trivial successful extension tool that always returns `{ "ok": true }`.
+**Purpose**: Returns a simple successful JSON result for the stub extension tool. It lets tests focus on adapter behavior rather than tool logic.
 
-**Data flow**: Ignores the incoming `codex_tools::ToolCall`, constructs `codex_tools::JsonToolOutput::new(json!({"ok": true}))`, boxes it as `dyn ToolOutput`, and returns it from a pinned async block.
+**Data flow**: It ignores the incoming tool call. It asynchronously returns a boxed JSON output containing `{ "ok": true }`.
 
-**Call relations**: It is exercised by `tests::exposes_generic_hook_payloads` to verify adapter-level hook payload extraction independent of any complex extension behavior.
+**Call relations**: This is the stub executor's run method. The adapter can call it through normal extension execution when the test invokes the tool.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (new, pin, json!).
 
@@ -1438,11 +1454,11 @@ fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFutur
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns the same plain tool name as the stub executor for capture-oriented tests.
+**Purpose**: Provides the fixed name for a test executor that records the call it receives. The name is used to make the test invocation match the executor.
 
-**Data flow**: Constructs and returns `ToolName::plain("extension_echo")`.
+**Data flow**: It receives no call-specific data. It returns the plain tool name `extension_echo`.
 
-**Call relations**: This metadata is used in the environment/history propagation test.
+**Call relations**: This supports `tests::passes_turn_fields_and_scoped_turn_item_emitter_to_extension_call`, which checks exactly what the adapter passes into the extension.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -1453,11 +1469,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Defines a permissive function spec for the capturing executor used in tests.
+**Purpose**: Defines a loose function-style specification for the capturing test tool. The exact schema is unimportant because the test is about captured call context.
 
-**Data flow**: Returns `ToolSpec::Function` with name `extension_echo`, description `Captures arguments.`, `strict: false`, and a default empty `JsonSchema`.
+**Data flow**: It creates a function tool specification with default JSON schema settings and returns it.
 
-**Call relations**: The exact schema is not central to the test; it simply makes the executor look like a valid extension tool.
+**Call relations**: It is part of the capturing executor used by the adapter conversion test.
 
 *Call graph*: 2 external calls (default, Function).
 
@@ -1468,11 +1484,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Routes the test executor's async work into its helper method.
+**Purpose**: Starts the asynchronous work for the capturing test executor. It delegates to `handle_call`, where the call is actually inspected and recorded.
 
-**Data flow**: Accepts a `codex_tools::ToolCall`, creates the future from `self.handle_call(call)`, pins it, and returns it.
+**Data flow**: It receives an extension `ToolCall`, wraps the future returned by `handle_call`, and returns that future to the caller.
 
-**Call relations**: This mirrors the production adapter pattern and delegates all observable behavior to `tests::CapturingExtensionExecutor::handle_call`.
+**Call relations**: When the adapter runs this test executor, this method calls `tests::CapturingExtensionExecutor::handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1486,11 +1502,11 @@ async fn handle_call(
         ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError>
 ```
 
-**Purpose**: Emits a synthetic web-search turn item, records the received extension call for later assertions, and returns a simple JSON success output.
+**Purpose**: Records the extension call produced by the adapter and emits sample web search events. This proves that extension calls include the right fields and that the emitter routes events through core.
 
-**Data flow**: Consumes a `codex_tools::ToolCall`, constructs an `ExtensionTurnItem::WebSearch` whose id matches `call.call_id`, emits started and completed events through `call.turn_item_emitter`, stores the full `call` into `captured_call: Arc<Mutex<Option<ToolCall>>>`, and returns boxed `JsonToolOutput { ok: true }`.
+**Data flow**: It receives a tool call. It creates a web search turn item using the call id, emits started and completed events through the call's emitter, stores the whole call in a shared test slot, and returns `{ "ok": true }`.
 
-**Call relations**: It is invoked by the executor's `handle` method during `tests::passes_turn_fields_and_scoped_turn_item_emitter_to_extension_call`. The emitted items exercise the adapter's `CoreTurnItemEmitter` path.
+**Call relations**: `tests::CapturingExtensionExecutor::handle` calls this. The larger test then reads the captured call and session events to verify adapter conversion and event emission.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (handle); 3 external calls (new, json!, WebSearch).
 
@@ -1501,11 +1517,11 @@ async fn handle_call(
 async fn exposes_generic_hook_payloads()
 ```
 
-**Purpose**: Verifies that an adapted extension function tool participates in generic pre/post tool-use hook payload generation.
+**Purpose**: Checks that extension tools produce the normal pre-tool and post-tool hook payloads. Hooks are callbacks that can inspect tool use before or after it happens.
 
-**Data flow**: Constructs an `ExtensionToolAdapter` around `StubExtensionExecutor`, creates a session/turn and a `ToolInvocation` with JSON function arguments, creates a matching JSON output, then compares `CoreToolRuntime::pre_tool_use_payload` and `post_tool_use_payload` against expected `PreToolUsePayload` and `PostToolUsePayload` values.
+**Data flow**: It builds a stub extension adapter, creates a fake session and turn, prepares a function payload, and asks the core runtime for pre-use and post-use payloads. It compares the results with the expected tool name, input JSON, call id, and output JSON.
 
-**Call relations**: This test exercises adapter integration with the shared `CoreToolRuntime` hook machinery rather than extension execution details.
+**Call relations**: This test constructs the adapter with `ExtensionToolAdapter::new` and uses the stub executor methods to confirm extension tools behave like core tools for hook reporting.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, new, new, plain, new); 5 external calls (new, assert_eq!, json!, new, new).
 
@@ -1516,11 +1532,11 @@ async fn exposes_generic_hook_payloads()
 async fn passes_turn_fields_and_scoped_turn_item_emitter_to_extension_call()
 ```
 
-**Purpose**: Checks that the adapter forwards turn metadata, conversation history, environments, and a weakly scoped turn-item emitter into the extension call object, and that emitted items become session events.
+**Purpose**: Verifies that the adapter passes the right turn information, conversation history, sandbox context, payload, and event emitter to an extension tool. It also checks that the emitter does not keep the session or turn alive forever.
 
-**Data flow**: Builds a capturing executor and adapter, creates a session/turn with an event receiver, records a history item into the session, invokes the adapter with a function payload, then inspects the captured `ToolCall` and received events. It asserts turn id, call id, tool name, model, truncation policy, sandbox cwd values, conversation history contents, payload preservation, weak-reference drop behavior, and the exact started/completed web-search events emitted through the scoped emitter.
+**Data flow**: It creates a session with an event receiver, records one history item, builds a tool invocation, and runs the adapter. Then it inspects the captured extension call and the emitted events to make sure all fields and web search events match expectations.
 
-**Call relations**: This is the main end-to-end test for `to_extension_call`, `CoreTurnItemEmitter::emit_started`, and `emit_completed` working together under the adapter's `handle` path.
+**Call relations**: This test uses `ExtensionToolAdapter::new` with `tests::CapturingExtensionExecutor`. That executor emits events and captures the translated call, allowing the test to validate `to_extension_call`, `emit_started`, and `emit_completed` together.
 
 *Call graph*: calls 4 internal fn (make_session_and_context_with_rx, new, new, plain); 13 external calls (clone, downgrade, new, new, assert!, assert_eq!, json!, panic!, from_ref, new (+3 more)).
 
@@ -1536,11 +1552,11 @@ fn contribute(
         ) -> codex_extension_api::Ext
 ```
 
-**Purpose**: Implements a test turn-item contributor that records that it ran by inserting a marker into turn extension data.
+**Purpose**: Marks that a turn item contributor ran during a test. A contributor is extension code that can add information to a completed turn item before it is published.
 
-**Data flow**: Receives thread store, turn store, and mutable `TurnItem`; ignores the thread store and item, inserts `ExtensionTurnItemContributorRan` into `turn_store`, and returns `Ok(())` from a boxed async future.
+**Data flow**: It receives thread-level extension data, turn-level extension data, and a mutable turn item. It ignores the thread data and item, inserts a marker into the turn data, and returns success.
 
-**Call relations**: It is registered in `tests::extension_completion_runs_turn_item_contributors` and is triggered indirectly by `CoreTurnItemEmitter::emit_completed` via `finalize_turn_item`.
+**Call relations**: `tests::extension_completion_runs_turn_item_contributors` registers this contributor, then calls the core emitter's completion path to prove `finalize_turn_item` invokes it.
 
 *Call graph*: calls 1 internal fn (insert); 1 external calls (pin).
 
@@ -1551,11 +1567,11 @@ fn contribute(
 async fn extension_completion_runs_turn_item_contributors()
 ```
 
-**Purpose**: Confirms that core finalization runs registered extension turn-item contributors before publishing a completed item.
+**Purpose**: Checks that completed extension turn items go through core finalization and run registered turn item contributors. Without this, extension-provided metadata could be skipped.
 
-**Data flow**: Creates a session/turn, installs an extension registry containing `RecordExtensionTurnItemContributor`, constructs a `CoreTurnItemEmitter` with weak refs, emits a completed `ExtensionTurnItem::WebSearch`, and then asserts that the turn's extension data contains the contributor marker type.
+**Data flow**: It creates a session and turn, registers a contributor that writes a marker, builds a `CoreTurnItemEmitter`, and emits a completed web search item. It then checks that the marker was written into the turn's extension data.
 
-**Call relations**: This test specifically targets the contributor-execution branch inside `CoreTurnItemEmitter::emit_completed`.
+**Call relations**: This test calls the emitter's `emit_completed` path directly. That path calls `finalize_turn_item`, which should trigger the registered contributor.
 
 *Call graph*: calls 2 internal fn (make_session_and_context, new); 5 external calls (downgrade, new, assert!, WebSearch, emit_completed).
 
@@ -1566,11 +1582,11 @@ async fn extension_completion_runs_turn_item_contributors()
 fn tool_name(&self) -> codex_tools::ToolName
 ```
 
-**Purpose**: Returns a namespaced image-generation tool name for image publication tests.
+**Purpose**: Provides a namespaced test tool name for image generation. The namespace shows that extension tools can use grouped names rather than only plain names.
 
-**Data flow**: Constructs and returns `ToolName::namespaced("image_gen", "imagegen")`.
+**Data flow**: It takes no call data and returns the namespaced tool name `image_gen/imagegen`.
 
-**Call relations**: The adapter uses this metadata when routing the image-generation test invocation.
+**Call relations**: This supports `tests::image_generation_publication_is_finalized_by_core`, where a simulated image-generation extension is run through the adapter.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -1581,11 +1597,11 @@ fn tool_name(&self) -> codex_tools::ToolName
 fn spec(&self) -> codex_tools::ToolSpec
 ```
 
-**Purpose**: Defines a permissive function spec for the synthetic image-generation extension tool.
+**Purpose**: Defines a basic function-style specification for the test image generation extension. The schema is minimal because the test focuses on published image items.
 
-**Data flow**: Returns `ToolSpec::Function` with name `imagegen`, description `Generates an image.`, `strict: false`, and a default schema.
+**Data flow**: It creates a function tool specification named `imagegen` with a default JSON schema and returns it.
 
-**Call relations**: This makes the test executor look like a normal extension tool while the test focuses on emitted item finalization.
+**Call relations**: It is part of the image generation test executor used by the image finalization test.
 
 *Call graph*: 2 external calls (default, Function).
 
@@ -1596,11 +1612,11 @@ fn spec(&self) -> codex_tools::ToolSpec
 fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Delegates the image-generation test executor's work to its async helper.
+**Purpose**: Starts the asynchronous image generation test work. It delegates to `handle_call`, where started and completed image events are emitted.
 
-**Data flow**: Accepts a `ToolCall`, creates and pins the future from `self.handle_call(call)`, and returns it.
+**Data flow**: It receives an extension tool call, wraps the future from `handle_call`, and returns that future.
 
-**Call relations**: It is invoked through the adapter during the image-publication test.
+**Call relations**: When the adapter runs the image generation test executor, this method calls `tests::ImageGenerationExtensionExecutor::handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1614,11 +1630,11 @@ async fn handle_call(
         ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError>
 ```
 
-**Purpose**: Simulates an extension that emits image-generation start and completion items, including a claimed saved path that core should override.
+**Purpose**: Simulates an extension that reports image generation progress and completion. It deliberately supplies a saved path on completion so the test can prove core replaces it with the official artifact path.
 
-**Data flow**: Consumes a `ToolCall`, emits `ExtensionTurnItem::ImageGeneration` with `status: in_progress`, then emits a completed image item containing revised prompt, base64 result `cG5n`, and `saved_path` pointing at `/tmp/extension-claimed.png`. It finally returns boxed JSON `{ "ok": true }`.
+**Data flow**: It receives a tool call. It emits an in-progress image item, then emits a completed image item containing base64-like result data and an extension-claimed path. It returns `{ "ok": true }`.
 
-**Call relations**: This helper is called by the executor's `handle` method and is used by `tests::image_generation_publication_is_finalized_by_core` to verify that `extension_turn_item` and `finalize_turn_item` replace the extension-provided path with a core-managed artifact.
+**Call relations**: `tests::ImageGenerationExtensionExecutor::handle` calls this. The finalization test then checks that `CoreTurnItemEmitter::emit_completed` lets core save the image artifact and set the final path.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (handle); 5 external calls (new, new, test_path_buf, json!, ImageGeneration).
 
@@ -1629,22 +1645,26 @@ async fn handle_call(
 async fn image_generation_publication_is_finalized_by_core()
 ```
 
-**Purpose**: Verifies that image-generation items emitted by extensions are finalized by core, including artifact persistence and replacement of the public `saved_path`.
+**Purpose**: Verifies that image generation items from extensions are finalized by core before users see them. In particular, core saves the generated artifact and sets the trusted saved path.
 
-**Data flow**: Creates an adapter around `ImageGenerationExtensionExecutor`, a session/turn with event receiver, computes the expected artifact path from thread and call id, invokes the tool, then reads the emitted started/completed image-generation events and legacy begin/end events. It asserts the started item has no saved path, the completed item points to the core-generated artifact path, and the file at that path contains decoded bytes `png`.
+**Data flow**: It builds an image generation extension adapter, computes the expected artifact path, runs a tool invocation, and reads the emitted events. It checks the started item, completed item, legacy begin/end events, final saved path, and actual bytes written to disk.
 
-**Call relations**: This test exercises the full adapter execution path plus `CoreTurnItemEmitter::emit_completed` finalization behavior for image outputs.
+**Call relations**: This test uses `ExtensionToolAdapter::new` with `tests::ImageGenerationExtensionExecutor`. The executor emits image turn items, and the test confirms the adapter and `CoreTurnItemEmitter::emit_completed` route them through core finalization.
 
 *Call graph*: calls 5 internal fn (make_session_and_context_with_rx, image_generation_artifact_path, new, new, namespaced); 7 external calls (new, assert!, assert_eq!, panic!, new, new, handle).
 
 
 ### `core/src/tools/handlers/tool_search.rs`
 
-`domain_logic` · `tool execution during request handling; cache rebuild when tool inventory changes`
+`domain_logic` · `request handling and tool registry updates`
 
-This file turns a list of `ToolSearchInfo` records into an executable search tool. `ToolSearchHandler::new` extracts any source-info metadata to build the published search-tool spec, then indexes each entry’s `search_text` into a BM25 `SearchEngine<usize>` using document IDs that correspond to positions in `search_infos`. At runtime, `handle_call` accepts only `ToolPayload::ToolSearch`, trims and validates the query, applies a default limit when omitted, rejects empty queries and zero limits with model-facing errors, and short-circuits to an empty result set when there are no searchable tools.
+When many tools are available, sending every full tool definition up front can be wasteful and confusing. This file provides a “tool search” tool: the model can ask for tools related to a query, and the system returns only the matching tool definitions that can then be loaded. Think of it like a catalog desk in a large hardware store: instead of walking every aisle, you describe what you need and get pointed to the right items.
 
-Actual retrieval happens in `search`, which asks the BM25 engine for the top matches, maps document IDs back into `search_infos`, and passes the resulting `ToolSearchEntry` sequence into `search_output_tools`. That helper calls `coalesce_loadable_tool_specs`, which is important because multiple hits may belong to the same namespace and should be merged into a single `LoadableToolSpec::Namespace` in the output. The companion `ToolSearchHandlerCache` stores an `Arc<ToolSearchHandler>` behind a `Mutex<Option<_>>` and compares the full `search_infos` vector for reuse; it also tolerates poisoned mutexes by recovering the inner value. The embedded tests verify both cache identity semantics and mixed-result coalescing across MCP and dynamic namespace tools.
+The main type, ToolSearchHandler, keeps three things together: the searchable information for each tool, the public specification for the search tool itself, and a BM25 search engine. BM25 is a common text-search scoring method that ranks documents by how well their words match a query. Each tool’s search text becomes one searchable document, and the document id points back to the original tool entry.
+
+When the search tool is called, the handler checks that the request really is a tool-search request, rejects an empty query or a zero limit with a message the model can fix, and then searches the index. The results are converted into loadable tool specs. If several results belong to the same namespace, they are combined so the output is tidy and valid.
+
+ToolSearchHandlerCache wraps the handler in a mutex, which is a lock that prevents two threads from changing the cached value at the same time. It reuses the existing handler when the tool list has not changed, and rebuilds it when it has.
 
 #### Function details
 
@@ -1654,11 +1674,11 @@ Actual retrieval happens in `search`, which asks the BM25 engine for the top mat
 fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler>
 ```
 
-**Purpose**: Returns a cached search handler when the searchable tool inventory is unchanged, or builds and stores a new one otherwise. It avoids rebuilding the BM25 index on repeated registrations with identical inputs.
+**Purpose**: Returns a shared ToolSearchHandler for a given list of searchable tools. It avoids rebuilding the search index when the list is the same as the one already cached.
 
-**Data flow**: It takes ownership of a `Vec<ToolSearchInfo>`, first locks the cache via `cached()` and compares any stored handler’s `search_infos` to the incoming vector; if equal, it returns an `Arc` clone of the cached handler. Otherwise it constructs a new `ToolSearchHandler`, re-locks the cache to handle races, rechecks whether an equivalent handler is now present, and either returns that existing one or stores and returns the newly built `Arc`.
+**Data flow**: It receives a list of ToolSearchInfo records. It first looks inside the cache; if the cached handler was built from the same list, it returns another shared pointer to that handler. If not, it builds a new ToolSearchHandler, checks the cache once more in case another thread already built the same thing, then stores and returns the new handler.
 
-**Call relations**: Callers use this method when they need a search handler for the current tool inventory. It delegates mutex access to `cached()` and handler construction to `ToolSearchHandler::new`.
+**Call relations**: This is the front door for code that needs a tool-search handler. It calls ToolSearchHandlerCache::cached to safely read or update the stored handler, and it calls ToolSearchHandler::new when the old handler is missing or out of date.
 
 *Call graph*: calls 2 internal fn (new, cached); 2 external calls (clone, new).
 
@@ -1669,11 +1689,11 @@ fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandl
 fn cached(&self) -> std::sync::MutexGuard<'_, Option<Arc<ToolSearchHandler>>>
 ```
 
-**Purpose**: Obtains the mutex guard protecting the optional cached handler, recovering gracefully from poisoning. This keeps cache callers from having to repeat poison-handling logic.
+**Purpose**: Safely opens the cache so code can read or replace the stored handler. It also recovers if another thread previously panicked while holding the lock.
 
-**Data flow**: It locks `self.cached`, returning the `MutexGuard` directly on success or `poisoned.into_inner()` if the mutex was poisoned. No other transformation occurs.
+**Data flow**: It reads the mutex-protected cache field and returns a guard, which is temporary access to the cached Option value. If the lock is poisoned, meaning a previous holder panicked, it still takes the contained value so the program can continue.
 
-**Call relations**: This helper is used internally by `ToolSearchHandlerCache::get_or_build` for both the initial cache lookup and the later store/update step.
+**Call relations**: ToolSearchHandlerCache::get_or_build uses this helper whenever it needs to inspect or update the cached handler. Keeping the lock behavior here makes the caching code simpler and consistent.
 
 *Call graph*: called by 1 (get_or_build).
 
@@ -1684,11 +1704,11 @@ fn cached(&self) -> std::sync::MutexGuard<'_, Option<Arc<ToolSearchHandler>>>
 fn new(search_infos: Vec<ToolSearchInfo>) -> Self
 ```
 
-**Purpose**: Builds a search handler from a concrete set of searchable tool records by generating the public search spec and indexing search text into a BM25 engine. It is the constructor that ties metadata, schema, and retrieval together.
+**Purpose**: Builds a fresh search handler from the current set of searchable tools. This prepares both the public search-tool description and the text index used to find matching tools quickly.
 
-**Data flow**: It takes `search_infos: Vec<ToolSearchInfo>`, extracts any `source_info` values into a separate vector for `create_tool_search_tool`, converts each entry’s `search_text` into a `Document<usize>` whose ID is the entry index, builds a `SearchEngine<usize>` with English language settings, and returns `Self { search_infos, spec, search_engine }`.
+**Data flow**: It receives ToolSearchInfo records. From them it gathers source information for the search tool’s own spec, turns each tool’s search text into a numbered BM25 document, builds an English-language search engine, and stores all of that in a ToolSearchHandler.
 
-**Call relations**: This constructor is called by `ToolSearchHandlerCache::get_or_build` in production and by the namespace-coalescing test directly. It delegates only the schema portion to `create_tool_search_tool`.
+**Call relations**: ToolSearchHandlerCache::get_or_build calls this when the cached handler cannot be reused. The test tests::mixed_search_results_coalesce_mcp_namespaces also builds a handler directly so it can check how search results are converted into output specs.
 
 *Call graph*: calls 1 internal fn (create_tool_search_tool); called by 2 (get_or_build, mixed_search_results_coalesce_mcp_namespaces); 1 external calls (with_documents).
 
@@ -1699,11 +1719,11 @@ fn new(search_infos: Vec<ToolSearchInfo>) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the canonical registry name for the tool-search handler. This aligns the runtime executor with the shared constant used elsewhere in the tool-search subsystem.
+**Purpose**: Reports the name of this tool-search tool to the tool registry. The registry uses this name to route incoming tool calls to the right handler.
 
-**Data flow**: It reads `TOOL_SEARCH_TOOL_NAME`, converts it with `ToolName::plain`, and returns the resulting `ToolName`.
+**Data flow**: It takes no outside input beyond the handler itself. It wraps the constant tool-search name in a ToolName value and returns it.
 
-**Call relations**: The tool registry calls this trait method when registering or dispatching the search tool.
+**Call relations**: This is part of the ToolExecutor interface, which lets ToolSearchHandler participate like any other executable tool. When the broader tool system asks what this executor is called, this function supplies the answer.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -1714,11 +1734,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the precomputed search-tool specification associated with this handler instance. The spec is built once at construction time from the available source metadata.
+**Purpose**: Returns the tool specification that describes how the model should call the search tool. This includes the shape of the arguments, such as query text and optional result limit.
 
-**Data flow**: It takes `&self`, clones `self.spec`, and returns the clone.
+**Data flow**: It reads the stored ToolSpec from the handler, clones it, and returns the copy. The handler keeps its own copy so callers cannot accidentally change it.
 
-**Call relations**: The registry invokes this method when it needs the published schema for the search tool; the actual spec was prepared earlier by `ToolSearchHandler::new`.
+**Call relations**: This is part of the ToolExecutor interface. The tool registry or model-facing layer asks for this spec when it needs to advertise the search tool.
 
 *Call graph*: 1 external calls (clone).
 
@@ -1729,11 +1749,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Declares that tool-search requests may run concurrently. Search is read-only over immutable indexed state, so parallel execution is safe.
+**Purpose**: States that this search tool can safely run at the same time as other tool calls. Searching the already-built index does not mutate shared state.
 
-**Data flow**: It takes `&self` and returns `true`.
+**Data flow**: It takes no additional input and always returns true.
 
-**Call relations**: The runtime consults this trait method when deciding whether multiple search invocations can execute at the same time.
+**Call relations**: This is part of the ToolExecutor interface. The runtime can use this answer when deciding whether it is allowed to execute tool calls concurrently.
 
 
 ##### `ToolSearchHandler::handle`  (lines 103–105)
@@ -1742,11 +1762,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async search implementation into the boxed future required by the executor trait. It is a forwarding layer with no search logic of its own.
+**Purpose**: Starts processing an incoming invocation of the tool-search tool. It adapts the async work into the future type expected by the tool runtime.
 
-**Data flow**: It consumes a `ToolInvocation`, calls `self.handle_call(invocation)`, boxes and pins the future, and returns it.
+**Data flow**: It receives a ToolInvocation, passes it into ToolSearchHandler::handle_call, boxes and pins the resulting future, and returns that future to the caller. Pinning means the future will stay in a stable memory location while it runs.
 
-**Call relations**: The tool runtime invokes this trait method for execution; it immediately delegates to `ToolSearchHandler::handle_call`.
+**Call relations**: The tool runtime calls this through the ToolExecutor interface when the model invokes the search tool. It immediately hands the real validation and search work to ToolSearchHandler::handle_call.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -1760,11 +1780,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates a tool-search request, executes the search, and packages the matching tools into a `ToolSearchOutput`. It is the main runtime entry point for search queries.
+**Purpose**: Validates a tool-search request, runs the search, and packages the answer for the model. It also turns user-correctable mistakes, like an empty query, into clear messages.
 
-**Data flow**: It takes a `ToolInvocation`, extracts `payload`, and accepts only `ToolPayload::ToolSearch { arguments }`; any other payload becomes a fatal error. It trims `arguments.query`, rejects empty queries, resolves `limit` from the request or `TOOL_SEARCH_DEFAULT_LIMIT`, rejects `limit == 0`, returns an empty `ToolSearchOutput` immediately if `self.search_infos` is empty, otherwise calls `self.search(query, limit)` and boxes the resulting tool list into `ToolSearchOutput`.
+**Data flow**: It receives a ToolInvocation and extracts the payload. If the payload is not a tool-search request, it returns a fatal error because the wrong handler was called. It trims the query, rejects an empty query, reads or defaults the result limit, rejects a limit of zero, returns an empty list if there are no tools, otherwise calls ToolSearchHandler::search and wraps the resulting tools in ToolSearchOutput.
 
-**Call relations**: This method is called only by `ToolSearchHandler::handle`. It delegates ranked retrieval to `search` and output boxing to `boxed_tool_output`.
+**Call relations**: ToolSearchHandler::handle calls this for every actual search request. When validation succeeds, it calls ToolSearchHandler::search; when output is ready, it uses boxed_tool_output so the result fits the common tool-output interface.
 
 *Call graph*: calls 2 internal fn (boxed_tool_output, search); called by 1 (handle); 4 external calls (new, format!, Fatal, RespondToModel).
 
@@ -1779,11 +1799,11 @@ fn search(
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError>
 ```
 
-**Purpose**: Runs the BM25 query against the indexed search text and maps ranked hits back to loadable tool specs. It bridges from search-engine results to tool-search output entries.
+**Purpose**: Searches the indexed tool descriptions and returns loadable tool definitions for the best matches. This is the core lookup step after the request has been validated.
 
-**Data flow**: It accepts a query string and a result limit, calls `self.search_engine.search(query, limit)`, converts each result to its document ID, looks up the corresponding `ToolSearchInfo` by index, maps those to `&ToolSearchEntry`, and passes the iterator into `self.search_output_tools`. It returns the resulting `Vec<LoadableToolSpec>` or any coalescing error.
+**Data flow**: It receives a query string and a maximum number of results. It asks the BM25 search engine for matching documents, turns each document id back into the corresponding ToolSearchInfo entry, keeps the tool output entries, and passes them to ToolSearchHandler::search_output_tools. It returns the final list or an error if conversion fails.
 
-**Call relations**: This helper is invoked by `handle_call` after request validation. It delegates final output shaping and namespace merging to `search_output_tools`.
+**Call relations**: ToolSearchHandler::handle_call calls this after checking the query and limit. It delegates the final shaping of results to ToolSearchHandler::search_output_tools so matching and output formatting stay separate.
 
 *Call graph*: calls 1 internal fn (search_output_tools); called by 1 (handle_call); 1 external calls (search).
 
@@ -1797,11 +1817,11 @@ fn search_output_tools(
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError>
 ```
 
-**Purpose**: Coalesces a sequence of matched search entries into the final loadable tool-spec list returned to callers. Its main job is merging entries that belong to the same namespace.
+**Purpose**: Turns raw matched tool entries into the final list of loadable tool specs. It also combines related tools that belong together, such as multiple tools from the same namespace.
 
-**Data flow**: It takes any iterable of `&ToolSearchEntry`, clones each entry’s `output` field, feeds the sequence into `coalesce_loadable_tool_specs`, and wraps the result in `Ok(...)`.
+**Data flow**: It receives an iterable set of ToolSearchEntry references. It clones each entry’s output spec, passes those specs to coalesce_loadable_tool_specs, and returns the combined list.
 
-**Call relations**: This helper is called by `search`, and it is also exercised directly by tests that want to validate coalescing behavior independently of BM25 ranking.
+**Call relations**: ToolSearchHandler::search calls this after ranking matches. The tests call it indirectly and directly to confirm that mixed results, especially namespaced MCP and dynamic tools, are returned in a clean combined form.
 
 *Call graph*: called by 1 (search); 2 external calls (into_iter, coalesce_loadable_tool_specs).
 
@@ -1812,11 +1832,11 @@ fn search_output_tools(
 fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes()
 ```
 
-**Purpose**: Verifies that the handler cache returns the same `Arc` for identical search inventories and a different one when the indexed search text changes. This protects the cache’s equality-based reuse semantics.
+**Purpose**: Checks that the cache reuses a handler when the searchable tool list is unchanged and builds a new one when the list changes. This protects both performance and correctness.
 
-**Data flow**: The test creates a default cache, builds one MCP-derived `ToolSearchInfo`, calls `get_or_build` twice with identical vectors and asserts pointer equality, then mutates the stored `search_text`, calls `get_or_build` again, and asserts pointer inequality with the original handler.
+**Data flow**: It creates a cache and one sample tool search entry. It asks the cache for a handler twice with the same data and confirms both shared pointers refer to the same object. Then it changes the search text, asks again, and confirms the returned handler is a different object.
 
-**Call relations**: It directly exercises `ToolSearchHandlerCache::get_or_build`, relying on MCP handler conversion helpers to produce realistic `ToolSearchInfo` input.
+**Call relations**: This test exercises ToolSearchHandlerCache::get_or_build through the realistic path of building search information from an MCP tool handler. It verifies the cache behavior that callers depend on when the available tools are refreshed.
 
 *Call graph*: 3 external calls (assert!, default, vec!).
 
@@ -1827,11 +1847,11 @@ fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes()
 fn mixed_search_results_coalesce_mcp_namespaces()
 ```
 
-**Purpose**: Checks that mixed search hits from MCP tools and dynamic namespace tools are coalesced into the correct namespace-shaped output. It validates output shaping independently of ranking.
+**Purpose**: Checks that search results from different tool sources are converted into a clean combined output. In particular, it verifies that multiple MCP tools from the same namespace are grouped together.
 
-**Data flow**: The test constructs one dynamic namespace/tool spec and two MCP tool infos, converts them into `ToolSearchInfo` values, builds a `ToolSearchHandler`, manually selects a result ordering from `handler.search_infos`, calls `search_output_tools`, and compares the returned `Vec<LoadableToolSpec>` against an expected pair of namespace specs with merged MCP tools and a separate dynamic namespace.
+**Data flow**: It builds sample dynamic-tool information and sample MCP tool information. It converts them into search infos, creates a ToolSearchHandler, manually chooses a mixed result order, and asks search_output_tools to produce loadable specs. It then compares the result with the exact expected grouped namespace output.
 
-**Call relations**: It directly invokes `ToolSearchHandler::new` and `search_output_tools` to validate namespace coalescing logic without depending on BM25 search ordering.
+**Call relations**: This test calls ToolSearchHandler::new and then directly checks ToolSearchHandler::search_output_tools. It uses tests::tool_info to make realistic MCP tool inputs, and it proves that the final output remains valid even when search results mix tool families.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (new, assert_eq!, tool_info, json!).
 
@@ -1842,24 +1862,24 @@ fn mixed_search_results_coalesce_mcp_namespaces()
 fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo
 ```
 
-**Purpose**: Creates a realistic `codex_mcp::ToolInfo` fixture for the tool-search tests. It standardizes MCP test input construction so cache and coalescing tests can focus on behavior.
+**Purpose**: Builds a small fake MCP tool description for tests. It saves the tests from repeating the same setup details for each sample tool.
 
-**Data flow**: It takes `server_name`, `tool_name`, and `description_prefix`, then constructs and returns a `ToolInfo` with MCP namespace naming, a `rmcp::model::Tool` carrying an empty object schema, formatted description text, and default/empty values for optional connector and plugin metadata.
+**Data flow**: It receives a server name, tool name, and description prefix. It fills in a ToolInfo value with a namespace name, callable name, description, empty JSON input schema, and default test-only metadata, then returns that ToolInfo.
 
-**Call relations**: This helper is used by both embedded tests to generate MCP tool metadata that can be converted into searchable entries.
+**Call relations**: The test functions call this helper when they need realistic MCP tool data. Those ToolInfo values are then converted by McpHandler into search information used by the cache and coalescing tests.
 
 *Call graph*: 6 external calls (new, new, format!, new, object, json!).
 
 
 ### `core/src/tools/handlers/tool_search_spec.rs`
 
-`config` · `tool registration / startup`
+`domain_logic` · `tool setup before model calls`
 
-This file is a small spec-construction helper for the deferred-tool discovery path. Its main job is to assemble a `codex_tools::ToolSpec::ToolSearch` value with a human-readable markdown description and a `JsonSchema::object` parameter schema containing `query` and `limit`. The schema always requires `query`, leaves `limit` optional, and sets `additionalProperties` to false.
+Some tool sets can be large, so the system may hold back many tools until the model asks for them. This file creates the small “search counter” the model can use to find those hidden tools later. In everyday terms, instead of handing someone every tool in a warehouse, it gives them a catalog search box.
 
-The notable logic is in how source metadata is rendered into the description. The function walks the provided `&[ToolSearchSourceInfo]`, groups entries by `source.name` in a `BTreeMap<String, Option<String>>`, and deliberately preserves the first non-`None` description seen for a duplicated source name. That means duplicate sources collapse to one bullet, and a later `None` description cannot erase an earlier descriptive string. If no sources are enabled, the description explicitly says `None currently enabled.`; otherwise it emits one bullet per distinct source, sorted by `BTreeMap` key order. The final markdown also hard-codes guidance that MCP discovery must use `tool_search` rather than `list_mcp_resources` or `list_mcp_resource_templates`.
+The main function, `create_tool_search_tool`, receives a list of searchable tool sources, such as Google Drive or documentation tools, plus a default result limit. It then builds a `ToolSpec`, which is the structured description the model sees. That description says what the tool is for, where it can search, and what inputs it accepts. The inputs are described with a JSON schema, which is a machine-readable shape saying: there must be a `query` text field, and there may be a numeric `limit` field.
 
-The test locks down both behaviors: deduplication of repeated source names and exact rendering of the resulting `ToolSpec`, including the default-limit text embedded in the `limit` field description.
+A notable detail is that source names are deduplicated. If the same source appears more than once, the function keeps one line for it and prefers a description when one is available. If no sources are enabled, the description says so plainly. The test checks this behavior so future changes do not accidentally make the model prompt noisy or misleading.
 
 #### Function details
 
@@ -1872,11 +1892,11 @@ fn create_tool_search_tool(
 ) -> ToolSpec
 ```
 
-**Purpose**: Constructs the full `ToolSpec::ToolSearch` definition for the deferred tool-search capability, including parameter schema and a markdown description listing searchable sources.
+**Purpose**: Creates the official specification for the `tool_search` tool. This tells the model how to search for deferred tools, what arguments it can provide, and which tool sources are currently available.
 
-**Data flow**: It takes a slice of `ToolSearchSourceInfo` plus a `default_limit`. It first builds a `BTreeMap<String, JsonSchema>` for `query` and `limit`, then folds the source slice into a deduplicated `BTreeMap<String, Option<String>>` keyed by source name, preferring an existing non-empty description over later `None` values. That map is rendered into either `None currently enabled.` or newline-separated bullet lines, interpolated into the final description string, and returned inside `ToolSpec::ToolSearch { execution: "client", description, parameters }`.
+**Data flow**: It takes a list of source names and optional descriptions, plus a default maximum number of results. It turns the inputs into a clean prompt description, removes duplicate source names while keeping useful descriptions, and builds a JSON-shaped parameter definition with a required `query` and optional `limit`. It returns a `ToolSpec::ToolSearch` value that the rest of the system can offer to the model.
 
-**Call relations**: This helper is invoked by the surrounding tool-registration constructor (`new`) when the system exposes deferred tool discovery. Internally it delegates schema node creation to `JsonSchema::string`, `JsonSchema::number`, and `JsonSchema::object` so the caller receives a ready-to-register tool spec.
+**Call relations**: This function is called by `new` when the tool system is being assembled. At that moment, it packages the available search sources into a form the model can understand, using helper constructors for JSON schema fields along the way.
 
 *Call graph*: calls 3 internal fn (number, object, string); called by 1 (new); 4 external calls (from, new, format!, vec!).
 
@@ -1887,26 +1907,26 @@ fn create_tool_search_tool(
 fn create_tool_search_tool_deduplicates_and_renders_enabled_sources()
 ```
 
-**Purpose**: Verifies that duplicate source names collapse into one rendered bullet and that the generated tool spec matches the expected description and schema exactly.
+**Purpose**: Checks that `create_tool_search_tool` produces the expected tool specification when there are repeated source names and mixed descriptions. It protects the wording and structure that the model depends on.
 
-**Data flow**: The test feeds `create_tool_search_tool` three `ToolSearchSourceInfo` values, including two entries for `Google Drive` with different description presence, and a default limit of 8. It compares the returned `ToolSpec::ToolSearch` against a fully spelled-out expected value, asserting the deduplicated source list, the preserved descriptive text, and the `JsonSchema::object` parameter structure.
+**Data flow**: The test feeds in two entries for Google Drive, one with a description and one without, plus a separate `docs` source. It compares the returned `ToolSpec` against the exact expected result, including the deduplicated source list, the default limit text, and the required `query` parameter. The output is a pass or fail from the test runner.
 
-**Call relations**: This is a unit test for `create_tool_search_tool`; it does not participate in runtime flow. Its single assertion acts as a regression guard for both the source-deduplication logic and the exact user-facing wording embedded in the generated spec.
+**Call relations**: This test exercises `create_tool_search_tool` directly. It uses an equality assertion to catch any change that would alter the generated tool description or parameter schema.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/handlers/view_image.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `tool call handling`
 
-This file contains both the runtime handler for image viewing and the `ToolOutput` implementation that serializes image results back into the conversation. `ViewImageHandler` stores `ViewImageToolOptions`; its default configuration disables original-detail requests and omits `environment_id` from the schema. Through `ToolExecutor<ToolInvocation>`, it exposes `view_image`, generates its schema via `create_view_image_tool`, allows parallel calls, and forwards execution into `handle_call`.
+This file is the bridge between a model asking “show me this image” and the system safely delivering that image back as model input. Without it, the model could receive text from tools but would not have a controlled way to inspect image files in the workspace.
 
-`handle_call` begins with a modality gate: if the current model does not advertise `InputModality::Image`, it immediately returns the fixed unsupported-message error. It then requires a function payload, parses `ViewImageArgs`, and validates `detail` strictly: only `high`, `original`, or omission are accepted. Next it resolves the target environment, converts its cwd to a native absolute path, joins the requested relative `path`, constructs a filesystem sandbox from the turn context, and uses the environment filesystem to fetch metadata and file bytes via `PathUri`.
+The main piece is `ViewImageHandler`. When a tool call arrives, it first makes sure the current model can actually accept images. It then reads the tool arguments: the file path, an optional environment id, and an optional detail setting. The detail setting is deliberately strict: it accepts only `high` or `original`, so a misspelled value does not silently do the wrong thing.
 
-The handler rejects non-files, maps filesystem failures into path-specific model errors, and decides whether original resolution is allowed by combining the request with `can_request_original_image_detail(&turn.model_info)`. If the `ResizeAllImages` feature is enabled, it wraps the raw bytes directly as an octet-stream data URL and leaves resizing to history insertion; otherwise it decodes and optionally resizes with `load_for_prompt_bytes`, using `PromptImageMode::Original` or `ResizeToFit`. It emits `TurnItem::ImageView` started/completed events around the successful read and returns `ViewImageOutput { image_url, image_detail }`.
+Next, the handler finds the selected environment and builds an absolute path from that environment’s current directory. It asks the environment’s filesystem for metadata and file bytes, using the turn’s sandbox rules. The sandbox is like a guardrail: even though the tool is reading a file, it must still obey the session’s permission limits.
 
-`ViewImageOutput` intentionally hides raw image data in logs, always reports success for logging, serializes to a `FunctionCallOutputPayload` containing an `InputImage` content item, and exposes a compact code-mode JSON object with `image_url` and `detail`. The tests cover log/code serialization, sandbox-context propagation, strict `detail` validation, and acceptance of explicit `high` detail.
+After reading the file, the handler decides whether to send the original image or a resized version. Some models may request original image detail; otherwise the default high-detail resized behavior is used. Finally, it emits a turn item so the UI/history can record that an image was viewed, and returns a `ViewImageOutput`, which knows how to hide large image data in logs while still sending the actual image to the model.
 
 #### Function details
 
@@ -1916,11 +1936,11 @@ The handler rejects non-files, maps filesystem failures into path-specific model
 fn default() -> Self
 ```
 
-**Purpose**: Creates the default `view_image` handler configuration with conservative schema options.
+**Purpose**: Creates a standard `view_image` handler with conservative options. By default, it does not advertise original-image detail support or include an environment id in the tool shape.
 
-**Data flow**: It takes no inputs and returns `ViewImageHandler { options }` where `can_request_original_image_detail` and `include_environment_id` are both `false`.
+**Data flow**: No outside input is needed. It builds a `ViewImageHandler` containing default `ViewImageToolOptions`, then returns that ready-to-use handler.
 
-**Call relations**: Tests instantiate the handler through this default constructor, while production registration can use `ViewImageHandler::new` to expose additional schema fields.
+**Call relations**: The tests call this when they need a normal handler without special setup. In production, more customized construction can use `ViewImageHandler::new` instead.
 
 *Call graph*: called by 3 (handle_accepts_explicit_high_detail, handle_passes_sandbox_context_for_local_filesystem_reads, handle_rejects_unsupported_detail).
 
@@ -1931,11 +1951,11 @@ fn default() -> Self
 fn new(options: ViewImageToolOptions) -> Self
 ```
 
-**Purpose**: Builds a `view_image` handler with caller-specified schema options.
+**Purpose**: Creates a `view_image` handler with caller-supplied options. This is used when the tool registry wants the handler to match the current runtime capabilities.
 
-**Data flow**: It accepts a `ViewImageToolOptions` value and returns `Self { options }` without side effects.
+**Data flow**: It receives `ViewImageToolOptions`, stores them inside a new `ViewImageHandler`, and returns that handler.
 
-**Call relations**: Core tool registration (`add_core_utility_tools`) uses this constructor when wiring the handler according to model capabilities and environment support.
+**Call relations**: The core tool setup code calls this while adding utility tools. The options it receives later affect what `spec` advertises to the model.
 
 *Call graph*: called by 1 (add_core_utility_tools).
 
@@ -1946,11 +1966,11 @@ fn new(options: ViewImageToolOptions) -> Self
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the external tool name for image viewing.
+**Purpose**: Reports the tool name as `view_image`. The tool registry uses this name to match an incoming tool call to this handler.
 
-**Data flow**: It returns `ToolName::plain("view_image")` and reads no mutable state.
+**Data flow**: It takes the handler, creates a plain tool name from the string `view_image`, and returns that name.
 
-**Call relations**: The tool registry queries this during registration and dispatch.
+**Call relations**: The tool execution framework calls this when identifying available tools. It relies on the shared tool-name constructor so the name has the expected internal form.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -1961,11 +1981,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Generates the model-facing `ToolSpec` for `view_image` based on the handler's options.
+**Purpose**: Builds the public description of the `view_image` tool that is shown to the model. This tells the model what arguments it may send.
 
-**Data flow**: It reads `self.options` and passes them to `create_view_image_tool`, returning the resulting `ToolSpec`.
+**Data flow**: It reads the handler’s stored options, passes them to the view-image tool specification builder, and returns the resulting tool specification.
 
-**Call relations**: Called during tool exposure; the helper determines whether `detail` and `environment_id` appear in the schema.
+**Call relations**: The tool registry calls this while presenting tools to the model. The work is handed to `create_view_image_tool`, which centralizes the exact schema and wording.
 
 *Call graph*: calls 1 internal fn (create_view_image_tool).
 
@@ -1976,11 +1996,11 @@ fn spec(&self) -> ToolSpec
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Declares that multiple image-view requests may run concurrently.
+**Purpose**: States that multiple `view_image` calls can run at the same time. This is safe because each call reads its requested file and does not rely on shared mutable state in the handler.
 
-**Data flow**: It takes no inputs and returns `true`.
+**Data flow**: It reads no data and always returns `true`.
 
-**Call relations**: The runtime uses this capability flag when scheduling tool calls.
+**Call relations**: The tool runner checks this before deciding whether it may execute several tool calls concurrently. This handler opts in to that faster path.
 
 
 ##### `ViewImageHandler::handle`  (lines 83–85)
@@ -1989,11 +2009,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Boxes the async image-loading implementation into the trait-required future type.
+**Purpose**: Starts handling a `view_image` tool call in the asynchronous tool-execution system. It wraps the real work so the tool framework can await it later.
 
-**Data flow**: It consumes a `ToolInvocation`, calls `self.handle_call(invocation)`, pins the future, and returns it.
+**Data flow**: It receives a `ToolInvocation`, calls `handle_call` with it, pins the resulting future so it can be stored safely by the async runtime, and returns that future.
 
-**Call relations**: This is the trait entrypoint invoked by the tool framework; all substantive work happens in `handle_call`.
+**Call relations**: The tool framework calls `handle` when the model invokes `view_image`. `handle` immediately hands the actual validation, file reading, and output creation to `handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -2007,13 +2027,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates a `view_image` request, reads the target file from the selected environment under sandbox rules, converts it into a data URL, emits turn events, and returns a `ViewImageOutput`.
+**Purpose**: Performs the full `view_image` operation: validates the request, finds and reads the image file under sandbox rules, prepares the image data, records the event, and returns a model-ready image output.
 
-**Data flow**: It consumes a `ToolInvocation`. First it reads `turn.model_info.input_modalities` and rejects the call if `InputModality::Image` is absent. It then destructures the invocation, requires `ToolPayload::Function`, parses `ViewImageArgs`, and validates `detail` into `Option<ViewImageDetail>`, rejecting any unsupported string. It resolves the target environment, converts its cwd to a native absolute path, joins the requested path, builds a sandbox via `turn.file_system_sandbox_context`, obtains the environment filesystem, and converts the absolute path to `PathUri`. It fetches metadata and file bytes, rejecting missing paths, read failures, and non-file targets with explicit path-bearing errors.
+**Data flow**: It receives a tool invocation containing the session, turn context, call id, and raw arguments. It checks that the model supports image input, parses the JSON arguments, validates the requested detail level, resolves the target environment, builds the file path, checks that the path is a file, reads the bytes through the sandboxed filesystem, converts or resizes those bytes into a data URL, emits started/completed image-view events, and returns a boxed `ViewImageOutput`. If any step is not allowed or fails, it returns a message meant for the model instead of an image.
 
-Next it computes whether original detail is both requested and allowed by `can_request_original_image_detail`, selects `ImageDetail::Original` or `DEFAULT_IMAGE_DETAIL`, and chooses the image conversion path: raw `data_url_from_bytes("application/octet-stream", &file_bytes)` when `Feature::ResizeAllImages` is enabled, otherwise `load_for_prompt_bytes(..., PromptImageMode::Original|ResizeToFit)` followed by `.into_data_url()`. On success it emits `TurnItem::ImageView` started and completed events through the session and returns the boxed `ViewImageOutput`.
-
-**Call relations**: Only `handle` calls this. It delegates argument parsing, environment resolution, filesystem access, image processing, feature gating, and event emission to shared subsystems; tests cover several early-return validation and sandbox branches.
+**Call relations**: `handle` calls this for every `view_image` request. It collaborates with argument parsing, environment resolution, path conversion, image conversion, and original-detail capability checks. At the end it hands its result to `boxed_tool_output` so the generic tool system can treat the image output like any other tool output.
 
 *Call graph*: calls 4 internal fn (boxed_tool_output, parse_arguments, resolve_tool_environment, from_abs_path); called by 1 (handle); 7 external calls (ImageView, data_url_from_bytes, load_for_prompt_bytes, can_request_original_image_detail, format!, matches!, RespondToModel).
 
@@ -2024,11 +2042,11 @@ Next it computes whether original detail is both requested and allowed by `can_r
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Produces a safe log string that reports only the data URL length, not the image contents.
+**Purpose**: Creates a safe short log message for an image result. It avoids putting the full image data into logs, which could be huge or sensitive.
 
-**Data flow**: It reads `self.image_url.len()` and formats `"<image data URL omitted: {} bytes>"`. It returns that string and writes no state.
+**Data flow**: It reads the stored image data URL only to measure its length. It returns a string such as `<image data URL omitted: N bytes>` and does not expose the actual image contents.
 
-**Call relations**: The logging path calls this through the `ToolOutput` trait. The corresponding test verifies that image bytes are intentionally omitted from logs.
+**Call relations**: The tool logging system calls this when it wants a preview of the result. The test `tests::log_preview_omits_image_data` checks that the image data is hidden.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2039,11 +2057,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks successful image-view outputs as successful for logging purposes.
+**Purpose**: Marks this output as a successful tool result for logging purposes. A created `ViewImageOutput` means the image was prepared successfully.
 
-**Data flow**: It takes no inputs beyond `&self` and returns `true`.
+**Data flow**: It reads no fields and always returns `true`.
 
-**Call relations**: The logging subsystem consults this trait method when recording tool outcomes.
+**Call relations**: The generic tool output code can call this when recording whether a tool call succeeded. Errors are represented before a `ViewImageOutput` is created, so this output type reports success.
 
 
 ##### `ViewImageOutput::to_response_item`  (lines 247–262)
@@ -2052,11 +2070,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Serializes the image result into a `ResponseInputItem::FunctionCallOutput` containing an `InputImage` content item.
+**Purpose**: Turns the image output into the response format that can be sent back to the model. This is the step that packages the data URL as an input image.
 
-**Data flow**: It takes the current output, a `call_id`, and ignores the payload. It builds `FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage { image_url: self.image_url.clone(), detail: Some(self.image_detail) }])`, wraps it in `FunctionCallOutputPayload { success: Some(true), body }`, and returns `ResponseInputItem::FunctionCallOutput { call_id: call_id.to_string(), output }`.
+**Data flow**: It receives the tool call id and ignores the original payload. It clones the stored image URL, pairs it with the chosen image detail, wraps that in a successful function-call output object, and returns a `ResponseInputItem` tied to the same call id.
 
-**Call relations**: The response-construction path invokes this through the `ToolOutput` trait so the model receives the image as structured multimodal output.
+**Call relations**: After `handle_call` returns a `ViewImageOutput`, the tool framework uses this method when building the next message to the model. It uses the protocol’s content-item structures so the model sees an actual image input, not just text.
 
 *Call graph*: 2 external calls (ContentItems, vec!).
 
@@ -2067,11 +2085,11 @@ fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInp
 fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value
 ```
 
-**Purpose**: Returns a compact JSON object for code-mode consumers containing the generated data URL and detail hint.
+**Purpose**: Provides a JSON-shaped version of the image result for code-oriented tool output. It includes the image data URL and the detail level.
 
-**Data flow**: It ignores the payload and returns `json!({ "image_url": self.image_url, "detail": self.image_detail })`.
+**Data flow**: It reads the stored image URL and image detail, places them into a JSON object with `image_url` and `detail`, and returns that object.
 
-**Call relations**: Code-mode result handling calls this trait method instead of the richer response-item serializer. A unit test verifies the exact object shape.
+**Call relations**: Code-mode consumers call this when they need structured JSON instead of the normal model response item. The test `tests::code_mode_result_returns_image_url_object` confirms the shape of this JSON.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2082,11 +2100,11 @@ fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value
 fn replace_primary_environment_cwd(turn: &mut crate::TurnContext, cwd: AbsolutePathBuf)
 ```
 
-**Purpose**: Test helper that swaps the primary turn environment's cwd to a supplied absolute path.
+**Purpose**: Test helper that changes the primary test environment’s current working directory. This lets tests point the handler at a temporary folder containing test files.
 
-**Data flow**: It takes a mutable `crate::TurnContext` and an `AbsolutePathBuf`, clones the current first `TurnEnvironment`, constructs a replacement `TurnEnvironment::new` with the same environment id, environment handle, and shell but a new `PathUri::from_abs_path(&cwd)`, and writes it back into `turn.environments.turn_environments[0]`.
+**Data flow**: It receives a mutable turn context and a new absolute path. It copies the current primary environment’s identity and filesystem, replaces only its current directory with the new path converted to a path URI, and writes that environment back into the turn.
 
-**Call relations**: Image-handler tests call this helper to point the primary environment at a temporary directory containing test files.
+**Call relations**: The image-handling tests use this before invoking the handler. It calls the turn-environment constructor and path conversion helper so the test setup resembles a real environment.
 
 *Call graph*: calls 2 internal fn (new, from_abs_path).
 
@@ -2097,11 +2115,11 @@ fn replace_primary_environment_cwd(turn: &mut crate::TurnContext, cwd: AbsoluteP
 fn log_preview_omits_image_data()
 ```
 
-**Purpose**: Verifies that `ViewImageOutput::log_preview` reports only byte length and not raw image data.
+**Purpose**: Checks that image output logging does not leak the full image data URL. This protects logs from becoming noisy or exposing image contents.
 
-**Data flow**: It constructs a `ViewImageOutput` with a short data URL and default detail, calls `log_preview`, and asserts the returned string is `<image data URL omitted: 25 bytes>`.
+**Data flow**: It creates a `ViewImageOutput` with a small fake data URL, calls `log_preview`, and compares the returned text with the expected redacted preview.
 
-**Call relations**: This is a focused unit test for the output type's logging behavior.
+**Call relations**: This test directly exercises `ViewImageOutput::log_preview`. It documents the intended logging behavior for future changes.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2112,11 +2130,11 @@ fn log_preview_omits_image_data()
 fn code_mode_result_returns_image_url_object()
 ```
 
-**Purpose**: Checks the exact JSON object returned by `ViewImageOutput::code_mode_result`.
+**Purpose**: Checks that code-mode output is a JSON object containing the image URL and detail value. This guards the structured output contract.
 
-**Data flow**: It constructs a `ViewImageOutput`, calls `code_mode_result` with a dummy function payload, and asserts the result equals `{"image_url": ..., "detail": "high"}`.
+**Data flow**: It creates a `ViewImageOutput`, calls `code_mode_result` with a dummy function payload, and compares the JSON result to the expected object.
 
-**Call relations**: This test validates the code-mode serialization branch of the `ToolOutput` implementation.
+**Call relations**: This test directly exercises `ViewImageOutput::code_mode_result`. It helps ensure code-mode callers can keep relying on the same field names.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2127,11 +2145,11 @@ fn code_mode_result_returns_image_url_object()
 async fn handle_passes_sandbox_context_for_local_filesystem_reads()
 ```
 
-**Purpose**: Ensures the handler performs filesystem reads through the turn's sandbox context rather than bypassing sandbox enforcement.
+**Purpose**: Checks that `view_image` reads files through the sandboxed filesystem rules instead of bypassing permissions. The expected failure proves the sandbox context is being passed along.
 
-**Data flow**: It creates a test session and mutable turn, points the primary environment cwd at a temp directory, writes a fake image file, sets `turn.permission_profile` to `PermissionProfile::read_only()`, invokes `ViewImageHandler::default().handle(...)` with `path: "image.png"`, and asserts the result is a `FunctionCallError::RespondToModel` whose message mentions sandboxed filesystem operations requiring configured runtime paths.
+**Data flow**: It creates a session and turn, moves the environment to a temporary directory, writes a fake image file, sets a read-only permission profile, and invokes the default handler. It expects an error message about sandboxed filesystem runtime paths, showing that the read went through the sandbox layer.
 
-**Call relations**: This integration-style test exercises the filesystem-access branch of `handle_call` under sandbox restrictions.
+**Call relations**: This test calls `ViewImageHandler::default` and then uses the normal `handle` path. It is focused on the filesystem-read part of `handle_call`, especially the handoff of sandbox information.
 
 *Call graph*: calls 5 internal fn (make_session_and_context, default, new, read_only, plain); 9 external calls (new, new, assert!, replace_primary_environment_cwd, json!, panic!, write, tempdir, new).
 
@@ -2142,11 +2160,11 @@ async fn handle_passes_sandbox_context_for_local_filesystem_reads()
 async fn handle_rejects_unsupported_detail()
 ```
 
-**Purpose**: Verifies that `view_image.detail` rejects unsupported string values instead of silently coercing them.
+**Purpose**: Checks that unsupported image detail values are rejected with a clear message. This prevents typos such as `low` from being treated as some accidental default.
 
-**Data flow**: It creates a test session and turn, invokes `ViewImageHandler::default().handle(...)` with `detail: "low"`, captures the model-facing error, and asserts the message exactly matches the strict validation text.
+**Data flow**: It creates a session and turn, invokes the default handler with JSON arguments containing `detail: "low"`, and expects a model-facing error explaining that only `high` and `original` are valid.
 
-**Call relations**: This test covers the explicit `detail` parsing branch in `handle_call` before any filesystem work occurs.
+**Call relations**: This test enters through `ViewImageHandler::handle`, which then calls `handle_call`. It specifically verifies the argument-validation branch before any filesystem work matters.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, default, new, plain); 6 external calls (new, new, assert_eq!, json!, panic!, new).
 
@@ -2157,24 +2175,24 @@ async fn handle_rejects_unsupported_detail()
 async fn handle_accepts_explicit_high_detail()
 ```
 
-**Purpose**: Checks that `detail: "high"` is accepted as a valid explicit spelling of the default resized-image behavior.
+**Purpose**: Checks that explicitly asking for `high` detail is accepted as valid input. The test expects a later image-processing error because the file contents are fake, which shows the detail value itself was not rejected.
 
-**Data flow**: It creates a test session and mutable turn, points the environment cwd at a temp directory with a fake image file, disables permissions, invokes `ViewImageHandler::default().handle(...)` with `detail: "high"`, and expects image processing to proceed far enough to fail later with an `unable to process image` message rather than a detail-validation error.
+**Data flow**: It creates a temporary environment with a fake `image.png`, disables permission restrictions, invokes the default handler with `detail: "high"`, and then checks that the failure message comes from image processing rather than detail validation.
 
-**Call relations**: This test distinguishes accepted `high` from rejected unknown detail strings, covering the successful validation branch in `handle_call`.
+**Call relations**: This test uses `tests::replace_primary_environment_cwd` for setup and then runs the regular `handle` path. It exercises the successful detail-parsing branch inside `handle_call` before the image conversion step fails on intentionally invalid bytes.
 
 *Call graph*: calls 4 internal fn (make_session_and_context, default, new, plain); 9 external calls (new, new, assert!, replace_primary_environment_cwd, json!, panic!, write, tempdir, new).
 
 
 ### `core/src/tools/handlers/view_image_spec.rs`
 
-`config` · `tool registration / startup`
+`config` · `startup/tool registration`
 
-This file is responsible for constructing the `ToolSpec` for `view_image`. It introduces `ViewImageToolOptions`, a small copyable configuration struct that controls whether the schema exposes the `detail` parameter for requesting original resolution and whether it exposes `environment_id` for selecting a non-primary environment.
+This file is like the menu card for a tool that can open an image from the local filesystem. It does not load the image itself. Instead, it describes how another part of the system may call that tool: it must provide a local file path, and it may be allowed to ask for extra options depending on the current environment.
 
-`create_view_image_tool` starts with a `BTreeMap` containing the required `path` property as a `JsonSchema::string`. If `can_request_original_image_detail` is enabled, it inserts a `detail` property using `JsonSchema::string_enum` with the only accepted values `"high"` and `"original"`, matching the runtime validator. If `include_environment_id` is enabled, it inserts a string property describing how to select an environment from `<environment_context>`. The function then wraps these properties in `JsonSchema::object`, requiring only `path` and forbidding additional properties, and returns `ToolSpec::Function(ResponsesApiTool { ... })` with `strict: false` and an explicit output schema.
+The main entry point builds a `ToolSpec`, which is a formal tool description used by the responses API. A schema is included for the input parameters. A schema is a structured description of what data is allowed, similar to a form that says which fields exist and which ones are required. The `path` field is always required. If the caller is allowed to request exact image resolution, the schema also includes a `detail` field with allowed values of `high` or `original`. If the system supports multiple environments, it can also include an `environment_id` field so the image can be read from the right place.
 
-That output schema is produced by `view_image_output_schema`, which returns a JSON object schema requiring exactly `image_url` and `detail`. The `detail` enum mirrors the runtime output values (`high` or `original`), making the tool contract concrete for downstream consumers and code-mode integrations.
+The file also defines the output schema. It says that a successful call returns an `image_url`, which is a data URL for the loaded image, and a `detail` value saying whether the image was returned at normal high detail or original resolution. Without this file, the model-facing tool interface would be ambiguous, and callers might send the wrong fields or misunderstand the result.
 
 #### Function details
 
@@ -2184,11 +2202,11 @@ That output schema is produced by `view_image_output_schema`, which returns a JS
 fn create_view_image_tool(options: ViewImageToolOptions) -> ToolSpec
 ```
 
-**Purpose**: Builds the full `ToolSpec::Function` definition for `view_image`, tailoring optional parameters to the supplied options.
+**Purpose**: Builds the formal description of the `view_image` tool so it can be offered to a model or API client. It decides which optional input fields should appear based on the capabilities passed in through `ViewImageToolOptions`.
 
-**Data flow**: It takes `ViewImageToolOptions`, initializes a `BTreeMap` with the `path` string property, conditionally inserts `detail` as a string enum over `high` and `original`, conditionally inserts `environment_id` as a string property, then constructs `JsonSchema::object(properties, Some(vec!["path".to_string()]), Some(false.into()))`. It returns `ToolSpec::Function(ResponsesApiTool { name, description, strict: false, defer_loading: None, parameters, output_schema: Some(view_image_output_schema()) })`.
+**Data flow**: It receives options saying whether original-resolution requests are allowed and whether an environment ID should be accepted. It starts with a required `path` field, conditionally adds `detail` and `environment_id`, attaches the expected output shape, and returns a complete `ToolSpec` describing the tool.
 
-**Call relations**: The runtime handler's `spec()` method calls this during tool registration. It delegates output-schema construction to `view_image_output_schema` so the input and output contracts stay defined together.
+**Call relations**: A higher-level tool specification builder calls this when assembling the available tools. During that setup, this function asks `view_image_output_schema` for the promised result format, then packages both the input and output schemas into the final tool definition.
 
 *Call graph*: calls 4 internal fn (view_image_output_schema, object, string, string_enum); called by 1 (spec); 3 external calls (from, Function, vec!).
 
@@ -2199,24 +2217,24 @@ fn create_view_image_tool(options: ViewImageToolOptions) -> ToolSpec
 fn view_image_output_schema() -> Value
 ```
 
-**Purpose**: Defines the JSON schema for the structured result returned by `view_image`.
+**Purpose**: Defines what the `view_image` tool returns after it loads an image. It gives callers a clear contract: they should expect an image data URL and a detail label.
 
-**Data flow**: It takes no inputs and returns a `serde_json::Value` describing an object with `image_url: string` and `detail: string` constrained to `high` or `original`, both required and with `additionalProperties: false`.
+**Data flow**: It takes no input. It creates a JSON object describing the output fields, marks both `image_url` and `detail` as required, disallows extra fields, and returns that JSON schema value.
 
-**Call relations**: Only `create_view_image_tool` calls this helper. It keeps the output contract centralized and synchronized with `ViewImageOutput::code_mode_result` and `to_response_item`.
+**Call relations**: This helper is used by `create_view_image_tool` while building the full tool description. It keeps the output contract in one small place so the main tool-building function can include it whenever the tool is registered.
 
 *Call graph*: called by 1 (create_view_image_tool); 1 external calls (json!).
 
 
 ### `core/src/tools/handlers/get_context_remaining.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `tool invocation during a conversation turn`
 
-This file contains both the runtime handler and its custom output type. `GetContextRemainingOutput` stores a single `Option<i64>` named `tokens_left`; `Some(n)` means the turn knows the model context window and can compute remaining budget, while `None` means the budget is unavailable. Its `fragment` method renders that state through `TokenBudgetRemainingContext`, using either `new(tokens_left)` or `unknown()`, so the textual representation stays consistent with the rest of the context system.
+Large language models can only read a limited amount of text at one time. That limit is called the context window. This file provides a small tool the model can call to ask, “How many tokens do I have left?” A token is a small chunk of text, often part of a word.
 
-The `ToolOutput` implementation makes this output always log as successful, uses the rendered fragment for `log_preview`, converts it into a `FunctionToolOutput::from_text(..., Some(true))` when building a `ResponseInputItem`, and exposes a compact JSON object `{ "tokens_left": ... }` for code mode.
+The main piece is `GetContextRemainingHandler`, which plugs into the tool system. When the tool is invoked, it first checks that the request is the expected kind of tool call. Then it asks the current turn for the model’s context-window size. If that size is not known, it returns an “unknown” answer rather than guessing. If it is known, it asks the session how many tokens are currently in use, subtracts that from the model’s maximum, and never lets the result go below zero.
 
-`GetContextRemainingHandler` is a stateless executor. It advertises a plain tool name from `GET_CONTEXT_REMAINING_TOOL_NAME` and a spec built by `create_get_context_remaining_tool`. At execution time it only accepts `ToolPayload::Function`; any other payload becomes `FunctionCallError::RespondToModel`. If `invocation.turn.model_context_window()` is absent, it returns an output with `tokens_left: None`. Otherwise it reads total token usage from `session.get_total_token_usage().await`, clamps negative usage to zero, subtracts it from the model window with `saturating_sub`, clamps the result to zero again, and returns that remaining-token count boxed as a tool output.
+The answer is wrapped in `GetContextRemainingOutput`. This output can be shown to the model as plain text, logged for humans, or returned as structured JSON in code-oriented mode. Think of it like a fuel gauge: it does not drive the car, but it tells the driver how much range remains before they must be careful.
 
 #### Function details
 
@@ -2226,11 +2244,11 @@ The `ToolOutput` implementation makes this output always log as successful, uses
 fn new(tokens_left: Option<i64>) -> Self
 ```
 
-**Purpose**: Constructs the output wrapper around an optional remaining-token count.
+**Purpose**: Creates a small output object holding the number of tokens left, or no number if the system cannot know it. This keeps the answer in one simple package for later formatting.
 
-**Data flow**: Takes `Option<i64>` and stores it in the `tokens_left` field, returning a new `GetContextRemainingOutput`.
+**Data flow**: It receives an optional token count. It stores that value inside a new `GetContextRemainingOutput` object and returns the object unchanged except for wrapping it in this output type.
 
-**Call relations**: It is used by `GetContextRemainingHandler::handle` for both the known-budget and unknown-budget branches.
+**Call relations**: The handler calls this after it has either calculated the remaining tokens or discovered that the model’s context size is unknown. The resulting object is then handed to the common tool-output wrapper so the rest of the system can return it in the usual way.
 
 *Call graph*: called by 1 (handle).
 
@@ -2241,11 +2259,11 @@ fn new(tokens_left: Option<i64>) -> Self
 fn fragment(&self) -> String
 ```
 
-**Purpose**: Renders the remaining-context state into the textual fragment shown to the model and logs.
+**Purpose**: Turns the stored token information into human-readable text. If the number is known, it renders a message with that number; if not, it renders an “unknown” context-budget message.
 
-**Data flow**: Reads `self.tokens_left`; when it is `Some(tokens_left)`, it constructs `TokenBudgetRemainingContext::new(tokens_left)` and renders it, otherwise it constructs `TokenBudgetRemainingContext::unknown()` and renders that. Returns the resulting `String`.
+**Data flow**: It reads `tokens_left` from the output object. When a number is present, it builds a token-budget context message from that number and renders it as text. When no number is present, it builds and renders an unknown-budget message. The result is a string.
 
-**Call relations**: This is the shared formatting helper used by both `log_preview` and `to_response_item` so those surfaces stay identical.
+**Call relations**: The logging path and the model-response path both call this so they show the same wording. Internally it relies on the context-rendering helpers that know how to phrase token-budget information.
 
 *Call graph*: calls 2 internal fn (new, unknown); called by 2 (log_preview, to_response_item).
 
@@ -2256,11 +2274,11 @@ fn fragment(&self) -> String
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Provides the log preview string for this tool output.
+**Purpose**: Provides the short text that should appear in logs for this tool result. It uses the same text shown to the model so logs stay easy to compare with actual behavior.
 
-**Data flow**: Calls `self.fragment()` and returns the rendered text.
+**Data flow**: It receives the output object, asks `fragment` to turn it into text, and returns that text as the log preview. It does not change any state.
 
-**Call relations**: It is part of the `ToolOutput` trait implementation and delegates all formatting to `fragment`.
+**Call relations**: The tool-output logging system calls this when it needs a quick summary of the result. It delegates the actual wording to `GetContextRemainingOutput::fragment`.
 
 *Call graph*: calls 1 internal fn (fragment).
 
@@ -2271,11 +2289,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks this output as successful for logging purposes regardless of whether the token count is known.
+**Purpose**: Marks this tool result as successful for logging purposes. Even an unknown token count is treated as a valid result, because the tool successfully answered with the best available information.
 
-**Data flow**: Returns the constant boolean `true` without reading or mutating additional state.
+**Data flow**: It takes no meaningful input beyond the output object and always returns `true`. Nothing is changed.
 
-**Call relations**: This is consumed by generic logging paths; it has no internal delegation.
+**Call relations**: The tool logging machinery uses this to decide whether the result should be recorded as a success. This function does not call out to other code because the answer is unconditional.
 
 
 ##### `GetContextRemainingOutput::to_response_item`  (lines 47–50)
@@ -2284,11 +2302,11 @@ fn success_for_logging(&self) -> bool
 fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the output into the standard function-tool response item injected back into the conversation.
+**Purpose**: Converts the token-budget answer into the standard response item format that can be sent back into the conversation. This is how the model receives the tool’s answer as text.
 
-**Data flow**: Reads `call_id` and `payload`, renders the text via `self.fragment()`, wraps it in `FunctionToolOutput::from_text(..., Some(true))`, and then delegates to that object's `to_response_item(call_id, payload)` to produce a `ResponseInputItem`.
+**Data flow**: It receives the tool call ID and the original tool payload, reads the output object, turns it into text with `fragment`, wraps that text as a successful function-tool output, and converts it into a `ResponseInputItem`. The returned item is ready for the conversation pipeline.
 
-**Call relations**: This method is called by generic tool-output handling when the result must be serialized into the model conversation.
+**Call relations**: The broader tool system calls this after the handler returns the output. It uses `FunctionToolOutput::from_text` to package the message, then hands off to that shared output type to produce the final response item.
 
 *Call graph*: calls 2 internal fn (from_text, fragment).
 
@@ -2299,11 +2317,11 @@ fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInpu
 fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 ```
 
-**Purpose**: Produces the structured JSON representation used by code-mode consumers.
+**Purpose**: Returns the same answer in a structured JSON form for code-oriented consumers. Instead of prose, it exposes a `tokens_left` field that software can read directly.
 
-**Data flow**: Ignores the payload and returns `json!({ "tokens_left": self.tokens_left })`.
+**Data flow**: It reads the stored optional token count and places it into a JSON object under the key `tokens_left`. If the count is unknown, the JSON value is null. It returns that JSON object and does not modify anything.
 
-**Call relations**: This is another `ToolOutput` trait hook, parallel to `to_response_item`, but aimed at structured downstream consumers.
+**Call relations**: The tool system calls this when it needs a machine-readable result rather than a plain text response. It uses JSON construction directly and does not depend on the text-rendering path.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2314,11 +2332,11 @@ fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Advertises the built-in tool under its fixed plain name.
+**Purpose**: Identifies this handler as the implementation for the `get_context_remaining` tool. The registry uses this name to match an incoming tool call to the right handler.
 
-**Data flow**: Constructs and returns `ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME)`.
+**Data flow**: It reads the tool-name constant, wraps it as a plain tool name, and returns that name. No outside state is changed.
 
-**Call relations**: The registry uses this metadata to expose and route the tool.
+**Call relations**: The tool registry calls this while registering or looking up tools. It uses the shared `ToolName::plain` helper so the name is represented in the standard format.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -2329,11 +2347,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the tool specification describing this built-in utility tool.
+**Purpose**: Provides the formal description of the tool, such as its name and expected shape, so the model and runtime know how it may be called.
 
-**Data flow**: Calls `create_get_context_remaining_tool()` and returns the resulting `ToolSpec`.
+**Data flow**: It calls the tool-specification builder and returns the resulting `ToolSpec`. It does not inspect the current session or invocation.
 
-**Call relations**: This delegates schema construction to the companion spec file so runtime logic stays separate from wire-shape definition.
+**Call relations**: The tool registry or setup code calls this when advertising available tools. The details come from `create_get_context_remaining_tool`, keeping the handler’s runtime behavior separate from the tool’s public definition.
 
 *Call graph*: calls 1 internal fn (create_get_context_remaining_tool).
 
@@ -2344,22 +2362,24 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Computes the remaining token budget for the current turn and returns it as a boxed tool output.
+**Purpose**: Runs the actual `get_context_remaining` tool call. It checks that the call is valid, calculates how many context tokens remain when possible, and returns that answer in the standard tool-output form.
 
-**Data flow**: Consumes a `ToolInvocation` inside a pinned async block. It first checks that `invocation.payload` matches `ToolPayload::Function`; otherwise it returns `FunctionCallError::RespondToModel`. It then queries `invocation.turn.model_context_window()`: if absent, it boxes `GetContextRemainingOutput::new(None)`; if present, it awaits `invocation.session.get_total_token_usage()`, clamps usage to nonnegative, computes `tokens_left = model_context_window.saturating_sub(active_context_tokens).max(0)`, wraps that in `GetContextRemainingOutput::new(Some(tokens_left))`, boxes it, and returns it.
+**Data flow**: It receives a `ToolInvocation`, which includes the payload, current turn, and session. First it rejects unsupported payloads with an error message. Then it reads the model’s context-window size from the turn. If that size is missing, it returns an output with no token count. If the size is known, it asks the session for total token usage, treats negative usage as zero, subtracts usage from the window size safely, clamps the result at zero, and returns that number as boxed tool output.
 
-**Call relations**: This is the sole execution path for the handler. It does not call other tool handlers, only the output constructor and session/turn accessors needed for the calculation.
+**Call relations**: The tool runtime calls this when the model invokes `get_context_remaining`. It creates `GetContextRemainingOutput` objects for both known and unknown cases, wraps them with `boxed_tool_output`, and reports a model-facing error if some other kind of payload reaches this handler.
 
 *Call graph*: calls 2 internal fn (boxed_tool_output, new); 3 external calls (pin, matches!, RespondToModel).
 
 
 ### `core/src/tools/handlers/agent_jobs_spec.rs`
 
-`config` · `tool registration and schema advertisement`
+`config` · `startup/tool registration`
 
-This file is pure tool-schema construction. It does not execute jobs; instead it builds `codex_tools::ToolSpec::Function` values that describe the accepted JSON parameters and human-readable semantics for two related tools. `create_spawn_agents_on_csv_tool` constructs an object schema with string fields for `csv_path`, `instruction`, `id_column`, and `output_csv_path`; numeric fields for `max_concurrency`, `max_workers`, and `max_runtime_seconds`; and an `output_schema` object whose description explains that it constrains each worker's reported result object. The resulting `ResponsesApiTool` marks only `csv_path` and `instruction` as required and disallows additional properties via `Some(false.into())`.
+This file is like the instruction card for two tools, not the place where the work itself is done. The first tool, `spawn_agents_on_csv`, lets a main agent point at a CSV file and give an instruction template. The system can then start one worker sub-agent for each row, filling placeholders like `{column_name}` with values from that row. The tool description also says which options are allowed, such as an ID column, an output CSV path, a concurrency limit, a per-worker timeout, and an optional JSON Schema. A JSON Schema is a machine-readable shape description for JSON data, used here to say what each worker result should look like.
 
-`create_report_agent_job_result_tool` similarly builds the worker callback schema. Its parameters require `job_id`, `item_id`, and `result`, with an optional boolean `stop` flag that requests cancellation of remaining items after recording the current result. Both specs set `strict: false`, leave `defer_loading` and `output_schema` unset, and embed detailed descriptions aimed at model behavior: the spawn tool blocks until completion and auto-exports CSV output, while the report tool is explicitly worker-only. The use of `BTreeMap` gives deterministic property ordering, which matters for stable tests and predictable serialized specs.
+The second tool, `report_agent_job_result`, is for the worker agents. It gives each worker a standard way to say, “Here is the result for my job item,” and optionally ask the larger job to stop after recording that result.
+
+Nothing in this file reads CSVs, starts agents, or writes output files. Its job is to build `ToolSpec` values: structured descriptions containing tool names, human-readable explanations, required fields, and allowed parameter shapes. Without this file, the system would not have a clear contract for these agent-job tools, and callers could not reliably know how to invoke them.
 
 #### Function details
 
@@ -2369,11 +2389,11 @@ This file is pure tool-schema construction. It does not execute jobs; instead it
 fn create_spawn_agents_on_csv_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the full function-tool specification for launching one worker sub-agent per CSV row.
+**Purpose**: Builds the formal description for the `spawn_agents_on_csv` tool. This description tells callers how to request a CSV-driven batch job where each row becomes work for a separate sub-agent.
 
-**Data flow**: It creates a `JsonSchema` object for `output_schema`, annotates it with a description, assembles a `BTreeMap<String, JsonSchema>` for all input properties, then wraps those properties in a `ResponsesApiTool` inside `ToolSpec::Function`. The return value is a complete immutable schema object; no external state is read or written.
+**Data flow**: It starts with no outside input. It creates a parameter schema describing the allowed fields: the CSV path, the instruction template, optional ID and output paths, worker limits, runtime limits, and an optional result-shape schema. It then wraps that schema with the tool name and explanation, and returns a `ToolSpec` that the wider system can register and expose.
 
-**Call relations**: Called by `SpawnAgentsOnCsvHandler::spec` so the runtime can advertise its accepted arguments. It centralizes the schema text that tests compare exactly.
+**Call relations**: The broader tool specification setup calls this function when assembling the available tools. Inside, it relies on schema-building helpers to describe strings, numbers, and objects, then hands back one complete tool definition for the rest of the system to advertise and validate against.
 
 *Call graph*: calls 3 internal fn (number, object, string); called by 1 (spec); 4 external calls (from, new, Function, vec!).
 
@@ -2384,22 +2404,24 @@ fn create_spawn_agents_on_csv_tool() -> ToolSpec
 fn create_report_agent_job_result_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the function-tool specification workers use to submit a result object for a specific job item.
+**Purpose**: Builds the formal description for the `report_agent_job_result` tool. This is the worker-only reporting channel used by sub-agents to submit the result for a single job item.
 
-**Data flow**: It creates a described object schema for `result`, defines `job_id`, `item_id`, `result`, and optional `stop` properties in a `BTreeMap`, and returns a `ToolSpec::Function` containing a `ResponsesApiTool` with those parameters and required-field metadata.
+**Data flow**: It starts with no outside input. It creates a schema requiring a job ID, an item ID, and a result object, with an optional `stop` flag that can cancel remaining work. It packages these rules with the tool name and description, then returns a `ToolSpec` ready for registration.
 
-**Call relations**: Used by the corresponding report-result handler's `spec` path. Its descriptions encode an important call-flow rule: only worker agents should invoke this tool.
+**Call relations**: The broader tool specification setup calls this function alongside other tool-definition builders. This function does not record any result itself; it only describes the shape of a valid report so the actual job system can later receive and check worker submissions consistently.
 
 *Call graph*: calls 3 internal fn (boolean, object, string); called by 1 (spec); 4 external calls (from, new, Function, vec!).
 
 
 ### `core/src/tools/handlers/new_context_window_spec.rs`
 
-`config` · `tool registration / schema publication`
+`config` · `tool registration`
 
-This file is the spec companion to the `new_context` handler. It exports the shared constant `NEW_CONTEXT_WINDOW_TOOL_NAME` with value `"new_context"`, ensuring the handler and schema stay aligned on the externally visible tool identifier. The single function, `create_new_context_window_tool`, constructs a `ToolSpec::Function` wrapping a `ResponsesApiTool` with a short description and no output schema.
+This file is like a small label and instruction card for one tool. The rest of the system needs a precise description of every tool it can offer, so that an outside caller knows the tool’s name, what it does, and what input it expects. Here, the tool is called `new_context`, and its job is to ask the system to begin a new context window.
 
-The parameter schema is deliberately an empty JSON object: `JsonSchema::object(BTreeMap::new(), None, Some(false.into()))` means there are no defined properties, no required fields, and additional properties are disallowed. `strict` is set to `false`, so the tool is not marked as strict at the Responses API layer even though the schema itself is minimal. `defer_loading` is left as `None`, indicating the tool is available immediately rather than lazily loaded. Because the tool's runtime behavior is just a session-side signal to start a new context window, there is no richer argument structure or typed output schema here. This file is purely declarative and is consumed by the handler's `spec` method.
+A “context window” is the chunk of conversation or working memory the model is currently using. Starting a new one is useful when the current working space is full or when a clean slate is needed.
+
+The file builds a `ToolSpec`, which is a structured description of the tool. It says the tool is a function-style tool, gives it the name `new_context`, describes it as “Start a new context window,” and declares that it takes no input parameters. The empty JSON schema is important: it tells callers they should not send arguments with this tool. Without this file, the broader tool registry would not know how to present or describe the `new_context` tool.
 
 #### Function details
 
@@ -2409,22 +2431,24 @@ The parameter schema is deliberately an empty JSON object: `JsonSchema::object(B
 fn create_new_context_window_tool() -> ToolSpec
 ```
 
-**Purpose**: Constructs the `ToolSpec` describing the `new_context` function tool. It declares the tool name, human-readable description, and an empty-object parameter schema.
+**Purpose**: Creates the formal description of the `new_context` tool so it can be offered to callers. Someone would use this when assembling the list of available tools.
 
-**Data flow**: Creates an empty `BTreeMap` for properties, passes it to `JsonSchema::object` with no required fields and `additionalProperties = false`, embeds that schema into a `ResponsesApiTool` with fixed metadata, wraps it in `ToolSpec::Function`, and returns it.
+**Data flow**: It takes no input. It builds a tool description with a fixed name, a short human-readable explanation, and an empty parameter schema meaning “no arguments are expected.” It returns that finished tool specification without changing any outside state.
 
-**Call relations**: Called by `NewContextWindowHandler::spec` when the runtime publishes or queries the tool definition.
+**Call relations**: When the broader `spec` code is collecting tool definitions, it calls this function to get the `new_context` tool’s description. Inside, this function uses helper constructors to build the empty JSON schema and wrap the result as a function-style tool specification.
 
 *Call graph*: calls 1 internal fn (object); called by 1 (spec); 2 external calls (new, Function).
 
 
 ### `core/src/tools/handlers/plan_spec.rs`
 
-`config` · `tool registration / schema publication`
+`config` · `startup/tool registration`
 
-This file is the declarative schema definition for the plan-update tool. `create_update_plan_tool` first builds `plan_item_properties`, a `BTreeMap` containing two fields: `step`, a descriptive string, and `status`, a string enum restricted to `pending`, `in_progress`, or `completed`. It then embeds that object schema inside the top-level `plan` array property, requiring both `step` and `status` on each item and disallowing additional properties on each plan item object.
+This file is like the form template for updating a task plan. It does not update the plan itself. Instead, it describes the tool that can be used to send a plan update: an optional explanation plus a list of steps, where each step has text and a status.
 
-At the top level, the schema exposes two properties: optional `explanation` text and required `plan`, which is the array of plan items. The final `ResponsesApiTool` is wrapped in `ToolSpec::Function` with name `update_plan`, `strict: false`, no deferred loading, and no output schema. The multiline description includes an important semantic rule not enforced structurally by the schema itself: at most one step can be `in_progress` at a time. That means consumers and downstream logic must treat this as a behavioral contract rather than a JSON-schema validation rule. Overall, this file is purely schema/configuration code used by `PlanHandler::spec` to advertise the tool to the model.
+The main reason this exists is to keep plan updates consistent. Without this specification, callers could send loosely shaped data, such as a step without a status or a status with an unexpected value. Here, the allowed statuses are limited to `pending`, `in_progress`, and `completed`, which makes the plan easier for the rest of the system to display and reason about.
+
+The file builds a JSON schema, which is a machine-readable description of valid JSON data. First it defines what each plan item looks like. Then it defines the full tool input: an optional `explanation` and a required `plan` array. Finally, it wraps that schema in a `ToolSpec`, giving the tool its public name, `update_plan`, and a human-readable description. The note that only one step should be `in_progress` is part of the tool description rather than something enforced by this schema.
 
 #### Function details
 
@@ -2434,11 +2458,11 @@ At the top level, the schema exposes two properties: optional `explanation` text
 fn create_update_plan_tool() -> ToolSpec
 ```
 
-**Purpose**: Constructs the full `ToolSpec` for the `update_plan` function tool, including nested schemas for plan items and top-level arguments. It captures both field-level descriptions and the required `plan` property.
+**Purpose**: Creates the formal definition of the `update_plan` tool so it can be registered and offered to callers. The definition says what fields the tool accepts and which values are valid.
 
-**Data flow**: Builds `plan_item_properties` as a `BTreeMap` of `JsonSchema` entries for `step` and `status`; wraps those in a `JsonSchema::object` requiring both keys and forbidding extra fields; places that object schema inside a `JsonSchema::array` for the `plan` property; builds a top-level properties map with optional `explanation` and required `plan`; then creates a `ResponsesApiTool` with fixed metadata and wraps it in `ToolSpec::Function` for return.
+**Data flow**: It starts with no outside input. It builds small schema pieces for a plan item, including a `step` string and a `status` string limited to known status words. It then builds the larger input schema with an optional explanation and a required list of plan items. The result is a `ToolSpec` object that the caller can register or publish as the `update_plan` tool.
 
-**Call relations**: Called by `PlanHandler::spec` whenever the runtime needs the advertised schema for the plan tool.
+**Call relations**: This function is called by `spec` when the system is assembling its available tools. Inside, it uses schema-building helpers such as string, enum, array, and object constructors to describe the accepted data, then hands back one complete function-style tool definition.
 
 *Call graph*: calls 4 internal fn (array, object, string, string_enum); called by 1 (spec); 3 external calls (from, Function, vec!).
 
@@ -2448,18 +2472,28 @@ This group introduces the code-mode subsystem and then follows the core-facing s
 
 ### `code-mode/src/lib.rs`
 
-`orchestration` · `service setup and code-mode session handling`
+`orchestration` · `cross-cutting`
 
-This crate root organizes the code-mode feature into `runtime` and `service` modules, then re-exports two different categories of API. First, it publicly re-exports everything from `codex_code_mode_protocol`, making the protocol’s request/response/message types available directly through this crate. Second, it selectively re-exports service-layer types from `service`: `CodeModeService`, `InProcessCodeModeSessionProvider`, and `NoopCodeModeSessionDelegate`. That combination suggests a layered design where protocol definitions are shared externally, while this crate adds executable behavior for hosting or brokering code-mode sessions. The naming indicates support for an in-process session provider and a no-op delegate implementation, likely useful for embedding, default wiring, or tests. The file itself contains no logic, but it is the integration point that turns lower-level protocol and service modules into a coherent public package. A reader should note that `runtime` is kept internal, implying that execution mechanics are intentionally hidden behind the exported service abstractions.
+This file is small, but it is important because it defines the library’s outside shape. In Rust, a `lib.rs` file is like the reception desk for a package: it decides which internal rooms exist and which names visitors are allowed to use directly.
+
+Here, the file declares two internal modules: `runtime` and `service`. Those modules contain the actual implementation details. It then re-exports, meaning “makes available again from here,” the protocol definitions from `codex_code_mode_protocol` and several service-related types from the `service` module.
+
+The practical effect is convenience and stability. Other code can import `CodeModeService`, `InProcessCodeModeSessionProvider`, `NoopCodeModeSessionDelegate`, and the protocol types from this library’s top level instead of needing to know where each item lives internally. Without this file, users of the library would have to reach into deeper module paths, and internal reorganizations would be more likely to break them.
+
+There are no functions here. Its job is not to run behavior directly, but to present a clean public API: the set of names this crate wants the rest of the system to rely on.
 
 
 ### `code-mode/src/runtime/globals.rs`
 
-`orchestration` · `runtime startup before module evaluation`
+`orchestration` · `runtime startup`
 
-This file is responsible for shaping the V8 global object before user code runs. `install_globals` starts from the current context’s global object, explicitly deletes `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`, then constructs and installs the runtime’s helper surface: `tools`, `ALL_TOOLS`, timeout helpers, output helpers, storage helpers, notification/yield helpers, and `exit`. Every installation step returns `Result<(), String>`, so startup fails fast with a concrete message if any V8 allocation or property mutation fails.
+This file is like setting up a carefully stocked workbench before letting someone start a task. The runtime uses V8, the JavaScript engine, to run code. Before that code begins, this file decides what global names the code can see.
 
-Two builders derive their contents from `RuntimeState.enabled_tools`. `build_tools_object` creates an object whose properties are each tool’s `global_name`, mapped to a V8 function generated by `tool_function`; the function carries the tool index as callback data so `tool_callback` can recover the selected tool later. `build_all_tools_value` creates an array of metadata objects with `name` and `description` fields for all enabled tools. `helper_function` is the generic constructor for named helper callbacks, attaching the helper name as callback data. `set_global` and `delete_global` centralize property mutation and produce formatted error messages that include the affected global name, which makes runtime initialization failures much easier to diagnose.
+First, it removes some default JavaScript globals: `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`. This likely keeps the environment smaller, more controlled, and less able to do things the runtime does not want to support. Then it adds project-specific globals. Some are helper functions, such as `text`, `image`, `store`, `load`, `notify`, `setTimeout`, `clearTimeout`, `yield_control`, and `exit`. Each of these is backed by a Rust callback, meaning JavaScript can call the function but Rust does the real work.
+
+It also exposes available tools in two forms. `tools` is an object whose properties are callable tool functions. `ALL_TOOLS` is an array of simple metadata objects, each with a name and description, so code can inspect what tools exist.
+
+The important idea is control. Without this file, user JavaScript would either miss the helpers it needs to interact with the host system, or it might have access to built-ins the runtime intentionally removes.
 
 #### Function details
 
@@ -2469,11 +2503,11 @@ Two builders derive their contents from `RuntimeState.enabled_tools`. `build_too
 fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String>
 ```
 
-**Purpose**: Configures the V8 global object for code-mode execution by removing unsupported globals and installing helper functions plus tool metadata.
+**Purpose**: Sets up the global JavaScript environment before user code runs. It removes selected built-in globals and installs the runtime’s supported helper functions and tool lists.
 
-**Data flow**: Obtains the current context’s global object from the scope. Calls `delete_global` for `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`; builds `tools` and `ALL_TOOLS`; creates helper functions for timeout, output, storage, notification, yielding, and exit callbacks; then writes each value onto the global object via `set_global`. Returns `Ok(())` only if every deletion, allocation, function creation, and property set succeeds.
+**Data flow**: It receives a V8 scope, which is the current access point into the JavaScript engine. From that scope it finds the current global object, deletes unwanted names from it, builds tool-related values and helper functions, then attaches all of them as global names. If any step fails, it returns an error message; otherwise it finishes successfully.
 
-**Call relations**: Called by `run_runtime` immediately after `RuntimeState` is placed into the scope and before any user module is evaluated. It orchestrates the helper constructors in this file and wires them to the callback functions defined in `callbacks.rs`.
+**Call relations**: This is called by `run_runtime` during runtime setup. It acts as the main coordinator in this file: it asks `delete_global` to remove blocked globals, asks `build_tools_object` and `build_all_tools_value` to prepare tool information, asks `helper_function` to wrap Rust callbacks as JavaScript functions, and uses `set_global` to publish everything into the JavaScript environment.
 
 *Call graph*: calls 5 internal fn (build_all_tools_value, build_tools_object, delete_global, helper_function, set_global); called by 1 (run_runtime); 1 external calls (get_current_context).
 
@@ -2486,11 +2520,11 @@ fn build_tools_object(
 ) -> Result<v8::Local<'s, v8::Object>, String>
 ```
 
-**Purpose**: Constructs the `tools` object exposed to JavaScript, with one callable property per enabled tool.
+**Purpose**: Creates the global `tools` object that JavaScript code can use to call enabled tools by name. Each enabled tool becomes one property on that object.
 
-**Data flow**: Creates a fresh V8 object, clones `RuntimeState.enabled_tools` from the scope slot if present, and iterates with indices. For each tool, allocates a V8 string from `tool.global_name`, creates a function via `tool_function(scope, tool_index)`, and sets that function on the object under the tool name. Returns the populated object or an allocation error string.
+**Data flow**: It reads the runtime state stored in the V8 scope to find the list of enabled tools. For each tool, it turns the tool’s global name into a JavaScript string, creates a callable JavaScript function for that tool, and places it on a new object. The result is that object, ready to be installed as `tools`.
 
-**Call relations**: Invoked by `install_globals` as part of startup. It delegates per-tool function creation to `tool_function`, which embeds the numeric index consumed later by `callbacks::tool_callback`.
+**Call relations**: `install_globals` calls this while preparing the runtime environment. For each tool it delegates to `tool_function`, which creates the actual JavaScript function connected to the shared `tool_callback` Rust callback.
 
 *Call graph*: calls 1 internal fn (tool_function); called by 1 (install_globals); 2 external calls (new, new).
 
@@ -2503,11 +2537,11 @@ fn build_all_tools_value(
 ) -> Result<v8::Local<'s, v8::Value>, String>
 ```
 
-**Purpose**: Builds the `ALL_TOOLS` array containing lightweight metadata for every enabled tool.
+**Purpose**: Creates the global `ALL_TOOLS` value, which is a JavaScript array describing the enabled tools. This gives JavaScript code a simple way to see what tools exist and what they are for.
 
-**Data flow**: Clones `RuntimeState.enabled_tools`, allocates a V8 array sized to the tool count, and allocates reusable `name` and `description` keys. For each tool it creates an object, allocates V8 strings for `tool.global_name` and `tool.description`, sets those fields on the object, and appends the object into the array by index. Returns the array as a `v8::Value` or a descriptive error if any set/index operation fails.
+**Data flow**: It reads the enabled tools from the runtime state in the V8 scope. It creates a JavaScript array, then for each tool creates a small object containing `name` and `description`. Those objects are placed into the array. The finished array is returned as a JavaScript value, or an error is returned if allocation or assignment fails.
 
-**Call relations**: Called only by `install_globals`. Unlike `build_tools_object`, it exposes metadata rather than executable callbacks, giving scripts a discoverable list of available tools.
+**Call relations**: `install_globals` calls this during setup and then publishes the returned value as the global `ALL_TOOLS`. Unlike `build_tools_object`, this does not create callable functions; it creates readable metadata for discovery.
 
 *Call graph*: called by 1 (install_globals); 3 external calls (new, new, new).
 
@@ -2522,11 +2556,11 @@ fn helper_function(
 ) -> Result<v8::Local<'s, v8::Function>, String>
 ```
 
-**Purpose**: Creates a named V8 function from a Rust callback and attaches the helper name as callback data.
+**Purpose**: Turns a Rust callback into a JavaScript function with a given name. This is used for built-in helpers like `text`, `store`, `notify`, and `exit`.
 
-**Data flow**: Allocates a V8 string from the provided `name`, builds a `v8::FunctionTemplate` from the supplied callback with `.data(name.into())`, materializes it into a concrete function with `get_function`, and returns that function or an allocation/creation error string.
+**Data flow**: It receives the V8 scope, the helper’s name, and the Rust callback that should run when JavaScript calls it. It creates a JavaScript string for the name, builds a V8 function template around the callback, stores the name as callback data, and produces a JavaScript function. The output is that function, or an error message if creation fails.
 
-**Call relations**: Used repeatedly by `install_globals` for non-tool helpers such as `text`, `image`, `notify`, and timeout controls. It centralizes the common V8 function-template boilerplate so startup wiring stays uniform.
+**Call relations**: `install_globals` calls this repeatedly, once for each runtime helper. The functions it returns are then passed to `set_global`, which makes them visible to JavaScript code.
 
 *Call graph*: called by 1 (install_globals); 2 external calls (builder, new).
 
@@ -2540,11 +2574,11 @@ fn tool_function(
 ) -> Result<v8::Local<'s, v8::Function>, String>
 ```
 
-**Purpose**: Creates a V8 function for a specific enabled tool, embedding the tool’s numeric index into callback data.
+**Purpose**: Creates one JavaScript function for one enabled tool. The function remembers which tool it represents by storing the tool’s index as callback data.
 
-**Data flow**: Converts `tool_index` to a string, allocates it as a V8 string, builds a `v8::FunctionTemplate` using `tool_callback` with that string as `.data(...)`, then materializes and returns the function. Errors report failure to allocate callback data or create the function.
+**Data flow**: It receives the V8 scope and a numeric tool index. It turns the index into a JavaScript string, builds a function template using the shared `tool_callback`, stores the index as data on that function, and returns the created JavaScript function. If V8 cannot allocate the needed values, it returns an error message.
 
-**Call relations**: Called by `build_tools_object` for each enabled tool. The embedded index is later parsed by `callbacks::tool_callback` to look up the corresponding `EnabledToolMetadata` entry in `RuntimeState`.
+**Call relations**: `build_tools_object` calls this once per enabled tool while building the global `tools` object. Later, when JavaScript calls one of those tool functions, the shared `tool_callback` can use the stored index to know which enabled tool was requested.
 
 *Call graph*: called by 1 (build_tools_object); 2 external calls (builder, new).
 
@@ -2560,11 +2594,11 @@ fn set_global(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Sets a named property on the V8 global object and converts V8 success/failure into a Rust `Result` with contextual error text.
+**Purpose**: Adds or replaces one named value on the JavaScript global object. It is the small safety-checked helper used to publish runtime functions and values.
 
-**Data flow**: Allocates a V8 string key from `name`, calls `global.set(scope, key.into(), value)`, and returns `Ok(())` only when V8 reports `Some(true)`. Allocation or property-set failure becomes an `Err` mentioning the exact global name.
+**Data flow**: It receives the V8 scope, the global object, a name, and the JavaScript value to store. It turns the name into a JavaScript string and tries to assign the value on the global object. If the assignment succeeds, it returns success; if not, it returns a clear error message naming the global that failed.
 
-**Call relations**: Used exclusively by `install_globals` after helper values have been built. It provides consistent error reporting for every global property installation.
+**Call relations**: `install_globals` calls this for every global it wants to expose, including `tools`, `ALL_TOOLS`, and each helper function. It is the final step that makes previously built values available to user JavaScript.
 
 *Call graph*: called by 1 (install_globals); 3 external calls (set, format!, new).
 
@@ -2579,22 +2613,24 @@ fn delete_global(
 ) -> Result<(), String>
 ```
 
-**Purpose**: Removes a named property from the V8 global object and reports failures with the property name included.
+**Purpose**: Removes one named value from the JavaScript global object. This is used to take away built-in features the runtime does not want user code to access.
 
-**Data flow**: Allocates a V8 string key from `name`, calls `global.delete(scope, key.into())`, and returns `Ok(())` only when V8 reports `Some(true)`. Allocation or deletion failure becomes an `Err` naming the global that could not be removed.
+**Data flow**: It receives the V8 scope, the global object, and the name to remove. It turns the name into a JavaScript string and asks V8 to delete that property from the global object. It returns success if deletion worked, or an error message naming the global that could not be removed.
 
-**Call relations**: Called by `install_globals` during environment hardening before helper installation. It is used specifically to strip built-ins that this runtime does not want exposed to user code.
+**Call relations**: `install_globals` calls this at the start of setup to remove `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`. This happens before new project-specific globals are installed, so the environment is cleaned first and then stocked with approved helpers.
 
 *Call graph*: called by 1 (install_globals); 3 external calls (delete, format!, new).
 
 
 ### `code-mode/src/runtime/callbacks.rs`
 
-`domain_logic` · `during JS execution and callback dispatch`
+`io_transport` · `during JavaScript runtime execution`
 
-This file is the bridge between user JavaScript and the Rust runtime state stored in the V8 scope. Each exported callback has the V8 `FunctionCallback` shape and is installed as a global helper elsewhere. The callbacks fall into four groups: tool invocation (`tool_callback`), output emission (`text_callback`, `image_callback`, `generated_image_callback`, `notify_callback`), persistent state access (`store_callback`, `load_callback`), and runtime control (`set_timeout_callback`, `clear_timeout_callback`, `yield_control_callback`, `exit_callback`).
+Think of this file as the service counter between sandboxed JavaScript and the Rust application around it. JavaScript code cannot directly touch Rust data structures or external tools, so these callbacks provide a safe, narrow set of doors. When a script calls one of these host functions, the callback checks the arguments, converts JavaScript values into plain JSON where needed, and either updates the runtime state or sends a RuntimeEvent to the outside system.
 
-Most functions follow the same pattern: inspect `args`, coerce or serialize values using helpers from `value.rs`, fetch `RuntimeState` from `scope` slots, and either mutate state or send a `RuntimeEvent` over `state.event_tx`. Errors are surfaced back into JS with `throw_type_error`, so malformed arguments fail synchronously inside the script. `tool_callback` is the most stateful path: it decodes the tool index from callback metadata, serializes the optional input to JSON, allocates a `PromiseResolver`, stores it in `pending_tool_calls` under a generated `tool-{n}` id, emits a `RuntimeEvent::ToolCall`, and returns the JS promise. `exit_callback` is intentionally special: it marks `exit_requested` and throws the `EXIT_SENTINEL` string so module evaluation can treat this as a clean exit rather than a user-visible error.
+The most important callback is the tool bridge. It creates a JavaScript Promise, records its resolver in pending_tool_calls, and sends a ToolCall event. Later, some other part of the runtime can finish that Promise when the tool result arrives. Output callbacks turn script-produced text or images into FunctionCallOutputContentItem values, which are the protocol objects used to report content back. Store and load give scripts a small key-value memory, but only for values that can be safely serialized. Timer callbacks delegate to the runtime timer system, while yield and exit let script code pause cooperatively or stop execution.
+
+A common safety pattern runs through the file: if an argument is missing, has the wrong type, or cannot be converted, the callback throws a JavaScript TypeError instead of silently doing the wrong thing.
 
 #### Function details
 
@@ -2608,11 +2644,11 @@ fn tool_callback(
 )
 ```
 
-**Purpose**: Implements each generated `tools.<name>(...)` function. It validates the embedded tool index, converts the first JS argument to optional JSON input, creates a promise resolver, records it in runtime state, emits a `RuntimeEvent::ToolCall`, and returns the promise to JavaScript.
+**Purpose**: Starts a tool call requested by JavaScript and gives the script back a Promise, which is JavaScript’s placeholder for a future result. This is how sandboxed code asks the outside Rust system to run an enabled tool without directly running it itself.
 
-**Data flow**: Reads callback metadata from `args.data()` and parses it as a `usize` tool index. Reads `args.get(0)` when present and converts it with `v8_value_to_json`, yielding `Option<JsonValue>`; malformed callback data or unserializable input triggers `throw_type_error` and early return. Allocates a `v8::PromiseResolver`, looks up the selected tool in `RuntimeState.enabled_tools`, generates an id like `tool-<next_tool_call_id>`, increments `next_tool_call_id` with saturation, inserts the resolver into `RuntimeState.pending_tool_calls`, sends `RuntimeEvent::ToolCall { id, name, kind, input }` on `event_tx`, and writes the created promise into `retval`.
+**Data flow**: It reads the hidden callback data to find which enabled tool this function represents, then reads the first JavaScript argument as optional JSON input. It creates a Promise resolver, stores that resolver in runtime state under a new tool-call id, sends a RuntimeEvent::ToolCall containing the id, tool name, kind, and input, and returns the Promise to JavaScript. If the tool index or input is invalid, it throws a JavaScript type error instead.
 
-**Call relations**: Installed indirectly through `globals::tool_function`, which binds the tool index into the callback data for each enabled tool. When user JS invokes a tool helper, this callback emits the event consumed by the service layer; later, `run_runtime` receives a matching `RuntimeCommand::ToolResponse` or `ToolError` and delegates to `module_loader::resolve_tool_response` to settle the stored promise.
+**Call relations**: V8 invokes this when JavaScript calls an exposed tool function. Inside the callback, it relies on v8_value_to_json to turn the script argument into Rust-friendly data and throw_type_error to report bad calls. It hands the real work off by sending a ToolCall event; the saved Promise resolver lets another part of the runtime complete the JavaScript Promise later.
 
 *Call graph*: calls 2 internal fn (throw_type_error, v8_value_to_json); 7 external calls (data, get, length, set, format!, new, new).
 
@@ -2627,11 +2663,11 @@ fn text_callback(
 )
 ```
 
-**Purpose**: Converts its first argument into output text and emits it as a `FunctionCallOutputContentItem::InputText` runtime event.
+**Purpose**: Lets JavaScript report a piece of text as output content. It is used when script code wants text to become part of the function-call result seen by the outside system.
 
-**Data flow**: Uses `undefined` when no argument is supplied, otherwise reads `args.get(0)`. Passes the value to `serialize_output_text`; on conversion failure it throws a JS type error and returns. If `RuntimeState` is present in the scope, sends `RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text })` through `event_tx`. Always sets the JS return value to `undefined`.
+**Data flow**: It takes the first JavaScript argument, or undefined if none was supplied, and converts it into output text. It then sends that text as a FunctionCallOutputContentItem::InputText event through the runtime event channel and returns undefined to JavaScript. If the value cannot be turned into text, it throws a type error.
 
-**Call relations**: Installed by `globals::install_globals` as the global `text` helper. It is invoked directly from user JS and delegates all coercion rules to `serialize_output_text` so output formatting stays consistent with `notify_callback`.
+**Call relations**: V8 calls this when JavaScript uses the exposed text output helper. The callback depends on serialize_output_text for the value-to-text rules and then passes the finished content item outward as a RuntimeEvent::ContentItem.
 
 *Call graph*: calls 2 internal fn (serialize_output_text, throw_type_error); 5 external calls (get, length, set, ContentItem, undefined).
 
@@ -2646,11 +2682,11 @@ fn image_callback(
 )
 ```
 
-**Purpose**: Accepts an image payload plus an optional detail override, normalizes it into a protocol image content item, and emits that item to the runtime event stream.
+**Purpose**: Lets JavaScript report an image as output content, with an optional detail setting. This provides a controlled way for script-created or script-referenced images to enter the host protocol.
 
-**Data flow**: Reads the first argument or substitutes `undefined`. If a second argument exists, accepts only a string, `null`, or `undefined`; any other type causes `throw_type_error`. Calls `normalize_output_image(scope, value, detail_override)` to validate and convert the payload into `FunctionCallOutputContentItem::InputImage`; if normalization already threw, it returns `Err(())` and this callback exits silently. On success, sends `RuntimeEvent::ContentItem(image_item)` if runtime state exists, then sets `retval` to `undefined`.
+**Data flow**: It reads the first argument as the image value and optionally reads the second argument as a detail string. It rejects the detail argument if it is neither a string nor null or undefined. Then it normalizes the image into the protocol’s image content format, sends it as a content event, and returns undefined.
 
-**Call relations**: Installed as the global `image` helper. It delegates all image-shape parsing and remote-URL rejection to `normalize_output_image`, then simply forwards the resulting content item into the event pipeline consumed by cell control.
+**Call relations**: V8 invokes this when script code calls the image output helper. The callback uses normalize_output_image to do the real image validation and formatting, then hands the resulting content item to the runtime event stream.
 
 *Call graph*: calls 2 internal fn (normalize_output_image, throw_type_error); 5 external calls (get, length, set, ContentItem, undefined).
 
@@ -2665,11 +2701,11 @@ fn generated_image_callback(
 )
 ```
 
-**Purpose**: Processes a generated-image result object, emitting both the normalized image content item and an optional textual `output_hint` as separate runtime events.
+**Purpose**: Reports an image-generation result object as output, and also reports its optional human-readable output hint as text. It is a specialized version of image output for results that may include extra guidance for how the image should be presented.
 
-**Data flow**: Reads the first argument or `undefined`. Calls `generated_image_output_hint` to extract an optional `output_hint` string from the object; invalid shape or type throws a JS type error and returns. Reuses `normalize_output_image` with no detail override to produce the image content item. If runtime state exists, sends the image as `RuntimeEvent::ContentItem`, then, when `output_hint` is `Some`, sends a second `RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text })`. Finally returns `undefined` to JS.
+**Data flow**: It reads the first JavaScript argument, checks it for an optional output_hint string, and normalizes the same value as an image. It sends the image content item first. If an output hint exists, it sends a second text content item containing that hint. It returns undefined, or throws a type error if the result object or hint is malformed.
 
-**Call relations**: Installed as the global `generatedImage` helper. It is the only callback in this file that composes two helper paths—`generated_image_output_hint` for metadata extraction and `normalize_output_image` for the actual image payload—before emitting one or two content events.
+**Call relations**: V8 calls this when JavaScript uses the generated-image helper. It first asks generated_image_output_hint to extract the optional hint, then uses normalize_output_image for the image itself, and finally emits one or two RuntimeEvent::ContentItem messages.
 
 *Call graph*: calls 3 internal fn (generated_image_output_hint, normalize_output_image, throw_type_error); 5 external calls (get, length, set, ContentItem, undefined).
 
@@ -2683,11 +2719,11 @@ fn generated_image_output_hint(
 ) -> Result<Option<String>, String>
 ```
 
-**Purpose**: Extracts the optional `output_hint` property from a generated-image helper argument and enforces that it is either absent/undefined or a string.
+**Purpose**: Pulls the optional output_hint field out of a generated image result object. It exists so generated_image_callback can keep the rules for this special field clear and separate.
 
-**Data flow**: Attempts to cast the incoming V8 value to `v8::Object`; failure returns an explanatory `Err(String)`. Allocates the `output_hint` property key, reads the property, returns `Ok(None)` when it is `undefined`, returns `Err` when it is present but not a string, and otherwise returns `Ok(Some(output_hint_text))`.
+**Data flow**: It receives a JavaScript value and tries to treat it as an object. From that object it reads output_hint. If the field is missing or undefined, it returns None. If the field is a string, it returns that string. If the value is not an object or the field has the wrong type, it returns an error message.
 
-**Call relations**: Called only by `generated_image_callback` before image normalization. It isolates the stricter object-shape validation for generated-image metadata so the callback can report a precise error before emitting any content.
+**Call relations**: This helper is called only by generated_image_callback. It does not send events itself; it just validates and extracts the hint so the caller can decide whether to emit an extra text content item.
 
 *Call graph*: called by 1 (generated_image_callback); 2 external calls (try_from, new).
 
@@ -2702,11 +2738,11 @@ fn store_callback(
 )
 ```
 
-**Purpose**: Stores a JSON-serializable JS value under a string key in the runtime’s per-session key-value store and records the write for later commit.
+**Purpose**: Lets JavaScript save a named value in the runtime’s small storage area. It is useful for remembering data across steps, but only when the value can be safely represented as plain JSON.
 
-**Data flow**: Converts `args.get(0)` to a string key using V8 string coercion; failure throws `store key must be a string`. Reads `args.get(1)` as the value and serializes it with `v8_value_to_json`. `Ok(None)` is treated as an unsupported non-plain/non-serializable value and triggers a formatted type error mentioning the key; `Err(error_text)` is forwarded as a type error. On success, mutably accesses `RuntimeState`, inserts the serialized value into both `stored_values` and `stored_value_writes`, and returns no explicit JS value.
+**Data flow**: It converts the first argument to a string key and converts the second argument into JSON. If the value cannot be serialized as a plain stored value, it throws a type error. Otherwise it writes the value into stored_values for immediate reads and stored_value_writes so the host can later see what changed.
 
-**Call relations**: Installed as the global `store` helper. Its writes are later harvested by runtime completion and merged into the session-wide store by the service layer after `RuntimeEvent::Result`.
+**Call relations**: V8 invokes this when script code calls the store helper. It uses v8_value_to_json to enforce the storage boundary, then updates RuntimeState directly instead of sending an event.
 
 *Call graph*: calls 2 internal fn (throw_type_error, v8_value_to_json); 2 external calls (get, format!).
 
@@ -2721,11 +2757,11 @@ fn load_callback(
 )
 ```
 
-**Purpose**: Loads a previously stored JSON value by key and converts it back into a V8 value, returning `undefined` when the key is absent.
+**Purpose**: Lets JavaScript read a value that was previously stored under a key. It returns undefined when nothing has been saved for that key, matching normal JavaScript expectations for a missing value.
 
-**Data flow**: Coerces `args.get(0)` to a string key or throws `load key must be a string`. Reads `RuntimeState.stored_values`, clones the matching `serde_json::Value` if present, and returns JS `undefined` immediately when absent. For a present value, calls `json_to_v8`; conversion failure throws `failed to load stored value`, otherwise the resulting V8 value is written into `retval`.
+**Data flow**: It converts the first argument to a string key, looks that key up in runtime state, and clones the stored JSON value if present. If no value exists, it returns JavaScript undefined. If a value exists, it converts the JSON back into a V8 JavaScript value and returns it. If conversion fails, it throws a type error.
 
-**Call relations**: Installed as the global `load` helper. It is the inverse of `store_callback`, relying on the same runtime slot state but only reading from the accumulated `stored_values` map.
+**Call relations**: V8 calls this when JavaScript uses the load helper. It is the counterpart to store_callback: store_callback writes JSON into RuntimeState, and load_callback uses json_to_v8 to turn that JSON back into something JavaScript can use.
 
 *Call graph*: calls 2 internal fn (json_to_v8, throw_type_error); 3 external calls (get, set, undefined).
 
@@ -2740,11 +2776,11 @@ fn notify_callback(
 )
 ```
 
-**Purpose**: Converts its argument to text, rejects blank notifications, and emits a `RuntimeEvent::Notify` tied to the current top-level tool call id.
+**Purpose**: Lets JavaScript send a short notification message to the host while work is in progress. It rejects empty messages so notifications are meaningful rather than blank noise.
 
-**Data flow**: Reads the first argument or `undefined`, serializes it with `serialize_output_text`, and throws on conversion failure. Trims the resulting string and throws `notify expects non-empty text` if it is blank. If runtime state exists, sends `RuntimeEvent::Notify { call_id: state.tool_call_id.clone(), text }` on `event_tx`. Sets the JS return value to `undefined`.
+**Data flow**: It reads the first argument, converts it into text, checks that the text is not empty after trimming whitespace, and sends a RuntimeEvent::Notify with the current tool call id and message text. It returns undefined when successful and throws a type error for invalid or empty text.
 
-**Call relations**: Installed as the global `notify` helper. The emitted event is consumed by `run_cell_control`, which spawns an async delegate notification task; unlike `text_callback`, this path does not append to cell output content.
+**Call relations**: V8 invokes this when script code calls the notify helper. It uses serialize_output_text for consistent text conversion, then sends a Notify event so the surrounding runtime can surface the message outside the JavaScript sandbox.
 
 *Call graph*: calls 2 internal fn (serialize_output_text, throw_type_error); 4 external calls (get, length, set, undefined).
 
@@ -2759,11 +2795,11 @@ fn set_timeout_callback(
 )
 ```
 
-**Purpose**: Implements the JS `setTimeout` helper by scheduling a Rust-side timeout and returning its numeric id.
+**Purpose**: Implements the host-side version of JavaScript’s setTimeout-style timer. It lets script code ask the runtime to run something later instead of blocking immediately.
 
-**Data flow**: Passes the V8 scope and callback arguments to `timers::schedule_timeout`. On `Err(error_text)`, throws a JS type error and returns. On success, converts the returned `u64` timeout id to a V8 `Number` and writes it into `retval`.
+**Data flow**: It passes the JavaScript arguments to the timer subsystem. If scheduling succeeds, it returns the numeric timeout id to JavaScript. If the arguments are invalid or the timer cannot be scheduled, it throws a type error.
 
-**Call relations**: Installed as the global `setTimeout` helper. It is a thin wrapper around `timers::schedule_timeout`, which stores the callback and spawns the sleeping thread that later sends `RuntimeCommand::TimeoutFired`.
+**Call relations**: V8 calls this when JavaScript requests a timeout. This callback does not implement timing itself; it delegates to timers::schedule_timeout and only translates the result into a JavaScript return value or error.
 
 *Call graph*: calls 2 internal fn (schedule_timeout, throw_type_error); 2 external calls (set, new).
 
@@ -2778,11 +2814,11 @@ fn clear_timeout_callback(
 )
 ```
 
-**Purpose**: Implements the JS `clearTimeout` helper by removing a pending timeout id from runtime state.
+**Purpose**: Cancels a timeout that was previously scheduled from JavaScript. This prevents a delayed callback from running when the script no longer wants it.
 
-**Data flow**: Delegates argument parsing and removal to `timers::clear_timeout`. If that returns an error, throws it as a JS type error; otherwise writes `undefined` into `retval`.
+**Data flow**: It gives the JavaScript arguments to the timer subsystem, which interprets the timeout id and tries to cancel it. On success it returns undefined. On failure it throws a type error with the timer subsystem’s error message.
 
-**Call relations**: Installed as the global `clearTimeout` helper. It is the counterpart to `set_timeout_callback`, delegating all timeout-id interpretation to `timers::clear_timeout`.
+**Call relations**: V8 invokes this when JavaScript calls the exposed clear-timeout helper. It pairs with set_timeout_callback: one schedules through timers::schedule_timeout, and this one cancels through timers::clear_timeout.
 
 *Call graph*: calls 2 internal fn (clear_timeout, throw_type_error); 2 external calls (set, undefined).
 
@@ -2797,11 +2833,11 @@ fn yield_control_callback(
 )
 ```
 
-**Purpose**: Requests that the host yield the current cell response immediately without terminating execution.
+**Purpose**: Lets JavaScript voluntarily give control back to the host runtime. This is a cooperative pause signal, useful when long-running script work should allow the surrounding system to catch up.
 
-**Data flow**: Ignores its JS arguments and return value. If `RuntimeState` is present, sends `RuntimeEvent::YieldRequested` on `event_tx`.
+**Data flow**: It reads the runtime state from the V8 scope. If state is available, it sends a RuntimeEvent::YieldRequested through the event channel. It does not return a special value and does not inspect JavaScript arguments.
 
-**Call relations**: Installed as the global `yield_control` helper. The service-side `run_cell_control` loop reacts to this event by cancelling any active yield timer and sending a yielded response to the current observer.
+**Call relations**: V8 calls this when script code uses the yield helper. Unlike tool or output callbacks, it does not convert data; it simply sends a signal event that the runtime can notice and act on.
 
 
 ##### `exit_callback`  (lines 313–324)
@@ -2814,24 +2850,24 @@ fn exit_callback(
 )
 ```
 
-**Purpose**: Marks the runtime as intentionally exiting and throws a sentinel exception that higher layers recognize as a clean stop rather than an error.
+**Purpose**: Requests that the running JavaScript code stop. It marks the runtime as wanting to exit and then throws a special sentinel exception so execution can unwind quickly.
 
-**Data flow**: Mutably reads `RuntimeState` from the scope and sets `exit_requested = true` when available. Allocates a V8 string containing `EXIT_SENTINEL` and throws it as a JS exception via `scope.throw_exception`.
+**Data flow**: It sets exit_requested to true in runtime state if the state is available. Then it creates a JavaScript string containing the exit sentinel and throws it as an exception. The result is not a normal return value; the thrown sentinel is the mechanism used to break out of execution.
 
-**Call relations**: Installed as the global `exit` helper. `module_loader::evaluate_main_module` and `module_loader::completion_state` both consult `is_exit_exception`, which checks `RuntimeState.exit_requested` plus the sentinel string to suppress user-visible errors for this path.
+**Call relations**: V8 invokes this when script code calls the exposed exit helper. The state flag records the intent to stop, while the thrown sentinel gives the runtime’s outer execution loop a recognizable signal rather than an ordinary script error.
 
 *Call graph*: 2 external calls (throw_exception, new).
 
 
 ### `core/src/tools/code_mode/mod.rs`
 
-`orchestration` · `per-turn code-mode execution and nested tool dispatch`
+`orchestration` · `active during code-mode tool calls and per-turn tool dispatch`
 
-This module ties together code-mode execution. `CodeModeService` wraps an optional `Arc<dyn CodeModeSession>` plus a shared `CodeModeDispatchBroker`. `new` creates a concrete `codex_code_mode::CodeModeService` with the broker as its delegate. The service methods `execute`, `wait`, `terminate`, and `shutdown` forward to the underlying session when available; `start_turn_worker` only enables nested dispatch for turns whose `tool_mode` is `ToolMode::CodeMode` or `ToolMode::CodeModeOnly`, returning a `CodeModeDispatchWorker` that lives for the turn.
+Code mode is like giving the assistant a workbench where it can run a script over time instead of doing everything in one quick tool call. This file provides the front door to that workbench. It creates the code-mode service, forwards requests such as execute, wait, terminate, and shutdown, and starts a per-turn worker when the current conversation turn allows code mode.
 
-The module also adapts runtime output into ordinary tool output. `handle_runtime_response` formats a status header, converts runtime content items into `FunctionCallOutputContentItem`s, sanitizes image detail according to the current model’s capabilities, truncates output using token-based policies, appends script errors for failed results, prepends wall-time/status text, and returns `FunctionToolOutput` with an explicit success flag. `truncate_code_mode_result` uses text-only truncation when every item is `InputText`, otherwise generic function-output truncation.
+It also translates results from the code runtime into the format expected by the wider tool system. When a script yields, finishes, fails, or is stopped, this file adds a clear status header, records the wall-clock time, includes any returned text or images, marks success or failure, and trims very large output so it does not overwhelm the model. Image output is also cleaned up depending on whether the current model is allowed to request original image detail.
 
-Nested tool invocation is handled by `call_nested_tool`. It rejects recursive calls to the public exec tool, converts the runtime’s `CodeModeNestedToolCall` into a core `ToolPayload` based on `CodeModeToolKind`, synthesizes a unique call id prefixed with the public tool name, and routes the call through `ToolCallRuntime::handle_tool_call_with_source` with `ToolCallSource::CodeMode { cell_id, runtime_tool_call_id }`. Helper functions serialize function-tool arguments from JSON objects, require strings for freeform tools, and surface model-facing validation errors when the runtime supplies the wrong shape. Inline tests lock the payload-conversion behavior and the warning-prefixed truncation format for text output.
+A second important job is nested tool calling. A running code cell may ask to call another tool. This file checks that the code-mode exec tool does not call itself, turns the nested request into the correct tool payload shape, sends it through the normal tool router, and returns the result back to the code runtime. Without this file, code mode would be isolated from the rest of the system and its results would not be safely shaped for the model.
 
 #### Function details
 
@@ -2841,11 +2877,11 @@ Nested tool invocation is handled by `call_nested_tool`. It rejects recursive ca
 fn is_exec_tool_name(tool_name: &ToolName) -> bool
 ```
 
-**Purpose**: Checks whether a tool name refers to the public un-namespaced code-mode exec tool.
+**Purpose**: Checks whether a tool name refers to the public, un-namespaced code-mode exec tool. This is used to prevent code mode from recursively invoking itself.
 
-**Data flow**: Reads `tool_name.namespace` and `tool_name.name`, returning true only when the namespace is `None` and the name equals `PUBLIC_TOOL_NAME`.
+**Data flow**: It receives a tool name, looks at whether it has no namespace and whether its plain name matches the code-mode public tool name, then returns true or false.
 
-**Call relations**: Used to reject recursive nested exec calls and to validate incoming exec-tool invocations.
+**Call relations**: When a running code cell asks to call another tool, call_nested_tool uses this check first. If the requested tool is the exec tool itself, the nested call is rejected before it can create a loop.
 
 *Call graph*: called by 1 (call_nested_tool).
 
@@ -2856,11 +2892,11 @@ fn is_exec_tool_name(tool_name: &ToolName) -> bool
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the core code-mode service wrapper and its delegate-backed runtime session.
+**Purpose**: Creates a new code-mode service wrapper for this application. It sets up the dispatch broker that lets code-mode cells hand nested tool calls back to the normal tool system.
 
-**Data flow**: Creates a shared `CodeModeDispatchBroker`, passes a clone into `codex_code_mode::CodeModeService::with_delegate`, stores the resulting session in `Some(Arc<dyn CodeModeSession>)`, and returns `CodeModeService`.
+**Data flow**: It starts with no inputs, creates a shared dispatch broker, gives that broker to the underlying code-mode service as a delegate, and returns a CodeModeService containing both pieces.
 
-**Call relations**: Used during session/service initialization to enable code-mode support.
+**Call relations**: This is the setup step for code mode. It calls the lower-level code-mode constructor with the delegate broker, so later code-mode execution can coordinate with the rest of the tool runtime.
 
 *Call graph*: calls 2 internal fn (with_delegate, new); 1 external calls (new).
 
@@ -2874,11 +2910,11 @@ async fn execute(
     ) -> Result<codex_code_mode::StartedCell, String>
 ```
 
-**Purpose**: Starts a code-mode execution request through the underlying runtime session.
+**Purpose**: Starts running a code-mode cell from an execute request. It is the service-level entry point for beginning script work.
 
-**Data flow**: Calls `self.session()?` to obtain the runtime session or an unavailable error, forwards the `ExecuteRequest`, awaits it, and returns `Result<StartedCell, String>`.
+**Data flow**: It receives an execute request, first retrieves the underlying session, then forwards the request to that session. The result is either a started cell description or an error message.
 
-**Call relations**: Called by `CodeModeExecuteHandler::execute` when the public exec tool is invoked.
+**Call relations**: Callers use this when the public exec tool wants to start work. It relies on CodeModeService::session to ensure code mode is available before handing the request to the underlying code-mode session.
 
 *Call graph*: calls 1 internal fn (session).
 
@@ -2892,11 +2928,11 @@ async fn wait(
     ) -> Result<codex_code_mode::WaitOutcome, String>
 ```
 
-**Purpose**: Waits for additional output or completion from an existing code-mode cell.
+**Purpose**: Waits for progress or completion from an already-running code-mode cell. This lets the model come back later for more output instead of blocking forever.
 
-**Data flow**: Obtains the runtime session via `session()?`, forwards the `WaitRequest`, awaits it, and returns `Result<WaitOutcome, String>`.
+**Data flow**: It receives a wait request, retrieves the underlying session, forwards the request, and returns either a wait outcome or an error string.
 
-**Call relations**: Used by the code-mode wait tool handler elsewhere in the module tree.
+**Call relations**: This is used by wait-style code-mode handling. Like execute and terminate, it goes through CodeModeService::session so unavailable code mode is reported cleanly.
 
 *Call graph*: calls 1 internal fn (session).
 
@@ -2910,11 +2946,11 @@ async fn terminate(
     ) -> Result<codex_code_mode::WaitOutcome, String>
 ```
 
-**Purpose**: Terminates a running code-mode cell through the runtime session.
+**Purpose**: Asks the code-mode runtime to stop a running cell. This gives the system a controlled way to cancel script work.
 
-**Data flow**: Obtains the runtime session via `session()?`, forwards the target `CellId`, awaits termination, and returns `Result<WaitOutcome, String>`.
+**Data flow**: It receives a cell ID, retrieves the underlying session, passes the termination request to it, and returns the final wait outcome or an error string.
 
-**Call relations**: Used by wait/termination flows that need to stop a running cell.
+**Call relations**: This is the stop path for code-mode cells. It uses CodeModeService::session before delegating to the underlying runtime session.
 
 *Call graph*: calls 1 internal fn (session).
 
@@ -2925,11 +2961,11 @@ async fn terminate(
 async fn shutdown(&self) -> Result<(), String>
 ```
 
-**Purpose**: Shuts down the underlying code-mode runtime session if one exists.
+**Purpose**: Shuts down the underlying code-mode session if one exists. It is used when the service is being cleaned up.
 
-**Data flow**: Matches on `self.session`; if present it awaits `session.shutdown()`, otherwise it returns `Ok(())` immediately.
+**Data flow**: It checks whether a session is present. If so, it asks that session to shut down and returns its result; if not, it treats shutdown as already complete.
 
-**Call relations**: Called during session teardown to stop code-mode infrastructure.
+**Call relations**: This belongs to teardown. Unlike execute, wait, and terminate, it does not call CodeModeService::session because having no session is not an error during shutdown.
 
 
 ##### `CodeModeService::mark_cell_ready_for_dispatch`  (lines 104–106)
@@ -2938,11 +2974,11 @@ async fn shutdown(&self) -> Result<(), String>
 fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId)
 ```
 
-**Purpose**: Signals that a started cell may now receive nested tool calls and notifications.
+**Purpose**: Marks a code cell as ready to send nested tool calls through the dispatch broker. This is a signal that the cell can now participate in tool dispatch.
 
-**Data flow**: Forwards `cell_id` to `dispatch_broker.mark_cell_ready_for_dispatch` and returns unit.
+**Data flow**: It receives a cell ID and passes that ID to the broker, which records that dispatch may begin for that cell.
 
-**Call relations**: Called by the execute handler after the runtime cell has been started.
+**Call relations**: This helps coordinate between the code runtime and the per-turn worker. The broker uses the mark later when routing nested tool calls from that cell.
 
 
 ##### `CodeModeService::finish_cell_dispatch`  (lines 108–110)
@@ -2951,11 +2987,11 @@ fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId)
 fn finish_cell_dispatch(&self, cell_id: &CellId)
 ```
 
-**Purpose**: Closes dispatch for a cell whose runtime lifecycle no longer needs nested communication.
+**Purpose**: Closes dispatch for a code cell after its nested tool-call work is finished. This prevents later dispatch attempts for a cell that is done.
 
-**Data flow**: Forwards `cell_id` to `dispatch_broker.close_cell` and returns unit.
+**Data flow**: It receives a cell ID and tells the dispatch broker to close that cell’s dispatch channel or state.
 
-**Call relations**: Called when a cell’s first response is terminal or when later lifecycle code closes the cell.
+**Call relations**: This is the cleanup counterpart to mark_cell_ready_for_dispatch. It keeps the broker’s view of active cells accurate.
 
 
 ##### `CodeModeService::start_turn_worker`  (lines 112–133)
@@ -2970,11 +3006,11 @@ fn start_turn_worker(
     ) -> Option<CodeModeD
 ```
 
-**Purpose**: Starts per-turn nested-dispatch support only for turns running in code mode.
+**Purpose**: Starts a worker for the current conversation turn when code mode is allowed. That worker is what lets running code cells call normal tools during the turn.
 
-**Data flow**: Checks `turn.tool_mode` against `ToolMode::CodeMode | ToolMode::CodeModeOnly` and also requires `self.session.is_some()`. If either condition fails it returns `None`; otherwise it clones the session and turn into `ExecContext`, delegates to `dispatch_broker.start_turn_worker`, and returns `Some(CodeModeDispatchWorker)`.
+**Data flow**: It receives the session, turn context, tool router, and diff tracker. It checks the turn’s tool mode and whether code mode is available. If allowed, it builds an execution context and asks the dispatch broker to start a worker; otherwise it returns nothing.
 
-**Call relations**: Called when a turn begins so nested tool dispatch is available only in code-mode turns.
+**Call relations**: This is called during turn setup. It links the turn, session, router, and tracker together through the dispatch broker so nested code-mode tool calls can be processed during that turn.
 
 *Call graph*: 2 external calls (clone, matches!).
 
@@ -2985,11 +3021,11 @@ fn start_turn_worker(
 fn session(&self) -> Result<&Arc<dyn CodeModeSession>, String>
 ```
 
-**Purpose**: Returns the underlying runtime session or a user-facing unavailable error.
+**Purpose**: Returns the underlying code-mode session or a clear error if code mode is unavailable. It keeps availability checking in one place.
 
-**Data flow**: Reads `self.session.as_ref()` and returns `Ok(&Arc<dyn CodeModeSession>)` when present, otherwise `Err("code mode is unavailable".to_string())`.
+**Data flow**: It reads the optional session field. If a session exists, it returns a reference to it; if not, it returns the message “code mode is unavailable.”
 
-**Call relations**: Shared helper used by `execute`, `wait`, and `terminate`.
+**Call relations**: CodeModeService::execute, CodeModeService::wait, and CodeModeService::terminate all call this before talking to the runtime. That gives them the same failure behavior.
 
 *Call graph*: called by 3 (execute, terminate, wait).
 
@@ -3005,11 +3041,11 @@ async fn handle_runtime_response(
 ) -> Result<FunctionToolOutput, Strin
 ```
 
-**Purpose**: Converts a raw code-mode `RuntimeResponse` into standard `FunctionToolOutput` with status text, truncation, image-detail sanitization, and success/error signaling.
+**Purpose**: Turns a raw runtime response from a code cell into normal function-tool output for the model. It adds status, timing, success information, cleaned image detail, and output truncation.
 
-**Data flow**: Takes `ExecContext`, a `RuntimeResponse`, optional `max_output_tokens`, and `started_at`. It computes a status string with `format_script_status`, converts runtime content items via `into_function_call_output_content_items`, sanitizes image detail, optionally appends `Script error:` text for failed `Result` responses, truncates output with `truncate_code_mode_result`, prepends status and elapsed wall time, and returns `FunctionToolOutput::from_content(..., Some(success_or_running))`.
+**Data flow**: It receives the execution context, a runtime response, an optional output-token limit, and the start time. It builds a human-readable status, converts runtime content into function-call output items, sanitizes image detail, adds script errors when needed, truncates oversized output, prepends a status-and-time header, and returns FunctionToolOutput.
 
-**Call relations**: Called by the execute and wait handlers after receiving runtime responses from the code-mode service.
+**Call relations**: This is the main adapter after execute, wait, or terminate produces a runtime response. It calls format_script_status, sanitize_runtime_image_detail, truncate_code_mode_result, and prepend_script_status so the rest of the system receives clean, bounded, model-ready output.
 
 *Call graph*: calls 6 internal fn (format_script_status, prepend_script_status, into_function_call_output_content_items, sanitize_runtime_image_detail, truncate_code_mode_result, from_content); 2 external calls (elapsed, format!).
 
@@ -3020,11 +3056,11 @@ async fn handle_runtime_response(
 fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem])
 ```
 
-**Purpose**: Downgrades or preserves image-detail fields in runtime output according to the current model’s capabilities.
+**Purpose**: Adjusts image output from code mode so it follows what the current model is allowed to receive. This protects against giving original image detail when the model should not request it.
 
-**Data flow**: Reads `turn.model_info`, computes whether original image detail is allowed with `can_request_original_image_detail`, and mutates the provided `items` slice in place via `sanitize_original_image_detail`.
+**Data flow**: It receives the current turn context and a mutable list of output items. It checks the model information to decide whether original image detail is allowed, then rewrites the image-detail fields in place as needed.
 
-**Call relations**: Used inside `handle_runtime_response` before truncation and final output assembly.
+**Call relations**: handle_runtime_response calls this after converting runtime content into normal output items. It uses shared image-detail policy helpers so code-mode output follows the same rules as other tool output.
 
 *Call graph*: called by 1 (handle_runtime_response); 2 external calls (can_request_original_image_detail, sanitize_original_image_detail).
 
@@ -3035,11 +3071,11 @@ fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOu
 fn format_script_status(response: &RuntimeResponse) -> String
 ```
 
-**Purpose**: Produces the human-readable status line describing the runtime state of a code-mode response.
+**Purpose**: Creates the short human-readable status line for a code cell result. It tells the model whether the script is still running, completed, failed, or was terminated.
 
-**Data flow**: Matches `RuntimeResponse`: yielded responses include the `cell_id` in `"Script running with cell ID ..."`, terminated responses become `"Script terminated"`, successful results become `"Script completed"`, and errored results become `"Script failed"`.
+**Data flow**: It receives a runtime response and inspects its variant. A yielded response becomes a message with the cell ID, a terminated response becomes “Script terminated,” and a final result becomes either “Script completed” or “Script failed.”
 
-**Call relations**: Used by `handle_runtime_response` to build the header prepended to tool output.
+**Call relations**: handle_runtime_response calls this before shaping output. The returned text is later inserted at the top of the tool output by prepend_script_status.
 
 *Call graph*: called by 1 (handle_runtime_response); 1 external calls (format!).
 
@@ -3054,11 +3090,11 @@ fn prepend_script_status(
 )
 ```
 
-**Purpose**: Prepends a status/wall-time header to the front of function-call output content items.
+**Purpose**: Adds a header to the beginning of code-mode output. The header gives the script status, elapsed wall time, and a clear “Output” label.
 
-**Data flow**: Computes wall time in tenths of a second from `Duration`, formats a header string containing status, wall time, and `Output:`, and inserts `FunctionCallOutputContentItem::InputText { text: header }` at index 0 of the mutable vector.
+**Data flow**: It receives the output item list, a status string, and elapsed time. It rounds the time to one decimal place, builds a text header, and inserts that header as the first output item.
 
-**Call relations**: Called by `handle_runtime_response` after truncation so the header is always present.
+**Call relations**: handle_runtime_response calls this at the end of output preparation. It makes code-mode results easier for the model and user to read before they see the raw script output.
 
 *Call graph*: called by 1 (handle_runtime_response); 2 external calls (as_secs_f32, format!).
 
@@ -3072,11 +3108,11 @@ fn truncate_code_mode_result(
 ) -> Vec<FunctionCallOutputContentItem>
 ```
 
-**Purpose**: Applies token-based truncation to code-mode output, using a text-specialized path when all items are plain text.
+**Purpose**: Shortens code-mode output when it is too large for the model. This keeps long scripts from flooding the conversation with more text or data than the system can safely pass along.
 
-**Data flow**: Resolves `max_output_tokens` through `resolve_max_tokens`, builds `TruncationPolicy::Tokens`, checks whether every item is `FunctionCallOutputContentItem::InputText`, and either calls `formatted_truncate_text_content_items_with_policy` or `truncate_function_output_items_with_policy`; returns the truncated item vector.
+**Data flow**: It receives output items and an optional token limit. It resolves the actual maximum, chooses a token-based truncation policy, then either uses a text-friendly truncation path when all items are plain text or a general function-output truncation path when mixed content is present. It returns the shortened item list.
 
-**Call relations**: Used by `handle_runtime_response` before the status header is prepended.
+**Call relations**: handle_runtime_response calls this before adding the final status header. The tests also check that text truncation produces a warning at the start, so users know output was shortened.
 
 *Call graph*: calls 1 internal fn (resolve_max_tokens); called by 1 (handle_runtime_response); 3 external calls (formatted_truncate_text_content_items_with_policy, truncate_function_output_items_with_policy, Tokens).
 
@@ -3092,11 +3128,11 @@ async fn call_nested_tool(
 ) -> Result<JsonValue, Function
 ```
 
-**Purpose**: Routes a nested tool call originating from code-mode runtime execution into the core tool router with code-mode-specific source metadata.
+**Purpose**: Lets a running code-mode cell call another tool through the normal tool system. It also blocks the dangerous case where the exec tool tries to invoke itself.
 
-**Data flow**: Destructures `CodeModeNestedToolCall` into cell id, runtime tool call id, tool name/kind, and optional input. It rejects recursive calls to the public exec tool, converts the input into a `ToolPayload` with `build_nested_tool_payload`, synthesizes a unique `call_id` prefixed by `PUBLIC_TOOL_NAME`, builds `ToolCall`, and awaits `tool_runtime.handle_tool_call_with_source(..., ToolCallSource::CodeMode { cell_id, runtime_tool_call_id }, cancellation_token)`. It returns the nested tool’s `code_mode_result()` JSON or a `FunctionCallError`.
+**Data flow**: It receives execution context, a tool-call runtime, a nested tool invocation, and a cancellation token. It unpacks the invocation, rejects self-calls, builds the right tool payload from the supplied input, creates a normal ToolCall with a fresh call ID, sends it through the tool runtime with code-mode source information, and returns the result as JSON for code mode.
 
-**Call relations**: Called by `CoreTurnHost::invoke_tool` from the dispatch worker when the runtime requests a nested tool.
+**Call relations**: This is the bridge from code-mode runtime back into the application’s tool router. It calls is_exec_tool_name for safety, build_nested_tool_payload for input shaping, and then hands the call to handle_tool_call_with_source so the ordinary tool machinery does the real work.
 
 *Call graph*: calls 3 internal fn (build_nested_tool_payload, is_exec_tool_name, handle_tool_call_with_source); 2 external calls (format!, RespondToModel).
 
@@ -3111,11 +3147,11 @@ fn build_nested_tool_payload(
 ) -> Result<ToolPayload, String>
 ```
 
-**Purpose**: Converts a code-mode nested tool call’s declared kind and JSON input into the corresponding core `ToolPayload`.
+**Purpose**: Chooses how to package input for a nested tool call based on what kind of tool is being called. Function-style tools expect JSON arguments, while freeform tools expect a raw string.
 
-**Data flow**: Matches `tool_kind`: function tools delegate to `build_function_tool_payload`, freeform tools delegate to `build_freeform_tool_payload`, and returns the resulting `Result<ToolPayload, String>`.
+**Data flow**: It receives a tool kind, tool name, and optional JSON input. If the kind is Function, it sends the input to build_function_tool_payload; if the kind is Freeform, it sends it to build_freeform_tool_payload. It returns either a ToolPayload or an error message.
 
-**Call relations**: Used by `call_nested_tool` and directly by unit tests.
+**Call relations**: call_nested_tool uses this before dispatching a nested tool. The unit tests call it directly to confirm both function-style and freeform-style payloads are built correctly.
 
 *Call graph*: calls 2 internal fn (build_freeform_tool_payload, build_function_tool_payload); called by 3 (call_nested_tool, build_nested_tool_payload_uses_freeform_kind, build_nested_tool_payload_uses_function_kind).
 
@@ -3129,11 +3165,11 @@ fn build_function_tool_payload(
 ) -> Result<ToolPayload, String>
 ```
 
-**Purpose**: Builds a function-style tool payload by serializing JSON object input into an arguments string.
+**Purpose**: Builds the payload for a normal function-style tool call. These tools receive their arguments as a JSON object encoded as text.
 
-**Data flow**: Calls `serialize_function_tool_arguments(tool_name, input)?` and wraps the resulting string in `ToolPayload::Function { arguments }`.
+**Data flow**: It receives a tool name and optional JSON input. It serializes the input into an argument string using serialize_function_tool_arguments, then wraps that string in a function ToolPayload.
 
-**Call relations**: Selected by `build_nested_tool_payload` for `CodeModeToolKind::Function`.
+**Call relations**: build_nested_tool_payload calls this when the nested code-mode call targets a function-style tool. It delegates validation and JSON text conversion to serialize_function_tool_arguments.
 
 *Call graph*: calls 1 internal fn (serialize_function_tool_arguments); called by 1 (build_nested_tool_payload).
 
@@ -3147,11 +3183,11 @@ fn serialize_function_tool_arguments(
 ) -> Result<String, String>
 ```
 
-**Purpose**: Validates and serializes nested function-tool input into the JSON string expected by core function tools.
+**Purpose**: Checks and serializes arguments for a function-style nested tool call. It enforces that arguments must be a JSON object, because that is the expected shape for function tools.
 
-**Data flow**: If `input` is `None`, returns `"{}"`. If it is `Some(JsonValue::Object(map))`, serializes that object with `serde_json::to_string`; serialization failures become formatted errors mentioning the tool name. Any non-object JSON value becomes an error stating that the tool expects a JSON object for arguments.
+**Data flow**: It receives a tool name and optional JSON input. Missing input becomes an empty object string, object input is converted to compact JSON text, and any non-object input becomes a clear error naming the tool.
 
-**Call relations**: Used only by `build_function_tool_payload`.
+**Call relations**: build_function_tool_payload calls this as its validation step. If serialization fails or the input has the wrong shape, the error travels back through build_nested_tool_payload to call_nested_tool, which reports it to the model.
 
 *Call graph*: called by 1 (build_function_tool_payload); 3 external calls (Object, format!, to_string).
 
@@ -3165,11 +3201,11 @@ fn build_freeform_tool_payload(
 ) -> Result<ToolPayload, String>
 ```
 
-**Purpose**: Builds a freeform/custom tool payload from a string input.
+**Purpose**: Builds the payload for a freeform nested tool call. Freeform tools take a plain string rather than JSON-style named arguments.
 
-**Data flow**: If `input` is `Some(JsonValue::String(input))`, returns `ToolPayload::Custom { input }`; otherwise returns an error stating that the tool expects a string input.
+**Data flow**: It receives a tool name and optional JSON input. If the input is a JSON string, it extracts that string and returns it as a custom ToolPayload; otherwise it returns an error saying the tool expects a string input.
 
-**Call relations**: Selected by `build_nested_tool_payload` for `CodeModeToolKind::Freeform`.
+**Call relations**: build_nested_tool_payload calls this when the nested tool kind is Freeform. Its validation errors flow back to call_nested_tool so bad nested tool requests can be explained to the model.
 
 *Call graph*: called by 1 (build_nested_tool_payload); 1 external calls (format!).
 
@@ -3180,11 +3216,11 @@ fn build_freeform_tool_payload(
 fn build_nested_tool_payload_uses_function_kind()
 ```
 
-**Purpose**: Verifies that function-kind nested tool payloads serialize object input into `ToolPayload::Function` arguments.
+**Purpose**: Tests that function-style nested tool calls are packaged as function payloads with serialized JSON arguments. This guards the contract used when code mode calls ordinary function tools.
 
-**Data flow**: Calls `build_nested_tool_payload(CodeModeToolKind::Function, ...)` with a JSON object, unwraps the result, pattern-matches the payload, and asserts the serialized arguments string equals `{"value":1}`.
+**Data flow**: It builds a sample function-kind payload with JSON input, checks that construction succeeds, then verifies the result contains the expected compact JSON argument string.
 
-**Call relations**: Unit test for function-kind payload conversion.
+**Call relations**: This test calls build_nested_tool_payload directly. It protects the path that call_nested_tool uses for function-style nested calls.
 
 *Call graph*: calls 2 internal fn (build_nested_tool_payload, plain); 3 external calls (assert_eq!, json!, panic!).
 
@@ -3195,11 +3231,11 @@ fn build_nested_tool_payload_uses_function_kind()
 fn build_nested_tool_payload_uses_freeform_kind()
 ```
 
-**Purpose**: Verifies that freeform-kind nested tool payloads preserve string input as `ToolPayload::Custom`.
+**Purpose**: Tests that freeform nested tool calls preserve their string input. This guards the contract for tools that accept raw text instead of JSON arguments.
 
-**Data flow**: Calls `build_nested_tool_payload(CodeModeToolKind::Freeform, ...)` with a JSON string, unwraps the result, pattern-matches the payload, and asserts the custom input string is preserved.
+**Data flow**: It builds a sample freeform-kind payload with the string “hello,” checks that construction succeeds, then verifies the result is a custom payload containing that same string.
 
-**Call relations**: Unit test for freeform-kind payload conversion.
+**Call relations**: This test calls build_nested_tool_payload directly. It protects the path that call_nested_tool uses for freeform nested calls.
 
 *Call graph*: calls 2 internal fn (build_nested_tool_payload, plain); 3 external calls (assert_eq!, json!, panic!).
 
@@ -3210,22 +3246,26 @@ fn build_nested_tool_payload_uses_freeform_kind()
 fn truncated_text_output_starts_with_warning()
 ```
 
-**Purpose**: Checks that text-only truncation emits the expected warning-prefixed output format.
+**Purpose**: Tests that truncated text output clearly starts with a warning. This helps ensure users and the model are not misled into thinking shortened output is complete.
 
-**Data flow**: Builds a single long `FunctionCallOutputContentItem::InputText`, calls `truncate_code_mode_result(items, Some(5))`, and asserts the returned vector contains the expected warning text with original token count and truncation summary.
+**Data flow**: It creates a long text output item, truncates it with a small token limit, and compares the result with the expected warning-plus-shortened-text format.
 
-**Call relations**: Regression test for the text-specialized truncation path.
+**Call relations**: This test exercises truncate_code_mode_result. It confirms the user-facing behavior that handle_runtime_response relies on when code-mode output is too large.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `core/src/tools/code_mode/execute_spec.rs`
 
-`config` · `tool registration/setup`
+`domain_logic` · `tool setup`
 
-This file is a small spec-construction helper. `create_code_mode_tool` returns a `ToolSpec::Freeform` describing the public code-mode execution tool. The function embeds a fixed Lark grammar string named `CODE_MODE_FREEFORM_GRAMMAR` that accepts either plain source or source preceded by a `// @exec:` pragma line. It then fills a `FreeformTool` with the public tool name from `codex_code_mode::PUBLIC_TOOL_NAME`, a description generated by `codex_code_mode::build_exec_tool_description`, and a `FreeformToolFormat` declaring `type = "grammar"`, `syntax = "lark"`, and the grammar definition itself.
+Code Mode lets the model submit a block of source-like text as a tool call, rather than filling out a fixed form with named fields. This file creates the specification for that tool, which is like the instruction card handed to the model: it gives the tool’s name, explains what it can do, and defines the shape of input that is allowed.
 
-The generated description depends on the enabled nested tools, namespace descriptions, whether the environment is code-mode-only, and whether deferred tools are available, so this helper is the point where runtime capability information is turned into the model-visible tool contract. The inline test constructs a minimal enabled-tool list and asserts that the resulting `ToolSpec` exactly matches the expected `FreeformTool`, including the grammar text and description generation call. That test acts as a regression guard for the public schema exposed to models.
+The main detail here is a small grammar. A grammar is a set of rules for what text counts as valid input. This one accepts either plain source text, or source text that begins with a special comment line such as `// @exec:...`. That first line acts like a note on top of a document, giving extra execution instructions before the actual code begins.
+
+The file also asks `codex_code_mode` to build the human-readable description of the tool. That description depends on which tools are enabled, what namespaces exist, whether the system is running in Code Mode only, and whether deferred tools are available.
+
+Without this file, the execute tool would not be advertised in a clear, machine-checkable way. The model might not know how to call it, and the system would not have a single place defining the accepted free-form format.
 
 #### Function details
 
@@ -3239,11 +3279,11 @@ fn create_code_mode_tool(
     deferred
 ```
 
-**Purpose**: Constructs the `ToolSpec::Freeform` for the public code-mode exec tool with its grammar-based input format.
+**Purpose**: Builds the complete tool specification for the public Code Mode execute tool. Other parts of the system use this specification to tell the model what the tool is and what input format it must use.
 
-**Data flow**: Takes enabled code-mode tool definitions, namespace descriptions, and two booleans controlling description wording. It builds the description with `build_exec_tool_description`, embeds the fixed grammar string into `FreeformToolFormat`, wraps everything in `FreeformTool`, and returns `ToolSpec::Freeform(...)`.
+**Data flow**: It receives the list of enabled Code Mode tools, namespace descriptions, and two feature flags. It uses that information to build a description string, combines it with the public tool name, and attaches a grammar that accepts either plain source text or source text with a leading `// @exec:` pragma line. It returns a `ToolSpec::Freeform`, meaning the tool accepts a free-form text body rather than a structured form.
 
-**Call relations**: Used during tool registration to expose the code-mode exec tool to the model.
+**Call relations**: When the system is preparing the set of tools available to the model, it calls this function to create the Code Mode execute tool entry. Inside, it hands the contextual details to `build_exec_tool_description` so the description matches the current environment, then wraps everything in a `FreeformTool` so the wider tool system can advertise and validate it.
 
 *Call graph*: 2 external calls (build_exec_tool_description, Freeform).
 
@@ -3254,24 +3294,24 @@ fn create_code_mode_tool(
 fn create_code_mode_tool_matches_expected_spec()
 ```
 
-**Purpose**: Verifies that `create_code_mode_tool` produces the exact expected freeform tool spec for a representative input.
+**Purpose**: Checks that `create_code_mode_tool` produces exactly the expected tool specification for a simple example. This protects the tool name, description source, and grammar from accidental changes.
 
-**Data flow**: Builds a one-entry `enabled_tools` vector, calls `create_code_mode_tool`, and compares the returned `ToolSpec` to an explicitly constructed expected `ToolSpec::Freeform` using `assert_eq!`.
+**Data flow**: It creates one fake enabled tool called `update_plan`, calls `create_code_mode_tool` with that list and empty namespace descriptions, then compares the result against a hand-written expected `ToolSpec::Freeform`. If any field differs, the test fails.
 
-**Call relations**: Unit test guarding the public tool schema and grammar emitted by this helper.
+**Call relations**: This test runs during the project’s test suite. It directly exercises `create_code_mode_tool` and uses `assert_eq!` to confirm that the constructed tool specification still matches the contract that other parts of the system rely on.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `core/src/tools/code_mode/execute_handler.rs`
 
-`domain_logic` · `tool execution during a code-mode turn`
+`orchestration` · `request handling`
 
-This file wraps the code-mode runtime behind the core tool-execution interfaces. `CodeModeExecuteHandler` stores the public `ToolSpec` for the `exec` tool plus the nested tool specs that code mode is allowed to call. Its main work happens in `execute`: it parses the raw JavaScript/freeform source using `codex_code_mode::parse_exec_source`, builds an `ExecContext` from the current `Session` and `TurnContext`, derives the enabled nested-tool definitions with `codex_tools::collect_code_mode_tool_definitions`, and submits an `ExecuteRequest` to `session.services.code_mode_service`.
+This file is the bridge between a model tool call and the code execution service. When the model asks to run code, the rest of the system needs a safe, predictable path from “here is some source text” to “the runtime started and returned a result, error, or yield.” Without this handler, code-mode tool calls would not know how to parse their input, which nested tools are available, how to start execution, or how to report the first runtime response back.
 
-Once the runtime returns a `StartedCell`, the handler records timing and tracing metadata. It captures the `cell_id`, starts a code-cell trace through `rollout_thread_trace.start_code_cell_trace`, marks the cell ready for nested dispatch via `code_mode_service.mark_cell_ready_for_dispatch`, and awaits the cell’s initial runtime response. That raw response is recorded into the trace before any model-visible adaptation. If the first response is terminal (`Result` or `Terminated` rather than `Yielded`), the trace is also marked ended and the dispatch gate is closed immediately with `finish_cell_dispatch`; yielded cells remain open for later wait operations. Finally, the response is normalized through `handle_runtime_response` and wrapped as `FunctionToolOutput`.
+The main type is `CodeModeExecuteHandler`. It stores the tool’s public description, called a `ToolSpec`, plus the specs for tools that code running inside the runtime may be allowed to call. When a tool invocation arrives, `handle_call` checks that the payload is the expected custom raw source text. It then calls `execute`.
 
-The type implements both `ToolExecutor<ToolInvocation>` and `CoreToolRuntime`. `handle_call` enforces that only `ToolPayload::Custom { input }` with the un-namespaced exec tool name is accepted; everything else becomes a model-facing `FunctionCallError` explaining that raw JavaScript source text is required.
+`execute` does the real handoff. First it parses the source text into execution settings, such as the code itself, output limits, and yield timing. Then it asks the code-mode service to start a cell, which is like opening a numbered notebook cell for one code run. It starts a trace so the system can later explain what happened, marks the cell ready to dispatch, waits for the initial runtime response, records that response, and finishes dispatch immediately if the runtime already ended. Finally, it delegates to `handle_runtime_response`, which converts the runtime response into the tool output returned to the model.
 
 #### Function details
 
@@ -3281,11 +3321,11 @@ The type implements both `ToolExecutor<ToolInvocation>` and `CoreToolRuntime`. `
 fn new(spec: ToolSpec, nested_tool_specs: Vec<ToolSpec>) -> Self
 ```
 
-**Purpose**: Constructs a code-mode execute handler from the public tool spec and the nested tool specs available to code mode.
+**Purpose**: Creates a new code-mode execute handler with the public tool description and the list of tools that code-mode execution may expose inside the runtime.
 
-**Data flow**: Consumes `spec: ToolSpec` and `nested_tool_specs: Vec<ToolSpec>`, stores them in the struct, and returns `Self`.
+**Data flow**: It receives a `ToolSpec` and a list of nested `ToolSpec` values. It stores both inside a new `CodeModeExecuteHandler` and returns that handler for registration in the tool system.
 
-**Call relations**: Used during tool registration to create the executor instance for the public `exec` tool.
+**Call relations**: This is used when the tool runtime is being set up. Later, the stored spec is returned by `CodeModeExecuteHandler::spec`, and the nested specs are used by `CodeModeExecuteHandler::execute` to decide which tools are available to running code.
 
 
 ##### `CodeModeExecuteHandler::execute`  (lines 29–91)
@@ -3298,11 +3338,11 @@ async fn execute(
         call_id: String,
 ```
 
-**Purpose**: Runs the public code-mode exec tool: parse source, start a runtime cell, open nested dispatch, trace the cell, and adapt the first runtime response into tool output.
+**Purpose**: Starts one code-mode execution and turns its first runtime response into model-visible tool output. This is the core path from raw source text to a recorded, dispatched code cell.
 
-**Data flow**: Takes the current `Session`, `TurnContext`, `call_id`, and raw `code` string. It parses the source into code-mode args, builds `ExecContext`, derives enabled nested tools, records `started_at`, calls `code_mode_service.execute(ExecuteRequest { tool_call_id, enabled_tools, source, yield_time_ms, max_output_tokens })`, starts a rollout code-cell trace, marks the cell ready for dispatch, awaits `started_cell.initial_response()`, records that response in the trace, conditionally records terminal end and closes dispatch for non-yielded responses, then passes the response to `handle_runtime_response` and returns `Result<FunctionToolOutput, FunctionCallError>`.
+**Data flow**: It receives the current session, the current turn, the tool call ID, and the raw code text. It parses the text into executable code and settings, collects the tool definitions that should be available inside the runtime, asks the code-mode service to start a cell, starts trace recording, marks the cell ready, waits for the first runtime response, records that response, and then returns a `FunctionToolOutput`. If parsing or runtime startup fails, it turns the problem into an error that can be shown back to the model.
 
-**Call relations**: Called only from `handle_call` after payload validation succeeds.
+**Call relations**: `CodeModeExecuteHandler::handle_call` calls this after it has confirmed the tool invocation looks like a code execution request. Inside, it uses `parse_exec_source` to understand the requested execution, `collect_code_mode_tool_definitions` to prepare nested tools, and `handle_runtime_response` to translate the runtime’s answer into the format expected by the rest of the tool system.
 
 *Call graph*: called by 1 (handle_call); 5 external calls (parse_exec_source, collect_code_mode_tool_definitions, matches!, now, handle_runtime_response).
 
@@ -3313,11 +3353,11 @@ async fn execute(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the public tool name handled by this executor.
+**Purpose**: Reports the public name of this tool so the registry can match incoming calls to this handler.
 
-**Data flow**: Constructs and returns `ToolName::plain(PUBLIC_TOOL_NAME)`.
+**Data flow**: It reads the fixed public tool name for code-mode execution, wraps it as a `ToolName`, and returns it. It does not change any stored state.
 
-**Call relations**: Used by the tool registry to index this executor under the code-mode exec tool.
+**Call relations**: The tool registry calls this when it needs to know which tool name this executor owns. It uses `ToolName::plain` to create the simple, non-namespaced name that incoming invocations are matched against.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -3328,11 +3368,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the stored tool specification for the public exec tool.
+**Purpose**: Returns the tool description that should be advertised to callers. The description tells the model how this tool is meant to be used.
 
-**Data flow**: Clones `self.spec` and returns the clone.
+**Data flow**: It reads the handler’s stored `ToolSpec`, clones it, and returns the copy. The original stays inside the handler for future calls.
 
-**Call relations**: Used by registry code that needs to expose the tool schema/description.
+**Call relations**: The tool system calls this when building or exposing the list of available tools. The value originally came from `CodeModeExecuteHandler::new`.
 
 *Call graph*: 1 external calls (clone).
 
@@ -3343,11 +3383,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts `handle_call` to the boxed future type required by the `ToolExecutor` trait.
+**Purpose**: Adapts an incoming tool invocation into the asynchronous execution style expected by the tool framework.
 
-**Data flow**: Takes a `ToolInvocation`, boxes `self.handle_call(invocation)`, and returns the executor future.
+**Data flow**: It receives a `ToolInvocation`, passes it to `CodeModeExecuteHandler::handle_call`, wraps the resulting future in a pinned box, and returns that future. In plain terms, it packages the work so the runtime can wait for it safely.
 
-**Call relations**: This is the trait entrypoint invoked by the tool router.
+**Call relations**: The tool framework calls this through the `ToolExecutor` interface when a tool invocation arrives. It immediately hands the real decision-making to `CodeModeExecuteHandler::handle_call`.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3361,11 +3401,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates the invocation payload and dispatches valid exec calls to `execute`.
+**Purpose**: Checks whether an invocation is a valid code-mode execute call, then either runs it or returns a clear error for the model.
 
-**Data flow**: Destructures `ToolInvocation` into session, turn, call id, tool name, and payload. If the payload is `ToolPayload::Custom { input }` and `is_exec_tool_name(&tool_name)` is true, it awaits `execute(session, turn, call_id, input)` and wraps the result with `boxed_tool_output`. Otherwise it returns `FunctionCallError::RespondToModel` with a message that the public tool expects raw JavaScript source text.
+**Data flow**: It receives a `ToolInvocation` and pulls out the session, turn, call ID, tool name, and payload. If the payload is custom raw input and the tool name is one of the accepted execute names, it sends the input to `CodeModeExecuteHandler::execute` and boxes the returned output. Otherwise, it returns an error saying the tool expects raw JavaScript source text.
 
-**Call relations**: Called by `handle`; it is the validation gate between generic tool routing and code-mode execution.
+**Call relations**: `CodeModeExecuteHandler::handle` calls this for every invocation routed to the handler. This function is the gatekeeper: it uses `is_exec_tool_name` to confirm the name, calls `CodeModeExecuteHandler::execute` for valid calls, and creates a model-facing error for invalid ones.
 
 *Call graph*: calls 1 internal fn (execute); called by 1 (handle); 3 external calls (format!, is_exec_tool_name, RespondToModel).
 
@@ -3376,24 +3416,26 @@ async fn handle_call(
 fn matches_kind(&self, payload: &ToolPayload) -> bool
 ```
 
-**Purpose**: Declares that this runtime handles custom/freeform tool payloads.
+**Purpose**: Tells the core tool runtime that this handler is interested in custom tool payloads.
 
-**Data flow**: Returns `true` when `payload` matches `ToolPayload::Custom { .. }`, otherwise `false`.
+**Data flow**: It receives a payload reference, checks whether it is the custom payload shape, and returns `true` or `false`. It only inspects the payload type and does not modify anything.
 
-**Call relations**: Used by core tool-runtime selection to route custom payloads to this handler.
+**Call relations**: The core tool runtime can use this as an early filter before routing a call. A `true` result means the payload is shaped like something `CodeModeExecuteHandler::handle_call` may be able to process further.
 
 *Call graph*: 1 external calls (matches!).
 
 
 ### `core/src/tools/code_mode/wait_spec.rs`
 
-`config` · `tool registration`
+`io_transport` · `tool registration and tests`
 
-This file builds the `ToolSpec` advertised for the code-mode wait tool. `create_wait_tool` constructs a `BTreeMap<String, JsonSchema>` for four parameters: required `cell_id` as a string, optional `yield_time_ms` as a number, optional `max_tokens` as a number, and optional `terminate` as a boolean. The schema is wrapped in `JsonSchema::object` with `required = ["cell_id"]` and `additional_properties = false`, so callers may omit optional fields but may not send arbitrary extras.
+This file is like the label and instruction card for a tool in a toolbox. The tool itself waits for more output from a running code execution cell, or can stop that cell. This file does not perform the waiting. Instead, it builds the formal tool specification that tells the surrounding API how the tool should be invoked.
 
-The returned spec is `ToolSpec::Function(ResponsesApiTool { ... })`. Its `name` comes from `codex_code_mode::WAIT_TOOL_NAME`, and its description is assembled from a fixed introductory sentence plus the trimmed output of `codex_code_mode::build_wait_tool_description()`. `strict` is explicitly `false`, `output_schema` is `None`, and `defer_loading` is `None`, reflecting that this is a normal eagerly available function tool.
+The main function lists the tool’s input fields. A caller must provide a `cell_id`, which identifies the already-running execution cell. The caller may also provide `yield_time_ms`, which says how long to wait before returning more output, `max_tokens`, which limits how much output can be returned, and `terminate`, which asks the system to stop the running cell instead of waiting.
 
-The test module asserts structural equality against a fully spelled-out expected `ToolSpec`. That test is important because it catches accidental changes to parameter ordering, descriptions, required fields, or the additional-properties setting, all of which affect model-visible behavior.
+These fields are described using JSON Schema, a standard way to say “this input should be a string,” “this one should be a number,” and so on. The result is wrapped as a `ToolSpec`, which is the project’s common shape for tools exposed through the Responses API.
+
+The test at the bottom protects this contract. If someone changes the tool name, wording, required fields, or allowed parameters by accident, the test will fail and make that change visible.
 
 #### Function details
 
@@ -3403,11 +3445,11 @@ The test module asserts structural equality against a fully spelled-out expected
 fn create_wait_tool() -> ToolSpec
 ```
 
-**Purpose**: Builds the complete function-tool specification for the code-mode wait operation. It defines the parameter schema, human-readable descriptions, and metadata exposed to the tool system.
+**Purpose**: Builds the official specification for the wait tool used in code mode. Other parts of the system use this specification to advertise the tool correctly and validate what inputs are allowed.
 
-**Data flow**: Takes no arguments → creates a `BTreeMap` of property schemas using `JsonSchema::string`, `number`, and `boolean` → formats a description string using `WAIT_TOOL_NAME`, `PUBLIC_TOOL_NAME`, and `build_wait_tool_description()` → wraps everything in `ToolSpec::Function(ResponsesApiTool { ... })` and returns it.
+**Data flow**: It starts with no runtime input. It creates a map of parameter names to their expected shapes: `cell_id` as text, `yield_time_ms` and `max_tokens` as numbers, and `terminate` as true-or-false. It then combines those parameters with the tool name and description, and returns a complete `ToolSpec` that can be registered with the API.
 
-**Call relations**: This function is called by `CodeModeWaitHandler::spec` when the runtime needs the wait tool definition. It delegates primitive schema construction to `JsonSchema` helpers and keeps the handler implementation free of schema-building details.
+**Call relations**: This function is called by `spec` when the larger tool list is being assembled. Inside, it relies on JSON Schema helper constructors such as `string`, `number`, `boolean`, and `object` to describe each accepted input, then wraps the finished definition as a function-style API tool.
 
 *Call graph*: calls 4 internal fn (boolean, number, object, string); called by 1 (spec); 4 external calls (from, format!, Function, vec!).
 
@@ -3418,26 +3460,26 @@ fn create_wait_tool() -> ToolSpec
 fn create_wait_tool_matches_expected_spec()
 ```
 
-**Purpose**: Verifies that `create_wait_tool` returns the exact expected `ToolSpec`, including descriptions, required fields, and parameter schema details. It serves as a snapshot-style regression test for the model-visible contract.
+**Purpose**: Checks that `create_wait_tool` still produces exactly the expected tool specification. This guards against accidental changes to the public contract of the wait tool.
 
-**Data flow**: Takes no arguments → calls `create_wait_tool()` → constructs an inline expected `ToolSpec::Function(ResponsesApiTool { ... })` → compares them with `assert_eq!`. It reads no shared state and writes no outputs beyond test assertions.
+**Data flow**: The test calls `create_wait_tool`, builds a second copy of the expected specification inline, and compares the two. If every field matches, nothing changes and the test passes. If anything differs, the assertion reports the mismatch.
 
-**Call relations**: This test exercises `create_wait_tool` directly. It does not delegate further beyond assertion machinery, and it protects callers such as `CodeModeWaitHandler::spec` from silent schema drift.
+**Call relations**: This test runs only during the test suite. It calls on the result of `create_wait_tool` indirectly through the comparison and uses `assert_eq!` to verify that the generated specification matches the fixed expected one.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `core/src/tools/code_mode/wait_handler.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `code-mode request handling`
 
-This file defines `CodeModeWaitHandler`, the executor for the special code-mode control tool named by `WAIT_TOOL_NAME`. Its argument schema is represented by `ExecWaitArgs`, which requires `cell_id` and optionally accepts `yield_time_ms`, `max_tokens`, and `terminate`; serde defaults supply `DEFAULT_WAIT_YIELD_TIME_MS`, `None`, and `false` respectively.
+Code mode lets the system run code in cells, and a running cell may take time to finish. This file provides the tool handler for `wait`, which is how the model asks, “Has that cell produced more output yet?” or “Please stop that cell.” Without this file, code mode could start work but would not have this standard path for polling results, yielding partial output, or terminating a cell.
 
-The handler implements `ToolExecutor<ToolInvocation>` so it can advertise its tool name and schema and expose an async `handle` entry point. The real logic lives in `handle_call`. It first destructures the invocation and only accepts `ToolPayload::Function` whose tool name exactly matches the un-namespaced wait tool. It parses the JSON arguments with a generic `parse_arguments`, wrapping parse failures as `FunctionCallError::RespondToModel`.
+The main type is `CodeModeWaitHandler`. It registers itself as the handler for the `wait` tool and supplies the tool’s public shape, or specification, so callers know what arguments to send. Those arguments include the target `cell_id`, how long to wait before yielding control back, an optional output size limit, and a `terminate` flag.
 
-After building an `ExecContext` from the session and turn, it records `started_at`, constructs a `codex_code_mode::CellId`, and chooses between `code_mode_service.terminate(cell_id)` and `code_mode_service.wait(WaitRequest { cell_id, yield_time_ms })` based on `args.terminate`. If the returned `WaitOutcome` is a live-cell response that is not `RuntimeResponse::Yielded`, the handler records the cell as ended in `rollout_thread_trace` and calls `finish_cell_dispatch` so reducer/runtime bookkeeping closes out the cell. Finally it delegates to `handle_runtime_response`, passing the optional `max_tokens` budget and elapsed-start anchor, then boxes the resulting tool output.
+When a `wait` call arrives, the handler first checks that it really is the plain `wait` tool and that its payload is JSON function arguments. It parses those arguments, builds an execution context from the current session and turn, then either asks the code-mode service to wait for the cell or to terminate it. If the cell has reached a final state, it also records trace information and tells the service that dispatch for that cell is finished. Finally, it converts the runtime response into the normal tool output format.
 
-A subtle but important design choice is that pre/post tool-use hooks are explicitly disabled for this tool: `wait` is treated as internal runtime control flow, so hooks must not rewrite or block its payloads.
+One important detail is that this tool deliberately opts out of pre- and post-tool hooks. The wait loop is internal runtime control, not a separate user-facing action, so outside hooks should not block it or rewrite its result.
 
 #### Function details
 
@@ -3447,11 +3489,11 @@ A subtle but important design choice is that pre/post tool-use hooks are explici
 fn default_wait_yield_time_ms() -> u64
 ```
 
-**Purpose**: Supplies the serde default for `ExecWaitArgs.yield_time_ms`. It centralizes the default wait interval so deserialization and runtime behavior stay aligned.
+**Purpose**: Provides the default amount of time the `wait` tool should pause before yielding control back. It is used when the caller does not include a custom `yield_time_ms` value.
 
-**Data flow**: Takes no arguments → returns `DEFAULT_WAIT_YIELD_TIME_MS` as `u64`. It reads a module-level constant and mutates no state.
+**Data flow**: It takes no input. It reads the shared code-mode default wait time constant and returns that number as milliseconds.
 
-**Call relations**: Serde invokes this function when `yield_time_ms` is omitted from incoming JSON for `ExecWaitArgs`. It is not part of the runtime call flow beyond argument deserialization.
+**Call relations**: This function is tied to the JSON argument parsing for `ExecWaitArgs`. When a `wait` call omits `yield_time_ms`, deserialization uses this function so the rest of the handler always has a concrete wait duration to send to the runtime.
 
 
 ##### `parse_arguments`  (lines 38–45)
@@ -3460,11 +3502,11 @@ fn default_wait_yield_time_ms() -> u64
 fn parse_arguments(arguments: &str) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Deserializes a JSON argument string into a requested Rust type and rewrites parse failures into model-facing tool errors. It is the generic parser used by the wait handler before any service call is attempted.
+**Purpose**: Turns the raw JSON argument string from a tool call into a typed Rust value. If the JSON is invalid or does not match the expected shape, it produces an error that can be sent back to the model.
 
-**Data flow**: Takes `arguments: &str` and a target type `T: Deserialize` → calls `serde_json::from_str(arguments)` → returns `Ok(T)` on success or `Err(FunctionCallError::RespondToModel(...))` with the serde error embedded in the message.
+**Data flow**: It receives a text string containing JSON. It asks the JSON parser to convert that text into the requested data type. On success it returns the typed value; on failure it returns a `FunctionCallError` with a plain error message.
 
-**Call relations**: This helper is called from `CodeModeWaitHandler::handle_call` after the tool name/payload shape check passes. It delegates actual JSON parsing to `serde_json::from_str` so the handler can stay focused on wait/terminate control flow.
+**Call relations**: `CodeModeWaitHandler::handle_call` uses this before doing any runtime work. This keeps bad tool calls from reaching the code-mode service and gives the model a clear explanation of what went wrong.
 
 *Call graph*: called by 1 (handle_call); 1 external calls (from_str).
 
@@ -3475,11 +3517,11 @@ fn parse_arguments(arguments: &str) -> Result<T, FunctionCallError>
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the canonical tool name for this executor. It binds the handler to the plain, non-namespaced code-mode wait tool identifier.
+**Purpose**: Identifies this handler as the owner of the plain `wait` tool name. The tool registry uses this to route matching tool calls here.
 
-**Data flow**: Takes `&self` → constructs and returns `ToolName::plain(WAIT_TOOL_NAME)`. No external state is read.
+**Data flow**: It takes the handler itself as input. It wraps the shared `WAIT_TOOL_NAME` string as a plain tool name and returns it.
 
-**Call relations**: The tool registry calls this when registering or matching executors. It delegates name construction to `ToolName::plain` so the handler participates in standard tool dispatch.
+**Call relations**: The registry calls this when wiring tools together. Its returned name must match the check inside `CodeModeWaitHandler::handle_call`, so that registration and actual execution agree on which tool this handler serves.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -3490,11 +3532,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the JSON-schema-backed tool specification for the wait tool. This is what the model/runtime sees as the callable interface.
+**Purpose**: Builds the public description of the `wait` tool, including what arguments it accepts. This lets the rest of the system expose the tool correctly to the model.
 
-**Data flow**: Takes `&self` → calls `create_wait_tool()` → returns the resulting `ToolSpec`.
+**Data flow**: It takes the handler itself as input. It calls the wait-tool specification builder and returns the resulting `ToolSpec`, which is the structured description of the tool.
 
-**Call relations**: The registry invokes this when exposing tool metadata. It delegates all schema construction to `wait_spec::create_wait_tool` so the runtime logic and schema definition remain separate.
+**Call relations**: The tool registry calls this when it needs the tool definition. It delegates the detailed specification to `create_wait_tool`, keeping this file focused on execution behavior rather than schema construction.
 
 *Call graph*: calls 1 internal fn (create_wait_tool).
 
@@ -3505,11 +3547,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async wait implementation to the boxed future type required by the `ToolExecutor` trait. It is the trait-facing entry point for execution.
+**Purpose**: Starts handling a `wait` tool invocation in the asynchronous tool-execution system. It wraps the real work in a future, which is a task that will complete later.
 
-**Data flow**: Takes `&self` and `invocation: ToolInvocation` → creates `self.handle_call(invocation)` future → boxes and pins it → returns `ToolExecutorFuture<'_>`.
+**Data flow**: It receives a `ToolInvocation`, which contains the session, turn, tool name, and payload. It passes that invocation to `CodeModeWaitHandler::handle_call` and returns a pinned asynchronous task that the executor can wait on.
 
-**Call relations**: The tool dispatch layer calls this when the wait tool is selected. It immediately delegates all substantive work to `CodeModeWaitHandler::handle_call`.
+**Call relations**: The tool runtime calls this when a `wait` invocation is dispatched to this handler. This function is a thin adapter: it hands off the actual logic to `CodeModeWaitHandler::handle_call` while matching the common `ToolExecutor` interface.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -3523,11 +3565,11 @@ async fn handle_call(
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Validates a wait-tool invocation, performs either a wait or terminate operation against the code-mode service, closes tracing for completed cells, and converts the runtime outcome into a boxed tool output. It is the file's main control-flow function.
+**Purpose**: Performs the actual `wait` tool work: validate the call, parse its arguments, wait for or terminate the requested code cell, record final-cell bookkeeping, and return the runtime result as tool output.
 
-**Data flow**: Consumes `ToolInvocation`, extracting `session`, `turn`, `tool_name`, and `payload` → checks that payload is `ToolPayload::Function` and the tool name is the plain wait tool → parses JSON into `ExecWaitArgs` → builds `ExecContext { session, turn }`, records `Instant::now()`, and wraps `args.cell_id` in `codex_code_mode::CellId::new`. If `args.terminate` is true it awaits `code_mode_service.terminate(cell_id)`; otherwise it awaits `code_mode_service.wait(WaitRequest { cell_id, yield_time_ms })`. Service errors are mapped to `FunctionCallError::RespondToModel`. For non-yielding live-cell outcomes, it extracts the runtime `cell_id`, records the end event in `rollout_thread_trace.code_cell_trace_context(...).record_ended(response)`, and calls `finish_cell_dispatch(runtime_cell_id)`. Finally it awaits `handle_runtime_response(&exec, wait_response.into(), args.max_tokens, started_at)`, boxes the returned output with `boxed_tool_output`, and maps any formatting error to `RespondToModel`. If the payload/name check fails, it returns a model-facing JSON-arguments error immediately.
+**Data flow**: It receives a full tool invocation. It pulls out the session, turn, tool name, and payload, then checks that the payload is JSON arguments for the plain `wait` tool. It parses those arguments into `ExecWaitArgs`, creates a code-cell ID, and records the start time. If `terminate` is true, it asks the code-mode service to stop the cell; otherwise it asks the service to wait for up to the requested yield time. If the response says a live cell has finished or terminated rather than merely yielded, it records that ending in the trace and marks the cell dispatch as finished. It then converts the runtime response into boxed tool output, applying any requested token limit. If anything fails, it returns an error message meant for the model.
 
-**Call relations**: This function is invoked only by `CodeModeWaitHandler::handle`. It delegates argument parsing to `parse_arguments`, runtime response shaping to `handle_runtime_response`, and uses session services for the actual wait/terminate operation plus trace/finalization side effects when a live cell completes.
+**Call relations**: `CodeModeWaitHandler::handle` calls this as the real worker. It uses `parse_arguments` for safe input parsing, calls into the session’s `code_mode_service` to do the runtime wait or termination, updates trace and dispatch state when a cell closes, and finally hands the runtime result to `handle_runtime_response` so the output is shaped consistently with the rest of code mode.
 
 *Call graph*: calls 2 internal fn (new, parse_arguments); called by 1 (handle); 5 external calls (format!, matches!, now, handle_runtime_response, RespondToModel).
 
@@ -3538,11 +3580,11 @@ async fn handle_call(
 fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload>
 ```
 
-**Purpose**: Suppresses pre-tool-use hook payload generation for the wait tool. This prevents hook logic from interfering with the internal code-mode wait loop.
+**Purpose**: Prevents normal pre-tool hooks from running for code-mode `wait`. This matters because `wait` is internal runtime control, not a standalone action that should be blocked or rewritten.
 
-**Data flow**: Takes `&self` and `_invocation: &ToolInvocation` → always returns `None`.
+**Data flow**: It receives the tool invocation but does not inspect it. It always returns `None`, meaning there is no pre-tool payload for hooks to act on.
 
-**Call relations**: The core tool runtime hook system calls this before execution. By returning `None`, the handler ensures no pre-use hook can block, rewrite, or annotate code-mode wait control traffic.
+**Call relations**: The core tool runtime asks for this before tool execution. By returning nothing, this handler keeps the code-mode wait loop flowing directly to `CodeModeWaitHandler::handle_call` instead of passing through hook behavior meant for ordinary model-facing tools.
 
 
 ##### `CodeModeWaitHandler::post_tool_use_payload`  (lines 144–152)
@@ -3555,11 +3597,11 @@ fn post_tool_use_payload(
     ) -> Option<PostToolUsePayload>
 ```
 
-**Purpose**: Suppresses post-tool-use hook payload generation for the wait tool result. This preserves the raw wait result for code-mode control flow instead of replacing it with hook feedback.
+**Purpose**: Prevents normal post-tool hooks from replacing or modifying the `wait` result. The returned result is part of code-mode control flow, so it must go back unchanged.
 
-**Data flow**: Takes `&self`, `_invocation: &ToolInvocation`, and `_result: &dyn ToolOutput` → always returns `None`.
+**Data flow**: It receives the invocation and the produced tool output, but it does not read or alter either one. It always returns `None`, meaning there is no post-tool payload to send through hook processing.
 
-**Call relations**: The runtime hook system calls this after execution. Returning `None` ensures the wait result continues directly into code-mode orchestration without post-hook substitution.
+**Call relations**: The core tool runtime asks for this after tool execution. By returning nothing, it ensures the response created through `handle_runtime_response` remains the response that code mode sees, rather than being swapped for hook feedback intended for user-facing tool calls.
 
 
 ### Extension registry and standalone tool namespaces
@@ -3567,13 +3609,13 @@ These files define the shared extension registry and then wire in concrete stand
 
 ### `ext/extension-api/src/registry.rs`
 
-`orchestration` · `startup`
+`orchestration` · `startup setup, then cross-cutting runtime lookups`
 
-This file is the assembly point for the extension API. `ExtensionRegistryBuilder<C>` is the mutable registration surface hosts use while installing extensions. It stores one `Arc<dyn ExtensionEventSink>` plus ordered `Vec<Arc<dyn ...>>` collections for every contributor category: thread lifecycle, turn lifecycle, config, token usage, prompt/context, MCP servers, turn input, tools, tool lifecycle, turn-item post-processing, and approval review. `Default` initializes all vectors empty and installs `NoopExtensionEventSink`, giving hosts a safe baseline even when they register nothing.
+Extensions can add behavior at many points: when a thread starts or stops, when a turn begins, when tools run, when prompts are built, when token use is recorded, and more. This file gives all of those add-ons one organized home. Think of it like a theater stage manager’s clipboard: during setup, every helper writes down what job they can do; once the show starts, the clipboard is read-only so everyone sees a stable plan.
 
-The builder methods are intentionally thin: each registration method pushes one contributor into the corresponding vector, preserving registration order. `with_event_sink` swaps in a host-provided sink while inheriting otherwise empty defaults. `build` consumes the builder and transfers all accumulated state into `ExtensionRegistry<C>`, the immutable runtime view.
+The file has two main parts. ExtensionRegistryBuilder is the temporary, mutable version used while extensions are being installed. It starts empty, or with a host-provided event sink, which is the place extensions can send events back to the host. Each registration method adds one contributor to the right list.
 
-`ExtensionRegistry<C>` mainly exposes borrowed slices of each contributor list so orchestration code can iterate them without copying. The one nontrivial method is `approval_review`, which walks `approval_review_contributors` in registration order, awaits each contributor’s async decision, and short-circuits on the first `Some(ReviewDecision)`. If no contributor claims the prompt, it returns `None`. That ordering behavior is a key invariant tested elsewhere. Finally, `empty_extension_registry` wraps a freshly built empty registry in `Arc`, providing a shared default for hosts that do not install any extensions.
+When setup is finished, build turns the builder into ExtensionRegistry. The registry is immutable, meaning its lists are no longer changed. Runtime code can then ask for the contributors it needs: tools, prompt context, lifecycle hooks, token tracking, and so on. One method, approval_review, does a little more than returning a list: it asks approval-review contributors in order and uses the first decision any contributor provides. Without this file, extension behavior would be scattered and hard to call consistently.
 
 #### Function details
 
@@ -3583,11 +3625,11 @@ The builder methods are intentionally thin: each registration method pushes one 
 fn default() -> Self
 ```
 
-**Purpose**: Creates an empty builder with a no-op event sink and no registered contributors in any category. It establishes the baseline registration state for hosts and tests.
+**Purpose**: Creates a fresh builder with no registered contributors and a do-nothing event sink. This gives hosts a safe starting point even when they have no extensions.
 
-**Data flow**: It constructs a new `Arc<dyn ExtensionEventSink>` containing `NoopExtensionEventSink`, initializes each contributor field with `Vec::new()`, and returns the populated `ExtensionRegistryBuilder<C>`. No external state is read or modified.
+**Data flow**: No outside data comes in. It creates empty lists for every contribution type and stores a NoopExtensionEventSink, which ignores events. The result is a builder ready to receive registrations.
 
-**Call relations**: This is the common initialization path behind `ExtensionRegistryBuilder::new` and `with_event_sink`. It delegates only to `Arc::new` and `Vec::new` to allocate the sink and empty collections.
+**Call relations**: ExtensionRegistryBuilder::new relies on this as the standard starting state. with_event_sink also uses it, then swaps in a real event sink while keeping all contributor lists empty.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -3598,11 +3640,11 @@ fn default() -> Self
 fn new() -> Self
 ```
 
-**Purpose**: Returns a fresh empty registry builder using the default no-op event sink. It is the standard entry point for host registration code.
+**Purpose**: Creates an empty extension registry builder. Hosts and tests use it when they want to start collecting extension contributions from scratch.
 
-**Data flow**: It takes no arguments, calls `Self::default()`, and returns the resulting builder. No additional transformation occurs.
+**Data flow**: It takes no input. It delegates to the default setup, producing a builder with empty contribution lists and a no-op event sink.
 
-**Call relations**: Hosts, tests, and helper constructors call this when beginning extension installation. It delegates entirely to `default`, inheriting that method’s initialization behavior.
+**Call relations**: This is the common entry point for setup code such as session creation and extension-related tests. Later, installer code adds contributors to the builder, and build turns it into the immutable registry.
 
 *Call graph*: called by 22 (make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx, prompt_extension_test_registry, session_new_fails_when_zsh_fork_enabled_without_packaged_zsh, plan_mode_uses_contributed_turn_item_for_last_agent_message, finalized_turn_item_defers_mailbox_for_contributed_visible_text, finalized_turn_item_keeps_mailbox_open_for_commentary_text, handle_non_tool_response_item_runs_turn_item_contributors_only_when_requested (+12 more)); 1 external calls (default).
 
@@ -3613,11 +3655,11 @@ fn new() -> Self
 fn with_event_sink(event_sink: Arc<dyn ExtensionEventSink>) -> Self
 ```
 
-**Purpose**: Creates an empty builder that retains a host-provided event sink instead of the default no-op sink. This lets extensions emit events through host-defined plumbing during and after installation.
+**Purpose**: Creates an empty builder that uses a host-provided event sink. Use this when extensions need a real place to report events instead of silently dropping them.
 
-**Data flow**: It takes `event_sink: Arc<dyn ExtensionEventSink>`, constructs a builder using struct update syntax with `..Self::default()`, and returns it. The supplied sink is stored directly; all contributor vectors come from the default builder.
+**Data flow**: It receives a shared event sink. It starts from the default empty builder, replaces the default no-op sink with the provided one, and returns the customized builder.
 
-**Call relations**: Hosts call this when they need event emission wired into extension constructors or runtime behavior. It delegates to `default` for all non-sink fields while overriding the sink field.
+**Call relations**: Setup code that cares about extension events calls this before installation begins. After that, installer code can fetch the sink with ExtensionRegistryBuilder::event_sink and pass it into extension constructors.
 
 *Call graph*: called by 1 (orchestrator_catalog_snapshot_caches_failure); 1 external calls (default).
 
@@ -3628,11 +3670,11 @@ fn with_event_sink(event_sink: Arc<dyn ExtensionEventSink>) -> Self
 fn event_sink(&self) -> Arc<dyn ExtensionEventSink>
 ```
 
-**Purpose**: Returns a clone of the builder’s retained event sink so host installation code can pass it into extension constructors. It preserves shared ownership semantics via `Arc`.
+**Purpose**: Returns the event sink currently attached to the builder. Extension installers use it so newly created extensions can send events back to the host.
 
-**Data flow**: It takes `&self`, clones `self.event_sink` with `Arc::clone`, and returns the cloned `Arc<dyn ExtensionEventSink>`. It does not mutate the builder.
+**Data flow**: It reads the builder’s stored shared event sink and returns another shared reference to the same sink. The builder keeps its own copy, and nothing is removed or changed.
 
-**Call relations**: Installation flows call this before registration is complete when constructing extensions that need to emit events. It delegates only to `Arc::clone`.
+**Call relations**: install_with_backend and install_with_providers call this while constructing extensions. It hands them the communication channel they need before they register their contributors.
 
 *Call graph*: called by 2 (install_with_backend, install_with_providers); 1 external calls (clone).
 
@@ -3643,11 +3685,11 @@ fn event_sink(&self) -> Arc<dyn ExtensionEventSink>
 fn approval_review_contributor(&mut self, contributor: Arc<dyn ApprovalReviewContributor>)
 ```
 
-**Purpose**: Registers one approval-review contributor at the end of the approval-review list. Registration order matters because runtime dispatch short-circuits on the first claim.
+**Purpose**: Registers one contributor that can review an approval prompt and optionally return a decision. This lets extensions participate in yes/no-style approval flows.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn ApprovalReviewContributor>`, pushes the contributor into `self.approval_review_contributors`, and returns `()`. It mutates only the builder’s internal vector.
+**Data flow**: It receives a shared approval-review contributor and appends it to the builder’s approval-review list. The builder is changed by remembering that contributor for later.
 
-**Call relations**: Host installation code invokes this while assembling the registry. The resulting order is later consumed by `ExtensionRegistry::approval_review`.
+**Call relations**: Although no specific caller is shown in the graph, this is the setup hook for approval review extensions. The stored contributors are later used by ExtensionRegistry::approval_review after build has frozen the registry.
 
 
 ##### `ExtensionRegistryBuilder::thread_lifecycle_contributor`  (lines 80–85)
@@ -3659,11 +3701,11 @@ fn thread_lifecycle_contributor(
     )
 ```
 
-**Purpose**: Registers one thread lifecycle contributor in order. These contributors are later invoked during thread start, resume, idle, and stop orchestration.
+**Purpose**: Registers one contributor that wants to be told about thread-level lifecycle events, such as resuming or stopping a thread. A thread here is a long-running conversation or work session.
 
-**Data flow**: It accepts `&mut self` and `Arc<dyn ThreadLifecycleContributor<C>>`, appends the contributor to `self.thread_lifecycle_contributors`, and returns unit. Only the builder’s vector is mutated.
+**Data flow**: It receives a shared thread lifecycle contributor and adds it to the builder’s thread lifecycle list. Nothing is returned; the builder’s future registry now includes this contributor.
 
-**Call relations**: Extension installation paths call this when a feature wants thread lifecycle hooks. Runtime thread orchestration later reads the accumulated slice from the built registry.
+**Call relations**: Extension installation paths call this when an extension offers thread lifecycle behavior. Later, runtime code asks ExtensionRegistry::thread_lifecycle_contributors for the frozen list during thread resume and stop flows.
 
 *Call graph*: called by 6 (install_with_backend, install, install, install, install_with_providers, install).
 
@@ -3674,11 +3716,11 @@ fn thread_lifecycle_contributor(
 fn turn_lifecycle_contributor(&mut self, contributor: Arc<dyn TurnLifecycleContributor>)
 ```
 
-**Purpose**: Registers one turn lifecycle contributor in order for later turn start/stop/abort/error notifications.
+**Purpose**: Registers one contributor that wants to be notified as a turn starts, stops, or errors. A turn is one round of interaction or work inside a thread.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn TurnLifecycleContributor>`, pushes the contributor into `self.turn_lifecycle_contributors`, and returns `()`. No other state changes.
+**Data flow**: It receives a shared turn lifecycle contributor and appends it to the turn lifecycle list. The builder now carries that contributor forward into the final registry.
 
-**Call relations**: Hosts call this during installation for features that observe turn lifecycle events. The built registry later exposes the ordered slice to turn orchestration code.
+**Call relations**: install_with_backend uses this during extension setup. Runtime turn code later reads these contributors through ExtensionRegistry::turn_lifecycle_contributors when starting, stopping, or reporting errors for a turn.
 
 *Call graph*: called by 1 (install_with_backend).
 
@@ -3689,11 +3731,11 @@ fn turn_lifecycle_contributor(&mut self, contributor: Arc<dyn TurnLifecycleContr
 fn config_contributor(&mut self, contributor: Arc<dyn ConfigContributor<C>>)
 ```
 
-**Purpose**: Registers one configuration-change contributor. These contributors are later notified after committed thread-config updates.
+**Purpose**: Registers one contributor that can add or shape configuration. This lets extensions provide settings or adjust host setup in a typed, organized way.
 
-**Data flow**: It receives `&mut self` and `Arc<dyn ConfigContributor<C>>`, appends the contributor to `self.config_contributors`, and returns unit. It mutates only that vector.
+**Data flow**: It receives a shared config contributor and stores it in the config contributor list. The builder is updated; no value is returned.
 
-**Call relations**: Installation code uses this to opt features into config-change callbacks. Runtime config update code later iterates the built registry’s config contributor slice.
+**Call relations**: Several install paths call this when extensions provide configuration behavior. The final registry exposes the collected contributors through ExtensionRegistry::config_contributors.
 
 *Call graph*: called by 5 (install_with_backend, install, install, install_with_providers, install).
 
@@ -3704,11 +3746,11 @@ fn config_contributor(&mut self, contributor: Arc<dyn ConfigContributor<C>>)
 fn token_usage_contributor(&mut self, contributor: Arc<dyn TokenUsageContributor>)
 ```
 
-**Purpose**: Registers one token-usage contributor for later token accounting notifications.
+**Purpose**: Registers one contributor interested in token usage reports. Tokens are the small text pieces counted when language models read or write text.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn TokenUsageContributor>`, pushes the contributor into `self.token_usage_contributors`, and returns `()`. No external state is touched.
+**Data flow**: It receives a shared token-usage contributor and appends it to the token usage list. The builder keeps it until build creates the read-only registry.
 
-**Call relations**: Hosts call this while installing features that observe model token usage. Token-recording orchestration later consumes the ordered list from the registry.
+**Call relations**: install_with_backend registers these contributors during setup. Later, record_token_usage asks the registry for them through ExtensionRegistry::token_usage_contributors.
 
 *Call graph*: called by 1 (install_with_backend).
 
@@ -3719,11 +3761,11 @@ fn token_usage_contributor(&mut self, contributor: Arc<dyn TokenUsageContributor
 fn prompt_contributor(&mut self, contributor: Arc<dyn ContextContributor>)
 ```
 
-**Purpose**: Registers one prompt/context contributor in order. These contributors later add `PromptFragment` values during prompt assembly.
+**Purpose**: Registers one contributor that can add context to a prompt. In plain terms, it lets an extension add useful background before the model is asked to respond.
 
-**Data flow**: It accepts `&mut self` and `Arc<dyn ContextContributor>`, appends the contributor to `self.context_contributors`, and returns unit. Only the builder’s vector changes.
+**Data flow**: It receives a shared context contributor and adds it to the context contributor list. The builder’s stored prompt-building helpers grow by one.
 
-**Call relations**: Prompt-related extension installation paths call this. Prompt assembly later iterates the registry’s context contributors in the same order they were registered.
+**Call relations**: Extension install flows call this when an extension can contribute prompt context. Later, contribute_prompt reads the final list through ExtensionRegistry::context_contributors.
 
 *Call graph*: called by 3 (install, install, install_with_providers).
 
@@ -3734,11 +3776,11 @@ fn prompt_contributor(&mut self, contributor: Arc<dyn ContextContributor>)
 fn mcp_server_contributor(&mut self, contributor: Arc<dyn McpServerContributor<C>>)
 ```
 
-**Purpose**: Registers one runtime MCP server contributor in order. These contributors later overlay MCP server configuration.
+**Purpose**: Registers one contributor that can provide a runtime MCP server. MCP, or Model Context Protocol, is a way for tools and data sources to be exposed to the model through a standard interface.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn McpServerContributor<C>>`, pushes the contributor into `self.mcp_server_contributors`, and returns `()`. It mutates only that collection.
+**Data flow**: It receives a shared MCP server contributor and appends it to the MCP server list. The builder remembers it for the final registry.
 
-**Call relations**: Host/plugin installation code uses this to add MCP overlays. Runtime config resolution later reads the ordered contributor slice from the built registry.
+**Call relations**: General extension installation and executor plugin installation call this when they add MCP-backed capabilities. The final registry later exposes these contributors through ExtensionRegistry::mcp_server_contributors.
 
 *Call graph*: called by 2 (install, install_executor_plugins).
 
@@ -3749,11 +3791,11 @@ fn mcp_server_contributor(&mut self, contributor: Arc<dyn McpServerContributor<C
 fn turn_input_contributor(&mut self, contributor: Arc<dyn TurnInputContributor>)
 ```
 
-**Purpose**: Registers one turn-input contributor that can add model-visible contextual fragments for a submitted turn.
+**Purpose**: Registers one contributor that can add or modify input for a turn. This lets extensions influence what information is fed into a round of work.
 
-**Data flow**: It receives `&mut self` and `Arc<dyn TurnInputContributor>`, appends the contributor to `self.turn_input_contributors`, and returns unit. No other state is affected.
+**Data flow**: It receives a shared turn-input contributor and stores it in the turn input list. The builder is updated and returns nothing.
 
-**Call relations**: Installation code calls this for features that contribute turn-local model input. Turn preparation logic later iterates the registry’s turn-input contributors.
+**Call relations**: install_with_providers calls this during setup when a provider offers turn input behavior. Runtime code can later read the frozen list through ExtensionRegistry::turn_input_contributors.
 
 *Call graph*: called by 1 (install_with_providers).
 
@@ -3764,11 +3806,11 @@ fn turn_input_contributor(&mut self, contributor: Arc<dyn TurnInputContributor>)
 fn tool_contributor(&mut self, contributor: Arc<dyn ToolContributor>)
 ```
 
-**Purpose**: Registers one native tool contributor in order. These contributors later expose `ToolExecutor<ToolCall>` implementations visible to the runtime.
+**Purpose**: Registers one contributor that provides native tools. A tool is a callable capability, such as reading data, running an action, or exposing a project-specific operation.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn ToolContributor>`, pushes the contributor into `self.tool_contributors`, and returns `()`. It mutates only the builder’s tool list.
+**Data flow**: It receives a shared tool contributor and appends it to the tool contributor list. That contributor will become available in the final registry.
 
-**Call relations**: Hosts call this while installing features that own tools. Tool discovery/orchestration later queries the built registry’s tool contributor slice.
+**Call relations**: Multiple extension installation paths call this when extensions add tools. Later, the tools flow asks ExtensionRegistry::tool_contributors for the complete list.
 
 *Call graph*: called by 5 (install_with_backend, install, install, install_with_providers, install).
 
@@ -3779,11 +3821,11 @@ fn tool_contributor(&mut self, contributor: Arc<dyn ToolContributor>)
 fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn ToolLifecycleContributor>)
 ```
 
-**Purpose**: Registers one tool lifecycle contributor for later start/finish notifications around tool execution.
+**Purpose**: Registers one contributor that wants to hear about tool lifecycle events, such as when a tool finishes. This is useful for logging, cleanup, or follow-up behavior around tool use.
 
-**Data flow**: It accepts `&mut self` and `Arc<dyn ToolLifecycleContributor>`, appends the contributor to `self.tool_lifecycle_contributors`, and returns unit. Only that vector is modified.
+**Data flow**: It receives a shared tool lifecycle contributor and adds it to the tool lifecycle list. The builder keeps it for the final registry.
 
-**Call relations**: Installation code uses this for features that observe tool execution without owning tools. Tool execution orchestration later iterates the registry’s lifecycle contributor slice.
+**Call relations**: install_with_backend registers these contributors during setup. Later, notify_tool_finish gets the list from ExtensionRegistry::tool_lifecycle_contributors.
 
 *Call graph*: called by 1 (install_with_backend).
 
@@ -3794,11 +3836,11 @@ fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn ToolLifecycleContr
 fn turn_item_contributor(&mut self, contributor: Arc<dyn TurnItemContributor>)
 ```
 
-**Purpose**: Registers one ordered turn-item contributor that can mutate parsed `TurnItem` values before emission.
+**Purpose**: Registers one contributor that can add ordered items to a turn. Ordered means its output matters in sequence with other turn content.
 
-**Data flow**: It takes `&mut self` and `Arc<dyn TurnItemContributor>`, pushes the contributor into `self.turn_item_contributors`, and returns `()`. It mutates only the corresponding vector.
+**Data flow**: It receives a shared turn-item contributor and appends it to the turn item list. The builder now includes that contributor for the registry that will be built.
 
-**Call relations**: Hosts call this during installation for features that post-process turn items. Later turn-item pipelines consume the contributors in registration order.
+**Call relations**: No caller is shown in the graph, but this is the setup hook for extensions that add turn items. The final registry exposes these contributors through ExtensionRegistry::turn_item_contributors.
 
 
 ##### `ExtensionRegistryBuilder::build`  (lines 133–148)
@@ -3807,11 +3849,11 @@ fn turn_item_contributor(&mut self, contributor: Arc<dyn TurnItemContributor>)
 fn build(self) -> ExtensionRegistry<C>
 ```
 
-**Purpose**: Consumes the mutable builder and produces the immutable runtime registry. It freezes contributor ordering and transfers ownership of all registered components.
+**Purpose**: Finishes setup and turns the mutable builder into a read-only registry. This is the moment extension registration closes.
 
-**Data flow**: It takes ownership of `self`, moves each field into a new `ExtensionRegistry<C>`, and returns that registry. No cloning is performed; the builder is consumed.
+**Data flow**: It consumes the builder, moving the event sink and every contributor list into a new ExtensionRegistry. After this, callers get an immutable registry instead of a builder they can keep changing.
 
-**Call relations**: Host setup code calls this once registration is complete. The resulting registry is then passed into runtime orchestration, which uses its accessor methods and approval-review dispatcher.
+**Call relations**: Setup code calls this after extension installers have added their pieces. Runtime code then uses the returned ExtensionRegistry to find contributors without worrying that the lists are changing underneath it.
 
 
 ##### `ExtensionRegistry::event_sink`  (lines 169–171)
@@ -3820,11 +3862,11 @@ fn build(self) -> ExtensionRegistry<C>
 fn event_sink(&self) -> Arc<dyn ExtensionEventSink>
 ```
 
-**Purpose**: Returns a clone of the registry’s retained event sink for runtime use. It preserves shared ownership while keeping the registry immutable.
+**Purpose**: Returns the event sink stored in the finished registry. This lets runtime code or extensions share the same event-reporting channel after setup is complete.
 
-**Data flow**: It takes `&self`, clones `self.event_sink` with `Arc::clone`, and returns the cloned sink. No registry state is mutated.
+**Data flow**: It reads the registry’s stored shared event sink and returns another shared reference to it. The registry keeps its own reference and does not change.
 
-**Call relations**: Runtime code calls this when it needs to emit extension-related events after installation has finished. It delegates only to `Arc::clone`.
+**Call relations**: This mirrors the builder’s event_sink method but works after build. It gives later code access to the host event channel without reopening registration.
 
 *Call graph*: 1 external calls (clone).
 
@@ -3835,11 +3877,11 @@ fn event_sink(&self) -> Arc<dyn ExtensionEventSink>
 fn thread_lifecycle_contributors(&self) -> &[Arc<dyn ThreadLifecycleContributor<C>>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered thread lifecycle contributors. It is a read-only view used by thread orchestration.
+**Purpose**: Returns all registered thread lifecycle contributors. Runtime code uses this when it needs to notify extensions about thread-level events.
 
-**Data flow**: It takes `&self` and returns `&[Arc<dyn ThreadLifecycleContributor<C>>]` referencing the internal vector. No copying or mutation occurs.
+**Data flow**: It reads the registry’s thread lifecycle list and returns a borrowed view of it. Nothing is copied, removed, or changed.
 
-**Call relations**: Thread resume and stop flows call this accessor before iterating contributors. It is a simple bridge from registry storage to orchestration loops.
+**Call relations**: resume_thread and stop_thread call this when thread state changes. They receive the contributors that were registered earlier through the builder.
 
 *Call graph*: called by 2 (resume_thread, stop_thread).
 
@@ -3850,11 +3892,11 @@ fn thread_lifecycle_contributors(&self) -> &[Arc<dyn ThreadLifecycleContributor<
 fn turn_lifecycle_contributors(&self) -> &[Arc<dyn TurnLifecycleContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered turn lifecycle contributors for turn orchestration code.
+**Purpose**: Returns all registered contributors interested in turn lifecycle events. This gives turn-running code one place to find every extension that needs turn notifications.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.turn_lifecycle_contributors`. No allocation or mutation occurs.
+**Data flow**: It reads the turn lifecycle list and returns a borrowed view of the stored shared contributors. The registry remains unchanged.
 
-**Call relations**: Turn start, stop, and error notification paths call this accessor before invoking contributor hooks. It does not delegate further.
+**Call relations**: notify_turn_error, start_turn_with_mode, and stop_turn call this during turn execution. The method hands them the frozen list built during extension setup.
 
 *Call graph*: called by 3 (notify_turn_error, start_turn_with_mode, stop_turn).
 
@@ -3865,11 +3907,11 @@ fn turn_lifecycle_contributors(&self) -> &[Arc<dyn TurnLifecycleContributor>]
 fn config_contributors(&self) -> &[Arc<dyn ConfigContributor<C>>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered config contributors. Runtime config update code uses it to notify extensions after committed changes.
+**Purpose**: Returns all registered configuration contributors. Code that builds or inspects configuration can use this list to include extension-provided settings.
 
-**Data flow**: It takes `&self` and returns `&[Arc<dyn ConfigContributor<C>>]` referencing the internal vector. No state changes occur.
+**Data flow**: It reads the config contributor list and returns it as a borrowed slice. No contributor is run here; the method only exposes the list.
 
-**Call relations**: Configuration orchestration reads this slice when broadcasting config changes. It is a passive accessor.
+**Call relations**: The contributors in this list come from ExtensionRegistryBuilder::config_contributor. No specific caller is shown in the graph, but this is the read side of that registration path.
 
 
 ##### `ExtensionRegistry::token_usage_contributors`  (lines 189–191)
@@ -3878,11 +3920,11 @@ fn config_contributors(&self) -> &[Arc<dyn ConfigContributor<C>>]
 fn token_usage_contributors(&self) -> &[Arc<dyn TokenUsageContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered token-usage contributors for token accounting notifications.
+**Purpose**: Returns all contributors that want token usage information. This supports extensions that track costs, quotas, analytics, or reporting around model usage.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.token_usage_contributors`. No copying or mutation occurs.
+**Data flow**: It reads the token usage contributor list and returns a borrowed view. It does not itself record usage; it only gives the caller the contributors to notify.
 
-**Call relations**: Token recording code calls this accessor before awaiting each contributor’s `on_token_usage` hook. It simply exposes stored registration order.
+**Call relations**: record_token_usage calls this when token counts are available. The method supplies the contributors registered earlier through ExtensionRegistryBuilder::token_usage_contributor.
 
 *Call graph*: called by 1 (record_token_usage).
 
@@ -3898,11 +3940,11 @@ async fn approval_review(
     ) -> Option<ReviewDecision>
 ```
 
-**Purpose**: Runs approval-review contributors in registration order and returns the first claimed `ReviewDecision`. It implements the registry’s only built-in dispatch policy with short-circuit semantics.
+**Purpose**: Asks approval-review contributors whether any of them wants to decide an approval prompt. It returns the first decision provided, so contributors are tried in registration order.
 
-**Data flow**: It takes `&self`, `&ExtensionData` for session and thread stores, and `prompt: &str`. It iterates `self.approval_review_contributors`, awaits each contributor’s `contribute(session_store, thread_store, prompt)`, and if the result is `Some(decision)` returns that decision immediately. If every contributor returns `None`, it returns `None` after the loop. It reads registry state and contributor outputs but does not mutate the registry itself.
+**Data flow**: It receives session-level extension data, thread-level extension data, and the prompt text. It calls each approval-review contributor asynchronously, meaning it may wait for work to finish. If a contributor returns a ReviewDecision, that decision is returned immediately; if none do, the result is None.
 
-**Call relations**: Runtime approval-review handling calls this when a rendered review prompt needs to be claimed by extensions. It delegates to each registered `ApprovalReviewContributor` until one accepts the prompt, then stops invoking later contributors.
+**Call relations**: This is the runtime use of contributors registered by ExtensionRegistryBuilder::approval_review_contributor. Unlike most registry methods, it does not just return a list; it actively walks the list and stops at the first contributor that claims the review.
 
 
 ##### `ExtensionRegistry::context_contributors`  (lines 214–216)
@@ -3911,11 +3953,11 @@ async fn approval_review(
 fn context_contributors(&self) -> &[Arc<dyn ContextContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered prompt/context contributors. Prompt assembly uses it to collect `PromptFragment` values.
+**Purpose**: Returns all contributors that can add context to prompts. Prompt-building code uses this so extensions can add useful background before a model request.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.context_contributors`. No mutation or allocation occurs.
+**Data flow**: It reads the context contributor list and returns a borrowed view of it. The contributors are not run inside this method.
 
-**Call relations**: Prompt contribution orchestration calls this accessor before iterating contributors. It is a passive read-only view.
+**Call relations**: contribute_prompt calls this while assembling prompt content. The contributors were previously registered through ExtensionRegistryBuilder::prompt_contributor.
 
 *Call graph*: called by 1 (contribute_prompt).
 
@@ -3926,11 +3968,11 @@ fn context_contributors(&self) -> &[Arc<dyn ContextContributor>]
 fn mcp_server_contributors(&self) -> &[Arc<dyn McpServerContributor<C>>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered MCP server contributors for runtime configuration resolution.
+**Purpose**: Returns all contributors that can provide runtime MCP servers. These contributors expose tools or context through the Model Context Protocol.
 
-**Data flow**: It takes `&self` and returns `&[Arc<dyn McpServerContributor<C>>]` referencing the internal vector. No state changes occur.
+**Data flow**: It reads the MCP server contributor list and returns a borrowed view. The registry remains unchanged and does not start any server itself.
 
-**Call relations**: MCP runtime configuration assembly reads this slice when applying extension-owned overlays. It simply exposes stored contributors.
+**Call relations**: This is the read side of ExtensionRegistryBuilder::mcp_server_contributor. Runtime setup code can call it when it needs to discover MCP servers supplied by extensions.
 
 
 ##### `ExtensionRegistry::turn_input_contributors`  (lines 224–226)
@@ -3939,11 +3981,11 @@ fn mcp_server_contributors(&self) -> &[Arc<dyn McpServerContributor<C>>]
 fn turn_input_contributors(&self) -> &[Arc<dyn TurnInputContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered turn-input contributors. Turn preparation uses it to gather additional contextual user fragments.
+**Purpose**: Returns all contributors that can affect input for a turn. This gives turn-preparation code access to extension-provided input additions.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.turn_input_contributors`. No copying or mutation occurs.
+**Data flow**: It reads the turn input contributor list and returns it by borrowed reference. It does not transform the input itself.
 
-**Call relations**: Turn input assembly code calls this accessor before awaiting each contributor. It is a straightforward registry read.
+**Call relations**: The list is filled by ExtensionRegistryBuilder::turn_input_contributor, notably from provider-based installation. Later turn input assembly can ask this method for those contributors.
 
 
 ##### `ExtensionRegistry::tool_contributors`  (lines 229–231)
@@ -3952,11 +3994,11 @@ fn turn_input_contributors(&self) -> &[Arc<dyn TurnInputContributor>]
 fn tool_contributors(&self) -> &[Arc<dyn ToolContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered tool contributors. Tool discovery uses it to collect native tool executors.
+**Purpose**: Returns all contributors that provide native tools. Tool discovery code uses this list to know which extension tools are available.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.tool_contributors`. No state is mutated.
+**Data flow**: It reads the tool contributor list and returns a borrowed view of the shared contributors. No tools are executed here.
 
-**Call relations**: Tool enumeration code calls this accessor before asking each contributor for visible tools. It serves as the registry-to-runtime handoff point.
+**Call relations**: The tools flow calls this when building or listing available tools. The list comes from registrations made through ExtensionRegistryBuilder::tool_contributor.
 
 *Call graph*: called by 1 (tools).
 
@@ -3967,11 +4009,11 @@ fn tool_contributors(&self) -> &[Arc<dyn ToolContributor>]
 fn tool_lifecycle_contributors(&self) -> &[Arc<dyn ToolLifecycleContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered tool lifecycle contributors for execution notifications.
+**Purpose**: Returns all contributors interested in tool lifecycle events. This lets the system notify extensions after important tool-use moments.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.tool_lifecycle_contributors`. No allocation or mutation occurs.
+**Data flow**: It reads the tool lifecycle contributor list and returns a borrowed view. The registry does not call the contributors itself in this method.
 
-**Call relations**: Tool finish notification code calls this accessor before invoking lifecycle hooks. It is a passive accessor preserving registration order.
+**Call relations**: notify_tool_finish calls this when a tool has finished. It receives the contributors registered earlier through ExtensionRegistryBuilder::tool_lifecycle_contributor.
 
 *Call graph*: called by 1 (notify_tool_finish).
 
@@ -3982,11 +4024,11 @@ fn tool_lifecycle_contributors(&self) -> &[Arc<dyn ToolLifecycleContributor>]
 fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>]
 ```
 
-**Purpose**: Exposes the ordered slice of registered turn-item contributors. Turn-item post-processing pipelines use it to mutate parsed items in sequence.
+**Purpose**: Returns all contributors that can add ordered items to a turn. This is used when turn content needs extension-provided pieces in a stable order.
 
-**Data flow**: It takes `&self` and returns a slice reference to `self.turn_item_contributors`. No state changes occur.
+**Data flow**: It reads the turn item contributor list and returns a borrowed view. Nothing is added or changed at this point.
 
-**Call relations**: Turn-item contribution code calls this accessor before awaiting each contributor in order. It does not delegate further.
+**Call relations**: This exposes the contributors registered through ExtensionRegistryBuilder::turn_item_contributor. No specific caller is shown in the graph, but it is the runtime access point for those ordered turn-item extensions.
 
 
 ##### `empty_extension_registry`  (lines 245–247)
@@ -3995,33 +4037,37 @@ fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>]
 fn empty_extension_registry() -> Arc<ExtensionRegistry<C>>
 ```
 
-**Purpose**: Constructs a shared empty registry for hosts that do not register any extension contributions. It provides a convenient zero-feature default wrapped in `Arc`.
+**Purpose**: Creates a shared, empty registry for hosts that do not install any extensions. This gives the rest of the system a normal registry object instead of forcing it to handle a missing one.
 
-**Data flow**: It takes no arguments, creates a new `ExtensionRegistryBuilder<C>`, builds it into an `ExtensionRegistry<C>`, wraps that registry in `Arc::new`, and returns `Arc<ExtensionRegistry<C>>`. No external state is read or modified.
+**Data flow**: It takes no input. It creates a new empty builder, builds it into an empty registry, wraps it in a shared reference, and returns that shared registry.
 
-**Call relations**: Callers use this when they need a registry object but have no extensions to install. It delegates to `ExtensionRegistryBuilder::new`, `build`, and `Arc::new` to produce the shared empty registry.
+**Call relations**: This is the convenience path for extension-free runs. It uses ExtensionRegistryBuilder::new and build so the empty case follows the same structure as the normal extension setup path.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (new).
 
 
 ### `ext/web-search/src/lib.rs`
 
-`orchestration` · `startup / extension registration`
+`orchestration` · `startup`
 
-This file is the root module for the web-search extension crate. Its main job is structural: it declares five sibling modules—`extension`, `history`, `output`, `schema`, and `tool`—which together implement the extension’s behavior, data formats, result rendering, and tool wiring. The only public API exposed directly from the crate root is `extension::install`, re-exported as `install`, which signals that external callers are expected to bootstrap or register the extension through that single function rather than reaching into internal modules.
+This file does not contain the web-search behavior itself. Instead, it tells Rust which internal source files make up the crate: the extension setup code, search history support, output formatting, schema definitions, and the tool implementation. Think of it like the table of contents at the front of a small manual: it does not explain every chapter, but it makes those chapters part of the book.
 
-The design choice here is deliberate encapsulation. By keeping the module declarations private and selectively re-exporting only `install`, the crate root establishes a narrow, stable boundary while allowing the implementation details of search history tracking, output shaping, schema definitions, and tool logic to evolve internally. There is no executable logic in this file, no state, and no control flow beyond Rust’s module loading and name resolution. Its importance is architectural: it defines the extension as a cohesive subsystem with one obvious public entrypoint and a set of internal implementation modules organized by concern.
+The most important line is the public re-export of `extension::install`. A re-export means outside code can call `install` directly from this crate, without needing to know that the function lives inside the internal `extension` module. That keeps the outside interface small and simple. Other parts of the system only need to know, “install the web-search extension,” not how the crate is organized behind the scenes.
+
+Without this file, the crate would not know about its component modules, and callers would not have the clean public entry point they need to register or activate the web-search feature.
 
 
 ### `ext/web-search/src/extension.rs`
 
-`orchestration` · `thread startup, config refresh, and tool discovery during request handling`
+`orchestration` · `startup, thread start, config changes, and tool discovery`
 
-This file defines two small internal structs: `WebSearchExtension`, which carries an `Arc<AuthManager>` needed to build authenticated model providers, and `WebSearchExtensionConfig`, a cached per-thread snapshot containing three concrete decisions: whether web search is available, which `ModelProviderInfo` to use, and the exact `SearchSettings` to pass into the tool. The `From<&Config>` implementation is the key policy point: it enables the tool only when the configured provider is OpenAI and `web_search_mode` is not `Disabled`, then delegates detailed option translation to `search_settings`.
+This file is the bridge between Codex and its web search tool. Without it, the web search code might exist, but the main application would not know when to offer it, how to configure it, or how to create it with the right login and model provider.
 
-`search_settings` converts protocol/config-layer types into API-layer search types. It maps optional user location fields into `ApproximateLocation` with `LocationType::Approximate`, translates `WebSearchContextSize` into `SearchContextSize`, copies allowed-domain filters into `SearchFilters` while intentionally leaving `blocked_domains` as `None`, restricts callers to `AllowedCaller::Direct`, and derives `external_web_access` from `WebSearchMode` (`Live` true, `Cached`/`Disabled` false). Remaining fields come from `SearchSettings::default()`.
+The file keeps a small per-thread snapshot called WebSearchExtensionConfig. That snapshot says whether web search is available, which model provider should be used, and what search preferences apply. These preferences include things like approximate user location, how much search context to request, allowed domains, and whether live web access is allowed.
 
-The extension participates in two lifecycle paths: on thread start it inserts a fresh `WebSearchExtensionConfig` into `thread_store`, and on config changes it overwrites that thread-local snapshot. Tool contribution then reads that cached config; if absent or marked unavailable, it contributes nothing. Otherwise it constructs a single `WebSearchTool` using the session ID from `session_store.level_id()`, a provider created by `create_model_provider(config.provider.clone(), Some(auth_manager.clone()))`, and cloned search settings. `install` wires the same extension instance into thread lifecycle, config, and tool contributor registries so all three hooks share the same auth manager and behavior. The included test verifies that when a thread store contains an enabled config, installation results in the expected namespaced web run tool with parallel tool-call support.
+When a new conversation thread starts, the extension stores this snapshot in the thread's shared extension data. If the app configuration changes later, it refreshes the snapshot. When Codex asks what tools are available, the extension checks the stored snapshot. If web search is disabled, unavailable, or not using an OpenAI provider, it returns no tools. If it is available, it builds a WebSearchTool with the current session id, authentication manager, provider information, and search settings.
+
+An everyday way to think about this file: it is the receptionist for web search. It checks whether web search is allowed, writes down the current instructions, and only then hands the user to the actual web search worker.
 
 #### Function details
 
@@ -4031,11 +4077,11 @@ The extension participates in two lifecycle paths: on thread start it inserts a 
 fn from(config: &Config) -> Self
 ```
 
-**Purpose**: Builds the thread-local web-search configuration snapshot from the full application `Config`. It decides whether the extension should be exposed at all and packages the provider plus translated search settings into `WebSearchExtensionConfig`.
+**Purpose**: This builds the web search extension's private configuration snapshot from the main Codex configuration. It decides whether web search can be offered and gathers the provider and search settings that the tool will need later.
 
-**Data flow**: Reads `config.web_search_mode.value()`, `config.model_provider`, and other web-search-related fields indirectly through `search_settings`. It computes `available` as true only when the provider reports OpenAI and the mode is not `WebSearchMode::Disabled`, clones the `ModelProviderInfo`, calls `search_settings(config, web_search_mode)`, and returns a new `WebSearchExtensionConfig` value without mutating external state.
+**Data flow**: It receives the full application Config. It reads the selected web search mode, checks whether the model provider is OpenAI, and calls search_settings to translate detailed web search preferences. It returns a WebSearchExtensionConfig containing an availability flag, provider information, and ready-to-use search settings.
 
-**Call relations**: This conversion is the common policy path used by both lifecycle hooks: `WebSearchExtension::on_thread_start` uses it to seed thread-local extension state when a thread begins, and `WebSearchExtension::on_config_changed` uses it to refresh that state after configuration updates. It delegates all field-by-field search option translation to `search_settings` so availability logic stays separate from settings mapping.
+**Call relations**: This is the common conversion step used whenever the extension needs fresh settings. WebSearchExtension::on_thread_start calls it when a conversation thread begins, and WebSearchExtension::on_config_changed calls it when the configuration changes. It hands off the detailed settings work to search_settings.
 
 *Call graph*: calls 1 internal fn (search_settings); called by 2 (on_config_changed, on_thread_start).
 
@@ -4046,11 +4092,11 @@ fn from(config: &Config) -> Self
 fn search_settings(config: &Config, web_search_mode: WebSearchMode) -> SearchSettings
 ```
 
-**Purpose**: Translates web-search-related fields from `Config` and `WebSearchMode` into the `codex_api::SearchSettings` structure expected by the runtime tool/provider layer. It normalizes optional location, context size, domain filters, caller restrictions, and live-vs-cached web access.
+**Purpose**: This translates Codex's web search configuration into the SearchSettings format expected by the lower-level search API. It turns user-facing choices, like location and context size, into the exact fields the search provider understands.
 
-**Data flow**: Consumes `&Config` plus the already-read `WebSearchMode`. It reads `config.web_search_config` and, if present, maps nested `user_location` into an `ApproximateLocation`, converts optional `WebSearchContextSize` variants into `SearchContextSize`, clones `allowed_domains` into `SearchFilters`, sets `allowed_callers` to `Some(vec![AllowedCaller::Direct])`, derives `external_web_access` from the mode, and fills all unspecified fields from `SearchSettings::default()`. It returns the assembled `SearchSettings` value.
+**Data flow**: It receives the main Config and the chosen WebSearchMode. It looks for optional web search configuration such as approximate location, desired context size, and allowed domains. It copies those choices into a SearchSettings value, sets calls to be direct only, and marks external web access as true only for live search mode. The result is a complete SearchSettings object, with unspecified fields filled from defaults.
 
-**Call relations**: This helper is only invoked from `WebSearchExtensionConfig::from`, which uses it to keep config-to-settings translation centralized. It does not perform registration or storage itself; its sole role in the call flow is to provide the normalized settings object later consumed by `WebSearchExtension::tools` when constructing `WebSearchTool`.
+**Call relations**: This function is called only by WebSearchExtensionConfig::from. It is the detail translator in the flow: the higher-level config builder decides whether search is available, while this function prepares the exact search instructions that will later be passed into WebSearchTool.
 
 *Call graph*: called by 1 (from); 2 external calls (default, vec!).
 
@@ -4064,11 +4110,11 @@ fn on_thread_start(
     ) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Initializes per-thread extension state when a new thread context starts. It asynchronously computes the current `WebSearchExtensionConfig` from the thread's `Config` and stores it in the thread-local extension data.
+**Purpose**: This prepares web search settings when a new conversation thread starts. It makes sure the thread has its own current web search configuration before any tools are requested.
 
-**Data flow**: Receives `ThreadStartInput<'a, Config>`, reads `input.config`, converts it with `WebSearchExtensionConfig::from`, and writes the resulting value into `input.thread_store` via `insert`. It returns an `ExtensionFuture<'a, ()>` created by boxing and pinning an async block.
+**Data flow**: It receives ThreadStartInput, which includes the current Config and a thread-level storage area. It converts the Config into a WebSearchExtensionConfig and inserts that snapshot into the thread store. It returns an asynchronous future that completes after the snapshot is stored.
 
-**Call relations**: The extension framework invokes this hook at thread startup because `install` registers `WebSearchExtension` as a `ThreadLifecycleContributor`. Inside that startup path it delegates config interpretation to `WebSearchExtensionConfig::from`; later, `WebSearchExtension::tools` depends on the stored value being present in `thread_store`.
+**Call relations**: The extension system calls this at thread startup because WebSearchExtension is registered as a thread lifecycle contributor. It relies on WebSearchExtensionConfig::from to build the snapshot that WebSearchExtension::tools will later read when deciding whether to offer the web search tool.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (pin).
 
@@ -4085,11 +4131,11 @@ fn on_config_changed(
     )
 ```
 
-**Purpose**: Refreshes the thread-local web-search snapshot after configuration changes. It ignores the previous config and session store, recomputing the current extension state solely from the new config.
+**Purpose**: This refreshes the stored web search settings when the application configuration changes. It prevents the web search tool from using stale choices after a user changes search mode, provider, location, or filters.
 
-**Data flow**: Takes `_session_store`, `thread_store`, `_previous_config`, and `new_config`. It reads `new_config`, converts it through `WebSearchExtensionConfig::from`, and writes the new snapshot into `thread_store` with `insert`; it returns no value.
+**Data flow**: It receives the session store, thread store, previous Config, and new Config. It ignores the session store and old configuration, converts the new Config into a fresh WebSearchExtensionConfig, and writes that into the thread store. The main output is the updated stored snapshot.
 
-**Call relations**: The extension framework calls this hook whenever config changes because `install` registers the extension as a `ConfigContributor`. It mirrors `on_thread_start`'s initialization path, ensuring that subsequent calls to `WebSearchExtension::tools` see updated availability, provider, and search settings without rebuilding the extension object itself.
+**Call relations**: The extension system calls this because WebSearchExtension is registered as a config contributor. Like thread startup, it uses WebSearchExtensionConfig::from. The refreshed data is later read by WebSearchExtension::tools when the app asks what tools are available.
 
 *Call graph*: calls 2 internal fn (insert, from).
 
@@ -4104,11 +4150,11 @@ fn tools(
     ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>>
 ```
 
-**Purpose**: Contributes the concrete `WebSearchTool` instance for the current session/thread when web search is enabled. It performs the final gate check against cached thread-local config and otherwise returns no tools.
+**Purpose**: This answers the question: should the web search tool be available right now, and if so, what tool object should Codex use? It is the gatekeeper that only exposes web search when the stored configuration says it is allowed.
 
-**Data flow**: Reads `thread_store.get::<WebSearchExtensionConfig>()`; if absent, returns an empty `Vec`. If present but `config.available` is false, also returns an empty `Vec`. Otherwise it reads `session_store.level_id()` for the session identifier, clones `config.provider` and `config.settings`, clones `self.auth_manager`, builds a provider with `create_model_provider(..., Some(...))`, constructs `WebSearchTool { session_id, provider, settings }`, wraps it in `Arc`, and returns a one-element vector of tool executors.
+**Data flow**: It receives session-level storage and thread-level storage. It looks in the thread store for WebSearchExtensionConfig. If no config is present, or if web search is marked unavailable, it returns an empty list. If web search is available, it creates a WebSearchTool using the session id, a model provider built from the stored provider and authentication manager, and the stored search settings. It returns that tool inside a list.
 
-**Call relations**: This method is invoked by the extension registry during tool discovery because `install` registers the extension as a `ToolContributor`; the test exercises exactly that path by iterating over `tool_contributors()` and calling `tools`. It depends on `on_thread_start` or `on_config_changed` having populated `thread_store`, and it delegates actual search execution to the `WebSearchTool` it instantiates.
+**Call relations**: The extension registry calls this when collecting available tools from contributors. It depends on the configuration snapshot written earlier by WebSearchExtension::on_thread_start or WebSearchExtension::on_config_changed. When enabled, it hands execution off to WebSearchTool, which is the object that actually performs web search calls.
 
 *Call graph*: 2 external calls (new, vec!).
 
@@ -4119,11 +4165,11 @@ fn tools(
 fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Arc<AuthManager>)
 ```
 
-**Purpose**: Creates the shared `WebSearchExtension` instance and registers it with all relevant extension registries. This is the single integration point that turns the file's logic into active lifecycle and tool hooks.
+**Purpose**: This registers the web search extension with the Codex extension registry. It is the setup step that tells the system this extension participates in thread startup, configuration changes, and tool discovery.
 
-**Data flow**: Accepts a mutable `ExtensionRegistryBuilder<Config>` and an `Arc<AuthManager>`. It constructs `Arc::new(WebSearchExtension { auth_manager })`, clones that `Arc` as needed, and writes registrations into `registry` via `thread_lifecycle_contributor`, `config_contributor`, and `tool_contributor`. It returns nothing.
+**Data flow**: It receives a mutable ExtensionRegistryBuilder and an AuthManager wrapped in Arc, which is a shared pointer that lets several parts of the program use the same login manager safely. It creates a WebSearchExtension holding that auth manager, then registers the same extension as a thread lifecycle contributor, config contributor, and tool contributor. It does not return a value; it changes the registry builder.
 
-**Call relations**: Callers use this function during extension setup; in this file the test invokes it to populate a builder before building the registry. Its role in the call flow is purely wiring: after registration, the framework later calls `WebSearchExtension::on_thread_start`, `WebSearchExtension::on_config_changed`, and `WebSearchExtension::tools` at the appropriate lifecycle moments.
+**Call relations**: This is called during extension setup, and in this file's test it is called by tests::installed_extension_contributes_web_run_when_enabled. The registrations made here are what allow the extension system to later call WebSearchExtension::on_thread_start, WebSearchExtension::on_config_changed, and WebSearchExtension::tools at the right times.
 
 *Call graph*: calls 3 internal fn (config_contributor, thread_lifecycle_contributor, tool_contributor); called by 1 (installed_extension_contributes_web_run_when_enabled); 1 external calls (new).
 
@@ -4134,11 +4180,11 @@ fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Arc<Au
 fn installed_extension_contributes_web_run_when_enabled()
 ```
 
-**Purpose**: Verifies that installing the extension causes the registry to expose the expected web run tool when thread-local config marks web search as available. It checks both the tool name and that the tool advertises parallel-call support.
+**Purpose**: This test proves that installing the extension makes the web search tool appear when the stored configuration says web search is available. It guards against accidentally registering the extension incorrectly or failing to expose the tool.
 
-**Data flow**: Creates an `ExtensionRegistryBuilder<Config>`, constructs a testing `AuthManager` from a dummy API key, calls `install`, builds the registry, creates `session_store` and `thread_store`, inserts a handcrafted `WebSearchExtensionConfig` with `available: true`, an OpenAI `ModelProviderInfo`, and default settings, then iterates over registered tool contributors to collect `(tool_name, supports_parallel_tool_calls)` tuples. It asserts that the collected vector equals a single namespaced web run entry.
+**Data flow**: It creates a fresh extension registry builder, installs the web search extension with a fake API-key login, and builds the registry. It creates session and thread stores, manually inserts a WebSearchExtensionConfig with availability set to true, then asks all registered tool contributors for their tools. It collects each tool's name and whether it supports parallel tool calls, then checks that the expected web run tool is present.
 
-**Call relations**: This test is the direct caller of `install` in the provided graph. Rather than exercising startup/config hooks, it seeds `thread_store` manually to isolate the `ToolContributor` path and confirm that `WebSearchExtension::tools` contributes the correct tool shape once the extension has been registered.
+**Call relations**: This test calls install to exercise the same setup path used by the real application. After installation, it asks the registry's tool contributors to produce tools, which reaches WebSearchExtension::tools through the registry. The final assertion confirms that the installed extension contributes the expected namespaced web search tool.
 
 *Call graph*: calls 5 internal fn (new, install, from_auth_for_testing, from_api_key, create_openai_provider); 3 external calls (default, new, assert_eq!).
 
@@ -4147,11 +4193,11 @@ fn installed_extension_contributes_web_run_when_enabled()
 
 `orchestration` · `request handling`
 
-This file is the concrete bridge between the extension tool API and the Codex search service. Its central type, `WebSearchTool`, carries the per-session request identity (`session_id`), a `SharedModelProvider` used to fetch API provider/auth credentials asynchronously, and `SearchSettings` cloned into each outbound request. Through `ToolExecutor<ToolCall>`, it publishes a namespaced tool called `web.run`, declares a hosted-tool-compatible JSON schema by parsing `commands_schema()` without metadata compaction, marks the tool as directly exposed, and explicitly allows parallel calls.
+This file is the bridge between the model’s tool-call language and the actual hosted web search service. Without it, the model might ask to search, open a page, or find text on a page, but nothing would know how to interpret that request, send it to the search service, or show the user what happened.
 
-The execution path starts in `handle`, which boxes the async `handle_call` future. `handle_call` parses JSON arguments into `SearchCommands`, computes a summarized `WebSearchAction` for telemetry/UI, resolves provider and auth from the shared provider, constructs a `SearchClient` over `ReqwestTransport` using the default reqwest client, and builds a `SearchRequest`. That request includes the current session id, selected model, recent conversation input from `recent_input(call.conversation_history.items())`, optional commands/settings, and a token cap derived from the truncation policy with overflow fallback to `u64::MAX`.
+The main piece is `WebSearchTool`, which implements the project’s `ToolExecutor` interface. That means it can advertise itself as the `web.run` tool, describe what inputs it accepts, and run when the model calls it. When a call arrives, the tool first reads the model’s JSON arguments and turns them into `SearchCommands`. It then gathers the current API provider and authentication details, builds an HTTP client, and sends a `SearchRequest` to the search service. The request includes the session id, model name, recent conversation input, the parsed commands, search settings, and a token limit.
 
-Before and after the remote `search` call, it emits `ExtensionTurnItem::WebSearch` items so the turn stream reflects tool start/completion. Error handling is intentionally split: malformed tool arguments become `RespondToModel`, while provider/auth/search failures become fatal. Helper functions encode subtle behavior: empty arguments mean default commands, action inference prefers `search_query` then `image_query`, `open` only reports a URL when `ref_id` is a literal URL, and `find` preserves the pattern even when the reference is an internal search result id.
+The file also creates user-visible progress items. Before the network request, it emits a generic “web search started” item. After the search completes, it emits a more specific action, such as “search for these queries,” “open this URL,” or “find this text on this page.” A small set of helper functions exists mainly to make that progress display accurate and understandable.
 
 #### Function details
 
@@ -4161,11 +4207,11 @@ Before and after the remote `search` call, it emits `ExtensionTurnItem::WebSearc
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the externally visible tool identifier for this executor as the namespaced tool `web.run`.
+**Purpose**: This tells the rest of the system the exact name of the tool: `web.run`. The name is how a model’s tool call is matched to this executor.
 
-**Data flow**: It reads no mutable state beyond the compile-time namespace/name constants and transforms them into a `ToolName` via `ToolName::namespaced`. It returns that `ToolName` without side effects.
+**Data flow**: It takes the tool object, reads no changing state from it, and combines the fixed namespace `web` with the fixed tool name `run`. The result is a `ToolName` value that other code can compare against incoming tool calls.
 
-**Call relations**: This is invoked by the extension framework when registering or matching the executor to incoming tool calls. It delegates only to the namespacing constructor so the rest of the system sees this implementation under the `web` namespace and `run` function name.
+**Call relations**: When the extension framework asks what this executor is called, this method answers by using the shared `namespaced` helper. That lets later tool dispatch send `web.run` calls to this `WebSearchTool` instead of to some unrelated tool.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -4176,11 +4222,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the tool definition advertised to the model, including the namespace wrapper, function description, and JSON parameter schema for search commands.
+**Purpose**: This builds the public description of the web search tool, including its name, human-readable description, and the shape of the JSON input it accepts. The model uses this specification to know how to call the tool correctly.
 
-**Data flow**: It calls `commands_schema()` to obtain the Rust-side schema source, parses it with `parse_tool_input_schema_without_compaction` so field descriptions are preserved, and panics if that schema cannot be parsed because the definition is treated as a build-time invariant. It then assembles and returns `ToolSpec::Namespace` containing a `ResponsesApiNamespace` with one `ResponsesApiTool` named `run`, the markdown description from `WEB_RUN_DESCRIPTION`, `strict: false`, the parsed parameters, and no output schema or deferred loading metadata.
+**Data flow**: It starts with the command schema from `commands_schema`, parses it without removing field descriptions, and wraps it in a namespace called `web`. If the schema cannot be parsed, it stops with a panic because the built-in schema is expected to always be valid. The output is a `ToolSpec` that describes the `web.run` function.
 
-**Call relations**: The framework calls this during tool discovery/registration so hosted and local definitions stay aligned. Its main delegation is to schema-generation helpers and namespace-description helpers; after that it is pure assembly of the advertised tool contract.
+**Call relations**: The extension framework calls this when it is collecting available tools. This method pulls in the schema, namespace description, and bundled tool description text, then hands back one complete advertised tool definition.
 
 *Call graph*: calls 1 internal fn (commands_schema); 5 external calls (parse_tool_input_schema_without_compaction, default_namespace_description, panic!, Namespace, vec!).
 
@@ -4191,11 +4237,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> ToolExposure
 ```
 
-**Purpose**: Declares that this tool is directly exposed rather than hidden behind another abstraction or gated mode.
+**Purpose**: This says the web search tool is directly available to the model. In plain terms, the model does not need to go through another wrapper tool to use it.
 
-**Data flow**: It takes no inputs besides `self` and returns the constant enum value `ToolExposure::Direct`. It does not read or mutate internal state.
+**Data flow**: It receives the tool object and returns the fixed value `ToolExposure::Direct`. It does not read or change any other data.
 
-**Call relations**: This is consulted by the tool framework when deciding how the tool should be surfaced to the model. It is a leaf decision point with no further delegation.
+**Call relations**: During tool setup, the surrounding tool system asks how this tool should be exposed. This answer lets the system present `web.run` as a directly callable capability.
 
 
 ##### `WebSearchTool::supports_parallel_tool_calls`  (lines 72–74)
@@ -4204,11 +4250,11 @@ fn exposure(&self) -> ToolExposure
 fn supports_parallel_tool_calls(&self) -> bool
 ```
 
-**Purpose**: Signals that multiple web-search invocations may safely run concurrently.
+**Purpose**: This tells the system that more than one web search call may run at the same time. That matters when the model wants to search for several things without waiting for each one in sequence.
 
-**Data flow**: It ignores instance fields and returns the constant boolean `true`. No state is changed.
+**Data flow**: It takes no input beyond the tool object and returns `true`. It does not modify the tool or any shared state.
 
-**Call relations**: The runtime uses this capability flag when scheduling tool calls. Because `handle_call` builds per-request clients and requests from cloned state, this method enables concurrent dispatch without additional coordination logic here.
+**Call relations**: The tool runner checks this capability before deciding whether it can run multiple calls concurrently. This method gives permission for parallel execution.
 
 
 ##### `WebSearchTool::handle`  (lines 76–78)
@@ -4217,11 +4263,11 @@ fn supports_parallel_tool_calls(&self) -> bool
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation into the boxed future type required by the `ToolExecutor` trait.
+**Purpose**: This is the entry point used when the model actually calls the web search tool. It wraps the real asynchronous work in the future type expected by the extension system.
 
-**Data flow**: It consumes the incoming `ToolCall`, passes it into `self.handle_call(call)`, and wraps the resulting future with `Box::pin`. It returns a `ToolExecutorFuture` and performs no immediate I/O itself.
+**Data flow**: It receives a `ToolCall`, passes that call to `handle_call`, and pins the resulting asynchronous task so it can be polled safely by the runtime. The output is a future that will eventually produce either tool output or a tool-call error.
 
-**Call relations**: This is the trait entrypoint invoked by the extension runtime for each tool call. Its only job is to forward control into `WebSearchTool::handle_call`, where all parsing, network access, and event emission occur.
+**Call relations**: The tool framework calls this after it has matched an incoming call to `web.run`. This method immediately hands the work to `WebSearchTool::handle_call`, which performs the parsing, API request, progress reporting, and result packaging.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4232,11 +4278,11 @@ fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes one `web.run` request end-to-end: parse arguments, derive action metadata, build the search client/request, emit lifecycle events, call the backend, and wrap the response as tool output.
+**Purpose**: This performs one complete web search tool run. It turns the model’s request into a search service request, sends it, emits progress events, and returns the service’s output.
 
-**Data flow**: It reads the `ToolCall` payload, first converting function arguments into `SearchCommands` with `parse_commands`, then summarizing those commands into a `WebSearchAction` via `command_action`. It asynchronously reads provider and auth credentials from `self.provider`, constructs a `SearchClient` using `ReqwestTransport::new(build_reqwest_client())`, and builds a `SearchRequest` from `self.session_id`, `call.model`, recent conversation items from `recent_input`, the parsed commands, cloned `self.settings`, and a token budget converted to `u64` with `u64::MAX` fallback on conversion failure. It writes progress to `call.turn_item_emitter` by emitting a started `web_search_item` with `WebSearchAction::Other`, performs `client.search(&request, HeaderMap::new()).await`, emits a completed `web_search_item` with the derived action, and returns `Box<dyn ToolOutput>` containing `SearchOutput::new(response.output)`. Provider/auth/search failures are mapped to `FunctionCallError::Fatal`; argument parsing failures propagate as returned errors from `parse_commands`.
+**Data flow**: It receives a `ToolCall` containing JSON arguments, model information, conversation history, a call id, and a token budget. It parses the arguments into search commands, decides what user-visible action best describes them, fetches API provider and authentication information, builds an HTTP search client, and creates a `SearchRequest`. It emits a started item, sends the request over the network, emits a completed item, and returns a boxed `SearchOutput`. If argument parsing should be shown to the model, or if provider, auth, or network work fails fatally, it returns a `FunctionCallError`.
 
-**Call relations**: This is called only from `WebSearchTool::handle` after the runtime dispatches a tool invocation. It orchestrates the whole call chain: argument parsing, action inference, provider/auth lookup, HTTP client creation, backend search execution, and turn-item emission before returning the final output object to the extension framework.
+**Call relations**: This is called by `WebSearchTool::handle`. It relies on `parse_commands` to understand the model’s JSON, `command_action` to summarize the action for progress reporting, `recent_input` to include relevant conversation context, `build_reqwest_client` and search client constructors to reach the hosted service, and `web_search_item` to create the turn items shown before and after the search.
 
 *Call graph*: calls 8 internal fn (new, new, recent_input, new, command_action, parse_commands, web_search_item, build_reqwest_client); called by 1 (handle); 6 external calls (new, new, api_auth, api_provider, clone, try_from).
 
@@ -4247,11 +4293,11 @@ async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, Funct
 fn parse_commands(call: &ToolCall) -> Result<SearchCommands, FunctionCallError>
 ```
 
-**Purpose**: Converts the raw tool-call argument string into `SearchCommands`, treating missing or whitespace-only arguments as an empty/default command set.
+**Purpose**: This reads the model’s tool arguments and turns them into structured search commands. It also treats empty arguments as a valid request with default commands.
 
-**Data flow**: It reads the serialized argument string from `call.function_arguments()`. If the string is empty after trimming, it returns `SearchCommands::default()`; otherwise it deserializes JSON with `serde_json::from_str` into `SearchCommands`. Errors from argument extraction or JSON parsing are returned as `FunctionCallError`, with parse failures specifically wrapped as `RespondToModel` so the model can be told its arguments were invalid.
+**Data flow**: It receives a `ToolCall`, asks it for the raw function arguments, and checks whether the argument string is blank. Blank input becomes default `SearchCommands`; non-blank input is parsed as JSON. The result is either structured commands or an error that can be sent back to the model if the JSON is invalid.
 
-**Call relations**: This helper is invoked at the start of `WebSearchTool::handle_call` to normalize the incoming tool payload before any backend work begins. It does not call back into the tool logic; it is the gatekeeper that decides whether execution can proceed with parsed commands.
+**Call relations**: This helper is used by `WebSearchTool::handle_call` at the start of a tool run. Its job is to make sure the rest of the flow works with typed command data instead of raw text.
 
 *Call graph*: called by 1 (handle_call); 3 external calls (default, function_arguments, from_str).
 
@@ -4262,11 +4308,11 @@ fn parse_commands(call: &ToolCall) -> Result<SearchCommands, FunctionCallError>
 fn command_action(commands: &SearchCommands) -> WebSearchAction
 ```
 
-**Purpose**: Derives a concise `WebSearchAction` summary from `SearchCommands` for UI/telemetry turn items, preferring search intent over navigation intent.
+**Purpose**: This chooses the best short description of what the web command is doing, such as searching, opening a page, finding text, or something more general. That description is used for progress and history display.
 
-**Data flow**: It inspects the `SearchCommands` fields in priority order. It first checks `search_query`, then `image_query`, converting either through `query_action`; if neither yields an action, it examines the first `open` operation and returns `OpenPage` only when `literal_url(&operation.ref_id)` succeeds; failing that, it examines the first `find` operation and returns `FindInPage` with an optional literal URL and cloned pattern. If none of those branches apply, it returns `WebSearchAction::Other`.
+**Data flow**: It receives structured `SearchCommands` and looks for the first meaningful action in priority order: text search, image search, opening a page, or finding text on a page. It extracts query text, a literal URL when one is present, or a find pattern. It returns a `WebSearchAction`, falling back to `Other` when no clear user-facing action can be shown.
 
-**Call relations**: This is called by `WebSearchTool::handle_call` before the backend request so the tool can emit a meaningful completion item afterward. It delegates to `query_action` for query lists and `literal_url` when deciding whether a reference id should be exposed as a real URL.
+**Call relations**: This is called by `WebSearchTool::handle_call` before the search request is sent. The returned action is later passed to `web_search_item` after the search completes, so the completed event can describe what actually happened.
 
 *Call graph*: called by 1 (handle_call).
 
@@ -4277,11 +4323,11 @@ fn command_action(commands: &SearchCommands) -> WebSearchAction
 fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction>
 ```
 
-**Purpose**: Maps one or more `SearchQuery` values into the `WebSearchAction::Search` shape expected by turn-item reporting.
+**Purpose**: This turns one or more search queries into a display-friendly search action. It keeps the single-query case simple and uses a list when there are multiple queries.
 
-**Data flow**: It pattern-matches on the slice of `SearchQuery`. An empty slice becomes `None`; a single query becomes `Some(WebSearchAction::Search { query: Some(query.q.clone()), queries: None })`; multiple queries become `Some(WebSearchAction::Search { query: None, queries: Some(vec_of_cloned_q_strings) })` by iterating and collecting each `q` field.
+**Data flow**: It receives a slice of `SearchQuery` values. If the slice is empty, it returns nothing. If there is one query, it returns a `Search` action with that query in the single-query field. If there are several, it collects their text into a list and returns a multi-query `Search` action.
 
-**Call relations**: This helper is used only from `command_action` when either `search_query` or `image_query` is present. Its role is to preserve the distinction between a single query string and a multi-query batch in the emitted action metadata.
+**Call relations**: This helper supports the action-summary work done by `command_action`. It keeps the query-specific formatting separate from the broader decision about whether the command is a search, open, find, or other action.
 
 *Call graph*: 1 external calls (iter).
 
@@ -4292,11 +4338,11 @@ fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction>
 fn literal_url(ref_id: &str) -> Option<String>
 ```
 
-**Purpose**: Determines whether a command reference id is an actual URL string rather than an internal search-result reference token.
+**Purpose**: This checks whether a reference string is an actual URL. That distinction matters because some references point to prior search results, not directly to web addresses.
 
-**Data flow**: It takes `ref_id: &str`, attempts `Url::parse(ref_id)`, and returns `Some(ref_id.to_string())` only if parsing succeeds; otherwise it returns `None`. It has no side effects.
+**Data flow**: It receives a string such as `https://example.com/docs` or `turn0search0`. It tries to parse the string as a URL. If parsing succeeds, it returns the original string as a URL; otherwise it returns nothing.
 
-**Call relations**: This helper is called from `command_action` when summarizing `open` and `find` operations. It prevents internal ids like `turn0search0` from being reported as navigated URLs while still allowing `find` actions to retain their pattern even when the URL is unknown.
+**Call relations**: This helper is used when building user-visible actions for open-page and find-in-page commands. It prevents internal result ids from being displayed as if they were real URLs.
 
 *Call graph*: 1 external calls (parse).
 
@@ -4307,11 +4353,11 @@ fn literal_url(ref_id: &str) -> Option<String>
 fn web_search_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnItem
 ```
 
-**Purpose**: Constructs the `ExtensionTurnItem::WebSearch` payload emitted at tool start and completion.
+**Purpose**: This creates the turn-history item that represents a web search action. It is what lets the rest of the system show a clean “web search started/completed” record to the user.
 
-**Data flow**: It takes a `call_id` and a concrete `WebSearchAction`, computes a human-readable `query` string with `web_search_action_detail(&action)`, and packages those values into `WebSearchItem { id, query, action }`, then wraps it in `ExtensionTurnItem::WebSearch`. It returns the assembled turn item without mutating external state.
+**Data flow**: It receives a call id and a `WebSearchAction`. It turns the action into a readable detail string using `web_search_action_detail`, then packages the id, detail, and action into a `WebSearchItem` wrapped as an `ExtensionTurnItem`. The output is ready to emit into the conversation turn stream.
 
-**Call relations**: This helper is used twice by `WebSearchTool::handle_call`: once before the backend request with a generic `Other` action and once after completion with the derived action. It centralizes the exact shape of emitted web-search turn items so both lifecycle events use the same formatting logic.
+**Call relations**: This is called by `WebSearchTool::handle_call` both before and after the search request. The first call uses a generic action, and the second uses the more specific action chosen by `command_action`.
 
 *Call graph*: called by 1 (handle_call); 2 external calls (web_search_action_detail, WebSearch).
 
@@ -4322,24 +4368,26 @@ fn web_search_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnItem
 fn command_action_reports_queries_and_navigation_detail()
 ```
 
-**Purpose**: Verifies that `command_action` produces the expected `WebSearchAction` for representative search, open, and find command payloads, including internal reference ids versus literal URLs.
+**Purpose**: This test checks that `command_action` reports search and navigation commands in the way the user interface expects. It protects against regressions where progress details become misleading or lose useful information.
 
-**Data flow**: The test defines a table of JSON argument strings paired with expected `WebSearchAction` values, deserializes each string into `SearchCommands` with `serde_json::from_str`, invokes `command_action`, and asserts equality with `assert_eq!`. It writes no persistent state; its output is pass/fail test status.
+**Data flow**: It defines several JSON command examples, parses each one into `SearchCommands`, runs `command_action`, and compares the result with the expected `WebSearchAction`. The cases cover multiple image queries, opening a literal URL, finding text at a literal URL, finding text through a search-result reference, and opening a non-URL reference.
 
-**Call relations**: This test exercises the helper logic in isolation rather than the full networked tool path. It specifically documents the intended precedence and URL-detection behavior that `WebSearchTool::handle_call` relies on when emitting completion metadata.
+**Call relations**: The test directly exercises `command_action`. It does not call the network-facing tool flow; instead, it focuses on the small but important translation from structured commands to user-visible action summaries.
 
 *Call graph*: 3 external calls (assert_eq!, from_str, vec!).
 
 
 ### `ext/web-search/src/output.rs`
 
-`io_transport` · `request handling`
+`io_transport` · `tool response handling`
 
-This file is a small adapter between the web-search extension and the shared extension/protocol APIs. Its only data type, `SearchOutput`, stores a single `String` containing the rendered search result text that should be returned to the model. The implementation is intentionally minimal: there is no parsing, formatting, or branching logic beyond wrapping that text in the correct protocol enum variants.
+When the web search extension finishes a search, it has a plain text answer. The rest of the system, however, does not pass around raw strings. It expects tool results to follow a shared shape, like putting a letter into the right envelope before sending it through the mail. This file defines that envelope for web search results.
 
-`SearchOutput` implements `ToolOutput`, which lets the extension runtime treat search results uniformly with outputs from other tools. The trait methods encode important metadata choices: logging always reports a fixed preview string instead of the actual search text, logging always marks the operation as successful, and the output is explicitly flagged as containing external context so downstream consumers know the content originated outside the conversation. The main conversion path is `to_response_item`, which ignores the incoming `ToolPayload` and builds a `ResponseInputItem::FunctionCallOutput` using the supplied `call_id`. The actual search text is inserted as a single `FunctionCallOutputContentItem::InputText`, then wrapped with `FunctionCallOutputPayload::from_content_items`.
+The main type is `SearchOutput`. It stores one piece of text: the search output. By implementing `ToolOutput`, it tells the extension framework how this result should appear in logs, whether it counts as a successful tool result, whether it includes outside information, and how to convert it into a protocol message that can be fed back into the model.
 
-The test locks in the wire-format contract: a `SearchOutput` created from plain text must serialize to exactly one plaintext content item under the matching call ID. That makes this file the canonical definition of how web-search results re-enter the conversation loop.
+A key detail is that `contains_external_context` returns true. That means this output is explicitly marked as information gathered from outside the current conversation or workspace. Another important detail is that `to_response_item` sends the search result as plain input text inside a function-call output message, preserving the original call ID so the response can be matched to the tool call that produced it.
+
+The test at the bottom checks the most important contract: a search result becomes a plaintext function-call output with the expected call ID and text.
 
 #### Function details
 
@@ -4349,11 +4397,11 @@ The test locks in the wire-format contract: a `SearchOutput` created from plain 
 fn new(output: String) -> Self
 ```
 
-**Purpose**: Constructs a `SearchOutput` by storing the provided rendered search-result text unchanged.
+**Purpose**: Creates a `SearchOutput` from the text produced by a web search. This is the simple starting point that packages raw search text into the type expected by the tool-output system.
 
-**Data flow**: Takes one owned `String` argument, `output`, and moves it into the struct field `output`. Returns a new `SearchOutput` value; it does not read or mutate any external state.
+**Data flow**: It receives a `String` containing the search result → stores that string inside a new `SearchOutput` value → returns the wrapped result so later code can log it or convert it into a response message.
 
-**Call relations**: This is the creation point for the output wrapper. It is used by the extension's call-handling path when a search result has been produced, and by the unit test to build a concrete instance before asserting the protocol conversion behavior.
+**Call relations**: The web search call flow uses this after it has produced search text, and the test uses it to build a sample output. After creation, the value is typically passed through the `ToolOutput` methods, especially `to_response_item`, so the rest of Codex can receive the search result in the standard format.
 
 *Call graph*: called by 2 (emits_plaintext_function_call_output, handle_call).
 
@@ -4364,11 +4412,11 @@ fn new(output: String) -> Self
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Provides a fixed, non-sensitive preview string for logs instead of exposing the actual search result contents.
+**Purpose**: Returns a short, safe label for logs instead of printing the full search result. This helps logs show what kind of output was produced without dumping potentially long or sensitive external text.
 
-**Data flow**: Reads no fields from `self` and ignores the stored output text. Returns a newly allocated `String` containing the literal `[standalone web search output]`; it writes no state.
+**Data flow**: It reads no outside input beyond the `SearchOutput` value → ignores the stored search text → returns the fixed string `[standalone web search output]`.
 
-**Call relations**: This method participates in the `ToolOutput` logging contract. It is invoked by generic extension/runtime logging code when it needs a human-readable summary without dumping the full external search content.
+**Call relations**: The extension framework can call this when it wants a brief logging preview of a tool result. It does not hand off to other code; it simply supplies a stable label for the larger logging flow.
 
 
 ##### `SearchOutput::success_for_logging`  (lines 22–24)
@@ -4377,11 +4425,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks this output as a successful tool result for logging and status reporting purposes.
+**Purpose**: Tells the logging system that this web search output represents a successful result. It is a simple status signal used for reporting.
 
-**Data flow**: Consumes only `&self` and reads no internal fields. Returns the constant boolean `true` and does not mutate any state.
+**Data flow**: It receives the current `SearchOutput` value → does not inspect the stored text → returns `true` to say the result should be logged as successful.
 
-**Call relations**: This is another `ToolOutput` metadata hook used by surrounding runtime code when deciding how to classify the tool invocation in logs or telemetry.
+**Call relations**: The tool-output framework can ask this when recording what happened during a tool call. This method does not call other functions; it provides one small piece of status information to the broader logging machinery.
 
 
 ##### `SearchOutput::contains_external_context`  (lines 26–28)
@@ -4390,11 +4438,11 @@ fn success_for_logging(&self) -> bool
 fn contains_external_context(&self) -> bool
 ```
 
-**Purpose**: Declares that the output text comes from an external source and should be treated as external context.
+**Purpose**: Marks this output as containing information from outside the current local context. For web search, this matters because the text may come from the internet rather than from the conversation or project files.
 
-**Data flow**: Takes `&self`, reads no fields, and returns the constant boolean `true`. It has no side effects.
+**Data flow**: It receives the `SearchOutput` value → does not need to inspect the text because all web search results are external by nature → returns `true`.
 
-**Call relations**: This method informs generic tool-processing code that the response carries externally sourced information, which can affect downstream handling, attribution, or safety policy.
+**Call relations**: The extension framework can call this when deciding how to label, audit, or treat tool results. It acts as a clear flag to the rest of the system that this result includes outside context.
 
 
 ##### `SearchOutput::to_response_item`  (lines 30–39)
@@ -4403,11 +4451,11 @@ fn contains_external_context(&self) -> bool
 fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Transforms the stored search text into the protocol-level `FunctionCallOutput` item that is fed back into the conversation.
+**Purpose**: Converts the stored search text into the protocol message format used to return a tool result to the model. It keeps the original tool-call ID so the model can connect this output to the request that caused it.
 
-**Data flow**: Reads `self.output` and clones it, takes `call_id: &str`, and accepts a `&ToolPayload` that is intentionally unused. It constructs `ResponseInputItem::FunctionCallOutput` with `call_id.to_string()` and a `FunctionCallOutputPayload` built from a one-element vector containing `FunctionCallOutputContentItem::InputText { text: cloned_output }`. The return value is the fully assembled response item; no persistent state is modified.
+**Data flow**: It receives the stored search output, a `call_id`, and a tool payload that is not needed here → copies the call ID and wraps the search text as an input-text content item → returns a `ResponseInputItem::FunctionCallOutput` containing that packaged text.
 
-**Call relations**: This is the core adapter method required by `ToolOutput`. It is called by the extension/runtime when a tool result must be serialized into the shared response stream, and it delegates payload assembly to `FunctionCallOutputPayload::from_content_items` after creating the single-item vector.
+**Call relations**: After `SearchOutput::new` creates the output object, the tool framework calls this when it is time to feed the result back into the conversation. Inside, it uses `FunctionCallOutputPayload::from_content_items` to build the protocol payload from a list containing the plaintext search result.
 
 *Call graph*: calls 1 internal fn (from_content_items); 1 external calls (vec!).
 
@@ -4418,27 +4466,37 @@ fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInp
 fn emits_plaintext_function_call_output()
 ```
 
-**Purpose**: Verifies that `SearchOutput` emits exactly the expected plaintext function-call output structure.
+**Purpose**: Checks that `SearchOutput` is converted into exactly the expected function-call output message. This protects the contract between the web search extension and the rest of the protocol.
 
-**Data flow**: Creates a `SearchOutput` from the literal `search output`, passes a sample call ID and a dummy `ToolPayload::Function { arguments: "{}" }` into `to_response_item`, and compares the returned `ResponseInputItem` against a manually constructed expected value. It writes no non-test state; its observable effect is pass/fail test status.
+**Data flow**: It creates a sample `SearchOutput` containing `search output` → asks it to become a response item for call ID `call-1` → compares the result with the exact expected protocol object, including the call ID and plaintext content.
 
-**Call relations**: This test exercises the normal construction path by calling `SearchOutput::new`, then validates the protocol conversion contract through `assert_eq!`. It serves as a regression check for the exact enum variants and content-item layout produced by `to_response_item`.
+**Call relations**: The test calls `SearchOutput::new` to build the example and then exercises `to_response_item` through the assertion. It serves as a safety check for the conversion behavior that production code relies on after a web search completes.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
 
 ### `ext/image-generation/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`orchestration` · `startup`
 
-This file is the minimal public surface for the image-generation extension. It declares three internal modules—`backend`, `extension`, and `tool`—which separate provider/backend integration, extension registration, and tool behavior. The only public re-export is `extension::install`, signaling that consumers are expected to integrate this extension through a single installer entrypoint rather than by constructing lower-level pieces directly. In addition, the file defines two crate-visible constants: `IMAGE_GEN_NAMESPACE` with value `"image_gen"` and `IMAGEGEN_TOOL_NAME` with value `"imagegen"`. These constants provide canonical identifiers for registration, routing, prompt/tool metadata, or metrics labels inside the crate, avoiding duplicated string literals and ensuring all internal components refer to the same namespace and tool name. The file itself contains no control flow, but it establishes an important invariant for the rest of the extension: all image-generation functionality should be grouped under the `image_gen` namespace and exposed through the `imagegen` tool identifier.
+This is a small but important doorway file. In Rust projects, a `lib.rs` file usually defines what the library contains and what other parts of the program are allowed to use. Here, it says that the image-generation extension is made from three internal modules: `backend`, `extension`, and `tool`. Those modules likely contain the actual work: talking to an image service, registering the extension, and defining the tool users or agents can call.
+
+The file then publicly re-exports `extension::install`. Re-exporting means it takes something defined deeper inside the crate and presents it at the crate’s front desk. That way, outside code can simply call the extension’s `install` function without knowing where it lives internally.
+
+It also defines two shared names: the namespace `image_gen` and the tool name `imagegen`. These are like labels on a mailbox. Other parts of the extension can use the same labels when registering or looking up the image generation feature, which avoids mismatched strings scattered through the code. Without this file, the crate would not have a clear public entry point, and the extension’s pieces would be harder to connect consistently.
 
 
 ### `ext/image-generation/src/extension.rs`
 
-`orchestration` · `thread startup, config changes, tool enumeration`
+`orchestration` · `thread startup, config changes, and tool discovery`
 
-This file contains the extension-facing policy for whether image generation should appear in a thread. `ImageGenerationExtension` holds an `AuthManager`, while `ImageGenerationExtensionConfig` snapshots the thread-relevant configuration: whether the current model provider supports this standalone path, which provider to use, and the thread's `codex_home`. The `From<&Config>` implementation computes that snapshot, currently marking the feature available only when `config.model_provider.is_openai()` is true. On thread start and on config changes, the extension stores a fresh `ImageGenerationExtensionConfig` in thread-scoped `ExtensionData`, ensuring later tool enumeration sees current settings. The `ToolContributor` implementation then gates tool exposure on two conditions: the stored config must exist and say `available`, and the current auth must use the Codex backend. If either check fails, it returns no tools. Otherwise it constructs a single `ImageGenerationTool` using a `CodexImagesBackend` built from `create_model_provider`, passes through `codex_home`, and uses the thread store's level id as the thread identifier string. The `install` function registers the same extension instance for thread lifecycle, config updates, and tool contribution so all three hooks share one auth manager.
+This file is the doorway between the image-generation code and the main Codex application. Without it, the image generator might exist as code, but Codex would not know when to offer it or how to build it for a conversation thread.
+
+The file defines a small extension object, `ImageGenerationExtension`, which carries the current authentication manager. That matters because image generation is only exposed when the user is signed in through the Codex backend. It also defines `ImageGenerationExtensionConfig`, a small per-thread snapshot of the settings needed for image generation: whether it is allowed, which model provider to use, and where the user’s Codex home folder is.
+
+When a new thread starts, the extension reads the main `Config` and stores this image-specific snapshot in the thread’s extension data. If the configuration changes later, it refreshes that snapshot. This is like keeping a small note card beside each conversation that says, “image generation is allowed here, using this provider, and saving relative to this home folder.”
+
+When Codex asks what tools are available, this extension checks the note card and the login state. If image generation is not available, it returns no tools. If everything is allowed, it builds an `ImageGenerationTool` backed by a model provider and returns it to the core system.
 
 #### Function details
 
@@ -4448,11 +4506,11 @@ This file contains the extension-facing policy for whether image generation shou
 fn from(config: &Config) -> Self
 ```
 
-**Purpose**: Derives the thread-scoped image-generation configuration snapshot from the full core `Config`. It decides whether the standalone image tool should even be considered available.
+**Purpose**: This function turns the full Codex configuration into the smaller image-generation configuration needed for one thread. It decides whether image generation should be considered available and keeps the provider and home folder information needed later to build the tool.
 
-**Data flow**: It takes `&Config`, reads `model_provider` and `codex_home`, computes `available` from `config.model_provider.is_openai()`, clones the provider and home path, and returns a new `ImageGenerationExtensionConfig`.
+**Data flow**: It receives a reference to the main `Config`. It reads the configured model provider, checks whether that provider is OpenAI, copies the provider information, and copies the Codex home path. It returns a new `ImageGenerationExtensionConfig` containing just those image-related details.
 
-**Call relations**: It is called by both `on_thread_start` and `on_config_changed` so thread-scoped extension data stays synchronized with the latest configuration.
+**Call relations**: This is used whenever the thread needs a fresh image-generation snapshot. The thread-start path calls it when a conversation begins, and the config-change path calls it again when settings are updated, so later tool creation sees current information.
 
 *Call graph*: called by 2 (on_config_changed, on_thread_start).
 
@@ -4466,11 +4524,11 @@ fn on_thread_start(
     ) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Seeds thread-scoped image-generation configuration when a thread begins. It ensures later tool enumeration has the necessary config snapshot.
+**Purpose**: This function prepares image generation state when a new thread begins. It stores the thread’s initial image-generation settings so later parts of the system can quickly decide whether to offer the image tool.
 
-**Data flow**: It takes `ThreadStartInput<Config>`, converts `input.config` into `ImageGenerationExtensionConfig`, inserts that config into `input.thread_store`, and returns a boxed async future.
+**Data flow**: It receives startup input containing the current app configuration and the thread’s extension data store. It builds an `ImageGenerationExtensionConfig` from the configuration, then inserts that snapshot into the thread store. It does not return data to the caller beyond completing the asynchronous setup.
 
-**Call relations**: The extension framework invokes it during thread startup because the extension implements `ThreadLifecycleContributor<Config>`. It delegates config derivation to `ImageGenerationExtensionConfig::from`.
+**Call relations**: The extension system calls this at the beginning of a thread because this file registered itself as a thread lifecycle contributor. It relies on `ImageGenerationExtensionConfig::from` to make the per-thread snapshot, which `ImageGenerationExtension::tools` later reads when Codex asks which tools are available.
 
 *Call graph*: calls 1 internal fn (from); 1 external calls (pin).
 
@@ -4487,11 +4545,11 @@ fn on_config_changed(
     )
 ```
 
-**Purpose**: Refreshes the stored image-generation configuration after a thread's config changes. It keeps tool availability and provider selection current without restarting the thread.
+**Purpose**: This function updates the stored image-generation settings after the thread’s configuration changes. It prevents the image tool from being offered using stale provider or availability information.
 
-**Data flow**: It ignores the session store and previous config, converts `new_config` into `ImageGenerationExtensionConfig`, and inserts the new snapshot into `thread_store`.
+**Data flow**: It receives the old and new configurations plus extension data stores. It ignores the session-wide store and the previous configuration, reads the new configuration, creates a fresh `ImageGenerationExtensionConfig`, and replaces or inserts that value in the thread store. Its visible effect is the updated thread-local snapshot.
 
-**Call relations**: The framework calls it on config updates because the extension implements `ConfigContributor<Config>`. It uses the same conversion logic as thread start.
+**Call relations**: The extension system calls this when configuration changes because this file registered the extension as a config contributor. It uses the same conversion helper as thread startup, so both first-time setup and later refreshes follow the same rule.
 
 *Call graph*: calls 2 internal fn (insert, from).
 
@@ -4506,11 +4564,11 @@ fn tools(
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
 ```
 
-**Purpose**: Returns the standalone image-generation tool only when thread config and current auth both permit it. It is the policy gate between stored configuration and actual tool exposure.
+**Purpose**: This function answers the question, “Should this thread have an image-generation tool right now, and if so, what tool object should Codex use?” It is the gatekeeper that only exposes image generation when both configuration and authentication allow it.
 
-**Data flow**: It reads `ImageGenerationExtensionConfig` from `thread_store`; if absent, unavailable, or the auth manager is not using the Codex backend, it returns an empty vector. Otherwise it creates a model provider from the stored provider plus cloned auth manager, wraps it in `CodexImagesBackend`, constructs `ImageGenerationTool` with backend, cloned `codex_home`, and `thread_store.level_id().to_string()`, and returns a one-element vector containing the tool in an `Arc`.
+**Data flow**: It receives session and thread extension data. It looks in the thread store for `ImageGenerationExtensionConfig`; if none is present, it returns an empty list. If image generation is marked unavailable, or the current login is not using the Codex backend, it also returns an empty list. Otherwise, it creates a model provider with the saved provider settings and authentication manager, wraps that in a `CodexImagesBackend`, builds an `ImageGenerationTool` with the backend, Codex home path, and thread identifier, and returns that tool in a list.
 
-**Call relations**: The extension registry calls this whenever it enumerates tools for a thread. It depends on prior `on_thread_start`/`on_config_changed` calls having populated thread-scoped config.
+**Call relations**: The core tool system calls this after the extension has been installed as a tool contributor. It depends on the thread-start and config-change functions having stored the per-thread image-generation config. When the checks pass, it hands off actual image work to `ImageGenerationTool` and `CodexImagesBackend`; this function only decides whether and how to construct them.
 
 *Call graph*: 2 external calls (new, vec!).
 
@@ -4521,24 +4579,24 @@ fn tools(
 fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Arc<AuthManager>)
 ```
 
-**Purpose**: Registers the image-generation extension for thread lifecycle, config updates, and tool contribution. It is the public entry point used by host setup code.
+**Purpose**: This function registers the image-generation extension with the Codex extension registry. It is the setup hook that makes the extension participate in thread startup, configuration changes, and tool discovery.
 
-**Data flow**: It takes a mutable `ExtensionRegistryBuilder<Config>` and shared `AuthManager`, constructs one `Arc<ImageGenerationExtension>`, clones it for thread lifecycle and config contributor registration, and registers the original for tool contribution.
+**Data flow**: It receives the shared extension registry builder and an authentication manager. It creates one shared `ImageGenerationExtension` containing that authentication manager, then registers the same extension object for three jobs: thread lifecycle events, configuration updates, and tool contribution. It changes the registry so the rest of the application will call this extension at the right times.
 
-**Call relations**: Hosts call this during extension installation. It wires one shared extension instance into all three contributor roles so they operate over the same auth manager.
+**Call relations**: Startup or extension setup code calls this to install image generation into Codex. After this function runs, the registry knows to call `ImageGenerationExtension::on_thread_start` when threads begin, `ImageGenerationExtension::on_config_changed` when settings change, and `ImageGenerationExtension::tools` when tools are requested.
 
 *Call graph*: calls 3 internal fn (config_contributor, thread_lifecycle_contributor, tool_contributor); 1 external calls (new).
 
 
 ### `ext/image-generation/src/tool.rs`
 
-`domain_logic` · `tool invocation / request handling`
+`domain_logic` · `request handling`
 
-This file contains the full runtime logic for the image-generation extension. `ImageGenerationTool` stores the backend executor plus `codex_home` and `thread_id`, which are later used to compute a persisted artifact path and a human-readable save hint. Through `ToolExecutor<ToolCall>`, it exposes a namespaced tool (`IMAGE_GEN_NAMESPACE` / `IMAGEGEN_TOOL_NAME`) with a JSON-schema-derived input contract based on `ImagegenArgs`. The arguments are strict at deserialization time (`deny_unknown_fields`) and allow either explicit `referenced_image_paths` or a bounded `num_last_images_to_include`, never both.
+This file is the bridge between a model saying “make or edit an image” and the image service actually doing it. Without it, the image-generation extension would not know how to advertise itself to the model, read the model’s arguments, collect reference images, call the backend image API, or package the result back into the conversation.
 
-`handle_call()` is the orchestration center. It parses arguments, derives an `ImageRequest` via `request_for_call_args()`, emits an in-progress `ImageGenerationItem`, dispatches to `backend.generate()` or `backend.edit()`, extracts the first `b64_json` image from the API response, and emits either a failed or completed turn item. On success it computes the artifact path with `image_generation_artifact_path()` and optionally an `extension_image_generation_output_hint()`.
+The main type is ImageGenerationTool. It stores the image backend, the Codex home folder, and the current conversation thread id. When the tool is called, it first parses the model’s JSON arguments: a prompt, optional file paths for reference images, or a request to reuse recent images from the conversation. If there are no references, it builds a plain “generate” request. If there are references, it builds an “edit” request. Reference images can come from disk, where they are read through the session’s file-system sandbox, or from earlier conversation items.
 
-The request-building logic is concrete and defensive. Generation requests always use `gpt-image-2` with auto background/quality/size. Edit requests either load and normalize local files through the session `ToolEnvironment` and `load_for_prompt_bytes()`, or mine recent images from conversation history. `recent_images()` first records valid function/custom-tool call IDs, then scans history backward so orphan outputs are ignored and newest images are selected first; it reverses the final list so the edit API receives chronological order. `GeneratedImageOutput` deliberately suppresses raw bytes in logs, returns a compact JSON object for code mode, and emits protocol content items with `DEFAULT_IMAGE_DETAIL` for normal model follow-up.
+The tool then emits an “in progress” event, calls the backend, and emits either a failed or completed event. The generated image is kept as base64 text, wrapped as a data URL when returned, and accompanied by a hint about where the image artifact should be saved. A small output type, GeneratedImageOutput, controls how the result appears in logs, code mode, and follow-up model input.
 
 #### Function details
 
@@ -4552,11 +4610,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs an image-generation tool instance bound to a specific backend, Codex home directory, and thread identifier.
+**Purpose**: Creates a ready-to-use image-generation tool. It remembers which backend to call, where Codex stores files, and which conversation thread this tool belongs to.
 
-**Data flow**: It takes a `CodexImagesBackend`, an `AbsolutePathBuf` for `codex_home`, and a `String` thread ID, then stores them unchanged in a new `ImageGenerationTool`. It returns the initialized struct with no side effects.
+**Data flow**: The caller provides a backend, a Codex home path, and a thread id. The function stores those three pieces inside a new ImageGenerationTool and returns it. It does not contact the image service or read any files.
 
-**Call relations**: This is the constructor used when the extension is wired into the runtime; later methods read these stored fields during execution, especially `handle_call()` when computing artifact paths.
+**Call relations**: This is used during setup, when the extension is building the tool object that will later be exposed to the model. The stored values are later used by ImageGenerationTool::handle_call when an actual image request arrives.
 
 
 ##### `ImageGenerationTool::tool_name`  (lines 85–87)
@@ -4565,11 +4623,11 @@ fn new(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Reports the fully qualified tool name used by the extension framework.
+**Purpose**: Returns the official namespaced name of this tool. A namespace is like a folder label that keeps tool names from colliding with other tools.
 
-**Data flow**: It reads the compile-time constants `IMAGE_GEN_NAMESPACE` and `IMAGEGEN_TOOL_NAME`, passes them to `ToolName::namespaced`, and returns the resulting `ToolName`.
+**Data flow**: It reads the fixed image-generation namespace and tool-name constants, combines them into a ToolName, and returns that value. Nothing else changes.
 
-**Call relations**: The extension framework calls this when registering or identifying the tool; it aligns the executor identity with the schema returned by `spec()`.
+**Call relations**: The tool framework calls this when it needs to identify the tool. This function delegates the name formatting to the shared namespaced helper so the name matches the rest of the Responses API tool surface.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -4580,11 +4638,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the model-facing tool specification for image generation and editing.
+**Purpose**: Describes to the model what inputs this tool accepts and what the tool is for. This is the contract the model sees before it decides to call the tool.
 
-**Data flow**: It invokes `imagegen_tool_spec()` and returns the resulting `ToolSpec` unchanged.
+**Data flow**: It takes no outside input beyond the tool itself. It calls imagegen_tool_spec to build the schema and description, then returns that ToolSpec.
 
-**Call relations**: The framework calls this during tool advertisement. It delegates all schema construction details to `imagegen_tool_spec()`.
+**Call relations**: The tool framework calls this while advertising available tools. The detailed construction is handed off to imagegen_tool_spec so the public trait method stays small.
 
 *Call graph*: calls 1 internal fn (imagegen_tool_spec).
 
@@ -4595,11 +4653,11 @@ fn spec(&self) -> ToolSpec
 fn exposure(&self) -> ToolExposure
 ```
 
-**Purpose**: Declares that the tool is directly exposed on the tool surface.
+**Purpose**: Says that this tool is directly available to the model. In plain terms, the model does not need to go through another wrapper tool to use it.
 
-**Data flow**: It returns the constant enum value `ToolExposure::Direct` and reads no mutable state.
+**Data flow**: It returns the fixed exposure value ToolExposure::Direct. It reads no call data and changes nothing.
 
-**Call relations**: This is consulted by the extension framework when deciding how the tool appears to callers; it does not delegate further.
+**Call relations**: The tool framework uses this during tool registration or selection. It affects how the image-generation tool is surfaced to the model.
 
 
 ##### `ImageGenerationTool::handle`  (lines 100–102)
@@ -4608,11 +4666,11 @@ fn exposure(&self) -> ToolExposure
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async image-generation implementation to the boxed future type required by `ToolExecutor`.
+**Purpose**: Starts processing one image-generation tool call. It wraps the real async work so it fits the common ToolExecutor interface.
 
-**Data flow**: It takes ownership of a `ToolCall`, invokes `self.handle_call(call)`, boxes and pins the future, and returns that executor future.
+**Data flow**: It receives a ToolCall from the framework, passes it to handle_call, boxes and pins the future so the framework can await it, and returns that future. Pinning here means keeping the async task safely in place while it runs.
 
-**Call relations**: The extension runtime invokes this entrypoint for each tool call. It is a thin wrapper whose only job is to forward into `handle_call()`.
+**Call relations**: The tool framework calls this when the model invokes the image tool. It immediately hands the real work to ImageGenerationTool::handle_call.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -4623,11 +4681,11 @@ fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes one image-generation or image-edit request end to end, including validation, backend dispatch, progress events, error mapping, and final output construction.
+**Purpose**: Runs a complete image request from start to finish. It parses the model’s request, chooses generation or editing, calls the image backend, reports progress, and returns the final image output.
 
-**Data flow**: It reads the incoming `ToolCall`, parses JSON arguments with `parse_args()`, derives an `ImageRequest` using `request_for_call_args()` against conversation history and environments, and emits an `ExtensionTurnItem::ImageGeneration` with `in_progress` status. It then matches on `ImageRequest`: `Generate` calls `self.backend.generate(request).await`, while `Edit` calls `self.backend.edit(request).await`. The API response is transformed by taking the first element of `response.data` and extracting `b64_json`; backend failures or empty data become `FunctionCallError::RespondToModel` after emitting a failed completion item. On success it emits a completed `ImageGenerationItem` containing the revised prompt and base64 result, computes an artifact path from `codex_home`, `thread_id`, and `call.call_id`, derives an optional output hint, and returns `Box<GeneratedImageOutput>`.
+**Data flow**: It receives a ToolCall containing JSON arguments, conversation history, environments, ids, and an event emitter. It parses the arguments, builds either a generate or edit request, emits an in-progress item, calls the backend, extracts the first returned base64 image, emits success or failure, computes an artifact path and output hint, and returns a GeneratedImageOutput. On errors, it returns a message meant for the model instead of pretending the call succeeded.
 
-**Call relations**: This is called only by `handle()`. It orchestrates the whole flow by delegating argument parsing to `parse_args()`, request selection to `request_for_call_args()`, backend work to `generate`/`edit`, and output formatting to `GeneratedImageOutput`.
+**Call relations**: ImageGenerationTool::handle calls this for every actual tool invocation. It relies on parse_args for input parsing, request_for_call_args for deciding what kind of image request to make, and the backend’s generate or edit operation for the real image work. At the end, it hands back GeneratedImageOutput, which later formats the result for logs, code mode, and model follow-up.
 
 *Call graph*: calls 4 internal fn (edit, generate, parse_args, request_for_call_args); called by 1 (handle); 6 external calls (new, new, extension_image_generation_output_hint, image_generation_artifact_path, RespondToModel, ImageGeneration).
 
@@ -4642,11 +4700,11 @@ async fn request_for_call_args(
 ) -> Result<ImageRequest, FunctionCallError>
 ```
 
-**Purpose**: Converts validated tool arguments plus runtime context into either a generation request or an edit request, enforcing all selector rules and limits.
+**Purpose**: Decides whether the tool call should create a fresh image or edit existing images. It also gathers and checks any reference images the model asked to use.
 
-**Data flow**: It reads `ImagegenArgs`, conversation `history`, and available `ToolEnvironment`s. First it normalizes `referenced_image_paths` to a slice and rejects more than `MAX_EDIT_IMAGES`. It then matches on whether explicit paths are present and whether `num_last_images_to_include` is set. With neither selector, it returns `ImageRequest::Generate` using the prompt and fixed defaults. With explicit paths only, it requires at least one environment, reads each path through `image_url()`, and collects `Vec<ImageUrl>`. With history count only, it validates the count range, gathers images via `recent_images()`, and errors if fewer than requested are available. With both selectors, it returns a model-facing conflict error. Successful edit branches are wrapped into `ImageRequest::Edit` with the same fixed defaults.
+**Data flow**: It receives parsed arguments, conversation history, and available tool environments. If no reference images are requested, it builds a Generate request with the prompt. If file paths are provided, it reads and converts those files into image URLs. If the model asks for recent conversation images, it searches history for them. It rejects invalid combinations, such as asking for both file paths and recent images, or asking for too many images.
 
-**Call relations**: This helper is called by `handle_call()` after parsing arguments. It delegates file-backed image loading to `image_url()` and history mining to `recent_images()` depending on which selector mode the caller chose.
+**Call relations**: ImageGenerationTool::handle_call calls this after parsing arguments. It calls image_url when references come from disk and recent_images when references come from the conversation. Its result tells handle_call whether to call the backend’s generate or edit method.
 
 *Call graph*: calls 2 internal fn (image_url, recent_images); called by 1 (handle_call); 6 external calls (with_capacity, Edit, Generate, format!, RespondToModel, first).
 
@@ -4657,11 +4715,11 @@ async fn request_for_call_args(
 fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl>
 ```
 
-**Purpose**: Finds the most recent usable images in conversation history, while excluding orphaned tool outputs and preserving chronological order in the returned edit list.
+**Purpose**: Finds the most recent images in the conversation so they can be used as edit references. This lets the model say, in effect, “edit the last image” without needing a file path.
 
-**Data flow**: It takes a slice of `ResponseItem` and a desired `count`. In a first pass, it builds `HashSet`s of valid function-call IDs and custom-tool-call IDs from `ResponseItem::FunctionCall` and `ResponseItem::CustomToolCall`. In a second reverse pass over history, it extracts image URLs from user `Message` content, from `FunctionCallOutput` only when the `call_id` was previously seen, from `CustomToolCallOutput` only when its `call_id` was seen, and from non-empty `ImageGenerationCall.result` by wrapping the base64 payload in a PNG data URL. It accumulates until `count` images are found, then reverses the collected vector and returns `Vec<ImageUrl>`.
+**Data flow**: It receives the conversation history and a requested count. It first records which function and custom tool call ids are real calls, so it can trust their matching outputs. Then it walks backward through history, collecting image URLs from messages, completed tool outputs, and prior image-generation results. It stops once it has enough images, reverses them back into normal chronological order, and returns them.
 
-**Call relations**: This function is used by `request_for_call_args()` for the history-based edit mode. It delegates extraction of image items inside tool outputs to `output_image_urls()`.
+**Call relations**: request_for_call_args calls this when the user or model asks to include recent conversation images. recent_images uses output_image_urls to pull image entries out of tool-output payloads. The returned images become the input list for an image edit request.
 
 *Call graph*: calls 1 internal fn (output_image_urls); called by 1 (request_for_call_args); 5 external calls (new, new, with_capacity, format!, iter).
 
@@ -4672,11 +4730,11 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl>
 fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item = String> + '_
 ```
 
-**Purpose**: Iterates over image URLs embedded in a function-call output payload, yielding them newest-first within that payload.
+**Purpose**: Extracts image URLs from a tool output payload. It ignores text and encrypted content because only images can be used as visual references.
 
-**Data flow**: It reads a `FunctionCallOutputPayload`, obtains its optional content items via `content_items()`, flattens them, reverses item order, filters for `FunctionCallOutputContentItem::InputImage`, clones each `image_url`, and returns an iterator of `String`s.
+**Data flow**: It receives one function-call output payload. It looks through its content items from newest to oldest, keeps only input-image items, clones their image URLs, and yields those strings as an iterator.
 
-**Call relations**: This helper is called by `recent_images()` when scanning `FunctionCallOutput` and `CustomToolCallOutput` items so those outputs can contribute images in reverse-recency order.
+**Call relations**: recent_images calls this while scanning conversation history. It is a focused helper that knows the shape of function-call output content, so recent_images does not need to repeat that filtering logic.
 
 *Call graph*: calls 1 internal fn (content_items); called by 1 (recent_images).
 
@@ -4690,11 +4748,11 @@ async fn image_url(
 ) -> Result<ImageUrl, FunctionCallError>
 ```
 
-**Purpose**: Loads a referenced local image through the session file-system abstraction, normalizes it for prompting, and converts it into the API’s `ImageUrl` data-URL form.
+**Purpose**: Reads an image file from the session’s file system and converts it into a data URL suitable for the image API. A data URL is text that contains both the image type and the encoded image bytes.
 
-**Data flow**: It takes an absolute path and a `ToolEnvironment`. The path is converted to a `PathUri`, and the environment’s sandbox context is cloned. It asynchronously reads raw bytes from `environment.file_system.read_file(...)`; read failures are mapped to `FunctionCallError::RespondToModel` with the original path in the message. The bytes are then passed to `load_for_prompt_bytes(path.as_path(), bytes, PromptImageMode::Original)`; processing failures are similarly mapped. On success, the normalized image is converted with `into_data_url()` and wrapped in `ImageUrl`.
+**Data flow**: It receives an absolute path and a tool environment. It turns the path into a path URI, reads the file through the environment’s sandboxed file system, loads and validates the image bytes, preserves the original image mode, converts the image into a data URL, and returns it inside an ImageUrl. If reading or processing fails, it returns a clear error for the model.
 
-**Call relations**: This helper is called by `request_for_call_args()` only in the explicit-path edit branch, one time per referenced image path.
+**Call relations**: request_for_call_args calls this for each referenced file path. This helper is where disk access and image decoding happen before the edit request is sent to the backend.
 
 *Call graph*: calls 2 internal fn (as_path, from_abs_path); called by 1 (request_for_call_args); 1 external calls (load_for_prompt_bytes).
 
@@ -4705,11 +4763,11 @@ async fn image_url(
 fn parse_args(call: &ToolCall) -> Result<ImagegenArgs, FunctionCallError>
 ```
 
-**Purpose**: Deserializes the model-supplied function arguments into the strict `ImagegenArgs` structure.
+**Purpose**: Turns the model’s raw JSON tool arguments into the strongly shaped ImagegenArgs structure. This catches malformed or unexpected input early.
 
-**Data flow**: It reads the raw JSON string from `call.function_arguments()?`, passes it to `serde_json::from_str`, and returns either `ImagegenArgs` or `FunctionCallError::RespondToModel` containing the serde error text.
+**Data flow**: It receives a ToolCall, asks it for its function-argument string, and parses that string as JSON. If parsing succeeds, it returns ImagegenArgs. If the JSON is invalid or does not match the expected fields, it returns an error message that can be shown to the model.
 
-**Call relations**: This is the first validation step inside `handle_call()`. Its output feeds directly into `request_for_call_args()`.
+**Call relations**: ImageGenerationTool::handle_call calls this at the very start of a request. The parsed result is then passed to request_for_call_args to build the real image API request.
 
 *Call graph*: called by 1 (handle_call); 2 external calls (function_arguments, from_str).
 
@@ -4720,11 +4778,11 @@ fn parse_args(call: &ToolCall) -> Result<ImagegenArgs, FunctionCallError>
 fn imagegen_tool_spec() -> ToolSpec
 ```
 
-**Purpose**: Builds the namespace tool specification and JSON schema exposed to the model for image generation.
+**Purpose**: Builds the tool description and input schema that are shown to the model. The schema is the machine-readable rulebook for what arguments the tool accepts.
 
-**Data flow**: It generates a root schema for `ImagegenArgs` using `schemars` draft 2019-09 settings with inline subschemas, serializes that schema to `serde_json::Value`, and asserts that the root is an object. It then extracts only `properties`, `required`, `type`, and `additionalProperties` into a fresh `Map`, parses that reduced object with `parse_tool_input_schema()`, and embeds it in `ToolSpec::Namespace(ResponsesApiNamespace { ... })`. The namespace uses `IMAGE_GEN_NAMESPACE`, `default_namespace_description(...)`, and a single nested `ResponsesApiTool` named `IMAGEGEN_TOOL_NAME` with `IMAGEGEN_DESCRIPTION` and `strict: false`.
+**Data flow**: It generates a JSON schema from ImagegenArgs, keeps the parts needed for tool parameters, and combines them with the namespace name, human description, tool name, and strictness setting. It returns a ToolSpec describing one image-generation function inside the image-generation namespace.
 
-**Call relations**: This function is called by `ImageGenerationTool::spec()` and is also directly exercised by tests to verify namespace naming and schema shape.
+**Call relations**: ImageGenerationTool::spec calls this when the framework asks what the tool looks like. The function uses shared schema and namespace helpers so this tool is advertised in the same format as other Responses API tools.
 
 *Call graph*: called by 1 (spec); 7 external calls (new, draft2019_09, default_namespace_description, to_value, Namespace, unreachable!, vec!).
 
@@ -4735,11 +4793,11 @@ fn imagegen_tool_spec() -> ToolSpec
 fn log_preview(&self) -> String
 ```
 
-**Purpose**: Provides a safe log preview string that avoids embedding generated image bytes in telemetry.
+**Purpose**: Provides a safe, short log message for a generated image. It avoids putting the full image bytes into telemetry or logs.
 
-**Data flow**: It ignores the stored image data and returns the fixed string `"[generated image]"`.
+**Data flow**: It ignores the stored base64 image and returns the fixed string "[generated image]". No state changes.
 
-**Call relations**: The logging layer calls this through the `ToolOutput` trait when summarizing tool results.
+**Call relations**: The tool framework calls this when recording or displaying a preview of tool output. Other GeneratedImageOutput methods still provide the actual image where it is needed.
 
 
 ##### `GeneratedImageOutput::success_for_logging`  (lines 420–422)
@@ -4748,11 +4806,11 @@ fn log_preview(&self) -> String
 fn success_for_logging(&self) -> bool
 ```
 
-**Purpose**: Marks generated-image outputs as successful for logging and telemetry purposes.
+**Purpose**: Tells the logging system that this output represents a successful tool call. It is a simple yes/no signal for logs.
 
-**Data flow**: It returns `true` unconditionally and does not inspect any fields.
+**Data flow**: It reads no external input and returns true. It does not inspect the image because this output type is only created after a successful backend result.
 
-**Call relations**: This is another `ToolOutput` hook consumed by the surrounding execution/logging framework.
+**Call relations**: The tool framework calls this while logging the completed tool call. Failure cases are handled earlier in ImageGenerationTool::handle_call and do not produce this output object.
 
 
 ##### `GeneratedImageOutput::code_mode_result`  (lines 425–437)
@@ -4761,11 +4819,11 @@ fn success_for_logging(&self) -> bool
 fn code_mode_result(&self, _payload: &ToolPayload) -> Value
 ```
 
-**Purpose**: Formats the generated image for code mode as a compact JSON object consumable by helper APIs such as `generatedImage()`.
+**Purpose**: Formats the generated image for code mode, especially for helpers such as generatedImage(). It returns a JSON object with the image as a data URL and, when available, a hint about saving or locating the artifact.
 
-**Data flow**: It reads `self.result` and `self.output_hint`. It creates a JSON object map containing `image_url` as a PNG data URL built from the base64 result. If `output_hint` is `Some`, it inserts an `output_hint` string field. It returns the assembled `serde_json::Value::Object`.
+**Data flow**: It reads the stored base64 image and optional output hint. It builds a JSON object whose image_url field starts with data:image/png;base64, followed by the image data. If an output hint exists, it adds that too. The payload argument is not used.
 
-**Call relations**: This method is invoked by code-mode consumers through the `ToolOutput` trait; tests verify both the mandatory image URL and optional hint field.
+**Call relations**: The tool framework calls this when code-mode tooling needs a structured result. It complements to_response_item, which formats the same image for conversation follow-up instead of code consumption.
 
 *Call graph*: 4 external calls (from_iter, Object, String, format!).
 
@@ -4776,11 +4834,11 @@ fn code_mode_result(&self, _payload: &ToolPayload) -> Value
 fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem
 ```
 
-**Purpose**: Converts the generated image into the protocol response item sent back as function-call output for model follow-up.
+**Purpose**: Formats the generated image as a response item that can be fed back into the model. This lets the model see the image result and continue reasoning about it.
 
-**Data flow**: It takes a `call_id` and ignores the payload. It builds a `Vec<FunctionCallOutputContentItem>` starting with `InputImage` whose `image_url` is a PNG data URL from `self.result` and whose `detail` is `Some(DEFAULT_IMAGE_DETAIL)`. If `self.output_hint` exists, it appends an `InputText` item containing that hint. It wraps the content in `FunctionCallOutputPayload { body: ContentItems(content), success: Some(true) }` and returns `ResponseInputItem::FunctionCallOutput` with the provided call ID.
+**Data flow**: It receives the original call id and reads the stored image and optional output hint. It creates a function-call output containing an input-image item with the base64 data URL and default image detail. If there is an output hint, it adds a text item after the image. It marks the output as successful and returns the response item.
 
-**Call relations**: This is the normal model-facing output path used after `handle_call()` returns a boxed `GeneratedImageOutput`. Tests cover both the hint-present and hint-omitted cases.
+**Call relations**: The tool framework calls this after ImageGenerationTool::handle_call returns GeneratedImageOutput. The returned item becomes part of the conversation history, where later requests can also find it through recent_images.
 
 *Call graph*: 2 external calls (ContentItems, vec!).
 
@@ -4789,14 +4847,22 @@ fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInp
 
 `orchestration` · `cross-cutting`
 
-This file defines the module layout for the goal extension and exposes the subset of types intended for external use. Internally, the crate is split into focused modules for accounting, analytics, API definitions, event handling, extension wiring, metrics, runtime state, tool specification, steering logic, and tool implementation. The root then re-exports the operational API types (`GoalService`, `GoalServiceError`, `GoalSetRequest`, `GoalSetOutcome`, `GoalObjectiveUpdate`, `GoalTokenBudgetUpdate`), the extension entry types (`GoalExtension`, `GoalExtensionConfig`, `install_with_backend`), runtime-facing handles and snapshots (`GoalRuntimeHandle`, `PreviousGoalSnapshot`), and the canonical tool names (`CREATE_GOAL_TOOL_NAME`, `GET_GOAL_TOOL_NAME`, `UPDATE_GOAL_TOOL_NAME`) plus `CreateGoalRequest`. As with many crate roots in this codebase, there is no executable logic here; its job is to present a coherent boundary around a larger subsystem. The important design implication is that callers can depend on this file’s exports without knowing whether a capability lives in API, runtime, or tool modules, while the crate retains freedom to reorganize internals behind that facade.
+This file does not contain the goal feature’s behavior itself. Instead, it acts like the index page of a small library. The real work is split into nearby modules: accounting, analytics, API types, events, runtime support, tool definitions, steering logic, and more. By declaring those modules here, the Rust compiler knows they are part of this crate.
+
+The second half of the file chooses what outsiders can import directly from the crate. For example, callers can use `GoalService` to work with goals, `GoalExtension` and `install_with_backend` to install the feature, tool-name constants such as `CREATE_GOAL_TOOL_NAME`, and request or update types such as `GoalSetRequest` and `GoalObjectiveUpdate`.
+
+This matters because it keeps the rest of the codebase from depending on the extension’s private layout. Other code can say, in effect, “give me the goal service” without needing to know which internal file defines it. Like a shop counter, this file presents the approved products up front while the storage room stays organized behind the scenes. Without it, users of the crate would either be unable to reach the goal feature’s public pieces or would have to import them through brittle internal paths.
 
 
 ### `ext/goal/src/tool.rs`
 
-`domain_logic` · `tool execution / goal state mutation`
+`domain_logic` · `request handling`
 
-This file contains the operational core for `get_goal`, `create_goal`, and `update_goal`. `GoalToolExecutor` is parameterized by a `GoalToolKind` and carries all dependencies needed to service a call: thread identity, state runtime, in-memory accounting state, analytics, event emitter, and metrics. The `ToolExecutor` implementation maps each executor instance to a tool name and spec, then dispatches asynchronously to the matching handler. `handle_get` validates that no arguments were supplied and reads the current persisted goal. `handle_create` parses JSON into `CreateGoalRequest`, trims and validates the objective, validates that any budget is positive, inserts a new active goal only if no unfinished goal exists, opportunistically fills an empty thread preview from the objective, marks the current turn as goal-active in accounting state, records metrics/analytics, emits a `thread_goal_updated` event, and returns a structured JSON payload. `handle_update` accepts only `complete` or `blocked`, first flushes any unaccounted progress for the active turn, then updates persisted status, records terminal metrics and analytics, clears the current-turn goal marker, emits an event, and optionally includes a completion-budget reporting hint. Helpers convert between state and protocol goal/status types, serialize `GoalToolResponse`, and compute `remaining_tokens` with zero clamping. A notable design choice is that progress accounting is guarded by a permit and expected-goal-id checks to avoid double-accounting or stale-turn mutations.
+This file is the front door for the goal feature when a model or extension calls a goal tool. A “goal” is a thread-level objective with a status, optional token budget, and recorded usage. Without this file, callers could not safely create, read, or finish goals through the tool system, and the rest of the product would miss important side effects like budget tracking, metrics, analytics, and update events.
+
+The main piece is `GoalToolExecutor`. Each executor is made for one kind of tool: get, create, or update. When a tool call arrives, the executor chooses the right path. Getting a goal simply reads stored state and formats it for the protocol. Creating a goal checks the requested objective and budget, stores a new active goal only if there is not already an unfinished one, fills the thread preview if it was blank, starts accounting for the current turn, and emits metrics, analytics, and a goal-updated event. Updating is more guarded: the tool can only mark a goal complete or blocked. Before changing status, it records the progress made during the active turn so token and time usage are not lost.
+
+A useful analogy is a checkout counter: the request comes in, the file checks that the item is allowed, updates the register, prints the receipt, and notifies the store systems that the sale happened.
 
 #### Function details
 
@@ -4811,11 +4877,11 @@ fn get(
         event_emitter: Goal
 ```
 
-**Purpose**: Constructs a `GoalToolExecutor` configured for the read-only `get_goal` operation. It packages all shared dependencies with `GoalToolKind::Get`.
+**Purpose**: Creates a goal-tool executor configured for the “get goal” tool. Other setup code uses this when it wants a tool that can read the current thread goal.
 
-**Data flow**: It takes a `ThreadId`, shared `StateRuntime`, shared `GoalAccountingState`, `GoalAnalytics`, `GoalEventEmitter`, and `GoalMetrics`, stores them in a new struct with `kind` set to `Get`, and returns that executor.
+**Data flow**: It receives the thread id, state database, accounting state, analytics, event emitter, and metrics objects. It stores those shared pieces together with the “Get” kind, and returns a ready-to-use executor.
 
-**Call relations**: It is used by extension wiring when registering the get tool. The returned executor later participates in `tool_name`, `spec`, and `handle` dispatch.
+**Call relations**: This is one of the constructor-style entry points for this file. Later, when the tool framework asks this executor for its name, spec, or behavior, the stored “Get” kind tells the shared methods to use the get-goal path.
 
 
 ##### `GoalToolExecutor::create`  (lines 95–112)
@@ -4829,11 +4895,11 @@ fn create(
         event_emitter: G
 ```
 
-**Purpose**: Constructs a `GoalToolExecutor` configured for `create_goal`. It is the create-operation counterpart to `get` and `update`.
+**Purpose**: Creates a goal-tool executor configured for the “create goal” tool. Setup code uses it when it wants a tool that can start a new goal for a thread.
 
-**Data flow**: It receives the same dependency set as the other constructors, stores them with `kind` set to `Create`, and returns the initialized executor.
+**Data flow**: It takes the same shared services as the other constructors, records the thread it belongs to, marks the executor kind as “Create”, and returns the executor.
 
-**Call relations**: It is called during tool installation for the create tool. Its only behavior is to prepare later dispatch through the shared `ToolExecutor` implementation.
+**Call relations**: This prepares the object that the tool framework will later call. The common `handle` method uses this kind value to send incoming calls to `GoalToolExecutor::handle_create`.
 
 
 ##### `GoalToolExecutor::update`  (lines 114–131)
@@ -4847,11 +4913,11 @@ fn update(
         event_emitter: G
 ```
 
-**Purpose**: Constructs a `GoalToolExecutor` configured for `update_goal`. It binds the update operation to the current thread and shared services.
+**Purpose**: Creates a goal-tool executor configured for the “update goal” tool. It is used when the system needs a tool that can mark an existing goal complete or blocked.
 
-**Data flow**: It takes thread/state/accounting/analytics/event/metrics dependencies, stores them with `kind` set to `Update`, and returns the executor.
+**Data flow**: It receives the thread id and shared service objects, stores them, marks the executor kind as “Update”, and returns the executor.
 
-**Call relations**: It is created during extension setup for the update tool and later routes calls through `handle_update`.
+**Call relations**: This is setup for the update route. When the tool framework later invokes the executor, `GoalToolExecutor::handle` sees the “Update” kind and calls `GoalToolExecutor::handle_update`.
 
 
 ##### `GoalToolExecutor::tool_name`  (lines 135–141)
@@ -4860,11 +4926,11 @@ fn update(
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the externally visible tool name corresponding to this executor's kind. It is the name advertised to the extension framework and model.
+**Purpose**: Tells the tool framework the public name of this particular goal tool. The name is how a caller knows whether it is calling get, create, or update.
 
-**Data flow**: It reads `self.kind`, selects one of the three exported tool-name constants, wraps it with `ToolName::plain`, and returns the resulting `ToolName`.
+**Data flow**: It reads the executor’s stored kind, chooses the matching tool-name constant, wraps it as a plain tool name, and returns it.
 
-**Call relations**: The extension framework calls this when enumerating tools and when tests search by name. It is paired with `spec` and `handle` to present a coherent tool implementation.
+**Call relations**: The tool framework calls this while registering or identifying tools. It does not perform the tool action itself; it only labels the executor so calls can be routed correctly.
 
 *Call graph*: calls 1 internal fn (plain).
 
@@ -4875,11 +4941,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Returns the schema/instruction spec matching this executor's kind. It keeps runtime dispatch aligned with the tool definitions in `spec.rs`.
+**Purpose**: Provides the formal description of the tool, including what arguments it accepts. This lets callers know how to shape their request.
 
-**Data flow**: It reads `self.kind`, calls the corresponding `create_*_tool` factory, and returns the resulting `ToolSpec`.
+**Data flow**: It checks whether this executor is for get, create, or update, then calls the matching spec-building function and returns the resulting tool specification.
 
-**Call relations**: The framework invokes it when exposing tool metadata. It delegates all schema construction to the dedicated spec module so execution and specification stay separate.
+**Call relations**: The tool framework asks for this during tool setup or advertisement. The function delegates to the spec module, which owns the exact schemas for the three goal tools.
 
 *Call graph*: calls 3 internal fn (create_create_goal_tool, create_get_goal_tool, create_update_goal_tool).
 
@@ -4890,11 +4956,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, invocation: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Asynchronously dispatches an incoming `ToolCall` to the concrete goal operation. It is the single entry point required by the `ToolExecutor` trait.
+**Purpose**: Receives an actual tool call and sends it to the correct goal operation. It is the shared dispatcher for get, create, and update.
 
-**Data flow**: It takes ownership of a `ToolCall`, boxes an async block, matches on `self.kind`, awaits `handle_get`, `handle_create`, or `handle_update`, and returns the framework future yielding either a boxed `ToolOutput` or `FunctionCallError`.
+**Data flow**: It takes a `ToolCall`, wraps asynchronous work in a future, checks the executor kind, and calls the matching private handler. The output is either a boxed tool result or an error the tool framework can report.
 
-**Call relations**: The extension runtime invokes this for every goal tool call. It delegates all substantive work to the per-operation handlers based on the executor kind.
+**Call relations**: The tool framework calls this when a user or model invokes the tool. From here, the flow branches to `GoalToolExecutor::handle_get`, `GoalToolExecutor::handle_create`, or `GoalToolExecutor::handle_update`.
 
 *Call graph*: calls 3 internal fn (handle_create, handle_get, handle_update); 1 external calls (pin).
 
@@ -4908,11 +4974,11 @@ async fn handle_get(
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes `get_goal` by validating the empty argument object and reading the current persisted goal for the thread. It returns the goal in the standard structured response shape without completion-report text.
+**Purpose**: Reads the current goal for the thread and returns it as a tool response. This is the simplest goal action: it does not change stored state.
 
-**Data flow**: It reads the invocation arguments via `function_arguments()` only to validate parseability, fetches the thread goal from `state_db.thread_goals()`, maps any stored goal through `protocol_goal_from_state`, converts storage errors into `RespondToModel`, and passes the optional protocol goal to `goal_response` with `CompletionBudgetReport::Omit`.
+**Data flow**: It receives the tool call, extracts its argument text to catch malformed calls, reads the thread’s goal from the state database, converts any stored goal into the public protocol shape, and packages it as JSON. If the database read fails, it returns a message meant for the model.
 
-**Call relations**: It is reached only from `handle` when `kind` is `Get`. It delegates response serialization to `goal_response` and state/protocol conversion to `protocol_goal_from_state`.
+**Call relations**: `GoalToolExecutor::handle` calls this for get-goal invocations. It hands the final formatting to `goal_response`, so all goal tools return the same response shape.
 
 *Call graph*: calls 1 internal fn (goal_response); called by 1 (handle); 1 external calls (function_arguments).
 
@@ -4926,11 +4992,11 @@ async fn handle_create(
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes `create_goal`, enforcing objective and budget validation, creating a new active goal in persistent state, and initializing per-turn accounting and observability side effects. It also fills an empty thread preview from the objective when possible.
+**Purpose**: Creates a new active goal for the thread, after checking that the request is valid and that there is not already an unfinished goal. It also starts the supporting bookkeeping that makes the goal visible and measurable.
 
-**Data flow**: It parses JSON arguments into `CreateGoalRequest`, trims `objective`, validates the objective text and optional positive `token_budget`, inserts a new active goal into `state_db`, converts insertion/storage failures into model-facing errors, rejects creation when an unfinished goal already exists, attempts `fill_empty_thread_preview_if_possible`, marks the current turn's active goal in `accounting_state`, records metrics and analytics, converts the stored goal to protocol form, emits a goal-updated event, and returns a boxed JSON tool output via `goal_response`.
+**Data flow**: It reads JSON arguments from the tool call, turns them into a `CreateGoalRequest`, trims and validates the objective, checks that any token budget is positive, then inserts an active goal into the state database. After a successful insert, it may set the thread preview, marks the current turn as working on that goal, records metrics and analytics, emits a goal-updated event, and returns the new goal as JSON.
 
-**Call relations**: It is called from `handle` for `GoalToolKind::Create`. It delegates parsing to `parse_arguments`, validation to `validate_thread_goal_objective` and `validate_goal_budget`, persistence to `state_db.thread_goals().insert_thread_goal`, event emission to `emit_goal_updated_from_tool_call`, and response shaping to `goal_response`.
+**Call relations**: `GoalToolExecutor::handle` calls this for create-goal invocations. It uses helper functions such as `parse_arguments`, `validate_goal_budget`, `fill_empty_thread_preview_if_possible`, `protocol_goal_from_state`, `emit_goal_updated_from_tool_call`, and `goal_response` to keep validation, conversion, notification, and formatting separate.
 
 *Call graph*: calls 9 internal fn (created, record_created, emit_goal_updated_from_tool_call, fill_empty_thread_preview_if_possible, goal_response, parse_arguments, protocol_goal_from_state, validate_goal_budget, validate_thread_goal_objective); called by 1 (handle); 2 external calls (function_arguments, Turn).
 
@@ -4944,11 +5010,11 @@ async fn handle_update(
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Executes `update_goal` for terminal transitions to `complete` or `blocked`, first flushing any unaccounted progress from the active turn and then updating persisted status. It rejects all non-terminal statuses because pause/resume and limit transitions are controlled elsewhere.
+**Purpose**: Marks the current goal complete or blocked, while making sure progress from the active turn is counted first. It deliberately refuses other status changes because those are controlled by the user or the system, not this tool.
 
-**Data flow**: It parses `UpdateGoalArgs`, checks that `status` is only `Complete` or `Blocked`, calls `account_active_goal_progress` with a mode chosen to preserve the intended terminal semantics, reads the previous goal status for metrics, updates the persisted goal status through `state_db.thread_goals().update_thread_goal`, maps storage failures or missing-goal cases to `RespondToModel`, records terminal metrics and analytics, converts the updated goal to protocol form, clears the current-turn goal marker in `accounting_state`, emits a goal-updated event, and returns `goal_response`, including a completion budget report only for `Complete`.
+**Data flow**: It parses the requested status from JSON. If the status is not complete or blocked, it returns a clear error. Otherwise it accounts for current turn progress, reads the previous status for metrics, updates the stored goal status, records terminal-status metrics and analytics, converts the stored goal to the public shape, clears the current turn’s active goal, emits an update event, and returns the result. If the new status is complete, the response may include guidance for reporting final budget usage.
 
-**Call relations**: It is reached from `handle` when `kind` is `Update`. It depends on `account_active_goal_progress` to avoid losing final usage, on `current_goal_status_for_metrics` and metrics/analytics methods for observability, on `state_status_from_protocol` for persistence, and on `emit_goal_updated_from_tool_call`/`goal_response` for outward effects.
+**Call relations**: `GoalToolExecutor::handle` calls this for update-goal invocations. It relies on `account_active_goal_progress` before the database status update so time and token usage are captured before the goal leaves its active state.
 
 *Call graph*: calls 9 internal fn (status_changed, record_terminal_if_status_changed, account_active_goal_progress, current_goal_status_for_metrics, emit_goal_updated_from_tool_call, goal_response, parse_arguments, protocol_goal_from_state, state_status_from_protocol); called by 1 (handle); 5 external calls (function_arguments, Turn, matches!, RespondToModel, unreachable!).
 
@@ -4964,11 +5030,11 @@ fn emit_goal_updated_from_tool_call(
     )
 ```
 
-**Purpose**: Emits a `thread_goal_updated` event tied to a specific tool call. It centralizes the event payload shape used by create and update handlers.
+**Purpose**: Sends a user-visible event saying that a goal changed because of a tool call. This keeps the rest of the system informed after create or update operations.
 
-**Data flow**: It takes the original `ToolCall`, an optional `turn_id`, and a protocol `ThreadGoal`, then forwards `invocation.call_id.clone()`, the turn id, and the goal to `event_emitter.thread_goal_updated`.
+**Data flow**: It receives the original tool call, an optional turn id, and the updated public goal. It takes the call id from the invocation and passes all of that to the event emitter.
 
-**Call relations**: It is called after successful create and update operations. Those callers use it so tool-originated goal mutations produce consistent event IDs and payloads.
+**Call relations**: `GoalToolExecutor::handle_create` and `GoalToolExecutor::handle_update` call this after they have changed the goal. It is the small bridge from the tool logic to the event system.
 
 *Call graph*: calls 1 internal fn (thread_goal_updated); called by 2 (handle_create, handle_update).
 
@@ -4983,11 +5049,11 @@ async fn account_active_goal_progress(
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
 ```
 
-**Purpose**: Flushes accumulated token/time progress for the current turn into persistent goal state, with concurrency protection and stale-goal checks. It is the mechanism that prevents final progress from being lost before a status change or other stop condition.
+**Purpose**: Records time and token progress for the currently active goal before a status change. This prevents usage from being lost when a goal is completed, blocked, or otherwise affected by accounting.
 
-**Data flow**: It takes an accounting mode, event id, and budget-limited disposition; reads the current turn id from `accounting_state`; acquires a progress-accounting permit; reads a progress snapshot for that turn; fetches the previous persisted goal status filtered by the snapshot's expected goal id; calls `state_db.thread_goals().account_thread_goal_usage` with time/token deltas and expected goal id; on `Updated(goal)` records terminal metrics if status changed, emits analytics for usage and status change, marks the snapshot accounted in `accounting_state`, converts the goal to protocol form, emits a `thread_goal_updated` event using the supplied event id and turn id, and returns `Some(goal)`; on `Unchanged(_)` it returns `None`.
+**Data flow**: It first checks whether there is a current turn; if not, it returns no goal. It then takes an accounting permit, which is like a lock that prevents overlapping progress updates, and reads a snapshot of time and token changes for that turn. It writes those deltas to the state database, updates metrics and analytics if the stored goal changed, tells the accounting state what was recorded, emits an event, and returns the updated public goal when there is one.
 
-**Call relations**: It is invoked by `handle_update` before terminal status changes. Internally it coordinates `current_goal_status_for_metrics`, persistence-layer accounting, analytics, metrics, accounting-state bookkeeping, and event emission so callers can safely mutate status afterward.
+**Call relations**: `GoalToolExecutor::handle_update` calls this before marking a goal complete or blocked. Inside, it uses `current_goal_status_for_metrics` and `protocol_goal_from_state`, then notifies analytics, metrics, accounting state, and the event emitter so all observers see the same progress update.
 
 *Call graph*: calls 6 internal fn (status_changed, usage_accounted, thread_goal_updated, record_terminal_if_status_changed, current_goal_status_for_metrics, protocol_goal_from_state); called by 1 (handle_update); 1 external calls (Turn).
 
@@ -5001,11 +5067,11 @@ async fn current_goal_status_for_metrics(
     ) -> Result<Option<codex_state::ThreadGoalStatus>, FunctionCallError>
 ```
 
-**Purpose**: Reads the current persisted goal status, optionally only if it matches an expected goal id. It exists to avoid recording metrics against a stale or replaced goal.
+**Purpose**: Looks up the current stored goal status so metrics can tell whether a later operation actually changed it. This avoids counting the same terminal transition twice.
 
-**Data flow**: It takes an optional expected goal id, fetches the current thread goal from storage, maps storage errors to `RespondToModel`, and returns `Some(status)` only when a goal exists and either no expected id was supplied or the stored goal id matches it.
+**Data flow**: It reads the current thread goal from the state database. If an expected goal id was supplied, it only returns the status when the stored goal matches that id; otherwise it returns the status of whatever goal exists. Database read errors become tool-call errors.
 
-**Call relations**: It is used by `handle_update` and `account_active_goal_progress` before recording status-change metrics. Those callers rely on the expected-id filter to suppress misleading metrics when the active goal has changed.
+**Call relations**: `GoalToolExecutor::account_active_goal_progress` uses this before accounting usage, and `GoalToolExecutor::handle_update` uses it before updating status. The returned old status is then compared with the new stored goal for metric recording.
 
 *Call graph*: called by 2 (account_active_goal_progress, handle_update).
 
@@ -5016,11 +5082,11 @@ async fn current_goal_status_for_metrics(
 fn parse_arguments(arguments: &str) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Deserializes raw JSON tool arguments into a typed request struct and converts parse failures into model-facing function-call errors. It is the common argument parser for create and update.
+**Purpose**: Turns the raw JSON argument string from a tool call into a typed Rust request object. It gives the caller a clean value instead of making each handler parse JSON by hand.
 
-**Data flow**: It takes an argument string, calls `serde_json::from_str` for generic `T: Deserialize`, returns the parsed value on success, and wraps any JSON error as `FunctionCallError::RespondToModel`.
+**Data flow**: It receives a string containing JSON. It asks the JSON library to deserialize that string into the requested type, returning the typed value on success or a model-facing error message on failure.
 
-**Call relations**: It is called by `handle_create` and `handle_update` immediately after extracting invocation arguments. Those handlers then perform semantic validation on the typed result.
+**Call relations**: `GoalToolExecutor::handle_create` uses this to read create-goal arguments, and `GoalToolExecutor::handle_update` uses it to read update-goal arguments. It centralizes argument parsing for the tool handlers.
 
 *Call graph*: called by 2 (handle_create, handle_update); 1 external calls (from_str).
 
@@ -5031,11 +5097,11 @@ fn parse_arguments(arguments: &str) -> Result<T, FunctionCallError>
 fn validate_goal_budget(value: Option<i64>) -> Result<(), String>
 ```
 
-**Purpose**: Enforces that an optional goal token budget, when present, is strictly positive. It is a small semantic validator shared with non-tool goal-setting paths.
+**Purpose**: Checks that an optional goal token budget is sensible. If a budget is provided, it must be greater than zero.
 
-**Data flow**: It takes `Option<i64>`, checks whether a present value is `<= 0`, returns an error string in that case, and otherwise returns `Ok(())` without mutating state.
+**Data flow**: It receives either no budget or a number. No budget passes. A positive number passes. Zero or a negative number returns an error message explaining that goal budgets must be positive.
 
-**Call relations**: It is used by `handle_create` and also by the service-side goal-setting path outside this file. Callers run it after parsing but before persistence.
+**Call relations**: `GoalToolExecutor::handle_create` calls this before inserting a goal, and another goal-setting path named `set_thread_goal` also uses it. This keeps the same budget rule in more than one entry point.
 
 *Call graph*: called by 2 (set_thread_goal, handle_create).
 
@@ -5049,11 +5115,11 @@ fn goal_response(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Builds the boxed JSON tool output returned by all goal tool handlers. It standardizes serialization of the optional goal, remaining tokens, and completion-report hint.
+**Purpose**: Builds the JSON tool output returned by all goal tool actions. This gives get, create, and update a consistent response format.
 
-**Data flow**: It takes an optional protocol `ThreadGoal` and a `CompletionBudgetReport` mode, constructs a `GoalToolResponse` via `GoalToolResponse::new`, serializes it with `serde_json::to_value`, converts serialization failures into fatal errors, wraps the JSON value in `JsonToolOutput`, boxes it as `dyn ToolOutput`, and returns it.
+**Data flow**: It receives an optional public goal and a choice about whether to include a completion budget report. It builds a `GoalToolResponse`, converts it to a JSON value, wraps it as a tool output, and returns it. If serialization unexpectedly fails, it returns a fatal error.
 
-**Call relations**: It is the final step in `handle_get`, `handle_create`, and `handle_update`. It delegates response-field computation to `GoalToolResponse::new` and output boxing to the extension API's JSON output type.
+**Call relations**: `GoalToolExecutor::handle_get`, `GoalToolExecutor::handle_create`, and `GoalToolExecutor::handle_update` all call this at the end of their work. It delegates response-field calculation to `GoalToolResponse::new`.
 
 *Call graph*: calls 2 internal fn (new, new); called by 3 (handle_create, handle_get, handle_update); 2 external calls (new, to_value).
 
@@ -5064,11 +5130,11 @@ fn goal_response(
 fn new(goal: Option<ThreadGoal>, report_mode: CompletionBudgetReport) -> Self
 ```
 
-**Purpose**: Computes the structured response fields derived from an optional goal and the caller's reporting mode. It adds convenience fields not stored directly in the goal record.
+**Purpose**: Assembles the structured response body for a goal tool call. It adds helpful derived fields, such as how many budgeted tokens remain.
 
-**Data flow**: It takes `Option<ThreadGoal>` and a `CompletionBudgetReport`, computes `remaining_tokens` from `goal.token_budget - goal.tokens_used` clamped at zero when a budget exists, computes `completion_budget_report` only when report mode is `Include` and the goal status is `Complete`, and returns a populated `GoalToolResponse` containing the original goal.
+**Data flow**: It receives an optional goal and a report mode. If the goal has a token budget, it subtracts used tokens from the budget and never lets the remaining count go below zero. If report mode asks for it and the goal is complete, it may add a short instruction telling the caller to report final usage from the structured fields.
 
-**Call relations**: It is called only by `goal_response`. That caller relies on it to encapsulate all response-shaping logic in one place.
+**Call relations**: `goal_response` calls this just before converting the response to JSON. It is the place where raw goal data becomes the friendlier response shape returned to tool callers.
 
 *Call graph*: called by 1 (goal_response).
 
@@ -5083,11 +5149,11 @@ async fn fill_empty_thread_preview_if_possible(
 )
 ```
 
-**Purpose**: Attempts to populate an empty thread preview with the newly created goal objective, without failing the tool call if preview persistence fails. It is a best-effort UX enhancement.
+**Purpose**: Uses a new goal’s objective as the thread preview, but only if the preview is currently empty. This gives a thread a useful label without overwriting an existing one.
 
-**Data flow**: It takes a `StateRuntime`, `ThreadId`, and stored `codex_state::ThreadGoal`, calls `set_thread_preview_if_empty(thread_id, goal.objective.as_str())`, and on error logs a warning instead of returning an error.
+**Data flow**: It receives the state database, thread id, and stored goal. It asks the database to set the thread preview to the goal objective if no preview exists. If that best-effort update fails, it logs a warning and does not stop the goal creation flow.
 
-**Call relations**: It is called after successful goal creation here and also from service-side goal setting. Its callers use it opportunistically so preview metadata follows the first goal objective when no preview already exists.
+**Call relations**: `GoalToolExecutor::handle_create` calls this after inserting a goal, and another path named `set_thread_goal` also uses it. It is intentionally non-blocking for the main goal operation: preview failure should not mean goal failure.
 
 *Call graph*: called by 2 (set_thread_goal, handle_create); 2 external calls (set_thread_preview_if_empty, warn!).
 
@@ -5098,11 +5164,11 @@ async fn fill_empty_thread_preview_if_possible(
 fn protocol_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal
 ```
 
-**Purpose**: Converts a persisted `codex_state::ThreadGoal` into the protocol-layer `ThreadGoal` returned to tools and events. It is the canonical state-to-protocol mapping for goals.
+**Purpose**: Converts the database version of a goal into the public protocol version sent through tool responses and events. This keeps storage details separate from what outside callers see.
 
-**Data flow**: It takes ownership of a stored goal, copies thread/objective/budget/usage fields, converts status through `protocol_status_from_state`, converts `created_at` and `updated_at` timestamps to Unix seconds, and returns the protocol struct.
+**Data flow**: It receives a `codex_state::ThreadGoal` from storage. It copies over the public fields, converts the status through `protocol_status_from_state`, turns timestamps into Unix seconds, and returns a `codex_protocol::protocol::ThreadGoal`.
 
-**Call relations**: It is used broadly by tool handlers and runtime/service paths whenever a stored goal must be exposed externally. Those callers rely on it for consistent status and timestamp translation.
+**Call relations**: Many goal flows use this whenever stored data must leave the state layer, including tool creation, progress accounting, external goal setting, idle accounting, continuation checks, and active-goal stopping. In this file, the handlers use it before emitting events or returning JSON.
 
 *Call graph*: calls 1 internal fn (protocol_status_from_state); called by 9 (set_thread_goal, account_active_goal_progress, account_idle_goal_progress, apply_external_goal_set, continue_if_idle, stop_active_goal_for_turn, account_active_goal_progress, handle_create, handle_update).
 
@@ -5113,11 +5179,11 @@ fn protocol_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal
 fn protocol_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus
 ```
 
-**Purpose**: Maps each persisted goal status enum variant to its protocol equivalent. It is a direct one-to-one translation helper.
+**Purpose**: Translates a stored goal status into the matching public protocol status. It is a small compatibility bridge between the database layer and the API layer.
 
-**Data flow**: It takes a `codex_state::ThreadGoalStatus`, matches every variant, and returns the corresponding `codex_protocol::protocol::ThreadGoalStatus`.
+**Data flow**: It receives one stored status value, matches it to the equivalent protocol status value, and returns that protocol value.
 
-**Call relations**: It is called only by `protocol_goal_from_state`. That wrapper uses it to keep status conversion isolated from field-copying logic.
+**Call relations**: `protocol_goal_from_state` calls this while converting a whole goal. Keeping the status mapping in one place makes the full goal conversion simpler and safer.
 
 *Call graph*: called by 1 (protocol_goal_from_state).
 
@@ -5130,11 +5196,11 @@ fn state_status_from_protocol(
 ) -> codex_state::ThreadGoalStatus
 ```
 
-**Purpose**: Maps protocol goal statuses back into the persistence-layer enum. It is the inverse translation used when tool input drives a state update.
+**Purpose**: Translates a public protocol goal status into the matching database status. This is needed when a tool request asks to change stored state.
 
-**Data flow**: It takes a protocol `ThreadGoalStatus`, matches every variant, and returns the corresponding `codex_state::ThreadGoalStatus`.
+**Data flow**: It receives a protocol status from the incoming request, maps it to the equivalent `codex_state` status, and returns the stored form.
 
-**Call relations**: It is used by `handle_update` before calling the persistence layer. That caller validates allowed statuses first, then uses this helper for the actual update payload.
+**Call relations**: `GoalToolExecutor::handle_update` calls this after it has already checked that the requested status is allowed. The converted value is then passed to the state database update call.
 
 *Call graph*: called by 1 (handle_update).
 
@@ -5145,11 +5211,11 @@ fn state_status_from_protocol(
 fn completion_budget_report(goal: &ThreadGoal) -> Option<String>
 ```
 
-**Purpose**: Generates the optional natural-language instruction telling the model to report final token/time usage after a completed goal. It is omitted when there is nothing meaningful to report.
+**Purpose**: Decides whether a completed-goal response should include a reminder to report final usage. The reminder tells the caller to use the structured goal fields instead of inventing numbers.
 
-**Data flow**: It reads a completed protocol `ThreadGoal`, returns `None` when both `token_budget` is absent and `time_used_seconds <= 0`, otherwise returns a fixed explanatory string describing which structured fields to summarize.
+**Data flow**: It receives a public goal. If there is no token budget and no recorded time, it returns nothing. Otherwise it returns a fixed instruction string explaining how to summarize token use and elapsed time from the response fields.
 
-**Call relations**: It is used indirectly by `GoalToolResponse::new` when completion reporting is enabled. That caller filters to completed goals before invoking it.
+**Call relations**: `GoalToolResponse::new` uses this when a goal has just been completed and the response mode asks for a completion report. It only affects the extra guidance text; it does not change the stored goal.
 
 
 ### Memories namespace and workspace support
@@ -5157,20 +5223,28 @@ This group covers the memories extension from crate entry through local backend 
 
 ### `ext/memories/src/lib.rs`
 
-`config` · `cross-cutting`
+`config` · `startup and cross-cutting`
 
-This root file organizes the memories extension into backend, extension wiring, local storage/access, metrics, prompt generation, schema definitions, and tool implementations. Its only public export is `extension::install`, keeping the integration surface narrow while internal modules remain crate-private. The rest of the file defines the constants that shape memory-tool behavior across the crate. It sets default and maximum result counts for listing (`DEFAULT_LIST_MAX_RESULTS` and `MAX_LIST_RESULTS`, both 2,000) and searching (`DEFAULT_SEARCH_MAX_RESULTS` and `MAX_SEARCH_RESULTS`, both 200), a default token ceiling for reads (`DEFAULT_READ_MAX_TOKENS` at 20,000), and a separate summary token limit used for developer instructions (`MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT` at 2,500). It also establishes the namespace and tool names: `MEMORY_TOOLS_NAMESPACE` is `"memories"`, with individual tools `add_ad_hoc_note`, `list`, `read`, and `search`. These constants are the key behavioral contract from this file: they encode hard caps and canonical identifiers that downstream modules should honor consistently. A test module is conditionally included under `#[cfg(test)]`, indicating this root also anchors crate-local tests without exposing them publicly.
+This file is like the label and control panel for the memories feature. The feature itself is split across several internal modules: storage backends, extension setup, local behavior, metrics, prompts, schema definitions, and tool implementations. This file gathers those pieces under one Rust library module so the rest of the project can treat “memories” as one extension rather than many loose files.
+
+Its one public export is `install`, which comes from the extension module. That is likely the function other parts of the system call when they want to add the memories extension to the larger application.
+
+The file also defines shared constants that keep the feature predictable. For example, listing memories is capped at 2,000 results, searching is capped at 200 results, and reading memory content has a token limit. A token is a small chunk of text used by language models, so these limits help stop memory operations from becoming too large, slow, or expensive. It also defines the public tool namespace and tool names, such as `memories.list`, `memories.read`, and `memories.search` in practical terms.
+
+Without this file, the memories extension would lack a clear entry point and shared vocabulary. Different modules might invent different limits or names, making the feature harder to connect and easier to break.
 
 
 ### `ext/memories/src/local/ad_hoc_note.rs`
 
 `domain_logic` · `request handling`
 
-This module implements note creation under `extensions/ad_hoc/notes` beneath the backend root. The top-level `add_ad_hoc_note` function first validates the requested filename and rejects notes whose trimmed content is empty. It then ensures the nested notes directory exists, opens the target file with `create_new(true)` so existing notes are never overwritten, maps `AlreadyExists` into the dedicated `AdHocNoteAlreadyExists` error, and writes the note bytes directly.
+This file is the local-file version of “add an ad hoc memory note.” An ad hoc note is a small standalone note, saved as a `.md` file, rather than a structured memory item. Without this code, callers could not reliably add these notes to disk, and unsafe or messy filenames could create confusing files or point outside the intended layout.
 
-Directory creation is intentionally defensive. `ensure_notes_dir` walks from the backend root through each fixed path component, calling `ensure_directory` at every step. `ensure_directory` checks existing metadata with `symlink_metadata`, rejects symlinks, verifies that existing paths are directories, and if absent creates the directory asynchronously before re-reading metadata to confirm the final path now exists and is still a real directory. That post-create verification closes the gap between creation and later use.
+The flow is simple. First, the requested filename is checked against a strict pattern: it must look like `YYYY-MM-DDTHH-MM-SS-<slug>.md`. The timestamp makes notes sort naturally by time, and the slug is the human-readable part. The slug is limited to lowercase letters, digits, and hyphens, which keeps filenames predictable across systems.
 
-Filename validation is strict and byte-oriented. Names must be at most 128 bytes, end in `.md`, and follow `YYYY-MM-DDTHH-MM-SS-<slug>.md`. The timestamp prefix is checked structurally rather than semantically: exact separator positions plus digit-only date/time fields. The slug must be 1–80 bytes and contain only lowercase ASCII letters, digits, or hyphens. Any violation is reported with a precise `InvalidFilename` reason.
+Next, the note text is checked so blank notes are rejected. Then the file makes sure the storage path exists: the backend root, then `extensions/ad_hoc/notes` under it. Each directory is checked carefully. If something already exists there, it must really be a directory, and it must not be a symbolic link, which is a filesystem shortcut that could redirect writes somewhere unexpected.
+
+Finally, the note is written using “create new” mode. That is like putting a note into an empty mailbox only if nobody has used that exact slot before: if the file already exists, the operation fails instead of overwriting it.
 
 #### Function details
 
@@ -5183,11 +5257,11 @@ async fn add_ad_hoc_note(
 ) -> Result<AddAdHocMemoryNoteResponse, MemoriesBackendError>
 ```
 
-**Purpose**: Validates an ad-hoc note request, ensures the destination directory tree exists, and writes a new markdown file exactly once. It is the concrete implementation behind the backend’s note-creation API.
+**Purpose**: Adds a new ad hoc memory note to the local filesystem. It is the main entry point in this file: it checks that the request is safe and meaningful, creates the note folder if needed, and writes the note without overwriting an existing file.
 
-**Data flow**: Consumes `backend` and `AddAdHocMemoryNoteRequest { filename, note }`. It calls `validate_filename(&request.filename)`, rejects whitespace-only notes with `EmptyAdHocNote`, awaits `ensure_notes_dir(backend)` to get the target directory, joins the filename onto that path, opens the file with `OpenOptions::new().write(true).create_new(true)`, maps `AlreadyExists` to `AdHocNoteAlreadyExists`, writes `request.note.as_bytes()` into the file, and returns an empty `AddAdHocMemoryNoteResponse`.
+**Data flow**: It receives a local backend, which contains the root storage folder, and a request containing a filename and note text. It first validates the filename, rejects note text that is only whitespace, asks for the notes directory to be prepared, then writes the note bytes to a newly created file. It returns an empty success response if the write worked, or a clear memory backend error if validation fails, the file already exists, or the filesystem reports a problem.
 
-**Call relations**: Called by `LocalMemoriesBackend::add_ad_hoc_note` as the local backend’s write implementation. It delegates directory preparation to `ensure_notes_dir` and filename policy enforcement to `validate_filename` before performing the actual file creation.
+**Call relations**: This is called when the local memories backend is asked to add an ad hoc note. It relies on `validate_filename` before touching disk, then on `ensure_notes_dir` to prepare the folder, and finally uses the standard file-opening machinery to create the note safely.
 
 *Call graph*: calls 2 internal fn (ensure_notes_dir, validate_filename); called by 1 (add_ad_hoc_note); 1 external calls (new).
 
@@ -5200,11 +5274,11 @@ async fn ensure_notes_dir(
 ) -> Result<std::path::PathBuf, MemoriesBackendError>
 ```
 
-**Purpose**: Creates or verifies the fixed `extensions/ad_hoc/notes` directory chain under the backend root. It guarantees the returned path is a real directory tree, not a file or symlink.
+**Purpose**: Makes sure the folder for ad hoc notes exists under the backend’s root directory. It builds the expected path one piece at a time so every level is checked before the note file is created.
 
-**Data flow**: Reads `backend.root`, first calls `ensure_directory(&backend.root)`, then clones the root into a mutable `PathBuf` and pushes each component from `AD_HOC_NOTES_DIR`, calling `ensure_directory(&path)` after each push. It returns the final notes directory path.
+**Data flow**: It receives the local backend and reads its root path. Starting from that root, it ensures the root exists, then appends `extensions`, `ad_hoc`, and `notes`, checking or creating each directory along the way. It returns the final notes folder path, or an error if any path component is unsafe or not a directory.
 
-**Call relations**: Used only by `add_ad_hoc_note` before file creation. It delegates each step’s existence/type check to `ensure_directory` so every intermediate directory is validated.
+**Call relations**: `add_ad_hoc_note` calls this after the request itself has passed validation. This function delegates each actual filesystem check or creation step to `ensure_directory`, so the same safety rules are applied at every level of the folder tree.
 
 *Call graph*: calls 1 internal fn (ensure_directory); called by 1 (add_ad_hoc_note).
 
@@ -5215,11 +5289,11 @@ async fn ensure_notes_dir(
 async fn ensure_directory(path: &Path) -> Result<(), MemoriesBackendError>
 ```
 
-**Purpose**: Ensures a given filesystem path exists as a directory and is not a symlink. It handles both pre-existing paths and paths that must be created.
+**Purpose**: Ensures that one specific path exists and is a real directory, not a file or symbolic link. This prevents note storage from being redirected or blocked by an unexpected filesystem item.
 
-**Data flow**: Accepts `&Path`, awaits `LocalMemoriesBackend::metadata_or_none(path)`, and branches: if metadata exists, it calls `reject_symlink`, returns success if `metadata.is_dir()`, otherwise returns `invalid_path(..., "must be a directory")`; if metadata is absent, it creates the directory with `tokio::fs::create_dir(path)`. After creation it re-reads metadata, errors with `NotFound` if still absent, rejects symlinks again, verifies `is_dir`, and returns `Ok(())`.
+**Data flow**: It receives a path. It asks the backend for metadata, meaning information about what exists at that path. If something exists, it rejects symbolic links and accepts only directories. If nothing exists, it creates the directory, then checks again that the created item really exists, is not a symbolic link, and is a directory. It returns success when the path is safe to use, or an error explaining what went wrong.
 
-**Call relations**: Called repeatedly by `ensure_notes_dir` for the backend root and each fixed subdirectory component. It relies on shared metadata and symlink helpers so note creation obeys the same filesystem safety rules as read/list/search paths.
+**Call relations**: `ensure_notes_dir` calls this for the backend root and for each folder below it. It uses `LocalMemoriesBackend::metadata_or_none` to inspect paths, `reject_symlink` to block redirecting filesystem shortcuts, and `tokio::fs::create_dir` to create missing directories without blocking the async runtime.
 
 *Call graph*: calls 3 internal fn (invalid_path, metadata_or_none, reject_symlink); called by 1 (ensure_notes_dir); 2 external calls (display, create_dir).
 
@@ -5230,11 +5304,11 @@ async fn ensure_directory(path: &Path) -> Result<(), MemoriesBackendError>
 fn validate_filename(filename: &str) -> Result<(), MemoriesBackendError>
 ```
 
-**Purpose**: Checks that an ad-hoc note filename matches the subsystem’s markdown timestamp-and-slug naming convention. It rejects malformed names with specific reasons.
+**Purpose**: Checks that a requested note filename follows the project’s safe, predictable naming rules. This keeps ad hoc notes organized and prevents odd filenames from sneaking into the storage folder.
 
-**Data flow**: Reads `filename: &str` and performs sequential validation: maximum byte length, `.md` suffix, presence of a slug after the fixed timestamp prefix length, structural timestamp validation via `has_valid_timestamp_prefix`, slug length bounds, and slug character whitelist. On the first failure it returns `MemoriesBackendError::invalid_filename(filename, reason)`; otherwise it returns `Ok(())`.
+**Data flow**: It receives the filename text. It checks the total byte length, confirms the `.md` ending, separates the timestamp-and-slug stem from the extension, verifies the timestamp-shaped prefix, then checks that the slug is present, short enough, and made only of lowercase ASCII letters, digits, or hyphens. It returns success if all rules pass, or a filename error with a human-readable reason if any rule fails.
 
-**Call relations**: Called at the start of `add_ad_hoc_note` before any filesystem work occurs. It delegates timestamp-shape checking to `has_valid_timestamp_prefix` and uses the backend error helper to produce consistent validation failures.
+**Call relations**: `add_ad_hoc_note` calls this before it creates directories or writes a file. For the timestamp portion, it hands the detailed shape check to `has_valid_timestamp_prefix`, keeping the filename rules split into smaller pieces.
 
 *Call graph*: calls 2 internal fn (invalid_filename, has_valid_timestamp_prefix); called by 1 (add_ad_hoc_note).
 
@@ -5245,11 +5319,11 @@ fn validate_filename(filename: &str) -> Result<(), MemoriesBackendError>
 fn has_valid_timestamp_prefix(stem: &str) -> bool
 ```
 
-**Purpose**: Verifies that a filename stem begins with the expected `YYYY-MM-DDTHH-MM-SS-` pattern. It checks separator placement and digit-only numeric fields, but not calendar validity.
+**Purpose**: Checks whether the start of a filename stem looks like the required timestamp format. It verifies the positions of separators such as `-` and `T`, and confirms that the date and time fields are made of digits.
 
-**Data flow**: Takes `stem: &str`, converts it to bytes, checks minimum length, verifies literal separators at fixed indices, and calls `are_digits` on each numeric slice for year, month, day, hour, minute, and second. It returns `true` only if all structural checks pass.
+**Data flow**: It receives the filename stem, meaning the filename without `.md`. It looks at the raw bytes and checks that the expected separator characters are in the right places, and that each number group is all digits. It returns `true` if the prefix has the required shape, or `false` otherwise. It does not check whether the date is a real calendar date; it only checks the format.
 
-**Call relations**: Used by `validate_filename` after stripping the `.md` suffix. It isolates the timestamp-prefix shape test so filename validation logic stays readable.
+**Call relations**: `validate_filename` calls this when deciding whether a filename follows `YYYY-MM-DDTHH-MM-SS-<slug>.md`. This function calls `are_digits` for each numeric slice so the digit test is shared and easy to read.
 
 *Call graph*: calls 1 internal fn (are_digits); called by 1 (validate_filename).
 
@@ -5260,11 +5334,11 @@ fn has_valid_timestamp_prefix(stem: &str) -> bool
 fn are_digits(bytes: &[u8]) -> bool
 ```
 
-**Purpose**: Tests whether every byte in a slice is an ASCII digit. It is the low-level helper used by timestamp validation.
+**Purpose**: Checks whether every byte in a small slice is an ASCII digit from `0` to `9`. It is a tiny helper used to make the timestamp-format check clearer.
 
-**Data flow**: Reads a byte slice and returns the result of `bytes.iter().all(u8::is_ascii_digit)`. It has no side effects.
+**Data flow**: It receives a slice of bytes. It tests each byte to see whether it is an ASCII digit. It returns `true` only if all bytes pass that test; otherwise it returns `false`.
 
-**Call relations**: Called only by `has_valid_timestamp_prefix` for each numeric segment of the timestamp prefix.
+**Call relations**: `has_valid_timestamp_prefix` calls this repeatedly for the year, month, day, hour, minute, and second parts of the filename prefix. It does not call other project code; it is just the small reusable digit check inside the filename validation flow.
 
 *Call graph*: called by 1 (has_valid_timestamp_prefix).
 
@@ -5273,11 +5347,13 @@ fn are_digits(bytes: &[u8]) -> bool
 
 `domain_logic` · `request handling`
 
-This module provides the local implementation of the backend’s `list` operation. It begins by clamping the caller’s `max_results` to the global `MAX_LIST_RESULTS`, resolving the optional requested path through `resolve_scoped_path`, and parsing the optional cursor as a zero-based start index. Invalid cursor strings become `InvalidCursor`, while a syntactically valid path that does not exist becomes `NotFound`.
+This file answers the question: “What memories are under this local path?” A memory here is represented by a file or directory on disk. Without this code, the local memories backend could not browse its stored content safely or return long directory listings in smaller pages.
 
-Once the start path exists, the function rejects symlinks at the root of the listing target. If the target is a file, the response contains exactly one `MemoryEntry` describing that file relative to the backend root. If the target is a directory, it reads entries in sorted path order, skips hidden names and symlinks, and includes only regular files and directories. Other filesystem object types are silently ignored. Relative path strings are normalized through `display_relative_path`, so callers never see absolute host paths.
+The main function first limits how many results can be returned, so a huge folder cannot produce an oversized response. It then converts the requested path into a path inside the backend’s allowed root folder. This matters because callers should not be able to escape into unrelated parts of the computer’s filesystem.
 
-Pagination is applied after the full visible entry list is assembled. A cursor larger than the number of collected entries is rejected as out of range. Otherwise the function computes an end index with saturating arithmetic, drains the requested slice into the response, and sets `next_cursor` plus `truncated` when more entries remain. The returned `path` echoes the original request path rather than the resolved absolute path.
+If the caller supplied a cursor, the function treats it as the starting position in the result list. A cursor is like a bookmark in a long list: “continue from item 50.” Bad cursors are rejected with a clear error.
+
+Next, the function checks what exists at the target path. If it is a file, it returns that one file. If it is a directory, it reads the directory in sorted order, skips hidden paths, skips symbolic links (filesystem shortcuts that could point somewhere unexpected), and includes only normal files and directories. Finally, it slices the list according to the cursor and maximum size, and returns a next cursor if more results remain.
 
 #### Function details
 
@@ -5290,11 +5366,11 @@ async fn list(
 ) -> Result<ListMemoriesResponse, MemoriesBackendError>
 ```
 
-**Purpose**: Lists a file or directory within the scoped memories root, filters out hidden and symlinked entries, and returns a paginated `ListMemoriesResponse`. It is the concrete local implementation of the backend’s listing API.
+**Purpose**: Lists local memory entries at a requested path, while keeping the result safe, predictable, and page-sized. It is used when a caller wants to browse memory files or folders without reading their contents.
 
-**Data flow**: Consumes `backend` and `ListMemoriesRequest { path, cursor, max_results }`. It clamps `max_results`, resolves `path` with `resolve_scoped_path`, parses `cursor` into `start_index` or returns `invalid_cursor`, fetches metadata with `metadata_or_none`, errors with `NotFound` if absent, and rejects symlinks using `display_relative_path` plus `reject_symlink`. If the target is a file, it builds a one-element `entries` vector; if it is a directory, it reads sorted child paths via `read_sorted_dir_paths`, skips hidden paths with `is_hidden_path`, skips missing entries and symlinks, maps directories/files to `MemoryEntryType`, and collects `MemoryEntry` values. It then validates `start_index`, computes `end_index`, `next_cursor`, and `truncated`, drains the selected range, and returns `ListMemoriesResponse { path: request.path, entries, next_cursor, truncated }`.
+**Data flow**: It receives a local backend, which knows the root folder on disk, and a list request containing an optional path, maximum result count, and optional cursor. It resolves the path into the backend’s allowed area, checks that it exists, rejects unsafe symbolic links, and then builds entries from either the single file or the visible children of a directory. It returns a response containing the requested page of entries, the original path, and a next cursor when there are more entries to fetch; if the path is missing or the cursor is invalid, it returns an error instead.
 
-**Call relations**: Called by `LocalMemoriesBackend::list` after the trait method is invoked. It depends on shared path-resolution and metadata helpers from `local.rs` and `local/path.rs` to enforce confinement and visibility rules before assembling the paginated response.
+**Call relations**: This function is the worker behind the local backend’s list operation. During a list request, it asks path helpers to resolve and display paths, read directory contents in a stable order, filter hidden paths, and reject symbolic links. It also relies on backend helpers to read filesystem metadata and uses the shared error type to report problems such as missing paths or unusable cursors.
 
 *Call graph*: calls 7 internal fn (invalid_cursor, metadata_or_none, resolve_scoped_path, display_relative_path, is_hidden_path, read_sorted_dir_paths, reject_symlink); called by 1 (list); 2 external calls (new, vec!).
 
@@ -5303,11 +5379,9 @@ async fn list(
 
 `domain_logic` · `request handling`
 
-This module serves the backend `read` operation. It validates two caller-controlled bounds up front: `line_offset` must be a 1-indexed positive line number, and `max_lines`, when present, must also be positive. It then resolves the requested path under the backend root, verifies the path exists, rejects symlinks, and requires the target to be a regular file rather than a directory.
+This file is the local backend’s read operation for memories: small text files stored on disk. Its job is like a careful librarian fetching a page range from a notebook. Before reading, it checks that the caller asked for a real starting line and did not request zero lines. It then turns the caller’s memory path into a safe path inside the backend’s allowed area, checks whether the file exists, rejects symbolic links, and refuses to read directories. These checks matter because reading arbitrary paths or following links could expose files that are not meant to be part of the memory store.
 
-The file is loaded as UTF-8 text with `tokio::fs::read_to_string`. Content slicing is line-based but implemented in byte offsets derived from `char_indices`, which preserves UTF-8 correctness when locating newline boundaries. `line_start_byte_offset` finds the byte index of the requested starting line and returns `LineOffsetExceedsFileLength` if the file has too few lines. `line_end_byte_offset` computes the exclusive end byte after the requested number of lines, or the end of the file when `max_lines` is absent.
-
-After extracting the requested line window, the function applies token truncation using `truncate_text` and `TruncationPolicy::Tokens`. A `max_tokens` value of zero is treated specially as “use `DEFAULT_READ_MAX_TOKENS`”. The response reports the original requested path and starting line number, returns the possibly truncated content slice, and marks `truncated` if either line-window clipping or token truncation shortened the original available content.
+Once the file is confirmed safe, the file is loaded as text. The code finds the byte position where the requested starting line begins, then finds where the requested maximum number of lines ends, if a limit was provided. It then applies a token limit. A token is a rough unit of text used by language models, so this prevents returning more text than the rest of the system can comfortably use. The response includes the requested path, the starting line number, the text slice, and a flag saying whether anything was left out because of line or token limits.
 
 #### Function details
 
@@ -5320,11 +5394,11 @@ async fn read(
 ) -> Result<ReadMemoryResponse, MemoriesBackendError>
 ```
 
-**Purpose**: Reads a scoped memory file starting at a 1-indexed line offset, optionally limits the number of lines, and token-truncates the returned text. It is the concrete local implementation of the backend read API.
+**Purpose**: Reads part of a local memory file and returns it in a safe, size-limited response. It is used when someone asks the local memories backend to show the contents of a memory starting at a particular line.
 
-**Data flow**: Consumes `backend` and `ReadMemoryRequest { path, line_offset, max_lines, max_tokens }`. It rejects `line_offset == 0` and `max_lines == Some(0)`, resolves the path with `resolve_scoped_path`, fetches metadata via `metadata_or_none`, errors with `NotFound` if absent, rejects symlinks with `reject_symlink`, and errors with `NotFile` if metadata is not a regular file. It reads the full file text with `read_to_string`, computes `start_byte` via `line_start_byte_offset`, computes `end_byte` via `line_end_byte_offset`, slices `content_from_offset`, substitutes `DEFAULT_READ_MAX_TOKENS` when `max_tokens == 0`, truncates with `truncate_text(..., TruncationPolicy::Tokens(max_tokens))`, computes whether truncation occurred, and returns `ReadMemoryResponse { path: request.path, start_line_number: request.line_offset, content, truncated }`.
+**Data flow**: It receives the local backend and a read request containing a path, a starting line, optional line limit, and optional token limit. It validates the request, resolves the path into the backend’s allowed storage area, checks the file’s metadata, rejects unsafe or unsuitable targets, reads the file text, cuts out the requested line range, truncates it to the token budget, and returns a response with the text and a flag showing whether it was shortened. If anything is invalid or unsafe, it returns a clear backend error instead.
 
-**Call relations**: Called by `LocalMemoriesBackend::read` after the trait method is invoked. It delegates path safety to shared helpers and line-boundary calculations to `line_start_byte_offset` and `line_end_byte_offset` before applying external truncation utilities.
+**Call relations**: This is the main read path for this file. As part of that flow, it asks the backend to resolve and inspect the path, uses the symlink check to prevent unsafe file access, calls the two line-position helpers to find the slice of text, reads the file from disk, and finally hands the selected text to the truncation utility before building the response.
 
 *Call graph*: calls 5 internal fn (metadata_or_none, resolve_scoped_path, reject_symlink, line_end_byte_offset, line_start_byte_offset); called by 1 (read); 3 external calls (truncate_text, Tokens, read_to_string).
 
@@ -5338,12 +5412,11 @@ fn line_start_byte_offset(
 ) -> Result<usize, MemoriesBackendError>
 ```
 
-**Purpose**: Finds the byte offset where a requested 1-indexed line begins within a UTF-8 string. It converts line numbering into a safe slice boundary.
+**Purpose**: Finds where a requested line starts inside a text string. This lets the reader return content beginning at line 1, line 20, or any other valid line without guessing by characters.
 
-**Data flow**: Reads `content: &str` and `line_offset: usize`. If `line_offset == 1`, it returns `0`. Otherwise it iterates `content.char_indices()`, increments a line counter on each `'
-'`, and returns the byte index immediately after the newline when the target line is reached. If the target line never appears, it returns `MemoriesBackendError::LineOffsetExceedsFileLength`.
+**Data flow**: It receives the full file content and a one-based line number. If the line is 1, it returns byte position 0. Otherwise, it walks through the text until it has counted enough newline characters to reach the requested line, then returns the byte position just after that newline. If the requested line is beyond the end of the file, it returns an error.
 
-**Call relations**: Used only by `read` after the file has been loaded. It isolates line-start calculation so the main read flow can slice content safely.
+**Call relations**: The main read function calls this after loading the file text. Its result becomes the starting point passed into the end-position calculation, so the rest of the read operation knows exactly where the requested slice begins.
 
 *Call graph*: called by 1 (read).
 
@@ -5354,11 +5427,11 @@ fn line_start_byte_offset(
 fn line_end_byte_offset(content: &str, start_byte: usize, max_lines: Option<usize>) -> usize
 ```
 
-**Purpose**: Computes the exclusive byte offset where the requested line window should end. It stops after a given number of lines or at end-of-file.
+**Purpose**: Finds where the returned text should stop, based on an optional maximum number of lines. If no line limit is given, it allows reading to the end of the file.
 
-**Data flow**: Accepts `content`, `start_byte`, and `max_lines`. If `max_lines` is `None`, it returns `content.len()`. Otherwise it scans `content[start_byte..].char_indices()`, counts newline boundaries starting from one seen line, and returns the byte index just after the newline that ends the requested window; if fewer lines exist, it returns `content.len()`.
+**Data flow**: It receives the full file content, the byte position where reading should start, and an optional line count. With no line count, it returns the file length. With a line count, it scans forward from the start position, counts newline characters, and returns the byte position after the last allowed line. If the file ends first, it returns the file length.
 
-**Call relations**: Called by `read` after the starting byte has been determined. It complements `line_start_byte_offset` by defining the slice end for the response content.
+**Call relations**: The main read function calls this after finding the starting byte. Its result defines the end of the raw text slice, which is then passed through token truncation before being returned to the caller.
 
 *Call graph*: called by 1 (read).
 
@@ -5367,11 +5440,13 @@ fn line_end_byte_offset(content: &str, start_byte: usize, max_lines: Option<usiz
 
 `domain_logic` · `request handling`
 
-This module performs content search across files under the scoped memories root. The top-level `search` function first trims every query string, rejects empty query sets or empty individual queries, rejects `AllWithinLines { line_count: 0 }`, clamps `max_results` to `MAX_SEARCH_RESULTS`, resolves and validates the starting path, and parses the optional cursor as a zero-based result index. It then constructs a `SearchMatcher`, recursively gathers all matches, sorts them by relative path and line number, and applies pagination.
+This file is the local search engine for “memories,” meaning saved text files under a controlled root folder. Without it, the backend could store and read memories, but it could not answer questions like “find every memory mentioning these words.”
 
-Traversal is iterative rather than recursive: `search_entries` uses a `pending` directory stack, skips hidden paths and symlinks, and only descends into real directories or scans real files. `search_file` reads UTF-8 text, silently skips files with invalid text encoding, splits content into lines, precomputes per-line query-match flags, and then applies one of three matching strategies. `Any` emits a match for each line containing at least one query; `AllOnSameLine` requires every query on the same line; `AllWithinLines` searches forward windows up to `line_count` lines, records the first satisfying end line for each start, and then suppresses windows that strictly contain another satisfying window so results stay minimal.
+The top-level search flow first cleans and checks the user’s query terms. It rejects empty searches and invalid “all terms must appear within N lines” requests. It then resolves the requested path safely inside the backend’s root folder, checks that the path exists, and refuses symbolic links (shortcuts that could point outside the allowed area). This matters because search walks the filesystem, so it must not accidentally wander into hidden or unsafe places.
 
-`build_search_match` expands each hit with surrounding context lines and records both the actual match line and the first line included in the returned snippet. `SearchMatcher` and `SearchComparison` separate query preparation from matching: they optionally lowercase text and optionally normalize by removing non-alphanumeric characters, using `Cow` to avoid allocations when no transformation is needed.
+After that, a SearchMatcher prepares the queries according to the request: it may ignore letter case, and it may “normalize” text by keeping only letters and numbers. The search then visits either a single file or all normal, non-hidden files under a directory. Each readable text file is split into lines and checked against the chosen match mode: any query on a line, all queries on the same line, or all queries within a small line window.
+
+For each hit, the code builds a MemorySearchMatch containing the relative path, line number, matching query terms, and optional context lines before and after. Finally it sorts results, applies cursor-based paging, and returns only the requested slice.
 
 #### Function details
 
@@ -5384,11 +5459,11 @@ async fn search(
 ) -> Result<SearchMemoriesResponse, MemoriesBackendError>
 ```
 
-**Purpose**: Validates a search request, traverses the scoped memories tree, collects and sorts matches, and returns a paginated `SearchMemoriesResponse`. It is the local backend’s top-level search implementation.
+**Purpose**: This is the main entry point for a local memory search request. It checks that the request is valid, searches the requested file or folder, sorts the results, and returns one page of matches.
 
-**Data flow**: Consumes `backend` and `SearchMemoriesRequest`. It trims each query into a new `Vec<String>`, rejects empty queries or zero-width `AllWithinLines`, clamps `max_results`, resolves the optional path with `resolve_scoped_path`, parses `cursor` into `start_index` or returns `invalid_cursor`, fetches metadata with `metadata_or_none`, errors with `NotFound` if absent, rejects symlinks using `display_relative_path` plus `reject_symlink`, constructs a `SearchMatcher::new(queries.clone(), request.match_mode.clone(), request.case_sensitive, request.normalized)`, initializes an empty matches vector, awaits `search_entries(...)` to populate it, sorts matches by `path` then `match_line_number`, validates `start_index`, computes pagination fields, drains the selected range, and returns `SearchMemoriesResponse { queries, match_mode: request.match_mode, path: request.path, matches, next_cursor, truncated }`.
+**Data flow**: It receives a LocalMemoriesBackend and a SearchMemoriesRequest containing queries, path, matching rules, paging cursor, and options such as case sensitivity. It trims and validates the queries, resolves the path inside the allowed memory root, checks the starting file or directory, builds a SearchMatcher, gathers all matches, sorts them by path and line number, then returns a SearchMemoriesResponse with the selected page of results and a next cursor if more results remain. It can return an error instead if the query, cursor, match window, path, or filesystem access is invalid.
 
-**Call relations**: Called by `LocalMemoriesBackend::search` when the backend trait’s search method is invoked. It delegates query preparation to `SearchMatcher::new`, filesystem traversal to `search_entries`, and relies on shared path helpers for confinement and symlink policy.
+**Call relations**: This function is called when the backend needs to perform a search. It relies on path helpers to keep the search scoped and safe, creates SearchMatcher::new to prepare the query comparison rules, and then hands the actual filesystem walk to search_entries. After search_entries fills the match list, this function takes back control to sort and paginate the final response.
 
 *Call graph*: calls 7 internal fn (invalid_cursor, metadata_or_none, resolve_scoped_path, display_relative_path, reject_symlink, new, search_entries); called by 1 (search); 2 external calls (new, matches!).
 
@@ -5405,11 +5480,11 @@ async fn search_entries(
     matches: &mut Vec<MemorySearchMatch>,
 ```
 
-**Purpose**: Walks the starting file or directory tree and dispatches each visible regular file to the file-search routine. It performs the recursive traversal phase of search.
+**Purpose**: This function searches either one file or every searchable file under a directory. It is the part that walks through folders while avoiding hidden paths, missing entries, and symbolic links.
 
-**Data flow**: Reads `root`, `current`, `current_metadata`, `matcher`, `context_lines`, and a mutable `matches` vector. If `current_metadata.is_file()`, it immediately awaits `search_file` on that file and returns. If it is not a directory, it returns without changes. Otherwise it initializes `pending` with `current.to_path_buf()`, repeatedly pops a directory, enumerates sorted child paths via `read_sorted_dir_paths`, skips hidden paths with `is_hidden_path`, fetches metadata with `metadata_or_none`, skips missing entries and symlinks, pushes directories back onto `pending`, and awaits `search_file` for regular files. It appends results into the provided `matches` vector.
+**Data flow**: It receives the root folder, the current starting path, that path’s metadata, the matcher, the requested number of context lines, and a shared list where matches should be added. If the starting path is a file, it sends that file to search_file. If it is a directory, it visits directory contents in sorted order, skips hidden paths and symlinks, pushes subdirectories onto a pending stack, and sends ordinary files to search_file. The output is not a separate return value; instead, it adds found matches into the provided matches list or returns an error if reading a directory fails.
 
-**Call relations**: Called only by `search` after the starting path has been validated. It delegates actual content inspection to `search_file` while handling tree traversal and visibility filtering itself.
+**Call relations**: search calls this after the request has been validated and the matcher is ready. search_entries does not decide what counts as a textual match; it delegates that to search_file for each file it finds. It uses filesystem helper functions from the local path module to read directories consistently and avoid unsafe or unwanted paths.
 
 *Call graph*: calls 4 internal fn (metadata_or_none, is_hidden_path, read_sorted_dir_paths, search_file); called by 1 (search); 3 external calls (is_dir, is_file, vec!).
 
@@ -5426,11 +5501,11 @@ async fn search_file(
 ) -> Result<(), MemoriesBackendError>
 ```
 
-**Purpose**: Searches one text file line by line according to the configured match mode and appends any resulting `MemorySearchMatch` records. It contains the core matching algorithms.
+**Purpose**: This function looks inside one text file and finds the lines or line ranges that satisfy the requested search mode. It turns raw file content into individual search hits.
 
-**Data flow**: Accepts `root`, `path`, `matcher`, `context_lines`, and mutable `matches`. It reads the file with `tokio::fs::read_to_string`; invalid UTF-8 (`InvalidData`) causes an early `Ok(())`, while other I/O errors propagate. It splits content into `lines`, computes `line_matches` by calling `matcher.matched_query_flags` for each line, then branches on `matcher.match_mode`: for `Any`, it emits one match per line with any true flag; for `AllOnSameLine`, one match per line where all flags are true; for `AllWithinLines`, it scans forward windows from each promising start line, accumulates OR-ed query flags until all queries are matched or the line-count limit is reached, stores satisfying windows, then filters out windows that strictly contain another satisfying window. Each emitted result is built with `build_search_match(...)` and uses `matcher.matched_queries(...)` to record which original queries matched.
+**Data flow**: It receives a file path, the root path, a SearchMatcher, the number of context lines to include, and the shared match list. It reads the file as text; if the file is not valid text, it quietly skips it. It splits readable content into lines, records which queries match each line, and then applies the selected rule: any query on a line, all queries on one line, or all queries within a limited group of nearby lines. For each accepted hit, it calls build_search_match and appends the result to the matches list.
 
-**Call relations**: Called by `search_entries` for each visible regular file. It depends on `SearchMatcher` methods for per-line matching and query-name recovery, and on `build_search_match` to package snippets and metadata into response objects.
+**Call relations**: search_entries calls this for every file that should be searched. search_file uses SearchMatcher::matched_query_flags to test each line, SearchMatcher::matched_queries to name the queries that matched, and build_search_match to package each hit into the response shape expected by the rest of the backend.
 
 *Call graph*: calls 2 internal fn (matched_queries, build_search_match); called by 1 (search_entries); 3 external calls (new, read_to_string, vec!).
 
@@ -5449,11 +5524,11 @@ fn build_search_match(
 ) ->
 ```
 
-**Purpose**: Constructs a `MemorySearchMatch` from line indices, surrounding context, and matched query names. It converts internal zero-based indices into the response’s 1-indexed line numbers and snippet text.
+**Purpose**: This function creates the final search-result object for one hit. It adds practical details such as the relative file path, line numbers, matching text, surrounding context, and which queries were found.
 
-**Data flow**: Reads `root`, `path`, `lines`, `match_start_index`, `match_end_index`, `context_lines`, and `matched_queries`. It computes `content_start_index` by saturating subtraction, computes `content_end_index` by adding context and clamping to `lines.len()`, joins the selected line slice with `"\n"`, formats the relative path with `display_relative_path`, and returns a populated `MemorySearchMatch`.
+**Data flow**: It receives the memory root, the matched file path, all lines from that file, the start and end line indexes of the match, the requested number of context lines, and the matched query strings. It expands the displayed text range backward and forward by the requested context amount without going outside the file, joins those lines into one text block, converts the file path into a display-friendly relative path, and returns a MemorySearchMatch.
 
-**Call relations**: Used by `search_file` whenever a line or window satisfies the chosen match mode. It isolates snippet assembly so the matching loops only decide which line ranges to emit.
+**Call relations**: search_file calls this whenever it has decided that a line or line window is a real match. This helper keeps result formatting in one place, so search_file can focus on deciding what matches while this function focuses on what a match should look like to callers.
 
 *Call graph*: calls 1 internal fn (display_relative_path); called by 1 (search_file).
 
@@ -5469,11 +5544,11 @@ fn new(
     ) -> Result<Self, MemoriesBackendError>
 ```
 
-**Purpose**: Builds a matcher that stores original queries, prepared comparison-ready queries, and the selected comparison/match settings. It validates that normalization does not collapse any query to empty.
+**Purpose**: This creates a matcher object that knows how to compare search queries against file lines. It prepares the queries once up front so every line can be checked consistently and efficiently.
 
-**Data flow**: Consumes `queries`, `match_mode`, `case_sensitive`, and `normalized`. It creates a `SearchComparison` via `SearchComparison::new`, maps each query through `comparison.prepare(query)`, converts the resulting `Cow<str>` values into owned strings, rejects the request with `EmptyQuery` if any prepared query is empty, and returns `SearchMatcher { queries, prepared_queries, comparison, match_mode }`.
+**Data flow**: It receives the original query strings, the selected match mode, and flags for case-sensitive and normalized searching. It builds a SearchComparison from those flags, prepares every query using the same comparison rules, rejects the search if preparation leaves any query empty, and returns a SearchMatcher containing both the original queries and their prepared forms.
 
-**Call relations**: Called by top-level `search` after basic request validation and before traversal begins. It delegates text-preparation policy creation to `SearchComparison::new` so later line matching can reuse the same normalization rules.
+**Call relations**: search calls this after validating the request and before walking files. It calls SearchComparison::new to capture the comparison settings, then uses SearchComparison::prepare on each query. Later, search_file uses the returned SearchMatcher to check lines and report matched query names.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (search).
 
@@ -5484,11 +5559,11 @@ fn new(
 fn matched_query_flags(&self, line: &str) -> Vec<bool>
 ```
 
-**Purpose**: Determines, for one line of text, which prepared queries are present under the configured comparison rules. It produces the boolean match vector used by all search modes.
+**Purpose**: This checks one line of text and reports which prepared queries appear in it. The result is a list of yes/no values, one for each query.
 
-**Data flow**: Reads `self` and `line: &str`, prepares the line with `self.comparison.prepare(line)`, then iterates `self.prepared_queries`, checking `line.as_ref().contains(query)` for each one and collecting the booleans into a `Vec<bool>`. It returns that vector without mutating state.
+**Data flow**: It receives a line from a file. It prepares that line using the same case and normalization rules used for the queries, then tests whether each prepared query is contained in the prepared line. It returns a vector of booleans, where true means the corresponding query matched that line.
 
-**Call relations**: Called by `search_file` for every line in a file before mode-specific matching begins. It delegates normalization/case handling to `SearchComparison::prepare`.
+**Call relations**: search_file uses this for every line in a readable file before applying the match mode. It depends on SearchComparison::prepare so that lines and queries are compared in the same form, such as both lowercased when case-insensitive search is requested.
 
 *Call graph*: calls 1 internal fn (prepare).
 
@@ -5499,11 +5574,11 @@ fn matched_query_flags(&self, line: &str) -> Vec<bool>
 fn matched_queries(&self, matched_query_flags: &[bool]) -> Vec<String>
 ```
 
-**Purpose**: Recovers the original query strings corresponding to a boolean match vector. It turns internal flags back into user-facing query names for the response.
+**Purpose**: This converts a list of yes/no match flags back into the original query strings that matched. It is used so search results can say which requested terms were found.
 
-**Data flow**: Reads `self.queries` and `matched_query_flags`, zips them together, clones each original query whose flag is `true`, collects those clones into a `Vec<String>`, and returns it.
+**Data flow**: It receives a boolean list aligned with the matcher’s original query list. It pairs each original query with its flag, keeps the queries whose flag is true, clones those strings, and returns them as a list of matched query names.
 
-**Call relations**: Used by `search_file` when constructing each `MemorySearchMatch`. It complements `matched_query_flags` by translating internal per-query booleans into response payload data.
+**Call relations**: search_file calls this when it is ready to build a MemorySearchMatch. The earlier line-checking step works with compact boolean flags; this function turns those internal flags into human-readable query strings for the response.
 
 *Call graph*: called by 1 (search_file).
 
@@ -5514,11 +5589,11 @@ fn matched_queries(&self, matched_query_flags: &[bool]) -> Vec<String>
 fn new(case_sensitive: bool, normalized: bool) -> Self
 ```
 
-**Purpose**: Creates the comparison policy controlling case sensitivity and normalization. It is a simple value constructor for search text preparation.
+**Purpose**: This records the text-comparison options for a search. It answers two basic questions: should uppercase and lowercase be treated as different, and should punctuation or spaces be ignored?
 
-**Data flow**: Accepts `case_sensitive` and `normalized` booleans and returns `SearchComparison { case_sensitive, normalized }`. No external state is read or written.
+**Data flow**: It receives two booleans: case_sensitive and normalized. It stores them in a SearchComparison value and returns that value. Nothing else is changed.
 
-**Call relations**: Called only by `SearchMatcher::new` while building a matcher. It provides the reusable policy object later consumed by `prepare`.
+**Call relations**: SearchMatcher::new calls this while setting up a search. The resulting SearchComparison is then reused for both query preparation and line preparation, keeping the comparison fair and consistent.
 
 *Call graph*: called by 1 (new).
 
@@ -5529,22 +5604,26 @@ fn new(case_sensitive: bool, normalized: bool) -> Self
 fn prepare(self, value: &'a str) -> Cow<'a, str>
 ```
 
-**Purpose**: Transforms a string into its comparison form according to case-sensitivity and normalization settings, avoiding allocation when no transformation is needed. It is the canonical preprocessing step for both queries and candidate lines.
+**Purpose**: This turns a piece of text into the form used for searching. Depending on the options, it may leave the text alone, lowercase it, remove non-letter-and-number characters, or do both.
 
-**Data flow**: Reads `self` and `value: &str`. If `case_sensitive` is true and `normalized` is false, it returns `Cow::Borrowed(value)` unchanged. Otherwise it lowercases into `Cow::Owned` when case-insensitive, or keeps a borrowed value when case-sensitive. If `normalized` is enabled, it filters the resulting characters to only `is_alphanumeric()` and returns an owned normalized string. The output is `Cow<'a, str>`.
+**Data flow**: It receives a string slice, such as a query or a file line. If the search is case-sensitive and not normalized, it returns a borrowed view of the original text without allocating a new string. Otherwise it lowercases the text when needed, and if normalization is enabled it filters the text down to only alphanumeric characters. It returns either the original borrowed text or a newly owned prepared string.
 
-**Call relations**: Called by `SearchMatcher::new` to preprocess queries and by `SearchMatcher::matched_query_flags` to preprocess each line. It centralizes the exact comparison semantics used throughout search.
+**Call relations**: SearchMatcher::new uses this to prepare queries, and SearchMatcher::matched_query_flags uses it to prepare each file line. This shared preparation step is what makes options like case-insensitive or punctuation-ignoring search behave the same way on both sides of the comparison.
 
 *Call graph*: called by 1 (matched_query_flags); 2 external calls (Borrowed, Owned).
 
 
 ### `ext/memories/src/tools/mod.rs`
 
-`orchestration` · `tool registration and shared request-processing support`
+`orchestration` · `startup and tool request handling`
 
-This module is the common infrastructure layer for all dedicated memory tools. It declares the four submodules (`ad_hoc_note`, `list`, `read`, `search`) and exposes `memory_tools`, which assembles one executor of each kind into a `Vec<Arc<dyn ToolExecutor<ToolCall>>>`. The function clones the backend and optional metrics client as needed so each tool instance owns what it needs while sharing the same underlying backend configuration.
+The memory extension offers several actions, such as adding a note, listing memories, reading one, and searching. This file ties those separate tool modules together so the rest of the system can see them as one set of callable tools. Without it, the memory backend might still know how to store and fetch data, but the outside tool framework would not have a clean way to discover or call those abilities.
 
-The remaining helpers encode cross-tool policy. `memory_tool_name` applies the shared `MEMORY_TOOLS_NAMESPACE`. `memory_function_tool` constructs a `ToolSpec::Namespace` containing a single `ResponsesApiTool` function definition with generated input and output schemas; it parses the input schema through `parse_tool_input_schema` and treats schema-generation failures as programmer errors via panic. `parse_args` is the strict JSON entrypoint used by handlers: it extracts the raw function arguments string from `ToolCall`, treats an empty or whitespace-only string as `{}`, otherwise parses JSON text into `Value`, then deserializes into the requested type. Because tool arg structs use `deny_unknown_fields`, this preserves strict request validation. `clamp_max_results` centralizes bounded pagination semantics. Finally, `backend_error_to_function_call` classifies backend failures into model-facing `RespondToModel` errors for invalid input/domain conditions versus `Fatal` for I/O failures. That split is important: user-correctable mistakes become tool-call responses, while infrastructure problems abort execution more severely.
+Think of this file like the reception desk in a small library. It does not write the books or search every shelf itself. Instead, it points visitors to the right service, makes sure each service has a proper sign, and explains errors in a way visitors can understand.
+
+It builds tool executors around a shared memory backend, optionally attaches a metrics client for reporting usage, and returns them as a list. It also creates namespaced tool names, meaning tool names are grouped under the memory extension’s namespace so they do not collide with tools from other extensions. For tools exposed through the Responses API, it builds the advertised input and output schemas, which are machine-readable descriptions of what arguments a tool accepts and what it returns.
+
+The file also contains shared helpers for parsing JSON arguments, limiting requested result counts to safe bounds, and converting backend errors into either model-visible messages or fatal system errors.
 
 #### Function details
 
@@ -5557,11 +5636,11 @@ fn memory_tools(
 ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
 ```
 
-**Purpose**: Constructs the full set of dedicated memory-tool executors backed by the same backend and optional metrics client.
+**Purpose**: Builds the full set of memory tools that the extension offers. It packages the shared memory backend and optional metrics reporter into each individual tool so they can all be called through the common tool interface.
 
-**Data flow**: It takes a cloneable `MemoriesBackend` implementation and an optional `MetricsClient`, clones them as needed, instantiates `AddAdHocNoteTool`, `ListTool`, `ReadTool`, and `SearchTool`, wraps each in `Arc<dyn ToolExecutor<ToolCall>>`, and returns them in a vector.
+**Data flow**: It receives a memory backend and an optional metrics client. It clones the backend and metrics client where needed, creates one executor each for adding an ad hoc note, listing, reading, and searching, wraps them in shared pointers so they can be passed around safely, and returns them as a list.
 
-**Call relations**: The extension’s tool-contribution path and the test helper `memory_tool` call this to obtain the available executors. It is the assembly point that wires shared backend/metrics dependencies into each concrete tool type.
+**Call relations**: This is called by the higher-level tool setup paths named `tools` and `memory_tool` when the extension is preparing its available tools. Inside, it constructs the list with `vec!`, then hands back the ready-to-use executors for the rest of the tool system to register or expose.
 
 *Call graph*: called by 2 (tools, memory_tool); 1 external calls (vec!).
 
@@ -5572,11 +5651,11 @@ fn memory_tools(
 fn memory_tool_name(name: &str) -> ToolName
 ```
 
-**Purpose**: Builds a namespaced `ToolName` for a short memory-tool identifier.
+**Purpose**: Creates the official name for a memory tool inside the memory namespace. This keeps memory tool names separate from similarly named tools elsewhere in the system.
 
-**Data flow**: It reads the global `MEMORY_TOOLS_NAMESPACE`, combines it with the provided short name via `ToolName::namespaced`, and returns the resulting `ToolName`.
+**Data flow**: It receives a short tool name, combines it with the memory tools namespace, and returns a `ToolName` that includes both pieces. The result is a fully qualified name the tool framework can recognize unambiguously.
 
-**Call relations**: Concrete tool implementations use this in their `tool_name` methods, and tests use an analogous helper to compare expected names. It centralizes namespace policy for all tools.
+**Call relations**: It delegates the actual name construction to `namespaced`. Other memory tool code can use this helper when it needs to refer to a tool by its public, namespaced name.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -5590,11 +5669,11 @@ fn memory_function_tool(
 ) -> ToolSpec
 ```
 
-**Purpose**: Creates a namespaced Responses-API function tool specification from Rust input/output schema types and a human-readable description.
+**Purpose**: Builds the public specification for a memory function tool. A tool specification is the description the API uses to know the tool’s name, what it does, what input shape it expects, and what output shape it returns.
 
-**Data flow**: It accepts a tool name and description, generates an input schema with `schema::input_schema_for::<I>()`, parses that schema into the API’s parameter representation with `parse_tool_input_schema`, generates an output schema with `schema::output_schema_for::<O>()`, and embeds the resulting `ResponsesApiTool` inside a `ToolSpec::Namespace` with the default namespace description and a single function entry.
+**Data flow**: It receives a tool name and human-readable description, plus type information for the expected input and output. It generates JSON schemas for those types, parses the input schema into the format the Responses API expects, creates a function-tool description, wraps it inside the memory namespace, and returns the finished `ToolSpec`.
 
-**Call relations**: Each concrete tool’s `spec` method delegates here so all memory tools share the same namespace wrapper and schema-generation behavior. It sits between the schema utility module and the extension API’s tool-spec types.
+**Call relations**: It calls the schema parser, the default namespace description helper, and the namespace constructor to assemble a tool advertisement. This is the bridge between the memory extension’s Rust types and the API-facing description that callers can inspect before invoking a tool.
 
 *Call graph*: 4 external calls (parse_tool_input_schema, default_namespace_description, Namespace, vec!).
 
@@ -5605,11 +5684,11 @@ fn memory_function_tool(
 fn parse_args(call: &ToolCall) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Strictly decodes a tool call’s JSON argument payload into a typed Rust struct, treating empty argument strings as an empty object.
+**Purpose**: Turns a tool call’s raw argument text into a strongly typed Rust value. It also treats an empty argument string as an empty JSON object, which lets no-argument tools be called cleanly.
 
-**Data flow**: It takes `&ToolCall`, extracts the raw argument string with `function_arguments()`, trims it to detect emptiness, substitutes `Value::Object({})` when empty, otherwise parses the JSON text with `serde_json::from_str`, and finally deserializes the resulting `Value` into `T` with `serde_json::from_value`. Parse or deserialize failures are converted into `FunctionCallError::RespondToModel` carrying the error text.
+**Data flow**: It receives a `ToolCall` and asks it for the function argument string. If the string is blank, it uses an empty JSON object; otherwise it parses the string as JSON. Then it converts that JSON value into the requested Rust type. If parsing or conversion fails, it returns an error meant to be shown back to the model.
 
-**Call relations**: Concrete tool handlers call this at the start of request processing to obtain typed args before invoking the backend. It isolates JSON parsing policy and ensures malformed model output becomes a recoverable model-facing error.
+**Call relations**: This helper sits in the request path for memory tools that need to read their arguments. It uses the tool call’s `function_arguments` method, JSON parsing, and JSON-to-type conversion, then hands either a usable typed input or a model-readable error back to the caller.
 
 *Call graph*: 5 external calls (Object, function_arguments, new, from_str, from_value).
 
@@ -5620,11 +5699,11 @@ fn parse_args(call: &ToolCall) -> Result<T, FunctionCallError>
 fn clamp_max_results(requested: Option<usize>, default: usize, max: usize) -> usize
 ```
 
-**Purpose**: Normalizes an optional requested page size into a bounded positive count using a default fallback and hard maximum.
+**Purpose**: Chooses a safe number of results to return when a caller asks for a limit. It prevents missing, too-small, or too-large requests from producing awkward or expensive behavior.
 
-**Data flow**: It takes `requested: Option<usize>`, a `default`, and a `max`; it substitutes the default when `requested` is `None`, then clamps the resulting value into the inclusive range `1..=max` and returns that `usize`.
+**Data flow**: It receives an optional requested count, a default count, and a maximum count. If no count was requested, it uses the default. Then it clamps the final number so it is at least 1 and no more than the maximum, and returns that safe value.
 
-**Call relations**: The list and other paginated tools use this helper before constructing backend requests so backends receive sane limits regardless of caller input.
+**Call relations**: This is a small shared helper for tools such as listing or searching, where callers may ask for a certain number of results. It keeps those tools from each having to repeat the same boundary-checking logic.
 
 
 ##### `backend_error_to_function_call`  (lines 95–113)
@@ -5633,22 +5712,26 @@ fn clamp_max_results(requested: Option<usize>, default: usize, max: usize) -> us
 fn backend_error_to_function_call(err: MemoriesBackendError) -> FunctionCallError
 ```
 
-**Purpose**: Maps backend-specific error variants into the extension API’s error categories, distinguishing user-correctable request problems from fatal infrastructure failures.
+**Purpose**: Converts errors from the memory storage layer into errors the tool framework understands. It separates mistakes the model can fix, such as a bad path or empty query, from serious system problems, such as input/output failures.
 
-**Data flow**: It consumes a `MemoriesBackendError`, pattern-matches on its variant, converts validation/path/query/not-found/window/domain errors into `FunctionCallError::RespondToModel(err.to_string())`, and converts `MemoriesBackendError::Io(_)` into `FunctionCallError::Fatal(err.to_string())`.
+**Data flow**: It receives a `MemoriesBackendError`. For validation-style problems and missing-data cases, it turns the error text into `RespondToModel`, meaning the model can see the message and potentially correct the call. For an I/O error, it turns the message into `Fatal`, meaning something went wrong at the system level and normal correction by the model is not expected.
 
-**Call relations**: Concrete tool handlers call this after awaiting backend operations and before returning to the tool runtime. It is the shared policy point that determines whether an error should be surfaced back to the model or treated as a hard execution failure.
+**Call relations**: Memory tools can use this after calling the backend. It calls `to_string` to make the backend error readable, then wraps it as either `RespondToModel` or `Fatal` so the broader function-call machinery knows how to react.
 
 *Call graph*: 3 external calls (to_string, Fatal, RespondToModel).
 
 
 ### `ext/memories/src/tools/ad_hoc_note.rs`
 
-`domain_logic` · `tool request handling for ad-hoc note creation`
+`orchestration` · `request handling`
 
-This file defines the ad-hoc note tool end to end: its argument schema, executor type, published tool metadata, and runtime call handling. `AddAdHocNoteArgs` is a private deserializable/JSON-schema struct with `deny_unknown_fields`, so callers must provide exactly `filename` and `note`. The filename field carries both length bounds and a regex requiring `YYYY-MM-DDTHH-MM-SS-<slug>.md`, where the slug is lowercase ASCII alphanumerics plus hyphens; this is the contract surfaced to models in the generated tool schema. The note itself must be non-empty.
+This file is a small bridge between the outside tool-call world and the memories storage system. Its job is to expose an “add ad-hoc note” tool: a controlled way for Codex to write a Markdown note into the user’s memory notes after the user has clearly requested it.
 
-`AddAdHocNoteTool<B>` stores a cloneable `MemoriesBackend` implementation and an optional `MetricsClient`. Through the `ToolExecutor<ToolCall>` impl, it exposes a namespaced tool name, a `ToolSpec` built with `memory_function_tool`, and a boxed future that delegates to the async `handle_call`. The actual handler clones the backend, parses arguments from the incoming `ToolCall` using the shared strict JSON parser, and submits an `AddAdHocMemoryNoteRequest` to the backend. Crucially, metrics are recorded before backend errors are mapped, so both success and failure outcomes are counted. The metric scope is fixed to `ad_hoc_notes`, and truncation is hard-coded to `not_applicable` because this operation returns only an empty-object response. Successful backend responses are serialized into `JsonToolOutput`; backend validation errors become model-facing `FunctionCallError`s via the shared converter.
+The file first defines the shape of the tool’s input. The caller must provide a filename in a strict timestamp-plus-slug format, such as a dated note name ending in `.md`, and a non-empty Markdown note. The strict filename rule matters because it keeps memory notes predictable and avoids surprising file names.
+
+The main type, `AddAdHocNoteTool`, holds two things: a backend, which is the part that actually stores the note, and an optional metrics client, which reports whether the tool call succeeded. Think of this file like a front desk: it confirms the request is written on the right form, passes it to the storage team, logs whether the job was completed, and then gives the caller a clean receipt.
+
+If parsing the arguments fails or the backend reports an error, the code turns that into a tool-call error. If everything works, it wraps the backend response as JSON so the extension API can return it to the caller.
 
 #### Function details
 
@@ -5658,11 +5741,11 @@ This file defines the ad-hoc note tool end to end: its argument schema, executor
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the fully namespaced tool identifier for the ad-hoc note function.
+**Purpose**: This tells the extension system the public name of this tool. The name is used so incoming tool calls can be matched to the code that knows how to run them.
 
-**Data flow**: It reads no mutable state and transforms the constant `ADD_AD_HOC_NOTE_TOOL_NAME` into a `ToolName` via the shared namespacing helper.
+**Data flow**: It reads the fixed ad-hoc-note tool name from the module → passes it through the shared memory-tool naming helper → returns the final `ToolName` used by the extension API.
 
-**Call relations**: The tool registry and tests call this through the `ToolExecutor` trait when enumerating or selecting tools. It delegates naming policy to `memory_tool_name`.
+**Call relations**: When the extension framework asks this tool to identify itself, this method answers by calling the shared `memory_tool_name` helper. That keeps this tool’s name consistent with the other memory tools.
 
 *Call graph*: 1 external calls (memory_tool_name).
 
@@ -5673,11 +5756,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Publishes the Responses-API tool specification for creating an ad-hoc memory note, including generated input and output schemas.
+**Purpose**: This describes the tool to the caller: what it is called, what input it expects, and what kind of response it returns. The description also states the important policy: use it only after the user explicitly asks Codex to remember, forget, or update something.
 
-**Data flow**: It combines the constant tool name, a human-readable description, and the `AddAdHocNoteArgs`/`AddAdHocMemoryNoteResponse` schema types into a `ToolSpec` returned by `memory_function_tool`.
+**Data flow**: It uses the input type `AddAdHocNoteArgs`, the response type `AddAdHocMemoryNoteResponse`, the fixed tool name, and a human-readable description → builds a `ToolSpec` → returns that specification to the extension system.
 
-**Call relations**: Registry construction and schema-focused tests reach this through the `ToolExecutor` trait. It delegates all schema generation and namespace wrapping to the shared tool-spec helper.
+**Call relations**: The extension framework uses this method when it needs to advertise or register the available tools. This method relies on the shared memory-tool specification builder so the ad-hoc note tool is presented in the same format as the other memory tools.
 
 
 ##### `AddAdHocNoteTool::handle`  (lines 59–61)
@@ -5686,11 +5769,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async handler into the boxed future type required by the `ToolExecutor` trait.
+**Purpose**: This is the standard entry point the extension API calls when someone invokes the tool. It starts the real work asynchronously, meaning the backend write can happen without blocking the whole system.
 
-**Data flow**: It takes ownership of a `ToolCall`, invokes `self.handle_call(call)`, pins the resulting future in a `Box`, and returns that boxed future.
+**Data flow**: It receives a raw `ToolCall` from the extension system → wraps the internal `handle_call` work in a pinned future, which is a promise of work that will complete later → returns that future to the caller.
 
-**Call relations**: The runtime tool-dispatch layer invokes this trait method for execution. Its only job is to forward into `handle_call` in the trait-compatible shape.
+**Call relations**: The extension framework calls this method for an incoming ad-hoc-note request. This method immediately hands the work to `AddAdHocNoteTool::handle_call`, which does the parsing, backend call, metrics recording, and response formatting.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -5704,22 +5787,24 @@ async fn handle_call(
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
 ```
 
-**Purpose**: Parses the incoming call, asks the backend to create the note file, records telemetry for the outcome, and returns the backend response as JSON tool output.
+**Purpose**: This does the actual work of creating the ad-hoc memory note. It validates the incoming arguments, asks the backend to store the note, records success or failure, and returns either a JSON response or a tool-call error.
 
-**Data flow**: It reads `self.backend` and `self.metrics_client`, clones the backend, parses `AddAdHocNoteArgs` from the `ToolCall`, builds `AddAdHocMemoryNoteRequest { filename, note }`, and awaits `backend.add_ad_hoc_note(...)`. It then records a metric using the operation name, fixed scope `ad_hoc_notes`, success derived from `response.is_ok()`, and truncation tag `not_applicable`; after that it maps backend errors into `FunctionCallError` and wraps the successful response in `JsonToolOutput` using `json!(response)`.
+**Data flow**: It receives the raw tool call → parses it into a filename and Markdown note → clones the backend handle so it can make the async storage request → sends an `AddAdHocMemoryNoteRequest` to the backend → records a metric saying whether the backend call succeeded → converts any backend error into a function-call error → wraps a successful backend response as JSON output.
 
-**Call relations**: This method is invoked only by `AddAdHocNoteTool::handle`. It depends on shared helpers for argument parsing, backend-error translation, tool naming/spec generation elsewhere in the type, and metric emission after backend completion.
+**Call relations**: It is called by `AddAdHocNoteTool::handle` after the extension API invokes the tool. Inside, it depends on `parse_args` to turn untrusted tool input into typed data, on the memories backend to actually add the note, on `record_tool_call` to report the outcome, and on JSON output wrapping so the result can travel back through the tool API.
 
 *Call graph*: calls 2 internal fn (record_tool_call, new); called by 1 (handle); 4 external calls (clone, new, json!, parse_args).
 
 
 ### `ext/memories/src/tools/list.rs`
 
-`domain_logic` · `tool request handling for directory listing`
+`orchestration` · `request handling`
 
-This file contains the dedicated list tool for browsing the memories store. `ListArgs` defines the accepted function-call payload: optional `path`, optional pagination `cursor`, and optional `max_results` with a schema-level minimum of 1; `deny_unknown_fields` ensures legacy or misspelled fields are rejected instead of ignored. `ListTool<B>` carries a cloneable backend plus optional metrics client and exposes the standard `ToolExecutor<ToolCall>` surface: namespaced tool name, generated `ToolSpec`, and a boxed async handler.
+This file is the front desk for one specific memory-store action: listing what is inside a folder-like path. Without it, outside callers could not ask the memories extension “what is here?” in the standard tool-call format.
 
-The core logic lives in `handle_call`. It first clones the backend and parses the incoming JSON arguments with the shared parser. Before issuing the backend request, it derives a low-cardinality metric scope from the optional path, defaulting to `root` when no path filter is supplied. It then constructs `ListMemoriesRequest`, preserving the optional path and cursor while normalizing `max_results` through `clamp_max_results(DEFAULT_LIST_MAX_RESULTS, MAX_LIST_RESULTS)`. That means callers can omit the field, request too few, or request too many, and the backend still receives a bounded positive count. After awaiting `backend.list`, the function records telemetry regardless of success, including a truncation tag extracted from the successful response when available and `unknown` otherwise. Finally, backend domain errors are converted into model-facing or fatal function-call errors, and successful responses are serialized into `JsonToolOutput`. The ordering ensures metrics capture both successful pagination and validation failures.
+The main type is `ListTool`, which holds two things: a memories backend, where the real stored data lives, and an optional metrics client, used to record whether the call succeeded. The tool first describes itself to the wider extension system: its name is the memory list tool name, and its input shape is `ListArgs`. Those arguments allow a caller to provide a path, a pagination cursor, and a maximum number of results. Pagination means the backend can return a chunk of a long listing and give the caller a cursor to continue later, like reading a long directory one page at a time.
+
+When a call arrives, the tool parses the incoming arguments, chooses a safe result limit by clamping it between defaults and maximums, and asks the backend to list that path. It then records metrics such as the requested scope, whether the backend succeeded, and whether the response was shortened. Backend errors are translated into tool-call errors. Successful responses are wrapped as JSON so the caller receives a normal machine-readable answer.
 
 #### Function details
 
@@ -5729,11 +5814,11 @@ The core logic lives in `handle_call`. It first clones the backend and parses th
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the namespaced identifier for the list tool.
+**Purpose**: This tells the extension system the public name of this tool. The name is built in the standard memory-tool format so callers can find and invoke it consistently.
 
-**Data flow**: It transforms the constant `LIST_TOOL_NAME` into a `ToolName` using the shared namespacing helper and returns it without mutating state.
+**Data flow**: It reads the fixed list-tool name for memories, passes it through the shared memory-tool naming helper, and returns the finished tool name. It does not change any stored data.
 
-**Call relations**: Tool enumeration and dispatch use this trait method to identify the executor. It delegates namespace formatting to `memory_tool_name`.
+**Call relations**: The tool framework calls this when it needs to identify which tool this executor represents. It hands off to the shared `memory_tool_name` helper so this tool follows the same naming pattern as the other memory tools.
 
 *Call graph*: 1 external calls (memory_tool_name).
 
@@ -5744,11 +5829,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the published tool specification for listing immediate files and directories under a memories path.
+**Purpose**: This describes what the list tool does and what kind of input and output it expects. The wider system uses this specification to expose the tool safely and clearly to callers.
 
-**Data flow**: It passes the list tool name, description string, `ListArgs` input type, and `ListMemoriesResponse` output type into `memory_function_tool` and returns the resulting `ToolSpec`.
+**Data flow**: It combines the list-tool name, the expected argument structure, the response structure, and a short human-readable description. The result is a tool specification object; no backend data is read or changed.
 
-**Call relations**: The registry and schema consumers reach this through the `ToolExecutor` trait. It relies on shared schema-generation machinery rather than constructing JSON manually.
+**Call relations**: The extension system asks for this specification when registering or advertising available tools. This function uses the shared memory-tool specification builder so the list tool is presented in the same format as the other memory tools.
 
 
 ##### `ListTool::handle`  (lines 57–59)
@@ -5757,11 +5842,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Wraps the async list implementation in the boxed future expected by the executor trait.
+**Purpose**: This is the standard entry point used when someone actually invokes the list tool. It starts the asynchronous work needed to process the request.
 
-**Data flow**: It consumes a `ToolCall`, forwards it to `self.handle_call(call)`, pins the future, and returns the boxed future object.
+**Data flow**: It receives a raw tool call, wraps the real handling work in a pinned future, and returns that future to the tool framework. The actual parsing, backend call, metrics, and response building happen later inside `ListTool::handle_call`.
 
-**Call relations**: Runtime dispatch invokes this method; it exists solely to bridge the trait interface to the internal async handler.
+**Call relations**: The tool framework calls this during request handling. It immediately delegates to `ListTool::handle_call`, because that function contains the step-by-step logic for serving the list request.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -5775,24 +5860,24 @@ async fn handle_call(
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
 ```
 
-**Purpose**: Parses list arguments, normalizes pagination limits, invokes the backend listing operation, records scoped metrics, and returns the JSON-encoded listing response.
+**Purpose**: This performs the real list operation from start to finish. It turns the incoming tool call into a backend list request, records whether it worked, and returns either a JSON response or a clean tool error.
 
-**Data flow**: It clones the backend, parses `ListArgs` from the `ToolCall`, computes a scope tag from `args.path.as_deref()` with default `root`, builds `ListMemoriesRequest { path, cursor, max_results }` where `max_results` is clamped between 1 and `MAX_LIST_RESULTS` with a default fallback, and awaits `backend.list(...)`. It records a metric using the operation name, derived scope, success flag from `response.is_ok()`, and a truncation tag derived from `response.as_ref().ok().map(|response| response.truncated)`. Then it maps backend errors into `FunctionCallError` and wraps the successful response in `JsonToolOutput`.
+**Data flow**: It starts with a raw tool call and reads its arguments into `ListArgs`. From those arguments it builds a scope label for metrics, clamps the requested result count to an allowed range, and sends a `ListMemoriesRequest` to the backend with the path, cursor, and limit. After the backend replies, it records metrics about success and truncation. If the backend returned an error, that error is converted into a function-call error; if it succeeded, the response is converted into JSON and boxed as tool output.
 
-**Call relations**: Only `ListTool::handle` calls this method. It coordinates shared helpers for argument parsing, max-result normalization, scope/truncation tagging, backend-error translation, and telemetry emission around the backend call.
+**Call relations**: This is called by `ListTool::handle` whenever the list tool is invoked. It coordinates several helpers: argument parsing for safe input, path-to-scope conversion for metrics, result-limit clamping for protection, the backend `list` call for the actual data, and JSON output creation for the final answer.
 
 *Call graph*: calls 4 internal fn (record_tool_call, scope_from_optional_path, truncated_tag, new); called by 1 (handle); 5 external calls (clone, new, json!, clamp_max_results, parse_args).
 
 
 ### `ext/memories/src/tools/read.rs`
 
-`io_transport` · `request handling`
+`orchestration` · `request handling`
 
-This file defines the read-side tool adapter for memory files. `ReadArgs` is the request schema accepted from the tool layer: a required relative `path`, plus optional 1-indexed `line_offset` and `max_lines`, with `deny_unknown_fields` and schema constraints so invalid caller payloads are rejected before backend access. `ReadTool<B>` is generic over a `MemoriesBackend`, carrying both the backend instance and an optional `MetricsClient`.
+This file is the front door for reading stored Codex memories through the extension tool system. A memory is addressed by a relative path, and the caller can optionally ask to start at a certain line and limit how many lines come back. Without this file, the backend might still know how to read memory files, but outside callers would not have a clean tool-shaped way to request them.
 
-As a `ToolExecutor<ToolCall>`, the type publishes a namespaced tool name and a `ToolSpec` built from the request/response types, so callers see the exact JSON contract for `ReadMemoryResponse`. Runtime execution is funneled through `handle`, which boxes and pins the async `handle_call` future.
+The main type is `ReadTool<B>`. It holds two things: a backend, which is the part that actually knows where and how memories are stored, and an optional metrics client, which is used to report basic facts about the call. Think of it like a library desk: this file receives the request slip, checks that it is filled out correctly, asks the archive for the document, notes whether the request succeeded, and hands the answer back in a standard envelope.
 
-`handle_call` performs the concrete work: it clones the backend for async use, parses `ReadArgs` from the incoming `ToolCall`, derives a metrics scope from the requested path, and invokes `backend.read` with a `ReadMemoryRequest`. The request always fills in `line_offset` with `1` when omitted and always enforces `DEFAULT_READ_MAX_TOKENS`, while leaving `max_lines` optional. After the backend returns, the function records success/failure and whether the response was truncated, then maps backend-specific errors through `backend_error_to_function_call`. Successful responses are serialized directly into `JsonToolOutput`. A subtle invariant here is that metrics are emitted for both success and failure paths before error conversion, preserving observability even when the tool call fails.
+The tool declares its public name and its input/output shape so callers know how to use it. When a call arrives, it parses the JSON arguments into `ReadArgs`, fills in defaults such as starting at line 1, applies a maximum token limit to avoid overly large responses, and calls the backend. It records metrics using a scope derived from the path and a tag saying whether the response was truncated. Backend errors are converted into tool-call errors, while successful reads are wrapped as JSON output.
 
 #### Function details
 
@@ -5802,11 +5887,11 @@ As a `ToolExecutor<ToolCall>`, the type publishes a namespaced tool name and a `
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the externally visible tool name for the memory read operation. It wraps the read tool constant in the extension's shared memory-tool naming convention.
+**Purpose**: This returns the public name used to identify the read-memory tool. Callers and the tool system use this name to route a request to this file.
 
-**Data flow**: Reads no call-specific input beyond `self`; transforms the static `READ_TOOL_NAME` through the shared naming helper into a `ToolName`; writes no state.
+**Data flow**: It reads the fixed read-tool name from the crate, passes it through the shared memory-tool naming helper, and returns the finished `ToolName`. No stored data is changed.
 
-**Call relations**: Invoked by the extension/tool registry when enumerating available tools. It delegates naming policy to `memory_tool_name` so this tool stays consistent with the other memory tools.
+**Call relations**: When the tool registry or executor needs to know what this tool is called, it asks this method. The method delegates the naming format to `memory_tool_name` so all memory tools are named consistently.
 
 *Call graph*: 1 external calls (memory_tool_name).
 
@@ -5817,11 +5902,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Builds the JSON-schema-backed tool specification for reading memory files. The spec advertises the accepted `ReadArgs` shape and the `ReadMemoryResponse` payload shape along with a human-readable description.
+**Purpose**: This describes what the read tool expects as input and what it returns. It is the tool’s instruction card for callers.
 
-**Data flow**: Consumes no runtime arguments besides `self`; combines `READ_TOOL_NAME`, the `ReadArgs` schema, the `ReadMemoryResponse` schema, and a fixed description string into a `ToolSpec`; writes no state.
+**Data flow**: It uses the `ReadArgs` input shape, the `ReadMemoryResponse` output shape, the read-tool name, and a plain-language description to build a `ToolSpec`. It returns that specification without changing anything else.
 
-**Call relations**: Used during tool registration and discovery so callers know how to invoke the tool. It relies on the shared `memory_function_tool` constructor to keep schema generation and formatting uniform across memory tools.
+**Call relations**: The tool system calls this when it needs to advertise or validate the tool. It relies on the shared `memory_function_tool` helper so this read tool is described in the same format as the other memory tools.
 
 
 ##### `ReadTool::handle`  (lines 56–58)
@@ -5830,11 +5915,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Adapts the async implementation into the `ToolExecutor` trait's boxed future interface. It is the synchronous entrypoint the extension framework calls for each tool invocation.
+**Purpose**: This is the required entry point for executing the read tool. It adapts the tool system’s call style into the asynchronous work done by `handle_call`.
 
-**Data flow**: Takes an incoming `ToolCall`, forwards it unchanged into `self.handle_call(call)`, and wraps the resulting future in `Box::pin`; returns a `ToolExecutorFuture` without mutating state.
+**Data flow**: It receives a `ToolCall`, starts `handle_call` with that call, boxes and pins the future so the tool framework can hold onto it safely, and returns that future. The actual reading happens later when the future runs.
 
-**Call relations**: Called by the extension runtime whenever this tool is executed. Its only job is to dispatch into `handle_call`, which contains the actual read logic.
+**Call relations**: The tool executor calls this when someone invokes the read tool. This method immediately hands the real work to `ReadTool::handle_call`, while packaging it in the form expected by the surrounding extension API.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -5848,26 +5933,24 @@ async fn handle_call(
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
 ```
 
-**Purpose**: Parses the tool arguments, issues the backend read request, records metrics, and returns the backend response as JSON tool output. It is the concrete implementation of the read tool's behavior.
+**Purpose**: This performs one complete read-memory request. It checks the caller’s arguments, asks the backend to read the memory file, records metrics, and returns either JSON data or a tool-friendly error.
 
-**Data flow**: Reads the incoming `ToolCall`, parses it into `ReadArgs`, extracts `path`, optional `line_offset`, and optional `max_lines`, derives a metrics scope from the path, and clones `self.backend`. It constructs a `ReadMemoryRequest` with `line_offset` defaulted to `1` and `max_tokens` fixed to `DEFAULT_READ_MAX_TOKENS`, awaits `backend.read`, records metrics using the success flag and optional `truncated` field from a successful response, maps backend errors into `FunctionCallError`, and on success serializes the `ReadMemoryResponse` into `JsonToolOutput`. It writes metrics externally but does not mutate internal tool state.
+**Data flow**: It starts with a raw `ToolCall`. It parses the call into a path plus optional line controls, clones the backend so it can be used during the asynchronous request, derives a metrics scope from the path, and sends a `ReadMemoryRequest` to the backend. The request includes the path, a default line offset of 1 if none was supplied, any requested line limit, and the built-in maximum token limit. After the backend replies, it records whether the call succeeded and whether the response was truncated. On failure, it converts the backend error into a function-call error. On success, it wraps the response as JSON tool output.
 
-**Call relations**: Reached only from `ReadTool::handle` after the framework dispatches a tool call. It delegates argument decoding to `parse_args`, metrics tagging to `scope_from_path` and `truncated_tag`, metrics emission to `record_tool_call`, and final JSON wrapping to `JsonToolOutput::new`; backend failures are normalized through `backend_error_to_function_call` before returning to the caller.
+**Call relations**: This is called by `ReadTool::handle` whenever the read tool is invoked. It coordinates several helpers: `parse_args` turns the incoming call into typed arguments, `scope_from_path` and `truncated_tag` prepare metrics labels, `record_tool_call` reports the outcome, the backend does the actual read, and `backend_error_to_function_call` translates storage-layer failures into errors the tool system understands.
 
 *Call graph*: calls 4 internal fn (record_tool_call, scope_from_path, truncated_tag, new); called by 1 (handle); 4 external calls (clone, new, json!, parse_args).
 
 
 ### `ext/memories/src/tools/search.rs`
 
-`io_transport` · `request handling`
+`orchestration` · `request handling`
 
-This file provides the tool-layer adapter for searching memory files. `SearchArgs` is the deserializable, schema-exported argument type accepted from tool callers. It supports multiple query strings, optional `SearchMatchMode`, optional path scoping and pagination cursor, optional context line count, case-sensitivity and normalization flags, and an optional result limit. Schema annotations enforce non-empty query lists and positive bounds where required, while `deny_unknown_fields` prevents silent acceptance of misspelled parameters.
+This file is the front door for searching Codex memory files through the extension tool system. A caller supplies one or more search strings, plus optional settings such as where to search, whether matching should care about letter case, how many surrounding lines to include, and how many results to return. Without this file, the memory backend might still know how to search, but outside callers would not have a clean tool-shaped way to ask for that search and receive a structured answer.
 
-`SearchTool<B>` mirrors the read tool structure: it stores a generic `MemoriesBackend` plus optional metrics client and implements `ToolExecutor<ToolCall>`. The trait methods expose a namespaced tool name, a generated `ToolSpec` for `SearchArgs` → `SearchMemoriesResponse`, and a boxed async handler.
+The main pieces are `SearchArgs` and `SearchTool`. `SearchArgs` describes the input the tool accepts. It is strict: unknown fields are rejected, and some values must be in sensible ranges, such as at least one query and at least one requested result when `max_results` is provided. This helps catch bad tool calls early.
 
-The main execution path is `handle_call`. It parses arguments, derives a metrics scope from the optional path (falling back to `"all"` when absent), converts `SearchArgs` into a backend-facing `SearchMemoriesRequest`, and awaits `backend.search`. Metrics are recorded regardless of success, including whether the backend marked the response as truncated. Successful responses are emitted as `JsonToolOutput`; backend errors are translated into function-call errors.
-
-The important normalization logic lives in `SearchArgs::into_request`: omitted fields are replaced with explicit defaults (`Any` match mode, zero context lines, case-sensitive search enabled, normalization disabled), and `max_results` is bounded through `clamp_max_results` using both default and hard maximum constants. That keeps backend behavior predictable even when callers omit or overspecify limits.
+`SearchTool` connects the extension API to the memory backend. When a call arrives, it parses the JSON arguments, chooses defaults for missing options, asks the backend to search, records whether the call succeeded, and wraps the backend response as JSON. A useful safety detail is that `max_results` is clamped, meaning callers cannot ask for an unlimited or overly large result set. Think of this file like a reception desk: it checks the request form, fills in default blanks, sends the request to the right office, logs the visit, and hands the answer back in a standard envelope.
 
 #### Function details
 
@@ -5877,11 +5960,11 @@ The important normalization logic lives in `SearchArgs::into_request`: omitted f
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the registered tool name for memory search. It applies the shared memory-tool naming convention to the search tool constant.
+**Purpose**: This returns the public name of the search tool as the extension system should see it. It makes sure the raw search tool name is wrapped in the memory-tool naming style used by this extension.
 
-**Data flow**: Reads no dynamic inputs beyond `self`; transforms `SEARCH_TOOL_NAME` into a `ToolName` via the shared helper; writes no state.
+**Data flow**: It takes the `SearchTool` instance, reads no search data from it, and uses the shared memory tool naming helper to build a `ToolName`. The result is the name that callers and the tool registry use to identify this tool.
 
-**Call relations**: Called by the tool framework during registration and discovery. It delegates the actual naming format to `memory_tool_name` so search aligns with the rest of the memories tool suite.
+**Call relations**: The extension API calls this when it needs to know what tool this executor represents. This function hands the base search name to `memory_tool_name`, so the search tool is registered under the same naming convention as the other memory tools.
 
 *Call graph*: 1 external calls (memory_tool_name).
 
@@ -5892,11 +5975,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Constructs the tool specification describing the search API. The spec binds the `SearchArgs` input schema to the `SearchMemoriesResponse` output schema and includes the user-facing description of supported search semantics.
+**Purpose**: This describes the search tool to the outside world: what arguments it accepts and what kind of response it returns. Tool specifications are like instruction cards that let callers know how to use the tool correctly.
 
-**Data flow**: Uses `SEARCH_TOOL_NAME`, the `SearchArgs` schema, the `SearchMemoriesResponse` schema, and a fixed description string to produce a `ToolSpec`; it does not read or mutate runtime state.
+**Data flow**: It starts with the `SearchArgs` input shape and the `SearchMemoriesResponse` output shape, then builds a `ToolSpec` with a human-readable description of what the search does. The result is metadata, not an actual search.
 
-**Call relations**: Used when the extension advertises available tools. It relies on `memory_function_tool` to generate a consistent function-style tool definition.
+**Call relations**: The extension system asks for this specification when advertising or validating available tools. This function does not call the backend; it prepares the contract that later tool calls must follow.
 
 
 ##### `SearchTool::handle`  (lines 65–67)
@@ -5905,11 +5988,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Bridges the trait-required synchronous method to the async search implementation. It packages the actual handler future into the boxed form expected by the extension API.
+**Purpose**: This is the synchronous-looking entry point required by the tool executor interface, but it starts the real asynchronous work. It accepts a tool call and returns a future, which is a promise that the answer will be available later.
 
-**Data flow**: Accepts a `ToolCall`, forwards it to `self.handle_call(call)`, pins the future, and returns it; no state is changed.
+**Data flow**: It receives a `ToolCall`, passes it into `handle_call`, and pins the resulting future so the extension runtime can safely wait for it. Nothing is searched immediately by this wrapper itself; it packages the work for asynchronous execution.
 
-**Call relations**: Invoked by the extension runtime for each search tool call. It exists solely to dispatch into `handle_call`.
+**Call relations**: The extension runtime calls this when someone invokes the search tool. `handle` immediately hands the request to `SearchTool::handle_call`, which performs parsing, backend search, metrics recording, and response formatting.
 
 *Call graph*: calls 1 internal fn (handle_call); 1 external calls (pin).
 
@@ -5923,11 +6006,11 @@ async fn handle_call(
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
 ```
 
-**Purpose**: Executes a memory search from a tool call: parse arguments, build the backend request, invoke the backend, emit metrics, and serialize the response. It is the operational core of the search tool.
+**Purpose**: This performs one complete search-tool request from start to finish. It reads the caller’s arguments, asks the memory backend to search, records a success or failure metric, and returns either JSON results or a tool-call error.
 
-**Data flow**: Consumes a `ToolCall`, parses it into `SearchArgs`, computes a metrics scope from `args.path`, clones `self.backend`, converts the args into a `SearchMemoriesRequest`, and awaits `backend.search`. It records metrics using the tool name, scope, success flag, and optional truncation marker from a successful response; then it maps backend errors into `FunctionCallError` and wraps a successful `SearchMemoriesResponse` in `JsonToolOutput`. It writes only external metrics.
+**Data flow**: It receives a raw `ToolCall`. First it clones the backend so the asynchronous search can use it, then parses the call into `SearchArgs`. It derives a metrics scope from the optional path, converts the arguments into a backend search request, and awaits the backend response. Before returning, it records a metric that includes whether the call succeeded and whether the response was truncated. On success it wraps the search response in `JsonToolOutput`; on backend failure it converts the backend error into the extension API’s function-call error format.
 
-**Call relations**: Reached from `SearchTool::handle` after framework dispatch. It depends on `parse_args` for validation, `SearchArgs::into_request` for defaulting/clamping, `scope_from_optional_path` and `truncated_tag` for metrics dimensions, `record_tool_call` for telemetry, and `backend_error_to_function_call` for error normalization.
+**Call relations**: `SearchTool::handle` calls this whenever the tool is invoked. During the flow, it relies on helpers such as `parse_args` to understand the incoming JSON, `scope_from_optional_path` to label metrics, `record_tool_call` and `truncated_tag` to report what happened, and `JsonToolOutput::new` to send the backend’s answer back in the expected format.
 
 *Call graph*: calls 4 internal fn (record_tool_call, scope_from_optional_path, truncated_tag, new); called by 1 (handle); 4 external calls (clone, new, json!, parse_args).
 
@@ -5938,22 +6021,24 @@ async fn handle_call(
 fn into_request(self) -> SearchMemoriesRequest
 ```
 
-**Purpose**: Converts tool-layer search arguments into the backend's concrete request type, filling in omitted options with explicit defaults and enforcing result limits. This is where the user-facing flexible API becomes a backend-ready `SearchMemoriesRequest`.
+**Purpose**: This turns user-facing search arguments into the exact request object the memory backend expects. It also fills in defaults so callers can omit common options without causing ambiguity.
 
-**Data flow**: Consumes `self` by value, moving `queries`, `path`, and `cursor` directly into the output request. It replaces missing `match_mode` with `SearchMatchMode::Any`, missing `context_lines` with `0`, missing `case_sensitive` with `true`, missing `normalized` with `false`, and computes `max_results` by passing the optional caller value plus `DEFAULT_SEARCH_MAX_RESULTS` and `MAX_SEARCH_RESULTS` through `clamp_max_results`; returns the assembled `SearchMemoriesRequest` without mutating external state.
+**Data flow**: It consumes a `SearchArgs` value. Required queries are carried over directly. Optional fields are either carried over or replaced with defaults: match mode defaults to `Any`, context lines to `0`, case sensitivity to `true`, normalized searching to `false`, and result count to a safe default capped by the allowed maximum. The output is a `SearchMemoriesRequest` ready for the backend.
 
-**Call relations**: Called from `SearchTool::handle_call` immediately before the backend search invocation. It centralizes parameter normalization so the handler and backend do not each need to duplicate defaulting logic.
+**Call relations**: This conversion sits between argument parsing and the backend search. After `SearchTool::handle_call` has parsed a tool call, this function shapes those arguments into the backend’s language. It uses `clamp_max_results` so the backend receives a reasonable result limit rather than whatever number the caller supplied.
 
 *Call graph*: 1 external calls (clamp_max_results).
 
 
 ### `memories/write/src/workspace.rs`
 
-`domain_logic` · `memory workspace setup, diff generation, and baseline reset`
+`orchestration` · `memory workspace setup, diff generation, and baseline reset`
 
-This module is the workspace-facing side of memory consolidation. Its public async functions are thin orchestration wrappers around `codex_git_utils`: `prepare_memory_workspace` creates the root directory, deletes any stale `phase2_workspace_diff.md`, and ensures a usable baseline `.git/` repository exists; `memory_workspace_diff` removes that generated file before asking git utilities for the diff since the latest baseline init; `write_workspace_diff` renders a `GitBaselineDiff` into markdown and writes it under the fixed workspace-diff filename; and `reset_memory_workspace_baseline` removes the generated diff before resetting the repository baseline so prompt artifacts do not become part of the baseline history.
+This file is the cleanup and change-tracking layer for the memory-writing workflow. The project keeps a memory directory under Git so it can tell what files were added, edited, or deleted since the last known baseline. Think of it like taking a photo of a desk before work begins, then later comparing the desk to that photo.
 
-The central invariant is that `phase2_workspace_diff.md` is never treated as workspace input. That is enforced by `remove_workspace_diff`, which ignores `NotFound` but wraps other deletion failures with path context. Rendering is split into pure helpers: `render_workspace_diff_file` emits a heading, a status section listing each `GitBaselineChange` as `- <status> <path>`, and either `- none` when `has_changes()` is false or a fenced `diff` block containing the unified diff. `append_bounded_diff` truncates oversized diffs at `crate::workspace_diff::MAX_BYTES`, using `previous_char_boundary` to avoid slicing through UTF-8 code points and appending a truncation notice. The design keeps filesystem effects isolated in async wrappers while making formatting and truncation deterministic and testable.
+The file does three main jobs. First, it makes sure the memory folder exists and has usable Git metadata for baseline comparison. Second, before every comparison, it deletes the generated `phase2_workspace_diff.md` file. That matters because this file is only a report for the next phase, not actual memory content; if it stayed in the folder, it could show up as a fake change in the next diff. Third, it can reset the baseline after the current memory state has been accepted, so future diffs start from the new state.
+
+The diff report is written in a bounded, Git-style format. “Bounded” means it will not grow past a configured byte limit. If the diff is too large, the code cuts it safely at a valid text boundary and adds a clear truncation note. This protects prompts or downstream readers from being flooded with an oversized file.
 
 #### Function details
 
@@ -5963,11 +6048,11 @@ The central invariant is that `phase2_workspace_diff.md` is never treated as wor
 async fn prepare_memory_workspace(root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Initializes a memory workspace directory so later git-baseline diffing can run against a clean, usable baseline. It also proactively removes the generated diff artifact so that file never contaminates future diffs.
+**Purpose**: This function gets the memory folder ready before work begins. It creates the folder if needed, removes any old generated diff report, and makes sure there is a usable Git baseline for later comparison.
 
-**Data flow**: It takes a workspace root `&Path`, creates the directory tree with `tokio::fs::create_dir_all`, calls `remove_workspace_diff` to delete `phase2_workspace_diff.md` if present, then invokes `ensure_git_baseline_repository` to create or repair the baseline repository. It returns `Ok(())` on success or an `anyhow` error enriched with the root path when directory creation fails.
+**Data flow**: It receives the path to the memory root folder. It creates that folder on disk, deletes the generated workspace diff file if it exists, then asks the Git utility layer to initialize or repair the baseline metadata. It returns success if the workspace is ready, or an error with context if setup fails.
 
-**Call relations**: The main `run` flow calls this during setup before any diffing occurs. Internally it delegates cleanup to `remove_workspace_diff` and repository initialization/recovery to the git utility layer.
+**Call relations**: The main run flow calls this before producing or comparing memory changes. It relies on `remove_workspace_diff` so the generated report is not mistaken for memory input, then hands off to the external Git baseline helper to make the folder diffable.
 
 *Call graph*: calls 1 internal fn (remove_workspace_diff); called by 1 (run); 2 external calls (ensure_git_baseline_repository, create_dir_all).
 
@@ -5978,11 +6063,11 @@ async fn prepare_memory_workspace(root: &Path) -> anyhow::Result<()>
 async fn memory_workspace_diff(root: &Path) -> anyhow::Result<GitBaselineDiff>
 ```
 
-**Purpose**: Computes the current diff between the workspace contents and the latest git baseline, after first removing the generated diff file so it is not included in the result.
+**Purpose**: This function asks, “What changed in the memory workspace since the last baseline?” It first removes the generated diff report so that report does not count as a real change.
 
-**Data flow**: Given a root path, it deletes `phase2_workspace_diff.md` via `remove_workspace_diff`, then awaits `diff_since_latest_init(root)` and returns the resulting `GitBaselineDiff`.
+**Data flow**: It receives the memory root path. It deletes `phase2_workspace_diff.md` if present, then asks the Git utility layer for the difference between the current folder and the latest initialized baseline. It returns a `GitBaselineDiff`, which contains change statuses and the text diff.
 
-**Call relations**: This is called by `run` when the system needs the current workspace delta. Its only internal orchestration is to enforce the no-self-inclusion invariant before delegating actual diff computation to `codex_git_utils`.
+**Call relations**: The main run flow calls this when it needs the current memory changes. It uses `remove_workspace_diff` as a guard step, then delegates the actual Git comparison to `diff_since_latest_init`.
 
 *Call graph*: calls 1 internal fn (remove_workspace_diff); called by 1 (run); 1 external calls (diff_since_latest_init).
 
@@ -5993,11 +6078,11 @@ async fn memory_workspace_diff(root: &Path) -> anyhow::Result<GitBaselineDiff>
 async fn write_workspace_diff(root: &Path, diff: &GitBaselineDiff) -> anyhow::Result<()>
 ```
 
-**Purpose**: Persists a markdown prompt artifact summarizing the current workspace diff in a bounded, human-readable format.
+**Purpose**: This function writes the human-readable diff report file, `phase2_workspace_diff.md`. That file tells the next phase what changed in the memory workspace.
 
-**Data flow**: It takes the workspace root and a borrowed `GitBaselineDiff`, joins the root with `crate::workspace_diff::FILENAME`, renders the diff through `render_workspace_diff_file`, and writes the resulting string with `tokio::fs::write`. On failure it returns an `anyhow` error annotated with the destination path.
+**Data flow**: It receives the memory root path and a prepared Git baseline diff. It builds the report text using `render_workspace_diff_file`, joins the root path with the configured report filename, and writes the rendered text to disk. It returns success or an error that names the file it could not write.
 
-**Call relations**: The `run` orchestration invokes this after obtaining a diff. It delegates all formatting and truncation policy to `render_workspace_diff_file`.
+**Call relations**: The main run flow calls this after it has collected the diff. This function bridges the in-memory diff data to a disk file by formatting it first, then using asynchronous file writing to save it.
 
 *Call graph*: calls 1 internal fn (render_workspace_diff_file); called by 1 (run); 2 external calls (join, write).
 
@@ -6008,11 +6093,11 @@ async fn write_workspace_diff(root: &Path, diff: &GitBaselineDiff) -> anyhow::Re
 async fn reset_memory_workspace_baseline(root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Promotes the current workspace contents to the new git baseline while ensuring the generated diff artifact is excluded from that reset.
+**Purpose**: This function marks the current memory folder as the new “clean starting point.” It is used after changes have been accepted so future comparisons only show newer changes.
 
-**Data flow**: It accepts the workspace root, removes `phase2_workspace_diff.md` via `remove_workspace_diff`, then calls `reset_git_repository(root)` and returns that result.
+**Data flow**: It receives the memory root path. It removes the generated diff report first, then tells the Git utility layer to reset the repository baseline to the folder’s current contents. It returns success or an error if cleanup or reset fails.
 
-**Call relations**: This function is used by a higher-level `handle` path when consolidation completes and the baseline should advance. It performs only the pre-reset cleanup before handing off to the git utility reset operation.
+**Call relations**: The higher-level `handle` flow calls this when it is time to accept the current memory state. It calls `remove_workspace_diff` first because the report file is only a prompt artifact and should not be preserved as part of the new memory baseline.
 
 *Call graph*: calls 1 internal fn (remove_workspace_diff); called by 1 (handle); 1 external calls (reset_git_repository).
 
@@ -6023,11 +6108,11 @@ async fn reset_memory_workspace_baseline(root: &Path) -> anyhow::Result<()>
 async fn remove_workspace_diff(root: &Path) -> anyhow::Result<()>
 ```
 
-**Purpose**: Deletes the generated `phase2_workspace_diff.md` file if it exists, treating absence as a normal condition. It is the shared guardrail that prevents the prompt artifact from feeding back into workspace state.
+**Purpose**: This function deletes the generated `phase2_workspace_diff.md` file if it exists. It deliberately leaves real memory files and the `.git` baseline data alone.
 
-**Data flow**: It builds the artifact path by joining `root` with `crate::workspace_diff::FILENAME`, calls `tokio::fs::remove_file`, returns `Ok(())` for successful deletion or `NotFound`, and wraps any other I/O error with the file path for diagnostics.
+**Data flow**: It receives the memory root path, builds the full path to the generated diff report, and tries to remove that file. If the file is already missing, that is treated as fine. If another file-system error happens, it returns an error with the file path included for easier diagnosis.
 
-**Call relations**: This helper is called before diffing, before baseline reset, and during workspace preparation. It centralizes the artifact-exclusion rule used by `prepare_memory_workspace`, `memory_workspace_diff`, and `reset_memory_workspace_baseline`.
+**Call relations**: This is the shared cleanup step used before preparing, diffing, and resetting the workspace. The other functions call it to make sure the generated report never becomes input to Git diffing or part of a saved baseline.
 
 *Call graph*: called by 3 (memory_workspace_diff, prepare_memory_workspace, reset_memory_workspace_baseline); 2 external calls (join, remove_file).
 
@@ -6038,11 +6123,11 @@ async fn remove_workspace_diff(root: &Path) -> anyhow::Result<()>
 fn render_workspace_diff_file(diff: &GitBaselineDiff) -> String
 ```
 
-**Purpose**: Formats a `GitBaselineDiff` into the markdown file consumed by later memory-consolidation phases. It emits both a concise status list and, when changes exist, a fenced unified diff section.
+**Purpose**: This function turns a structured Git diff into the Markdown text saved in `phase2_workspace_diff.md`. It gives readers a short status list first, then the detailed diff when changes exist.
 
-**Data flow**: It starts with a fixed markdown header and `## Status` section. If `diff.has_changes()` is false, it appends `- none` and returns immediately. Otherwise it iterates `diff.changes`, appending one line per change using each change status label and path, then opens a ```diff fence, appends the bounded unified diff via `append_bounded_diff`, closes the fence, and returns the assembled `String`.
+**Data flow**: It receives a `GitBaselineDiff`, which includes changed paths, their statuses, and a unified diff. It starts with a fixed heading and instructions, adds either `none` or a list of changed files, then appends the detailed diff through `append_bounded_diff`. It returns the complete report as a string.
 
-**Call relations**: Only `write_workspace_diff` calls this. It delegates byte-limit enforcement and UTF-8-safe truncation to `append_bounded_diff`.
+**Call relations**: `write_workspace_diff` calls this just before writing the report to disk. It calls `append_bounded_diff` so the detailed diff is included without exceeding the configured size limit.
 
 *Call graph*: calls 2 internal fn (has_changes, append_bounded_diff); called by 1 (write_workspace_diff); 2 external calls (from, format!).
 
@@ -6053,11 +6138,11 @@ fn render_workspace_diff_file(diff: &GitBaselineDiff) -> String
 fn append_bounded_diff(rendered: &mut String, diff: &str)
 ```
 
-**Purpose**: Appends the unified diff text to an output buffer, truncating at the configured byte cap without breaking UTF-8 boundaries and adding an explicit truncation marker when needed.
+**Purpose**: This function appends diff text to the report while enforcing a maximum size. If the diff is too large, it includes only the beginning and adds a clear message saying it was truncated.
 
-**Data flow**: It takes a mutable rendered markdown `String` and the raw diff `&str`. If the diff length is within `crate::workspace_diff::MAX_BYTES`, it appends the whole diff and ensures a trailing newline. Otherwise it computes the last valid character boundary at or before the byte cap using `previous_char_boundary`, appends that prefix, normalizes a trailing newline, and then appends a `[workspace diff truncated at ... bytes]` notice.
+**Data flow**: It receives a mutable report string and the raw diff text. If the diff fits within the configured byte limit, it appends it and makes sure it ends with a newline. If it is too long, it finds a safe cut point, appends only that slice, adds any needed newline, and writes a truncation notice.
 
-**Call relations**: This helper is called only from `render_workspace_diff_file` to enforce prompt-size limits while preserving valid UTF-8 output.
+**Call relations**: `render_workspace_diff_file` calls this when adding the detailed diff section. When truncation is needed, it asks `previous_char_boundary` for a safe place to cut so the resulting text remains valid.
 
 *Call graph*: calls 1 internal fn (previous_char_boundary); called by 1 (render_workspace_diff_file); 1 external calls (format!).
 
@@ -6068,11 +6153,11 @@ fn append_bounded_diff(rendered: &mut String, diff: &str)
 fn previous_char_boundary(value: &str, max_bytes: usize) -> usize
 ```
 
-**Purpose**: Finds the nearest valid UTF-8 character boundary at or before a requested byte index. It prevents truncation from slicing through a multibyte code point.
+**Purpose**: This function finds a safe byte position for cutting a text string. It prevents the code from slicing through the middle of a multi-byte character, which would make invalid text.
 
-**Data flow**: It takes a string slice and a maximum byte count. If the limit is beyond the string length it returns the full length; otherwise it decrements from `max_bytes` until `value.is_char_boundary(index)` becomes true, then returns that index.
+**Data flow**: It receives a string and a maximum byte position. If the maximum is already past the end, it returns the string length. Otherwise, it walks backward from the requested byte limit until it reaches a valid character boundary, then returns that index.
 
-**Call relations**: This low-level helper is used only by `append_bounded_diff` during oversized diff truncation.
+**Call relations**: `append_bounded_diff` uses this only when a diff must be shortened. It supplies the safe cut point that lets the report stay readable and valid even after truncation.
 
 *Call graph*: called by 1 (append_bounded_diff).
 
@@ -6084,20 +6169,24 @@ These files present the core and extension-side skills machinery, from shared AP
 
 `orchestration` · `cross-cutting`
 
-This crate root organizes the skills feature into focused submodules and re-exports the pieces that other crates are expected to use. Public modules cover configuration rules, injection, loading, management, model types, remote support, rendering, and system integration; internal-only modules such as `invocation_utils`, `mention_counts`, and `skill_instructions` provide implementation details that are selectively surfaced through re-exports. The file itself contains no executable logic, but it defines the conceptual API of the subsystem.
+This file does not contain the skill-loading logic itself. Instead, it acts like the table of contents and public reception desk for the core-skills crate, which is the Rust package for working with “skills” in this project. A skill appears to be a packaged capability with metadata, loading rules, rendering text, and invocation behavior.
 
-The exported items outline the skills pipeline. `SkillsManager` and `SkillsLoadInput` are the main orchestration entry points for loading and maintaining available skills. `detect_implicit_skill_invocation_for_command` and the crate-private `build_implicit_skill_path_indexes` support command-to-skill matching. `build_skill_name_counts` exposes mention counting used to infer relevance from conversation text. The `model` exports—such as `HostLoadedSkills`, `SkillMetadata`, `SkillPolicy`, `SkillLoadOutcome`, `SkillError`, and `filter_skill_load_outcome_for_product`—define the data and filtering semantics around loaded skills. Rendering exports like `AvailableSkills`, `SkillMetadataBudget`, `SkillRenderReport`, `build_available_skills`, `default_skill_metadata_budget`, and `render_available_skills_body`, plus the instructional constants, turn loaded skill state into prompt-ready text. `SkillInstructions` rounds out the API as the packaged instruction representation. This root file therefore acts as the stable façade for the entire skills subsystem.
+The first part lists the modules that make up the library, such as configuration rules, loading, management, remote skill support, rendering, and the skill data model. Some modules are public, meaning other crates can refer to them directly. Others are kept private to this crate, which helps protect internal details from becoming accidental public promises.
+
+The second part re-exports selected types and functions. A re-export is like putting commonly used tools on the front counter so callers do not need to know which back room they came from. For example, outside code can import SkillsManager, SkillMetadata, or build_available_skills from this crate root instead of digging through module paths.
+
+Without this file, the library would not have a clear public shape. Other parts of the system would need to know more about the internal folder layout, and changing that layout later would be much harder.
 
 
 ### `core-skills/src/invocation_utils.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `command inspection`
 
-This file supports the implicit-invocation feature by turning loaded skills into lookup indexes and then inspecting shell commands for evidence that a skill is being used indirectly. `build_implicit_skill_path_indexes` consumes a `Vec<SkillMetadata>` and produces two `HashMap<AbsolutePathBuf, SkillMetadata>` indexes: one keyed by canonicalized `scripts/` directories and one keyed by canonicalized `SKILL.md` document paths. Canonicalization is best-effort; nonexistent paths remain unchanged so tests and partially materialized paths still participate.
+A skill in this project appears to have a main document, usually SKILLS.md, and may also have a scripts folder beside it. This file builds quick lookup tables for those paths, then uses them to inspect a shell command and decide whether the command is implicitly invoking a skill. Without this, the system could miss that a user is using a skill just because they ran `python path/to/scripts/tool.py` or opened the skill’s documentation instead of calling the skill by name.
 
-`detect_implicit_skill_invocation_for_command` is the main entry. It canonicalizes the working directory, tokenizes the command with `shlex::split` and falls back to whitespace splitting if shell parsing fails, then tries two detectors in priority order. `detect_skill_script_run` looks for interpreter-style commands such as `python`, `bash`, `node`, `pwsh`, and similar. It skips flags and `--`, requires a recognized script extension, resolves the script path relative to the workdir, and walks ancestor directories upward until it finds a matching indexed `scripts/` directory. `detect_skill_doc_read` instead feeds the token list into the shared shell read-command parser and looks for `ParsedCommand::Read` entries whose resolved path matches an indexed skill doc.
+The flow is simple. First, `build_implicit_skill_path_indexes` takes the loaded skills and makes two maps: one from each skill’s scripts directory to that skill, and one from each skill document path to that skill. Paths are canonicalized when possible, meaning they are turned into their real filesystem form, so small differences like `.` or symbolic links are less likely to confuse the lookup.
 
-The design intentionally reuses canonicalized absolute paths on both indexing and lookup sides, so relative and absolute command forms converge. Script execution detection runs before doc-read detection, making active script use the stronger implicit invocation signal when both could match.
+Later, `detect_implicit_skill_invocation_for_command` receives a command string and the working directory where it will run. It splits the command into tokens, like a shell would. It first checks whether the command runs a known script with a runner such as Python, Bash, Node, or Ruby. If that does not match, it checks whether the command reads a known skill document. If either check succeeds, it returns the matching skill metadata.
 
 #### Function details
 
@@ -6112,11 +6201,11 @@ fn build_implicit_skill_path_indexes(
 )
 ```
 
-**Purpose**: Builds lookup tables that map each skill’s canonicalized `scripts/` directory and `SKILL.md` path back to that skill.
+**Purpose**: This prepares fast lookup tables so later code can recognize skill use from file paths. It records both the path to each skill’s main document and the path to the scripts folder beside that document.
 
-**Data flow**: Consumes a `Vec<SkillMetadata>`. For each skill it canonicalizes `path_to_skills_md` and inserts a cloned skill into `by_skill_doc_path`; if the skill doc has a parent directory, it joins `scripts`, canonicalizes that directory, and inserts the original skill into `by_scripts_dir`. It returns the two populated hash maps.
+**Data flow**: It receives a list of skill metadata records. For each skill, it normalizes the path to the skill document if the file exists, stores that path as a key, then looks for the neighboring `scripts` directory path and stores that too. It returns two maps: scripts directory → skill, and skill document path → skill.
 
-**Call relations**: Called when finalizing a loaded skill set so later command analysis can resolve paths back to skills quickly.
+**Call relations**: This is setup work for later detection. It relies on `canonicalize_if_exists` so the paths stored in the indexes match the normalized paths used when commands are checked.
 
 *Call graph*: calls 1 internal fn (canonicalize_if_exists); 1 external calls (new).
 
@@ -6131,11 +6220,11 @@ fn detect_implicit_skill_invocation_for_command(
 ) -> Option<SkillMetadata>
 ```
 
-**Purpose**: Determines whether a shell command implicitly invokes a known skill by running one script under its `scripts/` tree or reading its `SKILL.md` file.
+**Purpose**: This is the main checker for a single shell command. It decides whether the command appears to use a skill indirectly, either by running a skill script or reading a skill document.
 
-**Data flow**: Takes a `SkillLoadOutcome`, raw command string, and working directory. It canonicalizes the workdir, tokenizes the command, tries `detect_skill_script_run` first and returns that match if found; otherwise it tries `detect_skill_doc_read` and returns its result.
+**Data flow**: It receives the loaded-skill outcome, a command string, and the current working directory. It normalizes the working directory, splits the command into shell-like tokens, then tries script detection first and document-read detection second. It returns the matching skill metadata if one is found, or nothing if the command does not point at a known skill.
 
-**Call relations**: This is the public detector used by higher-level execution tracking. It orchestrates tokenization and the two specialized detectors in priority order.
+**Call relations**: Other code can call this when it is about to interpret or audit a command. It delegates the smaller jobs to `tokenize_command`, `detect_skill_script_run`, and `detect_skill_doc_read`, using `canonicalize_if_exists` to keep path comparison consistent.
 
 *Call graph*: calls 4 internal fn (canonicalize_if_exists, detect_skill_doc_read, detect_skill_script_run, tokenize_command).
 
@@ -6146,11 +6235,11 @@ fn detect_implicit_skill_invocation_for_command(
 fn tokenize_command(command: &str) -> Vec<String>
 ```
 
-**Purpose**: Splits a shell command string into tokens with a shell-aware parser and a whitespace fallback.
+**Purpose**: This breaks a command string into pieces in a way that respects common shell quoting. For example, it tries to keep a quoted path with spaces as one token.
 
-**Data flow**: Reads the command string, attempts `shlex::split`, and if parsing fails, falls back to `split_whitespace().map(str::to_string).collect()`, returning `Vec<String>`.
+**Data flow**: It receives the raw command text. It first tries shell-style splitting; if that fails, it falls back to a simpler split on whitespace. It returns a list of string tokens.
 
-**Call relations**: Used only by `detect_implicit_skill_invocation_for_command` to normalize command text before detection.
+**Call relations**: It is called by `detect_implicit_skill_invocation_for_command` before any deeper inspection happens. The later script and document checks depend on this token list instead of trying to parse the raw command text themselves.
 
 *Call graph*: called by 1 (detect_implicit_skill_invocation_for_command); 1 external calls (split).
 
@@ -6161,11 +6250,11 @@ fn tokenize_command(command: &str) -> Vec<String>
 fn script_run_token(tokens: &[String]) -> Option<&str>
 ```
 
-**Purpose**: Extracts the script path argument from interpreter-style commands when the runner and script extension are recognized.
+**Purpose**: This looks at command tokens and asks: does this look like a script being run by a known interpreter, such as Python, Bash, Node, or Ruby? If so, it returns the token that names the script file.
 
-**Data flow**: Consumes tokenized command arguments. It reads the first token, reduces it to a lowercase basename without `.exe`, checks it against a fixed runner allowlist, then scans subsequent tokens skipping flags and `--` until it finds the first positional token. If that token ends with one of the allowed script extensions, it returns `Some(&str)` for that token; otherwise `None`.
+**Data flow**: It receives already-split command tokens. It checks the first token as the runner command, strips it down to its base name, accepts known runners, skips flags like `-m` or separators like `--`, then looks for the first real script argument. If that argument has a recognized script extension, it returns it; otherwise it returns nothing.
 
-**Call relations**: Called by `detect_skill_script_run` as the gatekeeper for interpreter-based script execution detection.
+**Call relations**: It is used by `detect_skill_script_run` as the first filter. It calls `command_basename` so commands like `/usr/bin/python3` or `python.exe` can still be recognized as Python.
 
 *Call graph*: calls 1 internal fn (command_basename); called by 1 (detect_skill_script_run).
 
@@ -6180,11 +6269,11 @@ fn detect_skill_script_run(
 ) -> Option<SkillMetadata>
 ```
 
-**Purpose**: Matches a command against the indexed `scripts/` directories by resolving the executed script path and walking its ancestors.
+**Purpose**: This checks whether a command is running a script that lives inside a known skill’s scripts directory. It is how the system notices skill use through commands like `python ./some-skill/scripts/helper.py`.
 
-**Data flow**: Takes the loaded outcome, token list, and canonicalized workdir. It obtains a candidate script token via `script_run_token`, joins it to the workdir, canonicalizes the resulting path, then iterates through that path’s ancestors. On the first ancestor present in `outcome.implicit_skills_by_scripts_dir`, it clones and returns the associated `SkillMetadata`; otherwise it returns `None`.
+**Data flow**: It receives the loaded skill indexes, command tokens, and the working directory. It asks `script_run_token` for the script path, resolves that path relative to the working directory, normalizes it if possible, then walks upward through its parent directories. If any ancestor directory matches a known scripts directory, it returns that skill.
 
-**Call relations**: Invoked first by `detect_implicit_skill_invocation_for_command` because script execution is treated as the strongest implicit invocation signal.
+**Call relations**: It is the first detection path used by `detect_implicit_skill_invocation_for_command`. It uses `canonicalize_if_exists` for reliable path comparison, and it depends on the scripts-directory map built earlier by `build_implicit_skill_path_indexes`.
 
 *Call graph*: calls 3 internal fn (canonicalize_if_exists, script_run_token, join); called by 1 (detect_implicit_skill_invocation_for_command); 1 external calls (new).
 
@@ -6199,11 +6288,11 @@ fn detect_skill_doc_read(
 ) -> Option<SkillMetadata>
 ```
 
-**Purpose**: Matches shell commands that read a skill’s `SKILL.md` file using the shared parsed-command representation.
+**Purpose**: This checks whether a command reads a known skill document. It catches cases where a user or process opens the skill’s instructions directly rather than invoking the skill by name.
 
-**Data flow**: Consumes the loaded outcome, token list, and canonicalized workdir. It passes tokens to `parse_command_impl`, iterates parsed commands, and for each `ParsedCommand::Read { path, .. }` joins the path to the workdir, canonicalizes it, and looks it up in `outcome.implicit_skills_by_doc_path`. It returns the first cloned matching skill or `None`.
+**Data flow**: It receives the loaded skill indexes, command tokens, and the working directory. It parses the tokens into higher-level command actions, looks for read operations, resolves each read path relative to the working directory, normalizes it if possible, and compares it with the known skill document paths. If it finds a match, it returns that skill.
 
-**Call relations**: Called only if script-run detection fails, providing a secondary implicit invocation signal based on document reads.
+**Call relations**: It is called by `detect_implicit_skill_invocation_for_command` after script-run detection fails. It uses the command parser to understand read-like commands and the document-path map built by `build_implicit_skill_path_indexes`.
 
 *Call graph*: calls 3 internal fn (canonicalize_if_exists, parse_command_impl, join); called by 1 (detect_implicit_skill_invocation_for_command).
 
@@ -6214,11 +6303,11 @@ fn detect_skill_doc_read(
 fn command_basename(command: &str) -> String
 ```
 
-**Purpose**: Extracts the final path component of a command token for runner-name matching.
+**Purpose**: This extracts just the command name from a longer command path. For example, it turns `/usr/bin/python3` into `python3`.
 
-**Data flow**: Treats the input string as a `Path`, takes `file_name`, converts it to UTF-8 if possible, falls back to the original string otherwise, and returns an owned `String`.
+**Data flow**: It receives a command string. It treats it as a filesystem path, tries to take the final name component, and returns that as text. If it cannot extract a clean name, it returns the original string.
 
-**Call relations**: Used by `script_run_token` so commands like `/usr/bin/python3` and `python3.exe` match the runner allowlist.
+**Call relations**: It is called by `script_run_token` so runner detection works whether the user wrote `python3`, `/usr/bin/python3`, or another path-like form.
 
 *Call graph*: called by 1 (script_run_token); 1 external calls (new).
 
@@ -6229,24 +6318,26 @@ fn command_basename(command: &str) -> String
 fn canonicalize_if_exists(path: &AbsolutePathBuf) -> AbsolutePathBuf
 ```
 
-**Purpose**: Best-effort canonicalization helper that preserves the original absolute path when filesystem canonicalization fails.
+**Purpose**: This normalizes a path when the filesystem can confirm it exists, but safely leaves it unchanged when it cannot. It helps different spellings of the same real path compare equal.
 
-**Data flow**: Calls `path.canonicalize()` and returns the canonicalized path on success or a clone of the input `AbsolutePathBuf` on error.
+**Data flow**: It receives an absolute path. It asks the filesystem for the path’s canonical form, which is the cleaned-up real location. If that succeeds, it returns the canonical path; if it fails, it returns the original path unchanged.
 
-**Call relations**: Shared by indexing and detection functions so both sides compare normalized paths without requiring every path to exist.
+**Call relations**: This helper is used both when building the skill path indexes and when checking commands later. That symmetry matters: both sides of a comparison are cleaned up the same way, making matches more reliable.
 
 *Call graph*: calls 1 internal fn (canonicalize); called by 4 (build_implicit_skill_path_indexes, detect_implicit_skill_invocation_for_command, detect_skill_doc_read, detect_skill_script_run).
 
 
 ### `core-skills/src/remote.rs`
 
-`io_transport` · `remote skill discovery and download`
+`io_transport` · `on demand during remote skill listing or download`
 
-This file is an I/O-focused remote client that talks to the `/hazelnuts` API surface using authenticated HTTP requests. Two enums, `RemoteSkillScope` and `RemoteSkillProductSurface`, model the query dimensions exposed by the API and are converted into query-string values by small mapping helpers. Authentication is intentionally strict: `ensure_codex_backend_auth` rejects missing auth and rejects API-key-style auth that does not use the Codex backend.
+This file exists so the rest of the system can treat remote skills as simple things to list and download, instead of knowing the details of web requests, authentication, zip files, and safe file paths. A “remote skill” here is a packaged skill stored on a server. The code asks the server for available skills, or asks it to export one skill as a zip archive, then unpacks that archive locally.
 
-`list_remote_skills` builds a GET request with a 30-second timeout, optional `scope` and `enabled` query parameters, and auth headers derived from `CodexAuth`. It reads the full response body as text, fails fast on non-success status codes with the body included, deserializes the JSON payload from the oddly named `hazelnuts` field into internal structs, and maps those into `RemoteSkillSummary` values.
+Before it talks to the server, it checks that the user is signed in with ChatGPT/Codex backend authentication. API-key authentication is deliberately rejected for this feature. That matters because remote skill scopes appear to rely on the backend account context.
 
-`export_remote_skill` downloads `/hazelnuts/{skill_id}/export` as bytes, verifies success, checks the ZIP magic bytes before extraction, creates `<codex_home>/skills/<skill_id>`, and offloads archive extraction to `spawn_blocking`. Extraction is defensive: `normalize_zip_name` strips a leading `./` and an optional top-level `{skill_id}/` prefix, `safe_join` rejects any path containing non-`Normal` components to prevent traversal, and `extract_zip_to_dir` skips directory entries while creating parent directories and copying file contents. The result reports the downloaded skill id and output path.
+For listing, the file builds a `/hazelnuts` request with plain query values such as the product surface and scope, sends it with a 30-second timeout, checks that the server succeeded, and converts the JSON reply into simple `RemoteSkillSummary` records.
+
+For downloading, it calls `/hazelnuts/{skill_id}/export`, verifies the response looks like a zip file, creates a local `skills/<skill_id>` directory, and extracts files there. The extraction code is careful: it strips expected top-level zip folder names and refuses unsafe paths such as absolute paths or `..` parent-directory jumps. This is like checking every package label before putting it on a shelf, so a bad package cannot write files outside the intended shelf.
 
 #### Function details
 
@@ -6256,11 +6347,11 @@ This file is an I/O-focused remote client that talks to the `/hazelnuts` API sur
 fn as_query_scope(scope: RemoteSkillScope) -> Option<&'static str>
 ```
 
-**Purpose**: Maps a `RemoteSkillScope` enum value to the API's expected query-string representation.
+**Purpose**: Turns the program’s internal remote-skill scope choice into the exact text the server expects in the web request. For example, the internal `Personal` choice becomes the query value `personal`.
 
-**Data flow**: It takes a `RemoteSkillScope` and returns `Option<&'static str>`, matching each variant to a fixed kebab-case string. In the current implementation every variant maps to `Some(...)` and no state is read or written.
+**Data flow**: It receives a `RemoteSkillScope` value, matches it against the known scope options, and returns the matching query-string text wrapped in `Some`. Nothing outside the function is changed.
 
-**Call relations**: This helper is used by `list_remote_skills` when assembling optional query parameters for the `/hazelnuts` request.
+**Call relations**: When `list_remote_skills` is preparing its server request, it calls this helper so the request uses the server’s vocabulary rather than Rust enum names.
 
 *Call graph*: called by 1 (list_remote_skills).
 
@@ -6271,11 +6362,11 @@ fn as_query_scope(scope: RemoteSkillScope) -> Option<&'static str>
 fn as_query_product_surface(product_surface: RemoteSkillProductSurface) -> &'static str
 ```
 
-**Purpose**: Converts a `RemoteSkillProductSurface` enum into the exact product-surface string expected by the remote API.
+**Purpose**: Turns the internal product-surface choice into the text the remote service expects. A product surface means which product area the skill is for, such as ChatGPT, Codex, API, or Atlas.
 
-**Data flow**: It matches the enum argument and returns a static string such as `chatgpt`, `codex`, `api`, or `atlas`. It has no side effects.
+**Data flow**: It receives a `RemoteSkillProductSurface` value, chooses the corresponding lowercase string, and returns that string. It does not read or change any other state.
 
-**Call relations**: This is called by `list_remote_skills` to populate the mandatory `product_surface` query parameter.
+**Call relations**: When `list_remote_skills` builds the `/hazelnuts` request, it calls this function to add the correct `product_surface` query parameter.
 
 *Call graph*: called by 1 (list_remote_skills).
 
@@ -6286,11 +6377,11 @@ fn as_query_product_surface(product_surface: RemoteSkillProductSurface) -> &'sta
 fn ensure_codex_backend_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth>
 ```
 
-**Purpose**: Validates that remote-skill operations have ChatGPT/Codex-backend authentication available. It rejects both missing auth and unsupported API-key auth.
+**Purpose**: Checks that the caller has provided the right kind of sign-in information for remote skills. It rejects missing authentication and API-key authentication because this feature requires ChatGPT/Codex backend authentication.
 
-**Data flow**: It takes `Option<&CodexAuth>`, pattern-matches it, checks `uses_codex_backend()`, and returns `Result<&CodexAuth>`. On failure it constructs an `anyhow` error with a concrete explanatory message; on success it returns the borrowed auth unchanged.
+**Data flow**: It receives an optional reference to `CodexAuth`. If there is no authentication, or if the authentication is not for the Codex backend, it returns an error. If the authentication is acceptable, it returns the same authentication reference so the caller can use it in a request.
 
-**Call relations**: Both `list_remote_skills` and `export_remote_skill` call this first so they fail before issuing network requests when the auth mode cannot access remote skill scopes.
+**Call relations**: Both `list_remote_skills` and `export_remote_skill` call this first, before any network request is sent. This keeps the authentication rule in one place and prevents later code from accidentally calling the remote service with unsupported credentials.
 
 *Call graph*: called by 2 (export_remote_skill, list_remote_skills); 1 external calls (bail!).
 
@@ -6307,11 +6398,11 @@ async fn list_remote_skills(
 ) -> Re
 ```
 
-**Purpose**: Fetches the remote skill catalog for a given scope, product surface, and optional enabled-state filter, then converts the API response into lightweight summaries.
+**Purpose**: Asks the remote service for a list of available skills and returns a clean summary list to the caller. This is the read-only “show me what skills exist” operation.
 
-**Data flow**: It accepts the base URL, optional auth, a `RemoteSkillScope`, a `RemoteSkillProductSurface`, and `Option<bool>` for enabled filtering. It trims trailing slashes from the base URL, validates auth, builds the `/hazelnuts` URL and query parameter vector, creates a reqwest client, attaches timeout and auth headers, sends the request, reads the response body as text, checks HTTP status, deserializes `RemoteSkillsResponse` from JSON, and maps each `RemoteSkill` into `RemoteSkillSummary`. It returns `Result<Vec<RemoteSkillSummary>>` and performs outbound HTTP I/O.
+**Data flow**: It receives a base server URL, optional authentication, a skill scope, a product surface, and an optional enabled/disabled filter. It trims the base URL, verifies authentication, converts the scope and product surface into query text, builds an HTTP GET request to `/hazelnuts`, attaches authentication headers, and waits for the response. If the server reports an error, it returns an error with the status and body. If the response succeeds, it parses the JSON field named `hazelnuts` into skill records and returns a vector of `RemoteSkillSummary` values containing each skill’s id, name, and description.
 
-**Call relations**: This is the main read-side API client entrypoint. It delegates enum-to-query conversion and auth validation to local helpers, then performs the full request/parse pipeline itself.
+**Call relations**: This is the main listing entry point in the file. It relies on `ensure_codex_backend_auth` for the access check, `as_query_product_surface` and `as_query_scope` for request parameters, the shared HTTP client builder for network setup, and JSON parsing to turn the server reply into simple Rust data.
 
 *Call graph*: calls 4 internal fn (as_query_product_surface, as_query_scope, ensure_codex_backend_auth, build_reqwest_client); 5 external calls (bail!, auth_provider_from_auth, format!, from_str, vec!).
 
@@ -6327,11 +6418,11 @@ async fn export_remote_skill(
 ) -> Result<RemoteSkillDownloadResult>
 ```
 
-**Purpose**: Downloads a remote skill archive by id, validates that the payload is a ZIP, extracts it under the local Codex skills directory, and reports where it was written.
+**Purpose**: Downloads one remote skill as a zip archive and installs it into the local Codex skills directory. This is the “bring this remote skill onto my machine” operation.
 
-**Data flow**: It takes the base URL, `codex_home`, optional auth, and a `skill_id`. After auth validation it builds the `/hazelnuts/{skill_id}/export` URL, sends an authenticated GET with timeout, reads the body as bytes, checks status, verifies ZIP magic bytes with `is_zip_payload`, creates `<codex_home>/skills/<skill_id>`, clones the bytes and output path into a blocking task, and runs `extract_zip_to_dir` there with `prefix_candidates` containing the skill id. It returns `Result<RemoteSkillDownloadResult>` and writes files/directories on disk.
+**Data flow**: It receives the server URL, the local Codex home folder, optional authentication, and the skill id. It verifies authentication, builds a GET request to `/hazelnuts/{skill_id}/export`, sends it, and reads the response bytes. If the response failed, it reports the server status and response text. If the bytes do not look like a zip file, it rejects them. Otherwise it creates `codex_home/skills/<skill_id>`, then runs zip extraction in a blocking worker task so the async runtime is not tied up by file work. On success it returns the downloaded skill id and the local path where files were written.
 
-**Call relations**: This is the write-side remote client entrypoint. It relies on `ensure_codex_backend_auth` before networking, `is_zip_payload` before extraction, and `extract_zip_to_dir` plus its path-safety helpers to materialize the archive.
+**Call relations**: This is the main download entry point in the file. It calls `ensure_codex_backend_auth` before networking, `is_zip_payload` before trusting the download, and then hands the archive bytes to `extract_zip_to_dir`, which does the careful unpacking.
 
 *Call graph*: calls 3 internal fn (ensure_codex_backend_auth, is_zip_payload, build_reqwest_client); 8 external calls (join, from_utf8_lossy, bail!, auth_provider_from_auth, format!, create_dir_all, spawn_blocking, vec!).
 
@@ -6342,11 +6433,11 @@ async fn export_remote_skill(
 fn safe_join(base: &Path, name: &str) -> Result<PathBuf>
 ```
 
-**Purpose**: Safely appends an archive entry name to an output directory while rejecting traversal or absolute-path components.
+**Purpose**: Safely combines an output directory with a file name from the zip archive. Its job is to stop a malicious archive from writing outside the intended skill folder.
 
-**Data flow**: It takes a base `&Path` and an entry `&str`, parses the name as a `Path`, iterates its components, and permits only `Component::Normal(_)`. If any other component appears, it returns an error; otherwise it returns `base.join(path)` as a `PathBuf`.
+**Data flow**: It receives a trusted base directory and an archive file name. It breaks the file name into path pieces and only allows normal pieces such as folder or file names. If it sees anything suspicious, such as an absolute path or parent-directory component, it returns an error. If the name is safe, it returns the base directory joined with that path.
 
-**Call relations**: This helper is called from `extract_zip_to_dir` for every normalized archive entry so extraction cannot escape the intended output directory.
+**Call relations**: `extract_zip_to_dir` calls this for every file it wants to write. This makes path safety part of the extraction process rather than trusting names that came from the downloaded zip.
 
 *Call graph*: called by 1 (extract_zip_to_dir); 3 external calls (join, new, bail!).
 
@@ -6357,11 +6448,11 @@ fn safe_join(base: &Path, name: &str) -> Result<PathBuf>
 fn is_zip_payload(bytes: &[u8]) -> bool
 ```
 
-**Purpose**: Performs a quick signature check to see whether a byte buffer looks like a ZIP archive.
+**Purpose**: Performs a quick check that downloaded bytes look like a zip archive. It helps catch obvious wrong responses before the code tries to unpack them.
 
-**Data flow**: It reads the leading bytes of the provided slice and returns `true` if they match one of the standard ZIP signatures (`PK\x03\x04`, `PK\x05\x06`, or `PK\x07\x08`). It has no side effects.
+**Data flow**: It receives raw bytes from the server and checks whether they start with one of the standard zip signatures. It returns `true` if the bytes match one of those signatures and `false` otherwise.
 
-**Call relations**: This is used by `export_remote_skill` as an early validation step before creating directories and attempting extraction.
+**Call relations**: `export_remote_skill` calls this immediately after reading a successful download response. Only payloads that pass this check are sent on to the zip extraction step.
 
 *Call graph*: called by 1 (export_remote_skill).
 
@@ -6376,11 +6467,11 @@ fn extract_zip_to_dir(
 ) -> Result<()>
 ```
 
-**Purpose**: Extracts regular files from a ZIP archive into a target directory, optionally stripping a known top-level prefix and enforcing safe output paths.
+**Purpose**: Unpacks a zip archive into a chosen output folder while keeping only useful file entries and writing them safely. This turns the downloaded skill package into real files on disk.
 
-**Data flow**: It takes owned ZIP bytes, an output directory path, and a slice of prefix-candidate strings. It opens a `zip::ZipArchive` over a cursor, iterates entries by index, skips directory entries, normalizes each entry name with `normalize_zip_name`, skips entries normalized to `None`, validates the destination path with `safe_join`, creates parent directories as needed, creates the output file, and copies the entry contents into it. It returns `Result<()>` and performs synchronous filesystem writes.
+**Data flow**: It receives the zip bytes, the output directory, and possible top-level folder names to strip away. It opens the zip archive, walks through every entry, skips directories, normalizes each file name, and ignores entries that normalize to nothing. For each remaining file, it uses `safe_join` to choose a safe destination path, creates any needed parent folders, creates the output file, and copies the archive contents into it. It returns success when all accepted files are written, or an error if opening, reading, creating, or writing fails.
 
-**Call relations**: This function is invoked inside the blocking extraction task spawned by `export_remote_skill`. It delegates path normalization and path safety to local helpers so the extraction loop stays focused on archive traversal and file creation.
+**Call relations**: `export_remote_skill` hands downloaded zip bytes to this function inside a blocking task. Inside the extraction loop, this function calls `normalize_zip_name` to clean up archive names and `safe_join` to prevent unsafe writes.
 
 *Call graph*: calls 3 internal fn (normalize_zip_name, safe_join, new); 4 external calls (create, create_dir_all, copy, new).
 
@@ -6391,11 +6482,11 @@ fn extract_zip_to_dir(
 fn normalize_zip_name(name: &str, prefix_candidates: &[String]) -> Option<String>
 ```
 
-**Purpose**: Normalizes a ZIP entry name by removing a leading `./` and stripping one matching top-level prefix directory when present.
+**Purpose**: Cleans up a file name from the zip archive so it lands neatly inside the skill folder. In particular, it removes a leading `./` and can strip an expected top-level folder such as the skill id.
 
-**Data flow**: It takes the raw entry name and a list of prefix candidates. It trims leading `./`, then for each non-empty candidate checks for a `{prefix}/` prefix and strips the first match. If the resulting path is empty it returns `None`; otherwise it returns `Some(String)` with the normalized relative path.
+**Data flow**: It receives a raw archive name and a list of possible folder prefixes. It trims leading `./`, then checks whether the name starts with any non-empty prefix followed by `/`; if so, it removes that prefix. If nothing remains, it returns `None`, meaning there is no file path to write. Otherwise it returns the cleaned path text.
 
-**Call relations**: This helper is used by `extract_zip_to_dir` so exported archives can contain either bare files or a wrapping top-level directory named after the skill id without affecting the final on-disk layout.
+**Call relations**: `extract_zip_to_dir` calls this for each file entry before deciding where to write it. The cleaned name is then passed to `safe_join`, which performs the stricter safety check before disk output.
 
 *Call graph*: called by 1 (extract_zip_to_dir); 1 external calls (format!).
 
@@ -6404,25 +6495,33 @@ fn normalize_zip_name(name: &str, prefix_candidates: &[String]) -> Option<String
 
 `orchestration` · `cross-cutting`
 
-This file defines the top-level structure of the skills extension. It makes `catalog` and `provider` public modules, while keeping `config`, `extension`, `fragments`, `render`, `selection`, `sources`, `state`, and `tools` mostly internal. The root then re-exports the pieces external callers need to wire the extension into a host: `SkillsExtensionConfig`, the standard `install` path and `install_with_providers` variant, concrete provider implementations (`ExecutorSkillProvider`, `HostSkillProvider`, `OrchestratorSkillProvider`), the `SkillProvider` trait itself, and source-aggregation types (`SkillProviderSource`, `SkillProviders`). This arrangement reveals the intended architecture: callers configure and install the extension, optionally supply or select provider implementations, and rely on internal modules to render prompts, choose skills, maintain state, and expose tools. The file contains no executable logic, but it is the compatibility boundary for the subsystem. A notable design choice is selective visibility: catalog and provider concepts are first-class API, while prompt fragments and selection mechanics remain implementation details that can evolve without changing downstream imports.
+This file works like the table of contents and public reception desk for the skills extension. The extension appears to deal with “skills”: reusable capabilities supplied by different providers, such as a host, executor, or orchestrator. Most of the real work lives in the neighboring modules, such as configuration, provider definitions, source selection, rendering, state, and tools.
+
+The important job here is visibility. Some modules are made public, meaning outside code can refer to them by name, while others stay private inside the library. Then this file re-exports selected types and functions, such as `install`, `SkillsExtensionConfig`, and the main skill provider traits and structs. A re-export is like putting commonly needed items on the front counter so callers do not have to walk through the whole warehouse to find them.
+
+Without this file, the Rust compiler would not know which source files belong to this library, and other parts of the project would have a harder time using the skills extension. It does not run business logic itself; it organizes access to the pieces that do.
 
 
 ### `ext/skills/src/provider.rs`
 
-`domain_logic` · `request handling`
+`data_model` · `cross-cutting skill discovery and resource access`
 
-This file is the abstraction layer between the skills extension and the concrete places skills can come from. It declares three provider submodules—`executor`, `host`, and `orchestrator`—and re-exports their provider types so callers can instantiate source-specific implementations through a common API. The core data models are request structs tailored to each operation. `SkillListQuery` carries turn-scoped and environment-scoped inputs for catalog assembly: a `turn_id`, executor capability roots, optional host-loaded skills, booleans controlling inclusion of host, bundled, and orchestrator skills, and optional MCP resource access. `SkillReadRequest` identifies a single resource by `SkillAuthority`, `SkillPackageId`, and `SkillResourceId`, plus optional host and MCP clients needed to resolve it in the correct source. `SkillSearchRequest` narrows search to a specific authority/package pair and a query string, and derives equality for deterministic comparisons. `SkillProviderFuture<'a, T>` standardizes async provider results as boxed, pinned, `Send` futures yielding `SkillProviderResult<T>`. The `SkillProvider` trait then defines the three operations: `list`, `read`, and `search`. The most important invariant is documented directly in the trait comments: authority boundaries must be preserved. A provider that lists a resource must also be the one that reads or searches it; implementations must not collapse source-specific identifiers into ambient local paths, which protects isolation and attribution across host, executor, and orchestrator-backed skill stores.
+This file is the front door for the skill provider layer. A “skill” here is a packaged ability or resource the system can discover and use. Skills may come from different places, such as the host environment, bundled built-in packages, an orchestrator, or MCP resources, which are external resources accessed through the Model Context Protocol. This file gives all those sources the same shape so the rest of the program can ask simple questions: “What skills are available?”, “Read this skill resource,” and “Search inside this skill package.”
+
+The key idea is authority boundaries. In plain terms, if a skill came from one source, the program must go back to that same source to read or search it. It should not turn that skill into a loose local file path and bypass the provider. This is like checking out a library book through the same library system that cataloged it, rather than copying down a shelf location and sneaking around the rules.
+
+The file also re-exports three concrete provider types: executor, host, and orchestrator providers. Those live in separate files, while this file defines the shared contract they follow. The request structs carry the information each operation needs, such as the current turn, selected roots, package IDs, resource IDs, and optional access to host-loaded skills or MCP resources.
 
 
 ### `ext/skills/src/provider/executor.rs`
 
-`domain_logic` · `skill discovery and skill read`
+`domain_logic` · `skill listing and skill read requests`
 
-This provider bridges executor-owned filesystems into the shared skills catalog/read contract. `ExecutorSkillProvider` stores an `Arc<EnvironmentManager>` used to resolve environment ids into live environments and an optional `restriction_product` used to filter loaded skills by product.
+An execution environment is a separate place where files can live, such as a sandbox or remote workspace. This file provides a bridge between that environment and the skill catalog. Without it, skills stored in executor-owned folders would not appear in the catalog, and users could not read their skill definitions through the normal skill-provider interface.
 
-Its `list` implementation walks every selected executor capability root from `SkillListQuery`. For each root, it constructs an executor `SkillAuthority`, verifies that the referenced environment still exists, validates that the configured path is absolute via `executor_absolute_path`, and then loads skills from that root using `load_skills_from_roots` with `SkillScope::User` and the environment's filesystem handle. The resulting load outcome is filtered through `filter_skill_load_outcome_for_product`, loader errors are converted into warning strings on the `SkillCatalog`, and each discovered skill becomes a `SkillCatalogEntry` through `catalog_entry_from_skill`. That helper synthesizes a stable `skill://{selected_root_id}/...` display/package path, binds the main prompt resource to the owning environment and absolute path, and preserves short description, dependencies, enabled state, and implicit-invocation visibility.
+The main type is `ExecutorSkillProvider`. It keeps a shared reference to an `EnvironmentManager`, which is the object that knows how to find environments by ID. When asked to list skills, the provider walks through the selected executor roots from the query. For each root, it checks that the referenced environment exists, checks that the path is an absolute path, then asks the core skill loader to scan that folder. It also filters the results for a specific product when a product restriction is set, so skills meant for another product can be disabled or excluded as appropriate.
 
-`read` is intentionally strict: it only accepts `SkillSourceKind::Executor`, requires the package id to equal the resource id string, requires an embedded environment binding on the `SkillResourceId`, and verifies that the referenced environment still exists. It then converts the absolute path into a `PathUri` and reads text through the environment filesystem. Search is currently a no-op returning an empty `SkillSearchResult`. The key invariant is that executor resources are only readable when the catalog entry carried the hidden environment/path binding created during listing.
+Each discovered skill is converted into a `SkillCatalogEntry`, which is the catalog’s standard “card” for a skill: name, description, display path, dependencies, resource ID, and visibility flags. When asked to read a skill, the provider validates that the request really points to an executor skill, finds the right environment, and reads the skill file text from that environment’s filesystem. Search is intentionally empty here, so this provider contributes list-and-read behavior but no separate search results.
 
 #### Function details
 
@@ -6435,11 +6534,11 @@ fn new_with_restriction_product(
     ) -> Self
 ```
 
-**Purpose**: Constructs an executor skill provider with a specific environment manager and optional product restriction. The restriction controls which loaded skills survive filtering during listing.
+**Purpose**: Creates an executor-backed skill provider. The caller gives it access to the environment manager and may also give it a product restriction, which limits or marks skills based on which product they belong to.
 
-**Data flow**: Consumes an `Arc<EnvironmentManager>` and `Option<Product>`, stores them in `ExecutorSkillProvider { environment_manager, restriction_product }`, and returns the provider.
+**Data flow**: It receives a shared `EnvironmentManager` and an optional `Product`. It stores both values inside a new `ExecutorSkillProvider`. The result is a provider object ready to list and read executor skills.
 
-**Call relations**: Used by setup code and tests that need executor-backed skill discovery, sometimes with product-specific filtering enabled.
+**Call relations**: This is the setup step used by higher-level construction and tests, including `new`, `refresh_test_state`, and `selected_root_id_distinguishes_identical_executor_paths`. After this object is created, its `list`, `read`, and `search` methods can be called through the `SkillProvider` interface.
 
 *Call graph*: called by 3 (refresh_test_state, new, selected_root_id_distinguishes_identical_executor_paths).
 
@@ -6450,11 +6549,11 @@ fn new_with_restriction_product(
 fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 ```
 
-**Purpose**: Discovers skills under each selected executor capability root and converts them into catalog entries plus warnings. It is the provider's main catalog-building path.
+**Purpose**: Builds a catalog of skills found under the executor roots selected by the caller. It also records warnings instead of failing the whole listing when one root is missing, invalid, or contains broken skill data.
 
-**Data flow**: Consumes `SkillListQuery`, initializes `SkillCatalog::default()`, and iterates `query.executor_roots`. For each root it extracts the selected-root id, environment id, and path; constructs executor authority; looks up the environment in `self.environment_manager`; validates the path with `executor_absolute_path`; obtains the environment filesystem; loads skills from a single `SkillRoot`; filters the outcome by `self.restriction_product`; appends formatted loader errors to `catalog.warnings`; and pushes each discovered skill as a `SkillCatalogEntry` built by `catalog_entry_from_skill`. It returns `Ok(catalog)`.
+**Data flow**: It receives a `SkillListQuery` containing selected executor roots. For each root, it reads the environment ID and path, looks up the environment, verifies the path is absolute, loads skills from that environment’s filesystem, filters the load result for the configured product, and turns each skill into a catalog entry. It returns a `SkillCatalog` containing entries plus any warnings gathered along the way.
 
-**Call relations**: Called by higher-level provider orchestration when executor skills should be included in a turn's catalog. It delegates path validation to `executor_absolute_path`, skill loading to `load_skills_from_roots`, product filtering to `filter_skill_load_outcome_for_product`, and entry shaping to `catalog_entry_from_skill`.
+**Call relations**: This is the main discovery path for executor skills. It calls `executor_absolute_path` before touching the filesystem, calls `load_skills_from_roots` to scan for skill metadata, passes that result through `filter_skill_load_outcome_for_product`, and uses `catalog_entry_from_skill` to convert each loaded skill into the catalog format used by the rest of the skills system.
 
 *Call graph*: calls 4 internal fn (load_skills_from_roots, new, catalog_entry_from_skill, executor_absolute_path); 5 external calls (clone, pin, filter_skill_load_outcome_for_product, default, format!).
 
@@ -6465,11 +6564,11 @@ fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>
 ```
 
-**Purpose**: Reads the text contents of an executor-owned skill resource from the correct environment filesystem. It validates authority, package/resource consistency, and embedded environment binding before touching the filesystem.
+**Purpose**: Reads the text of one executor skill resource from its environment filesystem. It protects the provider from being asked to read the wrong kind of resource by checking the authority, package, environment binding, and environment availability first.
 
-**Data flow**: Consumes `SkillReadRequest`, checks `request.authority.kind` is `SkillSourceKind::Executor`, checks `request.package.0 == request.resource.as_str()`, extracts `(environment_id, resource_path)` from `request.resource.environment_path()`, resolves the environment from `self.environment_manager`, converts the absolute path to `PathUri`, and awaits `environment.get_filesystem().read_file_text(...)`. On success it returns `SkillReadResult { resource: request.resource, contents }`; on any validation or I/O failure it returns `SkillProviderError` with a concrete message.
+**Data flow**: It receives a `SkillReadRequest`. It checks that the request is for an executor skill, confirms the package and resource match, extracts the environment ID and file path from the resource ID, finds the environment, converts the path into a filesystem URI, and reads the file as text. It returns a `SkillReadResult` containing the original resource ID and the file contents, or a clear provider error if any step fails.
 
-**Call relations**: Invoked when thread-state routing selects the executor provider for a skill read. It depends on the environment binding inserted by `catalog_entry_from_skill`; without that binding, reads are rejected.
+**Call relations**: This is used when some caller already has a catalog entry and wants the actual skill file contents. It relies on the resource IDs created by `catalog_entry_from_skill`, because those IDs carry the environment ID and absolute path needed to read the file later.
 
 *Call graph*: calls 2 internal fn (new, from_abs_path); 2 external calls (pin, format!).
 
@@ -6480,11 +6579,11 @@ fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadRe
 fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>
 ```
 
-**Purpose**: Implements the provider search interface as a stub that returns no matches. Executor-backed skill search is not supported here.
+**Purpose**: Returns no search results for executor skills. This provider supports listing and reading, but it does not implement a separate search feature.
 
-**Data flow**: Ignores the incoming `SkillSearchRequest` and returns `Ok(SkillSearchResult::default())`.
+**Data flow**: It receives a search request but does not inspect it. It creates and returns an empty `SkillSearchResult`, leaving all data unchanged.
 
-**Call relations**: Called only if higher-level code asks this provider to search. It intentionally delegates nothing and produces an empty result.
+**Call relations**: This method completes the `SkillProvider` interface. When the broader skills system asks every provider to search, this provider simply contributes an empty result instead of scanning executor files again.
 
 *Call graph*: 2 external calls (pin, default).
 
@@ -6501,11 +6600,11 @@ fn catalog_entry_from_skill(
 ) -> SkillCatalogEntry
 ```
 
-**Purpose**: Transforms loaded executor skill metadata into a catalog entry with a synthetic `skill://` package path and an environment-bound main prompt resource. It also carries through enabled and prompt-visibility flags.
+**Purpose**: Converts raw loaded skill metadata into the catalog entry format used by the rest of the system. This is where executor skill files become user-facing catalog items with names, descriptions, display paths, dependencies, and visibility flags.
 
-**Data flow**: Reads `SkillMetadata`, `enabled`, `authority`, `selected_root_id`, and `environment_id`. It derives `skill_path` from `skill.path_to_skills_md`, normalizes backslashes to `/`, builds `display_path` as `skill://{selected_root_id}/...`, constructs a `SkillCatalogEntry::new(...)` with `SkillPackageId(display_path.clone())` and `SkillResourceId::environment(display_path.clone(), environment_id, skill.path_to_skills_md.clone())`, then chains short description, display path, and dependencies. If `enabled` is false it marks the entry disabled; if `skill.allows_implicit_invocation()` is false it hides the entry from prompt listings; returns the final entry.
+**Data flow**: It receives a loaded `SkillMetadata`, whether that skill is enabled, the authority describing where it came from, the selected root ID, and the environment ID. It builds a stable display path like a `skill://...` address, creates a package ID and environment-bound resource ID, copies descriptive fields and dependencies, then marks the entry disabled or hidden from prompts when the skill metadata says so. It returns the completed `SkillCatalogEntry`.
 
-**Call relations**: Called from `ExecutorSkillProvider::list` for each discovered skill. It encapsulates the provider-specific mapping from filesystem metadata to the shared catalog model.
+**Call relations**: This helper is called by `ExecutorSkillProvider::list` for every skill successfully loaded from an executor root. The entry it creates is later important to `ExecutorSkillProvider::read`, because its resource ID preserves enough information to find the same file again inside the correct environment.
 
 *Call graph*: calls 2 internal fn (new, environment); called by 1 (list); 3 external calls (allows_implicit_invocation, new, format!).
 
@@ -6516,26 +6615,24 @@ fn catalog_entry_from_skill(
 fn executor_absolute_path(path: &str) -> std::io::Result<AbsolutePathBuf>
 ```
 
-**Purpose**: Validates that a configured executor root path is absolute and converts it into `AbsolutePathBuf`. It rejects relative paths before skill loading begins.
+**Purpose**: Checks that an executor root path is absolute and converts it into the project’s trusted absolute-path type. This prevents the loader from receiving vague relative paths like `../skills`, which could mean different things depending on where the process is running.
 
-**Data flow**: Takes `path: &str`, converts it to `PathBuf`, checks `is_absolute()`, and either returns an `InvalidInput` `std::io::Error` or forwards the path into `AbsolutePathBuf::from_absolute_path_checked`; returns `std::io::Result<AbsolutePathBuf>`.
+**Data flow**: It receives a path string. It turns the string into a filesystem path, rejects it if it is not absolute, and then asks `AbsolutePathBuf` to validate and wrap it. It returns either the validated absolute path or an input error explaining that the executor path must be absolute.
 
-**Call relations**: Used by `ExecutorSkillProvider::list` before constructing `SkillRoot`s. It isolates path validation so listing can turn invalid roots into warnings instead of panics.
+**Call relations**: This helper is called by `ExecutorSkillProvider::list` before loading skills from a selected root. If it returns an error, listing records a warning for that root and moves on to the next one instead of trying to scan an unsafe or unclear path.
 
 *Call graph*: calls 1 internal fn (from_absolute_path_checked); called by 1 (list); 2 external calls (from, new).
 
 
 ### `ext/skills/src/provider/host.rs`
 
-`domain_logic` · `skill discovery and skill read`
+`domain_logic` · `request handling`
 
-This provider is the thin adapter between core host skill loading and the skills extension. `HostSkillProvider` is stateless and default-constructible because all dynamic data arrives through `SkillListQuery.host` and `SkillReadRequest.host`. The constant `HOST_AUTHORITY_ID` fixes the authority id used for all host-owned skills.
+The main program, called the host here, is responsible for finding and loading skills from all the places it knows about: plugin folders, extra runtime folders, and the normal environment. This file does not try to load those skills again. Instead, it provides a thin bridge called `HostSkillProvider` that says, “Use the skills the host already found.”
 
-In `list`, the provider requires `query.host` to be present; otherwise it returns a `SkillProviderError` explaining that loaded host skills are required. When host data exists, it converts the underlying `SkillLoadOutcome` into a `SkillCatalog` via `catalog_from_outcome`. That helper preserves loader errors as warning strings and maps each loaded skill into a `SkillCatalogEntry` using `catalog_entry_from_skill`.
+When someone asks for a list of skills, the provider checks that loaded host skills were included in the request. If they were not, it returns a clear error, because this provider cannot work without that host-owned data. If they were included, it turns the host’s loaded skill result into a `SkillCatalog`, which is the extension system’s standard list of available skills. Any loading errors become warnings in that catalog, so users can still see the good skills while being told what failed.
 
-The entry conversion keeps the package id as the original `skills.md` path string, uses `SkillAuthority::new(SkillSourceKind::Host, HOST_AUTHORITY_ID)`, stores the same path as the main prompt `SkillResourceId`, and separately computes a normalized display path with forward slashes. It also carries over short description and dependencies, marks disabled skills, and hides skills that disallow implicit invocation.
-
-`read` again requires host-loaded skills in the request. It locates the requested skill by comparing the requested resource id against both the raw path string and a slash-normalized version, which avoids Windows path separator mismatches. It then delegates file reading to `host_loaded_skills.read_skill_text`. Search is currently unsupported and returns an empty result. The key design choice is that this provider never reloads or caches skills; it trusts core to own loading and simply projects that state into extension-friendly types.
+When someone asks to read a skill, the provider looks for a loaded skill whose `SKILLS.md` path matches the requested resource. It accepts both normal platform paths and slash-based paths, which matters on Windows where paths often use backslashes. It then asks the host-loaded skill object to read the text. Search is intentionally empty for this provider; it only exposes the already-known host skills.
 
 #### Function details
 
@@ -6545,11 +6642,11 @@ The entry conversion keeps the package id as the original `skills.md` path strin
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the stateless host skill provider. Because all runtime data is supplied per request, the constructor simply returns `Self`.
+**Purpose**: Creates a new host skill provider. Someone uses this when wiring the skills extension into the larger system and wants a provider that exposes the host’s already-loaded skills.
 
-**Data flow**: Takes no inputs beyond type context and returns `HostSkillProvider` with no internal state.
+**Data flow**: Nothing is passed in. The function creates an empty `HostSkillProvider` value, because this provider does not keep its own cache or settings. The result is a ready-to-use provider object.
 
-**Call relations**: Used during extension installation to add host-backed skill support to the provider set.
+**Call relations**: The install flow calls this when setting up available skill providers. After that, the provider’s `list`, `read`, and `search` methods are called through the shared `SkillProvider` interface.
 
 *Call graph*: called by 1 (install).
 
@@ -6560,11 +6657,11 @@ fn new() -> Self
 fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 ```
 
-**Purpose**: Builds a catalog from the host's already-loaded skills for the current turn. It fails fast if the caller did not supply host-loaded skill state.
+**Purpose**: Builds a catalog of host-loaded skills for callers that want to know what skills are available. It fails early if the request did not include the host’s loaded skill data.
 
-**Data flow**: Consumes `SkillListQuery`, checks `query.host`, and either returns `SkillProviderError::new("host skill provider requires loaded host skills")` or passes `host_loaded_skills.outcome()` into `catalog_from_outcome`, returning the resulting `SkillCatalog`.
+**Data flow**: It receives a `SkillListQuery`, which may contain a reference to already-loaded host skills. If that reference is missing, it returns an error explaining that host skills are required. If present, it takes the host’s load outcome and turns it into a `SkillCatalog`, including both skill entries and warnings about skills that failed to load.
 
-**Call relations**: Called by provider orchestration when host skills should be included in the turn catalog. It delegates all catalog shaping to `catalog_from_outcome`.
+**Call relations**: This is called when the skill system asks this provider for its available skills. Inside the asynchronous task, it calls `catalog_from_outcome` to do the actual translation from host load results into extension catalog entries.
 
 *Call graph*: calls 2 internal fn (new, catalog_from_outcome); 1 external calls (pin).
 
@@ -6575,11 +6672,11 @@ fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>
 ```
 
-**Purpose**: Reads the contents of a host-owned skill resource from the already-loaded host skill set. It resolves the requested resource by matching against loaded skill paths, including slash-normalized variants.
+**Purpose**: Reads the text for one specific host-loaded skill resource. This is used after a caller has found a skill in the catalog and wants the actual contents behind it.
 
-**Data flow**: Consumes `SkillReadRequest`, checks `request.host`, scans `host_loaded_skills.outcome().skills` for a `SkillMetadata` whose `path_to_skills_md` string equals `request.resource.as_str()` either directly or after replacing backslashes with `/`, then awaits `host_loaded_skills.read_skill_text(skill)`. On success it returns `SkillReadResult { resource: request.resource, contents }`; on missing host state, missing skill, or read failure it returns `SkillProviderError` with a descriptive message.
+**Data flow**: It receives a `SkillReadRequest` containing the requested resource id and, ideally, the host’s loaded skills. First it checks that the loaded host skills are present. Then it searches those loaded skills for a matching `SKILLS.md` path, accepting both backslash and forward-slash path forms. If it finds the skill, it asks the host-loaded skill object to read the skill text. It returns the requested resource id plus the text, or an error if the host data is missing, the skill was not loaded, or the read failed.
 
-**Call relations**: Invoked when read routing selects the host provider for a skill entry. It depends on the host-loaded skill snapshot supplied by higher-level extension code.
+**Call relations**: This method is called when the provider is asked to open a specific host skill. It does not read from a catalog entry directly; instead, it finds the matching loaded skill metadata and hands off the actual text reading to the host-loaded skills object.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (pin, format!).
 
@@ -6590,11 +6687,11 @@ fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadRe
 fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>
 ```
 
-**Purpose**: Implements the provider search interface as an empty result. Host-backed skill search is not provided here.
+**Purpose**: Returns an empty search result for host skills. This provider supports listing and reading host-loaded skills, but it does not implement separate search behavior.
 
-**Data flow**: Ignores the incoming `SkillSearchRequest` and returns `Ok(SkillSearchResult::default())`.
+**Data flow**: It receives a search request but does not inspect it. It immediately returns the default empty `SkillSearchResult`, meaning no search hits and no extra work.
 
-**Call relations**: Only participates if higher-level code asks this provider to search; it intentionally performs no lookup.
+**Call relations**: This is called when the shared provider interface asks this provider to search. Unlike `list` and `read`, it does not hand off to helper functions or host data, because search is intentionally a no-op here.
 
 *Call graph*: 2 external calls (pin, default).
 
@@ -6605,11 +6702,11 @@ fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillS
 fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog
 ```
 
-**Purpose**: Converts a core `SkillLoadOutcome` into the extension's `SkillCatalog`, preserving loader errors as warnings and loaded skills as catalog entries. It is the host provider's catalog translation helper.
+**Purpose**: Turns the host’s skill-loading result into the extension system’s catalog format. This lets the rest of the extension code treat host-loaded skills the same way it treats skills from other sources.
 
-**Data flow**: Reads `outcome.errors` to build `warnings` strings of the form `Failed to load skill at ...`, initializes `SkillCatalog { entries: Vec::new(), warnings }`, iterates `outcome.skills_with_enabled()`, converts each pair with `catalog_entry_from_skill`, and pushes the result into the catalog; returns the populated catalog.
+**Data flow**: It receives a `SkillLoadOutcome`, which contains successfully loaded skills plus loading errors. It starts a new `SkillCatalog`, converts each loading error into a human-readable warning, then walks through each loaded skill together with whether it is enabled. For every skill, it creates a catalog entry and adds it to the catalog. The finished catalog comes out.
 
-**Call relations**: Called from `HostSkillProvider::list`. It delegates per-skill entry shaping to `catalog_entry_from_skill`.
+**Call relations**: `HostSkillProvider::list` calls this after confirming that host-loaded skills are available. For each individual skill, this helper calls `catalog_entry_from_skill` so the per-skill conversion stays in one focused place.
 
 *Call graph*: calls 2 internal fn (skills_with_enabled, catalog_entry_from_skill); called by 1 (list); 1 external calls (new).
 
@@ -6620,26 +6717,24 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog
 fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalogEntry
 ```
 
-**Purpose**: Maps one loaded host skill into a `SkillCatalogEntry` with host authority and normalized display path. It preserves metadata and visibility flags from the core skill metadata.
+**Purpose**: Builds one catalog entry from one host skill’s metadata. It records the skill’s name, description, path, dependencies, whether it is enabled, and whether it should be shown to the prompt.
 
-**Data flow**: Reads `SkillMetadata` and `enabled`, derives `skill_path` from `path_to_skills_md`, computes `display_path` by replacing backslashes with `/`, constructs `SkillCatalogEntry::new(...)` with `SkillPackageId(skill_path.clone())`, host authority, and `SkillResourceId::new(skill_path)`, then chains short description, display path, and dependencies. It conditionally marks the entry disabled and/or hidden from prompt based on `enabled` and `skill.allows_implicit_invocation()`; returns the final entry.
+**Data flow**: It receives a `SkillMetadata` object and a boolean saying whether that skill is enabled. It extracts the skill’s `SKILLS.md` path, creates both a stored resource id and a display-friendly path, and fills a new `SkillCatalogEntry` with the skill’s title, descriptions, source authority, resource id, and dependencies. If the skill is disabled, it marks the entry disabled. If the skill does not allow implicit invocation, it hides the entry from prompt use. The completed catalog entry is returned.
 
-**Call relations**: Called from `catalog_from_outcome` for each loaded host skill. It encapsulates the host-specific mapping into the shared catalog model.
+**Call relations**: `catalog_from_outcome` calls this once for each loaded host skill. The resulting entry is then pushed into the catalog that `HostSkillProvider::list` returns to callers.
 
 *Call graph*: calls 3 internal fn (new, new, new); called by 1 (catalog_from_outcome); 2 external calls (allows_implicit_invocation, new).
 
 
 ### `ext/skills/src/provider/orchestrator.rs`
 
-`domain_logic` · `skill discovery and skill read`
+`domain_logic` · `skill discovery and skill read requests`
 
-This provider exposes orchestrator-owned skills published over MCP. It is stateless, but its behavior is tightly constrained by constants: discovery and read timeouts, maximum resource pages and total skills, maximum lengths for names/descriptions/URIs, and a maximum read size for resource contents. Only resources with MIME type `mcp/skill` are considered.
+The orchestrator can expose skills as session resources. This file is the adapter that knows how to find those resources, check that they look safe and well-formed, and present them through the common SkillProvider interface used by the rest of the skills extension. Without it, orchestrator-owned skills would either be invisible or would have to leak MCP details into callers that should not need to know about the transport.
 
-`list` requires an MCP resource client and the presence of the `CODEX_APPS_MCP_SERVER_NAME` server; otherwise it returns an empty catalog. Discovery runs page-by-page under a single absolute deadline using `timeout_at`, tracking duplicate cursors, page count, total skill resources seen, malformed resources skipped, and whether truncation occurred. If the first page fails, the whole call errors; later failures degrade into warnings attached to the partial catalog. Each candidate resource is passed through `catalog_entry_from_resource`, which validates the package URI, extracts and normalizes metadata fields from `resource.meta`, qualifies non-user skills as `plugin_name:skill_name`, escapes descriptions, and synthesizes the main prompt URI by appending `/SKILL.md`.
+The main type, OrchestratorSkillProvider, is deliberately small. When asked to list skills, it first checks whether a session MCP resource client exists and whether the expected Codex Apps MCP server is available. It then pages through resources, like reading a catalog one page at a time, but with guardrails: a timeout, a maximum number of pages, a maximum number of skills, duplicate-cursor detection, and warnings when discovery is incomplete.
 
-`read` validates that the request authority exactly matches orchestrator ownership, checks that the requested resource URI belongs under the package URI, requires an MCP client, and performs a timed `read_resource` call. It then searches returned `ResourceContent` items for a text payload whose URI exactly matches the requested resource, rejects blobs or mismatched text entries, and enforces a byte-size limit before returning `SkillReadResult`.
-
-The helper functions are where most invariants live: URI validation rejects whitespace, control characters, angle brackets, credentials, ports, queries, fragments, and malformed path segments; package/resource matching requires the resource path to extend the package path; label normalization collapses whitespace and rejects XML-sensitive characters; description normalization additionally escapes XML entities. Together these checks prevent malformed MCP metadata from leaking into prompts or routing logic.
+Only resources with the special skill MIME type are considered. Each candidate is converted into a SkillCatalogEntry only if its URI, name, description, and metadata pass validation. When asked to read a skill, the provider verifies that the request is really for the orchestrator, that the requested resource belongs under the package URI, then reads matching text contents with a timeout and size limit. Search is currently a no-op and returns no results.
 
 #### Function details
 
@@ -6649,11 +6744,11 @@ The helper functions are where most invariants live: URI validation rejects whit
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the stateless orchestrator skill provider. All runtime transport state is supplied through list/read requests.
+**Purpose**: Creates a new orchestrator skill provider. It exists so setup code can add this provider to the larger skills system without knowing any internal details.
 
-**Data flow**: Takes no inputs and returns `OrchestratorSkillProvider`.
+**Data flow**: There is no input beyond the request to create it. The function returns an empty OrchestratorSkillProvider value, because this provider keeps no stored state of its own.
 
-**Call relations**: Used by extension setup code when orchestrator-backed skills should be available.
+**Call relations**: The thread extension setup calls this when it wires available skill providers together. After that, the provider is used through the shared SkillProvider interface.
 
 *Call graph*: called by 1 (thread_extensions).
 
@@ -6664,11 +6759,11 @@ fn new() -> Self
 fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 ```
 
-**Purpose**: Discovers orchestrator-owned skill resources over MCP, validates them, and returns a catalog plus warnings about truncation or malformed resources. It handles pagination, timeouts, and partial-failure behavior.
+**Purpose**: Finds orchestrator-published skills and returns them as a catalog the rest of the application can understand. It protects the caller from missing servers, slow resource discovery, malformed resources, and runaway pagination.
 
-**Data flow**: Consumes `SkillListQuery`, checks `query.mcp_resources`, and verifies the MCP server exists. It initializes discovery state (`discovery_deadline`, empty `SkillCatalog`, `cursor`, `seen_cursors`, counters, and truncation flags), then loops up to `MAX_RESOURCE_PAGES`, calling `client.list_resources(..., cursor.clone())` under `tokio::time::timeout_at`. First-page failures return `Err(SkillProviderError)`; later failures append a warning and stop. For each page it filters resources by MIME type, enforces `MAX_ORCHESTRATOR_SKILLS`, converts valid resources with `catalog_entry_from_resource`, counts malformed ones, and advances pagination unless there is no next cursor or a duplicate cursor is detected. After the loop it appends truncation/skipped-resource warnings as needed and returns `Ok(catalog)`.
+**Data flow**: It receives a SkillListQuery, mainly looking for a session MCP resource client. If there is no client or the expected MCP server is absent, it returns an empty catalog. Otherwise it asks the server for resource pages, filters for resources marked as orchestrator skills, converts valid ones into catalog entries, records warnings for partial or malformed discovery, and returns the completed catalog or an error if discovery fails before any page is read.
 
-**Call relations**: Called by higher-level provider orchestration when orchestrator skills are enabled. It delegates per-resource validation and entry construction to `catalog_entry_from_resource` and uses `SkillProviderError::new` to normalize transport failures.
+**Call relations**: Callers use this through the SkillProvider trait when building the available skills list. Inside the flow it creates a default catalog, uses timed MCP resource listing calls, and hands each matching resource to catalog_entry_from_resource so the validation and conversion rules stay in one place.
 
 *Call graph*: calls 2 internal fn (new, catalog_entry_from_resource); 6 external calls (pin, new, default, format!, now, timeout_at).
 
@@ -6679,11 +6774,11 @@ fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>
 fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>
 ```
 
-**Purpose**: Reads the main prompt text for an orchestrator-owned skill resource through MCP, with strict authority/package validation and timeout/size enforcement. It rejects malformed or mismatched resource responses.
+**Purpose**: Reads the actual text for one orchestrator skill resource. It makes sure the request is allowed and points to a resource inside the claimed skill package before fetching any contents.
 
-**Data flow**: Consumes `SkillReadRequest`, checks that `request.authority` equals `SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)`, verifies `resource_belongs_to_package(&request.package.0, request.resource.as_str())`, requires `request.mcp_resources`, and performs `client.read_resource(...)` under `tokio::time::timeout(ORCHESTRATOR_SKILL_READ_TIMEOUT, ...)`. It scans returned `result.contents` for `ResourceContent::Text` whose `uri` exactly matches the requested resource, extracts the text, rejects missing/mismatched contents and oversized payloads, and returns `SkillReadResult { resource: request.resource, contents }`; otherwise it returns `SkillProviderError` with a concrete message.
+**Data flow**: It receives a SkillReadRequest containing the expected authority, package URI, resource URI, and optional MCP resource client. It rejects the request if the authority is not the orchestrator, if the resource URI does not belong under the package URI, or if no client is available. Then it reads the resource with a timeout, selects the text content whose URI exactly matches the requested resource, checks the size limit, and returns that text with the resource id.
 
-**Call relations**: Invoked when read routing selects the orchestrator provider. It relies on `resource_belongs_to_package` to ensure callers cannot read arbitrary MCP resources outside the advertised package.
+**Call relations**: The skills system calls this through the SkillProvider trait when it needs to load a specific orchestrator skill. Before talking to MCP, it calls resource_belongs_to_package as a safety check; after that it performs the timed resource read and converts any transport failure into a SkillProviderError.
 
 *Call graph*: calls 3 internal fn (new, new, resource_belongs_to_package); 3 external calls (pin, format!, timeout).
 
@@ -6694,11 +6789,11 @@ fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadRe
 fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>
 ```
 
-**Purpose**: Implements the provider search interface as an empty result. Orchestrator-backed skill search is not implemented here.
+**Purpose**: Provides the required search method for the SkillProvider interface, but orchestrator skill search is not implemented here. It simply reports no search results.
 
-**Data flow**: Ignores the incoming `SkillSearchRequest` and returns `Ok(SkillSearchResult::default())`.
+**Data flow**: It receives a SkillSearchRequest but does not inspect it. It returns a default, empty SkillSearchResult and changes nothing.
 
-**Call relations**: Only participates if higher-level code asks this provider to search; it intentionally performs no MCP search operation.
+**Call relations**: The broader skills system may call this because every provider has a search method. This provider does not delegate to any helper or MCP call for search; it immediately completes with an empty result.
 
 *Call graph*: 2 external calls (pin, default).
 
@@ -6709,11 +6804,11 @@ fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillS
 fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
 ```
 
-**Purpose**: Validates an MCP resource's URI and metadata and, if valid, converts it into a `SkillCatalogEntry` for the orchestrator catalog. Invalid or malformed resources are dropped by returning `None`.
+**Purpose**: Turns one raw MCP resource into one safe skill catalog entry, if the resource contains all required information in the expected shape. It is the main gatekeeper for whether a discovered resource becomes a visible skill.
 
-**Data flow**: Reads `resource.uri`, validates it with `validated_skill_uri`, extracts `resource.meta` as an object, reads `skill_name`, optional `source`, and possibly `plugin_name`, normalizes labels with `normalized_label`, qualifies non-user names as `plugin_name:skill_name` subject to `MAX_QUALIFIED_SKILL_NAME_CHARS`, normalizes/escapes the description with `normalized_description`, computes `main_prompt` via `main_prompt_uri`, and constructs a `SkillCatalogEntry::new(...)` with orchestrator authority and `SkillResourceId::new(main_prompt)`, then sets `.with_display_path(uri)`; returns `Some(entry)` or `None` on any validation failure.
+**Data flow**: It receives a Resource from the MCP listing. It validates the package URI, reads metadata such as skill_name, plugin_name, and source, normalizes the display name and description, builds the main SKILL.md resource URI, and returns a SkillCatalogEntry. If any required field is missing or unsafe, it returns nothing so the resource can be skipped.
 
-**Call relations**: Called from `OrchestratorSkillProvider::list` for each candidate MCP resource. It encapsulates all metadata-shaping rules so listing can simply count malformed resources.
+**Call relations**: OrchestratorSkillProvider::list calls this for each resource with the orchestrator skill MIME type. This function gathers help from validated_skill_uri, normalized_label, normalized_description, and main_prompt_uri, then uses the catalog types to produce the entry that list adds to the catalog.
 
 *Call graph*: calls 7 internal fn (new, new, new, main_prompt_uri, normalized_description, normalized_label, validated_skill_uri); called by 1 (list); 2 external calls (new, format!).
 
@@ -6724,11 +6819,11 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
 fn validated_skill_uri(uri: &str, max_chars: usize) -> Option<&str>
 ```
 
-**Purpose**: Checks that a skill package URI is syntactically valid under the provider's rules and, if so, returns the original string slice. It is a convenience wrapper around full URL validation.
+**Purpose**: Checks that a skill package URI is valid, then returns the original text if it passes. It is a small wrapper used when the caller wants to keep the URI string rather than the parsed URL object.
 
-**Data flow**: Accepts `uri: &str` and `max_chars`, calls `validated_skill_url(uri, max_chars)`, and maps success to `Some(uri)` while preserving the original borrowed string.
+**Data flow**: It receives a URI string and a maximum character count. It asks validated_skill_url to parse and validate the URI; if that succeeds, it returns the original string slice, otherwise it returns nothing.
 
-**Call relations**: Used by `catalog_entry_from_resource` when it needs the validated original URI string rather than a parsed `Url` object.
+**Call relations**: catalog_entry_from_resource calls this before trusting a resource URI as a skill package id. The deeper URL rules live in validated_skill_url, so both listing and read-time checks use the same idea of a valid skill URL.
 
 *Call graph*: calls 1 internal fn (validated_skill_url); called by 1 (catalog_entry_from_resource).
 
@@ -6739,11 +6834,11 @@ fn validated_skill_uri(uri: &str, max_chars: usize) -> Option<&str>
 fn validated_skill_url(uri: &str, max_chars: usize) -> Option<Url>
 ```
 
-**Purpose**: Parses and validates a skill URI against strict structural and character constraints. It rejects malformed, ambiguous, or potentially unsafe URIs before they enter catalog or read logic.
+**Purpose**: Applies the strict rules for what counts as a safe skill URL. This prevents malformed, overly long, or surprising URLs from entering the skill catalog or being read.
 
-**Data flow**: Reads `uri` and `max_chars`, rejects strings that exceed the character limit or contain control characters, whitespace, `<`, or `>`, parses the URI with `Url::parse`, validates that the scheme is `skill`, the serialized URL matches the original string exactly, host is present and non-empty, username/password/port/query/fragment are absent, and path segments are present and non-empty, then returns `Some(Url)` or `None`.
+**Data flow**: It receives a URI string and a character limit. It rejects strings that are too long or contain control characters, whitespace, or angle brackets, then parses the URI as a URL. It accepts only skill:// URLs with a host, non-empty path segments, no username, password, port, query, or fragment, and no parser-normalized changes to the text. On success it returns the parsed Url.
 
-**Call relations**: Called by both `validated_skill_uri` and `resource_belongs_to_package`, making it the shared gatekeeper for orchestrator URI validity.
+**Call relations**: validated_skill_uri uses this while building catalog entries, and resource_belongs_to_package uses it while checking read requests. Because both paths rely on this helper, discovery and reading follow the same URL safety rules.
 
 *Call graph*: called by 2 (resource_belongs_to_package, validated_skill_uri); 1 external calls (parse).
 
@@ -6754,11 +6849,11 @@ fn validated_skill_url(uri: &str, max_chars: usize) -> Option<Url>
 fn resource_belongs_to_package(package: &str, resource: &str) -> bool
 ```
 
-**Purpose**: Determines whether a resource URI is a descendant of a package URI under the same validated skill-URI namespace. This prevents reads from escaping the advertised package subtree.
+**Purpose**: Checks whether a requested skill resource is actually inside the package it claims to come from. This stops a read request from using one package id while fetching an unrelated resource.
 
-**Data flow**: Accepts `package` and `resource` strings, validates both with `validated_skill_url` using package/resource-specific length limits, extracts and collects their path segments, and returns true only if scheme and host match, the resource has more path segments than the package, and the resource path starts with the package path segments.
+**Data flow**: It receives a package URI and a resource URI as text. It validates both as skill URLs, compares their scheme and host, breaks their paths into segments, and confirms the resource path starts with the package path but is longer. It returns true only when the resource is a child of the package.
 
-**Call relations**: Used by `OrchestratorSkillProvider::read` before issuing an MCP read, enforcing package/resource consistency.
+**Call relations**: OrchestratorSkillProvider::read calls this before reading from MCP. The helper relies on validated_skill_url so invalid package or resource strings fail safely instead of being treated as paths to read.
 
 *Call graph*: calls 1 internal fn (validated_skill_url); called by 1 (read).
 
@@ -6769,11 +6864,11 @@ fn resource_belongs_to_package(package: &str, resource: &str) -> bool
 fn normalized_label(value: &str, max_chars: usize) -> Option<String>
 ```
 
-**Purpose**: Normalizes a single-line metadata label and rejects empty or XML-sensitive values. It is used for skill names and plugin names that will later appear in prompt-visible text.
+**Purpose**: Cleans and validates a short human-facing label, such as a skill name or plugin name. It keeps catalog names readable and avoids characters that could be unsafe in display contexts.
 
-**Data flow**: Accepts `value` and `max_chars`, normalizes whitespace and control characters through `normalized_single_line`, then rejects the result if it is empty or contains `&`, `<`, or `>`; returns `Option<String>`.
+**Data flow**: It receives a text value and a maximum character count. It first turns the text into a single normalized line, then rejects empty labels or labels containing ampersand or angle brackets. If the label is acceptable, it returns the cleaned string.
 
-**Call relations**: Called by `catalog_entry_from_resource` when validating `skill_name` and `plugin_name` metadata.
+**Call relations**: catalog_entry_from_resource calls this when extracting skill_name and, for non-user skills, plugin_name. It builds on normalized_single_line so all label cleanup follows the same whitespace and length rules.
 
 *Call graph*: calls 1 internal fn (normalized_single_line); called by 1 (catalog_entry_from_resource).
 
@@ -6784,11 +6879,11 @@ fn normalized_label(value: &str, max_chars: usize) -> Option<String>
 fn normalized_description(value: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes a description to a single line and escapes XML-sensitive characters for safe prompt rendering. Unlike labels, descriptions may contain `&`, `<`, and `>` after escaping.
+**Purpose**: Cleans a skill description so it is a single safe line of text. Unlike labels, descriptions may contain special characters, so this function escapes them rather than rejecting them.
 
-**Data flow**: Accepts `value`, normalizes it with `normalized_single_line` using `MAX_SKILL_DESCRIPTION_CHARS`, then replaces `&`, `<`, and `>` with `&amp;`, `&lt;`, and `&gt;`; returns `Option<String>`.
+**Data flow**: It receives the raw description text. It normalizes whitespace and length through normalized_single_line, then replaces ampersand, less-than, and greater-than characters with safe text forms. It returns the cleaned description or nothing if the text is too long or contains control characters.
 
-**Call relations**: Used by `catalog_entry_from_resource` to sanitize resource descriptions before storing them in catalog entries.
+**Call relations**: catalog_entry_from_resource calls this while building the catalog entry description. It shares basic line cleanup with normalized_label through normalized_single_line, but then performs description-specific escaping.
 
 *Call graph*: calls 1 internal fn (normalized_single_line); called by 1 (catalog_entry_from_resource).
 
@@ -6799,11 +6894,11 @@ fn normalized_description(value: &str) -> Option<String>
 fn normalized_single_line(value: &str, max_chars: usize) -> Option<String>
 ```
 
-**Purpose**: Collapses arbitrary whitespace into single spaces and rejects control characters or overlong values. It is the shared primitive for label and description normalization.
+**Purpose**: Turns messy text into one compact line and checks its basic safety. It is the shared cleanup step for names and descriptions.
 
-**Data flow**: Splits `value` on whitespace, joins the pieces with single spaces, checks that the resulting character count is within `max_chars` and contains no control characters, and returns `Some(normalized_string)` or `None`.
+**Data flow**: It receives text and a maximum character count. It splits the text on whitespace, joins the pieces with single spaces, rejects the result if it is too long or contains control characters, and returns the cleaned string if valid.
 
-**Call relations**: Called by both `normalized_label` and `normalized_description` to enforce common single-line normalization rules.
+**Call relations**: normalized_label and normalized_description both call this first. That makes labels and descriptions behave consistently for whitespace, length, and control-character checks before each caller applies its own extra rules.
 
 *Call graph*: called by 2 (normalized_description, normalized_label).
 
@@ -6814,24 +6909,26 @@ fn normalized_single_line(value: &str, max_chars: usize) -> Option<String>
 fn main_prompt_uri(package_uri: &str) -> String
 ```
 
-**Purpose**: Derives the canonical main-prompt resource URI for a skill package by appending `SKILL.md`. It standardizes how package URIs map to readable prompt resources.
+**Purpose**: Builds the URI for the main skill prompt file inside a skill package. In this system, that main file is expected to be named SKILL.md.
 
-**Data flow**: Accepts `package_uri: &str`, trims any trailing slash, formats `"{package_uri}/SKILL.md"`, and returns the resulting `String`.
+**Data flow**: It receives a package URI as text. It removes any trailing slash and appends /SKILL.md, returning the resulting resource URI string.
 
-**Call relations**: Used by `catalog_entry_from_resource` when constructing the `SkillResourceId` for an orchestrator catalog entry.
+**Call relations**: catalog_entry_from_resource calls this after validating the package URI. The returned URI becomes the SkillResourceId stored in the catalog entry, so later read operations know which resource represents the skill’s main prompt.
 
 *Call graph*: called by 1 (catalog_entry_from_resource); 1 external calls (format!).
 
 
 ### `ext/skills/src/sources.rs`
 
-`orchestration` · `catalog load and skill IO dispatch`
+`orchestration` · `request handling`
 
-This file is the dispatch layer between higher-level skills logic and concrete provider backends. `SkillProviderSource` wraps one `Arc<dyn SkillProvider>` together with a `SkillSourceKind` and human-readable label. It offers convenience constructors for host, executor, and orchestrator sources, plus predicates that decide whether a source should participate in a listing query (`should_list`) or whether it owns a requested authority kind (`owns_kind`).
+A “skill” is a capability the system can discover, read about, or search for. This file acts like a front desk for skill providers. Instead of the rest of the program needing to know every possible source, it can talk to one collection called `SkillProviders`.
 
-`SkillProviders` is a small builder-style container around a `Vec<SkillProviderSource>`. It can be assembled incrementally with generic or specialized `with_*_provider` methods. For listing, `list_for_turn` delegates to `list_matching`, which iterates only sources allowed by the query and merges each returned `SkillCatalog` into one aggregate catalog. Listing failures are non-fatal here: `extend_catalog` appends a warning string like `"host skills unavailable: ..."` instead of aborting the whole operation. `list_orchestrator_for_turn` is stricter and returns an error immediately if any orchestrator provider fails, because orchestrator-only tool flows need a definitive result.
+Each `SkillProviderSource` wraps one real provider with two pieces of context: what kind of source it is, and a human-readable label used in warnings. The source kind matters because a request for an executor skill should not accidentally be sent to a host skill provider.
 
-For `read` and `search`, the registry filters sources by `request.authority.kind`, tries them in order, and returns the first success. If all matching providers fail, it returns the last provider error; if no provider of that kind is configured at all, it synthesizes a `SkillProviderError` stating that the corresponding provider is not configured.
+`SkillProviders` is the collection of these sources. It offers builder-style methods for adding host, executor, orchestrator, or custom providers. When listing skills for a turn, it asks only the providers that make sense for the query, then merges their catalogs. If one provider fails during normal listing, the system does not throw everything away; it adds a warning and keeps the skills from the providers that did answer. That makes the system more resilient.
+
+Reading or searching is stricter. Those requests target a specific source kind, so this file tries matching providers until one succeeds. If none are configured, it returns a clear “provider is not configured” error. If providers exist but fail, it returns the last provider error.
 
 #### Function details
 
@@ -6845,11 +6942,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a provider source wrapper from an explicit source kind, label, and provider implementation.
+**Purpose**: Creates a single named skill source from a source kind, a label, and the actual provider object. This is the basic constructor used by the more specific host, executor, and orchestrator helpers.
 
-**Data flow**: Accepts a `SkillSourceKind`, a label convertible into `String`, and an `Arc<dyn SkillProvider>`. It converts the label with `Into<String>` and returns a `SkillProviderSource` storing all three values.
+**Data flow**: It receives a source kind, a label that can be turned into text, and a shared provider reference. It stores those three values together in a new `SkillProviderSource`, converting the label into a `String` on the way. The result is a ready-to-use wrapper around one provider.
 
-**Call relations**: This is the base constructor used by the specialized `host`, `executor`, and `orchestrator` constructors. It is part of setup/build-time wiring rather than runtime dispatch.
+**Call relations**: The convenience constructors for host, executor, and orchestrator sources all rely on this function. It is the common doorway for making any `SkillProviderSource`.
 
 *Call graph*: 1 external calls (into).
 
@@ -6860,11 +6957,11 @@ fn new(
 fn host(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Creates a `SkillProviderSource` tagged as a host-backed provider.
+**Purpose**: Creates a skill source marked as coming from the host. The host is the surrounding environment that can provide skills directly.
 
-**Data flow**: Takes a label and provider, passes them with `SkillSourceKind::Host` into `SkillProviderSource::new`, and returns the resulting wrapper.
+**Data flow**: It receives a label and a shared provider reference. It fills in the source kind as `Host`, then passes everything to `SkillProviderSource::new`. The output is a host-labeled skill source.
 
-**Call relations**: It is called by `SkillProviders::with_host_provider` when assembling the provider registry. The specialization avoids repeating the host kind at call sites.
+**Call relations**: This is used by `SkillProviders::with_host_provider` when callers want to add a host provider without spelling out the source kind themselves.
 
 *Call graph*: called by 1 (with_host_provider); 1 external calls (new).
 
@@ -6875,11 +6972,11 @@ fn host(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self
 fn executor(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Creates a `SkillProviderSource` tagged as an executor-backed provider.
+**Purpose**: Creates a skill source marked as coming from an executor. An executor is a place that can run or expose a particular set of skills.
 
-**Data flow**: Takes a label and provider, forwards them with `SkillSourceKind::Executor` to `SkillProviderSource::new`, and returns the wrapper.
+**Data flow**: It receives a label and a shared provider reference. It sets the source kind to `Executor`, then delegates construction to `SkillProviderSource::new`. The result is an executor-labeled source.
 
-**Call relations**: It is called by `SkillProviders::with_executor_provider` during registry construction. This keeps executor source creation consistent with the other built-in kinds.
+**Call relations**: This is used by `SkillProviders::with_executor_provider`, which gives callers a short path for registering executor skills.
 
 *Call graph*: called by 1 (with_executor_provider); 1 external calls (new).
 
@@ -6890,11 +6987,11 @@ fn executor(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self
 fn orchestrator(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Creates a `SkillProviderSource` tagged as an orchestrator-backed provider.
+**Purpose**: Creates a skill source marked as coming from the orchestrator. The orchestrator is the coordinating layer that can expose its own skills.
 
-**Data flow**: Takes a label and provider, forwards them with `SkillSourceKind::Orchestrator` to `SkillProviderSource::new`, and returns the wrapper.
+**Data flow**: It receives a label and a shared provider reference. It sets the source kind to `Orchestrator`, then uses `SkillProviderSource::new` to build the source. The result is an orchestrator-labeled source.
 
-**Call relations**: It is called by `SkillProviders::with_orchestrator_provider` when tool-facing orchestrator skill access is configured.
+**Call relations**: This is used by `SkillProviders::with_orchestrator_provider` when the system registers orchestrator-provided skills.
 
 *Call graph*: called by 1 (with_orchestrator_provider); 1 external calls (new).
 
@@ -6905,11 +7002,11 @@ fn orchestrator(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> S
 fn should_list(&self, query: &SkillListQuery) -> bool
 ```
 
-**Purpose**: Determines whether this source should participate in a listing operation for the given turn query.
+**Purpose**: Decides whether this source should be included when building a skill list for the current turn. This prevents the system from asking irrelevant providers for skills.
 
-**Data flow**: Reads `self.kind` and the fields of `SkillListQuery`. It returns `query.include_host_skills` for host sources, checks that `executor_roots` is non-empty for executor sources, returns `query.include_orchestrator_skills` for orchestrator sources, and always returns `true` for custom sources.
+**Data flow**: It reads the source kind stored in `self` and the listing options in the query. Host sources are included only when host skills are requested, executor sources only when executor roots are present, orchestrator sources only when orchestrator skills are requested, and custom sources are always included. It returns true or false.
 
-**Call relations**: This predicate is consumed by `SkillProviders::list_for_turn` through `list_matching` to decide which providers are queried for a turn. It encodes the source-kind-specific inclusion policy.
+**Call relations**: This decision is used during `SkillProviders::list_for_turn`, which passes it into the shared listing helper so only matching sources are asked for catalogs.
 
 
 ##### `SkillProviderSource::owns_kind`  (lines 56–58)
@@ -6918,11 +7015,11 @@ fn should_list(&self, query: &SkillListQuery) -> bool
 fn owns_kind(&self, kind: &SkillSourceKind) -> bool
 ```
 
-**Purpose**: Checks whether this source is responsible for a requested `SkillSourceKind`.
+**Purpose**: Checks whether this source matches a requested source kind. It is used to route read and search requests to the right kind of provider.
 
-**Data flow**: Compares `self.kind` with the supplied `kind` reference and returns the equality result.
+**Data flow**: It compares the source kind stored in `self` with the requested kind. The output is a yes-or-no answer.
 
-**Call relations**: It is used by `SkillProviders::read` and `SkillProviders::search` to filter the provider list down to only those sources that can satisfy a request for a given authority kind.
+**Call relations**: The `read` and `search` methods use this check before asking a provider to answer a request, so a request is only sent to providers of the correct kind.
 
 
 ##### `SkillProviderSource::fmt`  (lines 62–68)
@@ -6931,11 +7028,11 @@ fn owns_kind(&self, kind: &SkillSourceKind) -> bool
 fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Implements a concise debug representation that exposes source kind and label without attempting to print the provider trait object.
+**Purpose**: Controls how a `SkillProviderSource` appears in debug output. It shows the kind and label while leaving out the provider object itself.
 
-**Data flow**: Writes a `DebugStruct` named `SkillProviderSource` into the provided formatter, including only the `kind` and `label` fields, and returns the formatter result.
+**Data flow**: It receives a debug formatter and writes a structured debug view containing the source kind and label. It does not expose or print the underlying provider. The result tells Rust whether formatting succeeded.
 
-**Call relations**: This method is used implicitly by Rust debug formatting. It supports diagnostics and tests while intentionally omitting the opaque provider implementation.
+**Call relations**: This is called automatically when debugging or logging code asks to format a `SkillProviderSource` with debug formatting.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -6946,11 +7043,11 @@ fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty provider registry.
+**Purpose**: Creates an empty collection of skill providers. Callers use it as the starting point before adding host, executor, orchestrator, or custom providers.
 
-**Data flow**: Calls `Default::default()` for `SkillProviders` and returns a value whose `sources` vector is empty.
+**Data flow**: It takes no input beyond the type itself. It returns the default `SkillProviders`, which contains no sources yet.
 
-**Call relations**: It is used by setup code and tests such as `thread_extensions` and `install` as the starting point for provider registration before chaining `with_*` methods.
+**Call relations**: Startup and setup code call this when building the skill system. Tests and installation paths also use it as the clean starting point for assembling providers.
 
 *Call graph*: called by 6 (thread_extensions, install, orchestrator_catalog_snapshot_caches_failure, prompt_hidden_skill_can_still_be_invoked, root_qualified_locator_selects_only_the_matching_executor_skill, selected_executor_catalog_is_context_and_selected_entrypoint_is_turn_input); 1 external calls (default).
 
@@ -6961,11 +7058,11 @@ fn new() -> Self
 fn with_provider(mut self, source: SkillProviderSource) -> Self
 ```
 
-**Purpose**: Appends an already-constructed provider source to the registry in builder style.
+**Purpose**: Adds an already-built skill source to the provider collection. This is the flexible path for callers that want to supply a source with a specific kind or label.
 
-**Data flow**: Takes ownership of `self` and a `SkillProviderSource`, pushes the source into `self.sources`, and returns the updated registry.
+**Data flow**: It takes the current `SkillProviders` value and one `SkillProviderSource`. It appends that source to the internal list and returns the updated collection, allowing calls to be chained.
 
-**Call relations**: This is the generic builder primitive underlying registry assembly. Callers use it when they already have a fully formed `SkillProviderSource`, including custom kinds.
+**Call relations**: This sits alongside the more specific `with_host_provider`, `with_executor_provider`, and `with_orchestrator_provider` helpers. It is useful when the caller has already constructed the source.
 
 
 ##### `SkillProviders::with_host_provider`  (lines 86–90)
@@ -6974,11 +7071,11 @@ fn with_provider(mut self, source: SkillProviderSource) -> Self
 fn with_host_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Adds a host provider with the standard `host` label.
+**Purpose**: Adds a host skill provider using the standard label `host`. This is a convenient shortcut for registering host-provided skills.
 
-**Data flow**: Consumes `self` and an `Arc<dyn SkillProvider>`, constructs a host source via `SkillProviderSource::host("host", provider)`, pushes it into `sources`, and returns the updated registry.
+**Data flow**: It receives the current provider collection and a shared provider reference. It wraps that provider as a host source, appends it to the list, and returns the updated collection.
 
-**Call relations**: This convenience builder is used during extension wiring to register host-backed skill providers without manually constructing the source wrapper.
+**Call relations**: It calls `SkillProviderSource::host` to make the source, then stores it. Later listing, reading, or searching can route host-related requests to this provider.
 
 *Call graph*: calls 1 internal fn (host).
 
@@ -6989,11 +7086,11 @@ fn with_host_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self
 fn with_executor_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Adds an executor provider with the standard `executor` label.
+**Purpose**: Adds an executor skill provider using the standard label `executor`. This is the shortcut for registering skills that come from an executor.
 
-**Data flow**: Consumes `self` and an `Arc<dyn SkillProvider>`, constructs an executor source via `SkillProviderSource::executor("executor", provider)`, pushes it into `sources`, and returns the updated registry.
+**Data flow**: It receives the current provider collection and a shared provider reference. It wraps the provider as an executor source, appends it, and returns the updated collection.
 
-**Call relations**: It is the executor-specific counterpart to `with_host_provider`, used when wiring environment-root-backed skill providers.
+**Call relations**: It calls `SkillProviderSource::executor` to create the source. Later, executor-related list, read, and search work can find this provider by its source kind.
 
 *Call graph*: calls 1 internal fn (executor).
 
@@ -7004,11 +7101,11 @@ fn with_executor_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self
 fn with_orchestrator_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self
 ```
 
-**Purpose**: Adds an orchestrator provider with the standard `orchestrator` label.
+**Purpose**: Adds an orchestrator skill provider using the standard label `orchestrator`. This lets the coordinating layer expose its own skills through the same provider system.
 
-**Data flow**: Consumes `self` and an `Arc<dyn SkillProvider>`, constructs an orchestrator source via `SkillProviderSource::orchestrator("orchestrator", provider)`, pushes it into `sources`, and returns the updated registry.
+**Data flow**: It receives the current provider collection and a shared provider reference. It wraps that provider as an orchestrator source, appends it, and returns the updated collection.
 
-**Call relations**: This builder is used when enabling orchestrator-owned skills and the tools that expose them.
+**Call relations**: It calls `SkillProviderSource::orchestrator` to build the source. Other code can later check for this provider or ask it for orchestrator skills.
 
 *Call graph*: calls 1 internal fn (orchestrator).
 
@@ -7019,11 +7116,11 @@ fn with_orchestrator_provider(mut self, provider: Arc<dyn SkillProvider>) -> Sel
 fn has_orchestrator_provider(&self) -> bool
 ```
 
-**Purpose**: Reports whether any registered source is an orchestrator provider.
+**Purpose**: Answers whether an orchestrator skill provider has been registered. This lets other parts of the system know whether orchestrator-specific tools or catalogs are available.
 
-**Data flow**: Iterates `self.sources`, compares each source kind to `SkillSourceKind::Orchestrator`, and returns `true` on the first match or `false` otherwise.
+**Data flow**: It looks through the stored sources and checks whether any source has the `Orchestrator` kind. It returns true if it finds one, otherwise false.
 
-**Call relations**: It is called by `tools` to decide whether orchestrator-specific skill tooling should be exposed.
+**Call relations**: The tools layer calls this when deciding how to expose skill-related behavior. It is a quick capability check rather than a full listing operation.
 
 *Call graph*: called by 1 (tools).
 
@@ -7034,11 +7131,11 @@ fn has_orchestrator_provider(&self) -> bool
 async fn list_for_turn(&self, query: SkillListQuery) -> SkillCatalog
 ```
 
-**Purpose**: Lists all skill sources relevant to a normal turn according to the supplied query flags and roots.
+**Purpose**: Builds the skill catalog that should be visible for a particular turn. A turn is one cycle of interaction, so this method chooses only the skills relevant to that moment.
 
-**Data flow**: Consumes a `SkillListQuery`, passes a closure based on `source.should_list(&query)` into `list_matching`, awaits the merged result, and returns a `SkillCatalog` containing entries and any accumulated warnings.
+**Data flow**: It receives a listing query that says which kinds of skills should be considered. It asks `list_matching` to visit only sources whose `should_list` check passes. The output is a combined `SkillCatalog` containing available skills plus any warnings from unavailable providers.
 
-**Call relations**: This method is called by `list_skills` for general catalog assembly. It delegates the actual iteration and merge behavior to `list_matching` while supplying the standard inclusion policy.
+**Call relations**: The skill-listing flow calls this when it needs the normal per-turn catalog. This method delegates the common collection work to `list_matching`.
 
 *Call graph*: calls 1 internal fn (list_matching); called by 1 (list_skills).
 
@@ -7052,11 +7149,11 @@ async fn list_orchestrator_for_turn(
     ) -> SkillProviderResult<SkillCatalog>
 ```
 
-**Purpose**: Lists only orchestrator-owned skills for a turn and fails fast if an orchestrator provider cannot be queried.
+**Purpose**: Builds a catalog using only orchestrator skill providers, and treats provider failure as an actual error. This is stricter than normal listing because the caller specifically asked for orchestrator skills.
 
-**Data flow**: Creates an empty `SkillCatalog`, iterates sources whose kind is `SkillSourceKind::Orchestrator`, clones the query for each provider call, awaits `provider.list`, maps any provider error into a labeled `SkillProviderError`, extends the aggregate catalog on success, and returns `Ok(catalog)` or the first mapped error.
+**Data flow**: It starts with an empty catalog and loops over sources marked as orchestrator providers. For each one, it asks the provider to list skills using the query. Successful catalogs are merged in; a failure is turned into a labeled `SkillProviderError` and returned immediately. On success, it returns the combined catalog.
 
-**Call relations**: It is called by `list_skills` and by `SkillToolContext::catalog` when orchestrator-only tool operations need a snapshot. Unlike `list_matching`, it does not downgrade failures to warnings because callers need a definitive orchestrator catalog.
+**Call relations**: Skill-listing and catalog code call this when they specifically need orchestrator skills. Unlike `list_for_turn`, it does not hide failures as warnings, because the requested source is the main point of the operation.
 
 *Call graph*: called by 2 (list_skills, catalog); 2 external calls (default, clone).
 
@@ -7071,11 +7168,11 @@ async fn list_matching(
     ) -> SkillCatalog
 ```
 
-**Purpose**: Implements the common loop for querying a filtered subset of providers and merging their catalogs with warning accumulation.
+**Purpose**: Performs the shared work of asking selected providers for their skill catalogs and merging the answers. It is the common listing engine behind per-turn listing.
 
-**Data flow**: Accepts a borrowed `SkillListQuery` and a predicate over `SkillProviderSource`. It initializes an empty `SkillCatalog`, iterates matching sources, clones the query for each async `provider.list` call, and passes each `Result<SkillCatalog, SkillProviderError>` plus the source label into `extend_catalog`; finally it returns the merged catalog.
+**Data flow**: It receives a query and a yes-or-no selection function. It starts with an empty catalog, filters the stored sources with the selection function, and asks each selected provider for a catalog. Each provider result is passed to `extend_catalog`, which either merges the catalog or records a warning. The final combined catalog is returned.
 
-**Call relations**: This internal helper is called by `list_for_turn`. It centralizes the provider iteration pattern so the public listing method only needs to define which sources should participate.
+**Call relations**: `SkillProviders::list_for_turn` calls this after supplying the rule for which sources belong in the current turn. This helper then calls `extend_catalog` so provider failures are handled consistently.
 
 *Call graph*: calls 1 internal fn (extend_catalog); called by 1 (list_for_turn); 2 external calls (default, clone).
 
@@ -7089,11 +7186,11 @@ async fn read(
     ) -> Result<SkillReadResult, SkillProviderError>
 ```
 
-**Purpose**: Routes a skill resource read request to providers of the matching authority kind and returns the first successful read.
+**Purpose**: Reads details for one requested skill from the provider kind named in the request. It routes the request to matching providers and returns the first successful answer.
 
-**Data flow**: Consumes a `SkillReadRequest`, initializes `last_error` to `None`, filters `self.sources` by `source.owns_kind(&request.authority.kind)`, clones the request for each provider call, and awaits `provider.read`. On the first `Ok`, it returns the `SkillReadResult`; on `Err`, it records the error and continues. If no provider succeeds, it returns the last provider error if any, otherwise constructs a new `SkillProviderError` stating that the requested kind is not configured.
+**Data flow**: It receives a read request that includes an authority, meaning the source kind that should own the skill. It filters providers to that kind, sends each a cloned request, and returns as soon as one succeeds. If matching providers fail, it returns the last error. If no matching provider exists, it returns a clear error saying that provider kind is not configured.
 
-**Call relations**: It is called by `read_skill` in thread state. The method acts as ordered fallback across providers of the same kind, while preserving a clear configuration error when no matching provider exists at all.
+**Call relations**: The `read_skill` flow calls this when someone wants the full information for a skill. This method uses `SkillProviderSource::owns_kind` to avoid asking the wrong kind of provider.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (read_skill); 2 external calls (clone, format!).
 
@@ -7107,11 +7204,11 @@ async fn search(
     ) -> Result<SkillSearchResult, SkillProviderError>
 ```
 
-**Purpose**: Routes a skill search request to providers of the matching authority kind and returns the first successful search result.
+**Purpose**: Searches for skills within the provider kind named in the request. It routes the search to matching providers and returns the first successful search result.
 
-**Data flow**: Consumes a `SkillSearchRequest`, filters sources by authority kind, clones the request for each provider invocation, and awaits `provider.search`. It returns the first successful `SkillSearchResult`, otherwise the last provider error seen, or a synthesized `SkillProviderError` if no provider of that kind is configured.
+**Data flow**: It receives a search request that names the authority, including the source kind. It tries providers whose kind matches, cloning the request for each attempt. A successful provider result is returned immediately. If all matching providers fail, it returns the last error; if none are configured, it returns an error explaining that the provider kind is missing.
 
-**Call relations**: This method follows the same fallback pattern as `read`, but for search operations. It is the search-side dispatch entry point for higher-level code that already knows the target authority kind.
+**Call relations**: This follows the same routing pattern as `read`, but for search requests. It uses `SkillProviderSource::owns_kind` so the search is sent only to providers that could own the requested skills.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (clone, format!).
 
@@ -7126,24 +7223,26 @@ fn extend_catalog(
 )
 ```
 
-**Purpose**: Merges one provider listing result into the aggregate catalog, converting provider failures into warning strings instead of aborting the listing.
+**Purpose**: Adds one provider’s listing result into a combined catalog. If that provider failed, it records a warning instead of stopping the whole listing process.
 
-**Data flow**: Takes a mutable aggregate `SkillCatalog`, a `Result<SkillCatalog, SkillProviderError>`, and the source label. On success it extends the aggregate catalog with the source catalog; on error it pushes a formatted warning into `catalog.warnings` using the source label and provider error message.
+**Data flow**: It receives the combined catalog being built, one provider result, and the provider’s label. If the result contains a catalog, it merges that catalog into the combined one. If the result contains an error, it appends a readable warning such as that the provider’s skills are unavailable. It changes the catalog in place and returns nothing.
 
-**Call relations**: It is called by `SkillProviders::list_matching` for each queried source. This helper is what gives normal listing its best-effort behavior across multiple providers.
+**Call relations**: `SkillProviders::list_matching` calls this after each provider listing attempt. This function is what lets normal skill listing be tolerant: one broken source can add a warning while other sources still contribute skills.
 
 *Call graph*: calls 1 internal fn (extend); called by 1 (list_matching); 1 external calls (format!).
 
 
 ### `ext/skills/src/tools/mod.rs`
 
-`orchestration` · `tool registration and tool request handling`
+`orchestration` · `startup and tool request handling`
 
-This module wires the skills tools into the extension API and centralizes the common mechanics they share. `skill_tools` builds a `SkillToolContext` from `SkillProviders`, optional `Arc<McpResourceClient>`, and `Arc<SkillsThreadState>`, then returns two boxed executors: `list::ListTool` and `read::ReadTool`. The context currently supports one authority, `SkillToolAuthority::Orchestrator`, and its `catalog` method resolves that authority into an orchestrator-only `SkillListQuery` with host and bundled skills disabled, empty executor roots, the current `turn_id`, and the optional MCP resource client. The resulting listing is cached through `SkillsThreadState::orchestrator_catalog_snapshot`.
+This file makes the “skills” feature available as tools the model can call. A skill is extra capability or guidance that can be discovered and read during a conversation. Without this file, the project would not have a clean way to register those skill tools, share their context, or safely translate model tool calls into Rust data and back into JSON responses.
 
-The module also defines the translation boundary between internal and tool-facing authorities. `SkillToolAuthority::from_authority` accepts only the orchestrator authority whose label matches `CODEX_APPS_MCP_SERVER_NAME`; `into_authority` reconstructs that exact `SkillAuthority`. Tool naming and schema generation are standardized through `skill_tool_name` and `skill_function_tool`, which build a `ResponsesApiNamespace` tool spec using generated JSON Schemas from the sibling `schema` module.
+The main setup function creates a shared SkillToolContext. That context is like a small backpack carried by each skill tool: it contains the available skill providers, optional MCP resources (MCP is a protocol for connecting to outside resources), and per-thread skill state. The list and read tools both use this backpack when answering requests.
 
-Finally, the file contains generic request/response helpers. `parse_args` tolerates empty argument strings by treating them as `{}` before deserializing. `validate_handle` and `is_bounded_handle` enforce non-empty, control-character-free, byte-bounded opaque handles. `external_json_output` serializes any `Serialize` value into `JsonToolOutput` and marks it as external context, with serialization failures treated as fatal tool errors.
+The file also defines which authority is allowed for these tools. Right now, only the orchestrator authority is accepted. In plain terms, the skill information must come from the project’s coordinating skill source, not from an arbitrary source.
+
+The remaining helpers keep the tool boundary tidy. They create namespaced tool names so skill tools do not collide with other tools, build tool specifications with input and output schemas, parse JSON arguments from a tool call, reject unsafe or oversized handles, and wrap successful results as JSON marked for external context. Together, these pieces form the safe adapter between model-facing tool calls and the internal skill catalog.
 
 #### Function details
 
@@ -7157,11 +7256,11 @@ fn skill_tools(
 ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
 ```
 
-**Purpose**: Constructs the full set of skills tool executors and shares one context object between them.
+**Purpose**: Builds the actual skill tools that can be offered to the model. It packages shared dependencies once, then gives that shared context to the list and read tools.
 
-**Data flow**: Consumes `SkillProviders`, an optional `Arc<McpResourceClient>`, and an `Arc<SkillsThreadState>`. It packages them into a `SkillToolContext`, clones that context for `list::ListTool`, moves the original into `read::ReadTool`, wraps both in `Arc<dyn ToolExecutor<ToolCall>>`, and returns them in a `Vec`.
+**Data flow**: It receives skill providers, optional MCP resource access, and thread-specific skill state. It puts these into a SkillToolContext, clones that context where needed, and returns a list containing the list-skill tool and the read-skill tool as generic tool executors.
 
-**Call relations**: This function is called by `tools` when the extension exposes its tool surface. It is the top-level wiring point that binds provider access and thread state into the concrete list/read tool implementations.
+**Call relations**: The broader tool setup calls on this function when it needs the skill tool set. This function then hands shared context to the list and read tool implementations so they can answer later tool calls consistently.
 
 *Call graph*: called by 1 (tools); 1 external calls (vec!).
 
@@ -7172,11 +7271,11 @@ fn skill_tools(
 async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog
 ```
 
-**Purpose**: Loads the catalog visible to a tool call for the requested tool authority, currently limited to orchestrator-owned skills.
+**Purpose**: Fetches the skill catalog that a tool should use for a specific conversation turn and authority. Today it supports the orchestrator authority, meaning the coordinating skill source.
 
-**Data flow**: Accepts a `turn_id` string and a `SkillToolAuthority`. For `Orchestrator`, it calls `thread_state.orchestrator_catalog_snapshot`, passing the optional MCP resource client and the future returned by `providers.list_orchestrator_for_turn` with a freshly built `SkillListQuery` containing the turn id, empty executor roots, `host: None`, `include_host_skills: false`, `include_bundled_skills: false`, `include_orchestrator_skills: true`, and the cloned MCP resource handle. It awaits and returns the resulting `SkillCatalog`.
+**Data flow**: It takes a turn ID and a SkillToolAuthority. For the orchestrator case, it asks the providers for orchestrator skills for that turn, includes MCP resource access if available, and asks the thread state to return an orchestrator catalog snapshot. The output is a SkillCatalog ready for the caller to inspect.
 
-**Call relations**: This method is called by both tool handlers (`ListTool::handle` and `ReadTool::handle`) whenever they need the current authority-scoped catalog. It bridges tool-facing authority selection to provider listing and thread-state caching.
+**Call relations**: The list and read tool request handlers call this when they need to see what skills are available. It delegates the actual gathering to the providers and thread state, so the tool handlers do not need to know how catalogs are assembled.
 
 *Call graph*: calls 1 internal fn (list_orchestrator_for_turn); called by 2 (handle, handle); 1 external calls (new).
 
@@ -7187,11 +7286,11 @@ async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCa
 fn from_authority(authority: &SkillAuthority) -> Option<Self>
 ```
 
-**Purpose**: Maps an internal `SkillAuthority` to the corresponding tool-visible authority enum when that authority is supported by the tools API.
+**Purpose**: Converts a general SkillAuthority into the narrower authority type accepted by these tools. It filters out anything that is not the supported orchestrator authority.
 
-**Data flow**: Reads the supplied `SkillAuthority` and compares it to `SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)`. It returns `Some(SkillToolAuthority::Orchestrator)` on an exact match and `None` otherwise.
+**Data flow**: It receives a SkillAuthority. It compares it with the expected orchestrator authority for the Codex apps MCP server. If it matches, it returns Some(Orchestrator); otherwise it returns None.
 
-**Call relations**: It is called by `listed_skill` in the list tool to suppress entries from unsupported authorities. This keeps the external tool API narrower than the internal catalog model.
+**Call relations**: The listed-skill conversion code calls this when preparing skill information for tool output. This keeps unsupported authorities from being exposed through this tool layer.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (listed_skill).
 
@@ -7202,11 +7301,11 @@ fn from_authority(authority: &SkillAuthority) -> Option<Self>
 fn into_authority(self) -> SkillAuthority
 ```
 
-**Purpose**: Converts the tool-facing authority enum back into the exact internal `SkillAuthority` used for provider requests and catalog filtering.
+**Purpose**: Turns this tool-specific authority back into the general SkillAuthority type used by the catalog. It is the reverse of narrowing the authority.
 
-**Data flow**: Consumes `self` and, for `Orchestrator`, constructs and returns `SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)`.
+**Data flow**: It receives a SkillToolAuthority value. For Orchestrator, it creates and returns the matching general SkillAuthority for the Codex apps MCP server.
 
-**Call relations**: This conversion is used by tool handlers after parsing arguments so they can compare catalog entries and build provider requests using the internal authority type.
+**Call relations**: When code needs to pass a tool authority back into catalog-level APIs, this helper supplies the general authority shape those APIs expect.
 
 *Call graph*: calls 1 internal fn (new).
 
@@ -7217,11 +7316,11 @@ fn into_authority(self) -> SkillAuthority
 fn skill_tool_name(name: &str) -> ToolName
 ```
 
-**Purpose**: Builds a namespaced tool name under the shared `skills` namespace.
+**Purpose**: Creates a full tool name inside the skills namespace. This prevents simple names like “list” or “read” from clashing with tools from other parts of the system.
 
-**Data flow**: Accepts a short tool name string and returns `ToolName::namespaced(SKILLS_NAMESPACE, name)`.
+**Data flow**: It receives a short tool name as text. It combines that name with the fixed namespace "skills" and returns a ToolName representing the namespaced tool.
 
-**Call relations**: It is called by both `ListTool::tool_name` and `ReadTool::tool_name` so all skills tools are registered consistently as `skills.<name>`.
+**Call relations**: Skill tool definitions use this naming pattern so the rest of the tool system can identify them as belonging to the skills group.
 
 *Call graph*: calls 1 internal fn (namespaced).
 
@@ -7232,11 +7331,11 @@ fn skill_tool_name(name: &str) -> ToolName
 fn skill_function_tool(name: &str, description: &str) -> ToolSpec
 ```
 
-**Purpose**: Creates a `ToolSpec` for a schema-driven function tool in the `skills` namespace using generated input and output schemas.
+**Purpose**: Builds the published specification for a skill function tool. A tool specification tells the model what the tool is called, what it does, what input shape it accepts, and what output shape it returns.
 
-**Data flow**: Accepts a tool name and description plus generic input/output schema types. It builds a `ResponsesApiTool` with the provided metadata, `strict: false`, no deferred loading, parses the generated input schema via `parse_tool_input_schema`, panicking if that generated schema cannot be parsed, attaches the generated output schema, wraps the function tool in a `ResponsesApiNamespace` with the default namespace description, and returns `ToolSpec::Namespace(...)`.
+**Data flow**: It receives a tool name and description, plus Rust types that describe the input and output JSON schemas. It generates and parses the input schema, creates the output schema, wraps the function inside the skills namespace, and returns a ToolSpec.
 
-**Call relations**: This helper is used by both `ListTool::spec` and `ReadTool::spec`. It centralizes schema generation and namespace wrapping so individual tools only provide their type parameters and descriptive text.
+**Call relations**: This helper is used when a skill tool needs to describe itself to the Responses API tool system. It hands off schema parsing to the extension API and namespace description creation to the shared tool utilities.
 
 *Call graph*: 4 external calls (parse_tool_input_schema, default_namespace_description, Namespace, vec!).
 
@@ -7247,11 +7346,11 @@ fn skill_function_tool(name: &str, description: &str) -> ToolSpec
 fn parse_args(call: &ToolCall) -> Result<T, FunctionCallError>
 ```
 
-**Purpose**: Parses a tool call’s JSON argument payload into a typed request struct, treating empty input as an empty object.
+**Purpose**: Turns the raw JSON argument text from a tool call into a strongly typed Rust value. It also reports argument mistakes in a way the model can see and correct.
 
-**Data flow**: Accepts a `ToolCall`, retrieves the raw argument string with `function_arguments()`, and if the trimmed string is empty substitutes `Value::Object(serde_json::Map::new())`; otherwise it parses the string with `serde_json::from_str`, mapping parse failures to `FunctionCallError::RespondToModel`. It then deserializes the `Value` into `T` with `serde_json::from_value`, again mapping failures to `RespondToModel`, and returns `Result<T, FunctionCallError>`.
+**Data flow**: It reads the function arguments from a ToolCall. If the argument string is empty, it treats it as an empty JSON object. Otherwise it parses the string as JSON, then converts that JSON into the requested Rust type. On bad JSON or wrong fields, it returns a RespondToModel error with the parse message.
 
-**Call relations**: This generic helper is called by both tool handlers before any business logic runs. It standardizes user-correctable argument errors as model-facing responses rather than fatal failures.
+**Call relations**: Tool request handlers use this at the start of handling a call. It stands between the model’s raw text input and the internal code, so later code can work with normal typed data instead of untrusted strings.
 
 *Call graph*: 5 external calls (Object, function_arguments, new, from_str, from_value).
 
@@ -7262,11 +7361,11 @@ fn parse_args(call: &ToolCall) -> Result<T, FunctionCallError>
 fn validate_handle(name: &str, value: &str, max_bytes: usize) -> Result<(), FunctionCallError>
 ```
 
-**Purpose**: Validates one opaque handle argument and returns a model-facing error message if it is empty, too long, or contains control characters.
+**Purpose**: Checks that a handle-like string is safe to use. A handle here is an identifier supplied through a tool call, and this check rejects empty, too-large, or control-character-containing values.
 
-**Data flow**: Takes a field name, a string value, and a byte limit. It calls `is_bounded_handle`; on success it returns `Ok(())`, and on failure it constructs `FunctionCallError::RespondToModel` with a formatted message naming the field and the maximum byte count.
+**Data flow**: It receives the handle’s field name, the handle text, and the maximum allowed byte length. It asks is_bounded_handle whether the value is acceptable. If yes, it returns success; if not, it returns an error message for the model explaining the rule.
 
-**Call relations**: This helper is used by `ReadTool::handle` to validate `package` and `resource` arguments before catalog lookup or provider access. It separates reusable validation policy from tool-specific control flow.
+**Call relations**: Tool handlers use this before trusting identifiers from tool input. It delegates the yes/no check to is_bounded_handle, then turns a failed check into a model-facing error.
 
 *Call graph*: calls 1 internal fn (is_bounded_handle); 2 external calls (format!, RespondToModel).
 
@@ -7277,11 +7376,11 @@ fn validate_handle(name: &str, value: &str, max_bytes: usize) -> Result<(), Func
 fn is_bounded_handle(value: &str, max_bytes: usize) -> bool
 ```
 
-**Purpose**: Checks the low-level validity rules for opaque handles used by the tools API.
+**Purpose**: Performs the simple yes/no test for whether a handle is non-empty, not too long, and free of control characters. Control characters are invisible or special characters that can cause confusing output or unsafe behavior.
 
-**Data flow**: Accepts a string and maximum byte count, and returns `true` only if the string is non-empty, its byte length is at most `max_bytes`, and none of its characters satisfy `char::is_control`.
+**Data flow**: It receives a string and a byte limit. It checks three facts: the string is not empty, its byte length is within the limit, and none of its characters are control characters. It returns true only if all three checks pass.
 
-**Call relations**: It is called by `validate_handle` and also by list-tool code when deciding whether a catalog entry can be safely exposed as a tool-visible handle.
+**Call relations**: validate_handle calls this helper to keep the validation rule separate from the error-message wording.
 
 *Call graph*: called by 1 (validate_handle).
 
@@ -7292,24 +7391,24 @@ fn is_bounded_handle(value: &str, max_bytes: usize) -> bool
 fn external_json_output(value: &T) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 ```
 
-**Purpose**: Serializes a response value into a `JsonToolOutput` marked as external context for the extension API.
+**Purpose**: Converts a Rust result value into the standard JSON output object used by external-context tools. This gives callers a uniform tool response format.
 
-**Data flow**: Accepts any `Serialize` value, converts it to `serde_json::Value` with `serde_json::to_value`, maps serialization failure to `FunctionCallError::Fatal`, wraps the value in `JsonToolOutput::new(value).with_external_context()`, boxes it as `Box<dyn ToolOutput>`, and returns it.
+**Data flow**: It receives any serializable value. It converts that value into serde_json’s generic JSON form, wraps it in JsonToolOutput, marks it as external context, and returns it boxed as a ToolOutput. If serialization fails, it returns a fatal tool error because the program could not produce a valid response.
 
-**Call relations**: This helper is called by both tool handlers after they have built their typed response structs. It centralizes the final output encoding and the policy that serialization failures are fatal internal errors.
+**Call relations**: Skill tool handlers use this at the end of successful work to send structured JSON back through the extension API. It hands off JSON conversion to serde_json and output wrapping to JsonToolOutput.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, to_value).
 
 
 ### `ext/skills/src/tools/list.rs`
 
-`io_transport` · `tool request handling`
+`domain_logic` · `request handling`
 
-This file defines the list-side tool surface for the skills namespace. `ListTool` implements `ToolExecutor<ToolCall>` and advertises itself as `skills.list` with a schema-driven function spec. At execution time it parses JSON arguments into `ListArgs`, converts the requested `SkillToolAuthority` into a concrete `SkillAuthority`, and asks the shared `SkillToolContext` for the current catalog snapshot for the call’s `turn_id`.
+This file is the “show me what is available” part of the skills system. A skill is an add-on capability, and the catalog is the project’s list of known skills. When an outside caller invokes the list tool, this code checks which authority, meaning which trusted owner group, the caller asked about. It then reads the skill catalog for the current turn and returns the enabled skills that belong to that authority.
 
-The returned `SkillCatalog` is then transformed into a `ListResponse`. Only entries that are both `enabled` and owned by the requested authority are considered. Each candidate is passed through `listed_skill`, which rejects entries whose package id or main resource handle is empty, contains control characters, or exceeds `MAX_HANDLE_BYTES`; this prevents the tool from emitting malformed or unbounded opaque handles. Accepted entries are serialized as `ListedSkill` values containing authority, package id, human-readable name and description, and the main resource handle.
+The response is deliberately cautious. It does not expose full internal objects. Instead, each skill is turned into a small public summary with its authority, package handle, name, description, and main resource handle. These handles are opaque labels: the caller should pass them to another tool, such as `skills.read`, rather than trying to interpret them. Like giving someone a claim ticket instead of the contents of the storage room.
 
-Warnings are also bounded before exposure: only the first four warning strings are kept, and each is truncated to 256 bytes with UTF-8-safe truncation. The final response is emitted through `external_json_output`, marking it as external-context JSON rather than free-form text.
+The file also protects the tool output from becoming too large or awkward. It drops skills whose important handles are longer than the allowed size, and it limits catalog warnings to a few short messages. The final answer is formatted as external JSON, so the caller receives a structured response rather than free-form text.
 
 #### Function details
 
@@ -7319,11 +7418,11 @@ Warnings are also bounded before exposure: only the first four warning strings a
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the fully namespaced tool name for the list operation.
+**Purpose**: Returns the public name of this tool, using the shared skills-tool naming convention. This is how the surrounding tool system knows this executor represents the list operation.
 
-**Data flow**: Reads the local `TOOL_NAME` constant (`"list"`), passes it to `skill_tool_name`, and returns the resulting `ToolName`.
+**Data flow**: It starts with the fixed local name `list`, passes that name through the common skill tool name builder, and returns the resulting `ToolName`. It does not read the catalog or change any state.
 
-**Call relations**: This method is invoked by the tool framework when registering or identifying the executor. It delegates namespace construction to the shared helper in `tools/mod.rs`.
+**Call relations**: The tool framework calls this when registering or identifying the tool. It hands the plain `list` label to `skill_tool_name`, which adds whatever shared prefix or formatting the skills tool family uses.
 
 *Call graph*: 1 external calls (skill_tool_name).
 
@@ -7334,11 +7433,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Describes the `skills.list` tool as a schema-backed function tool with its input and output types.
+**Purpose**: Describes the tool’s input and output shape for callers. It tells the outside system that this tool accepts a requested authority and returns a list of skills with warnings.
 
-**Data flow**: Uses `skill_function_tool::<ListArgs, ListResponse>` with the local tool name and a descriptive string, and returns the resulting `ToolSpec`.
+**Data flow**: It uses the `ListArgs` type as the expected input schema and `ListResponse` as the output schema, then combines them with a human-readable description. The result is a `ToolSpec`, which is metadata rather than an actual catalog lookup.
 
-**Call relations**: The tool framework calls this when exposing the tool schema. It relies on the shared schema/spec builder so list and read tools present a consistent namespace and schema shape.
+**Call relations**: The surrounding extension API asks for this specification when exposing the tool to callers. The specification explains how to call `skills.list` before `ListTool::handle` is ever run.
 
 
 ##### `ListTool::handle`  (lines 66–83)
@@ -7347,11 +7446,11 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Executes a `skills.list` call by loading the authority-specific catalog, filtering entries, bounding warnings, and returning JSON output.
+**Purpose**: Runs the actual list request. It reads the caller’s arguments, fetches the skill catalog for this turn, filters it down to enabled skills owned by the requested authority, and returns JSON.
 
-**Data flow**: Consumes a `ToolCall` inside an async future. It parses arguments with `parse_args`, converts `args.authority` into a concrete authority, awaits `self.context.catalog(&call.turn_id, args.authority)`, filters `catalog.entries` to enabled entries whose `entry.authority` equals the requested authority, transforms them with `listed_skill`, collects them into `ListResponse.skills`, truncates and limits `catalog.warnings` via `bounded_warnings`, and serializes the response through `external_json_output`.
+**Data flow**: It receives a `ToolCall`, parses its arguments into `ListArgs`, converts the requested authority into the internal authority form, and asks the context for the catalog tied to the call’s turn ID. From the catalog entries, it keeps only enabled entries with the matching authority, converts each safe entry with `listed_skill`, shortens the warning list with `bounded_warnings`, and sends the finished `ListResponse` out as JSON.
 
-**Call relations**: This is the runtime entrypoint for `skills.list`. It depends on `SkillToolContext::catalog` for catalog retrieval and on local helpers `listed_skill` and `bounded_warnings` to enforce output constraints before handing the result to the shared JSON-output helper.
+**Call relations**: This is the function the tool framework calls when someone invokes the list tool. During the request it calls `parse_args` to understand the input, uses the context’s catalog lookup to get available skills, calls `bounded_warnings` to keep warning output small, and finishes by passing the response to `external_json_output`.
 
 *Call graph*: calls 2 internal fn (catalog, bounded_warnings); 3 external calls (pin, external_json_output, parse_args).
 
@@ -7362,11 +7461,11 @@ fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_>
 fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill>
 ```
 
-**Purpose**: Converts one catalog entry into the externally exposed `ListedSkill` shape if its authority and opaque handles are valid for tool output.
+**Purpose**: Turns one internal catalog entry into the smaller public skill record returned by the list tool. It also refuses entries whose authority cannot be represented for the tool or whose handles are too large.
 
-**Data flow**: Consumes a `SkillCatalogEntry`, maps `entry.authority` to `SkillToolAuthority` with `from_authority`, validates `entry.id.0` and `entry.main_prompt.as_str()` using `is_bounded_handle`, and returns `None` if either check fails. Otherwise it constructs and returns `Some(ListedSkill)` containing the authority, package id, name, description, and main resource string.
+**Data flow**: It receives a `SkillCatalogEntry`. First it converts the entry’s internal authority into the tool-facing authority form. Then it checks that the package handle and main resource handle fit within the maximum allowed byte size. If either check fails, it returns nothing; otherwise it returns a `ListedSkill` containing the safe public fields.
 
-**Call relations**: It is called from `ListTool::handle` during response construction. The helper acts as the final gate that prevents unsupported authorities or malformed handles from leaking into tool-visible output.
+**Call relations**: This is used inside `ListTool::handle` while building the response list. It relies on `from_authority` to translate the owner information and on `is_bounded_handle` to enforce the output size rule before the skill is shown to the caller.
 
 *Call graph*: calls 1 internal fn (from_authority); 1 external calls (is_bounded_handle).
 
@@ -7377,24 +7476,24 @@ fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill>
 fn bounded_warnings(warnings: Vec<String>) -> Vec<String>
 ```
 
-**Purpose**: Limits the number and byte length of warning strings included in the list response.
+**Purpose**: Keeps catalog warnings from overwhelming the response. It returns only the first few warnings and trims each one to a safe byte length without breaking text encoding.
 
-**Data flow**: Consumes a `Vec<String>`, keeps only the first `MAX_WARNINGS` entries, truncates each warning to `MAX_WARNING_BYTES` using `truncate_utf8_to_bytes`, discards the truncation flag, and returns the resulting `Vec<String>`.
+**Data flow**: It receives a list of warning strings. It takes at most four, truncates each to the maximum warning size using UTF-8-safe truncation, and returns the shortened list. It does not change the original catalog; it builds a new warning list for the response.
 
-**Call relations**: This helper is called by `ListTool::handle` just before serialization. It ensures provider warnings remain informative without allowing unbounded warning payloads in tool responses.
+**Call relations**: This is called by `ListTool::handle` after the catalog has been loaded. Its job is to make sure the warning section of the final JSON response stays compact and safe for external callers.
 
 *Call graph*: called by 1 (handle).
 
 
 ### `ext/skills/src/tools/read.rs`
 
-`io_transport` · `tool request handling`
+`domain_logic` · `request handling`
 
-This file defines the read-side tool executor for the skills namespace. `ReadTool` exposes itself as `skills.read` with a schema describing three required inputs: `authority`, `package`, and `resource`. At runtime, the handler first parses arguments and converts the tool-facing authority into an internal `SkillAuthority`. It then validates the `package` and `resource` strings with the shared bounded-handle rules, rejecting empty, oversized, or control-character-containing values before any provider call is attempted.
+This file is the read path for skill resources. A skill package can expose resources, such as instructions, examples, or other text-like content. The model cannot just fetch any arbitrary resource by name. It must ask through this tool, using the authority, package, and resource identifiers it was previously given.
 
-The handler next loads the current authority-scoped catalog for the call’s `turn_id` and checks whether the requested package is presently available as an enabled entry owned by that authority. This prevents arbitrary reads against packages not surfaced by `skills.list`. If the package is available, it constructs a `SkillReadRequest` using the parsed package string wrapped as `SkillPackageId`, the requested resource wrapped as `SkillResourceId`, `host: None`, and the optional MCP resource client from context. The actual read is delegated through `SkillsThreadState::read_skill`, which may use orchestrator caching.
+The flow is like checking out a book from a controlled library. First, the tool reads the request arguments and makes sure the package and resource handles are not too large or malformed. Then it asks the current skill catalog what packages are enabled for this conversation turn. If the requested package is not enabled under the requested authority, the tool refuses the request with a message the model can understand.
 
-Provider failures are logged with `tracing::warn!` including turn id, call id, and resource, then converted into a model-facing generic error. As a final integrity check, the tool rejects any provider response whose `result.resource` differs from the requested resource id, treating that as a fatal internal contract violation before returning JSON output.
+If the package is allowed, the tool builds a `SkillReadRequest` and sends it to the skill provider through the shared thread state. A provider is the part of the system that knows how to fetch the real resource contents. If the provider fails, the tool logs a warning with useful debugging details but only returns a simple failure message to the model. Finally, it checks an important safety condition: the provider must return the same resource that was requested. If it returns something else, that is treated as a fatal internal error. Successful reads are returned as JSON containing the resource id and its contents.
 
 #### Function details
 
@@ -7404,11 +7503,11 @@ Provider failures are logged with `tracing::warn!` including turn id, call id, a
 fn tool_name(&self) -> ToolName
 ```
 
-**Purpose**: Returns the fully namespaced tool name for the read operation.
+**Purpose**: This tells the tool system the public name of this tool. It turns the short name `read` into the full skill tool name used when the model calls it.
 
-**Data flow**: Reads the local `TOOL_NAME` constant (`"read"`), passes it to `skill_tool_name`, and returns the resulting `ToolName`.
+**Data flow**: It starts with the fixed local tool name `read`. It passes that name into the shared skill naming helper, which applies the project’s standard naming format. It returns the finished `ToolName` value to the tool framework.
 
-**Call relations**: This method is used by the tool framework during registration and dispatch. It shares the common naming helper with the list tool.
+**Call relations**: The tool framework calls this when it needs to identify or register the tool. This function delegates the naming rule to `skill_tool_name`, so this file does not duplicate the convention used by other skill tools.
 
 *Call graph*: 1 external calls (skill_tool_name).
 
@@ -7419,11 +7518,11 @@ fn tool_name(&self) -> ToolName
 fn spec(&self) -> ToolSpec
 ```
 
-**Purpose**: Describes the `skills.read` tool as a schema-backed function tool with typed request and response payloads.
+**Purpose**: This describes the tool to the model: what arguments it accepts and what shape its answer has. The description also tells the model to use exact identifiers from `skills.list`, because resource names are opaque routing tokens rather than user-friendly paths.
 
-**Data flow**: Calls `skill_function_tool::<ReadArgs, ReadResponse>` with the local tool name and descriptive text, and returns the resulting `ToolSpec`.
+**Data flow**: It uses the `ReadArgs` input shape and `ReadResponse` output shape, along with a plain-language description of the tool. From that, it produces a `ToolSpec`, which is the formal description the tool framework can expose to the model.
 
-**Call relations**: The framework invokes this when exposing the tool schema. It relies on the shared spec builder so the read tool matches the namespace and schema conventions used by the list tool.
+**Call relations**: The tool framework asks for this specification when making tools available. This function relies on the shared `skill_function_tool` helper so the read tool is described in the same structured way as the other skill tools.
 
 
 ##### `ReadTool::handle`  (lines 58–111)
@@ -7432,26 +7531,26 @@ fn spec(&self) -> ToolSpec
 fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_>
 ```
 
-**Purpose**: Executes a `skills.read` call by validating arguments, confirming package availability in the current catalog, reading the requested resource, and returning its contents as JSON.
+**Purpose**: This is the main work of the file: it answers one `skills.read` call. It validates the request, confirms the package is enabled, asks the right provider for the resource, checks that the provider returned the exact requested resource, and formats the result for the model.
 
-**Data flow**: Consumes a `ToolCall` inside an async future. It parses `ReadArgs` with `parse_args`, converts `args.authority` into an internal authority, validates `args.package` and `args.resource` with `validate_handle`, and awaits `self.context.catalog(&call.turn_id, args.authority)`. It scans `catalog.entries` to ensure an enabled entry exists with matching authority and package id; if not, it returns `FunctionCallError::RespondToModel`. Otherwise it constructs `requested_resource = SkillResourceId::new(args.resource)` and a `SkillReadRequest` containing the authority, `SkillPackageId(args.package)`, cloned requested resource, `host: None`, and cloned MCP resources, then awaits `thread_state.read_skill(&providers, request)`. Provider errors are logged and mapped to a generic model-facing error. If the returned `result.resource` differs from `requested_resource`, it returns `FunctionCallError::Fatal`; otherwise it serializes `ReadResponse { resource, contents }` via `external_json_output`.
+**Data flow**: It receives a `ToolCall`, which contains the model’s arguments plus identifiers for the current turn and call. It parses those arguments into `ReadArgs`, converts the requested authority into the internal form, and checks that the package and resource handles fit the allowed size. It reads the current catalog for this turn and refuses the call if the package is not enabled for that authority. If allowed, it creates a resource id and sends a `SkillReadRequest` through the shared thread state to the configured providers. A successful provider response is checked against the original resource id, then converted into JSON with the resource name and contents. Failures become either a model-facing error message or, if the provider returned the wrong resource, a fatal internal error.
 
-**Call relations**: This is the runtime entrypoint for `skills.read`. It depends on `SkillToolContext::catalog` to authorize the package against the current catalog, on shared parsing/validation helpers from `tools/mod.rs`, and on `SkillsThreadState::read_skill` to perform the actual provider-backed read with orchestrator-aware caching.
+**Call relations**: The tool framework calls this whenever the model invokes the read tool. Inside the async task, it hands argument parsing to `parse_args`, handle checks to `validate_handle`, catalog lookup to the tool context, resource id creation to `SkillResourceId::new`, provider access to `thread_state.read_skill`, and final formatting to `external_json_output`. If something goes wrong in a way the model can act on, it returns a `RespondToModel` error; if the provider violates the contract by returning a different resource, it uses a fatal error path.
 
 *Call graph*: calls 2 internal fn (new, catalog); 7 external calls (pin, new, external_json_output, parse_args, validate_handle, Fatal, RespondToModel).
 
 
 ### `ext/skills/src/extension.rs`
 
-`orchestration` · `startup and turn handling`
+`orchestration` · `startup, thread start, config changes, and per-turn input preparation`
 
-This file is the orchestration layer for the skills extension. `SkillsExtension<C>` holds the configured `SkillProviders`, an `ExtensionEventSink` for warnings, and a host-config projection closure that extracts `SkillsExtensionConfig` from the host application's config type. It implements several extension traits so the same object participates in thread startup, config changes, prompt contribution, turn input processing, and tool registration.
+A “skill” here is a packaged instruction or capability that can be made available to the assistant. This file is the adapter between the general extension framework and the skills subsystem. Without it, the rest of the application might know how to store and read skills, but those skills would not appear at the right time in a conversation.
 
-At thread start, it snapshots selected capability roots from thread storage, determines whether orchestrator skills should be enabled by checking for the local environment, and inserts a fresh `SkillsThreadState`. On config changes, it updates the existing thread state if present or creates one if missing.
+The file defines `SkillsExtension`, which keeps three important things: the available skill providers, a way to send warning events back to the host, and a function for extracting skills settings from the host application’s configuration. When a thread starts, it creates per-thread skills state, including which filesystem or capability roots are selected and whether orchestrator skills are allowed. When configuration changes, it updates that state.
 
-For always-visible prompt context, the `ContextContributor` path lists skills for the current thread, emits any provider warnings as protocol warning events, and renders an available-skills developer fragment when instructions are enabled. For turn input, the extension performs the heavier flow: list all relevant skills, emit warnings, detect explicit skill mentions in the user's input, optionally inject a filtered available-skills fragment, then read and inject each selected skill's main prompt. Prompt contents are truncated to configured byte limits, with truncation warnings emitted and stored. It also tracks which host skill prompts were injected so core host-skill machinery can avoid duplicate prompt insertion.
+During a turn, it builds a catalog of available skills, notices explicit skill mentions in the user’s message, reads the selected skills’ main prompt text, trims that text if it is too large, and inserts the resulting instruction fragments into the model input. It also saves turn-level state so later parts of the system know which skills were available, selected, warned about, or injected.
 
-The helper methods keep responsibilities separated: `list_skills` merges ordinary provider results with an orchestrator snapshot path, `read_main_prompt` routes a single read through thread state/provider logic, and `emit_warning` converts plain strings into protocol `WarningEvent`s. The `install` functions construct the extension and register it with all relevant contributor hooks.
+The file also registers optional skill tools, especially for orchestrator-provided skills, and emits warning events when something cannot be loaded or must be truncated. The `install` functions are the doorway that attaches this extension to the registry.
 
 #### Function details
 
@@ -7461,11 +7560,11 @@ The helper methods keep responsibilities separated: `list_skills` merges ordinar
 fn on_thread_start(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()>
 ```
 
-**Purpose**: Initializes per-thread skills state when a new thread begins. It captures selected capability roots, computes whether orchestrator skills should be enabled, derives extension config from the host config, and stores a new `SkillsThreadState`.
+**Purpose**: This function prepares skills state when a new conversation thread begins. It records the current skills configuration, selected capability roots, and whether orchestrator skills should be enabled for this thread.
 
-**Data flow**: Reads `ThreadStartInput`: selected roots from `thread_store`, environment ids from `input.environments`, and host config from `input.config`. It clones the selected roots or defaults to an empty vector, computes `orchestrator_skills_enabled` by checking for absence of `LOCAL_ENVIRONMENT_ID`, constructs `SkillsThreadState::new(...)`, and inserts it into `thread_store`; returns an async future yielding `()`.
+**Data flow**: It receives thread-start information, including the host config, thread storage, selected roots if already present, and active environments. It turns the host config into `SkillsExtensionConfig`, checks whether the local environment is present, then stores a new `SkillsThreadState` in the thread store. After this, later skill steps can read a consistent per-thread state.
 
-**Call relations**: Called by the extension framework at thread startup. It establishes the state later consumed by prompt contribution, tool exposure, and turn input processing.
+**Call relations**: The extension framework calls this at thread startup because `install_with_providers` registers the extension as a thread lifecycle contributor. It creates the state that later methods, such as turn input contribution and tool contribution, expect to find.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (pin).
 
@@ -7482,11 +7581,11 @@ fn on_config_changed(
     )
 ```
 
-**Purpose**: Applies updated host configuration to the thread-local skills state. If no thread state exists yet, it creates one with empty roots and orchestrator skills enabled by default.
+**Purpose**: This function updates the skills settings when the host application’s configuration changes. It keeps the already-running thread in sync with new options such as whether bundled skills are enabled or instructions should be included.
 
-**Data flow**: Reads `new_config`, transforms it through `config_from_host`, then checks `thread_store` for an existing `SkillsThreadState`. If present, it calls `state.set_config(next_config)`; otherwise it constructs `SkillsThreadState::new(next_config, Vec::new(), true)` and inserts it into `thread_store`.
+**Data flow**: It receives the old and new host config plus shared stores. It extracts the next skills config from the new host config. If skills thread state already exists, it updates that state; if not, it creates and inserts a fresh `SkillsThreadState` with default selected roots and orchestrator skills enabled.
 
-**Call relations**: Invoked by the extension framework whenever host config changes. It keeps thread-local skills behavior synchronized with config without rebuilding the whole extension object.
+**Call relations**: The extension framework calls this after `install_with_providers` registers the extension as a config contributor. It supports the rest of the skills flow by ensuring later catalog building uses current settings rather than stale startup settings.
 
 *Call graph*: calls 2 internal fn (insert, new); 1 external calls (new).
 
@@ -7501,11 +7600,11 @@ fn tools(
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
 ```
 
-**Purpose**: Exposes skill-related tools only when orchestrator-backed skill tooling is available and enabled for the thread. It gates tool registration on both provider capability and thread state.
+**Purpose**: This function decides whether skill-related tools should be offered for the current thread. These tools let the model interact with orchestrator skills when that kind of provider is available and allowed.
 
-**Data flow**: Reads `thread_store` for `SkillsThreadState`; if absent returns an empty vector. It then checks `self.providers.has_orchestrator_provider()` and `thread_state.orchestrator_skills_enabled()`, and if both are true calls `skill_tools(self.providers.clone(), session_store.get::<McpResourceClient>(), thread_state)` to produce `Vec<Arc<dyn ToolExecutor<ToolCall>>>`.
+**Data flow**: It reads `SkillsThreadState` from the thread store and checks the configured providers. If there is no thread state, no orchestrator provider, or orchestrator skills are disabled, it returns an empty tool list. Otherwise it builds skill tool executors using the providers, optional MCP resource client, and thread state, then returns them to the extension framework.
 
-**Call relations**: Called by the framework when collecting tools for the current thread/session. It delegates actual tool construction to `skill_tools` and suppresses tools entirely when orchestrator support is unavailable.
+**Call relations**: The extension framework calls this because the extension was registered as a tool contributor. It hands off to `skill_tools` to create the actual tool executors, while this function acts as the gatekeeper that decides whether those tools should exist for this thread.
 
 *Call graph*: calls 2 internal fn (has_orchestrator_provider, skill_tools); 2 external calls (new, clone).
 
@@ -7522,11 +7621,11 @@ fn contribute(
     ) -> Ext
 ```
 
-**Purpose**: Builds turn-scoped contextual user fragments for skills: optional available-skills instructions plus injected main prompts for explicitly mentioned skills, while recording warnings and turn state. It is the main per-turn orchestration path for the extension.
+**Purpose**: This function prepares skill-related context for one user turn. It finds available skills, detects which ones the user explicitly asked for, loads their instruction text, warns about problems, and returns fragments that should be added to the model input.
 
-**Data flow**: Reads `TurnInputContext`, `session_store`, `thread_store`, and `turn_store`. It fetches `SkillsThreadState`, current config, and optional `HostLoadedSkills`; builds a `SkillListQuery`; awaits `self.list_skills`; emits each catalog warning through `emit_warning`; computes `selected_entries` via `collect_explicit_skill_mentions`; optionally clones and filters the catalog to non-executor/non-orchestrator entries before rendering an available-skills fragment; then iterates selected entries, calling `read_main_prompt` for each. Successful reads are truncated with `truncate_main_prompt_contents`, converted into `SkillInstructions` using byte-limited `name` and `path` via `truncate_utf8_to_bytes`, and pushed into the fragment list; failures become warning strings and warning events. It accumulates `warnings`, tracks `main_prompts_injected`, builds `InjectedHostSkillPrompts` for host deduplication, inserts `SkillsTurnState` and possibly injected-host metadata into `turn_store`, and returns the assembled fragment vector.
+**Data flow**: It starts with the turn input, session store, thread store, and turn store. It reads thread settings and any host-loaded skills, builds a skill-list query, and asks `list_skills` for a catalog. It sends warning events for catalog warnings, scans the user message for explicit skill mentions, optionally adds an available-skills fragment, then reads each selected skill’s main prompt through `read_main_prompt`. Loaded prompt text is shortened if needed, wrapped as `SkillInstructions`, and returned as contextual fragments. It also writes `SkillsTurnState` into the turn store, including the catalog, selected entries, warnings, and whether main prompts were injected.
 
-**Call relations**: Invoked by the framework during turn input preparation. It depends on `list_skills` to gather catalog data, `read_main_prompt` to fetch selected skill contents, `available_skills_fragment` and `SkillInstructions` to build fragments, and `emit_warning` to surface provider/read/truncation issues as protocol events.
+**Call relations**: The extension framework calls this during turn input preparation because `install_with_providers` registers the extension as a turn input contributor. Inside the turn flow, it calls `list_skills` to gather candidates, `read_main_prompt` to fetch selected skill instructions, and `emit_warning` whenever the user or host should be told about a loading or truncation issue.
 
 *Call graph*: calls 9 internal fn (insert, level_id, emit_warning, list_skills, read_main_prompt, available_skills_fragment, truncate_main_prompt_contents, truncate_utf8_to_bytes, collect_explicit_skill_mentions); 5 external calls (new, pin, new, default, format!).
 
@@ -7541,11 +7640,11 @@ async fn list_skills(
     ) -> SkillCatalog
 ```
 
-**Purpose**: Lists skills for a turn, optionally merging ordinary provider results with an orchestrator snapshot. It isolates the special handling required for orchestrator skills from the rest of the extension flow.
+**Purpose**: This helper builds the skill catalog for a turn. It combines the normal providers with orchestrator skills when those are enabled, while using a cached snapshot path for orchestrator results.
 
-**Data flow**: Takes a mutable `SkillListQuery` and `SkillsThreadState`. It snapshots `include_orchestrator_skills`, clones the original query for orchestrator use, extracts `mcp_resources`, disables orchestrator inclusion on the base query, awaits `self.providers.list_for_turn(query)` into a mutable `SkillCatalog`, and if orchestrator inclusion was requested, awaits `thread_state.orchestrator_catalog_snapshot(mcp_resources.as_deref(), self.providers.list_orchestrator_for_turn(orchestrator_query))` and merges the result with `catalog.extend(...)`; returns the final catalog.
+**Data flow**: It receives a `SkillListQuery` and thread state. It first saves whether orchestrator skills were requested, then runs the regular provider listing with orchestrator skills turned off. If orchestrator skills should be included, it asks the thread state for an orchestrator catalog snapshot, using the orchestrator provider listing as the source, and merges that into the main catalog. It returns the finished `SkillCatalog`.
 
-**Call relations**: Called from both prompt-context contribution and turn-input contribution whenever a catalog is needed. It delegates ordinary listing to `SkillProviders` and orchestrator caching/snapshot behavior to `SkillsThreadState`.
+**Call relations**: The turn contribution flow calls this before deciding what to show or inject. It delegates ordinary listing to `list_for_turn`, orchestrator listing to `list_orchestrator_for_turn`, and snapshot coordination to `orchestrator_catalog_snapshot` so repeated turn work can stay consistent.
 
 *Call graph*: calls 3 internal fn (list_for_turn, list_orchestrator_for_turn, orchestrator_catalog_snapshot); called by 1 (contribute); 1 external calls (clone).
 
@@ -7561,11 +7660,11 @@ async fn read_main_prompt(
         thread_state: &Sk
 ```
 
-**Purpose**: Reads the main prompt resource for a selected catalog entry through thread-state routing and provider infrastructure. It converts provider errors into plain strings suitable for warning messages.
+**Purpose**: This helper loads the main instruction text for one selected skill. That text is what gets injected into the model when the user asks for the skill.
 
-**Data flow**: Reads the selected `SkillCatalogEntry`, optional `HostLoadedSkills`, `session_store`, and `thread_state`; constructs a `SkillReadRequest` from the entry's authority, package id, and main prompt plus host/MCP context; awaits `thread_state.read_skill(&self.providers, request)`; on success returns `SkillReadResult`, on failure maps `SkillProviderError` to its `message` string.
+**Data flow**: It receives a catalog entry, optional host-loaded skill data, session storage, and thread state. It builds a `SkillReadRequest` from the entry’s source, package id, main prompt resource, host data, and optional MCP resource client. It asks the thread state to read the skill through the configured providers, then returns either the read result or a plain error message.
 
-**Call relations**: Used inside the turn-input contribution loop for each explicitly selected skill. It delegates actual authority-based read routing to `SkillsThreadState::read_skill`.
+**Call relations**: The per-turn `contribute` function calls this for each selected skill. This keeps the main flow focused on preparing fragments while this helper handles the exact read request needed to fetch skill content.
 
 *Call graph*: calls 1 internal fn (read_skill); called by 1 (contribute).
 
@@ -7576,11 +7675,11 @@ async fn read_main_prompt(
 fn emit_warning(&self, turn_id: &str, message: String)
 ```
 
-**Purpose**: Sends a warning event for the current turn through the extension event sink. It is the single place where skills warnings are converted into protocol events.
+**Purpose**: This function sends a warning event back to the host application. It is used when skill discovery or loading succeeds only partially, for example when a prompt is too large and must be cut down.
 
-**Data flow**: Accepts a `turn_id` and warning `message`, constructs an `Event` with `id: turn_id.to_string()` and `msg: EventMsg::Warning(WarningEvent { message })`, and emits it through `self.event_sink`.
+**Data flow**: It receives a turn id and warning message. It wraps the message in a protocol warning event, attaches the turn id as the event id, and sends it through the extension event sink. The output is not a returned value; the visible effect is that the host can receive and display or record the warning.
 
-**Call relations**: Called from both contribution paths whenever provider warnings, read failures, or truncation notices need to be surfaced to the host/UI.
+**Call relations**: The turn contribution flow calls this whenever catalog warnings, skill-load failures, or truncation notices occur. It is the small bridge between internal skills problems and user-visible host events.
 
 *Call graph*: called by 1 (contribute); 1 external calls (Warning).
 
@@ -7594,11 +7693,11 @@ fn install(
 )
 ```
 
-**Purpose**: Registers the skills extension with the default provider set. It creates a fresh `SkillProviders` containing a host provider and forwards to the more general installer.
+**Purpose**: This is the standard setup function for adding the skills extension to an extension registry. It uses the default skill providers, including the host skill provider.
 
-**Data flow**: Takes a mutable `ExtensionRegistryBuilder<C>` and a config projection closure, constructs `SkillProviders::new().with_host_provider(Arc::new(HostSkillProvider::new()))`, and passes both to `install_with_providers`; it mutates the registry indirectly through that call.
+**Data flow**: It receives the registry to modify and a function that can extract skills config from the host config. It creates the default `SkillProviders`, adds a host provider, and passes everything to `install_with_providers`. It does not return a value; it changes the registry by registering the extension.
 
-**Call relations**: Used by consumers that want the standard skills extension setup. It delegates all actual registration work to `install_with_providers`.
+**Call relations**: Application startup code can call this when it wants the normal skills setup. It delegates the actual registration work to `install_with_providers`, which is also useful for custom provider setups.
 
 *Call graph*: calls 3 internal fn (install_with_providers, new, new); 1 external calls (new).
 
@@ -7613,10 +7712,10 @@ fn install_with_providers(
 )
 ```
 
-**Purpose**: Constructs a `SkillsExtension` with the supplied providers and registers it for all relevant extension hooks. This is the configurable installation entrypoint used when tests or alternate deployments need custom providers.
+**Purpose**: This function registers a `SkillsExtension` with the extension system using a caller-supplied set of skill providers. It is the central wiring point that makes all the other methods active.
 
-**Data flow**: Consumes the provided `SkillProviders` and config projection closure, obtains the registry's event sink, wraps everything in `Arc<SkillsExtension<_>>`, and registers clones of that extension as thread lifecycle, config, prompt, turn input, and tool contributors on the `ExtensionRegistryBuilder`.
+**Data flow**: It receives the registry, skill providers, and config-extraction function. It creates one shared `SkillsExtension`, captures the registry’s event sink, and registers that same extension as a thread lifecycle contributor, config contributor, prompt contributor, turn input contributor, and tool contributor. After this, the framework knows to call the extension at the right moments.
 
-**Call relations**: Called by `install` and by any caller needing custom provider composition. It is the final wiring step that makes the extension active in the host runtime.
+**Call relations**: `install` calls this with the default providers, while tests or specialized setups can call it directly with custom providers. By registering each contributor role, it connects startup state creation, config updates, prompt context, turn input injection, and tool exposure into one coordinated skills feature.
 
 *Call graph*: calls 6 internal fn (config_contributor, event_sink, prompt_contributor, thread_lifecycle_contributor, tool_contributor, turn_input_contributor); called by 1 (install); 1 external calls (new).

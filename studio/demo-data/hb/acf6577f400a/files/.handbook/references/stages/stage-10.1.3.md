@@ -1,10 +1,10 @@
 # Chat widget interaction and command flows  `stage-10.1.3`
 
-This stage is the live interaction layer of the TUI chat experience: it sits in the main event loop between raw user input, backend protocol traffic, and the rendered chat surface. `chatwidget.rs` is the central stateful controller, coordinating transcript state, bottom-pane controls, approvals, feedback, and command execution. User actions enter through `interaction.rs`, then flow through `input_flow.rs`, `input_submission.rs`, and `slash_dispatch.rs`, which decide whether text becomes an immediate user turn, a shell-style command, a queued follow-up, or a specialized slash-command action.
+This stage is the main control room for the terminal chat screen. It runs during normal use, after startup, while the user is talking to the agent. The central chat widget keeps the transcript, input box, status messages, popups, and streaming replies in sync. Rendering turns that state into terminal rows. Protocol files listen for server events and turn them into visible changes, such as approvals, tool prompts, review results, and notices.
 
-Queued drafts and interrupted work are preserved by `input_queue.rs`, `input_restore.rs`, and `interrupts.rs`, so the widget can resume cleanly after turns or modal interruptions. Backend-driven changes arrive through `protocol.rs` and `protocol_requests.rs`, which convert notifications and requests into concrete UI updates, approvals, notices, and lifecycle transitions. `rendering.rs` turns all of that state into the visible transcript, transient notices, hook output, and composer area, while `notifications.rs` emits coalesced desktop alerts.
+User input passes through several gates. Interaction handles keys, paste, images, copy, interrupt, and quit. Input submission and input flow decide whether text is sent now, queued, treated as a slash command, or held until the current turn finishes. The queue and restore code protect drafts, rejected messages, steering instructions, and attachments from being lost.
 
-Specialized modules implement command-specific flows: skills and connectors browsing, `/ide`, `/goal`, hooks, model and review popups, plan-implementation confirmation, reasoning shortcuts, and `/usage` token and rate-limit-reset interactions.
+Other parts add focused features. Slash dispatch runs commands like `/new` or `/diff`. Skills, connectors, IDE context, goals, hooks, usage, tokens, reviews, model popups, plan implementation, and reasoning shortcuts build the small menus and actions around chat. Interrupt and notification helpers make sure prompts and alerts appear in a useful order.
 
 ## Files in this stage
 
@@ -13,13 +13,15 @@ Defines the main chat widget state, renders its UI, and handles deferred interru
 
 ### `tui/src/chatwidget.rs`
 
-`orchestration` · `main chat loop / request handling / rendering coordination`
+`orchestration` · `main loop`
 
-This file is the top-level state hub for the chat screen. It defines `ChatWidgetInit`, the large `ChatWidget` struct, several small enums and helper structs, and a broad slice of the widget’s local behavior. `ChatWidget` owns transcript state, the bottom pane, config/runtime status, streaming controllers, review mode, plugin and MCP state, terminal-title caches, git-status caches, thread metadata, and many transient UI flags. The methods in this file mostly coordinate those subsystems rather than implementing low-level rendering themselves.
+Think of ChatWidget as the control desk for the terminal chat experience. It does not run the AI agent itself. Instead, it listens to events from the agent and app server, turns them into visible transcript entries, and sends user actions back out as commands. Without this file, the TUI would have no central place to connect typed messages, streamed assistant replies, approvals, tool output, status lines, and overlays into one coherent screen.
 
-Several helpers normalize external data into UI-specific forms: terminal-dependent queued-message edit bindings, thread-name trimming, plan-keyword detection, approval-request conversion from app-server protocol structs, and token-usage conversion into `TokenUsageInfo`. The widget methods then use those values to drive UI flows: opening feedback and app-link views, showing enablement prompts for subagents and memories, updating token/context indicators in the bottom pane, recording committed user messages into transcript history, flushing active cells into committed history, and toggling raw-output or Vim modes with user-visible notices.
+The file keeps two kinds of transcript content. Finished items become history cells, like permanent lines in a logbook. In-progress content stays in an active cell, so it can change while a command runs or a model response streams. When that live content is ready, ChatWidget flushes it into the committed history.
 
-A recurring pattern is careful synchronization between live mutable cells and committed transcript history. `flush_active_cell`, `add_boxed_history`, `active_cell_transcript_key`, and `active_cell_transcript_hyperlink_lines` support the transcript overlay’s cached live tail while preserving grouping and separator invariants. Another pattern is redraw discipline: many mutators call `request_redraw()` after changing bottom-pane views, active cells, or status surfaces. The file also owns command submission plumbing through `submit_op`, including local pre-submission cleanup for interrupts and review-mode task-running state.
+It also owns many small user-facing flows: feedback forms, memory and multi-agent prompts, raw-output mode, review mode, shutdown messages, file-search results, token usage, and terminal resize behavior. The bottom pane is the input and popup area; ChatWidget tells it what to show and when. It also requests redraws whenever something changes, like ringing a bell to tell the UI to repaint.
+
+A lot of this file is glue code. Its importance is that it keeps several moving parts—agent progress, app-server requests, transcript rendering, keyboard behavior, and user prompts—from drifting out of sync.
 
 #### Function details
 
@@ -29,11 +31,11 @@ A recurring pattern is careful synchronization between live mutable cells and co
 fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding
 ```
 
-**Purpose**: Chooses the preferred keybinding for editing the most recently queued message based on terminal and multiplexer quirks.
+**Purpose**: Chooses the keyboard shortcut that should edit the most recently queued message. Some terminals intercept Alt+Up, so this picks a safer fallback for those environments.
 
-**Data flow**: Reads a `TerminalInfo`, first checks whether it is running under tmux and returns `Shift+Left` in that case, otherwise matches on `TerminalName` and returns either `Shift+Left` for terminals known to swallow `Alt+Up` or `Alt+Up` for terminals that reliably pass it through.
+**Data flow**: It receives detected terminal information, including the terminal name and whether the user is inside tmux. It checks that environment and returns either Shift+Left or Alt+Up as the shortcut to display and accept.
 
-**Call relations**: The hint-selection helper calls this to prefer a terminal-appropriate binding from the configured binding list.
+**Call relations**: queued_message_edit_hint_binding calls this first to learn the terminal-specific preferred shortcut before comparing it with the configured shortcuts.
 
 *Call graph*: calls 2 internal fn (alt, shift); called by 1 (queued_message_edit_hint_binding); 1 external calls (matches!).
 
@@ -47,11 +49,11 @@ fn queued_message_edit_hint_binding(
 ) -> Option<KeyBinding>
 ```
 
-**Purpose**: Selects which configured binding should be shown to the user for queued-message editing.
+**Purpose**: Picks the actual shortcut hint to show for editing a queued message. It prefers the terminal-safe shortcut, but falls back to the first configured binding if needed.
 
-**Data flow**: Computes the terminal-preferred binding with `queued_message_edit_binding_for_terminal`, returns it if the provided binding slice contains it, otherwise falls back to the first configured binding if any.
+**Data flow**: It takes a list of allowed key bindings and terminal information. It computes the best binding for that terminal, checks whether it is present in the configured list, and returns that binding or the first available one.
 
-**Call relations**: Constructor/setup code uses this to display a realistic shortcut hint without changing the actual configured bindings.
+**Call relations**: This is the small bridge between terminal detection and the user-visible key hint. It relies on queued_message_edit_binding_for_terminal to avoid showing a shortcut that the terminal may swallow.
 
 *Call graph*: calls 1 internal fn (queued_message_edit_binding_for_terminal); 1 external calls (contains).
 
@@ -62,11 +64,11 @@ fn queued_message_edit_hint_binding(
 fn normalize_thread_name(name: &str) -> Option<String>
 ```
 
-**Purpose**: Trims a thread name and suppresses empty or whitespace-only names.
+**Purpose**: Cleans up a proposed thread name and rejects empty names. This prevents whitespace-only session names from being saved or shown.
 
-**Data flow**: Calls `trim()` on the input string and returns `Some(trimmed.to_string())` only when the trimmed result is non-empty.
+**Data flow**: It receives a name string, trims leading and trailing whitespace, and returns the cleaned string only if something meaningful remains.
 
-**Call relations**: Thread metadata handling uses this to avoid storing blank names.
+**Call relations**: This helper supports thread naming flows elsewhere in the chat UI by turning raw user or server text into a safe optional display name.
 
 
 ##### `contains_plan_keyword`  (lines 814–817)
@@ -75,11 +77,11 @@ fn normalize_thread_name(name: &str) -> Option<String>
 fn contains_plan_keyword(text: &str) -> bool
 ```
 
-**Purpose**: Checks whether text contains the standalone word `plan` according to the same lexical heuristic used elsewhere in the app.
+**Purpose**: Checks whether text contains the standalone word “plan”. It is used for plan-mode suggestions without being fooled by words like “planning”.
 
-**Data flow**: Splits the input on any non-alphanumeric, non-underscore character and returns true if any resulting token equals `plan` case-insensitively.
+**Data flow**: It receives text, splits it around non-word separators, compares each word case-insensitively with “plan”, and returns true if there is an exact word match.
 
-**Call relations**: Plan-mode suggestion and nudge logic can use this lexical helper without conflating it with slash-command or shell-command policy.
+**Call relations**: Other chat-widget logic can use this to decide whether to show plan-mode nudges while keeping the text-matching rule simple and predictable.
 
 
 ##### `ThreadItemRenderSource::is_replay`  (lines 826–828)
@@ -88,11 +90,11 @@ fn contains_plan_keyword(text: &str) -> bool
 fn is_replay(self) -> bool
 ```
 
-**Purpose**: Reports whether a thread item is being rendered from replayed history rather than live events.
+**Purpose**: Tells whether a thread item is being rendered from saved history rather than from live activity. That distinction matters because replayed content should not always trigger live-side effects.
 
-**Data flow**: Matches `self` against `ThreadItemRenderSource::Replay(_)` and returns a boolean.
+**Data flow**: It reads the enum value and returns true for replay sources and false for live sources.
 
-**Call relations**: Thread-item handling uses this to branch between replay-specific and live-event behavior.
+**Call relations**: handle_thread_item calls this when deciding how to treat an incoming thread item, especially whether to behave as if the user or agent just did something live.
 
 *Call graph*: called by 1 (handle_thread_item); 1 external calls (matches!).
 
@@ -103,11 +105,11 @@ fn is_replay(self) -> bool
 fn replay_kind(self) -> Option<ReplayKind>
 ```
 
-**Purpose**: Extracts the specific replay kind when the render source is a replay.
+**Purpose**: Returns what kind of replay is happening, if any. This lets callers distinguish resumed initial messages from full thread snapshot playback.
 
-**Data flow**: Returns `Some(replay_kind)` for `Replay(replay_kind)` and `None` for `Live`.
+**Data flow**: It reads the enum value. Live input becomes None; replay input becomes the stored ReplayKind.
 
-**Call relations**: Thread-item handling uses this when replay-specific behavior depends on whether the source is initial-message replay or snapshot replay.
+**Call relations**: handle_thread_item calls this when it needs more detail than a simple live-versus-replay answer.
 
 *Call graph*: called by 1 (handle_thread_item).
 
@@ -121,11 +123,11 @@ fn exec_approval_request_from_params(
 ) -> ExecApprovalRequestEvent
 ```
 
-**Purpose**: Converts app-server command-approval parameters into the local `ExecApprovalRequestEvent` shape used by the TUI.
+**Purpose**: Converts an app-server command-approval request into the TUI’s internal approval event. This lets the approval popup show the command, working directory, reason, and permission choices in the format the UI expects.
 
-**Data flow**: Consumes `CommandExecutionRequestApprovalParams` plus a fallback cwd, splits the optional command string into argv with `split_command_string`, fills in cwd from params or fallback, and copies reason, network context, permissions, turn id, approval id, policy amendments, and available decisions into a new `ExecApprovalRequestEvent`.
+**Data flow**: It receives protocol parameters and a fallback working directory. It splits the command text into command parts, fills in the working directory if the server did not provide one, copies approval metadata, and returns an ExecApprovalRequestEvent.
 
-**Call relations**: Approval-request handling uses this adapter when translating protocol requests into bottom-pane approval UI events.
+**Call relations**: This is an adapter between the app-server protocol and the bottom-pane approval flow. Later UI code can work with one local approval type instead of raw server parameters.
 
 
 ##### `patch_approval_request_from_params`  (lines 861–871)
@@ -136,11 +138,11 @@ fn patch_approval_request_from_params(
 ) -> ApplyPatchApprovalRequestEvent
 ```
 
-**Purpose**: Converts app-server file-change approval parameters into the local patch-approval event type.
+**Purpose**: Converts an app-server file-change approval request into the TUI’s internal patch-approval event. It prepares the request for the approval UI.
 
-**Data flow**: Consumes `FileChangeRequestApprovalParams` and constructs `ApplyPatchApprovalRequestEvent` with the call id, turn id, an empty `HashMap` for changes, reason, and grant root.
+**Data flow**: It receives protocol parameters, copies identifiers and the reason, starts with an empty change map, and returns an ApplyPatchApprovalRequestEvent.
 
-**Call relations**: Patch-approval flows use this as the protocol-to-UI adapter before actual file-change details are populated.
+**Call relations**: This adapter lets file-change approval handling use the same internal event type as other TUI approval flows.
 
 *Call graph*: 1 external calls (new).
 
@@ -153,11 +155,11 @@ fn request_permissions_from_params(
 ) -> std::io::Result<RequestPermissionsEvent>
 ```
 
-**Purpose**: Converts app-server permissions-approval parameters into a `RequestPermissionsEvent`, validating the permissions payload.
+**Purpose**: Converts a server request for broader permissions into the TUI’s internal permission request. It can fail if the protocol permission list cannot be converted.
 
-**Data flow**: Consumes protocol params, attempts `params.permissions.try_into()?`, and on success returns a populated `RequestPermissionsEvent` containing turn/call/environment ids, timestamp, reason, converted permissions, and cwd.
+**Data flow**: It receives server parameters, converts the permission description into the internal type, attaches identifiers, timing, reason, and current directory, and returns either the request event or an input-output error.
 
-**Call relations**: Permission-request handling uses this conversion before surfacing the request to the user.
+**Call relations**: This prepares permission prompts for the UI layer, separating protocol decoding from the code that shows or routes the prompt.
 
 
 ##### `token_usage_info_from_app_server`  (lines 887–905)
@@ -166,11 +168,11 @@ fn request_permissions_from_params(
 fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsageInfo
 ```
 
-**Purpose**: Converts app-server thread token-usage data into the local `TokenUsageInfo` structure used by status surfaces.
+**Purpose**: Translates token usage reported by the app server into the local token-usage structure. Tokens are pieces of text counted by the model, and this data powers context-window displays.
 
-**Data flow**: Copies total and last token counters from `ThreadTokenUsage` into two local `TokenUsage` structs and preserves `model_context_window`, returning the assembled `TokenUsageInfo`.
+**Data flow**: It receives total and last-turn token counts from the protocol. It copies each count into local TokenUsage values and returns a TokenUsageInfo object with the optional model context window.
 
-**Call relations**: Token-count update handling uses this adapter before updating bottom-pane context indicators.
+**Call relations**: Later token display code can use the local structure without knowing the app-server protocol shape.
 
 
 ##### `ChatWidget::set_collab_agent_metadata`  (lines 914–927)
@@ -184,11 +186,11 @@ fn set_collab_agent_metadata(
     )
 ```
 
-**Purpose**: Stores or updates cached nickname/role metadata for a collaboration-agent thread.
+**Purpose**: Stores the nickname and role for a collaborative agent thread. This makes notifications and transcript entries show a friendly label instead of a raw thread id.
 
-**Data flow**: Inserts `AgentMetadata { agent_nickname, agent_role }` into `self.collab_agent_metadata` keyed by `thread_id`, overwriting any previous entry.
+**Data flow**: It receives a thread id plus optional nickname and role, wraps them in AgentMetadata, and inserts or replaces that entry in the widget’s metadata map.
 
-**Call relations**: Widget replacement and agent-picker synchronization call this before notifications referencing that thread are rendered.
+**Call relations**: replace_chat_widget calls this when rebuilding the chat widget so agent metadata survives and stays aligned with the navigation cache.
 
 *Call graph*: called by 1 (replace_chat_widget).
 
@@ -199,11 +201,11 @@ fn set_collab_agent_metadata(
 fn collab_agent_metadata(&self, thread_id: ThreadId) -> AgentMetadata
 ```
 
-**Purpose**: Returns cached collaboration-agent metadata for a thread, defaulting to empty metadata when absent.
+**Purpose**: Looks up the friendly metadata for a collaborative agent thread. If nothing was saved, it returns an empty default instead of failing.
 
-**Data flow**: Looks up `thread_id` in `self.collab_agent_metadata`, clones the stored `AgentMetadata` if present, or returns `AgentMetadata::default()`.
+**Data flow**: It receives a thread id, checks the internal metadata map, clones the saved metadata if present, or returns a default metadata value.
 
-**Call relations**: Rendering and notification formatting use this to avoid exposing raw thread ids when friendly metadata is available.
+**Call relations**: Rendering and notification code can call this before showing an agent-related item so the UI has the best available label.
 
 
 ##### `ChatWidget::restore_retry_status_header_if_present`  (lines 937–941)
@@ -212,11 +214,11 @@ fn collab_agent_metadata(&self, thread_id: ThreadId) -> AgentMetadata
 fn restore_retry_status_header_if_present(&mut self)
 ```
 
-**Purpose**: Restores a saved retry status header back into the visible status header slot if one was stashed.
+**Purpose**: Restores a saved status header after retry-related UI state has temporarily replaced it. This keeps the status area from getting stuck on retry text.
 
-**Data flow**: Calls `self.status_state.take_retry_status_header()`, and when it returns `Some(header)`, forwards that header to `self.set_status_header(header)`.
+**Data flow**: It asks status_state for a saved retry header. If one is returned, it installs it as the current status header.
 
-**Call relations**: Retry/error flows use this to reinstate status-header UI after temporary interruptions.
+**Call relations**: It depends on status_state.take_retry_status_header, and it fits into flows that temporarily alter the status header during retry handling.
 
 *Call graph*: calls 1 internal fn (take_retry_status_header).
 
@@ -227,11 +229,11 @@ fn restore_retry_status_header_if_present(&mut self)
 fn record_agent_markdown(&mut self, message: &str)
 ```
 
-**Purpose**: Appends non-empty assistant markdown to the transcript’s raw-markdown recording buffer.
+**Purpose**: Stores the raw markdown text for the current assistant turn. This is useful for transcript copying or later processing that needs the original model text.
 
-**Data flow**: Checks whether `message` is non-empty and, if so, calls `self.transcript.record_agent_markdown(message.to_string())`.
+**Data flow**: It receives a message string. If it is not empty, it copies the text into transcript state as agent markdown.
 
-**Call relations**: Streaming or finalized assistant-message handling uses this to preserve markdown for later copy/export behavior.
+**Call relations**: Streaming and message-handling code can call this as assistant text arrives so the transcript has both rendered output and original markdown.
 
 *Call graph*: calls 1 internal fn (record_agent_markdown).
 
@@ -242,11 +244,11 @@ fn record_agent_markdown(&mut self, message: &str)
 fn record_visible_user_turn_for_copy(&mut self)
 ```
 
-**Purpose**: Marks the current user turn as visible for transcript-copy bookkeeping.
+**Purpose**: Marks that a user turn is visible in the transcript and should count for copy-history behavior. This helps copy features know where user-visible conversation turns occur.
 
-**Data flow**: Delegates directly to `self.transcript.record_visible_user_turn()`.
+**Data flow**: It reads no external input and updates transcript state to record a visible user turn.
 
-**Call relations**: Called when a user message is actually rendered into history so copy/export logic tracks visible turns rather than merely submitted inputs.
+**Call relations**: on_user_message_display calls this before adding a visible user prompt to history.
 
 *Call graph*: calls 1 internal fn (record_visible_user_turn); called by 1 (on_user_message_display).
 
@@ -261,11 +263,11 @@ fn open_feedback_note(
     )
 ```
 
-**Purpose**: Public wrapper that opens the feedback-note composer for a given category.
+**Purpose**: Opens the feedback note UI for a chosen feedback category. It is a public wrapper used by other parts of the app.
 
-**Data flow**: Forwards `category` and `include_logs` to `show_feedback_note`.
+**Data flow**: It receives the feedback category and whether logs should be included, then passes both to show_feedback_note.
 
-**Call relations**: External callers use this entrypoint; the actual view construction lives in the private helper.
+**Call relations**: This function delegates the actual view creation to show_feedback_note, keeping the external entry point small.
 
 *Call graph*: calls 1 internal fn (show_feedback_note).
 
@@ -280,11 +282,11 @@ fn show_feedback_note(
     )
 ```
 
-**Purpose**: Creates and displays the feedback-note bottom-pane view, then schedules a redraw.
+**Purpose**: Creates and displays the feedback note form in the bottom pane. It also asks the UI to redraw so the form appears immediately.
 
-**Data flow**: Constructs `FeedbackNoteView::new(category, last_turn_id, app_event_tx.clone(), include_logs)`, passes it to `bottom_pane.show_view(Box::new(view))`, and calls `request_redraw()`.
+**Data flow**: It receives a category and log-inclusion flag, builds a FeedbackNoteView using the last turn id and event sender, installs that view in the bottom pane, and schedules a redraw.
 
-**Call relations**: Used by `open_feedback_note` and any internal flow that needs to open the same feedback-note UI.
+**Call relations**: open_feedback_note calls this. It hands off to the bottom pane, which owns modal views shown below the transcript.
 
 *Call graph*: calls 3 internal fn (show_view, new, request_redraw); called by 1 (open_feedback_note); 2 external calls (new, clone).
 
@@ -295,11 +297,11 @@ fn show_feedback_note(
 fn open_app_link_view(&mut self, params: crate::bottom_pane::AppLinkViewParams)
 ```
 
-**Purpose**: Opens the app-link view with the current list keymap and requests a redraw.
+**Purpose**: Shows a bottom-pane view for linking or opening an app connection. It wires the view to the current app-event sender and list keymap.
 
-**Data flow**: Builds `AppLinkView::new_with_keymap(params, app_event_tx.clone(), bottom_pane.list_keymap())`, shows it in the bottom pane, and schedules a frame.
+**Data flow**: It receives view parameters, creates an AppLinkView with those parameters and UI key bindings, displays it in the bottom pane, and schedules a redraw.
 
-**Call relations**: Called when the UI needs to present a link-oriented popup tied to app metadata.
+**Call relations**: This is used when an app-link flow needs to interrupt the normal composer and ask the user to act.
 
 *Call graph*: calls 4 internal fn (list_keymap, show_view, new_with_keymap, request_redraw); 2 external calls (new, clone).
 
@@ -310,11 +312,11 @@ fn open_app_link_view(&mut self, params: crate::bottom_pane::AppLinkViewParams)
 fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest)
 ```
 
-**Purpose**: Removes a resolved app-server request from both deferred interrupt queues and any currently visible bottom-pane prompt.
+**Purpose**: Removes an app-server request that has already been resolved somewhere else. This prevents the user from acting on a stale approval or prompt.
 
-**Data flow**: Calls `interrupts.remove_resolved_prompt(request)` and `bottom_pane.dismiss_app_server_request(request)`, then requests a redraw if either removal succeeded.
+**Data flow**: It receives the resolved request, removes matching deferred prompts from the interrupt manager, asks the bottom pane to dismiss a visible matching request, and redraws if anything changed.
 
-**Call relations**: Used when a remote request has already been resolved elsewhere and must no longer remain actionable in the UI.
+**Call relations**: It coordinates two places where a request might live: queued behind streaming in interrupts, or currently visible in the bottom pane.
 
 *Call graph*: calls 3 internal fn (dismiss_app_server_request, request_redraw, remove_resolved_prompt).
 
@@ -325,11 +327,11 @@ fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest)
 fn open_feedback_consent(&mut self, category: crate::app_event::FeedbackCategory)
 ```
 
-**Purpose**: Opens the feedback-upload consent selection view using current diagnostics and rollout context.
+**Purpose**: Shows a consent prompt before uploading feedback details and optional logs. This gives the user control over what diagnostic information is sent.
 
-**Data flow**: Snapshots feedback state, conditionally checks for a Windows sandbox log, builds selection params with `feedback_upload_consent_params`, shows them via `bottom_pane.show_selection_view`, and requests a redraw.
+**Data flow**: It receives a feedback category, takes a snapshot of available feedback diagnostics, checks whether a Windows sandbox log exists on Windows, builds selection-view parameters, shows them, and redraws.
 
-**Call relations**: Feedback flows call this before uploading logs or diagnostics so the user can explicitly consent.
+**Call relations**: This starts the feedback-upload consent flow by handing a configured selection view to the bottom pane.
 
 *Call graph*: calls 3 internal fn (snapshot, show_selection_view, request_redraw); 3 external calls (current_log_file_path_for_codex_home, feedback_upload_consent_params, clone).
 
@@ -340,11 +342,11 @@ fn open_feedback_consent(&mut self, category: crate::app_event::FeedbackCategory
 fn open_multi_agent_enable_prompt(&mut self)
 ```
 
-**Purpose**: Shows a yes/no selection popup for enabling subagents in future sessions.
+**Purpose**: Shows a prompt asking whether to enable subagents. The prompt explains that the setting will apply in a future session.
 
-**Data flow**: Builds two `SelectionItem`s with actions that may send `AppEvent::UpdateFeatureFlags` and insert a warning history cell, wraps them in `SelectionViewParams` with title/subtitle/hint, and shows the selection view in the bottom pane.
+**Data flow**: It builds two selection items: one that sends a feature-flag update and inserts a notice, and one that dismisses the prompt. It then shows those choices in the bottom pane.
 
-**Call relations**: Called when the user tries to access subagent functionality while the feature flag is disabled.
+**Call relations**: This function is used when a multi-agent feature is requested but currently disabled in configuration.
 
 *Call graph*: calls 2 internal fn (show_selection_view, standard_popup_hint_line); 2 external calls (default, vec!).
 
@@ -355,11 +357,11 @@ fn open_multi_agent_enable_prompt(&mut self)
 fn open_memories_popup(&mut self)
 ```
 
-**Purpose**: Opens either the memories settings view or the memories-enable prompt depending on feature availability.
+**Purpose**: Opens the memory settings UI if memories are enabled, or an enable prompt if they are not. Memories are saved facts the assistant can use in future sessions.
 
-**Data flow**: Checks `config.features.enabled(Feature::MemoryTool)`; if disabled it calls `open_memories_enable_prompt`, otherwise it constructs `MemoriesSettingsView::new(...)` with current settings and keymap and shows it in the bottom pane.
+**Data flow**: It checks the feature flag. If disabled, it calls open_memories_enable_prompt. If enabled, it creates a MemoriesSettingsView with current settings and key bindings and shows it in the bottom pane.
 
-**Call relations**: This is the main entrypoint for memories-related UI from the chat screen.
+**Call relations**: This is the main entry point for memory-related UI; it delegates the disabled-feature case to open_memories_enable_prompt.
 
 *Call graph*: calls 4 internal fn (list_keymap, show_view, new, open_memories_enable_prompt); 2 external calls (new, clone).
 
@@ -370,11 +372,11 @@ fn open_memories_popup(&mut self)
 fn open_memories_enable_prompt(&mut self)
 ```
 
-**Purpose**: Shows a yes/no selection popup for enabling the memories feature in future sessions.
+**Purpose**: Shows a prompt asking whether to enable the memories feature. It includes a documentation link so users can learn what the feature does.
 
-**Data flow**: Builds two `SelectionItem`s, one of which sends `AppEvent::UpdateFeatureFlags` for `Feature::MemoryTool`, wraps them in `SelectionViewParams` with title/subtitle, a footer note linking to docs, and a standard hint line, then shows the selection view.
+**Data flow**: It builds Yes and No selection items. The Yes action sends a feature-flag update; both choices dismiss the prompt. It then shows the selection view in the bottom pane.
 
-**Call relations**: Called by `open_memories_popup` when the memories feature is currently disabled.
+**Call relations**: open_memories_popup calls this when the memory feature is currently disabled.
 
 *Call graph*: calls 2 internal fn (show_selection_view, standard_popup_hint_line); called by 1 (open_memories_popup); 3 external calls (default, from, vec!).
 
@@ -385,11 +387,11 @@ fn open_memories_enable_prompt(&mut self)
 fn set_memory_settings(&mut self, use_memories: bool, generate_memories: bool)
 ```
 
-**Purpose**: Updates the in-memory config flags controlling memory usage and memory generation.
+**Purpose**: Updates the in-session memory settings stored in the widget’s config. This reflects user choices from the memory settings UI.
 
-**Data flow**: Writes the provided booleans into `self.config.memories.use_memories` and `self.config.memories.generate_memories`.
+**Data flow**: It receives two booleans, one for using memories and one for generating memories, and writes them into the config copy held by ChatWidget.
 
-**Call relations**: Settings-confirmation flows use this after the user changes memory preferences.
+**Call relations**: Memory settings views can call this after the user changes memory preferences so later UI state reflects the new values.
 
 
 ##### `ChatWidget::set_token_info`  (lines 1109–1118)
@@ -398,11 +400,11 @@ fn set_memory_settings(&mut self, use_memories: bool, generate_memories: bool)
 fn set_token_info(&mut self, info: Option<TokenUsageInfo>)
 ```
 
-**Purpose**: Updates token/context usage state and the bottom-pane context indicator from optional token-usage info.
+**Purpose**: Sets or clears the token-usage display. Tokens are the model’s text units, and this information helps users understand how much context is being used.
 
-**Data flow**: If `info` is `Some`, delegates to `apply_token_info`; if `None`, clears the bottom pane’s context window display and sets `self.token_info = None`.
+**Data flow**: It receives optional TokenUsageInfo. If present, it passes it to apply_token_info; if absent, it clears the bottom-pane context display and removes stored token info.
 
-**Call relations**: Token-count event handling calls this whenever fresh usage data arrives or needs to be cleared.
+**Call relations**: handle_token_count calls this when fresh token-count information arrives.
 
 *Call graph*: calls 2 internal fn (set_context_window, apply_token_info); called by 1 (handle_token_count).
 
@@ -413,11 +415,11 @@ fn set_token_info(&mut self, info: Option<TokenUsageInfo>)
 fn apply_token_info(&mut self, info: TokenUsageInfo)
 ```
 
-**Purpose**: Applies concrete token-usage info to both widget state and bottom-pane context display.
+**Purpose**: Applies token usage to both internal state and the bottom-pane display. It chooses whether to show remaining percentage or a raw token count.
 
-**Data flow**: Computes `percent` with `context_remaining_percent`, computes `used_tokens` with `context_used_tokens`, calls `bottom_pane.set_context_window(percent, used_tokens)`, and stores the full `TokenUsageInfo` in `self.token_info`.
+**Data flow**: It receives TokenUsageInfo, computes the remaining-context percent if a context window is known, computes used tokens when percent is not known, updates the bottom pane, and saves the info.
 
-**Call relations**: Used by normal token updates and by restoration after temporary review-mode overrides.
+**Call relations**: set_token_info and restore_pre_review_token_info call this when token information should be visible again.
 
 *Call graph*: calls 3 internal fn (set_context_window, context_remaining_percent, context_used_tokens); called by 2 (restore_pre_review_token_info, set_token_info).
 
@@ -428,11 +430,11 @@ fn apply_token_info(&mut self, info: TokenUsageInfo)
 fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64>
 ```
 
-**Purpose**: Computes the remaining context-window percentage from token-usage info when the model context window is known.
+**Purpose**: Computes how much of the model’s context window remains, as a percentage, when the model’s context size is known.
 
-**Data flow**: Reads `info.model_context_window` and, when present, calls `info.last_token_usage.percent_of_context_window_remaining(window)`.
+**Data flow**: It receives token info, reads the optional context-window size, and if present asks the last-turn token usage to compute remaining percentage.
 
-**Call relations**: `apply_token_info` uses this to decide whether to show a percentage-based context indicator.
+**Call relations**: apply_token_info calls this before updating the bottom-pane context display.
 
 *Call graph*: called by 1 (apply_token_info).
 
@@ -443,11 +445,11 @@ fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64>
 fn context_used_tokens(&self, info: &TokenUsageInfo, percent_known: bool) -> Option<i64>
 ```
 
-**Purpose**: Computes a fallback used-token count for the context indicator when a percentage cannot be shown.
+**Purpose**: Chooses whether to show a raw count of used context tokens. It only shows this count when a percentage is not available.
 
-**Data flow**: If `percent_known` is true it returns `None`; otherwise it returns `Some(info.total_token_usage.tokens_in_context_window())`.
+**Data flow**: It receives token info and a flag saying whether percentage is known. If percentage is known it returns None; otherwise it returns the total tokens currently in the context window.
 
-**Call relations**: `apply_token_info` uses this so the bottom pane can still show context usage when the model window size is unknown.
+**Call relations**: apply_token_info calls this as the fallback display value when it cannot show a context percentage.
 
 *Call graph*: called by 1 (apply_token_info).
 
@@ -458,11 +460,11 @@ fn context_used_tokens(&self, info: &TokenUsageInfo, percent_known: bool) -> Opt
 fn restore_pre_review_token_info(&mut self)
 ```
 
-**Purpose**: Restores token/context display state that was saved before entering review mode.
+**Purpose**: Restores the token display that was visible before code review mode changed it. This avoids leaving review-specific token state on screen.
 
-**Data flow**: Takes `self.review.pre_review_token_info`; if it contains `Some(info)` it reapplies that info with `apply_token_info`, and if it contains `None` it clears the bottom-pane context display and `self.token_info`.
+**Data flow**: It takes saved pre-review token info from review state. If it contains info, it reapplies it; if it says there was no info, it clears the context display and stored token info.
 
-**Call relations**: Called when review mode ends so the ordinary session token display returns.
+**Call relations**: exit_review_mode_after_item calls this when review mode ends.
 
 *Call graph*: calls 2 internal fn (set_context_window, apply_token_info); called by 1 (exit_review_mode_after_item).
 
@@ -473,11 +475,11 @@ fn restore_pre_review_token_info(&mut self)
 fn handle_history_entry_response(&mut self, event: HistoryLookupResponse)
 ```
 
-**Purpose**: Forwards an asynchronous history lookup response to the bottom pane.
+**Purpose**: Delivers an asynchronous message-history lookup result to the composer area. This supports browsing or recalling prior messages.
 
-**Data flow**: Destructures `HistoryLookupResponse { offset, log_id, entry }` and passes those fields to `bottom_pane.on_history_entry_response(log_id, offset, entry)`.
+**Data flow**: It receives a lookup response, unpacks the offset, log id, and entry, and forwards them to the bottom pane.
 
-**Call relations**: History-navigation or lookup flows call this when a requested history entry arrives.
+**Call relations**: The bottom pane owns the composer history UI, so ChatWidget simply routes the response there.
 
 *Call graph*: calls 1 internal fn (on_history_entry_response).
 
@@ -488,11 +490,11 @@ fn handle_history_entry_response(&mut self, event: HistoryLookupResponse)
 fn pre_draw_tick(&mut self)
 ```
 
-**Purpose**: Runs per-frame maintenance before drawing, including hook visibility, pet animation, plan nudges, goal status, and terminal-title refresh decisions.
+**Purpose**: Performs small time-based updates just before drawing the screen. This keeps animations, hints, pets, hooks, goal status, and terminal-title state fresh.
 
-**Data flow**: Calls several internal maintenance methods, forwards `pre_draw_tick` to the bottom pane, schedules pet frames when needed, refreshes plan-mode and goal-status indicators, and conditionally refreshes the terminal title when action-required state or spinner/action-required animation state has changed.
+**Data flow**: It reads current widget state, updates hook visibility and timers, ticks the bottom pane, schedules pet frames, refreshes plan and goal hints, and refreshes the terminal title when its animated or action-required state changes.
 
-**Call relations**: The main TUI draw loop and several delayed-redraw paths invoke this immediately before rendering.
+**Call relations**: handle_tui_event and several hook-related redraw paths call this before rendering so time-sensitive UI pieces are current.
 
 *Call graph*: calls 1 internal fn (pre_draw_tick); called by 5 (handle_tui_event, show_shutdown_feedback, expire_quiet_hook_linger, reveal_running_hooks, reveal_running_hooks_after_delayed_redraw).
 
@@ -503,11 +505,11 @@ fn pre_draw_tick(&mut self)
 fn flush_active_cell(&mut self)
 ```
 
-**Purpose**: Commits the current active transcript cell into history and marks that a separator may be needed afterward.
+**Purpose**: Moves the current in-progress transcript cell into committed history. This turns live output into a permanent transcript entry.
 
-**Data flow**: Takes `self.transcript.active_cell`; if present, sets `transcript.needs_final_message_separator = true`, sends `AppEvent::InsertHistoryCell(active)` through `app_event_tx`, and requests pending usage-output insertion.
+**Data flow**: It takes the active cell out of transcript state. If one exists, it marks that a separator may be needed, sends an InsertHistoryCell app event, and requests pending usage-output insertion.
 
-**Call relations**: History insertion, MCP loading transitions, session-info application, and review-mode exit all call this when a live cell must become committed history.
+**Call relations**: add_boxed_history, add_mcp_output, apply_session_info_cell, and exit_review_mode_after_item call this before adding new committed content or changing modes.
 
 *Call graph*: calls 1 internal fn (send); called by 4 (add_boxed_history, add_mcp_output, apply_session_info_cell, exit_review_mode_after_item); 1 external calls (InsertHistoryCell).
 
@@ -518,11 +520,11 @@ fn flush_active_cell(&mut self)
 fn add_to_history(&mut self, cell: impl HistoryCell + 'static)
 ```
 
-**Purpose**: Convenience wrapper that boxes a concrete `HistoryCell` and inserts it into transcript history.
+**Purpose**: Adds a typed history cell to the transcript. It is a convenience wrapper for callers that have a concrete cell value.
 
-**Data flow**: Boxes the provided cell and forwards it to `add_boxed_history`.
+**Data flow**: It receives a history cell, boxes it as a trait object, and passes it to add_boxed_history.
 
-**Call relations**: Many higher-level helpers use this to append info, warning, error, review, and process-output cells.
+**Call relations**: Many user-facing message helpers call this, including info, warning, error, debug, process-list, and review-status insertions.
 
 *Call graph*: calls 1 internal fn (add_boxed_history); called by 9 (add_debug_config_output, add_error_message, add_info_message, add_memories_enable_notice, add_ps_output, add_warning_message, enter_review_mode_with_hint, exit_review_mode_after_item, on_user_message_display); 1 external calls (new).
 
@@ -533,11 +535,11 @@ fn add_to_history(&mut self, cell: impl HistoryCell + 'static)
 fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>)
 ```
 
-**Purpose**: Adds a boxed history cell to committed history while preserving active-cell grouping and separator invariants.
+**Purpose**: Adds a boxed history cell while preserving transcript grouping rules. It decides when live output must be flushed before the new cell is inserted.
 
-**Data flow**: If an agent turn is running and the cell has visible lines, it records visible turn activity. It preserves a placeholder session header as the active cell until real session info arrives; otherwise, for visible cells and absent active stream tails, it flushes the current active cell and marks `needs_final_message_separator = true`. Finally it sends `AppEvent::InsertHistoryCell(cell)`.
+**Data flow**: It receives a boxed HistoryCell, checks whether it has visible lines, records turn activity if an agent turn is running, keeps a placeholder session header active when needed, flushes active cells when appropriate, and sends an InsertHistoryCell event.
 
-**Call relations**: This is the central committed-history insertion path used by most helper methods and by active-cell finalization.
+**Call relations**: add_to_history and several lower-level flows call this when they need exact control over committed transcript insertion.
 
 *Call graph*: calls 2 internal fn (send, flush_active_cell); called by 4 (add_plain_history_lines, add_to_history, apply_session_info_cell, finalize_active_cell_as_failed); 1 external calls (InsertHistoryCell).
 
@@ -548,11 +550,11 @@ fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>)
 fn enter_review_mode_with_hint(&mut self, hint: String, from_replay: bool)
 ```
 
-**Purpose**: Transitions the widget into review mode, preserving token state and appending a review-start banner.
+**Purpose**: Starts code review mode and shows a visible banner explaining what review began. It also preserves token display state so it can be restored later.
 
-**Data flow**: If no pre-review token snapshot exists, stores the current `token_info`; if not replaying and the bottom pane is not already marked running, sets task-running true; sets `review.is_review_mode = true`, formats a banner string, appends a review status-line history cell, and requests a redraw.
+**Data flow**: It receives a hint string and whether the transition came from replay. It saves current token info if needed, marks the task as running for live review, enables review mode, inserts a review-start status line, and redraws.
 
-**Call relations**: Review-start flows call this when a code review begins, whether from live interaction or replay.
+**Call relations**: Review flows call this when the app enters review mode; exit_review_mode_after_item is the matching cleanup path.
 
 *Call graph*: calls 4 internal fn (is_task_running, set_task_running, add_to_history, request_redraw); 2 external calls (format!, new_review_status_line).
 
@@ -563,11 +565,11 @@ fn enter_review_mode_with_hint(&mut self, hint: String, from_replay: bool)
 fn exit_review_mode_after_item(&mut self)
 ```
 
-**Purpose**: Leaves review mode, flushes pending live output, restores token display, and appends a review-finished banner.
+**Purpose**: Ends code review mode after the relevant item finishes. It flushes live content, restores previous token info, and adds a review-finished banner.
 
-**Data flow**: Flushes answer stream separators, interrupt queue, and active cell, clears `review.is_review_mode`, restores pre-review token info, appends a finished review status-line cell, and requests a redraw.
+**Data flow**: It flushes answer streaming, deferred interrupts, and the active cell, turns off review mode, restores pre-review token information, inserts a finished status line, and redraws.
 
-**Call relations**: Called when the review item or review session completes.
+**Call relations**: This is the counterpart to enter_review_mode_with_hint and is called when a review item is complete.
 
 *Call graph*: calls 4 internal fn (add_to_history, flush_active_cell, request_redraw, restore_pre_review_token_info); 1 external calls (new_review_status_line).
 
@@ -578,11 +580,11 @@ fn exit_review_mode_after_item(&mut self)
 fn on_committed_user_message(&mut self, items: &[UserInput], from_replay: bool)
 ```
 
-**Purpose**: Processes a committed user message, deciding whether to record replay history, consume a pending steer, or append a visible user prompt cell.
+**Purpose**: Responds when a user message becomes part of the committed thread. It avoids double-rendering messages that were already previewed or replayed.
 
-**Data flow**: Builds a `UserMessageDisplay` from the input items. In replay mode, it may synthesize mention bindings, record replayed history in the bottom pane, and forward the display to `on_user_message_display` unless review mode suppresses it. In live mode, it compares the message against the front pending steer queue, may pop and render the queued display, warns on impossible mismatches, and otherwise renders the display unless it duplicates the last rendered user message or review mode suppresses it.
+**Data flow**: It receives user-input items and a replay flag. For replay, it reconstructs display text, mention bindings, and history entries, then records and renders them. For live input, it compares against pending queued messages and renders only when needed.
 
-**Call relations**: Committed user-input handling calls this after protocol/user-input items have been finalized into a turn.
+**Call relations**: It hands actual prompt rendering to on_user_message_display and also records replayed messages in the bottom-pane history.
 
 *Call graph*: calls 3 internal fn (record_replayed_user_message_history, on_user_message_display, user_message_display_for_history); 5 external calls (pending_steer_compare_key_from_items, user_message_display_from_inputs, new, iter, warn!).
 
@@ -593,11 +595,11 @@ fn on_committed_user_message(&mut self, items: &[UserInput], from_replay: bool)
 fn on_user_message_display(&mut self, display: UserMessageDisplay)
 ```
 
-**Purpose**: Records and renders a user message display into transcript history when it has visible content.
+**Purpose**: Adds a user prompt to visible history and records it for copy behavior. Empty prompts with no attachments are ignored.
 
-**Data flow**: Stores `display` in `last_rendered_user_message_display`, and if the message text or attachments are non-empty, records the visible user turn for copy/export and appends a `new_user_prompt` history cell containing message text, text elements, local images, and remote image URLs. It then clears `transcript.needs_final_message_separator`.
+**Data flow**: It receives a prepared UserMessageDisplay, stores it as the last rendered display, checks whether it contains text or attachments, records a visible user turn, inserts a user-prompt history cell, and resets separator state.
 
-**Call relations**: Called by `on_committed_user_message` once duplicate suppression and replay/pending-steer logic have been resolved.
+**Call relations**: on_committed_user_message calls this after deciding that a user message should actually appear in the transcript.
 
 *Call graph*: calls 2 internal fn (add_to_history, record_visible_user_turn_for_copy); called by 1 (on_committed_user_message); 2 external calls (new_user_prompt, clone).
 
@@ -608,11 +610,11 @@ fn on_user_message_display(&mut self, display: UserMessageDisplay)
 fn request_immediate_exit(&self)
 ```
 
-**Purpose**: Requests an immediate process exit without waiting for shutdown.
+**Purpose**: Requests that the TUI exit immediately. This is meant for fallback or already-finished shutdown situations, not the usual user quit path.
 
-**Data flow**: Sends `AppEvent::Exit(ExitMode::Immediate)` through `app_event_tx`.
+**Data flow**: It sends an AppEvent::Exit with Immediate mode through the app event sender.
 
-**Call relations**: Used for emergency or already-completed shutdown paths rather than ordinary user-initiated quit.
+**Call relations**: Other shutdown logic can call this when waiting for graceful shutdown is no longer appropriate.
 
 *Call graph*: calls 1 internal fn (send); 1 external calls (Exit).
 
@@ -623,11 +625,11 @@ fn request_immediate_exit(&self)
 fn request_quit_without_confirmation(&self)
 ```
 
-**Purpose**: Requests a shutdown-first exit without additional confirmation.
+**Purpose**: Requests a graceful shutdown-first quit without asking for more confirmation. This is used for explicit quit commands and double-press quit shortcuts.
 
-**Data flow**: Sends `AppEvent::Exit(ExitMode::ShutdownFirst)` through `app_event_tx`.
+**Data flow**: It sends an AppEvent::Exit with ShutdownFirst mode through the app event sender.
 
-**Call relations**: Explicit quit commands and double-press quit shortcuts use this path.
+**Call relations**: Quit-handling code calls this when the user has clearly chosen to leave but the app should still shut down cleanly.
 
 *Call graph*: calls 1 internal fn (send); 1 external calls (Exit).
 
@@ -638,11 +640,11 @@ fn request_quit_without_confirmation(&self)
 fn show_shutdown_in_progress(&mut self)
 ```
 
-**Purpose**: Tells the bottom pane to display its shutdown-in-progress UI.
+**Purpose**: Shows the user that shutdown is underway. This prevents the interface from looking frozen after a quit request.
 
-**Data flow**: Delegates directly to `bottom_pane.show_shutdown_in_progress()`.
+**Data flow**: It tells the bottom pane to show its shutdown-in-progress state.
 
-**Call relations**: Shutdown feedback flows call this while waiting for the app to terminate cleanly.
+**Call relations**: show_shutdown_feedback calls this while the app is winding down.
 
 *Call graph*: calls 1 internal fn (show_shutdown_in_progress); called by 1 (show_shutdown_feedback).
 
@@ -653,11 +655,11 @@ fn show_shutdown_in_progress(&mut self)
 fn request_redraw(&mut self)
 ```
 
-**Purpose**: Schedules a future frame render for the chat widget.
+**Purpose**: Schedules the terminal UI to repaint. It is the common “something changed” signal inside ChatWidget.
 
-**Data flow**: Calls `self.frame_requester.schedule_frame()`.
+**Data flow**: It calls the frame requester to schedule a new frame; it does not draw immediately.
 
-**Call relations**: Most UI-mutating helpers call this after changing visible state.
+**Call relations**: Many flows call this after changing visible state, including message insertion, popups, resize handling, MCP loading, and feedback views.
 
 *Call graph*: calls 1 internal fn (schedule_frame); called by 17 (add_diff_in_progress, add_error_message, add_info_message, add_mcp_output, add_memories_enable_notice, add_plain_history_lines, add_warning_message, clear_mcp_inventory_loading, dismiss_app_server_request, enter_review_mode_with_hint (+7 more)).
 
@@ -668,11 +670,11 @@ fn request_redraw(&mut self)
 fn bump_active_cell_revision(&mut self)
 ```
 
-**Purpose**: Increments the transcript active-cell revision used by the transcript overlay cache key.
+**Purpose**: Marks the active transcript cell as changed. This helps cached transcript overlays know they must refresh their live tail.
 
-**Data flow**: Delegates to `self.transcript.bump_active_cell_revision()`.
+**Data flow**: It increments or updates the active-cell revision inside transcript state.
 
-**Call relations**: Called whenever the active cell changes in place so the transcript overlay knows to recompute its live tail.
+**Call relations**: add_mcp_output and clear_mcp_inventory_loading call this when the live MCP loading cell appears or disappears.
 
 *Call graph*: calls 1 internal fn (bump_active_cell_revision); called by 2 (add_mcp_output, clear_mcp_inventory_loading).
 
@@ -683,11 +685,11 @@ fn bump_active_cell_revision(&mut self)
 fn finalize_active_cell_as_failed(&mut self)
 ```
 
-**Purpose**: Marks the current active exec/tool cell as failed and commits it into history.
+**Purpose**: Marks the current active tool or command cell as failed and commits it to history. This makes failures visible instead of leaving a live spinner behind.
 
-**Data flow**: Takes `transcript.active_cell`, downcasts it to `ExecCell` or `McpToolCallCell` when possible to call `mark_failed()`, then inserts it into history with `add_boxed_history` and requests pending usage-output insertion.
+**Data flow**: It takes the active cell, checks whether it is an exec or MCP tool cell, marks that cell failed when possible, adds it to history, and requests pending usage-output insertion.
 
-**Call relations**: Failure-handling paths use this when an in-flight active cell should be finalized with an error state.
+**Call relations**: Failure paths can use this to close out live cells consistently before continuing with later transcript content.
 
 *Call graph*: calls 1 internal fn (add_boxed_history).
 
@@ -698,11 +700,11 @@ fn finalize_active_cell_as_failed(&mut self)
 fn set_pending_thread_approvals(&mut self, threads: Vec<String>)
 ```
 
-**Purpose**: Updates the bottom pane’s list of threads with pending approvals.
+**Purpose**: Updates the bottom pane with threads that are waiting for approval. This gives the user a visible indication of pending decisions.
 
-**Data flow**: Passes the provided `Vec<String>` to `bottom_pane.set_pending_thread_approvals`.
+**Data flow**: It receives a list of thread identifiers and forwards it to the bottom pane.
 
-**Call relations**: Approval-state synchronization uses this to keep the footer/status UI current.
+**Call relations**: Thread approval tracking code uses this to keep the footer or approval UI current.
 
 *Call graph*: calls 1 internal fn (set_pending_thread_approvals).
 
@@ -713,11 +715,11 @@ fn set_pending_thread_approvals(&mut self, threads: Vec<String>)
 fn clear_thread_rename_block(&mut self)
 ```
 
-**Purpose**: Clears any message explaining why thread renaming is currently blocked.
+**Purpose**: Clears the message that blocks thread renaming. This allows rename UI to proceed again once the blocking condition is gone.
 
-**Data flow**: Sets `self.thread_rename_block_message = None`.
+**Data flow**: It sets the stored thread_rename_block_message to None.
 
-**Call relations**: Thread-rename flows call this when the blocking condition is removed.
+**Call relations**: Rename-related flows can call this after a previous rename restriction no longer applies.
 
 
 ##### `ChatWidget::set_thread_rename_block_message`  (lines 1415–1417)
@@ -726,11 +728,11 @@ fn clear_thread_rename_block(&mut self)
 fn set_thread_rename_block_message(&mut self, message: impl Into<String>)
 ```
 
-**Purpose**: Stores a message explaining why thread renaming is blocked.
+**Purpose**: Stores a reason that thread renaming is currently blocked. The UI can show this message instead of allowing a rename.
 
-**Data flow**: Converts the input into `String` and stores it in `self.thread_rename_block_message`.
+**Data flow**: It receives any string-like message, converts it into a String, and saves it in thread_rename_block_message.
 
-**Call relations**: Thread-management flows use this to surface rename restrictions to the user.
+**Call relations**: Rename validation or app-server responses can call this to explain why a rename cannot happen.
 
 *Call graph*: 1 external calls (into).
 
@@ -741,11 +743,11 @@ fn set_thread_rename_block_message(&mut self, message: impl Into<String>)
 fn set_interrupted_turn_notice_mode(&mut self, mode: InterruptedTurnNoticeMode)
 ```
 
-**Purpose**: Updates how interrupted-turn notices should be displayed.
+**Purpose**: Changes how the widget should show notices for interrupted turns. This lets some flows suppress the normal interruption message.
 
-**Data flow**: Writes the provided `InterruptedTurnNoticeMode` into `self.interrupted_turn_notice_mode`.
+**Data flow**: It receives an InterruptedTurnNoticeMode value and stores it.
 
-**Call relations**: Interrupt and replay flows use this to suppress or restore interruption notices.
+**Call relations**: Interrupt-handling code can set this before or during turn cancellation to control later user-facing messages.
 
 
 ##### `ChatWidget::add_diff_in_progress`  (lines 1423–1425)
@@ -754,11 +756,11 @@ fn set_interrupted_turn_notice_mode(&mut self, mode: InterruptedTurnNoticeMode)
 fn add_diff_in_progress(&mut self)
 ```
 
-**Purpose**: Triggers a redraw when diff rendering enters an in-progress state.
+**Purpose**: Notifies the UI that diff-related work has begun by requesting a redraw. A diff is a view of file changes.
 
-**Data flow**: Calls `request_redraw()` without mutating other state.
+**Data flow**: It does not store new data; it simply schedules a new frame.
 
-**Call relations**: Diff lifecycle hooks use this as a lightweight visual refresh trigger.
+**Call relations**: Diff-start flows call this so any current progress indicators or status changes can appear.
 
 *Call graph*: calls 1 internal fn (request_redraw).
 
@@ -769,11 +771,11 @@ fn add_diff_in_progress(&mut self)
 fn on_diff_complete(&mut self)
 ```
 
-**Purpose**: Triggers a redraw when diff rendering completes.
+**Purpose**: Notifies the UI that diff-related work has finished by requesting a redraw. This lets progress indicators disappear or update.
 
-**Data flow**: Calls `request_redraw()`.
+**Data flow**: It schedules a new frame without changing other state directly.
 
-**Call relations**: Complements `add_diff_in_progress` for diff lifecycle updates.
+**Call relations**: Diff-completion flows call this after file-change rendering or calculation finishes.
 
 *Call graph*: calls 1 internal fn (request_redraw).
 
@@ -784,11 +786,11 @@ fn on_diff_complete(&mut self)
 fn add_debug_config_output(&mut self)
 ```
 
-**Purpose**: Appends a history cell showing the current debug configuration and session network proxy state.
+**Purpose**: Adds a debug view of the current configuration to the transcript. This helps users or developers inspect what settings are active.
 
-**Data flow**: Builds a cell with `crate::debug_config::new_debug_config_output(&self.config, self.session_network_proxy.as_ref())` and inserts it via `add_to_history`.
+**Data flow**: It reads the widget config and session network proxy state, builds a debug-config history cell, and adds it to history.
 
-**Call relations**: Debug commands use this to surface configuration details in the transcript.
+**Call relations**: Debug commands can call this to print configuration details in the same transcript as other chat output.
 
 *Call graph*: calls 2 internal fn (add_to_history, new_debug_config_output).
 
@@ -799,11 +801,11 @@ fn add_debug_config_output(&mut self)
 fn add_ps_output(&mut self)
 ```
 
-**Purpose**: Appends a history cell describing active unified-exec background processes.
+**Purpose**: Adds a process-list style summary of background terminal commands to the transcript. This helps users see what background executions are still around.
 
-**Data flow**: Maps `self.unified_exec_processes` into `UnifiedExecProcessDetails` values containing command display and recent chunks, then inserts a `new_unified_exec_processes_output` history cell.
+**Data flow**: It reads stored unified exec process summaries, converts each to display details, builds a history cell, and adds it to history.
 
-**Call relations**: The `/ps` command or equivalent UI action uses this to show background terminal details.
+**Call relations**: Process-inspection commands can call this to show background command state.
 
 *Call graph*: calls 1 internal fn (add_to_history); 1 external calls (new_unified_exec_processes_output).
 
@@ -814,11 +816,11 @@ fn add_ps_output(&mut self)
 fn clean_background_terminals(&mut self)
 ```
 
-**Purpose**: Requests cleanup of all background terminals, clears local process state, syncs the footer, and informs the user.
+**Purpose**: Requests that all background terminals stop, clears the local process summary, updates the footer, and tells the user what happened.
 
-**Data flow**: Submits `AppCommand::clean_background_terminals()`, clears `self.unified_exec_processes`, calls `sync_unified_exec_footer()`, and appends an informational history message.
+**Data flow**: It submits a clean-background-terminals command, clears the stored process list, syncs the exec footer, and adds an informational transcript message.
 
-**Call relations**: Invoked by commands like `/stop` that terminate unified-exec background sessions.
+**Call relations**: It uses submit_op to send the cleanup request and add_info_message to make the action visible to the user.
 
 *Call graph*: calls 2 internal fn (add_info_message, submit_op); 1 external calls (clean_background_terminals).
 
@@ -829,11 +831,11 @@ fn clean_background_terminals(&mut self)
 fn plugins_for_mentions(&self) -> Option<&[PluginCapabilitySummary]>
 ```
 
-**Purpose**: Returns the current plugin capability list for mention completion when the plugins feature is enabled.
+**Purpose**: Returns the plugin list that can be used for @-style mentions, but only when the plugins feature is enabled.
 
-**Data flow**: Checks `config.features.enabled(Feature::Plugins)` and returns `None` if disabled; otherwise returns `bottom_pane.plugins().map(Vec::as_slice)`.
+**Data flow**: It checks the feature flag. If plugins are disabled, it returns None; otherwise it returns the bottom pane’s plugin list as a slice if available.
 
-**Call relations**: Mention-completion logic uses this to decide whether plugin mentions should be offered.
+**Call relations**: Mention-building code can use this to decide whether plugin names should appear in mention suggestions.
 
 *Call graph*: calls 1 internal fn (plugins).
 
@@ -844,11 +846,11 @@ fn plugins_for_mentions(&self) -> Option<&[PluginCapabilitySummary]>
 fn placeholder_session_header_cell(config: &Config) -> Box<dyn HistoryCell>
 ```
 
-**Purpose**: Builds a dim italic placeholder session-header history cell shown before real session configuration arrives.
+**Purpose**: Builds a temporary session header while real session information is still loading. This avoids showing a blank transcript at startup.
 
-**Data flow**: Creates a placeholder `Style` with `DIM | ITALIC`, constructs `SessionHeaderHistoryCell::new_with_style` using `DEFAULT_MODEL_DISPLAY_NAME`, current cwd, and CLI version, optionally marks it as yolo mode, and returns it boxed as `dyn HistoryCell`.
+**Data flow**: It receives config, creates a dim italic session header using a loading model name, current directory, CLI version, and yolo-mode state, then returns it boxed as a history cell.
 
-**Call relations**: Session startup uses this placeholder so later real session info can merge into the same visual slot instead of creating duplicate header boxes.
+**Call relations**: Session startup code can install this placeholder and later replace or merge it through apply_session_info_cell.
 
 *Call graph*: calls 1 internal fn (new_with_style); 3 external calls (new, default, is_yolo_mode).
 
@@ -859,11 +861,11 @@ fn placeholder_session_header_cell(config: &Config) -> Box<dyn HistoryCell>
 fn apply_session_info_cell(&mut self, cell: history_cell::SessionInfoCell)
 ```
 
-**Purpose**: Merges real session info into an existing placeholder header when possible, otherwise commits it as ordinary history.
+**Purpose**: Installs the real session information cell without duplicating the startup placeholder. It keeps the transcript tidy during startup.
 
-**Data flow**: Boxes the incoming `SessionInfoCell`, checks whether the current active cell is a `SessionHeaderHistoryCell`, and if so replaces the active placeholder with the real cell before flushing. If no placeholder was merged, it flushes any active cell and inserts the session-info cell into history.
+**Data flow**: It receives a real session info cell, checks whether the active cell is a placeholder session header, replaces it when possible, flushes the active cell, and otherwise adds the real cell to history.
 
-**Call relations**: Session-configured handling uses this to avoid rendering both a placeholder header and a real header.
+**Call relations**: This is the transition from placeholder startup UI to real configured-session UI. It uses flush_active_cell and add_boxed_history to preserve transcript ordering.
 
 *Call graph*: calls 2 internal fn (add_boxed_history, flush_active_cell); 1 external calls (new).
 
@@ -874,11 +876,11 @@ fn apply_session_info_cell(&mut self, cell: history_cell::SessionInfoCell)
 fn add_info_message(&mut self, message: String, hint: Option<String>)
 ```
 
-**Purpose**: Appends an informational history event and schedules a redraw.
+**Purpose**: Adds an informational message to the transcript and redraws. It is used for neutral status updates that the user should see.
 
-**Data flow**: Creates a `new_info_event(message, hint)` history cell, inserts it with `add_to_history`, and calls `request_redraw()`.
+**Data flow**: It receives a message and optional hint, builds an info history cell, inserts it, and schedules a redraw.
 
-**Call relations**: Many user-visible toggles and background-terminal actions use this helper for lightweight notices.
+**Call relations**: clean_background_terminals, set_raw_output_mode_and_notify, and toggle_vim_mode_and_notify call this to confirm user-visible changes.
 
 *Call graph*: calls 2 internal fn (add_to_history, request_redraw); called by 3 (clean_background_terminals, set_raw_output_mode_and_notify, toggle_vim_mode_and_notify); 1 external calls (new_info_event).
 
@@ -889,11 +891,11 @@ fn add_info_message(&mut self, message: String, hint: Option<String>)
 fn add_memories_enable_notice(&mut self)
 ```
 
-**Purpose**: Appends the standard memories-enabled warning/notice cell and redraws.
+**Purpose**: Adds the standard notice that memories will be enabled in the next session. This confirms the user’s feature choice.
 
-**Data flow**: Creates `new_warning_event(MEMORIES_ENABLE_NOTICE.to_string())`, inserts it into history, and requests a redraw.
+**Data flow**: It builds a warning-style history cell containing the memory enable notice, adds it to history, and redraws.
 
-**Call relations**: Used after enabling memories so the user sees the deferred-effect notice.
+**Call relations**: Memory enable flows can call this after the feature flag has been changed.
 
 *Call graph*: calls 2 internal fn (add_to_history, request_redraw); 1 external calls (new_warning_event).
 
@@ -904,11 +906,11 @@ fn add_memories_enable_notice(&mut self)
 fn add_plain_history_lines(&mut self, lines: Vec<Line<'static>>)
 ```
 
-**Purpose**: Appends arbitrary plain transcript lines as a `PlainHistoryCell` and redraws.
+**Purpose**: Adds already-formatted plain lines to the transcript. This is useful when another part of the UI has prepared the exact text layout.
 
-**Data flow**: Wraps the provided `Vec<Line<'static>>` in `PlainHistoryCell::new`, boxes it, inserts it with `add_boxed_history`, and requests a redraw.
+**Data flow**: It receives a vector of terminal text lines, wraps them in a PlainHistoryCell, commits that cell, and schedules a redraw.
 
-**Call relations**: Utility paths use this when they already have fully formatted lines rather than a specialized history-cell type.
+**Call relations**: Callers use this when they need simple transcript output without a special warning, error, or info style.
 
 *Call graph*: calls 3 internal fn (add_boxed_history, request_redraw, new); 1 external calls (new).
 
@@ -919,11 +921,11 @@ fn add_plain_history_lines(&mut self, lines: Vec<Line<'static>>)
 fn add_warning_message(&mut self, message: String)
 ```
 
-**Purpose**: Appends a warning history event and redraws.
+**Purpose**: Adds a warning message to the transcript and redraws. Warnings are for important user-visible issues that are not necessarily fatal errors.
 
-**Data flow**: Creates `new_warning_event(message)`, inserts it with `add_to_history`, and requests a redraw.
+**Data flow**: It receives message text, builds a warning history cell, inserts it, and schedules a redraw.
 
-**Call relations**: Used for non-fatal warnings that should appear in the transcript.
+**Call relations**: Warning-producing flows can call this to surface a caution in the main chat history.
 
 *Call graph*: calls 2 internal fn (add_to_history, request_redraw); 1 external calls (new_warning_event).
 
@@ -934,11 +936,11 @@ fn add_warning_message(&mut self, message: String)
 fn add_error_message(&mut self, message: String)
 ```
 
-**Purpose**: Appends an error history event and redraws.
+**Purpose**: Adds an error message to the transcript and redraws. This gives failures a consistent visible style.
 
-**Data flow**: Creates `new_error_event(message)`, inserts it with `add_to_history`, and requests a redraw.
+**Data flow**: It receives message text, builds an error history cell, inserts it, and schedules a redraw.
 
-**Call relations**: Stubbed or failed feature paths use this to surface errors in the transcript.
+**Call relations**: add_app_server_stub_message calls this when the user reaches an unsupported app-server feature in the TUI.
 
 *Call graph*: calls 2 internal fn (add_to_history, request_redraw); called by 1 (add_app_server_stub_message); 1 external calls (new_error_event).
 
@@ -949,11 +951,11 @@ fn add_error_message(&mut self, message: String)
 fn add_app_server_stub_message(&mut self, feature: &str)
 ```
 
-**Purpose**: Logs and displays a standard `Not available in TUI yet.` error for unsupported app-server features.
+**Purpose**: Shows a clear error for an app-server feature that is not implemented in the TUI yet. It also logs a warning for developers.
 
-**Data flow**: Emits a warning log with the feature name and appends an error message combining the feature label with `TUI_STUB_MESSAGE`.
+**Data flow**: It receives a feature name, logs that the feature is stubbed, formats a user-facing unsupported-feature message, and adds it as an error.
 
-**Call relations**: Unsupported feature handlers call this instead of silently ignoring the request.
+**Call relations**: Unsupported feature paths call this instead of failing silently.
 
 *Call graph*: calls 1 internal fn (add_error_message); 2 external calls (format!, warn!).
 
@@ -964,11 +966,11 @@ fn add_app_server_stub_message(&mut self, feature: &str)
 fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds a plain history cell confirming a session rename and optionally includes a resume hint.
+**Purpose**: Builds a small transcript cell confirming that the session was renamed. When possible, it includes a command hint for resuming that session later.
 
-**Data flow**: Constructs a styled line beginning with a bullet and `Session renamed to`, colors the new name cyan, optionally appends `. To resume this session run <hint>` when `resume_hint` returns one, and wraps the line in `PlainHistoryCell`.
+**Data flow**: It receives the new name and optional thread id, formats a confirmation line, asks for a resume hint, appends that hint if available, and returns a PlainHistoryCell.
 
-**Call relations**: Thread/session rename flows use this to acknowledge successful renames in the transcript.
+**Call relations**: Thread rename flows can insert the returned cell into history after a successful rename.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (resume_hint, vec!).
 
@@ -979,11 +981,11 @@ fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHis
 fn add_mcp_output(&mut self, detail: McpServerStatusDetail)
 ```
 
-**Purpose**: Starts the asynchronous MCP inventory flow by showing a loading cell, bumping the active-cell revision, redrawing, and requesting inventory fetch.
+**Purpose**: Starts the MCP inventory display flow. MCP servers are external tool servers; this shows a loading cell while the app server gathers their status.
 
-**Data flow**: Flushes answer-stream separators and any active cell, sets `transcript.active_cell` to a new `McpInventoryLoadingCell`, bumps the active-cell revision, requests a redraw, and sends `AppEvent::FetchMcpInventory { detail, thread_id }`.
+**Data flow**: It flushes current answer and active cells, sets a new MCP loading cell as the active cell, bumps the active-cell revision, redraws, and sends a FetchMcpInventory event with detail and thread id.
 
-**Call relations**: Triggered when the user requests MCP inventory/status details from the chat UI.
+**Call relations**: clear_mcp_inventory_loading is the cleanup partner that removes the spinner when the inventory result arrives.
 
 *Call graph*: calls 5 internal fn (send, bump_active_cell_revision, flush_active_cell, request_redraw, thread_id); 2 external calls (new, new_mcp_inventory_loading).
 
@@ -994,11 +996,11 @@ fn add_mcp_output(&mut self, detail: McpServerStatusDetail)
 fn clear_mcp_inventory_loading(&mut self)
 ```
 
-**Purpose**: Removes the MCP inventory loading cell if it is still the current active cell.
+**Purpose**: Removes the MCP loading spinner if it is still the live active cell. It carefully avoids clearing unrelated content that may have appeared later.
 
-**Data flow**: Checks whether `transcript.active_cell` exists and is of type `McpInventoryLoadingCell` via `Any`; if so, sets it to `None`, bumps the active-cell revision, and requests a redraw.
+**Data flow**: It checks whether the active cell exists and is specifically an MCP inventory loading cell. If so, it clears it, bumps the active-cell revision, and redraws.
 
-**Call relations**: Called when MCP inventory results arrive so a stale loading spinner does not remain visible.
+**Call relations**: This finishes the loading state started by add_mcp_output.
 
 *Call graph*: calls 2 internal fn (bump_active_cell_revision, request_redraw).
 
@@ -1009,11 +1011,11 @@ fn clear_mcp_inventory_loading(&mut self)
 fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>)
 ```
 
-**Purpose**: Forwards file-search results to the bottom pane.
+**Purpose**: Forwards file-search results to the bottom pane. This supports mention or file-picking UI in the composer.
 
-**Data flow**: Passes the query string and `Vec<FileMatch>` directly to `bottom_pane.on_file_search_result`.
+**Data flow**: It receives the original query and matching files, then passes both to the bottom pane’s file-search result handler.
 
-**Call relations**: Asynchronous file-search completion handlers use this to update the active bottom-pane search UI.
+**Call relations**: Search result events are routed through ChatWidget because it owns the bottom pane instance.
 
 *Call graph*: calls 1 internal fn (on_file_search_result).
 
@@ -1024,11 +1026,11 @@ fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>)
 fn current_stream_width(&self, reserved_cols: usize) -> Option<usize>
 ```
 
-**Purpose**: Computes the usable markdown body width for live stream controllers based on the last rendered terminal width and reserved wrapper columns.
+**Purpose**: Computes the text width available for live streamed output. This keeps streaming text wrapping close to how finalized history cells will wrap.
 
-**Data flow**: Reads `last_rendered_width`; if absent or zero returns `None`. Otherwise it converts the width to `u16`, computes the history wrap width, subtracts reserved columns with `crate::width::usable_content_width`, and returns at least 1 column.
+**Data flow**: It reads the last rendered terminal width, subtracts history wrapping and reserved columns, and returns a usable content width if the terminal width is known and nonzero.
 
-**Call relations**: Terminal-resize handling uses this to keep active stream wrapping aligned with finalized transcript layout.
+**Call relations**: on_terminal_resize calls this to update stream controllers after the terminal changes size.
 
 *Call graph*: called by 1 (on_terminal_resize).
 
@@ -1039,11 +1041,11 @@ fn current_stream_width(&self, reserved_cols: usize) -> Option<usize>
 fn raw_output_mode(&self) -> bool
 ```
 
-**Purpose**: Returns whether raw transcript rendering mode is enabled.
+**Purpose**: Reports whether raw output mode is enabled. Raw mode favors clean selectable text over rich formatting.
 
-**Data flow**: Reads and returns `self.raw_output_mode`.
+**Data flow**: It returns the widget’s raw_output_mode boolean.
 
-**Call relations**: Rendering and toggle logic use this to choose between raw and rich transcript modes.
+**Call relations**: Other UI code can query this when choosing how to render or display transcript content.
 
 
 ##### `ChatWidget::history_render_mode`  (lines 1620–1626)
@@ -1052,11 +1054,11 @@ fn raw_output_mode(&self) -> bool
 fn history_render_mode(&self) -> HistoryRenderMode
 ```
 
-**Purpose**: Maps the raw-output flag to the corresponding `HistoryRenderMode` enum.
+**Purpose**: Chooses the transcript render mode based on raw-output setting. It maps a simple boolean into the render-mode type used by history cells and stream controllers.
 
-**Data flow**: Returns `HistoryRenderMode::Raw` when `raw_output_mode` is true and `HistoryRenderMode::Rich` otherwise.
+**Data flow**: It reads raw_output_mode and returns HistoryRenderMode::Raw when enabled, otherwise HistoryRenderMode::Rich.
 
-**Call relations**: Stream-controller updates use this when raw-output mode changes.
+**Call relations**: set_raw_output_mode calls this before updating active stream controllers.
 
 *Call graph*: called by 1 (set_raw_output_mode).
 
@@ -1067,11 +1069,11 @@ fn history_render_mode(&self) -> HistoryRenderMode
 fn set_raw_output_mode(&mut self, enabled: bool)
 ```
 
-**Purpose**: Updates raw-output mode, persists it into config, updates active stream controllers, and refreshes status surfaces.
+**Purpose**: Turns raw transcript output on or off and updates stream rendering to match. This lets the user switch between rich display and easier terminal text selection.
 
-**Data flow**: Writes `enabled` into `self.raw_output_mode` and `config.tui_raw_output_mode`, computes the new `HistoryRenderMode`, updates both stream controllers if present, and calls `refresh_status_surfaces()`.
+**Data flow**: It receives the desired enabled flag, stores it in widget state and config, computes the render mode, updates any active assistant or plan stream controller, and refreshes status surfaces.
 
-**Call relations**: Called by the notifying toggle helper and any direct settings application path.
+**Call relations**: set_raw_output_mode_and_notify calls this before adding a user-visible notice.
 
 *Call graph*: calls 1 internal fn (history_render_mode); called by 1 (set_raw_output_mode_and_notify).
 
@@ -1082,11 +1084,11 @@ fn set_raw_output_mode(&mut self, enabled: bool)
 fn raw_output_mode_notice(enabled: bool) -> &'static str
 ```
 
-**Purpose**: Returns the user-facing notice string corresponding to enabling or disabling raw-output mode.
+**Purpose**: Returns the message shown when raw output mode changes. This keeps the on/off wording consistent.
 
-**Data flow**: Matches on the boolean and returns one of two static explanatory strings.
+**Data flow**: It receives a boolean and returns one of two static strings explaining whether raw mode is now on or off.
 
-**Call relations**: The notifying setter uses this to append an informational transcript message.
+**Call relations**: set_raw_output_mode_and_notify uses this text in the info message added to history.
 
 
 ##### `ChatWidget::set_raw_output_mode_and_notify`  (lines 1649–1655)
@@ -1095,11 +1097,11 @@ fn raw_output_mode_notice(enabled: bool) -> &'static str
 fn set_raw_output_mode_and_notify(&mut self, enabled: bool)
 ```
 
-**Purpose**: Changes raw-output mode and appends a transcript notice describing the new state.
+**Purpose**: Changes raw output mode and tells the user what changed. This is the user-facing version of the raw-mode setter.
 
-**Data flow**: Calls `set_raw_output_mode(enabled)` and then `add_info_message(Self::raw_output_mode_notice(enabled).to_string(), None)`.
+**Data flow**: It receives the desired enabled flag, calls set_raw_output_mode, gets the matching notice text, and adds it as an info message.
 
-**Call relations**: Used by the toggle helper and any UI action that should both change the mode and inform the user.
+**Call relations**: toggle_raw_output_mode_and_notify calls this after flipping the current setting.
 
 *Call graph*: calls 2 internal fn (add_info_message, set_raw_output_mode); called by 1 (toggle_raw_output_mode_and_notify); 1 external calls (raw_output_mode_notice).
 
@@ -1110,11 +1112,11 @@ fn set_raw_output_mode_and_notify(&mut self, enabled: bool)
 fn toggle_raw_output_mode_and_notify(&mut self) -> bool
 ```
 
-**Purpose**: Flips raw-output mode, emits the corresponding notice, and returns the new enabled state.
+**Purpose**: Flips raw output mode and returns the new state. It also adds a transcript notice.
 
-**Data flow**: Computes `enabled = !self.raw_output_mode`, calls `set_raw_output_mode_and_notify(enabled)`, and returns `enabled`.
+**Data flow**: It negates the current raw_output_mode value, applies it through set_raw_output_mode_and_notify, and returns the new boolean.
 
-**Call relations**: Bound to the user-facing raw-output toggle action.
+**Call relations**: Keyboard shortcuts or commands can call this when the user toggles raw output mode.
 
 *Call graph*: calls 1 internal fn (set_raw_output_mode_and_notify).
 
@@ -1125,11 +1127,11 @@ fn toggle_raw_output_mode_and_notify(&mut self) -> bool
 fn on_terminal_resize(&mut self, width: u16)
 ```
 
-**Purpose**: Updates width-sensitive stream-controller state after a terminal resize and triggers an initial redraw when width becomes known.
+**Purpose**: Updates resize-sensitive chat state after the terminal width changes. This keeps live streamed text wrapping correctly.
 
-**Data flow**: Records whether a width had previously been rendered, stores the new width in `last_rendered_width`, computes body widths for ordinary and plan streams with `current_stream_width`, updates both stream controllers if present, syncs the active stream tail, and requests a redraw if this was the first known width.
+**Data flow**: It receives the new width, stores it, calculates stream widths for normal and plan output, updates active stream controllers, syncs the active stream tail, and requests an initial redraw if this is the first known width.
 
-**Call relations**: Terminal resize events call this so live streaming wraps consistently with the current viewport.
+**Call relations**: Terminal resize handling calls this so live output and later finalized transcript layout stay aligned.
 
 *Call graph*: calls 2 internal fn (current_stream_width, request_redraw).
 
@@ -1140,11 +1142,11 @@ fn on_terminal_resize(&mut self, width: u16)
 fn has_active_agent_stream(&self) -> bool
 ```
 
-**Purpose**: Reports whether a normal assistant-message stream controller is currently active.
+**Purpose**: Reports whether a normal assistant response is currently streaming. This excludes plan streams.
 
-**Data flow**: Returns `self.stream_controller.is_some()`.
+**Data flow**: It checks whether the main stream controller exists and returns a boolean.
 
-**Call relations**: Higher-level UI logic uses this to distinguish active assistant streaming from idle or plan-stream states.
+**Call relations**: Other UI logic can use this to decide whether output is still arriving from the assistant.
 
 
 ##### `ChatWidget::has_active_plan_stream`  (lines 1690–1692)
@@ -1153,11 +1155,11 @@ fn has_active_agent_stream(&self) -> bool
 fn has_active_plan_stream(&self) -> bool
 ```
 
-**Purpose**: Reports whether a proposed-plan stream controller is currently active.
+**Purpose**: Reports whether a proposed plan is currently streaming. Plan output has its own controller and layout.
 
-**Data flow**: Returns `self.plan_stream_controller.is_some()`.
+**Data flow**: It checks whether the plan stream controller exists and returns a boolean.
 
-**Call relations**: Used by UI logic that needs to know whether plan output is currently streaming.
+**Call relations**: Plan-mode UI code can use this to decide whether plan streaming is active.
 
 
 ##### `ChatWidget::is_plan_streaming_in_tui`  (lines 1694–1696)
@@ -1166,11 +1168,11 @@ fn has_active_plan_stream(&self) -> bool
 fn is_plan_streaming_in_tui(&self) -> bool
 ```
 
-**Purpose**: Internal synonym for checking whether a plan stream is active.
+**Purpose**: Checks whether plan streaming is active in the terminal UI. It is a private convenience wrapper.
 
-**Data flow**: Returns `self.plan_stream_controller.is_some()`.
+**Data flow**: It returns true if the plan stream controller is present.
 
-**Call relations**: Internal plan-stream logic uses this helper for readability.
+**Call relations**: Internal plan-related logic can call this when it needs a readable plan-streaming check.
 
 
 ##### `ChatWidget::composer_is_empty`  (lines 1698–1700)
@@ -1179,11 +1181,11 @@ fn is_plan_streaming_in_tui(&self) -> bool
 fn composer_is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether the bottom-pane composer currently has no user input.
+**Purpose**: Reports whether the input composer currently has no user-entered content.
 
-**Data flow**: Delegates to `bottom_pane.composer_is_empty()`.
+**Data flow**: It asks the bottom pane whether its composer is empty and returns that answer.
 
-**Call relations**: Submission and shortcut logic use this to decide whether certain actions are allowed.
+**Call relations**: Chat-level input handling uses this because the bottom pane owns the composer text.
 
 *Call graph*: calls 1 internal fn (composer_is_empty).
 
@@ -1194,11 +1196,11 @@ fn composer_is_empty(&self) -> bool
 fn is_task_running_for_test(&self) -> bool
 ```
 
-**Purpose**: Test-only accessor exposing whether the bottom pane currently considers a task to be running.
+**Purpose**: Exposes the bottom pane’s task-running state to tests. This helps tests check spinner or busy-state behavior.
 
-**Data flow**: Delegates to `bottom_pane.is_task_running()`.
+**Data flow**: It asks the bottom pane whether a task is running and returns the result.
 
-**Call relations**: Tests use this to assert task-running synchronization behavior.
+**Call relations**: This is compiled for tests and mirrors the same state used by normal UI busy indicators.
 
 *Call graph*: calls 1 internal fn (is_task_running).
 
@@ -1209,11 +1211,11 @@ fn is_task_running_for_test(&self) -> bool
 fn toggle_vim_mode_and_notify(&mut self)
 ```
 
-**Purpose**: Toggles Vim editing in the bottom-pane composer and appends a notice describing the new state.
+**Purpose**: Turns Vim-style editing mode on or off and adds a confirmation message. Vim mode means the composer uses keyboard behavior inspired by the Vim editor.
 
-**Data flow**: Calls `bottom_pane.toggle_vim_enabled()`, chooses either `"Vim mode enabled."` or `"Vim mode disabled."`, and appends it via `add_info_message`.
+**Data flow**: It asks the bottom pane to toggle Vim mode, chooses an enabled or disabled message based on the result, and adds that message to history.
 
-**Call relations**: Bound to the user-facing Vim-mode toggle action.
+**Call relations**: User commands or shortcuts call this; it delegates editing-mode state to the bottom pane and uses add_info_message for feedback.
 
 *Call graph*: calls 2 internal fn (toggle_vim_enabled, add_info_message).
 
@@ -1224,11 +1226,11 @@ fn toggle_vim_mode_and_notify(&mut self)
 fn is_normal_backtrack_mode(&self) -> bool
 ```
 
-**Purpose**: Reports whether the bottom pane is in its ordinary composer state with no running task or modal overlay.
+**Purpose**: Reports whether the UI is in a plain composer state where Escape-Escape backtracking is allowed. Backtracking means stepping back through recent input or UI state.
 
-**Data flow**: Delegates to `bottom_pane.is_normal_backtrack_mode()`.
+**Data flow**: It asks the bottom pane whether it is in normal backtrack mode and returns the answer.
 
-**Call relations**: Escape/backtrack routing uses this to decide when Esc-Esc should navigate backward rather than cancel a popup.
+**Call relations**: Keyboard handling uses this check before treating Escape sequences as backtracking commands.
 
 *Call graph*: calls 1 internal fn (is_normal_backtrack_mode).
 
@@ -1239,11 +1241,11 @@ fn is_normal_backtrack_mode(&self) -> bool
 fn should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool
 ```
 
-**Purpose**: Asks the bottom-pane composer whether a given Escape event should be consumed as a Vim insert-mode transition.
+**Purpose**: Decides whether a given Escape key event should be handled by Vim insert-mode behavior in the composer.
 
-**Data flow**: Delegates the `KeyEvent` to `bottom_pane.composer_should_handle_vim_insert_escape(key_event)`.
+**Data flow**: It receives a key event and asks the bottom pane’s composer logic whether Vim insert escape should consume it.
 
-**Call relations**: Top-level key routing uses this before applying broader chat-widget Escape behavior.
+**Call relations**: Key handling calls this before applying chat-level Escape behavior.
 
 *Call graph*: calls 1 internal fn (composer_should_handle_vim_insert_escape).
 
@@ -1254,11 +1256,11 @@ fn should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool
 fn insert_str(&mut self, text: &str)
 ```
 
-**Purpose**: Inserts text into the bottom-pane composer.
+**Purpose**: Inserts text into the composer. This is used when another UI action wants to add text as if the user typed it.
 
-**Data flow**: Delegates the provided string slice to `bottom_pane.insert_str(text)`.
+**Data flow**: It receives a string slice and forwards it to the bottom pane composer.
 
-**Call relations**: External helpers use this when they need to programmatically type into the composer.
+**Call relations**: ChatWidget owns the bottom pane, so external paste or insertion flows route through this method.
 
 *Call graph*: calls 1 internal fn (insert_str).
 
@@ -1274,11 +1276,11 @@ fn set_composer_text(
     )
 ```
 
-**Purpose**: Replaces the composer contents, including text elements and local image attachments, and refreshes plan-mode nudges.
+**Purpose**: Replaces the composer contents, including rich text elements and local image attachments. It also refreshes plan-mode nudges afterward.
 
-**Data flow**: Passes the provided text, `Vec<TextElement>`, and local image paths to `bottom_pane.set_composer_text`, then calls `refresh_plan_mode_nudge()`.
+**Data flow**: It receives text, text elements, and local image paths, passes them to the bottom pane, then refreshes the plan-mode nudge state.
 
-**Call relations**: Draft restore and queued-message edit flows use this to repopulate the composer.
+**Call relations**: Restore, edit, or queued-message flows can call this when they need to put a full draft back into the composer.
 
 *Call graph*: calls 1 internal fn (set_composer_text).
 
@@ -1289,11 +1291,11 @@ fn set_composer_text(
 fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>)
 ```
 
-**Purpose**: Stores the current set of remote image URLs in the bottom-pane composer state.
+**Purpose**: Sets remote image URLs attached to the current composer draft. These are images referenced by URL rather than local files.
 
-**Data flow**: Delegates the provided vector to `bottom_pane.set_remote_image_urls`.
+**Data flow**: It receives a list of URL strings and forwards it to the bottom pane.
 
-**Call relations**: Image-attachment flows use this when remote image selections are applied.
+**Call relations**: Attachment-handling code uses this because the bottom pane owns draft attachments.
 
 *Call graph*: calls 1 internal fn (set_remote_image_urls).
 
@@ -1304,11 +1306,11 @@ fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>)
 fn take_remote_image_urls(&mut self) -> Vec<String>
 ```
 
-**Purpose**: Removes and returns the current remote image URLs from the bottom-pane composer state.
+**Purpose**: Removes and returns the remote image URLs currently attached to the composer draft. This is useful when submitting a message.
 
-**Data flow**: Delegates to `bottom_pane.take_remote_image_urls()` and returns the resulting vector.
+**Data flow**: It asks the bottom pane to take its stored remote image URLs, leaving that list empty there, and returns the taken URLs.
 
-**Call relations**: Submission flows use this when consuming composer attachments.
+**Call relations**: Message-submission code can call this to move image URLs from draft state into the outgoing user message.
 
 *Call graph*: calls 1 internal fn (take_remote_image_urls).
 
@@ -1319,11 +1321,11 @@ fn take_remote_image_urls(&mut self) -> Vec<String>
 fn remote_image_urls(&self) -> Vec<String>
 ```
 
-**Purpose**: Test-only accessor returning the current remote image URLs from the bottom pane.
+**Purpose**: Returns the current remote image URLs for tests. It lets tests inspect composer attachment state.
 
-**Data flow**: Delegates to `bottom_pane.remote_image_urls()`.
+**Data flow**: It asks the bottom pane for its remote image URLs and returns a copy.
 
-**Call relations**: Tests use this to inspect attachment state.
+**Call relations**: This test-only helper mirrors the attachment state used by normal message submission.
 
 *Call graph*: calls 1 internal fn (remote_image_urls).
 
@@ -1334,11 +1336,11 @@ fn remote_image_urls(&self) -> Vec<String>
 fn pending_thread_approvals(&self) -> &[String]
 ```
 
-**Purpose**: Test-only accessor returning the current pending-thread-approval list from the bottom pane.
+**Purpose**: Returns the pending thread approvals for tests. This lets tests verify approval state shown by the bottom pane.
 
-**Data flow**: Delegates to `bottom_pane.pending_thread_approvals()`.
+**Data flow**: It asks the bottom pane for its pending thread approvals and returns the slice.
 
-**Call relations**: Tests use this to verify approval-state propagation.
+**Call relations**: This test-only helper exposes the same approval list set through set_pending_thread_approvals.
 
 *Call graph*: calls 1 internal fn (pending_thread_approvals).
 
@@ -1349,11 +1351,11 @@ fn pending_thread_approvals(&self) -> &[String]
 fn has_active_view(&self) -> bool
 ```
 
-**Purpose**: Test-only accessor reporting whether the bottom pane currently has an active modal view.
+**Purpose**: Reports whether the bottom pane currently has a modal or special view open. This is mainly useful in tests.
 
-**Data flow**: Delegates to `bottom_pane.has_active_view()`.
+**Data flow**: It asks the bottom pane whether an active view exists and returns the result.
 
-**Call relations**: Tests use this to assert popup/view lifecycle behavior.
+**Call relations**: Tests can use this to verify that prompts, popups, or forms were opened or dismissed.
 
 *Call graph*: calls 1 internal fn (has_active_view).
 
@@ -1364,11 +1366,11 @@ fn has_active_view(&self) -> bool
 fn show_esc_backtrack_hint(&mut self)
 ```
 
-**Purpose**: Asks the bottom pane to display its Escape backtrack hint.
+**Purpose**: Asks the bottom pane to show a hint about Escape-Escape backtracking. This guides users when that shortcut is available.
 
-**Data flow**: Delegates to `bottom_pane.show_esc_backtrack_hint()`.
+**Data flow**: It forwards the request to the bottom pane.
 
-**Call relations**: Navigation/backtrack flows use this when the user should be reminded of Esc-Esc behavior.
+**Call relations**: Input-handling logic can call this when it detects a situation where the hint should be visible.
 
 *Call graph*: calls 1 internal fn (show_esc_backtrack_hint).
 
@@ -1379,11 +1381,11 @@ fn show_esc_backtrack_hint(&mut self)
 fn clear_esc_backtrack_hint(&mut self)
 ```
 
-**Purpose**: Asks the bottom pane to hide its Escape backtrack hint.
+**Purpose**: Asks the bottom pane to hide the Escape-Escape backtracking hint.
 
-**Data flow**: Delegates to `bottom_pane.clear_esc_backtrack_hint()`.
+**Data flow**: It forwards the clear request to the bottom pane.
 
-**Call relations**: Called when the hint is no longer relevant.
+**Call relations**: Input-handling logic can call this when the hint no longer applies.
 
 *Call graph*: calls 1 internal fn (clear_esc_backtrack_hint).
 
@@ -1394,11 +1396,11 @@ fn clear_esc_backtrack_hint(&mut self)
 fn refresh_skills_for_current_cwd(&mut self, force_reload: bool)
 ```
 
-**Purpose**: Requests a skill list refresh for the current working directory, optionally forcing reload.
+**Purpose**: Requests a fresh list of skills for the current working directory. Skills are reusable tool-like abilities available to the assistant.
 
-**Data flow**: Builds `AppCommand::list_skills(vec![self.config.cwd.to_path_buf()], force_reload)` and submits it through `submit_op`.
+**Data flow**: It receives a force-reload flag, builds a list-skills command for the current directory, and submits it through submit_op.
 
-**Call relations**: Skill-refresh actions use this to ask core for updated skill metadata.
+**Call relations**: It uses submit_op to send the request into the app command flow.
 
 *Call graph*: calls 1 internal fn (submit_op); 2 external calls (list_skills, vec!).
 
@@ -1409,11 +1411,11 @@ fn refresh_skills_for_current_cwd(&mut self, force_reload: bool)
 fn submit_op(&mut self, op: T) -> bool
 ```
 
-**Purpose**: Submits an `AppCommand` either directly to codex or indirectly via `AppEvent`, while performing local pre-submission bookkeeping.
+**Purpose**: Sends an app command to Codex or wraps it as an app event, depending on how this widget was constructed. It is the main outgoing command path from the chat UI.
 
-**Data flow**: Converts the input into `AppCommand`, calls `prepare_local_op_submission(&op)`, marks the bottom pane task-running for review ops when needed, then either logs and sends the op through a direct `UnboundedSender<AppCommand>` or wraps it in `AppEvent::CodexOp` and sends it through `app_event_tx`. It returns `false` only if direct send fails.
+**Data flow**: It receives something convertible into AppCommand, converts it, prepares local UI state, marks review tasks running when needed, then either sends it directly through a command channel or through AppEvent::CodexOp. It returns whether direct sending succeeded.
 
-**Call relations**: Many chat-widget actions use this as the canonical command-submission path to core.
+**Call relations**: clean_background_terminals and refresh_skills_for_current_cwd call this. It calls prepare_local_op_submission before handing the command off.
 
 *Call graph*: calls 5 internal fn (send, is_task_running, set_task_running, prepare_local_op_submission, log_outbound_op); called by 2 (clean_background_terminals, refresh_skills_for_current_cwd); 4 external calls (into, is_review, CodexOp, error!).
 
@@ -1424,11 +1426,11 @@ fn submit_op(&mut self, op: T) -> bool
 fn append_message_history_entry(&self, text: String)
 ```
 
-**Purpose**: Requests persistence of a submitted message into per-thread message history when a thread id is available.
+**Purpose**: Requests that a text entry be appended to the current thread’s message history. It warns if there is no active thread yet.
 
-**Data flow**: If `self.thread_id` is `Some`, sends `AppEvent::AppendMessageHistoryEntry { thread_id, text }`; otherwise logs a warning and does nothing.
+**Data flow**: It receives text, checks for a thread id, and sends an AppendMessageHistoryEntry event with that id and text. If no thread id exists, it logs a warning and does nothing.
 
-**Call relations**: Submission/history flows use this after successful message handling.
+**Call relations**: Message-submission or slash-command flows can use this to persist recall history after a thread is known.
 
 *Call graph*: calls 1 internal fn (send); 1 external calls (warn!).
 
@@ -1439,11 +1441,11 @@ fn append_message_history_entry(&self, text: String)
 fn prepare_local_op_submission(&mut self, op: &AppCommand)
 ```
 
-**Purpose**: Performs local UI cleanup before certain commands, especially interrupts, are sent to core.
+**Purpose**: Updates local UI state before an outgoing command is submitted. It especially cleans up streaming state before interrupts.
 
-**Data flow**: If the op is `AppCommand::Interrupt` during an active agent turn, it may arm cancel-edit restoration for `RestorePromptIfNoOutput`, clears queued chunks in both stream controllers if present, clears the active stream tail, and requests a redraw.
+**Data flow**: It receives an AppCommand reference. If it is an interrupt during an active agent turn, it may arm cancel-edit restore, clears queued stream-controller output, clears the active stream tail, and redraws.
 
-**Call relations**: Called by `submit_op` before every outbound command so interrupt-specific local state is synchronized immediately.
+**Call relations**: submit_op calls this before sending every command so local UI state stays consistent with outgoing actions.
 
 *Call graph*: calls 1 internal fn (request_redraw); called by 1 (submit_op).
 
@@ -1454,11 +1456,11 @@ fn prepare_local_op_submission(&mut self, op: &AppCommand)
 fn on_list_skills(&mut self, ev: SkillsListResponse)
 ```
 
-**Purpose**: Applies a skills-list response and refreshes plugin mentions afterward.
+**Purpose**: Applies a skill-list response and then refreshes plugin mention suggestions. This keeps mention autocomplete in sync with available tools.
 
-**Data flow**: Calls `self.set_skills_from_response(&ev)` and then `self.refresh_plugin_mentions()`.
+**Data flow**: It receives a SkillsListResponse, stores the skills through the response handler, and calls refresh_plugin_mentions.
 
-**Call relations**: Skill-list response handling uses this to keep both skill state and mention suggestions current.
+**Call relations**: Skill-list response handling calls this after the app server returns available skills.
 
 *Call graph*: calls 1 internal fn (refresh_plugin_mentions).
 
@@ -1469,11 +1471,11 @@ fn on_list_skills(&mut self, ev: SkillsListResponse)
 fn refresh_plugin_mentions(&mut self)
 ```
 
-**Purpose**: Requests refreshed plugin mention data when plugins are enabled, or clears plugin mentions otherwise.
+**Purpose**: Refreshes the plugin mention list used by the composer. If plugins are disabled, it clears plugin mentions instead.
 
-**Data flow**: If the plugins feature is disabled, calls `bottom_pane.set_plugin_mentions(None)` and returns. Otherwise it sends `AppEvent::RefreshPluginMentions`.
+**Data flow**: It checks the plugins feature flag. If disabled, it tells the bottom pane there are no plugin mentions. If enabled, it sends a RefreshPluginMentions app event.
 
-**Call relations**: Called after skill updates and config changes that may affect mention availability.
+**Call relations**: on_list_skills calls this after skill updates, because skill and plugin mentions share the composer suggestion experience.
 
 *Call graph*: calls 2 internal fn (send, set_plugin_mentions); called by 1 (on_list_skills).
 
@@ -1487,11 +1489,11 @@ fn on_plugin_mentions_loaded(
     )
 ```
 
-**Purpose**: Applies newly loaded plugin mention capabilities to the bottom pane only when they differ from the current set.
+**Purpose**: Installs newly loaded plugin mention data in the bottom pane, but only if it changed. This avoids unnecessary UI churn.
 
-**Data flow**: Compares `bottom_pane.plugins()` to the incoming `Option<Vec<PluginCapabilitySummary>>`; if unchanged it returns, otherwise it forwards the new value to `bottom_pane.set_plugin_mentions`.
+**Data flow**: It receives optional plugin summaries, compares them with the bottom pane’s current plugin list, and updates the bottom pane when different.
 
-**Call relations**: Plugin-mention refresh responses use this to avoid unnecessary UI churn.
+**Call relations**: Plugin mention loading code calls this after the app event requested by refresh_plugin_mentions completes.
 
 *Call graph*: calls 2 internal fn (plugins, set_plugin_mentions).
 
@@ -1502,11 +1504,11 @@ fn on_plugin_mentions_loaded(
 fn sync_plugin_mentions_config(&mut self, config: &Config)
 ```
 
-**Purpose**: Copies plugin- and mention-related config fields from an updated config into the widget and refreshes mention-mode state.
+**Purpose**: Copies the parts of configuration that affect mention behavior into the widget. This keeps plugin and mention UI aligned after config changes.
 
-**Data flow**: Overwrites `self.config.features`, `config_layer_stack`, `memories`, and `terminal_resize_reflow` from the provided config, then calls `sync_mentions_v2_enabled()`.
+**Data flow**: It receives a config reference and copies feature flags, config-layer stack, memory settings, and resize-reflow setting into the widget config, then syncs mentions-v2 enabled state.
 
-**Call relations**: Live config-update handling uses this to keep mention behavior aligned with current settings.
+**Call relations**: Config update flows call this when the app’s configuration changes while the chat widget is already alive.
 
 
 ##### `ChatWidget::token_usage`  (lines 1867–1872)
@@ -1515,11 +1517,11 @@ fn sync_plugin_mentions_config(&mut self, config: &Config)
 fn token_usage(&self) -> TokenUsage
 ```
 
-**Purpose**: Returns the total token usage for the current thread, defaulting to zeroed usage when unavailable.
+**Purpose**: Returns the total token usage known to the widget. If no token info is available, it returns a default zero-like usage value.
 
-**Data flow**: Reads `self.token_info`, clones `total_token_usage` when present, or returns `TokenUsage::default()`.
+**Data flow**: It reads token_info, clones total_token_usage if present, or returns the default TokenUsage.
 
-**Call relations**: Status and telemetry surfaces use this accessor when they need aggregate token counts.
+**Call relations**: Status and reporting code can query this when it needs current token totals.
 
 
 ##### `ChatWidget::thread_id`  (lines 1874–1876)
@@ -1528,11 +1530,11 @@ fn token_usage(&self) -> TokenUsage
 fn thread_id(&self) -> Option<ThreadId>
 ```
 
-**Purpose**: Returns the current thread id, if one has been assigned.
+**Purpose**: Returns the current thread id, if the session has one. A thread id identifies the conversation on the app/server side.
 
-**Data flow**: Returns `self.thread_id`.
+**Data flow**: It reads and returns the optional thread_id field.
 
-**Call relations**: Used by MCP inventory requests and other flows that need to tag app events with the active thread.
+**Call relations**: add_mcp_output calls this when sending a FetchMcpInventory event so the request can be tied to the active thread.
 
 *Call graph*: called by 1 (add_mcp_output).
 
@@ -1543,11 +1545,11 @@ fn thread_id(&self) -> Option<ThreadId>
 fn thread_name(&self) -> Option<String>
 ```
 
-**Purpose**: Returns the current thread name as an owned string when available.
+**Purpose**: Returns the current thread name, if known. This is the user-friendly session title.
 
-**Data flow**: Clones and returns `self.thread_name`.
+**Data flow**: It clones and returns the optional thread_name field.
 
-**Call relations**: Thread-management and title/status rendering use this accessor.
+**Call relations**: Status, navigation, or resume-hint code can call this when it needs the display name for the active conversation.
 
 
 ##### `ChatWidget::rollout_path`  (lines 1887–1889)
@@ -1556,11 +1558,11 @@ fn thread_name(&self) -> Option<String>
 fn rollout_path(&self) -> Option<PathBuf>
 ```
 
-**Purpose**: Returns the current thread’s rollout path, if known.
+**Purpose**: Returns the file path where the current thread’s rollout may be stored. A rollout is the persisted record of a session.
 
-**Data flow**: Clones and returns `self.current_rollout_path`.
+**Data flow**: It clones and returns current_rollout_path, which may exist even before the file has been created.
 
-**Call relations**: Feedback and persistence flows use this when they need the current rollout file location.
+**Call relations**: Feedback and persistence-related flows can use this to attach or locate the active session’s stored record.
 
 
 ##### `ChatWidget::active_cell_transcript_key`  (lines 1901–1924)
@@ -1569,11 +1571,11 @@ fn rollout_path(&self) -> Option<PathBuf>
 fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey>
 ```
 
-**Purpose**: Builds the cache key describing the current live transcript tail for the transcript overlay.
+**Purpose**: Builds a cache key for the transcript overlay’s live tail. The live tail is the in-progress content shown alongside committed transcript entries.
 
-**Data flow**: Reads the active transcript cell, active hook cell, pending token-activity cell, and pending rate-limit-reset hint. If all are absent it returns `None`; otherwise it returns `ActiveCellTranscriptKey { revision, is_stream_continuation, animation_tick }`, deriving continuation and animation tick from the active cell or hook cell.
+**Data flow**: It checks active, hook, token-activity, and rate-limit hint cells. If none exist, it returns None. Otherwise it returns a key containing the active-cell revision, stream-continuation flag, and any animation tick.
 
-**Call relations**: The transcript overlay uses this key to decide when its cached live tail must be recomputed.
+**Call relations**: The transcript overlay uses this key to decide whether it must recompute in-flight transcript lines instead of reusing cached ones.
 
 
 ##### `ChatWidget::active_cell_transcript_hyperlink_lines`  (lines 1932–1963)
@@ -1585,11 +1587,11 @@ fn active_cell_transcript_hyperlink_lines(
     ) -> Option<Vec<HyperlinkLine>>
 ```
 
-**Purpose**: Collects the current live transcript tail as hyperlink-aware lines for a given width.
+**Purpose**: Collects the transcript-overlay lines for all current in-flight cells, preserving hyperlinks. It inserts blank separators between non-empty live sections.
 
-**Data flow**: Starts with an empty vector, appends transcript lines from the active cell, then from the active hook cell, pending token-activity cell, and pending rate-limit-reset hint, inserting blank separator lines between non-empty sections. It returns `Some(lines)` only when at least one line was produced.
+**Data flow**: It receives a width, asks the active cell, hook cell, pending token-activity cell, and rate-limit hint for transcript lines, joins non-empty sections with blank lines, and returns None if there is nothing to show.
 
-**Call relations**: The transcript overlay calls this when it needs the actual rendered live-tail content corresponding to `active_cell_transcript_key`.
+**Call relations**: active_cell_transcript_lines calls this and then strips hyperlink metadata for tests or plain visible-line use.
 
 *Call graph*: calls 1 internal fn (from); called by 1 (active_cell_transcript_lines); 1 external calls (new).
 
@@ -1600,11 +1602,11 @@ fn active_cell_transcript_hyperlink_lines(
 fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>>
 ```
 
-**Purpose**: Test-only convenience wrapper that converts hyperlink-aware live-tail lines into visible `Line<'static>` values.
+**Purpose**: Returns visible transcript lines for the active live tail without hyperlink metadata. This is a test-friendly convenience helper.
 
-**Data flow**: Calls `active_cell_transcript_hyperlink_lines(width)` and maps the result through `crate::terminal_hyperlinks::visible_lines`.
+**Data flow**: It receives a width, calls active_cell_transcript_hyperlink_lines, and converts hyperlink lines into ordinary visible terminal lines if any exist.
 
-**Call relations**: Tests use this to inspect live-tail transcript output without hyperlink metadata.
+**Call relations**: It is built directly on active_cell_transcript_hyperlink_lines so tests inspect the same live-tail content the overlay uses.
 
 *Call graph*: calls 1 internal fn (active_cell_transcript_hyperlink_lines).
 
@@ -1615,11 +1617,11 @@ fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>>
 fn config_ref(&self) -> &Config
 ```
 
-**Purpose**: Returns a shared reference to the widget’s current runtime config snapshot.
+**Purpose**: Returns a reference to the widget’s current config. This includes runtime changes made through the TUI.
 
-**Data flow**: Returns `&self.config`.
+**Data flow**: It returns a shared reference to the config field without copying it.
 
-**Call relations**: Callers use this when they need to inspect config after runtime overrides have been applied.
+**Call relations**: Other code can read effective chat-widget configuration through this method without taking ownership.
 
 
 ##### `ChatWidget::status_line_text`  (lines 1978–1980)
@@ -1628,11 +1630,11 @@ fn config_ref(&self) -> &Config
 fn status_line_text(&self) -> Option<String>
 ```
 
-**Purpose**: Test-only accessor returning the current bottom-pane status-line text.
+**Purpose**: Returns the current status-line text for tests. The status line is the compact footer summary shown in the bottom pane.
 
-**Data flow**: Delegates to `bottom_pane.status_line_text()`.
+**Data flow**: It asks the bottom pane for its status-line text and returns the optional string.
 
-**Call relations**: Tests use this to assert status-line rendering outcomes.
+**Call relations**: Test code calls this to verify what the bottom pane is displaying.
 
 *Call graph*: calls 1 internal fn (status_line_text); called by 1 (status_line_text).
 
@@ -1643,11 +1645,11 @@ fn status_line_text(&self) -> Option<String>
 fn clear_token_usage(&mut self)
 ```
 
-**Purpose**: Clears the cached token-usage info without updating the bottom-pane display.
+**Purpose**: Clears stored token usage from the widget. This removes the remembered token counts, though it does not itself update all displays.
 
-**Data flow**: Sets `self.token_info = None`.
+**Data flow**: It sets token_info to None.
 
-**Call relations**: Used by flows that need to discard cached usage state before a later refresh repopulates it.
+**Call relations**: Token-reset flows can use this when old token counts should no longer be considered current.
 
 
 ##### `has_websocket_timing_metrics`  (lines 1987–1994)
@@ -1656,11 +1658,11 @@ fn clear_token_usage(&mut self)
 fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool
 ```
 
-**Purpose**: Checks whether any websocket timing metrics in a runtime summary are non-zero.
+**Purpose**: Checks whether runtime metrics contain any websocket timing data. This helps decide whether there is meaningful timing information to show or report.
 
-**Data flow**: Returns true if any of the six timing fields on `RuntimeMetricsSummary` exceed zero.
+**Data flow**: It receives a RuntimeMetricsSummary and returns true if any of several timing fields is greater than zero.
 
-**Call relations**: Telemetry/status logic can use this to decide whether websocket timing details are worth surfacing.
+**Call relations**: Metrics display or logging code can call this before including websocket timing details.
 
 
 ##### `ChatWidget::drop`  (lines 1997–1999)
@@ -1669,11 +1671,11 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool
 fn drop(&mut self)
 ```
 
-**Purpose**: Performs widget teardown by stopping the rate-limit poller when the chat widget is dropped.
+**Purpose**: Cleans up when the chat widget is destroyed. It stops the rate-limit poller so background polling does not continue after the widget is gone.
 
-**Data flow**: Calls `self.stop_rate_limit_poller()` during `Drop`.
+**Data flow**: When Rust drops the ChatWidget, this method calls stop_rate_limit_poller.
 
-**Call relations**: This ensures background polling tied to the widget lifecycle is cleaned up automatically.
+**Call relations**: This runs automatically during teardown; callers do not invoke it directly.
 
 
 ##### `extract_first_bold`  (lines 2021–2047)
@@ -1682,22 +1684,24 @@ fn drop(&mut self)
 fn extract_first_bold(s: &str) -> Option<String>
 ```
 
-**Purpose**: Extracts the first Markdown bold span `**...**` from a string and returns its trimmed inner text.
+**Purpose**: Finds the first non-empty Markdown bold phrase written as **text**. It is useful for extracting a short header from streamed markdown.
 
-**Data flow**: Scans the byte slice for an opening `**`, then searches forward for the next closing `**`; if found, trims the inner substring and returns it when non-empty, otherwise returns `None`. If no closing delimiter exists after an opening one, it stops and returns `None`.
+**Data flow**: It scans the input string byte by byte for an opening ** and closing **. If it finds a non-empty trimmed inner value, it returns that text; if the bold text is empty or incomplete, it returns None.
 
-**Call relations**: Streaming/commentary parsing can use this to derive a heading-like label from partially accumulated markdown.
+**Call relations**: Streaming or reasoning-summary code can use this helper when it wants a compact title from markdown content.
 
 
 ### `tui/src/chatwidget/interrupts.rs`
 
-`orchestration` · `interrupt handling`
+`orchestration` · `request handling`
 
-This file defines a small deferred-interrupt subsystem. `QueuedInterrupt` is an enum covering every interrupt-style event that may need to wait behind another visible prompt: exec approval, apply-patch approval, MCP elicitation, permission requests, tool user-input requests, and thread-item lifecycle notifications (`ItemStarted` / `ItemCompleted`). `InterruptManager` then wraps a `VecDeque<QueuedInterrupt>` and provides typed push methods so callers do not construct enum variants manually.
+The chat screen can be interrupted by several kinds of urgent events: a command may need approval, a file change may need permission, a tool may ask the user a question, or a background item may start or finish. The interface can only show one such overlay at a time. This file provides the waiting-room for the rest.
 
-The manager’s behavior is intentionally simple and ordered. `new` starts with an empty queue, `is_empty` exposes whether anything is pending, and each `push_*` appends to the back. `remove_resolved_prompt` supports prompt dismissal races: when some app-server request has already been resolved elsewhere, it removes matching queued prompt overlays by retaining only entries whose `matches_resolved_prompt` returns false. Lifecycle events are deliberately never considered removable by this path.
+The main piece is InterruptManager. It owns a queue, which is like a line at a service desk: new interruptions join the back, and when the chat is ready, the oldest one is taken from the front. Each item in the line is a QueuedInterrupt, an enum, meaning a value that can be one of several known shapes. The enum records exactly what kind of interruption is waiting and carries the data needed to show it later.
 
-`flush_all` is the replay mechanism. It repeatedly pops from the front and invokes the corresponding immediate `ChatWidget` handler, preserving original arrival order across heterogeneous interrupt types. `QueuedInterrupt::matches_resolved_prompt` contains the concrete matching rules for each prompt-bearing variant, including the subtle exec-approval case where the effective approval id, not necessarily the raw call id, must match the resolved request. The tests lock in user-input matching, exec-approval-id matching, and the invariant that lifecycle events survive prompt-removal filtering.
+A key detail is that prompts can be resolved outside this queue. For example, an approval request might be answered before it reaches the screen. remove_resolved_prompt scans the queue and drops any waiting prompt that matches that completed request, so the user is not asked again. It deliberately does not remove lifecycle updates such as “item started” or “item completed,” because those are not answerable prompts.
+
+When the UI becomes free, flush_all drains the queue and hands each event to the matching ChatWidget method that displays or applies it immediately.
 
 #### Function details
 
@@ -1707,11 +1711,11 @@ The manager’s behavior is intentionally simple and ordered. `new` starts with 
 fn new() -> Self
 ```
 
-**Purpose**: Constructs an empty interrupt queue manager.
+**Purpose**: Creates a fresh interrupt manager with an empty waiting line. Code uses this when a chat widget or test needs somewhere to store interruptions that cannot be shown yet.
 
-**Data flow**: Allocates a new empty `VecDeque` and returns `InterruptManager { queue }`.
+**Data flow**: It takes no input. It creates an empty first-in, first-out queue, where the oldest saved interruption will be handled first. It returns a new InterruptManager containing that empty queue.
 
-**Call relations**: Used during chat-widget construction and in tests as the starting point for deferred interrupt handling.
+**Call relations**: During normal setup, new_with_op_target creates one so the chat area can defer interruptions. The tests also create managers this way before checking how queued prompts are removed.
 
 *Call graph*: called by 4 (new_with_op_target, remove_resolved_prompt_keeps_lifecycle_events, remove_resolved_prompt_matches_exec_approval_id, remove_resolved_prompt_removes_matching_user_input_only); 1 external calls (new).
 
@@ -1722,11 +1726,11 @@ fn new() -> Self
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether there are any deferred interrupts waiting to be flushed.
+**Purpose**: Answers the simple question: are there any delayed interruptions waiting? This lets other code decide whether there is deferred work to flush.
 
-**Data flow**: Reads `self.queue.is_empty()` and returns that boolean.
+**Data flow**: It reads the manager’s queue. If the queue has no entries, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Used by higher-level orchestration to decide whether deferred interrupt processing is needed.
+**Call relations**: This is a small status check for the broader chat flow. Other code can call it before deciding whether to drain the queue or leave the interrupt system alone.
 
 *Call graph*: 1 external calls (is_empty).
 
@@ -1737,11 +1741,11 @@ fn is_empty(&self) -> bool
 fn push_exec_approval(&mut self, ev: ExecApprovalRequestEvent)
 ```
 
-**Purpose**: Appends an exec-approval prompt event to the deferred interrupt queue.
+**Purpose**: Adds a command-execution approval request to the back of the waiting line. This is used when a command wants permission but another interruption is already visible.
 
-**Data flow**: Wraps `ev: ExecApprovalRequestEvent` in `QueuedInterrupt::ExecApproval` and pushes it to the back of `self.queue`.
+**Data flow**: It receives an ExecApprovalRequestEvent containing the command approval details. It wraps that event as a queued execution approval and appends it to the queue. Nothing is returned; the manager’s queue is changed.
 
-**Call relations**: Called when an exec approval arrives while another interrupt/prompt is already visible.
+**Call relations**: This is one of the entry points for putting work into the interrupt queue. Later, flush_all takes the saved approval back out and asks ChatWidget to show the execution approval immediately.
 
 *Call graph*: 2 external calls (push_back, ExecApproval).
 
@@ -1752,11 +1756,11 @@ fn push_exec_approval(&mut self, ev: ExecApprovalRequestEvent)
 fn push_apply_patch_approval(&mut self, ev: ApplyPatchApprovalRequestEvent)
 ```
 
-**Purpose**: Appends an apply-patch approval prompt event to the deferred queue.
+**Purpose**: Adds a file-change approval request to the waiting line. This keeps patch approval prompts from colliding with whatever prompt is already on screen.
 
-**Data flow**: Wraps `ev: ApplyPatchApprovalRequestEvent` in `QueuedInterrupt::ApplyPatchApproval` and pushes it onto `self.queue`.
+**Data flow**: It receives an ApplyPatchApprovalRequestEvent describing the requested file change. It stores that event inside a queued apply-patch approval and appends it to the queue. The function returns nothing and mutates the queue.
 
-**Call relations**: Used by approval-event handling when patch approval cannot be shown immediately.
+**Call relations**: This feeds patch approvals into the same deferred-interrupt path as other prompt types. When flush_all reaches this item, it hands it to ChatWidget’s immediate apply-patch approval handler.
 
 *Call graph*: 2 external calls (push_back, ApplyPatchApproval).
 
@@ -1771,11 +1775,11 @@ fn push_elicitation(
     )
 ```
 
-**Purpose**: Queues an MCP elicitation request identified by request id and parameter payload.
+**Purpose**: Queues an elicitation request, which is a server-driven request for extra information from the user. It preserves both the request identity and the prompt details so the question can be shown later.
 
-**Data flow**: Builds `QueuedInterrupt::Elicitation { request_id, params }` from the arguments and pushes it to the back of `self.queue`.
+**Data flow**: It receives a request ID and request parameters. It packages both into an elicitation queued item and appends that item to the queue. It does not return a value.
 
-**Call relations**: Used when elicitation prompts must wait behind another visible interrupt.
+**Call relations**: This stores server questions while another interruption is active. Later, flush_all passes the same request ID and parameters to ChatWidget so it can display the elicitation prompt and respond to the right server request.
 
 *Call graph*: 1 external calls (push_back).
 
@@ -1786,11 +1790,11 @@ fn push_elicitation(
 fn push_request_permissions(&mut self, ev: RequestPermissionsEvent)
 ```
 
-**Purpose**: Queues a permissions-approval request for later display.
+**Purpose**: Queues a permissions request, such as a tool asking for extra rights. This prevents permission prompts from being lost or stacked on top of another visible prompt.
 
-**Data flow**: Wraps `ev: RequestPermissionsEvent` in `QueuedInterrupt::RequestPermissions` and pushes it onto `self.queue`.
+**Data flow**: It receives a RequestPermissionsEvent with the permission request details. It wraps the event as a queued permissions request and appends it to the queue. It changes the queue and returns nothing.
 
-**Call relations**: Called by permission-request handling when immediate presentation is not possible.
+**Call relations**: This function adds permission prompts to the deferred flow. When the queue is flushed, ChatWidget receives the stored request through its immediate permissions handler.
 
 *Call graph*: 2 external calls (push_back, RequestPermissions).
 
@@ -1801,11 +1805,11 @@ fn push_request_permissions(&mut self, ev: RequestPermissionsEvent)
 fn push_user_input(&mut self, ev: ToolRequestUserInputParams)
 ```
 
-**Purpose**: Queues a tool-originated user-input request for later handling.
+**Purpose**: Queues a tool’s request for user input. This is used when a tool needs answers from the user but the interface is not ready to ask yet.
 
-**Data flow**: Wraps `ev: ToolRequestUserInputParams` in `QueuedInterrupt::RequestUserInput` and pushes it to the back of `self.queue`.
+**Data flow**: It receives ToolRequestUserInputParams, which include the tool item ID and the questions to ask. It wraps those parameters as a queued user-input request and appends them to the queue. The queue is updated; no value is returned.
 
-**Call relations**: Used when tool questions arrive while another interrupt overlay is active.
+**Call relations**: This lets tool questions wait their turn. Later, flush_all sends the saved input request to ChatWidget so the user can answer it.
 
 *Call graph*: 2 external calls (push_back, RequestUserInput).
 
@@ -1816,11 +1820,11 @@ fn push_user_input(&mut self, ev: ToolRequestUserInputParams)
 fn push_item_started(&mut self, item: ThreadItem)
 ```
 
-**Purpose**: Queues a thread-item started lifecycle event so it can be replayed after the current interrupt UI clears.
+**Purpose**: Queues a notification that a thread item has started, such as a command beginning to run. This lets the chat display stay in the correct order even while a prompt is blocking immediate updates.
 
-**Data flow**: Wraps `item: ThreadItem` in `QueuedInterrupt::ItemStarted` and pushes it onto `self.queue`.
+**Data flow**: It receives a ThreadItem describing the started item. It wraps it as an item-started queued event and appends it to the queue. It returns nothing and changes only the queue.
 
-**Call relations**: Used for deferred tool/lifecycle activity that should preserve ordering relative to queued prompts.
+**Call relations**: This adds lifecycle updates to the same line as prompts. When flush_all later sees this event, it tells ChatWidget to apply the queued “started” update immediately.
 
 *Call graph*: 2 external calls (push_back, ItemStarted).
 
@@ -1831,11 +1835,11 @@ fn push_item_started(&mut self, item: ThreadItem)
 fn push_item_completed(&mut self, item: ThreadItem)
 ```
 
-**Purpose**: Queues a thread-item completed lifecycle event for later replay.
+**Purpose**: Queues a notification that a thread item has completed. This keeps completion updates from being applied out of order while another interruption is visible.
 
-**Data flow**: Wraps `item: ThreadItem` in `QueuedInterrupt::ItemCompleted` and pushes it onto `self.queue`.
+**Data flow**: It receives a ThreadItem describing the completed item. It wraps it as an item-completed queued event and appends it to the queue. The manager stores the event and returns nothing.
 
-**Call relations**: Pairs with `push_item_started` to defer lifecycle updates while another interrupt is visible.
+**Call relations**: This is the companion to push_item_started for deferred lifecycle updates. During flushing, ChatWidget receives the completed item and updates the chat display.
 
 *Call graph*: 2 external calls (push_back, ItemCompleted).
 
@@ -1846,11 +1850,11 @@ fn push_item_completed(&mut self, item: ThreadItem)
 fn remove_resolved_prompt(&mut self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Removes queued prompt overlays that correspond to an app-server request already resolved elsewhere, and reports whether anything was removed.
+**Purpose**: Removes any queued prompt that has already been resolved elsewhere. This prevents the user from seeing an old approval or input request after it has already been answered.
 
-**Data flow**: Reads the original queue length, retains only queued entries for which `matches_resolved_prompt(request)` is false, compares the new length to the original, and returns `true` if the queue shrank.
+**Data flow**: It receives a ResolvedAppServerRequest, which identifies a completed prompt. It checks the current queue length, keeps only queued items that do not match that resolved prompt, then compares the new length with the old one. It returns true if something was removed, and false if the queue stayed the same.
 
-**Call relations**: Called by prompt-dismissal logic when a request is resolved before its deferred overlay is shown. It relies on `QueuedInterrupt::matches_resolved_prompt` for variant-specific matching.
+**Call relations**: dismiss_app_server_request calls this when the app learns that a server request is no longer pending. The actual matching decision is delegated to QueuedInterrupt::matches_resolved_prompt, so this function can focus on cleaning the queue.
 
 *Call graph*: called by 1 (dismiss_app_server_request); 2 external calls (len, retain).
 
@@ -1861,11 +1865,11 @@ fn remove_resolved_prompt(&mut self, request: &ResolvedAppServerRequest) -> bool
 fn flush_all(&mut self, chat: &mut ChatWidget)
 ```
 
-**Purpose**: Replays every deferred interrupt into the live `ChatWidget` in FIFO order using the corresponding immediate handler.
+**Purpose**: Drains every waiting interruption and applies it to the chat widget in order. This is what turns deferred events back into visible UI work once the chat is ready.
 
-**Data flow**: Takes `chat: &mut ChatWidget`, repeatedly pops the front of `self.queue`, matches on the `QueuedInterrupt` variant, and invokes the matching `chat.handle_*_now(...)` method with the stored payload. The queue is empty when the loop finishes.
+**Data flow**: It receives a mutable ChatWidget and repeatedly removes the oldest queued item. For each item, it looks at its kind and calls the matching ChatWidget method with the saved data. When it finishes, the queue is empty; the chat widget may have shown prompts or applied updates.
 
-**Call relations**: Used when the current interrupt UI clears and deferred events can finally be surfaced. It is the execution counterpart to the various `push_*` methods.
+**Call relations**: This is the bridge from storage back to action. The push functions put events into the queue, and flush_all later hands each one to the appropriate immediate ChatWidget handler, such as execution approval, patch approval, elicitation, permissions, user input, item started, or item completed.
 
 *Call graph*: 8 external calls (pop_front, handle_apply_patch_approval_now, handle_elicitation_request_now, handle_exec_approval_now, handle_queued_item_completed_now, handle_queued_item_started_now, handle_request_permissions_now, handle_request_user_input_now).
 
@@ -1876,11 +1880,11 @@ fn flush_all(&mut self, chat: &mut ChatWidget)
 fn matches_resolved_prompt(&self, request: &ResolvedAppServerRequest) -> bool
 ```
 
-**Purpose**: Determines whether a queued interrupt corresponds to a specific resolved app-server request and should therefore be removed from the deferred queue.
+**Purpose**: Decides whether one queued interruption is the same prompt as a resolved server request. This is the safety check that stops already-answered prompts from being shown later.
 
-**Data flow**: Reads `self` and `request` and pattern-matches both. It compares exec approvals by `effective_approval_id()`, patch approvals by `call_id`, elicitation requests by both `server_name` and `request_id`, permission approvals by `call_id`, and tool user-input requests by `item_id`. It always returns `false` for `ItemStarted` and `ItemCompleted`.
+**Data flow**: It reads the queued interruption and the resolved request. For prompt-like items, it compares the relevant IDs, such as approval ID, call ID, request ID, or server name. It returns true only when the queued prompt and resolved request refer to the same thing; lifecycle events always return false.
 
-**Call relations**: Used exclusively by `InterruptManager::remove_resolved_prompt` to implement variant-specific prompt-removal semantics.
+**Call relations**: InterruptManager::remove_resolved_prompt uses this for each queued item while cleaning the queue. It does not display anything itself; it only supplies the yes-or-no matching rule.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1891,11 +1895,11 @@ fn matches_resolved_prompt(&self, request: &ResolvedAppServerRequest) -> bool
 fn user_input(call_id: &str, turn_id: &str) -> ToolRequestUserInputParams
 ```
 
-**Purpose**: Builds a minimal `ToolRequestUserInputParams` fixture for interrupt-manager tests.
+**Purpose**: Builds a small fake user-input request for tests. It saves each test from repeating the same setup fields.
 
-**Data flow**: Takes `call_id` and `turn_id`, fills the remaining fields with fixed values (`thread-1`, empty questions, `None` auto-resolution), and returns the struct.
+**Data flow**: It receives a call ID and a turn ID. It fills in a ToolRequestUserInputParams value with fixed thread information, the provided IDs, no questions, and no automatic timeout. It returns that ready-to-queue test value.
 
-**Call relations**: Used by the user-input removal test to create queued request fixtures.
+**Call relations**: The user-input removal test calls this helper to create two different queued input prompts. Those prompts are then used to prove that only the matching one is removed.
 
 *Call graph*: 1 external calls (new).
 
@@ -1906,11 +1910,11 @@ fn user_input(call_id: &str, turn_id: &str) -> ToolRequestUserInputParams
 fn exec_approval(call_id: &str, approval_id: Option<&str>) -> ExecApprovalRequestEvent
 ```
 
-**Purpose**: Builds an `ExecApprovalRequestEvent` fixture with configurable call id and optional approval id for matching tests.
+**Purpose**: Builds a fake command approval request for tests. It lets the test control whether the approval has a separate approval ID.
 
-**Data flow**: Takes `call_id` and `approval_id`, constructs an `ExecApprovalRequestEvent` with fixed command/turn values, current working directory, and `None` for optional policy/amendment fields, then returns it.
+**Data flow**: It receives a command call ID and an optional approval ID. It creates an ExecApprovalRequestEvent for a harmless command, using the current directory as the working directory and leaving optional permission fields empty. It returns that event for the test to queue.
 
-**Call relations**: Used by the exec-approval matching test to verify that removal keys off the effective approval id.
+**Call relations**: The execution-approval test uses this helper to check an important distinction: a queued execution approval may match by its effective approval ID rather than only by the command call ID.
 
 *Call graph*: calls 1 internal fn (current_dir); 1 external calls (vec!).
 
@@ -1921,11 +1925,11 @@ fn exec_approval(call_id: &str, approval_id: Option<&str>) -> ExecApprovalReques
 fn command_execution(call_id: &str) -> ThreadItem
 ```
 
-**Purpose**: Builds a `ThreadItem::CommandExecution` fixture for lifecycle-event queue tests.
+**Purpose**: Builds a fake in-progress command item for tests. This represents a lifecycle update, not a prompt that the user can answer.
 
-**Data flow**: Takes `call_id`, constructs a `ThreadItem::CommandExecution` with fixed command, current directory, agent source, in-progress status, and empty optional output/action fields, and returns it.
+**Data flow**: It receives a call ID. It creates a ThreadItem for a command execution marked as in progress, with a simple command and the current directory as its working directory. It returns that thread item.
 
-**Call relations**: Used by the lifecycle-event test to ensure `remove_resolved_prompt` does not remove non-prompt queue entries.
+**Call relations**: The lifecycle-event test uses this helper to queue an “item started” event. That test then confirms that resolving a prompt does not accidentally remove ordinary progress updates.
 
 *Call graph*: calls 1 internal fn (current_dir); 1 external calls (new).
 
@@ -1936,11 +1940,11 @@ fn command_execution(call_id: &str) -> ThreadItem
 fn remove_resolved_prompt_removes_matching_user_input_only()
 ```
 
-**Purpose**: Verifies that removing a resolved user-input request deletes only the matching queued prompt and leaves other queued user-input requests intact.
+**Purpose**: Checks that resolving one user-input request removes only that matching queued prompt. This protects against accidentally deleting unrelated user questions.
 
-**Data flow**: Creates a new manager, queues two user-input fixtures with different call ids, removes one via `ResolvedAppServerRequest::UserInput`, asserts the removal returned true, asserts queue length is now one, and pattern-matches the remaining front entry to confirm its `item_id` is the other call id.
+**Data flow**: The test creates a manager, queues two fake user-input requests with different IDs, then asks the manager to remove the one whose call ID is resolved. It verifies that removal happened, that one item remains, and that the remaining item is the other request.
 
-**Call relations**: Exercises `InterruptManager::remove_resolved_prompt` and `QueuedInterrupt::matches_resolved_prompt` for the user-input variant.
+**Call relations**: This test exercises InterruptManager::new, the user-input helper, the queueing path, and remove_resolved_prompt. It proves the matching logic is precise for tool user-input prompts.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert!, assert_eq!, panic!, user_input).
 
@@ -1951,11 +1955,11 @@ fn remove_resolved_prompt_removes_matching_user_input_only()
 fn remove_resolved_prompt_matches_exec_approval_id()
 ```
 
-**Purpose**: Checks that exec-approval removal matches the effective approval id rather than the raw call id.
+**Purpose**: Checks that execution approvals are removed using the effective approval ID when one exists. This matters because the approval may be identified by a separate approval ID rather than the command’s call ID.
 
-**Data flow**: Creates a manager, queues one exec-approval fixture with `call` and approval id `approval`, attempts removal with resolved id `call` and asserts nothing was removed, then attempts removal with resolved id `approval` and asserts the queue becomes empty.
+**Data flow**: The test creates a manager, queues one fake execution approval with both a call ID and an approval ID, then tries to remove it first using the call ID. That should fail. It then removes it using the approval ID, which should succeed and leave the queue empty.
 
-**Call relations**: Locks in the subtle exec-approval matching rule implemented by `QueuedInterrupt::matches_resolved_prompt`.
+**Call relations**: This test drives InterruptManager::new, the execution-approval helper, and remove_resolved_prompt. It verifies the ID comparison inside QueuedInterrupt::matches_resolved_prompt for execution approvals.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, assert_eq!, exec_approval).
 
@@ -1966,24 +1970,26 @@ fn remove_resolved_prompt_matches_exec_approval_id()
 fn remove_resolved_prompt_keeps_lifecycle_events()
 ```
 
-**Purpose**: Ensures lifecycle events such as `ItemStarted` are never removed by prompt-resolution filtering.
+**Purpose**: Checks that lifecycle updates are not removed when a prompt with a similar ID is resolved. This prevents progress messages from disappearing just because an approval was answered.
 
-**Data flow**: Creates a manager, queues one `ItemStarted` fixture, calls `remove_resolved_prompt` with an unrelated exec-approval resolution, asserts the method returned false, asserts queue length remains one, and confirms the remaining entry is still `ItemStarted`.
+**Data flow**: The test creates a manager, queues an item-started event for a command, then reports an execution approval with the same ID as resolved. It verifies that nothing was removed and that the queued item-started event is still present.
 
-**Call relations**: Protects the invariant that only prompt-bearing queued interrupts participate in resolved-request removal.
+**Call relations**: This test uses InterruptManager::new, the command-execution helper, and remove_resolved_prompt. It confirms the rule in QueuedInterrupt::matches_resolved_prompt that item-started and item-completed events are never treated as resolved prompts.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (assert!, assert_eq!, command_execution).
 
 
 ### `tui/src/chatwidget/notifications.rs`
 
-`util` · `cross-cutting during event handling and redraw/post-render notification flush`
+`domain_logic` · `main loop`
 
-This file gives the chat widget a single pending desktop notification slot rather than posting every event immediately. `ChatWidget::notify` first checks the user’s notification settings against the notification’s type, then compares priorities so a lower-priority event cannot replace a more important pending one. If accepted, the notification is stored in `self.pending_notification` and a redraw is requested; actual delivery is deferred until `maybe_post_pending_notification`, which drains the slot and calls the outer TUI’s notifier.
+This file is the notification helper for the terminal chat screen. Its job is to turn important chat events into short desktop messages, while avoiding spam. Think of it like a receptionist who decides which note is important enough to put on your desk, and waits for the right moment to deliver it.
 
-The `Notification` enum covers five concrete cases: completed agent turns, execution approval requests, edit approval requests, elicitation requests from MCP servers, and Plan-mode prompts. `display` turns each variant into user-facing text. It truncates long command strings, summarizes file edits as either a single displayed path or a file count, and uses a normalized preview of agent responses when possible.
+The main flow starts when `ChatWidget` is told about a possible `Notification`. The widget first checks the user's notification settings. Notifications can be completely on or off, or limited to selected kinds such as completed agent turns or approval requests. If the new notification is allowed, the widget compares it with any notification already waiting to be shown. A higher-priority pending notification is kept, so a routine “agent turn complete” message cannot overwrite an approval request that needs the user's attention.
 
-Two small policy helpers support coalescing and filtering: `type_name` maps variants onto stable configuration keys, intentionally grouping all approval-style prompts under `approval-requested`, and `priority` gives approvals and Plan prompts precedence over passive completion notices. `agent_turn_preview` aggressively normalizes whitespace before truncation so notifications do not contain line breaks or repeated spacing, while `user_input_request_summary` extracts a short summary from the first tool-input question header or body.
+The actual desktop popup is not sent immediately. Instead, the notification is stored as `pending_notification` and the widget asks for a redraw. Later, `maybe_post_pending_notification` takes the stored notification, converts it into friendly text, and sends it through the TUI object.
+
+The `Notification` enum lists the kinds of messages the app can show: agent completion, command approval, edit approval, server/user approval, and plan mode prompts. Helper methods create short display text, classify notification types for settings, set priority, and trim long text so popups stay readable.
 
 #### Function details
 
@@ -1993,11 +1999,11 @@ Two small policy helpers support coalescing and filtering: `type_name` maps vari
 fn notify(&mut self, notification: Notification)
 ```
 
-**Purpose**: Queues a desktop notification if it is allowed by configuration and not superseded by a higher-priority pending notification.
+**Purpose**: This records a notification that may be shown to the user later. It filters out notifications the user has disabled and prevents a less important message from replacing a more important one already waiting.
 
-**Data flow**: It takes a `Notification`, reads `self.config.tui_notifications.notifications`, checks `notification.allowed_for(...)`, compares `existing.priority()` against `notification.priority()` when `self.pending_notification` is already set, and if accepted writes `Some(notification)` into `self.pending_notification` and requests redraw.
+**Data flow**: A `Notification` comes in, along with the widget's current notification settings and any already pending notification. The function checks whether this kind of notification is allowed, compares priorities if another notification is already waiting, and either ignores the new one or stores it as the new pending notification. If it stores one, it asks the chat widget to redraw so the pending work can be processed.
 
-**Call relations**: This is the widget-side enqueue point for desktop notifications. It relies on `Notification::allowed_for` and `Notification::priority` to enforce filtering and coalescing before `ChatWidget::maybe_post_pending_notification` eventually emits the message.
+**Call relations**: This is called when the chat widget learns about an event worth surfacing. It asks `Notification::allowed_for` whether the settings permit the message, and uses `Notification::priority` to decide whether it should replace an existing pending message. The stored result is later picked up by `ChatWidget::maybe_post_pending_notification`.
 
 *Call graph*: calls 2 internal fn (allowed_for, priority).
 
@@ -2008,11 +2014,11 @@ fn notify(&mut self, notification: Notification)
 fn maybe_post_pending_notification(&mut self, tui: &mut crate::tui::Tui)
 ```
 
-**Purpose**: Posts the currently queued notification to the outer TUI and clears it.
+**Purpose**: This sends the waiting notification to the desktop notification system, if one is queued. It is the final delivery step after `ChatWidget::notify` has decided what should be shown.
 
-**Data flow**: It takes `&mut crate::tui::Tui`, removes `self.pending_notification` with `take()`, converts it to display text with `notif.display()`, and passes that string to `tui.notify(...)`. If no notification is pending, it does nothing.
+**Data flow**: The function looks inside the widget for `pending_notification`. If there is none, nothing changes. If there is one, it removes it from the widget, turns it into display text with `Notification::display`, and passes that text to the TUI's notification sender.
 
-**Call relations**: This is the flush side of the notification pipeline. It is called later than `ChatWidget::notify`, after the widget has had a chance to coalesce multiple events into one pending notification.
+**Call relations**: This runs later in the UI flow, after `ChatWidget::notify` has queued a notification and requested a redraw. It hands the finished message to `tui.notify`, which is outside this file and is responsible for the actual desktop popup.
 
 *Call graph*: 1 external calls (notify).
 
@@ -2023,11 +2029,11 @@ fn maybe_post_pending_notification(&mut self, tui: &mut crate::tui::Tui)
 fn display(&self) -> String
 ```
 
-**Purpose**: Formats each notification variant into the exact desktop-notification string shown to the user.
+**Purpose**: This turns an internal notification into the short human-readable message that appears in a desktop popup. It keeps messages concise by using previews and truncating long commands or titles.
 
-**Data flow**: It matches on `self`. For `AgentTurnComplete` it calls `agent_turn_preview` and falls back to `Agent turn complete`; for command approvals it truncates the command; for edit approvals it formats either one displayed path relative to `cwd` or an `N files` summary; for elicitation and Plan prompts it interpolates the server name or title. It returns the final `String` without mutating state.
+**Data flow**: The function receives a `Notification` value. It looks at which kind it is, pulls out the useful details, and builds a string: a preview of the agent's response, a shortened command, a path or file count for edits, a server approval message, or a plan mode prompt title. The result is plain text ready to show to the user.
 
-**Call relations**: This formatter is used by `ChatWidget::maybe_post_pending_notification` right before the notification is handed to the TUI backend.
+**Call relations**: This is used by `ChatWidget::maybe_post_pending_notification` when a queued notification is finally delivered. For agent completion messages, it delegates to `Notification::agent_turn_preview` so long or messy responses become a clean one-line preview.
 
 *Call graph*: calls 1 internal fn (agent_turn_preview); 1 external calls (format!).
 
@@ -2038,11 +2044,11 @@ fn display(&self) -> String
 fn type_name(&self) -> &str
 ```
 
-**Purpose**: Maps a notification variant to the stable configuration category string used by custom notification settings.
+**Purpose**: This gives each notification a stable text label used by notification settings. It lets user configuration refer to categories such as `agent-turn-complete` or `approval-requested` without caring about the exact internal enum variant.
 
-**Data flow**: It matches on `self` and returns a `&str`: `agent-turn-complete`, `approval-requested`, or `plan-mode-prompt`. Multiple approval-like variants intentionally share the same category.
+**Data flow**: The function receives a notification and returns a short string name for its category. Several approval-related variants share the same returned name, because the settings treat them as one kind of alert.
 
-**Call relations**: This helper feeds `Notification::allowed_for`, which compares the returned category against the user’s configured allowlist.
+**Call relations**: This is used inside `Notification::allowed_for`. When custom notification settings list allowed categories, `allowed_for` compares those setting strings against the value returned here.
 
 
 ##### `Notification::priority`  (lines 78–86)
@@ -2051,11 +2057,11 @@ fn type_name(&self) -> &str
 fn priority(&self) -> u8
 ```
 
-**Purpose**: Assigns a numeric priority used to decide whether a new notification may replace an already pending one.
+**Purpose**: This assigns a simple importance level to each notification. Agent completion is lower priority, while approvals and plan prompts are higher priority because they may require the user's action.
 
-**Data flow**: It matches on `self` and returns `0` for `AgentTurnComplete` and `1` for all approval-style and Plan-mode prompt notifications. It reads no external state.
+**Data flow**: The function receives a notification and returns a small number representing its importance. Agent turn completion returns `0`; approval requests and plan mode prompts return `1`.
 
-**Call relations**: This function is consulted by `ChatWidget::notify` when a pending notification already exists; higher-priority pending notifications block replacement by lower-priority ones.
+**Call relations**: This is called by `ChatWidget::notify` when a new notification arrives and another one is already pending. The priority value decides whether the new notification can replace the old one or should be ignored.
 
 *Call graph*: called by 1 (notify).
 
@@ -2066,11 +2072,11 @@ fn priority(&self) -> u8
 fn allowed_for(&self, settings: &Notifications) -> bool
 ```
 
-**Purpose**: Checks whether a notification type is enabled under the current notification settings.
+**Purpose**: This checks whether the user's settings permit this notification to be shown. It supports both a simple on/off setting and a custom allow-list of notification categories.
 
-**Data flow**: It takes a `&Notifications` setting. For `Notifications::Enabled(enabled)` it returns that boolean directly; for `Notifications::Custom(allowed)` it returns whether any configured string equals `self.type_name()`.
+**Data flow**: The function receives a notification and the current notification settings. If settings are simply enabled or disabled, it returns that boolean value. If settings are custom, it gets the notification's category name and returns true only if that category appears in the allowed list.
 
-**Call relations**: This policy check is used by `ChatWidget::notify` before a notification is queued.
+**Call relations**: This is called by `ChatWidget::notify` before a notification is queued. It relies on `Notification::type_name` to translate the notification into the same category names used by the settings.
 
 *Call graph*: called by 1 (notify).
 
@@ -2081,11 +2087,11 @@ fn allowed_for(&self, settings: &Notifications) -> bool
 fn agent_turn_preview(response: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes an agent response into a single-line preview suitable for a desktop notification, or returns `None` if the response is effectively empty.
+**Purpose**: This creates a clean, short preview of the agent's final response for a desktop notification. It removes extra whitespace and avoids showing an empty popup if the response has no visible text.
 
-**Data flow**: It takes a response string slice, splits on whitespace, rebuilds a normalized string with single spaces, trims it, and returns `None` if empty; otherwise it truncates the normalized text to `AGENT_NOTIFICATION_PREVIEW_GRAPHEMES` and returns `Some(String)`.
+**Data flow**: The function receives the agent's response text. It splits the text into words, joins them back with single spaces, trims the result, and returns nothing if the result is empty. Otherwise, it returns the cleaned text shortened to the notification preview limit.
 
-**Call relations**: This helper is used by `Notification::display` for `AgentTurnComplete` and elsewhere in task-completion handling to derive concise previews from full responses.
+**Call relations**: This is used by `Notification::display` when building an `AgentTurnComplete` message. It is also called from `on_task_complete`, so task completion can create a suitable summary before a notification is shown.
 
 *Call graph*: called by 2 (display, on_task_complete); 1 external calls (new).
 
@@ -2098,24 +2104,26 @@ fn user_input_request_summary(
     ) -> Option<String>
 ```
 
-**Purpose**: Extracts a short summary line from the first tool user-input question for use in notifications or prompts.
+**Purpose**: This creates a short summary for a request that asks the user for input. It chooses the first question's header if available, otherwise the question text, and trims it for display.
 
-**Data flow**: It takes a slice of `ToolRequestUserInputQuestion`, reads the first element if present, prefers its trimmed `header` when non-empty and otherwise its trimmed `question`, returns `None` if the chosen text is empty, and otherwise truncates it to 30 graphemes.
+**Data flow**: The function receives a list of user-input questions. It looks at the first question only. If that question has a non-empty header, the header becomes the summary; otherwise the question text is used. If the chosen text is empty, it returns nothing; otherwise it returns a shortened version.
 
-**Call relations**: This helper is used when the widget needs a concise summary of a user-input request, notably in the request-user-input handling path.
+**Call relations**: This is called by `handle_request_user_input_now` when the app needs to summarize a user-input request. It does not send a notification itself; it prepares the concise text that other chat-widget code can use in that flow.
 
 *Call graph*: called by 1 (handle_request_user_input_now); 1 external calls (first).
 
 
 ### `tui/src/chatwidget/rendering.rs`
 
-`orchestration` · `main loop`
+`domain_logic` · `main loop rendering`
 
-This file defines how the chat widget becomes a `Renderable`. `ChatWidget::as_renderable` builds a `FlexRenderable` stack representing the visible surface. It first computes the right-column reserve needed for the ambient pet/composer area, then wraps the active transcript cell, active hook cell, pending token-activity output, and pending rate-limit reset hint in `TranscriptAreaRenderable` adapters that apply a top inset and right-side width reservation. The bottom pane is wrapped separately in `BottomPaneComposerReserveRenderable`, then inset by one row at the top so it sits beneath transcript content.
+The chat screen is made from several pieces: the conversation transcript, a possible active “hook” message, optional temporary messages such as token activity or rate-limit hints, and the bottom input pane where the user types. This file is the layout recipe that stacks those pieces into one renderable surface.
 
-`BottomPaneComposerReserveRenderable` is a thin adapter that forwards rendering, desired-height, cursor position, and cursor style queries to `BottomPane` methods that understand the reserved right margin. `TranscriptAreaRenderable` is more involved: it computes a child area by subtracting top and right insets, asks the `HistoryCell` for display lines at the available width, constructs a wrapped `Paragraph`, and scrolls vertically so the bottom of overflowing content remains visible. It clears the target area before rendering and computes desired height as the child’s desired height plus the top inset.
+The main idea is similar to arranging panels in a window. `ChatWidget::as_renderable` builds a vertical flexible layout. The main transcript gets room to grow, temporary cells can be added when they exist, and the bottom pane stays at the bottom. Some columns on the right may be reserved, so transcript text and the composer do not draw underneath another UI element.
 
-Finally, `ChatWidget` implements `Renderable` by delegating all four trait methods to a freshly built render tree from `as_renderable`. The `render` method additionally records the last rendered width in `last_rendered_width`, which other layout-sensitive behavior can consult later.
+Two small wrapper renderables make the parts fit this shared layout. `TranscriptAreaRenderable` draws a history cell with a top margin and right-side reserve, and scrolls to the bottom if the text is taller than the available space. `BottomPaneComposerReserveRenderable` forwards drawing, height, and cursor questions to the bottom pane while applying the same right-side reserve.
+
+Finally, `ChatWidget` itself implements the common `Renderable` interface, so the rest of the terminal UI can ask it to draw, report its desired height, and say where and how the cursor should appear.
 
 #### Function details
 
@@ -2125,11 +2133,11 @@ Finally, `ChatWidget` implements `Renderable` by delegating all four trait metho
 fn as_renderable(&self) -> RenderableItem<'_>
 ```
 
-**Purpose**: Builds the composite render tree for the chat surface, stacking transcript content, hook output, transient notices, and the bottom pane with consistent right-margin reservation. It is the single source of layout composition for the widget.
+**Purpose**: Builds a single drawable layout for the whole chat widget. It gathers the currently visible chat pieces and arranges them in the order they should appear on screen.
 
-**Data flow**: It reads `self.transcript.active_cell`, `self.active_hook_cell`, `pending_token_activity_output()`, `pending_rate_limit_reset_hint()`, `self.bottom_pane`, and `ambient_pet_wrap_reserved_cols()`. It wraps present cells in `TranscriptAreaRenderable`, pushes them into a `FlexRenderable` with chosen flex weights, wraps the bottom pane in `BottomPaneComposerReserveRenderable` plus an inset, and returns the whole structure as a `RenderableItem<'_>`.
+**Data flow**: It reads the widget’s transcript, optional active hook cell, optional pending token activity message, optional rate-limit hint, bottom pane, and the number of right-side columns that must be kept clear. From those inputs it creates a vertical flexible layout, wrapping transcript-like items so they get the right padding and top spacing. It returns that layout as one renderable object that other code can draw or query.
 
-**Call relations**: All `Renderable` trait methods on `ChatWidget` call this function so rendering, sizing, and cursor queries share the same composed layout.
+**Call relations**: The public rendering methods on `ChatWidget` all call this first, so there is one shared layout recipe for drawing, height calculation, cursor position, and cursor style. It creates the flex container and wraps child pieces so the later render step can treat the whole chat widget as one item.
 
 *Call graph*: calls 2 internal fn (tlbr, new); called by 4 (cursor_pos, cursor_style, desired_height, render); 2 external calls (new, Owned).
 
@@ -2140,11 +2148,11 @@ fn as_renderable(&self) -> RenderableItem<'_>
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the bottom pane while honoring the reserved composer-right margin. It is a direct adapter over the bottom pane’s specialized render method.
+**Purpose**: Draws the bottom input pane while keeping a reserved space on the right side. This prevents the composer from painting into space needed by another UI element.
 
-**Data flow**: It takes `&self`, a `Rect`, and a mutable `Buffer`, then forwards them plus `self.right_reserve` to `bottom_pane.render_with_composer_right_reserve`. It returns unit.
+**Data flow**: It receives a screen rectangle and a mutable terminal buffer. It passes those, plus the stored right-side reserve width, to the bottom pane’s specialized drawing method. The buffer is changed to contain the bottom pane’s visible text and decorations.
 
-**Call relations**: This method is used when the composite render tree built by `ChatWidget::as_renderable` renders the bottom-pane segment.
+**Call relations**: This wrapper is inserted by `ChatWidget::as_renderable` into the overall chat layout. When the layout reaches the bottom pane during drawing, this method hands the actual drawing work to the bottom pane with the reserve value included.
 
 *Call graph*: calls 1 internal fn (render_with_composer_right_reserve).
 
@@ -2155,11 +2163,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports the bottom pane’s desired height under the same right-margin reservation used for rendering. This keeps layout measurement consistent with actual drawing.
+**Purpose**: Asks how tall the bottom input pane wants to be when some right-side space is unavailable. This helps the layout reserve enough vertical room for the composer.
 
-**Data flow**: It takes `&self` and `width: u16`, forwards both plus `self.right_reserve` to `bottom_pane.desired_height_with_composer_right_reserve`, and returns the resulting height.
+**Data flow**: It receives the available width. It combines that width with the stored right-side reserve and asks the bottom pane to calculate its preferred height under those conditions. It returns that height.
 
-**Call relations**: The composite layout uses this through the render tree returned by `ChatWidget::as_renderable` during height calculation.
+**Call relations**: After `ChatWidget::as_renderable` includes this wrapper in the flex layout, the layout system calls this when deciding how much vertical space the bottom pane needs before drawing.
 
 *Call graph*: calls 1 internal fn (desired_height_with_composer_right_reserve).
 
@@ -2170,11 +2178,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Computes the cursor position for the bottom pane with the reserved right margin applied. It preserves correct cursor placement when the composer shares horizontal space.
+**Purpose**: Finds where the text cursor should appear inside the bottom pane, taking the right-side reserve into account. This is what lets the terminal cursor line up with the user’s typing area.
 
-**Data flow**: It takes `&self` and an `area: Rect`, forwards them plus `self.right_reserve` to `bottom_pane.cursor_pos_with_composer_right_reserve`, and returns the optional `(x, y)` cursor position.
+**Data flow**: It receives the screen rectangle assigned to the bottom pane. It passes that rectangle and the reserve width to the bottom pane, which returns either a cursor coordinate or nothing if no cursor should be shown there.
 
-**Call relations**: This adapter participates in cursor queries initiated through `ChatWidget`’s `Renderable` implementation.
+**Call relations**: When the surrounding UI asks the chat widget for the cursor location, the request flows through the renderable layout built by `ChatWidget::as_renderable`. If the bottom pane owns the cursor, this wrapper delegates the answer to the bottom pane.
 
 *Call graph*: calls 1 internal fn (cursor_pos_with_composer_right_reserve).
 
@@ -2185,11 +2193,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle
 ```
 
-**Purpose**: Returns the cursor style the bottom pane wants under the reserved-right layout. It is a direct forwarding adapter.
+**Purpose**: Asks the bottom pane what the terminal cursor should look like, while using the same reserved-right-space rules as drawing. Cursor style means things like a block cursor or a bar cursor.
 
-**Data flow**: It takes `&self` and an `area: Rect`, forwards them plus `self.right_reserve` to `bottom_pane.cursor_style_with_composer_right_reserve`, and returns the resulting `SetCursorStyle`.
+**Data flow**: It receives the bottom pane’s screen rectangle. It sends that rectangle and the right-side reserve to the bottom pane’s cursor-style method, then returns the style chosen by the bottom pane.
 
-**Call relations**: Like `cursor_pos`, this is used through the composite render tree assembled by `ChatWidget::as_renderable`.
+**Call relations**: The chat widget’s cursor-style query goes through the composed renderable layout. This wrapper keeps the bottom pane’s answer consistent with the space it was actually given for rendering.
 
 *Call graph*: calls 1 internal fn (cursor_style_with_composer_right_reserve).
 
@@ -2200,11 +2208,11 @@ fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a single `HistoryCell` into a transcript sub-area with top/right insets and bottom-aligned vertical scrolling for overflow. It ensures the newest lines remain visible when content exceeds the available height.
+**Purpose**: Draws one transcript-style cell inside its allotted area. If the cell has more lines than fit, it shows the bottom portion, which is usually the newest and most relevant part.
 
-**Data flow**: It takes `&self`, an `area: Rect`, and a mutable `Buffer`. It computes the child area via `child_area`, asks the `HistoryCell` for `display_lines(area.width)`, wraps them in a `Paragraph`, computes overflow by comparing `line_count` to available height, converts that overflow to a scroll offset, clears the area, and renders the paragraph scrolled by `(y, 0)`.
+**Data flow**: It starts with the screen rectangle assigned by the layout and the terminal buffer to draw into. It first shrinks the rectangle using `child_area`, leaving the requested top gap and right-side reserve. It asks the history cell for display lines at that width, turns those lines into a paragraph, computes how far to scroll if the paragraph is too tall, clears the target area, and draws the paragraph into the buffer.
 
-**Call relations**: Instances of this adapter are created by `ChatWidget::as_renderable` for active transcript cells, hook cells, and transient notice cells.
+**Call relations**: This renderable is created by `ChatWidget::as_renderable` for active transcript cells and temporary transcript-like messages. During the draw pass, it uses `child_area` to apply spacing before handing text to the terminal paragraph renderer.
 
 *Call graph*: calls 1 internal fn (child_area); 5 external calls (new, from, display_lines, try_from, from).
 
@@ -2215,11 +2223,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the total height needed for a transcript child including its top inset and reduced width from right reservation. It delegates the content-specific sizing to the `HistoryCell`.
+**Purpose**: Reports how much vertical space a transcript cell would like. It includes both the cell’s own text height and the extra top spacing used by this wrapper.
 
-**Data flow**: It takes `&self` and `width: u16`, computes `child_width = width.saturating_sub(self.right).max(1)`, asks `HistoryCell::desired_height(self.child, child_width)`, adds `self.top`, and returns the sum.
+**Data flow**: It receives the available width, subtracts the right-side reserve without going below one column, and asks the history cell how tall it wants to be at that usable width. It adds the top margin and returns the total.
 
-**Call relations**: This sizing method is used by the composite layout built in `ChatWidget::as_renderable`.
+**Call relations**: The flexible layout asks this before drawing so it can divide the chat area sensibly. Because `ChatWidget::as_renderable` wraps transcript cells in this type, transcript height calculations match the same padding used during rendering.
 
 *Call graph*: calls 1 internal fn (desired_height).
 
@@ -2230,11 +2238,11 @@ fn desired_height(&self, width: u16) -> u16
 fn child_area(&self, area: Rect) -> Rect
 ```
 
-**Purpose**: Derives the inner rectangle available to the wrapped transcript child after applying top and right reservations. It guarantees a minimum width of one column.
+**Purpose**: Calculates the exact rectangle where a transcript cell’s text should be drawn. It applies the wrapper’s top spacing and right-side reserve.
 
-**Data flow**: It takes `&self` and an outer `Rect`, computes a y-offset by adding `self.top`, reduces height by the same amount, subtracts `self.right` from width with saturation and `max(1)`, constructs a new `Rect`, and returns it.
+**Data flow**: It receives the larger rectangle assigned to the transcript wrapper. It moves the top edge down by the configured amount, reduces the height by that same amount, and reduces the width by the right-side reserve while keeping at least one column. It returns the smaller rectangle for the child content.
 
-**Call relations**: This helper is called by `TranscriptAreaRenderable::render` before line generation and paragraph rendering.
+**Call relations**: This is a helper used by `TranscriptAreaRenderable::render`. It keeps the rectangle math in one place so rendering can focus on turning the history cell’s lines into terminal output.
 
 *Call graph*: called by 1 (render); 1 external calls (new).
 
@@ -2245,11 +2253,11 @@ fn child_area(&self, area: Rect) -> Rect
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the full chat widget using the composed render tree and records the width that was last drawn. The width cache supports later layout-sensitive behavior elsewhere in the widget.
+**Purpose**: Draws the entire chat widget into the terminal buffer. It also remembers the width it was last drawn at, which other parts of the widget can use later.
 
-**Data flow**: It takes `&self`, an `area: Rect`, and a mutable `Buffer`, calls `self.as_renderable().render(area, buf)`, then writes `Some(area.width as usize)` into `self.last_rendered_width`. It returns unit.
+**Data flow**: It receives the screen area for the chat widget and the mutable terminal buffer. It builds the current renderable layout with `as_renderable`, asks that layout to draw into the buffer, then stores the area width as the last rendered width.
 
-**Call relations**: This is the `Renderable` trait entrypoint for drawing the widget and delegates actual composition to `ChatWidget::as_renderable`.
+**Call relations**: This is the main draw entry for the chat widget through the shared `Renderable` interface. It relies on `ChatWidget::as_renderable` so drawing uses the same layout recipe as height and cursor queries.
 
 *Call graph*: calls 1 internal fn (as_renderable).
 
@@ -2260,11 +2268,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports the widget’s desired height by delegating to the composed render tree. It keeps sizing logic centralized in `as_renderable`.
+**Purpose**: Reports how tall the chat widget would like to be for a given width. The surrounding terminal layout uses this to decide how much space to give it.
 
-**Data flow**: It takes `&self` and `width: u16`, calls `self.as_renderable().desired_height(width)`, and returns the resulting height.
+**Data flow**: It receives an available width. It builds the current renderable layout with `as_renderable`, asks that layout for its desired height at that width, and returns the result.
 
-**Call relations**: This trait method relies entirely on `ChatWidget::as_renderable` so measurement matches rendering.
+**Call relations**: This method is part of the chat widget’s `Renderable` interface. By going through `as_renderable`, it keeps size planning consistent with the actual pieces that will be drawn.
 
 *Call graph*: calls 1 internal fn (as_renderable).
 
@@ -2275,11 +2283,11 @@ fn desired_height(&self, width: u16) -> u16
 fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 ```
 
-**Purpose**: Returns the cursor position for the current composed chat surface. It delegates to the same render tree used for drawing.
+**Purpose**: Finds the terminal cursor position for the chat widget, usually so the cursor appears in the input area where the user is typing.
 
-**Data flow**: It takes `&self` and an `area: Rect`, calls `self.as_renderable().cursor_pos(area)`, and returns the optional cursor coordinates.
+**Data flow**: It receives the rectangle occupied by the chat widget. It builds the current renderable layout with `as_renderable`, asks that layout where the cursor should be, and returns either a coordinate or no cursor position.
 
-**Call relations**: This trait method shares layout logic with rendering through `ChatWidget::as_renderable`.
+**Call relations**: The larger UI calls this after or around rendering when it needs to place the terminal cursor. The request flows through the same composed layout, which lets the bottom pane answer when it owns the cursor.
 
 *Call graph*: calls 1 internal fn (as_renderable).
 
@@ -2290,11 +2298,11 @@ fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>
 fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle
 ```
 
-**Purpose**: Returns the cursor style for the current composed chat surface. It delegates to the render tree so style follows whichever child currently owns the cursor.
+**Purpose**: Chooses the visual style of the terminal cursor for the chat widget. This keeps the cursor appearance aligned with the active input state.
 
-**Data flow**: It takes `&self` and an `area: Rect`, calls `self.as_renderable().cursor_style(area)`, and returns the resulting cursor style.
+**Data flow**: It receives the chat widget’s screen rectangle. It builds the current renderable layout with `as_renderable`, asks that layout for the cursor style, and returns the chosen terminal cursor style.
 
-**Call relations**: This is the final `Renderable` trait adapter over `ChatWidget::as_renderable`.
+**Call relations**: The surrounding terminal UI calls this when it needs to set the cursor appearance. Like drawing and cursor positioning, it goes through `as_renderable` so the answer comes from the same current layout.
 
 *Call graph*: calls 1 internal fn (as_renderable).
 
@@ -2304,11 +2312,15 @@ Covers user interaction handling from keyboard/composer actions through queued i
 
 ### `tui/src/chatwidget/input_queue.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `main loop / chat turn handling`
 
-This file is the data-centric half of chat input queueing. `InputQueueState` groups all mutable queues that represent deferred user intent: `queued_user_messages` for ordinary follow-ups, `rejected_steers_queue` for steer messages that must be retried before regular queued input, `pending_steers` for steers already sent to core but not yet committed into history, and booleans controlling pending-start and autosend behavior. Two parallel `VecDeque<UserMessageHistoryRecord>` fields intentionally mirror the queued and rejected message deques because slash-command submissions can render different history text than the payload sent to core; missing history entries are treated as plain user-message text by consumers.
+In a chat interface, a user can type more input while the system is still working on the previous turn. This file is the waiting room for that input. Without it, follow-up messages could be lost, sent at the wrong time, or shown incorrectly in the UI.
 
-The behavior here is deliberately reducer-like. `has_queued_follow_up_messages` collapses the two deferred-message categories into one predicate. `clear` resets every queue and all interrupt-related flags except `suppress_queue_autosend`, which is notably preserved because autosend suppression is a separate policy toggle rather than transient queue content. `preview` converts the three queue categories into display strings while keeping them separate, using `user_message_preview_text` and index-based lookup into the parallel history-record deques. The tests lock in two important invariants: preview output must not merge categories, and `clear` must fully empty all queue-like state and reset pending-turn / pending-steer restoration flags.
+The central type is `InputQueueState`, a small state bag used by `ChatWidget`. It stores several queues. One queue holds normal user messages waiting for the current turn to finish. Another holds “rejected steers”: messages that tried to guide, or steer, a turn that was not in the right state to accept them. A third queue holds “pending steers” that have already been sent to the core system but are not yet safely recorded in chat history.
+
+The file also keeps matching history records beside some queues. This matters because what the user sees in history can differ from the exact text sent internally. For example, a slash command such as `/goal` may be displayed in a friendlier form. Think of it like keeping both the kitchen ticket and the customer-facing receipt.
+
+The methods here answer simple questions, reset the queues, and build a preview of pending input so the UI can show what is waiting without mixing the categories together.
 
 #### Function details
 
@@ -2318,11 +2330,11 @@ The behavior here is deliberately reducer-like. `has_queued_follow_up_messages` 
 fn has_queued_follow_up_messages(&self) -> bool
 ```
 
-**Purpose**: Reports whether there is any deferred user input waiting outside the pending-steer list. It treats rejected steers and ordinary queued messages as the two follow-up categories.
+**Purpose**: This function answers whether there is any user input waiting to be sent after the current work finishes. It looks at both normal queued messages and rejected steering messages, because either one means there is follow-up input still pending.
 
-**Data flow**: Reads `self.rejected_steers_queue.is_empty()` and `self.queued_user_messages.is_empty()`, negates the emptiness checks, and returns true if either deque contains entries.
+**Data flow**: It starts with the current `InputQueueState`. It checks whether the rejected-steer queue and the normal-message queue are empty. It returns `true` if at least one of those queues has something in it, and `false` only when both are empty.
 
-**Call relations**: Used by higher-level chat-widget logic when deciding whether queued drafts exist, including interrupt restore and queued-message editing flows.
+**Call relations**: Other chat-widget code can call this when deciding whether there is more user input to send next. Internally it only asks the queues whether they are empty; it does not move or change any messages.
 
 *Call graph*: 1 external calls (is_empty).
 
@@ -2333,11 +2345,11 @@ fn has_queued_follow_up_messages(&self) -> bool
 fn clear(&mut self)
 ```
 
-**Purpose**: Resets the queue state to an empty baseline after thread restoration or teardown-like transitions. It clears all queued/pending message collections and transient restoration flags.
+**Purpose**: This function wipes all pending input state and resets the related flags. It is used when the chat widget needs to forget queued work, such as after a reset or cleanup.
 
-**Data flow**: Calls `clear()` on `queued_user_messages`, `queued_user_message_history_records`, `rejected_steers_queue`, `rejected_steer_history_records`, and `pending_steers`; sets `user_turn_pending_start` and `submit_pending_steers_after_interrupt` to `false`. It returns no value.
+**Data flow**: It takes the existing mutable `InputQueueState`, empties every queue of messages, history records, rejected steers, and pending steers, then sets the pending-start and retry-after-interrupt flags back to `false`. Afterward, the input queue state is back to a clean empty condition.
 
-**Call relations**: Called from thread-input restoration when no saved state exists. The tests verify that it fully empties queue content and resets the associated booleans.
+**Call relations**: Chat-widget flow calls this when queued input should no longer survive. It hands off only to the standard queue-clearing operation for each stored list, and it does not produce a separate return value because it changes the state directly.
 
 *Call graph*: 1 external calls (clear).
 
@@ -2348,11 +2360,11 @@ fn clear(&mut self)
 fn preview(&self) -> PendingInputPreview
 ```
 
-**Purpose**: Builds a UI-friendly snapshot of queued input text grouped into queued messages, pending steers, and rejected steers. It preserves category boundaries instead of flattening everything into one list.
+**Purpose**: This function builds a user-facing snapshot of everything currently waiting in the input queues. It keeps normal queued messages, pending steers, and rejected steers separate so the UI can show them clearly.
 
-**Data flow**: Iterates over `queued_user_messages` with indices and maps each entry plus the optional parallel history record to `user_message_preview_text`. It separately maps `pending_steers` using each steer's embedded `history_record`, and maps `rejected_steers_queue` with indexed lookup into `rejected_steer_history_records`. It returns a `PendingInputPreview` containing the three collected `Vec<String>` lists.
+**Data flow**: It reads the current queues from `InputQueueState`. For each normal queued message, it pairs the message with its matching history record if one exists, then turns it into preview text. It does the same for pending steers, using their stored history records, and for rejected steers, using their matching rejected-steer history records. It returns a `PendingInputPreview` containing three lists of strings.
 
-**Call relations**: Consumed by `ChatWidget::refresh_pending_input_preview` to update the bottom-pane preview after queue mutations.
+**Call relations**: The chat UI can call this when it needs to display what is waiting to be sent or committed. This function relies on `user_message_preview_text` to turn each internal message plus optional history information into the text a person should see.
 
 *Call graph*: 1 external calls (iter).
 
@@ -2363,11 +2375,11 @@ fn preview(&self) -> PendingInputPreview
 fn preview_keeps_queue_categories_separate()
 ```
 
-**Purpose**: Verifies that `preview()` reports queued messages, pending steers, and rejected steers in distinct output vectors rather than merging or reordering them.
+**Purpose**: This test proves that `preview` does not blend different kinds of pending input together. A normal queued message, a pending steer, and a rejected steer should each appear in their own preview list.
 
-**Data flow**: Creates a default `InputQueueState`, pushes one sample message into each queue category, calls `state.preview()`, and asserts equality with an explicit `PendingInputPreview` containing one string in each corresponding field.
+**Data flow**: The test creates an empty `InputQueueState`, adds one message to each relevant category, then calls `preview`. It compares the returned `PendingInputPreview` with the expected three separate lists: queued, pending, and rejected.
 
-**Call relations**: This test exercises the preview-building logic directly and protects the UI contract relied on by the pending-input preview.
+**Call relations**: This test calls `InputQueueState::preview` in a controlled setup. It protects the behavior that the rest of the chat UI depends on when showing pending input to the user.
 
 *Call graph*: calls 1 internal fn (from); 2 external calls (assert_eq!, default).
 
@@ -2378,24 +2390,24 @@ fn preview_keeps_queue_categories_separate()
 fn clear_resets_all_input_queues()
 ```
 
-**Purpose**: Checks that `clear()` empties every queue and resets the pending-turn and pending-steer restoration flags.
+**Purpose**: This test checks that `clear` really resets the input queue state, not just part of it. It makes sure messages and important flags are all removed or turned off.
 
-**Data flow**: Builds a non-empty `InputQueueState`, sets `user_turn_pending_start` and `submit_pending_steers_after_interrupt` true, invokes `state.clear()`, and asserts that all deques are empty and both booleans are false.
+**Data flow**: The test creates an `InputQueueState`, adds queued and rejected messages, and turns on two boolean flags. It then calls `clear` and checks that all queues are empty and the flags are back to `false`.
 
-**Call relations**: This test locks in the reset semantics used by thread-state restoration when discarding prior input state.
+**Call relations**: This test calls `InputQueueState::clear` and verifies the cleanup contract used by the chat widget. It helps catch future changes that might accidentally leave stale pending input behind.
 
 *Call graph*: calls 1 internal fn (from); 2 external calls (assert!, default).
 
 
 ### `tui/src/chatwidget/input_restore.rs`
 
-`domain_logic` · `interrupt handling`
+`domain_logic` · `chat turn interruption, input queue processing, and thread state restore`
 
-This module covers the recovery side of chat input. One cluster of methods manages `cancel_edit`: after a visible user message is submitted, `record_cancel_edit_candidate` stores it as a possible restoration target; later UI activity can disqualify it, and `arm_cancel_edit` only arms restoration when the composer is empty, there are no pending or queued follow-ups, and no side conversation is active. `take_armed_cancel_edit_prompt` then restores that prompt only for `TurnAbortReason::Interrupted`.
+This part of `ChatWidget` is like the chat screen’s lost-and-found desk. In this app, a user can type a message while another turn is running, queue follow-up messages, add images, paste larger content, or send “steer” instructions that guide the active model turn. If the turn is interrupted, if the server rejects a steer, or if the user switches away and comes back, those pieces of input need to be put somewhere safe and then restored in a sensible order.
 
-The queue-restore path is more involved. `pop_next_queued_user_message` gives queue draining a priority rule: if any rejected steers exist, they are drained and merged into one `QueuedUserMessage` with a merged history record before ordinary queued messages are considered. `pop_latest_queued_composer_state` supports “edit queued message” by pulling the newest queued or rejected item back into a `ThreadComposerState`. `enqueue_rejected_steer` moves the oldest pending steer into the rejected queue when core reports the active turn was not steerable.
+The file mainly does three jobs. First, it tracks whether an interrupted turn should restore the prompt that was being edited, especially for a cancel-edit flow. Second, it moves messages between several waiting areas: pending steers, rejected steers, queued user messages, and the visible composer where the user types. Third, it can take a snapshot of all thread input state and later rebuild it.
 
-`on_interrupted_turn` finalizes the turn, emits either an interruption notice or a steer-submission notice, then either immediately resubmits merged pending steers or restores all pending content into the composer. `drain_pending_messages_for_restore` is the key merger: it drains rejected steers, pending steers, queued messages, and the current composer draft; converts history-aware representations back into editable `UserMessage`s; remaps colliding paste placeholders with a shared `HashSet`; merges messages in stable order; and returns a single `ThreadComposerState`. The file also snapshots and restores full `ThreadInputState`, carefully resizing parallel history-record vectors and reconstructing missing `PendingSteerCompareKey` values when older snapshots lack them.
+A subtle but important detail is attachment and paste restoration. Several messages may each refer to images or pasted blocks using placeholders. When messages are merged back into one draft after an interrupt, this file renumbers or remaps those placeholders so the text still points to the right attachment. Without this file, interruptions and thread switches could lose drafts, submit text at the wrong time, or restore a message with broken image and paste references.
 
 #### Function details
 
@@ -2405,11 +2417,11 @@ The queue-restore path is more involved. `pop_next_queued_user_message` gives qu
 fn record_cancel_edit_candidate(&mut self, prompt: UserMessage)
 ```
 
-**Purpose**: Stores the just-submitted prompt as the candidate to restore if the turn is later interrupted before meaningful visible activity occurs.
+**Purpose**: Marks a user prompt as something that may be restored if the current edit is cancelled. This is used to make cancel/edit behavior feel reversible instead of losing the prompt.
 
-**Data flow**: Takes a `UserMessage` and writes it into `self.cancel_edit.prompt = Some(prompt)`, sets `eligible = true`, and clears `armed = false`.
+**Data flow**: A `UserMessage` comes in. The function stores it in the widget’s cancel-edit state, marks that state as eligible, and leaves it unarmed for now. Nothing is returned; the widget’s internal state is updated.
 
-**Call relations**: Called after successful user-message submission in the normal render-in-history path so later interrupt handling can optionally restore that prompt.
+**Call relations**: This is an early setup step for the cancel-edit path. Later, `ChatWidget::arm_cancel_edit` decides whether the saved prompt is safe to restore, and `ChatWidget::on_interrupted_turn` may recover it through `ChatWidget::take_armed_cancel_edit_prompt`.
 
 
 ##### `ChatWidget::record_visible_turn_activity`  (lines 15–18)
@@ -2418,11 +2430,11 @@ fn record_cancel_edit_candidate(&mut self, prompt: UserMessage)
 fn record_visible_turn_activity(&mut self)
 ```
 
-**Purpose**: Disqualifies cancel-edit restoration once the turn has produced visible activity. After this point an interrupt should not silently restore the original prompt as if nothing happened.
+**Purpose**: Marks that visible activity happened during the turn, so the saved cancel-edit prompt should no longer be treated as cleanly restorable. This prevents the interface from restoring stale input after the conversation has visibly moved on.
 
-**Data flow**: Mutates `self.cancel_edit.eligible` and `self.cancel_edit.armed` to `false`. It leaves any stored prompt in place.
+**Data flow**: No outside data is passed in. The function changes two cancel-edit flags, making the prompt ineligible and disarmed. It returns nothing.
 
-**Call relations**: Used by turn-lifecycle code outside this file when visible output arrives, narrowing the conditions under which `on_interrupted_turn` may restore a cancelled prompt.
+**Call relations**: Other ChatWidget code calls this when the active turn has produced visible activity. It blocks the later cancel-edit restore path that would otherwise be checked by `ChatWidget::arm_cancel_edit` and `ChatWidget::take_armed_cancel_edit_prompt`.
 
 
 ##### `ChatWidget::arm_cancel_edit`  (lines 20–27)
@@ -2431,11 +2443,11 @@ fn record_visible_turn_activity(&mut self)
 fn arm_cancel_edit(&mut self)
 ```
 
-**Purpose**: Arms prompt restoration for a future interrupt only when the UI is in a clean state with no competing draft or queued input.
+**Purpose**: Decides whether the saved cancel-edit prompt is currently safe to restore if the turn is interrupted. It only arms the restore when the composer is empty and there are no other queued or active side inputs that could conflict.
 
-**Data flow**: Reads `self.cancel_edit.eligible`, whether a prompt exists, `self.bottom_pane.composer_is_empty()`, `self.input_queue.pending_steers.is_empty()`, `self.has_queued_follow_up_messages()`, and `self.active_side_conversation`. It writes the conjunction of those conditions into `self.cancel_edit.armed`.
+**Data flow**: It reads the cancel-edit state, the composer contents, pending steer queue, queued follow-up messages, and whether a side conversation is active. From those conditions it sets one internal boolean, `armed`, to true or false. It returns nothing.
 
-**Call relations**: This method prepares the state later consumed by `take_armed_cancel_edit_prompt` during interrupted-turn handling.
+**Call relations**: This prepares the state that `ChatWidget::take_armed_cancel_edit_prompt` checks during an interrupted turn. It acts like locking in a possible undo only when the chat input area is quiet enough.
 
 
 ##### `ChatWidget::take_armed_cancel_edit_prompt`  (lines 29–35)
@@ -2444,11 +2456,11 @@ fn arm_cancel_edit(&mut self)
 fn take_armed_cancel_edit_prompt(&mut self, reason: TurnAbortReason) -> Option<UserMessage>
 ```
 
-**Purpose**: Consumes and returns the stored cancel-edit prompt only for a user interrupt and only if restoration was both eligible and armed.
+**Purpose**: Retrieves the saved cancel-edit prompt, but only for the specific case where an interruption should restore it. “Take” means it removes the prompt from storage so it cannot be restored twice.
 
-**Data flow**: Takes `reason: TurnAbortReason`, checks whether it equals `Interrupted` and whether `self.cancel_edit.armed` and `eligible` are true, then `take()`s `self.cancel_edit.prompt` and returns the resulting `Option<UserMessage>`. Otherwise it returns `None` without mutation.
+**Data flow**: It receives the reason the turn was aborted. If the reason is `Interrupted` and the cancel-edit state is both armed and eligible, it removes and returns the saved `UserMessage`; otherwise it returns nothing.
 
-**Call relations**: Called at the start of `on_interrupted_turn` to decide whether the interrupted turn should restore the original prompt via an app event.
+**Call relations**: This is called by `ChatWidget::on_interrupted_turn` at the start of interruption handling. If it returns a prompt, that interruption flow later sends a restore event instead of treating the situation like an ordinary interrupted turn.
 
 *Call graph*: called by 1 (on_interrupted_turn).
 
@@ -2459,11 +2471,11 @@ fn take_armed_cancel_edit_prompt(&mut self, reason: TurnAbortReason) -> Option<U
 fn clear_cancel_edit(&mut self)
 ```
 
-**Purpose**: Resets all cancel-edit tracking to its default empty state.
+**Purpose**: Resets all cancel-edit tracking back to its empty default state. This is used when any saved cancel-edit prompt should be forgotten.
 
-**Data flow**: Replaces `self.cancel_edit` with `CancelEditState::default()`. It returns no value.
+**Data flow**: No input is needed. The function replaces the current cancel-edit state with a fresh default value. It returns nothing.
 
-**Call relations**: Used when the widget needs to discard any pending cancel-edit restoration context entirely.
+**Call relations**: This is a cleanup helper for other ChatWidget flows. It calls the default constructor for the cancel-edit state so the rest of the widget starts from a known blank slate.
 
 *Call graph*: 1 external calls (default).
 
@@ -2474,11 +2486,11 @@ fn clear_cancel_edit(&mut self)
 fn set_initial_user_message_submit_suppressed(&mut self, suppressed: bool)
 ```
 
-**Purpose**: Enables or disables deferred submission of the initial user message. This is a simple policy flag setter.
+**Purpose**: Turns automatic submission of the initial user message on or off. This lets startup or setup code delay the first message when the app is not ready to send it yet.
 
-**Data flow**: Writes the `suppressed` argument into `self.suppress_initial_user_message_submit`.
+**Data flow**: A boolean comes in: true means suppress automatic submit, false means allow it. The function stores that choice in the widget. It returns nothing.
 
-**Call relations**: Consulted later by `submit_initial_user_message_if_pending` during startup-like flows.
+**Call relations**: This setting is later read by `ChatWidget::submit_initial_user_message_if_pending`. Other setup code can use it as a safety switch before the initial message is allowed to leave the composer.
 
 
 ##### `ChatWidget::submit_initial_user_message_if_pending`  (lines 45–56)
@@ -2487,11 +2499,11 @@ fn set_initial_user_message_submit_suppressed(&mut self, suppressed: bool)
 fn submit_initial_user_message_if_pending(&mut self)
 ```
 
-**Purpose**: Submits the stored initial user message once startup conditions allow it. It respects explicit suppression and a Windows sandbox setup gate.
+**Purpose**: Submits the initial user message if one exists and submission is currently allowed. It prevents early sending when submission has been suppressed or, on supported builds, when required Windows sandbox setup is still pending.
 
-**Data flow**: Reads `self.suppress_initial_user_message_submit`; on Windows/test builds also checks `self.elevated_windows_sandbox_setup_required()`. If neither blocks submission and `self.initial_user_message.take()` yields a message, it submits that message via `submit_user_message`.
+**Data flow**: It reads the suppression flag, possible platform setup state, and the stored initial message. If sending is allowed and a message is present, it removes that message from storage and submits it. It returns nothing.
 
-**Call relations**: Used during early thread/session setup to release an initial prompt that was staged before the widget was ready.
+**Call relations**: This is called by surrounding ChatWidget startup or readiness code when the app may be ready to send the first message. If it does send, it hands the message to the normal user-message submission path.
 
 
 ##### `ChatWidget::pop_next_queued_user_message`  (lines 58–96)
@@ -2502,11 +2514,11 @@ fn pop_next_queued_user_message(
     ) -> Option<(QueuedUserMessage, UserMessageHistoryRecord)>
 ```
 
-**Purpose**: Removes the next queued input to process, giving rejected steers priority and merging all rejected steers into one synthetic queued message when present.
+**Purpose**: Takes the next message that should be sent from the waiting queue. Rejected steer instructions get priority and are merged together so they can be resent as one message.
 
-**Data flow**: If `rejected_steers_queue` is empty, it pops the front `QueuedUserMessage` and the matching front history record from `queued_user_message_history_records`, defaulting missing history to `UserMessageText`, and returns the pair. Otherwise it drains all rejected steer messages and all rejected history records into vectors, resizes the history vector to match message count with default records, merges them via `merge_user_messages_with_history_record`, wraps the merged message in `QueuedUserMessage::from`, and returns that plus the merged history record.
+**Data flow**: It looks first at the rejected-steer queue. If there are no rejected steers, it removes the oldest queued user message and its matching history record. If rejected steers exist, it drains all of them, fills in any missing history records with a safe default, merges them, and returns that combined message. The output is either a queued message plus its history record, or nothing if no message is waiting.
 
-**Call relations**: Consumed by `maybe_send_next_queued_input` so queue draining always retries rejected steers before ordinary queued follow-ups.
+**Call relations**: This is used by the broader input queue flow when ChatWidget needs the next item to send. It relies on message conversion and merging helpers so callers receive one clean message/history pair rather than several fragmented queue entries.
 
 *Call graph*: calls 1 internal fn (from).
 
@@ -2517,11 +2529,11 @@ fn pop_next_queued_user_message(
 fn pop_latest_queued_composer_state(&mut self) -> Option<ThreadComposerState>
 ```
 
-**Purpose**: Pops the most recently queued draft-like input and converts it back into editable composer state for the “edit queued message” shortcut.
+**Purpose**: Pulls the most recent queued input back into a composer-shaped draft. This is useful when the user needs the latest waiting message restored for editing instead of being sent.
 
-**Data flow**: First tries `queued_user_messages.pop_back()` and the matching history record from `queued_user_message_history_records.pop_back()`, defaulting missing history. It extracts `user_message` and `pending_pastes`, converts the message through `user_message_for_restore`, then through `composer_state_from_user_message`, and returns the resulting `ThreadComposerState`. If no queued message exists, it instead pops the newest rejected steer and matching history record, converts it similarly, and returns that state with empty pending pastes. If neither queue has entries, it returns `None`.
+**Data flow**: It first tries to remove the newest queued user message and its history record. If none exists, it tries the newest rejected steer instead. The selected message is adjusted for restore display and converted into a `ThreadComposerState`, including pending paste data when available. It returns that composer state or nothing.
 
-**Call relations**: Called from keyboard interaction when the user requests to edit the latest queued message instead of leaving it in the queue.
+**Call relations**: This function is part of the “bring it back into the text box” path. It uses `ChatWidget::composer_state_from_user_message` to turn a stored message into the same shape that the composer understands.
 
 *Call graph*: 2 external calls (composer_state_from_user_message, new).
 
@@ -2532,11 +2544,11 @@ fn pop_latest_queued_composer_state(&mut self) -> Option<ThreadComposerState>
 fn enqueue_rejected_steer(&mut self) -> bool
 ```
 
-**Purpose**: Moves the oldest pending steer into the rejected-steer queue after core reports that the active turn could not accept steer input.
+**Purpose**: Moves the oldest pending steer instruction into the rejected-steer queue after the app learns it could not be applied to the active turn. This keeps the user’s instruction available instead of dropping it.
 
-**Data flow**: Attempts to pop the front `PendingSteer` from `self.input_queue.pending_steers`. If none exists, it logs a warning and returns `false`. Otherwise it pushes the steer's `user_message` and `history_record` onto the rejected-steer queues, refreshes the pending-input preview, and returns `true`.
+**Data flow**: It removes one pending steer from the front of the pending-steer queue. If one exists, it stores its message and history record in the rejected queues, refreshes the pending-input preview, and returns true. If no matching pending steer exists, it logs a warning and returns false.
 
-**Call relations**: Used by error-handling paths outside this file when an active-turn-not-steerable response arrives. It preserves the steer for retry before later queued messages.
+**Call relations**: This is called when the system reports that an active turn was not steerable. It feeds later restore or resend paths, such as `ChatWidget::pop_next_queued_user_message` and `ChatWidget::drain_pending_messages_for_restore`, by preserving the rejected input.
 
 *Call graph*: 1 external calls (warn!).
 
@@ -2547,11 +2559,11 @@ fn enqueue_rejected_steer(&mut self) -> bool
 fn on_interrupted_turn(&mut self, reason: TurnAbortReason)
 ```
 
-**Purpose**: Handles turn abortion by finalizing running state, surfacing the right interruption notice, and either restoring pending input into the composer or immediately resubmitting pending steers.
+**Purpose**: Responds when a model turn stops early, such as from the user pressing Escape, running out of budget, or completing review. Its main job is to end the running turn cleanly and make sure any unsent input is either restored to the composer or submitted in the right way.
 
-**Data flow**: Takes `reason`, first consumes any armed cancel-edit prompt via `take_armed_cancel_edit_prompt`, then calls `finalize_turn()`. It reads and clears `input_queue.submit_pending_steers_after_interrupt`. Unless a cancel-edit prompt exists or notices are suppressed, it appends either an info event about interrupting to submit steers or an error event from `interrupted_turn_message(reason)`. If pending steers should be sent immediately, it drains `pending_steers`, merges them with history if non-empty, and submits them; otherwise, or if no pending steers remained, it calls `drain_pending_messages_for_restore()` and restores the resulting composer state if any. It refreshes the pending preview, emits `AppEvent::RestoreCancelledTurn(prompt)` if a cancel-edit prompt was taken, and requests redraw.
+**Data flow**: It receives the abort reason. It checks whether a cancel-edit prompt should be restored, finalizes the turn, decides whether to show an informational or error notice, then drains or submits pending input depending on queue settings. It refreshes previews, may send an app event to restore a cancelled prompt, and asks the interface to redraw.
 
-**Call relations**: This is the central interrupt-recovery orchestrator. It depends on `take_armed_cancel_edit_prompt` and `drain_pending_messages_for_restore`, and delegates actual composer restoration to `restore_composer_state`.
+**Call relations**: This is the central interruption flow in this file. It calls `ChatWidget::take_armed_cancel_edit_prompt` first, uses `ChatWidget::drain_pending_messages_for_restore` when queued input should return to the composer, calls `ChatWidget::restore_composer_state` to put that draft back on screen, and creates history notices with the info/error event helpers.
 
 *Call graph*: calls 3 internal fn (drain_pending_messages_for_restore, restore_composer_state, take_armed_cancel_edit_prompt); 3 external calls (RestoreCancelledTurn, new_error_event, new_info_event).
 
@@ -2562,11 +2574,11 @@ fn on_interrupted_turn(&mut self, reason: TurnAbortReason)
 fn drain_pending_messages_for_restore(&mut self) -> Option<ThreadComposerState>
 ```
 
-**Purpose**: Drains all locally tracked pending input sources and merges them into one `ThreadComposerState` suitable for restoring into the composer after an interrupt.
+**Purpose**: Combines all waiting input into one composer draft after an interrupt. It preserves the user’s words, images, mentions, and pasted blocks while making sure placeholders still point to the right content.
 
-**Data flow**: If both `pending_steers` and queued follow-up messages are empty, it returns `None`. Otherwise it snapshots the current composer draft into an `existing_message`, drains rejected steers plus history records and converts them with `user_message_for_restore`, drains pending steers similarly, then drains queued user messages plus history records. For each queued message it calls `remap_colliding_paste_placeholders`, accumulating remapped messages and `pending_pastes` while tracking used placeholders in a `HashSet`. If the current composer already has content, it also remaps its placeholders and appends it. Finally it merges all collected `UserMessage`s with `merge_user_messages`, converts the result plus accumulated `pending_pastes` through `composer_state_from_user_message`, and returns `Some(ThreadComposerState)`.
+**Data flow**: It reads and drains rejected steers, pending steers, queued user messages, their history records, and the current composer draft. It converts each message into restore form, remaps paste placeholders to avoid collisions, merges the messages in order, and packages the result as a `ThreadComposerState`. If there is nothing to restore, it returns nothing.
 
-**Call relations**: Called only by `on_interrupted_turn`. It encapsulates the tricky restore-time invariants around placeholder collision avoidance, history-aware text restoration, and stable merge ordering.
+**Call relations**: This helper is called by `ChatWidget::on_interrupted_turn` when pending input should be returned to the text box instead of auto-submitted. It uses `remap_colliding_paste_placeholders` for paste safety and `ChatWidget::composer_state_from_user_message` to produce the final composer state.
 
 *Call graph*: calls 1 internal fn (remap_colliding_paste_placeholders); called by 1 (on_interrupted_turn); 3 external calls (new, composer_state_from_user_message, new).
 
@@ -2577,11 +2589,11 @@ fn drain_pending_messages_for_restore(&mut self) -> Option<ThreadComposerState>
 fn restore_user_message_to_composer(&mut self, user_message: UserMessage)
 ```
 
-**Purpose**: Restores a single `UserMessage` into the composer without any pending-paste metadata. It is a convenience wrapper for blocked or deferred submissions.
+**Purpose**: Places a single user message back into the composer so the user can see and edit it. This is a simple bridge from stored message form to visible draft form.
 
-**Data flow**: Takes a `UserMessage`, converts it to `ThreadComposerState` with empty `pending_pastes` via `composer_state_from_user_message`, and passes that state to `restore_composer_state`.
+**Data flow**: A `UserMessage` comes in. The function turns it into a `ThreadComposerState` with no pending paste entries, then applies that state to the composer. It returns nothing.
 
-**Call relations**: Used by submission logic when a message cannot be sent and should be put back into the composer intact.
+**Call relations**: This function calls `ChatWidget::composer_state_from_user_message` and then `ChatWidget::restore_composer_state`. It is used by higher-level flows that already know exactly which one message should reappear in the input box.
 
 *Call graph*: calls 1 internal fn (restore_composer_state); 2 external calls (composer_state_from_user_message, new).
 
@@ -2592,11 +2604,11 @@ fn restore_user_message_to_composer(&mut self, user_message: UserMessage)
 fn restore_composer_state(&mut self, composer: ThreadComposerState)
 ```
 
-**Purpose**: Applies a full `ThreadComposerState` snapshot back into the bottom-pane composer, including text, images, mentions, and pending pastes.
+**Purpose**: Rebuilds the visible composer from a saved composer state. This is the final step that actually puts restored text, images, mentions, remote image links, and pending paste data back into the UI.
 
-**Data flow**: Destructures the `ThreadComposerState` into text, image lists, text elements, mention bindings, and pending pastes. It maps `local_images` to their paths, writes remote image URLs via `set_remote_image_urls`, updates the composer text and mention bindings with `bottom_pane.set_composer_text_with_mention_bindings(...)`, and restores pending pastes with `bottom_pane.set_composer_pending_pastes(...)`.
+**Data flow**: It receives a `ThreadComposerState`. It separates text, local images, remote image URLs, text metadata, mention bindings, and pending pastes; converts local image records into paths for the composer; updates remote image URLs; sets the composer text and bindings; and restores pending paste entries. It returns nothing.
 
-**Call relations**: Called from interrupted-turn recovery, thread-state restoration, and single-message restoration helpers whenever the widget needs to repopulate the composer UI.
+**Call relations**: This is the shared restore endpoint for several flows. `ChatWidget::on_interrupted_turn`, `ChatWidget::restore_user_message_to_composer`, and `ChatWidget::restore_thread_input_state` all call it when they have reconstructed what the input box should contain.
 
 *Call graph*: called by 3 (on_interrupted_turn, restore_thread_input_state, restore_user_message_to_composer).
 
@@ -2610,11 +2622,11 @@ fn composer_state_from_user_message(
     ) -> ThreadComposerState
 ```
 
-**Purpose**: Converts a `UserMessage` plus pending-paste metadata into the `ThreadComposerState` shape used by restore and snapshot code.
+**Purpose**: Wraps a stored user message in the shape used by the thread composer. It is a small adapter between “message ready to send” data and “draft visible in the input box” data.
 
-**Data flow**: Consumes a `UserMessage` and `pending_pastes`, destructures the message fields, and returns a `ThreadComposerState` containing the same text, images, text elements, mention bindings, and the supplied pending pastes.
+**Data flow**: It receives a `UserMessage` plus pending paste entries. It moves the message’s text, image lists, text element metadata, and mention bindings into a new `ThreadComposerState`, attaching the paste entries as well. The new composer state is returned.
 
-**Call relations**: Used internally by restore helpers to normalize message-shaped data into the composer-state representation expected by `restore_composer_state`.
+**Call relations**: Several restore paths use this conversion before calling `ChatWidget::restore_composer_state` or returning composer state to a caller. It keeps the mapping between message data and composer data consistent.
 
 
 ##### `ChatWidget::capture_thread_input_state`  (lines 342–385)
@@ -2623,11 +2635,11 @@ fn composer_state_from_user_message(
 fn capture_thread_input_state(&self) -> Option<ThreadInputState>
 ```
 
-**Purpose**: Snapshots the current composer and all queue-related input state so it can be restored when switching threads or rebuilding widget state.
+**Purpose**: Takes a snapshot of all input-related state for the current chat thread. This lets the app restore the user’s draft and queues later, for example after switching threads or rebuilding the UI.
 
-**Data flow**: Reads a composer draft snapshot from `bottom_pane`, wraps it into `ThreadComposerState`, and stores it as `Some` only if `has_content()` is true. It clones pending steers into parallel vectors of messages, history records, and compare keys; clones rejected-steer and queued-message deques plus their history-record deques; copies `user_turn_pending_start`, current/active collaboration mode fields, `bottom_pane.is_task_running()`, and `turn_lifecycle.agent_turn_running`; and returns `Some(ThreadInputState { ... })`.
+**Data flow**: It reads the current composer draft, pending steers, rejected steers, queued messages, history records, collaboration settings, and running-task flags. It packages those values into a `ThreadInputState`, omitting the composer part if the draft has no content. It returns that snapshot wrapped in `Some`.
 
-**Call relations**: Paired with `restore_thread_input_state`. It is used when preserving per-thread draft and queue state across thread switches.
+**Call relations**: This is the save half of the thread-input restore pair. `ChatWidget::restore_thread_input_state` is the matching load half that consumes this kind of snapshot and rebuilds the widget state.
 
 
 ##### `ChatWidget::restore_thread_input_state`  (lines 387–449)
@@ -2636,11 +2648,11 @@ fn capture_thread_input_state(&self) -> Option<ThreadInputState>
 fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>)
 ```
 
-**Purpose**: Rehydrates the composer, queue state, and collaboration/task indicators from an optional `ThreadInputState` snapshot, or clears them when no snapshot exists.
+**Purpose**: Restores the chat input area and its queues from a saved thread snapshot, or clears them when no snapshot is available. This is what makes switching back to a thread feel like returning to the same desk with the same draft still there.
 
-**Data flow**: Reads whether the incoming snapshot claimed `task_running`. If `Some`, it restores collaboration mode fields, running-state flags, `user_turn_pending_start`, model-dependent surfaces, and composer state. It then reconstructs `input_queue.pending_steers` by zipping saved pending-steer messages with resized history records and compare keys, synthesizing a `PendingSteerCompareKey` from message text and image count when missing. It restores rejected and queued deques plus their history-record deques, resizing those history deques to match queue lengths. If `None`, it clears running state, calls `input_queue.clear()`, and restores an empty composer. In both cases it refreshes task-running state, forces the bottom pane's task-running indicator back on if the snapshot said so but the current state did not, refreshes the pending preview, and requests redraw.
+**Data flow**: It receives an optional `ThreadInputState`. If a snapshot exists, it restores collaboration settings, running-turn state, composer contents, pending steers, rejected steers, queued messages, and missing default history records where needed. If no snapshot exists, it clears the input queue and composer. In both cases it refreshes task state, pending previews, status surfaces when needed, and redraws the UI.
 
-**Call relations**: This is the inverse of `capture_thread_input_state`. It delegates composer application to `restore_composer_state` and uses `InputQueueState::clear` when discarding prior thread input.
+**Call relations**: This is the load half of the snapshot system started by `ChatWidget::capture_thread_input_state`. It calls `ChatWidget::restore_composer_state` for the visible draft and uses the current time when rebuilding turn-running status.
 
 *Call graph*: calls 1 internal fn (restore_composer_state); 2 external calls (default, now).
 
@@ -2651,22 +2663,24 @@ fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>)
 fn set_queue_autosend_suppressed(&mut self, suppressed: bool)
 ```
 
-**Purpose**: Toggles the flag that prevents queued inputs from being auto-submitted when the widget becomes idle.
+**Purpose**: Turns automatic sending of queued messages on or off. This gives other parts of the app a way to pause queue sending during sensitive moments.
 
-**Data flow**: Writes the `suppressed` argument into `self.input_queue.suppress_queue_autosend`.
+**Data flow**: A boolean comes in. The function stores it in the input queue’s `suppress_queue_autosend` flag. It returns nothing.
 
-**Call relations**: This flag is later consulted by `maybe_send_next_queued_input` in the input-flow module.
+**Call relations**: Other ChatWidget queue-control code reads this flag before automatically sending waiting messages. This function is the simple switch used by higher-level flows that need to temporarily stop autosend.
 
 
 ### `tui/src/chatwidget/input_submission.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `input submission`
 
-This file is the core submission pipeline for chat input. `user_message_from_submission` captures the transient composer-side attachments and mention bindings that accompany submitted text. From there, shell-prefixed input and normal model input diverge. `submit_shell_command` trims the command, emits a help info event for empty `!` submissions, or sends `AppCommand::run_user_shell_command`; `submit_queued_shell_prompt` reuses that behavior when draining queued messages.
+This file is the chat input gatekeeper. When a user sends something, it has to decide: is this a normal message for the model, a local shell command that starts with `!`, a message with images, or a message that must wait because the chat session is not ready yet? Without this code, pressing enter could lose drafts, send unsupported images, forget mention links, or fail to record message history.
 
-The main logic lives in `submit_user_message_with_history_and_shell_escape_policy`. It first enforces preconditions: unconfigured sessions cause front-of-queue insertion instead of loss, empty messages are rejected, and image-bearing messages are restored to the composer with a warning if the current model lacks image support. For accepted messages, it constructs `Vec<UserInput>` in protocol order: remote images, local images, then text with converted `TextElement`s. It resolves mentions from both explicit `mention_bindings` and parsed text mentions, deduplicating selected skills, plugins, and apps with `HashSet`s and preserving bound mentions over heuristic discovery.
+The main flow builds a `UserMessage`, which is the user's visible text plus extras such as attached images and mention bindings. A mention binding is the hidden link behind something like a named tool, skill, plugin, or connected app, so the app knows exactly what the user meant instead of guessing from the name alone.
 
-Before sending, it validates that the effective collaboration mode has a non-empty model, optionally injects IDE context, computes collaboration-mode and personality/service-tier metadata, and builds `AppCommand::user_turn`. After successful submission it updates pending-turn state, appends encoded history text with mention placeholders, tracks pending steers for non-history-rendered submissions, records cancel-edit candidates for visible user turns, and emits the display-form user message into transcript history. The blocked-image restore path intentionally restores mention bindings too, so retries preserve exact mention resolution rather than degrading to plain text tokens.
+For normal chat messages, the file converts the message into `UserInput` items: text, local images, remote image URLs, selected skills, plugins, apps, and optional editor context. It checks whether the current model is available and whether it supports images or personality settings. Then it creates an `AppCommand` for a user turn and submits it to the rest of the application.
+
+It also keeps the user experience safe. If a session is not configured, it queues the message. If images are blocked by the selected model, it restores the draft to the composer so the user can fix it. If another agent turn is already running, it stores the new input as a pending steer rather than simply showing it as a fresh chat turn.
 
 #### Function details
 
@@ -2680,11 +2694,11 @@ fn user_message_from_submission(
     ) -> UserMessage
 ```
 
-**Purpose**: Packages submitted composer text together with the attachments and mention bindings captured at submission time into a `UserMessage`.
+**Purpose**: Builds a complete `UserMessage` from what the user just submitted. It gathers the visible text plus hidden extras like image attachments, remote image links, rich text pieces, and mention bindings.
 
-**Data flow**: Takes `text` and `text_elements`, drains recent local images from `bottom_pane.take_recent_submission_images_with_placeholders()`, drains remote image URLs from `self.take_remote_image_urls()`, drains mention bindings from `bottom_pane.take_recent_submission_mention_bindings()`, and returns a `UserMessage` containing all of those fields.
+**Data flow**: It receives the submitted text and its text elements. It then takes recent local images and mention bindings out of the bottom composer area, takes any remote image URLs stored on the widget, and packages everything into one `UserMessage` that can travel through the submission pipeline.
 
-**Call relations**: Used by input-flow code whenever the composer reports a submitted or queued message so later submission/queue logic works with a complete message object.
+**Call relations**: This is the first packing step after the composer gives up its current contents. Later submission functions expect one complete `UserMessage`, so this function acts like putting all items from a desk into one envelope before mailing it.
 
 
 ##### `ChatWidget::submit_shell_command`  (lines 24–38)
@@ -2693,11 +2707,11 @@ fn user_message_from_submission(
 fn submit_shell_command(&mut self, command: &str) -> QueueDrain
 ```
 
-**Purpose**: Executes a local shell command requested via `!` syntax, or shows shell-command help when the command body is empty after trimming.
+**Purpose**: Runs a user-entered local shell command when the command is not empty. If the user only typed the shell prefix without a real command, it shows a help message instead.
 
-**Data flow**: Reads `command`, trims it to `cmd`, and branches. If `cmd` is empty, it sends `AppEvent::InsertHistoryCell` containing an info event with `USER_SHELL_COMMAND_HELP_TITLE` and `USER_SHELL_COMMAND_HELP_HINT`, then returns `QueueDrain::Continue`. Otherwise it submits `AppCommand::run_user_shell_command(cmd.to_string())` and returns `QueueDrain::Stop`.
+**Data flow**: It receives a command string, trims extra spaces, and checks whether anything remains. If empty, it sends an app event that inserts an informational history cell explaining shell command help and returns a signal to keep draining queued input. If non-empty, it creates and submits an app command to run that shell command, then returns a signal to stop draining.
 
-**Call relations**: This is the primitive shell-execution helper. `submit_shell_command_with_history` wraps it to append history only when an actual command was launched.
+**Call relations**: It is called by `ChatWidget::submit_shell_command_with_history`, which adds history behavior around it. Inside, it hands real commands off to `AppCommand::run_user_shell_command`; for empty commands, it uses a history info event instead of running anything.
 
 *Call graph*: called by 1 (submit_shell_command_with_history); 4 external calls (new, run_user_shell_command, InsertHistoryCell, new_info_event).
 
@@ -2712,11 +2726,11 @@ fn submit_shell_command_with_history(
     ) -> QueueDrain
 ```
 
-**Purpose**: Runs a shell command and records the original `!` text in message history only when execution actually starts.
+**Purpose**: Runs a shell command and records it in message history only when it was actually accepted as a real command. This prevents a blank `!` help prompt from being saved as if it were a command.
 
-**Data flow**: Takes `command` and `history_text`, delegates to `submit_shell_command`, and if the returned `QueueDrain` is `Stop`, appends `history_text.to_string()` to message history. It returns the same `QueueDrain` value.
+**Data flow**: It receives the command to execute and the text that should be stored in history. It calls `ChatWidget::submit_shell_command`. If that call says the queue should stop, meaning a real command was submitted, it appends the history text. It returns the same queue-draining decision it got back.
 
-**Call relations**: Called from both queued-shell submission and the main user-message submission path when shell escapes are allowed.
+**Call relations**: It wraps `ChatWidget::submit_shell_command` for both queued shell prompts and inline `!command` submissions from normal message handling. It is the small bridge between command execution and durable message history.
 
 *Call graph*: calls 1 internal fn (submit_shell_command); called by 2 (submit_queued_shell_prompt, submit_user_message_with_history_and_shell_escape_policy).
 
@@ -2727,11 +2741,11 @@ fn submit_shell_command_with_history(
 fn submit_queued_shell_prompt(&mut self, user_message: UserMessage) -> QueueDrain
 ```
 
-**Purpose**: Processes a queued message that may represent either a shell escape or a normal user message. It preserves the original queued text for history when executing shell commands.
+**Purpose**: Submits a message that was waiting in the input queue, while preserving the special rule that text starting with `!` is treated as a shell command. This is used when queued input is later replayed.
 
-**Data flow**: Consumes a `UserMessage` and checks `user_message.text.strip_prefix('!')`. If present, it clones the full original text into `history_text` and delegates to `submit_shell_command_with_history`; otherwise it submits the message normally with `submit_user_message` and returns `QueueDrain::Stop`.
+**Data flow**: It receives a queued `UserMessage`. If the text starts with `!`, it removes that prefix and submits the rest as a shell command, using the original text for history. If it does not start with `!`, it submits the message as a normal user chat message. The result tells the queue whether to continue or stop.
 
-**Call relations**: Used by queue draining for `QueuedInputAction::RunShell`, allowing queued shell prompts to share the same shell/help/history semantics as immediate submissions.
+**Call relations**: When queued input is being processed, this function chooses between `ChatWidget::submit_shell_command_with_history` and `ChatWidget::submit_user_message`. It keeps queued shell prompts from accidentally being sent to the model as ordinary text.
 
 *Call graph*: calls 2 internal fn (submit_shell_command_with_history, submit_user_message).
 
@@ -2742,11 +2756,11 @@ fn submit_queued_shell_prompt(&mut self, user_message: UserMessage) -> QueueDrai
 fn submit_user_message(&mut self, user_message: UserMessage)
 ```
 
-**Purpose**: Submits a user message using the default history-record behavior and ignores the returned acceptance flag.
+**Purpose**: Submits a normal user message using the standard history behavior. It is the simple entry point when the caller does not need special history or shell-escape rules.
 
-**Data flow**: Takes a `UserMessage`, calls `submit_user_message_with_history_record(user_message, UserMessageHistoryRecord::UserMessageText)`, stores the boolean in `_accepted`, and returns no value.
+**Data flow**: It receives a `UserMessage` and passes it along with the default `UserMessageHistoryRecord::UserMessageText` setting. It ignores the detailed success value because this wrapper is used when callers only want to fire the submission through the normal path.
 
-**Call relations**: This is the common convenience entry used by queue draining and other callers that do not need custom history rendering.
+**Call relations**: It is called by `ChatWidget::submit_queued_shell_prompt` for queued messages that are not shell commands. It delegates the real work to `ChatWidget::submit_user_message_with_history_record`.
 
 *Call graph*: calls 1 internal fn (submit_user_message_with_history_record); called by 1 (submit_queued_shell_prompt).
 
@@ -2761,11 +2775,11 @@ fn submit_user_message_with_history_record(
     ) -> bool
 ```
 
-**Purpose**: Submits a user message with an explicit history-record policy while allowing shell escapes. It returns whether the submission was accepted.
+**Purpose**: Submits a user message while letting the caller choose what text should be saved in history. It still uses the normal rule that `!command` can escape to the local shell.
 
-**Data flow**: Takes `user_message` and `history_record`, forwards them plus `ShellEscapePolicy::Allow` to `submit_user_message_with_history_and_shell_escape_policy`, and returns the boolean acceptance component of the tuple.
+**Data flow**: It receives a `UserMessage` and a history-record choice. It forwards both into the main submission function with shell escaping allowed, then returns only the boolean part: whether the message was accepted.
 
-**Call relations**: Called by `submit_user_message` and queue-drain code when slash-command-derived history text may differ from the actual payload.
+**Call relations**: This function is called by `ChatWidget::submit_user_message` and feeds into `ChatWidget::submit_user_message_with_history_and_shell_escape_policy`, the main worker. It is a convenience layer for callers that care about history but not about the generated app command.
 
 *Call graph*: calls 1 internal fn (submit_user_message_with_history_and_shell_escape_policy); called by 1 (submit_user_message).
 
@@ -2780,11 +2794,11 @@ fn submit_user_message_with_shell_escape_policy(
     ) -> Option<AppCommand>
 ```
 
-**Purpose**: Submits a user message while letting the caller control whether leading `!` should be interpreted as a shell escape. It returns the generated `AppCommand` when one was produced.
+**Purpose**: Submits a user message while letting the caller decide whether leading `!` should be treated as a shell command or just ordinary text. It returns the app command if one was created.
 
-**Data flow**: Takes `user_message` and `shell_escape_policy`, forwards them with `UserMessageHistoryRecord::UserMessageText` to the main submission routine, and returns the optional `AppCommand` component of the result tuple.
+**Data flow**: It receives a `UserMessage` and a `ShellEscapePolicy`. It uses the normal message text as the history record, passes everything to the main submission function, and returns the optional `AppCommand` that resulted.
 
-**Call relations**: Used by callers that need access to the exact operation generated by submission or need to disable shell-escape interpretation.
+**Call relations**: This wrapper is for flows that need control over shell escaping. It delegates to `ChatWidget::submit_user_message_with_history_and_shell_escape_policy`, which performs the real checks, conversions, and submission.
 
 *Call graph*: calls 1 internal fn (submit_user_message_with_history_and_shell_escape_policy).
 
@@ -2799,11 +2813,11 @@ fn submit_user_message_with_history_and_shell_escape_policy(
         shell_escape_policy: ShellE
 ```
 
-**Purpose**: Validates, transforms, and submits a `UserMessage` as either a shell command or a model user turn, while updating queue state, transcript history, pending steers, and restoration state.
+**Purpose**: This is the main submission engine for user input. It validates the message, turns it into model-ready input items, resolves mentions, applies current chat settings, submits the app command, and updates history and pending-input state.
 
-**Data flow**: Consumes `user_message`, `history_record`, and `shell_escape_policy`. If the session is not configured, it warns, pushes the message and history record to the front of the queued-message deques, refreshes the preview, and returns `(true, None)`. If the message has no text or images, it returns `(false, None)`. If it contains images unsupported by the current model, it converts the message through `user_message_for_restore`, restores it to the composer with `restore_blocked_image_submission`, and returns `(false, None)`. Otherwise it destructures the message, computes whether to render in history based on `agent_turn_running`, and builds `items: Vec<UserInput>`: shell escape handling may short-circuit to `submit_shell_command_with_history`; otherwise remote images become `UserInput::Image`, local images become `UserInput::LocalImage`, and non-empty text becomes `UserInput::Text` with converted text elements. It parses mentions, deduplicates and appends `UserInput::Skill` and `UserInput::Mention` entries from explicit bindings and discovered mentions across skills, plugins, and apps. It validates that `effective_collaboration_mode().model()` is non-empty, restoring the message to the composer and emitting an error if not. It then mutates `items` via `maybe_apply_ide_context`, computes optional collaboration-mode metadata, optional `PendingSteer`, personality, service tier, and permission settings, builds `AppCommand::user_turn`, and submits it. On success it may set `input_queue.user_turn_pending_start`, append encoded history text with mention placeholders, push a pending steer and refresh the preview, record a cancel-edit candidate, emit a display-form user message into transcript history, clear `transcript.needs_final_message_separator`, and return `(true, Some(op))`.
+**Data flow**: It receives a full `UserMessage`, a rule for what to save in history, and a rule for whether `!` may run a shell command. First it queues the message if the session is not ready. It rejects completely empty input. It restores image drafts if the current model cannot accept images. If shell escaping is allowed and the text starts with `!`, it routes the input to shell-command submission instead of the model. Otherwise, it builds a list of user input items from remote images, local images, text, skills, plugins, apps, and optional editor context. It checks that a model is available, gathers settings such as approval policy, permission profile, collaboration mode, personality, and service tier, creates an `AppCommand::user_turn`, and submits it. After submission, it records history, pending steers, cancel/edit candidates, visible transcript content, and redraw-related state as needed. It returns whether the input was accepted and the command that was submitted, if any.
 
-**Call relations**: This is the central submission engine called by both public submission wrappers. It delegates blocked-image restoration, shell execution, and IDE-context augmentation to specialized helpers while owning the overall acceptance/rejection and bookkeeping flow.
+**Call relations**: The simpler submission wrappers all lead here. It calls `ChatWidget::submit_shell_command_with_history` for `!command` input, calls `ChatWidget::restore_blocked_image_submission` when images cannot be sent, uses mention and connector lookup helpers to turn typed names into concrete inputs, and finally hands the completed user turn to the app through `submit_op`.
 
 *Call graph*: calls 5 internal fn (from, connector_mention_slug, restore_blocked_image_submission, submit_shell_command_with_history, from); called by 2 (submit_user_message_with_history_record, submit_user_message_with_shell_escape_policy); 8 external calls (new, new, new, new, run_user_shell_command, user_turn, format!, warn!).
 
@@ -2819,11 +2833,11 @@ fn restore_blocked_image_submission(
         mention_bindings: Vec<Me
 ```
 
-**Purpose**: Restores an image-bearing draft back into the composer when the current model cannot accept image inputs, preserving mention bindings for an accurate retry.
+**Purpose**: Puts a blocked image message back into the composer so the user does not lose their draft. This matters when the selected model cannot accept image inputs.
 
-**Data flow**: Takes text, text elements, local images, mention bindings, and remote image URLs. It maps local images to their paths, writes remote URLs via `set_remote_image_urls`, restores the composer text plus mention bindings with `bottom_pane.set_composer_text_with_mention_bindings(...)`, appends a warning history event from `image_inputs_not_supported_message()`, and requests redraw.
+**Data flow**: It receives the text, text elements, local image attachments, mention bindings, and remote image URLs from the blocked submission. It stores the remote image URLs back on the widget, puts the text, local image paths, and mention bindings back into the composer, adds a warning message to the conversation history, and requests a redraw so the user sees the restored draft and warning.
 
-**Call relations**: Called only from the main submission routine when image support validation fails. It intentionally keeps the draft editable instead of dropping or partially restoring it.
+**Call relations**: It is called by `ChatWidget::submit_user_message_with_history_and_shell_escape_policy` when image input is present but unsupported. It uses a warning history cell to explain the problem, then returns control to the normal UI instead of submitting anything.
 
 *Call graph*: called by 1 (submit_user_message_with_history_and_shell_escape_policy); 1 external calls (new_warning_event).
 
@@ -2832,9 +2846,13 @@ fn restore_blocked_image_submission(
 
 `orchestration` · `request handling`
 
-This module is the bridge between low-level composer results and the rest of the chat turn lifecycle. `handle_composer_input_result` interprets `InputResult` variants from the bottom pane: submitted text becomes a `UserMessage`, slash commands are dispatched, queued actions preserve extra queue metadata, and empty submissions are dropped if they contain no text or images. The method also decides whether a submitted message should go out immediately or be queued, based on session configuration, plan-streaming mode, and a special case where only user shell commands are currently running; in that case non-`!` text is deferred instead of interleaving with shell activity.
+This file is the traffic controller for user input in the terminal chat screen. When a user presses Enter, the input might be a normal chat message, a slash command, a shell command, or something that must wait because the session is not ready or another turn is still running. Without this logic, messages could be sent at the wrong time, dropped, or hidden from the user while the assistant is busy.
 
-Queueing is represented in `self.input_queue` as `QueuedUserMessage` plus a parallel history-record deque. `queue_user_message_with_options` either appends to those deques and refreshes the pending-input preview, or bypasses the queue and submits immediately when the session is configured and idle. `maybe_send_next_queued_input` is the queue drain loop: unless autosend is suppressed or a turn is already pending/running, it repeatedly pops the next queued item and dispatches exactly one actionable follow-up, respecting `QueuedInputAction::Plain`, `ParseSlash`, and `RunShell`. It stops as soon as a new turn starts or a delegated parser/shell path requests a stop. The file also exposes small state predicates and a mode-aware submission helper that prevents collaboration-mode changes mid-turn and injects configured plan-mode reasoning effort.
+The main idea is a queue, like a small waiting line at a counter. If the app is ready, a message can go straight to submission. If the app is still setting up, streaming a plan, or running a previous turn, the message is saved in `input_queue`. The bottom pane then shows a preview so the user can see what is waiting.
+
+The file also protects special cases. For example, if only user-started shell commands are running, a normal chat message is queued instead of interrupting that work. When a modal window or popup closes, the file may send the next queued input. It sends at most one normal follow-up at a time, so each assistant turn has a clear beginning and end.
+
+A few helper methods answer questions such as “is a turn already running?” and “are only user shell commands active?” Other methods refresh the visible pending-input preview or submit text with a chosen collaboration mode, such as plan mode.
 
 #### Function details
 
@@ -2848,11 +2866,11 @@ fn handle_composer_input_result(
     )
 ```
 
-**Purpose**: Consumes the bottom pane's `InputResult` and performs the corresponding chat-widget action: submit, queue, dispatch a command, or do nothing. It also opportunistically drains queued input after modal/popup dismissal and refreshes plan-mode nudges.
+**Purpose**: This is the main decision point after the composer reports what the user did. It turns submitted text into a chat message, routes commands to command handling, queues messages when the app is busy, and starts submission when it is safe.
 
-**Data flow**: Takes `input_result` and `had_modal_or_popup`. For `Submitted`, it builds a `UserMessage`, drops it if text and both image lists are empty, computes whether immediate submission is allowed, and either submits now, queues it, or queues it specially when only user shell commands are running and the text is not a shell escape. For `Queued`, it builds a `UserMessage` and enqueues it with the provided `QueuedInputAction` and `pending_pastes`. For command variants it dispatches to slash/service-tier handlers. After the match, if a modal/popup had been active and none remains, it may autosend the next queued input; finally it refreshes the plan-mode nudge state.
+**Data flow**: It receives an `InputResult`, which says what came from the input box, plus a flag saying whether a modal or popup had been open. For submitted text, it builds a user message, ignores it if it is completely empty, then either submits it or places it in the queue. For queued input, it stores the message with its requested action. For commands, it sends them to the appropriate command dispatcher. Afterward, if a popup just cleared, it may send the next queued input, and it refreshes the plan-mode hint shown to the user.
 
-**Call relations**: This is the main consumer of composer output from key handling. It delegates queue insertion to `queue_user_message` or `queue_user_message_with_options`, checks `only_user_shell_commands_running` for the shell-only deferral rule, and invokes `maybe_send_next_queued_input` after UI overlays close.
+**Call relations**: This function sits at the front of the input flow. When it needs to postpone work, it calls `ChatWidget::queue_user_message` or `ChatWidget::queue_user_message_with_options`. Before sending a normal message while commands are running, it checks `ChatWidget::only_user_shell_commands_running`. If the screen just became clear after a modal or popup, it calls `ChatWidget::maybe_send_next_queued_input` to resume the waiting line.
 
 *Call graph*: calls 4 internal fn (maybe_send_next_queued_input, only_user_shell_commands_running, queue_user_message, queue_user_message_with_options); 1 external calls (from).
 
@@ -2863,11 +2881,11 @@ fn handle_composer_input_result(
 fn queue_user_message(&mut self, user_message: UserMessage)
 ```
 
-**Purpose**: Queues a plain user message using default queue semantics. It is a convenience wrapper for the more general queueing API.
+**Purpose**: This is the simple way to put a normal user message into the queue. It is used when there are no special queue actions or pending paste details to preserve.
 
-**Data flow**: Accepts a `UserMessage`, constructs the default action `QueuedInputAction::Plain` and an empty `Vec` of pending pastes, and forwards all of that to `queue_user_message_with_options`. It returns no value.
+**Data flow**: It receives a `UserMessage`. It wraps that message with the default queue action, meaning “send this as plain chat later,” and uses an empty list for pending pastes. It then passes everything to the more detailed queueing function.
 
-**Call relations**: Used by immediate input handling and mode-based submission when the widget decides a message should wait rather than submit now. It exists to keep common plain-message queueing concise.
+**Call relations**: This is a convenience step used by `ChatWidget::handle_composer_input_result` when a submitted message must wait, and by `ChatWidget::submit_user_message_with_mode` when plan streaming means the new text should not be sent immediately. It delegates the real queue decision to `ChatWidget::queue_user_message_with_options`.
 
 *Call graph*: calls 1 internal fn (queue_user_message_with_options); called by 2 (handle_composer_input_result, submit_user_message_with_mode); 1 external calls (new).
 
@@ -2878,11 +2896,11 @@ fn queue_user_message(&mut self, user_message: UserMessage)
 fn set_queue_submissions_until_session_configured(&mut self, queue: bool)
 ```
 
-**Purpose**: Controls whether the bottom pane should visually indicate that submissions are being queued until session setup completes. The flag is masked off once the session is already configured.
+**Purpose**: This tells the bottom pane whether new submissions should be visibly held back until the chat session is ready. It prevents the interface from pretending a message can be sent before the backend session exists.
 
-**Data flow**: Takes `queue: bool`, combines it with `!self.is_session_configured()`, and writes the result into `self.bottom_pane.set_queue_submissions(...)`. It does not touch the actual queue contents.
+**Data flow**: It receives a boolean request to queue submissions. It combines that request with the current session state: queueing is enabled only if the caller asked for it and the session is not configured yet. It then updates the bottom pane’s submission behavior.
 
-**Call relations**: This is a UI-state setter used around session setup phases so the composer can reflect whether user submissions will be deferred.
+**Call relations**: This method is a small control switch for startup or session-change flows elsewhere in `ChatWidget`. It does not call the queue-draining helpers itself; instead, it changes how the input area behaves while the session is still being prepared.
 
 
 ##### `ChatWidget::queue_user_message_with_options`  (lines 81–102)
@@ -2896,11 +2914,11 @@ fn queue_user_message_with_options(
     )
 ```
 
-**Purpose**: Either appends a message to the pending-input queue with its action/history metadata or submits it immediately if the widget is ready and idle. It is the central queue insertion point.
+**Purpose**: This is the full queueing path for user messages. It either stores a message for later, along with extra instructions, or submits it immediately if the app is idle and ready.
 
-**Data flow**: Consumes a `UserMessage`, a `QueuedInputAction`, and `pending_pastes`. It checks `!self.is_session_configured() || self.is_user_turn_pending_or_running()`. If true, it pushes a `QueuedUserMessage { user_message, action, pending_pastes }` onto `input_queue.queued_user_messages`, pushes `UserMessageHistoryRecord::UserMessageText` onto the parallel history deque, and refreshes the pending-input preview. Otherwise it bypasses the queue and calls `submit_user_message(user_message)`.
+**Data flow**: It receives a user message, a queue action such as plain chat or slash-command parsing, and any pending paste data. It checks whether the session is configured and whether a user turn is already pending or running. If the app is not ready, it appends the message to the queue, records a matching history placeholder, and refreshes the pending-input preview. If the app is ready, it submits the message right away.
 
-**Call relations**: Called by both `handle_composer_input_result` and the plain wrapper `queue_user_message`. It relies on `is_user_turn_pending_or_running` to preserve the invariant that queued messages are only stored while the widget cannot start a new turn.
+**Call relations**: `ChatWidget::handle_composer_input_result` calls this for explicitly queued input, and `ChatWidget::queue_user_message` calls it for ordinary queued messages. It relies on `ChatWidget::is_user_turn_pending_or_running` to avoid overlapping turns, and calls `ChatWidget::refresh_pending_input_preview` when the visible waiting list changes.
 
 *Call graph*: calls 2 internal fn (is_user_turn_pending_or_running, refresh_pending_input_preview); called by 2 (handle_composer_input_result, queue_user_message).
 
@@ -2911,11 +2929,11 @@ fn queue_user_message_with_options(
 fn maybe_send_next_queued_input(&mut self) -> bool
 ```
 
-**Purpose**: If autosend is allowed and no turn is active, drains queued follow-up inputs until one actually starts work or the queue is exhausted. It submits at most one actionable follow-up turn per invocation.
+**Purpose**: This tries to start the next waiting user input, but only when it is safe. It is careful to submit one normal follow-up at a time so turns do not blur together.
 
-**Data flow**: Reads `self.input_queue.suppress_queue_autosend` and `self.is_user_turn_pending_or_running()` to decide whether to return `false` immediately. Otherwise it loops while no turn is pending/running, popping the next queued message/history pair. `QueuedInputAction::Plain` submits via `submit_user_message_with_history_record` and breaks. `ParseSlash` delegates to `submit_queued_slash_prompt`; `RunShell` delegates to `submit_queued_shell_prompt`; either delegated path may return `QueueDrain::Stop`, in which case the method records whether a turn is now pending/running and breaks. After the loop it refreshes the pending-input preview and returns whether a follow-up was submitted.
+**Data flow**: It first checks whether automatic queue sending is suppressed, then checks whether a user turn is already pending or running. If sending is allowed, it repeatedly takes the next queued message. Plain messages are submitted as the next chat turn and then the function stops. Queued slash prompts and shell prompts are interpreted through their special submission paths, and those paths can say whether queue draining should continue or stop. At the end, it refreshes the pending-input preview and returns whether a follow-up was submitted.
 
-**Call relations**: Triggered after composer interactions when a modal/popup closes. It depends on `pop_next_queued_user_message` from the restore module and uses `is_user_turn_pending_or_running` both as a precondition and as the loop stop condition.
+**Call relations**: `ChatWidget::handle_composer_input_result` calls this after a modal or popup closes and no other popup is active. During its loop it repeatedly asks `ChatWidget::is_user_turn_pending_or_running` whether it must stop, and after changing the queue it calls `ChatWidget::refresh_pending_input_preview` so the bottom pane matches reality.
 
 *Call graph*: calls 2 internal fn (is_user_turn_pending_or_running, refresh_pending_input_preview); called by 1 (handle_composer_input_result).
 
@@ -2926,11 +2944,11 @@ fn maybe_send_next_queued_input(&mut self) -> bool
 fn is_user_turn_pending_or_running(&self) -> bool
 ```
 
-**Purpose**: Reports whether the widget is between submission and `TurnStarted` or already executing a task. This is the queueing gate used throughout input flow.
+**Purpose**: This answers the simple question: is the chat already in the middle of starting or running a user turn? Other methods use it to avoid sending two turns at once.
 
-**Data flow**: Reads `self.input_queue.user_turn_pending_start` and `self.bottom_pane.is_task_running()`, ORs them, and returns the resulting boolean.
+**Data flow**: It reads two pieces of state: whether a turn has been marked as pending start, and whether the bottom pane reports a running task. If either is true, it returns true. It does not change anything.
 
-**Call relations**: Used by queue insertion and queue draining to avoid starting a new user turn while one is already pending or active.
+**Call relations**: `ChatWidget::queue_user_message_with_options` uses this check to decide between storing a message and submitting it immediately. `ChatWidget::maybe_send_next_queued_input` uses it before and during queue draining so it stops as soon as a turn is active.
 
 *Call graph*: called by 2 (maybe_send_next_queued_input, queue_user_message_with_options).
 
@@ -2941,11 +2959,11 @@ fn is_user_turn_pending_or_running(&self) -> bool
 fn only_user_shell_commands_running(&self) -> bool
 ```
 
-**Purpose**: Detects the special state where an agent turn is active solely because user-triggered shell commands are still running. In that state, normal text submissions are queued instead of being mixed into the running shell activity.
+**Purpose**: This checks for a special busy state: the assistant turn is active, and the only running commands are shell commands started by the user. In that case, ordinary chat should wait rather than collide with those commands.
 
-**Data flow**: Reads `self.turn_lifecycle.agent_turn_running`, `self.running_commands`, and each command's `source`. It returns true only when an agent turn is running, the running-command map is non-empty, and every command has `source == ExecCommandSource::UserShell`.
+**Data flow**: It reads the turn lifecycle state and the map of running commands. It returns true only when an agent turn is marked running, there is at least one running command, and every running command came from the user-shell source. It does not modify state.
 
-**Call relations**: Consulted by `handle_composer_input_result` during immediate-submission decisions. It provides the narrow exception that queues non-`!` text even when the session is otherwise configured.
+**Call relations**: `ChatWidget::handle_composer_input_result` calls this before submitting a normal message. If this check is true and the message is not explicitly a shell-style command starting with `!`, the message is queued instead of submitted immediately.
 
 *Call graph*: called by 1 (handle_composer_input_result).
 
@@ -2956,11 +2974,11 @@ fn only_user_shell_commands_running(&self) -> bool
 fn refresh_pending_input_preview(&mut self)
 ```
 
-**Purpose**: Recomputes the bottom-pane preview of queued messages, pending steers, and rejected steers from the queue state. It is the UI synchronization point after any queue mutation.
+**Purpose**: This rebuilds the small preview of queued input shown in the bottom pane. It keeps the user informed about messages or steering instructions that are waiting.
 
-**Data flow**: Calls `self.input_queue.preview()` to obtain a `PendingInputPreview`, then writes its `queued_messages`, `pending_steers`, and `rejected_steers` vectors into `self.bottom_pane.set_pending_input_preview(...)`.
+**Data flow**: It asks the input queue to produce a preview. That preview contains queued messages, pending steering items, and rejected steering items. The method then sends those pieces to the bottom pane so the visible interface updates.
 
-**Call relations**: Invoked after queue insertions and queue draining so the composer-adjacent preview always reflects the current queue contents.
+**Call relations**: `ChatWidget::queue_user_message_with_options` calls this after adding something to the queue. `ChatWidget::maybe_send_next_queued_input` calls it after draining or attempting to drain queued input, so the display reflects what remains.
 
 *Call graph*: called by 2 (maybe_send_next_queued_input, queue_user_message_with_options).
 
@@ -2975,11 +2993,11 @@ fn submit_user_message_with_mode(
     )
 ```
 
-**Purpose**: Submits or queues a plain text user message while first applying a requested collaboration mode change. It also injects configured plan-mode reasoning effort and blocks mode switches during an active turn.
+**Purpose**: This submits text while also applying a chosen collaboration mode, such as plan mode. It is used when the user action is not just “send this text,” but “send this text under this working mode.”
 
-**Data flow**: Takes `text` and mutable `collaboration_mode`. If the requested mode is `ModeKind::Plan` and config provides `plan_mode_reasoning_effort`, it writes that into the mask. If an agent turn is running and the requested mask differs from `self.active_collaboration_mask`, it emits an error and returns. Otherwise it updates the active collaboration mask, computes whether plan streaming requires queueing, constructs a `UserMessage` with the given text and empty image/text-element/mention fields, and either queues or submits it.
+**Data flow**: It receives message text and a collaboration-mode setting. If the mode is plan mode and the configuration specifies a reasoning effort for plan mode, it adds that effort to the mode. If a turn is already running and the requested mode differs from the active one, it shows an error and stops. Otherwise, it records the selected mode, builds a plain `UserMessage` from the text, and either queues it during plan streaming or submits it immediately.
 
-**Call relations**: This helper is used by callers that want a mode change and a message submission to be treated as one user action. It delegates actual queueing through `queue_user_message` when plan streaming is active.
+**Call relations**: This method is called from higher-level user actions that choose a mode before sending text. When plan streaming means the app should wait, it calls `ChatWidget::queue_user_message`; otherwise it continues into the normal submission path.
 
 *Call graph*: calls 1 internal fn (queue_user_message); 1 external calls (new).
 
@@ -2990,22 +3008,24 @@ fn submit_user_message_with_mode(
 fn queued_user_message_texts(&self) -> Vec<String>
 ```
 
-**Purpose**: Test-only accessor that exposes the visible text of rejected steers followed by queued user messages. It supports assertions about queue contents without inspecting internal deques directly.
+**Purpose**: This test-only helper returns the text of messages currently waiting in the input queues. It gives tests an easy way to check that queueing happened in the expected order.
 
-**Data flow**: Iterates over `self.input_queue.rejected_steers_queue` and `self.input_queue.queued_user_messages`, clones each message text, chains the two iterators, and collects them into `Vec<String>`.
+**Data flow**: It reads rejected steering messages first, then ordinary queued user messages. From each queued item, it takes the text field and collects all of those strings into a vector. It does not change the queue.
 
-**Call relations**: Compiled only in tests. It gives test code a stable summary of queue ordering across the two queue categories.
+**Call relations**: Because it is compiled only for tests, this function supports test code rather than normal runtime behavior. It lets tests inspect the queue state without needing to know the internal queue structure.
 
 
 ### `tui/src/chatwidget/interaction.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `request handling`
 
-This file is the chat widget’s interactive front door. `handle_key_event` first gives active bottom-pane views priority, except for a small set of app-level shortcuts such as Ctrl+C, Ctrl+R, and Ctrl+U. It then handles reasoning shortcuts, copy-last-response, Ctrl+C/Ctrl+D quit-or-interrupt behavior, Ctrl/Alt+V image paste, queued-message editing, steer-specific interrupt rules during review, pending-steer interrupt submission, plan-mode nudge dismissal, plugin popup routing, collaboration-mode cycling on BackTab, and finally ordinary composer key handling. After delegated bottom-pane handling it feeds the resulting `InputResult` into the input-flow module.
+This file gives `ChatWidget` most of its direct user-interaction behavior. In plain terms, it answers: “The user pressed this key — should it type into the composer, close a popup, interrupt the assistant, paste an image, copy the last answer, rename the chat, or quit?” Without this layer, keystrokes would either go to the wrong place or trigger dangerous actions too easily.
 
-The rest of the file exposes focused UI helpers. Image attachment checks model capabilities before mutating the composer. External-editor state, footer hints, selection views, paste handling, and paste-burst ticking are thin wrappers around bottom-pane behavior plus redraw/nudge refresh. Copy support reads `transcript.last_agent_markdown`, uses an injectable clipboard backend for tests, stores any returned clipboard lease, and emits precise info/error history events, including a special rollback-eviction message.
+The main routine first checks whether the bottom pane has an active view, such as a popup or modal. If so, most keys are handed there, like giving the front desk first chance to answer a question. Some global shortcuts, especially quit and reset-style shortcuts, are kept at the chat-widget level so they work consistently.
 
-Quit behavior is a small state machine in `ChatWidget`: `on_ctrl_c` and `on_ctrl_d` interpret double-press quit semantics using `quit_shortcut_key` and `quit_shortcut_expires_at`, while still interrupting cancellable work when appropriate. `pause_active_goal_for_interrupt` sends a `SetThreadGoalStatus::Paused` app event only when an agent turn is running, the current goal is active, and a thread id exists. Rename prompting is similarly guarded by `thread_rename_block_message` and uses a `CustomPromptView` callback that normalizes names and reports empty-name errors through history.
+The file also protects users from surprises. Quitting can require pressing the same shortcut twice within a short time. Ctrl+C interrupts active work before it quits. Ctrl+D only starts quitting when the composer is empty. Image paste only attaches if the current model supports images; otherwise a warning is shown. Large paste bursts are delayed and flushed together so the interface does not redraw wastefully on every small paste fragment.
+
+Several small helper methods expose composer state, external-editor state, footer hints, selection views, and copy history. Together they make the chat screen feel responsive while keeping risky actions deliberate.
 
 #### Function details
 
@@ -3015,11 +3035,11 @@ Quit behavior is a small state machine in `ChatWidget`: `on_ctrl_c` and `on_ctrl
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Central keyboard dispatcher for the chat widget. It decides whether a key goes to an active bottom-pane view, triggers an app-level shortcut, edits queued input, interrupts work, changes collaboration mode, or becomes ordinary composer input.
+**Purpose**: This is the main keyboard router for the chat screen. It decides whether a key press belongs to a popup, the composer, a global shortcut, an image paste action, queued-message editing, collaboration mode switching, or interrupt/quit behavior.
 
-**Data flow**: Consumes a `KeyEvent` and reads extensive widget state: active views, modal/popup presence, review mode, pending steers, task-running state, plan-mode nudge visibility, and keymap bindings. Depending on the branch it may delegate directly to `bottom_pane.handle_key_event`, clear quit-shortcut state, invoke reasoning/copy/interrupt handlers, paste an image from the clipboard and attach it, restore the latest queued composer state, set `submit_pending_steers_after_interrupt` and submit an interrupt op, dismiss the plan-mode nudge, route plugin-popup keys, cycle collaboration mode, or pass the event to the bottom pane and then process the resulting `InputResult` via `handle_composer_input_result`.
+**Data flow**: A raw `KeyEvent` comes in. The function checks the current UI state, such as whether a modal is open, whether a task is running, whether review mode is active, and whether queued input exists. It either forwards the key to the bottom pane, changes chat state, submits an app command, adds a history message, attaches an image, or asks for a redraw.
 
-**Call relations**: This is the top-level key-routing entrypoint for the widget. It delegates to many specialized helpers in this file and to input-flow methods once a key has been interpreted as composer output.
+**Call relations**: This is the entry point for key handling inside this file. When it recognizes special shortcuts, it hands off to helpers such as `ChatWidget::on_ctrl_c`, `ChatWidget::on_ctrl_d`, `ChatWidget::attach_image`, and `ChatWidget::copy_last_agent_markdown`; otherwise it lets the bottom pane process the key and then reacts to the result.
 
 *Call graph*: calls 5 internal fn (attach_image, copy_last_agent_markdown, on_ctrl_c, on_ctrl_d, ctrl); 7 external calls (Char, interrupt, format!, new_error_event, matches!, debug!, warn!).
 
@@ -3030,11 +3050,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn attach_image(&mut self, path: PathBuf)
 ```
 
-**Purpose**: Adds a local image attachment to the composer only when the active model supports image inputs. Otherwise it leaves the draft untouched and warns the user.
+**Purpose**: This adds a local image file to the message draft, but only if the current model can accept image input. If images are not supported, it leaves the draft alone and tells the user why.
 
-**Data flow**: Takes `path: PathBuf`, checks `current_model_supports_images()`, and either appends a warning history event plus redraw or logs the path, calls `bottom_pane.attach_image(path)`, and requests redraw.
+**Data flow**: A file path comes in. The function checks the active model’s image support. If images are supported, it passes the path to the bottom pane and requests a redraw; if not, it adds a warning message to the chat history and redraws.
 
-**Call relations**: Called from keyboard handling after a successful clipboard-image paste, and potentially from other UI paths that attach local images.
+**Call relations**: `ChatWidget::handle_key_event` calls this after a successful image paste shortcut. This helper keeps the model-safety check close to the UI action so pasted images are not silently attached when they cannot be used.
 
 *Call graph*: called by 1 (handle_key_event); 2 external calls (new_warning_event, info!).
 
@@ -3045,11 +3065,11 @@ fn attach_image(&mut self, path: PathBuf)
 fn composer_text_with_pending(&self) -> String
 ```
 
-**Purpose**: Returns the composer text including any pending paste-burst content not yet flushed into the visible draft.
+**Purpose**: This returns the current composer text, including any text that is still pending inside the composer. It is used when another part of the app needs to know what the user is preparing to send.
 
-**Data flow**: Reads and returns `self.bottom_pane.composer_text_with_pending()` unchanged.
+**Data flow**: It reads the bottom pane’s composer state and returns a `String` containing the visible draft plus pending input. It does not change the UI.
 
-**Call relations**: Used by external editor or state-inspection code that needs the effective current composer text.
+**Call relations**: This is a small pass-through from `ChatWidget` to the bottom pane. It lets outside chat-widget code ask for composer text without needing to know the bottom pane’s internal structure.
 
 
 ##### `ChatWidget::apply_external_edit`  (lines 195–199)
@@ -3058,11 +3078,11 @@ fn composer_text_with_pending(&self) -> String
 fn apply_external_edit(&mut self, text: String)
 ```
 
-**Purpose**: Applies text produced by an external editor back into the composer and refreshes related UI hints.
+**Purpose**: This replaces or updates the composer text with content returned from an external editor. It then refreshes any plan-mode hint that depends on the draft text.
 
-**Data flow**: Takes `text`, passes it to `bottom_pane.apply_external_edit(text)`, refreshes the plan-mode nudge, and requests redraw.
+**Data flow**: Edited text comes in as a `String`. The function sends it to the bottom pane, refreshes the plan-mode nudge, and requests a redraw so the new draft appears on screen.
 
-**Call relations**: Used when an external editing workflow returns modified text to the chat widget.
+**Call relations**: This method is used after an external editing flow completes. It does not do the editing itself; it applies the finished text to the composer and updates nearby UI state.
 
 
 ##### `ChatWidget::external_editor_state`  (lines 201–203)
@@ -3071,11 +3091,11 @@ fn apply_external_edit(&mut self, text: String)
 fn external_editor_state(&self) -> ExternalEditorState
 ```
 
-**Purpose**: Exposes the widget’s current external-editor state flag.
+**Purpose**: This reports the current state of the external editor flow. Other code can use it to know whether an editor is idle, launching, or otherwise in progress.
 
-**Data flow**: Reads and returns `self.external_editor_state` by value.
+**Data flow**: It reads the `external_editor_state` field from the chat widget and returns it. No UI state is changed.
 
-**Call relations**: Used by surrounding orchestration to inspect whether an external editor session is active or pending.
+**Call relations**: This is a simple state accessor for code that coordinates launching or tracking an outside text editor.
 
 
 ##### `ChatWidget::set_external_editor_state`  (lines 205–207)
@@ -3084,11 +3104,11 @@ fn external_editor_state(&self) -> ExternalEditorState
 fn set_external_editor_state(&mut self, state: ExternalEditorState)
 ```
 
-**Purpose**: Updates the widget’s external-editor state flag.
+**Purpose**: This records a new state for the external editor flow. It is used so the chat widget knows where that flow currently stands.
 
-**Data flow**: Writes the provided `state` into `self.external_editor_state`.
+**Data flow**: A new `ExternalEditorState` comes in. The function stores it in the chat widget. It returns nothing and does not redraw by itself.
 
-**Call relations**: Called by external-editor orchestration code to keep the widget’s state machine in sync.
+**Call relations**: This pairs with `ChatWidget::external_editor_state`: one reads the state, the other updates it. Other orchestration code can use these methods without touching the field directly.
 
 
 ##### `ChatWidget::set_footer_hint_override`  (lines 209–211)
@@ -3097,11 +3117,11 @@ fn set_external_editor_state(&mut self, state: ExternalEditorState)
 fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>)
 ```
 
-**Purpose**: Overrides the bottom-pane footer hints with caller-provided items or clears the override.
+**Purpose**: This temporarily changes the footer hints shown near the composer. Footer hints are the small key-command reminders shown to the user.
 
-**Data flow**: Passes `items: Option<Vec<(String, String)>>` directly to `self.bottom_pane.set_footer_hint_override(items)`.
+**Data flow**: It receives either a list of hint label/value pairs or `None`. It passes that override to the bottom pane, which is responsible for displaying the footer.
 
-**Call relations**: Used by higher-level flows that need temporary footer guidance independent of the normal keymap hints.
+**Call relations**: This is a bridge from chat-level code to the bottom pane’s footer display. It lets other flows change the visible hints without owning the rendering details.
 
 
 ##### `ChatWidget::show_selection_view`  (lines 213–217)
@@ -3110,11 +3130,11 @@ fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>)
 fn show_selection_view(&mut self, params: SelectionViewParams)
 ```
 
-**Purpose**: Displays a selection-style view in the bottom pane and refreshes plan-mode hinting around that UI change.
+**Purpose**: This opens a selection-style view in the bottom pane, such as a small chooser the user can navigate. It also updates plan-mode hints because opening a view can change what the user should see next.
 
-**Data flow**: Takes `SelectionViewParams`, forwards them to `bottom_pane.show_selection_view(params)`, refreshes the plan-mode nudge, and requests redraw.
+**Data flow**: Selection view parameters come in. The function tells the bottom pane to show that view, refreshes the plan-mode nudge, and requests a redraw.
 
-**Call relations**: Used by picker-like flows, including keymap and other selection UIs, to present a modal selection surface.
+**Call relations**: This is used by higher-level chat flows that need the user to choose something. The actual view is shown by the bottom pane; this method wires it into the chat widget’s refresh behavior.
 
 
 ##### `ChatWidget::no_modal_or_popup_active`  (lines 219–221)
@@ -3123,11 +3143,11 @@ fn show_selection_view(&mut self, params: SelectionViewParams)
 fn no_modal_or_popup_active(&self) -> bool
 ```
 
-**Purpose**: Reports whether the bottom pane currently has no modal or popup UI active.
+**Purpose**: This answers whether the chat screen is currently free of modal dialogs or popups. Many shortcuts only run when no temporary view is in the way.
 
-**Data flow**: Returns `self.bottom_pane.no_modal_or_popup_active()`.
+**Data flow**: It asks the bottom pane whether any modal or popup is active and returns a boolean answer. It does not change state.
 
-**Call relations**: This is a convenience predicate used by callers that need to know whether app-level shortcuts or autosend behavior should proceed.
+**Call relations**: This is a convenience wrapper around the bottom pane. It helps other chat-widget code make safe decisions about whether global actions should run.
 
 
 ##### `ChatWidget::can_launch_external_editor`  (lines 223–225)
@@ -3136,11 +3156,11 @@ fn no_modal_or_popup_active(&self) -> bool
 fn can_launch_external_editor(&self) -> bool
 ```
 
-**Purpose**: Checks whether the bottom pane is currently in a state that allows launching the external editor.
+**Purpose**: This answers whether it is currently safe to open an external editor for the composer. For example, the app may avoid launching one while another view is active.
 
-**Data flow**: Returns `self.bottom_pane.can_launch_external_editor()`.
+**Data flow**: It asks the bottom pane for its current editor-launch availability and returns that yes-or-no result. Nothing is changed.
 
-**Call relations**: Consulted by external-editor launch code before attempting to open an editor.
+**Call relations**: External-editor orchestration can call this before starting the editor. The bottom pane remains the source of truth for whether the composer is ready.
 
 
 ##### `ChatWidget::can_run_ctrl_l_clear_now`  (lines 227–238)
@@ -3149,11 +3169,11 @@ fn can_launch_external_editor(&self) -> bool
 fn can_run_ctrl_l_clear_now(&mut self) -> bool
 ```
 
-**Purpose**: Implements the current rule for Ctrl+L clearing: it is blocked while a task is running and otherwise allowed.
+**Purpose**: This checks whether Ctrl+L is allowed to clear the screen right now. It blocks clearing while a task is running, so the user does not lose useful visible context during active work.
 
-**Data flow**: Reads `self.bottom_pane.is_task_running()`. If false, returns `true`. If true, it appends an error history event saying Ctrl+L is disabled during a task, requests redraw, and returns `false`.
+**Data flow**: It reads whether the bottom pane reports a running task. If no task is running, it returns `true`. If a task is running, it adds an error message to history, requests a redraw, and returns `false`.
 
-**Call relations**: Used by the Ctrl+L clear path outside this file to enforce the same runtime restriction as `/clear`.
+**Call relations**: Other key-command code can call this before performing the clear action. It uses the same rule as the `/clear` command and reports the reason through a history error event.
 
 *Call graph*: 1 external calls (new_error_event).
 
@@ -3164,11 +3184,11 @@ fn can_run_ctrl_l_clear_now(&mut self) -> bool
 fn copy_last_agent_markdown(&mut self)
 ```
 
-**Purpose**: Copies the last agent response to the clipboard using the production clipboard backend.
+**Purpose**: This copies the assistant’s most recent response, in raw Markdown form, to the system clipboard. It is the normal user-facing copy action.
 
-**Data flow**: Calls `copy_last_agent_markdown_with(crate::clipboard_copy::copy_to_clipboard)` and returns no value.
+**Data flow**: It takes no direct input. It calls the more general copy helper with the real clipboard function, which reads the saved last assistant message, attempts the copy, and records success or failure.
 
-**Call relations**: Triggered by the configured copy shortcut in `handle_key_event`; the injectable inner helper contains the actual logic.
+**Call relations**: `ChatWidget::handle_key_event` calls this when the configured copy shortcut is pressed. This wrapper keeps normal app behavior simple while `ChatWidget::copy_last_agent_markdown_with` supports testing with a fake clipboard.
 
 *Call graph*: calls 1 internal fn (copy_last_agent_markdown_with); called by 1 (handle_key_event).
 
@@ -3182,11 +3202,11 @@ fn truncate_agent_copy_history_to_user_turn_count(
     )
 ```
 
-**Purpose**: Trims stored copyable agent-response history to match a reduced number of user turns, such as after rollback.
+**Purpose**: This trims stored copyable assistant responses so they match a given number of user turns. It helps keep copy history consistent after rewinding or shortening a conversation.
 
-**Data flow**: Passes `user_turn_count` to `self.transcript.truncate_copy_history_to_user_turn_count(user_turn_count)`.
+**Data flow**: A target user-turn count comes in. The function tells the transcript to discard copy-history entries beyond that point. It returns nothing.
 
-**Call relations**: Used by transcript/rollback flows to keep copy history aligned with visible conversation history.
+**Call relations**: This is a chat-widget doorway into transcript maintenance. Other conversation-lifecycle code can use it when the visible thread history changes.
 
 
 ##### `ChatWidget::copy_last_agent_markdown_with`  (lines 254–281)
@@ -3198,11 +3218,11 @@ fn copy_last_agent_markdown_with(
     )
 ```
 
-**Purpose**: Copies the last agent markdown using an injected clipboard function and reports success or failure through history events.
+**Purpose**: This is the inner copy routine, written so tests can provide a fake clipboard. It copies the saved assistant response when possible and shows a clear success or error message.
 
-**Data flow**: Reads `self.transcript.last_agent_markdown.clone()` and `copy_history_evicted_by_rollback`. If non-empty markdown exists, it calls `copy_fn(&markdown)`: on success it stores the returned clipboard lease in `self.clipboard_lease` and appends an info event; on error it appends an error event. If no markdown exists but copy history was evicted by rollback, it appends a specific error mentioning `MAX_AGENT_COPY_HISTORY`; otherwise it appends a generic “No agent response to copy” error. It always requests redraw.
+**Data flow**: It receives a clipboard-copy function. It reads the transcript’s last saved assistant Markdown. If text exists, it passes that text to the copy function and stores any clipboard lease it returns; if copying fails or no copyable response exists, it adds an error event. It always requests a redraw at the end.
 
-**Call relations**: Called by the public copy method and designed for testability by allowing a fake clipboard backend.
+**Call relations**: `ChatWidget::copy_last_agent_markdown` calls this with the real clipboard backend. The helper adds history messages using info or error events so the user gets feedback after the shortcut.
 
 *Call graph*: called by 1 (copy_last_agent_markdown); 3 external calls (format!, new_error_event, new_info_event).
 
@@ -3213,11 +3233,11 @@ fn copy_last_agent_markdown_with(
 fn last_agent_markdown_text(&self) -> Option<&str>
 ```
 
-**Purpose**: Test-only accessor for the currently stored last-agent markdown text.
+**Purpose**: This test-only helper exposes the saved last assistant response as plain text. It exists so tests can check copy-related state without reaching into private fields.
 
-**Data flow**: Returns `self.transcript.last_agent_markdown.as_deref()`, yielding `Option<&str>`.
+**Data flow**: It reads `last_agent_markdown` from the transcript and returns it as an optional string slice. It does not change anything.
 
-**Call relations**: Used in tests to assert copy-related transcript state without exposing mutable internals.
+**Call relations**: Because it is compiled only for tests, it supports verification around transcript and copy behavior rather than normal runtime interaction.
 
 
 ##### `ChatWidget::show_rename_prompt`  (lines 288–316)
@@ -3226,11 +3246,11 @@ fn last_agent_markdown_text(&self) -> Option<&str>
 fn show_rename_prompt(&mut self)
 ```
 
-**Purpose**: Opens a prompt view that lets the user name or rename the current thread, with validation and persistence routed through app events.
+**Purpose**: This opens a small prompt that lets the user name or rename the current chat thread. It prevents the prompt from opening when renaming is blocked.
 
-**Data flow**: First checks `ensure_thread_rename_allowed()`. If allowed, it clones `app_event_tx`, derives the existing non-empty thread name, chooses the title `Rename thread` or `Name thread`, constructs a `CustomPromptView` with initial text and a callback that normalizes the entered name, emits an error history cell if normalization returns `None`, or calls `tx.set_thread_name(name)` otherwise, and shows that view in the bottom pane.
+**Data flow**: It first checks whether renaming is allowed. If allowed, it builds a prompt title and initial text from the existing thread name, then shows a custom prompt in the bottom pane. When the user submits text, the prompt normalizes the name, reports an error if it is empty, or sends an event to update the thread name.
 
-**Call relations**: Invoked by rename UI actions. It depends on `ensure_thread_rename_allowed` for policy gating and uses a callback so the actual rename flows back through the app-event channel.
+**Call relations**: This method calls `ChatWidget::ensure_thread_rename_allowed` before creating the prompt. It hands the finished view to the bottom pane, while the prompt callback sends app events when the user confirms a name.
 
 *Call graph*: calls 2 internal fn (new, ensure_thread_rename_allowed); 1 external calls (new).
 
@@ -3241,11 +3261,11 @@ fn show_rename_prompt(&mut self)
 fn ensure_thread_rename_allowed(&mut self) -> bool
 ```
 
-**Purpose**: Checks whether thread renaming is currently blocked and surfaces the blocking reason if so.
+**Purpose**: This checks whether the current thread may be renamed. If renaming is blocked, it tells the user the reason.
 
-**Data flow**: Reads `self.thread_rename_block_message.clone()`. If `Some(message)`, it emits that as an error message and returns `false`; otherwise it returns `true`.
+**Data flow**: It reads an optional stored block message. If a message exists, it adds that message as an error and returns `false`; otherwise it returns `true`.
 
-**Call relations**: Used by `show_rename_prompt` as a guard before opening the rename UI.
+**Call relations**: `ChatWidget::show_rename_prompt` calls this before opening the rename UI. This keeps the prompt from appearing when the app already knows the rename cannot succeed.
 
 *Call graph*: called by 1 (show_rename_prompt).
 
@@ -3256,11 +3276,11 @@ fn ensure_thread_rename_allowed(&mut self) -> bool
 fn handle_paste(&mut self, text: String)
 ```
 
-**Purpose**: Passes pasted text into the bottom pane and refreshes plan-mode hinting.
+**Purpose**: This sends pasted text into the composer. It also refreshes plan-mode guidance because pasted content can change what mode or hint should be shown.
 
-**Data flow**: Takes `text`, forwards it to `bottom_pane.handle_paste(text)`, and refreshes the plan-mode nudge.
+**Data flow**: A pasted text string comes in. The function passes it to the bottom pane’s paste handling and then refreshes the plan-mode nudge. It does not directly return a value.
 
-**Call relations**: Used by paste event handling outside this file; paste-burst timing is handled separately by `handle_paste_burst_tick`.
+**Call relations**: Paste delivery code can call this when the terminal reports pasted text. The bottom pane updates the draft, while this method keeps chat-level hinting in sync.
 
 
 ##### `ChatWidget::handle_paste_burst_tick`  (lines 334–350)
@@ -3269,11 +3289,11 @@ fn handle_paste(&mut self, text: String)
 fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool
 ```
 
-**Purpose**: Advances paste-burst batching and decides whether the current frame should be skipped because another redraw is imminent.
+**Purpose**: This smooths out rapid paste input so the interface does not redraw too often while a large paste is still arriving. It decides whether the current frame should be skipped because a better one is coming soon.
 
-**Data flow**: Takes a `FrameRequester`. If `bottom_pane.flush_paste_burst_if_due()` returns true, it refreshes the plan-mode nudge, requests redraw, and returns `true`. Else if `bottom_pane.is_in_paste_burst()` is true, it schedules a future frame using `ChatComposer::recommended_paste_flush_delay()` and returns `true`. Otherwise it returns `false`.
+**Data flow**: A frame requester comes in. The function asks the bottom pane whether a paste burst is ready to flush. If it flushes, the plan nudge is refreshed, a redraw is requested, and `true` is returned. If the burst is still ongoing, it schedules another frame after the recommended delay and returns `true`. If no burst is active, it returns `false`.
 
-**Call relations**: Called from the render loop or frame scheduler to coalesce rapid paste events without redundant intermediate renders.
+**Call relations**: The render or frame loop can call this during paste bursts. It uses the composer’s recommended paste delay and the frame requester to avoid redundant redraws.
 
 *Call graph*: calls 2 internal fn (recommended_paste_flush_delay, schedule_frame_in).
 
@@ -3284,11 +3304,11 @@ fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool
 fn on_ctrl_c(&mut self)
 ```
 
-**Purpose**: Implements Ctrl+C semantics at the chat-widget layer: dismiss active views when they handle it, arm or consume the double-press quit shortcut, and interrupt cancellable work when appropriate.
+**Purpose**: This defines what Ctrl+C means on the chat screen. Depending on state, it can let the bottom pane cancel something, arm a double-press quit shortcut, interrupt active work, pause an active goal, or quit.
 
-**Data flow**: Builds the Ctrl+C `KeyBinding`, checks whether a modal/popup is active, and first delegates to `bottom_pane.on_ctrl_c()`. If that reports handled, it may arm or clear the quit shortcut depending on double-press settings and modal state, then returns. Without double-press support, it either interrupts cancellable work—clearing quit state, pausing any active goal, and submitting `AppCommand::interrupt_and_restore_prompt_if_no_output()`—or requests quit immediately. With double-press enabled, it quits immediately if the shortcut is already active for Ctrl+C; otherwise it arms the shortcut and, if cancellable work is active, pauses the goal and submits the interrupt op.
+**Data flow**: It reads whether a modal is open, whether the bottom pane consumes Ctrl+C, whether double-press quit is enabled, whether work is cancellable, and whether the quit shortcut is already armed. It then clears or arms quit state, sends interrupt commands when needed, pauses an active goal when appropriate, or requests quitting.
 
-**Call relations**: Called from `handle_key_event` on Ctrl+C presses. It relies on `quit_shortcut_active_for`, `arm_quit_shortcut`, `is_cancellable_work_active`, and `pause_active_goal_for_interrupt` to implement the state machine.
+**Call relations**: `ChatWidget::handle_key_event` calls this when it sees Ctrl+C. This method relies on `ChatWidget::arm_quit_shortcut`, `ChatWidget::quit_shortcut_active_for`, `ChatWidget::is_cancellable_work_active`, and `ChatWidget::pause_active_goal_for_interrupt` to keep the behavior safe and predictable.
 
 *Call graph*: calls 5 internal fn (arm_quit_shortcut, is_cancellable_work_active, pause_active_goal_for_interrupt, quit_shortcut_active_for, ctrl); called by 1 (handle_key_event); 2 external calls (Char, interrupt_and_restore_prompt_if_no_output).
 
@@ -3299,11 +3319,11 @@ fn on_ctrl_c(&mut self)
 fn on_ctrl_d(&mut self) -> bool
 ```
 
-**Purpose**: Implements Ctrl+D quit behavior, but only when the composer is empty and no modal/popup is active. It participates in the same optional double-press quit shortcut as Ctrl+C.
+**Purpose**: This defines what Ctrl+D means on the chat screen. It only participates in quitting when the composer is empty and no popup or modal is active.
 
-**Data flow**: Builds the Ctrl+D `KeyBinding`. Without double-press support, it returns `false` if the composer is non-empty or a modal/popup is active; otherwise it requests quit and returns `true`. With double-press enabled, it quits and returns `true` if the shortcut is already active for Ctrl+D; if the composer is non-empty or a modal/popup is active it returns `false`; otherwise it arms the shortcut and returns `true`.
+**Data flow**: It checks the double-press quit setting, the current quit shortcut state, whether the composer is empty, and whether a modal or popup is open. It either requests quit, arms the quit shortcut, returns `false` so the key can be routed elsewhere, or returns `true` to say it handled the key.
 
-**Call relations**: Called from `handle_key_event` on Ctrl+D presses. Its boolean return tells the caller whether the key was fully handled at the chat-widget layer.
+**Call relations**: `ChatWidget::handle_key_event` calls this when it sees Ctrl+D. It uses `ChatWidget::quit_shortcut_active_for` and `ChatWidget::arm_quit_shortcut` for the double-press quit flow.
 
 *Call graph*: calls 3 internal fn (arm_quit_shortcut, quit_shortcut_active_for, ctrl); called by 1 (handle_key_event); 1 external calls (Char).
 
@@ -3314,11 +3334,11 @@ fn on_ctrl_d(&mut self) -> bool
 fn quit_shortcut_active_for(&self, key: KeyBinding) -> bool
 ```
 
-**Purpose**: Checks whether a given key matches the currently armed quit shortcut and whether the timeout window is still open.
+**Purpose**: This checks whether a specific quit shortcut is currently armed and still within its short time window. It prevents an old first key press from causing a quit much later.
 
-**Data flow**: Reads `self.quit_shortcut_key` and `self.quit_shortcut_expires_at`, compares the key for equality, checks `Instant::now() < expires_at` when an expiry exists, and returns the combined boolean.
+**Data flow**: A key binding comes in. The function compares it with the stored quit shortcut key and checks whether the stored expiry time is still in the future. It returns `true` only when both match.
 
-**Call relations**: Used by both `on_ctrl_c` and `on_ctrl_d` to detect the second press that should trigger immediate quit.
+**Call relations**: `ChatWidget::on_ctrl_c` and `ChatWidget::on_ctrl_d` call this before deciding that a second shortcut press should quit. It is the timer check for the double-press safety feature.
 
 *Call graph*: called by 2 (on_ctrl_c, on_ctrl_d).
 
@@ -3329,11 +3349,11 @@ fn quit_shortcut_active_for(&self, key: KeyBinding) -> bool
 fn arm_quit_shortcut(&mut self, key: KeyBinding)
 ```
 
-**Purpose**: Arms the double-press quit shortcut for a specific key and shows the corresponding footer hint.
+**Purpose**: This starts the short window where pressing the same quit shortcut again will exit the app. It also shows a footer hint so the user knows what just happened.
 
-**Data flow**: Computes `quit_shortcut_expires_at` as `Instant::now().checked_add(QUIT_SHORTCUT_TIMEOUT)` with a fallback to `Some(Instant::now())`, stores the provided `key` in `quit_shortcut_key`, and calls `bottom_pane.show_quit_shortcut_hint(key)`.
+**Data flow**: A key binding comes in. The function records that key, sets an expiry time a short duration in the future, and tells the bottom pane to show the quit-shortcut hint.
 
-**Call relations**: Called by `on_ctrl_c` and `on_ctrl_d` when the first press should prepare a time-bounded second-press quit.
+**Call relations**: `ChatWidget::on_ctrl_c` and `ChatWidget::on_ctrl_d` call this when the first quit-related shortcut press should not quit immediately. It stores the state in `ChatWidget` and delegates the visual hint to the bottom pane.
 
 *Call graph*: called by 2 (on_ctrl_c, on_ctrl_d); 1 external calls (now).
 
@@ -3344,11 +3364,11 @@ fn arm_quit_shortcut(&mut self, key: KeyBinding)
 fn is_cancellable_work_active(&self) -> bool
 ```
 
-**Purpose**: Reports whether Ctrl+C should interrupt work instead of acting purely as a quit shortcut. Review mode counts as cancellable work even without a running task.
+**Purpose**: This answers whether Ctrl+C should interrupt work instead of simply quitting. Review mode counts as cancellable work, even if the bottom pane is not reporting a normal running task.
 
-**Data flow**: Reads `self.bottom_pane.is_task_running()` and `self.review.is_review_mode`, ORs them, and returns the result.
+**Data flow**: It reads whether the bottom pane has a running task and whether review mode is active. It returns `true` if either condition is true.
 
-**Call relations**: Consulted by `on_ctrl_c` to decide whether an interrupt op should be submitted.
+**Call relations**: `ChatWidget::on_ctrl_c` calls this to decide whether to submit an interrupt command. This keeps the interrupt-versus-quit decision in one small place.
 
 *Call graph*: called by 1 (on_ctrl_c).
 
@@ -3359,11 +3379,11 @@ fn is_cancellable_work_active(&self) -> bool
 fn pause_active_goal_for_interrupt(&self)
 ```
 
-**Purpose**: Marks the current thread goal as paused before interrupting an active agent turn, but only when a goal is actually active and a thread id is known.
+**Purpose**: This marks the current thread goal as paused when the user interrupts an active assistant turn. It keeps goal status aligned with the user’s decision to stop the running work.
 
-**Data flow**: Reads `self.turn_lifecycle.agent_turn_running`, `self.current_goal_status`, and `self.thread_id`. If any prerequisite fails it returns early. Otherwise it sends `AppEvent::SetThreadGoalStatus { thread_id, status: AppThreadGoalStatus::Paused }` through `app_event_tx`.
+**Data flow**: It reads whether an agent turn is running, whether the current goal status is active, and whether there is a thread id. If all are true, it sends an app event changing that thread’s goal status to paused. If any condition is missing, it does nothing.
 
-**Call relations**: Called from `on_ctrl_c` immediately before submitting an interrupt op so goal state stays consistent with the impending interruption.
+**Call relations**: `ChatWidget::on_ctrl_c` calls this before submitting an interrupt command. It does not interrupt by itself; it updates the thread-goal status so the rest of the app sees that the goal was paused because of the interrupt.
 
 *Call graph*: called by 1 (on_ctrl_c).
 
@@ -3373,13 +3393,15 @@ Routes slash commands and supports the contextual command features that enrich o
 
 ### `tui/src/chatwidget/skills.rs`
 
-`domain_logic` · `skills popup interaction, skills refresh, and mention parsing during input handling`
+`domain_logic` · `request handling`
 
-This file has two distinct responsibilities. On the UI side, it opens the skills list/menu, builds the manage-skills popup, tracks the initial enabled/disabled state while that popup is open, applies toggles back into `skills_all`, and emits a summary info message when the popup closes with changes. It also loads skill metadata from `SkillsListResponse` by selecting the entry matching the current cwd and converting enabled protocol skills into core `SkillMetadata` for mention completion.
+A “skill” here is an add-on the assistant can use, described by a SKILL.md file. This file is the chat widget’s skill control center. It gives users two main doors: a quick way to open the skill mention list by typing the mention symbol, and a menu where they can choose to list skills or turn skills on and off.
 
-On the parsing side, it provides the mention-resolution utilities used to interpret `$name`/`@name`-style tool mentions and linked markdown mentions like `[$foo](skill://...)` or `[$bar](app://...)`. The parser scans raw bytes, recognizes mention-name characters (`[A-Za-z0-9_-]`), ignores common environment-variable names such as `PATH` and `HOME`, and records both plain names and linked paths. Skill matching prefers exact normalized skill-path matches first, then falls back to unique skill-name matches while deduplicating by both path and name. App matching similarly honors explicit `app://` bindings first, then unique connector slugs for accessible and enabled apps, while avoiding collisions with skill names.
+It also keeps the chat widget’s local skill list in sync with data from the server. When the server sends many skill lists for different working folders, this file picks the one for the current folder. It then converts enabled skills into the core format used by mention autocomplete and later assistant behavior.
 
-The file also includes tests that verify inaccessible or disabled apps are excluded from app-mention resolution for both slug-only and bound-path cases.
+Another important job is reading the user’s typed message and finding mentions such as `$my-skill` or linked mentions like `[$my-skill](skill://...)`. Think of this as a receptionist checking names on a guest list: it extracts the names, connects them to known skill paths when possible, and avoids mistaking common environment variables like `$PATH` for skill mentions. It can also recognize app mentions such as `app://google_drive`, but only if the app is both accessible and enabled.
+
+Finally, it improves command display by labeling reads of SKILL.md files with the skill name, so users can better understand why a file was read.
 
 #### Function details
 
@@ -3389,11 +3411,11 @@ The file also includes tests that verify inaccessible or disabled apps are exclu
 fn open_skills_list(&mut self)
 ```
 
-**Purpose**: Inserts the mention trigger character into the composer to open the skills list directly. The trigger is `@` when MentionsV2 is enabled and `$` otherwise.
+**Purpose**: This opens the skill mention list from the chat input. It inserts the right mention symbol into the input box, using `@` when the newer mentions feature is enabled and `$` otherwise.
 
-**Data flow**: It reads the MentionsV2 feature flag from config, chooses either `"@"` or `"$"`, and passes that string to `self.insert_str(...)`. It returns nothing.
+**Data flow**: It reads the chat widget configuration to see which mentions feature is active. Based on that setting, it adds one character to the current input text. It does not return a value; the visible chat input changes.
 
-**Call relations**: This is the direct-entry action for opening skill mentions from the UI. It does not build a popup itself; it relies on the composer’s mention behavior after inserting the trigger.
+**Call relations**: This is used when the user asks to open the skills list directly. It does not build the list itself; it nudges the existing input and mention system by inserting the trigger character.
 
 
 ##### `ChatWidget::open_skills_menu`  (lines 35–71)
@@ -3402,11 +3424,11 @@ fn open_skills_list(&mut self)
 fn open_skills_menu(&mut self)
 ```
 
-**Purpose**: Builds and shows a small popup with two skills actions: open the list directly or open the enable/disable management popup. The description text includes the current direct-open shortcut.
+**Purpose**: This opens a small menu called “Skills” with choices for listing skills or enabling and disabling them. It gives users a friendly control panel instead of requiring them to remember shortcuts.
 
-**Data flow**: It reads the MentionsV2 feature flag to choose the shortcut character, constructs two `SelectionItem`s whose actions send `AppEvent::OpenSkillsList` or `AppEvent::OpenManageSkillsPopup`, wraps them in `SelectionViewParams` with title/subtitle/footer hint, and shows the selection view in the bottom pane. It returns nothing.
+**Data flow**: It reads the feature flag to decide whether the direct-list shortcut should be shown as `@` or `$`. It builds two menu items, each with an action that sends an app event when selected, then asks the bottom pane to show that selection view.
 
-**Call relations**: This method is the higher-level skills menu entrypoint. It delegates footer-hint generation to `standard_popup_hint_line` and popup rendering to the bottom pane.
+**Call relations**: When the user opens the skills menu, this function prepares the visible choices. Selecting “List skills” sends an event to open the list, while selecting “Enable/Disable Skills” sends an event that later leads to `ChatWidget::open_manage_skills_popup`.
 
 *Call graph*: calls 1 internal fn (standard_popup_hint_line); 2 external calls (default, vec!).
 
@@ -3417,11 +3439,11 @@ fn open_skills_menu(&mut self)
 fn open_manage_skills_popup(&mut self)
 ```
 
-**Purpose**: Opens the interactive enable/disable skills view for the currently loaded skills. It snapshots the initial enabled state so changes can be summarized when the popup closes.
+**Purpose**: This opens the popup where users can turn individual skills on or off. If there are no skills, it tells the user instead of showing an empty control.
 
-**Data flow**: It first checks `self.skills_all`; if empty it adds an info message and returns. Otherwise it builds a `HashMap<AbsolutePathBuf, bool>` of initial enabled states into `self.skills_initial_state`, converts each protocol skill to core metadata with `protocol_skill_to_core`, maps those into `SkillsToggleItem`s, constructs a `SkillsToggleView` with the items, app-event sender, and list keymap, and shows that view in the bottom pane. It returns nothing.
+**Data flow**: It reads all known skills from the chat widget. First it records each skill’s current enabled state so later it can report what changed. Then it converts each server-format skill into the core skill format, builds a toggle row with a display name, description, path, and current on/off state, and shows the toggle view in the bottom pane.
 
-**Call relations**: This popup builder is triggered from the skills menu. It depends on `protocol_skill_to_core` for metadata conversion and delegates the interactive UI to `SkillsToggleView::new`.
+**Call relations**: This function is reached from the skills menu flow. It relies on `protocol_skill_to_core` to translate server skill records into the format expected by UI helper functions, then hands the finished rows to `SkillsToggleView` for display.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, new).
 
@@ -3432,11 +3454,11 @@ fn open_manage_skills_popup(&mut self)
 fn update_skill_enabled(&mut self, path: AbsolutePathBuf, enabled: bool)
 ```
 
-**Purpose**: Updates the enabled flag for a single skill identified by path and refreshes the bottom pane’s mentionable skills list to include only enabled skills. It mutates the in-memory `skills_all` cache in place.
+**Purpose**: This records that one skill has been turned on or off. It also refreshes the set of enabled skills used by mention autocomplete.
 
-**Data flow**: It takes a skill `path` and `enabled` boolean, iterates `self.skills_all` mutably to update matching entries, computes the enabled core skills via `enabled_skills_for_mentions(&self.skills_all)`, and forwards them through `self.set_skills(Some(...))`. It returns nothing.
+**Data flow**: It receives a skill file path and a new enabled value. It scans the stored skill list, changes the matching skill’s enabled flag, then rebuilds the enabled-skill list and gives it back to the chat widget’s skill mention system.
 
-**Call relations**: This method is used by the manage-skills UI when toggles change. It delegates enabled-skill extraction to `enabled_skills_for_mentions` and then updates the bottom pane through `ChatWidget::set_skills`.
+**Call relations**: The skills toggle popup calls this kind of update when a user flips a switch. It then uses `enabled_skills_for_mentions` so the mention list immediately reflects the user’s choices.
 
 *Call graph*: calls 1 internal fn (enabled_skills_for_mentions).
 
@@ -3447,11 +3469,11 @@ fn update_skill_enabled(&mut self, path: AbsolutePathBuf, enabled: bool)
 fn handle_manage_skills_closed(&mut self)
 ```
 
-**Purpose**: Compares the current skill enabled-state map against the snapshot taken when the manage-skills popup opened and emits a summary info message if any skills changed. No message is shown when nothing changed or no snapshot exists.
+**Purpose**: This reports how many skills were enabled or disabled while the manage-skills popup was open. It avoids bothering the user if nothing changed.
 
-**Data flow**: It takes no arguments, removes `self.skills_initial_state`, builds a current-state map from `self.skills_all`, counts transitions from disabled→enabled and enabled→disabled for paths present in both maps, and if either count is nonzero adds an info message like `"X skills enabled, Y skills disabled"`. It returns nothing.
+**Data flow**: It takes the saved starting state, compares it with the current skill states, counts how many changed from off to on and from on to off, and adds an informational chat message if either count is nonzero. It also clears the saved starting state.
 
-**Call relations**: This close-handler complements `ChatWidget::open_manage_skills_popup`, which stored the initial state. It performs all comparison locally and only emits a summary message when there were actual changes.
+**Call relations**: This belongs at the end of the manage-skills popup flow. `ChatWidget::open_manage_skills_popup` saves the original states; this function compares against them when the popup closes.
 
 *Call graph*: 2 external calls (new, format!).
 
@@ -3462,11 +3484,11 @@ fn handle_manage_skills_closed(&mut self)
 fn set_skills_from_response(&mut self, response: &SkillsListResponse)
 ```
 
-**Purpose**: Loads the current cwd’s skills from a `SkillsListResponse`, caches the full protocol metadata list, and refreshes the mentionable enabled-skill list. It is the app-server response ingestion point for skills.
+**Purpose**: This updates the chat widget when the app server sends a list of available skills. It keeps only the skills that apply to the current working folder.
 
-**Data flow**: It takes a `&SkillsListResponse`, selects the matching cwd entry via `skills_for_cwd(&self.config.cwd, &response.data)`, stores that vector in `self.skills_all`, computes enabled core skills with `enabled_skills_for_mentions`, and forwards them through `self.set_skills(Some(...))`. It returns nothing.
+**Data flow**: It receives a server response containing skill lists for one or more folders. It reads the chat widget’s current folder, picks the matching skill list, stores it as the full skill list, then separately prepares the enabled skills for mentions.
 
-**Call relations**: This method is called when fresh skills metadata arrives from the server. It delegates cwd filtering to `skills_for_cwd` and enabled-skill extraction to `enabled_skills_for_mentions`.
+**Call relations**: This is the entry point for fresh skill data from the server. It delegates folder matching to `skills_for_cwd` and enabled-skill filtering and conversion to `enabled_skills_for_mentions`.
 
 *Call graph*: calls 2 internal fn (enabled_skills_for_mentions, skills_for_cwd).
 
@@ -3480,11 +3502,11 @@ fn annotate_skill_reads_in_parsed_cmd(
     ) -> Vec<ParsedCommand>
 ```
 
-**Purpose**: Best-effort annotates parsed `Read` commands that target `SKILL.md` with the corresponding skill name, making command displays more informative. Only exact path matches against the loaded skills list are annotated.
+**Purpose**: This makes command summaries clearer when the assistant reads a skill file. If a parsed command says it read `SKILL.md`, this function can add the skill name beside it.
 
-**Data flow**: It takes ownership of `Vec<ParsedCommand>`, returns early unchanged if `skills_all` is empty, otherwise iterates mutably through commands, finds `ParsedCommand::Read { name, path, .. }` entries whose `name` is exactly `"SKILL.md"`, looks for a loaded skill whose path matches `path`, and rewrites the command name to `"SKILL.md (<skill name> skill)"`. It returns the modified vector.
+**Data flow**: It receives a list of parsed command records. For each record that is a file read named `SKILL.md`, it compares the read path with known skill paths. When it finds an exact match, it changes the displayed name to include the skill’s name. It returns the updated command list.
 
-**Call relations**: This helper is used when displaying parsed command activity so skill reads are easier to interpret. It does not delegate beyond string formatting and local skill lookup.
+**Call relations**: This is used after commands have already been parsed and before they are shown to the user. It does not discover skills itself; it uses the skill list already stored in the chat widget.
 
 *Call graph*: 1 external calls (format!).
 
@@ -3498,11 +3520,11 @@ fn skills_for_cwd(
 ) -> Vec<ProtocolSkillMetadata>
 ```
 
-**Purpose**: Selects the protocol skill list entry whose cwd matches the provided cwd and returns its skills vector. If no entry matches, it returns an empty vector.
+**Purpose**: This picks the skills that belong to the current working directory. It prevents the chat screen from showing skills meant for a different folder.
 
-**Data flow**: It takes a `cwd` and a slice of `SkillsListEntry`, searches for the first entry whose `entry.cwd` path equals `cwd`, clones that entry’s `skills` vector when found, and otherwise returns `Vec::new()`. It mutates no external state.
+**Data flow**: It receives the current folder path and a list of server entries, where each entry has a folder and its skills. It searches for the entry whose folder matches the current one and returns that entry’s skills, or an empty list if there is no match.
 
-**Call relations**: This helper is called by `ChatWidget::set_skills_from_response` to extract only the skills relevant to the widget’s current working directory.
+**Call relations**: It is called by `ChatWidget::set_skills_from_response` when fresh server data arrives. Its output becomes the chat widget’s full local skill list.
 
 *Call graph*: called by 1 (set_skills_from_response); 1 external calls (iter).
 
@@ -3513,11 +3535,11 @@ fn skills_for_cwd(
 fn enabled_skills_for_mentions(skills: &[ProtocolSkillMetadata]) -> Vec<SkillMetadata>
 ```
 
-**Purpose**: Filters a protocol skill list down to enabled skills and converts each one into core `SkillMetadata` suitable for mention completion. Invalid protocol entries are skipped.
+**Purpose**: This creates the list of skills that should appear in mention suggestions. Disabled skills are left out.
 
-**Data flow**: It takes a slice of `ProtocolSkillMetadata`, filters to `skill.enabled == true`, runs each through `protocol_skill_to_core`, drops `None` results, and returns the collected `Vec<SkillMetadata>`. It mutates no state.
+**Data flow**: It receives all server-format skills. It keeps only those marked enabled, converts each one to the core skill format, skips any that cannot be converted, and returns the converted list.
 
-**Call relations**: This helper is used by both `ChatWidget::set_skills_from_response` and `ChatWidget::update_skill_enabled` to derive the bottom pane’s mentionable skills.
+**Call relations**: It is called after skill data is loaded and after a user toggles a skill. `ChatWidget::set_skills_from_response` uses it for initial setup, and `ChatWidget::update_skill_enabled` uses it after changes.
 
 *Call graph*: called by 2 (set_skills_from_response, update_skill_enabled); 1 external calls (iter).
 
@@ -3528,11 +3550,11 @@ fn enabled_skills_for_mentions(skills: &[ProtocolSkillMetadata]) -> Vec<SkillMet
 fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> Option<SkillMetadata>
 ```
 
-**Purpose**: Converts app-server `ProtocolSkillMetadata` into core `SkillMetadata`, including nested interface and tool-dependency structures. Scope conversion is performed through JSON round-tripping and failures are logged and dropped.
+**Purpose**: This translates a skill record from the app-server format into the core skill format used inside the client. It is a bridge between two parts of the system that describe the same idea with different data types.
 
-**Data flow**: It takes a protocol skill reference, serializes `skill.scope` with `serde_json::to_value`, deserializes it into the core scope type, logs a warning and returns `None` on conversion failure, and otherwise constructs a new `SkillMetadata` by cloning/copying the protocol fields into core equivalents, including mapped `SkillInterface`, `SkillDependencies`, and `SkillToolDependency` values. It returns `Option<SkillMetadata>`.
+**Data flow**: It receives one server skill record. It converts the skill scope, copies names and descriptions, converts optional interface details, converts tool dependencies, fills in client-only fields such as policy and plugin ID as absent, and returns a core skill record. If the scope conversion fails, it logs a warning and returns nothing.
 
-**Call relations**: This converter is used by popup-building and mention-preparation helpers whenever protocol skill metadata must be consumed by core/UI code.
+**Call relations**: Several flows need this translation before skills can be displayed or used for mentions. It is used by `ChatWidget::open_manage_skills_popup` and by `enabled_skills_for_mentions`.
 
 *Call graph*: 1 external calls (to_value).
 
@@ -3546,11 +3568,11 @@ fn collect_tool_mentions(
 ) -> ToolMentions
 ```
 
-**Purpose**: Parses tool mentions from raw text and enriches them with explicit linked paths from a provided mention-binding map when the mentioned names match. It produces the combined `ToolMentions` structure used by skill/app resolution.
+**Purpose**: This extracts tool-like mentions from user text and connects them to known paths when the caller has that information. It turns raw typing into structured mention data.
 
-**Data flow**: It takes input `text` and a `HashMap<String, String>` of `mention_paths`, calls `extract_tool_mentions_from_text(text)` to get initial names and linked paths, then for each binding inserts the path into `mentions.linked_paths` when the mention name is present in `mentions.names`. It returns the enriched `ToolMentions`.
+**Data flow**: It receives the text the user typed and a map from mention names to paths. It first scans the text for mention names. Then, for any extracted name that appears in the provided path map, it records the matching path. It returns a `ToolMentions` object containing names and linked paths.
 
-**Call relations**: This helper is used by the tests in this file and by higher-level mention resolution code. It delegates raw parsing to `extract_tool_mentions_from_text`.
+**Call relations**: This is the public helper for mention collection in this file. It calls `extract_tool_mentions_from_text` for the scan, then enriches the result with caller-provided path bindings. The tests use it before checking app mention matching.
 
 *Call graph*: calls 1 internal fn (extract_tool_mentions_from_text); called by 2 (find_app_mentions_requires_accessible_enabled_apps_for_bound_paths, find_app_mentions_requires_accessible_enabled_apps_for_slugs).
 
@@ -3564,11 +3586,11 @@ fn find_skill_mentions_with_tool_mentions(
 ) -> Vec<SkillMetadata>
 ```
 
-**Purpose**: Resolves a parsed `ToolMentions` set against available skills, preferring exact linked skill-path matches and then falling back to unique skill-name matches. It deduplicates by both skill path and skill name.
+**Purpose**: This matches extracted mentions against known skills. It supports both exact path-based mentions and plain name-based mentions.
 
-**Data flow**: It takes `mentions` and a slice of core `SkillMetadata`, builds a normalized set of linked skill paths from `mentions.linked_paths`, then performs two passes over `skills`: first selecting exact path matches, then selecting remaining name matches from `mentions.names` while tracking `seen_names` and `seen_paths`. It returns the ordered `Vec<SkillMetadata>` matches.
+**Data flow**: It receives parsed mentions and a list of available core skills. First it looks for linked mention paths that point to skill files, normalizes those paths, and matches skills by path. Then it looks for remaining skills whose names were mentioned directly. It avoids returning the same skill twice and returns the matched skills.
 
-**Call relations**: This is the skill-resolution half of mention handling. It depends on `is_skill_path` and `normalize_skill_path` semantics encoded earlier in the file and performs all matching locally.
+**Call relations**: This function sits after mention extraction. `collect_tool_mentions` produces the mention data, and this function turns that data into actual skill records the rest of the system can use.
 
 *Call graph*: 2 external calls (new, new).
 
@@ -3583,11 +3605,11 @@ fn find_app_mentions(
 ) -> Vec<AppInfo>
 ```
 
-**Purpose**: Resolves tool mentions to connector `AppInfo` entries, honoring explicit `app://` bindings first and then unique connector slugs for accessible, enabled apps that do not collide with skill names. It filters out inaccessible or disabled apps throughout.
+**Purpose**: This finds app mentions in the user’s text. It only returns apps that are enabled and accessible, so the assistant does not try to use unavailable apps.
 
-**Data flow**: Inputs are `mentions`, a slice of `AppInfo`, and a set of lowercased skill names. It first scans `mentions.linked_paths`, extracting explicit app ids via `app_id_from_path` into `selected_ids` and recording explicit names. It then counts mention slugs among mentionable apps, performs a second pass to add uniquely matching slug mentions that are not explicit and do not collide with skill names, and finally returns cloned apps whose ids are in `selected_ids` and which satisfy `is_app_mentionable`. It mutates no external state.
+**Data flow**: It receives parsed mentions, a list of apps, and lower-case skill names that could conflict with app slugs. It first accepts explicit linked paths like `app://...`. Then it checks plain mention names against each app’s generated mention slug, but only when the slug uniquely identifies one app and does not collide with a skill name. It returns the matching app records.
 
-**Call relations**: This helper is the app-resolution counterpart to skill matching. It delegates slug generation to `codex_connectors::metadata::connector_mention_slug`, explicit-path parsing to `app_id_from_path`, and accessibility filtering to `is_app_mentionable`.
+**Call relations**: This function uses `app_id_from_path` for explicit app links and `is_app_mentionable` to filter out apps the user cannot use. The tests in this file verify that inaccessible or disabled apps are not returned.
 
 *Call graph*: calls 2 internal fn (connector_mention_slug, app_id_from_path); 3 external calls (new, new, iter).
 
@@ -3598,11 +3620,11 @@ fn find_app_mentions(
 fn is_app_mentionable(app: &AppInfo) -> bool
 ```
 
-**Purpose**: Returns whether an app is eligible for mention resolution. Both accessibility and enabled state must be true.
+**Purpose**: This answers a simple yes-or-no question: can this app be mentioned and used right now? An app must be both accessible and enabled.
 
-**Data flow**: It reads `app.is_accessible` and `app.is_enabled`, returns their conjunction, and mutates nothing.
+**Data flow**: It receives an app record, reads its `is_accessible` and `is_enabled` flags, and returns true only if both are true. It does not change anything.
 
-**Call relations**: This predicate is used by `find_app_mentions` to consistently exclude unavailable connectors.
+**Call relations**: It is used by `find_app_mentions` whenever that function considers app candidates. This keeps the availability rule in one small, easy-to-read place.
 
 
 ##### `extract_tool_mentions_from_text`  (lines 357–359)
@@ -3611,11 +3633,11 @@ fn is_app_mentionable(app: &AppInfo) -> bool
 fn extract_tool_mentions_from_text(text: &str) -> ToolMentions
 ```
 
-**Purpose**: Parses tool mentions from text using the default tool-mention sigil configured by `TOOL_MENTION_SIGIL`. It is a thin wrapper around the sigil-parameterized parser.
+**Purpose**: This scans user text for tool mentions using the standard mention symbol. It is the normal entry point for raw mention extraction.
 
-**Data flow**: It takes `&str text`, calls `extract_tool_mentions_from_text_with_sigil(text, TOOL_MENTION_SIGIL)`, and returns the resulting `ToolMentions`. It mutates no state.
+**Data flow**: It receives plain text. It passes that text and the configured tool mention symbol to the lower-level scanner, then returns the extracted mention names and linked paths.
 
-**Call relations**: This wrapper is called by `collect_tool_mentions` so most callers do not need to know the configured sigil.
+**Call relations**: It is called by `collect_tool_mentions`. The actual scanning rules live in `extract_tool_mentions_from_text_with_sigil`, which this function calls with the standard symbol.
 
 *Call graph*: calls 1 internal fn (extract_tool_mentions_from_text_with_sigil); called by 1 (collect_tool_mentions).
 
@@ -3626,11 +3648,11 @@ fn extract_tool_mentions_from_text(text: &str) -> ToolMentions
 fn extract_tool_mentions_from_text_with_sigil(text: &str, sigil: char) -> ToolMentions
 ```
 
-**Purpose**: Scans raw text bytes for plain and linked tool mentions using a specified sigil, collecting mention names and linked paths while ignoring common environment-variable names. Linked skill paths also contribute their names to the plain-name set.
+**Purpose**: This is the detailed scanner that finds mention names in text. It understands both simple mentions like `$name` and linked mentions like `[$name](some/path)`.
 
-**Data flow**: It takes `text` and a `sigil`, iterates byte-by-byte through `text.as_bytes()`, first attempting to parse markdown-style linked mentions with `parse_linked_tool_mention`, then recognizing plain sigil-prefixed names composed of `is_mention_name_char` bytes. It filters out names like `PATH` via `is_common_env_var`, records linked paths, inserts names into a `HashSet`, and returns `ToolMentions { names, linked_paths }`.
+**Data flow**: It receives text and the mention symbol to look for. It walks through the text byte by byte, collecting names made of letters, numbers, underscores, and hyphens. For linked mentions, it also records the path. It skips common environment variables such as `$PATH`, and for linked skill paths it records the name as a mention. It returns a `ToolMentions` object.
 
-**Call relations**: This is the core mention parser used by `extract_tool_mentions_from_text`. It delegates linked-mention parsing to `parse_linked_tool_mention` and uses `is_common_env_var`, `is_mention_name_char`, and `is_skill_path` to enforce parsing rules.
+**Call relations**: This function is called by `extract_tool_mentions_from_text`. It calls `parse_linked_tool_mention` when it sees a possible linked form, and uses small helper checks such as `is_common_env_var`, `is_mention_name_char`, and `is_skill_path` while scanning.
 
 *Call graph*: calls 4 internal fn (is_common_env_var, is_mention_name_char, is_skill_path, parse_linked_tool_mention); called by 1 (extract_tool_mentions_from_text); 2 external calls (new, new).
 
@@ -3646,11 +3668,11 @@ fn parse_linked_tool_mention(
 ) -> Option<(&'a str, &'a str, usize)>
 ```
 
-**Purpose**: Parses a markdown-style linked tool mention of the form `[@name](path)` or `[$name](path)` starting at a given byte index. It validates sigil, mention-name characters, closing bracket/parenthesis, and non-empty path.
+**Purpose**: This tries to read one linked mention from a specific place in the text. A linked mention looks like a label plus a path, similar to a Markdown link.
 
-**Data flow**: It takes the original `text`, its byte slice, a `start` index, and the expected `sigil`. It checks for `'['`, the sigil byte, a valid first name byte, consumes subsequent mention-name bytes, requires `']'`, skips whitespace, requires `'('`, scans until `')'`, trims the path, and returns `Some((name, path, end_index))` or `None` on any structural failure. It mutates no state.
+**Data flow**: It receives the full text, its bytes, a starting position, and the mention symbol. It checks for the exact pattern `[symbol name](path)`, verifies the name characters, trims the path, and rejects empty paths. If the pattern is valid, it returns the name, path, and the position after the linked mention; otherwise it returns nothing.
 
-**Call relations**: This parser is called from `extract_tool_mentions_from_text_with_sigil` whenever a `[` byte is encountered. It relies on `is_mention_name_char` for name validation.
+**Call relations**: The main scanner, `extract_tool_mentions_from_text_with_sigil`, calls this whenever it sees `[` and wants to know whether a linked mention starts there. This helper keeps that special parsing separate from the simpler `$name` scan.
 
 *Call graph*: calls 1 internal fn (is_mention_name_char); called by 1 (extract_tool_mentions_from_text_with_sigil).
 
@@ -3661,11 +3683,11 @@ fn parse_linked_tool_mention(
 fn is_common_env_var(name: &str) -> bool
 ```
 
-**Purpose**: Recognizes environment-variable-like names that should not be treated as tool mentions. The check is case-insensitive via uppercase normalization.
+**Purpose**: This prevents ordinary shell environment variables from being mistaken for tool or skill mentions. For example, `$PATH` should usually mean the system path, not a skill named PATH.
 
-**Data flow**: It takes a `&str`, converts it to uppercase ASCII, matches it against a fixed set such as `PATH`, `HOME`, `USER`, `PWD`, `TMPDIR`, and returns a boolean. It mutates nothing.
+**Data flow**: It receives a name, converts it to uppercase, and checks it against a fixed list of common environment variable names. It returns true for those common names and false otherwise.
 
-**Call relations**: This predicate is used by the mention parser to suppress false positives from shell/environment text.
+**Call relations**: It is used by `extract_tool_mentions_from_text_with_sigil` after a possible mention name is found. This keeps mention detection from being too eager in command-like text.
 
 *Call graph*: called by 1 (extract_tool_mentions_from_text_with_sigil); 1 external calls (matches!).
 
@@ -3676,11 +3698,11 @@ fn is_common_env_var(name: &str) -> bool
 fn is_mention_name_char(byte: u8) -> bool
 ```
 
-**Purpose**: Defines the allowed byte set for mention names: ASCII letters, digits, underscore, and hyphen. It is the lexical rule shared by plain and linked mention parsing.
+**Purpose**: This defines which characters are allowed inside a mention name. Allowed names can contain letters, numbers, underscores, and hyphens.
 
-**Data flow**: It takes a `u8` byte and returns whether it matches the allowed ranges/characters. No state is read or mutated.
+**Data flow**: It receives one byte from the text and returns true if that byte is an allowed mention-name character. It does not inspect the whole string or change anything.
 
-**Call relations**: This helper is used by both `extract_tool_mentions_from_text_with_sigil` and `parse_linked_tool_mention` to keep mention-name parsing consistent.
+**Call relations**: Both `extract_tool_mentions_from_text_with_sigil` and `parse_linked_tool_mention` use this helper while reading mention names. It gives both simple and linked mentions the same naming rules.
 
 *Call graph*: called by 2 (extract_tool_mentions_from_text_with_sigil, parse_linked_tool_mention); 1 external calls (matches!).
 
@@ -3691,11 +3713,11 @@ fn is_mention_name_char(byte: u8) -> bool
 fn is_skill_path(path: &str) -> bool
 ```
 
-**Purpose**: Classifies a linked mention path as a skill path rather than an app/MCP/plugin path. Any path not starting with `app://`, `mcp://`, or `plugin://` is treated as a skill path.
+**Purpose**: This decides whether a linked path should be treated as a skill path rather than an app, MCP server, or plugin path. MCP is an external tool connection protocol, and those paths are intentionally excluded here.
 
-**Data flow**: It takes a `&str path`, checks its prefixes, and returns a boolean. It mutates no state.
+**Data flow**: It receives a path string and checks its prefix. If the path starts with `app://`, `mcp://`, or `plugin://`, it returns false; otherwise it returns true.
 
-**Call relations**: This helper is used during mention parsing and skill matching to distinguish skill links from connector/plugin links.
+**Call relations**: It is used while extracting linked mentions and while matching skill mentions. It helps keep different mention types from being mixed together.
 
 *Call graph*: called by 1 (extract_tool_mentions_from_text_with_sigil).
 
@@ -3706,11 +3728,11 @@ fn is_skill_path(path: &str) -> bool
 fn normalize_skill_path(path: &str) -> &str
 ```
 
-**Purpose**: Normalizes a skill path by stripping the optional `skill://` prefix. Paths without that prefix are returned unchanged.
+**Purpose**: This removes the optional `skill://` prefix from a skill path. It lets prefixed and unprefixed forms compare as the same path.
 
-**Data flow**: It takes a `&str path`, applies `strip_prefix("skill://")`, and returns the stripped or original `&str`. It mutates nothing.
+**Data flow**: It receives a path string. If the string starts with `skill://`, it returns the part after that prefix; otherwise it returns the original string unchanged.
 
-**Call relations**: This helper is used by skill mention matching so linked skill paths compare correctly against stored filesystem-like skill paths.
+**Call relations**: It is used by `find_skill_mentions_with_tool_mentions` when comparing linked mention paths with known skill file paths. This makes matching more forgiving.
 
 
 ##### `app_id_from_path`  (lines 507–510)
@@ -3719,11 +3741,11 @@ fn normalize_skill_path(path: &str) -> &str
 fn app_id_from_path(path: &str) -> Option<&str>
 ```
 
-**Purpose**: Extracts the connector app id from an `app://...` linked mention path, rejecting empty ids. Non-app paths return `None`.
+**Purpose**: This extracts an app ID from a linked app path such as `app://google_drive`. It rejects empty app IDs.
 
-**Data flow**: It takes a `&str path`, strips the `app://` prefix, filters out empty results, and returns `Option<&str>`. It mutates no state.
+**Data flow**: It receives a path string. If the path starts with `app://` and has non-empty text after that prefix, it returns that text as the app ID. Otherwise it returns nothing.
 
-**Call relations**: This helper is used by `find_app_mentions` to honor explicit app bindings from linked mentions.
+**Call relations**: It is called by `find_app_mentions` when processing explicitly linked app mentions. The extracted ID is then used to select the matching app from the app list.
 
 *Call graph*: called by 1 (find_app_mentions).
 
@@ -3734,11 +3756,11 @@ fn app_id_from_path(path: &str) -> Option<&str>
 fn app(id: &str, name: &str) -> AppInfo
 ```
 
-**Purpose**: Constructs a minimal accessible, enabled `AppInfo` fixture for mention-resolution tests. Callers can then override fields with struct update syntax.
+**Purpose**: This test helper creates a simple enabled and accessible app record. It keeps the tests short and focused on mention behavior instead of repeated setup details.
 
-**Data flow**: It takes `id` and `name` strings, allocates owned `String` fields, fills the remaining `AppInfo` fields with `None`, empty vectors, or `true` accessibility/enabled defaults, and returns the new `AppInfo`.
+**Data flow**: It receives an app ID and name. It builds an `AppInfo` record with those values, most optional fields empty, and both availability flags set to true. It returns the app record.
 
-**Call relations**: This helper is used only by the tests in this module to reduce fixture boilerplate.
+**Call relations**: The tests call this helper to create base app objects, sometimes overriding one field such as `is_accessible` or `is_enabled` to check filtering behavior.
 
 *Call graph*: 1 external calls (new).
 
@@ -3749,11 +3771,11 @@ fn app(id: &str, name: &str) -> AppInfo
 fn find_app_mentions_requires_accessible_enabled_apps_for_slugs()
 ```
 
-**Purpose**: Verifies that slug-based app mention resolution returns only apps that are both accessible and enabled. Inaccessible and disabled apps are intentionally excluded even when mentioned by slug.
+**Purpose**: This test proves that plain app-name mentions only select apps that are both accessible and enabled. It protects against accidentally offering apps the user cannot use.
 
-**Data flow**: It builds a test `apps` vector with one normal app and two unavailable variants, parses mentions from a slug-only string via `collect_tool_mentions`, calls `find_app_mentions`, and asserts that only the accessible enabled app is returned.
+**Data flow**: It builds three apps: one usable, one inaccessible, and one disabled. It extracts mentions from text containing all three app slugs, runs `find_app_mentions`, and checks that only the usable app is returned.
 
-**Call relations**: This test exercises the interaction between `collect_tool_mentions`, `find_app_mentions`, and `is_app_mentionable` for plain slug mentions.
+**Call relations**: This test exercises the slug-based branch of `find_app_mentions`. It uses `collect_tool_mentions` to parse the typed text before matching apps.
 
 *Call graph*: calls 1 internal fn (collect_tool_mentions); 3 external calls (new, assert_eq!, vec!).
 
@@ -3764,24 +3786,24 @@ fn find_app_mentions_requires_accessible_enabled_apps_for_slugs()
 fn find_app_mentions_requires_accessible_enabled_apps_for_bound_paths()
 ```
 
-**Purpose**: Verifies that explicit `app://` mention bindings still respect accessibility and enabled-state filtering. Bound paths do not bypass availability checks.
+**Purpose**: This test proves that even explicit linked app paths must point to apps that are accessible and enabled. A direct path is not allowed to bypass availability rules.
 
-**Data flow**: It constructs the same app fixtures as the slug test, builds a `mention_paths` map from slugs to `app://` ids, parses mentions with `collect_tool_mentions`, resolves apps with `find_app_mentions`, and asserts that only the accessible enabled app is returned.
+**Data flow**: It builds three apps and a mention-path map linking all three names to `app://...` paths. It extracts mentions from text, attaches the paths, runs `find_app_mentions`, and checks that only the usable app is returned.
 
-**Call relations**: This test covers the explicit-binding branch in `find_app_mentions`, confirming that path-based selection still flows through `is_app_mentionable`.
+**Call relations**: This test exercises the explicit-path branch of `find_app_mentions`. It confirms that `app_id_from_path` can identify linked app IDs, but `is_app_mentionable` still filters the final result.
 
 *Call graph*: calls 1 internal fn (collect_tool_mentions); 3 external calls (from, assert_eq!, vec!).
 
 
 ### `tui/src/chatwidget/ide_context.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `chat command handling and message send`
 
-This file keeps the IDE-context feature state small and explicit: `IdeContextState` tracks whether prompt injection is enabled and whether the user has already been warned that context fetch failed for the current enabled period. The `ChatWidget` methods then use that state in two distinct flows: command handling (`/ide`, `/ide on|off|status`) and per-message prompt augmentation before submission.
+This file is the bridge between the chat widget and the user’s IDE, meaning their code editor or development environment. The feature is meant to help the assistant answer with more awareness of what the user is currently doing, such as their selected text or open tabs. Without this file, the chat UI would not know how to respond to `/ide`, and outgoing messages would not automatically include fresh editor context.
 
-The command path toggles or sets the feature, updates the bottom-pane indicator, and emits concrete info/error messages. Enabling is optimistic only until `add_ide_context_status_message` verifies connectivity by calling `crate::ide_context::fetch_ide_context(&self.config.cwd)`. A successful fetch keeps the feature enabled, clears warning suppression, and tailors the status hint depending on `has_prompt_context`; a failed fetch immediately disables the feature and shows the backend-provided user-facing hint.
+It keeps a small piece of state, `IdeContextState`, with two facts: whether IDE context is turned on, and whether the user has already been warned that fetching context failed. That warning flag matters because the app should not nag the user on every message if the IDE connection is unavailable.
 
-The submission path in `maybe_apply_ide_context` is intentionally softer: if IDE context is enabled but fetching fails for a particular outgoing turn, the turn still proceeds without IDE context. The method updates the status indicator either way, applies `apply_ide_context_to_user_input` only on success, and emits the “skipped for this message” notice at most once until a later successful fetch resets `prompt_fetch_warned`. The indicator reflects only the enabled flag, not whether the latest fetch produced prompt material.
+The `ChatWidget` methods do the visible work. They parse `/ide`, `/ide on`, `/ide off`, and `/ide status`; update the bottom-pane status indicator; and show friendly messages explaining what happened. When the user sends a message, `maybe_apply_ide_context` checks whether the feature is enabled. If it is, it asks the shared IDE-context code to fetch the latest context from the current working directory, then folds that context into the outgoing user input. If fetching fails, the message still goes out, but the user is told that IDE context was skipped.
 
 #### Function details
 
@@ -3791,11 +3813,11 @@ The submission path in `maybe_apply_ide_context` is intentionally softer: if IDE
 fn is_enabled(&self) -> bool
 ```
 
-**Purpose**: Returns the current on/off flag for IDE context injection. It is the single read accessor used by chat-widget command and submission logic.
+**Purpose**: This reports whether IDE context is currently turned on. Other parts of the chat widget use it before deciding whether to fetch editor information or show the feature as active.
 
-**Data flow**: Reads `self.enabled` and returns that boolean unchanged. It does not mutate any state or emit UI effects.
+**Data flow**: It reads the stored `enabled` flag from `IdeContextState` and returns that true-or-false value. It does not change anything.
 
-**Call relations**: This predicate gates both command toggling and prompt injection paths: callers check it before deciding whether to disable the feature, fetch IDE context, or update the status indicator.
+**Call relations**: This is the small gatekeeper used by the chat widget’s IDE-related flow. Command handling, status messages, prompt injection, and the bottom-pane indicator all rely on this answer to decide what should happen next.
 
 
 ##### `IdeContextState::enable`  (lines 18–21)
@@ -3804,11 +3826,11 @@ fn is_enabled(&self) -> bool
 fn enable(&mut self)
 ```
 
-**Purpose**: Turns IDE context on and resets one-shot warning suppression. Enabling always starts from a clean warning state so the next fetch failure can be surfaced again.
+**Purpose**: This turns IDE context on. It also clears the previous fetch-warning memory so that, after enabling, the user can be warned once if the IDE context cannot be fetched.
 
-**Data flow**: Mutates `self.enabled` to `true` and `self.prompt_fetch_warned` to `false`. It returns no value.
+**Data flow**: It takes the current state, sets `enabled` to true, and resets `prompt_fetch_warned` to false. It returns nothing, but the state is changed for later chat actions.
 
-**Call relations**: Used by the `/ide` command handlers before they show status. The later status/fetch path determines whether the feature remains enabled or is immediately disabled due to fetch failure.
+**Call relations**: This is used when the chat widget accepts `/ide` as a toggle or `/ide on` as an explicit request. After it runs, the surrounding chat code usually checks whether IDE context can actually be reached and then updates the UI.
 
 
 ##### `IdeContextState::disable`  (lines 23–26)
@@ -3817,11 +3839,11 @@ fn enable(&mut self)
 fn disable(&mut self)
 ```
 
-**Purpose**: Turns IDE context off and clears any remembered fetch-warning state. Disabling fully resets the feature state rather than preserving prior transient failures.
+**Purpose**: This turns IDE context off. It also clears the warning flag because skipped-context warnings no longer matter while the feature is disabled.
 
-**Data flow**: Mutates `self.enabled` to `false` and `self.prompt_fetch_warned` to `false`. It returns no value.
+**Data flow**: It takes the current state, sets `enabled` to false, and resets `prompt_fetch_warned` to false. It returns nothing, but future sends will no longer try to include IDE context.
 
-**Call relations**: Invoked when `/ide` toggles off, when `/ide off` is issued explicitly, and when status probing during enablement fails and the widget decides the feature cannot stay active.
+**Call relations**: This is used when the user runs `/ide off`, toggles the feature off, or when enabling fails during a status check. The chat widget then updates the status indicator and tells the user IDE context is off or could not be enabled.
 
 
 ##### `IdeContextState::mark_available`  (lines 28–30)
@@ -3830,11 +3852,11 @@ fn disable(&mut self)
 fn mark_available(&mut self)
 ```
 
-**Purpose**: Marks IDE context as successfully available by clearing the warning latch. This lets a later fetch failure produce a fresh informational warning.
+**Purpose**: This records that IDE context was successfully reached. Its main job is to clear the one-time warning flag after a successful fetch.
 
-**Data flow**: Writes `self.prompt_fetch_warned = false` and leaves `enabled` unchanged. It returns no value.
+**Data flow**: It changes `prompt_fetch_warned` back to false and leaves the enabled/disabled setting alone. Nothing is returned.
 
-**Call relations**: Called after successful IDE-context fetches from both the status-message path and the outgoing-turn augmentation path so transient failures do not permanently suppress future notices.
+**Call relations**: This is called after the chat widget successfully fetches IDE context, either while preparing a message or while checking status. It makes future failures eligible to show a warning again, because the connection had recovered.
 
 
 ##### `ChatWidget::handle_ide_command`  (lines 34–43)
@@ -3843,11 +3865,11 @@ fn mark_available(&mut self)
 fn handle_ide_command(&mut self)
 ```
 
-**Purpose**: Implements bare `/ide` as a toggle. It flips the enabled state, synchronizes the bottom-pane indicator, and emits either an immediate off message or the richer enable/status flow.
+**Purpose**: This implements plain `/ide` as a toggle. If IDE context is on, it turns it off; if it is off, it tries to turn it on and report the result.
 
-**Data flow**: Reads `self.ide_context.is_enabled()`. If already enabled, it disables the state, updates the indicator, and writes an info history message saying IDE context is off; otherwise it enables the state and delegates status verification/message generation.
+**Data flow**: It reads the current IDE-context state. If enabled, it disables the state, updates the bottom-pane indicator, and adds an informational chat message saying the feature is off. If disabled, it enables the state and asks `add_ide_context_status_message` to verify and explain the new status.
 
-**Call relations**: This is the no-argument branch used by `ChatWidget::handle_ide_command_args`. On the disable path it directly calls `sync_ide_context_status_indicator`; on the enable path it delegates to `add_ide_context_status_message` so fetch validation and user messaging stay centralized.
+**Call relations**: This is the simple toggle path used by `ChatWidget::handle_ide_command_args` when the user enters `/ide` with no extra words. It hands status reporting to `add_ide_context_status_message` when turning on, and uses `sync_ide_context_status_indicator` directly when turning off.
 
 *Call graph*: calls 2 internal fn (add_ide_context_status_message, sync_ide_context_status_indicator); called by 1 (handle_ide_command_args).
 
@@ -3858,11 +3880,11 @@ fn handle_ide_command(&mut self)
 fn handle_ide_command_args(&mut self, args: &str)
 ```
 
-**Purpose**: Parses `/ide` subcommands and dispatches to the appropriate enable/disable/status behavior. It accepts empty input, `on`, `off`, and `status`, and rejects anything else with usage text.
+**Purpose**: This reads the words after `/ide` and turns them into actions. It supports no argument, `on`, `off`, and `status`, and shows a usage error for anything else.
 
-**Data flow**: Consumes `args: &str`, lowercases it with ASCII semantics, and matches the resulting string. Depending on the branch it toggles via `handle_ide_command`, forces enable plus status message, forces disable plus indicator sync and off message, emits status only, or writes an error message with the accepted syntax.
+**Data flow**: It receives the raw argument text, lowercases it, and compares it to the supported commands. Depending on the match, it toggles the feature, enables it, disables it, reports status, or adds an error message. The result is visible UI feedback and an updated IDE-context state when appropriate.
 
-**Call relations**: Acts as the command dispatcher entry for `/ide ...`. It routes empty args through `handle_ide_command` and otherwise funnels user-visible status work through `add_ide_context_status_message` and `sync_ide_context_status_indicator`.
+**Call relations**: This is the command dispatcher for the `/ide` family. For the empty case it delegates to `ChatWidget::handle_ide_command`; for `on` and `status` it relies on `add_ide_context_status_message`; for `off` it updates the state and calls `sync_ide_context_status_indicator` so the UI matches the new setting.
 
 *Call graph*: calls 3 internal fn (add_ide_context_status_message, handle_ide_command, sync_ide_context_status_indicator).
 
@@ -3873,11 +3895,11 @@ fn handle_ide_command_args(&mut self, args: &str)
 fn maybe_apply_ide_context(&mut self, items: &mut Vec<UserInput>)
 ```
 
-**Purpose**: Fetches current IDE context just before a user turn is sent and appends that context to the outgoing `UserInput` list when available. Failures are non-fatal and only suppress IDE augmentation for that one message.
+**Purpose**: This is called before sending a user message, and it adds fresh IDE context to that message if the feature is enabled. If context cannot be fetched, it lets the message continue without it and warns the user only once until the connection succeeds again.
 
-**Data flow**: Takes `items: &mut Vec<UserInput>` and first reads `self.ide_context.is_enabled()`. If disabled, it returns immediately. If enabled, it calls external `fetch_ide_context(&self.config.cwd)`; on success it clears warning suppression, syncs the indicator, and mutates `items` via external `apply_ide_context_to_user_input`. On error it still syncs the indicator and, if `prompt_fetch_warned` is still false, sets that flag true and writes a one-time informational message using `err.prompt_skip_hint()`.
+**Data flow**: It receives the outgoing list of `UserInput` items. First it checks whether IDE context is enabled; if not, it leaves the list unchanged. If enabled, it asks `fetch_ide_context` for current editor information using the configured working directory. On success, it clears the warning flag, refreshes the status indicator, and calls `apply_ide_context_to_user_input` to insert the editor context into the outgoing input. On failure, it refreshes the indicator and may add an informational message with a hint, while leaving the outgoing input without IDE context.
 
-**Call relations**: This method sits in the user-message submission pipeline before the final `AppCommand::user_turn` is sent. It delegates actual IDE probing and prompt-item construction to the `crate::ide_context` helpers, while keeping UI warning throttling local to `ChatWidget`.
+**Call relations**: This function sits in the send-message path rather than the command path. It depends on the shared IDE-context module to fetch and apply the context, and it calls `sync_ide_context_status_indicator` so the visible UI stays consistent with the feature state.
 
 *Call graph*: calls 1 internal fn (sync_ide_context_status_indicator); 2 external calls (apply_ide_context_to_user_input, fetch_ide_context).
 
@@ -3888,11 +3910,11 @@ fn maybe_apply_ide_context(&mut self, items: &mut Vec<UserInput>)
 fn add_ide_context_status_message(&mut self)
 ```
 
-**Purpose**: Produces the user-facing status result for IDE context, including connectivity validation and explanatory hints. It is the authoritative status-reporting path for both enabling and explicit `/ide status` checks.
+**Purpose**: This checks the current IDE-context situation and adds a user-facing status message. It is used after enabling the feature or when the user asks for `/ide status`.
 
-**Data flow**: Reads `self.ide_context.is_enabled()`. If disabled, it syncs the indicator and writes an off info message. If enabled, it fetches IDE context from `self.config.cwd`; on success it clears warning suppression, syncs the indicator, checks external `has_prompt_context(&context)`, and writes an info message whose hint distinguishes between full prompt injection and mere IDE connectivity. On fetch error it disables IDE context, syncs the indicator, and writes an info message saying enablement failed with `err.user_facing_hint()`.
+**Data flow**: It first checks whether IDE context is enabled. If not, it updates the indicator and says the feature is off. If enabled, it tries to fetch IDE context for the configured working directory. On success, it marks the context as available, updates the indicator, and tells the user the feature is on, with a more specific hint if prompt-worthy context such as selection or tabs is present. On failure, it disables IDE context, updates the indicator, and explains why it could not be enabled.
 
-**Call relations**: Called from both `handle_ide_command` and `handle_ide_command_args` whenever the widget needs a definitive status message. It centralizes the fetch/validate/report logic so command handlers do not duplicate success/failure messaging.
+**Call relations**: This is the status-and-verification step used by `ChatWidget::handle_ide_command` and `ChatWidget::handle_ide_command_args`. It calls the shared IDE-context fetcher to prove the connection works, uses `has_prompt_context` to decide how much context is available, and then calls `sync_ide_context_status_indicator` to keep the bottom pane in step with the state.
 
 *Call graph*: calls 1 internal fn (sync_ide_context_status_indicator); called by 2 (handle_ide_command, handle_ide_command_args); 2 external calls (fetch_ide_context, has_prompt_context).
 
@@ -3903,24 +3925,26 @@ fn add_ide_context_status_message(&mut self)
 fn sync_ide_context_status_indicator(&mut self)
 ```
 
-**Purpose**: Pushes the current IDE-context enabled flag into the bottom-pane status indicator. It keeps the visual indicator aligned with `IdeContextState` after command changes and fetch attempts.
+**Purpose**: This updates the bottom-pane UI so it shows whether IDE context is active. It keeps the small visual indicator in sync with the stored state.
 
-**Data flow**: Reads `self.ide_context.is_enabled()` and passes that boolean to `self.bottom_pane.set_ide_context_active(...)`. It returns no value and does not alter `IdeContextState` itself.
+**Data flow**: It reads whether IDE context is enabled, then passes that true-or-false value to the bottom pane with `set_ide_context_active`. It returns nothing, but the UI state changes.
 
-**Call relations**: This is the shared UI-sync helper used after toggles, status checks, and per-turn fetch attempts. Other methods call it whenever they may have changed or validated the IDE-context state.
+**Call relations**: This is the shared UI-sync helper used after command changes, status checks, and send-time fetch attempts. The rest of the file changes or checks IDE-context state, then calls this function so the visible indicator does not drift out of date.
 
 *Call graph*: called by 4 (add_ide_context_status_message, handle_ide_command, handle_ide_command_args, maybe_apply_ide_context).
 
 
 ### `tui/src/chatwidget/goal_menu.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `user command handling`
 
-This file contains the user-facing goal menu helpers for `ChatWidget`. The widget methods are thin UI actions around `AppThreadGoal` state. `show_goal_summary` renders a compact transcript summary by delegating to `goal_summary_lines`, which builds styled `Line<'static>` rows for status, objective, elapsed time, tokens used, optional token budget, and a command hint tailored to the goal's status. The status wording is centralized in `goal_status_label`.
+A “goal” here is the task the assistant is meant to keep working toward in a chat thread. This file is the chat widget’s small goal-control panel: it shows a readable summary for `/goal`, opens an edit prompt for changing the goal text, asks whether to resume a paused goal, and clears the visible goal state when the active thread’s goal is removed.
 
-`show_goal_edit_prompt` opens a `CustomPromptView` prefilled with the current objective. Its submit closure captures the thread id, the edited-status mapping, and token budget, then sends `AppEvent::SetThreadGoalDraft` with a `goal_files::GoalDraft` containing the new objective and `ThreadGoalSetMode::UpdateExisting`. The helper `edited_goal_status` preserves paused/blocked/usage-limited states but resets budget-limited and complete goals back to active when edited.
+The file mostly translates between stored goal information and things a person can see or choose in the terminal. For example, `goal_summary_lines` turns fields like status, objective, time used, tokens used, and optional token budget into formatted lines. It also chooses the right command hint, so a paused goal suggests `/goal resume`, while an active goal suggests `/goal pause`.
 
-`show_resume_paused_goal_prompt` presents a two-item selection popup asking whether to resume a paused goal. Choosing the first item sends `AppEvent::SetThreadGoalStatus { status: Active }`; the second simply dismisses the popup. Finally, `on_thread_goal_cleared` clears `self.current_goal_status` and refreshes the collaboration mode indicator only when the cleared thread id matches the currently active thread.
+Editing works by showing a custom prompt at the bottom of the chat. When the user presses Enter, the prompt sends an application event with a new goal draft. That event is how the rest of the program learns that the goal should be updated. Resuming a paused goal works similarly, but through a selection menu with “Resume goal” and “Leave paused.”
+
+One important detail is that editing a completed or budget-limited goal makes it active again. That avoids saving an edited goal that still looks finished or blocked by its old budget state.
 
 #### Function details
 
@@ -3930,11 +3954,11 @@ This file contains the user-facing goal menu helpers for `ChatWidget`. The widge
 fn show_goal_summary(&mut self, goal: AppThreadGoal)
 ```
 
-**Purpose**: Adds a formatted summary of the current thread goal to chat history. It is the output path for the bare `/goal` command.
+**Purpose**: Shows a plain goal summary in the chat history. This is what the user sees after asking for the current goal with the bare `/goal` command.
 
-**Data flow**: Takes an `AppThreadGoal`, passes a reference to `goal_summary_lines(&goal)`, and feeds the resulting `Vec<Line<'static>>` into `self.add_plain_history_lines(...)`.
+**Data flow**: It receives an `AppThreadGoal`, which contains the goal’s objective, status, time used, token usage, and optional budget. It passes that goal to `goal_summary_lines`, then appends the returned display lines to the chat history. The visible result is a compact goal report in the conversation area.
 
-**Call relations**: This is a simple wrapper around the local formatter `goal_summary_lines`, used when the user requests goal information rather than an edit action.
+**Call relations**: This is the entry point in this file for displaying goal information. It relies on `goal_summary_lines` to do the wording and formatting, then uses the chat widget’s normal history display path to show the result.
 
 *Call graph*: calls 1 internal fn (goal_summary_lines).
 
@@ -3945,11 +3969,11 @@ fn show_goal_summary(&mut self, goal: AppThreadGoal)
 fn show_goal_edit_prompt(&mut self, thread_id: ThreadId, goal: AppThreadGoal)
 ```
 
-**Purpose**: Opens a text prompt for editing an existing goal objective and wires submission to a goal-draft update event. It preserves or adjusts the goal status according to edit semantics.
+**Purpose**: Opens a bottom-panel prompt where the user can rewrite the current goal objective. When the user submits the new text, it asks the wider app to update the stored goal.
 
-**Data flow**: Accepts `thread_id` and `goal`, clones `self.app_event_tx`, computes `status = edited_goal_status(goal.status)` and captures `token_budget`. It constructs a `CustomPromptView` with title, prompt text, and initial objective. The submit closure receives a new `objective` string and sends `AppEvent::SetThreadGoalDraft` containing the thread id, a `goal_files::GoalDraft` with that objective and defaulted remaining fields, and `ThreadGoalSetMode::UpdateExisting { status, token_budget }`. The view is then shown in the bottom pane.
+**Data flow**: It receives the thread id and the existing goal. It keeps the old token budget, chooses the status the edited goal should have, and pre-fills the prompt with the current objective. When the user enters a new objective, the prompt sends an `AppEvent::SetThreadGoalDraft` containing the new text and the preserved settings.
 
-**Call relations**: This method is invoked when the user chooses to edit a goal. It relies on `edited_goal_status` to preserve the intended lifecycle semantics of edited goals.
+**Call relations**: This function is used when the chat UI needs to edit an existing goal. It calls `edited_goal_status` to decide whether the old status should be kept or reset to active, then builds a `CustomPromptView` and hands it to the bottom pane for display.
 
 *Call graph*: calls 2 internal fn (new, edited_goal_status); 1 external calls (new).
 
@@ -3964,11 +3988,11 @@ fn show_resume_paused_goal_prompt(
     )
 ```
 
-**Purpose**: Shows a confirmation popup for resuming a paused goal. The popup offers either resuming immediately or leaving the goal paused.
+**Purpose**: Shows a small choice menu asking whether to resume a paused goal. It gives the user a safe confirmation step instead of immediately changing the goal state.
 
-**Data flow**: Takes `thread_id` and `objective`, builds a `Vec<SelectionAction>` whose action closure sends `AppEvent::SetThreadGoalStatus { thread_id, status: Active }`, then calls `self.show_selection_view(...)` with `SelectionViewParams` containing title, subtitle, footer hint, initial selection, and two `SelectionItem`s: 'Resume goal' with the action and 'Leave paused' with no action.
+**Data flow**: It receives the thread id and the goal objective. It builds two menu items: one sends an event that marks the goal active, and the other simply leaves the goal paused. The output is a selection pop-up shown in the chat interface.
 
-**Call relations**: This is a specialized UI path for paused goals. It does not itself mutate goal state; it emits the status-change event only if the user selects the resume option.
+**Call relations**: This function fits into the flow for `/goal resume` or similar resume actions. It prepares the menu and passes it to the chat widget’s selection-view machinery; if the user chooses “Resume goal,” the stored goal status is changed through an application event.
 
 *Call graph*: 3 external calls (default, format!, vec!).
 
@@ -3979,11 +4003,11 @@ fn show_resume_paused_goal_prompt(
 fn on_thread_goal_cleared(&mut self, thread_id: &str)
 ```
 
-**Purpose**: Clears the widget's cached goal-status indicator when the active thread's goal has been removed. It avoids touching state for unrelated threads.
+**Purpose**: Updates the chat widget after a goal has been cleared from a thread. It prevents the UI from showing stale goal status for the currently open thread.
 
-**Data flow**: Reads `self.thread_id` and compares its string form to the provided `thread_id`. If they match, it sets `self.current_goal_status = None` and calls `self.update_collaboration_mode_indicator()`.
+**Data flow**: It receives the id of the thread whose goal was cleared. If that id matches the chat widget’s active thread, it removes the widget’s current goal status and refreshes the collaboration-mode indicator. If the cleared goal belongs to another thread, it leaves this widget unchanged.
 
-**Call relations**: This is an event reaction used when thread-goal state changes externally. Its effect is limited to the currently displayed thread.
+**Call relations**: This function is called after the app reports that a thread goal was removed. It only acts when the event belongs to the thread currently displayed, then refreshes the visible status indicator so the chat screen matches reality.
 
 
 ##### `goal_summary_lines`  (lines 85–120)
@@ -3992,11 +4016,11 @@ fn on_thread_goal_cleared(&mut self, thread_id: &str)
 fn goal_summary_lines(goal: &AppThreadGoal) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Formats an `AppThreadGoal` into the exact transcript lines shown by `/goal`. It includes status, objective, usage metrics, optional budget, and a status-dependent command hint.
+**Purpose**: Builds the formatted text lines used for the goal summary. It turns raw goal fields into labels a person can quickly read in the terminal.
 
-**Data flow**: Reads fields from `goal` to build a `Vec<Line<'static>>`: bold 'Goal', status line using `goal_status_label`, objective line, time-used line via `format_goal_elapsed_seconds`, tokens-used line via `format_tokens_compact`, and optionally a token-budget line. It then selects a command-hint string based on `goal.status`, appends a blank line and the dimmed hint, and returns the vector.
+**Data flow**: It receives a reference to an `AppThreadGoal`. It creates lines for the title, status, objective, elapsed time, tokens used, and token budget if one exists. It then adds a blank line and a command hint that depends on the goal’s status. The result is a list of display lines ready to be added to chat history.
 
-**Call relations**: Called only by `ChatWidget::show_goal_summary`. It centralizes the transcript formatting so the widget method remains a thin wrapper.
+**Call relations**: `ChatWidget::show_goal_summary` calls this helper when it needs the actual text for the `/goal` summary. Inside the helper, goal values are converted into compact display strings, including formatted time and token counts, before being returned to the chat widget.
 
 *Call graph*: called by 1 (show_goal_summary); 3 external calls (default, from, vec!).
 
@@ -4007,11 +4031,11 @@ fn goal_summary_lines(goal: &AppThreadGoal) -> Vec<Line<'static>>
 fn goal_status_label(status: AppThreadGoalStatus) -> &'static str
 ```
 
-**Purpose**: Maps `AppThreadGoalStatus` to the lowercase human-readable label used in goal summaries. It covers all goal status variants explicitly.
+**Purpose**: Converts an internal goal status into a short lowercase label for people to read. For example, it turns the program’s `BudgetLimited` status into “limited by budget.”
 
-**Data flow**: Matches the input status and returns one of the static strings: `active`, `paused`, `blocked`, `usage limited`, `limited by budget`, or `complete`.
+**Data flow**: It receives an `AppThreadGoalStatus` value. It matches that value against the known goal states and returns the corresponding display text. It does not change any state.
 
-**Call relations**: Used by `goal_summary_lines` to keep status wording consistent in the `/goal` transcript output.
+**Call relations**: This helper supports the summary-building path by keeping status wording in one clear place. When goal text is prepared for display, this function supplies the human-friendly status label.
 
 
 ##### `edited_goal_status`  (lines 133–143)
@@ -4020,22 +4044,24 @@ fn goal_status_label(status: AppThreadGoalStatus) -> &'static str
 fn edited_goal_status(status: AppThreadGoalStatus) -> AppThreadGoalStatus
 ```
 
-**Purpose**: Determines what status an edited goal should keep after the objective is changed. It preserves in-progress paused/blocked states but reactivates completed or budget-limited goals.
+**Purpose**: Decides what status an existing goal should have after the user edits it. This keeps sensible states: paused or blocked goals stay that way, but completed or budget-limited goals become active again after their objective changes.
 
-**Data flow**: Matches the input `AppThreadGoalStatus` and returns the same status for `Active`, `Paused`, `Blocked`, and `UsageLimited`; returns `Active` for `BudgetLimited` and `Complete`.
+**Data flow**: It receives the goal’s current status. It returns the same status for active, paused, blocked, and usage-limited goals. It returns active for completed or budget-limited goals, because editing those goals means they should be ready to run again.
 
-**Call relations**: Used by `ChatWidget::show_goal_edit_prompt` when constructing the update event so editing a goal carries the intended lifecycle semantics.
+**Call relations**: `ChatWidget::show_goal_edit_prompt` calls this before creating the edit prompt. The chosen status is later included in the application event that updates the stored goal, so this small decision affects how the rest of the app treats the edited goal.
 
 *Call graph*: called by 1 (show_goal_edit_prompt).
 
 
 ### `tui/src/chatwidget/hooks.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `user action and async result handling`
 
-This file is a small orchestration layer around the hooks browser UI. `add_hooks_output` initiates loading by sending `AppEvent::FetchHooksList` with the widget's current configured working directory. When results arrive, `on_hooks_loaded` first checks that the response's `cwd` still matches `self.config.cwd`; this guards against stale asynchronous responses after the user has changed directories or context. If the cwd matches and the fetch succeeded, it reduces the full `HooksListResponse` to the relevant `HooksListEntry` for that cwd using `hooks_list_entry_for_cwd` and opens the browser. On failure, it surfaces a concrete error message in the chat history.
+This file is a small bridge between the chat interface, the background app event system, and the hooks browser shown in the bottom pane. When the user asks to see hooks, the chat widget does not load them directly. Instead, it sends an app event saying, in effect, “please fetch the hooks for the current working folder.” That keeps the interface responsive while another part of the app does the work.
 
-`open_hooks_browser` constructs a `HooksBrowserView` from the selected entry, the app-event sender, and the bottom pane's list keymap, then installs that view into the bottom pane and requests a redraw. The file intentionally contains no hook-editing logic or lifecycle state; it is only the transport from a fetch result into the dedicated browser view.
+When the results come back, the file first checks that they still belong to the folder the user is currently in. This matters because the user may have changed directories while the request was running. Without this check, the app could show hooks for the wrong project, like receiving mail for an old address after you have moved.
+
+If loading succeeds, the response is converted into the single hooks-list entry the browser needs, then the bottom pane is switched to a HooksBrowserView. If loading fails, the chat widget shows a plain error message instead. After opening the browser, it asks the terminal UI to redraw so the new pane becomes visible.
 
 #### Function details
 
@@ -4045,11 +4071,11 @@ This file is a small orchestration layer around the hooks browser UI. `add_hooks
 fn add_hooks_output(&mut self)
 ```
 
-**Purpose**: Starts loading the hooks list for the widget's current working directory. It is the command/output entrypoint for opening hooks UI.
+**Purpose**: Starts the process of showing hooks by asking the rest of the app to fetch the hooks list for the chat widget's current folder. It is used when the UI needs hook information but should not block while loading it.
 
-**Data flow**: Reads `self.config.cwd`, clones it to a `PathBuf`, and sends `AppEvent::FetchHooksList { cwd }` through `self.app_event_tx`.
+**Data flow**: It reads the current working directory from the chat widget's configuration, copies it into a path value, and sends an AppEvent::FetchHooksList message through the app event channel. Nothing is returned directly; the visible result comes later when the fetch finishes and another callback receives the answer.
 
-**Call relations**: This is the initial trigger for the hooks browser flow. The eventual response is handled by `ChatWidget::on_hooks_loaded`.
+**Call relations**: This is the first step in the hooks-view flow. It hands the request to the app event system, which is responsible for doing the actual fetch and eventually causing ChatWidget::on_hooks_loaded to run with either the loaded data or an error.
 
 
 ##### `ChatWidget::on_hooks_loaded`  (lines 17–32)
@@ -4062,11 +4088,11 @@ fn on_hooks_loaded(
     )
 ```
 
-**Purpose**: Consumes the asynchronous hooks-list result, discarding stale responses for old working directories and opening the hooks browser on success. It reports fetch failures as user-visible error messages.
+**Purpose**: Receives the result of a hooks-list fetch and decides whether to show it or report an error. It also protects the UI from showing stale hook data for a folder that is no longer current.
 
-**Data flow**: Takes a `cwd` and `Result<HooksListResponse, String>`. If `self.config.cwd.as_path() != cwd.as_path()`, it returns without side effects. Otherwise, on `Ok(response)` it computes the relevant `HooksListEntry` with `hooks_list_entry_for_cwd(response, &cwd)` and passes it to `open_hooks_browser`. On `Err(err)`, it formats `"Failed to load hooks: {err}"` and calls `self.add_error_message(...)`.
+**Data flow**: It receives the folder path that was used for the fetch and a result that is either a HooksListResponse or an error string. First it compares that folder with the chat widget's current folder; if they differ, it stops and changes nothing. If the result is successful, it reshapes the response into the entry needed by the hooks browser and opens that browser. If the result is an error, it adds a failure message to the chat.
 
-**Call relations**: This is the result handler paired with `add_hooks_output`. It delegates successful UI opening to `ChatWidget::open_hooks_browser`.
+**Call relations**: This function is the return point for the earlier fetch request. On success, it calls hooks_list_entry_for_cwd to pick or build the hooks entry for the current folder, then calls ChatWidget::open_hooks_browser to display it. On failure, it stays inside the chat widget and shows an error instead.
 
 *Call graph*: calls 2 internal fn (open_hooks_browser, hooks_list_entry_for_cwd); 2 external calls (as_path, format!).
 
@@ -4077,24 +4103,26 @@ fn on_hooks_loaded(
 fn open_hooks_browser(&mut self, entry: HooksListEntry)
 ```
 
-**Purpose**: Installs the hooks browser view into the bottom pane and redraws the UI. It packages the selected hooks entry together with the event sender and list key bindings.
+**Purpose**: Displays the hooks browser in the bottom pane of the terminal interface. It is the final UI step after hook data has been successfully loaded and prepared.
 
-**Data flow**: Accepts a `HooksListEntry`, constructs `HooksBrowserView::from_entry(entry, self.app_event_tx.clone(), self.bottom_pane.list_keymap())`, boxes it, passes it to `self.bottom_pane.show_view(...)`, and then calls `self.request_redraw()`.
+**Data flow**: It receives a HooksListEntry, builds a HooksBrowserView from that entry, a cloned app event sender, and the bottom pane's list key bindings. It then tells the bottom pane to show this new view and requests a redraw so the screen updates.
 
-**Call relations**: Called from `on_hooks_loaded` after a successful fetch and cwd validation. It is the final UI-opening step in the hooks browser flow.
+**Call relations**: ChatWidget::on_hooks_loaded calls this after it has confirmed the loaded hooks belong to the current folder. This function hands the prepared data into HooksBrowserView::from_entry and gives the resulting view to the bottom pane, which takes over displaying and interacting with the hooks list.
 
 *Call graph*: calls 1 internal fn (from_entry); called by 1 (on_hooks_loaded); 1 external calls (new).
 
 
 ### `tui/src/chatwidget/slash_dispatch.rs`
 
-`orchestration` · `request handling for slash commands and queued startup input`
+`orchestration` · `input handling`
 
-This file is the command dispatcher for the TUI chat surface. It defines a small internal source enum (`Live` vs `Queued`) and a `PreparedSlashCommandArgs` bundle so inline-argument commands can be processed uniformly whether they came directly from the composer or from queued startup input. The top-level wrappers also preserve local slash-command recall semantics by recording staged command history only after dispatch succeeds.
+This file is the switchboard for slash commands inside `ChatWidget`, the terminal chat interface. The text composer can recognize that the user typed a command, but this file decides what that command actually means for the app. Without it, typing `/model` would not open the model picker, `/diff` would not fetch a git diff, `/goal` would not update a thread goal, and queued slash commands would not be replayed correctly when a session finally starts.
 
-`dispatch_command` handles the large bare-command matrix. Before branching, it enforces side-conversation restrictions, review-mode restrictions for `/side`, and task-running restrictions for commands that are not allowed mid-task. The match arms then either mutate widget state directly, open popups, send `AppEvent`s, submit user messages or ops, spawn async work (for `/diff`), or emit usage/help errors. Several commands have special policy: `/plan` switches collaboration mode, `/goal` opens menus or appends history, `/raw` emits a separate raw-output-mode-changed event, and Windows-only sandbox elevation is guarded by runtime checks even though the command should normally be hidden.
+The code first checks whether a command is allowed in the current situation. For example, some commands cannot run during an active task, some are blocked inside side conversations, and `/usage` requires ChatGPT sign-in. Then it either performs the action directly, opens a popup, sends an app event to another part of the program, or submits a user message to the assistant.
 
-Inline-argument handling is split into preparation and execution. Live commands may reuse already prepared composer submission state or harvest recent images/mention bindings; queued commands reconstruct argument text-element ranges with `slash_command_args_elements`. `dispatch_prepared_command_with_args` then implements argument-aware variants such as `/goal`, `/plan`, `/rename`, `/usage`, `/mcp`, `/keymap`, `/side`, and `/pets`, including queueing `/goal` before session startup and draining composer submission state only for live non-goal commands. The file also computes built-in command flags for slash lookup and decides whether queued command draining should continue after each command.
+Commands with extra text need more care. `/rename my task` means something different from bare `/rename`, and `/goal improve tests` may include pasted text, images, or mentions. The file packages that extra material into a `UserMessage` or a goal draft while preserving the right text ranges.
+
+Queued commands are handled too. If a message was saved before the session was ready, this file later re-parses it and decides whether to run the command or send it as ordinary chat text.
 
 #### Function details
 
@@ -4104,11 +4132,11 @@ Inline-argument handling is split into preparation and execution. Live commands 
 fn handle_slash_command_dispatch(&mut self, cmd: SlashCommand)
 ```
 
-**Purpose**: Dispatches a bare slash command and then commits the staged local slash-history entry so Up-arrow recall treats it like submitted input. `/goal` additionally drains pending submission state after dispatch.
+**Purpose**: Runs a slash command that has no inline text after it, then records it for local command recall. This is the safe entry point for a live command because it avoids recording a command before the app has accepted it.
 
-**Data flow**: It takes a `SlashCommand`, calls `dispatch_command(cmd)`, conditionally drains pending submission state when `cmd == SlashCommand::Goal`, then calls `bottom_pane.record_pending_slash_command_history()`. It returns nothing.
+**Data flow**: It receives a parsed `SlashCommand`. It sends that command into the main dispatcher, clears special pending state for `/goal`, and then records the staged slash command in the bottom pane history. The visible result is whatever the command does, plus correct Up-arrow recall afterward.
 
-**Call relations**: This is the main entrypoint for slash commands without inline args. It delegates actual command behavior to `ChatWidget::dispatch_command` and then performs the local-history bookkeeping wrapper described in the module docs.
+**Call relations**: This wrapper hands the actual work to `ChatWidget::dispatch_command`. It exists so live command input goes through one place before the bottom pane saves the command for recall.
 
 *Call graph*: calls 1 internal fn (dispatch_command).
 
@@ -4119,11 +4147,11 @@ fn handle_slash_command_dispatch(&mut self, cmd: SlashCommand)
 fn handle_service_tier_command_dispatch(&mut self, command: ServiceTierCommand)
 ```
 
-**Purpose**: Dispatches a service-tier slash command, but blocks it inside side conversations with a user-facing error. In either case it records slash-command history afterward.
+**Purpose**: Runs a service-tier slash command, such as a command that changes the model speed or service mode. It refuses to do this inside a side conversation, where changing the service tier is not allowed.
 
-**Data flow**: It takes a `ServiceTierCommand`, checks `self.active_side_conversation`, and if true adds an error message, drains pending submission state, records slash history, and returns. Otherwise it calls `toggle_service_tier_from_ui(command)` and records slash history. It returns nothing.
+**Data flow**: It receives a `ServiceTierCommand`. If the chat is currently in a side conversation, it shows an error, clears pending submission state, records the command history, and stops. Otherwise it toggles the service tier and records the command for recall.
 
-**Call relations**: This wrapper is used from queued slash-prompt handling when slash lookup resolves to a service-tier command. It is separate from builtin command dispatch because service-tier commands are represented by a different slash-command item type.
+**Call relations**: Queued slash command processing calls this when it recognizes a service-tier command. Unlike built-in commands, it does not go through `dispatch_command`; it has its own small path because service-tier commands are represented separately.
 
 *Call graph*: called by 1 (submit_queued_slash_prompt); 1 external calls (format!).
 
@@ -4139,11 +4167,11 @@ fn handle_slash_command_with_args_dispatch(
     )
 ```
 
-**Purpose**: Dispatches an inline slash command with arguments and then records the staged slash-history entry exactly once. It prevents double-recording when inline args later flow through normal submission preparation.
+**Purpose**: Runs a slash command that was typed with extra text, such as `/rename New title` or `/goal improve coverage`. It also records the original command invocation for local history.
 
-**Data flow**: It takes a `SlashCommand`, raw `args`, and `text_elements`, forwards them to `dispatch_command_with_args`, then calls `bottom_pane.record_pending_slash_command_history()`. It returns nothing.
+**Data flow**: It receives the command, the raw argument text, and text metadata such as mention ranges. It passes them to the inline-command dispatcher, then records the pending slash command history entry. The output is the command’s effect and a single recall entry, not a duplicate.
 
-**Call relations**: This is the entry wrapper for slash commands that arrived with inline arguments from the composer. It delegates all command semantics to `ChatWidget::dispatch_command_with_args` and handles only recall-history bookkeeping.
+**Call relations**: This is the live-input wrapper around `ChatWidget::dispatch_command_with_args`. It keeps history recording outside the lower-level dispatcher so commands with arguments are not saved twice.
 
 *Call graph*: calls 1 internal fn (dispatch_command_with_args).
 
@@ -4154,11 +4182,11 @@ fn handle_slash_command_with_args_dispatch(
 fn apply_plan_slash_command(&mut self) -> bool
 ```
 
-**Purpose**: Attempts to switch the widget into Plan collaboration mode via the catalog’s Plan preset. It emits explanatory info messages when collaboration modes are disabled or no Plan preset is available.
+**Purpose**: Switches the conversation into plan mode when `/plan` is allowed. Plan mode is a collaboration mode where the assistant is guided to plan before acting.
 
-**Data flow**: It checks `collaboration_modes_enabled()`, and if false adds an info message plus hint and returns `false`. Otherwise it asks `collaboration_modes::plan_mask(self.model_catalog.as_ref())` for a Plan mask; if present it applies it through `set_collaboration_mask_from_user_action(mask)` and returns `true`, else it adds an info message and returns `false`.
+**Data flow**: It reads whether collaboration modes are enabled and whether the current model catalog can provide a plan-mode mask. If either check fails, it shows an informational message and returns `false`. If both pass, it applies the plan mask and returns `true`.
 
-**Call relations**: This helper is used by both bare `/plan` dispatch and inline `/plan ...` handling. It encapsulates the mode-switch policy so both paths share the same availability checks and user messaging.
+**Call relations**: `dispatch_command` uses this for bare `/plan`, and `dispatch_prepared_command_with_args` uses it before sending `/plan` text as a user message. It calls `plan_mask` to find the concrete mode setting to apply.
 
 *Call graph*: calls 1 internal fn (plan_mask); called by 2 (dispatch_command, dispatch_prepared_command_with_args).
 
@@ -4173,11 +4201,11 @@ fn request_side_conversation(
     )
 ```
 
-**Purpose**: Starts side-conversation creation by updating the footer/context label, requesting redraw, and sending the `StartSide` app event with optional initial user message. It is the common launch path for empty and inline-message side threads.
+**Purpose**: Starts a side conversation linked to the current thread. A side conversation is like opening a smaller side chat while keeping the main thread as its parent.
 
-**Data flow**: It takes a `parent_thread_id` and optional `UserMessage`, sets the side-conversation context label to `"Side starting..."`, requests redraw, and sends `AppEvent::StartSide { parent_thread_id, user_message }` through `app_event_tx`. It returns nothing.
+**Data flow**: It receives the parent thread ID and optionally a user message to seed the side conversation. It updates the side-conversation label to show that startup is in progress, asks the UI to redraw, and sends a `StartSide` event to the app.
 
-**Call relations**: This helper is called by `ChatWidget::request_empty_side_conversation` and by inline `/side` or `/btw` handling in `dispatch_prepared_command_with_args`.
+**Call relations**: `request_empty_side_conversation` calls it for bare `/side` or `/btw`. `dispatch_prepared_command_with_args` calls it when those commands include an initial message.
 
 *Call graph*: called by 2 (dispatch_prepared_command_with_args, request_empty_side_conversation).
 
@@ -4188,11 +4216,11 @@ fn request_side_conversation(
 fn request_empty_side_conversation(&mut self, cmd: SlashCommand)
 ```
 
-**Purpose**: Starts a side conversation without an initial message, but only after a session/thread exists. Before session startup it emits a command-specific error instead.
+**Purpose**: Starts a side conversation without an initial user message. It also gives a clear error if the main session has not started yet.
 
-**Data flow**: It takes the triggering `SlashCommand`, reads `self.thread_id`, and if absent formats and adds an error message like `'/side' is unavailable before the session starts.`. If present, it forwards the thread id and `None` user message to `request_side_conversation`. It returns nothing.
+**Data flow**: It receives the slash command that requested the side chat. It checks whether there is a current thread ID. If there is none, it shows an error saying the command cannot be used before the session starts. If there is one, it asks `request_side_conversation` to start the side chat with no message.
 
-**Call relations**: This helper is used by bare `/side` and `/btw` dispatch in `ChatWidget::dispatch_command`. It centralizes the pre-session guard and delegates successful launches to `ChatWidget::request_side_conversation`.
+**Call relations**: `dispatch_command` calls this for bare `/side` and `/btw`. It is a small guard around `request_side_conversation` that makes the missing-thread case user-friendly.
 
 *Call graph*: calls 2 internal fn (request_side_conversation, command); called by 1 (dispatch_command); 1 external calls (format!).
 
@@ -4203,11 +4231,11 @@ fn request_empty_side_conversation(&mut self, cmd: SlashCommand)
 fn emit_raw_output_mode_changed(&self, enabled: bool)
 ```
 
-**Purpose**: Broadcasts the current raw-output-mode state to the app layer. It is a tiny event-emission helper used after `/raw` changes.
+**Purpose**: Tells the rest of the app that raw output mode has been turned on or off. Raw output mode changes how assistant output is displayed, so other parts of the app need to know.
 
-**Data flow**: It takes a boolean `enabled` and sends `AppEvent::RawOutputModeChanged { enabled }` through `app_event_tx`. It returns nothing.
+**Data flow**: It receives a boolean value meaning enabled or disabled. It sends an `RawOutputModeChanged` event through the app event channel. It does not return a value; the change is carried by the event.
 
-**Call relations**: This helper is called from both bare and inline `/raw` command handling so the event emission stays consistent.
+**Call relations**: `dispatch_command` calls this after toggling raw mode with bare `/raw`. `dispatch_prepared_command_with_args` calls it when `/raw on` or `/raw off` explicitly sets the mode.
 
 *Call graph*: called by 2 (dispatch_command, dispatch_prepared_command_with_args).
 
@@ -4218,11 +4246,11 @@ fn emit_raw_output_mode_changed(&self, enabled: bool)
 fn dispatch_command(&mut self, cmd: SlashCommand)
 ```
 
-**Purpose**: Executes a bare slash command after enforcing side-conversation, review-mode, and task-running restrictions. Its match arms cover the full builtin command set, including popup opening, app-event emission, message submission, async diff computation, status output, and platform-specific sandbox actions.
+**Purpose**: Performs the action for a bare slash command. This is the main command switchboard for commands that do not need extra text.
 
-**Data flow**: It takes a `SlashCommand`, first checks `ensure_slash_command_allowed_in_side_conversation`, `ensure_side_command_allowed_outside_review`, and `cmd.available_during_task()` against task-running state. If allowed, it matches on `cmd` and performs command-specific actions: sending `AppEvent`s, opening selection views/popups, mutating widget state, submitting user messages or ops, spawning async `/diff` work, adding history/status output, toggling raw/vim/service-tier state, or emitting usage/help errors. It returns nothing; outputs are widget mutations, history cells, redraw requests, spawned tasks, and app events.
+**Data flow**: It receives a `SlashCommand`. First it checks whether the command is allowed in the current state, such as side conversation, review mode, or active task. Then it matches the command and either updates UI state, opens a popup, sends an app event, submits a message, starts background work, or shows an error. It changes the widget and app state through those actions rather than returning a result.
 
-**Call relations**: This is the central bare-command dispatcher, called by `handle_slash_command_dispatch`, by `dispatch_command_with_args` when a command has no usable args, by `dispatch_prepared_command_with_args` as a fallback, and by `submit_queued_slash_prompt` for queued bare commands. It delegates to many helpers in this file such as `apply_plan_slash_command`, `request_empty_side_conversation`, `emit_raw_output_mode_changed`, `ensure_usage_command_available`, and the side/review restriction guards.
+**Call relations**: Live command handling, queued command handling, and fallback paths from argument dispatch all call this function. It delegates special pieces to helpers such as `apply_plan_slash_command`, `request_empty_side_conversation`, `ensure_usage_command_available`, and `emit_raw_output_mode_changed` when a command needs shared checks or side effects.
 
 *Call graph*: calls 8 internal fn (apply_plan_slash_command, emit_raw_output_mode_changed, ensure_side_command_allowed_outside_review, ensure_slash_command_allowed_in_side_conversation, ensure_usage_command_available, request_empty_side_conversation, available_during_task, level_from_config); called by 4 (dispatch_command_with_args, dispatch_prepared_command_with_args, handle_slash_command_dispatch, submit_queued_slash_prompt); 12 external calls (default, from, from, DiffResult, feedback_disabled_params, feedback_selection_params, format!, new_error_event, include_str!, matches! (+2 more)).
 
@@ -4238,11 +4266,11 @@ fn dispatch_command_with_args(
     )
 ```
 
-**Purpose**: Runs an inline slash command, deciding whether to fall back to bare dispatch, prepare live inline arguments from composer state, or execute the argument-aware path directly. It also enforces the same side/review/task restrictions as bare dispatch.
+**Purpose**: Decides how to run a live slash command that came with inline text. It separates commands that truly support arguments from commands that should be treated as bare commands.
 
-**Data flow**: It takes a `SlashCommand`, raw `args`, and `text_elements`, checks side/review restrictions and task-running availability, falls back to `dispatch_command(cmd)` when the command does not support inline args or the trimmed args are empty, special-cases `/goal` to preserve pending pastes/images/URLs from the composer, otherwise obtains prepared args/elements from `prepare_live_inline_args` and forwards a `PreparedSlashCommandArgs` bundle to `dispatch_prepared_command_with_args`. It returns nothing.
+**Data flow**: It receives a command, the typed argument text, and text metadata. It checks whether the command is allowed, whether it supports inline arguments, whether a task blocks it, and whether the arguments are empty. It then prepares the argument text and any attached input data, and passes a packaged command to `dispatch_prepared_command_with_args`.
 
-**Call relations**: This method is called by `handle_slash_command_with_args_dispatch`. It delegates fallback behavior to `ChatWidget::dispatch_command`, live preparation to `ChatWidget::prepare_live_inline_args`, and actual argument-aware execution to `ChatWidget::dispatch_prepared_command_with_args`.
+**Call relations**: `handle_slash_command_with_args_dispatch` calls this for live input. It may fall back to `dispatch_command` for unsupported or empty arguments, and it uses `prepare_live_inline_args` when the composer still holds richer submitted input.
 
 *Call graph*: calls 7 internal fn (dispatch_command, dispatch_prepared_command_with_args, ensure_side_command_allowed_outside_review, ensure_slash_command_allowed_in_side_conversation, prepare_live_inline_args, available_during_task, supports_inline_args); called by 1 (handle_slash_command_with_args_dispatch); 3 external calls (new, format!, new_error_event).
 
@@ -4257,11 +4285,11 @@ fn prepare_live_inline_args(
     ) -> Option<(String, Vec<TextElement>)>
 ```
 
-**Purpose**: Determines how to obtain the final inline-argument text and text elements for a live slash command. If the composer is otherwise empty, it uses the provided args directly; otherwise it asks the bottom pane to prepare a submission snapshot.
+**Purpose**: Gets the final argument text and text metadata for a live inline command. This matters when the composer still contains the submitted text and can provide a more accurate prepared submission.
 
-**Data flow**: It takes raw `args` and `text_elements`. If `bottom_pane.composer_text()` is empty, it returns `Some((args, text_elements))`; otherwise it calls `bottom_pane.prepare_inline_args_submission(false)` and returns that `Option<(String, Vec<TextElement>)>`. It mutates only whatever state the bottom pane preparation path changes.
+**Data flow**: It receives the current argument string and text elements. If the composer text is already empty, it returns those values unchanged. Otherwise it asks the bottom pane to prepare the inline submission without recording normal history, and returns the prepared text and metadata if that succeeds.
 
-**Call relations**: This helper is used only by `ChatWidget::dispatch_command_with_args` to normalize live inline-argument preparation before dispatch.
+**Call relations**: `dispatch_command_with_args` calls this before packaging most live inline commands. It keeps slash-command history separate from normal message history.
 
 *Call graph*: called by 1 (dispatch_command_with_args).
 
@@ -4272,11 +4300,11 @@ fn prepare_live_inline_args(
 fn clear_live_goal_submission(&mut self)
 ```
 
-**Purpose**: Clears the composer text, text elements, pending pastes, and staged submission state for a live `/goal` command after the command has been consumed locally. It prevents stale draft state from lingering in the composer.
+**Purpose**: Clears the live composer state after a `/goal` command has been consumed. `/goal` has special handling because it can be transformed into a goal draft or queued slash command rather than an ordinary message.
 
-**Data flow**: It resets the composer text/elements/images to empty via `bottom_pane.set_composer_text(String::new(), Vec::new(), Vec::new())`, clears pending pastes with `set_composer_pending_pastes(Vec::new())`, drains pending submission state, and returns nothing.
+**Data flow**: It empties the composer text, clears pending pasted content, and drains pending submission state. Nothing is returned; the bottom pane is left clean so the same goal input is not submitted again.
 
-**Call relations**: This cleanup helper is called from several `/goal` branches inside `ChatWidget::dispatch_prepared_command_with_args`, especially when the goal command is handled locally rather than submitted as a normal user turn.
+**Call relations**: `dispatch_prepared_command_with_args` calls this in several live `/goal` paths after the command has been accepted, rejected, queued, or converted into a goal action.
 
 *Call graph*: called by 1 (dispatch_prepared_command_with_args); 2 external calls (new, new).
 
@@ -4292,11 +4320,11 @@ fn prepared_inline_user_message(
         mut remote_image_urls: V
 ```
 
-**Purpose**: Builds a `UserMessage` from prepared inline slash-command arguments, optionally replacing the supplied images/URLs/mention bindings with the most recent live submission artifacts. This keeps live inline commands aligned with the composer’s actual staged attachments and mentions.
+**Purpose**: Builds a `UserMessage` from prepared slash-command arguments. A `UserMessage` is the package of text and attachments that can be sent to the assistant or used to start a side conversation.
 
-**Data flow**: Inputs are `args`, `text_elements`, vectors of local images, remote image URLs, mention bindings, and a `SlashCommandDispatchSource`. For `Live` source it overwrites those attachment/binding vectors by taking recent submission images with placeholders, remote image URLs, and mention bindings from the widget/bottom pane; then it returns a `UserMessage { text: args, local_images, remote_image_urls, text_elements, mention_bindings }`.
+**Data flow**: It receives argument text, text metadata, images, remote image URLs, mention bindings, and whether the command came from live input or the queue. For live input, it replaces the supplied attachment lists with the most recent submitted images, URLs, and mentions from the bottom pane. It returns a complete `UserMessage`.
 
-**Call relations**: This helper is used by `ChatWidget::dispatch_prepared_command_with_args` for inline `/plan` and `/side` submissions so both live and queued sources produce a consistent `UserMessage` structure.
+**Call relations**: `dispatch_prepared_command_with_args` uses this for commands like `/plan` with text and `/side` with an initial message. It hides the difference between live input, where attachments must be taken from the composer, and queued input, where attachments are already stored.
 
 *Call graph*: called by 1 (dispatch_prepared_command_with_args).
 
@@ -4311,11 +4339,11 @@ fn dispatch_prepared_command_with_args(
     )
 ```
 
-**Purpose**: Executes the argument-aware behavior for prepared slash commands, covering commands like `/usage`, `/mcp`, `/keymap`, `/raw`, `/rename`, `/plan`, `/goal`, `/side`, `/review`, `/resume`, `/sandbox-add-read-dir`, and `/pets`. It is the main inline-command execution engine for both live and queued sources.
+**Purpose**: Runs a slash command after its inline arguments and attachments have already been prepared. This is the detailed dispatcher for commands like `/usage weekly`, `/raw on`, `/goal ...`, `/side ...`, and `/rename ...`.
 
-**Data flow**: It takes a `SlashCommand` and a `PreparedSlashCommandArgs` bundle, destructures the bundle, trims the args, and matches on `cmd`. Depending on the command it may parse token-activity views, validate keymap config, toggle raw mode, normalize and submit thread renames, switch to Plan mode and submit or queue a `UserMessage`, interpret `/goal` control commands (`clear`, `edit`, `pause`, `resume`) or build a `GoalDraft`, start side conversations with an inline message, submit review ops, resume sessions by id/name, begin Windows sandbox read-root setup, disable/select pets, or fall back to `dispatch_command(cmd)`. For live non-goal commands it drains pending submission state at the end. It returns nothing.
+**Data flow**: It receives a command plus a prepared bundle containing argument text, text elements, pasted content, images, URLs, mentions, and whether the input was live or queued. It trims and interprets the arguments, then performs the command-specific action: open a filtered usage view, change raw mode, rename a thread, submit a plan message, set or edit a goal, start a side conversation, and more. For live commands, it drains pending submission state when appropriate.
 
-**Call relations**: This method is called from `ChatWidget::dispatch_command_with_args` for live inline commands and from `ChatWidget::submit_queued_slash_prompt` for queued slash prompts with args. It delegates to helpers in this file such as `apply_plan_slash_command`, `clear_live_goal_submission`, `prepared_inline_user_message`, `request_side_conversation`, `emit_raw_output_mode_changed`, and `ensure_usage_command_available`, and falls back to `ChatWidget::dispatch_command` when no specialized arg handling applies.
+**Call relations**: `dispatch_command_with_args` calls this for live inline commands, and `submit_queued_slash_prompt` calls it when replaying queued slash input. It uses helpers such as `apply_plan_slash_command`, `prepared_inline_user_message`, `clear_live_goal_submission`, `request_side_conversation`, `ensure_usage_command_available`, and `emit_raw_output_mode_changed`, and falls back to `dispatch_command` when the argument form is not special.
 
 *Call graph*: calls 10 internal fn (apply_plan_slash_command, clear_live_goal_submission, dispatch_command, emit_raw_output_mode_changed, ensure_usage_command_available, prepared_inline_user_message, request_side_conversation, parse, from_config, command); called by 2 (dispatch_command_with_args, submit_queued_slash_prompt); 7 external calls (SetStatus, from, new, review, ResumeSessionByIdOrName, format!, matches!).
 
@@ -4329,11 +4357,11 @@ fn submit_queued_slash_prompt(
     ) -> QueueDrain
 ```
 
-**Purpose**: Consumes a queued user message that may begin with a slash command, resolves and dispatches that command if recognized, or falls back to normal message submission otherwise. It also decides whether queue draining should continue after the command runs.
+**Purpose**: Processes a queued user message that might be a slash command. Queued messages happen when input is saved before the session is ready and replayed later.
 
-**Data flow**: It takes a `QueuedUserMessage`, destructures out the `UserMessage` and `pending_pastes`, parses the leading slash name with `parse_slash_name(&text)`, and if parsing fails or the name contains `/` submits the message normally and returns `QueueDrain::Stop`. Otherwise it computes service-tier commands, resolves the slash item with `find_slash_command(name, self.builtin_command_flags(), &service_tier_commands)`, emits an info message and returns `QueueDrain::Continue` for unknown commands, dispatches bare builtin or service-tier commands when no args remain, or for inline-arg builtins trims/restores argument text elements via `slash_command_args_elements` and calls `dispatch_prepared_command_with_args` with `source: Queued`. It returns the `QueueDrain` decision from `queued_command_drain_result` or immediate branches.
+**Data flow**: It receives a queued message with text, attachments, mentions, and pending pasted content. It tries to parse a slash command name from the text. If the text is not a valid command, it submits it as a normal user message. If the command is recognized, it runs the bare command or prepares and dispatches its arguments. It returns a `QueueDrain` value telling the queue whether to continue draining more items or stop.
 
-**Call relations**: This is the queued-input counterpart to live slash dispatch. It delegates slash parsing to `parse_slash_name`, command lookup to `find_slash_command`, builtin flag computation to `ChatWidget::builtin_command_flags`, execution to `ChatWidget::dispatch_command`, `ChatWidget::handle_service_tier_command_dispatch`, or `ChatWidget::dispatch_prepared_command_with_args`, and post-command queue policy to `ChatWidget::queued_command_drain_result`.
+**Call relations**: This is the queued-input counterpart to live slash dispatch. It calls `parse_slash_name`, asks `builtin_command_flags` which commands are currently available, uses `find_slash_command` to identify the command, then calls `dispatch_command`, `handle_service_tier_command_dispatch`, or `dispatch_prepared_command_with_args`. After running a command, it asks `queued_command_drain_result` whether more queued input can safely proceed.
 
 *Call graph*: calls 7 internal fn (parse_slash_name, find_slash_command, builtin_command_flags, dispatch_command, dispatch_prepared_command_with_args, handle_service_tier_command_dispatch, queued_command_drain_result); 2 external calls (slash_command_args_elements, format!).
 
@@ -4344,11 +4372,11 @@ fn submit_queued_slash_prompt(
 fn builtin_command_flags(&self) -> BuiltinCommandFlags
 ```
 
-**Purpose**: Builds the `BuiltinCommandFlags` snapshot used during slash-command lookup so only currently valid commands are recognized. The flags reflect collaboration modes, connectors, plugins, goals, service-tier commands, personality support, side-conversation state, and Windows sandbox elevation availability.
+**Purpose**: Builds the set of feature flags that decide which built-in slash commands are visible and valid right now. For example, some commands depend on enabled features, authentication, platform, or whether a side conversation is active.
 
-**Data flow**: It reads multiple widget/config fields and feature flags, computes `allow_elevate_sandbox` from the Windows sandbox level on Windows or `false` elsewhere, and returns a populated `BuiltinCommandFlags` struct. It mutates no state.
+**Data flow**: It reads app configuration, feature flags, authentication state, current mode, and on Windows the sandbox level. It returns a `BuiltinCommandFlags` value describing which slash-command families should be enabled.
 
-**Call relations**: This helper is called by `ChatWidget::submit_queued_slash_prompt` before `find_slash_command` so queued slash parsing uses the same runtime availability rules as live command menus.
+**Call relations**: `submit_queued_slash_prompt` uses this before calling command lookup. That way queued command parsing follows the same availability rules as the rest of the UI.
 
 *Call graph*: calls 1 internal fn (level_from_config); called by 1 (submit_queued_slash_prompt); 1 external calls (matches!).
 
@@ -4359,11 +4387,11 @@ fn builtin_command_flags(&self) -> BuiltinCommandFlags
 fn ensure_usage_command_available(&mut self) -> bool
 ```
 
-**Purpose**: Checks whether `/usage` is currently allowed by backend authentication state. If not, it emits a fixed error message and returns `false`.
+**Purpose**: Checks whether the `/usage` command can be used. The command needs ChatGPT backend authentication, so unsigned-in users get a clear message instead of a broken view.
 
-**Data flow**: It reads `self.has_codex_backend_auth`; if true it returns `true`, otherwise it adds an error message using `USAGE_CHATGPT_LOGIN_REQUIRED` and returns `false`. It mutates history/UI state only in the failure case.
+**Data flow**: It reads whether backend authentication is present. If yes, it returns `true`. If not, it shows an error saying sign-in is required and returns `false`.
 
-**Call relations**: This guard is used by both bare and inline `/usage` handling so the command’s auth requirement is enforced consistently.
+**Call relations**: `dispatch_command` calls this before opening the usage menu, and `dispatch_prepared_command_with_args` calls it before showing a specific usage view such as daily or weekly.
 
 *Call graph*: called by 2 (dispatch_command, dispatch_prepared_command_with_args).
 
@@ -4374,11 +4402,11 @@ fn ensure_usage_command_available(&mut self) -> bool
 fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain
 ```
 
-**Purpose**: Determines whether queued-input draining should continue after a queued slash command executes. Commands that open modals, start tasks, or otherwise change interaction context generally stop draining.
+**Purpose**: Decides whether the queued-input system should keep processing after a queued slash command runs. Some commands are quick and safe to continue past; others open UI or start work, so the queue should pause.
 
-**Data flow**: It takes a `SlashCommand`, first checks whether a user turn is pending/running or a modal/popup is active and returns `QueueDrain::Stop` in that case. Otherwise it matches the command against a hard-coded allowlist of commands that return `QueueDrain::Continue`; all others return `QueueDrain::Stop`.
+**Data flow**: It receives the command that just ran. It first checks whether a user turn is pending or a modal popup is active; if so, it returns `Stop`. Otherwise it classifies the command and returns either `Continue` for lightweight informational commands or `Stop` for commands that likely need user attention or change session flow.
 
-**Call relations**: This helper is called only by `ChatWidget::submit_queued_slash_prompt` after queued command execution. It encapsulates queue-drain policy separately from command semantics.
+**Call relations**: `submit_queued_slash_prompt` calls this after running a queued built-in command. Its return value controls whether the queue drains the next saved input or waits.
 
 *Call graph*: called by 1 (submit_queued_slash_prompt).
 
@@ -4393,11 +4421,11 @@ fn slash_command_args_elements(
     ) -> Vec<TextElement>
 ```
 
-**Purpose**: Rebases `TextElement` byte ranges from the full slash-command text onto just the argument substring. Elements entirely before the argument offset or outside the trimmed argument length are dropped.
+**Purpose**: Extracts the text metadata that belongs only to a slash command’s arguments, not to the command name itself. This preserves things like mention ranges after `/goal ` or `/side ` is removed.
 
-**Data flow**: It takes the trimmed argument string `rest`, its byte offset within the original text, and a slice of original `text_elements`. If either input is empty it returns an empty vector. Otherwise it iterates elements, skips those ending before the offset, subtracts `rest_offset` from start/end, clamps end to `rest.len()`, drops empty/out-of-range spans, and returns the remapped `Vec<TextElement>`.
+**Data flow**: It receives the argument text, the byte offset where those arguments began in the original message, and the original text elements. It filters out elements that ended before the arguments, shifts remaining byte ranges so they are relative to the argument text, clips them to the argument length, and returns the adjusted list.
 
-**Call relations**: This helper is used by `ChatWidget::submit_queued_slash_prompt` when reconstructing inline-argument metadata for queued slash commands.
+**Call relations**: `submit_queued_slash_prompt` uses this when replaying a queued slash command with inline arguments. It lets `dispatch_prepared_command_with_args` receive clean argument metadata as if the user had typed only the argument body.
 
 *Call graph*: 3 external calls (new, is_empty, iter).
 
@@ -4408,11 +4436,11 @@ fn slash_command_args_elements(
 fn ensure_slash_command_allowed_in_side_conversation(&mut self, cmd: SlashCommand) -> bool
 ```
 
-**Purpose**: Rejects slash commands that are not permitted while a side conversation is active, emitting a standard error and draining pending submission state. Commands explicitly marked side-safe are allowed through.
+**Purpose**: Blocks slash commands that are not allowed inside side conversations. This protects the side chat from commands that only make sense in the main thread.
 
-**Data flow**: It takes a `SlashCommand`, checks `self.active_side_conversation` and `cmd.available_in_side_conversation()`, returns `true` when allowed, and otherwise adds an error message mentioning the command, drains pending submission state, and returns `false`.
+**Data flow**: It receives a command and checks whether the widget is currently in a side conversation and whether that command is permitted there. If allowed, it returns `true`. If blocked, it shows an error, clears pending submission state, and returns `false`.
 
-**Call relations**: This guard is called at the start of both `ChatWidget::dispatch_command` and `ChatWidget::dispatch_command_with_args` so side-conversation restrictions apply uniformly to bare and inline slash commands.
+**Call relations**: `dispatch_command` and `dispatch_command_with_args` call this before doing any command-specific work. It acts like a gate at the front of both bare and inline command paths.
 
 *Call graph*: calls 1 internal fn (available_in_side_conversation); called by 2 (dispatch_command, dispatch_command_with_args); 1 external calls (format!).
 
@@ -4423,11 +4451,11 @@ fn ensure_slash_command_allowed_in_side_conversation(&mut self, cmd: SlashComman
 fn ensure_side_command_allowed_outside_review(&mut self, cmd: SlashCommand) -> bool
 ```
 
-**Purpose**: Rejects `/side` and `/btw` while code review mode is active, since side conversations are unavailable during review. Other commands pass through unchanged.
+**Purpose**: Prevents `/side` and `/btw` from starting side conversations while code review mode is running. That avoids mixing a review workflow with a new side thread at the wrong time.
 
-**Data flow**: It takes a `SlashCommand`, returns `true` unless the command is `Side` or `Btw` and `self.review.is_review_mode` is true. In the blocked case it adds an error message, drains pending submission state, and returns `false`.
+**Data flow**: It receives a command. If the command is not `/side` or `/btw`, or if review mode is not active, it returns `true`. If side-chat creation is blocked by review mode, it shows an error, clears pending submission state, and returns `false`.
 
-**Call relations**: This guard is called by both `ChatWidget::dispatch_command` and `ChatWidget::dispatch_command_with_args` immediately after the side-conversation availability check.
+**Call relations**: `dispatch_command` and `dispatch_command_with_args` call this near the start of command processing. It is a focused rule that only applies to side-conversation commands during review.
 
 *Call graph*: calls 1 internal fn (command); called by 2 (dispatch_command, dispatch_command_with_args); 2 external calls (format!, matches!).
 
@@ -4437,13 +4465,13 @@ Maps backend notifications and requests into concrete chat-widget lifecycle, app
 
 ### `tui/src/chatwidget/protocol.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `main loop event handling`
 
-This file is the notification-side protocol adapter for `ChatWidget`. Its central method, `handle_server_notification`, first rejects misrouted `McpServerStatusUpdated` events when the embedded thread id does not match the widget’s current thread, specifically to avoid shared notification handling mutating the wrong parent widget. It then derives replay-related flags (`from_replay`, `is_resume_initial_replay`) and retry-error state so it can suppress live-only effects during replay and preserve retry headers while a retryable error is active.
+The chat screen does not create all of its own state. It is constantly told by the app server that something happened: a turn started, a message grew by a few words, a command produced output, a plan changed, an error occurred, and so on. This file is the traffic director for those messages.
 
-The large `match` translates each `ServerNotification` variant into a focused widget callback: token usage becomes `set_token_info`, thread metadata updates call thread-specific handlers, turn lifecycle notifications update `turn_lifecycle.last_turn_id`, clear `last_non_retry_error`, and invoke task start/completion flows, and item notifications are split into started/completed paths. Streaming deltas for agent text, plans, reasoning, terminal I/O, command output, patch output, and turn diffs are forwarded immediately. Several protocol enums are normalized into UI enums, notably turn-plan step statuses.
+The main method, `handle_server_notification`, takes one server notification and routes it to the right ChatWidget behavior. Before it does that, it rejects some updates that belong to a different child thread, so one chat does not accidentally show another chat’s status. It also pays attention to whether the notification is live or being replayed from history. That matters because replayed events should rebuild the screen without re-triggering some live-only behavior, such as shutdown completion or task-start side effects.
 
-Error handling is careful: retryable errors only surface as stream errors for live traffic, while non-retry errors are memoized in `last_non_retry_error` so a later failed `TurnCompleted` echo does not duplicate the same failure UI. `handle_turn_completed_notification` also resets user-message dedupe state at turn end and distinguishes completed, interrupted, failed, and still-in-progress turns. Item-start handling intentionally triggers only side-effect-safe beginnings, and item completion delegates to the replay-aware thread-item renderer.
+Most notification types are translated into more focused UI actions: token usage updates refresh the token display, message deltas append text, command output is added to an execution cell, warning messages become visible warnings, and completed items are rendered into the conversation. Turn completion gets special care because completed, interrupted, and failed turns each need a different cleanup path. In short, this file is like a receptionist for the chat UI: it reads each incoming notice, checks who it belongs to, and sends it to the right desk.
 
 #### Function details
 
@@ -4457,11 +4485,11 @@ fn handle_server_notification(
     )
 ```
 
-**Purpose**: Consumes one `ServerNotification` and routes it to the exact `ChatWidget` update path for that notification type, while filtering replay-only and thread-mismatch cases. It also maintains turn/error bookkeeping that later completion handlers rely on.
+**Purpose**: Receives one notification from the server and turns it into the appropriate chat-screen update. This is the central routing point for live and replayed server events.
 
-**Data flow**: Inputs are `&mut self`, a `ServerNotification`, and an optional `ReplayKind`. It reads widget state such as the current thread id, config flags, retry header state, `turn_lifecycle`, and `last_non_retry_error`; computes replay/error booleans; may early-return on mismatched MCP child-thread updates; then pattern-matches the notification into concrete UI callbacks and state mutations. Outputs are mutations to widget state and downstream UI/event side effects such as redraw requests, warnings, review prompts, shutdown, token info updates, and history entries via delegated methods.
+**Data flow**: It starts with a server notification and optional replay information. It first checks whether certain child-thread updates belong to this widget; if not, it ignores them. It then notes whether the event is from replay, restores retry-related UI state when appropriate, and matches the notification type. Depending on the kind of event, it updates stored state, calls UI methods to add text or output, records errors, refreshes skills, shows warnings, or delegates more detailed work to helper methods. The result is usually a changed ChatWidget state and a requested visual update rather than a returned value.
 
-**Call relations**: This is the top-level notification entry for chat protocol traffic. When a turn or item lifecycle event arrives, it delegates to `ChatWidget::handle_turn_completed_notification`, `ChatWidget::handle_item_started_notification`, or `ChatWidget::handle_item_completed_notification` so those narrower routines can apply turn-end dedupe and replay-aware item rendering. It also invokes `ThreadId::from_string` to validate thread-name updates and logs invalid ids instead of poisoning widget state.
+**Call relations**: This is the method the rest of the chat event flow calls when a server-side event arrives. For complex cases it hands off to `ChatWidget::handle_turn_completed_notification`, `ChatWidget::handle_item_started_notification`, or `ChatWidget::handle_item_completed_notification` so that turn endings and item lifecycle events stay easier to reason about. It also parses thread IDs when thread names change and logs a warning if the server sends an invalid one.
 
 *Call graph*: calls 4 internal fn (from_string, handle_item_completed_notification, handle_item_started_notification, handle_turn_completed_notification); 2 external calls (matches!, warn!).
 
@@ -4476,11 +4504,11 @@ fn handle_turn_completed_notification(
     )
 ```
 
-**Purpose**: Finalizes UI state for a completed turn based on the server-reported `TurnStatus`, including success, interruption, and failure paths. It also clears prompt-echo dedupe so future identical user messages are rendered normally.
+**Purpose**: Finishes the UI work for a turn after the server says that turn ended. It separates successful, interrupted, failed, and still-running turns so the chat screen cleans up correctly.
 
-**Data flow**: Inputs are `&mut self`, a `TurnCompletedNotification`, and optional `ReplayKind`. It clears `last_rendered_user_message_display`, reads `notification.turn.status`, `notification.turn.duration_ms`, `notification.turn.error`, and `turn_lifecycle` budget-limit markers, then updates `last_non_retry_error` and invokes completion/interruption/error-finalization methods accordingly. It returns no value; effects are state cleanup, redraw/finalization calls, and possibly queue advancement after errorless failed turns.
+**Data flow**: It receives a completed-turn notification plus replay information. First it clears a short-lived deduplication marker used to avoid showing the same locally typed user message twice. If the turn completed normally, it clears remembered errors and marks the task complete. If it was interrupted, it decides whether the reason was a budget limit or a normal interruption and updates the UI accordingly. If it failed, it either avoids repeating an error already shown earlier or displays the failure now; if no error is attached, it finalizes the turn, redraws, and may send queued input. It does not return data; it changes the widget’s state and visible conversation flow.
 
-**Call relations**: It is invoked only from `ChatWidget::handle_server_notification` when a `TurnCompleted` notification arrives, and also indirectly during replay because replay synthesizes a `TurnCompletedNotification` and routes it through the same path. Its duplicate-error suppression depends on `handle_server_notification` having stored `last_non_retry_error` when the non-retry `Error` notification arrived earlier.
+**Call relations**: It is called by `ChatWidget::handle_server_notification` when a `TurnCompleted` server notification arrives. It is the specialized cleanup branch for turn endings, so the main notification router does not need to carry all the details for success, interruption, and failure handling.
 
 *Call graph*: called by 1 (handle_server_notification).
 
@@ -4495,11 +4523,11 @@ fn handle_item_started_notification(
     )
 ```
 
-**Purpose**: Processes `ItemStartedNotification` variants that should create immediate in-progress UI affordances, such as command execution, patch application, web search, image generation, collaboration calls, and review mode entry. It intentionally ignores item kinds that have no start-time surface.
+**Purpose**: Responds when the server says a new work item has begun, such as a command, file edit, web search, image generation, tool call, or review mode entry. It creates or updates the right kind of in-progress UI element.
 
-**Data flow**: Inputs are `&mut self`, an `ItemStartedNotification`, and a `from_replay` flag. It reads `notification.item`, destructures specific `ThreadItem` variants, transforms file-change `changes` through `file_update_changes_to_display`, and forwards reconstructed or borrowed items into start handlers. It returns nothing and mutates transcript/review state through delegated widget methods.
+**Data flow**: It receives an item-start notification and a simple flag saying whether this came from replay. It looks at the item type. For command execution it starts a command display; for file changes it converts the changes into a display-friendly form and starts a patch view; for tool calls, web searches, image generation, collaboration activity, and sub-agent activity it calls the matching UI entry point. If the item is entering review mode, it only opens review mode for live events, not replayed history. It produces no return value; it prepares the chat screen to show ongoing work.
 
-**Call relations**: This function is called by `ChatWidget::handle_server_notification` for `ServerNotification::ItemStarted`. The caller passes `replay_kind.is_some()` so this routine can suppress live-only review-mode entry when the item came from replay, while still allowing other start markers to be rendered.
+**Call relations**: It is called by `ChatWidget::handle_server_notification` when an `ItemStarted` notification arrives. It acts as the small dispatcher for beginnings of individual items, while completed items are sent through `ChatWidget::handle_item_completed_notification`.
 
 *Call graph*: called by 1 (handle_server_notification).
 
@@ -4514,11 +4542,11 @@ fn handle_item_completed_notification(
     )
 ```
 
-**Purpose**: Converts an item-completed protocol event into the unified thread-item rendering path with the correct live-vs-replay source tag. It is the thin bridge from protocol completion events to transcript rendering.
+**Purpose**: Renders a finished conversation item after the server says it is complete. This is how completed messages, tool results, file changes, and similar items become final chat entries.
 
-**Data flow**: Inputs are `&mut self`, an `ItemCompletedNotification`, and optional `ReplayKind`. It extracts `notification.item` and `notification.turn_id`, maps the replay flag into `ThreadItemRenderSource::Live` or `ThreadItemRenderSource::Replay`, and passes all three values to `handle_thread_item`. It returns no value; the resulting transcript/history mutations happen in the delegated renderer.
+**Data flow**: It receives an item-completed notification and optional replay information. It takes the completed item and its turn ID, converts the replay information into a render source label — live event or replayed event — and passes everything to the general thread-item renderer. The output is not a returned value; the chat widget’s conversation display is updated.
 
-**Call relations**: It is called by `ChatWidget::handle_server_notification` for `ServerNotification::ItemCompleted`. Rather than duplicating item-specific completion logic here, it funnels all completed items through the same replay-aware rendering path used by explicit replay code.
+**Call relations**: It is called by `ChatWidget::handle_server_notification` for `ItemCompleted` events. Its job is deliberately narrow: it hands the finished item to the existing thread-item rendering path and preserves whether the item came from live server activity or from replayed history.
 
 *Call graph*: called by 1 (handle_server_notification).
 
@@ -4527,11 +4555,15 @@ fn handle_item_completed_notification(
 
 `orchestration` · `request handling`
 
-This module handles protocol messages that require user interaction or one-off UI reactions rather than transcript streaming. `handle_server_request` extracts a stable request id string and matches each `ServerRequest` variant into the corresponding widget flow: command execution approvals are localized with a fallback cwd from `self.config.cwd`, patch approvals are converted and shown, MCP elicitation requests are forwarded directly, permission approvals are localized through `request_permissions_from_params`, and tool-input requests open the user-input path. Unsupported request types that the TUI does not implement emit a stub error only for live traffic, not replay.
+The terminal chat widget receives many kinds of messages from the app server. Those messages are written in the server protocol, which is a shared language used between parts of the app. This file translates that shared language into actions the chat screen understands.
 
-The file also contains several small adapters for adjacent protocol surfaces. `handle_skills_list_response` simply forwards a skills-list response into the widget’s skills UI. `on_guardian_review_notification` is more substantial: it converts app-server guardian review structures into the TUI’s `GuardianAssessmentEvent`, including path-localization via `try_into`, optional completion timestamps, status mapping, risk-level mapping, user-authorization mapping, and decision-source mapping. Localization failures are surfaced as user-visible error messages and abort processing.
+Think of it like a front desk clerk. The server sends a form saying, for example, “ask the user before running this command” or “show this guardian review result.” This file reads the form, checks what kind it is, reshapes the data if needed, and sends it to the right part of ChatWidget.
 
-The remaining methods are narrow UI hooks: shutdown completion requests immediate exit, turn diffs are logged and cause a status-line refresh, deprecation notices are appended to transcript history and redrawn, and patch-apply output deltas are currently a no-op placeholder.
+The biggest function, handle_server_request, sorts incoming server requests. Some requests become approval prompts for commands or file changes. Some become permission requests, user-input prompts, or elicitation prompts. If a newer or unsupported request reaches this terminal UI during a live run, it shows a clear stub error instead of silently doing nothing.
+
+The guardian review notification path is more involved. It converts review status, risk level, user authorization, and decision source from app-server types into the internal approval types used by the chat UI. If filesystem paths cannot be converted into local paths, it reports that error to the user and stops.
+
+The file also contains small notification handlers for shutdown, turn diffs, skill-list responses, and deprecation notices.
 
 #### Function details
 
@@ -4545,11 +4577,11 @@ fn handle_server_request(
     )
 ```
 
-**Purpose**: Routes a single `ServerRequest` into the matching approval or input UI flow, using the request id as the interaction key. It also emits a stub message for unsupported live-only request types.
+**Purpose**: Receives one request from the app server and routes it to the right chat-widget flow. This is how server-side events become visible prompts or messages in the terminal UI.
 
-**Data flow**: Inputs are `&mut self`, a `ServerRequest`, and optional `ReplayKind`. It reads the request id via `request.id()`, reads config cwd for command-approval fallback localization, converts protocol params into widget events where needed, and either invokes the corresponding request handler or appends an error message. It returns no value; outputs are widget state/UI changes through delegated methods.
+**Data flow**: A ServerRequest comes in, along with optional replay information that says whether this is being replayed rather than happening live. The function reads the request id, looks at the request kind, converts the request data into the widget’s local shape when needed, and calls the matching ChatWidget action. If path conversion for a permissions request fails, it adds an error message. If the request kind is not implemented for the terminal UI and this is not a replay, it adds a stub error message.
 
-**Call relations**: This is the request dispatcher for chat protocol traffic. For supported variants it delegates into specialized widget handlers such as approval, elicitation, permissions, and user-input flows; for unsupported variants it only surfaces `TUI_STUB_MESSAGE` when the request is live, avoiding replay noise.
+**Call relations**: This is the main dispatch point for app-server requests aimed at ChatWidget. It first asks the request for its id, then branches by request type. Successful branches hand off to more focused widget flows such as execution approval, patch approval, permissions, elicitation, or tool user input. Error branches build user-facing messages with formatting so the problem appears in the chat instead of disappearing silently.
 
 *Call graph*: 2 external calls (id, format!).
 
@@ -4560,11 +4592,11 @@ fn handle_server_request(
 fn handle_skills_list_response(&mut self, response: SkillsListResponse)
 ```
 
-**Purpose**: Forwards a `SkillsListResponse` into the widget’s skills rendering/update path. It exists as a narrow protocol adapter rather than adding response-specific logic inline elsewhere.
+**Purpose**: Receives the server’s response containing available skills and passes it to the chat widget’s skill-list display flow.
 
-**Data flow**: It takes `&mut self` and a `SkillsListResponse`, passes the response unchanged to `on_list_skills`, and returns nothing. All state mutation occurs in the delegated handler.
+**Data flow**: A SkillsListResponse comes in from the server. The function does not change it; it forwards the response directly to the widget logic that knows how to show or use the skills list. Nothing is returned.
 
-**Call relations**: This function is a simple bridge from protocol response handling into the widget’s skills UI flow.
+**Call relations**: This function is a small adapter between the server protocol response and the ChatWidget’s internal skill-list behavior. It exists so the protocol-facing code has one clear place to send a skills response.
 
 
 ##### `ChatWidget::on_patch_apply_output_delta`  (lines 63–63)
@@ -4573,11 +4605,11 @@ fn handle_skills_list_response(&mut self, response: SkillsListResponse)
 fn on_patch_apply_output_delta(&mut self, _item_id: String, _delta: String)
 ```
 
-**Purpose**: Placeholder hook for patch-apply output streaming. The current implementation intentionally ignores both item id and delta.
+**Purpose**: Currently does nothing when partial output from applying a patch arrives. It is present as a placeholder for a notification type the protocol can send.
 
-**Data flow**: It accepts `&mut self`, an `_item_id: String`, and a `_delta: String`, performs no reads or writes, and returns unit.
+**Data flow**: It receives an item id and a text delta, meaning a small new piece of output. Both inputs are intentionally ignored, and the chat widget is left unchanged.
 
-**Call relations**: It is called from notification dispatch when `FileChangeOutputDelta` arrives, but currently acts as a stub so the protocol surface is wired without rendering behavior yet.
+**Call relations**: This is a no-op hook in the protocol notification surface. If patch-apply streaming output is supported later, this is the place where that incoming notification can be connected to visible chat UI updates.
 
 
 ##### `ChatWidget::on_guardian_review_notification`  (lines 65–153)
@@ -4591,11 +4623,11 @@ fn on_guardian_review_notification(
         review: codex_app_server_protocol::GuardianApprovalReview,
 ```
 
-**Purpose**: Converts app-server guardian review start/completion notifications into a normalized `GuardianAssessmentEvent` for the TUI. It performs enum translation, optional completion shaping, and path-localization validation before emitting the assessment.
+**Purpose**: Turns a guardian review notification from the app server into a guardian assessment event the chat widget can display. A guardian review is an automated safety or approval check around an action.
 
-**Data flow**: Inputs are `&mut self`, review identifiers/timestamps, an app-server `GuardianApprovalReview`, optional completion tuple, and a `GuardianApprovalReviewAction`. It first attempts `try_into()` on the action; on failure it writes an error message and returns early. Otherwise it expands the optional completion into `(completed_at_ms, decision_source)` options, maps app-server status/risk/user-authorization/decision-source enums into local protocol enums, constructs a `GuardianAssessmentEvent`, and passes it to `on_guardian_assessment`.
+**Data flow**: The function receives identifiers, timing information, a review object, optional completion information, and the action that was reviewed. It first tries to convert the action into the local form used by the UI; if that fails, it shows an error and stops. It then separates completion time and decision source, converts review status, risk level, user authorization, and decision source into internal approval types, and builds a GuardianAssessmentEvent. That event is passed into the widget so the review can be shown or updated.
 
-**Call relations**: This method is reached from notification dispatch for both guardian-review-started and guardian-review-completed notifications. The caller supplies `completion` as `None` or `Some(...)`, and this function centralizes the shared conversion logic so both notification variants produce the same downstream assessment event shape.
+**Call relations**: This function sits between app-server guardian notifications and the chat widget’s guardian-assessment display logic. It relies on conversion for the reviewed action and uses formatted error messages if conversion fails. Once the data is in the UI’s expected shape, it hands the completed assessment event to the widget’s guardian assessment flow.
 
 *Call graph*: 2 external calls (try_into, format!).
 
@@ -4606,11 +4638,11 @@ fn on_guardian_review_notification(
 fn on_shutdown_complete(&mut self)
 ```
 
-**Purpose**: Triggers immediate application exit once the server reports the thread/session has closed. It is the UI-side completion hook for shutdown.
+**Purpose**: Tells the terminal UI to exit as soon as the server says shutdown is complete.
 
-**Data flow**: It takes `&mut self`, calls `request_immediate_exit`, and returns unit. The only output is the widget/application exit request state.
+**Data flow**: No extra data comes in. The function changes the widget/application state by requesting an immediate exit. It does not return a value.
 
-**Call relations**: Notification dispatch invokes this only for live `ThreadClosed` events; replayed closures are intentionally ignored so historical sessions do not terminate the UI.
+**Call relations**: This is the final notification hook for shutdown. When the app server confirms that shutdown work is done, this function connects that confirmation to the UI’s exit request.
 
 
 ##### `ChatWidget::on_turn_diff`  (lines 159–162)
@@ -4619,11 +4651,11 @@ fn on_shutdown_complete(&mut self)
 fn on_turn_diff(&mut self, unified_diff: String)
 ```
 
-**Purpose**: Records receipt of a turn diff for diagnostics and refreshes the status line. It does not currently render the diff body into transcript history.
+**Purpose**: Receives a diff for the current turn and refreshes the status line. A diff is a text summary of what changed, often in the familiar plus-and-minus format used by version control tools.
 
-**Data flow**: It accepts `&mut self` and a `unified_diff: String`, logs the diff with `debug!`, refreshes the status line, and returns unit. No persistent transcript state is changed here.
+**Data flow**: A unified diff string comes in. The function writes it to the debug log for developers and then asks the widget to refresh its status line. The diff is not shown directly here, and no value is returned.
 
-**Call relations**: It is called from notification dispatch when `TurnDiffUpdated` arrives, serving as the current UI hook for that protocol event.
+**Call relations**: This notification hook connects turn-diff events to lightweight UI refresh work. It uses debug logging so developers can inspect the diff while keeping the visible user-facing behavior focused on updating the status line.
 
 *Call graph*: 1 external calls (debug!).
 
@@ -4634,11 +4666,11 @@ fn on_turn_diff(&mut self, unified_diff: String)
 fn on_deprecation_notice(&mut self, summary: String, details: Option<String>)
 ```
 
-**Purpose**: Adds a deprecation notice cell to transcript history and schedules a redraw so the warning becomes visible immediately. It is the user-facing surface for server deprecation notices.
+**Purpose**: Shows a deprecation notice in the chat history and asks the UI to redraw. A deprecation notice warns the user that something is outdated and may be removed or changed later.
 
-**Data flow**: Inputs are `&mut self`, a `summary: String`, and optional `details: Option<String>`. It builds a history cell with `history_cell::new_deprecation_notice`, appends it to history, requests redraw, and returns unit.
+**Data flow**: A short summary and optional details come in. The function builds a history cell for the notice, appends it to the chat history, and requests a redraw so the new notice appears on screen. It does not return a value.
 
-**Call relations**: Notification dispatch calls this for `DeprecationNotice` events. It encapsulates the exact history-cell construction so the dispatcher only needs to forward summary/details.
+**Call relations**: This function connects server-side deprecation warnings to the visible chat timeline. It uses the history-cell helper to create the display item, then hands that item to the chat history and asks the screen to repaint.
 
 *Call graph*: 1 external calls (new_deprecation_notice).
 
@@ -4648,13 +4680,13 @@ Builds the popup flows for models, reviews, plans, and connector browsing that l
 
 ### `tui/src/chatwidget/connectors.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `main loop and user interaction`
 
-This file encapsulates the connectors/apps subsystem inside `ChatWidget`. It defines `ConnectorsCacheState` with explicit `Uninitialized`, `Loading`, `Ready(ConnectorsSnapshot)`, and `Failed(String)` states, plus `ConnectorsState`, which adds `partial_snapshot`, `prefetch_in_flight`, and `force_refetch_pending` flags. Together these fields let the widget prefetch connector metadata, show partial installed-app results while a full fetch is still running, and queue a forced refetch if a second request arrives during an in-flight load.
+This file is the chat widget’s small control center for app connectors. A connector is an app integration that can be installed, enabled, disabled, or mentioned in a prompt. The file keeps track of whether the app list has never been loaded, is loading, is ready, or failed. It also remembers partial results, so the UI can show something useful while a fuller list is still arriving.
 
-The public entrypoints are `refresh_connectors`, `prefetch_connectors`, `connectors_for_mentions`, `add_connectors_output`, `on_connectors_loaded`, and `update_connector_enabled`. Refresh requests are funneled through `queue_connectors_refresh` and `begin_connectors_refresh`, which gate on feature/account availability and suppress duplicate fetches. UI rendering is split between a loading popup and a searchable connectors popup built from `SelectionViewParams`; each `SelectionItem` includes labels, descriptions, search text, and an action closure that either opens an app-management link or inserts an informational history cell when no link exists.
+The flow is like a shop window that refreshes its catalog in the background. When the user opens the apps popup, the widget asks for a refresh, but it can still show the last known list immediately. If the list is not ready yet, it shows a loading popup. When results arrive, it updates the cache, refreshes the popup if it is open, and shares the snapshot with the bottom pane so mentions and search can use it.
 
-When results arrive, the file merges `is_enabled` flags from the previous ready snapshot into the new snapshot, updates the bottom pane's connectors snapshot, refreshes any open popup while preserving selection, and falls back gracefully on errors: keep the old ready snapshot if possible, otherwise promote a partial snapshot, otherwise mark the cache failed.
+The file is careful not to start duplicate fetches. If a refresh is already running and a stronger “force refresh” request comes in, it records that request and runs it after the current one finishes. It also handles failures gently: if a fresh load fails but an older or partial list exists, it keeps showing that instead of leaving the user with nothing.
 
 #### Function details
 
@@ -4664,11 +4696,11 @@ When results arrive, the file merges `is_enabled` flags from the previous ready 
 fn refresh_connectors(&mut self, force_refetch: bool)
 ```
 
-**Purpose**: Starts a connectors refresh request, optionally forcing a refetch from the source rather than relying on cached data. It is the explicit user-facing refresh entrypoint.
+**Purpose**: Starts a user-visible refresh of the apps list. The caller can ask for a forced refresh, which means the list should be fetched again even if cached data already exists.
 
-**Data flow**: Takes a `force_refetch` boolean and forwards it unchanged to `self.queue_connectors_refresh(force_refetch)`. It does not directly mutate state beyond whatever the delegated refresh path changes.
+**Data flow**: It receives a true-or-false refresh preference, passes that preference into the shared refresh queue, and returns without producing a direct value. Any visible result comes later through app events and cache updates.
 
-**Call relations**: This is a thin wrapper used when callers want an explicit refresh. All actual gating, state mutation, and event emission happen in `ChatWidget::queue_connectors_refresh` and `ChatWidget::begin_connectors_refresh`.
+**Call relations**: This is a public-facing entry point for code that wants the chat widget to refresh apps. It immediately hands the work to `ChatWidget::queue_connectors_refresh`, which decides whether a fetch should actually be sent.
 
 *Call graph*: calls 1 internal fn (queue_connectors_refresh).
 
@@ -4679,11 +4711,11 @@ fn refresh_connectors(&mut self, force_refetch: bool)
 fn prefetch_connectors(&mut self)
 ```
 
-**Purpose**: Starts a non-forced background connectors fetch intended to warm the cache before the user opens the apps UI. It avoids stronger invalidation semantics.
+**Purpose**: Starts a quiet background load of the apps list before the user explicitly opens the apps popup. This helps the popup feel faster when the user later asks for it.
 
-**Data flow**: Calls `self.queue_connectors_refresh(false)`, relying on the shared refresh machinery to decide whether a fetch should actually be sent.
+**Data flow**: It has no input beyond the current widget state. It requests a normal, non-forced refresh and leaves the eventual result to be delivered later through the same connector-loading path.
 
-**Call relations**: This is the prefetch counterpart to `refresh_connectors`. It feeds into the same queueing path but always requests the non-forced mode.
+**Call relations**: This is used when the app wants to warm up the connector cache. It delegates to `ChatWidget::queue_connectors_refresh`, just like the explicit refresh path, but always asks for a non-forced fetch.
 
 *Call graph*: calls 1 internal fn (queue_connectors_refresh).
 
@@ -4694,11 +4726,11 @@ fn prefetch_connectors(&mut self)
 fn queue_connectors_refresh(&mut self, force_refetch: bool)
 ```
 
-**Purpose**: Centralizes the decision to emit a `FetchConnectorsList` app event. It only sends the event if refresh state transitions successfully into an in-flight fetch.
+**Purpose**: Decides whether to send a request to fetch the apps list, and sends that request if the widget is ready for one. It is the shared doorway for all connector refresh attempts.
 
-**Data flow**: Accepts `force_refetch`, calls `begin_connectors_refresh(force_refetch)`, and if that returns true sends `AppEvent::FetchConnectorsList { force_refetch }` through `self.app_event_tx`.
+**Data flow**: It receives whether this should be a forced refresh. It asks `ChatWidget::begin_connectors_refresh` to mark the refresh as started if allowed. If that succeeds, it sends an `AppEvent::FetchConnectorsList` message to the wider application; if not, it does nothing.
 
-**Call relations**: This function is the shared dispatch point used by explicit refresh, prefetch, popup-opening logic, and deferred force-refetch retries after a prior load completes. It delegates all eligibility checks to `begin_connectors_refresh`.
+**Call relations**: This function is called when prefetching, when the user asks for apps, when a refresh is requested directly, and when a pending forced refresh must run after another fetch finishes. It hands off the actual fetching to the application event system.
 
 *Call graph*: calls 1 internal fn (begin_connectors_refresh); called by 4 (add_connectors_output, on_connectors_loaded, prefetch_connectors, refresh_connectors).
 
@@ -4709,11 +4741,11 @@ fn queue_connectors_refresh(&mut self, force_refetch: bool)
 fn begin_connectors_refresh(&mut self, force_refetch: bool) -> bool
 ```
 
-**Purpose**: Transitions connector refresh state into an in-flight fetch when allowed, while coalescing overlapping requests. It also records a pending forced refetch if a stronger request arrives during an existing fetch.
+**Purpose**: Checks whether a connector fetch is allowed right now and updates the widget’s loading flags. This prevents duplicate requests and keeps the cache state honest.
 
-**Data flow**: Reads `self.connectors_enabled()` and returns false immediately if apps are unavailable. If `self.connectors.prefetch_in_flight` is already true, it sets `self.connectors.force_refetch_pending = true` when `force_refetch` is requested and returns false. Otherwise it sets `prefetch_in_flight = true`, changes `self.connectors.cache` to `Loading` unless it is already `Ready(_)`, and returns true.
+**Data flow**: It reads feature/account state and the connector refresh flags. If apps are disabled, it returns false. If a fetch is already running, it may remember that a forced refresh is pending, then returns false. Otherwise it marks a fetch as in flight, sets the cache to loading when there is no ready list yet, and returns true.
 
-**Call relations**: Called only by `queue_connectors_refresh`. Its boolean return controls whether that caller emits a fetch event or merely records pending intent.
+**Call relations**: This is called only by `ChatWidget::queue_connectors_refresh`. It acts as the gatekeeper before an app-list fetch event is sent.
 
 *Call graph*: calls 1 internal fn (connectors_enabled); called by 1 (queue_connectors_refresh); 1 external calls (matches!).
 
@@ -4724,11 +4756,11 @@ fn begin_connectors_refresh(&mut self, force_refetch: bool) -> bool
 fn connectors_enabled(&self) -> bool
 ```
 
-**Purpose**: Determines whether the connectors/apps feature should be exposed in the UI at all. It requires both the feature flag and a ChatGPT account.
+**Purpose**: Answers whether apps should be available in this chat session. Apps require both the apps feature flag and a ChatGPT account.
 
-**Data flow**: Reads `self.config.features.enabled(Feature::Apps)` and `self.has_chatgpt_account`, returning true only when both are true.
+**Data flow**: It reads the current configuration and account flag from the widget. It returns true only when the apps feature is enabled and the user has the needed account.
 
-**Call relations**: This predicate gates refresh initiation, mention completion exposure, and the `/apps` output path. It is a pure capability check used throughout the connectors subsystem.
+**Call relations**: This check is used before fetching, before showing the apps UI, and before offering connectors for mentions. It keeps disabled app features from leaking into the rest of the UI.
 
 *Call graph*: called by 3 (add_connectors_output, begin_connectors_refresh, connectors_for_mentions).
 
@@ -4739,11 +4771,11 @@ fn connectors_enabled(&self) -> bool
 fn connectors_for_mentions(&self) -> Option<&[AppInfo]>
 ```
 
-**Purpose**: Returns the currently available connectors list for mention/autocomplete use, preferring a partial in-progress snapshot when present. It hides connectors entirely when the feature is disabled.
+**Purpose**: Provides the current app list for mention suggestions, such as when the user types an app mention trigger. It returns nothing if apps are not available or no usable list has loaded yet.
 
-**Data flow**: Checks `connectors_enabled()` and returns `None` if false. If `self.connectors.partial_snapshot` exists, returns a slice of its `connectors`; otherwise matches `self.connectors.cache` and returns the ready snapshot's connector slice or `None` for loading/uninitialized/failed states.
+**Data flow**: It first checks whether connectors are enabled. If they are, it prefers a partial snapshot when one exists, because that may contain early useful results. Otherwise it returns the ready cached connector list, or no list if loading failed or has not completed.
 
-**Call relations**: This is a read-only accessor used by mention-related UI. It intentionally prefers partial data so autocomplete can work before the final full snapshot arrives.
+**Call relations**: This function is a read-only supplier for mention-related UI. It relies on `ChatWidget::connectors_enabled` to avoid offering suggestions when the apps feature should not be active.
 
 *Call graph*: calls 1 internal fn (connectors_enabled).
 
@@ -4754,11 +4786,11 @@ fn connectors_for_mentions(&self) -> Option<&[AppInfo]>
 fn add_connectors_output(&mut self)
 ```
 
-**Purpose**: Responds to the user requesting apps output by refreshing connector data if needed and opening the appropriate UI: info message, loading popup, connectors popup, or error history cell. It also decides when to force a refetch based on current cache state.
+**Purpose**: Responds when the user asks to see apps, such as through `$` or `/apps`. It either shows an app popup, a loading popup, an error, or a friendly disabled/no-apps message.
 
-**Data flow**: First checks `connectors_enabled()`; if false, inserts an info message explaining that apps are disabled and returns. Otherwise it clones `self.connectors.cache`, computes `should_force_refetch` as true when no fetch is in flight or the cache is already ready, and calls `queue_connectors_refresh(should_force_refetch)`. It then matches the cloned cache: `Ready(snapshot)` opens a popup or emits a 'No apps available' info message if empty; `Failed(err)` inserts an error history cell; `Loading` or `Uninitialized` opens the loading popup. Finally it requests redraw.
+**Data flow**: It checks whether apps are enabled. If not, it adds an informational chat message. If enabled, it starts or queues a refresh, then looks at the current cache copy. A ready non-empty list opens the apps popup; an empty list adds a “No apps available” message; a failure adds an error to history; a loading or uninitialized state opens the loading popup. It then requests a redraw so the screen updates.
 
-**Call relations**: This is the main user-facing apps command handler. It delegates popup construction to `open_connectors_loading_popup` or `open_connectors_popup` and uses the shared refresh queue to ensure data is being fetched in parallel with whatever UI it shows.
+**Call relations**: This is the main user-facing connector action. It calls the refresh queue so the list stays current, then calls either `ChatWidget::open_connectors_popup` or `ChatWidget::open_connectors_loading_popup` depending on what is already known.
 
 *Call graph*: calls 4 internal fn (connectors_enabled, open_connectors_loading_popup, open_connectors_popup, queue_connectors_refresh); 2 external calls (new_error_event, matches!).
 
@@ -4769,11 +4801,11 @@ fn add_connectors_output(&mut self)
 fn open_connectors_loading_popup(&mut self)
 ```
 
-**Purpose**: Shows or refreshes the loading-state selection popup for connectors. It prefers replacing an already-open connectors popup rather than stacking a new view.
+**Purpose**: Shows the temporary popup that tells the user the app list is still loading. If that same popup is already open, it replaces it instead of opening a duplicate.
 
-**Data flow**: Builds popup parameters via `self.connectors_loading_popup_params()`. It first tries `self.bottom_pane.replace_selection_view_if_active(CONNECTORS_SELECTION_VIEW_ID, ...)`; if that returns false, it calls `show_selection_view(...)` with the same params.
+**Data flow**: It builds loading-popup settings through `ChatWidget::connectors_loading_popup_params`. It then asks the bottom pane to replace the active apps selection view if possible; if there is no active one to replace, it opens a new selection view.
 
-**Call relations**: Used from `add_connectors_output` when connector data is not yet ready. It is the loading-state counterpart to `open_connectors_popup`.
+**Call relations**: This is called by `ChatWidget::add_connectors_output` when the user asks for apps before the list is ready. It hands the finished popup description to the bottom pane, which is responsible for displaying it.
 
 *Call graph*: calls 1 internal fn (connectors_loading_popup_params); called by 1 (add_connectors_output).
 
@@ -4784,11 +4816,11 @@ fn open_connectors_loading_popup(&mut self)
 fn open_connectors_popup(&mut self, connectors: &[AppInfo])
 ```
 
-**Purpose**: Displays the searchable connectors/apps selection popup populated with the provided connector list. It always opens with no preselected connector id.
+**Purpose**: Opens the real searchable apps popup for a known list of connectors. This is what the user sees when app data is ready.
 
-**Data flow**: Accepts a slice of `AppInfo` and passes `self.connectors_popup_params(connectors, None)` into `self.bottom_pane.show_selection_view(...)`.
+**Data flow**: It receives a slice of app connector records. It turns those records into popup settings with `ChatWidget::connectors_popup_params`, then tells the bottom pane to show that selection view.
 
-**Call relations**: Called from `add_connectors_output` once a ready snapshot exists. The detailed item construction is delegated to `connectors_popup_params`.
+**Call relations**: This is called by `ChatWidget::add_connectors_output` when the cache already contains a usable app list. The detailed item-building work is delegated to `ChatWidget::connectors_popup_params`.
 
 *Call graph*: calls 1 internal fn (connectors_popup_params); called by 1 (add_connectors_output).
 
@@ -4799,11 +4831,11 @@ fn open_connectors_popup(&mut self, connectors: &[AppInfo])
 fn connectors_loading_popup_params(&self) -> SelectionViewParams
 ```
 
-**Purpose**: Constructs the `SelectionViewParams` for the temporary loading popup shown while the connectors list is being fetched. The popup contains a static header and one disabled placeholder row.
+**Purpose**: Builds the contents of the loading version of the apps popup. It gives the user a clear title and a disabled placeholder row instead of an empty screen.
 
-**Data flow**: Creates a `ColumnRenderable` header with bold 'Apps' and a dim loading subtitle, then returns `SelectionViewParams` with `view_id` set to `CONNECTORS_SELECTION_VIEW_ID`, that header boxed, and a single disabled `SelectionItem` named 'Loading apps...' with explanatory description. Remaining fields use defaults.
+**Data flow**: It creates a header saying “Apps” and explaining that installed and available apps are loading. It returns a `SelectionViewParams` value with one disabled item that says the list will update when ready.
 
-**Call relations**: This helper is used only by `open_connectors_loading_popup`. It isolates the exact popup shape for the loading state.
+**Call relations**: This is used by `ChatWidget::open_connectors_loading_popup`. It does not show anything itself; it only prepares the description that the bottom pane uses to draw the popup.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (open_connectors_loading_popup); 4 external calls (new, default, from, vec!).
 
@@ -4818,11 +4850,11 @@ fn connectors_popup_params(
     ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds the full searchable connectors selection model, including header statistics, preserved selection, per-app descriptions, and action closures for opening install/manage links or reporting missing links. It is the core UI formatter for the apps browser.
+**Purpose**: Turns raw app connector records into a searchable popup the user can interact with. It decides the text, status labels, descriptions, and what happens when the user presses Enter on each app.
 
-**Data flow**: Takes a connector slice and optional selected connector id. It computes total and installed counts, builds a multi-line header, derives `initial_selected_idx` by matching the selected id, and then iterates over each `AppInfo`. For each connector it computes display label, title, long and brief descriptions, status label, and search text; creates a `SelectionItem`; and attaches an action closure. If `install_url` exists, the closure sends `AppEvent::OpenAppLink` with app metadata and install/manage instructions. Otherwise the closure sends `AppEvent::InsertHistoryCell` containing an info event that the app link is unavailable. It marks items dismiss-on-select and sets selected descriptions accordingly. Finally it returns `SelectionViewParams` with search enabled, footer hint from the bottom pane, auto column width, and the computed initial selection.
+**Data flow**: It receives the connector list and, optionally, the connector that should stay selected. It counts installed apps, builds a header, finds the initial selected row, and creates one selection item per connector. Each item gets a display name, search text, short description, and an action: open the app’s install/manage link when available, or insert an informational message when no link exists. It returns a complete `SelectionViewParams` object for the bottom pane.
 
-**Call relations**: This helper is used both when first opening the connectors popup and when refreshing an already-open popup after data changes. It depends on the local description/status helpers to keep item text consistent.
+**Call relations**: This is called when first opening the apps popup and when refreshing an already open popup. It uses the helper functions for connector description and status wording, and it packages user actions as app events for the rest of the application to perform.
 
 *Call graph*: calls 2 internal fn (connector_display_label, new); called by 2 (open_connectors_popup, refresh_connectors_popup_if_open); 11 external calls (new, default, from, connector_brief_description, connector_description, connector_status_label, with_capacity, iter, len, format! (+1 more)).
 
@@ -4833,11 +4865,11 @@ fn connectors_popup_params(
 fn refresh_connectors_popup_if_open(&mut self, connectors: &[AppInfo])
 ```
 
-**Purpose**: Rebuilds the connectors popup in place if that popup is currently active, preserving the user's selected connector when possible. It avoids opening a popup when none is visible.
+**Purpose**: Updates the apps popup in place when new connector data arrives or an app’s enabled state changes. It tries to keep the same app selected so the UI does not jump around unexpectedly.
 
-**Data flow**: Reads the selected index for the active connectors view from `self.bottom_pane`. If there is a selected index and the cache is `Ready(snapshot)`, it maps that index back to the previously selected connector id from the old snapshot; otherwise selected id is `None`. It then calls `replace_selection_view_if_active` with fresh params from `connectors_popup_params(connectors, selected_connector_id)` and ignores the boolean result.
+**Data flow**: It asks the bottom pane which row is selected in the active apps popup. If the cache has a ready snapshot, it translates that row into a connector id. It then rebuilds popup settings for the new connector list, using that id as the preferred selection, and asks the bottom pane to replace the active popup if it is open.
 
-**Call relations**: This is used after connector data loads and after a connector's enabled flag changes. It keeps the popup synchronized with cache updates without disrupting the current browsing context.
+**Call relations**: This is used after connector loading completes and after a connector’s enabled state changes. It relies on `ChatWidget::connectors_popup_params` to rebuild the popup contents.
 
 *Call graph*: calls 1 internal fn (connectors_popup_params); called by 2 (on_connectors_loaded, update_connector_enabled).
 
@@ -4848,11 +4880,11 @@ fn refresh_connectors_popup_if_open(&mut self, connectors: &[AppInfo])
 fn connector_brief_description(connector: &AppInfo) -> String
 ```
 
-**Purpose**: Formats the short one-line description shown in the connectors popup by combining status and optional connector description text. It ensures every item has at least a status label.
+**Purpose**: Creates the one-line summary shown for an app in the popup list. It combines the app’s install/enabled status with its trimmed description when one exists.
 
-**Data flow**: Accepts an `AppInfo`, computes `status_label` via `connector_status_label`, then calls `connector_description`. If a description exists, returns `"{status} · {description}"`; otherwise returns the status label alone as an owned `String`.
+**Data flow**: It receives one connector record. It gets the status text, then looks for a clean description. If there is a description, it returns text like “Installed · description”; otherwise it returns only the status text.
 
-**Call relations**: Used during popup item construction inside `connectors_popup_params`. It is a presentation helper layered on top of the lower-level status and description extractors.
+**Call relations**: This helper is used while building popup rows in `ChatWidget::connectors_popup_params`. It depends on `ChatWidget::connector_status_label` and `ChatWidget::connector_description` for the two pieces of text.
 
 *Call graph*: 3 external calls (connector_description, connector_status_label, format!).
 
@@ -4863,11 +4895,11 @@ fn connector_brief_description(connector: &AppInfo) -> String
 fn connector_status_label(connector: &AppInfo) -> &'static str
 ```
 
-**Purpose**: Maps connector accessibility and enabled state into the exact status text shown in the popup. It distinguishes installed-enabled, installed-disabled, and not-yet-installed connectors.
+**Purpose**: Chooses the short status phrase for an app connector. This tells the user whether the app is installed, installed but disabled, or available to install.
 
-**Data flow**: Reads `connector.is_accessible` and `connector.is_enabled`, returning one of three static strings: `Installed`, `Installed · Disabled`, or `Can be installed`.
+**Data flow**: It reads the connector’s accessibility and enabled flags. Accessible and enabled becomes “Installed”; accessible but disabled becomes “Installed · Disabled”; not accessible becomes “Can be installed”. It returns that fixed text.
 
-**Call relations**: This pure formatter is used by both `connector_brief_description` and `connectors_popup_params` so status wording stays consistent across item body and selected-description text.
+**Call relations**: This helper feeds popup descriptions and selected-row instructions. It is part of the wording layer used by `ChatWidget::connectors_popup_params` and `ChatWidget::connector_brief_description`.
 
 
 ##### `ChatWidget::connector_description`  (lines 281–288)
@@ -4876,11 +4908,11 @@ fn connector_status_label(connector: &AppInfo) -> &'static str
 fn connector_description(connector: &AppInfo) -> Option<String>
 ```
 
-**Purpose**: Extracts a cleaned optional description from connector metadata. It trims whitespace and suppresses empty descriptions.
+**Purpose**: Extracts a clean app description, if the connector has one. Blank or whitespace-only descriptions are treated as missing.
 
-**Data flow**: Reads `connector.description`, converts the `Option<String>` to `Option<&str>`, trims it, filters out empty strings, and returns an owned `Option<String>`.
+**Data flow**: It reads the optional description field from a connector. If present, it trims extra surrounding whitespace, rejects it if it becomes empty, and returns a new string containing the cleaned description. If there is no usable description, it returns nothing.
 
-**Call relations**: Used by popup formatting helpers to avoid displaying blank or whitespace-only descriptions.
+**Call relations**: This helper is used when building popup item text. It keeps the rest of the popup code from having to repeat the same cleanup rules.
 
 
 ##### `ChatWidget::on_connectors_loaded`  (lines 290–350)
@@ -4893,11 +4925,11 @@ fn on_connectors_loaded(
     )
 ```
 
-**Purpose**: Consumes connector fetch results, updates cache and bottom-pane snapshots, refreshes any open popup, and handles partial/fallback/error cases. It also triggers a queued forced refetch after the current fetch finishes when necessary.
+**Purpose**: Receives the result of an app-list fetch and updates the cache, popup, and mention data. It handles both partial and final results, and it protects the user from losing an older usable list when a refresh fails.
 
-**Data flow**: Takes `result` and `is_final`. If `is_final`, it clears `prefetch_in_flight` and, when `force_refetch_pending` was set, clears that flag and remembers to trigger another refresh afterward. On `Ok(mut snapshot)`, it preserves `is_enabled` values from any existing ready snapshot by id, then either stores the snapshot as `partial_snapshot` (non-final) or clears partial state, refreshes an open popup, and writes `self.connectors.cache = Ready(snapshot.clone())` (final). In both success cases it updates `self.bottom_pane.set_connectors_snapshot(Some(snapshot))`. On `Err(err)`, it first takes any partial snapshot. If a ready snapshot already exists, it logs a warning and keeps that snapshot in the bottom pane. Else if a partial snapshot exists, it warns, refreshes the popup with partial connectors, promotes that partial snapshot to `Ready`, and updates the bottom pane. Otherwise it stores `ConnectorsCacheState::Failed(err)` and clears the bottom-pane snapshot. At the end, if a pending forced refetch was deferred, it calls `queue_connectors_refresh(true)`.
+**Data flow**: It receives either a successful connector snapshot or an error string, plus a flag saying whether this is the final result. Final results clear the in-flight flag and may trigger a delayed forced refresh afterward. On success, it preserves existing enabled/disabled states where possible, stores partial results separately or final results in the cache, refreshes the popup when appropriate, and shares the snapshot with the bottom pane. On failure, it keeps a ready old snapshot if one exists, falls back to a partial snapshot if possible, or records a failed cache state and clears the bottom pane snapshot if there is no usable data.
 
-**Call relations**: This is the result handler for `FetchConnectorsList`. It is the only place that transitions connector cache state based on backend responses and the only place that consumes `force_refetch_pending`.
+**Call relations**: This is called when the wider application finishes fetching connectors. It may call `ChatWidget::refresh_connectors_popup_if_open` so visible UI updates immediately, and it may call `ChatWidget::queue_connectors_refresh` if a forced refresh was requested while another fetch was still running.
 
 *Call graph*: calls 2 internal fn (queue_connectors_refresh, refresh_connectors_popup_if_open); 3 external calls (Failed, Ready, warn!).
 
@@ -4908,26 +4940,26 @@ fn on_connectors_loaded(
 fn update_connector_enabled(&mut self, connector_id: &str, enabled: bool)
 ```
 
-**Purpose**: Applies a local enabled/disabled toggle to a connector already present in the ready cache and propagates the change to both popup UI and bottom-pane snapshot. It is a no-op when the cache is not ready or the value is unchanged.
+**Purpose**: Updates the cached enabled/disabled state for one app connector after that state changes elsewhere. This keeps the apps popup and mention data consistent without requiring a full refetch.
 
-**Data flow**: Clones the current ready snapshot from `self.connectors.cache`; if the cache is not `Ready`, returns. It scans `snapshot.connectors` for the matching `connector_id`, updates `is_enabled`, and tracks whether anything changed. If unchanged, returns. Otherwise it refreshes any open popup with the updated connector list, writes the modified snapshot back into `self.connectors.cache = Ready(snapshot.clone())`, and calls `self.bottom_pane.set_connectors_snapshot(Some(snapshot))`.
+**Data flow**: It receives a connector id and the new enabled value. If there is no ready cache, it stops. Otherwise it copies the ready snapshot, finds the matching connector, changes its enabled flag if needed, and stops if nothing changed. When there is a real change, it refreshes any open popup, stores the updated snapshot back in the cache, and shares it with the bottom pane.
 
-**Call relations**: This method is used when connector enablement changes independently of a full reload. It reuses `refresh_connectors_popup_if_open` to keep the visible popup synchronized with the cache mutation.
+**Call relations**: This is used after an app’s enabled state changes. It calls `ChatWidget::refresh_connectors_popup_if_open` so the visible app list reflects the new state right away.
 
 *Call graph*: calls 1 internal fn (refresh_connectors_popup_if_open); 1 external calls (Ready).
 
 
 ### `tui/src/chatwidget/model_popups.rs`
 
-`orchestration` · `interactive popup handling during command/input flows`
+`orchestration` · `user interaction`
 
-This file contains the UI decision tree for choosing models and reasoning levels. It starts with `open_model_popup`, which blocks selection until session startup is complete and gracefully handles a temporarily unavailable model catalog. The popup flow is intentionally split: quick “auto” presets are shown first, while non-auto presets are routed into a fuller picker and then, if needed, a reasoning-effort picker.
+This file is the control panel for model choice inside `ChatWidget`, the main chat screen. Without it, the user could not safely switch between quick “auto” models, browse all available models, or choose how much reasoning effort the model should use.
 
-`open_model_popup_with_presets` filters out presets hidden from the picker, identifies the current model label, partitions presets into auto and non-auto groups, sorts auto presets with a fixed preference order, and creates `SelectionItem`s whose actions either immediately update/persist model settings or redirect into a Plan-mode scope prompt. If no auto presets exist, it jumps straight to `open_all_models_popup`.
+The flow starts with the model picker. It first checks that startup has finished and that the model list is available. Then it splits models into quick “auto” choices and the larger “all models” list. The quick menu is like a short menu at a restaurant: fast, balanced, or thorough. If the user needs more detail, the “All models” item opens a second picker.
 
-The Plan-mode logic is subtle. `should_prompt_plan_mode_reasoning_scope` only prompts when collaboration modes are enabled, the active mode is `Plan`, the selected model matches the current model, and the chosen effort would change either the effective Plan-mode reasoning or the stored defaults. `open_plan_reasoning_scope_prompt` then offers two concrete write paths: update only the Plan override, or update both global defaults and the Plan override.
+The all-models picker sends the user to a reasoning picker when needed. “Reasoning effort” means how much internal problem-solving work the model is asked to spend before answering. Higher effort may give better results, but can use limits faster, so the file adds warnings for expensive choices.
 
-`open_reasoning_popup` handles models with one or many supported reasoning efforts, computes default/highlighted choices differently depending on whether the model is current and whether Plan mode is active, and adds rate-limit warnings for high-effort GPT-5.x Codex models. The helper label functions normalize enum values into display text, while `apply_model_and_effort` and its non-persisting variant send the exact `AppEvent`s that mutate runtime state and saved configuration.
+Plan mode adds one important wrinkle. If the user changes reasoning while already in Plan mode, the UI may ask whether the change should affect only Plan mode or become the global default. The file does this by building selection items whose actions send application events, rather than changing everything directly.
 
 #### Function details
 
@@ -4937,11 +4969,11 @@ The Plan-mode logic is subtle. `should_prompt_plan_mode_reasoning_scope` only pr
 fn open_model_popup(&mut self)
 ```
 
-**Purpose**: Starts model selection by validating that the session is ready, fetching the current model catalog, and opening the quick model picker.
+**Purpose**: Starts the model selection flow when the user asks to choose a model. It protects the user from opening the picker before startup is complete or while the model list is being refreshed.
 
-**Data flow**: It reads session readiness via `is_session_configured()` and the model catalog via `self.model_catalog.try_list_models()`. On failure paths it writes informational history/messages to the widget; on success it passes the fetched `Vec<ModelPreset>` to `open_model_popup_with_presets` and returns no value.
+**Data flow**: It reads the session state and asks the model catalog for the available presets. If the session is not ready or the catalog cannot be read, it adds a friendly message to the chat. If the presets are available, it passes them into the next step that builds the actual picker.
 
-**Call relations**: This is the top-level entry for `/model`-style interaction. It delegates all actual popup construction to `ChatWidget::open_model_popup_with_presets`, but short-circuits first when startup is incomplete or the catalog is mid-refresh.
+**Call relations**: This is the front door for the model popup. After doing readiness checks, it hands the model list to `ChatWidget::open_model_popup_with_presets`, which decides what kind of model menu to show.
 
 *Call graph*: calls 1 internal fn (open_model_popup_with_presets).
 
@@ -4952,11 +4984,11 @@ fn open_model_popup(&mut self)
 fn model_menu_header(&self, title: &str, subtitle: &str) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Constructs a reusable popup header with a bold title, dim subtitle, and an optional warning line about unsupported custom OpenAI base URLs.
+**Purpose**: Creates the reusable header shown at the top of model-related menus. It gives the menu a title, a short explanation, and, when needed, a warning about custom OpenAI server settings.
 
-**Data flow**: It takes `title` and `subtitle` string slices, clones them into owned `String`s, builds a `ColumnRenderable`, pushes formatted `Line`s, optionally appends the result of `model_menu_warning_line`, and returns the header boxed as `Box<dyn Renderable>`.
+**Data flow**: It receives title and subtitle text, turns them into styled display lines, asks whether a warning line is needed, and returns a renderable header object for the popup to display.
 
-**Call relations**: This helper is used by both `ChatWidget::open_model_popup_with_presets` and `ChatWidget::open_all_models_popup` so the quick picker and full picker share the same warning and visual structure.
+**Call relations**: Both `ChatWidget::open_model_popup_with_presets` and `ChatWidget::open_all_models_popup` call this when they need a consistent heading. It calls `ChatWidget::model_menu_warning_line` so the warning logic stays in one place.
 
 *Call graph*: calls 2 internal fn (model_menu_warning_line, new); called by 2 (open_all_models_popup, open_model_popup_with_presets); 2 external calls (new, from).
 
@@ -4967,11 +4999,11 @@ fn model_menu_header(&self, title: &str, subtitle: &str) -> Box<dyn Renderable>
 fn model_menu_warning_line(&self) -> Option<Line<'static>>
 ```
 
-**Purpose**: Produces a red warning line when the widget is configured to use a non-default OpenAI base URL.
+**Purpose**: Builds a red warning line when the app is using a custom OpenAI base URL. This matters because model selection may not work correctly against a non-standard server.
 
-**Data flow**: It reads `custom_openai_base_url()`. If that returns a URL, it formats a warning string mentioning the override and wraps it in a red `Line<'static>`; otherwise it returns `None`.
+**Data flow**: It asks `ChatWidget::custom_openai_base_url` whether there is a meaningful custom URL. If there is one, it formats a warning message and returns it as a display line. If not, it returns nothing.
 
-**Call relations**: This is only called from `ChatWidget::model_menu_header`, where it conditionally augments model-selection headers with a compatibility warning.
+**Call relations**: This is used only by `ChatWidget::model_menu_header`. It keeps the header simple by hiding the details of when the warning should appear.
 
 *Call graph*: calls 1 internal fn (custom_openai_base_url); called by 1 (model_menu_header); 2 external calls (from, format!).
 
@@ -4982,11 +5014,11 @@ fn model_menu_warning_line(&self) -> Option<Line<'static>>
 fn custom_openai_base_url(&self) -> Option<String>
 ```
 
-**Purpose**: Determines whether the current model provider is OpenAI with a meaningful, non-default custom base URL that should be surfaced to the user.
+**Purpose**: Checks whether the current OpenAI provider has been pointed at a non-default server address. It avoids warning users when they are using the normal OpenAI URL or no URL at all.
 
-**Data flow**: It reads `self.config.model_provider`, checks that the provider is OpenAI, extracts `base_url`, trims whitespace and trailing slashes, compares the normalized value against `DEFAULT_OPENAI_BASE_URL`, and returns `Some(trimmed.to_string())` only for non-empty, non-default overrides.
+**Data flow**: It reads the configured model provider. If the provider is not OpenAI, has no base URL, has an empty URL, or matches the default OpenAI URL after trimming trailing slashes, it returns nothing. Otherwise it returns the configured URL text.
 
-**Call relations**: This helper feeds `ChatWidget::model_menu_warning_line`; it encapsulates the normalization rules so popup code does not duplicate provider and URL checks.
+**Call relations**: This supports `ChatWidget::model_menu_warning_line`, which turns the result into a visible warning in model menus.
 
 *Call graph*: called by 1 (model_menu_warning_line).
 
@@ -4997,11 +5029,11 @@ fn custom_openai_base_url(&self) -> Option<String>
 fn open_model_popup_with_presets(&mut self, presets: Vec<ModelPreset>)
 ```
 
-**Purpose**: Builds the first-stage model picker, emphasizing quick auto presets and optionally adding an “All models” row that opens the full model-and-effort picker.
+**Purpose**: Builds the first model picker from a supplied list of model presets. It favors quick auto choices, while still offering an “All models” route for more specific selection.
 
-**Data flow**: It consumes a `Vec<ModelPreset>`, filters out presets with `show_in_picker == false`, reads the current model and display name, partitions presets into auto and non-auto groups, sorts auto presets by `auto_model_order`, maps each auto preset into a `SelectionItem` with actions from `model_selection_actions`, and may append an “All models” item whose action sends `AppEvent::OpenAllModelsPopup`. It then builds a header with `model_menu_header` and writes the resulting `SelectionViewParams` into `self.bottom_pane`.
+**Data flow**: It takes model presets, removes any that should not appear in the picker, finds the current model label, and separates quick auto models from the rest. Auto models become selectable rows with actions that update the model and reasoning effort, or ask a Plan mode scope question first. If there are other models, it adds an “All models” row that opens the full picker.
 
-**Call relations**: This function is called by `ChatWidget::open_model_popup` after catalog retrieval. If there are no auto presets it delegates immediately to `ChatWidget::open_all_models_popup`; otherwise it becomes the main quick-selection surface.
+**Call relations**: `ChatWidget::open_model_popup` calls this after it has successfully loaded presets. This function may call `ChatWidget::open_all_models_popup` directly if there are no quick auto models, and it uses `ChatWidget::model_menu_header` to make the popup heading.
 
 *Call graph*: calls 2 internal fn (model_menu_header, open_all_models_popup); called by 1 (open_model_popup); 3 external calls (default, format!, vec!).
 
@@ -5012,11 +5044,11 @@ fn open_model_popup_with_presets(&mut self, presets: Vec<ModelPreset>)
 fn is_auto_model(model: &str) -> bool
 ```
 
-**Purpose**: Classifies model IDs that belong to the quick auto-mode family.
+**Purpose**: Identifies whether a model name belongs to the quick auto-model family. These are the models shown in the short first-level picker.
 
-**Data flow**: It takes a model string slice and returns `true` when it starts with the literal prefix `codex-auto-`; it reads no widget state and writes nothing.
+**Data flow**: It receives a model name as text and returns true if the name starts with the expected auto-model prefix. It does not change any state.
 
-**Call relations**: This pure helper is used while partitioning presets in `ChatWidget::open_model_popup_with_presets`.
+**Call relations**: It is used as part of the quick-picker decision inside `ChatWidget::open_model_popup_with_presets`, helping split models into quick choices and the larger browse list.
 
 
 ##### `ChatWidget::auto_model_order`  (lines 161–168)
@@ -5025,11 +5057,11 @@ fn is_auto_model(model: &str) -> bool
 fn auto_model_order(model: &str) -> usize
 ```
 
-**Purpose**: Assigns a stable display order to known auto models so the quick picker shows fast, balanced, and thorough in a predictable sequence.
+**Purpose**: Defines the display order for quick auto models so the menu appears in a sensible sequence: fast, balanced, then thorough.
 
-**Data flow**: It matches the input model string and returns `0` for `codex-auto-fast`, `1` for `codex-auto-balanced`, `2` for `codex-auto-thorough`, and `3` for any other auto model.
+**Data flow**: It receives a model name and returns a sorting number. Known auto models get fixed positions, while unknown ones go after the known choices.
 
-**Call relations**: This helper is used by `ChatWidget::open_model_popup_with_presets` when sorting auto presets before rendering them.
+**Call relations**: It supports `ChatWidget::open_model_popup_with_presets` when that function sorts quick auto choices before showing them.
 
 
 ##### `ChatWidget::open_all_models_popup`  (lines 170–214)
@@ -5038,11 +5070,11 @@ fn auto_model_order(model: &str) -> usize
 fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>)
 ```
 
-**Purpose**: Shows the full model picker for non-auto presets, with each row opening a second-stage reasoning-effort popup.
+**Purpose**: Shows the full model list when the quick picker is not enough. Each model row leads to a reasoning-effort choice, unless the model has only one possible effort.
 
-**Data flow**: It consumes a `Vec<ModelPreset>`. If empty, it writes an informational message and returns. Otherwise it iterates presets, derives descriptions and current/default flags, computes whether each preset supports only one reasoning effort, creates `SelectionItem`s whose actions send `AppEvent::OpenReasoningPopup { model: preset }`, and writes a `SelectionViewParams` with a shared header into `self.bottom_pane`.
+**Data flow**: It receives model presets. If the list is empty, it adds a message saying no additional models are available. Otherwise it turns each preset into a selectable row, marks the current and default models, and attaches an action that opens the reasoning popup for that model.
 
-**Call relations**: This function is reached either directly from `ChatWidget::open_model_popup_with_presets` when no auto presets exist or via the “All models” action created there. It hands off per-model effort selection to `ChatWidget::open_reasoning_popup` through emitted app events.
+**Call relations**: `ChatWidget::open_model_popup_with_presets` calls this when the user chooses “All models” or when there are no quick auto choices. It uses `ChatWidget::model_menu_header` for the shared heading style.
 
 *Call graph*: calls 1 internal fn (model_menu_header); called by 1 (open_model_popup_with_presets); 3 external calls (default, new, vec!).
 
@@ -5057,11 +5089,11 @@ fn model_selection_actions(
     ) -> Vec<SelectionAction>
 ```
 
-**Purpose**: Creates the action closure for a direct model selection row, either prompting for Plan-mode scope or immediately updating and persisting the chosen model/effort.
+**Purpose**: Creates the action that runs when a quick model choice is selected. The action either updates the model immediately or opens the Plan mode scope question first.
 
-**Data flow**: It takes an owned model string, an optional `ReasoningEffortConfig`, and a boolean `should_prompt_plan_mode_scope`. It returns a one-element `Vec<SelectionAction>` whose closure sends either `AppEvent::OpenPlanReasoningScopePrompt` or the trio `UpdateModel`, `UpdateReasoningEffort`, and `PersistModelSelection`.
+**Data flow**: It receives the selected model, the selected reasoning effort, and a flag saying whether Plan mode needs a follow-up question. It returns a list containing one action. When that action runs, it sends events to update and persist the choice, or sends an event to open the Plan mode prompt instead.
 
-**Call relations**: This helper is used by `ChatWidget::open_model_popup_with_presets` to attach concrete behavior to quick auto-model rows.
+**Call relations**: This action builder is used by the quick model picker in `ChatWidget::open_model_popup_with_presets`. It does not perform the UI update itself; it hands instructions to the app event system.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -5076,11 +5108,11 @@ fn should_prompt_plan_mode_reasoning_scope(
     ) -> bool
 ```
 
-**Purpose**: Decides whether selecting a model/effort while in Plan mode should branch into a scope prompt instead of silently updating defaults.
+**Purpose**: Decides whether changing reasoning while in Plan mode needs an extra confirmation about where the change should apply. This prevents the app from silently changing both Plan-specific settings and global defaults when the user may only intend one of them.
 
-**Data flow**: It reads collaboration-mode enablement, the active mode kind, the current model, the effective reasoning effort, and `self.current_collaboration_mode`’s model/effort. Given a selected model and optional effort, it returns `true` only when the selection is in Plan mode on the current model and would change either the active Plan-mode effective reasoning or the stored global/default Plan-mode settings.
+**Data flow**: It reads whether collaboration modes are enabled, whether the active mode is Plan, what model is currently selected, the effective reasoning effort, and the stored Plan/global settings. It returns true only when the selected model is the current one and the reasoning change is not a true no-op for both Plan mode and the stored defaults.
 
-**Call relations**: This predicate is consulted by `ChatWidget::open_model_popup_with_presets` and `ChatWidget::open_reasoning_popup` before wiring selection actions, ensuring Plan-mode changes are scoped explicitly only when needed.
+**Call relations**: `ChatWidget::open_reasoning_popup` calls this before applying a reasoning choice. Quick model actions are also built around the same decision so they can route the user to `ChatWidget::open_plan_reasoning_scope_prompt` when needed.
 
 *Call graph*: called by 1 (open_reasoning_popup).
 
@@ -5095,11 +5127,11 @@ fn open_plan_reasoning_scope_prompt(
     )
 ```
 
-**Purpose**: Shows a two-choice popup asking whether a selected reasoning level should apply only to Plan mode or to all modes plus the Plan override.
+**Purpose**: Shows the special Plan mode question: apply this reasoning level only to Plan mode, or apply it to all modes. This makes an otherwise hidden configuration consequence visible to the user.
 
-**Data flow**: It takes a selected model and optional effort, derives human-readable reasoning phrases and the current source of Plan-mode reasoning from config or built-in masks, builds two `SelectionItem`s with closures that send different combinations of `UpdateModel`, `UpdateReasoningEffort`, `UpdatePlanModeReasoningEffort`, `PersistPlanModeReasoningEffort`, and `PersistModelSelection`, writes the popup to `self.bottom_pane`, and emits a desktop `Notification::PlanModePrompt` via `notify`.
+**Data flow**: It receives the selected model and reasoning effort. It builds human-readable descriptions, including where the current Plan reasoning setting came from, then creates two choices. The Plan-only choice updates and persists the Plan override. The all-modes choice updates the model, global reasoning, Plan reasoning, and persists both relevant settings. It also sends a notification that the prompt is open.
 
-**Call relations**: This popup is opened when `ChatWidget::should_prompt_plan_mode_reasoning_scope` says a selection is not a no-op in Plan mode. It is reached from quick model actions or reasoning-popup actions through `AppEvent::OpenPlanReasoningScopePrompt`.
+**Call relations**: Other selection actions open this prompt when `ChatWidget::should_prompt_plan_mode_reasoning_scope` says the user needs to choose the scope. The prompt then sends application events that perform the actual setting changes.
 
 *Call graph*: calls 1 internal fn (plan_mask); 3 external calls (default, format!, vec!).
 
@@ -5110,11 +5142,11 @@ fn open_plan_reasoning_scope_prompt(
 fn open_reasoning_popup(&mut self, preset: ModelPreset)
 ```
 
-**Purpose**: Shows the second-stage picker for a model’s supported reasoning efforts, including defaults, current selection highlighting, and high-effort warnings for certain models.
+**Purpose**: Shows the second step of model selection: choosing the reasoning effort for a chosen model. If there is only one possible effort, it applies that choice directly instead of making the user click through another menu.
 
-**Data flow**: It consumes a `ModelPreset`, extracts its default effort and supported effort options, computes whether the widget is currently in Plan mode, derives a warning effort/text for `High` or `XHigh`, builds the list of selectable efforts (falling back to the default if none are listed), and either applies the single available effort immediately or constructs `SelectionItem`s for each effort. It reads current model/effective reasoning/config Plan override to choose highlighted and initially selected rows, and writes the resulting popup to `self.bottom_pane`; in the single-choice case it may send an app event for the Plan scope prompt or call `apply_model_and_effort` directly.
+**Data flow**: It receives a model preset, reads its default and supported reasoning efforts, and builds a list of choices. It highlights the current or default effort, adds warning text for high-effort choices on certain models, and creates actions that update and persist the selected model and effort. If there is only one choice, it either opens the Plan mode scope prompt or applies the model and effort immediately.
 
-**Call relations**: This function is the second stage after `ChatWidget::open_all_models_popup`. It consults `ChatWidget::should_prompt_plan_mode_reasoning_scope` for each possible effort and delegates final application to `ChatWidget::apply_model_and_effort` when no extra prompt is needed.
+**Call relations**: `ChatWidget::open_all_models_popup` sends users here after they choose a specific model. This function consults `ChatWidget::should_prompt_plan_mode_reasoning_scope` before applying changes and calls `ChatWidget::apply_model_and_effort` for the simple one-choice case.
 
 *Call graph*: calls 3 internal fn (apply_model_and_effort, should_prompt_plan_mode_reasoning_scope, new); 7 external calls (new, default, from, reasoning_effort_label, new, format!, vec!).
 
@@ -5125,11 +5157,11 @@ fn open_reasoning_popup(&mut self, preset: ModelPreset)
 fn reasoning_effort_label(effort: &ReasoningEffortConfig) -> String
 ```
 
-**Purpose**: Converts a `ReasoningEffortConfig` enum value into the title-cased label shown in popup rows.
+**Purpose**: Turns an internal reasoning-effort value into a short label suitable for menus, such as “Low” or “Extra high.”
 
-**Data flow**: It matches the enum and returns owned strings such as `None`, `Minimal`, `Low`, `Medium`, `High`, `Extra high`, or the raw custom value.
+**Data flow**: It receives a reasoning-effort setting and returns display text. Built-in values become fixed labels, while a custom value is shown as the custom text itself.
 
-**Call relations**: This helper is used by `ChatWidget::open_reasoning_popup` and indirectly by sentence-label generation to keep effort naming consistent across popups.
+**Call relations**: Reasoning popups and Plan mode descriptions use this labeling helper so effort names are presented consistently to the user.
 
 
 ##### `ChatWidget::reasoning_effort_sentence_label`  (lines 512–517)
@@ -5138,11 +5170,11 @@ fn reasoning_effort_label(effort: &ReasoningEffortConfig) -> String
 fn reasoning_effort_sentence_label(effort: &ReasoningEffortConfig) -> String
 ```
 
-**Purpose**: Converts a reasoning effort into a phrase-friendly lowercase label for explanatory sentences, preserving custom values verbatim.
+**Purpose**: Turns a reasoning-effort value into wording that fits naturally inside a sentence. For example, menu label “High” becomes sentence text like “high reasoning.”
 
-**Data flow**: It matches `ReasoningEffortConfig::Custom` specially and otherwise lowercases the result of `reasoning_effort_label`, returning an owned `String`.
+**Data flow**: It receives a reasoning-effort setting. Custom values are returned unchanged, while standard values are converted through `ChatWidget::reasoning_effort_label` and lowercased.
 
-**Call relations**: This helper is used by `ChatWidget::open_plan_reasoning_scope_prompt` when composing explanatory text about where a reasoning choice will apply.
+**Call relations**: `ChatWidget::open_plan_reasoning_scope_prompt` uses this helper to write readable descriptions for the Plan-only and all-modes choices.
 
 *Call graph*: 1 external calls (reasoning_effort_label).
 
@@ -5157,11 +5189,11 @@ fn apply_model_and_effort_without_persist(
     )
 ```
 
-**Purpose**: Applies a model and reasoning effort to the live session without saving them to persistent configuration.
+**Purpose**: Applies a model and reasoning effort for the current running session without saving that choice as the new default. This is useful when another path is responsible for persistence, or when the change should be temporary.
 
-**Data flow**: It takes an owned model string and optional effort and sends `AppEvent::UpdateModel(model)` followed by `AppEvent::UpdateReasoningEffort(effort)` on `self.app_event_tx`. It does not mutate widget fields directly and returns no value.
+**Data flow**: It receives a model name and an optional reasoning effort. It sends one event to update the active model and another event to update the active reasoning effort. It does not write the choice to stored configuration.
 
-**Call relations**: This is the runtime-only half of model application. It is called by `ChatWidget::apply_model_and_effort`, which adds persistence on top.
+**Call relations**: `ChatWidget::apply_model_and_effort` calls this as its first step, then adds persistence afterward. This keeps the “apply now” part separate from the “remember for later” part.
 
 *Call graph*: called by 1 (apply_model_and_effort); 2 external calls (UpdateModel, UpdateReasoningEffort).
 
@@ -5172,24 +5204,26 @@ fn apply_model_and_effort_without_persist(
 fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>)
 ```
 
-**Purpose**: Applies a model/effort immediately and also persists the selection as the new default.
+**Purpose**: Applies a model and reasoning effort now, and also asks the app to remember that choice for future use.
 
-**Data flow**: It takes an owned model string and optional effort, first delegates to `apply_model_and_effort_without_persist` to send live update events, then sends `AppEvent::PersistModelSelection { model, effort }` to save the choice.
+**Data flow**: It receives a model name and an optional reasoning effort. First it sends the live update events through `ChatWidget::apply_model_and_effort_without_persist`. Then it sends a persistence event containing the same model and effort.
 
-**Call relations**: This helper is used by `ChatWidget::open_reasoning_popup` in the single-choice fast path when no Plan-mode scope prompt is required.
+**Call relations**: `ChatWidget::open_reasoning_popup` uses this in the simple case where a selected model has only one reasoning choice and no Plan mode scope prompt is needed.
 
 *Call graph*: calls 1 internal fn (apply_model_and_effort_without_persist); called by 1 (open_reasoning_popup).
 
 
 ### `tui/src/chatwidget/review_popups.rs`
 
-`orchestration` · `request handling`
+`orchestration` · `user interaction`
 
-This file contains the UI surfaces for starting code review actions from the chat widget. `open_review_popup` creates the top-level preset menu with four choices: review against a base branch, review uncommitted changes, review a commit, or provide custom review instructions. Each `SelectionItem` carries closures that either send an `AppEvent` to open a child picker using the current cwd or directly invoke `tx.review(...)` for immediate review targets. The popup is shown in the bottom pane with the standard footer hint.
+This file is the user-facing doorway into review mode inside the terminal chat interface. Instead of making the user remember commands, it shows small popups: review against a branch, review uncommitted changes, review one commit, or type custom review instructions. Think of it like a restaurant menu: the user picks the kind of review they want, and the code sends the order to the rest of the app.
 
-The two async picker methods populate searchable selection views from local git state. `show_review_branch_picker` awaits `local_git_branches(cwd)` and `current_branch_name(cwd)`, falling back to `"(detached HEAD)"` when needed, then builds items whose labels show `current -> target` and whose actions request `ReviewTarget::BaseBranch { branch }`. `show_review_commit_picker` awaits up to 100 recent commits, then builds searchable items keyed by subject and sha that request `ReviewTarget::Commit { sha, title }`.
+The main popup is built by `ChatWidget::open_review_popup`. Some choices immediately start a review, such as reviewing uncommitted changes. Other choices open a second popup, such as a searchable list of Git branches or recent commits. Git is the version-control tool used to track project history; branches and commits are different ways to point at code changes.
 
-`show_review_custom_prompt` opens a `CustomPromptView` instead of a selection list. Its submit closure trims the entered text, ignores empty submissions, and sends `ReviewTarget::Custom { instructions }` for non-empty input. A test-only helper mirrors the commit-picker construction using injected commit entries, allowing deterministic tests without shelling out to git.
+The branch and commit pickers fetch real repository data from the current working directory, turn each branch or commit into a selectable row, and attach an action to that row. When the user selects one, the action sends a `ReviewTarget`, which tells the app exactly what to review. The custom prompt view is slightly different: it asks the user to type free-form instructions, ignores empty text, and sends the typed instructions as the review target.
+
+There is also a test-only helper that builds the commit picker from supplied commit entries, so tests can check the popup behavior without reading an actual Git repository.
 
 #### Function details
 
@@ -5199,11 +5233,11 @@ The two async picker methods populate searchable selection views from local git 
 fn open_review_popup(&mut self)
 ```
 
-**Purpose**: Shows the top-level review preset menu with branch-based, uncommitted, commit-based, and custom-instructions options. Each option is wired to the appropriate review action or child picker event.
+**Purpose**: Shows the first review menu, where the user chooses what kind of review they want. This is the starting point for review selection in the chat interface.
 
-**Data flow**: It takes `&mut self`, builds a `Vec<SelectionItem>` by reading `self.config.cwd` for picker-launching closures, attaches actions that send `AppEvent::OpenReviewBranchPicker`, `tx.review(ReviewTarget::UncommittedChanges)`, `AppEvent::OpenReviewCommitPicker`, or `AppEvent::OpenReviewCustomPrompt`, wraps them in `SelectionViewParams`, and writes the popup into `self.bottom_pane`.
+**Data flow**: It starts with the chat widget's current state, especially the configured working directory. It builds a list of visible menu choices, and each choice carries a small action to run later if selected. The result is a selection popup shown in the bottom pane; nothing is reviewed yet unless the user picks an item.
 
-**Call relations**: This is the entrypoint for review popup UX. Some selections complete immediately, while others open child flows later handled by `show_review_branch_picker`, `show_review_commit_picker`, or `show_review_custom_prompt`.
+**Call relations**: This function is called when the app wants to open the review menu. It creates choices that either send an event to open a follow-up picker, such as the branch or commit picker, or directly send a review request for uncommitted changes. It hands the finished menu to the bottom pane so the user can interact with it.
 
 *Call graph*: 3 external calls (default, new, vec!).
 
@@ -5214,11 +5248,11 @@ fn open_review_popup(&mut self)
 async fn show_review_branch_picker(&mut self, cwd: &Path)
 ```
 
-**Purpose**: Loads local git branches and presents them as a searchable base-branch picker for review. Each selection starts a review against the chosen branch.
+**Purpose**: Shows a searchable list of local Git branches so the user can choose a base branch for a pull-request-style review. A base branch is the branch the current work should be compared against.
 
-**Data flow**: Inputs are `&mut self` and `cwd: &Path`. It asynchronously reads `branches = local_git_branches(cwd).await` and `current_branch_name(cwd).await`, defaulting detached HEAD text on failure, allocates a selection-item vector sized to the branch count, formats each item label as `current_branch -> branch`, stores the raw branch name as `search_value`, and shows the resulting searchable selection view in `bottom_pane`.
+**Data flow**: It receives a repository folder path. It reads the local branch names and the current branch name, then turns each possible target branch into a row labeled like "current branch -> target branch." When the user selects a row, the attached action sends a review request containing that branch name. The output is a searchable selection popup in the bottom pane.
 
-**Call relations**: This async picker is typically reached after the top-level review popup sends `AppEvent::OpenReviewBranchPicker`.
+**Call relations**: This is reached after the first review menu asks to open the branch picker. It relies on Git-reading helpers to supply branch information, then connects each branch choice to the app's review event sender. Once a branch is selected, the rest of the app receives a `BaseBranch` review target and can begin the review.
 
 *Call graph*: 4 external calls (default, with_capacity, format!, vec!).
 
@@ -5229,11 +5263,11 @@ async fn show_review_branch_picker(&mut self, cwd: &Path)
 async fn show_review_commit_picker(&mut self, cwd: &Path)
 ```
 
-**Purpose**: Loads recent commits and presents them as a searchable commit picker for review. Selecting an entry starts a review targeting that commit sha and subject.
+**Purpose**: Shows a searchable list of recent commits so the user can pick one commit to review. A commit is a saved snapshot of changes in Git history.
 
-**Data flow**: Inputs are `&mut self` and `cwd: &Path`. It asynchronously fetches `recent_commits(cwd, 100).await`, allocates a vector sized to the commit count, clones each entry’s subject and sha into a `SelectionItem` whose action sends `ReviewTarget::Commit { sha, title: Some(subject) }`, sets a combined `search_value` of subject plus sha, and shows the searchable selection view in `bottom_pane`.
+**Data flow**: It receives a repository folder path, asks for up to 100 recent commits, and builds one selectable row per commit. Each row displays the commit subject and stores searchable text made from the subject and commit ID. When selected, the row sends a review request containing the commit ID and title. The result is a commit picker shown in the bottom pane.
 
-**Call relations**: This async picker is typically reached after the top-level review popup sends `AppEvent::OpenReviewCommitPicker`.
+**Call relations**: This is opened from the main review menu when the user chooses to review a commit. It gathers recent history, turns that history into UI choices, and wires each choice to a `Commit` review target so the review system knows exactly which commit to inspect.
 
 *Call graph*: 4 external calls (default, with_capacity, format!, vec!).
 
@@ -5244,11 +5278,11 @@ async fn show_review_commit_picker(&mut self, cwd: &Path)
 fn show_review_custom_prompt(&mut self)
 ```
 
-**Purpose**: Opens a freeform prompt view for custom review instructions. Submitting non-empty text starts a custom review request.
+**Purpose**: Shows a text box where the user can type custom review instructions. This lets the user describe a review request that does not fit the preset branch, commit, or uncommitted-change choices.
 
-**Data flow**: It takes `&mut self`, clones `self.app_event_tx`, constructs a `CustomPromptView` with title, prompt text, empty initial text, no context label, and a submit closure that trims the entered string and sends `tx.review(ReviewTarget::Custom { instructions: trimmed })` only when the trimmed text is non-empty. It then shows that view in `bottom_pane`.
+**Data flow**: It copies the app event sender from the chat widget, creates a custom prompt view with a title and placeholder instructions, and gives that view a callback to run when the user submits text. The callback trims extra whitespace, ignores empty submissions, and sends a review request containing the typed instructions. The output is a custom prompt view shown in the bottom pane.
 
-**Call relations**: This method is the child flow behind the top-level popup’s custom-instructions option.
+**Call relations**: This is opened from the main review menu when the user chooses custom instructions. It hands control to `CustomPromptView`, and that view later calls the provided callback when the user presses Enter. The callback sends a `Custom` review target into the app event flow.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, new).
 
@@ -5262,24 +5296,24 @@ fn show_review_commit_picker_with_entries(
 )
 ```
 
-**Purpose**: Test helper that builds the same commit-review picker UI from injected commit entries instead of querying git. It enables deterministic tests of picker contents and actions.
+**Purpose**: Builds the commit picker from commit entries supplied directly by a test. This lets tests exercise the picker without depending on a real Git repository or recent commit history.
 
-**Data flow**: Inputs are `chat: &mut ChatWidget` and `entries: Vec<CommitLogEntry>`. It allocates a vector sized to the entry count, clones each subject and sha into `SelectionItem`s with commit-review actions and searchable subject+sha values, then installs the same searchable commit selection view into `chat.bottom_pane`.
+**Data flow**: It receives a mutable chat widget and a list of commit entries. It converts each entry into a selectable row, including display text, searchable text, and an action that sends a commit review request. It then shows the same searchable commit selection popup that the normal commit picker would show.
 
-**Call relations**: This helper mirrors `ChatWidget::show_review_commit_picker` for tests, replacing the async git fetch with caller-provided data.
+**Call relations**: This helper exists only when tests are compiled. It mirrors the normal commit picker’s UI-building path, but skips the Git lookup step by accepting prepared commit data. That makes the picker behavior easier to test in isolation.
 
 *Call graph*: 4 external calls (default, with_capacity, format!, vec!).
 
 
 ### `tui/src/chatwidget/plan_implementation.rs`
 
-`orchestration` · `post-plan approval prompt`
+`orchestration` · `after plan approval, during prompt/request handling`
 
-This small file is a focused popup builder for the transition out of Plan mode after a plan has been approved. It defines the user-facing strings for the title, button labels, the canned implementation message, and the long prefix used when the user chooses to clear context and carry the approved plan into a fresh thread.
+This file is about the handoff from “planning” to “coding.” In Plan mode, the assistant may first discuss and approve a plan before changing files. Once that plan is ready, the user needs a clear choice: go ahead and implement it, start a fresh conversation using that plan, or keep planning.
 
-The single function, `selection_view_params`, takes three pieces of state: an optional default collaboration-mode mask, optional approved plan markdown, and an optional usage label describing current context consumption. From those inputs it constructs two actionable rows and one passive cancel row. The “implement” row is enabled only when a default mode mask exists; its action sends `AppEvent::SubmitUserMessageWithMode` using the fixed message `Implement the plan.` and the provided default mask. The “clear context” row is stricter: it requires both a default mode and non-empty plan markdown, then sends `AppEvent::ClearUiAndSubmitUserMessage` with a prompt consisting of the fixed explanatory prefix followed by the approved plan text.
+The file defines the wording for that prompt and builds the menu items that appear in the terminal user interface. Each menu choice carries both display text and, when appropriate, an action to run if the user selects it. The first choice sends a normal user message saying “Implement the plan” while switching to the default collaboration mode. The second choice clears the current user interface context and submits a longer message that includes the approved plan, so the coding work can begin in a fresh thread. The third choice does nothing except close the prompt, leaving the user in Plan mode.
 
-When prerequisites are missing, the corresponding row is disabled with explicit reasons (`Default mode unavailable` or `No approved plan available`). The optional usage label is folded only into the clear-context description, producing either a generic “Fresh thread with this plan.” or a more specific “Fresh thread. Context: …”. The function returns a fully populated `SelectionViewParams` with the standard popup hint line and no side effects.
+The important safety detail is that some choices can be disabled. If the default mode is unavailable, implementation choices are not clickable. If there is no approved non-empty plan, the “clear context and implement” option is also disabled. This prevents the interface from offering actions that cannot actually work.
 
 #### Function details
 
@@ -5293,11 +5327,11 @@ fn selection_view_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Constructs the selection-view model for the “Implement this plan?” prompt, including enabled/disabled actions and explanatory copy based on available default mode and approved plan text.
+**Purpose**: Builds the confirmation popup that asks whether to implement an approved plan. It packages the visible menu text, short descriptions, disabled-state messages, and the actions that should happen when each choice is selected.
 
-**Data flow**: It takes `default_mask: Option<CollaborationModeMask>`, `plan_markdown: Option<&str>`, and `clear_context_usage_label: Option<&str>`. It derives action vectors and disabled reasons for the implement and clear-context rows, formats the clear-context description with or without the usage label, and returns a `SelectionViewParams` containing three `SelectionItem`s: implement, clear context, and stay in Plan mode. The action closures send either `SubmitUserMessageWithMode` or `ClearUiAndSubmitUserMessage`.
+**Data flow**: It receives three pieces of information: whether Default mode is available, the approved plan text if there is one, and an optional label showing how much context is already used. From that, it creates a `SelectionViewParams` value, which is the full recipe for drawing the popup. If Default mode is available, the normal implementation option sends an app event that submits “Implement the plan.” in that mode. If a non-empty plan is available too, the fresh-context option sends an app event that clears the UI and submits a longer message containing the plan. If required information is missing, the matching menu item is returned with a disabled reason instead of an action.
 
-**Call relations**: This pure builder is called by the Plan-mode prompt flow when the UI needs to present the post-approval decision. It does not perform the transition itself; instead it packages the exact actions that later selection handling will execute.
+**Call relations**: This function is used when the chat widget opens the plan-implementation prompt, and it is also exercised by a test that checks the fresh-context option requires both Default mode and an approved plan. Inside, it borrows the shared standard popup hint line so this prompt behaves like other selection popups, then hands back the finished selection-view description for the rest of the UI to display and execute.
 
 *Call graph*: calls 1 internal fn (standard_popup_hint_line); called by 2 (plan_implementation_clear_context_requires_default_mode_and_plan, open_plan_implementation_prompt); 4 external calls (default, new, format!, vec!).
 
@@ -5307,13 +5341,15 @@ Implements token and usage flows alongside quick controls for adjusting model re
 
 ### `tui/src/chatwidget/reasoning_shortcuts.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `chat key handling`
 
-This module isolates a small state machine for `Alt+,` / `Alt+.` style reasoning-effort shortcuts from the larger chat key dispatcher. `ReasoningShortcutDirection` captures whether the user wants to lower or raise effort and can generate a boundary message using the same sentence labels the rest of the widget uses.
+This file solves a user-interface problem: when a person presses the shortcut for “think less” or “think more,” the app needs to adjust the active model’s reasoning setting safely and predictably. “Reasoning effort” means how much work the model is asked to spend thinking before answering, where supported levels might be low, medium, high, or custom values.
 
-`handle_reasoning_shortcut` is the main entry point. It first recognizes whether the incoming `KeyEvent` matches the configured increase/decrease bindings; unrecognized keys return `false` so normal input handling can continue. Even recognized shortcuts are ignored when a modal or popup owns focus. Once active, the method requires the session to be configured and the current model to exist in the model catalog; otherwise it emits an informational message and reports the key as handled. For supported models, it derives the ordered reasoning choices from the preset’s advertised efforts, anchors the current effort to either the effective effort, the preset default, or the first advertised choice, and computes the next effort with `next_reasoning_effort`.
+The main function first checks whether the pressed key is one of the reasoning shortcuts. If not, it leaves the key alone so normal chat typing can use it. It also refuses to act while a popup or modal window owns the keyboard, much like ignoring a TV remote shortcut while a settings menu is open.
 
-If the user is already at the boundary, the method emits a direction-specific info message. Otherwise it applies the change differently by mode: in collaboration Plan mode it sends `AppEvent::UpdatePlanModeReasoningEffort`, while in normal mode it updates model/effort through the non-persisting application path. The helper functions are intentionally pure and tested for default anchoring, unsupported current values, custom ordering, bounds clamping, and single-option no-ops.
+Once the shortcut is accepted, the code looks up the current model’s preset. A preset describes what reasoning levels that model actually supports and what its default is. The file then builds the allowed list, anchors the current setting to a safe value if it is missing or unsupported, and steps one slot up or down in the model’s advertised order. If the user is already at the lowest or highest level, it shows a friendly message instead of changing anything.
+
+There is one important split: in normal chat mode, the new effort is applied temporarily without saving it permanently. In Plan mode, the shortcut updates only the Plan-mode override, avoiding a broader “global or Plan?” prompt.
 
 #### Function details
 
@@ -5323,11 +5359,11 @@ If the user is already at the boundary, the method emits a direction-specific in
 fn bound_message(self, effort: &ReasoningEffortConfig) -> String
 ```
 
-**Purpose**: Builds the informational message shown when the user tries to move past the lowest or highest supported reasoning level. The wording depends on direction and includes the human-readable effort label.
+**Purpose**: This creates the message shown when the user tries to lower or raise reasoning effort past the allowed edge. It turns a bare boundary case into a clear sentence like “already at the lowest level.”
 
-**Data flow**: It takes `self` and a borrowed `ReasoningEffortConfig`, converts the effort to a sentence label via `ChatWidget::reasoning_effort_sentence_label`, formats the lower- or upper-bound message string, and returns it.
+**Data flow**: It receives the shortcut direction and the effort level currently at the boundary. It asks ChatWidget for a human-friendly label for that effort, then formats a sentence. The result is a string that can be displayed to the user.
 
-**Call relations**: This helper is used by `ChatWidget::handle_reasoning_shortcut` when `next_reasoning_effort` reports there is no further step in the requested direction.
+**Call relations**: When ChatWidget::handle_reasoning_shortcut discovers there is no next level to move to, it uses this helper to explain why nothing changed. The helper depends on the shared label wording so the message matches the rest of the chat interface.
 
 *Call graph*: 2 external calls (format!, reasoning_effort_sentence_label).
 
@@ -5338,11 +5374,11 @@ fn bound_message(self, effort: &ReasoningEffortConfig) -> String
 fn handle_reasoning_shortcut(&mut self, key_event: KeyEvent) -> bool
 ```
 
-**Purpose**: Recognizes reasoning-effort shortcut keys and applies the next lower or higher supported effort for the current model, respecting modal focus and Plan-mode scoping. It returns whether the key was consumed.
+**Purpose**: This is the main shortcut handler for raising or lowering reasoning effort from the chat screen. It decides whether the key press belongs to this feature, checks whether it is safe to act, picks the next valid effort level, and applies it.
 
-**Data flow**: Inputs are `&mut self` and a `KeyEvent`. It reads the configured key bindings, bottom-pane modal state, session-configuration state, current model string, current model preset, effective reasoning effort, collaboration-mode enablement, and active mode kind. It computes the direction, derives supported choices with `reasoning_choices`, anchors the current effort, computes the next effort with `next_reasoning_effort`, and either writes an info message, sends `AppEvent::UpdatePlanModeReasoningEffort(Some(next_effort))`, or calls `apply_model_and_effort_without_persist(current_model, Some(next_effort))`. It returns `true` for recognized shortcuts it handled and `false` for unrelated keys or when a popup/modal blocks shortcut handling.
+**Data flow**: It takes a keyboard event as input and reads the chat widget’s current state: key bindings, popup state, session readiness, current model, model catalog, current reasoning effort, and active mode. If the key is not a reasoning shortcut, it returns false. If it is a shortcut, it either shows an informational message, sends a Plan-mode update event, or applies a temporary model-and-effort change, then returns true.
 
-**Call relations**: This method is the main shortcut entrypoint and delegates model lookup to `ChatWidget::current_model_preset`, choice extraction to `reasoning_choices`, and stepping logic to `next_reasoning_effort`. Its Plan-mode branch intentionally bypasses the broader scope-selection prompt used by settings popups.
+**Call relations**: This function is meant to run before the general chat key dispatcher, so recognized shortcuts do not get treated as ordinary typing. It calls ChatWidget::current_model_preset to find the active model’s rules, reasoning_choices to get the allowed effort list, and next_reasoning_effort to choose the neighboring level. If the app is in Plan mode, it hands the change to the app event system with UpdatePlanModeReasoningEffort; otherwise it applies the change directly without persisting it.
 
 *Call graph*: calls 3 internal fn (current_model_preset, next_reasoning_effort, reasoning_choices); 2 external calls (UpdatePlanModeReasoningEffort, format!).
 
@@ -5353,11 +5389,11 @@ fn handle_reasoning_shortcut(&mut self, key_event: KeyEvent) -> bool
 fn current_model_preset(&self) -> Option<ModelPreset>
 ```
 
-**Purpose**: Finds the full `ModelPreset` for the widget’s currently selected model. It returns `None` if the model catalog cannot be listed or the current model is absent.
+**Purpose**: This finds the preset information for the model currently selected in the chat widget. The preset is needed because different models can support different reasoning levels.
 
-**Data flow**: It reads `self.current_model()`, queries `self.model_catalog.try_list_models()`, converts catalog failure into `None`, scans the presets for one whose `model` equals the current model, and returns that preset.
+**Data flow**: It reads the current model name from the widget and asks the model catalog for the available presets. If the catalog can be listed and a preset has the same model name, it returns that preset. If listing fails or no match exists, it returns nothing.
 
-**Call relations**: It is called by `ChatWidget::handle_reasoning_shortcut` to determine whether reasoning shortcuts are supported and to obtain the preset’s default and advertised efforts.
+**Call relations**: ChatWidget::handle_reasoning_shortcut calls this before trying to change reasoning effort. Without a preset, the shortcut handler cannot know which effort levels are valid, so it shows a message and stops.
 
 *Call graph*: called by 1 (handle_reasoning_shortcut).
 
@@ -5368,11 +5404,11 @@ fn current_model_preset(&self) -> Option<ModelPreset>
 fn reasoning_choices(preset: &ModelPreset) -> Vec<ReasoningEffortConfig>
 ```
 
-**Purpose**: Extracts the ordered list of reasoning efforts a model advertises, falling back to the preset default when no explicit supported-efforts list exists. The returned order is preserved exactly.
+**Purpose**: This builds the list of reasoning effort levels that the active model says it supports. It also provides a fallback so there is at least one usable level when the model preset does not advertise any choices.
 
-**Data flow**: It takes a borrowed `ModelPreset`, maps `supported_reasoning_efforts` into a `Vec<ReasoningEffortConfig>`, pushes `default_reasoning_effort` if the list would otherwise be empty, and returns the vector.
+**Data flow**: It receives a model preset. It reads the preset’s supported reasoning efforts and copies their effort values into a new list. If that list is empty, it inserts the preset’s default reasoning effort. The output is the ordered list that shortcut stepping should follow.
 
-**Call relations**: This pure helper is used by `ChatWidget::handle_reasoning_shortcut` before stepping through efforts.
+**Call relations**: ChatWidget::handle_reasoning_shortcut uses this before choosing the next level. The order matters because next_reasoning_effort treats the list like a ladder: lower moves one rung backward and raise moves one rung forward.
 
 *Call graph*: called by 1 (handle_reasoning_shortcut).
 
@@ -5387,11 +5423,11 @@ fn next_reasoning_effort(
 ) -> Option<ReasoningEffortConfig>
 ```
 
-**Purpose**: Computes the adjacent reasoning effort in the requested direction within an ordered choices list. It does not infer positions for unsupported current values and returns `None` at bounds.
+**Purpose**: This chooses the next reasoning effort one step lower or higher than the current one. It is the small, focused rule that makes the shortcut behave like stepping through a fixed menu rather than guessing.
 
-**Data flow**: Inputs are a slice of `ReasoningEffortConfig`, an optional current effort, and a `ReasoningShortcutDirection`. It returns early on `None` current effort, searches `choices` for the current effort, and if found returns the previous or next element depending on direction using index arithmetic and safe access; otherwise it returns `None`.
+**Data flow**: It receives an ordered list of allowed choices, the current effort if there is one, and the requested direction. If there is no current effort, or the current effort is not in the list, it returns nothing. If the current effort is found, it returns the previous item for Lower, the next item for Raise, or nothing if the current effort is already at the edge.
 
-**Call relations**: This helper is called by `ChatWidget::handle_reasoning_shortcut` after that method has anchored the current effort to a supported value when possible.
+**Call relations**: ChatWidget::handle_reasoning_shortcut calls this after it has already anchored the current effort to a safe supported value. The tests in this file focus heavily on this function because it holds the core stepping behavior and boundary rules.
 
 *Call graph*: called by 1 (handle_reasoning_shortcut); 2 external calls (get, iter).
 
@@ -5402,11 +5438,11 @@ fn next_reasoning_effort(
 fn next_reasoning_effort_raises_from_default_anchor()
 ```
 
-**Purpose**: Verifies that stepping upward from a middle/default-like effort returns the next advertised effort. It checks the normal increasing path.
+**Purpose**: This test checks that raising from a middle effort level moves to the next higher advertised level. It protects the ordinary “increase reasoning” shortcut path.
 
-**Data flow**: The test constructs a vector of ordered efforts, calls `next_reasoning_effort` with `Medium` and `Raise`, and asserts that the result is `Some(High)`.
+**Data flow**: It creates a list ordered from Low through XHigh and uses Medium as the current effort. It asks next_reasoning_effort to raise the level. The expected result is High.
 
-**Call relations**: This test exercises the pure stepping helper directly to lock in upward traversal behavior.
+**Call relations**: This test exercises next_reasoning_effort directly. It represents the situation ChatWidget::handle_reasoning_shortcut reaches after it has chosen the current model’s supported effort list and current anchor.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -5417,11 +5453,11 @@ fn next_reasoning_effort_raises_from_default_anchor()
 fn next_reasoning_effort_lowers_from_default_anchor()
 ```
 
-**Purpose**: Verifies that stepping downward from a middle/default-like effort returns the previous advertised effort. It checks the normal decreasing path.
+**Purpose**: This test checks that lowering from a middle effort level moves to the previous advertised level. It protects the ordinary “decrease reasoning” shortcut path.
 
-**Data flow**: The test builds an ordered effort vector, calls `next_reasoning_effort` with `Medium` and `Lower`, and asserts that the result is `Some(Low)`.
+**Data flow**: It creates a list ordered Low, Medium, High and uses Medium as the current effort. It asks next_reasoning_effort to lower the level. The expected result is Low.
 
-**Call relations**: This test complements the upward-step test by covering the opposite direction on the same helper.
+**Call relations**: This test calls next_reasoning_effort in the same way the shortcut handler would after preparing a valid current value. It confirms the downward movement uses the list order.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -5432,11 +5468,11 @@ fn next_reasoning_effort_lowers_from_default_anchor()
 fn next_reasoning_effort_does_not_infer_position_for_unsupported_current()
 ```
 
-**Purpose**: Ensures the stepping helper refuses to guess where an unsupported current effort belongs in the advertised order. Both directions should return `None`.
+**Purpose**: This test makes sure the stepping function does not guess where an unsupported current effort belongs. That matters because different models may support unusual or sparse effort lists.
 
-**Data flow**: The test creates choices `[Low, High]`, calls `next_reasoning_effort` twice with unsupported `Medium` for `Raise` and `Lower`, and asserts the pair is `(None, None)`.
+**Data flow**: It creates a choices list containing Low and High, then uses Medium as the current effort even though Medium is not supported. It tries both raising and lowering. Both results are expected to be nothing.
 
-**Call relations**: This test documents the invariant that unsupported current values are not interpolated by `next_reasoning_effort` itself.
+**Call relations**: This test checks next_reasoning_effort by itself. The larger shortcut handler normally anchors unsupported values before calling it, but this test keeps the helper honest: it only steps from values that are actually present in the provided list.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -5447,11 +5483,11 @@ fn next_reasoning_effort_does_not_infer_position_for_unsupported_current()
 fn next_reasoning_effort_uses_advertised_order_for_custom_levels()
 ```
 
-**Purpose**: Checks that the helper respects the exact advertised order, even when it is nonstandard and includes custom effort labels. It proves the function is order-driven rather than semantically sorted.
+**Purpose**: This test confirms that custom or unusual effort levels follow the model’s advertised order, not a built-in assumption about what “low” or “high” means. This keeps the shortcut flexible for models with nonstandard choices.
 
-**Data flow**: The test constructs a custom effort plus an intentionally unusual order `[High, Low, Custom("max")]`, then asserts that raising from `High` yields `Low` and lowering from the custom effort also yields `Low`.
+**Data flow**: It creates a custom effort named “max” and a deliberately unusual order: High, Low, then custom max. It raises from High and lowers from custom max. In both cases, the expected neighboring level is Low, because Low sits next to those entries in the provided list.
 
-**Call relations**: This test guards the design choice that `next_reasoning_effort` follows catalog order exactly.
+**Call relations**: This test exercises next_reasoning_effort directly. It supports the behavior used by ChatWidget::handle_reasoning_shortcut when the active model catalog supplies custom reasoning options.
 
 *Call graph*: 3 external calls (Custom, assert_eq!, vec!).
 
@@ -5462,11 +5498,11 @@ fn next_reasoning_effort_uses_advertised_order_for_custom_levels()
 fn next_reasoning_effort_clamps_at_bounds()
 ```
 
-**Purpose**: Verifies that stepping below the first choice or above the last choice returns `None`. It covers both lower and upper boundaries.
+**Purpose**: This test checks that the stepping function stops at the lowest and highest available levels. It prevents shortcuts from wrapping around or producing invalid values at the edges.
 
-**Data flow**: The test builds `[Low, Medium, High]`, calls `next_reasoning_effort` with `Low/Lower` and `High/Raise`, and asserts both results are `None`.
+**Data flow**: It creates a Low, Medium, High list. It tries lowering from Low and raising from High. Both operations are expected to return nothing, meaning there is no valid next step.
 
-**Call relations**: This test confirms the boundary behavior that drives `bound_message` handling in the widget.
+**Call relations**: This test covers the boundary behavior that ChatWidget::handle_reasoning_shortcut turns into a user-facing message through ReasoningShortcutDirection::bound_message.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -5477,24 +5513,24 @@ fn next_reasoning_effort_clamps_at_bounds()
 fn next_reasoning_effort_single_option_is_noop()
 ```
 
-**Purpose**: Ensures a model with only one supported reasoning effort cannot be stepped in either direction. Both attempts should be no-ops represented by `None`.
+**Purpose**: This test checks the case where a model has only one available reasoning effort. In that situation, both shortcut directions should do nothing because there is nowhere to move.
 
-**Data flow**: The test creates a single-element choices vector `[High]`, calls `next_reasoning_effort` for both `Raise` and `Lower`, and asserts both results are `None`.
+**Data flow**: It creates a list with only High. It asks next_reasoning_effort to raise and lower from High. Both results are expected to be nothing.
 
-**Call relations**: This test covers the degenerate one-choice case for the stepping helper.
+**Call relations**: This test exercises next_reasoning_effort directly and protects the shortcut handler’s behavior for models with no real choice of reasoning level. In the full chat flow, that no-change result becomes an informational boundary message.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
 
 ### `tui/src/chatwidget/tokens.rs`
 
-`domain_logic` · `request handling`
+`orchestration` · `request handling and main loop`
 
-This module owns the non-rendering mechanics behind `/usage` token activity. The central state machine is `TokenActivityState`, which moves from `Loading` to either `Loaded { response, today }` or `Error`. That state is wrapped in `Arc<RwLock<_>>` inside `TokenActivityHandle`, allowing the background completion path and the widget-owned transient card to share one mutable render state safely. `new_token_activity_output` constructs a `CompositeHistoryCell` containing both the echoed slash command (`PlainHistoryCell`) and a `TokenActivityHistoryCell` that reads from the shared state.
+When a user types `/usage`, the app needs to fetch token-usage data from the account service. That takes time, but the interface should still respond right away. This file creates a temporary card that says “Loading...” and shows it above the message composer instead of immediately writing it into the permanent transcript. Think of it like putting a “your receipt is printing” slip on the counter before stapling the final receipt into the record book.
 
-`TokenActivityHistoryCell` implements `HistoryCell`: `display_lines` renders a loading stub, a stable unavailable message, or delegates to `chart::loaded_lines` for the full chart and summary. On the widget side, `ChatWidget::add_token_activity_output` allocates a monotonically wrapping request ID, clears any previously completed card, stores the new pending output, bumps active-cell revision, requests redraw, and emits `AppEvent::RefreshTokenActivity`.
+The main pieces are a shared card state, a completion handle, and chat-widget methods that decide when the card may enter history. `TokenActivityHandle` is held by the background request path. The visible card and the handle share the same state through a lock, so the background result can change the card from loading to loaded or unavailable. A request ID is kept with each pending card so a slow response from an older `/usage` command cannot overwrite a newer one.
 
-Completion is guarded by request correlation in `finish_token_activity_refresh`: only the currently pending request ID may transition into `completed_token_activity_output`; late responses are rejected and the pending output is restored unchanged. The module also defines the insertion barrier logic used by usage-related output generally: active streams, pending stream consolidations, active transcript cells, and active hook cells all block history insertion. Helper methods increment/decrement consolidation counters, expose pending/completed output for rendering, request deferred insertion retries, and clear stale token-activity state during transcript resets or replacement flows.
+Once the right response arrives, the card moves from “refreshing” to “completed.” It still may not be inserted into history immediately, because active streams or transcript updates could make the output appear in the wrong order. This file checks those blockers, retries insertion when they clear, and can clear pending cards when the transcript is reset or replaced.
 
 #### Function details
 
@@ -5504,11 +5540,11 @@ Completion is guarded by request correlation in `finish_token_activity_refresh`:
 fn finish(&self, result: Result<GetAccountTokenUsageResponse, String>)
 ```
 
-**Purpose**: Completes a token-activity card using the current UTC date as the chart anchor. It is the normal production entry point for turning a backend result into a terminal render state.
+**Purpose**: Marks a token-activity request as finished using the current date. Callers use this when the background account lookup returns either real usage data or an error.
 
-**Data flow**: Takes `&self` and a `Result<GetAccountTokenUsageResponse, String>`, reads the current date via `Utc::now().date_naive()`, and forwards both to `finish_with_today`. It returns no value and mutates the shared `RwLock<TokenActivityState>` indirectly.
+**Data flow**: It receives a result: either the token-usage response or an error message. It reads the current UTC date, then passes both the result and date to `TokenActivityHandle::finish_with_today`. The shared card state is changed indirectly, so the visible card can stop showing the loading message.
 
-**Call relations**: Called from `ChatWidget::finish_token_activity_refresh` after request-ID matching succeeds. It delegates the actual state replacement to `finish_with_today` so tests can inject a fixed date separately.
+**Call relations**: This is the public completion step for the handle created with a `/usage` card. `ChatWidget::finish_token_activity_refresh` calls it after confirming the request ID matches, and it delegates the actual state replacement to `TokenActivityHandle::finish_with_today`.
 
 *Call graph*: calls 1 internal fn (finish_with_today); 1 external calls (now).
 
@@ -5523,11 +5559,11 @@ fn finish_with_today(
     )
 ```
 
-**Purpose**: Replaces the shared token-activity state with either a loaded response anchored to a supplied date or a generic error state. This is the deterministic completion primitive used by both production code and tests.
+**Purpose**: Changes the shared card state from loading into either loaded data or an error state, using a supplied date. The explicit date makes the rendering consistent and easy to test.
 
-**Data flow**: Accepts `&self`, a backend result, and a `NaiveDate` named `today`. It maps `Ok(response)` to `TokenActivityState::Loaded { response, today }` and any `Err(_)` to `TokenActivityState::Error`, acquires a write lock on `self.state`, and overwrites the previous state in place.
+**Data flow**: It receives the account response result and a date called `today`. If the result is successful, it stores the response together with that date. If the result is an error, it stores a simple error state. It writes this new state into the shared locked storage used by the card.
 
-**Call relations**: Used by `TokenActivityHandle::finish`, and directly by tests that need a stable anchor date. It performs no request correlation itself; callers are expected to ensure they are completing the correct card.
+**Call relations**: This is called by `TokenActivityHandle::finish`. It is the low-level state update that lets the already-created history cell render different text the next time the chat widget redraws.
 
 *Call graph*: called by 1 (finish).
 
@@ -5540,11 +5576,11 @@ fn new_token_activity_output(
 ) -> (CompositeHistoryCell, TokenActivityHandle)
 ```
 
-**Purpose**: Builds the initial composite `/usage` output and the shared completion handle for one invocation. The returned card starts in loading state and includes the echoed slash command line above the chart area.
+**Purpose**: Builds the visible `/usage` output card and the handle that will later complete it. It gives the user immediate feedback by creating a composite cell that contains the echoed command plus a loading card.
 
-**Data flow**: Takes a `TokenActivityView`, formats `/usage <label>` using the view’s lowercase label into a magenta `PlainHistoryCell`, allocates `Arc<RwLock<TokenActivityState::Loading>>`, constructs a `TokenActivityHandle` and `TokenActivityHistoryCell` sharing that state, and returns `(CompositeHistoryCell, TokenActivityHandle)`.
+**Data flow**: It receives a `TokenActivityView`, which describes which usage view is being requested. It creates a small command line like `/usage daily`, creates shared state set to loading, builds a `TokenActivityHandle` pointing at that state, and builds a `TokenActivityHistoryCell` that reads the same state. It returns the combined history cell and the handle as a pair.
 
-**Call relations**: Called only by `ChatWidget::add_token_activity_output` when a new `/usage` request starts. It isolates the card/handle construction so the widget method can focus on request bookkeeping and event dispatch.
+**Call relations**: This is called by `ChatWidget::add_token_activity_output` when a new `/usage` command starts. The returned cell stays with the chat widget for rendering, while the returned handle is kept so the matching background response can update the card.
 
 *Call graph*: calls 2 internal fn (new, new); called by 1 (add_token_activity_output); 4 external calls (clone, new, new, vec!).
 
@@ -5555,11 +5591,11 @@ fn new_token_activity_output(
 fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Renders the token-activity portion of the `/usage` card according to the shared asynchronous state. It emits a loading stub, a fixed unavailable message, or the full chart and summary.
+**Purpose**: Turns the current token-activity card state into lines of text for the terminal. It decides whether the user sees a loading message, an unavailable message, or the finished chart.
 
-**Data flow**: Reads `self.state` through an `RwLock` read guard and matches on `TokenActivityState`. For `Loading`, it returns two lines (`Token activity` and dim `Loading...`); for `Error`, two lines with `Token activity unavailable`; for `Loaded`, it passes `self.view`, the stored response, stored `today`, and the requested width into `chart::loaded_lines` and returns those lines.
+**Data flow**: It receives the available display width. It reads the shared card state through a read lock. If the state is loading, it returns a bold title and dim loading text. If the state is an error, it returns a stable unavailable message. If the state has data, it asks the chart code to format the response for the given width.
 
-**Call relations**: This method is invoked through the `HistoryCell` trait wherever the composite card is rendered. `raw_lines` delegates to it, and loaded rendering further delegates into the pure chart module.
+**Call relations**: This method is part of the `HistoryCell` interface, so the chat rendering system can draw this card like any other history item. `TokenActivityHistoryCell::raw_lines` also calls it when plain, unstyled lines are needed.
 
 *Call graph*: calls 1 internal fn (loaded_lines); called by 1 (raw_lines); 1 external calls (vec!).
 
@@ -5570,11 +5606,11 @@ fn display_lines(&self, width: u16) -> Vec<Line<'static>>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Produces an unwrapped plain-text version of the rendered token-activity card. It is used for raw/copy-style output paths that want the same content without width constraints or styling structure.
+**Purpose**: Produces a plain-text version of the token-activity card. This is useful when the app needs the card content without terminal styling.
 
-**Data flow**: Calls `self.display_lines(u16::MAX)` to render without practical width limits, then passes the resulting styled lines through `plain_lines` and returns the flattened `Vec<Line<'static>>`.
+**Data flow**: It asks `TokenActivityHistoryCell::display_lines` to render the card at a very wide width, then passes those styled lines through `plain_lines` to strip or normalize styling. The output is a list of plain text lines.
 
-**Call relations**: Called via the `HistoryCell` trait’s raw-output path. It depends entirely on `display_lines` for content selection and only strips styling/formatting afterward.
+**Call relations**: This is the raw-text side of the `HistoryCell` interface. It relies on `display_lines` so the plain version stays consistent with what the user sees on screen.
 
 *Call graph*: calls 2 internal fn (display_lines, plain_lines).
 
@@ -5585,11 +5621,11 @@ fn raw_lines(&self) -> Vec<Line<'static>>
 fn add_token_activity_output(&mut self, view: TokenActivityView)
 ```
 
-**Purpose**: Starts a new asynchronous token-activity refresh and installs its loading card as the widget’s transient usage output. It also emits the app event that asks the backend layer to fetch usage data.
+**Purpose**: Starts a new `/usage` refresh in the chat widget. It replaces any current temporary usage card, shows a new loading card, and asks the rest of the app to fetch the data.
 
-**Data flow**: Reads `self.next_token_activity_request_id`, increments it with wrapping arithmetic, calls `new_token_activity_output(view)` to get a loading card and handle, clears `self.completed_token_activity_output`, stores a new `PendingTokenActivityOutput` in `self.refreshing_token_activity_output`, bumps active-cell revision, requests redraw, and sends `AppEvent::RefreshTokenActivity { request_id }` on `self.app_event_tx`.
+**Data flow**: It receives the requested token-activity view. It takes the next request ID, increments the counter for future requests, and calls `new_token_activity_output` to get a loading cell and completion handle. It clears any previously completed usage card, stores the new pending output, marks the active display as changed, requests a redraw, and sends an app event asking for token-activity refresh for that request ID.
 
-**Call relations**: This widget method is entered when `/usage` token activity is requested. It delegates card construction to `new_token_activity_output` and hands off actual data fetching to the outer app via the emitted event.
+**Call relations**: This is the starting point for the `/usage` card lifecycle inside the widget. It creates the pending state that later functions read, complete, render, or clear.
 
 *Call graph*: calls 1 internal fn (new_token_activity_output).
 
@@ -5600,11 +5636,11 @@ fn add_token_activity_output(&mut self, view: TokenActivityView)
 fn pending_token_activity_output(&self) -> Option<&dyn HistoryCell>
 ```
 
-**Purpose**: Exposes whichever token-activity card should currently render above the composer. A still-refreshing loading card takes precedence over a completed card waiting to be inserted into transcript history.
+**Purpose**: Returns the token-activity card that should currently be shown above the composer. It prefers a still-loading card, but can also return a completed card that has not yet been inserted into history.
 
-**Data flow**: Reads widget state immutably. If `self.refreshing_token_activity_output` is `Some`, it returns a trait-object reference to that pending composite cell; otherwise it falls back to `self.completed_token_activity_output` and returns a trait-object reference if present; otherwise it returns `None`.
+**Data flow**: It reads the widget’s pending token-activity fields. If a refreshing output exists, it returns a borrowed view of that composite cell. Otherwise, if a completed output is waiting, it returns that cell. If neither exists, it returns nothing. It does not move or change ownership of the card.
 
-**Call relations**: Used by rendering code that needs to show transient usage output without taking ownership. It does not mutate state and serves as the read-side counterpart to the add/finish/take methods.
+**Call relations**: The rendering path calls this when deciding what temporary output to draw outside the permanent transcript. It bridges the widget’s internal pending/completed slots to the generic history-cell rendering system.
 
 
 ##### `ChatWidget::finish_token_activity_refresh`  (lines 194–211)
@@ -5617,11 +5653,11 @@ fn finish_token_activity_refresh(
     ) -> bool
 ```
 
-**Purpose**: Applies a backend usage result to the currently pending token-activity request if and only if the request IDs match. Matching completions move the card from the refreshing slot into the completed slot for later history insertion.
+**Purpose**: Applies a background `/usage` result to the correct pending card. It protects the interface from late responses by checking the request ID before changing anything.
 
-**Data flow**: Takes a mutable widget, a `request_id`, and a backend result. It removes `self.refreshing_token_activity_output`; if none exists it returns `false`. If the stored request ID differs, it restores the pending output unchanged and returns `false`. On a match, it calls `output.handle.finish(result)`, stores `output.cell` into `self.completed_token_activity_output`, bumps active-cell revision, requests redraw, and returns `true`.
+**Data flow**: It receives a request ID and either a usage response or an error. It takes the current refreshing output, if any. If there is no pending output, or the ID does not match, it restores state as needed and returns `false`. If the ID matches, it uses the output’s handle to store the result, moves the cell into the completed slot, marks the display as changed, requests a redraw, and returns `true`.
 
-**Call relations**: This method is called when the backend responds to `AppEvent::RefreshTokenActivity`. It performs the request-correlation gate before delegating state mutation to `TokenActivityHandle::finish`, preventing late responses from mutating newer cards.
+**Call relations**: This is called when the background account request finishes. It hands the actual state update to `TokenActivityHandle::finish`, then prepares the completed card for later history insertion.
 
 
 ##### `ChatWidget::usage_history_insertion_blocked`  (lines 218–224)
@@ -5630,11 +5666,11 @@ fn finish_token_activity_refresh(
 fn usage_history_insertion_blocked(&self) -> bool
 ```
 
-**Purpose**: Reports whether usage-related output must remain transient instead of being inserted into transcript history. It centralizes all barriers that could reorder usage cards relative to visible work.
+**Purpose**: Checks whether it is currently unsafe to insert a completed usage card into chat history. This avoids putting the card in the wrong order while other output is still being streamed or consolidated.
 
-**Data flow**: Reads five widget fields: `stream_controller`, `plan_stream_controller`, `pending_stream_consolidations`, `transcript.active_cell`, and `active_hook_cell`. It returns `true` if any stream controller exists, any consolidation count is positive, or any active transcript/hook cell is present; otherwise `false`.
+**Data flow**: It reads several widget fields that indicate active work: normal streaming, plan streaming, queued stream consolidation, an active transcript cell, or an active hook cell. If any of these are present, it returns `true`; otherwise it returns `false`.
 
-**Call relations**: Consulted by higher-level usage-output insertion logic, including tests around deferred startup hints and token activity. It does not trigger retries itself; the request methods below do that.
+**Call relations**: Code that wants to commit completed usage output calls this before taking the completed card. If it reports a blocker, insertion is delayed and retried later.
 
 
 ##### `ChatWidget::note_stream_consolidation_queued`  (lines 230–233)
@@ -5643,11 +5679,11 @@ fn usage_history_insertion_blocked(&self) -> bool
 fn note_stream_consolidation_queued(&mut self)
 ```
 
-**Purpose**: Adds one pending stream-consolidation barrier to the usage-output insertion gate. This prevents completed usage cards from being inserted while stream output still needs consolidation.
+**Purpose**: Records that a stream-consolidation step has been queued, so usage-card insertion should wait. A stream consolidation is a cleanup step that turns streamed pieces into stable transcript content.
 
-**Data flow**: Mutably increments `self.pending_stream_consolidations` using `saturating_add(1)`. It returns no value and has no side effects beyond the counter update.
+**Data flow**: It reads the current count of pending stream consolidations and adds one, using saturating arithmetic so the number cannot overflow in normal use. The changed counter becomes one of the blockers checked before usage output is inserted.
 
-**Call relations**: Called by stream lifecycle code when a consolidation task is queued. It pairs conceptually with `note_stream_consolidation_completed`, which removes the barrier later.
+**Call relations**: This is called when the chat system queues consolidation work. It pairs with `ChatWidget::note_stream_consolidation_completed`, which removes the blocker later.
 
 
 ##### `ChatWidget::note_stream_consolidation_completed`  (lines 239–242)
@@ -5656,11 +5692,11 @@ fn note_stream_consolidation_queued(&mut self)
 fn note_stream_consolidation_completed(&mut self)
 ```
 
-**Purpose**: Removes one pending stream-consolidation barrier from the usage-output insertion gate. The counter saturates at zero to avoid underflow on mismatched completions.
+**Purpose**: Records that one queued stream-consolidation step has finished. This may help clear the way for a completed usage card to be inserted into history.
 
-**Data flow**: Mutably decrements `self.pending_stream_consolidations` using `saturating_sub(1)`. It returns no value and only updates the barrier counter.
+**Data flow**: It reads the pending consolidation count and subtracts one, using saturating arithmetic so an extra completion call cannot make the count go below zero. The resulting count is later checked by `ChatWidget::usage_history_insertion_blocked`.
 
-**Call relations**: Called after a queued consolidation finishes. It is the release-side counterpart to `note_stream_consolidation_queued` and affects `usage_history_insertion_blocked` results.
+**Call relations**: This is the counterpart to `ChatWidget::note_stream_consolidation_queued`. After stream cleanup finishes, callers use it so delayed usage output can eventually be committed.
 
 
 ##### `ChatWidget::take_completed_token_activity_output`  (lines 249–253)
@@ -5669,11 +5705,11 @@ fn note_stream_consolidation_completed(&mut self)
 fn take_completed_token_activity_output(&mut self) -> Option<CompositeHistoryCell>
 ```
 
-**Purpose**: Transfers ownership of a completed token-activity card out of the transient render area and into the history insertion path. Taking the card also marks the active-cell view as changed.
+**Purpose**: Removes the completed token-activity card from the temporary area and hands it to the history insertion path. Callers should only use this after checking that insertion is not blocked.
 
-**Data flow**: Mutably takes `self.completed_token_activity_output`; if absent, returns `None`. If present, it bumps active-cell revision and returns the `CompositeHistoryCell` inside `Some(...)`.
+**Data flow**: It looks for a completed token-activity output. If none exists, it returns nothing. If one exists, it takes ownership of the cell, clears the completed slot, marks the active display as changed, and returns the cell for insertion into transcript history.
 
-**Call relations**: Used by code that commits completed usage output into transcript history once insertion barriers clear. It is the ownership-moving counterpart to `pending_token_activity_output`, which only borrows.
+**Call relations**: This is used after `ChatWidget::usage_history_insertion_blocked` says it is safe to proceed. It is the handoff point between temporary rendering and permanent history.
 
 
 ##### `ChatWidget::request_pending_usage_output_insertion`  (lines 259–265)
@@ -5682,11 +5718,11 @@ fn take_completed_token_activity_output(&mut self) -> Option<CompositeHistoryCel
 fn request_pending_usage_output_insertion(&self)
 ```
 
-**Purpose**: Asks the outer app loop to retry committing deferred usage output into history. It only emits the retry event when there is actually completed token activity or a pending rate-limit-reset hint waiting.
+**Purpose**: Asks the app to try committing pending usage-related output if there is anything waiting. This is a retry signal for cases where an earlier insertion attempt was blocked.
 
-**Data flow**: Reads `self.completed_token_activity_output` and `self.pending_rate_limit_reset_hint()`. If either is present, it sends `AppEvent::CommitPendingUsageOutput` on `self.app_event_tx`; otherwise it does nothing.
+**Data flow**: It checks whether a completed token-activity card exists or whether a rate-limit reset hint is pending. If either is present, it sends an app event requesting `CommitPendingUsageOutput`. It does not itself insert the card.
 
-**Call relations**: Called after lifecycle changes that may have removed insertion barriers. It does not insert output itself; it schedules the app-level commit path to re-check conditions.
+**Call relations**: This is called after events that might have cleared insertion blockers. It nudges the app event loop to come back and run the commit path at a safe time.
 
 
 ##### `ChatWidget::request_pending_usage_output_insertion_after_stream_shutdown`  (lines 267–274)
@@ -5695,11 +5731,11 @@ fn request_pending_usage_output_insertion(&self)
 fn request_pending_usage_output_insertion_after_stream_shutdown(&self)
 ```
 
-**Purpose**: Requests a specialized retry of deferred usage-output insertion after stream shutdown. It mirrors the normal retry method but emits a distinct event for the post-shutdown phase.
+**Purpose**: Asks the app to try committing pending usage-related output after stream shutdown has finished. It is a more specific retry signal for the end of streaming activity.
 
-**Data flow**: Reads the same waiting-output conditions as `request_pending_usage_output_insertion`. If either a completed token card or pending reset hint exists, it sends `AppEvent::CommitPendingUsageOutputAfterStreamShutdown` on `self.app_event_tx`.
+**Data flow**: It checks for the same waiting work as `ChatWidget::request_pending_usage_output_insertion`: a completed token-activity card or a pending rate-limit reset hint. If either exists, it sends `CommitPendingUsageOutputAfterStreamShutdown` to the app event channel.
 
-**Call relations**: Used by stream shutdown paths that need a separate app-event variant. It plays the same scheduling role as `request_pending_usage_output_insertion` but for a different point in the stream lifecycle.
+**Call relations**: This is used around stream shutdown, where insertion must happen only after streaming state is fully cleared. It tells the event loop to retry the pending usage-output commit in that safer phase.
 
 
 ##### `ChatWidget::clear_pending_token_activity_refreshes`  (lines 280–287)
@@ -5708,22 +5744,22 @@ fn request_pending_usage_output_insertion_after_stream_shutdown(&self)
 fn clear_pending_token_activity_refreshes(&mut self)
 ```
 
-**Purpose**: Drops both in-flight and completed token-activity cards when they are no longer valid, such as after transcript resets or replacement flows. If anything was cleared, it also triggers the necessary UI refresh bookkeeping.
+**Purpose**: Drops any temporary or completed token-activity cards that should no longer affect the transcript. This is important after resets, backtracking, or replacement flows where old background results must be ignored.
 
-**Data flow**: Mutably takes `self.refreshing_token_activity_output` and `self.completed_token_activity_output`, recording whether either existed. If at least one was removed, it bumps active-cell revision and requests redraw; otherwise it leaves the widget untouched.
+**Data flow**: It removes the current refreshing output and the completed output, if they exist. If anything was actually cleared, it marks the active display as changed and requests a redraw. It does not cancel a background request directly, but it removes the widget-owned card that the result would have completed.
 
-**Call relations**: Called by transcript-management flows that invalidate widget-owned transient usage state. It prevents late backend responses from updating cards that should no longer exist.
+**Call relations**: This is called when the chat state changes in a way that makes pending `/usage` cards obsolete. Later calls to `ChatWidget::finish_token_activity_refresh` for those old requests will not find matching pending output, so they cannot mutate visible history.
 
 
 ### `tui/src/chatwidget/usage.rs`
 
-`domain_logic` · `request handling`
+`domain_logic` · `startup, user menu interaction, and async server response handling`
 
-This module manages a small popup-driven workflow around account usage and rate-limit reset credits. `open_usage_menu` shows a two-item selection view: one action opens token activity, the other opens the reset-credit flow. Whether the reset action is enabled and how it is described depends on account eligibility (`has_chatgpt_account` and non-workspace plan) plus any cached `available_rate_limit_reset_credits`.
+This file is the user-interface flow for `/usage` inside the terminal chat widget. Its main job is to let a person view token usage or redeem a rate-limit reset, which is like using a spare ticket to clear current usage limits. Without this file, the app might still know about resets in the background, but users would not get a clear menu, loading state, success message, retry option, or startup hint.
 
-The reset-credit flow is request-id based to avoid stale async responses mutating the wrong popup. `show_rate_limit_reset_loading_popup`, `show_rate_limit_reset_consuming_popup`, and `start_rate_limit_reset_startup_check` each allocate a monotonically wrapping request id via `take_next_rate_limit_reset_request_id`, store it in the appropriate pending field, and clear any pending transcript hint first. Completion methods reject mismatched ids early. Refresh completion either replaces the popup with a confirmation view, a simple message view, or leaves it unchanged on stale responses. Consumption completion distinguishes successful reset/already-redeemed outcomes from `NothingToReset`, `NoCredit`, and transport errors; success transitions into a second loading popup so remaining credits can be refreshed, while errors offer a retry action that reuses the same idempotency key.
+The code works like a small receptionist. When the user opens the usage menu, it builds a menu with “Show usage” and “Redeem rate limit reset.” If the app needs to ask the server how many resets are available, it shows a loading popup and records a request number. That request number matters because server replies can arrive late; the widget only accepts the reply that matches the latest request.
 
-The file also manages a transient `pending_rate_limit_reset_hint` rendered like an info history cell. Startup refresh can populate this hint only for authenticated non-workspace users with positive available credits. Clearing or taking the hint bumps the transcript active-cell revision so overlay caches notice the change.
+If resets are available, the file builds a confirmation popup. Choosing “Use a reset” sends an app event with an idempotency key, which is a unique safety label that helps avoid charging the same reset twice if a request is retried. After a reset succeeds, the file shows another loading screen while it refreshes the remaining count. It also supports a startup hint that tells users they have resets available, then removes that hint once it is no longer needed.
 
 #### Function details
 
@@ -5733,11 +5769,11 @@ The file also manages a transient `pending_rate_limit_reset_hint` rendered like 
 fn open_usage_menu(&mut self)
 ```
 
-**Purpose**: Shows the top-level usage popup with actions to view token usage or redeem a rate-limit reset. It computes reset eligibility and descriptive text from account state and cached credit availability.
+**Purpose**: Opens the Usage menu in the bottom pane. It gives the user a choice between viewing token activity and redeeming a rate-limit reset, while disabling the reset option when the account is not eligible.
 
-**Data flow**: Clears any pending reset hint, reads `has_chatgpt_account`, `plan_type`, and `available_rate_limit_reset_credits`, derives whether reset redemption should be enabled plus a description string, builds a `SelectionViewParams` with two `SelectionItem`s that send `AppEvent::OpenTokenActivity` or `AppEvent::OpenRateLimitResetCredits`, shows the selection view in the bottom pane, requests redraw, and returns nothing.
+**Data flow**: It reads the account type, plan type, and any known number of available reset credits. From that, it builds menu text and enabled or disabled menu items, clears any pending reset hint, shows the menu, and asks the screen to redraw.
 
-**Call relations**: Called when the user opens the usage UI. It is the entrypoint into the popup-based usage/reset workflow and delegates actual actions to emitted `AppEvent`s.
+**Call relations**: This is the front door for the usage flow. Before showing the menu, it asks `ChatWidget::clear_pending_rate_limit_reset_hint` to remove any old hint so the popup and chat history do not compete for attention. The menu actions then hand off to app-level events for token activity or reset-credit checking.
 
 *Call graph*: calls 1 internal fn (clear_pending_rate_limit_reset_hint); 3 external calls (default, format!, vec!).
 
@@ -5748,11 +5784,11 @@ fn open_usage_menu(&mut self)
 fn show_rate_limit_reset_loading_popup(&mut self) -> u64
 ```
 
-**Purpose**: Shows a loading popup while the widget checks how many rate-limit reset credits are available. It also establishes the request id that later refresh results must match.
+**Purpose**: Shows a temporary popup while the app checks how many rate-limit resets the user has. It also creates a request number so the later server reply can be matched to this exact check.
 
-**Data flow**: Clears any pending reset hint, allocates a new request id via `take_next_rate_limit_reset_request_id`, stores it in `pending_rate_limit_reset_request_id`, shows a disabled 'Loading...' selection view under the reset popup id, requests redraw, and returns the request id.
+**Data flow**: It clears any existing hint, takes the next request ID, stores it as the pending reset request, builds a disabled “Loading...” selection view, displays it, redraws the screen, and returns the request ID to the caller.
 
-**Call relations**: Used when beginning an explicit refresh of reset-credit availability. Later `finish_rate_limit_reset_credits_refresh` calls must present the same request id to update this popup.
+**Call relations**: This starts the visible refresh flow after the user asks to redeem a reset. It relies on `ChatWidget::take_next_rate_limit_reset_request_id` for a fresh tracking number and later expects `ChatWidget::finish_rate_limit_reset_credits_refresh` to receive the matching response.
 
 *Call graph*: calls 2 internal fn (clear_pending_rate_limit_reset_hint, take_next_rate_limit_reset_request_id); 2 external calls (default, vec!).
 
@@ -5767,11 +5803,11 @@ fn finish_rate_limit_reset_credits_refresh(
     ) -> bool
 ```
 
-**Purpose**: Completes the availability-refresh step for rate-limit reset credits and replaces the loading popup with either a confirmation or message view. It ignores stale responses whose request id no longer matches.
+**Purpose**: Finishes the check for available reset credits and replaces the loading popup with either a confirmation screen or an explanatory message. It ignores replies that do not belong to the current pending request.
 
-**Data flow**: Takes a `request_id` and `Result<RateLimitResetCreditsSummary, String>`. If the id does not equal `pending_rate_limit_reset_request_id`, it returns `false`. Otherwise it clears the pending id, updates `available_rate_limit_reset_credits` on success, chooses popup params: confirmation when `available_count > 0`, a no-credits message when zero, or a generic failure message on error. It asks the bottom pane to replace the popup if present, requests redraw only when replacement occurred, and returns whether replacement happened.
+**Data flow**: It receives a request ID and either a reset-credit summary or an error message. If the ID is stale, it returns `false` and changes nothing. If it matches, it clears the pending request, stores the available count on success, chooses the right popup content, replaces the existing popup if it is still visible, redraws if needed, and returns whether the popup was replaced.
 
-**Call relations**: This is the completion counterpart to `show_rate_limit_reset_loading_popup`. It delegates popup construction to `rate_limit_reset_confirmation_params` or `rate_limit_reset_message_params`.
+**Call relations**: This is the follow-up to `ChatWidget::show_rate_limit_reset_loading_popup`. When credits are available it uses `ChatWidget::rate_limit_reset_confirmation_params`; otherwise it uses `ChatWidget::rate_limit_reset_message_params` to explain that there are no credits or that loading failed.
 
 *Call graph*: 2 external calls (rate_limit_reset_confirmation_params, rate_limit_reset_message_params).
 
@@ -5782,11 +5818,11 @@ fn finish_rate_limit_reset_credits_refresh(
 fn rate_limit_reset_confirmation_params(available_count: i64) -> SelectionViewParams
 ```
 
-**Purpose**: Builds the confirmation popup shown when the user has at least one reset credit available. It embeds a fresh idempotency key into the 'Use a reset' action.
+**Purpose**: Builds the confirmation popup shown when the user has reset credits available. It prepares the “Use a reset” action and a safer default selection of “Cancel.”
 
-**Data flow**: Takes `available_count: i64`, generates a UUID string idempotency key, constructs `SelectionViewParams` with a subtitle describing the available count, a 'Use a reset' item that sends `AppEvent::ConsumeRateLimitResetCredit { idempotency_key }`, and a 'Cancel' item, sets the initial selection to Cancel, and returns the params.
+**Data flow**: It receives the available reset count, creates a fresh unique idempotency key, and returns popup settings with a title, count summary, footer hint, a “Use a reset” item, and a “Cancel” item. Selecting “Use a reset” sends an app event carrying the unique key.
 
-**Call relations**: Used by `finish_rate_limit_reset_credits_refresh` to replace the loading popup with a redeem-or-cancel confirmation view.
+**Call relations**: This helper is used by `ChatWidget::finish_rate_limit_reset_credits_refresh` after the server says credits exist. It hands control back to the larger app by wiring the menu action to a consume-reset event.
 
 *Call graph*: 4 external calls (default, new_v4, format!, vec!).
 
@@ -5797,11 +5833,11 @@ fn rate_limit_reset_confirmation_params(available_count: i64) -> SelectionViewPa
 fn rate_limit_reset_message_params(message: &str) -> SelectionViewParams
 ```
 
-**Purpose**: Builds a simple one-button informational popup for the rate-limit reset flow. It is used for no-credit, success, and generic error messages.
+**Purpose**: Builds a simple informational popup for the rate-limit reset flow. It is used when there is nothing for the user to choose except closing the message.
 
-**Data flow**: Takes a message `&str`, constructs `SelectionViewParams` with the reset popup id, a fixed title, the provided subtitle, and a single dismissing 'Close' item, then returns the params.
+**Data flow**: It takes a message string, places it in the popup subtitle, adds a single “Close” item, and returns the completed popup settings.
 
-**Call relations**: Used by several completion paths whenever the flow should end in an informational message rather than another action choice.
+**Call relations**: Several finish functions use this helper when the flow ends with a plain explanation, such as no credits available, nothing to reset, a loading failure, or final success.
 
 *Call graph*: 2 external calls (default, vec!).
 
@@ -5812,11 +5848,11 @@ fn rate_limit_reset_message_params(message: &str) -> SelectionViewParams
 fn show_rate_limit_reset_consuming_popup(&mut self) -> u64
 ```
 
-**Purpose**: Shows a non-cancelable loading popup while a reset credit is being redeemed. It also establishes the request id for the consume operation.
+**Purpose**: Shows a non-cancelable popup while the app is actively redeeming a reset credit. This prevents the user from starting another conflicting action while the reset is in progress.
 
-**Data flow**: Clears any pending reset hint, allocates a new request id, stores it in `pending_rate_limit_reset_request_id`, shows a reset popup with subtitle 'Resetting your usage...' and a disabled 'Using a reset...' item, sets `allow_cancel = false`, requests redraw, and returns the request id.
+**Data flow**: It clears any old hint, gets and stores a new request ID, creates a disabled “Using a reset...” popup, marks it as not cancelable, displays it, redraws the screen, and returns the request ID.
 
-**Call relations**: Used when the user confirms redemption. Later `finish_rate_limit_reset_consume` must present the same request id to update this popup.
+**Call relations**: This begins the redeem step after the user has chosen to use a reset. It uses `ChatWidget::take_next_rate_limit_reset_request_id` for tracking, and the matching result is later handled by `ChatWidget::finish_rate_limit_reset_consume`.
 
 *Call graph*: calls 2 internal fn (clear_pending_rate_limit_reset_hint, take_next_rate_limit_reset_request_id); 2 external calls (default, vec!).
 
@@ -5832,11 +5868,11 @@ fn finish_rate_limit_reset_consume(
     ) -> bo
 ```
 
-**Purpose**: Completes the consume-reset request, branching among success, no-op outcomes, no-credit outcomes, and retryable transport failures. It updates cached credit availability and popup contents accordingly.
+**Purpose**: Processes the server's answer after the user tries to redeem a reset. It shows success, explains why no reset happened, or offers a retry if the request failed.
 
-**Data flow**: Takes a `request_id`, `idempotency_key`, and `Result<ConsumeAccountRateLimitResetCreditResponse, String>`. If the request id is stale it returns `false`. On successful `Reset` or `AlreadyRedeemed`, it clears cached available credits, replaces the popup with a success-loading view for the follow-up refresh, and returns `true`. On successful `NothingToReset` or `NoCredit`, it clears the pending id, optionally caches zero credits, replaces the popup with an informational message, and returns `false`. On error, it clears the pending id and replaces the popup with a retry/close view whose retry action resends `ConsumeRateLimitResetCredit` with the same idempotency key, then returns `false`.
+**Data flow**: It receives the request ID, the idempotency key used for the redeem attempt, and either a server response or an error. If the ID is not current, it returns `false`. If the reset succeeded or was already redeemed, it clears the known credit count, switches to a success-and-refreshing popup, and returns `true`. If the server says there was nothing to reset or no credit, it clears the pending request, shows a message, and returns `false`. If there was an error, it clears the pending request and shows “Try again” and “Close”; retrying reuses the same idempotency key.
 
-**Call relations**: This is the completion counterpart to `show_rate_limit_reset_consuming_popup`. It delegates popup replacement to `replace_rate_limit_reset_popup` and uses `rate_limit_reset_success_loading_params` or `rate_limit_reset_message_params` depending on outcome.
+**Call relations**: This is the main decision point after `ChatWidget::show_rate_limit_reset_consuming_popup`. It uses `ChatWidget::replace_rate_limit_reset_popup` to update the visible popup, `ChatWidget::rate_limit_reset_success_loading_params` when a follow-up refresh is needed, and `ChatWidget::rate_limit_reset_message_params` for final explanatory messages.
 
 *Call graph*: calls 1 internal fn (replace_rate_limit_reset_popup); 6 external calls (default, rate_limit_reset_message_params, rate_limit_reset_success_loading_params, matches!, unreachable!, vec!).
 
@@ -5851,11 +5887,11 @@ fn finish_post_consume_reset_credits_refresh(
     ) -> bool
 ```
 
-**Purpose**: Completes the follow-up refresh after a successful reset redemption and shows the final remaining-credit message. It also ignores stale responses by request id.
+**Purpose**: Finishes the extra refresh that happens after a successful reset, so the user can see how many resets remain. Even if the refresh fails, it still tells the user that the reset happened.
 
-**Data flow**: Takes a `request_id` and `Result<RateLimitResetCreditsSummary, String>`. If the id is stale it returns `false`. Otherwise it clears the pending id, updates `available_rate_limit_reset_credits` on success, builds either a message like 'Usage reset. You have N resets left.' or the fallback 'Usage reset.', replaces the popup with that message view, and returns `true`.
+**Data flow**: It receives a request ID and either a fresh reset-credit summary or an error. If the ID is stale, it returns `false`. If it matches, it clears the pending request, updates the stored count when available, builds a final success message, replaces the popup, and returns `true`.
 
-**Call relations**: Used after `finish_rate_limit_reset_consume` transitions into the success-loading popup. It finalizes the happy-path flow by replacing that loading state with a terminal message.
+**Call relations**: This follows the success path from `ChatWidget::finish_rate_limit_reset_consume`. It uses `ChatWidget::rate_limit_reset_message_params` to build the final closeable message and `ChatWidget::replace_rate_limit_reset_popup` to put that message on screen.
 
 *Call graph*: calls 1 internal fn (replace_rate_limit_reset_popup); 2 external calls (rate_limit_reset_message_params, format!).
 
@@ -5866,11 +5902,11 @@ fn finish_post_consume_reset_credits_refresh(
 fn rate_limit_reset_success_loading_params() -> SelectionViewParams
 ```
 
-**Purpose**: Builds the intermediate non-cancelable popup shown after a reset succeeds but before remaining credits are refreshed. It communicates that the reset worked and a follow-up check is in progress.
+**Purpose**: Builds the interim popup shown right after a reset succeeds while the app checks the remaining reset count. It tells the user that the important action worked and that a refresh is still underway.
 
-**Data flow**: Constructs and returns `SelectionViewParams` with the reset popup id, a fixed title, subtitle 'Usage reset. Checking your remaining resets...', a disabled 'Refreshing...' item, and `allow_cancel = false`.
+**Data flow**: It creates popup settings with a success message, a disabled “Refreshing...” row, and cancellation turned off, then returns those settings.
 
-**Call relations**: Used by `finish_rate_limit_reset_consume` for successful or already-redeemed outcomes before the post-consume refresh completes.
+**Call relations**: This helper is used by `ChatWidget::finish_rate_limit_reset_consume` when the server confirms the reset. It prepares the screen for the next step, which is handled by `ChatWidget::finish_post_consume_reset_credits_refresh`.
 
 *Call graph*: 2 external calls (default, vec!).
 
@@ -5881,11 +5917,11 @@ fn rate_limit_reset_success_loading_params() -> SelectionViewParams
 fn replace_rate_limit_reset_popup(&mut self, params: SelectionViewParams)
 ```
 
-**Purpose**: Replaces the currently visible rate-limit reset popup if it is still present and redraws only when replacement succeeds. It centralizes the popup-update-and-redraw pattern.
+**Purpose**: Replaces the current rate-limit reset popup if it is still open. It is a small safety wrapper that redraws the screen only when something actually changed.
 
-**Data flow**: Takes `SelectionViewParams`, asks `bottom_pane.replace_selection_view_if_present` to replace the popup identified by `RATE_LIMIT_RESET_VIEW_ID`, requests redraw if replacement occurred, and returns nothing.
+**Data flow**: It receives new popup settings, asks the bottom pane to replace the popup with the rate-limit reset view ID, and requests a redraw if the replacement happened.
 
-**Call relations**: Called by `finish_rate_limit_reset_consume` and `finish_post_consume_reset_credits_refresh` to update the existing popup in place.
+**Call relations**: Both `ChatWidget::finish_rate_limit_reset_consume` and `ChatWidget::finish_post_consume_reset_credits_refresh` call this when a server response changes what the user should see next.
 
 *Call graph*: called by 2 (finish_post_consume_reset_credits_refresh, finish_rate_limit_reset_consume).
 
@@ -5896,11 +5932,11 @@ fn replace_rate_limit_reset_popup(&mut self, params: SelectionViewParams)
 fn start_rate_limit_reset_startup_check(&mut self) -> u64
 ```
 
-**Purpose**: Begins the background startup check for available reset credits and records the hint-refresh request id. It clears any stale hint before starting.
+**Purpose**: Starts a quiet startup check for reset credits. This is used to decide whether the chat should later show a helpful hint that resets are available.
 
-**Data flow**: Clears any pending reset hint, allocates a new request id, stores it in `pending_rate_limit_reset_hint_request_id`, and returns the id.
+**Data flow**: It clears any previous hint state, creates a new request ID, stores it as the pending hint request, and returns the ID so the server reply can be matched later.
 
-**Call relations**: Used during startup or auth-refresh flows that want to populate the passive transcript hint rather than open a popup.
+**Call relations**: This begins the background hint flow during startup. It uses `ChatWidget::take_next_rate_limit_reset_request_id` for tracking, and the matching response is processed by `ChatWidget::finish_rate_limit_reset_hint_refresh`.
 
 *Call graph*: calls 2 internal fn (clear_pending_rate_limit_reset_hint, take_next_rate_limit_reset_request_id).
 
@@ -5915,11 +5951,11 @@ fn finish_rate_limit_reset_hint_refresh(
     ) -> bool
 ```
 
-**Purpose**: Completes the startup/background refresh for reset-credit availability and optionally installs a passive transcript hint. It respects auth and workspace-account gating.
+**Purpose**: Finishes the startup reset-credit check and, when appropriate, creates a chat hint telling the user they have resets available. It avoids showing the hint for signed-out users or workspace accounts.
 
-**Data flow**: Takes a `request_id` and `Result<RateLimitResetCreditsSummary, String>`. If the id is stale it returns `false`. Otherwise it clears `pending_rate_limit_reset_hint_request_id`, returns `false` immediately if backend auth is unavailable, returns `true` without hinting for workspace accounts, and on successful responses caches `available_rate_limit_reset_credits` and calls `set_rate_limit_reset_available_hint(response.available_count)`. It returns `true` once the response was accepted, even if no hint was shown.
+**Data flow**: It receives a request ID and either a reset-credit summary or an error. If the ID is not the pending hint request, it returns `false`. If it matches, it clears the pending hint request, checks whether the account should see hints, stores the available count on success, creates a hint when the count is positive, and returns whether the response was accepted.
 
-**Call relations**: This is the completion counterpart to `start_rate_limit_reset_startup_check`. It delegates actual hint creation to `set_rate_limit_reset_available_hint`.
+**Call relations**: This is the response side of `ChatWidget::start_rate_limit_reset_startup_check`. When a useful positive count comes back, it hands off to `ChatWidget::set_rate_limit_reset_available_hint` to create the visible chat-history notice.
 
 *Call graph*: calls 1 internal fn (set_rate_limit_reset_available_hint).
 
@@ -5930,11 +5966,11 @@ fn finish_rate_limit_reset_hint_refresh(
 fn clear_pending_rate_limit_reset_requests(&mut self)
 ```
 
-**Purpose**: Clears all in-flight reset-credit request tracking, cached availability, pending hint state, and any visible reset popup. It is the full reset path for this feature’s local state.
+**Purpose**: Clears all in-progress rate-limit reset state and dismisses the reset popup. This is useful when the account or session state changes and old reset information should no longer be trusted.
 
-**Data flow**: Sets `pending_rate_limit_reset_request_id = None`, `available_rate_limit_reset_credits = None`, calls `clear_pending_rate_limit_reset_hint()`, dismisses the reset popup by id from the bottom pane, and returns nothing.
+**Data flow**: It removes the pending reset request ID, forgets the cached available credit count, clears any pending hint, and asks the bottom pane to close the rate-limit reset popup.
 
-**Call relations**: Used when account/session state changes or the feature needs to be fully reset so no stale popup or hint survives.
+**Call relations**: This is the broad cleanup path. It uses `ChatWidget::clear_pending_rate_limit_reset_hint` so both normal popups and background hints are reset together.
 
 *Call graph*: calls 1 internal fn (clear_pending_rate_limit_reset_hint).
 
@@ -5945,11 +5981,11 @@ fn clear_pending_rate_limit_reset_requests(&mut self)
 fn clear_pending_rate_limit_reset_hint(&mut self)
 ```
 
-**Purpose**: Removes any pending passive reset hint and invalidates transcript overlay caches if one was present. It also clears the associated hint-refresh request id.
+**Purpose**: Removes any pending chat-history hint about available reset credits. If removing the hint changes what is displayed, it marks the chat cell as changed and redraws the screen.
 
-**Data flow**: Sets `pending_rate_limit_reset_hint_request_id = None`, takes and discards `pending_rate_limit_reset_hint`, and if a hint actually existed bumps the active-cell revision and requests redraw. It returns nothing.
+**Data flow**: It clears the pending hint request ID and takes the stored hint out of the widget. If a hint was actually present, it bumps the display revision and requests a redraw.
 
-**Call relations**: Called before opening usage/reset popups and when clearing all pending reset state, so stale passive hints do not coexist with active reset UI.
+**Call relations**: This cleanup helper is called before opening the usage menu, before showing reset loading or consuming popups, before startup checks, and during full reset cleanup. That keeps old hints from lingering after the user starts a more direct reset flow.
 
 *Call graph*: called by 5 (clear_pending_rate_limit_reset_requests, open_usage_menu, show_rate_limit_reset_consuming_popup, show_rate_limit_reset_loading_popup, start_rate_limit_reset_startup_check).
 
@@ -5960,11 +5996,11 @@ fn clear_pending_rate_limit_reset_hint(&mut self)
 fn pending_rate_limit_reset_hint(&self) -> Option<&PlainHistoryCell>
 ```
 
-**Purpose**: Returns a shared reference to the currently pending passive reset hint, if any. It is a read-only accessor for transcript rendering code.
+**Purpose**: Returns the current reset-available hint without removing it. Other parts of the chat UI can use this to decide whether there is a hint ready to display.
 
-**Data flow**: Reads `self.pending_rate_limit_reset_hint` and returns `Option<&PlainHistoryCell>`. It does not mutate state.
+**Data flow**: It reads the optional stored hint and returns a borrowed view of it if one exists. It does not change the widget.
 
-**Call relations**: Used by rendering paths that need to know whether a passive reset hint should be displayed alongside transcript content.
+**Call relations**: This is a read-only access point for the hint created by `ChatWidget::set_rate_limit_reset_available_hint`. It lets display code look at the hint without consuming it.
 
 
 ##### `ChatWidget::take_pending_rate_limit_reset_hint`  (lines 346–350)
@@ -5973,11 +6009,11 @@ fn pending_rate_limit_reset_hint(&self) -> Option<&PlainHistoryCell>
 fn take_pending_rate_limit_reset_hint(&mut self) -> Option<PlainHistoryCell>
 ```
 
-**Purpose**: Consumes and returns the pending passive reset hint, invalidating transcript overlay caches when one is removed. It is the mutable counterpart to the read-only accessor.
+**Purpose**: Removes and returns the pending reset-available hint. This is used when the hint is being moved into the visible chat history.
 
-**Data flow**: Takes `self.pending_rate_limit_reset_hint`; if absent returns `None`. If present, bumps the active-cell revision and returns `Some(PlainHistoryCell)`. It mutates hint storage and cache-invalidation state.
+**Data flow**: It tries to take the stored hint. If none exists, it returns nothing. If one exists, it removes it, marks the active cell as changed, and returns the hint object.
 
-**Call relations**: Used when the hint is being moved out of pending state into another transcript/rendering location.
+**Call relations**: This is the consuming partner to `ChatWidget::pending_rate_limit_reset_hint`. After `ChatWidget::set_rate_limit_reset_available_hint` creates a hint, another part of the chat widget can call this to claim it for display.
 
 
 ##### `ChatWidget::set_rate_limit_reset_available_hint`  (lines 352–365)
@@ -5986,11 +6022,11 @@ fn take_pending_rate_limit_reset_hint(&mut self) -> Option<PlainHistoryCell>
 fn set_rate_limit_reset_available_hint(&mut self, available_count: i64)
 ```
 
-**Purpose**: Installs a passive info-style transcript hint advertising available reset credits, but only when the count is positive. It also invalidates transcript overlay caches so the hint becomes visible.
+**Purpose**: Creates a friendly chat hint when the user has one or more reset credits available. The hint tells the user to run `/usage` if they want to use one.
 
-**Data flow**: Takes `available_count: i64`, returns early if the count is nonpositive, otherwise creates an info history cell with text like 'You have N resets available. Run /usage to use one.', stores it in `pending_rate_limit_reset_hint`, bumps the active-cell revision, requests redraw, and returns nothing.
+**Data flow**: It receives an available count. If the count is zero or negative, it does nothing. Otherwise, it builds an informational history cell, stores it as the pending hint, bumps the display revision, and requests a redraw.
 
-**Call relations**: Called by `finish_rate_limit_reset_hint_refresh` after a successful background refresh for eligible users.
+**Call relations**: This is called by `ChatWidget::finish_rate_limit_reset_hint_refresh` after a successful background check. It creates the hint that can later be read or taken by the chat display flow.
 
 *Call graph*: called by 1 (finish_rate_limit_reset_hint_refresh); 2 external calls (format!, new_info_event).
 
@@ -6001,11 +6037,11 @@ fn set_rate_limit_reset_available_hint(&mut self, available_count: i64)
 fn take_next_rate_limit_reset_request_id(&mut self) -> u64
 ```
 
-**Purpose**: Allocates the next request id for reset-credit operations using wrapping arithmetic. It provides simple monotonic correlation for async popup and hint refreshes.
+**Purpose**: Provides the next tracking number for a rate-limit reset request. These numbers help the widget ignore late replies from older requests.
 
-**Data flow**: Reads `next_rate_limit_reset_request_id`, returns the current value, then increments the stored counter with `wrapping_add(1)`. It mutates only the counter field.
+**Data flow**: It reads the current next request ID, increments the stored counter with wraparound behavior, and returns the original value as the ID for the new request.
 
-**Call relations**: Used by popup-opening and startup-check methods to tag each async reset-credit request so stale responses can be ignored.
+**Call relations**: This helper is used whenever the file starts an async reset-related check: loading credits, consuming a reset, or doing the startup hint check. The returned ID is later compared by the corresponding finish function.
 
 *Call graph*: called by 3 (show_rate_limit_reset_consuming_popup, show_rate_limit_reset_loading_popup, start_rate_limit_reset_startup_check).
 
@@ -6016,8 +6052,8 @@ fn take_next_rate_limit_reset_request_id(&mut self) -> u64
 fn reset_label(count: i64) -> &'static str
 ```
 
-**Purpose**: Returns the singular or plural label for a rate-limit reset count. It keeps user-facing strings grammatically correct.
+**Purpose**: Chooses the correct singular or plural label for reset credits. It keeps user-facing messages grammatically correct.
 
-**Data flow**: Takes `count: i64` and returns the static string `"rate-limit reset"` when the count is exactly 1, otherwise `"rate-limit resets"`. It does not mutate state.
+**Data flow**: It receives a count. If the count is exactly one, it returns “rate-limit reset”; otherwise it returns “rate-limit resets.”
 
-**Call relations**: Used throughout this file when constructing subtitles and hint text that mention the number of available resets.
+**Call relations**: This small formatting helper supports the menu, confirmation popup, success message, and startup hint wherever the reset count is shown to the user.

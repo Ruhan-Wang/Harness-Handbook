@@ -1,12 +1,6 @@
 # Early process hardening and runtime bootstrap  `stage-2`
 
-This stage is the earliest bootstrap layer, running before the application enters its main logic. Its job is to make the process safe, deterministic, and correctly shaped for everything that follows: it hardens the OS process, fixes global crypto/TLS behavior, and establishes the execution environment and runtime scaffolding that later stages assume already exist.
-
-process-hardening/src/lib.rs runs first to reduce attack surface during startup. It applies platform-specific protections such as disabling core dumps or debugger attachment where supported, and strips dangerous dynamic-loader environment variables so inherited process state cannot redirect libraries or otherwise tamper with execution.
-
-utils/rustls-provider/src/lib.rs then performs a one-time, process-wide rustls initialization, forcing use of the aws-lc-rs provider and checking that the selected backend supports the required signature scheme. This prevents ambiguous crypto backend selection later.
-
-arg0/src/lib.rs ties the bootstrap together at the executable boundary. It interprets argv[0]/argv[1] to dispatch the single binary as multiple helper commands, creates temporary PATH aliases so re-execed subprocesses resolve consistently, and initializes the process environment and Tokio runtime in a way that preserves those aliases for the rest of the program’s lifetime.
+This stage happens at the very start, before Codex begins its real work. It is like locking the workshop, choosing the right power supply, and arranging the tool bench before anyone starts building. The process-hardening code tightens the running program’s defenses. On supported operating systems, it blocks or limits common ways another tool might inspect memory, create crash dumps, or tamper with the process. The rustls-provider code sets up the cryptography engine used by rustls, the library that makes secure TLS network connections. This matters because more than one engine may be available, and the program must choose one global provider early and consistently. The arg0 code shapes how the executable presents itself at launch. A single Codex binary can act like different helper programs depending on the name or hidden startup argument used. It also prepares early environment details, such as PATH aliases and .env variables, so later runtime setup can start from a predictable state.
 
 ## Files in this stage
 
@@ -15,13 +9,9 @@ Apply the earliest OS-level protections and environment sanitization before broa
 
 ### `process-hardening/src/lib.rs`
 
-`util` · `startup`
+`domain_logic` · `startup, before main program logic`
 
-This crate is intended to run as early as possible, ideally from a constructor before `main`, so hostile environment state or debugger attachment opportunities are reduced before the rest of the application initializes. `pre_main_hardening` is the cross-platform dispatcher: compile-time `cfg` gates select Linux/Android, macOS, BSD, or Windows behavior.
-
-On Linux/Android, `pre_main_hardening_linux` calls `libc::prctl(PR_SET_DUMPABLE, 0, ...)` to mark the process non-dumpable, exits with a dedicated code if that fails, then sets `RLIMIT_CORE` to zero and removes all environment variables whose raw byte keys start with `LD_`. macOS uses `ptrace(PT_DENY_ATTACH, ...)` instead, then also zeroes core limits and removes `DYLD_` variables. BSD currently applies the core-limit and `LD_` cleanup subset. Windows is a stub. The separate public `disable_process_dumping` exposes just the Linux non-dumpable operation as a recoverable `std::io::Result<()>` rather than terminating.
-
-The Unix helpers are careful about non-UTF-8 environment keys. `env_keys_with_prefix` operates on `OsString` pairs and checks prefixes using raw bytes via `OsStrExt::as_bytes`, so loader variables with invalid UTF-8 are still detected. `remove_env_vars_with_prefix` first collects matching keys, then removes them, avoiding mutation during iteration. Tests specifically verify both non-UTF-8 handling and exact prefix filtering.
+This file is a small security guard that runs at the very beginning of the program, ideally before normal startup code. Its job is to make the process harder to spy on or alter. On Unix-like systems, a “core dump” is a file containing the program’s memory after a crash; this file can include secrets, so the code turns core dumps off. On Linux and Android it also asks the operating system to mark the process as non-dumpable, which helps stop other same-user processes from attaching with ptrace, a system feature used by debuggers to inspect a running program. On macOS it uses a similar ptrace setting to deny debugger attachment. It also removes environment variables such as LD_* or DYLD_*, which can influence how shared libraries are loaded and may be abused to inject code. Think of this file as locking doors and closing blinds before the application begins work. If one of the key hardening calls fails, the process prints an error and exits with a specific code, rather than continuing in a weaker security state. Windows currently has a placeholder, so no comparable hardening is applied there yet.
 
 #### Function details
 
@@ -31,11 +21,11 @@ The Unix helpers are careful about non-UTF-8 environment keys. `env_keys_with_pr
 fn pre_main_hardening()
 ```
 
-**Purpose**: Dispatches to the platform-appropriate hardening routine at process startup. Its behavior is entirely determined by compile-time target OS configuration.
+**Purpose**: Runs the right hardening steps for the current operating system. This is the single public starting point for early process protection.
 
-**Data flow**: It takes no arguments and, through `#[cfg]`-guarded branches, invokes exactly the relevant OS-specific function for the current target. It returns `()` and may terminate the process indirectly if a delegated hardening step fails.
+**Data flow**: It takes no input. At compile time, only the branch for the target operating system is included; at runtime it calls that platform’s hardening routine. It returns nothing, but the called routine may change process settings, remove environment variables, or exit if a critical protection cannot be enabled.
 
-**Call relations**: This is the crate’s top-level entry used by pre-main initialization code. It delegates all real work to the OS-specific helpers so each platform’s policy remains isolated.
+**Call relations**: This is the front door for the file’s behavior. It chooses between the Linux, macOS, BSD, and Windows routines, so callers do not need to know the platform details.
 
 *Call graph*: calls 4 internal fn (pre_main_hardening_bsd, pre_main_hardening_linux, pre_main_hardening_macos, pre_main_hardening_windows).
 
@@ -46,11 +36,11 @@ fn pre_main_hardening()
 fn pre_main_hardening_linux()
 ```
 
-**Purpose**: Applies Linux/Android hardening by disabling dumpability, zeroing core-dump limits, and clearing `LD_` environment variables. It treats failure of the dumpability or rlimit steps as fatal startup errors.
+**Purpose**: Applies Linux and Android startup protections. It prevents process dumping, disables core dumps, and removes LD_* environment variables that could affect library loading.
 
-**Data flow**: It calls `libc::prctl(PR_SET_DUMPABLE, 0, ...)`, checks the return code, and on nonzero prints the last OS error and exits with `PRCTL_FAILED_EXIT_CODE`. On success it calls `set_core_file_size_limit_to_zero()` and `remove_env_vars_with_prefix(b"LD_")`. It mutates process state via kernel syscalls and environment-variable removal.
+**Data flow**: It reads no ordinary input, but it talks to the operating system. First it calls prctl to mark the process as not dumpable; if that fails, it prints the operating system error and exits. Then it sets the core dump size limit to zero. Finally it scans the environment and removes variables whose names start with LD_.
 
-**Call relations**: Only `pre_main_hardening` invokes this, on Linux/Android builds. It delegates the shared core-limit and environment cleanup work to helper functions after performing the Linux-specific `prctl` step.
+**Call relations**: This is called by pre_main_hardening on Linux and Android builds. It delegates core dump blocking to set_core_file_size_limit_to_zero and environment cleanup to remove_env_vars_with_prefix.
 
 *Call graph*: calls 2 internal fn (remove_env_vars_with_prefix, set_core_file_size_limit_to_zero); called by 1 (pre_main_hardening); 3 external calls (eprintln!, prctl, exit).
 
@@ -61,11 +51,11 @@ fn pre_main_hardening_linux()
 fn disable_process_dumping() -> std::io::Result<()>
 ```
 
-**Purpose**: Provides a recoverable Linux-only API to mark the current process non-dumpable. Unlike the pre-main hardening path, it reports failure as an `io::Result` instead of exiting.
+**Purpose**: Marks the current Linux process as non-dumpable and reports success or failure to the caller. This is a reusable Linux-only helper for code that wants the ptrace/dump protection without running all startup cleanup.
 
-**Data flow**: It performs `libc::prctl(PR_SET_DUMPABLE, 0, ...)`, returning `Ok(())` when the syscall succeeds and `Err(std::io::Error::last_os_error())` otherwise. It changes kernel process state but does not touch environment variables or limits.
+**Data flow**: It takes no input. It asks the operating system, through prctl, to disable dumping for this process. It returns Ok if the system accepted the request, or an I/O error containing the last operating system error if it failed.
 
-**Call relations**: This function stands apart from the startup dispatcher as a reusable runtime primitive for Linux callers that want explicit error handling rather than process termination.
+**Call relations**: Unlike the pre-main Linux routine, this function does not exit the process on failure and does not remove environment variables. It stands alone as a safer, caller-controlled way to request just the dump-protection step.
 
 *Call graph*: 2 external calls (last_os_error, prctl).
 
@@ -76,11 +66,11 @@ fn disable_process_dumping() -> std::io::Result<()>
 fn pre_main_hardening_bsd()
 ```
 
-**Purpose**: Applies the BSD subset of hardening currently implemented: disabling core dumps and clearing `LD_` environment variables. It omits ptrace-specific logic present on Linux/macOS.
+**Purpose**: Applies the available startup protections on FreeBSD and OpenBSD. It turns off core dumps and removes LD_* environment variables.
 
-**Data flow**: It calls `set_core_file_size_limit_to_zero()` and `remove_env_vars_with_prefix(b"LD_")`, thereby mutating process resource limits and environment state. It returns `()`.
+**Data flow**: It takes no input. It first sets the process’s core dump limit to zero, then scans environment variable names and removes those beginning with LD_. It returns nothing unless a core-limit failure causes the process to exit.
 
-**Call relations**: The top-level dispatcher calls this on FreeBSD/OpenBSD targets. It reuses the shared Unix helpers rather than implementing BSD-specific low-level syscalls here.
+**Call relations**: This is called by pre_main_hardening on supported BSD systems. It reuses the shared Unix helpers for core dump prevention and environment cleanup.
 
 *Call graph*: calls 2 internal fn (remove_env_vars_with_prefix, set_core_file_size_limit_to_zero); called by 1 (pre_main_hardening).
 
@@ -91,11 +81,11 @@ fn pre_main_hardening_bsd()
 fn pre_main_hardening_macos()
 ```
 
-**Purpose**: Applies macOS hardening by denying debugger attachment, zeroing core-dump limits, and clearing `DYLD_` environment variables. Failure to deny attach or set limits is treated as fatal.
+**Purpose**: Applies macOS startup protections. It blocks debugger attachment, prevents core dumps, and removes DYLD_* environment variables that can affect dynamic library loading.
 
-**Data flow**: It calls `libc::ptrace(PT_DENY_ATTACH, 0, null_mut(), 0)`, checks for `-1`, and on failure prints the last OS error and exits with `PTRACE_DENY_ATTACH_FAILED_EXIT_CODE`. On success it calls `set_core_file_size_limit_to_zero()` and `remove_env_vars_with_prefix(b"DYLD_")`, mutating process state and environment.
+**Data flow**: It takes no input. It asks macOS, through ptrace with the deny-attach option, to prevent debuggers from attaching; if that fails, it prints an error and exits. Then it sets the core dump size limit to zero and removes environment variables whose names start with DYLD_.
 
-**Call relations**: Only `pre_main_hardening` invokes this on macOS builds. It combines a macOS-specific anti-debugging syscall with the shared Unix helpers for core-limit and environment cleanup.
+**Call relations**: This is called by pre_main_hardening on macOS builds. It hands shared work to set_core_file_size_limit_to_zero and remove_env_vars_with_prefix after performing the macOS-specific deny-attach call.
 
 *Call graph*: calls 2 internal fn (remove_env_vars_with_prefix, set_core_file_size_limit_to_zero); called by 1 (pre_main_hardening); 4 external calls (eprintln!, ptrace, exit, null_mut).
 
@@ -106,11 +96,11 @@ fn pre_main_hardening_macos()
 fn set_core_file_size_limit_to_zero()
 ```
 
-**Purpose**: Sets `RLIMIT_CORE` to zero so the process cannot produce core dumps. It is the shared Unix hardening primitive used across Linux, macOS, and BSD paths.
+**Purpose**: Turns off core dump files for the current process. This helps keep memory contents, which may include secrets, from being written to disk after a crash.
 
-**Data flow**: It constructs a `libc::rlimit { rlim_cur: 0, rlim_max: 0 }`, passes it to `libc::setrlimit(libc::RLIMIT_CORE, &rlim)`, and if the syscall fails prints the last OS error and exits with `SET_RLIMIT_CORE_FAILED_EXIT_CODE`. On success it returns `()` after mutating the process resource limit.
+**Data flow**: It creates a resource-limit setting where both the current and maximum core file sizes are zero. It gives that setting to the operating system with setrlimit. If the system rejects it, it prints the last operating system error and exits; otherwise it returns nothing after changing the process limit.
 
-**Call relations**: All Unix-family pre-main hardening routines delegate here after their platform-specific setup. Centralizing this logic keeps failure handling and exit-code behavior consistent.
+**Call relations**: The Linux, macOS, and BSD hardening routines call this as a shared safety step. It is deliberately strict: callers do not continue if the process cannot disable core dumps.
 
 *Call graph*: called by 3 (pre_main_hardening_bsd, pre_main_hardening_linux, pre_main_hardening_macos); 3 external calls (eprintln!, setrlimit, exit).
 
@@ -121,11 +111,11 @@ fn set_core_file_size_limit_to_zero()
 fn pre_main_hardening_windows()
 ```
 
-**Purpose**: Placeholder for future Windows-specific hardening behavior. It currently performs no actions.
+**Purpose**: Acts as the Windows placeholder for startup hardening. It currently does not apply any Windows-specific protections.
 
-**Data flow**: It takes no inputs, reads no state, writes no state, and returns `()`. The body is intentionally empty aside from a TODO comment.
+**Data flow**: It takes no input and makes no changes. It simply returns immediately.
 
-**Call relations**: The top-level dispatcher calls this on Windows builds so the API surface remains uniform even though no hardening steps are implemented yet.
+**Call relations**: pre_main_hardening calls this on Windows builds. Its presence keeps the platform dispatch structure complete, while leaving the actual Windows hardening work to be added later.
 
 *Call graph*: called by 1 (pre_main_hardening).
 
@@ -136,11 +126,11 @@ fn pre_main_hardening_windows()
 fn remove_env_vars_with_prefix(prefix: &[u8])
 ```
 
-**Purpose**: Removes all environment variables whose raw key bytes start with a given prefix. It is used to clear dynamic-loader injection variables such as `LD_*` and `DYLD_*`.
+**Purpose**: Removes environment variables whose names begin with a given byte prefix. This is used to clear variables that can influence dynamic library loading.
 
-**Data flow**: It takes a byte-slice prefix, reads the current environment via `std::env::vars_os()`, passes that iterator into `env_keys_with_prefix` to collect matching `OsString` keys, then iterates those keys and calls `std::env::remove_var` on each inside an unsafe block. It mutates process environment state.
+**Data flow**: It receives a prefix such as LD_ or DYLD_ as raw bytes. It reads all current environment variables, asks env_keys_with_prefix which names match, and then removes each matching variable from the process environment. It returns nothing, but the process environment is changed.
 
-**Call relations**: Linux, macOS, and BSD hardening routines all delegate here after deciding which prefix to scrub. It relies on `env_keys_with_prefix` so matching works even for non-UTF-8 keys.
+**Call relations**: The platform hardening routines call this after their operating-system protections are set. It relies on env_keys_with_prefix to find the exact variables to remove, including names that are not valid text.
 
 *Call graph*: calls 1 internal fn (env_keys_with_prefix); called by 3 (pre_main_hardening_bsd, pre_main_hardening_linux, pre_main_hardening_macos); 2 external calls (remove_var, vars_os).
 
@@ -151,11 +141,11 @@ fn remove_env_vars_with_prefix(prefix: &[u8])
 fn env_keys_with_prefix(vars: I, prefix: &[u8]) -> Vec<OsString>
 ```
 
-**Purpose**: Filters an iterator of environment entries down to keys whose raw bytes begin with a specified prefix. It is careful to operate on `OsString` values without requiring UTF-8 decoding.
+**Purpose**: Finds environment variable names that start with a chosen byte prefix. It is careful to work even when names are not valid UTF-8 text.
 
-**Data flow**: It accepts any iterator yielding `(OsString, OsString)` pairs plus a byte-slice prefix. It iterates entries, inspects each key’s bytes via `key.as_os_str().as_bytes()`, retains keys whose bytes start with the prefix, collects those keys into `Vec<OsString>`, and returns the vector.
+**Data flow**: It receives any collection of environment variable key-value pairs and a byte prefix. It looks only at the keys, compares their raw bytes with the prefix, and collects the matching keys into a list. It returns that list without changing the environment.
 
-**Call relations**: The environment-removal helper uses this to find keys to delete, and the unit tests call it directly to verify matching behavior for both ordinary and non-UTF-8 keys.
+**Call relations**: remove_env_vars_with_prefix uses this as its search step before deleting variables. The tests call it directly to prove that matching works both for normal names and unusual non-text names.
 
 *Call graph*: called by 3 (remove_env_vars_with_prefix, env_keys_with_prefix_filters_only_matching_keys, env_keys_with_prefix_handles_non_utf8_entries); 1 external calls (into_iter).
 
@@ -166,11 +156,11 @@ fn env_keys_with_prefix(vars: I, prefix: &[u8]) -> Vec<OsString>
 fn env_keys_with_prefix_handles_non_utf8_entries()
 ```
 
-**Purpose**: Verifies that prefix filtering works on non-UTF-8 environment keys and does not accidentally drop matching loader variables just because they are not valid Unicode. It specifically checks that only the non-UTF-8 key beginning with `LD_` is retained.
+**Purpose**: Tests that environment variable filtering still works when variable names or values are not valid UTF-8 text. This matters because Unix environment data is bytes, not guaranteed human-readable strings.
 
-**Data flow**: It constructs two non-UTF-8 `OsString` keys and a non-UTF-8 value, asserts that the keys cannot be converted into UTF-8 strings, passes the key/value pairs into `env_keys_with_prefix(..., b"LD_")`, and asserts that the returned vector contains exactly the matching `LD_` key.
+**Data flow**: It builds sample environment entries with non-UTF-8 bytes, including one key that starts with LD_. It passes them to env_keys_with_prefix and checks that only the matching LD_ key is returned. It changes no real process environment.
 
-**Call relations**: This test directly exercises the raw-byte matching logic in `env_keys_with_prefix`, guarding the Unix hardening path against regressions in non-UTF-8 environment handling.
+**Call relations**: This test exercises env_keys_with_prefix directly. It protects the cleanup logic from accidentally assuming all environment names can be converted into normal strings.
 
 *Call graph*: calls 1 internal fn (env_keys_with_prefix); 5 external calls (from_bytes, from_vec, assert!, assert_eq!, vec!).
 
@@ -181,11 +171,11 @@ fn env_keys_with_prefix_handles_non_utf8_entries()
 fn env_keys_with_prefix_filters_only_matching_keys()
 ```
 
-**Purpose**: Verifies that prefix filtering returns only keys with the requested prefix and ignores unrelated variables. It checks both the count and the exact retained key.
+**Purpose**: Tests that the prefix filter returns only keys with the requested prefix. It makes sure an LD_ search does not accidentally match unrelated names such as PATH or DYLD_FOO.
 
-**Data flow**: It builds a small vector of UTF-8-compatible `OsString` environment entries including `PATH`, `LD_TEST`, and `DYLD_FOO`, calls `env_keys_with_prefix(vars, b"LD_")`, and asserts that the result length is one and that the sole key equals `LD_TEST`.
+**Data flow**: It creates a small fake environment with PATH, LD_TEST, and DYLD_FOO. It asks env_keys_with_prefix for LD_ matches, then checks that the result contains exactly LD_TEST. It does not touch the real environment.
 
-**Call relations**: This test complements the non-UTF-8 case by validating ordinary matching semantics for the helper used by environment scrubbing.
+**Call relations**: This test calls env_keys_with_prefix directly. It verifies the basic selection behavior that remove_env_vars_with_prefix depends on before deleting real environment variables.
 
 *Call graph*: calls 1 internal fn (env_keys_with_prefix); 3 external calls (from_bytes, assert_eq!, vec!).
 
@@ -195,11 +185,13 @@ Install and validate the process-wide rustls crypto backend so later TLS use is 
 
 ### `utils/rustls-provider/src/lib.rs`
 
-`orchestration` · `startup or first TLS use`
+`orchestration` · `startup or before making TLS connections`
 
-This file contains a tiny but important compatibility shim for rustls provider initialization. The constant `REQUIRED_SIGNATURE_SCHEME` is set to `rustls::SignatureScheme::ECDSA_NISTP521_SHA512`, reflecting a capability needed for some enterprise TLS proxy certificates. `ensure_rustls_crypto_provider` uses a process-global `Once` to guarantee that initialization logic runs at most once. Inside that one-time block it attempts to install `rustls::crypto::aws_lc_rs::default_provider()` as the default provider. If installation fails, the function deliberately returns without panicking so that embedded hosts that already installed a provider keep working unchanged.
+Secure network connections need low-level cryptography code to check certificates and encrypt traffic. In this project, rustls can be built with more than one possible crypto provider, which is like having two different sets of tools in the same toolbox. When both are available, rustls refuses to guess which one to use.
 
-When installation succeeds, the code fetches the active default provider and asserts that it supports the required signature scheme by inspecting `signature_verification_algorithms.supported_schemes()`. The helper `provider_supports_required_signature_scheme` encapsulates that capability check. The overall design is intentionally best-effort with respect to preinstalled providers, but strict when this crate itself successfully installs aws-lc-rs: in that case the provider must expose P-521/SHA-512 verification support or the process aborts. This makes TLS behavior predictable across mixed dependency graphs where rustls cannot auto-select between `ring` and `aws-lc-rs`.
+This file gives the program a clear answer: use the aws-lc-rs provider if possible. That choice matters because aws-lc-rs supports some certificate signature types that the ring provider does not, including ECDSA P-521 with SHA-512. Some company TLS inspection proxies use certificates with that signature type, so choosing the narrower provider could make otherwise valid network connections fail.
+
+The main public function, ensure_rustls_crypto_provider, is safe to call many times. Internally it uses a Once, which is a small lock-like guard that makes sure setup runs only one time for the whole process. If another part of the host program already installed a rustls provider, this file does not overwrite it. But when it successfully installs aws-lc-rs itself, it immediately checks that the installed provider really supports the required certificate signature scheme. That turns a hidden TLS compatibility problem into an early, clear failure.
 
 #### Function details
 
@@ -209,11 +201,11 @@ When installation succeeds, the code fetches the active default provider and ass
 fn ensure_rustls_crypto_provider()
 ```
 
-**Purpose**: Installs the aws-lc-rs rustls crypto provider once per process and validates that the installed provider supports ECDSA P-521/SHA-512 verification. It preserves any provider that was already installed by someone else.
+**Purpose**: This function makes sure rustls has a process-wide crypto provider selected. Callers use it before doing TLS work so secure connections do not fail later because rustls could not choose between available providers.
 
-**Data flow**: It takes no arguments and executes its body inside a static `Once`. Within that closure it obtains `rustls::crypto::aws_lc_rs::default_provider()` and calls `install_default()`. If installation returns an error, the function exits early without changing global state. If installation succeeds, it reads the process-global provider via `CryptoProvider::get_default()`, panics if none is present, then asserts via `provider_supports_required_signature_scheme` that the provider's supported verification schemes include `REQUIRED_SIGNATURE_SCHEME`.
+**Data flow**: It takes no input from the caller. It creates a one-time setup guard, then on the first call tries to install the aws-lc-rs rustls provider as the global default. If installation fails because something else already installed a provider, it leaves that existing choice alone. If installation succeeds, it reads back the installed provider and checks that it supports the required ECDSA P-521/SHA-512 certificate signature scheme; if that check fails, the program stops with a clear error.
 
-**Call relations**: This is the public entrypoint used by tests and by any runtime code that needs rustls initialized deterministically. It delegates the capability check to `provider_supports_required_signature_scheme` after successful installation.
+**Call relations**: This is the public doorway for the file. Code elsewhere should call it before rustls is used. During its one-time setup it relies on the standard library's Once creation, then uses the helper provider_supports_required_signature_scheme to verify that the chosen provider has the certificate support this project expects.
 
 *Call graph*: 1 external calls (new).
 
@@ -224,11 +216,11 @@ fn ensure_rustls_crypto_provider()
 fn provider_supports_required_signature_scheme(provider: &rustls::crypto::CryptoProvider) -> bool
 ```
 
-**Purpose**: Checks whether a rustls crypto provider advertises support for the required signature verification scheme. It is a narrow predicate over provider capabilities.
+**Purpose**: This helper answers one focused question: does this rustls crypto provider support the certificate signature scheme the project requires? It keeps the compatibility check small and easy to read.
 
-**Data flow**: It takes a borrowed `rustls::crypto::CryptoProvider`, reads `provider.signature_verification_algorithms.supported_schemes()`, tests whether that slice contains `REQUIRED_SIGNATURE_SCHEME`, and returns the resulting boolean.
+**Data flow**: It receives a rustls CryptoProvider. It looks at the provider's supported certificate signature schemes and checks whether the required ECDSA NIST P-521 with SHA-512 scheme is present. It returns true if the provider supports it and false if it does not; it does not change anything.
 
-**Call relations**: This helper is called only from `ensure_rustls_crypto_provider` to enforce the postcondition that the installed provider can verify P-521/SHA-512 signatures.
+**Call relations**: This helper is used as part of the provider setup check in ensure_rustls_crypto_provider. After the global provider is installed and read back, this function supplies the yes-or-no answer that decides whether setup can continue or should fail loudly.
 
 
 ### Dispatch and runtime bootstrap
@@ -238,11 +230,13 @@ Set up argv-based command dispatch, PATH aliasing, process environment, and Toki
 
 `orchestration` · `startup`
 
-This file is the startup shim for binaries that need Codex’s helper CLIs without shipping multiple binaries. Its core data model is `Arg0DispatchPaths`, which records stable executable paths for the current binary, the Linux sandbox alias, and the Unix execve wrapper alias. `Arg0PathEntryGuard` owns the temporary directory and lock file backing those aliases so they are not deleted while the process is still running.
+Codex is shipped mostly as one executable, but parts of the system need to call tools that look like separate commands, such as apply_patch or the Linux sandbox helper. This file solves that by using the “argv0 trick”: a program can inspect the name it was launched under, and choose a different behavior when that name is a special alias. It is like one worker wearing different name badges at different service counters.
 
-The top-level flow begins in `arg0_dispatch`: it inspects `argv[0]` to directly jump into special modes such as `codex-linux-sandbox`, `apply_patch`, the misspelled compatibility alias, and on Unix the `codex-execve-wrapper`. It also inspects `argv[1]` for hidden helper modes like filesystem helper, Windows sandbox wrapper, and core apply-patch execution. Only after those early exits does it load `~/.codex/.env`, explicitly filtering out any variable whose name starts with `CODEX_` as a security invariant.
+At startup, the file first checks whether Codex was invoked as one of those helper names or with a hidden helper argument. If so, it immediately runs the matching helper and exits. If not, it loads safe user environment variables from ~/.codex/.env, refusing CODEX_ variables so a local file cannot override protected internal settings.
 
-Alias setup is done by creating a per-session temp directory under `CODEX_HOME/tmp/arg0`, locking it with `.lock`, cleaning stale unlocked siblings, and creating symlinks (Unix) or batch wrappers (Windows). PATH is rebuilt by prepending package-managed path entries and then the alias directory. `arg0_dispatch_or_else` then runs the caller’s async main inside a dedicated thread with a 16 MiB stack and a multi-thread Tokio runtime, ensuring the alias guard stays alive until the future completes. Linux-specific re-exec logic prefers the `codex-linux-sandbox` alias over `current_exe()` so basename-based dispatch still works on systems lacking `--argv0` support.
+It then creates a per-session temporary directory containing aliases, such as apply_patch and, on Linux, codex-linux-sandbox. That directory is prepended to PATH so child processes can find those helper commands. A lock file keeps the directory alive while Codex is running, and a cleanup step removes old unlocked directories from earlier sessions.
+
+Finally, it starts the real asynchronous Codex main function on a Tokio runtime, which is Rust’s async task executor, with a larger stack size to avoid stack overflows in deep work.
 
 #### Function details
 
@@ -252,11 +246,11 @@ Alias setup is done by creating a per-session temp directory under `CODEX_HOME/t
 fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self
 ```
 
-**Purpose**: Constructs the guard object that owns the temporary alias directory, its lock file, and the derived dispatch paths. Keeping this value alive is what prevents cleanup of the alias directory during process execution.
+**Purpose**: Creates the guard object that keeps a temporary alias directory and its lock file alive. Without this guard, the helper command paths could disappear while Codex or its child processes still need them.
 
-**Data flow**: Consumes a `TempDir`, an opened and locked `File`, and an `Arg0DispatchPaths` value; stores them unchanged into the struct fields; returns a fully initialized `Arg0PathEntryGuard`.
+**Data flow**: It receives a temporary directory, an open lock file, and the helper paths discovered or created for this run. It stores all three inside one object. The returned guard owns those resources until it is dropped.
 
-**Call relations**: It is created during real alias setup in `prepare_path_entry_for_codex_aliases`, and also by tests that need to simulate a live alias directory. Later code reads the embedded paths through `Arg0PathEntryGuard::paths` while relying on ownership of the temp dir and lock file to preserve filesystem state.
+**Call relations**: The alias setup code calls this after creating the temporary helper directory. Tests also call it to build fake guards when checking sandbox path selection and whether aliases stay alive during the main async work.
 
 *Call graph*: called by 3 (prepare_path_entry_for_codex_aliases, linux_sandbox_exe_path_prefers_codex_linux_sandbox_alias, run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns).
 
@@ -267,11 +261,11 @@ fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self
 fn paths(&self) -> &Arg0DispatchPaths
 ```
 
-**Purpose**: Exposes the precomputed helper executable paths stored in the guard. It is the read-only accessor used after startup to derive child re-exec paths.
+**Purpose**: Gives read-only access to the helper executable paths stored in the guard. Code uses this when it needs to know where the temporary aliases are.
 
-**Data flow**: Reads `self.paths` and returns a shared reference `&Arg0DispatchPaths` without mutation.
+**Data flow**: It reads the paths field inside the guard and returns a shared reference to it. Nothing is changed.
 
-**Call relations**: It is used when runtime setup needs to extract alias paths from a live guard, notably in the path selection logic reached from `run_main_with_arg0_guard`.
+**Call relations**: It is used when later startup code needs to copy out paths, such as the Linux sandbox alias or the exec wrapper alias, while the guard continues to own the directory and lock.
 
 *Call graph*: called by 1 (paths).
 
@@ -282,11 +276,11 @@ fn paths(&self) -> &Arg0DispatchPaths
 fn arg0_dispatch() -> Option<Arg0PathEntryGuard>
 ```
 
-**Purpose**: Performs all early-process dispatch and environment mutation before any threads are spawned. It either transfers control into helper modes and exits, or prepares PATH aliases and returns the guard that keeps them alive.
+**Purpose**: Performs the early startup check that decides whether this process should behave as the main Codex CLI or as one of its helper commands. It also prepares the environment and PATH aliases for a normal Codex run.
 
-**Data flow**: Reads process arguments, `PATH`, current install context, current executable path, current directory, and `~/.codex/.env`. Depending on `argv[0]`/`argv[1]`, it may invoke helper entrypoints, build a single-thread Tokio runtime for wrapper tasks, run patch application, print warnings/errors, mutate `PATH`, and finally return `Option<Arg0PathEntryGuard>`.
+**Data flow**: It reads the process arguments, especially the executable name and first argument. If they match a helper mode, it runs that helper and exits the process. Otherwise it loads allowed .env variables, creates helper aliases, updates PATH if needed, and returns a guard that keeps those aliases alive.
 
-**Call relations**: This is the first step inside `arg0_dispatch_or_else`. In helper-mode branches it delegates directly to external helper mains or async wrappers and terminates the process. In normal mode it calls `load_dotenv` and `prepare_path_env_var_with_aliases`, then hands the resulting guard to later runtime setup.
+**Call relations**: arg0_dispatch_or_else calls this before the real main function starts. This function may hand off directly to helper implementations such as apply_patch, the file-system helper, the sandbox wrapper, or the execve wrapper, and otherwise hands back an Arg0PathEntryGuard for the normal startup path.
 
 *Call graph*: calls 4 internal fn (load_dotenv, prepare_path_env_var_with_aliases, current, current_dir); called by 1 (arg0_dispatch_or_else); 16 external calls (new, apply_patch, main, run_fs_helper_main, run_main, run_shell_escalation_execve_wrapper, run_windows_sandbox_wrapper_main, eprintln!, args, args_os (+6 more)).
 
@@ -300,11 +294,11 @@ fn prepare_path_env_var_with_aliases(
     prepare_aliases: impl FnOnce(Option<OsString>) -> std::io::Result<(Arg0PathEntryGua
 ```
 
-**Purpose**: Combines package-managed PATH injection with best-effort temporary alias creation. It preserves package PATH updates even if alias creation fails.
+**Purpose**: Builds the PATH value Codex should use at startup, combining any package-provided command directory with the temporary helper alias directory. If alias creation fails, it keeps going when possible so Codex can still start.
 
-**Data flow**: Takes an `InstallContext`, an optional existing PATH value, and a closure that creates aliases. It computes a package-prefixed PATH via `path_env_with_package_path_dir`, passes that PATH into the alias-preparation closure, and returns a pair of optional guard and optional updated PATH. On alias failure it emits a warning and falls back to package PATH only.
+**Data flow**: It receives the install context, the existing PATH, and a function that tries to create aliases. It first adds the package path directory if one exists, then asks the alias-creation function to add the per-session alias directory. It returns an optional guard for aliases and an optional new PATH value.
 
-**Call relations**: It is called from `arg0_dispatch` after dotenv loading. Its closure parameter is normally `prepare_path_entry_for_codex_aliases`, but tests inject failing closures to verify fallback behavior.
+**Call relations**: arg0_dispatch calls this while preparing startup. It calls path_env_with_package_path_dir first, then invokes the supplied alias preparation function, and warns the user if aliases could not be made.
 
 *Call graph*: calls 1 internal fn (path_env_with_package_path_dir); called by 1 (arg0_dispatch); 1 external calls (eprintln!).
 
@@ -315,11 +309,11 @@ fn prepare_path_env_var_with_aliases(
 fn arg0_dispatch_or_else(main_fn: F) -> anyhow::Result<()>
 ```
 
-**Purpose**: Wraps a binary crate’s async main with arg0 dispatch, PATH alias lifetime management, and Tokio runtime creation on a controlled-stack thread. It is the intended public entry wrapper for binaries in this workspace.
+**Purpose**: Wraps a binary crate’s real async main function with all the Codex startup work from this file. It is the usual entry wrapper for Codex executables that need helper dispatch and runtime setup.
 
-**Data flow**: Accepts a `main_fn` closure from `Arg0DispatchPaths` to an async result. It calls `arg0_dispatch`, captures `current_exe`, spawns a named OS thread with a 16 MiB stack, builds a Tokio runtime inside that thread, runs `run_main_with_arg0_guard`, joins the thread, and returns the propagated `anyhow::Result<()>` or resumes a panic payload.
+**Data flow**: It receives an async main function. It runs arg0_dispatch, records the current executable path, starts a dedicated main thread with a large stack, builds a Tokio runtime there, and runs the main function with the helper paths. It returns success or an error from that main function, or rethrows a panic if the thread panicked.
 
-**Call relations**: This is the orchestration entry used by binaries. It delegates startup probing to `arg0_dispatch`, runtime construction to `build_runtime`, and path-lifetime-sensitive execution to `run_main_with_arg0_guard`.
+**Call relations**: Binary entry points call this instead of directly building their own runtime. It calls arg0_dispatch first, then delegates the async portion to run_main_with_arg0_guard inside the newly built runtime.
 
 *Call graph*: calls 1 internal fn (arg0_dispatch); 3 external calls (current_exe, resume_unwind, new).
 
@@ -334,11 +328,11 @@ async fn run_main_with_arg0_guard(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Builds the final `Arg0DispatchPaths` passed to the caller’s async main and ensures the alias guard is dropped only after that future finishes. This is the point where startup filesystem state becomes runtime configuration.
+**Purpose**: Runs the real async Codex main function while keeping the temporary helper aliases alive for the whole run. It also assembles the path information that the rest of Codex needs for re-running itself or launching helpers.
 
-**Data flow**: Consumes an optional `Arg0PathEntryGuard`, an optional `current_exe`, and a `main_fn`. It derives `codex_self_exe`, conditionally computes `codex_linux_sandbox_exe` on Linux via `linux_sandbox_exe_path`, extracts `main_execve_wrapper_exe` from the guard, awaits `main_fn(paths)`, then explicitly drops the guard and returns the async result.
+**Data flow**: It receives the optional alias guard, the current executable path, and the async main function. It builds an Arg0DispatchPaths value, choosing the Linux sandbox path when appropriate, then awaits the main function. Only after the main function finishes does it drop the guard.
 
-**Call relations**: It is invoked from the thread created by `arg0_dispatch_or_else`. It delegates Linux alias selection to `linux_sandbox_exe_path`; tests call it directly to verify aliases remain present across suspension points.
+**Call relations**: arg0_dispatch_or_else runs this inside the Tokio runtime. It calls linux_sandbox_exe_path to choose the best sandbox executable path, then hands the completed path bundle to the caller’s main function.
 
 *Call graph*: calls 1 internal fn (linux_sandbox_exe_path); called by 1 (run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns); 1 external calls (cfg!).
 
@@ -352,11 +346,11 @@ fn linux_sandbox_exe_path(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Chooses the best executable path for Linux sandbox re-exec. It prefers the basename-preserving alias over the raw current executable path.
+**Purpose**: Chooses the executable path child processes should use when they need to start the Linux sandbox helper. It prefers the special alias because its file name triggers the right helper behavior.
 
-**Data flow**: Reads an optional guard reference and optional current executable path. It first tries `path_entry_guard.paths().codex_linux_sandbox_exe.clone()`, and if absent falls back to `current_exe`; returns `Option<PathBuf>`.
+**Data flow**: It receives an optional alias guard and an optional current executable path. If the guard contains a codex-linux-sandbox alias, it returns that. Otherwise it returns the current executable path if available.
 
-**Call relations**: It is only used while assembling `Arg0DispatchPaths` in `run_main_with_arg0_guard`, where preserving arg0 semantics for child processes matters.
+**Call relations**: run_main_with_arg0_guard calls this while building the path bundle for the real main function. A unit test verifies that the alias wins over the plain Codex executable path.
 
 *Call graph*: called by 1 (run_main_with_arg0_guard).
 
@@ -367,11 +361,11 @@ fn linux_sandbox_exe_path(
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime>
 ```
 
-**Purpose**: Creates the standard Tokio runtime used by wrapped binaries. The runtime is configured so worker threads use the same enlarged stack budget as the top-level main thread.
+**Purpose**: Creates the Tokio async runtime used to run Codex’s main async work. Tokio is the task engine that lets Rust run many waiting operations, such as I/O, without blocking one thread per task.
 
-**Data flow**: Constructs a multi-thread Tokio runtime builder, enables all Tokio subsystems, sets worker thread stack size to `TOKIO_WORKER_STACK_SIZE_BYTES`, builds the runtime, and returns it as `anyhow::Result<Runtime>`.
+**Data flow**: It creates a multi-thread Tokio runtime builder, enables the standard runtime features, sets a larger stack size for worker threads, and returns the built runtime or an error.
 
-**Call relations**: It is called from the dedicated thread inside `arg0_dispatch_or_else`, and also from a test that exercises `run_main_with_arg0_guard` under a real runtime.
+**Call relations**: arg0_dispatch_or_else uses this inside the main runtime thread before running the real async entry point. Tests also use it when checking async guard lifetime behavior.
 
 *Call graph*: 1 external calls (new_multi_thread).
 
@@ -382,11 +376,11 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime>
 fn load_dotenv()
 ```
 
-**Purpose**: Loads environment variables from `~/.codex/.env` before any threads exist, while enforcing that `.env` cannot define internal `CODEX_` variables. Missing home directory or missing file are silently ignored.
+**Purpose**: Loads user-defined environment variables from ~/.codex/.env during startup. This gives users a convenient place to set ordinary settings without editing their shell profile.
 
-**Data flow**: Reads the Codex home path via `find_codex_home`, attempts to create a dotenv iterator for `<codex_home>/.env`, and if successful passes it to `set_filtered`. It returns no value and mutates process environment only through that helper.
+**Data flow**: It looks up the Codex home directory, tries to open the .env file there, and if successful passes the parsed key-value entries to set_filtered. If the home directory or file cannot be read, it silently does nothing.
 
-**Call relations**: It is called during normal startup from `arg0_dispatch`, before PATH mutation and before Tokio/thread creation because environment mutation is process-global and not thread-safe.
+**Call relations**: arg0_dispatch calls this before any threads are created, because changing process environment variables is only safe at that early single-threaded point. It delegates the safety filtering to set_filtered.
 
 *Call graph*: calls 1 internal fn (set_filtered); called by 1 (arg0_dispatch); 2 external calls (find_codex_home, from_path_iter).
 
@@ -397,11 +391,11 @@ fn load_dotenv()
 fn set_filtered(iter: I)
 ```
 
-**Purpose**: Applies dotenv key/value pairs to the process environment while rejecting any key whose uppercase form starts with `CODEX_`. This preserves a security boundary between user dotenv files and internal control variables.
+**Purpose**: Sets environment variables from a .env iterator, but refuses any variable whose name starts with CODEX_. This protects internal Codex settings from being changed by a local .env file.
 
-**Data flow**: Consumes any iterator of `Result<(String, String), dotenvy::Error>`, flattens away parse errors, uppercases each key for prefix checking, and for allowed keys calls `std::env::set_var`. It returns unit and writes to process environment.
+**Data flow**: It receives parsed .env entries. For each successfully parsed key and value, it uppercases the key for checking, skips CODEX_ keys, and sets all other variables in the process environment.
 
-**Call relations**: It is the filtering worker used exclusively by `load_dotenv`.
+**Call relations**: load_dotenv calls this after reading ~/.codex/.env. It is the safety gate between user-provided environment data and the process-wide environment.
 
 *Call graph*: called by 1 (load_dotenv); 2 external calls (into_iter, set_var).
 
@@ -414,11 +408,11 @@ fn prepare_path_entry_for_codex_aliases(
 ) -> std::io::Result<(Arg0PathEntryGuard, OsString)>
 ```
 
-**Purpose**: Creates the temporary PATH directory containing helper aliases and returns both the lifetime guard and the new PATH value with that directory prepended. It also enforces filesystem safety constraints around where those helpers may be created.
+**Purpose**: Creates the temporary command aliases that let Codex expose helper tools without installing separate executables. It returns both the guard that keeps those aliases alive and the PATH value that makes them discoverable.
 
-**Data flow**: Reads Codex home, temp dir root, current executable path, and existing PATH. It rejects non-debug setups where `codex_home` lives under the system temp directory, creates `~/.codex/tmp/arg0`, tightens Unix permissions to `0700`, runs `janitor_cleanup`, creates a unique temp subdirectory, opens and locks `.lock`, creates symlinks or batch scripts for helper names, computes the updated PATH via `path_env_with_entry`, builds `Arg0DispatchPaths`, and returns `(Arg0PathEntryGuard, OsString)`.
+**Data flow**: It finds the Codex home directory, creates a secure temporary root, cleans up stale old alias directories, creates a fresh per-session directory, locks it, and writes aliases inside it. On Unix these are symbolic links, which are shortcut-like filesystem entries; on Windows it writes batch scripts for supported helpers. It then prepends that directory to PATH and returns the guard plus the new PATH.
 
-**Call relations**: It is normally passed as the alias-preparation closure into `prepare_path_env_var_with_aliases`. Internally it delegates stale-directory cleanup to `janitor_cleanup` and PATH string assembly to `path_env_with_entry`.
+**Call relations**: prepare_path_env_var_with_aliases receives this as the alias setup function during normal startup. It uses janitor_cleanup to remove old directories, path_env_with_entry to build PATH, and Arg0PathEntryGuard::new to package the live directory and lock.
 
 *Call graph*: calls 3 internal fn (new, janitor_cleanup, path_env_with_entry); 13 external calls (options, new, find_codex_home, from_mode, eprintln!, format!, current_exe, temp_dir, create_dir_all, set_permissions (+3 more)).
 
@@ -432,11 +426,11 @@ fn path_env_with_package_path_dir(
 ) -> Option<OsString>
 ```
 
-**Purpose**: Prepends the package layout’s optional `path_dir` to an existing PATH value. This lets packaged helper binaries participate in PATH ordering before temporary arg0 aliases are added.
+**Purpose**: Adds Codex’s package-provided command directory to PATH when the install layout says one exists. This helps packaged installs expose bundled helper commands in a predictable place.
 
-**Data flow**: Reads `install_context.package_layout.path_dir`; if absent returns `None`, otherwise calls `path_env_with_entry` with that directory and the existing PATH and returns the resulting `OsString`.
+**Data flow**: It reads the install context, looks for a package layout with a path_dir, and if present prepends that directory to the existing PATH. If no such directory is known, it returns nothing.
 
-**Call relations**: It is used by `prepare_path_env_var_with_aliases` as the first PATH transformation before alias setup is attempted.
+**Call relations**: prepare_path_env_var_with_aliases calls this before creating temporary aliases. It uses path_env_with_entry to do the actual PATH string construction.
 
 *Call graph*: calls 1 internal fn (path_env_with_entry); called by 1 (prepare_path_env_var_with_aliases).
 
@@ -447,11 +441,11 @@ fn path_env_with_package_path_dir(
 fn path_env_with_entry(path_entry: &Path, existing_path: Option<OsString>) -> OsString
 ```
 
-**Purpose**: Builds a new PATH string by prepending one filesystem entry to an optional existing PATH. It avoids repeated reallocations by precomputing capacity.
+**Purpose**: Builds a PATH environment variable with one directory placed at the front. Putting a directory first means the operating system looks there first when resolving command names.
 
-**Data flow**: Takes a `&Path` and optional `OsString`, chooses `:` on Unix or `;` on Windows, allocates an `OsString` with enough capacity for both parts plus separator, pushes the new entry first, then appends separator and old PATH if present, and returns the combined PATH value.
+**Data flow**: It receives a directory path and an optional existing PATH. It creates a new OS string starting with the new directory, then appends the platform’s PATH separator and the old PATH if there was one. It returns the combined PATH value.
 
-**Call relations**: It is the low-level PATH builder used both for package path insertion and for prepending the temporary alias directory.
+**Call relations**: path_env_with_package_path_dir uses this for package paths, and prepare_path_entry_for_codex_aliases uses it for the temporary alias directory. Tests check that the order stays correct.
 
 *Call graph*: called by 2 (path_env_with_package_path_dir, prepare_path_entry_for_codex_aliases); 2 external calls (with_capacity, as_os_str).
 
@@ -462,11 +456,11 @@ fn path_env_with_entry(path_entry: &Path, existing_path: Option<OsString>) -> Os
 fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()>
 ```
 
-**Purpose**: Best-effort removes stale per-session alias directories under the arg0 temp root. It only deletes directories whose lock file exists and can be locked, so active sessions are preserved.
+**Purpose**: Removes old per-session alias directories that are no longer in use. This prevents Codex’s home directory from filling up with stale temporary folders.
 
-**Data flow**: Reads directory entries under `temp_root`; if the root is missing it returns success. For each child directory it calls `try_lock_dir`; unlocked directories are removed with `remove_dir_all`, missing directories after the fact are tolerated as TOCTOU races, and any other filesystem error aborts with `Err`.
+**Data flow**: It receives the temporary root directory, lists its entries, and looks only at subdirectories. For each directory, it tries to lock that directory’s lock file. If the lock is missing or currently held, it skips the directory; if the lock is available, it removes the whole directory.
 
-**Call relations**: It is called during alias setup from `prepare_path_entry_for_codex_aliases` and directly by tests covering no-lock, held-lock, and stale-lock cases. It delegates lock probing to `try_lock_dir`.
+**Call relations**: prepare_path_entry_for_codex_aliases calls this before making a new alias directory. It relies on try_lock_dir to decide whether a directory is safe to delete, and tests cover the cases of missing, held, and unlocked lock files.
 
 *Call graph*: calls 1 internal fn (try_lock_dir); called by 4 (prepare_path_entry_for_codex_aliases, janitor_removes_dirs_with_unlocked_lock, janitor_skips_dirs_with_held_lock, janitor_skips_dirs_without_lock_file); 2 external calls (read_dir, remove_dir_all).
 
@@ -477,11 +471,11 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()>
 fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>>
 ```
 
-**Purpose**: Attempts to open and lock a session directory’s `.lock` file to determine whether that directory is stale. It distinguishes missing lock files, active locks, and real I/O failures.
+**Purpose**: Checks whether an alias directory appears unused by trying to lock its .lock file. A held lock means another Codex process is still using that directory.
 
-**Data flow**: Builds `<dir>/.lock`, opens it read/write, returns `Ok(None)` if the file is absent, otherwise tries `try_lock()`. A successful lock returns `Ok(Some(File))`, `WouldBlock` returns `Ok(None)`, and other errors are propagated.
+**Data flow**: It receives a directory path, opens its .lock file if it exists, and tries to take a file lock. It returns an open locked file when successful, returns none when there is no lock file or the lock is already held, and returns an error for other failures.
 
-**Call relations**: It is only used by `janitor_cleanup` to decide whether a candidate directory may be safely deleted.
+**Call relations**: janitor_cleanup calls this for each candidate stale directory. The returned locked file is kept briefly so the cleanup code knows it has exclusive access while deleting.
 
 *Call graph*: called by 1 (janitor_cleanup); 2 external calls (options, join).
 
@@ -492,11 +486,11 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>>
 fn create_lock(dir: &Path) -> std::io::Result<File>
 ```
 
-**Purpose**: Creates or opens the `.lock` file inside a test directory. Tests use it to simulate stale and active arg0 session directories.
+**Purpose**: Creates or opens the .lock file used by tests to simulate live or stale alias directories. It is a small test helper, not part of normal Codex startup.
 
-**Data flow**: Takes a directory path, joins `LOCK_FILENAME`, opens the file with read/write/create and no truncation, and returns the resulting `File`.
+**Data flow**: It receives a directory path, appends the lock file name, and opens the file for reading and writing, creating it if needed. It returns the open file to the test.
 
-**Call relations**: It supports multiple tests that need a lock file, including guard construction and janitor behavior checks.
+**Call relations**: Several tests call this before constructing guards or before running janitor_cleanup. It lets tests control whether a directory has no lock, an unlocked lock, or a held lock.
 
 *Call graph*: 2 external calls (options, join).
 
@@ -507,11 +501,11 @@ fn create_lock(dir: &Path) -> std::io::Result<File>
 fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture>
 ```
 
-**Purpose**: Builds a temporary package-layout fixture with separate arg0, package, path, and existing PATH directories. It centralizes the filesystem setup needed by PATH-ordering tests.
+**Purpose**: Builds a temporary fake install layout for tests that check PATH construction. It gives the tests real directories without touching the user’s machine.
 
-**Data flow**: Creates a `TempDir`, several subdirectories, canonicalizes package paths into `AbsolutePathBuf`, constructs an `InstallContext` with a `CodexPackageLayout`, and returns a `PackagePathTestFixture` containing both raw paths and the install context.
+**Data flow**: It creates a temporary directory tree with package, bin, package PATH, alias, and existing PATH directories. It converts the relevant paths into the project’s absolute path type and returns them bundled with an InstallContext.
 
-**Call relations**: It is called by tests that verify package PATH insertion and fallback behavior when alias setup fails.
+**Call relations**: The PATH-related tests call this to avoid repeating setup. Those tests then pass its install context into path_env_with_package_path_dir or prepare_path_env_var_with_aliases.
 
 *Call graph*: calls 1 internal fn (from_absolute_path); 2 external calls (new, create_dir_all).
 
@@ -522,11 +516,11 @@ fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture>
 fn linux_sandbox_exe_path_prefers_codex_linux_sandbox_alias() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that Linux sandbox path selection prefers the alias path stored in the guard over the plain executable path. This protects basename-based redispatch behavior.
+**Purpose**: Verifies that Linux sandbox path selection prefers the temporary alias over the plain Codex executable. This matters because the alias name is what triggers sandbox helper dispatch.
 
-**Data flow**: Creates a temp directory and lock file, constructs an `Arg0PathEntryGuard` with both self and alias paths, calls `linux_sandbox_exe_path`, and asserts that the alias path is returned.
+**Data flow**: It creates a temporary guard containing a fake codex-linux-sandbox alias and a fake current Codex path. It calls linux_sandbox_exe_path and checks that the alias path is returned.
 
-**Call relations**: This test directly exercises the helper used by `run_main_with_arg0_guard`.
+**Call relations**: This test directly exercises linux_sandbox_exe_path and uses Arg0PathEntryGuard::new plus create_lock to build the needed fake guard.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (from, new, create_lock, assert_eq!).
 
@@ -537,11 +531,11 @@ fn linux_sandbox_exe_path_prefers_codex_linux_sandbox_alias() -> std::io::Result
 fn path_env_can_prepend_package_path_before_arg0_alias_dir() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks PATH ordering when both package path and arg0 alias directory are prepended. The expected order is alias dir first, then package path dir, then the original PATH.
+**Purpose**: Checks that PATH is built in the intended order when both a package path and an arg0 alias directory are present. The final search order should put temporary aliases first, then package commands, then the user’s existing PATH.
 
-**Data flow**: Builds a fixture, computes package-prefixed PATH with `path_env_with_package_path_dir`, prepends the arg0 dir with `path_env_with_entry`, splits the resulting PATH, and asserts the exact sequence of directories.
+**Data flow**: It builds a fake install fixture, prepends the package path to an existing PATH, then prepends the arg0 alias directory. It splits the resulting PATH and compares the directory order with the expected list.
 
-**Call relations**: It validates the composition strategy used by `prepare_path_env_var_with_aliases`.
+**Call relations**: This test exercises path_env_with_package_path_dir and path_env_with_entry together. It protects the startup ordering used by prepare_path_env_var_with_aliases.
 
 *Call graph*: 4 external calls (package_path_test_fixture, assert_eq!, path_env_with_entry, path_env_with_package_path_dir).
 
@@ -552,11 +546,11 @@ fn path_env_can_prepend_package_path_before_arg0_alias_dir() -> anyhow::Result<(
 fn package_path_survives_arg0_alias_setup_failure() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures that failure to create temporary aliases does not discard package PATH injection. Startup should continue with package PATH only.
+**Purpose**: Checks that Codex still keeps the package PATH update even if creating temporary aliases fails. This makes startup more forgiving when alias creation has a filesystem problem.
 
-**Data flow**: Builds a fixture, calls `prepare_path_env_var_with_aliases` with a closure that inspects the incoming PATH and then returns an error, and asserts that no guard is returned while the updated PATH still contains package path followed by existing PATH.
+**Data flow**: It builds a fake install fixture and calls prepare_path_env_var_with_aliases with a deliberately failing alias setup function. It confirms no alias guard is returned, but the updated PATH still contains the package path before the existing path.
 
-**Call relations**: This test targets the fallback branch in `prepare_path_env_var_with_aliases`.
+**Call relations**: This test directly covers the failure branch in prepare_path_env_var_with_aliases. It ensures the warning-and-continue behavior does not throw away useful package PATH information.
 
 *Call graph*: 4 external calls (package_path_test_fixture, assert!, assert_eq!, prepare_path_env_var_with_aliases).
 
@@ -567,11 +561,11 @@ fn package_path_survives_arg0_alias_setup_failure() -> anyhow::Result<()>
 fn run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns() -> anyhow::Result<()>
 ```
 
-**Purpose**: Confirms that the alias temp directory is not dropped while the async main future is still running, even across an await point. This guards against child-path invalidation during execution.
+**Purpose**: Verifies that temporary alias files remain present while the async main function is running. This protects against a bug where the temporary directory could be deleted too early.
 
-**Data flow**: Creates a temp alias file and guard, runs `run_main_with_arg0_guard` inside a real Tokio runtime, and inside the async closure checks that the alias path exists both before and after `yield_now()`. The test returns success only if the file remains present throughout.
+**Data flow**: It creates a temporary alias file and guard, then runs run_main_with_arg0_guard inside a runtime. The supplied async function checks that the alias exists before and after yielding to the task scheduler.
 
-**Call relations**: It directly exercises `run_main_with_arg0_guard` and indirectly the guard-lifetime design used by `arg0_dispatch_or_else`.
+**Call relations**: This test uses build_runtime, Arg0PathEntryGuard::new, create_lock, and run_main_with_arg0_guard. It confirms the guard is intentionally dropped only after the main future completes.
 
 *Call graph*: calls 2 internal fn (new, run_main_with_arg0_guard); 5 external calls (from, new, create_lock, write, build_runtime).
 
@@ -582,11 +576,11 @@ fn run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns() -> anyhow::
 fn janitor_skips_dirs_without_lock_file() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that cleanup does not remove directories lacking a `.lock` file. Such directories are treated as ineligible rather than stale.
+**Purpose**: Checks that cleanup does not delete directories that lack a .lock file. Such directories may not be safe to identify as old Codex alias directories.
 
-**Data flow**: Creates a temp root and child directory without a lock file, runs `janitor_cleanup`, and asserts the directory still exists.
+**Data flow**: It creates a temporary root with one subdirectory and no lock file, runs janitor_cleanup, and verifies the subdirectory still exists.
 
-**Call relations**: It covers the `try_lock_dir` branch where missing lock files yield `Ok(None)`.
+**Call relations**: This test exercises janitor_cleanup’s missing-lock path, which depends on try_lock_dir returning none when the lock file is absent.
 
 *Call graph*: calls 1 internal fn (janitor_cleanup); 3 external calls (assert!, create_dir, tempdir).
 
@@ -597,11 +591,11 @@ fn janitor_skips_dirs_without_lock_file() -> std::io::Result<()>
 fn janitor_skips_dirs_with_held_lock() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that cleanup leaves directories alone when their lock file is currently held. This protects active sessions from accidental deletion.
+**Purpose**: Checks that cleanup does not delete an alias directory currently locked by another live process. This protects active Codex sessions.
 
-**Data flow**: Creates a temp root and child directory, creates and locks its `.lock` file, runs `janitor_cleanup`, and asserts the directory still exists.
+**Data flow**: It creates a subdirectory, creates and holds its lock file, runs janitor_cleanup, and verifies the directory is still there.
 
-**Call relations**: It covers the `WouldBlock` path returned by `try_lock_dir` and consumed by `janitor_cleanup`.
+**Call relations**: This test uses create_lock to hold a lock before calling janitor_cleanup. It covers the path where try_lock_dir sees that the lock would block.
 
 *Call graph*: calls 1 internal fn (janitor_cleanup); 4 external calls (create_lock, assert!, create_dir, tempdir).
 
@@ -612,14 +606,19 @@ fn janitor_skips_dirs_with_held_lock() -> std::io::Result<()>
 fn janitor_removes_dirs_with_unlocked_lock() -> std::io::Result<()>
 ```
 
-**Purpose**: Verifies that cleanup removes stale directories whose lock file exists but is not held. This is the intended reclamation path for abandoned session dirs.
+**Purpose**: Checks that cleanup removes a stale alias directory when its lock file exists but is not held. That is the sign of an old session that has ended.
 
-**Data flow**: Creates a temp root and child directory, creates but does not lock `.lock`, runs `janitor_cleanup`, and asserts the directory has been deleted.
+**Data flow**: It creates a subdirectory with a lock file, leaves the lock unheld, runs janitor_cleanup, and verifies the directory was removed.
 
-**Call relations**: It covers the successful-lock branch in `try_lock_dir` followed by deletion in `janitor_cleanup`.
+**Call relations**: This test covers the successful cleanup path through janitor_cleanup and try_lock_dir. It confirms the janitor can reclaim old per-session alias directories.
 
 *Call graph*: calls 1 internal fn (janitor_cleanup); 4 external calls (create_lock, assert!, create_dir, tempdir).
 
 ## 📊 State Registers Touched
 
-- `reg-process-environment` — The process-wide environment and argv/arg0-derived launch context that is sanitized, augmented, and then reused by later startup and runtime code.
+- `reg-install-home-context` — The discovered Codex home folder, install location, bundled resources, and stable local installation identity.
+- `reg-shell-workspace-environment` — The current machine, shell, PATH, working directory, project root, Git state, and environment variables used to make commands behave like the user’s terminal.
+- `reg-http-network-client` — The shared network client setup, including retries, streaming, cookies, proxy settings, TLS handling, and request failure reporting.
+- `reg-tls-crypto-provider` — The one process-wide cryptography provider chosen early so HTTPS and other TLS connections use the same security engine.
+- `reg-launch-invocation-context` — The raw launch context, including invoked binary/arg0, selected subcommand or runtime mode, startup flags, and output/interaction mode chosen before dispatch.
+- `reg-process-hardening-state` — Process-wide hardening status and OS security settings applied at bootstrap, such as dump/inspection/tamper restrictions that affect the rest of the run.

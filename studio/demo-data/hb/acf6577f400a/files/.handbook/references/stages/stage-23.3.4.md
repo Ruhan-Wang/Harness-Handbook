@@ -1,10 +1,10 @@
 # legacy and current execpolicy executable tests  `stage-23.3.4`
 
-This stage is the executable-facing verification layer for execpolicy: it sits around the policy runtime and CLI boundary, proving that real command checks, parsed policies, and emitted decisions behave as intended end to end. It combines the current implementation’s integration tests with the older command corpus that still defines much of the expected behavior.
+This stage is behind-the-scenes safety checking for the execution policy, the part of the system that decides whether a shell command may run, must be blocked, or needs user approval. It is not the main work loop itself; it is the test harness that proves the rules behave as expected.
 
-cli/tests/execpolicy.rs checks the public `codex execpolicy check` command, asserting the exact JSON decision payload for matched prefix rules, including cases with and without justifications. execpolicy/tests/basic.rs exercises the modern parser and runtime directly, covering prefix and network rules, examples, justifications, and host executable lookup, with small helpers for building commands and inspecting resolved rules.
+The current tests check both the policy engine and its command-line face. One test runs `codex execpolicy check` and confirms it reports JSON correctly when a rule blocks something risky like `git push`. Another checks policy files directly, making sure commands are sorted into allowed, denied, forbidden, or prompt-needed results.
 
-The legacy side is wired in by execpolicy-legacy/tests/all.rs and suite/mod.rs, which collect the suite into one test binary and namespace. good.rs and bad.rs guard the default policy’s curated positive and negative examples. Command-specific suites for cp, head, ls, pwd, literal matching, sed parsing, and full sed behavior verify exact acceptance, normalization into ValidExec, and precise rejection errors.
+The legacy tests act like an older library of examples that must still pass. A top-level test file and module list gather the suite. “Good” and “bad” command lists protect broad expectations. Command-specific tests then inspect known Unix tools: `cp`, `head`, `ls`, `pwd`, literal subcommands, and narrow safe forms of `sed`. Together they form a regression net, catching accidental changes that would make the policy too strict or too loose.
 
 ## Files in this stage
 
@@ -13,9 +13,13 @@ These tests cover the current execpolicy runtime and CLI-facing integration beha
 
 ### `cli/tests/execpolicy.rs`
 
-`test` · `policy evaluation command execution`
+`test` · `test run`
 
-This file exercises the policy-checking CLI against real rule files written under a temporary home directory. Each test creates `rules/policy.rules`, writes a small policy program containing a `prefix_rule` for `git push`, then invokes `codex execpolicy check --rules <path> git push origin main`. The command’s stdout is parsed as `serde_json::Value` and compared for exact equality against a `json!` literal, making these tests contract checks for the external JSON schema rather than loose behavioral smoke tests. The first case expects a `decision` of `forbidden` and a single `matchedRules` entry containing `prefixRuleMatch` with the matched prefix and decision. The second adds a `justification` field in the rule source and verifies that the same field appears in the emitted JSON. Because the assertions are exact, these tests pin down field names, nesting, and optional-field behavior. They also verify that the command succeeds end-to-end using the compiled binary, filesystem rule loading, and JSON serialization.
+This is an integration test file. Instead of testing one small Rust function directly, it runs the real `codex` command-line program the way a user would run it. The problem it guards against is simple but important: execution policy rules are only useful if the command-line checker reads them correctly and reports the decision in a stable format that other tools can trust.
+
+Each test creates a temporary fake Codex home directory, writes a small policy file into it, then runs `codex execpolicy check --rules ... git push origin main`. The policy says that any command beginning with `git push` is forbidden. The test then reads the program's standard output as JSON and compares it to the exact JSON structure expected.
+
+The two tests cover a small but meaningful difference. One checks the basic blocked-command response. The other checks that, when the rule includes a human explanation called a justification, that explanation appears in the JSON too. This matters because callers may show that message to users so they understand why something was blocked. The temporary directory keeps the tests isolated, like using a clean sandbox so no real user configuration affects the result.
 
 #### Function details
 
@@ -25,11 +29,11 @@ This file exercises the policy-checking CLI against real rule files written unde
 fn execpolicy_check_matches_expected_json() -> Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Verifies that a matching prefix rule produces the expected forbidden decision JSON without a justification field.
+**Purpose**: This test proves that `codex execpolicy check` correctly reports a forbidden decision when a rule matches the start of a command. It also checks that the JSON output contains the matched prefix and decision in the expected shape.
 
-**Data flow**: Creates a temp home, computes `rules/policy.rules`, creates parent directories, writes a policy file defining a `prefix_rule` for `git push`, runs `codex execpolicy check --rules <path> git push origin main`, asserts successful exit, parses stdout bytes with `serde_json::from_slice`, and compares the resulting JSON value to an exact expected object.
+**Data flow**: The test starts with no real user configuration and creates a temporary Codex home directory. It writes a policy file saying that commands starting with `git push` are forbidden. It then runs the `codex` binary with that rules file and the sample command `git push origin main`. The command's output is parsed as JSON, and the test compares it with the exact expected JSON object. If the program exits successfully and the JSON matches, the test passes; otherwise it fails.
 
-**Call relations**: This test directly constructs the command and filesystem inputs because the scenario is self-contained. It delegates parsing to `serde_json` and uses exact equality to validate the CLI’s serialized response shape.
+**Call relations**: During the test run, the Rust test harness calls this function. The function uses temporary-directory and file-writing helpers to build a small test environment, then uses the command-testing library to launch the real `codex` binary. After the external command returns, it hands the stdout bytes to JSON parsing and finally to an equality assertion, which is the pass-or-fail check.
 
 *Call graph*: 8 external calls (new, assert!, assert_eq!, new, cargo_bin, create_dir_all, write, from_slice).
 
@@ -40,11 +44,11 @@ fn execpolicy_check_matches_expected_json() -> Result<(), Box<dyn std::error::Er
 fn execpolicy_check_includes_justification_when_present() -> Result<(), Box<dyn std::error::Error>>
 ```
 
-**Purpose**: Verifies that when a matched prefix rule includes a justification, the emitted JSON includes that justification in the nested match object.
+**Purpose**: This test proves that a policy rule's explanation is not lost when `codex execpolicy check` reports a match. It checks that the JSON output includes the `justification` text alongside the forbidden decision.
 
-**Data flow**: Creates a temp home and policy file path, ensures the parent directory exists, writes a `prefix_rule` with `decision = "forbidden"` and a `justification` string, runs the same `execpolicy check` command against `git push origin main`, asserts success, parses stdout JSON, and compares it to an exact expected object containing the justification field.
+**Data flow**: The test creates a fresh temporary Codex home directory and writes a policy file with a `git push` blocking rule plus the explanation `pushing is blocked in this repo`. It runs the `codex` binary against the command `git push origin main`. The program's stdout is parsed into JSON, then compared with the expected JSON that includes the decision, the matched prefix, and the justification text. The temporary files disappear after the test finishes.
 
-**Call relations**: This test mirrors `execpolicy_check_matches_expected_json` but covers the optional justification branch. Together the two tests define the stable JSON contract for matched prefix-rule output.
+**Call relations**: The test harness calls this function as part of the integration test suite. Like the companion test, it prepares a throwaway policy file, launches the real command-line program through the command-testing helper, and then passes the output through JSON parsing before the final assertion. Its special role is to cover the path where a matched rule carries an extra user-facing explanation.
 
 *Call graph*: 8 external calls (new, assert!, assert_eq!, new, cargo_bin, create_dir_all, write, from_slice).
 
@@ -53,11 +57,11 @@ fn execpolicy_check_includes_justification_when_present() -> Result<(), Box<dyn 
 
 `test` · `test run`
 
-This test file is the executable specification for the `execpolicy` crate’s core behavior. The helper functions normalize repetitive setup: `tokens` converts `&str` slices into owned command vectors, `allow_all` and `prompt_all` act as deterministic heuristics fallbacks, path helpers generate platform-correct absolute executable paths and names, `starlark_string` escapes literals for embedding in policy source, and `rule_snapshots` downcasts `RuleRef` trait objects into comparable `PrefixRule` snapshots.
+The execution policy system is a safety gate for commands. A policy can say things like “git status is okay,” “rm is forbidden,” or “this full path counts as the git program.” This test file acts like a checklist for that gate. It feeds small policy snippets into the parser, asks the built policy to judge example commands, and compares the result with the expected answer.
 
-The tests cover both parser semantics and runtime evaluation. They verify that repeated file appends deduplicate emitted allow rules, multiple policy files accumulate rules in order, first-token alternatives expand into multiple rules while tail alternatives remain grouped, and `match`/`not_match` examples are enforced during parsing. They also check decision aggregation rules: more restrictive matches dominate less restrictive ones, both within a single command and across multiple commands, and heuristics fallback is used only when no policy rule matches.
+The tests cover prefix rules, where a command is matched by its starting words, such as `git commit`. They also cover explanations attached to rules, network access rules, example commands that must or must not match, and the rule that the strictest decision wins when several rules apply. For example, a broad `git` rule may prompt, while a narrower `git commit` rule may forbid; the final answer must be forbidden.
 
-A substantial section focuses on host executable support. Those tests confirm absolute-path validation, bare-name validation, basename consistency checks, last-definition-wins behavior for repeated `host_executable` declarations, basename-based rule matching when enabled, explicit empty allowlists blocking resolution, unmapped paths falling back to basename matching, and exact literal-path rules taking precedence over host-executable rewriting. Network-rule tests similarly verify protocol parsing, domain compilation, and wildcard-host rejection.
+A large part of the file checks host executable resolution. That means recognizing that `/usr/bin/git` may be the same intended program as `git`, but only when the policy allows that path. This matters because command safety depends not just on the name typed, but on which actual program is being run. Without these tests, small parser or matching changes could silently weaken the safety rules.
 
 #### Function details
 
@@ -67,11 +71,11 @@ A substantial section focuses on host executable support. Those tests confirm ab
 fn tokens(cmd: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Builds an owned command vector from a borrowed string slice array. It keeps test assertions concise and consistent.
+**Purpose**: Turns a short list of string slices into owned command words. Tests use it to write command examples compactly, like `git status`, while still giving the policy checker the owned strings it expects.
 
-**Data flow**: It takes `&[&str]`, maps each element through `ToString::to_string`, collects into `Vec<String>`, and returns that vector.
+**Data flow**: It receives a borrowed list of text pieces. It copies each piece into a new `String` and returns a vector of those strings. It does not change anything outside itself.
 
-**Call relations**: Used throughout the test suite wherever commands, matched prefixes, or expected heuristic commands need to be written compactly.
+**Call relations**: Many tests call this helper before checking a policy. It prepares the command shape that functions such as `basic_match`, `add_prefix_rule_extends_policy`, and host matching tests pass into the policy checker.
 
 *Call graph*: called by 11 (add_prefix_rule_extends_policy, append_allow_prefix_rule_dedupes_existing_rule, basic_match, heuristics_match_is_returned_when_no_policy_matches, justification_can_be_used_with_allow_decision, justification_is_attached_to_forbidden_matches, match_and_not_match_examples_are_enforced, only_first_token_alias_expands_to_multiple_rules, parses_multiple_policy_files, strictest_decision_wins_across_matches (+1 more)).
 
@@ -82,11 +86,11 @@ fn tokens(cmd: &[&str]) -> Vec<String>
 fn allow_all(_: &[String]) -> Decision
 ```
 
-**Purpose**: Provides a heuristics fallback that always returns `Decision::Allow`. It isolates tests from unrelated heuristic logic.
+**Purpose**: Provides a fallback answer of “allow” when no policy rule matches. Tests use it to make clear whether an allow decision came from fallback behavior or from a real rule.
 
-**Data flow**: It ignores its `&[String]` input and returns `Decision::Allow`.
+**Data flow**: It receives a command, ignores its contents, and returns `Decision::Allow`. Nothing else is read or changed.
 
-**Call relations**: Passed into policy evaluation in tests that want unmatched commands to resolve deterministically to allow.
+**Call relations**: Policy checks call this callback only when they need the heuristic fallback decision. Tests pass it into policy checking so unmatched commands are treated as allowed.
 
 
 ##### `prompt_all`  (lines 34–36)
@@ -95,11 +99,11 @@ fn allow_all(_: &[String]) -> Decision
 fn prompt_all(_: &[String]) -> Decision
 ```
 
-**Purpose**: Provides a heuristics fallback that always returns `Decision::Prompt`. It is used to prove that explicit allow rules override fallback prompting.
+**Purpose**: Provides a fallback answer of “prompt” when no policy rule matches. Tests use it to verify that explicit allow rules can override a cautious fallback.
 
-**Data flow**: It ignores its `&[String]` input and returns `Decision::Prompt`.
+**Data flow**: It receives a command, ignores it, and returns `Decision::Prompt`. It has no side effects.
 
-**Call relations**: Used in tests where the expected result should come from policy matching rather than the fallback.
+**Call relations**: Policy checks use this as their fallback decision provider in tests that need unmatched commands to require user confirmation.
 
 
 ##### `absolute_path`  (lines 38–40)
@@ -108,11 +112,11 @@ fn prompt_all(_: &[String]) -> Decision
 fn absolute_path(path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Converts a string into `AbsolutePathBuf` with a test assertion that the input is valid. It simplifies expected-value construction in host executable tests.
+**Purpose**: Converts a text path into the project’s absolute-path type for comparisons in tests. It makes expected results match the same type used by policy internals.
 
-**Data flow**: It takes a path string, calls `AbsolutePathBuf::try_from(path.to_string())`, panics on failure via `expect`, and returns the typed absolute path.
+**Data flow**: It takes a path string, tries to convert it into an `AbsolutePathBuf`, and returns that value. If the input is not absolute, the test fails immediately.
 
-**Call relations**: Used in assertions that compare parsed or resolved host executable paths against expected values.
+**Call relations**: Host executable tests use this helper when comparing resolved program paths returned by the policy. It relies on the absolute-path conversion routine to enforce that the test data is valid.
 
 *Call graph*: calls 1 internal fn (try_from).
 
@@ -123,11 +127,11 @@ fn absolute_path(path: &str) -> AbsolutePathBuf
 fn host_absolute_path(segments: &[&str]) -> String
 ```
 
-**Purpose**: Constructs a platform-appropriate absolute path string from path segments. It abstracts over Windows drive roots versus Unix root paths.
+**Purpose**: Builds an absolute path that works on the operating system running the tests. This avoids hard-coding Unix-style paths on Windows or Windows-style paths on Unix.
 
-**Data flow**: It takes a slice of path segments, starts from `C:\` on Windows or `/` otherwise, pushes each segment into a `PathBuf`, converts the result to a lossy string, and returns the owned `String`.
+**Data flow**: It starts with the platform root, such as `/` or `C:\`, appends each requested path segment, and returns the resulting path as text.
 
-**Call relations**: Used by host executable tests to generate realistic absolute paths without hardcoding platform-specific separators.
+**Call relations**: Host executable tests call this whenever they need realistic full paths like `/usr/bin/git`. It uses platform detection so the same tests can run across operating systems.
 
 *Call graph*: called by 10 (host_executable_last_definition_wins, host_executable_rejects_name_with_path_separator, host_executable_rejects_path_with_wrong_basename, host_executable_resolution_does_not_override_exact_match, host_executable_resolution_falls_back_without_mapping, host_executable_resolution_ignores_path_not_in_allowlist, host_executable_resolution_respects_explicit_empty_allowlist, host_executable_resolution_uses_basename_rule_when_allowed, parses_host_executable_paths, prefix_rule_examples_honor_host_executable_resolution); 2 external calls (from, cfg!).
 
@@ -138,11 +142,11 @@ fn host_absolute_path(segments: &[&str]) -> String
 fn host_executable_name(name: &str) -> String
 ```
 
-**Purpose**: Returns the platform-specific executable basename for a logical command name. On Windows it appends `.exe`; elsewhere it leaves the name unchanged.
+**Purpose**: Returns the executable file name for the current platform. On Windows it adds `.exe`, while on other systems it leaves the name alone.
 
-**Data flow**: It takes a bare name string, checks `cfg!(windows)`, and returns either `format!("{name}.exe")` or `name.to_string()`.
+**Data flow**: It receives a bare program name and returns the platform-appropriate executable name string.
 
-**Call relations**: Used in tests that need basename matching to reflect platform executable naming conventions.
+**Call relations**: Tests that build actual executable paths call this before passing the name into `host_absolute_path`. This keeps path-basename checks accurate on Windows and non-Windows systems.
 
 *Call graph*: called by 2 (host_executable_resolution_uses_basename_rule_when_allowed, prefix_rule_examples_honor_host_executable_resolution); 2 external calls (cfg!, format!).
 
@@ -153,11 +157,11 @@ fn host_executable_name(name: &str) -> String
 fn starlark_string(value: &str) -> String
 ```
 
-**Purpose**: Escapes backslashes and double quotes for embedding arbitrary paths into Starlark string literals. This keeps generated policy source syntactically valid.
+**Purpose**: Escapes a string so it can be safely inserted into a Starlark policy snippet. Starlark is the small configuration language used for these rule files.
 
-**Data flow**: It takes a raw string and returns a new string with `\` doubled and `"` escaped.
+**Data flow**: It receives plain text, doubles backslashes, escapes quotation marks, and returns the escaped text. This prevents generated policy strings from breaking when paths contain special characters.
 
-**Call relations**: Used by tests that build policy source strings containing absolute paths.
+**Call relations**: Tests that create policy text with host paths call this before using string formatting. It prepares values that are then parsed by `PolicyParser`.
 
 *Call graph*: called by 8 (host_executable_last_definition_wins, host_executable_rejects_name_with_path_separator, host_executable_rejects_path_with_wrong_basename, host_executable_resolution_does_not_override_exact_match, host_executable_resolution_ignores_path_not_in_allowlist, host_executable_resolution_uses_basename_rule_when_allowed, parses_host_executable_paths, prefix_rule_examples_honor_host_executable_resolution).
 
@@ -168,11 +172,11 @@ fn starlark_string(value: &str) -> String
 fn rule_snapshots(rules: &[RuleRef]) -> Vec<RuleSnapshot>
 ```
 
-**Purpose**: Downcasts `RuleRef` trait objects into comparable concrete snapshots for assertions. It currently supports only `PrefixRule` and panics on unexpected rule types.
+**Purpose**: Turns stored rule references into plain comparable snapshots for assertions. This lets tests check the exact rules inside a policy without depending on shared reference wrappers.
 
-**Data flow**: It takes a slice of `RuleRef`, iterates it, casts each rule to `&dyn Any`, downcasts to `PrefixRule`, clones the concrete rule into `RuleSnapshot::Prefix`, collects the snapshots, and returns them.
+**Data flow**: It receives a list of rule references, looks at each rule’s concrete type, clones prefix rules into `RuleSnapshot::Prefix`, and returns the snapshot list. If an unexpected rule type appears, the test fails.
 
-**Call relations**: Used by tests that inspect parser output structurally rather than only through runtime evaluation.
+**Call relations**: Several parser and rule-addition tests call this after building a policy. It bridges the policy’s internal rule storage and the simple expected values used in assertions.
 
 *Call graph*: called by 4 (add_prefix_rule_extends_policy, only_first_token_alias_expands_to_multiple_rules, parses_multiple_policy_files, tail_aliases_are_not_cartesian_expanded); 1 external calls (iter).
 
@@ -183,11 +187,11 @@ fn rule_snapshots(rules: &[RuleRef]) -> Vec<RuleSnapshot>
 fn append_allow_prefix_rule_dedupes_existing_rule() -> Result<()>
 ```
 
-**Purpose**: Verifies that appending the same allow prefix rule twice to a policy file does not duplicate the emitted declaration. It checks the on-disk file contents directly.
+**Purpose**: Checks that appending the same allow-prefix rule twice writes it only once. This protects policy files from growing duplicate entries when the same command is approved repeatedly.
 
-**Data flow**: The test creates a temporary directory and policy path, builds a `python3` prefix with `tokens`, calls `blocking_append_allow_prefix_rule` twice, reads the file back with `fs::read_to_string`, and asserts the contents contain exactly one `prefix_rule` declaration.
+**Data flow**: It creates a temporary policy file path, appends an allow rule for `python3` twice, reads the file back, and asserts that only one rule line exists.
 
-**Call relations**: This test drives the file-append helper externally and validates deduplication at the persisted policy-text layer.
+**Call relations**: This test uses `tokens` to build the prefix and calls the external append function under test. It verifies the disk-writing path rather than only in-memory policy behavior.
 
 *Call graph*: calls 1 internal fn (tokens); 4 external calls (assert_eq!, blocking_append_allow_prefix_rule, read_to_string, tempdir).
 
@@ -198,11 +202,11 @@ fn append_allow_prefix_rule_dedupes_existing_rule() -> Result<()>
 fn network_rules_compile_into_domain_lists() -> Result<()>
 ```
 
-**Purpose**: Checks that parsed network rules are stored correctly and compiled into final allow/deny domain lists with prompt-only rules omitted. It also verifies protocol parsing for HTTPS.
+**Purpose**: Checks that network rules are parsed and reduced into allow and deny domain lists. This matters because later network enforcement needs simple lists of domains it can act on.
 
-**Data flow**: It builds a multi-rule policy source string, parses it with `PolicyParser`, builds a `Policy`, asserts the number and protocol of parsed network rules, calls `compiled_network_domains`, and compares the returned allowed and denied vectors against expected hosts.
+**Data flow**: It parses policy text with allowed, denied, and prompt-only hosts, builds a policy, inspects the parsed network rules, then asks for the compiled domain lists and compares them with expected lists.
 
-**Call relations**: Exercises parser-side `network_rule` handling together with runtime `Policy::compiled_network_domains` reduction semantics.
+**Call relations**: The test creates a `PolicyParser`, feeds it network rule text, and then exercises the policy’s network-rule accessors. It confirms that prompt-only rules are not included in the allow or deny lists.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert_eq!).
 
@@ -213,11 +217,11 @@ fn network_rules_compile_into_domain_lists() -> Result<()>
 fn network_rule_rejects_wildcard_hosts()
 ```
 
-**Purpose**: Ensures wildcard network hosts are rejected during parsing. This protects the invariant that network rules target specific hosts only.
+**Purpose**: Checks that network rules cannot use wildcard hosts such as `*`. This prevents a policy from accidentally allowing or denying the whole internet through an overly broad host pattern.
 
-**Data flow**: It creates a parser, attempts to parse a `network_rule` with host `*`, captures the error with `expect_err`, and asserts the error text mentions that wildcards are not allowed.
+**Data flow**: It parses a policy containing a wildcard host, expects parsing to fail, and checks that the error message explains wildcards are not allowed.
 
-**Call relations**: Covers the parser path through `normalize_network_rule_host` error handling.
+**Call relations**: This test calls the parser directly and stops at the parse error. It protects the validation rule for network host names.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert!).
 
@@ -228,11 +232,11 @@ fn network_rule_rejects_wildcard_hosts()
 fn basic_match() -> Result<()>
 ```
 
-**Purpose**: Verifies the simplest successful prefix-rule match. A command matching an allow rule should produce a single `PrefixRuleMatch` and an overall allow decision.
+**Purpose**: Checks the simplest prefix-rule case: a policy rule for `git status` matches the command `git status`. It proves the basic command matching path works.
 
-**Data flow**: It parses a policy containing `prefix_rule(pattern = ["git", "status"])`, builds the policy, evaluates `git status` with `allow_all`, and asserts the returned `Evaluation` exactly matches the expected decision and matched prefix.
+**Data flow**: It parses one prefix rule, builds a policy, creates the command tokens, checks the command, and compares the evaluation with the expected allow decision and matched prefix.
 
-**Call relations**: Exercises the standard parse → build → `Policy::check` flow for a single exact prefix rule.
+**Call relations**: This test uses `tokens`, `PolicyParser`, and the policy checker together. It is the baseline example that later tests build on with stricter decisions and more complex patterns.
 
 *Call graph*: calls 2 internal fn (new, tokens); 1 external calls (assert_eq!).
 
@@ -243,11 +247,11 @@ fn basic_match() -> Result<()>
 fn justification_is_attached_to_forbidden_matches() -> Result<()>
 ```
 
-**Purpose**: Checks that a rule’s justification string is preserved in runtime match output for forbidden rules. This ensures rationale survives parsing and evaluation.
+**Purpose**: Checks that a forbidden rule can carry an explanation, and that the explanation appears in the match result. This helps callers tell users why a command was blocked.
 
-**Data flow**: It parses a forbidden `rm` rule with `justification = "destructive command"`, evaluates an `rm -rf ...` command, and asserts the resulting `PrefixRuleMatch` includes `justification: Some(...)` and `Decision::Forbidden`.
+**Data flow**: It parses a forbidden `rm` rule with a justification, checks an `rm -rf ...` command, and asserts that the final decision is forbidden and the justification text is present.
 
-**Call relations**: Covers parser-side justification handling and runtime propagation through `PrefixRule::matches`.
+**Call relations**: The policy parser creates the rule, and the checker returns the matched rule details. The test confirms that explanation text survives from policy source to evaluation output.
 
 *Call graph*: calls 2 internal fn (new, tokens); 1 external calls (assert_eq!).
 
@@ -258,11 +262,11 @@ fn justification_is_attached_to_forbidden_matches() -> Result<()>
 fn justification_can_be_used_with_allow_decision() -> Result<()>
 ```
 
-**Purpose**: Verifies that justifications are not limited to rejecting rules; allow rules may also carry explanatory text. The explicit allow match should override a prompting fallback.
+**Purpose**: Checks that justifications are not limited to blocked commands. An allow rule can also explain why something is considered safe.
 
-**Data flow**: It parses an allow `ls` rule with a justification, evaluates `ls -l` using `prompt_all` as fallback, and asserts the evaluation is allow with the justification attached to the matched rule.
+**Data flow**: It parses an allow rule for `ls` with explanation text, checks `ls -l` with a prompt fallback, and asserts that the explicit allow rule wins and includes its justification.
 
-**Call relations**: Demonstrates that justification is orthogonal to decision severity and that explicit matches outrank heuristics fallback.
+**Call relations**: This test uses `prompt_all` to prove the allow came from the policy rule, not the fallback. It verifies parser and checker support for justifications on allow rules.
 
 *Call graph*: calls 2 internal fn (new, tokens); 1 external calls (assert_eq!).
 
@@ -273,11 +277,11 @@ fn justification_can_be_used_with_allow_decision() -> Result<()>
 fn justification_cannot_be_empty()
 ```
 
-**Purpose**: Ensures blank or whitespace-only justifications are rejected at parse time. This prevents storing meaningless rationale strings.
+**Purpose**: Checks that a justification made only of spaces is rejected. This prevents policies from pretending to explain a decision while giving no useful reason.
 
-**Data flow**: It parses a `prefix_rule` whose justification is spaces only, expects parsing to fail, and asserts the error text contains `invalid rule: justification cannot be empty`.
+**Data flow**: It tries to parse a rule whose justification is blank after trimming, expects a parse error, and checks that the error message names the problem.
 
-**Call relations**: Exercises the validation branch inside the parser builtin before any rule is added.
+**Call relations**: The test exercises parser validation only. It protects the rule that justification text must contain real content.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert!).
 
@@ -288,11 +292,11 @@ fn justification_cannot_be_empty()
 fn add_prefix_rule_extends_policy() -> Result<()>
 ```
 
-**Purpose**: Checks the programmatic `Policy::add_prefix_rule` API. It verifies both the stored rule structure and the runtime evaluation result.
+**Purpose**: Checks that adding a prefix rule directly to an empty policy stores the rule and affects later command checks. This covers programmatic policy creation, not just parsing from files.
 
-**Data flow**: It starts from `Policy::empty()`, adds a prompt rule for `ls -l`, inspects the stored rules via `rule_snapshots`, evaluates a longer `ls -l ...` command with `allow_all`, and asserts both the internal `PrefixRule` and resulting `Evaluation` are correct.
+**Data flow**: It starts with an empty policy, adds a prompt rule for `ls -l`, snapshots the stored rules, checks a longer `ls -l ...` command, and verifies the prompt decision and matched prefix.
 
-**Call relations**: Covers the non-parser mutation path and confirms it produces the same runtime semantics as parsed rules.
+**Call relations**: This test calls `Policy::empty`, uses `tokens` to build prefixes and commands, and uses `rule_snapshots` to inspect internal rule storage before checking behavior.
 
 *Call graph*: calls 2 internal fn (rule_snapshots, tokens); 2 external calls (assert_eq!, empty).
 
@@ -303,11 +307,11 @@ fn add_prefix_rule_extends_policy() -> Result<()>
 fn add_prefix_rule_rejects_empty_prefix() -> Result<()>
 ```
 
-**Purpose**: Ensures the programmatic prefix-rule API rejects empty prefixes. This mirrors the parser’s non-empty pattern invariant.
+**Purpose**: Checks that a policy cannot add a prefix rule with no command words. A rule with an empty prefix would be ambiguous because it could match everything.
 
-**Data flow**: It creates an empty policy, calls `add_prefix_rule(&[], Decision::Allow)`, unwraps the error, pattern-matches it as `Error::InvalidPattern`, and asserts the message is `prefix cannot be empty`.
+**Data flow**: It creates an empty policy, tries to add an empty prefix, expects an error, and verifies that the error says the prefix cannot be empty.
 
-**Call relations**: Tests the direct API validation path rather than Starlark parsing.
+**Call relations**: This test targets the direct rule-adding API. It confirms invalid input is rejected before it can enter the policy.
 
 *Call graph*: 3 external calls (assert_eq!, empty, panic!).
 
@@ -318,11 +322,11 @@ fn add_prefix_rule_rejects_empty_prefix() -> Result<()>
 fn parses_multiple_policy_files() -> Result<()>
 ```
 
-**Purpose**: Verifies that one `PolicyParser` can ingest multiple files cumulatively and preserve both rules. It also checks that evaluation returns all matching rules in order and chooses the strictest decision.
+**Purpose**: Checks that one parser can read more than one policy file and keep the rules in order. This matters because real configurations may come from shared defaults plus user overrides.
 
-**Data flow**: It parses two separate policy strings into the same parser, builds the policy, inspects the stored `git` rules via `rule_snapshots`, evaluates `git status` and `git commit -m hi`, and asserts the prompt-only and prompt-plus-forbidden evaluations respectively.
+**Data flow**: It parses one file with a broad `git` prompt rule and another with a narrower `git commit` forbidden rule, builds the policy, inspects stored rules, and checks both `git status` and `git commit` commands.
 
-**Call relations**: Exercises the parser’s multi-file accumulation behavior and the runtime aggregation logic across overlapping prefix rules.
+**Call relations**: The test uses `rule_snapshots` to verify the combined rule list and `tokens` to check behavior. It shows how rules from multiple parse calls cooperate in one final policy.
 
 *Call graph*: calls 3 internal fn (new, rule_snapshots, tokens); 1 external calls (assert_eq!).
 
@@ -333,11 +337,11 @@ fn parses_multiple_policy_files() -> Result<()>
 fn only_first_token_alias_expands_to_multiple_rules() -> Result<()>
 ```
 
-**Purpose**: Checks that alternatives in the first pattern token create separate rules keyed by each head token. Tail alternatives remain embedded in each generated rule.
+**Purpose**: Checks how aliases in a prefix pattern are expanded when the first command word has alternatives. A pattern that starts with `bash` or `sh` should create separate rule entries for those two programs.
 
-**Data flow**: It parses a rule with first-token alternatives `["bash", "sh"]` and second-token alternatives `["-c", "-l"]`, inspects the resulting `bash` and `sh` rule sets, evaluates representative commands for each shell, and asserts both match correctly.
+**Data flow**: It parses a rule whose first token has two alternatives and whose second token also has alternatives, builds the policy, confirms separate `bash` and `sh` stored rules, and checks matching commands for both.
 
-**Call relations**: Validates the parser builtin’s special expansion logic for the first token only.
+**Call relations**: This test uses `rule_snapshots` to inspect expansion and `tokens` to test actual matching. It protects the special treatment of the first command word, which is used as the lookup key.
 
 *Call graph*: calls 3 internal fn (new, rule_snapshots, tokens); 1 external calls (assert_eq!).
 
@@ -348,11 +352,11 @@ fn only_first_token_alias_expands_to_multiple_rules() -> Result<()>
 fn tail_aliases_are_not_cartesian_expanded() -> Result<()>
 ```
 
-**Purpose**: Ensures alternatives after the first token are stored as `PatternToken::Alts` rather than expanded into multiple Cartesian-product rules. This keeps rule count bounded and matching semantics positional.
+**Purpose**: Checks that alternatives after the first command word stay inside one rule rather than exploding into every possible combination. This keeps policies compact and predictable.
 
-**Data flow**: It parses an `npm` rule with two tail alternative positions, inspects the single stored rule via `rule_snapshots`, evaluates commands using different allowed combinations, and asserts both commands match the same logical rule.
+**Data flow**: It parses an `npm` rule with alternatives for later arguments, verifies that the policy stores one rule with alternative tokens, then checks two valid command variants.
 
-**Call relations**: Covers the parser’s distinction between head-token expansion and tail-token grouped alternatives.
+**Call relations**: The test uses `rule_snapshots` to confirm the internal shape and policy checking to confirm the alternatives still match. It contrasts with the first-token expansion behavior tested elsewhere.
 
 *Call graph*: calls 3 internal fn (new, rule_snapshots, tokens); 1 external calls (assert_eq!).
 
@@ -363,11 +367,11 @@ fn tail_aliases_are_not_cartesian_expanded() -> Result<()>
 fn match_and_not_match_examples_are_enforced() -> Result<()>
 ```
 
-**Purpose**: Verifies that positive and negative examples attached to a rule are accepted when they reflect actual matching behavior. It also demonstrates that a non-matching command falls through to heuristics.
+**Purpose**: Checks that examples embedded in a rule are used to validate the rule’s pattern. The policy author can say “this should match” and “this should not match,” and the parser enforces those claims.
 
-**Data flow**: It parses a `git status` rule with both list-form and string-form examples, builds the policy, evaluates a matching command and a deliberately non-matching command, and asserts the first yields a `PrefixRuleMatch` while the second yields a heuristics allow match.
+**Data flow**: It parses a `git status` rule with positive and negative examples, builds the policy, checks a matching command, then checks a similar non-matching command and verifies it falls back to heuristics.
 
-**Call relations**: Exercises parse-time example parsing and validation together with runtime matching behavior.
+**Call relations**: This test goes through parser validation and runtime checking. It uses `tokens` to compare the intended command examples with the actual evaluation results.
 
 *Call graph*: calls 2 internal fn (new, tokens); 1 external calls (assert_eq!).
 
@@ -378,11 +382,11 @@ fn match_and_not_match_examples_are_enforced() -> Result<()>
 fn strictest_decision_wins_across_matches() -> Result<()>
 ```
 
-**Purpose**: Checks that when multiple rules match one command, the overall evaluation decision is the strictest among them. The matched-rules list should still include all contributing matches.
+**Purpose**: Checks that when multiple rules match one command, the most restrictive decision becomes the final answer. This prevents a broad softer rule from weakening a narrower stronger rule.
 
-**Data flow**: It parses a prompt `git` rule and a forbidden `git commit` rule, evaluates `git commit -m hi`, and asserts the evaluation contains both matches but has overall `Decision::Forbidden`.
+**Data flow**: It parses a prompt rule for `git` and a forbidden rule for `git commit`, checks `git commit -m hi`, and asserts that both rules are recorded but the final decision is forbidden.
 
-**Call relations**: Directly validates `Evaluation::from_matches` severity aggregation over multiple prefix matches.
+**Call relations**: The policy checker gathers all matching prefix rules and combines their decisions. This test confirms the combining rule prefers forbidden over prompt or allow.
 
 *Call graph*: calls 2 internal fn (new, tokens); 1 external calls (assert_eq!).
 
@@ -393,11 +397,11 @@ fn strictest_decision_wins_across_matches() -> Result<()>
 fn strictest_decision_across_multiple_commands() -> Result<()>
 ```
 
-**Purpose**: Checks that batch evaluation across several commands aggregates all matches and still chooses the strictest decision globally. Duplicate prompt matches from different commands are preserved.
+**Purpose**: Checks that the strictest decision also wins when evaluating a batch of commands. If any command in the batch is forbidden, the whole batch must be treated as forbidden.
 
-**Data flow**: It parses the same overlapping `git` rules as the previous test, builds a vector of two commands, calls `policy.check_multiple`, and asserts the resulting evaluation contains three matches total and overall `Decision::Forbidden`.
+**Data flow**: It builds a policy with prompt and forbidden `git` rules, creates two commands, checks them together, and verifies the final forbidden decision plus all individual matched rules.
 
-**Call relations**: Exercises `Policy::check_multiple` and `check_multiple_with_options` rather than single-command evaluation.
+**Call relations**: This test exercises `check_multiple` rather than single-command checking. It shows that batch evaluation reuses the same strictness logic across all commands.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_eq!, vec!).
 
@@ -408,11 +412,11 @@ fn strictest_decision_across_multiple_commands() -> Result<()>
 fn heuristics_match_is_returned_when_no_policy_matches()
 ```
 
-**Purpose**: Ensures that an empty policy produces a heuristics match instead of an empty evaluation. This confirms the fallback contract for unmatched commands.
+**Purpose**: Checks what happens when no explicit policy rule matches. The system should still return an evaluation, using the fallback heuristic decision and recording that it came from heuristics.
 
-**Data flow**: It creates `Policy::empty()`, evaluates `python` with `prompt_all`, and asserts the result is an `Evaluation` containing one `HeuristicsRuleMatch` with `Decision::Prompt`.
+**Data flow**: It creates an empty policy, checks `python` with a prompt fallback, and verifies that the result is a prompt heuristic match containing the original command.
 
-**Call relations**: Covers the fallback branch in `Policy::matches_for_command_with_options` and aggregation into `Evaluation`.
+**Call relations**: This test uses `Policy::empty`, `tokens`, and `prompt_all`. It confirms the checker’s fallback path produces a clear match record instead of an empty or unexplained result.
 
 *Call graph*: calls 1 internal fn (tokens); 2 external calls (assert_eq!, empty).
 
@@ -423,11 +427,11 @@ fn heuristics_match_is_returned_when_no_policy_matches()
 fn parses_host_executable_paths() -> Result<()>
 ```
 
-**Purpose**: Verifies that `host_executable` declarations parse absolute paths, deduplicate repeated entries, and store them under the executable name. It checks the resulting typed path values directly.
+**Purpose**: Checks that `host_executable` policy entries accept absolute paths, remove duplicates, and store the allowed paths for a program name. This is needed to safely map full executable paths back to command names.
 
-**Data flow**: It constructs two absolute `git` paths, escapes them for Starlark, parses a `host_executable` declaration containing both plus a duplicate, builds the policy, and asserts the stored `git` mapping contains exactly the two unique `AbsolutePathBuf` values in order.
+**Data flow**: It builds platform-correct paths for `git`, escapes them into policy text, parses the host executable entry, builds the policy, and compares the stored paths with expected absolute-path values.
 
-**Call relations**: Exercises parser-side host executable path parsing, basename validation, and deduplication.
+**Call relations**: The test relies on `host_absolute_path`, `starlark_string`, and `absolute_path`. It verifies the parser’s host executable storage before resolution behavior is tested later.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert_eq!, format!).
 
@@ -438,11 +442,11 @@ fn parses_host_executable_paths() -> Result<()>
 fn host_executable_rejects_non_absolute_path()
 ```
 
-**Purpose**: Ensures relative paths are rejected in `host_executable` declarations. This preserves the invariant that host executable mappings are absolute and unambiguous.
+**Purpose**: Checks that host executable paths must be absolute. A relative path like `git` is not precise enough to identify which program will run.
 
-**Data flow**: It parses `host_executable(name = "git", paths = ["git"])`, expects an error, and asserts the message mentions that paths must be absolute.
+**Data flow**: It parses a `host_executable` entry with `paths = ["git"]`, expects parsing to fail, and checks the error message.
 
-**Call relations**: Covers the parser helper `parse_literal_absolute_path` through the builtin error path.
+**Call relations**: This test targets parser validation for host executable paths. It protects the rule that executable allowlists must name exact full paths.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (assert!).
 
@@ -453,11 +457,11 @@ fn host_executable_rejects_non_absolute_path()
 fn host_executable_rejects_name_with_path_separator()
 ```
 
-**Purpose**: Ensures the declared executable name must be a bare basename rather than a full path. This prevents malformed lookup keys.
+**Purpose**: Checks that the `name` field for a host executable must be only a bare program name, not a path. This keeps the name separate from the list of allowed paths.
 
-**Data flow**: It generates an absolute git path, embeds it as both `name` and path, parses the declaration expecting failure, and asserts the error mentions that the name must be a bare executable name.
+**Data flow**: It creates an absolute git path, puts that path in the `name` field, parses the policy, expects an error, and checks that the message says the name must be bare.
 
-**Call relations**: Exercises `validate_host_executable_name` through the parser builtin.
+**Call relations**: The test uses `host_absolute_path` and `starlark_string` to build realistic invalid input. It confirms the parser rejects mixing up program names and paths.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert!, format!).
 
@@ -468,11 +472,11 @@ fn host_executable_rejects_name_with_path_separator()
 fn host_executable_rejects_path_with_wrong_basename()
 ```
 
-**Purpose**: Ensures each declared host executable path has the same basename as the declared executable name. This prevents mismatched mappings like `name = git` pointing at `rg`.
+**Purpose**: Checks that an allowed path for `git` must actually end with the executable name `git`. This prevents a policy from accidentally mapping a different program, such as `rg`, to the name `git`.
 
-**Data flow**: It generates an absolute `rg` path, embeds it in a `host_executable(name = "git", ...)` declaration, expects parsing to fail, and asserts the error mentions the required basename.
+**Data flow**: It creates a path ending in `rg`, inserts it into a `host_executable(name = "git")` entry, expects parsing to fail, and checks that the error mentions the required basename.
 
-**Call relations**: Covers the parser builtin’s basename consistency check using executable lookup helpers.
+**Call relations**: This test uses path and string helpers to create policy text. It protects the parser’s consistency check between executable name and allowed paths.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert!, format!).
 
@@ -483,11 +487,11 @@ fn host_executable_rejects_path_with_wrong_basename()
 fn host_executable_last_definition_wins() -> Result<()>
 ```
 
-**Purpose**: Verifies that when multiple parsed files define the same host executable name, the later definition replaces the earlier path list. This matches the builder’s `HashMap::insert` semantics.
+**Purpose**: Checks that when the same host executable is defined more than once, the later definition replaces the earlier one. This lets user-specific policy override shared defaults.
 
-**Data flow**: It parses one file mapping `git` to `/usr/bin/git`, then another mapping `git` to a Homebrew path, builds the policy, and asserts the stored mapping contains only the later path.
+**Data flow**: It parses one policy file mapping `git` to one path, then another mapping `git` to a different path, builds the policy, and asserts that only the later path remains.
 
-**Call relations**: Exercises multi-file parser accumulation specifically for host executable mappings rather than prefix rules.
+**Call relations**: The test parses multiple snippets through one `PolicyParser`. It uses host path helpers to verify override behavior in the final policy.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert_eq!, format!).
 
@@ -498,11 +502,11 @@ fn host_executable_last_definition_wins() -> Result<()>
 fn host_executable_resolution_uses_basename_rule_when_allowed() -> Result<()>
 ```
 
-**Purpose**: Checks that an absolute executable path can match basename-keyed rules when host executable resolution is enabled and the path is in the allowlist. The resulting match should record the resolved absolute program path.
+**Purpose**: Checks that a command using an allowed full executable path can match a rule written for the bare name. For example, `/usr/bin/git status` can match `git status` when `/usr/bin/git` is allowed.
 
-**Data flow**: It builds a policy with `prefix_rule(pattern = ["git", "status"], decision = "prompt")` plus a matching `host_executable` declaration, evaluates `[absolute_git_path, "status"]` with `resolve_host_executables: true`, and asserts the result is a prompt `PrefixRuleMatch` whose `resolved_program` is `Some(absolute_path)`.
+**Data flow**: It creates a policy with a `git status` prompt rule and an allowed git path, checks a command whose first word is that full path with resolution turned on, and expects the bare-name rule to match with the resolved path recorded.
 
-**Call relations**: Exercises the `match_host_executable_rules` branch and `RuleMatch::with_resolved_program` behavior.
+**Call relations**: This test combines prefix matching with host executable resolution. It uses platform-aware name and path helpers so the same behavior is verified across operating systems.
 
 *Call graph*: calls 4 internal fn (new, host_absolute_path, host_executable_name, starlark_string); 2 external calls (assert_eq!, format!).
 
@@ -513,11 +517,11 @@ fn host_executable_resolution_uses_basename_rule_when_allowed() -> Result<()>
 fn prefix_rule_examples_honor_host_executable_resolution() -> Result<()>
 ```
 
-**Purpose**: Verifies that parse-time `match` and `not_match` example validation uses host executable resolution. A positive example with an allowed absolute path and a negative example with a different path should both validate successfully.
+**Purpose**: Checks that rule examples are validated using the same host executable resolution rules as real command checks. This keeps examples honest when full paths are involved.
 
-**Data flow**: It constructs allowed and disallowed absolute git paths, embeds them into a policy where the rule examples use those paths and a `host_executable` declaration allows only one of them, then parses the policy and expects success.
+**Data flow**: It builds policy text where a `git status` rule has a positive example using an allowed full path and a negative example using another full path, then parses the policy successfully.
 
-**Call relations**: Specifically covers the parser’s deferred example validation path using a temporary policy with `resolve_host_executables: true`.
+**Call relations**: The test mainly exercises parser-time example validation. It uses `host_executable_name`, `host_absolute_path`, and `starlark_string` to create platform-correct examples.
 
 *Call graph*: calls 4 internal fn (new, host_absolute_path, host_executable_name, starlark_string); 1 external calls (format!).
 
@@ -528,11 +532,11 @@ fn prefix_rule_examples_honor_host_executable_resolution() -> Result<()>
 fn host_executable_resolution_respects_explicit_empty_allowlist() -> Result<()>
 ```
 
-**Purpose**: Ensures that an explicit empty `host_executable` path list blocks basename-based resolution rather than acting like no mapping. This lets policy authors intentionally disable host-path matching for a name.
+**Purpose**: Checks that an explicit empty allowlist means “do not resolve this executable name from any path.” This is different from having no mapping at all.
 
-**Data flow**: It parses a prompt `git` rule plus `host_executable(name = "git", paths = [])`, evaluates an absolute git path with host resolution enabled, and asserts the result falls through to a heuristics allow match instead of matching the basename rule.
+**Data flow**: It parses a `git` rule plus `host_executable(name = "git", paths = [])`, checks a full git path with resolution enabled, and verifies the bare `git` rule does not match; the command falls back to heuristics.
 
-**Call relations**: Exercises the allowlist check inside `match_host_executable_rules` where an existing mapping with no matching path causes an immediate no-match.
+**Call relations**: This test uses `host_absolute_path` to create the full path. It protects the meaning of an empty host executable list as a deliberate block on resolution.
 
 *Call graph*: calls 2 internal fn (new, host_absolute_path); 1 external calls (assert_eq!).
 
@@ -543,11 +547,11 @@ fn host_executable_resolution_respects_explicit_empty_allowlist() -> Result<()>
 fn host_executable_resolution_ignores_path_not_in_allowlist() -> Result<()>
 ```
 
-**Purpose**: Checks that basename-based resolution is denied for absolute paths not present in a configured allowlist. Unlisted paths should behave as unmatched commands.
+**Purpose**: Checks that full-path resolution happens only for paths listed in the allowlist. A different `git` binary should not match the bare `git` rule just because its file name is `git`.
 
-**Data flow**: It parses a prompt `git` rule plus a `host_executable` declaration allowing only one absolute path, evaluates a different absolute git path with host resolution enabled, and asserts the result is a heuristics allow match.
+**Data flow**: It defines an allowed git path, checks a different git path with resolution enabled, and verifies the policy falls back to the heuristic allow result instead of matching the prompt rule.
 
-**Call relations**: Covers the negative allowlist branch of `match_host_executable_rules`.
+**Call relations**: This test uses host path and escaping helpers to build the policy. It confirms the resolver compares the actual path against the allowlist before applying basename rules.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert_eq!, format!).
 
@@ -558,11 +562,11 @@ fn host_executable_resolution_ignores_path_not_in_allowlist() -> Result<()>
 fn host_executable_resolution_falls_back_without_mapping() -> Result<()>
 ```
 
-**Purpose**: Ensures that when no `host_executable` mapping exists for a basename, absolute-path commands may still match basename rules if host resolution is enabled. The original path should still be recorded in the match.
+**Purpose**: Checks the default behavior when there is no `host_executable` mapping at all. In that case, a full path can still fall back to matching by its basename.
 
-**Data flow**: It parses only a prompt `git` rule, evaluates an absolute git path with host resolution enabled, and asserts the result is a prompt `PrefixRuleMatch` with `resolved_program: Some(absolute_path)`.
+**Data flow**: It parses a prompt rule for `git`, checks a full path ending in `git` with resolution enabled, and expects the bare `git` rule to match with the resolved path recorded.
 
-**Call relations**: Exercises the permissive branch in `match_host_executable_rules` where absence of a mapping does not block basename matching.
+**Call relations**: This test contrasts with the explicit empty allowlist and not-in-allowlist tests. It shows the resolver’s fallback behavior when the policy has not restricted that executable name.
 
 *Call graph*: calls 2 internal fn (new, host_absolute_path); 1 external calls (assert_eq!).
 
@@ -573,11 +577,11 @@ fn host_executable_resolution_falls_back_without_mapping() -> Result<()>
 fn host_executable_resolution_does_not_override_exact_match() -> Result<()>
 ```
 
-**Purpose**: Verifies that exact first-token matches take precedence over host executable basename resolution. A literal absolute-path rule should win even if a basename rule and host mapping also exist.
+**Purpose**: Checks that an exact full-path rule takes priority over basename resolution. If the policy has a rule for `/usr/bin/git`, that exact rule should be used before considering the bare `git` rule.
 
-**Data flow**: It parses a policy containing an allow rule keyed by the absolute git path, a prompt basename `git` rule, and a matching `host_executable` declaration, evaluates the absolute-path command with host resolution enabled, and asserts only the exact allow rule matches with `resolved_program: None`.
+**Data flow**: It parses one rule for the full git path and another for bare `git`, adds the host executable mapping, checks the full-path command with resolution enabled, and verifies only the exact full-path allow rule matches.
 
-**Call relations**: Directly validates the precedence ordering implemented in `Policy::matches_for_command_with_options`: exact matches are attempted before host executable rewriting.
+**Call relations**: This test brings together exact prefix matching, host executable mappings, and resolution options. It confirms the matcher does not rewrite a command path when a direct rule already applies.
 
 *Call graph*: calls 3 internal fn (new, host_absolute_path, starlark_string); 2 external calls (assert_eq!, format!).
 
@@ -587,20 +591,20 @@ These files assemble the legacy execpolicy integration corpus into a single orga
 
 ### `execpolicy-legacy/tests/all.rs`
 
-`test` · `test discovery and execution`
+`test` · `test run`
 
-This file is intentionally minimal: it exists to make Cargo compile one integration test target that aggregates all test modules under `tests/suite/`. Rather than defining test logic itself, it declares `mod suite;`, causing Rust’s integration-test harness to load the nested module tree rooted at `tests/suite/mod.rs`. That arrangement consolidates formerly standalone integration tests into a shared binary, which can reduce duplicated setup and make common helpers or fixtures easier to share across modules.
-
-Because integration tests are compiled as separate crates, this file acts as the crate root for the test binary. Its only responsibility is module inclusion; all actual assertions, fixtures, and scenario coverage live below it. The design choice here is organizational rather than behavioral: by centralizing test discovery through one root, the suite can be structured as ordinary Rust modules instead of many separate files each producing its own binary. There is no runtime state, control flow, or exported API beyond the implicit test harness behavior triggered by module inclusion.
+This file is intentionally tiny, but it plays an important organizing role. In Rust, an integration test file under `tests/` is compiled as its own test program. Here, the project uses one test program named `all.rs` and pulls in a larger group of tests through `mod suite;`. That line is like putting a sign on the door that says, “the actual tests are in the suite room.” Without this file, the test modules under `tests/suite/` would not be connected to this integration test binary, so they may not run as part of the normal test command. The file does not contain test logic itself. Its job is to gather the test suite into one place so the test runner can discover and execute it consistently.
 
 
 ### `execpolicy-legacy/tests/suite/mod.rs`
 
-`test` · `test discovery and execution`
+`test` · `test run`
 
-This module is the index for the integration test suite under `tests/suite/`. It declares each scenario-focused submodule—`bad`, `cp`, `good`, `head`, `literal`, `ls`, `parse_sed_command`, `pwd`, and `sed`—so the parent integration-test crate can compile and run them together. The file itself contains no test code, but it defines the suite’s structure and therefore controls which test files participate in the aggregated binary.
+This file does not contain test code itself. Instead, it gathers several older, once-separate integration tests into one shared test suite. In Rust, a line like `mod bad;` means “include the test code from the matching module file.” Think of this file like the index page of a notebook: the real notes are on other pages, but without the index the notebook would not know which sections to include.
 
-The naming of the submodules reflects the coverage split: some modules appear to group broad success/failure cases (`good`, `bad`), while others target specific commands or parsing behaviors (`cp`, `head`, `ls`, `pwd`, `sed`, `parse_sed_command`, `literal`). By collecting them here, the suite can share crate-level imports and helper visibility rules while keeping command-specific assertions isolated. There is no executable logic in this file beyond Rust’s module-loading semantics, but it is still important to the test lifecycle because removing or renaming a module declaration here changes which tests are compiled and discovered by the harness.
+The modules named here appear to cover command behavior and parsing cases, such as `cp`, `head`, `ls`, `pwd`, and `sed`, plus broader categories like `good`, `bad`, `literal`, and `parse_sed_command`. By listing them here, the project makes sure those tests are discovered by the Rust test runner and checked as part of the legacy test suite.
+
+If this file were missing or a module line were removed, the corresponding tests would no longer be part of this suite. That could let regressions slip through unnoticed, especially in older behavior that the project still wants to preserve.
 
 
 ### Legacy corpus regressions
@@ -610,9 +614,7 @@ These regression tests validate that the curated default-policy good and bad com
 
 `test` · `test run`
 
-This test file is intentionally small and focused: it loads the crate's default policy and asks that policy to evaluate each entry in its built-in bad list one by one. The expected result is an empty `Vec<NegativeExamplePassedCheck>`, meaning no supposedly bad example slipped through validation. By asserting exact equality with an empty vector rather than only checking length, the test makes the intended contract explicit: there should be zero recorded violations of the negative-example suite.
-
-The file does not construct `ExecCall` values manually or inspect individual error variants. Instead, it exercises the policy's own aggregate self-check helper, which centralizes the list of known-bad commands and the logic for reporting any that unexpectedly pass. That makes this test a broad safety net over the shipped default policy rather than a unit test of one parser branch. Its main edge case is startup failure: if the default policy cannot be loaded, the test aborts immediately with `expect`, because no meaningful rejection audit can proceed without the canonical policy definition.
+This file is a safety net for the legacy execution policy. An execution policy is the set of rules that decides which commands are allowed to run and which should be blocked. Here, the project keeps a “bad list”: examples that must not pass the policy check. The test loads the default policy, checks each bad example one by one, and then confirms that none of those bad examples were accepted. In everyday terms, it is like checking a security guard’s training list: every person marked “do not admit” should be turned away. If even one bad example gets through, the test fails and reports it as a violation. This matters because a small policy change could accidentally allow a dangerous command. By running this test, developers get a clear warning before that weakened policy reaches users.
 
 #### Function details
 
@@ -622,11 +624,11 @@ The file does not construct `ExecCall` values manually or inspect individual err
 fn verify_everything_in_bad_list_is_rejected()
 ```
 
-**Purpose**: Loads the default policy and verifies that its built-in negative examples produce no false accepts. It acts as a suite-level invariant check over the policy's rejection corpus.
+**Purpose**: This test verifies that every known bad example is rejected by the default policy. It is used to catch mistakes where a forbidden command pattern starts being accepted.
 
-**Data flow**: Calls `get_default_policy()` and unwraps the resulting policy with `expect`. It then invokes `policy.check_each_bad_list_individually()`, collects the returned `Vec<NegativeExamplePassedCheck>`, and asserts that it equals a newly constructed empty vector.
+**Data flow**: It starts with no input from the caller. It loads the default policy, asks that policy to test each bad-list example separately, and receives a list of any bad examples that wrongly passed. It then compares that list with an empty list; the expected result is that there are no violations.
 
-**Call relations**: This is a top-level test entry invoked by the Rust test harness. It depends on the external default-policy loader and then on the policy object's aggregate bad-list checker; the final `assert_eq!` is the only decision point, failing the test if any bad example was accepted.
+**Call relations**: During the test run, this function calls `get_default_policy` to build the policy being tested. After checking the bad examples, it uses `assert_eq!` to make the test pass only when the list of wrongly accepted examples is empty.
 
 *Call graph*: 2 external calls (assert_eq!, get_default_policy).
 
@@ -635,9 +637,11 @@ fn verify_everything_in_bad_list_is_rejected()
 
 `test` · `test run`
 
-This file mirrors the negative-example suite but for allowed commands. It loads the default policy, asks it to evaluate each built-in good example individually, and asserts that the resulting `Vec<PositiveExampleFailedCheck>` is empty. In other words, none of the examples that document intended safe usage should fail validation.
+This file is a safety check for the legacy execution policy, which is the part of the system that decides whether a proposed command should be allowed to run. The policy has a “good list”: examples that are meant to be accepted. This test loads the project’s default policy, then asks it to test each good example one by one. If any supposedly good example is rejected, the test reports that as a failure.
 
-The test is intentionally aggregate rather than command-specific. It does not inspect `ValidExec` contents or individual error variants; instead, it trusts the policy object's own helper to iterate the positive corpus and report any failures in a structured way. That makes the file a broad compatibility check over the shipped policy definitions and examples. As with the bad-list test, policy loading is treated as a prerequisite: `expect` aborts immediately if the default policy cannot be constructed, because the suite's purpose is to validate the canonical policy bundle itself. The exact equality against an empty vector makes the success condition unambiguous and keeps any future failure output tied to the crate's dedicated `PositiveExampleFailedCheck` reporting type.
+In plain terms, this is like checking that every item on a restaurant’s “approved ingredients” list is still accepted by the kitchen rules. If the rules change and suddenly reject tomatoes, this test catches that mismatch.
+
+The important behavior is that it does not just check the list as a whole. It checks each good example individually, so the result can identify specific positive examples that no longer pass. The test expects an empty list of failures. If the list is not empty, that means the policy and its own examples disagree, and the test fails.
 
 #### Function details
 
@@ -647,11 +651,11 @@ The test is intentionally aggregate rather than command-specific. It does not in
 fn verify_everything_in_good_list_is_allowed()
 ```
 
-**Purpose**: Loads the default policy and verifies that all built-in positive examples pass checking. It serves as a suite-wide acceptance regression test.
+**Purpose**: This test proves that all examples labeled as allowed by the default legacy policy are still accepted. It is used to catch mistakes where a policy change accidentally blocks a command that the project says should be safe.
 
-**Data flow**: Calls `get_default_policy()` and unwraps it with `expect`, then invokes `policy.check_each_good_list_individually()` to obtain a `Vec<PositiveExampleFailedCheck>`. It asserts that this vector equals an empty vector.
+**Data flow**: It starts by loading the default policy. Then it asks that policy to check every “good” example separately. The policy returns a list of any positive examples that failed the check. The test then compares that list with an empty list; if anything is in it, the test fails.
 
-**Call relations**: This function is run directly by the test harness. It delegates policy construction and aggregate example checking to external crate APIs, then uses a single assertion to fail if any documented good example is rejected.
+**Call relations**: During the test run, the test calls on `get_default_policy` to obtain the standard policy used by the project. It then uses the policy’s own good-list checking behavior and finally hands the result to the assertion check, which decides whether the test passes or fails.
 
 *Call graph*: 2 external calls (assert_eq!, get_default_policy).
 
@@ -663,9 +667,11 @@ These command-specific matcher tests exercise default-policy handling for common
 
 `test` · `test run`
 
-This test module focuses on how the default policy interprets `cp` command lines. A shared `setup()` helper loads the default policy once per test invocation, keeping the individual tests concise. The negative cases establish the command's argument-shape rules: no arguments yields `Error::NotEnoughArgs` with the expected `ArgMatcher` sequence, while a single argument yields `Error::VarargMatcherDidNotMatchAnything`, reflecting that the source-file vararg matcher did not consume any values before the required destination.
+This is a test file for the legacy execution policy, which is the part of the system that decides whether a requested command is allowed and how its arguments should be understood. Here the command under inspection is `cp`, the common file-copying tool. In everyday terms, the policy should read `cp foo bar` as: “read from `foo`, write to `bar`.” For `cp foo bar baz`, it should read both `foo` and `bar` as source files, and `baz` as the destination.
 
-The positive cases build explicit expected `MatchedExec::Match` values. For a two-argument copy, the first positional argument must validate as `ArgType::ReadableFile` and the second as `ArgType::WriteableFile`. For a three-argument copy, the first two are readable sources and the last is the writable destination. Both tests also verify that the accepted execution includes the preferred absolute binaries `/bin/cp` and `/usr/bin/cp`. By constructing expected `MatchedArg` values with their original indices, the tests confirm not just acceptance but the parser's exact positional bookkeeping and type assignment. Returning `Result<()>` in the success tests allows `MatchedArg::new` validation failures to propagate naturally during test setup.
+The tests cover both rejected and accepted cases. If someone tries to run `cp` with no arguments, the policy should reject it because both the source and destination are missing. If there is only one argument, the policy should also reject it because there is no separate destination, and the source-file pattern did not get a usable match. For valid examples, the tests confirm that the policy records each argument with the right meaning: readable file for sources, writable file for the destination.
+
+This matters because the execution policy is like a gatekeeper. If it misunderstands command arguments, it could either block safe commands or allow unsafe file access. These tests make sure `cp` is interpreted in the expected, safety-conscious way.
 
 #### Function details
 
@@ -675,11 +681,11 @@ The positive cases build explicit expected `MatchedExec::Match` values. For a tw
 fn setup() -> Policy
 ```
 
-**Purpose**: Loads the default policy for the `cp` test cases. It centralizes the `expect` message so each test can focus on command-specific assertions.
+**Purpose**: This helper loads the default policy used by all the `cp` tests. It keeps the tests focused on command behavior instead of repeating policy setup code.
 
-**Data flow**: Calls `get_default_policy()` and unwraps the result with `expect("failed to load default policy")`, returning a concrete `Policy` value. It does not mutate shared state.
+**Data flow**: It takes no input. It asks the policy library for the default policy, expects that loading to succeed, and returns the loaded `Policy` object for the tests to use.
 
-**Call relations**: This helper is called by every test in the file before constructing an `ExecCall`. It sits at the start of each test's flow and delegates all policy loading to the external default-policy factory.
+**Call relations**: Each test calls this first, so they all check the same shared default rules. It delegates the actual loading work to `get_default_policy`, then hands the ready-to-use policy back to the test.
 
 *Call graph*: called by 4 (test_cp_multiple_files, test_cp_no_args, test_cp_one_arg, test_cp_one_file); 1 external calls (get_default_policy).
 
@@ -690,11 +696,11 @@ fn setup() -> Policy
 fn test_cp_no_args()
 ```
 
-**Purpose**: Verifies that invoking `cp` with no positional arguments is rejected as having too few arguments. It checks the exact error payload, including the expected argument matcher sequence.
+**Purpose**: This test proves that `cp` with no arguments is rejected. Without this check, the policy might accidentally treat an incomplete copy command as safe or meaningful.
 
-**Data flow**: Obtains a `Policy` via `setup()`, constructs `ExecCall::new("cp", &[])`, invokes `policy.check(&cp)`, and compares the result against `Err(Error::NotEnoughArgs { ... })` using `assert_eq!`.
+**Data flow**: It starts by loading the default policy, then builds an execution request for `cp` with an empty argument list. It sends that request into the policy checker and expects an error saying there are not enough arguments: the policy wanted readable source files and a writable destination file, but got nothing.
 
-**Call relations**: The test harness invokes this function as a standalone test. It depends on `setup` for policy initialization and on `ExecCall::new` to build the observed command, then exercises the policy checker and stops at the assertion.
+**Call relations**: The test uses `setup` to get the default rules, creates an `ExecCall` to describe the attempted command, and then compares the policy result with the expected failure. It is one of the negative tests that verifies bad `cp` shapes are refused.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -705,11 +711,11 @@ fn test_cp_no_args()
 fn test_cp_one_arg()
 ```
 
-**Purpose**: Checks that a single-argument `cp` call is rejected because the source-file vararg matcher cannot match a complete source/destination pattern. It documents the policy's interpretation of an incomplete copy command.
+**Purpose**: This test proves that `cp` with only one file name is rejected. A copy command needs a source and a destination, so one argument is not enough to safely understand the user’s intent.
 
-**Data flow**: Loads the policy with `setup()`, creates `ExecCall::new("cp", &["foo/bar"])`, runs `policy.check(&cp)`, and asserts equality with `Err(Error::VarargMatcherDidNotMatchAnything { program, matcher })`.
+**Data flow**: It loads the default policy, builds a request for `cp foo/bar`, and asks the policy to check it. The expected result is an error saying the variable-length source-file matcher did not match anything, because the single argument cannot satisfy both the source side and the destination side.
 
-**Call relations**: This test is another direct harness entry. It follows the same setup-and-check pattern as the other `cp` tests, but targets the branch where argument matching fails after partial input.
+**Call relations**: Like the other tests, it gets its policy from `setup` and describes the command with `ExecCall::new`. It then checks that the policy rejects this incomplete command before any later code could treat it as a valid file operation.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -720,11 +726,11 @@ fn test_cp_one_arg()
 fn test_cp_one_file() -> Result<()>
 ```
 
-**Purpose**: Verifies that `cp source dest` is accepted and normalized into a `ValidExec` with one readable source and one writable destination. It also checks the preferred absolute executable paths.
+**Purpose**: This test checks the simplest valid copy command: one source file and one destination file. It confirms that the policy marks the first path as something to read and the second path as something to write.
 
-**Data flow**: Calls `setup()` for a `Policy`, builds `ExecCall::new("cp", &["foo/bar", "../baz"])`, constructs the expected `MatchedExec::Match` using `ValidExec::new` and two validated `MatchedArg::new` values, asserts equality with `policy.check(&cp)`, and returns `Ok(())`.
+**Data flow**: It loads the default policy, creates a request for `cp foo/bar ../baz`, and runs the policy check. The expected output is a successful match: argument 0 becomes a readable file, argument 1 becomes a writable file, and the command is tied to the allowed `cp` program paths.
 
-**Call relations**: Invoked by the test harness for the successful two-argument case. It relies on `MatchedArg::new` and `ValidExec::new` to build the exact expected accepted-exec structure that `policy.check` should produce.
+**Call relations**: After `setup` provides the rules, this test builds both the command being checked and the expected structured result. It relies on `MatchedArg::new` and `ValidExec::new` to describe what a correctly approved `cp` command should look like, then compares that with the policy’s answer.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -735,11 +741,11 @@ fn test_cp_one_file() -> Result<()>
 fn test_cp_multiple_files() -> Result<()>
 ```
 
-**Purpose**: Verifies that `cp` with multiple source files and one destination is accepted with the correct per-position argument typing. It confirms that all but the final positional argument are treated as readable inputs and the last as the writable output.
+**Purpose**: This test checks the common `cp` form with multiple source files and one destination. It makes sure the policy treats all earlier arguments as readable sources and only the final argument as the writable target.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("cp", &["foo", "bar", "baz"])`, builds an expected `MatchedExec::Match` containing three `MatchedArg` entries and the `/bin/cp` and `/usr/bin/cp` system paths, asserts equality with `policy.check(&cp)`, and returns `Ok(())`.
+**Data flow**: It loads the default policy, creates a request for `cp foo bar baz`, and checks it. The expected result is a successful match where `foo` and `bar` are readable files, `baz` is a writable file, and the command is matched to the allowed system `cp` locations.
 
-**Call relations**: This test extends the successful flow from `test_cp_one_file` to the vararg source-file case. It is called by the harness, uses `setup` first, and then compares the policy checker output against a fully specified expected match.
+**Call relations**: This test follows the same pattern as the other successful case: `setup` supplies the default policy, `ExecCall::new` describes the attempted command, and the expected `MatchedExec` describes the safe interpretation. It confirms the policy’s variable source-file rule works when there is more than one source.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -748,9 +754,11 @@ fn test_cp_multiple_files() -> Result<()>
 
 `test` · `test run`
 
-This module exercises a richer command shape than the simpler `ls` and `cp` suites because `head` accepts both positional file arguments and an option with a typed value. The shared `setup()` helper loads the default policy. `test_head_no_args` intentionally asserts rejection even though `head` itself can read from stdin; the comments explain that the policy is stricter because it only approves cases it can prove safe. `test_head_one_file_no_flags` verifies the straightforward accepted case: one positional argument typed as `ReadableFile` and canonical system paths `/bin/head` and `/usr/bin/head`.
+This is a test file for a command policy checker. The checker looks at a program name plus its command-line arguments and decides whether that exact command matches a known safe pattern. Here, the command under test is `head`, a common tool that prints the first lines of a file or input stream.
 
-`test_head_one_flag_one_file` checks the mixed option-plus-argument path. The expected `ValidExec` contains an empty `flags` vector, one `MatchedOpt` for `-n` with `ArgType::PositiveInteger`, and one `MatchedArg` for the file at argv index 2. The remaining tests probe numeric validation boundaries. Values `0`, `1.5`, and `1.0` all produce `Error::InvalidPositiveInteger`, showing that the policy requires a strictly positive integer string. The `-1` case is different: because it begins with `-`, the parser treats it as another option token rather than a value, yielding `Error::OptionFollowedByOptionInsteadOfValue`. Together these tests capture both semantic validation and tokenization behavior.
+The tests build small fake command calls, such as `head src/extension.ts` or `head -n 100 src/extension.ts`, then ask the default policy whether each call is allowed. The file is mainly checking two ideas. First, `head` should be accepted when it reads from a named readable file, with or without the `-n` option. Second, the `-n` option must be followed by a positive whole number, not zero, a decimal number, or a negative-looking value.
+
+One important detail is that real `head` can run with no file and read from standard input, but this policy rejects that case. That does not mean the command is dangerous. It means the policy cannot prove it matches the allowed file-reading pattern. Think of the policy like a strict door guard: if the pass is not in exactly the expected format, the guard says no, even if the person might be harmless.
 
 #### Function details
 
@@ -760,11 +768,11 @@ This module exercises a richer command shape than the simpler `ls` and `cp` suit
 fn setup() -> Policy
 ```
 
-**Purpose**: Loads the default policy used by all `head` tests. It hides the common initialization and failure message.
+**Purpose**: Loads the default execution policy used by all the tests in this file. It keeps the tests focused on `head` behavior instead of repeating policy-loading code each time.
 
-**Data flow**: Invokes `get_default_policy()`, unwraps the result with `expect`, and returns the resulting `Policy`. No persistent state is changed.
+**Data flow**: It takes no input. It asks the library for the default policy, and if loading fails, the test stops with a clear failure message. On success, it returns a `Policy` object that the tests can use to check fake command calls.
 
-**Call relations**: Every test in this file calls `setup` first. It is the shared entry into the external policy-loading path before each command-specific assertion.
+**Call relations**: Each test starts by calling this helper so it is using the same default rules. The helper delegates the real loading work to `get_default_policy`, then hands the ready policy back to the individual test.
 
 *Call graph*: called by 7 (test_head_invalid_n_as_0, test_head_invalid_n_as_float, test_head_invalid_n_as_negative_int, test_head_invalid_n_as_nonint_float, test_head_no_args, test_head_one_file_no_flags, test_head_one_flag_one_file); 1 external calls (get_default_policy).
 
@@ -775,11 +783,11 @@ fn setup() -> Policy
 fn test_head_no_args()
 ```
 
-**Purpose**: Verifies that the policy rejects `head` with no file arguments, even though the real command could read from stdin. It documents the policy's conservative stance on unverifiable stdin-based behavior.
+**Purpose**: Checks what happens when `head` is called with no arguments. The expected result is rejection because this policy wants at least one readable file argument for this command pattern.
 
-**Data flow**: Gets a `Policy` from `setup()`, constructs `ExecCall::new("head", &[])`, runs `policy.check(&head)`, and asserts equality with `Err(Error::VarargMatcherDidNotMatchAnything { program, matcher: ArgMatcher::ReadableFiles })`.
+**Data flow**: The test gets the default policy, creates an `ExecCall` representing `head` with an empty argument list, and asks the policy to check it. The expected output is an error saying the readable-files matcher did not find anything to match.
 
-**Call relations**: This harness-invoked test follows the standard setup/check/assert flow. Its comments explain why the asserted rejection is intentional despite the underlying command's broader semantics.
+**Call relations**: This test calls `setup` to get the shared policy, then uses `ExecCall::new` to describe the command being tested. It finishes by comparing the policy result against the exact expected error.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -790,11 +798,11 @@ fn test_head_no_args()
 fn test_head_one_file_no_flags() -> Result<()>
 ```
 
-**Purpose**: Checks that `head file` is accepted and represented as a single readable-file positional argument. It confirms the exact accepted-exec structure for the simplest safe `head` invocation.
+**Purpose**: Checks that `head` is accepted when it is given one readable file and no options. This is the simplest allowed `head` use in these tests.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("head", &["src/extension.ts"])`, builds the expected `MatchedExec::Match` using `ValidExec::new` and one validated `MatchedArg::new`, asserts equality with `policy.check(&head)`, and returns `Ok(())`.
+**Data flow**: The test creates a command shaped like `head src/extension.ts`. The policy checks the command and should return a successful match showing that the file argument was recognized as a readable file and that `head` may resolve to `/bin/head` or `/usr/bin/head`.
 
-**Call relations**: Called by the test harness for the basic success path. It depends on `setup` for policy loading and on the model constructors to express the exact normalized result expected from `policy.check`.
+**Call relations**: After getting the default policy through `setup`, this test builds the command call and compares the checker’s response with the expected successful `MatchedExec` result.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -805,11 +813,11 @@ fn test_head_one_file_no_flags() -> Result<()>
 fn test_head_one_flag_one_file() -> Result<()>
 ```
 
-**Purpose**: Verifies that `head -n 100 file` is accepted with `-n` parsed as an option carrying a positive-integer value and the file preserved as a readable positional argument. It checks both option typing and argv indexing.
+**Purpose**: Checks that `head -n 100 <file>` is accepted. It proves the policy recognizes `-n` as an option whose value must be a positive whole number, followed by a readable file.
 
-**Data flow**: Obtains the policy, constructs `ExecCall::new("head", &["-n", "100", "src/extension.ts"])`, builds an expected `MatchedExec::Match` containing `MatchedOpt::new("-n", "100", ArgType::PositiveInteger)` and `MatchedArg::new(2, ArgType::ReadableFile, ...)`, asserts equality with `policy.check(&head)`, and returns `Ok(())`.
+**Data flow**: The test creates a command with three arguments: `-n`, `100`, and `src/extension.ts`. The policy should turn that into a successful match with one validated option, no standalone flags, and one readable file argument at the correct position.
 
-**Call relations**: This test exercises the branch where the checker recognizes an option/value pair before positional arguments. It uses `MatchedOpt::new` and `MatchedArg::new` to mirror the exact internal normalization that `policy.check` should perform.
+**Call relations**: This test follows the same pattern as the others: it obtains the policy with `setup`, builds the command with `ExecCall::new`, and uses an equality check to confirm the policy returns the expected structured match.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -820,11 +828,11 @@ fn test_head_one_flag_one_file() -> Result<()>
 fn test_head_invalid_n_as_0()
 ```
 
-**Purpose**: Checks that `-n 0` is rejected because zero is not considered a valid positive integer. It verifies the exact numeric-validation error variant.
+**Purpose**: Checks that `head -n 0 <file>` is rejected. The policy treats zero as invalid because `-n` must be followed by a positive integer, meaning a whole number greater than zero.
 
-**Data flow**: Calls `setup()`, creates `ExecCall::new("head", &["-n", "0", "src/extension.ts"])`, invokes `policy.check(&head)`, and asserts equality with `Err(Error::InvalidPositiveInteger { value: "0".to_string() })`.
+**Data flow**: The test builds a command where the `-n` value is `0`. When the policy checks it, the expected result is an `InvalidPositiveInteger` error containing the rejected value.
 
-**Call relations**: This test is run directly by the harness and targets the semantic validation path after option parsing succeeds. It depends on the policy checker to reject the value rather than the token shape.
+**Call relations**: The test uses `setup` for the policy and `ExecCall::new` for the command, then verifies that validation stops at the bad `-n` value and reports the specific error.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -835,11 +843,11 @@ fn test_head_invalid_n_as_0()
 fn test_head_invalid_n_as_nonint_float()
 ```
 
-**Purpose**: Verifies that a non-integer decimal string such as `1.5` is rejected for `-n`. It confirms that the policy does not coerce or truncate floating-point-looking values.
+**Purpose**: Checks that `head -n 1.5 <file>` is rejected. This confirms that decimal values are not accepted where the policy requires a positive whole number.
 
-**Data flow**: Loads the policy, constructs `ExecCall::new("head", &["-n", "1.5", "src/extension.ts"])`, evaluates `policy.check(&head)`, and asserts equality with `Err(Error::InvalidPositiveInteger { value: "1.5".to_string() })`.
+**Data flow**: The test creates a `head` call with `-n` followed by `1.5`. The policy reads that option value, tries to validate it as a positive integer, and returns an `InvalidPositiveInteger` error.
 
-**Call relations**: This harness-driven test follows the same path as the zero case but with a different malformed numeric string. It documents another branch of the positive-integer validator's rejection behavior.
+**Call relations**: Like the nearby invalid-value tests, it calls `setup`, builds the command, and compares the policy result with the exact error expected for a bad positive-integer value.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -850,11 +858,11 @@ fn test_head_invalid_n_as_nonint_float()
 fn test_head_invalid_n_as_float()
 ```
 
-**Purpose**: Checks that a decimal-formatted whole number like `1.0` is still rejected for `-n`. It ensures the validator requires integer syntax, not merely a numerically positive value.
+**Purpose**: Checks that `head -n 1.0 <file>` is rejected. Even though `1.0` represents one in ordinary math, the policy requires the text to look like a whole number, such as `1`.
 
-**Data flow**: Gets the policy from `setup()`, creates `ExecCall::new("head", &["-n", "1.0", "src/extension.ts"])`, runs `policy.check(&head)`, and asserts equality with `Err(Error::InvalidPositiveInteger { value: "1.0".to_string() })`.
+**Data flow**: The test passes `1.0` as the value after `-n`. The policy checks that text and returns an `InvalidPositiveInteger` error because it is written as a decimal, not an integer.
 
-**Call relations**: This test is another direct harness entry covering semantic validation after option parsing. It complements the `1.5` case by showing that even float strings representing whole numbers are not accepted.
+**Call relations**: This test uses the shared setup helper, creates the command call, and asserts that the policy reports the same kind of validation failure as for other non-integer `-n` values.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -865,11 +873,11 @@ fn test_head_invalid_n_as_float()
 fn test_head_invalid_n_as_negative_int()
 ```
 
-**Purpose**: Verifies that `-n -1` is rejected as an option followed by another option-like token rather than as an invalid integer value. It captures the parser's tokenization rule for dash-prefixed strings.
+**Purpose**: Checks that `head -n -1 <file>` is rejected. The notable behavior is that `-1` is treated like another option-looking argument, because it starts with a dash, rather than as a valid value for `-n`.
 
-**Data flow**: Loads the policy, constructs `ExecCall::new("head", &["-n", "-1", "src/extension.ts"])`, invokes `policy.check(&head)`, and asserts equality with `Err(Error::OptionFollowedByOptionInsteadOfValue { program, option, value })`.
+**Data flow**: The test builds a command where `-n` is followed by `-1`. The policy sees a dash-starting token where it expected the value for `-n`, so it returns an error saying an option was followed by another option instead of a value.
 
-**Call relations**: This test covers a distinct control-flow branch from the other invalid-number tests: the checker treats `-1` as syntactically option-like before numeric validation can run. It is invoked by the harness and depends on `setup` like the rest of the suite.
+**Call relations**: The test gets the default policy from `setup`, builds the command with `ExecCall::new`, and checks that the parser-style error is returned before any successful command match is made.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -878,9 +886,11 @@ fn test_head_invalid_n_as_negative_int()
 
 `test` · `test run`
 
-This module is a broad command-specific test suite for `ls`. A shared `setup()` helper loads the default policy. The tests establish that `ls` with no arguments is accepted, producing a `ValidExec` with no flags or args and preferred system paths `/bin/ls` and `/usr/bin/ls`. Known flags `-a` and `-l` are accepted and stored as `MatchedFlag` entries in order. Unknown options are rejected precisely: `-z` yields `Error::UnknownOption`, and bundled `-al` also yields `UnknownOption`, with a comment noting that this should change only if option bundling is explicitly implemented.
+This is a test file for the legacy execution policy system. That system decides whether a requested program call is safe and allowed. Here, the program under inspection is `ls`, the common command that lists files. The tests act like a checklist: they build fake `ls` calls, ask the default policy to inspect them, and compare the answer with the expected result.
 
-The positional-argument tests verify that one or many file operands are typed as `ArgType::ReadableFile` with their original indices preserved. Mixed tests confirm that flags and file args can coexist in the accepted result, and that the checker currently still accepts flags appearing after file arguments. The comment on `test_flags_after_file_args` highlights an intentional discrepancy between policy acceptance and actual `ls` CLI behavior: the invocation is considered safe enough by the current policy model even if the real command may not parse it as intended. Across the suite, expected values are built concretely with `MatchedFlag::new`, `MatchedArg::new`, and either `ValidExec::new` or struct literals using `..Default::default()` to emphasize exactly which fields should be populated.
+The file matters because `ls` is a simple but important command shape: it can be run with no arguments, with flags such as `-a` and `-l`, and with one or more file names. The tests confirm that safe file arguments are marked as readable files, that known flags are accepted, and that unknown options are rejected. This protects the policy from becoming too loose or accidentally blocking common safe uses.
+
+A small helper, `setup`, loads the default policy so every test starts from the same rulebook. Each test then creates an `ExecCall`, which is a plain description of “someone wants to run this program with these words after it.” The policy returns either a successful match, including the cleaned-up meaning of flags and arguments, or an error explaining why the call is not allowed. A few tests also document known limitations, such as bundled flags like `-al` not being accepted yet.
 
 #### Function details
 
@@ -890,11 +900,11 @@ The positional-argument tests verify that one or many file operands are typed as
 fn setup() -> Policy
 ```
 
-**Purpose**: Loads the default policy used by all `ls` tests. It provides a single initialization point and consistent failure message.
+**Purpose**: Loads the default execution policy used by all the tests in this file. It gives each test the same rulebook for deciding whether an `ls` command is allowed.
 
-**Data flow**: Calls `get_default_policy()`, unwraps the result with `expect`, and returns the resulting `Policy`. It has no side effects beyond test-local initialization.
+**Data flow**: It takes no input. It asks the library for the default policy, and if that cannot be loaded, the test stops with a clear failure message. It returns a ready-to-use `Policy` object.
 
-**Call relations**: Every test in this file begins by calling `setup`. It is the shared dependency that feeds the policy checker used in all subsequent assertions.
+**Call relations**: Every test in this file calls `setup` before checking an `ls` command. It hands the loaded policy back to the test, and the test then asks that policy to check a specific `ExecCall`.
 
 *Call graph*: called by 8 (test_flags_after_file_args, test_ls_dash_a_dash_l, test_ls_dash_al, test_ls_dash_z, test_ls_multiple_file_args, test_ls_multiple_flags_and_file_args, test_ls_no_args, test_ls_one_file_arg); 1 external calls (get_default_policy).
 
@@ -905,11 +915,11 @@ fn setup() -> Policy
 fn test_ls_no_args()
 ```
 
-**Purpose**: Verifies that bare `ls` is accepted with no matched flags or positional arguments. It checks the canonical system-path list included in the accepted execution.
+**Purpose**: Checks that plain `ls` with no extra words is allowed. This confirms the policy recognizes the basic command and its expected system locations.
 
-**Data flow**: Obtains a policy via `setup()`, constructs `ExecCall::new("ls", &[])`, invokes `policy.check(&ls)`, and asserts equality with `Ok(MatchedExec::Match { exec: ValidExec::new("ls", vec![], &["/bin/ls", "/usr/bin/ls"]) })`.
+**Data flow**: The test loads the default policy, creates an `ExecCall` for `ls` with an empty argument list, and asks the policy to check it. The expected result is a successful match with no flags or file arguments and with `/bin/ls` and `/usr/bin/ls` as allowed paths.
 
-**Call relations**: This harness-run test covers the simplest success path for `ls`. It uses `setup` and `ExecCall::new`, then compares the checker output against a minimal expected `ValidExec`.
+**Call relations**: This test uses `setup` to get the policy, builds the command with `ExecCall::new`, then uses an equality assertion to compare the policy's answer with the expected successful match.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -920,11 +930,11 @@ fn test_ls_no_args()
 fn test_ls_dash_a_dash_l()
 ```
 
-**Purpose**: Checks that two known flags, `-a` and `-l`, are accepted and preserved as matched flags in order. It verifies flag-only normalization without positional arguments.
+**Purpose**: Checks that `ls -a -l` is allowed when the two flags are written separately. This protects support for common `ls` options: showing hidden files and using long listing format.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("ls", &["-a", "-l"])`, builds an expected `ValidExec` struct literal with `flags: vec![MatchedFlag::new("-a"), MatchedFlag::new("-l")]`, system paths, and defaulted remaining fields, then asserts equality with `policy.check(&ls_a_l)`.
+**Data flow**: The test starts with the default policy and the argument list `-a`, `-l`. It turns those into an `ExecCall`, sends it to the policy, and expects a successful result where both flags are recorded as accepted flags.
 
-**Call relations**: This test is invoked by the harness and exercises the branch where the checker recognizes multiple allowed flags. It depends on `MatchedFlag::new` to express the exact expected normalized output.
+**Call relations**: Like the other tests, it gets its policy from `setup`, creates the command request with `ExecCall::new`, and then verifies the policy result with an assertion.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -935,11 +945,11 @@ fn test_ls_dash_a_dash_l()
 fn test_ls_dash_z()
 ```
 
-**Purpose**: Verifies that an unsupported `ls` option is rejected as `UnknownOption`. It documents the current allowlist boundary for recognized flags.
+**Purpose**: Checks that `ls -z` is rejected as an unknown option. This makes sure the policy does not silently allow flags it has not been taught are safe.
 
-**Data flow**: Calls `setup()`, constructs `ExecCall::new("ls", &["-z"])`, runs `policy.check(&ls_z)`, and asserts equality with `Err(Error::UnknownOption { program: "ls".into(), option: "-z".into() })`.
+**Data flow**: The test loads the policy, creates an `ls` call with `-z`, and asks the policy to inspect it. The expected output is an `UnknownOption` error naming program `ls` and option `-z`.
 
-**Call relations**: This harness-driven test covers the unknown-option rejection path after policy loading. Its comment notes that the real command's option set could evolve, but the policy currently rejects this token.
+**Call relations**: It follows the same test pattern: `setup` supplies the rulebook, `ExecCall::new` describes the requested command, and the assertion confirms that the policy rejects the command for the expected reason.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -950,11 +960,11 @@ fn test_ls_dash_z()
 fn test_ls_dash_al()
 ```
 
-**Purpose**: Checks that bundled short options like `-al` are currently rejected as a single unknown option. It captures the present behavior before any future option-bundling support is added.
+**Purpose**: Checks the current behavior for bundled flags such as `-al`. Although many command-line tools treat this as `-a -l`, this policy does not support that yet, so the test expects rejection.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("ls", &["-al"])`, invokes `policy.check(&ls_al)`, and asserts equality with `Err(Error::UnknownOption { program: "ls".into(), option: "-al".into() })`.
+**Data flow**: The test loads the default policy, creates an `ls` call with one argument, `-al`, and checks it. The expected result is an `UnknownOption` error for `-al`.
 
-**Call relations**: This test is called by the harness and targets a specific parser limitation documented in the inline comment. It follows the same setup/check/assert pattern as the other rejection tests.
+**Call relations**: This test documents a known limitation. It uses `setup` and `ExecCall::new`, then asserts the current answer so future changes will be deliberate when bundled option support is added.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -965,11 +975,11 @@ fn test_ls_dash_al()
 fn test_ls_one_file_arg() -> Result<()>
 ```
 
-**Purpose**: Verifies that `ls foo` is accepted with one readable-file positional argument. It confirms the exact argument typing and index assignment for a single operand.
+**Purpose**: Checks that `ls foo` is allowed and that `foo` is understood as a readable file argument. This confirms the policy can distinguish a file name from a flag.
 
-**Data flow**: Gets the policy from `setup()`, constructs `ExecCall::new("ls", &["foo"])`, builds the expected `MatchedExec::Match` using `ValidExec::new` and `MatchedArg::new(0, ArgType::ReadableFile, "foo")`, asserts equality with `policy.check(&ls_one_file_arg)`, and returns `Ok(())`.
+**Data flow**: The test loads the policy and creates an `ls` call with one argument, `foo`. It expects the policy to return a successful match where that argument is recorded at position 0 and classified as a readable file.
 
-**Call relations**: This harness-invoked test exercises the accepted positional-argument path. It relies on the model constructors to mirror the exact normalized result expected from the checker.
+**Call relations**: The test gets the policy through `setup`, builds the command with `ExecCall::new`, and compares the result with the expected `MatchedExec`. It also uses `MatchedArg::new`, which can fail, so the test returns a `Result`.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -980,11 +990,11 @@ fn test_ls_one_file_arg() -> Result<()>
 fn test_ls_multiple_file_args() -> Result<()>
 ```
 
-**Purpose**: Checks that multiple file operands are all accepted as readable positional arguments. It verifies that each argv position is preserved in the resulting `ValidExec`.
+**Purpose**: Checks that `ls` can be used with several file names. This confirms the policy accepts repeated readable file arguments rather than only one.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("ls", &["foo", "bar", "baz"])`, constructs an expected `ValidExec::new` with three `MatchedArg::new` values at indices 0, 1, and 2, asserts equality with `policy.check(&ls_multiple_file_args)`, and returns `Ok(())`.
+**Data flow**: The test creates an `ls` call with `foo`, `bar`, and `baz`. After checking it against the policy, the expected result is a successful match with all three inputs recorded as readable file arguments at their original positions.
 
-**Call relations**: This test extends the single-file success path to the vararg case. It is run by the harness and depends on `setup` plus the argument constructors to define the expected match.
+**Call relations**: It relies on `setup` for the default policy and `ExecCall::new` for the command description. The final assertion confirms that the policy preserves each file argument and its position.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -995,11 +1005,11 @@ fn test_ls_multiple_file_args() -> Result<()>
 fn test_ls_multiple_flags_and_file_args() -> Result<()>
 ```
 
-**Purpose**: Verifies that `ls` accepts a mix of known flags followed by multiple file operands. It checks that flags and positional arguments are separated correctly in the normalized result.
+**Purpose**: Checks that `ls` accepts a normal mix of flags followed by file names, such as `ls -l -a foo bar baz`. This tests the policy's ability to separate options from file targets.
 
-**Data flow**: Obtains the policy, constructs `ExecCall::new("ls", &["-l", "-a", "foo", "bar", "baz"])`, builds an expected `ValidExec` with two `MatchedFlag`s and three `MatchedArg`s at indices 2 through 4 plus system paths, asserts equality with `policy.check(&ls_multiple_flags_and_file_args)`, and returns `Ok(())`.
+**Data flow**: The test loads the policy and builds a command containing two flags followed by three file names. The expected result is a successful match with `-l` and `-a` stored as flags, and `foo`, `bar`, and `baz` stored as readable file arguments at their original argument indexes.
 
-**Call relations**: This harness-run test covers the branch where the checker processes multiple flags before positional arguments. It combines the behaviors validated separately in the flag-only and file-only tests.
+**Call relations**: This test combines the earlier cases. It uses `setup` to load rules, `ExecCall::new` to describe the command, and an assertion to prove the policy classifies both flags and file arguments correctly.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1010,22 +1020,24 @@ fn test_ls_multiple_flags_and_file_args() -> Result<()>
 fn test_flags_after_file_args() -> Result<()>
 ```
 
-**Purpose**: Checks the current policy behavior when a flag appears after a file operand: the invocation is still accepted and normalized with the file as an argument and the later token as a flag. It documents a known mismatch between policy permissiveness and actual `ls` parsing expectations.
+**Purpose**: Checks the current policy behavior when a flag appears after a file name, as in `ls foo -l`. The test expects this to be accepted for now, while the comment notes that real `ls` may not allow this shape and the policy may need to become stricter later.
 
-**Data flow**: Loads the policy, creates `ExecCall::new("ls", &["foo", "-l"])`, builds an expected `ValidExec` containing one `MatchedArg` at index 0 and one `MatchedFlag` for `-l`, asserts equality with `policy.check(&ls_flags_after_file_args)`, and returns `Ok(())`.
+**Data flow**: The test loads the default policy and creates an `ls` call with `foo` first and `-l` second. The expected result is a successful match where `foo` is treated as a readable file argument at position 0 and `-l` is treated as an accepted flag.
 
-**Call relations**: This test is invoked by the harness and targets an edge case called out in the comment. It demonstrates that the checker currently classifies the command as safe and accepted even though future configuration may choose to disallow this ordering.
+**Call relations**: This test uses the same path as the others: `setup` supplies the policy, `ExecCall::new` creates the request, and the assertion locks in the current behavior. It also serves as a reminder for future policy configuration work about whether flags after file arguments should be forbidden.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
 
 ### `execpolicy-legacy/tests/suite/pwd.rs`
 
-`test` · `policy matching tests`
+`test` · `test run`
 
-This test file is a focused regression suite for how the legacy policy interprets `pwd` invocations. It imports the concrete matching and error types from `codex_execpolicy_legacy` and compares `policy.check(&ExecCall)` results against fully constructed expected values, so the tests pin down not just success or failure but the exact `MatchedExec` or `Error` payload shape. A shared `setup` helper loads the default policy once per test via `get_default_policy`, failing the test immediately if the bundled policy cannot be loaded.
+This is a small test file for the command policy system. The policy system decides whether a program call is acceptable before it is allowed to run. Here, the program being checked is `pwd`, a common shell command that reports “where am I?” in the filesystem.
 
-The success cases cover three command forms: bare `pwd`, `pwd -L`, and `pwd -P`. In each case the expected match is a `MatchedExec::Match` containing a `ValidExec` with `program: "pwd"` and, for the flagged variants, a single `MatchedFlag` entry. The tests rely on `Default::default()` for all other `ValidExec` fields, which implicitly asserts that no extra args, opts, or path overrides are produced for these forms. The failure case constructs `pwd foo bar` and expects `Error::UnexpectedArguments` with two `PositionalArg` values preserving both original order and indexes 0 and 1. That makes this file valuable as a specification of argument indexing and strict rejection of stray operands.
+The tests all start by loading the project’s default policy. Then each test builds an `ExecCall`, which is a plain description of a command someone wants to run: the program name plus its arguments. The test asks the policy to check that command and compares the result with what should happen.
+
+The file confirms four important cases. Plain `pwd` with no arguments should be accepted. `pwd -L` and `pwd -P` should also be accepted, because those are recognized flags for choosing how symbolic links are shown. A symbolic link is like a shortcut to another folder. Finally, `pwd foo bar` should be rejected because `pwd` is not expected to receive ordinary extra words after the command. Without these tests, a change to the policy could accidentally block normal `pwd` use or, just as importantly, allow command shapes the policy meant to forbid.
 
 #### Function details
 
@@ -1035,11 +1047,11 @@ The success cases cover three command forms: bare `pwd`, `pwd -L`, and `pwd -P`.
 fn setup() -> Policy
 ```
 
-**Purpose**: Loads the default legacy policy used by all tests in this file. It converts policy-loading failure into an immediate test panic with a fixed message.
+**Purpose**: Loads the default execution policy used by all tests in this file. It keeps the test cases focused on the `pwd` behavior instead of repeating the same policy-loading code.
 
-**Data flow**: Takes no arguments. It calls `get_default_policy()` from the legacy crate, unwraps the returned result with `expect`, and returns the resulting `Policy` value without modifying shared state.
+**Data flow**: It takes no input from the caller. It asks the library for the default policy, expects that loading to succeed, and returns the loaded `Policy` object to the test that asked for it.
 
-**Call relations**: This helper is invoked at the start of every `pwd` test so each case evaluates against the same default policy baseline before constructing an `ExecCall` and asserting on `policy.check` output.
+**Call relations**: Each `pwd` test calls this first so it can check a command against the same default rules. Internally it hands off to `get_default_policy`, which does the actual policy loading.
 
 *Call graph*: called by 4 (test_pwd_capital_l, test_pwd_capital_p, test_pwd_extra_args, test_pwd_no_args); 1 external calls (get_default_policy).
 
@@ -1050,11 +1062,11 @@ fn setup() -> Policy
 fn test_pwd_no_args()
 ```
 
-**Purpose**: Verifies that a plain `pwd` invocation matches the policy with no flags or arguments attached. The assertion fixes the expected `ValidExec.program` value to `pwd` and leaves all other fields at defaults.
+**Purpose**: Checks that running `pwd` with no arguments is allowed by the default policy. This protects the most basic and common use of the command.
 
-**Data flow**: Creates a `Policy` via `setup`, then builds an `ExecCall` for program `pwd` with an empty argument slice. It compares `policy.check(&pwd)` against `Ok(MatchedExec::Match { exec: ValidExec { program: "pwd".into(), ..Default::default() } })` and returns unit through the test harness.
+**Data flow**: It loads the policy, builds an `ExecCall` for program `pwd` with an empty argument list, and asks the policy to check it. The expected result is a successful match for the `pwd` program with no flags or extra arguments.
 
-**Call relations**: The Rust test runner invokes this case directly. Inside the test, control flows from `setup` to `ExecCall::new`, then into the assertion that validates the policy engine's result for the simplest accepted form.
+**Call relations**: This test relies on `setup` to get the policy and on `ExecCall::new` to describe the command being tested. It then uses an equality assertion to confirm that the policy result matches the expected allowed command.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1065,11 +1077,11 @@ fn test_pwd_no_args()
 fn test_pwd_capital_l()
 ```
 
-**Purpose**: Checks that `pwd -L` is accepted and that the matcher records `-L` specifically as a matched flag. It distinguishes this accepted flag from positional arguments or other option encodings.
+**Purpose**: Checks that `pwd -L` is allowed. The `-L` flag asks `pwd` to show the logical path, which may include symbolic-link shortcuts.
 
-**Data flow**: Obtains a `Policy` from `setup`, constructs `ExecCall::new("pwd", &["-L"])`, and asserts equality with a successful `MatchedExec::Match` whose `ValidExec` contains `program: "pwd"` and `flags: vec![MatchedFlag::new("-L")]`.
+**Data flow**: It loads the policy, creates a command description for `pwd` with the single argument `-L`, and checks it. The expected output is a successful match where `-L` is recorded as an accepted flag.
 
-**Call relations**: Called by the test harness as one of the `pwd` acceptance cases. It follows the same setup-and-assert pattern as the other tests, specializing only the command tokens and expected matched flag payload.
+**Call relations**: Like the other tests, it starts with `setup`, creates the command with `ExecCall::new`, and then compares the policy’s answer with the expected accepted result. This test specifically covers one of the allowed `pwd` flags.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1080,11 +1092,11 @@ fn test_pwd_capital_l()
 fn test_pwd_capital_p()
 ```
 
-**Purpose**: Checks that `pwd -P` is accepted and represented as a single matched flag in the validated execution. This complements the `-L` case to document both supported `pwd` flag variants.
+**Purpose**: Checks that `pwd -P` is allowed. The `-P` flag asks `pwd` to show the physical path, resolving symbolic-link shortcuts to their real locations.
 
-**Data flow**: Loads the default `Policy`, creates an `ExecCall` for `pwd` with one argument `-P`, and asserts that `policy.check` returns `Ok(MatchedExec::Match { exec: ValidExec { program: "pwd".into(), flags: vec![MatchedFlag::new("-P")], ..Default::default() } })`.
+**Data flow**: It loads the default policy, builds an `ExecCall` for `pwd` with `-P`, and asks the policy to evaluate it. The expected result is a successful match that includes `-P` as an accepted flag.
 
-**Call relations**: The test harness invokes it independently. It reuses `setup` and `ExecCall::new`, then validates that the policy engine classifies `-P` as an allowed flag rather than rejecting or reinterpreting it.
+**Call relations**: This test follows the same pattern as the `-L` test: prepare the policy through `setup`, describe the command through `ExecCall::new`, then assert that the policy accepts exactly this flag.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1095,11 +1107,11 @@ fn test_pwd_capital_p()
 fn test_pwd_extra_args()
 ```
 
-**Purpose**: Verifies that extra positional operands after `pwd` are rejected with `UnexpectedArguments`, including exact indexes and values. It documents that `pwd` does not silently ignore trailing tokens.
+**Purpose**: Checks that `pwd` is rejected when it is given unexpected ordinary arguments. This makes sure the policy does not silently allow command forms outside the approved shape.
 
-**Data flow**: Builds a `Policy` with `setup`, creates `ExecCall::new("pwd", &["foo", "bar"])`, and compares `policy.check(&pwd)` to `Err(Error::UnexpectedArguments { program: "pwd".to_string(), args: vec![PositionalArg { index: 0, value: "foo".to_string() }, PositionalArg { index: 1, value: "bar".to_string() }] })`.
+**Data flow**: It loads the policy, creates an `ExecCall` for `pwd` with two extra arguments, `foo` and `bar`, and asks the policy to check it. The expected result is an error that names both unexpected positional arguments and their positions.
 
-**Call relations**: Invoked by the test harness as the negative case for this file. It depends on `setup` for policy loading and uses a full structural equality assertion to pin down the exact error variant and positional metadata emitted by the checker.
+**Call relations**: This test uses `setup` and `ExecCall::new` like the others, but expects failure instead of success. The final assertion confirms that the policy reports the extra arguments clearly rather than treating the command as valid.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1111,9 +1123,11 @@ These tests focus on specialized matching behavior, including literal positional
 
 `test` · `test run`
 
-This file builds a tiny policy from an inline source string rather than using the default policy bundle. The policy defines a fake executable whose two positional arguments must be the exact literals `subcommand` and `sub-subcommand`. The test then exercises both the success and failure paths against that custom policy.
+This test file checks a small but important promise of the legacy execution policy system: when a policy says an argument must be a specific word, only that exact word should pass. In everyday terms, it is like a guest list that says “Alice Smith” rather than “any Alice”; a near match must still be turned away.
 
-The setup sequence is important: `PolicyParser::new` receives a synthetic policy name and the raw policy text, and `parse()` produces a policy object used for subsequent checks. For the valid call, the test constructs an expected `MatchedExec::Match` whose `ValidExec` contains two `MatchedArg` entries typed as `ArgType::Literal(...)`, preserving both the literal payload and the original positional indices. For the invalid call, only the second argument differs, and the expected result is `Error::LiteralValueDidNotMatch` with both the expected and actual strings captured. This makes the test a precise specification of literal matching semantics: literals are not pattern prefixes or enums, but exact string equality checks tied to specific argument positions. Returning `Result<()>` allows the expected `MatchedArg::new` constructions to use `?` during test assembly.
+The test builds a tiny policy for a fake program named `fake_executable`. The policy says the program must be run with two exact arguments: `subcommand` followed by `sub-subcommand`. The test then creates one command call that follows those rules exactly and checks that the policy accepts it. It also checks that the accepted result records both matched arguments as literal values, meaning they were matched by exact text.
+
+Then the test creates a second command call where the first argument is right, but the second argument is `not-a-real-subcommand`. The policy should reject this call. Just as importantly, it should reject it for the clear reason that the literal value did not match, showing both the expected and actual text. Without this behavior, policies could accidentally allow the wrong subcommands, which would weaken command safety rules.
 
 #### Function details
 
@@ -1123,11 +1137,11 @@ The setup sequence is important: `PolicyParser::new` receives a synthetic policy
 fn test_invalid_subcommand() -> Result<()>
 ```
 
-**Purpose**: Parses a custom policy with literal positional arguments, then verifies one exact-match invocation succeeds and one mismatched invocation fails with the literal-specific error. It is the focused regression test for `ArgType::Literal` behavior.
+**Purpose**: This test confirms that literal command arguments must match exactly. It checks both the successful case, where all arguments match the policy, and the failure case, where one subcommand is different.
 
-**Data flow**: Creates an inline policy string, constructs `PolicyParser::new("test_invalid_subcommand", unparsed_policy)`, parses it into a policy, builds a valid `ExecCall` and asserts that `policy.check` returns a `MatchedExec::Match` containing two literal-typed `MatchedArg`s inside `ValidExec::new`, then builds an invalid `ExecCall` and asserts that `policy.check` returns `Err(Error::LiteralValueDidNotMatch { expected, actual })`. It returns `Ok(())` after both assertions pass.
+**Data flow**: The test starts with a policy written as text, turns it into a parsed policy, then builds two example command calls. The first call uses the expected program name and arguments, so the policy check should return a successful match containing the exact matched arguments. The second call changes the final argument, so the policy check should return an error that names the expected literal value and the actual wrong value.
 
-**Call relations**: This test is invoked directly by the harness and does not use the default-policy loader. It first drives the parser path to create a policy, then exercises the checker twice—once for the accepted exact-literal branch and once for the mismatch branch.
+**Call relations**: During the test, it creates the policy parser and command/match objects using constructor-style `new` calls, then compares the policy results against the expected outcomes with assertions. This function is run by the Rust test runner, and its job is to exercise the policy checker from the outside, the same way a caller would rely on it when deciding whether a command is allowed.
 
 *Call graph*: calls 2 internal fn (new, new); 1 external calls (assert_eq!).
 
@@ -1136,9 +1150,11 @@ fn test_invalid_subcommand() -> Result<()>
 
 `test` · `test run`
 
-This file focuses narrowly on `parse_sed_command`, a helper that decides whether a sed editing command is provably safe. The first test establishes a known-good baseline: the address-range print command `122,202p` must parse successfully and return `Ok(())`. The second test checks two malformed variants that omit the trailing print command character or the separating comma semantics expected by the parser, and both must produce `Error::SedCommandNotProvablySafe` carrying the original command string.
+This is a small test file for `parse_sed_command`, a function from the legacy execution-policy crate. In plain terms, that parser is being used as a gatekeeper: it decides whether a `sed` command is simple and predictable enough to allow. `sed` is a command-line text editing tool, and commands passed to it can vary a lot, so the policy wants to accept only forms it understands clearly.
 
-Because the tests call the parser directly, they bypass policy files, `ExecCall`, and `ValidExec` construction entirely. That makes this suite useful for pinning down the parser's own acceptance boundary independent of any command-line wrapper logic. The assertions are exact, including the embedded `command` field in the error, so any future change in parser diagnostics or accepted grammar will surface immediately. The file therefore acts as a compact specification of the currently supported safe sed subset: a simple numeric range followed by `p` is accepted, while superficially similar but incomplete strings are not.
+The file checks two cases. First, it confirms that a command like `122,202p` is accepted. That means “print lines 122 through 202,” and the final `p` is the important print instruction. Second, it confirms that similar-looking strings without the required print instruction are rejected. For example, `122,202` names a range but does not say what to do with it, and `122202` is just a number-like string. Both are expected to fail with `Error::SedCommandNotProvablySafe`, which means the policy refuses the command because it cannot confidently classify it as safe.
+
+A useful analogy is a security guard checking tickets: this test makes sure the guard lets in the exact ticket format it recognizes, but turns away lookalikes that are missing required information.
 
 #### Function details
 
@@ -1148,11 +1164,11 @@ Because the tests call the parser directly, they bypass policy files, `ExecCall`
 fn parses_simple_print_command()
 ```
 
-**Purpose**: Verifies that a simple sed print command with a numeric range is accepted by the safety parser. It establishes a concrete known-good example.
+**Purpose**: This test proves that a plain line-range print command is accepted by the parser. It checks the happy path: a command that says to print lines 122 through 202 should be considered safe.
 
-**Data flow**: Calls `parse_sed_command("122,202p")` and asserts that the returned result is exactly `Ok(())`. It reads no external state and writes no outputs beyond the test assertion.
+**Data flow**: The test gives the string `122,202p` to `parse_sed_command`. It then compares the returned result with `Ok(())`, meaning “accepted with no extra value returned.” If the parser rejects this command, the equality check fails and the test reports a problem.
 
-**Call relations**: This function is invoked directly by the test harness. It exercises the parser's success path and stops at the equality assertion.
+**Call relations**: During the Rust test run, this function is invoked as a test because of its test marker. Inside it, the only direct helper it uses is `assert_eq!`, which compares the parser's answer with the expected successful result.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1163,22 +1179,26 @@ fn parses_simple_print_command()
 fn rejects_malformed_print_command()
 ```
 
-**Purpose**: Checks that malformed sed command strings lacking the accepted safe form are rejected with `SedCommandNotProvablySafe`. It covers two distinct invalid inputs in one test.
+**Purpose**: This test proves that incomplete or malformed `sed` command strings are rejected. It is checking that the parser does not treat vague lookalikes as safe commands.
 
-**Data flow**: Calls `parse_sed_command("122,202")` and `parse_sed_command("122202")` separately, asserting each result equals `Err(Error::SedCommandNotProvablySafe { command: ... })` with the original input copied into the error payload.
+**Data flow**: The test sends two strings, `122,202` and `122202`, into `parse_sed_command`. For each one, it expects an `Error::SedCommandNotProvablySafe` result containing the original command text. If either input is accepted, or rejected with the wrong error, the equality check fails.
 
-**Call relations**: This harness-run test exercises the parser's rejection path twice. It does not depend on any setup helper; its only external interaction is direct invocation of `parse_sed_command` followed by exact assertions.
+**Call relations**: During the Rust test run, this function is invoked as a test. It uses `assert_eq!` twice to compare the parser's actual rejection results with the exact errors that the policy is supposed to produce.
 
 *Call graph*: 1 external calls (assert_eq!).
 
 
 ### `execpolicy-legacy/tests/suite/sed.rs`
 
-`test` · `policy matching tests`
+`test` · `test run`
 
-This file is a targeted test suite for the legacy `sed` policy rules. Like the `pwd` tests, it loads the default policy through a shared `setup` helper and then constructs concrete `ExecCall` values whose results are compared against exact `MatchedExec` or `Error` structures. The tests are more detailed because `sed` has both flags and typed arguments/options: they assert not only that a command matches, but that the matcher classifies tokens into `MatchedFlag`, `MatchedOpt`, and `MatchedArg` with the correct `ArgType` and original token indexes.
+This test file acts like a safety checklist for running `sed`, a common command-line tool used to search, print, and edit text. In this project, programs are not allowed to run freely; each proposed command is checked against a policy that decides whether it is safe. These tests make sure the policy understands a few important `sed` cases correctly.
 
-The first success case covers `sed -n 122,202p hello.txt`, expecting `-n` as a flag, the script `122,202p` as a positional `ArgType::SedCommand` at index 1, and `hello.txt` as a `ReadableFile` at index 2, plus a fixed `system_path` of `/usr/bin/sed`. The second success case checks the alternate `-e` form, where the script moves from positional args into `opts` as `MatchedOpt::new("-e", "122,202p", ArgType::SedCommand)`, and the file shifts to index 3. The negative tests pin down two policy constraints: shell-executing sed expressions such as `s/y/echo hi/e` are rejected as `SedCommandNotProvablySafe`, and a bare script token without `-e` or the required pattern form yields `MissingRequiredOptions` naming `-e` explicitly.
+The file first loads the default policy with `setup`, so every test uses the same real rules the system normally applies. Each test then builds an `ExecCall`, which is a plain description of a command someone wants to run, such as `sed -n 122,202p hello.txt`. The test asks the policy to check that command and compares the answer with the expected result.
+
+Two tests show safe commands being accepted: printing a specific range of lines directly, and printing the same range through `sed`’s `-e` option. The expected approval includes details such as the program name, accepted flags, accepted arguments, and the trusted system path for `/usr/bin/sed`.
+
+The other tests protect against mistakes or abuse. One rejects a `sed` substitution that uses the `e` flag, which can execute shell commands. Another rejects a command that supplies only a pattern without the required file argument or required option shape. Without tests like these, the policy could accidentally let a text-processing command become a way to run arbitrary code.
 
 #### Function details
 
@@ -1188,11 +1208,11 @@ The first success case covers `sed -n 122,202p hello.txt`, expecting `-n` as a f
 fn setup() -> Policy
 ```
 
-**Purpose**: Loads the default legacy policy used by all `sed` tests. It treats failure to load that policy as a fatal test setup error.
+**Purpose**: Loads the default execution policy used by all the tests in this file. This avoids repeating the same policy-loading code in each test and makes sure they all check against the same rules.
 
-**Data flow**: Accepts no inputs. It calls `get_default_policy()`, unwraps the result with `expect("failed to load default policy")`, and returns the resulting `Policy`.
+**Data flow**: It takes no input. It asks `get_default_policy` for the standard policy, expects that loading to succeed, and returns the ready-to-use `Policy`. If the policy cannot be loaded, the test stops immediately with a clear failure message.
 
-**Call relations**: Every test in this file begins by calling `setup`, ensuring all `sed` scenarios are evaluated against the same default policy contents before constructing command tokens.
+**Call relations**: Each `sed` test calls `setup` before building its sample command. `setup` delegates the actual loading work to `get_default_policy`, then hands the resulting policy back to the test so the test can call `policy.check`.
 
 *Call graph*: called by 4 (test_sed_print_specific_lines, test_sed_print_specific_lines_with_e_flag, test_sed_reject_dangerous_command, test_sed_verify_e_or_pattern_is_required); 1 external calls (get_default_policy).
 
@@ -1203,11 +1223,11 @@ fn setup() -> Policy
 fn test_sed_print_specific_lines() -> Result<()>
 ```
 
-**Purpose**: Checks that `sed -n 122,202p hello.txt` is accepted as a safe read-only command and that each token is typed and indexed correctly. It also verifies the resolved system path recorded in the validated execution.
+**Purpose**: Checks that the policy allows a simple safe `sed` command that prints a specific range of lines from a readable file. This protects a useful read-only case: looking at part of a file without editing it or running anything else.
 
-**Data flow**: Creates a `Policy` via `setup`, then an `ExecCall` for `sed` with `-n`, `122,202p`, and `hello.txt`. It asserts equality with `Ok(MatchedExec::Match { exec: ValidExec { program: "sed".to_string(), flags: vec![MatchedFlag::new("-n")], args: vec![MatchedArg::new(1, ArgType::SedCommand, "122,202p")?, MatchedArg::new(2, ArgType::ReadableFile, "hello.txt")?], system_path: vec!["/usr/bin/sed".to_string()], ..Default::default() } })`, then returns `Ok(())`.
+**Data flow**: The test starts by getting the default policy from `setup`. It creates a command description for `sed -n 122,202p hello.txt`. The policy checks that command, and the test expects a successful match showing `sed` as the program, `-n` as an allowed flag, `122,202p` as a safe `sed` command, and `hello.txt` as a readable file.
 
-**Call relations**: The test harness invokes this positive case directly. It uses `setup` for policy loading and relies on `MatchedArg::new` validation while constructing the expected value, mirroring the policy engine's own typed interpretation of the command.
+**Call relations**: This test uses `setup` to get the policy, uses `new` constructors to build the command and expected matched pieces, and then uses `assert_eq!` to compare the policy’s answer with the expected approval.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1218,11 +1238,11 @@ fn test_sed_print_specific_lines() -> Result<()>
 fn test_sed_print_specific_lines_with_e_flag() -> Result<()>
 ```
 
-**Purpose**: Verifies the alternate `sed -n -e 122,202p hello.txt` form, where the script is attached to the `-e` option rather than treated as a positional command argument. It confirms that token indexing shifts accordingly.
+**Purpose**: Checks that the policy also allows the safe line-printing command when it is supplied through `sed`’s `-e` option. The `-e` option tells `sed` that the next value is an editing script, so the policy must inspect that value carefully.
 
-**Data flow**: Loads the `Policy`, builds `ExecCall::new("sed", &["-n", "-e", "122,202p", "hello.txt"])`, and asserts that `policy.check` returns a `MatchedExec::Match` whose `ValidExec` has `flags: vec![MatchedFlag::new("-n")]`, `opts: vec![MatchedOpt::new("-e", "122,202p", ArgType::SedCommand).expect("should validate")]`, `args: vec![MatchedArg::new(3, ArgType::ReadableFile, "hello.txt")?]`, and `system_path: vec!["/usr/bin/sed".to_string()]`. It returns `Ok(())`.
+**Data flow**: The test gets the default policy, then builds a command description for `sed -n -e 122,202p hello.txt`. The policy examines the flag, the `-e` option value, and the file argument. The expected result is a successful match where `122,202p` is accepted as a safe `sed` command attached to `-e`, and `hello.txt` is accepted as the file to read.
 
-**Call relations**: Called by the test harness as the second acceptance case. It follows the same setup/assert structure as the previous test but specifically exercises the branch where the sed script is consumed by an option parser instead of positional argument matching.
+**Call relations**: Like the other approval test, it calls `setup` first, then uses `new` constructors to describe both the requested command and the expected validated form. Finally, `assert_eq!` confirms that the policy accepts the command in exactly that form.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1233,11 +1253,11 @@ fn test_sed_print_specific_lines_with_e_flag() -> Result<()>
 fn test_sed_reject_dangerous_command()
 ```
 
-**Purpose**: Ensures that a sed expression containing the `e` execution flag is rejected as unsafe. This test documents that the policy performs semantic safety checks on sed commands, not just token-shape validation.
+**Purpose**: Checks that the policy rejects a `sed` script that could execute another command. In particular, the `e` behavior in this `sed` expression could run `echo hi`, so it must not be treated as harmless text processing.
 
-**Data flow**: Obtains a `Policy` from `setup`, constructs `ExecCall::new("sed", &["-e", "s/y/echo hi/e", "hello.txt"])`, and asserts that `policy.check(&sed)` equals `Err(Error::SedCommandNotProvablySafe { command: "s/y/echo hi/e".to_string() })`.
+**Data flow**: The test loads the policy, then creates a command description for `sed -e s/y/echo hi/e hello.txt`. When the policy checks it, the expected output is an error saying the `sed` command is not provably safe, and it includes the exact unsafe command text.
 
-**Call relations**: The test harness invokes this negative case directly. It uses `setup` and `ExecCall::new`, then checks that the policy engine rejects the command before producing any successful `MatchedExec` structure.
+**Call relations**: This test calls `setup` to get the shared policy, uses `new` to build the attempted command, and then uses `assert_eq!` to make sure the policy returns the specific safety error rather than approving the command.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).
 
@@ -1248,10 +1268,10 @@ fn test_sed_reject_dangerous_command()
 fn test_sed_verify_e_or_pattern_is_required()
 ```
 
-**Purpose**: Checks that a lone sed script token without the required option structure is rejected with a missing-options error naming `-e`. It captures the policy's requirement that command syntax be explicit enough to classify safely.
+**Purpose**: Checks that the policy rejects an incomplete or wrongly shaped `sed` invocation. This helps ensure the policy does not accidentally treat a bare script-like argument as a complete, safe command when required options or arguments are missing.
 
-**Data flow**: Creates a `Policy` with `setup`, builds `ExecCall::new("sed", &["122,202p"])`, and asserts equality with `Err(Error::MissingRequiredOptions { program: "sed".to_string(), options: vec!["-e".to_string()] })`.
+**Data flow**: The test loads the policy and creates a command description for `sed 122,202p`. The policy checks it and is expected to return a `MissingRequiredOptions` error for `sed`, naming `-e` as the required option. Nothing is approved or converted into a valid execution.
 
-**Call relations**: Invoked by the test harness as a syntax-validation failure case. It complements the successful script-matching tests by showing the branch where the checker refuses to infer a valid sed command form from insufficient tokens.
+**Call relations**: This test follows the same pattern as the others: `setup` supplies the policy, `new` builds the command under test, and `assert_eq!` verifies that the result is the exact expected rejection.
 
 *Call graph*: calls 2 internal fn (new, setup); 1 external calls (assert_eq!).

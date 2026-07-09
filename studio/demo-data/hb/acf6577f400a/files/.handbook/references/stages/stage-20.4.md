@@ -1,8 +1,10 @@
 # Rollout trace recording, schema, and replay reducers  `stage-20.4`
 
-This stage is cross-cutting execution infrastructure: it sits alongside the main rollout flow to record what happened, persist it as a trace bundle, and later replay that bundle into structured models for debugging, analysis, and UI reconstruction. `lib.rs` exposes that surface, while `bundle.rs`, `raw_event.rs`, and `writer.rs` define the bundle manifest, append-only event format, payload ordering rules, and filesystem writer that make traces durable and deterministic. `protocol_event.rs` narrows broader protocol traffic into the trace vocabulary, and `rollout/src/config.rs` provides the stable config view used by rollout code that enables or shapes tracing.
+This stage is the project’s flight recorder. During the main run, it can write down what Codex does, then later turn that raw diary into a clean story that can be replayed or inspected. The bundle and raw event files define the trace package: a table of contents plus an ordered event log. The model files define the replay-friendly shapes for conversations, tool calls, threads, terminal work, code cells, compaction checkpoints, model requests, and stored payloads. The crate front door exports these pieces, while rollout configuration supplies the few settings tracing needs.
 
-On the recording side, `thread.rs`, `inference.rs`, `compaction.rs`, `code_cell.rs`, `tool_dispatch.rs`, and `mcp.rs` provide scoped tracing contexts for sessions, threads, model calls, compaction attempts, code execution, tool dispatch, and MCP backend calls, including correlation IDs and no-op behavior when tracing is disabled. On replay, `model/mod.rs` and `model/conversation.rs` define the reduced in-memory schema, and `reducer/mod.rs` drives deterministic reconstruction. Specialized reducers rebuild conversation snapshots, inference lifecycles, compaction checkpoints, thread/turn structure, code cells, generic tool calls, multi-agent interactions, and terminal sessions into one coherent rollout trace graph.
+The writer, thread, code cell, compaction, inference, tool dispatch, MCP, and protocol event files are the recording adapters. They sit beside normal work, assign trace IDs, save large payloads, and keep running even if tracing is off or a write fails.
+
+The reducer files are the replay workshop. They read the raw bundle in order and build one compact RolloutTrace. Separate reducers clean up conversations, normalize JSON messages, track model calls, compaction, threads, code cells, tools, agent handoffs, and terminal sessions, linking scattered events into one understandable run history.
 
 ## Files in this stage
 
@@ -11,13 +13,13 @@ These files define the public crate surface plus the raw, bundle, and reduced da
 
 ### `rollout-trace/src/bundle.rs`
 
-`data_model` · `trace bundle creation and replay metadata handling`
+`data_model` · `trace bundle creation and loading`
 
-This file is a compact data-model module for the rollout-trace bundle format. At the top it declares the canonical names used inside a bundle directory: `manifest.json` for the manifest itself, `trace.jsonl` for the raw event log, `payloads` for detached payload storage, and `state.json` for a reducer-written `RolloutTrace` cache. It also fixes separate schema-version constants for the manifest and reduced trace, both currently `1`, making version checks explicit rather than implicit in filenames.
+A trace bundle is a saved package of rollout history: the raw event log, any extra payload files, and a manifest file that explains what is inside. This file defines the standard names for those pieces, such as `manifest.json`, `trace.jsonl`, and the `payloads` folder. It also defines `TraceBundleManifest`, the manifest saved at the root of the bundle.
 
-The central type is `TraceBundleManifest`, a `Serialize`/`Deserialize` struct carrying the metadata needed to interpret a bundle root: `schema_version`, `trace_id`, `rollout_id`, `root_thread_id`, `started_at_unix_ms`, `raw_event_log`, and `payloads_dir`. The comment on `root_thread_id` captures an important invariant: replay must fail if the root thread is missing rather than inventing a placeholder, because reduced objects are scoped to that thread tree.
+The manifest is like the label on a box in storage. It says which trace and rollout the box belongs to, when recording started, where to find the raw event log, and which root thread the rollout began from. That root thread matters because the reduced trace data is organized under that thread tree. If it is missing or wrong, replay should not guess a replacement, because that could attach events to the wrong logical conversation or task.
 
-Its only behavior is the constructor `new`, which intentionally hardcodes the standard local layout by filling `schema_version` from `TRACE_MANIFEST_SCHEMA_VERSION` and setting `raw_event_log` and `payloads_dir` to the conventional constants. That keeps bundle writers consistent and avoids scattering literal filenames across the codebase.
+The file also records schema version numbers. A schema is the expected shape of saved data. Versioning lets future code know whether it understands the saved bundle format. The manifest can be serialized and deserialized, meaning it can be turned into JSON and read back into Rust data.
 
 #### Function details
 
@@ -32,11 +34,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs a manifest for a newly created trace bundle using the standard local directory layout and current manifest schema version.
+**Purpose**: Creates a new manifest using the project’s standard local bundle layout. Callers provide the unique trace details, and this function fills in the fixed file and folder names used inside the bundle.
 
-**Data flow**: It takes `trace_id: String`, `rollout_id: String`, `root_thread_id: AgentThreadId`, and `started_at_unix_ms: i64`, then returns `TraceBundleManifest` with `schema_version` set to `TRACE_MANIFEST_SCHEMA_VERSION`, the provided identifiers and timestamp copied through, `raw_event_log` set to `RAW_EVENT_LOG_FILE_NAME.to_string()`, and `payloads_dir` set to `PAYLOADS_DIR_NAME.to_string()`.
+**Data flow**: It takes a trace ID, rollout ID, root thread ID, and start time. It combines those with the current manifest schema version and the conventional locations for the raw event log and payload directory. The result is a complete `TraceBundleManifest` ready to be written into `manifest.json`.
 
-**Call relations**: Bundle-creation code calls this when materializing a new trace bundle manifest. The constructor encapsulates the file-layout convention so callers do not need to know the manifest's internal filename fields.
+**Call relations**: The bundle creation flow calls this when it is building a new trace bundle. After this function produces the manifest, the creator can save it alongside the raw trace log and payload directory so later readers know how to open the bundle.
 
 *Call graph*: called by 1 (create).
 
@@ -45,33 +47,37 @@ fn new(
 
 `orchestration` · `cross-cutting`
 
-This crate root assembles the rollout-trace subsystem into a stable import surface. Internally, the crate is split into modules for bundle layout, code-cell tracing, compaction tracing, inference tracing, MCP correlation, reduced-model definitions, raw payload references, protocol and raw event schemas, replay/reduction, thread tracing, tool-dispatch tracing, and the append-only writer. This file keeps those implementation details private and re-exports the concrete types that other crates need.
+This crate records and replays “rollout traces,” which are bundles of evidence about what happened during a Codex run: threads starting, model inference attempts, tool calls, compaction events, payload files, and the reduced summary produced from those raw events. This file does not implement that behavior directly. Instead, it declares the internal building blocks and carefully re-exports the pieces other code is meant to use.
 
-The exported API is intentionally layered. Writer-facing code gets no-op-capable context handles such as `ThreadTraceContext`, `InferenceTraceContext`, `InferenceTraceAttempt`, `CodeCellTraceContext`, `CompactionTraceContext`, `CompactionTraceAttempt`, `McpCallTraceContext`, and `ToolDispatchTraceContext`, plus the `TraceWriter` itself. Replay and viewer code gets the reduced model via `model::*`, raw event and payload identifiers like `RawEventSeq`, `RawTraceEvent`, `RawTraceEventPayload`, `RawPayloadId`, `RawPayloadKind`, and `RawPayloadRef`, and the reducer entrypoint `replay_bundle`. Bundle-level conventions are surfaced through `REDUCED_STATE_FILE_NAME` and the environment variable constant `CODEX_ROLLOUT_TRACE_ROOT_ENV`.
+Think of it like the reception desk for a larger office. The actual work happens in separate rooms such as `writer`, `reducer`, `thread`, `inference`, and `tool_dispatch`, but outsiders come through this one desk to get the official forms and services. That matters because hot-path Codex code can depend on a small, stable tracing API without knowing how the trace bundle is laid out internally.
 
-The comments make an important design boundary explicit: this crate owns the trace schema, while semantic replay and projections remain outside hot-path Codex code. That keeps instrumentation dependencies small while preserving a single canonical trace format.
+The comments also explain the project boundary: this crate owns the trace schema and writer API, while heavier semantic replay and viewer-style projections stay outside core Codex runtime code. The exported names include no-op-capable trace contexts, which means callers can use the same objects whether tracing is enabled or disabled. Without this file, users of the crate would need to know and import many private module paths directly, making the tracing system harder to understand and easier to break.
 
 
 ### `rollout-trace/src/model/conversation.rs`
 
-`data_model` · `trace replay and viewer projection`
+`data_model` · `cross-cutting: used whenever conversation traces are built, saved, loaded, or displayed`
 
-This file contains the transcript-centric portion of the reduced trace schema. Its central type, `ConversationItem`, represents one logical transcript row or structural boundary within a thread. Each item carries stable identity (`ConversationItemId`), owning thread, optional originating `CodexTurnId`, first-seen timestamp, normalized role and optional channel, item kind, optional `AgentMessageMetadata`, a structured `ConversationBody`, optional model-visible `call_id`, and a plural `produced_by` list of `ProducerRef` values. That last field is a key design choice: runtime causes are recorded as provenance only and are not allowed to rewrite the model-visible body.
+This file is a set of data definitions for the conversation part of a rollout trace. A rollout trace is a record of what happened during an agent run. Without these shared types, different parts of the system could disagree about what counts as a message, a tool call, a reasoning item, or an inference request.
 
-The schema distinguishes roles (`System`, `Developer`, `User`, `Assistant`, `Tool`), channels (`Analysis`, `Commentary`, `Final`, `Summary`), and normalized item kinds such as message, reasoning, function/custom tool call and output, plus `CompactionMarker` for history replacement boundaries. `ConversationBody` is an ordered list of `ConversationPart` variants, covering plain text, summaries, opaque encoded blobs, JSON summarized by a `RawPayloadId`, code blocks, and lazy-loaded payload references. This lets replay preserve exact model-visible structure while avoiding inlining large payloads.
+The central type is `ConversationItem`. Think of it like one entry in a chat transcript, but richer than a normal chat bubble. It records who the item belongs to, when it was first seen, what role it had, what channel it used, what kind of item it was, what visible content it contained, and what runtime event caused it to exist. Structural events, such as a compaction marker where old history was summarized or replaced, live in the same ordered list so a viewer can show the conversation as it changed over time.
 
-The file also defines `InferenceCall`, which links a single upstream model request/response pair to the reduced transcript. It stores execution timing, model/provider metadata, optional response and upstream request IDs, ordered request and response item IDs, tool calls started by the response, optional `TokenUsage`, and raw payload IDs for the full request and response bodies. Together these types form the semantic conversation graph that viewers and replay tools consume.
+`ConversationBody` and `ConversationPart` describe the actual content inside an item. Content can be plain text, a summary, encoded unreadable data, code, small JSON-like data, or a reference to a larger raw payload stored elsewhere. This keeps normal views readable while still preserving exact evidence for debugging.
+
+`InferenceCall` records one request sent to a model provider and the response metadata. It links the full raw request and response payloads to the reduced list of conversation item IDs that the model saw or produced. `TokenUsage` stores the token counts for cost and performance analysis.
 
 
 ### `rollout-trace/src/model/mod.rs`
 
-`data_model` · `replay/reduction and serialized artifact representation`
+`data_model` · `trace construction and replay data loading`
 
-This module is primarily schema definition. It introduces the string-based identifier aliases used throughout the reduced trace graph, including `AgentThreadId`, `CodexTurnId`, `InferenceCallId`, `McpCallId`, `CodeCellId`, `CompactionId`, and several reducer-owned edge and operation ids. It then re-exports the concrete model types from the `conversation`, `runtime`, and `session` submodules so consumers can import the whole reduced schema from one place.
+A Codex rollout can create a lot of noisy runtime data: chat messages, model calls, tool calls, terminal sessions, debug details, and raw JSON payloads. This file defines the cleaned-up model used after that activity has been reduced into something deterministic and replayable. In plain terms, it is the filing cabinet for one captured run.
 
-The central type is `RolloutTrace`, a `Serialize`/`Deserialize` struct representing one replayable rollout artifact. Its fields separate product/session identity (`trace_id`, `rollout_id`, `root_thread_id`) from lifecycle timing (`started_at_unix_ms`, optional `ended_at_unix_ms`, `status`) and from the reduced graph itself. The graph is stored in `BTreeMap`s keyed by stable ids for threads, turns, conversation items, inference calls, code cells, tool calls, terminal sessions and operations, compactions and compaction requests, interaction edges, and raw payload references. Using `BTreeMap` gives deterministic ordering in serialized output and replay.
+The file first gives clear names to many kinds of IDs. For example, an AgentThreadId names a conversation thread, a ToolCallId names a tool-call object owned by the reducer, and a TerminalId names a terminal runtime session. These are all strings underneath, but the aliases make the meaning of each string clear.
 
-`RolloutTrace::new` is the only behavior here: it constructs an empty trace in `Running` state with all maps initialized and `ended_at_unix_ms` unset. The reducer then incrementally fills these collections as it processes raw events.
+The main type is RolloutTrace. It stores the trace identity, rollout identity, start and end times, current status, the root conversation thread, and many ordered maps of related records. A BTreeMap is a map that keeps keys in a stable sorted order, which helps make saved traces predictable and easier to compare.
+
+This file also re-exports the more detailed model pieces from the conversation, runtime, and session submodules. Those files define the contents; this file defines the whole container that holds them together.
 
 #### Function details
 
@@ -87,24 +93,26 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs an empty reduced trace object ready for the reducer to populate. It establishes the initial rollout identity and marks the rollout as still running.
+**Purpose**: Creates a fresh, empty RolloutTrace for a reducer to fill in as it reads events from a rollout. It sets the basic identity and start time, marks the trace as still running, and prepares empty collections for every kind of record that may be added later.
 
-**Data flow**: Consumes `schema_version`, `trace_id`, `rollout_id`, `root_thread_id`, and `started_at_unix_ms`; stores them directly, sets `ended_at_unix_ms` to `None`, sets `status` to `RolloutStatus::Running`, and initializes every graph collection field as an empty `BTreeMap`. Returns the fully initialized `RolloutTrace`.
+**Data flow**: It receives the schema version, trace ID, rollout ID, root thread ID, and start timestamp. It copies those into a new RolloutTrace, sets the end time to absent because the run is not finished yet, sets the status to Running, and creates empty sorted maps for threads, turns, messages, model calls, tool calls, terminal records, compactions, interaction edges, and raw payload references. The result is a complete but empty trace object ready to be populated.
 
-**Call relations**: It is called by `replay_bundle` at the start of reduction, providing the empty accumulator into which replayed threads, turns, calls, payloads, and edges are inserted.
+**Call relations**: The replay_bundle flow calls this when it needs a blank trace to begin rebuilding or reducing a rollout. Inside this constructor, the empty maps are created with standard map constructors so later reducer steps can insert each discovered conversation item, runtime action, or payload reference into the right place.
 
 *Call graph*: called by 1 (replay_bundle); 1 external calls (new).
 
 
 ### `rollout-trace/src/raw_event.rs`
 
-`data_model` · `cross-cutting raw trace writing and validation`
+`data_model` · `cross-cutting trace recording and replay`
 
-This module is the low-level schema for raw rollout traces. `RawTraceEvent` is the common envelope written to the append-only log: it carries a schema version, monotonic sequence number, wall-clock timestamp, rollout id, optional thread and turn context, and a typed `RawTraceEventPayload`. `RawTraceEventContext` is the smaller writer-supplied subset used when appending events. The file also defines `RawToolCallRequester`, which distinguishes model-originated tool calls from those issued by a runtime code cell using runtime-local identifiers.
+This file gives the project a common language for recording trace events. A rollout can include model calls, tool calls, code execution, thread starts and stops, compaction, child-agent results, and lower-level protocol events. Without one shared event shape, the trace log would be harder to check, replay, or reduce into a cleaner graph later.
 
-The large `RawTraceEventPayload` enum enumerates every raw event shape currently emitted by the tracing system: rollout/thread/turn lifecycle, inference start/completion/failure/cancellation, tool-call lifecycle and MCP correlation, code-cell lifecycle, compaction attempts and installation, agent-result delivery, wrapped protocol events, and a generic `Other` escape hatch. Many variants carry `RawPayloadRef` fields pointing to separately stored JSON payloads rather than embedding large data inline.
+The central type is RawTraceEvent. Think of it like an envelope around a letter. The envelope always has the same basic facts: schema version, sequence number, timestamp, rollout id, optional thread id, optional turn id, and then the actual event payload. Because every envelope looks the same, the system can read events in order and do basic safety checks before it even understands the specific event inside.
 
-`raw_payload_refs` is the key behavioral helper. It pattern-matches every payload variant and returns the exact set of referenced `RawPayloadRef`s that must already exist before the event is appended. Variants with no payloads return an empty vector; optional payload fields are converted with `.iter().collect()` so absent payloads naturally disappear; multi-payload variants like `Other` return all refs. This function encodes an important invariant for trace integrity: event records may refer only to payloads that have already been persisted.
+RawTraceEventPayload is the list of possible “letters” inside that envelope. Each variant describes one kind of thing that may happen, such as an inference starting, a tool finishing, a code cell returning, or an unknown future event stored as Other. Some events point to separate raw payloads, using RawPayloadRef, instead of storing large request or response data directly.
+
+The helper method raw_payload_refs gathers those referenced payloads so the writer can make sure the referenced data exists before the event is appended.
 
 #### Function details
 
@@ -114,24 +122,26 @@ The large `RawTraceEventPayload` enum enumerates every raw event shape currently
 fn raw_payload_refs(&self) -> Vec<&RawPayloadRef>
 ```
 
-**Purpose**: Returns the list of raw payload references that a given raw event payload depends on. It is used to enforce that referenced payload blobs exist before the event itself is appended or replayed.
+**Purpose**: This method finds every separate raw payload that a trace event depends on. It is useful before writing an event, because the trace log should not point to request, response, or metadata blobs that have not been stored yet.
 
-**Data flow**: Matches on `self` across all `RawTraceEventPayload` variants. Variants with no payload-bearing fields return `Vec::new()`. Variants with one required payload return `vec![payload_ref]`. Variants with optional payloads use `.iter().collect()` so `None` yields an empty vector and `Some(ref)` yields a one-element vector. `Other` returns `payloads.iter().collect()`. The function reads only the enum fields and returns a new `Vec<&RawPayloadRef>`.
+**Data flow**: It starts with one RawTraceEventPayload value, such as an inference request, a tool result, or a protocol event. It checks which kind of event it is, then collects the RawPayloadRef values inside it, if any. It returns a list of borrowed payload references; events with no external payloads return an empty list, events with one payload return a one-item list, and the generic Other event returns all payloads it carries.
 
-**Call relations**: This helper is part of the raw-event schema itself and is consumed by writer or replay logic that needs to validate payload/event ordering and completeness.
+**Call relations**: This function sits beside the raw event definitions as a consistency helper. When code is preparing to append a raw event, it can call this method to ask, “Which payload blobs must already exist for this event to be valid?” Internally it only builds and returns small lists, using standard vector creation, and it does not write files or change the event.
 
 *Call graph*: 2 external calls (new, vec!).
 
 
 ### `rollout/src/config.rs`
 
-`config` · `config access and config snapshotting during rollout subsystem initialization`
+`config` · `config load and startup, then read throughout runtime`
 
-This file is intentionally minimal and type-focused. The `RolloutConfigView` trait exposes five getters required by the rollout subsystem: `codex_home`, `sqlite_home`, `cwd`, `model_provider_id`, and `generate_memories`. The concrete `RolloutConfig` struct stores those values as owned `PathBuf`s, a `String`, and a `bool`, and derives `Clone`, `Debug`, `PartialEq`, and `Eq`. `pub type Config = RolloutConfig` provides a compatibility alias.
+This file is the rollout system’s configuration shape. Think of it like a labeled folder that carries the few addresses and switches the rest of the program needs: the Codex home directory, the SQLite data directory, the current working directory, the model provider name, and a yes-or-no memory-generation flag.
 
-`RolloutConfig::from_view` is the only constructor-like behavior: it snapshots any `RolloutConfigView` into an owned `RolloutConfig` by cloning paths and strings and copying the boolean. The rest of the file is trait plumbing. `RolloutConfig` implements `RolloutConfigView` directly by returning borrowed views into its fields. Blanket implementations for `&T` and `Arc<T>` forward each getter to the underlying `T: RolloutConfigView + ?Sized`, allowing callers to pass borrowed or shared config objects without additional adapters.
+The central idea is the `RolloutConfigView` trait. A trait is a shared promise: anything that implements it can answer the same questions about configuration. That lets setup code, tests, or shared references all provide configuration in the same way.
 
-The main design choice is that this file avoids embedding any loading or validation logic. It exists purely to define the configuration contract and make ownership flexible at API boundaries.
+`RolloutConfig` is the concrete version. It owns its data, using `PathBuf` for stored filesystem paths and `String` for the provider id. The `from_view` function copies values out of any read-only configuration view and turns them into an owned `RolloutConfig`. This matters because startup code can accept flexible inputs, then freeze them into one stable configuration object for later use.
+
+The file also makes references and `Arc` values work as configuration views. `Arc` means “atomic reference-counted pointer,” a safe way for multiple parts of a program to share the same value. These forwarding implementations mean callers do not need to unwrap or clone configuration just to read it.
 
 #### Function details
 
@@ -141,11 +151,11 @@ The main design choice is that this file avoids embedding any loading or validat
 fn from_view(view: &impl RolloutConfigView) -> Self
 ```
 
-**Purpose**: Builds an owned `RolloutConfig` by copying values out of any `RolloutConfigView`. It is the snapshotting adapter from abstract config providers to the concrete config struct.
+**Purpose**: Builds a full owned `RolloutConfig` from any read-only configuration view. This is useful when initialization code wants to accept flexible configuration sources but store one stable copy for the rollout system.
 
-**Data flow**: Accepts `&impl RolloutConfigView`, reads `codex_home`, `sqlite_home`, and `cwd` and clones them into `PathBuf`s, clones `model_provider_id` into a `String`, copies `generate_memories`, and returns the assembled `RolloutConfig`.
+**Data flow**: It receives something that can answer configuration questions. It reads each needed value from that view, copies path values into owned path buffers, copies the model provider id into an owned string, and copies the memory-generation flag. The result is a new `RolloutConfig` that no longer depends on the original view.
 
-**Call relations**: Called during rollout initialization paths that want to decouple long-lived rollout state from the lifetime or ownership model of the original config source.
+**Call relations**: This is called during initialization by `init` and `try_init`. In that startup flow, they hand it a configuration-like object, and it asks that object for `codex_home`, `sqlite_home`, `cwd`, `model_provider_id`, and `generate_memories` so the rest of rollout can use a concrete config.
 
 *Call graph*: called by 2 (init, try_init); 5 external calls (codex_home, cwd, generate_memories, model_provider_id, sqlite_home).
 
@@ -156,11 +166,11 @@ fn from_view(view: &impl RolloutConfigView) -> Self
 fn codex_home(&self) -> &Path
 ```
 
-**Purpose**: Returns the configured Codex home directory as a `&Path`. It exposes the owned `PathBuf` through the trait interface.
+**Purpose**: Returns the configured Codex home directory as a borrowed path. Other code uses this when it needs to find files under the main Codex home area without taking ownership of the stored path.
 
-**Data flow**: Borrows `self` and returns `self.codex_home.as_path()`.
+**Data flow**: It reads the `codex_home` path stored inside the `RolloutConfig` and turns it into a borrowed `Path` view. Nothing is changed; the caller simply gets a read-only look at the path.
 
-**Call relations**: Used wherever rollout code needs the root home directory from a concrete `RolloutConfig`.
+**Call relations**: This is one of the methods that makes `RolloutConfig` satisfy `RolloutConfigView`. When code treats a `RolloutConfig` as a configuration view, this method supplies the Codex home path and uses the standard path conversion helper underneath.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -171,11 +181,11 @@ fn codex_home(&self) -> &Path
 fn sqlite_home(&self) -> &Path
 ```
 
-**Purpose**: Returns the configured SQLite home directory as a `&Path`. It is the concrete getter for the trait.
+**Purpose**: Returns the configured SQLite storage directory as a borrowed path. Code that opens or locates the local database uses this to know where that database-related data should live.
 
-**Data flow**: Borrows `self` and returns `self.sqlite_home.as_path()`.
+**Data flow**: It reads the stored `sqlite_home` path buffer and returns a read-only path slice of it. The original configuration remains unchanged.
 
-**Call relations**: Used by rollout code that needs database-related filesystem roots from a concrete config.
+**Call relations**: This supports the `RolloutConfigView` interface for `RolloutConfig`. When initialization or runtime code asks a concrete config for its SQLite location, this method provides it through the normal borrowed-path form.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -186,11 +196,11 @@ fn sqlite_home(&self) -> &Path
 fn cwd(&self) -> &Path
 ```
 
-**Purpose**: Returns the configured working directory as a `&Path`. It exposes the rollout session's cwd through the trait.
+**Purpose**: Returns the configured current working directory as a borrowed path. This gives the rollout code a stable idea of what directory work should be considered relative to.
 
-**Data flow**: Borrows `self` and returns `self.cwd.as_path()`.
+**Data flow**: It reads the `cwd` field stored in the config and exposes it as a borrowed `Path`. It does not modify the path or the config.
 
-**Call relations**: Used by rollout code that needs the session cwd from a concrete `RolloutConfig`.
+**Call relations**: This is part of the read-only configuration view implemented by `RolloutConfig`. Any caller using the config through `RolloutConfigView` can ask for the working directory and receive it here.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -201,11 +211,11 @@ fn cwd(&self) -> &Path
 fn model_provider_id(&self) -> &str
 ```
 
-**Purpose**: Returns the configured default model provider identifier as `&str`. It is the concrete string getter for the trait.
+**Purpose**: Returns the configured model provider identifier, such as the name or key for the provider the system should use. This lets the rest of the rollout code choose the right model backend.
 
-**Data flow**: Borrows `self` and returns `self.model_provider_id.as_str()`.
+**Data flow**: It reads the stored `model_provider_id` string and returns it as a borrowed string slice. No copy is made and the configuration is not changed.
 
-**Call relations**: Used by rollout code that needs the default provider name from a concrete config.
+**Call relations**: This method is part of the `RolloutConfigView` implementation for the concrete config. When setup code copies a config through `from_view`, or when other code reads the provider setting, this is the concrete source of that value.
 
 
 ##### `RolloutConfig::generate_memories`  (lines 53–55)
@@ -214,11 +224,11 @@ fn model_provider_id(&self) -> &str
 fn generate_memories(&self) -> bool
 ```
 
-**Purpose**: Returns whether rollout processing should generate memories. It is the concrete boolean getter for the trait.
+**Purpose**: Returns whether memory generation is enabled. This acts like a feature switch that other code can check before doing memory-related work.
 
-**Data flow**: Borrows `self` and returns `self.generate_memories`.
+**Data flow**: It reads the stored boolean flag and returns that true-or-false value. There are no side effects.
 
-**Call relations**: Used by rollout logic that conditionally enables memory generation based on config.
+**Call relations**: This completes the concrete config’s implementation of `RolloutConfigView`. Code that needs to decide whether to generate memories can ask through the shared view interface and receive this stored flag.
 
 
 ##### `T::codex_home`  (lines 59–61)
@@ -227,11 +237,11 @@ fn generate_memories(&self) -> bool
 fn codex_home(&self) -> &Path
 ```
 
-**Purpose**: Forwards `RolloutConfigView::codex_home` through a shared reference to another config view. It lets `&T` satisfy the trait without manual dereferencing by callers.
+**Purpose**: Lets a borrowed configuration object behave just like the configuration object itself when asking for the Codex home directory. This removes friction for callers that only have a reference.
 
-**Data flow**: Borrows `&&T`, dereferences to `*self`, calls `codex_home()` on the underlying `T`, and returns the resulting `&Path`.
+**Data flow**: It receives a reference to something that already knows how to provide configuration. It forwards the Codex home request to the underlying object and returns that same borrowed path.
 
-**Call relations**: Part of the blanket `impl RolloutConfigView for &T`; used implicitly whenever APIs receive borrowed config views.
+**Call relations**: This is part of the blanket implementation for `&T`, meaning references automatically support `RolloutConfigView` when the thing they point to does. It hands the request straight through to the underlying `codex_home` method.
 
 
 ##### `T::sqlite_home`  (lines 63–65)
@@ -240,11 +250,11 @@ fn codex_home(&self) -> &Path
 fn sqlite_home(&self) -> &Path
 ```
 
-**Purpose**: Forwards `sqlite_home` through a shared reference wrapper. It preserves the same trait interface for `&T`.
+**Purpose**: Lets a borrowed configuration object provide the SQLite home directory without extra wrapping or copying. Callers can pass references wherever a configuration view is expected.
 
-**Data flow**: Borrows `&&T`, dereferences, calls `sqlite_home()` on the underlying config view, and returns `&Path`.
+**Data flow**: It takes a reference to a configuration-capable object, asks the underlying object for its SQLite home path, and returns that borrowed path to the caller.
 
-**Call relations**: Used implicitly via the blanket reference implementation of `RolloutConfigView`.
+**Call relations**: This belongs to the reference-forwarding implementation of `RolloutConfigView`. When code has `&config` rather than `config`, this method forwards the SQLite location request to the real config object.
 
 
 ##### `T::cwd`  (lines 67–69)
@@ -253,11 +263,11 @@ fn sqlite_home(&self) -> &Path
 fn cwd(&self) -> &Path
 ```
 
-**Purpose**: Forwards `cwd` through a shared reference wrapper. This avoids requiring owned config values at call sites.
+**Purpose**: Lets a borrowed configuration object provide the current working directory. This keeps configuration access consistent whether code owns the config or only borrows it.
 
-**Data flow**: Borrows `&&T`, dereferences, calls `cwd()` on the underlying config view, and returns `&Path`.
+**Data flow**: It receives a reference, calls the underlying object’s `cwd` method, and returns the borrowed working-directory path it gets back. It changes nothing.
 
-**Call relations**: Used implicitly when rollout APIs are passed `&T` where `T: RolloutConfigView`.
+**Call relations**: This is used implicitly when a reference is treated as a `RolloutConfigView`. It simply passes the request down to the object being referenced.
 
 
 ##### `T::model_provider_id`  (lines 71–73)
@@ -266,11 +276,11 @@ fn cwd(&self) -> &Path
 fn model_provider_id(&self) -> &str
 ```
 
-**Purpose**: Forwards `model_provider_id` through a shared reference wrapper. It preserves trait usability for borrowed config objects.
+**Purpose**: Lets a borrowed configuration object provide the model provider id. This avoids unnecessary string copying just because code is working through a reference.
 
-**Data flow**: Borrows `&&T`, dereferences, calls `model_provider_id()` on the underlying config view, and returns `&str`.
+**Data flow**: It takes a reference to a configuration view, asks the underlying value for its provider id, and returns the borrowed string slice. The original value stays untouched.
 
-**Call relations**: Part of the blanket reference implementation used implicitly by config-consuming APIs.
+**Call relations**: As part of the `&T` forwarding implementation, this method makes references fit smoothly into the same configuration-reading flow used by owned configs.
 
 
 ##### `T::generate_memories`  (lines 75–77)
@@ -279,11 +289,11 @@ fn model_provider_id(&self) -> &str
 fn generate_memories(&self) -> bool
 ```
 
-**Purpose**: Forwards `generate_memories` through a shared reference wrapper. It keeps the boolean getter available on `&T`.
+**Purpose**: Lets a borrowed configuration object report whether memory generation is enabled. This allows feature checks to work the same way through references.
 
-**Data flow**: Borrows `&&T`, dereferences, calls `generate_memories()` on the underlying config view, and returns `bool`.
+**Data flow**: It receives a reference, asks the underlying config-like value for the memory-generation flag, and returns that true-or-false answer.
 
-**Call relations**: Used implicitly via the blanket `RolloutConfigView for &T` implementation.
+**Call relations**: This forwards the call for any referenced type that already implements `RolloutConfigView`. It keeps callers from needing special cases for borrowed configuration.
 
 
 ##### `Arc::codex_home`  (lines 81–83)
@@ -292,11 +302,11 @@ fn generate_memories(&self) -> bool
 fn codex_home(&self) -> &Path
 ```
 
-**Purpose**: Forwards `codex_home` through an `Arc<T>` wrapper. This allows shared config objects to satisfy `RolloutConfigView` directly.
+**Purpose**: Lets a shared `Arc` configuration object provide the Codex home directory. `Arc` is used when multiple parts of the program need safe shared access to the same config.
 
-**Data flow**: Borrows `&Arc<T>`, calls `self.as_ref().codex_home()`, and returns `&Path` from the underlying config view.
+**Data flow**: It receives an `Arc` pointing to a configuration-capable object, looks through the shared pointer to the underlying value, asks for the Codex home path, and returns the borrowed result.
 
-**Call relations**: Used implicitly when rollout APIs receive `Arc<T>` config objects.
+**Call relations**: This is part of the `Arc<T>` implementation of `RolloutConfigView`. When shared configuration is passed around, this method forwards the Codex home request to the actual config inside the `Arc`.
 
 
 ##### `Arc::sqlite_home`  (lines 85–87)
@@ -305,11 +315,11 @@ fn codex_home(&self) -> &Path
 fn sqlite_home(&self) -> &Path
 ```
 
-**Purpose**: Forwards `sqlite_home` through an `Arc<T>` wrapper. It preserves the trait interface for shared ownership.
+**Purpose**: Lets shared `Arc` configuration provide the SQLite home directory. This means database-related code can read the setting even when config is shared across parts of the program.
 
-**Data flow**: Borrows `&Arc<T>`, calls `self.as_ref().sqlite_home()`, and returns `&Path`.
+**Data flow**: It looks through the `Arc` to the underlying configuration value, asks that value for its SQLite home path, and returns the borrowed path. The shared pointer and config are not changed.
 
-**Call relations**: Part of the blanket `RolloutConfigView for Arc<T>` implementation.
+**Call relations**: This forwarding method makes `Arc<T>` usable wherever a `RolloutConfigView` is expected. It passes the SQLite location request on to the config stored inside the shared pointer.
 
 
 ##### `Arc::cwd`  (lines 89–91)
@@ -318,11 +328,11 @@ fn sqlite_home(&self) -> &Path
 fn cwd(&self) -> &Path
 ```
 
-**Purpose**: Forwards `cwd` through an `Arc<T>` wrapper. This avoids forcing callers to unwrap shared config state.
+**Purpose**: Lets shared `Arc` configuration provide the current working directory. This keeps shared configuration just as easy to read as an ordinary config value.
 
-**Data flow**: Borrows `&Arc<T>`, calls `self.as_ref().cwd()`, and returns `&Path`.
+**Data flow**: It receives an `Arc`, gets a reference to the underlying configuration object, asks for the working directory, and returns the borrowed path.
 
-**Call relations**: Used implicitly by config-consuming rollout code when config is shared via `Arc`.
+**Call relations**: This fits into the shared-configuration path. When code holds config in an `Arc` and asks for `cwd`, this method forwards that request to the inner object.
 
 
 ##### `Arc::model_provider_id`  (lines 93–95)
@@ -331,11 +341,11 @@ fn cwd(&self) -> &Path
 fn model_provider_id(&self) -> &str
 ```
 
-**Purpose**: Forwards `model_provider_id` through an `Arc<T>` wrapper. It keeps the string getter available on shared config values.
+**Purpose**: Lets shared `Arc` configuration provide the model provider id. This allows many parts of the program to read which provider to use without copying or unwrapping the config.
 
-**Data flow**: Borrows `&Arc<T>`, calls `self.as_ref().model_provider_id()`, and returns `&str`.
+**Data flow**: It looks inside the `Arc`, calls the underlying object’s provider-id method, and returns the borrowed string slice. No data is copied or modified.
 
-**Call relations**: Part of the blanket `Arc<T>` trait implementation used implicitly at API boundaries.
+**Call relations**: This is one of the forwarding methods that makes `Arc<T>` implement `RolloutConfigView`. In shared runtime flows, it passes provider-id reads through to the inner configuration.
 
 
 ##### `Arc::generate_memories`  (lines 97–99)
@@ -344,11 +354,11 @@ fn model_provider_id(&self) -> &str
 fn generate_memories(&self) -> bool
 ```
 
-**Purpose**: Forwards `generate_memories` through an `Arc<T>` wrapper. It preserves the boolean getter for shared config ownership.
+**Purpose**: Lets shared `Arc` configuration report whether memory generation is enabled. This supports simple feature-flag checks even when configuration is shared.
 
-**Data flow**: Borrows `&Arc<T>`, calls `self.as_ref().generate_memories()`, and returns `bool`.
+**Data flow**: It receives the shared pointer, reads through it to the underlying config-like object, asks for the memory-generation flag, and returns that boolean value.
 
-**Call relations**: Used implicitly whenever rollout code reads config through an `Arc<dyn RolloutConfigView>` or similar shared wrapper.
+**Call relations**: This completes the `Arc<T>` forwarding implementation. When shared configuration is used through the common view interface, this method passes the memory flag request to the real config value.
 
 
 ### trace writing backbone
@@ -356,13 +366,13 @@ These files provide the low-level event translation and persistence machinery us
 
 ### `rollout-trace/src/protocol_event.rs`
 
-`domain_logic` · `protocol event ingestion during session/turn/tool tracing`
+`domain_logic` · `request handling / event recording`
 
-This module is the bridge between the broad Codex protocol surface and the narrower rollout trace schema. `codex_turn_trace_event` recognizes only turn lifecycle messages: `TurnStarted` becomes `RawTraceEventPayload::CodexTurnStarted`, `TurnComplete` becomes `CodexTurnEnded` with `ExecutionStatus::Completed`, and `TurnAborted` becomes `CodexTurnEnded` with status derived from `execution_status_for_abort_reason`. For aborted turns without an explicit turn id, it falls back to the caller-supplied `default_turn_id`.
+Think of this file as a customs desk between two countries. On one side are many detailed Codex protocol events: turns starting and ending, shell commands, patch attempts, MCP tool calls, collaboration actions, warnings, and more. On the other side is the rollout trace format, which only wants certain events that mark important runtime boundaries.
 
-Tool-runtime mapping is more extensive. `ToolRuntimeTraceEvent` distinguishes `Started` and `Ended` observations, each carrying a borrowed `tool_call_id` and a `ToolRuntimePayload<'a>`. That payload enum wraps the original protocol event structs by reference and implements `Serialize` by delegating directly to the wrapped event, preserving exact protocol JSON without cloning into an intermediate `Value`. `tool_runtime_trace_event` explicitly matches many `EventMsg` variants, converting only runtime-boundary events such as exec commands, patch apply, MCP tool calls, collaboration lifecycle events, and `SubAgentActivity`. Notably, `ExecCommandBegin/End` events from `ExecCommandSource::UserShell` are excluded, and several end statuses are inferred from protocol-specific fields like `result.is_ok()` or `new_thread_id.is_some()`.
+The file decides which protocol events matter for tracing, converts them into trace-friendly shapes, and ignores the rest. Turn events become trace records saying a Codex turn started or ended, with a completed, failed, or cancelled status. Tool-like actions, such as running a command, applying a patch, calling an MCP tool, or interacting with a collaborator agent, become “started” or “ended” runtime events tied to a tool call id.
 
-`wrapped_protocol_event_type` separately classifies a small set of generic protocol events that should be wrapped as opaque observed events rather than mapped into dedicated runtime boundaries. Two trait impls map `ExecCommandStatus` and `PatchApplyStatus` into reduced `ExecutionStatus`, and `execution_status_for_abort_reason` collapses all current abort reasons into `Cancelled`.
+An important detail is that the file keeps the original protocol payload available by reference. That means the recorder can save the exact event data for debugging without copying it or reshaping it first. The long match statements are deliberate: when a new protocol event is added elsewhere, the compiler forces this file to make an explicit choice about whether that event should appear in rollout traces.
 
 #### Function details
 
@@ -376,11 +386,11 @@ fn codex_turn_trace_event(
 ) -> Option<CodexTurnTraceEvent>
 ```
 
-**Purpose**: Maps turn lifecycle protocol events into raw trace turn events with the correct context turn id. It handles started, completed, and aborted turns while ignoring all other protocol messages.
+**Purpose**: This function looks at a Codex protocol event and decides whether it marks the start or end of a Codex turn. If it does, it creates the matching raw trace event; if not, it returns nothing.
 
-**Data flow**: Accepts the enclosing `thread_id`, a `default_turn_id`, and an `&EventMsg`. For `TurnStarted`, it clones `event.turn_id` into both `context_turn_id` and `RawTraceEventPayload::CodexTurnStarted`. For `TurnComplete`, it emits `CodexTurnEnded` with `ExecutionStatus::Completed`. For `TurnAborted`, it uses `event.turn_id` if present or `default_turn_id.to_string()` otherwise, computes status via `execution_status_for_abort_reason`, and emits `CodexTurnEnded`. All other variants return `None`.
+**Data flow**: It receives the agent thread id, a fallback turn id, and one protocol event. For a turn start, it copies the event’s turn id and creates a “turn started” trace payload. For a normal turn completion, it creates a “turn ended” payload with a completed status. For an aborted turn, it uses the event’s turn id if present, otherwise the fallback id, then converts the abort reason into a cancelled-style execution status. For every other protocol event, nothing comes out.
 
-**Call relations**: It is called by `record_codex_turn_event` when protocol events arrive. It delegates abort-status mapping to `execution_status_for_abort_reason`.
+**Call relations**: The trace recording flow calls this from record_codex_turn_event when it is considering whether a protocol event should become a turn-level trace record. When the turn was aborted, this function hands the abort reason to execution_status_for_abort_reason so the trace uses the project’s standard execution status wording.
 
 *Call graph*: calls 1 internal fn (execution_status_for_abort_reason); called by 1 (record_codex_turn_event).
 
@@ -391,11 +401,11 @@ fn codex_turn_trace_event(
 fn serialize(&self, serializer: S) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes a borrowed wrapped protocol event using that event type's own `Serialize` implementation. This preserves the exact protocol payload shape in trace payloads without cloning or converting through `serde_json::Value` first.
+**Purpose**: This function tells Serde, Rust’s serialization library, how to write out a tool runtime payload. It preserves the exact original protocol event shape instead of converting everything into a generic blob first.
 
-**Data flow**: Matches on `self` across all `ToolRuntimePayload` variants and forwards `serializer` to the wrapped event's `serialize` method. It returns the serializer result and does not mutate state.
+**Data flow**: It receives a ToolRuntimePayload value, which is a wrapper around a borrowed protocol event. It checks which kind of event is inside, then asks that original event to serialize itself. The output is serialized data in the same structure as the underlying protocol event, with no extra copy or manual rebuilding.
 
-**Call relations**: This implementation is used whenever a `ToolRuntimePayload` is written into a raw payload by higher-level tracing code, making the wrapper enum transparent at serialization time.
+**Call relations**: This is used whenever a tool runtime payload is saved or sent through code that relies on Serde serialization. It supports the events produced by tool_runtime_trace_event by making their borrowed payloads writable in the trace.
 
 
 ##### `tool_runtime_trace_event`  (lines 142–290)
@@ -404,11 +414,11 @@ fn serialize(&self, serializer: S) -> Result<S::Ok, S::Error>
 fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTraceEvent<'_>>
 ```
 
-**Purpose**: Recognizes protocol events that correspond to concrete tool runtime boundaries and converts them into `Started` or `Ended` trace observations. It also computes reduced execution status for terminal events based on protocol-specific semantics.
+**Purpose**: This function decides whether a protocol event represents the beginning or end of a tool-like action that should appear in the rollout trace. It covers command execution, patch application, MCP tool calls, collaboration actions, and sub-agent activity.
 
-**Data flow**: Accepts `&EventMsg` and pattern-matches exhaustively. It returns `Some(ToolRuntimeTraceEvent::Started { ... })` for begin events such as non-`UserShell` exec commands, patch apply begin, MCP begin, and collaboration begin variants. It returns `Some(...Ended { status, payload })` for matching end events, deriving `status` via `trace_execution_status()`, `result.is_ok()`, `new_thread_id.is_some()`, or fixed `ExecutionStatus::Completed` depending on the variant. All explicitly listed non-runtime or unsupported variants return `None`.
+**Data flow**: It receives one protocol event. If the event starts a traced tool action, it returns a “started” trace event containing the tool call id and the original payload. If the event ends a traced action, it returns an “ended” trace event with the tool call id, a completed, failed, or cancelled status, and the original payload. User shell command events are deliberately skipped, and many protocol events that are not runtime boundaries return nothing.
 
-**Call relations**: It is called by `record_tool_call_event` to decide whether an incoming protocol event should produce a tool runtime trace event. It relies on the `TraceExecutionStatus` trait impls for exec and patch statuses.
+**Call relations**: The trace recorder calls this from record_tool_call_event when protocol events pass through the system. For command and patch endings, it uses the status conversion helpers on ExecCommandStatus and PatchApplyStatus. For collaboration events, it wraps the corresponding begin or end payload so the recorder can keep the original protocol details.
 
 *Call graph*: called by 1 (record_tool_call_event); 15 external calls (CollabAgentInteractionBegin, CollabAgentInteractionEnd, CollabAgentSpawnBegin, CollabAgentSpawnEnd, CollabCloseBegin, CollabCloseEnd, CollabWaitingBegin, CollabWaitingEnd, ExecCommandBegin, ExecCommandEnd (+5 more)).
 
@@ -419,11 +429,11 @@ fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTraceEvent<'_
 fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static str>
 ```
 
-**Purpose**: Classifies a small subset of protocol events by stable string type names for generic wrapping into trace events. It intentionally returns `None` for most protocol variants that either have dedicated trace mappings or are not traced.
+**Purpose**: This function picks out a small set of protocol events that should be recorded as wrapped protocol events and gives each one a stable text name. It is used for general trace visibility around important session-level events.
 
-**Data flow**: Matches on `&EventMsg` and returns `Some(&'static str)` for `SessionConfigured`, `TurnStarted`, `TurnComplete`, `TurnAborted`, `ThreadRolledBack`, `Error`, `Warning`, and `ShutdownComplete`. Every other listed variant returns `None`.
+**Data flow**: It receives one protocol event. For selected events such as session configuration, turn start, turn complete, turn abort, thread rollback, error, warning, and shutdown complete, it returns a short snake_case event type string. For all other protocol events, it returns nothing.
 
-**Call relations**: It is used by `record_protocol_event` when deciding whether to wrap an observed protocol event into `RawTraceEventPayload::ProtocolEventObserved` rather than mapping it through a dedicated trace-specific path.
+**Call relations**: record_protocol_event calls this when deciding whether to save a protocol event in wrapped form. This function does not build the whole trace record itself; it only answers the question, “Is this event one of the protocol events we wrap, and what should we call it?”
 
 *Call graph*: called by 1 (record_protocol_event).
 
@@ -434,11 +444,11 @@ fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static str>
 fn trace_execution_status(&self) -> ExecutionStatus
 ```
 
-**Purpose**: Converts protocol exec-command terminal status into the reduced trace execution status enum. It preserves the distinction between completion, failure, and user decline.
+**Purpose**: This function converts a command execution status from the Codex protocol into the rollout trace’s shared execution status language. It keeps command outcomes consistent with other traced actions.
 
-**Data flow**: Matches `self`: `Completed` maps to `ExecutionStatus::Completed`, `Failed` to `ExecutionStatus::Failed`, and `Declined` to `ExecutionStatus::Cancelled`. Returns the mapped status.
+**Data flow**: It receives a command status: completed, failed, or declined. It maps completed to completed, failed to failed, and declined to cancelled. The result is an ExecutionStatus value used by trace events.
 
-**Call relations**: This trait method is used by `tool_runtime_trace_event` when translating `ExecCommandEnd` events into terminal tool-runtime trace events.
+**Call relations**: tool_runtime_trace_event uses this when it sees the end of a traced command execution. That lets command-end trace events report their outcome in the same terms as patch, turn, and collaboration events.
 
 
 ##### `PatchApplyStatus::trace_execution_status`  (lines 388–394)
@@ -447,11 +457,11 @@ fn trace_execution_status(&self) -> ExecutionStatus
 fn trace_execution_status(&self) -> ExecutionStatus
 ```
 
-**Purpose**: Converts protocol patch-apply terminal status into the reduced trace execution status enum. It treats declined patch application as cancellation rather than failure.
+**Purpose**: This function converts a patch application status from the Codex protocol into the rollout trace’s shared execution status language. It makes patch results comparable to other runtime results in the trace.
 
-**Data flow**: Matches `self`: `Completed` becomes `ExecutionStatus::Completed`, `Failed` becomes `ExecutionStatus::Failed`, and `Declined` becomes `ExecutionStatus::Cancelled`. Returns the mapped value.
+**Data flow**: It receives a patch status: completed, failed, or declined. It maps completed to completed, failed to failed, and declined to cancelled. The result is an ExecutionStatus value for the trace.
 
-**Call relations**: This trait method is used by `tool_runtime_trace_event` when translating `PatchApplyEnd` events.
+**Call relations**: tool_runtime_trace_event uses this when it sees the end of a patch application. The converted status is then attached to the tool runtime trace event.
 
 
 ##### `execution_status_for_abort_reason`  (lines 397–404)
@@ -460,24 +470,26 @@ fn trace_execution_status(&self) -> ExecutionStatus
 fn execution_status_for_abort_reason(reason: &TurnAbortReason) -> ExecutionStatus
 ```
 
-**Purpose**: Maps turn abort reasons into the reduced execution status used by `CodexTurnEnded`. All currently supported abort reasons collapse to cancellation.
+**Purpose**: This function turns a Codex turn abort reason into the rollout trace’s execution status. In the current protocol, every listed abort reason means the turn did not finish normally, so the trace marks it as cancelled.
 
-**Data flow**: Matches `&TurnAbortReason`; `Interrupted`, `Replaced`, `ReviewEnded`, and `BudgetLimited` all return `ExecutionStatus::Cancelled`.
+**Data flow**: It receives a turn abort reason, such as interrupted, replaced, review ended, or budget limited. It maps that reason to ExecutionStatus::Cancelled. The output is the status used in a turn-ended trace event.
 
-**Call relations**: It is called only by `codex_turn_trace_event` when converting `TurnAborted` protocol events into raw trace turn-end events.
+**Call relations**: codex_turn_trace_event calls this when it receives a TurnAborted protocol event. This keeps the turn tracing path focused on building the trace event while this helper owns the small rule for interpreting abort reasons.
 
 *Call graph*: called by 1 (codex_turn_trace_event).
 
 
 ### `rollout-trace/src/writer.rs`
 
-`io_transport` · `whenever trace bundles are created or raw events/payloads are written to disk`
+`io_transport` · `active throughout tracing during rollout execution`
 
-The central type here is `TraceWriter`, which wraps a `Mutex<TraceWriterInner>`. The inner state holds the immutable `TraceBundleManifest`, the payloads directory path, a buffered append-only event log file, and monotonically increasing counters for event sequence numbers and payload ordinals. `create` initializes a bundle directory, creates the `payloads/` subdirectory, writes the manifest JSON, opens `trace.jsonl` in append mode, and seeds counters at 1.
+A rollout trace is like a black-box flight recorder for an agent run. This file is the part that records the black-box data while the run is still active. It does not try to build the final, cleaned-up view of the rollout in memory. Instead, it writes simple raw facts to disk: a manifest that describes the trace, a line-by-line event log, and separate payload files for larger JSON objects such as inference requests and responses.
 
-Two write paths are exposed. `write_json_payload` allocates the next payload ordinal, writes a pretty-printed JSON file under `payloads/{ordinal}.json`, and returns a `RawPayloadRef` containing a stable `raw_payload:{ordinal}` id, payload kind, and relative path. `append_with_context` allocates the next event sequence number, stamps the event with schema version, current wall-clock milliseconds, rollout id from the manifest, optional thread/turn context, and the supplied payload, then writes one JSON line and flushes immediately. `append` is just the context-free convenience wrapper.
+The main type is `TraceWriter`. It owns a mutex, which is a lock that stops two tasks from writing to the same files and counters at the same time. That matters because tracing can happen from different parts of the system, and the event sequence numbers and payload file names must stay consistent.
 
-The writer deliberately tolerates poisoned mutexes by recovering the inner state with `PoisonError::into_inner`; the comment explains that losing later diagnostic events after a panic would be worse than continuing. Another important invariant is payload-before-event ordering: payload files are written before the event that references them, so interrupted replays never see dangling payload references.
+The writer first creates the bundle directory and manifest. Later, callers can save a JSON payload file and get back a small reference to it. Events can then include that reference instead of embedding the whole payload. This is like putting a large document in a filing cabinet and writing its cabinet location in the logbook.
+
+One important safety detail is that payload files are written before events that point to them. If the process stops after an event is logged, replay should not find an event that refers to a missing payload file. Each event is flushed to disk immediately, favoring reliable diagnostics over maximum write speed.
 
 #### Function details
 
@@ -492,11 +504,11 @@ fn create(
     ) -> Result<Self>
 ```
 
-**Purpose**: Creates a new trace bundle on disk, writes its manifest, opens the raw event log, and initializes sequence counters. It is the one-time setup entrypoint for bundle writing.
+**Purpose**: Creates a new trace bundle on disk and returns a writer ready to record events. It sets up the payload folder, writes the manifest, opens the raw event log, and initializes the counters used for event order and payload file names.
 
-**Data flow**: Accepts a bundle directory path, `trace_id`, `rollout_id`, and `root_thread_id`. It creates `payloads/`, computes `started_at_unix_ms` via `unix_time_ms`, builds `TraceBundleManifest::new(...)`, writes it with `write_json_file`, opens `trace.jsonl` in create+append mode, and returns `TraceWriter { inner: Mutex::new(TraceWriterInner { manifest, payloads_dir, event_log: BufWriter::new(file), next_seq: 1, next_payload_ordinal: 1 }) }`.
+**Data flow**: It receives a bundle directory, trace ID, rollout ID, and root thread ID. It turns the directory into concrete paths, creates the payload directory, records the current time in milliseconds, builds a manifest, writes that manifest as JSON, and opens the event log file for appending. The result is a `TraceWriter` whose internal state is protected by a lock and starts with sequence number 1 and payload ordinal 1.
 
-**Call relations**: Called by root trace startup and various tests/helpers that need a started writer. It delegates timestamp generation to `unix_time_ms` and JSON file emission to `write_json_file`.
+**Call relations**: This is the starting point for trace recording. It is called by test setup, thread-writer helpers, and inference-tracing paths when a trace needs to begin. Inside, it relies on `unix_time_ms` to timestamp the bundle and `write_json_file` to persist the manifest before handing back a writer that later calls append and payload-writing methods.
 
 *Call graph*: calls 3 internal fn (new, unix_time_ms, write_json_file); called by 8 (started_inference_attempt, responses_websocket_request_prewarm_traces_logical_request, enabled_attempt_adds_inference_request_header, enabled_context_records_replayable_inference_attempt, create_started_writer_for_thread, child_thread_metadata_creates_spawn_origin_without_delivery_edge, start_root_in_root, writer_records_payload_refs_and_replays_rollout_status); 6 external calls (as_ref, join, new, new, new, create_dir_all).
 
@@ -511,11 +523,11 @@ fn write_json_payload(
     ) -> Result<RawPayloadRef>
 ```
 
-**Purpose**: Writes one payload body into the bundle's payload directory and returns the reference object used by raw events. It guarantees the payload file exists before any event points at it.
+**Purpose**: Writes a larger JSON payload into the bundle and returns a compact reference that later events can store. This keeps the event log small while still preserving the full request, response, or metadata content.
 
-**Data flow**: Accepts a `RawPayloadKind` and serializable value. It locks the inner state, reads and increments `next_payload_ordinal`, derives `raw_payload_id`, relative path `payloads/{ordinal}.json`, and absolute path under `payloads_dir`, writes the JSON file with `write_json_file`, and returns `RawPayloadRef { raw_payload_id, kind, path: relative_path }`.
+**Data flow**: It receives a payload kind and any serializable value. It locks the writer state, takes the next payload number, builds a stable payload ID and file path, writes the value to `payloads/<number>.json`, then returns a `RawPayloadRef` containing the ID, kind, and relative path. It also advances the next payload number inside the writer.
 
-**Call relations**: Used by higher-level best-effort helpers across thread, inference, compaction, and tool-dispatch tracing. It depends on `lock_inner` for synchronized ordinal allocation and `write_json_file` for actual serialization.
+**Call relations**: Higher-level tracing code calls this before logging events that need to point at detailed data, such as inference requests, inference responses, tool lifecycle payloads, or follow-up tool output. It uses `lock_inner` so numbering stays safe and `write_json_file` so the payload is actually on disk before any event can refer to it.
 
 *Call graph*: calls 2 internal fn (lock_inner, write_json_file); called by 9 (write_json_payload_best_effort, write_json_payload_best_effort, write_json_payload_best_effort, append_completed_inference, append_inference_request, append_spawn_agent_tool_lifecycle, append_followup_with_tool_output, append_inference_with_tool_call, write_json_payload_best_effort); 1 external calls (format!).
 
@@ -526,11 +538,11 @@ fn write_json_payload(
 fn append(&self, payload: RawTraceEventPayload) -> Result<RawTraceEvent>
 ```
 
-**Purpose**: Appends a raw event without explicit thread/turn context. It is a convenience wrapper for context-free events like rollout start/end.
+**Purpose**: Adds one raw trace event when no extra thread or turn context needs to be supplied separately. It is the convenient default path for simple event logging.
 
-**Data flow**: Accepts a `RawTraceEventPayload`, constructs `RawTraceEventContext::default()`, and forwards both to `append_with_context`. It returns the resulting `RawTraceEvent` or any I/O/serialization error.
+**Data flow**: It receives an event payload. It creates an empty default context and passes both the context and payload to `append_with_context`. The returned value is the complete raw event that was written to disk.
 
-**Call relations**: Called by higher-level tracing code for events that do not need contextual envelope fields. It delegates all real work to `append_with_context`.
+**Call relations**: Tracing helpers for starting threads, starting turns, inference starts, inference completions, and tool-output follow-ups call this when the payload already carries enough information or no envelope context is needed. It delegates all real writing work to `append_with_context`.
 
 *Call graph*: calls 1 internal fn (append_with_context); called by 6 (append_inference_completion, append_inference_start_for_thread, start_thread, start_turn_for_thread, append_followup_with_tool_output, append_inference_with_tool_call); 1 external calls (default).
 
@@ -545,11 +557,11 @@ fn append_with_context(
     ) -> Result<RawTraceEvent>
 ```
 
-**Purpose**: Appends one fully formed raw trace event line with optional thread and turn context. It assigns sequence number, timestamp, and rollout id at write time.
+**Purpose**: Writes one complete raw event to the event log, including its sequence number, timestamp, rollout ID, optional thread or turn context, and payload. This is the main event-recording function.
 
-**Data flow**: Accepts `RawTraceEventContext` and `RawTraceEventPayload`. It locks the inner state, builds `RawTraceEvent { schema_version, seq: inner.next_seq, wall_time_unix_ms: unix_time_ms(), rollout_id: inner.manifest.rollout_id.clone(), thread_id: context.thread_id, codex_turn_id: context.codex_turn_id, payload }`, increments `next_seq`, writes the event as JSON to `event_log`, appends a newline, flushes, and returns the event.
+**Data flow**: It receives explicit context and an event payload. It locks the writer, creates a `RawTraceEvent` with the current schema version, next sequence number, current wall-clock time, rollout ID from the manifest, context fields, and payload. It increments the sequence counter, writes the event as one JSON line, writes a newline, flushes the log to disk, and returns the event it wrote.
 
-**Call relations**: Used directly by contextual trace helpers and indirectly by `append`. It relies on `lock_inner` for serialized sequence assignment and `unix_time_ms` for wall-clock stamping.
+**Call relations**: This is called directly by tracing paths that have extra context, such as completed inference or spawned-agent tool lifecycle events, and indirectly by `append`. It uses `lock_inner` to keep event order consistent and `unix_time_ms` to timestamp the event before serializing it to the log.
 
 *Call graph*: calls 2 internal fn (lock_inner, unix_time_ms); called by 3 (append_completed_inference, append_spawn_agent_tool_lifecycle, append); 1 external calls (to_writer).
 
@@ -560,11 +572,11 @@ fn append_with_context(
 fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner>
 ```
 
-**Purpose**: Obtains mutable access to the writer's inner state while recovering from mutex poisoning. This preserves trace logging after panics in tracing code.
+**Purpose**: Safely opens access to the writer’s shared internal state. It also deliberately keeps working even if an earlier panic happened while the lock was held, so later diagnostic events are not lost.
 
-**Data flow**: Locks `self.inner` and returns `MutexGuard<'_, TraceWriterInner>`. If the mutex is poisoned, it calls `PoisonError::into_inner` to recover the guard instead of panicking.
+**Data flow**: It reads the mutex inside `TraceWriter` and returns a guard that lets the caller access the manifest, payload directory, event log, and counters. If the mutex was marked poisoned after a panic, it recovers the inner state instead of stopping the trace writer.
 
-**Call relations**: Used internally by both payload and event append paths. It is the synchronization point that protects sequence counters and buffered file handles.
+**Call relations**: `write_json_payload` calls this before assigning payload numbers, and `append_with_context` calls it before assigning event sequence numbers and writing the event log. It is the small gatekeeper that keeps concurrent trace writes from stepping on each other.
 
 *Call graph*: called by 2 (append_with_context, write_json_payload).
 
@@ -575,11 +587,11 @@ fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner>
 fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()>
 ```
 
-**Purpose**: Serializes a value as pretty-printed JSON into a newly created file. It is the shared helper for manifest and payload file creation.
+**Purpose**: Writes a value as nicely formatted JSON to a specific file path. It is a shared helper for manifest files and payload files.
 
-**Data flow**: Accepts a target `&Path` and serializable value, creates the file with `File::create`, writes JSON via `serde_json::to_writer_pretty`, and wraps filesystem/serialization failures with path-specific context.
+**Data flow**: It receives a file path and a serializable value. It creates or replaces the file at that path, then writes the value as pretty-printed JSON. On failure, it returns an error with path-specific context so the caller can tell which file could not be created or written.
 
-**Call relations**: Called by `TraceWriter::create` for the manifest and by `TraceWriter::write_json_payload` for payload bodies.
+**Call relations**: `TraceWriter::create` uses this to write the bundle manifest, and `TraceWriter::write_json_payload` uses it to write individual payload files. This helper centralizes the disk-writing step so both call sites get the same JSON formatting and error messages.
 
 *Call graph*: called by 2 (create, write_json_payload); 2 external calls (create, to_writer_pretty).
 
@@ -590,11 +602,11 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()>
 fn unix_time_ms() -> i64
 ```
 
-**Purpose**: Returns the current wall-clock time in Unix milliseconds, saturating safely on clock anomalies or integer overflow. It standardizes timestamps used in manifests and raw events.
+**Purpose**: Returns the current time as milliseconds since the Unix epoch, which is the common timestamp baseline starting at January 1, 1970 UTC. The trace uses this for bundle start time and event times.
 
-**Data flow**: Reads `SystemTime::now()`, computes duration since `UNIX_EPOCH` with `unwrap_or_default()` on backward-clock errors, converts `as_millis()` to `i64` with `try_from`, and returns `i64::MAX` on overflow.
+**Data flow**: It asks the system clock for the current time, measures how long it has been since the Unix epoch, converts that duration to milliseconds, and returns it as a signed integer. If the clock is earlier than the epoch, it falls back to zero duration; if the millisecond value is too large, it returns the largest possible integer instead.
 
-**Call relations**: Used by both bundle creation and event append paths so all on-disk timestamps share the same conversion behavior.
+**Call relations**: `TraceWriter::create` calls this when stamping the manifest with the trace start time. `TraceWriter::append_with_context` calls it for each event so replay and debugging tools can see when events happened in real-world time.
 
 *Call graph*: called by 2 (append_with_context, create); 2 external calls (now, try_from).
 
@@ -605,11 +617,11 @@ fn unix_time_ms() -> i64
 fn writer_records_payload_refs_and_replays_rollout_status() -> anyhow::Result<()>
 ```
 
-**Purpose**: Validates that the writer produces a replayable bundle with correct payload references, rollout status, thread/turn state, and payload-path bookkeeping. It is an end-to-end test of manifest, payload, and event writing.
+**Purpose**: Checks that the writer creates a replayable trace bundle with payload references and final rollout status intact. It proves that events and payload files written by this file can be read back into the reduced rollout view.
 
-**Data flow**: Creates a temp bundle with `TraceWriter::create`, appends rollout/thread/turn/inference lifecycle events, writes protocol and inference payload files, replays the bundle with `replay_bundle`, and asserts reduced rollout status, root thread id, turn execution status, inference payload ids, and payload path `payloads/1.json`.
+**Data flow**: It creates a temporary directory, creates a `TraceWriter`, writes a realistic sequence of rollout, thread, turn, inference, and completion events, and writes JSON payloads for metadata and inference data. It then replays the bundle from disk and compares the replayed rollout fields against the expected status, thread, turn, inference payload IDs, and payload path.
 
-**Call relations**: This test drives the public writer API directly, proving that payload refs and event ordering are sufficient for the reducer to reconstruct rollout state.
+**Call relations**: This test exercises the public flow beginning with `TraceWriter::create`, followed by `write_json_payload` and `append`, then hands the finished bundle to `replay_bundle`. Its role is to catch breaks in the contract between the writer and the replay code: if the writer logs events or payload references incorrectly, the replayed rollout will not match the assertions.
 
 *Call graph*: calls 1 internal fn (create); 4 external calls (new, assert_eq!, replay_bundle, json!).
 
@@ -619,13 +631,15 @@ These files expose the runtime-facing tracing APIs for threads and their special
 
 ### `rollout-trace/src/thread.rs`
 
-`domain_logic` · `session startup, per-thread execution, and thread/turn/tool runtime event recording`
+`domain_logic` · `cross-cutting during session and tool execution`
 
-This file defines the no-op-capable `ThreadTraceContext`, which wraps either a disabled state or an `EnabledThreadTraceContext` containing an `Arc<TraceWriter>`, the rollout's `root_thread_id`, and the current `thread_id`. It also defines the serialized startup payload `ThreadStartedTraceMetadata` and the child-result payload `AgentResultTracePayload`. Root tracing is enabled only when `CODEX_ROLLOUT_TRACE_ROOT` is present; startup is explicitly best-effort, with failures downgraded to warnings and a disabled context so diagnostics never break production sessions.
+A rollout can involve one main agent thread and several child agent threads. To understand what happened later, the system can write a trace bundle: a folder of events and payload files that describes the rollout like a flight recorder. This file is the thread-level control panel for that recorder.
 
-The main control flow is: create a root bundle directory and `TraceWriter`, append `RolloutStarted`, then append `ThreadStarted` with an optional raw metadata payload file. From there, the context can emit thread end events, wrap selected protocol events as raw breadcrumbs, derive typed Codex-turn and tool-runtime events from protocol messages, and create specialized sub-contexts for code cells, tool dispatch, inference, compaction, and MCP correlation. Every write path has a disabled fast path and an enabled best-effort path that logs warnings instead of propagating errors.
+The important idea is that tracing is optional and best-effort. If the environment variable CODEX_ROLLOUT_TRACE_ROOT is not set, or if creating the trace files fails, the code returns a disabled context. A disabled context accepts the same method calls but writes nothing. That means debugging traces can be turned on without making normal Codex sessions fragile.
 
-A notable invariant is that child threads share the root bundle writer but must get their own `ThreadStarted` event exactly once; resumed children should therefore use `disabled()` rather than inheriting the parent trace. Another subtlety is that only the root thread emits `RolloutEnded`; child `record_ended` calls update thread execution state without closing the whole rollout.
+When tracing is enabled, ThreadTraceContext stores a shared TraceWriter, the root thread ID, and the current thread ID. It can record the start and end of a thread, selected protocol events, Codex turn events, tool runtime events, child-agent result messages, code-cell execution, model inference attempts, compaction checkpoints, and MCP tool-call correlations. Think of it as a notebook assigned to one worker in a larger team: each worker writes their own actions, but the root notebook also marks when the whole job starts and ends.
+
+The private EnabledThreadTraceContext helpers centralize the repetitive work: write larger JSON payloads to side files, append small event records, attach thread and turn context, and log warnings instead of failing the session.
 
 #### Function details
 
@@ -635,11 +649,11 @@ A notable invariant is that child threads share the root bundle writer but must 
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a trace handle in the `Disabled` state. All later trace calls become cheap no-ops through this handle.
+**Purpose**: Creates a trace context that records nothing. Code uses this when tracing is not requested, or when a child/session should not write into an existing trace bundle.
 
-**Data flow**: Takes no arguments and creates `ThreadTraceContext { state: ThreadTraceContextState::Disabled }`. It reads no external state, writes nothing, and returns the inert context.
+**Data flow**: Nothing goes in. It builds a ThreadTraceContext whose internal state is Disabled. The result can be passed around safely; later trace calls will simply return without writing files.
 
-**Call relations**: Used by production and test setup paths whenever tracing is unavailable, intentionally suppressed, or should not be inherited. Callers then invoke normal trace methods without branching because those methods all early-return on the disabled state.
+**Call relations**: This is the safe fallback used by session setup, tests, and child-thread setup paths. Other methods in this file also return disabled contexts when tracing is unavailable, so callers can keep one simple code path whether tracing is on or off.
 
 *Call graph*: called by 9 (run_codex_thread_interactive, guardian_subagent_does_not_inherit_parent_exec_policy_rules, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx, session_new_fails_when_zsh_fork_enabled_without_packaged_zsh, parent_rollout_thread_trace_for_source, disabled_thread_context_accepts_trace_calls_without_writing).
 
@@ -650,11 +664,11 @@ fn disabled() -> Self
 fn start_root_or_disabled(metadata: ThreadStartedTraceMetadata) -> Self
 ```
 
-**Purpose**: Attempts to start a root rollout trace bundle from the `CODEX_ROLLOUT_TRACE_ROOT` environment variable, falling back to a disabled context on absence or initialization failure. This keeps trace startup optional and non-fatal.
+**Purpose**: Starts tracing for a root rollout thread if the CODEX_ROLLOUT_TRACE_ROOT environment variable points to a trace directory. If tracing cannot start, it logs a warning and returns a disabled context instead of stopping the session.
 
-**Data flow**: Consumes `ThreadStartedTraceMetadata`, reads the process environment via `std::env::var_os`, converts the configured root into a `PathBuf`, and invokes `start_root_in_root`. On success it returns the enabled root context; on missing env var or any error it logs a warning and returns `ThreadTraceContext::disabled()`.
+**Data flow**: It receives startup metadata about the thread and session. It reads the environment variable, turns it into a path, and asks start_root_in_root to create the bundle. The output is either an enabled root trace context or a disabled one.
 
-**Call relations**: Invoked by higher-level session construction when a new root session starts. It delegates bundle creation and initial event emission to `start_root_in_root`, and only handles the policy decision of enable-vs-disable.
+**Call relations**: Session creation calls this when a new root thread begins. It hands the real setup work to start_root_in_root, while using ThreadTraceContext::disabled as the fallback whenever the environment is absent or setup fails.
 
 *Call graph*: calls 1 internal fn (start_root_in_root); called by 1 (new); 4 external calls (from, disabled, var_os, warn!).
 
@@ -668,11 +682,11 @@ fn start_root_in_root_for_test(
     ) -> anyhow::Result<Self>
 ```
 
-**Purpose**: Starts a root trace bundle in an explicit directory without consulting environment variables. It exists so tests can create deterministic bundles without mutating process-global env state.
+**Purpose**: Starts a root trace in a specific directory supplied by a test. This avoids changing process-wide environment variables during tests.
 
-**Data flow**: Accepts a root `&Path` and startup metadata, forwards both to `start_root_in_root`, and returns that `anyhow::Result<ThreadTraceContext>` unchanged.
+**Data flow**: It receives a root directory and thread-start metadata. It forwards both to start_root_in_root. The result is either an enabled ThreadTraceContext or an error describing why the trace bundle could not be created.
 
-**Call relations**: Used only by tests and test helpers that need replayable bundles. It is a thin wrapper around the real root-start logic.
+**Call relations**: Trace-related tests call this to build repeatable trace bundles. It exists as a test-friendly doorway into the same root setup path used by normal startup.
 
 *Call graph*: calls 1 internal fn (start_root_in_root); called by 5 (attach_trace_bundle, attach_test_trace, create_in_root_writes_replayable_lifecycle_events, protocol_wrapper_records_selected_events_as_raw_payloads, spawned_thread_start_appends_to_root_bundle).
 
@@ -687,11 +701,11 @@ fn start(
     ) -> Self
 ```
 
-**Purpose**: Creates an enabled thread context inside an existing rollout bundle and immediately records the thread-start lifecycle event. It is the common constructor for both root and child thread traces once a writer already exists.
+**Purpose**: Creates an enabled trace context for one thread inside an existing rollout bundle. It also records that the thread has started.
 
-**Data flow**: Takes an `Arc<TraceWriter>`, the rollout's `root_thread_id`, and startup metadata. It builds `EnabledThreadTraceContext` using the metadata's `thread_id`, calls `record_thread_started` to emit the startup event and metadata payload, then returns `ThreadTraceContext::Enabled(context)`.
+**Data flow**: It receives a shared TraceWriter, the root thread ID, and metadata for the new thread. It stores the writer and IDs in an EnabledThreadTraceContext, writes a ThreadStarted event through record_thread_started, and returns an enabled ThreadTraceContext.
 
-**Call relations**: Called by `start_root_in_root` for the root thread and by `start_child_thread_trace_or_disabled` for spawned children. It delegates the actual startup event serialization to `record_thread_started`.
+**Call relations**: start_root_in_root uses this after it creates the trace bundle, and child-thread setup uses it when adding another thread to the same bundle. It is the common point where a live writer becomes a usable thread trace handle.
 
 *Call graph*: calls 1 internal fn (record_thread_started); called by 1 (start_root_in_root); 1 external calls (Enabled).
 
@@ -702,11 +716,11 @@ fn start(
 fn is_enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether this handle will actually write trace data. It lets callers avoid expensive payload preparation when tracing is off.
+**Purpose**: Tells callers whether this context will actually write trace events. This lets callers avoid preparing expensive trace-only data when tracing is off.
 
-**Data flow**: Reads `self.state` and returns `true` only when it matches `ThreadTraceContextState::Enabled(_)`. It does not mutate state or perform I/O.
+**Data flow**: It reads the context’s internal state. It returns true for an Enabled state and false for Disabled. It does not write anything or change the context.
 
-**Call relations**: This is a leaf predicate used by callers that want to branch before constructing trace-owned data. Most trace methods do not require it because they already contain their own disabled fast path.
+**Call relations**: This is a small guard for outside code. Most methods already check for Disabled internally, but callers can use this before cloning or building large payloads just for tracing.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -720,11 +734,11 @@ fn start_child_thread_trace_or_disabled(
     ) -> Self
 ```
 
-**Purpose**: Starts tracing for a newly spawned child thread within the same rollout bundle, or returns a disabled child context if the parent is disabled. It preserves the root bundle while assigning the child its own thread identity.
+**Purpose**: Creates a trace context for a newly spawned child thread that belongs to the same rollout bundle. If the parent is not tracing, the child also gets a disabled context.
 
-**Data flow**: Consumes child `ThreadStartedTraceMetadata`. If `self` is disabled, it returns `ThreadTraceContext::disabled()`. If enabled, it clones the parent's `Arc<TraceWriter>`, reuses the parent's `root_thread_id`, and calls `ThreadTraceContext::start` with the child metadata.
+**Data flow**: It receives metadata for the child thread. If the current context is Disabled, it returns a disabled child context. If enabled, it reuses the same shared writer and root thread ID, records the child thread start, and returns an enabled child context.
 
-**Call relations**: Called when a session spawns a fresh child thread. It bridges parent and child tracing by sharing the writer but ensuring the child gets its own startup event and thread id.
+**Call relations**: Session creation for spawned agents calls this when a child thread begins. It routes enabled children through ThreadTraceContext::start, while preserving the no-op behavior when the parent has no trace bundle.
 
 *Call graph*: called by 1 (new); 3 external calls (clone, disabled, start).
 
@@ -735,11 +749,11 @@ fn start_child_thread_trace_or_disabled(
 fn record_ended(&self, status: RolloutStatus)
 ```
 
-**Purpose**: Emits terminal lifecycle events for a thread and, if that thread is the root, for the entire rollout. This distinguishes child completion from rollout completion.
+**Purpose**: Records that this thread has finished, including its final rollout status. If the thread is the root thread, it also records that the whole rollout has ended.
 
-**Data flow**: Takes a `RolloutStatus`. In the enabled state it appends `RawTraceEventPayload::ThreadEnded { thread_id, status: status.clone() }`. If `thread_id == root_thread_id`, it also appends `RawTraceEventPayload::RolloutEnded { status }`. Disabled contexts do nothing.
+**Data flow**: It receives a RolloutStatus. If tracing is disabled, nothing happens. If enabled, it appends a ThreadEnded event for the current thread; when the current thread is also the root, it appends a RolloutEnded event too.
 
-**Call relations**: Called during graceful shutdown paths. It writes directly through the enabled context's append helper and conditionally emits the rollout-level terminal event only for the root thread.
+**Call relations**: This is used near graceful shutdown. It relies on the enabled context’s append helper so write failures become warnings, not session failures.
 
 *Call graph*: 1 external calls (clone).
 
@@ -750,11 +764,11 @@ fn record_ended(&self, status: RolloutStatus)
 fn record_protocol_event(&self, event: &EventMsg)
 ```
 
-**Purpose**: Wraps selected protocol events as raw trace breadcrumbs so reducers and debugging tools can inspect important protocol-level observations. High-volume deltas are intentionally excluded.
+**Purpose**: Records selected protocol messages as raw trace breadcrumbs. It deliberately skips noisy event types so the trace stays useful rather than flooded.
 
-**Data flow**: Accepts `&EventMsg`, checks enabled state, derives an event type string with `wrapped_protocol_event_type`, serializes the full event into a payload file of kind `RawPayloadKind::ProtocolEvent`, and appends `RawTraceEventPayload::ProtocolEventObserved { event_type, event_payload }`. If the event type is not one of the wrapped kinds or payload writing fails, it returns early.
+**Data flow**: It receives a protocol EventMsg. If tracing is off, or if wrapped_protocol_event_type says this event should not be wrapped, it returns. Otherwise it writes the full event as a JSON payload file and appends a ProtocolEventObserved event pointing to that payload.
 
-**Call relations**: Used when protocol traffic should be mirrored into rollout traces. It depends on `wrapped_protocol_event_type` to decide eligibility and on the enabled context helpers for payload persistence and event append.
+**Call relations**: Runtime protocol handling can call this as messages pass through. It asks protocol_event::wrapped_protocol_event_type whether the event matters for raw tracing, then uses the enabled context to store the payload and append the event.
 
 *Call graph*: calls 1 internal fn (wrapped_protocol_event_type).
 
@@ -765,11 +779,11 @@ fn record_protocol_event(&self, event: &EventMsg)
 fn record_codex_turn_event(&self, default_turn_id: &str, event: &EventMsg)
 ```
 
-**Purpose**: Converts protocol lifecycle events into typed Codex-turn trace events and records them with explicit thread/turn context. This gives reducers canonical turn lifecycle records instead of forcing them to infer everything from raw protocol messages.
+**Purpose**: Turns certain protocol lifecycle messages into typed Codex turn trace events. A Codex turn is one unit of agent work, such as responding to a user prompt.
 
-**Data flow**: Takes a fallback turn id `&str` and `&EventMsg`. In the enabled state it calls `codex_turn_trace_event(thread_id.clone(), default_turn_id, event)`. If conversion succeeds, it appends the returned payload using `append_with_context_best_effort`, keyed by `trace_event.context_turn_id`.
+**Data flow**: It receives a default turn ID and a protocol EventMsg. If enabled, it asks codex_turn_trace_event to translate the protocol message. If translation succeeds, it appends the resulting trace payload with the proper turn context.
 
-**Call relations**: Called from protocol lifecycle wiring when a protocol event may correspond to turn start/end semantics. It delegates event interpretation to `codex_turn_trace_event` and only performs contextual append.
+**Call relations**: Protocol event processing can call this alongside raw event recording. The translation logic lives in protocol_event, while this method supplies the current thread identity and writes the result.
 
 *Call graph*: calls 1 internal fn (codex_turn_trace_event).
 
@@ -780,11 +794,11 @@ fn record_codex_turn_event(&self, default_turn_id: &str, event: &EventMsg)
 fn record_tool_call_event(&self, codex_turn_id: impl Into<CodexTurnId>, event: &EventMsg)
 ```
 
-**Purpose**: Converts protocol lifecycle events into typed runtime tool events for an already-dispatched tool call. These events describe execution inside the dispatch boundary rather than the caller-facing dispatch itself.
+**Purpose**: Records runtime observations about a tool call, such as when the tool begins or ends. These are separate from the original tool dispatch, because they describe what happened while Codex executed it.
 
-**Data flow**: Accepts a `codex_turn_id` convertible into `CodexTurnId` and `&EventMsg`. If enabled, it derives a `ToolRuntimeTraceEvent` via `tool_runtime_trace_event`, converts that into a `RawTraceEventPayload` with `raw_tool_runtime_payload`, and appends it with thread/turn context. Any failed conversion causes an early return.
+**Data flow**: It receives a Codex turn ID and a protocol EventMsg. If enabled, it converts the protocol event with tool_runtime_trace_event, turns that into a raw trace payload through raw_tool_runtime_payload, and appends it with the given turn ID.
 
-**Call relations**: Used when protocol events reflect runtime progress of a tool call. It sits between protocol parsing and raw event append, delegating interpretation to `tool_runtime_trace_event` and payload shaping to `EnabledThreadTraceContext::raw_tool_runtime_payload`.
+**Call relations**: Tool execution paths can call this when protocol lifecycle events arrive. The protocol_event module recognizes the tool runtime event; this file adds the thread and turn context and writes it.
 
 *Call graph*: calls 1 internal fn (tool_runtime_trace_event); 1 external calls (into).
 
@@ -799,11 +813,11 @@ fn record_agent_result_interaction(
         payload: &AgentResultTracePayload<'_
 ```
 
-**Purpose**: Records a child-to-parent completion notification as an explicit graph edge in the trace. This preserves the runtime delivery event without pretending it was a tool call.
+**Purpose**: Records the moment a completed child agent sends its result message back to a parent thread. This makes the parent-child handoff explicit in the trace instead of forcing later tools to guess it from prompts.
 
-**Data flow**: Takes a child turn id, a parent thread id, and an `AgentResultTracePayload`. In the enabled state it converts ids into owned `CodexTurnId`/`AgentThreadId`, optionally writes the payload JSON as `RawPayloadKind::AgentResult`, constructs a stable `edge_id` string incorporating child thread, child turn, and parent thread, and appends `RawTraceEventPayload::AgentResultObserved` with message text and optional carried payload reference.
+**Data flow**: It receives the child turn ID, the parent thread ID, and a payload containing the child path, message, and status. If enabled, it stores the full payload as JSON when possible, builds a stable edge ID linking child and parent, and appends an AgentResultObserved event.
 
-**Call relations**: Called when a completed child sends its result back to the parent mailbox. It writes a trace-only edge event so reducers do not need to infer this relationship from later prompt snapshots.
+**Call relations**: Child-agent completion delivery can call this when notifying the parent. It uses the current thread as the child thread, then writes an edge that later trace reducers can use to rebuild the rollout graph.
 
 *Call graph*: 3 external calls (clone, into, format!).
 
@@ -814,11 +828,11 @@ fn record_agent_result_interaction(
 fn record_codex_turn_started(&self, codex_turn_id: impl Into<CodexTurnId>)
 ```
 
-**Purpose**: Emits an explicit turn-start event for tests and lightweight integrations that need valid reducer input without running the full production session loop. It is a direct hook for creating a turn lifecycle boundary.
+**Purpose**: Records an explicit Codex turn start event. This is especially useful in trace-focused tests that need valid reducer input without running the whole session loop.
 
-**Data flow**: Accepts a turn id convertible into `CodexTurnId`. In the enabled state it appends `RawTraceEventPayload::CodexTurnStarted { codex_turn_id, thread_id }` with matching thread/turn context. Disabled contexts return immediately.
+**Data flow**: It receives a Codex turn ID. If tracing is enabled, it appends a CodexTurnStarted event containing that turn ID and the current thread ID. If tracing is disabled, it does nothing.
 
-**Call relations**: Used primarily by trace-focused tests or simplified integrations. It bypasses protocol-derived turn detection and writes the canonical start event directly.
+**Call relations**: Integration tests and any code that needs a direct turn-start hook can call this. It writes through the same context-aware append helper used by other turn-scoped events.
 
 *Call graph*: 2 external calls (clone, into).
 
@@ -834,11 +848,11 @@ fn start_code_cell_trace(
         source_js:
 ```
 
-**Purpose**: Starts a first-class code-mode cell lifecycle and returns the corresponding `CodeCellTraceContext`. It combines context construction with the initial started event.
+**Purpose**: Starts tracing for a first-class code-mode cell and returns a handle for later cell events. A code cell is a runtime unit of code execution visible to the model or user interface.
 
-**Data flow**: Takes a turn id, runtime cell id, model-visible call id, and source JavaScript. It first builds a context via `code_cell_trace_context`, then calls `record_started(model_visible_call_id, source_js)` on that returned context, and finally returns it.
+**Data flow**: It receives the Codex turn ID, runtime cell ID, model-visible call ID, and source JavaScript. It first builds a CodeCellTraceContext with code_cell_trace_context, then records the cell start on that context, and returns the context.
 
-**Call relations**: Called when code mode begins executing a runtime cell. It layers a convenience start step on top of `code_cell_trace_context` so callers do not need two separate operations.
+**Call relations**: Code-mode execution calls this when a new cell begins. It delegates context construction to code_cell_trace_context, then immediately records the first lifecycle event.
 
 *Call graph*: calls 1 internal fn (code_cell_trace_context).
 
@@ -853,11 +867,11 @@ fn code_cell_trace_context(
     ) -> CodeCellTraceContext
 ```
 
-**Purpose**: Builds a reusable trace handle for a code-mode runtime cell that may already have been started elsewhere. It encapsulates the current thread id and shared writer.
+**Purpose**: Builds a trace handle for a code-mode cell that may already have started. This lets later code record more events for the same cell without re-emitting a start event.
 
-**Data flow**: Accepts a turn id and runtime cell id. If disabled, it returns `CodeCellTraceContext::disabled()`. If enabled, it clones the writer and calls `CodeCellTraceContext::enabled(writer, thread_id.clone(), codex_turn_id, runtime_cell_id)`.
+**Data flow**: It receives a Codex turn ID and runtime cell ID. If tracing is disabled, it returns a disabled CodeCellTraceContext. If enabled, it passes the shared writer, current thread ID, turn ID, and cell ID into CodeCellTraceContext::enabled.
 
-**Call relations**: Used directly when callers need a handle for an existing cell, and indirectly by `start_code_cell_trace` before it records the start event.
+**Call relations**: start_code_cell_trace calls this before recording a start event. Other code can use it when it only needs a handle for an existing cell.
 
 *Call graph*: calls 2 internal fn (disabled, enabled); called by 1 (start_code_cell_trace); 1 external calls (clone).
 
@@ -871,11 +885,11 @@ fn start_tool_dispatch_trace(
     ) -> ToolDispatchTraceContext
 ```
 
-**Purpose**: Starts tracing for one dispatch-level tool lifecycle while avoiding expensive invocation construction when tracing is disabled. The invocation closure is intentionally lazy for hot-path efficiency.
+**Purpose**: Starts tracing for one tool dispatch: the boundary where Codex asks a tool to do something. The tool invocation is built lazily so disabled tracing does not pay the cost of cloning large tool arguments.
 
-**Data flow**: Accepts a `FnOnce() -> Option<ToolDispatchInvocation>`. If disabled, it returns `ToolDispatchTraceContext::disabled()` without invoking the closure. If enabled, it executes the closure; `None` also yields a disabled dispatch context, while `Some(invocation)` is passed to `ToolDispatchTraceContext::start` with a cloned writer.
+**Data flow**: It receives a closure that can create a ToolDispatchInvocation. If tracing is disabled, the closure is never called and a disabled tool trace context is returned. If enabled, it calls the closure; when an invocation exists, it starts and returns a ToolDispatchTraceContext.
 
-**Call relations**: Called on the tool dispatch hot path. It gates whether the caller must adapt core tool objects into trace-owned payloads, and delegates actual lifecycle recording to `ToolDispatchTraceContext::start`.
+**Call relations**: Tool-dispatch code calls this at the start of a tool request. It hands off to ToolDispatchTraceContext::start for the detailed tool lifecycle, while keeping the disabled path cheap.
 
 *Call graph*: calls 2 internal fn (disabled, start); 1 external calls (clone).
 
@@ -891,11 +905,11 @@ fn inference_trace_context(
     ) -> InferenceTraceContext
 ```
 
-**Purpose**: Builds an `InferenceTraceContext` for a specific Codex turn, model, and provider without yet representing a concrete attempt. Transport code can then start one or more attempts under that logical inference context.
+**Purpose**: Creates a reusable trace context for model inference during one Codex turn. It does not start a specific network attempt yet, because retry and fallback logic decides when each concrete request begins.
 
-**Data flow**: Takes a turn id, model string, and provider name. Disabled state returns `InferenceTraceContext::disabled()`. Enabled state clones the writer and calls `InferenceTraceContext::enabled(writer, thread_id.clone(), codex_turn_id.into(), model.into(), provider_name.into())`.
+**Data flow**: It receives a turn ID, model name, and provider name. If disabled, it returns a disabled InferenceTraceContext. If enabled, it packages the shared writer, current thread ID, turn ID, model, and provider into an enabled inference context.
 
-**Call relations**: Used by inference transport code before request retries or fallbacks are known. It prepares shared context, leaving attempt-level events to downstream inference tracing APIs.
+**Call relations**: Model transport code can call this before making requests. The returned context is then used by lower-level inference code when actual attempts, retries, or fallbacks happen.
 
 *Call graph*: calls 2 internal fn (disabled, enabled); 2 external calls (clone, into).
 
@@ -911,11 +925,11 @@ fn compaction_trace_context(
         provider_name: impl
 ```
 
-**Purpose**: Builds a `CompactionTraceContext` for one remote compaction checkpoint flow. It captures the thread, turn, compaction id, model, and provider needed for request/response attempts and later checkpoint installation.
+**Purpose**: Creates a trace context for remote compaction, where older conversation history is summarized or replaced by a checkpoint. This needs special tracing because the model request and the later history replacement are both important.
 
-**Data flow**: Accepts a turn id, compaction id, model, and provider. Disabled state returns `CompactionTraceContext::disabled()`. Enabled state clones the writer and calls `CompactionTraceContext::enabled(writer, thread_id.clone(), codex_turn_id.into(), compaction_id.into(), model.into(), provider_name.into())`.
+**Data flow**: It receives a turn ID, compaction ID, model name, and provider name. If tracing is off, it returns a disabled CompactionTraceContext. If enabled, it builds an enabled compaction context with the shared writer and current thread ID.
 
-**Call relations**: Called when remote compaction is about to be used for a checkpoint. It parallels `inference_trace_context` but for compaction-specific lifecycle recording.
+**Call relations**: Remote-compaction code calls this when preparing a checkpoint operation. The returned context records request/response attempts and later checkpoint installation events.
 
 *Call graph*: calls 2 internal fn (disabled, enabled); 2 external calls (clone, into).
 
@@ -926,11 +940,11 @@ fn compaction_trace_context(
 fn start_mcp_call_trace(&self, tool_call_id: impl Into<ToolCallId>) -> McpCallTraceContext
 ```
 
-**Purpose**: Assigns a globally unique MCP correlation id to a concrete backend request and returns an `McpCallTraceContext` carrying that id. This separates rollout-local tool ids from cross-process correlation ids.
+**Purpose**: Creates a correlation ID for one MCP backend tool request. MCP means Model Context Protocol, a way to connect tools or services to the agent; the extra ID helps match rollout traces with logs from another process.
 
-**Data flow**: Accepts a tool call id convertible into `ToolCallId`. If disabled, it returns `McpCallTraceContext::disabled()`. If enabled, it generates a UUID string, creates `McpCallTraceContext::enabled(mcp_call_id.clone())`, appends `RawTraceEventPayload::McpToolCallCorrelationAssigned { tool_call_id, mcp_call_id }`, and returns the trace handle.
+**Data flow**: It receives the rollout-local tool call ID. If tracing is disabled, it returns a disabled McpCallTraceContext. If enabled, it creates a fresh UUID, returns a trace context containing that UUID, and appends an event linking the tool call ID to the MCP call ID.
 
-**Call relations**: Used when bridging a dispatch-level tool call to an MCP backend request. It emits the correlation assignment event immediately and hands the generated id to downstream MCP logging/tracing code.
+**Call relations**: MCP bridge code calls this before sending a concrete backend request. This file records the cross-process link, and McpCallTraceContext carries the generated ID onward.
 
 *Call graph*: calls 2 internal fn (disabled, enabled); 2 external calls (into, new_v4).
 
@@ -944,11 +958,11 @@ fn start_root_in_root(
 ) -> anyhow::Result<ThreadTraceContext>
 ```
 
-**Purpose**: Creates a new rollout trace bundle directory, initializes its writer and manifest, emits the rollout-start event, and returns the root thread context. It is the concrete root-start implementation shared by production and tests.
+**Purpose**: Creates a new trace bundle directory for a root rollout and returns the enabled root thread context. This is the core setup path behind both normal environment-based tracing and test tracing.
 
-**Data flow**: Consumes a root directory path and startup metadata. It generates a UUID `trace_id`, derives `bundle_dir` as `trace-{trace_id}-{thread_id}`, creates a `TraceWriter` with trace/rollout/root ids all tied to the root thread, appends `RawTraceEventPayload::RolloutStarted`, logs the bundle path at debug level, and returns `ThreadTraceContext::start(writer, thread_id, metadata)`. Errors from writer creation propagate; append failures only warn.
+**Data flow**: It receives a root directory and thread metadata. It generates a trace ID, builds a bundle path, creates a TraceWriter, writes a RolloutStarted event, logs where the trace is being recorded, and starts the root thread context. On setup failure, it returns an error.
 
-**Call relations**: Called by both `ThreadTraceContext::start_root_or_disabled` and `ThreadTraceContext::start_root_in_root_for_test`. It performs the one-time bundle setup before handing off to `ThreadTraceContext::start` for thread-level startup.
+**Call relations**: ThreadTraceContext::start_root_or_disabled calls this during normal startup, and ThreadTraceContext::start_root_in_root_for_test calls it in tests. After creating the writer, it hands control to ThreadTraceContext::start to record the thread start.
 
 *Call graph*: calls 2 internal fn (start, create); called by 2 (start_root_in_root_for_test, start_root_or_disabled); 6 external calls (new, join, new_v4, debug!, format!, warn!).
 
@@ -962,11 +976,11 @@ fn record_thread_started(
 )
 ```
 
-**Purpose**: Serializes startup metadata and appends the canonical `ThreadStarted` raw event for a thread. It captures both the visible agent path and an optional payload file containing richer operational metadata.
+**Purpose**: Writes the first event for a thread: that the thread started, where it sits in the agent path, and optional startup metadata. This gives later trace readers a stable entry point for that thread.
 
-**Data flow**: Takes an enabled context and owned `ThreadStartedTraceMetadata`. It writes the metadata JSON as `RawPayloadKind::SessionMetadata`, receiving an optional `RawPayloadRef`, then appends `RawTraceEventPayload::ThreadStarted { thread_id, agent_path, metadata_payload }`. Ownership of `metadata.thread_id` and `metadata.agent_path` is moved into the event.
+**Data flow**: It receives an enabled context and thread-start metadata. It tries to store the full metadata as a JSON payload file, then appends a ThreadStarted event containing the thread ID, agent path, and optional reference to that payload.
 
-**Call relations**: Called only from `ThreadTraceContext::start` as part of thread initialization. It relies on the enabled context's best-effort payload and append helpers.
+**Call relations**: ThreadTraceContext::start calls this whenever an enabled root or child thread trace is created. It uses the enabled context’s helper methods so payload and event write failures become warnings.
 
 *Call graph*: calls 2 internal fn (append_best_effort, write_json_payload_best_effort); called by 1 (start).
 
@@ -981,11 +995,11 @@ fn write_json_payload_best_effort(
     ) -> Option<RawPayloadRef>
 ```
 
-**Purpose**: Writes a JSON payload file through the shared `TraceWriter` and converts any failure into a warning plus `None`. It is the common payload persistence helper for thread-scoped tracing.
+**Purpose**: Writes a larger trace payload as a JSON side file, without letting write failures break the running session. It returns a small reference that later events can point to.
 
-**Data flow**: Accepts a `RawPayloadKind` and a serializable payload reference. It calls `self.writer.write_json_payload(kind, payload)`, returning `Some(RawPayloadRef)` on success or logging a warning and returning `None` on error.
+**Data flow**: It receives a payload kind and any serializable payload. It asks TraceWriter to write the JSON. On success it returns a RawPayloadRef; on failure it logs a warning and returns None.
 
-**Call relations**: Used by startup metadata recording and tool-runtime payload conversion, and indirectly by several public trace methods that need optional payload references without failing the main execution path.
+**Call relations**: record_thread_started and raw_tool_runtime_payload use this when an event needs to carry more detail than should be embedded directly. Other enabled trace methods use the same pattern for raw payload capture.
 
 *Call graph*: called by 2 (raw_tool_runtime_payload, record_thread_started); 1 external calls (warn!).
 
@@ -999,11 +1013,11 @@ fn raw_tool_runtime_payload(
     ) -> Option<RawTraceEventPayload>
 ```
 
-**Purpose**: Converts a parsed `ToolRuntimeTraceEvent` into the corresponding raw trace payload variant, including persistence of the runtime payload body. It normalizes started and ended runtime observations into the crate's raw event schema.
+**Purpose**: Converts a recognized tool runtime event into the raw trace event format used by the writer. It also stores the detailed tool runtime data as a JSON payload file.
 
-**Data flow**: Consumes a `crate::protocol_event::ToolRuntimeTraceEvent<'_>`. For `Started`, it writes the embedded payload as `RawPayloadKind::ToolRuntimeEvent` and returns `RawTraceEventPayload::ToolCallRuntimeStarted { tool_call_id, runtime_payload }`. For `Ended`, it writes the payload similarly and returns `RawTraceEventPayload::ToolCallRuntimeEnded { tool_call_id, status, runtime_payload }`. Any payload-write failure yields `None`.
+**Data flow**: It receives a ToolRuntimeTraceEvent, either Started or Ended. It writes the event’s detailed payload as a ToolRuntimeEvent JSON file. If that succeeds, it returns a ToolCallRuntimeStarted or ToolCallRuntimeEnded payload containing the tool call ID, status when present, and payload reference.
 
-**Call relations**: Called by `ThreadTraceContext::record_tool_call_event` after protocol-to-runtime interpretation has already happened. It isolates the schema mapping and payload-file creation.
+**Call relations**: ThreadTraceContext::record_tool_call_event uses this after protocol_event has identified a tool runtime lifecycle message. This helper bridges the typed protocol event into the raw event stream.
 
 *Call graph*: calls 1 internal fn (write_json_payload_best_effort).
 
@@ -1014,11 +1028,11 @@ fn raw_tool_runtime_payload(
 fn append_best_effort(&self, payload: RawTraceEventPayload)
 ```
 
-**Purpose**: Appends a raw trace event without extra context and suppresses append failures to warnings. It is the simplest event-write helper for thread-scoped tracing.
+**Purpose**: Appends a trace event without extra turn context, while treating failures as warnings. It is used for events that belong to the rollout or thread as a whole.
 
-**Data flow**: Accepts a `RawTraceEventPayload`, calls `self.writer.append(payload)`, and ignores the returned event object. On error it logs a warning; otherwise it writes to the bundle's `trace.jsonl`.
+**Data flow**: It receives a RawTraceEventPayload. It asks TraceWriter to append it to the trace. If writing fails, it logs a warning and returns nothing.
 
-**Call relations**: Used by startup, shutdown, rollout-start/end, and MCP-correlation paths that do not need explicit turn context attached.
+**Call relations**: record_thread_started uses this to write the ThreadStarted event, and the enabled trace flow uses the same idea for rollout-level or thread-level events. It is the simple final write step for events that do not need a Codex turn ID.
 
 *Call graph*: called by 1 (record_thread_started); 1 external calls (warn!).
 
@@ -1033,24 +1047,24 @@ fn append_with_context_best_effort(
     )
 ```
 
-**Purpose**: Appends a raw trace event with explicit thread and Codex-turn context, suppressing failures to warnings. It is the contextual counterpart to `append_best_effort`.
+**Purpose**: Appends a trace event with thread and Codex turn context attached. This makes later analysis able to place the event inside the right thread and turn.
 
-**Data flow**: Takes a `CodexTurnId` and `RawTraceEventPayload`, constructs `RawTraceEventContext { thread_id: Some(self.thread_id.clone()), codex_turn_id: Some(codex_turn_id) }`, and calls `self.writer.append_with_context(event_context, payload)`. Errors are logged and otherwise ignored.
+**Data flow**: It receives a Codex turn ID and a raw event payload. It builds a RawTraceEventContext containing the current thread ID and that turn ID, then asks TraceWriter to append the payload with that context. If writing fails, it logs a warning.
 
-**Call relations**: Used by turn, tool-runtime, agent-result, and explicit turn-start recording paths whenever reducers need the event tied to both a thread and a turn.
+**Call relations**: Turn-scoped recording methods use this after they translate or build their payloads. It is the shared final step for Codex turn events, tool runtime events, agent-result edges, and similar events that need precise placement.
 
 *Call graph*: 2 external calls (clone, warn!).
 
 
 ### `rollout-trace/src/code_cell.rs`
 
-`domain_logic` · `runtime cell execution and completion`
+`io_transport` · `during code-mode execution`
 
-This module centers on `CodeCellTraceContext`, a small cloneable wrapper whose internal state is either `Disabled` or `Enabled(EnabledCodeCellTraceContext)`. The enabled state captures the shared `Arc<TraceWriter>` plus the enclosing `AgentThreadId`, `CodexTurnId`, and the runtime-local `runtime_cell_id` that identifies the JavaScript cell inside code mode. Public methods all follow the same hot-path pattern: early-return if tracing is disabled, otherwise build a concrete `RawTraceEventPayload` and append it best-effort.
+A code-mode runtime cell is a piece of JavaScript execution that the assistant starts through the public `exec` tool. This file is the tracing layer for that cell. Its job is to leave a clear breadcrumb trail without forcing the main execution code to know the details of trace files, payload storage, or event shapes.
 
-`record_started` emits `CodeCellStarted` before nested tool calls can occur, preserving the model-visible call id and parsed JavaScript source. `record_initial_response` and `record_ended` both derive a `CodeCellRuntimeStatus` from `codex_code_mode::RuntimeResponse`, serialize the raw runtime response into a `ToolResult` payload, and attach that payload reference to `CodeCellInitialResponse` or `CodeCellEnded`. The response payload is intentionally the runtime-boundary object, not the later model-visible custom-tool output.
+The central type is `CodeCellTraceContext`. Think of it like a receipt book attached to one running code cell. If tracing is disabled, the receipt book is blank and every recording call returns immediately. If tracing is enabled, it holds a `TraceWriter`, the agent thread ID, the Codex turn ID, and the runtime cell ID. Those IDs make each event easy to connect back to the right conversation and turn.
 
-Two helper functions encapsulate failure policy: `write_json_payload_best_effort` logs a warning and returns `None` if payload persistence fails, while `append_with_context_best_effort` constructs `RawTraceEventContext` from the stored thread/turn ids and warns on append failure. The design invariant is that tracing must never affect execution: all serialization and append errors degrade to missing trace evidence rather than propagated failures.
+The file records three important moments: the cell started, the first runtime response arrived, and the cell ended. Runtime responses are also serialized into a raw payload, so the trace keeps evidence of what happened at the runtime boundary. The file is careful not to crash or interrupt execution if tracing fails. Failed writes only produce a warning. That matters because tracing is useful for debugging and replay, but it should not break the user-facing run.
 
 #### Function details
 
@@ -1060,11 +1074,11 @@ Two helper functions encapsulate failure policy: `write_json_payload_best_effort
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a trace context whose methods are safe no-ops. It is the disabled branch used when rollout tracing is unavailable or intentionally off.
+**Purpose**: Creates a tracing context that accepts recording calls but writes nothing. This is useful when tracing is turned off, because callers can still use the same API without checking a flag each time.
 
-**Data flow**: Takes no arguments and creates `CodeCellTraceContext { state: CodeCellTraceContextState::Disabled }`. It returns that value and writes no external state.
+**Data flow**: No outside data goes in. The function builds a `CodeCellTraceContext` whose internal state is `Disabled`. What comes out is a harmless no-op handle: later calls like `record_started` will simply return without changing anything.
 
-**Call relations**: It is selected by the higher-level `code_cell_trace_context` factory when tracing should not record code-cell events, allowing downstream execution code to call tracing methods unconditionally.
+**Call relations**: The broader code asks for this when building a code cell trace context and tracing is not available or not wanted. It lets later execution code call the normal recording methods without needing separate disabled-path logic.
 
 *Call graph*: called by 1 (code_cell_trace_context).
 
@@ -1080,11 +1094,11 @@ fn enabled(
     ) -> Self
 ```
 
-**Purpose**: Constructs an active trace context for a specific already-known runtime cell. It captures the writer and stable identifiers needed to stamp every later event with thread, turn, and runtime-cell identity.
+**Purpose**: Creates a tracing context that knows where to write trace events and which conversation turn and runtime cell those events belong to. Use this when a code cell is known and tracing should be active.
 
-**Data flow**: Consumes an `Arc<TraceWriter>` plus values convertible into `AgentThreadId`, `CodexTurnId`, and `String` for `runtime_cell_id`; converts them with `into()` and stores them in `EnabledCodeCellTraceContext`. Returns a `CodeCellTraceContext` in the `Enabled` state.
+**Data flow**: It receives a shared `TraceWriter`, a thread ID, a Codex turn ID, and a runtime cell ID. It converts the IDs into their stored forms and places them into an enabled context. The result is a `CodeCellTraceContext` that future recording calls can use to write properly labeled events.
 
-**Call relations**: It is chosen by `code_cell_trace_context` when rollout tracing is enabled and the runtime cell id is known, setting up the state later read by `record_started`, `record_initial_response`, and `record_ended`.
+**Call relations**: The broader code calls this while constructing the trace context for a real code-mode cell. The returned handle is then carried through cell execution so start, response, and end events can all be tied to the same writer and IDs.
 
 *Call graph*: called by 1 (code_cell_trace_context); 2 external calls (into, Enabled).
 
@@ -1099,11 +1113,11 @@ fn record_started(
     )
 ```
 
-**Purpose**: Emits the raw event that declares a code cell has started executing, including the model-visible `exec` call id and the parsed JavaScript source. This establishes the parent runtime object before nested tool activity can be traced.
+**Purpose**: Records that a code-mode runtime cell has started. It captures the model-visible call ID and the JavaScript source before that JavaScript has a chance to trigger nested tool calls.
 
-**Data flow**: Reads `self.state`; if disabled, returns immediately. Otherwise converts `model_visible_call_id` and `source_js`, clones `runtime_cell_id` from the enabled context, builds `RawTraceEventPayload::CodeCellStarted`, and passes it to `append_with_context_best_effort`, which writes the event through the stored `TraceWriter`.
+**Data flow**: It reads the context’s current state. If tracing is disabled, nothing happens. If tracing is enabled, it takes the model-visible call ID and source JavaScript, combines them with the runtime cell ID, and sends a `CodeCellStarted` event to the trace writer through `append_with_context_best_effort`.
 
-**Call relations**: It is invoked by runtime code at cell start. Its only delegation is to `append_with_context_best_effort`, which centralizes event-context construction and best-effort append behavior.
+**Call relations**: Execution code calls this at the beginning of a runtime cell. This function does not write directly; it hands the finished event to `append_with_context_best_effort`, which adds the thread and turn context and tries to append it safely.
 
 *Call graph*: calls 1 internal fn (append_with_context_best_effort); 1 external calls (into).
 
@@ -1114,11 +1128,11 @@ fn record_started(
 fn record_initial_response(&self, response: &RuntimeResponse)
 ```
 
-**Purpose**: Records the first runtime response returned by the public code-mode `exec` tool, distinguishing yielded cells from terminal initial responses. It preserves both a normalized status and the raw runtime response payload.
+**Purpose**: Records the first response returned by the public code-mode `exec` tool. This matters because a cell may yield control back to the model while still continuing to run.
 
-**Data flow**: Accepts `&RuntimeResponse`, checks whether tracing is enabled, then computes `status` via `code_cell_status_for_runtime_response` and `response_payload` via `code_cell_response_payload`. It clones `runtime_cell_id`, builds `RawTraceEventPayload::CodeCellInitialResponse`, and appends it with context.
+**Data flow**: It receives a `RuntimeResponse`. If tracing is disabled, it stops. If tracing is enabled, it translates the response into a simple lifecycle status, stores the full raw response as a JSON payload when possible, and appends a `CodeCellInitialResponse` event with the runtime cell ID, status, and optional payload reference.
 
-**Call relations**: It is called when the runtime produces the first response for a cell. It delegates status classification to `code_cell_status_for_runtime_response`, payload serialization to `code_cell_response_payload`, and final event emission to `append_with_context_best_effort`.
+**Call relations**: Execution code calls this when the first runtime response is available. It relies on `code_cell_status_for_runtime_response` to summarize the response and `code_cell_response_payload` to store the detailed response, then passes the event to `append_with_context_best_effort`.
 
 *Call graph*: calls 3 internal fn (append_with_context_best_effort, code_cell_response_payload, code_cell_status_for_runtime_response).
 
@@ -1129,11 +1143,11 @@ fn record_initial_response(&self, response: &RuntimeResponse)
 fn record_ended(&self, response: &RuntimeResponse)
 ```
 
-**Purpose**: Emits the terminal lifecycle event for a code-mode runtime cell. It marks final runtime status and optionally links the serialized terminal response payload.
+**Purpose**: Records the final lifecycle point for a code-mode runtime cell. It tells the trace whether the cell completed, failed, yielded, or terminated at the end.
 
-**Data flow**: Takes `&RuntimeResponse`, returns early if disabled, otherwise derives `CodeCellRuntimeStatus`, serializes the response into an optional `RawPayloadRef`, clones `runtime_cell_id`, constructs `RawTraceEventPayload::CodeCellEnded`, and appends it through the writer with thread/turn context.
+**Data flow**: It receives the final `RuntimeResponse`. With tracing disabled, it does nothing. With tracing enabled, it converts the response into a status, writes the raw response into payload storage when possible, and appends a `CodeCellEnded` event that points back to the same runtime cell.
 
-**Call relations**: It is called by the runtime owner when the cell has definitively ended. Like `record_initial_response`, it relies on the shared helpers for status mapping, payload writing, and best-effort append.
+**Call relations**: Execution code calls this once the runtime cell reaches its terminal point. Like the initial-response path, it uses `code_cell_status_for_runtime_response` and `code_cell_response_payload`, then hands the event to `append_with_context_best_effort` for safe writing.
 
 *Call graph*: calls 3 internal fn (append_with_context_best_effort, code_cell_response_payload, code_cell_status_for_runtime_response).
 
@@ -1144,11 +1158,11 @@ fn record_ended(&self, response: &RuntimeResponse)
 fn code_cell_status_for_runtime_response(response: &RuntimeResponse) -> CodeCellRuntimeStatus
 ```
 
-**Purpose**: Maps a `RuntimeResponse` into the reduced trace enum `CodeCellRuntimeStatus`. It distinguishes yielded, terminated, successful result, and failed result states using the presence of `error_text`.
+**Purpose**: Turns a detailed runtime response into a simpler status used by trace events. This gives later trace readers an easy way to tell whether the cell yielded, terminated, completed successfully, or failed.
 
-**Data flow**: Reads the `RuntimeResponse` variant: `Yielded` becomes `Yielded`, `Terminated` becomes `Terminated`, and `Result` becomes `Failed` if `error_text.is_some()` else `Completed`. Returns the derived status without side effects.
+**Data flow**: It receives a `RuntimeResponse`. If the response says the cell yielded, it returns `Yielded`; if it says the cell terminated, it returns `Terminated`; if it is a result, it checks whether there is error text and returns `Failed` or `Completed`. It does not change any outside state.
 
-**Call relations**: It is used by both `record_initial_response` and `record_ended` so those event constructors share one consistent status policy.
+**Call relations**: `record_initial_response` and `record_ended` call this before writing their events. It supplies the compact status field that sits beside the fuller raw response payload.
 
 *Call graph*: called by 2 (record_ended, record_initial_response).
 
@@ -1162,11 +1176,11 @@ fn code_cell_response_payload(
 ) -> Option<RawPayloadRef>
 ```
 
-**Purpose**: Serializes a runtime response into a raw trace payload reference suitable for code-cell lifecycle events. It wraps the borrowed response in a trace-specific payload struct so the raw runtime object is preserved.
+**Purpose**: Stores the full runtime response as a trace payload and returns a reference to it if that storage succeeds. This keeps detailed evidence available without stuffing the whole response directly into every event.
 
-**Data flow**: Reads the enabled context's `writer`, constructs `CodeCellResponseTracePayload { response }`, and passes it with `RawPayloadKind::ToolResult` to `write_json_payload_best_effort`. Returns `Some(RawPayloadRef)` on success or `None` if serialization/storage fails.
+**Data flow**: It receives the enabled trace context and a `RuntimeResponse`. It wraps the response in a serializable payload shape, asks `write_json_payload_best_effort` to write it as a tool-result payload, and returns either a payload reference or `None` if writing failed.
 
-**Call relations**: It is called by `record_initial_response` and `record_ended` to keep response-payload creation identical across initial and terminal events.
+**Call relations**: `record_initial_response` and `record_ended` call this when they need to attach the raw runtime response to an event. It delegates the actual JSON writing and error handling to `write_json_payload_best_effort`.
 
 *Call graph*: calls 1 internal fn (write_json_payload_best_effort); called by 2 (record_ended, record_initial_response).
 
@@ -1181,11 +1195,11 @@ fn write_json_payload_best_effort(
 ) -> Option<RawPayloadRef>
 ```
 
-**Purpose**: Attempts to persist a JSON payload to the trace store without letting failures affect the caller's main control flow. It converts writer errors into warnings and an absent payload reference.
+**Purpose**: Tries to write a JSON trace payload without letting failures interrupt the main program. If the write fails, it logs a warning and returns no payload reference.
 
-**Data flow**: Accepts a `TraceWriter`, `RawPayloadKind`, and serializable payload; calls `writer.write_json_payload(kind, payload)`. On success it wraps the returned payload ref in `Some`; on error it logs `warn!` and returns `None`.
+**Data flow**: It receives a `TraceWriter`, a payload kind, and data that can be serialized to JSON. It asks the writer to store that JSON. On success, it returns the new payload reference. On failure, it emits a warning and returns `None`.
 
-**Call relations**: It is only reached through `code_cell_response_payload`, isolating the best-effort serialization policy for code-cell response evidence.
+**Call relations**: `code_cell_response_payload` calls this when saving a runtime response. This helper is the safety wrapper around payload writing, so tracing problems stay visible in logs but do not break code execution.
 
 *Call graph*: calls 1 internal fn (write_json_payload); called by 1 (code_cell_response_payload); 1 external calls (warn!).
 
@@ -1199,24 +1213,26 @@ fn append_with_context_best_effort(
 )
 ```
 
-**Purpose**: Appends a raw trace event using the thread and turn ids stored in an enabled code-cell context. It ensures every emitted event carries the same envelope context and suppresses append failures to warnings.
+**Purpose**: Appends a trace event with the correct thread and turn information, while treating write failures as warnings instead of fatal errors. It is the common final step for recording code-cell lifecycle events.
 
-**Data flow**: Builds `RawTraceEventContext { thread_id: Some(...), codex_turn_id: Some(...) }` from the enabled context, then calls `context.writer.append_with_context(event_context, payload)`. It returns unit and only writes to the trace log; on error it emits `warn!`.
+**Data flow**: It receives an enabled context and a prepared raw trace event. It builds an event context containing the thread ID and Codex turn ID, then asks the writer to append the event. If appending fails, it logs a warning and otherwise leaves the program alone.
 
-**Call relations**: This helper is the final sink for `record_started`, `record_initial_response`, and `record_ended`, so all code-cell lifecycle events share identical envelope construction and failure handling.
+**Call relations**: `record_started`, `record_initial_response`, and `record_ended` all call this after building their specific events. It centralizes the shared context stamping and safe append behavior for every code-cell trace event in this file.
 
 *Call graph*: called by 3 (record_ended, record_initial_response, record_started); 1 external calls (warn!).
 
 
 ### `rollout-trace/src/compaction.rs`
 
-`domain_logic` · `history compaction request/retry and checkpoint installation`
+`io_transport` · `during remote compaction attempts and checkpoint installation`
 
-This file defines two layered no-op-capable handles: `CompactionTraceContext` for the overall semantic compaction operation within a turn, and `CompactionTraceAttempt` for one concrete upstream compact-endpoint request. The enabled context stores an `Arc<TraceWriter>`, `AgentThreadId`, `CodexTurnId`, stable `CompactionId`, and provider metadata (`model`, `provider_name`). Each attempt clones that context and adds a unique `CompactionRequestId` generated from the global `NEXT_COMPACTION_REQUEST` atomic counter.
+Compaction is like taking a long notebook and rewriting it into a shorter set of notes so future work can continue without carrying every old page. This file creates a small tracing layer around that process. It keeps one stable compaction ID for the overall checkpoint, and gives each upstream request attempt its own request ID, because compaction may retry before it finally succeeds.
 
-`start_attempt` is the main entry point: if tracing is disabled it returns a disabled attempt; otherwise it allocates a request id, constructs an enabled attempt, immediately records `CompactionRequestStarted`, and returns the attempt for later terminal recording. `record_completed` serializes the compact endpoint's `ResponseItem` list using `trace_response_item_json` from the inference module so trace evidence preserves response-item details that normal request serialization may omit. `record_result` lets callers pass a `Result` directly and dispatches to `record_completed` or `record_failed` without branching.
+The main type, CompactionTraceContext, is the long-lived context for one compaction lifecycle. It can be enabled, with a TraceWriter and identifying details such as thread, turn, model, and provider, or disabled, in which case every tracing call quietly does nothing. That no-op behavior matters because callers can record trace events unconditionally without checking whether tracing is turned on.
 
-At the context level, `record_installed` persists a `CompactionCheckpointTracePayload` containing both `input_history` and `replacement_history`, then emits `CompactionInstalled` tied to the stable `compaction_id`. Unlike the code-cell module, helper functions here are intentionally quieter: payload writes use `.ok()` and event appends ignore errors except in `record_installed`, where failures are explicitly warned because checkpoint installation is the semantic culmination of compaction.
+When a compaction request starts, the context creates a CompactionTraceAttempt. The attempt records the exact request payload, then later records either the response items or the error. If compaction succeeds and the compacted history becomes the live history, record_installed writes a checkpoint payload showing the old selected history and the replacement history.
+
+Most writes here are “best effort”: if trace writing fails, the main compaction work should not fail just because logging failed. Some failures are ignored, and one checkpoint write path emits a warning.
 
 #### Function details
 
@@ -1226,11 +1242,11 @@ At the context level, `record_installed` persists a `CompactionCheckpointTracePa
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a compaction trace context that accepts calls but records nothing. It gives compaction code a uniform API regardless of whether rollout tracing is enabled.
+**Purpose**: Creates a compaction trace context that accepts tracing calls but records nothing. This is useful when tracing is turned off, because the caller can still use the same code path without special checks.
 
-**Data flow**: Takes no inputs and returns `CompactionTraceContext { state: CompactionTraceContextState::Disabled }`. It does not touch external state.
+**Data flow**: Nothing comes in. The function builds a CompactionTraceContext marked as disabled. The result is a context object whose later methods will immediately return without writing trace data.
 
-**Call relations**: It is returned by the higher-level `compaction_trace_context` setup path when tracing is unavailable, and later causes `start_attempt` and `record_installed` to short-circuit.
+**Call relations**: The broader compaction setup calls this through compaction_trace_context when tracing should be inactive. Later, code may still call start_attempt or record_installed on it, but those calls become harmless no-ops.
 
 *Call graph*: called by 1 (compaction_trace_context).
 
@@ -1247,11 +1263,11 @@ fn enabled(
         provider_name: S
 ```
 
-**Purpose**: Builds an active context for all upstream attempts that contribute to one compaction checkpoint. It captures the stable compaction identity and provider metadata reused across retries.
+**Purpose**: Creates a live tracing context for one compaction checkpoint. It stores the trace writer and the identifying information needed to connect later events to the right agent thread, turn, model, provider, and compaction ID.
 
-**Data flow**: Consumes a `TraceWriter` handle, thread and turn ids, a `CompactionId`, and provider strings; stores them in `EnabledCompactionTraceContext` inside the `Enabled` enum variant. Returns the resulting `CompactionTraceContext`.
+**Data flow**: It receives a shared TraceWriter, IDs for the thread, turn, and compaction, plus model and provider names. It packages those values into an enabled internal state. The returned context can create traced request attempts and record checkpoint installation.
 
-**Call relations**: It is selected by `compaction_trace_context` when tracing is active, and its stored fields are later cloned into each `CompactionTraceAttempt` created by `start_attempt`.
+**Call relations**: The compaction trace setup path calls this through compaction_trace_context when tracing is available. The context it returns is later used by compaction code, especially compact_conversation_history, to start attempts and record final installation.
 
 *Call graph*: called by 1 (compaction_trace_context); 1 external calls (Enabled).
 
@@ -1262,11 +1278,11 @@ fn enabled(
 fn start_attempt(&self, request: &impl Serialize) -> CompactionTraceAttempt
 ```
 
-**Purpose**: Creates one traced upstream compaction request attempt and immediately records its request payload. This is the retry boundary: each call gets a fresh request id while sharing the same stable compaction id.
+**Purpose**: Starts tracing one upstream compaction request attempt and immediately records the request payload. This separates a single retryable request from the larger compaction checkpoint it belongs to.
 
-**Data flow**: Reads `self.state`; if disabled, returns `CompactionTraceAttempt::disabled()`. Otherwise clones the enabled context, generates a new `CompactionRequestId` via `next_compaction_request_id`, constructs an enabled `CompactionTraceAttempt`, calls `attempt.record_started(request)` to persist the request payload and start event, then returns the attempt.
+**Data flow**: It receives a serializable request object. If the context is disabled, it returns a disabled attempt. If enabled, it creates a new request ID, copies the shared compaction context into a new CompactionTraceAttempt, records the request as a trace payload, and returns the attempt for later completion or failure logging.
 
-**Call relations**: It is invoked by `compact_conversation_history` when issuing a compact endpoint request. It delegates request-id generation to `next_compaction_request_id` and startup event emission to `CompactionTraceAttempt::record_started`.
+**Call relations**: compact_conversation_history calls this when it is about to send a compaction request. Internally it uses next_compaction_request_id to label the attempt, falls back to CompactionTraceAttempt::disabled when tracing is off, and then hands the request payload to record_started.
 
 *Call graph*: calls 2 internal fn (disabled, next_compaction_request_id); called by 1 (compact_conversation_history); 1 external calls (Enabled).
 
@@ -1277,11 +1293,11 @@ fn start_attempt(&self, request: &impl Serialize) -> CompactionTraceAttempt
 fn record_installed(&self, checkpoint: &CompactionCheckpointTracePayload<'_>)
 ```
 
-**Purpose**: Records the moment compacted replacement history becomes the live thread history. It ties the installed checkpoint back to the same semantic `compaction_id` used by all request attempts.
+**Purpose**: Records the moment when a compacted replacement history becomes the live conversation history. This is the checkpoint event that says, in effect, “from now on, use this shorter history instead of that selected old history.”
 
-**Data flow**: Accepts a borrowed `CompactionCheckpointTracePayload`; if disabled, returns. Otherwise it writes the checkpoint as `RawPayloadKind::CompactionCheckpoint` through `context.writer.write_json_payload`, warning and returning on error. On success it builds `RawTraceEventContext` from the stored thread/turn ids and appends `RawTraceEventPayload::CompactionInstalled { compaction_id, checkpoint_payload }`, warning if append fails.
+**Data flow**: It receives a CompactionCheckpointTracePayload containing the input history chosen for compaction and the replacement history that will be used going forward. If tracing is disabled, nothing happens. If enabled, it writes that checkpoint as a JSON payload, then appends a CompactionInstalled event tied to the thread and turn. If writing fails, it logs a warning and stops or warns again for append failure.
 
-**Call relations**: This is called after a successful compaction result has been accepted and installed into live history. It does not use the generic helper functions because it needs explicit warning behavior for both payload-write and append failures.
+**Call relations**: This function is used after compaction succeeds and the system installs the new history. Unlike the small best-effort helpers used by request attempts, this path explicitly warns if the trace payload or event could not be written, because the checkpoint is an important record of the history change.
 
 *Call graph*: 1 external calls (warn!).
 
@@ -1292,11 +1308,11 @@ fn record_installed(&self, checkpoint: &CompactionCheckpointTracePayload<'_>)
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a no-op attempt object for callers that still want to invoke terminal recording methods uniformly. It mirrors the disabled-context pattern at the per-request level.
+**Purpose**: Creates a request-attempt object that records nothing. It is the attempt-level version of a disabled trace context.
 
-**Data flow**: Creates and returns `CompactionTraceAttempt { state: CompactionTraceAttemptState::Disabled }` with no side effects.
+**Data flow**: Nothing comes in. The function returns a CompactionTraceAttempt marked as disabled. Later calls such as record_completed or record_failed will see that state and do nothing.
 
-**Call relations**: It is produced by `CompactionTraceContext::start_attempt` when the parent context is disabled, ensuring later `record_result`, `record_completed`, or `record_failed` calls safely do nothing.
+**Call relations**: CompactionTraceContext::start_attempt calls this when someone starts an attempt from a disabled context. This keeps the caller’s code simple: it can still receive an attempt object and report the result without checking whether tracing exists.
 
 *Call graph*: called by 1 (start_attempt).
 
@@ -1307,11 +1323,11 @@ fn disabled() -> Self
 fn record_started(&self, request: &impl Serialize)
 ```
 
-**Purpose**: Persists the exact compact endpoint request payload and emits the corresponding start event for one upstream attempt. It captures both stable compaction identity and per-attempt request identity.
+**Purpose**: Records that a compaction request attempt has begun, including the exact request sent to the compact endpoint. This gives later debugging a copy of the input that produced a response or failure.
 
-**Data flow**: Reads `self.state`; if disabled, returns. Otherwise writes the serializable request as `RawPayloadKind::CompactionRequest` using `write_json_payload_best_effort`; if that returns `None`, it stops. With a payload ref, it builds `RawTraceEventPayload::CompactionRequestStarted` containing `compaction_id`, `compaction_request_id`, thread/turn ids, model, provider name, and `request_payload`, then appends it via `append_with_context_best_effort`.
+**Data flow**: It receives a serializable request. If the attempt is disabled, it returns immediately. If enabled, it tries to write the request as a JSON trace payload. If that succeeds, it appends a CompactionRequestStarted event containing the compaction ID, request ID, thread and turn IDs, model, provider, and the saved request payload reference.
 
-**Call relations**: It is called internally by `CompactionTraceContext::start_attempt` immediately after constructing an enabled attempt, so every returned enabled attempt has already emitted its start event.
+**Call relations**: CompactionTraceContext::start_attempt calls this right after creating an enabled attempt. The function relies on write_json_payload_best_effort to save the request body and append_with_context_best_effort to add the event to the trace without disrupting the main compaction flow if tracing fails.
 
 *Call graph*: calls 2 internal fn (append_with_context_best_effort, write_json_payload_best_effort).
 
@@ -1322,11 +1338,11 @@ fn record_started(&self, request: &impl Serialize)
 fn record_completed(&self, output_items: &[ResponseItem])
 ```
 
-**Purpose**: Records a successful non-streaming compact endpoint response and preserves the returned response items in trace-specific JSON form. It emits the terminal completed event for that request attempt.
+**Purpose**: Records a successful compaction response. It saves the response items in a trace-friendly form so the trace preserves what the compact endpoint returned.
 
-**Data flow**: If disabled, returns. Otherwise it maps each `ResponseItem` in `output_items` through `trace_response_item_json`, collects them into `TracedCompactionCompleted { output_items }`, writes that as `RawPayloadKind::CompactionResponse`, and if successful appends `RawTraceEventPayload::CompactionRequestCompleted { compaction_id, compaction_request_id, response_payload }`.
+**Data flow**: It receives a slice of ResponseItem values from the compact endpoint. If tracing is disabled, it does nothing. If enabled, it converts each response item with trace_response_item_json, wraps them in a response payload, writes that payload as JSON, and appends a CompactionRequestCompleted event pointing to the saved response.
 
-**Call relations**: It is reached from `record_result` on `Ok(...)`. It delegates response-item serialization to the inference module helper and uses the local best-effort helpers for payload persistence and event append.
+**Call relations**: CompactionTraceAttempt::record_result calls this when the compact endpoint returned success. It uses the same best-effort trace-writing helpers as record_started, so a trace write problem does not turn a successful compaction into an application failure.
 
 *Call graph*: calls 2 internal fn (append_with_context_best_effort, write_json_payload_best_effort); called by 1 (record_result); 1 external calls (iter).
 
@@ -1337,11 +1353,11 @@ fn record_completed(&self, output_items: &[ResponseItem])
 fn record_result(&self, result: Result<&[ResponseItem], E>)
 ```
 
-**Purpose**: Provides a single terminal-recording entry point for callers that already have a `Result` from the compact endpoint. It converts success into a completed event and failure into a failed event.
+**Purpose**: Records the outcome of a compaction request without making the caller write separate success and failure branches. It is a small convenience wrapper around the success and error recording paths.
 
-**Data flow**: Consumes `Result<&[ResponseItem], E>` where `E: Display`; matches on the result and forwards the slice to `record_completed` or the error to `record_failed`. Returns unit and writes whatever those delegated methods write.
+**Data flow**: It receives a Result: either response items on success or an error on failure. For success, it passes the response items to record_completed. For failure, it passes the error to record_failed. It returns no value; its effect is only trace recording.
 
-**Call relations**: It is the convenience wrapper used by callers that do not want to branch on trace behavior themselves. Its control flow is a simple dispatch to the two terminal methods.
+**Call relations**: Callers can use this after the compact endpoint finishes. Internally it chooses between record_completed and record_failed, so the rest of the tracing behavior stays centralized in those two functions.
 
 *Call graph*: calls 2 internal fn (record_completed, record_failed).
 
@@ -1352,11 +1368,11 @@ fn record_result(&self, result: Result<&[ResponseItem], E>)
 fn record_failed(&self, error: impl Display)
 ```
 
-**Purpose**: Emits a failed terminal event for a compaction request attempt when the compact endpoint errors before producing a usable response. It stores only the textual error, not a response payload.
+**Purpose**: Records that a compaction request attempt failed before producing a usable response. It stores the error text alongside the compaction and request IDs so the failed attempt can be understood later.
 
-**Data flow**: Checks whether the attempt is enabled; if so, converts the `Display` error to `String`, builds `RawTraceEventPayload::CompactionRequestFailed { compaction_id, compaction_request_id, error }`, and appends it with the parent context's thread/turn envelope.
+**Data flow**: It receives an error-like value that can be displayed as text. If tracing is disabled, it returns. If enabled, it converts the error to a string and appends a CompactionRequestFailed event tied to the current compaction and request attempt.
 
-**Call relations**: It is called by `record_result` on `Err(...)`. Unlike `record_completed`, it does not serialize any payload and goes straight to `append_with_context_best_effort`.
+**Call relations**: CompactionTraceAttempt::record_result calls this when the result is an error. It hands the event to append_with_context_best_effort, keeping failure tracing separate from the main application error handling.
 
 *Call graph*: calls 1 internal fn (append_with_context_best_effort); called by 1 (record_result); 1 external calls (to_string).
 
@@ -1367,11 +1383,11 @@ fn record_failed(&self, error: impl Display)
 fn next_compaction_request_id() -> CompactionRequestId
 ```
 
-**Purpose**: Generates a unique local request id for each upstream compaction attempt. The ids are monotonic within the process and formatted with a trace-specific prefix.
+**Purpose**: Creates a unique ID for each upstream compaction request attempt. This matters because one compaction checkpoint can involve several retries, and the trace needs to tell those attempts apart.
 
-**Data flow**: Reads and increments the static `NEXT_COMPACTION_REQUEST` atomic using `fetch_add(1, Ordering::Relaxed)`, formats the resulting ordinal as `compaction_request:{ordinal}`, and returns that `CompactionRequestId` string.
+**Data flow**: It reads and increments a shared atomic counter, which is a number that can be safely updated from multiple threads. It formats the number into a string like a compaction request ID and returns it.
 
-**Call relations**: It is called only by `CompactionTraceContext::start_attempt` to assign a fresh request id to each retry or new compact endpoint call.
+**Call relations**: CompactionTraceContext::start_attempt calls this whenever it creates an enabled attempt. The returned ID is then used by started, completed, and failed events so all events for the same request attempt line up.
 
 *Call graph*: called by 1 (start_attempt); 1 external calls (format!).
 
@@ -1386,11 +1402,11 @@ fn write_json_payload_best_effort(
 ) -> Option<crate::RawPayloadRef>
 ```
 
-**Purpose**: Attempts to write a JSON payload to the trace store and silently drops failures. It is the lightweight helper used for request and response payloads on compaction attempts.
+**Purpose**: Tries to save a trace payload as JSON, but treats failure as non-fatal. It is used when tracing should never break the real compaction work.
 
-**Data flow**: Calls `writer.write_json_payload(kind, payload).ok()` and returns `Some(RawPayloadRef)` on success or `None` on error. It performs no logging.
+**Data flow**: It receives a TraceWriter, a payload kind describing what is being saved, and a serializable payload. It asks the writer to store the JSON. If that succeeds, it returns a reference to the saved payload; if it fails, it returns nothing.
 
-**Call relations**: It is used by `CompactionTraceAttempt::record_started` and `CompactionTraceAttempt::record_completed` so those hot-path methods can skip event emission when payload persistence fails.
+**Call relations**: record_started and record_completed call this before appending events that point to request or response payloads. If it returns nothing, those functions stop recording that event rather than interrupting the compaction request.
 
 *Call graph*: calls 1 internal fn (write_json_payload); called by 2 (record_completed, record_started).
 
@@ -1404,24 +1420,24 @@ fn append_with_context_best_effort(
 )
 ```
 
-**Purpose**: Appends a compaction-related raw event with the thread and turn ids from the enabled context. It intentionally ignores append errors.
+**Purpose**: Appends a trace event with the thread and turn context attached, while ignoring append failures. It is the common helper for attempt-level trace events.
 
-**Data flow**: Builds `RawTraceEventContext` from `context.thread_id` and `context.codex_turn_id`, then calls `context.writer.append_with_context(event_context, payload)` and discards the result. Returns unit.
+**Data flow**: It receives the enabled compaction context and an event payload. It builds a RawTraceEventContext containing the thread ID and Codex turn ID, then asks the TraceWriter to append the event. It does not return anything and discards any write error.
 
-**Call relations**: It is the final append sink for `record_started`, `record_completed`, and `record_failed`, giving all per-attempt events the same envelope context and silent best-effort behavior.
+**Call relations**: record_started, record_completed, and record_failed call this after they have built their event payloads. It is the final step that places those attempt events into the trace stream.
 
 *Call graph*: called by 3 (record_completed, record_failed, record_started).
 
 
 ### `rollout-trace/src/inference.rs`
 
-`domain_logic` · `upstream inference request setup, streaming, and terminalization`
+`domain_logic` · `request handling`
 
-This module defines the main tracing machinery for model inference. `InferenceTraceContext` is a turn-local handle storing `Arc<TraceWriter>`, `AgentThreadId`, `CodexTurnId`, `model`, and `provider_name` when enabled, or a disabled sentinel otherwise. `start_attempt` creates an `InferenceTraceAttempt` for one concrete upstream request, assigning a UUID-based `InferenceCallId` and an `AtomicBool terminal_recorded` guard so only one terminal event can ever be emitted even if multiple code paths race to finish the stream.
+This file is the tracing layer for model inference calls. An inference call is a request to a model provider, such as asking a hosted model to produce the next response. During one Codex turn, there may be more than one attempt: for example, a retry after an authentication problem, or a fallback from WebSocket to HTTP. This file gives each attempt its own ID, records the request payload, and then records how the attempt ended: completed, failed, or cancelled.
 
-The attempt object supports three phases. First, `add_request_headers` injects `x-codex-inference-call-id` into an `http::HeaderMap` when enabled, but silently skips impossible header-conversion failures to preserve best-effort semantics. Second, `record_started` writes the logical or physical request payload as `InferenceRequest` and emits `InferenceStarted` with thread, turn, model, and provider metadata. Third, one of `record_completed`, `record_failed`, or `record_cancelled` consumes the terminal guard via `take_terminal_attempt`; duplicate terminal calls become no-ops.
+The main idea is a no-op handle. If tracing is disabled, callers still receive an InferenceTraceContext and InferenceTraceAttempt, but their methods quietly do nothing. This keeps the hot request path simple: transport code does not need to keep asking, “is tracing enabled?” It can just say, “record that this started” or “record that this failed.”
 
-Response payloads are summarized as `TracedResponseStreamOutput`, which stores optional `response_id`, optional provider `upstream_request_id`, optional `TokenUsage`, and fully serialized `ResponseItem`s. The helper `trace_response_item_json` is a key design choice: it starts from normal `serde_json::to_value(item)` but explicitly reinserts reasoning `content` that the protocol serializer omits for future-request shaping, preserving raw evidence for replay and debugging. The included tests verify disabled behavior, header propagation, replayable event recording, and reasoning-content preservation.
+When tracing is enabled, the context carries shared facts for the turn, such as the thread ID, turn ID, model, provider name, and trace writer. Each attempt gets a fresh UUID-like inference call ID, which can also be placed into request headers so downstream systems can connect provider-side logs to Codex traces. Terminal events are protected by an atomic flag, which is a small lock-free safety check that prevents the same attempt from being marked both failed and cancelled, for example. The file also saves response summaries, including special care to preserve reasoning content that normal request serialization may omit.
 
 #### Function details
 
@@ -1431,11 +1447,11 @@ Response payloads are summarized as `TracedResponseStreamOutput`, which stores o
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a turn-local inference trace context that records nothing. It allows transport code to keep tracing calls in place without branching on an `Option`.
+**Purpose**: Creates a tracing context that accepts all the usual tracing calls but records nothing. This is useful when tracing is off, because callers can keep one simple code path instead of checking for tracing everywhere.
 
-**Data flow**: Takes no arguments and returns `InferenceTraceContext { state: InferenceTraceContextState::Disabled }`. It does not mutate any shared state.
+**Data flow**: No outside data goes in. The function returns an InferenceTraceContext whose internal state is Disabled. Later calls made through this context become harmless no-ops.
 
-**Call relations**: It is used broadly by startup paths, tests, and transport code when tracing is absent, and causes `start_attempt` to return a disabled attempt whose methods all no-op.
+**Call relations**: Many request and test paths create this disabled context when tracing is unavailable or not relevant. When start_attempt is called on it, the flow continues with a disabled InferenceTraceAttempt instead of writing trace data.
 
 *Call graph*: called by 18 (prewarm_websocket, drain_to_completed, run_remote_compaction_request_v2, responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids, send_provider_auth_request, responses_websocket_emits_rate_limit_events, responses_websocket_emits_reasoning_included_event (+8 more)).
 
@@ -1452,11 +1468,11 @@ fn enabled(
     ) -> Self
 ```
 
-**Purpose**: Builds an active inference tracing context for one Codex turn. It captures the writer, thread/turn identity, and provider metadata reused by every attempt in that turn.
+**Purpose**: Creates a tracing context for one Codex turn. It stores the writer and identifying details needed to attach future inference attempts to the right thread, turn, model, and provider.
 
-**Data flow**: Consumes an `Arc<TraceWriter>`, `AgentThreadId`, `CodexTurnId`, `model`, and `provider_name`, stores them in `EnabledInferenceTraceContext`, and returns an enabled `InferenceTraceContext`.
+**Data flow**: It receives a shared TraceWriter, thread ID, turn ID, model name, and provider name. It wraps those values into an enabled context and returns an InferenceTraceContext ready to start traced attempts.
 
-**Call relations**: It is created by inference-trace setup code and tests before request streaming begins, and its stored fields are cloned into each attempt created by `start_attempt`.
+**Call relations**: Setup code and tests call this when rollout tracing is active. Later, stream_responses_api or stream_responses_websocket use the returned context to start concrete inference attempts.
 
 *Call graph*: called by 5 (started_inference_attempt, responses_websocket_request_prewarm_traces_logical_request, enabled_attempt_adds_inference_request_header, enabled_context_records_replayable_inference_attempt, inference_trace_context); 1 external calls (Enabled).
 
@@ -1467,11 +1483,11 @@ fn enabled(
 fn start_attempt(&self) -> InferenceTraceAttempt
 ```
 
-**Purpose**: Creates a new traced upstream request attempt with a fresh inference call id and a terminal-event guard. This is the unit used for retries, auth recovery, or protocol fallback.
+**Purpose**: Starts tracking one concrete request attempt to the model provider. A single turn can have several attempts because of retries or fallback paths.
 
-**Data flow**: Reads `self.state`; if disabled, returns `InferenceTraceAttempt::disabled()`. Otherwise clones the enabled context, generates a UUID string via `next_inference_call_id`, initializes `terminal_recorded` to `false`, wraps everything in `EnabledInferenceTraceAttempt`, and returns the enabled attempt.
+**Data flow**: It reads whether the context is enabled. If disabled, it returns a disabled attempt. If enabled, it clones the turn-level context, generates a new inference call ID, creates an atomic terminal-event guard set to false, and returns an enabled attempt.
 
-**Call relations**: It is invoked by both `stream_responses_api` and `stream_responses_websocket` after a concrete provider request has been built, so each transport attempt gets its own trace identity.
+**Call relations**: The HTTP and WebSocket streaming paths call this after building a provider request. It hands back an InferenceTraceAttempt that those paths can use to add headers and record started, completed, failed, or cancelled events.
 
 *Call graph*: calls 2 internal fn (disabled, next_inference_call_id); called by 2 (stream_responses_api, stream_responses_websocket); 2 external calls (new, Enabled).
 
@@ -1482,11 +1498,11 @@ fn start_attempt(&self) -> InferenceTraceAttempt
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a no-op attempt object for code paths that still want to call header injection and lifecycle recording uniformly. It mirrors the disabled context at per-request granularity.
+**Purpose**: Creates a single inference attempt that records nothing. This lets callers use the same attempt methods even when tracing is off.
 
-**Data flow**: Returns `InferenceTraceAttempt { state: InferenceTraceAttemptState::Disabled }` with no side effects.
+**Data flow**: No input is needed. The function returns an InferenceTraceAttempt with Disabled state, so later calls like add_request_headers or record_completed simply return without changing anything.
 
-**Call relations**: It is returned by `InferenceTraceContext::start_attempt` when tracing is disabled and is also used directly in tests and some fallback paths.
+**Call relations**: This is used directly by tests and WebSocket paths, and indirectly by InferenceTraceContext::start_attempt when the parent context is disabled.
 
 *Call graph*: called by 4 (stream_responses_websocket, response_stream_records_last_model_feedback_ids, start_attempt, disabled_attempt_adds_no_request_headers).
 
@@ -1497,11 +1513,11 @@ fn disabled() -> Self
 fn inference_call_id(&self) -> Option<&str>
 ```
 
-**Purpose**: Exposes the generated inference call id as an optional string slice. It hides the disabled/enabled state split from callers that only need the id if present.
+**Purpose**: Returns the attempt’s unique tracing ID if this attempt is being traced. Disabled attempts have no ID.
 
-**Data flow**: Matches on `self.state`; returns `None` for `Disabled` and `Some(&str)` borrowed from `attempt.inference_call_id` for `Enabled`. It does not mutate state.
+**Data flow**: It reads the attempt state. For a disabled attempt it returns None. For an enabled attempt it returns the stored inference call ID as text.
 
-**Call relations**: It is used only by `add_request_headers` to decide whether a propagation header should be inserted.
+**Call relations**: InferenceTraceAttempt::add_request_headers calls this before adding the trace ID to outgoing HTTP headers. It keeps the header code from needing to know the internal enabled-or-disabled layout.
 
 *Call graph*: called by 1 (add_request_headers).
 
@@ -1512,11 +1528,11 @@ fn inference_call_id(&self) -> Option<&str>
 fn add_request_headers(&self, headers: &mut HeaderMap)
 ```
 
-**Purpose**: Adds the rollout-trace correlation header to an outgoing provider request when tracing is enabled. It never lets tracing break request construction.
+**Purpose**: Adds a trace ID header to an outgoing provider request when tracing is enabled. This helps connect Codex’s trace record with logs or handling on the provider side.
 
-**Data flow**: Takes a mutable `HeaderMap`, obtains the optional id via `inference_call_id`, converts it to `HeaderValue` with `HeaderValue::from_str`, and if successful inserts it under `INFERENCE_CALL_ID_HEADER`. If tracing is disabled or conversion fails, it returns without modifying headers.
+**Data flow**: It receives a mutable HTTP header map. It asks the attempt for its inference call ID; if there is none, it changes nothing. If there is an ID and it can be safely represented as a header value, it inserts it under the x-codex-inference-call-id header name.
 
-**Call relations**: It is called by transport code before sending the provider request. Its only dependency is `inference_call_id`, which abstracts away disabled attempts.
+**Call relations**: Transport code calls this while preparing a provider request. It relies on inference_call_id, and it is intentionally best-effort: if something unexpected prevents making the header, the provider request is still allowed to continue.
 
 *Call graph*: calls 1 internal fn (inference_call_id); 2 external calls (insert, from_str).
 
@@ -1527,11 +1543,11 @@ fn add_request_headers(&self, headers: &mut HeaderMap)
 fn record_started(&self, request: &impl Serialize)
 ```
 
-**Purpose**: Persists the request payload that replay should treat as the model-visible inference input and emits the corresponding start event. It captures the exact request or a caller-supplied logical equivalent.
+**Purpose**: Records that an inference attempt has begun and saves the request payload that should be replayed or inspected later. This gives the trace a clear “what was sent to the model” starting point.
 
-**Data flow**: If the attempt is disabled, returns. Otherwise writes the serializable request as `RawPayloadKind::InferenceRequest` using `write_json_payload_best_effort`; if that fails, it stops. With a payload ref, it appends `RawTraceEventPayload::InferenceStarted` containing the attempt's `inference_call_id`, thread/turn ids, model, provider name, and `request_payload`.
+**Data flow**: It receives any serializable request object. If the attempt is disabled, nothing happens. If enabled, it writes the request as a raw inference-request payload; if that succeeds, it appends an InferenceStarted event containing the attempt ID, thread ID, turn ID, model, provider, and payload reference.
 
-**Call relations**: It is called by transport code after request construction. It delegates payload persistence to `write_json_payload_best_effort` and final append to `append_with_context_best_effort`.
+**Call relations**: Request-sending code calls this once the model-visible request is known. It uses write_json_payload_best_effort to save the request body and append_with_context_best_effort to add the event to the trace.
 
 *Call graph*: calls 2 internal fn (append_with_context_best_effort, write_json_payload_best_effort).
 
@@ -1548,11 +1564,11 @@ fn record_completed(
     )
 ```
 
-**Purpose**: Records successful provider completion for an inference stream and stores a summarized response payload containing ids, token usage, and completed output items. It is terminal and idempotent via the atomic guard.
+**Purpose**: Records that a provider attempt finished successfully. It saves a compact response summary, including response IDs, optional token usage, and completed output items.
 
-**Data flow**: Accepts `response_id`, optional `upstream_request_id`, optional `TokenUsage`, and a slice of `ResponseItem`. It first calls `take_terminal_attempt`; if another terminal event already won, it returns. Otherwise it serializes the response via `write_response_payload_best_effort`, and if successful appends `RawTraceEventPayload::InferenceCompleted` with the call id, copied `response_id`, mapped `upstream_request_id`, and `response_payload`.
+**Data flow**: It receives the response ID, optional upstream request ID, optional token usage, and output items. It first claims the terminal slot so only one final event can be recorded. Then it writes a response payload summary. If that succeeds, it appends an InferenceCompleted event with the response details and payload reference.
 
-**Call relations**: It is called by `map_response_events` when the provider stream reaches a successful terminal response. It relies on `take_terminal_attempt` to prevent duplicates and on `write_response_payload_best_effort` to encode the response summary.
+**Call relations**: map_response_events calls this when the response stream reaches a successful end. It depends on take_terminal_attempt to prevent duplicate endings, write_response_payload_best_effort to save the response summary, and append_with_context_best_effort to write the trace event.
 
 *Call graph*: calls 3 internal fn (take_terminal_attempt, append_with_context_best_effort, write_response_payload_best_effort); called by 1 (map_response_events).
 
@@ -1568,11 +1584,11 @@ fn record_failed(
     )
 ```
 
-**Purpose**: Records a failed inference attempt, including any complete output items observed before the failure. It covers both pre-response failures and mid-stream failures.
+**Purpose**: Records that an inference attempt failed before completion. If some complete output items were already seen, it also saves them as partial evidence.
 
-**Data flow**: Takes a displayable error, optional `upstream_request_id`, and observed `output_items`. It acquires terminal ownership via `take_terminal_attempt`; if none, returns. If `output_items` is non-empty, it serializes them as a partial response payload with no `response_id` or token usage; otherwise `partial_response_payload` is `None`. It then appends `RawTraceEventPayload::InferenceFailed` with the call id, optional upstream request id, `error.to_string()`, and the optional partial payload.
+**Data flow**: It receives an error, an optional upstream request ID, and any completed output items observed before failure. It claims the terminal slot; if another final event was already recorded, it stops. If there are output items, it writes a partial response payload. Then it appends an InferenceFailed event with the attempt ID, request ID, error text, and optional partial payload reference.
 
-**Call relations**: It is invoked by `map_response_events` on provider failure paths. It shares the same terminal guard and response-payload helper as the completion and cancellation paths.
+**Call relations**: map_response_events calls this when the provider request or stream ends in an error. It shares the same terminal guard and response-payload helper as completed and cancelled recording.
 
 *Call graph*: calls 3 internal fn (take_terminal_attempt, append_with_context_best_effort, write_response_payload_best_effort); called by 1 (map_response_events); 2 external calls (to_string, is_empty).
 
@@ -1588,11 +1604,11 @@ fn record_cancelled(
     )
 ```
 
-**Purpose**: Records that Codex intentionally stopped consuming a provider stream, such as interruption or mailbox preemption, while preserving any complete output items already seen. It is distinct from provider failure.
+**Purpose**: Records that Codex intentionally stopped consuming a provider stream. This can happen when the turn is interrupted or another message takes priority.
 
-**Data flow**: Accepts a displayable cancellation reason, optional `upstream_request_id`, and observed `output_items`. After `take_terminal_attempt`, it conditionally serializes non-empty output items into a partial response payload and appends `RawTraceEventPayload::InferenceCancelled` with the call id, optional upstream request id, `reason.to_string()`, and the optional partial payload.
+**Data flow**: It receives a cancellation reason, an optional upstream request ID, and any output items already completed. It claims the terminal slot. If there are partial output items, it writes them as a response payload. Then it appends an InferenceCancelled event with the reason and any partial evidence.
 
-**Call relations**: It is called by `map_response_events` when the client intentionally abandons a stream. Like the other terminal methods, it depends on `take_terminal_attempt` to ensure only one terminal event is emitted.
+**Call relations**: map_response_events calls this when the stream is stopped on purpose rather than succeeding or failing. Like record_failed and record_completed, it uses take_terminal_attempt so an attempt has only one final lifecycle event.
 
 *Call graph*: calls 3 internal fn (take_terminal_attempt, append_with_context_best_effort, write_response_payload_best_effort); called by 1 (map_response_events); 2 external calls (to_string, is_empty).
 
@@ -1603,11 +1619,11 @@ fn record_cancelled(
 fn take_terminal_attempt(&self) -> Option<&EnabledInferenceTraceAttempt>
 ```
 
-**Purpose**: Implements the single-terminal-event invariant for an inference attempt. It atomically marks the attempt as terminal the first time it is called and rejects all later terminal recordings.
+**Purpose**: Allows exactly one final event to be recorded for an enabled attempt. This prevents confusing traces where the same attempt appears to both fail and complete, for example.
 
-**Data flow**: Matches on `self.state`; disabled returns `None`. For enabled attempts it calls `attempt.terminal_recorded.swap(true, Ordering::AcqRel)`: if the previous value was already `true`, it returns `None`; otherwise it returns `Some(&EnabledInferenceTraceAttempt)`.
+**Data flow**: It reads the attempt state. Disabled attempts return None. Enabled attempts use an atomic boolean, which is a thread-safe true-or-false flag, to switch terminal_recorded from false to true. If it was already true, it returns None; otherwise it returns the enabled attempt data.
 
-**Call relations**: It is the gatekeeper used by `record_completed`, `record_failed`, and `record_cancelled`, preventing duplicate terminal events from retries in stream-mapping logic.
+**Call relations**: record_completed, record_failed, and record_cancelled all call this before writing their final event. It is the shared gatekeeper for the attempt’s ending.
 
 *Call graph*: called by 3 (record_cancelled, record_completed, record_failed).
 
@@ -1618,11 +1634,11 @@ fn take_terminal_attempt(&self) -> Option<&EnabledInferenceTraceAttempt>
 fn trace_response_item_json(item: &ResponseItem) -> JsonValue
 ```
 
-**Purpose**: Serializes a `ResponseItem` for trace evidence rather than future request construction, restoring reasoning content omitted by the normal protocol serializer. This preserves what Codex actually received from the provider.
+**Purpose**: Converts a model response item into JSON for trace evidence, while preserving reasoning content that normal serialization may leave out. This helps the trace reflect what Codex actually received, not only what would be sent back to a model later.
 
-**Data flow**: Starts with `serde_json::to_value(item)`, falling back to a JSON object containing `serialization_error` if serialization fails. If the item is `ResponseItem::Reasoning { content: Some(content), .. }` and the serialized value is an object, it inserts a `content` field serialized from the original reasoning content, again falling back to a `serialization_error` object on failure. Returns the resulting `JsonValue`.
+**Data flow**: It receives one ResponseItem. It first serializes the item to JSON. If serialization fails, it creates a JSON object describing the serialization error. For reasoning items with readable content, it inserts that content into the JSON object. It returns the final JSON value.
 
-**Call relations**: It is used by compaction and inference response-payload builders, and is directly exercised by the reasoning-content preservation test.
+**Call relations**: write_response_payload_best_effort uses this for every output item in a response summary. A test calls it directly to prove that reasoning content omitted by the normal serializer is restored for traces.
 
 *Call graph*: called by 1 (traced_response_item_preserves_reasoning_content_omitted_by_normal_serializer); 1 external calls (to_value).
 
@@ -1633,11 +1649,11 @@ fn trace_response_item_json(item: &ResponseItem) -> JsonValue
 fn next_inference_call_id() -> InferenceCallId
 ```
 
-**Purpose**: Generates a fresh inference call id for one upstream request attempt. The id is a UUID string suitable for propagation in request headers and trace events.
+**Purpose**: Creates a fresh unique ID for one inference attempt. This ID ties together trace events and can be propagated in request headers.
 
-**Data flow**: Calls `Uuid::new_v4().to_string()` and returns the resulting `InferenceCallId`. It has no other side effects.
+**Data flow**: No input is needed. It generates a new version-4 UUID, which is a random unique identifier, converts it to text, and returns it as an InferenceCallId.
 
-**Call relations**: It is called only by `InferenceTraceContext::start_attempt` when constructing an enabled attempt.
+**Call relations**: InferenceTraceContext::start_attempt calls this whenever an enabled context begins a new provider request attempt.
 
 *Call graph*: called by 1 (start_attempt); 1 external calls (new_v4).
 
@@ -1652,11 +1668,11 @@ fn write_json_payload_best_effort(
 ) -> Option<crate::RawPayloadRef>
 ```
 
-**Purpose**: Writes a serializable payload to the trace store and silently drops errors. It is the common helper for request and response payload persistence in inference tracing.
+**Purpose**: Writes a JSON payload to the trace store, but treats failure as non-fatal. Tracing should never be the reason a model request fails.
 
-**Data flow**: Calls `writer.write_json_payload(kind, payload).ok()` and returns an optional payload reference. It performs no logging or mutation beyond the writer call.
+**Data flow**: It receives a TraceWriter, a payload kind, and a serializable payload. It asks the writer to store the payload as JSON. If writing succeeds, it returns a payload reference; if writing fails, it returns None.
 
-**Call relations**: It is used directly by `record_started` and indirectly by all terminal methods through `write_response_payload_best_effort`.
+**Call relations**: record_started uses this to save request payloads. write_response_payload_best_effort also uses it after building a response summary.
 
 *Call graph*: calls 1 internal fn (write_json_payload); called by 2 (record_started, write_response_payload_best_effort).
 
@@ -1672,11 +1688,11 @@ fn write_response_payload_best_effort(
     outpu
 ```
 
-**Purpose**: Builds and persists the summarized response payload used by completed, failed, and cancelled inference terminal events. It centralizes the trace-specific response serialization rules.
+**Purpose**: Builds and writes the trace’s summary of an inference response. It records stable response identity, provider request identity, token usage when known, and completed output items.
 
-**Data flow**: Accepts the enabled attempt plus optional `response_id`, optional `upstream_request_id`, optional `TokenUsage`, and `output_items`. It maps each `ResponseItem` through `trace_response_item_json`, collects them into `TracedResponseStreamOutput`, and writes that struct as `RawPayloadKind::InferenceResponse` via `write_json_payload_best_effort`. Returns an optional payload ref.
+**Data flow**: It receives an enabled attempt, optional response ID, optional upstream request ID, optional token usage, and response items. It converts each response item into trace-friendly JSON, wraps everything in a TracedResponseStreamOutput object, and writes that object as an inference-response payload. It returns a payload reference if writing succeeds, or None if it does not.
 
-**Call relations**: It is called by `record_completed`, `record_failed`, and `record_cancelled` so all terminal inference events share one response-summary format.
+**Call relations**: record_completed calls this for full successful responses. record_failed and record_cancelled call it only when there are partial output items worth saving.
 
 *Call graph*: calls 1 internal fn (write_json_payload_best_effort); called by 3 (record_cancelled, record_completed, record_failed); 1 external calls (iter).
 
@@ -1690,11 +1706,11 @@ fn append_with_context_best_effort(
 )
 ```
 
-**Purpose**: Appends an inference-related raw event with the thread and turn ids from the enabled context. It intentionally ignores append errors to keep tracing non-intrusive.
+**Purpose**: Appends a trace event with the thread and turn already filled in, while ignoring write failures. It keeps trace-writing errors from disrupting model traffic.
 
-**Data flow**: Constructs `RawTraceEventContext` from `context.thread_id` and `context.codex_turn_id`, then calls `context.writer.append_with_context(event_context, payload)` and discards the result. Returns unit.
+**Data flow**: It receives the enabled tracing context and an event payload. It builds a RawTraceEventContext containing the thread ID and Codex turn ID, then asks the writer to append the event. The append result is discarded, so no error is returned.
 
-**Call relations**: It is the final append sink for `record_started`, `record_completed`, `record_failed`, and `record_cancelled`.
+**Call relations**: record_started, record_completed, record_failed, and record_cancelled all use this as their final step after preparing the event they want to add to the trace.
 
 *Call graph*: called by 4 (record_cancelled, record_completed, record_failed, record_started).
 
@@ -1705,11 +1721,11 @@ fn append_with_context_best_effort(
 fn disabled_attempt_adds_no_request_headers()
 ```
 
-**Purpose**: Verifies that a disabled inference attempt leaves an outgoing header map untouched. This protects the no-op contract for disabled tracing.
+**Purpose**: Checks that a disabled attempt does not modify outgoing request headers. This confirms that the no-op tracing path is safe and quiet.
 
-**Data flow**: Creates an empty `HeaderMap`, calls `InferenceTraceAttempt::disabled().add_request_headers(&mut headers)`, and asserts the map remains empty.
+**Data flow**: It creates an empty header map and a disabled attempt. It asks the attempt to add request headers, then verifies the header map is still empty.
 
-**Call relations**: This test exercises the disabled branch of `add_request_headers` and indirectly the disabled attempt constructor.
+**Call relations**: This test exercises InferenceTraceAttempt::disabled and InferenceTraceAttempt::add_request_headers from the disabled path.
 
 *Call graph*: calls 1 internal fn (disabled); 2 external calls (new, assert!).
 
@@ -1720,11 +1736,11 @@ fn disabled_attempt_adds_no_request_headers()
 fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()>
 ```
 
-**Purpose**: Checks that an enabled attempt injects the `x-codex-inference-call-id` header and that the value matches the attempt's generated UUID. It validates both propagation and id format.
+**Purpose**: Checks that an enabled attempt adds a valid inference call ID header. This proves trace IDs can travel with provider requests.
 
-**Data flow**: Creates a temporary trace writer and enabled context, starts an attempt, mutates a fresh `HeaderMap` via `add_request_headers`, then reads the inserted header, compares it to `attempt.inference_call_id()`, and parses it as a UUID.
+**Data flow**: It creates a temporary trace writer, builds an enabled context, starts an attempt, and passes an empty header map to add_request_headers. It then checks that the expected header exists, matches the attempt’s own ID, and parses as a UUID.
 
-**Call relations**: This test covers the normal enabled path from `InferenceTraceContext::enabled` through `start_attempt` into `add_request_headers`.
+**Call relations**: This test covers the enabled context setup, attempt creation, and header propagation flow through InferenceTraceContext::enabled, InferenceTraceContext::start_attempt, and InferenceTraceAttempt::add_request_headers.
 
 *Call graph*: calls 2 internal fn (enabled, create); 5 external calls (new, new, new, assert!, assert_eq!).
 
@@ -1735,11 +1751,11 @@ fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()>
 fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()>
 ```
 
-**Purpose**: Ensures an enabled context writes enough raw events and payloads for replay to reconstruct a completed inference call. It validates end-to-end integration with the reducer-facing replay bundle.
+**Purpose**: Checks that an enabled tracing context records a complete inference attempt that can later be read back for replay or inspection.
 
-**Data flow**: Creates a temporary trace writer, appends prerequisite `ThreadStarted` and `CodexTurnStarted` events, builds an enabled context, starts an attempt, records a JSON request and a completed response, then loads the trace with `replay_bundle` and asserts the reconstructed inference call's ids, status, upstream request id, and payload counts.
+**Data flow**: It creates a temporary trace, writes prerequisite thread and turn events, creates an enabled inference context, starts an attempt, records a request, and records a successful completion. Then it loads the replay bundle and verifies that one inference call exists with the expected thread, turn, completed status, upstream request ID, and raw payload count.
 
-**Call relations**: This test exercises the main happy path across `enabled`, `start_attempt`, `record_started`, and `record_completed`, then verifies the downstream replay consumer sees the expected reduced state.
+**Call relations**: This test follows the main happy path through InferenceTraceContext::enabled, record_started, record_completed, TraceWriter storage, and replay_bundle reading.
 
 *Call graph*: calls 2 internal fn (enabled, create); 5 external calls (new, new, assert_eq!, replay_bundle, json!).
 
@@ -1750,24 +1766,26 @@ fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()>
 fn traced_response_item_preserves_reasoning_content_omitted_by_normal_serializer()
 ```
 
-**Purpose**: Confirms that trace serialization restores reasoning `content` omitted by the standard `ResponseItem` serializer. It protects the module's key evidence-preservation behavior.
+**Purpose**: Checks that trace serialization keeps readable reasoning content that the normal protocol serializer omits. This protects important evidence in rollout traces.
 
-**Data flow**: Builds a `ResponseItem::Reasoning` with summary, content, and encrypted content; serializes it normally and via `trace_response_item_json`; then asserts the normal JSON lacks `content` while the traced JSON includes it with the expected shape.
+**Data flow**: It builds a reasoning response item containing a summary, raw reasoning content, and encrypted content. It serializes the item normally and also through trace_response_item_json. It verifies the normal JSON lacks the content field while the traced JSON includes it.
 
-**Call relations**: This test directly targets `trace_response_item_json`, documenting why the helper exists and what extra data it preserves.
+**Call relations**: This test directly guards the special behavior in trace_response_item_json, which is later used when response payloads are written for completed, failed, or cancelled attempts.
 
 *Call graph*: calls 1 internal fn (trace_response_item_json); 3 external calls (assert_eq!, to_value, vec!).
 
 
 ### `rollout-trace/src/tool_dispatch.rs`
 
-`domain_logic` · `tool dispatch and tool result conversion on the request handling hot path`
+`io_transport` · `tool dispatch tracing during request handling`
 
-This file centers on `ToolDispatchTraceContext`, which is either disabled or enabled with an `Arc<TraceWriter>`, `thread_id`, `codex_turn_id`, and `tool_call_id`. Core code passes a `ToolDispatchInvocation` describing the resolved tool call: tool name and optional namespace, requester (`Model` with `model_visible_call_id` or `CodeCell` with runtime ids), and one of several payload variants (`Function`, `ToolSearch`, `Custom`, `LocalShell`). The trace layer then converts that invocation into a canonical `ToolCallStarted` event plus a later `ToolCallEnded` event.
+When Codex decides to use a tool, that moment is an important boundary. This file turns that boundary into trace events: one event when the tool call starts, and one when it finishes or fails. Think of it like a shipping label and delivery receipt for each tool call. The label says what was sent, where it came from, and what kind of package it is; the receipt says whether it arrived and what came back.
 
-A key design choice is suppression of noncanonical boundaries: a `Custom` payload for the public code-mode tool with no namespace is intentionally not traced at this layer, because more specific code-mode tracing already represents that work. For traced calls, `record_started` computes a `ToolCallKind`, a human-readable label, and a truncated input preview, writes a JSON payload file for the full invocation, derives requester fields, and appends a contextual raw event. Completion paths serialize either a direct `ResponseInputItem`, a code-mode JSON value, or an error string into a result payload file and append `ToolCallEnded` with an `ExecutionStatus`.
+The main handle is ToolDispatchTraceContext. It can be enabled, meaning it has a TraceWriter and enough IDs to attach events to the right thread and turn, or disabled, meaning all later trace calls quietly do nothing. This lets the rest of the system call tracing code without constantly checking whether tracing is active.
 
-All writes are best-effort: payload or append failures only emit warnings. The helper methods keep hot-path overhead low by avoiding unnecessary formatting and by truncating previews to 160 characters.
+The file also defines the small data shapes used at this boundary: ToolDispatchInvocation for the incoming tool request, ToolDispatchPayload for the different kinds of tool input, and ToolDispatchResult for the result returned to the caller. It converts these into raw trace payloads, writes larger JSON payloads separately, and appends compact trace events that point to them.
+
+A key behavior is “best effort” writing. If trace payload writing or event appending fails, the code logs a warning but does not break the actual tool call. It also suppresses one known non-canonical code-mode boundary to avoid double-counting the same tool work.
 
 #### Function details
 
@@ -1777,11 +1795,11 @@ All writes are best-effort: payload or append failures only emit warnings. The h
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs a disabled dispatch trace handle that accepts lifecycle calls but records nothing. It is the inert fallback for disabled tracing or suppressed dispatch boundaries.
+**Purpose**: Creates a trace context that accepts trace calls but records nothing. This is used when tracing is turned off or when this particular tool boundary should not be recorded.
 
-**Data flow**: Takes no arguments and returns `ToolDispatchTraceContext { state: ToolDispatchTraceContextState::Disabled }`. It performs no I/O and mutates no shared state.
+**Data flow**: No input is needed. It builds a ToolDispatchTraceContext whose internal state is Disabled. The result is a harmless handle that later completion or failure calls can use without causing any trace output.
 
-**Call relations**: Returned by `ThreadTraceContext::start_tool_dispatch_trace` when thread tracing is disabled or the invocation closure yields `None`, and by `ToolDispatchTraceContext::start` when suppression rules exclude the boundary.
+**Call relations**: The wider trace setup calls this through start_tool_dispatch_trace when it needs a no-op trace handle. ToolDispatchTraceContext::start also returns this kind of handle when suppresses_tool_dispatch_trace says this dispatch should be skipped.
 
 *Call graph*: called by 1 (start_tool_dispatch_trace).
 
@@ -1792,11 +1810,11 @@ fn disabled() -> Self
 fn is_enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether this dispatch context will record result conversion work. Callers use it to avoid formatting or cloning outputs unnecessarily.
+**Purpose**: Tells callers whether this context will actually record a result. Callers can use this to avoid doing extra work, such as formatting or cloning large tool outputs, when no trace will be written.
 
-**Data flow**: Reads `self.state` and returns `true` only for `Enabled(_)`. It has no side effects.
+**Data flow**: It reads the context’s internal state. If the state is Enabled, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Queried by higher-level tool result code before constructing expensive trace result payloads; the method itself does not delegate further.
+**Call relations**: The higher-level record_completed flow checks this before preparing caller-side result data. Internally it simply tests the context state.
 
 *Call graph*: called by 1 (record_completed); 1 external calls (matches!).
 
@@ -1807,11 +1825,11 @@ fn is_enabled(&self) -> bool
 fn start(writer: Arc<TraceWriter>, invocation: ToolDispatchInvocation) -> Self
 ```
 
-**Purpose**: Starts one dispatch-level tool lifecycle, applying suppression rules before recording the canonical start event. It returns the handle that later records completion or failure.
+**Purpose**: Starts tracing for one resolved tool call. It records the “tool call started” event and returns a context that can later record the matching completion or failure.
 
-**Data flow**: Accepts an `Arc<TraceWriter>` and owned `ToolDispatchInvocation`. It first checks `suppresses_tool_dispatch_trace(&invocation)`; if true, it returns `disabled()`. Otherwise it builds `EnabledToolDispatchTraceContext` from the invocation's thread, turn, and tool-call ids, calls `record_started(&context, invocation)`, and returns `ToolDispatchTraceContext::Enabled(context)`.
+**Data flow**: It receives a shared TraceWriter and a ToolDispatchInvocation containing the tool IDs, name, requester, and input. First it checks whether this dispatch should be suppressed. If so, it returns a disabled context. Otherwise it stores the writer and IDs in an enabled context, writes the start event, and returns that enabled context.
 
-**Call relations**: Called from `ThreadTraceContext::start_tool_dispatch_trace` after lazy invocation construction. It delegates suppression policy to `suppresses_tool_dispatch_trace` and event emission to `record_started`.
+**Call relations**: The broader start_tool_dispatch_trace entry point calls this when tool routing has decided what will run. This function asks suppresses_tool_dispatch_trace whether to skip the trace, calls record_started to write the opening event, and then hands the returned context back to the caller for later completion.
 
 *Call graph*: calls 2 internal fn (record_started, suppresses_tool_dispatch_trace); called by 1 (start_tool_dispatch_trace); 2 external calls (disabled, Enabled).
 
@@ -1822,11 +1840,11 @@ fn start(writer: Arc<TraceWriter>, invocation: ToolDispatchInvocation) -> Self
 fn record_completed(&self, status: ExecutionStatus, result: ToolDispatchResult)
 ```
 
-**Purpose**: Records a successful or otherwise normal dispatch result, including the caller-facing result payload. It supports both direct protocol responses and code-mode JSON responses.
+**Purpose**: Records that a traced tool call finished with a normal result, whether successful or failed according to the supplied status. It captures the result in the trace format expected by the rest of the tracing system.
 
-**Data flow**: Takes an `ExecutionStatus` and owned `ToolDispatchResult`. If enabled, it matches the result into a borrowed `DispatchedToolTraceResponse` variant and passes that plus the status to `append_tool_call_ended`. Disabled contexts return immediately.
+**Data flow**: It reads the context state, the execution status, and the tool result. If the context is disabled, it returns immediately. If enabled, it converts the public result shape into the raw response shape and passes it along to be written as the end event.
 
-**Call relations**: Invoked after a traced tool dispatch finishes and the caller-facing result has been converted. It delegates payload-file creation and event append to `append_tool_call_ended`.
+**Call relations**: The higher-level record_completed flow calls this after a tool has produced a caller-facing result. This function delegates the actual payload writing and event append to append_tool_call_ended.
 
 *Call graph*: calls 1 internal fn (append_tool_call_ended); called by 1 (record_completed).
 
@@ -1837,11 +1855,11 @@ fn record_completed(&self, status: ExecutionStatus, result: ToolDispatchResult)
 fn record_failed(&self, error: impl Display)
 ```
 
-**Purpose**: Records a dispatch failure that did not produce a normal result payload. It wraps the error text into the trace response schema and marks the execution as failed.
+**Purpose**: Records that a tool dispatch failed before it could produce a normal result payload. This keeps failures visible in traces even when there is no ordinary tool response to store.
 
-**Data flow**: Accepts any `Display` error. If enabled, it converts the error to `String`, constructs `DispatchedToolTraceResponse::Error { error }`, and calls `append_tool_call_ended` with `ExecutionStatus::Failed`. Disabled contexts do nothing.
+**Data flow**: It receives an error value that can be displayed as text. If tracing is disabled, it does nothing. If enabled, it turns the error into a string, marks the status as Failed, wraps the error in a trace response, and records the end event.
 
-**Call relations**: Used on error paths before a normal tool result exists. It shares the same terminal append helper as `record_completed`.
+**Call relations**: The higher-level record_failed flow calls this when dispatch itself breaks. Like record_completed, it hands the final writing work to append_tool_call_ended.
 
 *Call graph*: calls 1 internal fn (append_tool_call_ended); called by 1 (record_failed); 1 external calls (to_string).
 
@@ -1852,11 +1870,11 @@ fn record_failed(&self, error: impl Display)
 fn suppresses_tool_dispatch_trace(invocation: &ToolDispatchInvocation) -> bool
 ```
 
-**Purpose**: Implements the policy for skipping noncanonical dispatch traces that would duplicate more specific code-mode tracing. The current rule suppresses the public code-mode tool when invoked as an unnamespaced custom payload.
+**Purpose**: Decides whether a specific tool dispatch should be left out of this trace layer. It prevents recording a known non-canonical code-mode boundary so the trace does not show duplicate or misleading tool calls.
 
-**Data flow**: Reads a borrowed `ToolDispatchInvocation` and returns `true` only when `payload` matches `ToolDispatchPayload::Custom { .. }`, `tool_namespace` is `None`, and `tool_name` equals `codex_code_mode::PUBLIC_TOOL_NAME`.
+**Data flow**: It examines the invocation’s payload type, namespace, and tool name. It returns true only for a custom payload with no namespace whose tool name matches the public code-mode tool name. All other invocations return false.
 
-**Call relations**: Called only by `ToolDispatchTraceContext::start` before any event is emitted. It acts as the gatekeeper for whether a dispatch lifecycle should exist at all.
+**Call relations**: ToolDispatchTraceContext::start calls this before writing anything. If it returns true, start returns a disabled context instead of calling record_started.
 
 *Call graph*: called by 1 (start); 1 external calls (matches!).
 
@@ -1867,11 +1885,11 @@ fn suppresses_tool_dispatch_trace(invocation: &ToolDispatchInvocation) -> bool
 fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDispatchInvocation)
 ```
 
-**Purpose**: Builds and appends the canonical `ToolCallStarted` raw event for a dispatch-level tool invocation. It computes classification, summary text, requester metadata, and an optional invocation payload file.
+**Purpose**: Writes the trace event that marks the beginning of a tool call. It prepares a readable summary, stores the full input payload, and attaches requester and identity information.
 
-**Data flow**: Consumes an enabled context and owned `ToolDispatchInvocation`. It extracts `tool_name` and `tool_namespace`, computes `kind` via `dispatched_tool_kind`, `label` via `dispatched_tool_label`, and `input_preview` via `invocation.payload.log_payload_preview()`. It converts the payload into JSON with `into_json_payload`, wraps it in `DispatchedToolTraceRequest`, writes that as `RawPayloadKind::ToolInvocation`, derives requester fields with `requester_fields`, and appends `RawTraceEventPayload::ToolCallStarted` with summary and optional payload reference.
+**Data flow**: It receives an enabled context and the invocation. It takes the tool name, namespace, requester, and payload from the invocation; classifies the tool kind; builds a label and short input preview; converts the full input into JSON; writes that JSON as a separate payload; converts requester details into trace fields; then appends a ToolCallStarted event. The trace writer is changed by adding the payload and event when those writes succeed.
 
-**Call relations**: Called only from `ToolDispatchTraceContext::start`. It orchestrates the helper functions that classify the tool, normalize requester metadata, and persist the invocation body.
+**Call relations**: ToolDispatchTraceContext::start calls this after it has built an enabled context. This function coordinates several helpers: dispatched_tool_kind, dispatched_tool_label, requester_fields, write_json_payload_best_effort, and append_with_context_best_effort.
 
 *Call graph*: calls 5 internal fn (append_with_context_best_effort, dispatched_tool_kind, dispatched_tool_label, requester_fields, write_json_payload_best_effort); called by 1 (start).
 
@@ -1888,11 +1906,11 @@ fn requester_fields(
 )
 ```
 
-**Purpose**: Normalizes the requester enum into the three fields expected by the raw event schema: optional model-visible call id, optional code-mode runtime tool id, and a `RawToolCallRequester` discriminator. It bridges core-facing requester data to trace-facing schema fields.
+**Purpose**: Turns the high-level description of who requested the tool into the exact fields stored in a raw trace event. It separates model-requested calls from code-cell-requested calls.
 
-**Data flow**: Consumes a `ToolDispatchRequester`. For `Model`, it returns `(Some(model_visible_call_id), None, RawToolCallRequester::Model)`. For `CodeCell`, it returns `(None, Some(runtime_tool_call_id), RawToolCallRequester::CodeCell { runtime_cell_id })`.
+**Data flow**: It receives a ToolDispatchRequester. For a model request, it outputs the model-visible call ID, no runtime tool ID, and a raw requester value saying Model. For a code-cell request, it outputs no model-visible call ID, the runtime tool call ID, and a raw requester value containing the runtime cell ID.
 
-**Call relations**: Used by `record_started` while constructing `ToolCallStarted`. It isolates the schema mapping so the start-recording logic stays linear.
+**Call relations**: record_started calls this while building the ToolCallStarted event. The returned fields are placed directly into that event so later trace readers can tell who caused the tool dispatch.
 
 *Call graph*: called by 1 (record_started).
 
@@ -1903,11 +1921,11 @@ fn requester_fields(
 fn dispatched_tool_kind(tool_name: &str, _payload: &ToolDispatchPayload) -> ToolCallKind
 ```
 
-**Purpose**: Maps a tool name to the normalized `ToolCallKind` used in trace summaries and reducers. It groups multiple synonymous tool names into shared semantic categories.
+**Purpose**: Classifies a tool name into a standard trace category, such as shell command, web search, image generation, or agent control. This makes traces easier to group and read than using raw tool names alone.
 
-**Data flow**: Reads `tool_name` and ignores the payload parameter. It matches known names like `exec_command`, `write_stdin`, `apply_patch`, `web_search`, `spawn_agent`, `interrupt_agent`, etc., returning the corresponding `ToolCallKind`; unknown names become `ToolCallKind::Other { name: other.to_string() }`.
+**Data flow**: It receives the tool name and the payload. It matches known names to standard ToolCallKind values. If the name is not recognized, it returns an Other category that still preserves the original name.
 
-**Call relations**: Called by `record_started` to classify the dispatch. The mapping is intentionally centralized here so tests can validate category behavior such as `interrupt_agent` mapping to `CloseAgent`.
+**Call relations**: record_started calls this before writing the start event. The kind it returns becomes part of the tool call summary in the trace.
 
 *Call graph*: called by 1 (record_started).
 
@@ -1922,11 +1940,11 @@ fn dispatched_tool_label(
 ) -> String
 ```
 
-**Purpose**: Builds the human-readable label shown in generic tool summaries. Namespaced tools are rendered as `namespace.tool_name`; otherwise the bare tool name is used.
+**Purpose**: Builds the human-readable label shown for a dispatched tool. If the tool belongs to a namespace, the label includes both namespace and tool name.
 
-**Data flow**: Reads `tool_name` and optional `tool_namespace`. It returns `format!("{namespace}.{tool_name}")` when a namespace exists, else `tool_name.to_string()`.
+**Data flow**: It receives the tool name, an optional namespace, and the payload. If a namespace is present, it returns a string like namespace.tool_name. If not, it returns just the tool name.
 
-**Call relations**: Used by `record_started` when constructing `ToolCallSummary::Generic`. It complements `dispatched_tool_kind` by producing display text rather than semantic classification.
+**Call relations**: record_started calls this when preparing the ToolCallStarted summary. The label is stored in the trace so readers can quickly recognize what ran.
 
 *Call graph*: called by 1 (record_started); 1 external calls (format!).
 
@@ -1937,11 +1955,11 @@ fn dispatched_tool_label(
 fn log_payload_preview(&self) -> String
 ```
 
-**Purpose**: Extracts a concise preview string from a tool invocation payload for inclusion in the start-event summary. It chooses the most user-meaningful text field for each payload variant.
+**Purpose**: Creates a short, safe preview of the tool input for the trace summary. This gives readers a quick glance at what was requested without putting the full payload into the event summary.
 
-**Data flow**: Borrows `self` and matches variants: `Function.arguments`, `ToolSearch.arguments.query`, `Custom.input`, or joined `LocalShell.command`. It passes the selected string to `truncate_preview` and returns the truncated preview.
+**Data flow**: It reads the payload variant. For function calls it previews the argument string; for search it previews the query; for custom input it previews the input text; for local shell it joins the command words into one command line. It passes that text to truncate_preview and returns the shortened string.
 
-**Call relations**: Called by `record_started` before the full payload is serialized. It provides lightweight summary text while the full invocation body goes into a payload file.
+**Call relations**: record_started uses this while building the input_preview for the ToolCallStarted summary. It relies on truncate_preview to enforce the length limit.
 
 *Call graph*: calls 1 internal fn (truncate_preview).
 
@@ -1952,11 +1970,11 @@ fn log_payload_preview(&self) -> String
 fn into_json_payload(self) -> JsonValue
 ```
 
-**Purpose**: Converts an owned dispatch payload into the JSON shape persisted in the raw payload file. Each variant is tagged with a `type` field and includes its variant-specific fields.
+**Purpose**: Converts the tool input into a structured JSON value that can be stored as the full invocation payload. This preserves the details needed for later debugging or replay-style inspection.
 
-**Data flow**: Consumes `self` and returns a `serde_json::Value`. `Function` becomes `{type:"function", arguments}`, `ToolSearch` becomes `{type:"tool_search", arguments}`, `Custom` becomes `{type:"custom", input}`, and `LocalShell` becomes a JSON object containing command, workdir, timeout, sandbox permissions, prefix rule, additional permissions, and justification.
+**Data flow**: It consumes the ToolDispatchPayload. Depending on the variant, it builds a JSON object with a type field and the relevant input fields, such as function arguments, search parameters, custom input, or local shell command settings. The output is a serde_json value ready to be written by the trace writer.
 
-**Call relations**: Used by `record_started` to build the `DispatchedToolTraceRequest` written as `RawPayloadKind::ToolInvocation`.
+**Call relations**: record_started calls this before writing the invocation payload. The resulting JSON is then passed to write_json_payload_best_effort.
 
 *Call graph*: 1 external calls (json!).
 
@@ -1967,11 +1985,11 @@ fn into_json_payload(self) -> JsonValue
 fn truncate_preview(value: &str) -> String
 ```
 
-**Purpose**: Limits preview strings to 160 Unicode scalar values and appends `...` when truncation occurs. This keeps summary fields bounded without corrupting UTF-8.
+**Purpose**: Shortens long text to a fixed preview length. This keeps trace summaries readable while still showing the beginning of the input.
 
-**Data flow**: Accepts `&str`, iterates over `.chars()`, collects up to `MAX_PREVIEW_CHARS` into a `String`, checks whether more characters remain, and conditionally appends `...`. It returns the resulting preview string.
+**Data flow**: It receives a string slice. It takes at most 160 characters, preserving character boundaries, and adds “...” if there was more text after that. It returns the preview string.
 
-**Call relations**: Called only by `ToolDispatchPayload::log_payload_preview` as the shared truncation primitive for all payload variants.
+**Call relations**: ToolDispatchPayload::log_payload_preview calls this for every kind of previewable input. It is a small helper used before the start event summary is written.
 
 *Call graph*: called by 1 (log_payload_preview).
 
@@ -1986,11 +2004,11 @@ fn append_tool_call_ended(
 )
 ```
 
-**Purpose**: Writes the result payload file for a completed or failed dispatch and appends the canonical `ToolCallEnded` raw event. It is the shared terminal-event helper for both success and failure paths.
+**Purpose**: Writes the trace event that marks the end of a tool call. It stores the result payload and appends a ToolCallEnded event with the final status.
 
-**Data flow**: Takes an enabled context, an `ExecutionStatus`, and a borrowed `DispatchedToolTraceResponse`. It writes the response JSON as `RawPayloadKind::ToolResult`, obtaining an optional `RawPayloadRef`, then appends `RawTraceEventPayload::ToolCallEnded { tool_call_id, status, result_payload }` with thread/turn context.
+**Data flow**: It receives the enabled context, an execution status, and a response shape. It writes the response as a JSON payload, getting back an optional reference to that payload. Then it appends a ToolCallEnded event containing the tool call ID, status, and payload reference. The trace writer gains the result payload and event if writing succeeds.
 
-**Call relations**: Called by both `ToolDispatchTraceContext::record_completed` and `ToolDispatchTraceContext::record_failed`. It delegates payload persistence and contextual append to the file-local best-effort helpers.
+**Call relations**: ToolDispatchTraceContext::record_completed and ToolDispatchTraceContext::record_failed both call this. It uses write_json_payload_best_effort for the result body and append_with_context_best_effort for the final event.
 
 *Call graph*: calls 2 internal fn (append_with_context_best_effort, write_json_payload_best_effort); called by 2 (record_completed, record_failed).
 
@@ -2005,11 +2023,11 @@ fn write_json_payload_best_effort(
 ) -> Option<RawPayloadRef>
 ```
 
-**Purpose**: Persists a JSON payload through `TraceWriter` and converts write failures into warnings plus `None`. It is the file-local payload helper for dispatch tracing.
+**Purpose**: Tries to write a JSON payload to the trace store without risking the main program flow. If writing fails, it logs a warning and lets execution continue.
 
-**Data flow**: Accepts a `&TraceWriter`, `RawPayloadKind`, and serializable payload reference. It calls `writer.write_json_payload(kind, payload)` and returns `Some(RawPayloadRef)` on success or logs a warning and returns `None` on error.
+**Data flow**: It receives a TraceWriter, a payload kind, and something serializable as JSON. It asks the writer to store the payload. On success, it returns a reference to the stored payload. On failure, it logs the error and returns None.
 
-**Call relations**: Used by both `record_started` and `append_tool_call_ended` so dispatch tracing can remain best-effort and non-fatal.
+**Call relations**: record_started calls this for invocation inputs, and append_tool_call_ended calls it for results. It is the file’s safety wrapper around TraceWriter::write_json_payload.
 
 *Call graph*: calls 1 internal fn (write_json_payload); called by 2 (append_tool_call_ended, record_started); 1 external calls (warn!).
 
@@ -2023,11 +2041,11 @@ fn append_with_context_best_effort(
 )
 ```
 
-**Purpose**: Appends a raw event with the dispatch context's thread and turn ids, suppressing append failures to warnings. It is the common event-write helper for dispatch start and end events.
+**Purpose**: Appends a raw trace event with the thread and turn context attached, while treating trace failures as non-fatal. This keeps tracing useful but never lets it break tool execution.
 
-**Data flow**: Takes an enabled dispatch context and a `RawTraceEventPayload`, constructs `RawTraceEventContext { thread_id: Some(context.thread_id.clone()), codex_turn_id: Some(context.codex_turn_id.clone()) }`, and calls `context.writer.append_with_context(...)`. Errors are logged and otherwise ignored.
+**Data flow**: It receives an enabled context and a raw trace event payload. It builds an event context from the stored thread ID and Codex turn ID, then asks the writer to append the event. If appending fails, it logs a warning and returns without raising the error.
 
-**Call relations**: Called by `record_started` and `append_tool_call_ended` to ensure both lifecycle edges are contextualized consistently.
+**Call relations**: record_started uses this for ToolCallStarted events, and append_tool_call_ended uses it for ToolCallEnded events. It is the shared final step for adding events to the trace.
 
 *Call graph*: called by 2 (append_tool_call_ended, record_started); 1 external calls (warn!).
 
@@ -2038,11 +2056,11 @@ fn append_with_context_best_effort(
 fn suppresses_only_noncanonical_dispatch_boundaries()
 ```
 
-**Purpose**: Verifies the suppression rule only excludes the specific noncanonical public code-mode custom dispatch and not other custom or namespaced calls. It protects against overbroad suppression.
+**Purpose**: Checks that trace suppression is narrow and only skips the intended non-canonical code-mode boundary. This protects against accidentally hiding ordinary custom tools or namespaced tools from traces.
 
-**Data flow**: Builds several `ToolDispatchInvocation` values with the local `invocation` helper and asserts `suppresses_tool_dispatch_trace` is true only for the unnamespaced public code-mode custom case.
+**Data flow**: It builds three sample invocations: the special code-mode custom call, a different custom tool, and a namespaced version of the code-mode tool. It asserts that only the first one is suppressed and the other two are still traceable.
 
-**Call relations**: This unit test targets `suppresses_tool_dispatch_trace` directly, documenting the intended boundary between canonical and suppressed dispatch traces.
+**Call relations**: The test calls the local tests::invocation helper to build inputs, then calls suppresses_tool_dispatch_trace through assertions. It documents the intended behavior used by ToolDispatchTraceContext::start.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2053,11 +2071,11 @@ fn suppresses_only_noncanonical_dispatch_boundaries()
 fn classifies_interrupt_agent_as_close_agent()
 ```
 
-**Purpose**: Checks that the tool-name classifier maps `interrupt_agent` into `ToolCallKind::CloseAgent`. This preserves semantic grouping for related agent-closing operations.
+**Purpose**: Checks that the interrupt_agent tool is grouped under the CloseAgent trace category. This keeps agent interruption events classified with other agent-closing actions.
 
-**Data flow**: Calls `dispatched_tool_kind` with tool name `interrupt_agent` and a sample function payload, then asserts the returned enum equals `ToolCallKind::CloseAgent`.
+**Data flow**: It passes the tool name interrupt_agent and a sample function payload into dispatched_tool_kind. It asserts that the returned kind is ToolCallKind::CloseAgent.
 
-**Call relations**: This unit test exercises the name-to-kind mapping in `dispatched_tool_kind`.
+**Call relations**: This test exercises dispatched_tool_kind directly. That same classifier is used by record_started when writing real ToolCallStarted events.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -2073,22 +2091,22 @@ fn invocation(
     ) -> ToolDispatchInvocation
 ```
 
-**Purpose**: Constructs a minimal `ToolDispatchInvocation` fixture for the local tests. It fills in stable thread, turn, and tool-call ids while allowing the test to vary tool name, namespace, requester, and payload.
+**Purpose**: Builds a small ToolDispatchInvocation for tests. It removes repeated setup code so the tests can focus on the behavior they are checking.
 
-**Data flow**: Accepts tool name, optional namespace, requester, and payload; returns a `ToolDispatchInvocation` with fixed `thread_id`, `codex_turn_id`, and `tool_call_id` strings plus the provided fields.
+**Data flow**: It receives a tool name, optional namespace, requester, and payload. It fills in fixed test IDs for thread, turn, and tool call, converts the tool name to a string, and returns a complete ToolDispatchInvocation.
 
-**Call relations**: Used by the file's tests to reduce duplication when probing suppression and classification behavior.
+**Call relations**: tests::suppresses_only_noncanonical_dispatch_boundaries calls this to create sample invocations. It is test-only support code and is not part of the runtime tracing flow.
 
 
 ### `rollout-trace/src/mcp.rs`
 
-`util` · `outgoing MCP request construction`
+`domain_logic` · `request handling`
 
-This module is intentionally minimal. `McpCallTraceContext` stores a single `Option<McpCallId>`; `None` means tracing is disabled and `Some(id)` means one concrete MCP backend execution has been assigned a trace-owned correlation id. The constant `MCP_CALL_ID_META_KEY` defines the private metadata field name inserted into MCP requests: `codex_bridge_mcp_call_id`.
+When the system decides to actually run an MCP request, tracing needs a reliable way to say, “this specific backend call belongs to this specific trace event.” This file provides that small bridge. Think of it like putting a discreet luggage tag on a request before it leaves, so later tooling can match the returned suitcase to the right trip.
 
-The main behavior is `add_request_meta`. It first checks `mcp_call_id()`: if tracing is disabled, it returns the original `Option<JsonValue>` unchanged. If enabled, it tries to preserve existing metadata while adding the correlation field. When metadata is already a JSON object, it mutates that object in place by inserting the trace id string. When metadata is absent, it creates a fresh `serde_json::Map` containing only the correlation field. If metadata exists but is not an object, the function deliberately falls back to a no-op rather than coercing or rejecting it; tracing is best-effort and must not break MCP requests.
+The main type is McpCallTraceContext. It can be disabled, meaning it carries no ID and changes nothing, or enabled, meaning it holds one MCP call ID created by the trace system. The important public action is add_request_meta. It takes the request’s existing metadata, if any, and adds a private key named codex_bridge_mcp_call_id when tracing is enabled.
 
-The tests cover both invariants: disabled tracing leaves metadata untouched, and enabled tracing preserves existing object fields while adding the bridge correlation key whose value matches the stored MCP call id.
+The code is deliberately cautious. If metadata is already a JSON object, it adds the ID while preserving the existing fields. If there is no metadata, it creates a new object containing only the ID. If the metadata is some unexpected JSON shape, like a string or list, it leaves it alone rather than risking a broken MCP request. Tracing is treated as best-effort: useful when possible, but never allowed to interfere with the real backend call.
 
 #### Function details
 
@@ -2098,11 +2116,11 @@ The tests cover both invariants: disabled tracing leaves metadata untouched, and
 fn disabled() -> Self
 ```
 
-**Purpose**: Constructs an MCP trace context that carries no correlation id and leaves request metadata unchanged. It is the no-op branch for callers that still want a uniform API.
+**Purpose**: Creates a trace context that does nothing. This is used when rollout tracing is not active, so MCP requests can continue normally without extra metadata.
 
-**Data flow**: Returns `McpCallTraceContext { mcp_call_id: None }` with no side effects.
+**Data flow**: Nothing goes in. The function creates a McpCallTraceContext with no stored MCP call ID. The result is a context whose later add_request_meta call will return request metadata unchanged.
 
-**Call relations**: It is chosen by `start_mcp_call_trace` when rollout tracing is not assigning an MCP call id, and causes `add_request_meta` to return its input unchanged.
+**Call relations**: start_mcp_call_trace calls this when it decides there should be no trace information for an MCP call. From that point on, callers can still use the same context-shaped object, but it behaves like a no-op placeholder.
 
 *Call graph*: called by 1 (start_mcp_call_trace).
 
@@ -2113,11 +2131,11 @@ fn disabled() -> Self
 fn enabled(mcp_call_id: McpCallId) -> Self
 ```
 
-**Purpose**: Constructs an MCP trace context for one concrete backend call with a trace-owned correlation id. That id can later be embedded into request metadata.
+**Purpose**: Creates a trace context for one real MCP backend execution. It stores the unique MCP call ID that will later be attached to the outgoing request.
 
-**Data flow**: Consumes an `McpCallId`, wraps it in `Some`, and returns `McpCallTraceContext { mcp_call_id: Some(mcp_call_id) }`.
+**Data flow**: An MCP call ID goes in. The function wraps that ID inside a McpCallTraceContext. The result is a context that can expose the ID internally and add it to request metadata.
 
-**Call relations**: It is used by `start_mcp_call_trace` and by the enabled-path test to create a context whose metadata injection behavior can be exercised.
+**Call relations**: start_mcp_call_trace calls this when tracing is active and a concrete MCP call needs to be linked to a rollout trace. The test tests::enabled_mcp_trace_adds_bridge_correlation_meta also calls it to prove that an enabled context adds the expected correlation field.
 
 *Call graph*: called by 2 (enabled_mcp_trace_adds_bridge_correlation_meta, start_mcp_call_trace).
 
@@ -2128,11 +2146,11 @@ fn enabled(mcp_call_id: McpCallId) -> Self
 fn mcp_call_id(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the stored MCP call id as an optional borrowed string slice. It hides the internal `Option<String>` representation from callers.
+**Purpose**: Returns the stored MCP call ID, if tracing is enabled. It gives the rest of this file a simple way to ask whether this context is active.
 
-**Data flow**: Reads `self.mcp_call_id` and returns `self.mcp_call_id.as_deref()`, yielding `None` when disabled or `Some(&str)` when enabled.
+**Data flow**: The function reads the McpCallTraceContext. If it contains an ID, it returns that ID as text; if it contains no ID, it returns nothing. It does not change the context.
 
-**Call relations**: It is used by `add_request_meta` to decide whether metadata should be modified at all.
+**Call relations**: McpCallTraceContext::add_request_meta calls this before touching metadata. That check decides whether the function should add a trace tag or leave the request exactly as it was.
 
 *Call graph*: called by 1 (add_request_meta).
 
@@ -2143,11 +2161,11 @@ fn mcp_call_id(&self) -> Option<&str>
 fn add_request_meta(&self, meta: Option<JsonValue>) -> Option<JsonValue>
 ```
 
-**Purpose**: Adds the bridge-private MCP correlation field to outgoing request metadata when tracing is enabled, while preserving existing object metadata. It never forces metadata into a different shape if the input is malformed.
+**Purpose**: Adds the private trace correlation ID to one outgoing MCP request’s metadata when tracing is enabled. It is careful not to disturb existing metadata or break requests if the metadata is in an unexpected form.
 
-**Data flow**: Accepts `Option<JsonValue>`. If `mcp_call_id()` returns `None`, it returns the original `meta`. If enabled and `meta` is `Some(JsonValue::Object(mut map))`, it inserts `MCP_CALL_ID_META_KEY -> JsonValue::String(mcp_call_id.to_string())` and returns the updated object. If `meta` is `None`, it creates a new `serde_json::Map`, inserts the same key/value, and returns `Some(JsonValue::Object(map))`. For any other JSON type, it returns the original `meta` unchanged.
+**Data flow**: The current optional JSON metadata goes in, along with the trace context’s stored ID if there is one. If there is no ID, the same metadata comes back unchanged. If there is an ID and the metadata is a JSON object, the function inserts codex_bridge_mcp_call_id into that object. If there is no metadata, it creates a new JSON object with that field. If the metadata is not an object, it returns it unchanged.
 
-**Call relations**: It is called during MCP request construction after a trace context has been created. Its only internal dependency is `mcp_call_id`, which abstracts the enabled/disabled split.
+**Call relations**: This is the main helper other MCP request-building code would use before sending a backend call. It first calls McpCallTraceContext::mcp_call_id to decide whether tracing is active, then uses JSON object and string construction helpers to place the ID into the request metadata when safe.
 
 *Call graph*: calls 1 internal fn (mcp_call_id); 3 external calls (Object, String, new).
 
@@ -2158,11 +2176,11 @@ fn add_request_meta(&self, meta: Option<JsonValue>) -> Option<JsonValue>
 fn disabled_mcp_trace_leaves_request_meta_unchanged()
 ```
 
-**Purpose**: Verifies that disabled MCP tracing does not alter request metadata. This protects the no-op guarantee for callers.
+**Purpose**: Checks that a disabled trace context is truly harmless. If tracing is off, existing request metadata should not be edited.
 
-**Data flow**: Builds a sample JSON object in `meta`, calls `McpCallTraceContext::disabled().add_request_meta(meta.clone())`, and asserts the returned value equals the original.
+**Data flow**: The test starts with sample JSON metadata containing a source field. It passes that metadata through a disabled McpCallTraceContext. The expected result is exactly the same metadata that went in.
 
-**Call relations**: This test exercises the disabled branch of `add_request_meta` through the public constructor.
+**Call relations**: This test exercises the no-op path of McpCallTraceContext::add_request_meta through McpCallTraceContext::disabled. It guards the promise that tracing can be turned off without changing MCP requests.
 
 *Call graph*: 2 external calls (assert_eq!, json!).
 
@@ -2173,11 +2191,11 @@ fn disabled_mcp_trace_leaves_request_meta_unchanged()
 fn enabled_mcp_trace_adds_bridge_correlation_meta()
 ```
 
-**Purpose**: Checks that enabled MCP tracing inserts the private correlation field while preserving existing metadata fields. It also verifies the inserted value matches the context's stored id.
+**Purpose**: Checks that an enabled trace context adds the private MCP call ID while preserving existing metadata. This proves the correlation tag is added without erasing other request information.
 
-**Data flow**: Creates an enabled trace context with a fixed id, passes object metadata through `add_request_meta`, unwraps the resulting object, and asserts both the original `source` field and the inserted `MCP_CALL_ID_META_KEY` field have the expected values.
+**Data flow**: The test creates an enabled context with the ID mcp-call-id and sample metadata containing a source field. It runs add_request_meta, reads the resulting JSON object, and verifies that the original source field remains and the private correlation key contains the trace ID.
 
-**Call relations**: This test covers the normal enabled-object path from `enabled` through `add_request_meta` and confirms `mcp_call_id` consistency.
+**Call relations**: This test calls McpCallTraceContext::enabled to build an active trace context, then verifies the behavior expected from McpCallTraceContext::add_request_meta. It documents the normal tracing path: keep existing metadata, add the bridge-private ID, and make the request traceable.
 
 *Call graph*: calls 1 internal fn (enabled); 2 external calls (assert_eq!, json!).
 
@@ -2187,11 +2205,15 @@ These files establish deterministic replay and rebuild the model-visible convers
 
 ### `rollout-trace/src/reducer/conversation.rs`
 
-`domain_logic` · `inference request/response reduction and compaction checkpoint reduction`
+`domain_logic` · `trace reduction, when model-facing payloads are processed`
 
-This module is the core of model-visible conversation reduction. It parses normalized items from request/response/checkpoint payloads, reconciles them against prior thread snapshots, and updates `rollout.conversation_items`, per-thread `conversation_item_ids`, and inference/compaction references. The key distinction is between full snapshots and append-only deltas. Full inference requests are authoritative snapshots of live context, so `reconcile_conversation_items` can reuse matching prior items by position or by content elsewhere in the previous snapshot, but only once per snapshot. Incremental requests with `previous_response_id` and response outputs are append-only: they reconstruct the omitted prefix from the prior inference call and then require exact positional consistency.
+A trace contains many snapshots of what was sent to or received from the model. Those snapshots can repeat old messages, omit earlier history, or replace history after compaction. This file is the part of the reducer that turns those messy snapshots into stable conversation items with stable IDs.
 
-The reducer also enforces call-id invariants: within a thread, the same model-visible `call_id` and `ConversationItemKind` cannot be reused with different content. Each sighting updates producer refs and, for reasoning items, may merge complementary readable text/summary with the same encrypted identity. Detached reconciliation is used for compaction checkpoints, where input history may reuse existing items but replacement history intentionally starts fresh ids because compaction is a rewrite boundary. After each reconciliation pass, the module triggers tool/code-cell attachment hooks and flushes pending code-cell starts, making conversation reduction the unlock point for runtime entities that were waiting on model-visible source items.
+The main idea is reconciliation: compare the current model-facing payload with what the reducer already knows. If an item is the same as an earlier one, reuse its ID. If it is new, create a new conversation item. This is like keeping a shared photo album from repeated exports: when an export includes photos you already have, you do not add duplicates; when it includes a new photo, you add it once.
+
+Requests are treated as the model-visible input. Responses are immediately appended because they are new output from the model. Incremental requests that only send a delta are expanded by looking up the previous response they refer to. Compaction checkpoints are special: they record both the old input history, a marker showing where history was compressed, and the replacement history that future requests should use as the new baseline.
+
+The file also has careful matching rules for reasoning items. Some reasoning payloads may appear once with readable text and later only as encrypted content. The reducer treats the encrypted part as the stable identity and merges readable evidence when it can.
 
 #### Function details
 
@@ -2207,11 +2229,11 @@ fn reduce_inference_request(
         request_paylo
 ```
 
-**Purpose**: Reduces an inference request payload into the thread's model-visible input item ids, handling both full snapshots and incremental requests that reference a previous response. It also applies post-compaction snapshot overrides for the first full request after compaction installation.
+**Purpose**: Turns a model request payload into the list of conversation item IDs that were visible to the model. It preserves existing IDs for repeated history and creates new IDs for newly introduced input.
 
-**Data flow**: Reads the request payload JSON, requires `input` to be an array, normalizes it with `normalize::normalize_model_items`, and inspects `previous_response_id`. For incremental requests, it finds the prior inference call in the same thread by matching `response_id`, reconstructs the omitted prefix from that call's request and response item ids, reconciles only the delta in append-only mode, and concatenates the ids. For full requests, it reconciles the whole normalized list in full-snapshot mode, optionally using `pending_compaction_replacement_item_ids[thread_id]` as the baseline snapshot. It appends the resulting ids to the thread, updates `thread_conversation_snapshots`, clears pending compaction replacement state when consumed, and returns the request item ids.
+**Data flow**: It receives the time, model call ID, thread and turn IDs, and a reference to the raw request payload. It reads the JSON payload, extracts the input array, normalizes the raw model items into the reducer’s common shape, then reconciles those items against the current thread snapshot. If the request points to a previous response, it rebuilds the omitted prefix from that earlier request and response before adding the new items. It returns the full list of request item IDs and updates the thread’s conversation list and latest snapshot.
 
-**Call relations**: This is called from `TraceReducer::start_inference_call` before the `InferenceCall` is inserted. It delegates item identity decisions to `reconcile_conversation_items` and thread-list mutation to `append_thread_conversation_items`.
+**Call relations**: This is called when the reducer sees an inference request. It hands the normalized input to TraceReducer::reconcile_conversation_items, then records the resulting IDs through TraceReducer::append_thread_conversation_items. It relies on normalize_model_items to turn provider-shaped JSON into the project’s common conversation shape.
 
 *Call graph*: calls 3 internal fn (append_thread_conversation_items, reconcile_conversation_items, normalize_model_items); 3 external calls (new, Ok, bail!).
 
@@ -2227,11 +2249,11 @@ fn reduce_inference_response(
     ) -> Result<Vec<String>>
 ```
 
-**Purpose**: Reduces an inference response payload into conversation items produced by that inference call and appends them to the thread snapshot immediately. It also captures token usage when present.
+**Purpose**: Turns a model response payload into conversation items produced by that model call. It also records token usage on the matching inference call when the payload contains it.
 
-**Data flow**: Reads the response payload JSON, requires `output_items` as an array, looks up the owning inference call to obtain `thread_id` and `codex_turn_id`, normalizes the output items, computes the append position from the current thread snapshot length, and reconciles the items in append-only mode with `ProducerRef::Inference { inference_call_id }`. It appends the resulting ids to the thread and snapshot, then parses `token_usage` via `normalize::token_usage_from_value` and stores it on the mutable `InferenceCall` if both usage and the inference record exist.
+**Data flow**: It receives the time, inference call ID, and raw response payload reference. It reads the JSON, extracts output_items, looks up which thread and turn the inference call belongs to, normalizes the output, and appends it after the current thread snapshot. It returns the IDs of the response items and updates the conversation snapshot and inference usage information.
 
-**Call relations**: This is called from `TraceReducer::complete_inference_call` whenever a terminal inference event carries a full or partial response payload. It relies on `reconcile_conversation_items` for item creation/reuse and on `append_thread_conversation_items` for thread ordering.
+**Call relations**: This runs after a model response is observed. It calls TraceReducer::reconcile_conversation_items in append-only mode because model output should be added after the known prefix, then uses TraceReducer::append_thread_conversation_items to make those items part of the thread transcript.
 
 *Call graph*: calls 3 internal fn (append_thread_conversation_items, reconcile_conversation_items, normalize_model_items); 3 external calls (Ok, bail!, vec!).
 
@@ -2246,11 +2268,11 @@ fn reconcile_conversation_items(
     ) -> Result<Vec<String>>
 ```
 
-**Purpose**: Performs the main snapshot reconciliation algorithm for normalized conversation items, deciding whether each item reuses an existing id or becomes a new `ConversationItem`. It also attaches tool/code-cell edges and resolves pending agent edges as each item is sighted.
+**Purpose**: Matches a list of normalized model-visible items against the current known conversation, reusing old IDs where safe and creating new items where needed. This is the central duplicate-avoidance and identity-preserving routine for live conversation snapshots.
 
-**Data flow**: Consumes a vector of `NormalizedConversationItem` plus a `ReconcileItems` context containing thread/turn ids, timestamp, producer refs, start index, mode, and optional snapshot override. It derives the previous snapshot, iterates normalized items with offsets, checks call-id consistency, and for each item either reuses the item at the same index if `item_matches`, searches the previous snapshot for another unused matching item in full-snapshot mode, creates a new item with `create_conversation_item`, or errors on append-only mismatches. After choosing an id it updates the item from the new sighting, attaches model-visible tool and code-cell links, resolves pending agent edges, pushes the id into the result vector, and finally calls `flush_pending_code_cell_starts` before returning all ids.
+**Data flow**: It receives normalized items plus context such as thread, turn, time, producer information, starting position, and reconciliation mode. For each item, it checks whether the expected existing item still matches; if not, a full snapshot may search elsewhere in the snapshot for matching content, while append-only mode treats mismatches as an error. It updates sightings, links model-visible tool and code-cell items, resolves pending agent edges, flushes pending code-cell starts, and returns the ordered item IDs.
 
-**Call relations**: This is the central reconciliation engine used by both `reduce_inference_request` and `reduce_inference_response`. It delegates creation, matching, consistency checks, and sighting updates to specialized helpers.
+**Call relations**: TraceReducer::reduce_inference_request and TraceReducer::reduce_inference_response both delegate to this function. It uses TraceReducer::ensure_call_id_consistency and TraceReducer::item_matches before deciding whether to reuse an ID, calls TraceReducer::find_matching_snapshot_item when position alone is not enough, creates new items with TraceReducer::create_conversation_item, and refreshes existing items through TraceReducer::update_conversation_item_from_sighting.
 
 *Call graph*: calls 5 internal fn (create_conversation_item, ensure_call_id_consistency, find_matching_snapshot_item, item_matches, update_conversation_item_from_sighting); called by 2 (reduce_inference_request, reduce_inference_response); 4 external calls (with_capacity, Ok, bail!, matches!).
 
@@ -2267,11 +2289,11 @@ fn reduce_compaction_checkpoint(
         checkpoint_paylo
 ```
 
-**Purpose**: Reduces a compaction checkpoint payload into conversation items representing the old input history, a structural compaction marker, and the installed replacement history. It returns all three pieces so the compaction reducer can record the installed boundary.
+**Purpose**: Processes a compaction checkpoint, where old conversation history is compressed and replaced by a shorter installed history. It records both the boundary and the replacement so later requests reconcile against the right baseline.
 
-**Data flow**: Reads checkpoint JSON, extracts `input_history` and `replacement_history` arrays with `required_array`, normalizes both arrays, and reconciles input history against the current thread snapshot using `reconcile_detached_conversation_items`. It then creates a fresh `CompactionMarker` item with empty body and `ProducerRef::Compaction`, reconciles replacement history with no reuse candidates so all replacement items get fresh ids, appends input ids, marker id, and replacement ids to the thread conversation list, and returns a `ReducedCompactionCheckpoint` containing those ids.
+**Data flow**: It receives time, thread and turn IDs, a compaction ID, and the raw checkpoint payload. It reads input_history and replacement_history arrays, normalizes both, reconciles the input history against existing candidates, creates a special compaction marker item, then creates or reconciles the replacement items as fresh post-compaction history. It appends the input items, marker, and replacement items to the thread and returns all three groups of IDs.
 
-**Call relations**: This is called only by `TraceReducer::reduce_compaction_installed_event`. It uses detached reconciliation because checkpoint histories are not reduced as ordinary inference snapshots.
+**Call relations**: This is called by the compaction-reduction path when a checkpoint payload is installed. It uses required_array to validate the expected JSON fields, normalize_model_items for the model-shaped arrays, TraceReducer::reconcile_detached_conversation_items for histories that are not simply the current live snapshot, TraceReducer::create_conversation_item for the marker, and TraceReducer::append_thread_conversation_items to record the transcript effects.
 
 *Call graph*: calls 5 internal fn (append_thread_conversation_items, create_conversation_item, reconcile_detached_conversation_items, normalize_model_items, required_array); 4 external calls (new, Ok, from_ref, vec!).
 
@@ -2286,11 +2308,11 @@ fn reconcile_detached_conversation_items(
     ) -> Result<Vec<String>>
 ```
 
-**Purpose**: Reconciles normalized items against an explicit candidate set rather than the live thread snapshot. It is used for compaction checkpoint histories that need reuse semantics different from ordinary request/response reduction.
+**Purpose**: Reconciles conversation items that come from a detached history, such as compaction input or replacement history, rather than the normal live request snapshot. It can reuse matching candidate items but does not depend on current position in the live thread snapshot.
 
-**Data flow**: Consumes normalized items and a `DetachedReconcileItems` context with thread/turn ids, timestamp, producer refs, and candidate item ids. For each item it checks call-id consistency, tries to find an unused matching candidate with `find_matching_snapshot_item`, otherwise creates a new item, updates the item from the new sighting, attaches model-visible tool/code-cell links, resolves pending agent edges, collects the chosen ids, and flushes pending code-cell starts before returning the ids.
+**Data flow**: It receives normalized items and a detached context containing candidate IDs, thread and turn IDs, time, and producer information. For each item, it verifies call ID consistency, looks for an unused matching candidate, creates a new item if none matches, updates producer and reasoning information, attaches tool or code-cell links, resolves pending edges, and returns the resulting IDs.
 
-**Call relations**: This helper is used by `reduce_compaction_checkpoint` for both input-history reuse and replacement-history fresh insertion.
+**Call relations**: TraceReducer::reduce_compaction_checkpoint calls this for both the pre-compaction input history and the replacement history. It shares much of the same inner work as TraceReducer::reconcile_conversation_items, especially consistency checks, item updates, and link attachment.
 
 *Call graph*: calls 3 internal fn (ensure_call_id_consistency, find_matching_snapshot_item, update_conversation_item_from_sighting); called by 1 (reduce_compaction_checkpoint); 2 external calls (with_capacity, Ok).
 
@@ -2307,11 +2329,11 @@ fn create_conversation_item(
         pr
 ```
 
-**Purpose**: Allocates a new conversation item id and inserts a fully populated `ConversationItem` into the rollout. It is the only constructor for new transcript nodes in this module.
+**Purpose**: Creates a brand-new conversation item record and stores it in the rollout. It is used whenever reconciliation decides that no existing item safely represents the current model-visible content.
 
-**Data flow**: Takes thread id, optional turn id, first-seen timestamp, a `NormalizedConversationItem`, and producer refs. It obtains a fresh id from `next_conversation_item_id`, then inserts a `ConversationItem` into `self.rollout.conversation_items` with copied role/channel/kind/agent metadata/body/call id and returns the new id.
+**Data flow**: It receives the thread, optional turn ID, first-seen time, normalized item content, and producer references. It asks for the next unique conversation item ID, builds a ConversationItem with the normalized role, channel, kind, body, call ID, and producer data, inserts it into the rollout map, and returns the new ID.
 
-**Call relations**: This is called from both reconciliation engines and from `reduce_compaction_checkpoint` when inserting the explicit compaction marker.
+**Call relations**: This is called from TraceReducer::reconcile_conversation_items, TraceReducer::reconcile_detached_conversation_items, and TraceReducer::reduce_compaction_checkpoint when they need a fresh item. It gets unique names from TraceReducer::next_conversation_item_id.
 
 *Call graph*: calls 1 internal fn (next_conversation_item_id); called by 2 (reconcile_conversation_items, reduce_compaction_checkpoint).
 
@@ -2327,11 +2349,11 @@ fn update_conversation_item_from_sighting(
     ) -> Result<()>
 ```
 
-**Purpose**: Merges additional evidence from a new sighting into an existing conversation item. For ordinary items it only adds missing producer refs; for reasoning items it may merge complementary readable body parts.
+**Purpose**: Updates an already-known conversation item when the same item is seen again. This mainly enriches reasoning items and adds any newly discovered producer links without duplicating them.
 
-**Data flow**: Looks up `self.rollout.conversation_items[item_id]` mutably, and if the item kind is `Reasoning` calls `merge_reasoning_body` on the existing and incoming bodies. It then iterates `produced_by` and appends any producer refs not already present. It errors if the item id does not exist.
+**Data flow**: It receives an item ID, the newly normalized sighting of that item, and producer references. It looks up the stored item, merges reasoning body details when appropriate, appends any producer references not already present, and returns success or an error if the item ID does not exist or reasoning content conflicts.
 
-**Call relations**: This is called after reconciliation chooses an item id, from both `reconcile_conversation_items` and `reconcile_detached_conversation_items`.
+**Call relations**: Both reconciliation functions call this after deciding which ID represents an item. It delegates the delicate reasoning merge to merge_reasoning_body.
 
 *Call graph*: calls 1 internal fn (merge_reasoning_body); called by 2 (reconcile_conversation_items, reconcile_detached_conversation_items); 2 external calls (Ok, bail!).
 
@@ -2346,11 +2368,11 @@ fn append_thread_conversation_items(
     ) -> Result<()>
 ```
 
-**Purpose**: Adds conversation item ids to a thread's ordered transcript list without duplicating ids already present. It preserves thread-level conversation order independently of snapshot reconciliation.
+**Purpose**: Adds conversation item IDs to a thread’s transcript without adding duplicates. This makes newly reduced items visible in the thread-level conversation order.
 
-**Data flow**: Mutably fetches the thread via `thread_mut`, iterates the provided `item_ids`, and pushes each id into `thread.conversation_item_ids` only if it is not already contained. It returns `()`.
+**Data flow**: It receives a thread ID and a slice of item IDs. It finds the thread, checks each ID, and appends only those not already present. It changes the thread’s conversation_item_ids list and returns success or an error from thread lookup.
 
-**Call relations**: This helper is used after request, response, and compaction checkpoint reduction to expose reduced items in the thread's visible conversation sequence.
+**Call relations**: The request, response, and compaction reducers call this after they have reduced payloads into item IDs. It is the final step that connects individual conversation item records to the thread transcript.
 
 *Call graph*: called by 3 (reduce_compaction_checkpoint, reduce_inference_request, reduce_inference_response); 1 external calls (Ok).
 
@@ -2366,11 +2388,11 @@ fn find_matching_snapshot_item(
     ) -> Option<String>
 ```
 
-**Purpose**: Searches a prior snapshot or candidate list for the first unused item whose stored content matches a normalized item. It supports content-based reuse during full-snapshot and detached reconciliation.
+**Purpose**: Searches a previous snapshot for an unused item whose content matches the current normalized item. It helps preserve IDs even when a full request snapshot has reordered repeated history.
 
-**Data flow**: Reads `previous_snapshot`, `used_item_ids`, and a normalized item, scans snapshot ids in order, skips ids already used in the current reconciliation pass, tests each remaining id with `self.item_matches`, and returns the first matching id cloned as `Option<String>`.
+**Data flow**: It receives a list of previous item IDs, the IDs already reused in the current pass, and the normalized item to match. It scans for the first previous ID that has not already been used and whose stored item matches the normalized content. It returns that ID if found, otherwise nothing.
 
-**Call relations**: This helper is called by both reconciliation engines when positional reuse is unavailable or inappropriate and content-based reuse is allowed.
+**Call relations**: TraceReducer::reconcile_conversation_items uses this in full-snapshot mode when position-based matching fails or when the current item extends beyond the old snapshot. TraceReducer::reconcile_detached_conversation_items uses it to reuse candidate items during compaction-related reconciliation.
 
 *Call graph*: called by 2 (reconcile_conversation_items, reconcile_detached_conversation_items).
 
@@ -2385,11 +2407,11 @@ fn ensure_call_id_consistency(
     ) -> Result<()>
 ```
 
-**Purpose**: Enforces that a model-visible `call_id` is not reused within a thread for the same item kind but different content. This prevents ambiguous linkage between transcript items and reduced tool/code-cell nodes.
+**Purpose**: Protects against one model-visible call ID being reused for different content in the same thread. This matters because call IDs are used to connect tool or code execution records to conversation items.
 
-**Data flow**: If the normalized item has no `call_id`, it returns immediately. Otherwise it scans all existing `self.rollout.conversation_items`, and for any item in the same thread with the same `call_id` and `kind`, it compares content using `conversation_item_matches`; if any differ, it errors. It does not mutate state.
+**Data flow**: It receives a thread ID and a normalized item. If the item has no call ID, it returns success. If it has a call ID, it scans existing conversation items in that thread with the same call ID and kind; if any such item has different content, it returns an error. Otherwise it succeeds.
 
-**Call relations**: This validation runs before item-id selection in both reconciliation engines so inconsistent call-id reuse fails replay early.
+**Call relations**: Both reconciliation functions call this before reusing or creating an item. It relies on conversation_item_matches to decide whether existing content is truly the same.
 
 *Call graph*: calls 1 internal fn (conversation_item_matches); called by 2 (reconcile_conversation_items, reconcile_detached_conversation_items); 2 external calls (Ok, bail!).
 
@@ -2400,11 +2422,11 @@ fn ensure_call_id_consistency(
 fn item_matches(&self, item_id: &str, normalized: &NormalizedConversationItem) -> bool
 ```
 
-**Purpose**: Checks whether an existing conversation item id refers to content equivalent to a normalized item. It is a thin lookup wrapper around `conversation_item_matches`.
+**Purpose**: Checks whether a stored conversation item ID represents the same content as a normalized item. It is a small helper that hides the lookup and comparison details.
 
-**Data flow**: Looks up `item_id` in `self.rollout.conversation_items`; if absent it returns `false`, otherwise it compares the stored item to the normalized item with `conversation_item_matches`. It is read-only.
+**Data flow**: It receives an item ID and normalized item. It looks up the stored conversation item; if it is missing, the answer is false. If found, it compares the stored item to the normalized one and returns true or false.
 
-**Call relations**: This helper is used by `reconcile_conversation_items` for positional reuse checks and by `find_matching_snapshot_item` indirectly.
+**Call relations**: TraceReducer::reconcile_conversation_items uses this while deciding whether an item at a particular snapshot position can be reused. The actual comparison rules live in conversation_item_matches.
 
 *Call graph*: calls 1 internal fn (conversation_item_matches); called by 1 (reconcile_conversation_items).
 
@@ -2415,11 +2437,11 @@ fn item_matches(&self, item_id: &str, normalized: &NormalizedConversationItem) -
 fn next_conversation_item_id(&mut self) -> String
 ```
 
-**Purpose**: Generates the next synthetic conversation item id in monotonically increasing ordinal order. It centralizes id allocation for transcript nodes.
+**Purpose**: Generates the next unique conversation item ID. This gives every newly created conversation item a stable name inside the reduced rollout.
 
-**Data flow**: Reads `self.next_conversation_item_ordinal`, increments it, and returns `format!("conversation_item:{ordinal}")`. It mutates only the ordinal counter.
+**Data flow**: It reads the reducer’s next conversation item number, increments that number for the future, formats the old number as a string like conversation_item:123, and returns it.
 
-**Call relations**: This is called exclusively by `create_conversation_item` whenever reconciliation needs a fresh transcript node.
+**Call relations**: TraceReducer::create_conversation_item calls this whenever it needs to insert a new item into the rollout.
 
 *Call graph*: called by 1 (create_conversation_item); 1 external calls (format!).
 
@@ -2434,11 +2456,11 @@ fn required_array(
 ) -> Result<&'a Vec<Value>>
 ```
 
-**Purpose**: Extracts a named array field from a checkpoint payload with a contextual error message that includes the raw payload id. It is a small validation helper for compaction checkpoint parsing.
+**Purpose**: Reads a named JSON field and confirms it is an array. It gives compaction checkpoint parsing a clear error when an expected history field is missing or has the wrong shape.
 
-**Data flow**: Reads a JSON `payload`, field `key`, and `RawPayloadRef`, attempts `payload.get(key).and_then(Value::as_array)`, and returns the borrowed array or an error mentioning `raw_payload.raw_payload_id` and the missing/non-array key.
+**Data flow**: It receives a JSON payload, the field name to read, and the raw payload reference for error reporting. It looks up the field and checks that it is an array. It returns a reference to that array or an error message naming the payload and missing field.
 
-**Call relations**: This helper is used by `reduce_compaction_checkpoint` to validate `input_history` and `replacement_history`.
+**Call relations**: TraceReducer::reduce_compaction_checkpoint calls this for input_history and replacement_history before normalizing those arrays.
 
 *Call graph*: called by 1 (reduce_compaction_checkpoint); 1 external calls (get).
 
@@ -2452,11 +2474,11 @@ fn conversation_item_matches(
 ) -> bool
 ```
 
-**Purpose**: Defines semantic equality between a stored `ConversationItem` and a normalized item. It treats reasoning items specially so encrypted identity can match even when readable text differs across sightings.
+**Purpose**: Compares a stored conversation item with a normalized item to decide whether they are the same logical transcript entry. It checks all identity-defining fields while using special rules for reasoning content.
 
-**Data flow**: Compares role, channel, kind, agent-message metadata, and call id directly. For the body it uses `reasoning_body_matches` when both sides are `Reasoning`, otherwise `conversation_body_matches`. It returns a boolean and does not mutate state.
+**Data flow**: It receives a stored ConversationItem and a normalized item. It compares role, channel, kind, agent message, call ID, and body. For ordinary items it compares body parts directly, while reasoning items may match by encrypted identity even if readable text differs. It returns true if the items represent the same content.
 
-**Call relations**: This comparison function underpins call-id consistency checks and item reuse decisions throughout conversation reconciliation.
+**Call relations**: TraceReducer::ensure_call_id_consistency and TraceReducer::item_matches both use this as their core comparison. It delegates body comparison to conversation_body_matches or reasoning_body_matches depending on the item kind.
 
 *Call graph*: calls 2 internal fn (conversation_body_matches, reasoning_body_matches); called by 2 (ensure_call_id_consistency, item_matches).
 
@@ -2467,11 +2489,11 @@ fn conversation_item_matches(
 fn conversation_body_matches(left: &ConversationBody, right: &ConversationBody) -> bool
 ```
 
-**Purpose**: Compares two `ConversationBody` values part-by-part, ignoring payload-local raw ids inside JSON parts and comparing only their summaries. This makes JSON-backed items reusable across different payload observations.
+**Purpose**: Checks whether two conversation bodies have the same visible parts. It treats JSON parts specially by comparing their summary text rather than raw payload IDs, because two equivalent JSON parts can come from different raw payload records.
 
-**Data flow**: Checks equal part counts, zips corresponding parts, and compares each pair; `ConversationPart::Json` compares only `summary`, while all other variants use direct equality. It returns a boolean.
+**Data flow**: It receives two ConversationBody values. It first checks that they have the same number of parts, then compares each pair in order. JSON parts match when their summaries match; other parts must be exactly equal. It returns true or false.
 
-**Call relations**: This is the default body comparator used by `conversation_item_matches`, and it is also consulted by reasoning-specific matching and merging.
+**Call relations**: conversation_item_matches uses this for normal body comparison. reasoning_body_matches and merge_reasoning_body also use it as the first, simplest check before applying reasoning-specific rules.
 
 *Call graph*: called by 3 (conversation_item_matches, merge_reasoning_body, reasoning_body_matches).
 
@@ -2482,11 +2504,11 @@ fn conversation_body_matches(left: &ConversationBody, right: &ConversationBody) 
 fn reasoning_body_matches(left: &ConversationBody, right: &ConversationBody) -> bool
 ```
 
-**Purpose**: Determines whether two reasoning bodies represent the same logical reasoning item, allowing encrypted-content identity to override differences in readable text or summary. This accommodates request/response asymmetry in reasoning serialization.
+**Purpose**: Compares reasoning bodies in a way that tolerates different readable forms of the same encrypted reasoning item. This prevents the reducer from creating duplicates when the response includes readable reasoning but a later request only includes the encrypted blob.
 
-**Data flow**: First checks `conversation_body_matches`; if that fails, it extracts the first encoded part from each body with `reasoning_encoded_part` and returns true only when both encoded `(label, value)` pairs exist and are equal. It is pure.
+**Data flow**: It receives two conversation bodies. It first tries the normal body comparison. If that fails, it looks for an encoded reasoning part in each body and compares the encoded label and value. It returns true when either the full body matches or the encoded identity matches.
 
-**Call relations**: This function is used by `conversation_item_matches` for reasoning items and by `merge_reasoning_body` to decide whether two sightings can be safely merged.
+**Call relations**: conversation_item_matches uses this for reasoning items, and merge_reasoning_body uses it before combining evidence from two sightings. It gets the encoded identity through reasoning_encoded_part.
 
 *Call graph*: calls 2 internal fn (conversation_body_matches, reasoning_encoded_part); called by 2 (conversation_item_matches, merge_reasoning_body).
 
@@ -2500,11 +2522,11 @@ fn merge_reasoning_body(
 ) -> Result<()>
 ```
 
-**Purpose**: Merges complementary readable evidence from two sightings of the same encrypted reasoning item without overwriting already-recorded readable content. It preserves the first readable text/summary unless one category is missing.
+**Purpose**: Combines two sightings of the same reasoning item so the stored item keeps the best available readable text, summaries, and encrypted identity. It refuses to merge if the encrypted identity shows they are actually different reasoning items.
 
-**Data flow**: If the bodies already match under `conversation_body_matches`, it returns unchanged. Otherwise it requires `reasoning_body_matches` to succeed, extracts existing text and summary parts plus incoming text and summary parts, keeps existing text/summary when present and fills missing categories from the incoming body, reuses encoded parts from the existing body, and rewrites `existing.parts` as text parts + summary parts + encoded parts. It errors if encrypted identities differ.
+**Data flow**: It receives the stored body as mutable data and an incoming body. If the bodies already match, it does nothing. If they do not represent the same encoded reasoning item, it returns an error. Otherwise it keeps existing text or summary parts when present, fills missing ones from the incoming body, preserves the encoded parts, rewrites the stored body in that order, and returns success.
 
-**Call relations**: This merge logic is invoked only by `update_conversation_item_from_sighting` for `ConversationItemKind::Reasoning` items.
+**Call relations**: TraceReducer::update_conversation_item_from_sighting calls this whenever a reasoning item is seen again. It uses conversation_body_matches and reasoning_body_matches for safety, then uses reasoning_text_parts, reasoning_summary_parts, and reasoning_encoded_parts to assemble the enriched body.
 
 *Call graph*: calls 5 internal fn (conversation_body_matches, reasoning_body_matches, reasoning_encoded_parts, reasoning_summary_parts, reasoning_text_parts); called by 1 (update_conversation_item_from_sighting); 2 external calls (Ok, bail!).
 
@@ -2515,11 +2537,11 @@ fn merge_reasoning_body(
 fn reasoning_text_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 ```
 
-**Purpose**: Returns all text parts from a reasoning body. It is a selector used during reasoning-body merging.
+**Purpose**: Collects the readable text parts from a reasoning body. These are the human-readable explanation fragments, when the provider includes them.
 
-**Data flow**: Iterates `body.parts`, filters for `ConversationPart::Text`, and collects borrowed references into a vector. It is read-only.
+**Data flow**: It receives a ConversationBody, scans its parts, keeps only Text parts, and returns references to those parts. It does not change the body.
 
-**Call relations**: This helper is used by `merge_reasoning_body` when deciding whether existing or incoming readable text should be retained.
+**Call relations**: merge_reasoning_body calls this on both the existing and incoming bodies to decide which readable text to preserve.
 
 *Call graph*: called by 1 (merge_reasoning_body).
 
@@ -2530,11 +2552,11 @@ fn reasoning_text_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 fn reasoning_summary_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 ```
 
-**Purpose**: Returns all summary parts from a reasoning body. It supports selective merging of readable reasoning summaries.
+**Purpose**: Collects summary parts from a reasoning body. Summaries are shorter readable descriptions that may appear alongside or instead of full reasoning text.
 
-**Data flow**: Iterates `body.parts`, filters for `ConversationPart::Summary`, and collects borrowed references into a vector. It is read-only.
+**Data flow**: It receives a ConversationBody, scans its parts, keeps only Summary parts, and returns references to them. It does not change the body.
 
-**Call relations**: This helper is used by `merge_reasoning_body` alongside text-part extraction.
+**Call relations**: merge_reasoning_body calls this while rebuilding the best combined reasoning body from existing and incoming sightings.
 
 *Call graph*: called by 1 (merge_reasoning_body).
 
@@ -2545,11 +2567,11 @@ fn reasoning_summary_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 fn reasoning_encoded_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 ```
 
-**Purpose**: Returns all encoded parts from a reasoning body. The merge logic preserves these as the stable identity-bearing portion of the item.
+**Purpose**: Collects encrypted or encoded reasoning parts from a body. These parts act as the stable identity for reasoning items across different payload snapshots.
 
-**Data flow**: Iterates `body.parts`, filters for `ConversationPart::Encoded`, and collects borrowed references into a vector. It is read-only.
+**Data flow**: It receives a ConversationBody, scans its parts, keeps only Encoded parts, and returns references to them. It does not change the body.
 
-**Call relations**: This helper is used by `merge_reasoning_body` when reconstructing the merged body.
+**Call relations**: merge_reasoning_body calls this after confirming the reasoning item identity, so the rebuilt stored body keeps the encoded content.
 
 *Call graph*: called by 1 (merge_reasoning_body).
 
@@ -2560,22 +2582,24 @@ fn reasoning_encoded_parts(body: &ConversationBody) -> Vec<&ConversationPart>
 fn reasoning_encoded_part(body: &ConversationBody) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Extracts the first encoded reasoning part as a `(label, value)` pair for identity comparison. It is the minimal representation needed to compare encrypted reasoning blobs.
+**Purpose**: Finds the first encoded reasoning part and returns its label and value. This gives reasoning comparison a compact identity to compare.
 
-**Data flow**: Scans `body.parts` and returns the first `ConversationPart::Encoded { label, value }` as borrowed string slices, or `None` if no encoded part exists. It is pure.
+**Data flow**: It receives a ConversationBody, scans parts until it finds an Encoded part, and returns the encoded label and value as borrowed strings. If there is no encoded part, it returns nothing.
 
-**Call relations**: This helper is used by `reasoning_body_matches` to compare encrypted identities across sightings.
+**Call relations**: reasoning_body_matches calls this for both bodies when normal body comparison fails. Matching encoded parts allow two differently serialized reasoning bodies to be treated as the same item.
 
 *Call graph*: called by 1 (reasoning_body_matches).
 
 
 ### `rollout-trace/src/reducer/mod.rs`
 
-`orchestration` · `trace replay`
+`orchestration` · `trace replay / bundle reduction`
 
-This module is the reducer entry surface for the crate: `replay_bundle` opens the bundle manifest and newline-delimited raw event log, constructs a `TraceReducer`, replays events in file order, then performs one final reconciliation pass for deferred spawn-edge targets before returning the finished `RolloutTrace`. The reducer state is intentionally richer than the final graph. Besides the in-progress `rollout`, it tracks conversation snapshot history per thread for transcript deduplication, pending compaction replacement item ids, a bridge from runtime-local code cell ids to reduced code-cell ids, queued code-cell starts and lifecycle events that arrive before their model-visible source item exists, and pending multi-agent interaction edges whose exact recipient transcript item has not yet been reduced.
+A trace bundle stores what happened as a line-by-line log of raw events, plus separate payload files for larger JSON bodies. This file is the reducer’s front door. Its job is like turning a box of timestamped receipts into a readable trip diary: it keeps the original evidence, but also builds a structured account of threads, turns, model calls, tool calls, code cells, compactions, and agent-to-agent messages.
 
-`apply_event` is the central dispatcher. Before interpreting semantics, it extracts every `RawPayloadRef` from the event and inserts it into `rollout.raw_payloads`, preserving raw evidence independently of whether the reducer creates a typed object for that event. It then matches every `RawTraceEventPayload` variant and forwards to the appropriate reducer method in thread, inference, tool, code-cell, compaction, or conversation logic. Several branches enforce invariants eagerly with reducer errors: missing thread/turn context on compaction install, unsupported `Other` events, and code-cell lifecycle events that cannot be mapped back to a thread/runtime cell. A notable design choice is deferred resolution: some edges and code-cell events are queued rather than guessed, so replay stays strict about model-visible ownership and exact graph anchors.
+The main function, `replay_bundle`, opens the bundle manifest, creates an empty `RolloutTrace`, then reads the raw event log one JSON line at a time. Each event is sent to `TraceReducer::apply_event`, which records any raw payload references first, then looks at the event kind and routes it to the right reducer logic. Most detailed work lives in neighboring modules such as `inference`, `tool`, `thread`, `conversation`, `code_cell`, and `compaction`.
+
+The `TraceReducer` also keeps temporary lookup tables for things that arrive out of order. For example, a runtime code-cell event may arrive before the model response item that proves where it came from, so the reducer queues it until ownership can be checked. At the end, pending spawn edges are resolved, because only then does the reducer know whether a child thread produced the preferred target item or needs a fallback.
 
 #### Function details
 
@@ -2585,11 +2609,11 @@ This module is the reducer entry surface for the crate: `replay_bundle` opens th
 fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace>
 ```
 
-**Purpose**: Replays an on-disk trace bundle directory into a fully reduced `RolloutTrace`. It initializes reducer bookkeeping from the manifest, streams the raw event log line by line, and performs a final pass to resolve deferred spawn-edge fallbacks.
+**Purpose**: Reads one local trace bundle from disk and rebuilds it into a `RolloutTrace`. This is the high-level replay entry for callers who want the reduced trace rather than the raw event log.
 
-**Data flow**: Takes a bundle directory path-like input, reads `MANIFEST_FILE_NAME` into `TraceBundleManifest`, and uses its ids/timestamps to construct `RolloutTrace::new` plus all reducer-side maps, counters, and queues. It then opens `RAW_EVENT_LOG_FILE_NAME`, skips blank lines, parses each non-empty line as `RawTraceEvent`, feeds each event into reducer state mutation, runs pending spawn fallback resolution after the loop, and returns the completed `RolloutTrace`.
+**Data flow**: It receives a bundle directory path. It reads the manifest file to get basic rollout identity and start information, creates a fresh reducer with empty tracking tables, then opens the raw event log. For each non-empty line, it parses a raw event from JSON and applies it to the reducer. After all lines are replayed, it resolves any edges that needed whole-bundle knowledge, then returns the completed `RolloutTrace` or an error with context if reading or parsing failed.
 
-**Call relations**: This is the public entry used by tests and callers that want reduction from a local bundle. It drives the entire replay sequence by repeatedly invoking `TraceReducer::apply_event`; after all events are seen, it invokes the deferred spawn-edge resolution step because only then is it known whether a child-thread delivery item ever appeared.
+**Call relations**: This is the outside caller’s way into the reducer. It sets up the `TraceReducer`, feeds events to `TraceReducer::apply_event` in file order, and finally returns the reducer’s accumulated rollout. It also creates the initial `RolloutTrace` using the bundle manifest, so later event handling has a graph to fill in.
 
 *Call graph*: calls 1 internal fn (new); 9 external calls (as_ref, join, to_path_buf, new, new, open, new, from_reader, from_str).
 
@@ -2600,11 +2624,11 @@ fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace>
 fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value>
 ```
 
-**Purpose**: Loads and parses a referenced raw payload file as JSON for reducer logic that needs typed fields from payload bodies. It keeps payload access centralized so subreducers can work from `RawPayloadRef` ids and paths.
+**Purpose**: Loads the JSON body for a raw payload reference stored in the bundle. Reducer steps use this when an event points to a separate payload file and they need to inspect a small part of that JSON to build the reduced trace.
 
-**Data flow**: Takes `&self` and a `&RawPayloadRef`, joins the reducer's `bundle_dir` with `payload.path`, opens that file, parses it with `serde_json::from_reader`, and returns a `serde_json::Value`. It does not mutate reducer state; it only adds contextual error messages naming the raw payload id.
+**Data flow**: It receives a `RawPayloadRef`, which contains the payload’s path and identifier. It joins that path with the bundle directory, opens the file, parses it as JSON, and returns the parsed `serde_json::Value`. If the file cannot be opened or parsed, it returns an error that names the payload being read.
 
-**Call relations**: This helper is called from specialized reducers when an event's semantic reduction depends on payload contents rather than just payload identity. It is delegated to by thread metadata parsing, terminal parsing, and agent-interaction parsing so those modules do not duplicate file-opening logic.
+**Call relations**: This helper is available to the reducer logic when typed replay needs details from an external payload file. It depends on the reducer’s stored bundle directory, which was set up by `replay_bundle` before any events were applied.
 
 *Call graph*: 3 external calls (open, join, from_reader).
 
@@ -2615,11 +2639,11 @@ fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value>
 fn apply_event(&mut self, event: RawTraceEvent) -> Result<()>
 ```
 
-**Purpose**: Dispatches one `RawTraceEvent` into the correct typed reduction path and updates the in-progress rollout graph plus reducer-side pending state. It is the single place where raw event variants are interpreted.
+**Purpose**: Applies one raw trace event to the in-progress reduced rollout. It is the central dispatcher that decides what each event means and sends it to the appropriate reducer path.
 
-**Data flow**: Consumes a `RawTraceEvent`, first iterates over `event.payload.raw_payload_refs()` and inserts each referenced payload into `rollout.raw_payloads`. It then matches on `event.payload`, updating top-level rollout fields directly for rollout start/end, or delegating to thread, turn, inference, tool, code-cell, compaction, and agent-edge reducers with event sequence numbers, timestamps, ids, statuses, and payload refs. It returns `Ok(())` on successful mutation or an error when invariants are violated, such as unsupported `Other` events or missing required thread/turn context.
+**Data flow**: It receives a parsed `RawTraceEvent`. Before interpreting the event, it records every raw payload reference into the rollout so the reduced trace can still point back to original evidence. Then it matches on the event’s payload kind. Start events create or update objects, end events mark objects finished with status and time, inference and tool events are routed to their specialized reducers, code-cell events may be recorded immediately or queued, and malformed or unsupported cases return an error. The output is either a successful update to the reducer’s internal `RolloutTrace` and pending tables, or an explanatory failure.
 
-**Call relations**: This function is invoked repeatedly by `replay_bundle` for every parsed log line. It delegates outward to nearly all reducer subsystems depending on the payload variant, and it calls `TraceReducer::insert_raw_payload` up front so semantic branches can assume raw payload evidence has already been recorded.
+**Call relations**: During replay, `replay_bundle` calls this once for each non-empty event-log line. Inside, it first calls `TraceReducer::insert_raw_payload` for evidence bookkeeping, then routes the event to the right part of the reducer. Some branches reject impossible data with an error, such as a compaction-installed event missing the thread or turn it belongs to.
 
 *Call graph*: calls 1 internal fn (insert_raw_payload); 1 external calls (bail!).
 
@@ -2630,22 +2654,24 @@ fn apply_event(&mut self, event: RawTraceEvent) -> Result<()>
 fn insert_raw_payload(&mut self, payload: &RawPayloadRef)
 ```
 
-**Purpose**: Copies a raw payload reference into the reduced trace's `raw_payloads` index. This preserves payload evidence independently of whether any typed reducer branch consumes the payload body.
+**Purpose**: Records that a raw payload file exists and belongs to this trace. This keeps the reduced rollout linked to the original data without copying the full raw body into the graph.
 
-**Data flow**: Takes `&mut self` and `&RawPayloadRef`, clones the payload ref, and inserts it into `self.rollout.raw_payloads` keyed by `raw_payload_id`. It returns no value and only mutates the raw-payload map.
+**Data flow**: It receives a reference to a raw payload record. It clones that small reference and inserts it into the rollout’s `raw_payloads` map, keyed by the payload’s raw payload id. Afterward, the rollout can point back to that payload whenever someone needs the original evidence.
 
-**Call relations**: It is called only from `TraceReducer::apply_event` before payload-specific dispatch. That placement ensures every payload referenced by an event is retained once, even for event kinds like protocol breadcrumbs that do not create reduced semantic objects.
+**Call relations**: This is called by `TraceReducer::apply_event` before the event is interpreted. That means every event’s payload references are preserved consistently, even when the event’s semantic reduction is handled elsewhere or, for debug-only protocol wrapper events, does not create a reduced object.
 
 *Call graph*: called by 1 (apply_event); 1 external calls (clone).
 
 
 ### `rollout-trace/src/reducer/conversation/normalize.rs`
 
-`domain_logic` · `payload parsing during conversation reduction`
+`domain_logic` · `request and response reduction`
 
-This module converts raw JSON payload fragments into `NormalizedConversationItem` values containing role, channel, kind, optional agent-routing metadata, body parts, and optional model-visible `call_id`. The reducer later decides whether those normalized items reuse existing `ConversationItem` ids or become new ones. The parser covers ordinary messages, agent messages, reasoning items, function/custom-tool calls and outputs, several JSON-backed tool-call variants, and compaction summary items. Unsupported item types fail replay explicitly rather than being ignored.
+The trace reducer receives conversation data in a “Responses-shaped” JSON format, where different item types use different fields and rules. This file normalizes those varied shapes into `NormalizedConversationItem`, a simpler in-between record that says: who spoke, which channel it belongs to, what kind of item it is, what its body contains, and whether it is tied to a tool call. Think of it like sorting a mixed bag of receipts, notes, and tickets into labeled folders before filing them permanently.
 
-Normalization is intentionally lossy in a few places to stabilize identity across payload observations. JSON-heavy items become `ConversationPart::Json` with a truncated summary plus `raw_payload_id`; equality later compares only the summary. Message content arrays are converted into text parts when possible and otherwise into `PayloadRef` placeholders so non-text content is still represented without embedding large blobs. `custom_tool_call` with `name == "exec"` becomes a `ConversationPart::Code` in JavaScript, while other custom tools become plain text input. Reasoning items collect readable content, summary text, and optional `encrypted_content`, and token usage extraction clamps negative integers to zero by using `max(0) as u64`. Agent messages are parsed through `codex_protocol::models::ResponseItem`, preserving `author` and `recipient` in `AgentMessageMetadata` and mapping encrypted content into `ConversationPart::Encoded`.
+The main flow starts with a list of JSON items. Each item must declare its `type`. Based on that type, the file routes it to the right parser: normal messages, agent messages, reasoning blocks, function calls, tool outputs, custom tool calls, search calls, and compaction summaries. If required fields are missing or have the wrong shape, it returns a clear error that includes the raw payload id, so the bad source can be found.
+
+The file also protects the trace from losing information. When content is too structured, unknown, image-based, or otherwise not easy to show as plain text, it stores either a short JSON summary or a reference back to the raw payload. That way the user interface can display something useful without pretending it fully understood every field.
 
 #### Function details
 
@@ -2658,11 +2684,11 @@ fn normalize_model_items(
 ) -> Result<Vec<NormalizedConversationItem>>
 ```
 
-**Purpose**: Normalizes an array of raw JSON model items into `NormalizedConversationItem` values. It is the batch entry point used by request, response, and compaction checkpoint reduction.
+**Purpose**: Converts a whole list of raw JSON model items into normalized conversation items. This is used when reducers need a clean, consistent conversation view from incoming request, response, or checkpoint data.
 
-**Data flow**: Takes a slice of `serde_json::Value` items and a `RawPayloadRef`, iterates the slice, calls `normalize_model_item` for each element, pushes each result into a vector, and returns the completed vector. It has no side effects beyond allocation.
+**Data flow**: It receives a slice of JSON values and a reference to the raw payload they came from. It walks through the items one by one, asks `normalize_model_item` to translate each item, and collects the results. If any item cannot be understood, the error stops the whole conversion; otherwise it returns the full normalized list.
 
-**Call relations**: This function is called by `reduce_inference_request`, `reduce_inference_response`, and `reduce_compaction_checkpoint` before any reconciliation logic runs.
+**Call relations**: Higher-level reducers call this when they see model conversation data in compaction checkpoints, inference requests, or inference responses. It is the batch wrapper around `normalize_model_item`, which does the item-by-item decision making.
 
 *Call graph*: calls 1 internal fn (normalize_model_item); called by 3 (reduce_compaction_checkpoint, reduce_inference_request, reduce_inference_response); 1 external calls (new).
 
@@ -2673,11 +2699,11 @@ fn normalize_model_items(
 fn token_usage_from_value(value: &Value) -> Option<TokenUsage>
 ```
 
-**Purpose**: Extracts token-usage counters from a JSON object into the reducer's `TokenUsage` struct. Missing or non-integer fields cause the whole extraction to return `None`.
+**Purpose**: Extracts token usage numbers from a JSON value, if all expected fields are present. Token usage is the accounting data that says roughly how much model input and output was consumed.
 
-**Data flow**: Reads `input_tokens`, `cached_input_tokens`, `output_tokens`, and `reasoning_output_tokens` using `u64_field`; if all are present it returns `Some(TokenUsage { ... })`, otherwise `None`. It is pure.
+**Data flow**: It receives one JSON value and reads four numeric fields from it. Each field is pulled through `u64_field`, which turns missing or non-numeric fields into failure and clamps negative numbers to zero. If all four fields are available, it returns a `TokenUsage`; if any are missing, it returns nothing.
 
-**Call relations**: This helper is used by `TraceReducer::reduce_inference_response` when storing usage on an `InferenceCall`.
+**Call relations**: This helper is separate from conversation item normalization because token accounting is related metadata, not a conversation message. It relies on `u64_field` for the repeated field-reading rule.
 
 *Call graph*: calls 1 internal fn (u64_field).
 
@@ -2691,11 +2717,11 @@ fn normalize_model_item(
 ) -> Result<NormalizedConversationItem>
 ```
 
-**Purpose**: Dispatches normalization based on the raw item's `type` field and constructs the corresponding normalized conversation representation. It is the central parser for Responses-shaped items.
+**Purpose**: Translates one raw JSON item into one normalized conversation item by looking at its declared type. This is the central dispatcher for all supported model item shapes.
 
-**Data flow**: Reads `item["type"]` as a string and matches it. Depending on the type it delegates to `normalize_message_item`, `normalize_agent_message_item`, `normalize_reasoning_item`, or directly constructs `NormalizedConversationItem` values using helpers like `raw_text_or_json_body`, `tool_output_body`, `custom_tool_call_body`, `json_body`, and `compaction_body`. It fills role/channel/kind/call_id according to the item type and errors on missing type or unsupported types.
+**Data flow**: It receives a JSON item and the raw payload reference. First it reads the item’s `type`; if there is no string type, it returns an error. Then it chooses the right normalization path: messages go to message parsers, reasoning goes to reasoning parsing, tool calls and outputs become commentary items, compaction items become summary-channel items, and unsupported types produce an error. The output is one `NormalizedConversationItem` with role, channel, kind, body, metadata, and optional call id filled in.
 
-**Call relations**: This function is called by `normalize_model_items` for each raw item and fans out to the specialized parsers and body builders.
+**Call relations**: `normalize_model_items` calls this for every item in a payload. This function then hands off to specialized helpers such as `normalize_message_item`, `normalize_agent_message_item`, `normalize_reasoning_item`, `raw_text_or_json_body`, `tool_output_body`, `custom_tool_call_body`, `compaction_body`, and `json_body` depending on what kind of item it sees.
 
 *Call graph*: calls 8 internal fn (compaction_body, custom_tool_call_body, json_body, normalize_agent_message_item, normalize_message_item, normalize_reasoning_item, raw_text_or_json_body, tool_output_body); called by 1 (normalize_model_items); 2 external calls (get, bail!).
 
@@ -2709,11 +2735,11 @@ fn normalize_message_item(
 ) -> Result<NormalizedConversationItem>
 ```
 
-**Purpose**: Parses a standard `message` item into a normalized conversation message with role, optional channel from `phase`, and body parts from `content`. It validates that the role string is supported.
+**Purpose**: Normalizes a standard conversation message, such as a system, user, assistant, developer, or tool message. It makes sure the sender role is known before the item enters the trace.
 
-**Data flow**: Reads `role` from the JSON item, maps it through `role_from_str`, optionally maps `phase` through `channel_from_phase`, converts `content` into `ConversationPart`s with `content_parts`, and returns a `NormalizedConversationItem` with kind `Message` and no `call_id`. It errors on missing or unsupported roles.
+**Data flow**: It receives a JSON message item and the raw payload reference. It reads the `role` field, converts that string into an internal role with `role_from_str`, optionally converts the `phase` field into a conversation channel, and turns the `content` array into conversation body parts with `content_parts`. It returns a normalized item of kind `Message`, or an error if the role is missing or unsupported.
 
-**Call relations**: This specialized parser is selected by `normalize_model_item` for `type: "message"`.
+**Call relations**: `normalize_model_item` calls this when it sees an item whose type is `message`. This function delegates role translation to `role_from_str` and body extraction to `content_parts`, so the main dispatcher does not need to know message-specific details.
 
 *Call graph*: calls 2 internal fn (content_parts, role_from_str); called by 1 (normalize_model_item); 2 external calls (get, bail!).
 
@@ -2727,11 +2753,11 @@ fn normalize_agent_message_item(
 ) -> Result<NormalizedConversationItem>
 ```
 
-**Purpose**: Parses an `agent_message` item using the protocol model so routing metadata and content variants are interpreted consistently with the wire schema. It preserves author/recipient and converts content into text or encoded parts.
+**Purpose**: Normalizes an `agent_message`, which carries assistant analysis content along with author and recipient metadata. It preserves encrypted content as encoded data rather than trying to read it.
 
-**Data flow**: Clones the raw JSON item and deserializes it into `codex_protocol::models::ResponseItem`, requires the `AgentMessage` variant, maps each `AgentMessageInputContent` entry into either `ConversationPart::Text` or `ConversationPart::Encoded`, errors if the content list is empty, and returns a `NormalizedConversationItem` with role `Assistant`, channel `Analysis`, kind `Message`, and `agent_message: Some(AgentMessageMetadata { author, recipient })`.
+**Data flow**: It receives a raw JSON item and payload reference. It first parses the JSON into the protocol’s typed `ResponseItem` form, then confirms that the parsed item is actually an agent message. It converts text content into text parts and encrypted content into encoded parts, checks that there is at least one part, and returns an assistant analysis-channel message with `AgentMessageMetadata` attached.
 
-**Call relations**: This parser is chosen by `normalize_model_item` for `type: "agent_message"`.
+**Call relations**: `normalize_model_item` calls this for items whose type is `agent_message`. It depends on the protocol model type `ResponseItem` to interpret this richer shape safely, then returns the same normalized conversation shape used by the rest of the reducer.
 
 *Call graph*: called by 1 (normalize_model_item); 2 external calls (clone, bail!).
 
@@ -2745,11 +2771,11 @@ fn normalize_reasoning_item(
 ) -> Result<NormalizedConversationItem>
 ```
 
-**Purpose**: Parses a `reasoning` item into a normalized reasoning body containing readable content parts, summary parts, and optional encrypted identity. It rejects reasoning items that contain none of those forms.
+**Purpose**: Normalizes a reasoning item, which represents the assistant’s internal reasoning content, summaries, or encrypted reasoning data. It keeps reasoning separate from ordinary messages by marking it as kind `Reasoning` on the analysis channel.
 
-**Data flow**: Starts with an empty `parts` vector, appends content parts from `content` and summary parts from `summary` via `append_reasoning_parts`, then inspects `encrypted_content`: `null` is ignored, a string becomes `ConversationPart::Encoded`, and any other type errors. If no parts were collected it errors; otherwise it returns a `NormalizedConversationItem` with role `Assistant`, channel `Analysis`, kind `Reasoning`, and no `call_id`.
+**Data flow**: It receives a JSON reasoning item and the raw payload reference. It gathers text reasoning from `content`, summary text from `summary`, and optional string `encrypted_content`. Text becomes normal text parts, summaries become summary parts, and encrypted data becomes an encoded part. If none of those sources provide content, it returns an error; otherwise it returns a normalized assistant reasoning item.
 
-**Call relations**: This parser is selected by `normalize_model_item` for `type: "reasoning"`.
+**Call relations**: `normalize_model_item` calls this when it sees a `reasoning` item. It uses `append_reasoning_parts` twice, once for main reasoning content and once for summaries, then adds encrypted content itself.
 
 *Call graph*: calls 1 internal fn (append_reasoning_parts); called by 1 (normalize_model_item); 3 external calls (get, new, bail!).
 
@@ -2766,11 +2792,11 @@ fn append_reasoning_parts(
 ) -> Result<()>
 ```
 
-**Purpose**: Validates and appends either readable reasoning content parts or summary parts from a reasoning item field. It enforces the allowed per-entry `type` values for each field.
+**Purpose**: Adds either reasoning text parts or reasoning summary parts from one array inside a reasoning JSON item. It enforces the expected shape so malformed reasoning data is caught early.
 
-**Data flow**: Reads `item[key]`; if absent it returns, and if `kind` is `Content` with `Value::Null` it also returns. Otherwise it requires an array, iterates entries, validates each entry's `type` (`reasoning_text`/`text` for content, `summary_text` for summary), extracts `text` as a string, and pushes either `ConversationPart::Text` or `ConversationPart::Summary` into the mutable `parts` vector. It errors on malformed entries.
+**Data flow**: It receives the full reasoning item, the key to read, whether that key should contain content or summaries, the raw payload reference, and a mutable list of parts to add to. If the key is absent, it does nothing. If the key is present, it must be an array with entries of the expected type and string `text` fields. Valid entries are appended to the parts list as either text or summary parts.
 
-**Call relations**: This helper is called twice by `normalize_reasoning_item`, once for `content` and once for `summary`.
+**Call relations**: `normalize_reasoning_item` calls this for the `content` and `summary` sections of a reasoning item. This helper owns the detailed validation rules, letting the caller focus on assembling the final normalized item.
 
 *Call graph*: called by 1 (normalize_reasoning_item); 3 external calls (get, bail!, matches!).
 
@@ -2781,11 +2807,11 @@ fn append_reasoning_parts(
 fn role_from_str(role: &str) -> Option<ConversationRole>
 ```
 
-**Purpose**: Maps raw message role strings into `ConversationRole` enum values. Unknown roles are rejected by returning `None`.
+**Purpose**: Converts a role name from JSON into the internal conversation role value. It keeps the accepted role vocabulary in one small place.
 
-**Data flow**: Matches the input string against `system`, `developer`, `user`, `assistant`, and `tool`, returning the corresponding enum or `None`. It is pure.
+**Data flow**: It receives a role string such as `user` or `assistant`. If the string is one of the supported roles, it returns the matching internal role. If the string is unknown, it returns nothing so the caller can report an unsupported role error.
 
-**Call relations**: This helper is used by `normalize_message_item` to validate and convert the `role` field.
+**Call relations**: `normalize_message_item` calls this while validating normal message items. It acts as the gatekeeper that prevents unknown role labels from silently entering the normalized conversation.
 
 *Call graph*: called by 1 (normalize_message_item).
 
@@ -2796,11 +2822,11 @@ fn role_from_str(role: &str) -> Option<ConversationRole>
 fn channel_from_phase(phase: &str) -> Option<ConversationChannel>
 ```
 
-**Purpose**: Maps a message `phase` string into an optional `ConversationChannel`. Unrecognized phases are ignored rather than treated as errors.
+**Purpose**: Converts a message `phase` string into an internal conversation channel. A channel is a broad lane for the message, such as commentary, final answer, or summary.
 
-**Data flow**: Matches `commentary`, `final_answer`, and `summary` to their enum variants and returns `None` for anything else. It is pure.
+**Data flow**: It receives a phase string from the raw JSON. Known phases become internal channel values; unknown phases return nothing, which means the normalized item simply has no channel from that phase.
 
-**Call relations**: This helper is used by `normalize_message_item` when populating the optional channel.
+**Call relations**: This helper is used when a normal message includes a `phase` field. It keeps phase-to-channel translation separate from the rest of message normalization.
 
 
 ##### `content_parts`  (lines 377–402)
@@ -2809,11 +2835,11 @@ fn channel_from_phase(phase: &str) -> Option<ConversationChannel>
 fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<ConversationPart>
 ```
 
-**Purpose**: Converts a message or tool-output `content` array into `ConversationPart`s, preserving text directly and representing unsupported or non-text content as payload references. It guarantees at least one part.
+**Purpose**: Turns a message-style `content` array into displayable conversation parts. It extracts plain text when it can and falls back to raw-payload references when the content is not directly representable.
 
-**Data flow**: If `content` is missing or not an array, it returns a single `PayloadRef` labeled `content`. Otherwise it iterates each part: text-like types (`input_text`, `output_text`, `text`) become `ConversationPart::Text` when they contain string `text`; `input_image` becomes a payload ref labeled `input_image`; other known/unknown types become payload refs labeled by their type; missing `type` becomes a generic `content` payload ref. If no parts were produced, it inserts an `empty_content` payload ref.
+**Data flow**: It receives optional JSON content and the raw payload reference. If the content is not an array, it returns a payload reference part pointing back to the original content. For each array entry, text-like types become text parts, images and unknown types become payload references, and entries without a type also become payload references. If the array produces no parts, it adds an `empty_content` reference so the item is still visible in the trace.
 
-**Call relations**: This helper is used by `normalize_message_item` and by `tool_output_body` when tool output is an array of content parts.
+**Call relations**: `normalize_message_item` uses this for normal message bodies, and `tool_output_body` uses it when a tool output is already shaped like a content array. It relies on `payload_ref_part` whenever it cannot safely turn a content entry into plain text.
 
 *Call graph*: calls 1 internal fn (payload_ref_part); called by 2 (normalize_message_item, tool_output_body); 2 external calls (new, vec!).
 
@@ -2824,11 +2850,11 @@ fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<Co
 fn custom_tool_call_body(item: &Value, raw_payload: &RawPayloadRef) -> ConversationBody
 ```
 
-**Purpose**: Builds the body for a `custom_tool_call`, treating `exec` specially as JavaScript source code and other custom tools as plain text input. If the expected string input is absent, it falls back to a JSON summary of the whole item.
+**Purpose**: Builds the body for a custom tool call. It gives special treatment to executable calls so code can be shown as code instead of as ordinary text.
 
-**Data flow**: Reads `item["input"]` as a string; if absent it returns `json_body(item, raw_payload)`. If present and `item["name"] == "exec"`, it returns a `ConversationBody` containing one `ConversationPart::Code { language: "javascript", source }`; otherwise it returns one `ConversationPart::Text { text: input }`.
+**Data flow**: It receives the full custom tool call item and the raw payload reference. If the item has no string `input`, it falls back to a JSON body for the whole item. If the tool name is `exec`, it returns the input as a JavaScript code part. Otherwise it returns the input as a text part.
 
-**Call relations**: This helper is used by `normalize_model_item` for `type: "custom_tool_call"`.
+**Call relations**: `normalize_model_item` calls this for `custom_tool_call` items. If the custom tool call is not in the expected simple shape, this helper hands off to `json_body` so the trace still keeps a summarized version of the original data.
 
 *Call graph*: calls 1 internal fn (json_body); called by 1 (normalize_model_item); 2 external calls (get, vec!).
 
@@ -2839,11 +2865,11 @@ fn custom_tool_call_body(item: &Value, raw_payload: &RawPayloadRef) -> Conversat
 fn raw_text_or_json_body(value: Option<&Value>, raw_payload: &RawPayloadRef) -> ConversationBody
 ```
 
-**Purpose**: Interprets a function-call arguments field as either raw text or embedded JSON. This lets stringified JSON arguments normalize to structured JSON summaries while preserving non-JSON strings as text.
+**Purpose**: Builds a conversation body from a value that might be raw text, JSON stored as a string, a real JSON object, or missing. This is useful for function-call arguments, which may arrive in different forms.
 
-**Data flow**: Matches on the optional `Value`: a `String` is parsed with `serde_json::from_str::<Value>` and becomes `json_body` on success or a single `Text` part on parse failure; any non-string value becomes `json_body`; `None` becomes a single payload-ref part labeled `payload`.
+**Data flow**: It receives an optional JSON value and the raw payload reference. If the value is a string, it tries to parse that string as JSON; parseable JSON becomes a JSON body, and ordinary text stays as a text part. If the value is already non-string JSON, it becomes a JSON body. If the value is missing, it returns a payload reference part so the trace still points back to the source payload.
 
-**Call relations**: This helper is used by `normalize_model_item` for `type: "function_call"`.
+**Call relations**: `normalize_model_item` calls this for standard function-call arguments. It delegates structured values to `json_body` and uses a payload reference when there is no argument value to show.
 
 *Call graph*: calls 1 internal fn (json_body); called by 1 (normalize_model_item); 1 external calls (vec!).
 
@@ -2854,11 +2880,11 @@ fn raw_text_or_json_body(value: Option<&Value>, raw_payload: &RawPayloadRef) -> 
 fn tool_output_body(output: Option<&Value>, raw_payload: &RawPayloadRef) -> ConversationBody
 ```
 
-**Purpose**: Normalizes tool output into text, content parts, or JSON summary depending on the raw output shape. Missing output is represented by a payload reference.
+**Purpose**: Builds the body for a tool output item. It chooses the most readable representation based on whether the output is text, a content array, other JSON, or missing.
 
-**Data flow**: If `output` is a string it returns a single `Text` part; if it is an array it delegates to `content_parts`; if it is any other JSON value it delegates to `json_body`; if absent it returns a single payload-ref part labeled `tool_output`.
+**Data flow**: It receives optional output JSON and the raw payload reference. A string output becomes a text part. An array output is interpreted through `content_parts`. Any other JSON value becomes a summarized JSON part. If the output is missing, it returns a payload reference labeled as tool output.
 
-**Call relations**: This helper is used by `normalize_model_item` for both function-call and custom-tool output item types.
+**Call relations**: `normalize_model_item` calls this for function-call and custom-tool-call output items. It reuses `content_parts` for message-like arrays and `json_body` for structured output that should be preserved but not expanded in full.
 
 *Call graph*: calls 2 internal fn (content_parts, json_body); called by 1 (normalize_model_item); 1 external calls (vec!).
 
@@ -2869,11 +2895,11 @@ fn tool_output_body(output: Option<&Value>, raw_payload: &RawPayloadRef) -> Conv
 fn compaction_body(item: &Value, raw_payload: &RawPayloadRef) -> Result<ConversationBody>
 ```
 
-**Purpose**: Parses a compaction summary item into an encoded conversation body keyed by `encrypted_content`. It treats the encrypted summary itself as the identity-bearing content.
+**Purpose**: Builds the body for a compaction summary item. Compaction means earlier conversation history was condensed, and this function preserves the encrypted summary that represents that condensed history.
 
-**Data flow**: Reads `item["encrypted_content"]` as a string and returns a `ConversationBody` containing one `ConversationPart::Encoded { label: "encrypted_content", value }`. It errors if the field is missing or not a string.
+**Data flow**: It receives the compaction item and raw payload reference. It requires a string `encrypted_content` field; if that field is missing or not a string, it returns an error. When present, it wraps the encrypted value in an encoded conversation part labeled `encrypted_content`.
 
-**Call relations**: This helper is used by `normalize_model_item` for `compaction`, `compaction_summary`, and `context_compaction` item types.
+**Call relations**: `normalize_model_item` calls this for compaction-related item types. The structural marker that history was cut is created elsewhere; this function only normalizes the encoded summary carried in the payload.
 
 *Call graph*: called by 1 (normalize_model_item); 3 external calls (get, bail!, vec!).
 
@@ -2884,11 +2910,11 @@ fn compaction_body(item: &Value, raw_payload: &RawPayloadRef) -> Result<Conversa
 fn json_body(value: &Value, raw_payload: &RawPayloadRef) -> ConversationBody
 ```
 
-**Purpose**: Wraps an arbitrary JSON value in a `ConversationPart::Json` using a summarized string plus the raw payload id. This preserves evidence of structured content without embedding the full value into equality semantics.
+**Purpose**: Wraps a JSON value as a conversation body while keeping a short readable summary and a link back to the raw payload. This is the safe fallback for structured data that should not be flattened into text.
 
-**Data flow**: Builds a `ConversationBody` with one `ConversationPart::Json { summary: summarize_json(value), raw_payload_id: raw_payload.raw_payload_id.clone() }` and returns it. It is pure aside from allocation.
+**Data flow**: It receives a JSON value and the raw payload reference. It creates one JSON conversation part containing a shortened summary from `summarize_json` and the raw payload id. The result is a `ConversationBody` with that single JSON part.
 
-**Call relations**: This helper is used by several normalization paths as the fallback representation for structured or unsupported content.
+**Call relations**: Several normalizers call this when they need to preserve structured information: `normalize_model_item`, `custom_tool_call_body`, `raw_text_or_json_body`, and `tool_output_body`. It keeps large or complex JSON readable without discarding the original source link.
 
 *Call graph*: called by 4 (custom_tool_call_body, normalize_model_item, raw_text_or_json_body, tool_output_body); 1 external calls (vec!).
 
@@ -2899,11 +2925,11 @@ fn json_body(value: &Value, raw_payload: &RawPayloadRef) -> ConversationBody
 fn payload_ref_part(label: &str, raw_payload: &RawPayloadRef) -> ConversationPart
 ```
 
-**Purpose**: Creates a `ConversationPart::PayloadRef` pointing back to the raw payload when content cannot or should not be inlined. It is a compact placeholder representation.
+**Purpose**: Creates a small placeholder part that points back to the raw payload. This is used when the normalizer cannot or should not copy the actual content into the conversation body.
 
-**Data flow**: Takes a label and `RawPayloadRef`, clones the payload id, and returns `ConversationPart::PayloadRef { label, raw_payload_id }`. It is pure.
+**Data flow**: It receives a label explaining what kind of content is being referenced and the raw payload reference. It returns a `PayloadRef` part containing that label and the raw payload id. Nothing is parsed or changed.
 
-**Call relations**: This helper is used by `content_parts` to represent missing, unsupported, or non-text content.
+**Call relations**: `content_parts` calls this for images, unknown content types, missing content, and empty content. It helps the trace stay honest: instead of inventing text, it says where the original data can be found.
 
 *Call graph*: called by 1 (content_parts).
 
@@ -2914,11 +2940,11 @@ fn payload_ref_part(label: &str, raw_payload: &RawPayloadRef) -> ConversationPar
 fn summarize_json(value: &Value) -> String
 ```
 
-**Purpose**: Serializes a JSON value into a bounded-length summary string for `ConversationPart::Json`. It truncates long JSON to keep stored summaries compact.
+**Purpose**: Creates a short string preview of a JSON value. This makes structured data easier to display in the trace without flooding the view with a huge blob.
 
-**Data flow**: Serializes the value with `serde_json::to_string`, falling back to `"<unserializable json>"` on failure, truncates the resulting string to 240 characters if necessary, appends `...` after truncation, and returns the summary.
+**Data flow**: It receives any JSON value. It serializes the value to a string, or uses a placeholder if serialization somehow fails. If the string is longer than the maximum summary length, it cuts it down and adds an ellipsis. The result is a compact summary string.
 
-**Call relations**: This helper is used only by `json_body` when constructing JSON-backed conversation parts.
+**Call relations**: `json_body` uses this when building JSON conversation parts. It provides the readable preview while `json_body` keeps the raw payload id for full provenance.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -2929,24 +2955,24 @@ fn summarize_json(value: &Value) -> String
 fn u64_field(value: &Value, field: &str) -> Option<u64>
 ```
 
-**Purpose**: Extracts a non-negative integer field from JSON as `u64`, clamping negative values to zero. It is a tolerant numeric helper for token usage parsing.
+**Purpose**: Reads one numeric token-usage field from JSON as a non-negative unsigned number. It provides a shared rule for token counters.
 
-**Data flow**: Reads `value[field]` as `i64`, applies `max(0) as u64`, and returns `Option<u64>`. Missing or non-integer fields yield `None`.
+**Data flow**: It receives a JSON value and a field name. It looks up that field, accepts it only if it is an integer, clamps negative values up to zero, and returns it as an unsigned number. If the field is missing or not an integer, it returns nothing.
 
-**Call relations**: This helper is used by `token_usage_from_value` for each token counter field.
+**Call relations**: `token_usage_from_value` calls this for each token counter it needs. This keeps all token fields using the same conversion behavior.
 
 *Call graph*: called by 1 (token_usage_from_value); 1 external calls (get).
 
 
 ### `rollout-trace/src/reducer/inference.rs`
 
-`domain_logic` · `inference start/completion and turn-end cleanup`
+`domain_logic` · `trace reduction during inference start, inference finish, and turn-end cleanup`
 
-This module adds inference-call lifecycle methods to `TraceReducer`. `StartedInferenceCall` packages the raw start-event fields into one struct so callers cannot accidentally swap adjacent string arguments. `start_inference_call` validates uniqueness and turn ownership before reducing the request payload into model-visible conversation items. Only after request reduction succeeds does it insert an `InferenceCall` with a running `ExecutionWindow`, model/provider metadata, request item ids, and raw request payload id.
+An inference call is one trip from Codex to a model provider, like sending a question to an AI service and waiting for the answer. This file makes those trips understandable in the reduced trace. Without it, the trace could show conversation content but not reliably connect that content to the model call that produced it, when it ran, or whether it completed successfully.
 
-`close_running_inference_calls_for_turn_end` is a cleanup path used when a turn ends before an inference stream has emitted its own terminal event. It scans all inference calls for the given turn and closes only those still marked `Running`, mapping turn completion/cancellation to `ExecutionStatus::Cancelled`, preserving `Failed`, and propagating `Aborted`.
+The main flow starts when a raw “inference started” event arrives. The reducer first checks that this call is not already known, then checks that it belongs to a real Codex turn and the correct thread. That matters because a trace is like a family tree: if a model call is attached to the wrong parent turn, later analysis becomes misleading. It then reduces the request payload into conversation items before inserting the inference call record, so the stored call already points to the exact request evidence.
 
-`complete_inference_call` handles all terminal inference event variants by pattern-matching `RawTraceEventPayload` into a normalized tuple of call id, terminal status, optional response id, optional upstream request id, and optional response payload. If a response payload exists—even for failed or cancelled calls—it reduces response items and stores them. When updating the `InferenceCall`, it preserves any terminal status already set by turn-end cleanup, while still recording late `upstream_request_id`, raw response payload id, and partial response item ids. This makes replay robust to asynchronous mapper events that arrive after the owning turn has already been closed.
+When a model call ends, the reducer accepts completion, failure, or cancellation events. If there is a response or partial response, it reduces that into response items and stores useful IDs from the provider. There is also a cleanup path for turn endings: if a turn ends while a model stream still looks live, this file closes that inference call so the final trace does not pretend it is still running.
 
 #### Function details
 
@@ -2961,11 +2987,11 @@ fn start_inference_call(
     ) -> Result<()>
 ```
 
-**Purpose**: Starts an inference call, validates its thread/turn association, reduces its request payload into conversation items, and inserts the resulting `InferenceCall` record. Request reduction happens before insertion so the inference object always points at valid request item ids.
+**Purpose**: This function begins tracking a model call when the trace says an inference request has started. It verifies that the call belongs to a known turn and thread, turns the outgoing request into conversation evidence, and then stores a new running inference record.
 
-**Data flow**: Consumes event sequence/time and a `StartedInferenceCall` containing inference id, thread id, turn id, model, provider, and request payload ref. It checks for duplicate inference ids, validates that `self.rollout.codex_turns[codex_turn_id]` exists and belongs to the supplied thread, calls `reduce_inference_request` to obtain `request_item_ids`, ensures the thread exists via `thread_mut`, and inserts an `InferenceCall` into `self.rollout.inference_calls` with a running `ExecutionWindow`, copied metadata, empty response/tool-call lists, `usage: None`, and raw payload ids.
+**Data flow**: It receives the raw event sequence number, the wall-clock time, and a StartedInferenceCall bundle containing IDs, model/provider names, and the raw request payload. It checks for duplicate inference IDs, looks up the referenced Codex turn, confirms the thread matches, and reduces the request payload into item IDs. After that, it inserts a new InferenceCall into the rollout with a running execution window, request links, model/provider details, and empty response fields. If the IDs are inconsistent or duplicated, it stops with an error instead of recording a misleading call.
 
-**Call relations**: This is called from outer event dispatch on inference-start events. It delegates transcript parsing to `reduce_inference_request` and establishes the inference record later updated by `complete_inference_call`.
+**Call relations**: This is used when the reducer is processing an inference-start event. It relies on the wider TraceReducer state to find the owning turn, reduce the request into normalized conversation items, and confirm the thread exists. If something is wrong, it uses the shared error path to reject the event; otherwise it leaves behind a running inference call that later completion or cleanup logic can update.
 
 *Call graph*: 2 external calls (new, bail!).
 
@@ -2982,11 +3008,11 @@ fn close_running_inference_calls_for_turn_end(
     )
 ```
 
-**Purpose**: Closes any inference calls that are still marked running when their owning turn ends. This prevents abandoned provider streams from appearing live in the reduced rollout.
+**Purpose**: This function closes any model calls that are still marked as running when their owning Codex turn ends. It prevents the reduced trace from showing an inference stream as still alive after the turn that owned it has already finished.
 
-**Data flow**: Takes turn-end sequence/time, `codex_turn_id`, and turn `ExecutionStatus`, maps the turn status to an inference terminal status (`Cancelled` for completed/cancelled turns, `Failed` for failed turns, `Aborted` for aborted turns, and no-op for running), then iterates `self.rollout.inference_calls.values_mut()` and updates `ended_at_unix_ms`, `ended_seq`, and `execution.status` for matching calls whose current status is still `Running`.
+**Data flow**: It receives the event sequence number, the end time, the Codex turn ID, and the final status of that turn. If the turn is still running, it does nothing. Otherwise, it chooses an inference status that matches the turn ending: completed or cancelled turns cause leftover running inferences to become cancelled, while failed or aborted turns pass through those statuses. It then scans stored inference calls, finds running ones attached to that turn, and fills in their end time, end sequence, and final status.
 
-**Call relations**: This cleanup helper is invoked by turn-end orchestration before or independently of later inference terminal events. `complete_inference_call` is written to preserve the status set here if a late terminal event arrives afterward.
+**Call relations**: This runs as part of turn-end cleanup rather than normal model completion. In the usual path, complete_inference_call closes the inference first. This function is the safety net for cases where Codex stopped observing the provider stream before a terminal inference event arrived, so later readers see a closed timeline instead of a dangling one.
 
 
 ##### `TraceReducer::complete_inference_call`  (lines 138–226)
@@ -3000,22 +3026,24 @@ fn complete_inference_call(
     ) -> Result<()>
 ```
 
-**Purpose**: Handles terminal inference events for completed, failed, or cancelled calls, optionally reducing any full or partial response payload into conversation items. It also records response ids, upstream request ids, and raw response payload ids while respecting earlier turn-end closure.
+**Purpose**: This function finishes a tracked model call when the trace reports that it completed, failed, or was cancelled. It records the final status, stores provider IDs, and turns any full or partial response payload into normalized response items.
 
-**Data flow**: Consumes event sequence/time and a `RawTraceEventPayload`, pattern-matching it into `(inference_call_id, status, response_id, upstream_request_id, response_payload)` for `InferenceCompleted`, `InferenceFailed`, or `InferenceCancelled`; any other payload errors. It verifies the inference exists, optionally reduces `response_payload` through `reduce_inference_response`, then mutably updates the `InferenceCall`: sets `response_id`, closes the execution window only if it is still `Running`, stores `upstream_request_id` when present, stores `raw_response_payload_id` when a payload exists, and replaces `response_item_ids` when response items were reduced.
+**Data flow**: It receives the event sequence number, the wall-clock time, and a raw terminal inference event. It first recognizes which kind of terminal event it is: completed, failed, or cancelled. From that it extracts the inference call ID, status, optional response ID, optional upstream request ID, and any response or partial-response payload. It checks that the inference call already exists. If a payload is present, it reduces that payload into response item IDs. Then it updates the stored inference call with response IDs, raw payload IDs, response item IDs, and, if the call is still running, its end time, end sequence, and final status. If the event is not a terminal inference event or refers to an unknown call, it returns an error.
 
-**Call relations**: This is called from outer event dispatch for terminal inference events. It delegates response transcript reduction to `reduce_inference_response` and is designed to coexist with prior turn-end cleanup from `close_running_inference_calls_for_turn_end`.
+**Call relations**: This is called when the reducer reaches the end event for an inference call. It follows the record created by TraceReducer::start_inference_call and fills in the response side of the story. It also cooperates with TraceReducer::close_running_inference_calls_for_turn_end: if cleanup already marked the call as terminal, this function keeps that earlier status but still preserves late-arriving partial response evidence and provider request IDs.
 
 *Call graph*: 1 external calls (bail!).
 
 
 ### `rollout-trace/src/reducer/compaction.rs`
 
-`domain_logic` · `compaction request handling and checkpoint install`
+`domain_logic` · `event reduction during trace processing`
 
-This module adds compaction-specific lifecycle methods to `TraceReducer`. `StartedCompactionRequest` packages the raw start-event fields so callers do not pass a long sequence of adjacent strings. `start_compaction_request` validates uniqueness, confirms the referenced thread exists, checks that the referenced Codex turn exists and belongs to that thread, and then inserts a `CompactionRequest` with an `ExecutionWindow` in `Running` state plus raw request payload id, model, and provider metadata.
+A compaction is a way of replacing a stretch of conversation history with a shorter checkpoint, like summarizing old pages in a notebook so the notebook stays usable. This file is responsible for tracking that process inside `TraceReducer`, which turns raw events into a cleaner model of what happened.
 
-`complete_compaction_request` closes one request attempt by validating that the request exists and that the completion's `compaction_id` matches the one recorded at start. It updates end timestamps, terminal `ExecutionStatus`, and optional raw response payload id, but deliberately does not touch conversation history. That semantic boundary is handled by `reduce_compaction_installed_event`, which validates uniqueness and thread/turn ownership, delegates checkpoint parsing and conversation-item creation to `reduce_compaction_checkpoint`, gathers all request ids associated with the installed `compaction_id`, stores the replacement item ids in `pending_compaction_replacement_item_ids` for the next full request reconciliation, and inserts a `Compaction` record containing the marker item, input history ids, and replacement history ids. The design makes request attempts evidence of remote calls, while installation is the only event that rewrites live transcript state.
+It separates two ideas that might look similar but are not the same. First, the system may send one or more remote compaction requests. Those requests have start times, end times, statuses, models, providers, and raw request or response payloads kept as evidence. Second, a compaction may later be installed, meaning the checkpoint becomes the live replacement history for the thread. A completed request alone does not rewrite the conversation.
+
+The code also protects the trace from impossible or inconsistent data. It rejects duplicate starts or installs, unknown turns, unknown requests, and mismatches where an event says it belongs to one thread or compaction but the earlier record says something else. If those checks were missing, the reduced trace could quietly connect the wrong request to the wrong conversation, which would make later analysis misleading.
 
 #### Function details
 
@@ -3030,11 +3058,11 @@ fn start_compaction_request(
     ) -> Result<()>
 ```
 
-**Purpose**: Begins tracking one upstream compaction request attempt and records its request payload metadata. It validates that the request id is unique and that the referenced turn belongs to the supplied thread.
+**Purpose**: Records that one attempt to ask an upstream service for a compaction has begun. It creates a running request record, but it does not change the conversation history.
 
-**Data flow**: Consumes event sequence/time and a `StartedCompactionRequest` containing compaction id, request id, thread id, turn id, model, provider, and request payload ref. It checks `self.rollout.compaction_requests` for duplicates, ensures the thread exists via `thread_mut`, validates `self.rollout.codex_turns[codex_turn_id]` and its thread ownership, then inserts a `CompactionRequest` with a running `ExecutionWindow`, copied metadata, and `raw_request_payload_id` set from the payload ref.
+**Data flow**: It receives the raw event sequence number, the wall-clock start time, and the unpacked start-event fields such as compaction ID, request ID, thread ID, turn ID, model, provider, and request payload. It first checks that this request ID has not already been seen, that the thread exists, that the referenced Codex turn exists, and that the turn belongs to the same thread. If everything lines up, it adds a new `CompactionRequest` to the rollout with a running execution window and a pointer to the raw request payload. The output is success, or an error if the event would make the trace inconsistent.
 
-**Call relations**: This is called from outer event dispatch when a compaction request starts. It does not reduce checkpoint content; it only establishes the request-attempt record later closed by `complete_compaction_request`.
+**Call relations**: This is used when the reducer sees the start of a compaction request. It records the request as evidence of an upstream call. If the event is a duplicate or points at the wrong thread or turn, it stops the reduction with an error through `bail!` rather than letting bad links enter the model.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -3050,11 +3078,11 @@ fn complete_compaction_request(
         compaction_request_id: CompactionRequestId,
 ```
 
-**Purpose**: Closes a previously started compaction request attempt and stores its terminal status and optional response payload id. It intentionally leaves conversation history unchanged.
+**Purpose**: Marks a previously started compaction request as finished. It stores the finish time, final status, and optional response payload, while still leaving the conversation itself unchanged.
 
-**Data flow**: Takes event sequence/time, `compaction_id`, `compaction_request_id`, terminal `ExecutionStatus`, and optional `RawPayloadRef`. It mutably looks up the request in `self.rollout.compaction_requests`, verifies the completion's `compaction_id` matches the request's recorded one, then sets `execution.ended_at_unix_ms`, `execution.ended_seq`, `execution.status`, and `raw_response_payload_id` from the optional payload.
+**Data flow**: It receives the event sequence number, finish time, compaction ID, request ID, final execution status, and maybe a raw response payload. It looks up the existing request by ID, confirms that the completion belongs to the same compaction that was recorded at start time, then fills in the request's end time, end sequence, status, and response payload ID. It returns success after updating that request, or an error if the completion refers to an unknown request or the wrong compaction.
 
-**Call relations**: This is invoked by terminal compaction-request events after `start_compaction_request` has inserted the request. It records remote-call evidence only; installation of replacement history happens separately in `reduce_compaction_installed_event`.
+**Call relations**: This follows `TraceReducer::start_compaction_request` in the normal lifecycle of an upstream compaction attempt. It completes the request record but deliberately does not install any checkpoint. If the completion cannot be matched to a valid start, it uses `bail!` so the reduced trace does not invent a request history.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -3071,22 +3099,26 @@ fn reduce_compaction_installed_event(
         checkpoint_pay
 ```
 
-**Purpose**: Processes the event that makes a compaction checkpoint live in the reduced conversation graph. It creates the installed `Compaction` record and primes future request reconciliation to compare against replacement history.
+**Purpose**: Records the moment when a compaction checkpoint actually becomes part of the reduced conversation. This is the point where replacement history is treated as live thread history.
 
-**Data flow**: Consumes install time, `thread_id`, `codex_turn_id`, `compaction_id`, and checkpoint payload ref. It rejects duplicate installs, validates thread existence and turn ownership, calls `reduce_compaction_checkpoint` to obtain `input_item_ids`, `marker_item_id`, and `replacement_item_ids`, collects all matching request ids from `self.rollout.compaction_requests`, stores the replacement ids in `self.pending_compaction_replacement_item_ids[thread_id]`, and inserts a `Compaction` into `self.rollout.compactions` with install metadata and checkpoint-derived item ids.
+**Data flow**: It receives the install time, thread ID, Codex turn ID, compaction ID, and checkpoint payload. It checks that this compaction has not already been installed, that the thread and turn exist, and that the turn belongs to the given thread. It then reduces the checkpoint payload into concrete conversation item IDs, gathers all request IDs that belong to this compaction, remembers the replacement item IDs as pending replacement history for the thread, and inserts a new `Compaction` record into the rollout. The result is a recorded installed compaction, or an error if the install event does not match the existing trace.
 
-**Call relations**: This is called when a compaction install event arrives, after any request attempts may already have been tracked. It delegates transcript-item creation to the conversation reducer and then records the installed compaction boundary for later full-request reconciliation.
+**Call relations**: This is the semantic finish line of the compaction flow. Earlier request start and completion records show that remote work was attempted; this function is called when an install event says the checkpoint should take effect. It relies on checkpoint reduction to interpret the payload, and it uses `bail!` to reject duplicate installs or references to the wrong thread or turn.
 
 *Call graph*: 1 external calls (bail!).
 
 
 ### `rollout-trace/src/reducer/thread.rs`
 
-`domain_logic` · `trace replay when thread and turn lifecycle events arrive`
+`domain_logic` · `trace reduction as raw events are processed`
 
-This module owns the reduced graph nodes that everything else hangs off of: threads and turns. `start_thread` inserts a new `AgentThread` with an `ExecutionWindow` beginning at the raw event's sequence and wall time, and it optionally parses a metadata payload into `ThreadStartedMetadata`. That metadata is authoritative for multi-agent v2 identity: if a nested `session_source.subagent.thread_spawn` object exists, the reducer derives `AgentOrigin::Spawned`, computes a stable spawn edge id, prefers metadata-provided `agent_path`, and derives a task name either from metadata or from the last non-empty path segment. Otherwise the thread is marked `AgentOrigin::Root`.
+A trace is a stream of low-level events. This file acts like the logbook clerk for the parts of that stream that say, “a thread began,” “a thread ended,” “a Codex turn began,” or “a Codex turn ended.” Without it, the rest of the system would not have reliable containers to attach conversations, tool calls, code cells, and model calls to.
 
-`end_thread` only marks the thread terminal; it intentionally does not imply rollout completion, which matters for child-agent shutdown. `start_codex_turn` validates that the owning thread already exists and inserts a running `CodexTurn`. `end_codex_turn` validates any thread id carried by the raw event against the turn's actual owner, marks the turn terminal, then triggers cleanup of still-running code cells and inference calls associated with that turn. The helper `thread_mut` centralizes unknown-thread errors with contextual messages, while `thread_started_metadata` reads and deserializes the metadata payload through the shared payload loader. The metadata structs are private implementation details used only to interpret optional session-source fields.
+The main owner is TraceReducer, which builds a structured rollout from raw events. When a thread starts, the reducer checks that the thread id has not already been used, reads optional metadata, and decides whether the thread is a root agent or a spawned child agent. For spawned agents, it derives a parent link, a task name, and an agent role so the final trace can show the agent tree clearly.
+
+A “Codex turn” is a single work interval inside a thread. This file records when each turn starts and ends, and it checks that a turn is attached to the thread it claims to belong to. When a turn ends, it also closes related work that should not keep running past the turn, such as code cells and inference calls.
+
+The important idea is that threads are the shelves, turns are folders on those shelves, and later reducer modules put their own documents into the right folder.
 
 #### Function details
 
@@ -3102,11 +3134,11 @@ fn start_thread(
         metadata_payload: Option<RawPayloadRef>,
 ```
 
-**Purpose**: Creates a reduced `AgentThread` from a raw thread-start event, optionally enriching it with parsed metadata and multi-agent spawn identity. It rejects duplicate thread ids.
+**Purpose**: Creates a new agent thread in the rollout when a raw event says a thread has started. It also works out whether this is the main/root agent or a child agent spawned by another thread.
 
-**Data flow**: Takes reducer state plus raw sequence/time, `thread_id`, denormalized `agent_path`, and optional `metadata_payload`. It checks for an existing thread id, optionally parses metadata via `thread_started_metadata`, derives authoritative agent path, nickname, default model, and either `AgentOrigin::Spawned` or `AgentOrigin::Root`, then inserts an `AgentThread` with a running `ExecutionWindow` and empty `conversation_item_ids` into `rollout.threads`.
+**Data flow**: It receives the event sequence number, time, thread id, event-provided agent path, and optional metadata payload. It first rejects duplicate thread ids. If metadata exists, it reads it and prefers the richer spawn metadata over the simpler event field. It then builds an AgentThread with start time, running status, model and nickname if present, and either a root origin or a spawned-child origin. The rollout’s thread map gains one new thread record.
 
-**Call relations**: This method is invoked from the central `apply_event` dispatcher on `RawTraceEventPayload::ThreadStarted`. It delegates spawn-edge id construction to `spawn_edge_id` and task-name fallback derivation to `task_name_from_agent_path` so thread insertion stays focused on assembling the final `AgentThread`.
+**Call relations**: This is called by the reducer when it sees a thread-start event. It uses spawn_edge_id to create the stable link name between a parent thread and a child thread. If the event would create an impossible state, such as starting the same thread twice, it stops reduction with an error.
 
 *Call graph*: 3 external calls (new, bail!, spawn_edge_id).
 
@@ -3123,11 +3155,11 @@ fn end_thread(
     ) -> Result<()>
 ```
 
-**Purpose**: Marks an existing thread's execution window as ended and maps rollout-level terminal status into thread-level `ExecutionStatus`. It does not alter overall rollout status.
+**Purpose**: Marks an existing agent thread as finished, failed, aborted, or still running based on the status carried by the trace event. It deliberately only ends that one thread, rather than treating a child thread ending as the whole rollout ending.
 
-**Data flow**: Takes reducer state, raw sequence/time, a `thread_id`, and `RolloutStatus`. It fetches the mutable thread via `thread_mut`, writes `ended_at_unix_ms`, `ended_seq`, and a mapped `ExecutionStatus` onto the thread's `execution`, and returns `Ok(())`.
+**Data flow**: It receives the event sequence number, time, thread id, and rollout-style status. It looks up the thread, writes the end time and ending sequence number, and converts the rollout status into the thread’s execution status. The thread record changes from open-ended running work to a terminal or updated execution state.
 
-**Call relations**: Called by `apply_event` for `ThreadEnded` events. It relies on `thread_mut` for existence validation and contextual unknown-thread errors.
+**Call relations**: When a thread-end event arrives, this function asks TraceReducer::thread_mut for the matching thread record. That helper provides the guardrail: if the event names a thread the reducer has never seen, the end operation fails instead of silently inventing data.
 
 *Call graph*: calls 1 internal fn (thread_mut).
 
@@ -3144,11 +3176,11 @@ fn start_codex_turn(
     ) -> Result<()>
 ```
 
-**Purpose**: Creates a running `CodexTurn` inside an already-known thread. It rejects duplicate turn ids and unknown owning threads.
+**Purpose**: Creates a new Codex turn inside an existing thread. A turn is a bounded stretch of work, so this records the starting point that later events can attach to.
 
-**Data flow**: Takes reducer state, raw sequence/time, `codex_turn_id`, and `thread_id`. It checks `rollout.codex_turns` for duplicates, validates the thread exists by calling `thread_mut`, then inserts a `CodexTurn` with the provided ids, a running `ExecutionWindow`, and empty `input_item_ids` into `rollout.codex_turns`.
+**Data flow**: It receives the event sequence number, time, Codex turn id, and thread id. It rejects duplicate turn ids, checks that the referenced thread already exists, and then inserts a new CodexTurn with running status and an empty list of input items. The rollout gains a new turn connected to its parent thread.
 
-**Call relations**: Invoked from `apply_event` on `CodexTurnStarted`. It uses `thread_mut` only for validation; all actual turn creation happens locally.
+**Call relations**: This is used when the reducer sees a turn-start event. It calls TraceReducer::thread_mut not because it needs to edit the thread, but to prove the thread exists before creating a turn under it. If the turn id is already in use, it reports an error rather than mixing two turns together.
 
 *Call graph*: calls 1 internal fn (thread_mut); 3 external calls (clone, new, bail!).
 
@@ -3165,11 +3197,11 @@ fn end_codex_turn(
         status: ExecutionStatus,
 ```
 
-**Purpose**: Marks a Codex turn terminal, validates any thread id carried by the raw event, and closes subordinate running work tied to that turn. It is the turn-level shutdown path.
+**Purpose**: Closes a Codex turn and records how it finished. It also checks that any thread id included in the raw event agrees with the thread that originally owned the turn.
 
-**Data flow**: Takes reducer state, raw sequence/time, optional event thread id, `codex_turn_id`, and terminal `ExecutionStatus`. It first checks that any supplied thread id matches the stored turn owner, then mutates the turn's execution end fields and status. After updating the turn, it triggers termination of running code cells and closure of running inference calls associated with that turn.
+**Data flow**: It receives the event sequence number, time, an optional thread id from the event, the Codex turn id, and the final execution status. If the event supplies a thread id, it compares that id with the stored owner of the turn and rejects a mismatch. It then finds the turn, writes its end time, ending sequence, and final status. After that, related running work for the turn is closed so the trace does not show activity continuing after the turn ended.
 
-**Call relations**: Called by `apply_event` for `CodexTurnEnded`. Beyond updating the turn itself, it delegates to turn-end cleanup helpers so unfinished code cells and inference calls do not remain running after the turn has ended.
+**Call relations**: This function is reached when a turn-end event is reduced. It stands at a boundary point: once it closes the turn, it also prompts the reducer’s other cleanup paths to stop still-running code cells and inference calls tied to that turn. If the turn was never started, or if the event points to the wrong thread, it raises an error.
 
 *Call graph*: 2 external calls (bail!, clone).
 
@@ -3180,11 +3212,11 @@ fn end_codex_turn(
 fn thread_mut(&mut self, thread_id: &str) -> Result<&mut AgentThread>
 ```
 
-**Purpose**: Fetches a mutable reduced thread by id with a reducer-specific unknown-thread error. It centralizes thread existence validation.
+**Purpose**: Finds an existing thread and gives the caller permission to change it. It provides a clear error message when a trace event mentions a thread id that is not known.
 
-**Data flow**: Takes `&mut self` and a thread id string slice, looks up `rollout.threads.get_mut(thread_id)`, and returns `Result<&mut AgentThread>`. It does not transform the thread beyond returning the mutable reference.
+**Data flow**: It receives a thread id and looks in the rollout’s thread map. If the id exists, it returns a mutable reference to that AgentThread so the caller can edit it. If the id is missing, it returns an error explaining that the trace referenced an unknown thread.
 
-**Call relations**: Used by `end_thread` and `start_codex_turn`, and likely by other reducer modules through the impl block. Its role in call flow is to provide a single contextual failure mode for unknown thread references.
+**Call relations**: TraceReducer::end_thread uses this helper before writing a thread’s end information. TraceReducer::start_codex_turn uses it as a validation step before creating a turn under a thread. This keeps the same “unknown thread” rule in one place.
 
 *Call graph*: called by 2 (end_thread, start_codex_turn).
 
@@ -3198,11 +3230,11 @@ fn thread_started_metadata(
     ) -> Result<ThreadStartedMetadata>
 ```
 
-**Purpose**: Reads and deserializes a thread-start metadata payload into the private `ThreadStartedMetadata` shape. It isolates payload parsing from thread insertion logic.
+**Purpose**: Reads and parses the optional metadata attached to a thread-start event. That metadata can contain useful human and hierarchy information, such as nickname, model, task name, and spawn details.
 
-**Data flow**: Takes `&self` and a `&RawPayloadRef`, loads the payload JSON via `read_payload_json`, deserializes it with `serde_json::from_value`, and returns `ThreadStartedMetadata`. It does not mutate reducer state.
+**Data flow**: It receives a reference to a raw payload. It asks the reducer to read that payload as JSON, then converts the JSON value into a ThreadStartedMetadata structure. The result is either parsed metadata ready for start_thread to use, or an error that includes which raw payload failed to parse.
 
-**Call relations**: Called only from `start_thread` when a `metadata_payload` is present. It delegates payload file access to the shared reducer helper and keeps metadata parsing errors tied to the raw payload id.
+**Call relations**: TraceReducer::start_thread calls this when a thread-start event includes metadata. This keeps metadata parsing out of the central event flow, so the rest of the reducer can work with a clearer, typed shape instead of loose JSON.
 
 *Call graph*: 1 external calls (from_value).
 
@@ -3213,11 +3245,11 @@ fn thread_started_metadata(
 fn thread_spawn(&self) -> Option<ThreadSpawnMetadata>
 ```
 
-**Purpose**: Extracts nested subagent spawn metadata from `session_source` and normalizes fallback fields from the outer metadata object. It returns only the subset needed to derive `AgentOrigin::Spawned`.
+**Purpose**: Looks inside thread-start metadata to see whether the thread was spawned as a child agent. If so, it extracts the parent thread id and child identity details needed to draw the parent-child relationship.
 
-**Data flow**: Reads `self.session_source`, navigates to `subagent.thread_spawn`, extracts `parent_thread_id`, optional `agent_path`, optional `task_name`, and optional `agent_role`, applying fallbacks from top-level metadata fields and `task_name_from_agent_path` when needed. It returns `Option<ThreadSpawnMetadata>` and does not mutate state.
+**Data flow**: It reads the metadata’s session_source JSON and searches for the nested subagent.thread_spawn section. If that section is missing or lacks a parent thread id, it returns nothing. If it is present, it builds ThreadSpawnMetadata using the nested agent path, task name, and agent role when available, falling back to top-level metadata where appropriate. It may also derive a task name from the agent path.
 
-**Call relations**: Used by `start_thread` after metadata deserialization to decide whether the thread is a spawned child and to gather the authoritative child identity fields.
+**Call relations**: TraceReducer::start_thread uses this right after parsing thread metadata. The result decides whether the new thread is stored as AgentOrigin::Root or as AgentOrigin::Spawned with a parent link and task label.
 
 
 ##### `task_name_from_agent_path`  (lines 264–270)
@@ -3226,11 +3258,11 @@ fn thread_spawn(&self) -> Option<ThreadSpawnMetadata>
 fn task_name_from_agent_path(agent_path: &str) -> String
 ```
 
-**Purpose**: Derives a human-readable task name from the last non-empty segment of an agent path. It is the fallback naming rule when metadata does not provide an explicit task name.
+**Purpose**: Creates a readable task name from an agent path by taking the last non-empty path segment. This gives spawned agents a sensible name even when the metadata does not provide one directly.
 
-**Data flow**: Takes an `agent_path` string slice, splits from the right on `/`, selects the first non-empty segment if any, falls back to the whole path otherwise, converts the chosen segment to `String`, and returns it. It is pure.
+**Data flow**: It receives a path-like string such as a slash-separated agent path. It scans from the end, skips empty pieces, and chooses the last meaningful segment. It returns that segment as a new string, or the whole input if no better segment is found.
 
-**Call relations**: Called from `start_thread` and `ThreadStartedMetadata::thread_spawn` when task-name metadata is absent. It provides consistent fallback naming across both metadata parsing and final origin construction.
+**Call relations**: TraceReducer::start_thread uses this as a fallback when spawned-thread metadata does not include a task name. ThreadStartedMetadata::thread_spawn also uses it while building spawn metadata, so task naming stays consistent wherever the spawn information is interpreted.
 
 
 ### runtime and tool replay
@@ -3238,11 +3270,13 @@ These files reduce runtime execution and tool activity into replayable code-cell
 
 ### `rollout-trace/src/reducer/code_cell.rs`
 
-`domain_logic` · `request/response reduction and runtime event handling`
+`domain_logic` · `trace reduction`
 
-This module extends `TraceReducer` with the full lifecycle for reduced `CodeCell` objects. Its core design is that the durable identity is `code_cell:{model_visible_call_id}`, while the runtime `cell_id` is only a thread-local handle used to resolve later waits and nested tool calls. To preserve the invariant that every reduced `CodeCell` points at the exact `ConversationItem` that authored the JavaScript, `CodeCellStarted` events are queued in `pending_code_cell_starts` until the matching `CustomToolCall` item appears in reduced conversation history. While a start is queued, early lifecycle events are stored in `pending_code_cell_lifecycle_events`, sorted by `RawEventSeq`, then replayed once the cell materializes.
+A code cell is the trace’s way of showing JavaScript that the model asked to run with an exec-style tool call. The tricky part is that two timelines are involved. The model-visible conversation item may only appear when an inference response is reduced, but the runtime may start executing the JavaScript earlier. Without this file, traces could show code running with no clear parent message, lose early failures, or leave code cells looking unfinished.
 
-When a cell starts, the reducer validates thread/turn ownership, finds the source item and any already-visible output items, backfills nested tool-call links by scanning existing `rollout.tool_calls`, and inserts a `CodeCell` with `ExecutionWindow` set to running and `runtime_status` set to `Starting`. Later helpers record initial response timestamps, yielded timestamps, terminal status, and reverse producer links from conversation output items. The file also maintains the `(thread_id, runtime_cell_id) -> code_cell_id` bridge so runtime-scoped identifiers can be resolved safely even when the same runtime cell id repeats across threads. Special handling for turn termination closes still-running cells on failed/cancelled/aborted turns, but deliberately leaves yielded cells alone on normal completion because they may resume via a later `wait`.
+The reducer acts like a careful clerk matching receipts to packages. If a runtime start arrives before the matching conversation item exists, it stores the start in a pending list. When later conversation reduction creates the model-visible item, the reducer creates the CodeCell, links it to its source item, and replays any early lifecycle events that were waiting.
+
+The file also records when a code cell first responds, yields, ends, or is force-closed because its owning turn failed or was cancelled. It connects nested tool calls back to the code cell that requested them, and it links wait calls by reading the runtime cell id from the wait tool’s arguments. Finally, it maintains a bridge from short-lived runtime cell ids to stable reduced code-cell ids, scoped by thread so identical runtime ids in different threads do not collide.
 
 #### Function details
 
@@ -3252,11 +3286,11 @@ When a cell starts, the reducer validates thread/turn ownership, finds the sourc
 fn start_or_queue_code_cell(&mut self, pending: PendingCodeCellStart) -> Result<()>
 ```
 
-**Purpose**: Accepts a parsed code-cell start event and either materializes the `CodeCell` immediately or stores it until the model-visible source `custom_tool_call` item exists. It also rejects duplicate starts against both live and pending state.
+**Purpose**: This starts a code cell if the conversation item that requested it is already known. If that source item has not appeared yet, it safely queues the start so the final trace will still point to the right model-visible request.
 
-**Data flow**: Consumes a `PendingCodeCellStart` containing event timing, thread/turn context, reduced `code_cell_id`, runtime cell id, model-visible call id, and source JS. It checks reducer state via `source_item_id_for_pending_code_cell`; if no source item is yet reduced, it inserts the payload into `self.pending_code_cell_starts`. Otherwise it forwards the same payload into `start_code_cell` and returns that result.
+**Data flow**: It receives a pending code-cell start, including timing, thread, turn, runtime id, model-visible call id, and JavaScript source. It checks whether the matching conversation item exists. If not, it stores the start by code-cell id; if yes, it passes the start on to be fully inserted. It errors if the same cell is started twice.
 
-**Call relations**: This is the entry path for code-cell start events after outer event dispatch has parsed them. It first probes conversation-derived availability through `source_item_id_for_pending_code_cell`; only when ownership can be proven does it delegate to `TraceReducer::start_code_cell`, otherwise it preserves the event for later replay.
+**Call relations**: This is the first stop for runtime start events. It asks `TraceReducer::source_item_id_for_pending_code_cell` whether the parent conversation item exists, and either waits or hands the work to `TraceReducer::start_code_cell`.
 
 *Call graph*: calls 2 internal fn (source_item_id_for_pending_code_cell, start_code_cell); 1 external calls (bail!).
 
@@ -3267,11 +3301,11 @@ fn start_or_queue_code_cell(&mut self, pending: PendingCodeCellStart) -> Result<
 fn flush_pending_code_cell_starts(&mut self) -> Result<()>
 ```
 
-**Purpose**: Scans queued code-cell starts and materializes any whose source conversation item has become available after inference or compaction reduction. It is the bridge that turns previously blocked runtime starts into real `CodeCell` nodes.
+**Purpose**: This revisits code-cell starts that were waiting for their model-visible source item. It lets delayed conversation data unlock runtime cells that had already begun executing.
 
-**Data flow**: Reads `self.pending_code_cell_starts`, tests each pending entry with `source_item_id_for_pending_code_cell`, collects ready ids into a temporary vector, removes each ready entry from the pending map, and passes it to `start_code_cell`. It mutates reducer state by shrinking the pending queue and inserting live code cells.
+**Data flow**: It scans the queued starts and checks each one against the current conversation items. Starts whose source item now exists are removed from the pending map and converted into real CodeCell records. Starts that are still missing their source stay queued.
 
-**Call relations**: This is invoked from conversation reconciliation paths after new model-visible items are created. It does not create cells itself; instead it identifies newly unblocked starts and hands each one to `TraceReducer::start_code_cell`.
+**Call relations**: This is called after parts of the reducer create new conversation items. It uses `TraceReducer::source_item_id_for_pending_code_cell` to find newly ready starts, then calls `TraceReducer::start_code_cell` to materialize them.
 
 *Call graph*: calls 2 internal fn (source_item_id_for_pending_code_cell, start_code_cell); 1 external calls (new).
 
@@ -3282,11 +3316,11 @@ fn flush_pending_code_cell_starts(&mut self) -> Result<()>
 fn start_code_cell(&mut self, pending: PendingCodeCellStart) -> Result<()>
 ```
 
-**Purpose**: Creates the final reduced `CodeCell` record once the source conversation item is known and validated. It seeds execution timing, source/output links, runtime metadata, and any nested tool-call edges already observed while the start was pending.
+**Purpose**: This creates the actual CodeCell record once the reducer can prove which conversation item authored the JavaScript. It also links any already-known outputs and nested tool calls.
 
-**Data flow**: Consumes a `PendingCodeCellStart`, destructures event metadata, validates uniqueness, requires a `codex_turn_id`, and checks thread/turn consistency with `validate_code_cell_turn`. It resolves the source item via `source_item_id_for_code_cell_start`, gathers output item ids with `model_visible_code_cell_item_ids`, scans `self.rollout.tool_calls` for calls whose requester is `ToolCallRequester::CodeCell { code_cell_id }`, and inserts a `CodeCell` into `self.rollout.code_cells` with an `ExecutionWindow` started at the event timestamp/seq. It then ensures the thread exists, links any already-known output items through `add_code_cell_output_item`, and replays queued lifecycle events via `flush_pending_code_cell_lifecycle_events`.
+**Data flow**: It takes a pending start, validates that it belongs to an existing thread and Codex turn, finds the source conversation item, gathers output items, and builds a CodeCell with running execution status. It stores the CodeCell in the rollout, links output conversation items back to it, and replays any queued lifecycle events such as early responses or endings.
 
-**Call relations**: This is called only after `start_or_queue_code_cell` or `flush_pending_code_cell_starts` determines the source item exists. It is the central constructor for reduced code-cell state and immediately delegates follow-up linking to output-item and lifecycle replay helpers so out-of-order traces become order-insensitive.
+**Call relations**: Only `TraceReducer::start_or_queue_code_cell` and `TraceReducer::flush_pending_code_cell_starts` call this after source ownership is known. It relies on helper methods to validate the turn, find source and output items, add output links, and replay waiting lifecycle events.
 
 *Call graph*: calls 5 internal fn (add_code_cell_output_item, flush_pending_code_cell_lifecycle_events, model_visible_code_cell_item_ids, source_item_id_for_code_cell_start, validate_code_cell_turn); called by 2 (flush_pending_code_cell_starts, start_or_queue_code_cell); 2 external calls (new, bail!).
 
@@ -3300,11 +3334,11 @@ fn source_item_id_for_pending_code_cell(
     ) -> Result<Option<String>>
 ```
 
-**Purpose**: Checks whether the model-visible `CustomToolCall` item for a pending code-cell start has already been reduced. It returns only the first matching item id because a start needs proof of ownership, not the full set.
+**Purpose**: This checks whether a pending code-cell start already has a matching model-visible custom tool call item. It answers the question, “Can this queued runtime start be safely attached now?”
 
-**Data flow**: Reads a `PendingCodeCellStart`'s `thread_id` and `model_visible_call_id`, queries `model_visible_code_cell_item_ids` for `ConversationItemKind::CustomToolCall`, and returns the first id as `Option<String>`. It does not mutate reducer state.
+**Data flow**: It reads the pending start’s thread id and model-visible call id, searches conversation items for a matching custom tool call, and returns the first matching item id if one exists. It does not change the rollout.
 
-**Call relations**: This helper is used by both `start_or_queue_code_cell` and `flush_pending_code_cell_starts` to decide whether a queued start can be materialized yet.
+**Call relations**: Both `TraceReducer::start_or_queue_code_cell` and `TraceReducer::flush_pending_code_cell_starts` use this before allowing a CodeCell to be created. It delegates the actual search to `TraceReducer::model_visible_code_cell_item_ids`.
 
 *Call graph*: calls 1 internal fn (model_visible_code_cell_item_ids); called by 2 (flush_pending_code_cell_starts, start_or_queue_code_cell).
 
@@ -3321,11 +3355,11 @@ fn record_or_queue_code_cell_initial_response(
         s
 ```
 
-**Purpose**: Processes the first runtime response/status observed for a code cell, but queues it if the cell start is still pending behind conversation reduction. This preserves strict unknown-cell validation without losing fast-failure or early-yield events.
+**Purpose**: This records the runtime’s first response for a code cell, such as moving from starting to running or yielded. If the cell itself is still waiting to be created, it queues the response instead of losing it.
 
-**Data flow**: Takes event sequence/time, reduced `code_cell_id`, runtime cell id, and `CodeCellRuntimeStatus`. It checks `self.rollout.code_cells`; if the cell is absent but `self.pending_code_cell_starts` contains the id, it appends a `PendingCodeCellLifecycleEventKind::InitialResponse` into the pending lifecycle map. If the cell already exists, it forwards all fields to `record_code_cell_initial_response`; otherwise it errors.
+**Data flow**: It receives event timing, a code-cell id, runtime cell id, and runtime status. If the CodeCell exists, it updates the cell immediately. If the start is pending, it stores this lifecycle event beside that start. If neither exists, it reports an unknown-cell error.
 
-**Call relations**: This is called from runtime event dispatch for initial-response events. Depending on whether the start has already materialized, it either stores an ordered pending lifecycle event via `queue_code_cell_lifecycle_event` or delegates immediately to `TraceReducer::record_code_cell_initial_response`.
+**Call relations**: Runtime initial-response events enter through this method. It either calls `TraceReducer::record_code_cell_initial_response` now or stores the event with `TraceReducer::queue_code_cell_lifecycle_event` so `TraceReducer::flush_pending_code_cell_lifecycle_events` can replay it later.
 
 *Call graph*: calls 2 internal fn (queue_code_cell_lifecycle_event, record_code_cell_initial_response); 1 external calls (bail!).
 
@@ -3342,11 +3376,11 @@ fn record_code_cell_initial_response(
         status: Co
 ```
 
-**Purpose**: Updates an existing `CodeCell` with the runtime's first response metadata and current runtime status. It also records the first yielded timestamp when the status is `Yielded`.
+**Purpose**: This updates an existing CodeCell when its runtime first answers. It captures the first response time and the latest runtime status.
 
-**Data flow**: Looks up `self.rollout.code_cells[code_cell_id]` mutably, sets `runtime_cell_id`, initializes `initial_response_at_unix_ms` and `initial_response_seq` only if they were previously unset, conditionally sets `yielded_at_unix_ms` and `yielded_seq` when status is `Yielded`, and finally overwrites `runtime_status`. It returns `()` or errors if the cell is missing.
+**Data flow**: It looks up the CodeCell by id, stores the runtime cell id, records the first response timestamp and sequence if they were not already set, and updates the runtime status. If the response says the cell yielded, it also records when that yield happened.
 
-**Call relations**: This is the concrete updater used both for immediate initial-response handling and for replay from `flush_pending_code_cell_lifecycle_events` after a queued start becomes real.
+**Call relations**: This is the direct updater used by `TraceReducer::record_or_queue_code_cell_initial_response` for already-created cells. It is also used by `TraceReducer::flush_pending_code_cell_lifecycle_events` when replaying responses that arrived before the cell could be created.
 
 *Call graph*: called by 2 (flush_pending_code_cell_lifecycle_events, record_or_queue_code_cell_initial_response); 1 external calls (bail!).
 
@@ -3363,11 +3397,11 @@ fn end_or_queue_code_cell(
     ) -> Result<()>
 ```
 
-**Purpose**: Processes a terminal runtime event for a code cell, or queues that terminal status until the pending start can be materialized. It mirrors the initial-response path for end events.
+**Purpose**: This ends a code cell when the runtime reports completion, failure, or termination. If the cell start is still pending, it saves the end event so very fast cells are not lost.
 
-**Data flow**: Consumes event sequence/time, reduced `code_cell_id`, and terminal `CodeCellRuntimeStatus`. If the cell is already present in `self.rollout.code_cells`, it calls `end_code_cell`. If the cell is absent but its start is pending, it stores a `PendingCodeCellLifecycleEventKind::Ended` in `self.pending_code_cell_lifecycle_events`; otherwise it errors.
+**Data flow**: It receives event timing, a code-cell id, and final runtime status. If the CodeCell exists, it closes it immediately. If the start is pending, it queues an end lifecycle event. If no known or pending cell matches, it returns an error.
 
-**Call relations**: This is invoked by runtime event dispatch for code-cell end events. It either records the terminal state immediately through `TraceReducer::end_code_cell` or preserves it beside a queued start using `queue_code_cell_lifecycle_event`.
+**Call relations**: Runtime end events pass through this method. It mirrors the initial-response path by either calling `TraceReducer::end_code_cell` immediately or using `TraceReducer::queue_code_cell_lifecycle_event` for later replay.
 
 *Call graph*: calls 2 internal fn (end_code_cell, queue_code_cell_lifecycle_event); 1 external calls (bail!).
 
@@ -3384,11 +3418,11 @@ fn end_code_cell(
     ) -> Result<()>
 ```
 
-**Purpose**: Marks an existing `CodeCell` as ended and translates runtime status into the broader `ExecutionStatus` used by the rollout graph. It also backfills initial-response timing if the cell ended before any explicit initial-response event was recorded.
+**Purpose**: This marks an existing CodeCell as no longer running. It records when it ended and converts the code-cell runtime status into the broader execution status used by the trace.
 
-**Data flow**: Mutably reads `self.rollout.code_cells[code_cell_id]`, initializes `initial_response_at_unix_ms`/`initial_response_seq` if absent, sets `execution.ended_at_unix_ms`, `execution.ended_seq`, and `execution.status` using `execution_status_for_code_cell(status)`, then stores the terminal `runtime_status`. It returns `()` or errors if the cell is unknown.
+**Data flow**: It looks up the CodeCell, fills in a first-response time if one was never recorded, writes the end time and sequence, converts the runtime status into completed, failed, cancelled, or still running, and stores the final runtime status.
 
-**Call relations**: This is the terminal-state primitive used by direct end handling, queued lifecycle replay, and turn-end cleanup in `terminate_running_code_cells_for_turn_end`.
+**Call relations**: This is the central closer for code cells. It is called directly by `TraceReducer::end_or_queue_code_cell`, during queued lifecycle replay by `TraceReducer::flush_pending_code_cell_lifecycle_events`, and by `TraceReducer::terminate_running_code_cells_for_turn_end` when a turn is interrupted.
 
 *Call graph*: calls 1 internal fn (execution_status_for_code_cell); called by 3 (end_or_queue_code_cell, flush_pending_code_cell_lifecycle_events, terminate_running_code_cells_for_turn_end); 1 external calls (bail!).
 
@@ -3405,11 +3439,11 @@ fn terminate_running_code_cells_for_turn_end(
     ) ->
 ```
 
-**Purpose**: Closes still-running code cells when their owning turn ends abnormally, preventing completed traces from showing abandoned JS frames as live. It intentionally ignores normal completion because yielded cells may continue across turns via `wait`.
+**Purpose**: This closes code cells that are still running when their owning turn fails, is cancelled, or is aborted. It prevents a finished trace from falsely looking like code is still live.
 
-**Data flow**: Reads the turn's `ExecutionStatus`, maps `Failed` to `CodeCellRuntimeStatus::Failed` and `Cancelled`/`Aborted` to `Terminated`, then scans `self.rollout.code_cells` for cells with matching `codex_turn_id` and `execution.status == Running`. For each matching id it calls `end_code_cell` with the turn-end sequence/time and derived runtime status.
+**Data flow**: It receives a turn id, event timing, and the turn’s final execution status. For normal running or completed turns, it does nothing. For failed or interrupted turns, it finds running code cells in that turn and ends each one with a matching failed or terminated runtime status.
 
-**Call relations**: This is called from turn-end orchestration, after the turn status is known. It delegates actual mutation to `end_code_cell` for each affected cell.
+**Call relations**: This is used when reducing turn-end events. It calls `TraceReducer::end_code_cell` for each affected cell, but intentionally does not close yielded cells just because a turn completed normally.
 
 *Call graph*: calls 1 internal fn (end_code_cell).
 
@@ -3424,11 +3458,11 @@ fn queue_code_cell_lifecycle_event(
     )
 ```
 
-**Purpose**: Stores an early lifecycle event for a code cell whose start is still pending and keeps the queue ordered by raw event sequence. This preserves original event ordering across delayed materialization.
+**Purpose**: This stores a lifecycle event for a code cell whose start has been seen but cannot be materialized yet. It keeps early responses and endings in the right order.
 
-**Data flow**: Takes a reduced `code_cell_id` and a `PendingCodeCellLifecycleEvent`, pushes the event into `self.pending_code_cell_lifecycle_events[code_cell_id]`, then sorts that vector by `event.seq`. It mutates only the pending lifecycle-event map.
+**Data flow**: It receives a code-cell id and a pending lifecycle event. It appends the event to that cell’s waiting list and sorts the list by raw event sequence so replay follows trace order.
 
-**Call relations**: This helper is used by both `record_or_queue_code_cell_initial_response` and `end_or_queue_code_cell` when runtime lifecycle events arrive before the source conversation item exists.
+**Call relations**: This is called by `TraceReducer::record_or_queue_code_cell_initial_response` and `TraceReducer::end_or_queue_code_cell` when the CodeCell is not created yet but its start is pending. The stored events are later consumed by `TraceReducer::flush_pending_code_cell_lifecycle_events`.
 
 *Call graph*: called by 2 (end_or_queue_code_cell, record_or_queue_code_cell_initial_response).
 
@@ -3439,11 +3473,11 @@ fn queue_code_cell_lifecycle_event(
 fn flush_pending_code_cell_lifecycle_events(&mut self, code_cell_id: &str) -> Result<()>
 ```
 
-**Purpose**: Replays any queued initial-response and end events after a code cell has been created. It ensures fast or failed cells retain their runtime history even when all lifecycle events arrived before conversation reduction caught up.
+**Purpose**: This replays response and end events that arrived before a queued code cell could be created. It makes the final CodeCell reflect what really happened at runtime.
 
-**Data flow**: Removes the vector of pending events for the given `code_cell_id` from `self.pending_code_cell_lifecycle_events`. It iterates in stored order and dispatches each event by matching its enum variant: `InitialResponse` calls `record_code_cell_initial_response`, and `Ended` calls `end_code_cell` with the saved sequence/time/status.
+**Data flow**: It receives a code-cell id, removes any queued lifecycle events for that cell, and applies them in stored order. Initial-response events update the first response and status; end events close the execution window.
 
-**Call relations**: This is called at the end of `start_code_cell` so a newly inserted `CodeCell` immediately absorbs any lifecycle events that were queued while its start was blocked.
+**Call relations**: This is called at the end of `TraceReducer::start_code_cell`, right after the CodeCell is inserted. It hands each queued event to either `TraceReducer::record_code_cell_initial_response` or `TraceReducer::end_code_cell`.
 
 *Call graph*: calls 2 internal fn (end_code_cell, record_code_cell_initial_response); called by 1 (start_code_cell).
 
@@ -3458,11 +3492,11 @@ fn link_tool_call_to_code_cell(
     ) -> Result<()>
 ```
 
-**Purpose**: Adds a nested tool call id to its parent code cell when the tool requester is `ToolCallRequester::CodeCell`. It silently skips unresolved parents because queued starts are backfilled later.
+**Purpose**: This records that a nested tool call was requested by JavaScript running inside a code cell. It gives viewers a parent-child path from the code cell to the tool work it triggered.
 
-**Data flow**: Reads the `requester`; if it is not `ToolCallRequester::CodeCell`, it returns immediately. Otherwise it looks up the parent cell in `self.rollout.code_cells` and, if present, appends `tool_call_id` to `cell.nested_tool_call_ids` using `push_unique` to avoid duplicates.
+**Data flow**: It receives a tool-call id and a requester description. If the requester is not a code cell, it changes nothing. If the requester names an existing code cell, it adds the tool-call id to that cell’s nested-tool list without duplicating it. If the cell is still pending, it leaves the link to be recovered later.
 
-**Call relations**: This is called from tool-call reduction after a tool call has been reduced. If the parent code cell already exists it links immediately; if not, `start_code_cell` later reconstructs the relationship by scanning existing tool calls.
+**Call relations**: Tool-call reduction uses this after deciding who requested the tool. It uses `push_unique` for safe list insertion, and `TraceReducer::start_code_cell` can backfill links for calls that were reduced before the cell became real.
 
 *Call graph*: calls 1 internal fn (push_unique).
 
@@ -3478,11 +3512,11 @@ fn link_wait_tool_call_from_request_payload(
     ) -> Result<()>
 ```
 
-**Purpose**: Infers a `wait` tool call's relationship to a code cell by parsing the runtime `cell_id` embedded in the tool invocation arguments. This covers waits, which are model-visible tool calls rather than nested JS tool requests.
+**Purpose**: This connects a model-visible wait tool call to the runtime code cell it is waiting on. Wait calls are special because the relationship is hidden inside the tool’s JSON arguments rather than expressed as a normal nested tool requester.
 
-**Data flow**: Accepts `thread_id`, `tool_call_id`, and an optional `RawPayloadRef`. If no payload exists, or the payload JSON's `tool_name` is not `wait`, it returns. Otherwise it reads the payload JSON, extracts `payload.arguments` as a string, parses that string into JSON, extracts `cell_id`, resolves it to a reduced code-cell id with `code_cell_id_for_runtime_cell_id_if_known`, and if the cell exists appends `tool_call_id` to `cell.wait_tool_call_ids` via `push_unique`. It errors on malformed wait payloads missing arguments or `cell_id`.
+**Data flow**: It receives the thread id, tool-call id, and an optional raw request payload reference. It reads the payload, ignores it unless the tool name is `wait`, parses the JSON arguments, extracts the runtime `cell_id`, translates that runtime id to a reduced code-cell id if known, and adds the wait call to that cell’s wait list.
 
-**Call relations**: This runs during tool-call reduction for invocation payloads. It depends on the runtime-id bridge maintained elsewhere and only links when the referenced runtime cell is already known in the same thread.
+**Call relations**: This is used while reducing tool request payloads. It looks up runtime-to-code-cell mappings through `TraceReducer::code_cell_id_for_runtime_cell_id_if_known` and adds the link with `push_unique`; malformed wait payloads produce errors instead of silent bad links.
 
 *Call graph*: calls 2 internal fn (code_cell_id_for_runtime_cell_id_if_known, push_unique); 2 external calls (bail!, from_str).
 
@@ -3498,11 +3532,11 @@ fn attach_model_visible_code_cell_item(
     ) -> Result<()>
 ```
 
-**Purpose**: Links a later-observed model-visible `custom_tool_call_output` conversation item back to its existing code cell. This lets conversation history reference code-cell output without copying runtime bytes into the runtime node itself.
+**Purpose**: This attaches a later-seen custom tool output conversation item to the CodeCell that produced it. It covers the case where runtime execution was already known before the model-visible output item appeared.
 
-**Data flow**: Takes a conversation `item_id`, optional `call_id`, and item `kind`. It returns early unless `call_id` is present and `kind` is `ConversationItemKind::CustomToolCallOutput`. It derives the reduced code-cell id with `reduced_code_cell_id_for_model_visible_call`, checks whether that cell exists in `self.rollout.code_cells`, and if so delegates to `add_code_cell_output_item` to update both the cell and the conversation item producer list.
+**Data flow**: It receives a conversation item id, optional call id, and item kind. It ignores items without a call id or items that are not custom tool call outputs. For matching outputs, it derives the CodeCell id from the call id, checks that the CodeCell exists, and links the output item to it.
 
-**Call relations**: This is invoked from conversation reconciliation whenever a model-visible item is reduced. It only acts for custom-tool output items and relies on `add_code_cell_output_item` for the actual reverse-link mutation.
+**Call relations**: Conversation-item reduction calls this when new items are observed. It uses `TraceReducer::reduced_code_cell_id_for_model_visible_call` to find the expected CodeCell id and `TraceReducer::add_code_cell_output_item` to add the two-way link.
 
 *Call graph*: calls 2 internal fn (add_code_cell_output_item, reduced_code_cell_id_for_model_visible_call).
 
@@ -3519,11 +3553,11 @@ fn code_cell_event_thread_id(
     ) -> Result<String>
 ```
 
-**Purpose**: Resolves the owning thread id for a code-cell runtime event, preferring the explicit thread id but falling back to the event's Codex turn id. This centralizes compatibility logic for older/raw event paths.
+**Purpose**: This finds the thread that owns a code-cell runtime event. It prefers the thread id carried by the event, but can fall back to the event’s Codex turn id for older or less complete traces.
 
-**Data flow**: Consumes optional `thread_id`, optional `codex_turn_id`, `runtime_cell_id`, and `event_name`. If `thread_id` is present it returns it unchanged. Otherwise it requires `codex_turn_id`, looks up `self.rollout.codex_turns[codex_turn_id]`, and returns that turn's `thread_id`; missing data produces contextual errors mentioning the event and runtime cell.
+**Data flow**: It receives an optional thread id, an optional turn id, the runtime cell id, and the event name for error messages. If a thread id is present, it returns it. Otherwise it looks up the turn and returns that turn’s thread id, or errors if neither path works.
 
-**Call relations**: This helper is used by outer code-cell event dispatch before runtime ids are resolved. It avoids duplicating thread-resolution logic in each event arm.
+**Call relations**: Code-cell event reduction uses this helper before resolving runtime cell ids or storing events. It avoids repeating the same fallback logic in every event-specific branch.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -3537,11 +3571,11 @@ fn reduced_code_cell_id_for_model_visible_call(
     ) -> CodeCellId
 ```
 
-**Purpose**: Builds the stable reduced code-cell id from the model-visible `exec` call id. This encodes the design choice that model-visible call identity, not runtime cell id, is the durable graph anchor.
+**Purpose**: This creates the stable CodeCell id from the model-visible exec call id. It treats the conversation call id as the durable identity, rather than relying on the runtime’s temporary cell handle.
 
-**Data flow**: Takes `model_visible_call_id: &str` and returns `format!("code_cell:{model_visible_call_id}")`. It does not read or mutate reducer state.
+**Data flow**: It receives a model-visible call id string and returns a new id by prefixing it as a code-cell id. It reads no reducer state and changes nothing.
 
-**Call relations**: This helper is used when conversation reduction needs to attach model-visible output items back to an existing code cell.
+**Call relations**: This helper is used by `TraceReducer::attach_model_visible_code_cell_item` when connecting later output items to the CodeCell that should own them.
 
 *Call graph*: called by 1 (attach_model_visible_code_cell_item); 1 external calls (format!).
 
@@ -3557,11 +3591,11 @@ fn record_runtime_code_cell_id(
     ) -> Result<()>
 ```
 
-**Purpose**: Registers the mapping from a thread-local runtime `cell_id` to the stable reduced code-cell id. It enforces that the same `(thread, runtime_cell_id)` pair cannot point at two different reduced cells.
+**Purpose**: This records the bridge from a runtime cell id to the stable reduced CodeCell id. The bridge is scoped by thread because runtime ids can repeat in different threads.
 
-**Data flow**: Builds a composite key with `runtime_code_cell_key(thread_id, runtime_cell_id)`, checks `self.code_cell_ids_by_runtime` for an existing mapping, returns success if it already matches, errors if it conflicts, and otherwise inserts `code_cell_id.to_string()` into the map.
+**Data flow**: It receives a thread id, runtime cell id, and CodeCell id. It builds a thread-and-runtime lookup key, checks whether a mapping already exists, accepts an identical repeat, rejects conflicting mappings, and otherwise stores the new mapping.
 
-**Call relations**: This is called by outer event reduction when a runtime cell id first becomes associated with a reduced code cell. Later resolution helpers and wait/nested-tool linking depend on this bridge.
+**Call relations**: Runtime start handling uses this kind of mapping so later events, waits, and nested tools can find the correct CodeCell. It builds keys with `runtime_code_cell_key` and reports conflicts rather than overwriting them.
 
 *Call graph*: calls 1 internal fn (runtime_code_cell_key); 1 external calls (bail!).
 
@@ -3577,11 +3611,11 @@ fn code_cell_id_for_runtime_cell_id(
     ) -> Result<CodeCellId>
 ```
 
-**Purpose**: Resolves a runtime `cell_id` within a thread to the reduced `CodeCellId`, failing with a contextual error if the mapping is unknown. It is the strict lookup variant used when the caller requires the edge to exist.
+**Purpose**: This resolves a runtime cell id into the stable CodeCell id for a specific thread. It is the strict version: unknown runtime cells become clear errors.
 
-**Data flow**: Reads `thread_id`, `runtime_cell_id`, and `event_name`, delegates to `code_cell_id_for_runtime_cell_id_if_known`, and wraps a missing result with an error mentioning the event and thread. It does not mutate state.
+**Data flow**: It receives a thread id, runtime cell id, and event name. It asks the optional lookup helper for the CodeCell id. If found, it returns the id; if not, it returns an error that names the event and missing runtime cell.
 
-**Call relations**: This is used by `reduce_tool_call_requester` when converting runtime-scoped nested-tool requesters into stable reduced graph requesters.
+**Call relations**: This is called by `TraceReducer::reduce_tool_call_requester` when a raw nested-tool requester names a runtime code cell. It wraps `TraceReducer::code_cell_id_for_runtime_cell_id_if_known` with better error reporting.
 
 *Call graph*: calls 1 internal fn (code_cell_id_for_runtime_cell_id_if_known); called by 1 (reduce_tool_call_requester).
 
@@ -3596,11 +3630,11 @@ fn code_cell_id_for_runtime_cell_id_if_known(
     ) -> Option<CodeCellId>
 ```
 
-**Purpose**: Performs the optional lookup from `(thread_id, runtime_cell_id)` to reduced `CodeCellId`. It is the lenient variant used when missing mappings should simply defer linking.
+**Purpose**: This does a quiet lookup from thread-local runtime cell id to stable CodeCell id. It is useful when an unknown mapping is allowed and should simply mean “not linked yet.”
 
-**Data flow**: Constructs the composite key with `runtime_code_cell_key`, reads `self.code_cell_ids_by_runtime`, and returns a cloned `Option<CodeCellId>`. It does not mutate reducer state.
+**Data flow**: It receives a thread id and runtime cell id, builds the combined lookup key, and returns the stored CodeCell id if present. It does not change state and returns nothing if the mapping is unknown.
 
-**Call relations**: This helper underpins both the strict resolver `code_cell_id_for_runtime_cell_id` and the best-effort wait-linking path in `link_wait_tool_call_from_request_payload`.
+**Call relations**: The strict resolver `TraceReducer::code_cell_id_for_runtime_cell_id` uses this and turns a miss into an error. `TraceReducer::link_wait_tool_call_from_request_payload` uses it directly because a wait link can be skipped when the cell is not known yet.
 
 *Call graph*: calls 1 internal fn (runtime_code_cell_key); called by 2 (code_cell_id_for_runtime_cell_id, link_wait_tool_call_from_request_payload).
 
@@ -3615,11 +3649,11 @@ fn reduce_tool_call_requester(
     ) -> Result<ToolCallRequester>
 ```
 
-**Purpose**: Converts a raw tool-call requester from event payloads into the reduced `ToolCallRequester` enum used in the rollout graph. For code-mode requesters it replaces the runtime cell handle with the stable reduced code-cell id.
+**Purpose**: This converts a raw requester description into the stable requester form used in the reduced trace. In particular, it turns runtime code-cell handles into stable CodeCell ids.
 
-**Data flow**: Consumes `thread_id` and a `RawToolCallRequester`. It maps `RawToolCallRequester::Model` directly to `ToolCallRequester::Model`; for `RawToolCallRequester::CodeCell { runtime_cell_id }` it resolves the runtime id through `code_cell_id_for_runtime_cell_id` and returns `ToolCallRequester::CodeCell { code_cell_id }`.
+**Data flow**: It receives a thread id and a raw requester. Model requesters pass through as model requesters. Code-cell requesters carry a runtime cell id, which it resolves to a stable CodeCell id and returns as a code-cell requester.
 
-**Call relations**: This is called during tool-call reduction at the boundary between raw event payloads and reduced graph state. It delegates runtime-id resolution to the strict lookup helper so nested tool calls cannot attach to unknown cells.
+**Call relations**: Tool-call reduction uses this at the boundary between raw events and the reduced graph. It calls `TraceReducer::code_cell_id_for_runtime_cell_id` so nested JavaScript tool calls are anchored to the correct CodeCell.
 
 *Call graph*: calls 1 internal fn (code_cell_id_for_runtime_cell_id).
 
@@ -3630,11 +3664,11 @@ fn reduce_tool_call_requester(
 fn validate_code_cell_turn(&self, thread_id: &str, codex_turn_id: &str) -> Result<()>
 ```
 
-**Purpose**: Checks that a code-cell start references an existing thread and an existing Codex turn that belongs to that thread. It prevents cross-thread or dangling turn associations from entering reduced state.
+**Purpose**: This checks that a code-cell start refers to a real thread and a real Codex turn, and that they belong together. It protects the trace from attaching runtime work to the wrong turn.
 
-**Data flow**: Reads `thread_id` and `codex_turn_id`, verifies `self.rollout.threads` contains the thread, fetches `self.rollout.codex_turns[codex_turn_id]`, and compares `turn.thread_id` to the supplied thread. It returns `()` on success or errors on any mismatch.
+**Data flow**: It receives a thread id and turn id. It verifies the thread exists, verifies the turn exists, and confirms the turn’s stored thread id matches the supplied thread id. It returns success or a specific error.
 
-**Call relations**: This validation is performed inside `start_code_cell` before the reducer inserts the `CodeCell`.
+**Call relations**: `TraceReducer::start_code_cell` calls this before inserting a CodeCell. That means bad ownership is caught before any partial CodeCell is written into the rollout.
 
 *Call graph*: called by 1 (start_code_cell); 1 external calls (bail!).
 
@@ -3650,11 +3684,11 @@ fn model_visible_code_cell_item_ids(
     ) -> Vec<String>
 ```
 
-**Purpose**: Finds conversation items in a thread that share a given model-visible call id and item kind. It is the common query used to locate both the source `custom_tool_call` item and any `custom_tool_call_output` items.
+**Purpose**: This finds conversation items in a thread that match a model-visible code-cell call id and a requested item kind. It is the shared search tool for source and output items.
 
-**Data flow**: Scans `self.rollout.conversation_items.values()`, filters by `item.thread_id == thread_id`, `item.call_id == Some(call_id)`, and `item.kind == kind`, then collects matching `item_id` strings into a vector. It is read-only.
+**Data flow**: It reads all reduced conversation items and filters them by thread id, call id, and kind. It returns the matching item ids as strings and does not mutate anything.
 
-**Call relations**: This helper supports source-item discovery for pending and starting code cells and output-item collection during `start_code_cell`.
+**Call relations**: `TraceReducer::source_item_id_for_pending_code_cell`, `TraceReducer::source_item_id_for_code_cell_start`, and `TraceReducer::start_code_cell` use this to locate the model-visible pieces that should be connected to a CodeCell.
 
 *Call graph*: called by 3 (source_item_id_for_code_cell_start, source_item_id_for_pending_code_cell, start_code_cell).
 
@@ -3670,11 +3704,11 @@ fn source_item_id_for_code_cell_start(
     ) -> Result<String>
 ```
 
-**Purpose**: Resolves the required source `CustomToolCall` conversation item for a code-cell start and errors if none was observed. It is the strict version used once the reducer has decided the start should materialize now.
+**Purpose**: This finds the exact conversation item that authored a code-cell start. Unlike the pending check, this requires the item to exist and errors if it does not.
 
-**Data flow**: Queries `model_visible_code_cell_item_ids` for `ConversationItemKind::CustomToolCall`, takes the first result, and returns it as `String`. If no item exists, it produces an error naming both the reduced code-cell id and the model-visible call id.
+**Data flow**: It receives the thread id, CodeCell id, and model-visible call id. It searches for a matching custom tool call item and returns the first item id. If none is found, it returns an explanatory error.
 
-**Call relations**: This is called from `start_code_cell` after turn validation, when the reducer is ready to construct the final `CodeCell` and needs a guaranteed source item id.
+**Call relations**: `TraceReducer::start_code_cell` calls this immediately before creating the CodeCell. It uses `TraceReducer::model_visible_code_cell_item_ids` for the search and enforces the rule that every CodeCell must have a source item.
 
 *Call graph*: calls 1 internal fn (model_visible_code_cell_item_ids); called by 1 (start_code_cell).
 
@@ -3685,11 +3719,11 @@ fn source_item_id_for_code_cell_start(
 fn add_code_cell_output_item(&mut self, code_cell_id: &str, item_id: &str) -> Result<()>
 ```
 
-**Purpose**: Adds a conversation output item id to a code cell and adds the reciprocal `ProducerRef::CodeCell` to the conversation item. It keeps both sides of the relationship synchronized and deduplicated.
+**Purpose**: This links a CodeCell to a conversation item that represents its custom tool output. It records the relationship in both directions so viewers can navigate either way.
 
-**Data flow**: Looks up the target `CodeCell` mutably, appends `item_id` to `cell.output_item_ids` via `push_unique`, then looks up the `ConversationItem` mutably and pushes `ProducerRef::CodeCell { code_cell_id }` into `item.produced_by` if absent. It errors if either side is missing.
+**Data flow**: It receives a CodeCell id and conversation item id. It adds the item id to the CodeCell’s output list without duplicates, then adds a producer reference to the conversation item showing it was produced by that CodeCell. It errors if either record has disappeared.
 
-**Call relations**: This helper is used both when a code cell starts and already has visible output items, and later when conversation reduction observes a new `custom_tool_call_output` item for an existing cell.
+**Call relations**: `TraceReducer::start_code_cell` uses this for outputs already visible at creation time, and `TraceReducer::attach_model_visible_code_cell_item` uses it for outputs discovered later. It relies on `push_unique` for duplicate-safe insertion.
 
 *Call graph*: calls 1 internal fn (push_unique); called by 2 (attach_model_visible_code_cell_item, start_code_cell); 1 external calls (bail!).
 
@@ -3700,11 +3734,11 @@ fn add_code_cell_output_item(&mut self, code_cell_id: &str, item_id: &str) -> Re
 fn execution_status_for_code_cell(status: &CodeCellRuntimeStatus) -> ExecutionStatus
 ```
 
-**Purpose**: Maps fine-grained `CodeCellRuntimeStatus` values into the coarser `ExecutionStatus` stored in `ExecutionWindow`. It preserves running semantics for `Starting`, `Running`, and `Yielded` while translating terminal runtime states to completed/failed/cancelled.
+**Purpose**: This translates a code-cell-specific runtime status into the general execution status used across the trace. It makes CodeCell endings comparable with other execution windows.
 
-**Data flow**: Takes a borrowed `CodeCellRuntimeStatus` and returns the corresponding `ExecutionStatus` by pattern match. It is pure and stateless.
+**Data flow**: It receives a CodeCellRuntimeStatus. Starting, running, and yielded become running; completed becomes completed; failed becomes failed; terminated becomes cancelled.
 
-**Call relations**: This function is used only by `TraceReducer::end_code_cell` when finalizing a code cell's execution window.
+**Call relations**: `TraceReducer::end_code_cell` calls this when closing a CodeCell so the cell’s execution window uses the common trace status language.
 
 *Call graph*: called by 1 (end_code_cell).
 
@@ -3715,11 +3749,11 @@ fn execution_status_for_code_cell(status: &CodeCellRuntimeStatus) -> ExecutionSt
 fn push_unique(items: &mut Vec<String>, item_id: &str)
 ```
 
-**Purpose**: Appends a string id to a vector only if that exact id is not already present. It is a small deduplication helper for relationship lists.
+**Purpose**: This appends a string to a list only if it is not already there. It prevents duplicate links in lists such as outputs, nested tools, and wait calls.
 
-**Data flow**: Mutably reads a `Vec<String>` and an `item_id`, scans for equality, and pushes `item_id.to_string()` only when absent. It mutates the vector in place and returns nothing.
+**Data flow**: It receives a mutable list of strings and a string to add. It checks whether the value is already present. If not, it copies the value into the list; otherwise it leaves the list unchanged.
 
-**Call relations**: This helper is reused by code-cell output linking, nested tool-call linking, and wait-tool linking to keep edge lists free of duplicates.
+**Call relations**: `TraceReducer::add_code_cell_output_item`, `TraceReducer::link_tool_call_to_code_cell`, and `TraceReducer::link_wait_tool_call_from_request_payload` use this whenever they add relationship ids that may be observed more than once.
 
 *Call graph*: called by 3 (add_code_cell_output_item, link_tool_call_to_code_cell, link_wait_tool_call_from_request_payload).
 
@@ -3730,22 +3764,26 @@ fn push_unique(items: &mut Vec<String>, item_id: &str)
 fn runtime_code_cell_key(thread_id: &str, runtime_cell_id: &str) -> (String, String)
 ```
 
-**Purpose**: Builds the composite map key used to scope runtime cell ids by thread. This prevents collisions when the same runtime `cell_id` appears in different threads.
+**Purpose**: This builds the lookup key used to map a runtime cell id to a stable CodeCell id. It includes the thread id so identical runtime ids in different threads stay separate.
 
-**Data flow**: Takes `thread_id` and `runtime_cell_id` and returns a `(String, String)` tuple containing owned copies of both. It is pure and stateless.
+**Data flow**: It receives a thread id and runtime cell id, copies both strings, and returns them as a pair. It has no side effects.
 
-**Call relations**: This helper is used by both runtime-id recording and lookup so they share the same thread-scoped key format.
+**Call relations**: `TraceReducer::record_runtime_code_cell_id` uses this when storing mappings, and `TraceReducer::code_cell_id_for_runtime_cell_id_if_known` uses it when looking mappings up.
 
 *Call graph*: called by 2 (code_cell_id_for_runtime_cell_id_if_known, record_runtime_code_cell_id).
 
 
 ### `rollout-trace/src/reducer/tool.rs`
 
-`domain_logic` · `trace replay during tool lifecycle events and transcript back-linking`
+`domain_logic` · `event reduction during trace building`
 
-This module turns raw tool lifecycle events into reduced `ToolCall` objects while coordinating several adjacent domains. `ToolCallStarted` is a typed wrapper for the raw start-event fields so the dispatcher can pass one structured argument instead of a long positional list. `start_tool_call` validates uniqueness of both `tool_call_id` and optional `model_visible_call_id`, resolves the owning thread either directly or through the referenced Codex turn, validates thread/turn consistency, reduces the requester, and discovers any already-reduced model-visible call/output conversation items for the same call id. It may also create a terminal operation immediately from the canonical invocation payload for direct tools like `write_stdin`, replacing the generic summary with `ToolCallSummary::Terminal` when appropriate.
+A “tool call” is when the system asks some outside capability to do work, such as running a command, writing to a terminal, or calling an MCP tool. The raw event stream can describe that work in pieces: a dispatch start, a runtime start, output seen in the conversation, a runtime end, and a final result. This file is the part of the reducer that stitches those pieces into one understandable object.
 
-After insertion, the module performs several reverse-link repairs that matter because replay order is not guaranteed to be transcript-first: it links the tool to a code cell if the requester came from one, associates the tool with any inference response that emitted its call item, attaches already-known output items as `ProducerRef::Tool`, and synchronizes terminal model observations. Runtime begin/end events append unique raw runtime payload ids and may create or complete terminal operations or multi-agent interaction edges. `end_tool_call` records terminal status and result payload ids, optionally ends a terminal operation from the canonical result when no runtime payloads exist, and attaches result payload evidence to any agent interaction edge. The remaining helpers enforce invariants and maintain one-to-one mappings between model-visible call ids and reduced tool calls.
+Think of it like assembling a package’s tracking history from scans at different warehouses. Each scan has only part of the story, so this code checks the package ID, finds the right route, and links every scan to the same delivery.
+
+The main work happens when a tool starts or ends. On start, the reducer checks that the tool is not duplicated, finds its thread, connects it to any model-visible call items already seen, and creates a `ToolCall` record. If the tool is terminal-backed, it also starts or links a richer terminal operation. On end, it records finish time, status, result payload, and closes related terminal or agent activity when appropriate.
+
+The file also handles ordering surprises. Conversation items may appear before or after the tool object. Runtime observations may add extra facts later. Helper functions keep links unique and stop contradictory data, such as two tools claiming the same model-visible call.
 
 #### Function details
 
@@ -3761,11 +3799,11 @@ fn start_tool_call(
         started: ToolCallStar
 ```
 
-**Purpose**: Creates a reduced `ToolCall` from a raw tool-start event, validates identity invariants, and establishes all immediately knowable links to transcript, terminal, code-cell, and inference structures. It is the main entry for tool reduction.
+**Purpose**: Creates the main record for a tool call when a raw “tool started” event arrives. It also links that tool to the right thread, Codex turn, model-visible conversation items, terminal operation, and inference response so later readers can see why the tool ran and what it belonged to.
 
-**Data flow**: Takes reducer state, raw sequence/time, optional thread id, optional turn id, and a `ToolCallStarted` bundle. It rejects duplicate tool ids, ensures the optional model-visible call id is not already claimed by another tool, resolves and validates the owning thread/turn, reduces requester information, gathers existing model-visible call/output item ids, optionally starts a terminal operation from the invocation payload, stores raw invocation payload id, inserts a running `ToolCall` into `rollout.tool_calls`, then post-processes links to code cells, inference responses, output items, and terminal observations.
+**Data flow**: It receives the event sequence number, wall-clock time, optional thread and turn identifiers, and a grouped set of tool-start fields. It checks that the tool call ID is new, checks that any model-visible call ID is not already claimed by another tool, works out the thread, validates the turn, finds any already-seen call or output conversation items, possibly starts a terminal operation from the invocation payload, stores the new `ToolCall`, and then adds reverse links from output items and inference responses. The result is either an updated rollout trace with a new connected tool call, or an error if the event contradicts existing trace data.
 
-**Call relations**: Called by `apply_event` on `ToolCallStarted`. It delegates thread resolution to `tool_thread_id`, consistency checks to `validate_tool_turn`, uniqueness checks to `ensure_unique_model_visible_tool_call`, terminal creation to terminal subreducers, and reverse-link maintenance to `add_tool_output_item` and `link_tool_to_inference_response`.
+**Call relations**: This is the main entry point in this file for tool-start events. It relies on `TraceReducer::tool_thread_id`, `TraceReducer::validate_tool_turn`, and `TraceReducer::ensure_unique_model_visible_tool_call` for safety checks, then uses `TraceReducer::add_tool_output_item` and `TraceReducer::link_tool_to_inference_response` to connect the new tool to conversation and inference records. If a required condition fails, it stops with an error through `bail!`.
 
 *Call graph*: calls 5 internal fn (add_tool_output_item, ensure_unique_model_visible_tool_call, link_tool_to_inference_response, tool_thread_id, validate_tool_turn); 2 external calls (new, bail!).
 
@@ -3780,11 +3818,11 @@ fn assign_mcp_tool_call_correlation(
     ) -> Result<()>
 ```
 
-**Purpose**: Stores the bridge-visible MCP call id on an already-created tool call. It enforces that correlation is assigned exactly once.
+**Purpose**: Adds the MCP call ID to a tool call after the generic tool record already exists. MCP means “Model Context Protocol,” a bridge protocol used to call external tools; this ID connects the local tool call to the protocol-level call.
 
-**Data flow**: Takes mutable reducer state, a `tool_call_id`, and an `McpCallId`. It looks up the tool call in `rollout.tool_calls`, replaces `mcp_call_id` if currently `None`, errors if the tool is unknown or already had a correlation, and returns `Ok(())`.
+**Data flow**: It receives a tool call ID and an MCP call ID. It looks up the existing tool call, stores the MCP ID if none was set before, and returns success. If the tool call does not exist or already has an MCP ID, it returns an error instead of silently overwriting the data.
 
-**Call relations**: Invoked from `apply_event` when an `McpToolCallCorrelationAssigned` event arrives after the generic tool call exists. It does not delegate further because the operation is a simple in-place enrichment.
+**Call relations**: This function is used after a tool has already been started by `TraceReducer::start_tool_call`. It does not create a tool call itself; it only enriches one with the bridge-visible MCP identifier. If the event points at a missing or already-correlated tool, it reports that through `bail!`.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -3801,11 +3839,11 @@ fn end_tool_call(
         result_payload: Option<RawPayl
 ```
 
-**Purpose**: Marks a tool call terminal, records its canonical result payload, optionally completes a terminal operation from that result, and attaches result evidence to any agent interaction edge. It is the generic tool-end reducer.
+**Purpose**: Marks a tool call as finished from the canonical dispatch result. It records when the tool ended, whether it succeeded or failed, and the raw result payload, and it may also close related terminal or agent activity.
 
-**Data flow**: Takes reducer state, raw sequence/time, `tool_call_id`, terminal `ExecutionStatus`, and optional result payload ref. It mutates the matching `ToolCall` execution end fields and `raw_result_payload_id`, captures whether terminal completion should come from the result payload, optionally calls `end_terminal_operation`, then forwards the result payload ref to agent-edge attachment logic. It returns `Ok(())` or errors on unknown tool ids.
+**Data flow**: It receives the end event’s sequence number and time, the tool call ID, the final execution status, and an optional result payload. It updates the stored `ToolCall` with end time, end sequence, status, and result payload ID. If this tool has a terminal operation that was not already driven by runtime payloads, it ends that terminal operation too. It also gives the result payload to the agent-interaction linking logic. It returns success after updating the trace, or an error if the tool call ID is unknown.
 
-**Call relations**: Called by `apply_event` for `ToolCallEnded`. It delegates terminal completion only when the tool has a terminal operation and no runtime payloads were recorded, and it delegates payload propagation to `attach_agent_interaction_tool_result` so pending or resolved agent edges retain the canonical result evidence.
+**Call relations**: This is the matching close-out path for a tool created by `TraceReducer::start_tool_call`. It clones stored identifiers so it can safely update related terminal and agent records after releasing the mutable borrow of the tool call. If the tool is unknown, it reports the broken event stream through `bail!`.
 
 *Call graph*: 2 external calls (bail!, clone).
 
@@ -3822,11 +3860,11 @@ fn start_tool_runtime_observation(
     ) -> Resul
 ```
 
-**Purpose**: Processes a runtime-begin payload for an existing tool call, recording raw runtime evidence and creating richer runtime-derived children such as terminal operations or agent edges. It is the runtime-start enrichment path.
+**Purpose**: Records a lower-level runtime “begin” observation for a tool that has already started. These runtime events can add facts that the dispatch event did not know, such as terminal details or agent interaction information.
 
-**Data flow**: Takes reducer state, raw sequence/time, `tool_call_id`, and runtime payload ref. It looks up the tool call, appends the runtime payload id uniquely to `raw_runtime_payload_ids`, checks whether creating another terminal operation would be invalid, optionally starts a terminal operation from the runtime payload, updates the tool summary and `terminal_operation_id` if one was newly created, synchronizes terminal model observations when relevant, and starts any supported agent interaction from the runtime payload.
+**Data flow**: It receives the event sequence, time, tool call ID, and a raw runtime payload. It finds the tool, adds the payload ID to the tool’s list of runtime payloads without duplicating it, checks that terminal-like tools do not accidentally create a second terminal operation, and then lets terminal and agent-specific logic read the runtime payload. If a terminal operation is created, the tool’s summary is updated to point at that richer terminal record. The result is an enriched tool call and possibly new linked domain records.
 
-**Call relations**: Invoked from `apply_event` on `ToolCallRuntimeStarted`. It delegates terminal parsing/creation to terminal subreducers and multi-agent edge creation to `start_agent_interaction_from_runtime`, while using `push_unique` locally to preserve runtime payload ids without duplication.
+**Call relations**: This function runs after `TraceReducer::start_tool_call` when runtime-level details arrive. It uses `push_unique` to remember the payload once and uses `matches!` to guard special terminal-backed kinds. If the observation would create inconsistent state, such as a second terminal operation for the same command, it stops with `bail!`.
 
 *Call graph*: calls 1 internal fn (push_unique); 2 external calls (bail!, matches!).
 
@@ -3843,11 +3881,11 @@ fn end_tool_runtime_observation(
         runtime_payload
 ```
 
-**Purpose**: Processes a runtime-end payload for an existing tool call, recording raw runtime evidence and completing any runtime-backed terminal or agent interaction state. It is the runtime-end counterpart to runtime-start reduction.
+**Purpose**: Records a lower-level runtime “end” observation for an already-started tool. This is important for tools whose real output and finish status come from runtime events rather than only from the dispatch result.
 
-**Data flow**: Takes reducer state, raw sequence/time, `tool_call_id`, terminal status, and runtime payload ref. It appends the runtime payload id uniquely to the tool call, captures the owning thread and optional terminal operation id, optionally ends the terminal operation with the runtime payload as response evidence, then ends or enriches any agent interaction derived from that runtime payload.
+**Data flow**: It receives the event sequence, time, tool call ID, final status, and raw runtime payload. It finds the tool, remembers the runtime payload ID once, retrieves the linked terminal operation if there is one, and ends that terminal operation using the runtime payload as its evidence. It also gives the runtime payload to agent-interaction ending logic. It returns success after updating linked records, or an error if the tool call is missing.
 
-**Call relations**: Called by `apply_event` for `ToolCallRuntimeEnded`. It delegates terminal completion to `end_terminal_operation` and multi-agent completion to `end_agent_interaction_from_runtime`.
+**Call relations**: This is the runtime-level partner to `TraceReducer::start_tool_runtime_observation`. It uses `push_unique` to avoid duplicate payload references, then hands off to terminal and agent-specific ending logic when the tool has those richer records. If the raw event references a tool that was never started, it reports that through `bail!`.
 
 *Call graph*: calls 1 internal fn (push_unique); 1 external calls (bail!).
 
@@ -3863,11 +3901,11 @@ fn attach_model_visible_tool_item(
     ) -> Result<()>
 ```
 
-**Purpose**: Back-links a newly reduced conversation item to its corresponding tool call when transcript reduction observes the item after the tool object already exists. It keeps tool/transcript relationships correct despite replay ordering.
+**Purpose**: Links a conversation item to an existing tool call when that conversation item is observed after the tool call was already reduced. This keeps the trace correct even when events arrive in an inconvenient order.
 
-**Data flow**: Takes mutable reducer state, a conversation `item_id`, optional model-visible `call_id`, and the item's `ConversationItemKind`. If no call id is present it returns immediately. Otherwise it resolves the unique tool for that call id and, depending on whether the item is a call item or output item, appends the item id to the appropriate tool field, updates inference-response linkage, and re-syncs terminal model observations.
+**Data flow**: It receives a conversation item ID, an optional model-visible call ID, and the item kind. If there is no call ID, it does nothing. For call items, it finds the single matching tool, adds the item to the tool’s call-item list, links the tool to any inference response that produced that item, and refreshes terminal observation links. For output items, it adds the item to the tool’s output list and marks the item as produced by the tool. Message, reasoning, and compaction marker items are ignored because they are not tool call/output records.
 
-**Call relations**: This is called from transcript/conversation reduction when model-visible tool items are materialized. It delegates tool lookup to `single_tool_for_model_visible_call`, then uses `add_tool_call_item`, `add_tool_output_item`, and `link_tool_to_inference_response` to update the already-inserted tool.
+**Call relations**: Transcript reduction calls this when it later discovers conversation items that belong to a tool. The function uses `TraceReducer::single_tool_for_model_visible_call` to find the right tool, then delegates the actual linking to `TraceReducer::add_tool_call_item`, `TraceReducer::add_tool_output_item`, and `TraceReducer::link_tool_to_inference_response` as needed.
 
 *Call graph*: calls 4 internal fn (add_tool_call_item, add_tool_output_item, link_tool_to_inference_response, single_tool_for_model_visible_call).
 
@@ -3882,11 +3920,11 @@ fn tool_thread_id(
     ) -> Result<String>
 ```
 
-**Purpose**: Resolves the owning thread id for a tool-start event from either explicit thread context or the referenced Codex turn. It enforces that at least one source of ownership is present.
+**Purpose**: Determines which conversation thread a tool call belongs to. A thread may be stated directly, or it may be inferred from the Codex turn that started the tool.
 
-**Data flow**: Takes `&self`, an optional owned thread id, and an optional turn id string slice. It returns the explicit thread id if present; otherwise it looks up the turn in `rollout.codex_turns` and returns that turn's thread id clone; if neither is available or the turn is unknown, it returns an error.
+**Data flow**: It receives an optional thread ID and an optional Codex turn ID. If the thread ID is present, it returns it immediately. If not, it requires a Codex turn ID, looks up that turn in the rollout, and returns the turn’s thread ID. If neither path works, it returns an error explaining what context is missing or unknown.
 
-**Call relations**: Used only by `start_tool_call` before tool insertion. It isolates the event-context resolution logic so the main start path can work with a concrete thread id.
+**Call relations**: `TraceReducer::start_tool_call` calls this early because every stored tool call must belong to a thread. It uses `bail!` when the raw start event does not provide enough information to place the tool in the trace.
 
 *Call graph*: called by 1 (start_tool_call); 1 external calls (bail!).
 
@@ -3897,11 +3935,11 @@ fn tool_thread_id(
 fn validate_tool_turn(&self, thread_id: &str, codex_turn_id: Option<&str>) -> Result<()>
 ```
 
-**Purpose**: Checks that a tool-start event references an existing thread and, when a Codex turn is supplied, that the turn exists and belongs to that same thread. It prevents cross-thread tool attribution.
+**Purpose**: Checks that a tool call’s thread and Codex turn agree with each other. This prevents a tool from being recorded under one thread while claiming to come from a turn in another thread.
 
-**Data flow**: Takes `&self`, a resolved thread id, and an optional turn id. It verifies `rollout.threads` contains the thread, optionally verifies `rollout.codex_turns` contains the turn, and compares `turn.thread_id` against the supplied thread id. It returns `Ok(())` or a reducer error.
+**Data flow**: It receives a thread ID and an optional Codex turn ID. It first confirms that the thread exists. If a turn ID is provided, it confirms that the turn exists and that the turn’s stored thread matches the supplied thread. It returns success when the context is consistent, or an error when the raw event points at missing or conflicting data.
 
-**Call relations**: Called by `start_tool_call` immediately after `tool_thread_id`. It performs validation only and delegates nothing further.
+**Call relations**: `TraceReducer::start_tool_call` uses this after choosing the thread with `TraceReducer::tool_thread_id`. It acts like a gatekeeper before the tool call is inserted into the rollout, using `bail!` to stop bad links from being saved.
 
 *Call graph*: called by 1 (start_tool_call); 1 external calls (bail!).
 
@@ -3916,11 +3954,11 @@ fn ensure_unique_model_visible_tool_call(
     ) -> Result<()>
 ```
 
-**Purpose**: Enforces that a model-visible call id maps to at most one reduced tool call. It guards against duplicate tool starts for the same transcript call item.
+**Purpose**: Makes sure a model-visible call ID is not claimed by two different tool calls. This matters because the conversation transcript should point to one concrete tool execution, not several competing ones.
 
-**Data flow**: Takes `&self`, an optional model-visible call id, and the current tool call id. If no call id is present it returns success. Otherwise it looks up any existing tool via `single_tool_for_model_visible_call` and errors if a different tool already claims that call id.
+**Data flow**: It receives an optional model-visible call ID and the tool call ID that is about to be inserted. If there is no model-visible ID, it succeeds immediately. Otherwise, it asks whether a tool with that visible call ID already exists. If an existing tool is found and it is not the same tool call ID, the function returns an error; otherwise it allows the start to continue.
 
-**Call relations**: Called by `start_tool_call` before insertion. It delegates the actual lookup to `single_tool_for_model_visible_call` and exists to keep the start path's invariant checks explicit.
+**Call relations**: `TraceReducer::start_tool_call` calls this before inserting a new tool. Internally it uses `TraceReducer::single_tool_for_model_visible_call` to search existing tools and `bail!` to reject duplicate ownership.
 
 *Call graph*: calls 1 internal fn (single_tool_for_model_visible_call); called by 1 (start_tool_call); 1 external calls (bail!).
 
@@ -3934,11 +3972,11 @@ fn single_tool_for_model_visible_call(
     ) -> Result<Option<ToolCallId>>
 ```
 
-**Purpose**: Finds the unique reduced tool call associated with a given model-visible call id, if any. It also detects and rejects impossible many-to-one mappings already present in reducer state.
+**Purpose**: Finds the one tool call that matches a model-visible call ID, if such a tool exists. It also detects the bad case where more than one tool matches the same visible ID.
 
-**Data flow**: Takes `&self` and a model-visible call id, scans `rollout.tool_calls` for matching `model_visible_call_id`, returns `Ok(None)` if none match, `Ok(Some(tool_call_id))` if exactly one matches, or an error if multiple matches are found.
+**Data flow**: It receives a model-visible call ID. It scans the stored tool calls for tools whose model-visible call ID equals that value. If it finds none, it returns `None`; if it finds exactly one, it returns that tool call ID; if it finds more than one, it returns an error because the trace has become ambiguous.
 
-**Call relations**: Used by `ensure_unique_model_visible_tool_call` during tool insertion and by `attach_model_visible_tool_item` during transcript back-linking. It is the canonical lookup for model-visible call ownership.
+**Call relations**: `TraceReducer::ensure_unique_model_visible_tool_call` uses this to prevent duplicates before a tool is inserted. `TraceReducer::attach_model_visible_tool_item` uses it later to decide which tool should receive a newly observed conversation item.
 
 *Call graph*: called by 2 (attach_model_visible_tool_item, ensure_unique_model_visible_tool_call); 1 external calls (bail!).
 
@@ -3954,11 +3992,11 @@ fn model_visible_tool_item_ids(
     ) -> Vec<String>
 ```
 
-**Purpose**: Collects already-reduced conversation item ids in a thread that match a given model-visible call id and any of a supplied set of item kinds. It is used to seed tool/transcript links when the transcript was reduced first.
+**Purpose**: Finds conversation items that already belong to a model-visible tool call. It is used when a tool starts after some related transcript items have already been seen.
 
-**Data flow**: Takes `&self`, a thread id, a call id, and a slice of `ConversationItemKind`. It filters `rollout.conversation_items` by matching thread, `call_id`, and kind membership, clones the matching `item_id`s into a `Vec<String>`, and returns that vector.
+**Data flow**: It receives a thread ID, a model-visible call ID, and a list of allowed conversation item kinds. It scans all conversation items and keeps only those in the same thread, with the same call ID, and with one of the requested kinds. It returns their item IDs as a list.
 
-**Call relations**: Called by `start_tool_call` to pre-populate `model_visible_call_item_ids` and discover output items that may already exist before the tool object is inserted.
+**Call relations**: `TraceReducer::start_tool_call` uses this during insertion to pick up pre-existing call items and output items. This lets the reducer cope with event streams where the transcript and tool lifecycle events are not perfectly ordered.
 
 
 ##### `TraceReducer::add_tool_call_item`  (lines 462–468)
@@ -3967,11 +4005,11 @@ fn model_visible_tool_item_ids(
 fn add_tool_call_item(&mut self, tool_call_id: &str, item_id: &str) -> Result<()>
 ```
 
-**Purpose**: Adds a conversation call-item id to a tool call's `model_visible_call_item_ids` without duplication. It is the low-level mutator for call-item back-links.
+**Purpose**: Adds a model-visible call conversation item to a tool call’s list. This records that the transcript item is the user- or model-facing representation of that tool request.
 
-**Data flow**: Takes mutable reducer state, a tool call id, and an item id. It fetches the mutable `ToolCall`, appends the item id via `push_unique`, and returns `Ok(())` or an error if the tool disappeared.
+**Data flow**: It receives a tool call ID and a conversation item ID. It looks up the tool call, appends the item ID only if it is not already present, and returns success. If the tool call cannot be found, it returns an error because the link would have nowhere to attach.
 
-**Call relations**: Called by `attach_model_visible_tool_item` when a function/custom tool call item is observed after tool insertion. It delegates duplicate suppression to `push_unique`.
+**Call relations**: `TraceReducer::attach_model_visible_tool_item` calls this when transcript reduction discovers a function-call or custom-tool-call item for an existing tool. It relies on `push_unique` so repeated observations do not create duplicate links.
 
 *Call graph*: calls 1 internal fn (push_unique); called by 1 (attach_model_visible_tool_item); 1 external calls (bail!).
 
@@ -3982,11 +4020,11 @@ fn add_tool_call_item(&mut self, tool_call_id: &str, item_id: &str) -> Result<()
 fn add_tool_output_item(&mut self, tool_call_id: &str, item_id: &str) -> Result<()>
 ```
 
-**Purpose**: Adds a conversation output-item id to a tool call and also records the reverse `ProducerRef::Tool` on the conversation item. It maintains both directions of the tool-output relationship.
+**Purpose**: Adds a model-visible output conversation item to a tool call and marks that item as produced by the tool. This creates a two-way connection: the tool knows its output item, and the item knows which tool produced it.
 
-**Data flow**: Takes mutable reducer state, a tool call id, and an item id. It fetches the mutable `ToolCall`, appends the item id uniquely to `model_visible_output_item_ids`, then fetches the mutable conversation item and pushes `ProducerRef::Tool { tool_call_id }` into `produced_by` if not already present. It errors if either object is missing.
+**Data flow**: It receives a tool call ID and a conversation item ID. It finds the tool call, adds the item ID to the tool’s output list without duplication, then finds the conversation item and adds a `ProducerRef::Tool` entry if it is not already there. It returns success after both sides are linked, or an error if either record has disappeared.
 
-**Call relations**: Called by `start_tool_call` for output items already known at insertion time and by `attach_model_visible_tool_item` for output items observed later. It uses `push_unique` for the tool-side list and performs the conversation-item reverse link locally.
+**Call relations**: `TraceReducer::start_tool_call` uses this to attach output items that were already observed before the tool start was reduced. `TraceReducer::attach_model_visible_tool_item` uses it for output items discovered later. It calls `push_unique` for the tool-side list and uses `bail!` when the link cannot be made safely.
 
 *Call graph*: calls 1 internal fn (push_unique); called by 2 (attach_model_visible_tool_item, start_tool_call); 1 external calls (bail!).
 
@@ -3997,11 +4035,11 @@ fn add_tool_output_item(&mut self, tool_call_id: &str, item_id: &str) -> Result<
 fn link_tool_to_inference_response(&mut self, tool_call_id: &str)
 ```
 
-**Purpose**: Associates a tool call with any inference response whose response items include the tool's model-visible call item. This lets the reduced inference record know which tools were started by its output.
+**Purpose**: Connects a tool call back to the inference response that started it. An inference response is the model’s produced answer; if that answer included a tool-call item, this function records that the response launched the tool.
 
-**Data flow**: Takes mutable reducer state and a tool call id. It reads the tool's `model_visible_call_item_ids`; if none exist it returns early. Otherwise it scans all `rollout.inference_calls`, and for each inference whose `response_item_ids` contain any of those call items, it appends the tool call id to `tool_call_ids_started_by_response` if not already present.
+**Data flow**: It receives a tool call ID. It looks up the tool, copies its model-visible call item IDs, and scans inference calls for responses that include any of those items. For each matching inference call, it adds the tool call ID to the inference’s list of tools started by that response, avoiding duplicates. If the tool is missing or has no call items yet, it quietly does nothing.
 
-**Call relations**: Called after tool insertion and after later transcript back-linking in `attach_model_visible_tool_item`. It does not delegate further; it is the bridge from transcript-linked tool items back to inference-call provenance.
+**Call relations**: `TraceReducer::start_tool_call` calls this after creating a tool, and `TraceReducer::attach_model_visible_tool_item` calls it when a call item is attached later. It is the bridge from transcript-level model output to the concrete tool execution record.
 
 *Call graph*: called by 2 (attach_model_visible_tool_item, start_tool_call).
 
@@ -4012,22 +4050,24 @@ fn link_tool_to_inference_response(&mut self, tool_call_id: &str)
 fn push_unique(items: &mut Vec<String>, item_id: &str)
 ```
 
-**Purpose**: Appends a string id to a vector only if it is not already present. It is the local duplicate-suppression helper for tool-side id lists.
+**Purpose**: Adds a string to a list only if the list does not already contain it. It is a small safety helper that keeps repeated events from creating duplicate IDs.
 
-**Data flow**: Takes a mutable `Vec<String>` and an item id string slice, scans for an equal existing entry, and pushes `item_id.to_string()` only when absent. It returns no value and mutates the vector in place.
+**Data flow**: It receives a mutable list of strings and an item ID. It checks whether the ID is already present. If not, it copies the ID into the list; if it is already there, the list is left unchanged. It does not return a value.
 
-**Call relations**: Used by tool-call item linking and runtime payload tracking helpers in this file. It is a small internal utility that keeps repeated observations from duplicating ids.
+**Call relations**: `TraceReducer::add_tool_call_item`, `TraceReducer::add_tool_output_item`, `TraceReducer::start_tool_runtime_observation`, and `TraceReducer::end_tool_runtime_observation` use this whenever they record links or payload IDs that may be seen more than once.
 
 *Call graph*: called by 4 (add_tool_call_item, add_tool_output_item, end_tool_runtime_observation, start_tool_runtime_observation).
 
 
 ### `rollout-trace/src/reducer/tool/agents.rs`
 
-`domain_logic` · `trace replay during multi-agent tool runtime, transcript reduction, and replay finalization`
+`domain_logic` · `trace reduction`
 
-This module is the reducer's multi-agent edge engine. It defines two reducer-only structs: `PendingAgentInteractionEdge`, which stores a not-yet-materialized delivery edge keyed by exact author/content/target-thread matching, and `ObservedAgentResultEdge`, which wraps child-result notifications observed outside normal tool lifecycle events. The core design is deferred resolution: sender-side runtime events often arrive before the recipient thread's mailbox message becomes a reduced `ConversationItem`, so the reducer queues a pending edge rather than anchoring it imprecisely. When the matching transcript item later appears, the edge is materialized to that exact item; for spawn edges only, a final replay-end fallback can target the child thread if no delivery item ever appears.
+This file is part of the trace reducer, which converts raw recorded events into a cleaner story of what happened. Its job is to build “interaction edges”: links that say, for example, “this tool call in the parent thread created this message in the child thread” or “this child agent result was delivered back to the parent.” Think of it like drawing arrows on a whiteboard after reading a chat log, so a newcomer can follow how agents talked to each other.
 
-Runtime begin/end handlers inspect the owning tool kind and deserialize protocol payloads into the appropriate codex-protocol event types. Message-like tools (`AssignAgentTask`, `SendMessage`) queue delivery edges keyed by sender agent path and message content; `CloseAgent` creates a direct thread-targeted edge; `SpawnAgent` can resolve either from explicit spawn-end payloads or from newer sub-agent activity events. Child-result notifications are special: the source anchor is the latest assistant message in the child turn when one exists, otherwise the child thread itself, because failed/cancelled children may notify the parent without producing a final assistant transcript item. Edge upsert logic merges repeated observations by widening time bounds and extending carried item/raw-payload ids while rejecting conflicting endpoints.
+A tricky part is timing. The sender-side tool event can appear before the recipient-side conversation message has been reduced. So this file often creates a pending edge, waits for the matching message to appear, and then attaches the edge to the exact message. If the exact message never appears, spawn edges can fall back to the child thread itself, so the trace still preserves the fact that a child agent was created.
+
+The file also keeps raw payload IDs with each edge. These are the original pieces of evidence behind the reduced link. It carefully merges duplicate observations, rejects conflicting ones, and avoids linking the same delivered message twice.
 
 #### Function details
 
@@ -4037,11 +4077,11 @@ Runtime begin/end handlers inspect the owning tool kind and deserialize protocol
 fn spawn_edge_id(parent_thread_id: &str, child_thread_id: &str) -> String
 ```
 
-**Purpose**: Builds the stable interaction-edge id for a parent-to-child spawn relationship. The id format is deterministic and reused across metadata-derived and runtime-derived spawn handling.
+**Purpose**: Builds the stable ID used for the link between a parent thread and a spawned child thread. A stable ID matters because the same spawn relationship may be seen more than once and must merge into one edge, not create duplicates.
 
-**Data flow**: Takes parent and child thread id string slices, formats `edge:spawn:{parent_thread_id}:{child_thread_id}`, and returns the resulting `String`. It is pure.
+**Data flow**: It receives a parent thread ID and a child thread ID. It combines them into a single string that names the spawn edge. The output is that edge ID.
 
-**Call relations**: Called when deriving spawn origins and when reducing spawn runtime/activity events. It provides the shared identifier that lets separate observations merge onto one edge.
+**Call relations**: Spawn-related reducer code uses this when it sees either a spawn completion or a sub-agent start notification, so both observations point at the same relationship.
 
 *Call graph*: called by 2 (end_spawn_agent_interaction, end_sub_agent_activity); 1 external calls (format!).
 
@@ -4056,11 +4096,11 @@ fn start_agent_interaction_from_runtime(
     ) -> Result<()>
 ```
 
-**Purpose**: Interprets a tool runtime-begin payload as the start of a multi-agent interaction when the tool kind supports one. It creates or updates pending delivery/close edges from begin-time protocol facts.
+**Purpose**: Starts building an agent-to-agent link from a runtime “begin” event. It records that an assignment, message, or close request has begun, even if the final recipient-side evidence is not visible yet.
 
-**Data flow**: Takes mutable reducer state, a tool call id, and runtime payload ref. It reads the tool kind from `rollout.tool_calls`, parses the payload JSON into the corresponding protocol type for supported kinds, and either queues a message interaction edge, upserts a close-agent edge, or returns `Ok(())` for unsupported tool kinds.
+**Data flow**: It receives a tool call ID and a raw runtime payload. It looks up what kind of tool call this is, reads the payload into the matching event shape, and either queues a message-style edge, creates or updates a close edge, or ignores tool kinds that are not agent deliveries. The result is an updated reducer state or an error if required data is missing or malformed.
 
-**Call relations**: Called by `start_tool_runtime_observation` after generic runtime payload bookkeeping. It delegates message-edge creation to `queue_message_agent_interaction` and close-edge creation to `upsert_close_agent_interaction`.
+**Call relations**: This is one of the entry points from tool runtime event reduction into the agent-linking logic. It hands message deliveries to TraceReducer::queue_message_agent_interaction and close requests to TraceReducer::upsert_close_agent_interaction.
 
 *Call graph*: calls 2 internal fn (queue_message_agent_interaction, upsert_close_agent_interaction); 1 external calls (from_value).
 
@@ -4076,11 +4116,11 @@ fn end_agent_interaction_from_runtime(
     ) -> Result<()>
 ```
 
-**Purpose**: Interprets a tool runtime-end payload as the completion or enrichment of a multi-agent interaction. It handles both classic protocol end payloads and newer sub-agent activity payloads.
+**Purpose**: Finishes or enriches an agent interaction when a runtime “end” event arrives. It adds completion time and, for spawn events, learns which child thread was created.
 
-**Data flow**: Takes mutable reducer state, wall-clock end time, tool call id, and runtime payload ref. It reads the tool kind, loads payload JSON, branches first on whether the payload contains `agent_thread_id` to detect `SubAgentActivityEvent`, otherwise deserializes the payload according to tool kind and forwards to spawn/message/close-specific end handlers. It returns `Ok(())` or a reducer error on mismatched activity/tool combinations.
+**Data flow**: It receives the event time, the tool call ID, and the raw runtime payload. It reads the payload, detects whether it is a sub-agent activity notification or a normal tool end payload, and then routes it to the matching helper. The reducer state gains an updated pending or materialized edge.
 
-**Call relations**: Called by `end_tool_runtime_observation` after generic runtime bookkeeping. It delegates to `end_sub_agent_activity`, `end_spawn_agent_interaction`, `end_message_agent_interaction`, or `upsert_close_agent_interaction` depending on payload shape and tool kind.
+**Call relations**: This is the counterpart to TraceReducer::start_agent_interaction_from_runtime. It delegates to TraceReducer::end_sub_agent_activity, TraceReducer::end_spawn_agent_interaction, TraceReducer::end_message_agent_interaction, or TraceReducer::upsert_close_agent_interaction depending on what kind of end event was observed.
 
 *Call graph*: calls 4 internal fn (end_message_agent_interaction, end_spawn_agent_interaction, end_sub_agent_activity, upsert_close_agent_interaction); 1 external calls (from_value).
 
@@ -4097,11 +4137,11 @@ fn end_sub_agent_activity(
     ) -> Result<()>
 ```
 
-**Purpose**: Maps a `SubAgentActivityEvent` emitted on runtime end into the appropriate interaction-edge update for spawn, follow-up task, send-message, or close-agent tools. It validates that the activity kind matches the tool kind.
+**Purpose**: Interprets a sub-agent activity event and makes sure it matches the tool call that produced it. This protects the trace from recording impossible links, such as treating a close notification as a normal message.
 
-**Data flow**: Takes mutable reducer state, wall-clock time, tool call id, tool kind, and parsed activity payload. It extracts the target child thread id and matches `(tool_kind, payload.kind)`, then either computes a spawn edge id and queues a spawn delivery edge, queues a message/follow-up edge keyed by the tool edge id, upserts a close-agent edge, or errors on incompatible combinations.
+**Data flow**: It receives the event time, tool call ID, tool kind, and activity payload. It compares the tool kind with the activity kind, then either queues a spawn/message edge, updates a close edge, or returns an error for a mismatch. The output is an updated reducer state or a clear failure.
 
-**Call relations**: Reached only from `end_agent_interaction_from_runtime` when the runtime payload has `agent_thread_id`. It delegates edge construction to `queue_sub_agent_activity_message_edge`, `upsert_close_agent_interaction`, `spawn_edge_id`, and `tool_edge_id`.
+**Call relations**: TraceReducer::end_agent_interaction_from_runtime calls this when the runtime end payload names an agent thread directly. This function then hands valid message-like activity to TraceReducer::queue_sub_agent_activity_message_edge or valid close activity to TraceReducer::upsert_close_agent_interaction.
 
 *Call graph*: calls 4 internal fn (queue_sub_agent_activity_message_edge, upsert_close_agent_interaction, spawn_edge_id, tool_edge_id); called by 1 (end_agent_interaction_from_runtime); 1 external calls (bail!).
 
@@ -4118,11 +4158,11 @@ fn queue_sub_agent_activity_message_edge(
         target
 ```
 
-**Purpose**: Builds a pending interaction edge from a sub-agent activity event using the tool's invocation payload to recover the delivered message content. It packages all edge metadata before queueing or immediate resolution.
+**Purpose**: Creates the pending link for a sub-agent activity message, using details from the original tool call. This is used when the runtime reports that the target agent actually received or started work.
 
-**Data flow**: Takes mutable reducer state, wall-clock time, tool call id, edge id, edge kind, target thread id, and optional unresolved spawn fallback thread id. It reads the tool call, derives start time, sender agent path, message content from invocation arguments, and carried raw payload ids, then constructs `PendingAgentInteractionEdge` and passes it to `queue_or_resolve_agent_interaction_edge`.
+**Data flow**: It receives timing, tool, edge, target-thread, and optional fallback information. It looks up the tool call, finds the sender agent path, extracts the message text from the tool invocation, gathers raw payload IDs, and builds a pending edge. That pending edge is then either resolved to an existing conversation item or saved for later.
 
-**Call relations**: Called by `end_sub_agent_activity` for spawn and interacted activity kinds. It delegates sender lookup to `agent_path_for_thread`, message extraction to `agent_message_content_from_invocation`, payload collection to `agent_tool_payload_ids`, and final queue/resolve behavior to `queue_or_resolve_agent_interaction_edge`.
+**Call relations**: TraceReducer::end_sub_agent_activity calls this after deciding that the activity is a valid spawn, assignment, or send-message event. It relies on helpers for message text, agent identity, payload evidence, and final queue-or-resolve behavior.
 
 *Call graph*: calls 4 internal fn (agent_message_content_from_invocation, agent_path_for_thread, agent_tool_payload_ids, queue_or_resolve_agent_interaction_edge); called by 1 (end_sub_agent_activity).
 
@@ -4133,11 +4173,11 @@ fn queue_sub_agent_activity_message_edge(
 fn agent_message_content_from_invocation(&self, tool_call_id: &str) -> Result<String>
 ```
 
-**Purpose**: Extracts the `message` field from a tool invocation payload's serialized function arguments. It is used when runtime activity events identify the recipient thread but do not repeat the message body.
+**Purpose**: Extracts the actual message text that was passed to an agent tool. This lets the reducer match the sender-side tool call with the recipient-side conversation message.
 
-**Data flow**: Takes `&self` and a tool call id, looks up the tool call and its `raw_invocation_payload_id`, resolves that id through `rollout.raw_payloads`, reads the payload JSON, navigates to `payload.arguments`, parses the JSON string into `AgentMessageInvocationArgs`, and returns the `message` string. It errors if any expected field or payload is missing.
+**Data flow**: It receives a tool call ID. It finds the tool call’s raw invocation payload, reads the JSON inside it, pulls out the serialized function arguments, parses those arguments, and returns the message field. If any piece is missing or badly formatted, it returns an error.
 
-**Call relations**: Called by `queue_sub_agent_activity_message_edge`. It depends on earlier raw-payload insertion by the top-level reducer and on the tool call already having recorded its invocation payload id.
+**Call relations**: TraceReducer::queue_sub_agent_activity_message_edge uses this when an activity event does not directly carry the message text but the original tool invocation does.
 
 *Call graph*: called by 1 (queue_sub_agent_activity_message_edge); 1 external calls (from_str).
 
@@ -4152,11 +4192,11 @@ fn attach_agent_interaction_tool_result(
     ) -> Result<()>
 ```
 
-**Purpose**: Adds a canonical tool result payload id to an already resolved or still-pending multi-agent interaction edge sourced from that tool call. It preserves result evidence even when the recipient transcript item has not appeared yet.
+**Purpose**: Adds the tool result payload to the agent interaction edge that came from the same tool call. This keeps the final tool response attached to the reduced link as supporting evidence.
 
-**Data flow**: Takes mutable reducer state, a tool call id, and an optional result payload ref. If no payload is provided it returns immediately. Otherwise it searches first for an existing `interaction_edges` entry whose source anchor is that tool call and appends the payload id uniquely to `carried_raw_payload_ids`; if none exists, it searches pending edges and appends there instead.
+**Data flow**: It receives a tool call ID and an optional result payload. If there is no payload, nothing changes. If a matching edge already exists, the payload ID is added there; if the edge is still pending, the payload ID is added to the pending record instead. Duplicate payload IDs are avoided.
 
-**Call relations**: Called by `end_tool_call` after generic tool completion. It uses `tool_call_source_matches` conceptually to find the relevant edge and `push_unique` to avoid duplicate payload ids.
+**Call relations**: This function is used after tool result reduction may have produced a result payload. It connects that result evidence to either the already-materialized interaction edge or the waiting pending edge.
 
 *Call graph*: calls 1 internal fn (push_unique).
 
@@ -4172,11 +4212,11 @@ fn end_spawn_agent_interaction(
     ) -> Result<()>
 ```
 
-**Purpose**: Builds a pending spawn interaction edge from a classic spawn runtime-end payload. It records the child thread as a possible fallback target if no child-side delivery item is ever reduced.
+**Purpose**: Records the relationship created when one agent spawns another agent thread. It captures the child thread, the prompt used to start it, and the raw payload evidence.
 
-**Data flow**: Takes mutable reducer state, wall-clock time, tool call id, and parsed `CollabAgentSpawnEndEvent`. If `new_thread_id` is absent it returns success without creating an edge. Otherwise it derives the child thread id, computes the stable spawn edge id, looks up the sender agent path and carried payload ids, constructs a `PendingAgentInteractionEdge` with `unresolved_spawn_thread_id: Some(child_thread_id)`, and queues or resolves it.
+**Data flow**: It receives the end time, tool call ID, and spawn-end payload. If the payload does not name a new child thread, it does nothing. Otherwise it builds a spawn edge from the tool call to the child’s first visible task message, with a fallback to the child thread if that message never appears.
 
-**Call relations**: Called by `end_agent_interaction_from_runtime` for `ToolCallKind::SpawnAgent` classic end payloads. It delegates sender lookup to `agent_path_for_thread`, payload collection to `agent_tool_payload_ids`, id construction to `spawn_edge_id`, and final handling to `queue_or_resolve_agent_interaction_edge`.
+**Call relations**: TraceReducer::end_agent_interaction_from_runtime calls this for completed spawn-agent tool calls. It uses spawn_edge_id for the stable relationship name and passes the resulting pending edge to TraceReducer::queue_or_resolve_agent_interaction_edge.
 
 *Call graph*: calls 4 internal fn (agent_path_for_thread, agent_tool_payload_ids, queue_or_resolve_agent_interaction_edge, spawn_edge_id); called by 1 (end_agent_interaction_from_runtime).
 
@@ -4192,11 +4232,11 @@ fn end_message_agent_interaction(
         payload: &CollabAgentInteractionEndEven
 ```
 
-**Purpose**: Converts a classic message-interaction runtime-end payload into the common message-edge queueing path. It exists to adapt the end payload type to the shared helper signature.
+**Purpose**: Completes an assignment or send-message interaction by adding the end time from the runtime event. It is a small adapter around the shared message-queueing logic.
 
-**Data flow**: Takes mutable reducer state, wall-clock time, tool call id, edge kind, and parsed `CollabAgentInteractionEndEvent`, then forwards receiver thread id, prompt text, and end time to `queue_message_agent_interaction`. It returns that helper's result.
+**Data flow**: It receives the event time, tool call ID, edge kind, and end payload. It pulls the receiver thread and prompt from the payload and forwards them with the completion time. The reducer state is updated through the shared message interaction path.
 
-**Call relations**: Called by `end_agent_interaction_from_runtime` for `AssignAgentTask` and `SendMessage` classic end payloads. It is a thin adapter over `queue_message_agent_interaction`.
+**Call relations**: TraceReducer::end_agent_interaction_from_runtime calls this for assignment and send-message tool completions. It hands the work to TraceReducer::queue_message_agent_interaction so begin and end events use the same matching logic.
 
 *Call graph*: calls 1 internal fn (queue_message_agent_interaction); called by 1 (end_agent_interaction_from_runtime).
 
@@ -4213,11 +4253,11 @@ fn queue_message_agent_interaction(
         ended_a
 ```
 
-**Purpose**: Constructs a pending message-delivery edge for assign-task or send-message tools using sender thread identity and carried payload ids from the tool call. It is the common path for begin/end payloads that already include the message content.
+**Purpose**: Builds the pending link for a direct agent message, such as assigning a task or sending a message. It prepares the information needed to match the sender tool call to the recipient conversation item.
 
-**Data flow**: Takes mutable reducer state, tool call id, interaction kind, target thread id, message content, and optional end time. It reads the tool call for start time and sender thread, derives sender agent path and carried raw payload ids, constructs a `PendingAgentInteractionEdge` keyed by `tool_edge_id(tool_call_id)`, and passes it to `queue_or_resolve_agent_interaction_edge`.
+**Data flow**: It receives the tool call ID, edge kind, target thread, message text, and optional end time. It looks up the tool call, finds the sender agent path, gathers raw payload IDs, and creates a pending edge. The edge is either resolved immediately to an existing message or stored until the message appears.
 
-**Call relations**: Called from both `start_agent_interaction_from_runtime` and `end_message_agent_interaction`. It delegates sender lookup to `agent_path_for_thread`, payload collection to `agent_tool_payload_ids`, edge-id construction to `tool_edge_id`, and queue/resolve behavior to `queue_or_resolve_agent_interaction_edge`.
+**Call relations**: Both TraceReducer::start_agent_interaction_from_runtime and TraceReducer::end_message_agent_interaction call this, so begin and end observations can merge into the same edge.
 
 *Call graph*: calls 4 internal fn (agent_path_for_thread, agent_tool_payload_ids, queue_or_resolve_agent_interaction_edge, tool_edge_id); called by 2 (end_message_agent_interaction, start_agent_interaction_from_runtime).
 
@@ -4228,11 +4268,11 @@ fn queue_message_agent_interaction(
 fn agent_tool_payload_ids(&self, tool_call_id: &str) -> Result<Vec<String>>
 ```
 
-**Purpose**: Collects all raw payload ids currently associated with a tool call's invocation, runtime observations, and result. It provides the evidence list carried on interaction edges.
+**Purpose**: Collects all raw payload IDs that belong to an agent-related tool call. These IDs are the original evidence behind the cleaned-up interaction edge.
 
-**Data flow**: Takes `&self` and a tool call id, looks up the tool call, initializes an empty vector, appends `raw_invocation_payload_id`, each `raw_runtime_payload_id`, and `raw_result_payload_id` uniquely when present, and returns the resulting `Vec<String>`.
+**Data flow**: It receives a tool call ID. It looks up the tool call and collects its invocation payload, runtime payloads, and result payload if present, while avoiding duplicates. It returns the list of payload IDs.
 
-**Call relations**: Used by message, spawn, close, and sub-agent activity edge builders so every interaction edge carries the raw payload evidence that produced it. It delegates duplicate suppression to the local `push_unique` helper.
+**Call relations**: Several edge-building paths call this before creating or updating an interaction edge, so assignments, messages, spawns, and close events all carry their source evidence.
 
 *Call graph*: calls 1 internal fn (push_unique); called by 4 (end_spawn_agent_interaction, queue_message_agent_interaction, queue_sub_agent_activity_message_edge, upsert_close_agent_interaction); 1 external calls (new).
 
@@ -4248,11 +4288,11 @@ fn upsert_close_agent_interaction(
     ) -> Result<()>
 ```
 
-**Purpose**: Creates or updates a close-agent interaction edge that targets a thread directly rather than a delivered conversation item. It intentionally drops edges to unknown target threads.
+**Purpose**: Creates or updates the link that says one tool call closed or interrupted an agent thread. It avoids creating links to threads that do not exist in the reduced trace.
 
-**Data flow**: Takes mutable reducer state, tool call id, target thread id, and optional end time. If the target thread is not present in `rollout.threads`, it returns success without creating an edge. Otherwise it reads the tool start time, gathers carried raw payload ids, constructs an `InteractionEdge` with `TraceAnchor::ToolCall` source and `TraceAnchor::Thread` target, and upserts it into `rollout.interaction_edges`.
+**Data flow**: It receives a tool call ID, target thread ID, and optional end time. If the target thread is unknown, it leaves the evidence only on the tool call and creates no edge. Otherwise it gathers timing and raw payload IDs, then inserts or merges a close-agent edge pointing at the target thread.
 
-**Call relations**: Called from runtime begin/end handling and sub-agent activity handling for `CloseAgent`. It delegates payload collection to `agent_tool_payload_ids`, edge-id construction to `tool_edge_id`, and merge/insert behavior to `upsert_interaction_edge`.
+**Call relations**: Start, end, and sub-agent activity paths call this when they see close-agent information. It delegates the actual insert-or-merge behavior to TraceReducer::upsert_interaction_edge.
 
 *Call graph*: calls 3 internal fn (agent_tool_payload_ids, upsert_interaction_edge, tool_edge_id); called by 3 (end_agent_interaction_from_runtime, end_sub_agent_activity, start_agent_interaction_from_runtime); 1 external calls (new).
 
@@ -4266,11 +4306,11 @@ fn queue_agent_result_interaction_edge(
     ) -> Result<()>
 ```
 
-**Purpose**: Queues or resolves the edge from a child agent's completion result to the parent-side notification message. It chooses the most precise available source anchor from the child side.
+**Purpose**: Records the delivery of a child agent’s result back to its parent thread. It preserves this relationship even when the child did not produce a final assistant message.
 
-**Data flow**: Takes mutable reducer state and an `ObservedAgentResultEdge`. It derives `message_author` from the child thread's agent path, chooses the source anchor as the latest assistant message item in the child turn if one exists or else the child thread, constructs a `PendingAgentInteractionEdge` of kind `AgentResult` targeting the parent thread with the observed message and optional carried payload id, and passes it to `queue_or_resolve_agent_interaction_edge`.
+**Data flow**: It receives an ObservedAgentResultEdge containing timing, child and parent thread IDs, the child turn ID, message text, and optional raw payload. It tries to anchor the source to the child’s latest assistant message for that turn; if none exists, it anchors to the child thread. It then creates a pending result edge aimed at the parent thread.
 
-**Call relations**: Called by the top-level dispatcher when an `AgentResultObserved` raw event arrives. It delegates sender lookup to `agent_path_for_thread`, source-item discovery to `latest_assistant_message_item_for_turn`, and final queue/resolve behavior to `queue_or_resolve_agent_interaction_edge`.
+**Call relations**: This is used when child completion notifications are observed outside the normal tool lifecycle. It uses TraceReducer::latest_assistant_message_item_for_turn to find the best source anchor and TraceReducer::queue_or_resolve_agent_interaction_edge to match the parent-side delivered message.
 
 *Call graph*: calls 3 internal fn (agent_path_for_thread, latest_assistant_message_item_for_turn, queue_or_resolve_agent_interaction_edge).
 
@@ -4284,11 +4324,11 @@ fn resolve_pending_agent_edges_for_item(
     ) -> Result<()>
 ```
 
-**Purpose**: Attempts to resolve any pending interaction edge whose intended target is a newly reduced conversation item. It is the transcript-side hook that turns queued deliveries into concrete graph edges.
+**Purpose**: Checks whether a newly reduced conversation item is the missing target for a pending agent edge. This is how delayed recipient-side messages get connected to the sender-side tool call.
 
-**Data flow**: Takes mutable reducer state and a conversation `item_id`. It first ignores items already targeted by an interaction edge, then extracts `(thread_id, author, content)` via `inter_agent_message_item`; if that succeeds, it searches `pending_agent_interaction_edges` for a matching pending edge, removes it, and materializes it to the item via `upsert_agent_interaction_edge_for_item`.
+**Data flow**: It receives a conversation item ID. If the item is already the target of an edge, it stops. Otherwise it extracts inter-agent message details from the item, searches pending edges for the same target thread, author, and content, removes the matching pending edge, and materializes it as a real edge to this item.
 
-**Call relations**: Called from conversation reduction when a new item is inserted. It depends on `inter_agent_message_item` to recognize only true inter-agent mailbox messages and on `is_interaction_edge_target_item` to avoid double-targeting the same item.
+**Call relations**: This function runs when conversation items become available during reduction. It works with TraceReducer::inter_agent_message_item, TraceReducer::is_interaction_edge_target_item, and TraceReducer::upsert_agent_interaction_edge_for_item.
 
 *Call graph*: calls 3 internal fn (inter_agent_message_item, is_interaction_edge_target_item, upsert_agent_interaction_edge_for_item).
 
@@ -4302,11 +4342,11 @@ fn queue_or_resolve_agent_interaction_edge(
     ) -> Result<()>
 ```
 
-**Purpose**: Either resolves a pending interaction edge immediately to an already-known recipient message item or stores/merges it in the pending queue for later transcript resolution. It is the central deferred-resolution mechanism for agent edges.
+**Purpose**: Either immediately connects a pending agent edge to its matching conversation item or stores it until that item appears. It also merges repeated observations of the same edge safely.
 
-**Data flow**: Takes mutable reducer state and a `PendingAgentInteractionEdge`. It first searches for an unlinked matching recipient message item via `find_unlinked_inter_agent_message_item`; if found, it materializes the edge immediately. Otherwise it looks for an existing pending edge with the same `edge_id`; if found, it verifies all endpoint-identifying fields match, merges time bounds and carried raw payload ids, and returns. If no existing pending edge matches, it pushes the new pending edge onto `pending_agent_interaction_edges`.
+**Data flow**: It receives a PendingAgentInteractionEdge. First it searches for an already-existing matching recipient message. If found, it creates the real edge. If not, it looks for an existing pending edge with the same ID; matching data is merged, conflicting data causes an error, and entirely new data is stored for later.
 
-**Call relations**: Called by all sender-side edge builders and by agent-result handling. It delegates immediate materialization to `upsert_agent_interaction_edge_for_item`, recipient lookup to `find_unlinked_inter_agent_message_item`, and payload-list merging to `extend_unique`.
+**Call relations**: All message-like agent edge builders funnel through this function. It is the central waiting-room logic that keeps early sender events from being lost before recipient messages are reduced.
 
 *Call graph*: calls 3 internal fn (find_unlinked_inter_agent_message_item, upsert_agent_interaction_edge_for_item, extend_unique); called by 4 (end_spawn_agent_interaction, queue_agent_result_interaction_edge, queue_message_agent_interaction, queue_sub_agent_activity_message_edge); 1 external calls (bail!).
 
@@ -4317,11 +4357,11 @@ fn queue_or_resolve_agent_interaction_edge(
 fn resolve_pending_spawn_edge_fallbacks(&mut self) -> Result<()>
 ```
 
-**Purpose**: At replay end, materializes any still-pending spawn edges to their child thread when no child-side delivery item was ever reduced. It is the final reconciliation pass for spawn-only fallback semantics.
+**Purpose**: Finalizes spawn edges that never found the child’s first visible task message but do have a real child thread. This prevents failed early child agents from disappearing from the trace.
 
-**Data flow**: Takes mutable reducer state, drains `pending_agent_interaction_edges` with `std::mem::take`, iterates the drained edges, and for each edge with `unresolved_spawn_thread_id` set verifies it is a `SpawnAgent` edge and that the child thread exists. It then inserts or merges an `InteractionEdge` targeting `TraceAnchor::Thread` with no carried item ids but preserved carried raw payload ids.
+**Data flow**: It takes all pending agent edges out of the reducer. For each edge with a spawn fallback thread, it checks that the edge really is a spawn edge and that the child thread exists. Valid unresolved spawns are inserted as edges to the child thread; non-spawn fallback data causes an error; other pending edges are left unmaterialized by this pass.
 
-**Call relations**: Called once by `replay_bundle` after all raw events have been processed. It delegates final insertion/merge behavior to `upsert_interaction_edge` and intentionally ignores non-spawn pending edges because only spawn has a valid thread-level fallback.
+**Call relations**: This is used after normal item matching has had its chance. It hands valid fallback edges to TraceReducer::upsert_interaction_edge so the final reduced trace still shows the parent-child relationship.
 
 *Call graph*: calls 1 internal fn (upsert_interaction_edge); 3 external calls (new, bail!, take).
 
@@ -4336,11 +4376,11 @@ fn upsert_agent_interaction_edge_for_item(
     ) -> Result<()>
 ```
 
-**Purpose**: Materializes a pending interaction edge to a concrete recipient conversation item and records that item as carried by the edge. It is the common item-targeted edge constructor.
+**Purpose**: Turns a pending agent interaction into a real edge whose target is a specific conversation item. The target item is also recorded as content carried by the edge.
 
-**Data flow**: Takes mutable reducer state, a `PendingAgentInteractionEdge`, and a target item id string. It constructs an `InteractionEdge` with the pending edge's id, kind, source, timestamps, and raw payload ids, sets `target` to `TraceAnchor::ConversationItem { item_id }`, sets `carried_item_ids` to a one-element vector containing that item id, and upserts it.
+**Data flow**: It receives a pending edge and the target item ID. It builds an InteractionEdge pointing at that conversation item, includes the item ID in the carried item list, preserves timing and raw payload evidence, and inserts or merges it into the rollout.
 
-**Call relations**: Called by `queue_or_resolve_agent_interaction_edge` for immediate resolution and by `resolve_pending_agent_edges_for_item` when transcript reduction later reveals the target item. It delegates merge/insert behavior to `upsert_interaction_edge`.
+**Call relations**: TraceReducer::queue_or_resolve_agent_interaction_edge uses this when a matching message is already present, and TraceReducer::resolve_pending_agent_edges_for_item uses it when a newly reduced item completes a pending edge.
 
 *Call graph*: calls 1 internal fn (upsert_interaction_edge); called by 2 (queue_or_resolve_agent_interaction_edge, resolve_pending_agent_edges_for_item); 1 external calls (vec!).
 
@@ -4351,11 +4391,11 @@ fn upsert_agent_interaction_edge_for_item(
 fn upsert_interaction_edge(&mut self, edge: InteractionEdge) -> Result<()>
 ```
 
-**Purpose**: Inserts a new `InteractionEdge` or merges a repeated observation of the same edge id when endpoints match. It is the canonical storage layer for reduced interaction edges.
+**Purpose**: Inserts a new interaction edge or merges new evidence into an existing edge with the same ID. It is the safety gate that prevents one edge ID from pointing at two different relationships.
 
-**Data flow**: Takes mutable reducer state and an `InteractionEdge`. If an edge with the same id already exists, it verifies `kind`, `source`, and `target` are identical, then widens `started_at_unix_ms`/`ended_at_unix_ms` and extends `carried_item_ids` and `carried_raw_payload_ids` uniquely. If no edge exists, it inserts the new edge into `rollout.interaction_edges`.
+**Data flow**: It receives a complete InteractionEdge. If no edge with that ID exists, it inserts it. If one exists with the same kind, source, and target, it widens the time range and adds any new carried item or payload IDs. If the existing edge points somewhere else, it returns an error.
 
-**Call relations**: Used by close-edge creation, item-targeted materialization, and replay-end spawn fallback resolution. It delegates list merging to `extend_unique` and serves as the final sink for all interaction-edge reduction paths.
+**Call relations**: Close edges, resolved message edges, and spawn fallback edges all use this shared insert-or-merge path so conflict checks and evidence merging behave consistently.
 
 *Call graph*: calls 1 internal fn (extend_unique); called by 3 (resolve_pending_spawn_edge_fallbacks, upsert_agent_interaction_edge_for_item, upsert_close_agent_interaction); 1 external calls (bail!).
 
@@ -4371,11 +4411,11 @@ fn find_unlinked_inter_agent_message_item(
     ) -> Option<String>
 ```
 
-**Purpose**: Searches a thread's conversation timeline for the first mailbox message item matching a given author and content that is not already targeted by another interaction edge. It supports immediate edge resolution when the recipient item already exists.
+**Purpose**: Searches a thread for a delivered inter-agent message that has not already been used as the target of an edge. This helps match early sender-side events to recipient-side transcript items.
 
-**Data flow**: Takes `&self`, a target thread id, message author, and message content. It looks up the thread, iterates its `conversation_item_ids` in order, filters out items already used as interaction-edge targets, checks each remaining item with `inter_agent_message_item`, and returns the first matching item id clone or `None`.
+**Data flow**: It receives a thread ID, expected author, and expected message content. It walks that thread’s conversation items, skips items already linked by an interaction edge, and returns the first item whose inter-agent message fields match. If none match, it returns nothing.
 
-**Call relations**: Called only by `queue_or_resolve_agent_interaction_edge`. It relies on `is_interaction_edge_target_item` and `inter_agent_message_item` to ensure only unused, semantically valid mailbox items are considered.
+**Call relations**: TraceReducer::queue_or_resolve_agent_interaction_edge calls this before deciding whether to materialize an edge immediately or keep it pending.
 
 *Call graph*: called by 1 (queue_or_resolve_agent_interaction_edge).
 
@@ -4386,11 +4426,11 @@ fn find_unlinked_inter_agent_message_item(
 fn inter_agent_message_item(&self, item_id: &str) -> Option<(String, String, String)>
 ```
 
-**Purpose**: Recognizes whether a reduced conversation item represents an inter-agent mailbox delivery and, if so, extracts its thread id, author agent path, and message content. It supports both newer structured agent-message items and older serialized transport JSON.
+**Purpose**: Extracts the thread, author, and content from a conversation item if that item is truly an inter-agent delivery for its own thread. This filters out ordinary assistant messages.
 
-**Data flow**: Takes `&self` and an item id, looks up the conversation item, extracts `(author_agent_path, recipient_agent_path, message_content)` via `inter_agent_message_fields`, looks up the owning thread, verifies the recipient agent path matches the thread's `agent_path`, and returns `Some((thread_id, author, content))` or `None`.
+**Data flow**: It receives an item ID. It looks up the conversation item, extracts possible inter-agent message fields, checks that the message recipient matches the thread’s agent path, and returns the thread ID, author, and content if valid. Otherwise it returns nothing.
 
-**Call relations**: Used by `resolve_pending_agent_edges_for_item` and indirectly by recipient-item search. It delegates the actual body parsing to `inter_agent_message_fields`.
+**Call relations**: TraceReducer::resolve_pending_agent_edges_for_item uses this to understand newly reduced items. It relies on inter_agent_message_fields for the item-level parsing.
 
 *Call graph*: calls 1 internal fn (inter_agent_message_fields); called by 1 (resolve_pending_agent_edges_for_item).
 
@@ -4401,11 +4441,11 @@ fn inter_agent_message_item(&self, item_id: &str) -> Option<(String, String, Str
 fn agent_path_for_thread(&self, thread_id: &str) -> Result<String>
 ```
 
-**Purpose**: Returns the reduced agent path for a thread id with a contextual unknown-thread error. It is the common sender/recipient identity lookup for agent-edge reduction.
+**Purpose**: Finds the agent identity path for a thread. The agent path is the name-like address used to match who sent or received an inter-agent message.
 
-**Data flow**: Takes `&self` and a thread id, looks up `rollout.threads`, clones the thread's `agent_path`, and returns it as `Result<String>`. It does not mutate state.
+**Data flow**: It receives a thread ID. It looks up the thread in the reduced rollout and returns its agent path. If the thread is unknown, it returns an error explaining which thread was missing.
 
-**Call relations**: Called by spawn, message, close, and agent-result edge builders whenever they need the sender agent identity. It is a small lookup helper with reducer-specific error context.
+**Call relations**: Edge-building functions use this whenever they need the sender’s identity, including spawn, message, sub-agent activity, and agent-result edges.
 
 *Call graph*: called by 4 (end_spawn_agent_interaction, queue_agent_result_interaction_edge, queue_message_agent_interaction, queue_sub_agent_activity_message_edge).
 
@@ -4416,11 +4456,11 @@ fn agent_path_for_thread(&self, thread_id: &str) -> Result<String>
 fn is_interaction_edge_target_item(&self, item_id: &str) -> bool
 ```
 
-**Purpose**: Checks whether a conversation item is already the target of any reduced interaction edge. It prevents multiple edges from claiming the same mailbox item as their target.
+**Purpose**: Checks whether a conversation item is already the target of an interaction edge. This prevents the same delivered message from being claimed twice.
 
-**Data flow**: Takes `&self` and an item id, scans `rollout.interaction_edges.values()` for any edge whose `target` is `TraceAnchor::ConversationItem` with that id, and returns a boolean. It is pure.
+**Data flow**: It receives an item ID. It scans existing interaction edges and returns true if any edge targets that exact conversation item, otherwise false.
 
-**Call relations**: Used by `resolve_pending_agent_edges_for_item` and `find_unlinked_inter_agent_message_item` to avoid double-targeting recipient items.
+**Call relations**: TraceReducer::resolve_pending_agent_edges_for_item calls this before trying to attach a newly reduced item to a pending edge.
 
 *Call graph*: called by 1 (resolve_pending_agent_edges_for_item).
 
@@ -4435,11 +4475,11 @@ fn latest_assistant_message_item_for_turn(
     ) -> Option<String>
 ```
 
-**Purpose**: Finds the latest ordinary assistant message item in a specific thread and Codex turn, excluding agent-message mailbox items. It is used as the preferred source anchor for child-result edges.
+**Purpose**: Finds the latest normal assistant message in a child agent turn. This gives an agent-result edge the most precise source when the child actually produced a final answer.
 
-**Data flow**: Takes `&self`, a thread id, and a turn id, filters `rollout.conversation_items` by matching thread, matching `codex_turn_id`, `ConversationRole::Assistant`, `ConversationItemKind::Message`, and `agent_message.is_none()`, selects the item with the maximum `first_seen_at_unix_ms`, and returns its id clone if any.
+**Data flow**: It receives a thread ID and a turn ID. It filters conversation items to normal assistant message items in that thread and turn, ignores inter-agent delivery messages, chooses the one seen latest, and returns its item ID if found.
 
-**Call relations**: Called by `queue_agent_result_interaction_edge` to anchor child results to the child's actual final assistant output when available, falling back to the thread otherwise.
+**Call relations**: TraceReducer::queue_agent_result_interaction_edge uses this before falling back to anchoring a result delivery on the whole child thread.
 
 *Call graph*: called by 1 (queue_agent_result_interaction_edge).
 
@@ -4450,11 +4490,11 @@ fn latest_assistant_message_item_for_turn(
 fn extend_unique(items: &mut Vec<String>, new_items: Vec<String>)
 ```
 
-**Purpose**: Appends multiple string ids into a vector while preserving uniqueness. It is the batch merge helper for carried item and payload id lists.
+**Purpose**: Adds several string IDs to a list while avoiding duplicates. It is used for evidence lists where repeating the same ID would add noise but no meaning.
 
-**Data flow**: Takes a mutable `Vec<String>` and a `Vec<String>` of new items, iterates the new items, and pushes each only if not already present. It mutates the destination vector in place.
+**Data flow**: It receives a mutable list and a second list of new strings. For each new string, it checks whether the first list already contains it; if not, it appends it. It changes the first list and returns no separate value.
 
-**Call relations**: Used by pending-edge merging and final interaction-edge upsert logic. It is the multi-item counterpart to `push_unique`.
+**Call relations**: Pending-edge merging and final edge merging use this helper so carried item IDs and raw payload IDs stay complete without repeated entries.
 
 *Call graph*: called by 2 (queue_or_resolve_agent_interaction_edge, upsert_interaction_edge).
 
@@ -4465,11 +4505,11 @@ fn extend_unique(items: &mut Vec<String>, new_items: Vec<String>)
 fn tool_edge_id(tool_call_id: &str) -> String
 ```
 
-**Purpose**: Builds the stable interaction-edge id for tool-scoped agent interactions such as send-message, assign-task, and close-agent. The id is derived solely from the tool call id.
+**Purpose**: Builds the stable ID used for an interaction edge that comes directly from a tool call. Stable IDs let separate begin, end, and payload observations merge into one edge.
 
-**Data flow**: Takes a tool call id string slice, formats `edge:tool:{tool_call_id}`, and returns the resulting `String`. It is pure.
+**Data flow**: It receives a tool call ID and formats it into an edge ID string. The output is that string.
 
-**Call relations**: Called by message, close, and sub-agent activity reducers whenever the interaction edge should be keyed directly to the tool call rather than a parent/child thread pair.
+**Call relations**: Message, close, and some sub-agent activity paths use this when the tool call itself is the source of the relationship.
 
 *Call graph*: called by 3 (end_sub_agent_activity, queue_message_agent_interaction, upsert_close_agent_interaction); 1 external calls (format!).
 
@@ -4480,11 +4520,11 @@ fn tool_edge_id(tool_call_id: &str) -> String
 fn tool_call_source_matches(anchor: &TraceAnchor, tool_call_id: &str) -> bool
 ```
 
-**Purpose**: Checks whether a `TraceAnchor` is a `ToolCall` anchor for a specific tool call id. It is a small predicate used when attaching result payloads to edges.
+**Purpose**: Checks whether a trace anchor points to a specific tool call. A trace anchor is a pointer to something in the reduced trace, such as a tool call, thread, or message item.
 
-**Data flow**: Takes a `&TraceAnchor` and a tool call id string slice, pattern-matches the anchor, and returns `true` only when it is `TraceAnchor::ToolCall { tool_call_id: source }` with the same id. It is pure.
+**Data flow**: It receives an anchor and a tool call ID. It returns true only when the anchor is a tool-call anchor with the same ID. It does not change any state.
 
-**Call relations**: Used internally by `attach_agent_interaction_tool_result` to find resolved or pending edges sourced from a given tool call.
+**Call relations**: This helper supports code that needs to find the edge or pending edge produced by a particular tool call, especially when attaching later tool-result evidence.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -4495,11 +4535,11 @@ fn tool_call_source_matches(anchor: &TraceAnchor, tool_call_id: &str) -> bool
 fn push_unique(items: &mut Vec<String>, item: &str)
 ```
 
-**Purpose**: Appends a single string to a vector only if it is not already present. It is the local duplicate-suppression helper for carried raw payload ids.
+**Purpose**: Adds one string ID to a list only if it is not already present. This keeps evidence lists tidy and prevents duplicate raw payload IDs.
 
-**Data flow**: Takes a mutable `Vec<String>` and an item string slice, scans for an equal existing entry, and pushes `item.to_string()` only when absent. It mutates the vector in place.
+**Data flow**: It receives a mutable list and one string. If the string is absent, it appends a copy; if it is already present, the list stays the same. It returns no separate value.
 
-**Call relations**: Used by `agent_tool_payload_ids` and `attach_agent_interaction_tool_result` to keep payload evidence lists deduplicated.
+**Call relations**: TraceReducer::agent_tool_payload_ids uses this while collecting payload IDs, and TraceReducer::attach_agent_interaction_tool_result uses it when adding a result payload.
 
 *Call graph*: called by 2 (agent_tool_payload_ids, attach_agent_interaction_tool_result).
 
@@ -4510,22 +4550,24 @@ fn push_unique(items: &mut Vec<String>, item: &str)
 fn inter_agent_message_fields(item: &ConversationItem) -> Option<(String, String, String)>
 ```
 
-**Purpose**: Extracts `(author, recipient, content)` from a conversation item if and only if the item encodes an inter-agent delivery message. It supports both structured `agent_message` items and older serialized `InterAgentCommunication` text bodies.
+**Purpose**: Recognizes a conversation item as an inter-agent message and extracts sender, recipient, and content. It supports both the newer explicit agent-message shape and an older JSON-in-text format.
 
-**Data flow**: Takes a `&ConversationItem`, first requires assistant-role message kind. If `item.agent_message` is present, it inspects `item.body.parts` and accepts either plain text or `encrypted_content` forms, returning the author, recipient, and chosen content. Otherwise it requires a single text part, attempts to parse it as `InterAgentCommunication`, and returns author, recipient, and encrypted-or-plain content on success; otherwise returns `None`.
+**Data flow**: It receives a conversation item. It first rejects anything that is not an assistant message. For newer items, it reads the embedded agent-message metadata and the text or encrypted content body. For older traces, it parses the message text as an InterAgentCommunication JSON object. It returns author, recipient, and content when the shape is valid, otherwise nothing.
 
-**Call relations**: Called by `inter_agent_message_item` as the low-level parser for mailbox-message semantics. It is intentionally strict so ordinary assistant JSON text is not misclassified as an inter-agent delivery.
+**Call relations**: TraceReducer::inter_agent_message_item calls this as the low-level parser before checking whether the recipient matches the thread that contains the item.
 
 *Call graph*: called by 1 (inter_agent_message_item).
 
 
 ### `rollout-trace/src/reducer/tool/terminal.rs`
 
-`domain_logic` · `trace replay during tool runtime/start/end and transcript back-linking`
+`domain_logic` · `trace reduction`
 
-This module is the terminal-specific branch of tool reduction. It supports two sources of terminal semantics. For protocol-backed tools such as `ExecCommand`, runtime begin/end payloads carry the richest process details and are parsed into `ExecCommandBeginPayload` and `ExecCommandEndPayload`. For direct tools like `WriteStdin`, the reducer can synthesize a terminal operation from the canonical dispatch invocation/result payloads when runtime begin data is absent, using the dispatch payload's `session_id` as the terminal/session join key. `start_terminal_operation_from_invocation` and `start_terminal_operation_from_runtime` both normalize into `TerminalOperationStart`, which `insert_terminal_operation` turns into a new `TerminalOperation` with a generated `terminal_operation:{n}` id and, when a terminal id is known, an associated `TerminalSession`.
+Raw traces record terminal work as scattered tool lifecycle events and JSON payloads. This file is the translator that turns those pieces into a cleaner story: a terminal operation starts, may belong to a terminal session, ends with a result, and can be linked back to what the model saw. Without it, terminal timelines would be hard to reconstruct, especially for actions like sending stdin to an existing process.
 
-`end_terminal_operation` updates execution end fields, parses an optional response payload into a `TerminalResult`, appends the raw payload id, and enforces that begin/end process ids cannot disagree. If the begin payload lacked a process id but the end payload has one, the end event retroactively completes the operation's terminal id and session linkage. `ensure_terminal_session` guarantees all operations sharing a terminal id belong to the same thread and appends operation ids uniquely. `sync_terminal_model_observation` projects model-visible tool call/output item ids from the owning `ToolCall` into a `TerminalModelObservation` with source `DirectToolCall`, intentionally keeping runtime result data separate from what later transcript items prove was shown to the model. The parsing helpers are strict about supported payload shapes and include fallback logic for code-mode write-stdin results.
+There are two ways a terminal operation can start. Rich protocol events describe exec-style runtime activity directly. Some direct tool calls, such as write_stdin, do not always have that rich runtime start event, so this file can also build a terminal row from the normal dispatch invocation payload. In both cases it parses the JSON, creates a TerminalOperation, assigns it a fresh id, and joins it to a TerminalSession when a process or session id is known.
+
+When the tool ends, the file records the finish time, status, and output. It accepts more than one response shape because different recording paths store terminal results differently. It also checks that a terminal id does not mysteriously change between start and end. Finally, it mirrors model-visible call and output item ids onto the terminal operation, so a UI can connect the transcript view and the terminal timeline.
 
 #### Function details
 
@@ -4541,11 +4583,11 @@ fn start_terminal_operation_from_invocation(
         kind: &ToolCallKi
 ```
 
-**Purpose**: Creates a terminal operation from a canonical dispatch invocation payload when the tool kind is `WriteStdin`. It is the fallback path for direct tools that do not emit a richer runtime-begin event.
+**Purpose**: Starts a terminal operation from a normal tool dispatch invocation, but only for write_stdin. This fills a gap for direct stdin-writing tools that may not produce a richer runtime-start event.
 
-**Data flow**: Takes mutable reducer state, raw sequence/time, thread id, tool call id, tool kind, and optional invocation payload ref. If the kind is not `WriteStdin` it returns `Ok(None)`. If the invocation payload is missing it also returns `Ok(None)`. Otherwise it reads the payload JSON, parses it with `parse_dispatch_terminal_request`, wraps the parsed request in `TerminalOperationStart`, and delegates insertion to `insert_terminal_operation`, returning the new operation id if created.
+**Data flow**: It receives the event sequence, time, thread id, tool call id, tool kind, and optional invocation payload. If the tool is not write_stdin, it does nothing and returns no operation id. If a payload exists, it reads the JSON, parses the write_stdin request and session id, then creates a terminal operation and returns its new id.
 
-**Call relations**: Called by `start_tool_call` before the generic `ToolCall` is inserted. It delegates payload parsing to `parse_dispatch_terminal_request` and actual operation/session creation to `insert_terminal_operation`.
+**Call relations**: This is used when the reducer sees the invocation side of a direct write_stdin tool call. It relies on parse_dispatch_terminal_request to understand the dispatch JSON, then hands the parsed request to insert_terminal_operation so the shared operation-creation path is used.
 
 *Call graph*: calls 2 internal fn (insert_terminal_operation, parse_dispatch_terminal_request); 1 external calls (matches!).
 
@@ -4562,11 +4604,11 @@ fn start_terminal_operation_from_runtime(
         kind: &ToolCallKind,
 ```
 
-**Purpose**: Creates a terminal operation from a protocol runtime-begin payload for terminal-capable tool kinds. It is the primary path for exec-like runtime observations.
+**Purpose**: Starts a terminal operation from a protocol runtime-begin payload. This is the main path for richer exec-style terminal events that already describe the command or stdin interaction.
 
-**Data flow**: Takes mutable reducer state, raw sequence/time, thread id, tool call id, tool kind, and runtime payload ref. It maps the tool kind to an optional `TerminalOperationKind` via `terminal_operation_kind`; if none, returns `Ok(None)`. Otherwise it reads and deserializes the runtime payload into `ExecCommandBeginPayload`, converts that to a normalized request with `parse_protocol_terminal_request`, and inserts the operation via `insert_terminal_operation`.
+**Data flow**: It receives event timing, thread and tool ids, the tool kind, and a runtime payload reference. It first decides whether this tool kind is terminal-related. If so, it reads the payload JSON, decodes it as an exec-command begin payload, converts it into a terminal request, and creates a new terminal operation.
 
-**Call relations**: Called by `start_tool_runtime_observation` after generic runtime bookkeeping. It delegates kind filtering to `terminal_operation_kind`, request normalization to `parse_protocol_terminal_request`, and storage/session creation to `insert_terminal_operation`.
+**Call relations**: This function is called when the reducer sees a runtime-begin event. It asks terminal_operation_kind whether the tool belongs in the terminal view, uses parse_protocol_terminal_request to convert the protocol payload, and then passes the result to insert_terminal_operation.
 
 *Call graph*: calls 3 internal fn (insert_terminal_operation, parse_protocol_terminal_request, terminal_operation_kind); 1 external calls (from_value).
 
@@ -4580,11 +4622,11 @@ fn insert_terminal_operation(
     ) -> Result<Option<TerminalOperationId>>
 ```
 
-**Purpose**: Allocates a new terminal operation id, inserts the `TerminalOperation`, and ensures a matching `TerminalSession` exists when a terminal id is known. It is the common sink for both invocation-derived and runtime-derived starts.
+**Purpose**: Creates and stores a new TerminalOperation in the rollout being built. It is the common insertion point for terminal operations regardless of whether they came from dispatch payloads or runtime payloads.
 
-**Data flow**: Takes mutable reducer state and a `TerminalOperationStart` bundle. It generates the next operation id with `next_terminal_operation_id`, destructures the parsed request into optional `terminal_id` and `TerminalRequest`, inserts a running `TerminalOperation` with initial raw payload id into `rollout.terminal_operations`, optionally calls `ensure_terminal_session` when `terminal_id` is present, and returns `Ok(Some(operation_id))`.
+**Data flow**: It receives a prepared start record containing timing, ids, operation kind, raw payload id, and parsed request details. It generates a new operation id, stores a running operation with its request and source payload, and, if a terminal id is known, makes sure there is a matching terminal session. It returns the new operation id.
 
-**Call relations**: Called by both terminal-start entry points. It delegates session creation/validation to `ensure_terminal_session` and id generation to `next_terminal_operation_id`.
+**Call relations**: Both start_terminal_operation_from_invocation and start_terminal_operation_from_runtime call this after parsing their input. It uses next_terminal_operation_id for a stable id and ensure_terminal_session when the operation can be tied to a terminal session.
 
 *Call graph*: calls 2 internal fn (ensure_terminal_session, next_terminal_operation_id); called by 2 (start_terminal_operation_from_invocation, start_terminal_operation_from_runtime); 2 external calls (new, vec!).
 
@@ -4602,11 +4644,11 @@ fn end_terminal_operation(
         re
 ```
 
-**Purpose**: Marks a terminal operation terminal and optionally parses and attaches a terminal result from a response payload. It also reconciles terminal/session identity when the process id is learned only at end time.
+**Purpose**: Marks a terminal operation as finished and attaches its output, if an output payload is available. It also keeps the terminal session link up to date once the terminal id is known.
 
-**Data flow**: Takes mutable reducer state, raw sequence/time, thread id, operation id, terminal status, and optional response payload ref. It looks up the operation kind, optionally reads and parses the response payload into `(raw_payload_id, ParsedTerminalResponse)`, mutates the operation's execution end fields and result, appends the raw payload id uniquely, validates or fills in `terminal_id` based on the response, captures the final terminal id and original start metadata, and if a terminal id is known ensures the corresponding session exists and includes this operation.
+**Data flow**: It receives the finish sequence, finish time, thread id, operation id, final status, and optional response payload. It finds the existing operation, parses the response if present, records the end time and status, adds the response payload id, checks or fills in the terminal id, and stores the terminal result. If a terminal id is available, it ensures the session contains this operation.
 
-**Call relations**: Called from generic tool reduction on tool end or runtime end depending on whether the terminal tool is protocol-backed. It delegates response parsing to `parse_terminal_response_payload` and session maintenance to `ensure_terminal_session`.
+**Call relations**: Callers can use this at the end of any tool lifecycle; non-terminal tools simply should not have a terminal operation id. It calls ensure_terminal_session after updating the operation, and uses push_unique so payload ids and session operation ids are not duplicated. It stops with an error if the operation is unknown or if the terminal id changes unexpectedly.
 
 *Call graph*: calls 1 internal fn (ensure_terminal_session); 2 external calls (bail!, push_unique).
 
@@ -4624,11 +4666,11 @@ fn ensure_terminal_session(
     )
 ```
 
-**Purpose**: Creates a `TerminalSession` on first sight of a terminal id and appends an operation id to that session, enforcing that all operations for a terminal belong to the same thread. It is the session join-key manager.
+**Purpose**: Makes sure a TerminalSession exists for a given terminal id and that a given operation is listed in it. A session is the long-lived terminal process or channel that several operations can belong to.
 
-**Data flow**: Takes mutable reducer state, thread id, terminal id, operation id, and the operation's start time/seq. If `rollout.terminal_sessions` lacks the terminal id, it inserts a new running `TerminalSession` with `created_by_operation_id` set to the current operation. It then fetches the session mutably, verifies `session.thread_id == thread_id`, appends the operation id uniquely to `operation_ids`, and returns `Ok(())`.
+**Data flow**: It receives a thread id, terminal id, operation id, and the operation's start time and sequence. If the session does not exist, it creates one using this operation as the creator. Then it checks that the same terminal id is not being reused by another thread and adds the operation id to the session if it is not already there.
 
-**Call relations**: Called by both `insert_terminal_operation` and `end_terminal_operation`. It uses `push_unique` from the parent tool module to avoid duplicate operation ids when an operation is linked to the session at both start and end.
+**Call relations**: insert_terminal_operation calls this when a terminal id is known at start time. end_terminal_operation calls it when the id is learned or confirmed at finish time. It is the guardrail that keeps terminal operations grouped into the right session.
 
 *Call graph*: called by 2 (end_terminal_operation, insert_terminal_operation); 3 external calls (new, bail!, push_unique).
 
@@ -4642,11 +4684,11 @@ fn sync_terminal_model_observation(
     ) -> Result<()>
 ```
 
-**Purpose**: Copies model-visible tool call/output item ids from a `ToolCall` onto its associated terminal operation as a `TerminalModelObservation`. It keeps terminal rows connected to transcript evidence.
+**Purpose**: Links a terminal operation to the tool call and tool output items that were visible to the model. This lets a viewer jump between the model transcript and the terminal timeline.
 
-**Data flow**: Takes mutable reducer state and a tool call id. It looks up the tool call, returns early if it has no `terminal_operation_id` or no call/output item ids, then fetches the terminal operation and either updates an existing `TerminalModelObservation` with source `DirectToolCall` or pushes a new one containing cloned call/output item id vectors.
+**Data flow**: It receives a tool call id and looks up that tool call in the reduced rollout. If the tool call has a terminal operation and has model-visible call or output item ids, it copies those ids into a terminal model observation on the operation. It updates an existing direct-tool-call observation when one is already present, or creates one otherwise.
 
-**Call relations**: Called after tool insertion, after transcript back-linking, and after runtime-created terminal operations are attached. It depends on generic tool reduction to have already populated the tool's model-visible item lists.
+**Call relations**: This runs after model-visible tool item ids have been learned for a tool call. It does not parse terminal output itself; instead, it connects already-reduced tool call data to the terminal operation created by the start and end paths.
 
 *Call graph*: 1 external calls (bail!).
 
@@ -4657,11 +4699,11 @@ fn sync_terminal_model_observation(
 fn next_terminal_operation_id(&mut self) -> TerminalOperationId
 ```
 
-**Purpose**: Generates the next stable reduced terminal operation id using the reducer's ordinal counter. It ensures deterministic ids across replay.
+**Purpose**: Produces the next unique id for a terminal operation. The id is simple and stable within the reduced rollout, like numbering tickets in order.
 
-**Data flow**: Takes mutable reducer state, reads `next_terminal_operation_ordinal`, increments it, formats `terminal_operation:{ordinal}`, and returns the resulting `String`. It mutates only the counter.
+**Data flow**: It reads the reducer's current terminal operation counter, formats it into a string such as terminal_operation:0, then increments the counter for next time. The output is the new operation id.
 
-**Call relations**: Called only by `insert_terminal_operation` when a new terminal operation is created.
+**Call relations**: insert_terminal_operation calls this whenever a new terminal operation is stored. It is kept private so ids are assigned from one central place.
 
 *Call graph*: called by 1 (insert_terminal_operation); 1 external calls (format!).
 
@@ -4672,11 +4714,11 @@ fn next_terminal_operation_id(&mut self) -> TerminalOperationId
 fn terminal_operation_kind(kind: &ToolCallKind) -> Option<TerminalOperationKind>
 ```
 
-**Purpose**: Maps a `ToolCallKind` to the corresponding `TerminalOperationKind` when the tool represents terminal activity. Non-terminal tool kinds map to `None`.
+**Purpose**: Decides whether a tool kind belongs in the terminal view and, if so, which terminal operation kind it maps to. This prevents unrelated tools, such as web or image tools, from becoming terminal rows.
 
-**Data flow**: Takes a `&ToolCallKind`, matches it, returns `Some(TerminalOperationKind::ExecCommand)` for `ExecCommand`, `Some(TerminalOperationKind::WriteStdin)` for `WriteStdin`, and `None` for all other kinds. It is pure.
+**Data flow**: It receives a ToolCallKind. For ExecCommand and WriteStdin it returns the matching TerminalOperationKind. For all other tool kinds it returns nothing.
 
-**Call relations**: Used by `start_terminal_operation_from_runtime` to decide whether a runtime payload should be interpreted as terminal activity at all.
+**Call relations**: start_terminal_operation_from_runtime calls this before parsing a runtime payload. If it returns nothing, the runtime event is ignored for terminal reduction.
 
 *Call graph*: called by 1 (start_terminal_operation_from_runtime).
 
@@ -4690,11 +4732,11 @@ fn parse_protocol_terminal_request(
 ) -> ParsedTerminalRequest
 ```
 
-**Purpose**: Normalizes a protocol runtime-begin payload into the reducer's `ParsedTerminalRequest` shape. It extracts both the optional terminal id and the operation-specific request fields.
+**Purpose**: Converts a rich protocol begin payload into the common TerminalRequest shape used by the reduced model. It normalizes exec commands and stdin writes into the same terminal-operation language.
 
-**Data flow**: Takes an `ExecCommandBeginPayload` and a `&TerminalOperationKind`. It clones `process_id` into `terminal_id`, then builds either `TerminalRequest::ExecCommand` from `command` and `cwd` or `TerminalRequest::WriteStdin` from `interaction_input.unwrap_or_default()`, with yield/max-output fields left `None`. It returns `ParsedTerminalRequest`.
+**Data flow**: It receives an ExecCommandBeginPayload and the terminal operation kind. It copies the optional process id as the terminal id, then builds either an ExecCommand request with command and working directory or a WriteStdin request with the interaction input. The output is a parsed request plus the optional terminal id.
 
-**Call relations**: Called by `start_terminal_operation_from_runtime` after payload deserialization. It is a pure normalization helper.
+**Call relations**: start_terminal_operation_from_runtime calls this after decoding runtime JSON. Its output is passed to insert_terminal_operation, which stores the operation and possibly creates the session.
 
 *Call graph*: called by 1 (start_terminal_operation_from_runtime).
 
@@ -4705,11 +4747,11 @@ fn parse_protocol_terminal_request(
 fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalRequest>
 ```
 
-**Purpose**: Parses a dispatch-style tool invocation payload into a `WriteStdin` terminal request. It is intentionally strict about tool name, payload type, and presence of `session_id`.
+**Purpose**: Parses the normal dispatch invocation payload for a direct write_stdin call. This is needed when the dispatch payload is the only place that carries the session id needed to join the terminal session.
 
-**Data flow**: Takes a `serde_json::Value`, deserializes it into `DispatchedToolTraceRequestPayload`, verifies `tool_name == "write_stdin"` and `payload.kind == "function"`, extracts the serialized `arguments` string, parses it into `DispatchedWriteStdinArgs`, converts `session_id` to a terminal id with `terminal_id_from_json`, and returns `ParsedTerminalRequest` containing `TerminalRequest::WriteStdin { stdin, yield_time_ms, max_output_tokens }`.
+**Data flow**: It receives raw JSON from a dispatch invocation. It checks that the tool name is write_stdin and that the payload is a function-style payload, then parses the function arguments string. It extracts the session id, stdin characters, and optional output-limiting settings, and returns a terminal request tied to that session.
 
-**Call relations**: Called by `start_terminal_operation_from_invocation` when a direct write-stdin tool start needs terminal semantics from the canonical invocation payload.
+**Call relations**: start_terminal_operation_from_invocation calls this for direct write_stdin starts. It uses terminal_id_from_json to accept session ids that arrive as either strings or numbers, and reports clear errors when the dispatch payload is not the expected shape.
 
 *Call graph*: calls 1 internal fn (terminal_id_from_json); called by 1 (start_terminal_operation_from_invocation); 3 external calls (bail!, from_str, from_value).
 
@@ -4724,11 +4766,11 @@ fn parse_terminal_response_payload(
 ) -> Result<ParsedTerminalResponse>
 ```
 
-**Purpose**: Parses a terminal response payload into a normalized `ParsedTerminalResponse`, choosing protocol or dispatch parsing based on operation kind and payload shape. It provides the tolerant write-stdin fallback logic.
+**Purpose**: Chooses the right parser for a terminal operation's response payload. Different recording paths can store terminal endings in protocol form or dispatch form, and this function hides that difference.
 
-**Data flow**: Takes a JSON value, a `&TerminalOperationKind`, and the raw payload id for error context. For `ExecCommand`, it deserializes directly to `ExecCommandEndPayload` and normalizes with `parse_protocol_terminal_response`. For `WriteStdin`, it first tries the same protocol parse; if that fails, it falls back to `parse_dispatch_terminal_response` with contextual error text mentioning both parse attempts. It returns `ParsedTerminalResponse`.
+**Data flow**: It receives response JSON, the operation kind, and the raw payload id for error messages. For exec commands it parses the protocol end payload. For write_stdin it first tries the protocol shape, and if that fails it tries the dispatch response shape. The output is a parsed terminal response containing an optional terminal id and a TerminalResult.
 
-**Call relations**: Called by `end_terminal_operation` when a response payload is present. It delegates to `parse_protocol_terminal_response` and `parse_dispatch_terminal_response` depending on kind and parse success.
+**Call relations**: The terminal-ending flow uses this before storing the final result on an operation. It delegates to parse_protocol_terminal_response for protocol results and parse_dispatch_terminal_response for dispatch-style write_stdin results.
 
 *Call graph*: calls 2 internal fn (parse_dispatch_terminal_response, parse_protocol_terminal_response); 1 external calls (clone).
 
@@ -4739,11 +4781,11 @@ fn parse_terminal_response_payload(
 fn parse_protocol_terminal_response(payload: ExecCommandEndPayload) -> ParsedTerminalResponse
 ```
 
-**Purpose**: Converts a protocol runtime-end payload into the reducer's normalized terminal response shape. It preserves process id and standard stdout/stderr/exit-code fields.
+**Purpose**: Turns a protocol exec-command end payload into a TerminalResult. This captures the usual terminal output fields: exit code, stdout, stderr, and formatted output.
 
-**Data flow**: Takes an `ExecCommandEndPayload`, copies `process_id` into `terminal_id`, builds `TerminalResult { exit_code: Some(...), stdout, stderr, formatted_output: Some(...), original_token_count: None, chunk_id: None }`, and returns `ParsedTerminalResponse`.
+**Data flow**: It receives an ExecCommandEndPayload. It copies the optional process id as the terminal id and packages stdout, stderr, exit code, and formatted output into the common result structure. Fields that the protocol payload does not provide, such as token count and chunk id, are left empty.
 
-**Call relations**: Used by `parse_terminal_response_payload` for protocol-backed exec responses and for write-stdin responses that happen to use the protocol shape.
+**Call relations**: parse_terminal_response_payload calls this after successfully decoding a protocol response. Its result is then stored on the terminal operation by the ending flow.
 
 *Call graph*: called by 1 (parse_terminal_response_payload).
 
@@ -4754,11 +4796,11 @@ fn parse_protocol_terminal_response(payload: ExecCommandEndPayload) -> ParsedTer
 fn parse_dispatch_terminal_response(value: JsonValue) -> Result<ParsedTerminalResponse>
 ```
 
-**Purpose**: Parses a dispatch-style tool result payload into a terminal response, supporting direct-response, code-mode-response, and error variants. It projects terminal-specific fields from higher-level tool result shapes.
+**Purpose**: Parses terminal output from dispatch-style tool responses. This covers direct responses, code-mode responses, and error responses that do not use the protocol end payload shape.
 
-**Data flow**: Takes a JSON value, deserializes it into `DispatchedToolTraceResponsePayload`, then matches the enum: `DirectResponse` extracts textual output from `response_item.output` via `json_text_content` or falls back to `to_string`; `CodeModeResponse` delegates to `parse_code_mode_exec_result`; `Error` maps the error string into stderr/formatted output. It returns `ParsedTerminalResponse` with `terminal_id: None`.
+**Data flow**: It receives response JSON and decodes it as a tagged dispatch response. A direct response becomes text output from the response item. A code-mode response is further interpreted as an exec result when possible. An error response becomes stderr and formatted output. It returns a terminal response without a terminal id, because this response shape does not provide one.
 
-**Call relations**: Called by `parse_terminal_response_payload` as the fallback for `WriteStdin` when protocol parsing fails. It delegates code-mode projection to `parse_code_mode_exec_result`.
+**Call relations**: parse_terminal_response_payload uses this as the fallback path for write_stdin responses that are not protocol-shaped. For code-mode values it hands off to parse_code_mode_exec_result so structured exec-like data is preserved.
 
 *Call graph*: calls 1 internal fn (parse_code_mode_exec_result); called by 1 (parse_terminal_response_payload); 2 external calls (new, from_value).
 
@@ -4769,11 +4811,11 @@ fn parse_dispatch_terminal_response(value: JsonValue) -> Result<ParsedTerminalRe
 fn parse_code_mode_exec_result(value: JsonValue) -> TerminalResult
 ```
 
-**Purpose**: Projects a code-mode exec result object into a `TerminalResult`, preserving structured fields when present and falling back to textual extraction otherwise. It handles JavaScript-facing write-stdin results.
+**Purpose**: Extracts terminal-like output from a code-mode tool value. Code-mode may return a structured exec result, but this function also has a safe fallback for less structured JSON.
 
-**Data flow**: Takes a JSON value, first attempts to deserialize it into `CodeModeExecResult`; on success it returns `TerminalResult` with `exit_code`, `output` as stdout/formatted output, and optional `original_token_count` and `chunk_id`. On deserialization failure it extracts text with `json_text_content` or falls back to `value.to_string()`, returning a less-structured `TerminalResult` with no exit code or token metadata.
+**Data flow**: It receives a JSON value. If the value matches the expected code-mode exec result shape, it copies exit code, output, token count, and chunk id into a TerminalResult. If not, it turns the JSON into readable text using json_text_content or a JSON string representation. The output is always a TerminalResult.
 
-**Call relations**: Called only by `parse_dispatch_terminal_response` for `CodeModeResponse` payloads. It encapsulates the structured-versus-fallback projection logic.
+**Call relations**: parse_dispatch_terminal_response calls this for code-mode dispatch responses. It uses json_text_content only on the fallback path, when the response is not the structured exec result it hoped for.
 
 *Call graph*: calls 1 internal fn (json_text_content); called by 1 (parse_dispatch_terminal_response); 2 external calls (clone, new).
 
@@ -4784,11 +4826,11 @@ fn parse_code_mode_exec_result(value: JsonValue) -> TerminalResult
 fn json_text_content(value: &JsonValue) -> Option<String>
 ```
 
-**Purpose**: Extracts a human-readable text representation from a JSON value used in dispatch response payloads. It supports plain strings, arrays of `{text}` objects, null, and generic fallback serialization.
+**Purpose**: Pulls human-readable text out of a JSON value. It is a small helper for cases where a response might be a plain string, a list of text parts, null, or another JSON object.
 
-**Data flow**: Takes a `&JsonValue`, returns `Some(cloned_string)` for `String`, joins all `text` fields with newlines for `Array`, returns `None` for `Null`, and returns `Some(other.to_string())` for any other JSON type. It is pure.
+**Data flow**: It receives a JSON value. A string is returned as-is. An array is searched for items with a text field and those texts are joined with new lines. Null returns nothing. Other JSON values are converted to their JSON text form. The output is optional text.
 
-**Call relations**: Used by `parse_dispatch_terminal_response` and `parse_code_mode_exec_result` when projecting textual terminal output from loosely structured JSON.
+**Call relations**: parse_code_mode_exec_result uses this when it cannot decode a structured code-mode exec result. It helps preserve something readable instead of dropping unusual response shapes.
 
 *Call graph*: called by 1 (parse_code_mode_exec_result).
 
@@ -4799,10 +4841,10 @@ fn json_text_content(value: &JsonValue) -> Option<String>
 fn terminal_id_from_json(value: &JsonValue) -> Option<String>
 ```
 
-**Purpose**: Converts a JSON `session_id` value into a terminal/session id string when the value is a non-empty string or a number. It rejects unsupported or empty forms.
+**Purpose**: Converts a JSON session id into the string form used as a terminal id. It accepts the practical forms seen in traces while rejecting empty or unsupported values.
 
-**Data flow**: Takes a `&JsonValue`, returns `Some(cloned_string)` for non-empty strings, `Some(number.to_string())` for numbers, and `None` otherwise. It is pure.
+**Data flow**: It receives a JSON value. A non-empty string is returned unchanged, and a number is converted to text. Other values, including empty strings, return nothing.
 
-**Call relations**: Called by `parse_dispatch_terminal_request` to recover the terminal/session join key from write-stdin dispatch arguments.
+**Call relations**: parse_dispatch_terminal_request calls this when reading the write_stdin session_id argument. If it cannot produce an id, the request parser reports that the dispatch payload omitted a usable session id.
 
 *Call graph*: called by 1 (parse_dispatch_terminal_request); 3 external calls (clone, is_empty, to_string).

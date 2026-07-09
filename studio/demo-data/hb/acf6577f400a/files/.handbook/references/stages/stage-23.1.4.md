@@ -1,10 +1,12 @@
 # App-server integration suites  `stage-23.1.4`
 
-This stage is the top-level end-to-end integration test layer for the app server. It spans startup validation, live request handling, long-lived client connections, and persisted conversation teardown/reload paths, proving that the server’s public API behaves correctly as a whole rather than as isolated components.
+This stage is the broad end-to-end test bench for the app server. It treats the server like a real client would: start it, connect to it, send requests, run conversations, use tools, and check that the answers and side effects are correct. It is mostly about the server’s public behavior, not small internal parts.
 
-One group covers auth, configuration, discovery, and core JSON-RPC operations: startup rejects bad config, clients initialize with the right capabilities, accounts and quotas behave correctly, feature flags persist, and operational RPCs such as filesystem, process execution, sandbox setup, and remote-control pairing expose the expected contracts. A second group exercises transport and protocol boundaries, validating websocket and Unix-socket connection lifecycles, graceful shutdown/restart, attestation headers, experimental API gating, and realtime conversation behavior across WebSocket and WebRTC.
+One group tests the basic “front desk”: login, accounts, rate limits, configuration, startup handshakes, model discovery, safe file and process access, and remote-control pairing. Another group tests the live connection pipes, such as WebSockets, authentication, reconnects, shutdown behavior, desktop proof tokens, experimental features, and realtime text or audio sessions.
 
-The extensibility suites verify plugins, marketplace flows, MCP servers, commands, and extension-backed tools from installation through invocation and cleanup. Finally, the thread/turn lifecycle suites test the core conversational state machine: creating and mutating threads, executing turns and reviews, persisting and reloading session state, and emitting the correct status, safety, and synchronization notifications.
+A third group checks extensions: plugins, marketplace installs, connector apps, hooks, skills, MCP tool servers, shell commands, file search, image generation, sleep, and web search. These tests make sure outside tools appear only when allowed and run safely.
+
+The final group follows the conversation lifecycle: creating threads, running turns, interrupting work, asking permissions, saving history, summarizing, reviewing code, reopening sessions, and deleting or archiving old work.
 
 ## Sub-stages
 

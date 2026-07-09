@@ -1,10 +1,10 @@
 # Prompt and context facade modules, fragments, and embedded instruction templates  `stage-12.1`
 
-This stage is cross-cutting prompt-assembly infrastructure: it sits beneath request execution and supplies the reusable building blocks that turn system state, user guidance, and built-in instructions into model-visible context. Rather than performing runtime business logic itself, it defines the facades, fragment abstractions, and embedded instruction sources that other stages call when composing prompts.
+This stage is shared behind-the-scenes support for building what the model sees. It does not run the main work itself. Instead, it provides the shelves and labels for prompt text and context snippets, so later code can assemble them safely and in the right order.
 
-At the edges, codex-home/src/lib.rs exposes the codex-home crate’s user-instruction provider entrypoint, while collaboration-mode-templates/src/lib.rs embeds the canonical collaboration-mode markdown templates as static strings available throughout the binary. prompts/src/lib.rs is the public surface for the prompts crate, re-exporting the prompt constants, types, and helpers that consumers use.
+The `codex-home` front door exposes the provider for user instructions, hiding the internal layout. `collaboration-mode-templates` bundles ready-made collaboration instructions into the program, like built-in note cards. The `prompts` front door collects prompt text, helper code for building prompts, and review-related types into one place.
 
-The fragment model is centered in context-fragments/src/fragment.rs, which defines how context fragments render, convert to protocol messages, and register in type-erased form; context-fragments/src/lib.rs packages that model behind a stable crate API. ext/extension-api/src/contributors/prompt.rs gives extension authors a compact fragment type for targeting specific prompt slots. Finally, core/src/context/mod.rs gathers the core context fragment modules into one namespace, and core/src/context/permissions_instructions.rs re-exports the shared permissions-instructions fragment so core code can inject it consistently.
+The `context-fragments` files define and export the common shape of a context fragment: a small piece of information injected into the conversation. They also let the system recognize its own injected fragments later. The extension prompt contributor file gives add-ons a labeled way to contribute prompt text to specific prompt sections. Finally, the core context files re-export permission instructions and other context pieces from convenient locations, making them easy for the rest of the system to use.
 
 ## Files in this stage
 
@@ -13,25 +13,35 @@ These crate roots expose the built-in instruction and prompt template sources th
 
 ### `codex-home/src/lib.rs`
 
-`orchestration` · `startup`
+`orchestration` · `compile-time library interface`
 
-This crate root is a minimal facade around the `instructions` module. It keeps the implementation details of instruction lookup or assembly private and re-exports only `CodexHomeUserInstructionsProvider`, which is the type other crates are expected to depend on. The structure suggests that the crate's responsibility is narrowly scoped: supplying home-directory or user-specific instruction content through a dedicated provider object, while hiding any filesystem paths, parsing rules, or fallback behavior inside the private module. Because there is no additional logic here, the file's main value is API shaping. It establishes a stable top-level import path for the provider and prevents consumers from coupling themselves to internal helper modules that may change over time.
+This is a small library entry file. Its job is to make one internal piece of the crate available to the outside world: `CodexHomeUserInstructionsProvider`. The actual code for that provider lives in the `instructions` module, which is brought into the library here with `mod instructions;`.
+
+The second line, `pub use instructions::CodexHomeUserInstructionsProvider;`, is a public re-export. In plain terms, it is like putting a useful tool on the library’s front counter instead of making callers walk into the back room to find it. Other code can import `CodexHomeUserInstructionsProvider` directly from `codex-home`, without needing to know that it is defined inside an `instructions` module.
+
+Without this file, or without the public re-export, the provider could still exist internally but would not be conveniently available as part of the crate’s public interface. This file does not contain the instruction-loading logic itself; it simply declares where that logic lives and chooses what part of it becomes public.
 
 
 ### `collaboration-mode-templates/src/lib.rs`
 
-`data_model` · `startup and prompt construction`
+`data_model` · `compile time and wherever collaboration templates are selected`
 
-This file is intentionally minimal: it defines four public `&'static str` constants, each populated with `include_str!` from a markdown file under `../templates/`. Because `include_str!` runs at compile time, the template contents become part of the compiled artifact rather than being loaded from disk at runtime. That design removes file I/O, avoids deployment-time path issues, and guarantees that the prompt text version always matches the crate version that was built.
+This file solves a simple but important problem: the rest of the project needs reliable access to standard template text for different collaboration modes, such as planning, executing, or pair programming. Instead of asking the program to find these Markdown files on disk at runtime, this file embeds their contents into the compiled program. That means the templates travel with the application, like pages bound into a book rather than loose papers that might be misplaced.
 
-The exported constants correspond to distinct collaboration modes: `PLAN`, `DEFAULT`, `EXECUTE`, and `PAIR_PROGRAMMING`. The file contains no parsing, validation, or selection logic; its role is purely to expose raw template text for higher-level prompt assembly code elsewhere. The main invariant is that the referenced template files must exist at build time and contain valid UTF-8, otherwise compilation fails. In practice, this crate acts as a stable asset bundle: downstream code can depend on these names without needing to know where the markdown lives on disk or how it is packaged.
+It exposes four public constants: `PLAN`, `DEFAULT`, `EXECUTE`, and `PAIR_PROGRAMMING`. Each one is a string containing the full text of a matching Markdown template file from the `templates` directory. Other parts of the system can import these constants and use the template text immediately.
+
+The key behavior is that `include_str!` reads the template files when the code is compiled, not when the program is running. If a template file is missing or has the wrong path, the build fails early. Without this file, callers would either need to duplicate template text in code or add runtime file-loading logic, which would be more fragile.
 
 
 ### `prompts/src/lib.rs`
 
-`orchestration` · `cross-cutting; used whenever prompts are imported`
+`orchestration` · `cross-cutting`
 
-This is the crate root for `prompts`, and its main job is namespace curation. It declares eight internal modules: `agents`, `apply_patch`, `compact`, `goals`, `permissions_instructions`, `realtime`, `review_exit`, and `review_request`. It then selectively re-exports their public items so downstream code can import prompt assets and prompt-related helpers directly from `prompts` instead of navigating submodules. The exported surface spans several categories: static prompt strings (`HIERARCHICAL_AGENTS_MESSAGE`, `APPLY_PATCH_TOOL_INSTRUCTIONS`, `SUMMARIZATION_PROMPT`, `SUMMARY_PREFIX`, `BACKEND_PROMPT`, `START_INSTRUCTIONS`, `END_INSTRUCTIONS`, `REVIEW_PROMPT`), goal-oriented prompt constructors (`budget_limit_prompt`, `continuation_prompt`, `objective_updated_prompt`), a configuration-like type (`PermissionsInstructions`), review-exit renderers, and review-request parsing/rendering helpers (`ResolvedReviewRequest`, `resolve_review_request`, `review_prompt`, `user_facing_hint`). There is no runtime control flow in this file, but it defines the crate's external contract: which prompt resources are considered stable and how consumers are expected to access them. In practice, this file is the central index that turns a set of template-specific modules into a coherent prompt library.
+This library is like a reception desk for all the instruction text the system gives to an AI model. The actual wording lives in separate files, grouped by topic: agent behavior, patch editing, summarization, permission guidance, real-time backend instructions, and review requests. This file does not create those prompts itself. Instead, it declares those topic files as internal modules, then re-exports the pieces other parts of the system are allowed to use.
+
+That matters because prompts are part of the product’s behavior. If different parts of the code imported prompt text from many scattered places, it would be harder to know what is official and harder to change safely. By re-exporting selected items here, the project gets a single, stable public surface. Other code can ask this library for things like the backend prompt, patch-application instructions, summarization prompt, or review prompt without needing to know which internal file stores them.
+
+A small but important detail is that some exports are plain constants, while others are functions or types. Constants provide fixed instruction text. Functions build prompt text that depends on the current situation, such as a changed objective or a review result. Types describe structured choices, such as permission instructions or resolved review requests.
 
 
 ### Fragment abstractions
@@ -39,15 +49,13 @@ This group defines the core fragment model and then exposes it as the public API
 
 ### `context-fragments/src/fragment.rs`
 
-`domain_logic` · `cross-cutting during context rendering and fragment recognition`
+`data_model` · `cross-cutting: used while building conversation context and while filtering or recognizing injected fragments`
 
-This file provides the generic machinery behind contextual fragments injected into model conversations. `FragmentRegistration` is a small type-erased trait used by filtering code that only needs to ask whether some text matches a fragment shape. `FragmentRegistrationProxy<T>` adapts any `T: ContextualUserFragment` into that registration interface using `PhantomData`, with a `const fn new()` and `Default` implementation for easy static construction.
+This file is like a standard envelope format for extra context the system adds to a chat. Different parts of the program may need to insert reminders, environment details, policy updates, or other hidden-in-plain-sight context into the model conversation. Without a shared format, each kind of fragment would have to invent its own way to say what role it uses, what text it contains, and how to recognize it later.
 
-The main trait, `ContextualUserFragment`, defines the fragment contract: each implementation supplies a response `role`, marker pair, body text, and static marker metadata. The default `matches_text` implementation delegates to `matches_marked_text`, which performs case-insensitive start/end marker checks after trimming leading and trailing whitespace. This default intentionally refuses to match when either marker is empty, preventing unmarked fragments from claiming arbitrary text.
+The main trait, `ContextualUserFragment`, says every fragment must provide a role, a body of text, and optional start and end markers. Markers are small wrapper strings, like labels on a package, that make it possible to tell later, “this text was one of our injected fragments.” The default `render` method joins the start marker, body, and end marker into the exact text sent to the model. The conversion methods turn a fragment into protocol message objects used elsewhere in the system.
 
-`render()` concatenates start marker, body, and end marker with no separators; if both markers are empty it returns only the body. The trait also includes three conversion helpers that package the rendered fragment into protocol types: `ResponseItem`, boxed `ResponseItem`, and `ResponseInputItem`, each as a message containing a single `ContentItem::InputText`. These helpers consistently set `id` and `phase` to `None`, and `metadata` to `None` where that field exists.
-
-Overall, this file is the reusable substrate that concrete fragment modules build on for recognition and serialization.
+The second trait, `FragmentRegistration`, is a lighter, type-erased way to ask, “does this text look like this kind of fragment?” `FragmentRegistrationProxy<T>` connects that generic question to a real fragment type. The helper `matches_marked_text` performs the actual marker check, ignoring leading/trailing whitespace and letter case for the markers. If markers are missing, it deliberately refuses to match, so ordinary text is not accidentally treated as injected context.
 
 #### Function details
 
@@ -57,11 +65,11 @@ Overall, this file is the reusable substrate that concrete fragment modules buil
 fn new() -> Self
 ```
 
-**Purpose**: Constructs a zero-sized registration proxy for a concrete fragment type.
+**Purpose**: Creates a registration proxy for a particular fragment type. The proxy carries no real data; it exists so code can ask whether some text matches that fragment type without constructing an actual fragment.
 
-**Data flow**: Creates and returns `FragmentRegistrationProxy<T>` with its `_marker` field set to `PhantomData` and no runtime state.
+**Data flow**: Nothing meaningful goes in. The function returns a tiny marker object that remembers the fragment type at compile time, but stores no runtime payload.
 
-**Call relations**: Callers use it when they need a `FragmentRegistration` implementation without instantiating the underlying fragment payload type.
+**Call relations**: This is the basic constructor for the proxy. When code needs a default proxy, `FragmentRegistrationProxy::default` simply delegates to this function instead of building the object another way.
 
 
 ##### `FragmentRegistrationProxy::default`  (lines 26–28)
@@ -70,11 +78,11 @@ fn new() -> Self
 fn default() -> Self
 ```
 
-**Purpose**: Provides the default constructor for a fragment registration proxy.
+**Purpose**: Provides the standard default value for a fragment registration proxy. This lets other code create the proxy using Rust’s normal default-value pattern.
 
-**Data flow**: Reads no state, calls `Self::new()`, and returns the resulting proxy.
+**Data flow**: Nothing goes in. It calls the proxy constructor and returns the same empty, type-tagged registration object.
 
-**Call relations**: It exists so registration proxies can be created through generic default-based APIs.
+**Call relations**: This is a convenience wrapper around `FragmentRegistrationProxy::new`. It matters when generic setup code expects a type to know how to make its own default instance.
 
 *Call graph*: 1 external calls (new).
 
@@ -85,11 +93,11 @@ fn default() -> Self
 fn matches_text(&self, text: &str) -> bool
 ```
 
-**Purpose**: Delegates text matching to the concrete fragment type’s static matcher.
+**Purpose**: Checks whether a piece of text looks like the fragment type represented by this proxy. It lets context filtering code identify injected fragments without building the full fragment object.
 
-**Data flow**: Accepts `&self` and `text: &str`, calls `T::matches_text(text)`, and returns that boolean result.
+**Data flow**: It receives a text string. It passes that text to the fragment type’s own matching rule, then returns true or false depending on whether the text has that fragment’s markers.
 
-**Call relations**: This is the bridge from type-erased `FragmentRegistration` back to the concrete `ContextualUserFragment` implementation.
+**Call relations**: This is the bridge from the type-erased `FragmentRegistration` interface back to a concrete `ContextualUserFragment` type. Filtering code can hold registrations uniformly, and this method forwards the real decision to the fragment type.
 
 *Call graph*: 1 external calls (matches_text).
 
@@ -100,11 +108,11 @@ fn matches_text(&self, text: &str) -> bool
 fn matches_text(text: &str) -> bool
 ```
 
-**Purpose**: Provides the default marker-based recognition logic for fragment types with fixed start and end markers.
+**Purpose**: Provides the default way for a fragment type to recognize text that it previously injected. It uses the type’s start and end markers as the identifying label.
 
-**Data flow**: Calls `Self::type_markers()` to obtain the static marker pair, passes them with `text` into `matches_marked_text`, and returns the boolean result.
+**Data flow**: It receives text to inspect. It asks the fragment type for its markers, then sends those markers and the text to `matches_marked_text`. The result is a true-or-false answer.
 
-**Call relations**: Concrete fragment types inherit this behavior unless they override it, as dynamic-tag fragments do.
+**Call relations**: This is the default matching rule used by `FragmentRegistrationProxy::matches_text`. It hands off the low-level string checking to `matches_marked_text`, so each fragment type only needs to define its markers.
 
 *Call graph*: calls 1 internal fn (matches_marked_text); 1 external calls (type_markers).
 
@@ -115,11 +123,11 @@ fn matches_text(text: &str) -> bool
 fn render(&self) -> String
 ```
 
-**Purpose**: Renders a fragment into the exact text inserted into a message.
+**Purpose**: Builds the exact text that will be placed into the conversation for this fragment. It wraps the body with markers when markers are present.
 
-**Data flow**: Reads `self.markers()` and `self.body()`. If both markers are empty it returns the body unchanged; otherwise it formats and returns `{start_marker}{body}{end_marker}`.
+**Data flow**: It reads the fragment’s markers and body. If both markers are empty, it returns just the body. Otherwise, it returns one combined string: start marker, body, then end marker, with no extra spaces added.
 
-**Call relations**: All conversion helpers rely on this method so every protocol representation uses the same textual rendering.
+**Call relations**: The conversion methods call this when they package a fragment into protocol message objects. Fragment implementations must include any needed whitespace in their body because this method intentionally does not insert separators.
 
 *Call graph*: 1 external calls (format!).
 
@@ -130,11 +138,11 @@ fn render(&self) -> String
 fn into(self) -> ResponseItem
 ```
 
-**Purpose**: Converts a concrete fragment into a `ResponseItem::Message` containing one input-text content item.
+**Purpose**: Turns a fragment into a full `ResponseItem` message, which is one of the protocol objects used to represent conversation history or model-facing messages. This is the common path for recording injected context as a message item.
 
-**Data flow**: Consumes `self`, reads `self.role()` and `self.render()`, constructs `ResponseItem::Message { id: None, role, content: vec![ContentItem::InputText { text }], phase: None, metadata: None }`, and returns it.
+**Data flow**: It takes ownership of the fragment. It reads the fragment’s role, renders its text, wraps that text as input text content, and returns a `ResponseItem::Message` with empty optional fields such as id, phase, and metadata.
 
-**Call relations**: Many message-building paths call this helper when appending contextual fragments to response histories or instruction streams.
+**Call relations**: Many higher-level flows use this when they need to add a concrete context fragment to the conversation, such as environment updates, policy amendment records, image-related history messages, token budget reminders, and rollout sampling. This function is the packaging step that turns domain-specific context into the shared protocol shape.
 
 *Call graph*: called by 11 (build_environment_update_item, append_guardian_followup_reminder, record_execpolicy_amendment_message, record_network_policy_amendment_message, handle_output_item_done_records_image_save_history_message, sample_rollout, maybe_record_token_budget_remaining_context, record_image_generation_instructions, interrupted_turn_history_marker, user_shell_command_record_item (+1 more)); 1 external calls (vec!).
 
@@ -145,11 +153,11 @@ fn into(self) -> ResponseItem
 fn into_boxed_response_item(self: Box<Self>) -> ResponseItem
 ```
 
-**Purpose**: Converts a boxed trait object fragment into a `ResponseItem::Message` without requiring the concrete type.
+**Purpose**: Turns a boxed fragment into a full `ResponseItem` message. A boxed fragment is one stored behind a pointer-like wrapper, often used when code wants to work with different fragment types through the same interface.
 
-**Data flow**: Consumes `self: Box<Self>`, reads `self.role()` and `self.render()`, and returns the same `ResponseItem::Message` shape as `into`, with `id`, `phase`, and `metadata` unset.
+**Data flow**: It takes ownership of the boxed fragment. It reads the role, renders the text, wraps the rendered text as input text content, and returns a `ResponseItem::Message` with the standard empty optional fields.
 
-**Call relations**: This supports dynamic dispatch scenarios where fragments are stored behind `Box<dyn ContextualUserFragment>`.
+**Call relations**: This mirrors `ContextualUserFragment::into`, but works when the fragment is held as a boxed trait object rather than as a known concrete type. It lets more flexible orchestration code still produce the same protocol message format.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -160,11 +168,11 @@ fn into_boxed_response_item(self: Box<Self>) -> ResponseItem
 fn into_response_input_item(self) -> ResponseInputItem
 ```
 
-**Purpose**: Converts a concrete fragment into the input-side protocol message type.
+**Purpose**: Turns a fragment into a `ResponseInputItem`, another protocol message shape used when preparing input for a response. It is for sending the fragment forward as input rather than storing it as a response-history item.
 
-**Data flow**: Consumes `self`, reads `self.role()` and `self.render()`, constructs `ResponseInputItem::Message { role, content: vec![ContentItem::InputText { text }], phase: None }`, and returns it.
+**Data flow**: It takes ownership of the fragment. It reads the role, renders the fragment text, wraps that text as input text content, and returns a `ResponseInputItem::Message` with no phase set.
 
-**Call relations**: It is used when the caller needs request/input items rather than response-history items.
+**Call relations**: This is the sibling of the `ResponseItem` conversion methods. When a caller needs the input-message version of a contextual fragment, this method performs the same rendering and wrapping in the protocol type expected by that path.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -175,22 +183,24 @@ fn into_response_input_item(self) -> ResponseInputItem
 fn matches_marked_text(start_marker: &str, end_marker: &str, text: &str) -> bool
 ```
 
-**Purpose**: Checks whether text begins and ends with the given markers, ignoring ASCII case and surrounding whitespace.
+**Purpose**: Checks whether a text string is wrapped in a given start marker and end marker. This is the shared safety check that prevents ordinary text from being mistaken for injected context.
 
-**Data flow**: Accepts `start_marker`, `end_marker`, and `text`. If either marker is empty it returns false immediately. Otherwise it trims leading whitespace, checks whether the prefix of matching length equals `start_marker` case-insensitively, trims trailing whitespace, checks whether the suffix of matching length equals `end_marker` case-insensitively using `saturating_sub` for safety, and returns true only if both checks succeed.
+**Data flow**: It receives a start marker, an end marker, and the text to inspect. If either marker is empty, it immediately returns false. Otherwise, it ignores extra whitespace at the outside, checks whether the text begins with the start marker and ends with the end marker, compares marker letters without caring about case, and returns true only if both checks pass.
 
-**Call relations**: It is the shared implementation behind the trait’s default `matches_text` method.
+**Call relations**: This is called by `ContextualUserFragment::matches_text`, which supplies the markers for a particular fragment type. Keeping the marker logic here means all fragment types follow the same recognition rules.
 
 *Call graph*: called by 1 (matches_text).
 
 
 ### `context-fragments/src/lib.rs`
 
-`data_model` · `prompt/context assembly`
+`other` · `cross-cutting`
 
-This crate root declares two internal modules, `additional_context` and `fragment`, then re-exports the fragment-related types that downstream code uses. The exported surface distinguishes between concrete additional-context fragment types—`AdditionalContextDeveloperFragment` and `AdditionalContextUserFragment`—and the more general registration and proxy abstractions—`ContextualUserFragment`, `FragmentRegistration`, and `FragmentRegistrationProxy`.
+This file does not contain the working logic itself. Instead, it acts like the index page of a small library. The real code lives in two internal modules: one for “additional context” fragments and one for more general user context fragments. This file declares those modules so they are part of the library, then re-exports the main types so outside code can use them without knowing the library’s internal file layout.
 
-The file itself contains no behavior, but its organization reveals the subsystem's shape. One part of the crate defines specific fragment payloads intended for developer- or user-supplied context, while another defines the registration machinery that lets those fragments be discovered, wrapped, or passed across boundaries. By concentrating exports here, the crate can evolve its internal module layout without forcing callers to update imports. This root therefore serves as the contract for prompt-context extension points: code that assembles prompts or contextual instructions depends on these re-exported types rather than on the internal module structure.
+That matters because other parts of the project should not have to care whether `AdditionalContextUserFragment` comes from `additional_context.rs` or whether `FragmentRegistrationProxy` comes from `fragment.rs`. They can simply import these names from the crate itself. In everyday terms, this file is like a shop counter: the stock is stored in the back rooms, but customers interact with the clearly labeled items at the front.
+
+Without this file, the crate would either expose nothing useful or force callers to reach into private module paths. That would make the code harder to read and more fragile if the internal layout changed later.
 
 
 ### Contributor-facing prompt pieces
@@ -198,13 +208,13 @@ These files define prompt fragment payloads for extension contributors and then 
 
 ### `ext/extension-api/src/contributors/prompt.rs`
 
-`data_model` · `request handling`
+`data_model` · `prompt construction`
 
-This file is a compact prompt data model. `PromptSlot` is an enum describing where a fragment belongs in prompt assembly: `DeveloperPolicy`, `DeveloperCapabilities`, `ContextualUser`, or `SeparateDeveloper`. `PromptFragment` then pairs one of those slots with the fragment’s model-visible `String` text.
+This file is a simple data model for prompt contributions. A prompt is not always one single lump of text; different pieces may need to go into different places, such as developer instructions, capability descriptions, or separate developer messages. The PromptSlot enum names those possible destinations, like labeled trays on a desk. The PromptFragment struct then pairs one of those labels with the actual text that should be shown to the model.
 
-The implementation is intentionally minimal and value-oriented. `PromptFragment::new` is the canonical constructor, accepting any `Into<String>` so callers can pass `String`, `&str`, or other string-like values without manual conversion. Three convenience constructors—`developer_policy`, `developer_capability`, and `separate_developer`—hard-code the corresponding `PromptSlot` variants and delegate to `new`, reducing repetitive call sites in contributors and tests. The remaining methods are simple accessors returning the stored slot and text.
+The main idea is safety and clarity. Instead of passing around plain strings and hoping everyone remembers where they should go, code can pass a PromptFragment that says both “here is the text” and “put it in this slot.” That matters because prompt placement can affect how a model interprets instructions.
 
-The derives (`Clone`, `Debug`, `PartialEq`, `Eq` on `PromptFragment`; plus `Copy`, `Hash` on `PromptSlot`) make these types easy to compare in tests, duplicate during prompt assembly, and use as keys or grouping markers. There is no validation or formatting logic here: the file’s responsibility is only to preserve the caller’s chosen slot and exact text. That simplicity is important because ordering, merging, and rendering semantics live elsewhere in the extension system.
+The file also provides convenience constructors for common slots. For example, developer_policy creates a fragment already marked as developer policy, so callers do not have to mention the slot directly. The slot and text methods let later prompt-building code inspect the fragment without changing it. A comment notes that this is likely temporary and should eventually be replaced by an existing fragment implementation.
 
 #### Function details
 
@@ -214,11 +224,11 @@ The derives (`Clone`, `Debug`, `PartialEq`, `Eq` on `PromptFragment`; plus `Copy
 fn new(slot: PromptSlot, text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Creates a prompt fragment with an explicit target slot and caller-supplied text. It is the base constructor used by the specialized helpers.
+**Purpose**: Creates a new prompt fragment from a destination slot and some text. This is the basic constructor used when the caller already knows exactly where the text should be placed.
 
-**Data flow**: It takes `slot: PromptSlot` and `text: impl Into<String>`, converts `text` with `into()`, and returns a `PromptFragment { slot, text }`. It reads no external state and writes no side effects.
+**Data flow**: It takes a PromptSlot and text that can be turned into a String. It converts the text into owned stored text, pairs it with the slot, and returns a new PromptFragment. Nothing outside the new object is changed.
 
-**Call relations**: Callers use this when they need full control over the destination slot. The convenience constructors in the same impl delegate to it so all fragment creation follows one path.
+**Call relations**: This is the central builder for the type. The more specific helper functions, such as PromptFragment::developer_policy, PromptFragment::developer_capability, and PromptFragment::separate_developer, call it so they all create fragments in the same consistent way.
 
 *Call graph*: 1 external calls (into).
 
@@ -229,11 +239,11 @@ fn new(slot: PromptSlot, text: impl Into<String>) -> Self
 fn developer_policy(text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Builds a fragment targeted at the `DeveloperPolicy` slot. It is a shorthand for the most common policy-style prompt contribution.
+**Purpose**: Creates a prompt fragment meant for developer policy text. This gives callers a clear, readable way to mark text as policy-level developer guidance.
 
-**Data flow**: It accepts `text: impl Into<String>`, passes `PromptSlot::DeveloperPolicy` and the text into `PromptFragment::new`, and returns the resulting fragment. No state is read or mutated.
+**Data flow**: It takes text from the caller, chooses the DeveloperPolicy slot for it, and passes both pieces to PromptFragment::new. The result is a PromptFragment whose text is stored and whose slot says it belongs in the developer policy area.
 
-**Call relations**: Prompt contributors and tests call this helper instead of spelling out the slot manually. It delegates directly to `new` to centralize fragment construction.
+**Call relations**: This is a convenience wrapper around PromptFragment::new. Code that wants to contribute developer policy text can call this instead of manually selecting the PromptSlot::DeveloperPolicy value.
 
 *Call graph*: 1 external calls (new).
 
@@ -244,11 +254,11 @@ fn developer_policy(text: impl Into<String>) -> Self
 fn developer_capability(text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Builds a fragment targeted at the `DeveloperCapabilities` slot. It is a convenience wrapper for capability-description prompt text.
+**Purpose**: Creates a prompt fragment that describes developer capabilities. This is useful when an extension needs to tell the model what tools, behaviors, or abilities are available in the developer context.
 
-**Data flow**: It takes `text: impl Into<String>`, forwards it with `PromptSlot::DeveloperCapabilities` to `PromptFragment::new`, and returns the constructed fragment. It has no side effects.
+**Data flow**: It receives text, attaches the DeveloperCapabilities slot to it, and delegates the actual object creation to PromptFragment::new. It returns the completed PromptFragment.
 
-**Call relations**: Used by contributors that want to advertise capabilities in a dedicated prompt section. Like the other helpers, it delegates all actual construction to `new`.
+**Call relations**: This function sits above PromptFragment::new as a named shortcut. It helps calling code express intent directly: the text is not just any prompt text, it belongs in the developer capabilities section.
 
 *Call graph*: 1 external calls (new).
 
@@ -259,11 +269,11 @@ fn developer_capability(text: impl Into<String>) -> Self
 fn separate_developer(text: impl Into<String>) -> Self
 ```
 
-**Purpose**: Builds a fragment targeted at the `SeparateDeveloper` slot. It supports prompt assembly strategies that emit a distinct top-level developer message.
+**Purpose**: Creates a prompt fragment meant to become a separate top-level developer prompt. This is for developer text that should stay separate rather than being merged into another developer section.
 
-**Data flow**: It accepts `text: impl Into<String>`, calls `PromptFragment::new(PromptSlot::SeparateDeveloper, text)`, and returns the resulting value. No external state is touched.
+**Data flow**: It takes caller-provided text, assigns it the SeparateDeveloper slot, and sends both to PromptFragment::new. The returned fragment carries both the chosen slot and the stored text.
 
-**Call relations**: This helper is used when contributors need a separate developer prompt rather than an inlined policy/capabilities fragment. It delegates directly to `new`.
+**Call relations**: Like the other named constructors, it relies on PromptFragment::new for the actual creation work. It gives prompt-building callers a clear way to request a separate developer message.
 
 *Call graph*: 1 external calls (new).
 
@@ -274,11 +284,11 @@ fn separate_developer(text: impl Into<String>) -> Self
 fn slot(&self) -> PromptSlot
 ```
 
-**Purpose**: Returns the fragment’s target prompt slot. It is the read accessor prompt assembly code uses to group or route fragments.
+**Purpose**: Returns the slot label for this prompt fragment. Code uses this to find out where the fragment should be placed when building the final prompt.
 
-**Data flow**: It takes `&self` and returns the stored `PromptSlot` by value. Because `PromptSlot` is `Copy`, no borrowing complications or allocation are involved.
+**Data flow**: It reads the fragment's stored PromptSlot and returns a copy of it. The fragment itself is not changed.
 
-**Call relations**: Prompt assembly and tests call this accessor when inspecting fragments after contribution. It is a leaf accessor with no delegated work.
+**Call relations**: Later prompt assembly code can call this after receiving a PromptFragment to decide which part of the final prompt should receive the fragment's text.
 
 
 ##### `PromptFragment::text`  (lines 47–49)
@@ -287,22 +297,30 @@ fn slot(&self) -> PromptSlot
 fn text(&self) -> &str
 ```
 
-**Purpose**: Returns the fragment’s model-visible text as a string slice. It exposes the exact stored content without copying.
+**Purpose**: Returns the text stored inside this prompt fragment. This lets prompt assembly code read the model-visible content without taking ownership of it or modifying it.
 
-**Data flow**: It takes `&self` and returns `&str` referencing `self.text`. No transformation or mutation occurs.
+**Data flow**: It reads the fragment's stored String and returns it as a string slice, which is a borrowed view of the text. The original PromptFragment keeps owning the text.
 
-**Call relations**: Rendering and test code use this accessor to inspect fragment contents after creation or collection. It is a simple leaf method.
+**Call relations**: After code has used PromptFragment::slot to decide where the fragment belongs, it can call PromptFragment::text to copy or insert the actual text into the final prompt.
 
 
 ### `core/src/context/permissions_instructions.rs`
 
-`orchestration` · `request handling`
+`data_model` · `cross-cutting`
 
-This file consists solely of `pub use codex_prompts::PermissionsInstructions;`, making the `PermissionsInstructions` type from the prompt library available under the core context module tree. The absence of wrappers means the type's semantics, constructors, formatting behavior, and any trait implementations all remain owned by `codex_prompts`; this module only establishes a stable location from which the rest of codex-core can import permission-related instructions alongside other context fragments. That keeps prompt-fragment discovery centralized in `core/src/context/mod.rs` even when the actual implementation lives in another crate. The design avoids duplication and preserves a clean separation between prompt text/templates and the orchestration code that decides when to inject them.
+This file does not define new behavior of its own. Instead, it re-exports `PermissionsInstructions` from the `codex_prompts` package, meaning it takes a type defined elsewhere and makes it visible through this module too. In everyday terms, it is like putting a commonly needed form at the front desk instead of making everyone walk to the back office to find it.
+
+`PermissionsInstructions` likely represents text or structured guidance about what actions are allowed, restricted, or need approval. By re-exporting it here, the core context code can treat permission instructions as part of its own public surface without copying or redefining the type. That matters because it keeps the project consistent: there is one real definition, but several parts of the code can refer to it through paths that make sense in their own area.
+
+Without this file, callers that expect to find permission instructions under `core::context` would fail to compile, or they would need to know about the lower-level `codex_prompts` crate directly. This file keeps that dependency detail tucked away.
 
 
 ### `core/src/context/mod.rs`
 
-`orchestration` · `request handling`
+`other` · `cross-cutting: used whenever model input context is assembled`
 
-This module is the namespace root for the system that builds model-visible context. It declares a large set of sibling modules, each representing one concrete fragment or instruction source: saved approvals and network rules, app/plugin/skill availability instructions, collaboration and realtime markers, environment and token-budget context, user instructions, shell-command echoes, legacy compatibility warnings, internal model context, and several hook- or agent-related messages. The file itself contains no executable logic; instead, it defines the composition boundary for the prompt-building subsystem by selectively re-exporting types from those local modules and from external crates such as `codex_context_fragments`, `codex_core_skills`, and `codex_prompts`. The visibility choices are meaningful: some exports are `pub` because downstream crates or broader APIs consume them directly, while many are `pub(crate)` to keep fragment construction internal to codex-core. It also exposes helper functions from `contextual_user_message` for recognizing and parsing contextual user fragments, which suggests that some incoming messages are dynamically interpreted into fragment objects. Overall, this file is the registry-like leaf that tells readers which context fragment implementations exist and which names form the supported interface for prompt assembly.
+When this system talks to a model, it does not send only the user’s latest message. It may also need to include extra guidance: user instructions, permission rules, environment details, plugin information, token budget warnings, realtime session markers, and other reminders. Each of those pieces lives in its own file so it can stay focused and easy to change.
+
+This file acts like the table of contents and service desk for that collection. It declares the submodules that make up the context system, then exposes selected types and helper functions from them. Some exports are public to the wider crate or outside users, while others are kept crate-private, meaning only this Rust package can use them. That boundary matters because context sent to a model can affect behavior, safety, permissions, and user experience.
+
+Without this file, the rest of the project would need to know the exact location of every context fragment. Instead, other code can import these pieces from one central place. The file contains no business logic itself; its job is to keep the context system organized and present a clean, intentional surface to the rest of the codebase.

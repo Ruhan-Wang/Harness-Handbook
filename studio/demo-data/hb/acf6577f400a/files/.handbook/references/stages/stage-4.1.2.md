@@ -1,10 +1,10 @@
 # Requirements layering and execution-policy composition  `stage-4.1.2`
 
-This stage is cross-cutting configuration infrastructure that runs as requirements are loaded, merged, validated, and sometimes updated on disk before the rest of the system consumes them. Its job is to turn multiple `requirements.toml` sources and related execution-policy inputs into one effective, source-aware policy surface.
+This stage is behind-the-scenes setup work. Before Codex starts running commands, it reads requirements.toml and other managed sources, then builds one clear rule set for what is allowed. config_requirements defines these high-level limits and keeps track of where each setting came from, so errors can point to the right source. requirements_layers/mod is the entry point for this combining system. layer cleans one raw requirements layer and separates normal settings from special ones, like execution policy, hooks, permissions, and sandbox rules. stack then assembles all layers into the final result.
 
-`config_requirements.rs` defines the requirements schema, normalization, provenance tracking, and compiled constraints that can later reject invalid runtime settings. `requirements_exec_policy.rs` parses execution-policy sections embedded in requirements and converts them into internal policy objects suitable for comparison and composition. Within `requirements_layers`, `layer.rs` normalizes each raw layer, preserving source paths and evaluating sandbox selectors; `permissions.rs`, `hooks.rs`, and `rules.rs` implement the nonstandard merge semantics for deny-read patterns, hook definitions, and prefix rules; `stack.rs` applies those rules to assemble the final `ConfigRequirementsWithSources`, while `mod.rs` exposes that composition API.
+Some fields need safer merging than simple “last one wins.” permissions keeps every denied read path from every layer. hooks combines hook event lists while preventing unsafe hook directory conflicts. rules preserves rule priority, keeping higher-priority rules first.
 
-Two consumers extend this work into runtime behavior: `network_proxy_loader.rs` builds and reloads proxy state from layered config plus exec-policy overlays, enforcing trusted constraints from non-user-controlled layers, and `hooks/config_rules.rs` derives effective persisted hook overrides with strict limits on user-controlled contributions. `execpolicy/amend.rs` supports safely appending new policy rules to disk.
+Execution policy is the command safety rulebook. requirements_exec_policy parses and validates it from requirements.toml. amend safely adds new allow or deny lines when a user approves something. network_proxy_loader turns config and policy into live network proxy settings and reloads them when files change. hooks/config_rules decides which saved hook settings are trusted enough to use.
 
 ## Files in this stage
 
@@ -13,13 +13,15 @@ These files define how execution-policy data is represented in requirements-faci
 
 ### `config/src/requirements_exec_policy.rs`
 
-`domain_logic` · `requirements parse and composition`
+`config` · `config load`
 
-This file bridges user-authored requirements TOML and the executable rule engine in `codex_execpolicy`. The central wrapper, `RequirementsExecPolicy`, stores a `Policy` and deliberately defines equality by a normalized fingerprint rather than by direct structural comparison; `policy_fingerprint` walks `policy.rules().iter_all()`, formats each `(program, rule)` pair, sorts the resulting strings, and compares those sorted lists so insertion order in the underlying multimap does not affect equality.
+This file is the bridge between a human-written requirements file and Codex's command safety system. A `requirements.toml` file can say things like “commands matching this prefix should prompt the user” or “commands matching this prefix are forbidden.” This code reads that TOML-shaped data, checks that it is well formed, and builds a `Policy` that the execution-policy engine can use later when commands are about to run.
 
-The TOML model is split into `RequirementsExecPolicyToml`, `RequirementsExecPolicyPrefixRuleToml`, `RequirementsExecPolicyPatternTokenToml`, and `RequirementsExecPolicyDecisionToml`. Pattern tokens are represented as tables with either `token` or `any_of` because TOML arrays cannot mix scalar strings and nested arrays the way the Starlark builtin can. Parsing is strict: empty `prefix_rules`, empty patterns, blank justifications, missing decisions, malformed token specifications, and `allow` decisions all produce a typed `RequirementsExecPolicyParseError` with the offending rule/token index embedded.
+The central wrapper is `RequirementsExecPolicy`, which simply holds an internal `Policy`. It exists so policies that came from requirements files can be treated as a distinct kind of configuration. The file also defines TOML-friendly structs for prefix rules, pattern tokens, and decisions. A pattern token is one part of a command pattern; it can be one exact word or one of several allowed alternatives.
 
-`RequirementsExecPolicyToml::to_policy` performs the real lowering. It validates each rule, converts each pattern element into a `PatternToken`, rejects `allow`, then splits the pattern into a first token and remaining suffix. Because the first token may contain alternatives, it expands one `PrefixRule` per head alternative and inserts each into a `MultiMap<String, RuleRef>` keyed by program name. The suffix tokens are shared via `Arc<[PatternToken]>`, and each rule is wrapped as an `Arc<PrefixRule>` before constructing the final `Policy`.
+The most important rule here is that `allow` is rejected in `requirements.toml`. Requirements policies are merged with other configuration using the most restrictive result, so this file only permits restrictive choices: `prompt` or `forbidden`. That prevents a requirements file from silently weakening safety settings elsewhere.
+
+When converting rules, the first pattern token is used to group rules by program name, like sorting mail into boxes by the first line of the address. Later, this lets the policy engine look up only the rules that could apply to a command.
 
 #### Function details
 
@@ -29,11 +31,11 @@ The TOML model is split into `RequirementsExecPolicyToml`, `RequirementsExecPoli
 fn new(policy: Policy) -> Self
 ```
 
-**Purpose**: Constructs the lightweight wrapper around an already-built `codex_execpolicy::Policy`. It exists so requirements-specific code can carry a distinct type while still exposing the underlying policy by reference.
+**Purpose**: Wraps an already-built execution `Policy` as a requirements-specific policy. This gives the rest of the program a clear signal that the policy came from `requirements.toml` rather than from some other source.
 
-**Data flow**: Takes a `Policy` by value, stores it in the `policy` field, and returns a new `RequirementsExecPolicy`. It does not inspect or mutate any external state.
+**Data flow**: A finished `Policy` goes in. The function stores it inside a `RequirementsExecPolicy` wrapper. The wrapper comes out unchanged except for having this more specific type.
 
-**Call relations**: Used by callers that already have an internal policy object, including tests that compare merged requirement policies and the TOML conversion path via `to_requirements_policy`.
+**Call relations**: Other configuration code and tests call this after they already have a `Policy` and need to treat it as a requirements policy. It does not build or validate rules itself; that work is done before this function is used.
 
 *Call graph*: called by 3 (child_does_not_use_parent_exec_policy_when_requirements_exec_policy_differs, merges_requirements_exec_policy_network_rules, preserves_host_executables_when_requirements_overlay_is_present).
 
@@ -44,11 +46,11 @@ fn new(policy: Policy) -> Self
 fn eq(&self, other: &Self) -> bool
 ```
 
-**Purpose**: Implements semantic equality for `RequirementsExecPolicy` by comparing normalized fingerprints of the wrapped policies. This avoids depending on incidental ordering in the underlying rule storage.
+**Purpose**: Compares two requirements policies to see whether they contain the same effective rules. It does this by comparing a stable fingerprint of each policy rather than relying on the internal storage order.
 
-**Data flow**: Reads `self.policy` and `other.policy`, passes both to `policy_fingerprint`, and returns `true` when the sorted string fingerprints match. It writes no state.
+**Data flow**: Two `RequirementsExecPolicy` values go in. The function asks `policy_fingerprint` to turn each inner policy into a sorted list of rule descriptions. It returns `true` if those lists match and `false` otherwise.
 
-**Call relations**: Invoked implicitly by equality assertions and comparisons on `RequirementsExecPolicy`; it delegates all normalization work to `policy_fingerprint`.
+**Call relations**: This is used whenever Rust needs to test equality for `RequirementsExecPolicy`. It delegates the real comparison work to `policy_fingerprint`, which hides ordering differences in the policy's internal map.
 
 *Call graph*: calls 1 internal fn (policy_fingerprint).
 
@@ -59,11 +61,11 @@ fn eq(&self, other: &Self) -> bool
 fn as_ref(&self) -> &Policy
 ```
 
-**Purpose**: Exposes the wrapped `Policy` through the standard `AsRef<Policy>` trait. This lets downstream code pass a `RequirementsExecPolicy` anywhere a borrowed `Policy` is needed.
+**Purpose**: Provides read-only access to the inner execution `Policy`. Code that knows how to work with a generic policy can use this without needing to unwrap the struct by hand.
 
-**Data flow**: Reads the `policy` field and returns `&Policy`. No allocation or mutation occurs.
+**Data flow**: A borrowed `RequirementsExecPolicy` goes in. The function returns a borrowed reference to the contained `Policy`. Nothing is copied or changed.
 
-**Call relations**: Called through trait-based borrowing by consumers of the wrapper type; it is a simple adapter with no further delegation.
+**Call relations**: This connects the requirements-specific wrapper back to the broader execution-policy system. Callers can pass the result into code that expects a plain `Policy` reference.
 
 
 ##### `policy_fingerprint`  (lines 37–46)
@@ -72,11 +74,11 @@ fn as_ref(&self) -> &Policy
 fn policy_fingerprint(policy: &Policy) -> Vec<String>
 ```
 
-**Purpose**: Builds a deterministic textual summary of a `Policy`'s rules for equality checks. The summary includes each program key and the debug representation of each rule.
+**Purpose**: Creates a simple, sorted summary of a policy's rules so two policies can be compared reliably. This avoids false differences caused only by rules being stored in a different order.
 
-**Data flow**: Accepts `&Policy`, iterates `policy.rules().iter_all()`, formats every `(program, rule)` pair into `String`s, sorts the vector, and returns `Vec<String>`. It only reads policy contents and produces a derived value.
+**Data flow**: A `Policy` reference goes in. The function reads every program name and every rule under that program, formats each pair as text, sorts all those text entries, and returns the sorted list.
 
-**Call relations**: Used exclusively by `RequirementsExecPolicy::eq` to normalize policies before comparison.
+**Call relations**: It is called by `RequirementsExecPolicy::eq` when two requirements policies are compared. Its job is to turn the policy into an order-independent comparison key.
 
 *Call graph*: called by 1 (eq); 3 external calls (new, rules, format!).
 
@@ -87,11 +89,11 @@ fn policy_fingerprint(policy: &Policy) -> Vec<String>
 fn as_decision(self) -> Decision
 ```
 
-**Purpose**: Maps the TOML enum used in requirements files onto the internal `codex_execpolicy::Decision` enum. The mapping is one-to-one for the three supported variants.
+**Purpose**: Converts a decision read from TOML into the decision type used by the execution-policy engine. It maps the configuration words `allow`, `prompt`, and `forbidden` to their internal equivalents.
 
-**Data flow**: Consumes `self`, matches `Allow`, `Prompt`, or `Forbidden`, and returns the corresponding internal `Decision`. It has no side effects.
+**Data flow**: A TOML-facing decision enum goes in. The function matches it to the corresponding internal `Decision` value. The converted decision comes out.
 
-**Call relations**: Called during `RequirementsExecPolicyToml::to_policy` after validation decides the rule's decision is present and permitted.
+**Call relations**: It is used during policy conversion after validation decides the TOML decision is acceptable. In this file, `allow` is checked and rejected before this conversion is used for requirements policies.
 
 
 ##### `RequirementsExecPolicyToml::to_policy`  (lines 125–183)
@@ -100,11 +102,11 @@ fn as_decision(self) -> Decision
 fn to_policy(&self) -> Result<Policy, RequirementsExecPolicyParseError>
 ```
 
-**Purpose**: Validates and lowers the deserialized requirements rule set into a `codex_execpolicy::Policy`. It enforces requirements-specific restrictions, especially that `allow` decisions are forbidden because merged requirements use the most restrictive outcome.
+**Purpose**: Validates the TOML rules and turns them into the internal `Policy` used to judge commands. This is the main conversion step from human-written configuration into executable safety rules.
 
-**Data flow**: Reads `self.prefix_rules`; rejects an empty list immediately. For each rule, it validates nonblank justification, nonempty pattern, converts each pattern element with `parse_pattern_token`, validates `decision`, clones optional justification, splits the parsed pattern into head and tail, shares the tail as `Arc<[PatternToken]>`, expands every alternative in the first token into a separate `PrefixRule`, wraps each as `RuleRef`, and inserts them into a `MultiMap<String, RuleRef>`. On success it returns `Policy::new(rules_by_program)`; on any validation failure it returns a `RequirementsExecPolicyParseError` carrying rule/token indices and a concrete reason.
+**Data flow**: A parsed `RequirementsExecPolicyToml` value goes in. The function checks that there is at least one rule, that each rule has a pattern, that pattern tokens are valid, that justifications are not blank, and that a decision is present. It rejects `allow` decisions because requirements files are not allowed to loosen safety. For valid rules, it builds prefix rules grouped by their first command token and returns a `Policy`; on any problem, it returns a specific parse error.
 
-**Call relations**: This is the main conversion routine for requirements execution rules. `to_requirements_policy` delegates directly to it, and its output feeds higher-level requirements composition and tests.
+**Call relations**: This is called by `RequirementsExecPolicyToml::to_requirements_policy`, which wraps the resulting policy. Inside the conversion it calls `parse_pattern_token` for each TOML pattern token and uses the execution-policy types to build the final rule objects.
 
 *Call graph*: called by 1 (to_requirements_policy); 4 external calls (from, new, new, new).
 
@@ -117,11 +119,11 @@ fn to_requirements_policy(
     ) -> Result<RequirementsExecPolicy, RequirementsExecPolicyParseError>
 ```
 
-**Purpose**: Converts TOML rules directly into the wrapper type used by the config layer. It is a thin convenience layer over `to_policy`.
+**Purpose**: Converts TOML rules directly into a `RequirementsExecPolicy` wrapper. It is a convenience step for callers that want the requirements-specific type rather than a plain internal policy.
 
-**Data flow**: Reads `self`, calls `to_policy`, and maps the successful `Policy` into `RequirementsExecPolicy::new`. It returns either the wrapped policy or the same parse error from the lower conversion step.
+**Data flow**: A parsed TOML policy goes in. The function calls `to_policy` to validate and build the internal policy. If that succeeds, it wraps the result in `RequirementsExecPolicy`; if validation fails, the same error comes back out.
 
-**Call relations**: Called by code that wants the requirements-specific wrapper rather than a bare `Policy`; it delegates all parsing and validation to `to_policy`.
+**Call relations**: This sits one layer above `to_policy`. Configuration-loading code can call it when it wants the final requirements policy object in one step.
 
 *Call graph*: calls 1 internal fn (to_policy).
 
@@ -136,24 +138,24 @@ fn parse_pattern_token(
 ) -> Result<PatternToken, RequirementsExecPolicyParseError>
 ```
 
-**Purpose**: Validates one TOML pattern-token table and converts it into a `PatternToken`. It enforces the invariant that exactly one of `token` or `any_of` must be set and that no provided strings are blank.
+**Purpose**: Checks and converts one TOML pattern token into the internal pattern-token format. It enforces that each token says either “this exact word” or “one of these words,” but not both and not neither.
 
-**Data flow**: Consumes a borrowed `RequirementsExecPolicyPatternTokenToml` plus `rule_index` and `token_index` for diagnostics. It matches the `(token, any_of)` combination, returns `PatternToken::Single` or `PatternToken::Alts` on valid input, and otherwise returns `RequirementsExecPolicyParseError::InvalidPatternToken` with a specific reason string.
+**Data flow**: One TOML token plus its rule index and token index go in. The function checks whether `token` or `any_of` is set, rejects empty strings and empty alternative lists, and returns either a single-token pattern or an alternatives pattern. If the token is malformed, it returns an error that includes where the bad token was found.
 
-**Call relations**: Used inside `RequirementsExecPolicyToml::to_policy` while mapping each rule's `pattern` vector into internal tokens; it isolates per-token validation so the caller can collect a full parsed pattern or fail early with indexed errors.
+**Call relations**: It is called repeatedly by `RequirementsExecPolicyToml::to_policy` while converting each rule's command pattern. Its detailed error messages help the configuration loader point users to the exact broken part of `requirements.toml`.
 
 *Call graph*: 2 external calls (Alts, Single).
 
 
 ### `execpolicy/src/amend.rs`
 
-`io_transport` · `policy amendment / disk write`
+`domain_logic` · `policy amendment / request handling`
 
-This module implements the write path for amending execpolicy rule files. Its public API consists of two blocking functions: one appends an allow-only `prefix_rule`, the other appends a `network_rule`. Both convert structured inputs into the textual policy language, then funnel through shared file-update helpers that create the containing directory if needed, lock the file, read existing contents, avoid writing duplicate lines, and preserve newline formatting when appending.
+This file exists so the program can update a policy file without asking a person to edit text by hand. A policy file is like a rulebook: each line says what kind of command or network access should be allowed, denied, or asked about. Without this code, the system could decide on a rule but would not have a safe, consistent way to save that rule for next time.
 
-`AmendError` is the central error surface and distinguishes validation failures from filesystem failures at each stage: missing parent directory, directory creation, serialization, open/lock/seek/read/write, and invalid network rule inputs. Prefix rules require at least one token; each token is JSON-serialized so embedded quotes and punctuation are escaped correctly before being inserted into `prefix_rule(pattern=[...], decision="allow")`. Network rules first normalize and validate the host with `normalize_network_rule_host`, reject blank justifications after trimming, serialize host/protocol/decision/justification fields individually with `serde_json`, and map `Decision::Forbidden` to the policy string `"deny"` rather than the enum variant name.
+There are two public entry points. One adds an allowed command prefix, such as a command beginning with `curl`. The other adds a network rule, such as allowing HTTPS access to `api.github.com`. Before writing, the code checks that the input makes sense. For example, command prefixes cannot be empty, network hosts are normalized to a standard form, wildcard hosts are rejected, and empty justifications are not allowed.
 
-The internal append path is intentionally conservative: it opens with create/read/append, acquires an advisory lock, rewinds to the start to inspect current contents, returns early if the exact line already exists, inserts a newline only when the file is non-empty and lacks one, then writes the new rule plus trailing newline. The embedded tests cover directory creation, newline behavior, mixed prefix/network appends, and wildcard-host rejection.
+The file then formats each rule as one policy-language line. It uses JSON-style quoting for values, so spaces and special characters are written safely. Finally, it creates the policy directory if needed, opens the file, locks it, reads existing lines, and appends the new rule only if it is not already present. The lock is an advisory file lock, meaning cooperating processes agree not to write at the same time. This is like taking a number at a counter before changing a shared notebook.
 
 #### Function details
 
@@ -166,11 +168,11 @@ fn blocking_append_allow_prefix_rule(
 ) -> Result<(), AmendError>
 ```
 
-**Purpose**: Builds a textual `prefix_rule` that allows a specific command-token prefix and appends it to the policy file. It validates that the prefix is non-empty and serializes each token as JSON to preserve exact token contents.
+**Purpose**: Adds a policy rule that allows commands matching a given list of starting tokens. Someone would use this after deciding that a command pattern should be trusted in the future.
 
-**Data flow**: Inputs are `policy_path: &Path` and `prefix: &[String]`. It first rejects an empty slice with `AmendError::EmptyPrefix`; otherwise it maps each token through `serde_json::to_string`, joins the serialized tokens into a JSON-like array string, embeds that into `prefix_rule(pattern=[...], decision="allow")`, and passes the final line to `append_rule_line`. It returns `Ok(())` on success or an `AmendError` describing validation, serialization, or file-update failure.
+**Data flow**: It receives a policy file path and a list of command tokens. It rejects an empty list, safely quotes each token, builds one `prefix_rule(...)` line, and passes that line onward to be written. The result is either success or a clear error explaining why the rule could not be made or saved.
 
-**Call relations**: This is one of the module's public entry points and is exercised by multiple unit tests covering directory creation and newline handling. After local validation and formatting, it delegates all filesystem concerns to `append_rule_line`.
+**Call relations**: The prefix-rule tests call this function to prove it creates files, appends cleanly, and preserves line breaks. In normal flow, this is the public doorway for prefix rules; after formatting the rule text, it hands the actual file work to `append_rule_line`.
 
 *Call graph*: calls 1 internal fn (append_rule_line); called by 4 (appends_prefix_and_network_rules, appends_rule_and_creates_directories, appends_rule_without_duplicate_newline, inserts_newline_when_missing_before_append); 1 external calls (format!).
 
@@ -187,11 +189,11 @@ fn blocking_append_network_rule(
 ) -> Result<(), AmendError>
 ```
 
-**Purpose**: Constructs and appends a textual `network_rule` from structured host, protocol, decision, and optional justification inputs. It normalizes the host, rejects invalid or empty justification text, and converts enum values into the policy language's expected strings.
+**Purpose**: Adds a policy rule for network access to one specific host, protocol, and decision. It is used when the system wants to remember whether a network destination should be allowed, denied, or prompted for later.
 
-**Data flow**: It accepts `policy_path`, raw `host`, `protocol: NetworkRuleProtocol`, `decision: Decision`, and `justification: Option<&str>`. The host is normalized with `normalize_network_rule_host`; failures become `AmendError::InvalidNetworkRule`. A present but whitespace-only justification is also rejected. It JSON-serializes the normalized host, `protocol.as_policy_string()`, and a decision string chosen from `allow`, `prompt`, or `deny`, optionally serializes the justification, assembles `network_rule(host=..., protocol=..., decision=..., justification=...)`, and forwards that line to `append_rule_line`.
+**Data flow**: It receives a policy path, host name, protocol, decision, and optional explanation. It normalizes the host, rejects invalid hosts or blank explanations, converts the protocol and decision into policy strings, safely quotes all fields, builds one `network_rule(...)` line, and sends it to be written. It returns success if the rule is saved or an error if validation, formatting, or writing fails.
 
-**Call relations**: This public entry point is used by tests for successful network-rule append, mixed append ordering, and wildcard-host rejection. It performs all semantic validation and string assembly itself, then relies on `append_rule_line` for directory creation, locking, duplicate detection, and writing.
+**Call relations**: The network-rule tests call this function to check normal appending, combining with prefix rules, and rejecting wildcard hosts. It depends on `normalize_network_rule_host` to clean and validate the host, uses the protocol’s policy spelling through `as_policy_string`, and then delegates file writing to `append_rule_line`.
 
 *Call graph*: calls 3 internal fn (append_rule_line, as_policy_string, normalize_network_rule_host); called by 3 (appends_network_rule, appends_prefix_and_network_rules, rejects_wildcard_network_rule_host); 4 external calls (InvalidNetworkRule, format!, to_string, vec!).
 
@@ -202,11 +204,11 @@ fn blocking_append_network_rule(
 fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError>
 ```
 
-**Purpose**: Prepares the filesystem location for a rule append by ensuring the policy file has a parent directory and creating that directory when absent. It isolates path-level setup from the lower-level locked append logic.
+**Purpose**: Prepares the filesystem so a rule line can be written to the policy file. It makes sure the policy file has a parent directory and creates that directory if it does not already exist.
 
-**Data flow**: Given `policy_path` and a fully formatted rule line, it reads `policy_path.parent()`, returning `AmendError::MissingParent` if none exists. It then calls `std::fs::create_dir(dir)`, treating `AlreadyExists` as success and mapping any other error to `AmendError::CreatePolicyDir`. Finally it calls `append_locked_line(policy_path, rule)` and returns that result.
+**Data flow**: It receives the path to the policy file and the already formatted rule text. It finds the directory part of the path, reports an error if there is no directory, creates the directory when needed, and then passes the path and rule line to the lower-level writer. It returns whatever success or error comes from these steps.
 
-**Call relations**: Both public append functions delegate here after formatting their rule strings. This helper in turn delegates the actual file open/read/lock/write sequence to `append_locked_line` once the directory precondition is satisfied.
+**Call relations**: `blocking_append_allow_prefix_rule` and `blocking_append_network_rule` both call this after they have built a valid policy line. This function is the bridge between rule formatting and the locked file append done by `append_locked_line`.
 
 *Call graph*: calls 1 internal fn (append_locked_line); called by 2 (blocking_append_allow_prefix_rule, blocking_append_network_rule); 2 external calls (parent, create_dir).
 
@@ -217,11 +219,11 @@ fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError>
 fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError>
 ```
 
-**Purpose**: Performs the actual append under an advisory file lock, while preventing duplicate rule lines and preserving correct newline separation. It is the module's critical section for safe concurrent file updates.
+**Purpose**: Writes one rule line into the policy file safely and without duplicates. It is the part that actually opens, locks, reads, and appends to the file.
 
-**Data flow**: Inputs are `policy_path` and the rule `line`. It opens the file with create/read/append options, maps open failures to `OpenPolicyFile`, acquires a lock mapped to `LockPolicyFile`, seeks to byte 0 mapped to `SeekPolicyFile`, and reads the entire file into a `String` mapped to `ReadPolicyFile`. If any existing line exactly equals `line`, it returns `Ok(())` without writing. Otherwise, if the file is non-empty and does not end with `\n`, it writes a newline first, then writes `{line}\n`, mapping write failures to `WritePolicyFile`. It returns `Ok(())` after the append.
+**Data flow**: It receives a policy file path and one full line of policy text. It opens or creates the file, takes a file lock so another cooperating writer does not change it at the same time, reads the current contents, and checks whether the exact line already exists. If the line is new, it adds a missing newline if needed and writes the rule followed by a newline. It returns success or an input/output error wrapped with the policy path for context.
 
-**Call relations**: Only `append_rule_line` calls this helper. It is the final stage in the append pipeline and encapsulates the lock/read-check-write sequence that all rule types share.
+**Call relations**: `append_rule_line` calls this after the directory is ready. This function is the final step in both prefix-rule and network-rule flows, and it is the reason repeated requests do not create repeated identical policy lines.
 
 *Call graph*: called by 1 (append_rule_line); 4 external calls (new, Start, new, format!).
 
@@ -232,11 +234,11 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError>
 fn appends_rule_and_creates_directories()
 ```
 
-**Purpose**: Verifies that appending a prefix rule creates the missing parent directory tree and writes the expected single-line file content. It serves as the baseline happy-path test for a fresh policy path.
+**Purpose**: Checks that adding a prefix rule also creates the needed policy directory and file. This protects the common first-run case where no policy file exists yet.
 
-**Data flow**: The test creates a temporary directory, derives `rules/default.rules` beneath it, calls `blocking_append_allow_prefix_rule` with `echo` and `Hello, world!`, then reads the file back with `std::fs::read_to_string` and asserts exact string equality including the trailing newline.
+**Data flow**: The test creates a temporary folder, chooses a nested policy path, calls `blocking_append_allow_prefix_rule`, then reads the file back. The expected result is a new file containing exactly one correctly formatted prefix rule.
 
-**Call relations**: Invoked by the test harness. It exercises the full public append path through directory creation and into the locked writer, validating the externally visible file contents.
+**Call relations**: This test calls the public prefix-rule function as an outside caller would. It indirectly exercises `append_rule_line` directory creation and `append_locked_line` file writing.
 
 *Call graph*: calls 1 internal fn (blocking_append_allow_prefix_rule); 4 external calls (from, assert_eq!, read_to_string, tempdir).
 
@@ -247,11 +249,11 @@ fn appends_rule_and_creates_directories()
 fn appends_rule_without_duplicate_newline()
 ```
 
-**Purpose**: Checks that appending to a file that already ends with a newline produces exactly one separator newline between rules. It guards against accidental blank lines during repeated amendments.
+**Purpose**: Checks that appending to a file that already ends with a newline does not insert an extra blank line. This keeps policy files tidy and predictable.
 
-**Data flow**: The test creates a temp directory, pre-creates the policy directory, seeds the file with one prefix rule ending in `\n`, calls `blocking_append_allow_prefix_rule` for a second rule, reads the file contents, and asserts that the result contains two consecutive rule lines with no empty line between them.
+**Data flow**: The test creates a temporary policy file with one existing rule ending in a newline. It appends a second prefix rule, reads the file, and verifies the two rules appear on consecutive lines with no empty line between them.
 
-**Call relations**: Called by the test harness to cover the branch in `append_locked_line` where `contents.ends_with('\n')` is true, so no extra newline should be inserted before writing the new rule.
+**Call relations**: This test calls `blocking_append_allow_prefix_rule`, which flows through the normal append path. It focuses on the newline behavior inside `append_locked_line`.
 
 *Call graph*: calls 1 internal fn (blocking_append_allow_prefix_rule); 6 external calls (from, assert_eq!, create_dir_all, read_to_string, write, tempdir).
 
@@ -262,11 +264,11 @@ fn appends_rule_without_duplicate_newline()
 fn inserts_newline_when_missing_before_append()
 ```
 
-**Purpose**: Verifies that the append logic inserts a separator newline when the existing file lacks a trailing newline. This preserves one-rule-per-line formatting even for manually edited or malformed seed files.
+**Purpose**: Checks that appending still works when an existing policy file does not end with a newline. This prevents two policy rules from being accidentally joined into one broken line.
 
-**Data flow**: It creates a temp directory and policy directory, writes an initial rule string without a trailing newline, invokes `blocking_append_allow_prefix_rule` for a second rule, reads the file back, and asserts that the resulting contents contain the original rule, an inserted newline, and the appended rule with its own trailing newline.
+**Data flow**: The test writes a policy file containing one rule with no final newline. It appends another prefix rule and then reads the file back. The expected result is that the code inserts the missing line break before adding the new rule.
 
-**Call relations**: The test harness invokes this case to exercise the `!contents.is_empty() && !contents.ends_with('\n')` branch inside `append_locked_line`.
+**Call relations**: This test reaches `append_locked_line` through `blocking_append_allow_prefix_rule`. It proves the append code repairs the file boundary before writing the next rule.
 
 *Call graph*: calls 1 internal fn (blocking_append_allow_prefix_rule); 6 external calls (from, assert_eq!, create_dir_all, read_to_string, write, tempdir).
 
@@ -277,11 +279,11 @@ fn inserts_newline_when_missing_before_append()
 fn appends_network_rule()
 ```
 
-**Purpose**: Confirms that a network rule is normalized, serialized, and appended in the exact policy syntax expected by downstream parsers. It specifically checks lowercase host normalization and inclusion of justification text.
+**Purpose**: Checks that a network rule is normalized and written in the expected policy format. This confirms that host names, protocols, decisions, and justifications become a valid rule line.
 
-**Data flow**: The test creates a temp policy path, calls `blocking_append_network_rule` with host `Api.GitHub.com`, protocol `Https`, decision `Allow`, and a justification string, then reads the file and asserts exact equality with a single `network_rule(...)` line containing normalized host `api.github.com`, protocol `https`, decision `allow`, and the justification field.
+**Data flow**: The test creates a temporary policy path, asks to allow HTTPS access to `Api.GitHub.com` with a justification, and reads the resulting file. The expected output uses the normalized lowercase host `api.github.com` and includes the quoted justification.
 
-**Call relations**: Invoked by the test harness as the primary positive test for the network-rule entry point. It covers host normalization and field serialization before the shared append machinery writes the file.
+**Call relations**: This test calls `blocking_append_network_rule` directly. Through that call, it exercises host normalization, field serialization, and the shared append path.
 
 *Call graph*: calls 1 internal fn (blocking_append_network_rule); 3 external calls (assert_eq!, read_to_string, tempdir).
 
@@ -292,11 +294,11 @@ fn appends_network_rule()
 fn appends_prefix_and_network_rules()
 ```
 
-**Purpose**: Checks that different rule kinds can be appended sequentially to the same file and preserve order. It validates interoperability of the two public amendment APIs against one shared append backend.
+**Purpose**: Checks that prefix rules and network rules can live together in the same policy file. This matters because real policy files may contain several kinds of rules.
 
-**Data flow**: The test creates a temp policy path, first calls `blocking_append_allow_prefix_rule` with `curl`, then `blocking_append_network_rule` with an HTTPS GitHub host rule, reads the resulting file, and asserts exact two-line contents in append order.
+**Data flow**: The test creates a temporary policy file path, appends one allowed command prefix, then appends one allowed network rule. It reads the file and verifies that both formatted lines appear in order.
 
-**Call relations**: The test harness invokes this case to exercise both public append functions in one scenario, proving they compose correctly through `append_rule_line` and `append_locked_line`.
+**Call relations**: This test calls both public amendment functions. It shows that both kinds of rules share the same lower-level append machinery without interfering with each other.
 
 *Call graph*: calls 2 internal fn (blocking_append_allow_prefix_rule, blocking_append_network_rule); 4 external calls (from, assert_eq!, read_to_string, tempdir).
 
@@ -307,24 +309,24 @@ fn appends_prefix_and_network_rules()
 fn rejects_wildcard_network_rule_host()
 ```
 
-**Purpose**: Ensures wildcard hosts are rejected before any file write occurs and that the surfaced error message is specific. It documents the invariant that network rules must target a concrete host.
+**Purpose**: Checks that wildcard network hosts, such as `*.example.com`, are refused. This protects the policy from accidentally granting broad network access when only specific hosts are allowed.
 
-**Data flow**: The test creates a temp policy path, calls `blocking_append_network_rule` with host `*.example.com`, protocol `Https`, decision `Allow`, and no justification, captures the returned error with `expect_err`, and asserts on `err.to_string()`.
+**Data flow**: The test calls `blocking_append_network_rule` with a wildcard host and expects an error instead of a written rule. It then checks that the error message clearly says wildcards are not allowed.
 
-**Call relations**: Called by the test harness as the negative validation case for network rules. It exercises the early host-normalization failure path in `blocking_append_network_rule`, so the shared append helpers are never reached.
+**Call relations**: This test enters through the public network-rule function and relies on the validation performed before any file-writing step. Because validation fails, the flow stops before `append_rule_line` is used.
 
 *Call graph*: calls 1 internal fn (blocking_append_network_rule); 2 external calls (assert_eq!, tempdir).
 
 
 ### `core/src/network_proxy_loader.rs`
 
-`orchestration` · `startup config load and runtime config reload for network proxy state`
+`orchestration` · `startup and config reload`
 
-This file is the loader/orchestration layer for network proxy configuration. Startup begins with `build_network_proxy_state` or `build_network_proxy_state_and_reloader`, which call `build_config_state_with_mtimes`. That function resolves `CODEX_HOME`, loads the full `ConfigLayerStack`, attempts to load exec policy, tolerates parse errors by warning and substituting an empty policy, then derives a `NetworkProxyConfig`, trusted `NetworkProxyConstraints`, and file mtimes before calling `codex_network_proxy::build_config_state`.
+The network proxy needs one clear set of rules: whether networking is enabled, which domains are allowed or denied, whether proxying through other servers is allowed, and whether special “man-in-the-middle” hooks should inspect traffic. In reality, those rules come from several places: system config, user config, project config, and execution policy files. This file is the funnel that reads those sources, combines them in the right order, checks that user-controlled settings do not break trusted restrictions, and produces a `ConfigState` the proxy can actually run with.
 
-Two parallel config derivations happen here. `config_from_layers` merges all enabled layers in precedence order into one TOML value, selects the final active permission profile’s network table, accumulates MITM hooks/actions through `NetworkConfigAccumulator`, finalizes `network.mitm`, and overlays compiled exec-policy allow/deny domains via `apply_exec_policy_network_rules`. Separately, `network_constraints_from_trusted_layers` merges only non-user-controlled layers (excluding user, project, and session flags), selects the final trusted profile network, and applies only constraint-relevant fields into `NetworkProxyConstraints`; `enforce_trusted_constraints` then validates the effective config against those constraints.
+Think of it like building a final house rule sheet from several binders. Some binders are trusted, like administrator rules, and some are user-editable. User rules may add detail, but they cannot override hard safety limits from trusted layers. The file first loads all config layers, then loads the execution policy. If the execution policy has a parse error, it warns and continues with an empty policy; other errors stop the setup. It then merges network settings, adds domain rules from execution policy, validates everything against trusted constraints, and builds the final proxy state.
 
-The file also tracks reloadability. `collect_layer_mtimes` records mtimes for system, user, project, and legacy managed config files. `MtimeConfigReloader` stores those mtimes behind an async `RwLock`, compares current metadata in `needs_reload`, and either returns `None` or rebuilds fresh `ConfigState` plus mtimes in `maybe_reload`; `reload_now` forces the rebuild. Important invariants include precedence-order merging, normalization/upsert of domain permissions, and selecting only the final active permission profile rather than unioning multiple profiles across layers.
+The file also records the last modified time of each config file. `MtimeConfigReloader` later compares those timestamps with the current files, so the proxy can refresh its rules without restarting.
 
 #### Function details
 
@@ -334,11 +336,11 @@ The file also tracks reloadability. `collect_layer_mtimes` records mtimes for sy
 async fn build_network_proxy_state() -> Result<NetworkProxyState>
 ```
 
-**Purpose**: Builds a `NetworkProxyState` with an attached config reloader from current layered config.
+**Purpose**: Builds the full network proxy state ready for use, including the ability to reload itself later when config files change. This is the convenient top-level function for callers that just want a working proxy state.
 
-**Data flow**: Calls `build_network_proxy_state_and_reloader()` to obtain a `ConfigState` and `MtimeConfigReloader`, wraps the reloader in `Arc`, and returns `NetworkProxyState::with_reloader(state, Arc::new(reloader))`.
+**Data flow**: It takes no direct input. It asks `build_network_proxy_state_and_reloader` for the current config state and a reloader, wraps the reloader in shared ownership, and returns a `NetworkProxyState` that carries both the settings and the reload hook.
 
-**Call relations**: Top-level entry used when the runtime wants a ready-to-use proxy state object that can self-reload.
+**Call relations**: This is the public front door for setup. It delegates the real loading work to `build_network_proxy_state_and_reloader`, then hands the result to the network proxy state constructor so the proxy can refresh itself later.
 
 *Call graph*: calls 2 internal fn (build_network_proxy_state_and_reloader, with_reloader); 1 external calls (new).
 
@@ -349,11 +351,11 @@ async fn build_network_proxy_state() -> Result<NetworkProxyState>
 async fn build_network_proxy_state_and_reloader() -> Result<(ConfigState, MtimeConfigReloader)>
 ```
 
-**Purpose**: Builds the initial network proxy config state and a matching mtime-based reloader.
+**Purpose**: Builds both pieces needed by the proxy: the current network configuration and the object that can rebuild it later. Use this when a caller needs direct access to the reloader as well as the config.
 
-**Data flow**: Calls `build_config_state_with_mtimes()` to get `(ConfigState, Vec<LayerMtime>)`, constructs `MtimeConfigReloader::new(layer_mtimes)`, and returns both pieces.
+**Data flow**: It takes no direct input. It calls `build_config_state_with_mtimes`, receives a usable config state plus remembered file modification times, creates an `MtimeConfigReloader` from those times, and returns both.
 
-**Call relations**: Used by `build_network_proxy_state` and can also be called directly by code that wants separate state and reloader objects.
+**Call relations**: It sits between the simple public setup function and the lower-level config-building code. `build_network_proxy_state` calls it during startup, and it calls `build_config_state_with_mtimes` to do the actual reading and validation.
 
 *Call graph*: calls 2 internal fn (new, build_config_state_with_mtimes); called by 1 (build_network_proxy_state).
 
@@ -364,11 +366,11 @@ async fn build_network_proxy_state_and_reloader() -> Result<(ConfigState, MtimeC
 async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime>)>
 ```
 
-**Purpose**: Loads layered config and exec policy, derives effective network proxy config plus trusted constraints, and records mtimes for reload detection.
+**Purpose**: Reads all relevant Codex configuration, folds in execution policy network rules, checks safety limits, and returns the finished proxy config along with file timestamps for future reload checks.
 
-**Data flow**: Finds `codex_home`, loads config layers with `load_config_layers_state`, loads exec policy with `load_exec_policy`, substituting `Policy::empty()` and logging a warning on parse errors, derives `NetworkProxyConfig` via `config_from_layers`, derives and validates trusted constraints via `enforce_trusted_constraints`, collects layer mtimes with `collect_layer_mtimes`, builds a `ConfigState` with `build_config_state(config, constraints)`, and returns `(state, layer_mtimes)`.
+**Data flow**: It starts by finding the Codex home folder, then loads the stacked config layers from disk. It tries to load the execution policy; if the policy text cannot be parsed, it logs a warning and continues with an empty policy, but other policy errors stop the process. It converts the layers into a `NetworkProxyConfig`, derives trusted constraints, records modification times for config files, builds the final `ConfigState`, and returns that state plus the timestamps.
 
-**Call relations**: Core builder used at startup and by both reload paths. It delegates config derivation, constraint derivation, and mtime collection to helper functions.
+**Call relations**: This is the central assembly line. It is called during initial setup by `build_network_proxy_state_and_reloader` and during reload paths by `MtimeConfigReloader::maybe_reload` and `MtimeConfigReloader::reload_now`. It relies on helper functions to collect timestamps, merge config, and enforce trusted restrictions before handing the result to the network proxy library.
 
 *Call graph*: calls 6 internal fn (load_config_layers_state, find_codex_home, load_exec_policy, collect_layer_mtimes, config_from_layers, enforce_trusted_constraints); called by 3 (maybe_reload, reload_now, build_network_proxy_state_and_reloader); 5 external calls (new, build_config_state, default, empty, warn!).
 
@@ -379,11 +381,11 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
 fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime>
 ```
 
-**Purpose**: Collects filesystem paths and current modification times for reload-relevant config layers.
+**Purpose**: Records the last modified time for each config file that came from a real file path. These records let the reloader later tell whether any relevant config file changed.
 
-**Data flow**: Iterates enabled layers from the `ConfigLayerStack` in lowest-precedence-first order, maps supported `ConfigLayerSource` variants to concrete config file paths (`System.file`, `User.file`, `Project.dot_codex_folder/config.toml`, `LegacyManagedConfigTomlFromFile.file`), converts each path into `LayerMtime::new`, and returns the resulting vector.
+**Data flow**: It receives a stack of config layers. It walks the enabled layers from lowest to highest priority, picks out layers that correspond to known files or project `.codex/config.toml` files, creates a `LayerMtime` for each path, and returns the list.
 
-**Call relations**: Called during initial state build and every reload rebuild so `MtimeConfigReloader` can later detect changes.
+**Call relations**: This helper is used by `build_config_state_with_mtimes` after config loading. Its output becomes the memory used by `MtimeConfigReloader` to decide whether a reload is needed.
 
 *Call graph*: calls 1 internal fn (get_layers); called by 1 (build_config_state_with_mtimes).
 
@@ -397,11 +399,11 @@ fn enforce_trusted_constraints(
 ) -> Result<NetworkProxyConstraints>
 ```
 
-**Purpose**: Derives trusted-layer network constraints and validates the effective network proxy config against them.
+**Purpose**: Makes sure the final network proxy config does not violate restrictions set by trusted configuration layers, such as system-level rules. This protects administrator or managed settings from being loosened by user or project config.
 
-**Data flow**: Calls `network_constraints_from_trusted_layers(layers)` to build `NetworkProxyConstraints`, then passes `config` and those constraints into `validate_policy_against_constraints`. On validation failure it converts the proxy constraint error into `anyhow` with context `network proxy constraints`; otherwise it returns the constraints.
+**Data flow**: It receives all config layers and the proposed final network proxy config. It extracts trusted network constraints, asks the network proxy validator to compare the config against those constraints, and returns the constraints if validation passes. If validation fails, it returns an error with context saying the problem is in network proxy constraints.
 
-**Call relations**: Used only by `build_config_state_with_mtimes` after effective config derivation, ensuring user-controlled layers cannot violate trusted baseline restrictions.
+**Call relations**: It is called by `build_config_state_with_mtimes` before the final `ConfigState` is built. It delegates constraint extraction to `network_constraints_from_trusted_layers` and validation to the network proxy library.
 
 *Call graph*: calls 1 internal fn (network_constraints_from_trusted_layers); called by 1 (build_config_state_with_mtimes); 1 external calls (validate_policy_against_constraints).
 
@@ -414,11 +416,11 @@ fn network_constraints_from_trusted_layers(
 ) -> Result<NetworkProxyConstraints>
 ```
 
-**Purpose**: Builds network proxy constraints from only trusted, non-user-controlled config layers.
+**Purpose**: Builds the set of network limits that come only from trusted config layers. User-controlled layers are deliberately ignored here so they cannot define their own safety ceiling.
 
-**Data flow**: Starts with default `NetworkProxyConstraints` and an empty TOML table, iterates enabled layers in precedence order, skips layers for which `is_user_controlled_layer` is true, merges remaining layer TOML into `merged`, deserializes `NetworkTablesToml` with `network_tables_from_toml`, selects the final active network table with `selected_network_from_tables`, and if present applies it into the constraints via `apply_network_constraints` before returning them.
+**Data flow**: It starts with empty constraints and an empty TOML table. It walks the enabled config layers, skips user, project, and session flag layers, merges the remaining trusted TOML values, parses the merged result into network-related tables, selects the active network profile if there is one, and copies its restrictive settings into `NetworkProxyConstraints`.
 
-**Call relations**: Called by `enforce_trusted_constraints`. It mirrors `config_from_layers` structurally but intentionally excludes user/project/session layers and only extracts constraint-relevant fields.
+**Call relations**: This function is called by `enforce_trusted_constraints`. It uses `is_user_controlled_layer` to filter layers, `network_tables_from_toml` and `selected_network_from_tables` to understand the merged TOML, and `apply_network_constraints` to translate selected settings into enforceable limits.
 
 *Call graph*: calls 5 internal fn (get_layers, apply_network_constraints, is_user_controlled_layer, network_tables_from_toml, selected_network_from_tables); called by 1 (enforce_trusted_constraints); 4 external calls (merge_toml_values, default, Table, new).
 
@@ -429,11 +431,11 @@ fn network_constraints_from_trusted_layers(
 fn apply_network_constraints(network: NetworkToml, constraints: &mut NetworkProxyConstraints)
 ```
 
-**Purpose**: Applies a selected `NetworkToml` profile into `NetworkProxyConstraints`, overlaying scalar flags and domain permissions.
+**Purpose**: Copies network settings from a selected permission profile into the constraint object used for safety validation. In plain terms, it turns trusted network config into hard limits.
 
-**Data flow**: Reads fields from `network` and writes corresponding `Option` fields on `constraints` for enablement, mode, upstream proxy, non-loopback proxy, all-unix-sockets, unix socket allowance, and local binding. For `domains`, it reconstructs a temporary `NetworkProxyConfig` seeded from any existing allowed/denied domains in `constraints`, overlays the new domain permissions with `overlay_network_domain_permissions`, then writes back normalized allowed and denied domain lists. For `unix_sockets`, it computes `allow_unix_sockets()` and stores that boolean.
+**Data flow**: It receives one `NetworkToml` value and a mutable constraints object. For each trusted setting that is present, it writes that setting into the constraints: enabled state, mode, proxy allowances, socket rules, local binding, and domain allow or deny lists. For domain rules, it uses a temporary proxy config so the same domain-merging logic is reused.
 
-**Call relations**: Used by `network_constraints_from_trusted_layers` and tested directly to ensure overlay semantics match effective config behavior.
+**Call relations**: It is called by `network_constraints_from_trusted_layers` after trusted layers have been merged and a network profile has been selected. It hands back its work by mutating the shared constraints object.
 
 *Call graph*: calls 1 internal fn (overlay_network_domain_permissions); called by 1 (network_constraints_from_trusted_layers); 1 external calls (default).
 
@@ -444,11 +446,11 @@ fn apply_network_constraints(network: NetworkToml, constraints: &mut NetworkProx
 fn network_tables_from_toml(value: &toml::Value) -> Result<NetworkTablesToml>
 ```
 
-**Purpose**: Deserializes the subset of merged TOML relevant to permission-profile network selection.
+**Purpose**: Converts raw TOML configuration data into the smaller structure this file cares about: default permission selection and permission profiles. This gives later code typed fields instead of loosely shaped config text.
 
-**Data flow**: Clones the input `toml::Value`, attempts `try_into::<NetworkTablesToml>()`, and returns the parsed struct or an `anyhow` error with context `failed to deserialize network tables from config`.
+**Data flow**: It receives a TOML value, clones it, and tries to deserialize it into `NetworkTablesToml`. On success it returns the parsed structure; on failure it returns an error explaining that network tables could not be deserialized from config.
 
-**Call relations**: Shared helper used by both effective-config and trusted-constraints derivation paths, plus test-only application helpers.
+**Call relations**: Both full config building and trusted-constraint extraction call this after TOML layers have been merged. It prepares data for `selected_network_from_tables`, which chooses the active network settings.
 
 *Call graph*: called by 2 (config_from_layers, network_constraints_from_trusted_layers); 1 external calls (clone).
 
@@ -459,11 +461,11 @@ fn network_tables_from_toml(value: &toml::Value) -> Result<NetworkTablesToml>
 fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<NetworkToml>>
 ```
 
-**Purpose**: Selects the final active `NetworkToml` from parsed config tables based on `default_permissions` and permission-profile inheritance rules.
+**Purpose**: Finds the network settings for the configured default permission profile, if those settings should come from a custom profile. Built-in profiles are intentionally ignored here because their network defaults are handled elsewhere.
 
-**Data flow**: Reads `parsed.default_permissions`; if absent, returns `Ok(None)`. If the name is a built-in permission profile, it returns `Ok(None)` after validating that unknown built-ins are rejected. Otherwise it requires a `[permissions]` table, resolves the named profile with `resolve_permission_profile`, and returns `Ok(profile.network)`.
+**Data flow**: It receives parsed config tables. If no `default_permissions` value is set, it returns no network settings. If the value names a known built-in profile, it also returns none. If it looks like an unknown built-in name, it raises an error. Otherwise it requires a `[permissions]` table, resolves the named profile, and returns that profile’s optional network settings.
 
-**Call relations**: Central selector used by both config and constraint derivation. It ensures only the final chosen profile contributes network settings.
+**Call relations**: This selector is used by config application and trusted constraint extraction. `network_constraints_from_trusted_layers`, the test-only `apply_network_tables`, and `NetworkConfigAccumulator::apply_network_tables` all call it before deciding whether there is any network config to apply.
 
 *Call graph*: called by 3 (apply_network_tables, apply_network_tables, network_constraints_from_trusted_layers); 3 external calls (is_builtin_permission_profile_name, reject_unknown_builtin_permission_profile, resolve_permission_profile).
 
@@ -474,11 +476,11 @@ fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<Netw
 fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesToml) -> Result<()>
 ```
 
-**Purpose**: Test-only helper that applies the selected network table from parsed config directly into a `NetworkProxyConfig`.
+**Purpose**: Applies parsed network tables directly to a network proxy config in tests. It exists only in test builds, giving tests a small way to exercise config parsing and application.
 
-**Data flow**: Calls `selected_network_from_tables(parsed)`; if it returns `Some(network)`, invokes `network.apply_to_network_proxy_config(config)`, then returns `Ok(())`.
+**Data flow**: It receives a mutable `NetworkProxyConfig` and parsed network tables. It asks `selected_network_from_tables` for the active network settings, applies them to the config if present, and returns success or an error.
 
-**Call relations**: Compiled only in tests and used by `network_proxy_loader_tests.rs` to validate overlay behavior incrementally.
+**Call relations**: Because it is compiled only for tests, it is not part of the runtime setup path. It uses the same selection logic as production code so tests can check the real behavior.
 
 *Call graph*: calls 1 internal fn (selected_network_from_tables).
 
@@ -489,11 +491,11 @@ fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesTo
 fn apply_network_tables(&mut self, parsed: NetworkTablesToml) -> Result<()>
 ```
 
-**Purpose**: Applies the selected network table from parsed config into the accumulator’s config and MITM collections.
+**Purpose**: Applies the active network profile from parsed config into an accumulator that is building the final proxy config. The accumulator is needed because some settings, especially MITM hooks and actions, must be collected and validated together.
 
-**Data flow**: Calls `selected_network_from_tables(parsed)`; if a `NetworkToml` is selected, forwards it to `self.apply_network(network)`, then returns `Ok(())`.
+**Data flow**: It receives parsed network tables and mutable access to the accumulator. It selects the active network settings with `selected_network_from_tables`; if a network section exists, it passes it to `NetworkConfigAccumulator::apply_network`. It returns success unless profile selection fails.
 
-**Call relations**: Used by `config_from_layers` and tests to process one merged or incremental network table at a time while preserving MITM action/hook accumulation.
+**Call relations**: This is called during `config_from_layers` after all config layers have been merged and parsed. It is the bridge from parsed TOML tables to accumulated runtime proxy configuration.
 
 *Call graph*: calls 2 internal fn (apply_network, selected_network_from_tables).
 
@@ -504,11 +506,11 @@ fn apply_network_tables(&mut self, parsed: NetworkTablesToml) -> Result<()>
 fn apply_network(&mut self, mut network: NetworkToml)
 ```
 
-**Purpose**: Applies one `NetworkToml` into the accumulator, separating ordinary network settings from MITM hook/action definitions.
+**Purpose**: Applies one selected network configuration to the accumulator while keeping MITM hook definitions and action definitions for later validation. MITM means “man in the middle,” where proxy code can inspect or alter traffic according to configured hooks.
 
-**Data flow**: Takes ownership of `network`, removes `network.mitm` with `take()`, applies the remaining network settings into `self.config` via `apply_to_network_proxy_config`, then extends `self.mitm_actions` and `self.mitm_hooks` with any actions/hooks found in the extracted MITM config.
+**Data flow**: It receives a `NetworkToml` value. It temporarily removes the MITM section, applies the ordinary network settings to the accumulator’s `NetworkProxyConfig`, then stores any MITM actions and hooks in ordered maps. Later entries can extend or replace earlier collected definitions according to map behavior.
 
-**Call relations**: Called by `NetworkConfigAccumulator::apply_network_tables` whenever a selected network profile is present.
+**Call relations**: It is called by `NetworkConfigAccumulator::apply_network_tables` once a profile has been selected. It does not finish MITM setup itself; that final validation and conversion happens in `NetworkConfigAccumulator::finish`.
 
 *Call graph*: calls 1 internal fn (apply_to_network_proxy_config); called by 1 (apply_network_tables); 1 external calls (extend).
 
@@ -519,11 +521,11 @@ fn apply_network(&mut self, mut network: NetworkToml)
 fn finish(mut self) -> Result<NetworkProxyConfig>
 ```
 
-**Purpose**: Finalizes accumulated network config by validating MITM action references, materializing runtime hooks, and computing the final MITM-enabled flag.
+**Purpose**: Completes the accumulated network proxy config and makes MITM settings safe to use. It validates that hooks refer to known actions before converting them into runtime hooks.
 
-**Data flow**: Consumes the accumulator. If `mitm_hooks` is non-empty, it builds a `NetworkMitmToml` from accumulated hooks and actions, validates hook action references, converts hooks to runtime hooks with `to_runtime_hooks`, and stores them in `self.config.network.mitm_hooks`. It then sets `self.config.network.mitm` to true if mode is `NetworkMode::Limited` or any MITM hooks exist, and returns the finished `NetworkProxyConfig`.
+**Data flow**: It consumes the accumulator. If hooks were collected, it combines hooks and actions into a MITM config, checks that every hook action reference is valid, converts those definitions into runtime hooks, and stores them on the network config. It also turns the general MITM flag on when the network mode is limited or when hooks exist, then returns the finished `NetworkProxyConfig`.
 
-**Call relations**: Called by `config_from_layers` after all merged network settings have been accumulated.
+**Call relations**: This is the last step after `NetworkConfigAccumulator::apply_network_tables` has applied config data. `config_from_layers` uses the completed config before adding execution policy domain rules.
 
 *Call graph*: 1 external calls (is_empty).
 
@@ -537,11 +539,11 @@ fn config_from_layers(
 ) -> Result<NetworkProxyConfig>
 ```
 
-**Purpose**: Builds the effective `NetworkProxyConfig` from all enabled config layers plus exec-policy domain overlays.
+**Purpose**: Combines all enabled config layers into one `NetworkProxyConfig`, then adds network allow and deny rules from the execution policy. This produces the effective proxy policy before trusted constraints are checked.
 
-**Data flow**: Starts with an empty TOML table, merges every enabled layer’s config in lowest-precedence-first order, deserializes `NetworkTablesToml`, creates a default `NetworkConfigAccumulator`, applies the selected network tables into it, finalizes the accumulator into a `NetworkProxyConfig`, overlays exec-policy network rules via `apply_exec_policy_network_rules`, and returns the config.
+**Data flow**: It receives a config layer stack and an execution policy. It merges enabled layers from lowest to highest priority into one TOML value, parses the network-related tables, applies them through a `NetworkConfigAccumulator`, finishes the config, then calls `apply_exec_policy_network_rules` to add domain rules from the execution policy. The finished `NetworkProxyConfig` is returned.
 
-**Call relations**: Called by `build_config_state_with_mtimes` as the main effective-config derivation step. It delegates profile selection to `selected_network_from_tables` and post-processing to the accumulator and exec-policy overlay helper.
+**Call relations**: It is called by `build_config_state_with_mtimes` as the main config-conversion step. It uses `network_tables_from_toml` for parsing, the accumulator for applying profile settings, and `apply_exec_policy_network_rules` to fold policy rules into the same network config.
 
 *Call graph*: calls 3 internal fn (get_layers, apply_exec_policy_network_rules, network_tables_from_toml); called by 1 (build_config_state_with_mtimes); 4 external calls (merge_toml_values, default, Table, new).
 
@@ -555,11 +557,11 @@ fn apply_exec_policy_network_rules(
 )
 ```
 
-**Purpose**: Overlays compiled exec-policy allow and deny domain rules onto the network proxy config.
+**Purpose**: Copies network domain rules from the execution policy into the proxy config. This makes execution policy restrictions part of the same allow and deny list the proxy uses at runtime.
 
-**Data flow**: Calls `exec_policy.compiled_network_domains()` to get allowed and denied host lists, then iterates each list and calls `upsert_network_domain(config, host, permission)` with `Allow` or `Deny` respectively.
+**Data flow**: It receives a mutable network proxy config and an execution policy. It asks the policy for compiled allowed and denied domains, then inserts each allowed domain with an allow permission and each denied domain with a deny permission.
 
-**Call relations**: Used by `config_from_layers` after config-derived network settings are built, so exec-policy rules take effect in the final runtime config.
+**Call relations**: It is called by `config_from_layers` after config-file settings have been applied. For each domain it calls `upsert_network_domain`, which performs the normalized insert or update.
 
 *Call graph*: calls 1 internal fn (upsert_network_domain); called by 1 (config_from_layers); 1 external calls (compiled_network_domains).
 
@@ -574,11 +576,11 @@ fn upsert_network_domain(
 )
 ```
 
-**Purpose**: Adds or updates one normalized domain permission entry in the network proxy config.
+**Purpose**: Adds or updates one domain permission in the network proxy config. “Upsert” means insert if missing, or update if it already exists.
 
-**Data flow**: Takes mutable `NetworkProxyConfig`, a host string, and a `NetworkDomainPermission`, then calls `config.network.upsert_domain_permission(host, permission, normalize_host)` to insert/update the normalized host entry.
+**Data flow**: It receives a mutable proxy config, a host name, and the permission to apply. It passes those to the config’s domain-permission table along with `normalize_host`, so equivalent host spellings are treated consistently. It changes the config in place and returns nothing.
 
-**Call relations**: Internal helper used by `apply_exec_policy_network_rules` to ensure domain normalization and overwrite semantics are centralized.
+**Call relations**: It is used by `apply_exec_policy_network_rules` for every allowed or denied domain from execution policy. It is the small final step that writes those policy decisions into the proxy config.
 
 *Call graph*: called by 1 (apply_exec_policy_network_rules).
 
@@ -589,11 +591,11 @@ fn upsert_network_domain(
 fn is_user_controlled_layer(layer: &ConfigLayerSource) -> bool
 ```
 
-**Purpose**: Classifies config layer sources that should be excluded when deriving trusted constraints.
+**Purpose**: Answers whether a config layer is controlled by the user, project, or current session rather than by a trusted source. This distinction matters because user-controlled layers are ignored when building safety constraints.
 
-**Data flow**: Matches the `ConfigLayerSource` and returns `true` for `User`, `Project`, and `SessionFlags`; returns `false` for all other layer kinds.
+**Data flow**: It receives a config layer source label. It checks whether the source is a user config, project config, or session flags, and returns `true` for those sources and `false` otherwise.
 
-**Call relations**: Used by `network_constraints_from_trusted_layers` to filter out layers that are not trusted enough to impose baseline constraints.
+**Call relations**: It is called by `network_constraints_from_trusted_layers` while scanning config layers. That caller uses the answer to skip layers that should not be allowed to define trusted restrictions.
 
 *Call graph*: called by 1 (network_constraints_from_trusted_layers); 1 external calls (matches!).
 
@@ -604,11 +606,11 @@ fn is_user_controlled_layer(layer: &ConfigLayerSource) -> bool
 fn new(path: AbsolutePathBuf) -> Self
 ```
 
-**Purpose**: Captures the current modification time for one config file path.
+**Purpose**: Creates a timestamp record for one config file path. The record says where the file is and what its last modified time was when the config was loaded.
 
-**Data flow**: Takes an `AbsolutePathBuf`, reads filesystem metadata and modified time if available, stores the path and optional `SystemTime` in a new `LayerMtime`, and returns it.
+**Data flow**: It receives an absolute path. It asks the filesystem for metadata and, if possible, reads the file’s modified time. It returns a `LayerMtime` containing the path and either the timestamp or `None` if the timestamp could not be read.
 
-**Call relations**: Called by `collect_layer_mtimes` when building the reload watch list.
+**Call relations**: This constructor is used when config layer paths are collected for reload tracking. Later, `MtimeConfigReloader::needs_reload` compares these saved timestamps with the current filesystem state.
 
 *Call graph*: 1 external calls (metadata).
 
@@ -619,11 +621,11 @@ fn new(path: AbsolutePathBuf) -> Self
 fn new(layer_mtimes: Vec<LayerMtime>) -> Self
 ```
 
-**Purpose**: Constructs a reloader initialized with the current set of tracked layer mtimes.
+**Purpose**: Creates a config reloader from the remembered modification times of config layers. It wraps the timestamp list in an asynchronous read-write lock so reload checks and updates can coordinate safely.
 
-**Data flow**: Wraps the provided `Vec<LayerMtime>` in a `tokio::sync::RwLock` and returns `MtimeConfigReloader { layer_mtimes }`.
+**Data flow**: It receives a list of `LayerMtime` records. It stores them inside an `RwLock`, which is a lock that allows many readers or one writer, and returns a new `MtimeConfigReloader`.
 
-**Call relations**: Created by `build_network_proxy_state_and_reloader` after the initial config state has been built.
+**Call relations**: It is called by `build_network_proxy_state_and_reloader` after the initial config state has been built. The resulting reloader is attached to the network proxy state or returned to callers.
 
 *Call graph*: called by 1 (build_network_proxy_state_and_reloader); 1 external calls (new).
 
@@ -634,11 +636,11 @@ fn new(layer_mtimes: Vec<LayerMtime>) -> Self
 async fn needs_reload(&self) -> bool
 ```
 
-**Purpose**: Checks whether any tracked config file has appeared, disappeared, or gained a newer modification time.
+**Purpose**: Checks whether any tracked config file has changed since the last load. It is a quick “should we rebuild?” test before doing the more expensive reload work.
 
-**Data flow**: Reads the current `layer_mtimes` lock, iterates each tracked layer, fetches current filesystem metadata for `layer.path`, compares current modified time against stored `layer.mtime`, and returns `true` if any file is newer, newly present, or newly missing; otherwise returns `false`.
+**Data flow**: It reads the saved `LayerMtime` list under a shared lock. For each path, it gets the current file modification time and compares it with the saved one. It returns `true` if a file is newer, appears after being missing, disappears after existing, or otherwise differs in a way that means the loaded config may be stale; otherwise it returns `false`.
 
-**Call relations**: Used internally by `MtimeConfigReloader::maybe_reload` as the cheap change detector before rebuilding config state.
+**Call relations**: It is called by `MtimeConfigReloader::maybe_reload`. If it says nothing changed, reload is skipped; if it says something changed, the reloader rebuilds the full config state.
 
 *Call graph*: called by 1 (maybe_reload).
 
@@ -649,11 +651,11 @@ async fn needs_reload(&self) -> bool
 fn source_label(&self) -> String
 ```
 
-**Purpose**: Provides a human-readable label describing what this reloader watches.
+**Purpose**: Returns a human-readable name for what this reloader watches. This label can be used in logs, status messages, or error reporting.
 
-**Data flow**: Returns the constant string `"config layers"` as an owned `String`.
+**Data flow**: It receives shared access to the reloader and returns the fixed string `config layers`. It does not inspect or change any state.
 
-**Call relations**: Implements the `ConfigReloader` trait’s labeling method for diagnostics and logging.
+**Call relations**: This is part of the `ConfigReloader` interface implemented for `MtimeConfigReloader`. Code that works with reloaders generically can ask this object what source it represents.
 
 
 ##### `MtimeConfigReloader::maybe_reload`  (lines 389–391)
@@ -662,11 +664,11 @@ fn source_label(&self) -> String
 fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>>
 ```
 
-**Purpose**: Implements conditional reload: rebuilds config state only if tracked layer mtimes indicate a change.
+**Purpose**: Implements the reload-if-needed behavior for the network proxy. It rebuilds the config only when tracked config files have changed.
 
-**Data flow**: Calls `self.needs_reload().await`; if false, returns `Ok(None)`. If true, it rebuilds `(state, layer_mtimes)` via `build_config_state_with_mtimes().await`, writes the new mtimes into the lock, and returns `Ok(Some(state))`.
+**Data flow**: It receives shared access to the reloader. It first checks `needs_reload`; if no file changed, it returns `None`. If a change is detected, it calls `build_config_state_with_mtimes`, replaces the saved timestamp list with the new one under a write lock, and returns the new `ConfigState` inside `Some`.
 
-**Call relations**: Exposed through the `ConfigReloader` trait and used by runtime code that polls for config changes without forcing a rebuild every time.
+**Call relations**: This is exposed through the `ConfigReloader` trait as a boxed asynchronous operation. The network proxy can call it during runtime to refresh settings without restarting, and the heavy rebuild work is delegated back to `build_config_state_with_mtimes`.
 
 *Call graph*: calls 2 internal fn (needs_reload, build_config_state_with_mtimes); 1 external calls (pin).
 
@@ -677,11 +679,11 @@ fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>>
 fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState>
 ```
 
-**Purpose**: Forces an unconditional rebuild of network proxy config state and refreshes tracked mtimes.
+**Purpose**: Forces a full rebuild of the network proxy config, even if file timestamps do not show a change. This is useful when a caller explicitly wants a fresh read.
 
-**Data flow**: Calls `build_config_state_with_mtimes().await`, writes the returned mtimes into the lock, and returns the rebuilt `ConfigState`.
+**Data flow**: It receives shared access to the reloader. It calls `build_config_state_with_mtimes`, replaces the saved timestamp list with the newly collected one, and returns the rebuilt `ConfigState`.
 
-**Call relations**: Exposed through the `ConfigReloader` trait for explicit reload requests that bypass change detection.
+**Call relations**: This is also exposed through the `ConfigReloader` trait as a boxed asynchronous operation. Unlike `maybe_reload`, it skips the `needs_reload` check and immediately delegates to `build_config_state_with_mtimes`.
 
 *Call graph*: calls 1 internal fn (build_config_state_with_mtimes); 1 external calls (pin).
 
@@ -691,22 +693,24 @@ These files establish the requirements model and prepare individual requirement 
 
 ### `config/src/requirements_layers/mod.rs`
 
-`orchestration` · `config load and requirement composition setup`
+`config` · `config load`
 
-This module file is the root of the `requirements_layers` subsystem. It declares five internal submodules—`hooks`, `layer`, `permissions`, `rules`, and `stack`—which together implement the mechanics of requirement layering. Although the implementation details live in those files, this root establishes the public API by re-exporting `RequirementsLayerEntry` from `layer` and `compose_requirements` from `stack`.
+This file does not contain the actual rules for requirements itself. Instead, it acts like an index page for a small section of the configuration system. The project appears to split requirement handling into several focused files: hooks, individual layers, permissions, rules, and stacking. This module ties those files together so the rest of the codebase does not need to know their internal layout.
 
-That structure signals the intended abstraction boundary. Callers outside the subsystem are expected to work with a layer entry type that describes one source of requirements and a composition function that folds a stack of such layers into an effective result; they are not meant to depend directly on the lower-level hook, permission, or rule-merging internals. The design keeps the crate organized around a layered policy model, where requirements can originate from multiple places and must be combined deterministically. This file itself contains no executable logic, but it is important because it defines which concepts are stable and public versus which remain implementation details hidden behind the module tree.
+The important public pieces are `RequirementsLayerEntry`, which represents one entry in a requirements layer, and `compose_requirements`, which is the function other parts of the system use to combine multiple layers into one final set of requirements. A “layer” here is like a transparent sheet placed over another: each sheet can add or change requirements, and composing them means deciding what the final combined picture looks like.
+
+Without this file, callers would have to import directly from deeper internal files such as `layer` or `stack`. That would make the subsystem harder to reorganize safely. By re-exporting only the intended public pieces, this file keeps the boundary clean: outside code gets the tools it needs, while the detailed implementation stays tucked away in the submodules.
 
 
 ### `config/src/config_requirements.rs`
 
-`domain_logic` · `config load`
+`config` · `config load`
 
-This file is the core of managed-requirements processing. It starts by modeling where a requirement came from with `RequirementSource`, including single origins, legacy MDM/file sources, enterprise-managed layers, and flattened/deduplicated composites for merged provenance. It then wraps constrained values in `ConstrainedWithSource<T>` and plain sourced values in `Sourced<T>` so later validation errors can name the exact layer that imposed a restriction.
+This file is the rulebook for managed configuration. A normal user config says what the user wants; requirements say what the system, company, or administrator allows. Without this layer, a user could accidentally or deliberately choose settings outside the managed policy, and error messages would not be able to explain which policy blocked the choice.
 
-The schema side is broad: `ConfigRequirementsToml` represents the raw requirements file, while helper TOML structs cover network permissions, filesystem deny-read patterns, managed hooks, app/tool approvals, MCP servers, plugins, Windows sandbox implementations, feature flags, residency, and remote-sandbox hostname overrides. Several custom deserializers normalize legacy shapes into canonical ones: network allow/deny lists become `NetworkDomainPermissionsToml` / `NetworkUnixSocketPermissionsToml`, filesystem deny-read entries are normalized to absolute paths or normalized glob prefixes, and `permissions.filesystem` is explicitly reserved so it cannot masquerade as a normal permission profile.
+The file has two main shapes of data. The first is the raw TOML shape, such as allowed approval policies, sandbox modes, web search modes, network rules, filesystem deny-read patterns, plugins, apps, hooks, and execution rules. The second is the normalized shape, ConfigRequirements, which wraps many settings in a Constrained value. A constraint is like a guardrail: it stores a current value and checks every future value against the allowed list.
 
-`ConfigRequirementsWithSources` merges multiple layers by filling only unset fields, except `apps`, which merge with special descending-precedence semantics: any `enabled = false` wins across layers, while higher-precedence tool approval modes are preserved. `ConfigRequirementsToml::apply_remote_sandbox_config` can replace top-level sandbox allowlists based on the first hostname-pattern match. Finally, `TryFrom<ConfigRequirementsWithSources> for ConfigRequirements` compiles raw allowlists into `Constrained` validators for approval policy, reviewer, permission profile, Windows sandbox mode, web search mode, managed hooks, and residency; converts rules into executable policy; and preserves network/filesystem constraints plus guardian-policy source metadata.
+A key theme is source tracking. Values are wrapped with RequirementSource or Sourced so later errors can say, for example, that a setting came from MDM, a system requirements.toml file, or an enterprise-managed backend layer. The file also supports merging several requirement layers by priority, preserving higher-priority values while still combining some app restrictions safely. Tests at the bottom document the expected behavior for parsing, merging, source-aware errors, and compatibility with older config formats.
 
 #### Function details
 
@@ -716,11 +720,11 @@ The schema side is broad: `ConfigRequirementsToml` represents the raw requiremen
 fn composite(sources: impl IntoIterator<Item = RequirementSource>) -> Self
 ```
 
-**Purpose**: Builds a single provenance value from multiple requirement sources while flattening nested composites and removing duplicates. It also collapses degenerate cases so zero inputs become `Unknown` and one input stays as that source instead of wrapping it.
+**Purpose**: Builds one source label from several requirement sources. This is used when a final policy value is the result of more than one managed layer.
 
-**Data flow**: Consumes any iterator of `RequirementSource` values, pushes each through `append_to_composite` into a temporary `Vec<RequirementSource>`, then returns `Unknown`, the sole source, or `Composite { sources }` depending on the flattened count. It writes no external state.
+**Data flow**: It receives a list of sources, flattens nested composite sources, removes duplicates, and returns Unknown for no sources, the single source for one source, or a Composite source for many.
 
-**Call relations**: Used when higher-level merge logic needs one error-reporting source that represents several contributing layers; callers use it before storing or surfacing provenance so downstream constraint errors mention all relevant layers in priority order.
+**Call relations**: Higher-level merge code and tests call this when they need one human-readable origin for a value that came from several places; it delegates the flattening work to RequirementSource::append_to_composite.
 
 *Call graph*: called by 4 (constraint_error_includes_composite_requirement_source, apply_to, merge_output_source, source_for_top_level_keys); 1 external calls (new).
 
@@ -731,11 +735,11 @@ fn composite(sources: impl IntoIterator<Item = RequirementSource>) -> Self
 fn append_to_composite(self, flattened: &mut Vec<RequirementSource>)
 ```
 
-**Purpose**: Recursively flattens one source into a composite accumulator. Nested `Composite` variants are expanded and duplicate leaf sources are skipped.
+**Purpose**: Adds a source into a growing composite source list without nesting composites or repeating the same source.
 
-**Data flow**: Takes ownership of `self` and a mutable `Vec<RequirementSource>` accumulator. If `self` is composite, it recursively appends each child; otherwise it checks `flattened.contains(&source)` and pushes only unique sources.
+**Data flow**: It takes one RequirementSource and a mutable list. If the source is already composite, it adds each inner source; otherwise it appends the source only if it is not already present.
 
-**Call relations**: This is the worker behind `RequirementSource::composite`; it is not part of external merge flow directly, but enforces the invariant that composite provenance is flat and deduplicated.
+**Call relations**: This is the internal helper behind RequirementSource::composite, keeping composite source labels tidy before they are shown in errors.
 
 
 ##### `RequirementSource::fmt`  (lines 83–112)
@@ -744,11 +748,11 @@ fn append_to_composite(self, flattened: &mut Vec<RequirementSource>)
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats requirement provenance into human-readable text for diagnostics and error messages. Each variant gets a concrete display string, including file paths and enterprise identifiers.
+**Purpose**: Turns a requirement source into text that a person can read in an error message or log.
 
-**Data flow**: Reads the enum variant and writes formatted text into the provided formatter. Composite sources are emitted as a comma-separated list prefixed with `requirements layers:`.
+**Data flow**: It reads the variant, such as MDM, enterprise-managed, or a TOML file path, and writes a clear label into the formatter.
 
-**Call relations**: Invoked implicitly whenever `RequirementSource` appears in `ConstraintError` or other formatted output, so all source-aware validation paths depend on this representation being concise and specific.
+**Call relations**: Rust's display formatting calls this whenever code prints a RequirementSource; composite sources use it recursively to print each part.
 
 *Call graph*: 1 external calls (write!).
 
@@ -759,11 +763,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn new(value: Constrained<T>, source: Option<RequirementSource>) -> Self
 ```
 
-**Purpose**: Constructs a constrained value paired with optional provenance. It is the standard wrapper used for normalized requirement-backed settings.
+**Purpose**: Pairs a constrained setting with the source that imposed it. This keeps the guardrail and its explanation together.
 
-**Data flow**: Accepts a `Constrained<T>` and an `Option<RequirementSource>`, stores them unchanged, and returns `ConstrainedWithSource<T>`.
+**Data flow**: It receives a Constrained value and an optional RequirementSource, then returns a ConstrainedWithSource containing both.
 
-**Call relations**: Called by defaults and by `ConfigRequirements::try_from` when compiling raw requirement fields into active constraints, so it is the bridge between generic constraint machinery and source-aware requirement state.
+**Call relations**: Default setup, config normalization, and other config builders call this whenever they create a setting that may later reject invalid values.
 
 *Call graph*: called by 17 (resolve_allowed_windows_sandbox_setup_mode_rejects_disallowed_mode, default, try_from, test_requirements_web_search_mode_allowlist_does_not_warn_when_unset, default, from, from_configured_with_optional_warnings, requirements_managed_hooks_execute_from_managed_dir, requirements_managed_hooks_execute_windows_command_override, requirements_managed_hooks_load_when_managed_dir_is_missing (+7 more)).
 
@@ -774,11 +778,11 @@ fn new(value: Constrained<T>, source: Option<RequirementSource>) -> Self
 fn deref(&self) -> &Self::Target
 ```
 
-**Purpose**: Exposes the inner `Constrained<T>` by shared reference so callers can use constraint APIs directly on the wrapper.
+**Purpose**: Lets code use ConstrainedWithSource as if it were the inner Constrained value for read-only access.
 
-**Data flow**: Reads `self.value` and returns `&Constrained<T>`.
+**Data flow**: It receives a reference to the wrapper and returns a reference to the wrapped Constrained value.
 
-**Call relations**: Supports ergonomic use of `ConstrainedWithSource` throughout config resolution and tests without manually reaching into the `value` field.
+**Call relations**: Rust uses this automatically when callers read methods or fields from the inner constraint through the wrapper.
 
 
 ##### `ConstrainedWithSource::deref_mut`  (lines 136–138)
@@ -787,11 +791,11 @@ fn deref(&self) -> &Self::Target
 fn deref_mut(&mut self) -> &mut Self::Target
 ```
 
-**Purpose**: Exposes the inner `Constrained<T>` mutably so callers can update or further constrain the wrapped value.
+**Purpose**: Lets code use ConstrainedWithSource as if it were the inner Constrained value for mutable access.
 
-**Data flow**: Returns `&mut Constrained<T>` from `self.value`.
+**Data flow**: It receives a mutable wrapper reference and returns a mutable reference to the wrapped Constrained value.
 
-**Call relations**: Used where requirement-backed constrained values need mutation through the wrapper, preserving attached source metadata alongside the mutable constraint.
+**Call relations**: Rust uses this automatically when callers need to update the constrained value while keeping the source attached.
 
 
 ##### `ConfigRequirements::default`  (lines 169–208)
@@ -800,11 +804,11 @@ fn deref_mut(&mut self) -> &mut Self::Target
 fn default() -> Self
 ```
 
-**Purpose**: Creates the permissive baseline requirements object used when no managed requirements are present. It chooses concrete defaults for constrained fields and leaves optional managed sections absent.
+**Purpose**: Creates a permissive baseline requirements object for when no managed requirements are configured.
 
-**Data flow**: Builds `ConfigRequirements` with unconstrained approval/reviewer defaults, `PermissionProfile::read_only()` as the initial permission profile, `WebSearchMode::Cached`, `None` for optional sections, and unconstrained `None` for optional Windows sandbox and residency fields.
+**Data flow**: It builds default constraints for approvals, reviewers, permissions, Windows sandbox choice, web search, and residency, while leaving optional managed sections unset.
 
-**Call relations**: Used as the empty normalized state before any managed layers are applied; later conversion and merge logic rely on these defaults to represent 'no requirement imposed'.
+**Call relations**: Config loading and tests use this as the starting point before applying stricter requirements from files or managed sources.
 
 *Call graph*: calls 4 internal fn (new, allow_any, allow_any_from_default, read_only).
 
@@ -815,11 +819,11 @@ fn default() -> Self
 fn exec_policy_source(&self) -> Option<&RequirementSource>
 ```
 
-**Purpose**: Returns the provenance of the compiled execution policy, if one exists. It is a convenience accessor over the sourced optional field.
+**Purpose**: Returns where the execution policy rules came from, if any were configured.
 
-**Data flow**: Reads `self.exec_policy`, maps `Some(Sourced<_>)` to `&policy.source`, and returns `Option<&RequirementSource>`.
+**Data flow**: It checks the optional execution policy field and returns a reference to its source when present.
 
-**Call relations**: Called by consumers that need to explain where an execution policy came from without unpacking the full sourced wrapper.
+**Call relations**: Other parts of the system can call this when they need to explain or report which policy supplied command execution rules.
 
 
 ##### `PluginRequirementsToml::is_empty`  (lines 235–237)
@@ -828,11 +832,11 @@ fn exec_policy_source(&self) -> Option<&RequirementSource>
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether a plugin requirements block contains any MCP server requirements. Empty or absent `mcp_servers` counts as empty.
+**Purpose**: Checks whether a plugin requirements block actually contains any MCP server restrictions.
 
-**Data flow**: Reads `self.mcp_servers`; returns true when it is `None` or when the contained `BTreeMap` is empty.
+**Data flow**: It looks at the optional server map and returns true if it is missing or empty.
 
-**Call relations**: Used by higher-level emptiness checks so blank plugin requirement entries do not make an otherwise empty requirements file appear configured.
+**Call relations**: The top-level emptiness check uses this to decide whether a parsed requirements file has meaningful plugin content.
 
 
 ##### `NetworkDomainPermissionsToml::is_empty`  (lines 247–249)
@@ -841,11 +845,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether the canonical domain-permission map has any entries.
+**Purpose**: Checks whether any domain allow or deny rules were configured.
 
-**Data flow**: Returns `self.entries.is_empty()`.
+**Data flow**: It reads the domain permission map and returns true when there are no entries.
 
-**Call relations**: Supports emptiness checks and normalization decisions around managed network constraints.
+**Call relations**: This is a small helper for callers that need to ignore empty network-domain sections.
 
 
 ##### `NetworkDomainPermissionsToml::allowed_domains`  (lines 251–259)
@@ -854,11 +858,11 @@ fn is_empty(&self) -> bool
 fn allowed_domains(&self) -> Option<Vec<String>>
 ```
 
-**Purpose**: Projects the canonical domain-permission map back into just the allowed patterns. It preserves sorted `BTreeMap` iteration order.
+**Purpose**: Extracts only the domain patterns that are explicitly allowed.
 
-**Data flow**: Iterates `self.entries`, filters entries whose value is `Allow`, clones the pattern keys into a `Vec<String>`, and returns `Some(vec)` unless the result is empty, in which case it returns `None`.
+**Data flow**: It scans the domain permission map, keeps entries marked allow, and returns them as a list, or None if there are none.
 
-**Call relations**: Used by callers that need legacy-style allowlists or reporting views derived from the canonical mixed allow/deny representation.
+**Call relations**: Network projection code and tests use this to convert the canonical allow/deny map into a simpler allow-list view.
 
 
 ##### `NetworkDomainPermissionsToml::denied_domains`  (lines 261–269)
@@ -867,11 +871,11 @@ fn allowed_domains(&self) -> Option<Vec<String>>
 fn denied_domains(&self) -> Option<Vec<String>>
 ```
 
-**Purpose**: Projects the canonical domain-permission map into only denied patterns.
+**Purpose**: Extracts only the domain patterns that are explicitly denied.
 
-**Data flow**: Iterates `self.entries`, selects `Deny` values, clones matching keys into a vector, and returns `Some(vec)` only when at least one deny entry exists.
+**Data flow**: It scans the domain permission map, keeps entries marked deny, and returns them as a list, or None if there are none.
 
-**Call relations**: Complements `allowed_domains` for diagnostics and compatibility projections from canonical network requirements.
+**Call relations**: Network projection code and tests use this alongside allowed_domains when they need separate allow and deny lists.
 
 
 ##### `NetworkDomainPermissionToml::fmt`  (lines 280–286)
@@ -880,11 +884,11 @@ fn denied_domains(&self) -> Option<Vec<String>>
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats a domain permission enum as the lowercase TOML token `allow` or `deny`.
+**Purpose**: Prints a domain permission as the lowercase words used in TOML: allow or deny.
 
-**Data flow**: Matches `self` and writes the corresponding static string to the formatter.
+**Data flow**: It receives an allow/deny enum value and writes the matching string into the formatter.
 
-**Call relations**: Used implicitly in debug or user-facing output involving canonical network permission entries.
+**Call relations**: Rust formatting calls this when domain permission values need to be displayed or serialized in a readable way.
 
 *Call graph*: 1 external calls (write_str).
 
@@ -895,11 +899,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether any Unix socket permission entries are present.
+**Purpose**: Checks whether any Unix socket network permissions were configured.
 
-**Data flow**: Returns `self.entries.is_empty()`.
+**Data flow**: It reads the socket permission map and returns true when it has no entries.
 
-**Call relations**: Supports normalization and emptiness checks for managed network socket constraints.
+**Call relations**: Callers can use this to skip empty Unix socket permission sections.
 
 
 ##### `NetworkUnixSocketPermissionsToml::allow_unix_sockets`  (lines 300–306)
@@ -908,11 +912,11 @@ fn is_empty(&self) -> bool
 fn allow_unix_sockets(&self) -> Vec<String>
 ```
 
-**Purpose**: Extracts only the allowed Unix socket paths from the canonical allow/deny map.
+**Purpose**: Extracts only the Unix socket paths that are explicitly allowed.
 
-**Data flow**: Iterates `self.entries`, filters `Allow` values, clones the path keys, and returns them as a `Vec<String>`; unlike domain helpers, it always returns a vector, possibly empty.
+**Data flow**: It scans the socket permission map, keeps entries marked allow, and returns those paths as strings.
 
-**Call relations**: Used when projecting canonical socket permissions into the legacy allowlist shape or for assertions/reporting.
+**Call relations**: Network compatibility code and tests use this to present the canonical socket map as an older allow-list shape.
 
 
 ##### `NetworkUnixSocketPermissionToml::fmt`  (lines 317–323)
@@ -921,11 +925,11 @@ fn allow_unix_sockets(&self) -> Vec<String>
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats a Unix socket permission enum as `allow` or `deny`.
+**Purpose**: Prints a Unix socket permission as allow or deny.
 
-**Data flow**: Matches the enum variant and writes the lowercase token to the formatter.
+**Data flow**: It receives an allow/deny enum value and writes the matching lowercase word.
 
-**Call relations**: Provides display behavior for canonical socket permission values in diagnostics and serialization-adjacent contexts.
+**Call relations**: Rust formatting calls this when socket permission values need readable text.
 
 *Call graph*: 1 external calls (write_str).
 
@@ -936,11 +940,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Custom-deserializes managed network requirements, enforcing that canonical and legacy field shapes are not mixed and normalizing legacy lists into canonical maps.
+**Purpose**: Reads the network requirements section from TOML while supporting both the current format and older list-based fields.
 
-**Data flow**: Deserializes into `RawNetworkRequirementsToml`, checks for invalid combinations of `domains` with `allowed_domains`/`denied_domains` and `unix_sockets` with `allow_unix_sockets`, then constructs `NetworkRequirementsToml`, filling `domains` and `unix_sockets` from canonical fields or legacy conversion helpers.
+**Data flow**: It deserializes raw fields, rejects mixed old and new shapes, converts legacy allowed and denied lists into canonical permission maps, and returns NetworkRequirementsToml.
 
-**Call relations**: Invoked by serde whenever `experimental_network` is parsed, and also indirectly by `NetworkConstraints::deserialize`; it centralizes compatibility logic so later code only sees one normalized shape.
+**Call relations**: Serde calls this during config parsing, and NetworkConstraints::deserialize also relies on it before turning requirements into normalized constraints.
 
 *Call graph*: called by 1 (deserialize); 2 external calls (custom, deserialize).
 
@@ -954,11 +958,11 @@ fn legacy_domain_permissions_from_lists(
 ) -> Option<NetworkDomainPermissionsToml>
 ```
 
-**Purpose**: Converts legacy `allowed_domains` and `denied_domains` lists into the canonical mixed permission map. Empty legacy lists are intentionally treated as unset.
+**Purpose**: Converts old allowed_domains and denied_domains lists into the newer map of domain patterns to allow/deny permissions.
 
-**Data flow**: Consumes two optional vectors, inserts allowed patterns then denied patterns into a `BTreeMap<String, NetworkDomainPermissionToml>`, and returns `Some(NetworkDomainPermissionsToml)` only if at least one entry exists.
+**Data flow**: It receives optional allow and deny lists, inserts each pattern into a map with its permission, and returns None if the result is empty.
 
-**Call relations**: Called only from `NetworkRequirementsToml::deserialize` when canonical `domains` is absent, providing backward compatibility for older requirements files.
+**Call relations**: NetworkRequirementsToml::deserialize calls this only when the new domains table is not used.
 
 *Call graph*: 1 external calls (new).
 
@@ -971,11 +975,11 @@ fn legacy_unix_socket_permissions_from_list(
 ) -> Option<NetworkUnixSocketPermissionsToml>
 ```
 
-**Purpose**: Converts the legacy `allow_unix_sockets` list into the canonical Unix socket permission map with all entries marked `Allow`.
+**Purpose**: Converts the old allow_unix_sockets list into the newer Unix socket permission map.
 
-**Data flow**: Consumes an optional vector of paths, maps each path to `(path, Allow)`, collects into a `BTreeMap`, and returns `Some(NetworkUnixSocketPermissionsToml)` only when non-empty.
+**Data flow**: It receives an optional list of paths, marks each path as allowed, and returns None if there are no paths.
 
-**Call relations**: Used by `NetworkRequirementsToml::deserialize` to normalize the old socket allowlist field into the canonical representation.
+**Call relations**: NetworkRequirementsToml::deserialize calls this only when the new unix_sockets table is not used.
 
 
 ##### `NetworkConstraints::deserialize`  (lines 465–471)
@@ -984,11 +988,11 @@ fn legacy_unix_socket_permissions_from_list(
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Deserializes normalized network constraints by reusing the requirements TOML parser and then converting the result into the runtime constraint struct.
+**Purpose**: Lets normalized network constraints be read directly from TOML-compatible data.
 
-**Data flow**: Delegates deserialization to `NetworkRequirementsToml::deserialize`, then converts the parsed value with `Into<NetworkConstraints>` and returns it.
+**Data flow**: It first parses NetworkRequirementsToml, then converts that into NetworkConstraints.
 
-**Call relations**: Lets callers deserialize directly into the normalized constraint type while still benefiting from the same legacy-shape validation and normalization rules.
+**Call relations**: Serde calls this when a NetworkConstraints value is deserialized; it reuses NetworkRequirementsToml::deserialize so both types follow the same rules.
 
 *Call graph*: calls 1 internal fn (deserialize).
 
@@ -999,11 +1003,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn from(value: NetworkRequirementsToml) -> Self
 ```
 
-**Purpose**: Performs a field-for-field conversion from `NetworkRequirementsToml` into the runtime `NetworkConstraints` struct.
+**Purpose**: Turns parsed network requirements into the normalized network constraints used by ConfigRequirements.
 
-**Data flow**: Consumes `NetworkRequirementsToml`, destructures all fields, and rebuilds them unchanged in `NetworkConstraints`.
+**Data flow**: It receives NetworkRequirementsToml, moves each network field into a NetworkConstraints value, and returns it.
 
-**Call relations**: Used by `NetworkConstraints::deserialize` and by `ConfigRequirements::try_from` when preserving managed network requirements as sourced runtime constraints.
+**Call relations**: ConfigRequirements::try_from uses this when preserving managed network rules with their source.
 
 
 ##### `FilesystemRequirementsToml::deserialize`  (lines 519–545)
@@ -1012,11 +1016,11 @@ fn from(value: NetworkRequirementsToml) -> Self
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Custom-deserializes requirements-level filesystem constraints while rejecting permission-profile fields in the reserved `permissions.filesystem` table.
+**Purpose**: Reads filesystem requirements while preventing a reserved table from being mistaken for a permission profile.
 
-**Data flow**: Deserializes into `RawFilesystemRequirementsToml`, checks whether any of `description`, `extends`, `workspace_roots`, `filesystem`, or `network` were supplied, returns a custom serde error if so, otherwise returns `FilesystemRequirementsToml { deny_read }`.
+**Data flow**: It deserializes raw filesystem fields, rejects profile-like fields such as extends or workspace_roots, and returns only deny_read requirements.
 
-**Call relations**: Runs during parsing of `permissions.filesystem`, ensuring that this table is used only for managed deny-read constraints and not confused with normal profile definitions.
+**Call relations**: Serde calls this during TOML parsing; tests verify that invalid profile-shaped filesystem requirements are rejected.
 
 *Call graph*: 2 external calls (custom, deserialize).
 
@@ -1027,11 +1031,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn from(value: PermissionsRequirementsToml) -> Self
 ```
 
-**Purpose**: Extracts the normalized filesystem deny-read constraint list from the broader permissions requirements structure.
+**Purpose**: Extracts filesystem deny-read rules from the broader permissions requirements section.
 
-**Data flow**: Consumes `PermissionsRequirementsToml`, pulls `filesystem.deny_read` if present, falls back to an empty vector otherwise, and returns `FilesystemConstraints { deny_read }`.
+**Data flow**: It receives PermissionsRequirementsToml, pulls out permissions.filesystem.deny_read if present, defaults to an empty list otherwise, and returns FilesystemConstraints.
 
-**Call relations**: Used by `ConfigRequirements::try_from` to preserve managed filesystem restrictions as a dedicated sourced constraint object.
+**Call relations**: ConfigRequirements::try_from calls this when turning parsed permissions requirements into runtime filesystem constraints.
 
 
 ##### `FilesystemDenyReadPattern::as_str`  (lines 577–579)
@@ -1040,11 +1044,11 @@ fn from(value: PermissionsRequirementsToml) -> Self
 fn as_str(&self) -> &str
 ```
 
-**Purpose**: Returns the normalized deny-read pattern string as a borrowed `&str`.
+**Purpose**: Returns the stored deny-read pattern as plain text.
 
-**Data flow**: Reads the inner transparent `String` and returns a string slice.
+**Data flow**: It reads the internal string and returns it as a string slice without changing anything.
 
-**Call relations**: Used by downstream filesystem enforcement or reporting code that needs the canonical pattern text.
+**Call relations**: Callers use this when they need to compare, display, or pass the normalized pattern onward.
 
 
 ##### `FilesystemDenyReadPattern::contains_glob`  (lines 581–583)
@@ -1053,11 +1057,11 @@ fn as_str(&self) -> &str
 fn contains_glob(&self) -> bool
 ```
 
-**Purpose**: Detects whether the normalized deny-read pattern contains glob metacharacters.
+**Purpose**: Reports whether the pattern contains wildcard characters such as *, ?, or [.
 
-**Data flow**: Scans the inner string character-by-character and returns true if any character satisfies `is_glob_metacharacter`.
+**Data flow**: It scans the stored string and returns true if any glob metacharacter is found.
 
-**Call relations**: Supports consumers that need to distinguish exact absolute paths from wildcard patterns.
+**Call relations**: Filesystem enforcement code can use this to decide whether a rule is an exact path or a pattern.
 
 
 ##### `FilesystemDenyReadPattern::from_input`  (lines 585–606)
@@ -1066,11 +1070,11 @@ fn contains_glob(&self) -> bool
 fn from_input(input: &str) -> Result<Self, String>
 ```
 
-**Purpose**: Normalizes a user-supplied deny-read path or glob into a canonical absolute-pattern string. Non-glob inputs must deserialize as absolute paths; glob inputs normalize only the directory prefix to an absolute path and preserve the wildcard suffix.
+**Purpose**: Normalizes a user-provided deny-read path or wildcard pattern into a safe absolute form.
 
-**Data flow**: Reads an input `&str`. If it contains no glob metacharacters, it validates/deserializes the whole string as `AbsolutePathBuf` and stores its lossy string form. Otherwise it splits the pattern at the first glob boundary with `split_glob_pattern`, normalizes the directory prefix via `deserialize_absolute_path` (using `.` when the prefix is empty), then reconstructs a normalized pattern string with careful handling for root `/` and empty suffix cases.
+**Data flow**: It receives an input string. If there are no wildcards, it parses the whole input as an absolute path. If there are wildcards, it normalizes the path prefix and then appends the wildcard suffix.
 
-**Call relations**: Called by serde deserialization and tests; it is the canonical entry point for deny-read pattern normalization before constraints are stored.
+**Call relations**: FilesystemDenyReadPattern::deserialize calls this while reading TOML, and tests call it to build expected normalized patterns.
 
 *Call graph*: calls 2 internal fn (deserialize_absolute_path, split_glob_pattern); 1 external calls (format!).
 
@@ -1081,11 +1085,11 @@ fn from_input(input: &str) -> Result<Self, String>
 fn from(value: AbsolutePathBuf) -> Self
 ```
 
-**Purpose**: Converts an already-validated absolute path buffer into a deny-read pattern without adding glob semantics.
+**Purpose**: Creates a deny-read pattern from an already validated absolute path.
 
-**Data flow**: Consumes `AbsolutePathBuf`, converts it to a lossy owned string, and wraps it in `FilesystemDenyReadPattern`.
+**Data flow**: It receives an AbsolutePathBuf, converts it to a string, and stores that string inside FilesystemDenyReadPattern.
 
-**Call relations**: Used in tests and any code that already has an absolute path object and wants the normalized deny-read wrapper directly.
+**Call relations**: Tests and other code use this conversion when they already have a trusted absolute path.
 
 *Call graph*: calls 1 internal fn (to_string_lossy).
 
@@ -1096,11 +1100,11 @@ fn from(value: AbsolutePathBuf) -> Self
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Serde entry point for deny-read patterns that accepts a string and normalizes it through `from_input`.
+**Purpose**: Reads a deny-read pattern from TOML and normalizes it immediately.
 
-**Data flow**: Deserializes a `String`, passes it to `FilesystemDenyReadPattern::from_input`, and maps any normalization error into a serde custom error.
+**Data flow**: It deserializes a string, passes it to FilesystemDenyReadPattern::from_input, and converts any normalization problem into a TOML parse error.
 
-**Call relations**: Invoked automatically when parsing `deny_read` arrays in requirements TOML.
+**Call relations**: Serde calls this for each entry in permissions.filesystem.deny_read.
 
 *Call graph*: 2 external calls (from_input, deserialize).
 
@@ -1111,11 +1115,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn deserialize_absolute_path(input: &str) -> Result<AbsolutePathBuf, String>
 ```
 
-**Purpose**: Parses a string into `AbsolutePathBuf` using serde's existing absolute-path deserializer and converts any failure into a plain string message.
+**Purpose**: Parses a string as an AbsolutePathBuf and turns parser errors into simple strings.
 
-**Data flow**: Builds a `StrDeserializer` over the input string, calls `AbsolutePathBuf::deserialize`, and returns either the parsed absolute path or the error text.
+**Data flow**: It receives path text, asks AbsolutePathBuf's deserializer to validate and normalize it, and returns either the path or an error message.
 
-**Call relations**: Used exclusively by `FilesystemDenyReadPattern::from_input` so path normalization shares the same validation rules as normal absolute-path TOML fields.
+**Call relations**: FilesystemDenyReadPattern::from_input calls this for exact paths and for the non-wildcard prefix of glob patterns.
 
 *Call graph*: calls 1 internal fn (deserialize); called by 1 (from_input); 1 external calls (new).
 
@@ -1126,11 +1130,11 @@ fn deserialize_absolute_path(input: &str) -> Result<AbsolutePathBuf, String>
 fn split_glob_pattern(input: &str) -> (&str, &str)
 ```
 
-**Purpose**: Splits a path/glob string into the longest directory prefix before the first glob metacharacter and the remaining suffix. It preserves root and Windows drive-prefix edge cases.
+**Purpose**: Splits a wildcard path into the directory part that can be normalized and the wildcard suffix that must be preserved.
 
-**Data flow**: Searches for the first glob character, then scans backward for the last path separator before it. Returns a tuple `(directory_prefix, suffix)` with special handling for `/`, Windows `C:\`-style prefixes, and no-separator cases.
+**Data flow**: It finds the first wildcard character, then looks backward for the nearest path separator, returning the prefix and suffix pieces.
 
-**Call relations**: Called by `FilesystemDenyReadPattern::from_input` to isolate the portion that must be normalized as an absolute path from the wildcard suffix that must remain textual.
+**Call relations**: FilesystemDenyReadPattern::from_input calls this before normalizing glob patterns.
 
 *Call graph*: called by 1 (from_input); 1 external calls (cfg!).
 
@@ -1141,11 +1145,11 @@ fn split_glob_pattern(input: &str) -> (&str, &str)
 fn is_path_separator(ch: char) -> bool
 ```
 
-**Purpose**: Determines whether a character counts as a path separator on the current platform.
+**Purpose**: Identifies characters that separate path components on the current operating system.
 
-**Data flow**: Returns true for `/` on Unix and for either `/` or `\` on Windows.
+**Data flow**: It receives one character and returns true for / on Unix-like systems, and for / or \ on Windows.
 
-**Call relations**: Used by `split_glob_pattern` so glob-prefix splitting respects platform path syntax.
+**Call relations**: split_glob_pattern uses this while locating the directory boundary before a wildcard.
 
 *Call graph*: 1 external calls (cfg!).
 
@@ -1156,11 +1160,11 @@ fn is_path_separator(ch: char) -> bool
 fn is_glob_metacharacter(ch: char) -> bool
 ```
 
-**Purpose**: Recognizes the subset of glob syntax that triggers special deny-read normalization.
+**Purpose**: Identifies wildcard characters used in glob patterns.
 
-**Data flow**: Returns true when the character is `*`, `?`, or `[`.
+**Data flow**: It receives one character and returns true for *, ?, or [.
 
-**Call relations**: Used by `contains_glob`, `from_input`, and `split_glob_pattern` to decide whether an input is a literal path or a wildcard pattern.
+**Call relations**: FilesystemDenyReadPattern::contains_glob, from_input, and split_glob_pattern use this to recognize patterns rather than exact paths.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1171,11 +1175,11 @@ fn is_glob_metacharacter(ch: char) -> bool
 fn from(mode: WebSearchMode) -> Self
 ```
 
-**Purpose**: Converts a runtime `WebSearchMode` into its requirements-layer enum counterpart.
+**Purpose**: Converts a runtime web search mode into the matching requirements enum.
 
-**Data flow**: Matches the input mode and returns the corresponding `WebSearchModeRequirement` variant.
+**Data flow**: It receives Disabled, Cached, or Live from the protocol type and returns the same concept in requirement form.
 
-**Call relations**: Used when building accepted-mode sets and error messages during requirement compilation.
+**Call relations**: Constraint checks use this conversion when comparing a candidate runtime web search mode against allowed requirement values.
 
 
 ##### `WebSearchMode::from`  (lines 686–692)
@@ -1184,11 +1188,11 @@ fn from(mode: WebSearchMode) -> Self
 fn from(mode: WebSearchModeRequirement) -> Self
 ```
 
-**Purpose**: Converts a requirements-layer web search mode into the runtime `WebSearchMode` enum.
+**Purpose**: Converts a requirements web search mode into the runtime protocol type.
 
-**Data flow**: Matches the requirement variant and returns the runtime equivalent.
+**Data flow**: It receives a requirement enum value and returns the equivalent WebSearchMode value.
 
-**Call relations**: Used by `ConfigRequirements::try_from` when constructing allowed-mode diagnostics and initial constrained values.
+**Call relations**: ConfigRequirements::try_from uses this while preparing readable allowed-value text for web search constraint errors.
 
 
 ##### `WebSearchModeRequirement::fmt`  (lines 696–702)
@@ -1197,11 +1201,11 @@ fn from(mode: WebSearchModeRequirement) -> Self
 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 ```
 
-**Purpose**: Formats a requirements web-search mode as the lowercase TOML token.
+**Purpose**: Prints a web search requirement as disabled, cached, or live.
 
-**Data flow**: Matches the enum variant and writes `disabled`, `cached`, or `live` to the formatter.
+**Data flow**: It receives the enum value and writes the matching lowercase string.
 
-**Call relations**: Supports readable diagnostics and serialization-adjacent output for web-search requirement values.
+**Call relations**: Rust formatting calls this when web search modes need human-readable text.
 
 *Call graph*: 1 external calls (write!).
 
@@ -1212,11 +1216,11 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether the computer-use requirements block contains any configured restriction.
+**Purpose**: Checks whether the computer-use requirements table contains any setting.
 
-**Data flow**: Returns true when `allow_locked_computer_use` is `None`.
+**Data flow**: It returns true when allow_locked_computer_use is not set.
 
-**Call relations**: Used by `ConfigRequirementsToml::is_empty` so an empty nested table does not count as configured requirements.
+**Call relations**: ConfigRequirementsToml::is_empty calls this to decide whether a parsed requirements file is effectively empty.
 
 
 ##### `WindowsRequirementsToml::is_empty`  (lines 722–724)
@@ -1225,11 +1229,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether the Windows-specific requirements block is empty.
+**Purpose**: Checks whether the Windows-specific requirements table contains any setting.
 
-**Data flow**: Returns true when `allowed_sandbox_implementations` is `None`.
+**Data flow**: It returns true when allowed_sandbox_implementations is not set.
 
-**Call relations**: Participates in top-level emptiness checks before requirements are compiled.
+**Call relations**: ConfigRequirementsToml::is_empty calls this when checking whether there are meaningful Windows requirements.
 
 
 ##### `FeatureRequirementsToml::is_empty`  (lines 734–736)
@@ -1238,11 +1242,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether any managed feature flags were specified.
+**Purpose**: Checks whether any feature flags were required on or off.
 
-**Data flow**: Returns `self.entries.is_empty()`.
+**Data flow**: It returns true when the feature map has no entries.
 
-**Call relations**: Used both in top-level emptiness checks and in `ConfigRequirements::try_from`, which drops empty feature maps.
+**Call relations**: ConfigRequirementsToml::is_empty and ConfigRequirements::try_from use this to ignore empty feature sections.
 
 
 ##### `AppToolRequirementToml::is_empty`  (lines 745–747)
@@ -1251,11 +1255,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether an app-tool requirement contains any approval override.
+**Purpose**: Checks whether a tool-level app requirement contains an approval mode.
 
-**Data flow**: Returns true when `approval_mode` is `None`.
+**Data flow**: It returns true when approval_mode is missing.
 
-**Call relations**: Used by app-level emptiness checks so structurally present but blank tool entries do not count as meaningful requirements.
+**Call relations**: AppToolsRequirementsToml::is_empty uses this for every tool in an app.
 
 
 ##### `AppToolsRequirementsToml::is_empty`  (lines 757–759)
@@ -1264,11 +1268,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether all tool requirement entries are empty.
+**Purpose**: Checks whether all tool-level requirements inside an app are empty.
 
-**Data flow**: Iterates `self.tools.values()` and returns true only if every `AppToolRequirementToml` is empty.
+**Data flow**: It scans every tool requirement and returns true only if each tool has no approval mode.
 
-**Call relations**: Used by `AppRequirementToml::is_empty` and top-level emptiness logic.
+**Call relations**: AppRequirementToml::is_empty uses this when deciding whether an app requirement has meaningful tool rules.
 
 
 ##### `AppRequirementToml::is_empty`  (lines 769–775)
@@ -1277,11 +1281,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether an app requirement has neither an `enabled` setting nor any non-empty tool requirements.
+**Purpose**: Checks whether an app requirement contains either an enabled setting or tool restrictions.
 
-**Data flow**: Returns true when `enabled` is `None` and `tools` is absent or empty according to `AppToolsRequirementsToml::is_empty`.
+**Data flow**: It returns true when enabled is missing and the optional tools section is missing or empty.
 
-**Call relations**: Used by `AppsRequirementsToml::is_empty` and by top-level emptiness checks.
+**Call relations**: AppsRequirementsToml::is_empty uses this across all configured apps.
 
 
 ##### `AppsRequirementsToml::is_empty`  (lines 785–787)
@@ -1290,11 +1294,11 @@ fn is_empty(&self) -> bool
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Checks whether every app entry is effectively empty.
+**Purpose**: Checks whether the app requirements section contains any meaningful rule.
 
-**Data flow**: Iterates all app requirement values and returns true only if each `AppRequirementToml` is empty.
+**Data flow**: It scans all app requirements and returns true only if every app requirement is empty.
 
-**Call relations**: Used by `ConfigRequirementsToml::is_empty` and merge tests to distinguish meaningful app restrictions from empty placeholders.
+**Call relations**: ConfigRequirementsToml::is_empty uses this to ignore empty app sections.
 
 
 ##### `merge_app_requirements_descending`  (lines 793–819)
@@ -1306,11 +1310,11 @@ fn merge_app_requirements_descending(
 )
 ```
 
-**Purpose**: Merges lower-precedence app requirements into an existing higher-precedence set using special semantics: any explicit disable wins across layers, while higher-precedence tool approval modes are retained when already set.
+**Purpose**: Merges lower-priority app requirements into an existing higher-priority set without weakening important restrictions.
 
-**Data flow**: Mutates `base: &mut AppsRequirementsToml` by iterating incoming apps. For each app, it merges `enabled` so `Some(false)` dominates from either side, otherwise prefers higher precedence then lower. For tools, it creates missing app/tool entries and copies `approval_mode` only when the higher-precedence tool has none.
+**Data flow**: It receives a mutable base and an incoming set. It unions apps, treats any false enabled value as disabling the app, and fills missing tool approval modes without overwriting higher-priority ones.
 
-**Call relations**: Called from `ConfigRequirementsWithSources::merge_unset_fields` for the one field that does not follow simple fill-if-missing semantics. This preserves enforcement-oriented disablement across layered managed sources while still respecting higher-priority exact tool approvals.
+**Call relations**: ConfigRequirementsWithSources::merge_unset_fields calls this for app requirements, and many tests exercise the edge cases around priority and disabling.
 
 *Call graph*: called by 8 (merge_unset_fields, merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset, merge_app_requirements_descending_prefers_false_from_lower_precedence, merge_app_requirements_descending_preserves_higher_false_when_lower_missing_app, merge_app_requirements_descending_preserves_higher_tool_approval_mode, merge_app_requirements_descending_unions_distinct_apps, merge_app_requirements_descending_uses_lower_tool_approval_when_higher_missing, merge_app_requirements_descending_uses_lower_value_when_higher_missing).
 
@@ -1321,11 +1325,11 @@ fn merge_app_requirements_descending(
 fn new(value: T, source: RequirementSource) -> Self
 ```
 
-**Purpose**: Constructs a value paired with the requirement source it came from.
+**Purpose**: Pairs any value with the requirement source that supplied it.
 
-**Data flow**: Accepts a value `T` and a `RequirementSource`, stores them unchanged, and returns `Sourced<T>`.
+**Data flow**: It receives a value and a RequirementSource, then returns a Sourced wrapper containing both.
 
-**Call relations**: Used throughout merge and normalization code whenever a raw or normalized requirement field must retain provenance for later diagnostics.
+**Call relations**: Merge and normalization code call this whenever they preserve a requirement value together with its origin.
 
 *Call graph*: called by 21 (try_from, merge_unset_fields, merge, apply_to, merge, populate_merged_regular_fields_with_sources, resolve_bootstrap_auth_keyring_backend_kind_uses_secret_auth_storage_feature, filter_mcp_servers_by_allowlist_blocks_all_when_empty, filter_mcp_servers_by_allowlist_enforces_identity_rules, filter_plugin_mcp_servers_by_allowlist_blocks_unlisted_plugin (+11 more)).
 
@@ -1336,11 +1340,11 @@ fn new(value: T, source: RequirementSource) -> Self
 fn deref(&self) -> &Self::Target
 ```
 
-**Purpose**: Provides shared-reference access to the wrapped value inside `Sourced<T>`.
+**Purpose**: Lets code read a Sourced value as if it were the wrapped value.
 
-**Data flow**: Returns `&self.value`.
+**Data flow**: It receives a Sourced reference and returns a reference to its inner value.
 
-**Call relations**: Enables ergonomic use of sourced values without repeatedly naming the `value` field.
+**Call relations**: Rust uses this automatically when callers access wrapped requirement data while source information remains attached.
 
 
 ##### `ConfigRequirementsWithSources::merge_unset_fields`  (lines 904–989)
@@ -1349,11 +1353,11 @@ fn deref(&self) -> &Self::Target
 fn merge_unset_fields(&mut self, source: RequirementSource, other: ConfigRequirementsToml)
 ```
 
-**Purpose**: Merges one raw requirements layer into an accumulated sourced structure, filling only fields that are still unset and tagging copied values with the incoming source. It also trims blank guardian policy text and performs special app merging.
+**Purpose**: Merges one requirements layer into the accumulated requirements, respecting priority and recording where each value came from.
 
-**Data flow**: Consumes a `RequirementSource` and `ConfigRequirementsToml`. After a destructuring guard that forces maintenance when fields are added, it normalizes blank `guardian_policy_config` to `None`, uses the `fill_missing_take!` macro to move each `Some` field into `self` only when the destination is `None`, and separately merges `apps` via `merge_app_requirements_descending` if both sides have app data.
+**Data flow**: It receives a source and a parsed TOML requirements object. For most fields it fills only missing values, ignores blank guardian policy text, and merges apps specially so lower layers can still contribute safe disables.
 
-**Call relations**: This is the main layer-composition routine used before final compilation. Higher-precedence callers invoke it first so later lower-precedence layers only backfill missing fields, except for app disablement/tool merging which intentionally combines across layers.
+**Call relations**: Config-loading code calls this once per requirements layer, from highest to lowest priority, before ConfigRequirements::try_from turns the result into runtime constraints.
 
 *Call graph*: calls 2 internal fn (new, merge_app_requirements_descending); 1 external calls (fill_missing_take!).
 
@@ -1364,11 +1368,11 @@ fn merge_unset_fields(&mut self, source: RequirementSource, other: ConfigRequire
 fn into_toml(self) -> ConfigRequirementsToml
 ```
 
-**Purpose**: Drops provenance wrappers and reconstructs a plain `ConfigRequirementsToml` from the sourced intermediate form.
+**Purpose**: Drops source labels and converts the source-tracked requirements back into the plain TOML-shaped structure.
 
-**Data flow**: Consumes `self`, maps each `Option<Sourced<T>>` to `Option<T>`, explicitly sets `remote_sandbox_config` to `None`, and returns a new `ConfigRequirementsToml` with the unwrapped values.
+**Data flow**: It receives ConfigRequirementsWithSources, unwraps each Sourced field to keep only its value, sets remote_sandbox_config to None, and returns ConfigRequirementsToml.
 
-**Call relations**: Used when callers need the merged raw requirements shape again after source-aware layering, without carrying provenance metadata forward.
+**Call relations**: Callers use this when they need the merged requirements in the same shape as parsed TOML rather than source-aware form.
 
 
 ##### `normalize_hostname`  (lines 1042–1045)
@@ -1377,11 +1381,11 @@ fn into_toml(self) -> ConfigRequirementsToml
 fn normalize_hostname(hostname: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes a hostname for remote-sandbox matching by trimming whitespace, removing a trailing dot, rejecting empties, and lowercasing ASCII.
+**Purpose**: Cleans a hostname before matching it against remote sandbox rules.
 
-**Data flow**: Reads `&str`, applies trim and `trim_end_matches('.')`, and returns `Some(lowercased)` unless the result is empty.
+**Data flow**: It trims whitespace, removes a trailing dot, lowercases the hostname, and returns None if nothing meaningful remains.
 
-**Call relations**: Used by hostname-pattern matching and remote-sandbox override application so matching is case-insensitive and tolerant of FQDN trailing dots.
+**Call relations**: ConfigRequirementsToml::apply_remote_sandbox_config and hostname_matches_any_pattern use this before wildcard matching.
 
 
 ##### `hostname_matches_any_pattern`  (lines 1047–1053)
@@ -1390,11 +1394,11 @@ fn normalize_hostname(hostname: &str) -> Option<String>
 fn hostname_matches_any_pattern(hostname: &str, patterns: &[String]) -> bool
 ```
 
-**Purpose**: Checks whether a normalized hostname matches any configured wildcard pattern using case-insensitive wildmatch semantics.
+**Purpose**: Checks whether a normalized hostname matches any configured wildcard hostname pattern.
 
-**Data flow**: Iterates the pattern strings, normalizes each with `normalize_hostname`, constructs a `WildMatchPattern<'*','?'>` for valid patterns, and returns true if any pattern matches the provided hostname.
+**Data flow**: It normalizes each pattern, builds a case-insensitive wildcard matcher, and returns true on the first match.
 
-**Call relations**: Called by `ConfigRequirementsToml::apply_remote_sandbox_config` to select the first remote-sandbox override whose hostname patterns match the current host.
+**Call relations**: ConfigRequirementsToml::apply_remote_sandbox_config uses this to find the first remote sandbox override that applies to the current host.
 
 
 ##### `SandboxModeRequirement::from`  (lines 1073–1079)
@@ -1403,11 +1407,11 @@ fn hostname_matches_any_pattern(hostname: &str, patterns: &[String]) -> bool
 fn from(mode: SandboxMode) -> Self
 ```
 
-**Purpose**: Converts a runtime `SandboxMode` into the requirements-layer sandbox enum.
+**Purpose**: Converts a runtime sandbox mode into the requirement enum used in managed policy.
 
-**Data flow**: Matches `SandboxMode::{ReadOnly, WorkspaceWrite, DangerFullAccess}` and returns the corresponding `SandboxModeRequirement` variant.
+**Data flow**: It receives ReadOnly, WorkspaceWrite, or DangerFullAccess and returns the matching SandboxModeRequirement.
 
-**Call relations**: Used when translating permission profiles or runtime sandbox settings into the requirement vocabulary for validation and diagnostics.
+**Call relations**: Code that compares runtime sandbox settings with requirement allow-lists uses this conversion.
 
 
 ##### `ConfigRequirementsToml::apply_remote_sandbox_config`  (lines 1089–1103)
@@ -1416,11 +1420,11 @@ fn from(mode: SandboxMode) -> Self
 fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>)
 ```
 
-**Purpose**: Applies the first matching `remote_sandbox_config` entry to override top-level `allowed_sandbox_modes` based on the current hostname.
+**Purpose**: Applies hostname-specific sandbox mode requirements when the current machine matches a remote sandbox rule.
 
-**Data flow**: Mutably reads `self.remote_sandbox_config`; if absent, hostname missing, hostname normalization fails, or no pattern matches, it returns without changes. On the first matching config, it clones that entry's `allowed_sandbox_modes` into `self.allowed_sandbox_modes`.
+**Data flow**: It reads remote_sandbox_config and an optional hostname. If a normalized hostname matches the first configured pattern set, it replaces allowed_sandbox_modes with that rule's allowed modes.
 
-**Call relations**: Called during requirements loading before source-aware merging. Because merge logic only fills unset fields, a higher-precedence layer's already-resolved sandbox modes still win over lower-precedence remote overrides.
+**Call relations**: Config loading calls this before merging layers so host-specific sandbox rules become ordinary allowed_sandbox_modes for later constraint building.
 
 
 ##### `ConfigRequirementsToml::is_empty`  (lines 1105–1149)
@@ -1429,11 +1433,11 @@ fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>)
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Determines whether a raw requirements TOML object contains any meaningful configured requirement. It treats blank nested sections and whitespace-only guardian policy text as empty.
+**Purpose**: Checks whether a parsed requirements file actually contains any meaningful requirement.
 
-**Data flow**: Checks every field explicitly: scalar options must be `None`, nested structs must be absent or report empty via their own `is_empty` methods, plugin maps must contain only empty plugin entries, and `guardian_policy_config` must be absent or blank after trimming.
+**Data flow**: It examines every top-level section, treating blank guardian policy text and empty nested sections as absent, and returns true only when nothing is configured.
 
-**Call relations**: Used by callers and tests to distinguish a truly empty requirements layer from one that merely contains syntactic scaffolding or compatibility-only blank values.
+**Call relations**: Tests and config-loading code use this to ignore empty requirements inputs or verify that false-valued settings still count as configured.
 
 
 ##### `ConfigRequirements::try_from`  (lines 1155–1459)
@@ -1442,11 +1446,11 @@ fn is_empty(&self) -> bool
 fn try_from(toml: ConfigRequirementsWithSources) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Compiles merged raw requirements with provenance into the normalized runtime `ConfigRequirements` object. It turns allowlists and exact requirements into active `Constrained` validators, validates required non-empty lists, converts execution rules, and preserves sourced non-constrained sections.
+**Purpose**: Converts source-tracked parsed requirements into runtime constraints that actively reject disallowed settings.
 
-**Data flow**: Consumes `ConfigRequirementsWithSources`, destructures fields, and builds each normalized field separately. Approval policies and reviewers require non-empty allowlists and use the first entry as the initial value. Sandbox-mode requirements constrain `PermissionProfile` by mapping candidate profiles through `sandbox_mode_requirement_for_permission_profile`, and reject allowlists that omit `read-only`. Windows sandbox implementations require a non-empty list and prefer `Elevated` as the initial value when allowed. Web-search requirements always add `Disabled` to the accepted set and choose an initial mode preferring `Cached`, then `Live`, then `Disabled`. Managed hooks are dropped if empty, otherwise constrained to exact equality. Residency is constrained to exact equality when present. Rules are parsed into `RequirementsExecPolicy`, with parse failures wrapped in `ConstraintError::ExecPolicyParse` carrying the source. Network and filesystem sections are converted into `NetworkConstraints` and `FilesystemConstraints` while preserving `Sourced` provenance. The function returns either a fully built `ConfigRequirements` or a `ConstraintError`.
+**Data flow**: It receives ConfigRequirementsWithSources, builds Constrained values for approvals, reviewers, sandbox-derived permission profiles, Windows sandbox mode, web search, hooks, residency, network, filesystem, and execution policy, and returns either ConfigRequirements or a source-aware ConstraintError.
 
-**Call relations**: This is the final normalization step after layer merging. Callers invoke it once they have a `ConfigRequirementsWithSources`; downstream runtime config code then uses the resulting `Constrained` fields to validate or reject user/session settings with source-aware errors.
+**Call relations**: This is the central normalization step after all requirement layers have been merged; many tests call it to verify that invalid candidates are rejected with the right source.
 
 *Call graph*: calls 7 internal fn (new, new, allow_any, allow_any_from_default, new, empty_field, read_only); 1 external calls (format!).
 
@@ -1459,11 +1463,11 @@ fn sandbox_mode_requirement_for_permission_profile(
 ) -> SandboxModeRequirement
 ```
 
-**Purpose**: Infers which sandbox requirement category a concrete `PermissionProfile` corresponds to. Managed profiles are classified by their filesystem write capabilities.
+**Purpose**: Classifies a permission profile into the sandbox mode category that requirements understand.
 
-**Data flow**: Reads a `PermissionProfile`. `Disabled` maps to `DangerFullAccess`, `External` maps to `ExternalSandbox`, and `Managed` profiles inspect `file_system_sandbox_policy()`: full-disk write implies `DangerFullAccess`, any writable entry implies `WorkspaceWrite`, otherwise `ReadOnly`.
+**Data flow**: It receives a PermissionProfile. Disabled becomes full access, external profiles become external sandbox, and managed profiles are inspected for write or full-disk access to choose read-only, workspace-write, or full access.
 
-**Call relations**: Used by `ConfigRequirements::try_from` when enforcing `allowed_sandbox_modes` against candidate permission profiles rather than against raw sandbox-mode enums.
+**Call relations**: ConfigRequirements::try_from uses this inside the permission profile constraint so allowed_sandbox_modes can control richer permission profiles.
 
 *Call graph*: calls 1 internal fn (file_system_sandbox_policy).
 
@@ -1474,11 +1478,11 @@ fn sandbox_mode_requirement_for_permission_profile(
 fn tokens(cmd: &[&str]) -> Vec<String>
 ```
 
-**Purpose**: Builds a `Vec<String>` from a slice of command tokens for exec-policy assertions.
+**Purpose**: Builds command-token test data from string slices.
 
-**Data flow**: Maps each `&str` in the input slice to an owned `String` and collects the results.
+**Data flow**: It receives a slice of string references and returns owned String values in a vector.
 
-**Call relations**: Used only by exec-policy tests to create command vectors in the same shape expected by policy evaluation.
+**Call relations**: Execution policy tests use this helper to check how command rules match tokenized commands.
 
 
 ##### `tests::system_requirements_toml_file_for_test`  (lines 1503–1507)
@@ -1487,11 +1491,11 @@ fn tokens(cmd: &[&str]) -> Vec<String>
 fn system_requirements_toml_file_for_test() -> Result<AbsolutePathBuf>
 ```
 
-**Purpose**: Constructs a deterministic temporary absolute path representing a system `requirements.toml` file for provenance assertions.
+**Purpose**: Creates a plausible temporary requirements.toml path for tests that need a file-based source.
 
-**Data flow**: Reads `std::env::temp_dir()`, appends `requirements.toml`, converts the path into `AbsolutePathBuf`, and returns it in `anyhow::Result`.
+**Data flow**: It takes the system temp directory, appends requirements.toml, converts it to AbsolutePathBuf, and returns it.
 
-**Call relations**: Shared by tests that need a concrete `RequirementSource::SystemRequirementsToml` value.
+**Call relations**: Source-aware error tests call this when constructing RequirementSource::SystemRequirementsToml.
 
 *Call graph*: calls 1 internal fn (try_from); 1 external calls (temp_dir).
 
@@ -1502,11 +1506,11 @@ fn system_requirements_toml_file_for_test() -> Result<AbsolutePathBuf>
 fn composite_requirement_source_flattens_and_deduplicates_sources()
 ```
 
-**Purpose**: Verifies that composite provenance flattens nested composites and removes duplicate sources while preserving order.
+**Purpose**: Verifies that composite requirement sources are flattened and duplicates are removed.
 
-**Data flow**: Constructs MDM and legacy sources, builds a nested composite, and asserts the result equals a flat two-source `Composite`.
+**Data flow**: It creates MDM and legacy sources, nests them in a composite, and asserts the resulting source list is ordered and unique.
 
-**Call relations**: Exercises `RequirementSource::composite` behavior directly.
+**Call relations**: This directly exercises RequirementSource::composite.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1517,11 +1521,11 @@ fn composite_requirement_source_flattens_and_deduplicates_sources()
 fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources
 ```
 
-**Purpose**: Converts a plain `ConfigRequirementsToml` into `ConfigRequirementsWithSources` by wrapping every present field with `RequirementSource::Unknown`.
+**Purpose**: Wraps every configured field in a parsed requirements object with the Unknown source for tests.
 
-**Data flow**: Destructures the raw TOML struct, maps each `Option<T>` to `Option<Sourced<T>>` with `Unknown`, and returns the sourced aggregate.
+**Data flow**: It receives ConfigRequirementsToml, maps each present field into Sourced using RequirementSource::Unknown, and returns ConfigRequirementsWithSources.
 
-**Call relations**: Used by many tests as a shortcut to feed raw TOML into `ConfigRequirements::try_from` without constructing explicit provenance.
+**Call relations**: Many tests use this shortcut before calling ConfigRequirements::try_from, so they can focus on behavior rather than source setup.
 
 
 ##### `tests::deserialize_allow_managed_hooks_only`  (lines 1591–1601)
@@ -1530,11 +1534,11 @@ fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSo
 fn deserialize_allow_managed_hooks_only() -> Result<()>
 ```
 
-**Purpose**: Checks that `allow_managed_hooks_only = true` deserializes and makes the requirements object non-empty.
+**Purpose**: Checks that allow_managed_hooks_only = true is parsed and makes the requirements non-empty.
 
-**Data flow**: Parses a TOML snippet into `ConfigRequirementsToml`, then asserts the field value and `is_empty()` result.
+**Data flow**: It parses a small TOML string, reads the boolean field, and asserts the config is not empty.
 
-**Call relations**: Covers a simple scalar requirement field in the raw schema.
+**Call relations**: This validates ConfigRequirementsToml parsing and ConfigRequirementsToml::is_empty behavior for this field.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1545,11 +1549,11 @@ fn deserialize_allow_managed_hooks_only() -> Result<()>
 fn allow_managed_hooks_only_false_is_still_configured() -> Result<()>
 ```
 
-**Purpose**: Ensures `allow_managed_hooks_only = false` still counts as an explicit configured requirement rather than being treated as absent.
+**Purpose**: Checks that an explicit false value for allow_managed_hooks_only still counts as a configured requirement.
 
-**Data flow**: Parses TOML, asserts the field is `Some(false)`, and asserts `is_empty()` is false.
+**Data flow**: It parses TOML with false, verifies the field is Some(false), and verifies the requirements are not empty.
 
-**Call relations**: Guards against emptiness logic accidentally dropping explicit false values.
+**Call relations**: This protects against treating false as if the field were missing.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1560,11 +1564,11 @@ fn allow_managed_hooks_only_false_is_still_configured() -> Result<()>
 fn deserialize_managed_permission_profiles() -> Result<()>
 ```
 
-**Purpose**: Verifies that managed permission-profile catalog fields and nested profile definitions deserialize together correctly.
+**Purpose**: Checks that managed permission profile names, defaults, and profile definitions are parsed together.
 
-**Data flow**: Parses TOML containing `default_permissions`, `allowed_permission_profiles`, and `[permissions.*]` tables, then asserts the allowlist map, default profile name, nested profile presence, and non-empty status.
+**Data flow**: It parses TOML containing allowed profiles and profile bodies, then asserts the allowed map, default name, and profile catalog are present.
 
-**Call relations**: Covers the raw TOML schema side of managed permission-profile configuration.
+**Call relations**: This covers the TOML data model around allowed_permission_profiles, default_permissions, and permissions profiles.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1575,11 +1579,11 @@ fn deserialize_managed_permission_profiles() -> Result<()>
 fn deserialize_allow_appshots() -> Result<()>
 ```
 
-**Purpose**: Checks deserialization of `allow_appshots = true` and confirms it marks the requirements as configured.
+**Purpose**: Checks that allow_appshots = true is parsed and treated as meaningful requirements content.
 
-**Data flow**: Parses TOML and asserts the field value and non-empty status.
+**Data flow**: It parses the TOML, asserts the field is Some(true), and asserts the parsed object is not empty.
 
-**Call relations**: Simple scalar-field coverage.
+**Call relations**: This validates ConfigRequirementsToml::is_empty for the appshots setting.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1590,11 +1594,11 @@ fn deserialize_allow_appshots() -> Result<()>
 fn filesystem_requirements_table_cannot_define_a_permission_profile()
 ```
 
-**Purpose**: Ensures the reserved `permissions.filesystem` table rejects profile-style fields such as `extends`.
+**Purpose**: Ensures permissions.filesystem cannot be used as a normal permission profile table.
 
-**Data flow**: Attempts to parse invalid TOML and asserts the resulting error message contains the reserved-table explanation.
+**Data flow**: It parses TOML that puts extends under permissions.filesystem and expects a parse error containing the reserved-table message.
 
-**Call relations**: Directly exercises `FilesystemRequirementsToml::deserialize` rejection logic.
+**Call relations**: This exercises FilesystemRequirementsToml::deserialize's rejection path.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1605,11 +1609,11 @@ fn filesystem_requirements_table_cannot_define_a_permission_profile()
 fn allow_appshots_false_is_still_configured() -> Result<()>
 ```
 
-**Purpose**: Confirms that an explicit false `allow_appshots` value is preserved and not treated as empty.
+**Purpose**: Checks that allow_appshots = false still counts as a configured requirement.
 
-**Data flow**: Parses TOML, asserts `Some(false)`, and checks `is_empty()` is false.
+**Data flow**: It parses the TOML, asserts Some(false), and confirms the requirements are not empty.
 
-**Call relations**: Protects emptiness semantics for boolean requirement fields.
+**Call relations**: This protects explicit administrator denials from being mistaken for missing values.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1620,11 +1624,11 @@ fn allow_appshots_false_is_still_configured() -> Result<()>
 fn allow_remote_control_false_is_still_configured() -> Result<()>
 ```
 
-**Purpose**: Checks that `allow_remote_control = false` is retained as an explicit requirement.
+**Purpose**: Checks that allow_remote_control = false still counts as a configured requirement.
 
-**Data flow**: Parses TOML and asserts the field value and non-empty status.
+**Data flow**: It parses the TOML, asserts Some(false), and confirms the requirements are not empty.
 
-**Call relations**: Another boolean-presence regression test.
+**Call relations**: This validates ConfigRequirementsToml::is_empty for remote-control policy.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1635,11 +1639,11 @@ fn allow_remote_control_false_is_still_configured() -> Result<()>
 fn deserialize_computer_use_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies nested `[computer_use]` requirements deserialize into the expected struct and count as configured.
+**Purpose**: Checks parsing of the computer_use requirements section.
 
-**Data flow**: Parses TOML, asserts the nested struct contents, and checks `is_empty()` is false.
+**Data flow**: It parses allow_locked_computer_use = false and asserts the nested struct contains that value and is not empty.
 
-**Call relations**: Covers nested optional requirement-table parsing.
+**Call relations**: This covers ComputerUseRequirementsToml and its role in top-level emptiness checks.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -1650,11 +1654,11 @@ fn deserialize_computer_use_requirements() -> Result<()>
 fn merge_unset_fields_copies_every_field_and_sets_sources()
 ```
 
-**Purpose**: Checks that `merge_unset_fields` copies all supported fields from an incoming layer into an empty target and tags each copied field with the provided source.
+**Purpose**: Verifies that merging into an empty source-tracked requirements object copies all ordinary fields and attaches the source.
 
-**Data flow**: Builds a fully populated `ConfigRequirementsToml`, merges it into a default `ConfigRequirementsWithSources`, and asserts the resulting sourced structure field-by-field.
+**Data flow**: It builds a populated ConfigRequirementsToml, merges it, and compares the full source-tracked result against the expected values.
 
-**Call relations**: Regression test for the explicit field list inside `merge_unset_fields`; adding new fields should force this test to be updated.
+**Call relations**: This is a broad safety test for ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 4 external calls (from, assert_eq!, default, vec!).
 
@@ -1665,11 +1669,11 @@ fn merge_unset_fields_copies_every_field_and_sets_sources()
 fn merge_unset_fields_fills_missing_values() -> Result<()>
 ```
 
-**Purpose**: Verifies that a missing field in the target is filled from an incoming layer with the correct source.
+**Purpose**: Checks that a missing field is filled from an incoming requirements layer.
 
-**Data flow**: Parses a minimal source TOML, merges it into an empty target, and asserts only the expected sourced field is populated.
+**Data flow**: It starts with an empty target, merges a TOML layer with allowed approval policies, and asserts the field appears with the correct source.
 
-**Call relations**: Covers the normal fill-if-missing merge path.
+**Call relations**: This exercises the normal fill-missing path in ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 3 external calls (assert_eq!, default, from_str).
 
@@ -1680,11 +1684,11 @@ fn merge_unset_fields_fills_missing_values() -> Result<()>
 fn merge_unset_fields_does_not_overwrite_existing_values() -> Result<()>
 ```
 
-**Purpose**: Ensures a lower-precedence merge does not replace an already-set field in the target.
+**Purpose**: Checks that higher-priority values are not overwritten by later lower-priority layers.
 
-**Data flow**: Merges one source setting `allowed_approval_policies`, then merges a second source with a different value, and asserts the original sourced value remains.
+**Data flow**: It merges one approval policy first, then another from a different source, and asserts the first value remains.
 
-**Call relations**: Validates precedence behavior of `merge_unset_fields`.
+**Call relations**: This protects the priority behavior in ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 3 external calls (assert_eq!, default, from_str).
 
@@ -1695,11 +1699,11 @@ fn merge_unset_fields_does_not_overwrite_existing_values() -> Result<()>
 fn merge_unset_fields_ignores_blank_guardian_override()
 ```
 
-**Purpose**: Checks that whitespace-only `guardian_policy_config` values are treated as absent so a later nonblank value can populate the field.
+**Purpose**: Checks that blank guardian policy text does not block a later meaningful guardian policy value.
 
-**Data flow**: Merges a blank guardian policy from one source, then a nonblank one from another, and asserts the final sourced value comes from the nonblank source.
+**Data flow**: It merges a blank guardian policy, then a real one, and asserts the real one is kept with its file source.
 
-**Call relations**: Exercises the special blank-string normalization inside `merge_unset_fields`.
+**Call relations**: This covers the special blank-string handling in ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 4 external calls (default, assert_eq!, default, system_requirements_toml_file_for_test).
 
@@ -1710,11 +1714,11 @@ fn merge_unset_fields_ignores_blank_guardian_override()
 fn deserialize_guardian_policy_config() -> Result<()>
 ```
 
-**Purpose**: Verifies multiline guardian policy text deserializes exactly, including trailing newline content from TOML literal formatting.
+**Purpose**: Checks that multiline guardian policy text is parsed exactly enough to preserve its content.
 
-**Data flow**: Parses TOML and asserts the resulting string value.
+**Data flow**: It parses a TOML multiline string and asserts the stored value matches the expected text.
 
-**Call relations**: Covers raw schema handling for guardian policy text.
+**Call relations**: This validates the guardian_policy_config field in ConfigRequirementsToml.
 
 *Call graph*: 2 external calls (assert_eq!, from_str).
 
@@ -1725,11 +1729,11 @@ fn deserialize_guardian_policy_config() -> Result<()>
 fn blank_guardian_policy_config_is_empty() -> Result<()>
 ```
 
-**Purpose**: Ensures a blank multiline guardian policy does not make the requirements object non-empty.
+**Purpose**: Checks that a guardian policy containing only whitespace does not make requirements non-empty.
 
-**Data flow**: Parses TOML with whitespace-only guardian policy text and asserts `is_empty()` is true.
+**Data flow**: It parses blank multiline guardian text and asserts ConfigRequirementsToml::is_empty returns true.
 
-**Call relations**: Protects the blank-string emptiness rule.
+**Call relations**: This verifies the blank handling used by ConfigRequirementsToml::is_empty.
 
 *Call graph*: 2 external calls (assert!, from_str).
 
@@ -1740,11 +1744,11 @@ fn blank_guardian_policy_config_is_empty() -> Result<()>
 fn allowed_approvals_reviewers_is_not_empty() -> Result<()>
 ```
 
-**Purpose**: Checks that setting `allowed_approvals_reviewers` makes the raw requirements object non-empty.
+**Purpose**: Checks that allowed approval reviewers count as meaningful requirements.
 
-**Data flow**: Parses TOML and asserts `is_empty()` is false.
+**Data flow**: It parses a reviewers allow-list and asserts the requirements are not empty.
 
-**Call relations**: Simple top-level emptiness coverage.
+**Call relations**: This protects ConfigRequirementsToml::is_empty coverage for allowed_approvals_reviewers.
 
 *Call graph*: 2 external calls (assert!, from_str).
 
@@ -1755,11 +1759,11 @@ fn allowed_approvals_reviewers_is_not_empty() -> Result<()>
 fn deserialize_filesystem_deny_read_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies absolute-path filesystem deny-read requirements deserialize and survive normalization into sourced `FilesystemConstraints`.
+**Purpose**: Checks that exact filesystem deny-read paths are parsed into normalized filesystem constraints.
 
-**Data flow**: Builds platform-specific TOML, parses it, converts through `with_unknown_source(...).try_into()`, and asserts the resulting sourced `FilesystemConstraints` contains normalized absolute patterns.
+**Data flow**: It builds platform-appropriate absolute paths, parses them from TOML, converts to ConfigRequirements, and compares the resulting deny_read list.
 
-**Call relations**: Exercises raw parsing plus `ConfigRequirements::try_from` filesystem preservation.
+**Call relations**: This exercises FilesystemDenyReadPattern deserialization, FilesystemConstraints::from, and ConfigRequirements::try_from.
 
 *Call graph*: 5 external calls (assert_eq!, cfg!, with_unknown_source, format!, from_str).
 
@@ -1770,11 +1774,11 @@ fn deserialize_filesystem_deny_read_requirements() -> Result<()>
 fn deserialize_filesystem_deny_read_glob_requirements() -> Result<()>
 ```
 
-**Purpose**: Checks that glob deny-read patterns are normalized relative to the current absolute-path base and preserved in filesystem constraints.
+**Purpose**: Checks that filesystem deny-read glob patterns are normalized correctly.
 
-**Data flow**: Sets an `AbsolutePathBufGuard` to the temp dir, parses TOML with a relative glob, converts to `ConfigRequirements`, and asserts the normalized pattern matches `FilesystemDenyReadPattern::from_input`.
+**Data flow**: It sets a temporary current path context, parses a relative glob pattern, converts requirements, and compares against FilesystemDenyReadPattern::from_input.
 
-**Call relations**: Covers the glob-specific normalization path in `FilesystemDenyReadPattern::from_input`.
+**Call relations**: This tests the glob path path through FilesystemDenyReadPattern::from_input.
 
 *Call graph*: calls 1 internal fn (new); 4 external calls (assert_eq!, with_unknown_source, temp_dir, from_str).
 
@@ -1785,11 +1789,11 @@ fn deserialize_filesystem_deny_read_glob_requirements() -> Result<()>
 fn deserialize_apps_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies app-level `enabled` requirements deserialize into the nested `AppsRequirementsToml` structure.
+**Purpose**: Checks parsing of an app-level enabled flag.
 
-**Data flow**: Parses TOML with `[apps.connector_123123] enabled = false` and asserts the resulting nested map structure.
+**Data flow**: It parses TOML disabling one app and asserts the AppsRequirementsToml structure matches.
 
-**Call relations**: Covers raw app requirement schema.
+**Call relations**: This validates the app requirements TOML shape.
 
 *Call graph*: 2 external calls (assert_eq!, from_str).
 
@@ -1800,11 +1804,11 @@ fn deserialize_apps_requirements() -> Result<()>
 fn deserialize_apps_tool_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies nested app tool approval requirements deserialize correctly.
+**Purpose**: Checks parsing of tool-level approval requirements inside an app.
 
-**Data flow**: Parses TOML with `[apps.<id>.tools.<tool>] approval_mode = ...` and asserts the nested app/tool map structure.
+**Data flow**: It parses a nested app tool table with an approval mode and asserts the nested maps contain the expected value.
 
-**Call relations**: Covers raw app-tool requirement schema.
+**Call relations**: This validates AppToolsRequirementsToml and AppToolRequirementToml deserialization.
 
 *Call graph*: 2 external calls (assert_eq!, from_str).
 
@@ -1815,11 +1819,11 @@ fn deserialize_apps_tool_requirements() -> Result<()>
 fn apps_requirements(entries: &[(&str, Option<bool>)]) -> AppsRequirementsToml
 ```
 
-**Purpose**: Builds a compact `AppsRequirementsToml` fixture from `(app_id, enabled)` pairs.
+**Purpose**: Builds simple app enabled/disabled requirement test data.
 
-**Data flow**: Maps the input slice into a `BTreeMap<String, AppRequirementToml>` with `tools: None` and returns the assembled struct.
+**Data flow**: It receives app IDs with optional enabled values and returns an AppsRequirementsToml map containing those entries.
 
-**Call relations**: Shared helper for app-merge tests.
+**Call relations**: App merge tests use this helper to keep their expected values easy to read.
 
 
 ##### `tests::app_tool_requirements`  (lines 2153–2174)
@@ -1832,11 +1836,11 @@ fn app_tool_requirements(
     ) -> AppsRequirementsToml
 ```
 
-**Purpose**: Builds an `AppsRequirementsToml` fixture containing one app with one tool approval requirement.
+**Purpose**: Builds app tool approval requirement test data for one app and one tool.
 
-**Data flow**: Constructs nested `BTreeMap` values for the app, its tools, and the `approval_mode`, then returns the assembled struct.
+**Data flow**: It receives an app ID, tool name, and approval mode, then returns an AppsRequirementsToml containing that nested tool rule.
 
-**Call relations**: Used by tests that focus on tool-level merge semantics.
+**Call relations**: Tool-level app merge tests use this helper before calling merge_app_requirements_descending.
 
 *Call graph*: 1 external calls (from).
 
@@ -1847,11 +1851,11 @@ fn app_tool_requirements(
 fn merge_app_requirements_descending_unions_distinct_apps()
 ```
 
-**Purpose**: Checks that merging app requirements preserves distinct apps from both layers.
+**Purpose**: Checks that app requirements for different apps are combined.
 
-**Data flow**: Creates separate high- and low-precedence app sets, merges them, and asserts both apps are present afterward.
+**Data flow**: It starts with one app in the higher-priority set, merges a different app from the lower-priority set, and asserts both remain.
 
-**Call relations**: Directly exercises `merge_app_requirements_descending` union behavior.
+**Call relations**: This directly tests merge_app_requirements_descending.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, apps_requirements).
 
@@ -1862,11 +1866,11 @@ fn merge_app_requirements_descending_unions_distinct_apps()
 fn merge_app_requirements_descending_prefers_false_from_lower_precedence()
 ```
 
-**Purpose**: Verifies that a lower-precedence `enabled = false` still disables an app even when the higher-precedence layer said `true`.
+**Purpose**: Checks that a lower-priority app disable can still disable an app.
 
-**Data flow**: Builds conflicting app fixtures, merges them, and asserts the merged result is `Some(false)`.
+**Data flow**: It starts with enabled true, merges enabled false for the same app, and asserts the merged result is false.
 
-**Call relations**: Covers the special disable-wins rule in app merging.
+**Call relations**: This verifies the special safety rule in merge_app_requirements_descending where false wins.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, apps_requirements).
 
@@ -1877,11 +1881,11 @@ fn merge_app_requirements_descending_prefers_false_from_lower_precedence()
 fn merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset()
 ```
 
-**Purpose**: Ensures an unset lower-precedence `enabled` value does not disturb a higher-precedence explicit `true`.
+**Purpose**: Checks that a missing lower-priority enabled value does not erase a higher-priority true value.
 
-**Data flow**: Merges a higher `Some(true)` app with a lower `None` app and asserts the result stays `Some(true)`.
+**Data flow**: It merges an unset enabled value into an app already set to true and asserts true remains.
 
-**Call relations**: Covers non-overwriting behavior for app enablement.
+**Call relations**: This tests merge_app_requirements_descending's handling of absent lower-layer values.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, apps_requirements).
 
@@ -1892,11 +1896,11 @@ fn merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset()
 fn merge_app_requirements_descending_uses_lower_value_when_higher_missing()
 ```
 
-**Purpose**: Checks that a lower-precedence app value is adopted when the higher-precedence layer has no entry for that app.
+**Purpose**: Checks that lower-priority app values are used when no higher-priority value exists.
 
-**Data flow**: Merges an empty base with a lower app fixture and asserts the lower value appears in the result.
+**Data flow**: It starts with no app rule, merges one app rule, and asserts the incoming value is present.
 
-**Call relations**: Covers backfill behavior in app merging.
+**Call relations**: This covers the fill-empty case in merge_app_requirements_descending.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, apps_requirements).
 
@@ -1907,11 +1911,11 @@ fn merge_app_requirements_descending_uses_lower_value_when_higher_missing()
 fn merge_app_requirements_descending_preserves_higher_false_when_lower_missing_app()
 ```
 
-**Purpose**: Ensures an existing disabled app remains disabled when the incoming lower-precedence layer lacks that app entirely.
+**Purpose**: Checks that an existing higher-priority app disable is preserved when the lower layer has no matching app.
 
-**Data flow**: Merges a disabled base app with an empty incoming set and asserts no change.
+**Data flow**: It merges an empty lower set into a base containing a disabled app and asserts the disabled app remains.
 
-**Call relations**: Regression coverage for no-op merges.
+**Call relations**: This protects merge_app_requirements_descending from dropping base entries.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, apps_requirements).
 
@@ -1922,11 +1926,11 @@ fn merge_app_requirements_descending_preserves_higher_false_when_lower_missing_a
 fn merge_app_requirements_descending_preserves_higher_tool_approval_mode()
 ```
 
-**Purpose**: Verifies that an existing higher-precedence tool approval mode is not overwritten by a lower-precedence one.
+**Purpose**: Checks that higher-priority tool approval settings are not overwritten.
 
-**Data flow**: Builds conflicting tool approval fixtures, merges them, and asserts the higher-precedence approval remains.
+**Data flow**: It merges a lower-priority approval mode for the same app tool and asserts the original higher-priority mode remains.
 
-**Call relations**: Covers the tool-level precedence rule in `merge_app_requirements_descending`.
+**Call relations**: This tests the tool-specific priority rule in merge_app_requirements_descending.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 2 external calls (assert_eq!, app_tool_requirements).
 
@@ -1937,11 +1941,11 @@ fn merge_app_requirements_descending_preserves_higher_tool_approval_mode()
 fn merge_app_requirements_descending_uses_lower_tool_approval_when_higher_missing()
 ```
 
-**Purpose**: Checks that a lower-precedence tool approval is copied in when the higher-precedence app has no tool-specific approval.
+**Purpose**: Checks that a lower-priority tool approval setting is used when the higher-priority layer has no tool setting.
 
-**Data flow**: Merges an app fixture lacking tool approvals with a lower fixture containing one, then asserts the tool approval appears.
+**Data flow**: It starts with an app but no tool approval mode, merges an incoming tool rule, and asserts the tool rule is added.
 
-**Call relations**: Covers the fill-missing branch for tool approvals.
+**Call relations**: This covers the fill-missing tool branch in merge_app_requirements_descending.
 
 *Call graph*: calls 1 internal fn (merge_app_requirements_descending); 3 external calls (assert_eq!, app_tool_requirements, apps_requirements).
 
@@ -1952,11 +1956,11 @@ fn merge_app_requirements_descending_uses_lower_tool_approval_when_higher_missin
 fn merge_unset_fields_merges_apps_across_sources_with_enabled_evaluation()
 ```
 
-**Purpose**: Verifies that `merge_unset_fields` uses app-specific merge semantics across sources and retains the higher-precedence source on the resulting `apps` field.
+**Purpose**: Checks that app requirements from multiple sources are merged while preserving the source of the higher-priority app block.
 
-**Data flow**: Merges a higher-precedence apps layer and then a lower-precedence one with overlapping and distinct apps, then asserts merged enablement values and that the stored source remains the higher source.
+**Data flow**: It merges a high-priority app set and a lower-priority app set, then asserts the combined app values and source.
 
-**Call relations**: Tests the special `apps` branch inside `merge_unset_fields`.
+**Call relations**: This exercises ConfigRequirementsWithSources::merge_unset_fields and its call to merge_app_requirements_descending.
 
 *Call graph*: 4 external calls (default, assert_eq!, default, apps_requirements).
 
@@ -1967,11 +1971,11 @@ fn merge_unset_fields_merges_apps_across_sources_with_enabled_evaluation()
 fn merge_unset_fields_apps_empty_higher_source_does_not_block_lower_disables()
 ```
 
-**Purpose**: Ensures an empty higher-precedence `apps` section does not prevent a later lower-precedence disable from taking effect.
+**Purpose**: Checks that an empty higher-priority app section does not prevent lower-priority app disables from being added.
 
-**Data flow**: Merges an empty apps set, then a disabling apps set, and asserts the disable is present afterward.
+**Data flow**: It merges an empty app set, then a set with a disabled app, and asserts the disabled app appears.
 
-**Call relations**: Covers an edge case where mere presence of an empty apps field should not block meaningful lower-layer data.
+**Call relations**: This protects the app merge behavior inside ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 4 external calls (default, assert_eq!, default, apps_requirements).
 
@@ -1982,11 +1986,11 @@ fn merge_unset_fields_apps_empty_higher_source_does_not_block_lower_disables()
 fn constraint_error_includes_requirement_source() -> Result<()>
 ```
 
-**Purpose**: Checks that compiled constraints embed the originating requirement source in validation errors for approval policy, permission profile, and approvals reviewer.
+**Purpose**: Checks that rejected values include the source of the requirement that blocked them.
 
-**Data flow**: Parses requirements TOML, merges it with a concrete system-file source, compiles `ConfigRequirements`, probes disallowed values with `can_set`, and asserts exact `ConstraintError::InvalidValue` contents.
+**Data flow**: It builds source-tracked requirements, converts them, tries disallowed approval, sandbox, and reviewer values, and compares the exact ConstraintError values.
 
-**Call relations**: Exercises the source-capturing closures created inside `ConfigRequirements::try_from`.
+**Call relations**: This exercises ConfigRequirementsWithSources::merge_unset_fields and ConfigRequirements::try_from.
 
 *Call graph*: 5 external calls (try_from, assert_eq!, default, system_requirements_toml_file_for_test, from_str).
 
@@ -1997,11 +2001,11 @@ fn constraint_error_includes_requirement_source() -> Result<()>
 fn constraint_error_includes_composite_requirement_source() -> Result<()>
 ```
 
-**Purpose**: Verifies that validation errors preserve a composite provenance value when requirements came from multiple layers.
+**Purpose**: Checks that errors can report a composite requirement source.
 
-**Data flow**: Builds a composite source, merges a simple approval-policy requirement, compiles constraints, probes a disallowed value, and asserts the error carries the composite source.
+**Data flow**: It creates a composite source, merges approval requirements with it, triggers a rejected approval value, and asserts the composite source appears in the error.
 
-**Call relations**: Confirms `RequirementSource::composite` integrates correctly with compiled constraint errors.
+**Call relations**: This directly calls RequirementSource::composite and then tests ConfigRequirements::try_from's source-aware constraint.
 
 *Call graph*: calls 1 internal fn (composite); 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2012,11 +2016,11 @@ fn constraint_error_includes_composite_requirement_source() -> Result<()>
 fn constrained_fields_store_requirement_source() -> Result<()>
 ```
 
-**Purpose**: Checks that normalized constrained and sourced fields retain their originating source after compilation.
+**Purpose**: Checks that normalized constrained fields remember the source that created them.
 
-**Data flow**: Parses a multi-field requirements TOML, merges it with a legacy source, compiles `ConfigRequirements`, and asserts the `source` fields on several constrained/sourced outputs.
+**Data flow**: It parses several constrained fields, merges them with a source, converts to ConfigRequirements, and asserts each relevant field stores that source.
 
-**Call relations**: Covers provenance propagation through `ConfigRequirements::try_from`.
+**Call relations**: This validates the source preservation done in ConfigRequirements::try_from.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2027,11 +2031,11 @@ fn constrained_fields_store_requirement_source() -> Result<()>
 fn deserialize_allowed_approval_policies() -> Result<()>
 ```
 
-**Purpose**: Verifies approval-policy allowlists compile into a constrained value whose initial value is the first allowed entry and whose validator rejects disallowed policies with source-aware errors.
+**Purpose**: Checks approval policy allow-list parsing and enforcement.
 
-**Data flow**: Parses TOML, wraps with unknown source, compiles requirements, then checks the initial value and several `can_set` outcomes.
+**Data flow**: It parses allowed approval policies, converts to requirements, checks accepted values, and checks rejected values produce the expected errors.
 
-**Call relations**: Exercises the approval-policy branch of `ConfigRequirements::try_from`.
+**Call relations**: This exercises ConfigRequirements::try_from's approval_policy constraint.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2042,11 +2046,11 @@ fn deserialize_allowed_approval_policies() -> Result<()>
 fn deserialize_allowed_approvals_reviewers() -> Result<()>
 ```
 
-**Purpose**: Checks approvals-reviewer allowlists compile correctly and choose the first allowed reviewer as the initial value.
+**Purpose**: Checks approvals reviewer allow-list parsing and enforcement.
 
-**Data flow**: Parses TOML, compiles requirements, asserts the initial reviewer, and verifies allowed reviewers pass `can_set`.
+**Data flow**: It parses allowed reviewers, converts to requirements, and verifies both listed reviewers are accepted.
 
-**Call relations**: Covers the reviewer branch of `ConfigRequirements::try_from`.
+**Call relations**: This exercises ConfigRequirements::try_from's approvals_reviewer constraint.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2057,11 +2061,11 @@ fn deserialize_allowed_approvals_reviewers() -> Result<()>
 fn deserialize_allowed_windows_sandbox_implementations() -> Result<()>
 ```
 
-**Purpose**: Verifies Windows sandbox implementation allowlists compile into a constrained optional mode that accepts only listed implementations and rejects `None`.
+**Purpose**: Checks Windows sandbox implementation allow-list parsing and enforcement.
 
-**Data flow**: Parses TOML, compiles requirements, asserts the initial value, and probes allowed/disallowed candidates with `can_set`.
+**Data flow**: It parses an elevated-only Windows sandbox requirement, converts it, and checks elevated is accepted while unelevated and None are rejected.
 
-**Call relations**: Exercises the Windows-specific branch of `ConfigRequirements::try_from`.
+**Call relations**: This exercises the Windows sandbox branch in ConfigRequirements::try_from.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2072,11 +2076,11 @@ fn deserialize_allowed_windows_sandbox_implementations() -> Result<()>
 fn empty_allowed_windows_sandbox_implementations_is_rejected() -> Result<()>
 ```
 
-**Purpose**: Ensures an empty Windows sandbox implementation allowlist is rejected as an empty required field.
+**Purpose**: Checks that an empty Windows sandbox implementation allow-list is invalid.
 
-**Data flow**: Parses TOML, attempts compilation, and asserts the returned `ConstraintError::EmptyField`.
+**Data flow**: It parses an empty list, converts to ConfigRequirementsWithSources, and asserts ConfigRequirements::try_from returns an EmptyField error.
 
-**Call relations**: Covers validation of non-empty Windows implementation lists.
+**Call relations**: This verifies the validation path in ConfigRequirements::try_from.
 
 *Call graph*: 2 external calls (assert_eq!, from_str).
 
@@ -2087,11 +2091,11 @@ fn empty_allowed_windows_sandbox_implementations_is_rejected() -> Result<()>
 fn allowed_windows_sandbox_implementations_prefer_elevated_fallback() -> Result<()>
 ```
 
-**Purpose**: Checks that when both Windows implementations are allowed, the compiled initial value prefers `Elevated`.
+**Purpose**: Checks that elevated is chosen as the initial Windows sandbox mode when both choices are allowed.
 
-**Data flow**: Parses TOML, compiles requirements, and asserts the constrained value is `Some(Elevated)`.
+**Data flow**: It parses both unelevated and elevated, converts requirements, and asserts the current value is elevated.
 
-**Call relations**: Covers the initial-value selection rule in the Windows branch.
+**Call relations**: This validates the default selection logic inside ConfigRequirements::try_from.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2102,11 +2106,11 @@ fn allowed_windows_sandbox_implementations_prefer_elevated_fallback() -> Result<
 fn deserialize_legacy_allowed_approvals_reviewer() -> Result<()>
 ```
 
-**Purpose**: Verifies legacy reviewer tokens still deserialize into the modern reviewer enum and compile correctly.
+**Purpose**: Checks compatibility with a legacy approvals reviewer name.
 
-**Data flow**: Parses TOML with legacy reviewer names, compiles requirements, and asserts the resulting initial reviewer.
+**Data flow**: It parses an older reviewer value alongside user, converts requirements, and asserts the runtime reviewer is AutoReview.
 
-**Call relations**: Compatibility coverage for reviewer deserialization.
+**Call relations**: This documents deserialization compatibility for ApprovalsReviewer values used by ConfigRequirements::try_from.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2117,11 +2121,11 @@ fn deserialize_legacy_allowed_approvals_reviewer() -> Result<()>
 fn empty_allowed_approvals_reviewers_is_rejected() -> Result<()>
 ```
 
-**Purpose**: Ensures an empty approvals-reviewer allowlist is rejected during compilation.
+**Purpose**: Checks that an empty approvals reviewer allow-list is invalid.
 
-**Data flow**: Parses TOML, compiles via `try_from`, captures the error, and asserts it is `ConstraintError::EmptyField` for the correct field.
+**Data flow**: It parses an empty reviewer list, tries to normalize it, and asserts an EmptyField error.
 
-**Call relations**: Covers non-empty validation for reviewer allowlists.
+**Call relations**: This tests ConfigRequirements::try_from's reviewer validation.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, with_unknown_source, from_str).
 
@@ -2132,11 +2136,11 @@ fn empty_allowed_approvals_reviewers_is_rejected() -> Result<()>
 fn deserialize_allowed_sandbox_modes() -> Result<()>
 ```
 
-**Purpose**: Verifies sandbox-mode allowlists constrain permission profiles by inferred sandbox category, allowing read-only and workspace-write profiles while rejecting danger-full-access and external profiles.
+**Purpose**: Checks sandbox mode allow-list parsing and how it constrains permission profiles.
 
-**Data flow**: Parses TOML, compiles requirements, constructs a workspace-write `PermissionProfile`, and probes several candidate profiles with `can_set`, asserting expected successes and source-aware failures.
+**Data flow**: It parses read-only and workspace-write modes, builds representative permission profiles, and verifies full access and external sandbox profiles are rejected.
 
-**Call relations**: Exercises the permission-profile constraint logic and `sandbox_mode_requirement_for_permission_profile` mapping.
+**Call relations**: This exercises sandbox_mode_requirement_for_permission_profile through ConfigRequirements::try_from's permission_profile constraint.
 
 *Call graph*: calls 2 internal fn (workspace_write_with, from_absolute_path); 5 external calls (assert!, assert_eq!, cfg!, with_unknown_source, from_str).
 
@@ -2147,11 +2151,11 @@ fn deserialize_allowed_sandbox_modes() -> Result<()>
 fn deserialize_remote_sandbox_config_requires_hostname_patterns_list() -> Result<()>
 ```
 
-**Purpose**: Checks that `remote_sandbox_config.hostname_patterns` must be a TOML list and that valid list syntax deserializes correctly.
+**Purpose**: Checks that remote sandbox configuration requires hostname_patterns to be a list.
 
-**Data flow**: Parses a valid TOML snippet and asserts the resulting struct, then parses an invalid string-valued variant and asserts the parse error mentions the wrong type.
+**Data flow**: It parses a valid remote sandbox config and then confirms that a string hostname_patterns value fails to parse.
 
-**Call relations**: Covers raw schema validation for remote sandbox overrides.
+**Call relations**: This validates the RemoteSandboxConfigToml data shape used by ConfigRequirementsToml::apply_remote_sandbox_config.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, from_str).
 
@@ -2162,11 +2166,11 @@ fn deserialize_remote_sandbox_config_requires_hostname_patterns_list() -> Result
 fn remote_sandbox_config_first_match_overrides_top_level() -> Result<()>
 ```
 
-**Purpose**: Verifies that applying remote sandbox config uses the first matching hostname-pattern entry to replace top-level allowed sandbox modes before compilation.
+**Purpose**: Checks that the first matching remote sandbox rule replaces the top-level sandbox allow-list.
 
-**Data flow**: Parses TOML with top-level and multiple remote configs, applies hostname-based override, merges with a source, asserts the chosen allowlist, compiles requirements, and probes resulting permission-profile constraints.
+**Data flow**: It parses top-level and remote sandbox rules, applies a matching hostname, merges sources, and verifies workspace-write is allowed while full access is rejected.
 
-**Call relations**: Exercises `apply_remote_sandbox_config` plus downstream compilation.
+**Call relations**: This exercises ConfigRequirementsToml::apply_remote_sandbox_config and then ConfigRequirements::try_from.
 
 *Call graph*: calls 2 internal fn (workspace_write_with, from_absolute_path); 6 external calls (try_from, assert!, assert_eq!, cfg!, default, from_str).
 
@@ -2177,11 +2181,11 @@ fn remote_sandbox_config_first_match_overrides_top_level() -> Result<()>
 fn remote_sandbox_config_non_match_preserves_top_level() -> Result<()>
 ```
 
-**Purpose**: Ensures that when no remote sandbox pattern matches, the original top-level sandbox allowlist remains in effect.
+**Purpose**: Checks that remote sandbox rules do nothing when the hostname does not match.
 
-**Data flow**: Parses TOML, applies a nonmatching hostname, merges and compiles requirements, then asserts a disallowed profile still fails according to the top-level allowlist.
+**Data flow**: It applies a non-matching hostname and verifies the original read-only-only sandbox rule still blocks full access.
 
-**Call relations**: Covers the no-match branch of remote sandbox override logic.
+**Call relations**: This tests the no-match path in ConfigRequirementsToml::apply_remote_sandbox_config.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2192,11 +2196,11 @@ fn remote_sandbox_config_non_match_preserves_top_level() -> Result<()>
 fn remote_sandbox_config_does_not_override_higher_precedence_sandbox_modes() -> Result<()>
 ```
 
-**Purpose**: Checks that a lower-precedence layer's remote-sandbox-derived allowlist cannot replace an already-set higher-precedence top-level sandbox allowlist.
+**Purpose**: Checks that a lower-priority remote sandbox rule cannot override a higher-priority sandbox allow-list.
 
-**Data flow**: Builds high- and low-precedence requirement layers, applies remote sandbox config to both, merges them in precedence order, compiles requirements, and asserts the higher-precedence restriction still governs.
+**Data flow**: It merges a high-priority read-only layer and a lower-priority hostname-matched workspace-write layer, then verifies workspace-write is still rejected.
 
-**Call relations**: Demonstrates the interaction between remote override application and `merge_unset_fields` precedence.
+**Call relations**: This covers the interaction between ConfigRequirementsToml::apply_remote_sandbox_config and ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2207,11 +2211,11 @@ fn remote_sandbox_config_does_not_override_higher_precedence_sandbox_modes() -> 
 fn deserialize_allowed_web_search_modes() -> Result<()>
 ```
 
-**Purpose**: Verifies web-search allowlists compile into a constrained mode that always permits `Disabled` and rejects unlisted stronger modes.
+**Purpose**: Checks web search mode allow-list parsing where cached is allowed and live is not.
 
-**Data flow**: Parses TOML, compiles requirements, asserts the initial mode, and probes `Disabled`, `Live`, and `Cached` with `can_set`.
+**Data flow**: It parses cached, converts requirements, verifies disabled is always allowed, cached is allowed, and live is rejected.
 
-**Call relations**: Exercises the web-search branch of `ConfigRequirements::try_from`.
+**Call relations**: This exercises ConfigRequirements::try_from's web_search_mode constraint.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2222,11 +2226,11 @@ fn deserialize_allowed_web_search_modes() -> Result<()>
 fn allowed_web_search_modes_allows_disabled() -> Result<()>
 ```
 
-**Purpose**: Checks that an allowlist containing only `disabled` compiles to a constraint that permits only `Disabled`.
+**Purpose**: Checks web search requirements that allow only disabled mode.
 
-**Data flow**: Parses TOML, compiles requirements, asserts the initial mode, and verifies `Cached` is rejected.
+**Data flow**: It parses disabled, converts requirements, verifies disabled is the current value, and cached is rejected.
 
-**Call relations**: Covers the minimal accepted-set case for web search.
+**Call relations**: This validates the disabled-only branch of ConfigRequirements::try_from's web search handling.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2237,11 +2241,11 @@ fn allowed_web_search_modes_allows_disabled() -> Result<()>
 fn allowed_web_search_modes_empty_restricts_to_disabled() -> Result<()>
 ```
 
-**Purpose**: Ensures an explicitly empty web-search allowlist is interpreted as allowing only `Disabled`, not as an error.
+**Purpose**: Checks that an empty web search allow-list means only disabled is allowed.
 
-**Data flow**: Parses TOML, compiles requirements, asserts the initial mode is `Disabled`, and verifies `Cached` is rejected.
+**Data flow**: It parses an empty list, converts requirements, and verifies disabled is accepted while cached is rejected.
 
-**Call relations**: Covers the special accepted-set construction that always inserts `Disabled`.
+**Call relations**: This documents the special behavior in ConfigRequirements::try_from that always includes disabled.
 
 *Call graph*: 4 external calls (assert!, assert_eq!, with_unknown_source, from_str).
 
@@ -2252,11 +2256,11 @@ fn allowed_web_search_modes_empty_restricts_to_disabled() -> Result<()>
 fn deserialize_feature_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies managed feature flags deserialize and are preserved as a sourced feature map after compilation.
+**Purpose**: Checks parsing and preservation of feature requirements.
 
-**Data flow**: Parses TOML, compiles requirements, and asserts the resulting `feature_requirements` sourced value.
+**Data flow**: It parses two feature flags, converts requirements, and asserts the source-tracked feature map matches.
 
-**Call relations**: Exercises feature-map preservation through `ConfigRequirements::try_from`.
+**Call relations**: This exercises ConfigRequirements::try_from's feature_requirements preservation.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2267,11 +2271,11 @@ fn deserialize_feature_requirements() -> Result<()>
 fn deserialize_managed_hooks_requirements() -> Result<()>
 ```
 
-**Purpose**: Checks that managed hooks requirements TOML deserializes with directories and hook handlers intact.
+**Purpose**: Checks parsing of managed hook requirements.
 
-**Data flow**: Parses TOML into `ManagedHooksRequirementsToml`, then asserts managed directory fields and handler counts.
+**Data flow**: It parses managed hook directories and a PreToolUse command hook, then asserts the managed directory and handler count.
 
-**Call relations**: Covers the raw managed-hooks schema used later by requirement compilation.
+**Call relations**: This validates the imported ManagedHooksRequirementsToml shape as used by this file.
 
 *Call graph*: 2 external calls (assert_eq!, from_str).
 
@@ -2282,11 +2286,11 @@ fn deserialize_managed_hooks_requirements() -> Result<()>
 fn merge_unset_fields_does_not_overwrite_existing_hooks() -> Result<()>
 ```
 
-**Purpose**: Ensures a lower-precedence hooks requirement layer does not replace an already-set higher-precedence hooks configuration.
+**Purpose**: Checks that higher-priority managed hooks are not overwritten by lower-priority hook requirements.
 
-**Data flow**: Merges two hook-bearing requirement layers from different sources and asserts the resulting managed directory and source remain from the first merge.
+**Data flow**: It merges cloud hooks first, then system hooks, and asserts the cloud managed directory and source remain.
 
-**Call relations**: Covers ordinary precedence behavior for the `hooks` field in `merge_unset_fields`.
+**Call relations**: This tests hook behavior in ConfigRequirementsWithSources::merge_unset_fields.
 
 *Call graph*: 3 external calls (assert_eq!, default, system_requirements_toml_file_for_test).
 
@@ -2297,11 +2301,11 @@ fn merge_unset_fields_does_not_overwrite_existing_hooks() -> Result<()>
 fn managed_hooks_constraint_rejects_drift() -> Result<()>
 ```
 
-**Purpose**: Verifies that compiled managed hooks are constrained to exact equality and reject later mutation to a different hook configuration.
+**Purpose**: Checks that managed hook requirements cannot be changed after normalization.
 
-**Data flow**: Parses hook requirements, compiles them, extracts the constrained managed hooks, attempts to `set` a different value, and asserts the resulting `ConstraintError::InvalidValue` carries the expected field and source.
+**Data flow**: It parses managed hooks, converts requirements, tries to set different hooks, and asserts a ConstraintError is returned.
 
-**Call relations**: Exercises the exact-match constraint closure built for managed hooks in `ConfigRequirements::try_from`.
+**Call relations**: This exercises the managed_hooks constraint created in ConfigRequirements::try_from.
 
 *Call graph*: 5 external calls (assert!, with_unknown_source, default, from, from_str).
 
@@ -2312,11 +2316,11 @@ fn managed_hooks_constraint_rejects_drift() -> Result<()>
 fn network_requirements_are_preserved_as_constraints_with_source() -> Result<()>
 ```
 
-**Purpose**: Checks that canonical managed network requirements survive compilation as sourced `NetworkConstraints` without losing any fields.
+**Purpose**: Checks canonical network requirements are carried into normalized constraints with their source.
 
-**Data flow**: Parses TOML with canonical domain and Unix socket maps, merges with a source, compiles requirements, extracts `network`, and asserts all fields and nested maps.
+**Data flow**: It parses network settings with domain and Unix socket allow/deny maps, merges with a source, converts requirements, and asserts each field.
 
-**Call relations**: Covers network preservation through `NetworkConstraints::from` and `ConfigRequirements::try_from`.
+**Call relations**: This tests NetworkRequirementsToml::deserialize, NetworkConstraints::from, and ConfigRequirements::try_from.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2327,11 +2331,11 @@ fn network_requirements_are_preserved_as_constraints_with_source() -> Result<()>
 fn legacy_network_requirements_are_preserved_as_constraints_with_source() -> Result<()>
 ```
 
-**Purpose**: Verifies that legacy network allow/deny list fields are normalized into canonical constraints and preserved with source metadata.
+**Purpose**: Checks older network requirement fields are converted and preserved as normalized constraints.
 
-**Data flow**: Parses TOML using legacy fields, merges and compiles requirements, then asserts the resulting canonical domain/socket maps and scalar fields.
+**Data flow**: It parses legacy allowed_domains, denied_domains, and allow_unix_sockets lists, converts requirements, and compares the canonical maps.
 
-**Call relations**: Exercises legacy normalization in `NetworkRequirementsToml::deserialize` plus preservation in `ConfigRequirements::try_from`.
+**Call relations**: This exercises legacy_domain_permissions_from_lists and legacy_unix_socket_permissions_from_list through NetworkRequirementsToml::deserialize.
 
 *Call graph*: 4 external calls (try_from, assert_eq!, default, from_str).
 
@@ -2342,11 +2346,11 @@ fn legacy_network_requirements_are_preserved_as_constraints_with_source() -> Res
 fn mixed_legacy_and_canonical_network_requirements_are_rejected()
 ```
 
-**Purpose**: Ensures network requirements reject mixed use of canonical and legacy domain/socket field shapes.
+**Purpose**: Checks that old and new network configuration shapes cannot be mixed.
 
-**Data flow**: Attempts to parse invalid TOML snippets combining `domains` with `allowed_domains` and `unix_sockets` with `allow_unix_sockets`, then asserts the parse errors mention the incompatibility.
+**Data flow**: It parses TOML that combines canonical domains with legacy domain lists, then canonical unix_sockets with legacy socket lists, and expects errors.
 
-**Call relations**: Directly covers the custom validation in `NetworkRequirementsToml::deserialize`.
+**Call relations**: This verifies the rejection checks in NetworkRequirementsToml::deserialize.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2357,11 +2361,11 @@ fn mixed_legacy_and_canonical_network_requirements_are_rejected()
 fn network_permission_containers_project_allowed_and_denied_entries()
 ```
 
-**Purpose**: Checks the helper projection methods on canonical network permission containers.
+**Purpose**: Checks helper methods that split canonical network permission maps into allowed and denied lists.
 
-**Data flow**: Constructs domain and socket permission maps in memory, calls `allowed_domains`, `denied_domains`, and `allow_unix_sockets`, and asserts the projected outputs.
+**Data flow**: It builds domain and socket permission maps, calls projection helpers, and compares the returned lists.
 
-**Call relations**: Exercises the convenience methods on `NetworkDomainPermissionsToml` and `NetworkUnixSocketPermissionsToml`.
+**Call relations**: This directly tests NetworkDomainPermissionsToml::allowed_domains, denied_domains, and NetworkUnixSocketPermissionsToml::allow_unix_sockets.
 
 *Call graph*: 2 external calls (from, assert_eq!).
 
@@ -2372,11 +2376,11 @@ fn network_permission_containers_project_allowed_and_denied_entries()
 fn deserialize_mcp_server_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies MCP server requirements deserialize into command- and URL-based identities and are preserved as sourced values after compilation.
+**Purpose**: Checks parsing of top-level MCP server identity requirements.
 
-**Data flow**: Parses TOML, compiles requirements via `with_unknown_source`, and asserts the resulting sourced `mcp_servers` map.
+**Data flow**: It parses one command-based and one URL-based MCP server identity, converts requirements, and compares the source-tracked server map.
 
-**Call relations**: Covers MCP server requirement schema and preservation.
+**Call relations**: This validates McpServerRequirement and McpServerIdentity as preserved by ConfigRequirements::try_from.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2387,11 +2391,11 @@ fn deserialize_mcp_server_requirements() -> Result<()>
 fn deserialize_plugin_mcp_server_requirements() -> Result<()>
 ```
 
-**Purpose**: Checks plugin-scoped MCP server requirements deserialize and survive compilation.
+**Purpose**: Checks parsing of MCP server requirements nested under plugins.
 
-**Data flow**: Parses TOML with nested plugin MCP server definitions, compiles requirements, and asserts the resulting sourced plugin map.
+**Data flow**: It parses plugin-specific command and URL MCP server identities, converts requirements, and compares the source-tracked plugin map.
 
-**Call relations**: Covers plugin requirement schema and preservation.
+**Call relations**: This validates PluginRequirementsToml preservation in ConfigRequirements::try_from.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2402,11 +2406,11 @@ fn deserialize_plugin_mcp_server_requirements() -> Result<()>
 fn deserialize_exec_policy_requirements() -> Result<()>
 ```
 
-**Purpose**: Verifies managed execution rules compile into an executable policy that enforces the configured decision.
+**Purpose**: Checks parsing and use of execution policy rules from requirements.
 
-**Data flow**: Parses TOML with a prefix rule, compiles requirements, extracts the `exec_policy`, evaluates a tokenized command, and asserts the resulting `Evaluation` and matched rule.
+**Data flow**: It parses a rule forbidding commands starting with rm, converts requirements, evaluates an rm command, and asserts the forbidden decision and matched rule.
 
-**Call relations**: Exercises the rules-to-policy conversion path in `ConfigRequirements::try_from`.
+**Call relations**: This exercises RequirementsExecPolicyToml conversion inside ConfigRequirements::try_from.
 
 *Call graph*: 3 external calls (assert_eq!, with_unknown_source, from_str).
 
@@ -2417,24 +2421,26 @@ fn deserialize_exec_policy_requirements() -> Result<()>
 fn exec_policy_error_includes_requirement_source() -> Result<()>
 ```
 
-**Purpose**: Ensures parse failures while compiling managed execution rules are wrapped in `ConstraintError::ExecPolicyParse` with the originating source.
+**Purpose**: Checks that execution policy parse errors include the source that supplied the bad policy.
 
-**Data flow**: Parses invalid rules TOML, merges it with a concrete system-file source, attempts compilation, and asserts the exact error value.
+**Data flow**: It parses an invalid rule missing a decision, merges it with a file source, tries to normalize it, and asserts the ExecPolicyParse error includes that source.
 
-**Call relations**: Covers the error-mapping branch for `RequirementsExecPolicyToml::to_requirements_policy()` inside `ConfigRequirements::try_from`.
+**Call relations**: This tests the error path in ConfigRequirements::try_from for execution policy conversion.
 
 *Call graph*: 5 external calls (try_from, assert_eq!, default, system_requirements_toml_file_for_test, from_str).
 
 
 ### `config/src/requirements_layers/layer.rs`
 
-`orchestration` · `requirements layer ingestion before composition`
+`config` · `config load`
 
-This file defines the boundary between raw layer inputs and the composition engine. `RequirementsLayerEntry` is the public input type: it stores a `RequirementSource`, either raw TOML text or a prebuilt `toml::Value`, and an optional `AbsolutePathBuf` base directory used while parsing. The helper constructors let callers build entries from strings or values, and `with_base_dir` attaches path context for relative-path resolution under an `AbsolutePathBufGuard`.
+A requirements layer is one piece of configuration that may come from a file, an in-memory TOML value, or an older compatibility path. This file is the adapter that makes that piece safe and consistent before the wider system combines it with other layers.
 
-The internal `ComposableRequirementsLayer` is what the stack actually merges. `from_entry` parses the same source twice: once into a generic `TomlValue` (`parse_layer_toml`) for ordinary TOML merging, and once into `ConfigRequirementsToml` (`parse_layer_requirements`) so typed requirement-specific transformations can run. If the layer contains `remote_sandbox_config`, hostname resolution is invoked lazily through the supplied callback; the selected sandbox result is applied to the typed requirements before being written back into the generic TOML via `materialize_remote_sandbox_config`, which removes `remote_sandbox_config` and inserts the computed `allowed_sandbox_modes` when present.
+It starts with `RequirementsLayerEntry`, which is a small wrapper around the raw TOML plus where it came from. The source matters because parse errors can then say which layer was bad. A layer may also carry a base directory, so relative paths inside the configuration can be interpreted from the right place.
 
-Finally, `strip_special_fields` removes fields that are merged elsewhere with custom semantics: `rules`, `hooks`, and `permissions.filesystem.deny_read`. The resulting `regular_toml` contains only fields safe for generic TOML merge, while `domain_fields` carries the extracted `rules`, `hooks`, and `permissions` fragments for specialized mergers. Recursive cleanup in `remove_nested_field_and_prune_empty` ensures stripping `deny_read` does not leave empty intermediate tables behind.
+`ComposableRequirementsLayer::from_entry` is the main conversion step. It parses the same TOML in two ways: once as general TOML that can be merged normally, and once as structured requirements data that the project understands. Then it applies remote sandbox configuration. A sandbox is a restricted environment for running commands; this code only asks for the machine hostname if the layer actually contains hostname-based sandbox choices, because that lookup can be slow.
+
+Finally, it removes special fields like `rules`, `hooks`, and a nested denied-read permission from the ordinary TOML. Those fields are kept separately so they can be merged with domain-specific rules instead of being treated like plain settings. Without this cleanup, the same requirement data could be merged twice or merged in the wrong way.
 
 #### Function details
 
@@ -2444,11 +2450,11 @@ Finally, `strip_special_fields` removes fields that are merged elsewhere with cu
 fn from_toml(source: RequirementSource, contents: impl Into<String>) -> Self
 ```
 
-**Purpose**: Builds a layer entry from raw TOML text and a source descriptor. The contents are stored lazily as a string until parsing time.
+**Purpose**: Creates a requirements layer entry from raw TOML text. Use this when the configuration was read as a string, such as from a file.
 
-**Data flow**: Takes a `RequirementSource` and any `contents` convertible into `String`, converts the contents, stores them as `RequirementsLayerToml::String`, sets `base_dir` to `None`, and returns `RequirementsLayerEntry`.
+**Data flow**: It receives a source label and TOML text. It stores the text inside the entry, records the source, and leaves the base directory unset. The result is a `RequirementsLayerEntry` ready for later parsing.
 
-**Call relations**: Used by requirements-loading code and tests to create layer inputs from textual TOML before they are normalized by `ComposableRequirementsLayer::from_entry`.
+**Call relations**: This is used when loading requirements TOML and in layer-building code. It does not parse the text itself; it simply packages it so `ComposableRequirementsLayer::from_entry` can do the real conversion later.
 
 *Call graph*: called by 2 (load_requirements_toml, layer); 2 external calls (into, String).
 
@@ -2459,11 +2465,11 @@ fn from_toml(source: RequirementSource, contents: impl Into<String>) -> Self
 fn from_toml_value(source: RequirementSource, value: TomlValue) -> Self
 ```
 
-**Purpose**: Builds a layer entry from an already-parsed `toml::Value`. This avoids reparsing when a caller already has structured TOML.
+**Purpose**: Creates a requirements layer entry from an already-parsed TOML value. This is useful when older configuration code has already converted TOML text into a structured value.
 
-**Data flow**: Takes a `RequirementSource` and `TomlValue`, stores the value as `RequirementsLayerToml::Value`, leaves `base_dir` unset, and returns the entry.
+**Data flow**: It receives a source label and a TOML value. It stores that value directly, records the source, and leaves the base directory unset. The output is a layer entry that can join the same composition flow as text-based layers.
 
-**Call relations**: Called by legacy requirements-loading paths that synthesize TOML values directly before handing them to the composition stack.
+**Call relations**: This is called by the legacy-scheme conversion path. It lets older configuration formats feed into `ComposableRequirementsLayer::from_entry` without first turning the TOML value back into text.
 
 *Call graph*: called by 1 (requirements_layers_from_legacy_scheme); 1 external calls (Value).
 
@@ -2474,11 +2480,11 @@ fn from_toml_value(source: RequirementSource, value: TomlValue) -> Self
 fn with_base_dir(mut self, base_dir: AbsolutePathBuf) -> Self
 ```
 
-**Purpose**: Attaches a base directory to a layer entry so parsing and path resolution can occur relative to that directory. It follows a builder-style API.
+**Purpose**: Attaches a base directory to a layer entry. This tells later parsing where relative paths inside that layer should be interpreted from.
 
-**Data flow**: Consumes `self`, writes `Some(base_dir)` into the `base_dir` field, and returns the updated entry.
+**Data flow**: It takes an existing layer entry and an absolute directory path. It records that path on the entry and returns the updated entry. Nothing is parsed or validated here beyond storing the path.
 
-**Call relations**: Used by callers preparing layer entries before they are parsed by `ComposableRequirementsLayer::from_entry`.
+**Call relations**: This is a small builder-style helper used before a layer is composed. Later, `ComposableRequirementsLayer::from_entry` reads the stored base directory and sets up the parsing context around it.
 
 
 ##### `ComposableRequirementsLayer::from_entry`  (lines 55–92)
@@ -2490,11 +2496,11 @@ fn from_entry(
     ) -> Result<Self, RequirementsCompositionError>
 ```
 
-**Purpose**: Parses and normalizes one raw layer into the split representation used by the composition stack. It evaluates per-layer remote sandbox selectors and removes fields that require custom merge logic.
+**Purpose**: Converts one raw requirements layer into the internal form that can be merged with other layers. It parses the TOML, applies sandbox-related rules, and separates special requirement fields from ordinary configuration.
 
-**Data flow**: Consumes a `RequirementsLayerEntry` and a hostname resolver callback. It destructures the entry, optionally installs an `AbsolutePathBufGuard` from `base_dir`, parses generic TOML with `parse_layer_toml`, parses typed requirements with `parse_layer_requirements`, lazily resolves a hostname only if `requirements.remote_sandbox_config` is present, applies remote sandbox selection to the typed requirements, writes the resulting `allowed_sandbox_modes` back into `regular_toml` via `materialize_remote_sandbox_config`, strips `rules`, `hooks`, and `permissions.filesystem.deny_read` from `regular_toml`, and returns a `ComposableRequirementsLayer` containing the source, cleaned TOML, and extracted domain fields.
+**Data flow**: It receives a `RequirementsLayerEntry` and a hostname lookup function. It temporarily uses the entry’s base directory if one was provided, parses the layer both as general TOML and as structured requirements, resolves remote sandbox choices if needed, writes the final allowed sandbox modes back into the regular TOML, removes special fields from that regular TOML, and returns a `ComposableRequirementsLayer`. If parsing or conversion fails, it returns an error that points back to the layer source.
 
-**Call relations**: Called by `RequirementsLayerStack::add_layer` for every incoming layer. It orchestrates all parsing and normalization helpers in this file.
+**Call relations**: This is called when a requirements stack adds a layer. It coordinates the helper functions in this file: `parse_layer_toml` for ordinary TOML, `parse_layer_requirements` for requirement-specific data, `materialize_remote_sandbox_config` for sandbox output, and `strip_special_fields` so later merging treats special fields correctly.
 
 *Call graph*: calls 4 internal fn (materialize_remote_sandbox_config, parse_layer_requirements, parse_layer_toml, strip_special_fields); called by 1 (add_layer).
 
@@ -2508,11 +2514,11 @@ fn parse_layer_toml(
 ) -> Result<TomlValue, RequirementsCompositionError>
 ```
 
-**Purpose**: Obtains a generic `toml::Value` view of a layer for ordinary TOML merging. It preserves parse errors with the originating layer source.
+**Purpose**: Turns the layer’s raw TOML into a general TOML value. This keeps the ordinary configuration available for normal merging.
 
-**Data flow**: Reads a `RequirementsLayerToml` and `RequirementSource`. For `String`, it parses with `toml::from_str`; for `Value`, it clones the existing value. Parse failures are converted into `RequirementsCompositionError::Parse { layer_source, message }`.
+**Data flow**: It receives either TOML text or an existing TOML value, plus the layer source for error messages. If it has text, it parses the text; if it already has a value, it clones it. It returns a TOML value or a parse error tied to the source layer.
 
-**Call relations**: Used by `ComposableRequirementsLayer::from_entry` to produce the `regular_toml` branch of the normalized layer.
+**Call relations**: `ComposableRequirementsLayer::from_entry` calls this near the start of layer conversion. The result becomes the regular configuration part after special fields are later removed.
 
 *Call graph*: called by 1 (from_entry); 1 external calls (from_str).
 
@@ -2526,11 +2532,11 @@ fn parse_layer_requirements(
 ) -> Result<ConfigRequirementsToml, RequirementsCompositionError>
 ```
 
-**Purpose**: Parses a layer into the typed `ConfigRequirementsToml` structure so requirements-specific transformations can run. It mirrors `parse_layer_toml` but targets the typed schema.
+**Purpose**: Reads the same layer as project-specific requirements data. This extracts meaning from fields like rules, hooks, permissions, and sandbox settings.
 
-**Data flow**: Accepts a `RequirementsLayerToml` and source. For `String`, it deserializes directly with `toml::from_str`; for `Value`, it clones and `try_into()`s `ConfigRequirementsToml`. Any deserialization error becomes `RequirementsCompositionError::Parse` with the layer source attached.
+**Data flow**: It receives the raw TOML form and the source label. If the layer is text, it parses it directly into `ConfigRequirementsToml`; if it is already a TOML value, it tries to convert that value into `ConfigRequirementsToml`. It returns structured requirements or a source-aware parse error.
 
-**Call relations**: Called by `ComposableRequirementsLayer::from_entry` alongside `parse_layer_toml`; the typed result feeds remote sandbox evaluation and extraction of special domain fields.
+**Call relations**: `ComposableRequirementsLayer::from_entry` calls this alongside `parse_layer_toml`. Its output drives sandbox materialization and supplies the domain-specific fields stored separately in the final composable layer.
 
 *Call graph*: called by 1 (from_entry); 1 external calls (from_str).
 
@@ -2544,11 +2550,11 @@ fn materialize_remote_sandbox_config(
 ) -> Result<(), RequirementsCompositionError>
 ```
 
-**Purpose**: Rewrites the generic TOML view after typed remote sandbox evaluation. It removes the selector block and inserts the computed `allowed_sandbox_modes` when one was produced.
+**Purpose**: Replaces the special remote sandbox selector with the concrete allowed sandbox modes that should appear in regular configuration. In other words, it turns a conditional sandbox rule into the plain setting the rest of the system expects.
 
-**Data flow**: Mutably reads and edits `layer_toml`: first removes the top-level `remote_sandbox_config` field, then checks `requirements.allowed_sandbox_modes`. If absent, it returns early. If present and `layer_toml` is a table, it serializes the value with `toml_value_from_serializable` and inserts it under `allowed_sandbox_modes`. Serialization failures become `RequirementsCompositionError::ComposedParse`.
+**Data flow**: It receives mutable regular TOML and the parsed requirements. It first removes the top-level `remote_sandbox_config` field. If the requirements contain final `allowed_sandbox_modes` and the TOML is a table, it serializes those modes into a TOML value and inserts them under `allowed_sandbox_modes`. It returns success or a conversion error.
 
-**Call relations**: Invoked by `ComposableRequirementsLayer::from_entry` after `apply_remote_sandbox_config` so the regular TOML merge sees the already-resolved sandbox modes instead of the selector syntax.
+**Call relations**: `ComposableRequirementsLayer::from_entry` calls this after applying remote sandbox configuration. It relies on `remove_top_level_field` to clear the special selector and `toml_value_from_serializable` to turn Rust data back into TOML.
 
 *Call graph*: calls 2 internal fn (remove_top_level_field, toml_value_from_serializable); called by 1 (from_entry); 1 external calls (as_table_mut).
 
@@ -2561,11 +2567,11 @@ fn toml_value_from_serializable(
 ) -> Result<TomlValue, RequirementsCompositionError>
 ```
 
-**Purpose**: Converts an arbitrary serializable Rust value into `toml::Value` while mapping conversion failures into the composition error type. It is a small adapter around `TomlValue::try_from`.
+**Purpose**: Converts normal Rust data into a TOML value. This is used when computed configuration needs to be written back into the TOML-shaped configuration tree.
 
-**Data flow**: Consumes a serializable `value`, attempts `TomlValue::try_from(value)`, and returns either the TOML value or `RequirementsCompositionError::ComposedParse { message }`.
+**Data flow**: It receives any value that can be serialized. It asks the TOML library to convert that value into a `TomlValue`. If that conversion fails, it wraps the failure in a requirements composition error.
 
-**Call relations**: Used only by `materialize_remote_sandbox_config` when reinserting computed typed data into the generic TOML tree.
+**Call relations**: `materialize_remote_sandbox_config` calls this when inserting computed `allowed_sandbox_modes` into regular TOML. It is the small bridge between structured Rust requirements data and the generic TOML representation.
 
 *Call graph*: called by 1 (materialize_remote_sandbox_config); 1 external calls (try_from).
 
@@ -2576,11 +2582,11 @@ fn toml_value_from_serializable(
 fn strip_special_fields(layer_toml: &mut TomlValue)
 ```
 
-**Purpose**: Removes fields from the generic TOML tree that are merged by custom domain-specific logic elsewhere. This prevents them from being merged twice with incompatible semantics.
+**Purpose**: Removes requirement-only fields from the regular TOML tree. This prevents fields that need special merge rules from also being merged like ordinary settings.
 
-**Data flow**: Mutably edits `layer_toml` by removing top-level `rules`, top-level `hooks`, and nested `permissions.filesystem.deny_read`; if nested tables become empty, cleanup is delegated to `remove_nested_field_and_prune_empty`.
+**Data flow**: It receives mutable TOML. It removes the top-level `rules` and `hooks` fields, then removes the nested `permissions.filesystem.deny_read` field and prunes any empty parent tables left behind. The same TOML value comes out cleaner, with special fields stripped away.
 
-**Call relations**: Called by `ComposableRequirementsLayer::from_entry` just before returning the normalized layer.
+**Call relations**: `ComposableRequirementsLayer::from_entry` calls this after sandbox materialization. It delegates simple top-level removal to `remove_top_level_field` and nested cleanup to `remove_nested_field_and_prune_empty`.
 
 *Call graph*: calls 2 internal fn (remove_nested_field_and_prune_empty, remove_top_level_field); called by 1 (from_entry).
 
@@ -2591,11 +2597,11 @@ fn strip_special_fields(layer_toml: &mut TomlValue)
 fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue>
 ```
 
-**Purpose**: Deletes a named top-level key from a TOML table if present. It is a tiny helper used by field-stripping code.
+**Purpose**: Removes one named field from the top level of a TOML table. It is a small helper for cleaning configuration without caring whether the field was present.
 
-**Data flow**: Takes `&mut TomlValue` and a key string, obtains the table with `as_table_mut()`, removes the key if possible, and returns the removed `Option<TomlValue>`.
+**Data flow**: It receives a mutable TOML value and a key name. If the TOML value is a table, it removes that key and returns the removed value. If the TOML is not a table or the key is missing, it returns nothing.
 
-**Call relations**: Used by both `materialize_remote_sandbox_config` and `strip_special_fields` to remove top-level special fields.
+**Call relations**: `materialize_remote_sandbox_config` uses this to remove `remote_sandbox_config`, and `strip_special_fields` uses it to remove `rules` and `hooks`. It keeps those callers focused on policy instead of table-editing details.
 
 *Call graph*: called by 2 (materialize_remote_sandbox_config, strip_special_fields); 1 external calls (as_table_mut).
 
@@ -2606,11 +2612,11 @@ fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue>
 fn remove_nested_field_and_prune_empty(value: &mut TomlValue, path: &[&str]) -> Option<TomlValue>
 ```
 
-**Purpose**: Recursively removes a nested TOML field and deletes any now-empty intermediate tables on the way back out. This keeps the regular TOML tree free of empty `permissions`/`filesystem` shells after stripping `deny_read`.
+**Purpose**: Removes a field buried inside nested TOML tables, then deletes any parent tables that become empty. This keeps the configuration tree tidy after removing a deeply nested special field.
 
-**Data flow**: Accepts `&mut TomlValue` and a path slice. It descends through table nodes using the path, removes the terminal key when reached, then checks whether the child table at the current level became empty and removes that table too. It returns the removed nested value if one existed.
+**Data flow**: It receives a mutable TOML value and a path such as `permissions → filesystem → deny_read`. It walks down the tables one key at a time, removes the final field, then walks back up and removes empty tables left behind. It returns the removed value if one was found.
 
-**Call relations**: Called by `strip_special_fields` for `permissions.filesystem.deny_read`; it encapsulates the recursive cleanup logic.
+**Call relations**: `strip_special_fields` calls this for the nested denied-read permission. This matters because removing only the leaf field could leave empty `permissions` or `filesystem` tables that look meaningful but contain nothing.
 
 *Call graph*: called by 1 (strip_special_fields); 1 external calls (as_table_mut).
 
@@ -2620,11 +2626,13 @@ These files implement the special per-field composition rules that override ordi
 
 ### `config/src/requirements_layers/permissions.rs`
 
-`domain_logic` · `requirements layer composition`
+`config` · `config load`
 
-This file isolates the one permissions field that does not follow ordinary TOML precedence. `DenyReadMergeState` accumulates a deduplicated `Vec<FilesystemDenyReadPattern>` plus optional source metadata while the stack walks layers from highest to lowest priority. The `merge` method extracts only `incoming.filesystem.deny_read`, ignoring all other permission content and skipping absent or empty lists. Each pattern is appended only if it is not already present, preserving the first-seen order—which, because the stack iterates in reverse, means higher-priority layers appear earlier in the final list. Whenever a new pattern is accepted, `merge_source` updates the aggregate source, combining multiple contributors with `merge_output_source`.
+Most configuration values follow a normal “later layer wins” rule, like putting a newer note on top of an older one. This file exists because one permission setting should not work that way: `permissions.filesystem.deny_read`. That setting lists filesystem patterns the program is not allowed to read, and each requirements layer is meant to add to the list rather than erase earlier restrictions.
 
-After all layers have been scanned, `apply_to` writes the accumulated deny-read union back into the composed permissions output. If there is no existing permissions block, it constructs a minimal `PermissionsRequirementsToml` containing only `filesystem.deny_read` and default `profiles`. If permissions already exist from the regular TOML merge path, it creates missing `filesystem` or `deny_read` containers as needed and appends any patterns not already present. Source metadata is preserved carefully: a single contributing source is kept as-is, while differing sources are collapsed into `RequirementSource::composite`. The implementation also avoids leaving empty permissions tables behind by returning early when no deny-read patterns were accumulated.
+`DenyReadMergeState` is a small temporary collector used while requirement layers are being merged. As each layer is inspected, it looks for a non-empty `deny_read` list. Any pattern that is not already present is added to the collector. The collector also remembers where those patterns came from, using a source value that can become a combined source if multiple layers contributed.
+
+After all relevant layers have been checked, the collected deny-read patterns are applied back into the final permissions requirements. If there was no permissions section yet, this file creates one containing only the collected filesystem deny-read list. If permissions already exist, it adds the missing patterns without duplicating entries. This keeps deny-read rules intentionally additive while leaving other permissions content, such as profile tables, to follow the project’s normal configuration precedence rules.
 
 #### Function details
 
@@ -2638,11 +2646,11 @@ fn merge(
     )
 ```
 
-**Purpose**: Extracts and accumulates deny-read filesystem patterns from one layer's permissions block. It ignores all other permission fields and deduplicates patterns across layers.
+**Purpose**: This function reads one incoming permissions layer and adds its filesystem deny-read patterns to the temporary collector. It ignores missing, empty, or duplicate entries so the final list stays clean.
 
-**Data flow**: Takes mutable `self`, an optional `PermissionsRequirementsToml`, and the layer `RequirementSource`. It drills down through `permissions.filesystem.deny_read`, filters out missing or empty vectors, then iterates each pattern; unseen patterns are pushed into `self.deny_read` and trigger `self.merge_source(source)`. It returns no value and mutates only the accumulator.
+**Data flow**: It receives an optional permissions block and the source that block came from. It looks inside the permissions block for `filesystem.deny_read`; if that list exists and has items, it checks each pattern against the collector’s current list. New patterns are stored, and the collector’s remembered source is updated to include the layer that contributed them. Nothing is returned; the collector is changed in place.
 
-**Call relations**: Called from `RequirementsLayerStack::compose` while scanning layers high-to-low, so the first occurrence of a pattern reflects the highest-priority layer.
+**Call relations**: During layered configuration merging, this is called for each permissions layer that might contribute deny-read rules. When it accepts a new pattern, it calls `DenyReadMergeState::merge_source` so the final output can still explain which requirement source or sources produced the collected restrictions.
 
 *Call graph*: calls 1 internal fn (merge_source).
 
@@ -2653,11 +2661,11 @@ fn merge(
 fn apply_to(self, target: &mut Option<Sourced<PermissionsRequirementsToml>>)
 ```
 
-**Purpose**: Writes the accumulated deny-read union into the composed permissions output. It either creates a minimal permissions structure or augments an existing one from the regular TOML merge path.
+**Purpose**: This function writes the collected deny-read patterns into the final permissions requirements. It is the step that turns the temporary collector into actual configuration output.
 
-**Data flow**: Consumes `self` and mutably updates `target: &mut Option<Sourced<PermissionsRequirementsToml>>`. If `self.deny_read` is empty, it returns immediately. Otherwise it chooses a source, defaulting to `RequirementSource::Unknown` if none was recorded. If `target` is `None`, it creates a new `Sourced<PermissionsRequirementsToml>` with `filesystem.deny_read = Some(self.deny_read)` and default `profiles`. If `target` already exists, it ensures `filesystem` and `deny_read` containers exist, appends any missing patterns, and if the existing source differs from the accumulated source, replaces it with `RequirementSource::composite([existing.source.clone(), source])`.
+**Data flow**: It takes ownership of the collected state and receives the final permissions target to update. If no patterns were collected, it leaves the target unchanged. If the target is empty, it creates a new sourced permissions value containing a filesystem deny-read list. If the target already exists, it ensures there is a filesystem section and deny-read list, appends any missing collected patterns, and combines source information when needed. The target is changed in place.
 
-**Call relations**: Invoked once at the end of `RequirementsLayerStack::compose` after regular TOML fields and other domain-specific fields have been merged.
+**Call relations**: After all layers have been scanned with `DenyReadMergeState::merge`, the merge process calls this function to fold the accumulated deny-read rules into the normal permissions result. It uses `Sourced::new` when it must create a fresh permissions block, and `RequirementSource::composite` when the final value needs to record that it came from more than one source.
 
 *Call graph*: calls 2 internal fn (composite, new); 1 external calls (default).
 
@@ -2668,22 +2676,26 @@ fn apply_to(self, target: &mut Option<Sourced<PermissionsRequirementsToml>>)
 fn merge_source(&mut self, source: &RequirementSource)
 ```
 
-**Purpose**: Accumulates source provenance for deny-read patterns as multiple layers contribute unique entries. The first source is stored directly; later distinct sources are merged into a composite source.
+**Purpose**: This helper updates the collector’s record of where its deny-read patterns came from. It keeps a single source when possible, and combines sources when several layers contribute rules.
 
-**Data flow**: Takes `&mut self` and `&RequirementSource`. If `self.source` is empty, it clones and stores the incoming source. Otherwise it mutates the existing source in place via `merge_output_source`.
+**Data flow**: It receives a source from the current layer. If the collector has no source yet, it stores a clone of that source. If a source is already stored, it merges the new one into the existing source value. It returns nothing; it only updates the collector’s source field.
 
-**Call relations**: Called internally by `DenyReadMergeState::merge` only when a new pattern is actually added, so provenance reflects contributing layers rather than merely inspected ones.
+**Call relations**: This helper is called by `DenyReadMergeState::merge` whenever a new deny-read pattern is accepted. It delegates the actual source-combining behavior to `merge_output_source`, keeping `merge` focused on collecting patterns while this function keeps the provenance information accurate.
 
 *Call graph*: calls 1 internal fn (merge_output_source); called by 1 (merge); 1 external calls (clone).
 
 
 ### `config/src/requirements_layers/hooks.rs`
 
-`domain_logic` · `requirements layer composition`
+`domain_logic` · `config load`
 
-This file contains the domain-specific merger for `ManagedHooksRequirementsToml`, which cannot be composed correctly by plain TOML replacement. `HookDirectoryField` identifies the two singleton directory fields, `managed_dir` and `windows_managed_dir`, and provides helpers to choose the active field for the current build target, name fields for diagnostics, and flip to the inactive platform field.
+Requirement layers are like stacked instruction sheets: each layer can add rules, and the system must turn the stack into one clear result. This file handles the hook part of that process. Hooks are commands or actions that run at certain moments, such as before a tool is used or when a session starts.
 
-`HookMergeState` carries two pieces of state across layer composition: which directory field is active for this run, and a `BTreeMap<HookDirectoryField, RequirementSource>` recording where each singleton directory value first came from. Its `merge` method ignores absent or logically empty incoming hook blocks, initializes the target on first non-empty input, and otherwise merges three categories separately. For the active platform directory, it extracts the incoming value with `take_hook_dir` and calls `merge_active_singleton`, which fails closed with `composition_conflict` if two different active directories are supplied by different layers. For the inactive platform directory, `fill_singleton` only writes the first seen value and never errors on later disagreement. Hook event groups are merged by `append_hook_events`, which destructures `HookEventsToml` without `..` so adding a new event type forces an explicit merge-policy decision. Each event vector is appended via `append_vec`, preserving high-priority-first ordering because the stack processes layers in reverse. Whenever any part changes, `merge_output_source` updates the composed source metadata.
+Most hook events are append-only. That means if one layer says “run this before tool use” and another layer adds another event, both are kept, in order. The managed hook directory is different. Only one directory can actually be used on a given operating system, so two different values for the active platform are treated as a conflict. This is a fail-safe choice: if two layers disagree about where trusted managed hooks live, the system refuses to silently pick one.
+
+There are two directory fields: one for normal platforms and one for Windows. The active platform’s field must not conflict. The inactive platform’s field is allowed to be filled only if it was empty, so the same configuration stack can carry both Unix-like and Windows paths without breaking on the current machine.
+
+The file also tracks where each directory value came from. If a conflict happens, the error can point back to the layers that disagreed, which makes configuration problems much easier to understand.
 
 #### Function details
 
@@ -2693,11 +2705,11 @@ This file contains the domain-specific merger for `ManagedHooksRequirementsToml`
 fn current_platform() -> Self
 ```
 
-**Purpose**: Selects which managed hook directory field is considered active on the current target platform. Non-Windows builds use `ManagedDir`; Windows builds use `WindowsManagedDir`.
+**Purpose**: Chooses which hook directory field matters for the machine currently running the program. On Windows it selects the Windows-specific field; everywhere else it selects the normal managed directory field.
 
-**Data flow**: Reads the compile-time `cfg!(windows)` condition and returns the corresponding `HookDirectoryField` variant. It does not touch external state.
+**Data flow**: It reads the compile-time platform check for Windows → turns that into the matching HookDirectoryField value → returns the field that should be treated as active for this run.
 
-**Call relations**: Called by composition entrypoints to initialize hook merging with the correct active singleton field for the current platform.
+**Call relations**: Higher-level requirement composition code calls this when it starts combining layers for a host. The result tells HookMergeState which directory field must be checked strictly for conflicts.
 
 *Call graph*: called by 2 (compose_requirements_for_hostname, compose_requirements_with_hostname_resolver); 1 external calls (cfg!).
 
@@ -2708,11 +2720,11 @@ fn current_platform() -> Self
 fn field_name(self) -> &'static str
 ```
 
-**Purpose**: Returns the TOML field path string used in conflict diagnostics for a directory field. The strings match the user-visible requirements keys.
+**Purpose**: Turns a hook directory field into the human-readable configuration name used in error messages. This helps users see exactly which setting caused a problem.
 
-**Data flow**: Consumes `self` by value, matches the enum variant, and returns a static `&'static str` such as `hooks.managed_dir` or `hooks.windows_managed_dir`.
+**Data flow**: It receives a HookDirectoryField value → matches it to its configuration key text → returns a string such as hooks.managed_dir or hooks.windows_managed_dir.
 
-**Call relations**: Used by `HookMergeState::merge_active_singleton` when constructing a `RequirementsCompositionError::Conflict` message.
+**Call relations**: When merge_active_singleton finds two different active directory values, it calls this so the conflict error can name the exact field that disagreed.
 
 *Call graph*: called by 1 (merge_active_singleton).
 
@@ -2723,11 +2735,11 @@ fn field_name(self) -> &'static str
 fn inactive(self) -> Self
 ```
 
-**Purpose**: Computes the opposite platform-specific directory field. This lets the merger treat one field as active and the other as passive fill-only state.
+**Purpose**: Finds the opposite directory field from the active one. If the active field is the normal managed directory, the inactive one is the Windows directory, and vice versa.
 
-**Data flow**: Consumes `self`, matches the variant, and returns the other `HookDirectoryField`.
+**Data flow**: It receives one HookDirectoryField value → switches to the other variant → returns that opposite field.
 
-**Call relations**: Called inside `HookMergeState::merge` to split incoming hook directories into active and inactive merge paths.
+**Call relations**: HookMergeState::merge uses this while combining layers so it can apply different rules to the active platform field and the inactive platform field.
 
 
 ##### `HookMergeState::new`  (lines 54–59)
@@ -2736,11 +2748,11 @@ fn inactive(self) -> Self
 fn new(directory_field: HookDirectoryField) -> Self
 ```
 
-**Purpose**: Creates a fresh hook merge accumulator for a composition run. It starts with no remembered directory sources.
+**Purpose**: Creates the small piece of working state needed while hook requirements are being merged. It remembers which directory field is active and prepares an empty record of where directory values came from.
 
-**Data flow**: Takes the chosen active `HookDirectoryField`, stores it, initializes `dir_sources` as an empty `BTreeMap`, and returns `HookMergeState`.
+**Data flow**: It receives the active HookDirectoryField → stores it as the field to enforce strictly → creates an empty map for source tracking → returns a ready-to-use HookMergeState.
 
-**Call relations**: Constructed by the requirements stack before iterating layers so all hook-specific state lives in one accumulator.
+**Call relations**: The broader compose process creates this state before it starts walking through requirement layers. Later, each layer is fed into HookMergeState::merge.
 
 *Call graph*: called by 1 (compose); 1 external calls (new).
 
@@ -2756,11 +2768,11 @@ fn merge(
     ) -> Re
 ```
 
-**Purpose**: Merges one layer's optional hook requirements into the accumulated hook output. It applies append semantics to event groups, conflict detection to the active managed directory, and first-fill semantics to the inactive directory.
+**Purpose**: Combines one incoming hook configuration layer into the accumulated hook configuration. It appends hook events, fills missing directory values, and rejects conflicting active-platform hook directories.
 
-**Data flow**: Accepts mutable access to the composed `target`, an optional incoming `ManagedHooksRequirementsToml`, and the incoming `RequirementSource`. It drops `None` or `is_empty()` inputs. On the first non-empty layer, it records sources for any singleton directories with `track_singleton_source` and stores the whole incoming value in `target` as `Sourced`. For subsequent layers, it computes active/inactive fields, removes those directory values from `incoming` via `take_hook_dir`, merges the active one with `merge_active_singleton`, fills the inactive one with `fill_singleton`, appends each hook event vector with `append_hook_events`, and if anything changed updates `existing.source` through `merge_output_source`. It returns `Ok(())` on success or a composition conflict error when active directories disagree.
+**Data flow**: It receives the current combined target, an optional incoming hook configuration, and the source of that incoming layer → ignores empty incoming data → if this is the first real hook data, stores it and records where directory values came from → otherwise separates active and inactive directory fields, checks the active one for conflicts, fills the inactive one only if missing, appends all hook event lists, and updates the combined source if anything changed → returns success or a composition error.
 
-**Call relations**: Called from `RequirementsLayerStack::compose` while processing layers high-to-low. It orchestrates all helper functions in this file and is the only path that can emit hook-specific composition conflicts.
+**Call relations**: This is the central function in the file. The composition pipeline calls it once per relevant requirements layer. Inside, it delegates small jobs to track_singleton_source, merge_active_singleton, fill_singleton, take_hook_dir, hook_dir_mut, append_hook_events, and merge_output_source so each merge rule stays clear.
 
 *Call graph*: calls 8 internal fn (new, fill_singleton, merge_active_singleton, track_singleton_source, append_hook_events, hook_dir_mut, take_hook_dir, merge_output_source); 1 external calls (clone).
 
@@ -2776,11 +2788,11 @@ fn track_singleton_source(
     )
 ```
 
-**Purpose**: Records the source of a singleton hook directory field the first time a non-`None` value is seen. This source is later used to explain conflicts accurately.
+**Purpose**: Records which requirements source first supplied a hook directory value. This matters because later conflicts should explain where the existing value came from.
 
-**Data flow**: Reads `value`; if it is `Some`, inserts `source.clone()` into `dir_sources` for the given field only when no source is already present. It mutates the internal source map but not the hook values themselves.
+**Data flow**: It receives a directory field, a possible path value, and the source layer → if the path is present and no source has been recorded for that field yet, it stores a copy of the source → it returns nothing but updates the merge state.
 
-**Call relations**: Used during the first-layer initialization path in `merge` so later active-directory conflicts can cite the original provider.
+**Call relations**: HookMergeState::merge calls this when the first hook configuration becomes the target. That first pass establishes source history before later layers are compared against it.
 
 *Call graph*: called by 1 (merge).
 
@@ -2796,11 +2808,11 @@ fn merge_active_singleton(
         incoming_source: &RequirementSource,
 ```
 
-**Purpose**: Merges the active platform's managed hook directory with fail-closed semantics. Different non-empty values from different layers are treated as an error rather than allowing one to silently override the other.
+**Purpose**: Applies the strict merge rule for the hook directory used on the current platform. A missing value can be filled, a repeated identical value is fine, but a different value is an error.
 
-**Data flow**: Takes the field identifier, mutable reference to the existing `Option<PathBuf>`, an incoming `Option<PathBuf>`, and the incoming source. If incoming is `None`, it returns `Ok(false)`. If both existing and incoming are present and unequal, it looks up the original source from `dir_sources` (falling back to the incoming source if absent) and returns `Err(composition_conflict(...))` with the field name and both paths in the message. If the values are equal it returns `Ok(false)`. If no existing value is set, it writes the incoming path, records the source in `dir_sources`, and returns `Ok(true)`.
+**Data flow**: It receives the field being checked, the existing path slot, a possible incoming path, and the incoming source → if there is no incoming path, nothing changes → if an existing different path is present, it builds a conflict error naming both sources and both paths → if the existing path matches, nothing changes → if the existing slot is empty, it stores the incoming path and records its source → returns whether the target changed, or an error.
 
-**Call relations**: Invoked only by `HookMergeState::merge` for the currently active directory field; it delegates error construction to `composition_conflict`.
+**Call relations**: HookMergeState::merge calls this for the active platform’s directory field. If this function reports a conflict, the whole requirements composition stops instead of silently choosing an unsafe directory.
 
 *Call graph*: calls 2 internal fn (field_name, composition_conflict); called by 1 (merge); 2 external calls (clone, format!).
 
@@ -2817,11 +2829,11 @@ fn fill_singleton(
     ) -
 ```
 
-**Purpose**: Applies first-fill semantics for the inactive platform's managed hook directory. Later conflicting values are ignored rather than causing composition failure.
+**Purpose**: Applies the softer merge rule for the inactive platform’s hook directory. It fills the field only if it is currently empty, and it does not treat later different values as conflicts.
 
-**Data flow**: Receives the field, mutable existing `Option<PathBuf>`, incoming `Option<PathBuf>`, and source. If `existing` is `None` and `incoming` is `Some`, it stores the path, records the source in `dir_sources`, and returns `true`; otherwise it leaves state unchanged and returns `false`.
+**Data flow**: It receives the field, the existing path slot, a possible incoming path, and the source → if the existing slot is empty and the incoming path exists, it stores that path and records its source → otherwise it leaves the existing value alone → returns true if it filled the slot, false otherwise.
 
-**Call relations**: Called by `HookMergeState::merge` for the inactive directory field so a single layer stack can carry both OS-specific directories without cross-platform conflicts.
+**Call relations**: HookMergeState::merge calls this for the platform directory that is not active on the current machine. This lets a shared stack carry paths for another operating system without causing unnecessary failures.
 
 *Call graph*: called by 1 (merge).
 
@@ -2835,11 +2847,11 @@ fn take_hook_dir(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Extracts one managed-directory field from a mutable `ManagedHooksRequirementsToml`, leaving `None` behind. This lets directory values be merged separately from event vectors.
+**Purpose**: Removes and returns one chosen hook directory path from a hook requirements object. This lets the merge code deal with the active and inactive directory fields separately.
 
-**Data flow**: Takes `&mut ManagedHooksRequirementsToml` and a `HookDirectoryField`, matches the field, calls `.take()` on the corresponding `Option<PathBuf>`, and returns the removed value.
+**Data flow**: It receives a mutable hook requirements object and a field choice → takes the path out of the matching field, leaving that field empty in the object → returns the removed path if one was present.
 
-**Call relations**: Used by `HookMergeState::merge` before merging singleton directories so the remaining `incoming.hooks` can be appended independently.
+**Call relations**: HookMergeState::merge calls this before applying the two different directory merge rules. After the paths are taken out, the remaining hook event data can be appended without accidentally reprocessing the directories.
 
 *Call graph*: called by 1 (merge).
 
@@ -2853,11 +2865,11 @@ fn hook_dir_mut(
 ) -> &mut Option<PathBuf>
 ```
 
-**Purpose**: Returns a mutable reference to one managed-directory slot inside `ManagedHooksRequirementsToml`. It provides field selection without duplicating match logic at call sites.
+**Purpose**: Finds the editable slot for one chosen hook directory field inside a hook requirements object. It gives the merge code a direct place to read or write that path.
 
-**Data flow**: Accepts `&mut ManagedHooksRequirementsToml` and a `HookDirectoryField`, matches the field, and returns `&mut Option<PathBuf>` for the chosen directory member.
+**Data flow**: It receives a mutable hook requirements object and a field choice → selects either managed_dir or windows_managed_dir → returns a mutable reference to that optional path slot.
 
-**Call relations**: Called by `HookMergeState::merge` to hand the correct existing directory slot to `merge_active_singleton` or `fill_singleton`.
+**Call relations**: HookMergeState::merge uses this when passing the existing target directory slot into merge_active_singleton or fill_singleton. It is the small adapter between a field name choice and the actual stored value.
 
 *Call graph*: called by 1 (merge).
 
@@ -2868,11 +2880,11 @@ fn hook_dir_mut(
 fn append_hook_events(existing: &mut HookEventsToml, incoming: HookEventsToml) -> bool
 ```
 
-**Purpose**: Appends every hook event group from one `HookEventsToml` into another and reports whether anything changed. The explicit destructuring forces future event additions to choose merge behavior intentionally.
+**Purpose**: Adds all incoming hook event lists to the existing hook event lists. It keeps every event rather than replacing earlier ones.
 
-**Data flow**: Consumes `incoming: HookEventsToml`, destructures all event vectors (`pre_tool_use`, `permission_request`, `post_tool_use`, `pre_compact`, `post_compact`, `session_start`, `user_prompt_submit`, `subagent_start`, `subagent_stop`, `stop`), appends each into the corresponding vector in `existing` via `append_vec`, ORs the per-field change flags, and returns a final `bool`.
+**Data flow**: It receives the existing hook events and a full incoming hook events object → breaks the incoming object into each event category → appends each incoming list onto the matching existing list → returns true if any list added at least one event.
 
-**Call relations**: Used by `HookMergeState::merge` after singleton directories are handled, so event groups always compose additively.
+**Call relations**: HookMergeState::merge calls this after directory fields have been handled. This function then calls append_vec for each event category, making the append-only rule explicit for every supported hook event.
 
 *Call graph*: calls 1 internal fn (append_vec); called by 1 (merge).
 
@@ -2883,22 +2895,24 @@ fn append_hook_events(existing: &mut HookEventsToml, incoming: HookEventsToml) -
 fn append_vec(existing: &mut Vec<T>, mut incoming: Vec<T>) -> bool
 ```
 
-**Purpose**: Moves all items from one vector into another and indicates whether the source vector was non-empty. It is the primitive used for append-only hook event merging.
+**Purpose**: Appends one list of items to another and reports whether anything was added. It is a small helper used to avoid repeating the same list-append pattern.
 
-**Data flow**: Takes `&mut Vec<T>` and `mut incoming: Vec<T>`, computes `changed` as `!incoming.is_empty()`, appends all incoming elements into `existing`, and returns that boolean.
+**Data flow**: It receives an existing list and an incoming list → checks whether the incoming list is empty → moves all incoming items onto the end of the existing list → returns true if the incoming list had items, false if it was empty.
 
-**Call relations**: Called repeatedly by `append_hook_events` for each hook event list.
+**Call relations**: append_hook_events calls this once for each hook event category. It provides the simple building block that makes hook event merging append-only.
 
 *Call graph*: called by 1 (append_hook_events).
 
 
 ### `config/src/requirements_layers/rules.rs`
 
-`domain_logic` · `requirements layer composition`
+`config` · `config load`
 
-This file is intentionally small because requirements rule composition is simple but nonstandard. The exported `merge` function accepts the current composed `Option<Sourced<RequirementsExecPolicyToml>>`, an optional incoming rules block, and the incoming `RequirementSource`. If the incoming layer has no rules, it does nothing. If this is the first rules-bearing layer, it wraps the incoming `RequirementsExecPolicyToml` in `Sourced::new` using the layer source. Otherwise it destructures the incoming value to obtain its `prefix_rules` vector and extends the existing vector with those rules.
+This file solves a small but important configuration problem: the system can receive requirement execution rules from more than one place, or “layer.” A layer might be a project setting, a user setting, or some other source of configuration. These rules are additive, meaning a new layer does not erase the old rules. Instead, its rules are added to the list.
 
-The important behavior is not in the mechanics but in how the stack calls it: `RequirementsLayerStack::compose` iterates layers in reverse priority order before invoking this function. That means `extend` appends lower-priority rules after higher-priority ones, preserving visible priority in the final `rules.prefix_rules` list. Source metadata is also merged rather than replaced; `merge_output_source` collapses multiple contributing layers into a composite source when necessary. This keeps the regular TOML merge path from accidentally overriding or deduplicating execution-policy rules, which are intended to remain additive.
+The order matters. Higher-priority rules are appended first, so when all layers are combined, a reader can still see which rules came from the more important sources. Think of it like stacking sticky notes on a checklist: the most important notes are placed at the top first, and later notes are added underneath.
+
+The main work happens in `merge`. If the incoming layer has no requirement policy, nothing changes. If this is the first policy seen, it becomes the target policy and is tagged with where it came from. If there is already a policy, the new prefix rules are added to the existing list, and the recorded source information is updated so the final configuration remembers that more than one source contributed to it.
 
 #### Function details
 
@@ -2912,11 +2926,11 @@ fn merge(
 )
 ```
 
-**Purpose**: Adds one layer's `RequirementsExecPolicyToml` into the accumulated rules output using append semantics. It preserves all prefix rules and updates provenance when multiple layers contribute.
+**Purpose**: This function folds one incoming requirements policy into the combined policy being built. It preserves the rule order by adding the incoming prefix rules to the end of the existing list, and it keeps track of which configuration source contributed the rules.
 
-**Data flow**: Takes mutable `target`, optional `incoming`, and `source`. If `incoming` is `None`, it returns immediately. If `target` is empty, it stores `Sourced::new(incoming, source.clone())`. Otherwise it destructures `incoming` to get `prefix_rules`, extends `existing.value.prefix_rules` with them, and updates `existing.source` through `merge_output_source`.
+**Data flow**: It receives a mutable target policy, an optional incoming policy, and the source that the incoming policy came from. If there is no incoming policy, it leaves the target unchanged. If the target is empty, it stores the incoming policy there and labels it with the source. If the target already has rules, it appends the incoming rules to the existing rules and updates the stored source information to include the new contributor.
 
-**Call relations**: Called from `RequirementsLayerStack::compose` during the high-to-low pass over domain-specific fields so higher-priority rules are inserted before lower-priority ones.
+**Call relations**: During configuration composition, `compose` calls this function when it is combining requirement-rule layers. When the first policy is stored, this function creates a sourced value so the policy is tied to its origin. When another layer contributes rules, it hands the source-tracking update to `merge_output_source`, so the final combined policy can still explain where its contents came from.
 
 *Call graph*: calls 2 internal fn (new, merge_output_source); called by 1 (compose); 1 external calls (clone).
 
@@ -2926,13 +2940,13 @@ These files assemble the full layered requirements result and then derive effect
 
 ### `config/src/requirements_layers/stack.rs`
 
-`orchestration` · `requirements composition`
+`domain_logic` · `config load`
 
-This file is the driver for requirements-layer composition. It defines `RequirementsCompositionError` for parse failures, merged-output parse failures, and explicit field conflicts, plus an `io::Error` conversion that maps all composition failures to `InvalidData`. The public entrypoint `compose_requirements` delegates to a hostname-aware helper using `crate::host_name`; test-only variants inject a fixed hostname and/or hook-directory field.
+A project can receive requirements from several places, such as defaults, user settings, or higher-priority policy files. This file is the assembly line that turns those layers into one usable requirements object, while preserving where each final value came from. Without it, later policy layers might not correctly override earlier ones, and special fields like hooks, rule prefixes, or denied file reads could be merged in an unsafe or misleading way.
 
-The core flow lives in `compose_requirements_with_hostname_resolver_and_hook_directory`. It wraps the hostname resolver in a `OnceCell` so hostname lookup is lazy and shared across all layers, then builds a `RequirementsLayerStack`, adds each `RequirementsLayerEntry` by normalizing it into a `ComposableRequirementsLayer`, and finally composes the stack. `RequirementsLayerStack::compose` first merges each layer's `regular_toml` low-to-high with `merge_toml_values`, parses the merged TOML back into `ConfigRequirementsToml`, and populates `ConfigRequirementsWithSources` for ordinary fields using `populate_merged_regular_fields_with_sources`. That helper explicitly destructures every top-level requirements field so new fields must choose between regular and special merge paths; source attribution comes from `source_for_top_level_keys`, which returns the winning source for scalars and a composite source for merged tables.
+The main flow starts with a list of requirement layers ordered from lowest priority to highest priority. Each layer is first converted into a form that separates ordinary TOML settings from fields that need custom rules. TOML is a configuration file format made of tables, lists, and values. Ordinary fields are merged like normal config: low-priority layers provide defaults, and higher-priority layers replace simple values while extending tables.
 
-After regular fields, the stack performs a second pass over layers in reverse order for domain-specific fields: `super::rules::merge` appends execution rules, `HookMergeState` appends hook events and enforces active-directory conflicts, and `DenyReadMergeState` unions `permissions.filesystem.deny_read`. The final output is dropped to `None` if converting it back to TOML yields an empty document. Utility helpers `merge_output_source` and `composition_conflict` centralize provenance merging and conflict construction.
+Some fields are treated differently. Rules and hooks are processed from highest priority back down so the final output keeps the most important entries first. Denied file reads are combined as a union, so restrictions are not accidentally lost. The file also records the source of each setting, sometimes as a composite source when a table was built from more than one layer. If the final requirements are empty, it returns no requirements at all.
 
 #### Function details
 
@@ -2942,11 +2956,11 @@ After regular fields, the stack performs a second pass over layers in reverse or
 fn from(error: RequirementsCompositionError) -> Self
 ```
 
-**Purpose**: Converts a `RequirementsCompositionError` into an `std::io::Error` with kind `InvalidData`. This lets callers surface composition failures through I/O-oriented APIs.
+**Purpose**: Turns a requirements-composition error into a standard input/output error. This lets code that expects ordinary I/O-style failures still report bad requirements data cleanly.
 
-**Data flow**: Consumes a `RequirementsCompositionError`, passes it to `io::Error::new(io::ErrorKind::InvalidData, error)`, and returns the resulting `io::Error`.
+**Data flow**: It receives a detailed requirements error, wraps it as an invalid-data I/O error, and returns that new error. The original explanation is kept inside the wrapper so it can still be shown to a user or caller.
 
-**Call relations**: Used implicitly where a composition error must be adapted to an I/O error boundary.
+**Call relations**: This is the bridge from this file’s custom error type to Rust’s common I/O error type. It uses the standard error-construction call so callers outside this requirements code can treat malformed requirements like other bad data read from configuration.
 
 *Call graph*: 1 external calls (new).
 
@@ -2959,11 +2973,11 @@ fn compose_requirements(
 ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError>
 ```
 
-**Purpose**: Public entrypoint for composing requirements layers using the real hostname resolver. It is the production-facing wrapper around the more configurable helper.
+**Purpose**: This is the normal public entry point for combining requirement layers. Callers use it when they want the final requirements for the current machine.
 
-**Data flow**: Accepts an iterator of `RequirementsLayerEntry`, forwards it to `compose_requirements_with_hostname_resolver` together with `crate::host_name`, and returns the resulting optional composed requirements or composition error.
+**Data flow**: It takes an ordered set of requirement layer entries, supplies the project’s normal hostname lookup, and passes both into the deeper composition routine. It returns either a finished requirements object with source information, no object if everything was empty, or a composition error.
 
-**Call relations**: Top-level API used by non-test callers; it delegates all substantive work to the hostname-aware helper.
+**Call relations**: This function starts the standard composition path. It hands the work to compose_requirements_with_hostname_resolver, which adds the default hostname behavior before the stack is built and merged.
 
 *Call graph*: calls 1 internal fn (compose_requirements_with_hostname_resolver).
 
@@ -2977,11 +2991,11 @@ fn compose_requirements_for_hostname(
 ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositi
 ```
 
-**Purpose**: Test-only helper that composes layers against a fixed optional hostname while using the current platform's active hook directory field. It makes remote sandbox behavior deterministic in tests.
+**Purpose**: Provides a test-only way to compose requirements as if the machine had a specific hostname. This makes hostname-dependent requirements predictable in tests.
 
-**Data flow**: Takes layers and `Option<&str>`, clones the hostname into an owned `Option<String>` captured by a closure, computes `HookDirectoryField::current_platform()`, and forwards everything to `compose_requirements_with_hostname_resolver_and_hook_directory`.
+**Data flow**: It receives layers and an optional hostname string, stores that hostname in a small closure, chooses the current platform’s hook-directory field, and runs the full composition flow. The result is the same kind of final requirements object or error as the normal path.
 
-**Call relations**: Invoked by many tests in `stack_tests.rs` to exercise composition without depending on actual DNS or machine hostname.
+**Call relations**: Tests call this instead of the production entry point when they need to control hostname matching. It calls the shared composition routine directly, using HookDirectoryField::current_platform for the hook directory choice.
 
 *Call graph*: calls 2 internal fn (current_platform, compose_requirements_with_hostname_resolver_and_hook_directory).
 
@@ -2996,11 +3010,11 @@ fn compose_requirements_for_hostname_and_hook_directory(
 ) -> Re
 ```
 
-**Purpose**: Test-only helper that fixes both the hostname and which hook directory field is considered active. It allows explicit testing of Windows/non-Windows hook conflict behavior.
+**Purpose**: Provides an even more controlled test-only composition path. It lets tests choose both the hostname and which hook-directory field should be treated as active.
 
-**Data flow**: Accepts layers, optional hostname, and a `HookDirectoryField`; wraps the hostname in a cloning closure and forwards all inputs to `compose_requirements_with_hostname_resolver_and_hook_directory`.
+**Data flow**: It receives layers, an optional hostname, and a hook-directory selector. It turns the hostname into a reusable closure and sends all of that to the shared composition routine. The output is the final composed requirements, no requirements, or an error.
 
-**Call relations**: Used by hook-specific tests that need to simulate active `managed_dir` versus active `windows_managed_dir` independently of the build platform.
+**Call relations**: Tests use this when they need to check behavior that depends on both hostname and hook-directory platform rules. It goes straight to compose_requirements_with_hostname_resolver_and_hook_directory so no production defaults get in the way.
 
 *Call graph*: calls 1 internal fn (compose_requirements_with_hostname_resolver_and_hook_directory).
 
@@ -3014,11 +3028,11 @@ fn compose_requirements_with_hostname_resolver(
 ) -> Result<Option<ConfigRequirementsW
 ```
 
-**Purpose**: Internal wrapper that composes layers with an injected hostname resolver while still selecting the active hook directory from the current platform. It is the shared path for production and some tests.
+**Purpose**: Adds the normal hook-directory choice to a composition run where the hostname lookup has been supplied by the caller. This is useful when the caller wants custom hostname lookup but not custom hook-directory behavior.
 
-**Data flow**: Takes layers and a hostname resolver closure, computes `HookDirectoryField::current_platform()`, and delegates to `compose_requirements_with_hostname_resolver_and_hook_directory`.
+**Data flow**: It receives layers and a hostname-resolving function. It chooses the current platform’s hook-directory field and forwards everything to the most detailed composition routine. The result is whatever that routine produces.
 
-**Call relations**: Called by `compose_requirements`; tests also call it directly to verify lazy hostname resolution behavior.
+**Call relations**: compose_requirements calls this in the production path. This function then calls compose_requirements_with_hostname_resolver_and_hook_directory, filling in the platform-specific hook-directory default.
 
 *Call graph*: calls 2 internal fn (current_platform, compose_requirements_with_hostname_resolver_and_hook_directory); called by 1 (compose_requirements).
 
@@ -3032,11 +3046,11 @@ fn compose_requirements_with_hostname_resolver_and_hook_directory(
     hook_directory_
 ```
 
-**Purpose**: Builds and runs a full composition with injected hostname and hook-directory policies. It ensures hostname resolution is lazy and cached across all layers.
+**Purpose**: Runs the full composition process with all environment choices supplied: the layers, hostname lookup, and hook-directory platform field. This is the shared core used by both production and tests.
 
-**Data flow**: Accepts layers, a hostname resolver, and the active `HookDirectoryField`. It creates a `OnceCell<Option<String>>`, wraps the resolver in `cached_hostname_resolver` using `get_or_init`, constructs a `RequirementsLayerStack::new(hook_directory_field)`, feeds each layer through `stack.add_layer(layer, &cached_hostname_resolver)?`, then returns `stack.compose()`.
+**Data flow**: It receives requirement layers, a function that can find the hostname, and a hook-directory selector. It wraps the hostname lookup in a one-time cache so all layers see the same hostname and the lookup only happens if needed. Then it creates a RequirementsLayerStack, adds each parsed layer to it, and asks the stack to compose the final result.
 
-**Call relations**: This is the central orchestration helper called by all public/test entrypoints. It delegates normalization to `add_layer` and final merging to `compose`.
+**Call relations**: This is called by the production helper and by the test helpers. It creates the stack with RequirementsLayerStack::new, feeds it layers, and then moves into the stack’s compose step for the actual merging.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (compose_requirements_for_hostname, compose_requirements_for_hostname_and_hook_directory, compose_requirements_with_hostname_resolver); 1 external calls (new).
 
@@ -3047,11 +3061,11 @@ fn compose_requirements_with_hostname_resolver_and_hook_directory(
 fn new(hook_directory_field: HookDirectoryField) -> Self
 ```
 
-**Purpose**: Initializes an empty stack of normalized requirements layers with the chosen active hook directory field. It is the mutable accumulator used during composition setup.
+**Purpose**: Creates an empty stack that is ready to receive requirement layers. The stack remembers which hook-directory field applies to this platform or test scenario.
 
-**Data flow**: Takes `hook_directory_field`, creates an empty `Vec<ComposableRequirementsLayer>`, stores both fields, and returns `RequirementsLayerStack`.
+**Data flow**: It receives a hook-directory field, creates an empty list of composable layers, stores both pieces, and returns the new stack. Nothing is merged yet.
 
-**Call relations**: Constructed by `compose_requirements_with_hostname_resolver_and_hook_directory` before layers are added.
+**Call relations**: The shared composition routine calls this before adding layers. It is the starting container for the later add-layer and compose steps.
 
 *Call graph*: called by 1 (compose_requirements_with_hostname_resolver_and_hook_directory); 1 external calls (new).
 
@@ -3066,11 +3080,11 @@ fn add_layer(
     ) -> Result<(), RequirementsCompositionError>
 ```
 
-**Purpose**: Normalizes one raw layer entry and appends it to the stack. Parsing and per-layer transformations happen here, not during final merge.
+**Purpose**: Adds one raw requirement layer to the stack after converting it into the form needed for composition. This is where per-layer parsing and hostname-sensitive evaluation happen.
 
-**Data flow**: Takes mutable `self`, a `RequirementsLayerEntry`, and a hostname resolver reference. It calls `ComposableRequirementsLayer::from_entry(layer, hostname_resolver)?`, pushes the result into `self.layers`, and returns `Ok(())` or the parse/composition error from normalization.
+**Data flow**: It receives a layer entry and a hostname resolver. It converts the entry with ComposableRequirementsLayer::from_entry, which can fail if the layer cannot be parsed or evaluated. On success, it appends the converted layer to the stack and returns success.
 
-**Call relations**: Called once per input layer by `compose_requirements_with_hostname_resolver_and_hook_directory`.
+**Call relations**: The shared composition routine calls this for each incoming layer before final merging. It hands off parsing and layer preparation to ComposableRequirementsLayer::from_entry so the stack only stores layers that are ready to merge.
 
 *Call graph*: calls 1 internal fn (from_entry).
 
@@ -3083,11 +3097,11 @@ fn compose(
     ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError>
 ```
 
-**Purpose**: Performs the actual two-phase merge of all normalized layers into `ConfigRequirementsWithSources`. It combines generic TOML precedence with custom mergers for rules, hooks, and deny-read permissions.
+**Purpose**: Combines all prepared layers into the final requirements object. It applies ordinary config merging first, then applies special rules for fields that cannot safely be merged as plain TOML.
 
-**Data flow**: Consumes `self`, initializes `merged_toml` as an empty table, and folds `layer.regular_toml` into it with `merge_toml_values` in original low-to-high order. It parses the merged TOML into `ConfigRequirementsToml`, creates a default `ConfigRequirementsWithSources`, and fills regular sourced fields via `populate_merged_regular_fields_with_sources`. It then initializes `rules = None`, `hooks = HookMergeState::new(hook_directory_field)`, `hooks_output = None`, and `deny_read = DenyReadMergeState::default()`. Iterating `layers.iter().rev()`, it merges domain fields with `super::rules::merge`, `hooks.merge(...)?`, and `deny_read.merge(...)`. Finally it assigns `output.rules`, `output.hooks`, applies deny-read into `output.permissions`, checks whether `output.clone().into_toml().is_empty()`, and returns `Some(output)` only when non-empty.
+**Data flow**: It starts with an empty TOML table and folds in each layer’s ordinary TOML from low priority to high priority. It parses that merged TOML into the requirements type, copies regular fields into the output along with source information, then processes special fields from high priority to low priority: rules, hooks, and denied file reads. Finally it returns no value if the output is empty, or the completed requirements with sources if anything was set.
 
-**Call relations**: Called once after all layers are added. It is the central merger and delegates field-specific behavior to helpers in sibling modules.
+**Call relations**: This is the main work step after layers have been added to the stack. It uses merge_toml_values for normal TOML merging, calls populate_merged_regular_fields_with_sources to attach source information, and then delegates special merging to the rules, hooks, and deny-read merger helpers.
 
 *Call graph*: calls 4 internal fn (merge_toml_values, new, merge, populate_merged_regular_fields_with_sources); 4 external calls (Table, default, default, new).
 
@@ -3102,11 +3116,11 @@ fn populate_merged_regular_fields_with_sources(
 )
 ```
 
-**Purpose**: Transfers regular merged requirement fields from `ConfigRequirementsToml` into `ConfigRequirementsWithSources` while attaching provenance. It explicitly enumerates every top-level field that belongs to the ordinary TOML merge path.
+**Purpose**: Copies the normally merged requirements fields into the final output and records where each value came from. This gives users and diagnostics a way to explain which layer supplied a setting.
 
-**Data flow**: Takes mutable `output`, the merged typed `requirements`, and the normalized `layers`. It destructures `ConfigRequirementsToml`, ignoring special fields like `remote_sandbox_config`, `hooks`, and `rules`. For each ordinary optional field, the `set_sourced!` macro wraps present values in `Sourced::new(value, source_for_top_level_keys(layers, keys))`. `guardian_policy_config` gets extra filtering so blank strings are omitted. It mutates `output` in place and returns nothing.
+**Data flow**: It receives the output object, the parsed merged requirements, and the prepared layers. For each regular field that is present, it wraps the value in a Sourced object containing both the value and the source found by source_for_top_level_keys. It intentionally skips fields that have special merge rules, and it ignores an empty guardian policy string.
 
-**Call relations**: Called by `RequirementsLayerStack::compose` immediately after parsing the merged regular TOML. It relies on `source_for_top_level_keys` to compute provenance.
+**Call relations**: RequirementsLayerStack::compose calls this after ordinary TOML has been merged and parsed. This function repeatedly asks source_for_top_level_keys to identify the winning or composite source for each top-level setting.
 
 *Call graph*: calls 2 internal fn (new, source_for_top_level_keys); called by 1 (compose); 1 external calls (set_sourced!).
 
@@ -3120,11 +3134,11 @@ fn source_for_top_level_keys(
 ) -> RequirementSource
 ```
 
-**Purpose**: Determines which layer source should be attached to a merged top-level field. Scalars and arrays use the winning highest-priority source, while merged tables may produce a composite source reflecting multiple contributors.
+**Purpose**: Finds which requirement source should be credited for a top-level field in the merged output. For tables, it can report a combined source when several layers contributed pieces.
 
-**Data flow**: Reads `layers` and a list of candidate top-level keys. It collects every layer whose `regular_toml` contains one of those keys using `top_level_value_for_keys`, then takes the last match as the winning source/value. If there is no match, it returns `RequirementSource::Unknown`. If the winning value is not a table, it returns the winning source directly. If it is a table, it walks matching layers in reverse priority order, collects sources whose values are tables, and returns `RequirementSource::composite(table_sources)` when more than one table contributed; otherwise it returns the winning source.
+**Data flow**: It receives the prepared layers and one or more possible top-level key names. It scans layers for that field, keeps the last matching layer as the winner for simple values, and returns Unknown if no layer had the field. If the winning value is a table and multiple layers contributed tables, it returns a composite source made from those layers.
 
-**Call relations**: Used by `populate_merged_regular_fields_with_sources` for every regular field to attach accurate provenance after TOML merging.
+**Call relations**: populate_merged_regular_fields_with_sources calls this whenever it wraps a regular value with source information. It uses top_level_value_for_keys to look inside each layer’s TOML table.
 
 *Call graph*: calls 1 internal fn (composite); called by 1 (populate_merged_regular_fields_with_sources); 1 external calls (iter).
 
@@ -3135,11 +3149,11 @@ fn source_for_top_level_keys(
 fn top_level_value_for_keys(value: &'a TomlValue, keys: &[&str]) -> Option<&'a TomlValue>
 ```
 
-**Purpose**: Looks up the first present top-level TOML value among a small set of alternative keys. It supports fields whose serialized key names differ from internal field names.
+**Purpose**: Looks for one of several possible names at the top level of a TOML value. This supports fields that may have more than one accepted key name.
 
-**Data flow**: Takes `&TomlValue` and a slice of key strings, obtains the top-level table with `as_table()`, scans the keys in order, and returns the first matching `&TomlValue` if any.
+**Data flow**: It receives a TOML value and a list of key names. If the value is a table, it checks those names and returns the first matching value it finds; if the value is not a table or none of the keys exist, it returns nothing.
 
-**Call relations**: Called by `source_for_top_level_keys` while searching each layer's regular TOML for the field that contributed to a sourced output.
+**Call relations**: source_for_top_level_keys relies on this small lookup helper while scanning every layer. It uses the TOML table view provided by as_table before checking keys.
 
 *Call graph*: 1 external calls (as_table).
 
@@ -3150,11 +3164,11 @@ fn top_level_value_for_keys(value: &'a TomlValue, keys: &[&str]) -> Option<&'a T
 fn merge_output_source(existing: &mut RequirementSource, incoming: &RequirementSource)
 ```
 
-**Purpose**: Combines provenance when two different requirement sources contribute to one composed output field. Equal sources are left unchanged; differing ones become a composite source.
+**Purpose**: Combines source labels when one output value has been built from more than one requirement layer. This prevents later merging from hiding the fact that multiple files contributed.
 
-**Data flow**: Mutably reads `existing` and compares it to `incoming`. If they differ, it replaces `*existing` with `RequirementSource::composite([existing.clone(), incoming.clone()])`.
+**Data flow**: It receives a mutable existing source and an incoming source. If they are different, it replaces the existing source with a composite source containing both; if they are the same, it leaves the source unchanged.
 
-**Call relations**: Shared utility used by the rules merger, hook merger, and deny-read source accumulator whenever multiple layers contribute to one output.
+**Call relations**: Special merge code elsewhere calls this while combining fields such as hooks, permissions, or other domain-specific outputs. It delegates to RequirementSource::composite to build the combined source label.
 
 *Call graph*: calls 1 internal fn (composite); called by 3 (merge, merge_source, merge); 1 external calls (clone).
 
@@ -3170,24 +3184,24 @@ fn composition_conflict(
 ) -> RequirementsCompositionError
 ```
 
-**Purpose**: Constructs a standardized `RequirementsCompositionError::Conflict` value for field-level merge failures. It centralizes the shape of conflict diagnostics.
+**Purpose**: Creates a clear conflict error when two requirement layers cannot be safely combined. It packages the field name, both sources, and a human-readable explanation.
 
-**Data flow**: Consumes a field name, existing and incoming sources, and any message convertible into `String`, then returns `RequirementsCompositionError::Conflict { ... }` with the message materialized.
+**Data flow**: It receives the conflicting field name, the existing source, the incoming source, and an error message. It turns the message into a string and returns a RequirementsCompositionError::Conflict containing all of that context.
 
-**Call relations**: Called by hook merging when active managed hook directories disagree across layers.
+**Call relations**: Special merge logic calls this when it detects an unsafe conflict, such as an active singleton value that cannot have two competing definitions. The returned error travels back through the composition flow so loading can fail closed instead of silently choosing a risky result.
 
 *Call graph*: called by 1 (merge_active_singleton); 1 external calls (into).
 
 
 ### `hooks/src/config_rules.rs`
 
-`domain_logic` · `hook discovery / config interpretation`
+`config` · `config load and hook discovery`
 
-This file extracts per-hook persisted state from configuration layers and merges it into a single `HashMap<String, HookStateToml>`. The central rule is intentionally narrow: only `ConfigLayerSource::User` and `ConfigLayerSource::SessionFlags` are allowed to write hook state, even though other layers may declare hooks. `hook_states_from_stack` walks the provided `ConfigLayerStack` in lowest-precedence-first order, including disabled layers, so later eligible layers can override earlier ones while preserving the same semantics used elsewhere for user preferences.
+Hooks are pieces of behavior that can run at certain moments, such as before a tool is used. The system needs to remember user choices about those hooks, for example whether a hook is enabled or whether a particular hook file hash has been trusted. This file builds that “effective” hook state from the layered configuration stack.
 
-For each eligible layer, it looks up `config["hooks"]["state"]`, requires that value to be a `TomlValue::Table`, and then iterates each hook key entry. Each entry is cloned and converted with `try_into()` into `HookStateToml`; malformed entries are skipped rather than failing the whole load. Keys are trimmed and empty keys are ignored. Merging is field-by-field: `enabled` and `trusted_hash` are only overwritten when the newer layer explicitly provides that field. This prevents a partial later write from erasing an earlier field value.
+A configuration stack is like a pile of notes where later notes can override earlier ones. This file reads the pile from lowest priority to highest priority, but it only listens to two kinds of notes: the user’s own configuration and session flags passed for the current run. That matters because project or plugin configuration may be allowed to discover hooks, but it must not silently change whether the user has enabled or trusted them.
 
-The test module exercises precedence, cross-layer field merging, and resilience to malformed unrelated hook config or malformed state entries. The helper builders serialize `HookStateToml` through JSON into `TomlValue` fixtures to mimic realistic config structures.
+For each allowed layer, it looks under `hooks.state`. If that section is missing, malformed, or contains bad entries, it skips the bad parts instead of failing the whole process. When the same hook appears in multiple layers, later layers win one field at a time. So a later setting can update only `trusted_hash` without accidentally deleting an earlier `enabled` choice. The tests check these safety rules: precedence, field-by-field merging, and ignoring malformed hook-related data.
 
 #### Function details
 
@@ -3199,11 +3213,11 @@ fn hook_states_from_stack(
 ) -> HashMap<String, HookStateToml>
 ```
 
-**Purpose**: Builds the effective per-hook state map from the subset of config layers allowed to override user hook preferences. It merges `enabled` and `trusted_hash` independently so partial updates do not erase existing fields.
+**Purpose**: Builds the final saved state for hooks from the configuration layers that are allowed to affect user preferences. It returns a map from each hook’s unique key to its remembered settings, such as whether it is enabled or which hash is trusted.
 
-**Data flow**: It takes an optional `&ConfigLayerStack`; `None` immediately yields an empty `HashMap`. For each layer in precedence order, it reads the layer source, filters to user and session-flag layers, extracts `hooks.state` from the layer’s TOML tree, requires a table, converts each entry into `HookStateToml`, trims and validates the key, and then merges non-`None` fields into the accumulated map entry. It returns the final `HashMap<String, HookStateToml>` without mutating external state.
+**Data flow**: It receives an optional configuration layer stack. If there is no stack, it returns an empty map. Otherwise, it walks through the layers from lowest priority to highest priority, reads only user and session-flag layers, looks for `hooks.state`, converts each valid entry into hook state, trims and checks the hook key, and merges fields into the output map. The result is a clean set of effective hook states, with later allowed layers overriding earlier ones only for the fields they actually provide.
 
-**Call relations**: This function is called by `discover_handlers` before hook discovery so discovery can apply persisted enablement and trust decisions. It does not delegate to other local helpers; its main control-flow decisions are layer-source filtering and tolerant skipping of malformed state values.
+**Call relations**: During hook discovery, `discover_handlers` calls this function to learn what the user or current session has already said about hooks. This function does not discover hooks itself; it supplies the trusted and enabled state that discovery can apply when deciding how hooks should behave.
 
 *Call graph*: called by 1 (discover_handlers); 2 external calls (new, matches!).
 
@@ -3214,11 +3228,11 @@ fn hook_states_from_stack(
 fn hook_states_from_stack_respects_layer_precedence()
 ```
 
-**Purpose**: Verifies that later eligible layers override earlier ones for the same hook key. The test specifically checks that a session-flags `enabled=true` value wins over a user-layer `enabled=false` value.
+**Purpose**: Checks that a higher-priority layer can override a lower-priority layer for the same hook. In plain terms, it verifies that a session choice can beat an older saved user choice.
 
-**Data flow**: It constructs a `ConfigLayerStack` with two entries using helper fixture builders, invokes `hook_states_from_stack(Some(&stack))`, and compares the returned map against the expected single merged `HookStateToml` using `assert_eq!`.
+**Data flow**: The test builds a stack with two layers for the same hook key: a user layer saying the hook is disabled, and a session-flags layer saying it is enabled. It runs `hook_states_from_stack` and compares the result with the expected map. The expected outcome is that the hook ends up enabled.
 
-**Call relations**: This test invokes the production function under a two-layer precedence scenario. It relies on the helper `config_with_hook_override` to build realistic layer configs.
+**Call relations**: This test exercises the main function in the situation where two allowed layers disagree. It proves that the layer ordering used by `hook_states_from_stack` gives the later, higher-priority layer the final say.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (default, assert_eq!, vec!).
 
@@ -3229,11 +3243,11 @@ fn hook_states_from_stack_respects_layer_precedence()
 fn hook_states_from_stack_merges_fields_across_layers()
 ```
 
-**Purpose**: Checks that field-by-field merging preserves earlier fields when a later layer only supplies another field. It demonstrates that `enabled` from one layer and `trusted_hash` from another coexist in the result.
+**Purpose**: Checks that hook state is merged one field at a time instead of replacing the whole record. This prevents a later partial update from erasing an earlier setting.
 
-**Data flow**: It builds a two-layer stack where the first layer sets `enabled` and the second sets only `trusted_hash`, runs `hook_states_from_stack`, and asserts that the returned map contains both fields on the same hook key.
+**Data flow**: The test creates a user layer that sets `enabled` and a session-flags layer that sets only `trusted_hash` for the same hook. It passes the stack into `hook_states_from_stack` and expects the final result to contain both pieces of information. The output should keep the earlier enabled value and add the later trusted hash.
 
-**Call relations**: This test exercises the merge semantics implemented in `hook_states_from_stack`. It uses `config_with_hook_state` to create exact `HookStateToml` payloads for each layer.
+**Call relations**: This test focuses on the merge behavior inside `hook_states_from_stack`. It shows why the function updates individual fields rather than overwriting the entire hook state each time it sees the same key.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (default, assert_eq!, vec!).
 
@@ -3244,11 +3258,11 @@ fn hook_states_from_stack_merges_fields_across_layers()
 fn hook_states_from_stack_ignores_malformed_hook_events()
 ```
 
-**Purpose**: Confirms that malformed non-state hook configuration does not interfere with extracting valid `hooks.state` entries. The test guards against accidental coupling between hook event parsing and state parsing.
+**Purpose**: Checks that unrelated or malformed hook event configuration does not prevent valid hook state from being read. This makes the configuration reader tolerant of bad data outside the `hooks.state` section.
 
-**Data flow**: It constructs a `TomlValue` containing a valid `hooks.state` table plus an invalid `hooks.SessionStart` value, wraps that in a one-layer `ConfigLayerStack`, calls `hook_states_from_stack`, and asserts that the valid state entry is still returned.
+**Data flow**: The test builds a configuration where `hooks.state` contains a valid saved state, while another hook-related entry has the wrong shape. It creates a stack from that configuration, runs `hook_states_from_stack`, and expects the valid state to be returned. The malformed event entry is ignored.
 
-**Call relations**: This test calls the production function with a mixed-validity config document. It demonstrates that `hook_states_from_stack` only reads the `hooks.state` subtree and ignores malformed event declarations.
+**Call relations**: This test supports the main function’s narrow focus: it only reads saved hook state, not the full hook event configuration. It confirms that bad event definitions do not interfere with state loading.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (default, assert_eq!, from_value, json!, vec!).
 
@@ -3259,11 +3273,11 @@ fn hook_states_from_stack_ignores_malformed_hook_events()
 fn hook_states_from_stack_ignores_malformed_state_entries()
 ```
 
-**Purpose**: Ensures malformed individual state entries are skipped without discarding valid sibling entries. This protects persisted hook state loading from one bad record poisoning the whole map.
+**Purpose**: Checks that one bad saved-state entry does not spoil all the good ones. This helps the system recover gracefully if a config file contains a typo or wrong value type.
 
-**Data flow**: It builds a config where one hook state entry deserializes correctly and another has an invalid `enabled` type, creates a stack, runs `hook_states_from_stack`, and asserts that only the valid entry appears in the returned map.
+**Data flow**: The test creates a `hooks.state` table with one valid hook entry and one malformed entry whose `enabled` value is not a true-or-false value. It runs `hook_states_from_stack` and expects only the valid hook state to appear in the result. The malformed entry is skipped.
 
-**Call relations**: This test targets the per-entry `try_into()` failure path inside `hook_states_from_stack`. It uses direct TOML/JSON fixture construction rather than helper wrappers to include malformed data.
+**Call relations**: This test verifies the error-tolerant path inside `hook_states_from_stack`. It shows that the function treats each saved hook entry separately, so a single bad entry does not block hook discovery from using the rest.
 
 *Call graph*: calls 1 internal fn (new); 5 external calls (default, assert_eq!, from_value, json!, vec!).
 
@@ -3274,11 +3288,11 @@ fn hook_states_from_stack_ignores_malformed_state_entries()
 fn config_with_hook_override(key: &str, enabled: Option<bool>) -> TomlValue
 ```
 
-**Purpose**: Builds a minimal hook-state config fixture that only varies the `enabled` field. It is a convenience wrapper used by precedence-focused tests.
+**Purpose**: Creates a small test configuration for a hook with just an `enabled` setting. It is a convenience helper so the tests can describe their intent without repeating setup details.
 
-**Data flow**: It accepts a hook key and an `Option<bool>` for `enabled`, constructs a `HookStateToml` with `trusted_hash: None`, and forwards both to `config_with_hook_state`. It returns the resulting `TomlValue` fixture.
+**Data flow**: It receives a hook key and an optional true-or-false enabled value. It wraps that value in a `HookStateToml` structure with no trusted hash, then passes it to `tests::config_with_hook_state`. The output is a TOML-like configuration value containing `hooks.state` for that hook.
 
-**Call relations**: This helper is only used by tests that care about enablement precedence. It delegates all actual fixture serialization and TOML shaping to `config_with_hook_state`.
+**Call relations**: The precedence test uses this helper when it only needs to vary whether a hook is enabled. The helper then hands off to `tests::config_with_hook_state`, which does the actual conversion into the configuration shape used by the main function.
 
 *Call graph*: 1 external calls (config_with_hook_state).
 
@@ -3289,10 +3303,10 @@ fn config_with_hook_override(key: &str, enabled: Option<bool>) -> TomlValue
 fn config_with_hook_state(key: &str, state: HookStateToml) -> TomlValue
 ```
 
-**Purpose**: Constructs a `TomlValue` fixture containing a `hooks.state` table with one serialized `HookStateToml` entry. It centralizes the test-side shape of hook-state config documents.
+**Purpose**: Builds a small TOML-like configuration value containing one hook state entry. It keeps the tests short and ensures they all create configuration data in the same shape.
 
-**Data flow**: It takes a hook key and a `HookStateToml`, serializes the state to JSON with `serde_json::to_value`, embeds that value under `hooks.state.<key>` in a JSON object, then deserializes the whole object into `TomlValue` and returns it.
+**Data flow**: It receives a hook key and a `HookStateToml` value. It converts the hook state into a JSON-like value, places it under `hooks.state` using the given key, and converts that into the `TomlValue` format used by the configuration system. The result is a ready-to-use config layer value for tests.
 
-**Call relations**: This helper underpins the test fixtures for the file. Other tests and helpers call it to produce realistic config payloads consumed by `hook_states_from_stack`.
+**Call relations**: The tests and the simpler `tests::config_with_hook_override` helper rely on this function to create realistic config input. That input is then placed into config layers and passed to `hook_states_from_stack`.
 
 *Call graph*: 3 external calls (from_value, json!, to_value).

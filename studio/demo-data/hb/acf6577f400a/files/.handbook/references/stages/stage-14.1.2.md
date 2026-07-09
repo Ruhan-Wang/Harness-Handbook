@@ -1,10 +1,10 @@
 # Guardian review and mediated approval sessions  `stage-14.1.2`
 
-This stage is the mediated approval path that runs during the main execution loop whenever an action must be reviewed by the Guardian before proceeding. It sits between a concrete approval-triggering event and the final allow/deny decision, packaging the request, launching a constrained nested review, and reporting the outcome back to the session and UI.
+This stage is a behind-the-scenes safety checkpoint in the main work loop. Before Codex takes a risky action, such as running a command, changing files, using the network, or calling an external MCP tool, Guardian may review it instead of immediately asking the user. It acts like a careful supervisor beside the main worker.
 
-At its foundation, core/src/guardian/mod.rs defines the shared Guardian types and constants and enforces the per-turn circuit breaker that stops a turn after too many automatic denials. core/src/guardian/approval_request.rs turns raw approval events into the canonical Guardian request model and renders that model into the JSON, analytics, action, and human-readable forms used downstream. core/src/guardian/prompt.rs then constructs the reviewer prompt from session history plus the exact request, while also parsing the reviewer’s structured assessment and trimming transcripts to keep prompts stable.
+The front door in `guardian/mod.rs` decides when Guardian can automatically allow or deny a request, and includes a safety brake if too many actions are rejected. `approval_request.rs` describes the kinds of actions that may need approval and reshapes them for prompts, logs, safety checks, and conversation records. `prompt.rs` builds the message sent to the Guardian reviewer and reads the reviewer’s structured JSON answer.
 
-On the orchestration side, core/src/session/review.rs opens a dedicated review sub-turn with restricted capabilities and review-specific context. core/src/guardian/review_session.rs executes and reuses nested Guardian sessions, including forks, deadlines, and cancellation. Finally, core/src/guardian/review.rs coordinates the full workflow: routing, retries, metrics, event publication, rejection persistence, and circuit-breaker-aware final decisions.
+The review itself runs as a separate mini-session. `session/review.rs` sets up that special review turn with its own model, limits, tools, and user-interface signal. `review_session.rs` manages whether to reuse an existing reviewer or start a temporary one, then handles timeouts and cancellation. Finally, `review.rs` turns the reviewer’s decision into an approved, denied, timed-out, or aborted result for the session, interface, and analytics.
 
 ## Files in this stage
 
@@ -13,11 +13,13 @@ Defines the guardian subsystem’s shared types and the approval-request model t
 
 ### `core/src/guardian/mod.rs`
 
-`domain_logic` · `cross-cutting guardian setup and per-turn denial tracking`
+`domain_logic` · `request handling`
 
-This module is the root of the guardian approval-review subsystem. Beyond wiring submodules together, it defines the constants that shape guardian behavior: the 90-second review timeout, the reviewer name used for subagent identification, transcript and action truncation budgets, and the denial thresholds used to stop pathological loops. It also declares the structured `GuardianAssessment` contract returned by the reviewer, the stored `GuardianRejection` rationale/source pair used for later user-facing messaging, and the `GuardianRejectionCircuitBreaker` state machine.
+The guardian is a safety reviewer for planned actions. When the main system is about to do something that normally needs user approval, the guardian can inspect the recent conversation, the planned action, and the policy rules, then return a strict allow-or-deny answer. This file ties that subsystem together: it declares the guardian submodules, re-exports the important pieces other code should use, and defines shared limits such as review timeout, transcript size caps, and denial thresholds.
 
-The circuit breaker tracks denial history per turn ID in a `HashMap<String, GuardianRejectionCircuitBreakerTurn>`. Each turn record stores a consecutive-denial counter, a bounded `VecDeque<bool>` of recent review outcomes, and a latch indicating whether an interrupt has already been triggered. `record_denial` increments the consecutive counter with saturation, appends a `true` into the sliding window, counts recent denials, and emits `InterruptTurn` exactly once when either the consecutive threshold or recent-window threshold is crossed. `record_non_denial` resets only the consecutive counter while still appending `false` into the recent window, so the rolling-rate threshold remains meaningful. `clear_turn` removes all state for a completed or discarded turn.
+The most active logic in this file is the rejection circuit breaker. A circuit breaker is like a fuse box: if too many unsafe-looking actions are rejected in a short span, it trips so the system stops pushing forward in the same turn. It tracks rejection history separately for each turn, using the turn ID as the key. It watches two patterns: too many denials in a row, or too many denials within a recent sliding window. Once either limit is reached, it returns an instruction to interrupt the turn. It only triggers once per turn, so repeated denials after that do not cause repeated interrupts.
+
+Without this file, other parts of the system would lack a single shared guardian interface and would not have this guardrail against repeatedly attempting actions the guardian has already judged unsafe.
 
 #### Function details
 
@@ -27,11 +29,11 @@ The circuit breaker tracks denial history per turn ID in a `HashMap<String, Guar
 fn clear_turn(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Deletes all denial-tracking state for a specific turn ID. This resets both consecutive and rolling-window history for that turn.
+**Purpose**: This forgets all guardian denial history for one conversation turn. It is used when a turn is finished or no longer needs tracking, so old rejections do not affect later work.
 
-**Data flow**: Takes `&mut self` and a `turn_id: &str`, removes the corresponding entry from the internal `turns: HashMap<String, GuardianRejectionCircuitBreakerTurn>`, and returns nothing.
+**Data flow**: It receives a turn ID as text. It looks up that ID in the circuit breaker's stored turn map and removes the matching entry if one exists. Nothing is returned; the only change is that the stored counters and recent-denial history for that turn are gone.
 
-**Call relations**: This is a simple state-reset operation used when a turn no longer needs guardian denial history. It does not delegate further.
+**Call relations**: This is the cleanup step for the circuit breaker. Other guardian review flow code can call it when a turn should no longer be monitored, so later calls to denial or non-denial recording start fresh for that turn ID.
 
 
 ##### `GuardianRejectionCircuitBreaker::record_denial`  (lines 103–120)
@@ -40,11 +42,11 @@ fn clear_turn(&mut self, turn_id: &str)
 fn record_denial(&mut self, turn_id: &str) -> GuardianRejectionCircuitBreakerAction
 ```
 
-**Purpose**: Records one denied guardian review for a turn and decides whether the turn should now be interrupted. It enforces both the consecutive-denial threshold and the rolling recent-denial threshold.
+**Purpose**: This records that the guardian rejected an action for a specific turn and decides whether that pattern is now serious enough to interrupt the turn. It protects the system from repeatedly trying actions that are being denied.
 
-**Data flow**: Accepts `&mut self` and `turn_id`. It looks up or creates the per-turn state, increments `consecutive_denials` with saturation, appends a denied marker via `record_recent_review`, counts `true` values in `recent_denials`, and returns either `GuardianRejectionCircuitBreakerAction::InterruptTurn { consecutive_denials, recent_denials }` if thresholds are crossed for the first time, or `Continue` otherwise. It also sets `interrupt_triggered = true` when it emits the interrupt action.
+**Data flow**: It receives a turn ID. It finds or creates the tracking record for that turn, increases the count of back-to-back denials, and records this review as a denial in the recent history by calling `record_recent_review`. It then counts how many denials are in the recent window. If this is the first time the turn has crossed either denial limit, it marks the turn as interrupted and returns `InterruptTurn` with the current counts. Otherwise it returns `Continue`.
 
-**Call relations**: This method is called by guardian review orchestration after a denial. It delegates the sliding-window maintenance to `record_recent_review`, then performs the threshold check itself so callers can decide whether to abort the turn.
+**Call relations**: This is called after a guardian review says no. It relies on `record_recent_review` to keep the sliding recent-history list up to date, then hands the caller a simple next step: keep going, or interrupt the current turn because the denial pattern has crossed the safety threshold.
 
 *Call graph*: 1 external calls (record_recent_review).
 
@@ -55,11 +57,11 @@ fn record_denial(&mut self, turn_id: &str) -> GuardianRejectionCircuitBreakerAct
 fn record_non_denial(&mut self, turn_id: &str)
 ```
 
-**Purpose**: Records an approved, aborted, timed-out, or otherwise non-denial review outcome for a turn. It clears the consecutive-denial streak without erasing the rolling recent-review window.
+**Purpose**: This records that a guardian review did not reject an action. It resets the back-to-back denial count while still keeping a note in the recent review history.
 
-**Data flow**: Takes `&mut self` and `turn_id`, looks up or creates the turn state, sets `consecutive_denials` to zero, appends `false` into `recent_denials` through `record_recent_review`, and returns nothing.
+**Data flow**: It receives a turn ID. It finds or creates the tracking record for that turn, sets the consecutive-denial counter back to zero, and calls `record_recent_review` with a non-denial marker. It returns nothing; it only updates the stored state for that turn.
 
-**Call relations**: Called by guardian review orchestration whenever a review should not count as a denial for interruption purposes. It shares the same recent-window bookkeeping helper as `record_denial`.
+**Call relations**: This is called when a guardian review allows an action or otherwise does not count as a rejection. It uses the same recent-history helper as `record_denial`, so the circuit breaker has a balanced view of both denied and not-denied reviews.
 
 *Call graph*: 1 external calls (record_recent_review).
 
@@ -70,22 +72,22 @@ fn record_non_denial(&mut self, turn_id: &str)
 fn record_recent_review(turn: &mut GuardianRejectionCircuitBreakerTurn, denied: bool)
 ```
 
-**Purpose**: Maintains the bounded sliding window of recent review outcomes for one turn. It ensures the deque never grows beyond `AUTO_REVIEW_DENIAL_WINDOW_SIZE`.
+**Purpose**: This keeps the short recent-history list for one turn at a fixed size. It is the helper that lets the circuit breaker ask, 'How many of the latest reviews were denials?'
 
-**Data flow**: Mutates a `GuardianRejectionCircuitBreakerTurn` by pushing `denied` onto `recent_denials`. If the deque length exceeds the configured window size, it pops the oldest entry from the front. It returns nothing.
+**Data flow**: It receives the stored tracking record for a turn and a true-or-false value saying whether the latest review was denied. It adds that value to the back of the recent-history queue. If the queue has grown beyond the configured window size, it removes the oldest entry from the front. It returns nothing; the queue is updated in place.
 
-**Call relations**: This private helper is used by both `record_denial` and `record_non_denial` so the rolling-window logic stays consistent across all review outcomes.
+**Call relations**: Both `record_denial` and `record_non_denial` call this helper after each guardian review. By centralizing the sliding-window update here, both paths keep the recent review history in the same shape before the denial-counting logic uses it.
 
 
 ### `core/src/guardian/approval_request.rs`
 
-`domain_logic` · `guardian request handling`
+`domain_logic` · `request handling during Guardian review`
 
-This file models every approval request Guardian can review through the `GuardianApprovalRequest` enum: shell commands, unified exec commands, Unix `execve`, patch application, network access, MCP tool calls, and permission requests. Supporting structs such as `GuardianNetworkAccessTrigger`, `GuardianMcpAnnotations`, and several private `*ApprovalAction` serializers define the exact JSON shape emitted for each request type. Optional fields are consistently omitted with `skip_serializing_if`, keeping prompts and telemetry compact.
+Guardian is the part of the system that reviews potentially risky actions before they happen. This file is its shared “request form” drawer. Each variant of GuardianApprovalRequest describes one kind of thing the assistant might want to do: run a shell command, execute a program, edit files with a patch, reach the network, call an MCP tool, or ask for broader permissions.
 
-The conversion functions serve different downstream consumers. `guardian_approval_request_to_json` produces structured JSON for prompt rendering, using specialized serializers for command-like actions and direct `json!` construction for patches. `guardian_assessment_action` maps requests into `GuardianAssessmentAction`, preserving enough semantic detail for policy/assessment logic, while `guardian_reviewed_action` strips each request down to the analytics-oriented `GuardianReviewedAction` variant. Two small helpers expose the target item id and effective turn id used by the review loop.
+The file then provides several ways to look at the same request. For a human- or model-facing approval prompt, it turns the request into JSON, with fields like the command, working directory, host, port, or tool name. For safety assessment, it creates a more compact GuardianAssessmentAction that focuses on the facts needed to judge risk. For analytics, it creates a GuardianReviewedAction that records what kind of action was reviewed without carrying every detail.
 
-A notable feature is recursive truncation for prompt display. `format_guardian_action_pretty` first serializes the request to `serde_json::Value`, then `truncate_guardian_action_value` walks strings, arrays, and objects recursively, truncating long strings with `guardian_truncate_text` and returning a `FormattedGuardianAction` that records whether any truncation occurred. Object keys are sorted before reconstruction, making pretty-printed output deterministic for prompts and tests.
+One important detail is formatting. Some action data can be very large, such as long patches or tool arguments. Before pretty-printing the JSON for a Guardian prompt, the file walks through every string inside it and truncates overly long text. It also sorts object keys, so the formatted result is stable and easier to compare. In short, this file keeps Guardian requests consistent, readable, and safe to pass between the review system, prompts, and reporting.
 
 #### Function details
 
@@ -95,11 +97,11 @@ A notable feature is recursive truncation for prompt display. `format_guardian_a
 fn serialize_guardian_action(value: impl Serialize) -> serde_json::Result<Value>
 ```
 
-**Purpose**: Serializes any `Serialize` value into a `serde_json::Value` for Guardian prompt/rendering pipelines.
+**Purpose**: This small helper turns any serializable Guardian action shape into a JSON value. It exists so the rest of the file can build typed Rust structs first, then convert them into a common JSON form for prompts or review messages.
 
-**Data flow**: Consumes `value: impl Serialize`, passes it to `serde_json::to_value`, and returns the resulting `serde_json::Result<Value>`.
+**Data flow**: It receives a value that knows how to serialize itself. It passes that value to JSON conversion and returns either the resulting JSON value or a serialization error if something cannot be represented.
 
-**Call relations**: Used as the common serialization primitive by `serialize_command_guardian_action` and several branches of `guardian_approval_request_to_json`.
+**Call relations**: The more specific conversion functions call this when they have built the right action shape. guardian_approval_request_to_json uses it for several request types, and serialize_command_guardian_action uses it for command-like requests.
 
 *Call graph*: called by 2 (guardian_approval_request_to_json, serialize_command_guardian_action); 1 external calls (to_value).
 
@@ -115,11 +117,11 @@ fn serialize_command_guardian_action(
     additional_permissions: Option
 ```
 
-**Purpose**: Builds and serializes the JSON payload for shell-like command approval requests. It standardizes the shared fields between shell and unified exec requests.
+**Purpose**: This helper builds the JSON description for command-style approvals, such as shell commands and unified exec commands. It keeps those two similar request types from duplicating the same serialization code.
 
-**Data flow**: Reads `tool`, `command`, `cwd`, `sandbox_permissions`, optional `additional_permissions`, optional `justification`, and optional `tty`; constructs a `CommandApprovalAction` borrowing those fields; passes it to `serialize_guardian_action`; and returns the JSON result.
+**Data flow**: It receives the tool name, command arguments, current directory, sandbox permissions, optional extra permissions, optional justification, and optional terminal setting. It wraps those pieces in a command approval structure, then turns that structure into JSON.
 
-**Call relations**: Called from `guardian_approval_request_to_json` for `Shell` and `ExecCommand` variants so both share one JSON shape.
+**Call relations**: guardian_approval_request_to_json calls this when it sees a Shell or ExecCommand request. This helper then hands the final conversion off to serialize_guardian_action.
 
 *Call graph*: calls 1 internal fn (serialize_guardian_action); called by 1 (guardian_approval_request_to_json).
 
@@ -134,11 +136,11 @@ fn command_assessment_action(
 ) -> GuardianAssessmentAction
 ```
 
-**Purpose**: Converts a command request into the `GuardianAssessmentAction::Command` form used by Guardian assessment logic.
+**Purpose**: This creates the compact safety-assessment version of a command request. It turns a list of command words into a single shell-like command string, while preserving where the command would run.
 
-**Data flow**: Reads `source`, `command`, and `cwd`; shell-joins the command vector with `codex_shell_command::parse_command::shlex_join`; clones `cwd`; and returns `GuardianAssessmentAction::Command { source, command, cwd }`.
+**Data flow**: It receives the command source, the command as a list of strings, and the working directory. It joins the command list into readable shell text, clones the directory, and returns a GuardianAssessmentAction::Command value.
 
-**Call relations**: Used by `guardian_assessment_action` for both `Shell` and `ExecCommand` variants.
+**Call relations**: guardian_assessment_action calls this for Shell and ExecCommand requests. It delegates the command-string formatting to shlex_join, which produces a readable and safely quoted command line.
 
 *Call graph*: calls 1 internal fn (shlex_join); called by 1 (guardian_assessment_action); 1 external calls (clone).
 
@@ -149,11 +151,11 @@ fn command_assessment_action(
 fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static str
 ```
 
-**Purpose**: Maps a Unix `GuardianCommandSource` to the tool name string used in serialized `Execve` approval actions.
+**Purpose**: On Unix systems, this maps a command source to the tool name used in Guardian JSON. It makes sure an execve request is labeled consistently as either coming from the shell flow or the unified exec flow.
 
-**Data flow**: Reads `source`, matches `Shell` to `"shell"` and `UnifiedExec` to `"exec_command"`, and returns the static string.
+**Data flow**: It receives a GuardianCommandSource value. It matches that source and returns the fixed text label "shell" or "exec_command".
 
-**Call relations**: Called only from the Unix `Execve` branch of `guardian_approval_request_to_json`.
+**Call relations**: guardian_approval_request_to_json calls this when serializing Unix-only Execve requests. The returned label becomes the JSON tool field shown to Guardian.
 
 *Call graph*: called by 1 (guardian_approval_request_to_json).
 
@@ -164,11 +166,11 @@ fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static 
 fn truncate_guardian_action_value(value: Value) -> (Value, bool)
 ```
 
-**Purpose**: Recursively truncates long strings inside a serialized Guardian action while preserving overall JSON structure and reporting whether truncation occurred.
+**Purpose**: This walks through a JSON value and shortens any string that is too large for a Guardian action display. It also reports whether anything was shortened, so callers can warn or mark the output as truncated.
 
-**Data flow**: Consumes a `serde_json::Value`; for `String`, calls `guardian_truncate_text` with `GUARDIAN_MAX_ACTION_STRING_TOKENS`; for `Array`, recursively truncates each element and ORs their truncation flags; for `Object`, sorts entries by key, recursively truncates each value, and rebuilds the object; for other scalar values, returns them unchanged. Returns `(Value, bool)`.
+**Data flow**: It receives a JSON value. If the value is a string, it truncates it using the Guardian text limit. If it is an array, it checks each item. If it is an object, it sorts the keys for stable output and checks each value. It returns the possibly changed JSON plus a true-or-false flag saying whether truncation happened.
 
-**Call relations**: Used by `format_guardian_action_pretty` after JSON serialization and before pretty-printing. It ensures prompt text stays bounded and deterministic.
+**Call relations**: format_guardian_action_pretty calls this after building the raw JSON for an approval request. This function relies on guardian_truncate_text for the actual text shortening and rebuilds JSON strings, arrays, and objects as needed.
 
 *Call graph*: calls 1 internal fn (guardian_truncate_text); called by 1 (format_guardian_action_pretty); 3 external calls (Array, Object, String).
 
@@ -181,11 +183,11 @@ fn guardian_approval_request_to_json(
 ) -> serde_json::Result<Value>
 ```
 
-**Purpose**: Serializes each `GuardianApprovalRequest` variant into the exact JSON object shown to Guardian or downstream consumers.
+**Purpose**: This converts any Guardian approval request into the detailed JSON form used for display or prompt construction. It is the main bridge from the internal request enum to a readable structured description.
 
-**Data flow**: Reads `action`, pattern-matches on its variant, and for each branch either calls `serialize_command_guardian_action`, constructs an `ExecveApprovalAction`, uses `serde_json::json!` for `ApplyPatch`, or serializes one of the other private action structs. Returns `serde_json::Result<Value>`.
+**Data flow**: It receives a GuardianApprovalRequest. It looks at which kind of request it is, selects the useful fields, and builds JSON with a tool name and relevant details such as command, directory, files, patch text, network target, MCP metadata, or requested permissions. It returns the JSON or an error if serialization fails.
 
-**Call relations**: This is the main serialization entry point used by `format_guardian_action_pretty`. It delegates variant-specific formatting to helper serializers and private action structs.
+**Call relations**: format_guardian_action_pretty calls this before making a prompt-friendly string. Inside, it uses serialize_command_guardian_action for command requests, serialize_guardian_action for typed action structs, guardian_command_source_tool_name for Unix execve labeling, and direct JSON construction for patch requests.
 
 *Call graph*: calls 3 internal fn (guardian_command_source_tool_name, serialize_command_guardian_action, serialize_guardian_action); called by 1 (format_guardian_action_pretty); 1 external calls (json!).
 
@@ -198,11 +200,11 @@ fn guardian_assessment_action(
 ) -> GuardianAssessmentAction
 ```
 
-**Purpose**: Maps a `GuardianApprovalRequest` into the semantic `GuardianAssessmentAction` consumed by Guardian review logic.
+**Purpose**: This converts a full approval request into the smaller action description used for Guardian risk assessment. It keeps the facts needed to judge the action, while leaving out details that are only needed for display or tracking.
 
-**Data flow**: Reads `action`, matches on its variant, and constructs the corresponding `GuardianAssessmentAction`, cloning owned fields like commands, paths, strings, permissions, and MCP metadata as needed.
+**Data flow**: It receives a GuardianApprovalRequest. Based on the request type, it copies or clones the relevant data into a GuardianAssessmentAction: command details, patch files, network endpoint, MCP tool identity, or requested permissions. The result is a compact assessment object.
 
-**Call relations**: Called by `run_guardian_review` to feed the assessment engine. It delegates command variants to `command_assessment_action` and handles other variants inline.
+**Call relations**: run_guardian_review calls this when it needs to ask Guardian to assess an action. For shell-like commands, this function hands off to command_assessment_action so command formatting stays consistent.
 
 *Call graph*: calls 1 internal fn (command_assessment_action); called by 1 (run_guardian_review).
 
@@ -215,11 +217,11 @@ fn guardian_reviewed_action(
 ) -> GuardianReviewedAction
 ```
 
-**Purpose**: Converts a request into the analytics-oriented `GuardianReviewedAction` summarizing what kind of action Guardian reviewed.
+**Purpose**: This creates the analytics-friendly record of what Guardian reviewed. It records the kind of action and selected important attributes, without carrying the full request payload.
 
-**Data flow**: Reads `request`, matches on its variant, and constructs the corresponding `GuardianReviewedAction`, copying scalar fields and cloning optional permission or metadata payloads where needed.
+**Data flow**: It receives a GuardianApprovalRequest. It matches the request type and returns a GuardianReviewedAction containing summary fields such as sandbox permissions, extra permissions, terminal use, program name, network protocol and port, or MCP tool identity.
 
-**Call relations**: Called by `run_guardian_review` after review decisions to emit analytics about the reviewed action.
+**Call relations**: run_guardian_review calls this after or during review to produce the reviewed-action record used by analytics. Unlike the JSON formatting path, this function does not call other helpers; it directly maps request variants into analytics variants.
 
 *Call graph*: called by 1 (run_guardian_review).
 
@@ -230,11 +232,11 @@ fn guardian_reviewed_action(
 fn guardian_request_target_item_id(request: &GuardianApprovalRequest) -> Option<&str>
 ```
 
-**Purpose**: Extracts the item id associated with a Guardian request when one exists. Network access requests intentionally have no target item id.
+**Purpose**: This finds the conversation item ID that a Guardian request is attached to, when such an ID exists. That lets the review system connect an approval decision back to the specific command, patch, tool call, or permission request in the conversation.
 
-**Data flow**: Reads `request`, matches on its variant, returns `Some(id)` for shell, exec, patch, MCP, request-permissions, and Unix execve variants, and `None` for `NetworkAccess`.
+**Data flow**: It receives a GuardianApprovalRequest. For request types that carry an id, it returns that id as text. For network access requests, it returns nothing because this request type is tracked differently and does not expose a target item ID here.
 
-**Call relations**: Used by `run_guardian_review` when associating review results with a specific target item.
+**Call relations**: run_guardian_review calls this when it needs to tie the review result to a target item. This function only extracts the ID; it does not create or modify any request.
 
 *Call graph*: called by 1 (run_guardian_review).
 
@@ -248,11 +250,11 @@ fn guardian_request_turn_id(
 ) -> &'a str
 ```
 
-**Purpose**: Returns the effective turn id for a Guardian request, falling back to a caller-supplied default for request types that do not carry their own turn id.
+**Purpose**: This chooses which conversation turn ID should be associated with a Guardian request. Some request types carry their own turn ID, while others should use the caller’s default turn ID.
 
-**Data flow**: Reads `request` and `default_turn_id`; returns the embedded `turn_id` for `NetworkAccess` and `RequestPermissions`, otherwise returns `default_turn_id`.
+**Data flow**: It receives a GuardianApprovalRequest and a default turn ID. If the request is NetworkAccess or RequestPermissions, it returns the turn ID stored in the request. For other request types, it returns the default provided by the caller.
 
-**Call relations**: Called by `run_guardian_review` to attribute review activity to the correct conversation turn.
+**Call relations**: run_guardian_review calls this while preparing review context. It acts like a simple routing rule for conversation tracking: use the request’s own turn ID when it has one, otherwise fall back to the surrounding turn.
 
 *Call graph*: called by 1 (run_guardian_review).
 
@@ -265,11 +267,11 @@ fn format_guardian_action_pretty(
 ) -> serde_json::Result<FormattedGuardianAction>
 ```
 
-**Purpose**: Produces a pretty-printed JSON string for a Guardian request along with a flag indicating whether any nested strings were truncated.
+**Purpose**: This produces a readable, pretty-printed JSON string for a Guardian approval request. It is used when the system needs to show or include the action details in a prompt without letting very large strings overwhelm the review.
 
-**Data flow**: Reads `action`, serializes it with `guardian_approval_request_to_json`, recursively truncates the resulting `Value` with `truncate_guardian_action_value`, pretty-prints it via `serde_json::to_string_pretty`, and returns `FormattedGuardianAction { text, truncated }`.
+**Data flow**: It receives a GuardianApprovalRequest. First it converts the request to JSON, then truncates any oversized strings inside that JSON, then formats the final JSON with indentation. It returns the formatted text together with a flag saying whether anything was shortened.
 
-**Call relations**: Used by `build_guardian_prompt_items_with_parent_turn` when constructing prompt content for Guardian review. It composes the file’s serialization and truncation helpers into the final display form.
+**Call relations**: build_guardian_prompt_items_with_parent_turn calls this when building the Guardian prompt items. This function ties together guardian_approval_request_to_json, truncate_guardian_action_value, and JSON pretty-printing into one prompt-ready result.
 
 *Call graph*: calls 2 internal fn (guardian_approval_request_to_json, truncate_guardian_action_value); called by 1 (build_guardian_prompt_items_with_parent_turn); 1 external calls (to_string_pretty).
 
@@ -279,11 +281,15 @@ Builds the reviewer-facing prompt and parses structured review results for guard
 
 ### `core/src/guardian/prompt.rs`
 
-`domain_logic` · `guardian request assembly and guardian response parsing`
+`domain_logic` · `approval review`
 
-This file contains the guardian prompt assembly logic. It first reduces raw `ResponseItem` history into `GuardianTranscriptEntry` values that preserve user, assistant, selected developer, and tool evidence while skipping contextual scaffolding. Tool calls and outputs are retained with synthetic roles like `tool read_file call` and `tool read_file result`, using a `call_id -> tool name` map so outputs can be labeled even when they arrive later. Transcript rendering then applies separate token budgets for human conversation and tool evidence, truncates each entry individually, anchors on the first and last user turns when possible, and fills remaining budget from newest relevant entries. Omitted entries produce a note rather than silently disappearing.
+When Codex wants to do something that needs approval, the Guardian needs a clear packet of evidence: what happened in the conversation, what tools were used, what action is now being requested, and what answer format is expected. This file builds that packet.
 
-Prompt construction supports both full and delta modes. A `GuardianTranscriptCursor` captures the parent history version and retained entry count; if a later review reuses the same history version and the cursor is still valid, only the unseen suffix is rendered with original numbering preserved. The assembled `GuardianPromptItems` are emitted as multiple `UserInput::Text` segments with explicit transcript and approval-request boundaries, optional parent-turn denied-read context, and special wording for network-access reviews that emphasizes evaluating the triggering command rather than the exact socket target. On the response side, `parse_guardian_assessment` accepts strict JSON or a prose-wrapped JSON object, fills defaults for omitted risk level, authorization, and rationale, and returns a concrete `GuardianAssessment`.
+It first turns the session history into a smaller transcript. It keeps the important human conversation, assistant messages, and tool calls or results, while skipping noisy setup messages. Then it trims long entries so the Guardian does not receive an oversized prompt. It uses separate space budgets for normal conversation and tool evidence, so a huge tool result cannot crowd out what the user actually asked for.
+
+The file can build either a full prompt or a delta prompt. A delta prompt is like saying, “Since you already reviewed the earlier pages, here are only the new pages.” If the saved cursor no longer matches the session history, it safely falls back to the full transcript.
+
+Finally, this file defines the Guardian’s required answer shape: strict JSON with an allow or deny outcome, optional risk details, and a rationale. It also contains the policy prompt assembly, combining a policy template with tenant-specific policy text.
 
 #### Function details
 
@@ -293,11 +299,11 @@ Prompt construction supports both full and delta modes. A `GuardianTranscriptCur
 fn role(&self) -> &str
 ```
 
-**Purpose**: Returns the textual role label used when rendering transcript entries for the guardian prompt.
+**Purpose**: Returns the label that should appear in the Guardian transcript for this kind of entry, such as user, assistant, developer, or a named tool role. This makes the rendered transcript readable to the reviewing model.
 
-**Data flow**: Reads `self` and returns `developer`, `user`, `assistant`, or the inner tool-role string for `Tool(String)`.
+**Data flow**: It reads the entry kind stored in the enum. It converts that kind into a short role string. It returns that string without changing anything.
 
-**Call relations**: Used during transcript rendering so each retained entry is prefixed with a stable human-readable role.
+**Call relations**: When transcript entries are rendered for Guardian review, the rendering code asks each entry kind for its display role so every line is clearly marked with who or what produced it.
 
 
 ##### `GuardianTranscriptEntryKind::is_user`  (lines 55–57)
@@ -306,11 +312,11 @@ fn role(&self) -> &str
 fn is_user(&self) -> bool
 ```
 
-**Purpose**: Identifies whether a transcript entry kind represents a user message.
+**Purpose**: Checks whether a transcript entry came from the user. This matters because user messages are treated as key evidence for authorization.
 
-**Data flow**: Matches `self` against `GuardianTranscriptEntryKind::User` and returns a boolean.
+**Data flow**: It receives an entry kind. It tests whether that kind is the user variant. It returns true for user entries and false for all others.
 
-**Call relations**: Called by transcript rendering to apply user-anchor selection and message-budget logic.
+**Call relations**: The transcript selection logic uses this check to protect important user turns, especially the first and latest user messages, when deciding what fits into the Guardian prompt.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -321,11 +327,11 @@ fn is_user(&self) -> bool
 fn is_tool(&self) -> bool
 ```
 
-**Purpose**: Identifies whether a transcript entry kind represents tool evidence.
+**Purpose**: Checks whether a transcript entry is tool-related. Tool entries have their own size budget so tool logs do not overwhelm the human conversation.
 
-**Data flow**: Matches `self` against `GuardianTranscriptEntryKind::Tool(_)` and returns a boolean.
+**Data flow**: It receives an entry kind. It tests whether that kind represents a tool call or tool result. It returns a simple yes or no.
 
-**Call relations**: Used by transcript rendering to choose per-entry truncation caps and the separate tool-token budget.
+**Call relations**: The transcript renderer uses this check when choosing token limits and when deciding whether an entry should count against the tool budget or the conversation budget.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -341,11 +347,11 @@ async fn build_guardian_prompt_items(
 ) -> serde_json::Result<GuardianPromp
 ```
 
-**Purpose**: Test-visible convenience wrapper that builds guardian prompt items without a parent-turn permission context.
+**Purpose**: Builds the Guardian prompt for tests and simpler callers that do not need extra parent-turn permission context. It is a convenience wrapper around the fuller prompt builder.
 
-**Data flow**: Accepts a `Session`, optional retry reason, `GuardianApprovalRequest`, and `GuardianPromptMode`, forwards them to `build_guardian_prompt_items_with_parent_turn` with `parent_turn` set to `None`, and returns the resulting `GuardianPromptItems` or JSON serialization error.
+**Data flow**: It receives a session, an optional retry reason, the approval request, and whether to build a full or delta prompt. It passes those along with no parent turn. It returns the completed Guardian prompt items or a JSON formatting error.
 
-**Call relations**: Used by tests and any caller that does not need parent-turn denied-read context. The real work is delegated to `build_guardian_prompt_items_with_parent_turn`.
+**Call relations**: This function immediately hands the work to build_guardian_prompt_items_with_parent_turn. It exists so callers can use the same prompt-building path without having to supply a parent turn.
 
 *Call graph*: calls 1 internal fn (build_guardian_prompt_items_with_parent_turn).
 
@@ -361,11 +367,11 @@ async fn build_guardian_prompt_items_with_parent_turn(
     mode: G
 ```
 
-**Purpose**: Constructs the full guardian user-input payload, including transcript, session ID, optional omission notes, optional parent permission context, and the exact planned action JSON. It chooses between full and delta transcript layouts based on the supplied prompt mode and current history version.
+**Purpose**: Creates the actual list of user-facing prompt items sent to the Guardian reviewer. It packages the transcript, session id, optional retry reason, permission warnings, and the exact action JSON under review.
 
-**Data flow**: Reads the parent `session`, optional `parent_turn`, optional `retry_reason`, approval `request`, and `mode`. It clones session history, converts raw items with `collect_guardian_transcript_entries`, computes a fresh `GuardianTranscriptCursor`, pretty-prints the action via `format_guardian_action_pretty`, decides whether the requested delta cursor is still reusable, renders either the full transcript or only the unseen suffix, and pushes a sequence of `UserInput::Text` items into a vector. It includes the reviewed session ID, omission note, optional denied-read context from `parent_turn_denied_reads_context`, and request-specific explanatory text; for network access it omits retry reason and uses specialized guidance. It returns `GuardianPromptItems { items, transcript_cursor, reviewed_action_truncated }`.
+**Data flow**: It starts with the current session history, optional parent turn, optional retry reason, approval request, and prompt mode. It copies the history, filters it into Guardian transcript entries, formats the proposed action as JSON, chooses full or delta transcript text, and appends clear headings and boundaries. It returns the prompt items, a cursor showing how much transcript has now been reviewed, and a flag saying whether the action JSON had to be shortened.
 
-**Call relations**: This is the main prompt builder. It is called by the wrapper above and by review-session execution when submitting a guardian turn. It delegates transcript extraction and rendering to `collect_guardian_transcript_entries`, `render_guardian_transcript_entries`, and `render_guardian_transcript_entries_with_offset`, and action formatting to `format_guardian_action_pretty`.
+**Call relations**: This is the central builder used when running a Guardian review. It relies on transcript collection, transcript rendering, action formatting, and optional parent-turn permission context, then hands a clean prompt packet back to the review runner.
 
 *Call graph*: calls 4 internal fn (format_guardian_action_pretty, collect_guardian_transcript_entries, render_guardian_transcript_entries, render_guardian_transcript_entries_with_offset); called by 2 (build_guardian_prompt_items, run_review_on_session); 3 external calls (new, clone_history, format!).
 
@@ -376,11 +382,11 @@ async fn build_guardian_prompt_items_with_parent_turn(
 fn parent_turn_denied_reads_context(turn: &TurnContext) -> Option<String>
 ```
 
-**Purpose**: Summarizes parent-turn filesystem read restrictions into a warning block for the guardian prompt. It only emits text when the active permission profile actually denies some roots or globs.
+**Purpose**: Creates a warning for the Guardian when the parent turn’s permission profile says certain files, folders, or path patterns must not be read. This helps prevent approving an escalation whose real purpose is to bypass those read restrictions.
 
-**Data flow**: Reads a `TurnContext`, extracts its cwd and filesystem sandbox policy, gathers unreadable roots and glob patterns relative to cwd, formats them as bullet lines, and returns `Some(String)` containing the explanatory paragraph plus entries, or `None` if there are no denied reads.
+**Data flow**: It receives a parent turn context and reads its working directory and file-system permission policy. It gathers unreadable roots and glob patterns into bullet points. If there are any, it returns a formatted warning string; otherwise it returns nothing.
 
-**Call relations**: Called from `build_guardian_prompt_items_with_parent_turn` when a parent turn is available, so guardian can avoid approving escalations whose purpose is to read explicitly denied paths.
+**Call relations**: The main prompt builder calls this when a parent turn is available. If it returns a warning, that warning is inserted into the Guardian prompt before the approval request.
 
 *Call graph*: 1 external calls (format!).
 
@@ -393,11 +399,11 @@ fn render_guardian_transcript_entries(
 ) -> (Vec<String>, Option<String>)
 ```
 
-**Purpose**: Renders retained transcript entries using the default numbering offset and empty placeholder.
+**Purpose**: Turns retained transcript entries into short, numbered text lines for a full Guardian review prompt. It also reports when some entries had to be left out.
 
-**Data flow**: Takes a slice of `GuardianTranscriptEntry`, forwards it to `render_guardian_transcript_entries_with_offset` with offset `0` and placeholder `<no retained transcript entries>`, and returns the rendered lines plus optional omission note.
+**Data flow**: It receives the filtered transcript entries. It asks the offset-aware renderer to number them from the beginning and to use a full-transcript empty placeholder if there are no entries. It returns rendered transcript lines plus an optional omission note.
 
-**Call relations**: Used by full prompt construction. It is a thin wrapper around the offset-aware renderer.
+**Call relations**: The main prompt builder uses this for full reviews. It delegates the real selection and trimming work to render_guardian_transcript_entries_with_offset.
 
 *Call graph*: calls 1 internal fn (render_guardian_transcript_entries_with_offset); called by 1 (build_guardian_prompt_items_with_parent_turn).
 
@@ -412,11 +418,11 @@ fn render_guardian_transcript_entries_with_offset(
 ) -> (Vec<String>, Option<String>)
 ```
 
-**Purpose**: Selects, truncates, numbers, and renders transcript entries under separate message and tool budgets. It preserves original numbering when rendering deltas and reports when entries were omitted.
+**Purpose**: Selects and formats the transcript evidence that will fit into the Guardian prompt. It keeps the most useful user and recent non-user evidence while respecting size limits.
 
-**Data flow**: Consumes a slice of entries, an `entry_number_offset`, and an `empty_placeholder`. If the slice is empty it returns a one-line placeholder and no omission note. Otherwise it pre-renders each entry with role prefix and per-entry truncation via `guardian_truncate_text`, computes approximate token counts, marks included entries according to the selection policy (first user, last user if budget allows, remaining users newest-first, then recent non-user entries newest-first under message/tool budgets and `GUARDIAN_RECENT_ENTRY_LIMIT`), collects included rendered strings in original order, and returns them with `Some("Some conversation entries were omitted.")` if any entries were skipped.
+**Data flow**: It receives transcript entries, a numbering offset, and text to show if the list is empty. It truncates each entry if needed, estimates its size, chooses which entries fit into message and tool budgets, and formats selected entries as numbered lines. It returns those lines and an omission note if anything was skipped.
 
-**Call relations**: Called by both full and delta prompt assembly, and by the simpler wrapper. It relies on `GuardianTranscriptEntryKind::is_user`, `is_tool`, and `role`, plus `guardian_truncate_text`, to enforce the guardian transcript design.
+**Call relations**: Full prompts and delta prompts both use this renderer. It calls the text truncation helper for each entry, then gives the prompt builder a compact transcript that is small enough to send to the Guardian.
 
 *Call graph*: called by 2 (build_guardian_prompt_items_with_parent_turn, render_guardian_transcript_entries); 4 external calls (is_empty, iter, len, vec!).
 
@@ -429,11 +435,11 @@ fn collect_guardian_transcript_entries(
 ) -> Vec<GuardianTranscriptEntry>
 ```
 
-**Purpose**: Filters raw session history down to the human-readable and tool-evidence entries that guardian should review. It intentionally excludes contextual user scaffolding and most developer messages.
+**Purpose**: Filters raw session history into the conversation and tool evidence that the Guardian should review. It removes synthetic context that would add noise and keeps useful user, assistant, and tool information.
 
-**Data flow**: Reads a slice of `ResponseItem` and iterates in order, building `GuardianTranscriptEntry` values. User messages are kept unless `is_contextual_user_message_content` says they are synthetic context; developer messages are kept only if their text starts with `AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX`; assistant messages and plaintext agent messages are retained as assistant entries; shell/function/custom/web-search calls are serialized into tool-call entries; function/custom tool outputs are converted to text and labeled using a `HashMap` from `call_id` to tool name when available. Empty or whitespace-only text is dropped. It returns the retained entries in original order.
+**Data flow**: It receives raw response items from the session history. It walks through them one by one, converts message content and tool data into plain text, skips empty or contextual-only entries, remembers tool names by call id, and labels tool results with the right tool name when possible. It returns a clean list of Guardian transcript entries.
 
-**Call relations**: Called by `build_guardian_prompt_items_with_parent_turn` before transcript rendering. It delegates content extraction to `content_items_to_text` and `plaintext_agent_message_content`, and uses the contextual-message predicate to avoid duplicating startup context in the guardian transcript.
+**Call relations**: The main prompt builder calls this before rendering the transcript. Its output is the raw material that later gets trimmed, selected, numbered, and placed into the Guardian prompt.
 
 *Call graph*: calls 3 internal fn (content_items_to_text, is_contextual_user_message_content, plaintext_agent_message_content); called by 1 (build_guardian_prompt_items_with_parent_turn); 4 external calls (new, new, Tool, to_string).
 
@@ -444,11 +450,11 @@ fn collect_guardian_transcript_entries(
 fn guardian_truncate_text(content: &str, token_cap: usize) -> (String, bool)
 ```
 
-**Purpose**: Truncates oversized text to an approximate token budget while preserving both prefix and suffix context and inserting an XML-like omission marker. It is designed for prompt readability rather than exact token accounting.
+**Purpose**: Shortens long text so it can fit inside a token budget, while clearly marking that content was omitted. A token is a rough chunk of text used by language models to measure prompt size.
 
-**Data flow**: Takes `content` and a `token_cap`. If the content is empty or already within the approximate byte budget from `approx_bytes_for_tokens`, it returns the original string and `false`. Otherwise it estimates omitted tokens from the dropped byte count, builds a `<truncated omitted_approx_tokens="..." />` marker, splits the remaining byte budget between prefix and suffix, computes UTF-8-safe boundaries with `split_guardian_truncation_bounds`, and returns the stitched string plus `true`.
+**Data flow**: It receives text and a token cap. It estimates how many bytes fit in that cap; if the text already fits, it returns the original text and false. If it is too long, it keeps a safe prefix and suffix, inserts an omission marker with an approximate omitted-token count, and returns the shortened text with true.
 
-**Call relations**: Used by transcript rendering and by action formatting code elsewhere in the guardian subsystem to keep prompts bounded while still exposing the start and end of long payloads.
+**Call relations**: Transcript rendering uses this kind of truncation, and action formatting code also calls it through truncation paths for Guardian action values. It depends on split_guardian_truncation_bounds to avoid cutting text in the middle of a character.
 
 *Call graph*: calls 1 internal fn (split_guardian_truncation_bounds); called by 1 (truncate_guardian_action_value); 4 external calls (new, approx_bytes_for_tokens, approx_tokens_from_byte_count, format!).
 
@@ -463,11 +469,11 @@ fn split_guardian_truncation_bounds(
 ) -> (&str, &str)
 ```
 
-**Purpose**: Finds UTF-8-safe slice boundaries for the prefix and suffix portions of a truncated string.
+**Purpose**: Finds safe prefix and suffix slices for shortened text without breaking multi-byte characters. This is important because some characters, such as emoji or non-Latin letters, take more than one byte.
 
-**Data flow**: Reads `content`, desired `prefix_bytes`, and `suffix_bytes`. It walks `char_indices()` to find the largest valid prefix end not exceeding the prefix budget and the earliest valid suffix start at or after the suffix target, ensures the suffix does not overlap the prefix, and returns borrowed `(&str, &str)` slices.
+**Data flow**: It receives the original text plus byte budgets for the beginning and end. It walks character by character to find valid cut points. It returns two string slices: the safe prefix and the safe suffix.
 
-**Call relations**: This is the low-level helper used only by `guardian_truncate_text` to avoid splitting inside multibyte characters.
+**Call relations**: guardian_truncate_text calls this after deciding how much room is available around the omission marker. This helper keeps truncation valid and prevents malformed text.
 
 *Call graph*: called by 1 (guardian_truncate_text).
 
@@ -478,11 +484,11 @@ fn split_guardian_truncation_bounds(
 fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<GuardianAssessment>
 ```
 
-**Purpose**: Parses the guardian reviewer’s final message into a `GuardianAssessment`, tolerating a prose wrapper around the JSON object and filling sensible defaults for omitted optional fields.
+**Purpose**: Reads the Guardian reviewer’s final answer and turns it into the program’s internal assessment object. It accepts strict JSON, and also tries to recover if the JSON is wrapped in extra prose.
 
-**Data flow**: Accepts `Option<&str>`. If absent, it returns an error stating that no assessment payload was produced. It first tries to deserialize the whole string as `GuardianAssessmentPayload`; if that fails, it searches for the outermost `{...}` slice and retries deserialization on that substring. It then derives `risk_level` from the payload or defaults it to `Low` for allow and `High` for deny, derives `user_authorization` or defaults to `Unknown`, normalizes blank or missing rationale into canned allow/deny messages, and returns a populated `GuardianAssessment`.
+**Data flow**: It receives optional text from the Guardian. If there is no text, it returns an error. It tries to parse the whole text as JSON; if that fails, it tries the substring between the first opening brace and last closing brace. It fills in safe defaults for missing risk level, user authorization, or rationale, then returns a GuardianAssessment.
 
-**Call relations**: Called by guardian review execution after the nested review session completes. It is the thin recovery layer between model output drift and the stricter internal assessment type.
+**Call relations**: The Guardian review session calls this after the model finishes. Its output is what the rest of the approval flow uses to allow or deny the requested action.
 
 *Call graph*: called by 1 (run_guardian_review_session_before_deadline); 1 external calls (bail!).
 
@@ -493,11 +499,11 @@ fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<GuardianAsses
 fn guardian_output_schema() -> Value
 ```
 
-**Purpose**: Returns the JSON schema supplied to the model as the guardian review’s final-output contract.
+**Purpose**: Builds the JSON schema that tells the Guardian model what final answer shape is expected. The schema requires an outcome and limits fields to known values.
 
-**Data flow**: Constructs and returns a `serde_json::Value` object schema with `additionalProperties: false`, optional `risk_level`, `user_authorization`, and `rationale` properties, and required `outcome` constrained to `allow` or `deny`.
+**Data flow**: It creates a JSON object describing allowed fields: risk level, user authorization, outcome, and rationale. It marks extra fields as not allowed and requires only the outcome. It returns that schema value.
 
-**Call relations**: Used by guardian review execution and tests so the request-side schema and parser-side expectations stay aligned.
+**Call relations**: Review setup code uses this schema when asking the Guardian for structured final output. Tests also use it to confirm review parameters stay aligned.
 
 *Call graph*: called by 2 (run_guardian_review, test_review_params); 1 external calls (json!).
 
@@ -508,11 +514,11 @@ fn guardian_output_schema() -> Value
 fn guardian_output_contract_prompt() -> &'static str
 ```
 
-**Purpose**: Provides the textual prompt fragment that explains the strict JSON output contract to the guardian model.
+**Purpose**: Provides the plain-text instructions that explain the Guardian’s required JSON answer format. It mirrors the schema in words so the model knows how to respond.
 
-**Data flow**: Returns a static string literal describing read-only tool checks, the bare low-risk allow form, and the full JSON schema shape for other cases.
+**Data flow**: It takes no input. It returns a fixed string explaining that the Guardian may use read-only checks and must finish with strict JSON, including the minimal allow form for low-risk actions.
 
-**Call relations**: Appended by `guardian_policy_prompt_with_config` so the human-readable policy prompt and machine-readable schema remain synchronized.
+**Call relations**: guardian_policy_prompt_with_config appends this text to the policy prompt. Keeping it near the schema helps the code and prompt stay consistent.
 
 
 ##### `guardian_policy_prompt`  (lines 695–697)
@@ -521,11 +527,11 @@ fn guardian_output_contract_prompt() -> &'static str
 fn guardian_policy_prompt() -> String
 ```
 
-**Purpose**: Builds the default guardian policy prompt using the bundled `policy.md` tenant-policy content.
+**Purpose**: Builds the default Guardian policy prompt using the project’s bundled policy file. This is the main way the review session gets its standing safety instructions.
 
-**Data flow**: Loads `policy.md` with `include_str!`, passes it to `guardian_policy_prompt_with_config`, and returns the resulting prompt string.
+**Data flow**: It reads the bundled policy text from policy.md at compile time. It passes that policy text into the configurable prompt builder. It returns the final complete policy prompt string.
 
-**Call relations**: Used when no workspace-managed guardian policy override is configured. It delegates final assembly to `guardian_policy_prompt_with_config`.
+**Call relations**: Review setup can call this when it wants the default policy. The detailed assembly is delegated to guardian_policy_prompt_with_config.
 
 *Call graph*: calls 1 internal fn (guardian_policy_prompt_with_config); 1 external calls (include_str!).
 
@@ -536,11 +542,11 @@ fn guardian_policy_prompt() -> String
 fn guardian_policy_prompt_with_config(tenant_policy_config: &str) -> String
 ```
 
-**Purpose**: Builds the full guardian developer/base prompt by injecting tenant policy text into the markdown template and appending the output-contract instructions.
+**Purpose**: Combines the Guardian policy template with a supplied tenant policy configuration and the required JSON output instructions. This supports different policy settings while keeping the overall prompt structure fixed.
 
-**Data flow**: Loads `policy_template.md`, trims trailing whitespace, replaces `{tenant_policy_config}` with the trimmed supplied config text, appends two newlines plus `guardian_output_contract_prompt()`, and returns the final `String`.
+**Data flow**: It receives tenant-specific policy text. It reads the bundled policy template, replaces the template placeholder with the trimmed tenant policy text, appends the output contract prompt, and returns the final policy prompt.
 
-**Call relations**: Called by `guardian_policy_prompt` and by guardian review session config building when a workspace-managed guardian policy override is present.
+**Call relations**: guardian_policy_prompt calls this with the default bundled policy. Other code or tests can use it to build the same policy shape with a custom configuration.
 
 *Call graph*: called by 1 (guardian_policy_prompt); 2 external calls (format!, include_str!).
 
@@ -552,9 +558,11 @@ Sets up review-mode turns and runs the reusable nested guardian review sessions 
 
 `orchestration` · `request handling`
 
-This file contains the session-side setup for review execution as a child task. The single async routine clones the parent turn’s runtime context, but deliberately rewrites several pieces of state so review runs in a constrained, isolated mode. It chooses the review model from `Config.review_model` when present, otherwise falls back to the parent turn’s model slug, then asks `models_manager` both for concrete `model_info` and the current `available_models` list. Before constructing the child context, it disables review-inappropriate features (`Feature::WebSearchRequest`, `Feature::WebSearchCached`, and `Feature::Goals`) and forces `WebSearchMode::Disabled`; if config requirements reject that assignment, it logs a warning and keeps the constrained fallback value instead of failing.
+This file exists so the system can ask the model to review something without disturbing the main conversation turn. Think of it like opening a side notebook for a proofreader: it uses information from the main session, but it has its own instructions and some stricter rules.
 
-The function builds a per-turn `Config`, computes `ToolMode` from the model’s declared mode or feature flags (`CodeModeOnly`, `CodeMode`, else `Direct`), and derives `UnifiedExecShellMode` from the filtered feature set and shell configuration. It also forks telemetry, auth/provider handles, reasoning settings, thread/session metadata, extension data, and inherited skills into a fresh `TurnContext`. Important invariants are encoded here: review turns have `developer_instructions` and `user_instructions` cleared, `multi_agent_version` forced to `Disabled`, `final_output_json_schema` removed, and fresh atomic flags / timing / terminal-error state. The child task is seeded with one synthesized `TurnInput::UserInput` text message containing the resolved review prompt, optionally starts git enrichment when a single local environment cwd exists, then launches `sess.spawn_task(..., ReviewTask::new())`. Only after spawning does it send `EventMsg::EnteredReviewMode`, carrying the resolved review target and user-facing hint so clients can switch UI state.
+The main job is to build a fresh turn context for the review. A turn context is the bundle of information a model run needs: which model to use, what tools are allowed, where the user is working, what permissions apply, what telemetry should record, and so on. For review turns, this file deliberately disables web search and some broader features, even if they are enabled globally. That matters because reviews should be based on the supplied target and prompt, not on outside browsing or unrelated goal-tracking behavior.
+
+The code chooses the review model, asks the model manager for details about it, prepares the shell/tool environment, copies safe pieces from the parent turn, and creates metadata so the review can be tracked as its own sub-task. It then seeds the review with a synthesized user message: the resolved review prompt. Finally, it starts the review task and sends an event telling user interfaces that review mode has begun. Without this file, review requests would either have to run as ordinary chat turns or duplicate a lot of fragile setup code elsewhere.
 
 #### Function details
 
@@ -569,22 +577,24 @@ async fn spawn_review_thread(
     resolved: crate::review_prompts::ResolvedReviewRequest
 ```
 
-**Purpose**: Builds a review-specific child `TurnContext` from an existing session and parent turn, then starts a `ReviewTask` seeded with the synthesized review prompt. It also emits the review-mode event that tells clients the session has transitioned into review behavior.
+**Purpose**: Starts a review task as a child of an existing session turn. It prepares a separate model run with review-specific settings, feeds it the generated review prompt, and tells the rest of the system that review mode has started.
 
-**Data flow**: Inputs are `Arc<Session>`, `Arc<Config>`, `Arc<TurnContext>`, a `sub_id`, and a resolved review request containing the prompt/target/hint. The function reads session services (`models_manager`, shell settings), session feature flags, locked session state (`forked_from_thread_id`), and many fields from the parent turn context (provider, auth, telemetry, skills, environment, permissions, network, cwd, etc.). It clones and mutates config into a per-turn review config, disables selected features, computes `ToolMode`, `UnifiedExecShellMode`, telemetry, metadata, extension data, and a fresh `TurnContext`, then wraps that context in `Arc`. It writes effects by optionally spawning git enrichment on `turn_metadata_state`, launching `sess.spawn_task` with a single synthesized `TurnInput::UserInput` containing the review prompt, logging a warning if web-search mode cannot be forced to disabled, and sending `EventMsg::EnteredReviewMode`. It returns no value.
+**Data flow**: It receives the current session, global configuration, the parent turn context, a sub-task id, and a resolved review request containing the prompt and target. It chooses the review model, fetches that model’s information, disables review-disallowed features such as web search, builds a new turn context with copied parent data plus review-specific overrides, and wraps the review prompt as the first user message. The result is not returned directly; instead, it changes the session by spawning a review task and sending an EnteredReviewMode event for listeners such as the UI.
 
-**Call relations**: This routine is invoked when the session subsystem decides to fork work into a review sub-thread. Within that flow it delegates object construction to several `new` constructors (`TurnMetadataState`, `ExtensionData`, `HostLoadedSkills`, `TurnSkillsContext`, `ReviewTask`, and default timing/error state), asks shell/tool helpers to derive the unified execution shell mode, and relies on session methods to actually run the child task and publish the mode-change event. Its role is the orchestration boundary between an already-running parent turn and the independently executing review task.
+**Call relations**: This function is called when the session needs to launch a review flow. Inside that flow, it asks shared services such as the model manager for model details and available models, uses helper constructors to build metadata, extension data, skills context, and shell execution settings, then hands the prepared context and prompt to the session’s task runner through spawn_task. After the task is started, it sends a session event so clients can switch into review display mode.
 
 *Call graph*: calls 7 internal fn (new, new, new, tool_user_shell_type, new, new, for_session); 8 external calls (new, new, new, unified_exec_feature_mode_for_features, default, EnteredReviewMode, warn!, vec!).
 
 
 ### `core/src/guardian/review_session.rs`
 
-`orchestration` · `during guardian review execution and guardian session reuse`
+`orchestration` · `approval review / request handling`
 
-This file implements the guardian review session cache and execution model. A `GuardianReviewSessionManager` owns a serialized state containing an optional reusable trunk session and a list of active ephemeral forked sessions. Reuse is controlled by `GuardianReviewSessionReuseKey`, which captures only spawn-time settings that affect nested-session behavior: model/provider details, permissions, instructions, cwd, MCP servers, managed features, and related execution knobs. If the cached trunk’s reuse key no longer matches, it is replaced when idle; if the trunk is busy, parallel reviews run in ephemeral forked sessions seeded from the trunk’s last committed rollout snapshot.
+Guardian review is like asking a second, read-only teammate to inspect a risky action before it happens. This file creates and supervises that teammate. Without it, the system would either have to start a fresh reviewer every time, wasting context and time, or risk reusing the wrong reviewer after settings changed.
 
-Each `GuardianReviewSession` wraps a `Codex` thread, a cancellation token, a single-permit semaphore to serialize trunk reviews, and mutable review state tracking prior review count, the last reviewed transcript cursor, and the last committed fork snapshot. `run_review_on_session` decides whether to send a full or delta prompt, optionally injects a one-time follow-up reminder after the first review, syncs approved hosts from the parent session, submits a read-only `Op::UserInput` with `approval_policy = never`, then waits for the matching child turn to complete while ignoring stale events from prior turns. On success it updates token-usage deltas and transcript cursor state. The file also builds the locked-down guardian config by clearing developer instructions, disabling memories/MCP/apps/plugins/hooks and other nonessential features, forcing read-only permissions, and optionally rebuilding network proxy permissions from live proxy state.
+The main idea is a cached “trunk” review session. If the Guardian’s configuration still matches the current request, the manager reuses that session and sends only the new material when possible. If the trunk is busy or no longer matches, it starts an “ephemeral” temporary session, sometimes forked from the trunk’s saved history, so parallel reviews do not block each other.
+
+The file also builds a locked-down Guardian configuration. The reviewer is read-only, cannot ask for approval, has extra tools and hooks disabled, and receives Guardian policy instructions instead of the normal assistant instructions. Each review is submitted as a turn, then the code waits only for events from that exact turn, ignoring stale events from earlier turns. If time runs out or the user cancels, it interrupts the Guardian and drains the event stream so the session can be safely reused when possible. It also records analytics such as model choice, session kind, truncation, time to first token, and token usage.
 
 #### Function details
 
@@ -594,11 +604,11 @@ Each `GuardianReviewSession` wraps a `Codex` thread, a cancellation token, a sin
 fn had_prior_review_context(prompt_mode: &GuardianPromptMode) -> bool
 ```
 
-**Purpose**: Reports whether the current guardian prompt mode represents a follow-up review with prior context.
+**Purpose**: Reports whether the Guardian prompt is using earlier review context. This matters for analytics, because a full review and a smaller follow-up review are different experiences.
 
-**Data flow**: Matches the supplied `GuardianPromptMode` and returns true only for `Delta { .. }`.
+**Data flow**: It receives a prompt mode. If the mode is a delta review, meaning it starts from a saved point in the transcript, it returns true; otherwise it returns false.
 
-**Call relations**: Used by `run_review_on_session` to populate analytics metadata about whether the guardian saw prior review context.
+**Call relations**: run_review_on_session asks this helper while preparing analytics for a Guardian run, so the recorded result can say whether the reviewer had prior context.
 
 *Call graph*: called by 1 (run_review_on_session); 1 external calls (matches!).
 
@@ -609,11 +619,11 @@ fn had_prior_review_context(prompt_mode: &GuardianPromptMode) -> bool
 fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage
 ```
 
-**Purpose**: Computes non-negative token-usage growth across a guardian review turn.
+**Purpose**: Calculates how many tokens the Guardian used during one review. Tokens are chunks of text the model reads or writes, and this keeps usage reporting focused on the review itself.
 
-**Data flow**: Reads starting and ending `TokenUsage` snapshots, subtracts each field, clamps negative differences to zero with `.max(0)`, and returns a new `TokenUsage` containing the deltas.
+**Data flow**: It receives token totals from before and after a review. It subtracts the start totals from the end totals for each field, never allowing a negative number, and returns the difference as a new usage record.
 
-**Call relations**: Called by `run_review_on_session` after a successful nested review to attribute only the current review’s token consumption.
+**Call relations**: run_review_on_session calls this after a successful review when token totals are available, then stores the result in the analytics data.
 
 *Call graph*: called by 1 (run_review_on_session).
 
@@ -627,11 +637,11 @@ fn from_spawn_config(
     ) -> Self
 ```
 
-**Purpose**: Extracts the subset of `Config` and user-instruction state that determines whether a guardian review session can be safely reused.
+**Purpose**: Builds a fingerprint of the settings that affect a spawned Guardian session. The manager uses this fingerprint to decide whether an existing reviewer can be reused safely.
 
-**Data flow**: Reads a `spawn_config` and optional `UserInstructions`, clones the relevant fields into a new `GuardianReviewSessionReuseKey`, and returns it.
+**Data flow**: It reads the Guardian spawn configuration plus current user instructions. It copies only the settings that can change model behavior, permissions, tools, working directory, or feature availability, and returns a reuse key.
 
-**Call relations**: Used whenever the manager compares a cached trunk session to a new review request, and by tests that verify reuse invalidation behavior.
+**Call relations**: run_review uses this before choosing the trunk session. Tests also use it to build realistic cached sessions and to confirm that important configuration changes invalidate reuse.
 
 *Call graph*: called by 7 (cache_for_test, register_ephemeral_for_test, run_review, guardian_review_session_compact_scope_change_invalidates_cached_session, guardian_review_session_config_change_invalidates_cached_session, run_review_removes_trunk_when_event_stream_is_broken, test_review_session).
 
@@ -645,11 +655,11 @@ fn prompt_cache_key_override_for_review_session(
 ) -> Option<String>
 ```
 
-**Purpose**: Builds the stable Responses API prompt-cache key used by guardian review sessions, scoped to the parent thread ID.
+**Purpose**: Creates a stable prompt-cache key for Guardian subagent sessions tied to a parent thread. This lets the model provider reuse cached prompt material without mixing different parent conversations.
 
-**Data flow**: Examines `session_source`; if it is `SessionSource::SubAgent(SubAgentSource::Other(name))` with `name == GUARDIAN_REVIEWER_NAME` and `parent_thread_id` is present, it returns `Some(format!("guardian:{parent_thread_id}"))`; otherwise it returns `None`.
+**Data flow**: It receives a session source and an optional parent thread id. If the source is the Guardian reviewer and a parent thread id is present, it returns a string like guardian:<thread>; otherwise it returns no override.
 
-**Call relations**: Used by tests and by surrounding session machinery to ensure guardian prompt caching is shared across reviews of the same parent thread but isolated across different parent threads.
+**Call relations**: The dedicated cache-key test checks that this helper scopes Guardian caching to the parent thread and refuses non-Guardian or parentless sessions.
 
 *Call graph*: called by 1 (guardian_prompt_cache_key_is_scoped_to_parent_thread); 1 external calls (format!).
 
@@ -660,11 +670,11 @@ fn prompt_cache_key_override_for_review_session(
 async fn shutdown(&self)
 ```
 
-**Purpose**: Cancels and fully shuts down a guardian review session’s underlying Codex thread.
+**Purpose**: Stops a Guardian review session and waits for it to finish. This prevents background reviewer work from leaking after the manager no longer needs it.
 
-**Data flow**: Cancels the session’s `CancellationToken`, awaits `codex.shutdown_and_wait()`, ignores its result, and returns nothing.
+**Data flow**: It cancels the session’s cancellation token, then asks the underlying Codex session to shut down and waits for completion. It does not return useful data; its effect is cleanup.
 
-**Call relations**: Called during manager shutdown and cleanup of stale trunk or ephemeral sessions.
+**Call relations**: The manager calls this during full shutdown, stale trunk replacement, ephemeral cleanup, and background shutdown paths.
 
 *Call graph*: calls 1 internal fn (shutdown_and_wait); 1 external calls (cancel).
 
@@ -675,11 +685,11 @@ async fn shutdown(&self)
 fn shutdown_in_background(self: &Arc<Self>)
 ```
 
-**Purpose**: Schedules asynchronous shutdown of a guardian review session without blocking the caller.
+**Purpose**: Starts shutdown for a Guardian session without making the caller wait. This is useful when the caller needs to return a review result promptly but still clean up old work.
 
-**Data flow**: Clones the `Arc<Self>`, spawns a Tokio task that awaits `shutdown()`, and drops the join handle.
+**Data flow**: It clones the shared session handle, starts an asynchronous task, and that task calls shutdown. The caller gets no direct result.
 
-**Call relations**: Used when stale or completed sessions should be torn down opportunistically after the manager has already moved on.
+**Call relations**: run_review uses this when discarding a stale or unhealthy trunk, and run_ephemeral_review uses it after a temporary review is finished.
 
 *Call graph*: 2 external calls (clone, spawn).
 
@@ -690,11 +700,11 @@ fn shutdown_in_background(self: &Arc<Self>)
 async fn fork_snapshot(&self) -> Option<GuardianReviewForkSnapshot>
 ```
 
-**Purpose**: Returns the last committed fork snapshot, if any, from a guardian review session.
+**Purpose**: Returns the latest saved history snapshot that can seed a temporary forked Guardian session. This helps a parallel reviewer start with useful context instead of from scratch.
 
-**Data flow**: Locks the session state, clones `last_committed_fork_snapshot`, and returns the optional snapshot.
+**Data flow**: It locks the session state, clones the saved fork snapshot if one exists, and returns it. Nothing is changed.
 
-**Call relations**: Called when a busy trunk needs to seed an ephemeral fork with the latest committed guardian history.
+**Call relations**: run_review asks the trunk for this snapshot when the trunk is busy and an ephemeral review must be started.
 
 
 ##### `GuardianReviewSession::refresh_last_committed_fork_snapshot`  (lines 232–250)
@@ -703,11 +713,11 @@ async fn fork_snapshot(&self) -> Option<GuardianReviewForkSnapshot>
 async fn refresh_last_committed_fork_snapshot(&self)
 ```
 
-**Purpose**: Refreshes the trunk session’s reusable fork snapshot from its persisted rollout history after a successful review. This snapshot is what parallel ephemeral reviews inherit.
+**Purpose**: Updates the trunk’s saved history so future temporary reviews can fork from a recent, completed Guardian state. This keeps forked reviewers efficient and context-aware.
 
-**Data flow**: Calls `load_rollout_items_for_fork(&self.codex.session)`. If it gets a non-empty item list, it locks state, reads `prior_review_count` and `last_reviewed_transcript_cursor`, and stores a new `GuardianReviewForkSnapshot { initial_history: InitialHistory::Forked(items), ... }`. Empty, absent, or failed loads are ignored except for a warning on error.
+**Data flow**: It loads persisted rollout items from the session. If there are items, it stores them with the current review count and transcript cursor as the latest fork snapshot; if loading fails, it logs a warning.
 
-**Call relations**: Called by `GuardianReviewSessionManager::run_review` after a successful trunk review that should keep the session reusable.
+**Call relations**: run_review calls this after a successful trunk review that should be kept, so later ephemeral reviews can inherit the latest committed Guardian conversation.
 
 *Call graph*: calls 1 internal fn (load_rollout_items_for_fork); 2 external calls (Forked, warn!).
 
@@ -721,11 +731,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Creates a drop guard that will unregister and shut down an ephemeral review session unless explicitly disarmed.
+**Purpose**: Creates a cleanup guard for a temporary Guardian review. A cleanup guard is like a safety tag: if the code exits early, it still knows what temporary session must be removed.
 
-**Data flow**: Stores the shared manager state and wraps the supplied `Arc<GuardianReviewSession>` in `Some(...)` inside the cleanup struct.
+**Data flow**: It receives the shared manager state and the temporary review session. It stores both and marks the session as armed for cleanup.
 
-**Call relations**: Constructed by `run_ephemeral_review` immediately after registering an active ephemeral session.
+**Call relations**: run_ephemeral_review creates this guard right after registering a temporary session, so unexpected exits still trigger cleanup.
 
 *Call graph*: called by 1 (run_ephemeral_review).
 
@@ -736,11 +746,11 @@ fn new(
 fn disarm(&mut self)
 ```
 
-**Purpose**: Disables the drop-time cleanup action for an ephemeral review session.
+**Purpose**: Turns off automatic cleanup for an ephemeral review guard. This is used after the session has already been removed and scheduled for shutdown normally.
 
-**Data flow**: Sets `self.review_session` to `None` and returns nothing.
+**Data flow**: It clears the stored session from the guard. After that, dropping the guard will do nothing.
 
-**Call relations**: Called when `run_ephemeral_review` has already removed and scheduled shutdown for the ephemeral session explicitly.
+**Call relations**: run_ephemeral_review calls this after it successfully takes the temporary session out of the manager’s active list.
 
 
 ##### `EphemeralReviewCleanup::drop`  (lines 270–288)
@@ -749,11 +759,11 @@ fn disarm(&mut self)
 fn drop(&mut self)
 ```
 
-**Purpose**: On scope exit, removes the tracked ephemeral session from manager state and shuts it down in the background if it was not disarmed.
+**Purpose**: Automatically cleans up a temporary Guardian review if its guard goes out of scope while still armed. This protects against leaks when a review exits through an error path.
 
-**Data flow**: Takes ownership of the optional review session, clones the shared state, spawns an async task that locks manager state, finds the matching ephemeral session by `Arc::ptr_eq`, removes it with `swap_remove`, and then awaits `shutdown()` on the removed session.
+**Data flow**: When dropped, it takes the stored review session, starts a background task, removes that exact session from the active ephemeral list, and shuts it down if found.
 
-**Call relations**: Provides fail-safe cleanup for `run_ephemeral_review` so leaked or early-returned ephemeral sessions do not remain registered.
+**Call relations**: This is the fallback path for EphemeralReviewCleanup created by run_ephemeral_review; disarm prevents it from running after normal cleanup.
 
 *Call graph*: 2 external calls (clone, spawn).
 
@@ -764,11 +774,11 @@ fn drop(&mut self)
 async fn trunk_rollout_path(&self) -> Option<PathBuf>
 ```
 
-**Purpose**: Returns the materialized rollout path for the cached guardian trunk session, if one exists.
+**Purpose**: Returns the disk path for the cached trunk Guardian session’s rollout, if one exists. A rollout is the saved conversation/history used for persistence and forking.
 
-**Data flow**: Locks manager state to clone the trunk session, asks the trunk session to ensure rollout materialization, then queries `current_rollout_path()`. It returns `Some(PathBuf)` on success or `None` if there is no trunk or path resolution fails, logging a warning on error.
+**Data flow**: It looks up the trunk session, ensures its rollout file has been created, then asks for the current rollout path. If anything is missing or fails, it returns nothing and logs failures.
 
-**Call relations**: Used by external code that needs to inspect the guardian trunk’s persisted rollout artifacts.
+**Call relations**: External code can call this when it needs to inspect or persist the trunk review history; it operates only on the current trunk.
 
 *Call graph*: 1 external calls (warn!).
 
@@ -779,11 +789,11 @@ async fn trunk_rollout_path(&self) -> Option<PathBuf>
 async fn shutdown(&self)
 ```
 
-**Purpose**: Shuts down the cached trunk session and all active ephemeral guardian review sessions.
+**Purpose**: Stops all Guardian review sessions owned by the manager. This is the main cleanup path when the parent session or process is ending.
 
-**Data flow**: Locks manager state, takes ownership of `trunk` and drains `ephemeral_reviews`, then sequentially awaits `shutdown()` on each session. It returns nothing.
+**Data flow**: It removes the trunk and all active ephemeral sessions from shared state, then shuts each one down. Afterward, the manager no longer has active reviewer sessions.
 
-**Call relations**: Called during broader session/service teardown to stop all nested guardian review threads.
+**Call relations**: Higher-level teardown code calls this to avoid leaving reviewer sessions running after the main session is done.
 
 *Call graph*: 1 external calls (take).
 
@@ -797,11 +807,11 @@ async fn run_review(
     ) -> (GuardianReviewSessionOutcome, GuardianReviewAnalyticsResult)
 ```
 
-**Purpose**: Selects or spawns the appropriate guardian review session, runs the review on it before the deadline, and decides whether the session remains reusable afterward. It is the manager’s main orchestration entrypoint.
+**Purpose**: Runs one Guardian review, choosing the safest and fastest session strategy. It reuses the trunk when possible, replaces stale trunks, or starts a temporary fork when the trunk is busy.
 
-**Data flow**: Consumes `GuardianReviewSessionParams`. It computes the next reuse key from the spawn config and parent user instructions, acquires the serialized manager state under deadline/cancellation control, optionally evicts a stale idle trunk whose reuse key changed, spawns a new trunk if none exists, and then chooses among three paths: use the trunk directly if its reuse key matches and its semaphore can be acquired; run an ephemeral fork if the trunk is busy; or run an ephemeral session if the trunk’s reuse key no longer matches. After `run_review_on_session`, it refreshes the trunk’s committed fork snapshot on successful reusable completion, drops the trunk lock, and either keeps the session cached or removes and background-shuts it down if the review indicated the session should not be kept. It returns `(GuardianReviewSessionOutcome, GuardianReviewAnalyticsResult)`.
+**Data flow**: It receives all review parameters, builds the expected reuse key, and checks the cached trunk under a lock. It may spawn a new trunk, shut down an old one, fall back to an ephemeral session, then runs the review and returns both the outcome and analytics.
 
-**Call relations**: Called by higher-level guardian review orchestration. It delegates spawning to `spawn_guardian_review_session`, actual review execution to `run_review_on_session`, deadline wrapping to `run_before_review_deadline` / `_with_cancel`, and fallback parallelism to `run_ephemeral_review`.
+**Call relations**: This is the manager’s central entry for Guardian review requests. It coordinates reuse-key creation, deadline-aware spawning, run_review_on_session, ephemeral fallback, trunk snapshot refresh, and removal of unhealthy trunks.
 
 *Call graph*: calls 8 internal fn (without_session, remove_trunk_if_current, run_ephemeral_review, from_spawn_config, run_before_review_deadline, run_before_review_deadline_with_cancel, run_review_on_session, spawn_guardian_review_session); 8 external calls (clone, new, pin, new, anyhow!, Completed, PromptBuildFailed, matches!).
 
@@ -812,11 +822,11 @@ async fn run_review(
 async fn cache_for_test(&self, codex: Codex)
 ```
 
-**Purpose**: Installs a supplied `Codex` instance as the cached trunk guardian session for tests.
+**Purpose**: Installs a provided Codex session as the cached trunk during tests. This lets tests control the reviewer session without starting a real one.
 
-**Data flow**: Builds a reuse key from the codex session config and user instructions, wraps the codex in a new `GuardianReviewSession` with fresh cancellation token, semaphore, and empty review state, and stores it as `state.trunk`.
+**Data flow**: It reads the Codex session configuration and user instructions, builds a reuse key, wraps the Codex session in GuardianReviewSession state, and stores it as the trunk.
 
-**Call relations**: Used only by tests that need to seed manager state without going through real spawning.
+**Call relations**: Test code can call this setup helper before exercising manager behavior that depends on a cached trunk.
 
 *Call graph*: calls 1 internal fn (from_spawn_config); 4 external calls (new, new, new, new).
 
@@ -827,11 +837,11 @@ async fn cache_for_test(&self, codex: Codex)
 async fn register_ephemeral_for_test(&self, codex: Codex)
 ```
 
-**Purpose**: Registers a supplied `Codex` instance as an active ephemeral guardian session for tests.
+**Purpose**: Adds a provided Codex session to the active temporary review list during tests. This gives tests a way to simulate in-flight ephemeral reviews.
 
-**Data flow**: Builds a reuse key from the codex session config and user instructions, wraps the codex in a new `GuardianReviewSession`, and pushes it into `state.ephemeral_reviews`.
+**Data flow**: It builds a reuse key from the Codex session, wraps the session with Guardian state, and pushes it into the manager’s ephemeral list.
 
-**Call relations**: Test helper for exercising ephemeral-session bookkeeping.
+**Call relations**: Test code uses this helper when it needs manager state that includes active temporary Guardian sessions.
 
 *Call graph*: calls 1 internal fn (from_spawn_config); 4 external calls (new, new, new, new).
 
@@ -842,11 +852,11 @@ async fn register_ephemeral_for_test(&self, codex: Codex)
 async fn committed_fork_rollout_items_for_test(&self) -> Option<Vec<RolloutItem>>
 ```
 
-**Purpose**: Returns the trunk session’s committed fork rollout items for assertions in tests.
+**Purpose**: Returns the trunk’s saved fork history items for tests. This lets tests confirm that successful trunk reviews refresh forkable history.
 
-**Data flow**: Clones the trunk session, locks its state, reads `last_committed_fork_snapshot`, and if its `initial_history` is `InitialHistory::Forked(items)`, returns `Some(items.clone())`; otherwise returns `None`.
+**Data flow**: It finds the trunk, reads its saved fork snapshot, and returns the stored rollout items only if the snapshot is a forked history.
 
-**Call relations**: Used by tests that verify follow-up reminders and prior guardian context are persisted into fork snapshots.
+**Call relations**: Tests call this after review flows that should have committed a fork snapshot.
 
 
 ##### `GuardianReviewSessionManager::send_trunk_event_raw_for_test`  (lines 505–514)
@@ -855,11 +865,11 @@ async fn committed_fork_rollout_items_for_test(&self) -> Option<Vec<RolloutItem>
 async fn send_trunk_event_raw_for_test(&self, event: Event)
 ```
 
-**Purpose**: Injects a raw event into the cached trunk session for tests.
+**Purpose**: Injects a raw event into the trunk session during tests. This helps tests simulate model events without a real model.
 
-**Data flow**: Clones the trunk session from manager state, panics if absent, and forwards the supplied `Event` to `trunk.codex.session.send_event_raw(event).await`.
+**Data flow**: It looks up the trunk session and sends the provided event into that session’s event stream. It does not produce a returned value.
 
-**Call relations**: Used by tests that simulate stale or out-of-band events on a reused trunk session.
+**Call relations**: Tests use this to drive code paths that wait for Guardian events.
 
 
 ##### `GuardianReviewSessionManager::remove_trunk_if_current`  (lines 516–530)
@@ -871,11 +881,11 @@ async fn remove_trunk_if_current(
     ) -> Option<Arc<GuardianReviewSession>>
 ```
 
-**Purpose**: Atomically removes the cached trunk session only if it is still the same `Arc` instance the caller expects.
+**Purpose**: Removes the trunk only if it is still the exact session the caller expects. This avoids accidentally deleting a newer trunk created by another task.
 
-**Data flow**: Locks manager state, compares the current trunk with the supplied `Arc<GuardianReviewSession>` using `Arc::ptr_eq`, and returns `state.trunk.take()` on match or `None` otherwise.
+**Data flow**: It locks manager state, compares the stored trunk pointer with the provided trunk pointer, and takes the trunk out only if they match. It returns the removed session or nothing.
 
-**Call relations**: Called by `run_review` when a trunk session should be discarded after a broken event stream or other non-reusable outcome.
+**Call relations**: run_review calls this when a trunk should be discarded after an unhealthy review result.
 
 *Call graph*: called by 1 (run_review).
 
@@ -886,11 +896,11 @@ async fn remove_trunk_if_current(
 async fn register_active_ephemeral(&self, review_session: Arc<GuardianReviewSession>)
 ```
 
-**Purpose**: Adds an ephemeral guardian review session to the manager’s active list.
+**Purpose**: Records a temporary Guardian session as active. This makes it visible to manager shutdown and cleanup logic.
 
-**Data flow**: Locks manager state and pushes the supplied `Arc<GuardianReviewSession>` into `ephemeral_reviews`.
+**Data flow**: It locks shared state and appends the provided review session to the ephemeral list. It returns no data.
 
-**Call relations**: Used by `run_ephemeral_review` immediately after spawning a forked session.
+**Call relations**: run_ephemeral_review calls this immediately after spawning a temporary reviewer.
 
 *Call graph*: called by 1 (run_ephemeral_review).
 
@@ -904,11 +914,11 @@ async fn take_active_ephemeral(
     ) -> Option<Arc<GuardianReviewSession>>
 ```
 
-**Purpose**: Removes and returns a specific active ephemeral session by pointer identity.
+**Purpose**: Removes a specific temporary Guardian session from the active list. This is used when its review has finished and it is ready to shut down.
 
-**Data flow**: Locks manager state, finds the matching session in `ephemeral_reviews` with `Arc::ptr_eq`, removes it with `swap_remove`, and returns it as `Some(...)`; returns `None` if not found.
+**Data flow**: It locks shared state, searches for the exact session pointer, removes it with a fast swap, and returns it if found.
 
-**Call relations**: Called by `run_ephemeral_review` after the review completes so the ephemeral session can be shut down explicitly.
+**Call relations**: run_ephemeral_review calls this during normal cleanup; the cleanup guard covers the case where this path is not reached.
 
 *Call graph*: called by 1 (run_ephemeral_review).
 
@@ -924,11 +934,11 @@ async fn run_ephemeral_review(
         fork_snapsh
 ```
 
-**Purpose**: Spawns a forked ephemeral guardian session, runs one review on it, and tears it down afterward. This path is used for parallel reviews or when the trunk cannot be reused directly.
+**Purpose**: Runs a review in a one-off temporary Guardian session. This keeps reviews moving when the reusable trunk is busy or unsuitable.
 
-**Data flow**: Clones and marks the spawn config as `ephemeral = true`, creates a spawn cancellation token, spawns the guardian session under deadline/cancellation control via `spawn_guardian_review_session`, registers it as active, installs an `EphemeralReviewCleanup` guard, runs `run_review_on_session` with `GuardianReviewSessionKind::EphemeralForked`, then removes the session from active state, disarms the cleanup guard, and schedules background shutdown. It returns the review outcome and analytics result.
+**Data flow**: It marks the spawned config as ephemeral, starts a Guardian session before the deadline, registers it as active, runs the review, removes it from active state, and shuts it down in the background. It returns the review outcome and analytics.
 
-**Call relations**: Called by `run_review` when the trunk is busy or unsuitable. It shares the same review execution path as trunk reviews but always uses a short-lived forked session.
+**Call relations**: run_review delegates here when trunk reuse is unsafe or unavailable. This function uses spawn_guardian_review_session, run_review_on_session, and EphemeralReviewCleanup to make temporary review sessions safe.
 
 *Call graph*: calls 7 internal fn (without_session, new, register_active_ephemeral, take_active_ephemeral, run_before_review_deadline_with_cancel, run_review_on_session, spawn_guardian_review_session); called by 1 (run_review); 5 external calls (clone, new, pin, new, PromptBuildFailed).
 
@@ -944,11 +954,11 @@ async fn spawn_guardian_review_session(
     fork_
 ```
 
-**Purpose**: Creates a new nested guardian `Codex` thread and wraps it in a `GuardianReviewSession`, optionally seeded from a fork snapshot.
+**Purpose**: Starts a new Guardian Codex thread and wraps it in Guardian session state. It can start fresh or from a saved fork snapshot.
 
-**Data flow**: Reads review params, a `spawn_config`, reuse key, cancellation token, and optional `GuardianReviewForkSnapshot`. It derives `initial_history`, `prior_review_count`, and initial transcript cursor from the snapshot when present, calls `run_codex_thread_interactive(...)` with `SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string())`, and returns a `GuardianReviewSession` containing the new codex, cancellation token, reuse key, semaphore, and initialized review state.
+**Data flow**: It receives review parameters, a spawn configuration, a reuse key, a cancellation token, and optional fork history. It launches an interactive Codex subagent named as the Guardian reviewer, then returns a GuardianReviewSession with counters and cursors initialized.
 
-**Call relations**: Used by both trunk and ephemeral session creation paths inside the manager.
+**Call relations**: run_review uses this to create a trunk, and run_ephemeral_review uses it to create temporary forked reviewers.
 
 *Call graph*: calls 1 internal fn (run_codex_thread_interactive); called by 2 (run_ephemeral_review, run_review); 6 external calls (clone, pin, clone, new, new, Other).
 
@@ -963,11 +973,11 @@ async fn run_review_on_session(
     deadline: tokio::time::I
 ```
 
-**Purpose**: Runs a single guardian review on an already spawned guardian session, handling prompt mode selection, prompt construction, nested turn submission, event waiting, analytics enrichment, and reusable-session state updates.
+**Purpose**: Submits one Guardian prompt to an already chosen review session and waits for the answer. This is where a selected reviewer actually performs the review.
 
-**Data flow**: Reads the target `review_session`, immutable review `params`, session kind, and deadline. It locks session state to decide whether to send the one-time follow-up reminder and whether prompt mode is `Full` or `Delta` based on `prior_review_count` and `last_reviewed_transcript_cursor`. It resolves model info, computes the effective guardian reasoning effort, initializes `GuardianReviewAnalyticsResult::from_session(...)`, optionally injects the follow-up reminder, syncs approved hosts from the parent session, builds prompt items with `build_guardian_prompt_items_with_parent_turn` under deadline control, snapshots starting token usage, submits `Op::UserInput` with read-only thread settings and the supplied JSON schema, waits for the matching child turn via `wait_for_guardian_review`, and on successful completion updates token-usage delta, increments `prior_review_count`, and stores the new transcript cursor. It returns `(GuardianReviewSessionOutcome, keep_review_session, GuardianReviewAnalyticsResult)`.
+**Data flow**: It reads review state to decide full versus delta prompt, gathers model and analytics information, optionally adds a follow-up reminder, builds prompt items, submits them with read-only settings, waits for the matching turn to finish, then updates counters, transcript cursor, token usage, and analytics.
 
-**Call relations**: Called by both trunk and ephemeral review paths. It delegates prompt building, reminder injection, deadline wrapping, token delta computation, and event waiting to the helpers in this file and the prompt module.
+**Call relations**: run_review and run_ephemeral_review both call this after choosing or spawning a session. It relies on prompt building, deadline guards, wait_for_guardian_review, and token_usage_delta.
 
 *Call graph*: calls 9 internal fn (from_session, build_guardian_prompt_items_with_parent_turn, append_guardian_followup_reminder, had_prior_review_context, run_before_review_deadline, token_usage_delta, wait_for_guardian_review, read_only, new); called by 3 (run_ephemeral_review, run_review, run_review_on_reused_session_waits_for_submitted_turn); 4 external calls (pin, default, PromptBuildFailed, matches!).
 
@@ -978,11 +988,11 @@ async fn run_review_on_session(
 async fn append_guardian_followup_reminder(review_session: &GuardianReviewSession)
 ```
 
-**Purpose**: Injects the one-time contextual reminder that prior guardian reviews are context, not binding precedent.
+**Purpose**: Adds a reminder message into the Guardian session after its first follow-up review. This nudges the reviewer to keep later reviews consistent with earlier context.
 
-**Data flow**: Converts `GuardianFollowupReviewReminder` into a `ResponseItem` via `ContextualUserFragment::into`, then calls `inject_no_new_turn` on the guardian session with a one-item vector.
+**Data flow**: It converts a GuardianFollowupReviewReminder into a response item and injects it into the session without starting a new turn.
 
-**Call relations**: Called by `run_review_on_session` only when `prior_review_count == 1`, so the reminder appears on the second and later reviews but is injected only once into the reusable guardian thread.
+**Call relations**: run_review_on_session calls this when the session state says exactly one prior review has happened.
 
 *Call graph*: calls 1 internal fn (into); called by 1 (run_review_on_session); 1 external calls (vec!).
 
@@ -995,11 +1005,11 @@ async fn load_rollout_items_for_fork(
 ) -> anyhow::Result<Option<Vec<RolloutItem>>>
 ```
 
-**Purpose**: Loads the persisted rollout history needed to fork a guardian session from its last committed state.
+**Purpose**: Loads the persisted Guardian conversation items needed to fork a temporary reviewer. This turns the current trunk history into reusable starting material.
 
-**Data flow**: Ensures rollout materialization, flushes rollout state, obtains the live thread for persistence, loads full history including archived items, and returns `Ok(Some(history.items))`.
+**Data flow**: It ensures rollout persistence exists, flushes pending history to disk, opens the live thread used for persistence, loads its history including archived items, and returns those items.
 
-**Call relations**: Used by `GuardianReviewSession::refresh_last_committed_fork_snapshot` to capture the trunk’s reusable fork baseline.
+**Call relations**: refresh_last_committed_fork_snapshot calls this after successful trunk reviews to capture a fork snapshot.
 
 *Call graph*: called by 1 (refresh_last_committed_fork_snapshot); 3 external calls (flush_rollout, live_thread_for_persistence, try_ensure_rollout_materialized).
 
@@ -1015,11 +1025,11 @@ async fn wait_for_guardian_review(
     anal
 ```
 
-**Purpose**: Waits for the submitted guardian child turn to finish, ignoring stale events from prior turns and handling timeout/cancellation by interrupting and draining the expected turn. It also captures TTFT and preserves structured session errors when possible.
+**Purpose**: Waits for the Guardian turn that was just submitted and turns its event stream into a clear outcome. It ignores events from older turns so reused sessions do not confuse stale messages with the current review.
 
-**Data flow**: Reads the `review_session`, `expected_turn_id`, deadline, optional external cancel token, and mutable analytics result. It pins a sleep-until-deadline future, tracks the last `ErrorEvent` seen for the expected turn, and loops over `tokio::select!` between deadline expiry, external cancellation, and `codex.next_event()`. Non-matching-turn events are ignored. For matching events: `TurnComplete` stores `time_to_first_token_ms`; if there is no `last_agent_message` but a prior matching `ErrorEvent` exists, it returns `SessionFailed { error, error_info }`; otherwise it returns `Completed(Ok(last_agent_message))`. `Error` updates `last_error`, `TurnAborted` returns `Aborted`, and stream errors return `Completed(Err(...))` with `keep_review_session = false`. Timeout or cancellation first call `interrupt_and_drain_turn` and return `TimedOut` or `Aborted` plus whether the session remained drainable.
+**Data flow**: It receives the review session, expected turn id, deadline, optional cancellation token, and analytics record. It watches for timeout, cancellation, or matching events; on completion it returns the Guardian message or error, and tells the caller whether the session can be kept and whether token usage should be captured.
 
-**Call relations**: Called by `run_review_on_session` after submitting the nested guardian turn. It relies on `event_matches_turn` and `interrupt_and_drain_turn` to avoid stale-turn confusion and to preserve session reusability after interruption.
+**Call relations**: run_review_on_session calls this after submitting a review. Several tests drive it directly to verify stale events, structured errors, timeouts, and cancellation behavior.
 
 *Call graph*: called by 7 (run_review_on_session, wait_for_guardian_review_cancel_drains_expected_turn_after_stale_terminal_event, wait_for_guardian_review_ignores_prior_turn_aborts, wait_for_guardian_review_ignores_prior_turn_completion, wait_for_guardian_review_ignores_prior_turn_errors, wait_for_guardian_review_preserves_structured_session_error, wait_for_guardian_review_timeout_drains_expected_turn_after_stale_terminal_event); 3 external calls (pin!, select!, sleep_until).
 
@@ -1030,11 +1040,11 @@ async fn wait_for_guardian_review(
 fn event_matches_turn(event: &Event, expected_turn_id: &str) -> bool
 ```
 
-**Purpose**: Determines whether an incoming event belongs to the expected guardian child turn.
+**Purpose**: Checks whether an event belongs to the Guardian turn currently being watched. This prevents stale events from earlier turns from ending the wrong review.
 
-**Data flow**: Compares `event.id` to `expected_turn_id`, then for terminal events additionally checks the embedded `turn_id` fields inside `TurnComplete` and `TurnAborted`. It returns a boolean.
+**Data flow**: It compares the event id with the expected turn id. For terminal events that also carry a turn id, it checks that inner id too, then returns true or false.
 
-**Call relations**: Used by `wait_for_guardian_review` and `interrupt_and_drain_turn` to ignore stale events from earlier guardian turns on a reused session.
+**Call relations**: interrupt_and_drain_turn uses this while draining after an interrupt; wait_for_guardian_review also applies the same matching logic when processing events.
 
 *Call graph*: called by 1 (interrupt_and_drain_turn).
 
@@ -1049,11 +1059,11 @@ fn build_guardian_review_session_config(
     reasoning_effort: Option<code
 ```
 
-**Purpose**: Derives the locked-down configuration used for nested guardian review sessions from the parent config and live network state. It strips mutable or user-extensible features while preserving the guardian policy and relevant network constraints.
+**Purpose**: Creates the locked-down configuration used for Guardian review sessions. It keeps the reviewer focused, read-only, and separate from normal assistant behavior.
 
-**Data flow**: Clones `parent_config`, overwrites `model` and `model_reasoning_effort`, reduces provider retries to 1, disables skill instructions, memories, dedicated memory tools, apps instructions, notifications, and developer instructions, sets `base_instructions` to either the default guardian policy prompt or a workspace-managed override, forces `approval_policy = never`, sets `PermissionProfile::read_only()`, clears MCP servers, optionally rebuilds `permissions.network` from `live_network_config` and config-layer constraints, and attempts to disable a fixed list of features (`SpawnCsv`, `Collab`, `MultiAgentV2`, `CodexHooks`, `Apps`, `Plugins`, `WebSearchRequest`, `WebSearchCached`), warning if a pinned feature remains enabled. It returns the new `Config` or an error if required mutations fail.
+**Data flow**: It clones the parent configuration, switches to the review model and reasoning effort, installs Guardian policy instructions, disables notifications, memory, skill/app instructions, MCP servers, and risky features, forces read-only permissions and no approval requests, and applies live network proxy settings when needed. It returns the adjusted config or an error if constraints cannot be applied.
 
-**Call relations**: Called by higher-level guardian review orchestration before spawning or reusing a guardian session. Tests in this file and `guardian/tests.rs` verify many of its invariants.
+**Call relations**: Higher-level Guardian review setup calls this before run_review. Tests call it to confirm configuration changes affect reuse and that unsafe extras are disabled.
 
 *Call graph*: calls 3 internal fn (allow_only, from_config_and_constraints, read_only); called by 6 (run_guardian_review_session_before_deadline, guardian_review_session_compact_scope_change_invalidates_cached_session, guardian_review_session_config_change_invalidates_cached_session, guardian_review_session_config_disables_hooks, guardian_review_session_config_disables_skill_instructions, test_review_params); 3 external calls (new, clone, warn!).
 
@@ -1068,11 +1078,11 @@ async fn run_before_review_deadline(
 ) -> Result<T, GuardianReviewSessionOutco
 ```
 
-**Purpose**: Runs an arbitrary future but converts deadline expiry or external cancellation into `GuardianReviewSessionOutcome` values.
+**Purpose**: Runs an asynchronous operation only while the Guardian review is still allowed to continue. It converts timeout or external cancellation into Guardian review outcomes.
 
-**Data flow**: Takes a deadline, optional external cancel token, and a future. It `tokio::select!`s between sleeping until the deadline, awaiting the future, and awaiting cancellation. It returns `Ok(result)` on success, `Err(TimedOut)` on deadline, or `Err(Aborted)` on cancellation.
+**Data flow**: It receives a deadline, optional cancellation token, and future work. It waits for whichever happens first: the deadline, the work finishing, or cancellation; it returns the work result or a timed-out/aborted outcome.
 
-**Call relations**: Used throughout manager and review execution code to ensure prompt building, state locking, spawning, and submission all respect the guardian review deadline.
+**Call relations**: run_review and run_review_on_session wrap locking, prompt building, and submission with this helper. Tests verify both timeout and cancellation behavior.
 
 *Call graph*: called by 5 (run_review, run_before_review_deadline_with_cancel, run_review_on_session, run_before_review_deadline_aborts_when_cancelled, run_before_review_deadline_times_out_before_future_completes); 1 external calls (select!).
 
@@ -1087,11 +1097,11 @@ async fn run_before_review_deadline_with_cancel(
     future: impl Future<Outp
 ```
 
-**Purpose**: Wraps `run_before_review_deadline` and additionally cancels a supplied internal token when the operation times out or is aborted.
+**Purpose**: Like run_before_review_deadline, but also cancels a provided token if the operation does not finish. This is useful when a spawned Guardian session must be told to stop after a timeout or abort.
 
-**Data flow**: Runs `run_before_review_deadline(...)`, and if the result is an error, calls `cancel_token.cancel()`. It returns the original `Result<T, GuardianReviewSessionOutcome>`.
+**Data flow**: It runs the provided future under the deadline helper. If the result is an error outcome, it cancels the supplied cancellation token; otherwise it leaves the token alone.
 
-**Call relations**: Used around guardian session spawning so a timed-out or aborted spawn attempt also cancels the in-flight nested session startup.
+**Call relations**: run_review and run_ephemeral_review use this around Guardian session spawning. Tests confirm that the token is cancelled only on timeout or abort.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline); called by 5 (run_ephemeral_review, run_review, run_before_review_deadline_with_cancel_cancels_token_on_abort, run_before_review_deadline_with_cancel_cancels_token_on_timeout, run_before_review_deadline_with_cancel_preserves_token_on_success); 1 external calls (cancel).
 
@@ -1102,11 +1112,11 @@ async fn run_before_review_deadline_with_cancel(
 async fn interrupt_and_drain_turn(codex: &Codex, expected_turn_id: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Interrupts the current guardian child turn and drains events until that specific turn reaches a terminal state, ignoring stale terminal events from prior turns.
+**Purpose**: Interrupts an active Guardian turn and waits until the event stream reaches that turn’s final event. This makes session reuse safer after timeouts or cancellations.
 
-**Data flow**: Submits `Op::Interrupt` to the `Codex`, then waits up to `GUARDIAN_INTERRUPT_DRAIN_TIMEOUT` for `codex.next_event()` to yield a matching-turn `TurnAborted` or `TurnComplete`, using `event_matches_turn` to ignore unrelated events. It returns `Ok(())` on successful drain or an error if the timeout expires or event retrieval fails.
+**Data flow**: It sends an interrupt operation to the Codex session, then reads events until it sees the expected turn complete or abort, with a short drain timeout. It returns success if the stream reaches that clean end, otherwise an error.
 
-**Call relations**: Called by `wait_for_guardian_review` on timeout or cancellation to preserve session reusability by draining the interrupted turn cleanly.
+**Call relations**: wait_for_guardian_review calls this when a review times out or is externally cancelled. The related test checks that it ignores terminal events from older turns.
 
 *Call graph*: calls 3 internal fn (event_matches_turn, next_event, submit); called by 1 (interrupt_and_drain_turn_ignores_prior_turn_completion); 2 external calls (matches!, timeout).
 
@@ -1121,11 +1131,11 @@ async fn test_review_session() -> (
     )
 ```
 
-**Purpose**: Builds a lightweight in-memory `GuardianReviewSession` plus channels for injecting events and observing submissions in tests.
+**Purpose**: Builds a fake Guardian review session for tests. It provides controllable event and submission channels so tests can simulate the model.
 
-**Data flow**: Creates a session/context fixture, bounded submission and unbounded event channels, a watch channel for agent status, derives a reuse key from the session config, and returns `(GuardianReviewSession, tx_event, rx_sub)`.
+**Data flow**: It creates a test session and turn context, wires channels for submissions and events, builds a reuse key, and returns the GuardianReviewSession plus the channels.
 
-**Call relations**: Shared fixture for the review-session tests that simulate nested turn submissions and event streams.
+**Call relations**: Many review-session tests use this helper before driving wait_for_guardian_review, interrupt behavior, or manager cleanup.
 
 *Call graph*: calls 3 internal fn (from_spawn_config, completed_session_loop_termination, make_session_and_context_with_rx); 6 external calls (new, new, new, bounded, unbounded, channel).
 
@@ -1140,11 +1150,11 @@ fn turn_complete_event(
     ) -> Event
 ```
 
-**Purpose**: Constructs a synthetic `EventMsg::TurnComplete` event for a given turn ID, optional last agent message, and optional TTFT.
+**Purpose**: Creates a test event representing a completed turn. This keeps test setup short and consistent.
 
-**Data flow**: Builds and returns an `Event` with matching outer `id` and inner `TurnCompleteEvent` fields.
+**Data flow**: It receives a turn id, optional final agent message, and optional time-to-first-token value. It returns an Event containing a TurnComplete message with those values.
 
-**Call relations**: Used by tests that feed terminal events into `wait_for_guardian_review` and `run_review_on_session`.
+**Call relations**: Tests feed these events into fake Guardian sessions to make wait_for_guardian_review finish.
 
 *Call graph*: 1 external calls (TurnComplete).
 
@@ -1155,11 +1165,11 @@ fn turn_complete_event(
 fn turn_aborted_event(turn_id: &str) -> Event
 ```
 
-**Purpose**: Constructs a synthetic `EventMsg::TurnAborted` event for a given turn ID.
+**Purpose**: Creates a test event representing an interrupted turn. This helps tests simulate cancellation and interrupt cleanup.
 
-**Data flow**: Builds and returns an `Event` containing `TurnAbortedEvent { turn_id: Some(...), reason: Interrupted, ... }`.
+**Data flow**: It receives a turn id and returns an Event containing a TurnAborted message for that id.
 
-**Call relations**: Used by tests that simulate interrupted guardian turns.
+**Call relations**: Timeout, cancellation, and interrupt-drain tests use this helper to signal that the expected turn ended after interruption.
 
 *Call graph*: 1 external calls (TurnAborted).
 
@@ -1170,11 +1180,11 @@ fn turn_aborted_event(turn_id: &str) -> Event
 async fn test_review_params() -> GuardianReviewSessionParams
 ```
 
-**Purpose**: Builds a representative `GuardianReviewSessionParams` fixture for tests, including a shell approval request and guardian session config.
+**Purpose**: Builds realistic Guardian review parameters for tests. This avoids repeating a large setup block in each test.
 
-**Data flow**: Creates a session/turn fixture, derives model and reasoning settings from the turn, builds guardian config with `build_guardian_review_session_config`, constructs a shell `GuardianApprovalRequest`, and returns a populated `GuardianReviewSessionParams` with a near-future deadline.
+**Data flow**: It creates a test parent session and turn, builds a Guardian config, fills in a sample shell approval request, schema, model settings, personality, and deadline, then returns the parameter object.
 
-**Call relations**: Shared by tests that exercise manager and session execution behavior.
+**Call relations**: Review-flow tests call this before invoking run_review_on_session or manager run_review paths.
 
 *Call graph*: calls 3 internal fn (guardian_output_schema, build_guardian_review_session_config, make_session_and_context); 4 external calls (new, from_secs, now, vec!).
 
@@ -1185,11 +1195,11 @@ async fn test_review_params() -> GuardianReviewSessionParams
 async fn guardian_review_session_config_change_invalidates_cached_session()
 ```
 
-**Purpose**: Verifies that changing a spawn-relevant config field changes the guardian session reuse key.
+**Purpose**: Checks that a meaningful model-provider configuration change makes a cached Guardian session unusable. This protects against reusing a reviewer with old connection settings.
 
-**Data flow**: Builds a cached guardian config and reuse key, mutates the parent config’s provider base URL, rebuilds the guardian config and reuse key, and asserts the keys differ while recomputing the original key remains stable.
+**Data flow**: It builds one Guardian config and reuse key, changes the parent model provider base URL, builds another config and key, and asserts that the keys differ while the original key remains stable.
 
-**Call relations**: Tests `GuardianReviewSessionReuseKey::from_spawn_config` and the reuse invalidation policy.
+**Call relations**: This test exercises build_guardian_review_session_config and GuardianReviewSessionReuseKey::from_spawn_config together.
 
 *Call graph*: calls 3 internal fn (test_config, from_spawn_config, build_guardian_review_session_config); 2 external calls (assert_eq!, assert_ne!).
 
@@ -1200,11 +1210,11 @@ async fn guardian_review_session_config_change_invalidates_cached_session()
 async fn guardian_prompt_cache_key_is_scoped_to_parent_thread()
 ```
 
-**Purpose**: Verifies that guardian prompt-cache keys are stable per parent thread, differ across parent threads, and are absent for non-guardian or missing-parent cases.
+**Purpose**: Checks that Guardian prompt cache keys are tied to the parent thread and only apply to Guardian subagents. This prevents cache sharing across unrelated conversations.
 
-**Data flow**: Constructs a guardian `SessionSource`, generates thread IDs, calls `prompt_cache_key_override_for_review_session` under several scenarios, and asserts equality, inequality, and `None` cases.
+**Data flow**: It builds a Guardian session source and parent thread id, asks for cache keys with same and different parents, and checks non-Guardian or missing-parent cases return none.
 
-**Call relations**: Tests the prompt-cache-key helper used to stabilize guardian prompt caching.
+**Call relations**: This test directly validates prompt_cache_key_override_for_review_session.
 
 *Call graph*: calls 2 internal fn (prompt_cache_key_override_for_review_session, new); 5 external calls (SubAgent, assert!, assert_eq!, assert_ne!, Other).
 
@@ -1215,11 +1225,11 @@ async fn guardian_prompt_cache_key_is_scoped_to_parent_thread()
 async fn guardian_review_session_compact_scope_change_invalidates_cached_session()
 ```
 
-**Purpose**: Verifies that changing auto-compaction scope affects the guardian session reuse key.
+**Purpose**: Checks that changing auto-compaction scope invalidates Guardian session reuse. Compaction changes what history the model sees, so reuse must be conservative.
 
-**Data flow**: Builds a baseline guardian config and reuse key, mutates `model_auto_compact_token_limit_scope`, rebuilds, and asserts the reuse key changes.
+**Data flow**: It builds a reuse key from the default config, changes the compact token limit scope, builds a second key, and asserts that they differ.
 
-**Call relations**: Another reuse-key invalidation test covering compaction-related config.
+**Call relations**: This test covers the reuse-key fields selected by GuardianReviewSessionReuseKey::from_spawn_config.
 
 *Call graph*: calls 3 internal fn (test_config, from_spawn_config, build_guardian_review_session_config); 1 external calls (assert_ne!).
 
@@ -1230,11 +1240,11 @@ async fn guardian_review_session_compact_scope_change_invalidates_cached_session
 async fn guardian_review_session_config_disables_hooks()
 ```
 
-**Purpose**: Checks that guardian session config disables the `CodexHooks` feature even if the parent config enabled it.
+**Purpose**: Checks that Guardian configs turn off hook features. Hooks are extension points that should not run inside this safer reviewer session.
 
-**Data flow**: Enables hooks on a parent config, builds guardian config, and asserts the resulting feature flag is disabled.
+**Data flow**: It enables hooks on a parent test config, builds the Guardian config, and asserts hooks are disabled there.
 
-**Call relations**: Tests one of the hardening invariants enforced by `build_guardian_review_session_config`.
+**Call relations**: This test validates one safety rule in build_guardian_review_session_config.
 
 *Call graph*: calls 2 internal fn (test_config, build_guardian_review_session_config); 1 external calls (assert!).
 
@@ -1245,11 +1255,11 @@ async fn guardian_review_session_config_disables_hooks()
 async fn guardian_review_session_config_disables_skill_instructions()
 ```
 
-**Purpose**: Checks that guardian session config disables skill instructions inherited from the parent config.
+**Purpose**: Checks that Guardian sessions do not include skill instructions from the parent. The reviewer should follow Guardian policy, not unrelated assistant skills.
 
-**Data flow**: Sets `include_skill_instructions = true` on the parent config, builds guardian config, and asserts the guardian config has it disabled.
+**Data flow**: It enables skill instructions on the parent config, builds the Guardian config, and asserts the Guardian setting is off.
 
-**Call relations**: Tests another hardening invariant of guardian session config.
+**Call relations**: This test validates another isolation rule in build_guardian_review_session_config.
 
 *Call graph*: calls 2 internal fn (test_config, build_guardian_review_session_config); 1 external calls (assert!).
 
@@ -1260,11 +1270,11 @@ async fn guardian_review_session_config_disables_skill_instructions()
 async fn run_before_review_deadline_times_out_before_future_completes()
 ```
 
-**Purpose**: Verifies that `run_before_review_deadline` returns `TimedOut` when the deadline expires before the future finishes.
+**Purpose**: Verifies that the deadline helper reports a timeout when work takes too long.
 
-**Data flow**: Runs the helper with a short deadline and a longer sleep future, awaits the result, and asserts it is `Err(TimedOut)`.
+**Data flow**: It runs a future that sleeps longer than a short deadline and checks that the result is TimedOut.
 
-**Call relations**: Tests the deadline branch of the generic deadline wrapper.
+**Call relations**: This test directly exercises run_before_review_deadline.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline); 4 external calls (from_millis, assert!, now, sleep).
 
@@ -1275,11 +1285,11 @@ async fn run_before_review_deadline_times_out_before_future_completes()
 async fn run_before_review_deadline_aborts_when_cancelled()
 ```
 
-**Purpose**: Verifies that `run_before_review_deadline` returns `Aborted` when the external cancellation token fires first.
+**Purpose**: Verifies that the deadline helper reports an abort when an external cancellation token fires.
 
-**Data flow**: Creates a cancellation token, spawns a task to cancel it shortly, runs the helper with a pending future, and asserts the result is `Err(Aborted)`.
+**Data flow**: It starts a task that cancels a token shortly after the test begins, runs pending work with that token, and checks that the result is Aborted.
 
-**Call relations**: Tests the cancellation branch of the generic deadline wrapper.
+**Call relations**: This test directly exercises the cancellation branch of run_before_review_deadline.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline); 7 external calls (new, from_millis, from_secs, assert!, spawn, now, sleep).
 
@@ -1290,11 +1300,11 @@ async fn run_before_review_deadline_aborts_when_cancelled()
 async fn run_before_review_deadline_with_cancel_cancels_token_on_timeout()
 ```
 
-**Purpose**: Verifies that the internal cancel token is cancelled when the wrapped operation times out.
+**Purpose**: Checks that the cancel-aware deadline helper cancels its internal token after a timeout.
 
-**Data flow**: Runs `run_before_review_deadline_with_cancel` with a short deadline and a longer sleep future, asserts the result is `Err(TimedOut)`, and checks `cancel_token.is_cancelled()`.
+**Data flow**: It runs work that sleeps past the deadline, expects a TimedOut result, and verifies the supplied cancellation token is marked cancelled.
 
-**Call relations**: Tests the timeout side effect of the cancel-propagating wrapper.
+**Call relations**: This test directly validates run_before_review_deadline_with_cancel.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline_with_cancel); 5 external calls (new, from_millis, assert!, now, sleep).
 
@@ -1305,11 +1315,11 @@ async fn run_before_review_deadline_with_cancel_cancels_token_on_timeout()
 async fn run_before_review_deadline_with_cancel_cancels_token_on_abort()
 ```
 
-**Purpose**: Verifies that the internal cancel token is cancelled when the wrapped operation is externally aborted.
+**Purpose**: Checks that the cancel-aware deadline helper cancels its internal token after external abort.
 
-**Data flow**: Creates external and internal cancellation tokens, schedules external cancellation, runs the helper with a pending future, and asserts both `Err(Aborted)` and internal token cancellation.
+**Data flow**: It arranges an external token to cancel, runs pending work through the helper, then checks for Aborted and confirms the internal token was cancelled.
 
-**Call relations**: Tests the abort side effect of the cancel-propagating wrapper.
+**Call relations**: This test validates the abort path of run_before_review_deadline_with_cancel.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline_with_cancel); 7 external calls (new, from_millis, from_secs, assert!, spawn, now, sleep).
 
@@ -1320,11 +1330,11 @@ async fn run_before_review_deadline_with_cancel_cancels_token_on_abort()
 async fn run_before_review_deadline_with_cancel_preserves_token_on_success()
 ```
 
-**Purpose**: Verifies that the internal cancel token remains untouched when the wrapped operation succeeds before deadline or cancellation.
+**Purpose**: Checks that successful work does not cancel the supplied token. This prevents normal Guardian spawning from being stopped accidentally.
 
-**Data flow**: Runs the helper with a successful immediate future, asserts the returned value, and checks that the cancel token is not cancelled.
+**Data flow**: It runs a quick future returning a number, asserts the number is returned, and verifies the token is still active.
 
-**Call relations**: Tests the success path of the cancel-propagating wrapper.
+**Call relations**: This test validates the success path of run_before_review_deadline_with_cancel.
 
 *Call graph*: calls 1 internal fn (run_before_review_deadline_with_cancel); 5 external calls (new, from_secs, assert!, assert_eq!, now).
 
@@ -1335,11 +1345,11 @@ async fn run_before_review_deadline_with_cancel_preserves_token_on_success()
 fn had_prior_review_context_tracks_prompt_mode()
 ```
 
-**Purpose**: Verifies that only delta prompt mode is reported as having prior review context.
+**Purpose**: Checks that full prompts are not marked as prior-context reviews and delta prompts are. This keeps analytics classification accurate.
 
-**Data flow**: Calls `had_prior_review_context` with `Full` and `Delta` prompt modes and asserts false/true respectively.
+**Data flow**: It calls the helper with a full mode and a delta mode, then asserts the expected false and true results.
 
-**Call relations**: Tests the analytics helper used by `run_review_on_session`.
+**Call relations**: This test directly validates had_prior_review_context.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -1350,11 +1360,11 @@ fn had_prior_review_context_tracks_prompt_mode()
 fn token_usage_delta_never_reports_negative_usage()
 ```
 
-**Purpose**: Verifies that token-usage deltas clamp negative differences to zero.
+**Purpose**: Checks that token usage differences never go below zero. This guards against odd counters or resets creating impossible negative analytics.
 
-**Data flow**: Constructs start and end `TokenUsage` values with some decreasing fields, calls `token_usage_delta`, and asserts the returned struct contains only non-negative deltas.
+**Data flow**: It builds start and end usage records where some end fields are lower, calls token_usage_delta, and asserts those fields become zero while positive deltas remain.
 
-**Call relations**: Tests the token accounting helper used after successful guardian reviews.
+**Call relations**: This test directly validates token_usage_delta.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1365,11 +1375,11 @@ fn token_usage_delta_never_reports_negative_usage()
 async fn run_review_on_reused_session_waits_for_submitted_turn()
 ```
 
-**Purpose**: Verifies that a reused guardian session ignores stale prior-turn completion events and waits for the completion of the newly submitted child turn.
+**Purpose**: Verifies that a reused Guardian session waits for the newly submitted turn, not an older completion event. This is important because reused sessions may still have stale events in their stream.
 
-**Data flow**: Creates a test review session with prior-review state, spawns `run_review_on_session`, receives the submitted child turn ID from the submission channel, injects a stale prior-turn completion followed by the real completion for the submitted turn, and asserts the outcome uses the fresh message and TTFT.
+**Data flow**: It prepares a session with prior review state, starts run_review_on_session, captures the submitted turn id, sends one stale completion and one matching completion, and checks that the fresh result is used.
 
-**Call relations**: Exercises the interaction between `run_review_on_session`, submission, and `wait_for_guardian_review` on reused sessions.
+**Call relations**: This test exercises run_review_on_session and the turn-matching behavior inside wait_for_guardian_review.
 
 *Call graph*: calls 1 internal fn (run_review_on_session); 9 external calls (from_secs, assert!, assert_eq!, test_review_params, test_review_session, turn_complete_event, panic!, spawn, now).
 
@@ -1380,11 +1390,11 @@ async fn run_review_on_reused_session_waits_for_submitted_turn()
 async fn run_review_removes_trunk_when_event_stream_is_broken()
 ```
 
-**Purpose**: Verifies that the manager discards the cached trunk session when its event stream is broken.
+**Purpose**: Checks that the manager discards a trunk session if its event stream is broken. A broken reviewer should not be cached for future reviews.
 
-**Data flow**: Seeds a manager with a trunk review session, drops the event sender to break the stream, runs `manager.run_review`, and asserts the outcome is a completed error and the trunk cache is now empty.
+**Data flow**: It creates a manager with a matching trunk, drops the event sender to break the stream, runs a review, and asserts the outcome is an error and the trunk is gone.
 
-**Call relations**: Tests the non-reusable-session path in `GuardianReviewSessionManager::run_review`.
+**Call relations**: This test drives GuardianReviewSessionManager::run_review and its remove_trunk_if_current cleanup path.
 
 *Call graph*: calls 1 internal fn (from_spawn_config); 6 external calls (new, new, new, assert!, test_review_params, test_review_session).
 
@@ -1395,11 +1405,11 @@ async fn run_review_removes_trunk_when_event_stream_is_broken()
 async fn wait_for_guardian_review_ignores_prior_turn_completion()
 ```
 
-**Purpose**: Verifies that waiting for a guardian review ignores stale completion events from earlier turns and captures TTFT from the expected turn.
+**Purpose**: Checks that waiting for a Guardian review ignores completion events from older turns.
 
-**Data flow**: Injects a prior-turn completion and then a current-turn completion into a test session, calls `wait_for_guardian_review`, and asserts it returns the current turn’s message, TTFT, and token-usage capture flag.
+**Data flow**: It sends a stale completion followed by the current turn completion, then verifies the returned message and timing come from the current turn.
 
-**Call relations**: Directly tests stale-event filtering in `wait_for_guardian_review`.
+**Call relations**: This test directly exercises wait_for_guardian_review.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 7 external calls (from_secs, assert!, assert_eq!, test_review_session, turn_complete_event, panic!, now).
 
@@ -1410,11 +1420,11 @@ async fn wait_for_guardian_review_ignores_prior_turn_completion()
 async fn wait_for_guardian_review_ignores_prior_turn_errors()
 ```
 
-**Purpose**: Verifies that stale error events from prior turns do not poison the current guardian review outcome.
+**Purpose**: Checks that errors from older turns do not poison the current Guardian review.
 
-**Data flow**: Injects a prior-turn `ErrorEvent` and then a current-turn completion with no message, calls `wait_for_guardian_review`, and asserts it still returns a completed outcome for the current turn rather than surfacing the stale error.
+**Data flow**: It sends a stale error event, then a current turn completion with no final message, and verifies the current turn completes normally.
 
-**Call relations**: Tests that `last_error` is only meaningful for the expected turn.
+**Call relations**: This test validates wait_for_guardian_review’s filtering of stale events.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 8 external calls (from_secs, assert!, assert_eq!, test_review_session, turn_complete_event, panic!, Error, now).
 
@@ -1425,11 +1435,11 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors()
 async fn wait_for_guardian_review_preserves_structured_session_error()
 ```
 
-**Purpose**: Verifies that a matching-turn error followed by a completion without a final message is surfaced as `SessionFailed` with preserved structured `CodexErrorInfo`.
+**Purpose**: Checks that a current-turn Guardian error keeps its structured error information. Structured error information lets higher layers distinguish causes such as server overload.
 
-**Data flow**: Injects a current-turn `ErrorEvent` carrying `ServerOverloaded`, then a current-turn completion with no message, calls `wait_for_guardian_review`, and asserts the returned outcome is `SessionFailed { error, error_info }` with the original values.
+**Data flow**: It sends a current-turn error with a structured code, then a completion without a final message, and asserts the outcome contains the original message and code.
 
-**Call relations**: Tests the structured-error preservation branch in `wait_for_guardian_review`.
+**Call relations**: This test validates the error-handling path in wait_for_guardian_review.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 8 external calls (from_secs, assert!, assert_eq!, test_review_session, turn_complete_event, panic!, Error, now).
 
@@ -1440,11 +1450,11 @@ async fn wait_for_guardian_review_preserves_structured_session_error()
 async fn wait_for_guardian_review_ignores_prior_turn_aborts()
 ```
 
-**Purpose**: Verifies that stale abort events from prior turns do not terminate the current guardian review wait.
+**Purpose**: Checks that abort events from older turns do not abort the current review.
 
-**Data flow**: Injects a prior-turn abort and then a current-turn completion, calls `wait_for_guardian_review`, and asserts it returns the current turn’s successful completion.
+**Data flow**: It sends a stale abort event followed by a current completion, then verifies the current review succeeds.
 
-**Call relations**: Another stale-event filtering test for `wait_for_guardian_review`.
+**Call relations**: This test directly validates stale-abort filtering in wait_for_guardian_review.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 8 external calls (from_secs, assert!, assert_eq!, test_review_session, turn_aborted_event, turn_complete_event, panic!, now).
 
@@ -1455,11 +1465,11 @@ async fn wait_for_guardian_review_ignores_prior_turn_aborts()
 async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_terminal_event()
 ```
 
-**Purpose**: Verifies that timeout handling interrupts and drains the expected turn even when a stale terminal event was seen earlier.
+**Purpose**: Checks that timeout cleanup interrupts and drains the expected current turn, even if an older terminal event appears first.
 
-**Data flow**: Injects a stale prior-turn completion, arranges for the next submission to be an `Op::Interrupt` that triggers a current-turn abort event, calls `wait_for_guardian_review` with a near-immediate deadline, and asserts the outcome is `TimedOut` with session preservation and no token-usage capture.
+**Data flow**: It sends a stale completion, lets the review timeout, intercepts the interrupt submission, sends a current-turn abort, and verifies the review reports TimedOut while keeping the session reusable.
 
-**Call relations**: Tests the timeout-and-drain path in `wait_for_guardian_review` and `interrupt_and_drain_turn`.
+**Call relations**: This test exercises wait_for_guardian_review together with interrupt_and_drain_turn behavior.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 7 external calls (from_millis, assert!, test_review_session, turn_aborted_event, turn_complete_event, spawn, now).
 
@@ -1470,11 +1480,11 @@ async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_termi
 async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_terminal_event()
 ```
 
-**Purpose**: Verifies that cancellation handling interrupts and drains the expected turn even when stale terminal events are present.
+**Purpose**: Checks that cancellation cleanup also drains the expected current turn after ignoring stale terminal events.
 
-**Data flow**: Injects a stale prior-turn completion, arranges for interrupt submission to yield a current-turn abort event, cancels the external token, calls `wait_for_guardian_review`, and asserts the outcome is `Aborted` with session preservation and no token-usage capture.
+**Data flow**: It sends a stale completion, uses an already-cancelled external token, observes the interrupt submission, sends the current abort, and checks the outcome is Aborted and reusable.
 
-**Call relations**: Tests the cancellation-and-drain path in `wait_for_guardian_review`.
+**Call relations**: This test validates wait_for_guardian_review’s external-cancel path and its use of interrupt draining.
 
 *Call graph*: calls 2 internal fn (without_session, wait_for_guardian_review); 8 external calls (new, from_secs, assert!, test_review_session, turn_aborted_event, turn_complete_event, spawn, now).
 
@@ -1485,11 +1495,11 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
 async fn interrupt_and_drain_turn_ignores_prior_turn_completion()
 ```
 
-**Purpose**: Verifies that interrupt draining ignores stale prior-turn completion events and waits for the expected turn’s terminal event.
+**Purpose**: Checks that interrupt draining waits for the target turn and ignores older completions. This prevents cleanup from stopping too early.
 
-**Data flow**: Injects a prior-turn completion and a current-turn abort into a test session, calls `interrupt_and_drain_turn`, asserts success, and checks that the event queue is empty afterward.
+**Data flow**: It sends an old completion and a current abort, calls interrupt_and_drain_turn, and confirms the event stream has been drained through the current abort.
 
-**Call relations**: Directly tests the stale-event filtering inside `interrupt_and_drain_turn`.
+**Call relations**: This test directly exercises interrupt_and_drain_turn and its event_matches_turn filtering.
 
 *Call graph*: calls 1 internal fn (interrupt_and_drain_turn); 4 external calls (assert!, test_review_session, turn_aborted_event, turn_complete_event).
 
@@ -1499,11 +1509,15 @@ Coordinates the full guardian approval-review workflow, tying request modeling, 
 
 ### `core/src/guardian/review.rs`
 
-`orchestration` · `approval handling and guardian review completion`
+`orchestration` · `request handling`
 
-This file drives a guardian review from start to finish. It decides whether approvals should route through guardian, creates review IDs, emits in-progress and terminal `GuardianAssessmentEvent`s, invokes the nested guardian review session with a strict JSON schema, and translates the result into a `ReviewDecision`. The workflow is intentionally fail-closed: explicit deny returns `Denied`, parse/session/prompt-build failures synthesize a high-risk deny rationale, timeout returns `TimedOut`, and cancellation returns `Abort`. Successful and failed reviews are both tracked through `GuardianReviewAnalyticsResult`, which is sent to both metrics and analytics.
+When the agent wants to do something that needs permission, this file can route that request to a special “guardian” reviewer instead of asking the user directly. The guardian is another locked-down review session whose job is only to judge risk. Think of it like a safety inspector: the main worker pauses, the inspector reads the proposed action, and then returns a clear allow-or-deny decision.
 
-The central `run_guardian_review` function computes request metadata such as target item ID, assessment turn ID, and redacted action summary, then handles several branches: immediate external cancellation, completed allow/deny assessment, timeout, cancellation, or fail-closed error. It stores denial rationales in `session.services.guardian_rejections` keyed by review ID so later user-facing rejection messages can retrieve them. It also updates the `GuardianRejectionCircuitBreaker`: explicit denials count toward interruption thresholds, while approvals, timeouts, cancellations, and fail-closed errors are recorded as non-denials. Retry behavior is narrowly scoped in `should_retry_guardian_review` to transient structured session failures and parse errors, with bounded exponential backoff and a shared absolute deadline. The file also supports detached review execution on a dedicated current-thread Tokio runtime for callers that need a oneshot receiver.
+The file starts by creating review IDs, deciding whether a request should go to the guardian, and formatting messages for denied or timed-out reviews. The main path sends an “in progress” event, runs the guardian review with a deadline, retries only for problems that are likely temporary, parses the guardian’s answer, and then turns that answer into a normal approval decision.
+
+It is deliberately cautious. If the guardian cannot be reached, gives malformed output, or fails in most ways, the code “fails closed,” meaning it blocks the action rather than silently allowing it. Timeouts are treated specially: they still do not approve the action, but callers can tell the difference between a timeout and an explicit denial.
+
+The file also records metrics, stores denial reasons so later messages can explain them, and has a circuit breaker that interrupts a turn if too many automatic reviews are denied in a row.
 
 #### Function details
 
@@ -1513,11 +1527,11 @@ The central `run_guardian_review` function computes request metadata such as tar
 fn new_guardian_review_id() -> String
 ```
 
-**Purpose**: Generates a fresh UUID string for a guardian review instance.
+**Purpose**: Creates a fresh unique ID for one guardian review. This lets events, metrics, stored rejection reasons, and final decisions all refer to the same review.
 
-**Data flow**: Calls `uuid::Uuid::new_v4()`, converts it to a string, and returns it.
+**Data flow**: It takes no input. It asks the UUID library for a new random identifier and turns it into text. The output is that text ID.
 
-**Call relations**: Used by higher-level approval flows when they need a unique review identifier before invoking guardian review orchestration.
+**Call relations**: Other approval-review code can call this before starting a review, then pass the ID through the rest of this file so every later event can be tied back to the same review.
 
 *Call graph*: 1 external calls (new_v4).
 
@@ -1528,11 +1542,11 @@ fn new_guardian_review_id() -> String
 async fn guardian_rejection_message(session: &Session, review_id: &str) -> String
 ```
 
-**Purpose**: Builds the user-facing rejection message for a previously denied guardian review, consuming any stored rationale from session state. It falls back to a generic denial rationale if none was stored or the stored rationale is blank.
+**Purpose**: Builds the message shown after the guardian has rejected an action. It explains the reason and warns the agent not to work around the denial.
 
-**Data flow**: Reads `session.services.guardian_rejections`, removes the entry for `review_id`, filters out empty rationales, substitutes a default `GuardianRejection` if needed, and formats a message containing the rationale plus `GUARDIAN_REJECTION_INSTRUCTIONS`. It returns the final `String`.
+**Data flow**: It receives the session and a review ID. It looks up and removes the saved rejection reason for that ID; if none exists, it uses a generic fallback reason. It returns a user-facing text message with the rationale and safety instructions.
 
-**Call relations**: Called after a denial when the system needs to explain the guardian decision to the user. It depends on `run_guardian_review` having inserted a `GuardianRejection` for denied reviews.
+**Call relations**: This is used after a denial has already been recorded by the review flow. It depends on the rejection store populated by run_guardian_review when the guardian denies an action.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1543,11 +1557,11 @@ async fn guardian_rejection_message(session: &Session, review_id: &str) -> Strin
 fn guardian_timeout_message() -> String
 ```
 
-**Purpose**: Returns the canned user-facing message for guardian review timeouts.
+**Purpose**: Returns the standard message used when the guardian review did not finish in time. The wording tells the agent not to assume the action is unsafe solely because of the timeout.
 
-**Data flow**: Clones `GUARDIAN_TIMEOUT_INSTRUCTIONS` into a `String` and returns it.
+**Data flow**: It takes no input. It copies a fixed instruction string into a new text value. The output is that timeout message.
 
-**Call relations**: Used by callers that need to distinguish timeout guidance from explicit policy denial messaging.
+**Call relations**: Callers use this when a review ends with the timed-out decision produced by run_guardian_review.
 
 
 ##### `GuardianReviewError::prompt_build`  (lines 119–123)
@@ -1556,11 +1570,11 @@ fn guardian_timeout_message() -> String
 fn prompt_build(err: anyhow::Error) -> Self
 ```
 
-**Purpose**: Wraps an arbitrary error as a guardian prompt-build failure.
+**Purpose**: Wraps a prompt or configuration-building failure in the guardian review error type. This keeps prompt setup failures separate from model-session failures or parsing failures.
 
-**Data flow**: Consumes an `anyhow::Error`, converts it to a string, and returns `GuardianReviewError::PromptBuild { message }`.
+**Data flow**: It receives a general error value. It converts that error into readable text and stores it in the PromptBuild variant. The output is a GuardianReviewError.
 
-**Call relations**: Used by review-session orchestration and tests to classify failures that occur before the nested guardian turn is submitted.
+**Call relations**: run_guardian_review_session_before_deadline uses this when it cannot prepare the guardian review session. The tests also call it to confirm that this kind of error is classified correctly.
 
 *Call graph*: called by 3 (guardian_review_error_reason_distinguishes_error_kinds, guardian_review_retry_only_retries_transient_session_and_parse_errors, run_guardian_review_session_before_deadline); 1 external calls (to_string).
 
@@ -1571,11 +1585,11 @@ fn prompt_build(err: anyhow::Error) -> Self
 fn session(err: anyhow::Error) -> Self
 ```
 
-**Purpose**: Wraps an arbitrary error as an unstructured guardian session failure.
+**Purpose**: Wraps a guardian session failure when there is no structured error detail. It records the problem as text so it can be surfaced and tracked.
 
-**Data flow**: Consumes an `anyhow::Error`, stringifies it, and returns `GuardianReviewError::Session { message, error_info: None }`.
+**Data flow**: It receives a general error value. It converts it to a message and stores it as a Session error with no extra error info. The output is a GuardianReviewError.
 
-**Call relations**: Used when the nested guardian session fails without structured `CodexErrorInfo` metadata.
+**Call relations**: run_guardian_review_session_before_deadline uses this for ordinary guardian runtime failures. The tests use it to check retry and failure-reason behavior.
 
 *Call graph*: called by 3 (guardian_review_error_reason_distinguishes_error_kinds, guardian_review_retry_only_retries_transient_session_and_parse_errors, run_guardian_review_session_before_deadline); 1 external calls (to_string).
 
@@ -1586,11 +1600,11 @@ fn session(err: anyhow::Error) -> Self
 fn session_with_error_info(err: anyhow::Error, error_info: CodexErrorInfo) -> Self
 ```
 
-**Purpose**: Wraps an arbitrary error as a guardian session failure while preserving structured `CodexErrorInfo` for retry decisions and analytics.
+**Purpose**: Wraps a guardian session failure together with structured error information. The structured part lets retry logic tell temporary service problems apart from permanent failures.
 
-**Data flow**: Consumes an `anyhow::Error` and a `CodexErrorInfo`, stringifies the error, and returns `GuardianReviewError::Session { message, error_info: Some(error_info) }`.
+**Data flow**: It receives a general error and a CodexErrorInfo value. It stores the error message and the structured detail inside a Session error. The output is a GuardianReviewError.
 
-**Call relations**: Used by review-session orchestration when the nested session surfaces a typed backend failure such as overload or connection loss.
+**Call relations**: run_guardian_review_session_before_deadline uses this when the lower review session reports extra error details. should_retry_guardian_review later reads those details to decide whether another attempt is worth trying.
 
 *Call graph*: called by 3 (guardian_review_error_reason_distinguishes_error_kinds, guardian_review_retry_only_retries_transient_session_and_parse_errors, run_guardian_review_session_before_deadline); 1 external calls (to_string).
 
@@ -1601,11 +1615,11 @@ fn session_with_error_info(err: anyhow::Error, error_info: CodexErrorInfo) -> Se
 fn parse(err: anyhow::Error) -> Self
 ```
 
-**Purpose**: Wraps an arbitrary error as a guardian assessment parse failure.
+**Purpose**: Wraps a failure to read the guardian’s answer. This is used when the review session produced text, but it did not match the expected assessment format.
 
-**Data flow**: Consumes an `anyhow::Error`, converts it to a string, and returns `GuardianReviewError::Parse { message }`.
+**Data flow**: It receives a general parsing error. It turns the error into text and stores it in the Parse variant. The output is a GuardianReviewError.
 
-**Call relations**: Used after the nested guardian session completes but its final message cannot be parsed into a `GuardianAssessment`.
+**Call relations**: run_guardian_review_session_before_deadline uses this after parse_guardian_assessment fails. The retry logic treats parse errors as retryable, and tests confirm that behavior.
 
 *Call graph*: called by 3 (guardian_review_error_reason_distinguishes_error_kinds, guardian_review_retry_only_retries_transient_session_and_parse_errors, run_guardian_review_session_before_deadline); 1 external calls (to_string).
 
@@ -1616,11 +1630,11 @@ fn parse(err: anyhow::Error) -> Self
 fn failure_reason(&self) -> GuardianReviewFailureReason
 ```
 
-**Purpose**: Maps internal guardian review error variants to analytics failure-reason enums.
+**Purpose**: Converts an internal guardian review error into the smaller set of failure reasons used by analytics. This keeps reporting consistent even though the code has more detailed error variants.
 
-**Data flow**: Matches `self` and returns the corresponding `GuardianReviewFailureReason` variant for prompt-build, session, parse, timeout, or cancellation failures.
+**Data flow**: It reads the kind of GuardianReviewError it was called on. It maps that kind to a GuardianReviewFailureReason such as timeout, cancelled, parse error, session error, or prompt-build error. The output is the analytics-friendly reason.
 
-**Call relations**: Called when constructing `GuardianReviewAnalyticsResult` for failed or aborted reviews.
+**Call relations**: run_guardian_review calls this when tracking failed, timed-out, or aborted reviews. The tests verify that each internal error kind reports the expected analytics reason.
 
 
 ##### `guardian_risk_level_str`  (lines 156–163)
@@ -1629,11 +1643,11 @@ fn failure_reason(&self) -> GuardianReviewFailureReason
 fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str
 ```
 
-**Purpose**: Converts a `GuardianRiskLevel` into the lowercase string used in warning messages.
+**Purpose**: Turns a guardian risk level into plain text for warning messages. This avoids exposing enum-style names directly to users.
 
-**Data flow**: Matches the enum and returns `low`, `medium`, `high`, or `critical`.
+**Data flow**: It receives a risk level such as low, medium, high, or critical. It chooses the matching lowercase word. The output is a static text slice.
 
-**Call relations**: Used by `run_guardian_review` when formatting the final warning event for approved or denied assessments.
+**Call relations**: run_guardian_review uses this when it writes the final approval or denial warning shown to the session.
 
 
 ##### `routes_approval_to_guardian`  (lines 168–170)
@@ -1642,11 +1656,11 @@ fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str
 fn routes_approval_to_guardian(turn: &TurnContext) -> bool
 ```
 
-**Purpose**: Determines whether the current turn’s approval policy and configured reviewer route approvals through guardian.
+**Purpose**: Decides whether the current turn should send approval prompts to the automatic guardian reviewer. It uses the reviewer setting already stored on the turn.
 
-**Data flow**: Reads the `TurnContext`, extracts `turn.config.approvals_reviewer`, forwards both to `routes_approval_to_guardian_with_reviewer`, and returns the resulting boolean.
+**Data flow**: It receives the turn context. It reads the turn’s approval policy and configured approvals reviewer, then delegates the actual check. The output is true if guardian review should be used, otherwise false.
 
-**Call relations**: This is the common routing predicate used by approval handling code. It delegates the actual policy/reviewer check to the reviewer-aware helper.
+**Call relations**: This is the simple entry point for routing decisions. It hands the details to routes_approval_to_guardian_with_reviewer so the same rule can also be used with an explicit reviewer choice.
 
 *Call graph*: calls 1 internal fn (routes_approval_to_guardian_with_reviewer).
 
@@ -1660,11 +1674,11 @@ fn routes_approval_to_guardian_with_reviewer(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a specific reviewer selection should route approvals through guardian for the given turn. It only allows guardian for `OnRequest` or `Granular` approval policies paired with `ApprovalsReviewer::AutoReview`.
+**Purpose**: Applies the exact rule for guardian routing. Approval prompts go to the guardian only when approvals are request-based or granular, and the selected reviewer is AutoReview.
 
-**Data flow**: Reads `turn.approval_policy.value()` and the supplied `approvals_reviewer`, evaluates the match expression, and returns `true` or `false`.
+**Data flow**: It receives a turn context and an approvals reviewer choice. It reads the turn’s approval policy and compares the reviewer to AutoReview. The output is a boolean routing decision.
 
-**Call relations**: Called by `routes_approval_to_guardian` and by tests that simulate per-approval reviewer overrides.
+**Call relations**: routes_approval_to_guardian calls this with the turn’s configured reviewer. Other code can use it when an approval request brings its own reviewer selection.
 
 *Call graph*: called by 1 (routes_approval_to_guardian); 1 external calls (matches!).
 
@@ -1677,11 +1691,11 @@ fn is_guardian_reviewer_source(
 ) -> bool
 ```
 
-**Purpose**: Recognizes whether a session source identifies the internal guardian reviewer subagent.
+**Purpose**: Checks whether a session source represents the guardian reviewer itself. This helps distinguish guardian sub-agent work from normal user-facing agent work.
 
-**Data flow**: Matches the supplied `SessionSource` against `SessionSource::SubAgent(SubAgentSource::Other(label))` and returns true only when `label == GUARDIAN_REVIEWER_NAME`.
+**Data flow**: It receives a session source. It checks whether it is a sub-agent labeled with the guardian reviewer name. The output is true for guardian review sessions and false otherwise.
 
-**Call relations**: Used elsewhere in the system to distinguish guardian-owned sessions from user-visible or other internal subagents.
+**Call relations**: Other parts of the guardian system can use this to recognize review-session traffic and avoid treating it like ordinary agent activity.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1696,11 +1710,11 @@ fn track_guardian_review(
     reviewed_action: &GuardianReviewedAction,
 ```
 
-**Purpose**: Sends the completed guardian review analytics payload to both metrics and the analytics events client.
+**Purpose**: Records the outcome of a guardian review in both metrics and analytics. Metrics are useful for system health, while analytics events preserve richer review details.
 
-**Data flow**: Reads the parent `session`, tracking context, approval source, reviewed action, analytics result, and completion timestamp. It computes elapsed latency from `completed_at_ms - tracking.started_at_ms`, calls `emit_guardian_review_metrics` with the session telemetry, then forwards the same tracking/result pair to `analytics_events_client.track_guardian_review`. It returns nothing.
+**Data flow**: It receives the session, tracking context, request source, reviewed action, final result, and completion time. It calculates elapsed time from the review start, emits metrics, and sends an analytics event. It returns nothing but causes those tracking side effects.
 
-**Call relations**: Called from `run_guardian_review` on every terminal path so metrics and analytics stay in sync.
+**Call relations**: run_guardian_review calls this whenever a review reaches a terminal state: approved, denied, timed out, failed, or aborted.
 
 *Call graph*: calls 1 internal fn (emit_guardian_review_metrics); called by 1 (run_guardian_review).
 
@@ -1711,11 +1725,11 @@ fn track_guardian_review(
 async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str)
 ```
 
-**Purpose**: Marks a guardian review outcome as non-denial in the per-turn circuit breaker.
+**Purpose**: Tells the denial circuit breaker that this review did not count as a denial. This resets or advances the safety counter so one bad streak does not continue forever.
 
-**Data flow**: Locks `session.services.guardian_rejection_circuit_breaker`, calls `record_non_denial(turn_id)`, and returns nothing.
+**Data flow**: It receives the session and turn ID. It locks the circuit-breaker state and records a non-denial for that turn. It returns nothing, but updates shared session state.
 
-**Call relations**: Used by `run_guardian_review` for approvals, timeouts, cancellations, and fail-closed errors that should not count toward denial-triggered interruption.
+**Call relations**: run_guardian_review calls this for approvals, timeouts, cancellations, and failures that should not count as explicit guardian denials.
 
 *Call graph*: called by 1 (run_guardian_review).
 
@@ -1726,11 +1740,11 @@ async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str)
 async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>, turn_id: &str)
 ```
 
-**Purpose**: Records an explicit guardian denial in the circuit breaker and interrupts the turn if denial thresholds are crossed. It emits a warning before scheduling the asynchronous turn abort.
+**Purpose**: Records an explicit guardian denial and interrupts the turn if too many denials happen close together. This prevents the agent from repeatedly asking for risky actions after being rejected.
 
-**Data flow**: Locks the circuit breaker and calls `record_denial(turn_id)`. If the result is `Continue`, it returns immediately. On `InterruptTurn`, it checks that the turn is still active via `session.turn_context_for_sub_id(turn_id)`, sends a `GuardianWarning` event describing the consecutive and recent denial counts, clones the runtime handle and session, and spawns an async task that calls `abort_turn_if_active(turn_id, TurnAbortReason::Interrupted)`. It returns nothing.
+**Data flow**: It receives the session, turn context, and turn ID. It updates the denial circuit breaker. If the breaker says to interrupt, it sends a warning event and starts an asynchronous abort of the active turn. The output is no direct value, but the turn may be interrupted.
 
-**Call relations**: Called by `run_guardian_review` after explicit deny outcomes, and exposed to tests through `record_guardian_denial_for_test`. It is the bridge between denial counting and actual turn interruption.
+**Call relations**: run_guardian_review calls this after a completed guardian assessment denies the request. record_guardian_denial_for_test calls it so tests can exercise the same behavior.
 
 *Call graph*: called by 2 (record_guardian_denial_for_test, run_guardian_review); 3 external calls (clone, format!, GuardianWarning).
 
@@ -1745,11 +1759,11 @@ async fn record_guardian_denial_for_test(
 )
 ```
 
-**Purpose**: Test-visible wrapper around denial recording and possible turn interruption.
+**Purpose**: Exposes the denial-recording behavior to tests. It exists only in test builds.
 
-**Data flow**: Forwards the supplied session, turn, and turn ID to `record_guardian_denial` and awaits it.
+**Data flow**: It receives the same session, turn context, and turn ID used by the real helper. It forwards them to record_guardian_denial. The output is whatever state changes that helper performs.
 
-**Call relations**: Used only by tests that need to exercise the circuit-breaker interruption path.
+**Call relations**: Test code calls this wrapper instead of reaching into the private helper directly. The wrapper keeps production visibility narrow while still allowing coverage.
 
 *Call graph*: calls 1 internal fn (record_guardian_denial).
 
@@ -1766,11 +1780,11 @@ async fn run_guardian_review(
     approval_request
 ```
 
-**Purpose**: Executes one guardian approval review end-to-end, including event emission, nested review-session execution, retries, analytics, rejection storage, and circuit-breaker updates. It is the central state machine for guardian review outcomes.
+**Purpose**: Runs the full guardian approval review from start to finish. It announces the review, runs the reviewer, tracks the result, sends final events, stores denial reasons, updates the circuit breaker, and returns the approval decision.
 
-**Data flow**: Consumes cloned `Session` and `TurnContext`, a `review_id`, `GuardianApprovalRequest`, optional retry reason, approval source, and optional external cancellation token. It derives target item ID, assessment turn ID, action summary, reviewed action, and a `GuardianReviewTrackContext`; emits an in-progress `GuardianAssessmentEvent`; handles immediate cancellation as an aborted review; builds the output schema; runs `run_guardian_review_session_with_retry`; timestamps completion; then branches on `GuardianReviewOutcome`. Completed assessments produce approved/denied analytics, warning text, stored rejection rationale for denies, terminal assessment events, and either `ReviewDecision::Approved` or `Denied`. Timeout emits timeout analytics, a warning, a timed-out assessment event, records non-denial, and returns `TimedOut`. Cancellation emits aborted analytics and event, records non-denial, and returns `Abort`. Prompt-build/session/parse failures emit fail-closed analytics, synthesize a high-risk deny assessment, continue through the normal denied-event path, but do not count toward the denial circuit breaker. All terminal paths write events and analytics; some mutate `guardian_rejections` and the circuit breaker.
+**Data flow**: It receives the session, turn, review ID, approval request, optional retry reason, request source, and optional cancellation token. It extracts IDs and action summaries, sends an in-progress event, checks for early cancellation, runs the guardian session with retry, converts the outcome into approved, denied, timed out, or aborted, and records events and analytics. The output is a ReviewDecision, and it also updates session state such as rejection rationales and denial counters.
 
-**Call relations**: This function is invoked by both public review entrypoints. It delegates nested execution to `run_guardian_review_session_with_retry`, telemetry to `track_guardian_review`, and circuit-breaker bookkeeping to `record_guardian_denial` or `record_guardian_non_denial` depending on the terminal outcome.
+**Call relations**: review_approval_request and review_approval_request_with_cancel are the public-facing wrappers that call this. Inside, it hands the model work to run_guardian_review_session_with_retry, hands tracking to track_guardian_review, and updates denial state through record_guardian_denial or record_guardian_non_denial.
 
 *Call graph*: calls 12 internal fn (without_session, new, guardian_assessment_action, guardian_request_target_item_id, guardian_request_turn_id, guardian_reviewed_action, guardian_output_schema, record_guardian_denial, record_guardian_non_denial, run_guardian_review_session_with_retry (+2 more)); called by 2 (review_approval_request, review_approval_request_with_cancel); 5 external calls (pin, format!, matches!, GuardianAssessment, GuardianWarning).
 
@@ -1787,11 +1801,11 @@ async fn review_approval_request(
 ) -> ReviewDec
 ```
 
-**Purpose**: Public async entrypoint for guardian review of a main-turn approval request without external cancellation.
+**Purpose**: Starts a guardian review for a normal main-turn approval request. It is the public entry point when no external cancellation token is needed.
 
-**Data flow**: Clones the supplied `Arc<Session>` and `Arc<TurnContext>`, boxes the future from `run_guardian_review` with `GuardianApprovalRequestSource::MainTurn` and no cancel token, awaits it, and returns the resulting `ReviewDecision`.
+**Data flow**: It receives borrowed shared session and turn handles, a review ID, the request, and an optional retry reason. It clones the shared handles, marks the source as MainTurn, and calls the main review runner. The output is the final ReviewDecision.
 
-**Call relations**: Called by approval handling code for ordinary guardian-reviewed requests. It exists mainly to keep callers from inlining the full guardian async state machine.
+**Call relations**: Callers use this instead of calling run_guardian_review directly. It keeps the common case small and hides the lower-level options.
 
 *Call graph*: calls 1 internal fn (run_guardian_review); 2 external calls (clone, pin).
 
@@ -1807,11 +1821,11 @@ async fn review_approval_request_with_cancel(
     retry_reason: Option<String>,
 ```
 
-**Purpose**: Public async entrypoint for guardian review when the caller needs to propagate an external cancellation token and explicit approval-request source.
+**Purpose**: Starts a guardian review that can be cancelled from outside. This is useful when the parent work may be stopped while the review is still running.
 
-**Data flow**: Clones the supplied session and turn Arcs, forwards all arguments plus `Some(cancel_token)` to `run_guardian_review`, awaits completion, and returns the `ReviewDecision`.
+**Data flow**: It receives the session, turn, review ID, request, retry reason, request source, and cancellation token. It passes those into the main review runner. The output is the final ReviewDecision, which may be Abort if cancellation wins.
 
-**Call relations**: Used by callers that need cancellation-aware guardian review, including delegated subagent approval flows and detached review execution.
+**Call relations**: spawn_approval_request_review calls this inside its separate runtime. It is also the direct wrapper for callers that need cancellation-aware guardian review.
 
 *Call graph*: calls 1 internal fn (run_guardian_review); 1 external calls (clone).
 
@@ -1828,11 +1842,11 @@ fn spawn_approval_request_review(
     approval_req
 ```
 
-**Purpose**: Runs a guardian review on a dedicated current-thread Tokio runtime in a new OS thread and returns a oneshot receiver for the decision. It provides a detached execution mode for callers that cannot await directly.
+**Purpose**: Runs a guardian review on a separate operating-system thread and returns a one-shot receiver for the answer. A one-shot receiver is a small channel that delivers exactly one value.
 
-**Data flow**: Creates a oneshot channel, spawns a new thread, builds a current-thread Tokio runtime inside it, and either sends `ReviewDecision::Denied` immediately if runtime creation fails or blocks on `review_approval_request_with_cancel(...)` and sends the resulting decision through the channel. The function returns the receiver.
+**Data flow**: It receives all information needed for a guardian review. It creates a one-use channel, starts a new thread, builds a small Tokio async runtime there, runs the cancellation-aware review, and sends the final decision back through the channel. The output is the receiving end of that channel; if runtime creation fails, the sent decision is Denied.
 
-**Call relations**: This is the detached orchestration wrapper around `review_approval_request_with_cancel`. It isolates guardian review execution from the caller’s runtime and stack.
+**Call relations**: This is used when the caller wants to kick off review work without awaiting it directly in the current async task. The spawned thread calls review_approval_request_with_cancel, which then calls run_guardian_review.
 
 *Call graph*: 2 external calls (channel, spawn).
 
@@ -1848,11 +1862,11 @@ async fn run_guardian_review_session_before_deadline(
     schema: serde_j
 ```
 
-**Purpose**: Prepares the locked-down guardian review session configuration, runs one nested guardian review attempt before the shared deadline, and converts the session outcome into either a parsed assessment or a classified review error plus analytics metadata.
+**Purpose**: Runs one actual guardian review attempt before a fixed deadline. It prepares the locked-down review configuration, chooses the review model, launches the guardian session, and parses the guardian’s final answer.
 
-**Data flow**: Reads the parent `session`, `turn`, approval `request`, optional retry reason, output `schema`, optional external cancel token, and absolute `deadline`. It loads live network proxy state if present, lists available models, chooses the guardian review model and reasoning effort based on override/default/catalog availability, builds a guardian-specific `Config` with `build_guardian_review_session_config`, and invokes `session.guardian_review_session.run_review(...)`. It then maps `GuardianReviewSessionOutcome` variants into `GuardianReviewOutcome`: completed message payloads are parsed with `parse_guardian_assessment`, missing payloads become session errors, prompt-build/session failures are wrapped appropriately, and timeout/abort become `Timeout`/`Cancelled`. It returns `(GuardianReviewOutcome, GuardianReviewAnalyticsResult)`.
+**Data flow**: It receives the parent session and turn, approval request, retry reason, required output schema, optional cancellation token, and deadline. It reads live network settings and available models, chooses the best guardian model and reasoning effort, builds a restricted review-session configuration, runs the guardian review session, and converts the session outcome into either a parsed GuardianAssessment or a GuardianReviewError. The output also includes analytics details gathered by the review session.
 
-**Call relations**: Called by `run_guardian_review_session_with_retry` for each attempt. It is the boundary between parent-turn state and the reusable guardian review session manager.
+**Call relations**: run_guardian_review_session_with_retry calls this for each attempt. This function delegates prompt/config creation to build_guardian_review_session_config and output interpretation to parse_guardian_assessment.
 
 *Call graph*: calls 7 internal fn (without_session, parse_guardian_assessment, parse, prompt_build, session, session_with_error_info, build_guardian_review_session_config); called by 1 (run_guardian_review_session_with_retry); 5 external calls (clone, pin, anyhow!, Completed, Error).
 
@@ -1868,11 +1882,11 @@ async fn run_guardian_review_session_with_retry(
     schema: serde_json::
 ```
 
-**Purpose**: Runs guardian review attempts until one succeeds, a non-retriable outcome occurs, cancellation/deadline intervenes, or the maximum attempt count is reached.
+**Purpose**: Repeats guardian review attempts when retrying is safe and useful. It stops when a review succeeds, a non-retryable failure happens, the maximum attempt count is reached, the deadline expires, or cancellation happens.
 
-**Data flow**: Consumes session, turn, request, retry reason, schema, optional cancel token, and `max_attempts`. It asserts `max_attempts > 0`, computes a single absolute deadline from `GUARDIAN_REVIEW_TIMEOUT`, loops from attempt 1 upward, calls `run_guardian_review_session_before_deadline`, stamps `analytics_result.attempt_count`, checks `should_retry_guardian_review`, optionally waits via `wait_before_guardian_retry`, and either returns the current outcome/analytics or retries with incremented attempt count.
+**Data flow**: It receives the session, turn, request, retry reason, schema, optional cancellation token, and maximum attempt count. It sets one overall deadline, runs an attempt, records the attempt count in analytics, checks whether that outcome should be retried, waits with backoff if needed, and loops. The output is the final review outcome plus analytics from the last attempt.
 
-**Call relations**: Called only by `run_guardian_review`. It delegates attempt execution to `run_guardian_review_session_before_deadline`, retry classification to `should_retry_guardian_review`, and backoff/deadline handling to `wait_before_guardian_retry`.
+**Call relations**: run_guardian_review calls this to get a dependable final guardian result. It relies on run_guardian_review_session_before_deadline for each attempt, should_retry_guardian_review for the retry decision, and wait_before_guardian_retry for the pause between attempts.
 
 *Call graph*: calls 3 internal fn (run_guardian_review_session_before_deadline, should_retry_guardian_review, wait_before_guardian_retry); called by 1 (run_guardian_review); 6 external calls (clone, now, clone, assert!, clone, Error).
 
@@ -1887,11 +1901,11 @@ async fn wait_before_guardian_retry(
 ) -> Option<GuardianReviewError>
 ```
 
-**Purpose**: Sleeps for the backoff delay before the next guardian retry, but aborts early on cancellation and converts deadline exhaustion into a timeout error.
+**Purpose**: Waits before trying the guardian again, while still respecting the overall deadline and cancellation. The delay uses backoff, meaning later retries wait longer than earlier ones.
 
-**Data flow**: Reads `attempt_count`, absolute `deadline`, and optional external cancel token. It computes `retry_delay` via `backoff`, caps the wake-up time at the deadline, then `tokio::select!`s between sleeping until `retry_at` and waiting for cancellation. On sleep completion it returns `Some(GuardianReviewError::Timeout)` if the deadline has been reached, otherwise `None`; on cancellation it returns `Some(GuardianReviewError::Cancelled)`.
+**Data flow**: It receives the current attempt count, deadline, and optional cancellation token. It computes the next retry time, then waits until either that time arrives or cancellation is requested. It returns no error if retry can continue, Timeout if the deadline has passed, or Cancelled if cancellation happened.
 
-**Call relations**: Used by `run_guardian_review_session_with_retry` between attempts so retries respect both the global guardian timeout and caller cancellation.
+**Call relations**: run_guardian_review_session_with_retry calls this between retryable attempts. The tests call it directly to confirm that cancellation and deadlines are honored.
 
 *Call graph*: calls 1 internal fn (backoff); called by 3 (guardian_review_retry_wait_honors_cancellation, guardian_review_retry_wait_honors_deadline, run_guardian_review_session_with_retry); 2 external calls (now, select!).
 
@@ -1902,11 +1916,11 @@ async fn wait_before_guardian_retry(
 fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool
 ```
 
-**Purpose**: Determines whether a guardian review outcome is transient enough to retry. Only selected structured session failures and parse failures qualify.
+**Purpose**: Decides whether a failed guardian review should be attempted again. It only retries parsing problems and specific session failures that look temporary, such as server overload or broken connections.
 
-**Data flow**: Matches a borrowed `GuardianReviewOutcome` and returns true for `GuardianReviewError::Parse` and for `GuardianReviewError::Session` carrying retryable `CodexErrorInfo` values such as overload, connection failures, internal server error, or stream disconnects; all other outcomes return false.
+**Data flow**: It receives a guardian review outcome. It inspects the outcome and, for session errors, any structured error info. The output is true if another attempt is allowed, otherwise false.
 
-**Call relations**: Called by `run_guardian_review_session_with_retry` after each attempt to decide whether another attempt is warranted.
+**Call relations**: run_guardian_review_session_with_retry calls this after each attempt. The retry-focused test checks that it says yes only for the intended temporary failures and parse errors.
 
 *Call graph*: called by 1 (run_guardian_review_session_with_retry); 1 external calls (matches!).
 
@@ -1917,11 +1931,11 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool
 fn guardian_review_error_reason_distinguishes_error_kinds()
 ```
 
-**Purpose**: Verifies that each `GuardianReviewError` constructor maps to the expected analytics failure reason.
+**Purpose**: Tests that each internal guardian error kind maps to the correct analytics failure reason. This protects reporting from accidentally grouping distinct failures together.
 
-**Data flow**: Constructs parse, prompt-build, session, and structured-session errors, calls `failure_reason()` on each, and asserts the expected `GuardianReviewFailureReason` variants.
+**Data flow**: It creates prompt-build, session, structured-session, and parse errors. It calls failure_reason on each and checks the returned category. The output is a passing or failing test result.
 
-**Call relations**: Exercises the error-classification helpers used by analytics emission.
+**Call relations**: This test exercises the GuardianReviewError constructor helpers and GuardianReviewError::failure_reason without running a real guardian session.
 
 *Call graph*: calls 4 internal fn (parse, prompt_build, session, session_with_error_info); 2 external calls (anyhow!, assert!).
 
@@ -1932,11 +1946,11 @@ fn guardian_review_error_reason_distinguishes_error_kinds()
 fn guardian_review_retry_only_retries_transient_session_and_parse_errors()
 ```
 
-**Purpose**: Verifies the retry policy accepts only transient structured session failures and parse failures, not successful outcomes or permanent failures.
+**Purpose**: Tests the retry policy for guardian reviews. It confirms that temporary service problems and parse errors are retried, while approvals, denials, bad requests, prompt failures, timeouts, and cancellations are not.
 
-**Data flow**: Builds a mix of `GuardianReviewOutcome` values, including completed assessments, prompt/session/parse errors, timeout, cancellation, and several structured transient session errors, then asserts `should_retry_guardian_review` matches the expected boolean for each case.
+**Data flow**: It builds a list of sample outcomes paired with the expected retry answer. For each one, it calls should_retry_guardian_review and compares the result to the expectation. The output is a passing or failing test result.
 
-**Call relations**: Directly tests the retry classifier that governs `run_guardian_review_session_with_retry`.
+**Call relations**: This test directly protects should_retry_guardian_review, which is used by run_guardian_review_session_with_retry in production.
 
 *Call graph*: calls 4 internal fn (parse, prompt_build, session, session_with_error_info); 4 external calls (anyhow!, assert_eq!, Completed, Error).
 
@@ -1947,11 +1961,11 @@ fn guardian_review_retry_only_retries_transient_session_and_parse_errors()
 async fn guardian_review_retry_wait_honors_cancellation()
 ```
 
-**Purpose**: Checks that retry waiting returns `Cancelled` immediately when the external cancellation token is already cancelled.
+**Purpose**: Tests that the retry wait stops immediately when cancellation has already been requested. This matters so cancelled work does not sleep unnecessarily.
 
-**Data flow**: Creates and cancels a `CancellationToken`, calls `wait_before_guardian_retry` with a future deadline, awaits the result, and asserts it is `Some(GuardianReviewError::Cancelled)`.
+**Data flow**: It creates a cancellation token, cancels it, then calls wait_before_guardian_retry with a future deadline. It checks that the returned error is Cancelled. The output is a passing or failing async test result.
 
-**Call relations**: Tests the cancellation branch of the retry wait helper.
+**Call relations**: This test covers the cancellation branch of wait_before_guardian_retry, the helper used between retry attempts.
 
 *Call graph*: calls 1 internal fn (wait_before_guardian_retry); 4 external calls (new, from_secs, now, assert!).
 
@@ -1962,10 +1976,10 @@ async fn guardian_review_retry_wait_honors_cancellation()
 async fn guardian_review_retry_wait_honors_deadline()
 ```
 
-**Purpose**: Checks that retry waiting returns `Timeout` when the deadline has already been reached.
+**Purpose**: Tests that the retry wait reports a timeout when the deadline has already arrived. This keeps retry logic from running past the review’s allowed time.
 
-**Data flow**: Calls `wait_before_guardian_retry` with `Instant::now()` as the deadline and no cancel token, awaits the result, and asserts it is `Some(GuardianReviewError::Timeout)`.
+**Data flow**: It calls wait_before_guardian_retry with the deadline set to now and no cancellation token. It checks that the returned error is Timeout. The output is a passing or failing async test result.
 
-**Call relations**: Tests the deadline-expiry branch of the retry wait helper.
+**Call relations**: This test covers the deadline branch of wait_before_guardian_retry, which run_guardian_review_session_with_retry depends on to enforce the overall timeout.
 
 *Call graph*: calls 1 internal fn (wait_before_guardian_retry); 2 external calls (now, assert!).

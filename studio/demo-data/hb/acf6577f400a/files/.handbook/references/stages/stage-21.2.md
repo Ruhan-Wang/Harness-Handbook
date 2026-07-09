@@ -1,8 +1,10 @@
 # SQLite runtime state and agent graph storage  `stage-21.2`
 
-This stage is the system’s cross-cutting persistence layer: it sits beneath the main execution loop and background workers, giving them durable SQLite storage for runtime state and a shared way to record agent-thread relationships. The `state` crate is the main facade. Its models define the typed boundary between SQL rows and domain objects: `thread_metadata` normalizes thread listings and timestamps, `thread_goal` represents validated goal rows and statuses, `agent_job` describes job batches and items, `backfill_state` tracks rollout-metadata backfill lifecycle, and `log` defines log records and query filters.
+This stage is the system’s durable notebook. It is shared behind-the-scenes support used while the app runs, and also during startup or recovery, so important runtime facts survive a restart. Most data is kept in SQLite, a small local database stored as files.
 
-On top of those models, the runtime modules implement the actual state machines and queries. `threads` stores thread metadata and parent/child spawn edges; `goals` persists per-thread goals with versioning and budget accounting; `memories` manages staged memory extraction and consolidation jobs; `agent_jobs` tracks batch work and completion; `backfill` coordinates a singleton leased backfill worker; `external_agent_config_imports` records import outcomes; and `remote_control` stores enrollment records. `audit` provides safe read-only inspection of existing databases. The `agent-graph-store` crate then exposes a storage-agnostic graph API, with `local` adapting that API directly onto `StateRuntime`’s persisted spawn-edge support.
+The state crate is the main entry point. It defines safe data shapes for thread summaries, thread goals, agent jobs, backfill progress, and logs, then pairs them with runtime code that reads and writes those records. The thread runtime catalogs conversation threads, including parent and child links. The goal runtime records what a thread is trying to do and its budget. The memories runtime schedules memory extraction work. Agent job storage tracks queued, running, finished, and failed work items. Backfill storage remembers catch-up progress and prevents two workers from doing the same job.
+
+Other pieces store imported external-agent configuration, remote-control server enrollments, and read-only audit views for diagnostics. The agent graph store adds a common interface for “which agent spawned which thread,” with a local SQLite implementation that reuses the same state database.
 
 ## Files in this stage
 
@@ -11,11 +13,13 @@ These files define the public entry points for the SQLite-backed state subsystem
 
 ### `state/src/audit.rs`
 
-`io_transport` · `diagnostics`
+`io_transport` · `diagnostics/audit`
 
-This file is deliberately narrow in scope: it defines `ThreadStateAuditRow`, a compact struct containing the persisted thread ID, rollout path, archived flag, source, and model provider, and one async function that reads those rows from the `threads` table. The query path is explicitly non-invasive. `read_thread_state_audit_rows` builds `SqliteConnectOptions` with `create_if_missing(false)` and `read_only(true)`, disables SQL statement logging, and opens a pool with `max_connections(1)` so the audit path does not create extra concurrency or side effects.
+This file exists for situations where someone needs to inspect the project’s saved state, not modify it. The state is stored in a SQLite database, which is a small database kept in a local file. For diagnostics and audits, it is important to open that file carefully: if the database is missing or broken, this code should report that fact rather than silently creating a new one or trying to fix it.
 
-It then executes a fixed `SELECT id, rollout_path, archived, source, model_provider FROM threads`, fetches all rows, closes the pool, and maps each SQL row into `ThreadStateAuditRow`. The `archived` column is read as `i64` and normalized to a Rust `bool` by comparing against zero, while `rollout_path` is read as a `String` and converted into `PathBuf`. Because the function uses `anyhow::Result`, SQL and conversion failures propagate directly. There is no migration, repair, or schema creation logic here by design; if the database is missing or malformed, the caller gets an error instead of this function attempting to fix anything.
+The main data shape here is `ThreadStateAuditRow`. It is a small summary of one saved thread: its ID, where its rollout data lives on disk, whether it is archived, where it came from, and which model provider was used. Think of it like a read-only index card pulled from a filing cabinet.
+
+The file’s single query function opens the database in read-only mode, asks for a few columns from the `threads` table, turns each database row into a Rust struct, and then closes the database connection. One important detail is that the database stores `archived` as a number, so the code converts zero into `false` and any non-zero value into `true`. If anything goes wrong, such as the file not existing or the table not matching expectations, the error is returned to the caller instead of being hidden.
 
 #### Function details
 
@@ -25,24 +29,26 @@ It then executes a fixed `SELECT id, rollout_path, archived, source, model_provi
 async fn read_thread_state_audit_rows(path: &Path) -> Result<Vec<ThreadStateAuditRow>>
 ```
 
-**Purpose**: Opens an existing SQLite state database in read-only mode and returns all persisted thread rows as simplified audit records. It avoids creating, migrating, or repairing the database.
+**Purpose**: Reads the saved thread summaries from an existing SQLite state database without changing the database. A diagnostic or audit command would use this when it wants to see what thread records are present while leaving the state file untouched.
 
-**Data flow**: It takes a filesystem `&Path`, builds `SqliteConnectOptions` pointing at that file with `create_if_missing(false)`, `read_only(true)`, and statement logging disabled, then opens a single-connection pool. It runs a fixed SQL query against `threads`, awaits all rows, closes the pool, converts each row into `ThreadStateAuditRow` by extracting typed columns and converting `rollout_path` into `PathBuf` and `archived` into `bool`, and collects the mapped results into `Vec<ThreadStateAuditRow>`.
+**Data flow**: It takes a path to a database file. It opens that file read-only, refuses to create it if it is missing, runs a query against the `threads` table, and reads the selected fields from every row. Each row is converted into a `ThreadStateAuditRow`, including turning the numeric `archived` value into a true-or-false value. The result is a list of these audit rows, or an error if the database cannot be opened, queried, or decoded.
 
-**Call relations**: This file contains only this top-level audit query; callers use it when they need diagnostics from persisted state without invoking the normal runtime initialization path.
+**Call relations**: When an audit path needs thread metadata, it calls this function with the state database path. Inside, the function relies on SQLite connection setup helpers and SQL query creation from external libraries, then hands the finished list of plain Rust records back to the caller for reporting or further checks.
 
 *Call graph*: 3 external calls (new, new, query).
 
 
 ### `state/src/lib.rs`
 
-`orchestration` · `startup/configuration and cross-cutting access to state APIs throughout runtime`
+`orchestration` · `cross-cutting`
 
-This file establishes the public contract of the `state` crate. At the top it enforces a hard compile-time invariant on the bundled SQLite version with an `assert!` against `libsqlite3_sys::SQLITE_VERSION_NUMBER`, requiring at least `3_051_003` because the crate depends on the WAL-reset corruption fix. That check is a notable safety measure: builds fail early rather than allowing a subtly unsafe SQLite runtime.
+This file is like the reception desk for the state subsystem. The real work is split across smaller modules, such as database runtime code, metadata extraction, migrations, audit reads, and telemetry. This file decides which of those pieces are visible to other crates and gives callers a simpler set of names to import.
 
-The module declarations divide the crate into audit reading, rollout extraction, log database access, schema migrations, shared models, path helpers, runtime orchestration, and telemetry. The file then re-exports a broad set of types so downstream code can treat the crate root as the stable API: low-level row/query structs like `LogEntry`, `LogRow`, and `LogQuery`; rollout and thread metadata models; stage-1 and phase-2 memory job claim types; agent job records; and the preferred high-level entrypoint `StateRuntime`. It also exposes runtime helpers for locating database files, backing up a corrupted runtime DB, checking SQLite corruption/lock errors, and running integrity checks, plus telemetry installation and metric-recording functions.
+The subsystem exists because rollout information starts out in JSONL files, meaning files where each line is a separate JSON record. Searching and updating that directly would be slow and awkward. The state crate mirrors the important metadata into SQLite, a small local database engine, so the rest of the system can query threads, jobs, goals, logs, memories, backfill status, and audit information in a structured way.
 
-Finally, it defines the environment variable `SQLITE_HOME_ENV`, canonical filenames for the logs/goals/memories/state databases, and metric name constants for DB errors, backfill, initialization, and fallback paths. Those constants centralize naming so the rest of the crate and external callers use consistent filesystem and observability identifiers.
+One important safety check happens here: the crate refuses to build unless the bundled SQLite version is new enough to include a specific fix for a WAL-reset corruption bug. WAL, or write-ahead logging, is SQLite’s way of safely recording changes before committing them. Without this guard, the project could ship with a database engine version known to risk data corruption.
+
+The file also defines shared database filenames, metric names, and the environment variable used to override where SQLite state lives. Most callers are expected to use StateRuntime, the higher-level entry point that owns configuration and metrics, rather than reaching into the lower-level storage pieces directly.
 
 
 ### Thread graph foundation
@@ -50,15 +56,13 @@ These files establish the core thread metadata model and the runtime layer that 
 
 ### `state/src/model/thread_metadata.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `state loading, thread indexing, listing, and reconciliation`
 
-This module is the central data-model layer for thread discovery and indexing. It defines pagination types (`SortKey`, `SortDirection`, `Anchor`, `ThreadsPage`), extraction output (`ExtractionOutcome`), and the full `ThreadMetadata` record containing identifiers, rollout path, timestamps, source classification, agent annotations, model/provider details, working directory, title/preview text, sandbox and approval modes, token usage, archive time, and Git metadata.
+A thread in this system has a full rollout file on disk, but lists and searches need a compact summary: when it started, where it ran, which model it used, its title, token count, Git context, archive state, and similar facts. This file is the shared shape for that summary. Without it, different parts of the state layer could disagree about what a thread “is,” or old database rows could be read incorrectly.
 
-`ThreadMetadataBuilder` exists for constructing canonical metadata from rollout parsing without requiring filename-derived defaults. Its `new` method seeds sensible defaults such as empty `cwd`, read-only sandbox policy, `OnRequest` approval mode, and absent optional fields. `build` then stringifies protocol enums, canonicalizes timestamps to the same precision used in storage, fills `updated_at` from `created_at` when absent, derives `agent_path` from the session source if not explicitly set, and falls back to the runtime’s default provider.
+The main type is `ThreadMetadata`, the clean in-memory record used by the rest of the program. `ThreadMetadataBuilder` is a safer way to create one when some facts are missing; it fills in sensible defaults such as read-only sandboxing, on-request approval, an empty title, and a default model provider. Think of it like a form that can be partly filled out, then turned into the official record.
 
-The file also contains reconciliation helpers: `prefer_existing_git_info` preserves already-known Git fields, while `prefer_existing_explicit_title` avoids overwriting a user-edited title with a generated one that merely mirrors the first user message. `diff_fields` enumerates exactly which fields differ between two metadata records for diagnostics or selective updates.
-
-On the storage side, `ThreadRow::try_from_row` extracts raw SQL columns and `TryFrom<ThreadRow> for ThreadMetadata` performs semantic decoding: parsing `ThreadId`, optional `ThreadSource`, optional `ReasoningEffort`, converting paths, treating empty `preview` and `first_user_message` strings as `None`, and decoding timestamps. The timestamp helpers include a compatibility rule in `epoch_millis_to_datetime`: values older than a 2020 millisecond threshold are treated as legacy second-precision rows and multiplied by 1000 in memory so old databases continue to sort correctly after newer writes use milliseconds.
+The file also includes `ThreadRow`, a database-facing version where paths and dates are stored in plain SQLite-friendly forms. Conversion functions turn those raw database values back into richer Rust values, including careful timestamp handling so older rows stored in seconds still sort correctly after newer millisecond-precision writes. Pagination helpers create anchors for thread lists, and comparison helpers preserve important existing user edits, such as explicit titles and Git information, when metadata is rebuilt from rollout files.
 
 #### Function details
 
@@ -73,11 +77,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Creates a builder for rollout-derived thread metadata with required identity fields and a full set of defaults for optional metadata. It establishes the baseline values later normalized by `build`.
+**Purpose**: Creates a new draft thread metadata record from the few facts that must always be known: the thread id, rollout file path, creation time, and source. It also fills in safe defaults for fields that may not be known yet.
 
-**Data flow**: It takes a `ThreadId`, rollout `PathBuf`, creation `DateTime<Utc>`, and `SessionSource`, then returns a `ThreadMetadataBuilder` with those fields set, `updated_at` and most optional metadata absent, `cwd` initialized to an empty `PathBuf`, `sandbox_policy` set via `SandboxPolicy::new_read_only_policy()`, and `approval_mode` set to `AskForApproval::OnRequest`.
+**Data flow**: It receives the required thread identity and origin details. It puts those into a `ThreadMetadataBuilder`, sets optional fields to empty, chooses a read-only sandbox policy, and sets approval to on-request. The result is a builder object that later code can add more details to before producing final metadata.
 
-**Call relations**: Many tests and metadata ingestion paths call this as the first step before filling optional fields and invoking `build`. It does not perform persistence itself; it prepares normalized construction inputs.
+**Call relations**: Many tests and seeding helpers call this when they need realistic thread metadata without spelling out every field. After callers have added any extra information, the builder is normally finished by `ThreadMetadataBuilder::build`.
 
 *Call graph*: called by 35 (test_thread_metadata, seed_stage1_output, thread_list_parent_filter_reads_direct_children_from_state_db, seed_recent_thread, upsert_thread_metadata, seed_thread_metadata, seed_stage1_candidate, seed_stage1_output, builder_from_items, builder_from_session_meta (+15 more)); 2 external calls (new, new_read_only_policy).
 
@@ -88,11 +92,11 @@ fn new(
 fn build(&self, default_provider: &str) -> ThreadMetadata
 ```
 
-**Purpose**: Builds a canonical `ThreadMetadata` from the builder, filling defaults and normalizing timestamps and enum fields. It is the main constructor used after rollout parsing.
+**Purpose**: Turns a draft `ThreadMetadataBuilder` into the final `ThreadMetadata` record used by the state system. It fills missing values with defaults and converts enum-like settings into stored strings.
 
-**Data flow**: It reads the builder fields plus a `default_provider: &str`, converts `source`, `sandbox_policy`, and `approval_mode` to strings via `crate::extract::enum_to_string`, canonicalizes `created_at` and optional `updated_at`, derives `updated_at` from `created_at` when missing, clones optional metadata fields, derives `agent_path` from `self.source.get_agent_path()` if no explicit path is set, falls back to `default_provider.to_string()` when `model_provider` is absent, and returns a `ThreadMetadata` with unset runtime-observed fields like `model`, `reasoning_effort`, `preview`, and `first_user_message` initialized to `None` or empty values.
+**Data flow**: It reads all fields from the builder plus a default model provider string. It normalizes timestamps, turns source, sandbox policy, and approval mode into strings, uses the default provider if none was set, copies optional agent and Git information, and initializes fields such as title, preview, model, and token count. The output is a complete `ThreadMetadata` value.
 
-**Call relations**: Callers use this after populating a `ThreadMetadataBuilder`. Internally it delegates timestamp normalization to `canonicalize_datetime` so in-memory values match storage precision.
+**Call relations**: This is the finishing step after `ThreadMetadataBuilder::new` and any field edits. Internally it calls `canonicalize_datetime` so stored timestamps use the same precision, and it uses `enum_to_string` to make protocol values database-friendly.
 
 *Call graph*: calls 2 internal fn (enum_to_string, canonicalize_datetime); 2 external calls (clone, new).
 
@@ -103,11 +107,11 @@ fn build(&self, default_provider: &str) -> ThreadMetadata
 fn prefer_existing_git_info(&mut self, existing: &Self)
 ```
 
-**Purpose**: Preserves already-known Git metadata when reconciling newly extracted rollout metadata with an existing stored record. It only copies fields from the existing record when they are present.
+**Purpose**: Keeps known Git information from an older metadata record when rebuilding metadata from another source. This prevents useful repository details from being erased just because a fresh extraction did not find them.
 
-**Data flow**: It mutably borrows `self` and immutably borrows `existing`, checks `existing.git_sha`, `existing.git_branch`, and `existing.git_origin_url` for `Some`, and overwrites the corresponding fields on `self` with cloned values when present.
+**Data flow**: It receives the current mutable metadata record and an existing record. For each Git field, if the existing record has a value, that value is copied into the current record. The function changes `self` in place and returns nothing.
 
-**Call relations**: Reconciliation code calls this before upserting refreshed metadata so rollout-derived updates do not erase Git information that may have been captured earlier from another source.
+**Call relations**: This fits the reconciliation flow, where rollout-derived metadata may be compared with data already stored in the state database. It does not hand off to other functions; it simply protects non-empty Git fields during that merge.
 
 
 ##### `ThreadMetadata::prefer_existing_explicit_title`  (lines 243–255)
@@ -116,11 +120,11 @@ fn prefer_existing_git_info(&mut self, existing: &Self)
 fn prefer_existing_explicit_title(&mut self, existing: &Self)
 ```
 
-**Purpose**: Keeps a user-meaningful existing title when the newly derived title is empty or merely duplicates the first user message. It distinguishes explicit titles from generated placeholders.
+**Purpose**: Preserves a user-facing title that appears to have been explicitly set before. It avoids replacing a real title with an automatic fallback such as the first user message.
 
-**Data flow**: It trims `existing.title` and returns early if that title is empty or equal to `existing.first_user_message` after trimming, because such a title is not considered explicitly meaningful. Otherwise it trims `self.title`; if the new title is empty or equals `self.first_user_message`, it replaces `self.title` with `existing.title.clone()`.
+**Data flow**: It looks at the existing title and checks whether it is blank or just the same as the first user message. If the existing title looks meaningful, and the new title is blank or only a fallback, it copies the existing title into the current metadata. The current record may be updated; no separate result is returned.
 
-**Call relations**: Metadata merge paths use this after extracting fresh rollout metadata. It complements `prefer_existing_git_info` by preserving user-facing presentation data rather than repository metadata.
+**Call relations**: This is another reconciliation helper used when refreshed rollout metadata is merged with stored metadata. It works alongside preservation helpers like `prefer_existing_git_info`, but its concern is the human-readable title.
 
 
 ##### `ThreadMetadata::diff_fields`  (lines 258–330)
@@ -129,11 +133,11 @@ fn prefer_existing_explicit_title(&mut self, existing: &Self)
 fn diff_fields(&self, other: &Self) -> Vec<&'static str>
 ```
 
-**Purpose**: Computes a field-by-field difference list between two `ThreadMetadata` values. It is intended for diagnostics, reconciliation decisions, or selective update reporting.
+**Purpose**: Reports exactly which metadata fields differ between two thread records. This is useful for deciding whether a database row needs updating or for explaining what changed.
 
-**Data flow**: It compares `self` and `other` across all modeled fields, pushes the corresponding field name string into a mutable `Vec<&'static str>` whenever a value differs, and returns that vector in comparison order.
+**Data flow**: It receives two `ThreadMetadata` records: `self` and `other`. It compares each field one by one and collects the names of fields whose values are different. It returns a list of field-name strings.
 
-**Call relations**: Higher-level synchronization or debugging code can call this to explain why two metadata records are not equal. It is a pure comparison helper with no side effects.
+**Call relations**: This function is used as a comparison tool in broader update or reconciliation logic. It does not modify either record and does not call domain-specific helpers beyond creating the result list.
 
 *Call graph*: 1 external calls (new).
 
@@ -144,11 +148,11 @@ fn diff_fields(&self, other: &Self) -> Vec<&'static str>
 fn canonicalize_datetime(dt: DateTime<Utc>) -> DateTime<Utc>
 ```
 
-**Purpose**: Normalizes a UTC datetime to the precision and conversion behavior used by persisted thread timestamps. It round-trips through epoch milliseconds and falls back to the original value if conversion unexpectedly fails.
+**Purpose**: Normalizes a UTC timestamp to the same precision used for storage. This avoids tiny precision differences making two otherwise identical metadata records look different.
 
-**Data flow**: It takes a `DateTime<Utc>`, converts it to milliseconds with `datetime_to_epoch_millis`, feeds that into `epoch_millis_to_datetime`, and returns the normalized datetime or the original input if the conversion returns an error.
+**Data flow**: It receives a `DateTime<Utc>`. It converts that time to Unix epoch milliseconds, then converts those milliseconds back to a `DateTime<Utc>`. If the conversion fails, it keeps the original value. The result is a timestamp rounded to the storage precision.
 
-**Call relations**: `ThreadMetadataBuilder::build` uses this for `created_at`, `updated_at`, and `archived_at` so constructed metadata matches the same timestamp semantics used when reading from SQLite.
+**Call relations**: `ThreadMetadataBuilder::build` calls this for creation, update, and archive times. It delegates the actual conversion work to `datetime_to_epoch_millis` and `epoch_millis_to_datetime`.
 
 *Call graph*: calls 2 internal fn (datetime_to_epoch_millis, epoch_millis_to_datetime); called by 1 (build).
 
@@ -159,11 +163,11 @@ fn canonicalize_datetime(dt: DateTime<Utc>) -> DateTime<Utc>
 fn try_from_row(row: &SqliteRow) -> Result<Self>
 ```
 
-**Purpose**: Extracts raw thread metadata columns from a SQLite row into a `ThreadRow`. It is the low-level storage decoding step before semantic parsing.
+**Purpose**: Reads one SQLite database row into a `ThreadRow`, the raw database-shaped version of thread metadata. It is the first step in turning stored database data back into application data.
 
-**Data flow**: It borrows a `SqliteRow`, reads each named column with `try_get`, and returns a `ThreadRow` containing strings, integers, and optional values exactly as stored in the database.
+**Data flow**: It receives a SQLite row. It asks the row for each expected column by name, such as `id`, `rollout_path`, timestamps, model fields, title, archive status, and Git fields. If all reads succeed, it returns a populated `ThreadRow`; if any column is missing or has the wrong type, it returns an error.
 
-**Call relations**: Query code uses this immediately after SQL execution. The resulting `ThreadRow` is then passed into `ThreadMetadata::try_from` for typed conversion.
+**Call relations**: Database query code calls this after SQLite returns rows. The resulting `ThreadRow` is then meant to be converted into `ThreadMetadata` through `ThreadMetadata::try_from`.
 
 *Call graph*: 1 external calls (try_get).
 
@@ -174,11 +178,11 @@ fn try_from_row(row: &SqliteRow) -> Result<Self>
 fn try_from(row: ThreadRow) -> std::result::Result<Self, Self::Error>
 ```
 
-**Purpose**: Converts a raw `ThreadRow` into a validated `ThreadMetadata`. It parses IDs and enums, converts timestamps and paths, and normalizes empty-string sentinel values into `None`.
+**Purpose**: Converts a raw `ThreadRow` from the database into the richer `ThreadMetadata` used by the program. It validates and parses stored strings, paths, timestamps, and optional fields.
 
-**Data flow**: It consumes a `ThreadRow`, destructures all fields, parses optional `thread_source` strings with `.parse()` and wraps parse failures as `anyhow::Error::msg`, converts `id` with `ThreadId::try_from`, converts `rollout_path` and `cwd` into `PathBuf`, decodes `created_at` and `updated_at` with `epoch_millis_to_datetime`, parses `reasoning_effort` with `value.parse::<ReasoningEffort>().ok()` so unknown values become `ReasoningEffort::Custom` if the parser supports them or `None` otherwise, turns empty `preview` and `first_user_message` strings into `None`, converts optional `archived_at` seconds with `epoch_seconds_to_datetime`, and returns the assembled `ThreadMetadata`.
+**Data flow**: It receives a `ThreadRow` whose values are mostly strings and integers. It parses the thread id, turns path strings into paths, converts epoch timestamps into UTC times, parses optional thread source and reasoning effort values, and treats empty preview or first-message strings as missing values. It returns either a complete `ThreadMetadata` or an error if required values are invalid.
 
-**Call relations**: Tests in this file call it directly to verify reasoning-effort parsing, and production query paths use it after `ThreadRow::try_from_row`. It is the semantic boundary between SQL rows and the canonical metadata model.
+**Call relations**: This follows `ThreadRow::try_from_row` in the database loading path. The tests `tests::thread_row_parses_reasoning_effort` and `tests::thread_row_preserves_model_defined_reasoning_effort_values` call it directly to confirm reasoning-effort parsing works.
 
 *Call graph*: calls 2 internal fn (try_from, epoch_millis_to_datetime); called by 2 (thread_row_parses_reasoning_effort, thread_row_preserves_model_defined_reasoning_effort_values); 1 external calls (from).
 
@@ -189,11 +193,11 @@ fn try_from(row: ThreadRow) -> std::result::Result<Self, Self::Error>
 fn anchor_from_item(item: &ThreadMetadata, sort_key: SortKey) -> Option<Anchor>
 ```
 
-**Purpose**: Builds a pagination anchor from a thread metadata item using the selected sort key. It extracts the timestamp component needed for keyset pagination.
+**Purpose**: Creates a pagination anchor from one thread item. A pagination anchor is a bookmark that says where the next page of results should continue.
 
-**Data flow**: It reads a borrowed `ThreadMetadata` and a `SortKey`, selects either `item.created_at` or `item.updated_at`, wraps that timestamp in `Anchor { ts }`, and returns `Some(anchor)`.
+**Data flow**: It receives a `ThreadMetadata` item and a sort key. If the list is sorted by creation time, it uses the item’s creation timestamp; if sorted by update time, it uses the update timestamp. It returns an `Anchor` containing that timestamp.
 
-**Call relations**: Thread listing code uses this when producing `ThreadsPage.next_anchor` values for subsequent page requests.
+**Call relations**: Thread listing code can use this after selecting the last item in a page. The returned anchor is then passed into later list queries so they continue from the right point.
 
 
 ##### `datetime_to_epoch_millis`  (lines 468–470)
@@ -202,11 +206,11 @@ fn anchor_from_item(item: &ThreadMetadata, sort_key: SortKey) -> Option<Anchor>
 fn datetime_to_epoch_millis(dt: DateTime<Utc>) -> i64
 ```
 
-**Purpose**: Converts a UTC datetime into Unix epoch milliseconds. It is the write-side counterpart to `epoch_millis_to_datetime`.
+**Purpose**: Converts a UTC timestamp into Unix epoch milliseconds, which means the number of milliseconds since January 1, 1970. This is the millisecond format used for newer stored thread times.
 
-**Data flow**: It takes a `DateTime<Utc>` and returns `dt.timestamp_millis()` as `i64`.
+**Data flow**: It receives a `DateTime<Utc>` and asks it for its millisecond timestamp. It returns that integer without changing anything else.
 
-**Call relations**: `canonicalize_datetime` calls this to round-trip timestamps through the same precision used by persisted thread rows.
+**Call relations**: `canonicalize_datetime` calls this before converting the value back, ensuring times are aligned with database precision.
 
 *Call graph*: called by 1 (canonicalize_datetime); 1 external calls (timestamp_millis).
 
@@ -217,11 +221,11 @@ fn datetime_to_epoch_millis(dt: DateTime<Utc>) -> i64
 fn datetime_to_epoch_seconds(dt: DateTime<Utc>) -> i64
 ```
 
-**Purpose**: Converts a UTC datetime into Unix epoch seconds. It supports persistence paths that store second-precision timestamps.
+**Purpose**: Converts a UTC timestamp into Unix epoch seconds, the older or simpler whole-second storage format. This is useful for fields that are stored only to second precision.
 
-**Data flow**: It takes a `DateTime<Utc>` and returns `dt.timestamp()` as `i64`.
+**Data flow**: It receives a `DateTime<Utc>`, extracts the number of seconds since January 1, 1970, and returns that integer. It does not change any stored state.
 
-**Call relations**: Other modules import this helper when writing second-precision fields such as archive or completion timestamps.
+**Call relations**: No specific caller is listed in the provided call facts, but it pairs with `epoch_seconds_to_datetime` for code that needs second-precision database values.
 
 *Call graph*: 1 external calls (timestamp).
 
@@ -232,11 +236,11 @@ fn datetime_to_epoch_seconds(dt: DateTime<Utc>) -> i64
 fn epoch_millis_to_datetime(value: i64) -> Result<DateTime<Utc>>
 ```
 
-**Purpose**: Converts persisted millisecond timestamps into `DateTime<Utc>`, with backward compatibility for legacy rows that stored seconds in the same column. It preserves ordering semantics across old and new databases.
+**Purpose**: Turns a stored integer timestamp into a UTC date and time, while also supporting old rows that accidentally or historically stored seconds instead of milliseconds.
 
-**Data flow**: It takes an `i64` value, compares it against `MIN_EPOCH_MILLIS` (2020-01-01 in ms), treats smaller values as legacy seconds by multiplying with `saturating_mul(1000)`, then calls `DateTime::<Utc>::from_timestamp_millis(millis)` and returns the datetime or an `anyhow` error if invalid.
+**Data flow**: It receives an integer timestamp. If the value is too small to be a plausible millisecond timestamp for modern thread data, it treats it as seconds and multiplies by 1000. It then converts the millisecond value into a `DateTime<Utc>`, returning an error if the number cannot represent a valid time.
 
-**Call relations**: Both `ThreadMetadata::try_from` and `canonicalize_datetime` rely on this helper. It is a key compatibility shim for mixed timestamp precisions in persisted thread rows.
+**Call relations**: `ThreadMetadata::try_from` calls this when loading created and updated timestamps from the database. `canonicalize_datetime` also calls it when normalizing newly built metadata.
 
 *Call graph*: called by 2 (try_from, canonicalize_datetime); 1 external calls (from_timestamp_millis).
 
@@ -247,11 +251,11 @@ fn epoch_millis_to_datetime(value: i64) -> Result<DateTime<Utc>>
 fn epoch_seconds_to_datetime(value: i64) -> Result<DateTime<Utc>>
 ```
 
-**Purpose**: Converts a Unix timestamp in seconds into `DateTime<Utc>` with validation. It is used for fields that remain second-precision in storage.
+**Purpose**: Turns a whole-second Unix timestamp into a UTC date and time. It is used for values that are intentionally stored at second precision.
 
-**Data flow**: It accepts an `i64`, calls `DateTime::<Utc>::from_timestamp(value, 0)`, and returns the datetime or an `anyhow` error if the timestamp is invalid.
+**Data flow**: It receives an integer count of seconds since January 1, 1970. It converts that into a `DateTime<Utc>` with zero extra nanoseconds. If the value cannot be represented as a valid timestamp, it returns an error.
 
-**Call relations**: `ThreadMetadata::try_from` uses this for the optional `archived_at` field.
+**Call relations**: `ThreadMetadata::try_from` uses this for the optional archive timestamp, because that database field is read as seconds rather than milliseconds.
 
 *Call graph*: 1 external calls (from_timestamp).
 
@@ -262,11 +266,11 @@ fn epoch_seconds_to_datetime(value: i64) -> Result<DateTime<Utc>>
 fn thread_row(reasoning_effort: Option<&str>) -> ThreadRow
 ```
 
-**Purpose**: Creates a representative `ThreadRow` fixture for conversion tests, parameterized by an optional reasoning-effort string. It keeps the tests concise and focused on parsing behavior.
+**Purpose**: Builds a sample raw database row for tests. It lets each test choose the stored reasoning-effort text while keeping all other fields consistent.
 
-**Data flow**: It takes `Option<&str>` for `reasoning_effort`, converts it to `Option<String>`, and returns a fully populated `ThreadRow` with fixed IDs, timestamps, paths, provider/model values, and empty-string sentinels for optional text fields.
+**Data flow**: It receives an optional reasoning-effort string. It creates a `ThreadRow` with fixed id, paths, timestamps, model, policy, token count, and empty optional display fields, inserting the provided reasoning-effort value if present. The output is test input for conversion into `ThreadMetadata`.
 
-**Call relations**: Both reasoning-effort tests call this helper to generate the raw row input passed into `ThreadMetadata::try_from`.
+**Call relations**: The reasoning-effort tests call this helper before calling `ThreadMetadata::try_from`. It keeps those tests focused on the one field they are checking.
 
 *Call graph*: 1 external calls (new).
 
@@ -277,11 +281,11 @@ fn thread_row(reasoning_effort: Option<&str>) -> ThreadRow
 fn expected_thread_metadata(reasoning_effort: Option<ReasoningEffort>) -> ThreadMetadata
 ```
 
-**Purpose**: Builds the expected `ThreadMetadata` value corresponding to the `thread_row` fixture. It parameterizes only the parsed `ReasoningEffort` outcome.
+**Purpose**: Builds the expected `ThreadMetadata` value for the test row. It gives the tests a clear target to compare against after conversion.
 
-**Data flow**: It takes `Option<ReasoningEffort>`, constructs a `ThreadMetadata` with parsed `ThreadId`, `PathBuf` paths, `DateTime<Utc>` timestamps from fixed epoch seconds, and `None` for fields represented by empty strings in the row fixture, then returns that expected value.
+**Data flow**: It receives an optional parsed `ReasoningEffort`. It constructs the full expected metadata record using the same fixed id, paths, timestamps, model, policy, and token count as `tests::thread_row`, with empty database strings represented as missing optional values. The output is the expected result for assertions.
 
-**Call relations**: The two conversion tests compare actual parsed metadata against this helper’s output to verify exact normalization behavior.
+**Call relations**: The two reasoning-effort tests use this helper to compare against the actual result from `ThreadMetadata::try_from`. It uses thread id and timestamp parsing helpers from external libraries to create realistic values.
 
 *Call graph*: calls 1 internal fn (from_string); 3 external calls (from_timestamp, from, new).
 
@@ -292,11 +296,11 @@ fn expected_thread_metadata(reasoning_effort: Option<ReasoningEffort>) -> Thread
 fn thread_row_parses_reasoning_effort()
 ```
 
-**Purpose**: Verifies that a known reasoning-effort string (`"high"`) is parsed into the corresponding typed enum variant. It checks the full converted metadata object, not just the single field.
+**Purpose**: Checks that a normal stored reasoning-effort value, such as `high`, is parsed into the expected program value.
 
-**Data flow**: It builds a raw row with `thread_row(Some("high"))`, converts it using `ThreadMetadata::try_from`, and asserts equality with `expected_thread_metadata(Some(ReasoningEffort::High))`.
+**Data flow**: It creates a test `ThreadRow` containing the text `high`, converts it with `ThreadMetadata::try_from`, and compares the result with metadata whose reasoning effort is `High`. The test passes if the converted metadata exactly matches the expected value.
 
-**Call relations**: This is a unit test run by the test harness. It exercises the `ThreadMetadata::try_from` conversion path for a standard reasoning-effort value.
+**Call relations**: This test exercises the conversion path provided by `ThreadMetadata::try_from`, using `tests::thread_row` for input and `tests::expected_thread_metadata` as the comparison target.
 
 *Call graph*: calls 1 internal fn (try_from); 2 external calls (assert_eq!, thread_row).
 
@@ -307,24 +311,26 @@ fn thread_row_parses_reasoning_effort()
 fn thread_row_preserves_model_defined_reasoning_effort_values()
 ```
 
-**Purpose**: Verifies that nonstandard reasoning-effort strings are preserved as model-defined custom values rather than discarded. It protects forward compatibility with future model outputs.
+**Purpose**: Checks that an unfamiliar reasoning-effort value is not thrown away. This matters because future models may define new effort names before this code knows about them.
 
-**Data flow**: It creates a raw row with `thread_row(Some("future"))`, converts it via `ThreadMetadata::try_from`, and asserts equality with `expected_thread_metadata(Some(ReasoningEffort::Custom("future".to_string())))`.
+**Data flow**: It creates a test `ThreadRow` containing the text `future`, converts it into `ThreadMetadata`, and expects the reasoning effort to become a custom value holding that same text. The test passes if the conversion preserves the unknown value.
 
-**Call relations**: This unit test complements the standard parsing test by covering the forward-compatible branch of reasoning-effort decoding.
+**Call relations**: Like the previous test, it calls `ThreadMetadata::try_from` through a controlled test row. Together, the tests show that known values are parsed normally and unknown values are still kept.
 
 *Call graph*: calls 1 internal fn (try_from); 2 external calls (assert_eq!, thread_row).
 
 
 ### `state/src/runtime/threads.rs`
 
-`domain_logic` · `active during thread ingestion, listing, mutation, archival, and cleanup`
+`domain_logic` · `cross-cutting thread state reads and writes`
 
-This file contains the bulk of the thread persistence logic for the runtime state database. On the read side, it can fetch a single thread, list thread IDs or full `ThreadMetadata` pages with keyset pagination, filter by archived state, source, provider, cwd, search term, and optional parent thread, and resolve rollout paths or exact-title matches. Query construction is centralized through `push_thread_select_columns`, `push_thread_filters`, `push_thread_order_and_limit`, and `push_list_threads_query`, which deliberately preserve index-friendly plans; the `OrderByIndex` toggle adds a unary `+` to disable timestamp-order index selection when multi-cwd filtering would otherwise regress into scans.
+A “thread” here is a saved conversation or agent run, with details like its title, preview text, working folder, model, token count, Git information, archive state, and the rollout file it came from. This file keeps those details in the database so the app can show thread lists quickly without rereading every rollout file from disk.
 
-On the write side, the file inserts and upserts thread rows, updates preview/title/git info/memory mode, and applies rollout items incrementally. `allocate_thread_updated_at` is a key design point: it maintains a process-local atomic high-water mark of millisecond timestamps so hot writes get unique, monotonic `updated_at_ms` values without querying SQLite, while still allowing sufficiently older historical timestamps through unchanged for backfill and repair. Upserts preserve existing non-null git fields atomically and avoid overwriting a non-empty preview with an empty incoming value.
+It also records when one thread spawns another. Think of this like a family tree: a parent thread can have child threads, and children can have their own descendants. The code can list children, walk the full subtree, filter by whether the link is open or closed, and find an agent by its canonical path.
 
-The file also persists directional spawn edges in `thread_spawn_edges`, supports direct and recursive descendant traversal, and can infer a parent edge from serialized `SessionSource`. Deletion is intentionally staged: logs, memories, goals, dynamic tools, agent job assignments, and spawn edges are cleaned before thread rows are removed, so partial failures leave enough graph state to retry cleanup safely. The extensive tests cover pagination semantics, index plans, memory-mode restoration, git-field preservation, preview filling, timestamp uniqueness, spawn-edge status filtering, and cleanup failure behavior.
+The listing code builds SQL queries from filters such as archived/not archived, source, model provider, current working directory, search text, sort order, and pagination anchor. Pagination uses timestamps as cursors, so this file carefully allocates millisecond-level updated times to keep ordering stable when several updates happen at once.
+
+The update paths are deliberately conservative. They preserve useful existing data, such as Git fields and non-empty previews, when older rollout data is replayed. Deletion also cleans related logs, memories, goals, dynamic tools, spawn edges, and job assignments, while deleting the core thread rows last so failed cleanup can be retried safely.
 
 #### Function details
 
@@ -334,11 +340,11 @@ The file also persists directional spawn edges in `thread_spawn_edges`, supports
 async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>>
 ```
 
-**Purpose**: Loads one thread row by `ThreadId` and converts it into `crate::ThreadMetadata`. It returns `None` when the thread does not exist.
+**Purpose**: Loads one thread’s saved metadata by its thread id. Callers use it when they need the current database view of a conversation before changing or displaying it.
 
-**Data flow**: It takes a `ThreadId`, converts it to a string key, executes a `SELECT` over the `threads` table, and fetches at most one row from `self.pool`. If a row is present, it passes it through `ThreadRow::try_from_row` and then `ThreadMetadata::try_from`; the final result is `anyhow::Result<Option<ThreadMetadata>>`.
+**Data flow**: It receives a thread id, reads the matching row from the threads table, converts the database fields into a ThreadMetadata value, and returns either that metadata or nothing if the id is unknown.
 
-**Call relations**: This is the canonical thread read path used by `apply_rollout_items`, `mark_archived`, and `mark_unarchived` before they mutate and re-upsert metadata. It delegates row decoding to the shared `ThreadRow` conversion logic.
+**Call relations**: Archive, unarchive, and rollout-apply flows call this first so they can start from the latest stored thread state before writing an updated version back.
 
 *Call graph*: called by 3 (apply_rollout_items, mark_archived, mark_unarchived); 2 external calls (to_string, query).
 
@@ -349,11 +355,11 @@ async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadM
 async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>>
 ```
 
-**Purpose**: Fetches only the persisted `memory_mode` column for a thread. It is a lightweight read path when callers do not need full metadata.
+**Purpose**: Reads the saved memory mode for a thread. This is used when code only needs that one setting instead of the whole thread record.
 
-**Data flow**: Given a `ThreadId`, it queries `SELECT memory_mode FROM threads WHERE id = ?`, converts the id to string, and returns `Ok(Some(String))` if the row and column are present, otherwise `Ok(None)`. SQL errors are propagated.
+**Data flow**: It takes a thread id, queries the memory_mode column, and returns the string if the row exists and the value can be read.
 
-**Call relations**: This method is used by tests and memory-mode-related flows after rollout application. It avoids the heavier full-row decoding performed by `get_thread`.
+**Call relations**: It is a small direct lookup used by callers and tests that verify whether rollout metadata restored or preserved the memory setting.
 
 *Call graph*: 2 external calls (to_string, query).
 
@@ -368,11 +374,11 @@ async fn set_thread_preview_if_empty(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Fills in a thread preview only when the stored preview is currently blank. It trims the incoming text and refuses to write empty or whitespace-only values.
+**Purpose**: Fills in a thread preview only if the thread currently has no preview. This protects a meaningful existing preview from being overwritten by later fallback text.
 
-**Data flow**: Inputs are a `ThreadId` and preview string. The function trims the preview, returns `Ok(false)` immediately if the trimmed value is empty, otherwise executes `UPDATE threads SET preview = ? WHERE id = ? AND preview = ''` and returns whether any row was updated.
+**Data flow**: It receives a thread id and preview text, trims surrounding whitespace, ignores empty text, and updates the database only when the stored preview is blank. It returns whether anything changed.
 
-**Call relations**: This targeted mutation path is used when a later signal can supply a preview but should not overwrite an existing one. It complements the broader upsert logic, which also preserves non-empty previews during conflict updates.
+**Call relations**: This is a targeted repair/update helper for places that discover a better preview later, while the main upsert path also has its own preview-preservation rule.
 
 *Call graph*: 2 external calls (to_string, query).
 
@@ -388,11 +394,11 @@ async fn upsert_thread_spawn_edge(
     ) -> anyhow::Resul
 ```
 
-**Purpose**: Creates or replaces the incoming spawn edge for a child thread, including its directional lifecycle status. The child thread is unique in this graph representation.
+**Purpose**: Creates or replaces the saved parent-to-child link for a spawned thread. It records which thread spawned which child and the current lifecycle status of that link.
 
-**Data flow**: It accepts parent and child `ThreadId`s plus a `DirectionalThreadSpawnEdgeStatus`, converts ids to strings and status to its string form, and executes an `INSERT ... ON CONFLICT(child_thread_id) DO UPDATE` into `thread_spawn_edges`. It returns `Ok(())` on success.
+**Data flow**: It takes parent id, child id, and status, writes them into thread_spawn_edges, and if that child already has an edge, replaces the parent and status.
 
-**Call relations**: Callers use this when explicitly managing spawned-thread relationships. Listing and descendant traversal methods later read the rows written here.
+**Call relations**: Thread-spawn features and tests use this to build the stored spawn graph that later listing, descendant search, and deletion cleanup rely on.
 
 *Call graph*: 3 external calls (to_string, query, as_ref).
 
@@ -407,11 +413,11 @@ async fn set_thread_spawn_edge_status(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Updates only the status of an existing child thread's incoming spawn edge. It leaves the parent-child linkage unchanged.
+**Purpose**: Changes the status of an existing spawn link for a child thread. This lets the system mark a spawned relationship as open, closed, or another supported state.
 
-**Data flow**: It takes a child `ThreadId` and new status, converts both to bound SQL values, runs `UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?`, and returns `Ok(())` or an error.
+**Data flow**: It receives a child thread id and a status, updates the matching row in thread_spawn_edges, and reports success or database errors through the result.
 
-**Call relations**: This is the narrow mutation path used after an edge already exists and only its lifecycle state changes. Status-aware listing methods consume the updated values.
+**Call relations**: After an edge is created by upsert_thread_spawn_edge or automatic source parsing, this function updates its lifecycle so status-filtered child and descendant lists stay accurate.
 
 *Call graph*: 3 external calls (to_string, query, as_ref).
 
@@ -426,11 +432,11 @@ async fn list_thread_spawn_children_with_status(
     ) -> anyhow::Result<Vec<ThreadId>>
 ```
 
-**Purpose**: Returns direct child thread IDs for a parent, filtered to a specific edge status. Results are ordered by child thread id.
+**Purpose**: Lists the direct children of a parent thread whose spawn link has a specific status. Use this when only open or only closed child links matter.
 
-**Data flow**: It takes a parent `ThreadId` and status, wraps the status in `Some`, and forwards to `list_thread_spawn_children_matching`. The returned `Vec<ThreadId>` contains only matching direct children.
+**Data flow**: It receives a parent id and status, passes both into the shared child-listing helper, and returns matching child thread ids.
 
-**Call relations**: This is a convenience wrapper over the internal query builder. Callers choose it when they need only open or closed children rather than all statuses.
+**Call relations**: It is the public, status-filtered wrapper around list_thread_spawn_children_matching.
 
 *Call graph*: calls 1 internal fn (list_thread_spawn_children_matching).
 
@@ -444,11 +450,11 @@ async fn list_thread_spawn_children(
     ) -> anyhow::Result<Vec<ThreadId>>
 ```
 
-**Purpose**: Returns all direct child thread IDs for a parent regardless of edge status. Ordering is stable by child thread id.
+**Purpose**: Lists all direct children of a parent thread, regardless of link status. This answers the simple question, “Which threads did this one spawn?”
 
-**Data flow**: It accepts a parent `ThreadId`, passes `None` as the status filter to `list_thread_spawn_children_matching`, and returns the resulting `Vec<ThreadId>`.
+**Data flow**: It receives a parent id, calls the shared child-listing helper without a status filter, and returns the child ids sorted by id.
 
-**Call relations**: This wrapper exposes the unfiltered direct-child traversal path. Tests use it to confirm that unknown future statuses are still included when no filter is requested.
+**Call relations**: It shares the same database path as the status-filtered version but intentionally includes every stored edge.
 
 *Call graph*: calls 1 internal fn (list_thread_spawn_children_matching).
 
@@ -463,11 +469,11 @@ async fn list_thread_spawn_descendants_with_status(
     ) -> anyhow::Result<Vec<ThreadId>>
 ```
 
-**Purpose**: Returns all descendants reachable from a root thread whose traversed edges match a given status. Ordering is breadth-first by depth, then thread id.
+**Purpose**: Lists all descendants below a root thread, but only through links with a chosen status. This is useful for walking an active or closed part of the spawn tree.
 
-**Data flow**: It takes a root `ThreadId` and status, forwards `Some(status)` to `list_thread_spawn_descendants_matching`, and returns the collected descendant IDs.
+**Data flow**: It takes a root id and status, asks the recursive descendant helper to walk the graph with that status filter, and returns ids ordered by depth and id.
 
-**Call relations**: This wrapper exposes the recursive status-filtered traversal path. It is used when callers need only open or closed subtrees.
+**Call relations**: It is the public filtered wrapper around list_thread_spawn_descendants_matching.
 
 *Call graph*: calls 1 internal fn (list_thread_spawn_descendants_matching).
 
@@ -481,11 +487,11 @@ async fn list_thread_spawn_descendants(
     ) -> anyhow::Result<Vec<ThreadId>>
 ```
 
-**Purpose**: Returns all descendants reachable from a root thread regardless of edge status. Results are breadth-first and stable within each depth.
+**Purpose**: Lists every spawned descendant under a root thread. Unlike direct-child listing, it includes grandchildren and deeper levels.
 
-**Data flow**: It accepts a root `ThreadId`, forwards `None` to `list_thread_spawn_descendants_matching`, and returns the resulting `Vec<ThreadId>`.
+**Data flow**: It receives a root id, calls the recursive descendant helper without a status filter, and returns all discovered ids breadth-first.
 
-**Call relations**: This is the unfiltered recursive traversal entrypoint. Cleanup tests use it to verify that retry graph structure remains intact after a failed deletion attempt.
+**Call relations**: Deletion retry tests and spawn-tree features use this to rediscover a subtree from the saved edges.
 
 *Call graph*: calls 1 internal fn (list_thread_spawn_descendants_matching).
 
@@ -500,11 +506,11 @@ async fn find_thread_spawn_child_by_path(
     ) -> anyhow::Result<Option<ThreadId>>
 ```
 
-**Purpose**: Finds a direct spawned child of a parent by canonical `threads.agent_path`. It errors if more than one child matches the same path.
+**Purpose**: Finds a direct spawned child by its canonical agent path. This lets the system reuse or locate a child agent thread by its stable path name.
 
-**Data flow**: Inputs are a parent `ThreadId` and `agent_path`. The function joins `thread_spawn_edges` to `threads`, filters by parent and path, orders by thread id, limits to two rows, and passes the rows to `one_thread_id_from_rows`. It returns `Ok(None)`, `Ok(Some(ThreadId))`, or an error on duplicates/SQL issues.
+**Data flow**: It takes a parent id and path, joins spawn edges to thread rows, fetches up to two matching ids, and returns none, one id, or an error if the path is ambiguous.
 
-**Call relations**: This lookup path is for direct children only. It delegates duplicate detection and row-to-id conversion to `one_thread_id_from_rows`.
+**Call relations**: It relies on one_thread_id_from_rows to enforce the rule that a canonical path should identify at most one matching child.
 
 *Call graph*: calls 1 internal fn (one_thread_id_from_rows); 2 external calls (to_string, query).
 
@@ -519,11 +525,11 @@ async fn find_thread_spawn_descendant_by_path(
     ) -> anyhow::Result<Option<ThreadId>>
 ```
 
-**Purpose**: Finds any spawned descendant under a root thread by canonical `agent_path`. It uses a recursive CTE and rejects ambiguous matches.
+**Purpose**: Finds any spawned descendant under a root thread by canonical agent path. This searches deeper than immediate children.
 
-**Data flow**: It takes a root `ThreadId` and path, builds a recursive `subtree` CTE over `thread_spawn_edges`, joins descendants to `threads`, filters by `agent_path`, orders by id, limits to two rows, and converts the rows through `one_thread_id_from_rows`.
+**Data flow**: It takes a root id and path, uses a recursive SQL query to walk the spawn subtree, filters descendants by agent path, and returns none, one id, or an ambiguity error.
 
-**Call relations**: This is the recursive counterpart to `find_thread_spawn_child_by_path`. It delegates ambiguity handling to `one_thread_id_from_rows` after the SQL traversal gathers candidate descendants.
+**Call relations**: Like the direct-child search, it hands raw rows to one_thread_id_from_rows so duplicate matches are caught clearly.
 
 *Call graph*: calls 1 internal fn (one_thread_id_from_rows); 2 external calls (to_string, query).
 
@@ -538,11 +544,11 @@ async fn list_thread_spawn_children_matching(
     ) -> anyhow::Result<Vec<ThreadId>>
 ```
 
-**Purpose**: Internal query builder for direct child listing with an optional status filter. It centralizes the SQL shape used by both public child-list methods.
+**Purpose**: Builds and runs the actual query for direct spawned children, optionally filtered by status. It avoids duplicating almost identical SQL in the public child-listing methods.
 
-**Data flow**: Inputs are a parent `ThreadId` and `Option<DirectionalThreadSpawnEdgeStatus>`. It constructs a `QueryBuilder<Sqlite>` selecting `child_thread_id` from `thread_spawn_edges`, conditionally appends `AND status = ?`, orders by `child_thread_id`, fetches all rows, and converts each string id into `ThreadId`.
+**Data flow**: It receives a parent id and optional status, builds a safe parameterized SQL query, reads child_thread_id values, converts them to ThreadId values, and returns the list.
 
-**Call relations**: Only `list_thread_spawn_children` and `list_thread_spawn_children_with_status` call this helper. It exists to keep the direct-child query logic and conversion behavior in one place.
+**Call relations**: Both list_thread_spawn_children and list_thread_spawn_children_with_status delegate to this helper.
 
 *Call graph*: called by 2 (list_thread_spawn_children, list_thread_spawn_children_with_status); 2 external calls (new, to_string).
 
@@ -557,11 +563,11 @@ async fn list_thread_spawn_descendants_matching(
     ) -> anyhow::Result<Vec<ThreadId>
 ```
 
-**Purpose**: Internal recursive traversal for descendant listing with an optional status filter. It emits descendants breadth-first by carrying depth through a recursive CTE.
+**Purpose**: Builds and runs the recursive query that walks a spawn tree. It can include all edges or only edges with a chosen status.
 
-**Data flow**: It accepts a root `ThreadId` and optional status. Using `QueryBuilder`, it creates a recursive `subtree(child_thread_id, depth)` CTE seeded from the root's direct children; when a status is provided, both the seed and recursive step constrain `status = ?`. It then selects `child_thread_id` ordered by `depth ASC, child_thread_id ASC`, fetches all rows, and converts them into `ThreadId`s.
+**Data flow**: It receives a root id and optional status, creates a recursive SQLite query, reads descendant ids with their depth, sorts them breadth-first, and returns converted ThreadId values.
 
-**Call relations**: This helper underpins both public descendant-list methods. The status-aware branch intentionally filters both the first hop and recursive expansion so only matching-status edges remain in the returned subtree.
+**Call relations**: The public descendant-listing methods call this so the tree-walking logic lives in one place.
 
 *Call graph*: called by 2 (list_thread_spawn_descendants, list_thread_spawn_descendants_with_status); 2 external calls (new, to_string).
 
@@ -576,11 +582,11 @@ async fn insert_thread_spawn_edge_if_absent(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Creates an open spawn edge only if the child thread does not already have one. It is used for inferred parentage rather than explicit edge replacement.
+**Purpose**: Creates a parent-child spawn edge only when the child does not already have one. It is a safe default insert used during thread import or creation.
 
-**Data flow**: It takes parent and child `ThreadId`s, converts them to strings, binds the default status `DirectionalThreadSpawnEdgeStatus::Open`, and executes `INSERT ... ON CONFLICT(child_thread_id) DO NOTHING`. It returns `Ok(())` regardless of whether a row was inserted.
+**Data flow**: It receives parent and child ids, inserts an Open status edge, and does nothing if the child already has an edge.
 
-**Call relations**: This helper is called only by `insert_thread_spawn_edge_from_source_if_absent`, which uses it after inferring a parent thread from serialized session source metadata.
+**Call relations**: insert_thread_spawn_edge_from_source_if_absent calls this after it has extracted a parent id from the thread source.
 
 *Call graph*: called by 1 (insert_thread_spawn_edge_from_source_if_absent); 2 external calls (to_string, query).
 
@@ -595,11 +601,11 @@ async fn insert_thread_spawn_edge_from_source_if_absent(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Infers a parent thread from a thread's serialized `source` string and inserts the corresponding spawn edge if one is not already present. If the source does not encode a parent, it does nothing.
+**Purpose**: Looks at a thread’s source information and records a spawn edge if that source names a parent thread. This automatically rebuilds the spawn graph while saving thread metadata.
 
-**Data flow**: Inputs are a child `ThreadId` and source string. The function parses the source via `thread_spawn_parent_thread_id_from_source_str`; if parsing yields `Some(parent_thread_id)`, it calls `insert_thread_spawn_edge_if_absent`, otherwise it returns `Ok(())` immediately.
+**Data flow**: It receives a child id and source string, parses the source for a parent id, and if found inserts the missing edge with an open status.
 
-**Call relations**: Both `insert_thread_if_absent` and `upsert_thread_with_creation_memory_mode` call this after writing a thread row so inferred spawn relationships are persisted automatically for threads whose source encodes parentage.
+**Call relations**: Both insert_thread_if_absent and upsert_thread_with_creation_memory_mode call this after saving thread rows, so source-derived parent links are kept in sync.
 
 *Call graph*: calls 2 internal fn (insert_thread_spawn_edge_if_absent, thread_spawn_parent_thread_id_from_source_str); called by 2 (insert_thread_if_absent, upsert_thread_with_creation_memory_mode).
 
@@ -614,11 +620,11 @@ async fn find_rollout_path_by_id(
     ) -> anyhow::Result<Option<PathBuf>>
 ```
 
-**Purpose**: Looks up the persisted rollout file path for a thread, optionally restricted to archived or unarchived rows. It returns the path without loading full metadata.
+**Purpose**: Finds the rollout file path for a thread id. A rollout is the on-disk record of events for a conversation.
 
-**Data flow**: It takes a `ThreadId` and `Option<bool>` for `archived_only`, builds a query selecting `rollout_path` from `threads`, conditionally appends `AND archived = 1` or `AND archived = 0`, fetches an optional row, and maps the string path into `PathBuf`.
+**Data flow**: It takes a thread id and optional archive filter, queries rollout_path from the threads table, and returns the path if a matching row exists.
 
-**Call relations**: This is a lightweight lookup path for callers that only need the rollout location. It uses dynamic SQL assembly rather than the broader thread-list helpers.
+**Call relations**: This is a direct database lookup for code that needs to locate the thread’s underlying rollout file without loading full metadata.
 
 *Call graph*: 2 external calls (new, to_string).
 
@@ -635,11 +641,11 @@ async fn find_thread_by_exact_title(
         cwd: Optio
 ```
 
-**Purpose**: Finds the newest visible thread whose title exactly matches a given string, subject to source/provider/archive/cwd filters. It returns at most one `ThreadMetadata` row ordered by newest `updated_at`.
+**Purpose**: Finds the newest thread with exactly the requested user-facing title. Filters keep the search limited to the right sources, providers, archive state, and optionally working folder.
 
-**Data flow**: Inputs are the title, allowed sources, optional provider list, archive flag, and optional cwd. The function builds a query using `push_thread_select_columns`, `push_thread_filters`, and `push_thread_order_and_limit`, adds `AND threads.title = ?` and optional cwd equality, fetches one row, and converts it into `ThreadMetadata`.
+**Data flow**: It receives title and filter settings, builds a normal thread-list query, adds an exact title condition, sorts newest first, and returns at most one metadata record.
 
-**Call relations**: This method composes the shared filtering and ordering helpers with an exact-title predicate. It is a specialized search path layered on top of the same thread-row projection used by list operations.
+**Call relations**: It reuses push_thread_select_columns, push_thread_filters, and push_thread_order_and_limit so exact-title search follows the same rules as general thread listing.
 
 *Call graph*: calls 3 internal fn (push_thread_filters, push_thread_order_and_limit, push_thread_select_columns); 1 external calls (new).
 
@@ -654,11 +660,11 @@ async fn list_threads(
     ) -> anyhow::Result<crate::ThreadsPage>
 ```
 
-**Purpose**: Lists visible threads as a paginated `ThreadsPage` using the supplied filter options. It is the general thread-list entrypoint without parent-child restriction.
+**Purpose**: Lists visible threads as a paged result. This powers thread list screens or APIs that browse conversations.
 
-**Data flow**: It takes a page size and `ThreadFilterOptions`, forwards them with `parent_thread_id` set to `None` into `list_threads_matching`, and returns the resulting page.
+**Data flow**: It receives a page size and filters, then delegates to the shared listing function without limiting results to a parent thread.
 
-**Call relations**: This public wrapper is used for ordinary thread browsing. It delegates all query construction, pagination, and row decoding to `list_threads_matching`.
+**Call relations**: It is the general public entry into list_threads_matching.
 
 *Call graph*: calls 1 internal fn (list_threads_matching).
 
@@ -674,11 +680,11 @@ async fn list_threads_by_parent(
     ) -> anyhow::Result<crate::ThreadsPage>
 ```
 
-**Purpose**: Lists direct child threads of a given parent as a paginated `ThreadsPage`, while still honoring the standard thread filters and ordering. It uses persisted spawn edges rather than rollout scanning.
+**Purpose**: Lists only the direct child threads spawned by a given parent, with the same filtering and pagination as the normal thread list.
 
-**Data flow**: Inputs are page size, parent `ThreadId`, and `ThreadFilterOptions`. The function forwards them to `list_threads_matching` with `Some(parent_thread_id)` so the query adds a child-edge restriction.
+**Data flow**: It receives page size, parent id, and filters, then delegates to the shared listing function with that parent id attached.
 
-**Call relations**: This wrapper exposes parent-scoped listing on top of the shared pagination machinery. Tests use it to verify direct-child filtering and keyset pagination behavior.
+**Call relations**: It uses list_threads_matching so child-thread browsing behaves like normal browsing plus an extra parent constraint.
 
 *Call graph*: calls 1 internal fn (list_threads_matching).
 
@@ -694,11 +700,11 @@ async fn list_threads_matching(
     ) -> anyhow::Result<crate::ThreadsPag
 ```
 
-**Purpose**: Internal implementation for paginated thread listing, optionally restricted to direct children of a parent thread. It computes `next_anchor` by overfetching one row.
+**Purpose**: Runs the shared paged thread-list query and turns database rows into a ThreadsPage. It also computes whether another page is available.
 
-**Data flow**: It receives page size, filter options, and optional parent id. The function computes `limit = page_size + 1`, builds the SQL with `push_list_threads_query`, fetches rows, converts them into `ThreadMetadata`, records `num_scanned_rows`, and if more than `page_size` items were fetched, pops the extra row and derives `next_anchor` from the last retained item using `anchor_from_item`.
+**Data flow**: It receives page size, filters, and optional parent id, asks for one extra row, converts rows to metadata, removes the extra row if present, and returns items plus a next-page anchor.
 
-**Call relations**: Both `list_threads` and `list_threads_by_parent` call this shared implementation. It delegates SQL assembly to `push_list_threads_query` and encapsulates the keyset-pagination contract for all thread-page callers.
+**Call relations**: list_threads and list_threads_by_parent both call this after deciding whether a parent filter is needed.
 
 *Call graph*: calls 1 internal fn (push_list_threads_query); called by 2 (list_threads, list_threads_by_parent); 1 external calls (new).
 
@@ -715,11 +721,11 @@ async fn list_thread_ids(
         model_providers: Op
 ```
 
-**Purpose**: Lists only thread IDs, not full metadata, using the same visibility and ordering filters as thread listing. This avoids rollout-path and metadata decoding overhead when only identifiers are needed.
+**Purpose**: Lists only thread ids, not full metadata. This is cheaper when callers just need identifiers for another stage of work.
 
-**Data flow**: Inputs are limit, optional anchor, sort key, allowed sources, optional providers, and archive flag. The function builds `SELECT threads.id FROM threads`, applies `push_thread_filters` and `push_thread_order_and_limit`, fetches all rows, extracts each `id` string, converts it to `ThreadId`, and returns the vector.
+**Data flow**: It receives limit, cursor anchor, sort key, source/provider filters, and archive state, builds a filtered ordered query, and returns converted ThreadId values.
 
-**Call relations**: This method reuses the shared filter/order helpers but bypasses `push_thread_select_columns` and `ThreadRow` decoding. It serves callers that need ordered identifiers for follow-up work.
+**Call relations**: It shares the same filter and ordering helpers as full listing, so id-only scans stay consistent with thread browsing.
 
 *Call graph*: calls 2 internal fn (push_thread_filters, push_thread_order_and_limit); 1 external calls (new).
 
@@ -730,11 +736,11 @@ async fn list_thread_ids(
 async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()>
 ```
 
-**Purpose**: Public convenience wrapper that upserts thread metadata using the default creation memory mode behavior. It is the standard write path for full metadata replacement/merge.
+**Purpose**: Inserts or updates a thread’s metadata using the normal memory-mode behavior. “Upsert” means insert if missing, otherwise update the existing row.
 
-**Data flow**: It takes a borrowed `ThreadMetadata` and forwards it to `upsert_thread_with_creation_memory_mode` with `None` for `creation_memory_mode`. The return value is the delegated `anyhow::Result<()>`.
+**Data flow**: It receives metadata and forwards it to the fuller upsert function without a special creation-time memory mode.
 
-**Call relations**: This wrapper is called by `apply_rollout_items`, `mark_archived`, and `mark_unarchived`, and by many tests. It exists so most callers do not need to reason about the special first-insert memory-mode override.
+**Call relations**: apply_rollout_items, mark_archived, and mark_unarchived call this when saving changed metadata for existing or normal threads.
 
 *Call graph*: calls 1 internal fn (upsert_thread_with_creation_memory_mode); called by 3 (apply_rollout_items, mark_archived, mark_unarchived).
 
@@ -748,11 +754,11 @@ async fn insert_thread_if_absent(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Attempts to insert a new thread row without overwriting an existing one. It also infers and inserts a spawn edge from the thread source when applicable.
+**Purpose**: Adds a thread row only if it does not already exist. This is used when fallback or discovery code should not overwrite better metadata already stored.
 
-**Data flow**: It reads a `ThreadMetadata`, allocates a persisted `updated_at` via `allocate_thread_updated_at`, derives the stored preview via `metadata_preview`, binds all thread columns into an `INSERT ... ON CONFLICT(id) DO NOTHING`, and executes it. Afterward it calls `insert_thread_spawn_edge_from_source_if_absent` regardless of whether the row already existed, then returns `true` if a row was inserted and `false` otherwise.
+**Data flow**: It receives metadata, chooses a safe updated_at timestamp, derives preview text, tries an insert with default memory mode, adds a source-derived spawn edge if appropriate, and returns whether a row was inserted.
 
-**Call relations**: This is the non-destructive insert path used when fallback metadata should not clobber newer persisted state. It depends on `allocate_thread_updated_at` for timestamp uniqueness, `metadata_preview` for preview fallback, and inferred-edge insertion for parent-child graph maintenance.
+**Call relations**: It uses allocate_thread_updated_at, metadata_preview, and insert_thread_spawn_edge_from_source_if_absent to match the main upsert path while preserving existing rows.
 
 *Call graph*: calls 3 internal fn (allocate_thread_updated_at, insert_thread_spawn_edge_from_source_if_absent, metadata_preview); 1 external calls (query).
 
@@ -767,11 +773,11 @@ async fn set_thread_memory_mode(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Updates the `memory_mode` column for a thread and reports whether a row was touched. It is a narrow mutation path separate from full metadata upserts.
+**Purpose**: Updates only the memory mode for a thread. This keeps a small setting change from rewriting the rest of the metadata.
 
-**Data flow**: Inputs are a `ThreadId` and memory-mode string. The function executes `UPDATE threads SET memory_mode = ? WHERE id = ?` and returns `Ok(result.rows_affected() > 0)`.
+**Data flow**: It takes a thread id and memory-mode string, updates the matching row, and returns whether a row was changed.
 
-**Call relations**: `apply_rollout_items` calls this after upserting metadata when rollout items contain a newer memory-mode signal. Keeping it separate avoids embedding memory-mode extraction logic into the main upsert SQL.
+**Call relations**: apply_rollout_items calls this when newly applied rollout items contain memory-mode information.
 
 *Call graph*: called by 1 (apply_rollout_items); 2 external calls (to_string, query).
 
@@ -786,11 +792,11 @@ async fn update_thread_title(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Replaces the stored title for a thread and reports whether the row existed. It does not modify any other metadata.
+**Purpose**: Changes only a thread’s title. This supports quick renaming without touching timestamps, previews, or other stored metadata.
 
-**Data flow**: It binds the new title and thread id into `UPDATE threads SET title = ? WHERE id = ?` and returns a boolean based on `rows_affected()`.
+**Data flow**: It receives a thread id and new title, writes the title to the matching row, and returns whether the row existed.
 
-**Call relations**: This is a focused update path for title edits. It bypasses the heavier full-row upsert machinery when only the title changes.
+**Call relations**: This is a focused update path for title edits, separate from the larger metadata upsert flow.
 
 *Call graph*: 2 external calls (to_string, query).
 
@@ -805,11 +811,11 @@ async fn touch_thread_updated_at(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Updates only the persisted `updated_at` and `updated_at_ms` fields for a thread, preserving all other columns. It still routes the timestamp through the monotonic allocator.
+**Purpose**: Updates only the thread’s updated_at timestamp. This marks a thread as recently changed while preserving all other fields.
 
-**Data flow**: Inputs are a `ThreadId` and desired `DateTime<Utc>`. The function calls `allocate_thread_updated_at`, converts the allocated time to seconds and millis, executes `UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?`, and returns whether any row was updated.
+**Data flow**: It receives a thread id and desired time, passes the time through the timestamp allocator, stores seconds and milliseconds, and returns whether a row changed.
 
-**Call relations**: This method is used when callers need to advance ordering/cursor state without rewriting metadata. It relies on `allocate_thread_updated_at` to preserve uniqueness guarantees shared with insert/upsert paths.
+**Call relations**: It uses allocate_thread_updated_at for the same stable ordering guarantee as thread inserts and upserts.
 
 *Call graph*: calls 1 internal fn (allocate_thread_updated_at); 2 external calls (to_string, query).
 
@@ -823,11 +829,11 @@ fn allocate_thread_updated_at(
     ) -> anyhow::Result<DateTime<Utc>>
 ```
 
-**Purpose**: Allocates a persisted `updated_at` timestamp that is monotonic and unique within the current process for hot writes, while preserving sufficiently older historical timestamps unchanged. This protects keyset ordering without requiring a database read on every write.
+**Purpose**: Chooses a safe persisted updated_at time for list ordering. It prevents hot, near-simultaneous updates from getting identical millisecond timestamps inside this process.
 
-**Data flow**: It takes a candidate `DateTime<Utc>`, converts it to epoch millis, then loops against `self.thread_updated_at_millis` using relaxed atomic loads and compare-exchange. If the candidate is newer than the current high-water mark, it installs and returns it; if it is at least one second older than current, it returns the candidate unchanged; otherwise it bumps the current mark by one millisecond and returns that bumped value. The final integer is converted back to `DateTime<Utc>`.
+**Data flow**: It receives a proposed timestamp, compares it with a process-local high-water mark, keeps clearly older historical times unchanged, or bumps close repeated times by one millisecond. It returns the allocated DateTime.
 
-**Call relations**: This allocator is called by `insert_thread_if_absent`, `touch_thread_updated_at`, and `upsert_thread_with_creation_memory_mode`. It is the core invariant-preserving helper behind stable thread ordering and duplicate-timestamp avoidance.
+**Call relations**: insert_thread_if_absent, touch_thread_updated_at, and upsert_thread_with_creation_memory_mode all call this before writing updated_at values used by pagination.
 
 *Call graph*: called by 3 (insert_thread_if_absent, touch_thread_updated_at, upsert_thread_with_creation_memory_mode).
 
@@ -843,11 +849,11 @@ async fn update_thread_git_info(
         git_origin_url: Option<Option<&str
 ```
 
-**Purpose**: Updates git metadata fields on a thread without disturbing unrelated columns. Each field can be left unchanged, set to a value, or explicitly cleared.
+**Purpose**: Updates Git-related fields for a thread without disturbing newer non-Git metadata. Each Git field can be left alone, set, or cleared.
 
-**Data flow**: Inputs are a `ThreadId` and three `Option<Option<&str>>` parameters for SHA, branch, and origin URL. For each field, outer `None` means leave unchanged, `Some(Some(v))` means set to `v`, and `Some(None)` means clear to SQL `NULL`. The function encodes those semantics with `CASE WHEN ? THEN ? ELSE existing END` expressions in one `UPDATE` and returns whether any row was affected.
+**Data flow**: It receives a thread id and three optional update instructions, uses SQL CASE expressions to change only requested fields, and returns whether a row was touched.
 
-**Call relations**: This targeted mutation path exists because rollout upserts may race with newer metadata writes; updating git fields independently avoids rewriting non-git columns. Tests verify both preservation of newer non-git metadata and explicit clearing behavior.
+**Call relations**: This focused path avoids the larger upsert flow when only repository commit, branch, or origin URL changes.
 
 *Call graph*: 2 external calls (to_string, query).
 
@@ -862,11 +868,11 @@ async fn upsert_thread_with_creation_memory_mode(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Inserts or updates a thread row while preserving important invariants: monotonic timestamps, non-empty preview retention, and atomic preservation of existing non-null git fields. On first insert it can seed a custom creation memory mode.
+**Purpose**: The main insert-or-update routine for thread metadata. It writes almost all thread columns while carefully preserving important existing values when incoming data is incomplete or stale.
 
-**Data flow**: It takes `ThreadMetadata` plus an optional creation memory mode, allocates `updated_at`, derives preview via `metadata_preview`, and executes an `INSERT ... ON CONFLICT(id) DO UPDATE`. The insert writes all thread columns including `memory_mode`; the conflict update refreshes most metadata but uses `COALESCE(NULLIF(excluded.preview, ''), threads.preview)` to avoid blanking preview and `COALESCE(threads.git_*, excluded.git_*)` to preserve existing git fields. After the SQL write it calls `insert_thread_spawn_edge_from_source_if_absent` and returns `Ok(())`.
+**Data flow**: It receives metadata and an optional creation memory mode, allocates updated_at, derives preview text, inserts a row or updates an existing one, preserves non-empty previews and existing Git fields, then records any source-derived spawn edge.
 
-**Call relations**: This is the real implementation behind `upsert_thread`, and `apply_rollout_items` also calls it directly when inserting a brand-new thread with a specific initial memory mode. It depends on `allocate_thread_updated_at`, `metadata_preview`, and inferred-edge insertion.
+**Call relations**: upsert_thread is the simple wrapper around this, while apply_rollout_items uses it directly when creating a new thread with a known initial memory mode.
 
 *Call graph*: calls 3 internal fn (allocate_thread_updated_at, insert_thread_spawn_edge_from_source_if_absent, metadata_preview); called by 2 (apply_rollout_items, upsert_thread); 1 external calls (query).
 
@@ -882,11 +888,11 @@ async fn apply_rollout_items(
         updated_at_override: Option<D
 ```
 
-**Purpose**: Merges a batch of rollout items into persisted thread metadata, creating the thread if needed and restoring memory mode from session metadata when present. It is the bridge from rollout-file events to SQLite thread state.
+**Purpose**: Applies newly read rollout events to the thread metadata stored in SQLite. This is the bridge from the event log on disk to the fast searchable thread table.
 
-**Data flow**: Inputs are a `ThreadMetadataBuilder`, a slice of `RolloutItem`, an optional creation memory mode for new threads, and an optional `updated_at` override. If `items` is empty it returns immediately. Otherwise it loads existing metadata with `get_thread`, builds or clones a metadata base, updates `rollout_path`, applies each rollout item via `apply_rollout_item`, preserves existing git info when a row already exists, chooses `updated_at` from the override or rollout file mtime, then either inserts with `upsert_thread_with_creation_memory_mode` or updates with `upsert_thread`. Finally it extracts the latest memory mode from the items via `extract_memory_mode` and, if present, persists it with `set_thread_memory_mode`.
+**Data flow**: It receives a metadata builder, rollout items, optional new-thread memory mode, and optional updated_at override. It loads existing metadata or builds fresh metadata, applies each item, preserves existing Git details, updates the timestamp, upserts the row, and stores memory mode if the items contain one.
 
-**Call relations**: This method is called by rollout ingestion paths. It orchestrates reads from `get_thread`, metadata mutation through `apply_rollout_item`, persistence through the upsert methods, and post-write memory-mode repair through `extract_memory_mode` and `set_thread_memory_mode`.
+**Call relations**: It calls get_thread first, then chooses between upsert_thread_with_creation_memory_mode for new rows and upsert_thread for existing rows; it also uses extract_memory_mode and set_thread_memory_mode for the memory setting.
 
 *Call graph*: calls 5 internal fn (get_thread, set_thread_memory_mode, upsert_thread, upsert_thread_with_creation_memory_mode, extract_memory_mode); 1 external calls (is_empty).
 
@@ -902,11 +908,11 @@ async fn mark_archived(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Marks an existing thread as archived and updates its rollout path and timestamp from the archived rollout file. Missing threads are ignored.
+**Purpose**: Marks a thread as archived in the database. Archived threads are hidden from normal lists and shown only when archive filters request them.
 
-**Data flow**: It takes a thread id, archived rollout path, and archive timestamp. The function loads the thread with `get_thread`; if absent it returns `Ok(())`. Otherwise it sets `archived_at`, replaces `rollout_path`, optionally refreshes `updated_at` from the file's modified time, warns if the loaded metadata id unexpectedly differs from the requested id, and persists the result with `upsert_thread`.
+**Data flow**: It receives a thread id, archive rollout path, and archive time, loads existing metadata, sets archived_at and path, refreshes updated_at from the file if possible, warns on id mismatch, and upserts the result.
 
-**Call relations**: Archive flows call this after moving or recognizing an archived rollout file. It depends on `get_thread` to avoid creating phantom rows and on `upsert_thread` to persist the modified metadata.
+**Call relations**: It depends on get_thread to avoid creating archive records for unknown threads and on upsert_thread to persist the changed metadata.
 
 *Call graph*: calls 2 internal fn (get_thread, upsert_thread); 2 external calls (to_path_buf, warn!).
 
@@ -921,11 +927,11 @@ async fn mark_unarchived(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Clears the archived flag on an existing thread and updates its rollout path and timestamp from the active rollout file. Missing threads are ignored.
+**Purpose**: Marks an archived thread as active again. This moves it back into normal, non-archived thread lists.
 
-**Data flow**: It accepts a thread id and rollout path, loads the thread via `get_thread`, returns early if absent, sets `archived_at` to `None`, updates `rollout_path`, optionally refreshes `updated_at` from file mtime, warns on an unexpected id mismatch, and writes the metadata back with `upsert_thread`.
+**Data flow**: It receives a thread id and rollout path, loads existing metadata, clears archived_at, updates the path and possibly updated_at, warns on id mismatch, and saves the metadata.
 
-**Call relations**: This is the inverse of `mark_archived` for restore/unarchive flows. It follows the same read-modify-write pattern and warning behavior.
+**Call relations**: It mirrors mark_archived, using get_thread before changing state and upsert_thread afterward.
 
 *Call graph*: calls 2 internal fn (get_thread, upsert_thread); 2 external calls (to_path_buf, warn!).
 
@@ -936,11 +942,11 @@ async fn mark_unarchived(
 async fn delete_thread(&self, thread_id: ThreadId) -> anyhow::Result<u64>
 ```
 
-**Purpose**: Deletes one thread and all associated state by delegating to the strict multi-thread deletion path. It returns the number of thread rows removed.
+**Purpose**: Deletes one thread and its associated state. It is the single-thread convenience wrapper around the stricter multi-delete routine.
 
-**Data flow**: It wraps the single `ThreadId` in a one-element slice and forwards to `delete_threads_strict`, returning that method's `u64` result.
+**Data flow**: It receives one thread id, puts it into a one-item slice, calls delete_threads_strict, and returns the number of thread rows deleted.
 
-**Call relations**: This is the convenience single-thread entrypoint. All real cleanup logic lives in `delete_threads_strict`.
+**Call relations**: All real cleanup work is handed to delete_threads_strict so single and batch deletion follow the same safety rules.
 
 *Call graph*: calls 1 internal fn (delete_threads_strict).
 
@@ -951,11 +957,11 @@ async fn delete_thread(&self, thread_id: ThreadId) -> anyhow::Result<u64>
 async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64>
 ```
 
-**Purpose**: Deletes threads and their associated logs, memories, goals, dynamic tools, spawn edges, and agent-job assignments in a retry-safe order. It also cancels jobs whose running worker threads are being deleted alongside their runner threads.
+**Purpose**: Deletes a set of threads and cleans the state connected to them. It is careful to remove the main thread rows last so a failed cleanup can be retried using the remaining graph information.
 
-**Data flow**: It takes a slice of `ThreadId`s and returns early with `0` if empty. It stringifies ids, then outside the main transaction deletes each thread's logs from `logs_pool`, memory state via `self.memories`, and goals via `self.thread_goals`. Inside a transaction on `self.pool`, it computes `now`, cancels affected `agent_jobs` when both runner and worker threads are in the deletion set, deletes `thread_dynamic_tools`, requeues running `agent_job_items` assigned to deleted threads with an error message, clears any remaining `assigned_thread_id`s, deletes spawn edges for each thread, then deletes thread rows and sums `rows_affected`. Finally it commits and returns the count.
+**Data flow**: It receives thread ids, deletes logs, memories, and goals, updates job and job-item records so deleted worker threads are unassigned or cancelled, removes dynamic tools and spawn edges, deletes thread rows in a transaction, commits, and returns the number of rows removed.
 
-**Call relations**: `delete_thread` delegates here for all cleanup work. The ordering is intentional: dependent state is removed before spawn edges and thread rows so a failure leaves enough graph information to rediscover and retry the same subtree cleanup.
+**Call relations**: delete_thread delegates here. The surrounding tests check both successful cleanup and the important retry behavior when an early cleanup step fails.
 
 *Call graph*: called by 1 (delete_thread); 4 external calls (now, is_empty, iter, query).
 
@@ -969,11 +975,11 @@ fn one_thread_id_from_rows(
 ) -> anyhow::Result<Option<ThreadId>>
 ```
 
-**Purpose**: Converts up to two SQL rows containing thread IDs into an optional unique `ThreadId`, rejecting ambiguous matches. It is used by path-based spawn lookups.
+**Purpose**: Turns search results for an agent path into a clear answer: no thread, one thread, or an error for duplicates. This protects callers from silently choosing the wrong spawned agent.
 
-**Data flow**: It takes a vector of `SqliteRow` and the queried `agent_path`, extracts each `id` string, converts them to `ThreadId`, and then returns `Ok(None)` for zero rows, `Ok(Some(id))` for one row, or an `anyhow!` error mentioning the canonical path when multiple rows were found.
+**Data flow**: It receives database rows and the searched path, converts row ids to ThreadId values, returns none for zero matches, one id for one match, and an error if more than one match exists.
 
-**Call relations**: Both `find_thread_spawn_child_by_path` and `find_thread_spawn_descendant_by_path` delegate their post-query uniqueness check to this helper so duplicate-path handling is consistent.
+**Call relations**: Both direct-child and descendant path searches use this helper after their SQL queries.
 
 *Call graph*: called by 2 (find_thread_spawn_child_by_path, find_thread_spawn_descendant_by_path); 1 external calls (anyhow!).
 
@@ -989,11 +995,11 @@ fn push_list_threads_query(
 )
 ```
 
-**Purpose**: Builds the full SQL for paginated thread listing, including selected columns, filters, optional parent-child restriction, and ordering/limit. It also chooses whether ORDER BY may use the timestamp index.
+**Purpose**: Assembles the SQL for a paged thread list. It combines selected columns, filters, optional parent-child restriction, ordering, and limit.
 
-**Data flow**: Inputs are a mutable `QueryBuilder<Sqlite>`, `ThreadFilterOptions`, optional parent thread id, and limit. The function appends the shared select projection, `FROM threads`, shared filters, an `IN (SELECT child_thread_id ...)` clause when `parent_thread_id` is present, computes `OrderByIndex` based on `cwd_filters` cardinality, and appends ordering and limit.
+**Data flow**: It receives a query builder, filter options, optional parent id, and limit, appends SQL fragments and bound values, and leaves the builder ready to execute.
 
-**Call relations**: `list_threads_matching` uses this helper for production queries, and one test calls it directly under `EXPLAIN QUERY PLAN` to verify index selection. It composes `push_thread_select_columns`, `push_thread_filters`, and `push_thread_order_and_limit`.
+**Call relations**: list_threads_matching uses it for real listing; an index-planning test also calls it to verify SQLite chooses efficient query plans.
 
 *Call graph*: calls 3 internal fn (push_thread_filters, push_thread_order_and_limit, push_thread_select_columns); called by 2 (list_threads_matching, list_threads_uses_indexes_matching_cwd_filters); 2 external calls (push, push_bind).
 
@@ -1004,11 +1010,11 @@ fn push_list_threads_query(
 fn push_thread_select_columns(builder: &mut QueryBuilder<Sqlite>)
 ```
 
-**Purpose**: Appends the canonical thread column projection used when decoding rows into `ThreadMetadata`. It keeps all thread-reading queries aligned on the same selected fields and aliases.
+**Purpose**: Adds the standard list of thread columns to a SQL SELECT query. This keeps all thread metadata queries reading the same shape of data.
 
-**Data flow**: It mutates the provided `QueryBuilder<Sqlite>` by pushing a multiline `SELECT` clause covering ids, rollout path, millisecond timestamps aliased as `created_at`/`updated_at`, source fields, model fields, preview/title, archive timestamp, and git fields.
+**Data flow**: It receives a SQL query builder and appends the SELECT clause with all fields needed to reconstruct ThreadMetadata.
 
-**Call relations**: This helper is called by `find_thread_by_exact_title` and `push_list_threads_query`. Centralizing the projection reduces drift between different thread-reading queries.
+**Call relations**: find_thread_by_exact_title and push_list_threads_query call this before adding FROM, WHERE, and ORDER BY clauses.
 
 *Call graph*: called by 2 (find_thread_by_exact_title, push_list_threads_query); 1 external calls (push).
 
@@ -1019,11 +1025,11 @@ fn push_thread_select_columns(builder: &mut QueryBuilder<Sqlite>)
 fn extract_memory_mode(items: &[RolloutItem]) -> Option<String>
 ```
 
-**Purpose**: Finds the most recent memory-mode value present in a rollout item batch. It scans from the end so later session metadata wins.
+**Purpose**: Finds the latest memory-mode value inside rollout items. It scans from the end because later rollout metadata should win.
 
-**Data flow**: It takes a slice of `RolloutItem`, iterates it in reverse, and returns the first `meta.memory_mode.clone()` found on a `RolloutItem::SessionMeta`. All other rollout item variants are ignored, yielding `None` if no session metadata carries a memory mode.
+**Data flow**: It receives rollout items, looks backward for a session metadata item with memory_mode, and returns that string if found.
 
-**Call relations**: `apply_rollout_items` calls this after persisting metadata so it can restore or update the dedicated `threads.memory_mode` column from rollout content.
+**Call relations**: apply_rollout_items uses this after saving metadata so the database memory_mode column reflects the newest rollout instruction.
 
 *Call graph*: called by 1 (apply_rollout_items); 1 external calls (iter).
 
@@ -1034,11 +1040,11 @@ fn extract_memory_mode(items: &[RolloutItem]) -> Option<String>
 fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId>
 ```
 
-**Purpose**: Parses a serialized thread source string and extracts an encoded parent thread id when present. It accepts either full JSON or a plain string form convertible into `SessionSource`.
+**Purpose**: Parses a thread source string and extracts the parent thread id if the source describes a spawned thread. This lets older or differently encoded source values still contribute to the spawn graph.
 
-**Data flow**: It takes a source `&str`, first tries `serde_json::from_str`, then falls back to wrapping the string in `Value::String` and deserializing that into `SessionSource`. If parsing succeeds, it calls `parent_thread_id()` on the parsed source and returns the resulting `Option<ThreadId>`.
+**Data flow**: It receives a source string, tries to parse it as session-source JSON or as a plain session-source value, then asks the parsed value for its parent id.
 
-**Call relations**: This parser is used only by `insert_thread_spawn_edge_from_source_if_absent` to infer persisted spawn edges from thread source metadata during inserts/upserts.
+**Call relations**: insert_thread_spawn_edge_from_source_if_absent calls this before deciding whether to create a spawn edge.
 
 *Call graph*: called by 1 (insert_thread_spawn_edge_from_source_if_absent); 1 external calls (from_str).
 
@@ -1052,11 +1058,11 @@ fn push_thread_filters(
 )
 ```
 
-**Purpose**: Appends the shared `WHERE` predicates for thread visibility, source/provider/cwd filtering, search, and keyset anchor pagination. It encodes several important invariants, including excluding blank-preview rows from listings.
+**Purpose**: Adds the shared WHERE conditions for thread queries. These conditions decide which threads are visible for a list or search.
 
-**Data flow**: It destructures `ThreadFilterOptions`, mutates the provided `QueryBuilder<Sqlite>`, and appends predicates for archived vs visible rows, `threads.preview <> ''`, optional source and provider `IN` lists, cwd filtering (`Some([])` becomes `AND 1 = 0`), optional substring search over title or preview using `instr`, and optional anchor comparison against either `created_at_ms` or `updated_at_ms` with direction-sensitive `>` or `<`.
+**Data flow**: It receives a query builder and filter options, then appends archive filtering, non-empty preview filtering, source/provider filters, working-directory filters, search text matching, and cursor-anchor conditions.
 
-**Call relations**: This helper is reused by `claim_stage1_jobs_for_startup`, `find_thread_by_exact_title`, `list_thread_ids`, and `push_list_threads_query`. It is the central place where thread-list semantics and pagination predicates are defined.
+**Call relations**: Thread listing, id listing, exact-title search, and startup job claiming reuse this helper so their filtering rules stay aligned.
 
 *Call graph*: called by 4 (claim_stage1_jobs_for_startup, find_thread_by_exact_title, list_thread_ids, push_list_threads_query); 3 external calls (push, push_bind, separated).
 
@@ -1073,11 +1079,11 @@ fn push_thread_order_and_limit(
 )
 ```
 
-**Purpose**: Appends the `ORDER BY` and `LIMIT` clause for thread queries, with optional suppression of index-based ordering. It supports both created-at and updated-at sorting in ascending or descending order.
+**Purpose**: Adds ORDER BY and LIMIT to a thread query. It supports sorting by creation or update time in either direction.
 
-**Data flow**: Inputs are a mutable `QueryBuilder<Sqlite>`, `SortKey`, `SortDirection`, `OrderByIndex`, and limit. The function chooses the timestamp column and SQL direction string, optionally prefixes the ordered column with unary `+` when index ordering is disabled, then pushes `ORDER BY ... LIMIT ?` and binds the limit as `i64`.
+**Data flow**: It receives a query builder, sort settings, an index-use hint, and a limit, then appends the ordered timestamp column and bound limit.
 
-**Call relations**: This helper is called by `find_thread_by_exact_title`, `list_thread_ids`, and `push_list_threads_query`. It works with `OrderByIndex` to preserve better filtering plans for multi-cwd queries.
+**Call relations**: The list and search builders call this after filters are added, making pagination and sorting consistent across those paths.
 
 *Call graph*: called by 3 (find_thread_by_exact_title, list_thread_ids, push_list_threads_query); 2 external calls (push, push_bind).
 
@@ -1088,11 +1094,11 @@ fn push_thread_order_and_limit(
 fn metadata_preview(metadata: &crate::ThreadMetadata) -> &str
 ```
 
-**Purpose**: Computes the preview text that should be stored for a thread from available metadata fields. It prefers explicit preview, then falls back to first user message, then empty string.
+**Purpose**: Chooses the best preview text available from thread metadata. It prefers an explicit preview, then falls back to the first user message.
 
-**Data flow**: It reads a borrowed `ThreadMetadata` and returns a borrowed `&str` chosen from `metadata.preview`, `metadata.first_user_message`, or `""`. No allocation or external state is involved.
+**Data flow**: It receives metadata and returns a borrowed string: preview if present, otherwise first_user_message if present, otherwise an empty string.
 
-**Call relations**: Both `insert_thread_if_absent` and `upsert_thread_with_creation_memory_mode` call this helper before binding the `preview` column, ensuring consistent fallback behavior across insert and upsert paths.
+**Call relations**: insert_thread_if_absent and upsert_thread_with_creation_memory_mode use this before writing the preview column.
 
 *Call graph*: called by 2 (insert_thread_if_absent, upsert_thread_with_creation_memory_mode).
 
@@ -1103,11 +1109,11 @@ fn metadata_preview(metadata: &crate::ThreadMetadata) -> &str
 async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows()
 ```
 
-**Purpose**: Verifies that the special creation-time memory mode is applied only on first insert and is not overwritten by later ordinary upserts. This protects the initial thread memory-mode choice.
+**Purpose**: Checks that a memory mode chosen when a thread is first created is not overwritten by a later normal upsert.
 
-**Data flow**: The test creates a runtime and deterministic metadata, inserts the thread through `upsert_thread_with_creation_memory_mode(..., Some("disabled"))`, reads `memory_mode` directly from SQLite, then modifies the title and calls `upsert_thread`. It reads `memory_mode` again and asserts it remains `disabled`.
+**Data flow**: The test creates a runtime and thread, inserts it with memory disabled, upserts changed metadata, then reads the database and expects memory_mode to remain disabled.
 
-**Call relations**: This async test drives both the specialized insert path and the normal upsert path to validate their interaction around the `memory_mode` column.
+**Call relations**: It protects the contract between upsert_thread and upsert_thread_with_creation_memory_mode.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 2 external calls (assert_eq!, query_scalar).
 
@@ -1118,11 +1124,11 @@ async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows()
 async fn delete_thread_cleans_associated_state() -> Result<()>
 ```
 
-**Purpose**: Checks that strict thread deletion removes or repairs all related state: logs, goals, dynamic tools, spawn edges, and agent-job assignments/status. It also verifies the behavior when deleting a missing thread id that still has associated state.
+**Purpose**: Verifies that deleting threads removes or repairs all related state, not just the thread row.
 
-**Data flow**: It initializes a runtime, inserts a thread, seeds cleanup-related state through `seed_thread_cleanup_state`, inserts a dynamic tool, creates and starts an agent job with a running item assigned to a child thread, then calls `delete_threads_strict` on parent and child. The test asserts thread removal count, absence of the thread row, zero dynamic tools, cleaned logs/goals/spawn edges via `assert_thread_cleanup_state`, pending/unassigned job item state, and cancelled job status. It then seeds state for a missing thread id and confirms `delete_thread` returns `0` while still cleaning associated state.
+**Data flow**: The test seeds a thread, spawn edge, logs, goals, dynamic tools, and agent job state, deletes parent and child ids, then checks cleanup, job cancellation, and behavior for a missing thread.
 
-**Call relations**: This test exercises the full cleanup orchestration in `delete_threads_strict`, along with helper fixtures `seed_thread_cleanup_state` and `assert_thread_cleanup_state`, under both existing-row and missing-row scenarios.
+**Call relations**: It exercises delete_threads_strict through realistic related records and also covers delete_thread for a single missing id.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 8 external calls (assert!, assert_eq!, json!, query, query_scalar, assert_thread_cleanup_state, seed_thread_cleanup_state, vec!).
 
@@ -1133,11 +1139,11 @@ async fn delete_thread_cleans_associated_state() -> Result<()>
 async fn delete_thread_keeps_retry_graph_on_cleanup_failure() -> Result<()>
 ```
 
-**Purpose**: Ensures a cleanup failure does not remove the thread row or spawn-edge graph needed for a later retry. It specifically simulates failure by closing the logs database before deletion.
+**Purpose**: Checks that a failed deletion leaves enough thread and spawn-edge data to retry later.
 
-**Data flow**: The test creates a runtime, inserts a thread, seeds cleanup state, closes `runtime.logs_pool`, and calls `delete_thread`, expecting an error. It then reads the thread back and lists descendants from the parent, asserting both the thread row and child edge remain present.
+**Data flow**: The test seeds cleanup state, deliberately closes the log database so deletion fails, then confirms the original thread and descendant edge are still discoverable.
 
-**Call relations**: This async test validates the retry-safety design of `delete_threads_strict`: because log deletion happens before thread-row and edge deletion, an early failure leaves enough state to rediscover the same subtree.
+**Call relations**: It validates the ordering promise inside delete_threads_strict: risky cleanup happens before deleting the graph.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 3 external calls (assert!, assert_eq!, seed_thread_cleanup_state).
 
@@ -1152,11 +1158,11 @@ async fn seed_thread_cleanup_state(
     ) -> Result<()>
 ```
 
-**Purpose**: Creates the minimal associated state needed to exercise thread cleanup logic in tests. It adds a spawn edge, a thread goal, and a log row.
+**Purpose**: Creates common related state used by deletion tests. It gives a thread a spawn edge, a goal, and a log entry.
 
-**Data flow**: Inputs are a runtime, parent thread id, and child thread id. The helper inserts a closed spawn edge with `upsert_thread_spawn_edge`, writes a thread goal through `thread_goals().replace_thread_goal`, inserts a log row into `logs_pool`, and returns `Result<()>`.
+**Data flow**: It receives a runtime plus parent and child ids, writes a closed spawn edge, stores a test goal, and inserts one log row.
 
-**Call relations**: Cleanup tests call this helper before invoking deletion paths. It prepares the dependent state that `delete_threads_strict` is expected to remove.
+**Call relations**: The deletion tests call this helper so they both start from the same cleanup scenario.
 
 *Call graph*: calls 1 internal fn (thread_goals); 3 external calls (to_string, query, upsert_thread_spawn_edge).
 
@@ -1170,11 +1176,11 @@ async fn assert_thread_cleanup_state(
     ) -> Result<()>
 ```
 
-**Purpose**: Asserts that cleanup-related state for a thread has been fully removed. It checks spawn edges, thread goals, and logs.
+**Purpose**: Checks that deletion removed the common related state for a thread. It keeps cleanup assertions shared and readable.
 
-**Data flow**: Given a runtime and thread id, it queries the count of matching `thread_spawn_edges`, fetches the thread goal through `thread_goals().get_thread_goal`, queries logs through `query_logs` with a `LogQuery` filtered to the thread id, and asserts zero edges, no goal, and an empty log result.
+**Data flow**: It receives a runtime and thread id, counts matching spawn edges, reads the thread goal, queries logs, and asserts all are gone.
 
-**Call relations**: Deletion tests call this helper after cleanup operations to verify the side effects of `delete_threads_strict` beyond just the `threads` table.
+**Call relations**: tests::delete_thread_cleans_associated_state calls this after deletion to confirm the helper-seeded state was cleaned.
 
 *Call graph*: 7 external calls (default, assert!, assert_eq!, to_string, query_scalar, query_logs, vec!).
 
@@ -1185,11 +1191,11 @@ async fn assert_thread_cleanup_state(
 async fn list_threads_updated_after_returns_oldest_changes_first()
 ```
 
-**Purpose**: Validates ascending keyset pagination over `updated_at`, especially when multiple rows share the same second-level timestamp but differ at millisecond precision. It confirms that pages advance from the oldest qualifying change to newer ones.
+**Purpose**: Tests cursor-based listing in ascending updated-time order. It ensures paging after an anchor returns the next oldest eligible changes first.
 
-**Data flow**: The test inserts three threads with controlled `updated_at` values, constructs an `Anchor` at the oldest timestamp, and calls `list_threads` twice with page size 1, ascending `UpdatedAt`, and a provider filter. It collects returned ids and anchors and asserts the first page yields the newer thread, the second yields the middle thread, and pagination terminates correctly.
+**Data flow**: The test inserts threads with controlled update times, lists one page after an anchor, checks the returned id and next anchor, then lists the next page.
 
-**Call relations**: This test exercises `list_threads`, `push_thread_filters`, `push_thread_order_and_limit`, and the anchor computation in `list_threads_matching` under ascending-order pagination.
+**Call relations**: It exercises list_threads and the filtering, ordering, and anchor logic built by push_thread_filters and push_thread_order_and_limit.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 2 external calls (from_timestamp, assert_eq!).
 
@@ -1200,11 +1206,11 @@ async fn list_threads_updated_after_returns_oldest_changes_first()
 async fn list_threads_filters_by_cwd()
 ```
 
-**Purpose**: Checks that thread listing can restrict results to one or more working directories and that an explicit empty cwd filter yields no rows. It also verifies pagination order within the filtered subset.
+**Purpose**: Verifies that thread listing can be limited to specific working directories. It also checks that an empty directory filter returns no threads.
 
-**Data flow**: It inserts three threads with distinct cwd values and timestamps, then calls `list_threads` twice with a two-entry cwd filter and descending `UpdatedAt`, asserting the two matching threads arrive in newest-first order across pages. It then calls `list_threads` with `cwd_filters: Some(&[])` and asserts the returned page is empty.
+**Data flow**: The test inserts threads in three folders, lists with two folders and paging, checks only those folders appear, then lists with an empty filter and expects no items.
 
-**Call relations**: This test validates the cwd branches inside `push_thread_filters` and the pagination behavior of `list_threads_matching` when cwd filtering is active.
+**Call relations**: It covers list_threads with cwd_filters and the page anchor behavior in that filtered case.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 3 external calls (from_timestamp, assert_eq!, vec!).
 
@@ -1215,11 +1221,11 @@ async fn list_threads_filters_by_cwd()
 async fn list_threads_uses_indexes_matching_cwd_filters()
 ```
 
-**Purpose**: Pins the query-plan choices for thread listing so cwd-filtered queries continue using the intended indexes. It also checks when SQLite must fall back to a temporary sort.
+**Purpose**: Checks that generated thread-list SQL uses suitable SQLite indexes for different working-directory filter shapes. This guards performance, not just correctness.
 
-**Data flow**: The test initializes a runtime, defines provider filters, cwd filters, and an anchor, then for each sort key and cwd/anchor combination builds `EXPLAIN QUERY PLAN` SQL via `push_list_threads_query`. It executes the plan query, collects the `detail` strings, and asserts that the expected visible or cwd-specific index appears and that `TEMP B-TREE` sorting is present only in the expected cases.
+**Data flow**: The test builds EXPLAIN QUERY PLAN queries for several filter combinations, reads SQLite’s chosen plan text, and asserts expected indexes and temporary sorts.
 
-**Call relations**: This test directly exercises `push_list_threads_query` and, indirectly, `push_thread_filters` and `push_thread_order_and_limit`, to lock in the planner-sensitive `OrderByIndex` behavior.
+**Call relations**: It calls push_list_threads_query directly so changes to query construction are caught before they slow production listing.
 
 *Call graph*: calls 3 internal fn (init, unique_temp_dir, push_list_threads_query); 5 external calls (from_timestamp, from, new, assert!, assert_eq!).
 
@@ -1230,11 +1236,11 @@ async fn list_threads_uses_indexes_matching_cwd_filters()
 async fn list_threads_by_parent_filters_direct_children_with_keyset_pagination()
 ```
 
-**Purpose**: Verifies that parent-scoped listing returns only direct children, not deeper descendants, and still honors keyset pagination by the chosen sort key. It uses persisted spawn edges rather than rollout-derived relationships.
+**Purpose**: Tests listing direct child threads of a parent with cursor pagination. It confirms grandchildren are not included.
 
-**Data flow**: The test inserts metadata for two direct children and one grandchild with controlled creation times, inserts spawn edges linking parent→children and child→grandchild, then calls `list_threads_by_parent` twice with page size 1 and descending `CreatedAt`. It asserts the pages contain only the two direct children in the expected order and that pagination ends after the second page.
+**Data flow**: The test creates two children and one grandchild, stores spawn edges, lists children one page at a time, and checks the order and final anchor.
 
-**Call relations**: This async test drives `upsert_thread_spawn_edge` and `list_threads_by_parent`, validating the parent restriction injected by `push_list_threads_query` on top of normal thread filtering and pagination.
+**Call relations**: It exercises list_threads_by_parent, which is the parent-filtered wrapper around list_threads_matching.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, test_thread_metadata, unique_temp_dir); 2 external calls (from_timestamp, assert_eq!).
 
@@ -1245,11 +1251,11 @@ async fn list_threads_by_parent_filters_direct_children_with_keyset_pagination()
 async fn apply_rollout_items_restores_memory_mode_from_session_meta()
 ```
 
-**Purpose**: Confirms that applying rollout items updates the dedicated `threads.memory_mode` column from the latest session metadata. This guards against stale or missing memory-mode state after rollout reconciliation.
+**Purpose**: Verifies that applying rollout session metadata updates the thread memory mode in the database.
 
-**Data flow**: It inserts an initial thread, constructs a `ThreadMetadataBuilder` and a single `RolloutItem::SessionMeta` carrying `memory_mode: Some("polluted")`, calls `apply_rollout_items`, then reads the persisted memory mode with `get_thread_memory_mode` and asserts it equals `Some("polluted")`.
+**Data flow**: The test creates a thread, builds a rollout item with a memory_mode value, applies it, then reads memory_mode and checks the new value.
 
-**Call relations**: The test exercises the full rollout-application path, specifically the post-upsert `extract_memory_mode` and `set_thread_memory_mode` branch.
+**Call relations**: It covers apply_rollout_items, extract_memory_mode, and set_thread_memory_mode working together.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, test_thread_metadata, unique_temp_dir); 2 external calls (assert_eq!, vec!).
 
@@ -1260,11 +1266,11 @@ async fn apply_rollout_items_restores_memory_mode_from_session_meta()
 async fn apply_rollout_items_preserves_existing_git_branch_and_fills_missing_git_fields()
 ```
 
-**Purpose**: Checks that rollout application merges git metadata conservatively: existing SQLite git fields win, but missing fields can still be filled from rollout data. This prevents stale rollout content from clobbering newer persisted git info.
+**Purpose**: Checks that rollout application preserves existing Git fields while still filling missing ones from rollout metadata.
 
-**Data flow**: The test inserts a thread whose metadata already has `git_branch`, constructs rollout session metadata containing a different branch plus SHA and repository URL, applies the rollout items, then reloads the thread and asserts SHA and origin URL were filled from rollout while the existing branch remained unchanged.
+**Data flow**: The test stores a thread with an existing branch, applies rollout metadata with commit, branch, and origin URL, then confirms the old branch remains while missing commit and URL are added.
 
-**Call relations**: This test validates the interaction between `apply_rollout_items`, `prefer_existing_git_info`, and the git-preserving upsert semantics in `upsert_thread_with_creation_memory_mode`.
+**Call relations**: It validates the Git-preservation path used by apply_rollout_items before upserting metadata.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, test_thread_metadata, unique_temp_dir); 2 external calls (assert_eq!, vec!).
 
@@ -1275,11 +1281,11 @@ async fn apply_rollout_items_preserves_existing_git_branch_and_fills_missing_git
 async fn upsert_thread_preserves_existing_git_fields_atomically()
 ```
 
-**Purpose**: Verifies that a later upsert cannot overwrite non-null git fields already stored in SQLite. The guarantee is enforced atomically in SQL rather than by a fragile read-modify-write sequence.
+**Purpose**: Ensures a later upsert with different Git values does not overwrite Git fields already stored in SQLite.
 
-**Data flow**: It inserts a thread with all three git fields populated, clones the metadata with different rollout git values, calls `upsert_thread` again, then reloads the thread and asserts the original SQLite git SHA, branch, and origin URL remain intact.
+**Data flow**: The test inserts metadata with Git fields, upserts cloned metadata carrying different Git fields, then reads back the original values.
 
-**Call relations**: This test targets the `COALESCE(threads.git_*, excluded.git_*)` conflict-update expressions inside `upsert_thread_with_creation_memory_mode`, reached through the public `upsert_thread` wrapper.
+**Call relations**: It protects the COALESCE-based preservation logic in upsert_thread_with_creation_memory_mode.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 1 external calls (assert_eq!).
 
@@ -1290,11 +1296,11 @@ async fn upsert_thread_preserves_existing_git_fields_atomically()
 async fn upsert_thread_preserves_existing_preview_when_incoming_preview_is_empty()
 ```
 
-**Purpose**: Ensures that an upsert with no preview does not erase an existing non-empty preview. This protects migrated or derived previews from being blanked by sparse rollout metadata.
+**Purpose**: Checks that an empty incoming preview does not erase a useful stored preview.
 
-**Data flow**: The test inserts a thread whose `preview` is set and `first_user_message` is absent, clones the metadata with `preview = None`, calls `upsert_thread`, then reloads the thread and asserts the original preview string is still present.
+**Data flow**: The test inserts a thread with a preview, upserts metadata with no preview, then verifies the original preview remains.
 
-**Call relations**: This test validates the preview-preservation clause in the upsert conflict update, reached through `upsert_thread`.
+**Call relations**: It validates the preview preservation rule in the main upsert SQL.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 1 external calls (assert_eq!).
 
@@ -1305,11 +1311,11 @@ async fn upsert_thread_preserves_existing_preview_when_incoming_preview_is_empty
 async fn set_thread_preview_if_empty_only_fills_blank_preview()
 ```
 
-**Purpose**: Checks the exact semantics of `set_thread_preview_if_empty`: whitespace-only input is ignored, the first non-empty preview fills a blank row, and later calls do not overwrite it. It also confirms trimming behavior.
+**Purpose**: Tests that set_thread_preview_if_empty ignores blank input, fills an empty preview once, and refuses to overwrite it afterward.
 
-**Data flow**: It inserts a thread with neither preview nor first user message, calls `set_thread_preview_if_empty` with whitespace, then with padded text, then with a replacement string. The test asserts the returned booleans are false/true/false respectively and reloads the thread to confirm the stored preview is the trimmed first non-empty value.
+**Data flow**: The test inserts a thread with no preview, tries whitespace, then a real preview, then another preview, and finally checks the stored value.
 
-**Call relations**: This test directly exercises the narrow preview-fill update path and its guard conditions.
+**Call relations**: It directly exercises set_thread_preview_if_empty’s “fill only blank” behavior.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 2 external calls (assert!, assert_eq!).
 
@@ -1320,11 +1326,11 @@ async fn set_thread_preview_if_empty_only_fills_blank_preview()
 async fn update_thread_git_info_preserves_newer_non_git_metadata()
 ```
 
-**Purpose**: Verifies that updating git fields does not revert newer non-git metadata written concurrently. It demonstrates why git updates are isolated from full metadata upserts.
+**Purpose**: Checks that updating Git information does not roll back unrelated thread metadata that may have changed separately.
 
-**Data flow**: The test inserts a thread, then directly updates `updated_at`, `tokens_used`, `first_user_message`, and `preview` in SQLite to simulate a newer concurrent write. It calls `update_thread_git_info` to set all git fields, reloads the thread, and asserts the newer non-git values and timestamp remain while git fields were updated.
+**Data flow**: The test inserts a thread, manually changes non-Git fields in the database, calls update_thread_git_info, then confirms non-Git fields stayed changed and Git fields were updated.
 
-**Call relations**: This test targets the focused `update_thread_git_info` SQL path and contrasts it with the broader upsert behavior that could otherwise overwrite unrelated columns.
+**Call relations**: It validates the purpose of the focused update_thread_git_info path.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 4 external calls (from_timestamp, assert!, assert_eq!, query).
 
@@ -1335,11 +1341,11 @@ async fn update_thread_git_info_preserves_newer_non_git_metadata()
 async fn insert_thread_if_absent_preserves_existing_metadata()
 ```
 
-**Purpose**: Confirms that `insert_thread_if_absent` is truly non-destructive when the row already exists. Existing tokens, preview, first user message, and timestamp must remain untouched.
+**Purpose**: Ensures insert_thread_if_absent does not overwrite an existing row with fallback metadata.
 
-**Data flow**: It inserts an initial thread with newer metadata values, constructs an older fallback metadata object for the same id, calls `insert_thread_if_absent`, asserts the returned flag is false, then reloads the thread and checks that the original persisted values are unchanged.
+**Data flow**: The test inserts rich existing metadata, calls insert_thread_if_absent with weaker fallback metadata for the same id, then checks the existing values remain.
 
-**Call relations**: This test exercises the `ON CONFLICT DO NOTHING` insert path and verifies that it can be safely used as a fallback without clobbering current state.
+**Call relations**: It protects the ON CONFLICT DO NOTHING behavior in insert_thread_if_absent.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 3 external calls (from_timestamp, assert!, assert_eq!).
 
@@ -1350,11 +1356,11 @@ async fn insert_thread_if_absent_preserves_existing_metadata()
 async fn update_thread_git_info_can_clear_fields()
 ```
 
-**Purpose**: Checks that `update_thread_git_info` can explicitly clear git fields by passing `Some(None)` for each one. This distinguishes clearing from leaving a field unchanged.
+**Purpose**: Verifies that Git fields can be explicitly cleared, not only set.
 
-**Data flow**: The test inserts a thread with all git fields populated, calls `update_thread_git_info(thread_id, Some(None), Some(None), Some(None))`, asserts the update touched the row, then reloads the thread and verifies all three git fields are now `None`.
+**Data flow**: The test inserts a thread with Git fields, calls update_thread_git_info with clear instructions, then reads back null values.
 
-**Call relations**: This test validates the tri-state parameter semantics encoded in `update_thread_git_info`'s SQL `CASE` expressions.
+**Call relations**: It covers the nested option behavior accepted by update_thread_git_info.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 2 external calls (assert!, assert_eq!).
 
@@ -1365,11 +1371,11 @@ async fn update_thread_git_info_can_clear_fields()
 async fn touch_thread_updated_at_updates_only_updated_at()
 ```
 
-**Purpose**: Ensures that touching a thread's timestamp changes only `updated_at` and leaves title, first user message, and preview intact. It also confirms preview fallback remains readable after the touch.
+**Purpose**: Checks that touching a thread changes its update time without altering title or message fields.
 
-**Data flow**: It inserts a thread with known title and first user message, calls `touch_thread_updated_at` with a later timestamp, asserts the returned boolean is true, then reloads the thread and checks that only `updated_at` changed while other metadata stayed the same.
+**Data flow**: The test inserts a thread, calls touch_thread_updated_at, then verifies the timestamp changed while other metadata stayed the same.
 
-**Call relations**: This test directly exercises the narrow timestamp-update path and its use of `allocate_thread_updated_at` without invoking a full metadata upsert.
+**Call relations**: It validates touch_thread_updated_at as a narrow update path and indirectly covers timestamp allocation.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 3 external calls (from_timestamp, assert!, assert_eq!).
 
@@ -1380,11 +1386,11 @@ async fn touch_thread_updated_at_updates_only_updated_at()
 async fn thread_updated_at_uses_unique_epoch_millis_and_reads_legacy_seconds()
 ```
 
-**Purpose**: Pins the timestamp allocation and decoding rules for thread ordering. It verifies unique millisecond allocation for same-time writes, preservation of sufficiently older timestamps, and compatibility with legacy rows that only have second-level `updated_at`.
+**Purpose**: Tests millisecond timestamp allocation and backward compatibility with older second-only timestamp rows.
 
-**Data flow**: The test inserts two threads with identical millisecond timestamps and asserts the second persisted row was bumped by one millisecond, then inspects raw SQLite timestamp columns. It inserts a third thread with an older timestamp and confirms it was preserved unchanged. Finally it manually writes a legacy second-level `updated_at` into SQLite for one thread, reloads it through `get_thread`, and asserts it is interpreted as whole-second milliseconds.
+**Data flow**: The test inserts two threads with the same millisecond time and expects the second to be bumped, inserts an older time unchanged, then manually writes a legacy seconds value and checks it reads as milliseconds.
 
-**Call relations**: This test exercises `allocate_thread_updated_at`, the insert/upsert paths that call it, and the row-decoding logic used by `get_thread` for legacy timestamp compatibility.
+**Call relations**: It covers allocate_thread_updated_at and the row conversion behavior used by get_thread.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 4 external calls (from_timestamp_millis, assert_eq!, query, query_as).
 
@@ -1395,11 +1401,11 @@ async fn thread_updated_at_uses_unique_epoch_millis_and_reads_legacy_seconds()
 async fn apply_rollout_items_uses_override_updated_at_when_provided()
 ```
 
-**Purpose**: Checks that rollout application honors an explicit `updated_at_override` instead of using the rollout file's modified time. This lets callers control ordering when replaying or repairing rollout data.
+**Purpose**: Verifies that apply_rollout_items respects an explicit updated_at override instead of using the rollout file modification time.
 
-**Data flow**: It inserts an initial thread, builds a rollout item carrying token usage, chooses an override timestamp, calls `apply_rollout_items` with that override, then reloads the thread and asserts both `tokens_used` and `updated_at` reflect the rollout content and supplied override.
+**Data flow**: The test applies a token-count rollout item with a supplied timestamp, then checks both token count and stored updated_at.
 
-**Call relations**: This test targets the `updated_at_override` branch inside `apply_rollout_items`, ensuring it wins over file mtime lookup.
+**Call relations**: It exercises the override branch inside apply_rollout_items.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, test_thread_metadata, unique_temp_dir); 3 external calls (from_timestamp, assert_eq!, vec!).
 
@@ -1410,11 +1416,11 @@ async fn apply_rollout_items_uses_override_updated_at_when_provided()
 async fn thread_spawn_edges_track_directional_status()
 ```
 
-**Purpose**: Verifies that spawn-edge status is persisted and respected by both direct-child and recursive descendant queries. It also checks that closing a parent edge prunes that branch from status-filtered descendant traversal while unfiltered traversal still sees all descendants.
+**Purpose**: Tests parent-child spawn edges, status changes, and descendant listing. It confirms status filters affect traversal as intended.
 
-**Data flow**: The test inserts parent→child and child→grandchild edges with `Open` status, queries open children and descendants, updates the child edge to `Closed`, then queries open and closed children/descendants plus unfiltered descendants. It asserts each returned `Vec<ThreadId>` matches the expected graph under the current statuses.
+**Data flow**: The test creates parent, child, and grandchild edges, lists open children and descendants, closes one edge, then checks open, closed, and all-descendant results.
 
-**Call relations**: This test exercises `upsert_thread_spawn_edge`, `set_thread_spawn_edge_status`, and all four public child/descendant listing methods to validate the status-filtered recursive SQL.
+**Call relations**: It covers upsert_thread_spawn_edge, set_thread_spawn_edge_status, and the child/descendant listing methods.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 1 external calls (assert_eq!).
 
@@ -1425,11 +1431,11 @@ async fn thread_spawn_edges_track_directional_status()
 async fn thread_spawn_children_without_status_filter_lists_all_statuses()
 ```
 
-**Purpose**: Confirms that unfiltered child listing returns every direct child regardless of status string, including unknown future statuses not represented by the current enum. This preserves forward compatibility for readers.
+**Purpose**: Ensures the unfiltered child listing includes edges with any status, even a future status string not known to current code.
 
-**Data flow**: It inserts open and closed child edges through `upsert_thread_spawn_edge`, inserts a third edge directly in SQL with status `future`, calls `list_thread_spawn_children`, and asserts the returned ids include all three children in sorted order.
+**Data flow**: The test inserts open, closed, and manually inserted future-status child edges, lists children without a status filter, and expects all three ids.
 
-**Call relations**: This test specifically validates the `None` status branch in `list_thread_spawn_children_matching`, showing that it does not constrain status values and therefore remains tolerant of newer statuses.
+**Call relations**: It protects list_thread_spawn_children and list_thread_spawn_children_matching from accidentally filtering unknown statuses.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 2 external calls (assert_eq!, query).
 
@@ -1439,13 +1445,15 @@ These files build higher-level per-thread state on top of the thread runtime, co
 
 ### `state/src/model/thread_goal.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `database read and model conversion`
 
-This module models goal-tracking state attached to a thread. `ThreadGoalStatus` is the central enum, covering active and paused execution states plus blocking and terminal budget/completion outcomes. It derives `Serialize` with `snake_case` names, and also exposes explicit string helpers and predicates so callers can consistently persist, display, and reason about status transitions.
+A thread goal is a piece of work attached to a conversation thread: it has an objective, a current state such as active or complete, optional token budget limits, usage counts, and creation/update times. This file is the shared vocabulary for that idea.
 
-`ThreadGoal` is the typed domain struct used by the rest of the runtime. It stores a parsed `ThreadId`, goal identifier, objective text, status, optional token budget, usage counters, and UTC creation/update timestamps. `ThreadGoalRow` is the raw storage-facing counterpart with string IDs/statuses and integer millisecond timestamps.
+It has three main parts. `ThreadGoalStatus` lists the allowed states for a goal. That matters because storing free-form text like “done” or “finished” would make the rest of the system guess what the goal means. Here, only known statuses are accepted, and unknown database text becomes an error instead of silently producing bad state.
 
-The conversion path is split in two. `ThreadGoalRow::try_from_row` extracts named columns from a `SqliteRow` without interpretation beyond SQLx type conversion. `TryFrom<ThreadGoalRow> for ThreadGoal` then performs semantic decoding: it parses the thread ID via `ThreadId::try_from`, converts the status string via `ThreadGoalStatus::try_from`, and turns millisecond timestamps into `DateTime<Utc>` using the shared `epoch_millis_to_datetime` helper from the parent model module. This separation keeps SQL row extraction simple while concentrating validation and normalization in one place. The status predicates (`is_active`, `is_terminal`) encode business meaning directly on the enum for downstream scheduling and accounting logic.
+`ThreadGoal` is the clean in-memory model. It uses proper types, such as `ThreadId` for the thread identity and real UTC date-time values for timestamps. This is the version other code should want to work with.
+
+`ThreadGoalRow` is the rougher database-facing version. SQLite rows arrive as strings, numbers, and millisecond timestamps. The conversion code reads those fields out of a database row, then turns them into the stronger `ThreadGoal` form. An everyday analogy is unpacking a shipping box: the database row is the box with labels, and `ThreadGoal` is the item assembled and checked before use.
 
 #### Function details
 
@@ -1455,11 +1463,11 @@ The conversion path is split in two. `ThreadGoalRow::try_from_row` extracts name
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical lowercase string form of a thread-goal status. It provides the stable persisted/display representation for each enum variant.
+**Purpose**: This turns a goal status into the exact text form used for storage or output, such as `active` or `budget_limited`. It gives the rest of the program one consistent spelling for each status.
 
-**Data flow**: It takes `self`, matches on the variant, and returns a `&'static str` such as `"usage_limited"` or `"complete"`.
+**Data flow**: It starts with one `ThreadGoalStatus` value. It matches that value to its fixed lowercase text name. It returns that text slice and does not change anything else.
 
-**Call relations**: This helper is used by code that writes or compares thread-goal statuses in textual form.
+**Call relations**: This is the outward conversion partner to `ThreadGoalStatus::try_from`: one function turns the enum into stored text, while the other turns stored text back into the enum. It is useful anywhere code needs to write or display the status in the same wording the database expects.
 
 
 ##### `ThreadGoalStatus::is_active`  (lines 35–37)
@@ -1468,11 +1476,11 @@ fn as_str(self) -> &'static str
 fn is_active(self) -> bool
 ```
 
-**Purpose**: Checks whether the goal is currently in the active state. It is a narrow predicate rather than a broader non-terminal test.
+**Purpose**: This answers the simple question, “Is this goal currently active?” It lets callers avoid repeating the exact comparison everywhere.
 
-**Data flow**: It compares `self` to `Self::Active` and returns a `bool` with no side effects.
+**Data flow**: It receives a status value. It compares it with `Active`. It returns `true` only for `Active`, otherwise `false`, and changes no stored data.
 
-**Call relations**: Higher-level goal logic uses this predicate when deciding whether a thread goal should continue consuming work or resources.
+**Call relations**: This is a small convenience check used by higher-level code when deciding whether a goal should keep running or be treated as not currently active. It does not call other project code; it only reads the status value it was given.
 
 
 ##### `ThreadGoalStatus::is_terminal`  (lines 39–41)
@@ -1481,11 +1489,11 @@ fn is_active(self) -> bool
 fn is_terminal(self) -> bool
 ```
 
-**Purpose**: Checks whether the goal has reached a terminal state that should stop further progression. In this model, `BudgetLimited` and `Complete` are terminal.
+**Purpose**: This answers whether a goal is in a final state, meaning the system should not expect normal progress to continue. In this file, `BudgetLimited` and `Complete` are treated as terminal states.
 
-**Data flow**: It evaluates a `matches!` expression over `self` and returns `true` only for the terminal variants.
+**Data flow**: It receives a status value. It checks whether the value is one of the final statuses. It returns a boolean result and does not modify anything.
 
-**Call relations**: Goal orchestration and accounting code can use this helper to gate updates or completion handling.
+**Call relations**: This gives higher-level goal logic a single place to ask whether a goal is effectively finished. Internally it uses Rust’s `matches!` pattern check, which is just a compact way to ask “is this one of these listed cases?”
 
 *Call graph*: 1 external calls (matches!).
 
@@ -1496,11 +1504,11 @@ fn is_terminal(self) -> bool
 fn try_from(value: &str) -> Result<Self>
 ```
 
-**Purpose**: Parses a stored status string into a `ThreadGoalStatus`. It fails fast on unknown values instead of defaulting.
+**Purpose**: This converts status text from outside the typed model, especially database text, into a safe `ThreadGoalStatus` value. It rejects unknown status names so bad data does not quietly spread through the program.
 
-**Data flow**: It accepts a `&str`, matches it against the six supported literals, returns the corresponding enum variant, or constructs an `anyhow!` error containing the unexpected string.
+**Data flow**: It receives a string such as `active` or `complete`. It compares the string with the allowed stored names. If the string is known, it returns the matching status; if not, it returns an error explaining the unknown status.
 
-**Call relations**: The `ThreadGoal` conversion path calls this while turning a `ThreadGoalRow` into a typed domain object.
+**Call relations**: This is used by `ThreadGoal::try_from` when a raw database row is being turned into a proper `ThreadGoal`. If the database contains an unexpected status, this function stops the conversion and hands back an error, created with `anyhow!`.
 
 *Call graph*: 1 external calls (anyhow!).
 
@@ -1511,11 +1519,11 @@ fn try_from(value: &str) -> Result<Self>
 fn try_from_row(row: &SqliteRow) -> Result<Self>
 ```
 
-**Purpose**: Extracts the raw thread-goal columns from a SQLite row into a `ThreadGoalRow`. It is the storage-facing first stage of row decoding.
+**Purpose**: This reads the thread-goal columns out of a SQLite result row and puts them into a simple intermediate struct. It is the first step in turning database data into application data.
 
-**Data flow**: It borrows a `SqliteRow`, reads each named column with `try_get`, and returns a `ThreadGoalRow` containing strings, integers, and optional integers exactly as stored.
+**Data flow**: It receives a SQLite row. It asks the row for each named column: thread id, goal id, objective, status, budget, usage counts, and timestamp numbers. If all fields can be read, it returns a `ThreadGoalRow`; if any field is missing or has the wrong type, it returns an error.
 
-**Call relations**: Callers such as `thread_goal_from_row` invoke this immediately after a SQL query. Semantic validation is deferred to `ThreadGoal::try_from`.
+**Call relations**: The call graph shows this being called by `thread_goal_from_row`, which is likely the surrounding helper that converts query results. This function only unpacks the database row; the stronger type checks and timestamp conversion happen afterward, especially in `ThreadGoal::try_from`.
 
 *Call graph*: called by 1 (thread_goal_from_row); 1 external calls (try_get).
 
@@ -1526,24 +1534,24 @@ fn try_from_row(row: &SqliteRow) -> Result<Self>
 fn try_from(row: ThreadGoalRow) -> Result<Self>
 ```
 
-**Purpose**: Converts a raw `ThreadGoalRow` into a validated `ThreadGoal`. It parses the thread ID and status and converts millisecond timestamps into UTC datetimes.
+**Purpose**: This turns the database-shaped `ThreadGoalRow` into the real `ThreadGoal` model used by the rest of the application. It validates and upgrades raw stored values into safer types.
 
-**Data flow**: It consumes a `ThreadGoalRow`, passes `row.thread_id` into `ThreadId::try_from`, parses `row.status` with `ThreadGoalStatus::try_from`, copies scalar counters and optional budget directly, converts `created_at_ms` and `updated_at_ms` via `epoch_millis_to_datetime`, and returns the assembled `ThreadGoal` or an error.
+**Data flow**: It receives a `ThreadGoalRow` containing mostly plain strings, numbers, and millisecond timestamps. It converts the thread id string into a `ThreadId`, converts the status string into `ThreadGoalStatus`, keeps the budget and usage numbers, and changes millisecond timestamps into UTC date-time values. If any conversion fails, it returns an error; otherwise it returns a complete `ThreadGoal`.
 
-**Call relations**: This is the second stage after `ThreadGoalRow::try_from_row`, providing the typed object used by the rest of the goal subsystem.
+**Call relations**: This function is the second half of database loading: after `ThreadGoalRow::try_from_row` has pulled values out of SQLite, this builds the application-ready object. It hands off status parsing to `ThreadGoalStatus::try_from`, thread id parsing to `ThreadId::try_from`, and timestamp parsing to `epoch_millis_to_datetime`.
 
 *Call graph*: calls 1 internal fn (try_from); 2 external calls (try_from, epoch_millis_to_datetime).
 
 
 ### `state/src/runtime/goals.rs`
 
-`domain_logic` · `thread lifecycle, goal editing, and per-turn usage accounting`
+`domain_logic` · `thread goal changes and usage accounting during runtime`
 
-This file defines `GoalStore`, the update payload type `GoalUpdate`, and two enums that describe accounting results and accounting modes. `GoalStore` wraps an `Arc<SqlitePool>` and provides CRUD plus accounting operations for `crate::ThreadGoal` rows keyed by `thread_id`. New or replaced goals get a fresh UUID `goal_id`, which acts as a version token; callers can pass `expected_goal_id` to reject stale updates after a replacement.
+A thread goal is like a job ticket pinned to a conversation: it says what the thread is trying to accomplish, whether it is active, paused, complete, or stopped by limits, and how much time and token usage has been spent on it. This file is the database-backed store for those tickets. Without it, the system could lose track of a thread’s current objective, accidentally overwrite a newer goal with an older update, or keep running after a token budget has been reached.
 
-The core logic lives in `update_thread_goal` and `account_thread_goal_usage`. `update_thread_goal` has four SQL branches depending on whether status and/or token budget are being changed. Those branches preserve independent fields with `COALESCE`, update `updated_at_ms`, and enforce an important invariant: if a goal is already `BudgetLimited`, attempts to set it to `Paused` or `Blocked` keep the terminal budget-limited status instead. Likewise, activating a goal that is already over budget immediately resolves back to `BudgetLimited`. `account_thread_goal_usage` increments `time_used_seconds` and `tokens_used` atomically with a `QueryBuilder` update, choosing which statuses are eligible based on `GoalAccountingMode`; it can account only active goals, active plus budget-limited, active plus complete, or active plus stopped states.
+The main type, `GoalStore`, wraps a shared SQLite connection pool. It can read the current goal, replace it with a fresh one, insert one only when allowed, update selected fields, delete it, and add usage totals. The code is careful about status rules. For example, an active goal with a token budget of zero becomes budget-limited immediately. If a goal is already over budget, trying to mark it active again does not revive it. Updates can also include an expected goal id, which acts like checking the ticket number before writing on it; stale updates are ignored if the goal has already been replaced.
 
-Helper functions convert rows (`thread_goal_from_row`) and compute immediate budget-limited status on insertion/replacement (`status_after_budget_limit`). The extensive tests cover replacement semantics, stale-version rejection, concurrent partial updates, budget crossings, stopped/completed final accounting, and deletion via thread cascade.
+The tests cover these edge cases, especially budget limits, concurrent updates, final usage accounting, and cleanup when a thread is deleted.
 
 #### Function details
 
@@ -1553,11 +1561,11 @@ Helper functions convert rows (`thread_goal_from_row`) and compute immediate bud
 fn new(pool: Arc<SqlitePool>) -> Self
 ```
 
-**Purpose**: Constructs a `GoalStore` wrapper around the shared SQLite pool. It is a lightweight initializer with no side effects beyond storing the pool handle.
+**Purpose**: Creates a `GoalStore` from an existing SQLite connection pool. This gives the rest of the runtime a focused object for working with thread goals instead of passing database access around directly.
 
-**Data flow**: Consumes `Arc<SqlitePool>` and returns `GoalStore { pool }`.
+**Data flow**: It receives a shared database pool, stores it inside a new `GoalStore`, and returns that store. Nothing is written to the database at this point.
 
-**Call relations**: Called during runtime initialization to wire goal persistence into the larger `StateRuntime`.
+**Call relations**: Runtime startup calls this while building the state runtime, through `init_inner`, so later code can ask for goal operations through one dedicated store.
 
 *Call graph*: called by 1 (init_inner).
 
@@ -1568,11 +1576,11 @@ fn new(pool: Arc<SqlitePool>) -> Self
 async fn close(&self)
 ```
 
-**Purpose**: Closes the underlying SQLite pool used by the goal store. This is part of runtime shutdown cleanup.
+**Purpose**: Closes the database pool used by this goal store. This is part of shutting down cleanly so open database work is not left hanging.
 
-**Data flow**: Reads `self.pool` and awaits `close()` on it; it returns no value.
+**Data flow**: It reads the stored pool and asks it to close asynchronously. It returns when the pool has finished closing.
 
-**Call relations**: Invoked by the enclosing runtime close path when tearing down database resources.
+**Call relations**: The broader runtime close path calls this during teardown, so goal database access shuts down with the rest of the state system.
 
 *Call graph*: called by 1 (close).
 
@@ -1586,11 +1594,11 @@ async fn get_thread_goal(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Fetches the current goal row for one thread and converts it into `crate::ThreadGoal`. Missing rows return `None`.
+**Purpose**: Looks up the current goal for one thread. Callers use this when they need to know what objective and status are currently stored.
 
-**Data flow**: Takes `thread_id`, stringifies it, selects all goal columns from `thread_goals`, fetches an optional row, and maps it through `thread_goal_from_row`. Returns `Option<ThreadGoal>` in `anyhow::Result`.
+**Data flow**: It receives a thread id, turns it into the database form, queries the `thread_goals` table, and returns either no goal or a `ThreadGoal` built from the row.
 
-**Call relations**: This is the common read helper used after updates and by accounting paths when no mutation occurs, so callers always see the canonical persisted row.
+**Call relations**: Update and accounting flows call this when they need to return the latest goal after a change, or when no change happened and the caller still needs the current stored value.
 
 *Call graph*: called by 3 (account_thread_goal_usage, update_active_thread_goal_status, update_thread_goal); 2 external calls (to_string, query).
 
@@ -1607,11 +1615,11 @@ async fn replace_thread_goal(
     ) -> anyhow::Result<c
 ```
 
-**Purpose**: Creates a fresh goal version for a thread, replacing any existing row unconditionally and resetting usage counters. It immediately applies budget-limit logic if the requested active goal is already over budget.
+**Purpose**: Creates a brand-new goal for a thread, replacing any existing one. This is used when the thread’s objective is intentionally reset.
 
-**Data flow**: Consumes `thread_id`, `objective`, desired `status`, and optional `token_budget`; generates a new UUID `goal_id`, computes `now_ms`, normalizes status through `status_after_budget_limit`, then performs an `INSERT ... ON CONFLICT(thread_id) DO UPDATE` that overwrites goal identity and resets `tokens_used` and `time_used_seconds` to zero. It fetches the returned row and converts it with `thread_goal_from_row`.
+**Data flow**: It receives the thread id, objective text, starting status, and optional token budget. It creates a new unique goal id and timestamps, applies the immediate budget rule, writes a fresh row with usage reset to zero, and returns the stored goal.
 
-**Call relations**: Used when callers want a brand-new goal version regardless of prior state. It delegates budget normalization to `status_after_budget_limit` and row decoding to `thread_goal_from_row`.
+**Call relations**: This is a top-level goal operation used by callers that want a clean replacement. It relies on `status_after_budget_limit` before writing and `thread_goal_from_row` after the database returns the saved row.
 
 *Call graph*: calls 2 internal fn (status_after_budget_limit, thread_goal_from_row); 5 external calls (now, new_v4, as_str, to_string, query).
 
@@ -1628,11 +1636,11 @@ async fn insert_thread_goal(
     ) -> anyhow::Result<Op
 ```
 
-**Purpose**: Attempts to create a new goal version only when there is no existing goal or the existing goal is already complete. Active/incomplete goals are left untouched.
+**Purpose**: Adds a goal when there is no active replacement to protect, while allowing replacement of a completed goal. This is a safer form of creation for callers that should not overwrite an unfinished goal.
 
-**Data flow**: Reads the same inputs as `replace_thread_goal`, generates a new UUID and timestamp, normalizes status with `status_after_budget_limit`, and executes an `INSERT ... ON CONFLICT(thread_id) DO UPDATE ... WHERE thread_goals.status = 'complete' RETURNING ...`. It returns `Some(goal)` if insertion/replacement happened, otherwise `None`.
+**Data flow**: It receives the thread id, objective, status, and optional budget. It creates ids and timestamps, applies the immediate budget rule, then inserts the goal or replaces only if the existing goal is complete. It returns the new goal if a write happened, or `None` if an unfinished goal was left alone.
 
-**Call relations**: This is the conservative creation path for callers that must not clobber an active goal. It shares the same normalization logic as `replace_thread_goal`.
+**Call relations**: This is used as a guarded creation path. It shares the same budget-limit decision helper as full replacement, but its database condition prevents accidental overwrites of work still in progress.
 
 *Call graph*: calls 1 internal fn (status_after_budget_limit); 5 external calls (now, new_v4, as_str, to_string, query).
 
@@ -1647,11 +1655,11 @@ async fn update_thread_goal(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Applies partial updates to objective, status, and/or token budget while preserving untouched fields and optionally enforcing optimistic concurrency via `expected_goal_id`. It also preserves budget-limited terminal semantics when appropriate.
+**Purpose**: Changes selected parts of an existing goal, such as its objective, status, or token budget. It is careful not to overwrite fields the caller did not ask to change.
 
-**Data flow**: Consumes `thread_id` and `GoalUpdate`, derives borrowed optional values, computes `now_ms`, then chooses one of four SQL update shapes based on whether `status` and `token_budget` are present. The SQL uses `COALESCE` for objective, conditional `CASE` expressions for status transitions, and `goal_id` matching when `expected_goal_id` is supplied. If no fields are provided, it either returns the current goal or `None` on version mismatch. After a successful update it reloads the row with `get_thread_goal`.
+**Data flow**: It receives a thread id and a `GoalUpdate`, whose fields may be present or absent. It writes only the requested changes, checks an optional expected goal id, updates the timestamp, applies budget-limit rules when needed, and returns the refreshed goal or `None` if no matching goal was updated.
 
-**Call relations**: This is the main mutation API for existing goals. It calls `GoalStore::get_thread_goal` both for the no-op/objective-absent branch and after successful updates so callers receive the fully decoded current row.
+**Call relations**: This is the main edit path for goals. It calls `get_thread_goal` when it needs to return the current goal without changing it, and again after successful writes so callers receive the database’s final version.
 
 *Call graph*: calls 1 internal fn (get_thread_goal); 3 external calls (now, to_string, query).
 
@@ -1665,11 +1673,11 @@ async fn pause_active_thread_goal(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Convenience wrapper that pauses an active goal if and only if it is currently in a pausable state. It does not override terminal statuses.
+**Purpose**: Pauses a goal, but only if it is currently active. This avoids accidentally changing completed or otherwise terminal goals.
 
-**Data flow**: Takes `thread_id` and forwards it with `ThreadGoalStatus::Paused` to `update_active_thread_goal_status`, returning that method’s optional updated goal.
+**Data flow**: It receives a thread id and asks the shared status-update helper to set that active goal to paused. It returns the updated goal if one was changed, otherwise `None`.
 
-**Call relations**: This is a narrow helper over `GoalStore::update_active_thread_goal_status`, used when callers want the standard pause transition without constructing a full `GoalUpdate`.
+**Call relations**: This is a small public convenience method. It hands the real work to `update_active_thread_goal_status`, which enforces the rule that only suitable current statuses may be changed.
 
 *Call graph*: calls 1 internal fn (update_active_thread_goal_status).
 
@@ -1683,11 +1691,11 @@ async fn usage_limit_active_thread_goal(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Convenience wrapper that marks an active or budget-limited goal as `UsageLimited`. It is intended for external usage-limit enforcement.
+**Purpose**: Marks a currently running goal as stopped by an outside usage limit. It can also convert a budget-limited goal into usage-limited so the more specific stop reason is visible.
 
-**Data flow**: Consumes `thread_id` and delegates to `update_active_thread_goal_status` with `ThreadGoalStatus::UsageLimited`, returning the optional updated goal.
+**Data flow**: It receives a thread id and asks the shared status-update helper to write the usage-limited status. It returns the changed goal or `None` if there was no eligible goal.
 
-**Call relations**: Like `pause_active_thread_goal`, this is a specialized front door into `GoalStore::update_active_thread_goal_status`.
+**Call relations**: This mirrors the pause helper but requests the usage-limited status. It delegates to `update_active_thread_goal_status` for the database update and follow-up read.
 
 *Call graph*: calls 1 internal fn (update_active_thread_goal_status).
 
@@ -1702,11 +1710,11 @@ async fn update_active_thread_goal_status(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Performs a constrained status transition for active goals, and for `UsageLimited` also allows promotion from `BudgetLimited`. It refuses to touch completed or otherwise terminal rows.
+**Purpose**: Updates a goal’s status only when the current status is safe to change. This protects completed, paused, blocked, or otherwise non-active goals from being clobbered by late events.
 
-**Data flow**: Reads `thread_id` and target `status`, computes `now_ms`, and updates `thread_goals` where `thread_id` matches and either current status is `active` or the requested status is `usage_limited` and current status is `budget_limited`. On success it reloads the row with `get_thread_goal`; otherwise it returns `None`.
+**Data flow**: It receives a thread id and target status. It updates the row only if the stored goal is active, with one special case that allows usage-limited to replace budget-limited, then returns the fresh goal if a row changed.
 
-**Call relations**: This is the shared implementation behind `pause_active_thread_goal` and `usage_limit_active_thread_goal`, centralizing the allowed-state checks.
+**Call relations**: `pause_active_thread_goal` and `usage_limit_active_thread_goal` both use this helper. After a successful write, it calls `get_thread_goal` so the caller gets the complete updated goal.
 
 *Call graph*: calls 1 internal fn (get_thread_goal); called by 2 (pause_active_thread_goal, usage_limit_active_thread_goal); 4 external calls (now, as_str, to_string, query).
 
@@ -1720,11 +1728,11 @@ async fn delete_thread_goal(
     ) -> anyhow::Result<Option<crate::ThreadGoal>>
 ```
 
-**Purpose**: Deletes the goal row for a thread and returns the deleted goal if one existed. It uses SQLite `RETURNING` to avoid a separate pre-read.
+**Purpose**: Deletes the goal for a thread and returns what was deleted. This is useful for explicit cleanup or for confirming what goal was removed.
 
-**Data flow**: Consumes `thread_id`, stringifies it, executes `DELETE FROM thread_goals WHERE thread_id = ? RETURNING ...`, fetches an optional row, and converts it through `thread_goal_from_row`. Returns `Option<ThreadGoal>`.
+**Data flow**: It receives a thread id, deletes the matching row from `thread_goals`, and returns the deleted goal if one existed. If no goal was present, it returns `None`.
 
-**Call relations**: Used when callers explicitly remove a goal. Tests also verify that deleting the parent thread cascades away the goal row.
+**Call relations**: This is a direct database operation exposed by the store. It does not call other store methods; it lets the database return the removed row in one step.
 
 *Call graph*: 2 external calls (to_string, query).
 
@@ -1741,11 +1749,11 @@ async fn account_thread_goal_usage(
         expected_goal_id: O
 ```
 
-**Purpose**: Atomically adds token/time usage to a goal under mode-specific status rules and may transition the goal to `BudgetLimited` when the budget is crossed. It returns whether the row changed or remained unchanged.
+**Purpose**: Adds time and token usage to a goal and may stop it when its token budget is reached. This is how the system keeps the goal’s running cost totals accurate.
 
-**Data flow**: Consumes `thread_id`, `time_delta_seconds`, `token_delta`, `GoalAccountingMode`, and optional `expected_goal_id`; clamps negative deltas to zero and short-circuits to `Unchanged(current_goal)` when both are zero. Otherwise it computes `now_ms`, derives SQL status filters from the accounting mode, builds an `UPDATE ... RETURNING` query with `QueryBuilder` that increments counters and conditionally sets `status = BudgetLimited`, optionally constrains by `goal_id`, and fetches an optional row. It returns `GoalAccountingOutcome::Updated(decoded_goal)` on success or `Unchanged(current_goal)` if no row matched.
+**Data flow**: It receives a thread id, time increase, token increase, an accounting mode, and an optional expected goal id. Negative increases are treated as zero; if nothing is added, it just returns the current goal. Otherwise it updates counters atomically in the database, applies the budget-limited status when appropriate, and returns either `Updated` with the new goal or `Unchanged` with the current goal.
 
-**Call relations**: This is the central accounting path for per-turn resource usage. It calls `GoalStore::get_thread_goal` when no mutation occurs and `thread_goal_from_row` when the SQL update returns a changed row.
+**Call relations**: Usage tracking calls this after work has happened or is being finalized. It calls `get_thread_goal` when no row is updated, and uses `thread_goal_from_row` when the database returns the updated row.
 
 *Call graph*: calls 2 internal fn (get_thread_goal, thread_goal_from_row); 5 external calls (new, now, to_string, Unchanged, Updated).
 
@@ -1756,11 +1764,11 @@ async fn account_thread_goal_usage(
 fn thread_goal_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::ThreadGoal>
 ```
 
-**Purpose**: Converts a raw SQLite row into the domain `crate::ThreadGoal` through the intermediate `ThreadGoalRow` model. It centralizes row decoding for all goal queries.
+**Purpose**: Turns a raw SQLite row into the project’s `ThreadGoal` type. This keeps database column decoding in one small place.
 
-**Data flow**: Takes `&sqlx::sqlite::SqliteRow`, calls `ThreadGoalRow::try_from_row`, then `crate::ThreadGoal::try_from`, returning the decoded goal or an error.
+**Data flow**: It receives a database row, first converts it into the internal row-shaped model, then converts that into the public `ThreadGoal`. If any field is invalid, it returns an error instead of a bad goal.
 
-**Call relations**: Used by read, replace, delete, and accounting paths so all row-to-domain conversion follows one implementation.
+**Call relations**: Goal-writing and accounting paths use this after SQLite returns a row, especially `replace_thread_goal` and `account_thread_goal_usage`, so the rest of the code deals with normal Rust goal objects instead of raw database rows.
 
 *Call graph*: calls 1 internal fn (try_from_row); called by 2 (account_thread_goal_usage, replace_thread_goal).
 
@@ -1775,11 +1783,11 @@ fn status_after_budget_limit(
 ) -> crate::ThreadGoalStatus
 ```
 
-**Purpose**: Normalizes a requested status so an active goal that is already at or above its token budget becomes `BudgetLimited` immediately. Other statuses pass through unchanged.
+**Purpose**: Applies the simple rule that an active goal already at or above its token budget should be budget-limited. This prevents a newly created active goal from starting in an impossible state.
 
-**Data flow**: Consumes a desired `ThreadGoalStatus`, `tokens_used`, and optional `token_budget`; if status is `Active` and `tokens_used >= budget`, returns `BudgetLimited`, else returns the original status.
+**Data flow**: It receives a proposed status, current token count, and optional budget. If the status is active and the token count meets or exceeds the budget, it returns budget-limited; otherwise it returns the original status.
 
-**Call relations**: Called during insertion and replacement to enforce budget semantics before the row is first written.
+**Call relations**: `replace_thread_goal` and `insert_thread_goal` call this before saving a goal, so budget rules are enforced from the moment the goal is created.
 
 *Call graph*: called by 2 (insert_thread_goal, replace_thread_goal).
 
@@ -1790,11 +1798,11 @@ fn status_after_budget_limit(
 async fn test_runtime() -> std::sync::Arc<StateRuntime>
 ```
 
-**Purpose**: Creates a fresh `StateRuntime` backed by a unique temporary directory for goal-store tests. It hides repetitive initialization boilerplate.
+**Purpose**: Builds a temporary state runtime for tests. It gives each test a fresh database-like environment to work in.
 
-**Data flow**: Calls `StateRuntime::init` with a unique temp dir and fixed provider string, returning an `Arc<StateRuntime>`.
+**Data flow**: It creates a unique temporary directory, initializes the state runtime with a test provider name, and returns the ready runtime wrapped for shared use.
 
-**Call relations**: Most tests call this helper first to obtain an isolated runtime.
+**Call relations**: Most tests call this first so they can exercise the real goal store behavior without touching a normal user database.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir).
 
@@ -1805,11 +1813,11 @@ async fn test_runtime() -> std::sync::Arc<StateRuntime>
 fn test_thread_id() -> ThreadId
 ```
 
-**Purpose**: Returns a stable, known-valid `ThreadId` used across tests. This keeps assertions deterministic.
+**Purpose**: Provides a stable, known thread id for tests. This makes expected values easier to compare.
 
-**Data flow**: Parses a fixed UUID string into `ThreadId` and returns it.
+**Data flow**: It parses a fixed UUID string into a `ThreadId` and returns it. If the fixed value were invalid, the test would fail immediately.
 
-**Call relations**: Used by many tests as the canonical thread identifier under test.
+**Call relations**: The test cases call this before inserting thread metadata and goals, so every test has a predictable thread identifier.
 
 *Call graph*: calls 1 internal fn (from_string).
 
@@ -1820,11 +1828,11 @@ fn test_thread_id() -> ThreadId
 async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId)
 ```
 
-**Purpose**: Seeds the state database with thread metadata required before goal operations can be exercised. It ensures the thread row exists for foreign-key and integration behavior.
+**Purpose**: Creates or updates the thread record that a goal belongs to. Goals depend on having a thread, so tests use this setup step before goal operations.
 
-**Data flow**: Builds metadata with `test_thread_metadata` using the runtime’s `codex_home`, then calls `runtime.upsert_thread(&metadata)` and panics on failure.
+**Data flow**: It receives a runtime and thread id, builds test thread metadata using the runtime’s home directory and a workspace path, then saves that metadata through the runtime.
 
-**Call relations**: Most tests call this before interacting with `runtime.thread_goals()` so goal rows are associated with a real thread.
+**Call relations**: The tests call this after creating the runtime and thread id. It prepares the database so goal insert, update, and delete behavior can be tested realistically.
 
 *Call graph*: calls 2 internal fn (codex_home, test_thread_metadata); 1 external calls (upsert_thread).
 
@@ -1835,11 +1843,11 @@ async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId)
 async fn replace_update_and_get_thread_goal()
 ```
 
-**Purpose**: Covers the basic lifecycle of replacing, reading, updating, replacing again, and deleting a thread goal. It also checks that unrelated thread metadata remains readable.
+**Purpose**: Checks the basic lifecycle: create a goal, read it, update it, replace it, delete it, and confirm it is gone.
 
-**Data flow**: Creates a runtime and thread, seeds metadata, performs `replace_thread_goal`, `get_thread_goal`, `update_thread_goal`, another replacement, and repeated deletions, asserting the returned `ThreadGoal` values and final absence.
+**Data flow**: It sets up a test runtime and thread, writes a goal, verifies the read result, updates status and budget, replaces the goal with a fresh one, then deletes it and checks later reads return nothing.
 
-**Call relations**: This is the broad smoke test for the main CRUD APIs on `GoalStore`.
+**Call relations**: The test runner invokes this test. It uses the shared setup helpers to create the environment before exercising the public `GoalStore` methods.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1850,11 +1858,11 @@ async fn replace_update_and_get_thread_goal()
 async fn replace_thread_goal_applies_budget_limit_immediately()
 ```
 
-**Purpose**: Verifies that replacing a goal with active status and a zero budget immediately stores it as `BudgetLimited`. This pins down insertion-time budget normalization.
+**Purpose**: Verifies that replacing a goal with an active status and a zero token budget stores it as budget-limited right away.
 
-**Data flow**: Seeds a thread, calls `replace_thread_goal` with `Active` and `Some(0)`, then asserts the returned goal has `BudgetLimited` status and zeroed counters.
+**Data flow**: It creates a thread, replaces its goal with budget zero, and checks that the saved status is budget-limited with zero usage.
 
-**Call relations**: This test specifically exercises `status_after_budget_limit` through the replacement path.
+**Call relations**: This test exercises the creation path that calls the budget-status helper through `replace_thread_goal`.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1865,11 +1873,11 @@ async fn replace_thread_goal_applies_budget_limit_immediately()
 async fn insert_thread_goal_does_not_replace_existing_goal()
 ```
 
-**Purpose**: Checks that `insert_thread_goal` leaves an existing active goal untouched instead of replacing it. Only the first insert should succeed.
+**Purpose**: Checks that guarded insertion does not overwrite an existing unfinished goal.
 
-**Data flow**: Seeds a thread, inserts one goal, attempts a second insert with different contents, asserts the second result is `None`, and confirms the stored goal is still the first one.
+**Data flow**: It inserts an initial goal, attempts a second insert with different text and budget, then verifies the second call returns `None` and the original goal is still stored.
 
-**Call relations**: This validates the `WHERE thread_goals.status = 'complete'` conflict-update guard in `GoalStore::insert_thread_goal`.
+**Call relations**: The test runner calls this to protect the contract of `insert_thread_goal`, using the common runtime, thread id, and thread setup helpers.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1880,11 +1888,11 @@ async fn insert_thread_goal_does_not_replace_existing_goal()
 async fn insert_thread_goal_applies_budget_limit_immediately()
 ```
 
-**Purpose**: Confirms that the conservative insert path also normalizes an over-budget active goal to `BudgetLimited` immediately. It mirrors the replacement test for the insert API.
+**Purpose**: Verifies that guarded insertion also applies the immediate budget-limit rule.
 
-**Data flow**: Seeds a thread, calls `insert_thread_goal` with active status and zero budget, unwraps the inserted goal, and asserts budget-limited status and zero counters.
+**Data flow**: It creates a thread, inserts an active goal with a zero token budget, and checks that the resulting goal is budget-limited with no usage counted.
 
-**Call relations**: This covers `status_after_budget_limit` through `GoalStore::insert_thread_goal`.
+**Call relations**: This test covers the `insert_thread_goal` path and its use of the same budget decision as replacement.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1895,11 +1903,11 @@ async fn insert_thread_goal_applies_budget_limit_immediately()
 async fn update_thread_goal_ignores_replaced_goal_version()
 ```
 
-**Purpose**: Verifies optimistic concurrency: an update carrying a stale `expected_goal_id` must not modify a newer replacement goal. A fresh matching version token should still succeed.
+**Purpose**: Checks that an update tied to an old goal id cannot change a newer replacement goal.
 
-**Data flow**: Creates an original goal, replaces it to get a new `goal_id`, attempts an update using the stale original id and asserts `None`, then retries with the replacement id and asserts the status changes to `Complete`.
+**Data flow**: It creates one goal, replaces it with another, tries to update using the old goal id, and confirms nothing changes. It then updates using the new goal id and confirms the change succeeds.
 
-**Call relations**: This test targets the `expected_goal_id` predicate in `GoalStore::update_thread_goal`.
+**Call relations**: This test focuses on the expected-goal-id safety check in `update_thread_goal`, after setup through the shared test helpers.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1910,11 +1918,11 @@ async fn update_thread_goal_ignores_replaced_goal_version()
 async fn usage_accounting_ignores_replaced_goal_version()
 ```
 
-**Purpose**: Checks that usage accounting also respects goal versioning and does not mutate a replaced goal when given a stale `expected_goal_id`. Instead it returns the current unchanged replacement goal.
+**Purpose**: Checks that usage from an old goal version is not added to a newer goal.
 
-**Data flow**: Creates an original goal, replaces it, calls `account_thread_goal_usage` with the stale original id, pattern-matches `GoalAccountingOutcome::Unchanged(Some(goal))`, and asserts the returned goal is the replacement with untouched counters.
+**Data flow**: It creates and then replaces a goal, attempts usage accounting with the old goal id, and verifies the replacement goal still has zero counted time and tokens.
 
-**Call relations**: This extends optimistic concurrency coverage from updates to `GoalStore::account_thread_goal_usage`.
+**Call relations**: This test exercises the expected-goal-id protection in `account_thread_goal_usage`, using assertions to prove stale accounting was ignored.
 
 *Call graph*: 6 external calls (assert_eq!, assert_ne!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1925,11 +1933,11 @@ async fn usage_accounting_ignores_replaced_goal_version()
 async fn update_thread_goal_objective_preserves_usage_and_created_at()
 ```
 
-**Purpose**: Ensures that changing objective/status/budget on an existing goal does not reset accumulated usage or creation time. Only the explicitly updated fields should change.
+**Purpose**: Verifies that editing a goal’s wording, status, or budget does not erase its existing usage totals or original creation time.
 
-**Data flow**: Creates a goal, accounts usage to produce nonzero counters, then updates objective, status, and budget with the current `goal_id` and asserts the returned goal preserves usage and `created_at` while reflecting the new fields.
+**Data flow**: It creates a goal, adds usage, updates objective/status/budget, and compares the result against the previously accounted goal with only the requested fields changed.
 
-**Call relations**: This test validates the partial-update semantics and field preservation logic in `GoalStore::update_thread_goal`.
+**Call relations**: This test combines usage accounting and later goal editing to make sure independent fields survive `update_thread_goal`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1940,11 +1948,11 @@ async fn update_thread_goal_objective_preserves_usage_and_created_at()
 async fn concurrent_partial_updates_preserve_independent_fields()
 ```
 
-**Purpose**: Checks that concurrent updates to different fields do not clobber each other. One task changes status while another changes budget, and both effects should survive.
+**Purpose**: Checks that two partial updates running at the same time do not wipe out each other’s changes.
 
-**Data flow**: Seeds a goal, launches two `update_thread_goal` futures with `tokio::join!`, waits for both, then reloads the goal and asserts it has both the paused status and the updated token budget.
+**Data flow**: It creates a goal, starts one update that changes status and another that changes budget, waits for both, then reads the goal and verifies both changes are present.
 
-**Call relations**: This test exercises the SQL `COALESCE`/partial-update design under concurrent writes.
+**Call relations**: This test uses concurrent execution through `join!` to protect the field-preserving behavior of `update_thread_goal`.
 
 *Call graph*: 5 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread, join!).
 
@@ -1955,11 +1963,11 @@ async fn concurrent_partial_updates_preserve_independent_fields()
 async fn pause_active_thread_goal_does_not_clobber_terminal_status()
 ```
 
-**Purpose**: Verifies that pausing works for an active goal but later pause attempts do not overwrite a terminal completed status. The helper should return `None` when no transition is allowed.
+**Purpose**: Verifies that pausing works for an active goal but does not overwrite a completed goal.
 
-**Data flow**: Creates an active goal, pauses it and checks the updated status, then marks it complete via `update_thread_goal`, calls `pause_active_thread_goal` again, and asserts no change occurred and the stored goal remains complete.
+**Data flow**: It creates an active goal and pauses it, then marks it complete and attempts to pause again. The second pause returns no change and the completed goal remains complete.
 
-**Call relations**: This covers the allowed-state filter inside `GoalStore::update_active_thread_goal_status` as used by the pause wrapper.
+**Call relations**: This test covers the public pause helper and the guarded status update helper beneath it.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1970,11 +1978,11 @@ async fn pause_active_thread_goal_does_not_clobber_terminal_status()
 async fn usage_limit_active_thread_goal_updates_active_or_budget_limited_goals()
 ```
 
-**Purpose**: Checks that usage limiting can transition both active and budget-limited goals to `UsageLimited`, but repeated application after that has no effect. It captures the special-case promotion rule.
+**Purpose**: Checks when a goal can become usage-limited. Active goals can change to usage-limited, repeated updates do nothing, and budget-limited goals can also be converted.
 
-**Data flow**: Creates an active goal and usage-limits it, asserts the new status, retries and expects `None`, then replaces the goal with `BudgetLimited`, usage-limits again, and asserts the status becomes `UsageLimited`.
+**Data flow**: It creates an active goal, marks it usage-limited, confirms a second attempt changes nothing, then creates a budget-limited goal and confirms usage-limited can replace that status.
 
-**Call relations**: This directly validates the conditional branch in `GoalStore::update_active_thread_goal_status` that allows `budget_limited -> usage_limited`.
+**Call relations**: This test exercises `usage_limit_active_thread_goal` and the special case inside the shared active-status update helper.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -1985,11 +1993,11 @@ async fn usage_limit_active_thread_goal_updates_active_or_budget_limited_goals()
 async fn usage_accounting_updates_active_goals_and_accounts_budget_limited_in_flight_usage()
 ```
 
-**Purpose**: Verifies normal active accounting, transition to `BudgetLimited` when crossing the budget, and continued accounting of in-flight usage after that transition. This captures the intended semantics of `ActiveOnly` mode.
+**Purpose**: Verifies normal usage counting and the rule that a goal can still receive in-flight usage after crossing its budget.
 
-**Data flow**: Creates an active goal with budget 20, accounts 5 tokens/7 seconds and checks active status, then accounts 15 more tokens to hit the budget and checks `BudgetLimited`, then accounts another 5/5 and asserts counters continue increasing while status stays budget-limited.
+**Data flow**: It creates an active goal with a budget, adds some usage below the budget, adds enough to hit the budget, then adds one more in-flight amount while budget-limited and checks all totals.
 
-**Call relations**: This test targets the status filters and `CASE` expression built by `GoalStore::account_thread_goal_usage`.
+**Call relations**: This test focuses on `account_thread_goal_usage` in active-only mode and its budget-limited transition behavior.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2000,11 +2008,11 @@ async fn usage_accounting_updates_active_goals_and_accounts_budget_limited_in_fl
 async fn active_status_only_usage_accounting_does_not_update_budget_limited_goals()
 ```
 
-**Purpose**: Ensures the stricter `ActiveStatusOnly` mode refuses to account usage on already budget-limited goals. The row should remain unchanged.
+**Purpose**: Checks the stricter accounting mode that only updates goals whose status is exactly active.
 
-**Data flow**: Creates a budget-limited goal, calls `account_thread_goal_usage` in `ActiveStatusOnly` mode, pattern-matches `Unchanged(Some(goal))`, and asserts counters remain zero.
+**Data flow**: It creates a budget-limited goal, attempts to add usage in active-status-only mode, and verifies counters remain at zero.
 
-**Call relations**: This distinguishes `ActiveStatusOnly` from the looser accounting modes in `GoalStore::account_thread_goal_usage`.
+**Call relations**: This test protects the difference between accounting modes in `account_thread_goal_usage`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2015,11 +2023,11 @@ async fn active_status_only_usage_accounting_does_not_update_budget_limited_goal
 async fn stopped_usage_accounting_promotes_paused_goal_over_budget()
 ```
 
-**Purpose**: Checks that `ActiveOrStopped` mode can account final in-flight usage on a paused goal and still promote it to `BudgetLimited` if the budget is exceeded. This supports accounting after a stop signal.
+**Purpose**: Verifies that final accounting for a stopped goal can still mark it budget-limited if the final usage puts it over budget.
 
-**Data flow**: Creates an active goal with budget, pauses it, then accounts 25 tokens/3 seconds in `ActiveOrStopped` mode and asserts the returned goal is budget-limited with updated counters.
+**Data flow**: It creates an active goal with a budget, pauses it, then accounts a final token amount above the budget using the active-or-stopped mode. The goal ends budget-limited with the final totals recorded.
 
-**Call relations**: This test exercises the broader stopped-status filter used only in `GoalAccountingMode::ActiveOrStopped`.
+**Call relations**: This test covers the broader stopped-goal accounting mode in `account_thread_goal_usage`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2030,11 +2038,11 @@ async fn stopped_usage_accounting_promotes_paused_goal_over_budget()
 async fn budget_updates_immediately_stop_active_goals_already_over_budget()
 ```
 
-**Purpose**: Verifies that lowering a token budget below already-used tokens immediately changes an active goal to `BudgetLimited`. Budget edits are therefore not purely cosmetic.
+**Purpose**: Checks that lowering a token budget below already-used tokens immediately stops the goal as budget-limited.
 
-**Data flow**: Creates an active goal with budget 100, accounts 50 tokens, then updates only `token_budget` to 40 and asserts the returned goal is now budget-limited with the lower budget and preserved usage.
+**Data flow**: It creates a goal, records token usage, lowers the budget beneath that usage, and verifies the status changes to budget-limited while preserving the counted tokens.
 
-**Call relations**: This covers the `(None, Some(token_budget))` branch in `GoalStore::update_thread_goal`.
+**Call relations**: This test exercises the budget-update branch of `update_thread_goal`.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2045,11 +2053,11 @@ async fn budget_updates_immediately_stop_active_goals_already_over_budget()
 async fn activating_goal_already_over_budget_keeps_it_budget_limited()
 ```
 
-**Purpose**: Ensures that trying to reactivate a goal whose usage already exceeds its budget does not restore `Active`; it remains `BudgetLimited`. Objective text may still update.
+**Purpose**: Verifies that trying to reactivate an over-budget goal does not bypass the budget limit.
 
-**Data flow**: Creates an active goal, accounts usage beyond budget, then calls `update_thread_goal` with a new objective and requested `Active` status and asserts the stored status remains budget-limited while the objective changes.
+**Data flow**: It creates a goal, records enough usage to exceed the budget, then asks to set the status back to active while changing the objective. The objective changes, but the status stays budget-limited.
 
-**Call relations**: This validates the status-preserving `CASE` logic in the status-update branches of `GoalStore::update_thread_goal`.
+**Call relations**: This test protects the status logic inside `update_thread_goal`, especially when the requested status conflicts with the stored budget state.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2060,11 +2068,11 @@ async fn activating_goal_already_over_budget_keeps_it_budget_limited()
 async fn pausing_budget_limited_goal_preserves_terminal_status()
 ```
 
-**Purpose**: Checks that requesting `Paused` on a budget-limited goal does not overwrite the budget-limited terminal state. The update should preserve status while still succeeding as a row update.
+**Purpose**: Checks that asking to pause a budget-limited goal does not hide the fact that the budget was exceeded.
 
-**Data flow**: Creates a goal, pushes it over budget through accounting, then updates status to `Paused` and asserts the returned goal still has `BudgetLimited` status and preserved counters/budget.
+**Data flow**: It creates a goal, records enough usage to make it budget-limited, then sends a pause update and verifies the status remains budget-limited.
 
-**Call relations**: This targets the explicit `WHEN status = budget_limited AND requested IN (paused, blocked) THEN status` logic in `GoalStore::update_thread_goal`.
+**Call relations**: This test exercises the rule in `update_thread_goal` that preserves budget-limited status over certain later status requests.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2075,11 +2083,11 @@ async fn pausing_budget_limited_goal_preserves_terminal_status()
 async fn blocking_budget_limited_goal_preserves_terminal_status()
 ```
 
-**Purpose**: Verifies the same preservation rule for `Blocked` requests against a budget-limited goal. The row updates timestamp-wise but status remains budget-limited.
+**Purpose**: Checks that asking to block a budget-limited goal also preserves the budget-limited status.
 
-**Data flow**: Creates a goal, accounts it over budget, then requests `Blocked` via `update_thread_goal` and asserts the returned goal matches the prior budget-limited state except for `updated_at`.
+**Data flow**: It creates a goal, records usage over budget, then sends a blocked-status update. The result keeps the budget-limited state, apart from the normal updated timestamp.
 
-**Call relations**: This complements the paused case and covers the other preserved-status branch in `GoalStore::update_thread_goal`.
+**Call relations**: This test covers another branch of the terminal-status preservation logic in `update_thread_goal`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2090,11 +2098,11 @@ async fn blocking_budget_limited_goal_preserves_terminal_status()
 async fn usage_accounting_can_finalize_completed_goal_for_completing_turn()
 ```
 
-**Purpose**: Shows that completed goals are ignored by `ActiveOnly` accounting but can still receive final usage in `ActiveOrComplete` mode. This supports accounting the turn that completed the goal.
+**Purpose**: Verifies that completed goals usually are not updated by active-only accounting, but can receive final usage for the turn that completed them.
 
-**Data flow**: Creates a completed goal, accounts usage in `ActiveOnly` mode and asserts unchanged counters, then accounts the same usage in `ActiveOrComplete` mode and asserts counters increase while status stays complete.
+**Data flow**: It creates a completed goal, tries active-only accounting and sees no change, then uses active-or-complete accounting and confirms the final time and tokens are recorded.
 
-**Call relations**: This test distinguishes the status filters selected by different `GoalAccountingMode` values.
+**Call relations**: This test protects the `ActiveOrComplete` mode in `account_thread_goal_usage`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2105,11 +2113,11 @@ async fn usage_accounting_can_finalize_completed_goal_for_completing_turn()
 async fn usage_accounting_can_finalize_stopped_goal_for_in_flight_turn()
 ```
 
-**Purpose**: Verifies that paused goals are ignored by `ActiveOnly` accounting but can still absorb final in-flight usage in `ActiveOrStopped` mode. Status remains paused after accounting.
+**Purpose**: Verifies that a paused goal can receive final usage for work that was already in flight when it stopped.
 
-**Data flow**: Creates an active goal, pauses it, accounts usage in `ActiveOnly` mode and asserts no change, then accounts the same usage in `ActiveOrStopped` mode and asserts counters increase while status stays paused.
+**Data flow**: It creates an active goal, pauses it, confirms active-only accounting does nothing, then uses active-or-stopped accounting and verifies usage is added while the status remains paused.
 
-**Call relations**: This covers the stopped-goal accounting path in `GoalStore::account_thread_goal_usage`.
+**Call relations**: This test protects the `ActiveOrStopped` mode in `account_thread_goal_usage`.
 
 *Call graph*: 5 external calls (assert_eq!, panic!, test_runtime, test_thread_id, upsert_test_thread).
 
@@ -2120,11 +2128,11 @@ async fn usage_accounting_can_finalize_stopped_goal_for_in_flight_turn()
 async fn usage_accounting_adds_concurrent_token_deltas()
 ```
 
-**Purpose**: Checks that concurrent accounting updates accumulate rather than overwrite each other. Both token and time deltas from separate tasks should be reflected in the final row.
+**Purpose**: Checks that two simultaneous usage updates add together instead of one overwriting the other.
 
-**Data flow**: Creates an active goal, launches two `account_thread_goal_usage` calls concurrently with different deltas, waits for both, then reloads the goal and asserts summed `tokens_used` and `time_used_seconds`.
+**Data flow**: It creates a goal, starts two accounting updates at once with different time and token amounts, waits for both, then reads the goal and verifies the totals are the sum.
 
-**Call relations**: This test validates the atomic increment behavior of the SQL update built by `GoalStore::account_thread_goal_usage`.
+**Call relations**: This test uses `join!` to exercise the atomic counter update behavior of `account_thread_goal_usage`.
 
 *Call graph*: 5 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread, join!).
 
@@ -2135,24 +2143,26 @@ async fn usage_accounting_adds_concurrent_token_deltas()
 async fn deleting_thread_deletes_goal()
 ```
 
-**Purpose**: Verifies that deleting a thread removes its associated goal row as well. This confirms the expected database-level relationship between threads and goals.
+**Purpose**: Verifies that deleting a thread also removes its goal. This prevents orphaned goal records from staying in the database after their thread is gone.
 
-**Data flow**: Creates a thread and goal, calls `runtime.delete_thread(thread_id)`, then reads the goal and asserts it is absent.
+**Data flow**: It creates a thread and goal, deletes the thread through the runtime, then checks that reading the goal returns nothing.
 
-**Call relations**: This test covers integration between thread deletion and goal persistence, rather than a direct `GoalStore` delete call.
+**Call relations**: This test connects the goal store to the wider thread deletion behavior, using the shared setup helpers and the runtime’s delete operation.
 
 *Call graph*: 4 external calls (assert_eq!, test_runtime, test_thread_id, upsert_test_thread).
 
 
 ### `state/src/runtime/memories.rs`
 
-`domain_logic` · `background memory extraction/consolidation, startup scans, and memory artifact maintenance`
+`domain_logic` · `background memory extraction and consolidation, with startup scanning and test support`
 
-This file defines `MemoryStore`, which uses two SQLite pools: a memories DB (`pool`) for `jobs` and `stage1_outputs`, and the main state DB (`state_pool`) for thread metadata. It coordinates a two-phase pipeline. Stage 1 is per-thread extraction (`memory_stage1`), keyed by thread id; phase 2 is singleton global consolidation (`memory_consolidate_global`, job key `global`). Constants define retry budgets, cooldowns, and selection paging.
+This file is the memory pipeline's database control room. The system first extracts useful memory from individual conversation threads, then later consolidates selected thread memories into a global memory view. Without this file, workers could repeat the same extraction, overwrite each other, forget to retry failures, or include memories from deleted or polluted threads.
 
-Stage-1 claiming is careful and transactional. `try_claim_stage1_job` opens `BEGIN IMMEDIATE`, first skips work if either an existing `stage1_outputs.source_updated_at` or the job row’s `last_success_watermark` is already at least the requested source watermark, then inserts or updates a `jobs` row to `running` only if the global running count is below `max_running_jobs`, any prior lease is stale, retry backoff has elapsed or the source watermark advanced, and retries remain unless the watermark advanced. Newer source watermarks reset retry budget. Success paths either upsert a non-empty `stage1_outputs` row or delete an existing one for no-output extraction; both can enqueue phase 2 by upserting the singleton global job and monotonically advancing its bookkeeping watermark.
+The main type is `MemoryStore`. It talks to two SQLite databases: one for memory-specific tables such as `stage1_outputs` and `jobs`, and one for thread metadata such as whether memory is enabled for a thread. SQLite is a small file-based database.
 
-Phase 2 uses a singleton lock row with lease, retry, and success cooldown semantics. Claiming ignores DB watermarks as a dirty check; actual work is determined later by workspace diffing. Successful completion rewrites `selected_for_phase2` markers so only the exact selected stage-1 snapshots remain marked, including the selected snapshot timestamp. Read-side helpers list visible stage-1 outputs, compute current phase-2 input selection using usage count and recency while filtering out disabled/polluted threads, record usage metadata, prune stale unselected outputs, and mark threads polluted to trigger forgetting. The large test suite covers concurrency, stale leases, retry exhaustion, selection ranking, retention, pollution, and exact snapshot bookkeeping.
+The pipeline works in two stages. Stage 1 claims work for stale threads, records success or failure, and saves the extracted memory text. Stage 2 is a single global consolidation job. It chooses the best current stage-1 outputs, based on recency and use, and marks exactly which snapshots were used in the last successful global build. The file also includes cleanup paths: deleting memory for a thread, pruning old unused outputs, marking polluted threads so they stop feeding global memory, and clearing all memory data.
+
+A key idea is leases. A lease is like a temporary reservation ticket for a worker. If the worker disappears, the lease expires and another worker may take over. Ownership tokens make sure only the worker that claimed a job can finish it.
 
 #### Function details
 
@@ -2162,11 +2172,11 @@ Phase 2 uses a singleton lock row with lease, retry, and success cooldown semant
 fn new(pool: Arc<SqlitePool>, state_pool: Arc<SqlitePool>) -> Self
 ```
 
-**Purpose**: Constructs a `MemoryStore` with separate pools for the memories database and the main state database. It is the wiring point for this subsystem.
+**Purpose**: Creates a `MemoryStore` from the database connections it needs. It gives the memory subsystem access to both its own memory database and the main state database.
 
-**Data flow**: Consumes `pool` and `state_pool` as `Arc<SqlitePool>` values and returns `MemoryStore { pool, state_pool }`.
+**Data flow**: It receives two shared SQLite connection pools, stores them inside a new `MemoryStore`, and returns that store for later use.
 
-**Call relations**: Called during runtime initialization to attach memory persistence and thread-metadata lookups.
+**Call relations**: The runtime setup path calls this from `init_inner` when it builds the full state runtime.
 
 *Call graph*: called by 1 (init_inner).
 
@@ -2177,11 +2187,11 @@ fn new(pool: Arc<SqlitePool>, state_pool: Arc<SqlitePool>) -> Self
 async fn close(&self)
 ```
 
-**Purpose**: Closes the memories database pool. This is part of runtime shutdown.
+**Purpose**: Closes the memory database connection pool. This is used when the runtime is shutting down or cleaning up.
 
-**Data flow**: Reads `self.pool` and awaits `close()` on it.
+**Data flow**: It reads the pool stored in `MemoryStore`, asks it to close, and produces no data result beyond completion.
 
-**Call relations**: Invoked by the enclosing runtime close path.
+**Call relations**: The wider runtime `close` flow calls this so memory database resources are released with the rest of the runtime.
 
 *Call graph*: called by 1 (close).
 
@@ -2192,11 +2202,11 @@ async fn close(&self)
 async fn clear_memory_data(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Deletes all persisted memory pipeline state from the memories database. It removes both stage-1 outputs and memory-related job rows.
+**Purpose**: Deletes all stored memory outputs and memory pipeline jobs. This is a reset button for generated memory data, not for thread records themselves.
 
-**Data flow**: Reads `self.pool` and delegates to `clear_memory_data_in_pool`, returning its result.
+**Data flow**: It takes the store's memory database pool, passes it to the shared clearing helper, and returns success or an error.
 
-**Call relations**: This is the store-level wrapper over the shared pool helper used for full memory-state resets.
+**Call relations**: It delegates the actual database deletion to `clear_memory_data_in_pool`, keeping the public method small.
 
 *Call graph*: calls 1 internal fn (clear_memory_data_in_pool).
 
@@ -2210,11 +2220,11 @@ async fn record_stage1_output_usage(
     ) -> anyhow::Result<usize>
 ```
 
-**Purpose**: Increments usage metadata for cited stage-1 outputs so later phase-2 selection can prioritize frequently used memories. Missing thread ids are ignored.
+**Purpose**: Records that certain per-thread memory outputs were used. This lets later selection prefer memories that are actually helpful.
 
-**Data flow**: Consumes a slice of `ThreadId`; returns `0` immediately if empty. Otherwise it computes `now`, opens a transaction, loops over thread ids, and for each executes `UPDATE stage1_outputs SET usage_count = COALESCE(usage_count, 0) + 1, last_usage = now WHERE thread_id = ?`, summing `rows_affected()` before commit. Returns the number of updated rows.
+**Data flow**: It receives thread IDs. For each one, it increments that output's usage count and sets its last-used time to now; missing rows are ignored. It returns how many rows were updated.
 
-**Call relations**: This is a write-side maintenance API used after memory outputs are cited or consumed, feeding ranking logic in `MemoryStore::get_phase2_input_selection`.
+**Call relations**: This is a direct database update path. It does not call other project helpers, but it feeds later ranking in `MemoryStore::get_phase2_input_selection`.
 
 *Call graph*: 3 external calls (now, is_empty, query).
 
@@ -2229,11 +2239,11 @@ async fn stage1_source_needs_update(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Determines whether a thread’s source watermark is newer than both any persisted stage-1 output and the last successful stage-1 job watermark. It avoids unnecessary re-extraction.
+**Purpose**: Checks whether a thread's saved memory is older than the thread itself. It prevents pointless extraction work when the existing output or successful job is already current.
 
-**Data flow**: Consumes `thread_id` and `source_updated_at`, stringifies the thread id, queries `stage1_outputs.source_updated_at` and then `jobs.last_success_watermark` for the stage-1 job key, and returns `false` if either stored watermark is already at least the requested source watermark; otherwise returns `true`.
+**Data flow**: It receives a thread ID and the thread's source update time. It looks for a saved output and then a job success watermark; if either is new enough, it returns `false`, otherwise `true`.
 
-**Call relations**: Used by `MemoryStore::claim_stage1_jobs_for_startup` to skip threads that are already up to date before attempting a claim.
+**Call relations**: `MemoryStore::claim_stage1_jobs_for_startup` calls this before trying to claim startup work, so it only reserves jobs that can actually produce newer memory.
 
 *Call graph*: called by 1 (claim_stage1_jobs_for_startup); 3 external calls (as_str, to_string, query).
 
@@ -2248,11 +2258,11 @@ async fn claim_stage1_jobs_for_startup(
     ) -> anyhow::Result<Vec<Stage1JobClaim>>
 ```
 
-**Purpose**: Scans eligible threads from the state database and claims up to `max_claimed` stale stage-1 jobs for startup processing. It bounds state-DB scanning separately from memory-DB claim attempts.
+**Purpose**: Finds old enough, active threads at startup and claims memory extraction jobs for them. This lets the system catch up on memory generation without scanning forever.
 
-**Data flow**: Consumes the current worker thread id and `Stage1StartupClaimParams`, returns empty if `scan_limit` or `max_claimed` is zero, computes age and idle cutoffs, builds a filtered thread query with `push_thread_filters`, `memory_mode = 'enabled'`, exclusion of the current thread, and updated-at bounds, then fetches and decodes `ThreadMetadata` rows from `state_pool`. It iterates those candidates in order, skips ones where `stage1_source_needs_update` is false, calls `try_claim_stage1_job` with the thread’s `updated_at.timestamp()` as source watermark, and collects successful claims into `Stage1JobClaim` values until `max_claimed` is reached.
+**Data flow**: It receives the current worker thread ID and limits such as scan size, age window, allowed sources, and lease length. It queries eligible threads from the state database, checks whether each needs an update, then tries to claim jobs until the requested maximum is reached. It returns claimed threads with ownership tokens.
 
-**Call relations**: This is the startup orchestration entry point for stage-1 work. It delegates staleness checks to `MemoryStore::stage1_source_needs_update`, thread filtering to `push_thread_filters`, and actual locking to `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It uses `push_thread_filters` to build the thread query, calls `MemoryStore::stage1_source_needs_update` to skip current rows, and hands each candidate to `MemoryStore::try_claim_stage1_job` to reserve the work.
 
 *Call graph*: calls 3 internal fn (stage1_source_needs_update, try_claim_stage1_job, push_thread_filters); 7 external calls (days, hours, new, now, new, try_from, as_str).
 
@@ -2263,11 +2273,11 @@ async fn claim_stage1_jobs_for_startup(
 async fn delete_thread_memory(&self, thread_id: ThreadId) -> anyhow::Result<()>
 ```
 
-**Purpose**: Removes a thread’s stage-1 output and stage-1 job row, and if the deleted output had been part of the last successful phase-2 baseline, enqueues global consolidation to forget it. The whole operation is transactional.
+**Purpose**: Removes all memory data and stage-1 job state for one thread. If that thread was part of the last global memory build, it asks phase 2 to rebuild without it.
 
-**Data flow**: Consumes `thread_id`, computes `now`, opens a transaction, reads `selected_for_phase2` from `stage1_outputs`, deletes the stage-1 output row and the corresponding stage-1 job row, conditionally calls `enqueue_global_consolidation_with_executor(&mut tx, now)` when a selected output was actually deleted, commits, and returns `()`.
+**Data flow**: It receives a thread ID. Inside one transaction, it checks whether the output was selected for phase 2, deletes the output and its stage-1 job row, maybe enqueues global consolidation, then commits.
 
-**Call relations**: This is called from thread-deletion flows so memory artifacts stay in sync with thread lifecycle. It delegates phase-2 enqueueing to the shared executor helper.
+**Call relations**: When a selected thread is removed, it calls `enqueue_global_consolidation_with_executor` so the global memory can be corrected.
 
 *Call graph*: calls 1 internal fn (enqueue_global_consolidation_with_executor); 4 external calls (now, as_str, to_string, query).
 
@@ -2281,11 +2291,11 @@ async fn list_stage1_outputs_for_global(
     ) -> anyhow::Result<Vec<Stage1Output>>
 ```
 
-**Purpose**: Returns the newest visible non-empty stage-1 outputs for use as global consolidation candidates. It filters out disabled or polluted threads by consulting the state database.
+**Purpose**: Lists recent non-empty per-thread memory outputs that could feed global consolidation. It also hides outputs for threads whose memory is no longer enabled.
 
-**Data flow**: Consumes `n`, returns empty if zero, selects all non-empty `stage1_outputs` rows ordered by `source_updated_at DESC, thread_id DESC`, then iterates rows and calls `stage1_output_from_row_if_thread_enabled`; each successful visible output is pushed until `n` outputs have been collected.
+**Data flow**: It receives a maximum count. It reads non-empty saved outputs in newest-first order, enriches each with thread metadata, skips invisible threads, and returns up to the requested number.
 
-**Call relations**: This is the main read path for phase-2 candidate materialization. It delegates thread visibility checks and row hydration to `MemoryStore::stage1_output_from_row_if_thread_enabled`.
+**Call relations**: For each database row, it calls `MemoryStore::stage1_output_from_row_if_thread_enabled`, which performs the thread-enabled check and builds the output object.
 
 *Call graph*: calls 1 internal fn (stage1_output_from_row_if_thread_enabled); 2 external calls (new, query).
 
@@ -2300,11 +2310,11 @@ async fn prune_stage1_outputs_for_retention(
     ) -> anyhow::Result<usize>
 ```
 
-**Purpose**: Deletes stale, unselected stage-1 outputs based on last usage or source recency while preserving selected baseline rows and all job watermarks. It prunes in bounded batches.
+**Purpose**: Deletes old, unused per-thread memory outputs to keep the memory database from growing forever. It avoids deleting outputs that are part of the last successful global baseline.
 
-**Data flow**: Consumes `max_unused_days` and `limit`, returns `0` if limit is zero, computes a cutoff timestamp, and executes a `DELETE` whose subquery selects up to `limit` thread ids from `stage1_outputs` where `selected_for_phase2 = 0` and `COALESCE(last_usage, source_updated_at) < cutoff`, ordered stalest-first. It returns the number of deleted rows as `usize`.
+**Data flow**: It receives an age limit and deletion limit. It computes a cutoff time, deletes at most that many unselected rows older than the cutoff, and returns the number deleted.
 
-**Call relations**: This is a retention-maintenance API for the memories DB. It intentionally touches only `stage1_outputs`, leaving `jobs` rows intact.
+**Call relations**: This is a standalone retention cleanup query. Its result changes what future listing and phase-2 selection calls can see.
 
 *Call graph*: 3 external calls (days, now, query).
 
@@ -2319,11 +2329,11 @@ async fn get_phase2_input_selection(
     ) -> anyhow::Result<Vec<Stage1Output>>
 ```
 
-**Purpose**: Computes the current top-N phase-2 input set from stage-1 outputs using usage count and recency, while filtering out stale, disabled, or polluted threads. It returns fully hydrated `Stage1Output` values sorted by thread id.
+**Purpose**: Chooses the current set of stage-1 outputs that should be materialized for global memory consolidation. It favors used, recent, non-empty memories from still-enabled threads.
 
-**Data flow**: Consumes `n` and `max_unused_days`, returns empty if `n == 0`, computes a cutoff timestamp, then pages through candidate `(thread_id, source_updated_at)` pairs from `stage1_outputs` ordered by `usage_count DESC`, `COALESCE(last_usage, source_updated_at) DESC`, `source_updated_at DESC`, `thread_id DESC`. For each candidate it calls `enabled_thread_metadata` to ensure the thread is still visible; selected keys are then reloaded from `stage1_outputs`, converted through `stage1_output_from_row_if_thread_enabled`, collected, and finally sorted by `thread_id` before return.
+**Data flow**: It receives a maximum count and max-unused age. It pages through ranked candidate rows, checks that each thread is still enabled, reloads each selected snapshot, builds full `Stage1Output` records, sorts them by thread ID for stable output, and returns them.
 
-**Call relations**: This is the read-side selection algorithm for phase 2. It depends on `enabled_thread_metadata` for visibility filtering and `stage1_output_from_row_if_thread_enabled` for final hydration.
+**Call relations**: It calls `MemoryStore::enabled_thread_metadata` during candidate filtering and `MemoryStore::stage1_output_from_row_if_thread_enabled` when building final outputs.
 
 *Call graph*: calls 3 internal fn (try_from, enabled_thread_metadata, stage1_output_from_row_if_thread_enabled); 6 external calls (days, now, new, with_capacity, try_from, query).
 
@@ -2337,11 +2347,11 @@ async fn stage1_output_from_row_if_thread_enabled(
     ) -> anyhow::Result<Option<Stage1Output>>
 ```
 
-**Purpose**: Hydrates a `Stage1Output` from a stage-1 row only if the corresponding thread still exists and has `memory_mode = 'enabled'`. Otherwise it suppresses the row.
+**Purpose**: Turns a saved stage-1 database row into a usable output only if the thread is still allowed to contribute memory.
 
-**Data flow**: Reads `thread_id` from the provided SQLite row, parses it into `ThreadId`, calls `enabled_thread_metadata`, and if metadata exists passes both row and thread metadata to `stage1_output_from_row_and_thread`; otherwise returns `Ok(None)`.
+**Data flow**: It receives a SQLite row. It reads the thread ID, fetches enabled thread metadata, returns `None` if the thread is missing or disabled, or returns a full `Stage1Output` if valid.
 
-**Call relations**: Used by both `list_stage1_outputs_for_global` and `get_phase2_input_selection` to enforce thread visibility and attach thread-derived fields like `cwd` and `git_branch`.
+**Call relations**: `MemoryStore::list_stage1_outputs_for_global` and `MemoryStore::get_phase2_input_selection` call this to avoid leaking disabled or polluted thread memory into global consolidation.
 
 *Call graph*: calls 3 internal fn (try_from, enabled_thread_metadata, stage1_output_from_row_and_thread); called by 2 (get_phase2_input_selection, list_stage1_outputs_for_global); 1 external calls (try_get).
 
@@ -2355,11 +2365,11 @@ async fn enabled_thread_metadata(
     ) -> anyhow::Result<Option<ThreadMetadata>>
 ```
 
-**Purpose**: Loads thread metadata from the main state database only when the thread’s `memory_mode` is `enabled`. Polluted or disabled threads are treated as absent for memory selection purposes.
+**Purpose**: Loads thread metadata only when that thread has memory enabled. This is the gatekeeper that keeps disabled or polluted threads out of memory results.
 
-**Data flow**: Consumes `thread_id`, stringifies it, selects thread columns from `threads WHERE id = ? AND memory_mode = 'enabled'` using `state_pool`, and converts an optional row through `ThreadRow::try_from_row` and `ThreadMetadata::try_from`.
+**Data flow**: It receives a thread ID, queries the state database for that thread with `memory_mode = 'enabled'`, converts the row to `ThreadMetadata`, and returns it or `None`.
 
-**Call relations**: This is the visibility gate used by stage-1 output listing and phase-2 input selection.
+**Call relations**: `MemoryStore::get_phase2_input_selection` and `MemoryStore::stage1_output_from_row_if_thread_enabled` call this before allowing a memory output to be used.
 
 *Call graph*: called by 2 (get_phase2_input_selection, stage1_output_from_row_if_thread_enabled); 2 external calls (to_string, query).
 
@@ -2373,11 +2383,11 @@ async fn mark_thread_memory_mode_polluted(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Marks a thread as `polluted` in the state database and, if its current stage-1 output participated in the last successful phase-2 baseline, enqueues global consolidation so that baseline can forget it. It reports whether the thread state actually changed.
+**Purpose**: Marks a thread as polluted, meaning its memory should no longer be trusted for global memory. If it was previously used in the global build, it schedules a rebuild.
 
-**Data flow**: Consumes `thread_id`, computes `now`, reads `selected_for_phase2` from `stage1_outputs`, updates `threads SET memory_mode = 'polluted' WHERE id = ? AND memory_mode != 'polluted'`, conditionally calls `enqueue_global_consolidation(now)` when the output had been selected, and returns whether the thread row update affected any rows.
+**Data flow**: It receives a thread ID. It checks whether the thread's output was selected for phase 2, updates the thread's memory mode in the state database, possibly enqueues global consolidation, and returns whether the mode actually changed.
 
-**Call relations**: This is the pollution/forgetting trigger. It delegates phase-2 enqueueing to `MemoryStore::enqueue_global_consolidation`.
+**Call relations**: When a selected thread becomes polluted, it calls `MemoryStore::enqueue_global_consolidation`, which forwards to the shared enqueue helper.
 
 *Call graph*: calls 1 internal fn (enqueue_global_consolidation); 4 external calls (now, as_str, to_string, query).
 
@@ -2394,11 +2404,11 @@ async fn try_claim_stage1_job(
         max_running_jobs: usize,
 ```
 
-**Purpose**: Attempts to claim a per-thread stage-1 extraction job with lease, retry, watermark, and global-running-cap semantics. It returns a precise `Stage1JobClaimOutcome` describing success or the reason for skipping.
+**Purpose**: Tries to reserve per-thread memory extraction for one worker. It prevents duplicate workers from processing the same thread and respects retry delays and a global running-job cap.
 
-**Data flow**: Consumes `thread_id`, `worker_id`, `source_updated_at`, `lease_seconds`, and `max_running_jobs`; computes `now`, `lease_until`, a fresh UUID `ownership_token`, and stringified ids; opens `BEGIN IMMEDIATE`; checks existing `stage1_outputs` and `jobs.last_success_watermark` for up-to-date skips; then executes an `INSERT ... SELECT ... ON CONFLICT(kind, job_key) DO UPDATE` that claims the row only if the global running count is below cap, any existing running lease is stale, retry backoff has elapsed or the watermark advanced, and retries remain or the watermark advanced. On success it commits and returns `Claimed { ownership_token }`; otherwise it reads current job state and maps it to `SkippedRetryExhausted`, `SkippedRetryBackoff`, `SkippedRunning`, or a default running skip.
+**Data flow**: It receives a thread ID, worker ID, source update time, lease length, and max running jobs. It checks whether existing output or job success is already current, then inserts or updates a job row with a fresh ownership token and lease if allowed. It returns a claimed token or a specific skip reason.
 
-**Call relations**: This is the core stage-1 locking primitive used directly by callers and by `MemoryStore::claim_stage1_jobs_for_startup`. Its transactional checks are what make concurrent claims conflict-safe.
+**Call relations**: `MemoryStore::claim_stage1_jobs_for_startup` calls this for startup candidates. Later success or failure methods use the ownership token it returns.
 
 *Call graph*: called by 1 (claim_stage1_jobs_for_startup); 5 external calls (now, new_v4, as_str, to_string, query).
 
@@ -2415,11 +2425,11 @@ async fn mark_stage1_job_succeeded(
         rollout_summary: &str,
 ```
 
-**Purpose**: Finalizes an owned running stage-1 job as successful, upserts the generated memory output, and enqueues global consolidation. It preserves prior phase-2 selection markers until phase 2 rewrites them.
+**Purpose**: Finishes a claimed stage-1 job that produced memory text. It saves the extracted memory and asks the global consolidation step to notice the change.
 
-**Data flow**: Consumes `thread_id`, `ownership_token`, `source_updated_at`, `raw_memory`, `rollout_summary`, and optional `rollout_slug`; computes `now`; opens a transaction; updates the matching running stage-1 `jobs` row to `done`, clears lease/error, and copies `input_watermark` into `last_success_watermark`; if no row matches it commits and returns `false`. Otherwise it upserts `stage1_outputs` with the new payload and `generated_at = now`, replacing existing output only when the new `source_updated_at` is newer or equal, calls `enqueue_global_consolidation_with_executor(&mut tx, source_updated_at)`, commits, and returns `true`.
+**Data flow**: It receives the thread ID, ownership token, source timestamp, memory text, rollout summary, and optional rollout slug. It updates only the matching running job, upserts the output row if the source is not older, enqueues phase 2, and returns whether finalization succeeded.
 
-**Call relations**: This is the normal successful completion path after `MemoryStore::try_claim_stage1_job`. It delegates phase-2 enqueueing to the shared executor helper.
+**Call relations**: It calls `enqueue_global_consolidation_with_executor` inside the same transaction so the saved output and the phase-2 notification stay in sync.
 
 *Call graph*: calls 1 internal fn (enqueue_global_consolidation_with_executor); 4 external calls (now, as_str, to_string, query).
 
@@ -2434,11 +2444,11 @@ async fn mark_stage1_job_succeeded_no_output(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Finalizes an owned running stage-1 job when extraction produced no memory output, deleting any existing stage-1 output instead of writing an empty one. It only enqueues phase 2 if an existing output was actually removed.
+**Purpose**: Finishes a claimed stage-1 job that found nothing worth saving. It still records the successful watermark so the same unchanged thread is not retried forever.
 
-**Data flow**: Consumes `thread_id` and `ownership_token`, computes `now`, opens a transaction, updates the matching running stage-1 job row to `done` and clears lease/error, returns `false` if no row matched, then reads the job’s `input_watermark`, deletes any `stage1_outputs` row for the thread, conditionally calls `enqueue_global_consolidation_with_executor` when a row was deleted, commits, and returns `true`.
+**Data flow**: It receives the thread ID and ownership token. It marks the owned job done, reads its input watermark, deletes any old output for that thread, and enqueues phase 2 only if an old output was actually removed.
 
-**Call relations**: This is the no-output success variant of stage-1 completion. It shares the same ownership check as `MemoryStore::mark_stage1_job_succeeded` but differs in how it updates `stage1_outputs` and phase-2 enqueueing.
+**Call relations**: If deletion changes global memory inputs, it calls `enqueue_global_consolidation_with_executor`; otherwise it just marks the stage-1 job complete.
 
 *Call graph*: calls 1 internal fn (enqueue_global_consolidation_with_executor); 4 external calls (now, as_str, to_string, query).
 
@@ -2455,11 +2465,11 @@ async fn mark_stage1_job_failed(
     ) -> anyhow::Result<bool
 ```
 
-**Purpose**: Marks an owned running stage-1 job as failed, clears its lease, stores the failure reason, and schedules retry backoff while decrementing retry budget. It returns whether the owned running row was matched.
+**Purpose**: Records that a claimed stage-1 extraction failed and schedules a retry later. This keeps temporary failures from causing tight retry loops.
 
-**Data flow**: Consumes `thread_id`, `ownership_token`, `failure_reason`, and `retry_delay_seconds`; computes `now` and `retry_at`; updates the matching running stage-1 job row to `status = 'error'`, `finished_at = now`, `lease_until = NULL`, `retry_at`, `retry_remaining = retry_remaining - 1`, and `last_error = failure_reason`; returns `rows_affected() > 0`.
+**Data flow**: It receives a thread ID, ownership token, failure message, and retry delay. It updates only the matching running job to error, clears its lease, lowers the retry count, stores the error, and returns whether a row matched.
 
-**Call relations**: This is the failure path paired with `MemoryStore::try_claim_stage1_job`, feeding the retry/backoff logic that later claims inspect.
+**Call relations**: This is the failure counterpart to the stage-1 success methods. Future calls to `MemoryStore::try_claim_stage1_job` read the retry fields it writes.
 
 *Call graph*: 4 external calls (now, as_str, to_string, query).
 
@@ -2470,11 +2480,11 @@ async fn mark_stage1_job_failed(
 async fn enqueue_global_consolidation(&self, input_watermark: i64) -> anyhow::Result<()>
 ```
 
-**Purpose**: Upserts the singleton global phase-2 job into a pending-or-running state and advances its bookkeeping watermark. It is the public wrapper over the executor-generic helper.
+**Purpose**: Schedules or refreshes the single global memory consolidation job. Callers use it when stage-1 outputs change or selected memory must be forgotten.
 
-**Data flow**: Consumes `input_watermark` and forwards `self.pool.as_ref()` plus that watermark to `enqueue_global_consolidation_with_executor`, returning `()`.
+**Data flow**: It receives an input watermark, passes the store's memory database executor to the helper, and returns success or an error.
 
-**Call relations**: Called when stage-1 outputs change or polluted/selected rows need forgetting. `MemoryStore::mark_thread_memory_mode_polluted` delegates here.
+**Call relations**: `MemoryStore::mark_thread_memory_mode_polluted` calls this. It delegates the database upsert to `enqueue_global_consolidation_with_executor`.
 
 *Call graph*: calls 1 internal fn (enqueue_global_consolidation_with_executor); called by 1 (mark_thread_memory_mode_polluted).
 
@@ -2489,11 +2499,11 @@ async fn try_claim_global_phase2_job(
     ) -> anyhow::Result<Phase2JobClaimOutcome>
 ```
 
-**Purpose**: Attempts to claim the singleton global consolidation lock with lease, retry-backoff, and success-cooldown semantics. It returns a `Phase2JobClaimOutcome` describing whether the caller now owns the lock.
+**Purpose**: Tries to reserve the one global consolidation job for a worker. It acts like a lock so only one worker rebuilds global memory at a time.
 
-**Data flow**: Consumes `worker_id` and `lease_seconds`, computes `now`, `lease_until`, `cooldown_cutoff`, and a fresh `ownership_token`, opens `BEGIN IMMEDIATE`, reads the singleton global job row, and if absent inserts a new running row with zero watermark and default retries. If present, it extracts `status`, `lease_until`, `retry_at`, `input_watermark`, `finished_at`, and `last_error`; returns `SkippedRetryUnavailable`, `SkippedRunning`, or `SkippedCooldown` when those conditions apply; otherwise updates the row to `running` with new ownership and lease if the stale/cooldown predicates still hold. It commits and returns either `Claimed { ownership_token, input_watermark }` or `SkippedRunning`.
+**Data flow**: It receives a worker ID and lease length. It reads or creates the singleton global job row, checks retry delay, active lease, and recent-success cooldown, then writes a running lease with an ownership token if allowed. It returns claimed information or a skip reason.
 
-**Call relations**: This is the phase-2 locking primitive used by consolidation workers. It is independent of actual work detection, which the caller performs after claiming.
+**Call relations**: Callers use this before doing phase-2 work. Success, heartbeat, and failure methods later rely on the ownership token created here.
 
 *Call graph*: 5 external calls (now, new_v4, as_str, to_string, query).
 
@@ -2508,11 +2518,11 @@ async fn heartbeat_global_phase2_job(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Extends the lease on an owned running global phase-2 job. It is a lightweight keepalive for long-running consolidation work.
+**Purpose**: Extends the lease for a running global consolidation job. This lets a long-running worker say, in effect, 'I am still alive.'
 
-**Data flow**: Consumes `ownership_token` and `lease_seconds`, computes `now` and `lease_until`, updates the singleton global job row’s `lease_until` where `status = 'running'` and `ownership_token` matches, and returns whether a row was updated.
+**Data flow**: It receives an ownership token and lease length. It computes a new lease expiry time and updates the singleton global job only if the token still owns a running job. It returns whether the lease was extended.
 
-**Call relations**: Used by active phase-2 workers after a successful claim from `MemoryStore::try_claim_global_phase2_job`.
+**Call relations**: This fits between claiming and finishing phase 2. It protects the job from being taken over while a legitimate worker is still progressing.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -2528,11 +2538,11 @@ async fn mark_global_phase2_job_succeeded(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Finalizes an owned running global phase-2 job as successful and rewrites the `selected_for_phase2` baseline markers to exactly match the selected outputs used for that run. This persists the latest successful baseline snapshot.
+**Purpose**: Finishes the owned global consolidation job and records exactly which stage-1 snapshots were used. This creates the baseline for later forgetting and cleanup decisions.
 
-**Data flow**: Consumes `ownership_token`, `completed_watermark`, and a slice of `Stage1Output`; opens a transaction; calls `mark_global_phase2_job_succeeded_row` to update the singleton job row to `done` and advance `last_success_watermark`; if no row matched it commits and returns `false`. Otherwise it clears all existing `selected_for_phase2` flags and snapshot timestamps in `stage1_outputs`, then for each selected output updates the matching `(thread_id, source_updated_at)` row to `selected_for_phase2 = 1` and `selected_for_phase2_source_updated_at = source_updated_at`, commits, and returns `true`.
+**Data flow**: It receives an ownership token, completed watermark, and selected outputs. It marks the job done, clears all previous selection flags, marks only the matching selected snapshots, and returns whether the owned job was finalized.
 
-**Call relations**: This is the successful completion path after `MemoryStore::try_claim_global_phase2_job`. It delegates the job-row state transition to `mark_global_phase2_job_succeeded_row`.
+**Call relations**: It calls `mark_global_phase2_job_succeeded_row` for the job-row update, then updates `stage1_outputs` selection markers in the same transaction.
 
 *Call graph*: calls 1 internal fn (mark_global_phase2_job_succeeded_row); 1 external calls (query).
 
@@ -2548,11 +2558,11 @@ async fn mark_global_phase2_job_failed(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Marks an owned running global phase-2 job as failed, clears its lease, stores the failure reason, and schedules retry backoff while decrementing retry budget. It requires strict ownership.
+**Purpose**: Records that the owned global consolidation job failed and schedules a retry. It is the normal failure path when the worker still owns the job.
 
-**Data flow**: Consumes `ownership_token`, `failure_reason`, and `retry_delay_seconds`; computes `now` and `retry_at`; updates the singleton global job row where `status = 'running'` and `ownership_token` matches, setting `status = 'error'`, `finished_at`, `lease_until = NULL`, `retry_at`, `retry_remaining = max(retry_remaining - 1, 0)`, and `last_error`; returns whether a row matched.
+**Data flow**: It receives an ownership token, failure reason, and retry delay. It updates the singleton job only if the token matches a running row, clears the lease, stores the error, reduces retries without going below zero, and returns whether it matched.
 
-**Call relations**: This is the normal failure path for a phase-2 worker that still owns the lock.
+**Call relations**: Future calls to `MemoryStore::try_claim_global_phase2_job` read the retry time and may temporarily skip the job.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -2568,11 +2578,11 @@ async fn mark_global_phase2_job_failed_if_unowned(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Fallback failure finalization for a running global phase-2 job when ownership may have been lost or cleared. It can match either the expected token or a null ownership token.
+**Purpose**: Provides a fallback way to mark global consolidation failed when ownership was lost or cleared. It helps recover a stuck running job.
 
-**Data flow**: Consumes the same inputs as `mark_global_phase2_job_failed`, computes `now` and `retry_at`, and updates the singleton global job row where `status = 'running'` and `(ownership_token = ? OR ownership_token IS NULL)`, applying the same error/retry transition and returning whether a row matched.
+**Data flow**: It receives an ownership token, failure reason, and retry delay. It applies the same failure update as the strict method, but also matches a running row with no ownership token. It returns whether it changed the job.
 
-**Call relations**: Used as a recovery path when strict ownership failure finalization does not match, such as after ownership token loss.
+**Call relations**: This mirrors `MemoryStore::mark_global_phase2_job_failed` but is looser for recovery situations, such as an unowned running row.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -2587,11 +2597,11 @@ async fn mark_global_phase2_job_succeeded_row(
 ) -> anyhow::Result<u64>
 ```
 
-**Purpose**: Performs just the singleton global job-row success transition, independent of rewriting selected stage-1 outputs. It is generic over any SQLx executor so it can run inside a transaction.
+**Purpose**: Updates the singleton global job row to say phase 2 succeeded. It is a small helper so the job-row update can be reused inside a larger transaction.
 
-**Data flow**: Consumes an executor, `ownership_token`, and `completed_watermark`; computes `now`; updates the singleton global job row where it is running and owned by the token, setting `status = 'done'`, `finished_at = now`, `lease_until = NULL`, `last_error = NULL`, and `last_success_watermark = max(existing, completed_watermark)`; returns `rows_affected()`.
+**Data flow**: It receives a database executor, ownership token, and completed watermark. It marks the matching running global job done, clears lease and error fields, advances the success watermark, and returns the number of rows changed.
 
-**Call relations**: Called only by `MemoryStore::mark_global_phase2_job_succeeded` as the first step of the transactional success path.
+**Call relations**: `MemoryStore::mark_global_phase2_job_succeeded` calls this before it rewrites the selected stage-1 snapshot markers.
 
 *Call graph*: called by 1 (mark_global_phase2_job_succeeded); 2 external calls (now, query).
 
@@ -2602,11 +2612,11 @@ async fn mark_global_phase2_job_succeeded_row(
 async fn clear_memory_data_in_pool(pool: &SqlitePool) -> anyhow::Result<()>
 ```
 
-**Purpose**: Deletes all stage-1 outputs and all memory-related job rows from a given memories database pool in one transaction. It is the shared implementation behind full memory-state clearing.
+**Purpose**: Deletes all memory outputs and memory-related job rows from a given memory database pool. It is the shared low-level reset helper.
 
-**Data flow**: Consumes `&SqlitePool`, begins a transaction, deletes all rows from `stage1_outputs`, deletes all `jobs` rows whose `kind` is stage 1 or global consolidation, commits, and returns `()`.
+**Data flow**: It receives a SQLite pool, opens a transaction, deletes all `stage1_outputs`, deletes stage-1 and phase-2 memory jobs, commits, and returns success or an error.
 
-**Call relations**: Used by `MemoryStore::clear_memory_data` and any other pool-level reset path.
+**Call relations**: `MemoryStore::clear_memory_data` calls this, and another SQLite-home clearing path can also call it directly.
 
 *Call graph*: called by 2 (clear_memory_data_in_sqlite_home, clear_memory_data); 2 external calls (begin, query).
 
@@ -2620,11 +2630,11 @@ fn stage1_output_from_row_and_thread(
 ) -> anyhow::Result<Stage1Output>
 ```
 
-**Purpose**: Combines a raw `stage1_outputs` row with already-loaded `ThreadMetadata` to produce a fully hydrated `Stage1Output`. It attaches thread-derived fields such as rollout path, cwd, and git branch.
+**Purpose**: Combines a memory-output database row with thread metadata into a `Stage1Output` object. This turns raw database fields into the shape used by consolidation code.
 
-**Data flow**: Reads `source_updated_at`, `generated_at`, `raw_memory`, `rollout_summary`, and `rollout_slug` from the SQLite row, converts the timestamps with `datetime_from_epoch_seconds`, and returns a `Stage1Output` populated from both the row and the supplied `ThreadMetadata`.
+**Data flow**: It receives a SQLite row and `ThreadMetadata`. It reads timestamps and memory text from the row, converts timestamp numbers into date-time values, copies workspace and branch data from the thread, and returns a `Stage1Output`.
 
-**Call relations**: Called by `MemoryStore::stage1_output_from_row_if_thread_enabled` after thread visibility has already been checked.
+**Call relations**: `MemoryStore::stage1_output_from_row_if_thread_enabled` calls this after it has confirmed the thread may be used.
 
 *Call graph*: calls 1 internal fn (datetime_from_epoch_seconds); called by 1 (stage1_output_from_row_if_thread_enabled); 1 external calls (try_get).
 
@@ -2635,11 +2645,11 @@ fn stage1_output_from_row_and_thread(
 fn datetime_from_epoch_seconds(secs: i64) -> anyhow::Result<DateTime<Utc>>
 ```
 
-**Purpose**: Converts a Unix-seconds timestamp into `DateTime<Utc>` and errors on invalid values. It centralizes timestamp validation for memory outputs.
+**Purpose**: Converts a Unix timestamp in seconds into a date-time value. It catches impossible timestamp values instead of silently accepting them.
 
-**Data flow**: Consumes `secs`, calls `DateTime::<Utc>::from_timestamp(secs, 0)`, and returns either the datetime or an `anyhow` error describing the invalid timestamp.
+**Data flow**: It receives an integer second count, asks the date-time library to convert it, and returns either the date-time or an error saying the timestamp was invalid.
 
-**Call relations**: Used by `stage1_output_from_row_and_thread` when hydrating persisted stage-1 output timestamps.
+**Call relations**: `stage1_output_from_row_and_thread` calls this for both the source update time and the generation time.
 
 *Call graph*: called by 1 (stage1_output_from_row_and_thread); 1 external calls (from_timestamp).
 
@@ -2653,11 +2663,11 @@ async fn enqueue_global_consolidation_with_executor(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Upserts the singleton global phase-2 job row using any SQLx executor, preserving running state when already running and monotonically advancing the bookkeeping watermark. It is the shared enqueue primitive for multiple write paths.
+**Purpose**: Creates or updates the singleton phase-2 job row that tells the system global memory consolidation should run. It works with either a plain pool or an active transaction.
 
-**Data flow**: Consumes an executor and `input_watermark`, executes an `INSERT ... ON CONFLICT(kind, job_key) DO UPDATE` for the global job key that sets pending defaults, preserves `running` status and retry timing when already running, raises `retry_remaining` to at least the default, and updates `input_watermark` to either the new higher watermark or `existing + 1` when the new watermark is not greater. Returns `()`.
+**Data flow**: It receives a database executor and watermark. It inserts a pending global job if missing, or updates the existing row while preserving a running job, refreshing retries, and advancing the bookkeeping watermark. It returns success or an error.
 
-**Call relations**: Called by `MemoryStore::delete_thread_memory`, `MemoryStore::enqueue_global_consolidation`, `MemoryStore::mark_stage1_job_succeeded`, and `MemoryStore::mark_stage1_job_succeeded_no_output`.
+**Call relations**: `MemoryStore::delete_thread_memory`, `MemoryStore::enqueue_global_consolidation`, `MemoryStore::mark_stage1_job_succeeded`, and `MemoryStore::mark_stage1_job_succeeded_no_output` call this whenever global memory may need to change.
 
 *Call graph*: called by 4 (delete_thread_memory, enqueue_global_consolidation, mark_stage1_job_succeeded, mark_stage1_job_succeeded_no_output); 1 external calls (query).
 
@@ -2668,11 +2678,11 @@ async fn enqueue_global_consolidation_with_executor(
 async fn clear_memory_data(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Test-only forwarding method from `StateRuntime` to `MemoryStore::clear_memory_data`. It exposes the store API through the runtime wrapper used in tests.
+**Purpose**: Test-only convenience wrapper for clearing memory data through the full runtime. It lets tests call the runtime instead of reaching into `MemoryStore` directly.
 
-**Data flow**: Reads `self.memories` and awaits `clear_memory_data()`, returning its result.
+**Data flow**: It receives the runtime, forwards the call to its `memories` store, and returns the same success or error.
 
-**Call relations**: Used only in the test module so tests can call memory APIs directly on `StateRuntime`.
+**Call relations**: This wrapper exists inside the test configuration and mirrors `MemoryStore::clear_memory_data` for test code.
 
 
 ##### `StateRuntime::record_stage1_output_usage`  (lines 1489–1491)
@@ -2681,11 +2691,11 @@ async fn clear_memory_data(&self) -> anyhow::Result<()>
 async fn record_stage1_output_usage(&self, thread_ids: &[ThreadId]) -> anyhow::Result<usize>
 ```
 
-**Purpose**: Test-only runtime wrapper for recording stage-1 output usage. It forwards directly to the memory store.
+**Purpose**: Test-only wrapper for recording usage of stage-1 outputs through `StateRuntime`.
 
-**Data flow**: Consumes a slice of `ThreadId`, calls `self.memories.record_stage1_output_usage(thread_ids)`, and returns the updated-row count.
+**Data flow**: It receives thread IDs, forwards them to the memory store, and returns the count of updated output rows.
 
-**Call relations**: Provides test access to the underlying store method.
+**Call relations**: Tests use this runtime-level shape while the real work remains in `MemoryStore::record_stage1_output_usage`.
 
 
 ##### `StateRuntime::claim_stage1_jobs_for_startup`  (lines 1493–1501)
@@ -2698,11 +2708,11 @@ async fn claim_stage1_jobs_for_startup(
     ) -> anyhow::Result<Vec<Stage1JobClaim>>
 ```
 
-**Purpose**: Test-only runtime wrapper for startup stage-1 claiming. It forwards the current thread id and claim parameters to the memory store.
+**Purpose**: Test-only wrapper for claiming startup stage-1 jobs through the full runtime.
 
-**Data flow**: Consumes `current_thread_id` and `Stage1StartupClaimParams`, delegates to `self.memories.claim_stage1_jobs_for_startup(...)`, and returns the resulting claims.
+**Data flow**: It receives the current thread ID and startup claim parameters, forwards them to `MemoryStore`, and returns the claimed jobs.
 
-**Call relations**: Used by tests that exercise startup scanning through the runtime facade.
+**Call relations**: This mirrors `MemoryStore::claim_stage1_jobs_for_startup` so tests can exercise the same public runtime style as other state operations.
 
 
 ##### `StateRuntime::list_stage1_outputs_for_global`  (lines 1503–1505)
@@ -2711,11 +2721,11 @@ async fn claim_stage1_jobs_for_startup(
 async fn list_stage1_outputs_for_global(&self, n: usize) -> anyhow::Result<Vec<Stage1Output>>
 ```
 
-**Purpose**: Test-only runtime wrapper for listing visible stage-1 outputs. It forwards to the memory store implementation.
+**Purpose**: Test-only wrapper for listing stage-1 outputs through `StateRuntime`.
 
-**Data flow**: Consumes `n`, calls `self.memories.list_stage1_outputs_for_global(n)`, and returns the vector.
+**Data flow**: It receives a maximum count, forwards it to the memory store, and returns the visible outputs.
 
-**Call relations**: Used by tests that inspect phase-2 candidate materialization.
+**Call relations**: It exposes `MemoryStore::list_stage1_outputs_for_global` to tests without changing the production API surface.
 
 
 ##### `StateRuntime::prune_stage1_outputs_for_retention`  (lines 1507–1515)
@@ -2728,11 +2738,11 @@ async fn prune_stage1_outputs_for_retention(
     ) -> anyhow::Result<usize>
 ```
 
-**Purpose**: Test-only runtime wrapper for stage-1 retention pruning. It exposes the store method through `StateRuntime`.
+**Purpose**: Test-only wrapper for pruning old stage-1 outputs.
 
-**Data flow**: Consumes `max_unused_days` and `limit`, delegates to `self.memories.prune_stage1_outputs_for_retention(...)`, and returns the deleted-row count.
+**Data flow**: It receives an age limit and batch limit, forwards them to `MemoryStore`, and returns how many rows were deleted.
 
-**Call relations**: Used by retention tests.
+**Call relations**: Tests call this wrapper to verify the retention behavior implemented in `MemoryStore::prune_stage1_outputs_for_retention`.
 
 
 ##### `StateRuntime::get_phase2_input_selection`  (lines 1517–1525)
@@ -2745,11 +2755,11 @@ async fn get_phase2_input_selection(
     ) -> anyhow::Result<Vec<Stage1Output>>
 ```
 
-**Purpose**: Test-only runtime wrapper for computing the current phase-2 input selection. It forwards to the memory store.
+**Purpose**: Test-only wrapper for loading the current phase-2 input selection.
 
-**Data flow**: Consumes `n` and `max_unused_days`, calls `self.memories.get_phase2_input_selection(...)`, and returns the selected outputs.
+**Data flow**: It receives the desired count and max-unused age, forwards them to `MemoryStore`, and returns selected `Stage1Output` records.
 
-**Call relations**: Used by tests that validate ranking and baseline-selection behavior.
+**Call relations**: It gives tests a runtime-level route into `MemoryStore::get_phase2_input_selection`.
 
 
 ##### `StateRuntime::mark_thread_memory_mode_polluted`  (lines 1527–1531)
@@ -2758,11 +2768,11 @@ async fn get_phase2_input_selection(
 async fn mark_thread_memory_mode_polluted(&self, thread_id: ThreadId) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Test-only runtime wrapper for marking a thread polluted and possibly enqueueing forgetting. It forwards to the memory store.
+**Purpose**: Test-only wrapper for marking a thread's memory mode as polluted.
 
-**Data flow**: Consumes `thread_id`, delegates to `self.memories.mark_thread_memory_mode_polluted(thread_id)`, and returns the boolean transition result.
+**Data flow**: It receives a thread ID, forwards it to the memory store, and returns whether the thread changed state.
 
-**Call relations**: Used by pollution tests.
+**Call relations**: Tests use this to verify the behavior of `MemoryStore::mark_thread_memory_mode_polluted` through the runtime.
 
 
 ##### `StateRuntime::try_claim_stage1_job`  (lines 1533–1550)
@@ -2777,11 +2787,11 @@ async fn try_claim_stage1_job(
         max_running_jobs: usize,
 ```
 
-**Purpose**: Test-only runtime wrapper for stage-1 job claiming. It exposes the store’s claim primitive through `StateRuntime`.
+**Purpose**: Test-only wrapper for trying to reserve a stage-1 job.
 
-**Data flow**: Consumes thread id, worker id, source watermark, lease seconds, and max running jobs; forwards them to `self.memories.try_claim_stage1_job(...)` and returns the claim outcome.
+**Data flow**: It receives thread, worker, timestamp, lease, and running-cap inputs, forwards them to `MemoryStore`, and returns the claim outcome.
 
-**Call relations**: Used heavily throughout the tests to drive stage-1 job state transitions.
+**Call relations**: Many tests use this to set up or check stage-1 job ownership while exercising `MemoryStore::try_claim_stage1_job`.
 
 
 ##### `StateRuntime::mark_stage1_job_succeeded`  (lines 1552–1571)
@@ -2796,11 +2806,11 @@ async fn mark_stage1_job_succeeded(
         rollout_summary: &str,
 ```
 
-**Purpose**: Test-only runtime wrapper for successful stage-1 completion with output. It forwards all completion data to the memory store.
+**Purpose**: Test-only wrapper for completing a stage-1 job that produced output.
 
-**Data flow**: Consumes thread id, ownership token, source watermark, raw memory, rollout summary, and optional rollout slug; delegates to `self.memories.mark_stage1_job_succeeded(...)` and returns the success boolean.
+**Data flow**: It receives the same completion details as the memory store method, forwards them, and returns whether finalization matched the owned job.
 
-**Call relations**: Used by tests after successful stage-1 claims.
+**Call relations**: Tests use this wrapper after `StateRuntime::try_claim_stage1_job` to verify success paths.
 
 
 ##### `StateRuntime::mark_stage1_job_succeeded_no_output`  (lines 1573–1581)
@@ -2813,11 +2823,11 @@ async fn mark_stage1_job_succeeded_no_output(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Test-only runtime wrapper for successful stage-1 completion without output. It forwards to the memory store.
+**Purpose**: Test-only wrapper for completing a stage-1 job that produced no saved memory.
 
-**Data flow**: Consumes thread id and ownership token, calls `self.memories.mark_stage1_job_succeeded_no_output(...)`, and returns the boolean result.
+**Data flow**: It receives a thread ID and ownership token, forwards them to the memory store, and returns whether the job was finalized.
 
-**Call relations**: Used by tests covering deletion/no-output semantics.
+**Call relations**: Tests call this to exercise `MemoryStore::mark_stage1_job_succeeded_no_output` through the runtime.
 
 
 ##### `StateRuntime::mark_stage1_job_failed`  (lines 1583–1598)
@@ -2832,11 +2842,11 @@ async fn mark_stage1_job_failed(
     ) -> anyhow::Result<bool
 ```
 
-**Purpose**: Test-only runtime wrapper for stage-1 failure finalization. It forwards failure details to the memory store.
+**Purpose**: Test-only wrapper for recording a failed stage-1 job.
 
-**Data flow**: Consumes thread id, ownership token, failure reason, and retry delay; delegates to `self.memories.mark_stage1_job_failed(...)` and returns whether the row matched.
+**Data flow**: It receives a thread ID, ownership token, failure reason, and retry delay, forwards them to the memory store, and returns whether a running owned job was updated.
 
-**Call relations**: Used by retry/backoff tests.
+**Call relations**: Tests use this to drive retry and exhaustion scenarios implemented by `MemoryStore::mark_stage1_job_failed`.
 
 
 ##### `StateRuntime::enqueue_global_consolidation`  (lines 1600–1604)
@@ -2845,11 +2855,11 @@ async fn mark_stage1_job_failed(
 async fn enqueue_global_consolidation(&self, input_watermark: i64) -> anyhow::Result<()>
 ```
 
-**Purpose**: Test-only runtime wrapper for enqueueing the singleton phase-2 job. It forwards to the memory store helper.
+**Purpose**: Test-only wrapper for scheduling global consolidation.
 
-**Data flow**: Consumes `input_watermark`, calls `self.memories.enqueue_global_consolidation(input_watermark)`, and returns `()`.
+**Data flow**: It receives a watermark, forwards it to the memory store, and returns success or an error.
 
-**Call relations**: Used by tests that seed or advance phase-2 work.
+**Call relations**: Tests use this wrapper to create or advance the singleton phase-2 job via `MemoryStore::enqueue_global_consolidation`.
 
 
 ##### `StateRuntime::try_claim_global_phase2_job`  (lines 1606–1614)
@@ -2862,11 +2872,11 @@ async fn try_claim_global_phase2_job(
     ) -> anyhow::Result<Phase2JobClaimOutcome>
 ```
 
-**Purpose**: Test-only runtime wrapper for claiming the singleton phase-2 lock. It forwards to the memory store implementation.
+**Purpose**: Test-only wrapper for trying to reserve the global phase-2 job.
 
-**Data flow**: Consumes `worker_id` and `lease_seconds`, delegates to `self.memories.try_claim_global_phase2_job(...)`, and returns the claim outcome.
+**Data flow**: It receives a worker ID and lease length, forwards them to the memory store, and returns the phase-2 claim outcome.
 
-**Call relations**: Used by many tests to drive phase-2 lock behavior.
+**Call relations**: Tests use it before calling the phase-2 success or failure wrappers.
 
 
 ##### `StateRuntime::mark_global_phase2_job_succeeded`  (lines 1616–1629)
@@ -2880,11 +2890,11 @@ async fn mark_global_phase2_job_succeeded(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Test-only runtime wrapper for successful phase-2 completion and baseline rewrite. It forwards to the memory store.
+**Purpose**: Test-only wrapper for finishing the global consolidation job successfully.
 
-**Data flow**: Consumes `ownership_token`, `completed_watermark`, and selected outputs, delegates to `self.memories.mark_global_phase2_job_succeeded(...)`, and returns the boolean result.
+**Data flow**: It receives an ownership token, completed watermark, and selected outputs, forwards them to the memory store, and returns whether finalization succeeded.
 
-**Call relations**: Used by tests that validate baseline selection persistence.
+**Call relations**: Tests use this to verify both job completion and selected snapshot bookkeeping in `MemoryStore::mark_global_phase2_job_succeeded`.
 
 
 ##### `StateRuntime::mark_global_phase2_job_failed`  (lines 1631–1640)
@@ -2898,11 +2908,11 @@ async fn mark_global_phase2_job_failed(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Test-only runtime wrapper for strict-ownership phase-2 failure finalization. It forwards to the memory store.
+**Purpose**: Test-only wrapper for marking global consolidation failed with strict ownership.
 
-**Data flow**: Consumes `ownership_token`, `failure_reason`, and `retry_delay_seconds`, delegates to `self.memories.mark_global_phase2_job_failed(...)`, and returns the boolean result.
+**Data flow**: It receives an ownership token, reason, and retry delay, forwards them to the memory store, and returns whether the owned running job was updated.
 
-**Call relations**: Used by phase-2 retry tests.
+**Call relations**: Tests use it to verify retry behavior implemented by `MemoryStore::mark_global_phase2_job_failed`.
 
 
 ##### `StateRuntime::mark_global_phase2_job_failed_if_unowned`  (lines 1642–1655)
@@ -2916,11 +2926,11 @@ async fn mark_global_phase2_job_failed_if_unowned(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Test-only runtime wrapper for fallback phase-2 failure finalization when ownership may be missing. It forwards to the memory store.
+**Purpose**: Test-only wrapper for the fallback failure path that can recover an unowned running phase-2 job.
 
-**Data flow**: Consumes `ownership_token`, `failure_reason`, and `retry_delay_seconds`, delegates to `self.memories.mark_global_phase2_job_failed_if_unowned(...)`, and returns the boolean result.
+**Data flow**: It receives an ownership token, reason, and retry delay, forwards them to the memory store, and returns whether the fallback update worked.
 
-**Call relations**: Used by tests covering recovery from unowned running phase-2 rows.
+**Call relations**: Tests use this to exercise `MemoryStore::mark_global_phase2_job_failed_if_unowned`.
 
 
 ##### `tests::stable_thread_id`  (lines 1678–1680)
@@ -2929,11 +2939,11 @@ async fn mark_global_phase2_job_failed_if_unowned(
 fn stable_thread_id(value: &str) -> ThreadId
 ```
 
-**Purpose**: Parses a fixed string into a deterministic `ThreadId` for tests that need stable ordering assertions. It avoids random UUIDs where exact ids matter.
+**Purpose**: Creates a predictable thread ID from a string for tests. Stable IDs make ordering assertions easier to read and repeat.
 
-**Data flow**: Consumes a string slice, calls `ThreadId::from_string`, and returns the parsed id.
+**Data flow**: It receives a string, parses it as a `ThreadId`, and returns the ID or fails the test if parsing is invalid.
 
-**Call relations**: Used by selection-ranking tests that compare exact thread-id order.
+**Call relations**: Several selection-ranking tests call this helper when they need deterministic thread ID order.
 
 *Call graph*: calls 1 internal fn (from_string).
 
@@ -2944,11 +2954,11 @@ fn stable_thread_id(value: &str) -> ThreadId
 fn memory_pool(runtime: &StateRuntime) -> &sqlx::SqlitePool
 ```
 
-**Purpose**: Returns a direct reference to the memories database pool inside a runtime. It lets tests inspect or mutate memory tables with raw SQL.
+**Purpose**: Gives tests direct access to the memory database pool. This is used for setup and assertions that inspect raw rows.
 
-**Data flow**: Reads `runtime.memories().pool.as_ref()` and returns `&SqlitePool`.
+**Data flow**: It receives a runtime, reads its memory store, and returns a reference to the memory SQLite pool.
 
-**Call relations**: Used by many tests for direct SQL assertions and setup.
+**Call relations**: Test helpers and test cases call this when they need direct SQL checks alongside runtime-level operations.
 
 *Call graph*: calls 1 internal fn (memories).
 
@@ -2959,11 +2969,11 @@ fn memory_pool(runtime: &StateRuntime) -> &sqlx::SqlitePool
 async fn age_phase2_success_beyond_cooldown(runtime: &StateRuntime)
 ```
 
-**Purpose**: Artificially ages the global phase-2 job’s `finished_at` timestamp so cooldown-based claim blocking no longer applies. It is a reusable test helper.
+**Purpose**: Moves the recorded phase-2 success time far enough into the past that the cooldown no longer blocks claims. It is a test helper for repeated consolidation runs.
 
-**Data flow**: Computes `Utc::now().timestamp() - PHASE2_SUCCESS_COOLDOWN_SECONDS - 1`, updates the global job row’s `finished_at` through raw SQL on `memory_pool(runtime)`, and returns `()`.
+**Data flow**: It receives a runtime, computes an old timestamp, and updates the global phase-2 job row in the memory database.
 
-**Call relations**: Used by multiple phase-2 tests that need to bypass the success cooldown after a prior successful run.
+**Call relations**: Cooldown-related tests call this helper before attempting another global phase-2 claim.
 
 *Call graph*: 3 external calls (now, query, memory_pool).
 
@@ -2974,11 +2984,11 @@ async fn age_phase2_success_beyond_cooldown(runtime: &StateRuntime)
 async fn stage1_claim_skips_when_up_to_date()
 ```
 
-**Purpose**: Verifies that once a stage-1 job has succeeded for a given source watermark, later claims at the same watermark are skipped as up to date, while a newer watermark is claimable. This covers both output and job-watermark freshness checks.
+**Purpose**: Checks that stage-1 extraction is not claimed again when saved memory already matches the thread's source timestamp.
 
-**Data flow**: Creates a runtime and thread, claims and completes stage 1 at watermark 100, then attempts another claim at 100 and asserts `SkippedUpToDate`, followed by a claim at 101 and asserts it is claimable.
+**Data flow**: The test creates a runtime and thread, claims and completes a stage-1 job, then tries claims at the same and newer timestamps. It expects the same timestamp to skip and the newer one to claim.
 
-**Call relations**: This test exercises `try_claim_stage1_job` together with `mark_stage1_job_succeeded`.
+**Call relations**: It exercises the claim and success flow around `try_claim_stage1_job` and `mark_stage1_job_succeeded`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -2989,11 +2999,11 @@ async fn stage1_claim_skips_when_up_to_date()
 async fn stage1_running_stale_can_be_stolen_but_fresh_running_is_skipped()
 ```
 
-**Purpose**: Checks lease semantics for stage-1 jobs: a fresh running lease blocks takeover, but an expired lease allows another worker to claim the job. It validates stale-runner recovery.
+**Purpose**: Verifies that an active stage-1 lease blocks another worker, but an expired lease can be taken over.
 
-**Data flow**: Claims a stage-1 job as owner A, attempts a fresh claim as owner B and expects `SkippedRunning`, manually sets `lease_until = 0`, then retries as owner B and expects a successful claim.
+**Data flow**: The test claims a job, confirms a second fresh claim is skipped, manually expires the lease in SQL, and confirms the second worker can then claim it.
 
-**Call relations**: This targets the stale-lease branch in `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It focuses on the lease checks inside `try_claim_stage1_job`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, query, memory_pool, remove_dir_all).
 
@@ -3004,11 +3014,11 @@ async fn stage1_running_stale_can_be_stolen_but_fresh_running_is_skipped()
 async fn stage1_concurrent_claim_for_same_thread_is_conflict_safe()
 ```
 
-**Purpose**: Verifies that concurrent claims for the same thread result in exactly one winner and one non-winning outcome, even under SQLite lock contention. It also retries transient `database is locked` errors in the test harness.
+**Purpose**: Makes sure two simultaneous workers cannot both claim the same stage-1 job.
 
-**Data flow**: Creates one thread, clones the runtime, launches two concurrent claim attempts with small retry loops, collects both outcomes, and asserts exactly one is `Claimed` and the other is either `SkippedRunning` or the winner.
+**Data flow**: The test starts two claim attempts for one thread at the same time and counts the outcomes. Exactly one should claim, while the other should see the job as running.
 
-**Call relations**: This test stresses the `BEGIN IMMEDIATE` and conflict-safe SQL in `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It stress-tests the transaction behavior of `try_claim_stage1_job`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (clone, new_v4, assert!, assert_eq!, remove_dir_all, join!, vec!).
 
@@ -3019,11 +3029,11 @@ async fn stage1_concurrent_claim_for_same_thread_is_conflict_safe()
 async fn stage1_concurrent_claims_respect_running_cap()
 ```
 
-**Purpose**: Checks that concurrent claims for different threads still respect the global `max_running_jobs` cap. Only one claim should succeed when the cap is one.
+**Purpose**: Checks that the global limit on running stage-1 jobs is respected even under concurrent claims for different threads.
 
-**Data flow**: Creates two threads, launches two concurrent claims with `max_running_jobs = 1`, and asserts exactly one outcome is `Claimed` while the other is throttled as `SkippedRunning`.
+**Data flow**: The test creates two threads and tries to claim both with a running cap of one. It expects one claim to succeed and one to be throttled.
 
-**Call relations**: This validates the global running-count guard embedded in `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It verifies the running-job cap enforced by `try_claim_stage1_job`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (clone, new_v4, assert!, assert_eq!, remove_dir_all, join!, vec!).
 
@@ -3034,11 +3044,11 @@ async fn stage1_concurrent_claims_respect_running_cap()
 async fn claim_stage1_jobs_filters_by_age_idle_and_current_thread()
 ```
 
-**Purpose**: Verifies startup scanning filters out the current thread, too-fresh threads, not-yet-idle threads, and too-old threads, leaving only eligible idle threads. It confirms the state-DB query predicates.
+**Purpose**: Checks that startup claiming only selects threads in the intended age and idle window, and never selects the current thread.
 
-**Data flow**: Seeds several threads with different `updated_at` ages, calls `claim_stage1_jobs_for_startup` with age and idle thresholds, and asserts only the eligible idle thread is claimed.
+**Data flow**: The test creates current, too-fresh, barely-not-idle, eligible, and too-old threads, then runs startup claiming. Only the eligible idle thread should be returned.
 
-**Call relations**: This test targets the thread-selection query built by `MemoryStore::claim_stage1_jobs_for_startup`.
+**Call relations**: It exercises filtering in `claim_stage1_jobs_for_startup`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 8 external calls (days, hours, minutes, now, new_v4, assert_eq!, remove_dir_all, vec!).
 
@@ -3049,11 +3059,11 @@ async fn claim_stage1_jobs_filters_by_age_idle_and_current_thread()
 async fn claim_stage1_jobs_bounds_state_scan_before_memory_probes()
 ```
 
-**Purpose**: Checks that `scan_limit` bounds how many state rows are considered before memory staleness checks and claims. A stale candidate beyond the scan window should not be reached.
+**Purpose**: Verifies that startup claiming respects the scan limit before checking memory staleness. This prevents expensive unbounded probing.
 
-**Data flow**: Seeds one up-to-date eligible thread and one stale eligible thread, first calls startup claiming with `scan_limit = 1` and asserts no claims, then with `scan_limit = 2` and asserts the stale thread is claimed.
+**Data flow**: The test seeds one newer up-to-date thread and one older stale thread. With a scan limit of one no job is claimed; with two, the stale thread is reached and claimed.
 
-**Call relations**: This validates the separation between state-DB scan bounding and memory-DB probing in `MemoryStore::claim_stage1_jobs_for_startup`.
+**Call relations**: It tests how `claim_stage1_jobs_for_startup` combines state-database scanning with `stage1_source_needs_update`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 8 external calls (hours, now, new_v4, assert!, assert_eq!, panic!, remove_dir_all, vec!).
 
@@ -3064,11 +3074,11 @@ async fn claim_stage1_jobs_bounds_state_scan_before_memory_probes()
 async fn claim_stage1_jobs_skips_threads_with_disabled_memory_mode()
 ```
 
-**Purpose**: Verifies that startup stage-1 scanning ignores threads whose `memory_mode` is `disabled`. Only enabled threads should be considered claimable.
+**Purpose**: Checks that startup claiming ignores threads whose memory mode is disabled.
 
-**Data flow**: Seeds current, disabled, and enabled threads, manually updates one thread to `memory_mode = 'disabled'`, runs startup claiming, and asserts only the enabled thread is returned.
+**Data flow**: The test creates one disabled and one enabled eligible thread, runs startup claiming, and expects only the enabled thread to be claimed.
 
-**Call relations**: This covers the `threads.memory_mode = 'enabled'` predicate in the startup scan query.
+**Call relations**: It verifies the memory-mode filter in `claim_stage1_jobs_for_startup`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (hours, now, new_v4, assert_eq!, query, remove_dir_all, vec!).
 
@@ -3079,11 +3089,11 @@ async fn claim_stage1_jobs_skips_threads_with_disabled_memory_mode()
 async fn clear_memory_data_clears_rows_and_preserves_thread_memory_modes()
 ```
 
-**Purpose**: Checks that clearing memory data removes stage-1 outputs and memory jobs without altering thread rows’ `memory_mode` values in the main state database. It distinguishes memory-state reset from thread-state reset.
+**Purpose**: Ensures clearing generated memory does not change each thread's memory-mode setting.
 
-**Data flow**: Seeds enabled and disabled threads, creates stage-1 output and phase-2 job state, calls `clear_memory_data`, then counts memory rows and reads thread `memory_mode` values to assert memory tables are empty while thread modes remain unchanged.
+**Data flow**: The test creates memory output and a global job, disables another thread, clears memory data, then checks memory tables are empty while thread modes remain enabled or disabled as before.
 
-**Call relations**: This test validates `MemoryStore::clear_memory_data` and the separation between memories DB and state DB.
+**Call relations**: It covers `clear_memory_data` and the lower-level deletion helper.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 10 external calls (hours, now, new_v4, assert!, assert_eq!, panic!, query, query_scalar, memory_pool, remove_dir_all).
 
@@ -3094,11 +3104,11 @@ async fn clear_memory_data_clears_rows_and_preserves_thread_memory_modes()
 async fn claim_stage1_jobs_enforces_global_running_cap()
 ```
 
-**Purpose**: Verifies that startup claiming respects the global stage-1 running cap even when many eligible threads exist and some jobs are already running. It should fill only the remaining capacity.
+**Purpose**: Checks that startup claiming stops when the total running stage-1 job cap is reached.
 
-**Data flow**: Seeds many eligible threads plus ten pre-existing running stage-1 jobs, runs startup claiming with `max_claimed = 64`, asserts exactly 54 new claims, then counts running jobs and confirms the total is 64 and subsequent claims return none.
+**Data flow**: The test seeds existing running jobs, creates many eligible threads, runs startup claiming, and verifies the number of new claims brings the total up to but not beyond the cap.
 
-**Call relations**: This exercises the interaction between startup scanning and the running-count guard in `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It verifies the interaction between `claim_stage1_jobs_for_startup` and `try_claim_stage1_job`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 10 external calls (hours, seconds, now, new_v4, assert_eq!, format!, query, memory_pool, remove_dir_all, vec!).
 
@@ -3109,11 +3119,11 @@ async fn claim_stage1_jobs_enforces_global_running_cap()
 async fn claim_stage1_jobs_processes_two_full_batches_across_startup_passes()
 ```
 
-**Purpose**: Checks that repeated startup passes can process multiple full batches of eligible threads. Completing the first batch should free capacity for the second.
+**Purpose**: Checks that startup claiming can process multiple batches over repeated passes.
 
-**Data flow**: Seeds 200 eligible threads, claims 64 on the first startup pass, marks each claimed job succeeded, then runs a second startup pass and asserts another 64 claims are returned.
+**Data flow**: The test creates many eligible threads, claims a full batch, marks that batch successful, then claims a second full batch.
 
-**Call relations**: This validates the intended batching behavior of `MemoryStore::claim_stage1_jobs_for_startup` across repeated runs.
+**Call relations**: It verifies that completed jobs become up-to-date and later startup passes move on to remaining work.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 9 external calls (hours, seconds, now, new_v4, assert!, assert_eq!, format!, remove_dir_all, vec!).
 
@@ -3124,11 +3134,11 @@ async fn claim_stage1_jobs_processes_two_full_batches_across_startup_passes()
 async fn delete_thread_removes_stage1_output_and_enqueues_phase2_when_selected()
 ```
 
-**Purpose**: Verifies that deleting a thread removes its stage-1 output and, if that output was part of the selected phase-2 baseline, re-enqueues the global phase-2 job. This ensures forgetting happens after thread deletion.
+**Purpose**: Ensures deleting a thread removes its memory output and schedules global consolidation if that output had been part of the global baseline.
 
-**Data flow**: Creates a thread and stage-1 output, runs a successful phase-2 selection that marks the output selected, deletes the thread, then asserts the output row is gone and the global phase-2 job is pending with an advanced input watermark.
+**Data flow**: The test creates and selects a stage-1 output, deletes the thread, then checks the output is gone and the global phase-2 job is pending.
 
-**Call relations**: This test covers the integration between thread deletion and `MemoryStore::delete_thread_memory`.
+**Call relations**: It exercises `delete_thread_memory` through the broader thread deletion path and verifies enqueue behavior.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 8 external calls (now, new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3139,11 +3149,11 @@ async fn delete_thread_removes_stage1_output_and_enqueues_phase2_when_selected()
 async fn mark_stage1_job_succeeded_no_output_skips_phase2_when_output_was_already_absent()
 ```
 
-**Purpose**: Checks that a no-output stage-1 success does not enqueue phase 2 when there was no existing stage-1 output to delete. It still marks the source watermark as up to date.
+**Purpose**: Checks that a no-output stage-1 success does not schedule global consolidation when there was no previous output to remove.
 
-**Data flow**: Claims a stage-1 job for a thread with no prior output, finalizes it with `mark_stage1_job_succeeded_no_output`, asserts no `stage1_outputs` row exists, verifies a same-watermark claim is skipped as up to date, and confirms no global phase-2 job row was created.
+**Data flow**: The test claims a job, completes it with no output, verifies no output row exists, confirms the same source is up-to-date, and checks no phase-2 job was created.
 
-**Call relations**: This targets the conditional enqueue behavior in `MemoryStore::mark_stage1_job_succeeded_no_output`.
+**Call relations**: It verifies the no-change branch of `mark_stage1_job_succeeded_no_output`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3154,11 +3164,11 @@ async fn mark_stage1_job_succeeded_no_output_skips_phase2_when_output_was_alread
 async fn mark_stage1_job_succeeded_no_output_enqueues_phase2_when_deleting_output()
 ```
 
-**Purpose**: Verifies the opposite no-output case: when a prior stage-1 output exists, a later no-output success deletes it and enqueues phase 2 so the baseline can forget it. The new phase-2 watermark should reflect the newer source.
+**Purpose**: Checks that a no-output stage-1 success schedules global consolidation when it deletes an existing output.
 
-**Data flow**: Creates an initial stage-1 output and successful phase-2 baseline, then claims stage 1 again at a newer watermark and finalizes with no output, asserts the output row is deleted, ages cooldown, claims phase 2 again, and checks the new input watermark equals the newer source watermark.
+**Data flow**: The test first saves output, completes phase 2, then reruns stage 1 at a newer timestamp with no output. It expects the old output to be deleted and phase 2 to become claimable with the newer watermark.
 
-**Call relations**: This exercises deletion-triggered enqueueing in `MemoryStore::mark_stage1_job_succeeded_no_output` plus later phase-2 claiming.
+**Call relations**: It verifies the deletion-and-enqueue branch of `mark_stage1_job_succeeded_no_output`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 8 external calls (new_v4, assert!, assert_eq!, panic!, query, age_phase2_success_beyond_cooldown, memory_pool, remove_dir_all).
 
@@ -3169,11 +3179,11 @@ async fn mark_stage1_job_succeeded_no_output_enqueues_phase2_when_deleting_outpu
 async fn stage1_retry_exhaustion_does_not_block_newer_watermark()
 ```
 
-**Purpose**: Checks that exhausting stage-1 retries for one source watermark blocks further claims at that watermark but does not block a newer source watermark, which resets retry budget. This is key to forward progress after source changes.
+**Purpose**: Ensures a stage-1 job that exhausted retries for one source version can still run when the thread changes.
 
-**Data flow**: Claims and fails the same stage-1 job three times at watermark 100, asserts a fourth claim at 100 yields `SkippedRetryExhausted`, then claims at 101 and asserts success plus reset `retry_remaining = 3` and updated `input_watermark` in the job row.
+**Data flow**: The test repeatedly claims and fails the same timestamp until retries are exhausted, confirms that timestamp is skipped, then claims a newer timestamp and verifies retries reset.
 
-**Call relations**: This validates the retry-reset-on-newer-watermark logic in `MemoryStore::try_claim_stage1_job`.
+**Call relations**: It exercises retry fields written by `mark_stage1_job_failed` and read by `try_claim_stage1_job`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3184,11 +3194,11 @@ async fn stage1_retry_exhaustion_does_not_block_newer_watermark()
 async fn phase2_global_lock_respects_success_cooldown()
 ```
 
-**Purpose**: Verifies that after a successful phase-2 run, subsequent claims are blocked during the success cooldown even if new enqueue events occur. Claims become possible again only after the cooldown ages out.
+**Purpose**: Checks that a recent successful global consolidation blocks another run for the cooldown period.
 
-**Data flow**: Enqueues phase 2, claims and completes it successfully, attempts another claim and expects `SkippedCooldown`, enqueues again and still expects cooldown blocking, then ages `finished_at` beyond cooldown and asserts a new claim succeeds.
+**Data flow**: The test enqueues, claims, and succeeds phase 2, then confirms another claim is skipped during cooldown even after enqueueing more work. After aging the success time, a claim succeeds.
 
-**Call relations**: This targets the cooldown branch in `MemoryStore::try_claim_global_phase2_job`.
+**Call relations**: It verifies cooldown logic in `try_claim_global_phase2_job` and uses `age_phase2_success_beyond_cooldown`.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, age_phase2_success_beyond_cooldown, remove_dir_all).
 
@@ -3199,11 +3209,11 @@ async fn phase2_global_lock_respects_success_cooldown()
 async fn phase2_global_lock_can_be_claimed_after_retry_budget_is_exhausted()
 ```
 
-**Purpose**: Checks that phase-2 retry exhaustion does not permanently block future claims. The lock can still be claimed later because actual work detection happens outside the DB row.
+**Purpose**: Checks that phase-2 retry exhaustion does not permanently block claiming the global lock.
 
-**Data flow**: Enqueues phase 2, claims and fails it three times to drive `retry_remaining` to zero, verifies that value in SQL, then attempts another claim and asserts it still succeeds.
+**Data flow**: The test fails phase 2 enough times to reduce retries to zero, confirms the stored count, then claims again successfully.
 
-**Call relations**: This validates the intentionally different semantics of phase-2 claiming versus stage-1 retry exhaustion.
+**Call relations**: It verifies that `try_claim_global_phase2_job` treats phase 2 as a lock and does not use retry exhaustion as a hard stop.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3214,11 +3224,11 @@ async fn phase2_global_lock_can_be_claimed_after_retry_budget_is_exhausted()
 async fn list_stage1_outputs_for_global_returns_latest_outputs()
 ```
 
-**Purpose**: Verifies that listing stage-1 outputs for global consolidation returns newest outputs first and hydrates thread-derived fields like `cwd` and `git_branch`. It also checks rollout slug persistence.
+**Purpose**: Checks that global listing returns non-empty outputs in newest order with thread metadata attached.
 
-**Data flow**: Creates two threads, writes stage-1 outputs at different source watermarks, then calls `list_stage1_outputs_for_global(10)` and asserts ordering, summaries, rollout slugs, cwd paths, and git branches.
+**Data flow**: The test creates two threads and outputs with different timestamps, then lists outputs and checks order, summaries, rollout slug, working directory, and git branch.
 
-**Call relations**: This test exercises `MemoryStore::list_stage1_outputs_for_global` and `stage1_output_from_row_if_thread_enabled`.
+**Call relations**: It exercises `list_stage1_outputs_for_global` and row-to-output conversion.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -3229,11 +3239,11 @@ async fn list_stage1_outputs_for_global_returns_latest_outputs()
 async fn list_stage1_outputs_for_global_skips_empty_payloads()
 ```
 
-**Purpose**: Checks that stage-1 outputs with both blank `raw_memory` and blank `rollout_summary` are excluded from global listing. Only non-empty payloads should be visible.
+**Purpose**: Checks that outputs with no memory text and no summary are not listed for global consolidation.
 
-**Data flow**: Inserts one non-empty and one empty `stage1_outputs` row directly, calls `list_stage1_outputs_for_global(1)`, and asserts only the non-empty output is returned.
+**Data flow**: The test inserts one non-empty row and one empty row directly, lists only one output, and verifies it is the non-empty one.
 
-**Call relations**: This validates the non-empty payload predicate in `MemoryStore::list_stage1_outputs_for_global`.
+**Call relations**: It verifies the non-empty filter in `list_stage1_outputs_for_global`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert_eq!, query, memory_pool, remove_dir_all).
 
@@ -3244,11 +3254,11 @@ async fn list_stage1_outputs_for_global_skips_empty_payloads()
 async fn list_stage1_outputs_for_global_skips_polluted_threads()
 ```
 
-**Purpose**: Verifies that outputs belonging to polluted threads are hidden from global listing even if the stage-1 rows still exist. Visibility depends on current thread metadata.
+**Purpose**: Checks that outputs from polluted threads are hidden from global consolidation.
 
-**Data flow**: Creates two threads and outputs, marks one thread polluted in the state DB, calls `list_stage1_outputs_for_global`, and asserts only the enabled thread’s output remains visible.
+**Data flow**: The test creates outputs for two threads, marks one polluted, then lists global outputs and expects only the still-enabled thread.
 
-**Call relations**: This covers the enabled-thread filtering performed by `MemoryStore::enabled_thread_metadata`.
+**Call relations**: It verifies the enabled-thread check used by `list_stage1_outputs_for_global`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -3259,11 +3269,11 @@ async fn list_stage1_outputs_for_global_skips_polluted_threads()
 async fn get_phase2_input_selection_returns_current_selected_rows()
 ```
 
-**Purpose**: Checks that phase-2 input selection combines current ranking with the previous successful baseline markers, returning the top current rows among visible outputs. It also verifies rollout-path hydration.
+**Purpose**: Checks the current phase-2 input selection behavior with multiple outputs.
 
-**Data flow**: Creates three threads and outputs, runs a successful phase-2 selection marking two outputs selected, then calls `get_phase2_input_selection(2, large_window)` and asserts the returned thread ids and rollout path values.
+**Data flow**: The test creates three outputs, records a phase-2 success with a selected subset, then asks for a two-row selection and checks the returned thread order and metadata.
 
-**Call relations**: This exercises `MemoryStore::get_phase2_input_selection` after a prior successful baseline rewrite.
+**Call relations**: It exercises `get_phase2_input_selection` and phase-2 success selection bookkeeping.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, stable_thread_id, remove_dir_all).
 
@@ -3274,11 +3284,11 @@ async fn get_phase2_input_selection_returns_current_selected_rows()
 async fn get_phase2_input_selection_excludes_polluted_previous_selection()
 ```
 
-**Purpose**: Verifies that previously selected outputs are excluded from current phase-2 input selection once their threads become polluted. Baseline markers alone do not override visibility rules.
+**Purpose**: Ensures phase-2 input selection excludes a thread that later becomes polluted, even if it was previously selected.
 
-**Data flow**: Creates two outputs, marks both selected via a successful phase-2 run, then marks one thread polluted and calls `get_phase2_input_selection`, asserting only the enabled thread remains.
+**Data flow**: The test creates and selects two outputs, marks one thread polluted, then asks for selection and expects only the enabled thread.
 
-**Call relations**: This covers the interaction between baseline markers and `enabled_thread_metadata` filtering.
+**Call relations**: It verifies `get_phase2_input_selection` checks live thread memory mode through `enabled_thread_metadata`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -3289,11 +3299,11 @@ async fn get_phase2_input_selection_excludes_polluted_previous_selection()
 async fn mark_thread_memory_mode_polluted_enqueues_phase2_for_selected_threads()
 ```
 
-**Purpose**: Checks that marking a selected thread polluted both changes its memory mode and causes phase 2 to become claimable again after cooldown. This is the forgetting trigger for selected baseline members.
+**Purpose**: Checks that marking a selected thread polluted schedules phase 2 so global memory can forget it.
 
-**Data flow**: Creates a thread and output, marks it selected through a successful phase-2 run, calls `mark_thread_memory_mode_polluted`, ages cooldown, then asserts a new phase-2 claim succeeds.
+**Data flow**: The test creates an output, selects it in phase 2, marks the thread polluted, ages the cooldown, and confirms phase 2 can be claimed again.
 
-**Call relations**: This validates the enqueue-on-selected behavior in `MemoryStore::mark_thread_memory_mode_polluted`.
+**Call relations**: It tests `mark_thread_memory_mode_polluted` and its call to enqueue global consolidation.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, panic!, age_phase2_success_beyond_cooldown, remove_dir_all).
 
@@ -3304,11 +3314,11 @@ async fn mark_thread_memory_mode_polluted_enqueues_phase2_for_selected_threads()
 async fn mark_thread_memory_mode_polluted_enqueues_phase2_when_already_polluted()
 ```
 
-**Purpose**: Verifies that even if the thread is already marked polluted, calling the pollution API still enqueues phase 2 when the thread had been selected, though the boolean return reports no state transition. Enqueueing and state-change reporting are intentionally separate.
+**Purpose**: Checks that even an already polluted selected thread can still trigger phase-2 forgetting work.
 
-**Data flow**: Creates a selected output, manually sets the thread to polluted, calls `mark_thread_memory_mode_polluted` and asserts it returns `false`, ages cooldown, then confirms phase 2 can be claimed again.
+**Data flow**: The test selects an output, manually marks the thread polluted, calls the polluted-marker method again, and confirms phase 2 is claimable after cooldown.
 
-**Call relations**: This covers the subtle case where enqueueing depends on selection membership, not on whether the thread row changed.
+**Call relations**: It verifies the enqueue side effect of `mark_thread_memory_mode_polluted` separately from whether the thread mode changed.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, panic!, query, age_phase2_success_beyond_cooldown, remove_dir_all).
 
@@ -3319,11 +3329,11 @@ async fn mark_thread_memory_mode_polluted_enqueues_phase2_when_already_polluted(
 async fn get_phase2_input_selection_returns_regenerated_selected_rows()
 ```
 
-**Purpose**: Checks that when a previously selected thread regenerates a newer stage-1 output, current phase-2 input selection returns the regenerated snapshot rather than the old selected snapshot. The old selected snapshot timestamp remains recorded until phase 2 rewrites it.
+**Purpose**: Checks that if a previously selected thread is regenerated, current phase-2 input uses the newer output.
 
-**Data flow**: Creates an initial output, marks it selected via phase 2, regenerates the thread’s stage-1 output at a newer watermark, calls `get_phase2_input_selection(1, large_window)`, and asserts the returned output uses the newer source watermark while SQL still shows `selected_for_phase2_source_updated_at` pointing to the older selected snapshot.
+**Data flow**: The test saves an output, selects it, regenerates the thread at a newer timestamp, then asks for phase-2 input and expects the newer timestamp while the old selection marker remains recorded.
 
-**Call relations**: This validates the distinction between current visible output rows and the persisted previous-baseline snapshot markers.
+**Call relations**: It tests how `mark_stage1_job_succeeded` and `get_phase2_input_selection` behave after regeneration.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, memory_pool, remove_dir_all).
 
@@ -3334,11 +3344,11 @@ async fn get_phase2_input_selection_returns_regenerated_selected_rows()
 async fn get_phase2_input_selection_uses_current_ranking_after_refreshes()
 ```
 
-**Purpose**: Verifies that current phase-2 selection ranking is based on current outputs and recency, not frozen previous selections. Refreshing some threads should reorder the top-N set accordingly.
+**Purpose**: Checks that phase-2 selection ranking is based on current outputs, not only the previous phase-2 baseline.
 
-**Data flow**: Creates four outputs, marks the initial top two selected via phase 2, refreshes three threads with newer stage-1 outputs, then calls `get_phase2_input_selection(2, large_window)` and asserts the returned thread ids are the newly highest-ranked current outputs.
+**Data flow**: The test creates four outputs, selects the top two, refreshes three outputs with newer timestamps, then asks for two selections and expects the newest current candidates.
 
-**Call relations**: This exercises the ranking logic in `MemoryStore::get_phase2_input_selection` after baseline drift.
+**Call relations**: It verifies ranking logic in `get_phase2_input_selection` after stage-1 refreshes.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, stable_thread_id, remove_dir_all).
 
@@ -3349,11 +3359,11 @@ async fn get_phase2_input_selection_uses_current_ranking_after_refreshes()
 async fn mark_global_phase2_job_succeeded_updates_selected_snapshot_timestamp()
 ```
 
-**Purpose**: Checks that a later successful phase-2 run updates `selected_for_phase2_source_updated_at` to the newly selected snapshot timestamp for a thread. The baseline marker should track the exact selected snapshot, not just the thread id.
+**Purpose**: Checks that phase-2 success records the exact source timestamp of selected snapshots.
 
-**Data flow**: Creates an initial output and successful phase-2 selection, refreshes the thread with a newer output, ages cooldown, runs phase 2 again selecting the refreshed output, then reads SQL and asserts `selected_for_phase2_source_updated_at` now equals the newer source watermark.
+**Data flow**: The test selects an initial output, refreshes it, runs phase 2 again after cooldown, and verifies the stored selected snapshot timestamp updates to the newer source timestamp.
 
-**Call relations**: This validates the exact-snapshot rewrite performed by `MemoryStore::mark_global_phase2_job_succeeded`.
+**Call relations**: It verifies selection-marker updates in `mark_global_phase2_job_succeeded`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, age_phase2_success_beyond_cooldown, memory_pool, remove_dir_all).
 
@@ -3364,11 +3374,11 @@ async fn mark_global_phase2_job_succeeded_updates_selected_snapshot_timestamp()
 async fn mark_global_phase2_job_succeeded_only_marks_exact_selected_snapshots()
 ```
 
-**Purpose**: Verifies that phase-2 success marks only the exact `(thread_id, source_updated_at)` snapshots passed in `selected_outputs`; if a thread refreshes before completion, the newer row is not incorrectly marked selected. This prevents stale selection metadata from drifting onto newer outputs.
+**Purpose**: Ensures phase-2 success does not mark a row selected if the row changed after the selection was prepared.
 
-**Data flow**: Creates an initial output, claims phase 2 and captures that selected snapshot, refreshes the thread with a newer output before finalizing phase 2, then completes phase 2 with the old selected snapshot and asserts the current row has no selected markers while current input selection returns the newer output.
+**Data flow**: The test prepares selected outputs at timestamp 100, refreshes the same thread to 101 before finalizing phase 2, then checks the row is not marked selected for the old snapshot.
 
-**Call relations**: This targets the exact-match `UPDATE ... WHERE thread_id = ? AND source_updated_at = ?` loop in `MemoryStore::mark_global_phase2_job_succeeded`.
+**Call relations**: It verifies the exact timestamp match used by `mark_global_phase2_job_succeeded`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, memory_pool, remove_dir_all).
 
@@ -3379,11 +3389,11 @@ async fn mark_global_phase2_job_succeeded_only_marks_exact_selected_snapshots()
 async fn record_stage1_output_usage_updates_usage_metadata()
 ```
 
-**Purpose**: Checks that recording usage increments `usage_count` per cited thread occurrence and stamps a shared `last_usage` timestamp. Missing thread ids should not count as updates.
+**Purpose**: Checks that usage recording increments counts and sets a shared last-used time.
 
-**Data flow**: Creates two stage-1 outputs, calls `record_stage1_output_usage` with `[thread_a, thread_a, thread_b, missing]`, asserts the returned updated-row count is three, then reads SQL to verify counts `2` and `1` plus equal positive `last_usage` timestamps.
+**Data flow**: The test creates outputs for two threads, records usage with duplicate IDs and a missing ID, then reads raw rows to confirm counts and last-usage timestamps.
 
-**Call relations**: This validates `MemoryStore::record_stage1_output_usage`, which later feeds phase-2 ranking.
+**Call relations**: It exercises `record_stage1_output_usage` and confirms missing rows are ignored.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3394,11 +3404,11 @@ async fn record_stage1_output_usage_updates_usage_metadata()
 async fn get_phase2_input_selection_prioritizes_usage_count_then_recent_usage()
 ```
 
-**Purpose**: Verifies the ranking order for phase-2 input selection: higher `usage_count` wins first, and ties are broken by more recent `last_usage`/source recency. This ensures frequently cited memories are preferred.
+**Purpose**: Checks that phase-2 selection prefers higher usage count, then more recent usage.
 
-**Data flow**: Creates three outputs, manually sets usage metadata so threads A and B tie on count but B has more recent usage, then calls `get_phase2_input_selection(1, 30)` and asserts thread B is selected.
+**Data flow**: The test creates three outputs, manually sets usage counts and last-used times, asks for one selected output, and expects the frequently and recently used row.
 
-**Call relations**: This targets the `ORDER BY usage_count DESC, COALESCE(last_usage, source_updated_at) DESC, ...` logic in `MemoryStore::get_phase2_input_selection`.
+**Call relations**: It verifies the ranking order in `get_phase2_input_selection`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 11 external calls (days, hours, now, new_v4, assert!, assert_eq!, panic!, query, memory_pool, stable_thread_id (+1 more)).
 
@@ -3409,11 +3419,11 @@ async fn get_phase2_input_selection_prioritizes_usage_count_then_recent_usage()
 async fn get_phase2_input_selection_excludes_stale_used_memories_but_keeps_fresh_never_used()
 ```
 
-**Purpose**: Checks the freshness window semantics: used memories are excluded when `last_usage` is too old, while never-used memories can still be included if their `source_updated_at` is fresh enough. This distinguishes stale usage from fresh generation.
+**Purpose**: Checks retention-style freshness rules for phase-2 input selection.
 
-**Data flow**: Creates three outputs with different ages, manually sets usage metadata so one used memory is stale, one never-used memory is fresh, and one used memory is recently used, then calls `get_phase2_input_selection(3, 30)` and asserts only the fresh-never-used and fresh-used threads remain.
+**Data flow**: The test creates old and fresh outputs with different usage metadata, then selects with a 30-day window. It expects stale used memory to be excluded, fresh never-used memory to remain, and recently used old memory to remain.
 
-**Call relations**: This validates the freshness predicate in `MemoryStore::get_phase2_input_selection`.
+**Call relations**: It verifies the age filters inside `get_phase2_input_selection`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 10 external calls (days, now, new_v4, assert!, assert_eq!, panic!, query, memory_pool, stable_thread_id, remove_dir_all).
 
@@ -3424,11 +3434,11 @@ async fn get_phase2_input_selection_excludes_stale_used_memories_but_keeps_fresh
 async fn get_phase2_input_selection_prefers_recent_thread_updates_over_recent_generation()
 ```
 
-**Purpose**: Verifies that phase-2 ranking uses `source_updated_at` rather than `generated_at` when comparing current outputs. A row with an older source watermark should not outrank a newer source just because it was regenerated later.
+**Purpose**: Checks that selection ranking uses the source thread update time, not merely when memory was generated.
 
-**Data flow**: Creates two outputs with source watermarks 100 and 200, manually edits `generated_at` so the older source appears newer by generation time, then calls `get_phase2_input_selection(1, large_window)` and asserts the newer source watermark still wins.
+**Data flow**: The test creates two outputs, manually makes the older source look more recently generated, and confirms the newer source timestamp still wins.
 
-**Call relations**: This test pins down that `generated_at` is not part of the ranking order in `MemoryStore::get_phase2_input_selection`.
+**Call relations**: It verifies the source-updated ordering used by `get_phase2_input_selection`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3439,11 +3449,11 @@ async fn get_phase2_input_selection_prefers_recent_thread_updates_over_recent_ge
 async fn prune_stage1_outputs_for_retention_prunes_stale_unselected_rows_only()
 ```
 
-**Purpose**: Checks that retention pruning deletes only stale unselected outputs, preserving selected baseline rows and recently used rows, and leaving stage-1 job rows untouched. It validates both selection protection and job preservation.
+**Purpose**: Checks that retention cleanup deletes stale unselected outputs but keeps selected or fresh outputs.
 
-**Data flow**: Creates four outputs with different ages, marks one stale row selected and one fresh row recently used, records the count of stage-1 job rows, runs pruning, then asserts only the fresh-used and selected outputs remain and the job-row count is unchanged.
+**Data flow**: The test creates stale unused, stale used, stale selected, and fresh used outputs, runs pruning, then checks only the appropriate stale unselected rows were removed and stage-1 job rows were preserved.
 
-**Call relations**: This exercises `MemoryStore::prune_stage1_outputs_for_retention` and its deliberate non-interaction with `jobs`.
+**Call relations**: It exercises `prune_stage1_outputs_for_retention` and its rule to preserve phase-2 baseline rows.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 10 external calls (days, now, new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all, vec!).
 
@@ -3454,11 +3464,11 @@ async fn prune_stage1_outputs_for_retention_prunes_stale_unselected_rows_only()
 async fn prune_stage1_outputs_for_retention_respects_batch_limit()
 ```
 
-**Purpose**: Verifies that retention pruning deletes at most the requested batch size even when more stale rows are eligible. This supports incremental cleanup passes.
+**Purpose**: Checks that pruning deletes no more than the requested batch limit.
 
-**Data flow**: Creates three stale outputs, runs pruning with `limit = 2`, asserts two rows were deleted, then counts remaining outputs and confirms one remains.
+**Data flow**: The test creates three stale outputs, prunes with a limit of two, and verifies one output remains.
 
-**Call relations**: This targets the `LIMIT ?` behavior in the pruning subquery.
+**Call relations**: It verifies the `limit` argument in `prune_stage1_outputs_for_retention`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 9 external calls (days, now, new_v4, assert!, assert_eq!, panic!, query_scalar, memory_pool, remove_dir_all).
 
@@ -3469,11 +3479,11 @@ async fn prune_stage1_outputs_for_retention_respects_batch_limit()
 async fn mark_stage1_job_succeeded_enqueues_global_consolidation()
 ```
 
-**Purpose**: Checks that successful stage-1 completions advance the global phase-2 job watermark so a later phase-2 claim sees the newest source watermark. Multiple stage-1 successes should raise the watermark to the max/newest bookkeeping value.
+**Purpose**: Checks that saving stage-1 outputs schedules global consolidation and advances its watermark to the latest source.
 
-**Data flow**: Creates two threads, completes stage 1 for source watermarks 100 and 101, then claims the global phase-2 job and asserts the returned `input_watermark` is 101.
+**Data flow**: The test completes two stage-1 jobs at timestamps 100 and 101, claims phase 2, and expects the phase-2 input watermark to be 101.
 
-**Call relations**: This validates the enqueueing side effect of `MemoryStore::mark_stage1_job_succeeded`.
+**Call relations**: It verifies the enqueue call inside `mark_stage1_job_succeeded`.
 
 *Call graph*: calls 4 internal fn (from_string, init, test_thread_metadata, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -3484,11 +3494,11 @@ async fn mark_stage1_job_succeeded_enqueues_global_consolidation()
 async fn phase2_global_lock_allows_only_one_fresh_runner()
 ```
 
-**Purpose**: Verifies that only one worker can hold a fresh global phase-2 running lease at a time. A second concurrent claimant should be skipped as running.
+**Purpose**: Checks that only one worker can hold the global phase-2 lock while its lease is fresh.
 
-**Data flow**: Enqueues phase 2, claims it as owner A and asserts success, then immediately attempts a claim as owner B and asserts `SkippedRunning`.
+**Data flow**: The test enqueues phase 2, lets one owner claim it, then confirms a second owner is skipped as running.
 
-**Call relations**: This covers the fresh-running-lease branch in `MemoryStore::try_claim_global_phase2_job`.
+**Call relations**: It exercises the active-lease branch of `try_claim_global_phase2_job`.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 4 external calls (new_v4, assert!, assert_eq!, remove_dir_all).
 
@@ -3499,11 +3509,11 @@ async fn phase2_global_lock_allows_only_one_fresh_runner()
 async fn phase2_global_lock_creates_missing_job_row()
 ```
 
-**Purpose**: Checks that the first phase-2 claim can create the singleton job row from scratch with input watermark zero. After successful completion, cooldown semantics still apply.
+**Purpose**: Checks that claiming phase 2 works even if the singleton job row does not exist yet.
 
-**Data flow**: Initializes a runtime with no global job row, claims phase 2 as owner A and asserts `input_watermark = 0`, verifies owner B is blocked while A runs, marks success, then asserts a later claim is skipped due to cooldown.
+**Data flow**: The test claims phase 2 with no prior enqueue, confirms the input watermark starts at zero, verifies a second claim is blocked, marks success, and confirms cooldown blocks an immediate new claim.
 
-**Call relations**: This exercises the missing-row insert path in `MemoryStore::try_claim_global_phase2_job`.
+**Call relations**: It verifies the row-creation path in `try_claim_global_phase2_job`.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 5 external calls (new_v4, assert!, assert_eq!, panic!, remove_dir_all).
 
@@ -3514,11 +3524,11 @@ async fn phase2_global_lock_creates_missing_job_row()
 async fn phase2_global_lock_stale_lease_allows_takeover()
 ```
 
-**Purpose**: Verifies stale-lease takeover for the singleton phase-2 lock and ensures the stale owner can no longer finalize success afterward. Ownership transfer must be exclusive.
+**Purpose**: Checks that an expired phase-2 lease can be taken over and the old owner can no longer finish the job.
 
-**Data flow**: Enqueues phase 2, claims it as owner A, manually expires `lease_until`, claims it as owner B and captures a different token, then asserts owner A’s success finalization returns false while owner B’s succeeds.
+**Data flow**: The test claims phase 2, manually expires the lease, claims with another owner, then verifies the old token cannot mark success while the new token can.
 
-**Call relations**: This targets stale-lease takeover semantics in `MemoryStore::try_claim_global_phase2_job` and ownership checks in `mark_global_phase2_job_succeeded`.
+**Call relations**: It tests lease takeover in `try_claim_global_phase2_job` and ownership checks in `mark_global_phase2_job_succeeded`.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 9 external calls (now, new_v4, assert!, assert_eq!, assert_ne!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3529,11 +3539,11 @@ async fn phase2_global_lock_stale_lease_allows_takeover()
 async fn enqueue_global_consolidation_keeps_phase2_input_watermark_monotonic()
 ```
 
-**Purpose**: Checks that enqueueing phase 2 with a lower watermark after a successful higher-watermark run still advances the bookkeeping watermark monotonically rather than decreasing it. This preserves a monotonic dirty counter.
+**Purpose**: Checks that enqueueing global consolidation with an older watermark still advances bookkeeping enough to signal new work.
 
-**Data flow**: Enqueues and successfully completes phase 2 at watermark 500, then enqueues again with watermark 400, ages cooldown, claims phase 2, and asserts the returned `input_watermark` is still greater than 500.
+**Data flow**: The test enqueues and completes watermark 500, then enqueues watermark 400, ages cooldown, claims again, and expects the stored input watermark to be greater than 500.
 
-**Call relations**: This validates the monotonic watermark update logic in `enqueue_global_consolidation_with_executor`.
+**Call relations**: It verifies the monotonic update behavior in `enqueue_global_consolidation_with_executor`.
 
 *Call graph*: calls 3 internal fn (from_string, init, unique_temp_dir); 6 external calls (new_v4, assert!, assert_eq!, panic!, age_phase2_success_beyond_cooldown, remove_dir_all).
 
@@ -3544,11 +3554,11 @@ async fn enqueue_global_consolidation_keeps_phase2_input_watermark_monotonic()
 async fn phase2_failure_fallback_updates_unowned_running_job()
 ```
 
-**Purpose**: Verifies the fallback failure path for a running global phase-2 job whose ownership token has been cleared. Strict ownership failure should miss, while the unowned fallback should transition the row to retry-unavailable error state.
+**Purpose**: Checks that the fallback failure method can recover a running phase-2 job whose ownership token was cleared.
 
-**Data flow**: Enqueues and claims phase 2, manually sets `ownership_token = NULL`, calls strict `mark_global_phase2_job_failed` and asserts false, then calls `mark_global_phase2_job_failed_if_unowned` and asserts true, finally attempting a new claim and expecting `SkippedRetryUnavailable`.
+**Data flow**: The test claims phase 2, manually clears the ownership token, confirms strict failure marking does not match, then uses the fallback method and verifies later claims are blocked by retry delay.
 
-**Call relations**: This test covers the recovery-oriented difference between `MemoryStore::mark_global_phase2_job_failed` and `MemoryStore::mark_global_phase2_job_failed_if_unowned`.
+**Call relations**: It compares `mark_global_phase2_job_failed` with `mark_global_phase2_job_failed_if_unowned`.
 
 *Call graph*: calls 4 internal fn (from_string, new, init, unique_temp_dir); 7 external calls (new_v4, assert!, assert_eq!, panic!, query, memory_pool, remove_dir_all).
 
@@ -3558,13 +3568,13 @@ These files define and persist operational workflow state for agent jobs and the
 
 ### `state/src/model/agent_job.rs`
 
-`data_model` · `cross-cutting`
+`data_model` · `cross-cutting, especially when reading or writing agent job state`
 
-This file contains the core types for batch-style agent execution. `AgentJobStatus` models whole-job lifecycle states (`Pending`, `Running`, `Completed`, `Failed`, `Cancelled`) and `AgentJobItemStatus` models per-item progress (`Pending`, `Running`, `Completed`, `Failed`). Each enum provides a stable lowercase string representation for persistence and a parser that rejects unknown values with contextual `anyhow` errors.
+An agent job appears to be a batch of work: a CSV file is read, each row becomes an item, and an agent processes those items. This file is the shared vocabulary for that feature. It says what a job contains, what an item contains, and what states they can be in, such as pending, running, completed, failed, or cancelled.
 
-The main structs are `AgentJob`, which stores job-wide metadata such as instruction text, CSV paths, optional JSON output schema, timestamps, and last error, and `AgentJobItem`, which stores row-level execution state including source identifiers, raw row JSON, assignment, attempts, optional result JSON, and reporting timestamps. Companion parameter structs capture creation-time inputs, while `AgentJobProgress` aggregates counts.
+The important job of this file is to keep messy stored data from leaking into the rest of the program. Databases often store values in simple forms: text for statuses, integers for yes/no flags, integer Unix timestamps for dates, and strings for JSON. The public structs, such as AgentJob and AgentJobItem, use clearer types instead: booleans, parsed JSON values, real date-time objects, and enums. An enum is a fixed list of allowed choices, like a traffic light that can only be red, yellow, or green.
 
-The important behavior lives in `TryFrom<AgentJobRow>` and `TryFrom<AgentJobItemRow>`. These conversions decode SQLite-friendly representations into typed fields: integer booleans become `bool`, optional JSON strings become `serde_json::Value`, JSON arrays become `Vec<String>`, optional integer runtime limits become `Option<u64>` with explicit overflow checking, and epoch-second timestamps become `DateTime<Utc>` through a shared validator. The timestamp helper rejects invalid Unix timestamps instead of silently normalizing them, so malformed persisted rows fail conversion early. Overall, this module keeps storage quirks localized and presents the rest of the runtime with validated, typed job records.
+The two internal row structs, AgentJobRow and AgentJobItemRow, match what comes back from the database. Their conversion functions check and transform those raw rows into the safer public structs. If a status string is unknown, a timestamp is invalid, or JSON text cannot be parsed, the conversion returns an error instead of creating a misleading object. Without this file, other code would have to repeat these checks everywhere and would be more likely to mishandle corrupted or unexpected stored data.
 
 #### Function details
 
@@ -3574,11 +3584,11 @@ The important behavior lives in `TryFrom<AgentJobRow>` and `TryFrom<AgentJobItem
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical lowercase storage string for a whole-job status. The mapping is fixed and used when serializing statuses into the database or logs.
+**Purpose**: Turns a job status into the exact lowercase text used outside the Rust enum, such as in a database or API response. This gives the project one consistent spelling for each status.
 
-**Data flow**: It takes `self` by value, matches on the enum variant, and returns a `&'static str` such as `"pending"` or `"cancelled"` without mutating any state.
+**Data flow**: It starts with an AgentJobStatus value, such as Pending or Failed. It matches that value to its stored text form. It returns a static string like "pending" or "failed" and does not change anything else.
 
-**Call relations**: This is a leaf conversion helper used by persistence code that needs a stable textual representation of `AgentJobStatus`.
+**Call relations**: This is the outward-facing companion to AgentJobStatus::parse. Code that needs to save or display a job status can ask this function for the stable text form, while parsing code uses AgentJobStatus::parse to come back from text into the enum.
 
 
 ##### `AgentJobStatus::parse`  (lines 26–35)
@@ -3587,11 +3597,11 @@ fn as_str(self) -> &'static str
 fn parse(value: &str) -> Result<Self>
 ```
 
-**Purpose**: Parses a persisted status string into an `AgentJobStatus` enum. It enforces that only known lowercase values are accepted.
+**Purpose**: Turns stored or received text into a valid AgentJobStatus. It protects the rest of the program from unknown status words by returning an error instead of guessing.
 
-**Data flow**: It reads an input `&str`, matches it against the allowed literals, returns the corresponding enum on success, and otherwise constructs an `anyhow` error containing the invalid value.
+**Data flow**: It receives a string like "running". It compares the string with the allowed job status names. If it recognizes the value, it returns the matching enum value; if not, it returns an error explaining that the status is invalid.
 
-**Call relations**: Row conversion code calls this while materializing `AgentJob` values from `AgentJobRow`, and other runtime logic such as cancellation checks also relies on it when interpreting stored status text.
+**Call relations**: AgentJob::try_from calls this while converting a database row into an AgentJob, so bad stored status text stops at the boundary. is_agent_job_cancelled also calls it when it needs to interpret stored status text before deciding whether a job has been cancelled.
 
 *Call graph*: called by 2 (try_from, is_agent_job_cancelled); 1 external calls (anyhow!).
 
@@ -3602,11 +3612,11 @@ fn parse(value: &str) -> Result<Self>
 fn is_final(self) -> bool
 ```
 
-**Purpose**: Reports whether a job status is terminal. It treats `Completed`, `Failed`, and `Cancelled` as final states.
+**Purpose**: Answers whether a job has reached an ending state. Completed, failed, and cancelled jobs are final; pending and running jobs are not.
 
-**Data flow**: It consumes `self`, evaluates a `matches!` expression over the enum variant, and returns a `bool` with no side effects.
+**Data flow**: It receives one AgentJobStatus value. It checks whether that value is one of the known finished states. It returns true for completed, failed, or cancelled, and false otherwise.
 
-**Call relations**: This is a pure predicate used by higher-level job orchestration to decide whether a job can still transition or receive more work.
+**Call relations**: This is a small decision helper for higher-level job flow. Other code can use it when it needs to know whether work should stop changing state, whether cleanup can happen, or whether progress should be treated as finished.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -3617,11 +3627,11 @@ fn is_final(self) -> bool
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical lowercase storage string for a per-item status. It provides the persisted representation for item lifecycle values.
+**Purpose**: Turns an individual job item’s status into the exact lowercase text form used for storage or communication. It keeps item status spelling consistent across the system.
 
-**Data flow**: It matches the `AgentJobItemStatus` variant and returns a corresponding `&'static str` such as `"running"` or `"failed"`.
+**Data flow**: It starts with an AgentJobItemStatus value, such as Running or Completed. It maps that value to a fixed string. It returns text like "running" or "completed" without changing any state.
 
-**Call relations**: This helper supports persistence and comparison code that needs a stable textual form of item status.
+**Call relations**: This mirrors AgentJobItemStatus::parse in the opposite direction. When code needs to write or show an item status, this function provides the canonical text; when reading text back, AgentJobItemStatus::parse restores the enum.
 
 
 ##### `AgentJobItemStatus::parse`  (lines 63–71)
@@ -3630,11 +3640,11 @@ fn as_str(self) -> &'static str
 fn parse(value: &str) -> Result<Self>
 ```
 
-**Purpose**: Parses a persisted item-status string into an `AgentJobItemStatus`. Unknown values are rejected rather than coerced.
+**Purpose**: Turns text into a valid status for one item inside a job. It rejects unknown words so an item cannot silently enter an impossible state.
 
-**Data flow**: It takes a `&str`, matches it against the four accepted literals, returns the enum variant on success, and otherwise returns an `anyhow` error naming the invalid status.
+**Data flow**: It receives a string such as "pending" or "failed". It checks that string against the allowed item statuses. It returns the matching AgentJobItemStatus, or an error if the text is not recognized.
 
-**Call relations**: The `AgentJobItem` row conversion path invokes this while decoding `AgentJobItemRow` records from SQLite.
+**Call relations**: AgentJobItem::try_from calls this during database row conversion. That means raw database text is checked before the rest of the program sees the item as a normal AgentJobItem.
 
 *Call graph*: called by 1 (try_from); 1 external calls (anyhow!).
 
@@ -3645,11 +3655,11 @@ fn parse(value: &str) -> Result<Self>
 fn try_from(value: AgentJobRow) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Converts a raw `AgentJobRow` loaded from SQLite into a validated `AgentJob`. It decodes JSON fields, converts integer-backed booleans and durations, parses status text, and validates timestamps.
+**Purpose**: Converts a raw database row for a job into the safer AgentJob struct used by application code. It performs the cleanup and validation needed at the storage boundary.
 
-**Data flow**: It consumes an `AgentJobRow`, optionally parses `output_schema_json` from JSON text into `Option<Value>`, parses `input_headers_json` into `Vec<String>`, converts `max_runtime_seconds: Option<i64>` into `Option<u64>` with overflow checking, maps `auto_export != 0` to `bool`, parses `status` via `AgentJobStatus::parse`, and converts all epoch-second fields through `epoch_seconds_to_datetime`, including optional timestamps via `map(...).transpose()`. On success it returns a fully populated `AgentJob`; on malformed JSON, invalid status text, invalid timestamps, or negative/overflowing runtime limits it returns an error.
+**Data flow**: It receives an AgentJobRow, where some fields are plain strings or integers because that is how they are stored. It parses JSON fields, converts the status string into an AgentJobStatus, turns integer timestamps into date-time values, changes the integer auto_export flag into a true-or-false value, and checks that max_runtime_seconds can safely become an unsigned number. It returns a complete AgentJob if every conversion succeeds, or an error if any stored value is malformed.
 
-**Call relations**: This conversion is the main bridge from SQLx row structs into the domain model. Callers that fetch `AgentJobRow` values rely on it to centralize validation and normalization before the rest of the runtime uses the job.
+**Call relations**: This function sits between database access code and the rest of the application. When a stored job is loaded, this conversion calls AgentJobStatus::parse for the job state, serde_json parsing for JSON text, and epoch_seconds_to_datetime for timestamps before handing back a clean AgentJob.
 
 *Call graph*: calls 2 internal fn (parse, epoch_seconds_to_datetime); 1 external calls (from_str).
 
@@ -3660,11 +3670,11 @@ fn try_from(value: AgentJobRow) -> Result<Self, Self::Error>
 fn try_from(value: AgentJobItemRow) -> Result<Self, Self::Error>
 ```
 
-**Purpose**: Converts a raw `AgentJobItemRow` from SQLite into a typed `AgentJobItem`. It validates status text, parses JSON payloads, and turns epoch seconds into UTC datetimes.
+**Purpose**: Converts a raw database row for one job item into the safer AgentJobItem struct. It makes sure row data, result data, status, and times are all valid before the item is used.
 
-**Data flow**: It consumes an `AgentJobItemRow`, copies scalar fields directly, parses `row_json` into `serde_json::Value`, parses `status` with `AgentJobItemStatus::parse`, optionally parses `result_json` when present, and converts required and optional timestamp fields with `epoch_seconds_to_datetime`. It returns the assembled `AgentJobItem` or an error if any JSON or timestamp is invalid.
+**Data flow**: It receives an AgentJobItemRow from storage. It parses the row_json text into JSON data, parses optional result_json when present, converts the status string into an AgentJobItemStatus, and changes timestamp numbers into date-time values. It returns a usable AgentJobItem, or an error if any JSON, status, or timestamp value is invalid.
 
-**Call relations**: This is the item-level counterpart to `AgentJob::try_from`, used by query paths that load item rows and need a validated in-memory representation.
+**Call relations**: This is the item-level version of AgentJob::try_from. Database loading code can rely on it to turn raw stored item rows into application objects, while it delegates status checking to AgentJobItemStatus::parse and time conversion to epoch_seconds_to_datetime.
 
 *Call graph*: calls 2 internal fn (parse, epoch_seconds_to_datetime); 1 external calls (from_str).
 
@@ -3675,22 +3685,24 @@ fn try_from(value: AgentJobItemRow) -> Result<Self, Self::Error>
 fn epoch_seconds_to_datetime(secs: i64) -> Result<DateTime<Utc>>
 ```
 
-**Purpose**: Validates and converts a Unix timestamp in seconds into `DateTime<Utc>`. It exists to keep timestamp parsing consistent across job and job-item row conversions.
+**Purpose**: Turns a Unix timestamp into a proper UTC date-time value. A Unix timestamp is a count of seconds since January 1, 1970, which is convenient for storage but not as clear for application code.
 
-**Data flow**: It takes an `i64` second count, calls `DateTime::<Utc>::from_timestamp(secs, 0)`, and returns the resulting datetime or an `anyhow` error if the timestamp is out of range.
+**Data flow**: It receives an integer number of seconds. It asks the date-time library to build a UTC DateTime from that number. It returns the DateTime if the number is valid, or an error if the timestamp cannot represent a real date-time.
 
-**Call relations**: Both `AgentJob::try_from` and `AgentJobItem::try_from` delegate all epoch-second decoding to this helper so invalid persisted timestamps fail uniformly.
+**Call relations**: AgentJob::try_from and AgentJobItem::try_from both call this helper while translating database rows. It keeps timestamp validation in one place so job and item conversions treat stored times the same way.
 
 *Call graph*: called by 2 (try_from, try_from); 1 external calls (from_timestamp).
 
 
 ### `state/src/runtime/agent_jobs.rs`
 
-`domain_logic` · `background job scheduling and per-item execution/reporting`
+`domain_logic` · `job creation and job/item status updates during agent work`
 
-This file adds agent-job persistence methods onto `StateRuntime` for two tables: `agent_jobs` and `agent_job_items`. Creation is transactional: `create_agent_job` serializes structured fields such as `input_headers`, optional `output_schema_json`, and each item's `row_json`, inserts the parent job row with `Pending` status and timestamps, inserts all child items as `Pending`, commits, then reloads the created job through the normal decoding path. Reads convert SQL rows (`AgentJobRow`, `AgentJobItemRow`) into domain types via `TryFrom`, so malformed stored JSON or invalid enum strings surface as errors instead of silently passing through.
+An agent job is a batch of work, and each job has smaller items, like rows in a spreadsheet that need to be processed one by one. This file gives `StateRuntime` the methods needed to store those jobs in SQLite, update their status over time, and read back progress. Without it, the system would have no reliable memory of which jobs were pending, running, completed, failed, or cancelled.
 
-The update methods encode a strict state machine in SQL `WHERE` clauses. Job-level transitions move between `Pending`, `Running`, `Completed`, `Failed`, and `Cancelled`, with cancellation only succeeding from pending/running states. Item-level transitions similarly require expected prior states: only pending items can be claimed as running, only running items can be reset, completed, failed, or assigned a thread, and `report_agent_job_item_result` additionally requires the reporting thread to match `assigned_thread_id`. That makes late or duplicate reports harmless: the update affects zero rows and returns `false`. `mark_agent_job_item_completed` also requires `result_json IS NOT NULL`, separating “result recorded” from “completion finalized.” Progress is computed with SQL aggregates and defensively converted from `i64` to `usize`, defaulting on impossible negative/overflow cases. The tests focus on the atomic result-report path and rejection of stale reports after failure.
+The file starts by creating a job and all of its items together inside a transaction. A transaction is like filling out several forms as one packet: either every form is saved, or none of them are. That prevents half-created jobs. It then provides lookup methods for jobs and items, plus list and progress methods for showing what remains.
+
+Most of the file is careful status-changing code. Jobs can move to running, completed, failed, or cancelled. Items can move from pending to running, back to pending, completed, or failed. Several updates only succeed if the item is currently in the expected state. This matters when multiple workers might be acting at once: the database update becomes a guardrail that prevents a late or wrong worker from overwriting newer truth. The tests focus on that safety, especially making sure a result report only completes the item when it comes from the currently assigned running thread.
 
 #### Function details
 
@@ -3704,11 +3716,11 @@ async fn create_agent_job(
     ) -> anyhow::Result<AgentJob>
 ```
 
-**Purpose**: Creates one `agent_jobs` row plus all associated `agent_job_items` rows in a single transaction, initializing statuses and timestamps. After commit, it reloads the job through the normal read path and fails if the inserted job cannot be fetched back.
+**Purpose**: Creates a new agent job and all of its starting work items in the database. It is used when the system receives a new batch of work and needs to save both the job summary and every row-like item that belongs to it.
 
-**Data flow**: Reads `params` and `items`, captures `Utc::now().timestamp()`, serializes `params.input_headers`, optional `params.output_schema_json`, and each item's `row_json`, converts optional `max_runtime_seconds` from `usize`-like input to `i64`, then inserts the parent row and each child row into SQLite via a transaction on `self.pool`. It returns the decoded `AgentJob`; on serialization, conversion, SQL, or reload failure it returns an `anyhow::Error`.
+**Data flow**: It receives job settings and a list of item settings. It turns structured values such as headers, row data, and optional output schema into JSON text, records the current time, inserts the job as pending, inserts each item as pending, commits the database transaction, then reads the job back and returns it.
 
-**Call relations**: This is the entry point used by higher-level job creation flows. After writing rows it delegates to `StateRuntime::get_agent_job` so the returned object is produced by the same decoding logic as later reads, rather than reconstructing it manually.
+**Call relations**: This is the beginning of the agent job flow. After writing the records, it calls `StateRuntime::get_agent_job` to load the newly created job in the same shape callers expect elsewhere.
 
 *Call graph*: calls 1 internal fn (get_agent_job); 4 external calls (now, from, to_string, query).
 
@@ -3719,11 +3731,11 @@ async fn create_agent_job(
 async fn get_agent_job(&self, job_id: &str) -> anyhow::Result<Option<AgentJob>>
 ```
 
-**Purpose**: Loads a single job row by `id` from `agent_jobs` and converts it into the domain `AgentJob`. Missing rows return `Ok(None)` rather than an error.
+**Purpose**: Looks up one agent job by its id. Callers use it when they need the saved job details, such as its name, instruction, status, paths, and timing information.
 
-**Data flow**: Takes `job_id`, runs a `SELECT` over all persisted job columns, fetches at most one `AgentJobRow`, and maps that row through `AgentJob::try_from`. It returns `Option<AgentJob>` wrapped in `anyhow::Result`.
+**Data flow**: It receives a job id, queries the `agent_jobs` table, and either gets no row or gets one stored row. If a row exists, it converts that database row into the normal `AgentJob` value returned to the rest of the program.
 
-**Call relations**: It is used immediately after insertion by `StateRuntime::create_agent_job` to verify the committed row can be read back and decoded correctly.
+**Call relations**: It is used by `StateRuntime::create_agent_job` immediately after creation to verify and return the stored job. Other code can also use it as a direct read path for job details.
 
 *Call graph*: called by 1 (create_agent_job).
 
@@ -3739,11 +3751,11 @@ async fn list_agent_job_items(
     ) -> anyhow::Result<Vec<AgentJobItem>>
 ```
 
-**Purpose**: Returns ordered item rows for one job, optionally filtered by item status and capped by a limit. The SQL is built dynamically so absent filters do not add unnecessary predicates.
+**Purpose**: Returns the items belonging to a job, optionally filtered by status and optionally capped to a maximum count. This is useful for finding pending work, showing job contents, or reading a manageable slice of a large job.
 
-**Data flow**: Consumes `job_id`, optional `AgentJobItemStatus`, and optional `limit`; builds a `QueryBuilder<Sqlite>` query with `WHERE job_id = ?`, optional `AND status = ?`, `ORDER BY row_index ASC`, and optional `LIMIT`. It fetches `Vec<AgentJobItemRow>` and converts each row into `AgentJobItem`, returning the collected vector.
+**Data flow**: It receives a job id, an optional item status, and an optional limit. It builds a SQL query with only the needed filters, orders items by their original row order, reads matching rows, converts each row into an `AgentJobItem`, and returns the list.
 
-**Call relations**: This is a read-side helper for callers that need to inspect queued, running, or completed items for a job. It does not delegate to other local methods because it performs a bulk query and conversion directly.
+**Call relations**: This method is a read-side helper for job runners or user-facing views. It builds its query dynamically so callers can ask broad questions, like all items, or narrow questions, like only pending items.
 
 *Call graph*: 1 external calls (new).
 
@@ -3758,11 +3770,11 @@ async fn get_agent_job_item(
     ) -> anyhow::Result<Option<AgentJobItem>>
 ```
 
-**Purpose**: Fetches one specific item identified by `(job_id, item_id)` and decodes it into `AgentJobItem`. It distinguishes absence from decode or SQL failure.
+**Purpose**: Looks up one specific item inside one specific job. It is used when code needs the latest saved state of a single unit of work.
 
-**Data flow**: Reads `job_id` and `item_id`, executes a `SELECT` over all item columns from `agent_job_items`, fetches an optional `AgentJobItemRow`, and maps it through `AgentJobItem::try_from`. Returns `Ok(None)` if no row matches.
+**Data flow**: It receives a job id and item id, queries the `agent_job_items` table for that exact pair, and returns either nothing or the converted `AgentJobItem` value.
 
-**Call relations**: This is a direct lookup used by tests and likely by higher-level execution/reporting code to inspect the latest persisted state of one item.
+**Call relations**: This is the direct read path for one item. The tests use it after status changes to confirm the database now contains the expected result.
 
 
 ##### `StateRuntime::mark_agent_job_running`  (lines 207–228)
@@ -3771,11 +3783,11 @@ async fn get_agent_job_item(
 async fn mark_agent_job_running(&self, job_id: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Transitions a job to `Running`, stamps `updated_at`, initializes `started_at` if it was previously null, and clears completion/error fields. It does not enforce a prior status check.
+**Purpose**: Marks a whole job as running. This records that work has started and clears any old completion or error marker.
 
-**Data flow**: Takes `job_id`, computes `now`, and issues an `UPDATE agent_jobs` setting `status`, `updated_at`, `started_at = COALESCE(started_at, now)`, `completed_at = NULL`, and `last_error = NULL`. It writes only to the database and returns `()` on success.
+**Data flow**: It receives a job id, records the current time, updates the job status to running, updates the timestamp, sets `started_at` if it was empty, clears `completed_at`, clears `last_error`, and returns success or a database error.
 
-**Call relations**: Called when a worker begins processing a job. It is independent of item transitions, which are handled by separate item-level methods.
+**Call relations**: This is usually called after a job has been created and before its items begin running. It uses the current time and a database update to make the job-level state match the active work.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3786,11 +3798,11 @@ async fn mark_agent_job_running(&self, job_id: &str) -> anyhow::Result<()>
 async fn mark_agent_job_completed(&self, job_id: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Marks the whole job as completed and records a completion timestamp. It also clears any previous error text.
+**Purpose**: Marks a whole job as completed. This records that the batch finished successfully.
 
-**Data flow**: Consumes `job_id`, computes `now`, and updates the matching `agent_jobs` row to `status = Completed`, `updated_at = now`, `completed_at = now`, `last_error = NULL`. Returns `()`.
+**Data flow**: It receives a job id, records the current time, updates the job status to completed, sets both `updated_at` and `completed_at`, clears any last error, and returns once the database update is done.
 
-**Call relations**: Used by orchestration code once all items have been successfully finalized; it does not inspect item state itself.
+**Call relations**: This is called near the end of a successful job run, after item processing is finished. It writes the final job-level state.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3805,11 +3817,11 @@ async fn mark_agent_job_failed(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Marks the whole job as failed and stores a human-readable error message. Completion time is set at failure time.
+**Purpose**: Marks a whole job as failed and stores the reason. This gives later readers a clear final state and an explanation.
 
-**Data flow**: Reads `job_id` and `error_message`, computes `now`, and updates the job row with `status = Failed`, `updated_at = now`, `completed_at = now`, and `last_error = error_message`. Returns `()`.
+**Data flow**: It receives a job id and an error message, records the current time, sets the job status to failed, stores the completion time and error text, and returns after the database update.
 
-**Call relations**: Used when job-level execution aborts. Unlike cancellation, it does not restrict which prior statuses may be overwritten.
+**Call relations**: This is used when the overall job cannot continue or cannot finish successfully. It writes the failure state directly to the job record.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3824,11 +3836,11 @@ async fn mark_agent_job_cancelled(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Attempts to cancel a job only if it is still pending or running, recording the cancellation reason. The boolean result tells callers whether the transition actually happened.
+**Purpose**: Tries to cancel a job that has not already reached a final state. It returns whether the cancellation actually changed the job.
 
-**Data flow**: Consumes `job_id` and `reason`, computes `now`, and runs an `UPDATE` guarded by `status IN (Pending, Running)`. It writes `Cancelled`, timestamps, and `last_error = reason`, then returns `true` if `rows_affected() > 0`.
+**Data flow**: It receives a job id and cancellation reason, records the current time, and updates the job to cancelled only if its current status is pending or running. It returns `true` if a row was changed and `false` if the job was already completed, failed, cancelled, or missing.
 
-**Call relations**: This is the safe cancellation path for external stop requests. The guarded update prevents terminal jobs from being overwritten after completion or failure.
+**Call relations**: This protects final states from being overwritten by a late cancellation request. Callers can use the returned boolean to know whether their cancellation was accepted.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3839,11 +3851,11 @@ async fn mark_agent_job_cancelled(
 async fn is_agent_job_cancelled(&self, job_id: &str) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Checks whether a persisted job currently has `Cancelled` status. Missing jobs are treated as not cancelled.
+**Purpose**: Checks whether a job is currently marked as cancelled. This lets long-running work notice when it should stop.
 
-**Data flow**: Takes `job_id`, selects only the `status` column, returns `false` if no row exists, otherwise parses the stored string with `AgentJobStatus::parse` and compares it to `Cancelled`. It returns a boolean in `anyhow::Result`.
+**Data flow**: It receives a job id, reads the job status from the database, and returns `false` if the job is missing. If the job exists, it parses the stored status text and returns whether it equals cancelled.
 
-**Call relations**: This is a polling helper for runners that need to stop work cooperatively if a cancellation request has been persisted.
+**Call relations**: This is a polling-style read method: worker code can ask it during processing to decide whether continuing would ignore a cancellation.
 
 *Call graph*: calls 1 internal fn (parse); 1 external calls (query).
 
@@ -3858,11 +3870,11 @@ async fn mark_agent_job_item_running(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Claims a pending item for execution without attaching a thread id, increments its attempt counter, and clears any prior error. It succeeds only from the `Pending` state.
+**Purpose**: Claims an item for work by moving it from pending to running. It also counts this as another attempt.
 
-**Data flow**: Reads `job_id` and `item_id`, computes `now`, and updates the matching row where `status = Pending`, setting `status = Running`, `assigned_thread_id = NULL`, `attempt_count = attempt_count + 1`, `updated_at = now`, and `last_error = NULL`. Returns whether one row changed.
+**Data flow**: It receives a job id and item id, records the current time, and updates the item only if it is currently pending. The update clears any assigned thread, increments the attempt count, clears the last error, and returns whether the claim succeeded.
 
-**Call relations**: Used by item runners that do not yet have or need a thread assignment. The guarded update prevents double-claiming the same item.
+**Call relations**: This is a guarded state transition. If another worker already moved the item out of pending, this method returns `false` instead of accidentally claiming work twice.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3878,11 +3890,11 @@ async fn mark_agent_job_item_running_with_thread(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Claims a pending item for execution and records the thread responsible for reporting its result. It also increments attempts and clears stale errors.
+**Purpose**: Claims an item for work and records which thread is responsible for it. Here, a thread id is a worker-specific identifier used to prove who owns the in-progress item.
 
-**Data flow**: Consumes `job_id`, `item_id`, and `thread_id`, computes `now`, and updates the row only if it is currently pending. It writes `status = Running`, `assigned_thread_id = thread_id`, increments `attempt_count`, updates `updated_at`, clears `last_error`, and returns a success boolean.
+**Data flow**: It receives a job id, item id, and thread id, records the current time, and updates the item from pending to running only if it is still pending. It stores the thread id, increments the attempt count, clears the last error, and returns whether the update succeeded.
 
-**Call relations**: This is the thread-aware claim path used by the tests’ setup helper and by execution flows that later rely on thread ownership checks in `StateRuntime::report_agent_job_item_result`.
+**Call relations**: This is used when later result reporting must be tied to the worker that claimed the item. The tests use it before reporting a result so the report can be checked against the assigned thread.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3898,11 +3910,11 @@ async fn mark_agent_job_item_pending(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Moves a running item back to pending, optionally preserving an error message explaining why it was requeued. It clears any assigned thread.
+**Purpose**: Moves a running item back to pending, optionally remembering why. This allows an in-progress item to be retried later.
 
-**Data flow**: Reads `job_id`, `item_id`, and optional `error_message`, computes `now`, and updates only rows currently in `Running`. It writes `status = Pending`, `assigned_thread_id = NULL`, `updated_at = now`, and `last_error = error_message`, returning whether the transition occurred.
+**Data flow**: It receives a job id, item id, and optional error message, records the current time, and updates the item only if it is currently running. It clears the assigned thread, sets the status back to pending, stores the optional error, and returns whether anything changed.
 
-**Call relations**: Used for retry/requeue behavior after a running attempt should be abandoned without marking the item terminal.
+**Call relations**: This is the retry path for a running item that did not finish cleanly but should not be considered permanently failed. The status guard prevents changing items that are no longer running.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3918,11 +3930,11 @@ async fn set_agent_job_item_thread(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Attaches or replaces the `assigned_thread_id` for an item that is already running. It refuses to modify non-running items.
+**Purpose**: Assigns or updates the thread id for an item that is already running. This records which worker is expected to report the result.
 
-**Data flow**: Consumes `job_id`, `item_id`, and `thread_id`, computes `now`, and updates `assigned_thread_id` plus `updated_at` where the row matches and `status = Running`. Returns `true` if the row was updated.
+**Data flow**: It receives a job id, item id, and thread id, records the current time, and stores that thread id only if the item is currently running. It returns whether the item was updated.
 
-**Call relations**: This supports flows where an item is first marked running and only later associated with a concrete thread identifier.
+**Call relations**: This supports workflows where an item first becomes running and the worker thread is attached afterward. The later reporting method relies on this assignment to reject reports from the wrong or stale thread.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3939,11 +3951,11 @@ async fn report_agent_job_item_result(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Atomically records a JSON result payload and completes the item, but only if the reporting thread still owns the running item. This prevents late or stolen reports from overwriting newer state.
+**Purpose**: Stores a completed item result and marks the item completed, but only if the reporting thread is still the assigned owner. This prevents late or wrong workers from overwriting the item.
 
-**Data flow**: Reads `job_id`, `item_id`, `reporting_thread_id`, and `result_json`; serializes the JSON value to a string; computes `now`; then updates the row only when `status = Running` and `assigned_thread_id = reporting_thread_id`. It writes `status = Completed`, `result_json`, `reported_at`, `completed_at`, `updated_at`, clears `last_error`, clears `assigned_thread_id`, and returns whether the update matched.
+**Data flow**: It receives a job id, item id, reporting thread id, and JSON result. It turns the JSON result into text, records the current time, and updates the item to completed only if it is running and assigned to that same thread. It stores the result, sets report and completion times, clears errors and assignment, and returns whether the report was accepted.
 
-**Call relations**: This is the key result-ingest path exercised by both tests. Its ownership and status predicates are what make completion atomic and reject late reports after another transition such as failure.
+**Call relations**: This is the safest result-submission path. The tests show both sides: a valid report completes the item, while a late report after failure is rejected because the item no longer matches the required running state.
 
 *Call graph*: 3 external calls (now, to_string, query).
 
@@ -3958,11 +3970,11 @@ async fn mark_agent_job_item_completed(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Finalizes a running item as completed only if a result payload has already been stored. It clears thread assignment and stamps completion time.
+**Purpose**: Marks a running item completed when a result has already been stored. It is a completion step that refuses to complete an item with no result.
 
-**Data flow**: Consumes `job_id` and `item_id`, computes `now`, and updates rows matching the item, `status = Running`, and `result_json IS NOT NULL`. It writes `status = Completed`, `completed_at`, `updated_at`, and `assigned_thread_id = NULL`, returning whether a row changed.
+**Data flow**: It receives a job id and item id, records the current time, and updates the item only if it is running and `result_json` is not empty. It sets the completed time, clears the assigned thread, and returns whether the update happened.
 
-**Call relations**: This supports a two-step completion flow where result persistence may happen separately from terminal status transition; the SQL guard enforces the invariant that completed items must have a result.
+**Call relations**: This is an alternate completion path to `StateRuntime::report_agent_job_item_result`. Its database condition protects against marking work done before any result exists.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3978,11 +3990,11 @@ async fn mark_agent_job_item_failed(
     ) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Marks a running item as failed, records the failure message, and releases any thread assignment. It only applies to currently running items.
+**Purpose**: Marks a running item as failed and records the error message. This gives the system and users a final item-level failure reason.
 
-**Data flow**: Reads `job_id`, `item_id`, and `error_message`, computes `now`, and updates the matching running row to `status = Failed`, `completed_at = now`, `updated_at = now`, `last_error = error_message`, `assigned_thread_id = NULL`. Returns whether the update matched.
+**Data flow**: It receives a job id, item id, and error message, records the current time, and updates the item only if it is currently running. It sets the status to failed, stores completion and update times, saves the error, clears the assigned thread, and returns whether the update succeeded.
 
-**Call relations**: Used when item execution terminates unsuccessfully. The tests use it to prove that a later `report_agent_job_item_result` call is rejected.
+**Call relations**: This is the item-level failure path. The late-report test uses it before trying to report a result, proving that once the item is failed, `StateRuntime::report_agent_job_item_result` will no longer accept a stale completion.
 
 *Call graph*: 2 external calls (now, query).
 
@@ -3993,11 +4005,11 @@ async fn mark_agent_job_item_failed(
 async fn get_agent_job_progress(&self, job_id: &str) -> anyhow::Result<AgentJobProgress>
 ```
 
-**Purpose**: Computes aggregate counts of pending, running, completed, and failed items for one job. It returns a normalized `AgentJobProgress` struct with `usize` fields.
+**Purpose**: Counts how many items in a job are total, pending, running, completed, and failed. This provides a compact progress summary for dashboards, logs, or job-control code.
 
-**Data flow**: Takes `job_id`, runs a single aggregate query with `COUNT(*)` and `SUM(CASE WHEN status = ... THEN 1 ELSE 0 END)` for each tracked status, extracts `i64`/`Option<i64>` values, converts them to `usize` with fallbacks, and returns `AgentJobProgress`.
+**Data flow**: It receives a job id, asks the database to count all matching items and count each status group, converts the database numbers into normal unsigned counts, and returns an `AgentJobProgress` value.
 
-**Call relations**: This is a read-side summary helper for dashboards or orchestration code deciding whether a job is finished or still has active work.
+**Call relations**: This is a read-side summary of the item table. The success test calls it after reporting a result to confirm the job now has one completed item and no pending or running work.
 
 *Call graph*: 2 external calls (query, try_from).
 
@@ -4010,11 +4022,11 @@ async fn create_running_single_item_job(
     ) -> anyhow::Result<(String, String, String)>
 ```
 
-**Purpose**: Builds a minimal one-item job fixture already transitioned into a running state with an assigned thread. It centralizes repetitive setup for the result-report tests.
+**Purpose**: Builds a small test fixture: one job, one item, and one assigned thread, with the item already running. It saves repeated setup code for the tests in this file.
 
-**Data flow**: Given a `StateRuntime`, it constructs fixed `job_id`, `item_id`, and `thread_id` strings, calls job creation with one JSON row, marks the job running, marks the item running with the thread, asserts that claim succeeded, and returns the three identifiers.
+**Data flow**: It receives a runtime connected to a temporary test database. It creates a job with one item, marks the job running, marks the item running with a thread id, checks that the item was claimed, and returns the three ids needed by the tests.
 
-**Call relations**: Both async tests call this helper before exercising success or late-report rejection paths, so they start from the same persisted state.
+**Call relations**: Both test cases call this helper before checking result-report behavior. It uses the same public runtime methods that production code would use, so the tests exercise the real database transitions.
 
 *Call graph*: 6 external calls (assert!, json!, create_agent_job, mark_agent_job_item_running_with_thread, mark_agent_job_running, vec!).
 
@@ -4025,11 +4037,11 @@ async fn create_running_single_item_job(
 async fn report_agent_job_item_result_completes_item_atomically() -> anyhow::Result<()>
 ```
 
-**Purpose**: Verifies that reporting a result both stores the JSON payload and transitions the item to completed in one accepted update. It also checks progress counters and cleanup of thread/error fields.
+**Purpose**: Tests that reporting a result both saves the result and completes the item in one safe database update. In plain terms, it checks that the item cannot be left half-reported.
 
-**Data flow**: Creates a temporary runtime, uses `create_running_single_item_job`, submits a JSON result through `report_agent_job_item_result`, then reloads the item and progress summary to assert completed status, stored result, cleared assignment/error, and populated timestamps.
+**Data flow**: It creates a temporary runtime, uses the helper to make one running item, reports a JSON result from the assigned thread, then reads the item and progress summary back. It expects the item to be completed, to contain the result, to have no assigned thread or error, and to count as completed in progress.
 
-**Call relations**: This test exercises the happy path of `StateRuntime::report_agent_job_item_result` and indirectly validates `get_agent_job_item` and `get_agent_job_progress` after the atomic update.
+**Call relations**: This test calls `tests::create_running_single_item_job`, then exercises `StateRuntime::report_agent_job_item_result` indirectly through the runtime. It confirms the main happy path for item result submission.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (assert!, assert_eq!, json!, create_running_single_item_job).
 
@@ -4040,24 +4052,24 @@ async fn report_agent_job_item_result_completes_item_atomically() -> anyhow::Res
 async fn report_agent_job_item_result_rejects_late_reports() -> anyhow::Result<()>
 ```
 
-**Purpose**: Proves that once a running item has already been failed, a later result report from the old thread is ignored rather than overwriting terminal state. The persisted failure remains intact.
+**Purpose**: Tests that a late result report is rejected after an item has already been failed. This protects the database from stale workers changing the truth after a timeout or failure decision.
 
-**Data flow**: Creates a temporary runtime and running fixture, marks the item failed with an error message, then attempts to report a JSON result. It asserts the report was rejected and reloads the item to confirm status is still `Failed`, `result_json` is absent, and `last_error` is preserved.
+**Data flow**: It creates a temporary runtime, uses the helper to make one running item, marks that item failed, then tries to report a JSON result from the old thread. It expects the report to be refused and the item to remain failed with its original error and no result.
 
-**Call relations**: This test targets the ownership/status guard in `StateRuntime::report_agent_job_item_result`, demonstrating why the SQL `WHERE` clause includes both running status and matching assigned thread.
+**Call relations**: This test sets up the same running state as the success test, then calls the failure path before result reporting. It proves that `StateRuntime::report_agent_job_item_result` respects the item’s current status instead of blindly accepting late data.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (assert!, assert_eq!, json!, create_running_single_item_job).
 
 
 ### `state/src/model/backfill_state.rs`
 
-`data_model` · `startup`
+`data_model` · `backfill state loading and progress tracking`
 
-This module models a single-row control record used by rollout metadata backfill. `BackfillState` stores three pieces of state: the current `BackfillStatus`, an optional `last_watermark` string identifying the last processed rollout position, and an optional `last_success_at` timestamp. Its `Default` implementation intentionally represents a never-run backfill: `Pending` status with no watermark and no success time.
+A backfill job can take time and may need to survive restarts. This file gives the rest of the system a small, clear record of that job’s lifecycle: its status, its last processed watermark, and the last time it finished successfully. A watermark is like a bookmark in a long list; it tells the job where to continue next time instead of starting over.
 
-`BackfillStatus` is a compact enum with `Pending`, `Running`, and `Complete` variants plus string conversion helpers. The parser is strict and returns an error for any unknown persisted value, preventing silent acceptance of corrupted or future-incompatible rows.
+The main type, `BackfillState`, is the shape of the saved record. Its default value means “nothing has run yet”: the job is pending, there is no bookmark, and there is no success time. When the state is read back from SQLite, `try_from_row` turns a database row into this Rust structure. It checks the text status, reads the optional watermark, and converts a stored Unix timestamp into a real UTC date and time.
 
-The main operational function is `BackfillState::try_from_row`, which reads named columns from a `sqlx::sqlite::SqliteRow`. It extracts `status` as a string, `last_watermark` as an optional string, and `last_success_at` as an optional epoch-second integer. Optional timestamps are converted with `map(...).transpose()` so `NULL` remains `None` while malformed integers become errors. The private timestamp helper wraps `DateTime::<Utc>::from_timestamp` and rejects invalid values. Together these pieces ensure the backfill subsystem sees a small, strongly typed state object rather than raw SQL values.
+`BackfillStatus` is the small set of allowed lifecycle states: pending, running, or complete. It can be turned into a database-friendly string and parsed back from one. This matters because saved data is only useful if the program can trust it; an unknown status or invalid timestamp becomes an error instead of silently producing a misleading state.
 
 #### Function details
 
@@ -4067,11 +4079,11 @@ The main operational function is `BackfillState::try_from_row`, which reads name
 fn default() -> Self
 ```
 
-**Purpose**: Constructs the initial in-memory backfill state used when no persisted progress exists yet. It represents an untouched backfill run.
+**Purpose**: Creates the starting state for a backfill job before any saved progress exists. It says the job is pending, has no saved bookmark, and has never completed successfully.
 
-**Data flow**: It takes no inputs and returns a `BackfillState` with `status` set to `BackfillStatus::Pending` and both optional fields set to `None`.
+**Data flow**: Nothing comes in. The function builds a new `BackfillState` with `Pending` status, an empty `last_watermark`, and an empty `last_success_at`, then returns it.
 
-**Call relations**: Backfill orchestration uses this default when it needs a baseline state before or instead of loading a persisted row.
+**Call relations**: When `backfill_sessions_with_lease` needs a fresh backfill state, it calls this function. That gives the larger backfill process a safe starting point instead of guessing what missing database state should mean.
 
 *Call graph*: called by 1 (backfill_sessions_with_lease).
 
@@ -4082,11 +4094,11 @@ fn default() -> Self
 fn try_from_row(row: &SqliteRow) -> Result<Self>
 ```
 
-**Purpose**: Builds a typed `BackfillState` from a SQLite result row. It validates the status string and converts the optional success timestamp into UTC.
+**Purpose**: Turns one SQLite database row into a `BackfillState` that the program can use. It also validates the saved values so bad database data is caught early.
 
-**Data flow**: It reads `status`, `last_watermark`, and `last_success_at` columns from a borrowed `SqliteRow` using `try_get`. The status string is parsed with `BackfillStatus::parse`; `last_success_at` is read as `Option<i64>` and converted through `epoch_seconds_to_datetime` with `transpose()` so nulls stay absent and invalid timestamps error. It returns the assembled `BackfillState` or a conversion error.
+**Data flow**: A SQLite row comes in. The function reads the saved status text, optional last watermark, and optional success timestamp. It parses the status into a known `BackfillStatus`, converts the timestamp from Unix seconds into a UTC date and time when present, and returns a complete `BackfillState`; if any value is missing, malformed, or invalid, it returns an error.
 
-**Call relations**: Database read code such as `get_backfill_state` invokes this after fetching a row. The function delegates status interpretation to `BackfillStatus::parse` and timestamp validation to the local helper.
+**Call relations**: `get_backfill_state` calls this after fetching the saved row from the database. Inside, it relies on `BackfillStatus::parse` to understand the status text and on database row-reading helpers to pull out the stored fields.
 
 *Call graph*: calls 1 internal fn (parse); called by 1 (get_backfill_state); 1 external calls (try_get).
 
@@ -4097,11 +4109,11 @@ fn try_from_row(row: &SqliteRow) -> Result<Self>
 fn as_str(self) -> &'static str
 ```
 
-**Purpose**: Returns the canonical lowercase string form of a backfill lifecycle status. This is the persisted representation written into the database.
+**Purpose**: Converts a backfill status into the exact lowercase text used for storage or display, such as `pending` or `complete`.
 
-**Data flow**: It matches the enum variant and returns one of `"pending"`, `"running"`, or `"complete"`.
+**Data flow**: A `BackfillStatus` value comes in. The function matches it to its fixed string form and returns that string; it does not change anything else.
 
-**Call relations**: Persistence code uses this helper when writing backfill status values, including startup initialization paths that seed the control row.
+**Call relations**: This is the outward-facing companion to `BackfillStatus::parse`. Code that needs to save or compare a status as text can use this so every part of the system uses the same spelling.
 
 
 ##### `BackfillStatus::parse`  (lines 60–67)
@@ -4110,11 +4122,11 @@ fn as_str(self) -> &'static str
 fn parse(value: &str) -> Result<Self>
 ```
 
-**Purpose**: Parses a persisted status string into a `BackfillStatus` enum. It rejects any value outside the known lifecycle vocabulary.
+**Purpose**: Converts saved status text back into one of the allowed backfill statuses. It protects the system from accepting unknown lifecycle states.
 
-**Data flow**: It takes a `&str`, matches it against the three accepted literals, returns the corresponding enum variant, or returns an `anyhow` error naming the invalid value.
+**Data flow**: A text value comes in. If it is `pending`, `running`, or `complete`, the function returns the matching `BackfillStatus`; otherwise it returns an error explaining that the status is invalid.
 
-**Call relations**: `BackfillState::try_from_row` calls this while decoding the `status` column from SQLite.
+**Call relations**: `BackfillState::try_from_row` calls this while rebuilding state from the database. That means loaded backfill state is checked before the rest of the backfill flow trusts it.
 
 *Call graph*: called by 1 (try_from_row); 1 external calls (anyhow!).
 
@@ -4125,24 +4137,26 @@ fn parse(value: &str) -> Result<Self>
 fn epoch_seconds_to_datetime(secs: i64) -> Result<DateTime<Utc>>
 ```
 
-**Purpose**: Converts a Unix timestamp in seconds into `DateTime<Utc>` with validation. It prevents invalid persisted timestamps from entering the backfill model.
+**Purpose**: Converts a saved Unix timestamp, measured in seconds since 1970-01-01 UTC, into a proper UTC date and time. It rejects timestamps that cannot be represented safely.
 
-**Data flow**: It accepts an `i64` second count, calls `DateTime::<Utc>::from_timestamp(secs, 0)`, and returns either the datetime or an `anyhow` error if conversion fails.
+**Data flow**: A number of seconds comes in. The function asks the date-time library to build a UTC timestamp from it; if that succeeds, the date-time value comes out, and if not, an error comes out instead.
 
-**Call relations**: This helper is used inside `BackfillState::try_from_row` for the optional `last_success_at` field.
+**Call relations**: `BackfillState::try_from_row` uses this when the database row includes a `last_success_at` value. It is the small translation step between compact database storage and the richer time value used in Rust code.
 
 *Call graph*: 1 external calls (from_timestamp).
 
 
 ### `state/src/runtime/backfill.rs`
 
-`domain_logic` · `startup and background backfill coordination`
+`domain_logic` · `startup and background backfill`
 
-This file extends `StateRuntime` with a tiny state machine around the `backfill_state` table. Every public method begins by ensuring the singleton row with `id = 1` exists, via `ensure_backfill_state_row`, so callers do not need separate initialization logic and reads can self-heal after accidental deletion. `get_backfill_state` then reads `status`, `last_watermark`, and `last_success_at` and delegates row decoding to `crate::BackfillState::try_from_row`.
+A backfill is a catch-up job: it scans older data and writes information that was not stored before. This file is the small control panel for that job. It stores the job’s state in a SQLite database table called backfill_state. SQLite is a local database stored on disk.
 
-The claim path is lease-based rather than owner-based. `try_claim_backfill` computes `lease_cutoff = now - lease_seconds`, then updates the singleton row to `Running` only if the backfill is not already `Complete` and either not currently `Running` or running with an expired `updated_at`. A successful update means this runtime claimed the worker slot. Separate helpers mark the backfill running, checkpoint a `last_watermark` while keeping status `Running`, and mark completion while optionally replacing the watermark and always setting `last_success_at` and `updated_at` to the same current timestamp.
+The important idea is that there is exactly one row for this job, with id = 1. Before any read or write, the code first makes sure that row exists. That means the system can repair a missing state row instead of crashing or treating the job as unknown.
 
-The tests cover the intended edge cases: progress persists across transitions, reads still succeed while another SQLite connection holds an immediate write transaction, deleting the singleton row is repaired transparently, stale running leases can be reclaimed, and completed backfills cannot be claimed again. The design intentionally uses `updated_at` as the lease heartbeat field, avoiding a separate lease column.
+The file supports the normal life of the job. It can read the current state, mark the job as running, save a checkpoint called a watermark, and mark the job complete. The watermark is like a bookmark in a book: if the job stops halfway through, it can later resume from the last saved place.
+
+It also has a claiming step. If several runtimes start at once, only one should run the backfill. try_claim_backfill updates the row only if the job is not complete and is not already owned by a fresh running worker. If the previous worker looks stale because its timestamp is too old, another runtime may take over. Without this file, multiple workers could duplicate work, lose progress, or rerun a completed migration-like task.
 
 #### Function details
 
@@ -4152,11 +4166,11 @@ The tests cover the intended edge cases: progress persists across transitions, r
 async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState>
 ```
 
-**Purpose**: Loads the singleton backfill state row and converts it into `crate::BackfillState`. It first guarantees the row exists so callers always get a coherent defaultable state.
+**Purpose**: Reads the saved backfill status from the database. Someone uses this to know whether the catch-up job still needs to run, is already running, or has finished.
 
-**Data flow**: Reads no external inputs beyond `self`, calls `ensure_backfill_state_row`, selects `status`, `last_watermark`, and `last_success_at` from `backfill_state WHERE id = 1`, and passes the fetched row to `crate::BackfillState::try_from_row`. Returns the decoded state or an error.
+**Data flow**: It starts with the runtime’s database connection pool. First it makes sure the single backfill_state row exists. Then it reads status, last_watermark, and last_success_at from that row. Finally it turns the database row into a BackfillState value and returns it.
 
-**Call relations**: This is the main read API for backfill status. It depends on `StateRuntime::ensure_backfill_state_row` so reads can repair missing singleton state before decoding.
+**Call relations**: This is the read side of the backfill control panel. It calls StateRuntime::ensure_backfill_state_row before querying, so callers get a usable state even if the singleton row was missing. It then hands the raw database row to try_from_row to convert stored text and timestamps into the project’s BackfillState type.
 
 *Call graph*: calls 2 internal fn (try_from_row, ensure_backfill_state_row); 1 external calls (query).
 
@@ -4167,11 +4181,11 @@ async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState>
 async fn try_claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Attempts to atomically claim the singleton backfill worker slot using a lease timeout. It refuses claims when the backfill is complete or when another non-stale runner still owns the slot.
+**Purpose**: Tries to reserve the backfill job for this runtime. It returns true only when this runtime successfully becomes the worker that should run the job.
 
-**Data flow**: Consumes `lease_seconds`, ensures the singleton row exists, computes `now` and `lease_cutoff`, then updates `backfill_state` to `status = Running, updated_at = now` only when `id = 1`, status is not `Complete`, and either status is not `Running` or `updated_at <= lease_cutoff`. It returns `true` if exactly one row was updated.
+**Data flow**: It receives a lease length in seconds, reads the current time, and computes the oldest acceptable running timestamp. It then asks the database to update the single state row to Running, but only if the job is not Complete and is not already Running with a fresh timestamp. The output is true if exactly one row changed, otherwise false.
 
-**Call relations**: This is the coordination primitive used by higher-level backfill workers. It relies on `ensure_backfill_state_row` and encodes the lease semantics directly in SQL rather than with a separate owner record.
+**Call relations**: This is used before starting the backfill work, as a gatekeeper. Like the other methods, it first calls StateRuntime::ensure_backfill_state_row. It relies on the database update itself to be the deciding moment, so two competing runtimes cannot both successfully claim the same singleton slot.
 
 *Call graph*: calls 1 internal fn (ensure_backfill_state_row); 2 external calls (now, query).
 
@@ -4182,11 +4196,11 @@ async fn try_claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<bool>
 async fn mark_backfill_running(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Forces the singleton backfill state to `Running` and refreshes its heartbeat timestamp. It does not perform lease checks.
+**Purpose**: Records that the backfill job is currently running. This is useful when the system wants to explicitly refresh or set the job’s visible status.
 
-**Data flow**: Ensures the row exists, computes the current timestamp, and updates `status` and `updated_at` for `id = 1`. Returns `()` on success.
+**Data flow**: It uses the runtime’s database pool, ensures the singleton row exists, gets the current time, and writes status = Running plus an updated timestamp into the row. It returns success or an error from the database operation.
 
-**Call relations**: Used by code that already knows it should be considered the active backfill worker and just needs to persist that state.
+**Call relations**: This is part of the write side of the backfill lifecycle. It calls StateRuntime::ensure_backfill_state_row first, then writes directly to the database. It does not decide ownership like StateRuntime::try_claim_backfill; it simply records the running state.
 
 *Call graph*: calls 1 internal fn (ensure_backfill_state_row); 2 external calls (now, query).
 
@@ -4197,11 +4211,11 @@ async fn mark_backfill_running(&self) -> anyhow::Result<()>
 async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Persists in-progress backfill progress by storing the latest processed watermark while keeping the state marked as running. This acts as resumable progress metadata.
+**Purpose**: Saves progress while the backfill is running. The saved watermark tells future work where the last successful point was.
 
-**Data flow**: Consumes `watermark`, ensures the singleton row exists, computes `Utc::now().timestamp()`, and updates `status = Running`, `last_watermark = watermark`, and `updated_at` for `id = 1`. Returns `()`.
+**Data flow**: It receives a watermark string, such as a path or ordered marker for the data already processed. It ensures the state row exists, writes status = Running, stores the watermark, and updates the timestamp. It returns nothing on success, or an error if the database write fails.
 
-**Call relations**: Called during long-running backfill work to advance progress without marking completion. It shares the same singleton-row precondition helper as the other methods.
+**Call relations**: A backfill worker calls this during the job, after it has safely processed a chunk of work. It depends on StateRuntime::ensure_backfill_state_row and then writes the progress marker so StateRuntime::get_backfill_state can later report it.
 
 *Call graph*: calls 1 internal fn (ensure_backfill_state_row); 2 external calls (now, query).
 
@@ -4212,11 +4226,11 @@ async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()>
 async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()>
 ```
 
-**Purpose**: Marks the singleton backfill as complete, records success time, and optionally updates the final watermark. Existing watermark is preserved when no new one is supplied.
+**Purpose**: Records that the backfill finished successfully. It also optionally stores the final watermark and saves the finish time.
 
-**Data flow**: Consumes optional `last_watermark`, ensures the row exists, computes `now`, and updates `status = Complete`, `last_watermark = COALESCE(input, existing)`, `last_success_at = now`, and `updated_at = now` for `id = 1`. Returns `()`.
+**Data flow**: It receives an optional last watermark. It ensures the state row exists, reads the current time, and updates the row to Complete. If a new watermark is provided, it replaces the old one; if not, the old watermark is kept. It also sets last_success_at and updated_at to the current time.
 
-**Call relations**: This is the terminal success transition for the backfill worker. After this, `StateRuntime::try_claim_backfill` will refuse future claims.
+**Call relations**: A backfill worker calls this at the end of a successful run. After this method marks the job Complete, StateRuntime::try_claim_backfill will refuse future claims, so the finished catch-up job is not run again.
 
 *Call graph*: calls 1 internal fn (ensure_backfill_state_row); 2 external calls (now, query).
 
@@ -4227,11 +4241,11 @@ async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::
 async fn ensure_backfill_state_row(&self) -> anyhow::Result<()>
 ```
 
-**Purpose**: Delegates to the shared pool-level helper that creates or repairs the singleton `backfill_state` row. It hides that initialization detail behind the runtime API.
+**Purpose**: Makes sure the database has the one required row that stores backfill state. This protects the rest of the code from missing-row surprises.
 
-**Data flow**: Reads `self.pool` and passes it to `ensure_backfill_state_row_in_pool`, returning only success or failure. It does not itself inspect or return row contents.
+**Data flow**: It takes the runtime’s database pool and passes it to a shared helper that inserts or repairs the singleton row if needed. It returns success when the row is available, or an error if the database operation fails.
 
-**Call relations**: Every public backfill method calls this first so reads and writes can assume `backfill_state(id=1)` exists.
+**Call relations**: Every public backfill state method calls this first: StateRuntime::get_backfill_state, StateRuntime::try_claim_backfill, StateRuntime::mark_backfill_running, StateRuntime::checkpoint_backfill, and StateRuntime::mark_backfill_complete. It is the common safety step before any read or write.
 
 *Call graph*: called by 5 (checkpoint_backfill, get_backfill_state, mark_backfill_complete, mark_backfill_running, try_claim_backfill).
 
@@ -4242,11 +4256,11 @@ async fn ensure_backfill_state_row(&self) -> anyhow::Result<()>
 async fn backfill_state_persists_progress_and_completion()
 ```
 
-**Purpose**: Checks the normal lifecycle from default pending state through running, checkpointed progress, and final completion. It verifies watermark and success timestamp persistence.
+**Purpose**: Checks the happy path for the backfill state record. It proves that the system starts pending, can record running progress, and can later record completion.
 
-**Data flow**: Creates a temporary runtime, reads initial state, calls `mark_backfill_running`, `checkpoint_backfill`, and `mark_backfill_complete`, then reloads state after each phase and asserts expected field values before cleaning up the temp directory.
+**Data flow**: The test creates a temporary runtime, reads the initial state, marks the job running, saves a checkpoint watermark, reads the state again, then marks the job complete with a final watermark. It compares each observed state with the expected status, watermark, and success time, then removes the temporary directory.
 
-**Call relations**: This test exercises the happy-path interaction among the public backfill state methods.
+**Call relations**: This test exercises StateRuntime::get_backfill_state, StateRuntime::mark_backfill_running, StateRuntime::checkpoint_backfill, and StateRuntime::mark_backfill_complete as one full story. It confirms that the main lifecycle methods work together rather than only working in isolation.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (assert!, assert_eq!, remove_dir_all).
 
@@ -4257,11 +4271,11 @@ async fn backfill_state_persists_progress_and_completion()
 async fn get_backfill_state_succeeds_while_another_connection_holds_writer_slot()
 ```
 
-**Purpose**: Verifies that reading backfill state still works while a separate SQLite connection holds an immediate write transaction. This guards against read-path fragility under writer contention.
+**Purpose**: Checks that reading the backfill state still works even when another database connection is holding a write lock. A write lock is a database reservation that prevents other writers from changing data at the same time.
 
-**Data flow**: Initializes a runtime, opens a second connection with `base_sqlite_options`, begins `BEGIN IMMEDIATE` to hold the writer slot, calls `get_backfill_state`, asserts it returns the default state, then rolls back and removes the temp directory.
+**Data flow**: The test creates a runtime, opens a second SQLite connection, and starts an immediate write transaction to occupy the writer slot. While that lock is held, it calls get_backfill_state and expects to receive the default backfill state. It then rolls back the transaction and deletes the temporary files.
 
-**Call relations**: This test specifically targets the robustness of `StateRuntime::get_backfill_state` and the singleton-row repair/read path under SQLite locking conditions.
+**Call relations**: This test focuses on StateRuntime::get_backfill_state under database contention. It uses StateRuntime::init, base_sqlite_options, and state_db_path to open the same database from another connection, then verifies that the read path remains usable.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 5 external calls (assert_eq!, state_db_path, connect_with, base_sqlite_options, remove_dir_all).
 
@@ -4272,11 +4286,11 @@ async fn get_backfill_state_succeeds_while_another_connection_holds_writer_slot(
 async fn get_backfill_state_repairs_a_missing_singleton_row()
 ```
 
-**Purpose**: Confirms that deleting the singleton row does not permanently break the API because the next read recreates it. It also verifies only one repaired row exists afterward.
+**Purpose**: Checks that the system can recover if the required backfill_state row is missing. This matters because the rest of the file assumes there is one row with id = 1.
 
-**Data flow**: Creates a runtime, manually deletes `backfill_state WHERE id = 1`, calls `get_backfill_state`, asserts the returned state is default, then counts rows with `id = 1` to ensure the repair recreated exactly one singleton row.
+**Data flow**: The test creates a runtime, manually deletes the singleton row from the database, then calls get_backfill_state. It expects the default state to come back and then counts the database rows to confirm the missing row was recreated. Finally it removes the temporary directory.
 
-**Call relations**: This test validates the contract provided by `StateRuntime::ensure_backfill_state_row`, which all public methods depend on.
+**Call relations**: This test proves that StateRuntime::get_backfill_state calls the repair step through StateRuntime::ensure_backfill_state_row. It directly changes the database with a query to simulate damage or an unexpected missing row.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 3 external calls (assert_eq!, query, remove_dir_all).
 
@@ -4287,11 +4301,11 @@ async fn get_backfill_state_repairs_a_missing_singleton_row()
 async fn backfill_claim_is_singleton_until_stale_and_blocked_when_complete()
 ```
 
-**Purpose**: Tests the lease-based claim semantics: first claim succeeds, duplicate fresh claim fails, stale running state can be reclaimed, and completed state blocks future claims. It captures the intended worker-slot behavior.
+**Purpose**: Checks the ownership rules for the backfill worker. It proves that only one fresh worker can claim the job, that a stale worker can be replaced, and that a completed job cannot be claimed again.
 
-**Data flow**: Initializes a runtime, calls `try_claim_backfill` twice, manually ages `updated_at` to a stale timestamp, claims again with a short lease, marks completion, then attempts one final claim and asserts the expected booleans at each step.
+**Data flow**: The test creates a runtime and successfully claims the backfill once. It tries a second claim and expects it to fail. Then it manually makes the running timestamp old, tries again with a short lease, and expects the claim to succeed. Finally it marks the job complete and confirms that claiming after completion returns false.
 
-**Call relations**: This test directly exercises `StateRuntime::try_claim_backfill` and `StateRuntime::mark_backfill_complete`, proving the SQL lease and completion guards behave as designed.
+**Call relations**: This test exercises StateRuntime::try_claim_backfill and StateRuntime::mark_backfill_complete around the edge cases that prevent duplicate workers. It uses a direct database update and the current time to simulate a stale lease.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 4 external calls (now, assert_eq!, query, remove_dir_all).
 
@@ -4301,24 +4315,26 @@ These files cover additional SQLite-backed runtime records for logs, external im
 
 ### `state/src/model/log.rs`
 
-`data_model` · `request handling and query execution whenever logs are inserted, fetched, or serialized`
+`data_model` · `request handling`
 
-This file provides three related data structures for log storage and retrieval. `LogEntry` is the richer serialized record shape intended for outward-facing use: it includes timestamps (`ts`, `ts_nanos`), severity and target strings, optional message content, optional `feedback_log_body`, thread/process identifiers, module path, source file, and line number. It derives `Serialize`, making it suitable for API responses or JSON export.
+Logs are the system’s diary: they record what happened, when it happened, where it came from, and often why it matters. This file does not fetch or write logs itself. Instead, it gives the rest of the program shared, named containers for log-related information so different parts of the system can agree on the same format.
 
-`LogRow` is the SQL-mapped storage representation, deriving `sqlx::FromRow`. It includes the database primary key `id` and most of the same core fields, but notably omits `feedback_log_body` and `module_path`, reflecting the exact columns expected from SQL queries rather than the full serialized view. Keeping this separate avoids coupling query code to presentation concerns.
+`LogEntry` is the outward-facing form of a log record. It can be serialized, meaning it can be turned into a format such as JSON for an API response or another consumer. It includes timestamps, severity level, source target, message text, optional thread and process details, and optional source-code location.
 
-`LogQuery` is a caller-built filter object with a `Default` implementation. It captures level filtering via uppercase strings, timestamp bounds, module/file wildcard lists, explicit thread IDs, free-text search, whether threadless rows should be included, cursor-style pagination through `after_id`, optional `limit`, and sort direction via `descending`. The shape makes query construction explicit and composable: absent options mean no filter, while vectors allow multi-value predicates. This file is purely schema-oriented; SQL generation and execution happen in the log DB layer.
+`LogRow` is the database-facing form. It represents one row read from storage and includes an `id`, which is useful for ordering or paging through logs. It derives `FromRow`, which lets the SQL database library fill the struct from a database query result.
+
+`LogQuery` describes what someone wants to search for: levels, time range, module or file matches, thread IDs, free-text search, paging controls, and sort direction. Think of it like a form filled out before asking the log database, “show me only these kinds of entries.”
 
 
 ### `state/src/runtime/external_agent_config_imports.rs`
 
-`domain_logic` · `post-import result recording and history/detail retrieval`
+`io_transport` · `after external agent config import completion and when import history/details are requested`
 
-This file contains four serializable record structs that describe external agent configuration import outcomes: success entries, failure entries, a detail view combining both lists, and a history view that also includes `import_id` and `completed_at_ms`. The records intentionally preserve concrete import metadata such as `item_type`, optional working directory (`PathBuf`), source and target identifiers, failure stage, and optional error type.
+When the system imports configuration from outside itself, it needs a receipt: what was attempted, what worked, what failed, and why. This file defines that receipt and stores it in the state database. Without it, users or later parts of the program would have no durable history of external agent configuration imports, making troubleshooting much harder.
 
-`StateRuntime::record_external_agent_config_import_completed` writes one row per `import_id` into `external_agent_config_imports`, storing the current completion time in epoch milliseconds via `datetime_to_epoch_millis(Utc::now())` and serializing the success/failure slices as JSON strings. The SQL uses `ON CONFLICT(import_id) DO UPDATE`, so repeated completion writes for the same import replace the stored payload rather than creating duplicates.
+The record types describe successful imported items, failed imported items, a detailed view for one import, and a history view for many imports. A success can include where the import ran from, its source, and its target. A failure also keeps the stage where things went wrong, an optional error type, and a human-readable message.
 
-The two read methods reverse that process. `external_agent_config_import_details_record` fetches one row by `import_id`, extracts the `successes` and `failures` JSON columns, and deserializes them into an `ExternalAgentConfigImportDetailsRecord`. `external_agent_config_import_history_records` fetches all rows ordered by newest completion time then `import_id`, deserializing each row into `ExternalAgentConfigImportHistoryRecord`. The design keeps the schema simple—JSON blobs in SQLite—while exposing strongly typed Rust records to callers. Tests live in a separate file referenced with `#[path = ...]`.
+The database stores the success and failure lists as JSON text. JSON is a common text format for structured data, so the code can keep rich lists inside a database row. The methods on `StateRuntime` are the bridge between normal Rust data and the database table `external_agent_config_imports`: one method writes a completed import, one reads the details for a single import, and one reads the full history ordered newest first. If the same import ID is written again, the old record is updated rather than duplicated, like replacing an old receipt with the latest copy.
 
 #### Function details
 
@@ -4332,11 +4348,11 @@ async fn record_external_agent_config_import_completed(
         failures: &[ExternalAgentConfigImp
 ```
 
-**Purpose**: Upserts the final success and failure lists for a completed external-agent-config import. Reusing the same `import_id` overwrites the previous stored payload and completion timestamp.
+**Purpose**: This function saves the final result of one external agent configuration import. It records the import ID, the finish time, and the lists of successful and failed items so the result can be reviewed later.
 
-**Data flow**: Consumes `import_id`, slices of `ExternalAgentConfigImportSuccessRecord` and `ExternalAgentConfigImportFailureRecord`, computes current epoch milliseconds, serializes both slices to JSON strings, and inserts or updates the `external_agent_config_imports` row in SQLite. It writes database state only and returns `()`.
+**Data flow**: It receives an import ID plus two lists: successes and failures. It gets the current time, converts that time into milliseconds since the Unix epoch, turns both lists into JSON text, and writes everything into the `external_agent_config_imports` database table. If a row with the same import ID already exists, it updates that row with the new timestamp and result lists. It returns success when the database write finishes, or an error if time conversion, JSON conversion, or the database operation fails.
 
-**Call relations**: This is the write-side API used when an import finishes. Later reads through the detail and history methods deserialize exactly the JSON written here.
+**Call relations**: This is called after an import has finished and the system needs to persist its outcome. Inside the function, it asks the clock for the current time, passes that through `datetime_to_epoch_millis` so the database stores a simple number, uses JSON serialization to prepare the result lists, and hands the final insert-or-update statement to the SQL layer.
 
 *Call graph*: 4 external calls (now, datetime_to_epoch_millis, to_string, query).
 
@@ -4350,11 +4366,11 @@ async fn external_agent_config_import_details_record(
     ) -> anyhow::Result<Option<ExternalAgentConfigImportDetailsRecord>>
 ```
 
-**Purpose**: Loads the stored success and failure payloads for one import id and returns them as a typed detail record. Missing imports return `None`.
+**Purpose**: This function looks up the stored success and failure details for one import. It is useful when a user or another part of the system wants to inspect exactly what happened during a specific import.
 
-**Data flow**: Reads `import_id`, selects `successes` and `failures` from `external_agent_config_imports`, fetches an optional row, extracts both columns as `String`, deserializes them from JSON into vectors, and wraps them in `ExternalAgentConfigImportDetailsRecord`.
+**Data flow**: It receives an import ID. It queries the database for the matching row and reads the stored JSON text for successes and failures. If no row exists, it returns `None`. If a row exists, it turns the JSON text back into normal Rust record lists and returns them inside an `ExternalAgentConfigImportDetailsRecord`. Any database or JSON reading problem becomes an error.
 
-**Call relations**: This is the per-import read path paired with `StateRuntime::record_external_agent_config_import_completed`, used when callers need the exact stored outcome for one import.
+**Call relations**: This sits on the read side of the same storage written by `StateRuntime::record_external_agent_config_import_completed`. When something asks for one import's details, this function sends a select query to the SQL layer, then rebuilds the in-memory detail record that callers can use without knowing how the data was stored.
 
 *Call graph*: 1 external calls (query).
 
@@ -4367,22 +4383,26 @@ async fn external_agent_config_import_history_records(
     ) -> anyhow::Result<Vec<ExternalAgentConfigImportHistoryRecord>>
 ```
 
-**Purpose**: Returns all recorded imports as typed history records ordered by newest completion time first. Each row includes both metadata and deserialized success/failure lists.
+**Purpose**: This function returns the saved history of external agent configuration imports. It gives callers a newest-first list, including each import's ID, completion time, successes, and failures.
 
-**Data flow**: Runs a `SELECT` over `import_id`, `completed_at_ms`, `successes`, and `failures`, ordered by `completed_at_ms DESC, import_id ASC`; for each row it extracts scalar columns, deserializes the JSON payloads, and collects `ExternalAgentConfigImportHistoryRecord` values into a vector.
+**Data flow**: It takes no import ID because it reads all stored import records. It asks the database for every row in `external_agent_config_imports`, ordered by completion time from newest to oldest, with import ID used as a stable tie-breaker. For each row, it reads the ID, timestamp, and JSON text fields, converts the JSON back into success and failure lists, and collects everything into a vector of history records. The result is the complete history list, or an error if any database read or JSON conversion fails.
 
-**Call relations**: This is the aggregate read path for UI/history views. It complements the single-record detail lookup and consumes the same persisted JSON schema.
+**Call relations**: This function is used when the system needs an overview rather than one import's details. It relies on the SQL layer to fetch all rows, then performs the same JSON rebuilding step as the single-detail reader so callers receive ordinary structured records instead of raw database text.
 
 *Call graph*: 1 external calls (query).
 
 
 ### `state/src/runtime/remote_control.rs`
 
-`domain_logic` · `runtime request handling for remote-control enrollment persistence`
+`io_transport` · `cross-cutting persistence during remote-control setup and preference changes`
 
-This file defines the persisted shape of a remote-control enrollment and the SQL used to read, insert/update, toggle, and delete those rows from the `remote_control_enrollments` table. The central data type is `RemoteControlEnrollmentRecord`, which stores the websocket endpoint, account identity, optional app-server client name, server/environment identifiers, server display name, and an optional `remote_control_enabled` preference. Because SQLite uniqueness and equality checks are simpler with non-null key columns, the file uses an empty-string sentinel (`REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE`) to encode `None` for `app_server_client_name`. `remote_control_app_server_client_name_key` performs the write-side normalization, while `app_server_client_name_from_key` reverses it on reads.
+This file is the small database layer for remote-control enrollment records. An enrollment is the app’s saved note that says, in effect: “for this WebSocket server URL and this account, use this server ID, environment ID, and server name.” Without this file, the app could not reliably remember or update those enrollments between runs.
 
-`StateRuntime::get_remote_control_enrollment` performs a keyed lookup and reconstructs the record from a row, including nullable `remote_control_enabled`. `upsert_remote_control_enrollment` inserts or updates by the composite key `(websocket_url, account_id, app_server_client_name)`, refreshing server identity fields and `updated_at`; notably, the conflict update clause does not overwrite `remote_control_enabled`, so preference changes are expected to flow through `set_remote_control_enabled`. `delete_remote_control_enrollment` removes exactly one keyed enrollment and returns affected-row count. The tests cover round-tripping by account/client tuple, selective deletion, and migration compatibility where legacy rows lacking the new preference column must surface as `None` after schema upgrade.
+The main record type is `RemoteControlEnrollmentRecord`, which is a plain bundle of saved fields. The `StateRuntime` methods then do the database work: look up one enrollment, insert or update one, change whether remote control is enabled, or delete one.
+
+A subtle detail is the optional `app_server_client_name`. In Rust, this can be `None`, meaning “no client name.” But the database key needs a concrete value to compare against, so this file stores `None` as an empty string. Think of it like writing “no middle name” as a blank box on a form, then turning that blank box back into “no value” when reading it.
+
+The tests check that records are separated correctly by account and client name, that deleting one record does not delete a neighboring one, and that older database rows without the newer remote-control preference still load safely with that preference left unknown.
 
 #### Function details
 
@@ -4392,11 +4412,11 @@ This file defines the persisted shape of a remote-control enrollment and the SQL
 fn remote_control_app_server_client_name_key(app_server_client_name: Option<&str>) -> &str
 ```
 
-**Purpose**: Converts an optional app-server client name into the canonical database key representation. `None` becomes the empty-string sentinel so the composite key can be stored and queried consistently.
+**Purpose**: This helper converts an optional app-server client name into the exact text used as part of the database lookup key. It makes sure “no client name” is stored and searched as an empty string.
 
-**Data flow**: It takes `Option<&str>` and returns `&str`, either the provided client name or `REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE`. It reads no external state and writes nothing.
+**Data flow**: It receives either a client name or no client name. If a name is present, it returns that name; if not, it returns the shared empty-string marker. Nothing else is changed.
 
-**Call relations**: This helper sits on every write and keyed lookup path for remote-control enrollments. `get_remote_control_enrollment`, `upsert_remote_control_enrollment`, `set_remote_control_enabled`, and `delete_remote_control_enrollment` all call it before binding the key column so they agree on how `None` is represented.
+**Call relations**: The database methods call this before reading, writing, updating, or deleting a row. That keeps every operation using the same rule for matching records whose client name is absent.
 
 *Call graph*: called by 4 (delete_remote_control_enrollment, get_remote_control_enrollment, set_remote_control_enabled, upsert_remote_control_enrollment).
 
@@ -4407,11 +4427,11 @@ fn remote_control_app_server_client_name_key(app_server_client_name: Option<&str
 fn app_server_client_name_from_key(app_server_client_name: String) -> Option<String>
 ```
 
-**Purpose**: Decodes the stored key representation back into the public optional client-name field. It treats the empty-string sentinel as absence and preserves any non-empty string.
+**Purpose**: This helper converts the database version of the client name back into the Rust version. An empty string from the database becomes “no client name,” while any other string becomes a real client name.
 
-**Data flow**: It accepts an owned `String` loaded from SQLite and returns `Option<String>`, mapping `""` to `None` and any other value to `Some(value)`. No external state is touched.
+**Data flow**: It receives the stored database text. If the text is empty, it returns no value; otherwise it wraps the text as a present client name. It does not touch the database itself.
 
-**Call relations**: This helper is used during row-to-record reconstruction inside `StateRuntime::get_remote_control_enrollment`. It is the read-side counterpart to `remote_control_app_server_client_name_key`.
+**Call relations**: It belongs to the read path, where a database row is turned back into a `RemoteControlEnrollmentRecord`. It is the reverse of the key helper used before database lookups and writes.
 
 
 ##### `StateRuntime::get_remote_control_enrollment`  (lines 30–65)
@@ -4425,11 +4445,11 @@ async fn get_remote_control_enrollment(
     ) -> anyhow::Result<Option<RemoteControl
 ```
 
-**Purpose**: Looks up a single remote-control enrollment by websocket URL, account ID, and optional app-server client name. If a row exists, it reconstructs a `RemoteControlEnrollmentRecord` with the normalized optional client name and nullable preference field.
+**Purpose**: This function looks up one saved remote-control enrollment. A caller uses it when it needs to know whether a specific account and remote-control endpoint already have saved server details.
 
-**Data flow**: Inputs are the three key components plus `self.pool`. The function builds a `SELECT` query, binds the URL, account, and normalized client-name key, fetches at most one row, then extracts typed columns with `try_get`. It returns `Ok(None)` when no row matches, `Ok(Some(record))` when one does, or propagates SQL/decoding errors.
+**Data flow**: It receives a WebSocket URL, an account ID, and an optional client name. It converts the optional client name into the database key format, asks the SQLite database for a matching row, and if one exists, builds a `RemoteControlEnrollmentRecord` from it. The result is either a full record, no record, or an error if the database read fails.
 
-**Call relations**: Callers use this as the read path after inserts, deletes, migrations, or preference changes. Internally it delegates key normalization to `remote_control_app_server_client_name_key` and row decoding to inline `try_get` extraction plus `app_server_client_name_from_key`.
+**Call relations**: This is the read side of the remote-control enrollment flow. It relies on `remote_control_app_server_client_name_key` so it searches with the same key format used by writes, then uses a database query to fetch the stored row.
 
 *Call graph*: calls 1 internal fn (remote_control_app_server_client_name_key); 1 external calls (query).
 
@@ -4443,11 +4463,11 @@ async fn upsert_remote_control_enrollment(
     ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Inserts a remote-control enrollment or updates the server identity fields of an existing enrollment keyed by target/account/client. It also stamps `updated_at` with the current UTC timestamp.
+**Purpose**: This function saves a remote-control enrollment, creating it if it is new or updating the existing row if the same URL, account, and client name already exist. “Upsert” means insert-or-update.
 
-**Data flow**: It takes a borrowed `RemoteControlEnrollmentRecord`, reads its fields, normalizes `app_server_client_name`, computes `Utc::now().timestamp()`, and executes an `INSERT ... ON CONFLICT DO UPDATE`. The insert writes all columns including `remote_control_enabled`; the conflict update refreshes `server_id`, `environment_id`, `server_name`, and `updated_at`. It returns `Ok(())` or propagates database errors.
+**Data flow**: It receives a complete `RemoteControlEnrollmentRecord`. It converts the optional client name into the database key format, writes all the identifying and server fields into the database, and stamps the row with the current time. If a matching row already exists, it updates the server ID, environment ID, server name, and timestamp instead of creating a duplicate.
 
-**Call relations**: This is the main persistence entry for enrollment creation and refresh. Tests call it before `get_remote_control_enrollment` and `delete_remote_control_enrollment`; preference-only changes are expected to go through `set_remote_control_enabled` rather than this method's narrower conflict update.
+**Call relations**: This is the write side of the enrollment flow. It calls the key helper before storing the row, calls the clock to record when the row changed, and sends the final SQL command to the database.
 
 *Call graph*: calls 1 internal fn (remote_control_app_server_client_name_key); 2 external calls (now, query).
 
@@ -4464,11 +4484,11 @@ async fn set_remote_control_enabled(
     ) ->
 ```
 
-**Purpose**: Updates only the `remote_control_enabled` flag for an existing enrollment and reports whether any row matched. It also refreshes `updated_at`.
+**Purpose**: This function changes the saved on/off preference for remote control on one enrollment. It is used when the app needs to remember whether remote control is enabled for a specific saved target.
 
-**Data flow**: Inputs are the enrollment key tuple, the new boolean flag, and `self.pool`. The function normalizes the optional client name, binds the new flag and current timestamp into an `UPDATE`, executes it, and returns the resulting `rows_affected()` count as `u64`.
+**Data flow**: It receives the identifying fields for one enrollment plus the new enabled value. It converts the optional client name into the database key format, updates the matching row’s `remote_control_enabled` value and timestamp, and returns how many rows were changed.
 
-**Call relations**: This method is the targeted preference-update path for existing enrollments. It relies on the same key normalization helper as the other CRUD methods so callers can address rows consistently whether `app_server_client_name` is present or absent.
+**Call relations**: This function is a focused update path: it does not rewrite the server identity fields, only the enabled preference. Like the other database methods, it uses the shared key helper and the current time before sending an update query.
 
 *Call graph*: calls 1 internal fn (remote_control_app_server_client_name_key); 2 external calls (now, query).
 
@@ -4484,11 +4504,11 @@ async fn delete_remote_control_enrollment(
     ) -> anyhow::Result<u64>
 ```
 
-**Purpose**: Deletes a single enrollment identified by websocket URL, account ID, and optional app-server client name. It returns how many rows were removed.
+**Purpose**: This function removes one saved remote-control enrollment from the local database. A caller uses it when an enrollment should no longer be remembered.
 
-**Data flow**: It reads the three key arguments, converts the optional client name into the stored key form, executes a `DELETE` against `remote_control_enrollments`, and returns `rows_affected()` as `u64`. No other state is modified.
+**Data flow**: It receives a WebSocket URL, an account ID, and an optional client name. It converts the client name into the database key format, deletes only the row matching all three pieces of identity, and returns how many rows were removed.
 
-**Call relations**: Callers use this to remove stale or revoked enrollments. The tests verify that it deletes only the matching row and leaves other account/client combinations intact.
+**Call relations**: This is the cleanup path for enrollments. It shares the same key conversion as lookups and writes, which prevents deleting the wrong row when two records differ only by account or client name.
 
 *Call graph*: calls 1 internal fn (remote_control_app_server_client_name_key); 1 external calls (query).
 
@@ -4499,11 +4519,11 @@ async fn delete_remote_control_enrollment(
 async fn remote_control_enrollment_round_trips_by_target_and_account()
 ```
 
-**Purpose**: Verifies that enrollments are keyed by websocket URL, account ID, and client name, and that inserted rows round-trip back into identical `RemoteControlEnrollmentRecord` values. It also checks that mismatched account or client lookups return `None`.
+**Purpose**: This test proves that enrollment records can be saved and read back correctly, and that different accounts stay separate even when they use the same remote-control URL and client name.
 
-**Data flow**: The test creates a temporary runtime, inserts two enrollment records with the same websocket URL and client name but different accounts, then performs three reads: one exact match and two misses. It compares the returned values to expected records and removes the temp directory at the end.
+**Data flow**: It creates a temporary state directory, initializes a test `StateRuntime`, inserts two enrollments, then reads them back. It expects the first account’s record to match exactly, while lookups for a missing account or wrong client name return nothing. At the end it removes the temporary directory.
 
-**Call relations**: This async test is driven by the test runner. It exercises the normal write/read flow through `StateRuntime::init`, `upsert_remote_control_enrollment`, and `get_remote_control_enrollment` under distinct key combinations.
+**Call relations**: This test exercises the main save-and-read story through `StateRuntime::init`, the enrollment writing method, and the enrollment reading method. The assertions act like checkpoints showing that the database key uses URL, account, and client name together.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -4514,11 +4534,11 @@ async fn remote_control_enrollment_round_trips_by_target_and_account()
 async fn delete_remote_control_enrollment_removes_only_matching_entry()
 ```
 
-**Purpose**: Confirms that deletion is scoped to the exact enrollment key and does not remove neighboring rows. The scenario specifically covers the `None` client-name case encoded through the empty-string sentinel.
+**Purpose**: This test checks that deleting one enrollment does not accidentally remove another enrollment with similar details. It protects against overly broad delete queries.
 
-**Data flow**: It initializes a runtime, inserts two enrollments sharing the same websocket URL but different accounts and no client name, deletes one by exact key, then reads both keys back. The test asserts one affected row, absence of the deleted record, presence of the retained record, and finally removes the temp directory.
+**Data flow**: It creates a temporary runtime, inserts two enrollments with the same URL and no client name but different accounts, deletes only the first account’s enrollment, then checks the first is gone and the second is still present. It finally cleans up the temporary directory.
 
-**Call relations**: The test runner invokes this async test to validate the interaction between `upsert_remote_control_enrollment`, `delete_remote_control_enrollment`, and `get_remote_control_enrollment` when the optional client-name component is absent.
+**Call relations**: This test follows the delete path after first using the normal insert path. It then calls the read path to confirm the deletion was precise rather than destructive.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 2 external calls (assert_eq!, remove_dir_all).
 
@@ -4529,11 +4549,11 @@ async fn delete_remote_control_enrollment_removes_only_matching_entry()
 async fn migration_preserves_legacy_remote_control_preference_as_null()
 ```
 
-**Purpose**: Checks schema migration compatibility for legacy enrollment rows created before `remote_control_enabled` existed. After upgrading the database, the old row should still load and expose `remote_control_enabled` as `None` rather than a fabricated default.
+**Purpose**: This test checks compatibility with older state databases that did not yet have a saved remote-control enabled preference. It makes sure old rows still load, with that newer field left unknown instead of forced to true or false.
 
-**Data flow**: The test creates a temp state DB, constructs an older migrator from the first 36 migrations, opens the SQLite file directly, applies the old schema, inserts a legacy enrollment row without the preference column, closes the pool, then initializes `StateRuntime` on the same home. It reads the migrated enrollment and asserts that `actual.remote_control_enabled` is `None`, then cleans up the temp directory.
+**Data flow**: It creates a temporary database using an older set of migrations, manually inserts a legacy enrollment row without `remote_control_enabled`, closes that database, then initializes the current runtime so migrations can bring it up to date. It reads the enrollment and checks that `remote_control_enabled` is still `None`.
 
-**Call relations**: This async migration test bypasses normal runtime writes to seed an old-schema database directly, then re-enters through `StateRuntime::init` and `get_remote_control_enrollment` to validate the upgraded read path.
+**Call relations**: This test connects the migration path with the normal enrollment read path. It uses the old migrator and direct SQL setup to recreate a real upgrade scenario, then relies on `StateRuntime::init` and the enrollment lookup to verify the upgraded data behaves correctly.
 
 *Call graph*: calls 2 internal fn (init, unique_temp_dir); 8 external calls (Owned, new, connect_with, assert_eq!, state_db_path, query, create_dir_all, remove_dir_all).
 
@@ -4545,29 +4565,37 @@ These files define the storage-agnostic agent graph store API and its local impl
 
 `data_model` · `cross-cutting`
 
-This file is the crate’s canonical error definition for persisted agent thread topology operations. It introduces `AgentGraphStoreResult<T>` as a direct alias for `Result<T, AgentGraphStoreError>`, ensuring every store API returns the same error shape regardless of backend. The central type is `AgentGraphStoreError`, an enum derived with `Debug` and `thiserror::Error`, so it participates cleanly in Rust error propagation while also formatting stable human-readable messages.
+The agent graph store is a part of the system that other code asks to save, read, or update graph-related data. When something goes wrong, callers need a predictable answer, not a mix of unrelated error shapes. This file provides that shared answer.
 
-The enum intentionally has only two variants. `InvalidRequest { message: String }` represents caller mistakes such as malformed identifiers, impossible state transitions, or unsupported query parameters. `Internal { message: String }` is the fallback for implementation failures that do not deserve a more specific public category, such as storage corruption, lock poisoning, or backend-specific failures being normalized at the crate boundary. Both variants carry a `String` rather than nested source types, which keeps the public API storage-neutral and avoids leaking backend internals through the trait boundary. The design choice here is minimalism: callers can distinguish bad input from store failure, while implementations retain freedom to map richer internal errors into concise external messages.
+It defines a convenient result type, `AgentGraphStoreResult<T>`, which means “either the requested value of type `T`, or an `AgentGraphStoreError`.” This keeps function signatures shorter and makes it clear that store operations can fail in known ways.
+
+The main error type, `AgentGraphStoreError`, has two cases. `InvalidRequest` is for problems caused by the caller, such as asking for something with missing or unacceptable input. `Internal` is for failures inside the store implementation itself, when the request was acceptable but the store could not complete it.
+
+Both cases carry a plain message meant to explain the problem. The `thiserror` helper turns these enum cases into normal Rust errors with readable text. Without this file, each graph store implementation might invent its own error style, making failures harder to understand and harder for callers to handle consistently.
 
 
 ### `agent-graph-store/src/store.rs`
 
-`domain_logic` · `request handling`
+`data_model` · `cross-cutting during thread graph persistence and lookup`
 
-This file contains the core abstraction of the crate: the `AgentGraphStore` trait. The trait is `Send + Sync`, making implementations safe to share across concurrent async execution contexts. Every method is asynchronous and returns an `AgentGraphStoreResult`, so callers interact with a uniform future-based API regardless of whether the backend is in-memory, file-backed, or remote.
+This file is a contract for storing and reading an agent thread graph. In this project, a thread can spawn another thread, creating a parent-to-child link. Those links also have a lifecycle status, such as whether the spawned thread is still open. Without this contract, every part of the system that wants to save or inspect those relationships would need to know the details of the chosen storage backend.
 
-The domain model is a directed edge from `parent_thread_id: ThreadId` to `child_thread_id: ThreadId`, annotated with a `ThreadSpawnEdgeStatus`. `upsert_thread_spawn_edge` establishes or replaces the single persisted incoming parent edge for a child; the comments make the one-parent invariant explicit and require re-insertion to overwrite both parent and status. `set_thread_spawn_edge_status` updates only the status and must treat unknown children as a successful no-op, which simplifies callers that race with deletion or partial persistence. The two list methods define important ordering and traversal semantics. `list_thread_spawn_children` returns direct children, optionally filtered by exact status. `list_thread_spawn_descendants` performs breadth-first traversal ordered first by depth and then by thread id, and its `status_filter` constrains traversal itself, not just final output. That subtle rule means a closed edge prunes the entire subtree when filtering for open edges. The file therefore serves as both interface and behavioral contract for deterministic graph queries.
+The central idea is the `AgentGraphStore` trait. A trait in Rust is like a promise: any storage implementation that claims to be an `AgentGraphStore` must provide the listed operations. The operations are asynchronous, meaning they return work that may finish later, which is important because real storage may involve waiting on disk or a database.
+
+The contract covers four main needs. It can insert or replace a parent-child spawn edge. It can update the status of an existing child edge, while treating a missing child as harmless. It can list the direct children of one parent, optionally filtered by status. It can also list all descendants under a root thread, walking level by level, like reading a family tree generation by generation.
+
+One important detail is stable ordering. Implementations are expected to return lists in a predictable order, so persisted results can be combined with live in-memory results without random-looking output changes.
 
 
 ### `agent-graph-store/src/local.rs`
 
-`io_transport` · `request handling / persistence access`
+`io_transport` · `cross-cutting; active whenever local agent thread relationships are written or read`
 
-This file is the bridge between the crate-level `AgentGraphStore` trait and the lower-level `StateRuntime` persistence API. The central type, `LocalAgentGraphStore`, is a thin cloneable wrapper around `Arc<StateRuntime>`, so multiple callers can share the same initialized state database handle without owning separate connections or setup logic. Its `Debug` implementation intentionally exposes only the runtime’s `codex_home` path and marks the struct non-exhaustive rather than dumping internal database state.
+Agents can create child threads, and the system needs to remember that family tree: which thread started which child, whether that connection is still open, and how to find all children or later descendants. This file supplies the local version of that storage. Think of it like a family-tree notebook kept on disk, where each parent-child line can be marked “open” or “closed.”
 
-The trait implementation is almost entirely adapter code: each public async method converts the crate’s `ThreadSpawnEdgeStatus` enum into `codex_state::DirectionalThreadSpawnEdgeStatus` via `to_state_status`, invokes the corresponding `StateRuntime` async method, and maps any backend error into `AgentGraphStoreError::Internal` using `internal_error`. The two list methods preserve an important branch: when a status filter is present they call the status-specific runtime query, otherwise they call the unfiltered query. There is no in-memory caching, deduplication, or traversal logic here; ordering and breadth-first descendant semantics come from `StateRuntime` and are asserted in tests.
+The main type, LocalAgentGraphStore, wraps an already-created StateRuntime, which is the lower-level state database. Rather than inventing new storage rules, it forwards each graph-store request to that database. When callers ask to add or update a parent-child connection, the store translates the public ThreadSpawnEdgeStatus value into the matching status type used by codex_state, then asks StateRuntime to write it. When callers ask for children or descendants, it either asks for all of them or, if a status filter is provided, asks for only open or only closed ones.
 
-The tests build a temporary runtime with `TempDir`, synthesize deterministic `ThreadId` values from formatted UUID strings, and verify direct-child listing, status mutation, and descendant traversal. They also confirm that filtered results match the underlying state runtime’s own filtered queries, making this file’s main invariant explicit: it must be a faithful status-converting façade over `StateRuntime`.
+The file also turns lower-level database errors into AgentGraphStoreError::Internal so callers see one consistent error shape. The tests build a temporary database, insert thread relationships, update statuses, and confirm that direct children and deeper descendants come back in the expected order and with the expected filtering.
 
 #### Function details
 
@@ -4577,11 +4605,11 @@ The tests build a temporary runtime with `TempDir`, synthesize deterministic `Th
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats the store for debugging without exposing the full runtime internals. It reports the `codex_home` backing path and leaves the struct marked non-exhaustive.
+**Purpose**: Creates a short debug view of the local graph store. It shows where the underlying Codex home directory is, without exposing every internal detail.
 
-**Data flow**: Reads `self.state_db.codex_home()` from the wrapped `StateRuntime` and writes that value into a `DebugStruct` builder attached to the provided formatter. Returns the formatter’s `std::fmt::Result`.
+**Data flow**: It receives the store and a debug formatter. It reads the codex_home path from the wrapped state database, writes that into a debug-style structure, and returns whether formatting succeeded.
 
-**Call relations**: This is invoked implicitly by Rust formatting/debugging paths rather than by the store logic itself. Its only delegation is to the formatter’s `debug_struct` machinery so logs can identify which local state directory backs the store.
+**Call relations**: When Rust code asks to print this store for debugging, this function is used. It relies on the formatter’s debug_struct helper to build a readable summary.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -4592,11 +4620,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn new(state_db: Arc<StateRuntime>) -> Self
 ```
 
-**Purpose**: Constructs a `LocalAgentGraphStore` from an already initialized shared `StateRuntime`. It performs no setup beyond storing the `Arc`.
+**Purpose**: Builds a LocalAgentGraphStore around an already-initialized StateRuntime. Use this when the database is ready and you want it to satisfy the AgentGraphStore interface.
 
-**Data flow**: Consumes an `Arc<StateRuntime>` argument and places it into the `state_db` field of a new `LocalAgentGraphStore`, returning that wrapper by value.
+**Data flow**: It takes a shared pointer to the state database as input. It stores that pointer inside a new LocalAgentGraphStore and returns the store.
 
-**Call relations**: Used by the file’s tests after creating a temporary runtime fixture. It is the entry point that wires this adapter around an existing runtime before trait methods are exercised.
+**Call relations**: The tests call this after creating a temporary StateRuntime. In normal use, setup code would do the same: initialize the state database first, then wrap it with this graph-store adapter.
 
 *Call graph*: called by 3 (local_store_lists_descendants_breadth_first_with_status_filters, local_store_updates_edge_status, local_store_upserts_and_lists_direct_children_with_status_filters).
 
@@ -4612,11 +4640,11 @@ async fn upsert_thread_spawn_edge(
     ) -> AgentGraphStoreResult<()>
 ```
 
-**Purpose**: Creates or updates a directional parent→child thread-spawn edge in the state database with the requested open/closed lifecycle status.
+**Purpose**: Adds or replaces the stored link from a parent thread to a child thread. This is used when one agent thread spawns another and the system needs to record that relationship.
 
-**Data flow**: Takes `parent_thread_id`, `child_thread_id`, and crate-level `ThreadSpawnEdgeStatus`; converts the status with `to_state_status`; awaits `state_db.upsert_thread_spawn_edge(...)`; maps any backend error into `AgentGraphStoreError::Internal`; returns `AgentGraphStoreResult<()>`.
+**Data flow**: It receives a parent thread id, a child thread id, and an open-or-closed status. It converts the status into the state database’s own status type, asks the database to save the edge, and returns success or a graph-store error.
 
-**Call relations**: As part of the `AgentGraphStore` trait implementation, this is called by higher-level graph users whenever a spawn relationship must be recorded. It delegates all persistence to `StateRuntime`, with this file only responsible for enum translation and error normalization.
+**Call relations**: This is one of the AgentGraphStore operations implemented by the local store. Before handing the work to StateRuntime, it calls to_state_status so the public store status matches the database status type.
 
 *Call graph*: calls 1 internal fn (to_state_status).
 
@@ -4631,11 +4659,11 @@ async fn set_thread_spawn_edge_status(
     ) -> AgentGraphStoreResult<()>
 ```
 
-**Purpose**: Updates the lifecycle status of an existing spawn edge identified by child thread id, such as closing an open child edge.
+**Purpose**: Changes the status of an existing child-thread relationship. For example, it can mark a previously open spawn edge as closed.
 
-**Data flow**: Accepts `child_thread_id` and crate-level `ThreadSpawnEdgeStatus`, translates the status via `to_state_status`, calls `state_db.set_thread_spawn_edge_status(...)`, converts any error through `internal_error`, and returns `AgentGraphStoreResult<()>`.
+**Data flow**: It receives the child thread id and the new status. It converts the status for the state database, asks the database to update the stored edge for that child, and returns success or a graph-store error.
 
-**Call relations**: Called when callers need to mutate edge state without re-specifying the parent. It follows the same adapter pattern as `upsert_thread_spawn_edge`, delegating the actual update to `StateRuntime`.
+**Call relations**: This method is called through the AgentGraphStore interface when higher-level code needs to close or reopen a spawn relationship. It uses to_state_status before passing the request to StateRuntime.
 
 *Call graph*: calls 1 internal fn (to_state_status).
 
@@ -4650,11 +4678,11 @@ async fn list_thread_spawn_children(
     ) -> AgentGraphStoreResult<Vec<ThreadId>>
 ```
 
-**Purpose**: Fetches direct child thread ids for a parent, optionally restricting results to only open or only closed edges.
+**Purpose**: Returns the direct children of a parent thread. A caller can ask for all children, or only those whose relationship is open or closed.
 
-**Data flow**: Receives `parent_thread_id` and `Option<ThreadSpawnEdgeStatus>`. If the option is `Some`, it converts the status and awaits `state_db.list_thread_spawn_children_with_status(...)`; otherwise it awaits `state_db.list_thread_spawn_children(...)`. In both branches it maps backend errors to `AgentGraphStoreError::Internal` and returns `Vec<ThreadId>`.
+**Data flow**: It receives a parent thread id and an optional status filter. If a filter is present, it converts that status and asks the state database for only matching children; otherwise it asks for all direct children. It returns a list of child thread ids or an error.
 
-**Call relations**: This method is invoked by graph consumers that need one-hop child relationships. Its key control-flow branch is driven by whether a status filter is present, selecting the filtered or unfiltered runtime query accordingly.
+**Call relations**: This method is the local store’s answer to the AgentGraphStore child-listing request. When filtering is needed, it calls to_state_status before delegating to the StateRuntime filtering query.
 
 *Call graph*: calls 1 internal fn (to_state_status).
 
@@ -4669,11 +4697,11 @@ async fn list_thread_spawn_descendants(
     ) -> AgentGraphStoreResult<Vec<ThreadId>>
 ```
 
-**Purpose**: Fetches all descendant thread ids under a root thread, optionally filtered by edge status.
+**Purpose**: Returns all known descendants below a root thread, not just immediate children. This lets callers see the whole spawned-thread tree under one starting thread.
 
-**Data flow**: Takes `root_thread_id` and `Option<ThreadSpawnEdgeStatus>`. A `match` chooses between `state_db.list_thread_spawn_descendants_with_status(...)` after status conversion or `state_db.list_thread_spawn_descendants(...)` with no filter. Errors are converted to `AgentGraphStoreError::Internal`; the return value is `Vec<ThreadId>`.
+**Data flow**: It receives a root thread id and an optional status filter. With a filter, it converts the requested status and asks the state database for matching descendants; without one, it asks for every descendant. It returns the descendant thread ids or an error.
 
-**Call relations**: Used when callers need transitive graph traversal rather than direct children. Like the child-listing method, it is a pure adapter whose branching mirrors the presence or absence of a status filter while leaving traversal ordering to `StateRuntime`.
+**Call relations**: This method implements the AgentGraphStore descendant-listing operation. It follows the same pattern as direct-child listing: decide whether filtering is needed, translate the status with to_state_status when necessary, then delegate to StateRuntime.
 
 *Call graph*: calls 1 internal fn (to_state_status).
 
@@ -4684,11 +4712,11 @@ async fn list_thread_spawn_descendants(
 fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThreadSpawnEdgeStatus
 ```
 
-**Purpose**: Maps the crate’s public thread-spawn edge status enum to the equivalent `codex_state` directional status enum.
+**Purpose**: Translates the graph store’s public edge status into the matching status type used by the state database. This keeps the rest of the file from repeating the same conversion logic.
 
-**Data flow**: Consumes a `ThreadSpawnEdgeStatus` value and returns the corresponding `codex_state::DirectionalThreadSpawnEdgeStatus` variant through a two-arm `match`.
+**Data flow**: It receives a ThreadSpawnEdgeStatus value. If it is Open, it returns the database’s Open value; if it is Closed, it returns the database’s Closed value.
 
-**Call relations**: This helper is the shared conversion point used by all trait methods that pass status into `StateRuntime`. It centralizes the enum mapping so the adapter methods stay consistent.
+**Call relations**: All four store operations that write, update, or filter by status call this helper before talking to StateRuntime. It is the small adapter between the graph-store vocabulary and the state-database vocabulary.
 
 *Call graph*: called by 4 (list_thread_spawn_children, list_thread_spawn_descendants, set_thread_spawn_edge_status, upsert_thread_spawn_edge).
 
@@ -4699,11 +4727,11 @@ fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThr
 fn internal_error(err: impl std::fmt::Display) -> AgentGraphStoreError
 ```
 
-**Purpose**: Wraps any displayable backend error as the store’s generic internal error variant with a string message.
+**Purpose**: Wraps a lower-level error in the graph store’s standard internal-error type. This gives callers one consistent error format instead of leaking database-specific error shapes.
 
-**Data flow**: Accepts any `err` implementing `Display`, converts it to a `String` with `to_string`, and returns `AgentGraphStoreError::Internal { message }`.
+**Data flow**: It receives any error-like value that can be displayed as text. It turns that value into a string and places it inside AgentGraphStoreError::Internal.
 
-**Call relations**: Used as the common `map_err` target after runtime calls fail. It collapses backend-specific error types into the trait’s crate-level error surface.
+**Call relations**: The store methods use this as the error-conversion step after calling the state database. Inside the helper, the original error is converted to text with to_string.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -4714,11 +4742,11 @@ fn internal_error(err: impl std::fmt::Display) -> AgentGraphStoreError
 fn thread_id(suffix: u128) -> ThreadId
 ```
 
-**Purpose**: Builds deterministic `ThreadId` values for tests from a numeric suffix embedded into a UUID-shaped string.
+**Purpose**: Creates predictable ThreadId values for tests. Predictable ids make it easy to check that returned lists are in the exact expected order.
 
-**Data flow**: Takes a `u128` suffix, formats it into `00000000-0000-0000-0000-{suffix:012}`, parses that string with `ThreadId::from_string`, and returns the resulting `ThreadId`, panicking if parsing fails.
+**Data flow**: It receives a numeric suffix. It formats that suffix into a UUID-shaped string, parses it into a ThreadId, and returns the ThreadId, failing the test if the string is somehow invalid.
 
-**Call relations**: Called by all three async tests to create stable parent/child ids without hardcoding many full UUID literals. It isolates test-id generation from the assertions.
+**Call relations**: The test cases call this helper whenever they need parent, child, grandchild, or deeper thread ids. It uses formatting and ThreadId parsing to avoid hard-coding many full UUID strings.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (format!).
 
@@ -4729,11 +4757,11 @@ fn thread_id(suffix: u128) -> ThreadId
 async fn state_runtime() -> TestRuntime
 ```
 
-**Purpose**: Creates a temporary initialized `StateRuntime` fixture backed by a fresh temp directory for integration tests.
+**Purpose**: Creates a fresh temporary state database for each test. This keeps tests isolated so data from one test cannot affect another.
 
-**Data flow**: Allocates a `TempDir`, passes its path and a fixed provider string into `StateRuntime::init(...).await`, stores the resulting `Arc<StateRuntime>` plus the tempdir handle in `TestRuntime`, and returns that fixture.
+**Data flow**: It creates a temporary directory, initializes StateRuntime inside that directory with a test provider name, and returns both the runtime and the temporary directory holder so the directory stays alive during the test.
 
-**Call relations**: This helper is the shared setup path for all tests in the module. By retaining the `TempDir` inside `TestRuntime`, it keeps the backing directory alive for the duration of each test.
+**Call relations**: Each test starts by calling this helper. It calls the temporary-directory constructor and StateRuntime initialization, then hands the ready database to LocalAgentGraphStore::new.
 
 *Call graph*: calls 1 internal fn (init); 1 external calls (new).
 
@@ -4744,11 +4772,11 @@ async fn state_runtime() -> TestRuntime
 async fn local_store_upserts_and_lists_direct_children_with_status_filters()
 ```
 
-**Purpose**: Verifies that inserted child edges are listed in expected order and that open/closed filtering matches both explicit expectations and the underlying state runtime.
+**Purpose**: Checks that the local store can insert direct child edges and list them with or without status filtering. It proves that open and closed child relationships are stored separately but can also be read together.
 
-**Data flow**: Builds a temporary runtime and store, creates one parent and two children, inserts one closed and one open edge, then queries all children, open children, and closed children. It compares returned vectors against expected `ThreadId` sequences and against `StateRuntime`’s filtered query result.
+**Data flow**: It creates a temporary database and store, builds one parent id and two child ids, inserts one closed edge and one open edge, then asks for all children, open children, and closed children. It compares the returned lists with the expected ids.
 
-**Call relations**: This test drives `LocalAgentGraphStore::new`, `upsert_thread_spawn_edge`, and `list_thread_spawn_children` through the normal adapter path. It specifically exercises the branch where `status_filter` is `None` and the branch where it is `Some(...)`.
+**Call relations**: This test calls state_runtime to get a clean database, LocalAgentGraphStore::new to wrap it, thread_id to make stable ids, and assertions to verify results. It also compares one filtered store result with the lower-level StateRuntime query to confirm the adapter is forwarding correctly.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (state_runtime, thread_id, assert_eq!).
 
@@ -4759,11 +4787,11 @@ async fn local_store_upserts_and_lists_direct_children_with_status_filters()
 async fn local_store_updates_edge_status()
 ```
 
-**Purpose**: Checks that changing an edge from open to closed moves the child between filtered result sets.
+**Purpose**: Checks that an existing child edge can have its status changed. It verifies that a child moves from the open list to the closed list after an update.
 
-**Data flow**: Creates a runtime and store, inserts an open edge, updates that child edge to closed, then queries open and closed child lists for the parent. It asserts that the open list becomes empty and the closed list contains the child id.
+**Data flow**: It creates a temporary store, inserts an open parent-child edge, updates that child edge to closed, then lists open and closed children. The expected result is no open children and one closed child.
 
-**Call relations**: This test covers the mutation path through `set_thread_spawn_edge_status` after an initial `upsert_thread_spawn_edge`. It validates that later filtered reads observe the updated persisted status.
+**Call relations**: This test uses state_runtime, LocalAgentGraphStore::new, thread_id, and assertions. It exercises the store’s insert, status-update, and filtered child-listing methods together.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (state_runtime, thread_id, assert_eq!).
 
@@ -4774,19 +4802,21 @@ async fn local_store_updates_edge_status()
 async fn local_store_lists_descendants_breadth_first_with_status_filters()
 ```
 
-**Purpose**: Builds a multi-level spawn tree and verifies descendant traversal order plus status-filtered descendant selection.
+**Purpose**: Checks that the local store can list a whole thread family tree, not just direct children, and can filter that tree by status. It also confirms the expected breadth-first order, meaning nearer generations are returned before deeper ones.
 
-**Data flow**: Creates several thread ids, inserts a mix of open and closed edges across child, grandchild, and great-grandchild levels, then queries all descendants, open descendants, and closed descendants from the root. It asserts breadth-first ordering for the unfiltered result and exact filtered subsets for open and closed queries, also cross-checking open descendants against the underlying state runtime.
+**Data flow**: It creates a temporary store, builds a root thread with children, grandchildren, and a great-grandchild, and inserts edges with mixed open and closed statuses. It then asks for all descendants, only open descendants, and only closed descendants, comparing each answer with the expected order and contents.
 
-**Call relations**: This is the broadest integration test in the file, exercising repeated `upsert_thread_spawn_edge` calls followed by `list_thread_spawn_descendants` with and without filters. It demonstrates that traversal semantics are inherited correctly from `StateRuntime` through this adapter.
+**Call relations**: This test calls state_runtime for a clean database, LocalAgentGraphStore::new for the adapter, thread_id for stable ids, and assertions for checking behavior. It also compares the open-descendant result with the direct StateRuntime query to make sure the local store’s translation layer matches the database behavior.
 
 *Call graph*: calls 1 internal fn (new); 3 external calls (state_runtime, thread_id, assert_eq!).
 
 
 ### `agent-graph-store/src/lib.rs`
 
-`orchestration` · `startup`
+`other` · `cross-cutting`
 
-This file is the top-level API surface for the `agent-graph-store` crate. Its module declarations split the crate into four concerns: `error` for shared failure types, `local` for the in-process implementation, `store` for the storage-neutral trait boundary, and `types` for domain enums such as edge lifecycle state. The crate-level documentation string summarizes the domain: persisted parent/child topology for agents spawned from threads.
+This file does not contain the storage logic itself. Instead, it organizes the crate and decides what outside code is allowed to use. The crate is about tracking a small graph of relationships: when one agent starts another agent or thread, there is a parent-to-child connection, much like a family tree. Keeping that topology separate from any one storage backend means the rest of the system can ask the same questions no matter where the data is kept.
 
-The file’s main job is selective re-export. External users do not need to know the internal module layout; instead they import `AgentGraphStoreError`, `AgentGraphStoreResult`, `LocalAgentGraphStore`, `AgentGraphStore`, and `ThreadSpawnEdgeStatus` directly from the crate root. That makes the crate read like a compact interface: one trait to program against, one concrete implementation for local use, one enum describing edge state, and one shared error/result pair. There is no executable logic here, but the design matters because it establishes the crate’s stable public boundary and hides implementation details behind a small set of names. In practice this file is active whenever another crate depends on the graph store API, whether for trait-based integration, testing with the local backend, or matching on standardized errors.
+The file pulls in four internal modules: errors, a local in-memory or local implementation, the shared store interface, and common types. Then it re-exports the important public names so callers can import them from this crate directly. That keeps other parts of the project from needing to know the internal folder layout.
+
+The exported items are the error and result types used when graph operations fail, the local store implementation, the main `AgentGraphStore` abstraction, and `ThreadSpawnEdgeStatus`, which describes the state of a parent/child thread-spawn connection. Without this file, the crate would still have internal pieces, but they would be harder or impossible for the rest of the system to reach cleanly.

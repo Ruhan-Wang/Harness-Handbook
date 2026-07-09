@@ -1,10 +1,8 @@
 # Rollout files and thread-store persistence  `stage-21.1`
 
-This stage is the persistence backbone that sits beneath the main conversation loop and survives process restarts. It records session rollouts to disk, exposes them as durable threads, and provides the query and maintenance paths used when the app resumes, lists, searches, archives, or deletes prior conversations.
+This stage is the system’s local memory for conversations. It runs behind the scenes during normal use, so chats can be resumed, listed, searched, archived, or deleted later. The rollout files are the raw diary: recorder.rs writes each session as JSON Lines, meaning one JSON record per line, while compression.rs can read old diaries even after they are packed into smaller .zst files. list.rs, search.rs, and session_index.rs help find those diaries by time, thread ID, name, or text match. core/src/rollout.rs and rollout/src/lib.rs make these tools easy for the rest of the app to reach.
 
-At the rollout layer, core/src/rollout.rs adapts the app’s Config into the rollout crate. rollout/src/lib.rs defines the public API, while recorder.rs drives JSONL recording, replay loading, resume selection, and background writing. compression.rs makes plain and zstd-compressed transcripts look like one logical file, session_index.rs maintains the lightweight thread-name sidecar, list.rs discovers and summarizes threads across active and archived files, and search.rs scans transcript contents and extracts snippets. message-history/src/lib.rs separately maintains the global append-only history file.
-
-The thread-store crate wraps these filesystem details behind a storage-neutral contract. store.rs defines the async ThreadStore API, error.rs standardizes failures, and in_memory.rs supplies a test backend. local/mod.rs integrates the real local backend, with live_writer.rs handling active writes, read_thread.rs reconstructing stored threads, list_threads.rs and search_threads.rs serving browse/search queries, delete_thread.rs removing persisted data, and helpers.rs supplying shared compatibility and parsing logic.
+The thread-store layer is the cleaner front desk on top of those files. store.rs defines the shared “save, read, list, update, archive, delete” contract, error.rs defines common failure messages, and lib.rs exports it all. The local store ties rollout logs, optional SQLite metadata, and live writers together. Its helpers validate paths and convert old metadata. live_writer.rs keeps active chats being saved, read_thread.rs rebuilds a thread, list_threads.rs and search_threads.rs support browsing, and delete_thread.rs removes saved files. message-history separately stores the user’s global prompt history safely across processes.
 
 ## Files in this stage
 
@@ -13,13 +11,13 @@ These files define the rollout subsystem’s public API and bridge the main appl
 
 ### `core/src/rollout.rs`
 
-`orchestration` · `cross-cutting integration used whenever rollout/session archival code needs config access`
+`orchestration` · `cross-cutting during session recording, listing, and rollout setup`
 
-This file is mostly an integration shim between core configuration and the rollout/session archival subsystem implemented in `codex_rollout`. At the top it re-exports a broad set of rollout constants, data types, sorting/paging helpers, and lookup functions so the rest of the core crate can consume rollout functionality through this module rather than depending directly on the external crate's paths. It also exposes a small nested `list` module and a test-only `recorder` module that selectively re-export rollout helpers for narrower use sites.
+A “rollout” here is the saved record of a Codex session or thread: where it lives on disk, how it is named, how it is listed, and what metadata belongs to it. Most of that work lives in the separate `codex_rollout` crate. This file makes that crate feel like part of `core` by publicly re-exporting its important types and helper functions.
 
-The only executable logic is the implementation of `codex_rollout::RolloutConfigView` for the local `Config` type. Each trait method is a direct field projection: filesystem paths are returned as `&Path` references via `.as_path()`, the model provider ID is returned as `&str` via `.as_str()`, and the memory-generation flag is forwarded from `self.memories.generate_memories`. This trait implementation is what allows generic rollout code to read the core application's home directories, current working directory, provider identity, and memory-generation setting without depending on the full `Config` definition.
+The one piece of real behavior in this file is an adapter between two worlds. The rollout crate expects something that implements `RolloutConfigView`, which is a small read-only view of the settings it needs. The main application already has a broader `Config` type. This file teaches `Config` how to answer the rollout crate’s specific questions: where the Codex home folder is, where SQLite data lives, what the current working directory is, which model provider is being used, and whether memory generation is enabled.
 
-The file also re-exports `map_session_init_error` and a `truncation` module from crate-local code, making rollout-related initialization and truncation helpers available alongside the rollout facade.
+An everyday analogy: the rollout crate asks for a short checklist, while `Config` is a full binder of settings. This file marks the binder pages that answer the checklist. Without it, session recording and thread listing code would either not compile or would need to know too much about the full application configuration.
 
 #### Function details
 
@@ -29,11 +27,11 @@ The file also re-exports `map_session_init_error` and a `truncation` module from
 fn codex_home(&self) -> &std::path::Path
 ```
 
-**Purpose**: Exposes the configured Codex home directory to rollout code through the `RolloutConfigView` trait. It is a direct borrowed view into `Config`.
+**Purpose**: This gives the rollout code the main Codex home folder. That folder is the base place where session and thread files can be found or stored.
 
-**Data flow**: It reads `self.codex_home` and returns `self.codex_home.as_path()` as `&Path`. No allocation or mutation occurs.
+**Data flow**: It starts with a `Config` object that already contains a `codex_home` path. The function borrows that path as a plain filesystem path and returns it without changing anything.
 
-**Call relations**: This trait method is invoked by generic `codex_rollout` code whenever it needs the Codex home root from a core `Config`. It is part of the trait bridge implemented in this file.
+**Call relations**: The rollout crate calls this through the `RolloutConfigView` interface when it needs to locate Codex-owned files. This method does not hand work off to any other function; it simply exposes the right field from `Config`.
 
 
 ##### `Config::sqlite_home`  (lines 31–33)
@@ -42,11 +40,11 @@ fn codex_home(&self) -> &std::path::Path
 fn sqlite_home(&self) -> &std::path::Path
 ```
 
-**Purpose**: Exposes the configured SQLite storage directory to rollout code. It forwards the path from the core config object unchanged.
+**Purpose**: This tells the rollout code where the application’s SQLite-related storage lives. SQLite is a small file-based database, so this path points rollout features toward the right data area.
 
-**Data flow**: It reads `self.sqlite_home` and returns a borrowed `&Path` via `.as_path()`. It has no side effects.
+**Data flow**: It receives the existing `Config`, reads its `sqlite_home` path, converts it to a borrowed filesystem path, and returns that reference. No files are opened and no setting is changed.
 
-**Call relations**: This method is called by rollout components operating through `RolloutConfigView` when they need the SQLite home path.
+**Call relations**: The rollout crate reaches this method through the shared configuration view when it needs database-location information. The method is a direct adapter from the core `Config` field to the rollout crate’s expected shape.
 
 
 ##### `Config::cwd`  (lines 35–37)
@@ -55,11 +53,11 @@ fn sqlite_home(&self) -> &std::path::Path
 fn cwd(&self) -> &std::path::Path
 ```
 
-**Purpose**: Exposes the current working directory recorded in `Config` to rollout code. It allows rollout helpers to resolve workspace-relative behavior against the active session directory.
+**Purpose**: This provides the rollout code with the current working directory saved in the configuration. That helps session records know the project or folder context they belong to.
 
-**Data flow**: It reads `self.cwd` and returns `self.cwd.as_path()` as a borrowed path reference. It does not mutate state.
+**Data flow**: It takes the `Config`, reads the stored `cwd` path, and returns it as a borrowed filesystem path. The before-and-after state is the same; the function only shares information.
 
-**Call relations**: This trait method is consumed by `codex_rollout` logic through the `RolloutConfigView` abstraction alongside the other config projections in this file.
+**Call relations**: When rollout-related code needs the working directory, it asks through `RolloutConfigView`, and this method supplies the answer from `Config`. It does not call other code or perform any disk access itself.
 
 
 ##### `Config::model_provider_id`  (lines 39–41)
@@ -68,11 +66,11 @@ fn cwd(&self) -> &std::path::Path
 fn model_provider_id(&self) -> &str
 ```
 
-**Purpose**: Exposes the configured model provider identifier string to rollout code. It returns a borrowed string slice rather than cloning.
+**Purpose**: This tells the rollout code which model provider is configured, as a short text identifier. That can be useful metadata for recording or organizing sessions.
 
-**Data flow**: It reads `self.model_provider_id` and returns `self.model_provider_id.as_str()`. No state changes occur.
+**Data flow**: It reads the `model_provider_id` string stored in `Config`, borrows it as plain text, and returns that borrowed text. Nothing is copied into a new owned value and nothing is modified.
 
-**Call relations**: This method participates in the `RolloutConfigView` implementation used by rollout recording and metadata generation code that needs provider identity.
+**Call relations**: Rollout code calls this through the configuration-view trait when it needs provider information. This method is only the connector; any later use of the provider id happens inside the rollout crate.
 
 
 ##### `Config::generate_memories`  (lines 43–45)
@@ -81,22 +79,24 @@ fn model_provider_id(&self) -> &str
 fn generate_memories(&self) -> bool
 ```
 
-**Purpose**: Reports whether memory generation is enabled in the current configuration for rollout-related consumers. It forwards the nested boolean flag from `Config`.
+**Purpose**: This tells the rollout code whether memory generation is turned on. In plain terms, it answers whether the system should create saved memory information from sessions when that feature is enabled.
 
-**Data flow**: It reads `self.memories.generate_memories` and returns that `bool`. It performs no mutation.
+**Data flow**: It receives `Config`, looks inside the nested `memories` settings, reads the `generate_memories` true-or-false value, and returns that value. It does not start memory generation by itself.
 
-**Call relations**: This trait method is called by rollout code through `RolloutConfigView` when deciding whether memory-related rollout behavior should be active.
+**Call relations**: Rollout-related code asks this question through `RolloutConfigView` when deciding how to behave around session metadata and memory-related features. This method only reports the configured choice; other parts of the system act on it.
 
 
 ### `rollout/src/lib.rs`
 
-`orchestration` · `cross-cutting`
+`other` · `cross-cutting`
 
-This file is the crate root for rollout persistence. It declares the internal modules that implement compression, configuration, listing, metadata extraction, persistence policy, recording, search, session-name indexing, SQLite metrics, and the state database, then selectively re-exports the types and functions that form the crate’s supported API. The result is a façade: consumers import `rollout` and get session-file path helpers, line readers, thread listing and cursor types, metadata builders, persistence filters, recorder types, search helpers, thread-name index operations, and the SQLite-backed `StateDbHandle` from one place.
+A “rollout” here is the saved record of a Codex session: the conversation, metadata, and related state written to disk so it can be reopened, searched, archived, or indexed later. This file does not do the storage work itself. Instead, it acts like a reception desk: it names the important rooms in the library and re-exports the tools callers are expected to use.
 
-Two directory-name constants, `SESSIONS_SUBDIR` and `ARCHIVED_SESSIONS_SUBDIR`, establish the on-disk layout expected by the rest of the crate. A lazily initialized static, `INTERACTIVE_SESSION_SOURCES`, defines the `SessionSource` values treated as interactive sessions: built-in CLI and VSCode sources plus custom `atlas` and `chatgpt` labels. Because it uses `LazyLock<Vec<SessionSource>>`, the allocation happens once on first access and then becomes shared immutable state.
+It declares the internal modules for compression, configuration, listing sessions, metadata, persistence policy, recording, searching, session indexes, metrics, and the state database. It also defines shared folder names, such as `sessions` and `archived_sessions`, so the rest of the codebase uses the same directory names instead of hard-coding them in many places.
 
-The file also re-exports protocol types from `codex_protocol`, including `SessionMeta`, and exposes `codex_login::default_client` through a nested module so rollout internals can share the standard login client wiring. A deprecated alias preserves compatibility for older callers still using the conversation-path naming.
+One important shared value is `INTERACTIVE_SESSION_SOURCES`, a lazily created list of session origins that count as interactive user sessions, such as the command line, VS Code, and selected custom clients. “Lazy” means the list is built only when first needed, like opening a toolbox only when someone reaches for it.
+
+Most of the file is public exports. These make items from deeper modules available through the rollout crate’s main namespace, including readers, recorders, search helpers, list types, session metadata, and database handles. Without this file, callers would need to know much more about the crate’s internal structure, and shared constants or public APIs could easily become inconsistent.
 
 
 ### Rollout storage primitives
@@ -104,13 +104,13 @@ These files provide the low-level persistence mechanisms for rollout files, side
 
 ### `message-history/src/lib.rs`
 
-`io_transport` · `cross-cutting during message append, history inspection, and lookup`
+`io_transport` · `cross-cutting`
 
-This library defines the history data model and all file operations around it. `HistoryEntry` is the JSONL record schema (`session_id`, `ts`, `text`), while `HistoryConfig` captures the Codex home directory, persistence mode, and optional byte cap derived from config. `history_filepath` resolves the fixed `history.jsonl` path under `codex_home`.
+This file is the persistence layer for Codex message history: it turns chat messages into durable records on disk, and later lets the app count or retrieve those records. The history file lives under the Codex home directory as `history.jsonl`, where each line is one complete JSON object. That format is like a notebook where every message gets its own row, making it easy to append new rows without rewriting the whole notebook.
 
-`append_entry` is the main async write path. It first honors `HistoryPersistence::None` by returning early, ensures the parent directory exists, computes the current Unix timestamp, serializes a `HistoryEntry` to one JSON line plus trailing newline, opens the file for read/write/create (with `append(true)` and mode `0o600` on Unix), normalizes permissions via `ensure_owner_only_permissions`, and then moves the blocking lock/write/trim work into `spawn_blocking`. Inside that closure it retries `try_lock()` up to `MAX_RETRIES`, seeks to end, writes and flushes the full line, then calls `enforce_history_limit` while still holding the exclusive lock.
+The main job is safe appending. When `append_entry` is asked to save a message, it first checks whether history saving is enabled. It then creates the history directory if needed, builds a record containing the conversation ID, timestamp, and text, and writes that whole record as one line. Before writing, it takes a file lock, which is a “please wait your turn” signal for other processes. This prevents two terminal windows from writing at the same time and corrupting the file.
 
-`enforce_history_limit` trims by whole lines only. If the file exceeds `max_bytes`, it scans line lengths, computes a soft-cap target via `trim_target_bytes` (80% of the hard cap, but never below the newest entry length), drops oldest lines until the retained tail fits, then rewrites the file with just that tail. Read-side helpers split responsibilities: `history_metadata`/`history_metadata_for_file` count newline bytes asynchronously and return a stable file identifier plus entry count; `lookup`/`lookup_history_entry` synchronously open the file, verify the identifier via `log_identity`, acquire a shared advisory lock with retries, and parse the requested zero-based line as JSON. The design favors append-only writes, whole-line trimming, and stable `(log_id, offset)` addressing across appends while degrading gracefully on missing files and parse/I/O failures.
+The file also protects privacy and storage. On Unix systems it forces the history file to be readable and writable only by the owner. If a maximum file size is configured, it trims old lines after a write, while keeping the newest entry. Finally, it provides lightweight lookup tools: one function reports the file’s identity and line count, and another finds a specific entry by line number only if the file is still the same file.
 
 #### Function details
 
@@ -120,11 +120,11 @@ This library defines the history data model and all file operations around it. `
 fn new(codex_home: impl Into<PathBuf>, history: &History) -> Self
 ```
 
-**Purpose**: Builds the runtime history configuration from a Codex home path and the higher-level `History` config section. It extracts only the fields this crate needs for persistence decisions and size enforcement.
+**Purpose**: Builds the small configuration object this history layer needs. It pulls the Codex home folder, the persistence choice, and the optional size limit into one place.
 
-**Data flow**: It takes `codex_home: impl Into<PathBuf>` and `&History`, converts the home path into a `PathBuf`, copies `history.persistence` and `history.max_bytes`, and returns a new `HistoryConfig`.
+**Data flow**: It receives a Codex home path and a broader history configuration. It converts the home path into a stored path value, copies the setting that says whether to save history, and copies the optional maximum byte size. The result is a `HistoryConfig` that other functions can use without needing the larger configuration object.
 
-**Call relations**: Callers constructing session or persistence state use this as the adapter from config-layer types into this crate’s simpler runtime config; tests also use it to vary `max_bytes` and persistence behavior.
+**Call relations**: Other parts of the application and tests create this before saving, reading, or describing history. Once created, it is handed to functions like `append_entry`, `history_metadata`, and `lookup` so they all agree on where the history file is and how it should behave.
 
 *Call graph*: called by 6 (append_entry_trims_history_to_soft_cap, append_entry_trims_history_when_beyond_max_bytes, append_message_history_entry, lookup_message_history_entry, session_configured_populates_history_metadata, thread_session_state_from_thread_response); 1 external calls (into).
 
@@ -135,11 +135,11 @@ fn new(codex_home: impl Into<PathBuf>, history: &History) -> Self
 fn history_filepath(config: &HistoryConfig) -> PathBuf
 ```
 
-**Purpose**: Resolves the absolute path of the JSONL history file under the configured Codex home directory.
+**Purpose**: Calculates the exact path to the history file. It keeps the filename rule in one place: the file is always named `history.jsonl` inside the configured Codex home directory.
 
-**Data flow**: It reads `config.codex_home`, joins it with the constant `HISTORY_FILENAME`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a `HistoryConfig`, reads its `codex_home` path, appends the fixed history filename, and returns the full path. It does not touch the disk.
 
-**Call relations**: This private helper is the common path resolver used by `append_entry`, `history_metadata`, and `lookup` so all operations target the same file location.
+**Call relations**: This is the shared path builder used by `append_entry`, `history_metadata`, and `lookup`. Those higher-level functions ask it where the file should be before they create, scan, or open the history file.
 
 *Call graph*: called by 3 (append_entry, history_metadata, lookup).
 
@@ -154,11 +154,11 @@ async fn append_entry(
 ) -> Result<()>
 ```
 
-**Purpose**: Appends one message to the history file as a single JSONL record, under an advisory exclusive lock, and optionally trims the file to the configured size budget.
+**Purpose**: Adds one message to the history file, if history saving is enabled. It is careful about concurrent writes, file permissions, timestamps, and optional size limits.
 
-**Data flow**: It takes message text, a displayable conversation id, and `&HistoryConfig`. It first checks `config.persistence`, returning immediately for `HistoryPersistence::None`. For `SaveAll`, it resolves the file path, creates the parent directory if needed, computes the current Unix timestamp, builds a `HistoryEntry`, serializes it to JSON, appends `\n`, opens the file with read/write/create (plus append and mode `0o600` on Unix), and calls `ensure_owner_only_permissions`. It then moves the file handle, serialized line, and optional `max_bytes` into `spawn_blocking`, where it retries `try_lock`, seeks to end, writes and flushes the line, invokes `enforce_history_limit`, and returns any I/O or lock-acquisition error.
+**Data flow**: It receives the message text, a conversation ID, and the history configuration. If persistence is disabled, it exits without changing anything. Otherwise it creates the history directory, records the current Unix timestamp, turns the message into one JSON line, opens or creates the file, fixes permissions where needed, and then writes the line while holding an exclusive file lock. After writing, it may trim older entries if the file is too large. It returns success or an input/output error.
 
-**Call relations**: This is the primary write API used by higher-level session code. It delegates path resolution to `history_filepath`, permission normalization to `ensure_owner_only_permissions`, and post-write trimming to `enforce_history_limit` while keeping all blocking lock/file operations off the async runtime.
+**Call relations**: This is the main write path for message history. It uses `history_filepath` to find the file, `ensure_owner_only_permissions` to keep the file private, and a blocking worker thread so file locking and writing do not freeze the async runtime. While locked, it hands off to `enforce_history_limit` to keep the file within the configured size.
 
 *Call graph*: calls 2 internal fn (ensure_owner_only_permissions, history_filepath); 6 external calls (to_string, new, to_string, now, create_dir_all, spawn_blocking).
 
@@ -169,11 +169,11 @@ async fn append_entry(
 fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()>
 ```
 
-**Purpose**: Shrinks the history file to fit within the configured byte budget by dropping whole oldest lines while always retaining the newest appended entry.
+**Purpose**: Keeps the history file from growing past its configured maximum size. When the file is too large, it removes older lines while preserving the newest entry.
 
-**Data flow**: It takes a mutable locked `File` and `Option<usize> max_bytes`. If the limit is absent, zero, too large to convert to `u64`, or the current file length is already within bounds, it returns immediately. Otherwise it clones the file, seeks to start, reads line-by-line through a `BufReader` to collect each line length, computes a trim target with `trim_target_bytes(max_bytes, newest_entry_len)`, accumulates `drop_bytes` by subtracting oldest line lengths until the retained size is at or below the target, seeks a reader to `drop_bytes`, reads the remaining tail into memory, truncates the original file to length 0, seeks back to start, writes the tail, flushes, and returns.
+**Data flow**: It receives an already-open history file and an optional byte limit. If there is no limit, the limit is zero, or the current file is small enough, it changes nothing. If the file is too large, it measures each line, decides how much old content to drop, reads the remaining tail, truncates the file to empty, writes the tail back, and flushes it to disk.
 
-**Call relations**: Only `append_entry` calls this, and specifically while holding the exclusive file lock so trimming and appending are atomic with respect to concurrent writers.
+**Call relations**: It is called from `append_entry` after a new message has been written and while the write lock is still held. It calls `trim_target_bytes` to choose a practical target size, so the file is trimmed below the hard cap rather than barely under it.
 
 *Call graph*: calls 1 internal fn (trim_target_bytes); 13 external calls (new, flush, metadata, seek, set_len, try_clone, write_all, Start, new, new (+3 more)).
 
@@ -184,11 +184,11 @@ fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()
 fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64
 ```
 
-**Purpose**: Computes the post-trim target size used when the history exceeds its hard cap. It intentionally trims below the hard cap to reduce immediate retrimming on the next append.
+**Purpose**: Chooses the target size to trim the history file down to. It aims for a softer limit below the maximum so the next append does not immediately need another trim.
 
-**Data flow**: It takes `max_bytes` and the newest entry length, computes `floor(max_bytes * HISTORY_SOFT_CAP_RATIO)` clamped to `[1, max_bytes]`, then returns the maximum of that soft cap and `newest_entry_len`.
+**Data flow**: It receives the configured maximum size and the byte length of the newest entry. It computes 80 percent of the maximum, keeps that value within a sensible range, and then makes sure the target is at least large enough to hold the newest entry. It returns the target byte count.
 
-**Call relations**: This helper is used only by `enforce_history_limit` to decide how aggressively to prune once the hard cap has been exceeded.
+**Call relations**: This is a helper for `enforce_history_limit`. The trimming code uses its result to decide how many old lines to remove while still keeping the latest message.
 
 *Call graph*: called by 1 (enforce_history_limit).
 
@@ -199,11 +199,11 @@ fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64
 async fn history_metadata(config: &HistoryConfig) -> (u64, usize)
 ```
 
-**Purpose**: Returns a stable identifier for the current history file together with the current number of entries. It is the async public wrapper around file-specific metadata scanning.
+**Purpose**: Reports basic information about the current history file: a file identity number and how many entries it appears to contain. This helps callers know whether a displayed history list still matches the file on disk.
 
-**Data flow**: It takes `&HistoryConfig`, resolves the history path with `history_filepath`, awaits `history_metadata_for_file(&path)`, and returns the `(log_id, count)` tuple.
+**Data flow**: It receives the history configuration, turns it into the history file path, and asks `history_metadata_for_file` to inspect that file. It returns a pair: the file identity and the number of newline-terminated records found.
 
-**Call relations**: Higher-level code uses this before random-access lookup so it can later ask for a specific line offset against a specific file identity; the actual scanning work is delegated to `history_metadata_for_file`.
+**Call relations**: This is the public, configuration-based wrapper for metadata lookup. It uses `history_filepath` for the standard location, then delegates the actual disk reading to `history_metadata_for_file`.
 
 *Call graph*: calls 2 internal fn (history_filepath, history_metadata_for_file).
 
@@ -214,11 +214,11 @@ async fn history_metadata(config: &HistoryConfig) -> (u64, usize)
 fn lookup(log_id: u64, offset: usize, config: &HistoryConfig) -> Option<HistoryEntry>
 ```
 
-**Purpose**: Fetches a single history entry by zero-based line offset, but only if the current history file still matches the caller’s expected file identity.
+**Purpose**: Finds one saved history entry by its line number, but only if the history file still matches the expected identity. This avoids reading from a different or replaced history file by mistake.
 
-**Data flow**: It takes a `log_id`, `offset`, and `&HistoryConfig`, resolves the history path via `history_filepath`, calls `lookup_history_entry(&path, log_id, offset)`, and returns `Option<HistoryEntry>`.
+**Data flow**: It receives an expected file identity, a zero-based line offset, and the history configuration. It builds the history file path and asks `lookup_history_entry` to open, lock, verify, scan, and parse the requested line. It returns the entry if everything matches, or `None` if anything fails.
 
-**Call relations**: This is the public read API paired with `history_metadata`; callers first obtain `(log_id, count)` and later use `lookup` to safely dereference an offset only if the file has not been replaced.
+**Call relations**: This is the public lookup wrapper used by callers that know the configuration but should not care about file paths. It relies on `history_filepath` for location and `lookup_history_entry` for the careful read-and-parse work.
 
 *Call graph*: calls 2 internal fn (history_filepath, lookup_history_entry).
 
@@ -229,11 +229,11 @@ fn lookup(log_id: u64, offset: usize, config: &HistoryConfig) -> Option<HistoryE
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()>
 ```
 
-**Purpose**: On Unix, enforces `0o600` permissions on the history file so only the owner can read or write it.
+**Purpose**: Makes the history file private to the current user where the operating system supports that permission model. On Unix, it enforces `rw-------`, meaning only the owner can read or write the file; on Windows, it does nothing and succeeds.
 
-**Data flow**: It reads the file metadata, masks the current mode to permission bits, and if the mode is not already `0o600`, clones the permissions and file handle and uses `spawn_blocking` to call `set_permissions` on the clone. It returns `Ok(())` if no change is needed or after the update succeeds.
+**Data flow**: It receives an open file. On Unix, it reads the file’s current permission bits, and if they are not owner-only, it clones the file handle and changes the permissions on a blocking worker thread. It returns success or an input/output error.
 
-**Call relations**: `append_entry` invokes this immediately after opening the file, before entering the blocking lock/write section, to keep the history file private.
+**Call relations**: It is called by `append_entry` after the history file is opened and before the message is written. This places the privacy check directly in the save path, so newly created or previously loose files are corrected during normal use.
 
 *Call graph*: called by 1 (append_entry); 3 external calls (metadata, try_clone, spawn_blocking).
 
@@ -244,11 +244,11 @@ async fn ensure_owner_only_permissions(_file: &File) -> Result<()>
 async fn history_metadata_for_file(path: &Path) -> (u64, usize)
 ```
 
-**Purpose**: Scans a specific history file asynchronously to derive its stable identity and count how many newline-terminated entries it contains.
+**Purpose**: Inspects a specific history file path and returns its identity plus an entry count. It is designed to fail gently: missing or unreadable files produce safe default values instead of crashing the caller.
 
-**Data flow**: It takes a `&Path`, first calls `fs::metadata(path)`; if the file is missing or metadata fails it returns `(0, 0)`, otherwise it derives `log_id` with `log_identity`. It then opens the file asynchronously; if open fails it returns `(log_id, 0)`. Next it repeatedly reads into an `HISTORY_READ_BUFFER_SIZE` byte buffer, counts `b'\n'` bytes in each chunk using `memchr_iter`, accumulates the total, and returns `(log_id, count)`. Any read error after metadata/open also yields `(log_id, 0)`.
+**Data flow**: It receives a file path. It first reads metadata and extracts a platform-specific identity using `log_identity`; if that fails, it returns `(0, 0)`. If metadata succeeds, it opens the file and reads it in chunks, counting newline bytes because each line is one history entry. It returns the identity and count, or the identity with count zero if scanning fails.
 
-**Call relations**: This private async worker backs the public `history_metadata` API. It separates existence/identity detection from line counting so callers can still detect that a file exists even if scanning fails.
+**Call relations**: It does the real work behind `history_metadata`. It calls `log_identity` to label the file and uses efficient byte scanning to count entries without parsing every JSON record.
 
 *Call graph*: calls 1 internal fn (log_identity); called by 1 (history_metadata); 3 external calls (open, metadata, memchr_iter).
 
@@ -259,11 +259,11 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize)
 fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry>
 ```
 
-**Purpose**: Synchronously opens the history file, verifies its identity, acquires a shared advisory lock, and parses the requested line as a `HistoryEntry`.
+**Purpose**: Reads one line from a specific history file and turns it back into a `HistoryEntry`. It checks the file identity first and uses a shared read lock so it does not read while another process is rewriting the file.
 
-**Data flow**: It takes a file path, expected `log_id`, and zero-based `offset`. It opens the file read-only with `OpenOptions`; on failure it logs a warning and returns `None`. It then reads metadata, derives `current_log_id` via `log_identity`, and if the caller supplied a nonzero `log_id` that does not match, returns `None`. Next it retries `file.try_lock_shared()` up to `MAX_RETRIES`, sleeping `RETRY_SLEEP` between `WouldBlock` results. Once locked, it wraps `&file` in a `BufReader`, iterates `lines().enumerate()`, and when `idx == offset` attempts `serde_json::from_str::<HistoryEntry>(&line)`, returning `Some(entry)` on success or logging and returning `None` on read/parse failure. If the offset is past EOF or locking never succeeds, it returns `None`.
+**Data flow**: It receives a path, an expected file identity, and a line offset. It opens the file, reads its metadata, gets the current identity, and stops if it does not match the expected one. It then repeatedly tries to take a shared lock, scans lines until it reaches the requested offset, parses that JSON line into a `HistoryEntry`, and returns it. If opening, locking, reading, matching, or parsing fails, it logs a warning where useful and returns `None`.
 
-**Call relations**: The public `lookup` wrapper delegates directly to this function. It is intentionally synchronous because it uses advisory shared locking; async callers are expected to place it in `spawn_blocking` if needed.
+**Call relations**: It is called by the public `lookup` function. It uses `log_identity` to avoid stale lookups, waits briefly and retries when another process holds the lock, and performs the final JSON parsing only for the requested line.
 
 *Call graph*: calls 1 internal fn (log_identity); called by 1 (lookup); 4 external calls (new, new, sleep, warn!).
 
@@ -274,24 +274,24 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
 fn log_identity(_metadata: &std::fs::Metadata) -> Option<u64>
 ```
 
-**Purpose**: Extracts the platform-specific stable identifier used to detect whether a history file is the same file across metadata and lookup operations.
+**Purpose**: Extracts a stable-ish identity number for the history file from its filesystem metadata. This lets the code tell whether the file being read is the same file that was counted earlier.
 
-**Data flow**: On Unix it reads `metadata.ino()`, on Windows `metadata.creation_time()`, and on unsupported platforms returns `None`. The result is wrapped in `Option<u64>`.
+**Data flow**: It receives file metadata. On Unix it returns the inode number, which is the filesystem’s internal file number. On Windows it returns the file creation time. On other platforms it returns no identity. The output is an optional number.
 
-**Call relations**: Both `history_metadata_for_file` and `lookup_history_entry` use this to coordinate `(log_id, offset)` addressing and reject lookups against a replaced file.
+**Call relations**: Both `history_metadata_for_file` and `lookup_history_entry` use this helper. The metadata path records the identity, and the lookup path compares against it before trusting a requested line offset.
 
 *Call graph*: called by 2 (history_metadata_for_file, lookup_history_entry); 2 external calls (creation_time, ino).
 
 
 ### `rollout/src/compression.rs`
 
-`io_transport` · `rollout file reads, append preparation, and periodic background maintenance/compression`
+`io_transport` · `startup background work, rollout read, rollout append, maintenance cleanup`
 
-This file has three major responsibilities. First, it resolves and reads rollout files regardless of whether they exist as plain `.jsonl` or compressed `.jsonl.zst`. `open_rollout_line_reader` retries briefly across representation transitions, and `RolloutLineReader` abstracts over async plain-file reading versus blocking zstd decoding wrapped in `spawn_blocking`. Second, it materializes compressed rollouts back to plain files for append paths. `materialize_rollout_for_append_blocking` preserves permissions, writes through a uniquely named temp file, installs the plain file without clobbering an existing winner, removes the compressed sibling when successful, and records metrics for plain/missing/decompressed/failed outcomes.
+Rollout files are append-only history files stored as `.jsonl`, meaning one JSON record per line. Old files can take up space, so this file compresses “cold” rollout files, which are files that have not changed for at least a week. Think of it like moving old paperwork into vacuum-sealed bags: it saves space, but the system must still be able to read it when needed.
 
-Third, the nested `worker` module runs best-effort background compression over active and archived session trees. It uses `CompressionRunMarker` under `codex_home/.tmp` to avoid overlapping or too-frequent runs, cleans stale temp files, scans directories recursively, and compresses at most two files concurrently. Compression is conservative: only files older than `MIN_ROLLOUT_AGE` are eligible, compressed output is verified by decoding it, original file metadata is preserved, and the source file is deleted only if the file's size, mtime, and permissions still match the pre-compression snapshot. If the source changed mid-run or a compressed sibling already exists, the worker records a skipped outcome instead of risking data loss.
+The file has three main jobs. First, it finds the right physical file for a rollout: if both plain and compressed versions exist, the plain `.jsonl` file wins because it is easier to append to. Second, it provides `RolloutLineReader`, which reads lines from either plain files or compressed `.jsonl.zst` files through the same simple interface. Third, it runs a background worker that scans session folders, compresses old plain rollout files, verifies the compressed copy, preserves timestamps and permissions, and only deletes the original if the file did not change during compression.
 
-Supporting modules handle metrics emission, path normalization between plain/compressed names, rollout filename validation, and platform-specific file creation with preserved permissions.
+The code is careful about races. If another part of the program appends to a rollout while compression is happening, compression backs off instead of risking data loss. A marker file prevents overlapping compression runs. Temporary files are used for safe writes, and stale temporary files are later removed.
 
 #### Function details
 
@@ -301,11 +301,11 @@ Supporting modules handle metrics emission, path normalization between plain/com
 fn spawn_rollout_compression_worker(codex_home: PathBuf)
 ```
 
-**Purpose**: Starts the fire-and-forget background compression worker for a given Codex home directory. It is the public entrypoint used by the rest of the rollout subsystem.
+**Purpose**: Starts the background job that looks for old local rollout files and compresses them. It is best-effort: if it cannot run, the main program should still continue.
 
-**Data flow**: Accepts `codex_home: PathBuf` and forwards it to `worker::spawn`. It returns no value and performs no direct I/O itself.
+**Data flow**: It receives the Codex home directory path → passes that path to the worker module → returns immediately without waiting for compression to finish.
 
-**Call relations**: Called during rollout subsystem setup when background maintenance should begin. All runtime detection, logging, and actual work are delegated to `worker::spawn`.
+**Call relations**: This is the public doorway into the compression worker. It delegates to `worker::spawn`, which starts the real asynchronous task when a Tokio runtime is available.
 
 *Call graph*: 1 external calls (spawn).
 
@@ -316,11 +316,11 @@ fn spawn_rollout_compression_worker(codex_home: PathBuf)
 async fn file_modified_time(path: &Path) -> io::Result<Option<time::OffsetDateTime>>
 ```
 
-**Purpose**: Returns the modification time of the logical rollout file, whether it currently exists in plain or compressed form. Missing files are reported as `Ok(None)` rather than errors.
+**Purpose**: Finds the last modified time for a rollout file, whether it currently exists as plain `.jsonl` or compressed `.jsonl.zst`. Callers use this when sorting or displaying rollout history.
 
-**Data flow**: Accepts `&Path`, resolves the existing physical path via `path::existing_rollout_path(path).await`, returns `Ok(None)` if neither representation exists, otherwise fetches metadata with `tokio::fs::metadata`, extracts `modified()`, converts it to `time::OffsetDateTime`, and wraps it in `Some`.
+**Data flow**: It receives a desired rollout path → asks which physical file actually exists → reads that file’s metadata → returns the modified timestamp, or `None` if neither version exists.
 
-**Call relations**: Used by listing code to compute `updated_at` timestamps and by wrappers that expose UTC modification times. It delegates representation resolution to the `path` module.
+**Call relations**: Higher-level history code calls this when it needs timestamps. It relies on the path lookup helper so callers do not need to check both plain and compressed filenames themselves.
 
 *Call graph*: called by 2 (file_modified_time, file_modified_time_utc); 2 external calls (existing_rollout_path, metadata).
 
@@ -331,11 +331,11 @@ async fn file_modified_time(path: &Path) -> io::Result<Option<time::OffsetDateTi
 async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineReader>
 ```
 
-**Purpose**: Opens a line reader over a rollout file that may be plain or compressed, retrying briefly if the file disappears during a representation transition. This shields callers from races between compression/materialization and reads.
+**Purpose**: Opens a rollout file for line-by-line reading, hiding whether the file is compressed. It also retries briefly if the file is being switched between plain and compressed forms.
 
-**Data flow**: Accepts `&Path` and loops up to `MAX_NOT_FOUND_RETRIES`. Each iteration calls `reader::open_once(path).await`; success returns the `RolloutLineReader`, `NotFound` sleeps for `OPEN_ROLLOUT_LINE_READER_RETRY_DELAY`, and any other error returns immediately. After retries are exhausted it performs one final `open_once`.
+**Data flow**: It receives a rollout path → tries to open the existing plain or compressed file → if the file briefly disappears, waits and retries → returns a `RolloutLineReader` or an error.
 
-**Call relations**: Called by summary extraction, rollout loading, and search paths that need line-oriented reads. It delegates actual open logic to `reader::open_once` and only adds retry behavior.
+**Call relations**: Rollout loading, searching, and summary code call this when they need records. It delegates one open attempt to `reader::open_once` and adds retry behavior around it.
 
 *Call graph*: called by 5 (read_head_for_summary, read_head_summary, load_rollout_items, first_rollout_content_match_snippet, rollout_contains); 2 external calls (open_once, sleep).
 
@@ -346,11 +346,11 @@ async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineReader>
 fn compressed_rollout_path(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the `.jsonl.zst` path corresponding to a rollout path. This test-only wrapper exposes the internal path helper.
+**Purpose**: Builds the compressed filename for a rollout path. This is mainly exposed for tests.
 
-**Data flow**: Accepts `&Path` and returns `path::compressed_rollout_path(path)`. It performs no I/O.
+**Data flow**: It receives a path → adds or preserves the `.zst` compressed suffix as needed → returns the compressed path.
 
-**Call relations**: Used by tests that need to assert on compressed sibling paths without reaching into the private `path` module.
+**Call relations**: It is a thin wrapper around the internal path helper, used where code needs the expected `.jsonl.zst` sibling path.
 
 *Call graph*: called by 1 (existing_rollout_path); 1 external calls (compressed_rollout_path).
 
@@ -361,11 +361,11 @@ fn compressed_rollout_path(path: &Path) -> PathBuf
 async fn materialize_rollout_for_append(path: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Asynchronously converts a compressed rollout back into its plain `.jsonl` representation so append code can write to it. The blocking filesystem and decompression work is offloaded from the async runtime.
+**Purpose**: Makes sure a rollout is available as a plain `.jsonl` file before asynchronous append code writes to it. If only a compressed copy exists, it decompresses it first.
 
-**Data flow**: Accepts `&Path`, clones it into a `PathBuf`, runs `materialize_rollout_for_append_blocking(path.as_path())` inside `tokio::task::spawn_blocking`, maps join errors to `io::Error::other`, and returns the resulting plain path.
+**Data flow**: It receives a rollout path → moves blocking disk and decompression work onto a blocking thread → returns the plain path that append code should write to.
 
-**Call relations**: Called by async append/resume paths before opening a rollout for writing. It delegates all actual materialization logic to the blocking helper.
+**Call relations**: Async append paths call this before writing. It hands the real work to `materialize_rollout_for_append_blocking` so the async runtime is not blocked by file I/O.
 
 *Call graph*: called by 2 (new, append_rollout_item_to_path); 2 external calls (to_path_buf, spawn_blocking).
 
@@ -376,11 +376,11 @@ async fn materialize_rollout_for_append(path: &Path) -> io::Result<PathBuf>
 fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result<PathBuf>
 ```
 
-**Purpose**: Performs the blocking materialization of a compressed rollout into a plain file while preserving permissions and avoiding clobber races. It is careful to leave a consistent winner if multiple actors race to materialize.
+**Purpose**: Restores a compressed rollout file back into a normal `.jsonl` file so new records can be appended. It avoids overwriting an existing plain file.
 
-**Data flow**: Accepts `&Path`, normalizes to the plain path with `plain_rollout_path`, and returns early with metrics if the plain file already exists or no compressed sibling exists. Otherwise it computes the compressed path and a unique temp path, creates parent directories, reads source permissions from the compressed file, decompresses through `zstd::stream::read::Decoder` into a temp file created by `create_file_with_permissions`, flushes and syncs it, then tries to install the plain file via hard link or `persist_temp_file_noclobber`. On success it removes the temp file and compressed file, records `materialize("decompressed")`, and returns the plain path; on failure it cleans up temp state, records `materialize("failed")`, and returns the error.
+**Data flow**: It receives a plain or compressed rollout path → computes the plain path → if plain already exists, returns it → if only compressed exists, decompresses into a temporary file, safely installs it, removes the compressed copy, records metrics, and returns the plain path.
 
-**Call relations**: Called by `materialize_rollout_for_append` and blocking append paths. It relies on path helpers, temp-path generation, permission-preserving file creation, and no-clobber persistence to safely switch representations.
+**Call relations**: Blocking append code calls this directly, while async append code reaches it through `materialize_rollout_for_append`. It uses path helpers, temporary-file helpers, and metric recording to make decompression safe and observable.
 
 *Call graph*: calls 2 internal fn (plain_rollout_path, temp_path_for); called by 1 (open_log_file); 4 external calls (materialize, compressed_rollout_path, create_dir_all, remove_file).
 
@@ -391,11 +391,11 @@ fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result<PathBuf>
 fn persist_temp_file_noclobber(temp_path: &Path, destination: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Installs a completed temp file at a destination only if the destination does not already exist. Existing winners are preserved without error.
+**Purpose**: Moves a temporary file into its final location without overwriting an existing file. This protects against races where another process creates the destination first.
 
-**Data flow**: Accepts temp and destination paths, converts the temp path into `tempfile::TempPath`, calls `persist_noclobber(destination)`, returns `Ok(())` on success or on `AlreadyExists`, and otherwise returns the underlying I/O error.
+**Data flow**: It receives a temporary path and destination → converts the temp path into a managed temporary-file object → tries to persist it only if the destination is absent → treats “already exists” as success.
 
-**Call relations**: Used by materialization when hard-link installation fails and by tests that verify no-clobber semantics.
+**Call relations**: The materialization path uses this as a fallback when a hard link cannot be created. It is part of the safety net that prevents decompression from clobbering newer data.
 
 *Call graph*: 2 external calls (persist_noclobber, try_from_path).
 
@@ -406,11 +406,11 @@ fn persist_temp_file_noclobber(temp_path: &Path, destination: &Path) -> io::Resu
 fn plain_rollout_path(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Returns the canonical plain `.jsonl` path for either a plain or compressed rollout path. It strips the compression suffix when present.
+**Purpose**: Returns the normal `.jsonl` path for a rollout, even if the input points at the compressed `.jsonl.zst` version.
 
-**Data flow**: Accepts `&Path` and returns `path::plain_rollout_path(path)`. No filesystem access occurs.
+**Data flow**: It receives a path → removes the compressed suffix if present → returns the plain path.
 
-**Call relations**: Used by materialization and path-resolution code whenever callers need the logical plain filename regardless of current representation.
+**Call relations**: Append, lookup, and sibling-check code use this to agree on the canonical uncompressed filename.
 
 *Call graph*: called by 3 (materialize_rollout_for_append_blocking, existing_rollout_path, should_skip_compressed_sibling); 1 external calls (plain_rollout_path).
 
@@ -421,11 +421,11 @@ fn plain_rollout_path(path: &Path) -> PathBuf
 fn parse_rollout_file_name(name: &str) -> Option<&str>
 ```
 
-**Purpose**: Validates a rollout filename and returns its canonical plain `.jsonl` name, stripping a trailing `.zst` when present. Non-rollout names return `None`.
+**Purpose**: Checks whether a filename looks like a rollout file and returns its normal `.jsonl` name. It accepts both plain and compressed rollout names.
 
-**Data flow**: Accepts `&str` and forwards to `file_name::parse_rollout_file_name(name)`, returning `Option<&str>`.
+**Data flow**: It receives a filename string → strips `.zst` if present → verifies the rollout naming pattern → returns the plain filename or `None`.
 
-**Call relations**: Used by listing and discovery code that parses timestamps and ids from filenames while treating compressed and plain names uniformly.
+**Call relations**: Directory scanning uses this through `RolloutFile::from_path` so non-rollout files are ignored.
 
 *Call graph*: 1 external calls (parse_rollout_file_name).
 
@@ -436,11 +436,11 @@ fn parse_rollout_file_name(name: &str) -> Option<&str>
 fn from_path(path: PathBuf) -> Option<Self>
 ```
 
-**Purpose**: Builds a logical rollout-file entry from a discovered physical path, normalizing compressed names and hiding compressed siblings when a plain file already exists. It prevents callers from reimplementing precedence rules.
+**Purpose**: Turns a discovered filesystem path into a logical rollout file entry. It filters out unrelated files and compressed duplicates hidden by an existing plain file.
 
-**Data flow**: Consumes a `PathBuf`, extracts its UTF-8 filename, validates it with `file_name::parse_rollout_file_name`, and checks `path::should_skip_compressed_sibling(path.as_path())`. If valid and not hidden, it returns `Some(RolloutFile { path, plain_file_name })`; otherwise `None`.
+**Data flow**: It receives a path found during directory walking → reads its filename → parses it as a rollout name → skips compressed siblings when a plain version exists → returns a `RolloutFile` with both physical path and canonical plain filename.
 
-**Call relations**: Used by worker scans, listing scans, search, and id lookup. It is the common normalization layer between raw directory entries and logical rollout files.
+**Call relations**: Compression scanning and rollout discovery code call this so they all follow the same plain-versus-compressed rules.
 
 *Call graph*: called by 7 (compress_rollouts_in_root, collect_flat_files_by_updated_at, collect_flat_rollout_files, find_rollout_path_by_id_from_filenames, collect_rollout_paths, scan_compressed_rollout_matches, scan_rollout_matches); 4 external calls (as_path, file_name, parse_rollout_file_name, should_skip_compressed_sibling).
 
@@ -451,11 +451,11 @@ fn from_path(path: PathBuf) -> Option<Self>
 fn path(&self) -> &Path
 ```
 
-**Purpose**: Returns the physical path that should be opened for this logical rollout file. This may be either plain or compressed.
+**Purpose**: Returns the actual path on disk that should be opened for reading. That path may point to either a plain or compressed file.
 
-**Data flow**: Borrows `self` and returns `self.path.as_path()`.
+**Data flow**: It reads the stored physical path inside the `RolloutFile` → returns it as a borrowed path.
 
-**Call relations**: Used by callers that need to inspect or open the chosen physical representation without consuming the `RolloutFile`.
+**Call relations**: Callers that need to open the discovered file use this accessor instead of reaching into the struct.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -466,11 +466,11 @@ fn path(&self) -> &Path
 fn plain_file_name(&self) -> &str
 ```
 
-**Purpose**: Returns the canonical plain `.jsonl` filename associated with this logical rollout file. This is the name used for timestamp and UUID parsing.
+**Purpose**: Returns the canonical plain `.jsonl` filename for the rollout. This is useful for parsing rollout IDs or timestamps consistently.
 
-**Data flow**: Borrows `self` and returns `self.plain_file_name.as_str()`.
+**Data flow**: It reads the stored plain filename string → returns it as text.
 
-**Call relations**: Used by listing and lookup code that parses metadata from filenames while ignoring whether the physical file is compressed.
+**Call relations**: Discovery and listing code can use this even when the physical file is compressed, so naming logic stays consistent.
 
 
 ##### `RolloutFile::is_compressed`  (lines 183–185)
@@ -479,11 +479,11 @@ fn plain_file_name(&self) -> &str
 fn is_compressed(&self) -> bool
 ```
 
-**Purpose**: Reports whether the physical path for this logical rollout file is the compressed representation. It distinguishes `.jsonl.zst` entries from plain `.jsonl` entries.
+**Purpose**: Tells whether this discovered rollout file is stored in compressed form.
 
-**Data flow**: Borrows `self`, passes `self.path.as_path()` to `path::is_compressed_rollout_path`, and returns the resulting boolean.
+**Data flow**: It reads the stored physical path → checks whether its filename ends like a compressed rollout → returns true or false.
 
-**Call relations**: Used by the compression worker to skip already-compressed files during scans.
+**Call relations**: The compression worker uses this to skip files that are already compressed.
 
 *Call graph*: 2 external calls (as_path, is_compressed_rollout_path).
 
@@ -494,11 +494,11 @@ fn is_compressed(&self) -> bool
 fn into_path(self) -> PathBuf
 ```
 
-**Purpose**: Consumes the logical rollout-file wrapper and returns the underlying physical path. It is the ownership-taking counterpart to `path()`.
+**Purpose**: Consumes a `RolloutFile` and returns its physical path. This is used when ownership of the path needs to move into another task.
 
-**Data flow**: Consumes `self` and returns `self.path`.
+**Data flow**: It takes the whole `RolloutFile` → extracts the stored path → returns that path.
 
-**Call relations**: Used when scan code has finished using the normalized wrapper and wants to store or open the actual path.
+**Call relations**: The compression worker uses this before spawning blocking compression jobs, because those jobs need to own the path they work on.
 
 
 ##### `RolloutLineReader::next_line`  (lines 205–220)
@@ -507,11 +507,11 @@ fn into_path(self) -> PathBuf
 async fn next_line(&mut self) -> io::Result<Option<String>>
 ```
 
-**Purpose**: Reads the next JSONL line from either a plain async file or a blocking compressed decoder. It hides the representation-specific mechanics behind one async method.
+**Purpose**: Reads the next record from a rollout file, whether the file is plain or compressed. It gives callers one simple async method for both cases.
 
-**Data flow**: Borrows `&mut self` and matches `self.inner`. For `Plain`, it awaits `lines.next_line()`. For `Blocking`, it temporarily takes the `BlockingLineReader` out of the `Option`, errors if it was already taken (`"compressed rollout reader is busy"`), runs `reader.next().transpose()` inside `spawn_blocking`, restores the reader into the slot, and returns the line result.
+**Data flow**: It reads from the inner reader → for plain files, awaits the async line reader → for compressed files, runs the blocking decompression read on a blocking thread → returns the next line, `None` at end of file, or an error.
 
-**Call relations**: Called by rollout summary and loading code after `open_rollout_line_reader`. The temporary `Option` dance prevents concurrent use of the same blocking decoder.
+**Call relations**: Any code that got a reader from `open_rollout_line_reader` calls this repeatedly. It bridges async callers with compressed reads that must happen through blocking I/O.
 
 *Call graph*: 2 external calls (other, spawn_blocking).
 
@@ -522,11 +522,11 @@ async fn next_line(&mut self) -> io::Result<Option<String>>
 fn try_claim(codex_home: &Path) -> io::Result<Option<Self>>
 ```
 
-**Purpose**: Attempts to claim the per-home compression run marker, reusing a stale marker if necessary. It prevents overlapping or too-frequent worker runs.
+**Purpose**: Tries to claim permission to run the compression worker for this local store. It prevents two compression runs from working on the same files at the same time.
 
-**Data flow**: Accepts `codex_home: &Path`, ensures `codex_home/.tmp` exists, computes the marker path, and tries `create_run_marker_file`. If creation succeeds it returns `Some(Self::new(path))`. If the marker already exists, it checks its age from metadata/modified time; a fresh marker yields `Ok(None)`, while a stale marker is removed and creation is retried. Other I/O errors propagate.
+**Data flow**: It receives the Codex home directory → creates a `.tmp` marker location → tries to create a lock file → if an old marker is stale, removes it and retries → returns a marker object, `None` if another run is active, or an error.
 
-**Call relations**: Called at the start of `worker::run` to decide whether the worker should proceed. It delegates file creation to `create_run_marker_file` and marker construction to `new`.
+**Call relations**: `worker::run` calls this at the start. If no marker is claimed, the worker exits early instead of overlapping another run.
 
 *Call graph*: 6 external calls (join, new, create_run_marker_file, create_dir_all, metadata, remove_file).
 
@@ -537,11 +537,11 @@ fn try_claim(codex_home: &Path) -> io::Result<Option<Self>>
 fn new(path: PathBuf) -> Self
 ```
 
-**Purpose**: Constructs a claimed run marker that will remove its file on drop unless persisted. It is the internal owner type for the lock file lifecycle.
+**Purpose**: Creates a marker object that will remove its marker file when dropped. This represents an active compression run.
 
-**Data flow**: Accepts a marker `PathBuf` and returns `CompressionRunMarker { path, remove_on_drop: true }`.
+**Data flow**: It receives the marker file path → stores it with `remove_on_drop` set to true → returns the marker object.
 
-**Call relations**: Used only by `try_claim` after successfully creating or reclaiming the marker file.
+**Call relations**: `try_claim` uses this after successfully creating the marker file.
 
 
 ##### `worker::CompressionRunMarker::persist`  (lines 311–313)
@@ -550,11 +550,11 @@ fn new(path: PathBuf) -> Self
 fn persist(mut self)
 ```
 
-**Purpose**: Marks the run marker so it survives drop after a successful worker run. This leaves a freshness marker that throttles subsequent runs.
+**Purpose**: Leaves the marker file behind after a successful run. This records that compression ran recently, so another run will not start too soon.
 
-**Data flow**: Consumes `self` mutably and sets `remove_on_drop = false`. It returns no value.
+**Data flow**: It receives the marker object by value → flips its cleanup flag off → when the object is dropped, the file remains.
 
-**Call relations**: Called at the end of a successful `worker::run` after metrics and logging have been recorded.
+**Call relations**: `worker::run` calls this only after finishing successfully. Failed or interrupted runs do not persist the marker.
 
 
 ##### `worker::CompressionRunMarker::drop`  (lines 317–321)
@@ -563,11 +563,11 @@ fn persist(mut self)
 fn drop(&mut self)
 ```
 
-**Purpose**: Removes the marker file when the marker owner is dropped, unless it was persisted. This automatically cleans up failed or aborted runs.
+**Purpose**: Cleans up the run marker file when a compression run did not finish in the normal persisted state.
 
-**Data flow**: On drop, checks `remove_on_drop`; if true, it attempts `std::fs::remove_file(self.path.as_path())` and ignores any error.
+**Data flow**: When the marker object goes out of scope → checks whether it should remove the marker → deletes the marker file if needed and ignores cleanup errors.
 
-**Call relations**: Runs implicitly when `CompressionRunMarker` leaves scope. It complements `persist` by making unsuccessful runs self-cleaning.
+**Call relations**: This is automatic cleanup tied to `CompressionRunMarker`. It supports `try_claim` and `run` by releasing the claim on failures.
 
 *Call graph*: 2 external calls (as_path, remove_file).
 
@@ -578,11 +578,11 @@ fn drop(&mut self)
 fn spawn(codex_home: PathBuf)
 ```
 
-**Purpose**: Schedules the async compression worker on the current Tokio runtime if one exists, otherwise logs and records a skipped metric. It is the runtime-aware launcher for background compression.
+**Purpose**: Starts the compression worker on the current Tokio runtime, if one exists. Tokio is the async task system used by this Rust program.
 
-**Data flow**: Accepts `codex_home: PathBuf`, tries `tokio::runtime::Handle::try_current()`, and if unavailable records `metrics::run("skipped_no_runtime")` and logs a warning. If a runtime exists, it spawns an async task that awaits `run(codex_home.clone())` and logs any returned error.
+**Data flow**: It receives the Codex home path → checks for a current async runtime → if missing, records a skipped run and logs a warning → otherwise spawns `run` as a background task.
 
-**Call relations**: Called by the public `spawn_rollout_compression_worker`. It delegates actual work to `run` and only handles runtime availability and detached task spawning.
+**Call relations**: The public `spawn_rollout_compression_worker` calls this. It is the handoff from startup code into the worker’s main routine.
 
 *Call graph*: 5 external calls (clone, run, run, try_current, warn!).
 
@@ -593,11 +593,11 @@ fn spawn(codex_home: PathBuf)
 async fn run(codex_home: PathBuf) -> io::Result<()>
 ```
 
-**Purpose**: Executes one full compression-worker pass: claim marker, clean stale temps, scan active and archived roots, compress eligible files, emit metrics, and persist the run marker on success. It is the worker's main orchestration function.
+**Purpose**: Performs one full compression maintenance run. It claims the run marker, cleans old temporary files, scans rollout folders, compresses cold files, and records the result.
 
-**Data flow**: Accepts `codex_home: PathBuf`, claims a marker with `CompressionRunMarker::try_claim`, records skip/start/failure/completion metrics, captures `started_at`, runs `cleanup_stale_temps`, then iterates over `archived_sessions` and `sessions` roots calling `compress_rollouts_in_root` until `WORKER_MAX_RUNTIME` is reached. On success it logs aggregate stats, records duration metrics, calls `marker.persist()`, and returns `Ok(())`; on failure it records failed metrics and returns the error.
+**Data flow**: It receives the Codex home path → claims or skips a run marker → cleans stale temp files → scans archived and active session directories until time runs out → logs and records metrics → keeps the marker if completed successfully.
 
-**Call relations**: Spawned by `worker::spawn` and directly invoked by tests. It coordinates the marker, cleanup, scanning, compression jobs, and metrics helpers.
+**Call relations**: `worker::spawn` runs this in the background. It coordinates the worker helpers such as `cleanup_stale_temps`, `compress_rollouts_in_root`, and the run marker.
 
 *Call graph*: 11 external calls (now, as_path, join, debug!, info!, run, run_duration, try_claim, default, cleanup_stale_temps (+1 more)).
 
@@ -608,11 +608,11 @@ async fn run(codex_home: PathBuf) -> io::Result<()>
 fn create_run_marker_file(path: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Creates the lock file for a compression run and writes a small diagnostic header containing pid and start time. It uses create-new semantics so concurrent claims fail cleanly.
+**Purpose**: Creates the marker file that identifies an active or recent compression run. It writes basic information for humans or debugging tools.
 
-**Data flow**: Accepts `&Path`, opens it with `OpenOptions::new().write(true).create_new(true)`, writes `pid=<pid> started_at=<SystemTime>` via `writeln!`, and returns `Ok(())` or the I/O error.
+**Data flow**: It receives the marker path → creates the file only if it does not already exist → writes the process ID and start time → returns success or a filesystem error.
 
-**Call relations**: Used only by `CompressionRunMarker::try_claim` when claiming or reclaiming the run marker.
+**Call relations**: `CompressionRunMarker::try_claim` uses this to atomically claim the worker slot.
 
 *Call graph*: 2 external calls (new, writeln!).
 
@@ -627,11 +627,11 @@ async fn compress_rollouts_in_root(
     ) -> io::Result<()>
 ```
 
-**Purpose**: Recursively scans one rollout root directory, queues compression jobs for eligible plain rollout files, and collects their outcomes with bounded concurrency. It is the worker's directory traversal and job scheduling loop.
+**Purpose**: Walks one rollout directory tree and starts compression jobs for plain rollout files it finds. It limits how many compressions run at once.
 
-**Data flow**: Accepts a root path, worker start time, and mutable `CompressionStats`. It returns early if the root does not exist, then depth-first traverses directories with a stack and `tokio::fs::read_dir`. For each regular file it builds `RolloutFile::from_path`, skips non-rollouts and compressed files, increments `stats.scanned` and metrics, throttles to `MAX_CONCURRENT_COMPRESSION_JOBS` by awaiting `collect_next_compression_job`, and spawns blocking jobs that call `compress_rollout_if_cold_blocking`. At the end it drains remaining jobs.
+**Data flow**: It receives a root directory, start time, and mutable stats → skips missing roots → walks subdirectories → filters valid plain rollout files → counts scanned files → starts blocking compression jobs with a concurrency cap → drains remaining jobs before returning.
 
-**Call relations**: Called by `worker::run` for both active and archived roots. It delegates actual compression to `compress_rollout_if_cold_blocking` and result accounting to `collect_next_compression_job`/`drain_compression_jobs`.
+**Call relations**: `worker::run` calls this for archived and active session roots. It uses `RolloutFile::from_path` for discovery and `collect_next_compression_job` to fold job results into stats.
 
 *Call graph*: calls 1 internal fn (from_path); 9 external calls (elapsed, new, file, collect_next_compression_job, drain_compression_jobs, read_dir, try_exists, vec!, warn!).
 
@@ -642,11 +642,11 @@ async fn compress_rollouts_in_root(
 fn tag(self) -> &'static str
 ```
 
-**Purpose**: Returns the metric tag string corresponding to a compression outcome enum variant. It standardizes labels used across counters and histograms.
+**Purpose**: Turns a compression result into a short label for metrics. Labels include compressed, skipped because not cold, skipped because changed, and already compressed.
 
-**Data flow**: Matches `self` and returns one of the static strings `compressed`, `skipped_not_cold`, `skipped_changed`, or `skipped_already_compressed`.
+**Data flow**: It receives an outcome enum value → matches it to a fixed text tag → returns that tag.
 
-**Call relations**: Used by job-result collection when recording per-file metrics.
+**Call relations**: `collect_next_compression_job` uses this when recording metrics for completed compression jobs.
 
 
 ##### `worker::CompressionMeasurement::new`  (lines 515–525)
@@ -659,11 +659,11 @@ fn new(
         ) -> Self
 ```
 
-**Purpose**: Constructs a measurement object summarizing one compression attempt's outcome and optional byte counts. It packages data for later metrics emission.
+**Purpose**: Builds a small report describing what happened to one file during compression. It includes the outcome and optional byte counts.
 
-**Data flow**: Accepts a `CompressionOutcome`, optional source byte count, and optional compressed byte count, and returns `CompressionMeasurement { outcome, source_bytes, compressed_bytes }`.
+**Data flow**: It receives an outcome, optional original size, and optional compressed size → stores them in a measurement object → returns it.
 
-**Call relations**: Used by `compress_rollout_if_cold_blocking` to report whether a file was compressed or skipped and with what sizes.
+**Call relations**: `compress_rollout_if_cold_blocking` creates these reports, and `collect_next_compression_job` later reads them to update stats and metrics.
 
 
 ##### `worker::drain_compression_jobs`  (lines 533–540)
@@ -675,11 +675,11 @@ async fn drain_compression_jobs(
     )
 ```
 
-**Purpose**: Waits for all outstanding compression jobs to finish and folds their results into aggregate stats. It is the full-drain helper used at the end of a scan or before propagating certain errors.
+**Purpose**: Waits for all outstanding compression jobs to finish and records their results. This is used before leaving a directory scan.
 
-**Data flow**: Accepts a mutable `JoinSet<CompressionJobResult>` and mutable `CompressionStats`, and repeatedly calls `collect_next_compression_job` until `jobs.is_empty()`.
+**Data flow**: It receives the active job set and stats → repeatedly waits for the next job while any remain → updates stats through `collect_next_compression_job`.
 
-**Call relations**: Called by `compress_rollouts_in_root` after traversal completes and on some early-error paths to ensure spawned jobs are accounted for.
+**Call relations**: `compress_rollouts_in_root` calls this at the end and when errors require cleanup of already-started jobs.
 
 *Call graph*: 2 external calls (is_empty, collect_next_compression_job).
 
@@ -693,11 +693,11 @@ async fn collect_next_compression_job(
     )
 ```
 
-**Purpose**: Consumes one completed compression job, updates aggregate stats, emits metrics, and logs failures. It is the result-accounting step for worker concurrency control.
+**Purpose**: Collects one finished compression job and turns its result into counters, timings, byte measurements, and warnings if needed.
 
-**Data flow**: Awaits `jobs.join_next()`. Successful jobs with `Ok(measurement)` increment `stats.compressed` or `stats.skipped` based on `measurement.outcome`, record file counters/durations and optional byte/ratio histograms. Jobs returning `Err(err)` increment `stats.failed`, record failed metrics, and log the path-specific warning. Join errors also increment failed stats and log a task-failure warning.
+**Data flow**: It waits for the next job result → if compression succeeded, updates compressed or skipped counts and records metrics → if the job returned an error or panicked, increments failure counts and logs a warning.
 
-**Call relations**: Called by both `drain_compression_jobs` and `compress_rollouts_in_root` when concurrency limits require waiting for a slot.
+**Call relations**: `compress_rollouts_in_root` and `drain_compression_jobs` use this to keep the worker’s statistics accurate as background compression tasks finish.
 
 *Call graph*: 7 external calls (join_next, compressed_bytes, compression_ratio, file, file_duration, source_bytes, warn!).
 
@@ -708,11 +708,11 @@ async fn collect_next_compression_job(
 fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement>
 ```
 
-**Purpose**: Compresses one rollout file to zstd if it is old enough and unchanged throughout the operation, preserving metadata and avoiding races with concurrent writers. It is the worker's core file transformation routine.
+**Purpose**: Compresses one plain rollout file, but only if it is old enough and unchanged while compression is happening. This is the core safety-critical compression step.
 
-**Data flow**: Accepts a source `&Path`, snapshots eligibility and metadata via `cold_file_state`, returns `SkippedNotCold` if too fresh or missing, returns `SkippedAlreadyCompressed` if the `.zst` sibling already exists, otherwise creates a temp file in the destination directory, writes compressed bytes with `encode_zstd_to_writer`, flushes, verifies the temp file by decoding it with `verify_zstd`, checks `same_file_state(path, &before)` before and after persisting, copies modified time and permissions with `set_file_metadata`, persists the temp file with `persist_noclobber`, removes the compressed file again if the source changed after persist, and finally deletes the original plain file only on a stable successful path. It returns a `CompressionMeasurement` describing compressed or skipped outcomes.
+**Data flow**: It receives a file path → checks whether the file is cold → skips if too new, missing, or already compressed → writes a compressed temporary file → verifies it can be decompressed → checks the source file did not change → preserves metadata → installs the compressed file without overwriting → checks again → deletes the original plain file → returns a measurement of the outcome.
 
-**Call relations**: Spawned in blocking worker jobs from `compress_rollouts_in_root`. It depends on file-state helpers and metadata-preservation helpers to make compression safe under concurrent modification.
+**Call relations**: `compress_rollouts_in_root` runs this inside blocking jobs. It relies on file-state checks, zstd encoding and verification, and metadata copying to avoid data loss.
 
 *Call graph*: 10 external calls (compressed_rollout_path, new, cold_file_state, encode_zstd_to_writer, same_file_state, set_file_metadata, verify_zstd, create_dir_all, remove_file, new).
 
@@ -723,11 +723,11 @@ fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasu
 fn cold_file_state(path: &Path) -> io::Result<ColdFileState>
 ```
 
-**Purpose**: Determines whether a file is eligible for compression based on existence, file type, and age, while capturing the metadata needed for later race checks. It distinguishes cold files from fresh or missing ones.
+**Purpose**: Decides whether a file is old enough to compress and records the file details needed to detect later changes.
 
-**Data flow**: Accepts `&Path`, reads metadata, returns `ColdFileState::NotCold(None)` for missing or non-file paths, otherwise captures `len`, `modified`, and `permissions` into `FileState`, computes age from `SystemTime::now()`, and returns `Cold(state)` if age is at least `MIN_ROLLOUT_AGE` or `NotCold(Some(state))` if not.
+**Data flow**: It receives a path → reads metadata → rejects missing, non-file, or recently modified paths → captures length, modified time, and permissions → returns either cold state or not-cold state.
 
-**Call relations**: Called by `compress_rollout_if_cold_blocking` before any compression work begins.
+**Call relations**: `compress_rollout_if_cold_blocking` calls this before doing expensive compression work.
 
 *Call graph*: 4 external calls (now, Cold, NotCold, metadata).
 
@@ -738,11 +738,11 @@ fn cold_file_state(path: &Path) -> io::Result<ColdFileState>
 fn same_file_state(path: &Path, expected: &FileState) -> io::Result<bool>
 ```
 
-**Purpose**: Checks whether a file still matches a previously captured size, modification time, and permissions snapshot. It is used to detect concurrent changes during compression.
+**Purpose**: Checks whether a file still has the same size, modified time, and permissions as before. This detects writes or metadata changes during compression.
 
-**Data flow**: Accepts a path and expected `FileState`, reads current metadata, and returns `Ok(true)` only if length, modified time, and permissions all match. Missing files return `Ok(false)`; other metadata errors propagate.
+**Data flow**: It receives a path and expected file state → reads current metadata → compares key fields → returns true if unchanged, false if missing or changed, or an error for unexpected failures.
 
-**Call relations**: Called by `compress_rollout_if_cold_blocking` before and after persisting the compressed file to decide whether compression should be committed or treated as skipped-changed.
+**Call relations**: `compress_rollout_if_cold_blocking` calls this before and after installing the compressed file, so it can abandon compression if another writer touched the file.
 
 *Call graph*: 1 external calls (metadata).
 
@@ -753,11 +753,11 @@ fn same_file_state(path: &Path, expected: &FileState) -> io::Result<bool>
 fn encode_zstd_to_writer(source: &Path, output: impl Write) -> io::Result<()>
 ```
 
-**Purpose**: Streams a source file into a zstd encoder writing to the provided output sink. It performs the actual compression step.
+**Purpose**: Compresses a source file into a writer using Zstandard, a compression format often shortened to zstd.
 
-**Data flow**: Accepts a source path and any `Write` output, opens the source file, creates `zstd::stream::write::Encoder` at `COMPRESSION_LEVEL`, copies bytes from input to encoder with `io::copy`, calls `finish()`, and returns `Ok(())` or an I/O/codec error.
+**Data flow**: It receives a source path and output writer → opens the source → streams bytes through a zstd encoder → finishes the encoder → returns success or an I/O error.
 
-**Call relations**: Used only by `compress_rollout_if_cold_blocking` when building the compressed temp file.
+**Call relations**: `compress_rollout_if_cold_blocking` uses this to create the temporary compressed copy.
 
 *Call graph*: 3 external calls (open, copy, new).
 
@@ -768,11 +768,11 @@ fn encode_zstd_to_writer(source: &Path, output: impl Write) -> io::Result<()>
 fn verify_zstd(path: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Verifies that a compressed file can be fully decoded by streaming it to `io::sink()`. This catches corrupt temp outputs before they replace the source.
+**Purpose**: Checks that a compressed file can actually be decompressed. This prevents replacing a good source file with a corrupt compressed copy.
 
-**Data flow**: Accepts a compressed file path, opens it, wraps it in `zstd::stream::read::Decoder`, copies all decoded bytes into `io::sink()`, and returns success only if decoding completes.
+**Data flow**: It receives a compressed path → opens it → streams it through a zstd decoder into a discard sink → returns success if decoding completes.
 
-**Call relations**: Called by `compress_rollout_if_cold_blocking` immediately after writing the compressed temp file and before persisting it.
+**Call relations**: `compress_rollout_if_cold_blocking` calls this before it installs the compressed file and deletes the original.
 
 *Call graph*: 4 external calls (open, copy, sink, new).
 
@@ -787,11 +787,11 @@ fn set_file_metadata(
     ) -> io::Result<()>
 ```
 
-**Purpose**: Applies the source file's modified time and permissions to the compressed output file. This preserves user-visible metadata across compression.
+**Purpose**: Copies the original file’s modified time and permissions onto the compressed file. This keeps history sorting and access behavior consistent after compression.
 
-**Data flow**: Accepts a `&File`, source `SystemTime`, and source `Permissions`, calls `file.set_times(FileTimes::new().set_modified(modified))`, then `file.set_permissions(permissions.clone())`.
+**Data flow**: It receives an open file, a modified time, and permissions → sets the file times → sets the permissions → returns success or an error.
 
-**Call relations**: Used by `compress_rollout_if_cold_blocking` after compression and verification but before syncing and persisting the compressed file.
+**Call relations**: `compress_rollout_if_cold_blocking` uses this before persisting the compressed temporary file.
 
 *Call graph*: 4 external calls (set_permissions, set_times, new, clone).
 
@@ -802,11 +802,11 @@ fn set_file_metadata(
 async fn cleanup_stale_temps(codex_home: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Removes stale compression temp files from both active and archived rollout roots before a worker run proceeds. This prevents abandoned temp buildup from previous interrupted runs.
+**Purpose**: Removes old temporary files left behind by interrupted compression or decompression work. This keeps session folders from collecting abandoned `.tmp` files.
 
-**Data flow**: Accepts `codex_home: &Path`, constructs the `sessions` and `archived_sessions` roots, calls `cleanup_stale_temps_in_root` for each, and returns `Ok(())` or the first propagated error.
+**Data flow**: It receives the Codex home directory → builds the active and archived session roots → asks each root cleanup helper to scan for stale temp files → returns success or an error.
 
-**Call relations**: Called near the start of `worker::run` before scanning for compressible files.
+**Call relations**: `worker::run` calls this before starting compression, so old leftovers are cleaned during normal maintenance.
 
 *Call graph*: 2 external calls (join, cleanup_stale_temps_in_root).
 
@@ -817,11 +817,11 @@ async fn cleanup_stale_temps(codex_home: &Path) -> io::Result<()>
 async fn cleanup_stale_temps_in_root(root: &Path) -> io::Result<()>
 ```
 
-**Purpose**: Recursively scans one root for stale `*.tmp` files left by compression and removes those older than the configured threshold. Fresh temp files are left untouched.
+**Purpose**: Walks one session tree and deletes stale temporary files. A temp file is considered stale only after several hours, so active work is not disturbed.
 
-**Data flow**: Accepts a root path, returns early if it does not exist, then depth-first traverses directories with a stack and `tokio::fs::read_dir`. For each regular file whose name ends with `TEMP_SUFFIX`, it checks age from metadata/modified time; stale files are removed with `tokio::fs::remove_file`, recording `metrics::temp_cleanup("removed")` on success, ignoring `NotFound`, and recording/logging failures otherwise.
+**Data flow**: It receives a root directory → skips it if missing → walks subdirectories → finds files whose names end in `.tmp` → checks their age → removes stale ones and records cleanup metrics.
 
-**Call relations**: Called by `cleanup_stale_temps` for both active and archived roots. It is the worker's pre-run housekeeping step.
+**Call relations**: `cleanup_stale_temps` calls this for each session root. It logs warnings for unreadable directories or failed removals.
 
 *Call graph*: 6 external calls (temp_cleanup, read_dir, remove_file, try_exists, vec!, warn!).
 
@@ -832,11 +832,11 @@ async fn cleanup_stale_temps_in_root(root: &Path) -> io::Result<()>
 fn file(outcome: &'static str)
 ```
 
-**Purpose**: Increments the per-file compression outcome counter. It is a thin metric wrapper.
+**Purpose**: Records one file-level compression outcome, such as compressed, skipped, or failed.
 
-**Data flow**: Accepts an outcome tag and calls `counter(FILE_COUNTER, &[("outcome", outcome)])`.
+**Data flow**: It receives an outcome label → sends a counter increment with that label to the metrics backend if one is configured.
 
-**Call relations**: Used throughout worker result accounting and scanning to record file-level outcomes.
+**Call relations**: Compression scanning and job collection call this whenever a file is scanned or finishes processing.
 
 *Call graph*: 1 external calls (counter).
 
@@ -847,11 +847,11 @@ fn file(outcome: &'static str)
 fn file_duration(outcome: &'static str, duration: Duration)
 ```
 
-**Purpose**: Records a duration histogram sample for one file compression outcome. It tags the sample by outcome.
+**Purpose**: Records how long processing one rollout file took. This helps operators see whether compression is slow.
 
-**Data flow**: Accepts an outcome tag and `Duration`, then calls `duration_histogram(FILE_DURATION_HISTOGRAM, duration, &[("outcome", outcome)])`.
+**Data flow**: It receives an outcome label and duration → records the duration in a histogram with that label.
 
-**Call relations**: Used when collecting completed compression jobs.
+**Call relations**: `collect_next_compression_job` calls this after compression jobs finish.
 
 *Call graph*: 1 external calls (duration_histogram).
 
@@ -862,11 +862,11 @@ fn file_duration(outcome: &'static str, duration: Duration)
 fn source_bytes(outcome: &'static str, bytes: u64)
 ```
 
-**Purpose**: Records the source-file byte size histogram for a compression outcome. Values are saturated into `i64` for the metrics backend.
+**Purpose**: Records the original size of a rollout file. This makes it possible to understand how much data compression is considering.
 
-**Data flow**: Accepts an outcome tag and `u64` byte count, converts with `saturating_i64`, and calls `histogram(FILE_SOURCE_BYTES_HISTOGRAM, value, tags)`.
+**Data flow**: It receives an outcome label and byte count → converts the count safely into the metric number type → records it in a histogram.
 
-**Call relations**: Used by compression job result accounting when source size is known.
+**Call relations**: `collect_next_compression_job` calls this when a measurement includes source size.
 
 *Call graph*: 2 external calls (histogram, saturating_i64).
 
@@ -877,11 +877,11 @@ fn source_bytes(outcome: &'static str, bytes: u64)
 fn compressed_bytes(outcome: &'static str, bytes: u64)
 ```
 
-**Purpose**: Records the compressed-file byte size histogram for a compression outcome. It mirrors `source_bytes` for output size.
+**Purpose**: Records the size of the compressed rollout file. This shows how much space the compressed representation uses.
 
-**Data flow**: Accepts an outcome tag and `u64` byte count, converts with `saturating_i64`, and calls `histogram(FILE_COMPRESSED_BYTES_HISTOGRAM, value, tags)`.
+**Data flow**: It receives an outcome label and byte count → converts it safely → records it in a histogram.
 
-**Call relations**: Used by compression job result accounting when compressed size is known.
+**Call relations**: `collect_next_compression_job` calls this after successful compression when compressed size is known.
 
 *Call graph*: 2 external calls (histogram, saturating_i64).
 
@@ -896,11 +896,11 @@ fn compression_ratio(
     )
 ```
 
-**Purpose**: Records an integer-valued compression ratio histogram in basis points, preserving sub-percent precision without floating-point metrics. Zero-byte sources are skipped.
+**Purpose**: Records the compressed-size-to-original-size ratio. It uses integer precision so the metric system can store it reliably.
 
-**Data flow**: Accepts outcome tag, source bytes, and compressed bytes. If `source_bytes == 0`, it returns early. Otherwise it computes `(compressed_bytes * 10_000) / source_bytes` as `u128`, converts with `saturating_i64`, and records it via `histogram(FILE_COMPRESSION_RATIO_HISTOGRAM, ratio, tags)`.
+**Data flow**: It receives an outcome label, original bytes, and compressed bytes → skips zero-length sources → computes the ratio in basis points, where 10,000 means 100% → records it in a histogram.
 
-**Call relations**: Called when both source and compressed sizes are available for a completed compression job.
+**Call relations**: `collect_next_compression_job` calls this when both source and compressed sizes are available.
 
 *Call graph*: 3 external calls (histogram, saturating_i64, from).
 
@@ -911,11 +911,11 @@ fn compression_ratio(
 fn materialize(outcome: &'static str)
 ```
 
-**Purpose**: Increments the materialization outcome counter for append-path decompression. It tracks plain-exists, missing, decompressed, and failed cases.
+**Purpose**: Records what happened when a compressed rollout was materialized back to plain form.
 
-**Data flow**: Accepts an outcome tag and calls `counter(MATERIALIZE_COUNTER, &[("outcome", outcome)])`.
+**Data flow**: It receives an outcome label such as `decompressed`, `missing`, or `failed` → increments the materialization counter.
 
-**Call relations**: Used by `materialize_rollout_for_append_blocking` to record representation-switch outcomes.
+**Call relations**: `materialize_rollout_for_append_blocking` calls this to make decompression-for-append visible.
 
 *Call graph*: 1 external calls (counter).
 
@@ -926,11 +926,11 @@ fn materialize(outcome: &'static str)
 fn run(status: &'static str)
 ```
 
-**Purpose**: Increments the worker-run status counter. It tracks statuses such as started, completed, failed, and skipped.
+**Purpose**: Records the overall status of a compression worker run, such as started, completed, failed, or skipped.
 
-**Data flow**: Accepts a status tag and calls `counter(RUN_COUNTER, &[("status", status)])`.
+**Data flow**: It receives a status label → increments the run counter with that status.
 
-**Call relations**: Used by `worker::spawn` and `worker::run` around worker lifecycle transitions.
+**Call relations**: `worker::spawn` and `worker::run` call this at important lifecycle points.
 
 *Call graph*: 1 external calls (counter).
 
@@ -941,11 +941,11 @@ fn run(status: &'static str)
 fn run_duration(status: &'static str, duration: Duration)
 ```
 
-**Purpose**: Records a duration histogram sample for a worker run status. It captures total runtime for completed or failed runs.
+**Purpose**: Records how long a full compression worker run took.
 
-**Data flow**: Accepts a status tag and `Duration`, then calls `duration_histogram(RUN_DURATION_HISTOGRAM, duration, &[("status", status)])`.
+**Data flow**: It receives a status label and duration → records the duration with that status label.
 
-**Call relations**: Used by `worker::run` when a run completes or fails.
+**Call relations**: `worker::run` calls this when the run completes or fails.
 
 *Call graph*: 1 external calls (duration_histogram).
 
@@ -956,11 +956,11 @@ fn run_duration(status: &'static str, duration: Duration)
 fn temp_cleanup(outcome: &'static str)
 ```
 
-**Purpose**: Increments the stale-temp cleanup outcome counter. It tracks removed and failed cleanup attempts.
+**Purpose**: Records whether stale temporary file cleanup removed a file or failed.
 
-**Data flow**: Accepts an outcome tag and calls `counter(TEMP_CLEANUP_COUNTER, &[("outcome", outcome)])`.
+**Data flow**: It receives a cleanup outcome label → increments the temp-cleanup counter.
 
-**Call relations**: Used by `cleanup_stale_temps_in_root` when stale temp removal succeeds or fails.
+**Call relations**: `cleanup_stale_temps_in_root` calls this while removing old `.tmp` files.
 
 *Call graph*: 1 external calls (counter).
 
@@ -971,11 +971,11 @@ fn temp_cleanup(outcome: &'static str)
 fn counter(name: &str, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Sends a counter increment to the global OpenTelemetry metrics backend if one is configured. Missing metrics infrastructure is silently ignored.
+**Purpose**: Sends a counter increment to the global metrics system, if metrics are enabled. If no metrics backend exists, it quietly does nothing.
 
-**Data flow**: Accepts a metric name and tag slice, calls `codex_otel::global()`, returns early if `None`, otherwise invokes `metrics.counter(name, 1, tags)` and ignores its result.
+**Data flow**: It receives a metric name and tags → looks up the global metrics recorder → increments the counter by one when available.
 
-**Call relations**: Used by the higher-level metric wrappers in this module.
+**Call relations**: The higher-level metric helpers use this for run, file, materialization, and cleanup counters.
 
 *Call graph*: 1 external calls (global).
 
@@ -986,11 +986,11 @@ fn counter(name: &str, tags: &[(&str, &str)])
 fn histogram(name: &str, value: i64, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Sends an integer histogram sample to the global metrics backend if available. It is the generic numeric metric helper for this module.
+**Purpose**: Sends a numeric measurement to the global metrics system. Histograms collect distributions, such as file sizes.
 
-**Data flow**: Accepts metric name, `i64` value, and tags, obtains `codex_otel::global()`, and if present calls `metrics.histogram(name, value, tags)`.
+**Data flow**: It receives a metric name, value, and tags → looks up the global metrics recorder → records the value if metrics are configured.
 
-**Call relations**: Used by byte-count and compression-ratio wrappers.
+**Call relations**: Size and ratio metric helpers call this after preparing their numeric values.
 
 *Call graph*: 1 external calls (global).
 
@@ -1001,11 +1001,11 @@ fn histogram(name: &str, value: i64, tags: &[(&str, &str)])
 fn duration_histogram(name: &str, duration: Duration, tags: &[(&str, &str)])
 ```
 
-**Purpose**: Sends a duration sample to the global metrics backend if available. It is the duration-specific metric helper for this module.
+**Purpose**: Records a time duration in the global metrics system. It is used for measuring file and worker run durations.
 
-**Data flow**: Accepts metric name, `Duration`, and tags, obtains `codex_otel::global()`, and if present calls `metrics.record_duration(name, duration, tags)`.
+**Data flow**: It receives a metric name, duration, and tags → looks up the global metrics recorder → records the duration if available.
 
-**Call relations**: Used by file-duration and run-duration wrappers.
+**Call relations**: `metrics::file_duration` and `metrics::run_duration` delegate to this helper.
 
 *Call graph*: 1 external calls (global).
 
@@ -1016,11 +1016,11 @@ fn duration_histogram(name: &str, duration: Duration, tags: &[(&str, &str)])
 fn saturating_i64(value: impl TryInto<i64>) -> i64
 ```
 
-**Purpose**: Converts numeric values into `i64`, saturating to `i64::MAX` on overflow or failed conversion. It keeps metric emission robust across large values.
+**Purpose**: Safely converts a number into a signed 64-bit integer for metrics. If the number is too large, it uses the largest possible value instead of failing.
 
-**Data flow**: Accepts any `TryInto<i64>`, attempts conversion, and returns the converted value or `i64::MAX` on failure.
+**Data flow**: It receives a convertible numeric value → tries to convert it to `i64` → returns the converted value or `i64::MAX` on overflow.
 
-**Call relations**: Used by byte-count and ratio metric wrappers before sending values to the metrics backend.
+**Call relations**: Metric helpers use this before sending byte counts and ratios to histogram recording.
 
 *Call graph*: 1 external calls (try_into).
 
@@ -1031,11 +1031,11 @@ fn saturating_i64(value: impl TryInto<i64>) -> i64
 async fn existing_rollout_path(path: &Path) -> Option<PathBuf>
 ```
 
-**Purpose**: Returns the existing physical path for a logical rollout, preferring the plain file over its compressed sibling. It is the public wrapper around the internal path-resolution helper.
+**Purpose**: Finds the physical rollout file that exists on disk, preferring the plain `.jsonl` version over the compressed `.jsonl.zst` version.
 
-**Data flow**: Accepts `&Path` and forwards to `path::existing_rollout_path(path).await`, returning `Option<PathBuf>`.
+**Data flow**: It receives a rollout path → delegates to the internal path helper → returns the existing path or `None`.
 
-**Call relations**: Used by callers outside this file that need representation-aware path resolution.
+**Call relations**: External code can call this when it needs to know which representation is currently available.
 
 *Call graph*: 1 external calls (existing_rollout_path).
 
@@ -1046,11 +1046,11 @@ async fn existing_rollout_path(path: &Path) -> Option<PathBuf>
 fn compressed_rollout_path(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the compressed sibling path for a rollout file. If the input is already compressed, it is returned unchanged.
+**Purpose**: Computes the compressed sibling path for a rollout file. If the input is already compressed, it returns it unchanged.
 
-**Data flow**: Accepts `&Path`, checks `is_compressed_rollout_path`, otherwise appends `.zst` to the filename (defaulting to `rollout.jsonl` if absent) and returns `path.with_file_name(file_name)`.
+**Data flow**: It receives a path → checks whether it already ends as a compressed rollout → otherwise appends `.zst` to the filename → returns the resulting path.
 
-**Call relations**: Used by materialization, worker compression, and public wrappers whenever the compressed representation path is needed.
+**Call relations**: Compression, materialization, and existence lookup code use this to agree on compressed filenames.
 
 *Call graph*: 4 external calls (file_name, to_path_buf, with_file_name, is_compressed_rollout_path).
 
@@ -1061,11 +1061,11 @@ fn compressed_rollout_path(path: &Path) -> PathBuf
 fn plain_rollout_path(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the plain `.jsonl` path corresponding to a rollout path. Compressed suffixes are stripped when present.
+**Purpose**: Computes the plain `.jsonl` path for a rollout file. If the path is not compressed, it returns it unchanged.
 
-**Data flow**: Accepts `&Path`, extracts the filename as UTF-8, strips `COMPRESSED_SUFFIX` if present, and returns `path.with_file_name(plain_file_name)`; paths without a valid filename are returned unchanged.
+**Data flow**: It receives a path → checks for the `.zst` suffix → strips it when present → returns the plain path.
 
-**Call relations**: Used by materialization, sibling-skipping logic, and existing-path resolution.
+**Call relations**: Append preparation and lookup code use this to normalize rollout paths before deciding what file to read or write.
 
 *Call graph*: 3 external calls (file_name, to_path_buf, with_file_name).
 
@@ -1076,11 +1076,11 @@ fn plain_rollout_path(path: &Path) -> PathBuf
 fn is_compressed_rollout_path(path: &Path) -> bool
 ```
 
-**Purpose**: Checks whether a path's filename ends with `.jsonl.zst`. It is the representation predicate for rollout paths.
+**Purpose**: Checks whether a path names a compressed rollout file.
 
-**Data flow**: Accepts `&Path`, inspects `file_name().and_then(OsStr::to_str)`, and returns whether the name ends with `.jsonl.zst`.
+**Data flow**: It receives a path → reads the filename as text → returns true only when it ends with `.jsonl.zst`.
 
-**Call relations**: Used by path normalization, reader opening, and worker scan logic.
+**Call relations**: Readers, scanners, and path helpers use this to branch between compressed and plain behavior.
 
 *Call graph*: 1 external calls (file_name).
 
@@ -1091,11 +1091,11 @@ fn is_compressed_rollout_path(path: &Path) -> bool
 fn should_skip_compressed_sibling(path: &Path) -> bool
 ```
 
-**Purpose**: Determines whether a compressed rollout file should be hidden because its plain sibling currently exists. This enforces plain-file precedence during discovery.
+**Purpose**: Decides whether a compressed file should be ignored because the plain version is present. This prevents duplicate logical rollout entries.
 
-**Data flow**: Accepts `&Path` and returns true only when the path is compressed and `plain_rollout_path(path).exists()`.
+**Data flow**: It receives a path → if it is compressed, computes the plain sibling path → checks whether the plain file exists → returns true when the compressed sibling should be hidden.
 
-**Call relations**: Used by `RolloutFile::from_path` so directory walkers see at most one logical file per rollout.
+**Call relations**: `RolloutFile::from_path` uses this during directory discovery.
 
 *Call graph*: calls 1 internal fn (plain_rollout_path); 1 external calls (is_compressed_rollout_path).
 
@@ -1106,11 +1106,11 @@ fn should_skip_compressed_sibling(path: &Path) -> bool
 async fn existing_rollout_path(path: &Path) -> Option<PathBuf>
 ```
 
-**Purpose**: Resolves the physical path for a logical rollout, preferring the plain file and falling back to the compressed sibling. It is the async representation-resolution primitive.
+**Purpose**: Looks for the existing version of a rollout file on disk, with plain files taking priority over compressed files.
 
-**Data flow**: Accepts `&Path`, computes the plain path, checks `tokio::fs::metadata` for an existing regular file there, otherwise computes the compressed sibling and checks it similarly, returning `Some(path)` for the first existing file or `None` if neither exists.
+**Data flow**: It receives a path → normalizes it to the plain path → checks for a plain file → if absent, checks for the compressed sibling → returns whichever existing file should be used, or `None`.
 
-**Call relations**: Used by public wrappers, file-modified-time lookup, and reader opening.
+**Call relations**: Top-level lookup, modified-time code, and reader opening code rely on this so they do not duplicate existence checks.
 
 *Call graph*: calls 2 internal fn (compressed_rollout_path, plain_rollout_path); 1 external calls (matches!).
 
@@ -1121,11 +1121,11 @@ async fn existing_rollout_path(path: &Path) -> Option<PathBuf>
 fn parse_rollout_file_name(name: &str) -> Option<&str>
 ```
 
-**Purpose**: Validates rollout filenames and normalizes compressed names to their plain `.jsonl` form. It accepts only names matching `rollout-*.jsonl[.zst]`.
+**Purpose**: Recognizes valid rollout filenames. It treats compressed and plain names as the same logical rollout and returns the plain name.
 
-**Data flow**: Accepts `&str`, strips a trailing `.zst` if present, and returns `Some(name)` only if the remaining name starts with `rollout-` and ends with `.jsonl`; otherwise returns `None`.
+**Data flow**: It receives a filename → removes `.zst` if present → checks that it starts with `rollout-` and ends with `.jsonl` → returns the normalized name or `None`.
 
-**Call relations**: Used by `RolloutFile::from_path` and public filename parsing wrappers.
+**Call relations**: `RolloutFile::from_path` and the public wrapper use this to filter directory entries.
 
 
 ##### `reader::open_once`  (lines 985–1007)
@@ -1134,11 +1134,11 @@ fn parse_rollout_file_name(name: &str) -> Option<&str>
 async fn open_once(path: &Path) -> io::Result<RolloutLineReader>
 ```
 
-**Purpose**: Opens a rollout line reader for the currently existing representation without retry logic. It chooses async plain reading or blocking zstd decoding based on the resolved path.
+**Purpose**: Performs one attempt to open a rollout line reader. It chooses a plain async reader or a compressed blocking decoder based on the file that exists.
 
-**Data flow**: Accepts `&Path`, resolves the existing physical path via `path::existing_rollout_path(path).await` or falls back to the requested path, then checks `path::is_compressed_rollout_path`. For compressed files it uses `spawn_blocking` to open the file, wrap it in a zstd decoder, and build a blocking `BufRead::lines()` iterator stored as `RolloutLineReaderInner::Blocking(Some(reader))`. For plain files it opens with `tokio::fs::File::open` and returns `RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines())`.
+**Data flow**: It receives a requested rollout path → resolves the existing plain or compressed path → if compressed, opens and wraps a zstd decoder on a blocking thread → if plain, opens it with Tokio async file I/O → returns a `RolloutLineReader`.
 
-**Call relations**: Called by `open_rollout_line_reader`, which adds retry behavior around this single-attempt open.
+**Call relations**: `open_rollout_line_reader` calls this and adds retry behavior around it. The returned reader is later consumed through `RolloutLineReader::next_line`.
 
 *Call graph*: 8 external calls (as_path, existing_rollout_path, is_compressed_rollout_path, Blocking, Plain, open, new, spawn_blocking).
 
@@ -1149,11 +1149,11 @@ async fn open_once(path: &Path) -> io::Result<RolloutLineReader>
 fn create_file_with_permissions(path: &Path, permissions: &Permissions) -> io::Result<File>
 ```
 
-**Purpose**: Creates a new file while preserving the source file's permissions, including Unix mode bits on Unix platforms. It is used when materializing compressed rollouts.
+**Purpose**: Creates a new file and applies permissions copied from another file. On Unix, it uses the permissions at creation time as well as setting them afterward.
 
-**Data flow**: Accepts a target path and source `Permissions`. On Unix it opens with `create_new(true)` and `.mode(permissions.mode() & 0o7777)`, then explicitly sets permissions; on non-Unix it opens normally and sets permissions afterward. It returns the created `File`.
+**Data flow**: It receives a destination path and permissions → opens a new file without overwriting an existing one → applies the requested permissions → returns the open file.
 
-**Call relations**: Used by `materialize_rollout_for_append_blocking` so decompressed plain files inherit the compressed source's permissions.
+**Call relations**: `materialize_rollout_for_append_blocking` uses this when writing a decompressed plain file so the restored file behaves like the compressed source.
 
 *Call graph*: 3 external calls (clone, mode, new).
 
@@ -1164,24 +1164,26 @@ fn create_file_with_permissions(path: &Path, permissions: &Permissions) -> io::R
 fn temp_path_for(path: &Path, operation: &str) -> PathBuf
 ```
 
-**Purpose**: Generates a unique temp filename adjacent to a rollout path for a named operation such as decompression. It avoids collisions across threads and processes.
+**Purpose**: Builds a unique temporary filename next to a rollout file. The name includes the operation, process ID, and a counter to avoid collisions.
 
-**Data flow**: Accepts a base path and operation string, derives the base filename (defaulting to `rollout`), increments the global `TEMP_COUNTER` atomically, appends `.{operation}.{pid}.{counter}.tmp`, and returns `path.with_file_name(file_name)`.
+**Data flow**: It receives a target path and operation name → starts with the target filename or a fallback → appends operation, process ID, counter, and `.tmp` → returns the sibling temporary path.
 
-**Call relations**: Used by `materialize_rollout_for_append_blocking` to create unique temp output paths during decompression.
+**Call relations**: `materialize_rollout_for_append_blocking` uses this before decompressing so incomplete output does not appear as the real rollout file.
 
 *Call graph*: called by 1 (materialize_rollout_for_append_blocking); 3 external calls (file_name, with_file_name, format!).
 
 
 ### `rollout/src/session_index.rs`
 
-`io_transport` · `cross-cutting title lookup and rename persistence`
+`io_transport` · `cross-cutting session naming and lookup`
 
-This file implements a small append-only index stored as `session_index.jsonl` under `codex_home`. Each `SessionIndexEntry` records a `ThreadId`, `thread_name`, and `updated_at` string. Writes are serialized with a global `LazyLock<Mutex<()>>` so concurrent append/remove operations do not interleave. `append_thread_name` stamps the current UTC time and delegates to `append_session_index_entry`, which appends one JSON line and flushes immediately. `remove_thread_name_entries` is the only rewriting operation: it loads the whole file, filters out entries for one thread ID, writes a temporary file, and renames it into place.
+This file is the project’s simple address book for sessions. Each time a thread is named or renamed, it writes one new JSON line to `session_index.jsonl` under the Codex home folder. It does not rewrite the whole file for normal updates. Instead, it treats the file like a notebook where newer notes are added at the end, and the newest note wins.
 
-Read paths are optimized around append order rather than timestamps. `find_thread_name_by_id` uses `spawn_blocking` plus a reverse scanner to find the newest entry for one ID. `find_thread_names_by_ids` instead streams the file forward asynchronously and lets later entries overwrite earlier ones in a `HashMap`, yielding the latest non-empty name for each requested ID. `find_thread_meta_by_name_str` is more involved: it reverse-scans matching thread IDs newest-first through a channel, then for each candidate asks the rollout listing code to resolve the thread’s rollout path and read its `SessionMetaLine`. This intentionally skips newer name entries whose rollout was never materialized or is unreadable, so an unsaved rename cannot shadow an older persisted session.
+That design makes renaming cheap and safe: appending one line is simpler than editing old records in place. To avoid two tasks writing at the same time and mixing their lines together, the file uses a mutex, which is a lock that allows only one writer into the critical section at once.
 
-The reverse scanner reads the file in fixed-size chunks from the end, accumulates bytes for each line in reverse, reconstructs UTF-8 lines, ignores malformed/blank JSON, and stops as soon as the visitor closure returns a matching `SessionIndexEntry`. `stream_thread_ids_from_end_by_name` also tracks seen IDs so historical names for a renamed thread are ignored once a newer name for that same ID has been observed.
+For lookups, the file often reads from the end backward, because the newest answer is usually near the end. It parses each line as a `SessionIndexEntry`, which contains the thread ID, the visible name, and the time of the update. Bad or empty lines are skipped rather than crashing the lookup.
+
+It also has a more careful name lookup that finds matching thread IDs from newest to oldest, then checks whether the actual saved rollout file exists and has readable session metadata. This prevents a partial or unsaved rename from hiding an older usable session with the same name.
 
 #### Function details
 
@@ -1195,11 +1197,11 @@ async fn append_thread_name(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Appends a new thread-name mapping for a thread ID with the current UTC timestamp. The index is append-only, so later entries supersede earlier ones.
+**Purpose**: Records a new visible name for a thread. It adds the current time so later lookups can tell when that name was written.
 
-**Data flow**: Takes `codex_home`, `thread_id`, and `name`; formats `OffsetDateTime::now_utc()` as RFC3339 with fallback to `"unknown"`; builds `SessionIndexEntry { id, thread_name, updated_at }`; delegates to `append_session_index_entry` and returns its I/O result.
+**Data flow**: It receives the Codex home folder, a thread ID, and a name. It creates a `SessionIndexEntry` with those values plus the current UTC time, then passes that entry onward to be written to disk. The result is success or an I/O error if the write fails.
 
-**Call relations**: This is the high-level write API used by callers that want to record a rename without constructing `SessionIndexEntry` manually.
+**Call relations**: This is the friendly public entry point for name updates. It gets the current time with `now_utc`, builds the record, and hands the actual file-writing work to `append_session_index_entry`.
 
 *Call graph*: calls 1 internal fn (append_session_index_entry); 1 external calls (now_utc).
 
@@ -1213,11 +1215,11 @@ async fn append_session_index_entry(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Appends one raw `SessionIndexEntry` JSON line to `session_index.jsonl` under a global process-local lock. It is the low-level durable write primitive for the session index.
+**Purpose**: Writes one already-built session index record to `session_index.jsonl`. It is useful when the caller already has the full record, including its timestamp.
 
-**Data flow**: Locks `SESSION_INDEX_LOCK`, computes the file path with `session_index_path`, opens the file in create+append mode, serializes the entry to JSON, appends a newline, writes bytes, flushes, and returns `std::io::Result<()>`.
+**Data flow**: It receives the Codex home folder and a session index entry. It locks the shared write lock, finds the index file path, turns the entry into one JSON string, adds a newline, appends it to the file, and flushes it so the bytes are pushed out. It returns success or the file/JSON error that stopped the write.
 
-**Call relations**: Called by `append_thread_name`; all append-only index writes funnel through this function.
+**Call relations**: `append_thread_name` calls this after preparing a normal rename record. This function uses `session_index_path` to decide where the index lives, and uses JSON serialization to make the record readable later.
 
 *Call graph*: calls 1 internal fn (session_index_path); called by 1 (append_thread_name); 2 external calls (to_string, new).
 
@@ -1231,11 +1233,11 @@ async fn remove_thread_name_entries(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Deletes all index entries for a given thread ID by rewriting the file without those lines. It is used when a thread’s name history should be fully removed.
+**Purpose**: Deletes every stored name record for one thread ID. This is used when the index should no longer remember any name history for that thread.
 
-**Data flow**: Locks `SESSION_INDEX_LOCK`, reads the whole index file if it exists, parses each line as `SessionIndexEntry`, filters out entries whose `id` matches `thread_id`, tracks whether anything was removed, writes the remaining lines to a temporary `.jsonl.tmp` file, and renames it over the original file.
+**Data flow**: It receives the Codex home folder and the thread ID to remove. It locks the index, reads the whole index file if it exists, keeps only the lines that do not decode to that thread ID, writes the remaining lines to a temporary file, and renames that temporary file over the old index. If the index file is missing, it treats that as already done.
 
-**Call relations**: This is the only non-append mutation path in the module; it complements `append_thread_name` for cleanup/removal scenarios.
+**Call relations**: Like the append path, it uses `session_index_path` to locate the file. Unlike normal updates, this must rewrite the file because it is removing older records rather than adding a new one.
 
 *Call graph*: calls 1 internal fn (session_index_path); 4 external calls (with_capacity, read_to_string, rename, write).
 
@@ -1249,11 +1251,11 @@ async fn find_thread_name_by_id(
 ) -> std::io::Result<Option<String>>
 ```
 
-**Purpose**: Finds the latest recorded thread name for one thread ID by scanning the index from the end. It avoids loading the whole file into memory on the async runtime thread.
+**Purpose**: Finds the current name for one thread ID, if the index has one. It searches for the newest matching record because older lines may contain old names.
 
-**Data flow**: Builds the index path, returns `Ok(None)` if it does not exist, copies the target ID, runs `scan_index_from_end_by_id` inside `tokio::task::spawn_blocking`, unwraps nested results, and maps the found entry to `entry.thread_name`.
+**Data flow**: It receives the Codex home folder and a thread ID. If the index file does not exist, it returns `None`. Otherwise it runs the disk scan on a blocking worker thread, reads backward through the file, and returns the matching entry’s thread name if one is found.
 
-**Call relations**: Uses the reverse-scanning helpers because append order defines recency in this index.
+**Call relations**: This function is the single-ID lookup path. It uses `session_index_path` to locate the index and `spawn_blocking` so the potentially slow file scanning does not block the async runtime.
 
 *Call graph*: calls 1 internal fn (session_index_path); 1 external calls (spawn_blocking).
 
@@ -1267,11 +1269,11 @@ async fn find_thread_names_by_ids(
 ) -> std::io::Result<HashMap<ThreadId, String>>
 ```
 
-**Purpose**: Finds the latest non-empty names for a batch of thread IDs by scanning the index forward and letting later entries overwrite earlier ones. It is optimized for bulk title lookup during listing/search.
+**Purpose**: Finds current names for many thread IDs in one pass through the index. This avoids doing a separate file scan for every thread in a list.
 
-**Data flow**: Returns an empty map if the ID set is empty or the index file is missing; otherwise opens the file asynchronously, reads lines through `BufReader::lines`, skips blank or malformed lines, trims names, and inserts matching IDs into a `HashMap<ThreadId, String>`, overwriting older values with later ones.
+**Data flow**: It receives the Codex home folder and a set of thread IDs. If there is nothing to look up or the index file is absent, it returns an empty map. Otherwise it reads the file line by line, skips empty or invalid lines, and stores names for requested IDs; because later lines overwrite earlier ones in the map, the final result keeps the newest name seen for each ID.
 
-**Call relations**: Called by rollout listing search code to map thread IDs to titles for substring filtering.
+**Call relations**: `filter_thread_items_by_search_term` calls this when it needs names for a batch of thread items, such as during search or filtering. This function uses `session_index_path` to find the file and asynchronous file reading so it can cooperate with the rest of the async program.
 
 *Call graph*: calls 1 internal fn (session_index_path); called by 1 (filter_thread_items_by_search_term); 4 external calls (new, with_capacity, open, new).
 
@@ -1286,11 +1288,11 @@ async fn find_thread_meta_by_name_str(
 ) -> std::io::Result<Option<(PathBuf, SessionMetaLine)>>
 ```
 
-**Purpose**: Finds the newest thread with a given current name that still has a readable rollout header. It resolves name collisions and skips unsaved or partial rollouts.
+**Purpose**: Looks up a saved thread by its human-readable name and returns the path to its rollout file plus its session metadata. It is careful not to stop at a name record if the actual saved session cannot be read.
 
-**Data flow**: Rejects blank names or missing index files, creates an `mpsc` channel, spawns a blocking reverse scan with `stream_thread_ids_from_end_by_name`, then asynchronously receives candidate thread IDs newest-first; for each ID it resolves a rollout path via `super::list::find_thread_path_by_id_str` and tries to read `SessionMetaLine` via `super::list::read_session_meta_line`; on the first success it stops and returns `Some((path, session_meta))`, otherwise returns `None` after the scan completes.
+**Data flow**: It receives the Codex home folder, a name string, and optional state database context. Empty names or a missing index immediately produce `None`. Otherwise it starts a backward scan of the index that streams matching thread IDs from newest to oldest through a channel. For each candidate ID, it asks the rollout listing code to find the saved file path, then reads that file’s metadata header. The first readable match becomes the returned path and metadata.
 
-**Call relations**: This is the highest-level lookup in the module, combining reverse index scanning with rollout-path resolution and header loading to avoid returning stale or unmaterialized name hits.
+**Call relations**: This is the name-to-session lookup path. It uses `session_index_path` to find the index, a channel to receive candidate IDs, and `spawn_blocking` for the backward file scan. For each candidate, it hands off to `find_thread_path_by_id_str` to locate the saved rollout and to `read_session_meta_line` to confirm the file is usable.
 
 *Call graph*: calls 3 internal fn (find_thread_path_by_id_str, read_session_meta_line, session_index_path); 2 external calls (channel, spawn_blocking).
 
@@ -1301,11 +1303,11 @@ async fn find_thread_meta_by_name_str(
 fn session_index_path(codex_home: &Path) -> PathBuf
 ```
 
-**Purpose**: Computes the absolute path to `session_index.jsonl` under a Codex home directory. It centralizes the filename constant.
+**Purpose**: Builds the full path to the session index file inside the Codex home folder. This keeps every caller using the same filename and location.
 
-**Data flow**: Joins `codex_home` with `SESSION_INDEX_FILE` and returns the resulting `PathBuf`.
+**Data flow**: It receives the Codex home directory path. It joins that directory with the fixed filename `session_index.jsonl`. It returns the resulting path.
 
-**Call relations**: Used by all read and write operations in this module.
+**Call relations**: All file-reading and file-writing functions call this before touching the index. It is the small shared rule that says where the index lives.
 
 *Call graph*: called by 5 (append_session_index_entry, find_thread_meta_by_name_str, find_thread_name_by_id, find_thread_names_by_ids, remove_thread_name_entries); 1 external calls (join).
 
@@ -1319,11 +1321,11 @@ fn scan_index_from_end_by_id(
 ) -> std::io::Result<Option<SessionIndexEntry>>
 ```
 
-**Purpose**: Finds the newest index entry for a specific thread ID by delegating to the generic reverse scanner. It is the ID-specialized reverse lookup helper.
+**Purpose**: Searches the index backward for the newest entry with a particular thread ID. It is a specialized wrapper around the more general backward scanner.
 
-**Data flow**: Accepts an index path and thread ID reference, calls `scan_index_from_end` with a predicate comparing `entry.id` to the target, and returns the optional matching entry.
+**Data flow**: It receives the index file path and the target thread ID. It creates a matching rule that checks whether each entry has that ID, then returns the first matching entry found while scanning from the end. If no match exists, it returns `None`.
 
-**Call relations**: Used by `find_thread_name_by_id` after moving the blocking work off the async runtime.
+**Call relations**: This helper delegates the actual backward file reading to `scan_index_from_end`. It exists so callers looking up by ID do not have to write the matching rule themselves.
 
 *Call graph*: calls 1 internal fn (scan_index_from_end).
 
@@ -1338,11 +1340,11 @@ fn stream_thread_ids_from_end_by_name(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Streams matching thread IDs for a given current name in newest-first append order, suppressing historical names for IDs that have since been renamed. It is designed for incremental async consumption.
+**Purpose**: Streams thread IDs whose latest recorded name equals a requested name, starting with the newest index records. It also avoids treating an old name as current after a thread has been renamed.
 
-**Data flow**: Creates a `HashSet` of seen IDs, reverse-scans entries with `scan_index_from_end_for_each`, and for each entry first records whether this is the newest row seen for that ID; if so and `entry.thread_name == name`, sends the ID over `tx.blocking_send`; if the receiver is gone, returns early by yielding `Some(entry.clone())` through the visitor.
+**Data flow**: It receives the index path, the name to match, and a channel sender. As it scans backward, it remembers which thread IDs it has already seen. The first time it sees an ID, that entry represents the thread’s latest name; if that name matches the requested name, it sends the ID through the channel. It finishes with success unless scanning fails.
 
-**Call relations**: Spawned inside `find_thread_meta_by_name_str` to feed candidate IDs over a channel while the async side resolves rollout paths.
+**Call relations**: `find_thread_meta_by_name_str` starts this on a blocking worker and receives IDs from its channel. This function uses `scan_index_from_end_for_each` so it can inspect entries newest-first and send matching IDs as they appear.
 
 *Call graph*: calls 1 internal fn (scan_index_from_end_for_each); 1 external calls (new).
 
@@ -1356,11 +1358,11 @@ fn scan_index_from_end(
 ) -> std::io::Result<Option<SessionIndexEntry>>
 ```
 
-**Purpose**: Runs a predicate over index entries in reverse append order and returns the first matching entry. It is the generic reverse-search wrapper around the chunked scanner.
+**Purpose**: Provides a simple backward search over the index file. The caller supplies the question, and this function returns the newest entry that answers yes.
 
-**Data flow**: Accepts a path and predicate closure, calls `scan_index_from_end_for_each` with a visitor that clones and returns the first entry satisfying the predicate, and returns the optional result.
+**Data flow**: It receives the index path and a predicate, which is a small yes-or-no test for each parsed entry. It scans entries from newest to oldest and returns a clone of the first entry that passes the test. If none pass, it returns `None`.
 
-**Call relations**: Used by `scan_index_from_end_by_id` and tests that need reverse-order lookup by arbitrary conditions.
+**Call relations**: `scan_index_from_end_by_id` uses this to express ID lookup in a short way. This function relies on `scan_index_from_end_for_each` for the low-level work of reading the file backward and parsing entries.
 
 *Call graph*: calls 1 internal fn (scan_index_from_end_for_each); called by 1 (scan_index_from_end_by_id).
 
@@ -1374,11 +1376,11 @@ fn scan_index_from_end_for_each(
 ) -> std::io::Result<Option<SessionIndexEntry>>
 ```
 
-**Purpose**: Scans the index file backward in fixed-size chunks, reconstructing lines from the end and visiting each parsed entry newest-first. It is the core reverse-reading engine for the session index.
+**Purpose**: Reads the index file from the end toward the beginning and visits each valid entry. This makes newest-first lookup fast without loading the whole file into memory.
 
-**Data flow**: Opens the file, gets its length, allocates a reverse-line buffer and chunk buffer, repeatedly seeks backward by up to `READ_CHUNK_SIZE`, reads bytes, iterates them in reverse, accumulates bytes until newline boundaries, calls `parse_line_from_rev` on each completed reversed line, and stops early if the visitor returns `Some(entry)`; after all chunks, parses any remaining buffered line and returns the optional visitor result.
+**Data flow**: It receives the index path and a visitor function. It opens the file, reads chunks from back to front, reconstructs each line in the correct order, parses it, and passes each valid `SessionIndexEntry` to the visitor. If the visitor returns an entry, scanning stops early and that entry is returned; otherwise the scan reaches the beginning and returns `None`.
 
-**Call relations**: Used by both `scan_index_from_end` and `stream_thread_ids_from_end_by_name`; it encapsulates the chunked reverse-file traversal logic.
+**Call relations**: This is the shared engine behind backward lookups. `scan_index_from_end` uses it for simple searches, and `stream_thread_ids_from_end_by_name` uses it to stream matching IDs while still moving newest-first. It calls `parse_line_from_rev` whenever it has collected one reversed line.
 
 *Call graph*: calls 1 internal fn (parse_line_from_rev); called by 2 (scan_index_from_end, stream_thread_ids_from_end_by_name); 5 external calls (open, Start, new, try_from, vec!).
 
@@ -1392,24 +1394,24 @@ fn parse_line_from_rev(
 ) -> std::io::Result<Option<SessionIndexEntry>>
 ```
 
-**Purpose**: Turns one reversed byte buffer into a parsed `SessionIndexEntry` and passes it to a visitor closure. It ignores empty, invalid UTF-8, and malformed JSON lines.
+**Purpose**: Turns one line collected backward into a usable session index entry, if possible. It quietly ignores empty, invalid, or non-UTF-8 lines so a bad record does not break the whole search.
 
-**Data flow**: If `line_rev` is empty returns `Ok(None)`; otherwise reverses the bytes in place, takes ownership of the buffer, attempts UTF-8 decoding, strips trailing `\r`, trims whitespace, deserializes `SessionIndexEntry`, and if successful calls `visit_entry(&entry)` and returns its result.
+**Data flow**: It receives a buffer containing the bytes of one line in reverse order and a visitor function. It reverses the bytes back, converts them to text, removes a trailing carriage return if present, trims whitespace, parses the JSON into a `SessionIndexEntry`, and passes that entry to the visitor. It clears the line buffer as part of taking the bytes out.
 
-**Call relations**: Called repeatedly by `scan_index_from_end_for_each` whenever a newline boundary or EOF completes one reversed line.
+**Call relations**: `scan_index_from_end_for_each` calls this whenever a newline marks the end of a collected record. This function is the parsing checkpoint between raw file bytes and the higher-level search logic.
 
 *Call graph*: called by 1 (scan_index_from_end_for_each); 2 external calls (from_utf8, take).
 
 
 ### `rollout/src/search.rs`
 
-`domain_logic` · `on-demand search and filtering`
+`domain_logic` · `request handling`
 
-This file implements rollout-content search over the sessions tree. The top-level API returns either just matching rollout paths or a map from canonical `.jsonl` paths to optional snippets. `search_rollout_matches` chooses the root directory based on the `archived` flag, JSON-escapes the search term so plain JSONL text can be matched literally, and first tries `ripgrep_rollout_paths` against `*.jsonl` files with fixed-string, case-insensitive search. If ripgrep is unavailable (`NotFound`), it falls back to a recursive scanner. Even when ripgrep succeeds, compressed rollouts still require manual scanning because ripgrep only sees plain `.jsonl` files.
+A rollout is a saved conversation log, stored as line-by-line JSON. This file is the search engine for those logs. Its job is to answer questions like “Which past sessions mentioned this text?” without making the rest of the program know about folders, compressed files, JSON escaping, or preview snippets.
 
-The fallback scanners walk the directory tree iteratively with a stack, recognize rollout files through `compression::RolloutFile::from_path`, and treat plain and compressed files differently. Plain files are searched line-by-line with a case-insensitive literal regex over the JSON-escaped term. Compressed files are decompressed through `compression::open_rollout_line_reader` and searched semantically: `first_rollout_content_match_snippet` looks for lines whose raw JSON contains the escaped term, then parses the line into `RolloutLine`, extracts conversational text from selected `RolloutItem` variants, and returns a trimmed excerpt around the first match.
+The fast path uses ripgrep, an external search tool, to scan plain `.jsonl` rollout files. That is like asking a very fast librarian to list every book containing a phrase. If ripgrep is missing, or when files are compressed, the file falls back to reading rollout files itself. For compressed logs it cannot rely on ripgrep, so it opens each rollout through the compression layer, reads one line at a time, parses matching conversation items, and extracts human-readable text.
 
-Text extraction is intentionally narrow. User messages strip the `USER_MESSAGE_BEGIN` prefix, agent messages use trimmed message text, and `ResponseItem::Message` contributes only user/assistant `InputText`/`OutputText` content. Snippet generation normalizes whitespace, then computes character-based context windows before and after the regex match so excerpts remain readable and Unicode-safe.
+The file is careful about what it searches. Since rollouts are JSON, the search text is first escaped the same way JSON stores it, so quotes, backslashes, and similar characters still match correctly. When it creates a snippet, it ignores metadata and only uses real user or assistant conversation text. It also normalizes whitespace and adds a little context before and after the match, so the result is useful in a search UI rather than just a raw JSON line.
 
 #### Function details
 
@@ -1424,11 +1426,11 @@ async fn search_rollout_paths(
 ) -> io::Result<HashSet<PathBuf>>
 ```
 
-**Purpose**: Searches rollouts and returns only the set of matching canonical rollout paths. It is the path-only convenience wrapper around the richer match API.
+**Purpose**: This is the simple public search entry point when the caller only wants to know which rollout files matched. It hides the extra snippet information and returns just the set of matching paths.
 
-**Data flow**: Accepts the ripgrep executable path, codex home, archived flag, and search term; calls `search_rollout_matches`; discards snippet values by collecting only the returned map’s keys into a `HashSet<PathBuf>`.
+**Data flow**: It receives the ripgrep command path, the Codex home folder, whether to search archived sessions, and the search text. It asks `search_rollout_matches` for the fuller result, throws away the snippet values, and returns only the file paths.
 
-**Call relations**: Delegates all real work to `search_rollout_matches` and exists for callers that do not need snippets.
+**Call relations**: This function sits one layer above `search_rollout_matches`. Callers use it when they do not need previews; it delegates the real searching work and then simplifies the answer.
 
 *Call graph*: calls 1 internal fn (search_rollout_matches).
 
@@ -1444,11 +1446,11 @@ async fn search_rollout_matches(
 ) -> io::Result<RolloutSearchMatches>
 ```
 
-**Purpose**: Searches active or archived rollout trees and returns matching canonical rollout paths plus optional snippets for compressed matches. It coordinates ripgrep, fallback scanning, and compressed-file handling.
+**Purpose**: This is the main search coordinator. It chooses the right session folder, tries the fast ripgrep search for plain files, and also searches compressed rollout files so they are not missed.
 
-**Data flow**: Builds the root path from `codex_home` and the archived flag, JSON-escapes the search term, tries `ripgrep_rollout_paths`; if ripgrep is unavailable returns `scan_rollout_matches`; otherwise converts plain-file matches into a `HashMap<PathBuf, None>`, extends it with `scan_compressed_rollout_matches` results containing snippets, and returns the combined map.
+**Data flow**: It receives the search settings and builds the folder path for either active or archived sessions. It converts the search term into its JSON-stored form, tries `ripgrep_rollout_paths`, and then returns a map from each matching plain rollout path to either no snippet or a snippet string. If ripgrep is unavailable, it falls back to scanning all rollout files itself.
 
-**Call relations**: This is the main search entry point used by `search_rollout_paths`. It delegates plain-file acceleration to ripgrep and all decompression-aware work to the scanner helpers.
+**Call relations**: It is called by `search_rollout_paths` and is the hub for this file. It hands quick plain-file searching to `ripgrep_rollout_paths`, fallback walking to `scan_rollout_matches`, compressed-file searching to `scan_compressed_rollout_matches`, and search-term escaping to `json_escaped_search_term`.
 
 *Call graph*: calls 4 internal fn (json_escaped_search_term, ripgrep_rollout_paths, scan_compressed_rollout_matches, scan_rollout_matches); called by 1 (search_rollout_paths); 1 external calls (join).
 
@@ -1463,11 +1465,11 @@ async fn ripgrep_rollout_paths(
 ) -> io::Result<Option<HashSet<PathBuf>>>
 ```
 
-**Purpose**: Runs external `rg` to find matching plain `.jsonl` rollout files quickly. It treats missing ripgrep as a soft fallback condition rather than an error.
+**Purpose**: This tries to use ripgrep to quickly find plain `.jsonl` rollout files containing the search text. If ripgrep is not installed, it reports that the fast path is unavailable instead of failing the whole search.
 
-**Data flow**: Checks whether the root exists; if not, returns `Some(empty set)`. Otherwise spawns `rg -l --fixed-strings --ignore-case --no-ignore --glob *.jsonl -- <term> <root>`, interprets `NotFound` as `Ok(None)`, interprets exit code 1 with empty stderr as no matches, converts successful stdout lines into absolute or root-joined `PathBuf`s, and returns `Some(HashSet<PathBuf>)`.
+**Data flow**: It receives the ripgrep executable path, a root folder, and the already JSON-escaped search text. It checks whether the folder exists, runs ripgrep with fixed-string and case-insensitive options, reads the matching file paths from ripgrep’s output, makes them absolute when needed, and returns them as a set. If ripgrep cannot be found, it returns `None` so the caller can use a slower built-in scan.
 
-**Call relations**: Called by `search_rollout_matches` as the fast path for plain JSONL files. Returning `None` signals the caller to use the built-in scanner.
+**Call relations**: It is called by `search_rollout_matches` as the preferred fast route. When it succeeds, `search_rollout_matches` combines its plain-file results with compressed-file results; when it is unavailable, `search_rollout_matches` switches to `scan_rollout_matches`.
 
 *Call graph*: called by 1 (search_rollout_matches); 8 external calls (new, join, from, from_utf8_lossy, new, other, format!, try_exists).
 
@@ -1482,11 +1484,11 @@ async fn scan_rollout_matches(
 ) -> io::Result<RolloutSearchMatches>
 ```
 
-**Purpose**: Recursively scans rollout files without ripgrep, handling both plain and compressed files. Plain matches return no snippet; compressed matches include the first content snippet.
+**Purpose**: This is the built-in folder scanner used when ripgrep is not available. It walks through rollout directories itself and checks both plain and compressed rollout files.
 
-**Data flow**: Starts from `root`, builds a case-insensitive literal regex over the JSON-escaped term, walks directories with a stack, recognizes rollout files via `compression::RolloutFile::from_path`, for compressed files calls `first_rollout_content_match_snippet` and inserts canonical plain paths with `Some(snippet)`, and for plain files calls `rollout_contains` and inserts matching paths with `None`.
+**Data flow**: It receives a root folder, the JSON-escaped search term, and the original search term. It builds a case-insensitive literal pattern, visits subfolders, ignores non-rollout files, checks plain files with `rollout_contains`, and checks compressed files with `first_rollout_content_match_snippet`. It returns a map of matching rollout paths, with snippets for compressed matches where available.
 
-**Call relations**: Used by `search_rollout_matches` when ripgrep is unavailable. It delegates line-level checks to `rollout_contains` and snippet extraction to `first_rollout_content_match_snippet`.
+**Call relations**: It is called by `search_rollout_matches` only on the fallback path. It relies on the compression module to recognize rollout files, on `rollout_contains` for simple plain-file matching, and on `first_rollout_content_match_snippet` when a compressed file needs real content extraction.
 
 *Call graph*: calls 4 internal fn (from_path, case_insensitive_literal_regex, first_rollout_content_match_snippet, rollout_contains); called by 1 (search_rollout_matches); 4 external calls (new, plain_rollout_path, read_dir, vec!).
 
@@ -1497,11 +1499,11 @@ async fn scan_rollout_matches(
 async fn rollout_contains(path: &Path, search_term: &Regex) -> io::Result<bool>
 ```
 
-**Purpose**: Checks whether any line in a rollout file matches a precompiled regex. It is the plain-file line scanner used by fallback search.
+**Purpose**: This checks whether one rollout file contains the search pattern anywhere in its stored lines. It is a small helper for the slower built-in scan of plain files.
 
-**Data flow**: Opens a rollout line reader through the compression layer, iterates lines asynchronously, tests each line with `Regex::is_match`, returns `Ok(true)` on the first match, and `Ok(false)` if the file ends without one.
+**Data flow**: It receives a rollout path and a prepared regular expression. It opens the rollout through the shared rollout line reader, reads each line, and returns `true` as soon as one line matches. If it reaches the end without a match, it returns `false`.
 
-**Call relations**: Called by `scan_rollout_matches` for uncompressed rollout files.
+**Call relations**: It is called by `scan_rollout_matches` for non-compressed rollout files. It uses `open_rollout_line_reader` from the compression layer so the scanning code does not need to know the low-level file-reading details.
 
 *Call graph*: calls 1 internal fn (open_rollout_line_reader); called by 1 (scan_rollout_matches); 1 external calls (is_match).
 
@@ -1515,11 +1517,11 @@ async fn first_rollout_content_match_snippet(
 ) -> io::Result<Option<String>>
 ```
 
-**Purpose**: Finds the first semantically meaningful content match in a rollout and returns a short excerpt around it. It is used primarily for compressed rollouts where raw ripgrep is unavailable.
+**Purpose**: This searches a rollout file and returns the first readable conversation snippet that contains the search term. It is especially useful for compressed files, where the program cannot rely on ripgrep’s plain text file listing.
 
-**Data flow**: Opens a rollout line reader, builds one regex for the JSON-escaped term and another for the human search term, scans lines until one matches the JSON regex, then calls `content_match_snippet` on that line and returns the first non-`None` snippet found; otherwise returns `Ok(None)`.
+**Data flow**: It receives a rollout path and the original search term. It opens the rollout line reader, prepares one pattern for the JSON-stored text and another for the human-readable text, then reads lines until it finds a JSON line that may contain the term. For that line, it tries to parse out conversation text and create a short excerpt; the first successful excerpt is returned.
 
-**Call relations**: Called by both `scan_rollout_matches` and `scan_compressed_rollout_matches` to produce snippets from decompressed content.
+**Call relations**: It is called by both `scan_rollout_matches` and `scan_compressed_rollout_matches` when they need a preview snippet. It uses `json_escaped_search_term` and `case_insensitive_literal_regex` to prepare safe searches, then hands each promising line to `content_match_snippet` for parsing and excerpt creation.
 
 *Call graph*: calls 4 internal fn (open_rollout_line_reader, case_insensitive_literal_regex, content_match_snippet, json_escaped_search_term); called by 2 (scan_compressed_rollout_matches, scan_rollout_matches).
 
@@ -1533,11 +1535,11 @@ async fn scan_compressed_rollout_matches(
 ) -> io::Result<RolloutSearchMatches>
 ```
 
-**Purpose**: Recursively scans only compressed rollout files and returns canonical plain paths mapped to snippets. It complements ripgrep, which only searches plain `.jsonl` files.
+**Purpose**: This searches compressed rollout files under a session folder. It exists because the fast ripgrep search only covers plain `.jsonl` files.
 
-**Data flow**: Walks the directory tree with a stack, recognizes rollout files, skips non-compressed ones, calls `first_rollout_content_match_snippet` for each compressed file, and inserts `compression::plain_rollout_path(path)` with `Some(snippet)` for matches.
+**Data flow**: It receives the root folder and search text. It walks through all subfolders, filters for rollout files that are compressed, asks `first_rollout_content_match_snippet` whether each one has a matching conversation snippet, and returns a map keyed by the normal plain rollout path with the snippet attached.
 
-**Call relations**: Always called by `search_rollout_matches` after successful ripgrep so compressed rollouts are not missed.
+**Call relations**: It is called by `search_rollout_matches` after the ripgrep plain-file search succeeds. This fills the gap left by ripgrep, so compressed sessions appear in the same result set as normal sessions.
 
 *Call graph*: calls 2 internal fn (from_path, first_rollout_content_match_snippet); called by 1 (search_rollout_matches); 4 external calls (new, plain_rollout_path, read_dir, vec!).
 
@@ -1548,11 +1550,11 @@ async fn scan_compressed_rollout_matches(
 fn json_escaped_search_term(search_term: &str) -> io::Result<String>
 ```
 
-**Purpose**: Escapes a search term the same way it appears inside JSON strings, minus the surrounding quotes. This lets raw JSONL line scans match serialized content literally.
+**Purpose**: This converts a user’s search text into the form it would have inside JSON. That matters because rollout files store conversation lines as JSON, not as raw text.
 
-**Data flow**: Serializes the input string with `serde_json::to_string`, strips the leading and trailing quote characters, and returns the inner escaped string as `io::Result<String>`.
+**Data flow**: It receives the original search string. It serializes it as a JSON string, removes the surrounding quotes added by JSON serialization, and returns the escaped inner text. For example, characters like quotes or backslashes become the exact sequences that would appear in a rollout line.
 
-**Call relations**: Used by `search_rollout_matches` and `first_rollout_content_match_snippet` before building regexes or invoking ripgrep.
+**Call relations**: It is used by `search_rollout_matches` before searching stored rollout lines and by `first_rollout_content_match_snippet` before checking individual JSON lines. It makes the later literal searches match the file format accurately.
 
 *Call graph*: called by 2 (first_rollout_content_match_snippet, search_rollout_matches); 1 external calls (to_string).
 
@@ -1563,11 +1565,11 @@ fn json_escaped_search_term(search_term: &str) -> io::Result<String>
 fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Regex>
 ```
 
-**Purpose**: Builds a case-insensitive regex that treats the search term as a literal string rather than a regex pattern. It avoids accidental regex metacharacter interpretation.
+**Purpose**: This builds a case-insensitive search pattern that treats the search text as ordinary text, not as a special regular-expression language. It prevents characters like `.` or `*` from changing the meaning of the search.
 
-**Data flow**: Reads the input as `AsRef<str>`, escapes it with `regex::escape`, builds a `RegexBuilder` with `case_insensitive(true)`, compiles it, and maps regex errors into `io::Error`.
+**Data flow**: It receives any string-like search term. It escapes special regex characters, builds a regular expression with case-insensitive matching turned on, and returns the compiled pattern or an I/O-style error if building fails.
 
-**Call relations**: Used by the fallback scanners and snippet extractor whenever a search term needs to be matched safely.
+**Call relations**: It is called by `scan_rollout_matches` and `first_rollout_content_match_snippet` before they scan text. Those callers can then use regular expression matching safely while still behaving like a plain text search.
 
 *Call graph*: called by 2 (first_rollout_content_match_snippet, scan_rollout_matches); 3 external calls (as_ref, new, escape).
 
@@ -1578,11 +1580,11 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
 fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String>
 ```
 
-**Purpose**: Parses one JSONL line into a rollout item, extracts conversational text from that item, and returns an excerpt around the first match. It is the semantic bridge from raw JSON to human-readable snippets.
+**Purpose**: This turns one raw rollout JSON line into a human-readable search preview, if that line contains searchable conversation text. It filters out lines that are not useful conversation messages.
 
-**Data flow**: Trims and deserializes the line into `RolloutLine`, extracts text with `conversation_text_from_item`, passes that text and the regex to `excerpt_around_match`, and returns the resulting `Option<String>`.
+**Data flow**: It receives a JSONL line and a prepared search pattern. It parses the line as a rollout record, extracts user or assistant text with `conversation_text_from_item`, then asks `excerpt_around_match` to create a short snippet around the match. If parsing fails, the line is not a conversation message, or the text does not match, it returns nothing.
 
-**Call relations**: Called by `first_rollout_content_match_snippet` after a raw JSON line has already been identified as containing the escaped search term.
+**Call relations**: It is called by `first_rollout_content_match_snippet` after a stored line appears to contain the search term. It delegates message filtering to `conversation_text_from_item` and preview formatting to `excerpt_around_match`.
 
 *Call graph*: calls 2 internal fn (conversation_text_from_item, excerpt_around_match); called by 1 (first_rollout_content_match_snippet).
 
@@ -1593,11 +1595,11 @@ fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String
 fn conversation_text_from_item(item: &RolloutItem) -> Option<String>
 ```
 
-**Purpose**: Extracts searchable human conversation text from selected rollout item variants. It intentionally ignores structural, tool-only, and non-conversational items.
+**Purpose**: This extracts the actual visible conversation text from a rollout item. It deliberately ignores metadata, context records, images, and other non-message records so snippets show what a person would recognize from the chat.
 
-**Data flow**: Matches on `RolloutItem`: for `EventMsg::UserMessage` strips the protocol prefix and returns non-empty text; for `EventMsg::AgentMessage` returns trimmed non-empty message text; for `ResponseItem::Message` concatenates text-bearing `ContentItem`s and returns it only for `role == "user"` or `"assistant"`; all other variants return `None`.
+**Data flow**: It receives a `RolloutItem`, which may be many kinds of saved record. For user messages it removes any internal user-message prefix, for agent messages it trims whitespace, and for response message records it joins text content from user or assistant roles. If the item has no useful text or belongs to another kind of record, it returns nothing.
 
-**Call relations**: Used by `content_match_snippet` to decide whether a matched JSON line can yield a readable snippet.
+**Call relations**: It is called by `content_match_snippet` when a raw rollout line has been parsed. It uses `strip_user_message_prefix` to clean older or wrapped user-message text before snippets are made.
 
 *Call graph*: calls 1 internal fn (strip_user_message_prefix); called by 1 (content_match_snippet).
 
@@ -1608,11 +1610,11 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String>
 fn content_item_text(item: &ContentItem) -> Option<&str>
 ```
 
-**Purpose**: Extracts text from a `ContentItem` when the item is textual. Images contribute no searchable text.
+**Purpose**: This pulls plain text out of one content item inside a response message. It ignores image content because images cannot be searched as text here.
 
-**Data flow**: Returns `Some(&str)` for `InputText` and `OutputText` variants by borrowing their `text` field, and `None` for `InputImage`.
+**Data flow**: It receives a content item. If the item is input text or output text, it returns a borrowed view of that text; if it is an image, it returns nothing.
 
-**Call relations**: Used by `conversation_text_from_item` when flattening `ResponseItem::Message` content.
+**Call relations**: This helper is used inside the response-message path of `conversation_text_from_item`. It lets that function join only text parts before deciding whether the message is searchable.
 
 
 ##### `strip_user_message_prefix`  (lines 298–303)
@@ -1621,11 +1623,11 @@ fn content_item_text(item: &ContentItem) -> Option<&str>
 fn strip_user_message_prefix(text: &str) -> &str
 ```
 
-**Purpose**: Removes the protocol-level `USER_MESSAGE_BEGIN` marker from stored user-message text before snippet generation. If the marker is absent, it just trims whitespace.
+**Purpose**: This removes an internal marker that may be stored before user message text. The result is cleaner text for matching and preview snippets.
 
-**Data flow**: Searches the input string for `USER_MESSAGE_BEGIN`; if found, returns the trimmed substring after the marker, otherwise returns `text.trim()`.
+**Data flow**: It receives a user message string. If it finds the known `USER_MESSAGE_BEGIN` marker, it returns the trimmed text after that marker; otherwise it returns the whole string trimmed.
 
-**Call relations**: Called by `conversation_text_from_item` for `EventMsg::UserMessage`.
+**Call relations**: It is called by `conversation_text_from_item` for saved user-message events. This keeps internal protocol wrapping out of the text shown to people.
 
 *Call graph*: called by 1 (conversation_text_from_item).
 
@@ -1636,11 +1638,11 @@ fn strip_user_message_prefix(text: &str) -> &str
 fn excerpt_around_match(text: &str, search_term: &Regex) -> Option<String>
 ```
 
-**Purpose**: Builds a short snippet around the first regex match with bounded context before and after the match. It normalizes whitespace and adds ellipses when the excerpt is clipped.
+**Purpose**: This creates a short preview around the first occurrence of the search term. It turns a full message into the kind of compact snippet people expect in search results.
 
-**Data flow**: Normalizes the input text with `normalize_preview_text`, finds the first regex match, computes byte-safe excerpt bounds using `char_start_before` and `char_end_after`, trims the excerpt, prefixes `"... "` when clipped at the start and suffixes `" ..."` when clipped at the end, and returns `Some(snippet)` or `None` if no match/excerpt exists.
+**Data flow**: It receives conversation text and a prepared search pattern. It first normalizes whitespace, finds the first match, chooses a safe character boundary before and after the match, trims the excerpt, and adds leading or trailing ellipses when the excerpt is cut from a longer message. It returns the snippet or nothing if no usable excerpt exists.
 
-**Call relations**: Used by `content_match_snippet` as the final snippet formatter.
+**Call relations**: It is called by `content_match_snippet` after conversation text has been extracted. It relies on `normalize_preview_text` to make text compact and on `char_start_before` and `char_end_after` to avoid cutting through multi-byte characters.
 
 *Call graph*: calls 3 internal fn (char_end_after, char_start_before, normalize_preview_text); called by 1 (content_match_snippet); 2 external calls (find, new).
 
@@ -1651,11 +1653,11 @@ fn excerpt_around_match(text: &str, search_term: &Regex) -> Option<String>
 fn normalize_preview_text(text: &str) -> String
 ```
 
-**Purpose**: Collapses all whitespace runs in a string into single spaces for cleaner snippets and stable matching context. It removes line breaks and repeated spacing.
+**Purpose**: This cleans text for display in a search preview by collapsing all whitespace into single spaces. It makes snippets easier to read, especially when the original message had newlines or extra spacing.
 
-**Data flow**: Splits the input on whitespace, collects the pieces, joins them with single spaces, and returns the normalized `String`.
+**Data flow**: It receives a text string, splits it into whitespace-separated words, joins those words with one space each, and returns the cleaned string.
 
-**Call relations**: Called by `excerpt_around_match` before locating and slicing the match.
+**Call relations**: It is called by `excerpt_around_match` before locating and cutting the preview text. This gives the excerpt code a simpler, more display-friendly string to work with.
 
 *Call graph*: called by 1 (excerpt_around_match).
 
@@ -1666,11 +1668,11 @@ fn normalize_preview_text(text: &str) -> String
 fn char_start_before(text: &str, byte_index: usize, chars_before: usize) -> usize
 ```
 
-**Purpose**: Finds the byte index that starts a given number of Unicode scalar values before a target byte index. It keeps excerpt slicing character-safe.
+**Purpose**: This finds a safe byte position a certain number of characters before a match. It is needed because Rust strings are stored as bytes, while people think in characters, and cutting at the wrong byte could break non-English text.
 
-**Data flow**: Iterates `char_indices()` over the prefix `text[..byte_index]` in reverse, selects the nth character boundary before the target, and returns that byte index or `0` if there are fewer characters.
+**Data flow**: It receives text, the byte position where the match starts, and the desired number of characters of context before it. It walks backward through character boundaries and returns the byte index to start the excerpt, or the beginning of the text if there is not enough earlier text.
 
-**Call relations**: Used by `excerpt_around_match` to compute the left excerpt boundary.
+**Call relations**: It is called by `excerpt_around_match` while building a preview. It supplies the left edge of the snippet so the excerpt includes context without corrupting the string.
 
 *Call graph*: called by 1 (excerpt_around_match).
 
@@ -1681,11 +1683,11 @@ fn char_start_before(text: &str, byte_index: usize, chars_before: usize) -> usiz
 fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize
 ```
 
-**Purpose**: Finds the byte index that ends a given number of Unicode scalar values after a target byte index. It keeps excerpt slicing character-safe on the right side.
+**Purpose**: This finds a safe byte position a certain number of characters after a match. It lets snippets include trailing context without cutting through a character.
 
-**Data flow**: Iterates `char_indices()` over the suffix `text[byte_index..]`, selects the nth character boundary after the target, adds the offset back to `byte_index`, and returns that byte index or `text.len()` if there are fewer characters.
+**Data flow**: It receives text, the byte position where the match ends, and the desired number of characters after it. It walks forward through character boundaries and returns the byte index to end the excerpt, or the end of the text if there is not enough later text.
 
-**Call relations**: Used by `excerpt_around_match` to compute the right excerpt boundary.
+**Call relations**: It is called by `excerpt_around_match` while building a preview. It supplies the right edge of the snippet so the final text is both readable and valid.
 
 *Call graph*: called by 1 (excerpt_around_match).
 
@@ -1695,13 +1697,15 @@ These files implement the main rollout workflows for writing session transcripts
 
 ### `rollout/src/list.rs`
 
-`domain_logic` · `thread listing, summary generation, pagination, and rollout-path lookup during user queries`
+`domain_logic` · `request handling`
 
-This file defines the listing data model (`ThreadsPage`, `ThreadItem`), pagination cursor (`Cursor`), sort/layout enums, and the scanning logic that turns rollout files into user-facing thread summaries. It supports two sort keys: `CreatedAt`, derived from the timestamp embedded in rollout filenames, and `UpdatedAt`, derived from file mtimes. It also supports two layouts: nested date directories and flat roots. Pagination is timestamp-based via `Cursor`, with `AnchorState` suppressing items until the scan passes the previous page's last timestamp; this keeps paging stable as new files arrive.
+Codex saves each thread as a rollout file, usually under date folders such as year/month/day. This file is the “table of contents” builder for those saved threads. Without it, the rest of the system would have to know how rollout files are named, where compressed files may live, how to read just enough JSON from the start of a file, and how to page through thousands of old sessions safely.
 
-Summary extraction is intentionally lightweight. `build_thread_item` reads only the head of a rollout via `read_head_summary`, which scans a bounded number of records looking for `SessionMeta`, a preview-bearing event, and the first user message. It extracts cwd, git metadata, source, parent thread id, agent nickname/role, model provider, CLI version, and timestamps, then applies source/provider/cwd filters. Compressed rollouts are handled transparently through `compression::open_rollout_line_reader` and `compression::RolloutFile`.
+The main flow starts with get_threads, which chooses the sessions folder and asks get_threads_in_root to list it. The listing can be sorted by when the thread was created, which is encoded in the filename, or by when the file was last updated, which must be read from the filesystem. It can also filter by session source, model provider, or working directory.
 
-The file also contains robust thread-id lookup. `find_thread_path_by_id_str_in_subdir` first validates UUID format, optionally consults the state DB, verifies any DB-returned path by reading `SessionMeta`, records discrepancies and fallback telemetry, then falls back to filename scanning and finally broader file search. This layered approach favors fast indexed lookup while remaining resilient to stale DB rows, compressed filenames, and missing metadata.
+To avoid doing unlimited work, scans stop at a fixed cap. Pagination uses a Cursor, which is just a timestamp bookmark. An AnchorState skips files until the scan has moved past the previous page’s last timestamp, like placing a bookmark in a stack of papers and continuing after it.
+
+For each candidate file, build_thread_item reads only the beginning of the rollout, extracts session metadata and a useful preview, and returns a compact ThreadItem. The file also includes helpers to locate a rollout by thread ID, preferring the state database when available and falling back to filename and content search.
 
 #### Function details
 
@@ -1711,11 +1715,11 @@ The file also contains robust thread-id lookup. `find_thread_path_by_id_str_in_s
 fn new(ts: OffsetDateTime) -> Self
 ```
 
-**Purpose**: Constructs a pagination cursor from a timestamp. It is the canonical constructor used throughout listing and serialization code.
+**Purpose**: Creates a pagination cursor from a timestamp. A cursor is a small bookmark that says where a list request should resume next time.
 
-**Data flow**: Accepts `OffsetDateTime` and returns `Cursor { ts }`.
+**Data flow**: It receives one timestamp, stores it inside a Cursor, and returns that Cursor. It does not read files or change outside state.
 
-**Call relations**: Used by cursor parsing, anchor conversion, and next-page cursor construction whenever a timestamp must become a cursor token.
+**Call relations**: Listing and parsing code use this whenever they need to create a new bookmark, such as after parsing a cursor string or after building the next page token.
 
 *Call graph*: called by 31 (run_sse, prepare_encoded_json, into_prepared_stores_compressed_body_for_reuse, unpack_plugin_bundle_tar_gz, extract_zipball_to_dir, curated_repo_backup_archive_zip_bytes, curated_repo_zipball_bytes, extract_zip_to_dir, original_detail_images_are_capped_at_max_patch_count, original_detail_images_scale_with_dimensions (+15 more)).
 
@@ -1726,11 +1730,11 @@ fn new(ts: OffsetDateTime) -> Self
 fn timestamp(&self) -> OffsetDateTime
 ```
 
-**Purpose**: Returns the timestamp stored inside the cursor. It exposes the cursor's ordering anchor to callers that need it.
+**Purpose**: Returns the timestamp stored inside a cursor. This lets other code inspect the bookmark without reaching into its private fields.
 
-**Data flow**: Borrows `self` and returns `self.ts` by value.
+**Data flow**: It reads the Cursor’s saved timestamp and returns it unchanged. Nothing else is modified.
 
-**Call relations**: A simple accessor used by code that needs to inspect a cursor's timestamp without parsing its serialized form.
+**Call relations**: This is a small accessor for callers that need to compare or convert a cursor’s time.
 
 
 ##### `AnchorState::new`  (lines 166–177)
@@ -1739,11 +1743,11 @@ fn timestamp(&self) -> OffsetDateTime
 fn new(anchor: Option<Cursor>) -> Self
 ```
 
-**Purpose**: Initializes pagination anchor state from an optional cursor. Without a cursor, scanning starts immediately; with one, scanning skips until it passes the anchor timestamp.
+**Purpose**: Sets up the pagination state for a scan. If there is an existing cursor, it remembers that timestamp and starts in “skip until past it” mode.
 
-**Data flow**: Accepts `Option<Cursor>`. For `Some(cursor)`, returns `AnchorState { ts: cursor.ts, passed: false }`; for `None`, returns `AnchorState { ts: OffsetDateTime::UNIX_EPOCH, passed: true }`.
+**Data flow**: It receives an optional Cursor. With a cursor, it stores its timestamp and marks that the scan has not passed it yet; without one, it starts from the beginning and skips nothing.
 
-**Call relations**: Called by all traversal variants before scanning files so they can apply stable pagination behavior through `should_skip`.
+**Call relations**: The four traversal paths create an AnchorState before scanning so their loops can decide which files belong on the current page.
 
 *Call graph*: called by 4 (traverse_directories_for_paths_created, traverse_directories_for_paths_updated, traverse_flat_paths_created, traverse_flat_paths_updated).
 
@@ -1754,11 +1758,11 @@ fn new(anchor: Option<Cursor>) -> Self
 fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool
 ```
 
-**Purpose**: Determines whether a candidate item should be skipped because the scan has not yet moved past the previous page's anchor timestamp. It flips into pass-through mode once an older timestamp is encountered.
+**Purpose**: Decides whether a file should be ignored because it belongs to an earlier page. This keeps pagination stable when newer files appear while someone is paging through older results.
 
-**Data flow**: Accepts a candidate timestamp and UUID. If `passed` is already true, returns false. Otherwise, if `ts < self.ts`, it sets `passed = true` and returns false; else it returns true. The UUID parameter is currently unused.
+**Data flow**: It receives a file timestamp and ID. If the scan has not yet moved past the saved cursor timestamp, it returns true to skip; once it sees an older timestamp, it flips its internal state and starts returning false.
 
-**Call relations**: Called by visitor and traversal loops before building thread items. It is the core pagination gate for timestamp-desc scans.
+**Call relations**: Visitor and traversal code calls this for each candidate before spending more work building a ThreadItem.
 
 *Call graph*: called by 1 (visit).
 
@@ -1775,11 +1779,11 @@ async fn visit(
     ) -> ControlFlow<()>
 ```
 
-**Purpose**: Processes one rollout file during created-at traversal, enforcing scan caps, pagination, and filters inline while building `ThreadItem`s. It stops traversal early once enough matches are found.
+**Purpose**: Processes one rollout file during a created-at-ordered directory walk. It applies paging, scan limits, and filters while collecting enough ThreadItem values for one page.
 
-**Data flow**: Accepts file timestamp, UUID, path, and current scanned count. It first checks whether the hard scan cap has been reached with a full page, then consults `anchor_state.should_skip`, then stops if `items.len() == page_size`. Otherwise it computes `updated_at` via `file_modified_time(&path).await.unwrap_or(None).and_then(format_rfc3339)`, calls `build_thread_item(...)`, and pushes any returned item into `items`. It returns `ControlFlow::Break(())` or `Continue(())` accordingly.
+**Data flow**: It receives the file’s creation timestamp, ID, path, and scan count. It may skip the file, stop the walk if the page is full or the scan cap has been reached, or read the file metadata and append a ThreadItem to the shared item list.
 
-**Call relations**: Invoked by `walk_rollout_files` during created-at traversal. It delegates summary extraction and filtering to `build_thread_item` and uses `file_modified_time` to populate the `updated_at` field.
+**Call relations**: walk_rollout_files calls this for each file. It uses AnchorState::should_skip, file_modified_time, and build_thread_item, then tells the walker either to continue or break.
 
 *Call graph*: calls 3 internal fn (should_skip, build_thread_item, file_modified_time); 2 external calls (Break, Continue).
 
@@ -1796,11 +1800,11 @@ async fn visit(
     ) -> ControlFlow<()>
 ```
 
-**Purpose**: Collects lightweight file candidates for later updated-at sorting instead of building full thread items immediately. This is necessary because updated-at ordering is not encoded in filenames.
+**Purpose**: Collects lightweight candidates for later updated-at sorting. It does not build full summaries yet, because all candidates must be sorted by modification time first.
 
-**Data flow**: Accepts timestamp, UUID, path, and scanned count, ignores the created-at timestamp and scanned count, computes `updated_at` via `file_modified_time(&path).await.unwrap_or(None)`, pushes `ThreadCandidate { path, id, updated_at }` into `candidates`, and returns `ControlFlow::Continue(())`.
+**Data flow**: It receives a rollout path and ID, reads the file’s modification time, and appends a ThreadCandidate containing the path, ID, and update time. It always tells the scan to continue.
 
-**Call relations**: Invoked by `walk_rollout_files` during updated-at collection. It defers expensive summary extraction until after all candidates have been sorted by mtime.
+**Call relations**: collect_files_by_updated_at uses this visitor through walk_rollout_files before the updated-at traversal sorts and filters the candidates.
 
 *Call graph*: calls 1 internal fn (file_modified_time); 1 external calls (Continue).
 
@@ -1811,11 +1815,11 @@ async fn visit(
 fn serialize(&self, serializer: S) -> Result<S::Ok, S::Error>
 ```
 
-**Purpose**: Serializes a cursor as an RFC3339 timestamp string. This makes pagination tokens stable and human-readable.
+**Purpose**: Turns a Cursor into a string for JSON output. The string uses RFC3339, a common internet timestamp format such as 2024-01-01T12:00:00Z.
 
-**Data flow**: Formats `self.ts` with `Rfc3339`, converts formatting errors into serializer errors, and calls `serializer.serialize_str(&ts_str)`.
+**Data flow**: It reads the cursor timestamp, formats it as an RFC3339 string, and gives that string to the JSON serializer. If formatting fails, it reports a serialization error.
 
-**Call relations**: Used implicitly by Serde whenever a `Cursor` is encoded for API responses or persisted state.
+**Call relations**: This lets ThreadsPage.next_cursor travel over APIs as a simple string token.
 
 *Call graph*: 2 external calls (format, serialize_str).
 
@@ -1826,11 +1830,11 @@ fn serialize(&self, serializer: S) -> Result<S::Ok, S::Error>
 fn deserialize(deserializer: D) -> Result<Self, D::Error>
 ```
 
-**Purpose**: Deserializes a cursor from its string token form using the same parsing rules as `parse_cursor`. Invalid tokens become Serde errors.
+**Purpose**: Reads a Cursor back from a JSON string. This lets a client send the previous next_cursor token into the next list request.
 
-**Data flow**: Deserializes a `String`, passes it to `parse_cursor`, and returns the resulting `Cursor` or a custom `invalid cursor` deserialization error.
+**Data flow**: It receives a JSON string, passes it to parse_cursor, and returns either a Cursor or a JSON decoding error if the token is invalid.
 
-**Call relations**: Used implicitly by Serde when cursors are received from clients or restored from stored state.
+**Call relations**: It reuses parse_cursor so JSON input and manual cursor parsing follow the same rules.
 
 *Call graph*: calls 1 internal fn (parse_cursor); 1 external calls (deserialize).
 
@@ -1841,11 +1845,11 @@ fn deserialize(deserializer: D) -> Result<Self, D::Error>
 fn from(anchor: codex_state::Anchor) -> Self
 ```
 
-**Purpose**: Converts a `codex_state::Anchor` into a listing cursor by translating its nanosecond timestamp into `OffsetDateTime`. Invalid or missing timestamps fall back to the Unix epoch.
+**Purpose**: Converts a stored state-database anchor into this file’s Cursor type. It bridges the database representation and the listing code’s pagination token.
 
-**Data flow**: Accepts `codex_state::Anchor`, extracts `anchor.ts.timestamp_nanos_opt()`, converts to `OffsetDateTime::from_unix_timestamp_nanos`, falls back to `OffsetDateTime::UNIX_EPOCH` on failure, and returns `Cursor::new(ts)`.
+**Data flow**: It receives a codex_state::Anchor, converts its timestamp into an OffsetDateTime, falls back to the Unix epoch if conversion fails, and returns a Cursor.
 
-**Call relations**: Used when bridging pagination state from the state layer into the rollout listing layer.
+**Call relations**: It hands database-provided pagination state into the same Cursor path used by file listing.
 
 *Call graph*: 1 external calls (new).
 
@@ -1862,11 +1866,11 @@ async fn get_threads(
     model_providers: Option<&[String
 ```
 
-**Purpose**: Lists thread summaries from the standard active sessions root under `codex_home`, applying pagination, sorting, and filters. It is the main public listing entrypoint.
+**Purpose**: Lists saved threads from the normal Codex sessions directory. This is the friendly public entry point for callers that know the Codex home folder but not the internal sessions path.
 
-**Data flow**: Accepts `codex_home`, page size, optional cursor, sort key, allowed sources, optional model providers, optional cwd filters, and default provider. It joins `codex_home` with `SESSIONS_SUBDIR`, constructs a `ThreadListConfig` with `ThreadListLayout::NestedByDate`, and awaits `get_threads_in_root(...)`.
+**Data flow**: It receives the Codex home path, page size, optional cursor, sort choice, filters, and default provider. It builds the sessions root path and forwards everything to get_threads_in_root, returning a ThreadsPage or an I/O error.
 
-**Call relations**: Called by higher-level APIs that need active thread listings. It delegates all actual traversal and filtering to `get_threads_in_root`.
+**Call relations**: Higher-level thread listing and tests call this. It delegates the real layout and traversal decisions to get_threads_in_root.
 
 *Call graph*: calls 1 internal fn (get_threads_in_root); called by 15 (find_latest_thread_path, list_threads_from_files_desc_unfiltered, test_base_instructions_missing_in_meta_defaults_to_null, test_base_instructions_present_in_meta_is_preserved, test_created_at_sort_uses_file_mtime_for_updated_at, test_get_thread_contents, test_goal_first_thread_reads_later_user_message, test_list_conversations_latest_first, test_list_threads_scans_past_head_for_user_event, test_list_threads_uses_goal_objective_as_preview (+5 more)); 1 external calls (join).
 
@@ -1883,11 +1887,11 @@ async fn get_threads_in_root(
 ) -> io::Result<ThreadsPage>
 ```
 
-**Purpose**: Lists thread summaries from an arbitrary root directory using the requested layout, sort key, and filters. It is the configurable core behind `get_threads`.
+**Purpose**: Lists threads from a specific root folder. It chooses the directory layout and sets up model-provider filtering before scanning.
 
-**Data flow**: Accepts a root `PathBuf`, page size, optional cursor, sort key, and `ThreadListConfig`. If the root does not exist, it returns an empty `ThreadsPage`. Otherwise it clones the cursor into `anchor`, builds an optional `ProviderMatcher` from `config.model_providers` and `config.default_provider`, dispatches to either `traverse_directories_for_paths` or `traverse_flat_paths` based on `config.layout`, and returns the resulting page.
+**Data flow**: It receives a root path, paging information, sort key, and ThreadListConfig. If the root is missing, it returns an empty page; otherwise it builds a ProviderMatcher when needed and calls the nested or flat traversal path.
 
-**Call relations**: Called by `get_threads` and tests. It chooses the traversal strategy and prepares provider filtering before delegating.
+**Call relations**: get_threads calls this for the standard sessions folder, while other callers can use it for custom roots. It hands work to traverse_directories_for_paths or traverse_flat_paths.
 
 *Call graph*: calls 2 internal fn (traverse_directories_for_paths, traverse_flat_paths); called by 2 (get_threads, list_threads_from_files_desc_unfiltered); 3 external calls (clone, exists, new).
 
@@ -1904,11 +1908,11 @@ async fn traverse_directories_for_paths(
     provider_matcher:
 ```
 
-**Purpose**: Dispatches nested-date-directory traversal to the created-at or updated-at implementation based on the requested sort key. It is the sort-key switch for the standard directory layout.
+**Purpose**: Chooses the correct scanner for the nested year/month/day rollout layout. The choice depends on whether the caller wants creation time or update time ordering.
 
-**Data flow**: Accepts root, page size, anchor, sort key, allowed sources, optional provider matcher, and optional cwd filters. It matches `sort_key` and awaits either `traverse_directories_for_paths_created` or `traverse_directories_for_paths_updated`.
+**Data flow**: It receives the nested root plus paging and filter settings. It forwards the same information to either the created-at or updated-at nested traversal and returns that page.
 
-**Call relations**: Called by `get_threads_in_root` when `ThreadListLayout::NestedByDate` is selected.
+**Call relations**: get_threads_in_root calls this when the configured layout is NestedByDate.
 
 *Call graph*: calls 2 internal fn (traverse_directories_for_paths_created, traverse_directories_for_paths_updated); called by 1 (get_threads_in_root).
 
@@ -1925,11 +1929,11 @@ async fn traverse_flat_paths(
     provider_matcher: Option<&Pro
 ```
 
-**Purpose**: Dispatches flat-directory traversal to the created-at or updated-at implementation based on the requested sort key. It is the sort-key switch for flat roots.
+**Purpose**: Chooses the correct scanner for a flat folder of rollout files. This supports roots where files are all in one directory instead of date subfolders.
 
-**Data flow**: Accepts the same parameters as the nested traversal dispatcher and matches `sort_key` to await either `traverse_flat_paths_created` or `traverse_flat_paths_updated`.
+**Data flow**: It receives the flat root plus paging and filter settings. It calls either the created-at or updated-at flat traversal and returns the resulting page.
 
-**Call relations**: Called by `get_threads_in_root` when `ThreadListLayout::Flat` is selected.
+**Call relations**: get_threads_in_root calls this when the configured layout is Flat.
 
 *Call graph*: calls 2 internal fn (traverse_flat_paths_created, traverse_flat_paths_updated); called by 1 (get_threads_in_root).
 
@@ -1945,11 +1949,11 @@ async fn traverse_directories_for_paths_created(
     provider_matcher: Option<&ProviderMatch
 ```
 
-**Purpose**: Scans nested date directories in reverse chronological order, building thread items inline in created-at order until the page fills or the scan cap is hit. It is the efficient path when filename timestamps define ordering.
+**Purpose**: Builds one page of threads from nested date folders ordered by creation time. This is efficient because the creation timestamp is in the directory and filename order.
 
-**Data flow**: Allocates `items` with page-size capacity, initializes `scanned_files`, `more_matches_available`, and a `FilesByCreatedAtVisitor` with `AnchorState::new(anchor)`, then calls `walk_rollout_files(&root, &mut scanned_files, &mut visitor).await`. After traversal it derives `reached_scan_cap`, possibly forces `more_matches_available`, computes `next_cursor` with `build_next_cursor(&items, ThreadSortKey::CreatedAt)` when needed, and returns `ThreadsPage`.
+**Data flow**: It creates an empty item list, a scan counter, and a FilesByCreatedAtVisitor. walk_rollout_files feeds files to the visitor until enough results are collected or the scan cap is reached, then it builds a next cursor if more results likely exist.
 
-**Call relations**: Called by `traverse_directories_for_paths`. It delegates per-file work to `FilesByCreatedAtVisitor::visit` via `walk_rollout_files`.
+**Call relations**: traverse_directories_for_paths calls this for CreatedAt sorting. It relies on walk_rollout_files for ordered scanning and build_next_cursor for pagination.
 
 *Call graph*: calls 3 internal fn (new, build_next_cursor, walk_rollout_files); called by 1 (traverse_directories_for_paths); 1 external calls (with_capacity).
 
@@ -1965,11 +1969,11 @@ async fn traverse_directories_for_paths_updated(
     provider_matcher: Option<&ProviderMatch
 ```
 
-**Purpose**: Scans nested date directories, collects all candidates up to the scan cap, sorts them by file mtime descending, and then builds filtered thread items in updated-at order. This is the slower but necessary path for updated-at sorting.
+**Purpose**: Builds one page of threads from nested date folders ordered by last update time. Because update time is not in the filename, it must first collect candidates and sort them.
 
-**Data flow**: Allocates `items`, `scanned_files`, `anchor_state`, and `more_matches_available`, collects candidates with `collect_files_by_updated_at(&root, &mut scanned_files).await`, sorts them by `(Reverse(updated_at_or_epoch), Reverse(id))`, iterates candidates applying `anchor_state.should_skip`, page-size stopping, and `build_thread_item(...)` with an `updated_at_fallback`, then computes `reached_scan_cap`, optional `next_cursor` via `build_next_cursor(..., UpdatedAt)`, and returns `ThreadsPage`.
+**Data flow**: It scans candidate files with their modification times, sorts newest first, applies the cursor and page size, then builds full ThreadItem summaries only for files that make the page. It reports scan counts, scan-cap status, and a next cursor when needed.
 
-**Call relations**: Called by `traverse_directories_for_paths`. It separates candidate collection from summary extraction because updated-at ordering requires a full mtime sort.
+**Call relations**: traverse_directories_for_paths calls this for UpdatedAt sorting. It uses collect_files_by_updated_at, build_thread_item, and build_next_cursor.
 
 *Call graph*: calls 4 internal fn (new, build_next_cursor, build_thread_item, collect_files_by_updated_at); called by 1 (traverse_directories_for_paths); 1 external calls (with_capacity).
 
@@ -1985,11 +1989,11 @@ async fn traverse_flat_paths_created(
     provider_matcher: Option<&ProviderMatcher<'_>>,
 ```
 
-**Purpose**: Lists thread items from a flat root in created-at order using filename timestamps. It mirrors the nested created-at traversal without descending date directories.
+**Purpose**: Builds one page from a flat directory ordered by creation time from filenames. It is the flat-layout counterpart to the nested created-at traversal.
 
-**Data flow**: Allocates `items`, `scanned_files`, `anchor_state`, and `more_matches_available`, collects `(ts, id, path)` tuples with `collect_flat_rollout_files`, iterates them applying pagination and page-size checks, computes `updated_at` via `file_modified_time`, builds items with `build_thread_item`, then computes `reached_scan_cap`, optional `next_cursor`, and returns `ThreadsPage`.
+**Data flow**: It collects flat rollout files, already sorted by timestamp and ID, skips anything before the cursor, reads modification time for display, builds ThreadItem summaries, and stops at page size or scan cap.
 
-**Call relations**: Called by `traverse_flat_paths` for flat roots sorted by created-at.
+**Call relations**: traverse_flat_paths calls this for CreatedAt sorting. It uses collect_flat_rollout_files, file_modified_time, build_thread_item, and build_next_cursor.
 
 *Call graph*: calls 5 internal fn (new, build_next_cursor, build_thread_item, collect_flat_rollout_files, file_modified_time); called by 1 (traverse_flat_paths); 1 external calls (with_capacity).
 
@@ -2005,11 +2009,11 @@ async fn traverse_flat_paths_updated(
     provider_matcher: Option<&ProviderMatcher<'_>>,
 ```
 
-**Purpose**: Lists thread items from a flat root in updated-at order by collecting candidates, sorting by mtime, and then building summaries. It is the flat-root analogue of the nested updated-at traversal.
+**Purpose**: Builds one page from a flat directory ordered by file update time. It scans the flat folder, sorts by modification time, then creates summaries for the requested page.
 
-**Data flow**: Allocates `items`, `scanned_files`, `anchor_state`, and `more_matches_available`, collects candidates with `collect_flat_files_by_updated_at`, sorts them by `(Reverse(updated_at_or_epoch), Reverse(id))`, iterates with pagination and page-size checks, builds items with `build_thread_item`, then computes `reached_scan_cap`, optional `next_cursor`, and returns `ThreadsPage`.
+**Data flow**: It collects candidate paths with update times, sorts newest first with ID as a tie breaker, applies the cursor and page size, reads each selected file’s summary, and returns a ThreadsPage.
 
-**Call relations**: Called by `traverse_flat_paths` when flat roots are sorted by updated-at.
+**Call relations**: traverse_flat_paths calls this for UpdatedAt sorting. It uses collect_flat_files_by_updated_at, build_thread_item, and build_next_cursor.
 
 *Call graph*: calls 4 internal fn (new, build_next_cursor, build_thread_item, collect_flat_files_by_updated_at); called by 1 (traverse_flat_paths); 1 external calls (with_capacity).
 
@@ -2020,11 +2024,11 @@ async fn traverse_flat_paths_updated(
 fn parse_cursor(token: &str) -> Option<Cursor>
 ```
 
-**Purpose**: Parses a pagination token into a `Cursor`, accepting either RFC3339 timestamps or the filename-style `YYYY-MM-DDThh-mm-ss` format. Tokens containing `|` are rejected outright.
+**Purpose**: Turns a cursor token string into a Cursor. It accepts the modern RFC3339 timestamp form and an older filename-style timestamp form.
 
-**Data flow**: Accepts `&str`, returns `None` if the token contains `|`, otherwise tries `OffsetDateTime::parse(token, &Rfc3339)` and falls back to parsing with a custom format description and `PrimitiveDateTime::assume_utc`. On success it wraps the timestamp with `Cursor::new`.
+**Data flow**: It receives a token string. Tokens containing a pipe character are rejected, then the function tries to parse the string as RFC3339 or as YYYY-MM-DDThh-mm-ss; on success it returns a Cursor.
 
-**Call relations**: Used by `Cursor` deserialization and other cursor-construction helpers that accept external token strings.
+**Call relations**: Cursor::deserialize uses this for JSON input, and tests use it to check cursor compatibility.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (deserialize, cursor_from_thread_item, cursor_to_anchor_normalizes_timestamp_format); 1 external calls (parse).
 
@@ -2035,11 +2039,11 @@ fn parse_cursor(token: &str) -> Option<Cursor>
 fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cursor>
 ```
 
-**Purpose**: Builds the pagination cursor for the next page from the last returned item, using either its created-at filename timestamp or its updated-at field depending on sort order. This keeps pagination aligned with the active ordering key.
+**Purpose**: Creates the pagination token for the next page. It uses the last item returned, because the next request should resume after that item.
 
-**Data flow**: Accepts a slice of `ThreadItem` and a `ThreadSortKey`. It takes the last item, extracts its filename, parses `(created_ts, _id)` with `parse_timestamp_uuid_from_filename`, then chooses `created_ts` for `CreatedAt` or parses `last.updated_at` as RFC3339 for `UpdatedAt`. It returns `Some(Cursor::new(ts))` or `None` if any required data is missing.
+**Data flow**: It reads the last ThreadItem, parses its filename for the created timestamp and ID, then chooses either the created timestamp or the item’s updated_at timestamp depending on the sort key. It returns a Cursor, or None if the needed data is missing.
 
-**Call relations**: Called by all traversal variants when there may be more results beyond the current page.
+**Call relations**: All four traversal functions call this when they believe more results may be available.
 
 *Call graph*: calls 2 internal fn (new, parse_timestamp_uuid_from_filename); called by 4 (traverse_directories_for_paths_created, traverse_directories_for_paths_updated, traverse_flat_paths_created, traverse_flat_paths_updated); 2 external calls (parse, last).
 
@@ -2055,11 +2059,11 @@ async fn build_thread_item(
     updated_at: Option<St
 ```
 
-**Purpose**: Reads a rollout file's head, applies source/provider/cwd filters, and constructs the user-facing `ThreadItem` summary if the rollout is discoverable. It is the central summary-extraction routine for listing and direct lookup.
+**Purpose**: Turns one rollout file into the compact summary shown in thread lists. It also applies source, model-provider, and working-directory filters.
 
-**Data flow**: Accepts a rollout path, allowed sources, optional provider matcher, optional cwd filters, and optional fallback `updated_at` string. It reads `HeadTailSummary` via `read_head_summary(&path, HEAD_RECORD_LIMIT).await.unwrap_or_default()`, rejects the file if source/provider/cwd filters do not match, and only proceeds when `saw_session_meta` is true and `preview` is present. It then destructures the summary, fills `updated_at` from the summary or fallback or created-at, and returns `Some(ThreadItem { ... })`; otherwise `None`.
+**Data flow**: It receives a path, filters, and an optional fallback update time. It reads a short summary from the start of the file, rejects files that do not match filters or lack metadata and a preview, fills missing updated_at from the fallback or created_at, and returns a ThreadItem.
 
-**Call relations**: Called by traversal visitors, traversal loops, and `read_thread_item_from_rollout`. It depends on `read_head_summary` for bounded parsing and on `ProviderMatcher`/path normalization for filtering.
+**Call relations**: Created-at visitors, updated-at traversals, flat traversals, and read_thread_item_from_rollout all use this as the central summary builder.
 
 *Call graph*: calls 1 internal fn (read_head_summary); called by 5 (visit, read_thread_item_from_rollout, traverse_directories_for_paths_updated, traverse_flat_paths_created, traverse_flat_paths_updated); 1 external calls (is_empty).
 
@@ -2070,11 +2074,11 @@ async fn build_thread_item(
 async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem>
 ```
 
-**Purpose**: Builds a single `ThreadItem` summary from a known rollout path without scanning directories. It is the direct-summary convenience wrapper around `build_thread_item`.
+**Purpose**: Builds a ThreadItem for one known rollout path without scanning the sessions tree. This is useful when another part of the system already found the file.
 
-**Data flow**: Accepts a `PathBuf`, calls `build_thread_item(path, &[], None, None, None).await`, and returns the resulting `Option<ThreadItem>`.
+**Data flow**: It receives a path and calls build_thread_item with no filters and no update-time fallback. It returns the summary if the file has enough metadata and preview information.
 
-**Call relations**: Used by callers that already resolved a rollout path and want the same summary extraction logic as list operations.
+**Call relations**: It is a simple public wrapper around build_thread_item for direct lookup use cases.
 
 *Call graph*: calls 1 internal fn (build_thread_item).
 
@@ -2085,11 +2089,11 @@ async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem>
 async fn collect_dirs_desc(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
 ```
 
-**Purpose**: Collects immediate subdirectories whose names parse successfully and returns them sorted descending by the parsed key. It is the generic helper for year/month/day directory traversal.
+**Purpose**: Reads child directories and sorts the ones with parseable names from newest or largest to oldest or smallest. It is used for year, month, and day folders.
 
-**Data flow**: Accepts a parent path and a parse function `Fn(&str) -> Option<T>`. It reads the directory asynchronously, filters entries to directories, converts names to strings, applies `parse`, pushes `(parsed_value, entry.path())` into a vector, sorts by `Reverse(parsed_value)`, and returns the vector.
+**Data flow**: It receives a parent directory and a parsing function for names. It reads entries, keeps directories whose names parse successfully, sorts them descending by the parsed value, and returns their parsed keys with paths.
 
-**Call relations**: Used by `walk_rollout_files` to traverse `YYYY/MM/DD` directories in reverse chronological order.
+**Call relations**: walk_rollout_files calls this repeatedly to move through nested date folders in reverse chronological order.
 
 *Call graph*: called by 1 (walk_rollout_files); 2 external calls (new, read_dir).
 
@@ -2100,11 +2104,11 @@ async fn collect_dirs_desc(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBu
 async fn collect_files(parent: &Path, parse: F) -> io::Result<Vec<T>>
 ```
 
-**Purpose**: Collects files in a directory and transforms them with a caller-provided parser. It is the generic file-collection helper used for day-directory scans.
+**Purpose**: Reads files in one directory and converts matching filenames into caller-chosen values. It is a reusable helper for file collection.
 
-**Data flow**: Accepts a parent path and parse function `Fn(&str, &Path) -> Option<T>`. It reads the directory asynchronously, filters to regular files, converts names to strings, applies the parser, pushes successful results into a vector, and returns it.
+**Data flow**: It receives a directory and a parsing function. It visits immediate file entries, passes each name and path to the parser, keeps successful results, and returns the collected list.
 
-**Call relations**: Used by `collect_rollout_day_files` to gather rollout files from one day directory.
+**Call relations**: collect_rollout_day_files uses this to gather rollout files for a single day folder.
 
 *Call graph*: called by 1 (collect_rollout_day_files); 2 external calls (new, read_dir).
 
@@ -2118,11 +2122,11 @@ async fn collect_flat_rollout_files(
 ) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>>
 ```
 
-**Purpose**: Collects rollout files from a flat root, parses their created-at timestamps and UUIDs from filenames, and returns them sorted newest first. It enforces the global scan cap while scanning.
+**Purpose**: Collects rollout files from one flat directory and sorts them by creation time from their filenames. It respects the global scan cap.
 
-**Data flow**: Accepts a root path and mutable scanned-file counter, reads the directory, skips non-files, normalizes entries with `compression::RolloutFile::from_path`, parses `(ts, id)` from `plain_file_name`, increments `scanned_files` for each accepted rollout, stops when the cap is exceeded, pushes `(ts, id, rollout_file.into_path())` into a vector, sorts by `(Reverse(ts), Reverse(id))`, and returns it.
+**Data flow**: It receives a root folder and a mutable scan counter. It reads file entries, recognizes rollout files including compressed ones, parses timestamp and UUID from each name, increments the scan count, and returns sorted timestamp-ID-path triples.
 
-**Call relations**: Called by `traverse_flat_paths_created` as the flat-root created-at candidate collector.
+**Call relations**: traverse_flat_paths_created uses this before applying pagination and building ThreadItem summaries.
 
 *Call graph*: calls 2 internal fn (from_path, parse_timestamp_uuid_from_filename); called by 1 (traverse_flat_paths_created); 2 external calls (new, read_dir).
 
@@ -2135,11 +2139,11 @@ async fn collect_rollout_day_files(
 ) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>>
 ```
 
-**Purpose**: Collects rollout files from one day directory and returns them sorted by created-at timestamp and UUID descending. It is the per-day helper used by nested traversal.
+**Purpose**: Collects all valid rollout files from one day directory. It gives the directory walker a sorted list for that day.
 
-**Data flow**: Accepts a day directory path, calls `collect_files` with a parser that builds `compression::RolloutFile`, parses `(ts, id)` from `plain_file_name`, and returns `(ts, id, rollout_file.into_path())`. It then sorts the resulting vector by `(Reverse(ts), Reverse(id))` and returns it.
+**Data flow**: It reads files in the day folder, recognizes rollout filenames, parses their timestamp and UUID, and sorts them newest first with UUID as a stable tie breaker.
 
-**Call relations**: Called by `walk_rollout_files` for each day directory encountered during nested traversal.
+**Call relations**: walk_rollout_files calls this after it has chosen a particular year, month, and day directory.
 
 *Call graph*: calls 1 internal fn (collect_files); called by 1 (walk_rollout_files).
 
@@ -2150,11 +2154,11 @@ async fn collect_rollout_day_files(
 fn parse_timestamp_uuid_from_filename(name: &str) -> Option<(OffsetDateTime, Uuid)>
 ```
 
-**Purpose**: Parses the created-at timestamp and thread UUID encoded in a rollout filename, accepting both plain and compressed names. It is the canonical filename parser for ordering and id lookup.
+**Purpose**: Extracts the creation timestamp and UUID from a rollout filename. This is how the system understands names like rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl.
 
-**Data flow**: Accepts a filename string, normalizes it with `compression::parse_rollout_file_name`, strips the `rollout-` prefix and `.jsonl` suffix, scans from the right for a `-` whose suffix parses as a `Uuid`, parses the left portion as `PrimitiveDateTime` with the fixed `YYYY-MM-DDThh-mm-ss` format, converts it to UTC `OffsetDateTime`, and returns `Some((ts, uuid))` or `None`.
+**Data flow**: It receives a filename string, normalizes it through the compression-aware filename parser, strips the rollout prefix and jsonl suffix, finds the UUID at the right end, parses the timestamp before it, and returns both values.
 
-**Call relations**: Used by cursor construction, file collection, id lookup, and other code that derives ordering or identity from rollout filenames.
+**Call relations**: Pagination, sorting, flat collection, and ID lookup all depend on this to interpret rollout filenames consistently.
 
 *Call graph*: called by 6 (build_next_cursor, collect_flat_files_by_updated_at, collect_flat_rollout_files, find_rollout_path_by_id_from_filenames, builder_from_items, thread_item_sort_key); 3 external calls (parse, parse_rollout_file_name, format_description!).
 
@@ -2168,11 +2172,11 @@ async fn collect_files_by_updated_at(
 ) -> io::Result<Vec<ThreadCandidate>>
 ```
 
-**Purpose**: Collects `ThreadCandidate`s from a nested date-directory tree for later updated-at sorting. It delegates traversal to the generic rollout walker.
+**Purpose**: Collects nested-layout rollout candidates with their file modification times. It prepares data for updated-at sorting.
 
-**Data flow**: Accepts a root path and mutable scanned-file counter, initializes an empty candidate vector and `FilesByUpdatedAtVisitor`, calls `walk_rollout_files(root, scanned_files, &mut visitor).await`, and returns the collected candidates.
+**Data flow**: It receives a root and scan counter, creates a FilesByUpdatedAtVisitor, and runs walk_rollout_files. The result is a list of ThreadCandidate values containing path, ID, and update time.
 
-**Call relations**: Called by `traverse_directories_for_paths_updated` before sorting candidates by mtime.
+**Call relations**: traverse_directories_for_paths_updated calls this before sorting and building the final page.
 
 *Call graph*: calls 1 internal fn (walk_rollout_files); called by 1 (traverse_directories_for_paths_updated); 1 external calls (new).
 
@@ -2186,11 +2190,11 @@ async fn collect_flat_files_by_updated_at(
 ) -> io::Result<Vec<ThreadCandidate>>
 ```
 
-**Purpose**: Collects `ThreadCandidate`s from a flat root for later updated-at sorting. It is the flat-root analogue of `collect_files_by_updated_at`.
+**Purpose**: Collects flat-layout rollout candidates with their file modification times. It is the flat-folder version of collect_files_by_updated_at.
 
-**Data flow**: Accepts a root path and mutable scanned-file counter, reads the directory, filters to regular files, normalizes with `compression::RolloutFile::from_path`, parses UUIDs from filenames, increments the scan counter, computes `updated_at` via `file_modified_time(rollout_file.path()).await.unwrap_or(None)`, pushes `ThreadCandidate { path: rollout_file.into_path(), id, updated_at }`, and returns the vector.
+**Data flow**: It reads file entries in the root, stops at the scan cap, recognizes rollout files, parses each UUID from the filename, reads modification time, and returns ThreadCandidate values.
 
-**Call relations**: Called by `traverse_flat_paths_updated` before sorting candidates by mtime.
+**Call relations**: traverse_flat_paths_updated calls this before sorting candidates by update time.
 
 *Call graph*: calls 3 internal fn (from_path, file_modified_time, parse_timestamp_uuid_from_filename); called by 1 (traverse_flat_paths_updated); 2 external calls (new, read_dir).
 
@@ -2205,11 +2209,11 @@ async fn walk_rollout_files(
 ) -> io::Result<()>
 ```
 
-**Purpose**: Traverses the nested `YYYY/MM/DD` rollout directory tree in reverse chronological order and invokes a visitor for each rollout file until traversal completes or the visitor breaks. It is the generic nested-tree walker.
+**Purpose**: Walks the nested rollout directory tree in newest-first order. It is the shared scanner for nested year/month/day storage.
 
-**Data flow**: Accepts a root path, mutable scanned-file counter, and mutable visitor. It collects year, month, and day directories descending with `collect_dirs_desc`, then for each day collects sorted files with `collect_rollout_day_files`. For each `(ts, id, path)` it increments `scanned_files`, stops if the cap is exceeded, and awaits `visitor.visit(ts, id, path, *scanned_files)`, breaking out of nested loops on `ControlFlow::Break(())`.
+**Data flow**: It receives the root, a scan counter, and a visitor. It collects year, month, and day folders descending, then day files descending, increments the scan count for each file, and lets the visitor decide whether to continue or stop.
 
-**Call relations**: Used by created-at and updated-at nested traversal paths. It delegates per-file behavior to the visitor implementations.
+**Call relations**: Created-at listing uses it directly with FilesByCreatedAtVisitor, and updated-at candidate collection uses it with FilesByUpdatedAtVisitor.
 
 *Call graph*: calls 2 internal fn (collect_dirs_desc, collect_rollout_day_files); called by 2 (collect_files_by_updated_at, traverse_directories_for_paths_created); 1 external calls (visit).
 
@@ -2220,11 +2224,11 @@ async fn walk_rollout_files(
 fn new(filters: &'a [String], default_provider: &'a str) -> Option<Self>
 ```
 
-**Purpose**: Builds an optional provider matcher from a non-empty filter list and the configured default provider. Empty filter lists disable provider filtering entirely.
+**Purpose**: Creates a model-provider filter helper. It also remembers whether sessions missing a provider should count as the default provider.
 
-**Data flow**: Accepts a slice of provider filter strings and the default provider string. If `filters.is_empty()`, returns `None`; otherwise computes whether any filter equals the default provider and returns `Some(ProviderMatcher { filters, matches_default_provider })`.
+**Data flow**: It receives a list of provider names and the default provider. If the list is empty it returns None; otherwise it stores the list and whether the default provider is included.
 
-**Call relations**: Called by `get_threads_in_root` before traversal so provider filtering can be applied during summary construction.
+**Call relations**: get_threads_in_root builds this once and passes it into traversal so build_thread_item can filter each file cheaply.
 
 
 ##### `ProviderMatcher::matches`  (lines 1064–1069)
@@ -2233,11 +2237,11 @@ fn new(filters: &'a [String], default_provider: &'a str) -> Option<Self>
 fn matches(&self, session_provider: Option<&str>) -> bool
 ```
 
-**Purpose**: Checks whether a session's model provider matches the configured provider filters, treating missing session providers as matching only when the default provider is allowed. This handles older rollouts that may omit provider metadata.
+**Purpose**: Checks whether a session’s model provider passes the configured provider filter. Missing provider values can match when the filter includes the default provider.
 
-**Data flow**: Accepts `Option<&str>` for the session provider. If `Some(provider)`, it returns whether any filter equals that provider. If `None`, it returns `self.matches_default_provider`.
+**Data flow**: It receives an optional provider string. If present, it compares it against the filter list; if absent, it returns the precomputed default-provider match result.
 
-**Call relations**: Called by `build_thread_item` when provider filtering is enabled.
+**Call relations**: build_thread_item calls this while deciding whether a rollout file should appear in the listing.
 
 
 ##### `read_head_summary`  (lines 1072–1154)
@@ -2246,11 +2250,11 @@ fn matches(&self, session_provider: Option<&str>) -> bool
 async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary>
 ```
 
-**Purpose**: Reads a bounded prefix of a rollout file and extracts the metadata and preview fields needed for thread listing. It stops early once it has enough information or reaches the extended scan limit.
+**Purpose**: Reads just enough of a rollout file to summarize it for a thread list. It avoids loading the whole conversation when only metadata and a preview are needed.
 
-**Data flow**: Accepts a rollout path and head limit, opens a `RolloutLineReader` via `compression::open_rollout_line_reader`, initializes `HeadTailSummary::default()` and `lines_scanned`, then loops while under the head limit or still missing preview/first-user-message after seeing session meta. It reads lines, trims and skips empties, parses `RolloutLine` with `serde_json::from_str`, and updates summary fields based on `RolloutItem`: first `SessionMeta` populates source/thread/cwd/git/provider/version/created_at; `ResponseItem` and `InterAgentCommunication` can backfill `created_at`; `EventMsg` uses `event_msg_preview` to set `preview` and `first_user_message`. It breaks early once session meta, preview, and first user message are all present, then returns the summary.
+**Data flow**: It opens the rollout line reader, scans a limited number of non-empty JSON lines, records the first session metadata, captures creation time, provider, source, Git details, and preview text, and stops once it has enough information or reaches the scan limit.
 
-**Call relations**: Called by `build_thread_item`. It depends on compression-aware line reading and `event_msg_preview` to keep listing fast without parsing entire transcripts.
+**Call relations**: build_thread_item relies on this to turn raw rollout JSON lines into a HeadTailSummary. It uses event_msg_preview to turn user-facing events into preview text.
 
 *Call graph*: calls 2 internal fn (open_rollout_line_reader, event_msg_preview); called by 1 (build_thread_item); 2 external calls (default, from_str).
 
@@ -2261,11 +2265,11 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>>
 ```
 
-**Purpose**: Reads up to `HEAD_RECORD_LIMIT` records from the start of a rollout and returns only the summary-relevant items as raw JSON values. It is used by callers that need the head payloads themselves rather than a reduced summary struct.
+**Purpose**: Reads the first meaningful records from a rollout file in a JSON-value form. This is for callers that need the same “head” data, not just the ThreadItem summary.
 
-**Data flow**: Accepts a rollout path, opens a `RolloutLineReader`, initializes an empty `Vec<serde_json::Value>`, then reads lines until the head limit or EOF. It trims and skips empty lines, parses `RolloutLine`, and for `SessionMeta`, `ResponseItem`, and `InterAgentCommunication` converts the inner item to JSON with `serde_json::to_value` and pushes it. `Compacted`, `TurnContext`, and `EventMsg` are ignored. It returns the collected JSON values.
+**Data flow**: It opens the file, reads up to the head record limit, parses rollout lines, converts session metadata, response items, and inter-agent messages into JSON values, and skips event and context records.
 
-**Call relations**: Called by `read_session_meta_line` and tests that inspect rollout heads. It shares the same compression-aware reader as summary extraction.
+**Call relations**: read_session_meta_line uses this to get the first metadata record, and tests use it to verify preserved head content.
 
 *Call graph*: calls 1 internal fn (open_rollout_line_reader); called by 3 (read_session_meta_line, test_base_instructions_missing_in_meta_defaults_to_null, test_base_instructions_present_in_meta_is_preserved); 2 external calls (new, to_value).
 
@@ -2276,11 +2280,11 @@ async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>
 fn strip_user_message_prefix(text: &str) -> &str
 ```
 
-**Purpose**: Removes the protocol's `USER_MESSAGE_BEGIN` prefix from a user message preview and trims surrounding whitespace. If the prefix is absent, it just trims the whole string.
+**Purpose**: Removes an internal marker from user-message text before showing it as a preview. This keeps list previews clean for humans.
 
-**Data flow**: Accepts `&str`, searches for `USER_MESSAGE_BEGIN`, and returns the substring after the prefix trimmed, or `text.trim()` if the prefix is not found.
+**Data flow**: It receives message text. If it finds the USER_MESSAGE_BEGIN marker, it returns the trimmed text after the marker; otherwise it returns the trimmed original text.
 
-**Call relations**: Used only by `event_msg_preview` when deriving previews from `EventMsg::UserMessage`.
+**Call relations**: event_msg_preview calls this when turning a UserMessage event into display text.
 
 *Call graph*: called by 1 (event_msg_preview).
 
@@ -2291,11 +2295,11 @@ fn strip_user_message_prefix(text: &str) -> &str
 fn event_msg_preview(event: &EventMsg) -> Option<String>
 ```
 
-**Purpose**: Extracts a user-facing preview string from selected event message types. It prefers meaningful text and falls back to `[Image]` for image-only user messages.
+**Purpose**: Extracts a human-readable preview from event messages that can describe a thread. It supports normal user messages, image-only messages, and thread goal updates.
 
-**Data flow**: Accepts `&EventMsg`. For `UserMessage`, it strips the prefix from `user.message`, returns the non-empty text if present, otherwise returns `[Image]` if remote or local images exist, else `None`. For `ThreadGoalUpdated`, it returns the trimmed non-empty objective string. All other event types return `None`.
+**Data flow**: It receives an EventMsg. For user messages it returns cleaned text, or [Image] if images exist but text is empty; for goal updates it returns the objective text; for other events it returns None.
 
-**Call relations**: Called by `read_head_summary` while scanning early rollout events for preview-bearing content.
+**Call relations**: read_head_summary calls this while scanning rollout events so the final ThreadItem can show a useful preview.
 
 *Call graph*: calls 1 internal fn (strip_user_message_prefix); called by 1 (read_head_summary).
 
@@ -2306,11 +2310,11 @@ fn event_msg_preview(event: &EventMsg) -> Option<String>
 async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine>
 ```
 
-**Purpose**: Reads and returns the `SessionMetaLine` from the head of a rollout file, erroring if the rollout is empty or does not begin with session metadata. It is the verification primitive used by path lookup and repair logic.
+**Purpose**: Reads the SessionMetaLine from the start of a rollout file. This gives callers the authoritative session metadata for a known file.
 
-**Data flow**: Accepts a rollout path, reads the head JSON values with `read_head_for_summary(path).await`, takes the first value or returns `io::Error::other("rollout at ... is empty")`, then attempts `serde_json::from_value::<SessionMetaLine>(first.clone())`, mapping failure to `io::Error::other("rollout at ... does not start with session metadata")`.
+**Data flow**: It calls read_head_for_summary, takes the first JSON value, and tries to deserialize it as SessionMetaLine. If the file is empty or does not start with metadata, it returns a clear I/O error.
 
-**Call relations**: Called by `find_thread_path_by_id_str_in_subdir`, metadata lookup, and state-db repair paths to verify that a candidate file belongs to the expected thread.
+**Call relations**: Thread-path lookup uses this to verify that a database path really belongs to the requested thread, and other metadata lookup code reuses it.
 
 *Call graph*: calls 1 internal fn (read_head_for_summary); called by 3 (find_thread_path_by_id_str_in_subdir, find_thread_meta_by_name_str, read_repair_rollout_path); 2 external calls (other, format!).
 
@@ -2321,11 +2325,11 @@ async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine>
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>>
 ```
 
-**Purpose**: Returns the rollout file's modification time truncated to millisecond precision. This normalizes filesystem timestamps before they are serialized or compared.
+**Purpose**: Reads a rollout file’s last modification time and normalizes it. This provides the updated_at value used for display and updated-time sorting.
 
-**Data flow**: Accepts `&Path`, awaits `compression::file_modified_time(path)`, and maps any returned `OffsetDateTime` through `truncate_to_millis` before wrapping it back in `Option`.
+**Data flow**: It asks the compression layer for the file modification time, then truncates the timestamp to milliseconds. It returns an optional timestamp inside an I/O result.
 
-**Call relations**: Used by listing visitors and flat-file collectors whenever `updated_at` ordering or display is needed.
+**Call relations**: Created-at and updated-at listing paths call this whenever they need filesystem update time.
 
 *Call graph*: calls 1 internal fn (file_modified_time); called by 4 (visit, visit, collect_flat_files_by_updated_at, traverse_flat_paths_created).
 
@@ -2336,11 +2340,11 @@ async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>>
 fn format_rfc3339(dt: OffsetDateTime) -> Option<String>
 ```
 
-**Purpose**: Formats an `OffsetDateTime` as an RFC3339 string, returning `None` on formatting failure. It is the stringification helper for created/updated timestamps.
+**Purpose**: Formats a timestamp as an RFC3339 string. This is the display and cursor-friendly timestamp format used in ThreadItem fields.
 
-**Data flow**: Accepts `OffsetDateTime`, calls `dt.format(&Rfc3339).ok()`, and returns `Option<String>`.
+**Data flow**: It receives an OffsetDateTime and tries to format it. On success it returns the string; on formatting failure it returns None.
 
-**Call relations**: Used when populating `ThreadItem.updated_at` and other timestamp fields from filesystem times.
+**Call relations**: Listing code uses this after reading modification times so updated_at can be stored as text.
 
 *Call graph*: 1 external calls (format).
 
@@ -2351,11 +2355,11 @@ fn format_rfc3339(dt: OffsetDateTime) -> Option<String>
 fn truncate_to_millis(dt: OffsetDateTime) -> Option<OffsetDateTime>
 ```
 
-**Purpose**: Rounds an `OffsetDateTime` down to millisecond precision by zeroing sub-millisecond nanoseconds. This avoids unstable higher-precision timestamps from filesystem metadata.
+**Purpose**: Rounds a timestamp down to millisecond precision. This avoids tiny nanosecond differences that are not useful for listing and cursor output.
 
-**Data flow**: Accepts `OffsetDateTime`, computes `millis_nanos = (dt.nanosecond() / 1_000_000) * 1_000_000`, calls `dt.replace_nanosecond(millis_nanos).ok()`, and returns the truncated timestamp or `None` on failure.
+**Data flow**: It receives a timestamp, computes the nearest lower millisecond nanosecond value, replaces the timestamp’s nanosecond field, and returns the adjusted timestamp if valid.
 
-**Call relations**: Used by the local `file_modified_time` wrapper before timestamps are formatted or sorted.
+**Call relations**: file_modified_time calls this before handing modification times to sorting and formatting code.
 
 *Call graph*: 2 external calls (nanosecond, replace_nanosecond).
 
@@ -2371,11 +2375,11 @@ async fn find_thread_path_by_id_str_in_subdir(
 ) -> io::Result<Option<PathBuf>>
 ```
 
-**Purpose**: Finds a rollout path by thread UUID within either the active or archived subdirectory, preferring verified state-db results but falling back to filename scanning and broader file search. It also records discrepancies and attempts read repair when fallback succeeds.
+**Purpose**: Finds a rollout file for a thread UUID inside either the active sessions folder or the archived sessions folder. It prefers the state database but has careful fallbacks when the database is missing, stale, or wrong.
 
-**Data flow**: Accepts `codex_home`, a subdir name, the thread id string, and optional `state_db_ctx`. It first validates UUID syntax and derives `archived_only` plus optional `ThreadId`. If a state DB is available, it calls `find_rollout_path_by_id`, resolves any returned path through `compression::existing_rollout_path`, and verifies ownership by reading `SessionMeta` with `read_session_meta_line`; verified matches return immediately, mismatches/stale paths log errors and record fallback telemetry, and unverifiable-but-existing paths are saved as `unverified_db_path`. It then builds the filesystem root, returns `unverified_db_path` if the root does not exist, otherwise tries `find_rollout_path_by_id_from_filenames`. If that fails to find a match, it runs broader `codex_file_search::run` with limit 1, normalizes matches through `compression::RolloutFile::from_path`, and picks the first path. When a fallback path is found, it logs DB discrepancy warnings, records fallback telemetry, and calls `state_db::read_repair_rollout_path(...)`. Finally it returns the found path or the earlier `unverified_db_path`.
+**Data flow**: It receives Codex home, a subdirectory name, an ID string, and an optional state database runtime. It validates the UUID, tries a database lookup and verifies the file’s metadata, then falls back to filename scanning and finally content search; when a fallback succeeds, it asks the state database repair code to record the corrected path.
 
-**Call relations**: Called by both `find_thread_path_by_id_str` and `find_archived_thread_path_by_id_str`. It orchestrates DB lookup, on-disk verification, filename scanning, broad search fallback, and read repair.
+**Call relations**: find_thread_path_by_id_str and find_archived_thread_path_by_id_str are thin wrappers around this. It calls read_session_meta_line for verification, find_rollout_path_by_id_from_filenames for faster disk fallback, and read_repair_rollout_path after a successful fallback.
 
 *Call graph*: calls 4 internal fn (from_string, find_rollout_path_by_id_from_filenames, read_session_meta_line, read_repair_rollout_path); called by 2 (find_archived_thread_path_by_id_str, find_thread_path_by_id_str); 11 external calls (default, new, to_path_buf, parse_str, record_fallback, existing_rollout_path, run, debug!, error!, warn! (+1 more)).
 
@@ -2389,11 +2393,11 @@ async fn find_rollout_path_by_id_from_filenames(
 ) -> io::Result<Option<PathBuf>>
 ```
 
-**Purpose**: Recursively scans a root directory for a rollout filename whose embedded UUID matches the target thread id. It is the fast filesystem fallback before broader content search.
+**Purpose**: Searches a rollout directory tree for a file whose filename contains the target UUID. This is faster than searching file contents because it only inspects names.
 
-**Data flow**: Accepts a root path and id string, parses the target UUID or returns `Ok(None)` if invalid, then depth-first traverses directories with a stack and `tokio::fs::read_dir`. For each regular file it normalizes with `compression::RolloutFile::from_path`, parses `(ts, id)` from `plain_file_name`, and returns `Ok(Some(rollout_file.into_path()))` on the first UUID match. If traversal completes without a match, it returns `Ok(None)`.
+**Data flow**: It receives a root path and ID string, parses the target UUID, walks directories with an explicit stack, recognizes rollout files, parses each filename’s UUID, and returns the first matching path.
 
-**Call relations**: Called by `find_thread_path_by_id_str_in_subdir` before falling back to broader file search.
+**Call relations**: find_thread_path_by_id_str_in_subdir uses this as its first disk fallback after a database lookup fails or cannot be trusted.
 
 *Call graph*: calls 2 internal fn (from_path, parse_timestamp_uuid_from_filename); called by 1 (find_thread_path_by_id_str_in_subdir); 3 external calls (parse_str, read_dir, vec!).
 
@@ -2408,11 +2412,11 @@ async fn find_thread_path_by_id_str(
 ) -> io::Result<Option<PathBuf>>
 ```
 
-**Purpose**: Finds an active-session rollout path by thread UUID string. It is the public wrapper for active-session lookup.
+**Purpose**: Finds an active, non-archived thread rollout file by UUID string. It is the public helper for normal session lookup.
 
-**Data flow**: Accepts `codex_home`, id string, and optional state DB context, then awaits `find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str, state_db_ctx)`.
+**Data flow**: It receives Codex home, an ID string, and an optional state database runtime, then calls find_thread_path_by_id_str_in_subdir with the active sessions subdirectory. It returns an optional path or an I/O error.
 
-**Call relations**: Called by higher-level APIs that need to resolve active rollout files by thread id.
+**Call relations**: Cleanup and metadata lookup code call this when they need to resolve a thread ID to its rollout file.
 
 *Call graph*: calls 1 internal fn (find_thread_path_by_id_str_in_subdir); called by 2 (cleanup_stale_snapshots, find_thread_meta_by_name_str).
 
@@ -2427,11 +2431,11 @@ async fn find_archived_thread_path_by_id_str(
 ) -> io::Result<Option<PathBuf>>
 ```
 
-**Purpose**: Finds an archived rollout path by thread UUID string. It is the archived-session counterpart to `find_thread_path_by_id_str`.
+**Purpose**: Finds an archived thread rollout file by UUID string. It is the archived-session counterpart to find_thread_path_by_id_str.
 
-**Data flow**: Accepts `codex_home`, id string, and optional state DB context, then awaits `find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str, state_db_ctx)`.
+**Data flow**: It receives Codex home, an ID string, and an optional state database runtime, then calls find_thread_path_by_id_str_in_subdir with the archived sessions subdirectory.
 
-**Call relations**: Used by callers that specifically search archived rollout storage.
+**Call relations**: Callers use this when they specifically want archived thread records rather than active sessions.
 
 *Call graph*: calls 1 internal fn (find_thread_path_by_id_str_in_subdir).
 
@@ -2442,24 +2446,26 @@ async fn find_archived_thread_path_by_id_str(
 fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
 ```
 
-**Purpose**: Extracts `YYYY`, `MM`, and `DD` strings from a rollout filename's date prefix. It is a lightweight helper for deriving directory components from filenames.
+**Purpose**: Extracts the year, month, and day folder names from a rollout filename. This helps place or reason about files in the nested date layout.
 
-**Data flow**: Accepts `&OsStr`, converts it to a lossy string, strips the `rollout-` prefix, takes the first 10 characters as the date, slices out year/month/day substrings, clones them into `String`s, and returns `Some((year, month, day))` or `None` if the filename does not match the expected shape.
+**Data flow**: It receives an OsStr filename, converts it to text, reads the date portion after the rollout prefix, slices out year, month, and day strings, and returns them if the name is shaped as expected.
 
-**Call relations**: Used by code that needs to map rollout filenames back to date-directory components.
+**Call relations**: This is a small filename utility for code that needs to map a rollout file name back to its date-directory components.
 
 *Call graph*: 1 external calls (to_string_lossy).
 
 
 ### `rollout/src/recorder.rs`
 
-`orchestration` · `request handling and long-lived session recording/listing`
+`io_transport` · `cross-cutting: session start, live recording, resume, listing, shutdown`
 
-This file is the core rollout subsystem. On the write side, `RolloutRecorder` owns an async `mpsc` channel and a shared `RolloutWriterTask` that tracks the spawned writer task and any terminal `IoError`. New sessions are created in deferred mode: `precompute_log_file_info` chooses a dated path under `sessions/YYYY/MM/DD`, `RolloutRecorder::new` prepares a `SessionMeta` but does not create the file until `persist()` or `flush()` forces materialization. Resumed sessions instead materialize/open the existing rollout immediately. The background `rollout_writer` owns `RolloutWriterState`, which buffers `pending_items`, writes session metadata once, flushes after writes, and on I/O failure drops the writer handle but keeps unwritten items so a later barrier can reopen and retry. `record_canonical_items`, `persist`, `flush`, and `shutdown` are thin command senders over this task.
+A “rollout” is the saved diary of a Codex session. Each line is one JSON record, so tools and later Codex runs can read the conversation back in order. This file is the main recorder for that diary.
 
-On the read side, `load_rollout_items` streams JSONL lines through the compression layer, skips blank lines, strips legacy `ghost_snapshot` response items (including inside compaction replacement history), counts parse errors instead of failing the whole file, and returns the first `SessionMeta` thread ID plus all surviving items. `get_rollout_history` wraps that into `InitialHistory`.
+For a new session, it chooses a filename under the Codex home directory, builds the first metadata record, and waits until the session really needs to be saved. For a resumed session, it opens the existing rollout file and appends to it. Actual writing happens in a background task, so the user-facing session is not slowed down by disk writes. The design is like a mail slot: callers drop records into a queue, and one writer task picks them up and writes them safely.
 
-The file also contains thread-listing orchestration. `list_threads_with_db_fallback` combines filesystem scans and SQLite listing depending on filters, sort direction, and DB availability. It can overfetch from the filesystem, repair stale DB rows via `read_repair_rollout_path` or full `reconcile_rollout`, overlay missing metadata from state DB onto filesystem `ThreadItem`s, and fall back to filesystem pages when SQLite is unavailable or inconsistent. Additional helpers implement ascending/descending filesystem scans, title search via the sidecar session index, conversion from `codex_state::ThreadMetadata` to `ThreadItem`, and cwd-aware resume-path selection that first trusts cached cwd, then latest `TurnContext`, then full metadata extraction.
+The file is careful about failure. If writing fails, it keeps unwritten records in memory, closes the bad file handle, and tries to reopen the file on the next persist or flush. It also knows how to read old rollout files, skip one legacy record type, and recover a session history.
+
+For listing sessions, it prefers the state database, but scans rollout files when the database is missing, stale, or filtered results need repair.
 
 #### Function details
 
@@ -2469,11 +2475,11 @@ The file also contains thread-listing orchestration. `list_threads_with_db_fallb
 fn new() -> Self
 ```
 
-**Purpose**: Initializes the shared observability state for a background writer task. Both the join handle and terminal failure slot start empty.
+**Purpose**: Creates the small shared status object used to watch the background writer task. It starts with no task handle and no recorded fatal error.
 
-**Data flow**: Allocates a `RolloutWriterTask` with `Mutex<Option<JoinHandle<()>>>` and `Mutex<Option<Arc<IoError>>>` both set to `None`; returns the new struct.
+**Data flow**: No outside data goes in. It builds empty lock-protected fields, then returns a fresh writer-task status object.
 
-**Call relations**: Called from `RolloutRecorder::new` before spawning the writer task so all recorder clones can later inspect task state.
+**Call relations**: RolloutRecorder::new creates this before spawning the background writer, so later recorder clones can see whether that writer has failed.
 
 *Call graph*: called by 1 (new); 1 external calls (new).
 
@@ -2484,11 +2490,11 @@ fn new() -> Self
 fn set_handle(&self, handle: JoinHandle<()>)
 ```
 
-**Purpose**: Stores the spawned Tokio task handle inside the shared writer-task state. This keeps ownership of the background task tied to the recorder lifecycle.
+**Purpose**: Stores the handle for the spawned background task. This keeps the task associated with the recorder for as long as recorder clones exist.
 
-**Data flow**: Takes a `JoinHandle<()>`, locks the internal `handle` mutex with poison recovery, and replaces the stored option with `Some(handle)`; returns no value.
+**Data flow**: It receives a task handle, locks the stored handle slot, and replaces the empty slot with that handle. It returns nothing and only changes this shared state.
 
-**Call relations**: Used only by `RolloutRecorder::new` immediately after spawning `rollout_writer`.
+**Call relations**: After RolloutRecorder::new spawns the writer task, it calls this to remember the task it just created.
 
 
 ##### `RolloutWriterTask::mark_failed`  (lines 137–143)
@@ -2497,11 +2503,11 @@ fn set_handle(&self, handle: JoinHandle<()>)
 fn mark_failed(&self, err: &IoError)
 ```
 
-**Purpose**: Records a terminal background-task failure so later API calls can surface a concrete `IoError` instead of a generic channel error. It clones the error into owned storage.
+**Purpose**: Records that the background writer stopped with a serious error. Future recorder calls can then report the real writer failure instead of a vague channel error.
 
-**Data flow**: Accepts an `&IoError`, locks `terminal_failure`, clones the error via `clone_io_error`, wraps it in `Arc`, and stores it as `Some(...)`.
+**Data flow**: It receives an input/output error, copies its kind and message, stores that copy in shared state, and returns nothing.
 
-**Call relations**: Called from the spawned task wrapper in `RolloutRecorder::new` only when `rollout_writer` itself exits with an error rather than reporting a recoverable command-level failure.
+**Call relations**: The spawned writer task calls this if rollout_writer returns a terminal error. It uses clone_io_error so the same error information can be reused later.
 
 *Call graph*: calls 1 internal fn (clone_io_error); 1 external calls (new).
 
@@ -2512,11 +2518,11 @@ fn mark_failed(&self, err: &IoError)
 fn terminal_failure(&self) -> Option<IoError>
 ```
 
-**Purpose**: Returns a fresh owned copy of the terminal writer-task error, if one has been recorded. This avoids exposing shared mutable state to callers.
+**Purpose**: Returns the stored fatal writer error, if one has happened. Recorder methods use this to give callers a meaningful error.
 
-**Data flow**: Locks `terminal_failure`, reads the optional `Arc<IoError>`, clones the underlying error with `clone_io_error`, and returns `Option<IoError>`.
+**Data flow**: It reads the shared error slot. If an error is present, it returns a fresh copy; otherwise it returns nothing.
 
-**Call relations**: Queried by recorder APIs when channel sends or oneshot waits fail, so they can prefer the real writer failure over a generic messaging error.
+**Call relations**: The public recorder methods consult this when sending to, or waiting on, the background writer fails.
 
 
 ##### `clone_io_error`  (lines 155–157)
@@ -2525,11 +2531,11 @@ fn terminal_failure(&self) -> Option<IoError>
 fn clone_io_error(err: &IoError) -> IoError
 ```
 
-**Purpose**: Creates a new `std::io::Error` with the same kind and message as another error. It is a small helper for storing and re-emitting I/O failures.
+**Purpose**: Makes a new input/output error with the same broad kind and text as another one. This is needed because standard I/O errors are not cheaply shareable by themselves.
 
-**Data flow**: Reads `err.kind()` and `err.to_string()`, constructs a new `IoError::new(kind, message)`, and returns it.
+**Data flow**: It reads the original error’s kind and message, then builds and returns a new error containing those details.
 
-**Call relations**: Used by `RolloutWriterTask::mark_failed` and `RolloutWriterTask::terminal_failure` to avoid sharing the original error object directly.
+**Call relations**: RolloutWriterTask::mark_failed uses this before storing an error for later API calls.
 
 *Call graph*: called by 1 (mark_failed); 3 external calls (kind, new, to_string).
 
@@ -2545,11 +2551,11 @@ fn new(
         thread_source: Option<ThreadSour
 ```
 
-**Purpose**: Builds `RolloutRecorderParams::Create` for a new session with no multi-agent version set. It packages the metadata needed to synthesize the initial `SessionMeta` line later.
+**Purpose**: Builds the settings for starting a brand-new recorded session. It gathers the session identity, parent or fork information, source details, base instructions, and available dynamic tools.
 
-**Data flow**: Consumes conversation/thread IDs, source info, base instructions, and dynamic tools; returns the `Create` enum variant with `multi_agent_version: None`.
+**Data flow**: Caller-supplied session details go in. The function packages them into a Create parameter value with no multi-agent version set yet.
 
-**Call relations**: Used by recorder creation call sites and tests as the standard constructor for new-session recording.
+**Call relations**: Session creation code and tests use this before calling RolloutRecorder::new.
 
 *Call graph*: called by 4 (find_locates_rollout_file_written_by_recorder, persist_reports_filesystem_error_and_retries_buffered_items, recorder_materializes_on_flush_with_pending_items, create_thread).
 
@@ -2563,11 +2569,11 @@ fn with_multi_agent_version(
     ) -> Self
 ```
 
-**Purpose**: Adds or replaces the `multi_agent_version` field on a `Create` parameter set while leaving `Resume` parameters unchanged. It supports fluent configuration.
+**Purpose**: Adds optional multi-agent version information to parameters for a new session. It leaves resume parameters unchanged.
 
-**Data flow**: Takes ownership of `self` and an `Option<MultiAgentVersion>`; if `self` is `Create`, mutates the embedded `multi_agent_version`; returns the updated enum value.
+**Data flow**: It receives existing parameters and an optional version. If the parameters describe a new session, it stores that version and returns the updated parameters.
 
-**Call relations**: Called by higher-level setup code that wants to enrich a create request before passing it to `RolloutRecorder::new`.
+**Call relations**: This is a builder-style step used before RolloutRecorder::new when multi-agent metadata should be written into the session record.
 
 
 ##### `RolloutRecorderParams::resume`  (lines 195–197)
@@ -2576,11 +2582,11 @@ fn with_multi_agent_version(
 fn resume(path: PathBuf) -> Self
 ```
 
-**Purpose**: Builds `RolloutRecorderParams::Resume` for reopening an existing rollout file. It is the constructor for resume-mode recorder creation.
+**Purpose**: Builds the settings for appending to an existing rollout file. Use this when continuing a saved session rather than creating a new one.
 
-**Data flow**: Consumes a `PathBuf` and returns `RolloutRecorderParams::Resume { path }`.
+**Data flow**: A file path goes in. The function returns a Resume parameter value containing that path.
 
-**Call relations**: Used by resume flows and tests that reopen an existing rollout rather than creating a deferred new one.
+**Call relations**: Resume flows pass this into RolloutRecorder::new so the recorder opens the existing rollout instead of choosing a new filename.
 
 *Call graph*: called by 2 (resume_materializes_compressed_rollout_path, resume_thread).
 
@@ -2596,11 +2602,11 @@ async fn list_threads(
         sort_key: ThreadSortKey,
 ```
 
-**Purpose**: Lists active threads using the normal filesystem-plus-state-DB repair strategy. It is the public entry point for non-archived thread listing.
+**Purpose**: Lists active saved sessions for display to a user. It supports paging, sorting, filtering by source, model provider, working directory, and search text.
 
-**Data flow**: Forwards all listing parameters plus `ThreadListArchiveFilter::Active` and `ThreadListRepairMode::ScanAndRepair` into `list_threads_with_db_fallback`; returns the resulting `ThreadsPage`.
+**Data flow**: It receives configuration, optional database access, paging and filter choices. It forwards those choices to the shared listing routine and returns a page of thread summaries.
 
-**Call relations**: Called by UI/API listing code and many tests. It is the standard active-thread listing path that may scan files and repair SQLite rows.
+**Call relations**: User-facing thread list code and tests call this. It delegates the real database-versus-filesystem decision to RolloutRecorder::list_threads_with_db_fallback.
 
 *Call graph*: called by 9 (thread_list_respects_search_term_filter, list_threads_db_disabled_does_not_skip_paginated_items, list_threads_db_enabled_drops_missing_rollout_paths, list_threads_db_enabled_repairs_stale_rollout_paths, list_threads_default_filter_returns_filesystem_scan_results, list_threads_metadata_filter_overlays_state_db_list_metadata, list_threads_search_repairs_stale_state_db_hits_before_returning, list_threads_state_db_only_skips_jsonl_repair_scan, list_rollout_threads); 1 external calls (list_threads_with_db_fallback).
 
@@ -2616,11 +2622,11 @@ async fn list_threads_from_state_db(
         sort_key:
 ```
 
-**Purpose**: Lists active threads strictly from the state DB without filesystem repair scanning. It exposes the DB-only view for callers that want speed or to test stale-row behavior.
+**Purpose**: Lists active saved sessions using only the state database path. This avoids scanning rollout JSON files for repair.
 
-**Data flow**: Passes the caller’s filters into `list_threads_with_db_fallback` with `Active` archive mode and `StateDbOnly` repair mode; returns a `ThreadsPage` converted from DB rows or defaulted on DB failure.
+**Data flow**: It receives the same listing inputs as list_threads, but asks the shared routine to use database-only repair mode. It returns a page, or an empty/default page if the database path cannot answer.
 
-**Call relations**: Used by tests and callers that explicitly want to skip JSONL reconciliation and observe the current SQLite contents.
+**Call relations**: Thread-list endpoints use this when they explicitly want the state database view. The common work still happens in RolloutRecorder::list_threads_with_db_fallback.
 
 *Call graph*: called by 4 (list_threads_default_filter_returns_filesystem_scan_results, list_threads_search_repairs_stale_state_db_hits_before_returning, list_threads_state_db_only_skips_jsonl_repair_scan, list_rollout_threads); 1 external calls (list_threads_with_db_fallback).
 
@@ -2636,11 +2642,11 @@ async fn list_archived_threads(
         sort_key: Threa
 ```
 
-**Purpose**: Lists archived threads using the normal scan-and-repair strategy. It is the archived analogue of `list_threads`.
+**Purpose**: Lists archived saved sessions instead of active ones. Archived sessions live in a separate directory.
 
-**Data flow**: Delegates to `list_threads_with_db_fallback` with `ThreadListArchiveFilter::Archived` and `ScanAndRepair`, preserving all other filters and pagination inputs.
+**Data flow**: It receives paging, sorting, and filter inputs, marks the request as archived, and returns a page of archived thread summaries.
 
-**Call relations**: Called by archived-thread listing flows; it differs from active listing only in the root directory and archived flag passed downstream.
+**Call relations**: The rollout thread listing flow calls this for archived views, while the shared listing routine handles repair and fallback.
 
 *Call graph*: called by 1 (list_rollout_threads); 1 external calls (list_threads_with_db_fallback).
 
@@ -2656,11 +2662,11 @@ async fn list_archived_threads_from_state_db(
         s
 ```
 
-**Purpose**: Lists archived threads from SQLite only, without filesystem repair. It is the archived analogue of `list_threads_from_state_db`.
+**Purpose**: Lists archived sessions from the state database without scanning files for repair. This is the database-only version of archived listing.
 
-**Data flow**: Forwards arguments into `list_threads_with_db_fallback` with `Archived` archive mode and `StateDbOnly` repair mode; returns the resulting page.
+**Data flow**: It passes the listing inputs to the shared routine with archived and state-database-only flags, then returns the resulting page.
 
-**Call relations**: Used where callers want archived rows exactly as represented in the state DB.
+**Call relations**: Archive list callers use this when they want the database result directly. The deeper work is still centralized in RolloutRecorder::list_threads_with_db_fallback.
 
 *Call graph*: called by 1 (list_rollout_threads); 1 external calls (list_threads_with_db_fallback).
 
@@ -2676,11 +2682,11 @@ async fn list_threads_with_db_fallback(
         sort_ke
 ```
 
-**Purpose**: Implements the full listing strategy that chooses between filesystem scans, SQLite pages, metadata overlay, and reconciliation. It is the central dispatcher for all thread-list variants.
+**Purpose**: Chooses the safest way to list sessions: prefer the state database, scan rollout files when needed, and repair stale database rows when possible. This keeps the session list useful even if the database is missing or out of date.
 
-**Data flow**: Reads `codex_home` from config, derives the archived flag, short-circuits empty cwd-filter slices, optionally performs DB-only listing, otherwise scans the filesystem ascending or descending, returns filesystem results directly when no DB exists, warms/repairs the DB for filesystem hits, queries SQLite, optionally fully reconciles search hits or DB-only metadata-filter hits, overlays missing metadata from state DB onto filesystem items, records fallback telemetry, and returns either a DB-backed or filesystem-backed `ThreadsPage`.
+**Data flow**: Listing options go in. It may scan JSONL files, query the database, reconcile mismatches, overlay missing metadata, and then returns a ThreadsPage with items and a next-page cursor.
 
-**Call relations**: All four public list methods funnel through this function. It delegates scanning to `list_threads_from_files_asc`/`desc`, DB access to `state_db::list_threads_db`, lightweight repair to `read_repair_rollout_path`, full repair to `reconcile_rollout`, and metadata enrichment to `fill_missing_thread_item_metadata_from_state_db`.
+**Call relations**: All active and archived listing entry points call this. It hands off file scanning to list_threads_from_files_asc or list_threads_from_files_desc, database work to state_db helpers, and metadata filling to fill_missing_thread_item_metadata_from_state_db.
 
 *Call graph*: calls 7 internal fn (fill_missing_thread_item_metadata_from_state_db, list_threads_from_files_asc, list_threads_from_files_desc, page_from_filesystem_scan, list_threads_db, read_repair_rollout_path, reconcile_rollout); 7 external calls (is_empty, record_fallback, matches!, codex_home, default, error!, warn!).
 
@@ -2696,11 +2702,11 @@ async fn find_latest_thread_path(
         sort_key: Thr
 ```
 
-**Purpose**: Finds the newest resumable rollout path, optionally constrained to a matching cwd. It prefers state DB pages when available but falls back to filesystem scans when necessary.
+**Purpose**: Finds the newest saved session that can be resumed, optionally only if it belongs to a given working directory. This is used for “resume last conversation” behavior.
 
-**Data flow**: Reads `codex_home`, wraps `filter_cwd` into an optional single-element cwd filter, iterates descending DB pages via `state_db::list_threads_db` when possible, selecting a path with `select_resume_path_from_db_page`; on DB failure or exhaustion records fallback telemetry and then iterates filesystem pages from `get_threads`, selecting with `select_resume_path`; returns `Ok(Some(path))` or `Ok(None)`.
+**Data flow**: It receives config, optional database access, filters, and an optional target directory. It searches database pages first, then filesystem pages if needed, and returns the chosen rollout path or nothing.
 
-**Call relations**: Used by resume flows to locate the best candidate session. It delegates cwd-sensitive candidate validation to `select_resume_path` and `select_resume_path_from_db_page`.
+**Call relations**: Resume code calls this before opening a session. It asks select_resume_path_from_db_page or select_resume_path to pick a valid candidate from each page.
 
 *Call graph*: calls 4 internal fn (get_threads, select_resume_path, select_resume_path_from_db_page, list_threads_db); 2 external calls (record_fallback, codex_home).
 
@@ -2714,11 +2720,11 @@ async fn new(
     ) -> std::io::Result<Self>
 ```
 
-**Purpose**: Creates a recorder for either a new deferred rollout or an existing resumed rollout, then spawns the background writer task. It prepares initial session metadata and the writer communication channel.
+**Purpose**: Creates a recorder for either a new session or a resumed one. It sets up the rollout path, optional first metadata record, and a background task that performs disk writes.
 
-**Data flow**: Matches on `RolloutRecorderParams`: for `Create`, computes a dated rollout path with `precompute_log_file_info`, formats a session timestamp, builds a `SessionMeta` from config and parameters, and leaves file creation deferred; for `Resume`, materializes compressed paths and opens the file in append mode immediately. It then clones cwd, creates an `mpsc` channel, allocates `RolloutWriterTask`, spawns `rollout_writer`, stores the handle, and returns `RolloutRecorder { tx, writer_task, rollout_path }`.
+**Data flow**: Configuration and create/resume parameters go in. For new sessions it precomputes a file path and metadata; for resumed sessions it opens the existing file. It returns a RolloutRecorder with a command channel to the writer task.
 
-**Call relations**: This is the constructor used by create/resume session flows. It delegates path generation to `precompute_log_file_info`, resume materialization to compression helpers, and all actual writing to the spawned `rollout_writer` task.
+**Call relations**: Session creation and resume flows call this. It prepares data with precompute_log_file_info or compression helpers, spawns rollout_writer, and stores task status in RolloutWriterTask.
 
 *Call graph*: calls 5 internal fn (originator, materialize_rollout_for_append, new, precompute_log_file_info, rollout_writer); called by 6 (find_locates_rollout_file_written_by_recorder, resume_materializes_compressed_rollout_path, persist_reports_filesystem_error_and_retries_buffered_items, recorder_materializes_on_flush_with_pending_items, create_thread, resume_thread); 10 external calls (clone, new, env!, error!, format_description!, cwd, generate_memories, model_provider_id, new, spawn).
 
@@ -2729,11 +2735,11 @@ async fn new(
 fn rollout_path(&self) -> &Path
 ```
 
-**Purpose**: Returns the recorder’s canonical rollout path. It exposes the path chosen at creation or resume time without materializing or touching the file.
+**Purpose**: Returns the path where this recorder writes its rollout file. Callers use it when they need to show, index, or later reopen the saved session.
 
-**Data flow**: Borrows `self.rollout_path`, converts it to `&Path`, and returns that reference.
+**Data flow**: It reads the recorder’s stored path and returns it as a borrowed path reference. Nothing is changed.
 
-**Call relations**: Used by callers and tests that need to inspect where the recorder will write.
+**Call relations**: This is a simple accessor used by code that already has a recorder and needs to know where its session is being saved.
 
 *Call graph*: 1 external calls (as_path).
 
@@ -2744,11 +2750,11 @@ fn rollout_path(&self) -> &Path
 async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result<()>
 ```
 
-**Purpose**: Queues already-filtered rollout items for asynchronous writing. It is a non-blocking enqueue operation unless the bounded channel is full.
+**Purpose**: Queues one or more session records to be written in order. These are the official history items that make later replay possible.
 
-**Data flow**: Accepts a slice of `RolloutItem`; returns immediately on empty input; otherwise clones the slice into a `Vec`, sends `RolloutCmd::AddItems` over the channel, and maps send failures to either the stored terminal writer error or a generic queueing error.
+**Data flow**: A slice of rollout items goes in. Empty input is ignored; otherwise the items are copied into a command and sent to the background writer. The result says whether queuing succeeded.
 
-**Call relations**: Called by live session code after persistence policy has already selected canonical items. The background `rollout_writer` later consumes the queued `AddItems` command.
+**Call relations**: Live session code calls this as the conversation progresses. The background rollout_writer receives the AddItems command and appends the items to its pending queue.
 
 *Call graph*: 4 external calls (send, is_empty, to_vec, AddItems).
 
@@ -2759,11 +2765,11 @@ async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result
 async fn persist(&self) -> std::io::Result<()>
 ```
 
-**Purpose**: Forces rollout materialization and persistence of all buffered items, retrying through the writer state if needed. It is idempotent once the file exists and the buffer is empty.
+**Purpose**: Forces a new deferred rollout to be materialized on disk and writes all buffered records. It is safe to call more than once.
 
-**Data flow**: Creates a oneshot channel, sends `RolloutCmd::Persist { ack }`, waits for the ack result, and maps channel/await failures to the terminal writer error when available; returns `std::io::Result<()>`.
+**Data flow**: No item data goes in directly. It sends a Persist command with a one-time reply channel, waits for the writer’s answer, and returns success or the write error.
 
-**Call relations**: Used by callers that want an explicit durability barrier. The actual work is performed inside `RolloutWriterState::persist` in the background task.
+**Call relations**: Callers use this when a session must definitely exist on disk. rollout_writer receives the command and asks RolloutWriterState::persist to do the actual work.
 
 *Call graph*: 2 external calls (send, channel).
 
@@ -2774,11 +2780,11 @@ async fn persist(&self) -> std::io::Result<()>
 async fn flush(&self) -> std::io::Result<()>
 ```
 
-**Purpose**: Waits until all queued writes have been processed and flushed by the writer task. It is the stronger synchronization point for callers that need ordering guarantees.
+**Purpose**: Waits until all queued rollout records have been written and flushed to disk. This gives callers a durability checkpoint.
 
-**Data flow**: Creates a oneshot channel, sends `RolloutCmd::Flush { ack }`, awaits the response, and returns the writer’s `std::io::Result<()>`, preferring any stored terminal failure on messaging errors.
+**Data flow**: It sends a Flush command to the writer and waits on a one-time reply. The output is success, or an error if writing and retrying failed.
 
-**Call relations**: Called by code and tests that need to ensure buffered items are committed. It maps directly to `RolloutWriterState::flush` in the background task.
+**Call relations**: Session code calls this before important transitions or shutdown. rollout_writer passes the request to RolloutWriterState::flush.
 
 *Call graph*: 2 external calls (send, channel).
 
@@ -2791,11 +2797,11 @@ async fn load_rollout_items(
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)>
 ```
 
-**Purpose**: Reads a rollout JSONL file into `RolloutItem`s while tolerating malformed lines and filtering legacy ghost-snapshot artifacts. It also extracts the first session thread ID and counts parse errors.
+**Purpose**: Reads a rollout file back into memory as session history. It tolerates bad lines by counting them and skips a known old “ghost snapshot” record shape.
 
-**Data flow**: Opens a line reader through `compression::open_rollout_line_reader`, skips blank lines, parses each line as `serde_json::Value`, drops legacy ghost-snapshot response items or prunes them from compacted history via `strip_legacy_ghost_snapshot_rollout_line`, attempts to deserialize `RolloutLine`, records the first `SessionMeta.meta.id` as `thread_id`, pushes surviving items, increments `parse_errors` on JSON/line parse failures, errors if the file had no non-empty lines, and returns `(Vec<RolloutItem>, Option<ThreadId>, usize)`.
+**Data flow**: A rollout path goes in. The function opens a line reader, parses each non-empty JSON line into a RolloutItem, remembers the first session ID, counts parse errors, and returns the items, thread ID, and error count.
 
-**Call relations**: This is the canonical rollout loader used by metadata extraction, history replay, resume-cwd matching, and many tests. It delegates legacy cleanup to `strip_legacy_ghost_snapshot_rollout_line`.
+**Call relations**: Resume, metadata extraction, tests, and cwd matching use this. It relies on compression readers and strip_legacy_ghost_snapshot_rollout_line before parsing each line.
 
 *Call graph*: calls 2 internal fn (open_rollout_line_reader, strip_legacy_ghost_snapshot_rollout_line); called by 13 (thread_id_from_rollout, sample, append_rollout_item_materializes_compressed_rollout, load_rollout_items_reads_compressed_rollout, resume_materializes_compressed_rollout_path, worker_skips_existing_compressed_archived_rollouts, extract_metadata_from_rollout, resume_candidate_matches_cwd, load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_history, load_rollout_items_preserves_legacy_guardian_assessment_lines (+3 more)); 6 external calls (new, other, from_str, trace!, debug!, warn!).
 
@@ -2806,11 +2812,11 @@ async fn load_rollout_items(
 async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory>
 ```
 
-**Purpose**: Converts a rollout file into `InitialHistory`, either `New` for empty item lists or `Resumed` with conversation ID and history. It is the replay-oriented wrapper around `load_rollout_items`.
+**Purpose**: Turns a saved rollout file into the initial history object used when resuming a session. It also reports an error if the file does not contain a session ID.
 
-**Data flow**: Loads items and optional thread ID from disk; errors if no thread ID can be parsed; returns `InitialHistory::New` when the item list is empty, otherwise returns `InitialHistory::Resumed` containing the conversation ID, full history, and plain rollout path.
+**Data flow**: A path goes in. It loads rollout items, extracts the conversation ID, and returns InitialHistory::Resumed with the items and plain rollout path; an empty item list becomes InitialHistory::New.
 
-**Call relations**: Used by thread resume/replay codepaths that need protocol-level history rather than raw items plus parse-error counts.
+**Call relations**: Thread resume and history-related tests call this. It is a thin resume-focused wrapper around RolloutRecorder::load_rollout_items.
 
 *Call graph*: called by 10 (thread_inject_items_adds_raw_response_items_to_thread_history, record_context_updates_and_set_reference_context_item_persists_baseline_without_emitting_diffs, record_context_updates_and_set_reference_context_item_persists_full_reinjection_to_rollout, record_context_updates_and_set_reference_context_item_persists_split_file_system_policy_to_rollout, thread_rollback_drops_last_turn_from_history, thread_rollback_persists_marker_and_replays_cumulatively, interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_history, interrupted_fork_snapshot_preserves_explicit_turn_id, interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_source, resume_materializes_compressed_rollout_path); 4 external calls (load_rollout_items, plain_rollout_path, info!, Resumed).
 
@@ -2821,11 +2827,11 @@ async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory>
 async fn shutdown(&self) -> std::io::Result<()>
 ```
 
-**Purpose**: Requests the writer task to drain pending items and stop. If draining fails, it returns the error and leaves the writer alive for future retries.
+**Purpose**: Asks the background writer to drain pending records and then stop. If draining fails, the writer is kept alive so another retry can happen.
 
-**Data flow**: Creates a oneshot channel, sends `RolloutCmd::Shutdown { ack }`, awaits the ack, and maps send/wait failures to either the stored terminal writer error or a generic shutdown error; returns `std::io::Result<()>`.
+**Data flow**: It sends a Shutdown command with a reply channel. On success it returns after the writer has flushed and exited; on failure it returns the writer or channel error.
 
-**Call relations**: Called during session teardown. The background task only exits after `RolloutWriterState::shutdown` succeeds.
+**Call relations**: Session teardown calls this. rollout_writer handles the command by calling RolloutWriterState::shutdown and only breaks its loop after success.
 
 *Call graph*: 5 external calls (send, other, format!, channel, warn!).
 
@@ -2836,11 +2842,11 @@ async fn shutdown(&self) -> std::io::Result<()>
 fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool
 ```
 
-**Purpose**: Removes obsolete `ghost_snapshot` response items from legacy rollout data before typed deserialization. It can either drop an entire response-item line or prune entries from compacted replacement history.
+**Purpose**: Removes or skips an old rollout record type that current code no longer wants to load. This keeps older session files from breaking resume.
 
-**Data flow**: Mutably inspects a JSON `Value`; if it is a `response_item` whose payload matches `is_legacy_ghost_snapshot_response_item`, returns `true` to signal the whole line should be skipped; if it is a `compacted` payload with `replacement_history`, removes ghost-snapshot entries in place and returns `false`; otherwise returns `false` unchanged.
+**Data flow**: A mutable JSON value goes in. If it is a standalone legacy ghost snapshot, the function reports that the whole line should be skipped; if it is inside compacted history, it removes those entries in place.
 
-**Call relations**: Called by `RolloutRecorder::load_rollout_items` on each parsed JSON value before deserializing into `RolloutLine`.
+**Call relations**: RolloutRecorder::load_rollout_items calls this before converting raw JSON into modern RolloutLine data.
 
 *Call graph*: called by 1 (load_rollout_items); 2 external calls (get, get_mut).
 
@@ -2851,11 +2857,11 @@ fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool
 fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool
 ```
 
-**Purpose**: Recognizes the legacy response-item payload shape for `ghost_snapshot`. It is a tiny predicate over raw JSON values.
+**Purpose**: Recognizes the old ghost snapshot response item shape. It exists so both standalone and nested legacy records can be detected the same way.
 
-**Data flow**: Reads the `type` field from a `serde_json::Value` and returns `true` only when it equals `"ghost_snapshot"`.
+**Data flow**: A JSON value goes in. The function checks its type field and returns true only for ghost_snapshot.
 
-**Call relations**: Used exclusively by `strip_legacy_ghost_snapshot_rollout_line`.
+**Call relations**: strip_legacy_ghost_snapshot_rollout_line uses this when deciding what to skip or remove.
 
 *Call graph*: 1 external calls (get).
 
@@ -2870,11 +2876,11 @@ fn truncate_fs_page(
 ) -> ThreadsPage
 ```
 
-**Purpose**: Truncates an overfetched filesystem page to the requested size and computes the next cursor from the last retained item. It is used to make descending filesystem scans paginate correctly.
+**Purpose**: Cuts a filesystem-scanned page down to the requested size and builds the cursor for the next page. This is needed because descending scans may intentionally fetch extra rows.
 
-**Data flow**: Takes a mutable `ThreadsPage`, requested `page_size`, and `ThreadSortKey`; if the page is already small enough returns it unchanged, otherwise truncates `items`, derives a cursor token from the last item’s filename timestamp or `updated_at`, parses that token into a `Cursor`, stores it as `next_cursor`, and returns the page.
+**Data flow**: A page, size, and sort key go in. If the page is too long, it removes items after the limit and sets the next cursor from the last remaining item.
 
-**Call relations**: Called by `page_from_filesystem_scan` when descending scans intentionally overfetch.
+**Call relations**: page_from_filesystem_scan calls this when adapting filesystem results for descending sort order.
 
 *Call graph*: called by 1 (page_from_filesystem_scan).
 
@@ -2890,11 +2896,11 @@ fn page_from_filesystem_scan(
 ) -> ThreadsPage
 ```
 
-**Purpose**: Normalizes a filesystem scan result into the page shape expected by callers, truncating only for descending order. Ascending scans already produce the final page directly.
+**Purpose**: Normalizes a page returned by filesystem scanning. Ascending scans are already the requested size; descending scans may need trimming.
 
-**Data flow**: Accepts a `ThreadsPage`, sort direction, page size, and sort key; returns the page unchanged for ascending order or passes it to `truncate_fs_page` for descending order.
+**Data flow**: A scanned page plus sort settings go in. It returns the page unchanged for ascending order or a truncated page for descending order.
 
-**Call relations**: Used by `list_threads_with_db_fallback` whenever it returns filesystem-backed results.
+**Call relations**: RolloutRecorder::list_threads_with_db_fallback uses this whenever it must return filesystem results instead of a database page.
 
 *Call graph*: calls 1 internal fn (truncate_fs_page); called by 1 (list_threads_with_db_fallback).
 
@@ -2908,11 +2914,11 @@ async fn fill_missing_thread_item_metadata_from_state_db(
 ) -> ThreadsPage
 ```
 
-**Purpose**: Overlays missing metadata fields on filesystem-derived `ThreadItem`s using authoritative state-DB rows. It enriches fallback pages without replacing filesystem identity.
+**Purpose**: Improves filesystem-scanned thread summaries with metadata from the state database. This gives file fallback results richer titles, previews, model information, and timestamps when available.
 
-**Data flow**: If no `StateRuntime` is provided, returns the page unchanged; otherwise iterates mutable page items, skips entries without `thread_id`, fetches metadata with `get_thread`, converts successful rows via `thread_item_from_state_metadata`, and merges them into each item with `fill_missing_thread_item_metadata`; returns the updated page.
+**Data flow**: An optional database runtime and a page go in. For each item with a thread ID, it fetches stored metadata and fills only missing or better fields, then returns the updated page.
 
-**Call relations**: Called by `list_threads_with_db_fallback` when filesystem results are returned for metadata-filtered listings or DB-error fallbacks.
+**Call relations**: RolloutRecorder::list_threads_with_db_fallback calls this when returning filesystem-backed filtered results.
 
 *Call graph*: calls 2 internal fn (fill_missing_thread_item_metadata, thread_item_from_state_metadata); called by 1 (list_threads_with_db_fallback); 1 external calls (warn!).
 
@@ -2923,11 +2929,11 @@ async fn fill_missing_thread_item_metadata_from_state_db(
 fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadItem)
 ```
 
-**Purpose**: Merges a state-derived `ThreadItem` into a filesystem-derived one while preserving filesystem path/thread identity and preferring state git fields. It fills only absent fields except for git metadata, which state values overwrite when present.
+**Purpose**: Copies useful metadata from a database-backed thread item into a filesystem-backed thread item without overwriting fields that are already present, except for git details where newer values replace blanks.
 
-**Data flow**: Consumes `&mut ThreadItem` plus a second `ThreadItem`; destructures the state item, ignores its path and thread ID, copies first-user-message/preview/cwd/source/agent/provider/version/timestamps only when the filesystem item lacks them, and unconditionally replaces git branch/SHA/origin when the state item has values.
+**Data flow**: A mutable thread item and a state-derived thread item go in. Missing fields such as preview, cwd, source, agent role, provider, and times are filled in place.
 
-**Call relations**: Used by `fill_missing_thread_item_metadata_from_state_db` as the field-level merge primitive.
+**Call relations**: fill_missing_thread_item_metadata_from_state_db calls this after converting database metadata into the same ThreadItem shape.
 
 *Call graph*: called by 1 (fill_missing_thread_item_metadata_from_state_db).
 
@@ -2944,11 +2950,11 @@ async fn list_threads_from_files_desc(
     model_providers
 ```
 
-**Purpose**: Performs descending filesystem thread listing, with optional title search that may scan multiple pages to accumulate enough matches. It is the descending-order file-backed listing engine.
+**Purpose**: Lists rollout files from newest to oldest, with optional title search support. Search requires scanning extra pages because matching is done after the basic file listing.
 
-**Data flow**: If `search_term` is present, repeatedly calls `list_threads_from_files_desc_unfiltered` with an expanded scan page size, accumulates scanned-file counts and items, filters each page by title via `filter_thread_items_by_search_term`, truncates matches to `page_size`, and computes `next_cursor` from the last retained item when more matches may exist; without search, simply delegates to the unfiltered helper.
+**Data flow**: Directory, paging, sorting, filter, archive, and search inputs go in. It gathers file-backed thread items, optionally filters by search term, trims to page size, and returns a ThreadsPage.
 
-**Call relations**: Called by `list_threads_with_db_fallback` for descending scans and by `list_threads_from_files_asc` as its underlying source of all items.
+**Call relations**: RolloutRecorder::list_threads_with_db_fallback uses this for descending file fallback. list_threads_from_files_asc also uses it as a building block.
 
 *Call graph*: calls 2 internal fn (filter_thread_items_by_search_term, list_threads_from_files_desc_unfiltered); called by 2 (list_threads_with_db_fallback, list_threads_from_files_asc); 1 external calls (new).
 
@@ -2965,11 +2971,11 @@ async fn list_threads_from_files_desc_unfiltered(
     mode
 ```
 
-**Purpose**: Lists rollout files from the filesystem in descending order without title-search post-filtering. It chooses between active and archived roots.
+**Purpose**: Performs the basic newest-first file scan without search filtering. It knows whether to read active sessions or archived sessions.
 
-**Data flow**: If `archived` is true, joins `codex_home` with `ARCHIVED_SESSIONS_SUBDIR` and calls `get_threads_in_root` with a flat layout config; otherwise calls `get_threads` on `codex_home`; returns the resulting `ThreadsPage`.
+**Data flow**: Codex home, paging, sort, filters, and archive flag go in. It calls the appropriate lower-level scanner and returns the page it finds.
 
-**Call relations**: Used by `list_threads_from_files_desc` as the raw filesystem listing primitive.
+**Call relations**: list_threads_from_files_desc calls this before any search-term filtering is applied.
 
 *Call graph*: calls 2 internal fn (get_threads, get_threads_in_root); called by 1 (list_threads_from_files_desc); 1 external calls (join).
 
@@ -2986,11 +2992,11 @@ async fn list_threads_from_files_asc(
     model_providers:
 ```
 
-**Purpose**: Builds ascending filesystem listings by scanning descending pages, collecting all items, sorting them ascending, and then applying cursor/page truncation. This avoids needing a separate ascending filesystem walker.
+**Purpose**: Lists rollout files from oldest to newest. Because the lower-level file scanner is newest-first, it gathers results, sorts them, and then applies the ascending cursor.
 
-**Data flow**: Repeatedly calls `list_threads_from_files_desc` with no search term and an expanded scan size until exhaustion, accumulates items and scan stats, optionally filters by title search, computes sortable keys with `thread_item_sort_key`, sorts ascending, applies the caller cursor by retaining items with keys after the anchor, truncates to `page_size`, computes `next_cursor` from the last retained item when more matches remain, and returns a `ThreadsPage`.
+**Data flow**: Listing settings go in. It repeatedly scans descending pages, optionally filters by search term, sorts all found items by the requested time key, applies the cursor, and returns one ascending page.
 
-**Call relations**: Called by `list_threads_with_db_fallback` for ascending listings. It reuses descending scans and local sorting rather than duplicating traversal logic.
+**Call relations**: RolloutRecorder::list_threads_with_db_fallback calls this when the requested sort direction is ascending.
 
 *Call graph*: calls 2 internal fn (filter_thread_items_by_search_term, list_threads_from_files_desc); called by 1 (list_threads_with_db_fallback); 1 external calls (new).
 
@@ -3005,11 +3011,11 @@ async fn filter_thread_items_by_search_term(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Filters thread items by title substring using the sidecar session index rather than rollout contents. This keeps filesystem fallback search behavior aligned with SQLite title filtering.
+**Purpose**: Filters file-backed thread summaries by title. The file scan itself only has thread IDs, so this looks titles up in the sidecar session index.
 
-**Data flow**: If `search_term` is absent, returns immediately; otherwise collects thread IDs from the items into a `HashSet`, loads names with `find_thread_names_by_ids`, and retains only items whose thread ID maps to a title containing the search term.
+**Data flow**: Codex home, a mutable item list, and an optional search term go in. If there is a search term, it loads names for the listed thread IDs and removes items whose title does not contain the term.
 
-**Call relations**: Used by both ascending and descending filesystem listing helpers when a title search is requested.
+**Call relations**: Both ascending and descending file-listing helpers call this so filesystem fallback behaves like database search.
 
 *Call graph*: calls 1 internal fn (find_thread_names_by_ids); called by 2 (list_threads_from_files_asc, list_threads_from_files_desc).
 
@@ -3023,11 +3029,11 @@ fn thread_item_sort_key(
 ) -> Option<(OffsetDateTime, uuid::Uuid)>
 ```
 
-**Purpose**: Computes the sortable `(timestamp, uuid)` key for a `ThreadItem` based on either filename creation time or metadata update time. It underpins cursor generation and ascending sorting.
+**Purpose**: Computes the timestamp used to sort a thread item, plus the UUID from its filename as a tie-breaker. This gives stable ordering for file-backed pages.
 
-**Data flow**: Reads the rollout filename from `item.path`, parses `(created_at, id)` with `parse_timestamp_uuid_from_filename`, chooses `created_at` or parses `item.updated_at`/`created_at` as RFC3339 depending on `ThreadSortKey`, and returns `Option<(OffsetDateTime, uuid::Uuid)>`.
+**Data flow**: A thread item and sort key go in. It reads the rollout filename and, for updated-at sorting, the item timestamps, then returns a sortable pair or nothing if required data is missing.
 
-**Call relations**: Called by `cursor_from_thread_item` and by `list_threads_from_files_asc` when sorting and applying cursors.
+**Call relations**: cursor_from_thread_item uses this to build page cursors, and ascending listing uses the same idea when sorting collected items.
 
 *Call graph*: calls 1 internal fn (parse_timestamp_uuid_from_filename); called by 1 (cursor_from_thread_item); 1 external calls (parse).
 
@@ -3038,11 +3044,11 @@ fn thread_item_sort_key(
 fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option<Cursor>
 ```
 
-**Purpose**: Builds a pagination cursor from a thread item’s sort key. It serializes the timestamp portion into the cursor token format expected by listing APIs.
+**Purpose**: Builds a pagination cursor from a thread item. A cursor is the marker that says where the next page should continue.
 
-**Data flow**: Calls `thread_item_sort_key`, formats the timestamp as RFC3339, parses that string with `parse_cursor`, and returns `Option<Cursor>`.
+**Data flow**: A thread item and sort key go in. It gets the item’s sort timestamp, formats it, parses it into a Cursor, and returns that cursor if all steps work.
 
-**Call relations**: Used by filesystem listing helpers to produce `next_cursor` values after truncation.
+**Call relations**: File-listing helpers use this when they need to report that more matching results may be available.
 
 *Call graph*: calls 2 internal fn (parse_cursor, thread_item_sort_key).
 
@@ -3056,11 +3062,11 @@ fn precompute_log_file_info(
 ) -> std::io::Result<LogFileInfo>
 ```
 
-**Purpose**: Chooses the dated rollout path and start timestamp for a newly created session. It embeds the conversation ID into the filename and nests files under year/month/day directories.
+**Purpose**: Chooses the rollout filename and directory for a new session before the file is actually created. The path includes the date and conversation ID.
 
-**Data flow**: Reads local time with `OffsetDateTime::now_local`, builds `codex_home/sessions/YYYY/MM/DD`, formats a filename-safe timestamp `YYYY-MM-DDThh-mm-ss`, constructs `rollout-{date_str}-{conversation_id}.jsonl`, joins it into a full path, and returns `LogFileInfo { path, conversation_id, timestamp }`.
+**Data flow**: Configuration and a conversation ID go in. It reads the current local time, builds a dated sessions path, formats a rollout filename, and returns the path, ID, and timestamp.
 
-**Call relations**: Called by `RolloutRecorder::new` for `Create` mode before the writer task is spawned.
+**Call relations**: RolloutRecorder::new calls this for newly created sessions so metadata and the future file path are ready up front.
 
 *Call graph*: called by 1 (new); 4 external calls (now_local, format!, format_description!, codex_home).
 
@@ -3071,11 +3077,11 @@ fn precompute_log_file_info(
 fn open_log_file(path: &Path) -> std::io::Result<File>
 ```
 
-**Purpose**: Materializes a rollout path for append, ensures its parent directory exists, and opens it in append/create mode using blocking std I/O. It is the low-level file opener used by the writer state.
+**Purpose**: Opens a rollout file for appending, creating its parent directories if needed. It also materializes a compressed rollout into an appendable plain file when necessary.
 
-**Data flow**: Materializes compressed/plain path variants via `compression::materialize_rollout_for_append_blocking`, checks for a parent directory, creates that directory tree, opens the file with append/create options, and returns `std::fs::File` or an `IoError`.
+**Data flow**: A path goes in. The function prepares the path, creates missing directories, opens the file in append/create mode, and returns the standard file handle.
 
-**Call relations**: Called by `RolloutWriterState::ensure_writer_open` whenever deferred or recovered writing needs a fresh file handle.
+**Call relations**: RolloutWriterState::ensure_writer_open calls this whenever deferred creation or recovery needs a usable file handle.
 
 *Call graph*: calls 1 internal fn (materialize_rollout_for_append_blocking); called by 1 (ensure_writer_open); 5 external calls (parent, other, format!, create_dir_all, new).
 
@@ -3092,11 +3098,11 @@ fn new(
     ) -> Sel
 ```
 
-**Purpose**: Constructs the mutable state owned by the background writer loop. It captures the optional open writer, deferred path info, pending queue, session metadata, cwd, and error-suppression state.
+**Purpose**: Creates the mutable state owned by the background writer task. This state holds the open file, buffered records, first metadata record, and recovery bookkeeping.
 
-**Data flow**: Wraps an optional `tokio::fs::File` into `JsonlWriter`, stores deferred log info, initializes `pending_items` empty, stores optional `SessionMeta`, cwd, rollout path, and `last_logged_error: None`; returns the new state struct.
+**Data flow**: Optional file, optional deferred file info, metadata, cwd, and rollout path go in. It wraps an existing file in a JsonlWriter if present and initializes an empty pending queue.
 
-**Call relations**: Created by `rollout_writer` at task startup and directly by a retry-focused test.
+**Call relations**: rollout_writer creates this when its task starts, and tests can construct it directly for retry behavior.
 
 *Call graph*: called by 2 (rollout_writer, writer_state_retries_write_error_before_reporting_flush_success); 1 external calls (new).
 
@@ -3107,11 +3113,11 @@ fn new(
 fn add_items(&mut self, items: Vec<RolloutItem>)
 ```
 
-**Purpose**: Appends newly queued rollout items to the in-memory pending buffer. It does not write immediately by itself.
+**Purpose**: Adds newly queued rollout records to the writer’s in-memory pending queue. They stay there until a successful write removes them.
 
-**Data flow**: Consumes a `Vec<RolloutItem>` and extends `self.pending_items` with it; returns no value.
+**Data flow**: A vector of rollout items goes in. The function appends them to pending_items and returns nothing.
 
-**Call relations**: Called by `rollout_writer` when it receives `RolloutCmd::AddItems`.
+**Call relations**: rollout_writer calls this after receiving an AddItems command from RolloutRecorder::record_canonical_items.
 
 
 ##### `RolloutWriterState::flush_if_materialized`  (lines 1438–1445)
@@ -3120,11 +3126,11 @@ fn add_items(&mut self, items: Vec<RolloutItem>)
 async fn flush_if_materialized(&mut self)
 ```
 
-**Purpose**: Attempts an immediate flush after new items arrive, but only when the rollout file has already been materialized. Deferred sessions keep buffering until an explicit barrier.
+**Purpose**: Best-effort writes pending items only if the rollout file already exists or is open. It avoids creating a deferred new-session file too early.
 
-**Data flow**: Checks `is_deferred`; if true returns immediately; otherwise calls `flush().await` and, on error, switches to recovery mode with `enter_recovery_mode`.
+**Data flow**: It reads the writer state. If still deferred, it does nothing; otherwise it tries to flush and enters recovery mode if that fails.
 
-**Call relations**: Used by `rollout_writer` after `AddItems` commands so active materialized sessions write eagerly while deferred sessions remain lazy.
+**Call relations**: rollout_writer calls this after AddItems so resumed or already-persisted sessions keep writing continuously.
 
 *Call graph*: calls 3 internal fn (enter_recovery_mode, flush, is_deferred).
 
@@ -3135,11 +3141,11 @@ async fn flush_if_materialized(&mut self)
 async fn persist(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Persists all pending data, materializing the file if necessary, with one retry after reopening on failure. It is the state-level implementation behind recorder `persist()`.
+**Purpose**: Writes all pending data and creates the rollout file if it was deferred. This is the state-level implementation of an explicit persist request.
 
-**Data flow**: Calls `write_pending_with_recovery("persist")` and returns its `std::io::Result<()>`.
+**Data flow**: It uses the current pending queue, metadata, and file info. It writes through the recovery wrapper and returns success or an input/output error.
 
-**Call relations**: Invoked by `rollout_writer` when handling `RolloutCmd::Persist`.
+**Call relations**: rollout_writer calls this when it receives a Persist command from RolloutRecorder::persist.
 
 *Call graph*: calls 1 internal fn (write_pending_with_recovery).
 
@@ -3150,11 +3156,11 @@ async fn persist(&mut self) -> std::io::Result<()>
 async fn flush(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Flushes all pending data, unless the recorder is still deferred and has nothing buffered. It is the state-level implementation behind recorder `flush()`.
+**Purpose**: Writes all pending records if there is anything to write. If a new session is still deferred and empty, it succeeds without creating a file.
 
-**Data flow**: If deferred with an empty pending queue, returns `Ok(())`; otherwise calls `write_pending_with_recovery("flush")` and returns the result.
+**Data flow**: It checks whether the writer is deferred and whether pending_items is empty. If writing is needed, it calls the recovery wrapper and returns the result.
 
-**Call relations**: Called by `flush_if_materialized` and by `rollout_writer` for explicit `Flush` commands.
+**Call relations**: RolloutWriterState::flush_if_materialized and rollout_writer’s Flush command both use this.
 
 *Call graph*: calls 2 internal fn (is_deferred, write_pending_with_recovery); called by 1 (flush_if_materialized).
 
@@ -3165,11 +3171,11 @@ async fn flush(&mut self) -> std::io::Result<()>
 async fn shutdown(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Drains pending data before shutdown, unless there is nothing to materialize or write. It is the state-level implementation behind recorder `shutdown()`.
+**Purpose**: Writes pending records as part of stopping the writer. Like flush, it does not create an empty deferred rollout file.
 
-**Data flow**: If deferred with no pending items, returns `Ok(())`; otherwise delegates to `write_pending_with_recovery("shutdown")`.
+**Data flow**: It inspects deferred state and pending items. If data exists, it writes with recovery; otherwise it returns success immediately.
 
-**Call relations**: Called by `rollout_writer` when processing `Shutdown`; success allows the task loop to break.
+**Call relations**: rollout_writer calls this for a Shutdown command and only exits the command loop if it succeeds.
 
 *Call graph*: calls 2 internal fn (is_deferred, write_pending_with_recovery).
 
@@ -3180,11 +3186,11 @@ async fn shutdown(&mut self) -> std::io::Result<()>
 async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Result<()>
 ```
 
-**Purpose**: Runs one write attempt, enters recovery mode on failure, reopens and retries once, and reports the final result. It centralizes the writer’s retry policy.
+**Purpose**: Tries to write pending data, and if the first attempt fails, closes the current writer, reopens it, and tries once more. This protects against transient file-handle problems.
 
-**Data flow**: Calls `write_pending_once`; on success clears `last_logged_error`; on first failure logs/recovery via `enter_recovery_mode`, warns, retries `write_pending_once`, clears `last_logged_error` on retry success, or logs/warns and returns the second error on retry failure.
+**Data flow**: An operation name goes in for logging. It attempts write_pending_once; on error it enters recovery mode, retries once, clears the stored error on success, or returns the second error.
 
-**Call relations**: Used by `persist`, `flush`, and `shutdown` so all barrier operations share the same reopen-and-retry semantics.
+**Call relations**: persist, flush, and shutdown all use this so their error handling is consistent.
 
 *Call graph*: calls 2 internal fn (enter_recovery_mode, write_pending_once); called by 3 (flush, persist, shutdown); 1 external calls (warn!).
 
@@ -3195,11 +3201,11 @@ async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Res
 fn is_deferred(&self) -> bool
 ```
 
-**Purpose**: Reports whether the recorder has not yet materialized its rollout file but still has deferred path information. This distinguishes lazy new sessions from active writers.
+**Purpose**: Checks whether this writer is waiting to create a new rollout file later. Deferred means there is no open writer yet but precomputed file information exists.
 
-**Data flow**: Returns `true` when `self.writer.is_none()` and `self.deferred_log_file_info.is_some()`, otherwise `false`.
+**Data flow**: It reads the writer and deferred-info fields and returns true or false.
 
-**Call relations**: Consulted by `flush_if_materialized`, `flush`, and `shutdown` to decide whether writing should happen yet.
+**Call relations**: flush_if_materialized, flush, and shutdown use this to avoid creating empty rollout files unnecessarily.
 
 *Call graph*: called by 3 (flush, flush_if_materialized, shutdown).
 
@@ -3210,11 +3216,11 @@ fn is_deferred(&self) -> bool
 fn enter_recovery_mode(&mut self, err: &IoError)
 ```
 
-**Purpose**: Drops the current writer handle after an I/O failure and logs the error once per distinct message. This preserves buffered items for later retry.
+**Purpose**: Records a write failure and drops the current file writer so the next attempt will reopen the file. This keeps unwritten items buffered for retry.
 
-**Data flow**: Converts the error to a string, compares it with `last_logged_error`, emits an error log if it is new, stores the message in `last_logged_error`, and sets `self.writer = None`.
+**Data flow**: An error goes in. The function logs it if it is new, saves its message, sets writer to none, and returns nothing.
 
-**Call relations**: Called after failed flush/write attempts by `flush_if_materialized` and `write_pending_with_recovery`.
+**Call relations**: flush_if_materialized and write_pending_with_recovery call this after write failures.
 
 *Call graph*: called by 2 (flush_if_materialized, write_pending_with_recovery); 2 external calls (to_string, error!).
 
@@ -3225,11 +3231,11 @@ fn enter_recovery_mode(&mut self, err: &IoError)
 async fn ensure_writer_open(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Opens or reopens the rollout file if no writer is currently available. It also clears deferred path info once the file is materialized.
+**Purpose**: Makes sure there is an open JsonlWriter before writing. It creates the deferred file or reopens the rollout path after recovery.
 
-**Data flow**: If `self.writer` already exists, returns `Ok(())`; otherwise chooses the path from deferred log info or `rollout_path`, opens it with `open_log_file`, wraps it in `tokio::fs::File` and `JsonlWriter`, stores it in `self.writer`, clears `deferred_log_file_info`, and returns success.
+**Data flow**: It reads existing writer state. If already open it returns success; otherwise it opens the right path, wraps the file for async writing, clears deferred info, and returns success or an error.
 
-**Call relations**: Called by `write_pending_once` before any metadata or item writes.
+**Call relations**: write_pending_once calls this before writing metadata or queued items.
 
 *Call graph*: calls 1 internal fn (open_log_file); called by 1 (write_pending_once); 2 external calls (as_path, from_std).
 
@@ -3240,11 +3246,11 @@ async fn ensure_writer_open(&mut self) -> std::io::Result<()>
 async fn write_session_meta_if_needed(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes the initial `SessionMeta` line exactly once, after the writer is open and before pending items are flushed. It also enriches the metadata with git info from the session cwd.
+**Purpose**: Writes the first session metadata record once, before normal pending items. This record identifies the session and captures startup context.
 
-**Data flow**: Clones `self.meta` if present, calls `write_session_meta(self.writer.as_mut(), session_meta, &self.cwd).await`, and on success sets `self.meta = None`; otherwise leaves state unchanged via propagated error.
+**Data flow**: It reads the optional metadata field. If present, it writes it with git information, then clears the field so it is not written again.
 
-**Call relations**: Called by `write_pending_once` so the session header precedes all later rollout items.
+**Call relations**: write_pending_once calls this after opening the writer and before writing queued rollout items.
 
 *Call graph*: calls 1 internal fn (write_session_meta); called by 1 (write_pending_once).
 
@@ -3255,11 +3261,11 @@ async fn write_session_meta_if_needed(&mut self) -> std::io::Result<()>
 async fn write_pending_once(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Performs one full write pass: ensure file open, write session metadata if needed, write pending items, and flush the file handle. It does not retry internally.
+**Purpose**: Performs one straight write attempt without retry logic. It opens the writer, writes session metadata if needed, writes pending items, and flushes the file.
 
-**Data flow**: Calls `ensure_writer_open`, `write_session_meta_if_needed`, and `write_pending_items_once`; then flushes the underlying file if a writer exists; returns `std::io::Result<()>`.
+**Data flow**: It uses the state’s file, metadata, and pending queue. Successfully written items are removed; errors are returned for the recovery wrapper to handle.
 
-**Call relations**: Used only by `write_pending_with_recovery`, which wraps it with reopen-and-retry behavior.
+**Call relations**: write_pending_with_recovery calls this for the first attempt and, if needed, the retry.
 
 *Call graph*: calls 3 internal fn (ensure_writer_open, write_pending_items_once, write_session_meta_if_needed); called by 1 (write_pending_with_recovery).
 
@@ -3270,11 +3276,11 @@ async fn write_pending_once(&mut self) -> std::io::Result<()>
 async fn write_pending_items_once(&mut self) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes as many pending rollout items as possible in order, draining only the successfully written prefix. This preserves unwritten suffix items for retry after partial failure.
+**Purpose**: Writes queued rollout items in order and removes only the items that were successfully written. This preserves the unwritten suffix after an error.
 
-**Data flow**: Requires `self.writer` to exist or returns an error; iterates `self.pending_items`, calling `writer.write_rollout_item(item)` until one fails; counts successful writes, drains that prefix from `pending_items`, and returns either `Ok(())` or the first encountered write error.
+**Data flow**: It reads pending_items and the open writer. It writes each item until one fails, drains the written prefix from the queue, and returns success or the first write error.
 
-**Call relations**: Called by `write_pending_once` as the item-level write loop.
+**Call relations**: write_pending_once calls this after metadata is handled.
 
 *Call graph*: called by 1 (write_pending_once); 1 external calls (other).
 
@@ -3290,11 +3296,11 @@ async fn rollout_writer(
     cwd: PathBuf,
 ```
 
-**Purpose**: Runs the background command loop that owns all mutable writer state. It serializes item buffering, persistence barriers, and shutdown handling on a single task.
+**Purpose**: Runs the background loop that owns the rollout file and processes recording commands. It is the single place that actually mutates writer state.
 
-**Data flow**: Constructs `RolloutWriterState`, then repeatedly awaits `rx.recv()`; on `AddItems` appends items and opportunistically flushes if materialized, on `Persist`/`Flush` sends back the corresponding state method result, and on successful `Shutdown` acknowledges and breaks the loop; returns `Ok(())` when the channel closes or shutdown succeeds.
+**Data flow**: Initial file/deferred info, metadata, cwd, path, and a command receiver go in. It receives commands, updates or flushes RolloutWriterState, sends acknowledgements for barrier commands, and exits after successful shutdown.
 
-**Call relations**: Spawned by `RolloutRecorder::new` and driven by commands from recorder API methods.
+**Call relations**: RolloutRecorder::new spawns this task. Recorder methods communicate with it by sending RolloutCmd messages.
 
 *Call graph*: calls 2 internal fn (recv, new); called by 1 (new).
 
@@ -3309,11 +3315,11 @@ async fn write_session_meta(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Builds and writes the initial `RolloutItem::SessionMeta` line, optionally augmenting it with git repository information from the session cwd. It is the one-time header writer for new sessions.
+**Purpose**: Writes the session metadata line, including git information when the working directory is inside a git repository. This makes saved sessions easier to understand later.
 
-**Data flow**: Checks whether `cwd` is inside a git repo via `get_git_repo_root`; if so, asynchronously collects git info and maps it into protocol `GitInfo`; constructs `SessionMetaLine { meta: session_meta, git }`, wraps it in `RolloutItem::SessionMeta`, and writes it through the provided `JsonlWriter` if present.
+**Data flow**: An optional writer, session metadata, and cwd go in. It collects git branch/commit/remote details if available, wraps everything as a SessionMeta rollout item, and writes it if a writer exists.
 
-**Call relations**: Called by `RolloutWriterState::write_session_meta_if_needed` before any pending items are written.
+**Call relations**: RolloutWriterState::write_session_meta_if_needed calls this before the first normal session records are written.
 
 *Call graph*: called by 1 (write_session_meta_if_needed); 3 external calls (collect_git_info, get_git_repo_root, SessionMeta).
 
@@ -3327,11 +3333,11 @@ async fn append_rollout_item_to_path(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Appends a single already-filtered rollout item directly to a rollout file outside the live recorder task. It is intended for metadata updates to unloaded threads.
+**Purpose**: Appends one rollout item directly to an existing rollout file. This is for metadata updates to sessions that are not currently loaded.
 
-**Data flow**: Materializes the target path for append, opens it in append mode with Tokio, wraps the file in `JsonlWriter`, writes the provided `RolloutItem`, and returns the write result.
+**Data flow**: A rollout path and item go in. It materializes the file if compressed, opens it for append, writes the item as JSONL, and returns the write result.
 
-**Call relations**: Used by external metadata-update flows that need ordered append semantics only for one item, not a full live recorder.
+**Call relations**: This bypasses RolloutRecorder’s live queue by design; live sessions should use record_canonical_items to preserve ordering.
 
 *Call graph*: calls 1 internal fn (materialize_rollout_for_append); 1 external calls (new).
 
@@ -3342,11 +3348,11 @@ async fn append_rollout_item_to_path(
 async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()>
 ```
 
-**Purpose**: Serializes one rollout item as a timestamped JSONL line using the current UTC time. It wraps the item in the on-disk `RolloutLineRef` shape.
+**Purpose**: Writes one rollout item as a timestamped JSON Lines record. The timestamp records when this line was appended.
 
-**Data flow**: Formats `OffsetDateTime::now_utc()` into millisecond RFC3339-like text, constructs `RolloutLineRef { timestamp, item }`, and delegates actual serialization/write to `write_line`.
+**Data flow**: A rollout item goes in. It creates the current UTC timestamp, builds a serializable line object, and passes it to write_line.
 
-**Call relations**: Called by writer-state item loops, session-meta writing, and direct append helpers.
+**Call relations**: RolloutWriterState and append_rollout_item_to_path use this for every rollout item written to disk.
 
 *Call graph*: calls 1 internal fn (write_line); 2 external calls (now_utc, format_description!).
 
@@ -3357,11 +3363,11 @@ async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::R
 async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()>
 ```
 
-**Purpose**: Serializes an arbitrary value to JSON, appends a newline, writes it to the file, and flushes immediately. It is the lowest-level JSONL output primitive in this module.
+**Purpose**: Serializes one value to JSON, adds a newline, writes it to the file, and flushes it. This is the lowest-level JSONL write step.
 
-**Data flow**: Takes any `serde::Serialize` value, converts it to a JSON string, appends `\n`, writes bytes with `write_all`, flushes the file, and returns `std::io::Result<()>`.
+**Data flow**: Any serializable item goes in. It becomes a JSON string plus newline, then bytes are written to the async file and flushed.
 
-**Call relations**: Used only by `JsonlWriter::write_rollout_item`.
+**Call relations**: JsonlWriter::write_rollout_item calls this after adding rollout-specific timestamp wrapping.
 
 *Call graph*: called by 1 (write_rollout_item); 3 external calls (flush, write_all, to_string).
 
@@ -3372,11 +3378,11 @@ async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<
 fn from(db_page: codex_state::ThreadsPage) -> Self
 ```
 
-**Purpose**: Converts a `codex_state::ThreadsPage` from SQLite into the rollout module’s filesystem-style `ThreadsPage`. It adapts item shape and pagination fields.
+**Purpose**: Converts a page returned by the state database into the rollout listing page type used by this module. This lets callers receive one consistent shape.
 
-**Data flow**: Consumes a DB page, maps each `codex_state::ThreadMetadata` through `thread_item_from_state_metadata`, converts `next_anchor` into `next_cursor`, copies `num_scanned_rows` into `num_scanned_files`, sets `reached_scan_cap` false, and returns the new page.
+**Data flow**: A database ThreadsPage goes in. Each database metadata row is converted into a ThreadItem, the database cursor is converted, and a new ThreadsPage comes out.
 
-**Call relations**: Used implicitly by listing code whenever a DB page is returned to rollout callers.
+**Call relations**: RolloutRecorder::list_threads_with_db_fallback uses this conversion whenever it returns database results.
 
 
 ##### `thread_item_from_state_metadata`  (lines 1706–1729)
@@ -3385,11 +3391,11 @@ fn from(db_page: codex_state::ThreadsPage) -> Self
 fn thread_item_from_state_metadata(item: codex_state::ThreadMetadata) -> ThreadItem
 ```
 
-**Purpose**: Transforms a state-DB thread metadata row into a `ThreadItem` suitable for listing APIs. It also parses the serialized source field back into `SessionSource`.
+**Purpose**: Turns one database thread metadata row into a ThreadItem used by rollout listing. It also parses the stored session source, defaulting to Unknown if parsing fails.
 
-**Data flow**: Consumes `codex_state::ThreadMetadata`; copies rollout path, IDs, preview/message/git/provider/version fields, wraps cwd/source/created/updated timestamps into the `ThreadItem` shape, parses `item.source` from JSON string or plain string with fallback to `SessionSource::Unknown`, and returns the populated `ThreadItem`.
+**Data flow**: A database ThreadMetadata value goes in. The function maps paths, IDs, preview fields, cwd, git details, provider, version, and timestamps into a ThreadItem.
 
-**Call relations**: Used by `ThreadsPage::from` and `fill_missing_thread_item_metadata_from_state_db`.
+**Call relations**: ThreadsPage::from and fill_missing_thread_item_metadata_from_state_db use this when they need database rows in file-listing format.
 
 *Call graph*: called by 1 (fill_missing_thread_item_metadata_from_state_db); 1 external calls (from_str).
 
@@ -3404,11 +3410,11 @@ async fn select_resume_path(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Chooses the first resumable rollout path from a filesystem `ThreadsPage`, optionally requiring cwd compatibility. Without a cwd filter it simply picks the first item.
+**Purpose**: Chooses a rollout path from a filesystem-backed page for resume. If a working directory filter is given, it checks candidates until one matches.
 
-**Data flow**: If `filter_cwd` is `Some`, iterates page items and asynchronously tests each with `resume_candidate_matches_cwd`, returning the first matching path clone; otherwise returns the first item’s path clone if present.
+**Data flow**: A ThreadsPage, optional cwd, and default provider go in. It returns the first page item when no cwd is required, or the first candidate whose saved cwd matches.
 
-**Call relations**: Called by `RolloutRecorder::find_latest_thread_path` when scanning filesystem pages.
+**Call relations**: RolloutRecorder::find_latest_thread_path calls this during filesystem fallback search.
 
 *Call graph*: calls 1 internal fn (resume_candidate_matches_cwd); called by 1 (find_latest_thread_path).
 
@@ -3424,11 +3430,11 @@ async fn resume_candidate_matches_cwd(
 ) -> bool
 ```
 
-**Purpose**: Determines whether a rollout belongs to a requested cwd, using progressively more expensive evidence. It first trusts cached cwd, then checks the latest `TurnContext`, then falls back to full metadata extraction.
+**Purpose**: Checks whether a saved session belongs to the requested working directory. It uses cached metadata first, then falls back to reading the rollout file or extracting metadata.
 
-**Data flow**: Accepts rollout path, optional cached cwd, target cwd, and default provider; returns true immediately if cached cwd matches via `cwd_matches`; otherwise loads rollout items and scans backward for the latest `RolloutItem::TurnContext.cwd`, comparing that to the target; if still unresolved, calls `metadata::extract_metadata_from_rollout` and compares `outcome.metadata.cwd`; returns a boolean.
+**Data flow**: A rollout path, optional cached cwd, target cwd, and default provider go in. It compares normalized paths from the cache, latest turn context, or extracted metadata, and returns true or false.
 
-**Call relations**: Used by both `select_resume_path` and `select_resume_path_from_db_page` to validate resume candidates under cwd filtering.
+**Call relations**: select_resume_path and select_resume_path_from_db_page call this when filtering resume candidates by cwd.
 
 *Call graph*: calls 3 internal fn (extract_metadata_from_rollout, load_rollout_items, cwd_matches); called by 2 (select_resume_path, select_resume_path_from_db_page).
 
@@ -3443,11 +3449,11 @@ async fn select_resume_path_from_db_page(
 ) -> Option<PathBuf>
 ```
 
-**Purpose**: Chooses the first resumable rollout path from a state-DB page, optionally requiring cwd compatibility. It mirrors `select_resume_path` but starts from DB rows.
+**Purpose**: Chooses a rollout path from a database-backed page for resume. It mirrors select_resume_path but starts from database metadata rows.
 
-**Data flow**: If `filter_cwd` is `Some`, iterates DB items and calls `resume_candidate_matches_cwd` with the row’s cached cwd and rollout path, returning the first matching path clone; otherwise returns the first row’s rollout path clone.
+**Data flow**: A database page, optional cwd, and default provider go in. It returns the first path if no cwd filter exists, or the first path whose cached or extracted cwd matches.
 
-**Call relations**: Called by `RolloutRecorder::find_latest_thread_path` during the preferred DB-backed search path.
+**Call relations**: RolloutRecorder::find_latest_thread_path calls this while trying database pages before falling back to filesystem scanning.
 
 *Call graph*: calls 1 internal fn (resume_candidate_matches_cwd); called by 1 (find_latest_thread_path).
 
@@ -3458,11 +3464,11 @@ async fn select_resume_path_from_db_page(
 fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool
 ```
 
-**Purpose**: Compares two paths after normalization using shared path utilities. It abstracts away platform/path-format differences for resume matching.
+**Purpose**: Compares two working-directory paths after normalization. This avoids false mismatches caused by harmless path spelling differences.
 
-**Data flow**: Takes `session_cwd` and target `cwd`, forwards them to `path_utils::paths_match_after_normalization`, and returns the resulting boolean.
+**Data flow**: Two paths go in. The shared path utility normalizes and compares them, and a boolean comes out.
 
-**Call relations**: Used only by `resume_candidate_matches_cwd`.
+**Call relations**: resume_candidate_matches_cwd uses this for every cwd comparison it performs.
 
 *Call graph*: called by 1 (resume_candidate_matches_cwd); 1 external calls (paths_match_after_normalization).
 
@@ -3474,25 +3480,39 @@ These files establish the storage-neutral thread persistence API, its shared err
 
 `data_model` · `cross-cutting`
 
-This file is the central error contract for the `thread-store` crate. It introduces `ThreadStoreResult<T>` as the crate-wide `Result` alias and `ThreadStoreError` as the enum every store implementation is expected to return. The enum is intentionally shaped around caller-meaningful failure modes rather than backend-specific details: `ThreadNotFound` carries the requested `codex_protocol::ThreadId`; `InvalidRequest` reports malformed or inconsistent input supplied by the caller; `Conflict` represents state-dependent failures such as duplicate creation or incompatible updates; `Unsupported` exposes a stable operation name for feature detection or graceful fallback; and `Internal` is the catch-all for implementation failures that do not fit the public categories. Each variant derives a user-facing message through `thiserror::Error`, so formatting is standardized across implementations. The design keeps backend internals out of the public API while still preserving enough structured data for higher layers to branch on not-found versus validation versus unsupported-operation cases. Because this file contains only types and no behavior, its main invariant is semantic consistency: all thread-store backends should map equivalent situations onto the same variant so application code can treat the trait uniformly.
+A thread store needs to fail in predictable ways. For example, someone may ask for a thread that is not saved, try an operation the store does not support, or send request data that does not make sense. This file collects those possible failures into one shared error type, `ThreadStoreError`, so callers do not have to guess how each store reports problems.
+
+It also defines `ThreadStoreResult<T>`, a shortcut meaning “either the requested value of type `T`, or a `ThreadStoreError`.” This is a common Rust pattern: instead of throwing exceptions, functions return a result that clearly says whether the operation succeeded or failed.
+
+The error categories are intentionally plain and stable. `ThreadNotFound` includes the requested `ThreadId`, so an error message can say exactly which thread was missing. `InvalidRequest` is for bad input from the caller. `Conflict` means the request was understandable, but it clashes with the store’s current state. `Unsupported` marks features a particular store cannot do yet. `Internal` is the fallback for unexpected implementation failures.
+
+Without this file, different thread-store backends could describe the same failure in different ways, making higher-level code harder to write and error messages less consistent.
 
 
 ### `thread-store/src/lib.rs`
 
-`orchestration` · `startup`
+`other` · `cross-cutting API surface`
 
-This file is the API surface of the `thread-store` crate. Its module declarations organize the crate into backend implementations (`in_memory`, `local`), live-thread coordination (`live_thread`), synchronization helpers (`thread_metadata_sync`), the core trait (`store`), shared request/response types (`types`), and error definitions (`error`). The top-level documentation establishes the key abstraction boundary: application code should persist and exchange only `codex_protocol::ThreadId`, while each backend is responsible for resolving that durable identifier into local files, rollout paths, RPC calls, or other storage-specific details. The file then re-exports the crate’s public contract in a flat namespace. Consumers can construct stores such as `InMemoryThreadStore` or `LocalThreadStore`, invoke the `ThreadStore` trait, and pass strongly typed parameter structs like `CreateThreadParams`, `AppendThreadItemsParams`, `ListThreadsParams`, or `UpdateThreadMetadataParams`. It also exposes the stored-data models returned by implementations, including `StoredThread`, `StoredTurn`, paginated wrappers, search results, and metadata patch types. This crate root contains no executable logic; its importance is in curating a coherent, backend-agnostic API so downstream code depends on stable names rather than internal module layout.
+This file does not store threads itself. Instead, it defines the shape of the crate’s public API: the set of names other code is meant to use when working with saved conversation threads. A thread here means a persisted conversation record, identified by a durable ThreadId from codex_protocol.
+
+The main idea is storage neutrality. Application code should not need to know whether a thread lives in local files, memory, a remote service, or another backing store. It should talk to the ThreadStore interface and pass around stable thread IDs. The concrete storage layer then figures out where the data really lives.
+
+This file declares the internal modules that make up the crate, such as error handling, in-memory storage, local storage, live-thread support, metadata syncing, and shared request/response types. It then re-exports the important pieces with pub use, which is like putting the most useful tools on the front counter instead of making callers search through the back rooms.
+
+Without this file, users of the crate would have to know its internal module layout and import many pieces from many places. This file keeps that boundary tidy and makes it easier to swap or add storage implementations without changing the rest of the application.
 
 
 ### `thread-store/src/store.rs`
 
-`domain_logic` · `cross-cutting`
+`io_transport` · `cross-cutting thread persistence`
 
-This file is the abstraction boundary for thread persistence. Its main artifact is the `ThreadStore` trait, which is constrained as `Any + Send + Sync` so implementations can be shared across threads and, when necessary, downcast through `as_any()` for implementation-specific escape hatches. All operations are asynchronous and normalized through the `ThreadStoreFuture<'a, T>` alias, a boxed, pinned `Future` returning `ThreadStoreResult<T>`, which gives callers a uniform error and scheduling model regardless of backend.
+This file is the storage doorway for threads. A thread is a saved conversation or work session, and different installations may store those threads in different ways. Without this shared doorway, every part of the app would need to know the exact storage system being used, which would make changing storage backends risky and messy.
 
-The trait covers the full thread lifecycle: opening live writers (`create_thread`, `resume_thread`), ingesting rollout items (`append_items`), forcing durability (`persist_thread`, `flush_thread`), closing or abandoning live state (`shutdown_thread`, `discard_thread`), and reading persisted state (`load_history`, `read_thread`, `read_thread_by_rollout_path`). It also defines discovery and maintenance APIs such as `list_threads`, metadata patching, archive/unarchive, and deletion. The parameter and return types are all explicit crate-level domain structs like `CreateThreadParams`, `StoredThread`, `ThreadPage`, and `StoredThreadHistory`, keeping policy and schema outside the trait itself.
+The central piece is the `ThreadStore` trait. A trait is like a checklist of promises: any storage implementation must provide these operations. The promises cover the full life of a thread: create it, reopen it, append new items, force pending data to be saved, shut down or discard a live writer, load history, read summaries, list and search threads, update metadata, archive, unarchive, and delete.
 
-A notable design choice is that three capabilities—thread search, turn listing, and item listing—have default implementations that immediately return `ThreadStoreError::Unsupported` with operation-specific identifiers. That makes these features optional for backends while preserving a single trait surface. The comments also encode important invariants: append implementations must apply shared rollout persistence policy before durable writes and projections, `discard_thread` must release live writer resources without deleting already durable data, and metadata updates are literal patches rather than policy-bearing transformations.
+Most methods are only declared here, not implemented. That means each storage backend must decide how to do the actual saving and reading. A few newer or optional features have safe default behavior: if a backend does not support searching, listing turns, or listing items, the default answer is an “unsupported operation” error. This is like a universal adapter saying, “I understand the request, but this device cannot do that.”
+
+The file also defines `ThreadStoreFuture`, the standard asynchronous return shape for these operations. In plain terms, store actions may take time, so they return a promise of a result instead of blocking immediately.
 
 #### Function details
 
@@ -3505,11 +3525,11 @@ fn search_threads(
     ) -> ThreadStoreFuture<'_, ThreadSearchPage>
 ```
 
-**Purpose**: Provides the trait's default behavior for backends that do not implement thread search. It returns an asynchronous error indicating that the `thread/search` operation is unsupported.
+**Purpose**: This is the default response when code asks a thread store to search threads, but that store has not provided search support. Instead of pretending to search, it clearly returns an “unsupported” error.
 
-**Data flow**: It accepts `SearchThreadsParams` but intentionally ignores them (`_params`). The body constructs a boxed pinned async future that resolves to `Err(ThreadStoreError::Unsupported { operation: "thread/search" })`. It does not read or mutate store state and produces no side effects beyond the returned error future.
+**Data flow**: A search request comes in, but this default version does not inspect the request fields. It creates an asynchronous result that immediately resolves to a `ThreadStoreError::Unsupported` error for the `thread/search` operation. Nothing is saved, changed, or read.
 
-**Call relations**: This method is invoked by callers using the `ThreadStore` trait when they request search against a backend that has not overridden the default. Rather than delegating to any backend logic, it terminates the flow immediately with a standardized unsupported-operation error wrapped in a pinned future.
+**Call relations**: This method is used as the fallback implementation for stores that do not override search. Its only handoff is wrapping the error in a pinned asynchronous future, so callers receive the same kind of future they would get from a real storage operation.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3520,11 +3540,11 @@ fn search_threads(
 fn list_turns(&self, _params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage>
 ```
 
-**Purpose**: Supplies the default implementation for listing turns within a stored thread when a backend lacks turn-level indexing or retrieval support. It reports that `list_turns` is unsupported.
+**Purpose**: This is the default response when code asks a thread store to list the turns inside a thread, but that store has not implemented turn-level listing. It fails in a clear, expected way rather than returning misleading empty data.
 
-**Data flow**: It takes `ListTurnsParams` and ignores the value. The function returns a `ThreadStoreFuture<'_, TurnPage>` created by boxing and pinning an async block whose output is `Err(ThreadStoreError::Unsupported { operation: "list_turns" })`. No persistent data is read, transformed, or written.
+**Data flow**: A turn-listing request comes in, but the default method ignores its details. It builds an asynchronous result that resolves to an `Unsupported` error naming `list_turns`. The store’s data is left untouched.
 
-**Call relations**: Callers reach this path only when using a `ThreadStore` implementation that relies on the trait default instead of providing its own turn-listing logic. The method does not call into other store APIs; it acts as a capability gate that ends the request with a uniform unsupported error.
+**Call relations**: This sits in the trait as an optional capability. If a concrete store does not supply its own version, callers who ask for turn listing get this fallback; it packages the error using a pinned future so it still matches the trait’s asynchronous interface.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3535,22 +3555,26 @@ fn list_turns(&self, _params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage
 fn list_items(&self, _params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage>
 ```
 
-**Purpose**: Implements the trait's fallback behavior for item-level listing inside a stored turn. Its concrete job is to reject the request with an unsupported-operation error for stores that do not expose persisted item enumeration.
+**Purpose**: This is the default response when code asks a thread store to list saved items inside a turn, but that store does not support item-level listing. It tells the caller the feature is unavailable.
 
-**Data flow**: It receives `ListItemsParams` and does not inspect them. It wraps an async block in `Box::pin`, yielding a future whose result is `Err(ThreadStoreError::Unsupported { operation: "list_items" })`. The function neither accesses backend state nor emits any writes or external I/O.
+**Data flow**: An item-listing request arrives, but this default implementation does not use the request contents. It returns an asynchronous result containing an `Unsupported` error for `list_items`. No thread data is loaded or modified.
 
-**Call relations**: This default path is used when higher-level code asks a `ThreadStore` for persisted items but the concrete backend has not overridden `list_items`. It delegates only to the standard future boxing/pinning mechanism and otherwise short-circuits the call flow with a consistent capability error.
+**Call relations**: This is the fallback path for storage implementations that have not added item listing. Like the other optional defaults, it hands back a pinned asynchronous future so higher-level code can treat it like any other store operation, even though the answer is an error.
 
 *Call graph*: 1 external calls (pin).
 
 
 ### `thread-store/src/in_memory.rs`
 
-`domain_logic` · `test-time persistence and debug-mode thread storage`
+`domain_logic` · `test/debug storage operations`
 
-This module implements a lightweight, fully in-memory persistence backend around `InMemoryThreadStore`, whose mutable state lives inside a `tokio::sync::Mutex<InMemoryThreadStoreState>`. The state tracks both stored data and observability: `InMemoryThreadStoreCalls` counts how many times each store operation was invoked, while maps hold `CreateThreadParams`, rollout histories (`Vec<RolloutItem>`), metadata patches, optional names, and rollout-path-to-thread mappings. A separate global `OnceLock<Mutex<HashMap<String, Arc<InMemoryThreadStore>>>>` lets tests obtain shared stores by string ID via `for_id` and remove them with `remove_id`.
+A “thread” here is a saved conversation, with metadata such as its ID, name, model, working directory, and a list of saved conversation items. Real thread stores may write to disk or talk to a remote service. This file offers a simpler stand-in: it keeps everything in hash maps protected by locks, like labeled folders in a locked cabinet.
 
-The store records a synthetic `SessionMeta` rollout item when a thread is created, can resume threads with optional preloaded history and rollout paths, canonicalizes appended items through `persisted_rollout_items`, and reconstructs `StoredThread` views on demand with `stored_thread_from_state`. That reconstruction merges original creation parameters with later metadata patches, derives rollout paths either from metadata or reverse lookup, synthesizes timestamps with `Utc::now()` when absent, and converts patched git metadata through `git_info_from_patch`. The `ThreadStore` trait implementation mostly boxes the inherent async methods, while unsupported pagination methods are intentionally inherited from trait defaults and tested as such. One notable design choice is that `list_threads` in the trait impl post-filters by `parent_thread_id`, while the inherent `list_threads` simply returns all created threads sorted by thread ID string. Deletion removes all associated maps and returns `ThreadNotFound` only if no history existed for that thread.
+The file supports creating a thread, resuming one, appending saved items, reading a thread back, listing known threads, updating metadata, archiving/unarchiving counters, and deleting stored data. It also records how many times each operation was called. That makes tests able to check not only “what was stored?” but also “did the code ask storage to do the right thing?”
+
+There is also a shared registry of named in-memory stores. Tests can ask for a store by ID and get the same store back later, which mimics selecting a configured non-local store without actually running a network service.
+
+The important limitation is that this store is temporary. It does not persist across process runs, and several operations are intentionally lightweight: archive-like methods mostly count calls, while thread contents live only in memory.
 
 #### Function details
 
@@ -3560,11 +3584,11 @@ The store records a synthetic `SessionMeta` rollout item when a thread is create
 fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>>
 ```
 
-**Purpose**: Returns the global registry of shared in-memory stores keyed by string ID. It lazily initializes the registry on first use.
+**Purpose**: Returns the global map of named in-memory thread stores, creating that map the first time it is needed. This lets different tests or debug configurations share a store by a simple string ID.
 
-**Data flow**: Reads the `IN_MEMORY_THREAD_STORES` `OnceLock`, initializes it with `Mutex<HashMap<String, Arc<InMemoryThreadStore>>>` if needed, and returns a `'static` reference to that mutex.
+**Data flow**: No caller-provided data goes in. The function checks a one-time global holder; if the holder is empty, it creates a mutex-protected hash map. It returns a reference to that shared locked map.
 
-**Call relations**: This helper is used only by `stores_guard`, which provides the actual locked access used by `for_id` and `remove_id`.
+**Call relations**: The locking helper calls this when it needs access to the registry. Higher-level functions do not use the global map directly; they go through the helper so locking is consistent.
 
 *Call graph*: called by 1 (stores_guard).
 
@@ -3575,11 +3599,11 @@ fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>>
 async fn default_turn_pagination_methods_return_unsupported()
 ```
 
-**Purpose**: Verifies that the in-memory store does not implement turn/item pagination and therefore inherits the trait’s unsupported-operation behavior. This protects the intended minimal scope of the test store.
+**Purpose**: Checks that the default turn and item pagination methods report that they are not supported by this in-memory store. This protects callers from assuming every store implementation can page through turns and items.
 
-**Data flow**: Creates a default `InMemoryThreadStore` and default `ThreadId`, calls `list_turns` and `list_items` with representative parameters, captures the resulting errors, and asserts that both are `ThreadStoreError::Unsupported` with the expected operation names.
+**Data flow**: The test creates a default store and a sample thread ID, then asks for turns and items. Instead of successful pages, it expects specific “unsupported operation” errors.
 
-**Call relations**: This test exercises trait-default behavior rather than any custom method in the module.
+**Call relations**: This is a test-only caller of the store’s default trait behavior. It confirms that unsupported pagination remains explicit rather than silently returning misleading empty data.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (assert!, default).
 
@@ -3590,11 +3614,11 @@ async fn default_turn_pagination_methods_return_unsupported()
 async fn list_threads_filters_by_parent_thread_id()
 ```
 
-**Purpose**: Checks that the `ThreadStore` trait implementation of `list_threads` applies `parent_thread_id` filtering on top of the in-memory store’s full listing. It validates the wrapper logic rather than just raw storage.
+**Purpose**: Checks that listing threads can filter children by their parent thread ID. This matters for features that show only threads belonging under a particular parent conversation.
 
-**Data flow**: Creates a default store, constructs parent/child/unrelated thread IDs, inserts two threads with different `parent_thread_id` values via `create_thread`, then calls `ThreadStore::list_threads` with `parent_thread_id: Some(parent_thread_id)` and asserts that only the child thread ID is returned.
+**Data flow**: The test creates one child thread with a parent ID and one unrelated thread without that parent. It then lists threads while asking for that parent only, and expects only the child thread to come back.
 
-**Call relations**: This test specifically targets the trait-impl `list_threads` wrapper, which delegates to the inherent listing method and then retains matching parent threads.
+**Call relations**: This test drives thread creation and the trait-level list operation. It verifies the filtering layer that sits on top of the store’s basic list of all created threads.
 
 *Call graph*: calls 3 internal fn (default, default, from_string); 4 external calls (new, assert_eq!, default, list_threads).
 
@@ -3605,11 +3629,11 @@ async fn list_threads_filters_by_parent_thread_id()
 fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore>>>
 ```
 
-**Purpose**: Locks the global shared-store registry and recovers from mutex poisoning by taking the inner guard anyway. This keeps test cleanup and reuse resilient after panics.
+**Purpose**: Locks the global store registry and returns access to it. If a previous panic poisoned the lock, it still recovers the inner map so tests can keep going.
 
-**Data flow**: Calls `stores().lock()`, returns the `MutexGuard` on success, or extracts and returns `poisoned.into_inner()` if the mutex was poisoned.
+**Data flow**: No ordinary input goes in. It asks `stores` for the shared registry, locks the mutex, and returns the guard that allows reading or changing the map.
 
-**Call relations**: It is the synchronization helper used by `InMemoryThreadStore::for_id` and `InMemoryThreadStore::remove_id`.
+**Call relations**: The named-store functions use this before adding, finding, or removing shared stores. It is the safe doorway into the global registry.
 
 *Call graph*: calls 1 internal fn (stores); called by 2 (for_id, remove_id).
 
@@ -3620,11 +3644,11 @@ fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore
 fn for_id(id: impl Into<String>) -> Arc<Self>
 ```
 
-**Purpose**: Returns a shared named in-memory store, creating it on first access. This allows multiple components in a test to point at the same synthetic persistence backend.
+**Purpose**: Gets the shared in-memory store for a given ID, creating it if it does not already exist. This is useful when configuration says “use store X” and different parts of a test need to refer to the same fake store.
 
-**Data flow**: Consumes any `Into<String>` ID, converts it to `String`, locks the global registry with `stores_guard`, inserts `Arc::new(Self::default())` if the ID is absent, clones the stored `Arc`, and returns it.
+**Data flow**: A string-like ID goes in. The function locks the global registry, looks for that ID, inserts a fresh default store if missing, and returns a reference-counted pointer to the store.
 
-**Call relations**: This is used by tests and config-driven store selection paths that need a reusable in-memory backend keyed by identifier.
+**Call relations**: Configuration and tests call this when they need a named fake store. It relies on `stores_guard` for safe access to the registry and hands back an object that implements the thread-store interface.
 
 *Call graph*: calls 1 internal fn (stores_guard); called by 8 (get_conversation_summary_by_thread_id_reads_pathless_store_thread, cold_thread_resume_reuses_non_local_history_probe, thread_delete_with_non_local_thread_store_does_not_create_local_persistence, thread_list_includes_store_thread_without_rollout_path, thread_read_loaded_include_turns_reads_store_history_without_rollout_path, thread_turns_list_reads_store_history_without_rollout_path, thread_unarchive_preserves_pathless_store_metadata, thread_store_from_config); 1 external calls (into).
 
@@ -3635,11 +3659,11 @@ fn for_id(id: impl Into<String>) -> Arc<Self>
 fn remove_id(id: &str) -> Option<Arc<Self>>
 ```
 
-**Purpose**: Removes and returns a shared named in-memory store from the global registry. It is mainly used for cleanup between tests.
+**Purpose**: Removes a named shared in-memory store from the global registry. Tests use this for cleanup so one test’s stored threads do not leak into another test.
 
-**Data flow**: Takes a string slice ID, locks the registry with `stores_guard`, removes the matching entry from the `HashMap`, and returns the removed `Arc` if present.
+**Data flow**: A store ID goes in. The function locks the registry, removes the matching entry if present, and returns the removed store pointer or nothing if there was no match.
 
-**Call relations**: This complements `for_id` and is typically invoked from drop/cleanup paths in tests.
+**Call relations**: Cleanup code calls this when a named store is no longer needed. It uses the same registry lock helper as `for_id`, but deletes instead of fetching or creating.
 
 *Call graph*: calls 1 internal fn (stores_guard); called by 4 (drop, drop, drop, drop).
 
@@ -3650,11 +3674,11 @@ fn remove_id(id: &str) -> Option<Arc<Self>>
 async fn calls(&self) -> InMemoryThreadStoreCalls
 ```
 
-**Purpose**: Returns a snapshot of the store’s operation call counters. It supports assertions about persistence behavior in tests.
+**Purpose**: Returns a snapshot of how many times each store operation has been called. Tests use this to check that code made the expected storage requests.
 
-**Data flow**: Locks `self.state`, clones the embedded `InMemoryThreadStoreCalls`, and returns that clone.
+**Data flow**: The store instance is the input. The function locks its internal state, clones the call-count record, and returns that copy without changing the stored threads.
 
-**Call relations**: This is a read-only inspection helper for tests that need to verify which store operations occurred.
+**Call relations**: Test code calls this after exercising behavior. It reads the counters that the other store methods increment as they run.
 
 
 ##### `InMemoryThreadStore::as_any`  (lines 390–392)
@@ -3663,11 +3687,11 @@ async fn calls(&self) -> InMemoryThreadStoreCalls
 fn as_any(&self) -> &dyn std::any::Any
 ```
 
-**Purpose**: Exposes the store as `dyn Any` for downcasting through the `ThreadStore` trait object. It enables callers to detect concrete store types.
+**Purpose**: Exposes this store as a generic Rust `Any` value, which allows code to later check whether a trait object is really an `InMemoryThreadStore`. This is mostly useful in tests and plumbing code.
 
-**Data flow**: Returns `self` as `&dyn std::any::Any` without modifying state.
+**Data flow**: The store instance goes in by reference. The function returns the same object viewed through a more general type, without copying or changing anything.
 
-**Call relations**: This satisfies the `ThreadStore` trait and supports code paths like `LiveThread::local_rollout_path` that downcast concrete stores.
+**Call relations**: This method is part of the shared `ThreadStore` interface. Code that only has a generic thread store can use it when it needs type-specific access.
 
 
 ##### `InMemoryThreadStore::create_thread`  (lines 394–396)
@@ -3676,11 +3700,11 @@ fn as_any(&self) -> &dyn std::any::Any
 fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements thread creation by recording the original creation parameters and seeding history with a synthetic `SessionMeta` rollout item. It also increments the create call counter.
+**Purpose**: Creates a new in-memory thread and records its starting session metadata. This gives later reads and history loads something realistic to return.
 
-**Data flow**: Receives `CreateThreadParams`, locks state, increments `calls.create_thread`, builds a `SessionMeta` from the params including source-derived nickname/role/path and metadata-derived provider/base instructions/dynamic tools/memory mode, pushes it as `RolloutItem::SessionMeta(SessionMetaLine { ... })` into the thread’s history, stores the original params in `created_threads`, and returns `Ok(())`.
+**Data flow**: Creation parameters go in, including the thread ID, source, parent or fork information, model provider, instructions, tools, and persistence metadata. The store locks its state, increments the create counter, writes an initial session metadata item into the thread history, saves the creation parameters, and returns success.
 
-**Call relations**: This inherent async method backs the trait implementation’s boxed `create_thread` call and is used by tests that seed in-memory threads.
+**Call relations**: Callers use this through the `ThreadStore` interface when a conversation begins. It prepares data later used by history loading, thread reading, and thread listing.
 
 *Call graph*: calls 1 internal fn (default); called by 1 (seed_pathless_store_thread); 3 external calls (pin, matches!, SessionMeta).
 
@@ -3691,11 +3715,11 @@ fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>
 fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Registers a resumed thread in memory, optionally replacing its history and associating a rollout path. It increments the resume call counter but does not validate prior existence.
+**Purpose**: Marks a thread as resumed and optionally seeds it with existing history and a rollout path. A rollout path is the file path where a conversation transcript may have been stored elsewhere.
 
-**Data flow**: Takes `ResumeThreadParams`, locks state, increments `calls.resume_thread`, inserts provided history into `histories` or ensures an empty history entry exists, stores any provided rollout path in `rollout_paths`, and returns `Ok(())`.
+**Data flow**: Resume parameters go in with a thread ID, optional history, and optional rollout path. The store locks its state, increments the resume counter, stores the provided history or creates an empty history slot, records the path-to-thread mapping if given, and returns success.
 
-**Call relations**: This method backs the trait implementation’s boxed `resume_thread` and is used when higher-level code resumes a live thread against the in-memory backend.
+**Call relations**: Code calls this when reopening an existing thread. Later reads by rollout path depend on the mapping saved here.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3706,11 +3730,11 @@ fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>
 fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Appends canonical persisted rollout items to a thread’s in-memory history and ignores non-persistable or empty input. It increments the append counter only when something canonical remains.
+**Purpose**: Adds new persisted conversation items to a thread’s stored history. It ignores items that should not be persisted, matching the behavior of real rollout storage.
 
-**Data flow**: Receives `AppendThreadItemsParams`, canonicalizes `params.items` with `persisted_rollout_items`, returns early if the canonical list is empty, otherwise locks state, increments `calls.append_items`, extends the thread’s history vector with the canonical items, and returns `Ok(())`.
+**Data flow**: Append parameters go in with a thread ID and raw items. The function first converts them to the canonical saved form; if nothing remains, it returns without touching counters. Otherwise it locks the state, increments the append counter, extends that thread’s history, and returns success.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `append_items` and is used by tests that simulate persisted rollout growth.
+**Call relations**: Conversation code calls this as new events happen. It uses the rollout item filtering helper before saving, and later `load_history` or `read_thread` can return the accumulated items.
 
 *Call graph*: called by 1 (seed_pathless_store_thread); 2 external calls (pin, persisted_rollout_items).
 
@@ -3721,11 +3745,11 @@ fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_,
 fn persist_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the persist operation as a no-op except for call counting. It exists so higher-level code can exercise persistence lifecycle hooks against the in-memory backend.
+**Purpose**: Records that the caller asked to persist a thread. In this in-memory implementation there is no disk or remote service to write to, so it only counts the request.
 
-**Data flow**: Ignores the thread ID payload, returns a boxed async block that locks state, increments `calls.persist_thread`, and yields `Ok(())`.
+**Data flow**: A thread ID is accepted but not otherwise used. The store locks its state, increments the persist counter, and returns success.
 
-**Call relations**: This is the `ThreadStore` trait implementation for persist and is typically reached through `LiveThread::persist`.
+**Call relations**: This fulfills the `ThreadStore` interface for code paths that expect to force persistence. Tests can later inspect the call counter to confirm the request happened.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3736,11 +3760,11 @@ fn persist_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn flush_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements flush as a no-op except for call counting. It models the lifecycle hook without durable storage effects.
+**Purpose**: Records that the caller asked to flush pending thread data. Because this store has no background buffer, flushing simply succeeds after counting the call.
 
-**Data flow**: Ignores the thread ID payload, returns a boxed async block that locks state, increments `calls.flush_thread`, and returns `Ok(())`.
+**Data flow**: A thread ID goes in. The function locks the state, increments the flush counter, and returns success without changing thread contents.
 
-**Call relations**: This trait method is reached through higher-level flush paths such as `LiveThread::flush`.
+**Call relations**: Code using the generic store interface may call this after writes. In this fake store, it exists so those flows can run unchanged in tests.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3751,11 +3775,11 @@ fn flush_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn shutdown_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements shutdown as a no-op except for call counting. It lets tests observe that shutdown was requested.
+**Purpose**: Records that the caller asked to shut down storage for a thread. The in-memory store does not need real shutdown work, but counting the call lets tests verify lifecycle behavior.
 
-**Data flow**: Ignores the thread ID payload, returns a boxed async block that locks state, increments `calls.shutdown_thread`, and returns `Ok(())`.
+**Data flow**: A thread ID goes in. The function locks the state, increments the shutdown counter, leaves stored data in place, and returns success.
 
-**Call relations**: This trait method is typically invoked by live-thread shutdown flows.
+**Call relations**: Thread lifecycle code calls this through the `ThreadStore` interface during cleanup. The method keeps that path testable without requiring real external resources.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3766,11 +3790,11 @@ fn shutdown_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn discard_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements discard as a no-op except for call counting. It models abandoning live persistence without deleting stored thread data.
+**Purpose**: Records that the caller asked to discard a thread. This implementation only counts the request; actual deletion is done by `delete_thread`.
 
-**Data flow**: Ignores the thread ID payload, returns a boxed async block that locks state, increments `calls.discard_thread`, and returns `Ok(())`.
+**Data flow**: A thread ID goes in. The function locks the state, increments the discard counter, makes no other data changes, and returns success.
 
-**Call relations**: This trait method is used by failure-cleanup paths such as `LiveThreadInitGuard` and `LiveThread::resume` error handling.
+**Call relations**: Generic thread cleanup flows can call this safely in tests. The recorded counter shows whether discard was requested.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3784,11 +3808,11 @@ fn load_history(
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>
 ```
 
-**Purpose**: Loads the stored rollout history for a thread and errors if the thread is unknown. It also increments the history-load counter.
+**Purpose**: Returns the saved conversation history for a thread. If the thread has no known history, it reports that the thread was not found.
 
-**Data flow**: Receives `LoadThreadHistoryParams`, locks state, increments `calls.load_history`, clones the thread’s history vector from `histories` or returns `ThreadStoreError::ThreadNotFound`, wraps the items in `StoredThreadHistory`, and returns it.
+**Data flow**: Load parameters go in with a thread ID. The store locks its state, increments the load-history counter, looks up that thread’s item list, clones it into a `StoredThreadHistory`, and returns it; if missing, it returns a not-found error.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `load_history` and is used by resume and read flows that need full rollout items.
+**Call relations**: Readers and resume flows use this when they need the actual saved conversation items. It reads histories created by `create_thread`, `resume_thread`, and `append_items`.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3799,11 +3823,11 @@ fn load_history(
 fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Builds a `StoredThread` view for a thread ID, optionally including history, and tracks both read counts and read-with-history counts. It delegates reconstruction to a shared helper.
+**Purpose**: Builds and returns a stored-thread summary, optionally including the full history. This is the main way callers read back thread metadata from the fake store.
 
-**Data flow**: Receives `ReadThreadParams`, locks state, increments `calls.read_thread`, conditionally increments `calls.read_thread_with_history`, calls `stored_thread_from_state(&state, thread_id, include_history)`, and returns that result.
+**Data flow**: Read parameters go in with a thread ID and an include-history flag. The store locks its state, increments read counters, and asks `stored_thread_from_state` to assemble the returned `StoredThread` or a not-found error.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `read_thread` and is used by higher-level thread inspection paths.
+**Call relations**: Generic store callers use this to fetch one thread. It delegates the detailed assembly work to `stored_thread_from_state`, which combines creation data, updates, names, paths, and optional history.
 
 *Call graph*: calls 1 internal fn (stored_thread_from_state); 1 external calls (pin).
 
@@ -3817,11 +3841,11 @@ fn read_thread_by_rollout_path(
     ) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Looks up a thread by rollout path and returns its reconstructed `StoredThread` view. It errors with `InvalidRequest` if the path is unknown.
+**Purpose**: Finds a thread by its rollout file path and returns the stored-thread view. This supports code that starts from a transcript path instead of a thread ID.
 
-**Data flow**: Receives `ReadThreadByRolloutPathParams`, locks state, increments `calls.read_thread_by_rollout_path`, looks up `params.rollout_path` in `rollout_paths`, returns an `InvalidRequest` error if absent, otherwise calls `stored_thread_from_state(&state, thread_id, include_history)` and returns the result.
+**Data flow**: Parameters go in with a rollout path and include-history flag. The store locks its state, increments the path-read counter, looks up which thread ID owns that path, and either returns an invalid-request error or builds the stored thread through `stored_thread_from_state`.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `read_thread_by_rollout_path` for callers that identify threads by persisted rollout location.
+**Call relations**: This depends on rollout path mappings saved during resume or metadata updates. Once it finds the thread ID, it follows the same assembly path as ordinary `read_thread`.
 
 *Call graph*: calls 1 internal fn (stored_thread_from_state); 2 external calls (pin, format!).
 
@@ -3832,11 +3856,11 @@ fn read_thread_by_rollout_path(
 fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>
 ```
 
-**Purpose**: Returns all created threads as a single page sorted by thread ID string. It does not itself apply filtering parameters.
+**Purpose**: Returns a page containing all threads known to the store, sorted by thread ID. The in-memory store does not produce additional pages, so there is no next cursor.
 
-**Data flow**: Locks state, increments `calls.list_threads`, maps every key in `created_threads` through `stored_thread_from_state(..., include_history=false)`, collects the results into a vector, sorts by `thread_id.to_string()`, wraps them in `ThreadPage { items, next_cursor: None }`, and returns it.
+**Data flow**: The store state is the input. The function locks it, increments the list counter, builds a stored-thread summary for every created thread without history, sorts the results, and returns them in a `ThreadPage`.
 
-**Call relations**: The trait implementation’s `list_threads` wrapper calls this inherent method first, then applies `parent_thread_id` filtering if requested.
+**Call relations**: The trait-level list method calls this basic lister, then may apply extra filtering such as parent-thread filtering. The actual item-building comes from the same state-to-thread helper used by single-thread reads.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3850,11 +3874,11 @@ fn update_thread_metadata(
     ) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Merges a metadata patch into stored thread metadata, updates the separately tracked thread name when present, and returns the reconstructed thread view. It increments the metadata-update counter.
+**Purpose**: Applies metadata changes to a thread and returns the updated stored-thread summary. This lets tests simulate later changes such as names, previews, model details, paths, or timestamps.
 
-**Data flow**: Receives `UpdateThreadMetadataParams`, locks state, increments `calls.update_thread_metadata`, stores `patch.name` into `names` when provided, merges the patch into `metadata_updates[thread_id]`, calls `stored_thread_from_state(&state, thread_id, false)`, and returns the resulting `StoredThread`.
+**Data flow**: Update parameters go in with a thread ID and a metadata patch. The store locks its state, increments the update counter, stores a name separately when provided, merges the patch with any earlier patch for that thread, and returns a fresh stored-thread view.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `update_thread_metadata` and is used by metadata-syncing higher-level code.
+**Call relations**: Callers use this after a thread already exists. It hands off to `stored_thread_from_state` so the returned value reflects both original creation data and the accumulated patch.
 
 *Call graph*: calls 1 internal fn (stored_thread_from_state); called by 1 (seed_pathless_store_thread); 1 external calls (pin).
 
@@ -3865,11 +3889,11 @@ fn update_thread_metadata(
 fn archive_thread(&self, _params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements archive as a no-op except for call counting. It does not move or mark data beyond incrementing the archive counter.
+**Purpose**: Records that a thread was archived. In this in-memory implementation, archiving does not hide the thread or set an archived timestamp; it only counts the call.
 
-**Data flow**: Ignores the archive parameters, returns a boxed async block that locks state, increments `calls.archive_thread`, and returns `Ok(())`.
+**Data flow**: Archive parameters go in but are not used to change stored thread data. The function locks the state, increments the archive counter, and returns success.
 
-**Call relations**: This trait method exists so archive lifecycle paths can be exercised against the in-memory backend.
+**Call relations**: Archive flows can run against this fake store through the common interface. Tests can check the counter, but should not expect full archive filtering behavior from this method.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3880,11 +3904,11 @@ fn archive_thread(&self, _params: ArchiveThreadParams) -> ThreadStoreFuture<'_, 
 fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Implements unarchive by incrementing the counter and returning the current reconstructed thread view. It does not maintain archived state internally.
+**Purpose**: Records that a thread was unarchived and returns its current stored-thread summary. This mirrors the interface expected by real stores while keeping behavior simple.
 
-**Data flow**: Receives `ArchiveThreadParams`, returns a boxed async block that locks state, increments `calls.unarchive_thread`, calls `stored_thread_from_state(&state, params.thread_id, false)`, and returns that `StoredThread`.
+**Data flow**: Archive parameters go in with the thread ID. The store locks its state, increments the unarchive counter, and uses `stored_thread_from_state` to return the thread or a not-found error.
 
-**Call relations**: This trait method supports unarchive flows in tests even though the in-memory backend does not track archived timestamps.
+**Call relations**: Unarchive flows call this through the `ThreadStore` interface. It reuses the central thread-building helper so returned metadata is consistent with ordinary reads.
 
 *Call graph*: calls 1 internal fn (stored_thread_from_state); 1 external calls (pin).
 
@@ -3895,11 +3919,11 @@ fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_,
 fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Deletes all in-memory data associated with a thread and reports `ThreadNotFound` if the thread had no history entry. It also removes any rollout-path mappings pointing to that thread.
+**Purpose**: Deletes all in-memory records for a thread. This is the operation that actually removes histories, creation data, names, metadata patches, and rollout path mappings.
 
-**Data flow**: Receives `DeleteThreadParams`, locks state, increments `calls.delete_thread`, removes the thread from `histories`, `created_threads`, `names`, and `metadata_updates`, prunes matching entries from `rollout_paths`, and returns `Ok(())` if a history entry existed or `ThreadStoreError::ThreadNotFound` otherwise.
+**Data flow**: Delete parameters go in with a thread ID. The store locks its state, increments the delete counter, removes the thread from all internal maps, removes any paths pointing to it, and returns success only if a history entry existed; otherwise it returns a not-found error.
 
-**Call relations**: This inherent method backs the trait implementation’s boxed `delete_thread` and is used by cleanup paths.
+**Call relations**: Callers use this through the common store interface when a thread should be removed. It is the stronger counterpart to lifecycle methods like discard, which only count requests here.
 
 *Call graph*: 1 external calls (pin).
 
@@ -3914,11 +3938,11 @@ fn stored_thread_from_state(
 ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Reconstructs a `StoredThread` snapshot by combining original creation parameters, accumulated metadata patches, optional history, and rollout-path mappings. It is the central read-model builder for the in-memory store.
+**Purpose**: Assembles a complete `StoredThread` view from the store’s internal maps. It is the central translator from scattered in-memory records into the shape callers expect.
 
-**Data flow**: Reads immutable `InMemoryThreadStoreState`, looks up `created_threads[thread_id]` or returns `ThreadNotFound`, clones history items if present, conditionally wraps them in `StoredThreadHistory`, resolves `name`, metadata patch, and rollout path, then builds a `StoredThread` with patched values taking precedence over creation defaults. Missing timestamps default to `Utc::now()`, missing provider/CLI version default to `"test"`, and git metadata is converted through `git_info_from_patch`.
+**Data flow**: The current state, a thread ID, and an include-history flag go in. The function finds the original creation record, collects history if requested, applies name and metadata patches, finds a rollout path, fills in sensible test defaults for missing fields, converts git metadata when present, and returns the finished stored thread or a not-found error.
 
-**Call relations**: This helper is called by `read_thread`, `read_thread_by_rollout_path`, `update_thread_metadata`, and `unarchive_thread` so all read paths share the same reconstruction rules.
+**Call relations**: Read, read-by-path, metadata update, and unarchive operations all rely on this helper. Keeping the assembly in one place means those operations return consistent thread data.
 
 *Call graph*: called by 4 (read_thread, read_thread_by_rollout_path, unarchive_thread, update_thread_metadata).
 
@@ -3929,11 +3953,11 @@ fn stored_thread_from_state(
 fn git_info_from_patch(patch: &ThreadMetadataPatch) -> Option<codex_protocol::protocol::GitInfo>
 ```
 
-**Purpose**: Converts optional git metadata stored in a `ThreadMetadataPatch` into the protocol-level `GitInfo` structure, dropping it entirely if every field is absent. It also wraps commit hashes in `GitSha`.
+**Purpose**: Converts git-related fields from a metadata patch into the protocol’s `GitInfo` shape. It returns nothing if the patch does not contain any meaningful git information.
 
-**Data flow**: Reads `patch.git_info`, extracts flattened optional `sha`, `branch`, and `origin_url`, returns `None` if all three are absent, otherwise constructs and returns `codex_protocol::protocol::GitInfo { commit_hash, branch, repository_url }` with `commit_hash` mapped through `codex_git_utils::GitSha::new`.
+**Data flow**: A metadata patch goes in. The function looks for commit SHA, branch, and origin URL, unwraps values that may explicitly be absent, and if at least one exists, builds a `GitInfo` object with the expected field names and SHA wrapper.
 
-**Call relations**: This helper is used only by `stored_thread_from_state` when reconstructing a `StoredThread` from patched metadata.
+**Call relations**: The stored-thread assembly helper calls this when it needs to include git information in a returned thread. It keeps the git conversion detail out of the main thread-building logic.
 
 
 ### Local thread-store foundation
@@ -3941,13 +3965,13 @@ These files define the local filesystem-backed thread store and the shared helpe
 
 ### `thread-store/src/local/helpers.rs`
 
-`util` · `cross-cutting`
+`util` · `cross-cutting during thread reads, archive/unarchive/delete operations, and metadata updates`
 
-This file is the utility layer for the local thread store. Several helpers enforce filesystem invariants: `scoped_rollout_path` canonicalizes both a root and candidate path and rejects anything outside the allowed subtree, while `rollout_path_is_archived` detects archived placement either by absolute prefix under `codex_home/archived_sessions` or by any matching path component. `matching_rollout_file_name` validates that a rollout basename ends with `<thread-id>.jsonl` or `.jsonl.zst`, preventing accidental cross-thread operations.
+A “thread” here is a saved conversation, and a “rollout” is the log file that records it. This file is like the thread store’s utility drawer: it does the careful small jobs that many larger operations rely on. Some helpers protect the filesystem by making sure a requested rollout path really lives inside the expected home directory and that its file name matches the thread ID. Without those checks, archive or delete operations could accidentally touch the wrong file. Other helpers recognize whether a rollout is archived, update a file’s modified time when it is restored, and extract a thread ID from the standard rollout file name format.
 
-The conversion helpers bridge rollout records and store-facing models. `stored_thread_from_rollout_item` builds a `StoredThread` from a `codex_rollout::ThreadItem`, filling defaults for missing provider, source, preview, timestamps, and permission settings, and normalizing compressed paths to logical plain `.jsonl` paths. Supporting parsers recover RFC3339 timestamps, derive `GitInfo`, and extract a `ThreadId` from rollout filenames when the item itself lacks one.
+The file also converts lower-level saved data into a `StoredThread`, which is the richer thread record the rest of the store understands. During that conversion it fills in safe defaults, parses timestamps, normalizes compressed rollout paths to their plain `.jsonl` form, builds Git information when present, and uses read-only permissions if nothing more specific is known.
 
-Compatibility logic is concentrated here as well. Permission metadata can be parsed from modern serialized `PermissionProfile` JSON or older sandbox-policy strings and enums; serialization failures are downgraded to warnings and an empty string. Title helpers suppress redundant names when the title is blank or duplicates the first user message/preview. Overall, the file codifies subtle fallback behavior that keeps old rollout files and newer SQLite metadata interoperable.
+Finally, it deals with metadata compatibility. Permission settings may be saved in the current JSON format or in older names such as `workspace-write`; this file reads both. It also avoids showing duplicate thread titles when the title is just the first user message repeated.
 
 #### Function details
 
@@ -3961,11 +3985,11 @@ fn scoped_rollout_path(
 ) -> ThreadStoreResult<PathBuf>
 ```
 
-**Purpose**: Canonicalizes a rollout path and verifies it resides under a specific allowed root directory. It is used as a path-traversal guard before archive, unarchive, and delete operations touch the filesystem.
+**Purpose**: Checks that a rollout file path is safely inside an allowed root directory. This prevents callers such as archive or delete operations from acting on files outside the thread store area.
 
-**Data flow**: Takes an owned `root` `PathBuf`, a candidate `rollout_path`, and a human-readable `root_name`. It canonicalizes `root`, canonicalizes `rollout_path`, compares `canonical_rollout_path.starts_with(&canonical_root)`, and returns the canonical rollout path on success; otherwise it returns `ThreadStoreError::Internal` for root-resolution failure or `ThreadStoreError::InvalidRequest` when the candidate is missing or outside the root.
+**Data flow**: It receives the allowed root folder, the rollout path to check, and a human-readable name for that root. It resolves both paths to their real filesystem locations, then compares them. If the rollout path is inside the root, it returns the resolved path; otherwise it returns an invalid-request error with a clear message.
 
-**Call relations**: Called by archive, unarchive, and delete code paths before moving or removing files. It delegates only to filesystem canonicalization and centralizes the scope check so those higher-level flows share identical validation semantics.
+**Call relations**: Archive, delete, and unarchive flows call this before touching a rollout file. It acts as the gatekeeper before those higher-level operations move or remove anything on disk.
 
 *Call graph*: called by 3 (archive_thread, delete_rollout_path, unarchive_thread); 2 external calls (format!, canonicalize).
 
@@ -3976,11 +4000,11 @@ fn scoped_rollout_path(
 fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool
 ```
 
-**Purpose**: Determines whether a rollout path should be treated as archived based on its location. It supports both direct paths under the configured archived root and paths containing the archived subdirectory anywhere in their components.
+**Purpose**: Decides whether a rollout path points to an archived session. This lets readers and resolvers treat archived conversations differently from active ones.
 
-**Data flow**: Consumes `codex_home` and a candidate `path`; it compares the path against `codex_home.join(ARCHIVED_SESSIONS_SUBDIR)` and scans path components for the archived subdirectory name. It returns a boolean with no side effects.
+**Data flow**: It receives the Codex home directory and a path. It checks whether the path starts inside the known archived sessions folder, or whether any part of the path is named like the archive folder. It returns `true` for archived-looking paths and `false` otherwise.
 
-**Call relations**: Used by read and history-loading flows to enforce `include_archived`, by rollout-path resolution logic, and by metadata conversion helpers that need to set `archived_at` consistently.
+**Call relations**: Thread loading and path resolution code calls this when it needs to label a thread or choose where to look. It supplies a simple yes-or-no answer used by `load_history`, `read_thread`, `read_thread_from_rollout_path`, `resolve_rollout_path`, and `stored_thread_from_session_meta`.
 
 *Call graph*: called by 5 (load_history, read_thread, read_thread_from_rollout_path, resolve_rollout_path, stored_thread_from_session_meta); 3 external calls (components, join, starts_with).
 
@@ -3995,11 +4019,11 @@ fn matching_rollout_file_name(
 ) -> ThreadStoreResult<std::ffi::OsString>
 ```
 
-**Purpose**: Checks that a rollout filename belongs to the expected thread ID by suffix, accepting both plain and compressed rollout extensions. This prevents operations on a path whose basename does not encode the requested thread.
+**Purpose**: Verifies that a rollout file name belongs to the thread ID the caller expects. This protects archive, delete, and unarchive actions from mixing up two different conversations.
 
-**Data flow**: Accepts a canonical `rollout_path`, the expected `ThreadId`, and a `display_path` for error messages. It extracts the file name, builds required suffixes `<thread_id>.jsonl` and `<thread_id>.jsonl.zst`, compares them against the lossy string form, and returns the owned file name on success or `ThreadStoreError::InvalidRequest` if the file name is missing or mismatched.
+**Data flow**: It receives a rollout path, the expected thread ID, and a display path for error messages. It extracts the file name and checks that it ends with either `<thread_id>.jsonl` or `<thread_id>.jsonl.zst`. If the name matches, it returns the file name; if not, it returns an invalid-request error.
 
-**Call relations**: Called by archive, unarchive, and delete helpers after path scoping succeeds. It complements `scoped_rollout_path` by validating identity at the filename level.
+**Call relations**: Archive, delete, and unarchive operations call this after choosing a path. It gives them confidence that the file they are about to move or delete really matches the thread requested by the user.
 
 *Call graph*: called by 3 (archive_thread, delete_rollout_path, unarchive_thread); 2 external calls (file_name, format!).
 
@@ -4010,11 +4034,11 @@ fn matching_rollout_file_name(
 fn touch_modified_time(path: &Path) -> std::io::Result<()>
 ```
 
-**Purpose**: Updates a file's modification timestamp to the current time without rewriting its contents. It opens the file in append mode and applies `FileTimes` with a fresh modified time.
+**Purpose**: Updates a file’s modified time to the current moment. This is useful when a rollout is restored so filesystem ordering can reflect that recent change.
 
-**Data flow**: Takes a `&Path`, creates `FileTimes::new().set_modified(SystemTime::now())`, opens the file with `OpenOptions::new().append(true)`, and calls `set_times`. It returns a plain `std::io::Result<()>`.
+**Data flow**: It receives a path. It opens that file for appending, creates a file timestamp using the current system time, and writes that timestamp onto the file metadata. It returns success or an operating-system I/O error.
 
-**Call relations**: Used by unarchive logic after moving a rollout so the restored file reflects a fresh modification time. It is intentionally low-level and does not wrap errors in store-specific types.
+**Call relations**: The unarchive flow calls this after bringing a thread back. It does not decide what to unarchive; it only refreshes the file’s timestamp once the larger operation has chosen the file.
 
 *Call graph*: called by 1 (unarchive_thread); 3 external calls (new, new, now).
 
@@ -4029,11 +4053,11 @@ fn stored_thread_from_rollout_item(
 ) -> Option<StoredThread>
 ```
 
-**Purpose**: Transforms a `codex_rollout::ThreadItem` summary into the store's `StoredThread` model, applying defaults and compatibility fallbacks for missing fields. It is the main adapter from rollout-library listing/search/read summaries into thread-store responses.
+**Purpose**: Turns a lightweight rollout index item into a fuller `StoredThread` record. This lets the rest of the thread store work with one consistent shape even when the source data is incomplete.
 
-**Data flow**: Consumes a `ThreadItem`, an `archived` flag, and the default provider string. It derives `thread_id` from `item.thread_id` or `thread_id_from_rollout_path`, parses `created_at`/`updated_at` with fallback to `Utc::now`, computes `archived_at`, builds `git_info` from SHA/branch/origin parts, chooses preview from `preview` then `first_user_message`, normalizes `item.path` to a plain rollout path, and constructs a `StoredThread` with fixed defaults such as `AskForApproval::OnRequest` and `PermissionProfile::read_only()`. It returns `None` if no thread ID can be determined.
+**Data flow**: It receives a `ThreadItem`, whether it is archived, and a default model provider name. It finds or derives the thread ID, parses creation and update times, builds optional Git information, chooses a preview message, normalizes the rollout path, and fills missing fields with safe defaults such as read-only permissions. If it cannot determine a thread ID, it returns nothing; otherwise it returns a completed `StoredThread`.
 
-**Call relations**: Called by list, search, read-by-rollout, and unarchive flows whenever a rollout-library `ThreadItem` must become a public `StoredThread`. It delegates timestamp and git parsing to local helpers.
+**Call relations**: Reading a thread from a rollout path and unarchiving a thread both use this conversion step. The included test also calls it to confirm compressed `.zst` rollout paths are stored as their logical plain `.jsonl` path. Inside the conversion it relies on helpers for timestamps, Git data, and path normalization.
 
 *Call graph*: calls 3 internal fn (read_only, git_info_from_parts, parse_rfc3339); called by 3 (stored_thread_from_rollout_item_returns_logical_rollout_path, read_thread_from_rollout_path, unarchive_thread); 1 external calls (plain_rollout_path).
 
@@ -4044,11 +4068,11 @@ fn stored_thread_from_rollout_item(
 fn permission_profile_from_metadata_value(value: &str, cwd: &Path) -> PermissionProfile
 ```
 
-**Purpose**: Parses persisted sandbox/permission metadata into a `PermissionProfile`, supporting both modern serialized profiles and legacy sandbox-policy encodings. Invalid values degrade to read-only permissions.
+**Purpose**: Reads saved permission settings from metadata and turns them into a current `PermissionProfile`. It exists so both new metadata and older saved formats still work.
 
-**Data flow**: Takes the raw metadata string and the thread `cwd`. It first tries `serde_json::from_str::<PermissionProfile>`, then falls back to `parse_legacy_sandbox_policy` and converts that policy with `PermissionProfile::from_legacy_sandbox_policy_for_cwd`, and finally returns `PermissionProfile::read_only()` if all parsing fails.
+**Data flow**: It receives a metadata string and the thread’s working directory. It first tries to parse the string as a current permission profile. If that fails, it tries to interpret it as an older sandbox policy and converts that into a permission profile for the working directory. If every attempt fails, it returns a read-only profile as the safest fallback.
 
-**Call relations**: Used when reading threads from SQLite metadata so callers receive a normalized permission model regardless of how older metadata was stored.
+**Call relations**: Thread-reading code calls this when rebuilding a thread from stored metadata, including SQLite metadata. It bridges old stored values into the current permission system before the rest of the store sees them.
 
 *Call graph*: called by 2 (read_thread, stored_thread_from_sqlite_metadata).
 
@@ -4061,11 +4085,11 @@ fn permission_profile_to_metadata_value(
 ) -> String
 ```
 
-**Purpose**: Serializes a `PermissionProfile` for storage in metadata, logging a warning and returning an empty string if serialization fails. This keeps metadata updates non-panicking even for unexpected serialization issues.
+**Purpose**: Converts a `PermissionProfile` into the string form saved in metadata. This is the reverse of reading permission metadata.
 
-**Data flow**: Accepts a `&PermissionProfile`, attempts `serde_json::to_string`, and returns the serialized string on success. On error it emits `tracing::warn!` and returns `String::new()`.
+**Data flow**: It receives a permission profile. It tries to serialize it as JSON text. If that works, it returns the JSON string; if serialization fails, it writes a warning to the log and returns an empty string.
 
-**Call relations**: Called by metadata-update code before writing permission settings into SQLite. It is the inverse of `permission_profile_from_metadata_value` for the modern storage format.
+**Call relations**: Metadata update code calls this when saving permission changes. It prepares the profile for storage so later reads can reconstruct the same setting.
 
 *Call graph*: called by 1 (apply_metadata_update); 3 external calls (new, to_string, warn!).
 
@@ -4076,11 +4100,11 @@ fn permission_profile_to_metadata_value(
 fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String>
 ```
 
-**Purpose**: Extracts a meaningful thread title from `ThreadMetadata` only when it is non-empty and not just a duplicate of the first user message. This avoids surfacing redundant names in list/search/read results.
+**Purpose**: Returns a thread title only if it is meaningful and not just a duplicate of the first user message. This keeps thread lists from showing redundant names.
 
-**Data flow**: Reads `metadata.title` and `metadata.first_user_message`, trims whitespace, and returns `Some(title.to_string())` only when the title is non-blank and differs from the trimmed first user message; otherwise it returns `None`.
+**Data flow**: It receives thread metadata. It trims whitespace from the title, checks whether it is empty, and compares it with the trimmed first user message if one exists. It returns no title for empty or duplicate text, otherwise it returns the cleaned title.
 
-**Call relations**: Used by list, search, and SQLite-to-thread conversion paths to decide whether SQLite title metadata should become a visible thread name.
+**Call relations**: Thread listing, SQLite metadata conversion, and search-result naming call this before displaying or storing a thread name. It supplies the “is this title worth showing?” decision.
 
 *Call graph*: called by 3 (list_threads, stored_thread_from_sqlite_metadata, set_thread_search_result_names).
 
@@ -4091,11 +4115,11 @@ fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String>
 fn set_thread_name_from_title(thread: &mut StoredThread, title: String)
 ```
 
-**Purpose**: Assigns a thread name from a title only when the title is non-empty and not identical to the thread preview. It preserves the convention that names should add information beyond the preview text.
+**Purpose**: Copies a title onto a stored thread as its display name, but only when the title is useful. It avoids setting names that are blank or merely repeat the preview text.
 
-**Data flow**: Mutably borrows a `StoredThread` and takes a `String` title. It trims both title and `thread.preview`, returns early if the title is blank or duplicates the preview, and otherwise writes `thread.name = Some(title)`.
+**Data flow**: It receives a mutable `StoredThread` and a proposed title. It trims and compares the title with the thread preview. If the title is blank or the same as the preview, it leaves the thread unchanged; otherwise it sets `thread.name` to that title.
 
-**Call relations**: Called after list/search/read flows gather titles from SQLite or legacy name indexes. It is the final gate that suppresses redundant naming in outward-facing thread summaries.
+**Call relations**: Thread listing, rollout-path reading, and search-result naming use this after they have found a possible title. It applies the final rule for whether the thread should get a separate display name.
 
 *Call graph*: called by 3 (list_threads, read_thread_from_rollout_path, set_thread_search_result_names).
 
@@ -4106,11 +4130,11 @@ fn set_thread_name_from_title(thread: &mut StoredThread, title: String)
 fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>>
 ```
 
-**Purpose**: Parses an optional RFC3339 timestamp string into `DateTime<Utc>`. Missing or invalid input yields `None`.
+**Purpose**: Parses a timestamp written in RFC 3339 format, a common internet date-time format such as `2025-01-03T12:00:00Z`. It gives the rollout conversion code reliable UTC times when the saved data includes them.
 
-**Data flow**: Accepts `Option<&str>`, returns early on `None`, otherwise parses with `DateTime::parse_from_rfc3339` and converts the timezone to UTC. It returns `Option<DateTime<Utc>>`.
+**Data flow**: It receives an optional string. If no string is present, it returns nothing. If a string is present, it tries to parse it as an RFC 3339 timestamp and convert it to UTC; failed parsing also returns nothing.
 
-**Call relations**: Used only by `stored_thread_from_rollout_item` to decode rollout summary timestamps while keeping invalid metadata non-fatal.
+**Call relations**: The rollout-item conversion helper calls this for created and updated times. If parsing fails, that caller chooses fallback times instead of letting a bad timestamp break thread loading.
 
 *Call graph*: called by 1 (stored_thread_from_rollout_item); 1 external calls (parse_from_rfc3339).
 
@@ -4121,11 +4145,11 @@ fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>>
 fn parse_legacy_sandbox_policy(value: &str) -> serde_json::Result<SandboxPolicy>
 ```
 
-**Purpose**: Interprets older sandbox-policy metadata encodings, including JSON values and several historical string aliases. It exists solely for backward compatibility with previously persisted metadata.
+**Purpose**: Interprets older saved sandbox permission values. A sandbox policy describes what a session was allowed to do, such as read-only access or workspace writing.
 
-**Data flow**: Takes a raw string and tries to deserialize it directly as `SandboxPolicy`, then as a JSON string value, then matches known literals like `danger-full-access`, `read-only`, `workspace-write`, and `external-sandbox`, finally retrying string-value deserialization for unknown cases. It returns `serde_json::Result<SandboxPolicy>`.
+**Data flow**: It receives a string. It tries several interpretations: direct JSON, JSON string value, and known legacy words such as `danger-full-access`, `read-only`, `workspace-write`, and `external-sandbox`. If one matches, it returns the corresponding sandbox policy; otherwise it returns a parse error.
 
-**Call relations**: Reached through `permission_profile_from_metadata_value` when modern `PermissionProfile` parsing fails. It isolates legacy decoding rules from the rest of the store.
+**Call relations**: The permission metadata reader uses this as a compatibility path when current permission-profile parsing fails. It lets old threads keep sensible permissions after the storage format has changed.
 
 *Call graph*: 1 external calls (from_str).
 
@@ -4140,11 +4164,11 @@ fn git_info_from_parts(
 ) -> Option<GitInfo>
 ```
 
-**Purpose**: Builds a `GitInfo` struct from optional SHA, branch, and origin URL fields, or returns `None` when all three are absent. It also wraps the SHA string in the `GitSha` newtype.
+**Purpose**: Builds optional Git repository information from separate saved pieces: commit hash, branch, and remote URL. Git is the version-control system used to track source code changes.
 
-**Data flow**: Consumes three `Option<String>` values. If all are `None`, it returns `None`; otherwise it constructs `GitInfo { commit_hash, branch, repository_url }`, mapping `sha` through `GitSha::new`.
+**Data flow**: It receives optional commit SHA text, branch name, and origin URL. If all three are missing, it returns no Git info. If any are present, it wraps the commit hash in the project’s Git SHA type and returns a `GitInfo` record containing the available pieces.
 
-**Call relations**: Used across rollout and SQLite conversion paths, plus metadata update logic, to normalize git metadata assembly in one place.
+**Call relations**: Rollout conversion, rollout-path reading, SQLite metadata conversion, metadata application, and metadata update code all call this when they need one Git-info object from scattered fields. It centralizes the rule that completely empty Git data should stay absent.
 
 *Call graph*: called by 5 (stored_thread_from_rollout_item, read_thread_by_rollout_path, stored_thread_from_sqlite_metadata, apply_metadata_update, update_thread_metadata).
 
@@ -4155,11 +4179,11 @@ fn git_info_from_parts(
 fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId>
 ```
 
-**Purpose**: Extracts a `ThreadId` from a rollout filename by stripping `.zst` and `.jsonl` suffixes and parsing the trailing UUID segment. It supports filenames of the form `...-<uuid>.jsonl[.zst]`.
+**Purpose**: Tries to recover a thread ID from the standard rollout file name. This helps load older or incomplete rollout items that did not store the thread ID separately.
 
-**Data flow**: Reads the file name from a `&Path`, converts it to UTF-8, strips optional `.zst` then required `.jsonl`, checks that the stem is long enough and contains a dash before the final 36-character UUID, and parses that suffix with `ThreadId::from_string`. It returns `Option<ThreadId>`.
+**Data flow**: It receives a path. It extracts the file name, removes a possible `.zst` compression suffix, then removes the `.jsonl` suffix. It expects the last 36 characters before that suffix to be a UUID-style thread ID preceded by a dash. If that pattern is valid, it returns the parsed `ThreadId`; otherwise it returns nothing.
 
-**Call relations**: Used as a fallback by `stored_thread_from_rollout_item` when the rollout summary lacks an explicit thread ID.
+**Call relations**: The rollout-item conversion helper uses this when the `ThreadItem` itself does not include a thread ID. It is a fallback, not the main source of identity.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (file_name).
 
@@ -4170,24 +4194,24 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId>
 fn stored_thread_from_rollout_item_returns_logical_rollout_path()
 ```
 
-**Purpose**: Verifies that converting a rollout item backed by a compressed file reports the logical plain `.jsonl` rollout path in `StoredThread`.
+**Purpose**: Checks that converting a compressed rollout item stores the logical plain rollout path rather than the compressed filename. This protects code that expects thread records to point at the `.jsonl` form.
 
-**Data flow**: Constructs a compressed-path `ThreadItem`, calls `stored_thread_from_rollout_item`, and asserts that the resulting `StoredThread.rollout_path` is the same filename with the `.jsonl` extension rather than `.jsonl.zst`.
+**Data flow**: It creates a fixed UUID and a fake compressed `.jsonl.zst` rollout path, builds a mostly default `ThreadItem`, and converts it with `stored_thread_from_rollout_item`. It then compares the stored path with the expected same path ending in `.jsonl`.
 
-**Call relations**: This test pins the path-normalization behavior relied on by list/read/search responses when rollout storage may be compressed.
+**Call relations**: This test exercises `stored_thread_from_rollout_item` directly. It documents and guards an important behavior used by thread reading and unarchiving: compressed rollout files are represented internally by their plain logical path.
 
 *Call graph*: calls 1 internal fn (stored_thread_from_rollout_item); 5 external calls (default, from, from_u128, assert_eq!, format!).
 
 
 ### `thread-store/src/local/mod.rs`
 
-`orchestration` · `cross-cutting`
+`orchestration` · `cross-cutting: active whenever local threads are created, read, updated, searched, archived, or shut down`
 
-This module is the root of the local thread-store implementation. It declares the submodules that hold operation-specific logic and defines two core types: `LocalThreadStoreConfig`, which captures `codex_home`, `sqlite_home`, and the fallback provider ID, and `LocalThreadStore`, which stores that config plus an optional `StateDbHandle` and a process-local `Arc<Mutex<HashMap<ThreadId, RolloutRecorder>>>` of active live writers.
+A thread is a saved conversation history. Locally, the project keeps the full replayable history in rollout JSONL files, while SQLite, when available, acts like a fast card catalog for thread names, dates, paths, and search metadata. This file defines LocalThreadStore, the concrete local version of the ThreadStore interface, and LocalThreadStoreConfig, which says where the local files and database live.
 
-The inherent methods expose shared primitives used across submodules. `new` constructs the store; `state_db` clones the optional DB handle; `live_recorder`, `ensure_live_recorder_absent`, and `insert_live_recorder` enforce the invariant that at most one live recorder exists per thread ID in a process. `live_rollout_path` and `read_thread_by_rollout_path` are convenience wrappers into submodules. `load_history` is the most substantial local method: it first prefers a live recorder’s rollout path, rejects archived live threads when `include_archived` is false, and otherwise falls back to the normal read path with history enabled.
+The important job here is coordination. Most detailed work is delegated to nearby modules such as live_writer, read_thread, list_threads, and archive_thread. This file keeps the shared pieces: configuration, the optional SQLite handle, and a map of currently open RolloutRecorder objects. That map is protected by a mutex, which is a lock that stops two async tasks from changing the same collection at the same time.
 
-The `ThreadStore` trait implementation is mostly dispatch glue: each trait method boxes an async future and forwards to the corresponding submodule function. This file therefore defines the object’s shape, concurrency boundaries, and delegation structure. The tests here focus on cross-module behavior: live writer lifecycle, duplicate-writer rejection, external rollout resumes, archived/live history semantics, and the contract that raw appends do not themselves update SQLite metadata.
+A useful analogy is a library desk. The JSONL files are the actual books, SQLite is the searchable catalog, and LocalThreadStore is the librarian who knows whether a book is currently being written, where to find it, and which specialist desk should handle reading, searching, archiving, or deleting. Without this file, callers would not have one consistent local storage object that obeys the ThreadStore contract.
 
 #### Function details
 
@@ -4197,11 +4221,11 @@ The `ThreadStore` trait implementation is mostly dispatch glue: each trait metho
 fn from_config(config: &impl codex_rollout::RolloutConfigView) -> Self
 ```
 
-**Purpose**: Builds a local-store configuration snapshot from any `codex_rollout::RolloutConfigView`. It copies the rollout roots and default provider into owned values.
+**Purpose**: Builds the local thread-store settings from the broader application configuration. It extracts the folders used for local Codex data and SQLite data, plus the default model provider used when older saved metadata is incomplete.
 
-**Data flow**: Reads `codex_home()`, `sqlite_home()`, and `model_provider_id()` from the supplied config view, converts the paths to `PathBuf`s and the provider to `String`, and returns a new `LocalThreadStoreConfig`.
+**Data flow**: It receives any configuration object that can reveal the Codex home folder, SQLite home folder, and model provider id. It copies those values into a LocalThreadStoreConfig. The result is a small, process-wide settings object for local thread storage.
 
-**Call relations**: Used by higher-level session/setup code when constructing a `LocalThreadStore` from broader application configuration.
+**Call relations**: Startup and test setup code call this when they need a LocalThreadStoreConfig. It asks the shared rollout configuration for the three paths or ids it needs, then hands the finished config to LocalThreadStore::new or similar setup paths.
 
 *Call graph*: called by 8 (resume_agent_from_rollout_reads_archived_rollout_path, guardian_subagent_does_not_inherit_parent_exec_policy_rules, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx, session_new_fails_when_zsh_fork_enabled_without_packaged_zsh, thread_store_from_config); 3 external calls (codex_home, model_provider_id, sqlite_home).
 
@@ -4212,11 +4236,11 @@ fn from_config(config: &impl codex_rollout::RolloutConfigView) -> Self
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats `LocalThreadStore` for debugging by exposing its configuration while intentionally omitting internal mutable state details. The output is marked non-exhaustive.
+**Purpose**: Provides a safe debug printout for LocalThreadStore. It shows the configuration but avoids dumping internal live writer state.
 
-**Data flow**: Reads `self.config`, writes it into a `debug_struct("LocalThreadStore")`, and finishes with `finish_non_exhaustive()`.
+**Data flow**: It receives a formatter from Rust's debugging system. It writes a debug structure containing the store config and marks the rest as intentionally not shown. Nothing in the store is changed.
 
-**Call relations**: This is the manual `Debug` implementation for the store type and is not part of runtime control flow.
+**Call relations**: This is used automatically when code formats LocalThreadStore with Rust's debug formatting. It delegates to the standard debug builder rather than being called directly by storage logic.
 
 *Call graph*: 1 external calls (debug_struct).
 
@@ -4227,11 +4251,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn new(config: LocalThreadStoreConfig, state_db: Option<StateDbHandle>) -> Self
 ```
 
-**Purpose**: Constructs a `LocalThreadStore` with the provided configuration and optional state DB handle, initializing an empty live-recorder map.
+**Purpose**: Creates a new local thread store object. Callers use it when they want one place to read and write local conversation threads.
 
-**Data flow**: Consumes `LocalThreadStoreConfig` and `Option<StateDbHandle>`, allocates `Arc<Mutex<HashMap<ThreadId, RolloutRecorder>>>` with an empty map, and returns `Self { config, live_recorders, state_db }`.
+**Data flow**: It receives local storage configuration and, optionally, a handle to the SQLite state database. It creates an empty shared map for live rollout writers, stores the database handle, and returns a ready LocalThreadStore.
 
-**Call relations**: Called by tests and application setup code before any thread-store operations occur.
+**Call relations**: Session setup, tests, and thread-store construction paths call this after configuration is known. Later ThreadStore methods use the fields initialized here to delegate work to writer, reader, search, archive, and delete modules.
 
 *Call graph*: called by 75 (resume_agent_from_rollout_reads_archived_rollout_path, has_recorded_sessions, guardian_subagent_does_not_inherit_parent_exec_policy_rules, make_session_and_context, make_session_and_context_with_auth_config_home_and_rx, make_session_with_config_and_rx, make_session_with_history_source_and_agent_control_and_rx, session_new_fails_when_zsh_fork_enabled_without_packaged_zsh, with_models_provider_home_and_state_for_tests, thread_store_from_config (+15 more)); 3 external calls (new, new, new).
 
@@ -4242,11 +4266,11 @@ fn new(config: LocalThreadStoreConfig, state_db: Option<StateDbHandle>) -> Self
 async fn state_db(&self) -> Option<StateDbHandle>
 ```
 
-**Purpose**: Returns a clone of the optional state DB handle used by the local store. This keeps callers from borrowing internal state directly.
+**Purpose**: Returns the optional SQLite database handle used by local storage. Other modules use it when they need fast metadata lookup or updates.
 
-**Data flow**: Reads `self.state_db.clone()` and returns `Option<StateDbHandle>` asynchronously.
+**Data flow**: It reads the store's saved database handle and clones it if one exists. The caller gets either a usable handle or None, meaning this store must rely on rollout files only.
 
-**Call relations**: Used throughout submodules whenever SQLite-backed metadata lookup or updates are needed.
+**Call relations**: Archive, delete, list, search, read, and repair-style helper paths call this when they may need SQLite. It does not perform database work itself; it simply shares the handle with the module that will.
 
 *Call graph*: called by 14 (archive_thread, delete_thread, list_threads, sync_materialized_rollout_path, read_sqlite_metadata, resolve_rollout_path, search_threads, set_thread_search_result_names, unarchive_thread, apply_metadata_update (+4 more)).
 
@@ -4257,11 +4281,11 @@ async fn state_db(&self) -> Option<StateDbHandle>
 async fn live_rollout_path(&self, thread_id: ThreadId) -> ThreadStoreResult<PathBuf>
 ```
 
-**Purpose**: Exposes the current rollout path for an active live recorder through the public store API surface. It is mainly for legacy local-only code paths.
+**Purpose**: Returns the file path currently used by the live writer for a thread. This supports older local-only code paths that still need to know the active rollout file location.
 
-**Data flow**: Takes a `ThreadId`, delegates to `live_writer::rollout_path(self, thread_id).await`, and returns the resulting `PathBuf` or store error.
+**Data flow**: It receives a thread id. It asks the live writer module to resolve that thread's rollout path and returns the path or an error if it cannot be found.
 
-**Call relations**: Thin wrapper over the live-writer helper, used by tests and compatibility callers.
+**Call relations**: Callers use this after creating or resuming a live thread, especially in tests and legacy flows. The actual lookup is handed to live_writer::rollout_path.
 
 *Call graph*: calls 1 internal fn (rollout_path).
 
@@ -4275,11 +4299,11 @@ async fn live_recorder(
     ) -> ThreadStoreResult<RolloutRecorder>
 ```
 
-**Purpose**: Looks up and clones the active `RolloutRecorder` for a thread ID from the in-memory live-recorder map. Missing entries are reported as `ThreadNotFound`.
+**Purpose**: Finds the active RolloutRecorder for a thread. A RolloutRecorder is the object that appends conversation items to that thread's JSONL history file.
 
-**Data flow**: Locks `self.live_recorders`, reads the map entry for `thread_id`, clones the `RolloutRecorder` if present, and returns it or `ThreadStoreError::ThreadNotFound`.
+**Data flow**: It receives a thread id, locks the live-recorder map, and looks up the matching recorder. It returns a cloned recorder when found, or a ThreadNotFound error when no live writer is open.
 
-**Call relations**: Used internally by live-writer operations such as append, flush, persist, and shutdown.
+**Call relations**: Append, persist, flush, and shutdown paths call this before touching a live thread. It is the gatekeeper that prevents writes to threads that are not currently open for live recording.
 
 *Call graph*: called by 4 (append_items, flush_thread, persist_thread, shutdown_thread).
 
@@ -4293,11 +4317,11 @@ async fn ensure_live_recorder_absent(
     ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Rejects attempts to create or resume a live writer when one is already registered for the thread. It enforces the single-live-writer-per-thread invariant.
+**Purpose**: Checks that a thread does not already have an open live writer. This prevents two writers from appending to the same thread at once.
 
-**Data flow**: Locks `self.live_recorders`, checks `contains_key(&thread_id)`, and returns `InvalidRequest` with a formatted message if present; otherwise returns `Ok(())`.
+**Data flow**: It receives a thread id, locks the live-recorder map, and checks whether that id is present. If present, it returns an InvalidRequest error; otherwise it returns success without changing anything.
 
-**Call relations**: Called before creating or resuming live writers so duplicate recorder insertion fails early.
+**Call relations**: Create and resume operations call this before opening a new live writer. It protects the later insert step from duplicate live writers, like checking that a room is free before issuing another key.
 
 *Call graph*: called by 2 (create_thread, resume_thread); 1 external calls (format!).
 
@@ -4312,11 +4336,11 @@ async fn insert_live_recorder(
     ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Atomically inserts a new live recorder into the map, failing if another recorder already occupies the thread ID. This closes the race between absence check and insertion.
+**Purpose**: Registers a newly opened live writer for a thread. This makes future appends, flushes, and shutdowns find the correct RolloutRecorder.
 
-**Data flow**: Locks `self.live_recorders`, matches on `entry(thread_id)`, inserts the provided `RolloutRecorder` into a vacant entry, or returns `InvalidRequest` if occupied.
+**Data flow**: It receives a thread id and recorder, locks the live-recorder map, and tries to insert the pair. If the id is already present it returns an InvalidRequest error; if not, it stores the recorder and returns success.
 
-**Call relations**: Used by live-writer create and resume flows after recorder construction.
+**Call relations**: Create and resume operations call this after the live writer module has prepared a recorder. Later live operations retrieve the same recorder through LocalThreadStore::live_recorder.
 
 *Call graph*: called by 2 (create_thread, resume_thread); 1 external calls (format!).
 
@@ -4330,11 +4354,11 @@ async fn read_thread_by_rollout_path_params(
     ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Adapts `ReadThreadByRolloutPathParams` into the lower-level read-by-path function signature. It is a small convenience wrapper for the trait implementation.
+**Purpose**: Adapts the trait-style parameter object into the lower-level read-by-path call. It exists so the ThreadStore interface can pass one params value while the internal reader receives separate arguments.
 
-**Data flow**: Consumes the params struct, extracts `rollout_path`, `include_archived`, and `include_history`, and forwards them to `read_thread::read_thread_by_rollout_path`.
+**Data flow**: It receives a ReadThreadByRolloutPathParams value containing a path and flags for archived threads and history. It passes those values to the read_thread module and returns the StoredThread result.
 
-**Call relations**: Called by the trait-method implementation for `read_thread_by_rollout_path`.
+**Call relations**: The ThreadStore implementation for read_thread_by_rollout_path calls this wrapper. The real file parsing and metadata construction are handed off to read_thread::read_thread_by_rollout_path.
 
 *Call graph*: calls 1 internal fn (read_thread_by_rollout_path); called by 1 (read_thread_by_rollout_path).
 
@@ -4345,11 +4369,11 @@ async fn read_thread_by_rollout_path_params(
 fn as_any(&self) -> &dyn std::any::Any
 ```
 
-**Purpose**: Returns the store as `&dyn Any` for downcasting through the `ThreadStore` trait object.
+**Purpose**: Lets code treat this store as a general Rust Any value for safe downcasting. Downcasting means checking at runtime whether a trait object is actually a LocalThreadStore.
 
-**Data flow**: Returns `self` as `&dyn std::any::Any` with no mutation.
+**Data flow**: It receives a reference to the store and returns the same object behind Rust's Any interface. It does not read storage data or change anything.
 
-**Call relations**: Part of the `ThreadStore` trait implementation; used by callers that need concrete-type access.
+**Call relations**: This is part of the ThreadStore trait implementation. Higher-level code can use it when it has a generic ThreadStore but needs to recognize the concrete local implementation.
 
 
 ##### `LocalThreadStore::create_thread`  (lines 232–234)
@@ -4358,11 +4382,11 @@ fn as_any(&self) -> &dyn std::any::Any
 fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the local live-writer create function.
+**Purpose**: Starts a new local live thread. It opens the machinery needed to write that thread's rollout history as conversation items arrive.
 
-**Data flow**: Accepts `CreateThreadParams`, captures `self`, and returns a boxed future that awaits `live_writer::create_thread(self, params)`.
+**Data flow**: It receives CreateThreadParams, wraps the async work in a boxed future, and delegates to live_writer::create_thread. The result is success or a store error; the live writer map may gain a recorder.
 
-**Call relations**: This is the trait entrypoint that forwards create requests into the live-writer subsystem.
+**Call relations**: Callers invoke this through the ThreadStore interface when a new conversation begins. The detailed file creation and recorder setup happen in the live_writer module.
 
 *Call graph*: calls 1 internal fn (create_thread); 1 external calls (pin).
 
@@ -4373,11 +4397,11 @@ fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>
 fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the local live-writer resume function.
+**Purpose**: Reopens an existing thread for live writing. This is used when a saved conversation continues and new items should be appended to its rollout file.
 
-**Data flow**: Accepts `ResumeThreadParams`, captures `self`, and returns a boxed future awaiting `live_writer::resume_thread(self, params)`.
+**Data flow**: It receives ResumeThreadParams, returns a boxed async future, and delegates to live_writer::resume_thread. That flow may locate old history, open the right rollout path, and register a live recorder.
 
-**Call relations**: Trait-level forwarding method for resume operations.
+**Call relations**: The ThreadStore interface calls this when a session is resumed. This wrapper keeps the public interface uniform while live_writer performs the storage-specific work.
 
 *Call graph*: calls 1 internal fn (resume_thread); 1 external calls (pin).
 
@@ -4388,11 +4412,11 @@ fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>
 fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the live append path.
+**Purpose**: Adds new rollout items to a live thread's history. These items are the durable replay records for the conversation.
 
-**Data flow**: Accepts `AppendThreadItemsParams` and returns a boxed future awaiting `live_writer::append_items(self, params)`.
+**Data flow**: It receives AppendThreadItemsParams with a thread id and items. It boxes an async call to live_writer::append_items, which writes the items through the active recorder. The call returns success or an error such as missing live thread.
 
-**Call relations**: Trait-level forwarding method for raw live appends.
+**Call relations**: Live conversation code calls this through ThreadStore while a thread is active. The wrapper delegates to live_writer, which uses LocalThreadStore::live_recorder internally.
 
 *Call graph*: calls 1 internal fn (append_items); 1 external calls (pin).
 
@@ -4403,11 +4427,11 @@ fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_,
 fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the live persist path.
+**Purpose**: Makes sure a live thread has been materialized on disk. This matters for threads that may have been buffered before a real rollout file exists.
 
-**Data flow**: Accepts a `ThreadId` and returns a boxed future awaiting `live_writer::persist_thread(self, thread_id)`.
+**Data flow**: It receives a thread id and returns a boxed async call to live_writer::persist_thread. The live writer module ensures the thread's saved file state is durable enough for later reads.
 
-**Call relations**: Trait-level forwarding method for materializing live rollout state.
+**Call relations**: Higher-level live-thread code calls this when it needs the thread to exist as stored data. This function is only the ThreadStore-facing doorway into the live writer behavior.
 
 *Call graph*: calls 1 internal fn (persist_thread); 1 external calls (pin).
 
@@ -4418,11 +4442,11 @@ fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the live flush path.
+**Purpose**: Flushes pending writes for a live thread. Flushing pushes buffered data out so readers and the filesystem can see the latest saved history.
 
-**Data flow**: Accepts a `ThreadId` and returns a boxed future awaiting `live_writer::flush_thread(self, thread_id)`.
+**Data flow**: It receives a thread id, boxes an async call, and delegates to live_writer::flush_thread. The result reports whether the flush succeeded.
 
-**Call relations**: Trait-level forwarding method for flushing buffered rollout writes.
+**Call relations**: Callers use this after appending items or before checking files. The live writer module retrieves the active recorder and performs the actual flush.
 
 *Call graph*: calls 1 internal fn (flush_thread); 1 external calls (pin).
 
@@ -4433,11 +4457,11 @@ fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the live shutdown path.
+**Purpose**: Closes a live writer for a thread. After shutdown, new appends to that live writer should fail unless the thread is resumed again.
 
-**Data flow**: Accepts a `ThreadId` and returns a boxed future awaiting `live_writer::shutdown_thread(self, thread_id)`.
+**Data flow**: It receives a thread id and delegates through a boxed future to live_writer::shutdown_thread. That path finalizes or removes writer state and returns success or an error.
 
-**Call relations**: Trait-level forwarding method for closing and removing a live writer.
+**Call relations**: Session teardown calls this when a live conversation ends. It works with the live writer module, which removes the recorder from the store's live map.
 
 *Call graph*: calls 1 internal fn (shutdown_thread); 1 external calls (pin).
 
@@ -4448,11 +4472,11 @@ fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the live discard path.
+**Purpose**: Drops a live thread that should not be kept. This is useful for empty or cancelled conversations that should not leave a saved rollout file behind.
 
-**Data flow**: Accepts a `ThreadId` and returns a boxed future awaiting `live_writer::discard_thread(self, thread_id)`.
+**Data flow**: It receives a thread id and delegates to live_writer::discard_thread. The live writer removes the active recorder and may delete an unmaterialized rollout file. The result is success or a storage error.
 
-**Call relations**: Trait-level forwarding method for abandoning a live writer without persistence.
+**Call relations**: Callers use this instead of shutdown when the live thread should be abandoned. This wrapper exposes that behavior through the ThreadStore trait.
 
 *Call graph*: calls 1 internal fn (discard_thread); 1 external calls (pin).
 
@@ -4466,11 +4490,11 @@ fn load_history(
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>
 ```
 
-**Purpose**: Loads a thread's rollout history, preferring an active live recorder's path when one exists and otherwise falling back to the normal read path. It also enforces archived-access rules for live threads.
+**Purpose**: Loads the saved item history for a thread. It gives special care to live resumed threads, because their true rollout path may be outside the normal local folder.
 
-**Data flow**: Consumes `LoadThreadHistoryParams`; first tries `live_writer::rollout_path(self, params.thread_id).await`. If a live path exists, it checks `helpers::rollout_path_is_archived` against `params.include_archived`, then reads the thread by rollout path with history enabled and extracts `thread.history`, returning an internal error if absent. If no live path exists, it calls `read_thread::read_thread` with `include_history: true` and similarly extracts the history.
+**Data flow**: It receives a thread id and an include-archived flag. First it tries to find a live rollout path; if found, it checks whether archived threads are allowed, reads that rollout file with history included, and returns the history. If no live path exists, it reads the thread by id with history included and extracts the history. If a read succeeds but history is missing, it returns an internal error.
 
-**Call relations**: This is both an inherent helper and the implementation behind the trait's `load_history` method. It bridges live-writer state and persisted read logic so callers see current history even for externally resumed or archived live threads.
+**Call relations**: The ThreadStore trait calls this when callers need only history rather than full thread metadata. It uses live_writer::rollout_path, helpers::rollout_path_is_archived, and the read_thread module to choose the safest source.
 
 *Call graph*: calls 4 internal fn (rollout_path_is_archived, rollout_path, read_thread, read_thread_by_rollout_path); 2 external calls (pin, format!).
 
@@ -4481,11 +4505,11 @@ fn load_history(
 fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the local read-thread logic.
+**Purpose**: Reads one stored thread by its id. The caller can choose whether archived threads and full history should be included.
 
-**Data flow**: Accepts `ReadThreadParams` and returns a boxed future awaiting `read_thread::read_thread(self, params)`.
+**Data flow**: It receives ReadThreadParams, wraps the async work in a boxed future, and delegates to read_thread::read_thread. The output is a StoredThread or an error.
 
-**Call relations**: Trait-level forwarding method for thread reads by ID.
+**Call relations**: This is the ThreadStore-facing read operation. The detailed lookup, whether through SQLite or rollout files, belongs to the read_thread module.
 
 *Call graph*: calls 1 internal fn (read_thread); 1 external calls (pin).
 
@@ -4499,11 +4523,11 @@ fn read_thread_by_rollout_path(
     ) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching through the params-adapter helper.
+**Purpose**: Reads a thread directly from a known rollout file path. This is useful when the caller already knows the file to inspect, including external or legacy rollout files.
 
-**Data flow**: Accepts `ReadThreadByRolloutPathParams` and returns a boxed future awaiting `LocalThreadStore::read_thread_by_rollout_path_params(self, params)`.
+**Data flow**: It receives ReadThreadByRolloutPathParams, boxes an async call to the local wrapper, and returns a StoredThread. The params control whether archived files are accepted and whether full history is loaded.
 
-**Call relations**: Trait-level forwarding method for direct rollout-path reads.
+**Call relations**: This implements the ThreadStore trait method. It hands off to LocalThreadStore::read_thread_by_rollout_path_params, which then calls the read_thread module.
 
 *Call graph*: calls 2 internal fn (read_thread_by_rollout_path_params, read_thread_by_rollout_path); 1 external calls (pin).
 
@@ -4514,11 +4538,11 @@ fn read_thread_by_rollout_path(
 fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the local listing logic.
+**Purpose**: Returns a page of stored threads for browsing. A page is a limited batch of results rather than every thread at once.
 
-**Data flow**: Accepts `ListThreadsParams` and returns a boxed future awaiting `list_threads::list_threads(self, params)`.
+**Data flow**: It receives ListThreadsParams, boxes an async call, and delegates to list_threads::list_threads. The result is a ThreadPage containing matching thread summaries and paging information.
 
-**Call relations**: Trait-level forwarding method for paginated thread listing.
+**Call relations**: UI or higher-level checks such as has_threads call this through ThreadStore. The listing module does the actual query and fallback work.
 
 *Call graph*: calls 1 internal fn (list_threads); called by 1 (has_threads); 1 external calls (pin).
 
@@ -4532,11 +4556,11 @@ fn search_threads(
     ) -> ThreadStoreFuture<'_, ThreadSearchPage>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to the local search logic.
+**Purpose**: Searches stored local threads. It lets callers find conversations by text or metadata instead of knowing the exact thread id.
 
-**Data flow**: Accepts `SearchThreadsParams` and returns a boxed future awaiting `search_threads::search_threads(self, params)`.
+**Data flow**: It receives SearchThreadsParams, boxes an async call, and delegates to search_threads::search_threads. The output is a page of search results.
 
-**Call relations**: Trait-level forwarding method for content-based thread search.
+**Call relations**: Search features call this through ThreadStore. The search_threads module uses the store's configuration and optional SQLite handle to perform the search.
 
 *Call graph*: calls 1 internal fn (search_threads); 1 external calls (pin).
 
@@ -4550,11 +4574,11 @@ fn update_thread_metadata(
     ) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to metadata-update logic.
+**Purpose**: Applies a metadata update to a stored thread. Metadata includes searchable or display information such as title, preview, and related thread fields.
 
-**Data flow**: Accepts `UpdateThreadMetadataParams` and returns a boxed future awaiting `update_thread_metadata::update_thread_metadata(self, params)`.
+**Data flow**: It receives UpdateThreadMetadataParams, boxes an async call, and delegates to update_thread_metadata::update_thread_metadata. The output is the updated StoredThread.
 
-**Call relations**: Trait-level forwarding method for metadata patch application.
+**Call relations**: Higher-level live-thread code calls this when appended items have been observed and should affect SQLite metadata. Raw append_items intentionally does not do this by itself.
 
 *Call graph*: calls 1 internal fn (update_thread_metadata); 1 external calls (pin).
 
@@ -4565,11 +4589,11 @@ fn update_thread_metadata(
 fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to archive logic.
+**Purpose**: Marks a thread as archived so normal active-thread views can hide it. Archiving keeps the data but changes where or how it is considered visible.
 
-**Data flow**: Accepts `ArchiveThreadParams` and returns a boxed future awaiting `archive_thread::archive_thread(self, params)`.
+**Data flow**: It receives ArchiveThreadParams, boxes an async call, and delegates to archive_thread::archive_thread. The result is success or a store error.
 
-**Call relations**: Trait-level forwarding method for moving a thread into the archived collection.
+**Call relations**: Archive actions call this through ThreadStore. The archive_thread module performs the filesystem and optional SQLite updates.
 
 *Call graph*: calls 1 internal fn (archive_thread); 1 external calls (pin).
 
@@ -4580,11 +4604,11 @@ fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, (
 fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to unarchive logic.
+**Purpose**: Restores an archived thread to the active set. It returns the thread after it has been made visible again.
 
-**Data flow**: Accepts `ArchiveThreadParams` and returns a boxed future awaiting `unarchive_thread::unarchive_thread(self, params)`.
+**Data flow**: It receives ArchiveThreadParams, boxes an async call, and delegates to unarchive_thread::unarchive_thread. The result is the restored StoredThread or an error.
 
-**Call relations**: Trait-level forwarding method for restoring an archived thread.
+**Call relations**: Unarchive actions call this through ThreadStore. The unarchive_thread module performs the concrete move or metadata changes.
 
 *Call graph*: calls 1 internal fn (unarchive_thread); 1 external calls (pin).
 
@@ -4595,11 +4619,11 @@ fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_,
 fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()>
 ```
 
-**Purpose**: Implements the trait method by boxing and dispatching to hard-delete logic.
+**Purpose**: Deletes a stored thread. This is the destructive path for removing local thread data.
 
-**Data flow**: Accepts `DeleteThreadParams` and returns a boxed future awaiting `delete_thread::delete_thread(self, params)`.
+**Data flow**: It receives DeleteThreadParams, boxes an async call, and delegates to delete_thread::delete_thread. The result tells whether deletion succeeded or why it failed.
 
-**Call relations**: Trait-level forwarding method for destructive thread deletion.
+**Call relations**: Delete commands call this through ThreadStore. The delete_thread module handles the actual file and optional SQLite cleanup.
 
 *Call graph*: calls 1 internal fn (delete_thread); 1 external calls (pin).
 
@@ -4610,11 +4634,11 @@ fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()>
 async fn live_writer_lifecycle_writes_and_closes()
 ```
 
-**Purpose**: Exercises the full live-writer lifecycle: create, append, persist, flush, verify rollout contents, shutdown, and confirm further appends fail.
+**Purpose**: Tests the normal life of a live writer: create, append, persist, flush, then shut down. It proves that data reaches the rollout file and that shutdown removes the live writer.
 
-**Data flow**: Creates a temp store and thread ID, opens a live writer, appends a user message, persists and flushes, reads the rollout file to assert the message exists, shuts down the writer, then attempts another append and asserts `ThreadNotFound`.
+**Data flow**: The test creates a temporary store, opens a thread, appends a user message, flushes it, checks the rollout file for that message, shuts the thread down, and then verifies another append fails.
 
-**Call relations**: This integration test spans the trait forwarding methods and the live-writer module to verify end-to-end lifecycle behavior.
+**Call relations**: It exercises LocalThreadStore::create_thread, append_items, persist_thread, flush_thread, live_rollout_path, and shutdown_thread. The helper assert_rollout_contains_message confirms the written file content.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 5 external calls (new, assert!, assert_rollout_contains_message, create_thread_params, vec!).
 
@@ -4625,11 +4649,11 @@ async fn live_writer_lifecycle_writes_and_closes()
 async fn raw_append_items_does_not_update_sqlite_metadata()
 ```
 
-**Purpose**: Pins the contract that raw append operations only write history and do not themselves materialize or update SQLite metadata.
+**Purpose**: Tests an important contract: raw appends write history only and do not automatically update SQLite metadata. This keeps metadata updates explicit.
 
-**Data flow**: Initializes a store with a state DB, creates a live thread, appends a user message, flushes, then queries SQLite and asserts no metadata row exists for the thread.
+**Data flow**: The test creates a store with SQLite, creates a thread, appends a message through append_items, flushes, and then reads SQLite directly. It expects no metadata row for that thread.
 
-**Call relations**: This test validates the separation between live JSONL appends and metadata updates performed elsewhere.
+**Call relations**: It contrasts raw ThreadStore appends with the LiveThread behavior tested later. The state database is used only to confirm that no metadata was created.
 
 *Call graph*: calls 4 internal fn (default, init, new, test_config); 4 external calls (new, assert_eq!, create_thread_params, vec!).
 
@@ -4640,11 +4664,11 @@ async fn raw_append_items_does_not_update_sqlite_metadata()
 async fn live_thread_observes_appended_items_into_sqlite_metadata()
 ```
 
-**Purpose**: Verifies that the higher-level `LiveThread` wrapper observes appended items and updates SQLite metadata accordingly.
+**Purpose**: Tests that the higher-level LiveThread wrapper observes appended messages and turns them into SQLite metadata. This confirms the intended path for keeping the searchable catalog current.
 
-**Data flow**: Creates a store with state DB, constructs a `LiveThread`, appends a user message through it, flushes, then reads SQLite metadata and asserts first-user-message, preview, and title were populated.
+**Data flow**: The test creates a store with SQLite, creates a LiveThread, appends a user message, flushes, and reads the database. It expects first message, preview, and title fields to reflect the appended text.
 
-**Call relations**: This test demonstrates the intended layering: `LocalThreadStore` provides raw persistence while `LiveThread` adds metadata observation above it.
+**Call relations**: It uses LiveThread::create instead of raw append_items. That higher layer calls the store and then updates metadata through the intended metadata path.
 
 *Call graph*: calls 5 internal fn (default, init, create, new, test_config); 5 external calls (new, new, assert_eq!, create_thread_params, user_message_item).
 
@@ -4655,11 +4679,11 @@ async fn live_thread_observes_appended_items_into_sqlite_metadata()
 async fn live_thread_shutdown_does_not_materialize_empty_thread_metadata()
 ```
 
-**Purpose**: Ensures shutting down an empty live thread does not create a rollout file or SQLite metadata row.
+**Purpose**: Tests that shutting down an empty live thread does not create a useless file or database record. Empty abandoned conversations should not clutter local storage.
 
-**Data flow**: Creates a live thread with state DB, captures its live rollout path, shuts it down without appends, then asserts the rollout path does not exist and SQLite returns `None` for the thread.
+**Data flow**: The test creates a LiveThread with SQLite, records its expected rollout path, shuts it down without appending items, and checks that the file and SQLite metadata are absent.
 
-**Call relations**: This test covers the interaction between shutdown, rollout materialization, and metadata sync.
+**Call relations**: It exercises LiveThread shutdown behavior on top of LocalThreadStore. The database read confirms that no metadata was accidentally materialized.
 
 *Call graph*: calls 5 internal fn (default, init, create, new, test_config); 5 external calls (new, new, assert!, assert_eq!, create_thread_params).
 
@@ -4670,11 +4694,11 @@ async fn live_thread_shutdown_does_not_materialize_empty_thread_metadata()
 async fn live_thread_shutdown_with_buffered_items_materializes_before_metadata_read()
 ```
 
-**Purpose**: Checks that shutdown flushes buffered items to disk before metadata is read, so SQLite can safely point at an existing rollout path.
+**Purpose**: Tests that a live thread with buffered items is saved before shutdown metadata is checked. Even metadata-only rollout items should cause the thread to exist if something was written.
 
-**Data flow**: Creates a live thread, appends a metadata-only token-count item, shuts down, asserts the rollout file now exists, then reads SQLite metadata and checks that `rollout_path` matches the materialized file.
+**Data flow**: The test creates a LiveThread, appends a token-count item, shuts down, then checks that the rollout file exists and SQLite has metadata pointing to that path.
 
-**Call relations**: This test validates the ordering guarantee enforced by shutdown plus `sync_materialized_rollout_path`.
+**Call relations**: It covers the shutdown path where buffered writer state must be persisted. The SQLite lookup verifies that metadata was created after materialization.
 
 *Call graph*: calls 5 internal fn (default, init, create, new, test_config); 7 external calls (new, new, assert!, assert_eq!, TokenCount, EventMsg, create_thread_params).
 
@@ -4685,11 +4709,11 @@ async fn live_thread_shutdown_with_buffered_items_materializes_before_metadata_r
 async fn live_thread_resume_loads_history_before_observing_metadata()
 ```
 
-**Purpose**: Verifies that resuming from an existing rollout loads prior history before metadata observation, preserving original created time, provider, and first user message.
+**Purpose**: Tests that resuming a saved thread reads its old history before deciding metadata from new appends. This prevents newer resume parameters from overwriting facts already present in the rollout.
 
-**Data flow**: Writes a session file, resumes a `LiveThread` with different incoming metadata, appends a new message, then reads SQLite metadata and asserts it reflects the original rollout's created timestamp, provider, and first user message.
+**Data flow**: The test writes an existing session file, resumes it as a LiveThread with different metadata values, appends a new message, and checks SQLite. It expects created time, provider, and first message to come from the old rollout history.
 
-**Call relations**: This test covers resume behavior across the local store, read path, and higher-level metadata observation.
+**Call relations**: It exercises LiveThread::resume and the local read/resume path. The write_session_file helper supplies the existing rollout that should be trusted first.
 
 *Call graph*: calls 6 internal fn (from_string, init, resume, new, test_config, write_session_file); 5 external calls (new, new, assert_eq!, user_message_item, from_u128).
 
@@ -4700,11 +4724,11 @@ async fn live_thread_resume_loads_history_before_observing_metadata()
 async fn live_thread_resume_loads_history_from_explicit_external_rollout_path()
 ```
 
-**Purpose**: Confirms that resume works from a rollout path outside `codex_home` and still seeds metadata from the external rollout's existing history.
+**Purpose**: Tests that resume can read history from a rollout file outside the normal Codex home. This matters for imported or explicitly supplied rollout paths.
 
-**Data flow**: Creates an external rollout file, resumes a `LiveThread` against it, appends a new message, then reads SQLite metadata and asserts created time, provider, and first user message came from the external rollout rather than the resume metadata.
+**Data flow**: The test writes a session file in a separate temporary folder, resumes using that explicit path, appends a new message, and checks SQLite metadata. It expects old history from the external file to shape the metadata.
 
-**Call relations**: This test validates external-path resume support and the store's ability to read history from non-local rollout locations.
+**Call relations**: It focuses on the resume path's ability to honor an explicit rollout_path. The local store must not assume every live thread file is under its own home directory.
 
 *Call graph*: calls 6 internal fn (from_string, init, resume, new, test_config, write_session_file); 5 external calls (new, new, assert_eq!, user_message_item, from_u128).
 
@@ -4715,11 +4739,11 @@ async fn live_thread_resume_loads_history_from_explicit_external_rollout_path()
 async fn create_thread_rejects_missing_cwd()
 ```
 
-**Purpose**: Ensures local thread creation fails when persistence metadata omits the working directory.
+**Purpose**: Tests that creating a local thread requires a current working directory. The directory is part of the local persistence metadata needed for later context.
 
-**Data flow**: Builds create params, clears `metadata.cwd`, calls `store.create_thread`, captures the error, and asserts it is the expected `InvalidRequest` message.
+**Data flow**: The test builds normal create params, removes the cwd field, calls create_thread, and expects an InvalidRequest error with the specific message.
 
-**Call relations**: This test covers validation performed in the create path beneath the trait forwarding layer.
+**Call relations**: It exercises validation inside the create-thread flow delegated to live_writer. The helper create_thread_params supplies the otherwise valid request.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 3 external calls (new, assert!, create_thread_params).
 
@@ -4730,11 +4754,11 @@ async fn create_thread_rejects_missing_cwd()
 async fn discard_thread_drops_unmaterialized_live_writer()
 ```
 
-**Purpose**: Checks that discarding a live writer removes it from memory without materializing a rollout file and causes later appends to fail.
+**Purpose**: Tests that discarding a not-yet-materialized live thread removes it cleanly. After discard, the file should not exist and the writer should no longer accept appends.
 
-**Data flow**: Creates a live thread, captures its live rollout path, calls `discard_thread`, asserts the path does not exist, then attempts an append and asserts `ThreadNotFound`.
+**Data flow**: The test creates a thread, records its rollout path, discards it, verifies the path does not exist, then tries to append and expects ThreadNotFound.
 
-**Call relations**: This test targets the discard branch of the live-writer lifecycle.
+**Call relations**: It covers LocalThreadStore::discard_thread and the live-recorder removal behavior. It is the discard counterpart to the normal shutdown lifecycle test.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 4 external calls (new, assert!, create_thread_params, vec!).
 
@@ -4745,11 +4769,11 @@ async fn discard_thread_drops_unmaterialized_live_writer()
 async fn resume_thread_reopens_live_writer_and_appends()
 ```
 
-**Purpose**: Verifies that a thread can be created, written, shut down, resumed in a new store instance, and appended to again using the same rollout file.
+**Purpose**: Tests that a thread can be created, shut down, reopened in a new store, and appended to again. This proves saved rollout files can continue across store instances.
 
-**Data flow**: Creates an initial store, writes and flushes a message, captures the rollout path, shuts down, creates a second store, resumes the thread without an explicit path, appends another message, flushes, and asserts both messages are present in the rollout.
+**Data flow**: The test writes an initial message with one store, flushes and shuts it down, creates a second store with the same config, resumes the thread, appends another message, and checks the same rollout file for both messages.
 
-**Call relations**: This test spans create, persist, flush, shutdown, resume, and append flows across two store instances.
+**Call relations**: It exercises create, append, persist, flush, shutdown, and resume flows. The final file check confirms that resume appended to the existing history rather than starting over.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 5 external calls (new, assert_rollout_contains_message, create_thread_params, thread_metadata, vec!).
 
@@ -4760,11 +4784,11 @@ async fn resume_thread_reopens_live_writer_and_appends()
 async fn create_thread_rejects_duplicate_live_writer()
 ```
 
-**Purpose**: Ensures creating the same live thread twice in one store instance is rejected.
+**Purpose**: Tests that creating the same live thread twice is rejected. This protects one rollout file from having two active writers.
 
-**Data flow**: Creates a live thread, attempts to create it again with the same params, captures the error, and asserts it is an `InvalidRequest` mentioning an existing live local writer.
+**Data flow**: The test creates a thread, then calls create_thread again with the same id. It expects an InvalidRequest error mentioning an existing live local writer.
 
-**Call relations**: This test covers the duplicate-prevention invariant enforced by `ensure_live_recorder_absent` and `insert_live_recorder`.
+**Call relations**: It exercises LocalThreadStore::ensure_live_recorder_absent and insert protection through the create path. This guards the live-recorder map against duplicates.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 3 external calls (new, assert!, create_thread_params).
 
@@ -4775,11 +4799,11 @@ async fn create_thread_rejects_duplicate_live_writer()
 async fn resume_thread_rejects_duplicate_live_writer()
 ```
 
-**Purpose**: Ensures resuming a thread that already has an active live writer in the same store instance is rejected.
+**Purpose**: Tests that resuming a thread already open for live writing is rejected. Resume must not create a second writer for the same thread.
 
-**Data flow**: Creates a live thread, obtains its rollout path, attempts to resume the same thread, and asserts the resulting error is an `InvalidRequest` mentioning an existing live local writer.
+**Data flow**: The test creates a live thread, gets its rollout path, tries to resume the same thread using that path, and expects an InvalidRequest error about an existing live writer.
 
-**Call relations**: This test exercises duplicate detection on the resume path.
+**Call relations**: It checks the same duplicate-writer protection as create, but through the resume path. The live_rollout_path call supplies the path for the attempted duplicate resume.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 4 external calls (new, assert!, create_thread_params, thread_metadata).
 
@@ -4790,11 +4814,11 @@ async fn resume_thread_rejects_duplicate_live_writer()
 async fn resume_thread_rejects_missing_cwd()
 ```
 
-**Purpose**: Checks that resuming a live writer fails when the supplied persistence metadata lacks a working directory.
+**Purpose**: Tests that resuming a local thread also requires a current working directory in metadata. Resume needs the same local context as create.
 
-**Data flow**: Writes a session file, constructs `ResumeThreadParams` with `metadata.cwd = None`, calls `store.resume_thread`, and asserts the error mentions the required cwd.
+**Data flow**: The test writes an existing session file, builds resume params with cwd set to None, calls resume_thread, and expects an InvalidRequest error mentioning the missing cwd.
 
-**Call relations**: This test covers validation in the resume path before recorder construction.
+**Call relations**: It exercises validation in live_writer::resume_thread through the LocalThreadStore trait method. The archived or external history details are not the focus here; metadata validity is.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 3 external calls (new, assert!, from_u128).
 
@@ -4805,11 +4829,11 @@ async fn resume_thread_rejects_missing_cwd()
 async fn load_history_uses_live_writer_rollout_path()
 ```
 
-**Purpose**: Verifies that history loading prefers the active live writer's rollout path, including when that path is external to `codex_home`.
+**Purpose**: Tests that load_history reads from the active live writer's rollout path, even when that path is external. This prevents history reads from looking in the wrong local folder.
 
-**Data flow**: Creates an external rollout, resumes it as a live thread, appends and flushes a new message, calls `store.load_history`, and asserts the returned history contains the appended external message.
+**Data flow**: The test writes an external session file, resumes it, appends and flushes a new item, then calls load_history. It expects the returned history to include the newly appended external item.
 
-**Call relations**: This test targets the live-path-first branch in `LocalThreadStore::load_history`.
+**Call relations**: It directly covers LocalThreadStore::load_history's first step: ask live_writer for the active path before falling back to thread-id lookup.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 5 external calls (new, assert!, thread_metadata, from_u128, vec!).
 
@@ -4820,11 +4844,11 @@ async fn load_history_uses_live_writer_rollout_path()
 async fn read_thread_uses_live_writer_rollout_path_for_external_resume()
 ```
 
-**Purpose**: Checks that reading a thread by ID while it is live-resumed from an external rollout returns that external rollout path and its history.
+**Purpose**: Tests that read_thread also respects the live writer path for an externally resumed thread. Reading by id should still find the actual active file.
 
-**Data flow**: Creates an external rollout, resumes it as a live thread, calls `store.read_thread` with history enabled, and asserts the returned `StoredThread` contains the external path and original user-message history.
+**Data flow**: The test creates an external rollout, resumes it, then reads the thread by id with history included. It expects the stored rollout path to equal the external path and the history to include the old user message.
 
-**Call relations**: This test validates the interaction between live-writer state and read-path resolution.
+**Call relations**: It covers read_thread behavior while a live recorder points outside the normal home. This complements the load_history external-path test.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 5 external calls (new, assert!, assert_eq!, thread_metadata, from_u128).
 
@@ -4835,11 +4859,11 @@ async fn read_thread_uses_live_writer_rollout_path_for_external_resume()
 async fn load_history_uses_live_writer_rollout_path_for_archived_source()
 ```
 
-**Purpose**: Ensures archived live sources are rejected when `include_archived` is false and accepted when it is true, both for reads and history loads.
+**Purpose**: Tests archived handling for a live thread resumed from an archived rollout file. Active-only reads should reject it, while archived-inclusive reads should work.
 
-**Data flow**: Creates an archived rollout, resumes it as a live thread, appends and flushes a message, performs active-only read/history calls expecting errors, then loads history with `include_archived: true` and asserts the appended message is present.
+**Data flow**: The test writes an archived session file, resumes it, appends and flushes a message, then tries read_thread and load_history with include_archived false and expects errors. It then loads history with include_archived true and expects the appended message.
 
-**Call relations**: This test covers archived gating in `LocalThreadStore::load_history` and related read behavior for live archived paths.
+**Call relations**: It exercises LocalThreadStore::load_history's archive check and the read path's equivalent behavior. The helper write_archived_session_file creates the archived source.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_archived_session_file); 5 external calls (new, assert!, thread_metadata, from_u128, vec!).
 
@@ -4850,11 +4874,11 @@ async fn load_history_uses_live_writer_rollout_path_for_archived_source()
 async fn read_thread_by_rollout_path_includes_history()
 ```
 
-**Purpose**: Verifies that direct rollout-path reads can include full history for a live-created thread.
+**Purpose**: Tests that reading directly by rollout path can include full history. This is the path-based read API's basic success case.
 
-**Data flow**: Creates a live thread, appends and flushes a user message, obtains the live rollout path, reads the thread by that path with history enabled, and asserts the returned history contains one user-message event.
+**Data flow**: The test creates a thread, appends one user message, flushes, gets the rollout path, reads by that path with history included, and checks the thread id and user-message count.
 
-**Call relations**: This test exercises the direct path-read wrapper and the underlying read-by-rollout logic.
+**Call relations**: It exercises the inherent path-read helper and the read_thread_by_rollout_path machinery. It confirms the include_history flag is honored.
 
 *Call graph*: calls 3 internal fn (default, new, test_config); 4 external calls (new, assert_eq!, create_thread_params, vec!).
 
@@ -4865,11 +4889,11 @@ async fn read_thread_by_rollout_path_includes_history()
 fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams
 ```
 
-**Purpose**: Builds standard `CreateThreadParams` used by the module's tests.
+**Purpose**: Builds a standard CreateThreadParams value for tests. It keeps test setup short and consistent.
 
-**Data flow**: Accepts a `ThreadId`, fills a `CreateThreadParams` struct with default instructions, empty tool lists, fixed source values, and metadata from `thread_metadata()`, and returns it.
+**Data flow**: It receives a thread id, fills in default source, instructions, tool, relationship, and metadata fields, and returns a complete create request.
 
-**Call relations**: Used by multiple tests to reduce duplication when creating live threads.
+**Call relations**: Many tests call this before creating a thread. It calls tests::thread_metadata for the shared metadata block.
 
 *Call graph*: calls 1 internal fn (default); 2 external calls (new, thread_metadata).
 
@@ -4880,11 +4904,11 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams
 fn thread_metadata() -> ThreadPersistenceMetadata
 ```
 
-**Purpose**: Builds standard `ThreadPersistenceMetadata` used by tests, including the current working directory and test provider.
+**Purpose**: Builds standard thread persistence metadata for tests. It supplies a current working directory, test model provider, and enabled memory mode.
 
-**Data flow**: Reads `std::env::current_dir()`, constructs `ThreadPersistenceMetadata { cwd: Some(...), model_provider: "test-provider", memory_mode: Enabled }`, and returns it.
+**Data flow**: It reads the process current directory, combines it with fixed test values, and returns ThreadPersistenceMetadata.
 
-**Call relations**: Shared helper for create/resume test setup.
+**Call relations**: Test helpers and resume tests call this wherever valid local metadata is needed. Individual tests modify its output when they need to test invalid metadata.
 
 *Call graph*: 1 external calls (current_dir).
 
@@ -4895,11 +4919,11 @@ fn thread_metadata() -> ThreadPersistenceMetadata
 fn user_message_item(message: &str) -> RolloutItem
 ```
 
-**Purpose**: Constructs a `RolloutItem` containing a plain user-message event for test appends.
+**Purpose**: Creates a rollout item representing a user message for tests. This avoids repeating the nested event construction in every test.
 
-**Data flow**: Takes a message string, builds `UserMessageEvent` with that message and default/empty ancillary fields, wraps it in `EventMsg::UserMessage`, then in `RolloutItem::EventMsg`, and returns it.
+**Data flow**: It receives message text, places it into a UserMessageEvent with default optional fields, wraps that as an EventMsg, then wraps it as a RolloutItem.
 
-**Call relations**: Used by many lifecycle tests to append recognizable content into rollouts.
+**Call relations**: Lifecycle, append, resume, and read tests use this helper when they need a realistic user-message entry in thread history.
 
 *Call graph*: 4 external calls (default, new, UserMessage, EventMsg).
 
@@ -4910,11 +4934,11 @@ fn user_message_item(message: &str) -> RolloutItem
 async fn assert_rollout_contains_message(path: &std::path::Path, expected: &str)
 ```
 
-**Purpose**: Loads rollout items from disk and asserts that at least one user-message event contains the expected text.
+**Purpose**: Checks that a rollout file contains a particular user message. It is a test assertion helper for confirming that writes reached disk.
 
-**Data flow**: Accepts a rollout path and expected string, calls `RolloutRecorder::load_rollout_items(path).await`, scans the returned items for a matching `UserMessage` event, and asserts success.
+**Data flow**: It receives a file path and expected text, loads rollout items from the file, scans for a user-message item with matching text, and fails the test if none is found.
 
-**Call relations**: Shared assertion helper for tests that verify persisted rollout contents after create/resume/append flows.
+**Call relations**: Several live-writer tests call this after flushing or resuming. It uses RolloutRecorder::load_rollout_items, the same rollout-file reader used by storage code.
 
 *Call graph*: calls 1 internal fn (load_rollout_items); 1 external calls (assert!).
 
@@ -4924,13 +4948,13 @@ These files cover the main local thread-store behaviors for live writing, recons
 
 ### `thread-store/src/local/live_writer.rs`
 
-`domain_logic` · `live thread persistence`
+`io_transport` · `active during a local thread’s live lifetime: create/resume, append, flush/persist, and shutdown`
 
-This file is the write-path counterpart to the read/list modules. It wraps `codex_rollout::RolloutRecorder` instances stored in `LocalThreadStore.live_recorders` and exposes lifecycle operations for live threads. `create_thread` ensures no recorder already exists for the thread, delegates recorder construction to the sibling `create_thread` module, and inserts the recorder into the in-memory map. `resume_thread` similarly rejects duplicates, resolves the rollout path either from explicit params or by reading the existing thread, requires a `cwd` in persistence metadata, builds a `RolloutConfig`, and opens a recorder in resume mode.
+A thread is a saved conversation. While a thread is “live”, new events need to be written to disk in the right order so the conversation can be recovered later. This file is the bridge between the local thread store and the rollout recorder, which is the object that writes the detailed history file for a thread.
 
-`append_items` canonicalizes incoming rollout items with `persisted_rollout_items`, skips empty canonical batches, records them to the live recorder, and then flushes immediately. The flush is intentional: metadata updates happen above this layer, so JSONL must be durable before SQLite metadata can be advanced. `persist_thread`, `flush_thread`, and `shutdown_thread` all invoke the corresponding recorder operation and then call `sync_materialized_rollout_path`, which checks whether a real rollout file now exists and, if SQLite metadata for the thread exists, updates its `rollout_path` to the recorder’s current path. Sync failures are logged as warnings rather than returned.
+The main idea is simple: before a thread can receive new saved items, it must have exactly one live recorder. Creating or resuming a thread starts that recorder and stores it in the local thread store. Appending items first converts them into the stable saved format, then asks the recorder to write them, and then flushes the writer so the JSONL history file is caught up before other metadata is applied. JSONL means “one JSON record per line”, a common format for append-only logs.
 
-`discard_thread` simply drops an unmaterialized recorder from memory, while `rollout_path` exposes the current live path for compatibility with read/history code. All recorder I/O errors are normalized into `ThreadStoreError::Internal` via `thread_store_io_error`.
+The file also has end-of-life actions. Persisting and flushing force pending data to disk. Shutting down closes the recorder and removes it from the live set. Discarding simply drops the live recorder without doing a shutdown write. A small helper keeps the stored metadata’s rollout path aligned with the real materialized file path, so the database does not point at the wrong history file.
 
 #### Function details
 
@@ -4943,11 +4967,11 @@ async fn create_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Starts live local persistence for a new thread by creating a `RolloutRecorder` and registering it in the store's live-recorder map. It rejects duplicate live writers for the same thread ID.
+**Purpose**: Starts a brand-new local thread recorder. It prevents accidentally starting two live writers for the same thread, then creates the underlying rollout recorder and registers it as the active writer.
 
-**Data flow**: Takes the store and `CreateThreadParams`; reads `params.thread_id`, checks `store.ensure_live_recorder_absent(thread_id).await`, delegates recorder creation to `create_thread::create_thread`, and writes the resulting recorder into `store.live_recorders` via `insert_live_recorder`. It returns `()` or a `ThreadStoreError` from duplicate detection or recorder creation.
+**Data flow**: It receives the local store and creation details, including the thread id. It first checks the store to make sure no recorder is already live for that id. Then it asks the lower-level thread creation code to make the recorder. Finally, it places that recorder into the store’s live-recorder map so later appends know where to write.
 
-**Call relations**: Invoked by the store trait's `create_thread` method. It is a thin orchestration layer over duplicate checking, recorder construction, and insertion.
+**Call relations**: This is called when the local thread store is asked to create a live thread. It relies on the store’s duplicate-recorder check before handing off to the lower-level create-thread routine, then gives the resulting recorder back to the store for future write operations.
 
 *Call graph*: calls 3 internal fn (ensure_live_recorder_absent, insert_live_recorder, create_thread); called by 1 (create_thread).
 
@@ -4961,11 +4985,11 @@ async fn resume_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Reopens live local persistence for an existing thread, optionally discovering the rollout path by reading the thread first. It requires persistence metadata to include a working directory.
+**Purpose**: Reopens an existing thread so new events can continue being written to its history file. It finds the correct rollout path, builds recorder settings from the thread metadata, and installs the resumed recorder as live.
 
-**Data flow**: Consumes the store and `ResumeThreadParams`; reads `params.thread_id`, `params.rollout_path`, `params.history`, `params.include_archived`, and `params.metadata`. It rejects duplicate live writers, resolves the rollout path either directly or by calling `read_thread`, extracts `cwd` from metadata or returns `InvalidRequest`, builds a `RolloutConfig` using the supplied provider and memory mode, creates a resumed `RolloutRecorder` with `RolloutRecorderParams::resume(rollout_path)`, and inserts it into `store.live_recorders`.
+**Data flow**: It receives the store and resume parameters. If the caller already supplied a rollout path, it uses that. Otherwise it reads the thread metadata to discover the saved rollout path. It also requires a current working directory from metadata, because the local recorder needs a folder context. It builds a rollout configuration from store settings and thread metadata, creates a recorder in resume mode, and saves that recorder in the live-recorder map.
 
-**Call relations**: Called by the store trait's resume path. When no explicit rollout path is supplied, it depends on `read_thread` to locate the persisted thread and delegates recorder construction to `RolloutRecorder::new` in resume mode.
+**Call relations**: This is used by the local resume flow before any new items are appended. If needed, it calls the thread reader to recover missing path information, then calls the rollout recorder constructor with resume parameters. Once the recorder is created, it hands it to the store so append, flush, persist, and shutdown calls can find it.
 
 *Call graph*: calls 5 internal fn (new, resume, ensure_live_recorder_absent, insert_live_recorder, read_thread); called by 1 (resume_thread); 1 external calls (matches!).
 
@@ -4979,11 +5003,11 @@ async fn append_items(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Appends canonicalized rollout items to an active live recorder and flushes them so JSONL persistence is durable before higher layers update metadata. Empty canonical batches are ignored.
+**Purpose**: Writes newly accepted thread items to the live rollout history. It also flushes immediately so the detailed history file is not behind the store metadata that may be updated right after this call.
 
-**Data flow**: Accepts the store and `AppendThreadItemsParams`; reads `params.items` and `params.thread_id`, transforms items with `persisted_rollout_items`, returns early if the canonical list is empty, fetches the recorder with `store.live_recorder`, writes items via `record_canonical_items`, then flushes the recorder. It returns `()` or wraps any `std::io::Error` as `ThreadStoreError::Internal`.
+**Data flow**: It receives the store and a batch of items to append. It converts the items into the canonical persisted form, meaning the stable form that should actually be saved. If nothing remains after that conversion, it returns without writing. Otherwise it looks up the live recorder for the thread, records the canonical items, and flushes the recorder to push the data to disk.
 
-**Call relations**: Invoked by the store trait append path. It sits between callers and the recorder, enforcing canonicalization and the flush-before-metadata invariant noted in the comments.
+**Call relations**: This is called when the live thread accepts new items. It depends on a recorder having already been installed by create_thread or resume_thread. After recording, it deliberately flushes before returning because the surrounding live-thread flow applies metadata immediately afterward, and the code wants the JSONL history to be at least as up to date as the database.
 
 *Call graph*: calls 1 internal fn (live_recorder); called by 1 (append_items); 1 external calls (persisted_rollout_items).
 
@@ -4997,11 +5021,11 @@ async fn persist_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Forces the live recorder to materialize/persist its rollout and then attempts to synchronize the resulting rollout path into SQLite metadata. It is used when a live thread should become durably visible on disk.
+**Purpose**: Forces a live thread recorder to persist its data, then updates stored metadata if the recorder’s actual rollout path has changed. This is used when the system wants stronger assurance that the thread’s history is saved.
 
-**Data flow**: Takes the store and a `ThreadId`, fetches the recorder with `live_recorder`, calls `persist().await`, maps I/O errors through `thread_store_io_error`, then calls `sync_materialized_rollout_path`. It returns `()` or a store error.
+**Data flow**: It receives the store and thread id. It finds the live recorder for that thread, asks it to persist, converts any file-writing error into a thread-store error, and then calls the path-sync helper. The result is either success or a thread-store error if the live recorder cannot be found or the write fails.
 
-**Call relations**: Called by the store trait persist method and also from metadata-update flows that need the rollout path materialized before updating SQLite.
+**Call relations**: This function is used by the local persist flow and also after metadata updates that need the disk state to be durable. It hands the final metadata alignment step to sync_materialized_rollout_path so the database can reflect the actual rollout file location.
 
 *Call graph*: calls 2 internal fn (live_recorder, sync_materialized_rollout_path); called by 2 (persist_thread, update_thread_metadata).
 
@@ -5015,11 +5039,11 @@ async fn flush_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Flushes buffered live rollout data to disk and then syncs any materialized rollout path into SQLite metadata. It does not remove the live recorder.
+**Purpose**: Pushes pending live recorder writes to disk without fully closing the recorder. It then checks whether the metadata’s rollout path needs to be brought up to date.
 
-**Data flow**: Reads the recorder for the given `ThreadId`, calls `flush().await`, maps I/O errors, then invokes `sync_materialized_rollout_path`. It returns `()` or a `ThreadStoreError`.
+**Data flow**: It receives the store and thread id. It gets the live recorder, asks it to flush buffered data, turns any input/output error into the project’s thread-store error type, and then runs the rollout-path sync. It leaves the recorder active for future appends.
 
-**Call relations**: Used by the store trait flush method. It shares the same post-write path-sync behavior as `persist_thread` and `shutdown_thread`.
+**Call relations**: This is called when the local thread store needs current pending writes to land on disk while the thread remains live. Like persist_thread, it delegates the metadata-path cleanup to sync_materialized_rollout_path after the recorder has written its data.
 
 *Call graph*: calls 2 internal fn (live_recorder, sync_materialized_rollout_path); called by 1 (flush_thread).
 
@@ -5033,11 +5057,11 @@ async fn shutdown_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Closes a live recorder, ensures any materialized rollout path is reflected in SQLite metadata, and removes the recorder from the in-memory live map. After this call, further appends for the thread will fail with not found.
+**Purpose**: Cleanly closes a live thread recorder and removes it from the store’s active recorder list. This is the normal end-of-life path for a live local thread writer.
 
-**Data flow**: Takes the store and `ThreadId`; fetches the recorder, calls `shutdown().await`, syncs the rollout path with `sync_materialized_rollout_path`, then mutates `store.live_recorders` to remove the thread entry. It returns `()` or a wrapped I/O/store error.
+**Data flow**: It receives the store and thread id. It looks up the live recorder, asks it to shut down, syncs the materialized rollout path into metadata if possible, then locks the live-recorder map and removes the recorder entry. After this, the thread is no longer considered live in this store.
 
-**Call relations**: Called by the store trait shutdown method. It is the terminal step in the live-writer lifecycle and combines recorder shutdown with cleanup of process-local state.
+**Call relations**: This is called when the local thread store is shutting down a live thread. It first lets the recorder finish its own shutdown work, then uses sync_materialized_rollout_path to keep metadata accurate, and only then removes the recorder so later operations cannot write through it.
 
 *Call graph*: calls 2 internal fn (live_recorder, sync_materialized_rollout_path); called by 1 (shutdown_thread).
 
@@ -5051,11 +5075,11 @@ async fn discard_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Drops a live recorder from memory without persisting or flushing it. This is intended for abandoning an unmaterialized live thread.
+**Purpose**: Forgets a live recorder without asking it to flush, persist, or shut down. This is useful for abandoning a live writer entry when the caller does not want the normal close-out behavior.
 
-**Data flow**: Consumes the store and `ThreadId`, locks `store.live_recorders`, removes the entry, maps presence to `Ok(())`, and returns `ThreadStoreError::ThreadNotFound` if no live recorder existed.
+**Data flow**: It receives the store and thread id. It locks the live-recorder map, removes the recorder for that thread if one exists, and returns success. If there is no matching recorder, it returns a thread-not-found error.
 
-**Call relations**: Invoked by the store trait discard method. Unlike shutdown, it does not touch the recorder or filesystem; it only mutates the in-memory recorder map.
+**Call relations**: This is called by the local discard flow. Unlike shutdown_thread, it does not talk to the recorder or sync metadata; it only edits the store’s live-recorder table.
 
 *Call graph*: called by 1 (discard_thread).
 
@@ -5069,11 +5093,11 @@ async fn rollout_path(
 ) -> ThreadStoreResult<PathBuf>
 ```
 
-**Purpose**: Returns the current rollout path tracked by an active live recorder. It is a compatibility hook for read/history/metadata code that needs the live path before shutdown.
+**Purpose**: Returns the filesystem path for the live recorder’s rollout history file. Other code uses this when it needs to read, resolve, or store the location of a live thread’s history.
 
-**Data flow**: Takes the store and `ThreadId`, locks `store.live_recorders`, looks up the recorder, calls `recorder.rollout_path()`, clones it into a `PathBuf`, and returns it or `ThreadStoreError::ThreadNotFound`.
+**Data flow**: It receives the store and thread id. It locks the live-recorder map, finds the recorder for that thread, asks the recorder for its rollout path, copies that path into a PathBuf, and returns it. If the thread has no live recorder, it returns a thread-not-found error.
 
-**Call relations**: Used by `LocalThreadStore::live_rollout_path`, history loading, rollout-path resolution, and metadata update/sync code whenever live state should override persisted lookup.
+**Call relations**: This is a small lookup helper used by several flows that need the live history file path, including history loading, path resolution, metadata updates, and the sync helper in this file. It does not write anything itself; it supplies the path that those larger operations need.
 
 *Call graph*: called by 7 (live_rollout_path, load_history, sync_materialized_rollout_path, resolve_rollout_path, apply_metadata_update, resolve_rollout_path, update_thread_metadata).
 
@@ -5087,11 +5111,11 @@ async fn sync_materialized_rollout_path(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Best-effort synchronization from a live recorder's current rollout path into SQLite thread metadata once a real rollout file exists. It intentionally logs failures instead of failing the caller.
+**Purpose**: Keeps the thread metadata’s rollout path aligned with the actual rollout file path once that file exists. This prevents the database from pointing to an outdated or temporary path.
 
-**Data flow**: Reads the live rollout path via `rollout_path`, checks `codex_rollout::existing_rollout_path` to see whether the file has materialized, fetches the optional state DB, then loads thread metadata with `get_thread(thread_id)`. If metadata exists and `metadata.rollout_path != rollout_path`, it updates the field and writes it back with `upsert_thread`; any error in this inner async block is converted to `ThreadStoreError`, logged with `warn!`, and suppressed. The outer function always returns `Ok(())` unless obtaining the live path itself fails.
+**Data flow**: It receives the store and thread id. It first asks rollout_path for the live recorder’s current path. If that path does not correspond to an existing materialized rollout file, it stops. If the store has no state database, it also stops. Otherwise it reads the thread metadata from the database, compares the saved rollout path with the live recorder’s path, and writes an updated metadata row only if the path changed. If this sync work fails, it logs a warning but still returns success to the caller.
 
-**Call relations**: Called after flush, persist, and shutdown. It bridges the live recorder subsystem and the SQLite index so readers can later find the correct rollout path.
+**Call relations**: This helper is called after persist_thread, flush_thread, and shutdown_thread, because those are moments when the recorder may have finalized or revealed the real file path. It consults the live recorder path, checks the rollout layer’s view of whether the file exists, and then talks to the state database only when there is something worth syncing.
 
 *Call graph*: calls 2 internal fn (state_db, rollout_path); called by 3 (flush_thread, persist_thread, shutdown_thread); 2 external calls (existing_rollout_path, warn!).
 
@@ -5102,11 +5126,11 @@ async fn sync_materialized_rollout_path(
 fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError
 ```
 
-**Purpose**: Converts a plain `std::io::Error` into the store's internal error type using the error's string message.
+**Purpose**: Converts a standard file input/output error into the thread store’s own error type. This gives callers one consistent kind of error to handle.
 
-**Data flow**: Accepts an `std::io::Error`, calls `to_string()`, and wraps it in `ThreadStoreError::Internal { message }`.
+**Data flow**: It receives a standard input/output error. It turns the error into text and wraps that text inside ThreadStoreError::Internal. The returned value can then be passed up through thread-store results.
 
-**Call relations**: Used as the common error-mapping helper for recorder operations in append, persist, flush, and shutdown paths.
+**Call relations**: This helper is used by recorder-writing operations in this file, such as append, persist, flush, and shutdown paths. It is the small adapter between low-level disk errors and the higher-level thread store API.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -5115,11 +5139,7 @@ fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError
 
 `domain_logic` · `request handling`
 
-This file contains the most nuanced read logic in the local store. `read_thread` first tries SQLite metadata via `read_sqlite_metadata`; if metadata exists and is acceptable for the caller’s archived/history requirements, it converts that metadata into a `StoredThread`. When history is not requested, it may still overlay rollout-derived fields such as preview, cwd, provider, and legacy metadata by reading the rollout path and replacing selected fields while preserving SQLite-derived name, git info, and permission profile. If SQLite cannot be trusted—for example because the rollout path is stale, points to another thread, or archived filtering excludes it—the code falls back to locating a rollout file directly.
-
-Rollout resolution prefers an active live writer’s path when it exists and is materialized, then searches active and optionally archived collections using rollout-library lookup helpers and the optional state DB. Reading from a rollout path supports both modern `ThreadItem` summaries and older files that only contain `session_meta`; in the latter case, `stored_thread_from_session_meta` reconstructs a minimal thread summary from the first line and filesystem metadata. Direct path reads canonicalize relative paths under `codex_home`, reject directories and non-files, and normalize compressed paths through `existing_rollout_path`.
-
-History attachment is explicit and optional: if requested, the code loads all rollout items through `RolloutRecorder::load_rollout_items` and stores them in `StoredThreadHistory`. Compatibility details include legacy thread-name lookup, fallback provider IDs, parsing old sandbox-policy strings into `PermissionProfile`, and preferring SQLite git metadata when reading by rollout path.
+A thread can be remembered in two places: a SQLite database that stores fast metadata, and a rollout file, which is a line-by-line log of what happened in the session. This file is the reader that turns those sources into one `StoredThread`, the project’s common shape for a saved conversation. It first tries the fast SQLite metadata when it is safe to trust. If the caller asks for full history, it double-checks that SQLite’s saved rollout path still exists and still belongs to the requested thread, because files can be moved or replaced. If SQLite is missing, stale, archived when archived threads are not allowed, or otherwise not enough, it searches for the rollout file by thread id. Reading by an explicit rollout path follows the same idea, but starts from the caller’s path and verifies it points to a real file. The file also handles older storage formats. If a rollout does not contain a normal summary item, it falls back to the session metadata line. It parses stored strings into richer values such as session source and approval mode, fills in defaults when old data is incomplete, and attaches history only when requested. The tests cover active and archived threads, stale SQLite paths, legacy names and sandbox policy data, fork information, and missing files.
 
 #### Function details
 
@@ -5132,11 +5152,11 @@ async fn read_thread(
 ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Reads a thread by ID, preferring SQLite metadata when it is valid for the request and falling back to rollout discovery otherwise. It optionally attaches full rollout history.
+**Purpose**: Reads one thread by its thread id. It chooses the best available source: SQLite metadata when it is trustworthy, otherwise the rollout log file on disk.
 
-**Data flow**: Consumes `&LocalThreadStore` and `ReadThreadParams`; reads `thread_id`, `include_archived`, `include_history`, optional SQLite metadata via `read_sqlite_metadata`, live/store config, and rollout files. If SQLite metadata exists and passes archived/history checks, it converts it with `stored_thread_from_sqlite_metadata`, may overlay rollout-derived fields from `read_thread_from_rollout_path` when history is not requested and the rollout has a non-empty preview, then calls `attach_history_if_requested`. Otherwise it resolves a rollout path with `resolve_rollout_path`, reads it with `read_thread_from_rollout_path`, enforces archived access, optionally attaches history, and returns the resulting `StoredThread` or a `ThreadStoreError`.
+**Data flow**: It receives a local store and read options, including the thread id, whether archived threads are allowed, and whether full history is wanted. It looks up SQLite metadata, checks archive rules and whether history can safely be loaded from the saved path, may refresh the summary from the rollout file, then optionally adds history. If SQLite is not usable, it locates the rollout file and reads from that instead. It returns a complete `StoredThread` or an error explaining why the thread could not be read.
 
-**Call relations**: This is the primary read implementation used by the store trait, history loading, resume logic, and metadata-update flows. It orchestrates SQLite-first reading, rollout fallback, and optional history attachment.
+**Call relations**: Higher-level flows such as loading history, resuming a thread, and applying or updating metadata call this when they need the current thread record. It delegates small jobs to `read_sqlite_metadata`, `stored_thread_from_sqlite_metadata`, `resolve_rollout_path`, `read_thread_from_rollout_path`, `sqlite_rollout_path_can_load_history_for_thread`, and `attach_history_if_requested` so each source and safety check is handled in one place.
 
 *Call graph*: calls 8 internal fn (permission_profile_from_metadata_value, rollout_path_is_archived, attach_history_if_requested, read_sqlite_metadata, read_thread_from_rollout_path, resolve_rollout_path, sqlite_rollout_path_can_load_history_for_thread, stored_thread_from_sqlite_metadata); called by 5 (load_history, read_thread, resume_thread, apply_metadata_update, update_thread_metadata); 1 external calls (format!).
 
@@ -5151,11 +5171,11 @@ async fn sqlite_rollout_path_can_load_history_for_thread(
 ) -> bool
 ```
 
-**Purpose**: Checks whether the rollout path stored in SQLite still exists and actually belongs to the requested thread before it is trusted as a history source. This guards against stale or repointed metadata.
+**Purpose**: Checks whether the rollout path saved in SQLite can really be used to load history for the requested thread. This protects against stale database records pointing at missing files or at a different thread.
 
-**Data flow**: Takes the store, a rollout `Path`, and `ThreadId`; it checks `codex_rollout::existing_rollout_path(path).await`, then reads the thread from that path and returns `true` only if the read succeeds and the resulting thread ID matches the requested one.
+**Data flow**: It receives the store, a path, and the expected thread id. It first checks whether the path exists as a rollout file. Then it reads the thread summary from that path and compares the thread id inside the file with the expected id. It returns `true` only if both checks pass.
 
-**Call relations**: Called only from `read_thread` when deciding whether SQLite metadata is safe to use for history-bearing reads.
+**Call relations**: `read_thread` uses this before trusting SQLite metadata when full history is requested. It calls `read_thread_from_rollout_path` as a verification step, so the history loader later does not replay the wrong file.
 
 *Call graph*: calls 1 internal fn (read_thread_from_rollout_path); called by 1 (read_thread); 2 external calls (to_path_buf, existing_rollout_path).
 
@@ -5171,11 +5191,11 @@ async fn read_thread_by_rollout_path(
 ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Reads a thread directly from a supplied rollout path, optionally rejecting archived threads and attaching history, then overlays SQLite git metadata when available.
+**Purpose**: Reads a thread when the caller already has a rollout file path instead of only a thread id. It is useful for path-based operations, while still applying archive rules and optional history loading.
 
-**Data flow**: Consumes the store, a `PathBuf`, and `include_archived`/`include_history` flags. It canonicalizes and validates the path with `resolve_requested_rollout_path`, reads the rollout summary with `read_thread_from_rollout_path`, rejects archived threads when requested, optionally fetches SQLite metadata for the thread ID and merges git SHA/branch/origin with rollout-derived fallbacks via `git_info_from_parts`, then calls `attach_history_if_requested` and returns the `StoredThread`.
+**Data flow**: It receives the store, a rollout path, and flags for archived threads and history. It resolves the path into a real file, reads the thread from that file, rejects archived threads unless allowed, and then consults SQLite for extra metadata such as newer git information. If requested, it loads the full history before returning the `StoredThread`.
 
-**Call relations**: Used by direct path-read APIs, by history loading for live paths, and by metadata-update code that needs to inspect a specific rollout file.
+**Call relations**: This is called by path-based history and metadata flows. It relies on `resolve_requested_rollout_path` for safe path handling, `read_thread_from_rollout_path` for the file contents, `read_sqlite_metadata` and `git_info_from_parts` for metadata enrichment, and `attach_history_if_requested` for full replay data.
 
 *Call graph*: calls 5 internal fn (git_info_from_parts, attach_history_if_requested, read_sqlite_metadata, read_thread_from_rollout_path, resolve_requested_rollout_path); called by 4 (load_history, read_thread_by_rollout_path, read_thread_by_rollout_path_params, update_thread_metadata); 1 external calls (format!).
 
@@ -5189,11 +5209,11 @@ async fn resolve_requested_rollout_path(
 ) -> ThreadStoreResult<std::path::PathBuf>
 ```
 
-**Purpose**: Normalizes a caller-supplied rollout path into a canonical existing file path, resolving relative paths under `codex_home` and rejecting directories or non-files. It also follows the rollout library's plain/compressed path resolution.
+**Purpose**: Turns a caller-provided rollout path into a canonical real file path. It rejects paths that do not point to a normal existing file.
 
-**Data flow**: Takes the store and a `PathBuf`; if the path is relative it joins it under `store.config.codex_home`, then checks async metadata to reject directories and non-files, asks `codex_rollout::existing_rollout_path` for the actual existing plain/compressed file, canonicalizes that path with `std::fs::canonicalize`, and returns the canonical `PathBuf` or `InvalidRequest` with a detailed message.
+**Data flow**: It receives the store and a path. If the path is relative, it treats it as relative to the Codex home directory. It checks whether the target is a directory, a non-file, or missing, and returns a clear invalid-request error for those cases. When valid, it returns the canonical absolute path.
 
-**Call relations**: Called only by `read_thread_by_rollout_path` to sanitize external input before any rollout parsing occurs.
+**Call relations**: `read_thread_by_rollout_path` calls this before reading any file contents. It uses filesystem metadata, rollout path existence checks, and canonicalization so later code can assume the path is safe and concrete.
 
 *Call graph*: called by 1 (read_thread_by_rollout_path); 5 external calls (is_relative, existing_rollout_path, format!, canonicalize, metadata).
 
@@ -5207,11 +5227,11 @@ async fn attach_history_if_requested(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Loads and attaches full rollout history to a `StoredThread` when requested. If history is not requested, it leaves the thread unchanged.
+**Purpose**: Adds the full rollout history to a thread only when the caller asked for it. This avoids expensive file replay when a summary is enough.
 
-**Data flow**: Mutably borrows a `StoredThread` and a boolean flag. If `include_history` is false it returns immediately; otherwise it reads `thread.thread_id` and `thread.rollout_path`, errors if no rollout path is present, loads items with `load_history_items`, writes `thread.history = Some(StoredThreadHistory { thread_id, items })`, and returns `Ok(())`.
+**Data flow**: It receives a mutable `StoredThread` and a flag. If the flag is false, it leaves the thread unchanged. If true, it requires the thread to have a rollout path, loads the rollout items from that path, and stores them inside `thread.history` along with the thread id.
 
-**Call relations**: Used by both ID-based and path-based read functions so history loading behavior is centralized.
+**Call relations**: Both `read_thread` and `read_thread_by_rollout_path` call this at the end of their reading process. It hands the actual file loading to `load_history_items` and converts the loaded items into `StoredThreadHistory`.
 
 *Call graph*: calls 1 internal fn (load_history_items); called by 2 (read_thread, read_thread_by_rollout_path); 1 external calls (format!).
 
@@ -5226,11 +5246,11 @@ async fn resolve_rollout_path(
 ) -> ThreadStoreResult<Option<std::path::PathBuf>>
 ```
 
-**Purpose**: Finds the best rollout path for a thread ID, preferring a materialized live-writer path and otherwise searching active and optionally archived collections. It respects the caller's archived-access flag.
+**Purpose**: Finds the rollout file for a thread id. It knows where to look for live, active, and archived rollout files.
 
-**Data flow**: Accepts the store, `ThreadId`, and `include_archived`. It first tries `live_writer::rollout_path(store, thread_id)` and keeps it only if `existing_rollout_path` says the file exists and archived filtering allows it. If that fails, it fetches the optional state DB handle and calls `find_thread_path_by_id_str`; when `include_archived` is true and no active path is found, it also calls `find_archived_thread_path_by_id_str`. It returns `Ok(Some(path))`, `Ok(None)`, or `InvalidRequest` on lookup errors.
+**Data flow**: It receives the store, a thread id, and whether archived threads are allowed. It first checks whether there is a live writer path for the thread. If that does not work, it uses the state database context when available and searches the Codex home directory for active files, and then archived files if allowed. It returns an optional path or an error if the search itself fails.
 
-**Call relations**: Called by `read_thread` when SQLite metadata is absent or unsuitable. It bridges live state and persisted rollout discovery.
+**Call relations**: `read_thread` calls this when SQLite metadata cannot be used. It works with `live_writer::rollout_path`, rollout existence checks, archive-path checks, and rollout search helpers to find the best file location.
 
 *Call graph*: calls 3 internal fn (state_db, rollout_path_is_archived, rollout_path); called by 1 (read_thread); 4 external calls (existing_rollout_path, find_archived_thread_path_by_id_str, find_thread_path_by_id_str, to_string).
 
@@ -5244,11 +5264,11 @@ async fn read_thread_from_rollout_path(
 ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Builds a `StoredThread` from a rollout file, using a modern `ThreadItem` summary when available and falling back to legacy `session_meta` parsing otherwise. It also applies session-meta overrides and legacy thread names.
+**Purpose**: Builds a `StoredThread` by reading a rollout log file. This is the main bridge from raw on-disk session logs to the thread summary used by the rest of the system.
 
-**Data flow**: Consumes the store and a rollout `PathBuf`. It calls `read_thread_item_from_rollout`; if that returns `None`, it delegates to `stored_thread_from_session_meta`. Otherwise it computes the archived flag with `rollout_path_is_archived`, converts the item with `stored_thread_from_rollout_item`, normalizes `thread.rollout_path` to the plain path, optionally reads `SessionMetaLine` to fill `forked_from_id`, `parent_thread_id`, and a non-empty `model_provider`, then looks up a legacy thread name with `find_thread_name_by_id` and applies it via `set_thread_name_from_title`.
+**Data flow**: It receives the store and a rollout path. It tries to read a summary item from the rollout. If none exists, it falls back to the session metadata line. When a summary is found, it converts it to a `StoredThread`, marks whether it is archived, records the plain rollout path, adds fork and parent ids from session metadata, applies a non-empty model provider from metadata, and applies a saved thread name if one exists. It returns the assembled thread.
 
-**Call relations**: Used by both read entrypoints and by SQLite-history validation. It is the core rollout-file decoding routine.
+**Call relations**: This helper is used by `read_thread`, `read_thread_by_rollout_path`, and `sqlite_rollout_path_can_load_history_for_thread`. It delegates conversion to `stored_thread_from_rollout_item`, fallback construction to `stored_thread_from_session_meta`, and name cleanup to `set_thread_name_from_title`.
 
 *Call graph*: calls 4 internal fn (rollout_path_is_archived, set_thread_name_from_title, stored_thread_from_rollout_item, stored_thread_from_session_meta); called by 3 (read_thread, read_thread_by_rollout_path, sqlite_rollout_path_can_load_history_for_thread); 6 external calls (as_path, clone, find_thread_name_by_id, plain_rollout_path, read_session_meta_line, read_thread_item_from_rollout).
 
@@ -5261,11 +5281,11 @@ async fn load_history_items(
 ) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>>
 ```
 
-**Purpose**: Loads all rollout items from a rollout file and maps any I/O/parsing failure into a store internal error.
+**Purpose**: Loads every recorded rollout item from a rollout file. This is used when callers need the full conversation, not just a summary.
 
-**Data flow**: Takes a rollout `Path`, calls `RolloutRecorder::load_rollout_items(path).await`, extracts the `items` vector from the returned tuple, and returns it or `ThreadStoreError::Internal` with the path in the message.
+**Data flow**: It receives a file path. It asks `RolloutRecorder` to load the rollout items from disk, converts any loading failure into a thread-store internal error with the path included, and returns the vector of rollout items.
 
-**Call relations**: Called only by `attach_history_if_requested`.
+**Call relations**: `attach_history_if_requested` calls this only when history was requested. It is the narrow point where full rollout replay data is read from disk.
 
 *Call graph*: calls 1 internal fn (load_rollout_items); called by 1 (attach_history_if_requested).
 
@@ -5279,11 +5299,11 @@ async fn read_sqlite_metadata(
 ) -> Option<ThreadMetadata>
 ```
 
-**Purpose**: Fetches thread metadata from the optional state DB, suppressing DB errors by returning `None`. This keeps read paths resilient when SQLite is unavailable or inconsistent.
+**Purpose**: Looks up a thread’s metadata row in the local SQLite state database. SQLite is the fast summary source when it is available.
 
-**Data flow**: Reads `store.state_db().await`, returns early if absent, otherwise calls `runtime.get_thread(thread_id).await`, discards errors with `.ok().flatten()`, and returns `Option<ThreadMetadata>`.
+**Data flow**: It receives the store and thread id. It asks the store for a state database runtime; if there is none, it returns `None`. If there is a database, it fetches the thread row and returns the metadata when found, ignoring lookup errors by returning no metadata.
 
-**Call relations**: Used by both ID-based and path-based reads as the SQLite metadata source.
+**Call relations**: `read_thread` uses this as its first possible source. `read_thread_by_rollout_path` uses it after reading a rollout file to enrich the result with database-backed details such as git information.
 
 *Call graph*: calls 1 internal fn (state_db); called by 2 (read_thread, read_thread_by_rollout_path).
 
@@ -5297,11 +5317,11 @@ async fn stored_thread_from_sqlite_metadata(
 ) -> StoredThread
 ```
 
-**Purpose**: Converts a `codex_state::ThreadMetadata` row into a `StoredThread`, supplementing it with legacy name-index and session-meta information where useful. It is the SQLite-side counterpart to rollout-item conversion.
+**Purpose**: Converts a SQLite `ThreadMetadata` record into the common `StoredThread` shape. It fills in names, preview text, permissions, git details, and defaults that callers expect.
 
-**Data flow**: Consumes the store and `ThreadMetadata`. It derives `name` from `distinct_thread_metadata_title` or falls back to `find_thread_name_by_id`, optionally reads `SessionMetaLine` from `metadata.rollout_path` to recover `forked_from_id` and `parent_thread_id`, normalizes the rollout path to plain `.jsonl`, computes preview from `metadata.preview` or `first_user_message`, parses `permission_profile` from `metadata.sandbox_policy`, parses `source` and `approval_mode` from stored strings, builds `git_info` from git fields, substitutes the store default provider when `metadata.model_provider` is empty, and returns a populated `StoredThread` with `history: None`.
+**Data flow**: It receives the store and one metadata record. It chooses a display name from a distinct SQLite title or a legacy saved thread name, reads session metadata from the rollout path when available for fork and parent ids, picks preview text from preview or first user message, parses stored strings into typed source and approval values, builds permission and git information, and returns a `StoredThread` without full history.
 
-**Call relations**: Called by `read_thread` when SQLite metadata is chosen as the primary source.
+**Call relations**: `read_thread` calls this when SQLite metadata is acceptable. It relies on helper functions such as `distinct_thread_metadata_title`, `permission_profile_from_metadata_value`, `git_info_from_parts`, `parse_session_source`, and `parse_or_default` to keep the conversion compatible with newer and older stored data.
 
 *Call graph*: calls 5 internal fn (distinct_thread_metadata_title, git_info_from_parts, permission_profile_from_metadata_value, parse_or_default, parse_session_source); called by 1 (read_thread); 3 external calls (find_thread_name_by_id, plain_rollout_path, read_session_meta_line).
 
@@ -5315,11 +5335,11 @@ async fn stored_thread_from_session_meta(
 ) -> ThreadStoreResult<StoredThread>
 ```
 
-**Purpose**: Reads a legacy rollout file's `session_meta` line and converts it into a minimal `StoredThread` when no modern thread summary item is available.
+**Purpose**: Creates a thread summary from only the session metadata line in a rollout file. This is the fallback for rollout files that do not contain a richer summary item.
 
-**Data flow**: Takes the store and rollout path, reads `SessionMetaLine` with `read_session_meta_line`, computes the archived flag with `rollout_path_is_archived`, delegates to `stored_thread_from_meta_line`, and returns the resulting `StoredThread` or an internal error if the meta line cannot be read.
+**Data flow**: It receives the store and path. It reads the session metadata line from the file, checks whether the path is archived, and passes those pieces into `stored_thread_from_meta_line`. If the metadata line cannot be read, it returns an internal error.
 
-**Call relations**: Used as the fallback branch inside `read_thread_from_rollout_path` for older rollout formats.
+**Call relations**: `read_thread_from_rollout_path` calls this when `read_thread_item_from_rollout` finds no summary item. It hands the actual object construction to `stored_thread_from_meta_line`.
 
 *Call graph*: calls 2 internal fn (rollout_path_is_archived, stored_thread_from_meta_line); called by 1 (read_thread_from_rollout_path); 2 external calls (as_path, read_session_meta_line).
 
@@ -5335,11 +5355,11 @@ fn stored_thread_from_meta_line(
 ) -> StoredThread
 ```
 
-**Purpose**: Constructs a `StoredThread` directly from a `SessionMetaLine` plus filesystem metadata. It is the lowest-level compatibility path for old rollout files.
+**Purpose**: Builds a minimal `StoredThread` from a session metadata line. It provides sensible defaults when only basic session information is available.
 
-**Data flow**: Consumes the store, `SessionMetaLine`, rollout path, and archived flag. It parses `created_at` from `meta_line.meta.timestamp` with fallback to `Utc::now`, derives `updated_at` from filesystem modified time or `created_at`, normalizes the rollout path to plain `.jsonl`, and builds a `StoredThread` using fields from `meta_line.meta` and `meta_line.git`, defaulting preview to empty, name to `None`, approval mode to `OnRequest`, and permission profile to `PermissionProfile::read_only()`.
+**Data flow**: It receives the store, a parsed metadata line, the file path, and whether the file is archived. It parses the creation time, uses the file modification time as the update time when available, stores the rollout path, copies ids, working directory, source, agent data, and git data from the metadata, and fills missing summary fields with safe defaults such as empty preview, read-only permissions, and approval-on-request. It returns the constructed thread.
 
-**Call relations**: Called only by `stored_thread_from_session_meta`.
+**Call relations**: `stored_thread_from_session_meta` calls this after successfully reading the metadata line. It uses `parse_rfc3339_non_optional` for the timestamp and filesystem metadata to estimate when the file was last updated.
 
 *Call graph*: calls 2 internal fn (read_only, parse_rfc3339_non_optional); called by 1 (stored_thread_from_session_meta); 4 external calls (as_path, new, plain_rollout_path, metadata).
 
@@ -5350,11 +5370,11 @@ fn stored_thread_from_meta_line(
 fn parse_session_source(source: &str) -> SessionSource
 ```
 
-**Purpose**: Parses a stored session-source string into `SessionSource`, accepting either full JSON or a bare string value. Unknown values become `SessionSource::Unknown`.
+**Purpose**: Parses a stored session source string into a typed `SessionSource` value. It keeps older plain-string storage working as well as newer JSON-shaped storage.
 
-**Data flow**: Takes a `&str`, tries `serde_json::from_str`, then wraps the string in `serde_json::Value::String` and retries, finally returning `SessionSource::Unknown` on failure.
+**Data flow**: It receives a string. It first tries to parse the string as JSON, then tries to treat the whole string as a JSON string value. If both fail, it returns `SessionSource::Unknown`.
 
-**Call relations**: Used by `stored_thread_from_sqlite_metadata` when decoding SQLite metadata.
+**Call relations**: `stored_thread_from_sqlite_metadata` uses this while converting SQLite metadata. It isolates compatibility parsing so the main conversion stays readable.
 
 *Call graph*: called by 1 (stored_thread_from_sqlite_metadata); 1 external calls (from_str).
 
@@ -5365,11 +5385,11 @@ fn parse_session_source(source: &str) -> SessionSource
 fn parse_or_default(value: &str, default: T) -> T
 ```
 
-**Purpose**: Generic helper that parses a stored string into any deserializable type, accepting either JSON or a bare string representation and falling back to a provided default.
+**Purpose**: Parses a stored string into any requested typed value, with a fallback default. It is a small compatibility helper for values that may be saved as JSON or as older plain strings.
 
-**Data flow**: Consumes a string slice and a default value of type `T: DeserializeOwned`; it tries `serde_json::from_str`, then string-value deserialization, and returns the parsed value or the supplied default.
+**Data flow**: It receives a string and a default value. It tries JSON parsing, then plain-string JSON conversion, and returns the parsed value if either works. If parsing fails, it returns the default.
 
-**Call relations**: Used by `stored_thread_from_sqlite_metadata` to decode fields like `approval_mode` without making malformed metadata fatal.
+**Call relations**: `stored_thread_from_sqlite_metadata` uses this for fields such as approval mode. The function keeps bad or old saved data from breaking thread reads.
 
 *Call graph*: called by 1 (stored_thread_from_sqlite_metadata); 1 external calls (from_str).
 
@@ -5380,11 +5400,11 @@ fn parse_or_default(value: &str, default: T) -> T
 fn parse_rfc3339_non_optional(value: &str) -> Option<DateTime<Utc>>
 ```
 
-**Purpose**: Parses a required RFC3339 timestamp string into UTC, returning `None` on invalid input.
+**Purpose**: Parses a timestamp written in RFC 3339 format, the common internet date-time format such as `2025-01-03T12:00:00Z`. It returns no value if the string is not valid.
 
-**Data flow**: Takes a `&str`, parses it with `DateTime::parse_from_rfc3339`, converts the timezone to UTC, and returns `Option<DateTime<Utc>>`.
+**Data flow**: It receives a timestamp string. It tries to parse it as RFC 3339, converts the result to UTC time if successful, and returns `Some(time)`. If parsing fails, it returns `None`.
 
-**Call relations**: Used by `stored_thread_from_meta_line` for legacy session-meta timestamps.
+**Call relations**: `stored_thread_from_meta_line` uses this to turn the session metadata timestamp into the thread creation time, falling back to the current time if parsing fails.
 
 *Call graph*: called by 1 (stored_thread_from_meta_line); 1 external calls (parse_from_rfc3339).
 
@@ -5395,11 +5415,11 @@ fn parse_rfc3339_non_optional(value: &str) -> Option<DateTime<Utc>>
 async fn read_thread_returns_active_rollout_summary()
 ```
 
-**Purpose**: Verifies that reading an active thread by ID returns rollout-derived summary fields and attached history.
+**Purpose**: Checks that an active rollout file can be read into a thread summary and full history. It proves the normal happy path works without SQLite.
 
-**Data flow**: Creates a temp store and active session file, reads the thread with history enabled, and asserts thread ID, rollout path, `archived_at`, preview, and history thread ID.
+**Data flow**: The test creates a temporary Codex home, writes a session file, reads by thread id with history enabled, and checks the id, rollout path, archive status, preview text, and loaded history id.
 
-**Call relations**: This test exercises the normal rollout-read path in `read_thread`.
+**Call relations**: It exercises the public store `read_thread` path, which reaches the `read_thread` function in this file and then the rollout-reading and history-loading helpers.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -5410,11 +5430,11 @@ async fn read_thread_returns_active_rollout_summary()
 async fn read_thread_returns_rollout_path_summary()
 ```
 
-**Purpose**: Checks that reading by a relative rollout path resolves it under `codex_home`, canonicalizes it, and returns the expected summary.
+**Purpose**: Checks that reading by a relative rollout path works. It makes sure relative paths are resolved under the Codex home directory.
 
-**Data flow**: Writes a session file, derives a relative path under the temp home, calls `read_thread_by_rollout_path`, and asserts thread ID, canonical rollout path, and preview.
+**Data flow**: The test writes a session file, strips the home directory prefix to make the path relative, reads by rollout path without history, and checks the thread id, canonical rollout path, and preview.
 
-**Call relations**: This test targets `resolve_requested_rollout_path` and direct path reading.
+**Call relations**: It exercises the public path-based read method, which goes through `read_thread_by_rollout_path`, `resolve_requested_rollout_path`, and `read_thread_from_rollout_path`.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -5425,11 +5445,11 @@ async fn read_thread_returns_rollout_path_summary()
 async fn read_thread_by_rollout_path_prefers_sqlite_git_info()
 ```
 
-**Purpose**: Ensures direct path reads overlay SQLite git metadata over rollout-derived git info when SQLite has newer values.
+**Purpose**: Checks that SQLite git metadata can override or complete git data from the rollout. This keeps path-based reads aligned with the latest saved state.
 
-**Data flow**: Creates a rollout and matching SQLite metadata with a different branch, reads by rollout path, extracts `git_info`, and asserts branch came from SQLite while commit hash and repository URL remain present.
+**Data flow**: The test writes a rollout with git data, stores SQLite metadata with a different branch, reads by rollout path, and verifies the result uses the SQLite branch while preserving fallback commit and repository URL from the rollout.
 
-**Call relations**: This test covers the SQLite git-merge logic in `read_thread_by_rollout_path`.
+**Call relations**: It drives `read_thread_by_rollout_path`, especially the part that calls `read_sqlite_metadata` and rebuilds git information with `git_info_from_parts`.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 4 external calls (new, now, from_u128, assert_eq!).
 
@@ -5440,11 +5460,11 @@ async fn read_thread_by_rollout_path_prefers_sqlite_git_info()
 async fn read_thread_returns_archived_rollout_when_requested()
 ```
 
-**Purpose**: Verifies that archived rollouts are hidden from active-only reads but returned when `include_archived` is true.
+**Purpose**: Checks that archived threads are hidden by default but returned when explicitly allowed. This protects callers that only want active conversations.
 
-**Data flow**: Writes an archived session file, performs an active-only read expecting an invalid-request message, then reads again with `include_archived: true` and asserts archived path, non-`None` `archived_at`, preview, and absent history.
+**Data flow**: The test writes an archived session file, first reads without archived permission and expects an invalid-request error, then reads with archived permission and checks the archived thread summary.
 
-**Call relations**: This test exercises archived filtering in `resolve_rollout_path` and `read_thread`.
+**Call relations**: It exercises archive filtering in `read_thread`, `resolve_rollout_path`, and `read_thread_from_rollout_path`.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_archived_session_file); 5 external calls (new, from_u128, assert!, assert_eq!, panic!).
 
@@ -5455,11 +5475,11 @@ async fn read_thread_returns_archived_rollout_when_requested()
 async fn read_thread_prefers_active_rollout_over_archived()
 ```
 
-**Purpose**: Checks that when both active and archived rollouts exist for the same thread ID, the active rollout is chosen.
+**Purpose**: Checks that when both active and archived files exist for the same thread, the active one wins. This avoids showing an older archived copy when a live copy is available.
 
-**Data flow**: Writes both active and archived session files for one UUID, reads with `include_archived: true`, and asserts the returned rollout path is the active one with `archived_at == None` and active preview text.
+**Data flow**: The test writes both active and archived session files for the same id, reads with archived files allowed, and verifies the returned path and preview come from the active file.
 
-**Call relations**: This test validates the active-first search order in `resolve_rollout_path`.
+**Call relations**: It focuses on the search order inside `resolve_rollout_path` as used by `read_thread`.
 
 *Call graph*: calls 5 internal fn (from_string, new, test_config, write_archived_session_file, write_session_file); 3 external calls (new, from_u128, assert_eq!).
 
@@ -5470,11 +5490,11 @@ async fn read_thread_prefers_active_rollout_over_archived()
 async fn read_thread_returns_forked_from_id()
 ```
 
-**Purpose**: Ensures fork ancestry encoded in session metadata is surfaced in the returned thread summary.
+**Purpose**: Checks that fork information is preserved when reading a thread. Fork information tells the system which earlier conversation this one came from.
 
-**Data flow**: Writes a session file containing `forked_from_id`, reads the thread, and asserts `thread.forked_from_id` matches the expected parent thread ID.
+**Data flow**: The test writes a session file that includes a parent/fork id, reads the thread, and verifies the returned `forked_from_id` matches the parent thread id.
 
-**Call relations**: This test covers the session-meta override logic in `read_thread_from_rollout_path`.
+**Call relations**: It exercises `read_thread_from_rollout_path`, including the extra session metadata read that fills fork and parent fields.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file_with_fork); 3 external calls (new, from_u128, assert_eq!).
 
@@ -5485,11 +5505,11 @@ async fn read_thread_returns_forked_from_id()
 async fn read_thread_applies_sqlite_thread_name()
 ```
 
-**Purpose**: Verifies that a meaningful SQLite title becomes the thread name when reading by ID.
+**Purpose**: Checks that a saved SQLite title becomes the thread’s display name. This confirms database metadata is used for user-facing names.
 
-**Data flow**: Creates a rollout and SQLite metadata with `title = "Saved title"` and first-user-message equal to the rollout preview, reads the thread, and asserts `thread.name` is `Some("Saved title")`.
+**Data flow**: The test writes a rollout file, inserts SQLite metadata with a title and first message, reads the thread, and checks that `name` is the saved title.
 
-**Call relations**: This test exercises `distinct_thread_metadata_title` and SQLite-to-thread conversion in `stored_thread_from_sqlite_metadata`.
+**Call relations**: It drives the SQLite-first branch of `read_thread` and the name selection inside `stored_thread_from_sqlite_metadata`.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 4 external calls (new, now, from_u128, assert_eq!).
 
@@ -5500,11 +5520,11 @@ async fn read_thread_applies_sqlite_thread_name()
 async fn read_thread_returns_permission_profile_from_sqlite_metadata()
 ```
 
-**Purpose**: Checks that a serialized modern `PermissionProfile` stored in SQLite is parsed and returned on reads.
+**Purpose**: Checks that a permission profile saved in SQLite is returned on the thread. Permissions describe what the session was allowed to do.
 
-**Data flow**: Creates a rollout and SQLite metadata whose `sandbox_policy` field contains serialized `PermissionProfile::Disabled`, reads the thread, and asserts preview and permission profile.
+**Data flow**: The test stores a serialized disabled permission profile in SQLite, reads the thread, and checks that the preview comes from the rollout while the permission profile comes from SQLite.
 
-**Call relations**: This test covers `permission_profile_from_metadata_value` as used by SQLite-backed reads.
+**Call relations**: It exercises the merge behavior in `read_thread` and the permission conversion through `permission_profile_from_metadata_value`.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 5 external calls (new, now, from_u128, assert_eq!, to_string).
 
@@ -5515,11 +5535,11 @@ async fn read_thread_returns_permission_profile_from_sqlite_metadata()
 async fn read_thread_accepts_legacy_sandbox_policy_metadata()
 ```
 
-**Purpose**: Verifies that legacy sandbox-policy strings in SQLite metadata are still accepted and converted into the correct permission profile.
+**Purpose**: Checks that older sandbox policy strings are still understood. This keeps old saved sessions readable after the permission format changed.
 
-**Data flow**: Creates a rollout and SQLite metadata with `sandbox_policy = "danger-full-access"`, reads the thread with history enabled, and asserts the resulting permission profile is `Disabled`.
+**Data flow**: The test stores a legacy policy string such as `danger-full-access`, reads with history enabled, and verifies it becomes the expected permission profile.
 
-**Call relations**: This test targets the legacy parsing branch in `permission_profile_from_metadata_value` reached through `read_thread`.
+**Call relations**: It covers the SQLite metadata conversion path in `stored_thread_from_sqlite_metadata` and the legacy handling inside `permission_profile_from_metadata_value`.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 4 external calls (new, now, from_u128, assert_eq!).
 
@@ -5530,11 +5550,11 @@ async fn read_thread_accepts_legacy_sandbox_policy_metadata()
 async fn read_thread_preserves_rollout_cwd_when_sqlite_metadata_exists()
 ```
 
-**Purpose**: Checks that when rollout and SQLite metadata disagree, a rollout with a real preview can override fields like cwd and provider while preserving SQLite title and permission semantics.
+**Purpose**: Checks that the rollout file’s working directory is kept when the rollout has the better live summary. This matters because permissions may depend on the actual directory used by the session.
 
-**Data flow**: Manually writes a rollout whose session meta has cwd `/` and provider `rollout-provider`, inserts SQLite metadata with a different cwd, title, first-user-message, and legacy sandbox policy, reads without history, and asserts the returned thread uses rollout path, rollout preview/provider/cwd, SQLite title, and a permission profile derived from the legacy policy against the rollout cwd.
+**Data flow**: The test creates a rollout with one working directory and SQLite metadata with another. It reads without history and verifies the result uses rollout preview, provider, and working directory, while still applying the SQLite title and permission policy converted for the rollout directory.
 
-**Call relations**: This test exercises the hybrid overlay branch in `read_thread` where rollout data replaces selected SQLite summary fields.
+**Call relations**: It exercises the part of `read_thread` that starts with SQLite metadata but replaces the summary with `read_thread_from_rollout_path` when the rollout has a real preview.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, new, test_config); 11 external calls (from, new, now, from_u128, new, assert_eq!, format!, json!, create, create_dir_all (+1 more)).
 
@@ -5545,11 +5565,11 @@ async fn read_thread_preserves_rollout_cwd_when_sqlite_metadata_exists()
 async fn read_thread_uses_legacy_thread_name_when_sqlite_title_is_missing()
 ```
 
-**Purpose**: Ensures that when no meaningful SQLite title exists, the legacy thread-name index is used as the thread name.
+**Purpose**: Checks that the older saved thread-name file is used when SQLite has no title. This keeps names from older installations visible.
 
-**Data flow**: Writes a session file, appends a legacy thread name entry, reads the thread, and asserts `thread.name` equals the legacy title.
+**Data flow**: The test writes a session file, appends a legacy thread name, reads the thread, and verifies that name is returned.
 
-**Call relations**: This test covers the fallback name lookup in rollout-based reads.
+**Call relations**: It exercises `read_thread_from_rollout_path`, which calls the rollout helper to find a saved thread name and then applies it with `set_thread_name_from_title`.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 4 external calls (new, from_u128, assert_eq!, append_thread_name).
 
@@ -5560,11 +5580,11 @@ async fn read_thread_uses_legacy_thread_name_when_sqlite_title_is_missing()
 async fn read_thread_uses_sqlite_metadata_for_rollout_without_user_preview()
 ```
 
-**Purpose**: Verifies that when a rollout lacks a user preview, SQLite metadata remains the primary summary source while history still loads from the rollout.
+**Purpose**: Checks that SQLite metadata is kept when the rollout file has no user-message preview. This prevents a sparse rollout from wiping out useful database summary data.
 
-**Data flow**: Creates a rollout containing only session meta, inserts SQLite metadata with title/provider/cwd/CLI version, reads with history enabled, and asserts the returned thread uses SQLite summary fields, empty preview, and one-item history.
+**Data flow**: The test writes a rollout containing only session metadata, inserts richer SQLite metadata, reads with history enabled, and checks that SQLite fields like name, provider, working directory, and CLI version are returned while history still loads from the rollout file.
 
-**Call relations**: This test covers the branch where rollout overlay is skipped because the rollout summary has no preview.
+**Call relations**: It covers the SQLite-first branch of `read_thread`, including `sqlite_rollout_path_can_load_history_for_thread` and `attach_history_if_requested`.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, new, test_config); 9 external calls (new, now, from_u128, assert_eq!, format!, json!, create, create_dir_all, writeln!).
 
@@ -5575,11 +5595,11 @@ async fn read_thread_uses_sqlite_metadata_for_rollout_without_user_preview()
 async fn read_thread_falls_back_to_rollout_search_when_sqlite_path_is_stale()
 ```
 
-**Purpose**: Checks that stale SQLite rollout paths do not block reads; the code falls back to searching actual rollout files by thread ID.
+**Purpose**: Checks that a missing rollout path saved in SQLite does not block reading the thread. The reader should search for the real rollout instead.
 
-**Data flow**: Creates a real local rollout, inserts SQLite metadata pointing at a missing external path, reads with archived/history enabled, and asserts the returned thread uses the real rollout path, rollout preview, default provider, and loaded history.
+**Data flow**: The test stores SQLite metadata pointing to a missing external file, writes the real rollout under Codex home, reads with archived and history allowed, and verifies the returned thread comes from the real rollout.
 
-**Call relations**: This test validates stale-path rejection via `sqlite_rollout_path_can_load_history_for_thread` and fallback through `resolve_rollout_path`.
+**Call relations**: It exercises `read_thread` rejecting stale SQLite history paths through `sqlite_rollout_path_can_load_history_for_thread`, then falling back to `resolve_rollout_path`.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 4 external calls (new, now, from_u128, assert_eq!).
 
@@ -5590,11 +5610,11 @@ async fn read_thread_falls_back_to_rollout_search_when_sqlite_path_is_stale()
 async fn read_thread_falls_back_when_sqlite_path_points_to_another_thread()
 ```
 
-**Purpose**: Ensures that if SQLite metadata points to a rollout belonging to a different thread, the read path falls back to the correct rollout discovered by thread ID.
+**Purpose**: Checks that SQLite metadata pointing at a valid file for the wrong thread is not trusted. This prevents loading another conversation’s history by mistake.
 
-**Data flow**: Creates a real local rollout for one thread and a different external rollout for another thread, stores the wrong path in SQLite metadata, reads the original thread, and asserts the returned summary and history come from the correct local rollout.
+**Data flow**: The test writes the real rollout for one id and an external rollout for another id, stores SQLite metadata for the first id pointing to the second file, reads with history, and verifies the result comes from the correct rollout.
 
-**Call relations**: This test covers the thread-ID verification logic in `sqlite_rollout_path_can_load_history_for_thread`.
+**Call relations**: It directly validates the thread-id check inside `sqlite_rollout_path_can_load_history_for_thread` as part of the `read_thread` fallback path.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_session_file); 4 external calls (new, now, from_u128, assert_eq!).
 
@@ -5605,11 +5625,11 @@ async fn read_thread_falls_back_when_sqlite_path_points_to_another_thread()
 async fn read_thread_uses_session_meta_for_rollout_without_user_preview_or_sqlite_metadata()
 ```
 
-**Purpose**: Verifies the legacy fallback path that reconstructs a thread solely from `session_meta` when no modern summary item or SQLite metadata exists.
+**Purpose**: Checks that a rollout containing only session metadata can still be read when SQLite is absent. This is important for minimal or older session files.
 
-**Data flow**: Writes a rollout containing only session meta, reads with history enabled, and asserts thread ID, rollout path, empty preview, absent name, provider, timestamps, cwd, CLI version, source, and one-item history.
+**Data flow**: The test writes a file with only a session metadata line, reads with history enabled, and checks id, path, empty preview, provider, timestamps, archive status, working directory, CLI version, source, and one loaded history item.
 
-**Call relations**: This test targets `stored_thread_from_session_meta` and `stored_thread_from_meta_line`.
+**Call relations**: It exercises the fallback from `read_thread_from_rollout_path` to `stored_thread_from_session_meta` and then `stored_thread_from_meta_line`.
 
 *Call graph*: calls 3 internal fn (from_string, new, test_config); 9 external calls (new, from_u128, assert!, assert_eq!, format!, json!, create, create_dir_all, writeln!).
 
@@ -5620,11 +5640,11 @@ async fn read_thread_uses_session_meta_for_rollout_without_user_preview_or_sqlit
 async fn read_thread_falls_back_to_sqlite_summary()
 ```
 
-**Purpose**: Checks that when no rollout can be found but SQLite metadata exists, the read path still returns a summary from SQLite.
+**Purpose**: Checks that SQLite alone can provide a thread summary when the rollout file is outside the normal searchable location and history is not requested. This lets the UI show metadata even when the log is not available through rollout search.
 
-**Data flow**: Creates SQLite metadata pointing at an external rollout path without creating the file, reads without history, and asserts preview, first-user-message, provider, model, cwd, CLI version, source, archived state, and absent history come from SQLite.
+**Data flow**: The test inserts SQLite metadata with preview, first user message, title, model, provider, working directory, CLI version, and source, then reads without history and checks those fields are returned.
 
-**Call relations**: This test covers the SQLite-summary fallback branch in `read_thread` when history is not requested.
+**Call relations**: It covers the `stored_thread_from_sqlite_metadata` path inside `read_thread` when no rollout replay is needed.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, new, test_config); 6 external calls (new, now, from_u128, assert!, assert_eq!, format!).
 
@@ -5635,11 +5655,11 @@ async fn read_thread_falls_back_to_sqlite_summary()
 async fn read_thread_sqlite_fallback_respects_include_archived()
 ```
 
-**Purpose**: Ensures SQLite-only fallback summaries still honor the caller's archived filter.
+**Purpose**: Checks that archived status in SQLite is respected when no rollout is used. Archived metadata should not appear in active-only reads.
 
-**Data flow**: Creates archived SQLite metadata without a usable rollout, performs an active-only read expecting an invalid-request message, then reads with `include_archived: true` and asserts preview and archived state.
+**Data flow**: The test stores archived SQLite metadata, tries to read without archived permission and expects an invalid-request error, then reads with archived permission and checks the archived summary is returned.
 
-**Call relations**: This test validates archived gating on the SQLite-first branch in `read_thread`.
+**Call relations**: It validates the archive checks at the start of `read_thread` before the SQLite metadata path is accepted.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, new, test_config); 7 external calls (new, now, from_u128, assert!, assert_eq!, format!, panic!).
 
@@ -5650,11 +5670,11 @@ async fn read_thread_sqlite_fallback_respects_include_archived()
 async fn read_thread_sqlite_fallback_loads_archived_history()
 ```
 
-**Purpose**: Checks that archived history can still be loaded when SQLite metadata points at an archived rollout and `include_archived` is true.
+**Purpose**: Checks that archived history can be loaded through a SQLite metadata path when archived threads are allowed. This ensures archived conversations are still fully replayable.
 
-**Data flow**: Writes an archived rollout, inserts matching archived SQLite metadata, reads with history enabled and archived allowed, and asserts rollout path, preview, archived state, and two-item history.
+**Data flow**: The test writes an archived rollout, stores matching archived SQLite metadata, reads with archived and history enabled, and checks the summary plus the loaded history item count.
 
-**Call relations**: This test covers the SQLite-backed archived-history path in `read_thread`.
+**Call relations**: It exercises `read_thread`, `sqlite_rollout_path_can_load_history_for_thread`, `stored_thread_from_sqlite_metadata`, and `attach_history_if_requested` working together for archived data.
 
 *Call graph*: calls 6 internal fn (from_string, new, init, new, test_config, write_archived_session_file); 5 external calls (new, now, from_u128, assert!, assert_eq!).
 
@@ -5665,11 +5685,11 @@ async fn read_thread_sqlite_fallback_loads_archived_history()
 async fn read_thread_fails_without_rollout()
 ```
 
-**Purpose**: Confirms that reading a nonexistent thread without usable SQLite fallback returns the expected invalid-request error.
+**Purpose**: Checks the error case when a requested thread cannot be found anywhere. This confirms callers get a clear invalid-request error instead of an empty or misleading thread.
 
-**Data flow**: Creates an empty temp store, reads a fixed thread ID, captures the error, and asserts the message says no rollout was found for that thread ID.
+**Data flow**: The test creates a store with no session files or database metadata, asks to read a thread id, and verifies the error message says no rollout was found for that id.
 
-**Call relations**: This test covers the terminal failure path in `read_thread` after rollout resolution returns `None`.
+**Call relations**: It drives `read_thread` through the path where `read_sqlite_metadata` finds nothing and `resolve_rollout_path` returns no file.
 
 *Call graph*: calls 3 internal fn (from_string, new, test_config); 4 external calls (new, from_u128, assert_eq!, panic!).
 
@@ -5678,11 +5698,11 @@ async fn read_thread_fails_without_rollout()
 
 `domain_logic` · `request handling`
 
-This file turns `ListThreadsParams` into a `ThreadPage`. The top-level `list_threads` function first parses an optional opaque cursor string using rollout-library cursor parsing and maps store-level sort enums into rollout-library equivalents. It then builds a `RolloutConfig` from the local store configuration and delegates the actual page fetch to `list_rollout_threads`, which chooses among four rollout-recorder listing APIs depending on `archived` and `use_state_db_only`, or uses a dedicated state-DB query when filtering by `parent_thread_id`.
+This file is the local thread store’s table-of-contents builder. A thread may live in newer SQLite state data, older rollout files on disk, or both, so this code decides where to look and then cleans up the result into one consistent shape. Without it, the app could not reliably show a user their saved conversations, page through long histories, search titles, or separate active threads from archived ones.
 
-Once a rollout page is returned, the code serializes the next cursor back into the string form expected by callers, converts each `codex_rollout::ThreadItem` into a `StoredThread` via `stored_thread_from_rollout_item`, and then performs a second enrichment pass for names. It gathers all thread IDs in the page, queries SQLite metadata when available, and uses `distinct_thread_metadata_title` to keep only meaningful titles. If some threads still lack names, it falls back to legacy thread-name index files under `codex_home` via `find_thread_names_by_ids`. Finally, `set_thread_name_from_title` applies those titles without duplicating the preview text.
+The main flow starts by checking the page cursor, which is a small bookmark saying “continue from here.” If the bookmark is malformed, the request is rejected early. The code then translates the store’s public sorting options into the matching options used by the lower-level rollout library. It asks that library for a page of rollout thread records, using the helper `list_rollout_threads` to pick the right source: active files, archived files, SQLite-only data, or a parent-filtered database query.
 
-Important behavior: parent-filtered listing requires the state DB and fails internally if unavailable; archived listing sets `archived_at` through rollout-item conversion; and missing provider metadata in rollout files is replaced with the configured default provider.
+After that, it converts the raw rollout records into stored thread summaries. One important finishing step is naming. The rollout data may not contain the best title, so the code first looks in the state database for distinct titles, then falls back to legacy name lookup from disk. It is like building a contact list from several address books, then filling in missing display names from the best available source.
 
 #### Function details
 
@@ -5695,11 +5715,11 @@ async fn list_threads(
 ) -> ThreadStoreResult<ThreadPage>
 ```
 
-**Purpose**: Builds a paginated thread listing for the local store, converts rollout summaries into `StoredThread` values, and enriches them with names from SQLite titles or legacy name indexes. It also validates the incoming cursor string.
+**Purpose**: This is the main local listing operation. It receives the caller’s filters and paging options, fetches matching thread records, converts them into the thread-store format, and fills in readable thread names when possible.
 
-**Data flow**: Consumes `&LocalThreadStore` and `ListThreadsParams`; reads `params.cursor`, sort settings, archive/search/filter flags, `store.config`, and the optional state DB. It parses the cursor, constructs a `RolloutConfig`, calls `list_rollout_threads`, converts returned `ThreadItem`s with `stored_thread_from_rollout_item`, gathers thread IDs into a `HashSet`, fills a `HashMap<ThreadId, String>` from SQLite metadata and then legacy name files, mutates each `StoredThread` name via `set_thread_name_from_title`, and returns `ThreadPage { items, next_cursor }`.
+**Data flow**: It takes a `LocalThreadStore` and `ListThreadsParams`. It reads the optional cursor, sorting choices, archive flag, filters, search term, store configuration, and optional state database. It validates and translates those inputs, asks `list_rollout_threads` for raw thread rows, converts those rows into stored thread summaries, gathers their thread IDs, looks up better titles from the state database and then from legacy files, applies those titles, and returns a `ThreadPage` with items plus the next cursor if more results exist. If the cursor is invalid or the lower-level listing fails, it returns a thread-store error instead.
 
-**Call relations**: This is the main list implementation behind the store trait method. It delegates page retrieval to `list_rollout_threads` and uses helper functions to merge metadata-derived names into the final response.
+**Call relations**: This function is called when the local thread store needs to answer a list request. It delegates the actual source selection and raw listing work to `list_rollout_threads`, then adds local-store polish: conversion into public thread objects and title enrichment. It also calls helper routines that recognize good metadata titles and write those titles back onto the returned thread summaries.
 
 *Call graph*: calls 4 internal fn (state_db, distinct_thread_metadata_title, set_thread_name_from_title, list_rollout_threads); called by 1 (list_threads); 2 external calls (with_capacity, find_thread_names_by_ids).
 
@@ -5715,11 +5735,11 @@ async fn list_rollout_threads(
     cursor: Option<&
 ```
 
-**Purpose**: Selects the concrete rollout/state-DB listing backend based on parent filtering, archive mode, and `use_state_db_only`. It is the lower-level page fetcher shared by list and search flows.
+**Purpose**: This helper chooses the correct lower-level rollout listing method for the caller’s request. It is where the code decides whether to read active threads, archived threads, only the state database, or a parent-thread slice.
 
-**Data flow**: Takes an optional `StateDbHandle`, a `RolloutConfig`, default provider ID, original `ListThreadsParams`, optional parsed cursor, and rollout sort enums. If `params.parent_thread_id` is set, it queries `codex_rollout::state_db::list_threads_db`, converts the result into `ThreadsPage`, and stamps `parent_thread_id` onto each item. Otherwise it dispatches to one of `RolloutRecorder::list_archived_threads_from_state_db`, `list_threads_from_state_db`, `list_archived_threads`, or `list_threads`, then maps backend errors into `ThreadStoreError::Internal`.
+**Data flow**: It receives an optional state database handle, rollout configuration, default model provider, list parameters, optional cursor, and sort settings. If a parent thread ID is present, it asks the state database for only child threads of that parent and marks each returned item with that parent ID. Otherwise, it chooses among active versus archived and database-only versus mixed disk/database listing paths. It returns a raw rollout `ThreadsPage`, or wraps any failure in a `ThreadStoreError::Internal` with a readable message.
 
-**Call relations**: Called directly by `list_threads` and reused by `search_threads` to scan sorted thread pages while intersecting them with content-search matches. It centralizes backend selection so both callers share identical listing semantics.
+**Call relations**: The higher-level `list_threads` function uses this as its source picker before doing conversion and name cleanup. The search flow also reuses it, so search and normal listing stay consistent about archived data, state-database-only mode, provider filters, working-directory filters, and pagination. It hands off to the rollout recorder or state database functions because those lower layers know how to read the actual stored records.
 
 *Call graph*: calls 5 internal fn (list_archived_threads, list_archived_threads_from_state_db, list_threads, list_threads_from_state_db, list_threads_db); called by 2 (list_threads, search_threads).
 
@@ -5730,11 +5750,11 @@ async fn list_rollout_threads(
 async fn list_threads_uses_default_provider_when_rollout_omits_provider()
 ```
 
-**Purpose**: Checks that listing fills in the configured default model provider when a rollout file lacks provider metadata.
+**Purpose**: This test checks that an old or incomplete rollout file without a model provider still produces a thread summary with the store’s default provider. That keeps older saved conversations from showing a blank or missing provider.
 
-**Data flow**: Creates a temp store, writes a session file with `model_provider` omitted, calls `store.list_threads(...)`, and asserts the single returned item's `model_provider` equals `test-provider`.
+**Data flow**: It creates a temporary home directory, builds a local store with test configuration, writes one session file that deliberately omits the model provider, and asks for a normal thread listing. The returned page is expected to contain one item, and that item’s provider must be the configured test default.
 
-**Call relations**: This test exercises the conversion path through `stored_thread_from_rollout_item` as reached from `list_threads`.
+**Call relations**: This test exercises the public listing path through the local store, which reaches the file’s `list_threads` function and then the rollout listing helper. It proves that the conversion step after raw rollout loading supplies a safe default when the underlying record does not include one.
 
 *Call graph*: calls 3 internal fn (new, test_config, write_session_file_with); 4 external calls (new, from_u128, new, assert_eq!).
 
@@ -5745,11 +5765,11 @@ async fn list_threads_uses_default_provider_when_rollout_omits_provider()
 async fn list_threads_preserves_sqlite_title_search_results()
 ```
 
-**Purpose**: Verifies that state-DB-only listing with a search term returns the matching thread and preserves the rollout preview/first-user-message rather than replacing it with the title.
+**Purpose**: This test checks that searching through SQLite title data returns the matching thread and keeps the preview text from the database. It protects the newer state-database search path from losing useful summary fields.
 
-**Data flow**: Initializes a state DB, inserts `ThreadMetadata` with a title containing the search term and a distinct preview/first message, calls `store.list_threads(...)` with `use_state_db_only: true` and `search_term: Some("needle")`, then asserts the returned thread ID and first-user-message.
+**Data flow**: It creates a temporary store with a real state database runtime, marks backfill as complete, inserts thread metadata whose title contains the search word, and then lists threads with `use_state_db_only` and a search term. The result should contain exactly that thread ID, and its first user message should remain the plain preview stored in the database.
 
-**Call relations**: This test covers the state-DB listing branch in `list_rollout_threads` and the title-enrichment logic in `list_threads`.
+**Call relations**: The test drives the same local listing entry point but forces the database-only branch inside `list_rollout_threads`. It is especially tied to title search behavior: the lower-level database lookup finds the thread, and the outer `list_threads` conversion must preserve the search result’s summary text.
 
 *Call graph*: calls 5 internal fn (from_string, new, init, new, test_config); 6 external calls (new, now, from_u128, new, assert_eq!, write).
 
@@ -5760,11 +5780,11 @@ async fn list_threads_preserves_sqlite_title_search_results()
 async fn list_threads_selects_active_or_archived_collection()
 ```
 
-**Purpose**: Confirms that the `archived` flag selects the correct rollout collection and that archived results carry `archived_at` while active ones do not.
+**Purpose**: This test verifies that active and archived thread listings are kept separate. A request for active threads should not include archived ones, and a request for archived threads should mark them as archived.
 
-**Data flow**: Writes one active and one archived session file, performs two listings with `archived: false` and `archived: true`, converts UUIDs to `ThreadId`s, and asserts each page contains only the expected thread plus the expected `archived_at` values.
+**Data flow**: It creates a temporary store, writes one active session file and one archived session file, then performs two listings: one with `archived` set to false and one with it set to true. It compares the returned IDs to the expected active or archived thread ID and checks that only the archived result has an archive timestamp.
 
-**Call relations**: This test validates the backend-selection branch in `list_rollout_threads` and the archived-state mapping performed by `stored_thread_from_rollout_item`.
+**Call relations**: This test covers the branch selection inside `list_rollout_threads`: normal listing should use the active collection, while archived listing should use the archived collection. The outer `list_threads` function then converts those raw records into returned items whose archive fields callers can trust.
 
 *Call graph*: calls 5 internal fn (from_string, new, test_config, write_archived_session_file, write_session_file); 4 external calls (new, from_u128, new, assert_eq!).
 
@@ -5775,11 +5795,11 @@ async fn list_threads_selects_active_or_archived_collection()
 async fn list_threads_returns_local_rollout_summary()
 ```
 
-**Purpose**: Checks that a normal local listing returns the expected summary fields extracted from a rollout file, including preview, rollout path, provider, CLI version, and source.
+**Purpose**: This test checks the basic happy path for listing a local rollout session. It confirms that a saved session file turns into a useful thread summary with ID, path, preview text, provider, version, and source.
 
-**Data flow**: Creates a temp store, writes a session file, calls `store.list_threads(...)` with source/provider filters, and asserts the returned page has one item with the expected thread ID and rollout-derived fields.
+**Data flow**: It creates a temporary local store, writes one session file, lists threads with source and provider filters, and inspects the first returned item. The expected output is one thread whose summary fields match the file that was written, including the first user message used as the preview.
 
-**Call relations**: This test exercises the standard non-archived, non-state-DB-only listing path end to end.
+**Call relations**: This test exercises the full normal flow: the local store calls `list_threads`, which calls `list_rollout_threads`, which reads rollout data from disk. It then verifies that the conversion helpers used by `list_threads` produce the public-facing summary that callers need for a thread list UI.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 4 external calls (new, from_u128, assert_eq!, vec!).
 
@@ -5790,11 +5810,11 @@ async fn list_threads_returns_local_rollout_summary()
 async fn list_threads_rejects_invalid_cursor()
 ```
 
-**Purpose**: Ensures that malformed cursor strings are rejected as invalid requests before any listing backend is queried.
+**Purpose**: This test ensures that bad pagination bookmarks are rejected instead of being ignored or passed deeper into the listing system. That gives callers a clear error when they send an unusable cursor.
 
-**Data flow**: Creates a temp store, calls `store.list_threads(...)` with `cursor: Some("not-a-cursor")`, captures the error, and asserts it matches `ThreadStoreError::InvalidRequest`.
+**Data flow**: It creates a temporary local store and calls the listing operation with `cursor` set to a string that is not a valid encoded cursor. The result should be an error, specifically an invalid-request error, rather than a page of threads.
 
-**Call relations**: This test targets the early cursor-parse validation branch in `list_threads`.
+**Call relations**: This test focuses on the first validation step in `list_threads`, before any rollout or database listing happens. It protects the boundary between caller input and lower-level storage code by making sure malformed cursors stop at the top.
 
 *Call graph*: calls 2 internal fn (new, test_config); 3 external calls (new, new, assert!).
 
@@ -5803,11 +5823,13 @@ async fn list_threads_rejects_invalid_cursor()
 
 `domain_logic` · `request handling`
 
-This file layers full-text rollout search on top of the listing machinery. `search_threads` first validates that `search_term` is non-empty and parses the optional cursor string. It maps store sort enums into rollout-library equivalents, builds a `RolloutConfig`, and asks `InstallContext::current().rg_command()` for the ripgrep executable used by `search_rollout_matches`. That search returns a map keyed by logical rollout path, with optional precomputed snippets.
+This file answers the question: “Which of my local threads mention this text?” Without it, the local thread store could list threads, but it could not search inside their saved conversation data and return useful search results.
 
-The function then scans sorted thread pages using `list_rollout_threads` rather than returning raw grep hits directly. This preserves the same ordering and filtering semantics as normal listing. To avoid too many round trips, it requests oversized scan pages (`page_size * 8`, clamped between 256 and 2048) and loops until it has enough matching items, exhausts the rollout-match set, or runs out of pages. For each listed thread item, it normalizes the path to the plain rollout path, checks whether that path is in the remaining match map, and either uses the stored snippet or lazily computes one with `first_rollout_content_match_snippet`.
+The main flow starts by checking that the user supplied a non-empty search term and that any paging cursor is valid. A cursor is like a bookmark: it says where the next page of results should continue. The file then translates the thread store’s sort choices into the rollout system’s sort choices, builds the rollout configuration, and asks the rollout search layer to find saved rollout files that contain the text.
 
-After truncating to the requested page size, it derives the next cursor from the last retained item's created/updated timestamp, converts each `ThreadItem` into a `StoredThreadSearchResult`, and enriches names exactly like listing does: SQLite titles first, then legacy name-index entries, with redundant titles suppressed. The result is a search page that is content-filtered but still sorted and shaped like normal thread summaries.
+There are two stages because searching file contents and listing thread metadata are separate jobs. First, it finds matching rollout files. Then it scans the normal thread list in sorted order and keeps only the threads whose rollout file matched. This preserves the expected ordering and filtering while still using fast content search. It also reads or builds a snippet for each match, so the caller can show a preview instead of only a thread title.
+
+Finally, it converts rollout items into stored thread search results and fills in human-friendly thread names. Names may come from the newer state database, or from older legacy rollout data if the database does not have them. The result is a page of search hits plus an optional next cursor.
 
 #### Function details
 
@@ -5820,11 +5842,11 @@ async fn search_threads(
 ) -> ThreadStoreResult<ThreadSearchPage>
 ```
 
-**Purpose**: Searches rollout contents for a term, intersects those matches with sorted thread listings, and returns paginated `StoredThreadSearchResult` values with snippets. It rejects empty search terms and malformed cursors.
+**Purpose**: Searches local thread history for a required text term and returns one page of matching threads. It combines content search, thread listing, pagination, sorting, filtering, snippets, and display names into the search response a caller needs.
 
-**Data flow**: Consumes `&LocalThreadStore` and `SearchThreadsParams`; reads `search_term`, cursor, sort settings, archive flag, allowed sources, and store config/state DB. It validates the term, parses the cursor, builds a `RolloutConfig`, gets the ripgrep command from `InstallContext::current()`, calls `search_rollout_matches`, then repeatedly calls `list_rollout_threads` with oversized scan params. For each listed item it normalizes the path with `plain_rollout_path`, looks up/removes a snippet from the remaining match map or computes one with `first_rollout_content_match_snippet`, accumulates `ThreadSearchItem`s, truncates to `page_size`, derives `next_cursor`, converts items with `stored_thread_from_rollout_item`, enriches names via `set_thread_search_result_names`, and returns `ThreadSearchPage`.
+**Data flow**: It receives a local thread store and search parameters, including the search text, page size, sort order, filters, archive choice, and optional cursor. It validates the search text and cursor, reads store configuration and the optional state database, asks the rollout search code to find files containing the term, then scans the regular thread list in order until it has enough matching results. Each matching rollout item is paired with a snippet, converted into a stored thread result, enriched with a display name, and returned as a ThreadSearchPage with an optional next cursor.
 
-**Call relations**: This is the store's search implementation. It delegates content matching to rollout-library grep helpers, ordering/filtering to `list_rollout_threads`, and final name enrichment to `set_thread_search_result_names`.
+**Call relations**: This is the central search operation for the file. During a search request, it gets install information through current, checks the store database through state_db, asks search_rollout_matches to find matching saved rollout files, uses list_rollout_threads to walk threads in the requested order, asks first_rollout_content_match_snippet for a snippet when needed, and calls set_thread_search_result_names at the end so the returned threads have readable names.
 
 *Call graph*: calls 4 internal fn (current, state_db, list_rollout_threads, set_thread_search_result_names); called by 1 (search_threads); 4 external calls (new, first_rollout_content_match_snippet, plain_rollout_path, search_rollout_matches).
 
@@ -5838,11 +5860,11 @@ fn cursor_from_thread_search_item(
 ) -> Option<codex_rollout::Cursor>
 ```
 
-**Purpose**: Derives a rollout cursor from a matched thread item using the timestamp field appropriate for the requested sort key. It returns `None` when the necessary timestamp is missing or unparsable.
+**Purpose**: Builds the paging bookmark for a search result item. The bookmark is based on the item’s creation or update time, depending on how the search results are being sorted.
 
-**Data flow**: Takes a `ThreadSearchItem` reference and `ThreadSortKey`; selects `item.item.created_at` for created-time sorting or `updated_at` falling back to `created_at` for updated-time sorting, then parses that timestamp string with `parse_cursor` and returns the resulting optional cursor.
+**Data flow**: It receives one internal search item and the chosen sort key. It chooses the relevant timestamp from the item: created time for creation sorting, or updated time with created time as a fallback for update sorting. It then turns that timestamp into a rollout cursor; if the needed timestamp is missing or cannot be parsed, it returns nothing.
 
-**Call relations**: Used only by `search_threads` when constructing the next-page cursor after truncating matched results.
+**Call relations**: search_threads uses this helper only when it has found more matches than fit on the current page. It takes the last returned item and produces the cursor that lets the next search request resume after that point.
 
 *Call graph*: 1 external calls (parse_cursor).
 
@@ -5856,11 +5878,11 @@ async fn set_thread_search_result_names(
 )
 ```
 
-**Purpose**: Enriches search results with thread names from SQLite titles or legacy name-index entries, suppressing redundant names that duplicate previews. It mirrors the naming logic used by normal listing.
+**Purpose**: Adds friendly names or titles to the search results before they are returned. This matters because raw thread records may have only an identifier, while users expect recognizable thread names.
 
-**Data flow**: Mutably borrows a slice of `StoredThreadSearchResult`, gathers their thread IDs into a `HashSet`, allocates a `HashMap<ThreadId, String>`, fills it from SQLite metadata using `distinct_thread_metadata_title`, falls back to `find_thread_names_by_ids` for missing names, then mutates each result's `thread` via `set_thread_name_from_title` when a title is available.
+**Data flow**: It receives the local store and a mutable list of search results. It collects all thread IDs, then looks for titles in the newer state database first. If some names are still missing, it looks in legacy rollout files. For every title it finds, it updates the matching thread result so the caller receives a named thread rather than just a bare ID.
 
-**Call relations**: Called at the end of `search_threads` so search results present the same naming behavior as list results.
+**Call relations**: search_threads calls this after converting matching rollout items into search results. This helper reaches into the store’s state database through state_db, uses distinct_thread_metadata_title to pick a usable title from metadata, falls back to find_thread_names_by_ids for older saved data, and applies each title with set_thread_name_from_title.
 
 *Call graph*: calls 3 internal fn (state_db, distinct_thread_metadata_title, set_thread_name_from_title); called by 1 (search_threads); 3 external calls (with_capacity, find_thread_names_by_ids, iter).
 
@@ -5869,9 +5891,11 @@ async fn set_thread_search_result_names(
 
 `domain_logic` · `request handling`
 
-This file performs destructive local thread removal against the filesystem-backed rollout store. The main async path first derives the target thread ID string, fetches the optional state DB handle from `LocalThreadStore`, and asks rollout lookup helpers for both active and archived rollout locations. It accumulates any discovered paths, deduplicating the archived result if it resolves to the same file as the active lookup. Lookup failures are surfaced as `ThreadStoreError::InvalidRequest` with thread-specific context, while absence of both active and archived rollouts becomes `ThreadStoreError::ThreadNotFound` only after cleanup attempts complete.
+A “thread” here is a saved conversation or session, and a “rollout file” is the on-disk log that stores it. This file provides the local hard-delete path: when someone asks to delete a thread, it first looks for that thread in the normal sessions area and then in the archived sessions area. If it finds one or both, it removes the matching files before reporting success. This matters because the thread’s real content lives in those files; if they stayed behind, the thread would not truly be deleted.
 
-For each discovered rollout, deletion is delegated through a two-step helper chain. `delete_rollout_file` normalizes to the plain `.jsonl` path and also targets the sibling `.jsonl.zst` compressed variant, deleting either or both. `delete_rollout_path` enforces path safety by canonicalizing the candidate under either `sessions` or `archived sessions`, tolerates a path that vanished before canonicalization by treating it as already deleted, verifies the filename suffix matches the requested `ThreadId`, and then removes the file. After all rollout files are gone, the code removes legacy thread-name index entries under `codex_home`; only then does it clear any in-memory live recorder entry for the thread. A key invariant is that success means all discovered rollout artifacts and name-index entries are gone, but SQLite cleanup is intentionally left to higher layers.
+The deletion is deliberately defensive. Before removing a file, the code checks that the path is inside the expected sessions folders, which helps prevent accidental deletion outside the project’s storage area. It also checks that the file name matches the requested thread id, like checking the label on a box before throwing it away. It removes both the plain rollout file and a possible compressed sibling ending in `.jsonl.zst`.
+
+After file deletion, it removes thread-name index entries, which are lookup records used to find threads by name. If no rollout file was found at all, it reports “thread not found.” It also removes any live recorder for that thread from memory so the local store no longer tracks an active writer for something that has been deleted.
 
 #### Function details
 
@@ -5884,11 +5908,11 @@ async fn delete_thread(
 ) -> ThreadStoreResult<()>
 ```
 
-**Purpose**: Deletes every persisted rollout file associated with a thread ID, including active and archived copies, then removes legacy thread-name index entries and drops any live recorder entry. It reports `ThreadNotFound` only when no rollout path was found in either collection.
+**Purpose**: Deletes one local thread by finding its saved rollout files, removing them from disk, clearing its name-index entries, and forgetting any live in-memory recorder for it. This is the main operation used when a caller wants a thread to be permanently removed from local storage.
 
-**Data flow**: Takes a `&LocalThreadStore` and `DeleteThreadParams`; reads `params.thread_id`, `store.config.codex_home`, the optional state DB via `store.state_db().await`, and the `live_recorders` map. It resolves active and archived rollout paths, collects them into a vector, invokes `delete_rollout_file` for each path, then calls `remove_thread_name_entries` under `codex_home`. On success it removes the thread from `store.live_recorders`; on failure it returns a `ThreadStoreError` describing lookup, deletion, or index-removal failure.
+**Data flow**: It receives a local store and delete parameters containing the thread id. It reads the store configuration to find the Codex home folder, optionally reads the state database context, searches both active and archived session locations, and collects any matching rollout paths. It then deletes each found rollout file, removes name-index entries for the thread, reports an error if no rollout was found, and finally removes the thread from the store’s live recorder map.
 
-**Call relations**: This is the local implementation behind the store-level delete operation. It is invoked from the higher-level `ThreadStore` method path and orchestrates the whole delete flow, delegating actual file removal to `delete_rollout_file` and relying on rollout-library lookup/index helpers to discover files and erase legacy name entries.
+**Call relations**: This is the top-level delete routine used by the local thread store’s delete operation. It asks the rollout lookup helpers to find active and archived files, passes each discovered path to delete_rollout_file for the actual disk removal, then calls the rollout index cleanup helper so stale name lookups do not remain.
 
 *Call graph*: calls 2 internal fn (state_db, delete_rollout_file); called by 1 (delete_thread); 5 external calls (new, find_archived_thread_path_by_id_str, find_thread_path_by_id_str, remove_thread_name_entries, format!).
 
@@ -5903,11 +5927,11 @@ fn delete_rollout_file(
 ) -> ThreadStoreResult<bool>
 ```
 
-**Purpose**: Deletes both the logical plain rollout path and its compressed `.jsonl.zst` sibling for a single discovered rollout. It returns whether either variant was actually removed.
+**Purpose**: Deletes the physical rollout file for a thread, including both the normal plain file and a possible compressed copy. It returns whether anything was actually removed.
 
-**Data flow**: Accepts the store, a rollout path, and the expected `ThreadId`. It converts the supplied path to the plain rollout path with `codex_rollout::plain_rollout_path`, derives the compressed sibling by changing the extension to `jsonl.zst`, calls `delete_rollout_path` on both, and returns `true` if either call deleted a file.
+**Data flow**: It receives the store, a rollout path, and the thread id that should own that file. It normalizes the path to the plain rollout location, builds the matching compressed `.jsonl.zst` path, and asks delete_rollout_path to remove each one. It returns true if either version was deleted, or false if both were already gone.
 
-**Call relations**: Called once per discovered rollout by `delete_thread`. It exists to centralize the dual-path deletion rule so the top-level delete logic does not need to know whether the persisted artifact is plain, compressed, or both.
+**Call relations**: delete_thread calls this once for each rollout path it found. This function does not do the low-level safety checks itself; it delegates each candidate file to delete_rollout_path, which verifies the location and file name before deleting.
 
 *Call graph*: calls 1 internal fn (delete_rollout_path); called by 1 (delete_thread); 1 external calls (plain_rollout_path).
 
@@ -5922,11 +5946,11 @@ fn delete_rollout_path(
 ) -> ThreadStoreResult<bool>
 ```
 
-**Purpose**: Validates that a candidate rollout file is scoped under the allowed sessions roots, confirms its filename matches the requested thread ID, and removes the file while treating `NotFound` as already deleted. This is the safety-critical filesystem deletion primitive in the file.
+**Purpose**: Safely removes one specific rollout file from disk. It protects against deleting the wrong file by checking that the path belongs under the known sessions folders and that the file name matches the requested thread id.
 
-**Data flow**: Receives the store, a concrete path candidate, and the expected `ThreadId`. It reads `store.config.codex_home`, tries to canonicalize the path under `sessions` first and `archived sessions` second via `scoped_rollout_path`, falls back to the original path only when `try_exists` says the file is already gone, validates the basename with `matching_rollout_file_name`, then calls `std::fs::remove_file`. It returns `Ok(true)` when a file was removed, `Ok(false)` when it was already absent, or a `ThreadStoreError` for invalid scope/name or I/O failure.
+**Data flow**: It receives the store, a path to delete, and the expected thread id. It first resolves the path as being inside either the active sessions folder or the archived sessions folder; if the file has already vanished, it allows that as a successful no-op. It then checks that the file name matches the thread id, tries to remove the file, returns true when deletion happened, false when the file was already missing, and an internal error if the operating system refused the delete for another reason.
 
-**Call relations**: Used only by `delete_rollout_file`. It encapsulates the path-validation and deletion semantics so the caller can safely attempt deletion of both plain and compressed variants without duplicating security checks.
+**Call relations**: delete_rollout_file calls this for the plain rollout path and the compressed sibling path. It relies on scoped_rollout_path for the “is this file in the allowed area?” check, matching_rollout_file_name for the “is this the right thread?” check, and finally the filesystem remove call for the actual deletion.
 
 *Call graph*: calls 2 internal fn (matching_rollout_file_name, scoped_rollout_path); called by 1 (delete_rollout_file); 2 external calls (format!, remove_file).
 
@@ -5937,11 +5961,11 @@ fn delete_rollout_path(
 async fn delete_thread_removes_active_and_archived_rollouts()
 ```
 
-**Purpose**: Verifies that deleting a thread removes rollout files from both active and archived collections, and also removes a compressed sibling when present for an active rollout.
+**Purpose**: Checks that deleting a thread removes rollout files from both normal sessions and archived sessions. It also confirms that a compressed sibling file is removed along with the plain active file.
 
-**Data flow**: Builds a temporary `LocalThreadStore`, writes one active session file plus a `.jsonl.zst` sibling and one archived session file, converts UUIDs into `ThreadId`s, invokes `store.delete_thread(...)`, and asserts the corresponding files no longer exist.
+**Data flow**: The test creates a temporary Codex home folder, builds a local thread store pointed at it, writes one active session file, writes a compressed companion file, and writes one archived session file. It then deletes each thread by id and checks that the corresponding files no longer exist afterward.
 
-**Call relations**: This test exercises the full top-level delete path and indirectly covers both rollout discovery branches and the compressed-sibling behavior delegated through `delete_rollout_file`.
+**Call relations**: This test exercises the public local-store delete path, which leads into delete_thread and then down into the rollout deletion helpers. It uses test support helpers to create realistic files so the delete flow is tested against actual disk paths.
 
 *Call graph*: calls 5 internal fn (from_string, new, test_config, write_archived_session_file, write_session_file); 4 external calls (new, from_u128, assert!, write).
 
@@ -5952,11 +5976,11 @@ async fn delete_thread_removes_active_and_archived_rollouts()
 async fn delete_rollout_file_treats_vanished_path_as_already_deleted()
 ```
 
-**Purpose**: Checks that deleting a rollout path that disappeared after discovery returns success with `false` rather than failing. This pins the retry-friendly semantics described in the module docs.
+**Purpose**: Checks the race-friendly behavior where a rollout file that disappears before deletion is treated as already deleted. This matters because another process or cleanup step might remove the file after it was discovered.
 
-**Data flow**: Creates a temp store and session file, removes the file manually, then calls `delete_rollout_file` with the stale path and asserts the returned boolean is `false`.
+**Data flow**: The test creates a temporary store and a session file, then manually removes that file before calling delete_rollout_file. The expected result is a successful return value of false, meaning no file was deleted by this call because it was already gone.
 
-**Call relations**: This test targets the lower-level helper directly, specifically the `try_exists`/`NotFound` path inside `delete_rollout_path` as reached through `delete_rollout_file`.
+**Call relations**: This test calls delete_rollout_file directly to focus on the lower-level file deletion behavior. It verifies the rule described by delete_rollout_path: a missing file is not treated as a failure when the delete operation reaches it.
 
 *Call graph*: calls 4 internal fn (from_string, new, test_config, write_session_file); 4 external calls (new, from_u128, assert!, remove_file).
 
@@ -5967,10 +5991,10 @@ async fn delete_rollout_file_treats_vanished_path_as_already_deleted()
 async fn delete_thread_reports_missing_thread()
 ```
 
-**Purpose**: Confirms that deleting a thread with no active or archived rollout produces the user-facing not-found error.
+**Purpose**: Checks that asking to delete a thread with no rollout file produces a clear “thread not found” error. This prevents a missing thread from being silently treated as a successful delete.
 
-**Data flow**: Creates an empty temp store, parses a fixed `ThreadId`, calls `store.delete_thread(...)`, captures the error, and compares its string form to the expected not-found message.
+**Data flow**: The test creates an empty temporary store, builds a valid-looking thread id that has no saved file, and calls the store’s delete operation. It expects an error and compares the user-facing error text to the exact missing-thread message.
 
-**Call relations**: This test covers the top-level branch in `delete_thread` where no rollout paths are discovered and the function returns `ThreadStoreError::ThreadNotFound` after cleanup attempts.
+**Call relations**: This test goes through the store delete API into delete_thread. It covers the branch where both active and archived lookup find nothing, so the operation reports ThreadNotFound after attempting the related cleanup steps.
 
 *Call graph*: calls 3 internal fn (from_string, new, test_config); 2 external calls (new, assert_eq!).
